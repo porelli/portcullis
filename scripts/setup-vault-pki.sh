@@ -14,6 +14,8 @@ VAULT_TOKEN="${VAULT_TOKEN:-myroot}"
 CERT_DIR="${CERT_DIR:-./certs}"
 DOMAIN="${DOMAIN:-portcullis.local}"
 mkdir -p "$CERT_DIR"
+ls -la "$CERT_DIR/" 2>&1 || true
+echo "DEBUG: CERT_DIR=$CERT_DIR pwd=$(pwd) whoami=$(whoami)"
 TTL_ROOT="87600h"          # 10 years
 TTL_INTERMEDIATE="43800h"  # 5 years
 TTL_CLIENT="24h"           # short-lived client certs
