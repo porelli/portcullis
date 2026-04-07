@@ -127,12 +127,12 @@ jobs:
         run: |
           docker compose up -d keycloak
           echo "Waiting for Keycloak to start..."
-          for i in $(seq 1 60); do
+          for i in $(seq 1 90); do
             if curl -sf http://localhost:8080/health/ready > /dev/null 2>&1; then
               echo "Keycloak is ready"
               break
             fi
-            if [ "$i" -eq 60 ]; then
+            if [ "$i" -eq 90 ]; then
               echo "FAIL: Keycloak did not start in time"
               docker compose logs keycloak | tail -50
               exit 1
