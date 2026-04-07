@@ -1,0 +1,34 @@
+services:
+  plex:
+    image: plexinc/pms-docker:latest
+    environment:
+      PLEX_CLAIM: ${PLEX_CLAIM:-}
+      ADVERTISE_IP: https://plex.${PORTCULLIS_DOMAIN:-portcullis.local}:443
+    volumes:
+      - plex-config:/config
+      - plex-transcode:/transcode
+      # Mount your media library:
+      # - /path/to/movies:/data/movies
+      # - /path/to/tv:/data/tv
+      # - /path/to/music:/data/music
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.plex.rule: Host(`plex.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.plex.entrypoints: websecure
+      traefik.http.routers.plex.tls.options: public@file
+      traefik.http.routers.plex.middlewares: security-headers@file
+      traefik.http.services.plex.loadbalancer.server.port: "32400"
+    restart: unless-stopped
+
+volumes:
+  plex-config:
+    name: portcullis_plex-config
+  plex-transcode:
+    name: portcullis_plex-transcode
+
+networks:
+  portcullis-proxy:
+    external: true

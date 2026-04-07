@@ -1,0 +1,59 @@
+{
+  "Stuns": [
+    {
+      "Proto": "udp",
+      "URI": "stun:${TURN_HOST}:3478"
+    }
+  ],
+  "TURNConfig": {
+    "Turns": [
+      {
+        "Proto": "udp",
+        "URI": "turn:${TURN_HOST}:3478",
+        "Username": "",
+        "Password": ""
+      }
+    ],
+    "CredentialsTTL": "12h",
+    "Secret": "${COTURN_AUTH_SECRET}",
+    "TimeBasedCredentials": true
+  },
+  "Signal": {
+    "Proto": "https",
+    "URI": "${NETBIRD_DOMAIN}:443",
+    "Username": "",
+    "Password": ""
+  },
+  "HttpConfig": {
+    "AuthIssuer": "https://auth.${PORTCULLIS_DOMAIN}/realms/portcullis",
+    "AuthAudience": "netbird-dashboard",
+    "OIDCConfigEndpoint": "https://auth.${PORTCULLIS_DOMAIN}/realms/portcullis/.well-known/openid-configuration"
+  },
+  "IdpManagerConfig": {
+    "ManagerType": "none"
+  },
+  "DeviceAuthorizationFlow": {
+    "Provider": "none",
+    "ProviderConfig": {
+      "Audience": "netbird-dashboard",
+      "ClientID": "netbird-dashboard",
+      "TokenEndpoint": "https://auth.${PORTCULLIS_DOMAIN}/realms/portcullis/protocol/openid-connect/token",
+      "DeviceAuthEndpoint": "https://auth.${PORTCULLIS_DOMAIN}/realms/portcullis/protocol/openid-connect/auth/device",
+      "Scope": "openid profile email"
+    }
+  },
+  "PKCEAuthorizationFlow": {
+    "ProviderConfig": {
+      "Audience": "netbird-dashboard",
+      "ClientID": "netbird-dashboard",
+      "ClientSecret": "${NETBIRD_OIDC_CLIENT_SECRET}",
+      "AuthorizationEndpoint": "https://auth.${PORTCULLIS_DOMAIN}/realms/portcullis/protocol/openid-connect/auth",
+      "TokenEndpoint": "https://auth.${PORTCULLIS_DOMAIN}/realms/portcullis/protocol/openid-connect/token",
+      "Scope": "openid profile email",
+      "RedirectURLs": [
+        "https://${NETBIRD_DOMAIN}/auth",
+        "https://${NETBIRD_DOMAIN}/silent-auth"
+      ]
+    }
+  }
+}

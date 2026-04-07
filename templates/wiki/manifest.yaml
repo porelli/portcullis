@@ -1,0 +1,27 @@
+name: Wiki.js
+description: Modern wiki — mTLS if cert present, WebAuthn fallback
+icon: "\U0001F4D6"
+category: productivity
+tags: [wiki, docs, knowledge-base]
+conflicts: []
+
+auth:
+  method: forward-auth
+  sso: false
+  group_access: true
+  group_admin: false
+  access_group: users_wiki
+  admin_group: admin_wiki
+  notes: No SSO configured yet. Access gated by group-gate middleware. Wiki.js supports OIDC natively but needs manual setup after wizard.
+
+env:
+  - key: WIKI_DB_PASSWORD
+    description: Wiki.js database password
+    generate: random
+
+keycloak_clients: []
+config_files: []
+
+urls:
+  - label: Wiki
+    url: "https://wiki.{{DOMAIN}}"

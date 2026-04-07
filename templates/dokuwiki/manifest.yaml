@@ -1,0 +1,23 @@
+name: DokuWiki
+description: Simple, file-based wiki — no database required, easy backups
+icon: "\U0001F4DD"
+category: productivity
+tags: [wiki, docs, knowledge-base, file-based]
+conflicts: []
+
+auth:
+  method: forward-auth
+  sso: false
+  group_access: true
+  group_admin: false
+  access_group: users_dokuwiki
+  admin_group: admin_dokuwiki
+  notes: No SSO support. Has its own internal ACL system. Access gated by group-gate middleware.
+
+env: []
+keycloak_clients: []
+config_files: []
+
+urls:
+  - label: Wiki
+    url: "https://dokuwiki.{{DOMAIN}}"

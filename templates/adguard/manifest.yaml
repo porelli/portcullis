@@ -1,0 +1,23 @@
+name: AdGuard Home
+description: Network-wide ad and tracker blocking with DNS-over-HTTPS
+icon: "\U0001F6E1"
+category: networking
+tags: [dns, adblock, privacy, filtering]
+conflicts: [pihole]
+
+auth:
+  method: forward-auth
+  sso: false
+  group_access: true
+  group_admin: false
+  access_group: users_adguard
+  admin_group: admin_adguard
+  notes: No SSO support. Has its own local admin password set during setup wizard. Access gated by group-gate middleware.
+
+env: []
+keycloak_clients: []
+config_files: []
+
+urls:
+  - label: Dashboard
+    url: "https://adguard.{{DOMAIN}}"

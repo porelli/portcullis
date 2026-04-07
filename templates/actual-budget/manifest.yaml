@@ -1,0 +1,32 @@
+name: Actual Budget
+description: Privacy-first local budgeting app with bank sync
+icon: "\U0001F4B0"
+category: finance
+tags: [budget, finance, money, tracking]
+conflicts: []
+
+auth:
+  method: native-oidc
+  sso: true
+  group_access: false
+  group_admin: false
+  access_group: users_actual-budget
+  admin_group: admin_actual-budget
+  notes: OpenID login with auto-register. No native group/role support — all SSO users get equal access.
+
+env:
+  - key: ACTUAL_OIDC_SECRET
+    description: Actual Budget OIDC client secret
+    generate: random
+
+keycloak_clients:
+  - client_id: actual-budget
+    secret_env: ACTUAL_OIDC_SECRET
+    redirect_uri: "https://budget.{{DOMAIN}}/openid/callback"
+    name: Actual Budget
+
+config_files: []
+
+urls:
+  - label: Budget
+    url: "https://budget.{{DOMAIN}}"

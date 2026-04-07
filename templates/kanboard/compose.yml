@@ -1,0 +1,38 @@
+services:
+  kanboard:
+    image: kanboard/kanboard:latest
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost/ -o /dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+    environment:
+      PLUGIN_INSTALLER: "true"
+      REVERSE_PROXY_AUTH: "true"
+      REVERSE_PROXY_USER_HEADER: HTTP_X_FORWARDED_USER
+      REVERSE_PROXY_DEFAULT_ADMIN: admin
+      TRUSTED_PROXY_NETWORKS: "0.0.0.0/0"
+    volumes:
+      - kanboard-data:/var/www/app/data
+      - kanboard-plugins:/var/www/app/plugins
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.kanboard.rule: Host(`kanboard.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.kanboard.entrypoints: websecure
+      traefik.http.routers.kanboard.tls.options: authaware@file
+      traefik.http.routers.kanboard.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.kanboard.loadbalancer.server.port: "80"
+    restart: unless-stopped
+
+volumes:
+  kanboard-data:
+    name: portcullis_kanboard-data
+  kanboard-plugins:
+    name: portcullis_kanboard-plugins
+
+networks:
+  portcullis-proxy:
+    external: true

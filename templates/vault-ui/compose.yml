@@ -1,0 +1,18 @@
+services:
+  vault-ui:
+    image: drakkan/sftpgo:latest  # placeholder — replace with actual app
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.vault-ui.rule: Host(`vault.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.vault-ui.entrypoints: websecure
+      traefik.http.routers.vault-ui.tls.options: protected@file
+      traefik.http.routers.vault-ui.middlewares: client-headers@file,security-headers@file
+      traefik.http.services.vault-ui.loadbalancer.server.port: "8080"
+    restart: unless-stopped
+
+networks:
+  portcullis-proxy:
+    external: true

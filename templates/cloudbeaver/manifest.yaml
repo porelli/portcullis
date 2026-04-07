@@ -1,0 +1,23 @@
+name: CloudBeaver
+description: Web-based database manager — PostgreSQL, MySQL, SQLite and more
+icon: "\U0001F5C3"
+category: devops
+tags: [database, sql, admin, postgresql, mysql]
+conflicts: []
+
+auth:
+  method: forward-auth
+  sso: false
+  group_access: true
+  group_admin: false
+  access_group: users_cloudbeaver
+  admin_group: admin_cloudbeaver
+  notes: No SSO support. Uses its own internal user/role system. Access gated by group-gate middleware.
+
+env: []
+keycloak_clients: []
+config_files: []
+
+urls:
+  - label: Database Manager
+    url: "https://db.{{DOMAIN}}"

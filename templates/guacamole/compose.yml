@@ -1,0 +1,77 @@
+services:
+  guacamole:
+    image: guacamole/guacamole:latest
+    environment:
+      GUACD_HOSTNAME: guacd
+      MYSQL_HOSTNAME: guacamole-db
+      MYSQL_DATABASE: guacamole
+      MYSQL_USER: guacamole
+      MYSQL_PASSWORD: ${GUACAMOLE_DB_PASSWORD:-changeme}
+      OPENID_AUTHORIZATION_ENDPOINT: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis/protocol/openid-connect/auth
+      OPENID_JWKS_ENDPOINT: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis/protocol/openid-connect/certs
+      OPENID_ISSUER: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis
+      OPENID_CLIENT_ID: guacamole
+      OPENID_REDIRECT_URI: https://remote.${PORTCULLIS_DOMAIN:-portcullis.local}
+      HTTP_AUTH_ENABLED: "true"
+      HTTP_AUTH_HEADER: X-Forwarded-User
+    depends_on:
+      guacd:
+        condition: service_started
+      guacamole-db:
+        condition: service_healthy
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.guacamole.rule: Host(`remote.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.guacamole.entrypoints: websecure
+      traefik.http.routers.guacamole.tls.options: authaware@file
+      traefik.http.routers.guacamole.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,guacamole-prefix@docker,security-headers@file
+      traefik.http.middlewares.guacamole-prefix.addprefix.prefix: /guacamole
+      traefik.http.services.guacamole.loadbalancer.server.port: "8080"
+    restart: unless-stopped
+
+  guacamole-init:
+    image: guacamole/guacamole:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Extracting Guacamole schema..."
+        cat /opt/guacamole/extensions/guacamole-auth-jdbc/mysql/schema/001-create-schema.sql /opt/guacamole/extensions/guacamole-auth-jdbc/mysql/schema/002-create-admin-user.sql > /initdb/001-init.sql
+        echo "Schema files ready."
+    volumes:
+      - guacamole-initdb:/initdb
+
+  guacd:
+    image: guacamole/guacd:latest
+
+  guacamole-db:
+    image: mysql:8
+    environment:
+      MYSQL_ROOT_PASSWORD: ${GUACAMOLE_DB_PASSWORD:-changeme}
+      MYSQL_DATABASE: guacamole
+      MYSQL_USER: guacamole
+      MYSQL_PASSWORD: ${GUACAMOLE_DB_PASSWORD:-changeme}
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uguacamole", "-p${GUACAMOLE_DB_PASSWORD:-changeme}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    volumes:
+      - guacamole-db-data:/var/lib/mysql
+      - guacamole-initdb:/docker-entrypoint-initdb.d:ro
+    depends_on:
+      guacamole-init:
+        condition: service_completed_successfully
+
+volumes:
+  guacamole-db-data:
+    name: portcullis_guacamole-db-data
+  guacamole-initdb:
+    name: portcullis_guacamole-initdb
+
+networks:
+  portcullis-proxy:
+    external: true

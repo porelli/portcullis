@@ -1,0 +1,97 @@
+services:
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:release
+    environment:
+      DB_HOSTNAME: immich-db
+      DB_USERNAME: immich
+      DB_PASSWORD: ${IMMICH_DB_PASSWORD:-changeme}
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: immich-redis
+      IMMICH_CONFIG_FILE: /etc/immich/config.json
+      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-bundle-with-staging.crt
+    volumes:
+      - immich-upload:/usr/src/app/upload
+      - immich-config:/etc/immich:ro
+      - ./certs/ca-bundle-with-staging.crt:/etc/ssl/certs/ca-bundle-with-staging.crt:ro
+    depends_on:
+      immich-init:
+        condition: service_completed_successfully
+      immich-db:
+        condition: service_started
+      immich-redis:
+        condition: service_started
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.immich.rule: Host(`photos.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.immich.entrypoints: websecure
+      traefik.http.routers.immich.tls.options: authaware@file
+      traefik.http.routers.immich.middlewares: client-headers@file,security-headers@file
+      traefik.http.services.immich.loadbalancer.server.port: "2283"
+    restart: unless-stopped
+
+  immich-init:
+    image: alpine:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ ! -f /etc/immich/config.json ]; then
+          echo "Generating Immich config..."
+          sed \
+            -e "s|\$${PORTCULLIS_DOMAIN}|${PORTCULLIS_DOMAIN}|g" \
+            -e "s|\$${IMMICH_OIDC_SECRET}|${IMMICH_OIDC_SECRET}|g" \
+            /tmp/config.json.tmpl > /etc/immich/config.json
+          cat /etc/immich/config.json
+        else
+          echo "Config already exists."
+        fi
+    environment:
+      PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
+      IMMICH_OIDC_SECRET: ${IMMICH_OIDC_SECRET:-}
+    volumes:
+      - immich-config:/etc/immich
+      - ./templates/immich/immich-config.json.tmpl:/tmp/config.json.tmpl:ro
+
+  immich-setup:
+    image: alpine:latest
+    entrypoint: ["/bin/sh", "/setup.sh"]
+    environment:
+      IMMICH_ADMIN_PASSWORD: ${IMMICH_DB_PASSWORD:-changeme}
+    volumes:
+      - ./templates/immich/setup.sh:/setup.sh:ro
+    depends_on:
+      - immich-server
+    restart: "no"
+
+  immich-machine-learning:
+    image: ghcr.io/immich-app/immich-machine-learning:release
+    volumes:
+      - immich-ml-cache:/cache
+
+  immich-redis:
+    image: redis:7-alpine
+
+  immich-db:
+    image: tensorchord/pgvecto-rs:pg16-v0.2.0
+    environment:
+      POSTGRES_USER: immich
+      POSTGRES_PASSWORD: ${IMMICH_DB_PASSWORD:-changeme}
+      POSTGRES_DB: immich
+    volumes:
+      - immich-db-data:/var/lib/postgresql/data
+
+volumes:
+  immich-upload:
+    name: portcullis_immich-upload
+  immich-ml-cache:
+    name: portcullis_immich-ml-cache
+  immich-db-data:
+    name: portcullis_immich-db-data
+  immich-config:
+    name: portcullis_immich-config
+
+networks:
+  portcullis-proxy:
+    external: true

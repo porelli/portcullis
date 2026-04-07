@@ -1,0 +1,54 @@
+# Shared middleware definitions.
+# Assign to routers via label: traefik.http.routers.<name>.middlewares=client-headers@file
+#
+# Traefik's passTLSClientCert middleware extracts client cert info and passes
+# it to backends via the X-Forwarded-Tls-Client-Cert-Info header.
+
+http:
+  middlewares:
+    # Passes client certificate details as headers to backends.
+    # Backends receive:
+    #   X-Forwarded-Tls-Client-Cert:      URL-encoded full client cert (PEM)
+    #   X-Forwarded-Tls-Client-Cert-Info: Structured info (subject, issuer, serial, etc.)
+    client-headers:
+      passTLSClientCert:
+        pem: false
+        info:
+          notAfter: true
+          notBefore: true
+          sans: true
+          serialNumber: true
+          subject:
+            commonName: true
+            country: true
+            organization: true
+            organizationalUnit: true
+          issuer:
+            commonName: true
+
+    # Rate limiting for public-facing endpoints (login, enrollment).
+    # Allows 50 requests per second average, burst of 100.
+    rate-limit:
+      rateLimit:
+        average: 50
+        burst: 100
+
+    # Stricter rate limit for auth endpoints (login, token).
+    # Allows 10 requests per second average, burst of 20.
+    rate-limit-auth:
+      rateLimit:
+        average: 10
+        burst: 20
+
+    # Security headers for all responses
+    security-headers:
+      headers:
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        forceSTSHeader: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+        referrerPolicy: "strict-origin-when-cross-origin"
+        customRequestHeaders:
+          X-Forwarded-Proto: https

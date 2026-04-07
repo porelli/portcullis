@@ -1,0 +1,345 @@
+name: portcullis
+
+networks:
+  portcullis:
+    name: portcullis
+  portcullis-proxy:
+    name: portcullis-proxy
+
+services:
+  traefik:
+    image: traefik:v3.6
+    environment:
+      # Static configuration (env vars are the sole config source)
+      TRAEFIK_API_DASHBOARD: "true"
+      TRAEFIK_API_INSECURE: "false"
+      TRAEFIK_LOG_LEVEL: INFO
+      TRAEFIK_ACCESSLOG: "true"
+      # Entrypoints
+      TRAEFIK_ENTRYPOINTS_WEB_ADDRESS: ":80"
+      TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_TO: websecure
+      TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_SCHEME: https
+      TRAEFIK_ENTRYPOINTS_WEBSECURE_ADDRESS: ":443"
+      TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_CERTRESOLVER: letsencrypt
+      TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_DOMAINS_0_MAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
+      TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_DOMAINS_0_SANS: "*.${PORTCULLIS_DOMAIN:-portcullis.local}"
+      # Providers
+      TRAEFIK_PROVIDERS_DOCKER: "true"
+      TRAEFIK_PROVIDERS_DOCKER_EXPOSEDBYDEFAULT: "false"
+      TRAEFIK_PROVIDERS_DOCKER_NETWORK: portcullis-proxy
+      TRAEFIK_PROVIDERS_FILE_DIRECTORY: /etc/traefik/dynamic
+      TRAEFIK_PROVIDERS_FILE_WATCH: "true"
+      # ACME (Let's Encrypt)
+      TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL: ${ACME_EMAIL:-admin@portcullis.local}
+      TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_STORAGE: /acme/acme.json
+      TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_CASERVER: ${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
+      TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_DNSCHALLENGE: "true"
+      TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_DNSCHALLENGE_PROVIDER: ${DNS_PROVIDER:-cloudflare}
+      TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_DNSCHALLENGE_RESOLVERS: 1.1.1.1:53,8.8.8.8:53
+      # DNS provider credentials
+      # Cloudflare
+      CF_API_EMAIL: ${CF_API_EMAIL:-}
+      CF_DNS_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      # Porkbun
+      PORKBUN_API_KEY: ${PORKBUN_API_KEY:-}
+      PORKBUN_SECRET_API_KEY: ${PORKBUN_SECRET_API_KEY:-}
+      # Route53
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_HOSTED_ZONE_ID: ${AWS_HOSTED_ZONE_ID:-}
+      # DigitalOcean
+      DO_AUTH_TOKEN: ${DO_AUTH_TOKEN:-}
+      # Hetzner
+      HETZNER_API_KEY: ${HETZNER_API_KEY:-}
+      # Google Cloud DNS
+      GCE_PROJECT: ${GCE_PROJECT:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/dynamic:/etc/traefik/dynamic:ro
+      - ./certs:/certs:ro
+      - traefik_acme:/acme
+    networks:
+      - portcullis
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.dashboard.rule: Host(`traefik.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.dashboard.entrypoints: websecure
+      traefik.http.routers.dashboard.tls: "true"
+      traefik.http.routers.dashboard.tls.certresolver: letsencrypt
+      traefik.http.routers.dashboard.tls.domains[0].main: ${PORTCULLIS_DOMAIN:-portcullis.local}
+      traefik.http.routers.dashboard.tls.domains[0].sans: "*.${PORTCULLIS_DOMAIN:-portcullis.local}"
+      traefik.http.routers.dashboard.tls.options: authaware@file
+      traefik.http.routers.dashboard.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.routers.dashboard.service: api@internal
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - portcullis
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keycloak"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  vault:
+    image: hashicorp/vault:1.21
+    cap_add:
+      - IPC_LOCK
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_TOKEN:-myroot}
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+      VAULT_ADDR: "http://127.0.0.1:8200"
+    ports:
+      - "8200:8200"
+    volumes:
+      - vault_data:/vault/data
+      - ./scripts:/vault/scripts:ro
+      - ./certs:/vault/certs
+    networks:
+      - portcullis
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  lldap:
+    image: lldap/lldap:stable
+    environment:
+      LLDAP_JWT_SECRET: ${LLDAP_JWT_SECRET:-changeme-jwt-secret}
+      LLDAP_LDAP_USER_PASS: ${LLDAP_ADMIN_PASSWORD:-changeme}
+      LLDAP_LDAP_BASE_DN: ${LLDAP_BASE_DN:-dc=portcullis,dc=local}
+      LLDAP_LDAP_USER_DN: admin
+      LLDAP_LDAP_USER_EMAIL: admin@portcullis.local
+      LLDAP_HTTP_URL: https://directory.${PORTCULLIS_DOMAIN:-portcullis.local}
+    volumes:
+      - lldap_data:/data
+    networks:
+      - portcullis
+    labels:
+      # LLDAP web UI — protected tier
+      traefik.enable: "true"
+      traefik.http.routers.lldap.rule: Host(`directory.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.lldap.entrypoints: websecure
+      traefik.http.routers.lldap.tls.options: authaware@file
+      traefik.http.routers.lldap.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.lldap.loadbalancer.server.port: "17170"
+    healthcheck:
+      test: ["CMD", "/app/lldap", "healthcheck", "--config-file", "/data/lldap_config.toml"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.5
+    command:
+      - start
+      - --import-realm
+      - --http-enabled=true
+      - --http-port=8080
+      - --hostname=https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}
+      - --proxy-headers=xforwarded
+      - --health-enabled=true
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    networks:
+      - portcullis
+    healthcheck:
+      test: ["CMD", "bash", "-c", "{ printf 'HEAD /health/ready HTTP/1.0\\r\\n\\r\\n' >&0; grep 'HTTP/1.0 200'; } 0<>/dev/tcp/localhost/9000"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    labels:
+      traefik.enable: "true"
+      # All routers on auth.<domain> MUST use the same TLS option (Traefik requirement).
+      # Using public@file so users without client certs can authenticate via WebAuthn.
+      # Public OIDC/SAML endpoints — no forward-auth (users need these to log in)
+      traefik.http.routers.keycloak.rule: Host(`auth.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.keycloak.entrypoints: websecure
+      traefik.http.routers.keycloak.tls.options: public@file
+      traefik.http.routers.keycloak.middlewares: rate-limit-auth@file,client-headers@file,security-headers@file
+      traefik.http.routers.keycloak.priority: "1"
+      traefik.http.services.keycloak.loadbalancer.server.port: "8080"
+      # Admin console — protected behind forward-auth + group-gate (lldap_admin)
+      traefik.http.routers.keycloak-admin.rule: Host(`auth.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/admin`)
+      traefik.http.routers.keycloak-admin.entrypoints: websecure
+      traefik.http.routers.keycloak-admin.tls.options: public@file
+      traefik.http.routers.keycloak-admin.middlewares: rate-limit-auth@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.routers.keycloak-admin.priority: "10"
+      traefik.http.routers.keycloak-admin.service: keycloak
+    depends_on:
+      postgres:
+        condition: service_healthy
+      lldap:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+    restart: unless-stopped
+
+  forward-auth:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.9.0
+    extra_hosts:
+      - "auth.${PORTCULLIS_DOMAIN:-portcullis.local}:host-gateway"
+    volumes:
+      - ./certs/ca-bundle-with-staging.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    environment:
+      # OIDC provider
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_OIDC_ISSUER_URL: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis
+      OAUTH2_PROXY_CLIENT_ID: portcullis-forward-auth
+      OAUTH2_PROXY_CLIENT_SECRET: ${FORWARD_AUTH_CLIENT_SECRET:-portcullis-forward-auth-secret}
+      OAUTH2_PROXY_SCOPE: openid email profile groups
+      # Cookie config — shared across all subdomains
+      OAUTH2_PROXY_COOKIE_SECRET: ${FORWARD_AUTH_COOKIE_SECRET:-}
+      OAUTH2_PROXY_COOKIE_DOMAINS: .${PORTCULLIS_DOMAIN:-portcullis.local}
+      OAUTH2_PROXY_COOKIE_SAMESITE: lax
+      # Behaviour
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_SET_XAUTHREQUEST: "true"
+      OAUTH2_PROXY_SET_AUTHORIZATION_HEADER: "false"
+      OAUTH2_PROXY_PASS_USER_HEADERS: "true"
+      OAUTH2_PROXY_WHITELIST_DOMAINS: .${PORTCULLIS_DOMAIN:-portcullis.local}
+      OAUTH2_PROXY_REDIRECT_URL: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/oauth2/callback
+      OAUTH2_PROXY_CODE_CHALLENGE_METHOD: S256
+      OAUTH2_PROXY_UPSTREAMS: static://202
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      OAUTH2_PROXY_OIDC_GROUPS_CLAIM: groups
+      OAUTH2_PROXY_SSL_UPSTREAM_INSECURE_SKIP_VERIFY: "true"
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.forward-auth.loadbalancer.server.port: "4180"
+      # Forward auth middleware — Traefik delegates auth checks here
+      # Uses /oauth2/start which returns 302→Keycloak for unauth'd users
+      # and 202 with user headers for auth'd users (via cookie)
+      traefik.http.middlewares.portcullis-auth.forwardauth.address: http://forward-auth:4180
+      traefik.http.middlewares.portcullis-auth.forwardauth.trustForwardHeader: "true"
+      traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Forwarded-User
+      # OAuth2 callback + sign-in routes on auth subdomain
+      traefik.http.routers.oauth2-callback.rule: Host(`auth.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/oauth2`)
+      traefik.http.routers.oauth2-callback.entrypoints: websecure
+      traefik.http.routers.oauth2-callback.tls.options: public@file
+      traefik.http.routers.oauth2-callback.priority: "1000"
+      traefik.http.routers.oauth2-callback.service: forward-auth
+      # Also handle /oauth2 paths on ANY subdomain (for sign_in redirect)
+      traefik.http.routers.oauth2-all.rule: PathPrefix(`/oauth2/`)
+      traefik.http.routers.oauth2-all.entrypoints: websecure
+      traefik.http.routers.oauth2-all.tls.options: public@file
+      traefik.http.routers.oauth2-all.priority: "900"
+      traefik.http.routers.oauth2-all.service: forward-auth
+    restart: unless-stopped
+    depends_on:
+      keycloak:
+        condition: service_healthy
+
+  group-gate:
+    image: python:3-alpine
+    entrypoint: ["python3", "-u", "/app/group-gate.py"]
+    volumes:
+      - ./scripts/group-gate.py:/app/group-gate.py:ro
+      - ./scripts/group-gate-map.conf:/etc/group-gate/map.conf:ro
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      traefik.http.services.group-gate.loadbalancer.server.port: "8080"
+      traefik.http.middlewares.portcullis-groups.forwardauth.address: http://group-gate:8080
+      traefik.http.middlewares.portcullis-groups.forwardauth.trustForwardHeader: "true"
+      traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Groups,X-Forwarded-User
+    restart: unless-stopped
+
+  hub:
+    image: ghcr.io/porelli/portcullis-hub:latest
+    environment:
+      PROJECT_DIR: /project
+      PROJECT_HOST_DIR: ${PWD:-.}
+      HUB_DATA_DIR: /data
+      PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
+      DEFAULT_TEMPLATES_URL: https://github.com/porelli/portcullis-templates.git
+      PORTAL_DISPLAY_NAME: ${PORTAL_DISPLAY_NAME:-Portcullis}
+      KEYCLOAK_URL: http://keycloak:8080
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      LLDAP_HTTP_URL: http://lldap:17170
+      LLDAP_ADMIN_USER: admin
+      LLDAP_ADMIN_PASSWORD: ${LLDAP_ADMIN_PASSWORD:-changeme}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/project:ro
+      - hub_data:/data
+      - ./.env:/project/.env:rw
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.hub.rule: Host(`hub.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.hub.entrypoints: websecure
+      traefik.http.routers.hub.tls.options: authaware@file
+      traefik.http.routers.hub.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.hub.loadbalancer.server.port: "8888"
+    depends_on:
+      - keycloak
+    restart: unless-stopped
+
+  enroll:
+    build:
+      context: ./enroll
+    environment:
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: ${VAULT_DEV_TOKEN:-myroot}
+      LLDAP_URL: ldap://lldap:3890
+      LLDAP_BASE_DN: ${LLDAP_BASE_DN:-dc=portcullis,dc=local}
+      LLDAP_BIND_DN: uid=admin,ou=people,${LLDAP_BASE_DN:-dc=portcullis,dc=local}
+      LLDAP_BIND_PASSWORD: ${LLDAP_ADMIN_PASSWORD:-changeme}
+      PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.enroll.rule: Host(`enroll.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.enroll.entrypoints: websecure
+      traefik.http.routers.enroll.tls.options: authaware@file
+      traefik.http.routers.enroll.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.enroll.loadbalancer.server.port: "8443"
+    depends_on:
+      vault:
+        condition: service_healthy
+      lldap:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  vault_data:
+  lldap_data:
+  hub_data:
+  traefik_acme:

@@ -1,0 +1,30 @@
+services:
+  adguard:
+    image: adguard/adguardhome:latest
+    ports:
+      - "${HOST_IP:-0.0.0.0}:53:53/tcp"
+      - "${HOST_IP:-0.0.0.0}:53:53/udp"
+    volumes:
+      - adguard-work:/opt/adguardhome/work
+      - adguard-conf:/opt/adguardhome/conf
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.adguard.rule: Host(`adguard.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.adguard.entrypoints: websecure
+      traefik.http.routers.adguard.tls.options: authaware@file
+      traefik.http.routers.adguard.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.adguard.loadbalancer.server.port: "3000"
+    restart: unless-stopped
+
+volumes:
+  adguard-work:
+    name: portcullis_adguard-work
+  adguard-conf:
+    name: portcullis_adguard-conf
+
+networks:
+  portcullis-proxy:
+    external: true

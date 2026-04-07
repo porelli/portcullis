@@ -1,0 +1,35 @@
+services:
+  vaultwarden:
+    image: vaultwarden/server:latest
+    environment:
+      DOMAIN: https://passwords.${PORTCULLIS_DOMAIN:-portcullis.local}
+      ADMIN_TOKEN: ${VAULTWARDEN_ADMIN_TOKEN:-changeme}
+      SIGNUPS_ALLOWED: "false"
+      SSO_ENABLED: "true"
+      SSO_AUTHORITY: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis
+      SSO_CLIENT_ID: vaultwarden
+      SSO_CLIENT_SECRET: ${VAULTWARDEN_OIDC_SECRET:-vaultwarden-oidc-secret}
+      SSO_SIGNUPS_MATCH_EMAIL: "true"
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - vaultwarden-data:/data
+      - ./certs/ca-bundle-with-staging.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.vaultwarden.rule: Host(`passwords.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.vaultwarden.entrypoints: websecure
+      traefik.http.routers.vaultwarden.tls.options: authaware@file
+      traefik.http.routers.vaultwarden.middlewares: client-headers@file,security-headers@file
+      traefik.http.services.vaultwarden.loadbalancer.server.port: "80"
+    restart: unless-stopped
+
+volumes:
+  vaultwarden-data:
+    name: portcullis_vaultwarden-data
+
+networks:
+  portcullis-proxy:
+    external: true

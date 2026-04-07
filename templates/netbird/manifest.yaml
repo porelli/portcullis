@@ -1,0 +1,39 @@
+name: NetBird
+description: Mesh VPN + zero-trust networking with TURN relay
+icon: "\U0001F426"
+category: vpn
+tags: [vpn, wireguard, mesh, zero-trust]
+conflicts: [headscale]
+
+auth:
+  method: native-oidc
+  sso: true
+  group_access: false
+  group_admin: false
+  access_group: users_netbird
+  admin_group: admin_netbird
+  notes: Dashboard uses OIDC. Management API validates JWT audience. No group-based access restriction — all OIDC users can access dashboard.
+
+env:
+  - key: NETBIRD_OIDC_CLIENT_SECRET
+    description: OIDC client secret for NetBird dashboard
+    generate: random
+  - key: COTURN_EXTERNAL_IP
+    description: Public IP for TURN relay (required for NAT traversal)
+    generate: none
+    required: false
+  - key: COTURN_AUTH_SECRET
+    description: Shared secret for TURN authentication
+    generate: random
+
+keycloak_clients:
+  - client_id: netbird-dashboard
+    secret_env: NETBIRD_OIDC_CLIENT_SECRET
+    redirect_uri: "https://netbird.{{DOMAIN}}/*"
+    name: NetBird Dashboard
+
+config_files: []
+
+urls:
+  - label: Dashboard
+    url: "https://netbird.{{DOMAIN}}"

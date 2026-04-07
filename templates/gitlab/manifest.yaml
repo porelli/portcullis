@@ -1,0 +1,35 @@
+name: GitLab
+description: Complete DevOps platform — Git, CI/CD, container registry, issue tracking
+icon: "\U0001F98A"
+category: devops
+tags: [git, ci-cd, devops, registry, issues]
+conflicts: []
+
+auth:
+  method: native-oidc
+  sso: true
+  group_access: false
+  group_admin: false
+  access_group: users_gitea
+  admin_group: admin_gitea
+  notes: Full OIDC with Keycloak. User provisioning and role mapping possible via OIDC claims but not yet configured.
+
+env:
+  - key: GITLAB_ROOT_PASSWORD
+    description: GitLab root password
+    generate: random
+  - key: GITLAB_OIDC_SECRET
+    description: GitLab OIDC client secret
+    generate: random
+
+keycloak_clients:
+  - client_id: gitlab
+    secret_env: GITLAB_OIDC_SECRET
+    redirect_uri: "https://git.{{DOMAIN}}/users/auth/openid_connect/callback"
+    name: GitLab
+
+config_files: []
+
+urls:
+  - label: GitLab
+    url: "https://git.{{DOMAIN}}"

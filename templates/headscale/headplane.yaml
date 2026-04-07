@@ -1,0 +1,8 @@
+headscale:
+  url: http://headscale:8080
+
+oidc:
+  issuer: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis
+  client_id: headplane
+  client_secret: ${HEADPLANE_OIDC_CLIENT_SECRET:-headplane-oidc-secret}
+  redirect_uri: https://vpn-admin.${PORTCULLIS_DOMAIN:-portcullis.local}/admin/oidc/callback

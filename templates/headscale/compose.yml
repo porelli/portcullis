@@ -1,0 +1,90 @@
+services:
+  headscale-init:
+    image: alpine:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ ! -f /etc/headscale/config.yaml ]; then
+          echo "Generating headscale config..."
+          sed \
+            -e "s|PORTCULLIS_DOMAIN_PLACEHOLDER|${PORTCULLIS_DOMAIN}|g" \
+            -e "s|HEADSCALE_OIDC_SECRET_PLACEHOLDER|${HEADSCALE_OIDC_CLIENT_SECRET}|g" \
+            /tmp/config.yaml.tmpl > /etc/headscale/config.yaml
+          echo "Config generated."
+        else
+          echo "Config already exists."
+        fi
+    environment:
+      PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
+      HEADSCALE_OIDC_CLIENT_SECRET: ${HEADSCALE_OIDC_CLIENT_SECRET:-}
+    volumes:
+      - headscale-config:/etc/headscale
+      - ./templates/headscale/config/config.yaml:/tmp/config.yaml.tmpl:ro
+
+  headscale:
+    image: headscale/headscale:latest
+    command: serve
+    environment:
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+    volumes:
+      - headscale-data:/var/lib/headscale
+      - headscale-config:/etc/headscale:ro
+      - ./certs/ca-bundle-with-staging.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    depends_on:
+      headscale-init:
+        condition: service_completed_successfully
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.headscale.rule: Host(`vpn.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.headscale.entrypoints: websecure
+      traefik.http.routers.headscale.tls.options: public@file
+      traefik.http.routers.headscale.middlewares: security-headers@file
+      traefik.http.services.headscale.loadbalancer.server.port: "8080"
+    restart: unless-stopped
+
+  headplane:
+    image: ghcr.io/tale/headplane:latest
+    environment:
+      HEADPLANE_LOAD_ENV_OVERRIDES: "true"
+      HEADPLANE_HEADSCALE__URL: http://headscale:8080
+      HEADPLANE_OIDC__ISSUER: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis
+      HEADPLANE_OIDC__CLIENT_ID: headplane
+      HEADPLANE_OIDC__CLIENT_SECRET: ${HEADPLANE_OIDC_CLIENT_SECRET:-}
+      HEADPLANE_OIDC__HEADSCALE_API_KEY: ${HEADSCALE_API_KEY:-}
+      HEADPLANE_SERVER__COOKIE_SECRET: ${HEADPLANE_COOKIE_SECRET:-changeme-cookie-secret}
+      HEADPLANE_SERVER__BASE_URL: https://vpn-admin.${PORTCULLIS_DOMAIN:-portcullis.local}
+      NODE_EXTRA_CA_CERTS: /etc/ssl/certs/ca-bundle-with-staging.crt
+    volumes:
+      - headplane-data:/var/lib/headplane
+      - ./certs/ca-bundle-with-staging.crt:/etc/ssl/certs/ca-bundle-with-staging.crt:ro
+    depends_on:
+      - headscale
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.headplane.rule: Host(`vpn-admin.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.headplane.entrypoints: websecure
+      traefik.http.routers.headplane.tls.options: authaware@file
+      traefik.http.routers.headplane.middlewares: client-headers@file,headplane-root-redirect@docker,security-headers@file
+      traefik.http.middlewares.headplane-root-redirect.redirectregex.regex: ^https://vpn-admin\.[^/]+/?$$
+      traefik.http.middlewares.headplane-root-redirect.redirectregex.replacement: https://vpn-admin.${PORTCULLIS_DOMAIN:-portcullis.local}/admin
+      traefik.http.middlewares.headplane-root-redirect.redirectregex.permanent: "false"
+      traefik.http.services.headplane.loadbalancer.server.port: "3000"
+    restart: unless-stopped
+
+volumes:
+  headscale-data:
+    name: portcullis_headscale-data
+  headscale-config:
+    name: portcullis_headscale-config
+  headplane-data:
+    name: portcullis_headplane-data
+
+networks:
+  portcullis-proxy:
+    external: true

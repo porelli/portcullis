@@ -1,0 +1,47 @@
+name: Immich
+description: Self-hosted photo and video backup with AI-powered search
+icon: "\U0001F4F7"
+category: media
+tags: [photos, videos, backup, ai, gallery]
+conflicts: []
+
+auth:
+  method: native-oidc
+  sso: true
+  group_access: false
+  group_admin: false
+  access_group: users_immich
+  admin_group: admin_immich
+  notes: Full OIDC with auto-register and auto-launch. Admin must be promoted via API or admin UI. roleClaim available but not yet mapped to groups.
+
+settings:
+  - key: IMMICH_EXTERNAL_PATH
+    label: External photo library
+    description: Host path to existing photos to import (mounted read-only)
+    type: path
+    target:
+      service: immich-server
+      mount: /usr/src/app/external
+
+env:
+  - key: IMMICH_DB_PASSWORD
+    description: Immich database password
+    generate: random
+  - key: IMMICH_OIDC_SECRET
+    description: Immich OIDC client secret
+    generate: random
+
+keycloak_clients:
+  - client_id: immich
+    secret_env: IMMICH_OIDC_SECRET
+    redirect_uris:
+      - "https://photos.{{DOMAIN}}/auth/login"
+      - "https://photos.{{DOMAIN}}/user-settings"
+      - "app.immich:///oauth-callback"
+    name: Immich
+
+config_files: []
+
+urls:
+  - label: Photos
+    url: "https://photos.{{DOMAIN}}"

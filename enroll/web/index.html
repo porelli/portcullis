@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Portcullis</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; line-height: 1.6; }
+    .container { max-width: 900px; margin: 0 auto; padding: 2rem; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 3rem; padding-bottom: 1rem; border-bottom: 1px solid #1e293b; }
+    h1 { font-size: 1.5rem; color: #f1f5f9; }
+    h1 span { color: #3b82f6; }
+    .user-badge { background: #1e293b; padding: 0.5rem 1rem; border-radius: 0.5rem; font-size: 0.875rem; }
+    .user-badge strong { color: #3b82f6; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 1.5rem; }
+    .card { background: #1e293b; border-radius: 0.75rem; padding: 2rem; text-decoration: none; color: #e2e8f0; transition: transform 0.2s, background 0.2s; }
+    .card:hover { transform: translateY(-2px); background: #263548; }
+    .card h2 { font-size: 1.25rem; margin-bottom: 0.5rem; }
+    .card p { color: #94a3b8; font-size: 0.875rem; }
+    .card .icon { font-size: 2rem; margin-bottom: 1rem; }
+    .card .badge { display: inline-block; padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.6875rem; font-weight: 600; margin-top: 0.75rem; }
+    .badge-browser { background: #064e3b; color: #6ee7b7; }
+    .badge-cli { background: #78350f; color: #fcd34d; }
+    .hero { text-align: center; margin-bottom: 3rem; }
+    .hero h2 { font-size: 2rem; color: #f1f5f9; margin-bottom: 0.5rem; }
+    .hero p { color: #94a3b8; font-size: 1.125rem; }
+    .section-title { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; color: #64748b; margin-bottom: 1rem; margin-top: 2rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1><span>&#9906;</span> Portcullis</h1>
+      {{if .User}}
+      <div class="user-badge">Authenticated as <strong>{{.User}}</strong></div>
+      {{else}}
+      <div class="user-badge">Not authenticated</div>
+      {{end}}
+    </header>
+
+    <div class="hero">
+      <h2>YubiKey Enrollment</h2>
+      <p>Register your security key for hardware-backed authentication</p>
+    </div>
+
+    <div class="section-title">Enroll your YubiKey</div>
+    <div class="cards">
+      <a class="card" href="https://auth.{{.Domain}}/realms/portcullis/account/#/security/signingin" target="_blank">
+        <div class="icon">&#128272;</div>
+        <h2>WebAuthn (Browser)</h2>
+        <p>Register your YubiKey for browser-based authentication. No software to install — just tap your key when prompted.</p>
+        <div class="badge badge-browser">Zero install</div>
+      </a>
+
+      <a class="card" href="/users">
+        <div class="icon">&#128274;</div>
+        <h2>mTLS Certificate (Advanced)</h2>
+        <p>Issue a client certificate for mTLS authentication. For API access, CLI tools, and service-to-service auth.</p>
+        <div class="badge badge-cli">Requires ykman CLI</div>
+      </a>
+    </div>
+
+    <div class="section-title">Manage</div>
+    <div class="cards">
+      <a class="card" href="/users">
+        <div class="icon">&#128101;</div>
+        <h2>Users</h2>
+        <p>View directory users and manage certificate enrollment.</p>
+      </a>
+
+      <a class="card" href="/certs">
+        <div class="icon">&#128196;</div>
+        <h2>Certificates</h2>
+        <p>View issued certificates, expiry dates, and revocation status.</p>
+      </a>
+    </div>
+
+    <div class="section-title">Administration</div>
+    <div class="cards">
+      <a class="card" href="https://hub.{{.Domain}}" target="_blank">
+        <div class="icon">&#128230;</div>
+        <h2>App Hub</h2>
+        <p>Browse and enable app templates — VPN, monitoring, wiki, and more.</p>
+      </a>
+
+      <a class="card" href="https://directory.{{.Domain}}" target="_blank">
+        <div class="icon">&#128218;</div>
+        <h2>Directory</h2>
+        <p>Manage users and groups in LLDAP.</p>
+      </a>
+
+      <a class="card" href="https://auth.{{.Domain}}/admin/portcullis/console/" target="_blank">
+        <div class="icon">&#128737;</div>
+        <h2>Identity Provider</h2>
+        <p>Keycloak admin — SAML, OIDC, WebAuthn, auth flows.</p>
+      </a>
+
+      <a class="card" href="https://traefik.{{.Domain}}" target="_blank">
+        <div class="icon">&#128752;</div>
+        <h2>Gateway</h2>
+        <p>Traefik dashboard — routes, services, TLS.</p>
+      </a>
+    </div>
+  </div>
+</body>
+</html>

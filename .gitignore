@@ -1,0 +1,27 @@
+# User config directory (separate git repo — see scripts/init-config.sh)
+config/
+
+# User config symlinks (point into config/)
+.env
+docker-compose.override.yml
+traefik/dynamic/local/
+headscale/config.local.yaml
+
+# Generated / runtime
+certs/
+*.jks
+*.p12
+*.pem
+*.key
+*.crt
+acme.json
+backups/
+.hub/
+!certs/.gitkeep
+!traefik/dynamic/local/.gitkeep
+
+# Playwright test artifacts
+.playwright-mcp/
+
+# OS
+.DS_Store

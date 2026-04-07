@@ -1,0 +1,27 @@
+services:
+  cloudbeaver:
+    image: dbeaver/cloudbeaver:latest
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    volumes:
+      - cloudbeaver-data:/opt/cloudbeaver/workspace
+      - ./templates/cloudbeaver/cloudbeaver-runtime.conf:/opt/cloudbeaver/workspace/GlobalConfiguration/.cloudbeaver.runtime.conf:ro
+      - ./templates/cloudbeaver/entrypoint.sh:/entrypoint.sh:ro
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.cloudbeaver.rule: Host(`db.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.cloudbeaver.entrypoints: websecure
+      traefik.http.routers.cloudbeaver.tls.options: authaware@file
+      traefik.http.routers.cloudbeaver.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.cloudbeaver.loadbalancer.server.port: "8978"
+    restart: unless-stopped
+
+volumes:
+  cloudbeaver-data:
+    name: portcullis_cloudbeaver-data
+
+networks:
+  portcullis-proxy:
+    external: true

@@ -1,0 +1,33 @@
+services:
+  pihole:
+    image: pihole/pihole:latest
+    environment:
+      WEBPASSWORD: ${PIHOLE_WEBPASSWORD:-changeme}
+      VIRTUAL_HOST: pihole.${PORTCULLIS_DOMAIN:-portcullis.local}
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"
+    volumes:
+      - pihole-data:/etc/pihole
+      - pihole-dnsmasq:/etc/dnsmasq.d
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.pihole.rule: Host(`pihole.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.pihole.entrypoints: websecure
+      traefik.http.routers.pihole.tls.options: authaware@file
+      traefik.http.routers.pihole.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.pihole.loadbalancer.server.port: "80"
+    restart: unless-stopped
+
+volumes:
+  pihole-data:
+    name: portcullis_pihole-data
+  pihole-dnsmasq:
+    name: portcullis_pihole-dnsmasq
+
+networks:
+  portcullis-proxy:
+    external: true

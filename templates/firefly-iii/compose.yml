@@ -1,0 +1,50 @@
+services:
+  firefly-iii:
+    image: fireflyiii/core:latest
+    environment:
+      APP_KEY: ${FIREFLY_APP_KEY:-changeme-32-characters-exactly!!}
+      DB_CONNECTION: pgsql
+      DB_HOST: firefly-db
+      DB_PORT: "5432"
+      DB_DATABASE: firefly
+      DB_USERNAME: firefly
+      DB_PASSWORD: ${FIREFLY_DB_PASSWORD:-changeme}
+      APP_URL: https://finance.${PORTCULLIS_DOMAIN:-portcullis.local}
+      TRUSTED_PROXIES: "**"
+      AUTHENTICATION_GUARD: remote_user_guard
+      AUTHENTICATION_GUARD_HEADER: HTTP_X_FORWARDED_USER
+      AUTHENTICATION_GUARD_EMAIL: HTTP_X_FORWARDED_USER
+    depends_on:
+      - firefly-db
+    volumes:
+      - firefly-upload:/var/www/html/storage/upload
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.firefly.rule: Host(`finance.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.firefly.entrypoints: websecure
+      traefik.http.routers.firefly.tls.options: authaware@file
+      traefik.http.routers.firefly.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.firefly.loadbalancer.server.port: "8080"
+    restart: unless-stopped
+
+  firefly-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: firefly
+      POSTGRES_USER: firefly
+      POSTGRES_PASSWORD: ${FIREFLY_DB_PASSWORD:-changeme}
+    volumes:
+      - firefly-db-data:/var/lib/postgresql/data
+
+volumes:
+  firefly-upload:
+    name: portcullis_firefly-upload
+  firefly-db-data:
+    name: portcullis_firefly-db-data
+
+networks:
+  portcullis-proxy:
+    external: true

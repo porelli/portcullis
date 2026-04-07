@@ -1,0 +1,60 @@
+name: Jellyfin
+description: Free and open-source media server — movies, TV, music, live TV
+icon: "\U0001F4FA"
+category: media
+tags: [media, movies, tv, music, streaming, opensource]
+conflicts: []
+
+auth:
+  method: native-oidc
+  sso: true
+  group_access: true
+  group_admin: true
+  access_group: users_jellyfin
+  admin_group: admin_jellyfin
+  notes: SSO-Auth plugin with group enforcement. Users must be in access_group to log in. Members of admin_group get Jellyfin admin. Configured automatically by setup sidecar.
+
+settings:
+  - key: JELLYFIN_MOVIES_PATH
+    label: Movies folder
+    description: Host path to your movies library
+    type: path
+    target:
+      service: jellyfin
+      mount: /data/movies
+  - key: JELLYFIN_TV_PATH
+    label: TV Shows folder
+    description: Host path to your TV shows library
+    type: path
+    target:
+      service: jellyfin
+      mount: /data/tv
+  - key: JELLYFIN_MUSIC_PATH
+    label: Music folder
+    description: Host path to your music library
+    type: path
+    target:
+      service: jellyfin
+      mount: /data/music
+
+env:
+  - key: JELLYFIN_ADMIN_PASSWORD
+    description: Jellyfin admin password
+    generate: random
+  - key: JELLYFIN_OIDC_SECRET
+    description: Jellyfin OIDC client secret
+    generate: random
+
+keycloak_clients:
+  - client_id: jellyfin
+    secret_env: JELLYFIN_OIDC_SECRET
+    redirect_uris:
+      - "https://media.{{DOMAIN}}/sso/OID/redirect/keycloak"
+      - "http://media.{{DOMAIN}}/sso/OID/redirect/keycloak"
+    name: Jellyfin
+
+config_files: []
+
+urls:
+  - label: Jellyfin
+    url: "https://media.{{DOMAIN}}"

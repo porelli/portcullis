@@ -1,0 +1,30 @@
+services:
+  scrutiny:
+    image: ghcr.io/analogj/scrutiny:master-omnibus
+    privileged: true
+    volumes:
+      - scrutiny-config:/opt/scrutiny/config
+      - scrutiny-db:/opt/scrutiny/influxdb
+      - /run/udev:/run/udev:ro
+      - /dev:/dev:ro
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.scrutiny.rule: Host(`disks.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.scrutiny.entrypoints: websecure
+      traefik.http.routers.scrutiny.tls.options: authaware@file
+      traefik.http.routers.scrutiny.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.scrutiny.loadbalancer.server.port: "8080"
+    restart: unless-stopped
+
+volumes:
+  scrutiny-config:
+    name: portcullis_scrutiny-config
+  scrutiny-db:
+    name: portcullis_scrutiny-db
+
+networks:
+  portcullis-proxy:
+    external: true

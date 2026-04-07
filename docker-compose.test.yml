@@ -1,0 +1,30 @@
+services:
+  # Public app — no auth, tests DNS + TLS cert
+  whoami-public:
+    image: traefik/whoami
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.whoami-public.rule: Host(`test.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.whoami-public.entrypoints: websecure
+      traefik.http.routers.whoami-public.tls.options: public@file
+      traefik.http.routers.whoami-public.middlewares: security-headers@file
+      traefik.http.services.whoami-public.loadbalancer.server.port: "80"
+
+  # Protected app — forward-auth (OIDC/non-SAML), tests auth flow
+  whoami-auth:
+    image: traefik/whoami
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.whoami-auth.rule: Host(`app.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.whoami-auth.entrypoints: websecure
+      traefik.http.routers.whoami-auth.tls.options: authaware@file
+      traefik.http.routers.whoami-auth.middlewares: client-headers@file,portcullis-auth@docker,security-headers@file
+      traefik.http.services.whoami-auth.loadbalancer.server.port: "80"
+
+networks:
+  portcullis:
+    external: true

@@ -1,0 +1,47 @@
+services:
+  jellyfin:
+    image: jellyfin/jellyfin:latest
+    environment:
+      JELLYFIN_ADMIN_PASSWORD: ${JELLYFIN_ADMIN_PASSWORD:-changeme}
+      ASPNETCORE_FORWARDEDHEADERS_ENABLED: "true"
+    volumes:
+      - jellyfin-config:/config
+      - jellyfin-cache:/cache
+      - ./certs/ca-bundle-with-staging.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.jellyfin.rule: Host(`media.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.jellyfin.entrypoints: websecure
+      traefik.http.routers.jellyfin.tls.options: authaware@file
+      traefik.http.routers.jellyfin.middlewares: client-headers@file,security-headers@file
+      traefik.http.services.jellyfin.loadbalancer.server.port: "8096"
+    restart: unless-stopped
+
+  jellyfin-setup:
+    image: python:3-alpine
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        pip install --quiet requests && python3 /setup.py
+    environment:
+      JELLYFIN_ADMIN_PASSWORD: ${JELLYFIN_ADMIN_PASSWORD:-changeme}
+      JELLYFIN_OIDC_SECRET: ${JELLYFIN_OIDC_SECRET:-}
+      PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
+    volumes:
+      - ./templates/jellyfin/setup.py:/setup.py:ro
+    depends_on:
+      - jellyfin
+    restart: "no"
+
+volumes:
+  jellyfin-config:
+    name: portcullis_jellyfin-config
+  jellyfin-cache:
+    name: portcullis_jellyfin-cache
+
+networks:
+  portcullis-proxy:
+    external: true

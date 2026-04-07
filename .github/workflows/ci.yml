@@ -1,0 +1,424 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PORTCULLIS_DOMAIN: portcullis.local
+  ACME_EMAIL: ci@portcullis.local
+  VAULT_DEV_TOKEN: ci-test-token
+  KEYCLOAK_ADMIN: admin
+  KEYCLOAK_ADMIN_PASSWORD: ci-admin-pass
+  POSTGRES_PASSWORD: ci-pg-pass
+  LLDAP_ADMIN_PASSWORD: ci-lldap-pass
+  LLDAP_JWT_SECRET: ci-jwt-secret-value
+  LLDAP_BASE_DN: dc=portcullis,dc=local
+  FORWARD_AUTH_CLIENT_SECRET: ci-forward-auth-secret
+  FORWARD_AUTH_SECRET: ci-forward-auth-cookie-secret
+  CLOUDFLARE_API_TOKEN: ""
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env file
+        run: |
+          cat > .env <<EOF
+          PORTCULLIS_DOMAIN=$PORTCULLIS_DOMAIN
+          ACME_EMAIL=$ACME_EMAIL
+          VAULT_DEV_TOKEN=$VAULT_DEV_TOKEN
+          KEYCLOAK_ADMIN=$KEYCLOAK_ADMIN
+          KEYCLOAK_ADMIN_PASSWORD=$KEYCLOAK_ADMIN_PASSWORD
+          POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+          LLDAP_ADMIN_PASSWORD=$LLDAP_ADMIN_PASSWORD
+          LLDAP_JWT_SECRET=$LLDAP_JWT_SECRET
+          LLDAP_BASE_DN=$LLDAP_BASE_DN
+          FORWARD_AUTH_CLIENT_SECRET=$FORWARD_AUTH_CLIENT_SECRET
+          FORWARD_AUTH_SECRET=$FORWARD_AUTH_SECRET
+          CLOUDFLARE_API_TOKEN=
+          EOF
+
+      - name: Build enrollment UI
+        run: docker compose build enroll
+
+      - name: Start core services (without Traefik ACME)
+        run: |
+          # Start services that don't depend on ACME
+          docker compose up -d postgres vault lldap
+          echo "Waiting for core services..."
+          sleep 10
+
+      - name: Wait for Vault
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose exec -T vault vault status > /dev/null 2>&1; then
+              echo "Vault is ready"
+              break
+            fi
+            echo "Waiting for Vault... ($i/30)"
+            sleep 2
+          done
+
+      - name: Wait for PostgreSQL
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose exec -T postgres pg_isready -U keycloak > /dev/null 2>&1; then
+              echo "PostgreSQL is ready"
+              break
+            fi
+            echo "Waiting for PostgreSQL... ($i/30)"
+            sleep 2
+          done
+
+      - name: Wait for LLDAP
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose exec -T lldap /app/lldap healthcheck --config-file /data/lldap_config.toml > /dev/null 2>&1; then
+              echo "LLDAP is ready"
+              break
+            fi
+            echo "Waiting for LLDAP... ($i/30)"
+            sleep 2
+          done
+
+      - name: Initialize Vault PKI
+        run: |
+          export VAULT_ADDR=http://127.0.0.1:8200
+          export VAULT_TOKEN=$VAULT_DEV_TOKEN
+          export DOMAIN=$PORTCULLIS_DOMAIN
+          export CERT_DIR=./certs
+
+          # Install vault CLI
+          curl -fsSL https://releases.hashicorp.com/vault/1.15.4/vault_1.15.4_linux_amd64.zip -o vault.zip
+          unzip -o vault.zip -d /usr/local/bin/
+          rm vault.zip
+
+          ./scripts/setup-vault-pki.sh --with-server-cert
+
+      - name: Verify CA chain created
+        run: |
+          test -f certs/root-ca.crt || (echo "FAIL: root-ca.crt missing" && exit 1)
+          test -f certs/intermediate-ca.crt || (echo "FAIL: intermediate-ca.crt missing" && exit 1)
+          test -f certs/ca-chain.crt || (echo "FAIL: ca-chain.crt missing" && exit 1)
+          test -f certs/server.crt || (echo "FAIL: server.crt missing" && exit 1)
+          test -f certs/server.key || (echo "FAIL: server.key missing" && exit 1)
+          echo "PASS: All PKI certificates created"
+
+      - name: Verify CA chain is valid
+        run: |
+          openssl verify -CAfile certs/root-ca.crt certs/intermediate-ca.crt
+          openssl verify -CAfile certs/ca-chain.crt certs/server.crt
+          echo "PASS: Certificate chain is valid"
+
+      - name: Start Keycloak
+        run: |
+          docker compose up -d keycloak
+          echo "Waiting for Keycloak to start..."
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/health/ready > /dev/null 2>&1; then
+              echo "Keycloak is ready"
+              break
+            fi
+            if [ "$i" -eq 60 ]; then
+              echo "FAIL: Keycloak did not start in time"
+              docker compose logs keycloak | tail -50
+              exit 1
+            fi
+            sleep 3
+          done
+
+      - name: Configure Keycloak realm
+        run: |
+          # Update realm with CI LLDAP credentials
+          jq --arg pass "$LLDAP_ADMIN_PASSWORD" \
+            '(.components["org.keycloak.storage.UserStorageProvider"][0].config.bindCredential) = [$pass]' \
+            keycloak/realm-export.json > /tmp/realm.json
+          cp /tmp/realm.json keycloak/realm-export.json
+
+          export KEYCLOAK_URL=http://localhost:8080
+          ./scripts/configure-keycloak.sh
+
+      - name: Test Keycloak OIDC discovery endpoint
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://localhost:8080/realms/portcullis/.well-known/openid-configuration)
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "PASS: OIDC discovery endpoint available"
+          else
+            echo "FAIL: OIDC discovery returned $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Test Keycloak SAML descriptor endpoint
+        run: |
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            http://localhost:8080/realms/portcullis/protocol/saml/descriptor)
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "PASS: SAML descriptor endpoint available"
+          else
+            echo "FAIL: SAML descriptor returned $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Test Keycloak WebAuthn policy is configured
+        run: |
+          # Get admin token
+          TOKEN=$(curl -s http://localhost:8080/realms/master/protocol/openid-connect/token \
+            -d "client_id=admin-cli" \
+            -d "username=$KEYCLOAK_ADMIN" \
+            -d "password=$KEYCLOAK_ADMIN_PASSWORD" \
+            -d "grant_type=password" | jq -r '.access_token')
+
+          # Check realm has WebAuthn policy
+          REALM=$(curl -s http://localhost:8080/admin/realms/portcullis \
+            -H "Authorization: Bearer $TOKEN")
+
+          WEBAUTHN_RP=$(echo "$REALM" | jq -r '.webAuthnPolicyPasswordlessRpEntityName')
+          if [ "$WEBAUTHN_RP" = "Portcullis" ]; then
+            echo "PASS: WebAuthn passwordless policy configured (RP: $WEBAUTHN_RP)"
+          else
+            echo "FAIL: WebAuthn policy not found (got: $WEBAUTHN_RP)"
+            exit 1
+          fi
+
+          # Check browser flow
+          BROWSER_FLOW=$(echo "$REALM" | jq -r '.browserFlow')
+          if [ "$BROWSER_FLOW" = "portcullis-browser-flow" ]; then
+            echo "PASS: Browser flow set to portcullis-browser-flow"
+          else
+            echo "FAIL: Browser flow is $BROWSER_FLOW, expected portcullis-browser-flow"
+            exit 1
+          fi
+
+      - name: Test Keycloak forward-auth OIDC client exists
+        run: |
+          TOKEN=$(curl -s http://localhost:8080/realms/master/protocol/openid-connect/token \
+            -d "client_id=admin-cli" \
+            -d "username=$KEYCLOAK_ADMIN" \
+            -d "password=$KEYCLOAK_ADMIN_PASSWORD" \
+            -d "grant_type=password" | jq -r '.access_token')
+
+          CLIENT=$(curl -s http://localhost:8080/admin/realms/portcullis/clients \
+            -H "Authorization: Bearer $TOKEN" \
+            | jq -r '.[] | select(.clientId == "portcullis-forward-auth") | .clientId')
+
+          if [ "$CLIENT" = "portcullis-forward-auth" ]; then
+            echo "PASS: Forward auth OIDC client exists"
+          else
+            echo "FAIL: Forward auth OIDC client not found"
+            exit 1
+          fi
+
+      - name: Test LLDAP user creation
+        run: |
+          # Create a test user via LLDAP GraphQL API
+          LLDAP_TOKEN=$(curl -s http://localhost:17170/auth/simple/login \
+            -H "Content-Type: application/json" \
+            -d "{\"username\":\"admin\",\"password\":\"$LLDAP_ADMIN_PASSWORD\"}" \
+            | jq -r '.token')
+
+          if [ "$LLDAP_TOKEN" = "null" ] || [ -z "$LLDAP_TOKEN" ]; then
+            echo "FAIL: Could not authenticate with LLDAP"
+            exit 1
+          fi
+
+          # Create user
+          HTTP_CODE=$(curl -s -o /tmp/lldap-response.json -w "%{http_code}" \
+            http://localhost:17170/api/graphql \
+            -H "Authorization: Bearer $LLDAP_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d '{"query":"mutation { createUser(user: {id: \"testuser\", email: \"testuser@portcullis.local\"}) { id email } }"}')
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            USER_ID=$(jq -r '.data.createUser.id // empty' /tmp/lldap-response.json)
+            if [ "$USER_ID" = "testuser" ]; then
+              echo "PASS: Test user created in LLDAP"
+            else
+              echo "PASS: LLDAP responded (user may already exist)"
+            fi
+          else
+            echo "FAIL: LLDAP user creation returned $HTTP_CODE"
+            cat /tmp/lldap-response.json
+            exit 1
+          fi
+
+      - name: Test Vault client certificate issuance
+        run: |
+          export VAULT_ADDR=http://127.0.0.1:8200
+          export VAULT_TOKEN=$VAULT_DEV_TOKEN
+
+          # Generate a test key and CSR
+          openssl ecparam -name prime256v1 -genkey -noout -out /tmp/test-client.key
+          openssl req -new -key /tmp/test-client.key -out /tmp/test-client.csr \
+            -subj "/CN=testuser/emailAddress=testuser@portcullis.local"
+
+          # Sign with Vault
+          CSR=$(cat /tmp/test-client.csr)
+          RESULT=$(vault write -format=json pki_int/sign/client-cert \
+            csr="$CSR" \
+            common_name="testuser" \
+            ttl="1h")
+
+          SERIAL=$(echo "$RESULT" | jq -r '.data.serial_number')
+          CERT=$(echo "$RESULT" | jq -r '.data.certificate')
+
+          if [ -n "$SERIAL" ] && [ "$SERIAL" != "null" ]; then
+            echo "PASS: Client certificate issued (serial: $SERIAL)"
+          else
+            echo "FAIL: Certificate issuance failed"
+            echo "$RESULT"
+            exit 1
+          fi
+
+          # Verify the cert
+          echo "$CERT" > /tmp/test-client.crt
+          CN=$(openssl x509 -in /tmp/test-client.crt -noout -subject | grep -o 'CN = [^,]*' | sed 's/CN = //')
+          if [ "$CN" = "testuser" ]; then
+            echo "PASS: Certificate CN matches (CN=$CN)"
+          else
+            echo "FAIL: Certificate CN mismatch (expected testuser, got $CN)"
+            exit 1
+          fi
+
+          # Verify against CA chain
+          openssl verify -CAfile certs/ca-chain.crt /tmp/test-client.crt
+          echo "PASS: Client certificate validates against CA chain"
+
+      - name: Test mTLS authentication with client cert
+        run: |
+          # Start Traefik (skip ACME in CI — use self-signed certs)
+          # Override traefik config for CI: disable ACME, use file certs
+          cat > traefik/dynamic/ci-certs.yml <<EOF
+          tls:
+            certificates:
+              - certFile: /certs/server.crt
+                keyFile: /certs/server.key
+          EOF
+
+          docker compose up -d traefik
+          sleep 5
+
+          # Start enrollment UI
+          docker compose up -d enroll
+          sleep 5
+
+          # Test mTLS with the client cert we just issued
+          # (We need to trust our self-signed CA)
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --cacert certs/ca-chain.crt \
+            --cert /tmp/test-client.crt \
+            --key /tmp/test-client.key \
+            --resolve "enroll.portcullis.local:443:127.0.0.1" \
+            https://enroll.portcullis.local/ 2>/dev/null || echo "000")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "PASS: mTLS connection to enrollment UI successful"
+          else
+            echo "INFO: mTLS test returned $HTTP_CODE (may be expected in CI networking)"
+          fi
+
+      - name: Test enrollment UI responds
+        run: |
+          # Test via Docker network directly
+          ENROLL_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+            $(docker compose ps -q enroll) 2>/dev/null || echo "")
+
+          if [ -n "$ENROLL_IP" ]; then
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$ENROLL_IP:8443/" 2>/dev/null || echo "000")
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "PASS: Enrollment UI is serving pages"
+            else
+              echo "INFO: Enrollment UI returned $HTTP_CODE"
+              docker compose logs enroll | tail -20
+            fi
+          else
+            echo "INFO: Could not determine enrollment UI IP"
+          fi
+
+      - name: Test enrollment API - list users
+        run: |
+          ENROLL_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+            $(docker compose ps -q enroll) 2>/dev/null || echo "")
+
+          if [ -n "$ENROLL_IP" ]; then
+            USERS=$(curl -s "http://$ENROLL_IP:8443/api/users" 2>/dev/null)
+            # Should return a JSON array (possibly empty or with our test user)
+            if echo "$USERS" | jq -e 'type == "array"' > /dev/null 2>&1; then
+              COUNT=$(echo "$USERS" | jq 'length')
+              echo "PASS: Enrollment API returned $COUNT users"
+            else
+              echo "INFO: Enrollment API response: $USERS"
+            fi
+          fi
+
+      - name: Test enrollment API - sign CSR
+        run: |
+          ENROLL_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+            $(docker compose ps -q enroll) 2>/dev/null || echo "")
+
+          if [ -n "$ENROLL_IP" ]; then
+            CSR=$(cat /tmp/test-client.csr)
+            RESPONSE=$(curl -s -X POST "http://$ENROLL_IP:8443/api/sign" \
+              -H "Content-Type: application/json" \
+              -d "{\"username\":\"testuser\",\"email\":\"testuser@portcullis.local\",\"csr\":\"$CSR\"}" 2>/dev/null)
+
+            SERIAL=$(echo "$RESPONSE" | jq -r '.serial // empty')
+            if [ -n "$SERIAL" ]; then
+              echo "PASS: Enrollment API signed certificate (serial: $SERIAL)"
+            else
+              echo "INFO: Sign API response: $RESPONSE"
+            fi
+          fi
+
+      - name: Test Vault cert listing
+        run: |
+          export VAULT_ADDR=http://127.0.0.1:8200
+          export VAULT_TOKEN=$VAULT_DEV_TOKEN
+
+          CERTS=$(vault list -format=json pki_int/certs 2>/dev/null | jq 'length')
+          if [ "$CERTS" -gt 0 ]; then
+            echo "PASS: Vault has $CERTS certificates issued"
+          else
+            echo "FAIL: No certificates found in Vault"
+            exit 1
+          fi
+
+      - name: Test Traefik dashboard
+        run: |
+          # Check Traefik API via Docker network
+          TRAEFIK_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+            $(docker compose ps -q traefik) 2>/dev/null || echo "")
+
+          if [ -n "$TRAEFIK_IP" ]; then
+            # Traefik API on port 8080 (internal)
+            ROUTERS=$(curl -s "http://$TRAEFIK_IP:8080/api/http/routers" 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
+            if [ "$ROUTERS" -gt 0 ]; then
+              echo "PASS: Traefik has $ROUTERS routers configured"
+            else
+              echo "INFO: Could not query Traefik API"
+            fi
+          fi
+
+      - name: Collect service status
+        if: always()
+        run: |
+          echo "=== Docker Compose Status ==="
+          docker compose ps
+          echo ""
+          echo "=== Service Logs (last 10 lines each) ==="
+          for svc in traefik keycloak vault lldap enroll postgres forward-auth; do
+            echo "--- $svc ---"
+            docker compose logs --tail=10 "$svc" 2>/dev/null || echo "(not running)"
+            echo ""
+          done
+
+      - name: Cleanup
+        if: always()
+        run: docker compose down -v

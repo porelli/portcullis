@@ -1,0 +1,292 @@
+name: App Auth Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PORTCULLIS_DOMAIN: portcullis.local
+  ACME_EMAIL: ci@portcullis.local
+  VAULT_DEV_TOKEN: ci-test-token
+  KEYCLOAK_ADMIN: admin
+  KEYCLOAK_ADMIN_PASSWORD: ci-admin-pass
+  POSTGRES_PASSWORD: ci-pg-pass
+  LLDAP_ADMIN_PASSWORD: ci-lldap-pass
+  LLDAP_JWT_SECRET: ci-jwt-secret-value
+  LLDAP_BASE_DN: dc=portcullis,dc=local
+  FORWARD_AUTH_CLIENT_SECRET: ci-forward-auth-secret
+  FORWARD_AUTH_COOKIE_SECRET: Y2ktY29va2llLXNlY3JldC0zMi1ieXRlcw==
+  CLOUDFLARE_API_TOKEN: ""
+  # App secrets (auto-generated in CI)
+  JELLYFIN_ADMIN_PASSWORD: ci-jellyfin-pass
+  JELLYFIN_OIDC_SECRET: ci-jellyfin-oidc
+  IMMICH_DB_PASSWORD: ci-immich-db-pass
+  IMMICH_OIDC_SECRET: ci-immich-oidc
+  VAULTWARDEN_ADMIN_TOKEN: ci-vw-admin-token
+  VAULTWARDEN_OIDC_SECRET: ci-vw-oidc
+  ACTUAL_OIDC_SECRET: ci-actual-oidc
+  GUACAMOLE_DB_PASSWORD: ci-guacamole-db
+  HEADSCALE_OIDC_CLIENT_SECRET: ci-headscale-oidc
+  HEADPLANE_OIDC_CLIENT_SECRET: ci-headplane-oidc
+  HEADPLANE_COOKIE_SECRET: ci-headplane-cookie-secr
+  NETBIRD_OIDC_CLIENT_SECRET: ci-netbird-oidc
+  COTURN_AUTH_SECRET: ci-coturn-secret
+  FIREFLY_APP_KEY: ci-firefly-app-key-32chars000000
+  FIREFLY_DB_PASSWORD: ci-firefly-db
+  WIKI_DB_PASSWORD: ci-wiki-db
+  PIHOLE_WEBPASSWORD: ci-pihole-pass
+  LITELLM_MASTER_KEY: ci-litellm-key
+  LITELLM_OIDC_SECRET: ci-litellm-oidc
+  GITLAB_ROOT_PASSWORD: ci-gitlab-root-pass00
+  GITLAB_OIDC_SECRET: ci-gitlab-oidc
+  NEXTCLOUD_ADMIN_PASSWORD: ci-nextcloud-pass
+
+jobs:
+  app-auth-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Bootstrap infrastructure ───────────────────────
+      - name: Create .env file
+        run: |
+          cat > .env << 'ENVEOF'
+          PORTCULLIS_DOMAIN=portcullis.local
+          ACME_EMAIL=ci@portcullis.local
+          VAULT_DEV_TOKEN=ci-test-token
+          KEYCLOAK_ADMIN=admin
+          KEYCLOAK_ADMIN_PASSWORD=ci-admin-pass
+          POSTGRES_PASSWORD=ci-pg-pass
+          LLDAP_ADMIN_PASSWORD=ci-lldap-pass
+          LLDAP_JWT_SECRET=ci-jwt-secret-value
+          LLDAP_BASE_DN=dc=portcullis,dc=local
+          FORWARD_AUTH_CLIENT_SECRET=ci-forward-auth-secret
+          FORWARD_AUTH_COOKIE_SECRET=Y2ktY29va2llLXNlY3JldC0zMi1ieXRlcw==
+          CLOUDFLARE_API_TOKEN=
+          JELLYFIN_ADMIN_PASSWORD=ci-jellyfin-pass
+          JELLYFIN_OIDC_SECRET=ci-jellyfin-oidc
+          IMMICH_DB_PASSWORD=ci-immich-db-pass
+          IMMICH_OIDC_SECRET=ci-immich-oidc
+          VAULTWARDEN_ADMIN_TOKEN=ci-vw-admin-token
+          VAULTWARDEN_OIDC_SECRET=ci-vw-oidc
+          ACTUAL_OIDC_SECRET=ci-actual-oidc
+          GUACAMOLE_DB_PASSWORD=ci-guacamole-db
+          HEADSCALE_OIDC_CLIENT_SECRET=ci-headscale-oidc
+          HEADPLANE_OIDC_CLIENT_SECRET=ci-headplane-oidc
+          HEADPLANE_COOKIE_SECRET=ci-headplane-cookie-secr
+          NETBIRD_OIDC_CLIENT_SECRET=ci-netbird-oidc
+          COTURN_AUTH_SECRET=ci-coturn-secret
+          FIREFLY_APP_KEY=ci-firefly-app-key-32chars000000
+          FIREFLY_DB_PASSWORD=ci-firefly-db
+          WIKI_DB_PASSWORD=ci-wiki-db
+          PIHOLE_WEBPASSWORD=ci-pihole-pass
+          LITELLM_MASTER_KEY=ci-litellm-key
+          LITELLM_OIDC_SECRET=ci-litellm-oidc
+          GITLAB_ROOT_PASSWORD=ci-gitlab-root-pass00
+          GITLAB_OIDC_SECRET=ci-gitlab-oidc
+          NEXTCLOUD_ADMIN_PASSWORD=ci-nextcloud-pass
+          ENVEOF
+
+      - name: Start core services
+        run: |
+          docker compose up -d postgres vault lldap
+          echo "Waiting for core services..."
+          sleep 10
+
+      - name: Wait for Vault
+        run: |
+          for i in $(seq 1 30); do
+            docker compose exec -T vault vault status > /dev/null 2>&1 && break
+            sleep 2
+          done
+
+      - name: Wait for PostgreSQL
+        run: |
+          for i in $(seq 1 30); do
+            docker compose exec -T postgres pg_isready -U keycloak > /dev/null 2>&1 && break
+            sleep 2
+          done
+
+      - name: Wait for LLDAP
+        run: |
+          for i in $(seq 1 30); do
+            docker compose exec -T lldap /app/lldap healthcheck --config-file /data/lldap_config.toml > /dev/null 2>&1 && break
+            sleep 2
+          done
+
+      - name: Initialize Vault PKI
+        run: |
+          export VAULT_ADDR=http://127.0.0.1:8200
+          export VAULT_TOKEN=$VAULT_DEV_TOKEN
+          export DOMAIN=$PORTCULLIS_DOMAIN
+          export CERT_DIR=./certs
+          curl -fsSL https://releases.hashicorp.com/vault/1.15.4/vault_1.15.4_linux_amd64.zip -o vault.zip
+          unzip -o vault.zip -d /usr/local/bin/
+          rm vault.zip
+          ./scripts/setup-vault-pki.sh --with-server-cert
+
+      - name: Create CI TLS config for Traefik
+        run: |
+          cat > traefik/dynamic/ci-certs.yml << 'EOF'
+          tls:
+            certificates:
+              - certFile: /certs/server.crt
+                keyFile: /certs/server.key
+          EOF
+          # Also create a staging CA bundle from our self-signed CA
+          cp certs/ca-chain.crt certs/ca-bundle-with-staging.crt
+
+      - name: Start Keycloak
+        run: |
+          docker compose up -d keycloak
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8080/health/ready > /dev/null 2>&1 && break
+            [ "$i" -eq 60 ] && { docker compose logs keycloak | tail -30; exit 1; }
+            sleep 3
+          done
+          echo "Keycloak ready"
+
+      - name: Configure Keycloak realm
+        run: |
+          jq --arg pass "$LLDAP_ADMIN_PASSWORD" \
+            '(.components["org.keycloak.storage.UserStorageProvider"][0].config.bindCredential) = [$pass]' \
+            keycloak/realm-export.json > /tmp/realm.json
+          cp /tmp/realm.json keycloak/realm-export.json
+          export KEYCLOAK_URL=http://localhost:8080
+          ./scripts/configure-keycloak.sh
+
+      - name: Register OIDC clients
+        run: |
+          export KEYCLOAK_URL=http://localhost:8080
+          ./scripts/register-oidc-clients.sh
+
+      - name: Start Traefik + auth services
+        run: |
+          docker compose up -d traefik forward-auth group-gate
+          sleep 5
+
+      - name: Create CI test users and groups
+        run: |
+          source tests/lib.sh
+
+          # Create test users
+          lldap_create_user "ci-user" "ci-user@portcullis.local"
+          lldap_create_user "ci-user-nogroup" "ci-nogroup@portcullis.local"
+
+          # Create per-app groups
+          for app in adguard cloudbeaver pihole scrutiny wiki dokuwiki grafana firefly kanboard jellyfin immich vaultwarden actual-budget guacamole headscale netbird litellm nextcloud; do
+            GID=$(lldap_create_group "users_$app")
+            [ -n "$GID" ] && lldap_add_to_group "ci-user" "$GID"
+            AGID=$(lldap_create_group "admin_$app")
+            [ -n "$AGID" ] && lldap_add_to_group "ci-user" "$AGID"
+          done
+
+          # Sync to Keycloak
+          lldap_sync_keycloak
+          echo "Test users and groups created"
+
+      - name: Enable direct-access-grants for CI
+        run: |
+          source tests/lib.sh
+          keycloak_enable_direct_grant "portcullis-forward-auth"
+          echo "Direct access grants enabled"
+
+      # ── Forward-auth app tests ──────────────────────────
+      - name: "Test: AdGuard Home (forward-auth + group-gate)"
+        if: always()
+        run: bash tests/apps/adguard.sh
+
+      - name: "Test: CloudBeaver (forward-auth + group-gate)"
+        if: always()
+        run: bash tests/apps/cloudbeaver.sh
+
+      - name: "Test: Pi-hole (forward-auth + group-gate)"
+        if: always()
+        run: bash tests/apps/pihole.sh
+
+      - name: "Test: Scrutiny (forward-auth + group-gate)"
+        if: always()
+        run: bash tests/apps/scrutiny.sh
+
+      - name: "Test: Wiki.js (forward-auth + group-gate)"
+        if: always()
+        run: bash tests/apps/wiki.sh
+
+      - name: "Test: DokuWiki (forward-auth + group-gate)"
+        if: always()
+        run: bash tests/apps/dokuwiki.sh
+
+      # ── Header-auth app tests ───────────────────────────
+      - name: "Test: Grafana (header-auth + group-gate)"
+        if: always()
+        run: bash tests/apps/grafana.sh
+
+      - name: "Test: Firefly III (header-auth)"
+        if: always()
+        run: bash tests/apps/firefly-iii.sh
+
+      - name: "Test: Kanboard (header-auth + group-gate)"
+        if: always()
+        run: bash tests/apps/kanboard.sh
+
+      # ── Native OIDC app tests ───────────────────────────
+      - name: "Test: Jellyfin (native OIDC + groups)"
+        if: always()
+        run: bash tests/apps/jellyfin.sh
+
+      - name: "Test: Immich (native OIDC + auto-register)"
+        if: always()
+        run: bash tests/apps/immich.sh
+
+      - name: "Test: Vaultwarden (native OIDC SSO)"
+        if: always()
+        run: bash tests/apps/vaultwarden.sh
+
+      - name: "Test: Actual Budget (native OIDC)"
+        if: always()
+        run: bash tests/apps/actual-budget.sh
+
+      - name: "Test: Guacamole (native OIDC + header)"
+        if: always()
+        run: bash tests/apps/guacamole.sh
+
+      - name: "Test: Headscale (native OIDC)"
+        if: always()
+        run: bash tests/apps/headscale.sh
+
+      - name: "Test: NetBird (native OIDC dashboard)"
+        if: always()
+        run: bash tests/apps/netbird.sh
+
+      # ── Public app tests ────────────────────────────────
+      - name: "Test: Plex (public, no auth)"
+        if: always()
+        run: bash tests/apps/plex.sh
+
+      - name: "Test: Docs Site (public, no auth)"
+        if: always()
+        run: bash tests/apps/docs.sh
+
+      # ── Cleanup ─────────────────────────────────────────
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "=== Docker Compose Status ==="
+          docker compose ps
+          echo ""
+          echo "=== Core Service Logs ==="
+          for svc in traefik keycloak forward-auth group-gate lldap vault postgres; do
+            echo "--- $svc ---"
+            docker compose logs --tail=20 "$svc" 2>/dev/null || echo "(not running)"
+          done
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose down -v 2>/dev/null || true
+          # Also clean up any app containers
+          docker ps -a --filter "label=com.docker.compose.project=portcullis" -q | xargs -r docker rm -f 2>/dev/null || true

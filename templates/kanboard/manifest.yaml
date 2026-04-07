@@ -1,0 +1,23 @@
+name: Kanboard
+description: Minimalist Kanban project management with header-based auth
+icon: "\U0001F4CB"
+category: productivity
+tags: [kanban, projects, tasks, boards]
+conflicts: []
+
+auth:
+  method: header-auth
+  sso: partial
+  group_access: true
+  group_admin: false
+  access_group: users_kanboard
+  admin_group: admin_kanboard
+  notes: Reverse proxy auth with X-Forwarded-User header. Auto-creates users on first login. Admin role set manually in Kanboard UI. Access gated by group-gate.
+
+env: []
+keycloak_clients: []
+config_files: []
+
+urls:
+  - label: Kanboard
+    url: "https://kanboard.{{DOMAIN}}"

@@ -1,0 +1,23 @@
+name: Grafana
+description: Monitoring dashboards — protected by WebAuthn
+icon: "\U0001F4CA"
+category: monitoring
+tags: [monitoring, dashboards, metrics]
+conflicts: []
+
+auth:
+  method: header-auth
+  sso: partial
+  group_access: true
+  group_admin: false
+  access_group: users_grafana
+  admin_group: admin_grafana
+  notes: Proxy auth with X-Forwarded-User header. Auto-creates users as Viewer role. Admin role requires manual promotion in Grafana. Access gated by group-gate.
+
+env: []
+keycloak_clients: []
+config_files: []
+
+urls:
+  - label: Dashboard
+    url: "https://grafana.{{DOMAIN}}"

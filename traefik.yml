@@ -1,0 +1,46 @@
+# Traefik static configuration
+# https://doc.traefik.io/traefik/reference/static-configuration/file/
+#
+# Dynamic values (domain, ACME email, DNS provider, CA server) are set
+# via TRAEFIK_* environment variables in docker-compose.yml.
+
+api:
+  dashboard: true
+  insecure: false  # dashboard served via routers, not :8080
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+
+  websecure:
+    address: ":443"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false  # only route containers with traefik.enable=true
+    network: portcullis
+
+  file:
+    directory: /etc/traefik/dynamic
+    watch: true
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      storage: /acme/acme.json
+      dnsChallenge:
+        delayBeforeCheck: 10s
+        resolvers:
+          - "1.1.1.1:53"
+          - "8.8.8.8:53"
+
+log:
+  level: INFO
+
+accessLog: {}

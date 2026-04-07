@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Portcullis - Certificates</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; line-height: 1.6; }
+    .container { max-width: 900px; margin: 0 auto; padding: 2rem; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid #1e293b; }
+    h1 { font-size: 1.5rem; color: #f1f5f9; }
+    h1 a { color: #3b82f6; text-decoration: none; }
+    .user-badge { background: #1e293b; padding: 0.5rem 1rem; border-radius: 0.5rem; font-size: 0.875rem; }
+    .user-badge strong { color: #3b82f6; }
+    table { width: 100%; border-collapse: collapse; background: #1e293b; border-radius: 0.75rem; overflow: hidden; }
+    th { text-align: left; padding: 0.75rem 1rem; background: #263548; color: #94a3b8; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    td { padding: 0.75rem 1rem; border-top: 1px solid #0f172a; font-size: 0.875rem; }
+    tr:hover td { background: #263548; }
+    .badge { display: inline-block; padding: 0.125rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
+    .badge-valid { background: #064e3b; color: #6ee7b7; }
+    .badge-expired { background: #7f1d1d; color: #fca5a5; }
+    .badge-expiring { background: #78350f; color: #fcd34d; }
+    .empty { text-align: center; padding: 3rem; color: #64748b; }
+    .mono { font-family: monospace; font-size: 0.8125rem; color: #94a3b8; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1><a href="/">Portcullis</a> / Certificates</h1>
+      {{if .User}}
+      <div class="user-badge"><strong>{{.User}}</strong></div>
+      {{end}}
+    </header>
+
+    {{if .Certs}}
+    <table>
+      <thead>
+        <tr>
+          <th>User</th>
+          <th>Serial</th>
+          <th>Issued</th>
+          <th>Expires</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Certs}}
+        <tr>
+          <td><strong>{{.Username}}</strong></td>
+          <td><span class="mono">{{.Serial}}</span></td>
+          <td>{{.NotBefore.Format "2006-01-02 15:04"}}</td>
+          <td>{{.NotAfter.Format "2006-01-02 15:04"}}</td>
+          <td>
+            {{if .NotAfter.Before $.Now}}
+              <span class="badge badge-expired">Expired</span>
+            {{else if .NotAfter.Before ($.Now.Add 7200000000000)}}
+              <span class="badge badge-expiring">Expiring soon</span>
+            {{else}}
+              <span class="badge badge-valid">Valid</span>
+            {{end}}
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+    {{else}}
+    <div class="empty">
+      <p>No certificates have been issued yet.</p>
+      <p><a href="/users" style="color:#3b82f6;">Enroll a user</a> to get started.</p>
+    </div>
+    {{end}}
+  </div>
+</body>
+</html>

@@ -1,0 +1,114 @@
+services:
+  coturn:
+    image: coturn/coturn:latest
+    network_mode: host
+    volumes:
+      - coturn-data:/var/lib/coturn
+    command: >
+      --listening-port=3478
+      --tls-listening-port=5349
+      --min-port=49152
+      --max-port=65535
+      --realm=${PORTCULLIS_DOMAIN:-portcullis.local}
+      --external-ip=${COTURN_EXTERNAL_IP:-}
+      --use-auth-secret
+      --static-auth-secret=${COTURN_AUTH_SECRET:-coturn-secret}
+      --no-cli
+      --fingerprint
+      --log-file=stdout
+
+  netbird-management:
+    image: netbirdio/management:latest
+    entrypoint: ["/bin/sh", "/etc/netbird/management-entrypoint.sh"]
+    command: >
+      --port 8011
+      --log-level info
+      --log-file console
+      --disable-anonymous-metrics
+      --single-account-mode-domain ${PORTCULLIS_DOMAIN:-portcullis.local}
+    volumes:
+      - netbird-mgmt:/var/lib/netbird
+      - netbird-config:/etc/netbird
+      - ./templates/netbird/management.json.tmpl:/etc/netbird/management.json.tmpl:ro
+      - ./templates/netbird/management-entrypoint.sh:/etc/netbird/management-entrypoint.sh:ro
+      - ./certs/ca-bundle-with-staging.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    environment:
+      PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
+      COTURN_EXTERNAL_IP: ${COTURN_EXTERNAL_IP:-}
+      COTURN_AUTH_SECRET: ${COTURN_AUTH_SECRET:-coturn-secret}
+      NETBIRD_OIDC_CLIENT_SECRET: ${NETBIRD_OIDC_CLIENT_SECRET:-}
+    depends_on:
+      - coturn
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.netbird-api.rule: Host(`netbird.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/api`)
+      traefik.http.routers.netbird-api.priority: "30"
+      traefik.http.routers.netbird-api.entrypoints: websecure
+      traefik.http.routers.netbird-api.tls.options: public@file
+      traefik.http.routers.netbird-api.middlewares: security-headers@file
+      traefik.http.routers.netbird-api.service: netbird-api
+      traefik.http.services.netbird-api.loadbalancer.server.port: "8011"
+      traefik.http.routers.netbird-mgmt.rule: Host(`netbird.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/management.ManagementService/`)
+      traefik.http.routers.netbird-mgmt.priority: "30"
+      traefik.http.routers.netbird-mgmt.entrypoints: websecure
+      traefik.http.routers.netbird-mgmt.tls.options: public@file
+      traefik.http.routers.netbird-mgmt.middlewares: security-headers@file
+      traefik.http.routers.netbird-mgmt.service: netbird-mgmt
+      traefik.http.services.netbird-mgmt.loadbalancer.server.port: "8011"
+      traefik.http.services.netbird-mgmt.loadbalancer.server.scheme: h2c
+    restart: unless-stopped
+
+  netbird-signal:
+    image: netbirdio/signal:latest
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.netbird-signal.rule: Host(`netbird.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/signalexchange.SignalExchange/`)
+      traefik.http.routers.netbird-signal.priority: "30"
+      traefik.http.routers.netbird-signal.entrypoints: websecure
+      traefik.http.routers.netbird-signal.tls.options: public@file
+      traefik.http.routers.netbird-signal.middlewares: security-headers@file
+      traefik.http.services.netbird-signal.loadbalancer.server.port: "10000"
+      traefik.http.services.netbird-signal.loadbalancer.server.scheme: h2c
+    restart: unless-stopped
+
+  netbird-dashboard:
+    image: netbirdio/dashboard:latest
+    environment:
+      NETBIRD_MGMT_API_ENDPOINT: https://netbird.${PORTCULLIS_DOMAIN:-portcullis.local}
+      NETBIRD_MGMT_GRPC_API_ENDPOINT: https://netbird.${PORTCULLIS_DOMAIN:-portcullis.local}
+      AUTH_AUTHORITY: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis
+      AUTH_CLIENT_ID: netbird-dashboard
+      AUTH_CLIENT_SECRET: ${NETBIRD_OIDC_CLIENT_SECRET:-}
+      USE_AUTH0: "false"
+      AUTH_SUPPORTED_SCOPES: openid profile email
+      AUTH_AUDIENCE: netbird-dashboard
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.netbird-dash.rule: Host(`netbird.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.netbird-dash.priority: "10"
+      traefik.http.routers.netbird-dash.entrypoints: websecure
+      traefik.http.routers.netbird-dash.tls.options: public@file
+      traefik.http.routers.netbird-dash.middlewares: client-headers@file,security-headers@file
+      traefik.http.services.netbird-dash.loadbalancer.server.port: "80"
+    restart: unless-stopped
+
+volumes:
+  coturn-data:
+    name: portcullis_coturn-data
+  netbird-mgmt:
+    name: portcullis_netbird-mgmt
+  netbird-config:
+    name: portcullis_netbird-config
+
+networks:
+  portcullis-proxy:
+    external: true

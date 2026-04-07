@@ -1,0 +1,43 @@
+name: Headscale
+description: Self-hosted Tailscale control server with Headplane admin UI
+icon: "\U0001F310"
+category: vpn
+tags: [vpn, wireguard, mesh, tailscale]
+conflicts: [netbird]
+
+auth:
+  method: native-oidc
+  sso: true
+  group_access: false
+  group_admin: false
+  access_group: users_headscale
+  admin_group: admin_headscale
+  notes: Headscale uses OIDC for node registration. Headplane admin UI has its own OIDC client. No group-based access restriction — all OIDC users can register nodes.
+
+env:
+  - key: HEADSCALE_OIDC_CLIENT_SECRET
+    description: OIDC client secret for Headscale
+    generate: random
+  - key: HEADPLANE_OIDC_CLIENT_SECRET
+    description: OIDC client secret for Headplane admin UI
+    generate: random
+
+keycloak_clients:
+  - client_id: headscale
+    secret_env: HEADSCALE_OIDC_CLIENT_SECRET
+    redirect_uri: "https://vpn.{{DOMAIN}}/oidc/callback"
+    name: Headscale VPN
+  - client_id: headplane
+    secret_env: HEADPLANE_OIDC_CLIENT_SECRET
+    redirect_uri: "https://vpn-admin.{{DOMAIN}}/*"
+    name: Headplane Admin UI
+
+config_files:
+  - src: config/config.yaml
+    dest: headscale/config.yaml
+
+urls:
+  - label: VPN Control Server
+    url: "https://vpn.{{DOMAIN}}"
+  - label: Admin UI
+    url: "https://vpn-admin.{{DOMAIN}}"

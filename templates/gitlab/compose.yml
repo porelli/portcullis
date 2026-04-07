@@ -1,0 +1,43 @@
+services:
+  gitlab:
+    image: gitlab/gitlab-ce:latest
+    hostname: git.${PORTCULLIS_DOMAIN:-portcullis.local}
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'https://git.${PORTCULLIS_DOMAIN:-portcullis.local}'
+        nginx['listen_port'] = 80
+        nginx['listen_https'] = false
+        nginx['proxy_set_headers'] = { "X-Forwarded-Proto" => "https", "X-Forwarded-Ssl" => "on" }
+        gitlab_rails['initial_root_password'] = '${GITLAB_ROOT_PASSWORD:-changeme}'
+        letsencrypt['enable'] = false
+        gitlab_rails['omniauth_enabled'] = true
+        gitlab_rails['omniauth_allow_single_sign_on'] = ['openid_connect']
+        gitlab_rails['omniauth_block_auto_created_users'] = false
+        gitlab_rails['omniauth_providers'] = [{ name: 'openid_connect', label: 'Portcullis SSO', args: { name: 'openid_connect', scope: ['openid', 'profile', 'email'], response_type: 'code', issuer: 'https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis', discovery: true, client_auth_method: 'query', uid_field: 'preferred_username', client_options: { identifier: 'gitlab', secret: '${GITLAB_OIDC_SECRET:-gitlab-oidc-secret}', redirect_uri: 'https://git.${PORTCULLIS_DOMAIN:-portcullis.local}/users/auth/openid_connect/callback' }}}]
+    volumes:
+      - gitlab-config:/etc/gitlab
+      - gitlab-logs:/var/log/gitlab
+      - gitlab-data:/var/opt/gitlab
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.gitlab.rule: Host(`git.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.gitlab.entrypoints: websecure
+      traefik.http.routers.gitlab.tls.options: authaware@file
+      traefik.http.routers.gitlab.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.gitlab.loadbalancer.server.port: "80"
+    restart: unless-stopped
+
+volumes:
+  gitlab-config:
+    name: portcullis_gitlab-config
+  gitlab-logs:
+    name: portcullis_gitlab-logs
+  gitlab-data:
+    name: portcullis_gitlab-data
+
+networks:
+  portcullis-proxy:
+    external: true

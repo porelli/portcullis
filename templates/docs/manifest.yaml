@@ -1,0 +1,21 @@
+name: Docs Site
+description: Public documentation — no authentication
+icon: "\U0001F4C4"
+category: public
+tags: [docs, static, nginx]
+conflicts: []
+
+auth:
+  method: public
+  sso: false
+  group_access: false
+  group_admin: false
+  notes: Public documentation site — no authentication required.
+
+env: []
+keycloak_clients: []
+config_files: []
+
+urls:
+  - label: Docs
+    url: "https://docs.{{DOMAIN}}"

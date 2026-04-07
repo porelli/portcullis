@@ -1,0 +1,28 @@
+services:
+  dokuwiki:
+    image: linuxserver/dokuwiki:latest
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: UTC
+    volumes:
+      - dokuwiki-data:/config
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.dokuwiki.rule: Host(`dokuwiki.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.dokuwiki.entrypoints: websecure
+      traefik.http.routers.dokuwiki.tls.options: authaware@file
+      traefik.http.routers.dokuwiki.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.dokuwiki.loadbalancer.server.port: "80"
+    restart: unless-stopped
+
+volumes:
+  dokuwiki-data:
+    name: portcullis_dokuwiki-data
+
+networks:
+  portcullis-proxy:
+    external: true

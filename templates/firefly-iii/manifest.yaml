@@ -1,0 +1,30 @@
+name: Firefly III
+description: Self-hosted personal finance manager with double-entry bookkeeping
+icon: "\U0001F4B8"
+category: finance
+tags: [finance, accounting, budget, bookkeeping]
+conflicts: []
+
+auth:
+  method: header-auth
+  sso: partial
+  group_access: true
+  group_admin: false
+  access_group: users_firefly
+  admin_group: admin_firefly
+  notes: Uses remote_user_guard with X-Forwarded-User header from oauth2-proxy. Auto-creates user on first login. No group-based admin support.
+
+env:
+  - key: FIREFLY_APP_KEY
+    description: Firefly III encryption key (32 chars)
+    generate: random
+  - key: FIREFLY_DB_PASSWORD
+    description: Firefly III database password
+    generate: random
+
+keycloak_clients: []
+config_files: []
+
+urls:
+  - label: Firefly III
+    url: "https://finance.{{DOMAIN}}"

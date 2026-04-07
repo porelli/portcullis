@@ -1,0 +1,31 @@
+# User overrides — copy this to docker-compose.override.yml
+# Docker Compose automatically merges this on top of docker-compose.yml.
+# This file is gitignored, so it survives git pull.
+#
+# Usage: cp docker-compose.override.example.yml docker-compose.override.yml
+#
+# Common customizations:
+
+services:
+  # Example: expose Vault on a different port
+  # vault:
+  #   ports:
+  #     - "8201:8200"
+
+  # Example: add resource limits to Keycloak
+  # keycloak:
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 2G
+
+  # Example: mount media library for Jellyfin/Plex templates
+  # jellyfin:
+  #   volumes:
+  #     - /mnt/media/movies:/data/movies:ro
+  #     - /mnt/media/tv:/data/tv:ro
+
+  # Example: change Traefik log level
+  # traefik:
+  #   environment:
+  #     TRAEFIK_LOG_LEVEL: DEBUG

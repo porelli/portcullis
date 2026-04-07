@@ -1,0 +1,46 @@
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-changeme}
+      DATABASE_URL: postgresql://litellm:${LITELLM_DB_PASSWORD:-changeme}@litellm-db:5432/litellm
+      GENERIC_CLIENT_ID: litellm
+      GENERIC_CLIENT_SECRET: ${LITELLM_OIDC_SECRET:-litellm-oidc-secret}
+      GENERIC_AUTHORIZATION_ENDPOINT: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis/protocol/openid-connect/auth
+      GENERIC_TOKEN_ENDPOINT: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis/protocol/openid-connect/token
+      GENERIC_USERINFO_ENDPOINT: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis/protocol/openid-connect/userinfo
+      GENERIC_SCOPE: "openid profile email"
+      PROXY_BASE_URL: https://llm.${PORTCULLIS_DOMAIN:-portcullis.local}
+      AUTO_REDIRECT_UI_LOGIN_TO_SSO: "true"
+    volumes:
+      - ./certs/ca-bundle-with-staging.crt:/etc/ssl/certs/ca-certificates.crt:ro
+    depends_on:
+      - litellm-db
+    networks:
+      - default
+      - portcullis-proxy
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.litellm.rule: Host(`llm.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.litellm.entrypoints: websecure
+      traefik.http.routers.litellm.tls.options: authaware@file
+      traefik.http.routers.litellm.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.litellm.loadbalancer.server.port: "4000"
+    restart: unless-stopped
+
+  litellm-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: litellm
+      POSTGRES_USER: litellm
+      POSTGRES_PASSWORD: ${LITELLM_DB_PASSWORD:-changeme}
+    volumes:
+      - litellm-db-data:/var/lib/postgresql/data
+
+volumes:
+  litellm-db-data:
+    name: portcullis_litellm-db-data
+
+networks:
+  portcullis-proxy:
+    external: true

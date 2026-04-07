@@ -1,0 +1,27 @@
+# File provider for non-Docker services (VMs, bare metal, external hosts).
+# Add entries here for services that can't use Docker labels.
+#
+# Traefik will watch this file for changes — edits take effect immediately.
+#
+# Example: route wiki.portcullis.example.com to an external server
+#
+# http:
+#   routers:
+#     wiki:
+#       rule: "Host(`wiki.{{ env "PORTCULLIS_DOMAIN" }}`)"
+#       entryPoints:
+#         - websecure
+#       tls:
+#         options: protected
+#       middlewares:
+#         - client-headers
+#         - security-headers
+#       service: wiki
+#
+#   services:
+#     wiki:
+#       loadBalancer:
+#         servers:
+#           - url: "http://10.0.1.50:8080"
+
+# Uncomment and modify the above to add non-Docker services.

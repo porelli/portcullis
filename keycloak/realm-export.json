@@ -1,0 +1,326 @@
+{
+  "realm": "portcullis",
+  "displayName": "Portcullis",
+  "displayNameHtml": "<span style=\"font-size:2rem;font-weight:700;letter-spacing:-0.02em\">Portcullis</span>",
+  "enabled": true,
+  "sslRequired": "all",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": true,
+  "maxFailureWaitSeconds": 900,
+  "failureFactor": 5,
+  "ssoSessionIdleTimeout": 28800,
+  "ssoSessionMaxLifespan": 43200,
+  "accessTokenLifespan": 300,
+  "accessTokenLifespanForImplicitFlow": 300,
+  "webAuthnPolicyRpEntityName": "Portcullis",
+  "webAuthnPolicySignatureAlgorithms": ["ES256"],
+  "webAuthnPolicyRpId": "",
+  "webAuthnPolicyAttestationConveyancePreference": "none",
+  "webAuthnPolicyAuthenticatorAttachment": "cross-platform",
+  "webAuthnPolicyRequireResidentKey": "No",
+  "webAuthnPolicyUserVerificationRequirement": "preferred",
+  "webAuthnPolicyCreateTimeout": 60,
+  "webAuthnPolicyAvoidSameAuthenticatorRegister": true,
+  "webAuthnPolicyPasswordlessRpEntityName": "Portcullis",
+  "webAuthnPolicyPasswordlessSignatureAlgorithms": ["ES256"],
+  "webAuthnPolicyPasswordlessRpId": "",
+  "webAuthnPolicyPasswordlessAttestationConveyancePreference": "none",
+  "webAuthnPolicyPasswordlessAuthenticatorAttachment": "cross-platform",
+  "webAuthnPolicyPasswordlessRequireResidentKey": "Yes",
+  "webAuthnPolicyPasswordlessUserVerificationRequirement": "required",
+  "webAuthnPolicyPasswordlessCreateTimeout": 60,
+  "webAuthnPolicyPasswordlessAvoidSameAuthenticatorRegister": true,
+  "authenticationFlows": [
+    {
+      "alias": "portcullis-browser-flow",
+      "description": "Browser flow: cookie → X.509 client cert → WebAuthn passwordless → username + WebAuthn",
+      "providerId": "basic-flow",
+      "topLevel": true,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "auth-cookie",
+          "authenticatorFlow": false,
+          "requirement": "ALTERNATIVE",
+          "priority": 10
+        },
+        {
+          "authenticator": "auth-x509-client-username-form",
+          "authenticatorFlow": false,
+          "requirement": "ALTERNATIVE",
+          "priority": 20,
+          "authenticatorConfig": "x509-config"
+        },
+        {
+          "authenticator": "webauthn-authenticator-passwordless",
+          "authenticatorFlow": false,
+          "requirement": "ALTERNATIVE",
+          "priority": 30
+        },
+        {
+          "authenticatorFlow": true,
+          "requirement": "ALTERNATIVE",
+          "priority": 40,
+          "flowAlias": "portcullis-username-webauthn"
+        }
+      ]
+    },
+    {
+      "alias": "portcullis-username-webauthn",
+      "description": "Username form followed by WebAuthn (for non-passwordless keys)",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "auth-username-form",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 10
+        },
+        {
+          "authenticator": "webauthn-authenticator",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 20
+        }
+      ]
+    },
+    {
+      "alias": "portcullis-registration-flow",
+      "description": "Registration flow with WebAuthn setup",
+      "providerId": "basic-flow",
+      "topLevel": true,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "registration-page-form",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 10
+        }
+      ]
+    }
+  ],
+  "authenticatorConfig": [
+    {
+      "alias": "x509-config",
+      "config": {
+        "x509-cert-auth.canonical-dn-enabled": "false",
+        "x509-cert-auth.serialnumber-hex-enabled": "false",
+        "x509-cert-auth.regular-expression": "(.*?)(?:$)",
+        "x509-cert-auth.mapper-selection": "Username or Email",
+        "x509-cert-auth.mapper-selection.user-attribute-name": "usercertificate",
+        "x509-cert-auth.mapping-source-selection": "Subject's Common Name",
+        "x509-cert-auth.crl-checking-enabled": "false",
+        "x509-cert-auth.crldp-checking-enabled": "false",
+        "x509-cert-auth.ocsp-checking-enabled": "false",
+        "x509-cert-auth.ocsp-responder-uri": "",
+        "x509-cert-auth.keyusage": "",
+        "x509-cert-auth.extendedkeyusage": "",
+        "x509-cert-auth.confirmation-page-disallowed": "true"
+      }
+    }
+  ],
+  "browserFlow": "portcullis-browser-flow",
+  "requiredActions": [
+    {
+      "alias": "webauthn-register",
+      "name": "WebAuthn Register",
+      "providerId": "webauthn-register",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 70
+    },
+    {
+      "alias": "webauthn-register-passwordless",
+      "name": "WebAuthn Register Passwordless",
+      "providerId": "webauthn-register-passwordless",
+      "enabled": true,
+      "defaultAction": true,
+      "priority": 80
+    }
+  ],
+  "components": {
+    "org.keycloak.storage.UserStorageProvider": [
+      {
+        "name": "lldap",
+        "providerId": "ldap",
+        "config": {
+          "vendor": ["other"],
+          "connectionUrl": ["ldap://lldap:3890"],
+          "bindDn": ["uid=admin,ou=people,LLDAP_BASE_DN_PLACEHOLDER"],
+          "bindCredential": ["LLDAP_PASSWORD_PLACEHOLDER"],
+          "usersDn": ["ou=people,LLDAP_BASE_DN_PLACEHOLDER"],
+          "usernameLDAPAttribute": ["uid"],
+          "rdnLDAPAttribute": ["uid"],
+          "uuidLDAPAttribute": ["uid"],
+          "userObjectClasses": ["person"],
+          "editMode": ["READ_ONLY"],
+          "syncRegistrations": ["false"],
+          "importEnabled": ["true"],
+          "batchSizeForSync": ["1000"],
+          "fullSyncPeriod": ["604800"],
+          "changedSyncPeriod": ["86400"],
+          "searchScope": ["1"],
+          "useTruststoreSpi": ["ldapsOnly"],
+          "connectionPooling": ["true"],
+          "pagination": ["true"],
+          "enabled": ["true"],
+          "priority": ["0"]
+        },
+        "subComponents": {
+          "org.keycloak.storage.ldap.mappers.LDAPStorageMapper": [
+            {
+              "name": "username",
+              "providerId": "user-attribute-ldap-mapper",
+              "config": {
+                "ldap.attribute": ["uid"],
+                "user.model.attribute": ["username"],
+                "is.mandatory.in.ldap": ["true"],
+                "read.only": ["true"]
+              }
+            },
+            {
+              "name": "email",
+              "providerId": "user-attribute-ldap-mapper",
+              "config": {
+                "ldap.attribute": ["mail"],
+                "user.model.attribute": ["email"],
+                "is.mandatory.in.ldap": ["true"],
+                "read.only": ["true"]
+              }
+            },
+            {
+              "name": "first name",
+              "providerId": "user-attribute-ldap-mapper",
+              "config": {
+                "ldap.attribute": ["givenName"],
+                "user.model.attribute": ["firstName"],
+                "is.mandatory.in.ldap": ["false"],
+                "read.only": ["true"]
+              }
+            },
+            {
+              "name": "last name",
+              "providerId": "user-attribute-ldap-mapper",
+              "config": {
+                "ldap.attribute": ["sn"],
+                "user.model.attribute": ["lastName"],
+                "is.mandatory.in.ldap": ["false"],
+                "read.only": ["true"]
+              }
+            },
+            {
+              "name": "groups",
+              "providerId": "group-ldap-mapper",
+              "config": {
+                "groups.dn": ["ou=groups,LLDAP_BASE_DN_PLACEHOLDER"],
+                "group.name.ldap.attribute": ["cn"],
+                "group.object.classes": ["groupOfUniqueNames"],
+                "membership.ldap.attribute": ["uniqueMember"],
+                "membership.attribute.type": ["DN"],
+                "membership.user.ldap.attribute": ["uid"],
+                "mode": ["READ_ONLY"],
+                "drop.non.existing.groups.during.sync": ["false"]
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "saml-sp-example",
+      "name": "Example SAML Service Provider",
+      "description": "Template SAML SP client - duplicate and configure for each app",
+      "enabled": true,
+      "protocol": "saml",
+      "frontchannelLogout": true,
+      "attributes": {
+        "saml.server.signature": "true",
+        "saml.server.signature.keyinfo.ext": "false",
+        "saml.signing.certificate": "",
+        "saml.signature.algorithm": "RSA_SHA256",
+        "saml_force_name_id_format": "false",
+        "saml_name_id_format": "username",
+        "saml.client.signature": "false",
+        "saml.authnstatement": "true",
+        "saml_single_logout_service_url_redirect": "https://your-app.example.com/saml/sls",
+        "saml.assertion.signature": "true"
+      },
+      "redirectUris": [
+        "https://your-app.example.com/saml/acs"
+      ],
+      "adminUrl": "https://your-app.example.com/saml/acs",
+      "baseUrl": "https://your-app.example.com",
+      "fullScopeAllowed": true,
+      "protocolMappers": [
+        {
+          "name": "email",
+          "protocol": "saml",
+          "protocolMapper": "saml-user-property-idp-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "email",
+            "friendly.name": "email",
+            "attribute.name": "email",
+            "attribute.nameformat": "Basic"
+          }
+        },
+        {
+          "name": "username",
+          "protocol": "saml",
+          "protocolMapper": "saml-user-property-idp-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "username",
+            "friendly.name": "username",
+            "attribute.name": "username",
+            "attribute.nameformat": "Basic"
+          }
+        }
+      ]
+    },
+    {
+      "clientId": "portcullis-forward-auth",
+      "name": "Portcullis Forward Auth",
+      "description": "OIDC client used by Traefik forward auth middleware for WebAuthn-authenticated users",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "portcullis-forward-auth-secret",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "redirectUris": [
+        "https://*/_oauth/callback"
+      ],
+      "webOrigins": [
+        "+"
+      ],
+      "defaultClientScopes": [
+        "openid",
+        "profile",
+        "email"
+      ]
+    }
+  ],
+  "roles": {
+    "realm": [
+      {
+        "name": "user",
+        "description": "Standard authenticated user"
+      },
+      {
+        "name": "admin",
+        "description": "Administrator"
+      }
+    ]
+  },
+  "defaultRoles": ["user"]
+}

@@ -1,0 +1,36 @@
+name: LiteLLM
+description: Unified LLM proxy — OpenAI-compatible API for 100+ models with auth and rate limits
+icon: "\U0001F916"
+category: ai
+tags: [llm, ai, openai, proxy, api]
+conflicts: []
+
+auth:
+  method: native-oidc
+  sso: true
+  group_access: false
+  group_admin: false
+  access_group: users_litellm
+  admin_group: admin_litellm
+  notes: OIDC login for the admin UI. API access uses master key, not SSO. No group-based restriction on UI access.
+
+env:
+  - key: LITELLM_MASTER_KEY
+    description: LiteLLM admin API key
+    generate: random
+  - key: LITELLM_OIDC_SECRET
+    description: LiteLLM OIDC client secret
+    generate: random
+
+keycloak_clients:
+  - client_id: litellm
+    secret_env: LITELLM_OIDC_SECRET
+    redirect_uri: "https://llm.{{DOMAIN}}/sso/callback"
+    name: LiteLLM
+config_files: []
+
+urls:
+  - label: LiteLLM Proxy
+    url: "https://llm.{{DOMAIN}}"
+  - label: Admin UI
+    url: "https://llm.{{DOMAIN}}/ui"

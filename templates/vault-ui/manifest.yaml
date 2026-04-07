@@ -1,0 +1,21 @@
+name: Vault UI
+description: Vault web interface — mTLS only (high security)
+icon: "\U0001F512"
+category: security
+tags: [vault, secrets, pki]
+conflicts: []
+
+auth:
+  method: mtls
+  sso: false
+  group_access: false
+  group_admin: false
+  notes: mTLS only (protected TLS tier). Requires PIV client certificate. No SSO or group integration — access controlled at the TLS layer.
+
+env: []
+keycloak_clients: []
+config_files: []
+
+urls:
+  - label: Vault UI
+    url: "https://vault.{{DOMAIN}}"

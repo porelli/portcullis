@@ -1,0 +1,12 @@
+site_name: Portcullis Docs
+theme:
+  name: material
+  palette:
+    scheme: slate
+    primary: indigo
+    accent: indigo
+nav:
+  - TLS & mTLS: certificates.md
+  - Adding a Domain: adding-a-domain.md
+  - SAML App (Nextcloud): saml-app-nextcloud.md
+  - Non-SAML App (Kanboard): non-saml-app-kanboard.md

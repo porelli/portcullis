@@ -1,0 +1,22 @@
+{
+  "oauth": {
+    "autoLaunch": true,
+    "autoRegister": true,
+    "buttonText": "Login with SSO",
+    "clientId": "immich",
+    "clientSecret": "${IMMICH_OIDC_SECRET}",
+    "tokenEndpointAuthMethod": "client_secret_post",
+    "timeout": 30000,
+    "defaultStorageQuota": null,
+    "enabled": true,
+    "issuerUrl": "https://auth.${PORTCULLIS_DOMAIN}/realms/portcullis",
+    "mobileOverrideEnabled": false,
+    "mobileRedirectUri": "",
+    "scope": "openid email profile",
+    "signingAlgorithm": "RS256",
+    "profileSigningAlgorithm": "none",
+    "storageLabelClaim": "preferred_username",
+    "storageQuotaClaim": "immich_quota",
+    "roleClaim": "immich_role"
+  }
+}

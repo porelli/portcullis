@@ -1,0 +1,32 @@
+name: Nextcloud
+description: Self-hosted productivity platform — files, calendar, contacts, office
+icon: "\u2601"
+category: productivity
+tags: [files, calendar, office, collaboration]
+conflicts: []
+
+auth:
+  method: native-oidc
+  sso: true
+  group_access: false
+  group_admin: false
+  access_group: users_nextcloud
+  admin_group: admin_nextcloud
+  notes: OIDC login via oidc_login app. Group mapping possible but not yet configured. Admin set manually in Nextcloud.
+
+env:
+  - key: NEXTCLOUD_ADMIN_PASSWORD
+    description: Nextcloud admin password
+    generate: random
+
+keycloak_clients:
+  - client_id: nextcloud
+    secret_env: NEXTCLOUD_OIDC_SECRET
+    redirect_uri: "https://cloud.{{DOMAIN}}/apps/oidc_login/oidc"
+    name: Nextcloud
+
+config_files: []
+
+urls:
+  - label: Nextcloud
+    url: "https://cloud.{{DOMAIN}}"

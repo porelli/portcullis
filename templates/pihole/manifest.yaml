@@ -1,0 +1,27 @@
+name: Pi-hole
+description: Network-wide ad blocking via DNS sinkhole
+icon: "\U0001F6AB"
+category: networking
+tags: [dns, adblock, privacy, filtering]
+conflicts: [adguard]
+
+auth:
+  method: forward-auth
+  sso: false
+  group_access: true
+  group_admin: false
+  access_group: users_pihole
+  admin_group: admin_pihole
+  notes: No SSO support. Has its own web password. Access gated by group-gate middleware.
+
+env:
+  - key: PIHOLE_WEBPASSWORD
+    description: Pi-hole web interface password
+    generate: random
+
+keycloak_clients: []
+config_files: []
+
+urls:
+  - label: Dashboard
+    url: "https://pihole.{{DOMAIN}}/admin"

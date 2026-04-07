@@ -1,0 +1,23 @@
+name: Scrutiny
+description: Hard drive S.M.A.R.T monitoring with web dashboard and alerts
+icon: "\U0001F4BE"
+category: monitoring
+tags: [disk, smart, health, monitoring, hardware]
+conflicts: []
+
+auth:
+  method: forward-auth
+  sso: false
+  group_access: true
+  group_admin: false
+  access_group: users_scrutiny
+  admin_group: admin_scrutiny
+  notes: No SSO or user system. Access gated by group-gate middleware. All authenticated users have full access.
+
+env: []
+keycloak_clients: []
+config_files: []
+
+urls:
+  - label: Dashboard
+    url: "https://disks.{{DOMAIN}}"

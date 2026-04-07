@@ -1,0 +1,48 @@
+# Headscale configuration for Portcullis integration.
+# Docs: https://headscale.net/ref/configuration/
+
+server_url: https://vpn.${PORTCULLIS_DOMAIN:-portcullis.local}
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 0.0.0.0:9090
+
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+
+# Node registration requires OIDC login → Keycloak → YubiKey WebAuthn tap
+oidc:
+  only_start_if_oidc_is_available: true
+  issuer: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis
+  client_id: headscale
+  # Set via environment or replace with actual secret after bootstrap
+  client_secret: ${HEADSCALE_OIDC_CLIENT_SECRET:-headscale-oidc-secret}
+  scope:
+    - openid
+    - profile
+    - email
+  # Map Keycloak email to Headscale user
+  strip_email_domain: true
+
+# IP allocation for VPN nodes
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+
+# DERP (relay) — use built-in defaults
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    stun_listen_addr: 0.0.0.0:3478
+
+dns:
+  magic_dns: true
+  base_domain: vpn.internal
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 9.9.9.9
+
+log:
+  level: info

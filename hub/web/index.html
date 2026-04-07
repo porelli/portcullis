@@ -1,0 +1,760 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Portcullis Hub</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; line-height: 1.6; }
+    .container { max-width: 1100px; margin: 0 auto; padding: 2rem; }
+
+    /* Header */
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid #1e293b; }
+    h1 { font-size: 1.5rem; color: #f1f5f9; }
+    h1 span { color: #3b82f6; }
+    .user-badge { background: #1e293b; padding: 0.5rem 1rem; border-radius: 0.5rem; font-size: 0.875rem; }
+    .user-badge strong { color: #3b82f6; }
+
+    /* Tabs */
+    .tabs { display: flex; gap: 0; margin-bottom: 2rem; border-bottom: 2px solid #1e293b; }
+    .tab { padding: 0.75rem 1.5rem; cursor: pointer; color: #94a3b8; font-size: 0.875rem; font-weight: 500; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; }
+    .tab:hover { color: #e2e8f0; }
+    .tab.active { color: #3b82f6; border-bottom-color: #3b82f6; }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
+
+    /* Category headers */
+    .category { margin-bottom: 2rem; }
+    .category-title { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; color: #64748b; margin-bottom: 1rem; }
+
+    /* App cards */
+    .apps { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 1rem; }
+    .app-card { background: #1e293b; border-radius: 0.75rem; padding: 1.5rem; position: relative; transition: transform 0.2s, border-color 0.2s; cursor: pointer; border: 1px solid transparent; }
+    .app-card:hover { transform: translateY(-1px); border-color: #334155; }
+    .app-card.enabled { border-color: #22c55e33; }
+    .app-card.expanded { border-color: #3b82f6; }
+    .app-card.conflict { opacity: 0.5; }
+    .app-header { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; }
+    .app-icon { font-size: 1.75rem; }
+    .app-name { font-size: 1.125rem; font-weight: 600; }
+    .app-source { font-size: 0.6875rem; color: #64748b; background: #0f172a; padding: 0.125rem 0.5rem; border-radius: 9999px; margin-left: auto; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; background: #64748b; flex-shrink: 0; }
+    .status-dot.running { background: #22c55e; }
+    .status-dot.partial { background: #f59e0b; }
+    .status-dot.stopped { background: #ef4444; }
+    .app-desc { color: #94a3b8; font-size: 0.875rem; margin-bottom: 0.75rem; }
+
+    /* Auth badges */
+    .app-auth { display: flex; gap: 0.375rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
+    .auth-badge { font-size: 0.6875rem; padding: 0.125rem 0.5rem; border-radius: 9999px; font-weight: 500; }
+    .auth-badge.sso { background: #22c55e22; color: #22c55e; border: 1px solid #22c55e44; }
+    .auth-badge.sso-partial { background: #f59e0b22; color: #f59e0b; border: 1px solid #f59e0b44; }
+    .auth-badge.group { background: #3b82f622; color: #3b82f6; border: 1px solid #3b82f644; }
+    .auth-badge.group-admin { background: #a855f722; color: #a855f7; border: 1px solid #a855f744; }
+    .auth-badge.method { background: #0f172a; color: #94a3b8; }
+    .auth-badge.public { background: #64748b22; color: #64748b; border: 1px solid #64748b44; }
+
+    .app-tags { display: flex; flex-wrap: wrap; gap: 0.375rem; margin-bottom: 1rem; }
+    .tag { font-size: 0.6875rem; padding: 0.125rem 0.5rem; border-radius: 9999px; background: #0f172a; color: #64748b; }
+    .app-urls { margin-bottom: 1rem; }
+    .app-url { font-size: 0.8125rem; color: #3b82f6; text-decoration: none; display: block; margin-bottom: 0.25rem; }
+    .app-url:hover { text-decoration: underline; }
+    .app-footer { display: flex; justify-content: space-between; align-items: center; }
+    .app-conflicts { font-size: 0.75rem; color: #f59e0b; }
+
+    /* Toggle button */
+    .toggle { padding: 0.5rem 1.25rem; border: none; border-radius: 0.375rem; font-size: 0.875rem; font-weight: 500; cursor: pointer; transition: all 0.2s; }
+    .toggle.enable { background: #22c55e; color: #fff; }
+    .toggle.enable:hover { background: #16a34a; }
+    .toggle.disable { background: #ef4444; color: #fff; }
+    .toggle.disable:hover { background: #dc2626; }
+    .toggle:disabled { opacity: 0.5; cursor: not-allowed; }
+    .toggle.loading { opacity: 0.7; pointer-events: none; }
+
+    /* Detail panel */
+    .app-detail { grid-column: 1 / -1; background: #1a2332; border-radius: 0.75rem; padding: 1.5rem; border: 1px solid #334155; display: none; }
+    .app-detail.visible { display: block; }
+    .detail-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+    .detail-title { font-size: 1rem; font-weight: 600; }
+    .detail-close { background: none; border: none; color: #64748b; font-size: 1.25rem; cursor: pointer; padding: 0.25rem 0.5rem; }
+    .detail-close:hover { color: #e2e8f0; }
+    .detail-tabs { display: flex; gap: 1rem; margin-bottom: 1rem; border-bottom: 1px solid #334155; padding-bottom: 0.5rem; }
+    .detail-tab { cursor: pointer; color: #64748b; font-size: 0.8125rem; padding-bottom: 0.5rem; border-bottom: 2px solid transparent; margin-bottom: -0.5rem; }
+    .detail-tab:hover { color: #e2e8f0; }
+    .detail-tab.active { color: #3b82f6; border-bottom-color: #3b82f6; }
+    .detail-content { display: none; min-height: 80px; }
+    .detail-content.active { display: block; }
+
+    /* Settings form */
+    .settings-form .form-group { margin-bottom: 1rem; }
+    .settings-form label { display: block; font-size: 0.8125rem; font-weight: 500; margin-bottom: 0.25rem; }
+    .settings-form small { display: block; color: #64748b; font-size: 0.75rem; margin-bottom: 0.375rem; }
+    .settings-form input[type="text"], .settings-form select { width: 100%; padding: 0.5rem 0.75rem; background: #0f172a; border: 1px solid #334155; border-radius: 0.375rem; color: #e2e8f0; font-size: 0.875rem; font-family: inherit; }
+    .settings-form input:focus, .settings-form select:focus { outline: none; border-color: #3b82f6; }
+    .settings-form input::placeholder { color: #475569; }
+    .settings-empty { color: #64748b; font-size: 0.875rem; }
+    .auth-notes { color: #94a3b8; font-size: 0.8125rem; background: #0f172a; padding: 0.75rem 1rem; border-radius: 0.5rem; margin-bottom: 1rem; border-left: 3px solid #3b82f6; }
+
+    /* Status list */
+    .status-list { display: flex; flex-direction: column; gap: 0.5rem; }
+    .status-row { display: flex; align-items: center; gap: 0.75rem; background: #0f172a; padding: 0.625rem 1rem; border-radius: 0.375rem; font-size: 0.8125rem; }
+    .status-name { font-weight: 500; flex: 1; font-family: 'SF Mono', 'Fira Code', monospace; }
+    .status-state { color: #94a3b8; }
+
+    /* Log viewer */
+    .log-viewer { background: #0f172a; border: 1px solid #1e293b; border-radius: 0.5rem; padding: 1rem; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.75rem; color: #94a3b8; max-height: 400px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+    .log-controls { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; align-items: center; }
+    .log-controls select { background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 0.375rem 0.5rem; border-radius: 0.375rem; font-size: 0.8125rem; }
+
+    /* Sources panel */
+    .sources-list { margin-bottom: 1.5rem; }
+    .source-item { background: #1e293b; border-radius: 0.5rem; padding: 1rem 1.25rem; margin-bottom: 0.75rem; display: flex; justify-content: space-between; align-items: center; }
+    .source-info { flex: 1; }
+    .source-name { font-weight: 600; font-size: 1rem; }
+    .source-url { color: #94a3b8; font-size: 0.8125rem; word-break: break-all; }
+    .source-actions { display: flex; gap: 0.5rem; }
+
+    /* Forms & buttons */
+    .form-row { display: flex; gap: 0.75rem; margin-bottom: 1rem; }
+    .form-row input { flex: 1; padding: 0.625rem 0.875rem; background: #1e293b; border: 1px solid #334155; border-radius: 0.375rem; color: #e2e8f0; font-size: 0.875rem; }
+    .form-row input::placeholder { color: #475569; }
+    .form-row input:focus { outline: none; border-color: #3b82f6; }
+    .btn { padding: 0.625rem 1.25rem; border: none; border-radius: 0.375rem; font-size: 0.875rem; font-weight: 500; cursor: pointer; transition: all 0.2s; }
+    .btn-primary { background: #3b82f6; color: #fff; }
+    .btn-primary:hover { background: #2563eb; }
+    .btn-danger { background: #334155; color: #94a3b8; }
+    .btn-danger:hover { background: #ef4444; color: #fff; }
+    .btn-secondary { background: #334155; color: #e2e8f0; }
+    .btn-secondary:hover { background: #475569; }
+    .btn-sm { padding: 0.375rem 0.75rem; font-size: 0.8125rem; }
+
+    .badge-builtin { color: #3b82f6; }
+    .badge-community { color: #a855f7; }
+
+    /* Status toast */
+    .toast { position: fixed; bottom: 2rem; right: 2rem; background: #1e293b; border: 1px solid #334155; border-radius: 0.5rem; padding: 1rem 1.5rem; font-size: 0.875rem; opacity: 0; transform: translateY(1rem); transition: all 0.3s; z-index: 100; }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast.success { border-color: #22c55e; }
+    .toast.error { border-color: #ef4444; }
+
+    .empty { text-align: center; padding: 3rem; color: #64748b; }
+
+    /* Expert mode */
+    .expert-section { margin-bottom: 1.5rem; }
+    .expert-section-title { font-size: 0.8125rem; font-weight: 600; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
+    .expert-section-title .warn { color: #f59e0b; font-size: 0.75rem; font-weight: 400; }
+    .code-editor { width: 100%; min-height: 200px; max-height: 500px; background: #0f172a; border: 1px solid #334155; border-radius: 0.5rem; padding: 0.75rem; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.75rem; color: #e2e8f0; resize: vertical; tab-size: 2; line-height: 1.5; }
+    .code-editor:focus { outline: none; border-color: #3b82f6; }
+    .expert-actions { display: flex; gap: 0.5rem; margin-top: 0.5rem; align-items: center; }
+    .expert-actions .saved-msg { color: #22c55e; font-size: 0.75rem; opacity: 0; transition: opacity 0.3s; }
+    .expert-actions .saved-msg.show { opacity: 1; }
+    .env-table { width: 100%; border-collapse: collapse; }
+    .env-table th { text-align: left; font-size: 0.75rem; color: #64748b; padding: 0.375rem 0.5rem; border-bottom: 1px solid #334155; }
+    .env-table td { padding: 0.25rem 0.5rem; }
+    .env-table input { width: 100%; background: #0f172a; border: 1px solid #334155; border-radius: 0.25rem; padding: 0.375rem 0.5rem; color: #e2e8f0; font-family: 'SF Mono', monospace; font-size: 0.75rem; }
+    .env-table input:focus { outline: none; border-color: #3b82f6; }
+    .env-key { font-family: 'SF Mono', monospace; font-size: 0.75rem; color: #94a3b8; white-space: nowrap; }
+    .terminal { background: #0a0e17; border: 1px solid #334155; border-radius: 0.5rem; padding: 0.75rem; font-family: 'SF Mono', monospace; font-size: 0.75rem; }
+    .terminal-output { color: #94a3b8; max-height: 250px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; margin-bottom: 0.5rem; }
+    .terminal-input { display: flex; gap: 0.5rem; align-items: center; }
+    .terminal-input select { background: #0f172a; border: 1px solid #334155; color: #e2e8f0; padding: 0.375rem; border-radius: 0.25rem; font-size: 0.75rem; }
+    .terminal-input input { flex: 1; background: transparent; border: none; color: #22c55e; font-family: inherit; font-size: inherit; outline: none; }
+    .terminal-prompt { color: #3b82f6; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1><span>&#9906;</span> {{.PortalName}} Hub</h1>
+      {{if .User}}
+      <div class="user-badge">Authenticated as <strong>{{.User}}</strong></div>
+      {{else}}
+      <div class="user-badge">{{.Domain}}</div>
+      {{end}}
+    </header>
+
+    <div class="tabs">
+      <div class="tab active" data-tab="catalog">App Catalog</div>
+      <div class="tab" data-tab="sources">Template Sources</div>
+    </div>
+
+    <!-- Catalog Tab -->
+    <div class="tab-content active" id="tab-catalog">
+      {{range $category, $apps := .Categories}}
+      <div class="category">
+        <div class="category-title">{{$category}}</div>
+        <div class="apps">
+          {{range $apps}}
+          <div class="app-card {{if .Enabled}}enabled{{end}}" data-id="{{.ID}}" data-conflicts="{{range .Manifest.Conflicts}}{{.}},{{end}}" onclick="toggleDetail('{{.ID}}', event)">
+            <div class="app-header">
+              {{if .Enabled}}<span class="status-dot" data-status-id="{{.ID}}" title="Checking..."></span>{{end}}
+              <span class="app-icon">{{.Manifest.Icon}}</span>
+              <span class="app-name">{{.Manifest.Name}}</span>
+              <span class="app-source {{if eq .Source "local"}}badge-builtin{{else}}badge-community{{end}}">{{.Source}}</span>
+            </div>
+            <div class="app-desc">{{.Manifest.Description}}</div>
+            <div class="app-auth">
+              {{if .Manifest.Auth.Method}}
+                {{if eq (printf "%v" .Manifest.Auth.SSO) "true"}}
+                  <span class="auth-badge sso" title="Full Single Sign-On support">SSO</span>
+                {{else if eq (printf "%v" .Manifest.Auth.SSO) "partial"}}
+                  <span class="auth-badge sso-partial" title="Partial SSO via proxy auth header">SSO*</span>
+                {{end}}
+                {{if .Manifest.Auth.GroupAccess}}
+                  <span class="auth-badge group" title="Access restricted by LLDAP group">Group Access</span>
+                {{end}}
+                {{if .Manifest.Auth.GroupAdmin}}
+                  <span class="auth-badge group-admin" title="Admin role assigned by LLDAP group">Group Admin</span>
+                {{end}}
+                {{if eq .Manifest.Auth.Method "public"}}
+                  <span class="auth-badge public">Public</span>
+                {{else}}
+                  <span class="auth-badge method" title="{{.Manifest.Auth.Notes}}">{{.Manifest.Auth.Method}}</span>
+                {{end}}
+              {{end}}
+            </div>
+            <div class="app-tags">
+              {{range .Manifest.Tags}}<span class="tag">{{.}}</span>{{end}}
+            </div>
+            {{if and .Enabled (gt (len .Manifest.URLs) 0)}}
+            <div class="app-urls">
+              {{range .Manifest.URLs}}
+              <a class="app-url" href="{{.URL}}" target="_blank" onclick="event.stopPropagation()">{{.Label}} &#8599;</a>
+              {{end}}
+            </div>
+            {{end}}
+            <div class="app-footer">
+              {{if .Manifest.Conflicts}}
+              <span class="app-conflicts">Conflicts: {{range $i, $c := .Manifest.Conflicts}}{{if $i}}, {{end}}{{$c}}{{end}}</span>
+              {{else}}
+              <span></span>
+              {{end}}
+              {{if .Enabled}}
+              <button class="toggle disable" onclick="toggleApp('{{.ID}}', false, event)">Disable</button>
+              {{else}}
+              <button class="toggle enable" onclick="toggleApp('{{.ID}}', true, event)">Enable</button>
+              {{end}}
+            </div>
+          </div>
+          <!-- Detail panel placeholder for {{.ID}} -->
+          <div class="app-detail" id="detail-{{.ID}}">
+            <div class="detail-header">
+              <span class="detail-title">{{.Manifest.Icon}} {{.Manifest.Name}}</span>
+              <button class="detail-close" onclick="closeDetail(event)">&times;</button>
+            </div>
+            {{if .Manifest.Auth.Notes}}
+            <div class="auth-notes">{{.Manifest.Auth.Notes}}</div>
+            {{end}}
+            <div class="detail-tabs">
+              <span class="detail-tab active" data-dtab="settings" data-app="{{.ID}}">Settings</span>
+              {{if .Enabled}}
+              <span class="detail-tab" data-dtab="status" data-app="{{.ID}}">Status</span>
+              <span class="detail-tab" data-dtab="logs" data-app="{{.ID}}">Logs</span>
+              {{end}}
+              <span class="detail-tab" data-dtab="expert" data-app="{{.ID}}">Expert</span>
+            </div>
+            <div class="detail-content active" id="detail-settings-{{.ID}}"></div>
+            <div class="detail-content" id="detail-status-{{.ID}}"></div>
+            <div class="detail-content" id="detail-logs-{{.ID}}"></div>
+            <div class="detail-content" id="detail-expert-{{.ID}}"></div>
+          </div>
+          {{end}}
+        </div>
+      </div>
+      {{end}}
+
+      {{if not .Templates}}
+      <div class="empty">No templates found. Add a template source or check the templates/ directory.</div>
+      {{end}}
+    </div>
+
+    <!-- Sources Tab -->
+    <div class="tab-content" id="tab-sources">
+      <div class="category-title" style="margin-bottom: 1rem;">Built-in</div>
+      <div class="source-item">
+        <div class="source-info">
+          <div class="source-name">local</div>
+          <div class="source-url">templates/ directory (built-in templates)</div>
+        </div>
+      </div>
+
+      <div class="category-title" style="margin-top: 2rem; margin-bottom: 1rem;">Community / Private Repositories</div>
+
+      <div class="sources-list" id="sources-list">
+        {{range .Sources}}
+        <div class="source-item" data-name="{{.Name}}">
+          <div class="source-info">
+            <div class="source-name">{{.Name}}</div>
+            <div class="source-url">{{.URL}}</div>
+          </div>
+          <div class="source-actions">
+            <button class="btn btn-danger" onclick="removeSource('{{.Name}}')">Remove</button>
+          </div>
+        </div>
+        {{end}}
+        {{if not .Sources}}
+        <div class="empty" id="no-sources">No external template sources added yet.</div>
+        {{end}}
+      </div>
+
+      <div style="margin-top: 1.5rem;">
+        <div class="category-title">Add Template Repository</div>
+        <p style="color: #94a3b8; font-size: 0.875rem; margin-bottom: 1rem;">
+          Add a git repository containing template directories. Each template needs a <code style="background: #0f172a; padding: 0.125rem 0.375rem; border-radius: 0.25rem;">manifest.yaml</code> and <code style="background: #0f172a; padding: 0.125rem 0.375rem; border-radius: 0.25rem;">compose.yml</code>.
+        </p>
+        <div class="form-row">
+          <input type="text" id="source-name" placeholder="Name (e.g., my-templates)">
+          <input type="text" id="source-url" placeholder="Git URL (e.g., https://github.com/user/portcullis-templates.git)">
+          <button class="btn btn-primary" onclick="addSource()">Add</button>
+        </div>
+      </div>
+
+      <div style="margin-top: 2rem;">
+        <button class="btn btn-secondary" onclick="syncSources()">Sync All Sources</button>
+        <span style="color: #64748b; font-size: 0.8125rem; margin-left: 0.75rem;">Pull latest from all repositories</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    // ── Tab switching ─────────────────────────────────────
+    document.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+      });
+    });
+
+    // Detail tab switching
+    document.querySelectorAll('.detail-tab').forEach(tab => {
+      tab.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const appId = tab.dataset.app;
+        const panel = document.getElementById('detail-' + appId);
+        panel.querySelectorAll('.detail-tab').forEach(t => t.classList.remove('active'));
+        panel.querySelectorAll('.detail-content').forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById('detail-' + tab.dataset.dtab + '-' + appId).classList.add('active');
+        // Load content on tab switch
+        if (tab.dataset.dtab === 'status') loadStatus(appId);
+        if (tab.dataset.dtab === 'logs') loadLogs(appId);
+        if (tab.dataset.dtab === 'expert') loadExpert(appId);
+      });
+    });
+
+    // ── Toast ─────────────────────────────────────────────
+    function showToast(msg, type) {
+      const toast = document.getElementById('toast');
+      toast.textContent = msg;
+      toast.className = 'toast show ' + (type || '');
+      setTimeout(() => toast.className = 'toast', 3000);
+    }
+
+    // ── API helpers ───────────────────────────────────────
+    async function apiCall(url, method, body) {
+      const opts = { method, headers: { 'Content-Type': 'application/json' } };
+      if (body !== undefined) opts.body = JSON.stringify(body);
+      const res = await fetch(url, opts);
+      if (!res.ok) throw new Error(await res.text());
+      return res;
+    }
+    async function apiPost(url, body) { return (await apiCall(url, 'POST', body)).json(); }
+    async function apiPut(url, body) { return (await apiCall(url, 'PUT', body)).json(); }
+    async function apiGet(url) { return (await apiCall(url, 'GET')).json(); }
+
+    function escapeHtml(s) {
+      const d = document.createElement('div'); d.textContent = s; return d.innerHTML;
+    }
+
+    // ── Detail panel ──────────────────────────────────────
+    let openDetailId = null;
+
+    function toggleDetail(id, e) {
+      if (e.target.closest('.toggle, .app-url, .detail-close')) return;
+      const panel = document.getElementById('detail-' + id);
+      const card = document.querySelector(`.app-card[data-id="${id}"]`);
+
+      if (openDetailId === id) {
+        closeDetail(e);
+        return;
+      }
+      // Close any open panel
+      if (openDetailId) {
+        document.getElementById('detail-' + openDetailId).classList.remove('visible');
+        document.querySelector(`.app-card[data-id="${openDetailId}"]`)?.classList.remove('expanded');
+      }
+      openDetailId = id;
+      card.classList.add('expanded');
+      panel.classList.add('visible');
+      loadSettings(id);
+    }
+
+    function closeDetail(e) {
+      e.stopPropagation();
+      if (openDetailId) {
+        document.getElementById('detail-' + openDetailId).classList.remove('visible');
+        document.querySelector(`.app-card[data-id="${openDetailId}"]`)?.classList.remove('expanded');
+        openDetailId = null;
+      }
+    }
+
+    // ── Settings ──────────────────────────────────────────
+    async function loadSettings(id) {
+      const container = document.getElementById('detail-settings-' + id);
+      try {
+        const data = await apiGet('/api/templates/settings/' + id);
+        if (!data.definitions || data.definitions.length === 0) {
+          container.innerHTML = '<p class="settings-empty">No configurable settings for this app.</p>';
+          return;
+        }
+        let html = '<form class="settings-form" onsubmit="saveSettings(event, \'' + id + '\')">';
+        for (const s of data.definitions) {
+          const val = (data.values && data.values[s.key]) || s.default || '';
+          html += '<div class="form-group">';
+          html += '<label>' + escapeHtml(s.label) + '</label>';
+          if (s.description) html += '<small>' + escapeHtml(s.description) + '</small>';
+          if (s.type === 'boolean') {
+            html += '<select name="' + s.key + '"><option value="false"' + (val !== 'true' ? ' selected' : '') + '>No</option><option value="true"' + (val === 'true' ? ' selected' : '') + '>Yes</option></select>';
+          } else if (s.type === 'select') {
+            html += '<select name="' + s.key + '">';
+            for (const opt of (s.options || [])) {
+              html += '<option value="' + escapeHtml(opt) + '"' + (val === opt ? ' selected' : '') + '>' + escapeHtml(opt) + '</option>';
+            }
+            html += '</select>';
+          } else {
+            const ph = s.type === 'path' ? '/path/on/host (e.g., /mnt/media/movies)' : '';
+            html += '<input type="text" name="' + s.key + '" value="' + escapeHtml(val) + '" placeholder="' + ph + '">';
+          }
+          html += '</div>';
+        }
+        html += '<button type="submit" class="btn btn-primary btn-sm">Save Settings</button></form>';
+        container.innerHTML = html;
+      } catch (e) {
+        container.innerHTML = '<p class="settings-empty">Failed to load settings.</p>';
+      }
+    }
+
+    async function saveSettings(e, id) {
+      e.preventDefault();
+      e.stopPropagation();
+      const form = e.target;
+      const values = {};
+      for (const el of form.elements) {
+        if (el.name) values[el.name] = el.value;
+      }
+      try {
+        await apiPut('/api/templates/settings/' + id, values);
+        showToast('Settings saved. App will restart if running.', 'success');
+      } catch (err) {
+        showToast('Failed to save: ' + err.message, 'error');
+      }
+    }
+
+    // ── Container status ──────────────────────────────────
+    async function loadStatus(id) {
+      const container = document.getElementById('detail-status-' + id);
+      container.innerHTML = '<p class="settings-empty">Loading...</p>';
+      try {
+        const statuses = await apiGet('/api/templates/status/' + id);
+        if (!statuses || statuses.length === 0) {
+          container.innerHTML = '<p class="settings-empty">No containers found. App may not be running.</p>';
+          return;
+        }
+        let html = '<div class="status-list">';
+        for (const s of statuses) {
+          const color = s.state === 'running' ? '#22c55e' : s.state === 'restarting' ? '#f59e0b' : '#ef4444';
+          html += '<div class="status-row">';
+          html += '<span class="status-dot" style="background:' + color + '"></span>';
+          html += '<span class="status-name">' + escapeHtml(s.name) + '</span>';
+          html += '<span class="status-state">' + escapeHtml(s.status) + '</span>';
+          html += '</div>';
+        }
+        html += '</div>';
+        container.innerHTML = html;
+      } catch (e) {
+        container.innerHTML = '<p class="settings-empty">Failed to load status.</p>';
+      }
+    }
+
+    async function pollStatuses() {
+      const dots = document.querySelectorAll('[data-status-id]');
+      for (const dot of dots) {
+        const id = dot.dataset.statusId;
+        try {
+          const statuses = await apiGet('/api/templates/status/' + id);
+          if (!statuses || statuses.length === 0) {
+            dot.className = 'status-dot';
+          } else if (statuses.every(s => s.state === 'running')) {
+            dot.className = 'status-dot running';
+            dot.title = 'All containers running';
+          } else if (statuses.some(s => s.state === 'running')) {
+            dot.className = 'status-dot partial';
+            dot.title = 'Some containers not running';
+          } else {
+            dot.className = 'status-dot stopped';
+            dot.title = 'Containers stopped';
+          }
+        } catch (e) { /* ignore */ }
+      }
+    }
+    pollStatuses();
+    setInterval(pollStatuses, 15000);
+
+    // ── Logs ──────────────────────────────────────────────
+    async function loadLogs(id, lines) {
+      const container = document.getElementById('detail-logs-' + id);
+      lines = lines || '200';
+      container.innerHTML = '<p class="settings-empty">Loading logs...</p>';
+      try {
+        const res = await fetch('/api/templates/logs/' + id + '?lines=' + lines);
+        const text = await res.text();
+        container.innerHTML =
+          '<div class="log-controls">' +
+            '<button class="btn btn-secondary btn-sm" onclick="event.stopPropagation(); loadLogs(\'' + id + '\')">Refresh</button>' +
+            '<select onchange="event.stopPropagation(); loadLogs(\'' + id + '\', this.value)">' +
+              '<option value="100"' + (lines==='100'?' selected':'') + '>100 lines</option>' +
+              '<option value="200"' + (lines==='200'?' selected':'') + '>200 lines</option>' +
+              '<option value="500"' + (lines==='500'?' selected':'') + '>500 lines</option>' +
+            '</select>' +
+          '</div>' +
+          '<pre class="log-viewer">' + escapeHtml(text || 'No logs available.') + '</pre>';
+        const viewer = container.querySelector('.log-viewer');
+        if (viewer) viewer.scrollTop = viewer.scrollHeight;
+      } catch (e) {
+        container.innerHTML = '<p class="settings-empty">Failed to load logs.</p>';
+      }
+    }
+
+    // ── Expert mode ────────────────────────────────────────
+    async function loadExpert(id) {
+      const container = document.getElementById('detail-expert-' + id);
+      container.innerHTML = '<p class="settings-empty">Loading...</p>';
+      try {
+        const [composeData, envData] = await Promise.all([
+          apiGet('/api/templates/compose/' + id),
+          apiGet('/api/templates/env/' + id),
+        ]);
+        const services = envData.services || [];
+        let html = '';
+
+        // Compose editor
+        html += '<div class="expert-section">';
+        html += '<div class="expert-section-title">compose.yml <span class="warn">Changes require restart</span></div>';
+        html += '<textarea class="code-editor" id="expert-compose-' + id + '" spellcheck="false">' + escapeHtml(composeData.compose || '') + '</textarea>';
+        html += '<div class="expert-actions">';
+        html += '<button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); saveCompose(\'' + id + '\')">Save compose.yml</button>';
+        html += '<button class="btn btn-secondary btn-sm" onclick="event.stopPropagation(); restartApp(\'' + id + '\')">Restart App</button>';
+        html += '<span class="saved-msg" id="compose-saved-' + id + '">Saved</span>';
+        html += '</div></div>';
+
+        // Override editor
+        html += '<div class="expert-section">';
+        html += '<div class="expert-section-title">compose.hub-override.yml <span class="warn">Auto-generated from Settings; edits here override</span></div>';
+        html += '<textarea class="code-editor" id="expert-override-' + id + '" style="min-height:80px" spellcheck="false">' + escapeHtml(composeData.override || '') + '</textarea>';
+        html += '</div>';
+
+        // Env vars
+        html += '<div class="expert-section">';
+        html += '<div class="expert-section-title">Environment Variables</div>';
+        const vars = envData.variables || {};
+        const keys = Object.keys(vars).sort();
+        if (keys.length > 0) {
+          html += '<table class="env-table"><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody>';
+          for (const k of keys) {
+            html += '<tr><td class="env-key">' + escapeHtml(k) + '</td>';
+            html += '<td><input type="text" data-env-key="' + escapeHtml(k) + '" value="' + escapeHtml(vars[k]) + '"></td></tr>';
+          }
+          html += '</tbody></table>';
+        }
+        html += '<div class="expert-actions" style="margin-top:0.5rem; gap:0.5rem">';
+        html += '<input type="text" id="new-env-key-' + id + '" placeholder="NEW_VAR_NAME" style="width:200px;background:#0f172a;border:1px solid #334155;border-radius:0.25rem;padding:0.375rem 0.5rem;color:#e2e8f0;font-family:SF Mono,monospace;font-size:0.75rem">';
+        html += '<input type="text" id="new-env-val-' + id + '" placeholder="value" style="flex:1;background:#0f172a;border:1px solid #334155;border-radius:0.25rem;padding:0.375rem 0.5rem;color:#e2e8f0;font-family:SF Mono,monospace;font-size:0.75rem">';
+        html += '<button class="btn btn-secondary btn-sm" onclick="event.stopPropagation(); addEnvVar(\'' + id + '\')">Add</button>';
+        html += '</div>';
+        html += '<div class="expert-actions" style="margin-top:0.5rem">';
+        html += '<button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); saveEnvVars(\'' + id + '\')">Save Env Vars</button>';
+        html += '<span class="saved-msg" id="env-saved-' + id + '">Saved</span>';
+        html += '</div>';
+        html += '</div>';
+
+        // Shell
+        html += '<div class="expert-section">';
+        html += '<div class="expert-section-title">Container Shell</div>';
+        html += '<div class="terminal" id="terminal-' + id + '">';
+        html += '<div class="terminal-output" id="term-output-' + id + '"></div>';
+        html += '<div class="terminal-input">';
+        html += '<select id="term-svc-' + id + '">';
+        for (const svc of services) {
+          html += '<option value="' + escapeHtml(svc) + '">' + escapeHtml(svc) + '</option>';
+        }
+        html += '</select>';
+        html += '<span class="terminal-prompt">$</span> ';
+        html += '<input type="text" id="term-cmd-' + id + '" placeholder="command..." onkeydown="if(event.key===\'Enter\'){event.stopPropagation();execCmd(\'' + id + '\')}">';
+        html += '</div></div></div>';
+
+        container.innerHTML = html;
+
+        // Handle tab key in code editors
+        container.querySelectorAll('.code-editor').forEach(el => {
+          el.addEventListener('keydown', (e) => {
+            if (e.key === 'Tab') {
+              e.preventDefault();
+              const start = el.selectionStart;
+              el.value = el.value.substring(0, start) + '  ' + el.value.substring(el.selectionEnd);
+              el.selectionStart = el.selectionEnd = start + 2;
+            }
+          });
+        });
+      } catch (e) {
+        container.innerHTML = '<p class="settings-empty">Failed to load expert data: ' + escapeHtml(e.message) + '</p>';
+      }
+    }
+
+    async function saveCompose(id) {
+      const compose = document.getElementById('expert-compose-' + id).value;
+      const override = document.getElementById('expert-override-' + id).value;
+      try {
+        await apiPut('/api/templates/compose/' + id, { compose, override });
+        const msg = document.getElementById('compose-saved-' + id);
+        msg.classList.add('show');
+        setTimeout(() => msg.classList.remove('show'), 2000);
+      } catch (e) {
+        showToast('Save failed: ' + e.message, 'error');
+      }
+    }
+
+    async function saveEnvVars(id) {
+      const inputs = document.querySelectorAll('#detail-expert-' + id + ' [data-env-key]');
+      const values = {};
+      inputs.forEach(input => { values[input.dataset.envKey] = input.value; });
+      try {
+        await apiPut('/api/templates/env/' + id, values);
+        const msg = document.getElementById('env-saved-' + id);
+        msg.classList.add('show');
+        setTimeout(() => msg.classList.remove('show'), 2000);
+      } catch (e) {
+        showToast('Save failed: ' + e.message, 'error');
+      }
+    }
+
+    function addEnvVar(id) {
+      const keyInput = document.getElementById('new-env-key-' + id);
+      const valInput = document.getElementById('new-env-val-' + id);
+      const key = keyInput.value.trim().toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+      const val = valInput.value;
+      if (!key) { showToast('Variable name required', 'error'); return; }
+      // Add a row to the table (or create table if none)
+      const container = document.getElementById('detail-expert-' + id);
+      let table = container.querySelector('.env-table tbody');
+      if (!table) {
+        const section = keyInput.closest('.expert-section');
+        const tableHtml = '<table class="env-table"><thead><tr><th>Key</th><th>Value</th></tr></thead><tbody></tbody></table>';
+        section.insertAdjacentHTML('afterbegin', '<div class="expert-section-title">Environment Variables</div>' + tableHtml);
+        table = section.querySelector('.env-table tbody');
+      }
+      const row = document.createElement('tr');
+      row.innerHTML = '<td class="env-key">' + escapeHtml(key) + '</td><td><input type="text" data-env-key="' + escapeHtml(key) + '" value="' + escapeHtml(val) + '"></td>';
+      table.appendChild(row);
+      keyInput.value = '';
+      valInput.value = '';
+      showToast('Added ' + key + '. Click "Save Env Vars" to persist.', 'success');
+    }
+
+    async function restartApp(id) {
+      try {
+        await apiPost('/api/templates/restart/' + id, {});
+        showToast(id + ' restarting...', 'success');
+      } catch (e) {
+        showToast('Restart failed: ' + e.message, 'error');
+      }
+    }
+
+    async function execCmd(id) {
+      const svc = document.getElementById('term-svc-' + id).value;
+      const cmdInput = document.getElementById('term-cmd-' + id);
+      const output = document.getElementById('term-output-' + id);
+      const cmd = cmdInput.value.trim();
+      if (!cmd) return;
+      cmdInput.value = '';
+      output.textContent += '$ ' + cmd + '\n';
+      try {
+        const res = await fetch('/api/templates/exec/' + id, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ service: svc, command: cmd }),
+        });
+        const data = await res.json();
+        if (data.output) output.textContent += data.output;
+        if (data.exitCode !== 0) output.textContent += '[exit ' + data.exitCode + ']\n';
+      } catch (e) {
+        output.textContent += 'Error: ' + e.message + '\n';
+      }
+      output.scrollTop = output.scrollHeight;
+    }
+
+    // ── Enable / Disable ──────────────────────────────────
+    async function toggleApp(id, enable, e) {
+      e.stopPropagation();
+      const card = document.querySelector(`[data-id="${id}"]`);
+      const btn = card.querySelector('.toggle');
+      btn.classList.add('loading');
+      btn.textContent = enable ? 'Enabling...' : 'Disabling...';
+      try {
+        const endpoint = enable ? '/api/templates/enable' : '/api/templates/disable';
+        await apiPost(endpoint, { id });
+        showToast(`${id} ${enable ? 'enabled' : 'disabled'}`, 'success');
+        setTimeout(() => location.reload(), 500);
+      } catch (err) {
+        showToast(err.message, 'error');
+        btn.classList.remove('loading');
+        btn.textContent = enable ? 'Enable' : 'Disable';
+      }
+    }
+
+    // ── Sources ───────────────────────────────────────────
+    async function addSource() {
+      const name = document.getElementById('source-name').value.trim();
+      const url = document.getElementById('source-url').value.trim();
+      if (!name || !url) { showToast('Name and URL are required', 'error'); return; }
+      try {
+        await apiPost('/api/sources/add', { name, url });
+        showToast(`Source "${name}" added`, 'success');
+        setTimeout(() => location.reload(), 500);
+      } catch (e) { showToast(e.message, 'error'); }
+    }
+    async function removeSource(name) {
+      if (!confirm(`Remove source "${name}"? Apps from this source will be disabled.`)) return;
+      try {
+        await apiPost('/api/sources/remove', { name });
+        showToast(`Source "${name}" removed`, 'success');
+        setTimeout(() => location.reload(), 500);
+      } catch (e) { showToast(e.message, 'error'); }
+    }
+    async function syncSources() {
+      try {
+        await apiPost('/api/sources/sync', {});
+        showToast('All sources synced', 'success');
+        setTimeout(() => location.reload(), 1000);
+      } catch (e) { showToast(e.message, 'error'); }
+    }
+
+    // ── Conflict marking ──────────────────────────────────
+    document.querySelectorAll('.app-card.enabled').forEach(card => {
+      const conflicts = card.dataset.conflicts.split(',').filter(Boolean);
+      conflicts.forEach(c => {
+        const cc = document.querySelector(`[data-id="${c}"]`);
+        if (cc && !cc.classList.contains('enabled')) {
+          cc.classList.add('conflict');
+          const btn = cc.querySelector('.toggle');
+          if (btn) { btn.disabled = true; btn.title = 'Conflicts with ' + card.dataset.id; }
+        }
+      });
+    });
+  </script>
+</body>
+</html>

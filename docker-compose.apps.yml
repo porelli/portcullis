@@ -1,0 +1,214 @@
+# Example app definitions showing all access tiers.
+# Use: docker compose -f docker-compose.yml -f docker-compose.apps.yml up -d
+#
+# Or merge these into your own compose file — the key is the labels.
+#
+# There are now TWO ways to protect an app:
+#
+# 1. mTLS only (protected tier) — requires YubiKey PIV client certificate at TLS level.
+#    Best for: CLI tools, APIs, service-to-service, high-security admin panels.
+#
+# 2. WebAuthn via forward auth (portcullis-auth) — redirects to Keycloak login,
+#    user taps YubiKey in browser. Works without any local software.
+#    Best for: browser apps, general users who only have WebAuthn enrolled.
+#
+# You can combine both: use authaware TLS (passes cert if present) + forward auth
+# (falls back to WebAuthn login if no cert). This gives the best experience —
+# mTLS users get instant access, WebAuthn users get a login prompt.
+
+services:
+  # ============================================================
+  # mTLS ONLY — requires YubiKey PIV client certificate
+  # (TLS handshake fails without a valid cert)
+  # ============================================================
+  vault-ui:
+    image: drakkan/sftpgo:latest  # placeholder
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.vault-ui.rule: Host(`vault.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.vault-ui.entrypoints: websecure
+      traefik.http.routers.vault-ui.tls.options: protected@file
+      traefik.http.routers.vault-ui.middlewares: client-headers@file,security-headers@file
+      traefik.http.services.vault-ui.loadbalancer.server.port: "8080"
+
+  # ============================================================
+  # WEBAUTHN (via forward auth) — browser login with YubiKey tap
+  # No client cert needed. Redirects to Keycloak if not logged in.
+  # ============================================================
+  grafana:
+    image: grafana/grafana:latest
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.grafana.rule: Host(`grafana.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.grafana.entrypoints: websecure
+      traefik.http.routers.grafana.tls.options: public@file
+      traefik.http.routers.grafana.middlewares: portcullis-auth@docker,security-headers@file
+      traefik.http.services.grafana.loadbalancer.server.port: "3000"
+
+  # ============================================================
+  # BEST OF BOTH — mTLS if cert present, otherwise WebAuthn login
+  # (authaware TLS + forward auth fallback)
+  # ============================================================
+  wiki:
+    image: requarks/wiki:2
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.wiki.rule: Host(`wiki.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.wiki.entrypoints: websecure
+      traefik.http.routers.wiki.tls.options: authaware@file
+      traefik.http.routers.wiki.middlewares: client-headers@file,portcullis-auth@docker,security-headers@file
+      traefik.http.services.wiki.loadbalancer.server.port: "3000"
+
+  # ============================================================
+  # HEADSCALE — self-hosted Tailscale control server
+  # OIDC via Keycloak → YubiKey WebAuthn at node registration.
+  # Admin UI protected by mTLS + WebAuthn fallback.
+  # ============================================================
+  headscale:
+    image: headscale/headscale:latest
+    command: serve
+    volumes:
+      - headscale-data:/var/lib/headscale
+      - ./headscale/config.yaml:/etc/headscale/config.yaml:ro
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      # Main control server — public TLS so Tailscale clients can reach it
+      traefik.http.routers.headscale.rule: Host(`vpn.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.headscale.entrypoints: websecure
+      traefik.http.routers.headscale.tls.options: public@file
+      traefik.http.routers.headscale.middlewares: security-headers@file
+      traefik.http.services.headscale.loadbalancer.server.port: "8080"
+
+  headplane:
+    image: ghcr.io/tale/headplane:latest
+    environment:
+      HEADSCALE_URL: http://headscale:8080
+      OIDC_ISSUER: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis
+      OIDC_CLIENT_ID: headplane
+      OIDC_CLIENT_SECRET: ${HEADPLANE_OIDC_CLIENT_SECRET:-headplane-oidc-secret}
+      ROOT_URL: https://vpn-admin.${PORTCULLIS_DOMAIN:-portcullis.local}
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      # Admin UI — mTLS if cert present, WebAuthn fallback
+      traefik.http.routers.headplane.rule: Host(`vpn-admin.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.headplane.entrypoints: websecure
+      traefik.http.routers.headplane.tls.options: authaware@file
+      traefik.http.routers.headplane.middlewares: client-headers@file,portcullis-auth@docker,security-headers@file
+      traefik.http.services.headplane.loadbalancer.server.port: "3000"
+
+  # ============================================================
+  # NETBIRD — mesh VPN + zero-trust networking
+  # OIDC via Keycloak → YubiKey WebAuthn at peer registration.
+  # Management API and dashboard protected by WebAuthn.
+  # ============================================================
+  coturn:
+    image: coturn/coturn:latest
+    network_mode: host
+    volumes:
+      - coturn-data:/var/lib/coturn
+    command: >
+      --listening-port=3478
+      --tls-listening-port=5349
+      --min-port=49152
+      --max-port=65535
+      --realm=${PORTCULLIS_DOMAIN:-portcullis.local}
+      --external-ip=${COTURN_EXTERNAL_IP:-}
+      --use-auth-secret
+      --static-auth-secret=${COTURN_AUTH_SECRET:-coturn-secret}
+      --no-cli
+      --fingerprint
+      --log-file=stdout
+
+  netbird-management:
+    image: netbirdio/management:latest
+    command: >
+      --port 8011
+      --log-level info
+      --log-file console
+      --disable-anonymous-metrics
+    volumes:
+      - netbird-mgmt:/var/lib/netbird
+    environment:
+      NETBIRD_DOMAIN: netbird.${PORTCULLIS_DOMAIN:-portcullis.local}
+      NETBIRD_TURN_HOST: ${COTURN_EXTERNAL_IP:-turn.${PORTCULLIS_DOMAIN:-portcullis.local}}
+      NETBIRD_TURN_PORT: "3478"
+      NETBIRD_TURN_SECRET: ${COTURN_AUTH_SECRET:-coturn-secret}
+    depends_on:
+      - coturn
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.netbird-api.rule: Host(`netbird.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/api`)
+      traefik.http.routers.netbird-api.entrypoints: websecure
+      traefik.http.routers.netbird-api.tls.options: public@file
+      traefik.http.routers.netbird-api.middlewares: security-headers@file
+      traefik.http.services.netbird-api.loadbalancer.server.port: "8011"
+
+  netbird-signal:
+    image: netbirdio/signal:latest
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.netbird-signal.rule: Host(`netbird.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/signalexchange.SignalExchange/`)
+      traefik.http.routers.netbird-signal.entrypoints: websecure
+      traefik.http.routers.netbird-signal.tls.options: public@file
+      traefik.http.routers.netbird-signal.middlewares: security-headers@file
+      traefik.http.services.netbird-signal.loadbalancer.server.port: "10000"
+      traefik.http.services.netbird-signal.loadbalancer.server.scheme: h2c
+
+  netbird-dashboard:
+    image: netbirdio/dashboard:latest
+    environment:
+      NETBIRD_MGMT_API_ENDPOINT: https://netbird.${PORTCULLIS_DOMAIN:-portcullis.local}
+      NETBIRD_MGMT_GRPC_API_ENDPOINT: https://netbird.${PORTCULLIS_DOMAIN:-portcullis.local}
+      AUTH_AUTHORITY: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis
+      AUTH_CLIENT_ID: netbird-dashboard
+      USE_AUTH0: "false"
+      AUTH_SUPPORTED_SCOPES: openid profile email
+      AUTH_AUDIENCE: netbird-dashboard
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      # Dashboard — WebAuthn protected
+      traefik.http.routers.netbird-dash.rule: Host(`netbird.${PORTCULLIS_DOMAIN:-portcullis.local}`) && !PathPrefix(`/api`) && !PathPrefix(`/signalexchange.SignalExchange/`)
+      traefik.http.routers.netbird-dash.entrypoints: websecure
+      traefik.http.routers.netbird-dash.tls.options: public@file
+      traefik.http.routers.netbird-dash.middlewares: portcullis-auth@docker,security-headers@file
+      traefik.http.services.netbird-dash.loadbalancer.server.port: "80"
+
+  # ============================================================
+  # PUBLIC — no authentication at all
+  # ============================================================
+  docs:
+    image: nginx:alpine
+    networks:
+      - portcullis
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.docs.rule: Host(`docs.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.docs.entrypoints: websecure
+      traefik.http.routers.docs.tls.options: public@file
+      traefik.http.routers.docs.middlewares: security-headers@file
+      traefik.http.services.docs.loadbalancer.server.port: "80"
+
+volumes:
+  headscale-data:
+  netbird-mgmt:
+  coturn-data:
+
+networks:
+  portcullis:
+    external: true

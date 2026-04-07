@@ -1,0 +1,34 @@
+name: Vaultwarden
+description: Lightweight Bitwarden-compatible password manager
+icon: "\U0001F510"
+category: security
+tags: [passwords, bitwarden, vault, secrets]
+conflicts: []
+
+auth:
+  method: native-oidc
+  sso: true
+  group_access: false
+  group_admin: false
+  access_group: users_vaultwarden
+  admin_group: admin_vaultwarden
+  notes: Native SSO via OpenID Connect. Users still need a master password for vault encryption. Admin panel uses a separate token. No group-based access restriction.
+
+env:
+  - key: VAULTWARDEN_ADMIN_TOKEN
+    description: Vaultwarden admin panel token
+    generate: random
+  - key: VAULTWARDEN_OIDC_SECRET
+    description: Vaultwarden OIDC client secret
+    generate: random
+
+keycloak_clients:
+  - client_id: vaultwarden
+    secret_env: VAULTWARDEN_OIDC_SECRET
+    redirect_uri: "https://passwords.{{DOMAIN}}/identity/connect/oidc-signin"
+    name: Vaultwarden
+config_files: []
+
+urls:
+  - label: Vault
+    url: "https://passwords.{{DOMAIN}}"

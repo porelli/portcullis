@@ -1,0 +1,32 @@
+name: Apache Guacamole
+description: Clientless remote desktop gateway — RDP, SSH, VNC in the browser
+icon: "\U0001F5A5"
+category: remote-access
+tags: [rdp, ssh, vnc, remote-desktop, browser]
+conflicts: []
+
+auth:
+  method: native-oidc
+  sso: true
+  group_access: false
+  group_admin: false
+  access_group: users_guacamole
+  admin_group: admin_guacamole
+  notes: OpenID Connect with Keycloak plus HTTP header auth fallback. No native group-based access control — connection permissions managed in Guacamole UI.
+
+env:
+  - key: GUACAMOLE_DB_PASSWORD
+    description: Guacamole database password
+    generate: random
+
+keycloak_clients:
+  - client_id: guacamole
+    secret_env: GUACAMOLE_OIDC_SECRET
+    redirect_uri: "https://remote.{{DOMAIN}}/*"
+    name: Guacamole
+
+config_files: []
+
+urls:
+  - label: Remote Desktop
+    url: "https://remote.{{DOMAIN}}"

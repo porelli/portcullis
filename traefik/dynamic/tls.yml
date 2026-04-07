@@ -1,0 +1,28 @@
+# TLS options for the three access tiers.
+# Assign to routers via label: traefik.http.routers.<name>.tls.options=<tier>
+#
+# Protected:  RequireAndVerifyClientCert — no cert = TLS handshake fails
+# Auth-aware: VerifyClientCertIfGiven    — cert optional, verified if present
+# Public:     NoClientCert               — no client cert requested
+
+tls:
+  options:
+    protected:
+      clientAuth:
+        caFiles:
+          - /certs/ca-chain.crt
+        clientAuthType: RequireAndVerifyClientCert
+      minVersion: VersionTLS12
+      sniStrict: false
+
+    authaware:
+      clientAuth:
+        caFiles:
+          - /certs/ca-chain.crt
+        clientAuthType: VerifyClientCertIfGiven
+      minVersion: VersionTLS12
+      sniStrict: false
+
+    public:
+      minVersion: VersionTLS12
+      sniStrict: false

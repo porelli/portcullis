@@ -1,0 +1,49 @@
+name: Plex
+description: Media server for movies, TV, music with transcoding and client apps
+icon: "\U0001F3AC"
+category: media
+tags: [media, movies, tv, music, streaming]
+conflicts: []
+
+auth:
+  method: custom
+  sso: false
+  group_access: false
+  group_admin: false
+  notes: Plex uses its own plex.tv account system. No SSO or group integration possible. Claim token required for initial setup.
+
+settings:
+  - key: PLEX_MOVIES_PATH
+    label: Movies folder
+    description: Host path to your movies library
+    type: path
+    target:
+      service: plex
+      mount: /data/movies
+  - key: PLEX_TV_PATH
+    label: TV Shows folder
+    description: Host path to your TV shows library
+    type: path
+    target:
+      service: plex
+      mount: /data/tv
+  - key: PLEX_MUSIC_PATH
+    label: Music folder
+    description: Host path to your music library
+    type: path
+    target:
+      service: plex
+      mount: /data/music
+
+env:
+  - key: PLEX_CLAIM
+    description: Plex claim token (get from https://plex.tv/claim)
+    generate: none
+    required: false
+
+keycloak_clients: []
+config_files: []
+
+urls:
+  - label: Plex
+    url: "https://plex.{{DOMAIN}}"
