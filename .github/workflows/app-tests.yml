@@ -157,7 +157,7 @@ jobs:
           sed -i 's/^          //' docker-compose.ci.yml
           docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d keycloak
           for i in $(seq 1 60); do
-            curl -sf http://localhost:8080/health/ready > /dev/null 2>&1 && break
+            curl -sf http://localhost:9000/health/ready > /dev/null 2>&1 && break
             [ "$i" -eq 60 ] && { docker compose logs keycloak | tail -30; exit 1; }
             sleep 3
           done
