@@ -94,6 +94,7 @@ jobs:
           export VAULT_TOKEN=$VAULT_DEV_TOKEN
           export DOMAIN=$PORTCULLIS_DOMAIN
           export CERT_DIR=./certs
+          mkdir -p "$CERT_DIR"
 
           # Install vault CLI
           curl -fsSL https://releases.hashicorp.com/vault/1.15.4/vault_1.15.4_linux_amd64.zip -o vault.zip
