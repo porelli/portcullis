@@ -47,16 +47,28 @@ jobs:
           # Strip leading whitespace from heredoc
           sed -i 's/^[[:space:]]*//' .env
 
-      - name: Create directories for bind mounts
-        run: mkdir -p certs
+      - name: Create directories and CI compose override
+        run: |
+          mkdir -p certs
+          cat > docker-compose.ci.yml <<'YML'
+          services:
+            keycloak:
+              command: ["start-dev", "--import-realm", "--http-enabled=true", "--http-port=8080", "--hostname=https://auth.portcullis.local", "--health-enabled=true"]
+              ports:
+                - "127.0.0.1:8080:8080"
+                - "127.0.0.1:9000:9000"
+            lldap:
+              ports:
+                - "127.0.0.1:17170:17170"
+          YML
+          sed -i 's/^          //' docker-compose.ci.yml
 
       - name: Build enrollment UI
-        run: docker compose build enroll
+        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml build enroll
 
       - name: Start core services (without Traefik ACME)
         run: |
-          # Start services that don't depend on ACME
-          docker compose up -d postgres vault lldap
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d postgres vault lldap
           echo "Waiting for core services..."
           sleep 10
 
@@ -125,16 +137,6 @@ jobs:
 
       - name: Start Keycloak
         run: |
-          # Use start-dev to skip the slow build/optimization step in CI
-          cat > docker-compose.ci.yml <<'YML'
-          services:
-            keycloak:
-              command: ["start-dev", "--import-realm", "--http-enabled=true", "--http-port=8080", "--hostname=https://auth.portcullis.local", "--health-enabled=true"]
-              ports:
-                - "127.0.0.1:8080:8080"
-                - "127.0.0.1:9000:9000"
-          YML
-          sed -i 's/^          //' docker-compose.ci.yml
           docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d keycloak
           echo "Waiting for Keycloak to start..."
           for i in $(seq 1 90); do
