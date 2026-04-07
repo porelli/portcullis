@@ -13,6 +13,7 @@ VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
 VAULT_TOKEN="${VAULT_TOKEN:-myroot}"
 CERT_DIR="${CERT_DIR:-./certs}"
 DOMAIN="${DOMAIN:-portcullis.local}"
+mkdir -p "$CERT_DIR"
 TTL_ROOT="87600h"          # 10 years
 TTL_INTERMEDIATE="43800h"  # 5 years
 TTL_CLIENT="24h"           # short-lived client certs
