@@ -139,6 +139,9 @@ jobs:
 
       - name: Boot infrastructure
         run: |
+          # Create proxy network for app containers
+          docker network create portcullis-proxy 2>/dev/null || true
+
           # Start core services
           docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d postgres vault lldap
           sleep 10
@@ -196,4 +199,6 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: docker compose down -v 2>/dev/null || true
+        run: |
+          docker compose down -v 2>/dev/null || true
+          docker network rm portcullis-proxy 2>/dev/null || true
