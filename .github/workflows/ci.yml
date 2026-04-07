@@ -382,10 +382,12 @@ jobs:
             $(docker compose ps -q enroll) 2>/dev/null || echo "")
 
           if [ -n "$ENROLL_IP" ]; then
-            CSR=$(cat /tmp/test-client.csr)
+            # Build JSON payload with properly escaped CSR
+            PAYLOAD=$(jq -n --arg csr "$(cat /tmp/test-client.csr)" \
+              '{username:"testuser",email:"testuser@portcullis.local",csr:$csr}')
             RESPONSE=$(curl -s -X POST "http://$ENROLL_IP:8443/api/sign" \
               -H "Content-Type: application/json" \
-              -d "{\"username\":\"testuser\",\"email\":\"testuser@portcullis.local\",\"csr\":\"$CSR\"}" 2>/dev/null)
+              -d "$PAYLOAD" 2>/dev/null)
 
             SERIAL=$(echo "$RESPONSE" | jq -r '.serial // empty')
             if [ -n "$SERIAL" ]; then
