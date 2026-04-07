@@ -153,6 +153,9 @@ jobs:
           services:
             keycloak:
               command: ["start-dev", "--import-realm", "--http-enabled=true", "--http-port=8080", "--hostname=https://auth.portcullis.local", "--health-enabled=true"]
+              ports:
+                - "127.0.0.1:8080:8080"
+                - "127.0.0.1:9000:9000"
           YML
           sed -i 's/^          //' docker-compose.ci.yml
           docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d keycloak
