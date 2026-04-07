@@ -30,20 +30,25 @@ jobs:
 
       - name: Create .env file
         run: |
-          cat > .env <<EOF
-          PORTCULLIS_DOMAIN=$PORTCULLIS_DOMAIN
-          ACME_EMAIL=$ACME_EMAIL
-          VAULT_DEV_TOKEN=$VAULT_DEV_TOKEN
-          KEYCLOAK_ADMIN=$KEYCLOAK_ADMIN
-          KEYCLOAK_ADMIN_PASSWORD=$KEYCLOAK_ADMIN_PASSWORD
-          POSTGRES_PASSWORD=$POSTGRES_PASSWORD
-          LLDAP_ADMIN_PASSWORD=$LLDAP_ADMIN_PASSWORD
-          LLDAP_JWT_SECRET=$LLDAP_JWT_SECRET
-          LLDAP_BASE_DN=$LLDAP_BASE_DN
-          FORWARD_AUTH_CLIENT_SECRET=$FORWARD_AUTH_CLIENT_SECRET
-          FORWARD_AUTH_SECRET=$FORWARD_AUTH_SECRET
+          cat > .env <<'ENVEOF'
+          PORTCULLIS_DOMAIN=portcullis.local
+          ACME_EMAIL=ci@portcullis.local
+          VAULT_DEV_TOKEN=ci-test-token
+          KEYCLOAK_ADMIN=admin
+          KEYCLOAK_ADMIN_PASSWORD=ci-admin-pass
+          POSTGRES_PASSWORD=ci-pg-pass
+          LLDAP_ADMIN_PASSWORD=ci-lldap-pass
+          LLDAP_JWT_SECRET=ci-jwt-secret-value
+          LLDAP_BASE_DN=dc=portcullis,dc=local
+          FORWARD_AUTH_CLIENT_SECRET=ci-forward-auth-secret
+          FORWARD_AUTH_SECRET=ci-forward-auth-cookie-secret
           CLOUDFLARE_API_TOKEN=
-          EOF
+          ENVEOF
+          # Strip leading whitespace from heredoc
+          sed -i 's/^[[:space:]]*//' .env
+
+      - name: Create directories for bind mounts
+        run: mkdir -p certs
 
       - name: Build enrollment UI
         run: docker compose build enroll

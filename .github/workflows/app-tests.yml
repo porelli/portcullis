@@ -90,6 +90,11 @@ jobs:
           GITLAB_OIDC_SECRET=ci-gitlab-oidc
           NEXTCLOUD_ADMIN_PASSWORD=ci-nextcloud-pass
           ENVEOF
+          # Strip leading whitespace from heredoc
+          sed -i 's/^[[:space:]]*//' .env
+
+      - name: Create directories for bind mounts
+        run: mkdir -p certs
 
       - name: Start core services
         run: |
