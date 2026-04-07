@@ -139,11 +139,8 @@ jobs:
 
       - name: Boot infrastructure
         run: |
-          # Create proxy network for app containers
-          docker network create portcullis-proxy 2>/dev/null || true
-
-          # Start core services
-          docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d postgres vault lldap
+          # Start core services + traefik (traefik creates portcullis-proxy network)
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d postgres vault lldap traefik
           sleep 10
 
           # Wait for services
@@ -179,8 +176,8 @@ jobs:
           ./scripts/configure-keycloak.sh
           ./scripts/register-oidc-clients.sh
 
-          # Start auth services
-          docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d traefik forward-auth group-gate
+          # Start auth services (traefik already running from initial boot)
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d forward-auth group-gate
           sleep 5
 
       - name: "Test: ${{ matrix.app }}"
@@ -199,6 +196,4 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: |
-          docker compose down -v 2>/dev/null || true
-          docker network rm portcullis-proxy 2>/dev/null || true
+        run: docker compose down -v 2>/dev/null || true
