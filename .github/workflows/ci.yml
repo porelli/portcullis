@@ -125,7 +125,14 @@ jobs:
 
       - name: Start Keycloak
         run: |
-          docker compose up -d keycloak
+          # Use start-dev to skip the slow build/optimization step in CI
+          cat > docker-compose.ci.yml <<'YML'
+          services:
+            keycloak:
+              command: ["start-dev", "--import-realm", "--http-enabled=true", "--http-port=8080", "--hostname=https://auth.portcullis.local", "--health-enabled=true"]
+          YML
+          sed -i 's/^          //' docker-compose.ci.yml
+          docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d keycloak
           echo "Waiting for Keycloak to start..."
           for i in $(seq 1 90); do
             if curl -sf http://localhost:8080/health/ready > /dev/null 2>&1; then
