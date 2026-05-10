@@ -208,10 +208,10 @@ jobs:
 
           # Check browser flow
           BROWSER_FLOW=$(echo "$REALM" | jq -r '.browserFlow')
-          if [ "$BROWSER_FLOW" = "portcullis-browser-flow" ]; then
-            echo "PASS: Browser flow set to portcullis-browser-flow"
+          if [ "$BROWSER_FLOW" = "portcullis-universal" ]; then
+            echo "PASS: Browser flow set to portcullis-universal"
           else
-            echo "FAIL: Browser flow is $BROWSER_FLOW, expected portcullis-browser-flow"
+            echo "FAIL: Browser flow is $BROWSER_FLOW, expected portcullis-universal"
             exit 1
           fi
 
