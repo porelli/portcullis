@@ -85,9 +85,9 @@ Traefik uses three TLS tiers:
 | **authaware** | `VerifyClientCertIfGiven` | Client cert **optional** — verified if present, WebAuthn fallback if not |
 | **public** | `NoClientCert` | No client cert requested |
 
-Most apps use `authaware` — users with a PIV certificate (YubiKey) are authenticated automatically via X.509, while users without a cert fall through to WebAuthn.
+The tier is no longer hard-coded per template. The Hub derives it from each app's **access policy** (see `docs/operations/auth-policies.md` in the docs site) and writes the chosen tier into a per-app compose override. You change tiers by editing the app's policy in the Hub UI, not by editing `compose.yml`.
 
-Vault UI uses `protected` — it requires a valid client certificate (highest security tier).
+Most apps end up on `authaware` with a default policy of "any of mTLS / WebAuthn" — users with a PIV certificate are authenticated automatically via X.509, users without fall through to WebAuthn. Apps with "mTLS only" or "all of … mTLS" get `protected`; public apps get `public`.
 
 **Issuing client certificates:**
 

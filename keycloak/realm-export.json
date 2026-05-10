@@ -34,10 +34,13 @@
   "webAuthnPolicyPasswordlessUserVerificationRequirement": "required",
   "webAuthnPolicyPasswordlessCreateTimeout": 60,
   "webAuthnPolicyPasswordlessAvoidSameAuthenticatorRegister": true,
+  "attributes": {
+    "acr.loa.map": "{\"public\":\"0\",\"pwd\":\"1\",\"hwk\":\"2\",\"mtls\":\"3\"}"
+  },
   "authenticationFlows": [
     {
-      "alias": "portcullis-browser-flow",
-      "description": "Browser flow: cookie → X.509 client cert → WebAuthn passwordless → username + WebAuthn",
+      "alias": "portcullis-universal",
+      "description": "Universal LoA-aware flow: cookie reuse + three conditional LoA subflows (pwd=1, hwk=2, mtls=3)",
       "providerId": "basic-flow",
       "topLevel": true,
       "builtIn": false,
@@ -49,44 +52,139 @@
           "priority": 10
         },
         {
+          "authenticatorFlow": true,
+          "requirement": "CONDITIONAL",
+          "priority": 20,
+          "flowAlias": "portcullis-loa-1"
+        },
+        {
+          "authenticatorFlow": true,
+          "requirement": "CONDITIONAL",
+          "priority": 30,
+          "flowAlias": "portcullis-loa-2"
+        },
+        {
+          "authenticatorFlow": true,
+          "requirement": "CONDITIONAL",
+          "priority": 40,
+          "flowAlias": "portcullis-loa-3"
+        }
+      ]
+    },
+    {
+      "alias": "portcullis-loa-1",
+      "description": "LoA 1: any single factor (password, hardware key, or mTLS cert)",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "conditional-level-of-authentication",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 10,
+          "authenticatorConfig": "loa-1-config"
+        },
+        {
+          "authenticatorFlow": true,
+          "requirement": "REQUIRED",
+          "priority": 20,
+          "flowAlias": "portcullis-loa-1-factors"
+        }
+      ]
+    },
+    {
+      "alias": "portcullis-loa-1-factors",
+      "description": "Any factor satisfies LoA 1",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
           "authenticator": "auth-x509-client-username-form",
           "authenticatorFlow": false,
           "requirement": "ALTERNATIVE",
-          "priority": 20,
+          "priority": 10,
           "authenticatorConfig": "x509-config"
         },
         {
           "authenticator": "webauthn-authenticator-passwordless",
           "authenticatorFlow": false,
           "requirement": "ALTERNATIVE",
-          "priority": 30
+          "priority": 20
         },
         {
-          "authenticatorFlow": true,
+          "authenticator": "auth-username-password-form",
+          "authenticatorFlow": false,
           "requirement": "ALTERNATIVE",
-          "priority": 40,
-          "flowAlias": "portcullis-username-webauthn"
+          "priority": 30
         }
       ]
     },
     {
-      "alias": "portcullis-username-webauthn",
-      "description": "Username form followed by WebAuthn (for non-passwordless keys)",
+      "alias": "portcullis-loa-2",
+      "description": "LoA 2: hardware-backed factor required (WebAuthn or mTLS cert)",
       "providerId": "basic-flow",
       "topLevel": false,
       "builtIn": false,
       "authenticationExecutions": [
         {
-          "authenticator": "auth-username-form",
+          "authenticator": "conditional-level-of-authentication",
           "authenticatorFlow": false,
           "requirement": "REQUIRED",
-          "priority": 10
+          "priority": 10,
+          "authenticatorConfig": "loa-2-config"
         },
         {
-          "authenticator": "webauthn-authenticator",
+          "authenticatorFlow": true,
+          "requirement": "REQUIRED",
+          "priority": 20,
+          "flowAlias": "portcullis-loa-2-factors"
+        }
+      ]
+    },
+    {
+      "alias": "portcullis-loa-2-factors",
+      "description": "Hardware factor satisfies LoA 2",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "auth-x509-client-username-form",
+          "authenticatorFlow": false,
+          "requirement": "ALTERNATIVE",
+          "priority": 10,
+          "authenticatorConfig": "x509-config"
+        },
+        {
+          "authenticator": "webauthn-authenticator-passwordless",
+          "authenticatorFlow": false,
+          "requirement": "ALTERNATIVE",
+          "priority": 20
+        }
+      ]
+    },
+    {
+      "alias": "portcullis-loa-3",
+      "description": "LoA 3: mTLS client certificate required",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "conditional-level-of-authentication",
           "authenticatorFlow": false,
           "requirement": "REQUIRED",
-          "priority": 20
+          "priority": 10,
+          "authenticatorConfig": "loa-3-config"
+        },
+        {
+          "authenticator": "auth-x509-client-username-form",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 20,
+          "authenticatorConfig": "x509-config"
         }
       ]
     },
@@ -124,9 +222,21 @@
         "x509-cert-auth.extendedkeyusage": "",
         "x509-cert-auth.confirmation-page-disallowed": "true"
       }
+    },
+    {
+      "alias": "loa-1-config",
+      "config": { "loa": "1", "max_age": "36000" }
+    },
+    {
+      "alias": "loa-2-config",
+      "config": { "loa": "2", "max_age": "36000" }
+    },
+    {
+      "alias": "loa-3-config",
+      "config": { "loa": "3", "max_age": "36000" }
     }
   ],
-  "browserFlow": "portcullis-browser-flow",
+  "browserFlow": "portcullis-universal",
   "requiredActions": [
     {
       "alias": "webauthn-register",
@@ -290,7 +400,7 @@
     {
       "clientId": "portcullis-forward-auth",
       "name": "Portcullis Forward Auth",
-      "description": "OIDC client used by Traefik forward auth middleware for WebAuthn-authenticated users",
+      "description": "OIDC client used by Traefik forward auth middleware. ACR/AMR claims surface per-session LoA to group-gate for per-app policy enforcement.",
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,
@@ -303,10 +413,14 @@
       "webOrigins": [
         "+"
       ],
+      "attributes": {
+        "default.acr.values": "pwd"
+      },
       "defaultClientScopes": [
         "openid",
         "profile",
-        "email"
+        "email",
+        "acr"
       ]
     }
   ],

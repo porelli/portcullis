@@ -1,23 +1,58 @@
 #!/usr/bin/env python3
-"""Group-gate: per-app group authorization middleware for Traefik ForwardAuth.
+"""Group-gate: per-app authorization middleware for Traefik ForwardAuth.
 
-Reads X-Forwarded-Host to determine which app is being accessed,
-then checks X-Auth-Request-Groups (set by oauth2-proxy) for the
-required users_<app> group. Returns 200 (allow) or 403 (deny).
+Two checks, run in order:
+  1. Auth policy — does the current session's ACR/AMR satisfy the app's
+     required factor set (one of mtls/webauthn/password, with AND/OR
+     semantics)? If not, 403 with a stepup URL so the user can re-auth
+     at the needed Level of Authentication.
+  2. Group — does the user belong to the subdomain's required LLDAP
+     group (users_<app>)? If not, 403.
 
-Config: GATE_MAP env var or /etc/group-gate/map.conf file.
-Format: one "subdomain=required_group" per line.
+Config sources:
+  - /etc/group-gate/map.conf — subdomain=required_group (existing)
+  - /hub-data/group-gate-policy.json — written by the Hub with per-app
+    {factors, op} policies plus a global default. Optional; no file
+    means every app falls through to the group check only.
+
+Access token is read from X-Forwarded-Access-Token (oauth2-proxy with
+PASS_ACCESS_TOKEN=true). The JWT signature is NOT verified here — it was
+already verified upstream by oauth2-proxy before the request reaches us.
+We only decode the payload to read the acr/amr claims.
 """
 
+from __future__ import annotations
+
+import base64
+import json
 import os
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from typing import Optional, Tuple
 
 LISTEN_PORT = int(os.environ.get("GATE_PORT", "8080"))
+POLICY_FILE = os.environ.get("GATE_POLICY_FILE", "/hub-data/group-gate-policy.json")
 
-def load_map():
-    """Load subdomain→group mapping from env or file."""
+# Factor string ↔ AMR value used in tokens (RFC 8176 where possible).
+FACTOR_TO_AMR = {
+    "mtls": "mtls",
+    "webauthn": "hwk",
+    "password": "pwd",
+}
+
+# Factor → LoA level (must match the realm acr.loa.map).
+FACTOR_TO_LOA = {
+    "password": 1,
+    "webauthn": 2,
+    "mtls": 3,
+}
+
+# acr string → LoA int (must match realm acr.loa.map).
+ACR_TO_LOA = {"public": 0, "pwd": 1, "hwk": 2, "mtls": 3}
+
+
+def load_group_map():
     mapping = {}
-    # From file
     conf = os.environ.get("GATE_MAP_FILE", "/etc/group-gate/map.conf")
     if os.path.isfile(conf):
         with open(conf) as f:
@@ -28,7 +63,6 @@ def load_map():
                 if "=" in line:
                     sub, group = line.split("=", 1)
                     mapping[sub.strip()] = group.strip()
-    # From env (overrides file)
     env_map = os.environ.get("GATE_MAP", "")
     for pair in env_map.split(","):
         pair = pair.strip()
@@ -37,30 +71,152 @@ def load_map():
             mapping[sub.strip()] = group.strip()
     return mapping
 
-GATE = load_map()
-print(f"group-gate: loaded {len(GATE)} mappings: {GATE}")
+
+def load_policy_file():
+    """Return {policies: {app_id: {factors: [...], op: str}}, default: {...}} or empty dict."""
+    try:
+        with open(POLICY_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+GATE = load_group_map()
+print(f"group-gate: loaded {len(GATE)} group mappings: {GATE}", flush=True)
+
+
+def decode_jwt_payload(token: str) -> dict:
+    """Decode a JWT payload without verifying the signature.
+
+    The token has already been verified by oauth2-proxy upstream — we're
+    inside the trust boundary and only need the claims.
+    """
+    try:
+        _header, payload, _sig = token.split(".", 2)
+    except ValueError:
+        return {}
+    # JWT uses base64url without padding; re-pad and decode.
+    padded = payload + "=" * (-len(payload) % 4)
+    try:
+        return json.loads(base64.urlsafe_b64decode(padded.encode()))
+    except (ValueError, UnicodeDecodeError):
+        return {}
+
+
+def resolve_policy(policy_doc: dict, subdomain: str) -> Optional[dict]:
+    """Return {factors, op} for this app, or None if no policy configured."""
+    if not policy_doc:
+        return None
+    policies = policy_doc.get("policies") or {}
+    if subdomain in policies:
+        return policies[subdomain]
+    default = policy_doc.get("default")
+    if default and default.get("factors") is not None:
+        return default
+    return None
+
+
+def evaluate_policy(policy: dict, acr: str, amr: list) -> Tuple[bool, str, int]:
+    """Return (allowed, reason, required_loa).
+
+    required_loa is the LoA the user needs to reach to satisfy the policy;
+    callers can encode it in a stepup URL when allowed=False.
+    """
+    factors = [f for f in (policy.get("factors") or []) if f in FACTOR_TO_AMR]
+    op = (policy.get("op") or "").lower() or ("any" if len(factors) > 1 else "")
+
+    # No factors = public, allow.
+    if not factors:
+        return True, "public", 0
+
+    amr_set = set(amr or [])
+    needed_amrs = {FACTOR_TO_AMR[f] for f in factors}
+
+    if op == "all":
+        required_loa = max(FACTOR_TO_LOA[f] for f in factors)
+        if needed_amrs.issubset(amr_set):
+            return True, f"all factors present (amr={sorted(amr_set)})", required_loa
+        missing = sorted(needed_amrs - amr_set)
+        return False, f"need all of {sorted(needed_amrs)}, missing {missing}", required_loa
+
+    # op == "any" (or len == 1)
+    required_loa = min(FACTOR_TO_LOA[f] for f in factors)
+    if amr_set & needed_amrs:
+        return True, f"amr {sorted(amr_set & needed_amrs)} satisfies any-of {sorted(needed_amrs)}", required_loa
+    return False, f"need any of {sorted(needed_amrs)}, have {sorted(amr_set)}", required_loa
+
+
+def stepup_url(host: str, needed_loa: int, factors: list) -> str:
+    """Build a stepup URL that points oauth2-proxy at Keycloak with the right acr_values."""
+    # Map LoA back to the acr string the realm knows (see acr.loa.map).
+    loa_to_acr = {0: "public", 1: "pwd", 2: "hwk", 3: "mtls"}
+    acr = loa_to_acr.get(needed_loa, "pwd")
+    # Redirect via oauth2-proxy's sign_in with acr_values hint; Keycloak
+    # triggers the LoA conditional subflow.
+    query = urllib.parse.urlencode({"acr_values": acr})
+    return f"https://{host}/oauth2/start?{query}"
+
+
+def safe_factor_name(amr: str) -> str:
+    for factor, amr_value in FACTOR_TO_AMR.items():
+        if amr_value == amr:
+            return factor
+    return amr
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         host = self.headers.get("X-Forwarded-Host", "")
-        groups_raw = self.headers.get("X-Auth-Request-Groups", "")
+        subdomain = host.split(".")[0] if host else ""
         user = self.headers.get("X-Auth-Request-Email", "") or self.headers.get("X-Auth-Request-User", "unknown")
 
-        # Extract subdomain (first component of host)
-        subdomain = host.split(".")[0] if host else ""
+        # Per-request policy reload — the Hub rewrites this file on each
+        # policy change. Cheap (<1kb JSON, rare reads).
+        policy_doc = load_policy_file()
+        policy = resolve_policy(policy_doc, subdomain)
 
-        # Debug: log first few requests
-        if not hasattr(Handler, '_debug_count'):
-            Handler._debug_count = 0
-        if Handler._debug_count < 3:
-            Handler._debug_count += 1
-            print(f"group-gate: req#{Handler._debug_count} host={host} sub={subdomain} user={user} groups_raw='{groups_raw}' required={GATE.get(subdomain, 'NONE')}")
+        # --- Auth policy check (optional, only when policy is set) ---
+        if policy:
+            access_token = self.headers.get("X-Forwarded-Access-Token", "")
+            if not access_token:
+                auth_header = self.headers.get("Authorization", "")
+                if auth_header.lower().startswith("bearer "):
+                    access_token = auth_header[7:]
 
-        # Look up required group
-        required = GATE.get(subdomain)
-        if not required:
-            # No mapping = no group restriction, allow through
+            claims = decode_jwt_payload(access_token) if access_token else {}
+            acr = claims.get("acr", "")
+            amr = claims.get("amr") or []
+
+            allowed, reason, required_loa = evaluate_policy(policy, acr, amr)
+            if not allowed:
+                url = stepup_url(host or "localhost", required_loa, policy.get("factors") or [])
+                self.send_response(403)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("X-Stepup-URL", url)
+                self.end_headers()
+                factors = policy.get("factors") or []
+                op = policy.get("op") or "any"
+                have = ", ".join(safe_factor_name(a) for a in amr) or "none"
+                need_desc = f"{op} of: {', '.join(factors)}"
+                self.wfile.write(
+                    (
+                        f"<h1>Step up required</h1>"
+                        f"<p><b>{subdomain}</b> requires {need_desc}. "
+                        f"Your session currently has: <code>{have}</code>.</p>"
+                        f"<p><a href=\"{url}\">Click here to authenticate with the required factor</a>.</p>"
+                    ).encode()
+                )
+                print(
+                    f"group-gate: STEPUP user={user} host={host} policy={policy} "
+                    f"acr={acr!r} amr={amr} reason={reason!r}",
+                    flush=True,
+                )
+                return
+
+        # --- Group check (existing behavior) ---
+        groups_raw = self.headers.get("X-Auth-Request-Groups", "")
+        required_group = GATE.get(subdomain)
+        if not required_group:
             self.send_response(200)
             email = self.headers.get("X-Auth-Request-Email", "")
             if email:
@@ -68,38 +224,32 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        # Parse groups (comma or space separated)
         groups = {g.strip().strip('"') for g in groups_raw.replace(",", " ").split() if g.strip()}
-
-        if required in groups:
+        if required_group in groups:
             self.send_response(200)
-            # Pass user identity as X-Forwarded-User for header-auth apps
             email = self.headers.get("X-Auth-Request-Email", "")
             if email:
                 self.send_header("X-Forwarded-User", email)
             self.end_headers()
-        else:
-            self.send_response(403)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(
-                f"<h1>Access Denied</h1><p>User <b>{user}</b> is not authorized to access <b>{subdomain}</b>.</p>"
-                f"<p>Required group: <code>{required}</code></p>".encode()
-            )
-            print(f"group-gate: DENIED user={user} host={host} need={required} have={groups}")
+            return
+
+        self.send_response(403)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        self.wfile.write(
+            f"<h1>Access Denied</h1><p>User <b>{user}</b> is not authorized to access <b>{subdomain}</b>.</p>"
+            f"<p>Required group: <code>{required_group}</code></p>".encode()
+        )
+        print(
+            f"group-gate: DENIED user={user} host={host} need={required_group} have={groups}",
+            flush=True,
+        )
 
     def log_message(self, fmt, *args):
-        # Suppress default per-request logs (denials logged above)
+        # Default per-request logs are noisy; explicit logging above.
         pass
-
-    def do_first_debug(self):
-        """Log first request details for verification, then stop."""
-        host = self.headers.get("X-Forwarded-Host", "")
-        groups = self.headers.get("X-Auth-Request-Groups", "NONE")
-        user = self.headers.get("X-Auth-Request-Email", "")
-        print(f"group-gate: DEBUG host={host} user={user} groups={groups}")
 
 
 if __name__ == "__main__":
-    print(f"group-gate: listening on :{LISTEN_PORT}")
+    print(f"group-gate: listening on :{LISTEN_PORT}, policy_file={POLICY_FILE}", flush=True)
     HTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
