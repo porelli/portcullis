@@ -84,7 +84,11 @@ services:
       POSTGRES_USER: keycloak
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # Postgres 18+ expects the mount at /var/lib/postgresql (the image stores
+      # data under a versioned subdir so pg_upgrade can work without mount
+      # boundary issues). Mounting at /var/lib/postgresql/data makes the image
+      # refuse to start on a fresh volume.
+      - postgres_data:/var/lib/postgresql
     networks:
       - portcullis
     healthcheck:
