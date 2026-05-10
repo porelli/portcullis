@@ -211,7 +211,7 @@ services:
     extra_hosts:
       - "auth.${PORTCULLIS_DOMAIN:-portcullis.local}:host-gateway"
     volumes:
-      - ./certs/ca-bundle-with-staging.crt:/etc/ssl/certs/ca-certificates.crt:ro
+      - ./certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
     environment:
       # OIDC provider
       OAUTH2_PROXY_PROVIDER: oidc

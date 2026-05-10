@@ -22,7 +22,7 @@ docker compose up -d --force-recreate traefik
 
 - Uses Let's Encrypt **staging** CA — no rate limits, but **browsers won't trust the certificate**.
 - Great for initial setup, testing, and development.
-- All app containers that talk to Keycloak over HTTPS need the staging CA bundle mounted (`ca-bundle-with-staging.crt`). This is handled automatically.
+- App containers that talk to Keycloak over HTTPS mount `certs/ca-bundle.crt`, which `apply-config.sh` builds from: system CAs + the internal Portcullis PKI chain + the Let's Encrypt staging root (only when `ACME_STAGING=true`). This is handled automatically.
 
 **Browser workarounds:**
 
@@ -160,10 +160,10 @@ Same as above — staging CA is not trusted by browsers.
 
 ### App shows "unable to get local issuer certificate"
 The app container can't verify Keycloak's staging TLS cert. Make sure:
-- `certs/ca-bundle-with-staging.crt` exists (run `./scripts/apply-config.sh`)
-- The container mounts it (check compose.yml for `ca-bundle-with-staging.crt` volume mount)
-- For Node.js apps: set `NODE_EXTRA_CA_CERTS=/path/to/ca-bundle-with-staging.crt`
-- For Go apps: set `SSL_CERT_FILE=/path/to/ca-bundle-with-staging.crt`
+- `certs/ca-bundle.crt` exists (run `./scripts/apply-config.sh`)
+- The container mounts it (check compose.yml for `ca-bundle.crt` volume mount)
+- For Node.js apps: set `NODE_EXTRA_CA_CERTS=/path/to/ca-bundle.crt`
+- For Go apps: set `SSL_CERT_FILE=/path/to/ca-bundle.crt`
 
 ### mTLS: "ERR_BAD_SSL_CLIENT_AUTH_CERT"
 Your client certificate is invalid, expired, or not signed by the Portcullis CA. Re-enroll your YubiKey via the Enrollment UI.

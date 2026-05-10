@@ -26,39 +26,74 @@ echo "  MTLS_ENABLED=$MTLS_ENABLED"
 echo ""
 
 # ── ACME Staging / Production ──────────────────────────────
+# Detect a flip vs the last-applied value. The ACME account and issued
+# certs in acme.json are bound to the CA directory URL, so switching
+# directions without wiping the file leaves Traefik trying to reuse a
+# staging account against production (or vice versa) — it often keeps
+# serving the old cert until the file is cleared.
+SENTINEL="certs/.acme-staging-last"
+LAST_STAGING=""
+[ -f "$SENTINEL" ] && LAST_STAGING=$(cat "$SENTINEL")
+
+if [ -n "$LAST_STAGING" ] && [ "$LAST_STAGING" != "$ACME_STAGING" ]; then
+  echo "ACME_STAGING flipped: $LAST_STAGING → $ACME_STAGING"
+  echo "  Clearing Traefik ACME storage so it re-registers against the new CA."
+  # Stop Traefik if running (best-effort) and wipe acme.json
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^portcullis-traefik-1$'; then
+    docker compose stop traefik >/dev/null 2>&1 || true
+  fi
+  docker volume inspect portcullis_traefik_acme >/dev/null 2>&1 && \
+    docker run --rm -v portcullis_traefik_acme:/acme alpine sh -c 'rm -f /acme/acme.json' >/dev/null 2>&1 || true
+  echo "  ACME storage cleared. Traefik will re-register on next start."
+fi
+
 if [ "$ACME_STAGING" = "true" ]; then
   CA_SERVER="https://acme-staging-v02.api.letsencrypt.org/directory"
   echo "TLS: Using Let's Encrypt STAGING (untrusted certs)"
   echo "     Browsers will show certificate warnings."
-  echo "     Chrome: /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --ignore-certificate-errors"
-
-  # Create CA bundle with staging CA for app containers
-  if [ -f certs/ca-chain.crt ]; then
-    # Fetch Let's Encrypt staging root if not cached
-    STAGING_CA="certs/letsencrypt-stg-root-x1.pem"
-    if [ ! -f "$STAGING_CA" ]; then
-      curl -sf -o "$STAGING_CA" "https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem" 2>/dev/null || true
-    fi
-    # Combine system CAs + staging root + our PKI chain
-    cat /etc/ssl/certs/ca-certificates.crt "$STAGING_CA" certs/ca-chain.crt > certs/ca-bundle-with-staging.crt 2>/dev/null || \
-    cat certs/ca-chain.crt "$STAGING_CA" > certs/ca-bundle-with-staging.crt 2>/dev/null || true
-    echo "     Created certs/ca-bundle-with-staging.crt"
-  fi
 else
   CA_SERVER="https://acme-v02.api.letsencrypt.org/directory"
   echo "TLS: Using Let's Encrypt PRODUCTION (trusted certs)"
-
-  # Production certs don't need a custom CA bundle
-  # Create a symlink so containers that mount ca-bundle-with-staging.crt still work
-  if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
-    cp /etc/ssl/certs/ca-certificates.crt certs/ca-bundle-with-staging.crt
-  fi
-  echo "     certs/ca-bundle-with-staging.crt → system CA bundle"
 fi
+
+# Build the CA bundle for app containers.
+# Always includes:
+#   - System CAs (so public issuers like Let's Encrypt production are trusted)
+#   - Internal Portcullis PKI chain (so apps can verify internal-only certs)
+# Adds staging root only when ACME_STAGING=true.
+BUNDLE="certs/ca-bundle.crt"
+LEGACY_BUNDLE="certs/ca-bundle-with-staging.crt"
+mkdir -p certs
+
+: > "$BUNDLE"
+if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+  cat /etc/ssl/certs/ca-certificates.crt >> "$BUNDLE"
+elif [ -f /etc/pki/tls/certs/ca-bundle.crt ]; then
+  cat /etc/pki/tls/certs/ca-bundle.crt >> "$BUNDLE"
+fi
+if [ -f certs/ca-chain.crt ]; then
+  cat certs/ca-chain.crt >> "$BUNDLE"
+fi
+if [ "$ACME_STAGING" = "true" ]; then
+  STAGING_CA="certs/letsencrypt-stg-root-x1.pem"
+  if [ ! -f "$STAGING_CA" ]; then
+    curl -sf -o "$STAGING_CA" "https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem" 2>/dev/null || true
+  fi
+  [ -f "$STAGING_CA" ] && cat "$STAGING_CA" >> "$BUNDLE"
+fi
+echo "     Wrote $BUNDLE (system + internal PKI$([ "$ACME_STAGING" = "true" ] && echo " + staging root"))"
+
+# Back-compat: keep the old filename populated for any compose files that
+# still reference it. Prefer a real file copy over a symlink so bind mounts
+# resolve consistently through the Docker daemon.
+cp "$BUNDLE" "$LEGACY_BUNDLE"
+
+# Record what we applied so we can detect the next flip.
+echo "$ACME_STAGING" > "$SENTINEL"
 
 # Update ACME_CA_SERVER in .env
 if grep -q '^ACME_CA_SERVER=' "$ENV_FILE"; then
-  sed -i "s|^ACME_CA_SERVER=.*|ACME_CA_SERVER=$CA_SERVER|" "$ENV_FILE"
+  sed -i.bak "s|^ACME_CA_SERVER=.*|ACME_CA_SERVER=$CA_SERVER|" "$ENV_FILE" && rm -f "${ENV_FILE}.bak"
 else
   echo "ACME_CA_SERVER=$CA_SERVER" >> "$ENV_FILE"
 fi
