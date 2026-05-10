@@ -62,7 +62,6 @@ fi
 #   - Internal Portcullis PKI chain (so apps can verify internal-only certs)
 # Adds staging root only when ACME_STAGING=true.
 BUNDLE="certs/ca-bundle.crt"
-LEGACY_BUNDLE="certs/ca-bundle-with-staging.crt"
 mkdir -p certs
 
 : > "$BUNDLE"
@@ -82,11 +81,6 @@ if [ "$ACME_STAGING" = "true" ]; then
   [ -f "$STAGING_CA" ] && cat "$STAGING_CA" >> "$BUNDLE"
 fi
 echo "     Wrote $BUNDLE (system + internal PKI$([ "$ACME_STAGING" = "true" ] && echo " + staging root"))"
-
-# Back-compat: keep the old filename populated for any compose files that
-# still reference it. Prefer a real file copy over a symlink so bind mounts
-# resolve consistently through the Docker daemon.
-cp "$BUNDLE" "$LEGACY_BUNDLE"
 
 # Record what we applied so we can detect the next flip.
 echo "$ACME_STAGING" > "$SENTINEL"
