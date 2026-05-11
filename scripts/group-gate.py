@@ -147,17 +147,21 @@ def evaluate_policy(policy: dict, acr: str, amr: list) -> Tuple[bool, str, int]:
 
 
 def stepup_url(host: str, needed_loa: int, factors: list) -> str:
-    """Build a stepup URL that signs the user out of oauth2-proxy and then
-    redirects to the app root. oauth2-proxy will start a fresh authorization
-    request with its configured acr_values, which administrators should
-    align with the strictest enabled app's policy.
+    """Build a step-up URL that asks oauth2-proxy for a fresh login at the
+    required Level of Authentication.
 
-    Per-request acr_values (true LoA step-up without full re-auth) requires
-    oauth2-proxy's login_url_parameters config — available only in the alpha
-    config format from 7.10+. When we upgrade, this helper can emit
-    /oauth2/start?acr_values=<acr> directly."""
-    query = urllib.parse.urlencode({"rd": f"https://{host}/"})
-    return f"https://{host}/oauth2/sign_out?{query}"
+    The flow is: sign out of oauth2-proxy (so it doesn't short-circuit back
+    to the existing too-weak session), then /oauth2/start?acr_values=<acr>&rd=...
+    which oauth2-proxy forwards to Keycloak (per-request acr_values enabled
+    via loginURLParameters in alpha config). Keycloak triggers the matching
+    LoA conditional subflow and prompts the user for the missing factor.
+    """
+    loa_to_acr = {0: "public", 1: "pwd", 2: "hwk", 3: "mtls"}
+    acr = loa_to_acr.get(needed_loa, "pwd")
+    start_q = urllib.parse.urlencode({"acr_values": acr, "rd": f"https://{host}/"})
+    start_url = f"https://{host}/oauth2/start?{start_q}"
+    sign_out_q = urllib.parse.urlencode({"rd": start_url})
+    return f"https://{host}/oauth2/sign_out?{sign_out_q}"
 
 
 def safe_factor_name(amr: str) -> str:
@@ -201,6 +205,25 @@ class Handler(BaseHTTPRequestHandler):
                 op = policy.get("op") or "any"
                 have = ", ".join(safe_factor_name(a) for a in amr) or "none"
                 need_desc = f"{op} of: {', '.join(factors)}" if len(factors) > 1 else factors[0] if factors else "authentication"
+                # If a hardware factor is in play, surface a link to the
+                # Keycloak account console so users who haven't enrolled yet
+                # can register a WebAuthn key. Parent domain comes from
+                # X-Forwarded-Host so the page works regardless of which app
+                # served the 403.
+                needs_hardware = any(f in ("mtls", "webauthn") for f in factors)
+                parent_domain = ".".join(host.split(".")[1:]) if host and "." in host else ""
+                account_url = (
+                    f"https://auth.{parent_domain}/realms/portcullis/account/account-security/signing-in"
+                    if parent_domain else ""
+                )
+                enrollment_block = ""
+                if needs_hardware and account_url:
+                    enrollment_block = (
+                        f"<p style=\"background:#fff7ed;border:1px solid #fed7aa;padding:.75rem 1rem;border-radius:.5rem;margin-top:1rem\">"
+                        f"<b>No hardware key yet?</b> "
+                        f"<a href=\"{account_url}\" target=\"_blank\" rel=\"noopener\">Open the account console</a> "
+                        f"to register a security key, then return and retry.</p>"
+                    )
                 # Meta-refresh bumps the user through the sign-out + fresh
                 # authorize flow automatically after 2 seconds. The explicit
                 # link is the accessible fallback.
@@ -219,6 +242,7 @@ class Handler(BaseHTTPRequestHandler):
                         f"Your current session was authenticated with <code>{have}</code>, which does not satisfy the app's policy.</p>"
                         f"<p>You will be redirected to re-authenticate in a moment. "
                         f"If nothing happens, <a href=\"{url}\">click here</a>.</p>"
+                        f"{enrollment_block}"
                         "</body></html>"
                     ).encode()
                 )
