@@ -1,0 +1,91 @@
+# oauth2-proxy alpha config.
+#
+# Why alpha config: upstream keeps per-request loginURLParameters out of the
+# legacy env-based config. We need per-request acr_values so group-gate's
+# step-up redirect (/oauth2/start?acr_values=hwk) actually reaches Keycloak.
+# Once --alpha-config is set, providers + upstreams MUST live here; every
+# other knob (cookie, headers, ingress) still comes from OAUTH2_PROXY_* env.
+#
+# Env substitution: ${FOO} is expanded at load time, so secrets stay in .env.
+providers:
+  - id: portcullis-keycloak
+    provider: oidc
+    clientID: portcullis-forward-auth
+    clientSecret: ${FORWARD_AUTH_CLIENT_SECRET}
+    scope: openid email profile groups
+    code_challenge_method: S256
+    oidcConfig:
+      issuerURL: https://auth.${PORTCULLIS_DOMAIN}/realms/portcullis
+      skipDiscovery: false
+      groupsClaim: groups
+      audienceClaims:
+        - aud
+    # Per-request acr_values passthrough. Group-gate forwards a stronger
+    # value via /oauth2/start?acr_values=hwk|mtls when the app's policy
+    # demands it; `allow` gates accepted values.
+    loginURLParameters:
+      - name: acr_values
+        default:
+          - pwd
+        allow:
+          - value: pwd
+          - value: hwk
+          - value: mtls
+      # `prompt=login` forces Keycloak to run the flow instead of reusing
+      # its SSO cookie via auth-cookie. Needed on step-up so the higher
+      # LoA actually runs its factor subflow and amr reflects reality.
+      - name: prompt
+        allow:
+          - value: login
+
+server:
+  bindAddress: 0.0.0.0:4180
+
+# Forward-auth emits headers on the /oauth2/auth 202 response via
+# injectResponseHeaders (NOT injectRequestHeaders — that one mutates the
+# inbound request object which Traefik drops). Traefik's authResponseHeaders
+# copies these onto the downstream service's request.
+#
+# Value schema is flat {claim: ...}, not {claimSource: {claim: ...}}.
+injectResponseHeaders:
+  - name: X-Auth-Request-User
+    values:
+      - claimSource:
+          claim: user
+  - name: X-Auth-Request-Email
+    values:
+      - claimSource:
+          claim: email
+  - name: X-Auth-Request-Groups
+    values:
+      - claimSource:
+          claim: groups
+  - name: X-Auth-Request-Preferred-Username
+    values:
+      - claimSource:
+          claim: preferred_username
+  - name: X-Auth-Request-Access-Token
+    values:
+      - claimSource:
+          claim: access_token
+  - name: X-Forwarded-Access-Token
+    values:
+      - claimSource:
+          claim: access_token
+  - name: X-Forwarded-User
+    values:
+      - claimSource:
+          claim: user
+  - name: Authorization
+    values:
+      - claimSource:
+          claim: access_token
+          prefix: "Bearer "
+
+upstreamConfig:
+  upstreams:
+    # 202 sentinel: this instance is forward-auth only, not proxying upstream.
+    - id: static
+      path: /
+      static: true
+      staticCode: 202
