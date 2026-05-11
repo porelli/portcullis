@@ -41,13 +41,13 @@ if [ "${PORTCULLIS_WIPE_REALM:-}" = "true" ]; then
     -H "Authorization: Bearer $TOKEN"
 fi
 
-# Realm-export references {{DOMAIN}} / LLDAP_*_PLACEHOLDER — substitute before
-# posting so Keycloak's strict validators accept concrete URIs and DNs.
-DOMAIN_VAL="${PORTCULLIS_DOMAIN:-portcullis.local}"
+# Realm-export references LLDAP_*_PLACEHOLDER — substitute before posting so
+# the LDAP federation binds on first import. DOMAIN isn't templated in the
+# export (the forward-auth redirectUri uses a placeholder host that's PUT
+# onto the real domain after import — see below).
 LLDAP_BASE_DN="${LLDAP_BASE_DN:-dc=portcullis,dc=local}"
 LLDAP_PASS="${LLDAP_ADMIN_PASSWORD:-}"
 REALM_EXPANDED=$(sed \
-  -e "s|{{DOMAIN}}|$DOMAIN_VAL|g" \
   -e "s|LLDAP_BASE_DN_PLACEHOLDER|$LLDAP_BASE_DN|g" \
   -e "s|LLDAP_PASSWORD_PLACEHOLDER|$LLDAP_PASS|g" \
   keycloak/realm-export.json)
@@ -236,10 +236,13 @@ FWD_CLIENT_UUID=$(curl -sk "$KEYCLOAK_URL/admin/realms/$REALM/clients?clientId=p
 if [ -n "$FWD_CLIENT_UUID" ]; then
   FWD_CLIENT=$(curl -sk "$KEYCLOAK_URL/admin/realms/$REALM/clients/$FWD_CLIENT_UUID" \
     -H "Authorization: Bearer $TOKEN")
+  # Force redirectUris onto the real domain. The realm export ships a
+  # placeholder (auth.portcullis.local) so Keycloak's strict URL parser
+  # accepts it at import; we overwrite with the configured domain here.
   UPDATED_FWD=$(echo "$FWD_CLIENT" | jq --arg d "$DOMAIN_VAL" '
     .attributes = ((.attributes // {}) + {"default.acr.values":"pwd"}) |
     .defaultClientScopes = ((.defaultClientScopes // []) + ["acr"] | unique) |
-    .redirectUris = [(.redirectUris // [])[] | sub("\\{\\{DOMAIN\\}\\}"; $d)]
+    .redirectUris = ["https://auth." + $d + "/oauth2/callback"]
   ')
   HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" -X PUT \
     "$KEYCLOAK_URL/admin/realms/$REALM/clients/$FWD_CLIENT_UUID" \

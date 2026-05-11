@@ -425,7 +425,7 @@
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
       "redirectUris": [
-        "https://auth.{{DOMAIN}}/oauth2/callback"
+        "https://auth.portcullis.local/oauth2/callback"
       ],
       "webOrigins": [
         "+"
