@@ -124,45 +124,35 @@ else
   echo "    acr.loa.map set; browserFlow=$(echo "$UPDATE_PAYLOAD" | jq -r '.browserFlow // "preserved"')"
 fi
 
-echo "==> Attaching AMR reference values to factor executors..."
-# Keycloak's AMR mapper emits `amr` values read from each execution's
-# `default.reference.value`. Without this config, `amr` is always an empty
-# list. Walk the LoA-factor subflows and give each executor a reference
-# (pwd / hwk / mtls) with a long max_age so the value survives the session.
-attach_amr_ref() {
-  # $1 = parent flow alias, $2 = authenticator provider id, $3 = reference value
-  local parent="$1" provider="$2" ref="$3"
-  local exec_id
-  exec_id=$(curl -sk "$KEYCLOAK_URL/admin/realms/$REALM/authentication/flows/$parent/executions" \
-    -H "Authorization: Bearer $TOKEN" | jq -r --arg p "$provider" \
-    '.[] | select(.providerId == $p) | .id' | head -1)
-  if [ -z "$exec_id" ]; then return; fi
-  # Only create if not already configured
-  local existing
-  existing=$(curl -sk "$KEYCLOAK_URL/admin/realms/$REALM/authentication/executions/$exec_id" \
-    -H "Authorization: Bearer $TOKEN" | jq -r '.authenticationConfig // ""')
-  if [ -n "$existing" ]; then return; fi
-  local payload
-  payload=$(jq -n --arg a "amr-$parent-$provider" --arg r "$ref" '{
-    alias: $a,
-    config: {
-      "default.reference.value": $r,
-      "default.reference.maxAge": "36000"
-    }
-  }')
-  curl -sk -o /dev/null -w "    amr-ref $provider in $parent: %{http_code}\n" -X POST \
-    "$KEYCLOAK_URL/admin/realms/$REALM/authentication/executions/$exec_id/config" \
-    -H "Authorization: Bearer $TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "$payload"
+echo "==> Linting: factor executors have AMR reference values..."
+# Each authenticator inside portcullis-loa-*-factors and portcullis-loa-3 needs
+# an authenticatorConfig with default.reference.value so the AMR mapper can
+# emit a non-empty amr array. Walk the subflows and warn loudly if any
+# factor is missing a reference — the policy layer depends on this to
+# distinguish factors in AND-mode policies.
+lint_amr_refs() {
+  local flow="$1"
+  local execs
+  execs=$(curl -sk "$KEYCLOAK_URL/admin/realms/$REALM/authentication/flows/$flow/executions" \
+    -H "Authorization: Bearer $TOKEN" 2>/dev/null)
+  if [ -z "$execs" ] || [ "$execs" = "null" ]; then return; fi
+  echo "$execs" | jq -r '.[] | select(.providerId and .providerId != "conditional-level-of-authentication") | .id + " " + .providerId + " " + (.authenticationConfig // "none")' | \
+  while read -r exec_id provider cfg_id; do
+    if [ "$cfg_id" = "none" ]; then
+      echo "    WARN: $flow/$provider has no authenticator config → amr will be empty for this factor"
+      continue
+    fi
+    local ref
+    ref=$(curl -sk "$KEYCLOAK_URL/admin/realms/$REALM/authentication/config/$cfg_id" \
+      -H "Authorization: Bearer $TOKEN" | jq -r '.config["default.reference.value"] // empty')
+    if [ -z "$ref" ]; then
+      echo "    WARN: $flow/$provider config has no default.reference.value → amr will be empty for this factor"
+    fi
+  done
 }
-
-attach_amr_ref portcullis-loa-1-factors auth-username-password-form pwd
-attach_amr_ref portcullis-loa-1-factors webauthn-authenticator-passwordless hwk
-attach_amr_ref portcullis-loa-1-factors auth-x509-client-username-form mtls
-attach_amr_ref portcullis-loa-2-factors webauthn-authenticator-passwordless hwk
-attach_amr_ref portcullis-loa-2-factors auth-x509-client-username-form mtls
-attach_amr_ref portcullis-loa-3 auth-x509-client-username-form mtls
+for FLOW in portcullis-loa-1-factors portcullis-loa-2-factors portcullis-loa-3; do
+  lint_amr_refs "$FLOW"
+done
 
 echo "==> Attaching AMR mapper to acr client scope..."
 ACR_SCOPE_ID=$(curl -sk "$KEYCLOAK_URL/admin/realms/$REALM/client-scopes" \

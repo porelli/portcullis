@@ -147,14 +147,17 @@ def evaluate_policy(policy: dict, acr: str, amr: list) -> Tuple[bool, str, int]:
 
 
 def stepup_url(host: str, needed_loa: int, factors: list) -> str:
-    """Build a stepup URL that points oauth2-proxy at Keycloak with the right acr_values."""
-    # Map LoA back to the acr string the realm knows (see acr.loa.map).
-    loa_to_acr = {0: "public", 1: "pwd", 2: "hwk", 3: "mtls"}
-    acr = loa_to_acr.get(needed_loa, "pwd")
-    # Redirect via oauth2-proxy's sign_in with acr_values hint; Keycloak
-    # triggers the LoA conditional subflow.
-    query = urllib.parse.urlencode({"acr_values": acr})
-    return f"https://{host}/oauth2/start?{query}"
+    """Build a stepup URL that signs the user out of oauth2-proxy and then
+    redirects to the app root. oauth2-proxy will start a fresh authorization
+    request with its configured acr_values, which administrators should
+    align with the strictest enabled app's policy.
+
+    Per-request acr_values (true LoA step-up without full re-auth) requires
+    oauth2-proxy's login_url_parameters config — available only in the alpha
+    config format from 7.10+. When we upgrade, this helper can emit
+    /oauth2/start?acr_values=<acr> directly."""
+    query = urllib.parse.urlencode({"rd": f"https://{host}/"})
+    return f"https://{host}/oauth2/sign_out?{query}"
 
 
 def safe_factor_name(amr: str) -> str:
@@ -186,13 +189,6 @@ class Handler(BaseHTTPRequestHandler):
             claims = decode_jwt_payload(access_token) if access_token else {}
             acr = claims.get("acr", "")
             amr = claims.get("amr") or []
-            # Debug: first request per unique acr/amr combo, dump the claim keys
-            dbg_key = f"{acr}|{amr}"
-            if not hasattr(Handler, "_dbg_seen"):
-                Handler._dbg_seen = set()
-            if dbg_key not in Handler._dbg_seen:
-                Handler._dbg_seen.add(dbg_key)
-                print(f"group-gate: TOKEN claims keys={list(claims.keys())} acr={acr!r} amr={amr} azp={claims.get('azp')!r}", flush=True)
 
             allowed, reason, required_loa = evaluate_policy(policy, acr, amr)
             if not allowed:
@@ -204,13 +200,26 @@ class Handler(BaseHTTPRequestHandler):
                 factors = policy.get("factors") or []
                 op = policy.get("op") or "any"
                 have = ", ".join(safe_factor_name(a) for a in amr) or "none"
-                need_desc = f"{op} of: {', '.join(factors)}"
+                need_desc = f"{op} of: {', '.join(factors)}" if len(factors) > 1 else factors[0] if factors else "authentication"
+                # Meta-refresh bumps the user through the sign-out + fresh
+                # authorize flow automatically after 2 seconds. The explicit
+                # link is the accessible fallback.
                 self.wfile.write(
                     (
-                        f"<h1>Step up required</h1>"
+                        "<!doctype html><html><head>"
+                        f"<meta http-equiv=\"refresh\" content=\"2;url={url}\">"
+                        "<title>Additional authentication required</title>"
+                        "<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:32rem;"
+                        "margin:4rem auto;padding:2rem;color:#1e293b;line-height:1.55}"
+                        "h1{font-size:1.5rem;margin:0 0 1rem}"
+                        "code{background:#f1f5f9;padding:.15rem .4rem;border-radius:.25rem;font-size:.95em}"
+                        "a{color:#3b82f6}</style></head><body>"
+                        "<h1>Additional authentication required</h1>"
                         f"<p><b>{subdomain}</b> requires {need_desc}. "
-                        f"Your session currently has: <code>{have}</code>.</p>"
-                        f"<p><a href=\"{url}\">Click here to authenticate with the required factor</a>.</p>"
+                        f"Your current session was authenticated with <code>{have}</code>, which does not satisfy the app's policy.</p>"
+                        f"<p>You will be redirected to re-authenticate in a moment. "
+                        f"If nothing happens, <a href=\"{url}\">click here</a>.</p>"
+                        "</body></html>"
                     ).encode()
                 )
                 print(

@@ -126,13 +126,15 @@
           "authenticator": "webauthn-authenticator-passwordless",
           "authenticatorFlow": false,
           "requirement": "ALTERNATIVE",
-          "priority": 20
+          "priority": 20,
+          "authenticatorConfig": "amr-hwk-loa1"
         },
         {
           "authenticator": "auth-username-password-form",
           "authenticatorFlow": false,
           "requirement": "ALTERNATIVE",
-          "priority": 30
+          "priority": 30,
+          "authenticatorConfig": "amr-pwd-loa1"
         }
       ]
     },
@@ -176,7 +178,8 @@
           "authenticator": "webauthn-authenticator-passwordless",
           "authenticatorFlow": false,
           "requirement": "ALTERNATIVE",
-          "priority": 20
+          "priority": 20,
+          "authenticatorConfig": "amr-hwk-loa2"
         }
       ]
     },
@@ -251,6 +254,18 @@
     {
       "alias": "loa-3-config",
       "config": { "loa-condition-level": "3", "loa-max-age": "36000" }
+    },
+    {
+      "alias": "amr-hwk-loa1",
+      "config": { "default.reference.value": "hwk", "default.reference.maxAge": "36000" }
+    },
+    {
+      "alias": "amr-pwd-loa1",
+      "config": { "default.reference.value": "pwd", "default.reference.maxAge": "36000" }
+    },
+    {
+      "alias": "amr-hwk-loa2",
+      "config": { "default.reference.value": "hwk", "default.reference.maxAge": "36000" }
     }
   ],
   "browserFlow": "portcullis-universal",
