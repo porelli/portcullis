@@ -186,6 +186,13 @@ class Handler(BaseHTTPRequestHandler):
             claims = decode_jwt_payload(access_token) if access_token else {}
             acr = claims.get("acr", "")
             amr = claims.get("amr") or []
+            # Debug: first request per unique acr/amr combo, dump the claim keys
+            dbg_key = f"{acr}|{amr}"
+            if not hasattr(Handler, "_dbg_seen"):
+                Handler._dbg_seen = set()
+            if dbg_key not in Handler._dbg_seen:
+                Handler._dbg_seen.add(dbg_key)
+                print(f"group-gate: TOKEN claims keys={list(claims.keys())} acr={acr!r} amr={amr} azp={claims.get('azp')!r}", flush=True)
 
             allowed, reason, required_loa = evaluate_policy(policy, acr, amr)
             if not allowed:

@@ -40,7 +40,7 @@
   "authenticationFlows": [
     {
       "alias": "portcullis-universal",
-      "description": "Universal LoA-aware flow: cookie reuse + three conditional LoA subflows (pwd=1, hwk=2, mtls=3)",
+      "description": "Universal LoA-aware flow: cookie reuse or a step-up subflow containing three conditional LoA subflows (pwd=1, hwk=2, mtls=3)",
       "providerId": "basic-flow",
       "topLevel": true,
       "builtIn": false,
@@ -53,20 +53,35 @@
         },
         {
           "authenticatorFlow": true,
-          "requirement": "CONDITIONAL",
+          "requirement": "ALTERNATIVE",
           "priority": 20,
+          "flowAlias": "portcullis-step-up"
+        }
+      ]
+    },
+    {
+      "alias": "portcullis-step-up",
+      "description": "Runs the LoA-appropriate subflow based on the acr_values requested by the client",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticatorFlow": true,
+          "requirement": "CONDITIONAL",
+          "priority": 10,
           "flowAlias": "portcullis-loa-1"
         },
         {
           "authenticatorFlow": true,
           "requirement": "CONDITIONAL",
-          "priority": 30,
+          "priority": 20,
           "flowAlias": "portcullis-loa-2"
         },
         {
           "authenticatorFlow": true,
           "requirement": "CONDITIONAL",
-          "priority": 40,
+          "priority": 30,
           "flowAlias": "portcullis-loa-3"
         }
       ]
@@ -220,20 +235,22 @@
         "x509-cert-auth.ocsp-responder-uri": "",
         "x509-cert-auth.keyusage": "",
         "x509-cert-auth.extendedkeyusage": "",
-        "x509-cert-auth.confirmation-page-disallowed": "true"
+        "x509-cert-auth.confirmation-page-disallowed": "true",
+        "default.reference.value": "mtls",
+        "default.reference.maxAge": "36000"
       }
     },
     {
       "alias": "loa-1-config",
-      "config": { "loa": "1", "max_age": "36000" }
+      "config": { "loa-condition-level": "1", "loa-max-age": "36000" }
     },
     {
       "alias": "loa-2-config",
-      "config": { "loa": "2", "max_age": "36000" }
+      "config": { "loa-condition-level": "2", "loa-max-age": "36000" }
     },
     {
       "alias": "loa-3-config",
-      "config": { "loa": "3", "max_age": "36000" }
+      "config": { "loa-condition-level": "3", "loa-max-age": "36000" }
     }
   ],
   "browserFlow": "portcullis-universal",
@@ -408,20 +425,14 @@
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
       "redirectUris": [
-        "https://*/_oauth/callback"
+        "https://auth.{{DOMAIN}}/oauth2/callback"
       ],
       "webOrigins": [
         "+"
       ],
       "attributes": {
         "default.acr.values": "pwd"
-      },
-      "defaultClientScopes": [
-        "openid",
-        "profile",
-        "email",
-        "acr"
-      ]
+      }
     }
   ],
   "roles": {
