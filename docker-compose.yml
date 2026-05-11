@@ -226,12 +226,20 @@ services:
       OAUTH2_PROXY_EMAIL_DOMAINS: "*"
       OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
       OAUTH2_PROXY_REVERSE_PROXY: "true"
+      # Only trust X-Forwarded-* headers from the portcullis network (traefik).
+      # Without this, oauth2-proxy treats 0.0.0.0/0 as trusted — spoofable by
+      # any container that can reach the forward-auth port directly.
+      OAUTH2_PROXY_TRUSTED_PROXY_IPS: "172.16.0.0/12,127.0.0.1/32"
       OAUTH2_PROXY_SET_XAUTHREQUEST: "true"
       OAUTH2_PROXY_SET_AUTHORIZATION_HEADER: "true"
       OAUTH2_PROXY_PASS_ACCESS_TOKEN: "true"
       OAUTH2_PROXY_PASS_USER_HEADERS: "true"
       OAUTH2_PROXY_WHITELIST_DOMAINS: .${PORTCULLIS_DOMAIN:-portcullis.local}
       OAUTH2_PROXY_REDIRECT_URL: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/oauth2/callback
+      # Chain Keycloak logout on /oauth2/sign_out so the realm SSO cookie
+      # also gets cleared. Without this, Keycloak reuses the SSO session
+      # via auth-cookie and the new token has amr=[] — breaking step-up.
+      OAUTH2_PROXY_BACKEND_LOGOUT_URL: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis/protocol/openid-connect/logout?id_token_hint={id_token}
       OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
       OAUTH2_PROXY_SSL_UPSTREAM_INSECURE_SKIP_VERIFY: "true"
       SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt

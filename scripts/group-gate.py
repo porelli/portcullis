@@ -150,18 +150,24 @@ def stepup_url(host: str, needed_loa: int, factors: list) -> str:
     """Build a step-up URL that asks oauth2-proxy for a fresh login at the
     required Level of Authentication.
 
-    The flow is: sign out of oauth2-proxy (so it doesn't short-circuit back
-    to the existing too-weak session), then /oauth2/start?acr_values=<acr>&rd=...
-    which oauth2-proxy forwards to Keycloak (per-request acr_values enabled
-    via loginURLParameters in alpha config). Keycloak triggers the matching
-    LoA conditional subflow and prompts the user for the missing factor.
+    We pass `prompt=login` and `acr_values=<acr>` to /oauth2/start, which
+    oauth2-proxy forwards to Keycloak's authorize endpoint. `prompt=login`
+    tells Keycloak to bypass its SSO `auth-cookie` short-circuit and re-run
+    the flow; `acr_values` routes the user into the matching LoA conditional
+    subflow so the missing factor is actually prompted for.
+
+    No sign_out in the chain: the browser still has oauth2-proxy's cookie
+    but we want Keycloak to issue a *new* token reflecting the step-up, not
+    to delete the old session.
     """
     loa_to_acr = {0: "public", 1: "pwd", 2: "hwk", 3: "mtls"}
     acr = loa_to_acr.get(needed_loa, "pwd")
-    start_q = urllib.parse.urlencode({"acr_values": acr, "rd": f"https://{host}/"})
-    start_url = f"https://{host}/oauth2/start?{start_q}"
-    sign_out_q = urllib.parse.urlencode({"rd": start_url})
-    return f"https://{host}/oauth2/sign_out?{sign_out_q}"
+    query = urllib.parse.urlencode({
+        "acr_values": acr,
+        "prompt": "login",
+        "rd": f"https://{host}/",
+    })
+    return f"https://{host}/oauth2/start?{query}"
 
 
 def safe_factor_name(amr: str) -> str:
