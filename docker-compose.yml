@@ -9,8 +9,8 @@ networks:
   # Dynamic container addresses come from PORTCULLIS_PROXY_IP_RANGE, which
   # must lie inside the subnet and must NOT contain PORTCULLIS_TRAEFIK_IP —
   # so no app container can ever be handed Traefik's address.
-  # Changing these on an existing install needs the network recreated:
-  # ./scripts/upgrade.sh does that automatically.
+  # Docker cannot change IPAM in place: after editing these, the network
+  # must be removed and recreated (./portcullis up explains how).
   portcullis-proxy:
     name: portcullis-proxy
     ipam:
@@ -95,7 +95,7 @@ services:
     environment:
       POSTGRES_DB: keycloak
       POSTGRES_USER: keycloak
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set — run ./portcullis init}
     volumes:
       # Postgres 18+ expects the mount at /var/lib/postgresql (the image stores
       # data under a versioned subdir so pg_upgrade can work without mount
@@ -116,7 +116,7 @@ services:
     image: hashicorp/vault:2.2
     # Server mode with raft storage (vault/vault.hcl). The wrapper starts
     # Vault and auto-unseals it on every container start from
-    # secrets/vault-unseal/unseal-key (written by scripts/vault-init.sh).
+    # secrets/vault-unseal/unseal-key (written by ./portcullis vault init).
     entrypoint: ["/bin/sh", "/vault/portcullis/entrypoint.sh"]
     environment:
       VAULT_ADDR: "http://127.0.0.1:8200"
@@ -124,8 +124,8 @@ services:
       # IPC_LOCK capability needed, so skip the image's setcap step.
       SKIP_SETCAP: "true"
     ports:
-      # Loopback only: host-side scripts (setup-vault-pki.sh, enroll-yubikey.sh,
-      # status.sh, ...) use http://127.0.0.1:8200. The listener is plain HTTP —
+      # Loopback only: the ./portcullis CLI (pki setup, cert ..., status)
+      # uses http://127.0.0.1:8200. The listener is plain HTTP —
       # never expose it on 0.0.0.0.
       - "127.0.0.1:8200:8200"
     volumes:
@@ -148,8 +148,8 @@ services:
   lldap:
     image: lldap/lldap:stable
     environment:
-      LLDAP_JWT_SECRET: ${LLDAP_JWT_SECRET:-changeme-jwt-secret}
-      LLDAP_LDAP_USER_PASS: ${LLDAP_ADMIN_PASSWORD:-changeme}
+      LLDAP_JWT_SECRET: ${LLDAP_JWT_SECRET:?LLDAP_JWT_SECRET is not set — run ./portcullis init}
+      LLDAP_LDAP_USER_PASS: ${LLDAP_ADMIN_PASSWORD:?LLDAP_ADMIN_PASSWORD is not set — run ./portcullis init}
       LLDAP_LDAP_BASE_DN: ${LLDAP_BASE_DN:-dc=portcullis,dc=local}
       LLDAP_LDAP_USER_DN: admin
       LLDAP_LDAP_USER_EMAIL: admin@portcullis.local
@@ -187,9 +187,9 @@ services:
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
       KC_DB_USERNAME: keycloak
-      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set — run ./portcullis init}
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
-      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?KEYCLOAK_ADMIN_PASSWORD is not set — run ./portcullis init}
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -215,7 +215,7 @@ services:
       traefik.http.services.keycloak.loadbalancer.server.port: "8080"
       # Admin console + master realm — protected behind forward-auth + group-gate
       # (auth=lldap_admin). /realms/master is the admin realm's login/token
-      # endpoint; it has no business being public. Scripts and the Hub reach
+      # endpoint; it has no business being public. The CLI and the Hub reach
       # the admin API over the internal network (http://keycloak:8080 or the
       # 127.0.0.1:8080 publish), which bypasses Traefik.
       traefik.http.routers.keycloak-admin.rule: Host(`auth.${PORTCULLIS_DOMAIN:-portcullis.local}`) && (PathPrefix(`/admin`) || PathPrefix(`/realms/master`))
@@ -244,8 +244,8 @@ services:
       - ./oauth2-proxy/alpha.yaml:/etc/oauth2-proxy/alpha.yaml:ro
     environment:
       PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
-      FORWARD_AUTH_CLIENT_SECRET: ${FORWARD_AUTH_CLIENT_SECRET:-portcullis-forward-auth-secret}
-      OAUTH2_PROXY_COOKIE_SECRET: ${FORWARD_AUTH_COOKIE_SECRET:-}
+      FORWARD_AUTH_CLIENT_SECRET: ${FORWARD_AUTH_CLIENT_SECRET:?FORWARD_AUTH_CLIENT_SECRET is not set — run ./portcullis init}
+      OAUTH2_PROXY_COOKIE_SECRET: ${FORWARD_AUTH_COOKIE_SECRET:?FORWARD_AUTH_COOKIE_SECRET is not set — run ./portcullis init}
       OAUTH2_PROXY_COOKIE_DOMAINS: .${PORTCULLIS_DOMAIN:-portcullis.local}
       OAUTH2_PROXY_COOKIE_SAMESITE: lax
       OAUTH2_PROXY_EMAIL_DOMAINS: "*"
@@ -303,7 +303,7 @@ services:
       - ./group-gate/group-gate-map.conf:/etc/group-gate/map.conf:ro
       # Hub writes per-app auth policies into this volume under group-gate-policy.json
       - hub_data:/hub-data:ro
-      # Revoked client-cert serials, written by scripts/revoke-cert.sh.
+      # Revoked client-cert serials, written by ./portcullis cert revoke|sync.
       - ./certs/revocation:/etc/group-gate/revocation:ro
     environment:
       GATE_POLICY_FILE: /hub-data/group-gate-policy.json
@@ -337,10 +337,14 @@ services:
       PORTAL_DISPLAY_NAME: ${PORTAL_DISPLAY_NAME:-Portcullis}
       KEYCLOAK_URL: http://keycloak:8080
       KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
-      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?KEYCLOAK_ADMIN_PASSWORD is not set — run ./portcullis init}
       LLDAP_HTTP_URL: http://lldap:17170
       LLDAP_ADMIN_USER: admin
-      LLDAP_ADMIN_PASSWORD: ${LLDAP_ADMIN_PASSWORD:-changeme}
+      LLDAP_ADMIN_PASSWORD: ${LLDAP_ADMIN_PASSWORD:?LLDAP_ADMIN_PASSWORD is not set — run ./portcullis init}
+      # Shared secret Traefik will send as X-Portcullis-Proxy-Secret on every
+      # request routed to the Hub (integration contract §5); the Hub refuses
+      # to start without it. Generated by ./portcullis init.
+      HUB_PROXY_SECRET: ${HUB_PROXY_SECRET:?HUB_PROXY_SECRET is not set — run ./portcullis init}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - .:/project:ro
@@ -383,13 +387,13 @@ services:
     environment:
       VAULT_ADDR: http://vault:8200
       # Least-privilege AppRole (policy vault/policies/enroll.hcl), created
-      # by scripts/vault-init.sh. No static/root token.
+      # by ./portcullis vault init. No static/root token.
       VAULT_ROLE_ID_FILE: /run/secrets/portcullis-enroll/role-id
       VAULT_SECRET_ID_FILE: /run/secrets/portcullis-enroll/secret-id
       LLDAP_URL: ldap://lldap:3890
       LLDAP_BASE_DN: ${LLDAP_BASE_DN:-dc=portcullis,dc=local}
       LLDAP_BIND_DN: uid=admin,ou=people,${LLDAP_BASE_DN:-dc=portcullis,dc=local}
-      LLDAP_BIND_PASSWORD: ${LLDAP_ADMIN_PASSWORD:-changeme}
+      LLDAP_BIND_PASSWORD: ${LLDAP_ADMIN_PASSWORD:?LLDAP_ADMIN_PASSWORD is not set — run ./portcullis init}
       PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
     networks:
       - portcullis

@@ -436,7 +436,7 @@
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,
-      "secret": "portcullis-forward-auth-secret",
+      "secret": "FORWARD_AUTH_CLIENT_SECRET_PLACEHOLDER",
       "standardFlowEnabled": true,
       "directAccessGrantsEnabled": false,
       "redirectUris": [
