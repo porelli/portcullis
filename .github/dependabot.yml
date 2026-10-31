@@ -1,0 +1,51 @@
+# Dependency updates, weekly, one grouped PR per ecosystem.
+# Not covered (update by hand, CI's pin check keeps them tag@sha256): the
+# image constants in scripts/lib/*.sh (PORTCULLIS_HELPER_IMAGE,
+# BACKUP_RESTIC_IMAGE) and the images used inline in .github/workflows/ci.yml.
+version: 2
+updates:
+  # docker-compose.yml (all profiles), docker-compose.apps.yml, docker-compose.test.yml:
+  # tag@digest pins are updated together.
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      compose-images:
+        patterns: ["*"]
+
+  # enroll/Dockerfile base images (golang, alpine).
+  - package-ecosystem: docker
+    directory: /enroll
+    schedule:
+      interval: weekly
+    groups:
+      enroll-images:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: /enroll
+    schedule:
+      interval: weekly
+    groups:
+      enroll-go:
+        patterns: ["*"]
+
+  # Actions are pinned by commit SHA with a `# vX.Y.Z` comment; Dependabot
+  # updates both.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # tests/e2e/requirements.txt (Playwright, used by the CI e2e job).
+  - package-ecosystem: pip
+    directory: /tests/e2e
+    schedule:
+      interval: weekly
+    groups:
+      e2e-python:
+        patterns: ["*"]
