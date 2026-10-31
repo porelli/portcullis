@@ -33,7 +33,7 @@ status_run() {
   vault_json="$(jq -n --arg c "$vault_code" '{http_status: $c,
       initialized: ($c != "501" and $c != "000"), sealed: ($c == "503"), active: ($c == "200")}')"
   [ "$vault_code" = 200 ] || problems=1
-  local root_exp="" int_exp="" certs_issued=null expiring="[]"
+  local root_exp="" int_exp="" certs_issued=null expiring="[]" newest="[]"
   if [ "$vault_code" = 200 ] && vault_admin_env 2>/dev/null && vault_use_container_cli 2>/dev/null; then
     root_exp="$(vault read -field=certificate pki/cert/ca 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 || true)"
     int_exp="$(vault read -field=certificate pki_int/cert/ca 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 || true)"
@@ -53,12 +53,18 @@ status_run() {
       done
       # Per user, only the cert that lasts longest counts: once renewed, the
       # old (still valid) cert is no reason to warn.
-      expiring="$(printf '%s' "$valid" | jq -cs --argjson now "$now" --argjson w "$warn_s" '
-          group_by(.cn) | map(max_by(.epoch)) | map(select(.epoch - $now < $w))
+      newest="$(printf '%s' "$valid" | jq -cs 'group_by(.cn) | map(max_by(.epoch)) | map({cn, serial, expires, epoch})')"
+      expiring="$(printf '%s' "$newest" | jq -c --argjson now "$now" --argjson w "$warn_s" '
+          map(select(.epoch - $now < $w))
           | map({cn, serial, expires, days_left: ((.epoch - $now) / 86400 | floor)})')"
     fi
+    local root_epoch=0 int_epoch=0
+    [ -z "$root_exp" ] || root_epoch="$(to_epoch "$root_exp")"
+    [ -z "$int_exp" ] || int_epoch="$(to_epoch "$int_exp")"
     vault_json="$(printf '%s' "$vault_json" | jq --arg r "$root_exp" --arg i "$int_exp" --argjson n "$certs_issued" --argjson x "$expiring" \
-      '. + {root_ca_expires: $r, intermediate_ca_expires: $i, certs_issued: $n, certs_expiring: $x}')"
+      --argjson c "$newest" --argjson re "$root_epoch" --argjson ie "$int_epoch" \
+      '. + {root_ca_expires: $r, intermediate_ca_expires: $i, root_ca_expires_epoch: $re,
+            intermediate_ca_expires_epoch: $ie, certs_issued: $n, certs_expiring: $x, client_certs: $c}')"
   fi
 
   # ── keycloak (health on the unpublished management port → docker health) ──
@@ -147,9 +153,99 @@ status_run() {
   return "$problems"
 }
 
+# status_textfile — status as Prometheus textfile metrics
+# (monitoring/textfile/status.prom; monitoring profile). Same exit status.
+status_textfile() {
+  local out rc=0
+  out="$(status_run true)" || rc=$?
+  printf '%s' "$out" | jq -r --argjson now "$(date +%s)" '
+    def esc: tostring | gsub("\\\\"; "\\\\") | gsub("\""; "\\\"") | gsub("\n"; " ");
+    def up: if .state == "running" and (.health == "healthy" or .health == "n/a") then 1 else 0 end;
+    def g(n; h): "# HELP \(n) \(h)", "# TYPE \(n) gauge";
+    g("portcullis_status_last_run_timestamp_seconds"; "Unix time of the last portcullis status --textfile."),
+    "portcullis_status_last_run_timestamp_seconds \($now)",
+    g("portcullis_status_ok"; "1 if portcullis status found no problem."),
+    "portcullis_status_ok \(if .ok then 1 else 0 end)",
+    g("portcullis_service_up"; "1 if the compose service is running and healthy (or has no healthcheck)."),
+    (.services[] | "portcullis_service_up{service=\"\(.name | esc)\"} \(up)"),
+    g("portcullis_vault_active"; "1 if Vault is initialised, unsealed and active."),
+    "portcullis_vault_active \(if .vault.active then 1 else 0 end)",
+    g("portcullis_ca_expiry_timestamp_seconds"; "Expiry of the client-certificate CAs in Vault."),
+    (if (.vault.root_ca_expires_epoch // 0) > 0 then "portcullis_ca_expiry_timestamp_seconds{ca=\"root\"} \(.vault.root_ca_expires_epoch)" else empty end),
+    (if (.vault.intermediate_ca_expires_epoch // 0) > 0 then "portcullis_ca_expiry_timestamp_seconds{ca=\"intermediate\"} \(.vault.intermediate_ca_expires_epoch)" else empty end),
+    g("portcullis_client_cert_expiry_timestamp_seconds"; "Expiry of the newest valid, unrevoked client certificate of each user."),
+    ((.vault.client_certs // [])[] | "portcullis_client_cert_expiry_timestamp_seconds{cn=\"\(.cn | esc)\"} \(.epoch)")
+  ' | metrics_textfile_write status
+  return "$rc"
+}
+
+# portcullis_version — core version: VERSION (release tarballs), else
+# `git describe` of the checkout, else "unknown".
+portcullis_version() {
+  if [ -s "$PORTCULLIS_HOME/VERSION" ]; then
+    tr -d '[:space:]' < "$PORTCULLIS_HOME/VERSION"
+  elif git -C "$PORTCULLIS_HOME" rev-parse --git-dir >/dev/null 2>&1; then
+    git -C "$PORTCULLIS_HOME" describe --tags --always --dirty 2>/dev/null || echo unknown
+  else
+    echo unknown
+  fi
+}
+
+# hub_image_default — the HUB_IMAGE default in docker-compose.yml.
+hub_image_default() {
+  sed -n 's/.*\${HUB_IMAGE:-\([^}]*\)}.*/\1/p' "$PORTCULLIS_HOME/docker-compose.yml" | head -n1
+}
+
+version_run() {
+  local json="$1" ver hub src running="" cid=""
+  ver="$(portcullis_version)"
+  [ ! -f "$(env_file)" ] || env_load
+  if [ -n "${HUB_IMAGE:-}" ]; then hub="$HUB_IMAGE" src="HUB_IMAGE"; else hub="$(hub_image_default)" src="default"; fi
+  # The running Hub, if this is an installation and Docker answers.
+  if [ -f "$(env_file)" ] && command -v docker >/dev/null 2>&1; then
+    cid="$(dc ps -q hub 2>/dev/null | head -n1 || true)"
+    [ -z "$cid" ] || running="$(docker inspect --format '{{.Config.Image}} ({{.Image}})' "$cid" 2>/dev/null || true)"
+  fi
+  if [ "$json" = true ]; then
+    jq -n --arg v "$ver" --arg h "$hub" --arg s "$src" --arg r "$running" \
+      '{version: $v, hub_image: $h, hub_image_source: $s, hub_running: (if $r == "" then null else $r end)}'
+    return 0
+  fi
+  printf 'portcullis  %s\n' "$ver"
+  printf 'hub image   %s (%s)\n' "$hub" "$src"
+  [ -z "$running" ] || printf 'hub running %s\n' "$running"
+}
+
+help_version() {
+  cat <<'EOF'
+Usage: portcullis version [--json]
+
+Print the core version (VERSION in a release tarball, else `git describe`
+of the checkout) and the Hub image in use: HUB_IMAGE from .env or the
+environment, else the default pinned in docker-compose.yml, plus the image
+of the running Hub container if there is one.
+
+Options:
+  --json   machine-readable output
+EOF
+}
+
+cmd_version() {
+  local json=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=true ;;
+      -h|--help) help_version; return 0 ;;
+      *) usage_error version "unknown argument: $1" ;;
+    esac
+    shift
+  done
+  version_run "$json"
+}
+
 help_status() {
   cat <<'EOF'
-Usage: portcullis status [--json]
+Usage: portcullis status [--json | --textfile]
 
 Health overview: compose services, Vault (sealed/active, CA expiry, issued
 certs, client certs expiring within CERT_EXPIRY_WARN_DAYS = 7 days),
@@ -158,20 +254,26 @@ LLDAP and Traefik. Exits 1 if a core service is down/unhealthy or Vault is
 not active, 0 otherwise.
 
 Options:
-  --json   machine-readable output (same exit status)
+  --json       machine-readable output (same exit status)
+  --textfile   write the same as Prometheus metrics to
+               monitoring/textfile/status.prom for the monitoring profile
+               (service health, Vault active, CA and per-user client-cert
+               expiry); run after every scheduled backup
 EOF
 }
 
 cmd_status() {
-  local json=false
+  local json=false textfile=false
   while [ $# -gt 0 ]; do
     case "$1" in
       --json) json=true ;;
+      --textfile) textfile=true ;;
       -h|--help) help_status; return 0 ;;
       *) usage_error status "unknown argument: $1" ;;
     esac
     shift
   done
   need_env
+  if [ "$textfile" = true ]; then status_textfile; return; fi
   status_run "$json"
 }

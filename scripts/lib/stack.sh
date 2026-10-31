@@ -78,6 +78,18 @@ PORTCULLIS_AUTH_TRAEFIK_IP=172.31.251.2
 # every request, so this is about renewal cadence; see docs/certificates.md.
 CLIENT_CERT_TTL=720h
 
+# Off-host backups (restic, docs/backups.md): ./portcullis backup --offsite.
+# BACKUP_PASSWORD (generated below) encrypts them. Backups contain the
+# Vault root token + unseal key: store BACKUP_PASSWORD OFFLINE as well.
+#BACKUP_REPOSITORY=s3:https://s3.amazonaws.com/<bucket>/portcullis
+#BACKUP_KEEP_DAILY=7
+#BACKUP_KEEP_WEEKLY=4
+#BACKUP_KEEP_MONTHLY=6
+
+# Monitoring (docs/monitoring.md): Prometheus, Alertmanager, Grafana at
+# https://metrics.<domain> (lldap_admin).
+#COMPOSE_PROFILES=monitoring
+
 # Generated secrets
 EOF
   chmod 600 "$file"
@@ -113,7 +125,7 @@ init_run() {
   # Any secret that is empty/missing is generated — on a fresh .env that is
   # all of them; on a copied .env.example the blank ones.
   # shellcheck disable=SC2086
-  env_generate_missing $CORE_SECRETS
+  env_generate_missing $CORE_SECRETS $BACKUP_SECRETS
   [ -n "$(env_get KEYCLOAK_ADMIN)" ] || env_set KEYCLOAK_ADMIN admin
   chmod 600 "$(env_file)" 2>/dev/null || true
   env_load
@@ -199,7 +211,7 @@ upgrade_run() {
   # Only secrets nothing on disk depends on are generated on upgrade; the
   # database / admin passwords must already be there.
   # shellcheck disable=SC2086
-  env_generate_missing $ROTATABLE_SECRETS
+  env_generate_missing $ROTATABLE_SECRETS $BACKUP_SECRETS
   # shellcheck disable=SC2086
   env_require PORTCULLIS_DOMAIN $CORE_SECRETS
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
@@ -241,7 +253,7 @@ Usage: portcullis init [options]
 
 First-time setup. Creates .env (0600) with every secret randomly generated
 (Postgres, Keycloak admin, LLDAP admin + JWT, forward-auth client + cookie
-secret, HUB_PROXY_SECRET), then: DNS records, Vault init + unseal + enroll
+secret, HUB_PROXY_SECRET, BACKUP_PASSWORD for off-host backups), then: DNS records, Vault init + unseal + enroll
 AppRole, CA bundle, `docker compose up`, Vault PKI (incl. a self-signed
 wildcard server cert for local use), Keycloak realm, OIDC clients, config/.
 
@@ -291,8 +303,9 @@ Usage: portcullis upgrade [--skip-backup]
 
 Update a running installation after `git pull`:
   1. generates any missing HUB_PROXY_SECRET / FORWARD_AUTH_* / LLDAP_JWT_SECRET
-     (other secrets must already be in .env)
-  2. backs up .env, certs/, secrets/ and the volumes (portcullis backup)
+     / BACKUP_PASSWORD (other secrets must already be in .env)
+  2. creates a local backup (portcullis backup: Vault snapshot, pg_dump,
+     volumes, .env, certs/, secrets/)
   3. pulls images
   4. re-runs the idempotent setup steps: vault init, pki setup (client
      role incl. CLIENT_CERT_TTL, Keycloak truststore), CA bundle

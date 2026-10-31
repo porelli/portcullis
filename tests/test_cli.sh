@@ -57,7 +57,7 @@ case "$ERR" in *"unknown command 'frobnicate'"*) t_pass "unknown command message
 
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 21 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 21
+expect_eq "help lists 24 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 24
 while IFS= read -r c; do
   # shellcheck disable=SC2086
   run $c --help
@@ -88,8 +88,18 @@ down -v|unknown argument: -v
 upgrade --dry-run|unknown argument: --dry-run
 upgrade --migrate-vault|unknown argument: --migrate-vault
 backup now|unknown argument: now
-restore|expected <backup-dir>
+backup --frob|unknown argument: --frob
+backup verify --frob|unknown argument: --frob
+backup verify --snapshot|--snapshot needs a value
+backup verify --local x --snapshot y|exclusive
+backup schedule|--systemd is required
+backup schedule --systemd --on-calendar|--on-calendar needs a value
+backup schedule --cron|unknown argument: --cron
+restore|expected <backup-dir> or --from-offsite
 restore a b|unexpected argument: b
+restore --frob|unknown option: --frob
+version --bogus|unknown argument: --bogus
+status --json --bogus|unknown argument: --bogus
 init --domain|--domain needs a value
 init --domain --email|--domain needs a value
 init --frob|unknown argument: --frob
@@ -111,6 +121,27 @@ dns setup --fix|unknown argument
 keycloak configure --wipe|unknown argument
 oidc register now|unknown argument
 EOF
+
+# version and backup schedule work without .env (and without docker).
+run version
+expect_eq "version without .env exits 0" "$RC" 0
+case "$OUT" in "portcullis "*"hub image "*"ghcr.io/porelli/portcullis-hub:"*"(default)"*) t_pass "version shows core + hub image" ;; *) t_fail "version output: $OUT" ;; esac
+RC=0; OUT="$(HUB_IMAGE=example/hub:1.2.3 "$CLI" version --json </dev/null)" || RC=$?
+expect_eq "version --json honours HUB_IMAGE" "$RC:$(printf '%s' "$OUT" | jq -r '.hub_image + " " + .hub_image_source')" "0:example/hub:1.2.3 HUB_IMAGE"
+run backup schedule --systemd
+expect_eq "backup schedule --systemd exits 0" "$RC" 0
+case "$OUT" in *"ExecStart=$(cd "$HERE/.." && pwd)/portcullis backup"*"ExecStopPost=-"*"status --textfile"*"OnCalendar=*-*-* 03:15:00"*"Persistent=true"*) t_pass "systemd units: backup + status, daily timer" ;; *) t_fail "systemd units: $OUT" ;; esac
+case "$OUT" in *"backup --offsite"*) t_fail "no BACKUP_REPOSITORY → no --offsite" ;; *) t_pass "no BACKUP_REPOSITORY → local backup only" ;; esac
+case "$OUT" in *"Environment=PORTCULLIS_ROOT=$PORTCULLIS_ROOT"*) t_pass "units keep PORTCULLIS_ROOT" ;; *) t_fail "units lack PORTCULLIS_ROOT" ;; esac
+run backup schedule --systemd --on-calendar 'Sun 04:00' --output "$WORK/units"
+expect_eq "backup schedule --output exits 0" "$RC" 0
+expect_eq "timer written with OnCalendar" "$(grep -c '^OnCalendar=Sun 04:00$' "$WORK/units/portcullis-backup.timer" 2>/dev/null)" 1
+expect_ok "service written" test -s "$WORK/units/portcullis-backup.service"
+RC=0; OUT="$(BACKUP_REPOSITORY=/srv/restic "$CLI" backup schedule --systemd </dev/null)" || RC=$?
+case "$OUT" in *"portcullis backup --offsite"*) t_pass "BACKUP_REPOSITORY → backup --offsite" ;; *) t_fail "no --offsite: $OUT" ;; esac
+run restore --from-offsite
+expect_eq "restore --from-offsite without a repository exits 1" "$RC" 1
+case "$ERR" in *"BACKUP_REPOSITORY is not set"*) t_pass "restore --from-offsite explains BACKUP_REPOSITORY" ;; *) t_fail "restore --from-offsite: $ERR" ;; esac
 
 # Commands that need .env fail cleanly without one (exit 1, no docker).
 run up;          expect_eq "up without .env exits 1" "$RC" 1
@@ -137,6 +168,10 @@ for v in POSTGRES_PASSWORD KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD LLDAP_JW
 done
 expect_eq "HUB_PROXY_SECRET is 64 hex chars" "$(get HUB_PROXY_SECRET | grep -Ec '^[0-9a-f]{64}$')" 1
 expect_eq "no public default forward-auth secret" "$(grep -c 'portcullis-forward-auth-secret' "$ENVF")" 0
+expect_eq "BACKUP_PASSWORD generated (48 chars)" "$(get BACKUP_PASSWORD | grep -Ec '^[A-Za-z0-9]{48}$')" 1
+run backup verify --local
+expect_eq "backup verify --local without backups exits 1" "$RC" 1
+case "$ERR" in *"no local backups"*) t_pass "backup verify --local: no local backups" ;; *) t_fail "backup verify --local: $ERR" ;; esac
 BEFORE="$(cat "$ENVF")"
 run init --env-only --non-interactive --domain other.example
 expect_eq "init re-run succeeds" "$RC" 0

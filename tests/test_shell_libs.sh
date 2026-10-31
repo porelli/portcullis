@@ -329,6 +329,62 @@ rc=0; STUB_VAULT_RC=1 STUB_VAULT_OUT='sealed' VAULT_TOKEN=t PORTCULLIS_ROOT="$PK
 expect_eq "cli cert sync fails on Vault error" "$rc" 1
 expect_ok "cli cert sync error keeps the list" grep -qx '11:22' "$PKI_ROOT/certs/revocation/revoked-serials.txt"
 
+# ══ monitoring: alertmanager config, textfile metrics ═════
+# shellcheck source=../scripts/lib/monitoring.sh
+source "$HERE/../scripts/lib/monitoring.sh"
+am() { env -u ALERT_WEBHOOK_URL -u ALERT_NTFY_URL -u ALERT_SMTP_SMARTHOST -u ALERT_SMTP_TO "$@" bash -c \
+  "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/monitoring.sh'; alertmanager_config"; }
+OUT="$(am)"
+expect_eq "alertmanager: default receiver has no integrations" "$(printf '%s' "$OUT" | jq -c '.receivers')" '[{"name":"portcullis"}]'
+expect_eq "alertmanager: route to it" "$(printf '%s' "$OUT" | jq -r '.route.receiver')" portcullis
+OUT="$(am ALERT_WEBHOOK_URL='https://hooks.example/x?a="b"' ALERT_NTFY_URL=https://ntfy.sh/topic)"
+expect_eq "alertmanager: webhook + ntfy (JSON-escaped)" "$(printf '%s' "$OUT" | jq -r '[.receivers[0].webhook_configs[].url] | join(" ")')" \
+  'https://hooks.example/x?a="b" https://ntfy.sh/topic?template=alertmanager'
+OUT="$(am ALERT_SMTP_SMARTHOST=smtp.example:587 ALERT_SMTP_TO=ops@example ALERT_SMTP_USERNAME=u ALERT_SMTP_PASSWORD="p'w\"d" PORTCULLIS_DOMAIN=d.example)"
+expect_eq "alertmanager: smtp receiver" "$(printf '%s' "$OUT" | jq -c '.receivers[0].email_configs[0] | [.to, .from, .smarthost, .auth_password, .require_tls]')" \
+  '["ops@example","portcullis@d.example","smtp.example:587","p'"'"'w\"d",true]'
+expect_eq "alertmanager: smtp needs a recipient" "$(am ALERT_SMTP_SMARTHOST=smtp.example:587 | jq '.receivers[0] | has("email_configs")')" false
+
+# shellcheck disable=SC2034  # read by metrics_textfile_write
+MONITORING_TEXTFILE_DIR="$WORK/textfile"
+printf 'x 1\n' | metrics_textfile_write test
+expect_eq "textfile: written as <name>.prom" "$(cat "$WORK/textfile/test.prom")" "x 1"
+expect_eq "textfile: world-readable" "$(file_mode "$WORK/textfile/test.prom")" 644
+expect_eq "textfile: no temp file left" "$(find "$WORK/textfile" -name '.*' -type f | wc -l | tr -d ' ')" 0
+expect_eq "metrics_label escapes" "$(metrics_label 'a"b\c')" 'a\"b\\c'
+
+# ══ backup: manifest, layout, pruning (no Docker) ═════════
+# shellcheck source=../scripts/lib/status.sh
+source "$HERE/../scripts/lib/status.sh"
+# shellcheck source=../scripts/lib/backup.sh
+source "$HERE/../scripts/lib/backup.sh"
+B="$WORK/backup"
+mkdir -p "$B/secrets/vault-unseal" "$B/certs"
+echo 'PORTCULLIS_DOMAIN=x' > "$B/.env"
+echo '{"root_token":"r","unseal_keys_b64":["k"]}' > "$B/secrets/vault-init.json"
+printf k > "$B/secrets/vault-unseal/unseal-key"
+echo snap > "$B/vault.snap"; echo PGDMP > "$B/postgres.dump"; echo 'with space' > "$B/certs/a b.crt"
+_BACKUP_CFG='{"services":{"hub":{"image":"hub:1"}}}'
+_backup_manifest "$B"
+expect_eq "manifest: format + every file" "$(jq -c '[.format, (.files | keys)]' "$B/MANIFEST.json")" \
+  '[1,[".env","certs/a b.crt","postgres.dump","secrets/vault-init.json","secrets/vault-unseal/unseal-key","vault.snap"]]'
+expect_eq "manifest: hub image recorded" "$(jq -r .hub_image "$B/MANIFEST.json")" hub:1
+expect_ok "manifest: checksums verify" _backup_check_manifest "$B"
+echo tampered >> "$B/postgres.dump"
+expect_fail "manifest: a modified file fails" _backup_check_manifest "$B"
+expect_ok "layout: complete backup accepted" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/monitoring.sh'; source '$HERE/../scripts/lib/backup.sh'; _backup_check_layout '$B'"
+rm "$B/secrets/vault-unseal/unseal-key"
+expect_fail "layout: missing unseal key rejected" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/monitoring.sh'; source '$HERE/../scripts/lib/backup.sh'; _backup_check_layout '$B'"
+
+BACKUP_ROOT="$WORK/backups"
+mkdir -p "$BACKUP_ROOT"/{20260101-000000,20260102-000000,20260103-000000,pre-restore-20260101-000000,offsite-20260101-000000,20260104-000000.partial}
+BACKUP_KEEP_LOCAL=2 _backup_prune_local >/dev/null
+expect_eq "prune: keeps the newest BACKUP_KEEP_LOCAL, leaves other dirs" "$(cd "$BACKUP_ROOT" && ls -1 | tr '\n' ' ')" \
+  "20260102-000000 20260103-000000 20260104-000000.partial offsite-20260101-000000 pre-restore-20260101-000000 "
+expect_eq "backup dirs: only timestamped ones" "$(_backup_dirs | tr '\n' ' ')" "20260102-000000 20260103-000000 "
+expect_eq "restic creds: BACKUP_<NAME> wins" "$(AWS_ACCESS_KEY_ID=dns BACKUP_AWS_ACCESS_KEY_ID=bak _backup_cred AWS_ACCESS_KEY_ID)" bak
+expect_eq "restic creds: falls back to <NAME>" "$(B2_ACCOUNT_ID=b2 _backup_cred B2_ACCOUNT_ID)" b2
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
