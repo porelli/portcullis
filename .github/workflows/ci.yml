@@ -60,10 +60,47 @@ jobs:
           if grep -rn 'portcullis-forward-auth-secret' docker-compose*.yml keycloak/ .env.example; then
             echo "FAIL: public default forward-auth secret is back"; exit 1
           fi
+          CFG="$(docker compose -f docker-compose.yml config --format json)"
+          # Contract §6: only the socket proxies mount the Docker socket.
+          echo "$CFG" | jq -e '[.services | to_entries[] | select([.value.volumes[]?.source] | index("/var/run/docker.sock")) | .key] | sort == ["socket-proxy-hub", "socket-proxy-traefik"]' >/dev/null \
+            || { echo "FAIL: a service other than the socket proxies mounts docker.sock"; exit 1; }
+          echo "$CFG" | jq -e '.services.traefik.environment.TRAEFIK_PROVIDERS_DOCKER_ENDPOINT == "tcp://socket-proxy-traefik:2375"
+              and .services.hub.environment.DOCKER_HOST == "tcp://socket-proxy-hub:2375"
+              and .services["socket-proxy-traefik"].environment.POST == "0"
+              and ([.services.traefik.networks | keys[]] | index("socket-proxy-traefik"))
+              and ([.services.hub.networks | keys[]] | index("socket-proxy-hub"))
+              and ([.services | to_entries[] | select((.value.networks // {}) | has("socket-proxy-hub")) | .key] | sort == ["hub", "socket-proxy-hub"])
+              and ([.services | to_entries[] | select((.value.networks // {}) | has("socket-proxy-traefik")) | .key] | sort == ["socket-proxy-traefik", "traefik"])' >/dev/null \
+            || { echo "FAIL: socket proxy wiring"; exit 1; }
+          # Contract §5: Traefik injects the generated secret on the Hub router.
+          echo "$CFG" | jq -e '.services.hub.labels as $l
+              | ($l["traefik.http.routers.hub.middlewares"] | test("hub-proxy-secret@docker"))
+              and $l["traefik.http.middlewares.hub-proxy-secret.headers.customrequestheaders.X-Portcullis-Proxy-Secret"] == .services.hub.environment.HUB_PROXY_SECRET
+              and (.services.hub.image | test("^ghcr.io/porelli/portcullis-hub:"))' >/dev/null \
+            || { echo "FAIL: hub proxy-secret middleware / image"; exit 1; }
+          # Every core image is pinned by digest (the Hub via HUB_IMAGE, enroll is built).
+          UNPINNED="$(echo "$CFG" | jq -r '.services | to_entries[] | select(.key != "hub" and .key != "enroll")
+              | select((.value.image // "") | test("@sha256:[0-9a-f]{64}$") | not) | .key')"
+          [ -z "$UNPINNED" ] || { echo "FAIL: images not pinned by digest: $UNPINNED"; exit 1; }
+          if grep -E '^FROM ' enroll/Dockerfile | grep -v '@sha256:'; then echo "FAIL: unpinned base image in enroll/Dockerfile"; exit 1; fi
+          # Hardening baseline on every core service.
+          WEAK="$(echo "$CFG" | jq -r '.services | to_entries[]
+              | select((.value.security_opt // [] | index("no-new-privileges:true") | not) or ((.value.cap_drop // []) != ["ALL"])
+                       or (.value.mem_limit == null) or (.value.pids_limit == null)) | .key')"
+          [ -z "$WEAK" ] || { echo "FAIL: services without no-new-privileges/cap_drop ALL/limits: $WEAK"; exit 1; }
+          # Keycloak trusts proxy headers only from Traefik's address on portcullis-auth.
+          echo "$CFG" | jq -e '(.services.keycloak.command | index("--proxy-trusted-addresses=172.31.251.2"))
+              and .services.traefik.networks["portcullis-auth"].ipv4_address == "172.31.251.2"
+              and ([.services | to_entries[] | select((.value.networks // {}) | has("portcullis-auth")) | .key] | sort == ["keycloak", "traefik"])' >/dev/null \
+            || { echo "FAIL: portcullis-auth / proxy-trusted-addresses wiring"; exit 1; }
+          echo "PASS: socket proxies, hub proxy secret, digest pins, hardening, auth network"
       - name: enroll unit tests
         working-directory: enroll
         run: |
-          docker run --rm -e CGO_ENABLED=0 -v "$PWD:/src" -w /src golang:1.27-alpine sh -c 'go vet ./... && go test ./...'
+          # golang:1.27.3-alpine3.24 (same as enroll/Dockerfile)
+          docker run --rm -e CGO_ENABLED=0 -v "$PWD:/src" -w /src \
+            golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb \
+            sh -c 'go vet ./... && go test ./...'
 
   build-and-test:
     runs-on: ubuntu-latest
@@ -87,12 +124,13 @@ jobs:
 
       - name: CI compose override
         run: |
+          # Keycloak runs its production command (x509 lookup provider,
+          # proxy-trusted-addresses, truststore); only the management port
+          # is published for the health checks.
           cat > docker-compose.ci.yml <<'YML'
           services:
             keycloak:
-              command: ["start-dev", "--import-realm", "--http-enabled=true", "--http-port=8080", "--hostname=https://auth.portcullis.local", "--health-enabled=true"]
               ports:
-                - "127.0.0.1:8080:8080"
                 - "127.0.0.1:9000:9000"
             lldap:
               ports:
@@ -115,10 +153,16 @@ jobs:
         run: |
           ./portcullis vault init
           test "$(stat -c %a secrets)" = 700 || { echo "FAIL: secrets/ is not 0700"; exit 1; }
-          for f in secrets/vault-init.json secrets/vault-unseal/unseal-key secrets/enroll/role-id secrets/enroll/secret-id; do
-            test -s "$f" || { echo "FAIL: $f missing"; exit 1; }
-            test "$(stat -c %a "$f")" = 600 || { echo "FAIL: $f is not 0600"; exit 1; }
+          test -s secrets/vault-init.json && test "$(stat -c %a secrets/vault-init.json)" = 600 \
+            || { echo "FAIL: secrets/vault-init.json missing or not 0600"; exit 1; }
+          # Read by non-root containers: operator-owned, container group, 0640/0750.
+          for f in secrets/vault-unseal/unseal-key:1000 secrets/enroll/role-id:10002 secrets/enroll/secret-id:10002 secrets/hub/core.env:10001; do
+            test -s "${f%:*}" || { echo "FAIL: ${f%:*} missing"; exit 1; }
+            test "$(stat -c %a:%u:%g "${f%:*}")" = "640:$(id -u):${f#*:}" || { echo "FAIL: ${f%:*} is $(stat -c %a:%u:%g "${f%:*}"), want 640:$(id -u):${f#*:}"; exit 1; }
+            test "$(stat -c %a:%g "$(dirname "${f%:*}")")" = "750:${f#*:}" || { echo "FAIL: $(dirname "${f%:*}") mode/group"; exit 1; }
           done
+          test "$(stat -c %u templates)" = 10001 || { echo "FAIL: templates/ not owned by the Hub uid"; exit 1; }
+          if grep -Eq 'PASSWORD|SECRET=.{8}' secrets/hub/core.env; then echo "FAIL: core secrets leaked into the Hub env"; cat secrets/hub/core.env; exit 1; fi
           docker compose exec -T vault vault status -format=json | jq -e '.sealed == false and .storage_type == "raft"' \
             || { echo "FAIL: Vault not unsealed / not on raft storage"; exit 1; }
           # Idempotent: a second run must not re-init or rotate anything.
@@ -187,8 +231,14 @@ jobs:
           VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
           CA_BEFORE=$(vault read -field=certificate pki_int/cert/ca | sha256sum)
           docker compose restart vault
-          # Waits for unsealed AND active (raft leader), not just unsealed.
-          ./portcullis vault unseal || { echo "FAIL: Vault did not auto-unseal / become active"; docker compose logs --tail=30 vault; exit 1; }
+          # The container must unseal ITSELF (non-root vault user reading the
+          # group-readable key file) — no `portcullis vault unseal` here.
+          for i in $(seq 1 60); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8200/v1/sys/health)" = 200 ] && break
+            [ "$i" -eq 60 ] && { echo "FAIL: Vault did not auto-unseal"; docker compose logs --tail=30 vault; exit 1; }
+            sleep 1
+          done
+          ./portcullis vault unseal || { echo "FAIL: Vault not active"; docker compose logs --tail=30 vault; exit 1; }
           CA_AFTER=$(vault read -field=certificate pki_int/cert/ca | sha256sum)
           test "$CA_BEFORE" = "$CA_AFTER" || { echo "FAIL: PKI changed/lost across restart"; exit 1; }
           echo "PASS: Vault auto-unsealed after restart and kept its PKI"
@@ -410,7 +460,7 @@ jobs:
           cat > /tmp/ci-mtls.yml <<'YML'
           services:
             whoami:
-              image: traefik/whoami
+              image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
               networks: [portcullis-proxy]
               labels:
                 traefik.enable: "true"
@@ -431,6 +481,15 @@ jobs:
           YML
           docker compose up -d traefik group-gate enroll
           docker compose -p ci-mtls -f /tmp/ci-mtls.yml up -d
+          docker compose ps
+          for svc in socket-proxy-traefik traefik group-gate enroll; do
+            for i in $(seq 1 40); do
+              [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q "$svc")")" = healthy ] && break
+              [ "$i" -eq 40 ] && { echo "FAIL: $svc not healthy"; docker compose logs --tail=40 "$svc"; exit 1; }
+              sleep 3
+            done
+          done
+          echo "PASS: socket-proxy-traefik, traefik, group-gate, enroll healthy (non-root, read-only)"
 
           TRAEFIK_CID=$(docker compose ps -q traefik)
           GOT_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis-proxy").IPAddress}}' "$TRAEFIK_CID")
@@ -480,6 +539,113 @@ jobs:
           code=$(mtls gated.portcullis.local --cert /tmp/test-client.crt --key /tmp/test-client.key)
           [ "$code" = 200 ] || { echo "FAIL: group-gated router with valid cert got $code"; cat /tmp/mtls.out; exit 1; }
           echo "PASS: group-gated router accepts valid, unrevoked cert"
+
+      - name: Test client-cert headers cannot be spoofed and path rules see X-Forwarded-Uri
+        run: |
+          gated() { curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt \
+                      --resolve "gated.portcullis.local:443:127.0.0.1" "${@:2}" "https://gated.portcullis.local$1" || true; }
+          VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
+          # Revoke a throwaway cert, then CLAIM it in spoofed headers (no TLS
+          # client cert). If Traefik passed them through, group-gate would deny.
+          openssl ecparam -name prime256v1 -genkey -noout -out /tmp/spoof.key
+          openssl req -new -key /tmp/spoof.key -subj "/CN=testuser" -out /tmp/spoof.csr
+          SN=$(vault write -format=json pki_int/sign/client-cert csr="$(cat /tmp/spoof.csr)" common_name=testuser ttl=1h | jq -r .data.serial_number)
+          ./portcullis cert revoke --yes "$SN" >/dev/null
+          DEC=$(python3 -c "print(int('${SN//:/}', 16))")
+          INFO="Subject%3D%22CN%3Dtestuser%22%3BSerialNumber%3D%22$DEC%22"
+          for h in "X-Forwarded-Tls-Client-Cert-Info: $INFO" "X_Forwarded_Tls_Client_Cert_Info: $INFO" "X-Forwarded-Tls-Client-Cert: MIIB"; do
+            code=$(gated / -H "$h")
+            [ "$code" = 200 ] || { echo "FAIL: spoofed '$h' reached group-gate ($code)"; docker compose logs --tail=10 group-gate; exit 1; }
+          done
+          echo "PASS: Traefik strips client-supplied client-cert headers (incl. aliases)"
+
+          # path_groups through Traefik: group-gate only sees the path via
+          # X-Forwarded-Uri set by Traefik's forwardAuth.
+          printf '%s' '{"version":2,"groups":{"gated":"users_ci"},"path_groups":{"gated":[{"prefix":"/admin","group":"admin_ci"}]}}' \
+            | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
+                sh -c 'cat > /d/group-gate-policy.json && chmod 644 /d/group-gate-policy.json'
+          # (the gated router has no forward-auth, so the groups header is the test's)
+          for p in /admin /admin/x /%61dmin //admin /x/../admin /ADMIN '/admin;x=1' /admin%2fx; do
+            code=$(gated "$p" --path-as-is -H 'X-Auth-Request-Groups: users_ci')
+            [ "$code" = 403 ] || { echo "FAIL: $p without admin_ci got $code"; docker compose logs --tail=10 group-gate; exit 1; }
+          done
+          [ "$(gated /admin -H 'X-Auth-Request-Groups: users_ci,admin_ci')" = 200 ] || { echo "FAIL: admin_ci denied"; exit 1; }
+          [ "$(gated /administrator -H 'X-Auth-Request-Groups: users_ci')" = 200 ] || { echo "FAIL: /administrator denied"; exit 1; }
+          [ "$(gated /x%00 --path-as-is -H 'X-Auth-Request-Groups: users_ci')" = 403 ] || { echo "FAIL: NUL path allowed"; exit 1; }
+          [ "$(gated / -H 'X-Auth-Request-Groups: other')" = 403 ] || { echo "FAIL: subdomain group not enforced"; exit 1; }
+          echo '{}' | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a sh -c 'cat > /d/group-gate-policy.json'
+          echo "PASS: path_groups enforced on Traefik's X-Forwarded-Uri (bypass variants denied)"
+
+      - name: Test the socket proxies
+        run: |
+          # Traefik's proxy: read-only, containers/networks/events/version only.
+          # busybox wget -S prints the status line ("HTTP/1.1 403 ...") also on errors.
+          tp() { docker compose exec -T traefik wget -q -O /dev/null -S "$@" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -n1 | cut -d' ' -f2; }
+          [ "$(tp http://socket-proxy-traefik:2375/version)" = 200 ] || { echo "FAIL: traefik proxy /version"; exit 1; }
+          [ "$(tp http://socket-proxy-traefik:2375/containers/json)" = 200 ] || { echo "FAIL: traefik proxy /containers/json"; exit 1; }
+          for denied in /images/json /info /volumes /secrets /swarm /system/df; do
+            [ "$(tp "http://socket-proxy-traefik:2375$denied")" = 403 ] || { echo "FAIL: traefik proxy allowed $denied"; exit 1; }
+          done
+          [ "$(tp --post-data='{}' --header 'Content-Type: application/json' http://socket-proxy-traefik:2375/containers/create)" = 403 ] \
+            || { echo "FAIL: traefik proxy allowed a POST"; exit 1; }
+          echo "PASS: socket-proxy-traefik is read-only and minimal"
+
+          # Hub's proxy: run real `docker compose` through it, like the Hub does.
+          docker compose up -d socket-proxy-hub
+          for _ in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q socket-proxy-hub)")" = healthy ] && break; sleep 2
+          done
+          NET="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$(docker compose ps -q socket-proxy-hub)")"
+          mkdir -p /tmp/hubproj && cat > /tmp/hubproj/compose.yml <<'YML'
+          services:
+            web:
+              image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+              volumes: [data:/data]
+              networks: [portcullis-proxy, default]
+          volumes:
+            data:
+          networks:
+            portcullis-proxy:
+              external: true
+          YML
+          sed -i 's/^          //' /tmp/hubproj/compose.yml
+          dcli() { docker run --rm --network "$NET" -e DOCKER_HOST=tcp://socket-proxy-hub:2375 -v /tmp/hubproj:/p:ro -w /p \
+                     docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb "$@"; }
+          dcli docker compose -p ci-hubproxy up -d --pull missing || { docker compose logs --tail=30 socket-proxy-hub; echo "FAIL: compose up through socket-proxy-hub"; exit 1; }
+          dcli docker compose -p ci-hubproxy ps --format json | grep -q '"State":"running"' || { echo "FAIL: compose ps"; exit 1; }
+          dcli docker compose -p ci-hubproxy logs web >/dev/null || { echo "FAIL: compose logs"; exit 1; }
+          dcli docker compose -p ci-hubproxy exec -T web /whoami --help >/dev/null 2>&1 || dcli docker compose -p ci-hubproxy top >/dev/null 2>&1 || true
+          dcli docker compose -p ci-hubproxy restart web || { echo "FAIL: compose restart"; exit 1; }
+          dcli docker compose -p ci-hubproxy down -v || { echo "FAIL: compose down -v"; exit 1; }
+          for denied in "docker swarm init" "docker system df" "docker plugin ls" "docker secret ls" "docker node ls"; do
+            # shellcheck disable=SC2086
+            if dcli $denied >/dev/null 2>&1; then echo "FAIL: socket-proxy-hub allowed: $denied"; exit 1; fi
+          done
+          echo "PASS: docker compose up/ps/logs/restart/down -v work through socket-proxy-hub; swarm/system/plugins/secrets/nodes denied"
+
+      - name: Test the Hub (non-root, socket proxy, proxy secret)
+        run: |
+          if ! docker compose pull --quiet hub; then
+            echo "::warning::Hub image $(docker compose config --format json | jq -r .services.hub.image) cannot be pulled — skipping the Hub test"
+            exit 0
+          fi
+          docker compose up -d hub
+          HUB_CID="$(docker compose ps -q hub)"
+          test "$(docker inspect -f '{{json .HostConfig.Binds}}' "$HUB_CID" | grep -c docker.sock)" = 0 || { echo "FAIL: hub mounts docker.sock"; exit 1; }
+          HUB_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$HUB_CID")
+          for i in $(seq 1 30); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$HUB_IP:8888/healthz")" = 200 ] && break
+            [ "$i" -eq 30 ] && { echo "FAIL: hub /healthz"; docker compose logs --tail=40 hub; exit 1; }
+            sleep 2
+          done
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://$HUB_IP:8888/")
+          case "$code" in 401|403) ;; *) echo "FAIL: hub without proxy secret got $code"; exit 1 ;; esac
+          SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H @<(printf 'X-Portcullis-Proxy-Secret: %s\n' "$SECRET") "http://$HUB_IP:8888/")
+          case "$code" in 401|403|000) echo "FAIL: hub WITH proxy secret got $code"; docker compose logs --tail=20 hub; exit 1 ;; esac
+          docker compose exec -T hub sh -c 'test "$(id -u)" = 10001 && test -w /project/templates && ! grep -q POSTGRES_PASSWORD /project/.env && docker version >/dev/null' \
+            || { echo "FAIL: hub runtime (uid / templates / env subset / DOCKER_HOST)"; docker compose logs --tail=20 hub; exit 1; }
+          echo "PASS: Hub runs as 10001 without the socket, sees only the env subset, enforces the proxy secret"
 
       - name: Test enrollment UI responds
         run: |
@@ -592,7 +758,7 @@ jobs:
           docker compose ps
           echo ""
           echo "=== Service Logs (last 10 lines each) ==="
-          for svc in traefik keycloak vault lldap enroll postgres group-gate; do
+          for svc in socket-proxy-traefik socket-proxy-hub traefik keycloak vault lldap enroll postgres group-gate hub; do
             echo "--- $svc ---"
             docker compose logs --tail=10 "$svc" 2>/dev/null || echo "(not running)"
             echo ""
@@ -602,4 +768,191 @@ jobs:
         if: always()
         run: |
           docker compose -p ci-mtls -f /tmp/ci-mtls.yml down 2>/dev/null || true
+          docker compose -p ci-hubproxy down -v 2>/dev/null || true
+          docker compose down -v
+
+  # Browser end-to-end login through the real chain:
+  # Traefik → oauth2-proxy → Keycloak (LLDAP users, WebAuthn, X.509) → group-gate.
+  # tests/e2e/e2e_login.py documents every scenario.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      E2E_DOMAIN: portcullis.local
+      E2E_ARTIFACTS: e2e-artifacts
+      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Generate .env and the CI override
+        run: |
+          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+            --email ci@portcullis.local --dns-provider none
+          for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
+            val="$(grep "^$v=" .env | cut -d= -f2-)"
+            [ "$v" = KEYCLOAK_ADMIN ] || echo "::add-mask::$val"
+            echo "$v=$val" >> "$GITHUB_ENV"
+          done
+          for v in E2E_PASSWORD E2E_OTHER_PASSWORD; do
+            val="$(openssl rand -hex 16)Aa1!"
+            echo "::add-mask::$val"
+            echo "$v=$val" >> "$GITHUB_ENV"
+          done
+          cat > docker-compose.ci.yml <<'YML'
+          services:
+            keycloak:
+              ports:
+                - "127.0.0.1:9000:9000"
+            lldap:
+              ports:
+                - "127.0.0.1:17170:17170"
+          YML
+          sed -i 's/^          //' docker-compose.ci.yml
+          docker compose config -q
+
+      - name: Start the core stack (Vault, PKI, all services except the Hub)
+        run: |
+          docker compose build enroll
+          docker compose up -d postgres lldap
+          ./portcullis vault init
+          ./portcullis pki setup --with-server-cert
+          ./portcullis config apply --bundle-only
+          # No ACME in CI: serve the Vault-issued wildcard cert.
+          printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
+          # shellcheck disable=SC2046
+          docker compose up -d $(docker compose config --services | grep -vx hub)
+          for i in $(seq 1 100); do
+            curl -sf http://127.0.0.1:9000/health/ready >/dev/null && break
+            [ "$i" -eq 100 ] && { echo "FAIL: Keycloak not ready"; docker compose logs --tail=80 keycloak; exit 1; }
+            sleep 3
+          done
+          ./portcullis keycloak configure
+          ./portcullis oidc register
+          # oauth2-proxy exits while Keycloak is down; make sure it runs now.
+          docker compose up -d forward-auth
+          docker compose restart forward-auth
+          docker compose ps
+
+      - name: Users, groups, passkey requirement, policy, test app, certs
+        run: |
+          set -o pipefail
+          gql() {
+            jq -n --arg q "$1" '{query: $q}' | curl -sf http://127.0.0.1:17170/api/graphql \
+              -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @- \
+              | tee /dev/stderr | jq -e '.errors == null' >/dev/null
+          }
+          LLDAP_TOKEN=$(jq -n --arg p "$LLDAP_ADMIN_PASSWORD" '{username: "admin", password: $p}' \
+            | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          gql 'mutation { createUser(user: {id: "e2e", email: "e2e@portcullis.local"}) { id } }'
+          gql 'mutation { createUser(user: {id: "e2e-other", email: "e2e-other@portcullis.local"}) { id } }'
+          for g in users_e2e admin_e2e; do
+            gql "mutation { createGroup(name: \"$g\") { id } }"
+          done
+          GID=$(jq -n '{query: "{ groups { id displayName } }"}' | curl -sf http://127.0.0.1:17170/api/graphql \
+            -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @- \
+            | jq -r '.data.groups[] | select(.displayName == "users_e2e") | .id')
+          gql "mutation { addUserToGroup(userId: \"e2e\", groupId: $GID) { ok } }"
+          docker compose exec -T lldap /app/lldap_set_password --base-url http://localhost:17170 \
+            --admin-username admin --admin-password "$LLDAP_ADMIN_PASSWORD" --username e2e --password "$E2E_PASSWORD"
+          docker compose exec -T lldap /app/lldap_set_password --base-url http://localhost:17170 \
+            --admin-username admin --admin-password "$LLDAP_ADMIN_PASSWORD" --username e2e-other --password "$E2E_OTHER_PASSWORD"
+
+          # Keycloak: import e2e from LDAP and require passkey registration.
+          KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+            --data-urlencode client_id=admin-cli --data-urlencode "username=$KEYCLOAK_ADMIN" \
+            --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          kc() { curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") -H 'Content-Type: application/json' "$@"; }
+          KC_UID=$(kc "http://127.0.0.1:8080/admin/realms/portcullis/users?username=e2e&exact=true" | jq -r '.[0].id')
+          [ -n "$KC_UID" ] && [ "$KC_UID" != null ] || { echo "FAIL: e2e not visible in Keycloak (LDAP federation)"; exit 1; }
+          kc -X PUT -d '{"requiredActions": ["webauthn-register-passwordless"]}' "http://127.0.0.1:8080/admin/realms/portcullis/users/$KC_UID"
+
+          # group-gate policy (normally written by the Hub).
+          printf '%s' '{"version": 2,
+            "policies": {"hwk": {"factors": ["webauthn"], "op": ""}, "mtls": {"factors": ["mtls"], "op": ""}},
+            "groups": {"app": "users_e2e", "hwk": "users_e2e", "mtls": "users_e2e"},
+            "path_groups": {"app": [{"prefix": "/admin", "group": "admin_e2e"}]}}' \
+            | docker run --rm -i -v portcullis_hub_data:/d "$ALPINE" sh -c 'cat > /d/group-gate-policy.json && chmod 644 /d/group-gate-policy.json'
+
+          # Test app behind the standard forward-auth chain.
+          cat > /tmp/e2e-app.yml <<'YML'
+          services:
+            whoami:
+              image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+              networks: [portcullis-proxy]
+              labels:
+                traefik.enable: "true"
+                traefik.http.services.e2e.loadbalancer.server.port: "80"
+                traefik.http.routers.e2e.rule: Host(`app.portcullis.local`) || Host(`hwk.portcullis.local`) || Host(`mtls.portcullis.local`)
+                traefik.http.routers.e2e.entrypoints: websecure
+                traefik.http.routers.e2e.tls.options: authaware@file
+                traefik.http.routers.e2e.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+                traefik.http.routers.e2e.service: e2e
+          networks:
+            portcullis-proxy:
+              external: true
+          YML
+          sed -i 's/^          //' /tmp/e2e-app.yml
+          docker compose -p e2e-app -f /tmp/e2e-app.yml up -d
+          echo "127.0.0.1 auth.portcullis.local app.portcullis.local hwk.portcullis.local mtls.portcullis.local" | sudo tee -a /etc/hosts
+
+          # Client certs: one for e2e from Vault, one from a foreign CA.
+          VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
+          openssl ecparam -name prime256v1 -genkey -noout -out /tmp/e2e.key
+          openssl req -new -key /tmp/e2e.key -subj "/CN=e2e" -out /tmp/e2e.csr
+          docker compose exec -T -e VAULT_TOKEN vault vault write -format=json pki_int/sign/client-cert \
+            csr="$(cat /tmp/e2e.csr)" common_name=e2e ttl=2h > /tmp/e2e.json
+          jq -r .data.certificate /tmp/e2e.json > /tmp/e2e.crt
+          echo "E2E_REVOKE_CMD=./portcullis cert revoke --yes $(jq -r .data.serial_number /tmp/e2e.json)" >> "$GITHUB_ENV"
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+            -keyout /tmp/foreign.key -out /tmp/foreign.crt -subj "/CN=e2e" -days 1
+
+          # Wait until the app is routed (unauthenticated → redirect to sign-in).
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt https://app.portcullis.local/ || true)
+            case "$code" in 302|401|403) echo "app routed (HTTP $code)"; break ;; esac
+            [ "$i" -eq 40 ] && { echo "FAIL: app not routed ($code)"; docker compose logs --tail=40 traefik forward-auth; exit 1; }
+            sleep 3
+          done
+
+      - name: Install Playwright (pinned) and trust the CA
+        run: |
+          python3 -m venv /tmp/e2e-venv
+          /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
+          /tmp/e2e-venv/bin/playwright install --with-deps chromium
+          sudo apt-get install -y -qq libnss3-tools >/dev/null
+          mkdir -p "$HOME/.pki/nssdb"
+          certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
+          certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
+
+      - name: Run the browser login tests
+        env:
+          E2E_USER: e2e
+          E2E_OTHER: e2e-other
+          E2E_CERT: /tmp/e2e.crt
+          E2E_KEY: /tmp/e2e.key
+          E2E_FOREIGN_CERT: /tmp/foreign.crt
+          E2E_FOREIGN_KEY: /tmp/foreign.key
+        run: NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_login.py
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p e2e-artifacts
+          docker compose ps -a > e2e-artifacts/compose-ps.txt 2>&1 || true
+          for svc in traefik keycloak forward-auth group-gate lldap vault socket-proxy-traefik; do
+            docker compose logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
+          done
+
+      - name: Upload screenshots, traces and logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-artifacts
+          path: e2e-artifacts/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -p e2e-app -f /tmp/e2e-app.yml down 2>/dev/null || true
           docker compose down -v

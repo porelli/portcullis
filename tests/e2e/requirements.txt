@@ -1,0 +1,2 @@
+# Pinned: the e2e job installs exactly these (pip install -r).
+playwright==1.64.1
