@@ -43,10 +43,16 @@ Request paths on group-gate itself (the forwardAuth `address`):
                         any authenticated user. Used for self-service routes
                         such as enroll.<domain>/self (portcullis-self@docker).
   /healthz              liveness (no checks, for the container healthcheck)
+  /metrics              Prometheus metrics (monitoring profile): decisions by
+                        endpoint/result, denials and step-ups by reason,
+                        policy load errors, CRL freshness (last good fetch,
+                        the CRL's nextUpdate), revoked-serial counts. Only
+                        reachable on the internal `portcullis` network —
+                        Traefik's forwardAuth always calls / or /authenticated.
 
 Config sources (both re-read on every request; they are tiny):
   - /etc/group-gate/map.conf — subdomain=required_group. Authoritative for
-    core subdomains (auth, traefik, hub, directory, enroll): the Hub policy
+    core subdomains (auth, traefik, hub, directory, enroll, metrics): the Hub policy
     file can never override those.
   - /hub-data/group-gate-policy.json — written by the Hub (contract §4):
       {"version": 2,
@@ -73,6 +79,7 @@ We only decode the payload to read the acr/amr/preferred_username claims.
 from __future__ import annotations
 
 import base64
+import calendar
 import html
 import json
 import os
@@ -96,7 +103,7 @@ CERT_INFO_HEADER = "X-Forwarded-Tls-Client-Cert-Info"
 # Core infrastructure subdomains. Their required group comes only from
 # map.conf / GATE_MAP; Hub-written "groups" entries for them are ignored.
 # If map.conf somehow lacks one, it defaults to lldap_admin (fail closed).
-CORE_SUBDOMAINS = ("auth", "traefik", "hub", "directory", "enroll")
+CORE_SUBDOMAINS = ("auth", "traefik", "hub", "directory", "enroll", "metrics")
 CORE_DEFAULT_GROUP = "lldap_admin"
 VALID_OPS = ("", "any", "all")
 # Highest policy-file schema version this gate understands (contract §4).
@@ -343,6 +350,76 @@ def required_path_groups(rules: List[Tuple[str, str]], candidates: List[str]) ->
     return needed
 
 
+# ── Metrics (GET /metrics, Prometheus text format) ────────────────────
+
+
+class Metrics:
+    """Tiny thread-safe counter registry (no client library in the image)."""
+
+    HELP = {
+        "group_gate_requests_total": ("counter", "Forward-auth decisions by endpoint (gate|authenticated) and result (allow|deny|stepup)."),
+        "group_gate_denials_total": ("counter", "Denied requests by reason."),
+        "group_gate_stepups_total": ("counter", "Step-up (re-authentication) answers by reason."),
+        "group_gate_policy_load_errors_total": ("counter", "Requests denied because the Hub policy file or a policy in it is invalid."),
+        "group_gate_crl_fetch_failures_total": ("counter", "Failed CRL fetches (the last good CRL is kept)."),
+    }
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._values: dict = {}
+
+    def inc(self, name: str, **labels):
+        key = (name, tuple(sorted(labels.items())))
+        with self._lock:
+            self._values[key] = self._values.get(key, 0) + 1
+
+    def get(self, name: str, **labels) -> float:
+        with self._lock:
+            return self._values.get((name, tuple(sorted(labels.items()))), 0)
+
+    @staticmethod
+    def _fmt(name: str, labels, value) -> str:
+        if labels:
+            inner = ",".join(f'{k}="{str(v).replace(chr(92), chr(92) * 2).replace(chr(34), chr(92) + chr(34))}"'
+                             for k, v in labels)
+            name = f"{name}{{{inner}}}"
+        value = float(value)
+        return f"{name} {int(value) if value.is_integer() else repr(value)}"
+
+    def render(self) -> str:
+        lines: List[str] = []
+        with self._lock:
+            values = dict(self._values)
+        for name, (mtype, help_text) in self.HELP.items():
+            lines += [f"# HELP {name} {help_text}", f"# TYPE {name} {mtype}"]
+            series = sorted((k[1], v) for k, v in values.items() if k[0] == name)
+            if not series and mtype == "counter" and name in ("group_gate_policy_load_errors_total",
+                                                               "group_gate_crl_fetch_failures_total"):
+                series = [((), 0)]
+            lines += [self._fmt(name, labels, v) for labels, v in series]
+        crl = CRL_CACHE
+        gauges = [
+            ("group_gate_crl_enabled", "1 if revocation is also checked against Vault's CRL.", 1 if crl else 0),
+        ]
+        if crl is not None:
+            gauges += [
+                ("group_gate_crl_last_success_timestamp_seconds", "Unix time of the last successful CRL fetch (0 = never).", crl.last_success),
+                ("group_gate_crl_next_update_timestamp_seconds", "nextUpdate of the cached CRL (0 = unknown).", crl.next_update or 0),
+                ("group_gate_crl_revoked_serials", "Revoked serials in the cached CRL.", len(crl.serials)),
+            ]
+        try:
+            file_serials = float(len(load_revoked_file()))
+        except RevocationError:
+            file_serials = -1.0
+        gauges.append(("group_gate_revoked_file_serials", "Serials in the revoked-serials file (-1 = unreadable: cert requests are denied).", file_serials))
+        for name, help_text, value in gauges:
+            lines += [f"# HELP {name} {help_text}", f"# TYPE {name} gauge", self._fmt(name, (), value)]
+        return "\n".join(lines) + "\n"
+
+
+METRICS = Metrics()
+
+
 # ── Client-certificate revocation ─────────────────────────────────────
 
 
@@ -417,8 +494,27 @@ def _der_children(buf: bytes, start: int, end: int) -> List[Tuple[int, int, int]
     return out
 
 
+def _der_time(buf: bytes, tag: int, start: int, end: int) -> Optional[float]:
+    """UTCTime (0x17) / GeneralizedTime (0x18) → epoch seconds (UTC), or None."""
+    text = buf[start:end].decode("ascii", "replace").rstrip("Z")
+    try:
+        if tag == 0x17:
+            yy = int(text[:2])
+            text = ("19" if yy >= 50 else "20") + text
+        st = time.strptime(text[:14], "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    return float(calendar.timegm(st))
+
+
 def parse_crl_serials(data: bytes) -> FrozenSet[int]:
-    """Revoked serial numbers from an X.509 CRL (DER, or PEM).
+    """Revoked serial numbers from an X.509 CRL (DER, or PEM)."""
+    return parse_crl(data)[0]
+
+
+def parse_crl(data: bytes) -> Tuple[FrozenSet[int], Optional[float]]:
+    """(revoked serial numbers, nextUpdate epoch or None) from an X.509 CRL
+    (DER, or PEM).
 
     The CRL signature is not verified: it is fetched from Vault over the
     internal network, and it can only ever ADD denials.
@@ -441,7 +537,9 @@ def parse_crl_serials(data: bytes) -> FrozenSet[int]:
     if i >= len(fields) or fields[i][0] not in times:
         raise ValueError("CRL thisUpdate missing")
     i += 1
+    next_update = None
     if i < len(fields) and fields[i][0] in times:  # nextUpdate
+        next_update = _der_time(data, *fields[i])
         i += 1
     serials = set()
     if i < len(fields) and fields[i][0] == 0x30:  # revokedCertificates
@@ -452,7 +550,7 @@ def parse_crl_serials(data: bytes) -> FrozenSet[int]:
             stag, ss, se = _der_tlv(data, es)
             if stag == 0x02:
                 serials.add(int.from_bytes(data[ss:se], "big", signed=True))
-    return frozenset(serials)
+    return frozenset(serials), next_update
 
 
 class CrlCache:
@@ -463,13 +561,16 @@ class CrlCache:
         self.interval = max(interval, 1.0)
         self.serials: FrozenSet[int] = frozenset()
         self.last_error: Optional[str] = None
+        self.last_success: float = 0.0      # epoch of the last good fetch (0 = never)
+        self.next_update: Optional[float] = None  # the CRL's own nextUpdate
 
     def refresh(self) -> bool:
         try:
             with urllib.request.urlopen(self.url, timeout=5) as resp:
                 data = resp.read(16 * 1024 * 1024)
-            serials = parse_crl_serials(data)
+            serials, next_update = parse_crl(data)
         except Exception as e:  # noqa: BLE001 — any failure keeps the last good CRL
+            METRICS.inc("group_gate_crl_fetch_failures_total")
             err = f"{type(e).__name__}: {e}"
             if err != self.last_error:
                 print(f"group-gate: CRL fetch from {self.url} failed ({err}); keeping last good list "
@@ -479,6 +580,8 @@ class CrlCache:
         if serials != self.serials or self.last_error:
             print(f"group-gate: CRL loaded from {self.url}: {len(serials)} revoked serial(s)", flush=True)
         self.serials = serials
+        self.next_update = next_update
+        self.last_success = time.time()
         self.last_error = None
         return True
 
@@ -740,7 +843,10 @@ def identity_headers(req_headers) -> dict:
 
 
 class Handler(BaseHTTPRequestHandler):
-    def _deny(self, title: str, body_html: str, log: str, extra_headers: Optional[dict] = None):
+    def _deny(self, title: str, body_html: str, log: str, reason: str,
+              extra_headers: Optional[dict] = None):
+        METRICS.inc("group_gate_requests_total", endpoint=self._endpoint, result="deny")
+        METRICS.inc("group_gate_denials_total", reason=reason)
         self.send_response(403)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         for k, v in (extra_headers or {}).items():
@@ -750,21 +856,26 @@ class Handler(BaseHTTPRequestHandler):
         print(f"group-gate: {log}", flush=True)
 
     def _allow(self):
+        METRICS.inc("group_gate_requests_total", endpoint=self._endpoint, result="allow")
         self.send_response(200)
         for name, value in identity_headers(self.headers).items():
             self.send_header(name, value)
         self.end_headers()
 
     def _deny_policy(self, user: str, host: str, reason: str):
+        METRICS.inc("group_gate_policy_load_errors_total")
         self._deny(
             "Access Denied",
             "<p>The access policy for this app is misconfigured, so access is denied. "
             "Ask an administrator to fix it in the Hub.</p>",
             f"DENIED user={user} host={host} reason=malformed policy: {reason}",
+            "policy_error",
         )
 
     def _stepup(self, host: str, subdomain: str, user: str, policy: dict, required_loa: int,
-                acr: str, amr: list, reason: str, detail_html: str = ""):
+                acr: str, amr: list, reason: str, detail_html: str = "", metric_reason: str = "policy"):
+        METRICS.inc("group_gate_requests_total", endpoint=self._endpoint, result="stepup")
+        METRICS.inc("group_gate_stepups_total", reason=metric_reason)
         url = stepup_url(host, required_loa, policy.get("factors") or [])
         e_url = html.escape(url, quote=True)
         e_sub = html.escape(subdomain)
@@ -824,8 +935,18 @@ class Handler(BaseHTTPRequestHandler):
             flush=True,
         )
 
+    _endpoint = "gate"
+
     def do_GET(self):
         gate_path = urllib.parse.urlsplit(self.path).path
+        if gate_path == "/metrics":
+            body = METRICS.render().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if gate_path == "/healthz":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -834,6 +955,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         # /authenticated: any authenticated user, no subdomain group check.
         authenticated_only = gate_path == "/authenticated" or gate_path.startswith("/authenticated/")
+        self._endpoint = "authenticated" if authenticated_only else "gate"
 
         raw_host = self.headers.get("X-Forwarded-Host", "")
         host = normalize_host(raw_host)
@@ -846,6 +968,7 @@ class Handler(BaseHTTPRequestHandler):
                 "Access Denied",
                 "<p>Unrecognised host.</p>",
                 f"DENIED user={user} host={raw_host!r} reason=host not under PORTCULLIS_DOMAIN={DOMAIN!r}",
+                "host",
             )
             return
         e_sub = html.escape(subdomain)
@@ -857,6 +980,7 @@ class Handler(BaseHTTPRequestHandler):
                 "Access Denied",
                 "<p>Your account carries a reserved group name. Ask an administrator to remove it.</p>",
                 f"DENIED user={user} host={host} reason=user claims reserved group {DENY_GROUP!r}",
+                "reserved_group",
             )
             return
 
@@ -877,6 +1001,7 @@ class Handler(BaseHTTPRequestHandler):
                         "<p>The certificate revocation list is unavailable, so client certificates "
                         "cannot be accepted right now.</p>",
                         f"DENIED user={user} host={host} reason=revocation list error: {e}",
+                        "revocation_unavailable",
                     )
                     return
                 hit = [sn for sn in cert_serials if sn in revoked]
@@ -886,6 +1011,7 @@ class Handler(BaseHTTPRequestHandler):
                         "<p>Your client certificate has been <b>revoked</b>. "
                         "Ask an administrator to re-enroll your security key.</p>",
                         f"DENIED user={user} host={host} reason=revoked client cert serial={format_serial(hit[0])}",
+                        "revoked_cert",
                     )
                     return
 
@@ -941,6 +1067,7 @@ class Handler(BaseHTTPRequestHandler):
                         "<p><b>" + e_sub + "</b> requires your client certificate (security key) on "
                         "every request, and it must belong to the signed-in user. Insert your "
                         "security key, select its certificate when the browser asks, and sign in again.</p>",
+                        metric_reason="mtls_binding",
                     )
                     return
 
@@ -953,6 +1080,7 @@ class Handler(BaseHTTPRequestHandler):
                     f"<p>The configuration of <b>{e_sub}</b> is unavailable, so access is denied. "
                     "Ask an administrator to check the app in the Hub.</p>",
                     f"DENIED user={user} host={host} reason=app configuration unavailable ({DENY_GROUP})",
+                    "app_unavailable",
                 )
                 return
             if not required_group:
@@ -963,12 +1091,14 @@ class Handler(BaseHTTPRequestHandler):
                     f"<p>User <b>{e_user}</b> is not authorized to access <b>{e_sub}</b>.</p>"
                     f"<p>Required group: <code>{html.escape(required_group)}</code></p>",
                     f"DENIED user={user} host={host} need={required_group} have={sorted(groups)}",
+                    "group",
                 )
                 return
         else:
             if not self.headers.get("X-Auth-Request-User", "").strip():
                 self._deny("Access Denied", "<p>Not signed in.</p>",
-                           f"DENIED host={host} reason=authenticated-only route without a user")
+                           f"DENIED host={host} reason=authenticated-only route without a user",
+                           "unauthenticated")
                 return
 
         # --- Path groups (in addition to the subdomain group) ---
@@ -981,6 +1111,7 @@ class Handler(BaseHTTPRequestHandler):
                     "Access Denied",
                     "<p>The request path is not acceptable.</p>",
                     f"DENIED user={user} host={host} uri={raw_uri!r} reason=path: {e}",
+                    "path_invalid",
                 )
                 return
             for need in required_path_groups(path_rules, candidates):
@@ -990,6 +1121,7 @@ class Handler(BaseHTTPRequestHandler):
                         f"<p>User <b>{e_user}</b> is not authorized to access this part of <b>{e_sub}</b>.</p>"
                         f"<p>Required group: <code>{html.escape(need)}</code></p>",
                         f"DENIED user={user} host={host} path={candidates[0]!r} need={need} have={sorted(groups)}",
+                        "path_group",
                     )
                     return
 

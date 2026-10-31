@@ -105,6 +105,13 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.req("NewApp.example.com", groups="users_newapp"), 200)
         self.assertEqual(self.req("hub.example.com", groups="users_anyone"), 403)
 
+    def test_metrics_subdomain_is_core_admin_only(self):
+        # Grafana (monitoring profile): lldap_admin, never overridable by the Hub.
+        write_policy({"groups": {"metrics": "users_anyone"}, "path_groups": {"metrics": [{"prefix": "/x", "group": "g"}]}})
+        self.assertEqual(self.req("metrics.example.com", groups="users_anyone"), 403)
+        self.assertEqual(self.req("metrics.example.com", groups="lldap_admin"), 200)
+        self.assertEqual(self.req("metrics.example.com", groups="lldap_admin", uri="/x"), 200)
+
     def test_policy_file_without_groups_ok(self):
         write_policy({"policies": {}, "default": {"factors": [], "op": ""}})
         self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), 200)
@@ -545,6 +552,98 @@ class RevocationGateTest(GateTest):
             self.assertEqual(self.req("random.example.com", extra={gg.CERT_INFO_HEADER: cert_info(0x77)}), 403)
         finally:
             srv.shutdown()
+
+
+class MetricsTest(GateTest):
+    def setUp(self):
+        super().setUp()
+        write_revoked(None)
+        gg.CRL_CACHE = None
+
+    def tearDown(self):
+        write_revoked(None)
+        gg.CRL_CACHE = None
+
+    def scrape(self):
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/metrics") as r:
+            self.assertTrue(r.headers["Content-Type"].startswith("text/plain"))
+            return r.read().decode()
+
+    def test_counters_by_result_and_reason(self):
+        m = gg.METRICS
+        allow0 = m.get("group_gate_requests_total", endpoint="gate", result="allow")
+        group0 = m.get("group_gate_denials_total", reason="group")
+        host0 = m.get("group_gate_denials_total", reason="host")
+        step0 = m.get("group_gate_stepups_total", reason="policy")
+        pol0 = m.get("group_gate_policy_load_errors_total")
+        auth0 = m.get("group_gate_requests_total", endpoint="authenticated", result="allow")
+        self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), 200)
+        self.assertEqual(self.req("grafana.example.com", groups="users_x"), 403)
+        self.assertEqual(self.req("grafana.evil.com"), 403)
+        self.assertEqual(self.req("hub.example.com", gate_path="/authenticated", groups=""), 200)
+        write_policy({"policies": {"grafana": {"factors": ["webauthn"], "op": ""}}})
+        self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), 403)
+        write_policy("{not json")
+        self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), 403)
+        self.assertEqual(m.get("group_gate_requests_total", endpoint="gate", result="allow"), allow0 + 1)
+        self.assertEqual(m.get("group_gate_denials_total", reason="group"), group0 + 1)
+        self.assertEqual(m.get("group_gate_denials_total", reason="host"), host0 + 1)
+        self.assertEqual(m.get("group_gate_stepups_total", reason="policy"), step0 + 1)
+        self.assertEqual(m.get("group_gate_policy_load_errors_total"), pol0 + 1)
+        self.assertEqual(m.get("group_gate_requests_total", endpoint="authenticated", result="allow"), auth0 + 1)
+        text = self.scrape()
+        self.assertIn('group_gate_denials_total{reason="group"}', text)
+        self.assertIn("# TYPE group_gate_requests_total counter", text)
+        self.assertIn("group_gate_crl_enabled 0", text)
+        self.assertIn("group_gate_revoked_file_serials 0", text)
+
+    def test_revoked_cert_reason_and_unreadable_file_gauge(self):
+        before = gg.METRICS.get("group_gate_denials_total", reason="revoked_cert")
+        write_revoked(["0a:bc"])
+        self.assertEqual(self.req("random.example.com", extra={gg.CERT_INFO_HEADER: cert_info(0xABC)}), 403)
+        self.assertEqual(gg.METRICS.get("group_gate_denials_total", reason="revoked_cert"), before + 1)
+        self.assertIn("group_gate_revoked_file_serials 1", self.scrape())
+        write_revoked(None)
+        os.mkdir(REVOKED)
+        try:
+            self.assertIn("group_gate_revoked_file_serials -1", self.scrape())
+        finally:
+            os.rmdir(REVOKED)
+
+    def test_metrics_endpoint_needs_no_auth_headers_and_is_not_a_decision(self):
+        before = gg.METRICS.get("group_gate_denials_total", reason="host")
+        self.scrape()
+        self.assertEqual(gg.METRICS.get("group_gate_denials_total", reason="host"), before)
+
+    def test_crl_freshness_gauges(self):
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CrlHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            _CrlHandler.status, _CrlHandler.body = 200, build_crl([7])
+            cache = gg.CrlCache(f"http://127.0.0.1:{srv.server_address[1]}/crl", 60)
+            gg.CRL_CACHE = cache
+            self.assertIn("group_gate_crl_last_success_timestamp_seconds 0\n", self.scrape())
+            self.assertTrue(cache.refresh())
+            text = self.scrape()
+            self.assertIn("group_gate_crl_enabled 1", text)
+            self.assertIn("group_gate_crl_revoked_serials 1", text)
+            # build_crl uses 2025-01-01T00:00:00Z for thisUpdate/nextUpdate.
+            self.assertIn("group_gate_crl_next_update_timestamp_seconds 1735689600", text)
+            ok = cache.last_success
+            self.assertGreater(ok, 0)
+            failures = gg.METRICS.get("group_gate_crl_fetch_failures_total")
+            _CrlHandler.status = 500
+            self.assertFalse(cache.refresh())
+            self.assertEqual(cache.last_success, ok)  # a failure keeps the old timestamp
+            self.assertEqual(gg.METRICS.get("group_gate_crl_fetch_failures_total"), failures + 1)
+        finally:
+            _CrlHandler.status = 200
+            srv.shutdown()
+
+    def test_parse_crl_next_update(self):
+        self.assertEqual(gg.parse_crl(build_crl([1]))[1], 1735689600.0)
+        self.assertIsNone(gg.parse_crl(build_crl([1], with_next_update=False))[1])
+        self.assertEqual(gg._der_time(b"20991231235959Z", 0x18, 0, 15), 4102444799.0)
 
 
 if __name__ == "__main__":
