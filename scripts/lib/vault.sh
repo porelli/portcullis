@@ -5,9 +5,10 @@
 # Vault runs in server mode (raft storage). `portcullis vault init` writes
 # the init material to secrets/ on the host (outside git, dir 0700, files 0600):
 #   secrets/vault-init.json         root token + unseal key (vault operator init output)
-#   secrets/vault-unseal/unseal-key unseal key only (mounted read-only into vault)
+#   secrets/vault-unseal/unseal-key unseal key only (mounted read-only into
+#                                   vault; group 1000 = the vault user, 0640)
 #   secrets/enroll/role-id          AppRole credentials for the enrollment UI
-#   secrets/enroll/secret-id        (mounted read-only into enroll)
+#   secrets/enroll/secret-id        (mounted read-only into enroll; group 10002, 0640)
 #
 # Single key share trade-off: Shamir splitting only helps if the shares are
 # held by different people/places. Portcullis auto-unseals from a key file
@@ -222,6 +223,8 @@ vault_init() {
   else
     ok "Enroll AppRole credentials are valid."
   fi
+  # The vault / enroll containers run as non-root: give them group read.
+  secrets_fix_perms
   umask "$old_umask"
   ok "Vault ready (server mode, raft storage, auto-unseal on container start)."
 }
@@ -246,12 +249,13 @@ Idempotent; run by `portcullis init`, `upgrade` and `restore`.
   1. Starts the vault container if it is not running.
   2. If Vault is uninitialised: `vault operator init` with ONE key share,
      saving the output to secrets/vault-init.json (0600) and the unseal key
-     to secrets/vault-unseal/unseal-key (mounted read-only into vault, which
-     auto-unseals on every start).
+     to secrets/vault-unseal/unseal-key (0640, group of the vault user;
+     mounted read-only into vault, which auto-unseals on every start).
   3. Unseals Vault if it is sealed and waits until the raft node is active.
   4. Enables AppRole, writes the portcullis-enroll policy
      (vault/policies/enroll.hcl) and role, and stores the enroll role-id /
-     secret-id in secrets/enroll/ (mounted read-only into enroll).
+     secret-id in secrets/enroll/ (0640, group 10002 = the enroll user;
+     mounted read-only into enroll).
 
 Keep an OFFLINE copy of secrets/vault-init.json: losing it together with
 the host means losing the CA.

@@ -68,6 +68,15 @@ LLDAP_BASE_DN=dc=$(printf '%s' "$domain" | sed 's/\./,dc=/g')
 PORTCULLIS_PROXY_SUBNET=172.31.250.0/24
 PORTCULLIS_PROXY_IP_RANGE=172.31.250.128/25
 PORTCULLIS_TRAEFIK_IP=172.31.250.2
+# Traefik <-> Keycloak network; Keycloak trusts proxy headers only from
+# PORTCULLIS_AUTH_TRAEFIK_IP.
+PORTCULLIS_AUTH_SUBNET=172.31.251.0/28
+PORTCULLIS_AUTH_IP_RANGE=172.31.251.8/29
+PORTCULLIS_AUTH_TRAEFIK_IP=172.31.251.2
+
+# Client certificate lifetime (Vault duration). Revocation is enforced on
+# every request, so this is about renewal cadence; see docs/certificates.md.
+CLIENT_CERT_TTL=720h
 
 # Generated secrets
 EOF
@@ -140,8 +149,11 @@ init_run() {
   info "Creating the Vault PKI..."
   pki_setup false true
   config_build_ca_bundle
-  info "Restarting Traefik and forward-auth to pick up the CA chain..."
-  dc restart traefik forward-auth
+  # server.key was just written: give Traefik (group 0) read access.
+  stack_prepare
+  info "Restarting Traefik, forward-auth and Keycloak to pick up the CA chain..."
+  dc restart traefik forward-auth keycloak
+  wait_healthy 300 keycloak
 
   keycloak_configure false
   oidc_register
@@ -209,9 +221,9 @@ upgrade_run() {
 
   info "Starting services..."
   dc up -d --build
-  if [ "$PKI_CREATED" = true ]; then
-    # Traefik and forward-auth read the CA chain only at start-up.
-    dc restart traefik forward-auth >/dev/null
+  if [ "$PKI_CREATED" = true ] || [ "${PKI_TRUSTSTORE_CHANGED:-false}" = true ]; then
+    # Traefik, forward-auth and Keycloak read the CA chain only at start-up.
+    dc restart traefik forward-auth keycloak >/dev/null
   fi
   wait_healthy 300 vault postgres lldap keycloak
   keycloak_configure false
@@ -282,7 +294,8 @@ Update a running installation after `git pull`:
      (other secrets must already be in .env)
   2. backs up .env, certs/, secrets/ and the volumes (portcullis backup)
   3. pulls images
-  4. re-runs the idempotent setup steps: vault init, pki setup, CA bundle
+  4. re-runs the idempotent setup steps: vault init, pki setup (client
+     role incl. CLIENT_CERT_TTL, Keycloak truststore), CA bundle
   5. docker compose up -d --build, waits for health
   6. keycloak configure, oidc register
 

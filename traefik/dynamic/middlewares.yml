@@ -3,16 +3,41 @@
 #
 # Traefik's passTLSClientCert middleware extracts client cert info and passes
 # it to backends via the X-Forwarded-Tls-Client-Cert-Info header.
+#
+# Spoofing: the websecure entrypoint deletes client-supplied
+# X-Forwarded-Tls-Client-Cert(-Info) headers (no forwardedHeaders.trustedIPs)
+# and their aliases (aliasHeadersStrategy=delete), so after these
+# middlewares the headers only ever describe a cert Traefik verified.
 
 http:
   middlewares:
     # Passes client certificate details as headers to backends.
     # Backends receive:
-    #   X-Forwarded-Tls-Client-Cert:      URL-encoded full client cert (PEM)
+    #   X-Forwarded-Tls-Client-Cert:      PEM bodies, comma-separated (client-cert-pem only)
     #   X-Forwarded-Tls-Client-Cert-Info: Structured info (subject, issuer, serial, etc.)
     client-headers:
       passTLSClientCert:
         pem: false
+        info:
+          notAfter: true
+          notBefore: true
+          sans: true
+          serialNumber: true
+          subject:
+            commonName: true
+            country: true
+            organization: true
+            organizationalUnit: true
+          issuer:
+            commonName: true
+
+    # Same, plus the full cert as comma-separated PEM bodies in
+    # X-Forwarded-Tls-Client-Cert (the format Keycloak's `traefik` x509
+    # lookup provider reads). For auth.<domain> (X.509 login) and
+    # enroll.<domain>/self (renewal of the presented cert's key) only.
+    client-cert-pem:
+      passTLSClientCert:
+        pem: true
         info:
           notAfter: true
           notBefore: true
