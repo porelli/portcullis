@@ -695,6 +695,13 @@ jobs:
                 traefik.http.routers.ci-gated.tls.options: authaware@file
                 traefik.http.routers.ci-gated.middlewares: client-headers@file,portcullis-groups@docker
                 traefik.http.routers.ci-gated.service: ci-whoami
+                # Public-exception stand-in: every path goes through the
+                # public guard only (the Hub's routers also restrict paths).
+                traefik.http.routers.ci-public.rule: Host(`public.portcullis.local`)
+                traefik.http.routers.ci-public.entrypoints: websecure
+                traefik.http.routers.ci-public.tls.options: authaware@file
+                traefik.http.routers.ci-public.middlewares: portcullis-public-guard@docker
+                traefik.http.routers.ci-public.service: ci-whoami
           networks:
             portcullis-proxy:
               external: true
@@ -855,6 +862,35 @@ jobs:
           [ "$(gated / -H 'X-Auth-Request-Groups: other')" = 403 ] || { echo "FAIL: subdomain group not enforced"; exit 1; }
           echo '{}' | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a sh -c 'cat > /d/group-gate-policy.json'
           echo "PASS: path_groups enforced on Traefik's X-Forwarded-Uri (bypass variants denied)"
+
+      - name: Test the public guard (public exceptions) through Traefik
+        run: |
+          pub() { curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt \
+                    --resolve "public.portcullis.local:443:127.0.0.1" "${@:2}" "https://public.portcullis.local$1" || true; }
+          policy() { docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
+                       sh -c 'cat > /d/group-gate-policy.json.tmp && chmod 644 /d/group-gate-policy.json.tmp && mv /d/group-gate-policy.json.tmp /d/group-gate-policy.json'; }
+          # No public_paths entry (or an older file version): denied.
+          echo '{"version":2}' | policy
+          [ "$(pub /s/AbC123)" = 403 ] || { echo "FAIL: public path allowed without a v3 public_paths entry"; exit 1; }
+          jq -n '{version: 3, public_paths: {public: {
+                    paths: [{path: "/s/{token}", match: "prefix"}, {path: "/dist", match: "static"}],
+                    token_pattern: "^[A-Za-z0-9-]{1,32}$", static_extensions: ["js", "css"],
+                    credential_headers: ["X-Api-Key"], credential_cookies: ["nc_token"], credential_query: ["auth_token"]}}}' | policy
+          for p in /s/AbC123 /s/AbC123/download /dist/core-common.js; do
+            [ "$(pub "$p")" = 200 ] || { echo "FAIL: public $p denied"; docker compose logs --tail=10 group-gate; exit 1; }
+          done
+          for p in / /s /x /dist/a.php /dist/x.php/a.js /s/a.b /s/AbC%2Fx /s/AbC123/../../x; do
+            [ "$(pub "$p" --path-as-is)" = 403 ] || { echo "FAIL: non-public $p allowed"; exit 1; }
+          done
+          for h in "Authorization: Basic YWRtaW46eA==" "Proxy-Authorization: x" "X-Api-Key: k" \
+                   "Cookie: nc_token=x" "Cookie: a=1; nc.token=x" "Cookie:  nc[token=x" "Cookie: nc_token[]=x" "Cookie: NC%5Ftoken=x"; do
+            [ "$(pub /s/AbC123 -H "$h")" = 403 ] || { echo "FAIL: credential '$h' passed the public guard"; exit 1; }
+          done
+          for q in auth_token=x auth.token=x +auth_token=x 'auth_token%5B%5D=x' auth%5Ftoken=x; do
+            [ "$(pub "/s/AbC123?$q")" = 403 ] || { echo "FAIL: credential query $q passed the public guard"; exit 1; }
+          done
+          echo '{}' | policy
+          echo "PASS: public guard: only published paths, no credentials (PHP-normalised names)"
 
       - name: Test the socket proxies
         run: |

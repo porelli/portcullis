@@ -563,6 +563,11 @@ services:
       traefik.http.middlewares.portcullis-self.forwardauth.address: http://group-gate:8080/authenticated
       traefik.http.middlewares.portcullis-self.forwardauth.trustForwardHeader: "true"
       traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email
+      # Public exceptions (the Hub's portcullis-public-<app> routers, no
+      # forward-auth): allows only published public paths without any
+      # credential (contract §5). No authResponseHeaders: nobody is signed in.
+      traefik.http.middlewares.portcullis-public-guard.forwardauth.address: http://group-gate:8080/public-guard
+      traefik.http.middlewares.portcullis-public-guard.forwardauth.trustForwardHeader: "true"
     restart: unless-stopped
 
   hub:
