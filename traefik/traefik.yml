@@ -1,8 +1,0 @@
-# This file is NOT used as Traefik's static configuration.
-#
-# All static config is passed via environment variables in docker-compose.yml.
-# Traefik's three config methods (file, CLI, env vars) are mutually exclusive.
-# We use env vars so that domain, ACME, and DNS provider can be set from .env.
-#
-# This directory still provides *dynamic* configuration (middlewares, TLS options)
-# via the TRAEFIK_PROVIDERS_FILE_DIRECTORY env var pointing here.

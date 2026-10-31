@@ -184,8 +184,7 @@ auth in common apps (Gitea, Grafana, Wiki.js, pgAdmin, etc.).
 │   ├── main.go
 │   ├── Dockerfile
 │   └── web/                        # HTML templates
-├── traefik/
-│   ├── traefik.yml                 # Static config
+├── traefik/                        # Static config: env vars in docker-compose.yml
 │   └── dynamic/
 │       ├── tls.yml                 # TLS options (protected/authaware/public)
 │       ├── middlewares.yml         # Client cert headers, rate limits, security headers

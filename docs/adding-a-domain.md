@@ -46,6 +46,9 @@ traefik.portcullis.example.com    A  203.0.113.10
 
 You'll need to add a record each time you add a new service.
 
+`./portcullis dns setup` creates the A/AAAA records for the domain and its
+wildcard with the provider's API (Cloudflare, Porkbun, …; see `--help`).
+
 ## Step 2: Create DNS Provider API Token
 
 Portcullis needs a DNS API token to solve ACME DNS-01 challenges for the
@@ -154,46 +157,39 @@ You should see a Let's Encrypt certificate for `*.portcullis.example.com`.
 
 ## Using a Different DNS Provider
 
-Portcullis supports any DNS provider that Traefik/lego supports. Just set
-`DNS_PROVIDER` in `.env` and the provider's required env vars. No need to edit
-`traefik.yml` — the provider is read from the environment.
+Portcullis supports any DNS provider that Traefik/lego supports. Traefik is
+configured entirely through environment variables in `docker-compose.yml`
+(there is no `traefik.yml`): set `DNS_PROVIDER` in `.env` and the
+provider's required env vars.
 
 For the full list of 80+ providers, see the
 [Traefik ACME DNS providers documentation](https://doc.traefik.io/traefik/https/acme/#providers).
 
 If your provider's env vars aren't already in `docker-compose.yml`, add them to
-the traefik service's `environment` section.
+the traefik service's `environment` section in a `docker-compose.override.yml`.
 
-## Multiple Domains
+## One domain per installation
 
-If you want to serve apps under multiple domains (e.g., `portcullis.example.com`
-AND `internal.corp.io`), you need to:
+A Portcullis installation serves exactly one base domain,
+`PORTCULLIS_DOMAIN`: every app lives at `<subdomain>.${PORTCULLIS_DOMAIN}`.
+This is enforced, not just a default:
 
-1. Add both wildcard DNS records
-2. Update `traefik/traefik.yml` to request certs for both:
+- group-gate denies every request whose host is not exactly
+  `<label>.${PORTCULLIS_DOMAIN}` (it looks policies and groups up by that
+  label);
+- the Hub rejects templates whose routers use any other domain
+  (integration contract §4);
+- Traefik requests one wildcard certificate (`${PORTCULLIS_DOMAIN}` +
+  `*.${PORTCULLIS_DOMAIN}`), oauth2-proxy's cookie and redirect whitelist
+  cover `.${PORTCULLIS_DOMAIN}` only, and Keycloak's hostname is
+  `auth.${PORTCULLIS_DOMAIN}`.
 
-```yaml
-entryPoints:
-  websecure:
-    address: ":443"
-    http:
-      tls:
-        certResolver: letsencrypt
-        domains:
-          - main: "portcullis.example.com"
-            sans:
-              - "*.portcullis.example.com"
-          - main: "internal.corp.io"
-            sans:
-              - "*.internal.corp.io"
-```
-
-3. Use the full hostname in your service labels:
-
-```yaml
-labels:
-  traefik.http.routers.myapp.rule: Host(`myapp.internal.corp.io`)
-```
+To serve a second domain, run a second installation. Supporting several
+domains in one installation would need: group-gate keyed by full host (or a
+domain list), the Hub's host validation and policy file keyed the same way,
+a certificate (and DNS records) per domain, oauth2-proxy cookies per domain
+(a session cookie cannot span unrelated domains, so users would sign in per
+domain), and Keycloak redirect URIs for each.
 
 ## Local Development (No Public Domain)
 
