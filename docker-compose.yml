@@ -563,9 +563,9 @@ services:
       KEYCLOAK_URL: http://keycloak:8080
       KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?KEYCLOAK_ADMIN_PASSWORD is not set — run ./portcullis init}
-      LLDAP_HTTP_URL: http://lldap:17170
-      LLDAP_ADMIN_USER: admin
-      LLDAP_ADMIN_PASSWORD: ${LLDAP_ADMIN_PASSWORD:?LLDAP_ADMIN_PASSWORD is not set — run ./portcullis init}
+      # No LLDAP credentials: X-Forwarded-User is already the LLDAP username
+      # (the Hub used the LLDAP admin account only to map emails to usernames),
+      # and LLDAP admin could put anyone into lldap_admin.
       # Shared secret Traefik sends as X-Portcullis-Proxy-Secret on every
       # request routed to the Hub (hub-proxy-secret middleware below,
       # integration contract §5); the Hub refuses to start without it.

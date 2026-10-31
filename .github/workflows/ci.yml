@@ -76,8 +76,9 @@ jobs:
           echo "$CFG" | jq -e '.services.hub.labels as $l
               | ($l["traefik.http.routers.hub.middlewares"] | test("hub-proxy-secret@docker"))
               and $l["traefik.http.middlewares.hub-proxy-secret.headers.customrequestheaders.X-Portcullis-Proxy-Secret"] == .services.hub.environment.HUB_PROXY_SECRET
-              and (.services.hub.image | test("^ghcr.io/porelli/portcullis-hub:"))' >/dev/null \
-            || { echo "FAIL: hub proxy-secret middleware / image"; exit 1; }
+              and (.services.hub.image | test("^ghcr.io/porelli/portcullis-hub:"))
+              and ([.services.hub.environment | keys[] | select(startswith("LLDAP_"))] == [])' >/dev/null \
+            || { echo "FAIL: hub proxy-secret middleware / image / no LLDAP credentials"; exit 1; }
           # Every core image is pinned by digest (the Hub via HUB_IMAGE, enroll is built).
           UNPINNED="$(echo "$CFG" | jq -r '.services | to_entries[] | select(.key != "hub" and .key != "enroll")
               | select((.value.image // "") | test("@sha256:[0-9a-f]{64}$") | not) | .key')"
