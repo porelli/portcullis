@@ -129,7 +129,9 @@ services:
       # never expose it on 0.0.0.0.
       - "127.0.0.1:8200:8200"
     volumes:
-      - vault_data:/vault/data
+      # /vault/file: vault-owned in the image (it runs non-root), so the
+      # fresh named volume gets the right owner. See vault/vault.hcl.
+      - vault_data:/vault/file
       - ./vault:/vault/portcullis:ro
       - ./secrets/vault-unseal:/vault/unseal:ro
     networks:

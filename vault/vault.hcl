@@ -21,8 +21,12 @@ disable_mlock = true
 api_addr     = "http://vault:8200"
 cluster_addr = "http://vault:8201"
 
+# /vault/file exists in the image, owned by the `vault` user. The image runs
+# Vault as that non-root user, so a fresh named volume mounted here inherits
+# the right ownership (Docker copies it from the image directory); a new
+# mountpoint like /vault/data would be root-owned and raft could not write.
 storage "raft" {
-  path    = "/vault/data"
+  path    = "/vault/file"
   node_id = "portcullis-vault-1"
 }
 

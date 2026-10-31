@@ -20,13 +20,15 @@
 
 KEY_FILE="${PORTCULLIS_UNSEAL_KEY_FILE:-/vault/unseal/unseal-key}"
 CONFIG_FILE="${PORTCULLIS_VAULT_CONFIG:-/vault/portcullis/vault.hcl}"
-DATA_DIR="${PORTCULLIS_VAULT_DATA:-/vault/data}"
+DATA_DIR="${PORTCULLIS_VAULT_DATA:-/vault/file}"
 export VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
 
 log() { echo "portcullis-vault: $*" >&2; }
 
-# Raft needs a data dir owned by the vault user. Named volumes start out
-# root-owned, and restore.sh untars as root, so fix ownership every start.
+# Raft needs a data dir owned by the vault user. The image runs as that
+# user (non-root) and the vault_data volume is mounted at /vault/file, which
+# the image creates vault-owned, so nothing to do. Only when the container is
+# started as root (e.g. a compose override with user: root) fix ownership.
 if [ "$(id -u)" = 0 ] && id vault >/dev/null 2>&1; then
   mkdir -p "$DATA_DIR"
   chown -R vault:vault "$DATA_DIR" 2>/dev/null || log "warning: could not chown $DATA_DIR"
