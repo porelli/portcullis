@@ -57,9 +57,12 @@ nothing here migrates old data.
 ### Changed
 
 - **Identity is the LLDAP username, never the email** (users can edit their
-  own email in LLDAP): `X-Forwarded-User` / `X-Auth-Request-User` carry the
-  username (oauth2-proxy `userIDClaim: preferred_username`), the email moves
-  to `X-Forwarded-Email`; Keycloak does not mark LLDAP email as verified.
+  own email in LLDAP): `X-Forwarded-User` / `X-Auth-Request-User` /
+  `X-Auth-Request-Preferred-Username` carry the username (oauth2-proxy
+  injects the `preferred_username` claim; its session user is Keycloak's
+  `sub`), the email moves to `X-Forwarded-Email`; Keycloak does not mark
+  LLDAP email as verified. group-gate takes the user only from
+  `X-Auth-Request-Preferred-Username` and denies requests without it.
   Header-auth apps must log users in by username.
   `keycloak configure` maintains an `email-unverified` client scope (`email`
   claim, no `email_verified`) for apps that refuse `email_verified=false`

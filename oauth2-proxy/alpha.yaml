@@ -19,10 +19,13 @@ providers:
       skipDiscovery: false
       groupsClaim: groups
       # Identity = the LLDAP username (immutable, admin-assigned), never the
-      # email: LLDAP lets every user edit their own mail. The session user
-      # (X-Auth-Request-User / X-Forwarded-User) is preferred_username; the
-      # email is passed along for display only.
-      userIDClaim: preferred_username
+      # email: LLDAP lets every user edit their own mail. oauth2-proxy's
+      # session "user" is always the token's `sub` (Keycloak's user UUID) —
+      # there is no setting for it: `userIDClaim` is a deprecated alias of
+      # emailClaim (v7.15: it only replaced the EMAIL with the username).
+      # So the identity headers below are built from the preferred_username
+      # claim, and group-gate reads only X-Auth-Request-Preferred-Username.
+      emailClaim: email
       # Keycloak does not trust LLDAP's (user-editable) mail, so
       # email_verified is false. Nothing here authorises by email, so accept it.
       insecureAllowUnverifiedEmail: true
@@ -54,12 +57,13 @@ server:
 # inbound request object which Traefik drops). Traefik's authResponseHeaders
 # copies these onto the downstream service's request.
 #
-# Value schema is flat {claim: ...}, not {claimSource: {claim: ...}}.
+# X-Auth-Request-User / X-Forwarded-User / X-Auth-Request-Preferred-Username
+# all carry preferred_username (the LLDAP username), NOT `user` (= sub).
 injectResponseHeaders:
   - name: X-Auth-Request-User
     values:
       - claimSource:
-          claim: user
+          claim: preferred_username
   - name: X-Auth-Request-Email
     values:
       - claimSource:
@@ -83,7 +87,7 @@ injectResponseHeaders:
   - name: X-Forwarded-User
     values:
       - claimSource:
-          claim: user
+          claim: preferred_username
   - name: Authorization
     values:
       - claimSource:

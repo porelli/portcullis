@@ -26,8 +26,9 @@ Checks, run in order:
      factor (amr=mtls), the token alone is not enough — it may have been
      obtained with a cert that has since been revoked. The CURRENT request
      must present a client cert (checked for revocation in step 0) whose
-     subject CN equals the session user (preferred_username); otherwise
-     step-up / deny.
+     subject CN equals the session user (the LLDAP username from
+     X-Auth-Request-Preferred-Username, which must also match the token's
+     preferred_username); otherwise step-up / deny.
   2. Group — does the user belong to the subdomain's required LLDAP
      group (users_<app>)? If not, 403. The reserved group
      __portcullis_deny__ (published by the Hub for apps whose config is
@@ -813,24 +814,39 @@ def safe_factor_name(amr: str) -> str:
     return amr
 
 
+# The one header the signed-in username is read from: set by oauth2-proxy
+# (portcullis-auth, injectResponseHeaders in alpha.yaml) from the ID token's
+# preferred_username = the LLDAP username. oauth2-proxy's own session "user"
+# is the token's `sub` (Keycloak's internal user UUID) and can't be
+# configured (alpha `userIDClaim` is a deprecated alias of `emailClaim`),
+# so neither it nor the email is ever used as the identity.
+USERNAME_HEADER = "X-Auth-Request-Preferred-Username"
+
+
+def session_username(req_headers) -> str:
+    """The signed-in LLDAP username, or '' if portcullis-auth did not set one."""
+    return (req_headers.get(USERNAME_HEADER, "") or "").strip()
+
+
 def identity_headers(req_headers) -> dict:
     """Identity headers group-gate returns on ALLOW (Traefik copies them onto
     the upstream request: they are this middleware's authResponseHeaders, so
     Traefik first deletes any client-supplied copies).
 
-    X-Forwarded-User is the LLDAP username — oauth2-proxy's session user,
-    i.e. the token's preferred_username (userIDClaim in alpha.yaml) — and
-    NEVER the email: LLDAP lets users edit their own mail, so an email-keyed
-    identity could be taken over. The email travels separately in
-    X-Forwarded-Email for display / notifications only.
+    X-Forwarded-User / X-Auth-Request-User are the LLDAP username (see
+    USERNAME_HEADER) and NEVER the email or Keycloak's user id: LLDAP lets
+    users edit their own mail, so an email-keyed identity could be taken
+    over. The email travels separately in X-Forwarded-Email for display /
+    notifications only.
     """
     out = {}
-    user = (req_headers.get("X-Auth-Request-User", "") or "").strip()
+    user = session_username(req_headers)
     email = (req_headers.get("X-Auth-Request-Email", "") or "").strip()
     groups = req_headers.get("X-Auth-Request-Groups", "") or ""
     if user:
         out["X-Forwarded-User"] = user
         out["X-Auth-Request-User"] = user
+        out[USERNAME_HEADER] = user
     if email:
         out["X-Forwarded-Email"] = email
         out["X-Auth-Request-Email"] = email
@@ -960,7 +976,8 @@ class Handler(BaseHTTPRequestHandler):
 
         raw_host = self.headers.get("X-Forwarded-Host", "")
         host = normalize_host(raw_host)
-        user = self.headers.get("X-Auth-Request-User", "") or "unknown"
+        username = session_username(self.headers)
+        user = username or "unknown"  # for logs / pages only
         e_user = html.escape(user)
 
         subdomain = subdomain_for(host)
@@ -1016,6 +1033,19 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
 
+        # --- Identity: every route needs the username portcullis-auth sets.
+        # Missing = the router lacks portcullis-auth@docker (or oauth2-proxy
+        # did not get preferred_username): deny instead of falling back to
+        # the email / Keycloak user id or letting the request through
+        # anonymously. Runs after the revocation check, which never depends
+        # on who the user is.
+        if not username:
+            self._deny("Access Denied", "<p>Not signed in.</p>",
+                       f"DENIED host={host} reason=no {USERNAME_HEADER} "
+                       f"(router without portcullis-auth@docker?)",
+                       "unauthenticated")
+            return
+
         # Per-request reload — the Hub rewrites the policy file on each
         # change, and both files are tiny.
         try:
@@ -1052,15 +1082,18 @@ class Handler(BaseHTTPRequestHandler):
 
             # --- mTLS binding: amr=mtls is only as good as the cert used NOW ---
             if policy_relies_on_mtls(policy, amr):
-                session_user = claims.get("preferred_username")
+                # The cert must belong to the same user apps are told about
+                # (X-Forwarded-User = username); the token, from the same
+                # session, must agree.
+                token_user = claims.get("preferred_username")
                 cert_cn = leaf_cert_cn(cert_info) if cert_info else None
                 problem = None
                 if not cert_info or not cert_serials:
                     problem = "no client certificate on this request"
-                elif not isinstance(session_user, str) or not session_user:
-                    problem = "token has no preferred_username"
-                elif cert_cn is None or cert_cn != session_user:
-                    problem = f"client cert CN {cert_cn!r} != session user {session_user!r}"
+                elif token_user != username:
+                    problem = f"token preferred_username {token_user!r} != session user {username!r}"
+                elif cert_cn is None or cert_cn != username:
+                    problem = f"client cert CN {cert_cn!r} != session user {username!r}"
                 if problem:
                     self._stepup(
                         host, subdomain, user, policy, FACTOR_TO_LOA["mtls"], acr, amr,
@@ -1094,12 +1127,6 @@ class Handler(BaseHTTPRequestHandler):
                     f"DENIED user={user} host={host} need={required_group} have={sorted(groups)}",
                     "group",
                 )
-                return
-        else:
-            if not self.headers.get("X-Auth-Request-User", "").strip():
-                self._deny("Access Denied", "<p>Not signed in.</p>",
-                           f"DENIED host={host} reason=authenticated-only route without a user",
-                           "unauthenticated")
                 return
 
         # --- Path groups (in addition to the subdomain group) ---

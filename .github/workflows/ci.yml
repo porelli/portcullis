@@ -582,7 +582,12 @@ jobs:
                 keyFile: /certs/server.key
           EOF
           # Test app on portcullis-proxy: one router on the protected tier
-          # (cert required), one on authaware gated by group-gate.
+          # (cert required), one on authaware gated by group-gate. ci-gated has
+          # no portcullis-auth (no browser login in this job) and no group
+          # mapping (ALLOW-UNMAPPED): the tests send the identity headers
+          # portcullis-auth would set themselves. group-gate denies requests
+          # without X-Auth-Request-Preferred-Username; revocation is checked
+          # before that and does not depend on the user.
           cat > /tmp/ci-mtls.yml <<'YML'
           services:
             whoami:
@@ -663,6 +668,9 @@ jobs:
           echo "PASS: valid client cert accepted; backend sees cert info + Traefik's static IP"
 
           code=$(mtls gated.portcullis.local --cert /tmp/test-client.crt --key /tmp/test-client.key)
+          [ "$code" = 403 ] || { echo "FAIL: group-gated router without a username got $code"; cat /tmp/mtls.out; exit 1; }
+          echo "PASS: group-gate fails closed without X-Auth-Request-Preferred-Username"
+          code=$(mtls gated.portcullis.local --cert /tmp/test-client.crt --key /tmp/test-client.key -H 'X-Auth-Request-Preferred-Username: testuser')
           [ "$code" = 200 ] || { echo "FAIL: group-gated router with valid cert got $code"; cat /tmp/mtls.out; exit 1; }
           echo "PASS: group-gated router accepts valid, unrevoked cert"
 
@@ -719,8 +727,10 @@ jobs:
 
       - name: Test client-cert headers cannot be spoofed and path rules see X-Forwarded-Uri
         run: |
+          # (the gated router has no forward-auth: the username header is the test's)
           gated() { curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt \
-                      --resolve "gated.portcullis.local:443:127.0.0.1" "${@:2}" "https://gated.portcullis.local$1" || true; }
+                      --resolve "gated.portcullis.local:443:127.0.0.1" -H 'X-Auth-Request-Preferred-Username: testuser' \
+                      "${@:2}" "https://gated.portcullis.local$1" || true; }
           VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
           # Revoke a throwaway cert, then CLAIM it in spoofed headers (no TLS
           # client cert). If Traefik passed them through, group-gate would deny.
@@ -877,8 +887,9 @@ jobs:
 
       - name: Test certificate revocation is enforced
         run: |
+          # (the gated router has no forward-auth: the username header is the test's)
           gated() { curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt \
-                      --resolve "gated.portcullis.local:443:127.0.0.1" \
+                      --resolve "gated.portcullis.local:443:127.0.0.1" -H 'X-Auth-Request-Preferred-Username: testuser' \
                       --cert "$1.crt" --key "$1.key" https://gated.portcullis.local/ || true; }
 
           # 1) portcullis cert revoke → serial file → immediate denial

@@ -60,8 +60,11 @@ class GateTest(unittest.TestCase):
         write_policy(None)
 
     def req(self, host, groups="users_x", extra=None, uri=None, gate_path="/", want_headers=False):
+        # What portcullis-auth (oauth2-proxy) hands group-gate: User = the
+        # token's sub (Keycloak user id), Preferred-Username = LLDAP username.
         h = {"X-Forwarded-Host": host, "X-Auth-Request-Email": "bob@example.com",
-             "X-Auth-Request-User": "bob"}
+             "X-Auth-Request-User": "8d3c0d2e-5f4b-4bd1-9a51-1f2d3c4b5a69",
+             "X-Auth-Request-Preferred-Username": "bob"}
         if groups is not None:
             h["X-Auth-Request-Groups"] = groups
         if uri is not None:
@@ -98,6 +101,16 @@ class GateTest(unittest.TestCase):
 
     def test_unmapped_allows_authenticated(self):
         self.assertEqual(self.req("random.example.com", groups=""), 200)
+
+    def test_no_username_fails_closed_everywhere(self):
+        # No portcullis-auth in front (or no preferred_username): deny, even
+        # for unmapped apps, and never fall back to sub / email.
+        for gate_path in ("/", "/authenticated"):
+            for extra in ({"X-Auth-Request-Preferred-Username": None},
+                          {"X-Auth-Request-Preferred-Username": "  "}):
+                with self.subTest(gate_path=gate_path, extra=extra):
+                    self.assertEqual(self.req("random.example.com", groups="", gate_path=gate_path, extra=extra), 403)
+                    self.assertEqual(self.req("hub.example.com", groups="lldap_admin", gate_path=gate_path, extra=extra), 403)
 
     def test_policy_groups_merge_but_cannot_override_core(self):
         write_policy({"groups": {"newapp": "users_newapp", "hub": "users_anyone", "HUB": "users_anyone"}})
@@ -138,31 +151,34 @@ class GateTest(unittest.TestCase):
 
     # ── identity headers: username, never the (user-editable) email ──
 
-    def test_allow_forwards_username_not_email(self):
+    def test_allow_forwards_username_not_email_or_sub(self):
         code, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
         self.assertEqual(code, 200)
         self.assertEqual(hdrs.get("X-Forwarded-User"), "bob")
         self.assertEqual(hdrs.get("X-Auth-Request-User"), "bob")
+        self.assertEqual(hdrs.get("X-Auth-Request-Preferred-Username"), "bob")
         self.assertEqual(hdrs.get("X-Forwarded-Email"), "bob@example.com")
         self.assertEqual(hdrs.get("X-Auth-Request-Email"), "bob@example.com")
         self.assertEqual(hdrs.get("X-Auth-Request-Groups"), "users_grafana")
 
-    def test_email_alone_is_no_identity(self):
-        # An admin's address in the email header must not become the user.
-        code, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True,
-                              extra={"X-Auth-Request-User": None, "X-Auth-Request-Email": "admin@example.com"})
-        self.assertEqual(code, 200)
-        self.assertNotIn("X-Forwarded-User", hdrs)
-        self.assertNotIn("X-Auth-Request-User", hdrs)
-        self.assertEqual(hdrs.get("X-Forwarded-Email"), "admin@example.com")
-        # ...and /authenticated (self-service) needs a username.
-        self.assertEqual(self.req("enroll.example.com", gate_path="/authenticated",
-                                  extra={"X-Auth-Request-User": None, "X-Auth-Request-Email": "admin@example.com"}), 403)
+    def test_email_or_sub_alone_is_no_identity(self):
+        # An admin's address in the email header, or oauth2-proxy's session
+        # user (the token's sub), must not become the user: no username = 403.
+        for extra in ({"X-Auth-Request-Preferred-Username": None, "X-Auth-Request-Email": "admin@example.com"},
+                      {"X-Auth-Request-Preferred-Username": None, "X-Auth-Request-User": "admin"}):
+            for gate_path in ("/", "/authenticated"):
+                with self.subTest(extra=extra, gate_path=gate_path):
+                    self.assertEqual(self.req("grafana.example.com", groups="users_grafana",
+                                              gate_path=gate_path, extra=extra), 403)
 
     def test_identity_headers_mapping(self):
         self.assertEqual(gg.identity_headers({}), {})
-        self.assertEqual(gg.identity_headers({"X-Auth-Request-User": " alice ", "X-Auth-Request-Email": "a@x"}),
+        self.assertEqual(gg.identity_headers({"X-Auth-Request-User": "sub-uuid", "X-Auth-Request-Email": "a@x"}),
+                         {"X-Forwarded-Email": "a@x", "X-Auth-Request-Email": "a@x"})
+        self.assertEqual(gg.identity_headers({"X-Auth-Request-User": "sub-uuid", "X-Auth-Request-Email": "a@x",
+                                              "X-Auth-Request-Preferred-Username": " alice "}),
                          {"X-Forwarded-User": "alice", "X-Auth-Request-User": "alice",
+                          "X-Auth-Request-Preferred-Username": "alice",
                           "X-Forwarded-Email": "a@x", "X-Auth-Request-Email": "a@x"})
 
     # ── reserved deny group (contract §4) ──
@@ -210,7 +226,8 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.req("enroll.example.com", groups="", gate_path="/authenticated/self"), 200)
         # no user at all
         self.assertEqual(self.req("enroll.example.com", groups="", gate_path="/authenticated",
-                                  extra={"X-Auth-Request-Email": None, "X-Auth-Request-User": None}), 403)
+                                  extra={"X-Auth-Request-Email": None, "X-Auth-Request-User": None,
+                                         "X-Auth-Request-Preferred-Username": None}), 403)
         # host check still applies
         self.assertEqual(self.req("enroll.evil.com", groups="", gate_path="/authenticated"), 403)
         # "/authenticatedX" is not the authenticated-only endpoint
@@ -442,9 +459,10 @@ class MtlsBindingTest(GateTest):
     def tearDown(self):
         write_revoked(None)
 
-    def r(self, policy, amr, cert=None, user="bob", host="grafana.example.com"):
+    def r(self, policy, amr, cert=None, user="bob", host="grafana.example.com", token_user=None):
         write_policy({"policies": {"grafana": policy}})
-        extra = {"X-Forwarded-Access-Token": token(amr=amr, preferred_username=user)}
+        extra = {"X-Forwarded-Access-Token": token(amr=amr, preferred_username=user if token_user is None else token_user),
+                 "X-Auth-Request-Preferred-Username": user or None}
         if cert is not None:
             extra[gg.CERT_INFO_HEADER] = cert
         return self.req(host, groups="users_grafana", extra=extra, want_headers=True)
@@ -461,6 +479,12 @@ class MtlsBindingTest(GateTest):
         self.assertEqual(self.r({"factors": ["mtls"]}, ["mtls"], cert_info_for("alice", 0x10))[0], 403)
         self.assertEqual(self.r({"factors": ["mtls"]}, ["mtls"], cert_info_for("Bob", 0x10))[0], 403)
         self.assertEqual(self.r({"factors": ["mtls"]}, ["mtls"], cert_info_for("bob", 0x10), user="")[0], 403)
+
+    def test_mtls_binding_uses_the_session_username(self):
+        # CN compared with the username apps get; the token must agree.
+        self.assertEqual(self.r({"factors": ["mtls"]}, ["mtls"], cert_info_for("bob", 0x10), token_user="")[0], 403)
+        self.assertEqual(self.r({"factors": ["mtls"]}, ["mtls"], cert_info_for("bob", 0x10), token_user="alice")[0], 403)
+        self.assertEqual(self.r({"factors": ["mtls"]}, ["mtls"], cert_info_for("alice", 0x10), token_user="alice")[0], 403)
 
     def test_mtls_token_with_revoked_cert(self):
         write_revoked(["10"])

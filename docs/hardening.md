@@ -95,11 +95,21 @@ Therefore:
 
 - Keycloak's LDAP federation has `trustEmail=false`: tokens carry
   `email_verified=false` for LLDAP users.
-- oauth2-proxy keys the session on `preferred_username` (`userIDClaim` in
-  `oauth2-proxy/alpha.yaml`) and accepts the unverified email
-  (`insecureAllowUnverifiedEmail`) because nothing authorises by it.
+- oauth2-proxy's session user is always the token's `sub` (Keycloak's user
+  UUID); its alpha `userIDClaim` is only a deprecated alias of
+  `emailClaim`, so it is not used (CI rejects it). Instead
+  `oauth2-proxy/alpha.yaml` builds `X-Auth-Request-User`,
+  `X-Forwarded-User` and `X-Auth-Request-Preferred-Username` from the
+  `preferred_username` claim, keeps `emailClaim: email`, and accepts the
+  unverified email (`insecureAllowUnverifiedEmail`) because nothing
+  authorises by it.
+- group-gate reads the username ONLY from
+  `X-Auth-Request-Preferred-Username` (set by `portcullis-auth`, which must
+  run first) and denies the request when it is missing — it never falls
+  back to the email or `sub`.
 - Apps behind `portcullis-auth@docker,portcullis-groups@docker` receive
-  `X-Forwarded-User` / `X-Auth-Request-User` = username and
+  `X-Forwarded-User` / `X-Auth-Request-User` /
+  `X-Auth-Request-Preferred-Username` = username and
   `X-Forwarded-Email` / `X-Auth-Request-Email` = email (display only), plus
   `X-Auth-Request-Groups`. All of them are `authResponseHeaders` of the
   forward-auth middlewares, so Traefik deletes client-supplied copies
