@@ -485,7 +485,7 @@ _verify_pg() {
     sleep 2
   done
   docker exec "$n" createdb -U postgres keycloak >/dev/null 2>&1 \
-    && docker exec -i "$n" pg_restore -U postgres -d keycloak --no-owner --exit-on-error < "$dump" >/dev/null
+    && docker exec -i "$n" pg_restore -U postgres -d keycloak --no-owner --no-privileges --exit-on-error < "$dump" >/dev/null
 }
 
 # backup_verify <snapshot|""> <local-dir|""> <local:true|false>
