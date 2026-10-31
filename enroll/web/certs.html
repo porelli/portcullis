@@ -55,7 +55,7 @@
           <td>
             {{if .NotAfter.Before $.Now}}
               <span class="badge badge-expired">Expired</span>
-            {{else if .NotAfter.Before ($.Now.Add 7200000000000)}}
+            {{else if .NotAfter.Before ($.Now.Add 604800000000000)}}
               <span class="badge badge-expiring">Expiring soon</span>
             {{else}}
               <span class="badge badge-valid">Valid</span>

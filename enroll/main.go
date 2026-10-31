@@ -88,7 +88,7 @@ func loadConfig() Config {
 		LDAPBindPass: envOr("LLDAP_BIND_PASSWORD", "changeme"),
 		Domain:       envOr("PORTCULLIS_DOMAIN", "portcullis.local"),
 		ListenAddr:   envOr("LISTEN_ADDR", ":8443"),
-		CertTTL:      envOr("CERT_TTL", "24h"),
+		CertTTL:      envOr("CERT_TTL", "720h"),
 		PKIRole:      envOr("PKI_ROLE", "client-cert"),
 	}
 }
@@ -539,6 +539,10 @@ func render(w http.ResponseWriter, name string, data any) {
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
 	user := s.authenticatedUser(r)
 	data := map[string]interface{}{
 		"User":   user,
@@ -684,6 +688,12 @@ func main() {
 	mux.HandleFunc("GET /enroll/{username}", srv.handleEnroll)
 	mux.HandleFunc("POST /api/sign", srv.handleSign)
 	mux.HandleFunc("GET /api/users", srv.handleAPIUsers)
+	// Self-service (any signed-in user, own certificate only; see self.go).
+	mux.HandleFunc("GET /self", srv.handleSelf)
+	mux.HandleFunc("POST /api/self/renew", srv.handleSelfRenew)
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.Write([]byte("ok\n"))
+	})
 
 	// Surface Vault credential problems at start-up (non-fatal: the files
 	// may be written by `portcullis vault init` after enroll starts; every request
