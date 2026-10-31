@@ -70,7 +70,7 @@ Both methods are phishing-resistant and hardware-backed. Users can have both.
 | **Hub** | App catalog — enable/disable templates, manage sources | `hub.<domain>` |
 | **Keycloak** | WebAuthn, SAML/OIDC IdP, X.509 auth | `auth.<domain>` |
 | **LLDAP** | Lightweight user/group directory with web UI | `directory.<domain>` |
-| **Vault PKI** | Private CA, issues short-lived client certificates | `localhost:8200` |
+| **Vault PKI** | Private CA, issues client certificates (30 days, self-service renewal) | `localhost:8200` |
 | **Forward Auth** | OIDC bridge — redirects unauthenticated browser users to Keycloak | (internal) |
 
 ## Access Tiers
@@ -104,6 +104,9 @@ Keycloak syncs from LLDAP automatically.
 ```
 
 Or use the web UI at `https://enroll.<domain>` → "mTLS Certificate" for a guided flow.
+Certificates last 30 days (`CLIENT_CERT_TTL`); users renew their own at
+`https://enroll.<domain>/self` (same key, cert still valid). With the cert
+selected in the browser, users can also log in to Keycloak by X.509.
 
 ### 3. Add services
 
@@ -164,17 +167,19 @@ auth in common apps (Gitea, Grafana, Wiki.js, pgAdmin, etc.).
 │   └── config.yaml                # Headscale config (OIDC → Keycloak)
 ├── docs/
 │   ├── adding-a-domain.md          # DNS, certs, multiple domains
+│   ├── certificates.md             # TLS, mTLS, client certs, revocation, Vault
+│   ├── hardening.md                # Socket proxies, container hardening, exceptions
 │   ├── saml-app-nextcloud.md       # SAML app integration guide
 │   └── non-saml-app-kanboard.md    # Header-based auth guide
 ├── portcullis                     # The admin CLI (./portcullis help)
 ├── scripts/lib/                    # CLI libraries, one per area (vault, pki, certs, keycloak, ...)
 ├── group-gate/
-│   ├── group-gate.py               # Per-subdomain group / policy / revocation gate
+│   ├── group-gate.py               # Per-subdomain group / path / policy / revocation gate
 │   └── group-gate-map.conf         # Core subdomain → required LLDAP group
 ├── templates/                      # Hub-generated copies of enabled app templates (gitignored)
 ├── vault/                          # Vault server config (raft), auto-unseal entrypoint, enroll policy
 ├── secrets/                        # Vault root token, unseal key, enroll AppRole creds (gitignored, 0700)
-├── tests/                          # Unit tests (CLI, shell libs, group-gate)
+├── tests/                          # Unit tests (CLI, shell libs, group-gate); e2e/ browser login test (CI)
 ├── enroll/                         # Enrollment web UI (Go)
 │   ├── main.go
 │   ├── Dockerfile
@@ -255,9 +260,11 @@ Portcullis is an auth layer that works with existing platforms:
 
 - **Vault**: runs in server mode (raft storage) and auto-unseals from `secrets/` on the host — back up `secrets/vault-init.json` (root token + unseal key) **offline**
 - **Secrets**: `portcullis init` generates every password and secret into `.env` (0600); docker compose refuses to start if one is missing — there are no default passwords
-- **Revocation**: `./portcullis cert revoke <serial>` — enforced by group-gate (Traefik itself doesn't check CRLs); optionally also enable CRL checking in Keycloak's X.509 config
-- **Renewal**: automate `./portcullis cert renew <user>` via cron/launchd (mTLS users only)
+- **Revocation**: `./portcullis cert revoke <serial>` — enforced by group-gate on every request (Traefik itself doesn't check CRLs), by Keycloak's X.509 login (CRL) and by the mTLS binding (an `amr=mtls` session needs the unrevoked cert on every request); see [docs/certificates.md](docs/certificates.md)
+- **Renewal**: client certs live `CLIENT_CERT_TTL` (default 30 days); users renew their own at `https://enroll.<domain>/self` with the cert still valid, `portcullis status` warns 7 days ahead
 - **Backups**: `./portcullis backup` (also run by `upgrade`) saves `.env`, `certs/`, `secrets/` (the unseal key — the Vault volume is useless without it) and the Vault, PostgreSQL and LLDAP volumes to `backups/`; `./portcullis restore <dir>` puts them back
 - **Network**: `portcullis-proxy` uses a fixed subnet (`PORTCULLIS_PROXY_SUBNET`, default `172.31.250.0/24`) with Traefik pinned at `PORTCULLIS_TRAEFIK_IP` — change in `.env` only if it collides with a host network (before `init`; later the network has to be recreated, `./portcullis up` explains how)
-- **Docker socket**: consider a socket proxy for Traefik for hardening
+- **Docker socket**: only the two socket proxies mount it — Traefik gets read-only containers/networks/events, the Hub what `docker compose` needs (no swarm/system/plugins/secrets/build); see [docs/hardening.md](docs/hardening.md)
+- **Containers**: every core image is pinned by digest; services run with `no-new-privileges`, `cap_drop: ALL`, read-only root filesystems, non-root users and memory/pid limits where the image allows — exceptions in [docs/hardening.md](docs/hardening.md)
+- **Hub image**: `HUB_IMAGE` (default `ghcr.io/porelli/portcullis-hub:edge`); pin a release tag/digest for production. The Hub gets a generated env subset (`secrets/hub/core.env`), never the core `.env`
 - **PIV PIN**: enforce PIN changes from default (123456) for mTLS users

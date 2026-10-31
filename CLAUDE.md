@@ -39,7 +39,7 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 
 - Access groups: `users_<app>` — required to access the app
 - Admin groups: `admin_<app>` — grants admin privileges
-- Core infrastructure requires `lldap_admin` group
+- Core infrastructure requires `lldap_admin` group (`enroll.<domain>/self` is the one exception: any signed-in user, own cert only)
 - Groups: LLDAP → Keycloak (LDAP sync) → oauth2-proxy → group-gate
 
 ### Testing
@@ -49,13 +49,16 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 - Lint: `shellcheck -S warning portcullis scripts/lib/*.sh tests/*.sh`, `actionlint`
 - CI drives everything through `./portcullis` and runs `<cmd> --help` for every command listed by `./portcullis help`
 - Client-cert revocation is enforced by group-gate, so routers need `client-headers@file` BEFORE `portcullis-groups@docker`
+- Browser e2e (CI job `e2e`, needs the whole stack): `tests/e2e/e2e_login.py` (Playwright, pinned in `tests/e2e/requirements.txt`, CDP virtual WebAuthn authenticator). Not collected by pytest. Screenshots/traces/logs are uploaded on failure
+- Local verification without Docker: `docker compose -f docker-compose.yml --env-file <generated .env> config -q` (generate one with `PORTCULLIS_ROOT=/tmp/x ./portcullis init --env-only --non-interactive --domain ci.example.org --dns-provider none`)
 - Per-app template tests live in `porelli/portcullis-templates` (`tests/apps/<app>.sh`, `.github/workflows/test-apps.yml`)
 
 ### Admin CLI
 
 - **One entrypoint: `./portcullis`** (bash, `set -euo pipefail`). `./portcullis help` lists every command, `./portcullis <cmd> --help` documents it. Logic lives in `scripts/lib/<area>.sh` (common, network, vault, pki, certs, keycloak, dns, config, status, backup, stack); the entrypoint sources them all and dispatches to `cmd_<name>`. There are no other scripts — don't add standalone ones.
 - New command: add `cmd_<x>` + `help_<x>` in the right lib, list it in `help_main`, extend `tests/test_cli.sh`. `--help` must work without `.env`/Docker; argument errors exit 2.
-- `.env` is **parsed, never sourced** (the Hub can write it); shell environment wins over `.env`, like docker compose. Edit it with `env_set` (in place — it is bind-mounted into the Hub and may be a symlink into `config/`).
+- `.env` is **parsed, never sourced**; shell environment wins over `.env`, like docker compose. Edit it with `env_set` (in place — it may be a symlink into `config/`). The Hub never sees it: `hub_env_write` generates `secrets/hub/core.env` (whitelisted vars only, never `CORE_SECRETS`), mounted read-only as the Hub's `/project/.env`.
+- Files a non-root container reads stay operator-owned with the container's GID (`ct_group_read`: 0640 / dirs 0750; `ct_own` uses a throwaway root container when not root). UIDs/GIDs are `CT_*` in `common.sh` and must match `user:` / the images (vault 100:1000, hub 10001, enroll 10002, group-gate 10003, Traefik root/group 0). `stack_prepare` → `secrets_fix_perms` repairs them on every run.
 - Secrets never go on argv: request bodies via stdin, bearer tokens via `curl -H @<(...)`, Vault secrets via `key=-`.
 - No migration/back-compat code: the project has no installs to upgrade from. `portcullis upgrade` = backup, pull, re-run the idempotent steps, `up`.
 
@@ -66,24 +69,31 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 - Vault runs in server mode (raft, data in `/vault/file`) and auto-unseals from `secrets/`; the CLI reads the root token from `secrets/vault-init.json` (or `VAULT_TOKEN`). Never add a default/dev token.
 - `portcullis-proxy` has fixed IPAM (`PORTCULLIS_PROXY_SUBNET`/`_IP_RANGE`); Traefik is pinned to `PORTCULLIS_TRAEFIK_IP` — header-auth apps trust only that IP
 - `templates/` must exist before `up` (`init`/`up`/`upgrade` create it); the Hub fills it
-- Hub pulls from GHCR: `ghcr.io/porelli/portcullis-hub`; it needs `HUB_PROXY_SECRET` (contract §5)
+- Hub image: `${HUB_IMAGE:-ghcr.io/porelli/portcullis-hub:edge}` (edge = main; releases are semver tags). It needs `HUB_PROXY_SECRET` (contract §5): the `hub-proxy-secret@docker` headers middleware injects it, placed AFTER the forward-auth middlewares so the secret never reaches oauth2-proxy / group-gate
+- **No service mounts `/var/run/docker.sock` except `socket-proxy-traefik` (read-only) and `socket-proxy-hub`** (contract §6), each on its own internal network. Endpoint sets and limits: `docs/hardening.md`
+- Every core image is pinned `tag@sha256:…` (get the index digest from the registry, e.g. `docker manifest inspect` / registry API); every service has `no-new-privileges`, `cap_drop: ALL`, mem/pids limits; read-only root FS + non-root where possible (exceptions in `docs/hardening.md`). CI enforces pins, the socket rule and the hardening baseline
+- Keycloak sits on `portcullis-auth` (internal, fixed IPAM `PORTCULLIS_AUTH_*`) with Traefik; `--proxy-trusted-addresses=$PORTCULLIS_AUTH_TRAEFIK_IP` — proxy headers incl. the forwarded client cert (X.509 login, `traefik` lookup provider, `client-cert-pem@file`) are trusted only from there. All `auth.<domain>` routers use `authaware@file`
+- Client certs: `CLIENT_CERT_TTL` (default 720h); `pki setup` rewrites the Vault role every run. Self-service renewal at `enroll.<domain>/self` (router `enroll-self`, `portcullis-self@docker` = group-gate `/authenticated`)
 - Hub auto-clones templates from `porelli/portcullis-templates`
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `docker-compose.yml` | Core services (Traefik, Keycloak, LLDAP, Vault, oauth2-proxy, group-gate, Hub) |
+| `docker-compose.yml` | Core services (socket proxies, Traefik, Keycloak, LLDAP, Vault, oauth2-proxy, group-gate, Hub, enroll) |
 | `portcullis` | The admin CLI (`./portcullis help`) |
 | `scripts/lib/*.sh` | CLI libraries, one per area |
-| `group-gate/group-gate.py` | Per-subdomain group / auth-policy / revocation middleware |
+| `group-gate/group-gate.py` | Per-subdomain group / `path_groups` / auth-policy / mTLS-binding / revocation middleware (policy file v2, reserved group `__portcullis_deny__` always denies) |
 | `group-gate/group-gate-map.conf` | Subdomain → required LLDAP group mapping (authoritative for core subdomains; Hub's `groups` key in `group-gate-policy.json` adds/overrides app subdomains) |
-| `tests/test_group_gate.py` | group-gate unit tests (`python3 tests/test_group_gate.py`) |
+| `tests/test_group_gate.py` | group-gate unit tests (`python3 tests/test_group_gate.py`) incl. path-bypass and mTLS-binding cases |
+| `tests/e2e/e2e_login.py` | Browser e2e (CI job `e2e`): redirect, password + passkey registration, group / path denial, WebAuthn step-up, X.509 login, mTLS binding, revoked / foreign cert |
+| `enroll/self.go` | Self-service renewal: same key, current valid unrevoked cert, CN = signed-in user |
+| `docs/hardening.md` | Socket proxies, per-service hardening and exceptions, secrets ownership, header trust |
 | `tests/test_cli.sh` | CLI help / argument parsing / dispatch / `init --env-only` tests (stub `docker`) |
 | `keycloak/realm-export.json` | Keycloak realm with WebAuthn + X.509 flows |
 | `tests/test_shell_libs.sh` | Unit tests for `.env` handling, secret generation, network validation, revoked-serial sync, `pki setup` idempotency (stub `docker`/`vault`) |
 | `vault/` | Vault server config (`vault.hcl`, raft), auto-unseal entrypoint, `policies/enroll.hcl` |
-| `secrets/` | **gitignored** (only `.gitkeep` tracked; masked from the Hub by tmpfs), 0700: `vault-init.json` (root token + unseal key), `vault-unseal/`, `enroll/` AppRole creds |
+| `secrets/` | **gitignored** (only `.gitkeep` tracked; masked from the Hub by tmpfs), 0700: `vault-init.json` (root token + unseal key, 0600), `vault-unseal/` (group 1000), `enroll/` AppRole creds (group 10002), `hub/core.env` (group 10001) |
 | `certs/revocation/revoked-serials.txt` | Revoked client-cert serials (written by `portcullis cert revoke` / `cert sync`, read by group-gate) |
 | `templates/` | **gitignored**, Hub-generated copies of app template dirs (mounted rw into the Hub at `/project/templates`) so `./templates/<app>/...` bind mounts resolve on the host |
 | `.github/workflows/ci.yml` | Core infrastructure CI |
