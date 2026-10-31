@@ -1,0 +1,107 @@
+name: Release
+
+# Publishes a GitHub release for a vX.Y.Z tag (integration contract §1):
+#   1. the tag is semver and CHANGELOG.md has a "## [X.Y.Z]" section,
+#   2. the HUB_IMAGE default in docker-compose.yml is a RELEASED Hub tag
+#      pinned by digest (ghcr.io/porelli/portcullis-hub:A.B.C@sha256:...),
+#      and that tag still resolves to that digest,
+#   3. the full CI (ci.yml) passes on the tagged commit,
+#   4. release notes (the CHANGELOG section + GitHub's generated notes) and
+#      portcullis-X.Y.Z.tar.gz (the checkout without .git, plus VERSION)
+#      with its .sha256 are published.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Tag is vX.Y.Z and CHANGELOG.md has its section
+        id: tag
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          [[ "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || { echo "::error::tag $TAG is not vMAJOR.MINOR.PATCH"; exit 1; }
+          V="${TAG#v}"
+          grep -qE "^## \[$V\]" CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## [$V]' section"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: HUB_IMAGE default is a released Hub tag pinned by digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # shellcheck disable=SC2016  # a literal ${HUB_IMAGE:-...} in docker-compose.yml
+          HUB="$(sed -n 's/.*\${HUB_IMAGE:-\([^}]*\)}.*/\1/p' docker-compose.yml | head -n1)"
+          echo "HUB_IMAGE default: $HUB"
+          [[ "$HUB" =~ ^ghcr\.io/porelli/portcullis-hub:([0-9]+\.[0-9]+\.[0-9]+)@(sha256:[0-9a-f]{64})$ ]] \
+            || { echo "::error::HUB_IMAGE default must be ghcr.io/porelli/portcullis-hub:X.Y.Z@sha256:<digest> (got $HUB)"; exit 1; }
+          HV="${BASH_REMATCH[1]}" HD="${BASH_REMATCH[2]}"
+          gh release view "v$HV" -R porelli/portcullis-hub --json tagName,isDraft,isPrerelease \
+            | jq -e '.isDraft == false and .isPrerelease == false' >/dev/null \
+            || { echo "::error::v$HV is not a published release of porelli/portcullis-hub"; exit 1; }
+          GOT="$(docker buildx imagetools inspect "ghcr.io/porelli/portcullis-hub:$HV" --format '{{json .Manifest}}' | jq -r .digest)"
+          [ "$GOT" = "$HD" ] || { echo "::error::ghcr.io/porelli/portcullis-hub:$HV is $GOT, docker-compose.yml pins $HD"; exit 1; }
+          echo "PASS: Hub $HV pinned at $HD"
+
+  ci:
+    needs: preflight
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: [preflight, ci]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Release tarball (checkout without .git, plus VERSION) and checksum
+        env:
+          V: ${{ needs.preflight.outputs.version }}
+        run: |
+          N="portcullis-$V"
+          mkdir -p dist "$RUNNER_TEMP/src"
+          git archive --format=tar --prefix="$N/" "$GITHUB_REF_NAME" | tar -x -C "$RUNNER_TEMP/src"
+          printf '%s\n' "$V" > "$RUNNER_TEMP/src/$N/VERSION"
+          # Reproducible: sorted, numeric root owner, commit time.
+          tar -C "$RUNNER_TEMP/src" --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime="@$(git log -1 --format=%ct "$GITHUB_REF_NAME")" -cf - "$N" | gzip -n > "dist/$N.tar.gz"
+          (cd dist && sha256sum "$N.tar.gz" > "$N.tar.gz.sha256")
+          test "$(tar -xzOf "dist/$N.tar.gz" "$N/VERSION")" = "$V"
+          if tar -tzf "dist/$N.tar.gz" | grep -q '/\.git/'; then echo "::error::.git in the tarball"; exit 1; fi
+          cat dist/*.sha256
+
+      - name: Release notes and GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.preflight.outputs.version }}
+        run: |
+          awk -v v="$V" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }' CHANGELOG.md > notes.md
+          # shellcheck disable=SC2016  # a literal ${HUB_IMAGE:-...} in docker-compose.yml
+          HUB="$(sed -n 's/.*\${HUB_IMAGE:-\([^}]*\)}.*/\1/p' docker-compose.yml | head -n1)"
+          {
+            echo
+            echo "**Hub image:** \`$HUB\`"
+            echo
+            echo "Verify the tarball: \`sha256sum -c portcullis-$V.tar.gz.sha256\`"
+          } >> notes.md
+          gh release create "$GITHUB_REF_NAME" "dist/portcullis-$V.tar.gz" "dist/portcullis-$V.tar.gz.sha256" \
+            --verify-tag --title "Portcullis $V" --notes-file notes.md --generate-notes
