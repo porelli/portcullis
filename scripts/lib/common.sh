@@ -292,6 +292,27 @@ ct_own() {
     || fail "could not chown ${todo[*]} to $spec (try: sudo chown $spec ${todo[*]})"
 }
 
+# volume_own <volume> <uid:gid> — make sure the compose named volume exists
+# and its top directory belongs to <uid:gid>. Needed for volumes shared by
+# several services: whichever container starts first creates the volume, and
+# if its image lacks the mountpoint (e.g. group-gate mounting hub_data
+# read-only) the volume starts root-owned and Docker never copies the owning
+# image's ownership in. Created with compose's labels so compose adopts it.
+volume_own() {
+  local vol="$1" spec="$2" project="${COMPOSE_PROJECT_NAME:-portcullis}" name
+  name="${project}_$vol"
+  if ! docker volume inspect "$name" >/dev/null 2>&1; then
+    docker volume create --label "com.docker.compose.project=$project" \
+      --label "com.docker.compose.volume=$vol" "$name" >/dev/null \
+      || fail "could not create the Docker volume $name"
+  fi
+  # shellcheck disable=SC2016  # $1 is expanded by the container's sh
+  docker run --rm --network none --user 0:0 --cap-drop ALL --cap-add CHOWN \
+    --security-opt no-new-privileges:true --mount "type=volume,src=$name,dst=/v" \
+    "$PORTCULLIS_HELPER_IMAGE" sh -c '[ "$(stat -c %u:%g /v)" = "$1" ] || chown "$1" /v' _ "$spec" >/dev/null \
+    || fail "could not set the owner of volume $name to $spec"
+}
+
 # ct_group_read <gid> <path>... — operator-owned, group <gid>: dirs 0750,
 # files 0640. For secrets a non-root container must read.
 ct_group_read() {
@@ -380,6 +401,8 @@ stack_prepare() {
   [ ! -f "$PORTCULLIS_ROOT/certs/server.key" ] || ct_group_read "$CT_GID_TRAEFIK" "$PORTCULLIS_ROOT/certs/server.key"
   [ "$(_owner_of "$PORTCULLIS_ROOT/templates")" != "$(id -u):$(id -g)" ] || chmod 755 "$PORTCULLIS_ROOT/templates"
   ct_own "$CT_UID_HUB:$CT_UID_HUB" "$PORTCULLIS_ROOT/templates"
+  # hub_data is also mounted (read-only) by group-gate, which may create it.
+  volume_own hub_data "$CT_UID_HUB:$CT_UID_HUB"
   hub_env_write
   # Files of the opt-in monitoring profile (scripts/lib/monitoring.sh).
   if declare -F monitoring_prepare >/dev/null; then monitoring_prepare; fi
