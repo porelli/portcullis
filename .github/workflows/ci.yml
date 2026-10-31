@@ -9,20 +9,13 @@ on:
 permissions:
   contents: read
 
+# Secrets are NOT set here: `./portcullis init --env-only` generates them
+# into .env (exactly as on a real install) and the steps that need one read
+# it from there.
 env:
   PORTCULLIS_DOMAIN: portcullis.local
-  ACME_EMAIL: ci@portcullis.local
-  KEYCLOAK_ADMIN: admin
-  KEYCLOAK_ADMIN_PASSWORD: ci-admin-pass
-  POSTGRES_PASSWORD: ci-pg-pass
-  LLDAP_ADMIN_PASSWORD: ci-lldap-pass
-  LLDAP_JWT_SECRET: ci-jwt-secret-value
-  LLDAP_BASE_DN: dc=portcullis,dc=local
-  FORWARD_AUTH_CLIENT_SECRET: ci-forward-auth-secret
-  FORWARD_AUTH_COOKIE_SECRET: ci-forward-auth-cookie-secret-32
-  CLOUDFLARE_API_TOKEN: ""
-  # Every plain `docker compose` call (incl. the ones inside scripts/) uses
-  # the core file + the CI override written below.
+  # Every plain `docker compose` call (incl. the ones inside ./portcullis)
+  # uses the core file + the CI override written below.
   COMPOSE_FILE: docker-compose.yml:docker-compose.ci.yml
   VAULT_ADDR: http://127.0.0.1:8200
   TRAEFIK_IP: 172.31.250.2
@@ -33,10 +26,40 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+      - name: shellcheck
+        run: shellcheck -S warning portcullis scripts/lib/*.sh tests/*.sh vault/entrypoint.sh
+      - name: CLI help for every command
+        run: |
+          ./portcullis help
+          # Every command listed by `portcullis help` must print its usage.
+          ./portcullis help | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p' | while read -r cmd; do
+            echo "::group::portcullis $cmd --help"
+            # shellcheck disable=SC2086
+            ./portcullis $cmd --help | tee /tmp/help.out
+            head -n1 /tmp/help.out | grep -q "^Usage: portcullis $cmd" || { echo "FAIL: '$cmd --help' has no usage line"; exit 1; }
+            echo "::endgroup::"
+          done
+      - name: CLI argument parsing tests
+        run: bash tests/test_cli.sh
+      - name: shell library tests (.env, proxy network, revocation sync, pki setup)
+        run: bash tests/test_shell_libs.sh
       - name: group-gate unit tests
         run: python3 tests/test_group_gate.py
-      - name: shell library tests (proxy network, revocation sync)
-        run: bash tests/test_shell_libs.sh
+      - name: compose files are valid with a generated .env
+        run: |
+          ./portcullis init --env-only --non-interactive --domain ci.example.org --dns-provider none
+          docker compose -f docker-compose.yml config -q
+          docker compose -f docker-compose.yml -f docker-compose.apps.yml config -q
+          docker compose -f docker-compose.test.yml config -q
+          docker compose -f docker-compose.yml config --format json \
+            | jq -e '.services.hub.environment.HUB_PROXY_SECRET | test("^[0-9a-f]{64}$")' >/dev/null \
+            || { echo "FAIL: hub has no generated HUB_PROXY_SECRET"; exit 1; }
+          if HUB_PROXY_SECRET='' docker compose -f docker-compose.yml config -q 2>/dev/null; then
+            echo "FAIL: compose accepted an empty HUB_PROXY_SECRET"; exit 1
+          fi
+          if grep -rn 'portcullis-forward-auth-secret' docker-compose*.yml keycloak/ .env.example; then
+            echo "FAIL: public default forward-auth secret is back"; exit 1
+          fi
       - name: enroll unit tests
         working-directory: enroll
         run: |
@@ -49,34 +72,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Create .env file
+      - name: Generate .env (portcullis init --env-only)
         run: |
-          cat > .env <<'ENVEOF'
-          PORTCULLIS_DOMAIN=portcullis.local
-          ACME_EMAIL=ci@portcullis.local
-          KEYCLOAK_ADMIN=admin
-          KEYCLOAK_ADMIN_PASSWORD=ci-admin-pass
-          POSTGRES_PASSWORD=ci-pg-pass
-          LLDAP_ADMIN_PASSWORD=ci-lldap-pass
-          LLDAP_JWT_SECRET=ci-jwt-secret-value
-          LLDAP_BASE_DN=dc=portcullis,dc=local
-          FORWARD_AUTH_CLIENT_SECRET=ci-forward-auth-secret
-          FORWARD_AUTH_COOKIE_SECRET=ci-forward-auth-cookie-secret-32
-          CLOUDFLARE_API_TOKEN=
-          PORTCULLIS_PROXY_SUBNET=172.31.250.0/24
-          PORTCULLIS_PROXY_IP_RANGE=172.31.250.128/25
-          PORTCULLIS_TRAEFIK_IP=172.31.250.2
-          ENVEOF
-          # Strip leading whitespace from heredoc
-          sed -i 's/^[[:space:]]*//' .env
+          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+            --email ci@portcullis.local --dns-provider none
+          test "$(stat -c %a .env)" = 600 || { echo "FAIL: .env is not 0600"; exit 1; }
+          # Make the generated values available to the test steps below.
+          for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD FORWARD_AUTH_CLIENT_SECRET; do
+            val="$(grep "^$v=" .env | cut -d= -f2-)"
+            [ -n "$val" ] || { echo "FAIL: $v not generated"; exit 1; }
+            [ "$v" = KEYCLOAK_ADMIN ] || echo "::add-mask::$val"
+            echo "$v=$val" >> "$GITHUB_ENV"
+          done
 
-      - name: Create directories and CI compose override
+      - name: CI compose override
         run: |
-          # Bind-mount sources must exist before compose, or Docker creates
-          # them root-owned and the scripts can't write into them.
-          mkdir -p certs/revocation templates backups
-          : > certs/revocation/revoked-serials.txt
-          (umask 077 && mkdir -p secrets/vault-unseal secrets/enroll)
           cat > docker-compose.ci.yml <<'YML'
           services:
             keycloak:
@@ -103,7 +113,7 @@ jobs:
 
       - name: Initialize and unseal Vault (server mode)
         run: |
-          ./scripts/vault-init.sh
+          ./portcullis vault init
           test "$(stat -c %a secrets)" = 700 || { echo "FAIL: secrets/ is not 0700"; exit 1; }
           for f in secrets/vault-init.json secrets/vault-unseal/unseal-key secrets/enroll/role-id secrets/enroll/secret-id; do
             test -s "$f" || { echo "FAIL: $f missing"; exit 1; }
@@ -111,12 +121,9 @@ jobs:
           done
           docker compose exec -T vault vault status -format=json | jq -e '.sealed == false and .storage_type == "raft"' \
             || { echo "FAIL: Vault not unsealed / not on raft storage"; exit 1; }
-          if docker compose config --format json | jq -e '[.services[] | (.environment // {}) | keys[]] | any(startswith("VAULT_DEV"))' >/dev/null; then
-            echo "FAIL: compose still sets VAULT_DEV_* variables"; exit 1
-          fi
           # Idempotent: a second run must not re-init or rotate anything.
           SID_BEFORE=$(sha256sum secrets/enroll/secret-id)
-          ./scripts/vault-init.sh
+          ./portcullis vault init
           test "$SID_BEFORE" = "$(sha256sum secrets/enroll/secret-id)" || { echo "FAIL: re-run rotated secret-id"; exit 1; }
           echo "PASS: Vault initialised, unsealed, secrets owner-only, re-run idempotent"
 
@@ -152,13 +159,12 @@ jobs:
 
       - name: Initialize Vault PKI
         run: |
-          export DOMAIN=$PORTCULLIS_DOMAIN
-          export CERT_DIR=./certs
-          # Root token is read from secrets/vault-init.json by the script.
-          ./scripts/setup-vault-pki.sh --with-server-cert
+          # Root token is read from secrets/vault-init.json by the CLI.
+          ./portcullis pki setup --with-server-cert
+          test "$(stat -c %a certs/server.key)" = 600 || { echo "FAIL: server.key is not 0600"; exit 1; }
           # Second run must be a no-op (would otherwise replace the CA).
           BEFORE=$(sha256sum certs/root-ca.crt)
-          ./scripts/setup-vault-pki.sh --with-server-cert
+          ./portcullis pki setup --with-server-cert
           test "$BEFORE" = "$(sha256sum certs/root-ca.crt)" || { echo "FAIL: re-run replaced the CA"; exit 1; }
 
       - name: Verify CA chain created
@@ -181,10 +187,8 @@ jobs:
           VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
           CA_BEFORE=$(vault read -field=certificate pki_int/cert/ca | sha256sum)
           docker compose restart vault
-          # Wait for unsealed AND active (raft leader), not just unsealed.
-          # shellcheck source=/dev/null
-          source scripts/lib/vault-common.sh
-          vault_wait_active 60 || { echo "FAIL: Vault did not auto-unseal / become active"; docker compose logs --tail=30 vault; exit 1; }
+          # Waits for unsealed AND active (raft leader), not just unsealed.
+          ./portcullis vault unseal || { echo "FAIL: Vault did not auto-unseal / become active"; docker compose logs --tail=30 vault; exit 1; }
           CA_AFTER=$(vault read -field=certificate pki_int/cert/ca | sha256sum)
           test "$CA_BEFORE" = "$CA_AFTER" || { echo "FAIL: PKI changed/lost across restart"; exit 1; }
           echo "PASS: Vault auto-unsealed after restart and kept its PKI"
@@ -226,16 +230,12 @@ jobs:
             sleep 3
           done
 
-      - name: Configure Keycloak realm
+      - name: Configure Keycloak realm and OIDC clients
         run: |
-          # Update realm with CI LLDAP credentials
-          jq --arg pass "$LLDAP_ADMIN_PASSWORD" \
-            '(.components["org.keycloak.storage.UserStorageProvider"][0].config.bindCredential) = [$pass]' \
-            keycloak/realm-export.json > /tmp/realm.json
-          cp /tmp/realm.json keycloak/realm-export.json
-
-          export KEYCLOAK_URL=http://localhost:8080
-          ./scripts/configure-keycloak.sh
+          ./portcullis keycloak configure
+          ./portcullis oidc register
+          # Idempotent: a second run must succeed too.
+          ./portcullis oidc register
 
       - name: Test Keycloak OIDC discovery endpoint
         run: |
@@ -307,6 +307,15 @@ jobs:
             echo "FAIL: Forward auth OIDC client not found"
             exit 1
           fi
+
+          # The realm export ships a placeholder; `oidc register` must have
+          # pushed the generated secret from .env.
+          UUID=$(curl -s "http://localhost:8080/admin/realms/portcullis/clients?clientId=portcullis-forward-auth" \
+            -H "Authorization: Bearer $TOKEN" | jq -r '.[0].id')
+          KC_SECRET=$(curl -s "http://localhost:8080/admin/realms/portcullis/clients/$UUID/client-secret" \
+            -H "Authorization: Bearer $TOKEN" | jq -r '.value')
+          [ "$KC_SECRET" = "$FORWARD_AUTH_CLIENT_SECRET" ] || { echo "FAIL: Keycloak client secret != .env FORWARD_AUTH_CLIENT_SECRET"; exit 1; }
+          echo "PASS: forward-auth client secret in Keycloak matches the generated .env value"
 
       - name: Test LLDAP user creation
         run: |
@@ -430,7 +439,7 @@ jobs:
             || { echo "FAIL: portcullis-proxy IPAM config"; exit 1; }
           WHOAMI_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis-proxy").IPAddress}}' "$(docker compose -p ci-mtls -f /tmp/ci-mtls.yml ps -q whoami)")
           # shellcheck source=/dev/null
-          source scripts/lib/proxy-network.sh
+          source scripts/lib/network.sh
           cidr_contains 172.31.250.128/25 "$WHOAMI_IP" || { echo "FAIL: app IP $WHOAMI_IP outside the dynamic range"; exit 1; }
           echo "PASS: Traefik pinned to $GOT_IP, apps get dynamic IPs ($WHOAMI_IP)"
 
@@ -529,13 +538,16 @@ jobs:
                       --resolve "gated.portcullis.local:443:127.0.0.1" \
                       --cert "$1.crt" --key "$1.key" https://gated.portcullis.local/ || true; }
 
-          # 1) revoke-cert.sh → serial file → immediate denial
+          # 1) portcullis cert revoke → serial file → immediate denial
           SERIAL=$(cat /tmp/test-client.serial)
-          ./scripts/revoke-cert.sh --yes "$SERIAL"
+          ./portcullis cert list --all | grep -qi "$SERIAL" || { echo "FAIL: cert list does not show $SERIAL"; exit 1; }
+          ./portcullis cert revoke --yes "$SERIAL"
           grep -qi "^$SERIAL\$" certs/revocation/revoked-serials.txt || { echo "FAIL: serial not in revoked-serials.txt"; exit 1; }
           code=$(gated /tmp/test-client)
           [ "$code" = 403 ] || { echo "FAIL: revoked cert (serial file) got $code"; docker compose logs --tail=20 group-gate; exit 1; }
-          echo "PASS: cert revoked via revoke-cert.sh is denied"
+          echo "PASS: cert revoked via portcullis cert revoke is denied"
+          ./portcullis cert sync
+          grep -qi "^$SERIAL\$" certs/revocation/revoked-serials.txt || { echo "FAIL: cert sync dropped the serial"; exit 1; }
 
           # 2) revoke directly in Vault (no file update) → CRL refresh → denial
           VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
@@ -552,6 +564,26 @@ jobs:
             sleep 1
           done
           echo "FAIL: cert revoked in Vault still accepted ($code)"; docker compose logs --tail=20 group-gate; exit 1
+
+      - name: portcullis status
+        run: |
+          ./portcullis status || true   # hub/forward-auth are not started in CI
+          OUT=$(./portcullis status --json || true)
+          echo "$OUT" | jq -e '.vault.active == true and .keycloak.health == "healthy" and .keycloak.realm == true and .keycloak.forward_auth_client == true and (.vault.certs_issued > 0)' \
+            || { echo "FAIL: unexpected status: $OUT"; exit 1; }
+          echo "PASS: portcullis status --json reports Vault, PKI and Keycloak healthy"
+
+      - name: Backup
+        run: |
+          ./portcullis backup
+          B=$(find backups -maxdepth 1 -type d -name '2*' | sort | tail -n1)
+          for f in .env secrets/vault-init.json certs/ca-chain.crt vault_data.tar.gz postgres_data.tar.gz lldap_data.tar.gz; do
+            test -s "$B/$f" || { echo "FAIL: backup lacks $f"; exit 1; }
+          done
+          test "$(stat -c %a "$B")" = 700 || { echo "FAIL: backup dir is not 0700"; exit 1; }
+          ./portcullis vault unseal
+          ./portcullis restore --list | grep -q "$(basename "$B")"
+          echo "PASS: backup contains .env, secrets, certs and the volumes; Vault active again"
 
       - name: Collect service status
         if: always()
