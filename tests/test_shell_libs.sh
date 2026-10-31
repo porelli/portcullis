@@ -388,6 +388,25 @@ expect_eq "backup dirs: only timestamped ones" "$(_backup_dirs | tr '\n' ' ')" "
 expect_eq "restic creds: BACKUP_<NAME> wins" "$(AWS_ACCESS_KEY_ID=dns BACKUP_AWS_ACCESS_KEY_ID=bak _backup_cred AWS_ACCESS_KEY_ID)" bak
 expect_eq "restic creds: falls back to <NAME>" "$(B2_ACCOUNT_ID=b2 _backup_cred B2_ACCOUNT_ID)" b2
 
+# Vault snapshot check: a real-sized snapshot (meta.json first, then a large
+# state.bin) under pipefail. `tar -t | grep -q` used to die of SIGPIPE here.
+SNAPD="$WORK/snapsrc"; mkdir -p "$SNAPD" "$WORK/curlstub"
+echo '{"Index":5}' > "$SNAPD/meta.json"
+head -c 3000000 /dev/urandom > "$SNAPD/state.bin"
+(cd "$SNAPD" && { sha256sum meta.json state.bin 2>/dev/null || shasum -a 256 meta.json state.bin; } > SHA256SUMS \
+  && tar -czf "$WORK/good.snap" meta.json state.bin SHA256SUMS)
+printf '<html>not a snapshot</html>' > "$WORK/bad.snap"
+cat > "$WORK/curlstub/curl" <<'SH'
+#!/bin/sh
+# -o <file> → copy $SNAP_SRC there, print the status for -w.
+while [ $# -gt 0 ]; do [ "$1" = -o ] && { cp "$SNAP_SRC" "$2"; shift; }; shift; done
+printf 200
+SH
+chmod +x "$WORK/curlstub/curl"
+snap_check() { (set -euo pipefail; PATH="$WORK/curlstub:$PATH" SNAP_SRC="$1" VAULT_TOKEN=t _backup_vault_snapshot "$WORK/out.snap"); }
+for _ in 1 2 3; do expect_ok "backup: large raft snapshot accepted under pipefail" snap_check "$WORK/good.snap"; done
+expect_fail "backup: non-snapshot body rejected" snap_check "$WORK/bad.snap"
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

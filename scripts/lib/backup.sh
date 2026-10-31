@@ -175,8 +175,15 @@ _backup_vault_snapshot() {
     -H @<(printf 'X-Vault-Token: %s\n' "$VAULT_TOKEN") \
     "${VAULT_ADDR:-http://127.0.0.1:8200}/v1/sys/storage/raft/snapshot" || true)"
   [ "$code" = 200 ] || fail "Vault raft snapshot failed (HTTP ${code:-none})"
-  gzip -t "$out" 2>/dev/null && tar -tzf "$out" 2>/dev/null | grep -qx 'meta.json' \
-    || fail "Vault returned something that is not a raft snapshot"
+  # List into a variable first: `tar -t | grep -q` under pipefail fails
+  # whenever grep exits on the first entry (meta.json) and tar, still
+  # listing state.bin / SHA256SUMS, dies of SIGPIPE.
+  local list=""
+  if ! gzip -t "$out" 2>/dev/null || ! list="$(tar -tzf "$out" 2>/dev/null)" \
+     || ! grep -qxE '(\./)?meta\.json' <<< "$list" || ! grep -qxE '(\./)?state\.bin' <<< "$list"; then
+    echo "  snapshot: $(wc -c < "$out") bytes, $(file -b "$out" 2>/dev/null || echo '?'), entries: $(tr '\n' ' ' <<< "$list")" >&2
+    fail "Vault returned something that is not a raft snapshot"
+  fi
 }
 
 _backup_pg_dump() {
