@@ -25,7 +25,7 @@ services:
   # routers whose chain includes client-headers@file + portcullis-groups@docker.
   # ============================================================
   vault-ui:
-    image: drakkan/sftpgo:latest  # placeholder
+    image: drakkan/sftpgo:v2.7.6@sha256:1edd28d80de2a008863fbfc58c8ff7db47b1b410bae48d4e6076192337809b11  # placeholder
     networks:
       - portcullis-proxy
     labels:
@@ -41,7 +41,7 @@ services:
   # No client cert needed. Redirects to Keycloak if not logged in.
   # ============================================================
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
     networks:
       - portcullis-proxy
     labels:
@@ -57,7 +57,7 @@ services:
   # (authaware TLS + forward auth fallback)
   # ============================================================
   wiki:
-    image: requarks/wiki:2
+    image: requarks/wiki:2.5.317@sha256:e4708eed80c014449c0c8426c8d466c7a52a62131555bb44372fa48378b448b8
     networks:
       - portcullis-proxy
     labels:
@@ -74,7 +74,7 @@ services:
   # Admin UI protected by mTLS + WebAuthn fallback.
   # ============================================================
   headscale:
-    image: headscale/headscale:latest
+    image: headscale/headscale:v0.29.7@sha256:11f81665e842809db9fe3006a38c56a66e968baa5abd4bac498e86445572b970
     command: serve
     volumes:
       - headscale-data:/var/lib/headscale
@@ -91,7 +91,7 @@ services:
       traefik.http.services.headscale.loadbalancer.server.port: "8080"
 
   headplane:
-    image: ghcr.io/tale/headplane:latest
+    image: ghcr.io/tale/headplane:0.8.2@sha256:b053a0a6699d0a67be3f0d9bae8e7dbe35ed67ae8448412adcbad7ea49866faa
     environment:
       HEADSCALE_URL: http://headscale:8080
       OIDC_ISSUER: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis
@@ -115,7 +115,7 @@ services:
   # Management API and dashboard protected by WebAuthn.
   # ============================================================
   coturn:
-    image: coturn/coturn:latest
+    image: coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
     network_mode: host
     volumes:
       - coturn-data:/var/lib/coturn
@@ -133,7 +133,7 @@ services:
       --log-file=stdout
 
   netbird-management:
-    image: netbirdio/management:latest
+    image: netbirdio/management:0.82.0@sha256:07c8f979fcc980678cc64e584cf6b7b27204ceb4c871531b29e2dce39592e9ff
     command: >
       --port 8011
       --log-level info
@@ -159,7 +159,7 @@ services:
       traefik.http.services.netbird-api.loadbalancer.server.port: "8011"
 
   netbird-signal:
-    image: netbirdio/signal:latest
+    image: netbirdio/signal:0.82.0@sha256:0c0c38bbef7dcdfa1822b6d59844615db55dc7303b664e7aed498151edc0dbfb
     networks:
       - portcullis-proxy
     labels:
@@ -172,7 +172,7 @@ services:
       traefik.http.services.netbird-signal.loadbalancer.server.scheme: h2c
 
   netbird-dashboard:
-    image: netbirdio/dashboard:latest
+    image: netbirdio/dashboard:v2.96.0@sha256:340b13c00b84349572a2acc5605e907cb09250a9e6461c757097eabdb8e02f2c
     environment:
       NETBIRD_MGMT_API_ENDPOINT: https://netbird.${PORTCULLIS_DOMAIN:-portcullis.local}
       NETBIRD_MGMT_GRPC_API_ENDPOINT: https://netbird.${PORTCULLIS_DOMAIN:-portcullis.local}
@@ -196,7 +196,7 @@ services:
   # PUBLIC — no authentication at all
   # ============================================================
   docs:
-    image: nginx:alpine
+    image: nginx:1.31.8-alpine@sha256:785835ea65db4bba6f021acc0f3be91b0fef76a53fe41f8588c6698d2aed0606
     networks:
       - portcullis-proxy
     labels:

@@ -42,12 +42,17 @@ tests:
         alertname: CrlStale
         exp_alerts:
           - exp_labels: {severity: critical, job: group-gate, instance: "group-gate:8080"}
+            exp_annotations:
+              summary: group-gate's copy of Vault's CRL is stale
+              description: >-
+                group-gate has not fetched a fresh CRL for 10 minutes, or the CRL is past its nextUpdate (Keycloak then refuses X.509 logins). Certs revoked in Vault only (not via ./portcullis cert revoke) may still be accepted.
 
   # Backups: one from t=0, none after → too old after 36h (+30m for).
-  - interval: 1h
+  # (Samples every 5m: the textfile exporter is scraped continuously.)
+  - interval: 5m
     input_series:
       - series: 'portcullis_backup_last_success_timestamp_seconds{job="portcullis",kind="offsite"}'
-        values: '0x40'
+        values: '0x480'
     alert_rule_test:
       - eval_time: 30h
         alertname: BackupTooOld
@@ -56,12 +61,16 @@ tests:
         alertname: BackupTooOld
         exp_alerts:
           - exp_labels: {severity: warning, job: portcullis, kind: offsite}
+            exp_annotations:
+              summary: "No successful offsite backup for 36 hours"
+              description: "The last offsite backup is 1d 14h 0m 0s old. Check the portcullis-backup.timer (journalctl -u portcullis-backup)."
 
-  # Public cert: 30 days left, then 10.
-  - interval: 1h
+  # Public cert (absolute expiry): 30 days from t=0 for the first hour,
+  # then a cert that expires 10 days after t=0.
+  - interval: 1m
     input_series:
       - series: 'probe_ssl_earliest_cert_expiry{job="tls",instance="auth.example.org:443"}'
-        values: '2592000x3 864000x5'
+        values: '2592000x60 864000x400'
     alert_rule_test:
       - eval_time: 1h
         alertname: PublicCertExpiringSoon
@@ -70,6 +79,10 @@ tests:
         alertname: PublicCertExpiringSoon
         exp_alerts:
           - exp_labels: {severity: critical, job: tls, instance: "auth.example.org:443"}
+            exp_annotations:
+              summary: The public certificate expires in less than 14 days
+              description: >-
+                auth.example.org:443 presents a certificate that expires in 9d 18h 0m 0s. ACME renewal (Traefik, DNS-01) is failing: check docker compose logs traefik and the DNS provider credentials.
 
   - interval: 1m
     input_series:
@@ -80,3 +93,6 @@ tests:
         alertname: GroupGateDenySpike
         exp_alerts:
           - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: Many requests denied by group-gate
+              description: "1 denials/s for 10 minutes. Check the denial reasons on the Portcullis dashboard."

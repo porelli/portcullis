@@ -221,6 +221,14 @@ def main() -> int:
         check("apps get the username (not the email) as X-Forwarded-User; spoofed identity headers are dropped",
               identity_is_username)
 
+        if os.environ.get("E2E_METRICS"):
+            def metrics_needs_admin():
+                # Grafana (monitoring profile) is a core subdomain: lldap_admin only.
+                code = goto_status(page, f"https://metrics.{DOMAIN}/")
+                shot(page, "metrics-non-admin")
+                assert code == 403, f"metrics.<domain> for a non-admin: HTTP {code}"
+            check("metrics.<domain> (Grafana) is denied to non-admins", metrics_needs_admin)
+
         def path_groups_denied():
             for path in ("/admin", "/admin/x", "/%61dmin", "//admin", "/x/../admin", "/ADMIN"):
                 code = goto_status(page, APP + path)
