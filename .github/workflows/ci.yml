@@ -1362,11 +1362,17 @@ jobs:
           done
           q() { docker compose exec -T prometheus wget -qO- "http://127.0.0.1:9090/api/v1/$1"; }
           qq() { q "query?query=$(jq -rn --arg q "$1" '$q | @uri')"; }
+          # Every scrape job must be up. The blackbox jobs (vault_health,
+          # services, services_tcp, tls) are up whenever blackbox answers, so
+          # they are checked through probe_success below, not here.
           want="alertmanager grafana group-gate keycloak portcullis prometheus traefik vault"
           for i in $(seq 1 40); do
             UP="$(qq 'up == 1' | jq -r '[.data.result[].metric.job] | unique | join(" ")')"
-            [ "$UP" = "$want" ] && break
-            [ "$i" -eq 40 ] && { echo "FAIL: targets up: '$UP', want '$want'"; q targets | jq -c '.data.activeTargets[] | {job: .labels.job, health, lastError}'; exit 1; }
+            DOWN="$(qq 'up == 0' | jq -r '[.data.result[].metric.job] | unique | join(" ")')"
+            missing=""
+            for j in $want; do [[ " $UP " == *" $j "* ]] || missing="$missing $j"; done
+            [ -z "$missing" ] && [ -z "$DOWN" ] && break
+            [ "$i" -eq 40 ] && { echo "FAIL: targets missing:${missing:- none}, down: ${DOWN:-none} (up: $UP)"; q targets | jq -c '.data.activeTargets[] | {job: .labels.job, health, lastError}'; exit 1; }
             sleep 5
           done
           echo "targets up: $UP"
