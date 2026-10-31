@@ -277,6 +277,13 @@ def main() -> int:
             except PWError as e:
                 print(f"    foreign cert: navigation failed as expected ({str(e).splitlines()[0]})")
                 return
+            # Playwright presents client certs through its own TLS proxy and
+            # reports a failed server handshake as a synthetic 503 page.
+            body = page.content()
+            if resp is not None and resp.status == 503 and "client-certificate error" in body \
+                    and "unknown ca" in body:
+                print("    foreign cert: TLS handshake refused by the server (alert unknown ca)")
+                return
             shot(page, "foreign")
             raise AssertionError(f"foreign-CA cert got HTTP {resp and resp.status}")
         check("client cert from a foreign CA is rejected in the TLS handshake", foreign_cert)
