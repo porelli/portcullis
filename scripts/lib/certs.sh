@@ -14,6 +14,14 @@
 
 REVOKED_FILE="${REVOKED_FILE:-$PORTCULLIS_ROOT/certs/revocation/revoked-serials.txt}"
 
+# cert_warn_seconds — "expiring" threshold for cert list / status
+# (CERT_EXPIRY_WARN_DAYS, default 7).
+cert_warn_seconds() {
+  local d="${CERT_EXPIRY_WARN_DAYS:-7}"
+  [[ "$d" =~ ^[0-9]+$ ]] || d=7
+  echo $((d * 86400))
+}
+
 # write_revoked_serials <file> — atomically rewrite the revoked-serial list
 # read by group-gate from Vault's authoritative list (pki_int/certs/revoked).
 # Needs an admin VAULT_TOKEN and a `vault` command. Fails — leaving <file>
@@ -69,9 +77,10 @@ _cert_info() {
 }
 
 cert_list() {
-  local show_revoked="$1" serials serial info cn end revoked now epoch status
+  local show_revoked="$1" serials serial info cn end revoked now epoch status warn_s
   serials="$(vault list -format=json pki_int/certs 2>/dev/null)" || fail "Cannot list certs. Is Vault running and unsealed?"
   now="$(date +%s)"
+  warn_s="$(cert_warn_seconds)"
   printf '%-40s %-24s %-9s %s\n' SERIAL "COMMON NAME" STATUS EXPIRES
   for serial in $(printf '%s' "$serials" | jq -r '.[]'); do
     info="$(_cert_info "$serial")" || continue
@@ -82,7 +91,7 @@ cert_list() {
       status="${C_RED}revoked${C_NC}"
     elif [ "$epoch" -lt "$now" ]; then
       status="${C_RED}expired${C_NC}"
-    elif [ $((epoch - now)) -lt 21600 ]; then
+    elif [ $((epoch - now)) -lt "$warn_s" ]; then
       status="${C_YELLOW}expiring${C_NC}"
     else
       status="${C_GREEN}valid${C_NC}"
@@ -117,11 +126,13 @@ cert_revoke() {
   [ -z "$crl" ] || printf '%s\n' "$crl" > "$PORTCULLIS_ROOT/certs/crl.pem"
   ok "Requests with this certificate are now denied by group-gate on every router"
   ok "using client-headers@file + portcullis-groups@docker (all core routers and"
-  ok "the default app templates)."
+  ok "the default app templates). Sessions that reached an mtls-only policy with it"
+  ok "need the (now revoked) cert on every request, so they stop working too, and"
+  ok "Keycloak refuses new X.509 logins with it (CRL, refreshed within 60s)."
   warn "NOT covered: routers relying on the TLS client cert alone (protected tier"
   warn "without portcullis-groups@docker) — Traefik does not check CRLs; the cert"
-  warn "stops working there when it expires (24h). A Keycloak session opened with"
-  warn "this cert stays valid until it ends: sign the user out in the Keycloak admin console."
+  warn "keeps working there until it expires. Password/WebAuthn sessions of the"
+  warn "user are not affected: sign them out in the Keycloak admin console if needed."
 }
 
 # _cert_issue <user> <email> <slot> <ttl> <tmpdir> — CSR from the key in
@@ -171,7 +182,8 @@ cert_enroll() {
   _cert_issue "$user" "$email" "$slot" "$ttl" "$tmp"
   ok "Certificate for $user written to slot $slot (TTL $ttl)."
   echo "    Verify:  ykman piv certificates export $slot - | openssl x509 -text -noout"
-  echo "    Renew:   ./portcullis cert renew $user $email   (daily, e.g. from cron)"
+  echo "    Renew:   before it expires, at https://enroll.${PORTCULLIS_DOMAIN:-<domain>}/self"
+  echo "             (the user, with the key inserted) or ./portcullis cert renew $user $email"
 }
 
 help_cert() {
@@ -192,7 +204,8 @@ _help_cert_enroll_common() {
   cat <<'EOF'
 Options:
   --slot SLOT   PIV slot (default: $PIV_SLOT or 9a, Authentication)
-  --ttl TTL     certificate lifetime (default: $TTL or 24h; the role caps it at 24h)
+  --ttl TTL     certificate lifetime (default: $CLIENT_CERT_TTL or 720h; the
+                Vault role caps it at CLIENT_CERT_TTL as of the last pki setup)
 
 Environment:
   PIV_PIN       YubiKey PIV PIN. If unset, ykman prompts for it (preferred:
@@ -239,7 +252,8 @@ help_cert_list() {
   cat <<'EOF'
 Usage: portcullis cert list [--all]
 
-List issued client certificates (serial, CN, status, expiry).
+List issued client certificates (serial, CN, status, expiry). "expiring" =
+less than CERT_EXPIRY_WARN_DAYS (default 7) days left.
 
 Options:
   --all   include revoked certificates
@@ -265,7 +279,7 @@ cmd_cert() {
     enroll|renew|revoke|list|sync) ;;
     *) usage_error cert "unknown subcommand: $sub" ;;
   esac
-  local slot="${PIV_SLOT:-9a}" ttl="${TTL:-24h}" yes=false all=false
+  local slot="${PIV_SLOT:-9a}" ttl="${TTL:-${CLIENT_CERT_TTL:-720h}}" yes=false all=false
   local -a pos=()
   while [ $# -gt 0 ]; do
     case "$sub:$1" in

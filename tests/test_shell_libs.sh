@@ -134,6 +134,46 @@ expect_ok "generate_missing appends a missing key" grep -Eq '^FORWARD_AUTH_CLIEN
 expect_eq "generate_missing keeps existing values" "$(env_get LLDAP_JWT_SECRET)" keep
 expect_eq "generate_missing writes each key once" "$(grep -c '^HUB_PROXY_SECRET=' "$PORTCULLIS_ROOT/.env")" 1
 
+# ══ common: Hub env subset, container file ownership ═══════
+HR="$WORK/hubroot"
+mkdir -p "$HR"
+cat > "$HR/.env" <<'ENVEOF'
+PORTCULLIS_DOMAIN=hub.test
+POSTGRES_PASSWORD=pg-secret
+HUB_PROXY_SECRET=hub-secret
+KEYCLOAK_ADMIN_PASSWORD=kc-secret
+HEADSCALE_OIDC_CLIENT_SECRET=hs-secret
+NETBIRD_OIDC_CLIENT_SECRET=nb-secret
+MY_APP_VAR=shared
+HUB_SHARED_ENV=MY_APP_VAR POSTGRES_PASSWORD
+ENVEOF
+hub_env_run() (
+  PORTCULLIS_ROOT="$HR"
+  unset PORTCULLIS_DOMAIN HEADSCALE_OIDC_CLIENT_SECRET NETBIRD_OIDC_CLIENT_SECRET MY_APP_VAR HUB_SHARED_ENV POSTGRES_PASSWORD HUB_PROXY_SECRET KEYCLOAK_ADMIN_PASSWORD
+  env_load
+  hub_env_write 2>/dev/null
+)
+hub_env_run
+HE="$HR/secrets/hub/core.env"
+expect_ok   "hub env: domain" grep -qx 'PORTCULLIS_DOMAIN=hub.test' "$HE"
+expect_ok   "hub env: Traefik IP (compose default)" grep -qx 'PORTCULLIS_TRAEFIK_IP=172.31.250.2' "$HE"
+expect_ok   "hub env: VPN client secret by prefix" grep -qx 'HEADSCALE_OIDC_CLIENT_SECRET=hs-secret' "$HE"
+expect_ok   "hub env: HUB_SHARED_ENV" grep -qx 'MY_APP_VAR=shared' "$HE"
+expect_fail "hub env: never a core secret" grep -Eq 'pg-secret|hub-secret|kc-secret' "$HE"
+INODE_BEFORE="$(file_inode "$HE")"
+hub_env_run
+expect_eq "hub env: rewritten in place" "$(file_inode "$HE")" "$INODE_BEFORE"
+
+rm -f "$STUB_DIR/calls"
+mkdir -p "$HR/secrets/enroll" && echo r > "$HR/secrets/enroll/role-id" && chmod 600 "$HR/secrets/enroll/role-id"
+ct_group_read 10002 "$HR/secrets/enroll" "$HR/secrets/enroll/role-id"
+expect_eq "ct_group_read: file 0640" "$(file_mode "$HR/secrets/enroll/role-id")" 640
+expect_eq "ct_group_read: dir 0750" "$(file_mode "$HR/secrets/enroll")" 750
+expect_ok "ct_group_read: chgrp through a helper container" grep -q "run --rm --network none --user 0:0 --cap-drop ALL --cap-add CHOWN.*chown $(id -u):10002 /t/0 /t/1" "$STUB_DIR/calls"
+rm -f "$STUB_DIR/calls"
+ct_own "$(id -u):$(id -g)" "$HR/secrets/enroll/role-id"
+expect_fail "ct_own: no-op when already right" test -s "$STUB_DIR/calls"
+
 # ══ network: IP math / validation ══════════════════════════
 expect_eq "ip_to_int" "$(ip_to_int 172.31.250.2)" "$(( (172<<24) | (31<<16) | (250<<8) | 2 ))"
 expect_eq "ip_to_int leading zeros are decimal" "$(ip_to_int 010.0.0.8)" "$(( (10<<24) | 8 ))"
@@ -152,6 +192,13 @@ expect_fail "range outside subnet"            check_cfg 172.31.250.0/24 172.31.2
 expect_fail "traefik IP outside subnet"       check_cfg 172.31.250.0/24 172.31.250.128/25 172.31.251.2
 expect_fail "traefik IP = gateway"            check_cfg 172.31.250.0/24 172.31.250.128/25 172.31.250.1
 expect_fail "invalid subnet"                  check_cfg 172.31.250.0/33 172.31.250.128/25 172.31.250.2
+unset PORTCULLIS_AUTH_SUBNET PORTCULLIS_AUTH_IP_RANGE PORTCULLIS_AUTH_TRAEFIK_IP
+expect_ok "auth: defaults are valid" validate_auth_network_config
+check_auth() { PORTCULLIS_AUTH_SUBNET="$1" PORTCULLIS_AUTH_IP_RANGE="$2" PORTCULLIS_AUTH_TRAEFIK_IP="$3" validate_auth_network_config; }
+expect_ok   "auth: custom valid config"       check_auth 10.98.0.0/28 10.98.0.8/29 10.98.0.2
+expect_fail "auth: traefik IP in range"       check_auth 172.31.251.0/28 172.31.251.0/29 172.31.251.2
+expect_fail "auth: overlaps portcullis-proxy" check_auth 172.31.250.0/28 172.31.250.8/29 172.31.250.2
+expect_fail "auth: traefik IP = gateway"      check_auth 172.31.251.0/28 172.31.251.8/29 172.31.251.1
 
 # ══ network: state + guard ═════════════════════════════════
 rm -f "$STUB_DIR/ipam"
@@ -164,6 +211,7 @@ expect_eq "state mismatch (docker-assigned subnet)" "$(proxy_network_state)" mis
 printf '%s' '172.31.250.0/24|;' > "$STUB_DIR/ipam"
 expect_eq "state mismatch (no ip_range)" "$(proxy_network_state)" mismatch
 expect_fail "guard: mismatch aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+expect_fail "guard: invalid auth config aborts" bash -c "rm -f '$STUB_DIR/ipam'; PORTCULLIS_AUTH_TRAEFIK_IP=172.31.251.9; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 expect_fail "guard: invalid config aborts" bash -c "PORTCULLIS_TRAEFIK_IP=1.2.3.4; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 expect_fail "network lib has no migration code" grep -Eq 'proxy_network_(migrate|reconnect)|docker network (connect|disconnect)' "$HERE/../scripts/lib/network.sh"
 
@@ -240,11 +288,21 @@ run_pki() {
 expect_eq "pki: fresh install succeeds" "$(run_pki none --with-server-cert)" 0
 expect_ok "pki: fresh install generates a root" grep -q 'root/generate/internal' "$STUB_DIR/pki-calls"
 expect_ok "pki: root CN uses PORTCULLIS_DOMAIN" grep -q 'common_name=example.test Root CA' "$STUB_DIR/pki-calls"
-expect_eq "pki: server.key is 0600" "$(file_mode "$PKI_ROOT/certs/server.key")" 600
+expect_eq "pki: server.key is 0640 (group 0 for Traefik)" "$(file_mode "$PKI_ROOT/certs/server.key")" 640
+expect_ok "pki: server.key chgrp via a helper container" grep -q "chown $(id -u):0 /t/0" "$STUB_DIR/calls"
 expect_ok "pki: ca-chain written" grep -q INT "$PKI_ROOT/certs/ca-chain.crt"
+expect_ok "pki: Keycloak truststore written" cmp -s "$PKI_ROOT/certs/ca-chain.crt" "$PKI_ROOT/certs/truststore/portcullis-ca-chain.pem"
+expect_ok "pki: client role defaults to 30 days" grep -q 'roles/client-cert .*max_ttl=720h ttl=720h' "$STUB_DIR/pki-calls"
+expect_ok "pki: CRL auto-rebuild configured" grep -q 'pki_int/config/crl .*auto_rebuild=true' "$STUB_DIR/pki-calls"
 expect_eq "pki: complete PKI is a no-op" "$(run_pki complete)" 0
 expect_fail "pki: complete PKI → no generate / disable" grep -Eq 'generate|secrets disable' "$STUB_DIR/pki-calls"
 expect_ok "pki: complete PKI re-exports missing CA files" test -s "$PKI_ROOT/certs/ca-chain.crt"
+expect_ok "pki: complete PKI rewrites the role (TTL changes apply)" grep -q 'write pki_int/roles/client-cert' "$STUB_DIR/pki-calls"
+rm -f "$PKI_ROOT/certs/truststore/portcullis-ca-chain.pem"
+expect_eq "pki: CLIENT_CERT_TTL=2160h" "$(CLIENT_CERT_TTL=2160h run_pki complete)" 0
+expect_ok "pki: role uses CLIENT_CERT_TTL" grep -q 'max_ttl=2160h ttl=2160h' "$STUB_DIR/pki-calls"
+expect_ok "pki: complete PKI re-exports the truststore" test -s "$PKI_ROOT/certs/truststore/portcullis-ca-chain.pem"
+expect_eq "pki: invalid CLIENT_CERT_TTL fails" "$(CLIENT_CERT_TTL='30 days' run_pki complete)" 1
 expect_eq "pki: missing role only" "$(run_pki norole)" 0
 expect_ok "pki: missing role is recreated" grep -q 'write pki_int/roles/client-cert' "$STUB_DIR/pki-calls"
 expect_fail "pki: missing role does NOT wipe the CA" grep -Eq 'generate|secrets disable' "$STUB_DIR/pki-calls"

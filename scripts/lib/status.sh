@@ -37,20 +37,25 @@ status_run() {
   if [ "$vault_code" = 200 ] && vault_admin_env 2>/dev/null && vault_use_container_cli 2>/dev/null; then
     root_exp="$(vault read -field=certificate pki/cert/ca 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 || true)"
     int_exp="$(vault read -field=certificate pki_int/cert/ca 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 || true)"
-    local serials s info cn end revoked now epoch
+    local serials s info cn end revoked now epoch warn_s valid="" server_cn="*.${PORTCULLIS_DOMAIN:-}"
+    warn_s="$(cert_warn_seconds)"
     if serials="$(vault list -format=json pki_int/certs 2>/dev/null)"; then
       certs_issued="$(printf '%s' "$serials" | jq 'length')"
       now="$(date +%s)"
       for s in $(printf '%s' "$serials" | jq -r '.[]'); do
         info="$(_cert_info "$s")" || continue
         IFS='|' read -r cn end revoked <<< "$info"
-        [ "$revoked" = false ] || continue
+        [ "$revoked" = false ] && [ -n "$cn" ] && [ "$cn" != "$server_cn" ] || continue
         epoch="$(to_epoch "$end")"
-        # valid but expiring within 6h (client certs live 24h)
-        if [ "$epoch" -ge "$now" ] && [ $((epoch - now)) -lt 21600 ]; then
-          expiring="$(printf '%s' "$expiring" | jq -c --arg cn "$cn" --arg e "$end" '. + [{cn: $cn, expires: $e}]')"
-        fi
+        [ "$epoch" -ge "$now" ] || continue
+        valid+="$(jq -cn --arg cn "$cn" --arg e "$end" --arg s "$s" --argjson t "$epoch" \
+          '{cn: $cn, serial: $s, expires: $e, epoch: $t}')"$'\n'
       done
+      # Per user, only the cert that lasts longest counts: once renewed, the
+      # old (still valid) cert is no reason to warn.
+      expiring="$(printf '%s' "$valid" | jq -cs --argjson now "$now" --argjson w "$warn_s" '
+          group_by(.cn) | map(max_by(.epoch)) | map(select(.epoch - $now < $w))
+          | map({cn, serial, expires, days_left: ((.epoch - $now) / 86400 | floor)})')"
     fi
     vault_json="$(printf '%s' "$vault_json" | jq --arg r "$root_exp" --arg i "$int_exp" --argjson n "$certs_issued" --argjson x "$expiring" \
       '. + {root_ca_expires: $r, intermediate_ca_expires: $i, certs_issued: $n, certs_expiring: $x}')"
@@ -111,9 +116,12 @@ status_run() {
       [ -n "$root_exp" ] && _st_line ok "root CA expires $root_exp" || _st_line warn "root CA not found (./portcullis pki setup)"
       [ -n "$int_exp" ] && _st_line ok "intermediate CA expires $int_exp" || _st_line warn "intermediate CA not found"
       [ "$certs_issued" = null ] || _st_line ok "issued certificates: $certs_issued"
-      while IFS=$'\t' read -r cn end; do
-        [ -n "$cn" ] && _st_line warn "  $cn expires $end"
-      done < <(printf '%s' "$expiring" | jq -r '.[] | [.cn, .expires] | @tsv')
+      if [ "$(printf '%s' "$expiring" | jq length)" != 0 ]; then
+        _st_line warn "client certificates expiring within ${CERT_EXPIRY_WARN_DAYS:-7} days (renew at https://enroll.${PORTCULLIS_DOMAIN:-<domain>}/self):"
+      fi
+      while IFS=$'\t' read -r cn end days; do
+        [ -n "$cn" ] && _st_line warn "  $cn expires $end ($days day(s) left)"
+      done < <(printf '%s' "$expiring" | jq -r '.[] | [.cn, .expires, .days_left] | @tsv')
     fi
   fi
 
@@ -144,7 +152,8 @@ help_status() {
 Usage: portcullis status [--json]
 
 Health overview: compose services, Vault (sealed/active, CA expiry, issued
-and soon-expiring certs), Keycloak (realm, users, forward-auth client),
+certs, client certs expiring within CERT_EXPIRY_WARN_DAYS = 7 days),
+Keycloak (realm, users, forward-auth client),
 LLDAP and Traefik. Exits 1 if a core service is down/unhealthy or Vault is
 not active, 0 otherwise.
 

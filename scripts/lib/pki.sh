@@ -1,8 +1,8 @@
 # shellcheck shell=bash
 #
 # `portcullis pki setup` — Vault PKI: root CA + intermediate CA for
-# short-lived client certificates (and optionally a self-signed wildcard
-# server cert for local dev / CI).
+# client certificates (and optionally a self-signed wildcard server cert
+# for local dev / CI).
 #
 # Root and intermediate keys are generated `internal`: they never leave
 # Vault and are persisted (encrypted) in Vault's raft storage.
@@ -15,8 +15,13 @@
 
 PKI_TTL_ROOT="87600h"          # 10 years
 PKI_TTL_INTERMEDIATE="43800h"  # 5 years
-PKI_TTL_CLIENT="24h"           # short-lived client certs
 PKI_CREATED=false              # set to true when a new CA was created
+
+# Client-cert lifetime: CLIENT_CERT_TTL (.env), default 30 days. Revocation
+# is enforced on every request (group-gate) and at login (Keycloak CRL
+# check), so the lifetime no longer has to stand in for revocation; users
+# renew from the enrollment UI (/self) or `portcullis cert renew`.
+pki_client_ttl() { echo "${CLIENT_CERT_TTL:-720h}"; }
 
 # _vault_probe <vault args...> — 0 = present, 2 = absent ("No value found",
 # vault CLI exit 2); anything else aborts: a sealed Vault or a bad token
@@ -44,15 +49,18 @@ _pki_issue_server_cert() {
     common_name="*.$domain" alt_names="$domain,localhost" ip_sans="127.0.0.1" ttl="8760h")" \
     || fail "server certificate issuance failed"
   printf '%s\n' "$issued" | jq -r '.data.certificate' > "$certs/server.crt"
-  # Private key: owner-only (Traefik runs as root and can still read it).
+  # Private key: operator + group 0 (Traefik runs as root but without
+  # CAP_DAC_OVERRIDE, so it reads by mode like everyone else).
   (umask 077 && printf '%s\n' "$issued" | jq -r '.data.private_key' > "$certs/server.key")
-  chmod 600 "$certs/server.key"
+  ct_group_read "$CT_GID_TRAEFIK" "$certs/server.key"
   ok "Server cert: $certs/server.crt"
 }
 
 _pki_write_client_role() {
-  local domain="$1"
-  info "Writing client-cert role..."
+  local domain="$1" ttl
+  ttl="$(pki_client_ttl)"
+  [[ "$ttl" =~ ^[0-9]+[smhd]?$ ]] || fail "CLIENT_CERT_TTL=$ttl is not a Vault duration (e.g. 720h)"
+  info "Writing client-cert role (TTL $ttl)..."
   # Client-auth only. The CN is always the explicit common_name parameter
   # (enroll / `portcullis cert enroll` pass the LLDAP username), never the
   # CSR's, and CSR SANs are ignored — a crafted CSR cannot smuggle in a
@@ -61,7 +69,29 @@ _pki_write_client_role() {
     allowed_domains="$domain" allow_any_name=true enforce_hostnames=false \
     use_csr_common_name=false use_csr_sans=false \
     client_flag=true server_flag=false code_signing_flag=false email_protection_flag=false \
-    key_type=ec key_bits=256 max_ttl="$PKI_TTL_CLIENT" ttl="$PKI_TTL_CLIENT" no_store=false >/dev/null
+    key_type=ec key_bits=256 max_ttl="$ttl" ttl="$ttl" no_store=false >/dev/null
+}
+
+# _pki_configure_crl — keep pki_int's CRL fresh: Vault rebuilds it on every
+# revoke; auto_rebuild also re-signs it before nextUpdate (72h) passes, so
+# Keycloak's CRL check never sees a stale list.
+_pki_configure_crl() {
+  vault write pki_int/config/crl expiry=72h auto_rebuild=true auto_rebuild_grace_period=12h >/dev/null \
+    || warn "could not configure CRL auto-rebuild on pki_int"
+}
+
+# _pki_export_truststore — CA chain for Keycloak's X.509 authenticator
+# (certs/truststore/, mounted into Keycloak; read at start-up).
+_pki_export_truststore() {
+  local certs="$1"
+  mkdir -p "$certs/truststore"
+  chmod 755 "$certs/truststore"
+  if ! cmp -s "$certs/ca-chain.crt" "$certs/truststore/portcullis-ca-chain.pem" 2>/dev/null; then
+    cp "$certs/ca-chain.crt" "$certs/truststore/portcullis-ca-chain.pem"
+    chmod 644 "$certs/truststore/portcullis-ca-chain.pem"
+    # shellcheck disable=SC2034  # read by stack.sh
+    PKI_TRUSTSTORE_CHANGED=true
+  fi
 }
 
 # pki_setup <force> <with_server_cert>
@@ -84,13 +114,16 @@ pki_setup() {
     ok "Vault PKI already initialised — not touching the CA (--force destroys it)."
     if ! _vault_probe read -format=json pki_int/roles/client-cert; then
       warn "client-cert role missing — recreating it."
-      _pki_write_client_role "$domain"
     fi
+    # Always rewritten: picks up a changed CLIENT_CERT_TTL.
+    _pki_write_client_role "$domain"
+    _pki_configure_crl
     # Re-export the public CA files if they are missing (e.g. fresh checkout).
     [ -s "$certs/root-ca.crt" ] || vault read -field=certificate pki/cert/ca > "$certs/root-ca.crt"
     [ -s "$certs/intermediate-ca.crt" ] || vault read -field=certificate pki_int/cert/ca > "$certs/intermediate-ca.crt"
     [ -s "$certs/ca-chain.crt" ] || cat "$certs/root-ca.crt" "$certs/intermediate-ca.crt" > "$certs/ca-chain.crt"
     [ -f "$certs/revocation/revoked-serials.txt" ] || : > "$certs/revocation/revoked-serials.txt"
+    _pki_export_truststore "$certs"
     if [ "$server_cert" = true ] && [ ! -s "$certs/server.crt" ]; then
       _pki_issue_server_cert "$domain" "$certs"
     fi
@@ -141,9 +174,11 @@ pki_setup() {
     crl_distribution_points="$VAULT_ADDR/v1/pki_int/crl" >/dev/null
 
   _pki_write_client_role "$domain"
+  _pki_configure_crl
 
   # CA chain last: its presence marks a complete setup (see the guard above).
   cat "$certs/root-ca.crt" "$certs/intermediate-ca.crt" > "$certs/ca-chain.crt"
+  _pki_export_truststore "$certs"
   # New CA → old revocations are meaningless; start an empty serial list.
   : > "$certs/revocation/revoked-serials.txt"
 
@@ -168,11 +203,16 @@ help_pki_setup() {
 Usage: portcullis pki setup [--force] [--with-server-cert]
 
 Create the client-certificate CA in Vault: root CA (10y), intermediate CA
-(5y) and the client-cert role (24h certs, CN taken from the caller, never
-from the CSR). Writes certs/root-ca.crt, intermediate-ca.crt, ca-chain.crt.
+(5y) and the client-cert role (lifetime CLIENT_CERT_TTL, default 720h = 30
+days; CN taken from the caller, never from the CSR). Writes
+certs/root-ca.crt, intermediate-ca.crt, ca-chain.crt and Keycloak's
+truststore (certs/truststore/portcullis-ca-chain.pem); enables CRL
+auto-rebuild on pki_int.
 
-Idempotent: an existing CA is never replaced; missing pieces (role, CA
-files, server cert) are recreated, and a partial earlier run is redone.
+Idempotent: an existing CA is never replaced; the client-cert role is
+rewritten (so a new CLIENT_CERT_TTL applies to certs issued from now on),
+missing pieces (CA files, truststore, server cert) are recreated, and a
+partial earlier run is redone.
 Refuses to create a new CA when Vault has none but certs/ca-chain.crt
 exists (Vault data lost) — restore a backup or use --force.
 
@@ -180,7 +220,7 @@ Options:
   --force              DESTROY the existing CA and create a new one
                        (every enrolled client certificate stops working)
   --with-server-cert   Also issue a self-signed *.<domain> server cert
-                       (certs/server.crt, server.key 0600) for local dev/CI
+                       (certs/server.crt, server.key 0640 group 0) for local dev/CI
 
 Admin token: VAULT_TOKEN if set, else the root token in secrets/vault-init.json.
 EOF
