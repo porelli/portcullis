@@ -56,11 +56,12 @@ Config sources (both re-read on every request; they are tiny):
     file can never override those.
   - /hub-data/group-gate-policy.json — written by the Hub (contract §4):
       {"version": 2,
-       "policies": {"<template-id-or-subdomain>": {"factors": [...], "op": "any|all|"}},
+       "policies": {"<subdomain>": {"factors": [...], "op": "any|all|"}},
        "default":  {"factors": [...], "op": "..."},
        "groups":   {"<subdomain>": "<required LLDAP group>"},
        "path_groups": {"<subdomain>": [{"prefix": "/admin", "group": "<LLDAP group>"}]}}
-    Optional; no file means every app falls through to the group check
+    Every map is keyed by the lowercase subdomain the request is for —
+    never by template ID. Optional; no file means every app falls through to the group check
     only. Missing keys (incl. `version`) are treated as empty. A file that
     exists but cannot be parsed, a newer `version` than this gate knows, or
     a policy with unknown factor names / op / rule shape fails CLOSED (403).
