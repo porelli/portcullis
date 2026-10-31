@@ -1,4 +1,4 @@
-# User config directory (separate git repo — see scripts/init-config.sh)
+# User config directory (separate git repo — see ./portcullis config init)
 config/
 
 # User config symlinks (point into config/)

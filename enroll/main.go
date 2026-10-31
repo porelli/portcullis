@@ -173,7 +173,7 @@ func (cfg *Config) getUser(username string) (*User, error) {
 // Vault authentication
 //
 // enroll authenticates with a least-privilege AppRole (policy
-// vault/policies/enroll.hcl, created by scripts/vault-init.sh): it can only
+// vault/policies/enroll.hcl, created by ./portcullis vault init): it can only
 // sign with the client-cert role and read/list issued certs. There is no
 // static token and no fallback. Tokens are short-lived (1h); vaultAuth logs
 // in again shortly before expiry, and immediately when Vault answers 403
@@ -225,11 +225,11 @@ func (a *vaultAuth) newClient() (*vault.Client, error) {
 func (a *vaultAuth) login(c *vault.Client) error {
 	roleID, err := readSecretFile(a.roleIDFile)
 	if err != nil {
-		return fmt.Errorf("vault approle role-id: %w (run scripts/vault-init.sh)", err)
+		return fmt.Errorf("vault approle role-id: %w (run ./portcullis vault init)", err)
 	}
 	secretID, err := readSecretFile(a.secretIDFile)
 	if err != nil {
-		return fmt.Errorf("vault approle secret-id: %w (run scripts/vault-init.sh)", err)
+		return fmt.Errorf("vault approle secret-id: %w (run ./portcullis vault init)", err)
 	}
 	secret, err := c.Logical().Write("auth/"+a.mount+"/login", map[string]interface{}{
 		"role_id":   roleID,
@@ -686,7 +686,7 @@ func main() {
 	mux.HandleFunc("GET /api/users", srv.handleAPIUsers)
 
 	// Surface Vault credential problems at start-up (non-fatal: the files
-	// may be written by vault-init.sh after enroll starts; every request
+	// may be written by `portcullis vault init` after enroll starts; every request
 	// retries the login).
 	if _, err := cfg.vault.client(false); err != nil {
 		log.Printf("WARNING: Vault AppRole login failed: %v", err)

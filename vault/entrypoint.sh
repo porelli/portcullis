@@ -4,13 +4,13 @@
 #
 # Starts Vault in server mode with vault/vault.hcl and then unseals it
 # automatically, on EVERY container start (docker compose up, restart,
-# host reboot), using the unseal key that scripts/vault-init.sh wrote to
+# host reboot), using the unseal key that ./portcullis vault init wrote to
 # ./secrets/vault-unseal/unseal-key (mounted read-only at /vault/unseal/).
 #
 # The unseal loop only acts while Vault reports "sealed"; once unsealed it
 # exits, so a deliberate `vault operator seal` stays sealed until the next
 # container restart. If the key file is absent (Vault not initialised yet)
-# it just waits — scripts/vault-init.sh unseals directly after `init`.
+# it just waits — ./portcullis vault init unseals directly after `init`.
 #
 # Trade-off (documented in docs/certificates.md): keeping the unseal key on
 # the same host as the encrypted data means anyone with root on the host
@@ -54,7 +54,7 @@ auto_unseal() {
           sleep 10
         else
           if [ "$waiting_logged" = false ]; then
-            log "sealed and no unseal key at $KEY_FILE - waiting for scripts/vault-init.sh"
+            log "sealed and no unseal key at $KEY_FILE - waiting for ./portcullis vault init"
             waiting_logged=true
           fi
           sleep 5

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+#
+# portcullis — the single admin entrypoint for a Portcullis installation.
+# Run `./portcullis help`. Logic lives in scripts/lib/*.sh (one file per area).
+#
+set -euo pipefail
+
+_self="${BASH_SOURCE[0]}"
+while [ -L "$_self" ]; do
+  _dir="$(cd "$(dirname "$_self")" && pwd)"
+  _self="$(readlink "$_self")"
+  case "$_self" in /*) ;; *) _self="$_dir/$_self" ;; esac
+done
+PORTCULLIS_HOME="$(cd "$(dirname "$_self")" && pwd)"
+PORTCULLIS_LIB="$PORTCULLIS_HOME/scripts/lib"
+# PORTCULLIS_ROOT (where .env, certs/, secrets/ live) may be overridden,
+# e.g. by the tests; it defaults to this checkout.
+PORTCULLIS_ROOT="${PORTCULLIS_ROOT:-$PORTCULLIS_HOME}"
+# shellcheck disable=SC2034  # used by scripts/lib/backup.sh
+PORTCULLIS_CALLER_PWD="$PWD"
+unset _self _dir
+
+for _lib in common network vault pki certs keycloak dns config status backup stack; do
+  # shellcheck source=/dev/null
+  source "$PORTCULLIS_LIB/$_lib.sh"
+done
+unset _lib
+
+help_main() {
+  cat <<'EOF'
+Usage: portcullis <command> [options]
+
+Setup and lifecycle:
+  init                        First-time setup: .env + secrets, Vault, PKI, Keycloak, start
+  up                          Start/update the core stack and wait until healthy
+  down                        Stop the core stack (volumes and secrets are kept)
+  upgrade                     Back up, pull, re-run idempotent setup steps, restart
+  status                      Health overview (--json for machines)
+  backup                      Back up .env, certs/, secrets/ and volumes to backups/
+  restore                     Restore a backup
+
+Configuration:
+  config apply                Apply ACME_STAGING / MTLS_ENABLED, rebuild the CA bundle
+  config init                 Keep your settings in config/, a separate git repo
+  dns setup                   Create A/AAAA records for the domain and its wildcard
+
+Vault and PKI:
+  vault init                  Initialise/unseal Vault, set up the enroll AppRole
+  vault unseal                Unseal Vault and wait until it is active
+  vault rotate-enroll-secret  Issue a new enroll AppRole secret-id
+  pki setup                   Create the client-certificate CA (idempotent)
+
+Identity:
+  keycloak configure          Import/patch the portcullis realm
+  oidc register               Create core OIDC clients, push their secrets from .env
+
+Client certificates (YubiKey PIV):
+  cert enroll                 New key + certificate on a YubiKey
+  cert renew                  New certificate for the key already on the YubiKey
+  cert revoke                 Revoke a certificate (enforced by group-gate)
+  cert list                   List issued certificates
+  cert sync                   Rewrite the revoked-serial list from Vault
+
+Run 'portcullis <command> --help' for the options of a command.
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    help|-h|--help)
+      # `portcullis help <command> [sub]` == `portcullis <command> [sub] --help`
+      if [ $# -gt 0 ]; then main "$@" --help; else help_main; fi
+      return 0 ;;
+    "") help_main >&2; return 2 ;;
+  esac
+  cd "$PORTCULLIS_ROOT"
+  case "$cmd" in
+    init|up|down|upgrade|status|backup|restore|config|dns|vault|pki|keycloak|oidc|cert)
+      "cmd_$cmd" "$@" ;;
+    *)
+      printf "portcullis: unknown command '%s'\nRun 'portcullis help' for the list of commands.\n" "$cmd" >&2
+      return 2 ;;
+  esac
+}
+
+main "$@"

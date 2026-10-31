@@ -3,7 +3,7 @@
 #
 # - Integrated (raft) storage on the `vault_data` volume, so the PKI
 #   (root + intermediate CA keys, issued-cert records, CRL) survives
-#   restarts. The old dev-mode server kept everything in memory.
+#   restarts.
 # - Plain HTTP listener: Vault is only reachable on the internal
 #   `portcullis` Docker network and on 127.0.0.1:8200 on the host.
 #   Never publish 8200 on a non-loopback address without enabling TLS.
@@ -12,7 +12,7 @@
 #   the container no longer needs CAP_IPC_LOCK. Make sure the host has
 #   swap disabled or encrypted if that matters to you.
 #
-# Initialisation and unsealing are automated by scripts/vault-init.sh and
+# Initialisation and unsealing are automated by ./portcullis vault init and
 # vault/entrypoint.sh (see docs/certificates.md "Vault storage & unsealing").
 
 ui            = true

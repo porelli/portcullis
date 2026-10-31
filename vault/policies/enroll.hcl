@@ -1,5 +1,5 @@
 # Least-privilege policy for the enrollment UI (enroll/main.go).
-# Attached to the `portcullis-enroll` AppRole by scripts/vault-init.sh.
+# Attached to the `portcullis-enroll` AppRole by ./portcullis vault init.
 #
 # enroll needs exactly three things:
 #   - sign a user's CSR with the client-cert role  (POST /api/sign)
