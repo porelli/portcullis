@@ -75,7 +75,11 @@ monitoring_prepare() {
   jq -n --arg d "${PORTCULLIS_DOMAIN:-portcullis.local}" \
     '[{targets: ["auth." + $d + ":443"], labels: {probe: "public-cert"}}]' > "$m/prometheus/tls-targets.json"
   alertmanager_config > "$m/alertmanager/alertmanager.yml.tmp"
-  cat "$m/alertmanager/alertmanager.yml.tmp" > "$m/alertmanager/alertmanager.yml"
+  if ! cmp -s "$m/alertmanager/alertmanager.yml.tmp" "$m/alertmanager/alertmanager.yml"; then
+    cat "$m/alertmanager/alertmanager.yml.tmp" > "$m/alertmanager/alertmanager.yml"
+    # shellcheck disable=SC2034  # read by stack_up (reload)
+    MONITORING_ALERTMANAGER_CHANGED=true
+  fi
   rm -f "$m/alertmanager/alertmanager.yml.tmp"
   if [ ! -s "$m/grafana/admin-password" ]; then
     pw="$(gen_alnum 32)"
@@ -84,6 +88,14 @@ monitoring_prepare() {
   mkdir -p "$MONITORING_TEXTFILE_DIR"
   chmod 755 "$PORTCULLIS_ROOT/monitoring" "$MONITORING_TEXTFILE_DIR" 2>/dev/null || true
   monitoring_fix_perms
+}
+
+# monitoring_reload — after `up`: a running Alertmanager re-reads a changed
+# config on SIGHUP.
+monitoring_reload() {
+  [ "${MONITORING_ALERTMANAGER_CHANGED:-false}" = true ] || return 0
+  [ -n "$(dc ps -q --status running alertmanager 2>/dev/null)" ] || return 0
+  dc kill -s HUP alertmanager >/dev/null 2>&1 && info "Alertmanager reloaded its receivers." || true
 }
 
 # monitoring_fix_perms — part of secrets_fix_perms.

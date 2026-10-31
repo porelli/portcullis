@@ -201,6 +201,7 @@ stack_up() {
   stack_prepare
   config_build_ca_bundle
   dc up -d --build
+  monitoring_reload
   wait_healthy 300 vault postgres lldap keycloak
   ok "Portcullis is up. Check: ./portcullis status"
 }
@@ -233,6 +234,7 @@ upgrade_run() {
 
   info "Starting services..."
   dc up -d --build
+  monitoring_reload
   if [ "$PKI_CREATED" = true ] || [ "${PKI_TRUSTSTORE_CHANGED:-false}" = true ]; then
     # Traefik, forward-auth and Keycloak read the CA chain only at start-up.
     dc restart traefik forward-auth keycloak >/dev/null
