@@ -196,7 +196,7 @@ domain), and Keycloak redirect URIs for each.
 For local development without a real domain or ACME:
 
 1. Set `PORTCULLIS_DOMAIN=portcullis.local` in `.env`
-2. Run the Vault PKI setup with `--with-server-cert` to generate a self-signed wildcard cert
+2. Run `./portcullis init` (it also issues a self-signed wildcard server cert for local use)
 3. Add entries to `/etc/hosts`:
 
 ```

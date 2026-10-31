@@ -820,7 +820,8 @@ services:
       GF_AUTH_PROXY_ENABLED: "true"
       GF_AUTH_PROXY_HEADER_NAME: X-Forwarded-User
       GF_AUTH_PROXY_HEADER_PROPERTY: username
-      GF_AUTH_PROXY_HEADERS: Email:X-Forwarded-Email
+      # Deliberately no GF_AUTH_PROXY_HEADERS email mapping: Grafana's user
+      # sync can match accounts by email, and LLDAP email is user-editable.
       GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
       GF_AUTH_PROXY_ENABLE_LOGIN_TOKEN: "false"
       GF_AUTH_PROXY_WHITELIST: ${PORTCULLIS_TRAEFIK_IP:-172.31.250.2}

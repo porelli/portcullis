@@ -95,8 +95,9 @@ running Alertmanager reloads it.
   `traefik`, …): it always requires `lldap_admin` and the Hub's policy file
   cannot change that. The router uses
   `client-headers@file,portcullis-auth@docker,portcullis-groups@docker`.
-- Grafana logs users in from `X-Forwarded-User` (the LLDAP **username**) and
-  `X-Forwarded-Email`, accepted only from Traefik's fixed IP
+- Grafana logs users in from `X-Forwarded-User` (the LLDAP **username**)
+  only, never by email (LLDAP email is user-editable and Grafana can link
+  accounts by email), accepted only from Traefik's fixed IP
   (`GF_AUTH_PROXY_WHITELIST=${PORTCULLIS_TRAEFIK_IP}`); its login form and
   basic auth are off. Everyone who gets through is an admin, so they are
   Grafana Admins.
