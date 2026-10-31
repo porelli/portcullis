@@ -649,7 +649,9 @@ backup_restore() {
   # Refreshes the enroll AppRole creds and the metrics token, verifies the
   # restored root token works.
   vault_init false
-  dc up -d
+  # The core must come up; a non-core service (e.g. a Hub image that cannot
+  # be pulled right now) must not abort a restore.
+  dc up -d || warn "some services did not start — check ./portcullis status"
   wait_healthy 300 vault postgres lldap keycloak
   ok "Restore complete.${pre:+ Previous .env/secrets/certs: $pre.} Verify with ./portcullis status"
 }
