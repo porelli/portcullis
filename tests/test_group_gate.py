@@ -59,17 +59,22 @@ class GateTest(unittest.TestCase):
     def setUp(self):
         write_policy(None)
 
-    def req(self, host, groups="users_x", extra=None):
-        h = {"X-Forwarded-Host": host, "X-Auth-Request-Email": "bob@example.com"}
+    def req(self, host, groups="users_x", extra=None, uri=None, gate_path="/", want_headers=False):
+        h = {"X-Forwarded-Host": host, "X-Auth-Request-Email": "bob@example.com",
+             "X-Auth-Request-User": "bob"}
         if groups is not None:
             h["X-Auth-Request-Groups"] = groups
+        if uri is not None:
+            h["X-Forwarded-Uri"] = uri
         h.update(extra or {})
-        r = urllib.request.Request(f"http://127.0.0.1:{self.port}/", headers=h)
+        h = {k: v for k, v in h.items() if v is not None}
+        r = urllib.request.Request(f"http://127.0.0.1:{self.port}{gate_path}", headers=h)
         try:
             with urllib.request.urlopen(r) as resp:
-                return resp.status
+                return (resp.status, dict(resp.headers)) if want_headers else resp.status
         except urllib.error.HTTPError as e:
-            return e.code
+            with e:
+                return (e.code, dict(e.headers)) if want_headers else e.code
 
     def test_hub_case_and_port_variants_denied_for_non_admin(self):
         for host in ["hub.example.com", "HUB.example.com", "Hub.Example.Com",
@@ -115,13 +120,150 @@ class GateTest(unittest.TestCase):
                 self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), 403)
 
     def test_valid_policy_stepup(self):
-        write_policy({"policies": {"grafana": {"factors": ["mtls"], "op": ""}}})
-        self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), 403)
-        import base64
-        payload = base64.urlsafe_b64encode(json.dumps({"amr": ["mtls"]}).encode()).decode().rstrip("=")
-        tok = f"x.{payload}.y"
+        write_policy({"policies": {"grafana": {"factors": ["webauthn"], "op": ""}}})
+        code, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
+        self.assertEqual(code, 403)
+        self.assertIn("acr_values=hwk", hdrs.get("X-Stepup-URL", ""))
         self.assertEqual(self.req("grafana.example.com", groups="users_grafana",
-                                  extra={"X-Forwarded-Access-Token": tok}), 200)
+                                  extra={"X-Forwarded-Access-Token": token(amr=["pwd"])}), 403)
+        self.assertEqual(self.req("grafana.example.com", groups="users_grafana",
+                                  extra={"X-Forwarded-Access-Token": token(amr=["hwk"])}), 200)
+
+    # ── reserved deny group (contract §4) ──
+
+    def test_deny_sentinel_group_denies_everyone(self):
+        write_policy({"groups": {"ghost": gg.DENY_GROUP}})
+        for groups in ("", "users_ghost", "lldap_admin", "users_ghost,lldap_admin"):
+            with self.subTest(groups=groups):
+                self.assertEqual(self.req("ghost.example.com", groups=groups), 403)
+
+    def test_deny_sentinel_cannot_be_satisfied_by_membership(self):
+        write_policy({"groups": {"ghost": gg.DENY_GROUP}})
+        self.assertEqual(self.req("ghost.example.com", groups=gg.DENY_GROUP), 403)
+
+    def test_user_claiming_deny_group_is_denied_everywhere(self):
+        for host in ("random.example.com", "grafana.example.com", "hub.example.com"):
+            with self.subTest(host=host):
+                self.assertEqual(self.req(host, groups=f"users_grafana,lldap_admin, {gg.DENY_GROUP}"), 403)
+        self.assertEqual(self.req("random.example.com", groups="users_x", gate_path="/authenticated"), 200)
+        self.assertEqual(self.req("random.example.com", groups=gg.DENY_GROUP, gate_path="/authenticated"), 403)
+
+    def test_deny_sentinel_in_path_groups(self):
+        write_policy({"path_groups": {"grafana": [{"prefix": "/x", "group": gg.DENY_GROUP}]}})
+        self.assertEqual(self.req("grafana.example.com", groups="users_grafana", uri="/x/1"), 403)
+        self.assertEqual(self.req("grafana.example.com", groups="users_grafana", uri="/y"), 200)
+
+    # ── version ──
+
+    def test_policy_version(self):
+        for doc, want in [({"version": 2}, 200), ({"version": 1}, 200), ({}, 200),
+                          ({"version": 3}, 403), ({"version": "2"}, 403), ({"version": True}, 403),
+                          ({"version": 0}, 403)]:
+            with self.subTest(doc=doc):
+                write_policy(doc)
+                self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), want)
+
+    # ── healthz / authenticated-only ──
+
+    def test_healthz(self):
+        self.assertEqual(self.req("", groups=None, gate_path="/healthz"), 200)
+
+    def test_authenticated_only_skips_group_but_not_other_checks(self):
+        self.assertEqual(self.req("enroll.example.com", groups="users_x"), 403)
+        self.assertEqual(self.req("enroll.example.com", groups="users_x", gate_path="/authenticated"), 200)
+        self.assertEqual(self.req("enroll.example.com", groups="", gate_path="/authenticated/self"), 200)
+        # no user at all
+        self.assertEqual(self.req("enroll.example.com", groups="", gate_path="/authenticated",
+                                  extra={"X-Auth-Request-Email": None, "X-Auth-Request-User": None}), 403)
+        # host check still applies
+        self.assertEqual(self.req("enroll.evil.com", groups="", gate_path="/authenticated"), 403)
+        # "/authenticatedX" is not the authenticated-only endpoint
+        self.assertEqual(self.req("enroll.example.com", groups="users_x", gate_path="/authenticatedX"), 403)
+
+
+def token(**claims):
+    import base64
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"x.{payload}.y"
+
+
+ADMIN_RULES = {"version": 2,
+               "groups": {"vw": "users_vw"},
+               "path_groups": {"vw": [{"prefix": "/admin", "group": "admin_vw"},
+                                      {"prefix": "/admin/super", "group": "super_vw"},
+                                      {"prefix": "/api/admin/", "group": "admin_vw"}]}}
+
+
+class PathGroupsTest(GateTest):
+    def r(self, uri, groups="users_vw"):
+        write_policy(ADMIN_RULES)
+        return self.req("vw.example.com", groups=groups, uri=uri)
+
+    def test_normalisation(self):
+        n = gg.normalize_path_candidates
+        self.assertEqual(n("/a//b/./c/../d?x=/admin#frag")[0], "/a/b/d")
+        self.assertEqual(n("/%61dmin")[0], "/admin")
+        self.assertEqual(n("")[0], "/")
+        self.assertEqual(n("/x/..")[0], "/")
+        self.assertEqual(n("/../../admin")[0], "/admin")
+        self.assertEqual(n("http://h/admin?q")[0], "/admin")
+        self.assertIn("/admin", n("/%2561dmin"))           # double-decoding backends
+        self.assertIn("/admin/x", n("/admin;jsessionid=1/x"))
+        self.assertIn("/admin", n("/x\\..\\admin"))
+        # One decode turns %2f into a real "/" (matched as such, deny-biased);
+        # what is still encoded after that, NULs and controls are rejected.
+        self.assertEqual(n("/foo/..%2fadmin")[0], "/admin")
+        for bad in ("/a%00", "/a%252fb", "/a%255Cb", "/a%2500", "/%0a", "/%ff", "/a\x00b"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(gg.PathError):
+                    n(bad)
+
+    def test_prefix_segment_boundary_and_longest_wins(self):
+        rules = [("/admin", "a"), ("/admin/super", "s")]
+        self.assertEqual(gg.required_path_groups(rules, ["/admin"]), ["a"])
+        self.assertEqual(gg.required_path_groups(rules, ["/admin/x"]), ["a"])
+        self.assertEqual(gg.required_path_groups(rules, ["/administrator"]), [])
+        self.assertEqual(gg.required_path_groups(rules, ["/admin/super/x"]), ["s"])
+        self.assertEqual(gg.required_path_groups([("/", "root")], ["/anything"]), ["root"])
+
+    def test_group_required_in_addition_to_subdomain_group(self):
+        self.assertEqual(self.r("/", groups="users_vw"), 200)
+        self.assertEqual(self.r("/administrator", groups="users_vw"), 200)
+        self.assertEqual(self.r("/admin", groups="users_vw"), 403)
+        self.assertEqual(self.r("/admin", groups="admin_vw"), 403)      # lacks users_vw
+        self.assertEqual(self.r("/admin", groups="users_vw,admin_vw"), 200)
+        self.assertEqual(self.r("/admin/super/x", groups="users_vw,admin_vw"), 403)
+        self.assertEqual(self.r("/admin/super/x", groups="users_vw,super_vw"), 200)
+        self.assertEqual(self.r("/api/admin/users", groups="users_vw"), 403)
+
+    def test_bypass_attempts_denied(self):
+        for uri in ("/admin/../admin", "//admin", "/./admin", "/x/../admin/", "/%61dmin",
+                    "/%2561dmin", "/Admin", "/ADMIN/x", "/admin?", "/admin#x", "/admin;x=1",
+                    "/foo/..%2fadmin", "/admin%2f", "/%2e%2e/admin", "/.%2e/admin",
+                    "/x\\..\\admin", "/admin%00", "admin", "/api//admin/x"):
+            with self.subTest(uri=uri):
+                self.assertEqual(self.r(uri, groups="users_vw"), 403)
+
+    def test_missing_uri_is_root(self):
+        write_policy(ADMIN_RULES)
+        self.assertEqual(self.req("vw.example.com", groups="users_vw"), 200)
+
+    def test_malformed_rules_fail_closed(self):
+        for pg in ([], {"vw": {"prefix": "/a"}}, {"vw": [{"prefix": "admin", "group": "g"}]},
+                   {"vw": [{"prefix": "/a", "group": ""}]}, {"vw": ["x"]},
+                   {"vw": [{"prefix": "/a/../b", "group": "g"}]}, {"vw": [{"prefix": "/%61", "group": "g"}]}):
+            with self.subTest(pg=pg):
+                write_policy({"groups": {"vw": "users_vw"}, "path_groups": pg})
+                self.assertEqual(self.req("vw.example.com", groups="users_vw", uri="/"), 403)
+
+    def test_subdomain_key_case_insensitive(self):
+        write_policy({"path_groups": {"VW": [{"prefix": "/admin", "group": "admin_vw"}]}})
+        self.assertEqual(self.req("vw.example.com", groups="x", uri="/admin"), 403)
+
+    def test_core_subdomains_ignore_hub_path_rules(self):
+        write_policy({"path_groups": {"hub": [{"prefix": "/", "group": "nobody"}]}})
+        self.assertEqual(self.req("hub.example.com", groups="lldap_admin", uri="/x"), 200)
+
 
 
 
@@ -251,6 +393,72 @@ class _CrlHandler(http.server.BaseHTTPRequestHandler):
 
     def log_message(self, *a):
         pass
+
+
+class MtlsBindingTest(GateTest):
+    """A token with amr=mtls only counts with a matching, unrevoked cert NOW."""
+
+    def setUp(self):
+        super().setUp()
+        write_revoked(None)
+        gg.CRL_CACHE = None
+
+    def tearDown(self):
+        write_revoked(None)
+
+    def r(self, policy, amr, cert=None, user="bob", host="grafana.example.com"):
+        write_policy({"policies": {"grafana": policy}})
+        extra = {"X-Forwarded-Access-Token": token(amr=amr, preferred_username=user)}
+        if cert is not None:
+            extra[gg.CERT_INFO_HEADER] = cert
+        return self.req(host, groups="users_grafana", extra=extra, want_headers=True)
+
+    def test_mtls_token_without_cert_steps_up(self):
+        code, hdrs = self.r({"factors": ["mtls"]}, ["mtls"])
+        self.assertEqual(code, 403)
+        self.assertIn("acr_values=mtls", hdrs.get("X-Stepup-URL", ""))
+
+    def test_mtls_token_with_matching_cert(self):
+        self.assertEqual(self.r({"factors": ["mtls"]}, ["mtls"], cert_info_for("bob", 0x10))[0], 200)
+
+    def test_mtls_token_with_foreign_user_cert(self):
+        self.assertEqual(self.r({"factors": ["mtls"]}, ["mtls"], cert_info_for("alice", 0x10))[0], 403)
+        self.assertEqual(self.r({"factors": ["mtls"]}, ["mtls"], cert_info_for("Bob", 0x10))[0], 403)
+        self.assertEqual(self.r({"factors": ["mtls"]}, ["mtls"], cert_info_for("bob", 0x10), user="")[0], 403)
+
+    def test_mtls_token_with_revoked_cert(self):
+        write_revoked(["10"])
+        self.assertEqual(self.r({"factors": ["mtls"]}, ["mtls"], cert_info_for("bob", 0x10))[0], 403)
+
+    def test_cert_info_without_serial_does_not_satisfy_binding(self):
+        self.assertEqual(self.r({"factors": ["mtls"]}, ["mtls"], urllib.parse.quote('Subject="CN=bob"'))[0], 403)
+
+    def test_any_policy_satisfied_by_other_factor_needs_no_cert(self):
+        p = {"factors": ["mtls", "webauthn"], "op": "any"}
+        self.assertEqual(self.r(p, ["hwk"])[0], 200)
+        self.assertEqual(self.r(p, ["mtls", "hwk"])[0], 200)
+        self.assertEqual(self.r(p, ["mtls"])[0], 403)
+        self.assertEqual(self.r(p, ["mtls"], cert_info_for("bob", 1))[0], 200)
+
+    def test_all_policy_with_mtls_always_needs_cert(self):
+        p = {"factors": ["mtls", "webauthn"], "op": "all"}
+        self.assertEqual(self.r(p, ["mtls", "hwk"])[0], 403)
+        self.assertEqual(self.r(p, ["mtls", "hwk"], cert_info_for("bob", 1))[0], 200)
+
+    def test_policy_without_mtls_unaffected(self):
+        self.assertEqual(self.r({"factors": ["webauthn"]}, ["hwk"])[0], 200)
+
+    def test_leaf_cert_cn(self):
+        self.assertEqual(gg.leaf_cert_cn(cert_info_for("bob", 1)), "bob")
+        self.assertEqual(gg.leaf_cert_cn(urllib.parse.quote_plus(
+            'Subject="C=DE,O=x,CN=carol";SerialNumber="1",Subject="CN=Intermediate";SerialNumber="2"')), "carol")
+        self.assertIsNone(gg.leaf_cert_cn(""))
+        self.assertIsNone(gg.leaf_cert_cn('Issuer="CN=x"'))
+
+
+def cert_info_for(cn, serial):
+    return urllib.parse.quote_plus(f'Subject="CN={cn}";Issuer="CN=example.com Intermediate CA";'
+                                   f'SerialNumber="{serial}";NB="1700000000";NA="1700086400"')
 
 
 class RevocationGateTest(GateTest):

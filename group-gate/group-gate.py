@@ -16,24 +16,48 @@ Checks, run in order:
          re-fetched every GATE_CRL_REFRESH_SECONDS (default 60) in the
          background. Fetch errors keep the last good CRL (fail open on
          Vault outages — the serial file still applies).
+     Traefik's entrypoint deletes client-supplied X-Forwarded-Tls-Client-*
+     headers, so the header only ever describes a cert Traefik verified.
   1. Auth policy — does the current session's ACR/AMR satisfy the app's
      required factor set (one of mtls/webauthn/password, with AND/OR
      semantics)? If not, 403 with a stepup URL so the user can re-auth
      at the needed Level of Authentication.
+     mTLS binding: when the policy is satisfied only through the `mtls`
+     factor (amr=mtls), the token alone is not enough — it may have been
+     obtained with a cert that has since been revoked. The CURRENT request
+     must present a client cert (checked for revocation in step 0) whose
+     subject CN equals the session user (preferred_username); otherwise
+     step-up / deny.
   2. Group — does the user belong to the subdomain's required LLDAP
-     group (users_<app>)? If not, 403.
+     group (users_<app>)? If not, 403. The reserved group
+     __portcullis_deny__ (published by the Hub for apps whose config is
+     unknown) always denies, and so does a user who claims to be in it.
+  3. Path groups — for subdomains with `path_groups` rules, the normalised
+     X-Forwarded-Uri path is matched against the rule prefixes (segment
+     boundaries, longest prefix wins) and that rule's group is required in
+     addition to the subdomain group. See normalize_path_candidates().
+
+Request paths on group-gate itself (the forwardAuth `address`):
+  /                     full checks (portcullis-groups@docker)
+  /authenticated[/...]  everything except the subdomain group check (step 2):
+                        any authenticated user. Used for self-service routes
+                        such as enroll.<domain>/self (portcullis-self@docker).
+  /healthz              liveness (no checks, for the container healthcheck)
 
 Config sources (both re-read on every request; they are tiny):
   - /etc/group-gate/map.conf — subdomain=required_group. Authoritative for
     core subdomains (auth, traefik, hub, directory, enroll): the Hub policy
     file can never override those.
-  - /hub-data/group-gate-policy.json — written by the Hub:
-      {"policies": {"<template-id-or-subdomain>": {"factors": [...], "op": "any|all|"}},
+  - /hub-data/group-gate-policy.json — written by the Hub (contract §4):
+      {"version": 2,
+       "policies": {"<template-id-or-subdomain>": {"factors": [...], "op": "any|all|"}},
        "default":  {"factors": [...], "op": "..."},
-       "groups":   {"<subdomain>": "<required LLDAP group>"}}
+       "groups":   {"<subdomain>": "<required LLDAP group>"},
+       "path_groups": {"<subdomain>": [{"prefix": "/admin", "group": "<LLDAP group>"}]}}
     Optional; no file means every app falls through to the group check
-    only. A file that exists but cannot be parsed, or a policy with unknown
-    factor names / op, fails CLOSED (403).
+    only. Missing keys (incl. `version`) are treated as empty. A file that
+    exists but cannot be parsed, a newer `version` than this gate knows, or
+    a policy with unknown factor names / op / rule shape fails CLOSED (403).
 
 Host handling: X-Forwarded-Host is normalised (lowercased, port and
 trailing dot stripped) because Traefik's Host() matcher is
@@ -43,7 +67,7 @@ case-insensitive. When PORTCULLIS_DOMAIN is set, the host must be exactly
 Access token is read from X-Forwarded-Access-Token (oauth2-proxy with
 PASS_ACCESS_TOKEN=true). The JWT signature is NOT verified here — it was
 already verified upstream by oauth2-proxy before the request reaches us.
-We only decode the payload to read the acr/amr claims.
+We only decode the payload to read the acr/amr/preferred_username claims.
 """
 
 from __future__ import annotations
@@ -75,6 +99,11 @@ CERT_INFO_HEADER = "X-Forwarded-Tls-Client-Cert-Info"
 CORE_SUBDOMAINS = ("auth", "traefik", "hub", "directory", "enroll")
 CORE_DEFAULT_GROUP = "lldap_admin"
 VALID_OPS = ("", "any", "all")
+# Highest policy-file schema version this gate understands (contract §4).
+POLICY_VERSION = 2
+# Reserved group (contract §4): the Hub publishes it for routed apps whose
+# config is unknown. It always denies; nobody may claim membership.
+DENY_GROUP = "__portcullis_deny__"
 
 # Factor string ↔ AMR value used in tokens (RFC 8176 where possible).
 FACTOR_TO_AMR = {
@@ -162,7 +191,156 @@ def load_policy_file() -> dict:
         raise PolicyError(f"cannot read policy file: {e}") from e
     if not isinstance(doc, dict):
         raise PolicyError("policy file is not a JSON object")
+    version = doc.get("version")
+    if version is not None:
+        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
+            raise PolicyError(f"invalid policy file version {version!r}")
+        if version > POLICY_VERSION:
+            # A newer schema may carry restrictions we would silently drop.
+            raise PolicyError(f"policy file version {version} is newer than supported ({POLICY_VERSION})")
     return doc
+
+
+# ── Path rules (path_groups) ──────────────────────────────────────────
+
+
+def _normalize_prefix(prefix: str) -> str:
+    prefix = "/" + prefix.strip().lstrip("/")
+    return prefix.rstrip("/") or "/"
+
+
+def path_rules_for(policy_doc: dict, subdomain: str) -> List[Tuple[str, str]]:
+    """[(prefix, group)] for the subdomain; raises PolicyError if malformed.
+
+    Core subdomains never take rules from the Hub file.
+    """
+    pg = policy_doc.get("path_groups") if isinstance(policy_doc, dict) else None
+    if pg is None:
+        return []
+    if not isinstance(pg, dict):
+        raise PolicyError("'path_groups' is not an object")
+    rules_raw = None
+    for key, value in pg.items():
+        if isinstance(key, str) and key.strip().lower() == subdomain:
+            rules_raw = value
+            break
+    if rules_raw is None:
+        return []
+    if subdomain in CORE_SUBDOMAINS:
+        print(f"group-gate: ignoring policy-file path_groups for core subdomain {subdomain!r}", flush=True)
+        return []
+    if not isinstance(rules_raw, list):
+        raise PolicyError(f"path_groups for {subdomain!r} is not a list")
+    rules = []
+    for rule in rules_raw:
+        if not isinstance(rule, dict):
+            raise PolicyError(f"path_groups rule for {subdomain!r} is not an object")
+        prefix, group = rule.get("prefix"), rule.get("group")
+        if not isinstance(prefix, str) or not prefix.strip().startswith("/"):
+            raise PolicyError(f"path_groups rule for {subdomain!r} has an invalid prefix {prefix!r}")
+        if not isinstance(group, str) or not group.strip():
+            raise PolicyError(f"path_groups rule for {subdomain!r} has an invalid group {group!r}")
+        if any(c in prefix for c in "%?#\\\x00") or "/./" in prefix + "/" or "/../" in prefix + "/":
+            raise PolicyError(f"path_groups prefix {prefix!r} for {subdomain!r} is not a normalised path")
+        rules.append((_normalize_prefix(prefix), group.strip()))
+    return rules
+
+
+class PathError(Exception):
+    """The request path is ambiguous (encoded slash / NUL) — deny."""
+
+
+_PCT_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+
+
+def _resolve_dot_segments(path: str) -> str:
+    """RFC 3986 remove_dot_segments on an absolute path, plus // collapsing."""
+    out: List[str] = []
+    segments = path.split("/")
+    for seg in segments[1:]:
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if out:
+                out.pop()
+            continue
+        out.append(seg)
+    trailing = path.endswith("/") or segments[-1] in (".", "..")
+    result = "/" + "/".join(out)
+    if trailing and result != "/":
+        result += "/"
+    return result
+
+
+def normalize_path_candidates(raw_uri: str) -> List[str]:
+    """Normalised forms of X-Forwarded-Uri's path, for deny-biased matching.
+
+    The primary form (contract §4): query and fragment stripped, percent-
+    decoded ONCE, '//' collapsed, dot-segments resolved. Raises PathError if
+    the decoded path still contains an encoded slash/backslash/NUL, or a NUL
+    / control character — such paths mean different things to different
+    backends, so they are denied outright.
+
+    Extra candidates cover how some backends read the same bytes
+    differently: fully percent-decoded (double-decoding backends),
+    backslash as separator, and ';' path parameters stripped (servlet
+    containers). A rule applies if it matches ANY candidate.
+    """
+    uri = raw_uri or "/"
+    path = uri.split("#", 1)[0].split("?", 1)[0]
+    if not path.startswith("/"):
+        # Absolute-form ("http://h/p") or garbage: keep only the path part.
+        m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/]*(/.*)?$", path)
+        path = (m.group(1) or "/") if m else "/" + path
+    try:
+        once = urllib.parse.unquote(path, errors="strict") if "%" in path else path
+    except UnicodeDecodeError as e:
+        raise PathError("path is not valid UTF-8 after decoding") from e
+    if re.search(r"%(2[fF]|5[cC]|00)", once):
+        raise PathError("encoded slash/backslash/NUL after decoding")
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in once):
+        raise PathError("control character in path")
+    forms = [once]
+    full = once
+    for _ in range(3):
+        if not _PCT_RE.search(full):
+            break
+        full = urllib.parse.unquote(full)
+    if any(ord(c) < 0x20 for c in full):
+        raise PathError("control character after repeated decoding")
+    forms.append(full)
+    forms += [f.replace("\\", "/") for f in list(forms)]
+    forms += [re.sub(r";[^/]*", "", f) for f in list(forms)]
+    out: List[str] = []
+    for f in forms:
+        n = _resolve_dot_segments(f if f.startswith("/") else "/" + f)
+        if n not in out:
+            out.append(n)
+    return out
+
+
+def _prefix_matches(path: str, prefix: str) -> bool:
+    if prefix == "/":
+        return True
+    return path == prefix or path.startswith(prefix + "/")
+
+
+def required_path_groups(rules: List[Tuple[str, str]], candidates: List[str]) -> List[str]:
+    """Groups required by path rules: for every candidate path, matched both
+    case-sensitively and case-insensitively, the group of the longest
+    matching prefix. Several distinct groups → all are required."""
+    needed: List[str] = []
+    for path in candidates:
+        for fold in (False, True):
+            p = path.lower() if fold else path
+            best = None
+            for prefix, group in rules:
+                pf = prefix.lower() if fold else prefix
+                if _prefix_matches(p, pf) and (best is None or len(pf) > len(best[0])):
+                    best = (pf, group)
+            if best and best[1] not in needed:
+                needed.append(best[1])
+    return needed
 
 
 # ── Client-certificate revocation ─────────────────────────────────────
@@ -338,13 +516,33 @@ def cert_serials_from_info(raw: str) -> List[int]:
     certs in the presented chain joins them with ','. Every serial found is
     returned (leaf first).
     """
+    return [int(m) for m in _SERIAL_RE.findall(_decode_cert_info(raw))]
+
+
+_SUBJECT_RE = re.compile(r'Subject="([^"]*)"')
+
+
+def _decode_cert_info(raw: str) -> str:
     value = raw or ""
     for _ in range(3):
         decoded = urllib.parse.unquote(value)
         if decoded == value:
             break
         value = decoded
-    return [int(m) for m in _SERIAL_RE.findall(value)]
+    return value
+
+
+def leaf_cert_cn(raw: str) -> Optional[str]:
+    """Subject CN of the leaf (first) cert in X-Forwarded-Tls-Client-Cert-Info."""
+    value = _decode_cert_info(raw)
+    m = _SUBJECT_RE.search(value)
+    if not m:
+        return None
+    for attr in m.group(1).split(","):
+        attr = attr.strip()
+        if attr.startswith("CN="):
+            return attr[3:]
+    return None
 
 
 def normalize_host(raw: str) -> str:
@@ -465,6 +663,21 @@ def evaluate_policy(policy: dict, acr: str, amr: list) -> Tuple[bool, str, int]:
     return False, f"need any of {sorted(needed_amrs)}, have {sorted(amr_set)}", required_loa
 
 
+def policy_relies_on_mtls(policy: dict, amr: list) -> bool:
+    """True if the (already satisfied) policy is satisfied only through the
+    mtls factor: `all` with mtls in it, or `any` where mtls is the only
+    required factor present in amr."""
+    factors = list(policy.get("factors") or [])
+    if "mtls" not in factors:
+        return False
+    op = (policy.get("op") or "").lower() or ("any" if len(factors) > 1 else "")
+    if op == "all" or len(factors) == 1:
+        return True
+    amr_set = set(amr or [])
+    others = {FACTOR_TO_AMR[f] for f in factors if f != "mtls"}
+    return not (amr_set & others)
+
+
 def stepup_url(host: str, needed_loa: int, factors: list) -> str:
     """Build a step-up URL that asks oauth2-proxy for a fresh login at the
     required Level of Authentication.
@@ -521,7 +734,86 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header(name, value)
         self.end_headers()
 
+    def _deny_policy(self, user: str, host: str, reason: str):
+        self._deny(
+            "Access Denied",
+            "<p>The access policy for this app is misconfigured, so access is denied. "
+            "Ask an administrator to fix it in the Hub.</p>",
+            f"DENIED user={user} host={host} reason=malformed policy: {reason}",
+        )
+
+    def _stepup(self, host: str, subdomain: str, user: str, policy: dict, required_loa: int,
+                acr: str, amr: list, reason: str, detail_html: str = ""):
+        url = stepup_url(host, required_loa, policy.get("factors") or [])
+        e_url = html.escape(url, quote=True)
+        e_sub = html.escape(subdomain)
+        self.send_response(403)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("X-Stepup-URL", url)
+        self.end_headers()
+        factors = policy.get("factors") or []
+        op = policy.get("op") or "any"
+        have = ", ".join(safe_factor_name(str(a)) for a in amr) or "none"
+        need_desc = f"{op} of: {', '.join(factors)}" if len(factors) > 1 else factors[0] if factors else "authentication"
+        # If a hardware factor is in play, surface a link to the
+        # Keycloak account console so users who haven't enrolled yet
+        # can register a WebAuthn key.
+        needs_hardware = any(f in ("mtls", "webauthn") for f in factors)
+        parent_domain = DOMAIN or (".".join(host.split(".")[1:]) if "." in host else "")
+        account_url = (
+            f"https://auth.{parent_domain}/realms/portcullis/account/account-security/signing-in"
+            if parent_domain else ""
+        )
+        enrollment_block = ""
+        if needs_hardware and account_url:
+            enrollment_block = (
+                f"<p style=\"background:#fff7ed;border:1px solid #fed7aa;padding:.75rem 1rem;border-radius:.5rem;margin-top:1rem\">"
+                f"<b>No hardware key yet?</b> "
+                f"<a href=\"{html.escape(account_url, quote=True)}\" target=\"_blank\" rel=\"noopener\">Open the account console</a> "
+                f"to register a security key, then return and retry.</p>"
+            )
+        if not detail_html:
+            detail_html = (f"<p><b>{e_sub}</b> requires {html.escape(need_desc)}. "
+                           f"Your current session was authenticated with <code>{html.escape(have)}</code>, "
+                           "which does not satisfy the app's policy.</p>")
+        # Meta-refresh bumps the user through the fresh authorize
+        # flow automatically after 2 seconds. The explicit link is
+        # the accessible fallback.
+        self.wfile.write(
+            (
+                "<!doctype html><html><head>"
+                f"<meta http-equiv=\"refresh\" content=\"2;url={e_url}\">"
+                "<title>Additional authentication required</title>"
+                "<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:32rem;"
+                "margin:4rem auto;padding:2rem;color:#1e293b;line-height:1.55}"
+                "h1{font-size:1.5rem;margin:0 0 1rem}"
+                "code{background:#f1f5f9;padding:.15rem .4rem;border-radius:.25rem;font-size:.95em}"
+                "a{color:#3b82f6}</style></head><body>"
+                "<h1>Additional authentication required</h1>"
+                f"{detail_html}"
+                f"<p>You will be redirected to re-authenticate in a moment. "
+                f"If nothing happens, <a href=\"{e_url}\">click here</a>.</p>"
+                f"{enrollment_block}"
+                "</body></html>"
+            ).encode()
+        )
+        print(
+            f"group-gate: STEPUP user={user} host={host} policy={policy} "
+            f"acr={acr!r} amr={amr} reason={reason!r}",
+            flush=True,
+        )
+
     def do_GET(self):
+        gate_path = urllib.parse.urlsplit(self.path).path
+        if gate_path == "/healthz":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+            return
+        # /authenticated: any authenticated user, no subdomain group check.
+        authenticated_only = gate_path == "/authenticated" or gate_path.startswith("/authenticated/")
+
         raw_host = self.headers.get("X-Forwarded-Host", "")
         host = normalize_host(raw_host)
         user = self.headers.get("X-Auth-Request-Email", "") or self.headers.get("X-Auth-Request-User", "unknown")
@@ -537,11 +829,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         e_sub = html.escape(subdomain)
 
+        groups_raw = self.headers.get("X-Auth-Request-Groups", "")
+        groups = {g.strip() for g in groups_raw.split(",") if g.strip()}
+        if DENY_GROUP in groups:
+            self._deny(
+                "Access Denied",
+                "<p>Your account carries a reserved group name. Ask an administrator to remove it.</p>",
+                f"DENIED user={user} host={host} reason=user claims reserved group {DENY_GROUP!r}",
+            )
+            return
+
         # --- Client-cert revocation (before anything else) ---
         cert_info = self.headers.get(CERT_INFO_HEADER, "")
+        cert_serials: List[int] = []
         if cert_info:
-            serials = cert_serials_from_info(cert_info)
-            if not serials:
+            cert_serials = cert_serials_from_info(cert_info)
+            if not cert_serials:
                 print(f"group-gate: WARNING {CERT_INFO_HEADER} has no SerialNumber — revocation "
                       f"cannot be checked (enable info.serialNumber in client-headers@file)", flush=True)
             else:
@@ -555,7 +858,7 @@ class Handler(BaseHTTPRequestHandler):
                         f"DENIED user={user} host={host} reason=revocation list error: {e}",
                     )
                     return
-                hit = [sn for sn in serials if sn in revoked]
+                hit = [sn for sn in cert_serials if sn in revoked]
                 if hit:
                     self._deny(
                         "Access Denied",
@@ -572,17 +875,12 @@ class Handler(BaseHTTPRequestHandler):
             gate = build_group_map(policy_doc)
             policy = resolve_policy(policy_doc, subdomain)
             policy_err = validate_policy(policy) if policy else None
+            path_rules = path_rules_for(policy_doc, subdomain)
         except PolicyError as e:
-            policy_err = str(e)
-            policy = None
-            gate = {}
+            self._deny_policy(user, host, str(e))
+            return
         if policy_err:
-            self._deny(
-                "Access Denied",
-                "<p>The access policy for this app is misconfigured, so access is denied. "
-                "Ask an administrator to fix it in the Hub.</p>",
-                f"DENIED user={user} host={host} reason=malformed policy: {policy_err}",
-            )
+            self._deny_policy(user, host, policy_err)
             return
 
         # --- Auth policy check (optional, only when policy is set) ---
@@ -601,81 +899,81 @@ class Handler(BaseHTTPRequestHandler):
 
             allowed, reason, required_loa = evaluate_policy(policy, acr, amr)
             if not allowed:
-                url = stepup_url(host, required_loa, policy.get("factors") or [])
-                e_url = html.escape(url, quote=True)
-                self.send_response(403)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("X-Stepup-URL", url)
-                self.end_headers()
-                factors = policy.get("factors") or []
-                op = policy.get("op") or "any"
-                have = ", ".join(safe_factor_name(str(a)) for a in amr) or "none"
-                need_desc = f"{op} of: {', '.join(factors)}" if len(factors) > 1 else factors[0] if factors else "authentication"
-                # If a hardware factor is in play, surface a link to the
-                # Keycloak account console so users who haven't enrolled yet
-                # can register a WebAuthn key.
-                needs_hardware = any(f in ("mtls", "webauthn") for f in factors)
-                parent_domain = DOMAIN or (".".join(host.split(".")[1:]) if "." in host else "")
-                account_url = (
-                    f"https://auth.{parent_domain}/realms/portcullis/account/account-security/signing-in"
-                    if parent_domain else ""
-                )
-                enrollment_block = ""
-                if needs_hardware and account_url:
-                    enrollment_block = (
-                        f"<p style=\"background:#fff7ed;border:1px solid #fed7aa;padding:.75rem 1rem;border-radius:.5rem;margin-top:1rem\">"
-                        f"<b>No hardware key yet?</b> "
-                        f"<a href=\"{html.escape(account_url, quote=True)}\" target=\"_blank\" rel=\"noopener\">Open the account console</a> "
-                        f"to register a security key, then return and retry.</p>"
-                    )
-                # Meta-refresh bumps the user through the fresh authorize
-                # flow automatically after 2 seconds. The explicit link is
-                # the accessible fallback.
-                self.wfile.write(
-                    (
-                        "<!doctype html><html><head>"
-                        f"<meta http-equiv=\"refresh\" content=\"2;url={e_url}\">"
-                        "<title>Additional authentication required</title>"
-                        "<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:32rem;"
-                        "margin:4rem auto;padding:2rem;color:#1e293b;line-height:1.55}"
-                        "h1{font-size:1.5rem;margin:0 0 1rem}"
-                        "code{background:#f1f5f9;padding:.15rem .4rem;border-radius:.25rem;font-size:.95em}"
-                        "a{color:#3b82f6}</style></head><body>"
-                        "<h1>Additional authentication required</h1>"
-                        f"<p><b>{e_sub}</b> requires {html.escape(need_desc)}. "
-                        f"Your current session was authenticated with <code>{html.escape(have)}</code>, which does not satisfy the app's policy.</p>"
-                        f"<p>You will be redirected to re-authenticate in a moment. "
-                        f"If nothing happens, <a href=\"{e_url}\">click here</a>.</p>"
-                        f"{enrollment_block}"
-                        "</body></html>"
-                    ).encode()
-                )
-                print(
-                    f"group-gate: STEPUP user={user} host={host} policy={policy} "
-                    f"acr={acr!r} amr={amr} reason={reason!r}",
-                    flush=True,
-                )
+                self._stepup(host, subdomain, user, policy, required_loa, acr, amr, reason)
                 return
 
+            # --- mTLS binding: amr=mtls is only as good as the cert used NOW ---
+            if policy_relies_on_mtls(policy, amr):
+                session_user = claims.get("preferred_username")
+                cert_cn = leaf_cert_cn(cert_info) if cert_info else None
+                problem = None
+                if not cert_info or not cert_serials:
+                    problem = "no client certificate on this request"
+                elif not isinstance(session_user, str) or not session_user:
+                    problem = "token has no preferred_username"
+                elif cert_cn is None or cert_cn != session_user:
+                    problem = f"client cert CN {cert_cn!r} != session user {session_user!r}"
+                if problem:
+                    self._stepup(
+                        host, subdomain, user, policy, FACTOR_TO_LOA["mtls"], acr, amr,
+                        f"mtls binding: {problem}",
+                        "<p><b>" + e_sub + "</b> requires your client certificate (security key) on "
+                        "every request, and it must belong to the signed-in user. Insert your "
+                        "security key, select its certificate when the browser asks, and sign in again.</p>",
+                    )
+                    return
+
         # --- Group check ---
-        required_group = gate.get(subdomain)
-        if not required_group:
-            print(f"group-gate: ALLOW-UNMAPPED user={user} host={host} (no group mapping for {subdomain!r})", flush=True)
-            self._allow()
-            return
+        if not authenticated_only:
+            required_group = gate.get(subdomain)
+            if required_group == DENY_GROUP:
+                self._deny(
+                    "Access Denied",
+                    f"<p>The configuration of <b>{e_sub}</b> is unavailable, so access is denied. "
+                    "Ask an administrator to check the app in the Hub.</p>",
+                    f"DENIED user={user} host={host} reason=app configuration unavailable ({DENY_GROUP})",
+                )
+                return
+            if not required_group:
+                print(f"group-gate: ALLOW-UNMAPPED user={user} host={host} (no group mapping for {subdomain!r})", flush=True)
+            elif required_group not in groups:
+                self._deny(
+                    "Access Denied",
+                    f"<p>User <b>{e_user}</b> is not authorized to access <b>{e_sub}</b>.</p>"
+                    f"<p>Required group: <code>{html.escape(required_group)}</code></p>",
+                    f"DENIED user={user} host={host} need={required_group} have={sorted(groups)}",
+                )
+                return
+        else:
+            uid = self.headers.get("X-Auth-Request-User", "") or self.headers.get("X-Auth-Request-Email", "")
+            if not uid:
+                self._deny("Access Denied", "<p>Not signed in.</p>",
+                           f"DENIED host={host} reason=authenticated-only route without a user")
+                return
 
-        groups_raw = self.headers.get("X-Auth-Request-Groups", "")
-        groups = {g.strip() for g in groups_raw.split(",") if g.strip()}
-        if required_group in groups:
-            self._allow()
-            return
+        # --- Path groups (in addition to the subdomain group) ---
+        if path_rules:
+            raw_uri = self.headers.get("X-Forwarded-Uri", "")
+            try:
+                candidates = normalize_path_candidates(raw_uri)
+            except PathError as e:
+                self._deny(
+                    "Access Denied",
+                    "<p>The request path is not acceptable.</p>",
+                    f"DENIED user={user} host={host} uri={raw_uri!r} reason=path: {e}",
+                )
+                return
+            for need in required_path_groups(path_rules, candidates):
+                if need == DENY_GROUP or need not in groups:
+                    self._deny(
+                        "Access Denied",
+                        f"<p>User <b>{e_user}</b> is not authorized to access this part of <b>{e_sub}</b>.</p>"
+                        f"<p>Required group: <code>{html.escape(need)}</code></p>",
+                        f"DENIED user={user} host={host} path={candidates[0]!r} need={need} have={sorted(groups)}",
+                    )
+                    return
 
-        self._deny(
-            "Access Denied",
-            f"<p>User <b>{e_user}</b> is not authorized to access <b>{e_sub}</b>.</p>"
-            f"<p>Required group: <code>{html.escape(required_group)}</code></p>",
-            f"DENIED user={user} host={host} need={required_group} have={sorted(groups)}",
-        )
+        self._allow()
 
     def log_message(self, fmt, *args):
         # Default per-request logs are noisy; explicit logging above.
