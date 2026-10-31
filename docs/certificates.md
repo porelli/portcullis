@@ -92,8 +92,45 @@ Most apps end up on `authaware` with a default policy of "any of mTLS / WebAuthn
 **Issuing client certificates:**
 
 1. Users enroll their YubiKey PIV slot via the Enrollment UI (`enroll.<domain>`)
-2. The Enrollment UI signs a CSR using Vault's PKI engine
+2. The Enrollment UI signs a CSR using Vault's PKI engine (with a least-privilege AppRole, see below)
 3. Certificates are short-lived (24 hours) and automatically renewable
+
+### Revoking client certificates
+
+```bash
+./scripts/revoke-cert.sh --list          # find the serial
+./scripts/revoke-cert.sh <serial>        # revoke (add --yes to skip the prompt)
+./scripts/revoke-cert.sh --sync          # rewrite the serial list from Vault
+```
+
+**Traefik does not check CRLs** — a TLS handshake with a revoked-but-unexpired cert still succeeds. Revocation is enforced by **group-gate** (`portcullis-groups@docker`): `client-headers@file` (Traefik `passTLSClientCert`, with `serialNumber: true`) passes `X-Forwarded-Tls-Client-Cert-Info` to the backend *and* to every later forward-auth middleware, and group-gate returns 403 when the cert's serial is revoked. Sources:
+
+- `certs/revocation/revoked-serials.txt` — rewritten atomically by `revoke-cert.sh` from Vault's list of revoked serials; checked on the next request. If Vault can't be queried (sealed, bad token, unreachable) the file is left unchanged and the script fails — it never "un-revokes" by writing an empty list.
+- Vault's CRL (`http://vault:8200/v1/pki_int/crl`), re-fetched every 60 s — also covers revocations made directly through the Vault API/UI. If Vault is unreachable the last good CRL is kept.
+
+Coverage: every router whose middleware chain has `client-headers@file` **before** `portcullis-groups@docker` (all core routers and the default app templates). **Not covered:** routers that rely on the TLS client cert alone (e.g. a `protected`-tier router without `portcullis-groups@docker`) — the 24 h cert lifetime bounds the exposure there — and Keycloak sessions that were already opened with the cert (sign the user out in the Keycloak admin console, or enable CRL checking in the realm's X.509 authenticator).
+
+## Vault storage, unsealing & tokens
+
+Vault runs in **server mode** with integrated (raft) storage on the `vault_data` volume (`vault/vault.hcl`), so the CA survives restarts. The listener is plain HTTP on the internal `portcullis` network and `127.0.0.1:8200` on the host only.
+
+`./scripts/vault-init.sh` (run by `bootstrap.sh`, `upgrade.sh` and `restore.sh`; idempotent) does:
+
+1. **Init** (first run only) with **one key share, threshold 1**, writing to `secrets/` (dir `0700`, files `0600`, gitignored):
+   - `secrets/vault-init.json` — root token + unseal key (`vault operator init` output)
+   - `secrets/vault-unseal/unseal-key` — mounted read-only into the vault container
+2. **Unseal**. Afterwards `vault/entrypoint.sh` unseals automatically on every container start (`docker compose up`, restart, host reboot).
+3. **Least privilege for enroll**: AppRole `portcullis-enroll` with policy `vault/policies/enroll.hcl` (only `pki_int/sign/client-cert`, list `pki_int/certs`, read `pki_int/cert/*`). Credentials in `secrets/enroll/` are mounted read-only into enroll, which logs in for 1 h tokens and logs in again before expiry or on 403 — there is no static or root token in `.env` any more. Rotate with `./scripts/vault-init.sh --rotate-enroll-secret`.
+
+Admin scripts (`setup-vault-pki.sh`, `enroll-yubikey.sh`, `renew-yubikey.sh`, `revoke-cert.sh`, `status.sh`) use the root token from `secrets/vault-init.json`, or `VAULT_TOKEN` if exported. They use the host `vault` CLI if installed, otherwise the CLI inside the vault container (token passed by environment-variable name, never on the command line). `secrets/` and `backups/` are masked from the Hub container with empty tmpfs mounts.
+
+`setup-vault-pki.sh` is idempotent: it does nothing when the root issuer, intermediate issuer and `client-cert` role all exist; if it finds an incomplete PKI (an earlier run aborted) it wipes and recreates it; any Vault error aborts instead of being mistaken for "no PKI". `certs/server.key` is written `0600`.
+
+**Trade-off.** The unseal key lives on the same host as the encrypted data, so root on the host (or anyone who can read `secrets/`) can unseal Vault. What it does protect: a copy of the `vault_data` volume alone is useless. Multiple Shamir shares on the same disk would add nothing, hence one share. For stronger guarantees remove the `secrets/vault-unseal` mount and unseal manually (`docker compose exec vault vault operator unseal`) after each restart, or use a cloud KMS auto-unseal. **Keep an offline copy of `secrets/vault-init.json`** — backups made by `upgrade.sh` include `secrets/`, so protect them like the keys themselves.
+
+### Upgrading from dev-mode Vault
+
+Older releases ran Vault in dev mode (in-memory, root token `myroot`). The CA keys were generated `internal` (non-exportable) inside that in-memory Vault, so they **cannot be migrated**. `./scripts/upgrade.sh` detects dev mode and stops unless you pass `--migrate-vault` (or confirm interactively). Migrating creates a new root + intermediate CA, rewrites `certs/root-ca.crt`, `certs/intermediate-ca.crt`, `certs/ca-chain.crt` (and `server.crt`/`server.key` if present; the old files are copied to `backups/certs-before-vault-migration-*`), and **every YubiKey client certificate must be re-enrolled**. WebAuthn logins are unaffected. `VAULT_DEV_TOKEN` in `.env` is no longer used and can be deleted.
 
 ### Disabled (`MTLS_ENABLED=false`)
 

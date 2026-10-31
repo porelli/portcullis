@@ -1,9 +1,12 @@
+# Smoke-test apps. Run as a separate project AFTER the core stack is up
+# (it creates portcullis-proxy with its fixed IPAM config):
+#   docker compose -p portcullis-test -f docker-compose.test.yml up -d
 services:
   # Public app — no auth, tests DNS + TLS cert
   whoami-public:
     image: traefik/whoami
     networks:
-      - portcullis
+      - portcullis-proxy
     labels:
       traefik.enable: "true"
       traefik.http.routers.whoami-public.rule: Host(`test.${PORTCULLIS_DOMAIN:-portcullis.local}`)
@@ -16,15 +19,17 @@ services:
   whoami-auth:
     image: traefik/whoami
     networks:
-      - portcullis
+      - portcullis-proxy
     labels:
       traefik.enable: "true"
       traefik.http.routers.whoami-auth.rule: Host(`app.${PORTCULLIS_DOMAIN:-portcullis.local}`)
       traefik.http.routers.whoami-auth.entrypoints: websecure
       traefik.http.routers.whoami-auth.tls.options: authaware@file
-      traefik.http.routers.whoami-auth.middlewares: client-headers@file,portcullis-auth@docker,security-headers@file
+      traefik.http.routers.whoami-auth.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.services.whoami-auth.loadbalancer.server.port: "80"
 
+# Apps join the shared routing plane only, never the core `portcullis`
+# network (see CLAUDE.md). Start the core stack first so it exists.
 networks:
-  portcullis:
+  portcullis-proxy:
     external: true

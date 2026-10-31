@@ -6,10 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   PORTCULLIS_DOMAIN: portcullis.local
   ACME_EMAIL: ci@portcullis.local
-  VAULT_DEV_TOKEN: ci-test-token
   KEYCLOAK_ADMIN: admin
   KEYCLOAK_ADMIN_PASSWORD: ci-admin-pass
   POSTGRES_PASSWORD: ci-pg-pass
@@ -17,23 +19,41 @@ env:
   LLDAP_JWT_SECRET: ci-jwt-secret-value
   LLDAP_BASE_DN: dc=portcullis,dc=local
   FORWARD_AUTH_CLIENT_SECRET: ci-forward-auth-secret
-  FORWARD_AUTH_SECRET: ci-forward-auth-cookie-secret
+  FORWARD_AUTH_COOKIE_SECRET: ci-forward-auth-cookie-secret-32
   CLOUDFLARE_API_TOKEN: ""
+  # Every plain `docker compose` call (incl. the ones inside scripts/) uses
+  # the core file + the CI override written below.
+  COMPOSE_FILE: docker-compose.yml:docker-compose.ci.yml
+  VAULT_ADDR: http://127.0.0.1:8200
+  TRAEFIK_IP: 172.31.250.2
 
 jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: group-gate unit tests
+        run: python3 tests/test_group_gate.py
+      - name: shell library tests (proxy network, revocation sync)
+        run: bash tests/test_shell_libs.sh
+      - name: enroll unit tests
+        working-directory: enroll
+        run: |
+          docker run --rm -e CGO_ENABLED=0 -v "$PWD:/src" -w /src golang:1.27-alpine sh -c 'go vet ./... && go test ./...'
+
   build-and-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Create .env file
         run: |
           cat > .env <<'ENVEOF'
           PORTCULLIS_DOMAIN=portcullis.local
           ACME_EMAIL=ci@portcullis.local
-          VAULT_DEV_TOKEN=ci-test-token
           KEYCLOAK_ADMIN=admin
           KEYCLOAK_ADMIN_PASSWORD=ci-admin-pass
           POSTGRES_PASSWORD=ci-pg-pass
@@ -41,15 +61,22 @@ jobs:
           LLDAP_JWT_SECRET=ci-jwt-secret-value
           LLDAP_BASE_DN=dc=portcullis,dc=local
           FORWARD_AUTH_CLIENT_SECRET=ci-forward-auth-secret
-          FORWARD_AUTH_SECRET=ci-forward-auth-cookie-secret
+          FORWARD_AUTH_COOKIE_SECRET=ci-forward-auth-cookie-secret-32
           CLOUDFLARE_API_TOKEN=
+          PORTCULLIS_PROXY_SUBNET=172.31.250.0/24
+          PORTCULLIS_PROXY_IP_RANGE=172.31.250.128/25
+          PORTCULLIS_TRAEFIK_IP=172.31.250.2
           ENVEOF
           # Strip leading whitespace from heredoc
           sed -i 's/^[[:space:]]*//' .env
 
       - name: Create directories and CI compose override
         run: |
-          mkdir -p certs
+          # Bind-mount sources must exist before compose, or Docker creates
+          # them root-owned and the scripts can't write into them.
+          mkdir -p certs/revocation templates backups
+          : > certs/revocation/revoked-serials.txt
+          (umask 077 && mkdir -p secrets/vault-unseal secrets/enroll)
           cat > docker-compose.ci.yml <<'YML'
           services:
             keycloak:
@@ -60,65 +87,79 @@ jobs:
             lldap:
               ports:
                 - "127.0.0.1:17170:17170"
+            group-gate:
+              environment:
+                # Faster CRL refresh so the CRL-only revocation test is quick.
+                GATE_CRL_REFRESH_SECONDS: "3"
           YML
           sed -i 's/^          //' docker-compose.ci.yml
+          docker compose config -q
 
       - name: Build enrollment UI
-        run: docker compose -f docker-compose.yml -f docker-compose.ci.yml build enroll
+        run: docker compose build enroll
 
       - name: Start core services (without Traefik ACME)
-        run: |
-          docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d postgres vault lldap
-          echo "Waiting for core services..."
-          sleep 10
+        run: docker compose up -d postgres lldap
 
-      - name: Wait for Vault
+      - name: Initialize and unseal Vault (server mode)
         run: |
-          for i in $(seq 1 30); do
-            if docker compose exec -T vault vault status > /dev/null 2>&1; then
-              echo "Vault is ready"
-              break
-            fi
-            echo "Waiting for Vault... ($i/30)"
-            sleep 2
+          ./scripts/vault-init.sh
+          test "$(stat -c %a secrets)" = 700 || { echo "FAIL: secrets/ is not 0700"; exit 1; }
+          for f in secrets/vault-init.json secrets/vault-unseal/unseal-key secrets/enroll/role-id secrets/enroll/secret-id; do
+            test -s "$f" || { echo "FAIL: $f missing"; exit 1; }
+            test "$(stat -c %a "$f")" = 600 || { echo "FAIL: $f is not 0600"; exit 1; }
           done
+          docker compose exec -T vault vault status -format=json | jq -e '.sealed == false and .storage_type == "raft"' \
+            || { echo "FAIL: Vault not unsealed / not on raft storage"; exit 1; }
+          if docker compose config --format json | jq -e '[.services[] | (.environment // {}) | keys[]] | any(startswith("VAULT_DEV"))' >/dev/null; then
+            echo "FAIL: compose still sets VAULT_DEV_* variables"; exit 1
+          fi
+          # Idempotent: a second run must not re-init or rotate anything.
+          SID_BEFORE=$(sha256sum secrets/enroll/secret-id)
+          ./scripts/vault-init.sh
+          test "$SID_BEFORE" = "$(sha256sum secrets/enroll/secret-id)" || { echo "FAIL: re-run rotated secret-id"; exit 1; }
+          echo "PASS: Vault initialised, unsealed, secrets owner-only, re-run idempotent"
+
+      - name: Install Vault CLI (copied from the pinned Vault image)
+        run: |
+          # Same binary as the server, integrity covered by the image pull —
+          # no unverified download from releases.hashicorp.com.
+          docker compose exec -T vault sh -c 'cat "$(command -v vault)"' > /tmp/vault
+          sudo install -m 0755 /tmp/vault /usr/local/bin/vault
+          vault version
 
       - name: Wait for PostgreSQL
         run: |
           for i in $(seq 1 30); do
             if docker compose exec -T postgres pg_isready -U keycloak > /dev/null 2>&1; then
-              echo "PostgreSQL is ready"
-              break
+              echo "PostgreSQL is ready"; exit 0
             fi
             echo "Waiting for PostgreSQL... ($i/30)"
             sleep 2
           done
+          echo "FAIL: PostgreSQL not ready"; exit 1
 
       - name: Wait for LLDAP
         run: |
           for i in $(seq 1 30); do
             if docker compose exec -T lldap /app/lldap healthcheck --config-file /data/lldap_config.toml > /dev/null 2>&1; then
-              echo "LLDAP is ready"
-              break
+              echo "LLDAP is ready"; exit 0
             fi
             echo "Waiting for LLDAP... ($i/30)"
             sleep 2
           done
+          echo "FAIL: LLDAP not ready"; exit 1
 
       - name: Initialize Vault PKI
         run: |
-          export VAULT_ADDR=http://127.0.0.1:8200
-          export VAULT_TOKEN=$VAULT_DEV_TOKEN
           export DOMAIN=$PORTCULLIS_DOMAIN
           export CERT_DIR=./certs
-          mkdir -p "$CERT_DIR"
-
-          # Install vault CLI
-          curl -fsSL https://releases.hashicorp.com/vault/1.15.4/vault_1.15.4_linux_amd64.zip -o vault.zip
-          unzip -o vault.zip -d /usr/local/bin/
-          rm vault.zip
-
+          # Root token is read from secrets/vault-init.json by the script.
           ./scripts/setup-vault-pki.sh --with-server-cert
+          # Second run must be a no-op (would otherwise replace the CA).
+          BEFORE=$(sha256sum certs/root-ca.crt)
+          ./scripts/setup-vault-pki.sh --with-server-cert
+          test "$BEFORE" = "$(sha256sum certs/root-ca.crt)" || { echo "FAIL: re-run replaced the CA"; exit 1; }
 
       - name: Verify CA chain created
         run: |
@@ -135,9 +176,42 @@ jobs:
           openssl verify -CAfile certs/ca-chain.crt certs/server.crt
           echo "PASS: Certificate chain is valid"
 
+      - name: Test Vault persistence and auto-unseal across restart
+        run: |
+          VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
+          CA_BEFORE=$(vault read -field=certificate pki_int/cert/ca | sha256sum)
+          docker compose restart vault
+          # Wait for unsealed AND active (raft leader), not just unsealed.
+          # shellcheck source=/dev/null
+          source scripts/lib/vault-common.sh
+          vault_wait_active 60 || { echo "FAIL: Vault did not auto-unseal / become active"; docker compose logs --tail=30 vault; exit 1; }
+          CA_AFTER=$(vault read -field=certificate pki_int/cert/ca | sha256sum)
+          test "$CA_BEFORE" = "$CA_AFTER" || { echo "FAIL: PKI changed/lost across restart"; exit 1; }
+          echo "PASS: Vault auto-unsealed after restart and kept its PKI"
+
+      - name: Test enroll AppRole is least-privilege
+        run: |
+          TOKEN=$(vault write -field=token auth/approle/login \
+            role_id="$(cat secrets/enroll/role-id)" secret_id="$(cat secrets/enroll/secret-id)")
+          export VAULT_TOKEN="$TOKEN"
+          vault list pki_int/certs >/dev/null || { echo "FAIL: enroll token cannot list certs"; exit 1; }
+          for denied in "write -f pki/root/generate/internal common_name=x" \
+                        "write pki_int/issue/server-cert common_name=x.portcullis.local" \
+                        "write pki_int/revoke serial_number=00" \
+                        "read sys/auth" \
+                        "policy write evil -"; do
+            # shellcheck disable=SC2086
+            if echo 'path "*" { capabilities = ["sudo"] }' | vault $denied >/dev/null 2>&1; then
+              echo "FAIL: enroll token was allowed: vault $denied"; exit 1
+            fi
+          done
+          TTL=$(vault token lookup -format=json | jq -r .data.ttl)
+          [ "$TTL" -gt 0 ] && [ "$TTL" -le 3600 ] || { echo "FAIL: enroll token TTL $TTL not short-lived"; exit 1; }
+          echo "PASS: enroll token can only use its PKI paths (ttl ${TTL}s)"
+
       - name: Start Keycloak
         run: |
-          docker compose -f docker-compose.yml -f docker-compose.ci.yml up -d keycloak
+          docker compose up -d keycloak
           echo "Waiting for Keycloak to start..."
           for i in $(seq 1 90); do
             if curl -sf http://localhost:9000/health/ready > /dev/null 2>&1; then
@@ -269,8 +343,7 @@ jobs:
 
       - name: Test Vault client certificate issuance
         run: |
-          export VAULT_ADDR=http://127.0.0.1:8200
-          export VAULT_TOKEN=$VAULT_DEV_TOKEN
+          VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
 
           # Generate a test key and CSR
           openssl ecparam -name prime256v1 -genkey -noout -out /tmp/test-client.key
@@ -289,6 +362,7 @@ jobs:
 
           if [ -n "$SERIAL" ] && [ "$SERIAL" != "null" ]; then
             echo "PASS: Client certificate issued (serial: $SERIAL)"
+            echo "$SERIAL" > /tmp/test-client.serial
           else
             echo "FAIL: Certificate issuance failed"
             echo "$RESULT"
@@ -309,100 +383,139 @@ jobs:
           openssl verify -CAfile certs/ca-chain.crt /tmp/test-client.crt
           echo "PASS: Client certificate validates against CA chain"
 
-      - name: Test mTLS authentication with client cert
+          # A cert from an unrelated CA, for negative mTLS tests
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+            -keyout /tmp/foreign.key -out /tmp/foreign.crt -subj "/CN=testuser" -days 1
+
+      - name: Start Traefik, group-gate and the mTLS test app
         run: |
-          # Start Traefik (skip ACME in CI — use self-signed certs)
-          # Override traefik config for CI: disable ACME, use file certs
-          cat > traefik/dynamic/ci-certs.yml <<EOF
+          # CI has no ACME: serve the Vault-issued wildcard cert from the file provider.
+          cat > traefik/dynamic/ci-certs.yml <<'EOF'
           tls:
             certificates:
               - certFile: /certs/server.crt
                 keyFile: /certs/server.key
           EOF
+          # Test app on portcullis-proxy: one router on the protected tier
+          # (cert required), one on authaware gated by group-gate.
+          cat > /tmp/ci-mtls.yml <<'YML'
+          services:
+            whoami:
+              image: traefik/whoami
+              networks: [portcullis-proxy]
+              labels:
+                traefik.enable: "true"
+                traefik.http.services.ci-whoami.loadbalancer.server.port: "80"
+                traefik.http.routers.ci-mtls.rule: Host(`mtls.portcullis.local`)
+                traefik.http.routers.ci-mtls.entrypoints: websecure
+                traefik.http.routers.ci-mtls.tls.options: protected@file
+                traefik.http.routers.ci-mtls.middlewares: client-headers@file
+                traefik.http.routers.ci-mtls.service: ci-whoami
+                traefik.http.routers.ci-gated.rule: Host(`gated.portcullis.local`)
+                traefik.http.routers.ci-gated.entrypoints: websecure
+                traefik.http.routers.ci-gated.tls.options: authaware@file
+                traefik.http.routers.ci-gated.middlewares: client-headers@file,portcullis-groups@docker
+                traefik.http.routers.ci-gated.service: ci-whoami
+          networks:
+            portcullis-proxy:
+              external: true
+          YML
+          docker compose up -d traefik group-gate enroll
+          docker compose -p ci-mtls -f /tmp/ci-mtls.yml up -d
 
-          docker compose up -d traefik
-          sleep 5
+          TRAEFIK_CID=$(docker compose ps -q traefik)
+          GOT_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis-proxy").IPAddress}}' "$TRAEFIK_CID")
+          test "$GOT_IP" = "$TRAEFIK_IP" || { echo "FAIL: Traefik IP on portcullis-proxy is $GOT_IP, want $TRAEFIK_IP"; exit 1; }
+          docker network inspect portcullis-proxy | jq -e '.[0].IPAM.Config[0] | .Subnet == "172.31.250.0/24" and .IPRange == "172.31.250.128/25"' \
+            || { echo "FAIL: portcullis-proxy IPAM config"; exit 1; }
+          WHOAMI_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis-proxy").IPAddress}}' "$(docker compose -p ci-mtls -f /tmp/ci-mtls.yml ps -q whoami)")
+          # shellcheck source=/dev/null
+          source scripts/lib/proxy-network.sh
+          cidr_contains 172.31.250.128/25 "$WHOAMI_IP" || { echo "FAIL: app IP $WHOAMI_IP outside the dynamic range"; exit 1; }
+          echo "PASS: Traefik pinned to $GOT_IP, apps get dynamic IPs ($WHOAMI_IP)"
 
-          # Start enrollment UI
-          docker compose up -d enroll
-          sleep 5
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt \
+              --cert /tmp/test-client.crt --key /tmp/test-client.key \
+              --resolve "mtls.portcullis.local:443:127.0.0.1" https://mtls.portcullis.local/ || true)
+            [ "$code" = 200 ] && break
+            if [ "$i" -eq 30 ]; then echo "FAIL: routers not ready (last code $code)"; docker compose logs --tail=40 traefik; exit 1; fi
+            sleep 2
+          done
 
-          # Test mTLS with the client cert we just issued
-          # (We need to trust our self-signed CA)
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            --cacert certs/ca-chain.crt \
-            --cert /tmp/test-client.crt \
-            --key /tmp/test-client.key \
-            --resolve "enroll.portcullis.local:443:127.0.0.1" \
-            https://enroll.portcullis.local/ 2>/dev/null || echo "000")
+      - name: Test mTLS authentication with client cert
+        run: |
+          mtls() { curl -s -o /tmp/mtls.out -w '%{http_code}' --cacert certs/ca-chain.crt \
+                     --resolve "$1:443:127.0.0.1" "${@:2}" "https://$1/" || true; }
 
-          if [ "$HTTP_CODE" = "200" ]; then
-            echo "PASS: mTLS connection to enrollment UI successful"
-          else
-            echo "INFO: mTLS test returned $HTTP_CODE (may be expected in CI networking)"
-          fi
+          code=$(mtls mtls.portcullis.local)
+          [ "$code" = 000 ] || { echo "FAIL: protected tier accepted a request WITHOUT client cert ($code)"; exit 1; }
+          echo "PASS: protected tier rejects missing client cert"
+
+          code=$(mtls mtls.portcullis.local --cert /tmp/foreign.crt --key /tmp/foreign.key)
+          [ "$code" = 000 ] || { echo "FAIL: protected tier accepted a cert from a foreign CA ($code)"; exit 1; }
+          echo "PASS: protected tier rejects foreign-CA client cert"
+
+          code=$(mtls gated.portcullis.local --cert /tmp/foreign.crt --key /tmp/foreign.key)
+          [ "$code" = 000 ] || { echo "FAIL: authaware tier accepted a cert from a foreign CA ($code)"; exit 1; }
+          echo "PASS: authaware tier rejects foreign-CA client cert"
+
+          code=$(mtls mtls.portcullis.local --cert /tmp/test-client.crt --key /tmp/test-client.key)
+          [ "$code" = 200 ] || { echo "FAIL: valid client cert got $code"; cat /tmp/mtls.out; exit 1; }
+          grep -qi '^X-Forwarded-Tls-Client-Cert-Info:.*SerialNumber' /tmp/mtls.out \
+            || { echo "FAIL: backend did not get cert info with SerialNumber"; cat /tmp/mtls.out; exit 1; }
+          grep -q "^RemoteAddr: $TRAEFIK_IP:" /tmp/mtls.out \
+            || { echo "FAIL: backend saw requests from a non-Traefik IP"; cat /tmp/mtls.out; exit 1; }
+          echo "PASS: valid client cert accepted; backend sees cert info + Traefik's static IP"
+
+          code=$(mtls gated.portcullis.local --cert /tmp/test-client.crt --key /tmp/test-client.key)
+          [ "$code" = 200 ] || { echo "FAIL: group-gated router with valid cert got $code"; cat /tmp/mtls.out; exit 1; }
+          echo "PASS: group-gated router accepts valid, unrevoked cert"
 
       - name: Test enrollment UI responds
         run: |
-          # Test via Docker network directly
-          ENROLL_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
-            $(docker compose ps -q enroll) 2>/dev/null || echo "")
-
-          if [ -n "$ENROLL_IP" ]; then
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$ENROLL_IP:8443/" 2>/dev/null || echo "000")
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "PASS: Enrollment UI is serving pages"
-            else
-              echo "INFO: Enrollment UI returned $HTTP_CODE"
-              docker compose logs enroll | tail -20
-            fi
-          else
-            echo "INFO: Could not determine enrollment UI IP"
-          fi
+          ENROLL_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q enroll)")
+          test -n "$ENROLL_IP" || { echo "FAIL: no enroll IP on the portcullis network"; exit 1; }
+          echo "ENROLL_IP=$ENROLL_IP" >> "$GITHUB_ENV"
+          for _ in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://$ENROLL_IP:8443/" || true)
+            [ "$code" = 200 ] && { echo "PASS: Enrollment UI is serving pages"; exit 0; }
+            sleep 2
+          done
+          echo "FAIL: Enrollment UI returned $code"; docker compose logs --tail=30 enroll; exit 1
 
       - name: Test enrollment API - list users
         run: |
-          ENROLL_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
-            $(docker compose ps -q enroll) 2>/dev/null || echo "")
+          USERS=$(curl -sf "http://$ENROLL_IP:8443/api/users")
+          echo "$USERS" | jq -e 'type == "array" and any(.[]; .username == "testuser")' >/dev/null \
+            || { echo "FAIL: /api/users did not return testuser: $USERS"; exit 1; }
+          echo "PASS: Enrollment API returned $(echo "$USERS" | jq length) users"
 
-          if [ -n "$ENROLL_IP" ]; then
-            USERS=$(curl -s "http://$ENROLL_IP:8443/api/users" 2>/dev/null)
-            # Should return a JSON array (possibly empty or with our test user)
-            if echo "$USERS" | jq -e 'type == "array"' > /dev/null 2>&1; then
-              COUNT=$(echo "$USERS" | jq 'length')
-              echo "PASS: Enrollment API returned $COUNT users"
-            else
-              echo "INFO: Enrollment API response: $USERS"
-            fi
-          fi
-
-      - name: Test enrollment API - sign CSR
+      - name: Test enrollment API - sign CSR (AppRole token)
         run: |
-          ENROLL_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
-            $(docker compose ps -q enroll) 2>/dev/null || echo "")
-
-          if [ -n "$ENROLL_IP" ]; then
-            # Build JSON payload with properly escaped CSR
-            PAYLOAD=$(jq -n --arg csr "$(cat /tmp/test-client.csr)" \
-              '{username:"testuser",email:"testuser@portcullis.local",csr:$csr}')
-            RESPONSE=$(curl -s -X POST "http://$ENROLL_IP:8443/api/sign" \
-              -H "Content-Type: application/json" \
-              -d "$PAYLOAD" 2>/dev/null)
-
-            SERIAL=$(echo "$RESPONSE" | jq -r '.serial // empty')
-            if [ -n "$SERIAL" ]; then
-              echo "PASS: Enrollment API signed certificate (serial: $SERIAL)"
-            else
-              echo "INFO: Sign API response: $RESPONSE"
-            fi
+          PAYLOAD=$(jq -n --arg csr "$(cat /tmp/test-client.csr)" \
+            '{username:"testuser",email:"testuser@portcullis.local",csr:$csr}')
+          # Direct-to-container call bypasses Traefik, so supply the
+          # header Traefik would set from forward-auth for an admin.
+          RESPONSE=$(curl -s -X POST "http://$ENROLL_IP:8443/api/sign" \
+            -H "Content-Type: application/json" \
+            -H "X-Auth-Request-Groups: lldap_admin" \
+            -d "$PAYLOAD")
+          SERIAL=$(echo "$RESPONSE" | jq -r '.serial // empty' 2>/dev/null || true)
+          if [ -z "$SERIAL" ]; then
+            echo "FAIL: Sign API response: $RESPONSE"; docker compose logs --tail=30 enroll; exit 1
           fi
+          echo "PASS: Enrollment API signed certificate via its AppRole (serial: $SERIAL)"
+          # Non-admins must be refused
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://$ENROLL_IP:8443/api/sign" \
+            -H "Content-Type: application/json" -H "X-Auth-Request-Groups: users_x" -d "$PAYLOAD")
+          [ "$code" = 403 ] || { echo "FAIL: non-admin sign got $code"; exit 1; }
+          echo "PASS: non-admin sign refused"
 
       - name: Test Vault cert listing
         run: |
-          export VAULT_ADDR=http://127.0.0.1:8200
-          export VAULT_TOKEN=$VAULT_DEV_TOKEN
-
-          CERTS=$(vault list -format=json pki_int/certs 2>/dev/null | jq 'length')
+          VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
+          CERTS=$(vault list -format=json pki_int/certs | jq 'length')
           if [ "$CERTS" -gt 0 ]; then
             echo "PASS: Vault has $CERTS certificates issued"
           else
@@ -410,21 +523,35 @@ jobs:
             exit 1
           fi
 
-      - name: Test Traefik dashboard
+      - name: Test certificate revocation is enforced
         run: |
-          # Check Traefik API via Docker network
-          TRAEFIK_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
-            $(docker compose ps -q traefik) 2>/dev/null || echo "")
+          gated() { curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt \
+                      --resolve "gated.portcullis.local:443:127.0.0.1" \
+                      --cert "$1.crt" --key "$1.key" https://gated.portcullis.local/ || true; }
 
-          if [ -n "$TRAEFIK_IP" ]; then
-            # Traefik API on port 8080 (internal)
-            ROUTERS=$(curl -s "http://$TRAEFIK_IP:8080/api/http/routers" 2>/dev/null | jq 'length' 2>/dev/null || echo "0")
-            if [ "$ROUTERS" -gt 0 ]; then
-              echo "PASS: Traefik has $ROUTERS routers configured"
-            else
-              echo "INFO: Could not query Traefik API"
-            fi
-          fi
+          # 1) revoke-cert.sh → serial file → immediate denial
+          SERIAL=$(cat /tmp/test-client.serial)
+          ./scripts/revoke-cert.sh --yes "$SERIAL"
+          grep -qi "^$SERIAL\$" certs/revocation/revoked-serials.txt || { echo "FAIL: serial not in revoked-serials.txt"; exit 1; }
+          code=$(gated /tmp/test-client)
+          [ "$code" = 403 ] || { echo "FAIL: revoked cert (serial file) got $code"; docker compose logs --tail=20 group-gate; exit 1; }
+          echo "PASS: cert revoked via revoke-cert.sh is denied"
+
+          # 2) revoke directly in Vault (no file update) → CRL refresh → denial
+          VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
+          openssl ecparam -name prime256v1 -genkey -noout -out /tmp/c2.key
+          openssl req -new -key /tmp/c2.key -subj "/CN=testuser" -out /tmp/c2.csr
+          R=$(vault write -format=json pki_int/sign/client-cert csr="$(cat /tmp/c2.csr)" common_name=testuser ttl=1h)
+          echo "$R" | jq -r .data.certificate > /tmp/c2.crt
+          code=$(gated /tmp/c2)
+          [ "$code" = 200 ] || { echo "FAIL: fresh cert got $code"; exit 1; }
+          vault write pki_int/revoke serial_number="$(echo "$R" | jq -r .data.serial_number)" >/dev/null
+          for _ in $(seq 1 20); do
+            code=$(gated /tmp/c2)
+            [ "$code" = 403 ] && { echo "PASS: cert revoked in Vault is denied via CRL"; exit 0; }
+            sleep 1
+          done
+          echo "FAIL: cert revoked in Vault still accepted ($code)"; docker compose logs --tail=20 group-gate; exit 1
 
       - name: Collect service status
         if: always()
@@ -433,7 +560,7 @@ jobs:
           docker compose ps
           echo ""
           echo "=== Service Logs (last 10 lines each) ==="
-          for svc in traefik keycloak vault lldap enroll postgres forward-auth; do
+          for svc in traefik keycloak vault lldap enroll postgres group-gate; do
             echo "--- $svc ---"
             docker compose logs --tail=10 "$svc" 2>/dev/null || echo "(not running)"
             echo ""
@@ -441,4 +568,6 @@ jobs:
 
       - name: Cleanup
         if: always()
-        run: docker compose down -v
+        run: |
+          docker compose -p ci-mtls -f /tmp/ci-mtls.yml down 2>/dev/null || true
+          docker compose down -v

@@ -3,12 +3,24 @@ name: portcullis
 networks:
   portcullis:
     name: portcullis
+  # Shared routing plane (Traefik + app frontends). Fixed IPAM so Traefik
+  # has a well-known address: header-auth apps (grafana, firefly-iii, ...)
+  # trust X-Forwarded-User / X-WEBAUTH-USER only from PORTCULLIS_TRAEFIK_IP.
+  # Dynamic container addresses come from PORTCULLIS_PROXY_IP_RANGE, which
+  # must lie inside the subnet and must NOT contain PORTCULLIS_TRAEFIK_IP —
+  # so no app container can ever be handed Traefik's address.
+  # Changing these on an existing install needs the network recreated:
+  # ./scripts/upgrade.sh does that automatically.
   portcullis-proxy:
     name: portcullis-proxy
+    ipam:
+      config:
+        - subnet: ${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24}
+          ip_range: ${PORTCULLIS_PROXY_IP_RANGE:-172.31.250.128/25}
 
 services:
   traefik:
-    image: traefik:v3.6
+    image: traefik:v3.7
     environment:
       # Static configuration (env vars are the sole config source)
       TRAEFIK_API_DASHBOARD: "true"
@@ -62,8 +74,9 @@ services:
       - ./certs:/certs:ro
       - traefik_acme:/acme
     networks:
-      - portcullis
-      - portcullis-proxy
+      portcullis: {}
+      portcullis-proxy:
+        ipv4_address: ${PORTCULLIS_TRAEFIK_IP:-172.31.250.2}
     labels:
       traefik.enable: "true"
       traefik.http.routers.dashboard.rule: Host(`traefik.${PORTCULLIS_DOMAIN:-portcullis.local}`)
@@ -100,26 +113,34 @@ services:
     restart: unless-stopped
 
   vault:
-    image: hashicorp/vault:1.21
-    cap_add:
-      - IPC_LOCK
+    image: hashicorp/vault:2.2
+    # Server mode with raft storage (vault/vault.hcl). The wrapper starts
+    # Vault and auto-unseals it on every container start from
+    # secrets/vault-unseal/unseal-key (written by scripts/vault-init.sh).
+    entrypoint: ["/bin/sh", "/vault/portcullis/entrypoint.sh"]
     environment:
-      VAULT_DEV_ROOT_TOKEN_ID: ${VAULT_DEV_TOKEN:-myroot}
-      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
       VAULT_ADDR: "http://127.0.0.1:8200"
+      # disable_mlock = true in vault.hcl (recommended for raft) — no
+      # IPC_LOCK capability needed, so skip the image's setcap step.
+      SKIP_SETCAP: "true"
     ports:
-      - "8200:8200"
+      # Loopback only: host-side scripts (setup-vault-pki.sh, enroll-yubikey.sh,
+      # status.sh, ...) use http://127.0.0.1:8200. The listener is plain HTTP —
+      # never expose it on 0.0.0.0.
+      - "127.0.0.1:8200:8200"
     volumes:
       - vault_data:/vault/data
-      - ./scripts:/vault/scripts:ro
-      - ./certs:/vault/certs
+      - ./vault:/vault/portcullis:ro
+      - ./secrets/vault-unseal:/vault/unseal:ro
     networks:
       - portcullis
     healthcheck:
+      # Exit code 0 only when initialised AND unsealed.
       test: ["CMD", "vault", "status"]
       interval: 5s
       timeout: 3s
       retries: 5
+      start_period: 30s
     restart: unless-stopped
 
   lldap:
@@ -151,7 +172,7 @@ services:
     restart: unless-stopped
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.5
+    image: quay.io/keycloak/keycloak:26.8
     command:
       - start
       - --import-realm
@@ -190,8 +211,12 @@ services:
       traefik.http.routers.keycloak.middlewares: rate-limit-auth@file,client-headers@file,security-headers@file
       traefik.http.routers.keycloak.priority: "1"
       traefik.http.services.keycloak.loadbalancer.server.port: "8080"
-      # Admin console — protected behind forward-auth + group-gate (lldap_admin)
-      traefik.http.routers.keycloak-admin.rule: Host(`auth.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/admin`)
+      # Admin console + master realm — protected behind forward-auth + group-gate
+      # (auth=lldap_admin). /realms/master is the admin realm's login/token
+      # endpoint; it has no business being public. Scripts and the Hub reach
+      # the admin API over the internal network (http://keycloak:8080 or the
+      # 127.0.0.1:8080 publish), which bypasses Traefik.
+      traefik.http.routers.keycloak-admin.rule: Host(`auth.${PORTCULLIS_DOMAIN:-portcullis.local}`) && (PathPrefix(`/admin`) || PathPrefix(`/realms/master`))
       traefik.http.routers.keycloak-admin.entrypoints: websecure
       traefik.http.routers.keycloak-admin.tls.options: public@file
       traefik.http.routers.keycloak-admin.middlewares: rate-limit-auth@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
@@ -202,12 +227,10 @@ services:
         condition: service_healthy
       lldap:
         condition: service_healthy
-      vault:
-        condition: service_healthy
     restart: unless-stopped
 
   forward-auth:
-    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.2
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.5
     extra_hosts:
       - "auth.${PORTCULLIS_DOMAIN:-portcullis.local}:host-gateway"
     command: ["--alpha-config=/etc/oauth2-proxy/alpha.yaml"]
@@ -278,8 +301,19 @@ services:
       - ./scripts/group-gate-map.conf:/etc/group-gate/map.conf:ro
       # Hub writes per-app auth policies into this volume under group-gate-policy.json
       - hub_data:/hub-data:ro
+      # Revoked client-cert serials, written by scripts/revoke-cert.sh.
+      - ./certs/revocation:/etc/group-gate/revocation:ro
     environment:
       GATE_POLICY_FILE: /hub-data/group-gate-policy.json
+      # Client-cert revocation: requests whose TLS client cert (seen via
+      # client-headers@file → X-Forwarded-Tls-Client-Cert-Info) has a
+      # revoked serial are denied. Sources: the serial file above (instant)
+      # plus Vault's CRL (unauthenticated endpoint, refreshed periodically).
+      GATE_REVOKED_FILE: /etc/group-gate/revocation/revoked-serials.txt
+      GATE_CRL_URL: http://vault:8200/v1/pki_int/crl
+      # Requests whose X-Forwarded-Host is not <label>.<PORTCULLIS_DOMAIN>
+      # (after lowercasing / stripping port) are denied.
+      PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
     networks:
       - portcullis
     labels:
@@ -308,6 +342,24 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - .:/project:ro
+      # Writable overlay: before every `compose up` the Hub copies each app's
+      # template dir here, so `./templates/<app>/...` bind mounts in template
+      # compose files resolve to real files on the HOST (compose resolves them
+      # against --project-directory = this checkout). Generated, gitignored.
+      - ./templates:/project/templates:rw
+      # The Hub only needs /project/.env, /project/templates and the config
+      # file targets. Mask the Vault root token / unseal key (secrets/) and
+      # backups (which contain copies of secrets/ and .env) with empty
+      # tmpfs mounts. Both dirs are tracked via .gitkeep so the mountpoints
+      # always exist inside the read-only /project bind.
+      - type: tmpfs
+        target: /project/secrets
+        tmpfs:
+          size: 1048576
+      - type: tmpfs
+        target: /project/backups
+        tmpfs:
+          size: 1048576
       - hub_data:/data
       - ./.env:/project/.env:rw
     networks:
@@ -328,7 +380,10 @@ services:
       context: ./enroll
     environment:
       VAULT_ADDR: http://vault:8200
-      VAULT_TOKEN: ${VAULT_DEV_TOKEN:-myroot}
+      # Least-privilege AppRole (policy vault/policies/enroll.hcl), created
+      # by scripts/vault-init.sh. No static/root token.
+      VAULT_ROLE_ID_FILE: /run/secrets/portcullis-enroll/role-id
+      VAULT_SECRET_ID_FILE: /run/secrets/portcullis-enroll/secret-id
       LLDAP_URL: ldap://lldap:3890
       LLDAP_BASE_DN: ${LLDAP_BASE_DN:-dc=portcullis,dc=local}
       LLDAP_BIND_DN: uid=admin,ou=people,${LLDAP_BASE_DN:-dc=portcullis,dc=local}
@@ -343,6 +398,8 @@ services:
       traefik.http.routers.enroll.tls.options: authaware@file
       traefik.http.routers.enroll.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.services.enroll.loadbalancer.server.port: "8443"
+    volumes:
+      - ./secrets/enroll:/run/secrets/portcullis-enroll:ro
     depends_on:
       vault:
         condition: service_healthy

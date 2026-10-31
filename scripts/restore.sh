@@ -13,6 +13,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
+# Keycloak 26 serves /health/ready on the management port (9000), which is
+# not published — so ask Docker for the compose healthcheck status instead.
+keycloak_healthy() {
+  local cid
+  cid=$(docker compose ps -q keycloak 2>/dev/null | head -n1)
+  [ -n "$cid" ] || return 1
+  [ "$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$cid" 2>/dev/null)" = "healthy" ]
+}
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -77,9 +86,25 @@ fi
 if [ -f "$BACKUP_DIR/headscale-config.yaml" ]; then
   echo "  4. Replace headscale/config.yaml"
 fi
+if [ -d "$BACKUP_DIR/certs" ]; then
+  echo "  *  Replace certs/ (CA chain, server cert, revoked-serial list)"
+fi
+if [ -d "$BACKUP_DIR/secrets" ]; then
+  echo "  *  Replace secrets/ (Vault root token, unseal key, enroll AppRole creds)"
+fi
+# A vault_data archive is only usable together with the unseal key that
+# was current when it was taken. Backups from the dev-mode era have no
+# secrets/ (and an empty vault_data) — restoring them would wipe the
+# current Vault, so skip vault_data in that case.
+SKIP_VAULT_DATA=false
+if [ -f "$BACKUP_DIR/vault_data.tar.gz" ] && [ ! -d "$BACKUP_DIR/secrets" ]; then
+  SKIP_VAULT_DATA=true
+  warn "Backup has vault_data but no secrets/ (pre server-mode backup) — vault_data will NOT be restored."
+fi
 for vol_archive in "$BACKUP_DIR"/*.tar.gz; do
   [ -f "$vol_archive" ] || continue
   vol_name=$(basename "$vol_archive" .tar.gz)
+  [ "$vol_name" = vault_data ] && [ "$SKIP_VAULT_DATA" = true ] && continue
   echo "  *  Restore volume: $vol_name"
 done
 echo ""
@@ -94,9 +119,12 @@ esac
 
 PRE_RESTORE_DIR="backups/pre-restore-$(date +%Y%m%d-%H%M%S)"
 info "Saving current .env to $PRE_RESTORE_DIR/ (just in case)..."
-mkdir -p "$PRE_RESTORE_DIR"
-cp .env "$PRE_RESTORE_DIR/.env"
-ok "Current .env saved."
+# Backups and .env hold secrets — keep them owner-only.
+(umask 077 && mkdir -p "$PRE_RESTORE_DIR" && cp .env "$PRE_RESTORE_DIR/.env")
+# secrets/ holds the unseal key for the CURRENT vault_data — keep it too.
+[ -d secrets ] && (umask 077 && cp -a secrets "$PRE_RESTORE_DIR/secrets")
+[ -d certs ] && (umask 077 && cp -a certs "$PRE_RESTORE_DIR/certs")
+ok "Current .env, secrets/ and certs/ saved."
 
 # ── Stop services ──────────────────────────────────────────
 
@@ -107,7 +135,7 @@ ok "Services stopped."
 # ── Restore .env ───────────────────────────────────────────
 
 info "Restoring .env..."
-cp "$BACKUP_DIR/.env" .env
+(umask 077 && cp "$BACKUP_DIR/.env" .env && chmod 600 .env)
 ok ".env restored."
 
 # ── Restore config files ──────────────────────────────────
@@ -125,6 +153,21 @@ if [ -f "$BACKUP_DIR/headscale-config.yaml" ]; then
   ok "Headscale config restored."
 fi
 
+if [ -d "$BACKUP_DIR/certs" ]; then
+  info "Restoring certs/..."
+  rm -rf certs.restore-tmp && cp -a "$BACKUP_DIR/certs" certs.restore-tmp
+  rm -rf certs && mv certs.restore-tmp certs
+  ok "certs/ restored."
+fi
+
+if [ -d "$BACKUP_DIR/secrets" ]; then
+  info "Restoring secrets/ (Vault unseal key + tokens)..."
+  (umask 077 && rm -rf secrets.restore-tmp && cp -a "$BACKUP_DIR/secrets" secrets.restore-tmp)
+  rm -rf secrets && mv secrets.restore-tmp secrets
+  chmod 700 secrets
+  ok "secrets/ restored."
+fi
+
 # ── Restore volumes ───────────────────────────────────────
 
 set -a; source .env; set +a
@@ -132,6 +175,10 @@ set -a; source .env; set +a
 for vol_archive in "$BACKUP_DIR"/*.tar.gz; do
   [ -f "$vol_archive" ] || continue
   vol_name=$(basename "$vol_archive" .tar.gz)
+  if [ "$vol_name" = vault_data ] && [ "$SKIP_VAULT_DATA" = true ]; then
+    warn "Skipping vault_data (no matching secrets/ in this backup)."
+    continue
+  fi
 
   # Find the actual Docker volume name
   full_vol=$(docker compose config --format json 2>/dev/null | jq -r ".volumes.\"${vol_name}\".name // empty" 2>/dev/null || echo "")
@@ -157,7 +204,16 @@ done
 
 # ── Restart ────────────────────────────────────────────────
 
+# forward-auth bind-mounts certs/ca-bundle.crt — make sure it is a file.
+if [ ! -f certs/ca-bundle.crt ]; then
+  ./scripts/apply-config.sh --bundle-only
+fi
+
 info "Starting services..."
+# Vault first: it auto-unseals from secrets/vault-unseal/ on start;
+# vault-init.sh verifies that and refreshes the enroll AppRole creds.
+docker compose up -d --no-deps vault
+./scripts/vault-init.sh || warn "Vault init/unseal check failed — see above (does secrets/ match vault_data?)"
 docker compose up -d
 
 info "Waiting for services to be healthy..."
@@ -177,7 +233,7 @@ done
 
 printf "  Waiting for Keycloak..."
 for i in $(seq 1 60); do
-  if curl -sf http://localhost:8080/health/ready >/dev/null 2>&1; then
+  if keycloak_healthy; then
     echo -e " ${GREEN}ready${NC}"
     break
   fi

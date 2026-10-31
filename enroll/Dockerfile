@@ -1,12 +1,12 @@
-FROM golang:1.22-alpine AS builder
+FROM golang:1.27-alpine AS builder
 WORKDIR /app
-COPY go.mod ./
+COPY go.mod go.sum ./
+RUN go mod download
 COPY *.go ./
 COPY web/ ./web/
-RUN go mod tidy && go mod download
-RUN CGO_ENABLED=0 go build -o /enroll .
+RUN CGO_ENABLED=0 go build -trimpath -o /enroll .
 
-FROM alpine:3.19
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /enroll /usr/local/bin/enroll
 EXPOSE 8443

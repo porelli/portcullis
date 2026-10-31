@@ -78,9 +78,26 @@ fi
 
 VAULT_OK=false
 VAULT_CERTS_JSON="[]"
-if curl -sf "$VAULT_ADDR/v1/sys/health" >/dev/null 2>&1; then
+CERT_SERIALS=()
+SEAL_JSON=$(curl -s --max-time 5 "$VAULT_ADDR/v1/sys/seal-status" 2>/dev/null || true)
+if [ -n "$SEAL_JSON" ] && [ "$(echo "$SEAL_JSON" | jq -r '.sealed // empty' 2>/dev/null)" = "true" ]; then
+  if [ "$JSON_MODE" = false ]; then
+    if [ "$(echo "$SEAL_JSON" | jq -r '.initialized')" = "true" ]; then
+      check_fail "Vault is SEALED (auto-unseal failed?) — run ./scripts/vault-init.sh, check: docker compose logs vault"
+    else
+      check_fail "Vault is NOT INITIALISED — run ./scripts/vault-init.sh"
+    fi
+  fi
+elif curl -sf "$VAULT_ADDR/v1/sys/health" >/dev/null 2>&1; then
   VAULT_OK=true
-  export VAULT_TOKEN="${VAULT_DEV_TOKEN:-}"
+  # shellcheck source=lib/vault-common.sh
+  source "$SCRIPT_DIR/lib/vault-common.sh"
+  vault_use_container_cli 2>/dev/null || true
+  vault_admin_env 2>/dev/null || [ "$JSON_MODE" = true ] || check_warn "No admin token (secrets/vault-init.json unreadable, VAULT_TOKEN unset) — PKI details unavailable"
+  STORAGE_TYPE=$(echo "$SEAL_JSON" | jq -r '.storage_type // "unknown"' 2>/dev/null || echo unknown)
+  if [ "$JSON_MODE" = false ] && [ "$STORAGE_TYPE" = "inmem" ]; then
+    check_fail "Vault is in DEV mode (in-memory) — PKI is lost on restart. Run ./scripts/upgrade.sh --migrate-vault"
+  fi
 
   # Root CA expiry
   ROOT_EXPIRY=""
@@ -95,13 +112,12 @@ if curl -sf "$VAULT_ADDR/v1/sys/health" >/dev/null 2>&1; then
   fi
 
   # Issued certificates
-  CERT_SERIALS=()
   if CERT_LIST=$(vault list -format=json pki_int/certs 2>/dev/null); then
     mapfile -t CERT_SERIALS < <(echo "$CERT_LIST" | jq -r '.[]')
   fi
 
   if [ "$JSON_MODE" = false ]; then
-    check_status "Vault reachable"
+    check_status "Vault reachable, unsealed (storage: $STORAGE_TYPE)"
     [ -n "$ROOT_EXPIRY" ] && check_status "Root CA expires: $ROOT_EXPIRY" || check_warn "Root CA: not found"
     [ -n "$INT_EXPIRY" ] && check_status "Intermediate CA expires: $INT_EXPIRY" || check_warn "Intermediate CA: not found"
     check_status "Issued certificates: ${#CERT_SERIALS[@]}"

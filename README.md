@@ -155,13 +155,14 @@ auth in common apps (Gitea, Grafana, Wiki.js, pgAdmin, etc.).
 │   └── non-saml-app-kanboard.md    # Header-based auth guide
 ├── scripts/
 │   ├── bootstrap.sh                # One-command setup
-│   ├── setup-vault-pki.sh          # Initialize CA hierarchy
+│   ├── vault-init.sh               # Init/unseal Vault, enroll AppRole (idempotent)
+│   ├── setup-vault-pki.sh          # Initialize CA hierarchy (no-op if it exists)
 │   ├── configure-keycloak.sh       # Import realm config
 │   ├── init-config.sh              # Initialize config/ directory
 │   ├── upgrade.sh                  # Safe upgrade for existing deployments
 │   ├── restore.sh                  # Restore from backup
 │   ├── status.sh                   # Health dashboard
-│   ├── revoke-cert.sh              # Revoke client certificate + update CRL
+│   ├── revoke-cert.sh              # Revoke client certificate (enforced by group-gate)
 │   ├── register-oidc-clients.sh    # Register OIDC clients in Keycloak
 │   ├── enroll-yubikey.sh           # CLI mTLS enrollment
 │   └── renew-yubikey.sh            # CLI mTLS renewal
@@ -254,11 +255,12 @@ Portcullis is an auth layer that works with existing platforms:
 
 ## Production Considerations
 
-- **Vault**: switch from dev mode to proper storage + auto-unseal
+- **Vault**: runs in server mode (raft storage) and auto-unseals from `secrets/` on the host — back up `secrets/vault-init.json` (root token + unseal key) **offline**. Upgrading from the old dev-mode Vault: `./scripts/upgrade.sh --migrate-vault` (creates a new CA; every YubiKey must be re-enrolled)
 - **Passwords**: the bootstrap script generates random values — keep them safe
 - **Forward Auth secret**: generate a strong `FORWARD_AUTH_SECRET` and `FORWARD_AUTH_CLIENT_SECRET`
-- **OCSP/CRL**: enable in Keycloak's X.509 config for cert revocation checking
+- **Revocation**: `./scripts/revoke-cert.sh <serial>` — enforced by group-gate (Traefik itself doesn't check CRLs); optionally also enable CRL checking in Keycloak's X.509 config
 - **Renewal**: automate `renew-yubikey.sh` via cron/launchd (mTLS users only)
-- **Backups**: Vault (CA keys), PostgreSQL (Keycloak), LLDAP data volume
+- **Backups**: Vault volume **plus `secrets/`** (unseal key — without it the volume is useless), PostgreSQL (Keycloak), LLDAP data volume; `upgrade.sh` backs up all of them
+- **Network**: `portcullis-proxy` uses a fixed subnet (`PORTCULLIS_PROXY_SUBNET`, default `172.31.250.0/24`) with Traefik pinned at `PORTCULLIS_TRAEFIK_IP` — change in `.env` only if it collides with a host network, then run `upgrade.sh`
 - **Docker socket**: consider a socket proxy for Traefik for hardening
 - **PIV PIN**: enforce PIN changes from default (123456) for mTLS users

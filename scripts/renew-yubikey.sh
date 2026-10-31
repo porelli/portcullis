@@ -5,13 +5,17 @@
 #
 set -euo pipefail
 
-VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
-VAULT_TOKEN="${VAULT_TOKEN:-myroot}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/vault-common.sh
+source "$SCRIPT_DIR/lib/vault-common.sh"
+# Admin token: VAULT_TOKEN if exported, else the root token from
+# secrets/vault-init.json (only readable on the Portcullis host).
+vault_admin_env || exit 1
+vault_use_container_cli || exit 1
 PIV_SLOT="${PIV_SLOT:-9a}"
 PIV_PIN="${PIV_PIN:-123456}"
 TTL="${TTL:-24h}"
 
-export VAULT_ADDR VAULT_TOKEN
 
 usage() {
   echo "Usage: $0 <username> [email]"

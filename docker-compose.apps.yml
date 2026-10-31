@@ -20,11 +20,14 @@ services:
   # ============================================================
   # mTLS ONLY — requires YubiKey PIV client certificate
   # (TLS handshake fails without a valid cert)
+  # NOTE: Traefik does not check CRLs, so a REVOKED (but unexpired) cert
+  # still passes here. Revocation is enforced by group-gate, i.e. only on
+  # routers whose chain includes client-headers@file + portcullis-groups@docker.
   # ============================================================
   vault-ui:
     image: drakkan/sftpgo:latest  # placeholder
     networks:
-      - portcullis
+      - portcullis-proxy
     labels:
       traefik.enable: "true"
       traefik.http.routers.vault-ui.rule: Host(`vault.${PORTCULLIS_DOMAIN:-portcullis.local}`)
@@ -40,13 +43,13 @@ services:
   grafana:
     image: grafana/grafana:latest
     networks:
-      - portcullis
+      - portcullis-proxy
     labels:
       traefik.enable: "true"
       traefik.http.routers.grafana.rule: Host(`grafana.${PORTCULLIS_DOMAIN:-portcullis.local}`)
       traefik.http.routers.grafana.entrypoints: websecure
       traefik.http.routers.grafana.tls.options: public@file
-      traefik.http.routers.grafana.middlewares: portcullis-auth@docker,security-headers@file
+      traefik.http.routers.grafana.middlewares: portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.services.grafana.loadbalancer.server.port: "3000"
 
   # ============================================================
@@ -56,13 +59,13 @@ services:
   wiki:
     image: requarks/wiki:2
     networks:
-      - portcullis
+      - portcullis-proxy
     labels:
       traefik.enable: "true"
       traefik.http.routers.wiki.rule: Host(`wiki.${PORTCULLIS_DOMAIN:-portcullis.local}`)
       traefik.http.routers.wiki.entrypoints: websecure
       traefik.http.routers.wiki.tls.options: authaware@file
-      traefik.http.routers.wiki.middlewares: client-headers@file,portcullis-auth@docker,security-headers@file
+      traefik.http.routers.wiki.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.services.wiki.loadbalancer.server.port: "3000"
 
   # ============================================================
@@ -77,7 +80,7 @@ services:
       - headscale-data:/var/lib/headscale
       - ./headscale/config.yaml:/etc/headscale/config.yaml:ro
     networks:
-      - portcullis
+      - portcullis-proxy
     labels:
       traefik.enable: "true"
       # Main control server — public TLS so Tailscale clients can reach it
@@ -96,14 +99,14 @@ services:
       OIDC_CLIENT_SECRET: ${HEADPLANE_OIDC_CLIENT_SECRET:-headplane-oidc-secret}
       ROOT_URL: https://vpn-admin.${PORTCULLIS_DOMAIN:-portcullis.local}
     networks:
-      - portcullis
+      - portcullis-proxy
     labels:
       traefik.enable: "true"
       # Admin UI — mTLS if cert present, WebAuthn fallback
       traefik.http.routers.headplane.rule: Host(`vpn-admin.${PORTCULLIS_DOMAIN:-portcullis.local}`)
       traefik.http.routers.headplane.entrypoints: websecure
       traefik.http.routers.headplane.tls.options: authaware@file
-      traefik.http.routers.headplane.middlewares: client-headers@file,portcullis-auth@docker,security-headers@file
+      traefik.http.routers.headplane.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.services.headplane.loadbalancer.server.port: "3000"
 
   # ============================================================
@@ -146,7 +149,7 @@ services:
     depends_on:
       - coturn
     networks:
-      - portcullis
+      - portcullis-proxy
     labels:
       traefik.enable: "true"
       traefik.http.routers.netbird-api.rule: Host(`netbird.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/api`)
@@ -158,7 +161,7 @@ services:
   netbird-signal:
     image: netbirdio/signal:latest
     networks:
-      - portcullis
+      - portcullis-proxy
     labels:
       traefik.enable: "true"
       traefik.http.routers.netbird-signal.rule: Host(`netbird.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/signalexchange.SignalExchange/`)
@@ -179,14 +182,14 @@ services:
       AUTH_SUPPORTED_SCOPES: openid profile email
       AUTH_AUDIENCE: netbird-dashboard
     networks:
-      - portcullis
+      - portcullis-proxy
     labels:
       traefik.enable: "true"
       # Dashboard — WebAuthn protected
       traefik.http.routers.netbird-dash.rule: Host(`netbird.${PORTCULLIS_DOMAIN:-portcullis.local}`) && !PathPrefix(`/api`) && !PathPrefix(`/signalexchange.SignalExchange/`)
       traefik.http.routers.netbird-dash.entrypoints: websecure
       traefik.http.routers.netbird-dash.tls.options: public@file
-      traefik.http.routers.netbird-dash.middlewares: portcullis-auth@docker,security-headers@file
+      traefik.http.routers.netbird-dash.middlewares: portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.services.netbird-dash.loadbalancer.server.port: "80"
 
   # ============================================================
@@ -195,7 +198,7 @@ services:
   docs:
     image: nginx:alpine
     networks:
-      - portcullis
+      - portcullis-proxy
     labels:
       traefik.enable: "true"
       traefik.http.routers.docs.rule: Host(`docs.${PORTCULLIS_DOMAIN:-portcullis.local}`)
@@ -209,6 +212,8 @@ volumes:
   netbird-mgmt:
   coturn-data:
 
-networks:
-  portcullis:
-    external: true
+# Apps join the shared routing plane only, never the core `portcullis`
+# network (see CLAUDE.md). `portcullis-proxy` (with its fixed IPAM subnet
+# and Traefik's static IP) is defined in docker-compose.yml, which this
+# file is merged with — don't redeclare it here: `external: true` would
+# conflict with the core definition's IPAM config.

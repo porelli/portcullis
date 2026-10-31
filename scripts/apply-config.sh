@@ -7,8 +7,17 @@
 #   ./scripts/apply-config.sh
 #   docker compose up -d --force-recreate traefik
 #
+# ./scripts/apply-config.sh --bundle-only
+#   Only (re)build certs/ca-bundle.crt (system CAs + internal PKI chain +
+#   LE staging root if ACME_STAGING=true). bootstrap/upgrade/restore run
+#   this before `docker compose up` — forward-auth bind-mounts the file,
+#   and a missing file would make Docker create a directory instead.
+#
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+BUNDLE_ONLY=false
+[ "${1:-}" = "--bundle-only" ] && BUNDLE_ONLY=true
 
 ENV_FILE=".env"
 if [ ! -f "$ENV_FILE" ]; then
@@ -19,6 +28,46 @@ fi
 # Read values
 ACME_STAGING=$(grep '^ACME_STAGING=' "$ENV_FILE" | cut -d= -f2 | tr -d ' "' || echo "true")
 MTLS_ENABLED=$(grep '^MTLS_ENABLED=' "$ENV_FILE" | cut -d= -f2 | tr -d ' "' || echo "true")
+
+build_ca_bundle() {
+  # Build the CA bundle for app containers.
+  # Always includes:
+  #   - System CAs (so public issuers like Let's Encrypt production are trusted)
+  #   - Internal Portcullis PKI chain (so apps can verify internal-only certs)
+  # Adds staging root only when ACME_STAGING=true.
+  BUNDLE="certs/ca-bundle.crt"
+  mkdir -p certs
+  # A failed earlier `docker compose up` leaves a directory here (Docker
+  # creates missing bind sources as dirs). Replace it if it is empty.
+  if [ -d "$BUNDLE" ]; then
+    rmdir "$BUNDLE" 2>/dev/null || { echo "ERROR: $BUNDLE is a non-empty directory — remove it manually" >&2; exit 1; }
+  fi
+
+  # Truncate in place (same inode) so a running container's bind mount
+  # sees the new content.
+  : > "$BUNDLE"
+  if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+    cat /etc/ssl/certs/ca-certificates.crt >> "$BUNDLE"
+  elif [ -f /etc/pki/tls/certs/ca-bundle.crt ]; then
+    cat /etc/pki/tls/certs/ca-bundle.crt >> "$BUNDLE"
+  fi
+  if [ -f certs/ca-chain.crt ]; then
+    cat certs/ca-chain.crt >> "$BUNDLE"
+  fi
+  if [ "$ACME_STAGING" = "true" ]; then
+    STAGING_CA="certs/letsencrypt-stg-root-x1.pem"
+    if [ ! -f "$STAGING_CA" ]; then
+      curl -sf -o "$STAGING_CA" "https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem" 2>/dev/null || true
+    fi
+    [ -f "$STAGING_CA" ] && cat "$STAGING_CA" >> "$BUNDLE"
+  fi
+  echo "     Wrote $BUNDLE (system + internal PKI$([ "$ACME_STAGING" = "true" ] && echo " + staging root"))"
+}
+
+if [ "$BUNDLE_ONLY" = true ]; then
+  build_ca_bundle
+  exit 0
+fi
 
 echo "Configuration:"
 echo "  ACME_STAGING=$ACME_STAGING"
@@ -56,31 +105,7 @@ else
   echo "TLS: Using Let's Encrypt PRODUCTION (trusted certs)"
 fi
 
-# Build the CA bundle for app containers.
-# Always includes:
-#   - System CAs (so public issuers like Let's Encrypt production are trusted)
-#   - Internal Portcullis PKI chain (so apps can verify internal-only certs)
-# Adds staging root only when ACME_STAGING=true.
-BUNDLE="certs/ca-bundle.crt"
-mkdir -p certs
-
-: > "$BUNDLE"
-if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
-  cat /etc/ssl/certs/ca-certificates.crt >> "$BUNDLE"
-elif [ -f /etc/pki/tls/certs/ca-bundle.crt ]; then
-  cat /etc/pki/tls/certs/ca-bundle.crt >> "$BUNDLE"
-fi
-if [ -f certs/ca-chain.crt ]; then
-  cat certs/ca-chain.crt >> "$BUNDLE"
-fi
-if [ "$ACME_STAGING" = "true" ]; then
-  STAGING_CA="certs/letsencrypt-stg-root-x1.pem"
-  if [ ! -f "$STAGING_CA" ]; then
-    curl -sf -o "$STAGING_CA" "https://letsencrypt.org/certs/staging/letsencrypt-stg-root-x1.pem" 2>/dev/null || true
-  fi
-  [ -f "$STAGING_CA" ] && cat "$STAGING_CA" >> "$BUNDLE"
-fi
-echo "     Wrote $BUNDLE (system + internal PKI$([ "$ACME_STAGING" = "true" ] && echo " + staging root"))"
+build_ca_bundle
 
 # Record what we applied so we can detect the next flip.
 echo "$ACME_STAGING" > "$SENTINEL"

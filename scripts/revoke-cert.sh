@@ -1,13 +1,25 @@
 #!/usr/bin/env bash
 #
-# Portcullis cert revocation — revoke a client certificate and update CRL.
+# Portcullis cert revocation — revoke a client certificate and enforce it.
 #
 # Usage:
-#   ./scripts/revoke-cert.sh <serial>           # revoke by serial number
+#   ./scripts/revoke-cert.sh <serial>           # revoke by serial number (asks to confirm)
+#   ./scripts/revoke-cert.sh --yes <serial>     # revoke without prompting
 #   ./scripts/revoke-cert.sh --list             # list all certs (find serial)
 #   ./scripts/revoke-cert.sh --list-revoked     # list revoked certs
+#   ./scripts/revoke-cert.sh --sync             # rewrite the revoked-serials file from Vault
 #
 # The serial number is shown in the enrollment UI (/certs) or by --list.
+#
+# How revocation is enforced: Traefik does NOT check CRLs. group-gate
+# (portcullis-groups@docker) denies any request whose TLS client cert has a
+# revoked serial. It learns revoked serials from
+#   - certs/revocation/revoked-serials.txt (rewritten by this script from
+#     Vault's authoritative list — takes effect on the next request), and
+#   - Vault's CRL (http://vault:8200/v1/pki_int/crl, re-fetched every 60s),
+#     which also covers revocations done via the Vault API/UI directly.
+# Only routers whose middleware chain contains client-headers@file BEFORE
+# portcullis-groups@docker are covered.
 #
 set -euo pipefail
 
@@ -31,10 +43,20 @@ fail()  { echo -e "${RED}ERROR:${NC} $*"; exit 1; }
 [ -f .env ] || fail ".env not found."
 set -a; source .env; set +a
 
-export VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
-export VAULT_TOKEN="${VAULT_DEV_TOKEN:-}"
+# shellcheck source=lib/vault-common.sh
+source "$SCRIPT_DIR/lib/vault-common.sh"
+vault_admin_env || exit 1
+# Host vault CLI if installed, else the CLI inside the vault container.
+vault_use_container_cli || exit 1
 
-command -v vault >/dev/null || fail "vault CLI is required"
+REVOKED_FILE="certs/revocation/revoked-serials.txt"
+
+# sync_revoked_file — rewrite $REVOKED_FILE from Vault's list of revoked
+# serials. Aborts (file untouched) if Vault can't be queried.
+sync_revoked_file() {
+  write_revoked_serials "$REVOKED_FILE" || fail "Could not refresh $REVOKED_FILE (left unchanged)."
+  ok "Revoked-serial list updated: $REVOKED_FILE ($(grep -vc '^#' "$REVOKED_FILE" || true) serial(s))"
+}
 
 # ── List mode ──────────────────────────────────────────────
 
@@ -89,16 +111,28 @@ if [ "${1:-}" = "--list-revoked" ]; then
   exit 0
 fi
 
+if [ "${1:-}" = "--sync" ]; then
+  sync_revoked_file
+  exit 0
+fi
+
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
-  echo "Usage: $0 <serial>           Revoke cert by serial number"
+  echo "Usage: $0 [--yes] <serial>   Revoke cert by serial number"
   echo "       $0 --list             List all active certificates"
   echo "       $0 --list-revoked     List all certificates including revoked"
+  echo "       $0 --sync             Rewrite $REVOKED_FILE from Vault"
   echo ""
   echo "Find serial numbers with --list or in the enrollment UI (/certs)."
   exit 0
 fi
 
 # ── Revoke mode ────────────────────────────────────────────
+
+ASSUME_YES=false
+if [ "${1:-}" = "--yes" ] || [ "${1:-}" = "-y" ]; then
+  ASSUME_YES=true
+  shift
+fi
 
 SERIAL="${1:-}"
 [ -z "$SERIAL" ] && fail "Usage: $0 <serial-number>  (use --list to find serials)"
@@ -113,6 +147,7 @@ REVOCATION_TIME=$(echo "$CERT_DATA" | jq -r '.data.revocation_time // "0"')
 
 if [ "$REVOCATION_TIME" != "0" ] && [ "$REVOCATION_TIME" != "null" ]; then
   warn "Certificate is already revoked."
+  sync_revoked_file
   exit 0
 fi
 
@@ -123,44 +158,44 @@ echo "    Serial:   $SERIAL"
 echo "    Expires:  $END_DATE"
 echo ""
 
-read -rp "Revoke this certificate? [y/N] " CONFIRM
-case "$CONFIRM" in
-  y|Y|yes|YES) ;;
-  *) echo "Cancelled."; exit 0 ;;
-esac
+if [ "$ASSUME_YES" != true ]; then
+  read -rp "Revoke this certificate? [y/N] " CONFIRM
+  case "$CONFIRM" in
+    y|Y|yes|YES) ;;
+    *) echo "Cancelled."; exit 0 ;;
+  esac
+fi
 
 # Revoke
 info "Revoking certificate..."
 vault write pki_int/revoke serial_number="$SERIAL" || fail "Revocation failed"
 ok "Certificate revoked."
 
-# Rotate CRL
+# Rotate CRL (Vault rebuilds it on revoke; this is belt and braces)
 info "Rotating CRL..."
-vault read -format=json pki_int/crl/rotate >/dev/null 2>&1
-ok "CRL updated."
+vault read -format=json pki_int/crl/rotate >/dev/null 2>&1 || warn "CRL rotate failed (group-gate still uses the serial file)"
 
-# Update CA chain + CRL bundle for Traefik
-info "Updating CRL for Traefik..."
-CRL_PEM=$(vault read -format=json pki_int/cert/crl 2>/dev/null | jq -r '.data.certificate // empty')
+# Enforce: group-gate reads this file on every request.
+sync_revoked_file
+
+# Keep a PEM copy of the CRL for tools that want one (e.g. Keycloak X.509
+# CRL checking with a file URL). NOT used by Traefik.
+CRL_PEM=$(curl -sf "$VAULT_ADDR/v1/pki_int/crl/pem" 2>/dev/null || true)
 if [ -n "$CRL_PEM" ]; then
-  CERTS_DIR="certs"
-  mkdir -p "$CERTS_DIR"
-  echo "$CRL_PEM" > "$CERTS_DIR/crl.pem"
-
-  # Append CRL to ca-chain if not already there
-  if [ -f "$CERTS_DIR/ca-chain.crt" ] && ! grep -q "X509 CRL" "$CERTS_DIR/ca-chain.crt" 2>/dev/null; then
-    cat "$CERTS_DIR/crl.pem" >> "$CERTS_DIR/ca-chain.crt"
-    ok "CRL appended to ca-chain.crt"
-  fi
-
-  ok "CRL saved to $CERTS_DIR/crl.pem"
+  printf '%s\n' "$CRL_PEM" > certs/crl.pem
 fi
 
-# Hint about reloading
 echo ""
-warn "Traefik will pick up the updated CRL automatically (file provider watches for changes)."
-warn "For Keycloak X.509 CRL checking, configure the CRL URL in the realm's X.509 auth flow."
+ok "Requests presenting this certificate are now denied by group-gate on every"
+ok "router using client-headers@file + portcullis-groups@docker (all core routers"
+ok "and the default app templates)."
+warn "NOT covered: routers that rely on the TLS client cert alone (protected tier"
+warn "without portcullis-groups@docker) — Traefik does not check CRLs. Client certs"
+warn "are short-lived (24h), so such routers stop accepting it when it expires."
+warn "A Keycloak session that was opened with this cert stays valid until it ends;"
+warn "to cut it now, sign the user out in the Keycloak admin console."
 echo ""
 echo "  To verify revocation:"
 echo "    vault read pki_int/cert/$SERIAL | grep revocation_time"
+echo "    grep -i '$SERIAL' $REVOKED_FILE"
 echo ""

@@ -8,20 +8,24 @@
 #
 # Prerequisites:
 #   - ykman (YubiKey Manager CLI)
-#   - vault CLI
+#   - vault CLI (optional on the Portcullis host: falls back to the vault container)
 #   - openssl
 #   - A YubiKey 5 series inserted
 #
 set -euo pipefail
 
-VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
-VAULT_TOKEN="${VAULT_TOKEN:-myroot}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/vault-common.sh
+source "$SCRIPT_DIR/lib/vault-common.sh"
+# Admin token: VAULT_TOKEN if exported, else the root token from
+# secrets/vault-init.json (only readable on the Portcullis host).
+vault_admin_env || exit 1
+vault_use_container_cli || exit 1
 CERT_DIR="${CERT_DIR:-./certs}"
 PIV_SLOT="${PIV_SLOT:-9a}"
 PIV_PIN="${PIV_PIN:-123456}"
 TTL="${TTL:-24h}"
 
-export VAULT_ADDR VAULT_TOKEN
 
 usage() {
   cat <<EOF
@@ -35,7 +39,7 @@ Arguments:
 
 Environment variables:
   VAULT_ADDR    Vault server address (default: http://127.0.0.1:8200)
-  VAULT_TOKEN   Vault authentication token
+  VAULT_TOKEN   Vault admin token (default: root token from secrets/vault-init.json)
   PIV_SLOT      YubiKey PIV slot (default: 9a - Authentication)
   PIV_PIN       YubiKey PIV PIN (default: 123456)
   TTL           Certificate TTL (default: 24h)
@@ -91,18 +95,12 @@ ykman piv certificates request \
 echo "==> Requesting signed certificate from Vault..."
 CSR_CONTENT=$(cat "$TMPDIR/request.csr")
 
+# common_name is mandatory: the client-cert role ignores the CSR subject.
 vault write -format=json pki_int/sign/client-cert \
   csr="$CSR_CONTENT" \
   common_name="$USERNAME" \
   ttl="$TTL" \
   | jq -r '.data.certificate' > "$TMPDIR/client.crt"
-
-# Also save the full chain
-vault write -format=json pki_int/sign/client-cert \
-  csr="$CSR_CONTENT" \
-  common_name="$USERNAME" \
-  ttl="$TTL" \
-  | jq -r '(.data.certificate + "\n" + (.data.ca_chain | join("\n")))' > "$TMPDIR/client-chain.crt"
 
 echo "==> Writing certificate to YubiKey PIV slot $PIV_SLOT..."
 ykman piv certificates import \

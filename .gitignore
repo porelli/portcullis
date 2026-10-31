@@ -7,6 +7,10 @@ docker-compose.override.yml
 traefik/dynamic/local/
 headscale/config.local.yaml
 
+# Vault init material (root token, unseal key, AppRole creds) — never commit
+secrets/*
+!secrets/.gitkeep
+
 # Generated / runtime
 certs/
 *.jks
@@ -15,7 +19,10 @@ certs/
 *.key
 *.crt
 acme.json
-backups/
+backups/*
+!backups/.gitkeep
+# Hub-generated copies of app template dirs (see hub volumes in docker-compose.yml)
+templates/
 .hub/
 !certs/.gitkeep
 !traefik/dynamic/local/.gitkeep

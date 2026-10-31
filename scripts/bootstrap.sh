@@ -30,7 +30,6 @@ info "Checking prerequisites..."
 
 command -v docker >/dev/null || fail "docker is required"
 command -v docker compose version >/dev/null 2>&1 || command -v docker-compose >/dev/null || fail "docker compose is required"
-command -v vault >/dev/null || fail "vault CLI is required (https://developer.hashicorp.com/vault/install)"
 command -v jq >/dev/null || fail "jq is required"
 
 ok "All prerequisites met."
@@ -40,6 +39,9 @@ ok "All prerequisites met."
 # Check for .env in config/ (symlinked) or project root
 if [ ! -f .env ]; then
   info "Creating .env from template..."
+  # .env holds every secret — create it owner-only.
+  OLD_UMASK=$(umask)
+  umask 077
   cp .env.example .env
 
   # Generate random passwords
@@ -47,7 +49,10 @@ if [ ! -f .env ]; then
   GENERATED_KC_PASS=$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 24)
   GENERATED_LLDAP_PASS=$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 24)
   GENERATED_JWT=$(openssl rand -base64 32)
-  GENERATED_VAULT_TOKEN=$(openssl rand -base64 24 | tr -dc 'a-zA-Z0-9' | head -c 24)
+  GENERATED_FWD_CLIENT_SECRET=$(openssl rand -base64 48 | tr -dc 'a-zA-Z0-9' | head -c 40)
+  # oauth2-proxy cookie secret must decode to exactly 16, 24 or 32 bytes:
+  # base64url-encode 32 random bytes (44 chars incl. padding).
+  GENERATED_FWD_COOKIE_SECRET=$(openssl rand -base64 32 | tr -- '+/' '-_')
 
   # Prompt for domain
   DOMAIN="${PORTCULLIS_DOMAIN:-}"
@@ -127,31 +132,56 @@ ACME_EMAIL=$ACME_EMAIL
 DNS_PROVIDER=$DNS_PROVIDER
 $DNS_ENV_LINES
 
-VAULT_DEV_TOKEN=$GENERATED_VAULT_TOKEN
 KEYCLOAK_ADMIN=admin
 KEYCLOAK_ADMIN_PASSWORD=$GENERATED_KC_PASS
 POSTGRES_PASSWORD=$GENERATED_PG_PASS
 LLDAP_ADMIN_PASSWORD=$GENERATED_LLDAP_PASS
 LLDAP_JWT_SECRET=$GENERATED_JWT
 LLDAP_BASE_DN=dc=$(echo "$DOMAIN" | sed 's/\./,dc=/g')
+
+FORWARD_AUTH_CLIENT_SECRET=$GENERATED_FWD_CLIENT_SECRET
+FORWARD_AUTH_COOKIE_SECRET=$GENERATED_FWD_COOKIE_SECRET
+
+# Fixed IPAM for portcullis-proxy; header-auth apps trust only Traefik's IP.
+# Change only if it collides with a host network (see .env.example).
+PORTCULLIS_PROXY_SUBNET=172.31.250.0/24
+PORTCULLIS_PROXY_IP_RANGE=172.31.250.128/25
+PORTCULLIS_TRAEFIK_IP=172.31.250.2
 EOF
+  chmod 600 .env
+  umask "$OLD_UMASK"
 
   ok "Generated .env with random passwords."
   echo ""
   warn "IMPORTANT: Save these credentials somewhere safe!"
   echo "  Keycloak admin:    admin / $GENERATED_KC_PASS"
   echo "  LLDAP admin:       admin / $GENERATED_LLDAP_PASS"
-  echo "  Vault token:       $GENERATED_VAULT_TOKEN"
+  echo "  Vault:             root token + unseal key will be in secrets/vault-init.json"
   echo "  PostgreSQL:        keycloak / $GENERATED_PG_PASS"
   echo ""
 else
   info "Using existing .env file."
 fi
 
+# Existing .env from an older release: add the proxy network settings the
+# Hub copies into app envs (header-auth apps need PORTCULLIS_TRAEFIK_IP).
+for kv in PORTCULLIS_PROXY_SUBNET=172.31.250.0/24 \
+          PORTCULLIS_PROXY_IP_RANGE=172.31.250.128/25 \
+          PORTCULLIS_TRAEFIK_IP=172.31.250.2; do
+  grep -q "^${kv%%=*}=" .env || { echo "$kv" >> .env; info "Added ${kv} to .env"; }
+done
+
 # Source the env
 set -a
 source .env
 set +a
+
+# shellcheck source=lib/proxy-network.sh
+source "$SCRIPT_DIR/lib/proxy-network.sh"
+NET_ERR="$(validate_proxy_network_config)" || fail "Invalid portcullis-proxy settings in .env: $NET_ERR"
+if [ "$(proxy_network_state)" = mismatch ]; then
+  fail "Docker network portcullis-proxy exists with a different IPAM config. Run ./scripts/upgrade.sh (it recreates the network)."
+fi
 
 # ── DNS records ───────────────────────────────────────────
 
@@ -159,6 +189,23 @@ info "Setting up DNS records..."
 ./scripts/setup-dns.sh
 
 # ── Start services ─────────────────────────────────────────
+
+# Bind-mount sources must exist before compose runs, or Docker creates
+# them root-owned and the scripts below can't write into them.
+(umask 077 && mkdir -p secrets/vault-unseal secrets/enroll)
+mkdir -p certs/revocation
+# Hub copies app template dirs here (bind-mounted rw into the hub).
+mkdir -p templates
+# Mountpoints for the Hub's tmpfs masks (must exist inside the ro /project bind).
+mkdir -p secrets backups
+[ -f certs/revocation/revoked-serials.txt ] || : > certs/revocation/revoked-serials.txt
+
+info "Starting and initialising Vault..."
+./scripts/vault-init.sh
+
+# forward-auth bind-mounts certs/ca-bundle.crt: it must be a file before
+# `up` (rebuilt below once the internal CA exists).
+./scripts/apply-config.sh --bundle-only
 
 info "Starting services..."
 docker compose up -d --build
@@ -183,37 +230,27 @@ done
 
 info "Initializing Vault PKI..."
 export VAULT_ADDR=http://127.0.0.1:8200
-export VAULT_TOKEN="$VAULT_DEV_TOKEN"
 export DOMAIN="$PORTCULLIS_DOMAIN"
 
+# Token comes from secrets/vault-init.json. Skips (no-op) if the PKI exists.
 ./scripts/setup-vault-pki.sh --with-server-cert
 
 # ── Restart Traefik (pick up certs) ───────────────────────
 
-info "Restarting Traefik to pick up CA chain..."
-docker compose restart traefik
+info "Rebuilding CA bundle with the internal CA chain..."
+./scripts/apply-config.sh --bundle-only
+
+info "Restarting Traefik and forward-auth to pick up the CA chain..."
+docker compose restart traefik forward-auth
 
 # ── Configure Keycloak ────────────────────────────────────
 
 info "Configuring Keycloak..."
 
-# Update LLDAP bind password in realm config before import
-REALM_FILE="keycloak/realm-export.json"
-TEMP_REALM=$(mktemp)
-jq --arg pass "$LLDAP_ADMIN_PASSWORD" \
-  '(.components["org.keycloak.storage.UserStorageProvider"][0].config.bindCredential) = [$pass]' \
-  "$REALM_FILE" > "$TEMP_REALM"
-
-# Also update base DN
-jq --arg basedn "$LLDAP_BASE_DN" \
-  '(.components["org.keycloak.storage.UserStorageProvider"][0].config.usersDn) = ["ou=people," + $basedn] |
-   (.components["org.keycloak.storage.UserStorageProvider"][0].config.bindDn) = ["uid=admin,ou=people," + $basedn] |
-   (.components["org.keycloak.storage.UserStorageProvider"][0].subComponents["org.keycloak.storage.ldap.mappers.LDAPStorageMapper"][] |
-     select(.name == "groups").config["groups.dn"]) = ["ou=groups," + $basedn]' \
-  "$TEMP_REALM" > "${TEMP_REALM}.2" && mv "${TEMP_REALM}.2" "$TEMP_REALM"
-
-cp "$TEMP_REALM" "$REALM_FILE"
-rm -f "$TEMP_REALM"
+# keycloak/realm-export.json is git-tracked and keeps its
+# LLDAP_*_PLACEHOLDER values. configure-keycloak.sh substitutes them in
+# memory for its API import and PUTs the real bind DN / password onto the
+# LDAP federation component, so no secret is ever written to the repo.
 
 # Run configure-keycloak inside the network so it can reach keycloak:8080
 export KEYCLOAK_URL="http://localhost:8080"
@@ -243,7 +280,7 @@ echo "    Enrollment UI:   https://enroll.${PORTCULLIS_DOMAIN}"
 echo "    Directory (LLDAP): https://directory.${PORTCULLIS_DOMAIN}"
 echo "    Identity (Keycloak): https://auth.${PORTCULLIS_DOMAIN}"
 echo "    Gateway (Traefik): https://traefik.${PORTCULLIS_DOMAIN}"
-echo "    Vault:           http://localhost:8200"
+echo "    Vault:           http://localhost:8200  (root token: secrets/vault-init.json)"
 echo ""
 echo "  Next steps:"
 echo "    1. Log into LLDAP and create users: https://directory.${PORTCULLIS_DOMAIN}"
@@ -251,4 +288,6 @@ echo "       (admin / check .env for password)"
 echo "    2. Enroll a YubiKey:"
 echo "       ./scripts/enroll-yubikey.sh <username> <email>"
 echo "       Or use the web UI: https://enroll.${PORTCULLIS_DOMAIN}"
+echo ""
+warn "Back up secrets/vault-init.json OFFLINE (Vault root token + unseal key)."
 echo ""

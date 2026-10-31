@@ -72,6 +72,39 @@ register_client \
   "https://auth.${DOMAIN}/_oauth" \
   "Portcullis Forward Auth"
 
+# The realm export (auto-imported on first Keycloak start) ships the public
+# default secret, so "Exists" above usually means Keycloak still holds that
+# default. Push the .env value so oauth2-proxy and Keycloak always agree and
+# a non-default secret actually takes effect. Idempotent.
+sync_client_secret() {
+  local client_id="$1" secret="$2" uuid client updated code
+  uuid=$(curl -sk "$KEYCLOAK_URL/admin/realms/portcullis/clients?clientId=$client_id" \
+    -H "Authorization: Bearer $KC_TOKEN" | jq -r '.[0].id // empty')
+  if [ -z "$uuid" ]; then
+    echo -e "  ${RED}Failed${NC}  $client_id secret sync (client not found)"
+    return 0
+  fi
+  client=$(curl -sk "$KEYCLOAK_URL/admin/realms/portcullis/clients/$uuid" \
+    -H "Authorization: Bearer $KC_TOKEN")
+  updated=$(echo "$client" | jq --arg s "$secret" '.secret = $s')
+  code=$(curl -sk -o /dev/null -w "%{http_code}" -X PUT \
+    "$KEYCLOAK_URL/admin/realms/portcullis/clients/$uuid" \
+    -H "Authorization: Bearer $KC_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "$updated")
+  if [ "$code" = "204" ]; then
+    echo -e "  ${GREEN}Synced${NC}  $client_id client secret from .env"
+  else
+    echo -e "  ${RED}Failed${NC}  $client_id secret sync (HTTP $code)"
+  fi
+}
+
+FWD_SECRET="${FORWARD_AUTH_CLIENT_SECRET:-portcullis-forward-auth-secret}"
+sync_client_secret "portcullis-forward-auth" "$FWD_SECRET"
+if [ "$FWD_SECRET" = "portcullis-forward-auth-secret" ]; then
+  echo -e "  ${YELLOW}WARNING${NC} FORWARD_AUTH_CLIENT_SECRET is the public default — set a random value in .env, re-run this script, then: docker compose up -d forward-auth"
+fi
+
 # VPN clients (optional — only register if secrets are set)
 if [ -n "${HEADSCALE_OIDC_CLIENT_SECRET:-}" ]; then
   register_client \

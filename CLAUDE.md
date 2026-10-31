@@ -8,10 +8,10 @@ This is the **core infrastructure repo**. Related repos:
 
 | Repo | Purpose | Local path |
 |------|---------|------------|
-| `porelli/portcullis` | **This repo** — core stack | `/Volumes/workspace/midway` |
-| `porelli/portcullis-hub` | Hub management UI (`ghcr.io/porelli/portcullis-hub`) | `/Volumes/workspace/portcullis-hub` |
-| `porelli/portcullis-templates` | Default app marketplace (22 templates) | `/Volumes/workspace/portcullis-templates` |
-| `porelli/portcullis-docs` | Documentation website | `/Volumes/workspace/portcullis-docs` |
+| `porelli/portcullis` | **This repo** — core stack | `/Volumes/workspace/portcullis/portcullis` |
+| `porelli/portcullis-hub` | Hub management UI (`ghcr.io/porelli/portcullis-hub`) | `/Volumes/workspace/portcullis/portcullis-hub` |
+| `porelli/portcullis-templates` | Default app marketplace (22 templates) | `/Volumes/workspace/portcullis/portcullis-templates` |
+| `porelli/portcullis-docs` | Documentation website | `/Volumes/workspace/portcullis/portcullis-docs` |
 
 ## Critical Rules
 
@@ -44,15 +44,19 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 
 ### Testing
 
-- Per-app test scripts at `tests/apps/<app>.sh`
-- Shared helpers in `tests/lib.sh`
-- CI: `.github/workflows/app-tests.yml`
-- Local: `act -W .github/workflows/app-tests.yml`
+- Core infra CI: `.github/workflows/ci.yml` (this repo)
+- Unit tests (no containers): `python3 -m pytest tests/test_group_gate.py`, `bash tests/test_shell_libs.sh`, `cd enroll && go test ./...`
+- Client-cert revocation is enforced by group-gate, so routers need `client-headers@file` BEFORE `portcullis-groups@docker`
+- Per-app template tests live in `porelli/portcullis-templates` (`tests/apps/<app>.sh`, `.github/workflows/test-apps.yml`)
 
 ### Deployment
 
 - Server: `admin@203.0.113.10:~/midway`
 - Core: `docker compose -p portcullis up -d`
+- Upgrade: `./scripts/upgrade.sh` (one-time `--migrate-vault` when leaving Vault dev mode — creates a new CA, all YubiKeys must re-enroll)
+- Vault runs in server mode (raft) and auto-unseals from `secrets/`; admin scripts read the root token from `secrets/vault-init.json` (or `VAULT_TOKEN`). Never add a default/dev token.
+- `portcullis-proxy` has fixed IPAM (`PORTCULLIS_PROXY_SUBNET`/`_IP_RANGE`); Traefik is pinned to `PORTCULLIS_TRAEFIK_IP` — header-auth apps trust only that IP
+- `templates/` must exist before `up` (bootstrap/upgrade create it); the Hub fills it
 - Hub pulls from GHCR: `ghcr.io/porelli/portcullis-hub:latest`
 - Hub auto-clones templates from `porelli/portcullis-templates`
 
@@ -62,9 +66,15 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 |------|---------|
 | `docker-compose.yml` | Core services (Traefik, Keycloak, LLDAP, Vault, oauth2-proxy, group-gate, Hub) |
 | `scripts/group-gate.py` | Per-subdomain group authorization middleware |
-| `scripts/group-gate-map.conf` | Subdomain → required LLDAP group mapping |
+| `scripts/group-gate-map.conf` | Subdomain → required LLDAP group mapping (authoritative for core subdomains; Hub's `groups` key in `group-gate-policy.json` adds/overrides app subdomains) |
+| `tests/test_group_gate.py` | group-gate unit tests (`python3 tests/test_group_gate.py`) |
 | `scripts/apply-config.sh` | Applies ACME_STAGING and MTLS_ENABLED toggles |
 | `scripts/bootstrap.sh` | One-command initial setup |
 | `keycloak/realm-export.json` | Keycloak realm with WebAuthn + X.509 flows |
-| `tests/lib.sh` | Shared test helpers |
-| `.github/workflows/app-tests.yml` | Per-app auth CI tests |
+| `tests/test_shell_libs.sh` | Unit tests for `scripts/lib/proxy-network.sh` + revoked-serial sync in `scripts/lib/vault-common.sh` (stub `docker`/`vault`) |
+| `scripts/vault-init.sh` | Vault init (1 key share) / unseal / enroll AppRole; idempotent, run by bootstrap + upgrade |
+| `vault/` | Vault server config (`vault.hcl`, raft), auto-unseal entrypoint, `policies/enroll.hcl` |
+| `secrets/` | **gitignored** (only `.gitkeep` tracked; masked from the Hub by tmpfs), 0700: `vault-init.json` (root token + unseal key), `vault-unseal/`, `enroll/` AppRole creds |
+| `certs/revocation/revoked-serials.txt` | Revoked client-cert serials (written by `revoke-cert.sh`, read by group-gate) |
+| `templates/` | **gitignored**, Hub-generated copies of app template dirs (mounted rw into the Hub at `/project/templates`) so `./templates/<app>/...` bind mounts resolve on the host |
+| `.github/workflows/ci.yml` | Core infrastructure CI |
