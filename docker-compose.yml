@@ -299,8 +299,8 @@ services:
     image: python:3-alpine
     entrypoint: ["python3", "-u", "/app/group-gate.py"]
     volumes:
-      - ./scripts/group-gate.py:/app/group-gate.py:ro
-      - ./scripts/group-gate-map.conf:/etc/group-gate/map.conf:ro
+      - ./group-gate/group-gate.py:/app/group-gate.py:ro
+      - ./group-gate/group-gate-map.conf:/etc/group-gate/map.conf:ro
       # Hub writes per-app auth policies into this volume under group-gate-policy.json
       - hub_data:/hub-data:ro
       # Revoked client-cert serials, written by scripts/revoke-cert.sh.

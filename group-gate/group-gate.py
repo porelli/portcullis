@@ -9,7 +9,7 @@ Checks, run in order:
      itself never checks CRLs, so this is where revocation is enforced.
      Revoked serials come from
        - GATE_REVOKED_FILE (one hex serial per line, colons optional, '#'
-         comments; written by scripts/revoke-cert.sh), re-read whenever it
+         comments; written by `portcullis cert revoke|sync`), re-read whenever it
          changes. Missing file = none revoked; unreadable file = requests
          that present a cert are denied (fail closed).
        - GATE_CRL_URL (Vault's DER CRL, e.g. http://vault:8200/v1/pki_int/crl),

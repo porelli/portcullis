@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for scripts/group-gate.py.
+"""Unit tests for group-gate/group-gate.py.
 
 Run: python3 tests/test_group_gate.py
 Starts group-gate in-process on an ephemeral port with temp map/policy files.
@@ -18,8 +18,8 @@ import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-GATE_PATH = os.path.join(HERE, "..", "scripts", "group-gate.py")
-MAP_PATH = os.path.join(HERE, "..", "scripts", "group-gate-map.conf")
+GATE_PATH = os.path.join(HERE, "..", "group-gate", "group-gate.py")
+MAP_PATH = os.path.join(HERE, "..", "group-gate", "group-gate-map.conf")
 
 TMP = tempfile.mkdtemp()
 POLICY = os.path.join(TMP, "policy.json")
