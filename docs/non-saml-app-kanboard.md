@@ -221,7 +221,7 @@ in automatically as the user matching your certificate's CN.
 The first time, you need to bootstrap an admin user in Kanboard:
 
 1. In LLDAP, create a user (e.g., `admin`) if not already present
-2. Enroll their YubiKey with `./scripts/enroll-yubikey.sh admin admin@example.com`
+2. Enroll their YubiKey with `./portcullis cert enroll admin admin@example.com`
 3. Visit Kanboard with that cert — the user is created automatically
 4. If you configured `REVERSE_PROXY_DEFAULT_ADMIN`, that user gets admin rights
 

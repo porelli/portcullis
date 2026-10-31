@@ -4,15 +4,17 @@ Portcullis uses two independent TLS features that can be toggled independently:
 
 | Setting | `.env` variable | Default | What it controls |
 |---------|----------------|---------|------------------|
-| **Certificate source** | `ACME_STAGING` | `true` | Staging (test) vs production (trusted) Let's Encrypt certs |
+| **Certificate source** | `ACME_STAGING` | `false` | Staging (test) vs production (trusted) Let's Encrypt certs |
 | **Client certificates** | `MTLS_ENABLED` | `true` | Whether Traefik requests mTLS client certs (PIV/YubiKey) |
 
 After changing either toggle, run:
 
 ```bash
-./scripts/apply-config.sh
-docker compose up -d --force-recreate traefik
+./portcullis config apply
+./portcullis up
 ```
+
+`config apply` rewrites `traefik/dynamic/tls.yml` (hot-reloaded by Traefik) and `ACME_CA_SERVER` in `.env`; `up` recreates Traefik when its environment changed.
 
 ---
 
@@ -22,7 +24,7 @@ docker compose up -d --force-recreate traefik
 
 - Uses Let's Encrypt **staging** CA — no rate limits, but **browsers won't trust the certificate**.
 - Great for initial setup, testing, and development.
-- App containers that talk to Keycloak over HTTPS mount `certs/ca-bundle.crt`, which `apply-config.sh` builds from: system CAs + the internal Portcullis PKI chain + the Let's Encrypt staging root (only when `ACME_STAGING=true`). This is handled automatically.
+- App containers that talk to Keycloak over HTTPS mount `certs/ca-bundle.crt`, which `portcullis config apply` (and `init`, `up`, `upgrade`) builds from: system CAs + the internal Portcullis PKI chain + the Let's Encrypt staging root (only when `ACME_STAGING=true`). This is handled automatically.
 
 **Browser workarounds:**
 
@@ -58,12 +60,11 @@ curl -k https://app.portcullis.example.com
    ACME_STAGING=false
    ```
 
-2. Apply and restart:
+2. Apply and restart (`config apply` notices the staging→production flip
+   and clears Traefik's `acme.json`, so a new certificate is requested):
    ```bash
-   ./scripts/apply-config.sh
-   # Delete the old staging cert so Traefik requests a new one
-   docker compose exec traefik rm -f /acme/acme.json
-   docker compose up -d --force-recreate traefik
+   ./portcullis config apply
+   ./portcullis up
    ```
 
 3. Wait ~2 minutes for DNS-01 challenge to complete. Check logs:
@@ -98,14 +99,14 @@ Most apps end up on `authaware` with a default policy of "any of mTLS / WebAuthn
 ### Revoking client certificates
 
 ```bash
-./scripts/revoke-cert.sh --list          # find the serial
-./scripts/revoke-cert.sh <serial>        # revoke (add --yes to skip the prompt)
-./scripts/revoke-cert.sh --sync          # rewrite the serial list from Vault
+./portcullis cert list                # find the serial (--all includes revoked)
+./portcullis cert revoke <serial>     # revoke (add --yes to skip the prompt)
+./portcullis cert sync                # rewrite the serial list from Vault
 ```
 
 **Traefik does not check CRLs** — a TLS handshake with a revoked-but-unexpired cert still succeeds. Revocation is enforced by **group-gate** (`portcullis-groups@docker`): `client-headers@file` (Traefik `passTLSClientCert`, with `serialNumber: true`) passes `X-Forwarded-Tls-Client-Cert-Info` to the backend *and* to every later forward-auth middleware, and group-gate returns 403 when the cert's serial is revoked. Sources:
 
-- `certs/revocation/revoked-serials.txt` — rewritten atomically by `revoke-cert.sh` from Vault's list of revoked serials; checked on the next request. If Vault can't be queried (sealed, bad token, unreachable) the file is left unchanged and the script fails — it never "un-revokes" by writing an empty list.
+- `certs/revocation/revoked-serials.txt` — rewritten atomically by `portcullis cert revoke` / `cert sync` from Vault's list of revoked serials; checked on the next request. If Vault can't be queried (sealed, bad token, unreachable) the file is left unchanged and the command fails — it never "un-revokes" by writing an empty list.
 - Vault's CRL (`http://vault:8200/v1/pki_int/crl`), re-fetched every 60 s — also covers revocations made directly through the Vault API/UI. If Vault is unreachable the last good CRL is kept.
 
 Coverage: every router whose middleware chain has `client-headers@file` **before** `portcullis-groups@docker` (all core routers and the default app templates). **Not covered:** routers that rely on the TLS client cert alone (e.g. a `protected`-tier router without `portcullis-groups@docker`) — the 24 h cert lifetime bounds the exposure there — and Keycloak sessions that were already opened with the cert (sign the user out in the Keycloak admin console, or enable CRL checking in the realm's X.509 authenticator).
@@ -114,23 +115,19 @@ Coverage: every router whose middleware chain has `client-headers@file` **before
 
 Vault runs in **server mode** with integrated (raft) storage on the `vault_data` volume (`vault/vault.hcl`), so the CA survives restarts. The listener is plain HTTP on the internal `portcullis` network and `127.0.0.1:8200` on the host only.
 
-`./scripts/vault-init.sh` (run by `bootstrap.sh`, `upgrade.sh` and `restore.sh`; idempotent) does:
+`./portcullis vault init` (run by `portcullis init`, `upgrade` and `restore`; idempotent) does:
 
 1. **Init** (first run only) with **one key share, threshold 1**, writing to `secrets/` (dir `0700`, files `0600`, gitignored):
    - `secrets/vault-init.json` — root token + unseal key (`vault operator init` output)
    - `secrets/vault-unseal/unseal-key` — mounted read-only into the vault container
 2. **Unseal**. Afterwards `vault/entrypoint.sh` unseals automatically on every container start (`docker compose up`, restart, host reboot).
-3. **Least privilege for enroll**: AppRole `portcullis-enroll` with policy `vault/policies/enroll.hcl` (only `pki_int/sign/client-cert`, list `pki_int/certs`, read `pki_int/cert/*`). Credentials in `secrets/enroll/` are mounted read-only into enroll, which logs in for 1 h tokens and logs in again before expiry or on 403 — there is no static or root token in `.env` any more. Rotate with `./scripts/vault-init.sh --rotate-enroll-secret`.
+3. **Least privilege for enroll**: AppRole `portcullis-enroll` with policy `vault/policies/enroll.hcl` (only `pki_int/sign/client-cert`, list `pki_int/certs`, read `pki_int/cert/*`). Credentials in `secrets/enroll/` are mounted read-only into enroll, which logs in for 1 h tokens and logs in again before expiry or on 403 — there is no static or root token in `.env`. Rotate with `./portcullis vault rotate-enroll-secret`.
 
-Admin scripts (`setup-vault-pki.sh`, `enroll-yubikey.sh`, `renew-yubikey.sh`, `revoke-cert.sh`, `status.sh`) use the root token from `secrets/vault-init.json`, or `VAULT_TOKEN` if exported. They use the host `vault` CLI if installed, otherwise the CLI inside the vault container (token passed by environment-variable name, never on the command line). `secrets/` and `backups/` are masked from the Hub container with empty tmpfs mounts.
+The admin commands (`portcullis pki setup`, `cert enroll|renew|revoke|list|sync`, `status`) use the root token from `secrets/vault-init.json`, or `VAULT_TOKEN` if exported. They use the host `vault` CLI if installed, otherwise the CLI inside the vault container (token passed by environment-variable name, never on the command line). `secrets/` and `backups/` are masked from the Hub container with empty tmpfs mounts.
 
-`setup-vault-pki.sh` is idempotent: it does nothing when the root issuer, intermediate issuer and `client-cert` role all exist; if it finds an incomplete PKI (an earlier run aborted) it wipes and recreates it; any Vault error aborts instead of being mistaken for "no PKI". `certs/server.key` is written `0600`.
+`portcullis pki setup` is idempotent: it never replaces an existing CA (only missing pieces such as the `client-cert` role or the exported CA files are recreated); if it finds an incomplete PKI (an earlier run aborted before the intermediate was signed) it wipes and recreates it; any Vault error aborts instead of being mistaken for "no PKI". If Vault has no CA but `certs/ca-chain.crt` exists (Vault data lost), it refuses to create a new CA — restore a backup, or pass `--force` to create a new one (every client cert must then be re-enrolled). `certs/server.key` is written `0600`.
 
-**Trade-off.** The unseal key lives on the same host as the encrypted data, so root on the host (or anyone who can read `secrets/`) can unseal Vault. What it does protect: a copy of the `vault_data` volume alone is useless. Multiple Shamir shares on the same disk would add nothing, hence one share. For stronger guarantees remove the `secrets/vault-unseal` mount and unseal manually (`docker compose exec vault vault operator unseal`) after each restart, or use a cloud KMS auto-unseal. **Keep an offline copy of `secrets/vault-init.json`** — backups made by `upgrade.sh` include `secrets/`, so protect them like the keys themselves.
-
-### Upgrading from dev-mode Vault
-
-Older releases ran Vault in dev mode (in-memory, root token `myroot`). The CA keys were generated `internal` (non-exportable) inside that in-memory Vault, so they **cannot be migrated**. `./scripts/upgrade.sh` detects dev mode and stops unless you pass `--migrate-vault` (or confirm interactively). Migrating creates a new root + intermediate CA, rewrites `certs/root-ca.crt`, `certs/intermediate-ca.crt`, `certs/ca-chain.crt` (and `server.crt`/`server.key` if present; the old files are copied to `backups/certs-before-vault-migration-*`), and **every YubiKey client certificate must be re-enrolled**. WebAuthn logins are unaffected. `VAULT_DEV_TOKEN` in `.env` is no longer used and can be deleted.
+**Trade-off.** The unseal key lives on the same host as the encrypted data, so root on the host (or anyone who can read `secrets/`) can unseal Vault. What it does protect: a copy of the `vault_data` volume alone is useless. Multiple Shamir shares on the same disk would add nothing, hence one share. For stronger guarantees remove the `secrets/vault-unseal` mount and unseal manually (`docker compose exec vault vault operator unseal`) after each restart, or use a cloud KMS auto-unseal. **Keep an offline copy of `secrets/vault-init.json`** — backups made by `portcullis backup` / `upgrade` include `secrets/`, so protect them like the keys themselves.
 
 ### Disabled (`MTLS_ENABLED=false`)
 
@@ -147,8 +144,8 @@ This is simpler to set up and doesn't require `ykman` CLI or PIV slot configurat
 
 2. Apply and restart:
    ```bash
-   ./scripts/apply-config.sh
-   docker compose up -d --force-recreate traefik
+   ./portcullis config apply
+   ./portcullis up
    ```
 
 ---
@@ -197,7 +194,7 @@ Same as above — staging CA is not trusted by browsers.
 
 ### App shows "unable to get local issuer certificate"
 The app container can't verify Keycloak's staging TLS cert. Make sure:
-- `certs/ca-bundle.crt` exists (run `./scripts/apply-config.sh`)
+- `certs/ca-bundle.crt` exists (run `./portcullis config apply --bundle-only`)
 - The container mounts it (check compose.yml for `ca-bundle.crt` volume mount)
 - For Node.js apps: set `NODE_EXTRA_CA_CERTS=/path/to/ca-bundle.crt`
 - For Go apps: set `SSL_CERT_FILE=/path/to/ca-bundle.crt`

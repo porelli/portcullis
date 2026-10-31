@@ -101,12 +101,17 @@ Set `DNS_PROVIDER=<lego-provider-name>` and its required env vars in `.env`.
 
 ## Step 3: Configure Portcullis
 
-### If using bootstrap (first time setup)
+### First-time setup
 
-The bootstrap script will prompt you for your domain and DNS provider:
+`portcullis init` prompts for your domain, email and DNS provider (the
+provider's API credentials are read with a hidden prompt, or from the
+environment):
 
 ```bash
-./scripts/bootstrap.sh
+./portcullis init
+# or unattended:
+PORKBUN_API_KEY=pk1_... PORKBUN_SECRET_API_KEY=sk1_... \
+  ./portcullis init --non-interactive --domain portcullis.example.com --dns-provider porkbun
 ```
 
 ### If updating an existing installation
@@ -122,11 +127,13 @@ PORKBUN_SECRET_API_KEY=sk1_...
 LLDAP_BASE_DN=dc=portcullis,dc=example,dc=com
 ```
 
-Then restart services:
+Then restart services (and refresh the Keycloak redirect URI for the new
+domain):
 
 ```bash
-docker compose down
-docker compose up -d
+./portcullis down
+./portcullis up
+./portcullis keycloak configure
 ```
 
 Traefik will automatically request and renew the wildcard certificate.

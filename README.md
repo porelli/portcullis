@@ -9,11 +9,24 @@ a user directory, and SAML/OIDC identity provider for downstream applications.
 
 ```bash
 git clone git@github.com:porelli/portcullis.git && cd portcullis
-./scripts/bootstrap.sh
+./portcullis init
 ```
 
-The bootstrap script generates passwords, starts all services, initializes the CA,
-configures the identity provider, and prints URLs and credentials.
+`portcullis init` asks for your domain and DNS provider, writes `.env` (0600) with
+every secret randomly generated, initialises Vault and the CA, starts all
+services, configures the identity provider, and prints the URLs.
+
+Everything else goes through the same command — `./portcullis help`:
+
+```
+init | up | down | upgrade | status [--json] | backup | restore
+config apply [--bundle-only] | config init | dns setup [--check]
+vault init | vault unseal | vault rotate-enroll-secret | pki setup [--force] [--with-server-cert]
+keycloak configure | oidc register
+cert enroll | cert renew | cert revoke | cert list | cert sync
+```
+
+`./portcullis <command> --help` documents each one.
 
 ## Two Ways to Authenticate
 
@@ -87,7 +100,7 @@ Keycloak syncs from LLDAP automatically.
 
 **mTLS (CLI — for advanced users):**
 ```bash
-./scripts/enroll-yubikey.sh <username> <email>
+./portcullis cert enroll <username> <email>
 ```
 
 Or use the web UI at `https://enroll.<domain>` → "mTLS Certificate" for a guided flow.
@@ -153,30 +166,15 @@ auth in common apps (Gitea, Grafana, Wiki.js, pgAdmin, etc.).
 │   ├── adding-a-domain.md          # DNS, certs, multiple domains
 │   ├── saml-app-nextcloud.md       # SAML app integration guide
 │   └── non-saml-app-kanboard.md    # Header-based auth guide
-├── scripts/
-│   ├── bootstrap.sh                # One-command setup
-│   ├── vault-init.sh               # Init/unseal Vault, enroll AppRole (idempotent)
-│   ├── setup-vault-pki.sh          # Initialize CA hierarchy (no-op if it exists)
-│   ├── configure-keycloak.sh       # Import realm config
-│   ├── init-config.sh              # Initialize config/ directory
-│   ├── upgrade.sh                  # Safe upgrade for existing deployments
-│   ├── restore.sh                  # Restore from backup
-│   ├── status.sh                   # Health dashboard
-│   ├── revoke-cert.sh              # Revoke client certificate (enforced by group-gate)
-│   ├── register-oidc-clients.sh    # Register OIDC clients in Keycloak
-│   ├── enroll-yubikey.sh           # CLI mTLS enrollment
-│   └── renew-yubikey.sh            # CLI mTLS renewal
-├── hub/                            # App catalog web UI (Go)
-│   ├── main.go
-│   ├── Dockerfile
-│   └── web/                        # HTML templates
-├── templates/                      # App templates (local catalog)
-│   ├── headscale/                  # VPN — Headscale + Headplane
-│   ├── netbird/                    # VPN — NetBird + COTURN
-│   ├── grafana/                    # Monitoring
-│   ├── wiki/                       # Wiki.js
-│   ├── vault-ui/                   # Vault web UI
-│   └── docs/                       # Public docs site
+├── portcullis                     # The admin CLI (./portcullis help)
+├── scripts/lib/                    # CLI libraries, one per area (vault, pki, certs, keycloak, ...)
+├── group-gate/
+│   ├── group-gate.py               # Per-subdomain group / policy / revocation gate
+│   └── group-gate-map.conf         # Core subdomain → required LLDAP group
+├── templates/                      # Hub-generated copies of enabled app templates (gitignored)
+├── vault/                          # Vault server config (raft), auto-unseal entrypoint, enroll policy
+├── secrets/                        # Vault root token, unseal key, enroll AppRole creds (gitignored, 0700)
+├── tests/                          # Unit tests (CLI, shell libs, group-gate)
 ├── enroll/                         # Enrollment web UI (Go)
 │   ├── main.go
 │   ├── Dockerfile
@@ -203,20 +201,19 @@ portcullis/              ← git pull updates this (upstream)
     .env                 ← secrets, domain, DNS provider
     docker-compose.override.yml  ← compose customizations
     traefik/*.yml        ← custom Traefik routes
-    hub/state.yaml       ← enabled apps & sources
 ```
 
 ### Setup
 
 ```bash
-# Bootstrap creates config/ automatically, or init manually:
-./scripts/init-config.sh
+# `portcullis init` creates config/ automatically, or run it yourself:
+./portcullis config init
 
-# Point it at your private repo:
-./scripts/init-config.sh --remote git@github.com:you/my-portcullis-config.git
+# Point it at your private repo (.env holds every secret):
+./portcullis config init --remote git@github.com:you/my-portcullis-config.git
 
 # Or restore an existing config on a new machine:
-./scripts/init-config.sh --from git@github.com:you/my-portcullis-config.git
+./portcullis config init --from git@github.com:you/my-portcullis-config.git
 ```
 
 ### Day-to-day workflow
@@ -230,7 +227,7 @@ vi config/docker-compose.override.yml
 cd config && git add -A && git commit -m "update passwords" && git push
 
 # Update Portcullis (no conflicts)
-cd .. && git pull && docker compose up -d
+cd .. && git pull && ./portcullis upgrade
 ```
 
 | What to customize | File in `config/` | Mechanism |
@@ -238,7 +235,8 @@ cd .. && git pull && docker compose up -d
 | Secrets, domain, DNS provider | `.env` | Symlinked to project root |
 | Compose overrides (ports, volumes, limits) | `docker-compose.override.yml` | Docker Compose auto-merges |
 | Custom Traefik routers/middlewares | `traefik/*.yml` | Symlinked into `traefik/dynamic/local/`, hot-reloaded |
-| Enabled apps + template sources | `hub/state.yaml` | Managed by Hub UI |
+
+Enabled apps and template sources are Hub state (in the `hub_data` volume), managed in the Hub UI.
 
 ## Integration
 
@@ -255,12 +253,11 @@ Portcullis is an auth layer that works with existing platforms:
 
 ## Production Considerations
 
-- **Vault**: runs in server mode (raft storage) and auto-unseals from `secrets/` on the host — back up `secrets/vault-init.json` (root token + unseal key) **offline**. Upgrading from the old dev-mode Vault: `./scripts/upgrade.sh --migrate-vault` (creates a new CA; every YubiKey must be re-enrolled)
-- **Passwords**: the bootstrap script generates random values — keep them safe
-- **Forward Auth secret**: generate a strong `FORWARD_AUTH_SECRET` and `FORWARD_AUTH_CLIENT_SECRET`
-- **Revocation**: `./scripts/revoke-cert.sh <serial>` — enforced by group-gate (Traefik itself doesn't check CRLs); optionally also enable CRL checking in Keycloak's X.509 config
-- **Renewal**: automate `renew-yubikey.sh` via cron/launchd (mTLS users only)
-- **Backups**: Vault volume **plus `secrets/`** (unseal key — without it the volume is useless), PostgreSQL (Keycloak), LLDAP data volume; `upgrade.sh` backs up all of them
-- **Network**: `portcullis-proxy` uses a fixed subnet (`PORTCULLIS_PROXY_SUBNET`, default `172.31.250.0/24`) with Traefik pinned at `PORTCULLIS_TRAEFIK_IP` — change in `.env` only if it collides with a host network, then run `upgrade.sh`
+- **Vault**: runs in server mode (raft storage) and auto-unseals from `secrets/` on the host — back up `secrets/vault-init.json` (root token + unseal key) **offline**
+- **Secrets**: `portcullis init` generates every password and secret into `.env` (0600); docker compose refuses to start if one is missing — there are no default passwords
+- **Revocation**: `./portcullis cert revoke <serial>` — enforced by group-gate (Traefik itself doesn't check CRLs); optionally also enable CRL checking in Keycloak's X.509 config
+- **Renewal**: automate `./portcullis cert renew <user>` via cron/launchd (mTLS users only)
+- **Backups**: `./portcullis backup` (also run by `upgrade`) saves `.env`, `certs/`, `secrets/` (the unseal key — the Vault volume is useless without it) and the Vault, PostgreSQL and LLDAP volumes to `backups/`; `./portcullis restore <dir>` puts them back
+- **Network**: `portcullis-proxy` uses a fixed subnet (`PORTCULLIS_PROXY_SUBNET`, default `172.31.250.0/24`) with Traefik pinned at `PORTCULLIS_TRAEFIK_IP` — change in `.env` only if it collides with a host network (before `init`; later the network has to be recreated, `./portcullis up` explains how)
 - **Docker socket**: consider a socket proxy for Traefik for hardening
 - **PIV PIN**: enforce PIN changes from default (123456) for mTLS users
