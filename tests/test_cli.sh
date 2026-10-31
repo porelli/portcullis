@@ -8,6 +8,10 @@
 #
 set -uo pipefail
 
+# The shell environment wins over .env (like docker compose): make sure
+# the caller's (e.g. CI's workflow-level) settings cannot leak in.
+unset PORTCULLIS_DOMAIN VAULT_ADDR VAULT_TOKEN COMPOSE_FILE KEYCLOAK_URL
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI="$HERE/../portcullis"
 WORK="$(mktemp -d)"
