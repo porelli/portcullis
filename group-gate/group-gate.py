@@ -46,6 +46,16 @@ Request paths on group-gate itself (the forwardAuth `address`):
   /authenticated[/...]  everything except the subdomain group check (step 2):
                         any authenticated user. Used for self-service routes
                         such as enroll.<domain>/self (portcullis-self@docker).
+  /public-guard         public exceptions (portcullis-public-guard@docker, on
+                        the Hub's portcullis-public-<app> routers, no forward-
+                        auth): no user, no group, no policy. Allows only if the
+                        subdomain has a `public_paths` entry (policy file
+                        version 3), the normalised path is inside one of its
+                        patterns, and the request carries no credential
+                        (Authorization, Proxy-Authorization, the app's
+                        credential headers, cookies or query parameters,
+                        names normalised the way PHP does). Otherwise 403.
+                        See public_guard_check().
   /healthz              liveness (no checks, for the container healthcheck)
   /metrics              Prometheus metrics (monitoring profile): decisions by
                         endpoint/result, denials and step-ups by reason,
@@ -59,11 +69,15 @@ Config sources (both re-read on every request; they are tiny):
     core subdomains (auth, traefik, hub, directory, enroll, metrics): the Hub policy
     file can never override those.
   - /hub-data/group-gate-policy.json — written by the Hub (contract §4):
-      {"version": 2,
+      {"version": 3,
        "policies": {"<subdomain>": {"factors": [...], "op": "any|all|"}},
        "default":  {"factors": [...], "op": "..."},
        "groups":   {"<subdomain>": "<required LLDAP group>"},
-       "path_groups": {"<subdomain>": [{"prefix": "/admin", "group": "<LLDAP group>"}]}}
+       "path_groups": {"<subdomain>": [{"prefix": "/admin", "group": "<LLDAP group>"}]},
+       "public_paths": {"<subdomain>": {"paths": [{"path": "/s/{token}", "match": "prefix"}],
+                        "token_pattern": "^...$", "static_extensions": [...],
+                        "credential_headers": [...], "credential_cookies": [...],
+                        "credential_query": [...]}}}
     Every map is keyed by the lowercase subdomain the request is for —
     never by template ID. Optional; no file means every app falls through to the group check
     only. Missing keys (incl. `version`) are treated as empty. A file that
@@ -113,7 +127,10 @@ CORE_SUBDOMAINS = ("auth", "traefik", "hub", "directory", "enroll", "metrics")
 CORE_DEFAULT_GROUP = "lldap_admin"
 VALID_OPS = ("", "any", "all")
 # Highest policy-file schema version this gate understands (contract §4).
-POLICY_VERSION = 2
+POLICY_VERSION = 3
+# /public-guard needs a file of exactly this version: an older file has no
+# (or another) public_paths shape, so the guard denies.
+PUBLIC_GUARD_VERSION = 3
 # Reserved group (contract §4): the Hub publishes it for routed apps whose
 # config is unknown. It always denies; nobody may claim membership.
 DENY_GROUP = "__portcullis_deny__"
@@ -189,12 +206,23 @@ def build_group_map(policy_doc: dict) -> dict:
     return mapping
 
 
-def load_policy_file() -> dict:
-    """Return the Hub policy doc, {} if the file is absent.
+_POLICY_CACHE: dict = {}
+_POLICY_LOCK = threading.Lock()
 
-    Raises PolicyError if the file exists but is not a JSON object — a
-    broken policy must not silently downgrade apps to "no policy".
-    """
+
+def _read_policy_doc():
+    """Parsed policy file, cached on (path, inode, mtime, size): the Hub
+    replaces it atomically (rename), so any change gives a new key."""
+    try:
+        st = os.stat(POLICY_FILE)
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        raise PolicyError(f"cannot read policy file: {e}") from e
+    key = (POLICY_FILE, st.st_ino, st.st_mtime_ns, st.st_size)
+    with _POLICY_LOCK:
+        if _POLICY_CACHE.get("key") == key:
+            return _POLICY_CACHE["doc"]
     try:
         with open(POLICY_FILE) as f:
             doc = json.load(f)
@@ -202,6 +230,20 @@ def load_policy_file() -> dict:
         return {}
     except (OSError, ValueError) as e:
         raise PolicyError(f"cannot read policy file: {e}") from e
+    with _POLICY_LOCK:
+        _POLICY_CACHE.clear()
+        _POLICY_CACHE.update(key=key, doc=doc)
+    return doc
+
+
+def load_policy_file() -> dict:
+    """Return the Hub policy doc, {} if the file is absent.
+
+    Raises PolicyError if the file exists but is not a JSON object — a
+    broken policy must not silently downgrade apps to "no policy". Callers
+    must not modify the returned (cached) document.
+    """
+    doc = _read_policy_doc()
     if not isinstance(doc, dict):
         raise PolicyError("policy file is not a JSON object")
     version = doc.get("version")
@@ -356,6 +398,243 @@ def required_path_groups(rules: List[Tuple[str, str]], candidates: List[str]) ->
     return needed
 
 
+# ── Public guard (public exceptions, /public-guard) ───────────────────
+#
+# The Hub's public router (portcullis-public-<app>, no forward-auth) runs
+# portcullis-public-guard@docker first. The guard re-checks what Traefik's
+# rule already restricts (defence in depth) and refuses any request that
+# carries a credential the app would log a user in with: on these paths a
+# stolen password, API key or session cookie must not get past the
+# gateway's hardware-key requirement.
+
+PUBLIC_MATCHES = ("prefix", "exact", "static")
+PUBLIC_KEYS = {"paths", "token_pattern", "static_extensions", "credential_headers",
+               "credential_cookies", "credential_query"}
+ALWAYS_CREDENTIAL_HEADERS = ("authorization", "proxy-authorization")
+_PUBLIC_TOKEN = "{token}"
+_TOKEN_CHARS_RE = re.compile(r"[A-Za-z0-9._~-]{1,128}")
+_PUBLIC_PATH_RE = re.compile(r"(/([A-Za-z0-9._~-]+|\{token\}))+")
+_NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+_HEADER_NAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}")
+_EXT_RE = re.compile(r"[a-z0-9]{1,8}")
+
+
+class PublicConfig:
+    def __init__(self, paths, token_re, exts, headers, cookies, query):
+        self.paths = paths            # [(path, match)]
+        self.token_re = token_re      # compiled or None
+        self.exts = exts              # tuple of extensions
+        self.headers = headers        # normalised header names (lower, '-')
+        self.cookies = cookies        # php_var_name(...).lower() of each name
+        self.query = query
+
+
+def _str_list(entry: dict, key: str, rx, sub: str) -> List[str]:
+    v = entry.get(key, [])
+    if not isinstance(v, list) or not all(isinstance(x, str) and rx.fullmatch(x) for x in v):
+        raise PolicyError(f"public_paths[{sub!r}].{key} is not a list of valid names")
+    return v
+
+
+def public_config_for(policy_doc: dict, subdomain: str) -> Optional[PublicConfig]:
+    """The subdomain's public_paths entry, validated (None if absent).
+
+    Raises PolicyError for a file version other than PUBLIC_GUARD_VERSION or
+    any malformed / unknown field: the guard then denies (fail closed).
+    """
+    version = policy_doc.get("version")
+    if version != PUBLIC_GUARD_VERSION:
+        raise PolicyError(f"public guard needs policy file version {PUBLIC_GUARD_VERSION}, got {version!r}")
+    pp = policy_doc.get("public_paths")
+    if pp is None:
+        return None
+    if not isinstance(pp, dict):
+        raise PolicyError("'public_paths' is not an object")
+    if subdomain in CORE_SUBDOMAINS:
+        return None
+    entry = pp.get(subdomain)
+    if entry is None:
+        return None
+    if not isinstance(entry, dict):
+        raise PolicyError(f"public_paths[{subdomain!r}] is not an object")
+    unknown = set(entry) - PUBLIC_KEYS
+    if unknown:
+        raise PolicyError(f"public_paths[{subdomain!r}] has unknown keys {sorted(unknown)}")
+    raw_paths = entry.get("paths")
+    if not isinstance(raw_paths, list) or not raw_paths:
+        raise PolicyError(f"public_paths[{subdomain!r}].paths is empty")
+    paths = []
+    has_token = False
+    for p in raw_paths:
+        if not isinstance(p, dict) or set(p) != {"path", "match"}:
+            raise PolicyError(f"public_paths[{subdomain!r}] has a malformed path entry {p!r}")
+        path, match = p["path"], p["match"]
+        if not isinstance(path, str) or not _PUBLIC_PATH_RE.fullmatch(path) or match not in PUBLIC_MATCHES:
+            raise PolicyError(f"public_paths[{subdomain!r}] has an invalid path {path!r} / match {match!r}")
+        segs = path.split("/")[1:]
+        if any(seg in (".", "..") or (".." in seg) for seg in segs) or segs.count(_PUBLIC_TOKEN) > 1 \
+                or (match != "prefix" and _PUBLIC_TOKEN in segs):
+            raise PolicyError(f"public_paths[{subdomain!r}] has an invalid path {path!r}")
+        has_token = has_token or _PUBLIC_TOKEN in segs
+        paths.append((path, match))
+    token_re = None
+    pat = entry.get("token_pattern", "")
+    if not isinstance(pat, str):
+        raise PolicyError(f"public_paths[{subdomain!r}].token_pattern is not a string")
+    if has_token:
+        if not (pat.startswith("^") and pat.endswith("$")):
+            raise PolicyError(f"public_paths[{subdomain!r}].token_pattern must be anchored")
+        try:
+            token_re = re.compile(pat)
+        except re.error as e:
+            raise PolicyError(f"public_paths[{subdomain!r}].token_pattern: {e}") from e
+    exts = tuple(_str_list(entry, "static_extensions", _EXT_RE, subdomain))
+    headers = {h.lower().replace("_", "-") for h in _str_list(entry, "credential_headers", _HEADER_NAME_RE, subdomain)}
+    headers.update(ALWAYS_CREDENTIAL_HEADERS)
+    cookies = {php_var_name(n.encode()).lower() for n in _str_list(entry, "credential_cookies", _NAME_RE, subdomain)}
+    query = {php_var_name(n.encode()).lower() for n in _str_list(entry, "credential_query", _NAME_RE, subdomain)}
+    return PublicConfig(paths, token_re, exts, headers, cookies, query)
+
+
+def php_var_name(name: bytes) -> bytes:
+    """The variable name PHP stores a request field under.
+
+    Port of php_register_variable_ex() (php-src main/php_variables.c,
+    PHP-8.4): C-string (stops at NUL), leading spaces dropped, ' ' and '.'
+    become '_' up to the first '['; a '[' with a matching ']' later starts
+    an array, so the variable is the part before it (nc_token[] and
+    nc_token[x] are $_COOKIE['nc_token']); a '[' without one becomes '_'
+    and ' ', '.', '[' after it become '_' too.
+    """
+    name = name.split(b"\0", 1)[0].lstrip(b" ")
+    out = bytearray()
+    for i, c in enumerate(name):
+        if c in (0x20, 0x2E):
+            out.append(0x5F)
+        elif c == 0x5B:
+            rest = name[i + 1:]
+            after = rest[1:] if rest[:1].isspace() else rest
+            if b"]" in after:
+                return bytes(out)
+            out.append(0x5F)
+            out.extend(0x5F if ch in (0x20, 0x2E, 0x5B) else ch for ch in rest)
+            return bytes(out)
+        else:
+            out.append(c)
+    return bytes(out)
+
+
+class CredentialError(Exception):
+    """The request carries something that may log a user in."""
+
+
+def _name_candidates(raw: str, url_decoded: bool) -> List[bytes]:
+    """Names an app may read a cookie / query key as: raw, and percent- /
+    '+'-decoded (PHP url-decodes query keys, not cookie names; other
+    stacks differ, so both are checked). Non-UTF-8 (incl. overlong forms)
+    or control characters after decoding are refused outright."""
+    forms = [raw.encode("utf-8", "surrogateescape")]
+    forms.append(urllib.parse.unquote_to_bytes(raw.replace("+", " ")))
+    out = []
+    for f in forms:
+        try:
+            f.decode("utf-8", "strict")
+        except UnicodeDecodeError as e:
+            raise CredentialError(f"name {raw!r} is not valid UTF-8") from e
+        if any(b < 0x20 or b == 0x7F for b in f):
+            raise CredentialError(f"name {raw!r} contains control characters")
+        out.append(php_var_name(f).lower())
+        out.append(f.strip().lower())
+    return out
+
+
+def credential_problem(cfg: PublicConfig, headers, raw_uri: str) -> Optional[str]:
+    """Why the request carries a credential, or None."""
+    for name in headers.keys():
+        if name.strip().lower().replace("_", "-") in cfg.headers:
+            return f"credential header {name}"
+    try:
+        for cookie_header in headers.get_all("Cookie") or []:
+            # PHP splits on ';' only; ',' too, for other parsers.
+            for part in re.split(r"[;,]", cookie_header):
+                name = part.split("=", 1)[0].lstrip(" \t\r\n\v\f")
+                if not name:
+                    continue
+                if cfg.cookies & set(_name_candidates(name, False)):
+                    return f"credential cookie {name!r}"
+        query = raw_uri.split("#", 1)[0].split("?", 1)[1] if "?" in raw_uri else ""
+        for part in re.split(r"[&;]", query):
+            name = part.split("=", 1)[0]
+            if not name:
+                continue
+            if cfg.query & set(_name_candidates(name, True)):
+                return f"credential query parameter {name!r}"
+    except CredentialError as e:
+        return str(e)
+    return None
+
+
+def _static_ok(path: str, prefix: str, exts) -> bool:
+    if not exts or not path.startswith(prefix + "/"):
+        return False
+    rest = path[len(prefix) + 1:].split("/")
+    dirs, file = rest[:-1], rest[-1]
+    if any(not re.fullmatch(r"[A-Za-z0-9_~@+-]+", d) for d in dirs):
+        return False
+    m = re.fullmatch(r"[A-Za-z0-9_~@+-][A-Za-z0-9._~@+-]*\.([A-Za-z0-9]+)", file)
+    return bool(m) and m.group(1) in exts
+
+
+def public_path_allowed(cfg: PublicConfig, path: str) -> bool:
+    """Is a normalised path inside one of the published patterns? Same
+    semantics as the Hub's router: prefix = segment boundary, exact = the
+    path itself, static = files with a static extension below the prefix;
+    {token} matches one segment the token_pattern accepts."""
+    segs = path.split("/")[1:]
+    for pattern, match in cfg.paths:
+        if match == "static":
+            if _static_ok(path, pattern, cfg.exts):
+                return True
+            continue
+        psegs = pattern.split("/")[1:]
+        if len(segs) < len(psegs) or (match == "exact" and len(segs) != len(psegs)):
+            continue
+        ok = True
+        for ps, s in zip(psegs, segs):
+            if ps == _PUBLIC_TOKEN:
+                ok = bool(cfg.token_re and _TOKEN_CHARS_RE.fullmatch(s) and s not in (".", "..")
+                          and cfg.token_re.fullmatch(s))
+            else:
+                ok = ps == s
+            if not ok:
+                break
+        if ok:
+            return True
+    return False
+
+
+def public_guard_check(policy_doc: dict, subdomain: str, headers, raw_uri: str) -> Optional[str]:
+    """None to allow the public request, else the reason to deny."""
+    try:
+        cfg = public_config_for(policy_doc, subdomain)
+    except PolicyError as e:
+        return f"policy: {e}"
+    if cfg is None:
+        return "no public exception for this subdomain"
+    raw_path = (raw_uri or "").split("#", 1)[0].split("?", 1)[0]
+    if re.search(r"%(2[fF]|5[cC]|00)", raw_path):
+        # An encoded / \ or NUL means different paths to Traefik and the app.
+        return "path: encoded slash, backslash or NUL"
+    try:
+        candidates = normalize_path_candidates(raw_uri)
+    except PathError as e:
+        return f"path: {e}"
+    outside = [c for c in candidates if not public_path_allowed(cfg, c)]
+    if outside:
+        return f"path {outside[0]!r} is not public"
+    return credential_problem(cfg, headers, raw_uri)
+
+
 # ── Metrics (GET /metrics, Prometheus text format) ────────────────────
 
 
@@ -363,7 +642,7 @@ class Metrics:
     """Tiny thread-safe counter registry (no client library in the image)."""
 
     HELP = {
-        "group_gate_requests_total": ("counter", "Forward-auth decisions by endpoint (gate|authenticated) and result (allow|deny|stepup)."),
+        "group_gate_requests_total": ("counter", "Forward-auth decisions by endpoint (gate|authenticated|public_guard) and result (allow|deny|stepup)."),
         "group_gate_denials_total": ("counter", "Denied requests by reason."),
         "group_gate_stepups_total": ("counter", "Step-up (re-authentication) answers by reason."),
         "group_gate_policy_load_errors_total": ("counter", "Requests denied because the Hub policy file or a policy in it is invalid."),
@@ -1013,6 +1292,34 @@ class Handler(BaseHTTPRequestHandler):
 
     _endpoint = "gate"
 
+    def _public_guard(self):
+        raw_host = self.headers.get("X-Forwarded-Host", "")
+        host = normalize_host(raw_host)
+        subdomain = subdomain_for(host)
+        raw_uri = self.headers.get("X-Forwarded-Uri", "")
+        reason = "host not under PORTCULLIS_DOMAIN"
+        if subdomain is not None:
+            try:
+                doc = load_policy_file()
+            except PolicyError as e:
+                doc = None
+                reason = f"policy: {e}"
+            if doc is not None:
+                reason = public_guard_check(doc, subdomain, self.headers, raw_uri)
+        if reason:
+            self._deny(
+                "Access Denied",
+                "<p>This public link can't be opened with these request details. If you are "
+                "signed in to the app in this browser, open the link in a private window.</p>",
+                f"DENIED public host={raw_host!r} uri={raw_uri!r} reason={reason}",
+                "public_guard",
+            )
+            return
+        METRICS.inc("group_gate_requests_total", endpoint=self._endpoint, result="allow")
+        # No identity headers: nobody is signed in on a public path.
+        self.send_response(200)
+        self.end_headers()
+
     def do_GET(self):
         gate_path = urllib.parse.urlsplit(self.path).path
         if gate_path == "/metrics":
@@ -1028,6 +1335,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"ok\n")
+            return
+        if gate_path == "/public-guard":
+            self._endpoint = "public_guard"
+            self._public_guard()
             return
         # /authenticated: any authenticated user, no subdomain group check.
         authenticated_only = gate_path == "/authenticated" or gate_path.startswith("/authenticated/")

@@ -42,8 +42,12 @@ def write_policy(doc):
         if os.path.exists(POLICY):
             os.remove(POLICY)
         return
-    with open(POLICY, "w") as f:
+    # Like the Hub: temp file + rename (group-gate caches the parsed file on
+    # inode/mtime/size; a rename always gives a new inode).
+    tmp = POLICY + ".tmp"
+    with open(tmp, "w") as f:
         f.write(doc if isinstance(doc, str) else json.dumps(doc))
+    os.replace(tmp, POLICY)
 
 
 class GateTest(unittest.TestCase):
@@ -217,8 +221,8 @@ class GateTest(unittest.TestCase):
     # ── version ──
 
     def test_policy_version(self):
-        for doc, want in [({"version": 2}, 200), ({"version": 1}, 200), ({}, 200),
-                          ({"version": 3}, 403), ({"version": "2"}, 403), ({"version": True}, 403),
+        for doc, want in [({"version": 3}, 200), ({"version": 2}, 200), ({"version": 1}, 200), ({}, 200),
+                          ({"version": 4}, 403), ({"version": "2"}, 403), ({"version": True}, 403),
                           ({"version": 0}, 403)]:
             with self.subTest(doc=doc):
                 write_policy(doc)
@@ -374,6 +378,126 @@ def build_crl(serials, with_next_update=True, with_version=True):
         tbs += _der(0x30, b"".join(_der(0x30, _der_int(sn) + t) for sn in serials))
     tbs += _der(0xA0, _der(0x30, b""))  # crlExtensions
     return _der(0x30, _der(0x30, tbs) + alg + _der(0x03, b"\x00\x01\x02"))
+
+
+PUBLIC_DOC = {
+    "version": 3,
+    "public_paths": {
+        "cloud": {
+            "paths": [
+                {"path": "/s/{token}", "match": "prefix"},
+                {"path": "/public.php/dav/files/{token}", "match": "prefix"},
+                {"path": "/dist", "match": "static"},
+                {"path": "/core/mimeicon", "match": "exact"},
+                {"path": "/apps/text/public", "match": "prefix"},
+            ],
+            "token_pattern": "^[A-Za-z0-9-]{1,32}$",
+            "static_extensions": ["css", "js", "svg"],
+            "credential_headers": ["X-Api-Key"],
+            "credential_cookies": ["nc_token", "nc_username"],
+            "credential_query": ["auth_token", "apiKey"],
+        }
+    },
+}
+
+
+class PhpVarNameTest(unittest.TestCase):
+    """php_register_variable_ex() (php-src main/php_variables.c)."""
+
+    def test_mangling(self):
+        for raw, want in [
+            (b"nc_token", b"nc_token"), (b"nc.token", b"nc_token"), (b"nc token", b"nc_token"),
+            (b" nc_token", b"nc_token"), (b"   nc.token", b"nc_token"), (b"nc[token", b"nc_token"),
+            (b"nc[to.ken", b"nc_to_ken"), (b"nc[to[ken", b"nc_to_ken"), (b"nc_token[]", b"nc_token"),
+            (b"nc_token[x]", b"nc_token"), (b"nc_token[ ]", b"nc_token"), (b"nc_token[x][y]", b"nc_token"),
+            (b"nc_token\0junk", b"nc_token"), (b"nc+token", b"nc+token"), (b"", b""),
+        ]:
+            with self.subTest(raw=raw):
+                self.assertEqual(gg.php_var_name(raw), want)
+
+
+class PublicGuardTest(GateTest):
+    def guard(self, uri, host="cloud.example.com", headers=()):
+        """Raw request: repeated headers (several Cookie lines) allowed."""
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.putrequest("GET", "/public-guard", skip_accept_encoding=True)
+        c.putheader("X-Forwarded-Host", host)
+        c.putheader("X-Forwarded-Uri", uri)
+        for k, v in headers:
+            c.putheader(k, v)
+        c.endheaders()
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return r.status
+
+    def setUp(self):
+        write_policy(PUBLIC_DOC)
+
+    def test_allowed(self):
+        for uri in ["/s/AbC123", "/s/AbC123/", "/s/AbC123/download?files=a.txt", "/public.php/dav/files/AbC123/x.txt",
+                    "/dist/core-common.js", "/dist/x/y.min.css", "/core/mimeicon?mime=text", "/apps/text/public/session/1",
+                    "/s/AbC123?x=1&nc_tokens=2", "/s/AbC123?nc=token"]:
+            with self.subTest(uri=uri):
+                self.assertEqual(self.guard(uri, headers=[("Cookie", "oc123=sess; nc_sameSiteCookielax=true")]), 200)
+
+    def test_path_outside(self):
+        for uri in ["/", "/s", "/sx/AbC", "/s/a.b", "/s/..", "/s/AbC/../../apps/files", "/s/%2e%2e/apps",
+                    "/s/AbC%2Fx", "/dist", "/dist/", "/dist/a", "/dist/a.php", "/dist/a.php/b.js", "/dist/x.y/a.js",
+                    "/core/mimeicon/x", "/apps/text", "/index.php/s/AbC", "/S/AbC", "/s/AbC%00", "/s/%C0%AE%C0%AE/x",
+                    "/s/" + "a" * 40]:
+            with self.subTest(uri=uri):
+                self.assertEqual(self.guard(uri), 403)
+
+    def test_credential_headers(self):
+        for h in [("Authorization", "Basic YWRtaW46YWRtaW4="), ("authorization", "Bearer x"), ("Proxy-Authorization", "x"),
+                  ("X-Api-Key", "k"), ("x_api_key", "k"), ("Authorization", "")]:
+            with self.subTest(h=h):
+                self.assertEqual(self.guard("/s/AbC123", headers=[h]), 403)
+
+    def test_credential_cookies(self):
+        for cookie in ["nc_token=x", "a=1; nc_token=x", "a=1;nc_token=x", " nc_token=x", "nc.token=x", "nc token=x",
+                       "nc[token=x", "nc_token[]=x", "nc_token[x]=y", "NC_TOKEN=x", "Nc.ToKeN=x", "nc+token=x",
+                       "nc%5Ftoken=x", "%6Ec_token=x", "nc%2Etoken=x", "nc_username=bob", "a=1, nc_token=x",
+                       "\tnc_token=x", "nc_token"]:
+            with self.subTest(cookie=cookie):
+                self.assertEqual(self.guard("/s/AbC123", headers=[("Cookie", cookie)]), 403)
+        # Split over several Cookie headers, and duplicates.
+        self.assertEqual(self.guard("/s/AbC123", headers=[("Cookie", "a=1"), ("Cookie", "nc_token=x")]), 403)
+        self.assertEqual(self.guard("/s/AbC123", headers=[("Cookie", "nc_token=x; nc_token=y")]), 403)
+        # Overlong UTF-8 / control characters in a name: refused.
+        self.assertEqual(self.guard("/s/AbC123", headers=[("Cookie", "nc%C0%AEtoken=x")]), 403)
+
+    def test_credential_query(self):
+        for q in ["auth_token=x", "auth.token=x", "auth+token=x", "auth%20token=x", "+auth_token=x", "%20auth_token=x",
+                  "auth[token=x", "auth_token[]=x", "auth_token[x]=y", "AUTH_TOKEN=x", "%61uth_token=x",
+                  "a=1&auth_token=x", "a=1;auth_token=x", "auth_token", "apiKey=k", "apikey=k", "auth_token%00x=1",
+                  "auth%C0%AEtoken=1"]:
+            with self.subTest(q=q):
+                self.assertEqual(self.guard("/s/AbC123?" + q), 403)
+
+    def test_fail_closed(self):
+        for doc in [None, {}, {"version": 2, "public_paths": PUBLIC_DOC["public_paths"]}, {"version": 3},
+                    {"version": 3, "public_paths": []},
+                    {"version": 3, "public_paths": {"cloud": {"paths": [{"path": "/s", "match": "prefix"}], "extra": 1}}},
+                    {"version": 3, "public_paths": {"cloud": {"paths": []}}},
+                    {"version": 3, "public_paths": {"cloud": {"paths": [{"path": "/s/{token}", "match": "prefix"}]}}},
+                    {"version": 3, "public_paths": {"cloud": {"paths": [{"path": "/s/../x", "match": "prefix"}]}}},
+                    {"version": 3, "public_paths": {"cloud": {"paths": [{"path": "/s", "match": "regex"}]}}},
+                    "not json"]:
+            with self.subTest(doc=doc):
+                write_policy(doc)
+                self.assertEqual(self.guard("/s/AbC123"), 403)
+        write_policy(PUBLIC_DOC)
+        for host in ["other.example.com", "cloud.evil.com", "hub.example.com", ""]:
+            with self.subTest(host=host):
+                self.assertEqual(self.guard("/s/AbC123", host=host), 403)
+
+    def test_no_identity_headers_returned(self):
+        status, hdrs = self.req("cloud.example.com", uri="/s/AbC123", gate_path="/public-guard", want_headers=True)
+        self.assertEqual(status, 200)
+        self.assertFalse([k for k in hdrs if k.lower().startswith(("x-forwarded-user", "x-auth-request"))])
 
 
 class RevocationUnitTest(unittest.TestCase):
