@@ -149,7 +149,7 @@ See `docker-compose.apps.yml` for complete examples.
 
 | Guide | Description |
 |-------|-------------|
-| [Adding a Domain](docs/adding-a-domain.md) | DNS setup, Cloudflare config, wildcard certs, multiple domains, local dev |
+| [Adding a Domain](docs/adding-a-domain.md) | DNS setup, Cloudflare config, wildcard certs, one domain per installation, local dev |
 | [SAML App: Nextcloud](docs/saml-app-nextcloud.md) | Full walkthrough — deploy Nextcloud, register in Keycloak, configure SAML SSO |
 | [Non-SAML App: Kanboard](docs/non-saml-app-kanboard.md) | Header-based auth — deploy Kanboard, extract CN from mTLS, reverse proxy auth pattern |
 
@@ -166,7 +166,7 @@ auth in common apps (Gitea, Grafana, Wiki.js, pgAdmin, etc.).
 ├── headscale/
 │   └── config.yaml                # Headscale config (OIDC → Keycloak)
 ├── docs/
-│   ├── adding-a-domain.md          # DNS, certs, multiple domains
+│   ├── adding-a-domain.md          # DNS, certs, single-domain scope
 │   ├── certificates.md             # TLS, mTLS, client certs, revocation, Vault
 │   ├── hardening.md                # Socket proxies, container hardening, exceptions
 │   ├── saml-app-nextcloud.md       # SAML app integration guide
