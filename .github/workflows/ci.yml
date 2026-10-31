@@ -1063,8 +1063,15 @@ jobs:
         run: |
           echo "BACKUP_REPOSITORY=$RUNNER_TEMP/restic-repo" >> .env
           ./portcullis backup --offsite
-          ./portcullis backup --offsite   # incremental, then retention: one snapshot per day
-          test "$(./portcullis backup --list --offsite --json | jq length)" = 1 || { echo "FAIL: retention kept $(./portcullis backup --list --offsite --json | jq length) same-day snapshots"; exit 1; }
+          first=$(./portcullis backup --list --offsite --json | jq -r '.[0].id')
+          ./portcullis backup --offsite   # incremental
+          ./portcullis backup --offsite   # third same-day snapshot -> retention prunes the middle one
+          # restic >= 0.17 also keeps the OLDEST snapshot while a keep-* bucket is not
+          # full yet ("oldest daily snapshot"), so after 3 same-day backups exactly the
+          # oldest and the newest survive.
+          snaps=$(./portcullis backup --list --offsite --json)
+          test "$(jq length <<<"$snaps")" = 2 || { echo "FAIL: retention kept $(jq length <<<"$snaps") same-day snapshots (want 2)"; jq . <<<"$snaps"; exit 1; }
+          jq -e --arg f "$first" 'map(.id) | index($f) != null' <<<"$snaps" >/dev/null || { echo "FAIL: oldest snapshot $first was pruned"; exit 1; }
           grep -q 'kind="offsite"' monitoring/textfile/backup_offsite.prom || { echo "FAIL: no offsite metric"; exit 1; }
           ./portcullis backup verify
           # Encrypted at rest: neither the root token nor the .env secrets appear.
