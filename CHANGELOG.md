@@ -61,6 +61,9 @@ nothing here migrates old data.
   username (oauth2-proxy `userIDClaim: preferred_username`), the email moves
   to `X-Forwarded-Email`; Keycloak does not mark LLDAP email as verified.
   Header-auth apps must log users in by username.
+  `keycloak configure` maintains an `email-unverified` client scope (`email`
+  claim, no `email_verified`) for apps that refuse `email_verified=false`
+  (Hub templates opt in with `email_verified_claim: false`).
 - **Docker socket**: only two socket proxies mount it (Traefik read-only, the
   Hub what `docker compose` needs), each on its own internal network.
 - **Hardening**: every core image pinned by digest; `no-new-privileges`,

@@ -113,6 +113,13 @@ Therefore:
   on the email, and must not link existing accounts by email (e.g.
   Vaultwarden `SSO_SIGNUPS_MATCH_EMAIL`); apps that insist on
   `email_verified=true` need their "allow unverified email" option.
+- Apps that refuse `email_verified=false` but accept the claim being absent
+  (Vaultwarden SSO signups) use the `email-unverified` client scope instead
+  of `email`: `portcullis keycloak configure` maintains it with a single
+  `email` mapper and no `email_verified` mapper, and the Hub attaches it to
+  clients whose template sets `keycloak_clients[].email_verified_claim:
+  false`. The email is just as unverified; such apps must still never link
+  accounts by it.
 
 - The `websecure` entrypoint has no `forwardedHeaders.trustedIPs`, so
   Traefik deletes client-supplied `X-Forwarded-*` and

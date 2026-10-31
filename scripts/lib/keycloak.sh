@@ -174,6 +174,8 @@ keycloak_configure() {
     echo "    groups scope present"
   fi
 
+  _kc_email_unverified_scope
+
   info "Configuring the forward-auth client (acr, groups, redirect URI)..."
   fwd_uuid="$(kc_get "/$KC_REALM/clients?clientId=portcullis-forward-auth" | jq -r '.[0].id // empty')"
   if [ -n "$fwd_uuid" ]; then
@@ -208,6 +210,58 @@ keycloak_configure() {
 
   ok "Keycloak configured. Admin console: https://auth.$domain/admin/master/console/"
   echo "    SAML metadata: https://auth.$domain/realms/$KC_REALM/protocol/saml/descriptor"
+}
+
+# Client scope that carries `email` but never `email_verified`. LLDAP lets
+# users edit their own mail, so the built-in `email` scope always says
+# email_verified=false; apps that refuse that value but accept the claim
+# being absent (Vaultwarden SSO signups) get this scope instead of `email`
+# (Hub: keycloak_clients[].email_verified_claim: false). Identity stays the
+# sub / username; the email is still unverified, just not labelled.
+KC_EMAIL_UNVERIFIED_SCOPE="email-unverified"
+
+# _kc_email_unverified_scope — create the scope, or reconcile an existing one
+# to exactly one `email` mapper (any other mapper, e.g. an added
+# "email verified", is deleted).
+_kc_email_unverified_scope() {
+  local scope_id rep mappers mid code
+  local mapper='{name: "email", protocol: "openid-connect", protocolMapper: "oidc-usermodel-property-mapper",
+      config: {"user.attribute": "email", "claim.name": "email", "jsonType.label": "String",
+               "id.token.claim": "true", "access.token.claim": "true", "userinfo.token.claim": "true",
+               "introspection.token.claim": "true"}}'
+  local attrs='{"include.in.token.scope": "true", "display.on.consent.screen": "true"}'
+
+  info "Ensuring the $KC_EMAIL_UNVERIFIED_SCOPE client scope (email, no email_verified)..."
+  scope_id="$(kc_get "/$KC_REALM/client-scopes" | jq -r --arg n "$KC_EMAIL_UNVERIFIED_SCOPE" '.[] | select(.name == $n) | .id' | head -n1)"
+  if [ -z "$scope_id" ]; then
+    code="$(jq -n --arg n "$KC_EMAIL_UNVERIFIED_SCOPE" "{name: \$n, protocol: \"openid-connect\",
+        description: \"email claim without email_verified (LLDAP email is user-editable)\",
+        attributes: $attrs, protocolMappers: [$mapper]}" | kc_send POST "/$KC_REALM/client-scopes")"
+    _kc_report "$KC_EMAIL_UNVERIFIED_SCOPE scope" "$code" 201 || true
+    return 0
+  fi
+
+  rep="$(kc_get "/$KC_REALM/client-scopes/$scope_id")"
+  code="$(printf '%s' "$rep" | jq "del(.protocolMappers) | .protocol = \"openid-connect\" |
+      .attributes = ((.attributes // {}) + $attrs)" | kc_send PUT "/$KC_REALM/client-scopes/$scope_id")"
+  _kc_report "$KC_EMAIL_UNVERIFIED_SCOPE scope attributes" "$code" 204 || true
+
+  mappers="$(kc_get "/$KC_REALM/client-scopes/$scope_id/protocol-mappers/models")"
+  printf '%s' "$mappers" | jq -e 'type == "array"' >/dev/null 2>&1 \
+    || { warn "    cannot list $KC_EMAIL_UNVERIFIED_SCOPE mappers"; return 0; }
+  for mid in $(printf '%s' "$mappers" | jq -r '.[] | select(.name != "email") | .id'); do
+    code="$(kc_send DELETE "/$KC_REALM/client-scopes/$scope_id/protocol-mappers/models/$mid" < /dev/null)"
+    _kc_report "remove extra mapper $mid" "$code" 204 || true
+  done
+  mid="$(printf '%s' "$mappers" | jq -r '[.[] | select(.name == "email")][0].id // empty')"
+  if [ -z "$mid" ]; then
+    code="$(jq -n "$mapper" | kc_send POST "/$KC_REALM/client-scopes/$scope_id/protocol-mappers/models")"
+    _kc_report "email mapper" "$code" 201 || true
+  else
+    code="$(jq -n --arg id "$mid" "$mapper + {id: \$id}" \
+      | kc_send PUT "/$KC_REALM/client-scopes/$scope_id/protocol-mappers/models/$mid")"
+    _kc_report "email mapper" "$code" 204 || true
+  fi
 }
 
 # _oidc_client <client-id> <secret-var> <redirect-uri> <name> — create the
@@ -279,6 +333,8 @@ API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
   - pushes the X.509 authenticator settings from the file (CRL check against
     Vault's pki_int CRL, trust re-validation, clientAuth EKU) to the realm
   - checks AMR reference values, ensures the amr mapper and groups scope
+  - ensures the email-unverified scope (email claim, no email_verified) that
+    Hub templates opt into with keycloak_clients[].email_verified_claim: false
   - sets acr/groups scopes and the redirect URI on portcullis-forward-auth
   - creates a credential-less `testuser`, applies PORTAL_DISPLAY_NAME branding
 
