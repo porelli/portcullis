@@ -132,7 +132,8 @@ Therefore:
   `portcullis-public-guard@docker` (group-gate `/public-guard`), returns
   403 unless the policy file (version 3) publishes the subdomain in
   `public_paths`, the normalised path is inside one of its patterns
-  (prefix / exact / static files; encoded `/`, `\` or NUL denied), and the
+  (prefix / exact / static files; encoded `/`, `\`, NUL or `#` denied, and
+  so is any `#` in `X-Forwarded-Uri`: browsers never send fragments), and the
   request carries none of `Authorization`, `Proxy-Authorization`, the
   app's `credential_headers` (also in `_` form), `credential_cookies` or
   `credential_query`. Cookie and query names are compared case-insensitively
@@ -140,7 +141,11 @@ Therefore:
   leading spaces dropped, ` `/`.` → `_`, `name[...]` is `name`, an unclosed
   `[` → `_`, NUL ends the name), both raw and percent-/`+`-decoded; names
   that are not valid UTF-8 (overlong forms) are refused. It never returns
-  identity headers.
+  identity headers. Its logs (like group-gate's path denials) show the path
+  with token-like segments masked as `<token>` and query parameter names
+  only — never share tokens, query values, cookies or credentials.
+- group-gate's `path_groups` checks also deny a `#` in the URI or an
+  encoded one in the path.
 - Native OIDC apps must key accounts on `sub` / `preferred_username`, not
   on the email, and must not link existing accounts by email (e.g.
   Vaultwarden `SSO_SIGNUPS_MATCH_EMAIL`); apps that insist on

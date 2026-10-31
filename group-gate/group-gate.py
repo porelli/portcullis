@@ -330,11 +330,11 @@ def _resolve_dot_segments(path: str) -> str:
 def normalize_path_candidates(raw_uri: str) -> List[str]:
     """Normalised forms of X-Forwarded-Uri's path, for deny-biased matching.
 
-    The primary form (contract §4): query and fragment stripped, percent-
-    decoded ONCE, '//' collapsed, dot-segments resolved. Raises PathError if
+    The primary form (contract §4): query stripped, percent-decoded ONCE, '//' collapsed, dot-segments resolved. Raises PathError if
     the decoded path still contains an encoded slash/backslash/NUL, or a NUL
     / control character — such paths mean different things to different
-    backends, so they are denied outright.
+    backends, so they are denied outright. So is a '#' in the URI or an
+    encoded one in the path (browsers never send fragments).
 
     Extra candidates cover how some backends read the same bytes
     differently: fully percent-decoded (double-decoding backends),
@@ -342,7 +342,11 @@ def normalize_path_candidates(raw_uri: str) -> List[str]:
     containers). A rule applies if it matches ANY candidate.
     """
     uri = raw_uri or "/"
-    path = uri.split("#", 1)[0].split("?", 1)[0]
+    if "#" in uri:
+        # Browsers never send a fragment: a raw '#' means different things
+        # to different parsers (some read what follows as query or path).
+        raise PathError("'#' in the request URI")
+    path = uri.split("?", 1)[0]
     if not path.startswith("/"):
         # Absolute-form ("http://h/p") or garbage: keep only the path part.
         m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/]*(/.*)?$", path)
@@ -353,6 +357,8 @@ def normalize_path_candidates(raw_uri: str) -> List[str]:
         raise PathError("path is not valid UTF-8 after decoding") from e
     if re.search(r"%(2[fF]|5[cC]|00)", once):
         raise PathError("encoded slash/backslash/NUL after decoding")
+    if "#" in once:
+        raise PathError("encoded '#' in the path")
     if any(ord(c) < 0x20 or ord(c) == 0x7F for c in once):
         raise PathError("control character in path")
     forms = [once]
@@ -562,7 +568,7 @@ def credential_problem(cfg: PublicConfig, headers, raw_uri: str) -> Optional[str
                     continue
                 if cfg.cookies & set(_name_candidates(name, False)):
                     return f"credential cookie {name!r}"
-        query = raw_uri.split("#", 1)[0].split("?", 1)[1] if "?" in raw_uri else ""
+        query = raw_uri.split("?", 1)[1] if "?" in raw_uri else ""
         for part in re.split(r"[&;]", query):
             name = part.split("=", 1)[0]
             if not name:
@@ -621,18 +627,60 @@ def public_guard_check(policy_doc: dict, subdomain: str, headers, raw_uri: str) 
         return f"policy: {e}"
     if cfg is None:
         return "no public exception for this subdomain"
-    raw_path = (raw_uri or "").split("#", 1)[0].split("?", 1)[0]
-    if re.search(r"%(2[fF]|5[cC]|00)", raw_path):
-        # An encoded / \ or NUL means different paths to Traefik and the app.
-        return "path: encoded slash, backslash or NUL"
+    if "#" in (raw_uri or ""):
+        return "path: '#' in the request URI"
+    raw_path = (raw_uri or "").split("?", 1)[0]
+    if re.search(r"%(2[fF]|5[cC]|00|23)", raw_path):
+        # An encoded / \ NUL or # means different paths to Traefik and the app.
+        return "path: encoded slash, backslash, NUL or '#'"
     try:
         candidates = normalize_path_candidates(raw_uri)
     except PathError as e:
         return f"path: {e}"
     outside = [c for c in candidates if not public_path_allowed(cfg, c)]
     if outside:
-        return f"path {outside[0]!r} is not public"
+        return "path is not public"
     return credential_problem(cfg, headers, raw_uri)
+
+
+_LOG_SEG_RE = re.compile(r"[A-Za-z0-9._~-]{1,40}")
+
+
+def log_uri(raw_uri: str, cfg: Optional[PublicConfig] = None) -> str:
+    """A request URI for logs: never share tokens, query values, cookies or
+    credentials. The path is reduced to its segments, each masked as
+    <token> when it sits where a published {token} does, matches the
+    token_pattern, or looks like an opaque value (digits, or longer than 16
+    characters); query parameters are logged by name only."""
+    raw = raw_uri or ""
+    path, _, query = raw.partition("?")
+    try:
+        path = urllib.parse.unquote(path.split("#", 1)[0])
+    except Exception:  # noqa: BLE001 - logging must never fail
+        path = "<undecodable>"
+    token_slots = set()
+    if cfg is not None:
+        segs = path.split("/")[1:]
+        for pattern, _match in cfg.paths:
+            psegs = pattern.split("/")[1:]
+            if "{token}" in psegs and len(segs) > psegs.index("{token}") \
+                    and segs[:psegs.index("{token}")] == psegs[:psegs.index("{token}")]:
+                token_slots.add(psegs.index("{token}"))
+    out = []
+    for i, seg in enumerate(path.split("/")[1:]):
+        opaque = (i in token_slots or not _LOG_SEG_RE.fullmatch(seg) or len(seg) > 16
+                  or re.search(r"\d", seg) is not None
+                  or (cfg is not None and cfg.token_re is not None and cfg.token_re.fullmatch(seg) is not None and len(seg) >= 6))
+        out.append("<token>" if opaque and seg else seg)
+    logged = "/" + "/".join(out)
+    if query:
+        names = []
+        for part in re.split(r"[&;]", query):
+            name = part.split("=", 1)[0]
+            if name:
+                names.append(name if _LOG_SEG_RE.fullmatch(name) else "<name>")
+        logged += "?" + "&".join(names[:20]) + ("&…" if len(names) > 20 else "")
+    return logged
 
 
 # ── Metrics (GET /metrics, Prometheus text format) ────────────────────
@@ -1298,6 +1346,7 @@ class Handler(BaseHTTPRequestHandler):
         subdomain = subdomain_for(host)
         raw_uri = self.headers.get("X-Forwarded-Uri", "")
         reason = "host not under PORTCULLIS_DOMAIN"
+        cfg = None
         if subdomain is not None:
             try:
                 doc = load_policy_file()
@@ -1306,12 +1355,16 @@ class Handler(BaseHTTPRequestHandler):
                 reason = f"policy: {e}"
             if doc is not None:
                 reason = public_guard_check(doc, subdomain, self.headers, raw_uri)
+                try:
+                    cfg = public_config_for(doc, subdomain)
+                except PolicyError:
+                    cfg = None
         if reason:
             self._deny(
                 "Access Denied",
                 "<p>This public link can't be opened with these request details. If you are "
                 "signed in to the app in this browser, open the link in a private window.</p>",
-                f"DENIED public host={raw_host!r} uri={raw_uri!r} reason={reason}",
+                f"DENIED public host={raw_host!r} uri={log_uri(raw_uri, cfg)!r} reason={reason}",
                 "public_guard",
             )
             return
@@ -1508,7 +1561,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._deny(
                     "Access Denied",
                     "<p>The request path is not acceptable.</p>",
-                    f"DENIED user={user} host={host} uri={raw_uri!r} reason=path: {e}",
+                    f"DENIED user={user} host={host} uri={log_uri(raw_uri)!r} reason=path: {e}",
                     "path_invalid",
                 )
                 return
@@ -1518,7 +1571,7 @@ class Handler(BaseHTTPRequestHandler):
                         "Access Denied",
                         f"<p>User <b>{e_user}</b> is not authorized to access this part of <b>{e_sub}</b>.</p>"
                         f"<p>Required group: <code>{html.escape(need)}</code></p>",
-                        f"DENIED user={user} host={host} path={candidates[0]!r} need={need} have={sorted(groups)}",
+                        f"DENIED user={user} host={host} path={log_uri(candidates[0])!r} need={need} have={sorted(groups)}",
                         "path_group",
                     )
                     return

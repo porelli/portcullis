@@ -879,7 +879,7 @@ jobs:
           for p in /s/AbC123 /s/AbC123/download /dist/core-common.js; do
             [ "$(pub "$p")" = 200 ] || { echo "FAIL: public $p denied"; docker compose logs --tail=10 group-gate; exit 1; }
           done
-          for p in / /s /x /dist/a.php /dist/x.php/a.js /s/a.b /s/AbC%2Fx /s/AbC123/../../x; do
+          for p in / /s /x /dist/a.php /dist/x.php/a.js /s/a.b /s/AbC%2Fx /s/AbC%23x /s/AbC123/../../x; do
             [ "$(pub "$p" --path-as-is)" = 403 ] || { echo "FAIL: non-public $p allowed"; exit 1; }
           done
           for h in "Authorization: Basic YWRtaW46eA==" "Proxy-Authorization: x" "X-Api-Key: k" \

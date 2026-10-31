@@ -267,7 +267,10 @@ class PathGroupsTest(GateTest):
 
     def test_normalisation(self):
         n = gg.normalize_path_candidates
-        self.assertEqual(n("/a//b/./c/../d?x=/admin#frag")[0], "/a/b/d")
+        self.assertEqual(n("/a//b/./c/../d?x=/admin")[0], "/a/b/d")
+        for bad in ("/a#frag", "/a?x=1#frag", "/a%23b"):
+            with self.assertRaises(gg.PathError):
+                n(bad)
         self.assertEqual(n("/%61dmin")[0], "/admin")
         self.assertEqual(n("")[0], "/")
         self.assertEqual(n("/x/..")[0], "/")
@@ -494,10 +497,46 @@ class PublicGuardTest(GateTest):
             with self.subTest(host=host):
                 self.assertEqual(self.guard("/s/AbC123", host=host), 403)
 
+    def test_fragment_and_encoded_hash(self):
+        for uri in ["/s/AbC123#x", "/s/AbC123?a=1#nc_token=x", "/s/AbC123#?nc_token=x", "/s/Ab%23C", "/dist/a%23.js", "/s/AbC123/%23"]:
+            with self.subTest(uri=uri):
+                self.assertEqual(self.guard(uri), 403)
+        # The query is everything after the first '?'.
+        self.assertEqual(self.guard("/s/AbC123?x=1?auth_token=y"), 200)  # key "x", value "1?auth_token=y"
+        self.assertEqual(self.guard("/s/AbC123?x=1&auth_token=y"), 403)
+
+    def test_logs_hide_tokens_values_and_credentials(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.guard("/s/SeCrEtToKeN42/../../x?apiKey=S3cr3tValue&q=PlainValue",
+                       headers=[("Cookie", "nc_token=CookieSecret"), ("Authorization", "Basic QmFzaWNTZWNyZXQ=")])
+            self.guard("/s/SeCrEtToKeN42?apiKey=S3cr3tValue", headers=[("Cookie", "nc_token=CookieSecret")])
+            self.guard("/s/SeCrEtToKeN42", headers=[("Authorization", "Basic QmFzaWNTZWNyZXQ=")])
+            write_policy({"version": 2, "path_groups": {"cloud": [{"prefix": "/admin", "group": "admin_x"}]}})
+            self.req("cloud.example.com", uri="/admin/SeCrEtToKeN42?apiKey=S3cr3tValue")
+            self.req("cloud.example.com", uri="/admin/%2fSeCrEtToKeN42?apiKey=S3cr3tValue")
+        out = buf.getvalue()
+        self.assertIn("DENIED", out)
+        for secret in ["SeCrEtToKeN42", "S3cr3tValue", "PlainValue", "CookieSecret", "QmFzaWNTZWNyZXQ="]:
+            self.assertNotIn(secret, out)
+        self.assertIn("apiKey", out)  # parameter names are logged
+
     def test_no_identity_headers_returned(self):
         status, hdrs = self.req("cloud.example.com", uri="/s/AbC123", gate_path="/public-guard", want_headers=True)
         self.assertEqual(status, 200)
         self.assertFalse([k for k in hdrs if k.lower().startswith(("x-forwarded-user", "x-auth-request"))])
+
+
+class PathFragmentTest(GateTest):
+    def test_hash_denied_on_path_rules(self):
+        write_policy({"version": 3, "groups": {"cloud": "users_x"},
+                      "path_groups": {"cloud": [{"prefix": "/admin", "group": "admin_x"}]}})
+        for uri in ["/x#/admin", "/x%23/../admin", "/admin%23"]:
+            with self.subTest(uri=uri):
+                self.assertEqual(self.req("cloud.example.com", uri=uri), 403)
+        self.assertEqual(self.req("cloud.example.com", uri="/x?a=1"), 200)
 
 
 class RevocationUnitTest(unittest.TestCase):
