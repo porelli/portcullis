@@ -205,7 +205,9 @@ jobs:
         run: |
           # Root token is read from secrets/vault-init.json by the CLI.
           ./portcullis pki setup --with-server-cert
-          test "$(stat -c %a certs/server.key)" = 600 || { echo "FAIL: server.key is not 0600"; exit 1; }
+          # Read by Traefik (root without CAP_DAC_OVERRIDE): operator-owned, group 0, 0640.
+          test "$(stat -c %a:%u:%g certs/server.key)" = "640:$(id -u):0" \
+            || { echo "FAIL: server.key is $(stat -c %a:%u:%g certs/server.key), want 640:$(id -u):0"; exit 1; }
           # Second run must be a no-op (would otherwise replace the CA).
           BEFORE=$(sha256sum certs/root-ca.crt)
           ./portcullis pki setup --with-server-cert
