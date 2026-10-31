@@ -126,6 +126,21 @@ Therefore:
   Traefik answers 421 on it. group-gate's step-up page therefore sends the
   browser to `https://auth.<domain>/oauth2/start?acr_values=…&rd=<app>`.
   CI rejects router rules without `Host(`.
+- Public exceptions (the Hub's `portcullis-public-<app>` routers) have no
+  forward-auth: nothing is signed in and no identity header is passed (the
+  Hub's strip middleware deletes client copies). Their first middleware,
+  `portcullis-public-guard@docker` (group-gate `/public-guard`), returns
+  403 unless the policy file (version 3) publishes the subdomain in
+  `public_paths`, the normalised path is inside one of its patterns
+  (prefix / exact / static files; encoded `/`, `\` or NUL denied), and the
+  request carries none of `Authorization`, `Proxy-Authorization`, the
+  app's `credential_headers` (also in `_` form), `credential_cookies` or
+  `credential_query`. Cookie and query names are compared case-insensitively
+  after PHP's mangling (`main/php_variables.c` `php_register_variable_ex`:
+  leading spaces dropped, ` `/`.` → `_`, `name[...]` is `name`, an unclosed
+  `[` → `_`, NUL ends the name), both raw and percent-/`+`-decoded; names
+  that are not valid UTF-8 (overlong forms) are refused. It never returns
+  identity headers.
 - Native OIDC apps must key accounts on `sub` / `preferred_username`, not
   on the email, and must not link existing accounts by email (e.g.
   Vaultwarden `SSO_SIGNUPS_MATCH_EMAIL`); apps that insist on

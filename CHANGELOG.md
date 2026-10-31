@@ -41,7 +41,16 @@ nothing here migrates old data.
   closed when stale), mTLS binding for `amr=mtls` sessions.
 - **X.509 login** through Traefik (Keycloak `traefik` lookup provider); proxy
   headers are trusted only from Traefik's fixed address on `portcullis-auth`.
-- **group-gate**: `path_groups`, policy file v2, reserved deny group,
+- **group-gate public guard** (`/public-guard`, middleware
+  `portcullis-public-guard@docker`) for the Hub's public exceptions: allows
+  only the paths a subdomain publishes in the policy file's `public_paths`
+  and refuses requests carrying `Authorization`, `Proxy-Authorization` or
+  the app's credential headers, cookies or query parameters (names
+  normalised the way PHP's `php_register_variable_ex` does). Policy file
+  version 3; the guard requires exactly 3, and the Hub and core must be
+  upgraded together.
+- **group-gate**: `path_groups`, policy file v3 (v1–v3 accepted, parsed file
+  cached on inode/mtime/size), reserved deny group,
   `/authenticated` (self-service routes), `/healthz`, `/metrics`.
 - `portcullis version` (core version and the Hub image in use).
 - **Releases**: `release.yml` for `vX.Y.Z` tags (full CI, released + pinned

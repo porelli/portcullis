@@ -96,7 +96,7 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 | `docker-compose.yml` | Core services (socket proxies, Traefik, Keycloak, LLDAP, Vault, oauth2-proxy, group-gate, Hub, enroll) |
 | `portcullis` | The admin CLI (`./portcullis help`) |
 | `scripts/lib/*.sh` | CLI libraries, one per area |
-| `group-gate/group-gate.py` | Per-subdomain group / `path_groups` / auth-policy / mTLS-binding / revocation middleware (policy file v2, reserved group `__portcullis_deny__` always denies); `/metrics` |
+| `group-gate/group-gate.py` | Per-subdomain group / `path_groups` / auth-policy / mTLS-binding / revocation middleware (policy file v3, cached on inode/mtime/size; reserved group `__portcullis_deny__` always denies); `/public-guard` for the Hub's public routers (published `public_paths` only, no credentials, PHP-normalised cookie/query names); `/metrics` |
 | `group-gate/group-gate-map.conf` | Subdomain → required LLDAP group mapping (authoritative for core subdomains; Hub's `groups` key in `group-gate-policy.json` adds/overrides app subdomains) |
 | `tests/test_group_gate.py` | group-gate unit tests (`python3 tests/test_group_gate.py`) incl. path-bypass and mTLS-binding cases |
 | `tests/e2e/e2e_login.py` | Browser e2e (CI job `e2e`): redirect, password + passkey registration, group / path denial, WebAuthn step-up, X.509 login, mTLS binding, revoked / foreign cert |
