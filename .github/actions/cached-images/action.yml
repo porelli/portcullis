@@ -1,0 +1,119 @@
+name: Cached images
+description: >-
+  Restore a `docker save` tarball of the given images from the Actions cache,
+  bind every image ref by a registry pull of its pinned digest (only loaded
+  content whose digests match the pinned manifest is reused), and on a
+  trusted run with a cache miss save the verified images for the next run.
+
+# The cache is not a trust boundary (same reasoning as the templates repo's
+# test-apps.yml): entries are only saved by trusted runs (the caller passes
+# save=true only for pushes to main), but the names and RepoDigests inside a
+# tarball can claim anything. What can't be faked is content addressing:
+#   - every name a tarball sets is removed right after `docker load` (ours
+#     are saved by digest ref and carry none), so a planted tag can never be
+#     used; the content is parked under a name nothing references;
+#   - every ref is then bound by `docker pull <tag>@sha256:<digest>`: the
+#     engine checks the manifest against the pinned digest and reuses local
+#     content only where the layer / config digests match, downloading
+#     anything else fresh;
+#   - afterwards RepoDigests must hold <repo>@<pinned digest>, which only a
+#     verified pull sets.
+# On a cache hit each pull is a manifest fetch (~0.5 s), not a download.
+inputs:
+  images:
+    description: File with one image ref per line, each pinned tag@sha256:<digest>
+    required: true
+  name:
+    description: Cache entry name (one per job image set)
+    required: true
+  save:
+    description: "'true' = save the verified images on a cache miss (trusted pushes to main only)"
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Image list and cache key
+      id: key
+      shell: bash
+      env:
+        LIST: ${{ inputs.images }}
+        NAME: ${{ inputs.name }}
+      run: |
+        set -euo pipefail
+        sorted="$RUNNER_TEMP/ci-images-$NAME.txt"
+        grep -v '^[[:space:]]*$' "$LIST" | LC_ALL=C sort -u > "$sorted"
+        [ -s "$sorted" ] || { echo "::error::no images in $LIST"; exit 1; }
+        # Verification needs a digest: refuse anything not tag@sha256-pinned.
+        if grep -vE '^[^@[:space:]]+:[^@[:space:]]+@sha256:[0-9a-f]{64}$' "$sorted"; then
+          echo "::error::unpinned image ref(s) above"; exit 1
+        fi
+        cat "$sorted"
+        {
+          echo "list=$sorted"
+          echo "dir=$RUNNER_TEMP/ci-images/$NAME"
+          echo "key=ci-images-$NAME-$(sha256sum "$sorted" | cut -c1-16)"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Restore image cache
+      id: cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}
+
+    - name: Load and verify images
+      shell: bash
+      env:
+        LIST: ${{ steps.key.outputs.list }}
+        DIR: ${{ steps.key.outputs.dir }}
+      run: |
+        set -euo pipefail
+        tar="$DIR/images.tar"
+        if [ -f "$tar" ]; then
+          out=$(docker load -q -i "$tar")
+          echo "loaded $(grep -c '^Loaded image' <<< "$out" || true) images from the cache"
+          # Keep the content (parked under a name nothing uses), drop the name.
+          sed -n 's/^Loaded image: //p' <<< "$out" | while read -r ref; do
+            id=$(docker image inspect --format '{{.Id}}' "$ref")
+            docker tag "$id" "ci-cache-untrusted/loaded:${id#sha256:}"
+            docker image rm "$ref" > /dev/null
+            echo "::warning::cached tarball set the name $ref; removed"
+          done
+        else
+          echo "no cached images; pulling"
+        fi
+        # Registries rate-limit bursts (toomanyrequests): retry with backoff.
+        pull() {
+          local img="$1" i pinned
+          for i in 1 2 3 4 5; do
+            docker pull -q "$img" > /dev/null && break
+            [ "$i" = 5 ] && { echo "::error::cannot pull $img"; return 1; }
+            echo "pull $img failed (attempt $i), retrying"; sleep $((i * 15))
+          done
+          pinned="${img##*@}"
+          docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$img" | grep -q "@${pinned}\$" \
+            || { echo "::error::$img: no registry-verified digest after pull"; return 1; }
+          echo "verified $img"
+        }
+        export -f pull
+        xargs -P 4 -n 1 bash -c 'pull "$0"' < "$LIST"
+
+    - name: Save verified images
+      if: inputs.save == 'true' && steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        LIST: ${{ steps.key.outputs.list }}
+        DIR: ${{ steps.key.outputs.dir }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$DIR"
+        xargs docker save -o "$DIR/images.tar" < "$LIST"
+        du -h "$DIR/images.tar"
+
+    - name: Save image cache
+      if: inputs.save == 'true' && steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.key.outputs.dir }}
+        key: ${{ steps.key.outputs.key }}

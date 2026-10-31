@@ -32,9 +32,11 @@ updates:
         patterns: ["*"]
 
   # Actions are pinned by commit SHA with a `# vX.Y.Z` comment; Dependabot
-  # updates both.
+  # updates both (workflows and the local composite actions).
   - package-ecosystem: github-actions
-    directory: /
+    directories:
+      - /
+      - /.github/actions/*
     schedule:
       interval: weekly
     groups:
