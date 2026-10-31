@@ -463,6 +463,69 @@ jobs:
             exit 1
           fi
 
+      - name: Test the email-unverified scope (email claim, no email_verified)
+        run: |
+          set -o pipefail
+          # configure is idempotent: a second run must leave the scope with
+          # exactly its one email mapper.
+          ./portcullis keycloak configure >/dev/null
+          KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+            --data-urlencode client_id=admin-cli --data-urlencode "username=$KEYCLOAK_ADMIN" \
+            --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          kc() { curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") -H 'Content-Type: application/json' "$@"; }
+          A=http://127.0.0.1:8080/admin/realms/portcullis
+          SCOPE=$(kc "$A/client-scopes" | jq -c '[.[] | select(.name == "email-unverified")][0] // empty')
+          [ -n "$SCOPE" ] || { echo "FAIL: email-unverified client scope missing"; exit 1; }
+          echo "$SCOPE" | jq -e '.protocol == "openid-connect" and .attributes["include.in.token.scope"] == "true"
+              and ([.protocolMappers[] | .config["claim.name"]] == ["email"])' >/dev/null \
+            || { echo "FAIL: email-unverified scope must have exactly one mapper, for email: $SCOPE"; exit 1; }
+
+          # A throwaway LLDAP user with a password and a direct-grant client
+          # that has email-unverified instead of email.
+          PW="$(openssl rand -hex 16)Aa1!"; echo "::add-mask::$PW"
+          LLDAP_TOKEN=$(jq -n --arg p "$LLDAP_ADMIN_PASSWORD" '{username: "admin", password: $p}' \
+            | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          jq -n '{query: "mutation { createUser(user: {id: \"scopecheck\", email: \"scopecheck@portcullis.local\"}) { id } }"}' \
+            | curl -sf http://127.0.0.1:17170/api/graphql -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") \
+              -H 'Content-Type: application/json' -d @- | jq -e '.errors == null' >/dev/null
+          docker compose exec -T lldap /app/lldap_set_password --base-url http://localhost:17170 \
+            --admin-username admin --admin-password "$LLDAP_ADMIN_PASSWORD" --username scopecheck --password "$PW"
+          CS="$(openssl rand -hex 24)"; echo "::add-mask::$CS"
+          jq -n --arg s "$CS" '{clientId: "ci-email-unverified", protocol: "openid-connect", publicClient: false,
+              secret: $s, standardFlowEnabled: false, directAccessGrantsEnabled: true,
+              defaultClientScopes: ["basic", "profile", "email-unverified"], optionalClientScopes: []}' \
+            | kc -X POST -d @- "$A/clients"
+          CU=$(kc "$A/clients?clientId=ci-email-unverified" | jq -r '.[0].id')
+          trap 'kc -X DELETE "$A/clients/$CU" || true' EXIT
+          kc "$A/clients/$CU/default-client-scopes" | jq -e '[.[].name] | index("email-unverified") and (index("email") | not)' >/dev/null \
+            || { echo "FAIL: throwaway client scopes: $(kc "$A/clients/$CU/default-client-scopes" | jq -c '[.[].name]')"; exit 1; }
+
+          TOK=$(printf '%s' "$PW" | curl -sf http://127.0.0.1:8080/realms/portcullis/protocol/openid-connect/token \
+            -H @<(printf 'Authorization: Basic %s\n' "$(printf '%s' "ci-email-unverified:$CS" | base64 -w0)") --data-urlencode grant_type=password --data-urlencode scope=openid \
+            --data-urlencode username=scopecheck --data-urlencode password@-)
+          claims() { echo "$TOK" | jq -r ".$1" | cut -d. -f2 | tr '_-' '/+' | awk '{while (length($0) % 4) $0 = $0 "="; print}' | base64 -d; }
+          for t in id_token access_token; do
+            claims "$t" | jq -e '.email == "scopecheck@portcullis.local" and (has("email_verified") | not)
+                and .preferred_username == "scopecheck"' >/dev/null \
+              || { echo "FAIL: $t claims: $(claims "$t" | jq -c '{email, email_verified, preferred_username}')"; exit 1; }
+          done
+          AT=$(echo "$TOK" | jq -r .access_token)
+          curl -sf http://127.0.0.1:8080/realms/portcullis/protocol/openid-connect/userinfo -H @<(printf 'Authorization: Bearer %s\n' "$AT") \
+            | jq -e '.email == "scopecheck@portcullis.local" and (has("email_verified") | not)' >/dev/null \
+            || { echo "FAIL: userinfo carries email_verified or lacks email"; exit 1; }
+          echo "PASS: email-unverified scope: email in id/access token and userinfo, no email_verified"
+
+          # Control: the built-in email scope does send email_verified=false
+          # (LLDAP email is never trusted), which is why the scope exists.
+          kc -X DELETE "$A/clients/$CU/default-client-scopes/$(echo "$SCOPE" | jq -r .id)"
+          kc -X PUT "$A/clients/$CU/default-client-scopes/$(kc "$A/client-scopes" | jq -r '.[] | select(.name == "email") | .id')"
+          TOK=$(printf '%s' "$PW" | curl -sf http://127.0.0.1:8080/realms/portcullis/protocol/openid-connect/token \
+            -H @<(printf 'Authorization: Basic %s\n' "$(printf '%s' "ci-email-unverified:$CS" | base64 -w0)") --data-urlencode grant_type=password --data-urlencode scope=openid \
+            --data-urlencode username=scopecheck --data-urlencode password@-)
+          claims id_token | jq -e '.email_verified == false' >/dev/null \
+            || { echo "FAIL: built-in email scope: $(claims id_token | jq -c '{email, email_verified}')"; exit 1; }
+          echo "PASS: built-in email scope sends email_verified=false"
+
       - name: Test Vault client certificate issuance
         run: |
           VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
