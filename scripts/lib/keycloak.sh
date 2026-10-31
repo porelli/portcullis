@@ -128,6 +128,22 @@ keycloak_configure() {
     done < <(printf '%s' "$execs" | jq -r '.[] | select(.providerId and .providerId != "conditional-level-of-authentication") | .providerId + " " + (.authenticationConfig // "none")')
   done
 
+  info "Applying the X.509 authenticator config (CRL check, trust re-validation)..."
+  # realm-export.json is only imported into a NEW realm; push the x509-config
+  # authenticator settings onto every existing x509 execution's config.
+  local x509_cfg cfg_ids cid
+  x509_cfg="$(jq -c '.authenticatorConfig[] | select(.alias == "x509-config") | .config' "$PORTCULLIS_ROOT/keycloak/realm-export.json")"
+  cfg_ids="$(for flow in portcullis-loa-1-factors portcullis-loa-2-factors portcullis-loa-3; do
+      kc_get "/$KC_REALM/authentication/flows/$flow/executions" \
+        | jq -r '.[]? | select(.providerId == "auth-x509-client-username-form") | .authenticationConfig // empty' 2>/dev/null
+    done | sort -u)"
+  for cid in $cfg_ids; do
+    code="$(kc_get "/$KC_REALM/authentication/config/$cid" | jq --argjson c "$x509_cfg" '.config = ((.config // {}) + $c)' \
+      | kc_send PUT "/$KC_REALM/authentication/config/$cid")"
+    _kc_report "x509 config $cid" "$code" 204 || true
+  done
+  [ -n "$cfg_ids" ] || warn "    no X.509 executions found (custom flows?) — CRL checking not configured"
+
   info "Ensuring the amr mapper on the acr client scope..."
   scope_id="$(kc_get "/$KC_REALM/client-scopes" | jq -r '.[] | select(.name == "acr") | .id' | head -n1)"
   if [ -n "$scope_id" ]; then
@@ -257,6 +273,8 @@ API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
   - imports keycloak/realm-export.json if the realm does not exist
   - points the LDAP federation at LLDAP (LLDAP_BASE_DN, LLDAP_ADMIN_PASSWORD)
   - sets the ACR→LoA map and browserFlow=portcullis-universal
+  - pushes the X.509 authenticator settings from the file (CRL check against
+    Vault's pki_int CRL, trust re-validation, clientAuth EKU) to the realm
   - checks AMR reference values, ensures the amr mapper and groups scope
   - sets acr/groups scopes and the redirect URI on portcullis-forward-auth
   - creates a credential-less `testuser`, applies PORTAL_DISPLAY_NAME branding
