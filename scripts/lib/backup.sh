@@ -390,9 +390,10 @@ backup_offsite() {
   ok "Off-host backup done ($BACKUP_REPOSITORY)."
 }
 
+# backup_snapshots [--json]
 backup_snapshots() {
   _restic_require
-  _restic snapshots --host "$BACKUP_RESTIC_HOST" --tag portcullis
+  _restic snapshots --host "$BACKUP_RESTIC_HOST" --tag portcullis "$@"
 }
 
 # _restic_restore_to <snapshot> <dir> — restore a snapshot; prints the
@@ -721,7 +722,7 @@ EOF
 
 help_backup() {
   cat <<'EOF'
-Usage: portcullis backup [--offsite] [--list]
+Usage: portcullis backup [--offsite] [--list [--json]]
        portcullis backup verify [--local [DIR] | --snapshot ID]
        portcullis backup schedule --systemd [--on-calendar SPEC] [--output DIR]
 
@@ -740,7 +741,8 @@ Options:
               without it the off-host copies are useless, with it they
               are the keys to everything), then apply the retention
               BACKUP_KEEP_DAILY/WEEKLY/MONTHLY (7/4/6)
-  --list      list local backups (with --offsite: the restic snapshots)
+  --list      list local backups (with --offsite: the restic snapshots;
+              --json for restic's JSON)
 
 Subcommands: verify, schedule (see 'portcullis backup <sub> --help').
 See docs/backups.md.
@@ -810,7 +812,7 @@ EOF
 }
 
 cmd_backup() {
-  local offsite=false list=false sub="" snap="" ldir="" local_only=false systemd=false cal="*-*-* 03:15:00" out=""
+  local offsite=false list=false json=false sub="" snap="" ldir="" local_only=false systemd=false cal="*-*-* 03:15:00" out=""
   case "${1:-}" in
     verify|schedule) sub="$1"; shift ;;
   esac
@@ -819,6 +821,7 @@ cmd_backup() {
       *:-h|*:--help) if [ -n "$sub" ]; then "help_backup_$sub"; else help_backup; fi; return 0 ;;
       :--offsite) offsite=true ;;
       :--list) list=true ;;
+      :--json) json=true ;;
       verify:--snapshot) need_value "backup verify" "$1" "${2:-}"; snap="$2"; shift ;;
       verify:--local)
         local_only=true
@@ -845,8 +848,14 @@ cmd_backup() {
       backup_schedule_systemd "$cal" "$out"
       return ;;
   esac
+  [ "$json" = false ] || { [ "$list" = true ] && [ "$offsite" = true ]; } || usage_error backup "--json only goes with --list --offsite"
   if [ "$list" = true ]; then
-    if [ "$offsite" = true ]; then need_env; backup_snapshots; else backup_list; fi
+    if [ "$offsite" = true ]; then
+      need_env
+      if [ "$json" = true ]; then backup_snapshots --json; else backup_snapshots; fi
+    else
+      backup_list
+    fi
     return 0
   fi
   need_env

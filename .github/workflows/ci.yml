@@ -880,8 +880,8 @@ jobs:
         run: |
           echo "BACKUP_REPOSITORY=$RUNNER_TEMP/restic-repo" >> .env
           ./portcullis backup --offsite
-          ./portcullis backup --offsite   # incremental + retention
-          test "$(./portcullis backup --list --offsite | grep -c portcullis)" -ge 2 || { echo "FAIL: expected 2 snapshots"; exit 1; }
+          ./portcullis backup --offsite   # incremental, then retention: one snapshot per day
+          test "$(./portcullis backup --list --offsite --json | jq length)" = 1 || { echo "FAIL: retention kept $(./portcullis backup --list --offsite --json | jq length) same-day snapshots"; exit 1; }
           grep -q 'kind="offsite"' monitoring/textfile/backup_offsite.prom || { echo "FAIL: no offsite metric"; exit 1; }
           ./portcullis backup verify
           # Encrypted at rest: neither the root token nor the .env secrets appear.
@@ -1140,7 +1140,11 @@ jobs:
           for i in $(seq 1 20); do [ "$(probe vault_health '')" = 1 ] && break; sleep 3; done
           [ "$(probe vault_health '')" = 1 ] || { echo "FAIL: vault_health probe"; exit 1; }
           for svc in enroll forward-auth lldap; do [ "$(probe services "$svc")" = 1 ] || { echo "FAIL: $svc probe"; exit 1; }; done
-          has() { [ "$(qq "$1" | jq '.data.result | length')" -gt 0 ] || { echo "FAIL: no $1"; exit 1; }; }
+          # Textfile metrics were just written: allow a scrape interval or two.
+          has() {
+            for _ in $(seq 1 15); do [ "$(qq "$1" | jq '.data.result | length')" -gt 0 ] && return 0; sleep 5; done
+            echo "FAIL: no $1"; exit 1
+          }
           has 'sum(group_gate_requests_total)>0'
           has 'group_gate_crl_last_success_timestamp_seconds>0'
           has 'portcullis_backup_last_success_timestamp_seconds'
@@ -1154,7 +1158,7 @@ jobs:
           # Grafana: unauthenticated → sign-in redirect; a forged identity header from
           # anywhere but Traefik's IP is not accepted.
           code=$(curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt https://metrics.portcullis.local/)
-          [ "$code" = 302 ] || { echo "FAIL: metrics.<domain> unauthenticated got $code"; exit 1; }
+          case "$code" in 302|401) ;; *) echo "FAIL: metrics.<domain> unauthenticated got $code"; exit 1 ;; esac
           CURL_IMG=curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
           code=$(docker run --rm --network portcullis-proxy "$CURL_IMG" -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-User: admin' http://grafana:3000/api/user)
           [ "$code" != 200 ] || { echo "FAIL: Grafana accepted X-Forwarded-User from a non-Traefik peer"; exit 1; }

@@ -89,6 +89,7 @@ upgrade --dry-run|unknown argument: --dry-run
 upgrade --migrate-vault|unknown argument: --migrate-vault
 backup now|unknown argument: now
 backup --frob|unknown argument: --frob
+backup --json|--json only goes with --list --offsite
 backup verify --frob|unknown argument: --frob
 backup verify --snapshot|--snapshot needs a value
 backup verify --local x --snapshot y|exclusive
@@ -136,7 +137,7 @@ case "$OUT" in *"Environment=PORTCULLIS_ROOT=$PORTCULLIS_ROOT"*) t_pass "units k
 run backup schedule --systemd --on-calendar 'Sun 04:00' --output "$WORK/units"
 expect_eq "backup schedule --output exits 0" "$RC" 0
 expect_eq "timer written with OnCalendar" "$(grep -c '^OnCalendar=Sun 04:00$' "$WORK/units/portcullis-backup.timer" 2>/dev/null)" 1
-expect_ok "service written" test -s "$WORK/units/portcullis-backup.service"
+expect_eq "service written" "$(grep -c "^ExecStart=" "$WORK/units/portcullis-backup.service" 2>/dev/null)" 1
 RC=0; OUT="$(BACKUP_REPOSITORY=/srv/restic "$CLI" backup schedule --systemd </dev/null)" || RC=$?
 case "$OUT" in *"portcullis backup --offsite"*) t_pass "BACKUP_REPOSITORY → backup --offsite" ;; *) t_fail "no --offsite: $OUT" ;; esac
 run restore --from-offsite
