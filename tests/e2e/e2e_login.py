@@ -243,6 +243,9 @@ def main() -> int:
             shot(page, "hwk-stepup")
             assert resp and resp.status == 403 and "Additional authentication required" in page.content(), \
                 f"expected step-up page, got {resp and resp.status}"
+            # The step-up goes through oauth2-proxy on auth.<domain>: a
+            # /oauth2/ path on the app host would get Traefik's 421.
+            assert f'url={AUTH}/oauth2/start?' in page.content(), "step-up meta refresh is not on auth.<domain>"
             page.wait_for_url(re.compile(re.escape(AUTH)), timeout=TIMEOUT_MS)  # meta refresh
             keycloak_login(page, user, pw, passkey=True, until=HWK, label="hwk")
             shot(page, "hwk-after-stepup")

@@ -118,7 +118,14 @@ Therefore:
   `X-Forwarded-Email`.
 - enroll identifies the signed-in user by `X-Forwarded-User` as-is (no
   email → username lookup); group-gate's mTLS binding compares the cert CN
-  with the token's `preferred_username`.
+  with that same username (and requires the token's `preferred_username`
+  to match it).
+- oauth2-proxy's endpoints (`/oauth2/start`, `/oauth2/callback`,
+  `/oauth2/sign_out`) are routed only on `auth.<domain>`: a host-less
+  `PathPrefix(/oauth2/)` router cannot carry the tiers' TLS options and
+  Traefik answers 421 on it. group-gate's step-up page therefore sends the
+  browser to `https://auth.<domain>/oauth2/start?acr_values=…&rd=<app>`.
+  CI rejects router rules without `Host(`.
 - Native OIDC apps must key accounts on `sub` / `preferred_username`, not
   on the email, and must not link existing accounts by email (e.g.
   Vaultwarden `SSO_SIGNUPS_MATCH_EMAIL`); apps that insist on

@@ -149,6 +149,14 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.req("grafana.example.com", groups="users_grafana",
                                   extra={"X-Forwarded-Access-Token": token(amr=["hwk"])}), 200)
 
+    def test_stepup_url_is_on_the_auth_host(self):
+        # A host-less /oauth2/ router gets 421 from Traefik on tiered hosts.
+        url = gg.stepup_url("hwk.example.com", 2, ["webauthn"])
+        parts = urllib.parse.urlsplit(url)
+        self.assertEqual((parts.scheme, parts.netloc, parts.path), ("https", "auth.example.com", "/oauth2/start"))
+        self.assertEqual(urllib.parse.parse_qs(parts.query),
+                         {"acr_values": ["hwk"], "prompt": ["login"], "rd": ["https://hwk.example.com/"]})
+
     # ── identity headers: username, never the (user-editable) email ──
 
     def test_allow_forwards_username_not_email_or_sub(self):

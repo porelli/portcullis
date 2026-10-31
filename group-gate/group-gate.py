@@ -783,6 +783,11 @@ def policy_relies_on_mtls(policy: dict, amr: list) -> bool:
     return not (amr_set & others)
 
 
+def parent_domain(host: str) -> str:
+    """PORTCULLIS_DOMAIN, or (dev/test without it) the host minus its first label."""
+    return DOMAIN or (host.split(".", 1)[1] if "." in host else "")
+
+
 def stepup_url(host: str, needed_loa: int, factors: list) -> str:
     """Build a step-up URL that asks oauth2-proxy for a fresh login at the
     required Level of Authentication.
@@ -792,6 +797,13 @@ def stepup_url(host: str, needed_loa: int, factors: list) -> str:
     tells Keycloak to bypass its SSO `auth-cookie` short-circuit and re-run
     the flow; `acr_values` routes the user into the matching LoA conditional
     subflow so the missing factor is actually prompted for.
+
+    The URL is on auth.<domain> (router oauth2-callback), never on the app's
+    own host: a host-less PathPrefix(`/oauth2/`) router cannot carry the
+    tiers' TLS options, so Traefik serves it with the default options and
+    answers 421 Misdirected Request on every app host (they all use
+    authaware/protected/public). oauth2-proxy's cookie is set for
+    .<domain> and `rd` is in its whitelist, so the user lands back on the app.
 
     No sign_out in the chain: the browser still has oauth2-proxy's cookie
     but we want Keycloak to issue a *new* token reflecting the step-up, not
@@ -804,7 +816,8 @@ def stepup_url(host: str, needed_loa: int, factors: list) -> str:
         "prompt": "login",
         "rd": f"https://{host}/",
     })
-    return f"https://{host}/oauth2/start?{query}"
+    parent = parent_domain(host)
+    return f"https://auth.{parent}/oauth2/start?{query}" if parent else f"https://{host}/oauth2/start?{query}"
 
 
 def safe_factor_name(amr: str) -> str:
@@ -908,10 +921,10 @@ class Handler(BaseHTTPRequestHandler):
         # Keycloak account console so users who haven't enrolled yet
         # can register a WebAuthn key.
         needs_hardware = any(f in ("mtls", "webauthn") for f in factors)
-        parent_domain = DOMAIN or (".".join(host.split(".")[1:]) if "." in host else "")
+        parent = parent_domain(host)
         account_url = (
-            f"https://auth.{parent_domain}/realms/portcullis/account/account-security/signing-in"
-            if parent_domain else ""
+            f"https://auth.{parent}/realms/portcullis/account/account-security/signing-in"
+            if parent else ""
         )
         enrollment_block = ""
         if needs_hardware and account_url:

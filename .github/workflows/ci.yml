@@ -108,6 +108,23 @@ jobs:
               and .services.grafana.environment.GF_AUTH_BASIC_ENABLED == "false"' >/dev/null \
             || { echo "FAIL: monitoring profile wiring"; exit 1; }
           grep -qx 'metrics=lldap_admin' group-gate/group-gate-map.conf || { echo "FAIL: metrics is not lldap_admin in the group-gate map"; exit 1; }
+          # Every HTTPS router names its Host: Traefik cannot pick TLS options
+          # (authaware / protected / public) for a host-less rule and answers
+          # 421 on it (that broke /oauth2/start on app hosts).
+          HOSTLESS="$(for files in "docker-compose.yml" "docker-compose.yml -f docker-compose.apps.yml" "docker-compose.test.yml"; do
+              # shellcheck disable=SC2086
+              docker compose -f $files --profile '*' config --format json \
+                | jq -r '.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.rule$")) | select(.value | test("Host\\(") | not) | "\(.key)=\(.value)"'
+            done)"
+          [ -z "$HOSTLESS" ] || { echo "FAIL: routers without Host(): $HOSTLESS"; exit 1; }
+          # group-gate needs the username header from portcullis-auth and must
+          # pass it on; both forward-auth middlewares strip client copies.
+          echo "$CFG" | jq -e '[.services["forward-auth"].labels["traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeaders"],
+                 .services["group-gate"].labels["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders"],
+                 .services["group-gate"].labels["traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeaders"]]
+              | all(split(",") | index("X-Auth-Request-Preferred-Username") and index("X-Forwarded-User") and index("X-Auth-Request-User"))' >/dev/null \
+            || { echo "FAIL: identity headers missing from a forward-auth authResponseHeaders"; exit 1; }
+          if grep -nE '^\s*userIDClaim:' oauth2-proxy/alpha.yaml; then echo "FAIL: userIDClaim is an alias of emailClaim in oauth2-proxy v7"; exit 1; fi
           echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring"
 
       - name: every image is pinned tag@sha256 (all compose files, all profiles, CLI, workflows)
