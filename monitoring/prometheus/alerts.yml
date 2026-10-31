@@ -1,0 +1,134 @@
+# Portcullis alert rules (docs/monitoring.md). Tested by
+# monitoring/prometheus/tests/alerts_test.yml (`promtool test rules`, CI).
+groups:
+  - name: portcullis
+    rules:
+      - alert: VaultSealedOrDown
+        expr: probe_success{job="vault_health"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: Vault is sealed, uninitialised or down
+          description: >-
+            /v1/sys/health is not 200: no certificates can be issued and the CRL
+            is not refreshed. Run ./portcullis vault unseal and check
+            docker compose logs vault.
+
+      - alert: TargetDown
+        expr: up == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.job }} cannot be scraped"
+          description: "{{ $labels.instance }} ({{ $labels.job }}) has been unreachable for 5 minutes."
+
+      - alert: ServiceProbeFailed
+        expr: probe_success{job=~"services|services_tcp"} == 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.service }} is down or unhealthy"
+          description: "The health probe of {{ $labels.service }} ({{ $labels.instance }}) has failed for 5 minutes."
+
+      - alert: PublicCertExpiringSoon
+        expr: probe_ssl_earliest_cert_expiry{job="tls"} - time() < 14 * 86400
+        for: 1h
+        labels: {severity: critical}
+        annotations:
+          summary: The public certificate expires in less than 14 days
+          description: >-
+            {{ $labels.instance }} presents a certificate that expires in
+            {{ $value | humanizeDuration }}. ACME renewal (Traefik, DNS-01) is
+            failing: check docker compose logs traefik and the DNS provider credentials.
+
+      - alert: PublicCertProbeFailed
+        expr: probe_success{job="tls"} == 0
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: TLS handshake with the public endpoint fails
+          description: "{{ $labels.instance }}: expired, untrusted or wrong certificate, or Traefik is down."
+
+      - alert: CrlStale
+        expr: >-
+          group_gate_crl_enabled == 1
+          and (
+            time() - group_gate_crl_last_success_timestamp_seconds > 600
+            or (group_gate_crl_next_update_timestamp_seconds > 0) < time()
+          )
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: group-gate's copy of Vault's CRL is stale
+          description: >-
+            group-gate has not fetched a fresh CRL for 10 minutes, or the CRL is
+            past its nextUpdate (Keycloak then refuses X.509 logins). Certs revoked
+            in Vault only (not via ./portcullis cert revoke) may still be accepted.
+
+      - alert: RevocationListUnreadable
+        expr: group_gate_revoked_file_serials < 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: group-gate cannot read certs/revocation/revoked-serials.txt
+          description: Every request that presents a client certificate is denied until it is readable.
+
+      - alert: GroupGateDenySpike
+        expr: sum(rate(group_gate_denials_total[5m])) > 0.5
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: Many requests denied by group-gate
+          description: "{{ $value | humanize }} denials/s for 10 minutes. Check the denial reasons on the Portcullis dashboard."
+
+      - alert: GroupGatePolicyErrors
+        expr: increase(group_gate_policy_load_errors_total[10m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: The Hub policy file (or a policy in it) is invalid
+          description: group-gate fails closed and denies the affected apps. Check the Hub and docker compose logs group-gate.
+
+      - alert: BackupTooOld
+        expr: time() - portcullis_backup_last_success_timestamp_seconds > 36 * 3600
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "No successful {{ $labels.kind }} backup for 36 hours"
+          description: "The last {{ $labels.kind }} backup is {{ $value | humanizeDuration }} old. Check the portcullis-backup.timer (journalctl -u portcullis-backup)."
+
+      - alert: BackupNeverRan
+        expr: absent(portcullis_backup_last_success_timestamp_seconds)
+        for: 6h
+        labels: {severity: warning}
+        annotations:
+          summary: No backup has been recorded
+          description: Run ./portcullis backup --offsite and schedule it (./portcullis backup schedule --systemd).
+
+      - alert: ClientCertExpiring
+        expr: portcullis_client_cert_expiry_timestamp_seconds - time() < 7 * 86400
+        labels: {severity: info}
+        annotations:
+          summary: "Client certificate of {{ $labels.cn }} expires soon"
+          description: "Renew at https://enroll.<domain>/self or with ./portcullis cert renew ({{ $value | humanizeDuration }} left)."
+
+      - alert: CaExpiring
+        expr: portcullis_ca_expiry_timestamp_seconds - time() < 90 * 86400
+        labels: {severity: critical}
+        annotations:
+          summary: "The {{ $labels.ca }} CA expires in less than 90 days"
+          description: Every client certificate stops working when it expires.
+
+      - alert: PortcullisStatusStale
+        expr: time() - portcullis_status_last_run_timestamp_seconds > 36 * 3600
+        labels: {severity: warning}
+        annotations:
+          summary: ./portcullis status --textfile has not run for 36 hours
+          description: Client-cert and CA expiry metrics are out of date (it runs after every scheduled backup).
+
+      - alert: PortcullisStatusProblems
+        expr: portcullis_status_ok == 0
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: ./portcullis status reported problems
+          description: Run ./portcullis status on the host.

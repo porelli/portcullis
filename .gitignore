@@ -21,6 +21,9 @@ certs/
 acme.json
 backups/*
 !backups/.gitkeep
+# Textfile metrics written by ./portcullis (monitoring profile)
+monitoring/textfile/*
+!monitoring/textfile/.gitkeep
 # Hub-generated copies of app template dirs (see hub volumes in docker-compose.yml)
 templates/
 .hub/

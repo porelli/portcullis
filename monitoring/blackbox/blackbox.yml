@@ -1,0 +1,29 @@
+# blackbox exporter modules (compose profile `monitoring`).
+modules:
+  http_2xx:
+    prober: http
+    timeout: 5s
+    http:
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+      follow_redirects: false
+      valid_status_codes: [200, 204]
+
+  tcp_connect:
+    prober: tcp
+    timeout: 5s
+    tcp:
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+
+  # TLS handshake against the public endpoint; SNI = the target host.
+  # Verified against the system roots, so an expired / untrusted / wrong
+  # certificate fails the probe (and probe_ssl_earliest_cert_expiry tells
+  # how long the current one lasts).
+  tls_cert:
+    prober: tcp
+    timeout: 10s
+    tcp:
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+      tls: true

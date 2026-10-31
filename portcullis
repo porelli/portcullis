@@ -20,7 +20,7 @@ PORTCULLIS_ROOT="${PORTCULLIS_ROOT:-$PORTCULLIS_HOME}"
 PORTCULLIS_CALLER_PWD="$PWD"
 unset _self _dir
 
-for _lib in common network vault pki certs keycloak dns config status backup stack; do
+for _lib in common network vault pki certs keycloak dns config status monitoring backup stack; do
   # shellcheck source=/dev/null
   source "$PORTCULLIS_LIB/$_lib.sh"
 done
@@ -35,9 +35,14 @@ Setup and lifecycle:
   up                          Start/update the core stack and wait until healthy
   down                        Stop the core stack (volumes and secrets are kept)
   upgrade                     Back up, pull, re-run idempotent setup steps, restart
-  status                      Health overview (--json for machines)
-  backup                      Back up .env, certs/, secrets/ and volumes to backups/
-  restore                     Restore a backup
+  status                      Health overview (--json for machines, --textfile for Prometheus)
+  version                     Core version and the Hub image in use
+
+Backups:
+  backup                      Consistent backup to backups/ (--offsite: also restic, encrypted)
+  backup verify               restic check + restore + sanity checks (or --local)
+  backup schedule             systemd timer for daily backups
+  restore                     Restore a local or off-host (--from-offsite) backup
 
 Configuration:
   config apply                Apply ACME_STAGING / MTLS_ENABLED, rebuild the CA bundle
@@ -77,7 +82,7 @@ main() {
   esac
   cd "$PORTCULLIS_ROOT"
   case "$cmd" in
-    init|up|down|upgrade|status|backup|restore|config|dns|vault|pki|keycloak|oidc|cert)
+    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|cert)
       "cmd_$cmd" "$@" ;;
     *)
       printf "portcullis: unknown command '%s'\nRun 'portcullis help' for the list of commands.\n" "$cmd" >&2

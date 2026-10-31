@@ -1,0 +1,82 @@
+# promtool test rules monitoring/prometheus/tests/alerts_test.yml
+rule_files:
+  - ../alerts.yml
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'probe_success{job="vault_health",instance="http://vault:8200/v1/sys/health"}'
+        values: '1 1 0 0 0 0'
+      - series: 'up{job="keycloak",instance="keycloak:9000"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: VaultSealedOrDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: VaultSealedOrDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: vault_health, instance: "http://vault:8200/v1/sys/health"}
+            exp_annotations:
+              summary: Vault is sealed, uninitialised or down
+              description: >-
+                /v1/sys/health is not 200: no certificates can be issued and the CRL is not refreshed. Run ./portcullis vault unseal and check docker compose logs vault.
+      - eval_time: 10m
+        alertname: TargetDown
+        exp_alerts: []
+
+  # CRL: fresh at first, then the fetch stops succeeding.
+  - interval: 1m
+    input_series:
+      - series: 'group_gate_crl_enabled{job="group-gate",instance="group-gate:8080"}'
+        values: '1x30'
+      - series: 'group_gate_crl_last_success_timestamp_seconds{job="group-gate",instance="group-gate:8080"}'
+        values: '0+60x5 300x25'
+      - series: 'group_gate_crl_next_update_timestamp_seconds{job="group-gate",instance="group-gate:8080"}'
+        values: '999999999x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CrlStale
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: CrlStale
+        exp_alerts:
+          - exp_labels: {severity: critical, job: group-gate, instance: "group-gate:8080"}
+
+  # Backups: one from t=0, none after → too old after 36h (+30m for).
+  - interval: 1h
+    input_series:
+      - series: 'portcullis_backup_last_success_timestamp_seconds{job="portcullis",kind="offsite"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30h
+        alertname: BackupTooOld
+        exp_alerts: []
+      - eval_time: 38h
+        alertname: BackupTooOld
+        exp_alerts:
+          - exp_labels: {severity: warning, job: portcullis, kind: offsite}
+
+  # Public cert: 30 days left, then 10.
+  - interval: 1h
+    input_series:
+      - series: 'probe_ssl_earliest_cert_expiry{job="tls",instance="auth.example.org:443"}'
+        values: '2592000x3 864000x5'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: PublicCertExpiringSoon
+        exp_alerts: []
+      - eval_time: 6h
+        alertname: PublicCertExpiringSoon
+        exp_alerts:
+          - exp_labels: {severity: critical, job: tls, instance: "auth.example.org:443"}
+
+  - interval: 1m
+    input_series:
+      - series: 'group_gate_denials_total{job="group-gate",reason="group"}'
+        values: '0+60x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: GroupGateDenySpike
+        exp_alerts:
+          - exp_labels: {severity: warning}

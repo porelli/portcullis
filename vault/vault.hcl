@@ -35,3 +35,11 @@ listener "tcp" {
   cluster_address = "0.0.0.0:8201"
   tls_disable     = true
 }
+
+# Prometheus metrics at /v1/sys/metrics?format=prometheus (monitoring
+# profile). Reading them needs a token with the portcullis-metrics policy
+# (vault/policies/metrics.hcl), created by ./portcullis vault init.
+telemetry {
+  prometheus_retention_time = "12h"
+  disable_hostname          = true
+}

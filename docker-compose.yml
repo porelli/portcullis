@@ -36,6 +36,13 @@ networks:
     internal: true
   socket-proxy-hub:
     internal: true
+  # Monitoring profile: Prometheus, Alertmanager, Grafana, exporters. No
+  # egress; Prometheus / blackbox also join `portcullis` to reach the
+  # targets, Grafana `portcullis-proxy` (Traefik), Alertmanager `alerting`
+  # (egress for webhook / SMTP receivers).
+  monitoring:
+    internal: true
+  alerting: {}
 
 # Hardening defaults (see docs/hardening.md for per-service exceptions).
 x-hardening: &hardening
@@ -135,6 +142,15 @@ services:
       TRAEFIK_ACCESSLOG: "true"
       # Entrypoints
       TRAEFIK_PING: "true"
+      # Internal entrypoint for /ping (healthcheck) — not published.
+      TRAEFIK_ENTRYPOINTS_TRAEFIK_ADDRESS: ":8080"
+      TRAEFIK_ENTRYPOINTS_TRAEFIK_HTTP_ALIASHEADERSSTRATEGY: delete
+      # Prometheus metrics on an internal entrypoint (:8082, not published;
+      # scraped over the portcullis network by the monitoring profile).
+      TRAEFIK_ENTRYPOINTS_METRICS_ADDRESS: ":8082"
+      TRAEFIK_ENTRYPOINTS_METRICS_HTTP_ALIASHEADERSSTRATEGY: delete
+      TRAEFIK_METRICS_PROMETHEUS: "true"
+      TRAEFIK_METRICS_PROMETHEUS_ENTRYPOINT: metrics
       TRAEFIK_ENTRYPOINTS_WEB_ADDRESS: ":80"
       # Drop header-name aliases (X_Forwarded_Tls_Client_Cert, ...) before
       # routing; the canonical X-Forwarded-* / X-Forwarded-Tls-Client-*
@@ -352,6 +368,8 @@ services:
       # publish below, used by the CLI, cannot be used to forge a cert).
       - --proxy-trusted-addresses=${PORTCULLIS_AUTH_TRAEFIK_IP:-172.31.251.2}
       - --health-enabled=true
+      # /metrics on the management port 9000 (not routed by Traefik).
+      - --metrics-enabled=true
       # X.509 login: Traefik verifies the client cert (authaware TLS on
       # auth.<domain>) and forwards it PEM-encoded in X-Forwarded-Tls-Client-Cert
       # (client-cert-pem@file); Keycloak's `traefik` lookup provider reads it.
@@ -677,9 +695,182 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── Monitoring (opt-in: COMPOSE_PROFILES=monitoring in .env, then
+  # ./portcullis up). docs/monitoring.md. Config: monitoring/; generated
+  # files and the Vault metrics token: secrets/monitoring/ (./portcullis up).
+  prometheus:
+    image: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+    profiles: [monitoring]
+    <<: *hardening
+    user: "65534:65534"
+    read_only: true
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}
+    volumes:
+      - ./monitoring/prometheus:/etc/prometheus:ro
+      - ./secrets/monitoring/prometheus:/etc/portcullis:ro
+      - prometheus_data:/prometheus
+    networks:
+      - monitoring
+      - portcullis
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    mem_limit: 1g
+    pids_limit: 256
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.2@sha256:39d8bb3966c694a124428a3a88fbcffd40bd069129ecd47c059f8a3f17c55f3b
+    profiles: [monitoring]
+    <<: *hardening
+    user: "65534:65534"
+    read_only: true
+    command:
+      # Generated from ALERT_* in .env by ./portcullis up (monitoring.sh).
+      - --config.file=/etc/portcullis/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --cluster.listen-address=
+    volumes:
+      - ./secrets/monitoring/alertmanager:/etc/portcullis:ro
+      - alertmanager_data:/alertmanager
+    networks:
+      - monitoring
+      - alerting
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9093/-/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    mem_limit: 128m
+    pids_limit: 64
+    restart: unless-stopped
+
+  blackbox:
+    image: prom/blackbox-exporter:v0.29.1@sha256:ea1c7aa3ef3f307cd03e85f34abb604478ccb90b567fc690da0cd9776da76b13
+    profiles: [monitoring]
+    <<: *hardening
+    user: "65534:65534"
+    read_only: true
+    command: ["--config.file=/etc/blackbox_exporter/config.yml"]
+    # The TLS probe connects to auth.<domain> the way browsers do: through
+    # the host's published :443, so it sees Traefik's real (ACME) cert.
+    extra_hosts:
+      - "auth.${PORTCULLIS_DOMAIN:-portcullis.local}:host-gateway"
+    volumes:
+      - ./monitoring/blackbox/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+    networks:
+      - monitoring
+      - portcullis
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9115/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    mem_limit: 64m
+    pids_limit: 64
+    restart: unless-stopped
+
+  # Serves monitoring/textfile/*.prom (written by ./portcullis backup and
+  # ./portcullis status --textfile): backup age, client-cert / CA expiry.
+  # Only the textfile collector — no host metrics, no host mounts.
+  textfile-exporter:
+    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    profiles: [monitoring]
+    <<: *hardening
+    user: "65534:65534"
+    read_only: true
+    command:
+      - --collector.disable-defaults
+      - --collector.textfile
+      - --collector.textfile.directory=/textfile
+    volumes:
+      - ./monitoring/textfile:/textfile:ro
+    networks:
+      - monitoring
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9100/metrics"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    mem_limit: 64m
+    pids_limit: 64
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
+    profiles: [monitoring]
+    <<: *hardening
+    user: "472:472"
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      GF_SERVER_ROOT_URL: https://metrics.${PORTCULLIS_DOMAIN:-portcullis.local}/
+      GF_LOG_MODE: console
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+      # Sign-in is Portcullis: forward-auth + group-gate (lldap_admin) set
+      # X-Forwarded-User (LLDAP username) / X-Forwarded-Email; Grafana
+      # accepts them only from Traefik's fixed IP on portcullis-proxy.
+      GF_AUTH_PROXY_ENABLED: "true"
+      GF_AUTH_PROXY_HEADER_NAME: X-Forwarded-User
+      GF_AUTH_PROXY_HEADER_PROPERTY: username
+      GF_AUTH_PROXY_HEADERS: Email:X-Forwarded-Email
+      GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
+      GF_AUTH_PROXY_ENABLE_LOGIN_TOKEN: "false"
+      GF_AUTH_PROXY_WHITELIST: ${PORTCULLIS_TRAEFIK_IP:-172.31.250.2}
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_DISABLE_SIGNOUT_MENU: "true"
+      GF_AUTH_BASIC_ENABLED: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Everyone who gets here is in lldap_admin.
+      GF_USERS_AUTO_ASSIGN_ORG_ROLE: Admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana/admin-password
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana-dashboards:ro
+      - ./secrets/monitoring/grafana:/run/secrets/grafana:ro
+    networks:
+      - monitoring
+      - portcullis-proxy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    mem_limit: 512m
+    pids_limit: 256
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: portcullis-proxy
+      traefik.http.routers.grafana-metrics.rule: Host(`metrics.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.grafana-metrics.entrypoints: websecure
+      traefik.http.routers.grafana-metrics.tls.options: authaware@file
+      traefik.http.routers.grafana-metrics.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.grafana-metrics.loadbalancer.server.port: "3000"
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   vault_data:
   lldap_data:
   hub_data:
   traefik_acme:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:

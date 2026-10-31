@@ -223,6 +223,8 @@ vault_init() {
   else
     ok "Enroll AppRole credentials are valid."
   fi
+  # Scoped token for Prometheus (monitoring profile): reads sys/metrics only.
+  vault_metrics_token
   # The vault / enroll containers run as non-root: give them group read.
   secrets_fix_perms
   umask "$old_umask"
@@ -256,6 +258,10 @@ Idempotent; run by `portcullis init`, `upgrade` and `restore`.
      (vault/policies/enroll.hcl) and role, and stores the enroll role-id /
      secret-id in secrets/enroll/ (0640, group 10002 = the enroll user;
      mounted read-only into enroll).
+  5. Writes the portcullis-metrics policy (vault/policies/metrics.hcl: read
+     sys/metrics) and keeps a token with only that policy in
+     secrets/monitoring/prometheus/vault-token for Prometheus (monitoring
+     profile); recreated when it has less than a year left.
 
 Keep an OFFLINE copy of secrets/vault-init.json: losing it together with
 the host means losing the CA.

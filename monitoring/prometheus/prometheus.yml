@@ -1,0 +1,114 @@
+# Prometheus for the Portcullis core stack (compose profile `monitoring`,
+# docs/monitoring.md). Static: everything domain- or secret-specific comes
+# from files ./portcullis writes into secrets/monitoring/prometheus/
+# (mounted at /etc/portcullis).
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+  external_labels:
+    stack: portcullis
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: alertmanager
+    static_configs:
+      - targets: ["alertmanager:9093"]
+
+  # Traefik's internal `metrics` entrypoint (:8082, not published).
+  - job_name: traefik
+    static_configs:
+      - targets: ["traefik:8082"]
+
+  # Needs a token with the portcullis-metrics policy (./portcullis vault init).
+  # A sealed Vault answers 503 here too — see the vault_health probe.
+  - job_name: vault
+    metrics_path: /v1/sys/metrics
+    params:
+      format: [prometheus]
+    authorization:
+      type: Bearer
+      credentials_file: /etc/portcullis/vault-token
+    static_configs:
+      - targets: ["vault:8200"]
+
+  - job_name: group-gate
+    static_configs:
+      - targets: ["group-gate:8080"]
+
+  # Keycloak management interface (--metrics-enabled), not routed by Traefik.
+  - job_name: keycloak
+    static_configs:
+      - targets: ["keycloak:9000"]
+
+  - job_name: grafana
+    static_configs:
+      - targets: ["grafana:3000"]
+
+  # Textfile metrics written by ./portcullis (backup age, client-cert and CA
+  # expiry, `portcullis status` service health).
+  - job_name: portcullis
+    honor_labels: true
+    static_configs:
+      - targets: ["textfile-exporter:9100"]
+
+  # Unauthenticated health: 200 only when Vault is initialised, unsealed and active.
+  - job_name: vault_health
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets: ["http://vault:8200/v1/sys/health"]
+    relabel_configs: &blackbox
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+
+  # Liveness of the services without a metrics endpoint.
+  - job_name: services
+    metrics_path: /probe
+    params:
+      module: [http_2xx]
+    static_configs:
+      - targets: ["http://enroll:8443/healthz"]
+        labels: {service: enroll}
+      - targets: ["http://forward-auth:4180/ping"]
+        labels: {service: forward-auth}
+      - targets: ["http://hub:8888/healthz"]
+        labels: {service: hub}
+      - targets: ["http://lldap:17170/"]
+        labels: {service: lldap}
+    relabel_configs: *blackbox
+
+  - job_name: services_tcp
+    metrics_path: /probe
+    params:
+      module: [tcp_connect]
+    static_configs:
+      - targets: ["postgres:5432"]
+        labels: {service: postgres}
+      - targets: ["lldap:3890"]
+        labels: {service: lldap-ldap}
+    relabel_configs: *blackbox
+
+  # The public (ACME) certificate as browsers see it: TLS to auth.<domain>:443.
+  - job_name: tls
+    metrics_path: /probe
+    params:
+      module: [tls_cert]
+    file_sd_configs:
+      - files: [/etc/portcullis/tls-targets.json]
+    relabel_configs: *blackbox
