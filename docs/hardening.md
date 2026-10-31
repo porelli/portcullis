@@ -85,7 +85,11 @@ are refused). It is rewritten in place on every `./portcullis up`.
   describe a certificate Traefik verified (CI checks this).
 - Keycloak accepts proxy headers (incl. the client cert for X.509 login)
   only from Traefik's fixed IP on `portcullis-auth`
-  (`--proxy-trusted-addresses=${PORTCULLIS_AUTH_TRAEFIK_IP}`).
+  (`--proxy-trusted-addresses=${PORTCULLIS_AUTH_TRAEFIK_IP}`); the check
+  uses the TCP peer address and cannot be set by a client header. The
+  `127.0.0.1:8080` publish stays for the CLI's admin API calls — requests
+  from there are untrusted, so they can't use a cert header. CI sends a
+  forged header from every reachable place (see `docs/certificates.md`).
 - The Hub only answers requests carrying `X-Portcullis-Proxy-Secret`,
   which the `hub-proxy-secret` middleware adds **after** the forward-auth
   middlewares (so the secret is never sent to oauth2-proxy / group-gate).

@@ -346,7 +346,10 @@ services:
       - --hostname=https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}
       - --proxy-headers=xforwarded
       # Proxy headers (X-Forwarded-*, and the client cert below) are honoured
-      # only from Traefik's fixed address on the portcullis-auth network.
+      # only from Traefik's fixed address on the portcullis-auth network:
+      # Quarkus decides "trusted proxy" from the TCP peer of each request and
+      # the x509 lookup returns no cert otherwise (so the 127.0.0.1:8080
+      # publish below, used by the CLI, cannot be used to forge a cert).
       - --proxy-trusted-addresses=${PORTCULLIS_AUTH_TRAEFIK_IP:-172.31.251.2}
       - --health-enabled=true
       # X.509 login: Traefik verifies the client cert (authaware TLS on
