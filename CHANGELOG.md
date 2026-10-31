@@ -67,6 +67,13 @@ nothing here migrates old data.
   `keycloak configure` maintains an `email-unverified` client scope (`email`
   claim, no `email_verified`) for apps that refuse `email_verified=false`
   (Hub templates opt in with `email_verified_claim: false`).
+- **Step-up** goes to `https://auth.<domain>/oauth2/start?acr_values=…&rd=<app>`;
+  oauth2-proxy is routed on `auth.<domain>` only (a host-less `/oauth2/`
+  router gets Traefik's 421 on tiered hosts).
+- **Delta CRLs** on pki_int (`enable_delta`, rebuilt every minute):
+  `auto_rebuild` defers full CRL rebuilds, so revocations made in Vault
+  directly are only in the delta CRL until then; group-gate
+  (`GATE_DELTA_CRL_URL`) and Keycloak's X.509 login read both.
 - **Docker socket**: only two socket proxies mount it (Traefik read-only, the
   Hub what `docker compose` needs), each on its own internal network.
 - **Hardening**: every core image pinned by digest; `no-new-privileges`,

@@ -7,8 +7,13 @@
 # revoked serial. It learns revoked serials from
 #   - certs/revocation/revoked-serials.txt (rewritten from Vault's
 #     authoritative list by `cert revoke` / `cert sync`; next request), and
-#   - Vault's CRL (http://vault:8200/v1/pki_int/crl, re-fetched every 60s),
-#     which also covers revocations done via the Vault API/UI directly.
+#   - Vault's full + delta CRL (http://vault:8200/v1/pki_int/crl and
+#     .../crl/delta, re-fetched every 60s), which also covers revocations
+#     done via the Vault API/UI directly. pki_int has auto_rebuild=true, so
+#     Vault does not rebuild the full CRL on revoke: a direct revocation
+#     shows up in the delta CRL (rebuilt about once a minute) and in the
+#     full CRL at its next rebuild. `cert revoke` rotates the full CRL
+#     right away. Keycloak's X.509 login checks both CRLs too.
 # Only routers whose middleware chain has client-headers@file BEFORE
 # portcullis-groups@docker are covered.
 
@@ -116,8 +121,11 @@ cert_revoke() {
   fi
   vault write pki_int/revoke serial_number="$serial" >/dev/null || fail "Revocation failed"
   ok "Certificate revoked in Vault."
-  # Vault rebuilds the CRL on revoke; this is belt and braces.
-  vault read -format=json pki_int/crl/rotate >/dev/null 2>&1 || warn "CRL rotate failed (group-gate still uses the serial file)"
+  # auto_rebuild=true: Vault does NOT rebuild the full CRL on revoke (the
+  # serial would otherwise only reach the delta CRL within ~1-2 minutes).
+  # Rebuild it now so Keycloak and group-gate see it on their next fetch.
+  vault read -format=json pki_int/crl/rotate >/dev/null 2>&1 \
+    || warn "CRL rotate failed: the delta CRL picks the revocation up within ~2 minutes (group-gate uses the serial file now)"
   # Enforce: group-gate reads this file on every request.
   cert_sync
   # PEM copy of the CRL for tools that want one (e.g. Keycloak X.509 CRL

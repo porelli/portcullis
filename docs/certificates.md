@@ -111,7 +111,7 @@ Certificates used to live 24 h, which meant a manual `cert renew` with the YubiK
 
 - maps the Subject CN to the LLDAP username,
 - **re-validates** the chain against `certs/truststore/` (written by `pki setup`, mounted as Keycloak's truststore) and checks the validity period and the `clientAuth` EKU,
-- **checks the CRL** at `http://vault:8200/v1/pki_int/crl` (Keycloak caches it for at most 60 s; Vault rebuilds it on every revoke and `auto_rebuild` keeps it from going stale).
+- **checks the CRLs** at `http://vault:8200/v1/pki_int/crl` and `.../crl/delta` (`##`-separated in `crl-relative-path`; Keycloak caches each for at most 60 s). pki_int has `auto_rebuild=true` (keeps the full CRL from going stale) and therefore `enable_delta=true`: Vault does **not** rebuild the full CRL on revoke, new revocations land in the delta CRL (rebuilt every minute) until the next full rebuild. `portcullis cert revoke` also rotates the full CRL immediately.
 
 - **fails closed on the CRL**: if the CRL cannot be fetched the X.509 login fails, and `x509-cert-auth-crl-abort-if-non-updated=true` (that is Keycloak's actual key, with a dash) also rejects a CRL past its `nextUpdate`. Vault never lets it get there: `pki setup` sets `pki_int/config/crl` to `expiry=72h auto_rebuild=true auto_rebuild_grace_period=12h`, and every revoke rebuilds it.
 
@@ -138,7 +138,7 @@ A token with `amr=mtls` proves a cert was used **at login**. When an app's polic
 **Traefik does not check CRLs** — a TLS handshake with a revoked-but-unexpired cert still succeeds. Revocation is enforced by **group-gate** (`portcullis-groups@docker`): `client-headers@file` (Traefik `passTLSClientCert`, with `serialNumber: true`) passes `X-Forwarded-Tls-Client-Cert-Info` to the backend *and* to every later forward-auth middleware, and group-gate returns 403 when the cert's serial is revoked. Sources:
 
 - `certs/revocation/revoked-serials.txt` — rewritten atomically by `portcullis cert revoke` / `cert sync` from Vault's list of revoked serials; checked on the next request. If Vault can't be queried (sealed, bad token, unreachable) the file is left unchanged and the command fails — it never "un-revokes" by writing an empty list.
-- Vault's CRL (`http://vault:8200/v1/pki_int/crl`), re-fetched every 60 s — also covers revocations made directly through the Vault API/UI. If Vault is unreachable the last good CRL is kept.
+- Vault's full and delta CRL (`GATE_CRL_URL` = `http://vault:8200/v1/pki_int/crl`, `GATE_DELTA_CRL_URL` = `.../crl/delta`), re-fetched every 60 s (`GATE_CRL_REFRESH_SECONDS`); the union is enforced — also covers revocations made directly through the Vault API/UI, which reach the delta CRL within about 2 minutes (Vault's periodic rebuild runs once a minute) and are denied at group-gate's next refresh. If Vault is unreachable the last good copy of each CRL is kept.
 
 Coverage: every router whose middleware chain has `client-headers@file` **before** `portcullis-groups@docker` (all core routers and the default app templates), new Keycloak X.509 logins (CRL), and sessions on mtls-only policies (mTLS binding above). **Not covered:** routers that rely on the TLS client cert alone (e.g. a `protected`-tier router without `portcullis-groups@docker`) — Traefik never checks CRLs, so there the cert works until it expires — and password/WebAuthn sessions of the same user (sign them out in the Keycloak admin console if needed).
 

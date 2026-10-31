@@ -737,10 +737,14 @@ jobs:
 
           # 3) Vault keeps the CRL fresh, so crl-abort-if-non-updated=true never locks people out.
           VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
-          vault read -format=json pki_int/config/crl | jq -e '.data.auto_rebuild == true' >/dev/null || { echo "FAIL: CRL auto_rebuild off"; exit 1; }
-          NEXT=$(curl -sf http://127.0.0.1:8200/v1/pki_int/crl/pem | openssl crl -noout -nextupdate | cut -d= -f2)
-          [ "$(date -d "$NEXT" +%s)" -gt "$(date +%s)" ] || { echo "FAIL: Vault CRL is stale (nextUpdate $NEXT)"; exit 1; }
-          echo "PASS: CRL auto-rebuild on, nextUpdate $NEXT"
+          vault read -format=json pki_int/config/crl | jq -e '.data.auto_rebuild == true and .data.enable_delta == true' >/dev/null \
+            || { echo "FAIL: CRL auto_rebuild / enable_delta off: $(vault read -format=json pki_int/config/crl | jq -c .data)"; exit 1; }
+          for crl in crl crl/delta; do
+            NEXT=$(curl -sf "http://127.0.0.1:8200/v1/pki_int/$crl/pem" | openssl crl -noout -nextupdate | cut -d= -f2)
+            [ -n "$NEXT" ] && [ "$(date -d "$NEXT" +%s)" -gt "$(date +%s)" ] || { echo "FAIL: Vault $crl is missing/stale (nextUpdate '$NEXT')"; exit 1; }
+            echo "PASS: pki_int/$crl nextUpdate $NEXT"
+          done
+          echo "PASS: CRL auto-rebuild + delta CRL on (group-gate and Keycloak read both)"
 
       - name: Test client-cert headers cannot be spoofed and path rules see X-Forwarded-Uri
         run: |
@@ -920,21 +924,37 @@ jobs:
           ./portcullis cert sync
           grep -qi "^$SERIAL\$" certs/revocation/revoked-serials.txt || { echo "FAIL: cert sync dropped the serial"; exit 1; }
 
-          # 2) revoke directly in Vault (no file update) → CRL refresh → denial
+          # 2) revoke directly in Vault (no file update, no CRL rotate). With
+          #    auto_rebuild Vault does not rebuild the full CRL on revoke; the
+          #    serial reaches the delta CRL at the next delta rebuild
+          #    (delta_rebuild_interval=1m, Vault's periodic function runs once a
+          #    minute → ≤ ~2 min), then group-gate's next refresh (3s here, 60s
+          #    by default) denies it. Window: 180s.
           VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
           openssl ecparam -name prime256v1 -genkey -noout -out /tmp/c2.key
           openssl req -new -key /tmp/c2.key -subj "/CN=testuser" -out /tmp/c2.csr
           R=$(vault write -format=json pki_int/sign/client-cert csr="$(cat /tmp/c2.csr)" common_name=testuser ttl=1h)
           echo "$R" | jq -r .data.certificate > /tmp/c2.crt
+          SN2=$(echo "$R" | jq -r .data.serial_number)
           code=$(gated /tmp/c2)
-          [ "$code" = 200 ] || { echo "FAIL: fresh cert got $code"; exit 1; }
-          vault write pki_int/revoke serial_number="$(echo "$R" | jq -r .data.serial_number)" >/dev/null
-          for _ in $(seq 1 20); do
+          [ "$code" = 200 ] || { echo "FAIL: fresh cert got $code"; docker compose logs --tail=20 group-gate; exit 1; }
+          vault write pki_int/revoke serial_number="$SN2" >/dev/null
+          in_crl() { curl -sf "http://127.0.0.1:8200/v1/pki_int/$1/pem" | openssl crl -noout -text 2>/dev/null \
+                       | tr -d ' :' | grep -qi "SerialNumber${SN2//:/}"; }
+          start=$(date +%s); seen=""
+          while [ $(( $(date +%s) - start )) -lt 180 ]; do
+            if [ -z "$seen" ]; then
+              in_crl crl/delta && seen="delta CRL"
+              in_crl crl && seen="full CRL"
+              [ -z "$seen" ] || echo "serial in Vault's $seen after $(( $(date +%s) - start ))s"
+            fi
             code=$(gated /tmp/c2)
-            [ "$code" = 403 ] && { echo "PASS: cert revoked in Vault is denied via CRL"; exit 0; }
-            sleep 1
+            [ "$code" = 403 ] && { echo "PASS: cert revoked in Vault only is denied via the CRLs after $(( $(date +%s) - start ))s"; exit 0; }
+            sleep 3
           done
-          echo "FAIL: cert revoked in Vault still accepted ($code)"; docker compose logs --tail=20 group-gate; exit 1
+          echo "FAIL: cert revoked in Vault still accepted after 180s ($code; in Vault CRL: ${seen:-no})"
+          vault read -format=json pki_int/config/crl | jq -c .data
+          docker compose logs --tail=20 group-gate; exit 1
 
       - name: portcullis status
         run: |

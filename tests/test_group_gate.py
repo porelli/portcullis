@@ -28,6 +28,7 @@ os.environ["GATE_MAP_FILE"] = MAP_PATH
 os.environ["GATE_POLICY_FILE"] = POLICY
 os.environ["GATE_REVOKED_FILE"] = REVOKED
 os.environ.pop("GATE_CRL_URL", None)
+os.environ.pop("GATE_DELTA_CRL_URL", None)
 os.environ["PORTCULLIS_DOMAIN"] = "example.com"
 os.environ.pop("GATE_MAP", None)
 
@@ -446,11 +447,15 @@ class RevocationUnitTest(unittest.TestCase):
 class _CrlHandler(http.server.BaseHTTPRequestHandler):
     body = b""
     status = 200
+    by_path: dict = {}  # path -> (status, body), overrides status/body
+    fetched: list = []
 
     def do_GET(self):
-        self.send_response(self.status)
+        _CrlHandler.fetched.append(self.path)
+        status, body = self.by_path.get(self.path, (self.status, self.body))
+        self.send_response(status)
         self.end_headers()
-        self.wfile.write(self.body)
+        self.wfile.write(body)
 
     def log_message(self, *a):
         pass
@@ -584,6 +589,69 @@ class RevocationGateTest(GateTest):
             self.assertEqual(self.req("random.example.com", extra={gg.CERT_INFO_HEADER: cert_info(0x77)}), 403)
         finally:
             srv.shutdown()
+
+
+class DeltaCrlTest(GateTest):
+    """Vault with auto_rebuild: new revocations are only in the delta CRL."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.crl_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CrlHandler)
+        threading.Thread(target=cls.crl_srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.crl_srv.shutdown()
+        cls.crl_srv.server_close()
+        super().tearDownClass()
+
+    def setUp(self):
+        super().setUp()
+        write_revoked(None)
+        gg.CRL_CACHE = None
+        base = f"http://127.0.0.1:{self.crl_srv.server_address[1]}/v1/pki_int"
+        self.cache = gg.CrlCache(base + "/crl", 60, delta_url=base + "/crl/delta")
+
+    def tearDown(self):
+        _CrlHandler.by_path = {}
+        _CrlHandler.fetched = []
+        gg.CRL_CACHE = None
+
+    def test_union_of_full_and_delta(self):
+        _CrlHandler.by_path = {"/v1/pki_int/crl": (200, build_crl([0x10])),
+                               "/v1/pki_int/crl/delta": (200, build_crl([0x20]))}
+        _CrlHandler.fetched = []
+        self.assertTrue(self.cache.refresh())
+        # delta first: a full rebuild in between can only move serials into the full CRL
+        self.assertEqual(_CrlHandler.fetched, ["/v1/pki_int/crl/delta", "/v1/pki_int/crl"])
+        self.assertEqual(self.cache.serials, {0x10, 0x20})
+        gg.CRL_CACHE = self.cache
+        for sn in (0x10, 0x20):
+            self.assertEqual(self.req("random.example.com", extra={gg.CERT_INFO_HEADER: cert_info(sn)}), 403)
+        self.assertEqual(self.req("random.example.com", extra={gg.CERT_INFO_HEADER: cert_info(0x30)}), 200)
+        # Revocation is checked before (and independently of) the user.
+        self.assertEqual(self.req("random.example.com", extra={gg.CERT_INFO_HEADER: cert_info(0x20),
+                                                                "X-Auth-Request-Preferred-Username": None}), 403)
+
+    def test_delta_failure_keeps_last_good_delta_and_reports_staleness(self):
+        _CrlHandler.by_path = {"/v1/pki_int/crl": (200, build_crl([0x10])),
+                               "/v1/pki_int/crl/delta": (200, build_crl([0x20]))}
+        self.assertTrue(self.cache.refresh())
+        ok = self.cache.last_success
+        _CrlHandler.by_path["/v1/pki_int/crl/delta"] = (404, b"no delta")
+        self.assertFalse(self.cache.refresh())
+        self.assertEqual(self.cache.serials, {0x10, 0x20})
+        # Freshness = the oldest source: the delta's last good fetch.
+        self.assertEqual(self.cache.last_success, ok)
+        self.assertEqual(self.cache.next_update, 1735689600.0)
+
+    def test_never_fetched_delta_means_never_fresh(self):
+        _CrlHandler.by_path = {"/v1/pki_int/crl": (200, build_crl([0x10])),
+                               "/v1/pki_int/crl/delta": (500, b"")}
+        self.assertFalse(self.cache.refresh())
+        self.assertEqual(self.cache.last_success, 0)
+        self.assertEqual(self.cache.serials, {0x10})
 
 
 class MetricsTest(GateTest):

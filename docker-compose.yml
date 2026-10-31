@@ -532,7 +532,11 @@ services:
       # revoked serial are denied. Sources: the serial file above (instant)
       # plus Vault's CRL (unauthenticated endpoint, refreshed periodically).
       GATE_REVOKED_FILE: /etc/group-gate/revocation/revoked-serials.txt
+      # auto_rebuild=true: Vault adds new revocations to the DELTA CRL
+      # (rebuilt about once a minute) and folds them into the full CRL only
+      # at its next rebuild — group-gate enforces both.
       GATE_CRL_URL: http://vault:8200/v1/pki_int/crl
+      GATE_DELTA_CRL_URL: http://vault:8200/v1/pki_int/crl/delta
       # Requests whose X-Forwarded-Host is not <label>.<PORTCULLIS_DOMAIN>
       # (after lowercasing / stripping port) are denied.
       PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}

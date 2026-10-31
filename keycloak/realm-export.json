@@ -233,7 +233,7 @@
         "x509-cert-auth.mapper-selection.user-attribute-name": "usercertificate",
         "x509-cert-auth.mapping-source-selection": "Subject's Common Name",
         "x509-cert-auth.crl-checking-enabled": "true",
-        "x509-cert-auth.crl-relative-path": "http://vault:8200/v1/pki_int/crl",
+        "x509-cert-auth.crl-relative-path": "http://vault:8200/v1/pki_int/crl##http://vault:8200/v1/pki_int/crl/delta",
         "x509-cert-auth-crl-abort-if-non-updated": "true",
         "x509-cert-auth.crldp-checking-enabled": "false",
         "x509-cert-auth.ocsp-checking-enabled": "false",

@@ -12,10 +12,13 @@ Checks, run in order:
          comments; written by `portcullis cert revoke|sync`), re-read whenever it
          changes. Missing file = none revoked; unreadable file = requests
          that present a cert are denied (fail closed).
-       - GATE_CRL_URL (Vault's DER CRL, e.g. http://vault:8200/v1/pki_int/crl),
-         re-fetched every GATE_CRL_REFRESH_SECONDS (default 60) in the
-         background. Fetch errors keep the last good CRL (fail open on
-         Vault outages — the serial file still applies).
+       - GATE_CRL_URL (Vault's full DER CRL, http://vault:8200/v1/pki_int/crl)
+         and GATE_DELTA_CRL_URL (its delta CRL, .../pki_int/crl/delta: with
+         auto_rebuild Vault puts new revocations only there until the next
+         full rebuild), re-fetched every GATE_CRL_REFRESH_SECONDS (default
+         60) in the background; the union is enforced. Fetch errors keep
+         the last good CRL (fail open on Vault outages — the serial file
+         still applies).
      Traefik's entrypoint deletes client-supplied X-Forwarded-Tls-Client-*
      headers, so the header only ever describes a cert Traefik verified.
   1. Auth policy — does the current session's ACR/AMR satisfy the app's
@@ -99,6 +102,7 @@ MAP_FILE = os.environ.get("GATE_MAP_FILE", "/etc/group-gate/map.conf")
 DOMAIN = os.environ.get("PORTCULLIS_DOMAIN", "").strip().lower().rstrip(".")
 REVOKED_FILE = os.environ.get("GATE_REVOKED_FILE", "/etc/group-gate/revocation/revoked-serials.txt")
 CRL_URL = os.environ.get("GATE_CRL_URL", "").strip()
+DELTA_CRL_URL = os.environ.get("GATE_DELTA_CRL_URL", "").strip()
 CRL_REFRESH_SECONDS = float(os.environ.get("GATE_CRL_REFRESH_SECONDS", "60"))
 CERT_INFO_HEADER = "X-Forwarded-Tls-Client-Cert-Info"
 
@@ -405,9 +409,9 @@ class Metrics:
         ]
         if crl is not None:
             gauges += [
-                ("group_gate_crl_last_success_timestamp_seconds", "Unix time of the last successful CRL fetch (0 = never).", crl.last_success),
-                ("group_gate_crl_next_update_timestamp_seconds", "nextUpdate of the cached CRL (0 = unknown).", crl.next_update or 0),
-                ("group_gate_crl_revoked_serials", "Revoked serials in the cached CRL.", len(crl.serials)),
+                ("group_gate_crl_last_success_timestamp_seconds", "Unix time of the last successful CRL fetch, oldest of full and delta CRL (0 = never).", crl.last_success),
+                ("group_gate_crl_next_update_timestamp_seconds", "Earliest nextUpdate of the cached full / delta CRL (0 = unknown).", crl.next_update or 0),
+                ("group_gate_crl_revoked_serials", "Revoked serials in the cached CRLs (full + delta, deduplicated).", len(crl.serials)),
             ]
         try:
             file_serials = float(len(load_revoked_file()))
@@ -555,12 +559,11 @@ def parse_crl(data: bytes) -> Tuple[FrozenSet[int], Optional[float]]:
     return frozenset(serials), next_update
 
 
-class CrlCache:
-    """Background-refreshed set of serials from GATE_CRL_URL."""
+class CrlSource:
+    """One CRL URL: last good serials / nextUpdate, kept across fetch errors."""
 
-    def __init__(self, url: str, interval: float):
+    def __init__(self, url: str):
         self.url = url
-        self.interval = max(interval, 1.0)
         self.serials: FrozenSet[int] = frozenset()
         self.last_error: Optional[str] = None
         self.last_success: float = 0.0      # epoch of the last good fetch (0 = never)
@@ -587,13 +590,56 @@ class CrlCache:
         self.last_error = None
         return True
 
+
+class CrlCache:
+    """Background-refreshed revoked serials from Vault's CRLs.
+
+    Vault (pki_int/config/crl auto_rebuild=true) does NOT rebuild the full
+    CRL on revoke: new revocations appear in the delta CRL (enable_delta,
+    rebuilt about once a minute) until the next full rebuild, which then
+    clears the delta. So both are fetched and the union is enforced.
+
+    Order: delta first, then full. A full rebuild between the two fetches
+    can then only move a serial from the (already fetched) delta into the
+    (about to be fetched) full CRL — never out of both.
+
+    Freshness for /metrics is the WORST of the sources: oldest successful
+    fetch, earliest nextUpdate.
+    """
+
+    def __init__(self, url: str, interval: float, delta_url: str = ""):
+        self.sources = ([CrlSource(delta_url)] if delta_url else []) + [CrlSource(url)]
+        self.url = url
+        self.interval = max(interval, 1.0)
+
+    @property
+    def serials(self) -> FrozenSet[int]:
+        out: FrozenSet[int] = frozenset()
+        for src in self.sources:
+            out = out | src.serials
+        return out
+
+    @property
+    def last_success(self) -> float:
+        return min(src.last_success for src in self.sources)
+
+    @property
+    def next_update(self) -> Optional[float]:
+        known = [src.next_update for src in self.sources if src.next_update]
+        return min(known) if known else None
+
+    def refresh(self) -> bool:
+        results = [src.refresh() for src in self.sources]
+        return all(results)
+
     def run_forever(self):
         while True:
             self.refresh()
             time.sleep(self.interval)
 
 
-CRL_CACHE: Optional[CrlCache] = CrlCache(CRL_URL, CRL_REFRESH_SECONDS) if CRL_URL else None
+CRL_CACHE: Optional[CrlCache] = (CrlCache(CRL_URL, CRL_REFRESH_SECONDS, DELTA_CRL_URL)
+                                 if CRL_URL else None)
 
 
 def revoked_serials() -> FrozenSet[int]:
@@ -1181,7 +1227,7 @@ if __name__ == "__main__":
     )
     print(f"group-gate: static group mappings: {load_static_map()}", flush=True)
     print(f"group-gate: revocation: file={REVOKED_FILE} crl={CRL_URL or '(disabled)'} "
-          f"refresh={CRL_REFRESH_SECONDS:g}s", flush=True)
+          f"delta={DELTA_CRL_URL or '(none)'} refresh={CRL_REFRESH_SECONDS:g}s", flush=True)
     if CRL_CACHE is not None:
         threading.Thread(target=CRL_CACHE.run_forever, daemon=True, name="crl-refresh").start()
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()

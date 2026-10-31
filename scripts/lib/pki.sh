@@ -72,12 +72,19 @@ _pki_write_client_role() {
     key_type=ec key_bits=256 max_ttl="$ttl" ttl="$ttl" no_store=false >/dev/null
 }
 
-# _pki_configure_crl — keep pki_int's CRL fresh: Vault rebuilds it on every
-# revoke; auto_rebuild also re-signs it before nextUpdate (72h) passes, so
-# Keycloak's CRL check never sees a stale list.
+# _pki_configure_crl — keep pki_int's CRLs fresh. auto_rebuild re-signs the
+# full CRL before its nextUpdate (72h) passes, so Keycloak's CRL check
+# (crl-abort-if-non-updated) never sees a stale list. With auto_rebuild,
+# Vault no longer rebuilds the full CRL on revoke: new revocations go into
+# the delta CRL (enable_delta), rebuilt every delta_rebuild_interval
+# (Vault's periodic function runs once a minute, so 1m is the floor) and
+# folded into the full CRL at its next rebuild. group-gate and Keycloak
+# read both (/v1/pki_int/crl + /v1/pki_int/crl/delta); `cert revoke` also
+# rotates the full CRL immediately.
 _pki_configure_crl() {
-  vault write pki_int/config/crl expiry=72h auto_rebuild=true auto_rebuild_grace_period=12h >/dev/null \
-    || warn "could not configure CRL auto-rebuild on pki_int"
+  vault write pki_int/config/crl expiry=72h auto_rebuild=true auto_rebuild_grace_period=12h \
+    enable_delta=true delta_rebuild_interval=1m >/dev/null \
+    || warn "could not configure CRL auto-rebuild / delta CRLs on pki_int"
 }
 
 # _pki_export_truststore — CA chain for Keycloak's X.509 authenticator
@@ -207,7 +214,7 @@ Create the client-certificate CA in Vault: root CA (10y), intermediate CA
 days; CN taken from the caller, never from the CSR). Writes
 certs/root-ca.crt, intermediate-ca.crt, ca-chain.crt and Keycloak's
 truststore (certs/truststore/portcullis-ca-chain.pem); enables CRL
-auto-rebuild on pki_int.
+auto-rebuild + delta CRLs (rebuilt every minute) on pki_int.
 
 Idempotent: an existing CA is never replaced; the client-cert role is
 rewritten (so a new CLIENT_CERT_TTL applies to certs issued from now on),
