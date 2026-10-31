@@ -51,12 +51,14 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 - CI drives everything through `./portcullis` and runs `<cmd> --help` for every command listed by `./portcullis help`
 - Client-cert revocation is enforced by group-gate, so routers need `client-headers@file` BEFORE `portcullis-groups@docker`
 - Browser e2e (CI job `e2e`, needs the whole stack): `tests/e2e/e2e_login.py` (Playwright, pinned in `tests/e2e/requirements.txt`, CDP virtual WebAuthn authenticator). Not collected by pytest. Screenshots/traces/logs are uploaded on failure
+- Monitoring config: CI runs `promtool check config --syntax-only`, `promtool check rules`, `promtool test rules monitoring/prometheus/tests/alerts_test.yml`, `amtool check-config` on every generated receiver variant, `blackbox_exporter --config.check`. Rule tests need `exp_annotations` and samples at least every 5m (lookback)
+- CI build-and-test ends with backup → `backup verify --local` → restic (local repo) `--offsite` x2 → `backup verify` → wipe everything (`down -v`, `.env`, `secrets/`, `certs/`) → `restore --from-offsite` → CA / cert records / revocations / Keycloak / LLDAP must match. The e2e job runs with `COMPOSE_PROFILES=monitoring` (targets up, probes, rules, Grafana gated)
 - Local verification without Docker: `docker compose -f docker-compose.yml --env-file <generated .env> config -q` (generate one with `PORTCULLIS_ROOT=/tmp/x ./portcullis init --env-only --non-interactive --domain ci.example.org --dns-provider none`)
 - Per-app template tests live in `porelli/portcullis-templates` (`tests/apps/<app>.sh`, `.github/workflows/test-apps.yml`)
 
 ### Admin CLI
 
-- **One entrypoint: `./portcullis`** (bash, `set -euo pipefail`). `./portcullis help` lists every command, `./portcullis <cmd> --help` documents it. Logic lives in `scripts/lib/<area>.sh` (common, network, vault, pki, certs, keycloak, dns, config, status, backup, stack); the entrypoint sources them all and dispatches to `cmd_<name>`. There are no other scripts — don't add standalone ones.
+- **One entrypoint: `./portcullis`** (bash, `set -euo pipefail`). `./portcullis help` lists every command, `./portcullis <cmd> --help` documents it. Logic lives in `scripts/lib/<area>.sh` (common, network, vault, pki, certs, keycloak, dns, config, status, monitoring, backup, stack); the entrypoint sources them all and dispatches to `cmd_<name>`. There are no other scripts — don't add standalone ones.
 - New command: add `cmd_<x>` + `help_<x>` in the right lib, list it in `help_main`, extend `tests/test_cli.sh`. `--help` must work without `.env`/Docker; argument errors exit 2.
 - `.env` is **parsed, never sourced**; shell environment wins over `.env`, like docker compose. Edit it with `env_set` (in place — it may be a symlink into `config/`). The Hub never sees it: `hub_env_write` generates `secrets/hub/core.env` (whitelisted vars only, never `CORE_SECRETS`), mounted read-only as the Hub's `/project/.env`.
 - Files a non-root container reads stay operator-owned with the container's GID (`ct_group_read`: 0640 / dirs 0750; `ct_own` uses a throwaway root container when not root). UIDs/GIDs are `CT_*` in `common.sh` and must match `user:` / the images (vault 100:1000, hub 10001, enroll 10002, group-gate 10003, Traefik root/group 0). `stack_prepare` → `secrets_fix_perms` repairs them on every run.
@@ -75,7 +77,16 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 - Every core image is pinned `tag@sha256:…` (get the index digest from the registry, e.g. `docker manifest inspect` / registry API); every service has `no-new-privileges`, `cap_drop: ALL`, mem/pids limits; read-only root FS + non-root where possible (exceptions in `docs/hardening.md`). CI enforces pins, the socket rule and the hardening baseline
 - Keycloak sits on `portcullis-auth` (internal, fixed IPAM `PORTCULLIS_AUTH_*`) with Traefik; `--proxy-trusted-addresses=$PORTCULLIS_AUTH_TRAEFIK_IP` — proxy headers incl. the forwarded client cert (X.509 login, `traefik` lookup provider, `client-cert-pem@file`) are trusted only from there. All `auth.<domain>` routers use `authaware@file`
 - Client certs: `CLIENT_CERT_TTL` (default 720h); `pki setup` rewrites the Vault role every run. Self-service renewal at `enroll.<domain>/self` (router `enroll-self`, `portcullis-self@docker` = group-gate `/authenticated`)
-- Hub auto-clones templates from `porelli/portcullis-templates`
+- Hub auto-clones templates from `porelli/portcullis-templates`; the Hub gets no LLDAP credentials
+
+### Backups, monitoring, releases
+
+- `portcullis backup` is **logical and online**: Vault raft snapshot (root token, API), `pg_dump -Fc`, SQLite online backup inside the lldap/hub/acme volume archives (run as the volume owner's uid), plus `.env`, `certs/`, `secrets/`, `config/`, `MANIFEST.json` (sha256 of every file). Never stop services for it. `--offsite` = restic in its pinned image (`BACKUP_RESTIC_IMAGE`), as the operator uid; `BACKUP_PASSWORD` + provider creds passed by env NAME in a subshell (`BACKUP_<NAME>` overrides `<NAME>`, so Route53 `AWS_*` don't leak into restic or vice versa). `BACKUP_PASSWORD` is generated by init/upgrade (`BACKUP_SECRETS`, not a compose secret) and must never be rotated
+- `restore` restores the raft snapshot into a FRESH Vault (temp init → `snapshot-force` → install backed-up `secrets/` → recreate → auto-unseal with the original key) and `pg_restore`s into a fresh Postgres; it refuses backups whose checksums don't match
+- Scheduling is a systemd timer (`backup schedule --systemd`), not a container: a scheduler container would need the Docker socket (contract §6)
+- Monitoring = compose profile `monitoring` (`COMPOSE_PROFILES=monitoring` in `.env`). `monitoring_prepare` (in `stack_prepare`) writes `secrets/monitoring/{prometheus,alertmanager}` (group 65534) and `grafana/` (group 472); `vault init` keeps the Prometheus token (policy `portcullis-metrics`, `vault/policies/metrics.hcl`). Metrics endpoints stay internal (Traefik `:8082` entrypoint, group-gate `/metrics`, Keycloak `:9000`). `metrics` is a core group-gate subdomain (`lldap_admin`). The CLI publishes textfile metrics in `monitoring/textfile/` (`backup`, `status --textfile`)
+- Releases: `vX.Y.Z` tags only, `release.yml` (preflight: CHANGELOG section + `HUB_IMAGE` default = released Hub tag@digest; then `ci.yml` via `workflow_call`; then notes + `portcullis-X.Y.Z.tar.gz` with `VERSION` + sha256). `portcullis version` = `VERSION` file, else `git describe`. Keep `CHANGELOG.md` (Keep a Changelog) `Unreleased` up to date
+- Supply chain: every image `tag@sha256` in all compose files/profiles, CLI constants and workflows; actions pinned by full commit SHA with `# vX.Y.Z`; CI enforces all of it. `.github/dependabot.yml` covers compose, enroll Dockerfile, gomod, actions, e2e pip (not the CLI/workflow inline images)
 
 ## Key Files
 
@@ -84,7 +95,7 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 | `docker-compose.yml` | Core services (socket proxies, Traefik, Keycloak, LLDAP, Vault, oauth2-proxy, group-gate, Hub, enroll) |
 | `portcullis` | The admin CLI (`./portcullis help`) |
 | `scripts/lib/*.sh` | CLI libraries, one per area |
-| `group-gate/group-gate.py` | Per-subdomain group / `path_groups` / auth-policy / mTLS-binding / revocation middleware (policy file v2, reserved group `__portcullis_deny__` always denies) |
+| `group-gate/group-gate.py` | Per-subdomain group / `path_groups` / auth-policy / mTLS-binding / revocation middleware (policy file v2, reserved group `__portcullis_deny__` always denies); `/metrics` |
 | `group-gate/group-gate-map.conf` | Subdomain → required LLDAP group mapping (authoritative for core subdomains; Hub's `groups` key in `group-gate-policy.json` adds/overrides app subdomains) |
 | `tests/test_group_gate.py` | group-gate unit tests (`python3 tests/test_group_gate.py`) incl. path-bypass and mTLS-binding cases |
 | `tests/e2e/e2e_login.py` | Browser e2e (CI job `e2e`): redirect, password + passkey registration, group / path denial, WebAuthn step-up, X.509 login, mTLS binding, revoked / foreign cert |
@@ -94,7 +105,13 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 | `keycloak/realm-export.json` | Keycloak realm with WebAuthn + X.509 flows |
 | `tests/test_shell_libs.sh` | Unit tests for `.env` handling, secret generation, network validation, revoked-serial sync, `pki setup` idempotency (stub `docker`/`vault`) |
 | `vault/` | Vault server config (`vault.hcl`, raft), auto-unseal entrypoint, `policies/enroll.hcl` |
-| `secrets/` | **gitignored** (only `.gitkeep` tracked; masked from the Hub by tmpfs), 0700: `vault-init.json` (root token + unseal key, 0600), `vault-unseal/` (group 1000), `enroll/` AppRole creds (group 10002), `hub/core.env` (group 10001) |
+| `secrets/` | **gitignored** (only `.gitkeep` tracked; masked from the Hub by tmpfs), 0700: `vault-init.json` (root token + unseal key, 0600), `vault-unseal/` (group 1000), `enroll/` AppRole creds (group 10002), `hub/core.env` (group 10001), `monitoring/` (Prometheus token, Alertmanager receivers: group 65534; Grafana: 472) |
 | `certs/revocation/revoked-serials.txt` | Revoked client-cert serials (written by `portcullis cert revoke` / `cert sync`, read by group-gate) |
 | `templates/` | **gitignored**, Hub-generated copies of app template dirs (mounted rw into the Hub at `/project/templates`) so `./templates/<app>/...` bind mounts resolve on the host |
-| `.github/workflows/ci.yml` | Core infrastructure CI |
+| `.github/workflows/ci.yml` | Core infrastructure CI (also `workflow_call`ed by `release.yml`) |
+| `.github/workflows/release.yml` | Release on `vX.Y.Z` tags |
+| `.github/dependabot.yml` | Weekly grouped dependency updates |
+| `CHANGELOG.md` | Keep a Changelog; release notes come from its `## [X.Y.Z]` section |
+| `docs/backups.md`, `docs/monitoring.md` | Backups (restic, verify, restore), monitoring profile (scrapes, alerts, receivers) |
+| `monitoring/` | Prometheus config + `alerts.yml` (+ `tests/`), blackbox modules, Grafana provisioning + dashboard; `textfile/` is generated |
+| `vault/policies/metrics.hcl` | Policy of the Prometheus token (read `sys/metrics`) |

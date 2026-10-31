@@ -49,6 +49,15 @@ Every service: `security_opt: [no-new-privileges:true]`, `cap_drop: [ALL]`,
 | group-gate | 10003:10003 | read-only (`tmpfs /tmp`) | — | `/healthz` | Only world-readable mounts |
 | hub | 10001:10001 (image) | read-only (`tmpfs /tmp`, `/home/hub`) | — | image `HEALTHCHECK` (`/healthz`) | Writes `/data` (volume), `/project/templates` (chowned to 10001 by `./portcullis up`) |
 | enroll | 10002:10002 (`USER` in Dockerfile) | read-only | — | `/healthz` | Reads `secrets/enroll/` via group 10002 |
+| prometheus, alertmanager, blackbox, textfile-exporter (profile `monitoring`) | 65534:65534 | read-only | — | `/-/ready`, `/-/healthy`, `/metrics` | `monitoring` network is `internal`; nothing published. Alertmanager's only egress is the `alerting` network |
+| grafana (profile `monitoring`) | 472:472 | read-only (`tmpfs /tmp`) | — | `/api/health` | Header auth only from `PORTCULLIS_TRAEFIK_IP`; login form and basic auth off |
+
+Throwaway containers the CLI starts: the chown helper (pinned `alpine`,
+`--network none`, only `CAP_CHOWN`); for backups the volume snapshot and
+LLDAP check (group-gate's `python` image, the volume owner's uid,
+`--network none`, read-only, no capabilities), `restic` (pinned, the
+operator's uid, read-only, no capabilities; `--network none` for a local
+repository) and, for `backup verify`, a `postgres` without network.
 
 ## Secrets the containers read
 
@@ -62,6 +71,9 @@ operator can still rewrite them and nobody else can read them
 | `secrets/vault-unseal/unseal-key` | 1000 | 0640 (dir 0750) | vault (auto-unseal) |
 | `secrets/enroll/{role-id,secret-id}` | 10002 | 0640 (dir 0750) | enroll |
 | `secrets/hub/core.env` | 10001 | 0640 (dir 0750) | Hub (as `/project/.env`) |
+| `secrets/monitoring/prometheus/{vault-token,tls-targets.json}` | 65534 | 0640 (dir 0750) | Prometheus (Vault metrics token: policy `portcullis-metrics`) |
+| `secrets/monitoring/alertmanager/alertmanager.yml` | 65534 | 0640 (dir 0750) | Alertmanager (receivers incl. SMTP password / webhook URLs) |
+| `secrets/monitoring/grafana/admin-password` | 472 | 0640 (dir 0750) | Grafana |
 | `certs/server.key` (dev/CI only) | 0 | 0640 | Traefik |
 | `templates/` | owner 10001 | 0755 | Hub (writes) |
 

@@ -19,7 +19,8 @@ services, configures the identity provider, and prints the URLs.
 Everything else goes through the same command — `./portcullis help`:
 
 ```
-init | up | down | upgrade | status [--json] | backup | restore
+init | up | down | upgrade | status [--json|--textfile] | version
+backup [--offsite] | backup verify [--local] | backup schedule --systemd | restore [--from-offsite]
 config apply [--bundle-only] | config init | dns setup [--check]
 vault init | vault unseal | vault rotate-enroll-secret | pki setup [--force] [--with-server-cert]
 keycloak configure | oidc register
@@ -152,6 +153,9 @@ See `docker-compose.apps.yml` for complete examples.
 | [Adding a Domain](docs/adding-a-domain.md) | DNS setup, Cloudflare config, wildcard certs, one domain per installation, local dev |
 | [SAML App: Nextcloud](docs/saml-app-nextcloud.md) | Full walkthrough — deploy Nextcloud, register in Keycloak, configure SAML SSO |
 | [Non-SAML App: Kanboard](docs/non-saml-app-kanboard.md) | Header-based auth — deploy Kanboard, extract CN from mTLS, reverse proxy auth pattern |
+| [Backups](docs/backups.md) | Consistent backups, off-host with restic, verify, schedule, restore (also on a new host) |
+| [Monitoring](docs/monitoring.md) | Opt-in profile: Prometheus, Alertmanager, Grafana at `metrics.<domain>`, alerts |
+| [Hardening](docs/hardening.md) | Socket proxies, per-service hardening, secrets ownership, header trust, identity |
 
 The Kanboard guide includes a **general pattern table** for configuring header-based
 auth in common apps (Gitea, Grafana, Wiki.js, pgAdmin, etc.).
@@ -169,9 +173,13 @@ auth in common apps (Gitea, Grafana, Wiki.js, pgAdmin, etc.).
 │   ├── adding-a-domain.md          # DNS, certs, single-domain scope
 │   ├── certificates.md             # TLS, mTLS, client certs, revocation, Vault
 │   ├── hardening.md                # Socket proxies, container hardening, exceptions
+│   ├── backups.md                  # Consistent + off-host (restic) backups, verify, restore
+│   ├── monitoring.md               # Monitoring profile: Prometheus, alerts, Grafana
 │   ├── saml-app-nextcloud.md       # SAML app integration guide
 │   └── non-saml-app-kanboard.md    # Header-based auth guide
 ├── portcullis                     # The admin CLI (./portcullis help)
+├── monitoring/                     # Prometheus config + alert rules (+ tests), blackbox, Grafana provisioning/dashboard
+├── CHANGELOG.md                    # Keep a Changelog; releases are vX.Y.Z tags (release.yml)
 ├── scripts/lib/                    # CLI libraries, one per area (vault, pki, certs, keycloak, ...)
 ├── group-gate/
 │   ├── group-gate.py               # Per-subdomain group / path / policy / revocation gate
@@ -261,9 +269,12 @@ Portcullis is an auth layer that works with existing platforms:
 - **Secrets**: `portcullis init` generates every password and secret into `.env` (0600); docker compose refuses to start if one is missing — there are no default passwords
 - **Revocation**: `./portcullis cert revoke <serial>` — enforced by group-gate on every request (Traefik itself doesn't check CRLs), by Keycloak's X.509 login (CRL) and by the mTLS binding (an `amr=mtls` session needs the unrevoked cert on every request); see [docs/certificates.md](docs/certificates.md)
 - **Renewal**: client certs live `CLIENT_CERT_TTL` (default 30 days); users renew their own at `https://enroll.<domain>/self` with the cert still valid, `portcullis status` warns 7 days ahead
-- **Backups**: `./portcullis backup` (also run by `upgrade`) saves `.env`, `certs/`, `secrets/` (the unseal key — the Vault volume is useless without it) and the Vault, PostgreSQL and LLDAP volumes to `backups/`; `./portcullis restore <dir>` puts them back
+- **Backups**: `./portcullis backup` (also run by `upgrade`) makes a consistent backup without stopping anything (Vault raft snapshot, `pg_dump`, SQLite online backup, `.env`, `certs/`, `secrets/`); `--offsite` uploads it to a restic repository, encrypted with `BACKUP_PASSWORD` — **store that password offline**, the backups contain the Vault root token and unseal key. `backup verify` restores and checks it, `backup schedule --systemd` runs it daily, `restore [--from-offsite]` puts it back; see [docs/backups.md](docs/backups.md)
+- **Monitoring**: `COMPOSE_PROFILES=monitoring` adds Prometheus, Alertmanager and Grafana (`https://metrics.<domain>`, `lldap_admin`) with alerts for a sealed Vault, expiring certificates, a stale CRL, deny spikes, down services and old backups; see [docs/monitoring.md](docs/monitoring.md)
+- **Identity**: apps receive the LLDAP **username** as `X-Forwarded-User` and the email separately as `X-Forwarded-Email` — users can edit their own email in LLDAP, so never key accounts on it; see [docs/hardening.md](docs/hardening.md#header-trust)
 - **Network**: `portcullis-proxy` uses a fixed subnet (`PORTCULLIS_PROXY_SUBNET`, default `172.31.250.0/24`) with Traefik pinned at `PORTCULLIS_TRAEFIK_IP` — change in `.env` only if it collides with a host network (before `init`; later the network has to be recreated, `./portcullis up` explains how)
 - **Docker socket**: only the two socket proxies mount it — Traefik gets read-only containers/networks/events, the Hub what `docker compose` needs (no swarm/system/plugins/secrets/build); see [docs/hardening.md](docs/hardening.md)
 - **Containers**: every core image is pinned by digest; services run with `no-new-privileges`, `cap_drop: ALL`, read-only root filesystems, non-root users and memory/pid limits where the image allows — exceptions in [docs/hardening.md](docs/hardening.md)
-- **Hub image**: `HUB_IMAGE` (default `ghcr.io/porelli/portcullis-hub:edge`); pin a release tag/digest for production. The Hub gets a generated env subset (`secrets/hub/core.env`), never the core `.env`
+- **Hub image**: `HUB_IMAGE` (default `ghcr.io/porelli/portcullis-hub:edge` on `main`; a core release pins a released Hub tag by digest); `./portcullis version` shows the core version and the Hub image in use. The Hub gets a generated env subset (`secrets/hub/core.env`), never the core `.env`, and no LLDAP credentials
+- **Releases**: `vX.Y.Z` tags; `release.yml` runs the full CI, requires a released, digest-pinned `HUB_IMAGE` default and a `CHANGELOG.md` section, and publishes notes plus a tarball with its sha256. Dependabot proposes weekly image/action/module updates; CI fails on any unpinned image or action
 - **PIV PIN**: enforce PIN changes from default (123456) for mTLS users
