@@ -5,11 +5,14 @@
 # (and by tests); never executed directly. Bash 3.2 compatible (macOS).
 #
 # Globals (set by ./portcullis before sourcing, overridable for tests):
-#   PORTCULLIS_ROOT   checkout root: .env, certs/, secrets/, compose files
+#   PORTCULLIS_ROOT   installation root: .env, certs/, secrets/, compose files
+#   PORTCULLIS_HOME   the checkout itself (defaults to this lib's ../..)
 #   PORTCULLIS_LIB    this directory
 
 PORTCULLIS_LIB="${PORTCULLIS_LIB:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 PORTCULLIS_ROOT="${PORTCULLIS_ROOT:-$(cd "$PORTCULLIS_LIB/../.." && pwd)}"
+# The checkout (CLI, compose file, VERSION); set by ./portcullis.
+PORTCULLIS_HOME="${PORTCULLIS_HOME:-$(cd "$PORTCULLIS_LIB/../.." && pwd)}"
 
 # ── Output ─────────────────────────────────────────────────
 
