@@ -129,6 +129,35 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.req("grafana.example.com", groups="users_grafana",
                                   extra={"X-Forwarded-Access-Token": token(amr=["hwk"])}), 200)
 
+    # ── identity headers: username, never the (user-editable) email ──
+
+    def test_allow_forwards_username_not_email(self):
+        code, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
+        self.assertEqual(code, 200)
+        self.assertEqual(hdrs.get("X-Forwarded-User"), "bob")
+        self.assertEqual(hdrs.get("X-Auth-Request-User"), "bob")
+        self.assertEqual(hdrs.get("X-Forwarded-Email"), "bob@example.com")
+        self.assertEqual(hdrs.get("X-Auth-Request-Email"), "bob@example.com")
+        self.assertEqual(hdrs.get("X-Auth-Request-Groups"), "users_grafana")
+
+    def test_email_alone_is_no_identity(self):
+        # An admin's address in the email header must not become the user.
+        code, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True,
+                              extra={"X-Auth-Request-User": None, "X-Auth-Request-Email": "admin@example.com"})
+        self.assertEqual(code, 200)
+        self.assertNotIn("X-Forwarded-User", hdrs)
+        self.assertNotIn("X-Auth-Request-User", hdrs)
+        self.assertEqual(hdrs.get("X-Forwarded-Email"), "admin@example.com")
+        # ...and /authenticated (self-service) needs a username.
+        self.assertEqual(self.req("enroll.example.com", gate_path="/authenticated",
+                                  extra={"X-Auth-Request-User": None, "X-Auth-Request-Email": "admin@example.com"}), 403)
+
+    def test_identity_headers_mapping(self):
+        self.assertEqual(gg.identity_headers({}), {})
+        self.assertEqual(gg.identity_headers({"X-Auth-Request-User": " alice ", "X-Auth-Request-Email": "a@x"}),
+                         {"X-Forwarded-User": "alice", "X-Auth-Request-User": "alice",
+                          "X-Forwarded-Email": "a@x", "X-Auth-Request-Email": "a@x"})
+
     # ── reserved deny group (contract §4) ──
 
     def test_deny_sentinel_group_denies_everyone(self):

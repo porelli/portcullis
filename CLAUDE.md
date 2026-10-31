@@ -41,6 +41,7 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 - Admin groups: `admin_<app>` — grants admin privileges
 - Core infrastructure requires `lldap_admin` group (`enroll.<domain>/self` is the one exception: any signed-in user, own cert only)
 - Groups: LLDAP → Keycloak (LDAP sync) → oauth2-proxy → group-gate
+- **Identity = LLDAP username, never the email** (users can edit their own mail in LLDAP): Keycloak LDAP `trustEmail=false`, oauth2-proxy `userIDClaim: preferred_username` + `insecureAllowUnverifiedEmail`, group-gate returns `X-Forwarded-User` = username and `X-Forwarded-Email` = email. Every identity header must be in the forward-auth middlewares' `authResponseHeaders` (that is what strips client copies). Details: `docs/hardening.md`
 
 ### Testing
 

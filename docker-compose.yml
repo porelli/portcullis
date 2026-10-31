@@ -469,7 +469,10 @@ services:
       # and 202 with user headers for auth'd users (via cookie)
       traefik.http.middlewares.portcullis-auth.forwardauth.address: http://forward-auth:4180
       traefik.http.middlewares.portcullis-auth.forwardauth.trustForwardHeader: "true"
-      traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Forwarded-User,Authorization,X-Forwarded-Access-Token
+      # Identity headers apps may trust. Every name listed is deleted from the
+      # client's request first, so none of them can be spoofed. X-Forwarded-User /
+      # X-Auth-Request-User = LLDAP username (never the user-editable email).
+      traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,Authorization,X-Forwarded-Access-Token
       # OAuth2 callback + sign-in routes on auth subdomain
       traefik.http.routers.oauth2-callback.rule: Host(`auth.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/oauth2`)
       traefik.http.routers.oauth2-callback.entrypoints: websecure
@@ -530,12 +533,12 @@ services:
       traefik.http.services.group-gate.loadbalancer.server.port: "8080"
       traefik.http.middlewares.portcullis-groups.forwardauth.address: http://group-gate:8080
       traefik.http.middlewares.portcullis-groups.forwardauth.trustForwardHeader: "true"
-      traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Groups,X-Forwarded-User
+      traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Forwarded-User,X-Forwarded-Email
       # Same checks minus the subdomain group (any signed-in user): for
       # self-service routes such as enroll.<domain>/self.
       traefik.http.middlewares.portcullis-self.forwardauth.address: http://group-gate:8080/authenticated
       traefik.http.middlewares.portcullis-self.forwardauth.trustForwardHeader: "true"
-      traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Groups,X-Forwarded-User
+      traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Forwarded-User,X-Forwarded-Email
     restart: unless-stopped
 
   hub:

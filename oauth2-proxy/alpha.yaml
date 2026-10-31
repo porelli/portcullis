@@ -18,6 +18,14 @@ providers:
       issuerURL: https://auth.${PORTCULLIS_DOMAIN}/realms/portcullis
       skipDiscovery: false
       groupsClaim: groups
+      # Identity = the LLDAP username (immutable, admin-assigned), never the
+      # email: LLDAP lets every user edit their own mail. The session user
+      # (X-Auth-Request-User / X-Forwarded-User) is preferred_username; the
+      # email is passed along for display only.
+      userIDClaim: preferred_username
+      # Keycloak does not trust LLDAP's (user-editable) mail, so
+      # email_verified is false. Nothing here authorises by email, so accept it.
+      insecureAllowUnverifiedEmail: true
       audienceClaims:
         - aud
     # Per-request acr_values passthrough. Group-gate forwards a stronger

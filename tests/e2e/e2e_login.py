@@ -197,6 +197,30 @@ def main() -> int:
             assert re.search(r"X-Forwarded-User: \S+", body), "app did not get X-Forwarded-User"
         check("password login (+ passkey registration) reaches the app", password_login_registers_passkey)
 
+        def identity_is_username():
+            # Identity = LLDAP username; the (user-editable) email travels
+            # separately. Client-supplied copies of these headers are dropped.
+            spoof = {"X-Forwarded-User": "admin", "X-Forwarded-Email": "admin@" + DOMAIN,
+                     "X-Auth-Request-User": "admin", "X-Auth-Request-Email": "admin@" + DOMAIN,
+                     "X-Auth-Request-Preferred-Username": "admin"}
+            for extra in ({}, spoof):
+                page.set_extra_http_headers(extra)
+                try:
+                    page.goto(APP + "/", wait_until="domcontentloaded")
+                    body = page.inner_text("body")
+                finally:
+                    page.set_extra_http_headers({})
+                seen = {}
+                for line in body.splitlines():
+                    name, _, value = line.partition(": ")
+                    seen.setdefault(name.strip().lower(), []).append(value.strip())
+                for name, want in (("x-forwarded-user", user), ("x-auth-request-user", user),
+                                   ("x-forwarded-email", f"{user}@{DOMAIN}")):
+                    assert seen.get(name) == [want], f"{name}: {seen.get(name)} (want [{want!r}], spoofed={bool(extra)})"
+                assert "admin" not in seen.get("x-auth-request-preferred-username", [user]), body[:800]
+        check("apps get the username (not the email) as X-Forwarded-User; spoofed identity headers are dropped",
+              identity_is_username)
+
         def path_groups_denied():
             for path in ("/admin", "/admin/x", "/%61dmin", "//admin", "/x/../admin", "/ADMIN"):
                 code = goto_status(page, APP + path)

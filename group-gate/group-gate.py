@@ -709,6 +709,36 @@ def safe_factor_name(amr: str) -> str:
     return amr
 
 
+def identity_headers(req_headers) -> dict:
+    """Identity headers group-gate returns on ALLOW (Traefik copies them onto
+    the upstream request: they are this middleware's authResponseHeaders, so
+    Traefik first deletes any client-supplied copies).
+
+    X-Forwarded-User is the LLDAP username — oauth2-proxy's session user,
+    i.e. the token's preferred_username (userIDClaim in alpha.yaml) — and
+    NEVER the email: LLDAP lets users edit their own mail, so an email-keyed
+    identity could be taken over. The email travels separately in
+    X-Forwarded-Email for display / notifications only.
+    """
+    out = {}
+    user = (req_headers.get("X-Auth-Request-User", "") or "").strip()
+    email = (req_headers.get("X-Auth-Request-Email", "") or "").strip()
+    groups = req_headers.get("X-Auth-Request-Groups", "") or ""
+    if user:
+        out["X-Forwarded-User"] = user
+        out["X-Auth-Request-User"] = user
+    if email:
+        out["X-Forwarded-Email"] = email
+        out["X-Auth-Request-Email"] = email
+    # Traefik's forwardAuth deletes every authResponseHeaders entry from the
+    # upstream request and only re-adds those present in OUR response: echo
+    # the groups oauth2-proxy set (portcullis-auth runs first) so backends
+    # like enroll still see them.
+    if groups:
+        out["X-Auth-Request-Groups"] = groups
+    return out
+
+
 class Handler(BaseHTTPRequestHandler):
     def _deny(self, title: str, body_html: str, log: str, extra_headers: Optional[dict] = None):
         self.send_response(403)
@@ -721,17 +751,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _allow(self):
         self.send_response(200)
-        email = self.headers.get("X-Auth-Request-Email", "")
-        if email:
-            self.send_header("X-Forwarded-User", email)
-        # Traefik's forwardAuth deletes every authResponseHeaders entry from
-        # the upstream request and only re-adds those present in OUR
-        # response. Echo the values oauth2-proxy set (portcullis-auth runs
-        # first) so backends like enroll still see the user's groups.
-        for name in ("X-Auth-Request-User", "X-Auth-Request-Groups"):
-            value = self.headers.get(name, "")
-            if value:
-                self.send_header(name, value)
+        for name, value in identity_headers(self.headers).items():
+            self.send_header(name, value)
         self.end_headers()
 
     def _deny_policy(self, user: str, host: str, reason: str):
@@ -816,7 +837,7 @@ class Handler(BaseHTTPRequestHandler):
 
         raw_host = self.headers.get("X-Forwarded-Host", "")
         host = normalize_host(raw_host)
-        user = self.headers.get("X-Auth-Request-Email", "") or self.headers.get("X-Auth-Request-User", "unknown")
+        user = self.headers.get("X-Auth-Request-User", "") or "unknown"
         e_user = html.escape(user)
 
         subdomain = subdomain_for(host)
@@ -945,8 +966,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
         else:
-            uid = self.headers.get("X-Auth-Request-User", "") or self.headers.get("X-Auth-Request-Email", "")
-            if not uid:
+            if not self.headers.get("X-Auth-Request-User", "").strip():
                 self._deny("Access Denied", "<p>Not signed in.</p>",
                            f"DENIED host={host} reason=authenticated-only route without a user")
                 return

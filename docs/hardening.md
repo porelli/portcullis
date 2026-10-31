@@ -77,6 +77,31 @@ are refused). It is rewritten in place on every `./portcullis up`.
 
 ## Header trust
 
+**Identity is the LLDAP username, never the email.** LLDAP lets every user
+edit their own `mail`, so an email can be set to someone else's address.
+Therefore:
+
+- Keycloak's LDAP federation has `trustEmail=false`: tokens carry
+  `email_verified=false` for LLDAP users.
+- oauth2-proxy keys the session on `preferred_username` (`userIDClaim` in
+  `oauth2-proxy/alpha.yaml`) and accepts the unverified email
+  (`insecureAllowUnverifiedEmail`) because nothing authorises by it.
+- Apps behind `portcullis-auth@docker,portcullis-groups@docker` receive
+  `X-Forwarded-User` / `X-Auth-Request-User` = username and
+  `X-Forwarded-Email` / `X-Auth-Request-Email` = email (display only), plus
+  `X-Auth-Request-Groups`. All of them are `authResponseHeaders` of the
+  forward-auth middlewares, so Traefik deletes client-supplied copies
+  (the e2e test sends spoofed ones). Header-auth apps must log users in by
+  `X-Forwarded-User` as a username and take the email from
+  `X-Forwarded-Email`.
+- enroll identifies the signed-in user by `X-Forwarded-User` as-is (no
+  email → username lookup); group-gate's mTLS binding compares the cert CN
+  with the token's `preferred_username`.
+- Native OIDC apps must key accounts on `sub` / `preferred_username`, not
+  on the email, and must not link existing accounts by email (e.g.
+  Vaultwarden `SSO_SIGNUPS_MATCH_EMAIL`); apps that insist on
+  `email_verified=true` need their "allow unverified email" option.
+
 - The `websecure` entrypoint has no `forwardedHeaders.trustedIPs`, so
   Traefik deletes client-supplied `X-Forwarded-*` and
   `X-Forwarded-Tls-Client-Cert(-Info)` headers, and

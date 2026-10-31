@@ -307,6 +307,7 @@
           "uuidLDAPAttribute": ["uid"],
           "userObjectClasses": ["person"],
           "editMode": ["READ_ONLY"],
+          "trustEmail": ["false"],
           "syncRegistrations": ["false"],
           "importEnabled": ["true"],
           "batchSizeForSync": ["1000"],

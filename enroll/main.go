@@ -406,34 +406,19 @@ func listCertsWith(vc *vault.Client) ([]CertInfo, error) {
 	return certs, nil
 }
 
-// Look up LLDAP username by email address
-func (cfg *Config) usernameByEmail(email string) string {
-	l, err := cfg.ldapConn()
-	if err != nil {
-		return email
-	}
-	defer l.Close()
-	result, err := l.Search(ldap.NewSearchRequest(
-		"ou=people,"+cfg.LDAPBaseDN,
-		ldap.ScopeSingleLevel, ldap.NeverDerefAliases, 1, 5, false,
-		fmt.Sprintf("(mail=%s)", ldap.EscapeFilter(email)),
-		[]string{"uid"},
-		nil,
-	))
-	if err != nil || len(result.Entries) == 0 {
-		return email
-	}
-	if uid := result.Entries[0].GetAttributeValue("uid"); uid != "" {
-		return uid
-	}
-	return email
+// forwardedUser is the LLDAP username of the signed-in user: X-Forwarded-User,
+// set by group-gate from oauth2-proxy's user (the token's preferred_username).
+// Traefik deletes any client-supplied X-Forwarded-User (it is one of
+// group-gate's authResponseHeaders). Never derive the identity from the
+// email: users can edit their own email in LLDAP.
+func forwardedUser(r *http.Request) string {
+	return strings.TrimSpace(r.Header.Get("X-Forwarded-User"))
 }
 
 // Extract authenticated user from forward-auth header or Traefik's client cert header
 func (s *Server) authenticatedUser(r *http.Request) string {
-	// Check forward-auth / OIDC user first (returns email)
-	if email := r.Header.Get("X-Forwarded-User"); email != "" {
-		return s.cfg.usernameByEmail(email)
+	if user := forwardedUser(r); user != "" {
+		return user
 	}
 	info := r.Header.Get("X-Forwarded-Tls-Client-Cert-Info")
 	if info == "" {

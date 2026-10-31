@@ -10,7 +10,8 @@ package main
 // verified against the CA in this very TLS session.
 //
 // A renewal re-certifies the key the user is ALREADY using: the request must
-//   - come from a signed-in user (X-Forwarded-User, set by group-gate),
+//   - come from a signed-in user (X-Forwarded-User = LLDAP username, set
+//     by group-gate),
 //   - present a client cert whose CN is that user, that Vault issued
 //     (pki_int/cert/<serial> holds exactly these bytes), that is not revoked
 //     and not expired,
@@ -162,13 +163,9 @@ func checkRenewal(username string, cert *x509.Certificate, csrPEM, email string,
 	return nil
 }
 
-// sessionUser is the LLDAP username of the signed-in user.
+// sessionUser is the LLDAP username of the signed-in user (see forwardedUser).
 func (s *Server) sessionUser(r *http.Request) string {
-	email := r.Header.Get("X-Forwarded-User")
-	if email == "" {
-		return ""
-	}
-	return s.cfg.usernameByEmail(email)
+	return forwardedUser(r)
 }
 
 func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {

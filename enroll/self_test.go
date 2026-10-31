@@ -158,7 +158,7 @@ func TestSelfTemplateRenders(t *testing.T) {
 	var buf strings.Builder
 	data := map[string]interface{}{
 		"User": "alice", "TTL": "720h", "Now": time.Now(), "Domain": "example.com",
-		"Certs": []CertInfo{{Username: "alice", Serial: "10", NotBefore: leaf.NotBefore, NotAfter: leaf.NotAfter}},
+		"Certs":     []CertInfo{{Username: "alice", Serial: "10", NotBefore: leaf.NotBefore, NotAfter: leaf.NotAfter}},
 		"Presented": map[string]interface{}{"CN": "alice", "Serial": "10", "NotAfter": leaf.NotAfter, "Matches": true},
 	}
 	if err := templates.ExecuteTemplate(&buf, "self.html", data); err != nil {
@@ -167,6 +167,29 @@ func TestSelfTemplateRenders(t *testing.T) {
 	for _, want := range []string{"/api/self/renew", "CN=alice", "less than 7 days"} {
 		if !strings.Contains(buf.String(), want) {
 			t.Errorf("self.html lacks %q", want)
+		}
+	}
+}
+
+// The session user is the forwarded username as-is — never resolved via
+// the (user-editable) email.
+func TestSessionUserIsForwardedUsername(t *testing.T) {
+	s := &Server{}
+	for _, tc := range []struct{ hdr, want string }{
+		{"alice", "alice"},
+		{" alice ", "alice"},
+		{"", ""},
+		{"admin@example.com", "admin@example.com"}, // taken literally, no LDAP lookup
+	} {
+		r := httptest.NewRequest("GET", "/self", nil)
+		if tc.hdr != "" {
+			r.Header.Set("X-Forwarded-User", tc.hdr)
+		}
+		if got := s.sessionUser(r); got != tc.want {
+			t.Errorf("sessionUser(%q) = %q, want %q", tc.hdr, got, tc.want)
+		}
+		if got := s.authenticatedUser(r); got != tc.want {
+			t.Errorf("authenticatedUser(%q) = %q, want %q", tc.hdr, got, tc.want)
 		}
 	}
 }

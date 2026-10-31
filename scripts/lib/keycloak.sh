@@ -84,14 +84,17 @@ keycloak_configure() {
 
   info "Pointing the LDAP federation at LLDAP..."
   # Keycloak's own --import-realm loads the file verbatim, placeholders
-  # included; patch DN + bind credential onto the component.
+  # included; patch DN + bind credential onto the component. trustEmail
+  # stays off: LLDAP lets users edit their own mail, so it is never
+  # asserted as verified (identity is the username, see oauth2-proxy/alpha.yaml).
   comp="$(kc_get "/$KC_REALM/components" | jq '[.[] | select(.providerId == "ldap")][0] // empty')"
   if [ -n "$comp" ]; then
     ldap_id="$(printf '%s' "$comp" | jq -r .id)"
     code="$(printf '%s' "$comp" | LLDAP_PASS="${LLDAP_ADMIN_PASSWORD:-}" jq --arg b "$base_dn" '
         .config.usersDn = ["ou=people," + $b] |
         .config.bindDn = ["uid=admin,ou=people," + $b] |
-        .config.bindCredential = [env.LLDAP_PASS]' | kc_send PUT "/$KC_REALM/components/$ldap_id")"
+        .config.bindCredential = [env.LLDAP_PASS] |
+        .config.trustEmail = ["false"]' | kc_send PUT "/$KC_REALM/components/$ldap_id")"
     _kc_report "LDAP base DN + bind credential" "$code" 204 || true
     mapper="$(kc_get "/$KC_REALM/components?parent=$ldap_id" | jq '[.[] | select(.providerId == "group-ldap-mapper")][0] // empty')"
     if [ -n "$mapper" ]; then
