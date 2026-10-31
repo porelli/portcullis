@@ -21,6 +21,14 @@ env:
   COMPOSE_FILE: docker-compose.yml:docker-compose.ci.yml
   VAULT_ADDR: http://127.0.0.1:8200
   TRAEFIK_IP: 172.31.250.2
+  # Go toolchain for the enroll unit tests (same as enroll/Dockerfile's golang image).
+  GO_VERSION: 1.27.3
+
+# Caches (images, Go, buildx layers, Playwright) are RESTORED by every run but
+# SAVED only by pushes to main (trusted code; also not by release.yml's tag
+# runs). PR runs could only write their own PR-scoped entries anyway, and
+# everything restored is verified or content-addressed (see
+# .github/actions/cached-images).
 
 jobs:
   unit-tests:
@@ -182,13 +190,39 @@ jobs:
           done
           jq -e '.uid == "portcullis" and (.panels | length) > 0' monitoring/grafana/dashboards/portcullis.json >/dev/null
           echo "PASS: prometheus config + rules (+ rule tests), alertmanager receivers, blackbox modules, dashboard"
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # Module + build cache handled below (saved on main only).
+          cache: false
+      - name: Restore the Go module and build cache
+        id: go-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum') }}-${{ hashFiles('enroll/**/*.go') }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum') }}-
       - name: enroll unit tests
         working-directory: enroll
+        env:
+          CGO_ENABLED: "0"
         run: |
-          # golang:1.27.3-alpine3.24 (same as enroll/Dockerfile)
-          docker run --rm -e CGO_ENABLED=0 -v "$PWD:/src" -w /src \
-            golang:1.27.3-alpine3.24@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb \
-            sh -c 'go vet ./... && go test ./...'
+          # The module cache is checked against go.sum, the build cache is
+          # keyed by content hashes.
+          go mod verify
+          go vet ./...
+          go test ./...
+      - name: Save the Go module and build cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ steps.go-cache.outputs.cache-primary-key }}
 
   build-and-test:
     runs-on: ubuntu-latest
@@ -1272,15 +1306,38 @@ jobs:
             sleep 3
           done
 
+      # pip wheels + Playwright's browsers, keyed on the pinned
+      # tests/e2e/requirements.txt (the browser build is tied to the
+      # Playwright version).
+      - name: Restore the pip / Playwright browser cache
+        id: pw-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/ms-playwright
+          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+
       - name: Install Playwright (pinned) and trust the CA
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
-          /tmp/e2e-venv/bin/playwright install --with-deps chromium
+          # OS packages always (apt); the browser download is skipped when cached.
+          sudo /tmp/e2e-venv/bin/playwright install-deps chromium
+          /tmp/e2e-venv/bin/playwright install chromium
           sudo apt-get install -y -qq libnss3-tools >/dev/null
           mkdir -p "$HOME/.pki/nssdb"
           certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
           certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
+
+      - name: Save the pip / Playwright browser cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.pw-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/ms-playwright
+          key: ${{ steps.pw-cache.outputs.cache-primary-key }}
 
       - name: Run the browser login tests
         env:
