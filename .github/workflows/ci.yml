@@ -3,10 +3,21 @@ name: CI
 on:
   push:
     branches: [main]
+    # Docs-only changes don't need the stack booted.
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
   pull_request:
     branches: [main]
+    paths-ignore: ['**.md', 'docs/**', 'LICENSE']
   # release.yml runs exactly these checks before publishing a tag.
   workflow_call:
+
+
+# A newer push to the same ref supersedes the older run (runners are shared
+# across the four repos). Release runs come in via workflow_call and get the
+# caller's group, so they are never cancelled by a push to main.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_call' }}
 
 permissions:
   contents: read
