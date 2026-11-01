@@ -93,7 +93,8 @@ keycloak_configure() {
 
   info "Pointing the LDAP federation at LLDAP..."
   # Keycloak's own --import-realm loads the file verbatim, placeholders
-  # included; patch DN + bind credential onto the component. trustEmail
+  # included; patch DN + bind credential onto the component (plus the user
+  # filter that keeps the Hub's service account out). trustEmail
   # stays off: LLDAP lets users edit their own mail, so it is never
   # asserted as verified (identity is the username, see oauth2-proxy/alpha.yaml).
   comp="$(kc_get "/$KC_REALM/components" | jq '[.[] | select(.providerId == "ldap")][0] // empty')"
@@ -103,8 +104,18 @@ keycloak_configure() {
         .config.usersDn = ["ou=people," + $b] |
         .config.bindDn = ["uid=admin,ou=people," + $b] |
         .config.bindCredential = [env.LLDAP_PASS] |
-        .config.trustEmail = ["false"]' | kc_send PUT "/$KC_REALM/components/$ldap_id")"
-    _kc_report "LDAP base DN + bind credential" "$code" 204 || true
+        .config.trustEmail = ["false"] |
+        .config.customUserSearchFilter = ["(!(uid=portcullis-hub))"]' | kc_send PUT "/$KC_REALM/components/$ldap_id")"
+    _kc_report "LDAP base DN + bind credential, portcullis-hub excluded" "$code" 204 || true
+    # The Hub's LLDAP service account (lldap_admin) must never sign in
+    # through the gateway: the user filter above keeps it out of the
+    # federation; drop a copy imported before the filter existed.
+    local hub_kc
+    hub_kc="$(kc_get "/$KC_REALM/users?username=portcullis-hub&exact=true" | jq -r '.[0].id // empty' 2>/dev/null || true)"
+    if [ -n "$hub_kc" ]; then
+      code="$(kc_send DELETE "/$KC_REALM/users/$hub_kc" < /dev/null)"
+      _kc_report "remove Keycloak's copy of portcullis-hub" "$code" 204 404 || true
+    fi
     mapper="$(kc_get "/$KC_REALM/components?parent=$ldap_id" | jq '[.[] | select(.providerId == "group-ldap-mapper")][0] // empty')"
     if [ -n "$mapper" ]; then
       code="$(printf '%s' "$mapper" | jq --arg b "$base_dn" '.config["groups.dn"] = ["ou=groups," + $b]' \
@@ -449,11 +460,11 @@ _kc_invite_idp() {
     _kc_report "invite identity provider" "$code" 201 || return 0
     rep="$(kc_get "/$KC_REALM/identity-provider/instances/portcullis-invite")"
   fi
-  code="$(printf '%s' "$rep" | SECRET="$(cat "$secret_file")" jq -c --arg d "$domain" \
+  code="$(printf '%s' "$rep" | jq -c --arg d "$domain" --rawfile secret "$secret_file" \
       --argjson want "$(jq -c '.identityProviders[] | select(.alias == "portcullis-invite")' "$(_kc_export)")" '
       . + ($want | {enabled, hideOnLogin, trustEmail, storeToken, linkOnly, firstBrokerLoginFlowAlias, postBrokerLoginFlowAlias})
       | .config = ((.config // {}) + $want.config + {
-          clientSecret: env.SECRET,
+          clientSecret: ($secret | rtrimstr("\n")),
           authorizationUrl: ("https://enroll." + $d + "/invite/authorize"),
           issuer: ("https://enroll." + $d + "/invite")})' \
     | kc_send PUT "/$KC_REALM/identity-provider/instances/portcullis-invite")"
@@ -467,14 +478,14 @@ _kc_invite_idp() {
 _kc_enroll_client() {
   local f="$PORTCULLIS_ROOT/secrets/enroll/keycloak-client-secret" uuid code sa rm roles
   [ -r "$f" ] || { warn "    $f missing (./portcullis up creates it)"; return 0; }
-  code="$(SECRET="$(cat "$f")" jq -nc '{clientId: "portcullis-enroll", name: "Portcullis enroll (invites)",
-      enabled: true, protocol: "openid-connect", publicClient: false, secret: env.SECRET,
+  code="$(jq -nc --rawfile s "$f" '{clientId: "portcullis-enroll", name: "Portcullis enroll (invites)",
+      enabled: true, protocol: "openid-connect", publicClient: false, secret: ($s | rtrimstr("\n")),
       serviceAccountsEnabled: true, standardFlowEnabled: false, implicitFlowEnabled: false,
       directAccessGrantsEnabled: false, frontchannelLogout: false}' | kc_send POST "/$KC_REALM/clients")"
   case "$code" in 201|409) ;; *) warn "    client portcullis-enroll: HTTP $code"; return 0 ;; esac
   uuid="$(kc_get "/$KC_REALM/clients?clientId=portcullis-enroll" | jq -r '.[0].id // empty')"
   [ -n "$uuid" ] || { warn "    client portcullis-enroll not found"; return 0; }
-  code="$(kc_get "/$KC_REALM/clients/$uuid" | SECRET="$(cat "$f")" jq -c '.secret = env.SECRET | .serviceAccountsEnabled = true
+  code="$(kc_get "/$KC_REALM/clients/$uuid" | jq -c --rawfile s "$f" '.secret = ($s | rtrimstr("\n")) | .serviceAccountsEnabled = true
       | .standardFlowEnabled = false | .directAccessGrantsEnabled = false | .publicClient = false' \
     | kc_send PUT "/$KC_REALM/clients/$uuid")"
   _kc_report "client portcullis-enroll (service account, secret)" "$code" 204 || return 0

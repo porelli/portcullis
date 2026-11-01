@@ -373,6 +373,7 @@
           "bindDn": ["uid=admin,ou=people,LLDAP_BASE_DN_PLACEHOLDER"],
           "bindCredential": ["LLDAP_PASSWORD_PLACEHOLDER"],
           "usersDn": ["ou=people,LLDAP_BASE_DN_PLACEHOLDER"],
+          "customUserSearchFilter": ["(!(uid=portcullis-hub))"],
           "usernameLDAPAttribute": ["uid"],
           "rdnLDAPAttribute": ["uid"],
           "uuidLDAPAttribute": ["uid"],

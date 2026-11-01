@@ -192,6 +192,14 @@ class GateTest(unittest.TestCase):
         self.assertEqual(urllib.parse.parse_qs(parts.query),
                          {"acr_values": ["hwk"], "rd": ["https://hwk.example.com/"]})
 
+    def test_hub_service_account_is_denied(self):
+        for gate_path in ("/", "/authenticated", "/portal"):
+            for name in ("portcullis-hub", "Portcullis-Hub"):
+                with self.subTest(gate_path=gate_path, name=name):
+                    self.assertEqual(self.req("hub.example.com", groups="lldap_admin", gate_path=gate_path,
+                                              extra={"X-Auth-Request-Preferred-Username": name}), 403)
+        self.assertEqual(self.req("hub.example.com", groups="lldap_admin"), 200)
+
     def test_password_factor_met_by_hardware_factors(self):
         # No password in the browser flow: hwk / mtls sessions satisfy it.
         for amr in (["hwk"], ["mtls"], ["pwd"]):

@@ -134,6 +134,9 @@ PUBLIC_GUARD_VERSION = 3
 # Reserved group (contract §4): the Hub publishes it for routed apps whose
 # config is unknown. It always denies; nobody may claim membership.
 DENY_GROUP = "__portcullis_deny__"
+# Service accounts that must never use the gateway (the Hub's LLDAP account
+# is in lldap_admin; Keycloak's federation also filters it out).
+DENY_USERS = frozenset(u.strip().lower() for u in os.environ.get("GATE_DENY_USERS", "portcullis-hub").split(",") if u.strip())
 
 # Factor string ↔ AMR value used in tokens (RFC 8176 where possible).
 FACTOR_TO_AMR = {
@@ -1455,6 +1458,10 @@ class Handler(BaseHTTPRequestHandler):
         if not user:
             self._deny("Access Denied", "<p>Not signed in.</p>", "DENIED portal reason=no username", "no_user")
             return
+        if user.lower() in DENY_USERS:
+            self._deny("Access Denied", "<p>This account is a service account and cannot sign in.</p>",
+                       f"DENIED portal user={user} reason=service account", "service_account")
+            return
         METRICS.inc("group_gate_requests_total", endpoint="portal", result="allow")
         body = render_portal(user, groups, load_portal_apps(), DOMAIN)
         self.send_response(200)
@@ -1595,6 +1602,10 @@ class Handler(BaseHTTPRequestHandler):
                        f"DENIED host={host} reason=no {USERNAME_HEADER} "
                        f"(router without portcullis-auth@docker?)",
                        "unauthenticated")
+            return
+        if username.lower() in DENY_USERS:
+            self._deny("Access Denied", "<p>This account is a service account and cannot sign in.</p>",
+                       f"DENIED user={user} host={host} reason=service account", "service_account")
             return
 
         # Per-request reload — the Hub rewrites the policy file on each
