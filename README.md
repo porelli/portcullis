@@ -85,19 +85,22 @@ Both methods are phishing-resistant and hardware-backed. Users can have both.
 
 ## Workflow
 
-### 1. Manage users
+### 1. First sign-in (bootstrap admin)
 
-Open `https://directory.<domain>` — add users and groups in LLDAP.
-Keycloak syncs from LLDAP automatically.
+`./portcullis init` ends with a **one-time setup link** for the LLDAP
+`admin`. Open it, click "Register my key", touch the YubiKey (set / enter
+its PIN): you are signed in and land in the Hub. There is no password
+anywhere in the browser sign-in; a new link any time (lost key, expired
+link): `./portcullis invite admin --to hub` on the server.
 
-### 2. Enroll YubiKeys
+### 2. Users and their keys
 
-**WebAuthn (browser — zero install):**
-1. Visit `https://enroll.<domain>`
-2. Click "WebAuthn (Browser)"
-3. Log into Keycloak (first time: username + temporary password from LLDAP)
-4. Browser prompts "Touch your security key" → tap YubiKey
-5. Done. Future logins just require a tap.
+Create users and groups in the Hub (**Users & Groups**, or LLDAP at
+`https://directory.<domain>`, which keeps its own login). Each new user gets
+a setup link (Hub, or `./portcullis invite <user>`): open it, register the
+key, signed in — every later sign-in is one touch ("Sign in with Passkey").
+The link works once, expires after 72 h and replaces earlier links.
+`https://<domain>/` lists the apps a user may open (and the Hub for admins).
 
 **mTLS (CLI — for advanced users):**
 ```bash

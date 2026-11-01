@@ -8,8 +8,25 @@ tag's version as its release notes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Sign-in is passkey-only, one touch.** The browser flow (`portcullis-universal`) has no password: LoA 1 is a client cert (automatic when presented) or a passkey, LoA 2 (`hwk`) is reached by the same touch (no second prompt), LoA 3 still needs the cert. oauth2-proxy asks for `acr_values=hwk` by default, so webauthn-policy apps (the Hub's fresh-install default) need no step-up, and group-gate's step-up no longer sends `prompt=login` (Keycloak's LoA step-up asks only for the missing level). The policy factor `password` is met by any hardware factor.
+- **`keycloak configure` applies flow changes to existing realms**: each top-level flow of `realm-export.json` (`portcullis-universal`, `portcullis-invite-link`, `portcullis-invite-session`) is rebuilt when its tree changed (hash kept in the flow description), bindings moved, the old tree deleted. No `--wipe-realm` needed for flow changes.
+- The `portcullis` realm uses `sslRequired=external` (browsers reach Keycloak only through Traefik over HTTPS; `all` refused the invite identity provider's back-channel URLs on the private network).
+- **Fresh-install lockout fixed**: the Hub's `webauthn` default stepped every user up to LoA 2, which a user without a passkey (every user of a new install, the bootstrap `admin` included) could not pass: "Invalid username or password". Keycloak 26.8 cannot enrol a passkey from inside that flow (`WebAuthnPasswordlessAuthenticatorFactory.isUserSetupAllowed()` is false: a REQUIRED passkey step fails with "credential setup required"), so first passkeys now come from setup links. group-gate's step-up page no longer auto-redirects when a hardware factor is missing: a Continue button and links to register a passkey / enrol a certificate.
+
+### Added
+
+- **One-time setup links** (`./portcullis invite <user> [--ttl] [--to hub|portal|URL]`; `init` prints the bootstrap admin's link): open it, register the security key, signed in (acr `hwk`, amr `hwk`) and on the landing page — no password, no LLDAP / Keycloak login. enroll serves `https://enroll.<domain>/invite/<token>` (public router), acts as the hidden OIDC identity provider `portcullis-invite` for Keycloak (first login links to the existing LLDAP user only; ES256 id_token, PKCE, client secret, back-channel on the unrouted port 8445) and adds the `webauthn-register-passwordless` required action through the service account `portcullis-enroll` (manage-users) when the link is redeemed. Tokens: 256 bit, stored hashed, single use, 72 h (max 7 days), a new link revokes older ones, viewing does not consume, same-origin redeem only, rate limited, audited (`INVITE ...` log lines without tokens).
+- **Hub invite API** (integration contract §9.4): `POST http://enroll:8444/internal/invites` with the bearer secret in `secrets/enroll/invite-api-secret` (Hub copy: `/run/portcullis/invite/secret`); refuses `admin` and `portcullis-hub` (409).
+- **The Hub's LLDAP service account** (contract §9.1): `init` / `up` / `upgrade` keep LLDAP user `portcullis-hub` in `lldap_admin` with the password in `secrets/hub/lldap/password`, mounted read-only at `/run/portcullis/lldap/{username,password}` (group 10001, 0640); Hub env `LLDAP_HTTP_URL`, `LLDAP_LDAP_URL`, `LLDAP_BASE_DN`.
+- **Landing portal** at `https://<domain>/` (group-gate `/portal`, behind forward-auth): the apps of the Hub's `portal-apps.json` (contract §10) the user's groups allow, the Hub and consoles for `lldap_admin`, the user's passkeys and certificate.
+- `lldap_admin` members get `realm-admin` on the `portcullis` realm: `https://auth.<domain>/admin/portcullis/console/` works with the normal passkey session.
+- `tests/e2e/e2e_invite.py`: setup-link check (registration, no password, acr/amr, single use, one-touch second login, IdP closed without a link) for CI or a live server.
+
 ### Fixed
 
+- Keycloak admin consoles behind forward-auth answered "You do not have permission to access this resource": `portcullis-auth` replaced the console's own `Authorization: Bearer` header with the forward-auth session's token. The `/admin` router uses `portcullis-auth-console` (same, minus `Authorization`). The console's ~40 JS chunks also hit the login rate limit (HTTP 429, "Failed to fetch dynamically imported module"): `/resources/` has its own router with the general limit.
 - `init`, `up` and `upgrade` now run `config apply`, so `ACME_STAGING` and `MTLS_ENABLED` reach Traefik. Previously only the CA bundle was rebuilt, and Traefik always used the production ACME CA. A first flip to staging also clears ACME storage that the compose default (production) had already filled.
 
 First release of the modernised core stack. There are no earlier installs:

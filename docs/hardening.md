@@ -70,7 +70,10 @@ operator can still rewrite them and nobody else can read them
 |------|-------|------|---------|
 | `secrets/vault-unseal/unseal-key` | 1000 | 0640 (dir 0750) | vault (auto-unseal) |
 | `secrets/enroll/{role-id,secret-id}` | 10002 | 0640 (dir 0750) | enroll |
+| `secrets/enroll/{invite-client-secret,keycloak-client-secret,invite-api-secret}` | 10002 | 0640 | enroll (invite IdP client, Keycloak service account `portcullis-enroll`, Hub invite API) |
 | `secrets/hub/core.env` | 10001 | 0640 (dir 0750) | Hub (as `/project/.env`) |
+| `secrets/hub/lldap/{username,password}` | 10001 | 0640 (dir 0750) | Hub (`/run/portcullis/lldap`, LLDAP account `portcullis-hub`, `lldap_admin`) |
+| `secrets/hub/invite/secret` | 10001 | 0640 (dir 0750) | Hub (`/run/portcullis/invite/secret`, same value as enroll's `invite-api-secret`) |
 | `secrets/monitoring/prometheus/{vault-token,tls-targets.json}` | 65534 | 0640 (dir 0750) | Prometheus (Vault metrics token: policy `portcullis-metrics`) |
 | `secrets/monitoring/alertmanager/alertmanager.yml` | 65534 | 0640 (dir 0750) | Alertmanager (receivers incl. SMTP password / webhook URLs) |
 | `secrets/monitoring/grafana/admin-password` | 472 | 0640 (dir 0750) | Grafana |
@@ -126,6 +129,33 @@ Therefore:
   Traefik answers 421 on it. group-gate's step-up page therefore sends the
   browser to `https://auth.<domain>/oauth2/start?acr_values=…&rd=<app>`.
   CI rejects router rules without `Host(`.
+- Keycloak's `/admin` and `/realms/master` router uses
+  `portcullis-auth-console`: the same forward-auth, minus `Authorization`
+  in `authResponseHeaders`. The admin console sends its own bearer token to
+  the admin API; `portcullis-auth` replaced it with the forward-auth
+  session's token ("You do not have permission to access this resource").
+- Setup links: `enroll-invite` (`enroll.<domain>/invite/*`) is the only
+  enroll router without forward-auth. The token is 256 bit, stored as
+  SHA-256, single use, bound to one LLDAP user, 72 h (max 7 days), revoked
+  by a newer link; `GET` only shows it (link previews must not burn it), the
+  same-origin `POST` redeems it. enroll then acts as the hidden identity
+  provider `portcullis-invite` (Keycloak shows it only for
+  `kc_idp_hint=portcullis-invite`; its first-login flow links the existing
+  LLDAP user and never creates one): a 10-minute HttpOnly redemption cookie
+  scoped to `/invite/`, a 60 s single-use code bound to the broker redirect
+  URI and the PKCE challenge, an ES256 id_token. Its token / JWKS port
+  (8445) and the Hub's invite API (8444, bearer secret, refuses `admin` and
+  `portcullis-hub`) are not routed by Traefik; `enroll invite` (the CLI,
+  through `docker exec`) uses a loopback-only listener (8446), the only way
+  to invite the bootstrap `admin`. The invite session is LoA 2 / amr `hwk`:
+  it cannot finish without the passkey registration (`webauthn-register-passwordless`,
+  added by enroll's service account `portcullis-enroll`, realm-management
+  view-users + manage-users, when the link is redeemed). enroll already held
+  the LLDAP admin bind and Vault signing rights, so this adds no new class
+  of power to it.
+- The Hub logs in to LLDAP as `portcullis-hub` (`lldap_admin`): it could
+  already start arbitrary containers through its socket proxy, so this is
+  no new trust (integration contract §9.1).
 - Public exceptions (the Hub's `portcullis-public-<app>` routers) have no
   forward-auth: nothing is signed in and no identity header is passed (the
   Hub's strip middleware deletes client copies). Their first middleware,

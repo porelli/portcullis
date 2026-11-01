@@ -123,6 +123,18 @@ Certificates used to live 24 h, which meant a manual `cert renew` with the YubiK
 
 `portcullis keycloak configure` pushes the `x509-config` settings from `keycloak/realm-export.json` to an existing realm.
 
+### Sign-in levels (Keycloak browser flow)
+
+`portcullis-universal` (kept equal to `keycloak/realm-export.json` by `portcullis keycloak configure`) has **no password**:
+
+| acr (LoA) | Satisfied by | amr |
+|-----------|--------------|-----|
+| `pwd` (1) | the client cert (automatic when the browser presents one) or a passkey | `mtls` / `hwk` |
+| `hwk` (2) | reaching LoA 1 — every LoA 1 factor is hardware-backed, so no second touch | (same) |
+| `mtls` (3) | the client cert | `mtls` |
+
+oauth2-proxy asks for `hwk` by default; group-gate asks for `mtls` when a policy needs the cert. Keycloak's step-up on an existing session asks only for the levels it has not reached (no `prompt=login`). A user's first passkey comes from a one-time setup link (`./portcullis invite <user>`, or the Hub): Keycloak 26.8 cannot enrol a passkey from inside the flow (`WebAuthnPasswordlessAuthenticatorFactory.isUserSetupAllowed()` is false). The setup link signs the user in through the hidden identity provider `portcullis-invite` (enroll) with LoA 2 / amr `hwk`, after the passkey registration it requires. Details: [hardening](hardening.md#header-trust).
+
 ### mTLS binding (group-gate)
 
 A token with `amr=mtls` proves a cert was used **at login**. When an app's policy is satisfied **only** through the `mtls` factor (`mtls` alone, `all` including `mtls`, or `any` where `mtls` is the only factor in the token), group-gate also requires the **current request** to carry a client cert that is not revoked and whose CN equals the session's `preferred_username`. Otherwise the user gets the step-up page (`acr_values=mtls`). So a session opened with a cert that is revoked later, or replayed from another browser without the key, stops working immediately.
