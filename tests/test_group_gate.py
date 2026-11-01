@@ -154,13 +154,95 @@ class GateTest(unittest.TestCase):
         self.assertEqual(self.req("grafana.example.com", groups="users_grafana",
                                   extra={"X-Forwarded-Access-Token": token(amr=["hwk"])}), 200)
 
+    def stepup_page(self, policy, amr=("pwd",)):
+        write_policy({"policies": {"grafana": policy}})
+        h = {"X-Forwarded-Host": "grafana.example.com", "X-Auth-Request-Email": "bob@example.com",
+             "X-Auth-Request-Preferred-Username": "bob", "X-Auth-Request-Groups": "users_grafana",
+             "X-Forwarded-Access-Token": token(amr=list(amr))}
+        r = urllib.request.Request(f"http://127.0.0.1:{self.port}/", headers=h)
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(r)
+        with cm.exception as e:
+            self.assertEqual(e.code, 403)
+            return e.read().decode()
+
+    def test_stepup_page_hardware_factor_waits_for_the_user(self):
+        # A user without a passkey must be able to read / follow the
+        # enrolment link: no auto-redirect, a Continue button instead.
+        body = self.stepup_page({"factors": ["webauthn"], "op": ""})
+        self.assertNotIn('http-equiv="refresh"', body)
+        self.assertIn('id="stepup-continue"', body)
+        self.assertIn('href="https://auth.example.com/oauth2/start?', body)
+        self.assertIn("https://auth.example.com/realms/portcullis/account/account-security/signing-in", body)
+        body = self.stepup_page({"factors": ["mtls"], "op": ""})
+        self.assertNotIn('http-equiv="refresh"', body)
+        self.assertIn('href="https://enroll.example.com/"', body)
+        self.assertNotIn("account-security", body)
+
+    def test_stepup_page_password_factor_redirects(self):
+        body = self.stepup_page({"factors": ["password"], "op": ""}, amr=())
+        self.assertIn('http-equiv="refresh" content="2;url=https://auth.example.com/oauth2/start?', body)
+        self.assertNotIn("No hardware key", body)
+
     def test_stepup_url_is_on_the_auth_host(self):
         # A host-less /oauth2/ router gets 421 from Traefik on tiered hosts.
         url = gg.stepup_url("hwk.example.com", 2, ["webauthn"])
         parts = urllib.parse.urlsplit(url)
         self.assertEqual((parts.scheme, parts.netloc, parts.path), ("https", "auth.example.com", "/oauth2/start"))
         self.assertEqual(urllib.parse.parse_qs(parts.query),
-                         {"acr_values": ["hwk"], "prompt": ["login"], "rd": ["https://hwk.example.com/"]})
+                         {"acr_values": ["hwk"], "rd": ["https://hwk.example.com/"]})
+
+    def test_password_factor_met_by_hardware_factors(self):
+        # No password in the browser flow: hwk / mtls sessions satisfy it.
+        for amr in (["hwk"], ["mtls"], ["pwd"]):
+            self.assertTrue(gg.evaluate_policy({"factors": ["password"], "op": ""}, "", amr)[0], amr)
+        self.assertFalse(gg.evaluate_policy({"factors": ["password"], "op": ""}, "", [])[0])
+        self.assertTrue(gg.evaluate_policy({"factors": ["password", "webauthn"], "op": "all"}, "", ["hwk"])[0])
+        self.assertFalse(gg.evaluate_policy({"factors": ["webauthn"], "op": ""}, "", ["mtls"])[0])
+
+    def portal(self, groups, doc):
+        path = os.path.join(TMP, "portal-apps.json")
+        if doc is None:
+            if os.path.exists(path):
+                os.unlink(path)
+        else:
+            with open(path, "w") as f:
+                f.write(doc if isinstance(doc, str) else json.dumps(doc))
+        old = gg.PORTAL_FILE
+        gg.PORTAL_FILE = path
+        try:
+            h = {"X-Auth-Request-Preferred-Username": "bob", "X-Auth-Request-Groups": groups}
+            r = urllib.request.Request(f"http://127.0.0.1:{self.port}/portal", headers=h)
+            with urllib.request.urlopen(r) as resp:
+                return resp.read().decode()
+        finally:
+            gg.PORTAL_FILE = old
+
+    def test_portal_filters_and_escapes(self):
+        doc = {"version": 1, "apps": [
+            {"id": "wiki", "name": "Wiki <b>", "description": "<script>x</script>", "icon": "W",
+             "urls": [{"label": "Open", "url": "https://wiki.example.com/"}], "access_group": "users_wiki"},
+            {"id": "open", "name": "Open app", "urls": [{"label": "Go", "url": "https://open.example.com/"},
+                                                         {"label": "bad", "url": "javascript:alert(1)"},
+                                                         {"label": "foreign", "url": "https://evil.org/"}],
+             "access_group": ""},
+            {"id": "secret", "name": "Secret", "urls": [{"label": "S", "url": "https://secret.example.com/"}],
+             "access_group": "users_secret"}]}
+        body = self.portal("users_wiki", doc)
+        self.assertIn("Wiki &lt;b&gt;", body)
+        self.assertNotIn("<script>x", body)
+        self.assertIn("https://open.example.com/", body)
+        self.assertNotIn("javascript:", body)
+        self.assertNotIn("evil.org", body)
+        self.assertNotIn("Secret", body)
+        self.assertNotIn("hub.example.com", body)
+        self.assertIn("Signed in as <strong>bob</strong>", body)
+        admin = self.portal("lldap_admin, users_secret", doc)
+        self.assertIn("https://hub.example.com/", admin)
+        self.assertIn("Secret", admin)
+        self.assertIn("not available", self.portal("users_wiki", {"version": 2, "apps": doc["apps"]}))
+        self.assertIn("not available", self.portal("users_wiki", None))
+        self.assertIn("not available", self.portal("users_wiki", "{broken"))
 
     # ── identity headers: username, never the (user-editable) email ──
 

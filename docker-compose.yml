@@ -416,6 +416,15 @@ services:
       traefik.http.routers.keycloak.middlewares: rate-limit-auth@file,client-cert-pem@file,security-headers@file
       traefik.http.routers.keycloak.priority: "1"
       traefik.http.services.keycloak.loadbalancer.server.port: "8080"
+      # Static assets (themes, the admin console's ~40 JS chunks): the login
+      # rate limit (rate-limit-auth, 10/s burst 20) made the console fail
+      # with "Failed to fetch dynamically imported module" (HTTP 429).
+      traefik.http.routers.keycloak-resources.rule: Host(`auth.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/resources/`)
+      traefik.http.routers.keycloak-resources.entrypoints: websecure
+      traefik.http.routers.keycloak-resources.tls.options: authaware@file
+      traefik.http.routers.keycloak-resources.middlewares: rate-limit@file,security-headers@file
+      traefik.http.routers.keycloak-resources.priority: "5"
+      traefik.http.routers.keycloak-resources.service: keycloak
       # Admin console + master realm — protected behind forward-auth + group-gate
       # (auth=lldap_admin). /realms/master is the admin realm's login/token
       # endpoint; it has no business being public. The CLI and the Hub reach
@@ -424,7 +433,12 @@ services:
       traefik.http.routers.keycloak-admin.rule: Host(`auth.${PORTCULLIS_DOMAIN:-portcullis.local}`) && (PathPrefix(`/admin`) || PathPrefix(`/realms/master`))
       traefik.http.routers.keycloak-admin.entrypoints: websecure
       traefik.http.routers.keycloak-admin.tls.options: authaware@file
-      traefik.http.routers.keycloak-admin.middlewares: rate-limit-auth@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      # portcullis-auth-console, not portcullis-auth: the admin console sends
+      # its own `Authorization: Bearer <console token>` to /admin/realms/...;
+      # portcullis-auth would replace it with the forward-auth session's
+      # token (portcullis realm, no admin roles) → "You do not have
+      # permission to access this resource".
+      traefik.http.routers.keycloak-admin.middlewares: rate-limit-auth@file,client-cert-pem@file,portcullis-auth-console@docker,portcullis-groups@docker,security-headers@file
       traefik.http.routers.keycloak-admin.priority: "10"
       traefik.http.routers.keycloak-admin.service: keycloak
     depends_on:
@@ -492,6 +506,11 @@ services:
       # X-Auth-Request-User / X-Auth-Request-Preferred-Username = LLDAP username
       # (never the user-editable email, nor Keycloak's user id).
       traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,Authorization,X-Forwarded-Access-Token
+      # Keycloak's admin consoles only: the same, minus Authorization (the
+      # console's own bearer token must reach the admin API).
+      traefik.http.middlewares.portcullis-auth-console.forwardauth.address: http://forward-auth:4180
+      traefik.http.middlewares.portcullis-auth-console.forwardauth.trustForwardHeader: "true"
+      traefik.http.middlewares.portcullis-auth-console.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,X-Forwarded-Access-Token
       # oauth2-proxy's own endpoints (/oauth2/callback, /oauth2/start for
       # group-gate's step-up, /oauth2/sign_out) live ONLY on auth.<domain>.
       # No host-less PathPrefix(`/oauth2/`) router: Traefik cannot select TLS
@@ -527,6 +546,8 @@ services:
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
       GATE_POLICY_FILE: /hub-data/group-gate-policy.json
+      # Landing portal (https://<domain>/): the Hub's app list (contract §10).
+      GATE_PORTAL_FILE: /hub-data/portal-apps.json
       # Client-cert revocation: requests whose TLS client cert (seen via
       # client-headers@file → X-Forwarded-Tls-Client-Cert-Info) has a
       # revoked serial are denied. Sources: the serial file above (instant)
@@ -568,6 +589,15 @@ services:
       # credential (contract §5). No authResponseHeaders: nobody is signed in.
       traefik.http.middlewares.portcullis-public-guard.forwardauth.address: http://group-gate:8080/public-guard
       traefik.http.middlewares.portcullis-public-guard.forwardauth.trustForwardHeader: "true"
+      # Landing portal at the apex domain: any signed-in user; group-gate's
+      # /portal lists the apps of portal-apps.json their groups allow and,
+      # for lldap_admin, the Hub and the consoles.
+      traefik.http.routers.portal.rule: Host(`${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.portal.entrypoints: websecure
+      traefik.http.routers.portal.tls.options: authaware@file
+      traefik.http.routers.portal.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portal-path@docker,security-headers@file
+      traefik.http.routers.portal.service: group-gate
+      traefik.http.middlewares.portal-path.replacepath.path: /portal
     restart: unless-stopped
 
   hub:
@@ -592,9 +622,18 @@ services:
       KEYCLOAK_URL: http://keycloak:8080
       KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
       KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?KEYCLOAK_ADMIN_PASSWORD is not set — run ./portcullis init}
-      # No LLDAP credentials: X-Forwarded-User is already the LLDAP username
-      # (the Hub used the LLDAP admin account only to map emails to usernames),
-      # and LLDAP admin could put anyone into lldap_admin.
+      # Users & Groups (integration contract §9): the Hub logs in to LLDAP
+      # as its own service account `portcullis-hub` (lldap_admin), whose
+      # credentials are FILES under /run/portcullis/lldap (never env vars),
+      # kept in place by ./portcullis up. Invites go to enroll's API with the
+      # shared secret in /run/portcullis/invite/secret; enroll refuses
+      # `admin` and `portcullis-hub` (./portcullis invite admin on the host).
+      HUB_LLDAP_CREDENTIALS_DIR: /run/portcullis/lldap
+      LLDAP_HTTP_URL: http://lldap:17170
+      LLDAP_LDAP_URL: ldap://lldap:3890
+      LLDAP_BASE_DN: ${LLDAP_BASE_DN:-dc=portcullis,dc=local}
+      HUB_INVITE_API_URL: http://enroll:8444/internal/invites
+      HUB_INVITE_SECRET_FILE: /run/portcullis/invite/secret
       # Shared secret Traefik sends as X-Portcullis-Proxy-Secret on every
       # request routed to the Hub (hub-proxy-secret middleware below,
       # integration contract §5); the Hub refuses to start without it.
@@ -626,6 +665,9 @@ services:
       # IP, VPN client secrets, HUB_SHARED_ENV). Rewritten in place by
       # ./portcullis up; group 10001, mode 0640.
       - ./secrets/hub/core.env:/project/.env:ro
+      # secrets/ is masked above; these two subdirectories are the Hub's.
+      - ./secrets/hub/lldap:/run/portcullis/lldap:ro
+      - ./secrets/hub/invite:/run/portcullis/invite:ro
     networks:
       - portcullis
       - socket-proxy-hub
@@ -669,6 +711,10 @@ services:
       # Lifetime of client certs issued by enroll (admin enrolment and
       # self-service renewal). Capped by the Vault role (portcullis pki setup).
       CERT_TTL: ${CLIENT_CERT_TTL:-720h}
+      # Invites: Keycloak admin API as the service account portcullis-enroll
+      # (secret: secrets/enroll/keycloak-client-secret); the invite OIDC
+      # client secret and the Hub's invite API secret are files there too.
+      KEYCLOAK_URL: http://keycloak:8080
     networks:
       - portcullis
     healthcheck:
@@ -696,6 +742,16 @@ services:
       traefik.http.routers.enroll-self.priority: "100"
       traefik.http.routers.enroll-self.middlewares: rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-self@docker,security-headers@file
       traefik.http.routers.enroll-self.service: enroll
+      # One-time invite links (enroll/invite.go): public, no forward-auth
+      # (the user has no passkey yet). Only /invite/* reaches enroll this
+      # way; the token / JWKS (:8445) and invite API (:8444) ports are not
+      # routed by Traefik (Keycloak / the Hub use them on `portcullis`).
+      traefik.http.routers.enroll-invite.rule: Host(`enroll.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/invite/`)
+      traefik.http.routers.enroll-invite.entrypoints: websecure
+      traefik.http.routers.enroll-invite.tls.options: authaware@file
+      traefik.http.routers.enroll-invite.priority: "110"
+      traefik.http.routers.enroll-invite.middlewares: rate-limit-auth@file,client-headers@file,security-headers@file
+      traefik.http.routers.enroll-invite.service: enroll
       traefik.http.services.enroll.loadbalancer.server.port: "8443"
     volumes:
       - ./secrets/enroll:/run/secrets/portcullis-enroll:ro

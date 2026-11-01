@@ -236,6 +236,88 @@ def _read_policy_doc():
     return doc
 
 
+PORTAL_FILE = os.environ.get("GATE_PORTAL_FILE", os.path.join(os.path.dirname(POLICY_FILE), "portal-apps.json"))
+
+
+def load_portal_apps():
+    """Apps of the Hub's portal-apps.json (contract §10), or None when the
+    file is missing, unreadable or of an unknown version (show nothing)."""
+    try:
+        with open(PORTAL_FILE) as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or doc.get("version") != 1 or not isinstance(doc.get("apps"), list):
+        return None
+    return [a for a in doc["apps"] if isinstance(a, dict)]
+
+
+def _safe_url(u) -> str:
+    """https URLs on the portal domain only (anything else is dropped)."""
+    if not isinstance(u, str):
+        return ""
+    parts = urllib.parse.urlsplit(u)
+    host = (parts.hostname or "").lower()
+    if parts.scheme != "https" or parts.username or not host:
+        return ""
+    if DOMAIN and not (host == DOMAIN or host.endswith("." + DOMAIN)):
+        return ""
+    return u
+
+
+def render_portal(user: str, groups: set, apps, domain: str) -> bytes:
+    e = lambda v: html.escape(str(v), quote=True)  # noqa: E731
+    cards = []
+    for a in apps or []:
+        need = a.get("access_group") or ""
+        if not isinstance(need, str) or (need and need not in groups) or need == DENY_GROUP:
+            continue
+        links = []
+        for u in a.get("urls") or []:
+            if not isinstance(u, dict):
+                continue
+            href = _safe_url(u.get("url"))
+            if href:
+                links.append(f'<a href="{e(href)}">{e(u.get("label") or href)}</a>')
+        if not links:
+            continue
+        icon = a.get("icon") if isinstance(a.get("icon"), str) else ""
+        cards.append(
+            f'<li class="card"><h3><span aria-hidden="true">{e(icon[:4])}</span> {e(a.get("name") or a.get("id") or "")}</h3>'
+            f'<p>{e(a.get("description") or "")}</p><p class="links">{" · ".join(links)}</p></li>')
+    if apps is None:
+        app_html = "<p class=\"muted\">The app list is not available yet.</p>"
+    elif cards:
+        app_html = "<ul class=\"grid\">" + "".join(cards) + "</ul>"
+    else:
+        app_html = "<p class=\"muted\">No apps are available to you yet.</p>"
+    own = [("My passkeys", f"https://auth.{domain}/realms/portcullis/account/account-security/signing-in"),
+           ("My client certificate", f"https://enroll.{domain}/self")]
+    admin = []
+    if "lldap_admin" in groups:
+        admin = [("Hub (apps, users &amp; marketplace)", f"https://hub.{domain}/"),
+                 ("Keycloak (realm console)", f"https://auth.{domain}/admin/portcullis/console/"),
+                 ("Certificates", f"https://enroll.{domain}/"),
+                 ("Directory (LLDAP, own login)", f"https://directory.{domain}/"),
+                 ("Traefik", f"https://traefik.{domain}/")]
+    def ul(items):
+        return "<ul class=\"plain\">" + "".join(f'<li><a href="{e(u)}">{t}</a></li>' for t, u in items) + "</ul>"
+    page = (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+        f"<title>{e(domain)}</title><style>"
+        "body{font-family:system-ui,-apple-system,sans-serif;max-width:60rem;margin:2rem auto;padding:0 1.5rem;color:#1e293b;line-height:1.5}"
+        "h1{font-size:1.6rem;margin:0 0 .25rem}h2{font-size:1.15rem;margin:2rem 0 .75rem}h3{font-size:1.05rem;margin:0 0 .35rem}"
+        ".muted{color:#64748b}.grid{list-style:none;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(16rem,1fr));gap:1rem}"
+        ".card{border:1px solid #e2e8f0;border-radius:.6rem;padding:1rem}.card p{margin:.25rem 0}.plain{padding-left:1.1rem}"
+        "a{color:#1d4ed8}a:focus-visible{outline:3px solid #f59e0b;outline-offset:2px}</style></head><body><main>"
+        f"<h1>{e(domain)}</h1><p class=\"muted\">Signed in as <strong>{e(user)}</strong></p>"
+        f"<h2>Apps</h2>{app_html}"
+        + (f"<h2>Administration</h2>{ul(admin)}" if admin else "")
+        + f"<h2>Your account</h2>{ul(own)}</main></body></html>")
+    return page.encode()
+
+
 def load_policy_file() -> dict:
     """Return the Hub policy doc, {} if the file is absent.
 
@@ -1125,6 +1207,10 @@ def evaluate_policy(policy: dict, acr: str, amr: list) -> Tuple[bool, str, int]:
         return True, "public", 0
 
     amr_set = set(amr or [])
+    # The browser flow has no password: "password" (any first factor) is
+    # met by every hardware factor too.
+    if amr_set & {"hwk", "mtls"}:
+        amr_set.add(FACTOR_TO_AMR["password"])
     needed_amrs = {FACTOR_TO_AMR[f] for f in factors}
 
     if op == "all":
@@ -1165,11 +1251,12 @@ def stepup_url(host: str, needed_loa: int, factors: list) -> str:
     """Build a step-up URL that asks oauth2-proxy for a fresh login at the
     required Level of Authentication.
 
-    We pass `prompt=login` and `acr_values=<acr>` to /oauth2/start, which
-    oauth2-proxy forwards to Keycloak's authorize endpoint. `prompt=login`
-    tells Keycloak to bypass its SSO `auth-cookie` short-circuit and re-run
-    the flow; `acr_values` routes the user into the matching LoA conditional
-    subflow so the missing factor is actually prompted for.
+    We pass `acr_values=<acr>` to /oauth2/start, which oauth2-proxy forwards
+    to Keycloak's authorize endpoint. No `prompt=login`: Keycloak's cookie
+    authenticator already runs the flow when the requested LoA is above the
+    session's (LoA step-up), and then asks only for the levels not reached
+    yet — a full re-authentication would ask again for factors the session
+    already has.
 
     The URL is on auth.<domain> (router oauth2-callback), never on the app's
     own host: a host-less PathPrefix(`/oauth2/`) router cannot carry the
@@ -1186,7 +1273,6 @@ def stepup_url(host: str, needed_loa: int, factors: list) -> str:
     acr = loa_to_acr.get(needed_loa, "pwd")
     query = urllib.parse.urlencode({
         "acr_values": acr,
-        "prompt": "login",
         "rd": f"https://{host}/",
     })
     parent = parent_domain(host)
@@ -1290,46 +1376,65 @@ class Handler(BaseHTTPRequestHandler):
         op = policy.get("op") or "any"
         have = ", ".join(safe_factor_name(str(a)) for a in amr) or "none"
         need_desc = f"{op} of: {', '.join(factors)}" if len(factors) > 1 else factors[0] if factors else "authentication"
-        # If a hardware factor is in play, surface a link to the
-        # Keycloak account console so users who haven't enrolled yet
-        # can register a WebAuthn key.
+        # A hardware factor (passkey / client cert) may be one the user
+        # does not have yet: no auto-redirect then (it would bounce them
+        # straight back into a sign-in they cannot complete), but a
+        # Continue button and, right next to it, how to enrol. Users who
+        # have no passkey yet finish the step-up at LoA 1, so they land
+        # here again until they register one.
         needs_hardware = any(f in ("mtls", "webauthn") for f in factors)
         parent = parent_domain(host)
-        account_url = (
-            f"https://auth.{parent}/realms/portcullis/account/account-security/signing-in"
-            if parent else ""
-        )
+        enrol = []
+        if parent and "webauthn" in factors:
+            account_url = f"https://auth.{parent}/realms/portcullis/account/account-security/signing-in"
+            enrol.append(
+                f"<a href=\"{html.escape(account_url, quote=True)}\" target=\"_blank\" rel=\"noopener\">"
+                "Register a passkey in the account console</a> (Signing in &rarr; Passkey &rarr; Set up)")
+        if parent and "mtls" in factors:
+            enrol.append(
+                f"<a href=\"{html.escape(f'https://enroll.{parent}/', quote=True)}\" target=\"_blank\" rel=\"noopener\">"
+                "Enrol a client certificate</a>")
         enrollment_block = ""
-        if needs_hardware and account_url:
+        if needs_hardware and enrol:
             enrollment_block = (
-                f"<p style=\"background:#fff7ed;border:1px solid #fed7aa;padding:.75rem 1rem;border-radius:.5rem;margin-top:1rem\">"
-                f"<b>No hardware key yet?</b> "
-                f"<a href=\"{html.escape(account_url, quote=True)}\" target=\"_blank\" rel=\"noopener\">Open the account console</a> "
-                f"to register a security key, then return and retry.</p>"
+                "<section aria-labelledby=\"enrol-h\" style=\"background:#fff7ed;border:1px solid #fed7aa;"
+                "padding:.75rem 1rem;border-radius:.5rem;margin-top:1.5rem\">"
+                "<h2 id=\"enrol-h\" style=\"font-size:1.05rem;margin:0 0 .4rem\">No hardware key registered yet?</h2>"
+                f"<p style=\"margin:0\">{' or '.join(enrol)}, then come back and press <b>Continue</b>.</p>"
+                "</section>"
             )
         if not detail_html:
             detail_html = (f"<p><b>{e_sub}</b> requires {html.escape(need_desc)}. "
                            f"Your current session was authenticated with <code>{html.escape(have)}</code>, "
                            "which does not satisfy the app's policy.</p>")
-        # Meta-refresh bumps the user through the fresh authorize
-        # flow automatically after 2 seconds. The explicit link is
-        # the accessible fallback.
+        if needs_hardware:
+            refresh = ""
+            action = (f"<p><a id=\"stepup-continue\" class=\"btn\" href=\"{e_url}\" autofocus>Continue</a> "
+                      "to sign in again with the required factor.</p>")
+        else:
+            # Nothing to enrol: bump the user through the fresh authorize
+            # flow after 2 seconds; the link is the accessible fallback.
+            refresh = f"<meta http-equiv=\"refresh\" content=\"2;url={e_url}\">"
+            action = (f"<p>You will be redirected to re-authenticate in a moment. "
+                      f"If nothing happens, <a id=\"stepup-continue\" href=\"{e_url}\">click here</a>.</p>")
         self.wfile.write(
             (
-                "<!doctype html><html><head>"
-                f"<meta http-equiv=\"refresh\" content=\"2;url={e_url}\">"
+                "<!doctype html><html lang=\"en\"><head>"
+                f"{refresh}"
                 "<title>Additional authentication required</title>"
                 "<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:32rem;"
                 "margin:4rem auto;padding:2rem;color:#1e293b;line-height:1.55}"
                 "h1{font-size:1.5rem;margin:0 0 1rem}"
                 "code{background:#f1f5f9;padding:.15rem .4rem;border-radius:.25rem;font-size:.95em}"
-                "a{color:#3b82f6}</style></head><body>"
-                "<h1>Additional authentication required</h1>"
+                "a{color:#1d4ed8}"
+                ".btn{display:inline-block;background:#1d4ed8;color:#fff;padding:.55rem 1.25rem;"
+                "border-radius:.4rem;text-decoration:none;font-weight:600}"
+                ".btn:focus-visible{outline:3px solid #f59e0b;outline-offset:2px}</style></head><body>"
+                "<main><h1>Additional authentication required</h1>"
                 f"{detail_html}"
-                f"<p>You will be redirected to re-authenticate in a moment. "
-                f"If nothing happens, <a href=\"{e_url}\">click here</a>.</p>"
+                f"{action}"
                 f"{enrollment_block}"
-                "</body></html>"
+                "</main></body></html>"
             ).encode()
         )
         print(
@@ -1339,6 +1444,25 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     _endpoint = "gate"
+
+    def _portal(self):
+        """Landing page at https://<domain>/ (router `portal`: portcullis-auth,
+        then replacePath /portal). Lists the apps of portal-apps.json the
+        user's groups allow (contract §10) and, for lldap_admin, the core
+        consoles. Identity headers come from forward-auth's authResponseHeaders."""
+        user = session_username(self.headers)
+        groups = {g.strip() for g in self.headers.get("X-Auth-Request-Groups", "").split(",") if g.strip()}
+        if not user:
+            self._deny("Access Denied", "<p>Not signed in.</p>", "DENIED portal reason=no username", "no_user")
+            return
+        METRICS.inc("group_gate_requests_total", endpoint="portal", result="allow")
+        body = render_portal(user, groups, load_portal_apps(), DOMAIN)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _public_guard(self):
         raw_host = self.headers.get("X-Forwarded-Host", "")
@@ -1388,6 +1512,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             self.wfile.write(b"ok\n")
+            return
+        if gate_path == "/portal":
+            self._endpoint = "portal"
+            self._portal()
             return
         if gate_path == "/public-guard":
             self._endpoint = "public_guard"

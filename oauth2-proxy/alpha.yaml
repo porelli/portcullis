@@ -2,7 +2,7 @@
 #
 # Why alpha config: upstream keeps per-request loginURLParameters out of the
 # legacy env-based config. We need per-request acr_values so group-gate's
-# step-up redirect (/oauth2/start?acr_values=hwk) actually reaches Keycloak.
+# step-up redirect (/oauth2/start?acr_values=mtls) actually reaches Keycloak.
 # Once --alpha-config is set, providers + upstreams MUST live here; every
 # other knob (cookie, headers, ingress) still comes from OAUTH2_PROXY_* env.
 #
@@ -31,20 +31,28 @@ providers:
       insecureAllowUnverifiedEmail: true
       audienceClaims:
         - aud
-    # Per-request acr_values passthrough. Group-gate forwards a stronger
-    # value via /oauth2/start?acr_values=hwk|mtls when the app's policy
-    # demands it; `allow` gates accepted values.
+    # Per-request parameters for Keycloak; `allow` gates accepted values.
     loginURLParameters:
+      # Every sign-in asks for LoA 2 (hwk) by default: the browser flow
+      # has no password, so a passkey (or client cert) touch reaches it in
+      # one step and webauthn-policy apps (the Hub's default) need no
+      # step-up afterwards. group-gate asks for mtls (/oauth2/start?
+      # acr_values=mtls) when an app's policy needs a client cert.
       - name: acr_values
         default:
-          - pwd
+          - hwk
         allow:
           - value: pwd
           - value: hwk
           - value: mtls
-      # `prompt=login` forces Keycloak to run the flow instead of reusing
-      # its SSO cookie via auth-cookie. Needed on step-up so the higher
-      # LoA actually runs its factor subflow and amr reflects reality.
+      # One-time invite links (enroll/invite.go) start here with
+      # kc_idp_hint=portcullis-invite (Keycloak's identity provider
+      # redirector) and prompt=login, so an SSO session of whoever used the
+      # browser before is not reused. group-gate's step-up never sends
+      # prompt: Keycloak's LoA step-up asks only for the missing level.
+      - name: kc_idp_hint
+        allow:
+          - value: portcullis-invite
       - name: prompt
         allow:
           - value: login
