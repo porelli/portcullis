@@ -390,6 +390,9 @@ services:
       - "127.0.0.1:8080:8080"
     volumes:
       - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+      # Login theme `portcullis` (keycloak.v2 + unique passkey labels, no
+      # label prompt; keycloak/themes/portcullis).
+      - ./keycloak/themes/portcullis:/opt/keycloak/themes/portcullis:ro
       - ./certs/truststore:/opt/keycloak/conf/truststores/portcullis:ro
     networks:
       - portcullis

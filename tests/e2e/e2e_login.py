@@ -173,7 +173,8 @@ def main() -> int:
             ctx = browser.new_context(client_certificates=certs, storage_state=storage_state)
             ctx.set_default_timeout(TIMEOUT_MS)
             ctx.tracing.start(screenshots=True, snapshots=True, name=trace_name)
-            ctx.on("page", lambda p: p.on("dialog", lambda d: d.accept(f"e2e-key-{time.time_ns()}")))
+            # A user pressing OK on any dialog (the stock label prompt): keep the default.
+            ctx.on("page", lambda p: p.on("dialog", lambda d: d.accept(d.default_value)))
             return ctx
 
         def close(ctx, name):

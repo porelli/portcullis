@@ -110,9 +110,26 @@ invite_create() {
   printf '%s' "$out"
 }
 
+# invite_replace_keys <user> — delete the user's passkeys / security keys
+# in Keycloak and end their sessions (lost or stolen key), before a new link.
+invite_replace_keys() {
+  local user="$1" uid cid code n=0
+  require_cmd curl
+  kc_login
+  uid="$(kc_get "/$KC_REALM/users?username=$(jq -rn --arg u "$user" '$u|@uri')&exact=true" | jq -r '.[0].id // empty')"
+  [ -n "$uid" ] || fail "$user is not known to Keycloak (no such LLDAP user?)"
+  for cid in $(kc_get "/$KC_REALM/users/$uid/credentials" | jq -r '.[]? | select(.type == "webauthn" or .type == "webauthn-passwordless") | .id'); do
+    code="$(kc_send DELETE "/$KC_REALM/users/$uid/credentials/$cid" < /dev/null)"
+    [ "$code" = 204 ] || fail "could not delete a key of $user (HTTP $code)"
+    n=$((n + 1))
+  done
+  code="$(kc_send POST "/$KC_REALM/users/$uid/logout" < /dev/null)"
+  _kc_report "$user: removed $n key(s), signed out everywhere" "$code" 204 || fail "could not sign $user out"
+}
+
 help_invite() {
   cat <<'EOF'
-Usage: portcullis invite <user> [--ttl DURATION] [--to hub|portal|URL] [--json]
+Usage: portcullis invite <user> [--ttl DURATION] [--to hub|portal|URL] [--replace-keys] [--json]
 
 Prints a one-time setup link for an LLDAP user. Opening it lets the user
 register a passkey / security key (YubiKey) and signs them in: no password,
@@ -127,18 +144,23 @@ refuses invites for `admin`; only the server can issue them.
   --to             where to land afterwards: hub (https://hub.<domain>/),
                    portal (https://<domain>/, default) or an https URL on
                    the domain
+  --replace-keys   lost / stolen key: first delete ALL of the user's passkeys
+                   and security keys in Keycloak and sign them out everywhere.
+                   Without it the new key is added next to the old ones (a
+                   spare key); the old ones keep working.
   --json           print enroll's JSON ({"url","expires_at"})
 EOF
 }
 
 cmd_invite() {
-  local user="" ttl="" to="portal" json=false landing out
+  local user="" ttl="" to="portal" json=false replace=false landing out
   while [ $# -gt 0 ]; do
     case "$1" in
       -h|--help) help_invite; return 0 ;;
       --ttl) [ $# -ge 2 ] || usage_error invite "--ttl needs a value"; ttl="$2"; shift ;;
       --to) [ $# -ge 2 ] || usage_error invite "--to needs a value"; to="$2"; shift ;;
       --json) json=true ;;
+      --replace-keys) replace=true ;;
       -*) usage_error invite "unknown option: $1" ;;
       *) [ -z "$user" ] || usage_error invite "one user only"; user="$1" ;;
     esac
@@ -158,6 +180,10 @@ cmd_invite() {
     *) landing="$to" ;;
   esac
   out="$(invite_create "$user" "$ttl" "$landing")"
+  # The link first: if it can't be made, the old keys stay.
+  if [ "$replace" = true ]; then
+    invite_replace_keys "$user" >&2
+  fi
   if [ "$json" = true ]; then
     printf '%s\n' "$out"
   else

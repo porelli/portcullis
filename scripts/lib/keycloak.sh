@@ -136,7 +136,10 @@ keycloak_configure() {
   code="$(kc_get "/$KC_REALM" | jq '
       {sslRequired: "external", attributes: {"acr.loa.map": "{\"public\":\"0\",\"pwd\":\"1\",\"hwk\":\"2\",\"mtls\":\"3\"}"}} +
       (if ((.browserFlow // "") == "" or .browserFlow == "portcullis-browser-flow")
-       then {browserFlow: "portcullis-universal"} else {} end)' | kc_send PUT "/$KC_REALM")"
+       then {browserFlow: "portcullis-universal"} else {} end) +
+      # Login theme: unique passkey labels, so a second key (recovery) can be
+      # registered; an operator-chosen theme other than the defaults is kept.
+      (if ((.loginTheme // "") | IN("", "keycloak", "keycloak.v2")) then {loginTheme: "portcullis"} else {} end)' | kc_send PUT "/$KC_REALM")"
   _kc_report "realm attributes" "$code" 204 || true
 
   info "Syncing the authentication flows from realm-export.json..."
