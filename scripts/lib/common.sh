@@ -332,8 +332,10 @@ secrets_fix_perms() {
   chmod 700 "$s" 2>/dev/null || true
   [ ! -e "$s/vault-init.json" ] || chmod 600 "$s/vault-init.json"
   ct_group_read "$CT_GID_VAULT" "$s/vault-unseal" "$s/vault-unseal/unseal-key"
-  ct_group_read "$CT_UID_ENROLL" "$s/enroll" "$s/enroll/role-id" "$s/enroll/secret-id"
-  ct_group_read "$CT_UID_HUB" "$s/hub" "$s/hub/core.env"
+  ct_group_read "$CT_UID_ENROLL" "$s/enroll" "$s/enroll/role-id" "$s/enroll/secret-id" \
+    "$s/enroll/invite-client-secret" "$s/enroll/keycloak-client-secret" "$s/enroll/invite-api-secret"
+  ct_group_read "$CT_UID_HUB" "$s/hub" "$s/hub/core.env" \
+    "$s/hub/lldap" "$s/hub/lldap/username" "$s/hub/lldap/password" "$s/hub/invite" "$s/hub/invite/secret"
   # secrets/monitoring/ (scripts/lib/monitoring.sh)
   if declare -F monitoring_fix_perms >/dev/null; then monitoring_fix_perms; fi
 }
@@ -404,6 +406,8 @@ stack_prepare() {
   # hub_data is also mounted (read-only) by group-gate, which may create it.
   volume_own hub_data "$CT_UID_HUB:$CT_UID_HUB"
   hub_env_write
+  # Invite / service-account secrets (scripts/lib/users.sh).
+  if declare -F users_secret_files >/dev/null; then users_secret_files; fi
   # Files of the opt-in monitoring profile (scripts/lib/monitoring.sh).
   if declare -F monitoring_prepare >/dev/null; then monitoring_prepare; fi
   secrets_fix_perms

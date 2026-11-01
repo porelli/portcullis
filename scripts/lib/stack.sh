@@ -170,6 +170,7 @@ init_run() {
 
   keycloak_configure false
   oidc_register
+  lldap_service_account
 
   if [ "$config_repo" = true ]; then
     config_init "" ""
@@ -180,16 +181,25 @@ init_run() {
   ok "Portcullis is running."
   cat <<EOF
 
-  Enrollment UI   https://enroll.$d
-  Directory       https://directory.$d   (LLDAP: admin / LLDAP_ADMIN_PASSWORD in .env)
-  Identity        https://auth.$d        (Keycloak: \$KEYCLOAK_ADMIN / KEYCLOAK_ADMIN_PASSWORD in .env)
-  Hub             https://hub.$d
-  Gateway         https://traefik.$d
+  Portal          https://$d             (your apps; the Hub for admins)
+  Hub             https://hub.$d         (apps, marketplace, users & groups)
+  Identity        https://auth.$d/admin/portcullis/console/  (realm console for lldap_admin)
   Vault           http://127.0.0.1:8200  (root token: secrets/vault-init.json)
+  Break-glass     Keycloak master console https://auth.$d/admin/master/console/
+                  (\$KEYCLOAK_ADMIN / KEYCLOAK_ADMIN_PASSWORD), LLDAP https://directory.$d
+                  (admin / LLDAP_ADMIN_PASSWORD) — both in .env
 
-  Next: create users in the directory, then enroll a YubiKey at
-  https://enroll.$d (or: ./portcullis cert enroll <user> <email>).
+  Sign-in is passkey-only. Open the link below, register your security key
+  (YubiKey) and you land in the Hub as the LLDAP admin. New link any time:
+  ./portcullis invite admin --to hub
 EOF
+  local link
+  if link="$(invite_create admin "" "https://hub.$d/")"; then
+    printf '\n  Setup link for admin (one use, expires %s):\n\n  %s\n\n' \
+      "$(printf '%s' "$link" | jq -r .expires_at)" "$(printf '%s' "$link" | jq -r .url)"
+  else
+    warn "Could not create the admin's setup link; run: ./portcullis invite admin --to hub"
+  fi
   warn "Back up secrets/vault-init.json OFFLINE (Vault root token + unseal key)."
 }
 
@@ -204,6 +214,7 @@ stack_up() {
   dc up -d --build
   monitoring_reload
   wait_healthy 300 vault postgres lldap keycloak
+  lldap_service_account
   ok "Portcullis is up. Check: ./portcullis status"
 }
 
@@ -243,6 +254,7 @@ upgrade_run() {
   wait_healthy 300 vault postgres lldap keycloak
   keycloak_configure false
   oidc_register
+  lldap_service_account
   # Picks up a FORWARD_AUTH_CLIENT_SECRET generated above, if any.
   dc up -d forward-auth >/dev/null
 

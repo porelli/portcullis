@@ -20,7 +20,7 @@ PORTCULLIS_ROOT="${PORTCULLIS_ROOT:-$PORTCULLIS_HOME}"
 PORTCULLIS_CALLER_PWD="$PWD"
 unset _self _dir
 
-for _lib in common network vault pki certs keycloak dns config status monitoring backup stack; do
+for _lib in common network vault pki certs keycloak users dns config status monitoring backup stack; do
   # shellcheck source=/dev/null
   source "$PORTCULLIS_LIB/$_lib.sh"
 done
@@ -56,6 +56,7 @@ Vault and PKI:
   pki setup                   Create the client-certificate CA (idempotent)
 
 Identity:
+  invite                      One-time setup link: register a passkey, signed in (no password)
   keycloak configure          Import/patch the portcullis realm
   oidc register               Create core OIDC clients, push their secrets from .env
 
@@ -82,7 +83,7 @@ main() {
   esac
   cd "$PORTCULLIS_ROOT"
   case "$cmd" in
-    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|cert)
+    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert)
       "cmd_$cmd" "$@" ;;
     *)
       printf "portcullis: unknown command '%s'\nRun 'portcullis help' for the list of commands.\n" "$cmd" >&2
