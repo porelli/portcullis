@@ -192,6 +192,27 @@ class GateTest(unittest.TestCase):
         self.assertEqual(urllib.parse.parse_qs(parts.query),
                          {"acr_values": ["hwk"], "rd": ["https://hwk.example.com/"]})
 
+    def test_hub_default_any_of_mtls_webauthn(self):
+        # The Hub's fresh-install default: a passkey OR a cert session passes.
+        pol = {"factors": ["mtls", "webauthn"], "op": "any"}
+        self.assertEqual(gg.evaluate_policy(pol, "hwk", ["hwk"])[0], True)
+        self.assertEqual(gg.evaluate_policy(pol, "hwk", ["mtls"])[0], True)
+        ok, _, loa = gg.evaluate_policy(pol, "", [])
+        self.assertEqual((ok, loa), (False, 2))  # step-up to hwk (passkey), not mtls
+        # Cert-only sessions are bound to the cert on the request.
+        self.assertTrue(gg.policy_relies_on_mtls(pol, ["mtls"]))
+        self.assertFalse(gg.policy_relies_on_mtls(pol, ["hwk", "mtls"]))
+        write_policy({"version": 3, "default": pol})
+        code, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
+        self.assertEqual(code, 403)
+        self.assertIn("acr_values=hwk", hdrs.get("X-Stepup-URL", ""))
+        self.assertEqual(self.req("grafana.example.com", groups="users_grafana",
+                                  extra={"X-Forwarded-Access-Token": token(amr=["hwk"])}), 200)
+        body = self.stepup_page(pol, amr=())
+        self.assertNotIn('http-equiv="refresh"', body)
+        self.assertIn("account-security/signing-in", body)  # register a passkey
+        self.assertIn('href="https://enroll.example.com/"', body)  # or get a cert
+
     def test_hub_service_account_is_denied(self):
         for gate_path in ("/", "/authenticated", "/portal"):
             for name in ("portcullis-hub", "Portcullis-Hub"):
@@ -251,6 +272,22 @@ class GateTest(unittest.TestCase):
         self.assertIn("not available", self.portal("users_wiki", {"version": 2, "apps": doc["apps"]}))
         self.assertIn("not available", self.portal("users_wiki", None))
         self.assertIn("not available", self.portal("users_wiki", "{broken"))
+
+    def test_portal_strict_csp_allows_only_its_inline_style(self):
+        import base64, hashlib, re as _re
+        h = {"X-Auth-Request-Preferred-Username": "bob", "X-Auth-Request-Groups": ""}
+        r = urllib.request.Request(f"http://127.0.0.1:{self.port}/portal", headers=h)
+        with urllib.request.urlopen(r) as resp:
+            csp = resp.headers.get("Content-Security-Policy", "")
+            body = resp.read().decode()
+        self.assertIn("default-src 'none'", csp)
+        self.assertNotIn("unsafe-inline", csp)
+        styles = _re.findall(r"<style>(.*?)</style>", body, _re.S)
+        self.assertEqual(len(styles), 1)
+        digest = base64.b64encode(hashlib.sha256(styles[0].encode()).digest()).decode()
+        self.assertIn(f"'sha256-{digest}'", csp)
+        self.assertNotIn("<script", body)
+        self.assertNotIn(' style="', body)  # no inline style attributes (blocked by the CSP)
 
     # ── identity headers: username, never the (user-editable) email ──
 

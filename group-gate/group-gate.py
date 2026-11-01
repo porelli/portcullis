@@ -99,6 +99,7 @@ from __future__ import annotations
 
 import base64
 import calendar
+import hashlib
 import html
 import json
 import os
@@ -268,6 +269,28 @@ def _safe_url(u) -> str:
     return u
 
 
+# Same dark look as enroll's pages (enroll/web/*.html). Inline only, no
+# external assets; allowed by PORTAL_CSP through its hash.
+PORTAL_CSS = (
+    "*{box-sizing:border-box;margin:0;padding:0}"
+    "body{font-family:-apple-system,BlinkMacSystemFont,\"Segoe UI\",Roboto,sans-serif;background:#0f172a;color:#e2e8f0;line-height:1.6}"
+    ".container{max-width:60rem;margin:0 auto;padding:2rem}"
+    "header{display:flex;flex-wrap:wrap;gap:1rem;justify-content:space-between;align-items:center;margin-bottom:2rem;padding-bottom:1rem;border-bottom:1px solid #1e293b}"
+    "h1{font-size:1.5rem;color:#f1f5f9}h2{font-size:1.15rem;color:#f1f5f9;margin:0 0 .75rem}h3{font-size:1rem;color:#f1f5f9;margin-bottom:.25rem}"
+    "section{margin-bottom:2rem}.user-badge{background:#1e293b;padding:.5rem 1rem;border-radius:.5rem;font-size:.875rem}"
+    ".user-badge strong{color:#60a5fa}.muted{color:#94a3b8}"
+    ".grid{list-style:none;display:grid;grid-template-columns:repeat(auto-fill,minmax(16rem,1fr));gap:1rem}"
+    ".card{background:#1e293b;border-radius:.75rem;padding:1.25rem}.card p{color:#94a3b8;font-size:.875rem;margin:.25rem 0}"
+    ".card .links{margin-top:.5rem;font-size:.9rem}.panel{background:#1e293b;border-radius:.75rem;padding:1.25rem 1.5rem}"
+    ".plain{list-style:none}.plain li{padding:.3rem 0;border-bottom:1px solid #0f172a}.plain li:last-child{border-bottom:none}"
+    "a{color:#60a5fa;text-decoration:none}a:hover{text-decoration:underline}"
+    "a:focus-visible{outline:3px solid #f59e0b;outline-offset:2px;border-radius:.2rem}"
+)
+PORTAL_CSP = ("default-src 'none'; style-src 'sha256-"
+              + base64.b64encode(hashlib.sha256(PORTAL_CSS.encode()).digest()).decode()
+              + "'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+
+
 def render_portal(user: str, groups: set, apps, domain: str) -> bytes:
     e = lambda v: html.escape(str(v), quote=True)  # noqa: E731
     cards = []
@@ -308,16 +331,12 @@ def render_portal(user: str, groups: set, apps, domain: str) -> bytes:
     page = (
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-        f"<title>{e(domain)}</title><style>"
-        "body{font-family:system-ui,-apple-system,sans-serif;max-width:60rem;margin:2rem auto;padding:0 1.5rem;color:#1e293b;line-height:1.5}"
-        "h1{font-size:1.6rem;margin:0 0 .25rem}h2{font-size:1.15rem;margin:2rem 0 .75rem}h3{font-size:1.05rem;margin:0 0 .35rem}"
-        ".muted{color:#64748b}.grid{list-style:none;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(16rem,1fr));gap:1rem}"
-        ".card{border:1px solid #e2e8f0;border-radius:.6rem;padding:1rem}.card p{margin:.25rem 0}.plain{padding-left:1.1rem}"
-        "a{color:#1d4ed8}a:focus-visible{outline:3px solid #f59e0b;outline-offset:2px}</style></head><body><main>"
-        f"<h1>{e(domain)}</h1><p class=\"muted\">Signed in as <strong>{e(user)}</strong></p>"
-        f"<h2>Apps</h2>{app_html}"
-        + (f"<h2>Administration</h2>{ul(admin)}" if admin else "")
-        + f"<h2>Your account</h2>{ul(own)}</main></body></html>")
+        "<meta name=\"color-scheme\" content=\"dark\">"
+        f"<title>{e(domain)}</title><style>{PORTAL_CSS}</style></head><body><main class=\"container\">"
+        f"<header><h1>{e(domain)}</h1><span class=\"user-badge\">Signed in as <strong>{e(user)}</strong></span></header>"
+        f"<section><h2>Apps</h2>{app_html}</section>"
+        + (f"<section class=\"panel\"><h2>Administration</h2>{ul(admin)}</section>" if admin else "")
+        + f"<section class=\"panel\"><h2>Your account</h2>{ul(own)}</section></main></body></html>")
     return page.encode()
 
 
@@ -1467,6 +1486,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", PORTAL_CSP)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
