@@ -8,6 +8,10 @@ tag's version as its release notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- `init`, `up` and `upgrade` now run `config apply`, so `ACME_STAGING` and `MTLS_ENABLED` reach Traefik. Previously only the CA bundle was rebuilt, and Traefik always used the production ACME CA. A first flip to staging also clears ACME storage that the compose default (production) had already filled.
+
 First release of the modernised core stack. There are no earlier installs:
 nothing here migrates old data.
 

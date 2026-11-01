@@ -61,11 +61,16 @@ config_apply() {
   # old account/cert.
   sentinel="$PORTCULLIS_ROOT/certs/.acme-staging-last"
   last="$(cat "$sentinel" 2>/dev/null || true)"
+  # No sentinel but ACME storage exists: it was filled by compose's default
+  # CA (production) — treat it as such so a first flip to staging clears it.
+  if [ -z "$last" ] && docker volume inspect portcullis_traefik_acme >/dev/null 2>&1; then
+    last=false
+  fi
   if [ -n "$last" ] && [ "$last" != "$staging" ]; then
     warn "ACME_STAGING flipped ($last → $staging): clearing Traefik's ACME storage."
     dc stop traefik >/dev/null 2>&1 || true
     if docker volume inspect portcullis_traefik_acme >/dev/null 2>&1; then
-      docker run --rm -v portcullis_traefik_acme:/acme alpine rm -f /acme/acme.json >/dev/null 2>&1 \
+      docker run --rm --network none -v portcullis_traefik_acme:/acme "$PORTCULLIS_HELPER_IMAGE" rm -f /acme/acme.json >/dev/null 2>&1 \
         || warn "could not clear acme.json"
     fi
   fi

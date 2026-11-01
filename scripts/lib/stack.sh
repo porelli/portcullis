@@ -150,9 +150,10 @@ init_run() {
   stack_prepare
   info "Initialising Vault..."
   vault_init false
-  # forward-auth bind-mounts certs/ca-bundle.crt: it must be a file before
-  # the first `up` (rebuilt below once the internal CA exists).
-  config_build_ca_bundle
+  # ACME_STAGING / MTLS_ENABLED → ACME_CA_SERVER + TLS tiers, and the CA
+  # bundle (forward-auth bind-mounts certs/ca-bundle.crt: it must be a file
+  # before the first `up`; rebuilt below once the internal CA exists).
+  config_apply
 
   info "Starting services..."
   dc up -d --build
@@ -199,7 +200,7 @@ stack_up() {
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
   network_check
   stack_prepare
-  config_build_ca_bundle
+  config_apply
   dc up -d --build
   monitoring_reload
   wait_healthy 300 vault postgres lldap keycloak
@@ -230,7 +231,7 @@ upgrade_run() {
   stack_prepare
   vault_init false
   pki_setup false false
-  config_build_ca_bundle
+  config_apply
 
   info "Starting services..."
   dc up -d --build
