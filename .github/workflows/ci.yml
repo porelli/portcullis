@@ -1546,6 +1546,24 @@ jobs:
           E2E_FOREIGN_KEY: /tmp/foreign.key
         run: NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_login.py
 
+      - name: Re-invite / lost-key recovery (second key, --replace-keys)
+        run: |
+          set -o pipefail
+          LT=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
+            | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          for u in e2e-spare e2e-lost; do
+            jq -n --arg u "$u" '{query: ("mutation { createUser(user: {id: \"" + $u + "\", email: \"" + $u + "@portcullis.local\"}) { id } }")}' \
+              | curl -sf http://127.0.0.1:17170/api/graphql -H @<(printf 'Authorization: Bearer %s\n' "$LT") -H 'Content-Type: application/json' -d @- \
+              | jq -e '.errors == null' >/dev/null
+          done
+          export NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt"
+          # A second key next to the first (both work) ...
+          /tmp/e2e-venv/bin/python tests/e2e/e2e_invite.py "$(./portcullis invite e2e-spare --json | jq -r .url)" https://portcullis.local/ \
+            --reinvite-cmd "./portcullis invite e2e-spare --json"
+          # ... and a lost key replaced (the old one stops working).
+          /tmp/e2e-venv/bin/python tests/e2e/e2e_invite.py "$(./portcullis invite e2e-lost --json | jq -r .url)" https://portcullis.local/ \
+            --reinvite-cmd "./portcullis invite e2e-lost --replace-keys --json" --replaced
+
       - name: Monitoring (targets up, probes, rules, alerts, Grafana behind forward-auth)
         run: |
           ./portcullis backup >/dev/null

@@ -100,6 +100,8 @@ Create users and groups in the Hub (**Users & Groups**, or LLDAP at
 a setup link (Hub, or `./portcullis invite <user>`): open it, register the
 key, signed in — every later sign-in is one touch ("Sign in with Passkey").
 The link works once, expires after 72 h and replaces earlier links.
+A second link adds another key (a spare); for a lost or stolen key use
+`./portcullis invite <user> --replace-keys`, which removes the old keys first.
 `https://<domain>/` lists the apps a user may open (and the Hub for admins).
 
 **mTLS (CLI — for advanced users):**

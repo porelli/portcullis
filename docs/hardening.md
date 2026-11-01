@@ -158,7 +158,9 @@ Therefore:
   added by enroll's service account `portcullis-enroll`, realm-management
   view-users + manage-users, when the link is redeemed). enroll already held
   the LLDAP admin bind and Vault signing rights, so this adds no new class
-  of power to it.
+  of power to it. A re-invite of a user who already has keys adds one more
+  (spare); `./portcullis invite <user> --replace-keys` (lost / stolen key)
+  deletes the user's WebAuthn credentials and sessions first.
 - The Hub logs in to LLDAP as `portcullis-hub` (`lldap_admin`; LLDAP
   0.6.3's `lldap_password_manager` cannot create users or groups): it could
   already start arbitrary containers through its socket proxy, so this is

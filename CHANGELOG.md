@@ -23,6 +23,7 @@ tag's version as its release notes.
 - `tests/test_cli.sh` fails on secrets on the CLI's command lines (`--arg x "$(cat ...)"`, secret variables in `--arg`, `--password $...`); the LLDAP / SMTP passwords now reach jq via `--rawfile` / its environment.
 - **Landing portal** at `https://<domain>/` (group-gate `/portal`, behind forward-auth): the apps of the Hub's `portal-apps.json` (contract §10) the user's groups allow, the Hub and consoles for `lldap_admin`, the user's passkeys and certificate.
 - `lldap_admin` members get `realm-admin` on the `portcullis` realm: `https://auth.<domain>/admin/portcullis/console/` works with the normal passkey session.
+- **Lost-key recovery / spare keys**: login theme `portcullis` (`keycloak/themes/portcullis`, keycloak.v2 + one changed `webauthnRegister.js`) labels each new passkey "Security key <date time>" without asking. Stock Keycloak prompted for a label with a fixed default, and a second key of the same user then failed with "Device already exists with the same name" — re-inviting a user who already had a key (incl. `./portcullis invite admin`) could not work. `./portcullis invite <user> --replace-keys` first deletes the user's keys and signs them out (lost / stolen key); without it the new key is added next to the old ones.
 - `tests/e2e/e2e_invite.py`: setup-link check (registration, no password, acr/amr, single use, one-touch second login, IdP closed without a link) for CI or a live server.
 
 ### Fixed
