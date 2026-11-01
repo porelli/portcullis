@@ -22,16 +22,25 @@ kc_login() {
     --data-urlencode "grant_type=password" \
     --data-urlencode "password@-" | jq -r '.access_token // empty' 2>/dev/null || true)"
   [ -n "$KC_TOKEN" ] || fail "Could not authenticate to Keycloak at $(kc_url) as ${KEYCLOAK_ADMIN:-admin}. Is it running (portcullis status)?"
+  KC_TOKEN_AT=$SECONDS
+}
+
+# _kc_fresh — admin-cli tokens live 60 s: log in again before they expire
+# (in a $(...) subshell the new token only lives for that call).
+_kc_fresh() {
+  if [ -n "${KC_TOKEN_AT:-}" ] && [ $(( SECONDS - KC_TOKEN_AT )) -gt 40 ]; then kc_login; fi
 }
 
 # kc_get <path> — GET JSON from the admin API (path relative to /admin/realms).
 kc_get() {
+  _kc_fresh
   curl -sk --max-time 20 -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") \
     "$(kc_url)/admin/realms$1"
 }
 
 # kc_send <METHOD> <path> — body on stdin (empty for none); prints HTTP code.
 kc_send() {
+  _kc_fresh
   curl -sk --max-time 20 -o /dev/null -w '%{http_code}' -X "$1" \
     -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") \
     -H 'Content-Type: application/json' --data-binary @- \
@@ -55,9 +64,9 @@ keycloak_configure() {
   kc_login
   local base_dn="${LLDAP_BASE_DN:-dc=portcullis,dc=local}" domain="${PORTCULLIS_DOMAIN:-portcullis.local}"
 
-  # Delete-then-import is the only reliable way to apply nested auth-flow
-  # changes on an existing realm. Users and their WebAuthn keys live in
-  # LLDAP, and clients are re-registered by `portcullis oidc register`.
+  # Last resort: flow changes are applied by _kc_sync_flow below. Wiping
+  # deletes Keycloak's copy of every user incl. their passkeys (LLDAP keeps
+  # the accounts); clients are re-registered by `portcullis oidc register`.
   if [ "$wipe" = true ]; then
     warn "--wipe-realm: deleting realm $KC_REALM before import"
     code="$(kc_send DELETE "/$KC_REALM" < /dev/null)"
@@ -109,17 +118,34 @@ keycloak_configure() {
   info "Setting ACR→LoA map and the browser flow..."
   # Only switch browserFlow if it is unset or the realm's built-in value;
   # an operator's custom flow is preserved.
+  # sslRequired=external: browsers only reach Keycloak through Traefik
+  # (HTTPS; proxy headers trusted from Traefik only), and "all" would also
+  # refuse the invite identity provider's back-channel URLs on the private
+  # network (http://enroll:8445, Keycloak's URL check resolves the host).
   code="$(kc_get "/$KC_REALM" | jq '
-      {attributes: {"acr.loa.map": "{\"public\":\"0\",\"pwd\":\"1\",\"hwk\":\"2\",\"mtls\":\"3\"}"}} +
+      {sslRequired: "external", attributes: {"acr.loa.map": "{\"public\":\"0\",\"pwd\":\"1\",\"hwk\":\"2\",\"mtls\":\"3\"}"}} +
       (if ((.browserFlow // "") == "" or .browserFlow == "portcullis-browser-flow")
        then {browserFlow: "portcullis-universal"} else {} end)' | kc_send PUT "/$KC_REALM")"
   _kc_report "realm attributes" "$code" 204 || true
 
+  info "Syncing the authentication flows from realm-export.json..."
+  for flow in $KC_EXPORT_FLOWS; do _kc_sync_flow "$flow" || true; done
+  _kc_invite_idp
+  _kc_enroll_client
+  local ra
+  ra="$(kc_get "/$KC_REALM/authentication/required-actions/webauthn-register-passwordless")"
+  if printf '%s' "$ra" | jq -e '.enabled != true or .defaultAction != false' >/dev/null 2>&1; then
+    code="$(printf '%s' "$ra" | jq -c '.enabled = true | .defaultAction = false' \
+      | kc_send PUT "/$KC_REALM/authentication/required-actions/webauthn-register-passwordless")"
+    _kc_report "webauthn-register-passwordless required action enabled" "$code" 204 || true
+  fi
+
   info "Checking factor executors carry AMR reference values..."
-  # Each authenticator in portcullis-loa-*-factors / portcullis-loa-3 needs
-  # an authenticatorConfig with default.reference.value, or the amr claim is
-  # empty and AND-mode policies cannot tell factors apart.
-  for flow in portcullis-loa-1-factors portcullis-loa-2-factors portcullis-loa-3; do
+  # Each authenticator in portcullis-loa-1-factors / portcullis-loa-3 /
+  # portcullis-invite-loa needs an authenticatorConfig with
+  # default.reference.value, or the amr claim is empty and AND-mode policies
+  # cannot tell factors apart.
+  for flow in portcullis-loa-1-factors portcullis-loa-3 portcullis-invite-loa; do
     execs="$(kc_get "/$KC_REALM/authentication/flows/$flow/executions")"
     printf '%s' "$execs" | jq -e 'type == "array"' >/dev/null 2>&1 || continue
     while read -r provider cfg; do
@@ -128,7 +154,7 @@ keycloak_configure() {
       elif [ -z "$(kc_get "/$KC_REALM/authentication/config/$cfg" | jq -r '.config["default.reference.value"] // empty')" ]; then
         warn "    $flow/$provider config has no default.reference.value → empty amr for this factor"
       fi
-    done < <(printf '%s' "$execs" | jq -r '.[] | select(.providerId and .providerId != "conditional-level-of-authentication") | .providerId + " " + (.authenticationConfig // "none")')
+    done < <(printf '%s' "$execs" | jq -r '.[] | select(.providerId and (.providerId | startswith("conditional-") | not)) | .providerId + " " + (.authenticationConfig // "none")')
   done
 
   info "Applying the X.509 authenticator config (CRL check, trust re-validation)..."
@@ -136,7 +162,7 @@ keycloak_configure() {
   # authenticator settings onto every existing x509 execution's config.
   local x509_cfg cfg_ids cid
   x509_cfg="$(jq -c '.authenticatorConfig[] | select(.alias == "x509-config") | .config' "$PORTCULLIS_ROOT/keycloak/realm-export.json")"
-  cfg_ids="$(for flow in portcullis-loa-1-factors portcullis-loa-2-factors portcullis-loa-3; do
+  cfg_ids="$(for flow in portcullis-loa-1-factors portcullis-loa-3; do
       kc_get "/$KC_REALM/authentication/flows/$flow/executions" \
         | jq -r '.[]? | select(.providerId == "auth-x509-client-username-form") | .authenticationConfig // empty' 2>/dev/null
     done | sort -u)"
@@ -175,6 +201,8 @@ keycloak_configure() {
   fi
 
   _kc_email_unverified_scope
+  info "Granting lldap_admin the $KC_REALM realm console..."
+  _kc_admin_roles
 
   info "Configuring the forward-auth client (acr, groups, redirect URI)..."
   fwd_uuid="$(kc_get "/$KC_REALM/clients?clientId=portcullis-forward-auth" | jq -r '.[0].id // empty')"
@@ -264,6 +292,224 @@ _kc_email_unverified_scope() {
   fi
 }
 
+KC_EXPORT_FLOWS="portcullis-universal portcullis-invite-link portcullis-invite-session"
+
+# _kc_export — realm-export.json (path) for jq.
+_kc_export() { echo "$PORTCULLIS_ROOT/keycloak/realm-export.json"; }
+
+# _kc_flow_tree <top-alias> — the export's flows reachable from <top-alias>
+# plus the authenticator configs they use, as compact sorted JSON.
+_kc_flow_tree() {
+  jq -cS --arg top "$1" '
+    .authenticationFlows as $f | .authenticatorConfig as $c
+    | def reach($a): [$a] + ([$f[] | select(.alias == $a) | .authenticationExecutions[] | select(.flowAlias) | .flowAlias]
+                            | map(reach(.)) | add // []);
+      (reach($top) | unique) as $names
+    | {flows: [$f[] | select(.alias as $a | $names | index($a))],
+       configs: [$c[] | select(.alias as $a | [$f[] | select(.alias as $x | $names | index($x)) | .authenticationExecutions[].authenticatorConfig] | index($a))]}' \
+    "$(_kc_export)"
+}
+
+# _kc_flow_id <alias> — id of the realm flow with that alias, or empty.
+_kc_flow_id() {
+  kc_get "/$KC_REALM/authentication/flows" | jq -r --arg a "$1" '[.[]? | select(.alias == $a)][0].id // empty'
+}
+
+# _kc_build_execs <tree-json> <export-flow> <realm-flow> <suffix> — add the
+# export flow's executions (recursively) to an existing, empty realm flow.
+# Sub-flows get "<alias>.<suffix>", configs "<alias>.<suffix>.<seq>" (aliases
+# are realm-unique and the export shares x509-config between executions);
+# _kc_sync_flow renames them once the old tree is gone.
+_kc_build_execs() {
+  local tree="$1" src="$2" dst="$3" sfx="$4" ex prio req sub prov cfg id code n
+  while read -r ex; do
+    prio="$(jq -r .priority <<<"$ex")"; req="$(jq -r .requirement <<<"$ex")"
+    if [ "$(jq -r .authenticatorFlow <<<"$ex")" = true ]; then
+      sub="$(jq -r .flowAlias <<<"$ex")"
+      code="$(jq -nc --arg a "$sub.$sfx" --argjson p "$prio" \
+          --arg d "$(jq -r --arg a "$sub" '[.flows[] | select(.alias == $a)][0].description // ""' <<<"$tree")" \
+          '{alias: $a, type: "basic-flow", priority: $p, description: $d}' \
+        | kc_send POST "/$KC_REALM/authentication/flows/$dst/executions/flow")"
+      [ "$code" = 201 ] || { warn "    $dst: add sub-flow $sub: HTTP $code"; return 1; }
+    else
+      prov="$(jq -r .authenticator <<<"$ex")"
+      code="$(jq -nc --arg p "$prov" --argjson n "$prio" '{provider: $p, priority: $n}' \
+        | kc_send POST "/$KC_REALM/authentication/flows/$dst/executions/execution")"
+      [ "$code" = 201 ] || { warn "    $dst: add $prov: HTTP $code"; return 1; }
+    fi
+    id="$(kc_get "/$KC_REALM/authentication/flows/$dst/executions" \
+      | jq -c --argjson p "$prio" '[.[] | select(.level == 0 and .priority == $p)][0]')"
+    code="$(jq -c --arg r "$req" '.requirement = $r' <<<"$id" | kc_send PUT "/$KC_REALM/authentication/flows/$dst/executions")"
+    case "$code" in 202|204) ;; *) warn "    $dst: requirement $req (priority $prio): HTTP $code"; return 1 ;; esac
+    cfg="$(jq -r '.authenticatorConfig // empty' <<<"$ex")"
+    if [ -n "$cfg" ]; then
+      _KC_CFG_SEQ=$(( _KC_CFG_SEQ + 1 ))
+      code="$(jq -c --arg a "$cfg" --arg n "$cfg.$sfx.$_KC_CFG_SEQ" '[.configs[] | select(.alias == $a)][0] | .alias = $n' <<<"$tree" \
+        | kc_send POST "/$KC_REALM/authentication/executions/$(jq -r .id <<<"$id")/config")"
+      [ "$code" = 201 ] || { warn "    $dst: config $cfg: HTTP $code"; return 1; }
+    fi
+    if [ "$(jq -r .authenticatorFlow <<<"$ex")" = true ]; then
+      _kc_build_execs "$tree" "$sub" "$sub.$sfx" "$sfx" || return 1
+    fi
+  done < <(jq -c --arg a "$src" '[.flows[] | select(.alias == $a)][0].authenticationExecutions | sort_by(.priority)[]' <<<"$tree")
+}
+
+# _kc_sync_flow <top-alias> — make the realm's flow tree equal to the
+# export's. Nested flow changes cannot be applied in place reliably, so a
+# changed tree is rebuilt next to the old one ("<alias>.<hash>"), bindings
+# (realm browser flow, identity providers) are moved over, the old tree is
+# deleted (with its configs) and the new one renamed. The tree's hash is
+# kept in the top flow's description: unchanged trees are left alone.
+_kc_sync_flow() {
+  local top="$1" tree hash marker cur old_id new_id code idp desc f sfx
+  tree="$(_kc_flow_tree "$top")"
+  hash="$(printf '%s' "$tree" | sha256sum | cut -c1-10)"
+  marker="[sync $hash]"
+  cur="$(kc_get "/$KC_REALM/authentication/flows" | jq -r --arg a "$top" '[.[]? | select(.alias == $a)][0].description // empty')"
+  if [ "${cur% "$marker"}" != "$cur" ]; then
+    echo "    $top: up to date"
+    return 0
+  fi
+  # Leftovers of an interrupted run.
+  for f in $(kc_get "/$KC_REALM/authentication/flows" | jq -r --arg a "$top." '.[]? | select(.alias | startswith($a)) | .id'); do
+    kc_send DELETE "/$KC_REALM/authentication/flows/$f" < /dev/null >/dev/null
+  done
+  # Build suffix: unique per run, so a half-renamed earlier build never clashes.
+  sfx="b$(date +%s)$$"
+  desc="$(jq -r --arg a "$top" '[.flows[] | select(.alias == $a)][0].description' <<<"$tree") $marker"
+  code="$(jq -nc --arg a "$top.$sfx" --arg d "$desc" \
+      '{alias: $a, description: $d, providerId: "basic-flow", topLevel: true, builtIn: false}' \
+    | kc_send POST "/$KC_REALM/authentication/flows")"
+  [ "$code" = 201 ] || { warn "    $top: create: HTTP $code"; return 1; }
+  _KC_CFG_SEQ=0
+  _kc_build_execs "$tree" "$top" "$top.$sfx" "$sfx" || { warn "    $top: rebuild failed, the realm keeps the old flow"; return 1; }
+
+  # Move the bindings, then drop the old tree.
+  if [ "$(kc_get "/$KC_REALM" | jq -r --arg a "$top" '(.browserFlow // "") as $b | ($b == $a or ($a == "portcullis-universal" and ($b == "" or $b == "browser" or $b == "portcullis-browser-flow")))')" = true ]; then
+    code="$(jq -nc --arg a "$top.$sfx" '{browserFlow: $a}' | kc_send PUT "/$KC_REALM")"
+    _kc_report "$top: browser flow binding" "$code" 204 || return 1
+  fi
+  while read -r idp; do
+    [ -n "$idp" ] || continue
+    code="$(kc_get "/$KC_REALM/identity-provider/instances/$idp" | jq -c --arg o "$top" --arg n "$top.$sfx" '
+        (if .firstBrokerLoginFlowAlias == $o then .firstBrokerLoginFlowAlias = $n else . end)
+        | (if .postBrokerLoginFlowAlias == $o then .postBrokerLoginFlowAlias = $n else . end)' \
+      | kc_send PUT "/$KC_REALM/identity-provider/instances/$idp")"
+    _kc_report "$top: identity provider $idp binding" "$code" 204 || return 1
+  done < <(kc_get "/$KC_REALM/identity-provider/instances" | jq -r --arg a "$top" '.[]? | select(.firstBrokerLoginFlowAlias == $a or .postBrokerLoginFlowAlias == $a) | .alias')
+  old_id="$(_kc_flow_id "$top")"
+  if [ -n "$old_id" ]; then
+    code="$(kc_send DELETE "/$KC_REALM/authentication/flows/$old_id" < /dev/null)"
+    _kc_report "$top: remove the previous flow" "$code" 204 || return 1
+  fi
+  # Canonical names (GET /flows lists top-level flows only: sub-flows come
+  # from the executions).
+  new_id="$(_kc_flow_id "$top.$sfx")"
+  code="$(kc_get "/$KC_REALM/authentication/flows/$new_id" | jq -c --arg a "$top" '.alias = $a | del(.authenticationExecutions)' \
+    | kc_send PUT "/$KC_REALM/authentication/flows/$new_id")"
+  _kc_report "$top: rename" "$code" 204 || return 1
+  while read -r f; do
+    [ -n "$f" ] || continue
+    code="$(kc_get "/$KC_REALM/authentication/flows/${f%% *}" | jq -c --arg a "${f#* }" '.alias = ($a | sub("\\.[^.]+$"; "")) | del(.authenticationExecutions)' \
+      | kc_send PUT "/$KC_REALM/authentication/flows/${f%% *}")"
+    [ "$code" = 204 ] || warn "    rename ${f#* }: HTTP $code"
+  done < <(kc_get "/$KC_REALM/authentication/flows/$top/executions" \
+    | jq -r --arg h ".$sfx" '.[] | select(.authenticationFlow == true and (.displayName | endswith($h))) | .flowId + " " + .displayName')
+  # Configs: the first use of an export alias gets the alias, later ones "-2", "-3"...
+  local seen=" " cfgs base n
+  cfgs="$(for f in $(kc_get "/$KC_REALM/authentication/flows/$top/executions" | jq -r '.[] | .authenticationConfig // empty'); do
+      kc_get "/$KC_REALM/authentication/config/$f" | jq -c '{id, alias}'
+    done | jq -sc --arg h "$sfx" '[.[] | select(.alias | test("\\." + $h + "\\.[0-9]+$"))
+      | . + (.alias | capture("^(?<base>.*)\\.[^.]+\\.(?<seq>[0-9]+)$") | {base, seq: (.seq | tonumber)})] | sort_by(.seq)[]')"
+  while read -r f; do
+    [ -n "$f" ] || continue
+    base="$(jq -r .base <<<"$f")"
+    n="$(printf '%s' "$seen" | tr ' ' '\n' | grep -cxF "$base" || true)"
+    seen="$seen$base "
+    [ "$n" = 0 ] && n="" || n="-$((n + 1))"
+    code="$(kc_get "/$KC_REALM/authentication/config/$(jq -r .id <<<"$f")" | jq -c --arg a "$base$n" '.alias = $a' \
+      | kc_send PUT "/$KC_REALM/authentication/config/$(jq -r .id <<<"$f")")"
+    [ "$code" = 204 ] || warn "    rename config $base$n: HTTP $code"
+  done <<<"$cfgs"
+  echo "    $top: rebuilt from realm-export.json"
+}
+
+# _kc_invite_idp — the `portcullis-invite` identity provider (enroll's
+# one-time invite login, enroll/invite.go): created from realm-export.json
+# if missing, URLs (domain) and the client secret
+# (secrets/enroll/invite-client-secret) pushed every run.
+_kc_invite_idp() {
+  info "Ensuring the invite identity provider (one-time setup links)..."
+  local domain="${PORTCULLIS_DOMAIN:-portcullis.local}" secret_file="$PORTCULLIS_ROOT/secrets/enroll/invite-client-secret" rep code
+  [ -r "$secret_file" ] || { warn "    $secret_file missing (./portcullis up creates it) — invite login not configured"; return 0; }
+  rep="$(kc_get "/$KC_REALM/identity-provider/instances/portcullis-invite")"
+  if ! printf '%s' "$rep" | jq -e '.alias' >/dev/null 2>&1; then
+    rep="$(jq -c '.identityProviders[] | select(.alias == "portcullis-invite")' "$(_kc_export)")"
+    code="$(printf '%s' "$rep" | kc_send POST "/$KC_REALM/identity-provider/instances")"
+    _kc_report "invite identity provider" "$code" 201 || return 0
+    rep="$(kc_get "/$KC_REALM/identity-provider/instances/portcullis-invite")"
+  fi
+  code="$(printf '%s' "$rep" | SECRET="$(cat "$secret_file")" jq -c --arg d "$domain" \
+      --argjson want "$(jq -c '.identityProviders[] | select(.alias == "portcullis-invite")' "$(_kc_export)")" '
+      . + ($want | {enabled, hideOnLogin, trustEmail, storeToken, linkOnly, firstBrokerLoginFlowAlias, postBrokerLoginFlowAlias})
+      | .config = ((.config // {}) + $want.config + {
+          clientSecret: env.SECRET,
+          authorizationUrl: ("https://enroll." + $d + "/invite/authorize"),
+          issuer: ("https://enroll." + $d + "/invite")})' \
+    | kc_send PUT "/$KC_REALM/identity-provider/instances/portcullis-invite")"
+  _kc_report "invite identity provider (URLs, client secret)" "$code" 204 || true
+}
+
+# _kc_enroll_client — confidential client portcullis-enroll (service
+# account only, secret = secrets/enroll/keycloak-client-secret) with
+# realm-management view-users + manage-users: enroll adds the passkey
+# registration required action to a user redeeming an invite.
+_kc_enroll_client() {
+  local f="$PORTCULLIS_ROOT/secrets/enroll/keycloak-client-secret" uuid code sa rm roles
+  [ -r "$f" ] || { warn "    $f missing (./portcullis up creates it)"; return 0; }
+  code="$(SECRET="$(cat "$f")" jq -nc '{clientId: "portcullis-enroll", name: "Portcullis enroll (invites)",
+      enabled: true, protocol: "openid-connect", publicClient: false, secret: env.SECRET,
+      serviceAccountsEnabled: true, standardFlowEnabled: false, implicitFlowEnabled: false,
+      directAccessGrantsEnabled: false, frontchannelLogout: false}' | kc_send POST "/$KC_REALM/clients")"
+  case "$code" in 201|409) ;; *) warn "    client portcullis-enroll: HTTP $code"; return 0 ;; esac
+  uuid="$(kc_get "/$KC_REALM/clients?clientId=portcullis-enroll" | jq -r '.[0].id // empty')"
+  [ -n "$uuid" ] || { warn "    client portcullis-enroll not found"; return 0; }
+  code="$(kc_get "/$KC_REALM/clients/$uuid" | SECRET="$(cat "$f")" jq -c '.secret = env.SECRET | .serviceAccountsEnabled = true
+      | .standardFlowEnabled = false | .directAccessGrantsEnabled = false | .publicClient = false' \
+    | kc_send PUT "/$KC_REALM/clients/$uuid")"
+  _kc_report "client portcullis-enroll (service account, secret)" "$code" 204 || return 0
+  sa="$(kc_get "/$KC_REALM/clients/$uuid/service-account-user" | jq -r '.id // empty')"
+  rm="$(kc_get "/$KC_REALM/clients?clientId=realm-management" | jq -r '.[0].id // empty')"
+  [ -n "$sa" ] && [ -n "$rm" ] || { warn "    portcullis-enroll: service account or realm-management missing"; return 0; }
+  roles="$(kc_get "/$KC_REALM/clients/$rm/roles" | jq -c '[.[] | select(.name == "view-users" or .name == "manage-users")]')"
+  code="$(printf '%s' "$roles" | kc_send POST "/$KC_REALM/users/$sa/role-mappings/clients/$rm")"
+  _kc_report "portcullis-enroll: view-users, manage-users" "$code" 204 || true
+}
+
+# _kc_admin_roles — members of the LLDAP group lldap_admin administer the
+# portcullis realm (realm-management realm-admin) with their normal
+# passkey session at https://auth.<domain>/admin/portcullis/console/. The
+# group appears in Keycloak through the LDAP group mapper; sync it first.
+_kc_admin_roles() {
+  local comp mapper gid client role code
+  comp="$(kc_get "/$KC_REALM/components?type=org.keycloak.storage.UserStorageProvider" | jq -r '[.[]? | select(.providerId == "ldap")][0].id // empty')"
+  mapper="$(kc_get "/$KC_REALM/components?parent=$comp" | jq -r '[.[]? | select(.providerId == "group-ldap-mapper")][0].id // empty')"
+  if [ -n "$comp" ] && [ -n "$mapper" ]; then
+    code="$(kc_send POST "/$KC_REALM/user-storage/$comp/mappers/$mapper/sync?direction=fedToKeycloak" < /dev/null)"
+    _kc_report "sync LLDAP groups" "$code" 200 204 || true
+  fi
+  gid="$(kc_get "/$KC_REALM/groups?search=lldap_admin&exact=true" | jq -r '[.[]? | select(.name == "lldap_admin")][0].id // empty')"
+  client="$(kc_get "/$KC_REALM/clients?clientId=realm-management" | jq -r '.[0].id // empty')"
+  [ -n "$gid" ] && [ -n "$client" ] || { warn "    group lldap_admin or client realm-management not found — realm console access not granted"; return 0; }
+  if kc_get "/$KC_REALM/groups/$gid/role-mappings/clients/$client" | jq -e 'any(.[]?; .name == "realm-admin")' >/dev/null; then
+    echo "    lldap_admin: realm-admin"
+    return 0
+  fi
+  role="$(kc_get "/$KC_REALM/clients/$client/roles/realm-admin")"
+  code="$(printf '[%s]' "$role" | kc_send POST "/$KC_REALM/groups/$gid/role-mappings/clients/$client")"
+  _kc_report "lldap_admin: realm-admin of $KC_REALM" "$code" 204 || true
+}
+
 # _oidc_client <client-id> <secret-var> <redirect-uri> <name> — create the
 # client if missing, then push the secret from .env (the realm export,
 # auto-imported at Keycloak's first start, carries a placeholder secret).
@@ -329,7 +575,13 @@ Idempotent post-start configuration of the portcullis realm via the admin
 API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
   - imports keycloak/realm-export.json if the realm does not exist
   - points the LDAP federation at LLDAP (LLDAP_BASE_DN, LLDAP_ADMIN_PASSWORD)
-  - sets the ACR→LoA map and browserFlow=portcullis-universal
+  - sets the ACR→LoA map, sslRequired=external and browserFlow=portcullis-universal
+  - rebuilds every top-level flow of the file whose tree changed (passkey-only
+    browser flow, the invite identity provider's first-login / post-login flows)
+  - the invite identity provider portcullis-invite (enroll; URLs + client
+    secret from secrets/enroll/invite-client-secret) and the service-account
+    client portcullis-enroll (view-users, manage-users)
+  - lldap_admin = realm-admin of the portcullis realm (realm console)
   - pushes the X.509 authenticator settings from the file (CRL check against
     Vault's pki_int CRL, trust re-validation, clientAuth EKU) to the realm
   - checks AMR reference values, ensures the amr mapper and groups scope
@@ -340,7 +592,7 @@ API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
 
 Options:
   --wipe-realm   delete the realm first and re-import it from the file
-                 (needed to apply auth-flow changes; clients must then be
+                 (users' passkeys are lost; clients must then be
                  re-registered with `portcullis oidc register`)
 EOF
 }
