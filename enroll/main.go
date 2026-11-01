@@ -657,6 +657,9 @@ func (s *Server) handleAPIUsers(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "invite" {
+		os.Exit(runInviteCommand(os.Args[2:]))
+	}
 	cfg := loadConfig()
 	srv := &Server{cfg: cfg}
 
@@ -679,6 +682,38 @@ func main() {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Write([]byte("ok\n"))
 	})
+
+	// One-time invites (invite.go): public /invite/* on this port, the
+	// Keycloak-only OIDC endpoints and the invite API on ports Traefik does
+	// not route.
+	secretDir := envOr("ENROLL_SECRETS_DIR", "/run/secrets/portcullis-enroll")
+	clientSecret, err := readInviteSecret(secretDir + "/invite-client-secret")
+	if err != nil {
+		log.Printf("WARNING: invite login disabled: %v", err)
+	}
+	apiSecret, err := readInviteSecret(secretDir + "/invite-api-secret")
+	if err != nil {
+		log.Printf("WARNING: Hub invite API disabled: %v", err)
+	}
+	kc := newKeycloakClient(envOr("KEYCLOAK_URL", "http://keycloak:8080"), "portcullis", "portcullis-enroll", secretDir+"/keycloak-client-secret")
+	inv, err := newInviteService(cfg.Domain, clientSecret, apiSecret, cfg.getUser, kc.RequirePasskey)
+	if err != nil {
+		log.Fatalf("invite service: %v", err)
+	}
+	inv.register(mux)
+	for _, l := range []struct {
+		addr string
+		h    http.Handler
+	}{
+		{envOr("INVITE_OIDC_ADDR", ":8445"), inv.internalHandler()},
+		{inviteAPIAddr, inv.apiHandler(false)},
+		{inviteLocalAddr, inv.apiHandler(true)},
+	} {
+		go func(addr string, h http.Handler) {
+			s := &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 10 * time.Second}
+			log.Fatal(s.ListenAndServe())
+		}(l.addr, l.h)
+	}
 
 	// Surface Vault credential problems at start-up (non-fatal: the files
 	// may be written by `portcullis vault init` after enroll starts; every request

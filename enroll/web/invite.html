@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="referrer" content="no-referrer">
+  <title>Portcullis - Set up your passkey</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; line-height: 1.6; }
+    main { max-width: 34rem; margin: 4rem auto; padding: 2rem; background: #1e293b; border-radius: 0.75rem; }
+    h1 { font-size: 1.5rem; color: #f1f5f9; margin-bottom: 1rem; }
+    p { color: #cbd5e1; margin-bottom: 1rem; }
+    .muted { color: #94a3b8; font-size: 0.875rem; }
+    .btn { display: inline-block; padding: 0.7rem 1.6rem; background: #2563eb; color: #fff; border: none; border-radius: 0.4rem; font-size: 1rem; font-weight: 600; cursor: pointer; }
+    .btn:hover { background: #1d4ed8; }
+    .btn:focus-visible { outline: 3px solid #f59e0b; outline-offset: 2px; }
+    .error { background: #7f1d1d; color: #fecaca; padding: 1rem; border-radius: 0.5rem; }
+  </style>
+</head>
+<body>
+<main>
+{{if .Error}}
+  <h1>Setup link not usable</h1>
+  <p class="error" role="alert">{{.Error}}</p>
+{{else}}
+  <h1>Set up your passkey</h1>
+  <p>Hello <strong>{{.User}}</strong>. Register your security key (YubiKey) or passkey for <strong>{{.Domain}}</strong>: after that you are signed in, and from then on you sign in with one touch of the key.</p>
+  <p class="muted">This link works once and expires {{.Expires}}. Have the key ready; you will be asked to touch it and to set or enter its PIN.</p>
+  <form method="post">
+    <button class="btn" type="submit" id="invite-continue" autofocus>Register my key</button>
+  </form>
+{{end}}
+</main>
+</body>
+</html>
