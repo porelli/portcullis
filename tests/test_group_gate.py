@@ -857,6 +857,25 @@ class PolicyV4Test(GateTest):
         status, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
         self.assertEqual(hdrs.get("X-Forwarded-Attr-City").encode("latin-1").decode("utf-8"), "Zürich, 東京")
 
+    def test_invalid_attribute_field_skipped_not_file(self):
+        # A field the Hub's rule now forbids (dept_ -> "Dept-", a__b ->
+        # "A--B", an over-long name) is skipped; the other fields still
+        # produce their headers.
+        long_name = "a" * 32
+        write_attrs({"version": 1,
+                     "fields": {"city": "City", "dept_": "Dept-", "a__b": "A--B", long_name: "A" * 32,
+                                "Bad": "Bad", "ok_1": "Ok-1"},
+                     "users": {"bob": {"city": ["Milan"], "dept_": ["x"], "a__b": ["y"], long_name: ["z"],
+                                       "Bad": ["w"], "ok_1": ["v"]}}})
+        status, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
+        self.assertEqual(status, 200)
+        attrs = {k: v for k, v in hdrs.items() if k.lower().startswith("x-forwarded-attr-")}
+        self.assertEqual(attrs, {"X-Forwarded-Attr-City": "Milan", "X-Forwarded-Attr-Ok-1": "v"})
+        self.assertEqual(sorted(gg.parse_user_attributes(
+            {"version": 1, "fields": {"city": "City", "dept_": "Dept-"},
+             "users": {"bob": {"city": ["Milan"], "dept_": ["x"]}}})["bob"]),
+            [("X-Forwarded-Attr-City", "Milan")])
+
     def test_attribute_headers_missing_or_corrupt_file_never_denies(self):
         for doc in (None, "{not json", [], {"version": 2, "fields": {}, "users": {}},
                     {"version": 1, "fields": {"city": "City\r\nX: y"}, "users": {"bob": {"city": ["Milan"]}}},

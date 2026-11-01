@@ -95,9 +95,10 @@ Config sources (both re-read on every request; they are tiny):
      "users": {"<user>": {"<field>": ["value", ...]}}}. Every allow on / and
     /authenticated returns X-Forwarded-Attr-<Header-Name>: control
     characters stripped, values over 1 KB dropped (logged), `%` -> `%25`
-    and `,` -> `%2C` in each value, values joined with ", ". Missing /
-    corrupt file (logged; also two fields on one header, case-insensitive)
-    = no attribute headers, never a deny.
+    and `,` -> `%2C` in each value, values joined with ", ". A field whose
+    name or header name is invalid is skipped (logged); missing / corrupt
+    file (logged; also two fields on one header, case-insensitive) = no
+    attribute headers, never a deny.
   - Token headers: Authorization / X-Forwarded-Access-Token are echoed on
     allow (portcullis-groups lists them in authResponseHeaders) unless an
     expired membership was stripped for the request — the token still
@@ -454,7 +455,9 @@ ATTRIBUTES_FILE = os.environ.get("GATE_ATTRIBUTES_FILE",
                                  os.path.join(os.path.dirname(POLICY_FILE), "user-attributes.json"))
 ATTR_HEADER_PREFIX = "X-Forwarded-Attr-"
 ATTR_VALUE_MAX = 1024  # bytes (UTF-8) per value; longer values are dropped
-_ATTR_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
+# Field names (contract §4.1): '_' only between letters/digits, <= 31 chars,
+# so the header mapping is injective and always a valid header name.
+_ATTR_FIELD_RE = re.compile(r"^(?=.{1,31}$)[a-z][a-z0-9]*(_[a-z0-9]+)*$")
 _ATTR_HEADER_RE = re.compile(r"^[A-Za-z0-9]+(-[A-Za-z0-9]+){0,30}$")
 _ATTR_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _ATTR_CACHE: dict = {"key": None, "users": {}}
@@ -484,14 +487,20 @@ def parse_user_attributes(doc) -> dict:
     if not isinstance(fields, dict) or not isinstance(users, dict):
         raise AttributesError("'fields' / 'users' is not an object")
     seen_headers = {}
+    valid = {}
     for name, header in fields.items():
         if not _ATTR_FIELD_RE.match(name) or not isinstance(header, str) or not _ATTR_HEADER_RE.match(header):
-            raise AttributesError(f"invalid field {name!r} -> {header!r}")
+            # One bad field doesn't cost every other field its header: it is
+            # skipped (logged once per file version: the result is cached).
+            print(f"group-gate: skipping invalid attribute field {name!r} -> {header!r} in {ATTRIBUTES_FILE}", flush=True)
+            continue
         # Header names are case-insensitive: two fields on one header would
         # merge their values.
         other = seen_headers.setdefault(header.lower(), name)
         if other != name:
             raise AttributesError(f"fields {other!r} and {name!r} map to the same header {header!r}")
+        valid[name] = header
+    fields = valid
     out = {}
     for user, values in users.items():
         if not isinstance(values, dict):
