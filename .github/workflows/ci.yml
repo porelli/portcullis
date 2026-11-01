@@ -181,6 +181,11 @@ jobs:
                  .services["group-gate"].labels["traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeaders"]]
               | all(split(",") | index("X-Auth-Request-Preferred-Username") and index("X-Forwarded-User") and index("X-Auth-Request-User"))' >/dev/null \
             || { echo "FAIL: identity headers missing from a forward-auth authResponseHeaders"; exit 1; }
+          # Expired memberships: group-gate must be able to withhold the token
+          # headers, so portcullis-groups lists them (Traefik deletes unreturned ones).
+          echo "$CFG" | jq -e '.services["group-gate"].labels["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders"]
+              | split(",") | index("Authorization") and index("X-Forwarded-Access-Token")' >/dev/null \
+            || { echo "FAIL: portcullis-groups does not list Authorization / X-Forwarded-Access-Token"; exit 1; }
           if grep -nE '^\s*userIDClaim:' oauth2-proxy/alpha.yaml; then echo "FAIL: userIDClaim is an alias of emailClaim in oauth2-proxy v7"; exit 1; fi
           echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring"
 
@@ -927,7 +932,7 @@ jobs:
           [ "$(gated /administrator -H 'X-Auth-Request-Groups: users_ci')" = 200 ] || { echo "FAIL: /administrator denied"; exit 1; }
           [ "$(gated /x%00 --path-as-is -H 'X-Auth-Request-Groups: users_ci')" = 403 ] || { echo "FAIL: NUL path allowed"; exit 1; }
           [ "$(gated / -H 'X-Auth-Request-Groups: other')" = 403 ] || { echo "FAIL: subdomain group not enforced"; exit 1; }
-          echo '{}' | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a sh -c 'cat > /d/group-gate-policy.json'
+          echo '{"version":4}' | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a sh -c 'cat > /d/group-gate-policy.json'
           echo "PASS: path_groups enforced on Traefik's X-Forwarded-Uri (bypass variants denied)"
 
           # Attribute headers (contract §5): group-gate's reach the app, the
@@ -981,7 +986,7 @@ jobs:
             -H 'X-Forwarded-Attr-City: Forged' https://public.portcullis.local/s/AbC123 > /tmp/pub-attrs.out || true
           grep -q 'Hostname' /tmp/pub-attrs.out || { echo "FAIL: public path not served"; cat /tmp/pub-attrs.out; exit 1; }
           if grep -qi 'Forged' /tmp/pub-attrs.out; then echo "FAIL: forged X-Forwarded-Attr-* reached a public router's app"; exit 1; fi
-          echo '{}' | policy
+          echo '{"version":4}' | policy
           echo "PASS: public guard: only published paths, no credentials (PHP-normalised names)"
 
       - name: Test the socket proxies

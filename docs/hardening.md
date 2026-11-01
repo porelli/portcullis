@@ -126,11 +126,13 @@ Therefore:
   `/authenticated`, app and core subdomains alike) it also returns
   `X-Forwarded-Attr-<Header-Name>` for the signed-in user's shared custom
   fields, read from the Hub's `user-attributes.json` in `hub_data`
-  (contract §4.1/§5): values joined with `, `, control characters
-  (0x00–0x1F, 0x7F) stripped, values over 1 KB dropped and logged, non-ASCII
-  as UTF-8 bytes. A missing or corrupt file (logged) means no attribute
-  headers, never a deny; header names must match
-  `^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$`. `portcullis-groups` forwards them with
+  (contract §4.1/§5): control characters (0x00–0x1F, 0x7F) stripped,
+  values over 1 KB dropped and logged, then `%` → `%25` and `,` → `%2C` in
+  every value (so `Doe, Jane` stays one value; apps percent-decode each
+  item) and the values joined with `, `; non-ASCII as UTF-8 bytes. A
+  missing or corrupt file (logged) means no attribute headers, never a
+  deny; header names must match `^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$` and be
+  unique case-insensitively (two fields on one header = corrupt). `portcullis-groups` forwards them with
   `authResponseHeadersRegex: ^X-Forwarded-Attr-`. A headers middleware can
   only delete headers by exact name (and the field names are the Hub's), so
   client-sent `X-Forwarded-Attr-*` are deleted by the same regex on every
@@ -139,12 +141,24 @@ Therefore:
   before copying the auth server's. Public routers therefore get none, and
   `_` aliases are dropped by the entrypoints (`aliasHeadersStrategy`). CI
   sends forged ones through the gated and public test routers.
+  Routers with **no** forwardAuth middleware (`keycloak`,
+  `keycloak-resources`, `lldap` (redirect only), `vault-ui`,
+  `enroll-invite`, and in the app overlays `headscale`, `netbird-*`,
+  `docs`) do not strip client-sent `X-Forwarded-Attr-*`: their backends
+  must never trust those headers (none of them reads them today).
 - Temporary memberships: the policy file (version 4, the only version
   group-gate serves) lists `expiring` `{user, group, at}` entries; group-gate
   treats a membership as absent once `now >= at` — for the subdomain and
   path-group checks and in the `X-Auth-Request-Groups` it returns —
   whatever the token says, so expiry holds even while the Hub is down.
-  A malformed entry denies (fail closed).
+  A malformed entry denies (fail closed). The access token still names the
+  expired group, so when group-gate strips a membership it withholds
+  `Authorization` and `X-Forwarded-Access-Token` (both are
+  `portcullis-groups` `authResponseHeaders`, so Traefik deletes them);
+  otherwise it echoes them unchanged (apps keep the token, the Keycloak
+  console behind `portcullis-auth-console` keeps its own bearer).
+  Only version 4 is served: a file without `version` denies as well; only
+  a missing file means "nothing published".
 - `people.<domain>` (the Hub's directory listener `:8889`, contract §5.1)
   is open to any signed-in user: `people=*` in `group-gate-map.conf` (`*` is
   valid only there; in the policy file's `groups` it is ignored, in

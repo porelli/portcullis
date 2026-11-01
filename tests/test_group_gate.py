@@ -37,7 +37,11 @@ gg = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gg)
 
 
-def write_policy(doc):
+def write_policy(doc, raw=False):
+    # Only version 4 is served: a dict without "version" gets 4 unless the
+    # test is about the version itself (raw=True).
+    if isinstance(doc, dict) and not raw and "version" not in doc:
+        doc = dict(doc, version=4)
     if doc is None:
         if os.path.exists(POLICY):
             os.remove(POLICY)
@@ -352,13 +356,13 @@ class GateTest(unittest.TestCase):
 
     def test_policy_version(self):
         # group-gate serves only version 4 (contract §4); a file without
-        # `version` is treated as empty for the missing keys.
-        for doc, want in [({"version": 4}, 200), ({}, 200),
+        # `version` denies, only a missing file is "nothing published".
+        for doc, want in [({"version": 4}, 200), (None, 200), ({}, 403), ({"groups": {}}, 403),
                           ({"version": 3}, 403), ({"version": 2}, 403), ({"version": 1}, 403),
                           ({"version": 5}, 403), ({"version": "4"}, 403), ({"version": True}, 403),
                           ({"version": 0}, 403)]:
             with self.subTest(doc=doc):
-                write_policy(doc)
+                write_policy(doc, raw=True)
                 self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), want)
 
     # ── healthz / authenticated-only ──
@@ -629,7 +633,7 @@ class PublicGuardTest(GateTest):
                     {"version": 4, "public_paths": {"cloud": {"paths": [{"path": "/s", "match": "regex"}]}}},
                     "not json"]:
             with self.subTest(doc=doc):
-                write_policy(doc)
+                write_policy(doc, raw=True)
                 self.assertEqual(self.guard("/s/AbC123"), 403)
         write_policy(PUBLIC_DOC)
         for host in ["other.example.com", "cloud.evil.com", "hub.example.com", ""]:
@@ -737,6 +741,32 @@ class PolicyV4Test(GateTest):
         self.assertEqual(status, 200)
         self.assertNotIn("X-Auth-Request-Groups", hdrs)
 
+    def test_token_headers_echoed_unless_membership_expired(self):
+        tok = {"Authorization": "Bearer abc.def.ghi", "X-Forwarded-Access-Token": "abc.def.ghi"}
+        write_policy({"version": 4, "groups": {"app": "a"},
+                      "expiring": [{"user": "bob", "group": "b", "at": FUTURE}]})
+        status, hdrs = self.req("app.example.com", groups="a,b", extra=tok, want_headers=True)
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs.get("Authorization"), "Bearer abc.def.ghi")
+        self.assertEqual(hdrs.get("X-Forwarded-Access-Token"), "abc.def.ghi")
+        # Keycloak console routes: only the console's own bearer, echoed as-is.
+        status, hdrs = self.req("auth.example.com", groups="lldap_admin", want_headers=True,
+                                extra={"Authorization": "Bearer console"})
+        self.assertEqual((status, hdrs.get("Authorization")), (200, "Bearer console"))
+        self.assertNotIn("X-Forwarded-Access-Token", hdrs)
+        # An expired membership was stripped: the token still names it, so
+        # neither token header is returned (Traefik deletes them).
+        write_policy({"version": 4, "groups": {"app": "a"},
+                      "expiring": [{"user": "bob", "group": "b", "at": PAST}]})
+        status, hdrs = self.req("app.example.com", groups="a,b", extra=tok, want_headers=True)
+        self.assertEqual(status, 200)
+        self.assertNotIn("Authorization", hdrs)
+        self.assertNotIn("X-Forwarded-Access-Token", hdrs)
+        self.assertEqual(hdrs.get("X-Auth-Request-Groups"), "a")
+        # An expiry for a group the token doesn't carry changes nothing.
+        status, hdrs = self.req("app.example.com", groups="a", extra=tok, want_headers=True)
+        self.assertEqual(hdrs.get("Authorization"), "Bearer abc.def.ghi")
+
     def test_not_yet_expired_kept(self):
         write_policy({"version": 4, "groups": {"app": "b"},
                       "expiring": [{"user": "bob", "group": "b", "at": FUTURE}]})
@@ -813,6 +843,15 @@ class PolicyV4Test(GateTest):
                                 extra={"X-Auth-Request-Preferred-Username": "carol"})
         self.assertEqual(status, 200)
         self.assertFalse([k for k in hdrs if k.lower().startswith("x-forwarded-attr-")])
+        # `%` and `,` are percent-encoded in every value (single ones too), so
+        # the ", " separator is unambiguous.
+        write_attrs({"version": 1, "fields": {"name": "Name", "quota": "Quota"},
+                     "users": {"bob": {"name": ["Doe, Jane", "Roe,Rick"], "quota": ["100%,%2C"]}}})
+        status, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
+        self.assertEqual(hdrs.get("X-Forwarded-Attr-Name"), "Doe%2C Jane, Roe%2CRick")
+        self.assertEqual(hdrs.get("X-Forwarded-Attr-Quota"), "100%25%2C%252C")
+        self.assertEqual([urllib.parse.unquote(v) for v in hdrs["X-Forwarded-Attr-Name"].split(", ")],
+                         ["Doe, Jane", "Roe,Rick"])
         # Non-ASCII values travel as UTF-8 bytes.
         write_attrs({"version": 1, "fields": {"city": "City"}, "users": {"bob": {"city": ["Zürich", "東京"]}}})
         status, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
@@ -823,7 +862,10 @@ class PolicyV4Test(GateTest):
                     {"version": 1, "fields": {"city": "City\r\nX: y"}, "users": {"bob": {"city": ["Milan"]}}},
                     {"version": 1, "fields": {"city": "City"}, "users": {"bob": {"city": "Milan"}}},
                     {"version": 1, "fields": {"City!": "City"}, "users": {"bob": {"City!": ["Milan"]}}},
-                    {"version": 1, "fields": [], "users": {}}):
+                    {"version": 1, "fields": [], "users": {}},
+                    # two fields on one header (header names are case-insensitive)
+                    {"version": 1, "fields": {"city": "City", "town": "CITY"},
+                     "users": {"bob": {"city": ["Milan"], "town": ["Rome"]}}}):
             with self.subTest(doc=doc):
                 write_attrs(doc)
                 status, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)

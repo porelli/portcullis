@@ -604,7 +604,11 @@ services:
       traefik.http.middlewares.portcullis-groups.forwardauth.trustForwardHeader: "true"
       # group-gate reads the username from X-Auth-Request-Preferred-Username
       # (set by portcullis-auth, which must run first) and denies without it.
-      traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email
+      # Authorization / X-Forwarded-Access-Token: group-gate echoes them
+      # unchanged on allow (the Keycloak console keeps its own bearer behind
+      # portcullis-auth-console) and withholds both when it stripped an
+      # expired membership the token still names — Traefik then deletes them.
+      traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,Authorization,X-Forwarded-Access-Token
       # The user's shared custom fields (user-attributes.json in hub_data,
       # contract §4.1/§5) on every allowed request; client copies are deleted
       # first (forwardAuth removes all request headers matching the regex).

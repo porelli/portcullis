@@ -86,16 +86,22 @@ Config sources (both re-read on every request; they are tiny):
                      "at": "<RFC 3339 UTC>"}]}
     Every map is keyed by the lowercase subdomain the request is for —
     never by template ID. Optional; no file means every app falls through to the group check
-    only. Missing keys (incl. `version`) are treated as empty. A file that
-    exists but cannot be parsed, any `version` other than 4, or a policy /
-    expiry with unknown factor names / op / rule shape fails CLOSED (403).
+    only. Missing keys (other than `version`) are treated as empty. A file
+    that exists but cannot be parsed, has no `version` or any `version`
+    other than 4, or a policy / expiry with unknown factor names / op /
+    rule shape fails CLOSED (403).
   - /hub-data/user-attributes.json — written by the Hub (contract §4.1):
     {"version": 1, "fields": {"<field>": "<Header-Name>"},
      "users": {"<user>": {"<field>": ["value", ...]}}}. Every allow on / and
-    /authenticated returns X-Forwarded-Attr-<Header-Name>: values joined
-    with ", ", control characters stripped, values over 1 KB dropped
-    (logged). Missing / corrupt file (logged) = no attribute headers, never
-    a deny.
+    /authenticated returns X-Forwarded-Attr-<Header-Name>: control
+    characters stripped, values over 1 KB dropped (logged), `%` -> `%25`
+    and `,` -> `%2C` in each value, values joined with ", ". Missing /
+    corrupt file (logged; also two fields on one header, case-insensitive)
+    = no attribute headers, never a deny.
+  - Token headers: Authorization / X-Forwarded-Access-Token are echoed on
+    allow (portcullis-groups lists them in authResponseHeaders) unless an
+    expired membership was stripped for the request — the token still
+    names the group, so it is withheld and Traefik deletes it.
 
 Host handling: X-Forwarded-Host is normalised (lowercased, port and
 trailing dot stripped) because Traefik's Host() matcher is
@@ -150,7 +156,8 @@ VALID_OPS = ("", "any", "all")
 # The one policy-file schema version this gate serves (contract §4): any
 # other `version` denies (an older file lacks `expiring`, so a temporary
 # membership would never end; a newer one may carry restrictions we would
-# drop). A file without `version` is treated as empty for missing keys.
+# drop). A file without `version` denies too; only a missing FILE means
+# "nothing published" (empty policy).
 POLICY_VERSION = 4
 # /public-guard needs a file of exactly this version (no `version` = deny).
 PUBLIC_GUARD_VERSION = 4
@@ -243,11 +250,12 @@ _POLICY_LOCK = threading.Lock()
 
 def _read_policy_doc():
     """Parsed policy file, cached on (path, inode, mtime, size): the Hub
-    replaces it atomically (rename), so any change gives a new key."""
+    replaces it atomically (rename), so any change gives a new key.
+    None when the file does not exist."""
     try:
         st = os.stat(POLICY_FILE)
     except FileNotFoundError:
-        return {}
+        return None
     except OSError as e:
         raise PolicyError(f"cannot read policy file: {e}") from e
     key = (POLICY_FILE, st.st_ino, st.st_mtime_ns, st.st_size)
@@ -258,7 +266,7 @@ def _read_policy_doc():
         with open(POLICY_FILE) as f:
             doc = json.load(f)
     except FileNotFoundError:
-        return {}
+        return None
     except (OSError, ValueError) as e:
         raise PolicyError(f"cannot read policy file: {e}") from e
     with _POLICY_LOCK:
@@ -368,21 +376,22 @@ def render_portal(user: str, groups: set, apps, domain: str) -> bytes:
 
 
 def load_policy_file() -> dict:
-    """Return the Hub policy doc, {} if the file is absent.
+    """Return the Hub policy doc, {} if the file is absent (nothing
+    published yet).
 
-    Raises PolicyError if the file exists but is not a JSON object — a
-    broken policy must not silently downgrade apps to "no policy". Callers
-    must not modify the returned (cached) document.
+    Raises PolicyError if the file exists but is not a JSON object or its
+    `version` is not exactly POLICY_VERSION (a missing `version` included) —
+    a broken or foreign policy must not silently downgrade apps to "no
+    policy". Callers must not modify the returned (cached) document.
     """
     doc = _read_policy_doc()
+    if doc is None:
+        return {}
     if not isinstance(doc, dict):
         raise PolicyError("policy file is not a JSON object")
     version = doc.get("version")
-    if version is not None:
-        if isinstance(version, bool) or not isinstance(version, int) or version < 1:
-            raise PolicyError(f"invalid policy file version {version!r}")
-        if version != POLICY_VERSION:
-            raise PolicyError(f"policy file version {version} is not supported (only {POLICY_VERSION})")
+    if isinstance(version, bool) or version != POLICY_VERSION:
+        raise PolicyError(f"policy file version {version!r} is not supported (only {POLICY_VERSION})")
     return doc
 
 
@@ -456,19 +465,33 @@ class AttributesError(Exception):
     pass
 
 
+def attr_encode(value: str) -> str:
+    """Percent-encode the two characters that would make a joined header
+    value ambiguous: `%` (first) and the `,` separator."""
+    return value.replace("%", "%25").replace(",", "%2C")
+
+
 def parse_user_attributes(doc) -> dict:
     """{lowercase user: [(header, value)]} from a user-attributes.json
     document; raises AttributesError if it is malformed. Control characters
     are stripped from every value; values longer than ATTR_VALUE_MAX bytes
-    are dropped (logged, never truncated). Values are joined with ", "."""
+    are dropped (logged, never truncated). In every value `%` becomes `%25`
+    and `,` becomes `%2C` (so "Doe, Jane" stays one value), then the values
+    are joined with ", "."""
     if not isinstance(doc, dict) or doc.get("version") != 1:
         raise AttributesError("not a version 1 document")
     fields, users = doc.get("fields", {}), doc.get("users", {})
     if not isinstance(fields, dict) or not isinstance(users, dict):
         raise AttributesError("'fields' / 'users' is not an object")
+    seen_headers = {}
     for name, header in fields.items():
         if not _ATTR_FIELD_RE.match(name) or not isinstance(header, str) or not _ATTR_HEADER_RE.match(header):
             raise AttributesError(f"invalid field {name!r} -> {header!r}")
+        # Header names are case-insensitive: two fields on one header would
+        # merge their values.
+        other = seen_headers.setdefault(header.lower(), name)
+        if other != name:
+            raise AttributesError(f"fields {other!r} and {name!r} map to the same header {header!r}")
     out = {}
     for user, values in users.items():
         if not isinstance(values, dict):
@@ -487,7 +510,7 @@ def parse_user_attributes(doc) -> dict:
                           f"for user {user!r} (limit {ATTR_VALUE_MAX})", flush=True)
                     continue
                 if v:
-                    kept.append(v)
+                    kept.append(attr_encode(v))
             if kept:
                 headers.append((ATTR_HEADER_PREFIX + fields[name], ", ".join(kept)))
         if headers:
@@ -1416,7 +1439,15 @@ def session_username(req_headers) -> str:
     return (req_headers.get(USERNAME_HEADER, "") or "").strip()
 
 
-def identity_headers(req_headers, groups: Optional[str] = None) -> dict:
+# Token headers portcullis-auth sets and portcullis-groups lists in its
+# authResponseHeaders: echoed unchanged on allow (apps keep the token, the
+# Keycloak console keeps its own bearer: portcullis-auth-console leaves
+# Authorization alone), OMITTED when an expired membership was stripped —
+# the token still carries the expired group, so Traefik must drop it.
+TOKEN_HEADERS = ("Authorization", "X-Forwarded-Access-Token")
+
+
+def identity_headers(req_headers, groups: Optional[str] = None, omit_tokens: bool = False) -> dict:
     """Identity headers group-gate returns on ALLOW (Traefik copies them onto
     the upstream request: they are this middleware's authResponseHeaders, so
     Traefik first deletes any client-supplied copies).
@@ -1446,6 +1477,11 @@ def identity_headers(req_headers, groups: Optional[str] = None) -> dict:
     # (the caller passes the filtered list).
     if groups:
         out["X-Auth-Request-Groups"] = groups
+    if not omit_tokens:
+        for name in TOKEN_HEADERS:
+            value = req_headers.get(name)
+            if value:
+                out[name] = value
     return out
 
 
@@ -1465,7 +1501,9 @@ class Handler(BaseHTTPRequestHandler):
     def _allow(self, groups_header: Optional[str] = None, username: str = ""):
         METRICS.inc("group_gate_requests_total", endpoint=self._endpoint, result="allow")
         self.send_response(200)
-        for name, value in identity_headers(self.headers, groups_header).items():
+        # groups_header is set only when expired memberships were stripped.
+        for name, value in identity_headers(self.headers, groups_header,
+                                            omit_tokens=groups_header is not None).items():
             self.send_header(name, value)
         # Attribute headers (contract §5): only on allow; Traefik forwards
         # them through authResponseHeadersRegex ^X-Forwarded-Attr- (which
@@ -1758,7 +1796,8 @@ class Handler(BaseHTTPRequestHandler):
         if expired & groups:
             groups -= expired
             groups_header = ",".join(g for g in (x.strip() for x in groups_raw.split(",")) if g and g in groups)
-            print(f"group-gate: user={user} expired memberships ignored: {sorted(expired)}", flush=True)
+            print(f"group-gate: user={user} expired memberships ignored: {sorted(expired)} "
+                  f"(token headers withheld)", flush=True)
 
         # --- Auth policy check (optional, only when policy is set) ---
         if policy:
