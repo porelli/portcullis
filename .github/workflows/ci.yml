@@ -965,27 +965,28 @@ jobs:
           echo "PASS: Hub runs as 10001 without the socket, sees only the env subset, enforces the proxy secret"
 
           # Product default: on a fresh install (no admin choice yet) the Hub
-          # publishes {factors: [webauthn]} as the default auth policy, and
-          # group-gate applies it to every app subdomain without its own
-          # policy — here the ci-gated test app (valid cert, no WebAuthn
-          # session → step-up 403).
+          # publishes {factors: [mtls, webauthn], op: any} (a hardware factor:
+          # passkey or client cert) as the default auth policy, and group-gate
+          # applies it to every app subdomain without its own policy — here
+          # the ci-gated test app (a cert on the request but no session with
+          # amr mtls / hwk → step-up 403).
           hubapi() { curl -s -H @<(printf 'X-Portcullis-Proxy-Secret: %s\n' "$SECRET") "$@"; }
           policy_file() { docker run --rm -v portcullis_hub_data:/d:ro alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a cat /d/group-gate-policy.json 2>/dev/null; }
           gated() { curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt \
                       --resolve "gated.portcullis.local:443:127.0.0.1" -H 'X-Auth-Request-Preferred-Username: testuser' \
                       --cert /tmp/test-client.crt --key /tmp/test-client.key https://gated.portcullis.local/ || true; }
-          hubapi "http://$HUB_IP:8888/api/settings" | jq -e '.default_auth_policy.factors == ["webauthn"]' >/dev/null \
-            || { echo "FAIL: fresh Hub default policy is not webauthn: $(hubapi "http://$HUB_IP:8888/api/settings")"; exit 1; }
+          hubapi "http://$HUB_IP:8888/api/settings" | jq -e '(.default_auth_policy.factors | sort) == ["mtls", "webauthn"] and .default_auth_policy.op == "any"' >/dev/null \
+            || { echo "FAIL: fresh Hub default policy is not any of [mtls, webauthn]: $(hubapi "http://$HUB_IP:8888/api/settings")"; exit 1; }
           for i in $(seq 1 30); do
-            policy_file | jq -e '.version == 3 and .default.factors == ["webauthn"]' >/dev/null 2>&1 && break
-            [ "$i" -eq 30 ] && { echo "FAIL: Hub did not publish the webauthn default: $(policy_file)"; docker compose logs --tail=20 hub; exit 1; }
+            policy_file | jq -e '.version == 3 and (.default.factors | sort) == ["mtls", "webauthn"] and .default.op == "any"' >/dev/null 2>&1 && break
+            [ "$i" -eq 30 ] && { echo "FAIL: Hub did not publish the any-of [mtls, webauthn] default: $(policy_file)"; docker compose logs --tail=20 hub; exit 1; }
             sleep 2
           done
           code=$(gated)
-          [ "$code" = 403 ] || { echo "FAIL: gated app under the webauthn default without a WebAuthn session got $code"; exit 1; }
-          docker compose logs group-gate 2>&1 | grep -q "STEPUP user=testuser host=gated.portcullis.local policy={'factors': \['webauthn'\]" \
-            || { echo "FAIL: group-gate did not step up for the webauthn default"; docker compose logs --tail=10 group-gate; exit 1; }
-          echo "PASS: fresh Hub publishes default auth policy {factors: [webauthn]}; group-gate steps up apps without their own policy"
+          [ "$code" = 403 ] || { echo "FAIL: gated app under the hardware default without an mtls / hwk session got $code"; exit 1; }
+          docker compose logs group-gate 2>&1 | grep -E "STEPUP user=testuser host=gated.portcullis.local policy=\{'factors': \[('mtls', 'webauthn'|'webauthn', 'mtls')\], 'op': 'any'\}" >/dev/null \
+            || { echo "FAIL: group-gate did not step up for the any-of [mtls, webauthn] default"; docker compose logs --tail=10 group-gate; exit 1; }
+          echo "PASS: fresh Hub publishes default auth policy {factors: [mtls, webauthn], op: any}; group-gate steps up apps without their own policy"
 
           # The following tests (revocation) drive ci-gated with a client cert
           # only, i.e. they assume a public default: set it like an admin
@@ -1454,10 +1455,10 @@ jobs:
           kc "http://127.0.0.1:8080/admin/realms/portcullis/users/$KC_UID" | jq -e '(.requiredActions // []) == []' >/dev/null \
             || { echo "FAIL: e2e has required actions before redeeming its link"; exit 1; }
 
-          # group-gate policy (normally written by the Hub).
-          # Explicit public default: "app" is gated by groups / path_groups
-          # only (the Hub's built-in default would be webauthn).
-          printf '%s' '{"version": 2, "default": {"factors": [], "op": ""},
+          # group-gate policy (normally written by the Hub), with the Hub's
+          # fresh-install default: any of [mtls, webauthn]. "app" has no
+          # policy of its own (passkey and cert-only sessions must both pass).
+          printf '%s' '{"version": 2, "default": {"factors": ["mtls", "webauthn"], "op": "any"},
             "policies": {"hwk": {"factors": ["webauthn"], "op": ""}, "mtls": {"factors": ["mtls"], "op": ""}},
             "groups": {"app": "users_e2e", "hwk": "users_e2e", "mtls": "users_e2e"},
             "path_groups": {"app": [{"prefix": "/admin", "group": "admin_e2e"}]}}' \

@@ -4,8 +4,10 @@
 Runs in CI (job `e2e` in .github/workflows/ci.yml) against a full core stack
 plus a whoami test app with three hosts:
 
-  app.<domain>    users_e2e group; path_groups /admin -> admin_e2e
-  hwk.<domain>    policy: webauthn (the Hub's fresh-install default)
+  app.<domain>    users_e2e group; path_groups /admin -> admin_e2e; the
+                  default policy (the Hub's fresh-install default: any of
+                  mtls / webauthn)
+  hwk.<domain>    policy: webauthn
   mtls.<domain>   policy: mtls (X.509 login through Keycloak + mtls binding)
 
 Sign-in is passkey-only. Every user starts from a one-time setup link
@@ -13,7 +15,9 @@ Sign-in is passkey-only. Every user starts from a one-time setup link
 fails on ANY password field. Then: the session reaches the apps, a second
 login in a fresh browser is one passkey touch, the link is single use, a user
 outside the group is denied, the bootstrap admin's link lands on the portal
-with the Hub link, X.509 login / mtls binding / revocation / foreign CA.
+with the Hub link, X.509 login / mtls binding, a cert-only session (no
+authenticator) opens a default-policy app and renews its cert at /self,
+revocation / foreign CA.
 
 Browser: Playwright Chromium with a CDP virtual WebAuthn authenticator
 (CTAP2, USB, resident keys, user verification). The CA must be trusted by
@@ -36,6 +40,7 @@ Against a live server without certs: tests/e2e/e2e_invite.py.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -54,6 +59,7 @@ AUTH = f"https://auth.{DOMAIN}"
 APP = f"https://app.{DOMAIN}"
 HWK = f"https://hwk.{DOMAIN}"
 MTLS = f"https://mtls.{DOMAIN}"
+ENROLL = f"https://enroll.{DOMAIN}"
 PORTAL = f"https://{DOMAIN}/"
 
 os.makedirs(ART, exist_ok=True)
@@ -169,7 +175,7 @@ def main() -> int:
         def new_context(client_cert=None, storage_state=None, trace_name="ctx"):
             certs = []
             if client_cert:
-                certs = [dict(client_cert, origin=o) for o in (AUTH, APP, HWK, MTLS)]
+                certs = [dict(client_cert, origin=o) for o in (AUTH, APP, HWK, MTLS, ENROLL)]
             ctx = browser.new_context(client_certificates=certs, storage_state=storage_state)
             ctx.set_default_timeout(TIMEOUT_MS)
             ctx.tracing.start(screenshots=True, snapshots=True, name=trace_name)
@@ -343,6 +349,28 @@ def main() -> int:
             finally:
                 close(c2, "nocert")
         check("mtls session without the cert on the request is refused", binding_without_cert)
+
+        # The same browser has a cert and NO authenticator: a cert-only
+        # session (amr=[mtls]) under the Hub's default any of [mtls, webauthn].
+        def cert_only_default_app():
+            resp = page.goto(APP + "/", wait_until="domcontentloaded")
+            shot(page, "cert-only-app")
+            assert resp and resp.status == 200 and "Hostname" in page.inner_text("body"), \
+                f"default-policy app for a cert-only session: HTTP {resp and resp.status}"
+        check("cert-only session opens an app with the default policy (any of mtls / webauthn)", cert_only_default_app)
+
+        def cert_only_self_renewal():
+            resp = page.goto(ENROLL + "/self", wait_until="domcontentloaded")
+            shot(page, "cert-only-self")
+            assert resp and resp.status == 200 and "Additional authentication" not in page.content(), \
+                f"/self for a cert-only session: HTTP {resp and resp.status}"
+            csr = subprocess.run(["openssl", "req", "-new", "-key", os.environ["E2E_KEY"], "-subj", f"/CN={user}"],
+                                 check=True, capture_output=True, text=True).stdout
+            r = page.request.post(ENROLL + "/api/self/renew", data=json.dumps({"csr": csr}),
+                                  headers={"Content-Type": "application/json"})
+            assert r.status == 200, f"renewal: HTTP {r.status} {r.text()[:200]}"
+            assert "BEGIN CERTIFICATE" in r.json().get("certificate", ""), r.text()[:200]
+        check("cert-only session renews its own certificate at enroll /self", cert_only_self_renewal)
 
         def revoked_cert():
             subprocess.run(shlex.split(os.environ["E2E_REVOKE_CMD"]), check=True)
