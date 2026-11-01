@@ -188,6 +188,8 @@ auth in common apps (Gitea, Grafana, Wiki.js, pgAdmin, etc.).
 ├── scripts/lib/                    # CLI libraries, one per area (vault, pki, certs, keycloak, ...)
 ├── group-gate/
 │   ├── group-gate.py               # Per-subdomain group / path / policy / revocation gate
+│   ├── Dockerfile                  # Image portcullis-group-gate (pinned python base)
+│   ├── requirements.txt            # cryptography, PyJWT (pinned with hashes)
 │   └── group-gate-map.conf         # Core subdomain → required LLDAP group
 ├── templates/                      # Hub-generated copies of enabled app templates (gitignored)
 ├── vault/                          # Vault server config (raft), auto-unseal entrypoint, enroll policy

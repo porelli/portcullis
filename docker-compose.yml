@@ -536,23 +536,26 @@ services:
         condition: service_healthy
 
   group-gate:
-    image: python:3.15.2-alpine3.24@sha256:20a82dbc2783112ddb91d1534603f802d222a3e63e593cd002eb2ac534e70211
+    # Built locally like enroll: pinned python base + group-gate/requirements.txt
+    # (pip --require-hashes) + the script. Named so ./portcullis backup can run
+    # its SQLite helpers in it (scripts/lib/backup.sh).
+    build:
+      context: ./group-gate
+    image: portcullis-group-gate
     <<: *hardening
-    # Unprivileged uid with no home: reads only world-readable mounts.
+    # Unprivileged uid with no home (USER 10003 in group-gate/Dockerfile):
+    # reads only world-readable mounts.
     user: "10003:10003"
     read_only: true
     tmpfs:
       - /tmp
-    entrypoint: ["python3", "-u", "/app/group-gate.py"]
     volumes:
-      - ./group-gate/group-gate.py:/app/group-gate.py:ro
       - ./group-gate/group-gate-map.conf:/etc/group-gate/map.conf:ro
       # Hub writes per-app auth policies into this volume under group-gate-policy.json
       - hub_data:/hub-data:ro
       # Revoked client-cert serials, written by ./portcullis cert revoke|sync.
       - ./certs/revocation:/etc/group-gate/revocation:ro
     environment:
-      PYTHONDONTWRITEBYTECODE: "1"
       GATE_POLICY_FILE: /hub-data/group-gate-policy.json
       # Landing portal (https://<domain>/): the Hub's app list (contract §10).
       GATE_PORTAL_FILE: /hub-data/portal-apps.json

@@ -370,9 +370,12 @@ class GateTest(unittest.TestCase):
 
 
 def token(**claims):
+    """A well-formed JWT with a dummy signature (group-gate never verifies it:
+    oauth2-proxy did)."""
     import base64
-    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
-    return f"x.{payload}.y"
+    def b64(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+    return f"{b64({'alg': 'RS256', 'typ': 'JWT'})}.{b64(claims)}.c2lnbmF0dXJl"
 
 
 ADMIN_RULES = {"version": 2,
@@ -493,12 +496,14 @@ def _der_int(n):
     return _der(0x02, n.to_bytes(n.bit_length() // 8 + 1, "big", signed=True))
 
 
-def build_crl(serials, with_next_update=True, with_version=True):
-    """Structurally valid (unsigned) X.509 v2 CRL."""
+def build_crl(serials, with_next_update=True, with_version=True, next_update=None):
+    """Structurally valid (unsigned) X.509 v2 CRL. next_update: DER time
+    element (default: the UTCTime used for thisUpdate)."""
     alg = _der(0x30, _der(0x06, bytes.fromhex("2a8648ce3d040302")))  # ecdsa-with-SHA256
     issuer = _der(0x30, _der(0x31, _der(0x30, _der(0x06, b"\x55\x04\x03") + _der(0x0C, b"Test CA"))))
     t = _der(0x17, b"250101000000Z")
-    tbs = (_der_int(1) if with_version else b"") + alg + issuer + t + (t if with_next_update else b"")
+    nu = next_update or t
+    tbs = (_der_int(1) if with_version else b"") + alg + issuer + t + (nu if with_next_update else b"")
     if serials:
         tbs += _der(0x30, b"".join(_der(0x30, _der_int(sn) + t) for sn in serials))
     tbs += _der(0xA0, _der(0x30, b""))  # crlExtensions
@@ -1028,7 +1033,27 @@ class MetricsTest(GateTest):
     def test_parse_crl_next_update(self):
         self.assertEqual(gg.parse_crl(build_crl([1]))[1], 1735689600.0)
         self.assertIsNone(gg.parse_crl(build_crl([1], with_next_update=False))[1])
-        self.assertEqual(gg._der_time(b"20991231235959Z", 0x18, 0, 15), 4102444799.0)
+        # GeneralizedTime (dates from 2050 on)
+        gen = _der(0x18, b"20991231235959Z")
+        self.assertEqual(gg.parse_crl(build_crl([1], next_update=gen))[1], 4102444799.0)
+
+
+class JwtClaimsTest(unittest.TestCase):
+    """decode_jwt_payload: claims only, no verification (oauth2-proxy did it)."""
+
+    def test_claims_without_verification(self):
+        # Dummy signature, expired, foreign audience: still decoded.
+        self.assertEqual(gg.decode_jwt_payload(token(acr="hwk", amr=["hwk"], exp=1, aud="other")),
+                         {"acr": "hwk", "amr": ["hwk"], "exp": 1, "aud": "other"})
+
+    def test_malformed_gives_no_claims(self):
+        import base64
+        b64 = lambda raw: base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        hdr = b64(b'{"alg": "RS256"}')
+        for bad in ("", "x", "a.b", "x.y.z", f"{hdr}.{b64(b'[1, 2]')}.c2ln", f"{hdr}.{b64(b'not json')}.c2ln",
+                    f"{b64(b'[]')}.{b64(b'{}')}.c2ln"):
+            with self.subTest(token=bad):
+                self.assertEqual(gg.decode_jwt_payload(bad), {})
 
 
 if __name__ == "__main__":

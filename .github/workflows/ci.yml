@@ -64,8 +64,27 @@ jobs:
         run: bash tests/test_cli.sh
       - name: shell library tests (.env, proxy network, revocation sync, pki setup)
         run: bash tests/test_shell_libs.sh
+      # group-gate's own pins (group-gate/requirements.txt, hashes), the same
+      # files its image installs; pip's wheel cache saved on main only.
+      - name: Restore the group-gate pip cache
+        id: gg-pip-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: group-gate-pip-${{ runner.os }}-${{ hashFiles('group-gate/requirements.txt') }}
+      - name: Install group-gate's dependencies (pinned, hashes)
+        run: |
+          python3 -m venv /tmp/gg-venv
+          /tmp/gg-venv/bin/pip install --quiet --disable-pip-version-check \
+            --require-hashes --only-binary=:all: -r group-gate/requirements.txt
+      - name: Save the group-gate pip cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gg-pip-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pip
+          key: ${{ steps.gg-pip-cache.outputs.cache-primary-key }}
       - name: group-gate unit tests
-        run: python3 tests/test_group_gate.py
+        run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_group_gate.py
       - name: compose files are valid with a generated .env
         run: |
           ./portcullis init --env-only --non-interactive --domain ci.example.org --dns-provider none
@@ -161,7 +180,14 @@ jobs:
             [ "$svc" = hub ] && continue
             [[ "$img" =~ ^[^@[:space:]]+:[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || { echo "UNPINNED: $svc → $img"; bad=1; }
           done < /tmp/images
-          if grep -E '^FROM ' enroll/Dockerfile | grep -v '@sha256:'; then echo "UNPINNED base image in enroll/Dockerfile"; bad=1; fi
+          for df in enroll/Dockerfile group-gate/Dockerfile; do
+            if grep -E '^FROM ' "$df" | grep -v '@sha256:'; then echo "UNPINNED base image in $df"; bad=1; fi
+          done
+          # group-gate's Python deps: exact pins with hashes, installed with --require-hashes.
+          grep -q -- '--require-hashes' group-gate/Dockerfile || { echo "group-gate/Dockerfile installs without --require-hashes"; bad=1; }
+          if grep -vE '^\s*(#|$|--hash=sha256:[0-9a-f]{64})' group-gate/requirements.txt | grep -vE '^[A-Za-z0-9._-]+==[^ ]+( ;.*)? \\$'; then
+            echo "group-gate/requirements.txt: not an exact pin with hashes"; bad=1
+          fi
           # Images the CLI runs itself (PORTCULLIS_HELPER_IMAGE, BACKUP_RESTIC_IMAGE, ...).
           if grep -nE '^[A-Z_]+_IMAGE="' scripts/lib/*.sh | grep -v '@sha256:[0-9a-f]\{64\}"'; then echo "UNPINNED image constant in scripts/lib"; bad=1; fi
           # Inline compose snippets and docker run images in the workflows.
@@ -283,7 +309,7 @@ jobs:
           # edge Hub, pulled by its own test) + the pinned images used inline
           # here and by the CLI (helper, restic, whoami, curl, docker cli).
           {
-            docker compose config --images | grep -vxE 'portcullis-enroll|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/*.sh
           } > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
@@ -307,6 +333,17 @@ jobs:
           sbom: false
           cache-from: type=gha,scope=enroll
           cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=enroll,mode=max' || '' }}
+      - name: Build group-gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: group-gate
+          # compose's image name for group-gate
+          tags: portcullis-group-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=group-gate
+          cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=group-gate,mode=max' || '' }}
 
       - name: Start core services (without Traefik ACME)
         run: docker compose up -d postgres lldap
@@ -1378,7 +1415,7 @@ jobs:
           # Compose services incl. the monitoring profile (minus enroll and the
           # edge Hub) + the helper alpine, whoami and curl used inline.
           {
-            docker compose config --images | grep -vxE 'portcullis-enroll|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh \
               | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
           } > "$RUNNER_TEMP/images.txt"
@@ -1400,6 +1437,16 @@ jobs:
           sbom: false
           cache-from: type=gha,scope=enroll
           # build-and-test writes the (identical) cache on main.
+          cache-to: ""
+      - name: Build group-gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: group-gate
+          tags: portcullis-group-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=group-gate
           cache-to: ""
 
       - name: Start the core stack (Vault, PKI, all services except the Hub)

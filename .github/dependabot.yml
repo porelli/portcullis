@@ -23,6 +23,24 @@ updates:
       enroll-images:
         patterns: ["*"]
 
+  # group-gate/Dockerfile base image (python).
+  - package-ecosystem: docker
+    directory: /group-gate
+    schedule:
+      interval: weekly
+    groups:
+      group-gate-images:
+        patterns: ["*"]
+
+  # group-gate/requirements.txt (cryptography, PyJWT + deps; pins with hashes).
+  - package-ecosystem: pip
+    directory: /group-gate
+    schedule:
+      interval: weekly
+    groups:
+      group-gate-python:
+        patterns: ["*"]
+
   - package-ecosystem: gomod
     directory: /enroll
     schedule:

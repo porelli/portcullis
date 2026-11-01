@@ -35,7 +35,10 @@ as host-root-equivalent and keep it behind `lldap_admin` + the proxy secret.
 
 Every service: `security_opt: [no-new-privileges:true]`, `cap_drop: [ALL]`,
 `mem_limit`, `pids_limit`, image pinned `tag@sha256:digest` (the Hub via
-`HUB_IMAGE`, enroll is built from `enroll/Dockerfile` whose bases are pinned).
+`HUB_IMAGE`; enroll and group-gate are built from `enroll/Dockerfile` /
+`group-gate/Dockerfile`, whose bases are pinned; group-gate's Python
+dependencies are exact pins with hashes in `group-gate/requirements.txt`,
+installed wheels-only with `pip install --require-hashes`).
 
 | Service | User | Root FS | `cap_add` | Healthcheck | Notes |
 |---------|------|---------|-----------|-------------|-------|
@@ -46,7 +49,7 @@ Every service: `security_opt: [no-new-privileges:true]`, `cap_drop: [ALL]`,
 | lldap | 1000 (`-rootless` image) | read-only (`tmpfs /tmp`) | — | `lldap healthcheck` | |
 | keycloak | 1000 (image) | **writable** (`tmpfs /tmp`) | — | `/health/ready` | Exception: `start` re-augments the server into `/opt/keycloak/lib` because the x509 lookup provider is a build option. A custom pre-built (`--optimized`) image would allow read-only |
 | forward-auth | 65532 (distroless) | read-only | — | **none** | Exception: the image has no shell or HTTP client |
-| group-gate | 10003:10003 | read-only (`tmpfs /tmp`) | — | `/healthz` | Only world-readable mounts |
+| group-gate | 10003:10003 (`USER` in Dockerfile) | read-only (`tmpfs /tmp`) | — | `/healthz` | Image `portcullis-group-gate`: pinned `python` alpine base + `cryptography` (CRL parsing) and `PyJWT` (token claims) + the script. Only world-readable mounts |
 | hub | 10001:10001 (image) | read-only (`tmpfs /tmp`, `/home/hub`) | — | image `HEALTHCHECK` (`/healthz`) | Writes `/data` (volume), `/project/templates` (chowned to 10001 by `./portcullis up`) |
 | enroll | 10002:10002 (`USER` in Dockerfile) | read-only | — | `/healthz` | Reads `secrets/enroll/` via group 10002 |
 | prometheus, alertmanager, blackbox, textfile-exporter (profile `monitoring`) | 65534:65534 | read-only | — | `/-/ready`, `/-/healthy`, `/metrics` | `monitoring` network is `internal`; nothing published. Alertmanager's only egress is the `alerting` network |
@@ -54,7 +57,7 @@ Every service: `security_opt: [no-new-privileges:true]`, `cap_drop: [ALL]`,
 
 Throwaway containers the CLI starts: the chown helper (pinned `alpine`,
 `--network none`, only `CAP_CHOWN`); for backups the volume snapshot and
-LLDAP check (group-gate's `python` image, the volume owner's uid,
+LLDAP check (the `portcullis-group-gate` image, built first if missing; the volume owner's uid,
 `--network none`, read-only, no capabilities), `restic` (pinned, the
 operator's uid, read-only, no capabilities; `--network none` for a local
 repository) and, for `backup verify`, a `postgres` without network.

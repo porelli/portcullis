@@ -98,7 +98,6 @@ We only decode the payload to read the acr/amr/preferred_username claims.
 from __future__ import annotations
 
 import base64
-import calendar
 import hashlib
 import html
 import json
@@ -110,6 +109,9 @@ import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import FrozenSet, List, Optional, Tuple
+
+import jwt  # PyJWT
+from cryptography import x509
 
 LISTEN_PORT = int(os.environ.get("GATE_PORT", "8080"))
 POLICY_FILE = os.environ.get("GATE_POLICY_FILE", "/hub-data/group-gate-policy.json")
@@ -904,47 +906,6 @@ def load_revoked_file(path: Optional[str] = None) -> FrozenSet[int]:
     return serials
 
 
-def _der_tlv(buf: bytes, pos: int) -> Tuple[int, int, int]:
-    """Return (tag, content_start, content_end) of the DER element at pos."""
-    if pos + 2 > len(buf):
-        raise ValueError("truncated DER")
-    tag = buf[pos]
-    length = buf[pos + 1]
-    pos += 2
-    if length & 0x80:
-        n = length & 0x7F
-        if n == 0 or n > 4 or pos + n > len(buf):
-            raise ValueError("bad DER length")
-        length = int.from_bytes(buf[pos:pos + n], "big")
-        pos += n
-    if pos + length > len(buf):
-        raise ValueError("truncated DER")
-    return tag, pos, pos + length
-
-
-def _der_children(buf: bytes, start: int, end: int) -> List[Tuple[int, int, int]]:
-    out = []
-    pos = start
-    while pos < end:
-        tag, cs, ce = _der_tlv(buf, pos)
-        out.append((tag, cs, ce))
-        pos = ce
-    return out
-
-
-def _der_time(buf: bytes, tag: int, start: int, end: int) -> Optional[float]:
-    """UTCTime (0x17) / GeneralizedTime (0x18) → epoch seconds (UTC), or None."""
-    text = buf[start:end].decode("ascii", "replace").rstrip("Z")
-    try:
-        if tag == 0x17:
-            yy = int(text[:2])
-            text = ("19" if yy >= 50 else "20") + text
-        st = time.strptime(text[:14], "%Y%m%d%H%M%S")
-    except ValueError:
-        return None
-    return float(calendar.timegm(st))
-
-
 def parse_crl_serials(data: bytes) -> FrozenSet[int]:
     """Revoked serial numbers from an X.509 CRL (DER, or PEM)."""
     return parse_crl(data)[0]
@@ -952,43 +913,19 @@ def parse_crl_serials(data: bytes) -> FrozenSet[int]:
 
 def parse_crl(data: bytes) -> Tuple[FrozenSet[int], Optional[float]]:
     """(revoked serial numbers, nextUpdate epoch or None) from an X.509 CRL
-    (DER, or PEM).
+    (DER, or PEM). Malformed input raises ValueError.
 
     The CRL signature is not verified: it is fetched from Vault over the
     internal network, and it can only ever ADD denials.
     """
-    if data.lstrip().startswith(b"-----BEGIN"):
-        b64 = b"".join(l for l in data.splitlines() if l and not l.startswith(b"-----"))
-        data = base64.b64decode(b64)
-    tag, cs, ce = _der_tlv(data, 0)
-    if tag != 0x30:
-        raise ValueError("CRL is not a SEQUENCE")
-    tbs_tag, ts, te = _der_tlv(data, cs)
-    if tbs_tag != 0x30:
-        raise ValueError("tbsCertList is not a SEQUENCE")
-    fields = _der_children(data, ts, te)
-    i = 0
-    if i < len(fields) and fields[i][0] == 0x02:  # version
-        i += 1
-    i += 2  # signature AlgorithmIdentifier, issuer Name
-    times = (0x17, 0x18)  # UTCTime, GeneralizedTime
-    if i >= len(fields) or fields[i][0] not in times:
-        raise ValueError("CRL thisUpdate missing")
-    i += 1
-    next_update = None
-    if i < len(fields) and fields[i][0] in times:  # nextUpdate
-        next_update = _der_time(data, *fields[i])
-        i += 1
-    serials = set()
-    if i < len(fields) and fields[i][0] == 0x30:  # revokedCertificates
-        _, rs, re_ = fields[i]
-        for etag, es, ee in _der_children(data, rs, re_):
-            if etag != 0x30:
-                continue
-            stag, ss, se = _der_tlv(data, es)
-            if stag == 0x02:
-                serials.add(int.from_bytes(data[ss:se], "big", signed=True))
-    return frozenset(serials), next_update
+    stripped = data.lstrip()
+    if stripped.startswith(b"-----BEGIN"):
+        crl = x509.load_pem_x509_crl(stripped)
+    else:
+        crl = x509.load_der_x509_crl(data)
+    next_update = crl.next_update_utc
+    return (frozenset(entry.serial_number for entry in crl),
+            next_update.timestamp() if next_update else None)
 
 
 class CrlSource:
@@ -1116,7 +1053,12 @@ def _decode_cert_info(raw: str) -> str:
 
 
 def leaf_cert_cn(raw: str) -> Optional[str]:
-    """Subject CN of the leaf (first) cert in X-Forwarded-Tls-Client-Cert-Info."""
+    """Subject CN of the leaf (first) cert in X-Forwarded-Tls-Client-Cert-Info.
+
+    This header is Traefik's own text format (Subject="C=..,O=..,CN=..",
+    values unescaped — not RFC 4514), not a certificate: client-headers@file
+    sends no PEM, so there is nothing for an X.509 parser to load here.
+    """
     value = _decode_cert_info(raw)
     m = _SUBJECT_RE.search(value)
     if not m:
@@ -1157,21 +1099,18 @@ def subdomain_for(host: str) -> Optional[str]:
 
 
 def decode_jwt_payload(token: str) -> dict:
-    """Decode a JWT payload without verifying the signature.
+    """Claims of a JWT, WITHOUT verifying its signature (or exp/aud/iss).
 
     The token has already been verified by oauth2-proxy upstream — we're
-    inside the trust boundary and only need the claims.
+    inside the trust boundary and only need the claims. Anything that is not
+    a well-formed JWT with a JSON-object payload gives {} (no claims: the
+    auth policy then fails closed).
     """
     try:
-        _header, payload, _sig = token.split(".", 2)
-    except ValueError:
+        claims = jwt.decode(token, options={"verify_signature": False})
+    except jwt.PyJWTError:
         return {}
-    # JWT uses base64url without padding; re-pad and decode.
-    padded = payload + "=" * (-len(payload) % 4)
-    try:
-        return json.loads(base64.urlsafe_b64decode(padded.encode()))
-    except (ValueError, UnicodeDecodeError):
-        return {}
+    return claims if isinstance(claims, dict) else {}
 
 
 def resolve_policy(policy_doc: dict, subdomain: str) -> Optional[dict]:

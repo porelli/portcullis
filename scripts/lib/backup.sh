@@ -41,7 +41,7 @@ BACKUP_LAST_DIR=""
 _BACKUP_CFG=""
 _RESTIC_MOUNTS=()
 
-# Runs inside the python image (group-gate's), as the volume owner:
+# Runs inside group-gate's (locally built) python image, as the volume owner:
 # /data → gzipped tar on stdout; SQLite files via the online backup API.
 read -r -d '' _BACKUP_PY_SNAPSHOT <<'PY' || true
 import os, sqlite3, sys, tarfile, tempfile
@@ -123,6 +123,16 @@ _backup_load_cfg() {
 }
 _volume_name() { printf '%s' "$_BACKUP_CFG" | jq -r --arg v "$1" '.volumes[$v].name // empty'; }
 _svc_image() { printf '%s' "$_BACKUP_CFG" | jq -r --arg s "$1" '.services[$s].image // empty'; }
+# _py_image — group-gate's image (python3 for the SQLite helpers), built
+# first if this host does not have it yet (e.g. verify before the first `up`).
+_py_image() {
+  local img
+  img="$(_svc_image group-gate)"
+  [ -n "$img" ] || fail "group-gate has no image name in the compose config"
+  docker image inspect "$img" >/dev/null 2>&1 || dc build --quiet group-gate >&2 \
+    || fail "cannot build the group-gate image ($img)"
+  printf '%s' "$img"
+}
 _project_name() { printf '%s' "$_BACKUP_CFG" | jq -r '.name // "portcullis"'; }
 
 # _sha256_c <listfile> — verify "<hash>  <path>" lines (cwd-relative).
@@ -194,9 +204,11 @@ _backup_pg_dump() {
 
 # _backup_volume_files <volume> <uid> <gid> — tar.gz of the volume on stdout.
 _backup_volume_files() {
+  local img
+  img="$(_py_image)" || return 1
   docker run --rm --network none --user "$2:$3" --cap-drop ALL --security-opt no-new-privileges:true \
     --read-only --tmpfs /tmp -e PYTHONDONTWRITEBYTECODE=1 -v "$1:/data" \
-    "$(_svc_image group-gate)" python3 -c "$_BACKUP_PY_SNAPSHOT"
+    "$img" python3 -c "$_BACKUP_PY_SNAPSHOT"
 }
 
 # _backup_dirs — names of the timestamped backups in BACKUP_ROOT, oldest first.
@@ -439,7 +451,7 @@ backup_verify_dir() {
   rm -rf "$t"
 
   _backup_load_cfg
-  pg_img="$(_svc_image postgres)" py_img="$(_svc_image group-gate)"
+  pg_img="$(_svc_image postgres)" py_img="$(_py_image)"
   # Postgres: restore the dump into a throwaway server.
   n="portcullis-verify-pg-$$"
   docker run -d --rm --name "$n" --network none --tmpfs /var/lib/postgresql \
