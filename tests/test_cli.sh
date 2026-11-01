@@ -57,7 +57,7 @@ case "$ERR" in *"unknown command 'frobnicate'"*) t_pass "unknown command message
 
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 25 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 25
+expect_eq "help lists 26 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 26
 while IFS= read -r c; do
   # shellcheck disable=SC2086
   run $c --help
@@ -127,6 +127,7 @@ invite --ttl|--ttl needs a value
 invite a --to ftp://x|--to must be hub, portal or an https URL
 invite 'bad;user'|invalid user name
 invite a --frob|unknown option: --frob
+lldap-ui now|unknown argument: now
 EOF
 
 # ── no secret on a command line (CLAUDE.md: stdin, -H @<(...), key=-, jq

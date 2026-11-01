@@ -57,6 +57,7 @@ Vault and PKI:
 
 Identity:
   invite                      One-time setup link: register a passkey, signed in (no password)
+  lldap-ui                    Break-glass SSH tunnel to LLDAP's own web UI (server only)
   keycloak configure          Import/patch the portcullis realm
   oidc register               Create core OIDC clients, push their secrets from .env
 
@@ -85,6 +86,7 @@ main() {
   case "$cmd" in
     init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert)
       "cmd_$cmd" "$@" ;;
+    lldap-ui) cmd_lldap_ui "$@" ;;
     *)
       printf "portcullis: unknown command '%s'\nRun 'portcullis help' for the list of commands.\n" "$cmd" >&2
       return 2 ;;

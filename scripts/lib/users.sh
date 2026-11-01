@@ -192,3 +192,34 @@ cmd_invite() {
     echo "    Send it to $user over a channel you trust. It works once."
   fi
 }
+
+help_lldap_ui() {
+  cat <<'EOF'
+Usage: portcullis lldap-ui
+
+Break-glass access to LLDAP's own web UI. directory.<domain> only redirects
+to the Hub (LLDAP has no single sign-on), so LLDAP's UI is reachable only
+from the server. Prints the SSH tunnel to run on your machine; then open
+http://localhost:17170 and sign in as the LLDAP admin (LLDAP_ADMIN_PASSWORD
+in .env). Use it for recovery only: day-to-day, people and groups are
+managed in the Hub.
+EOF
+}
+
+cmd_lldap_ui() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) help_lldap_ui; return 0 ;;
+      *) usage_error lldap-ui "unknown argument: $1" ;;
+    esac
+  done
+  require_cmd docker
+  local id ip
+  id="$(dc ps -q lldap 2>/dev/null || true)"
+  [ -n "$id" ] || fail "LLDAP is not running (portcullis up)"
+  ip="$(docker inspect -f '{{with index .NetworkSettings.Networks "portcullis"}}{{.IPAddress}}{{end}}' "$id")"
+  [ -n "$ip" ] || fail "LLDAP has no address on the portcullis network"
+  ok "LLDAP's web UI listens on $ip:17170 (reachable from this server only). On your machine run:"
+  printf '\n  ssh -N -L 17170:%s:17170 %s@%s\n\n' "$ip" "$(id -un)" "$(hostname -f 2>/dev/null || hostname)"
+  echo "    then open http://localhost:17170 and sign in as the LLDAP admin (LLDAP_ADMIN_PASSWORD in .env)."
+}
