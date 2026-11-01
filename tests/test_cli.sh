@@ -129,6 +129,14 @@ invite 'bad;user'|invalid user name
 invite a --frob|unknown option: --frob
 EOF
 
+# ── no secret on a command line (CLAUDE.md: stdin, -H @<(...), key=-, jq
+# --rawfile / env.X) ── lines marked "secret-argv-ok" are reviewed exceptions.
+ARGV_RE='--arg(json)? [A-Za-z_]+ "?\$\(cat|--arg(json)? [A-Za-z_]+ "?\$\{?[A-Za-z_]*(PASSWORD|SECRET|TOKEN|PASS)\b|--(admin-)?password[ =]"?\$|--token[ =]"?\$|(PASSWORD|SECRET|TOKEN)=[^ ]*\$\(cat '
+HITS="$(grep -nE -e "$ARGV_RE" "$HERE/../portcullis" "$HERE"/../scripts/lib/*.sh | grep -v 'secret-argv-ok' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
+expect_eq "no secrets on argv in the CLI" "$HITS" ""
+case "$(printf '%s\n' '  jq -n --arg p "$(cat "$f")" x' '  jq --arg pass "$LLDAP_ADMIN_PASSWORD"' | grep -cE -e "$ARGV_RE")" in
+  2) t_pass "argv secret pattern catches --arg \"\$(cat ...)\" and secret variables" ;; *) t_fail "argv secret pattern" ;; esac
+
 # version and backup schedule work without .env (and without docker).
 run version
 expect_eq "version without .env exits 0" "$RC" 0

@@ -33,7 +33,8 @@ users_secret_files() {
 # _lldap_login — prints an LLDAP JWT for the LLDAP admin (LLDAP_ADMIN_PASSWORD).
 _lldap_login() {
   env_require LLDAP_ADMIN_PASSWORD
-  jq -nc --arg p "$LLDAP_ADMIN_PASSWORD" '{username: "admin", password: $p}' \
+  # The password reaches jq through its environment, never argv.
+  LLDAP_ADMIN_PASSWORD="$LLDAP_ADMIN_PASSWORD" jq -nc '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
     | dc exec -T lldap curl -sf --max-time 20 http://localhost:17170/auth/simple/login \
         -H 'Content-Type: application/json' -d @- | jq -r '.token // empty'
 }
@@ -78,17 +79,19 @@ lldap_service_account() {
       && echo "    $HUB_LLDAP_USER: added to lldap_admin" || warn "    could not add $HUB_LLDAP_USER to lldap_admin"
   fi
   # Password: try it; reset it when LLDAP and the file disagree.
-  if jq -nc --arg u "$HUB_LLDAP_USER" --arg p "$(cat "$pw")" '{username: $u, password: $p}' \
+  if jq -nc --arg u "$HUB_LLDAP_USER" --rawfile p "$pw" '{username: $u, password: ($p | rtrimstr("\n"))}' \
       | dc exec -T lldap curl -sf -o /dev/null --max-time 20 http://localhost:17170/auth/simple/login \
           -H 'Content-Type: application/json' -d @-; then
     echo "    $HUB_LLDAP_USER: password matches secrets/hub/lldap/password"
     return 0
   fi
   # lldap_set_password takes the user's password from LLDAP_USER_PASSWORD;
-  # the admin JWT (short-lived) is the one argument inside the container.
+  # it has no env / file option for the admin credential, so the short-lived
+  # admin JWT is its one secret argument — inside the lldap container only,
+  # never on the host's command lines. (secret-argv-ok)
   # shellcheck disable=SC2016
   if { printf '%s\n' "$tok"; cat "$pw"; echo; } | dc exec -T lldap sh -c 'read -r T; read -r P; export LLDAP_USER_PASSWORD="$P";
-      exec /app/lldap_set_password --base-url http://localhost:17170 --token "$T" --username "$1"' _ "$HUB_LLDAP_USER" >/dev/null; then
+      exec /app/lldap_set_password --base-url http://localhost:17170 --token "$T" --username "$1"' _ "$HUB_LLDAP_USER" >/dev/null; then # secret-argv-ok: inside the lldap container
     echo "    $HUB_LLDAP_USER: password set from secrets/hub/lldap/password"
   else
     warn "    could not set the password of $HUB_LLDAP_USER"

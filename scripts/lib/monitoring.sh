@@ -40,10 +40,10 @@ alertmanager_config() {
   if [ -n "$ntfy" ]; then
     case "$ntfy" in *\?*) ntfy="$ntfy&template=alertmanager" ;; *) ntfy="$ntfy?template=alertmanager" ;; esac
   fi
-  jq -n \
+  ALERT_SMTP_PASSWORD="${ALERT_SMTP_PASSWORD:-}" jq -n \
     --arg webhook "${ALERT_WEBHOOK_URL:-}" --arg ntfy "$ntfy" \
     --arg smarthost "${ALERT_SMTP_SMARTHOST:-}" --arg from "${ALERT_SMTP_FROM:-}" --arg to "${ALERT_SMTP_TO:-}" \
-    --arg user "${ALERT_SMTP_USERNAME:-}" --arg pass "${ALERT_SMTP_PASSWORD:-}" \
+    --arg user "${ALERT_SMTP_USERNAME:-}" \
     --arg tls "${ALERT_SMTP_REQUIRE_TLS:-true}" --arg domain "${PORTCULLIS_DOMAIN:-portcullis.local}" '
     def nonempty: . != "";
     ([ (if $webhook | nonempty then {url: $webhook, send_resolved: true} else empty end),
@@ -51,7 +51,7 @@ alertmanager_config() {
     | (if ($smarthost | nonempty) and ($to | nonempty) then
          [{to: $to, from: (if $from | nonempty then $from else "portcullis@" + $domain end),
            smarthost: $smarthost, require_tls: ($tls != "false"), send_resolved: true}
-          + (if $user | nonempty then {auth_username: $user, auth_password: $pass} else {} end)]
+          + (if $user | nonempty then {auth_username: $user, auth_password: env.ALERT_SMTP_PASSWORD} else {} end)]
        else [] end) as $mails
     | {
         route: {receiver: "portcullis", group_by: ["alertname", "severity"],
