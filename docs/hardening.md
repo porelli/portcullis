@@ -147,15 +147,21 @@ Therefore:
   (8445) and the Hub's invite API (8444, bearer secret, refuses `admin` and
   `portcullis-hub`) are not routed by Traefik; `enroll invite` (the CLI,
   through `docker exec`) uses a loopback-only listener (8446), the only way
-  to invite the bootstrap `admin`. The invite session is LoA 2 / amr `hwk`:
+  to invite an administrator: the Hub API refuses `admin`, `portcullis-hub`
+  and every member of `lldap_admin`, `lldap_password_manager` and the
+  core-console groups of `group-gate-map.conf` (LLDAP group lookup, fails
+  closed), so a leaked API secret cannot take over an admin account. The invite session is LoA 2 / amr `hwk`:
   it cannot finish without the passkey registration (`webauthn-register-passwordless`,
   added by enroll's service account `portcullis-enroll`, realm-management
   view-users + manage-users, when the link is redeemed). enroll already held
   the LLDAP admin bind and Vault signing rights, so this adds no new class
   of power to it.
-- The Hub logs in to LLDAP as `portcullis-hub` (`lldap_admin`): it could
+- The Hub logs in to LLDAP as `portcullis-hub` (`lldap_admin`; LLDAP
+  0.6.3's `lldap_password_manager` cannot create users or groups): it could
   already start arbitrary containers through its socket proxy, so this is
-  no new trust (integration contract §9.1).
+  no new trust (integration contract §9.1). The account cannot sign in:
+  Keycloak's federation filters it out (`(!(uid=portcullis-hub))`) and
+  group-gate denies it (`GATE_DENY_USERS`).
 - Public exceptions (the Hub's `portcullis-public-<app>` routers) have no
   forward-auth: nothing is signed in and no identity header is passed (the
   Hub's strip middleware deletes client copies). Their first middleware,

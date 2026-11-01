@@ -1070,6 +1070,16 @@ jobs:
               --header "Authorization: Bearer $(cat /run/secrets/portcullis-enroll/invite-api-secret)$2" \
               --post-data "{\"username\":\"$1\"}" http://127.0.0.1:8444/internal/invites 2>&1 | sed -n "s/^ *HTTP\/1.1 \([0-9]*\).*/\1/p"' _ "$1" "${2:-}"; }
           [ "$(api testuser)" = 201 ] || { echo "FAIL: Hub invite API for testuser"; exit 1; }
+          # Any lldap_admin member (not just `admin`) is refused: an invite hands over the account.
+          LT=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
+            | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          lg() { jq -n --arg q "$1" '{query: $q}' | curl -sf http://127.0.0.1:17170/api/graphql \
+            -H @<(printf 'Authorization: Bearer %s\n' "$LT") -H 'Content-Type: application/json' -d @- | jq -e '.errors == null' >/dev/null; }
+          lg 'mutation { createUser(user: {id: "ciadmin2", email: "ciadmin2@portcullis.local"}) { id } }'
+          lg 'mutation { addUserToGroup(userId: "ciadmin2", groupId: 1) { ok } }'
+          [ "$(api ciadmin2)" = 409 ] || { echo "FAIL: Hub invite API must refuse lldap_admin members"; exit 1; }
+          ./portcullis invite ciadmin2 --json | jq -e .url >/dev/null || { echo "FAIL: the server must be able to invite an administrator"; exit 1; }
+          lg 'mutation { deleteUser(userId: "ciadmin2") { ok } }'
           for u in admin portcullis-hub; do [ "$(api "$u")" = 409 ] || { echo "FAIL: Hub invite API must refuse $u"; exit 1; }; done
           [ "$(api nosuchuser)" = 404 ] || { echo "FAIL: Hub invite API for an unknown user"; exit 1; }
           [ "$(api testuser x)" = 401 ] || { echo "FAIL: Hub invite API with a wrong secret"; exit 1; }
@@ -1181,6 +1191,14 @@ jobs:
             | curl -sf -o /dev/null http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- \
             || { echo "FAIL: secrets/hub/lldap/password does not log in"; exit 1; }
           test "$(stat -c '%a %g' secrets/hub/lldap/password)" = "640 10001" || { echo "FAIL: password file mode/group"; exit 1; }
+          # The service account never reaches Keycloak (federation user filter), so it cannot sign in.
+          ./portcullis keycloak configure >/dev/null
+          KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+            --data-urlencode client_id=admin-cli --data-urlencode "username=${KEYCLOAK_ADMIN:-admin}" \
+            --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") \
+              "http://127.0.0.1:8080/admin/realms/portcullis/users?username=portcullis-hub&exact=true" | jq -e 'length == 0' >/dev/null \
+            || { echo "FAIL: portcullis-hub is visible in Keycloak"; exit 1; }
           # A changed password in LLDAP is reset from the file on the next run.
           docker compose exec -T lldap /app/lldap_set_password --base-url http://localhost:17170 \
             --admin-username admin --admin-password "$LLDAP_ADMIN_PASSWORD" --username portcullis-hub --password "$(openssl rand -hex 20)" >/dev/null
