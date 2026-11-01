@@ -632,6 +632,8 @@ services:
       LLDAP_HTTP_URL: http://lldap:17170
       LLDAP_LDAP_URL: ldap://lldap:3890
       LLDAP_BASE_DN: ${LLDAP_BASE_DN:-dc=portcullis,dc=local}
+      # Extra groups treated as administrators (no invites via the API); same value as enroll.
+      INVITE_PROTECTED_GROUPS: ${INVITE_PROTECTED_GROUPS:-}
       HUB_INVITE_API_URL: http://enroll:8444/internal/invites
       HUB_INVITE_SECRET_FILE: /run/portcullis/invite/secret
       # Shared secret Traefik sends as X-Portcullis-Proxy-Secret on every
@@ -698,6 +700,8 @@ services:
     # USER 10002 in enroll/Dockerfile; secrets/enroll is group 10002, 0750/0640.
     read_only: true
     environment:
+      # Extra groups treated as administrators (no invites via the API); same value as the hub.
+      INVITE_PROTECTED_GROUPS: ${INVITE_PROTECTED_GROUPS:-}
       VAULT_ADDR: http://vault:8200
       # Least-privilege AppRole (policy vault/policies/enroll.hcl), created
       # by ./portcullis vault init. No static/root token.
