@@ -639,6 +639,9 @@ services:
       INVITE_PROTECTED_GROUPS: ${INVITE_PROTECTED_GROUPS:-}
       HUB_INVITE_API_URL: http://enroll:8444/internal/invites
       HUB_INVITE_SECRET_FILE: /run/portcullis/invite/secret
+      # Host directories an app's custom (Expert) override may bind-mount
+      # (colon-separated; empty = /srv:/mnt:/media).
+      HUB_OVERRIDE_BIND_ROOTS: ${HUB_OVERRIDE_BIND_ROOTS:-}
       # Shared secret Traefik sends as X-Portcullis-Proxy-Secret on every
       # request routed to the Hub (hub-proxy-secret middleware below,
       # integration contract §5); the Hub refuses to start without it.
