@@ -149,19 +149,19 @@ jobs:
           grep -qx 'metrics=lldap_admin' group-gate/group-gate-map.conf || { echo "FAIL: metrics is not lldap_admin in the group-gate map"; exit 1; }
           # Contract §5 / §5.1: attribute headers, people.<domain>, directory redirect.
           grep -qx 'people=\*' group-gate/group-gate-map.conf || { echo "FAIL: people is not * (any signed-in user) in the group-gate map"; exit 1; }
-          echo "$CFG" | jq -e '.services["group-gate"].labels as $g | .services["forward-auth"].labels as $f | .services.hub.labels as $h
+          echo "$CFG" | jq -e --arg d "${PORTCULLIS_DOMAIN:-ci.example.org}" '.services["group-gate"].labels as $g | .services["forward-auth"].labels as $f | .services.hub.labels as $h
               | ([$g["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeadersRegex"],
                   $g["traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeadersRegex"],
                   $g["traefik.http.middlewares.portcullis-public-guard.forwardauth.authResponseHeadersRegex"],
                   $f["traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeadersRegex"],
                   $f["traefik.http.middlewares.portcullis-auth-console.forwardauth.authResponseHeadersRegex"]] | all(. == "^X-Forwarded-Attr-"))
               and .services.hub.environment.HUB_PEOPLE_ADDR == ":8889"
-              and $h["traefik.http.routers.people.rule"] == "Host(`people.ci.example.org`)"
+              and $h["traefik.http.routers.people.rule"] == "Host(`people.\($d)`)"
               and $h["traefik.http.routers.people.tls.options"] == "authaware@file"
               and $h["traefik.http.routers.people.middlewares"] == "rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file"
               and $h["traefik.http.services.\($h["traefik.http.routers.people.service"]).loadbalancer.server.port"] == "8889"
               and $h["traefik.http.services.\($h["traefik.http.routers.hub.service"]).loadbalancer.server.port"] == "8888"
-              and .services.lldap.labels["traefik.http.middlewares.directory-redirect.redirectregex.replacement"] == "https://people.ci.example.org/"
+              and .services.lldap.labels["traefik.http.middlewares.directory-redirect.redirectregex.replacement"] == "https://people.\($d)/"
               and .services["forward-auth"].environment.OAUTH2_PROXY_COOKIE_REFRESH == "1m"
               and (.services["forward-auth"].environment.OAUTH2_PROXY_COOKIE_EXPIRE // null) == null' >/dev/null \
             || { echo "FAIL: attribute-header regex / people router / directory redirect / forward-auth cookie refresh wiring"; exit 1; }
