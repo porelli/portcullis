@@ -91,8 +91,9 @@ jobs:
               | ($l["traefik.http.routers.hub.middlewares"] | test("hub-proxy-secret@docker"))
               and $l["traefik.http.middlewares.hub-proxy-secret.headers.customrequestheaders.X-Portcullis-Proxy-Secret"] == .services.hub.environment.HUB_PROXY_SECRET
               and (.services.hub.image | test("^ghcr.io/porelli/portcullis-hub:"))
-              and ([.services.hub.environment | keys[] | select(startswith("LLDAP_"))] == [])' >/dev/null \
-            || { echo "FAIL: hub proxy-secret middleware / image / no LLDAP credentials"; exit 1; }
+              and ([.services.hub.environment | keys[] | select(test("LLDAP") and test("PASS|SECRET|TOKEN|KEY"))] == [])
+              and ([.services.hub.volumes[] | select(.target == "/run/portcullis/lldap" or .target == "/run/portcullis/invite") | .read_only] == [true, true])' >/dev/null \
+            || { echo "FAIL: hub proxy-secret middleware / image / LLDAP + invite credentials only as read-only files"; exit 1; }
           # Hardening baseline on every core service (all profiles).
           WEAK="$(echo "$CFG_ALL" | jq -r '.services | to_entries[]
               | select((.value.security_opt // [] | index("no-new-privileges:true") | not) or ((.value.cap_drop // []) != ["ALL"])
@@ -1021,6 +1022,62 @@ jobs:
             || { echo "FAIL: /api/users did not return testuser: $USERS"; exit 1; }
           echo "PASS: Enrollment API returned $(echo "$USERS" | jq length) users"
 
+      - name: Test passkey-only flows, setup links and the invite APIs
+        run: |
+          set -o pipefail
+          KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+            --data-urlencode client_id=admin-cli --data-urlencode "username=${KEYCLOAK_ADMIN:-admin}" \
+            --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          kc() { curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") "http://127.0.0.1:8080/admin/realms/portcullis$1"; }
+          # The browser flow has no password factor anywhere; LoA 1 = cert or
+          # passkey, LoA 2 needs nothing more; the invite IdP is reachable only
+          # with kc_idp_hint (hidden), linking to existing users only.
+          EX=$(kc /authentication/flows/portcullis-universal/executions)
+          echo "$EX" | jq -e '[.[].providerId // empty] | (index("auth-username-password-form") == null) and (index("auth-password-form") == null)
+              and index("identity-provider-redirector") and index("webauthn-authenticator-passwordless") and index("allow-access-authenticator")' >/dev/null \
+            || { echo "FAIL: browser flow: $(echo "$EX" | jq -c '[.[] | {displayName, requirement}]')"; exit 1; }
+          kc /authentication/flows | jq -e 'any(.[]; .alias == "portcullis-universal" and (.description | test("\\[sync [0-9a-f]{10}\\]$")))' >/dev/null \
+            || { echo "FAIL: browser flow not synced from realm-export.json"; exit 1; }
+          kc /identity-provider/instances/portcullis-invite | jq -e '.enabled and .hideOnLogin and (.trustEmail | not)
+              and .firstBrokerLoginFlowAlias == "portcullis-invite-link" and .postBrokerLoginFlowAlias == "portcullis-invite-session"
+              and .config.tokenUrl == "http://enroll:8445/oidc/token" and .config.pkceEnabled == "true"' >/dev/null \
+            || { echo "FAIL: invite identity provider: $(kc /identity-provider/instances/portcullis-invite | jq -c 'del(.config.clientSecret)')"; exit 1; }
+          kc /authentication/flows/portcullis-invite-link/executions | jq -e '[.[].providerId] == ["idp-detect-existing-broker-user", "idp-auto-link"]' >/dev/null \
+            || { echo "FAIL: invite first-login flow must only link existing users"; exit 1; }
+          ENR=$(kc "/clients?clientId=portcullis-enroll" | jq -r '.[0].id')
+          SA=$(kc "/clients/$ENR/service-account-user" | jq -r .id)
+          RM=$(kc "/clients?clientId=realm-management" | jq -r '.[0].id')
+          kc "/users/$SA/role-mappings/clients/$RM" | jq -e '[.[].name] | sort == ["manage-users", "view-users"]' >/dev/null \
+            || { echo "FAIL: portcullis-enroll service account roles"; exit 1; }
+          # Idempotent: a second run rebuilds nothing.
+          ./portcullis keycloak configure | grep -c "up to date" | grep -qx 3 || { echo "FAIL: flows rebuilt on a second configure"; exit 1; }
+          echo "PASS: passkey-only browser flow, hidden invite IdP (link-only), enroll service account; configure idempotent"
+
+          # Setup links (CLI → enroll over docker exec; enroll needs no secret on argv).
+          L1=$(./portcullis invite testuser --json | jq -r .url)
+          L2=$(./portcullis invite testuser --ttl 30m --to hub --json | jq -r .url)
+          for l in "$L1" "$L2"; do [[ "$l" =~ ^https://enroll\.portcullis\.local/invite/[A-Za-z0-9_-]{43}$ ]] || { echo "FAIL: link $l"; exit 1; }; done
+          page() { curl -s -o /dev/null -w '%{http_code}' "http://$ENROLL_IP:8443/invite/${1##*/}"; }
+          [ "$(page "$L1")" = 404 ] || { echo "FAIL: a new link must revoke the older one"; exit 1; }
+          [ "$(page "$L2")" = 200 ] || { echo "FAIL: setup page"; exit 1; }
+          [ "$(page "$L2")" = 200 ] || { echo "FAIL: viewing the setup page must not consume the link"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Sec-Fetch-Site: cross-site' "http://$ENROLL_IP:8443/invite/${L2##*/}")
+          [ "$code" = 403 ] || { echo "FAIL: cross-site redeem got $code"; exit 1; }
+          if ./portcullis invite portcullis-hub >/dev/null 2>&1; then echo "FAIL: invite for the Hub's service account"; exit 1; fi
+          ./portcullis invite admin --json | jq -e .url >/dev/null || { echo "FAIL: the server must be able to invite the bootstrap admin"; exit 1; }
+          # The Hub's API (contract §9.4): bearer secret from the shared file; admin / portcullis-hub refused.
+          api() { docker compose exec -T enroll sh -c 'wget -S -q -O /dev/null --header "Content-Type: application/json" \
+              --header "Authorization: Bearer $(cat /run/secrets/portcullis-enroll/invite-api-secret)$2" \
+              --post-data "{\"username\":\"$1\"}" http://127.0.0.1:8444/internal/invites 2>&1 | sed -n "s/^ *HTTP\/1.1 \([0-9]*\).*/\1/p"' _ "$1" "${2:-}"; }
+          [ "$(api testuser)" = 201 ] || { echo "FAIL: Hub invite API for testuser"; exit 1; }
+          for u in admin portcullis-hub; do [ "$(api "$u")" = 409 ] || { echo "FAIL: Hub invite API must refuse $u"; exit 1; }; done
+          [ "$(api nosuchuser)" = 404 ] || { echo "FAIL: Hub invite API for an unknown user"; exit 1; }
+          [ "$(api testuser x)" = 401 ] || { echo "FAIL: Hub invite API with a wrong secret"; exit 1; }
+          cmp -s secrets/enroll/invite-api-secret secrets/hub/invite/secret || { echo "FAIL: the Hub's invite secret differs"; exit 1; }
+          docker compose exec -T enroll wget -q -O - http://127.0.0.1:8445/oidc/jwks | jq -e '.keys[0].alg == "ES256"' >/dev/null \
+            || { echo "FAIL: invite JWKS"; exit 1; }
+          echo "PASS: setup links (single owner, revocation, no consumption on view, same-origin redeem), Hub invite API (§9.4)"
+
       - name: Test enrollment API - sign CSR (AppRole token)
         run: |
           PAYLOAD=$(jq -n --arg csr "$(cat /tmp/test-client.csr)" \
@@ -1109,6 +1166,30 @@ jobs:
           echo "FAIL: cert revoked in Vault still accepted after 180s ($code; in Vault CRL: ${seen:-no})"
           vault read -format=json pki_int/config/crl | jq -c .data
           docker compose logs --tail=20 group-gate; exit 1
+
+      - name: portcullis up (whole stack) keeps the Hub's LLDAP service account
+        run: |
+          # `up` starts every service, the Hub included.
+          docker compose pull --quiet hub || { echo "::warning::Hub image cannot be pulled — skipping"; exit 0; }
+          ./portcullis up
+          LLDAP_TOKEN=$(jq -n --arg p "$LLDAP_ADMIN_PASSWORD" '{username: "admin", password: $p}' \
+            | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          jq -n '{query: "{ user(userId: \"portcullis-hub\") { id groups { displayName } } }"}' | curl -sf http://127.0.0.1:17170/api/graphql \
+            -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @- \
+            | jq -e 'any(.data.user.groups[]; .displayName == "lldap_admin")' >/dev/null || { echo "FAIL: portcullis-hub not in lldap_admin"; exit 1; }
+          jq -n --rawfile p secrets/hub/lldap/password '{username: "portcullis-hub", password: ($p | rtrimstr("\n"))}' \
+            | curl -sf -o /dev/null http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- \
+            || { echo "FAIL: secrets/hub/lldap/password does not log in"; exit 1; }
+          test "$(stat -c '%a %g' secrets/hub/lldap/password)" = "640 10001" || { echo "FAIL: password file mode/group"; exit 1; }
+          # A changed password in LLDAP is reset from the file on the next run.
+          docker compose exec -T lldap /app/lldap_set_password --base-url http://localhost:17170 \
+            --admin-username admin --admin-password "$LLDAP_ADMIN_PASSWORD" --username portcullis-hub --password "$(openssl rand -hex 20)" >/dev/null
+          ./portcullis up | grep -q "portcullis-hub: password set from secrets/hub/lldap/password" || { echo "FAIL: password not reconciled"; exit 1; }
+          if docker compose ps -q hub | grep -q .; then
+            docker compose exec -T hub sh -c 'test "$(cat /run/portcullis/lldap/username)" = portcullis-hub && test -s /run/portcullis/lldap/password && test -s /run/portcullis/invite/secret' \
+              || { echo "FAIL: Hub does not see its LLDAP / invite files"; exit 1; }
+          fi
+          echo "PASS: portcullis up creates / reconciles portcullis-hub (lldap_admin, password from the 0640 file) and mounts it into the Hub"
 
       - name: portcullis status
         run: |
@@ -1246,11 +1327,6 @@ jobs:
             [ "$v" = KEYCLOAK_ADMIN ] || echo "::add-mask::$val"
             echo "$v=$val" >> "$GITHUB_ENV"
           done
-          for v in E2E_PASSWORD E2E_OTHER_PASSWORD; do
-            val="$(openssl rand -hex 16)Aa1!"
-            echo "::add-mask::$val"
-            echo "$v=$val" >> "$GITHUB_ENV"
-          done
           cat > docker-compose.ci.yml <<'YML'
           services:
             keycloak:
@@ -1314,7 +1390,7 @@ jobs:
           docker compose restart forward-auth
           docker compose ps
 
-      - name: Users, groups, passkey requirement, policy, test app, certs
+      - name: Users, groups, setup links, policy, test app, certs
         run: |
           set -o pipefail
           gql() {
@@ -1333,19 +1409,28 @@ jobs:
             -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @- \
             | jq -r '.data.groups[] | select(.displayName == "users_e2e") | .id')
           gql "mutation { addUserToGroup(userId: \"e2e\", groupId: $GID) { ok } }"
-          docker compose exec -T lldap /app/lldap_set_password --base-url http://localhost:17170 \
-            --admin-username admin --admin-password "$LLDAP_ADMIN_PASSWORD" --username e2e --password "$E2E_PASSWORD"
-          docker compose exec -T lldap /app/lldap_set_password --base-url http://localhost:17170 \
-            --admin-username admin --admin-password "$LLDAP_ADMIN_PASSWORD" --username e2e-other --password "$E2E_OTHER_PASSWORD"
+          # No passwords at all: every user (incl. the bootstrap admin) gets
+          # a one-time setup link, like `portcullis init` prints for admin.
+          # Nothing is pre-assigned in Keycloak: redeeming the link adds the
+          # passkey registration itself.
+          for spec in "E2E_INVITE e2e https://hwk.portcullis.local/" "E2E_OTHER_INVITE e2e-other https://app.portcullis.local/" \
+                      "E2E_ADMIN_INVITE admin portal"; do
+            read -r var who to <<<"$spec"
+            url="$(./portcullis invite "$who" --to "$to" --json | jq -r .url)"
+            [[ "$url" =~ ^https://enroll\.portcullis\.local/invite/[A-Za-z0-9_-]{43}$ ]] || { echo "FAIL: setup link for $who: $url"; exit 1; }
+            echo "::add-mask::$url"
+            echo "$var=$url" >> "$GITHUB_ENV"
+          done
 
-          # Keycloak: import e2e from LDAP and require passkey registration.
+          # Keycloak imports the users from LDAP when the links are redeemed.
           KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
             --data-urlencode client_id=admin-cli --data-urlencode "username=$KEYCLOAK_ADMIN" \
             --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
           kc() { curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") -H 'Content-Type: application/json' "$@"; }
           KC_UID=$(kc "http://127.0.0.1:8080/admin/realms/portcullis/users?username=e2e&exact=true" | jq -r '.[0].id')
           [ -n "$KC_UID" ] && [ "$KC_UID" != null ] || { echo "FAIL: e2e not visible in Keycloak (LDAP federation)"; exit 1; }
-          kc -X PUT -d '{"requiredActions": ["webauthn-register-passwordless"]}' "http://127.0.0.1:8080/admin/realms/portcullis/users/$KC_UID"
+          kc "http://127.0.0.1:8080/admin/realms/portcullis/users/$KC_UID" | jq -e '(.requiredActions // []) == []' >/dev/null \
+            || { echo "FAIL: e2e has required actions before redeeming its link"; exit 1; }
 
           # group-gate policy (normally written by the Hub).
           # Explicit public default: "app" is gated by groups / path_groups
@@ -1376,7 +1461,7 @@ jobs:
           YML
           sed -i 's/^          //' /tmp/e2e-app.yml
           docker compose -p e2e-app -f /tmp/e2e-app.yml up -d
-          echo "127.0.0.1 auth.portcullis.local app.portcullis.local hwk.portcullis.local mtls.portcullis.local metrics.portcullis.local" | sudo tee -a /etc/hosts
+          echo "127.0.0.1 portcullis.local auth.portcullis.local enroll.portcullis.local app.portcullis.local hwk.portcullis.local mtls.portcullis.local metrics.portcullis.local" | sudo tee -a /etc/hosts
 
           # Client certs: one for e2e from Vault, one from a foreign CA.
           VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
@@ -1433,7 +1518,6 @@ jobs:
       - name: Run the browser login tests
         env:
           E2E_USER: e2e
-          E2E_OTHER: e2e-other
           E2E_CERT: /tmp/e2e.crt
           E2E_KEY: /tmp/e2e.key
           E2E_FOREIGN_CERT: /tmp/foreign.crt
