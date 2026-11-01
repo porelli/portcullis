@@ -416,6 +416,8 @@ class PathGroupsTest(GateTest):
         self.assertEqual(n("/x/..")[0], "/")
         self.assertEqual(n("/../../admin")[0], "/admin")
         self.assertEqual(n("http://h/admin?q")[0], "/admin")
+        with self.assertRaises(gg.PathError):              # absolute-form keeps its "\n"
+            n("http://h/admin\n")
         self.assertIn("/admin", n("/%2561dmin"))           # double-decoding backends
         self.assertIn("/admin/x", n("/admin;jsessionid=1/x"))
         self.assertIn("/admin", n("/x\\..\\admin"))
@@ -875,6 +877,27 @@ class PolicyV4Test(GateTest):
             {"version": 1, "fields": {"city": "City", "dept_": "Dept-"},
              "users": {"bob": {"city": ["Milan"], "dept_": ["x"]}}})["bob"]),
             [("X-Forwarded-Attr-City", "Milan")])
+
+    def test_attribute_field_or_header_with_trailing_newline_skipped(self):
+        # Python's "$" also matches before a trailing "\n": validation must
+        # use fullmatch, so "city\n" / "City\n" are skipped like any other
+        # invalid field, and no header is emitted for them.
+        doc = {"version": 1, "fields": {"city\n": "City", "dept": "Dept\n", "ok": "Ok"},
+               "users": {"bob": {"city\n": ["Milan"], "dept": ["x"], "ok": ["v"]}}}
+        self.assertEqual(gg.parse_user_attributes(doc)["bob"], [("X-Forwarded-Attr-Ok", "v")])
+        write_attrs(doc)
+        status, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
+        self.assertEqual(status, 200)
+        attrs = {k: v for k, v in hdrs.items() if k.lower().startswith("x-forwarded-attr-")}
+        self.assertEqual(attrs, {"X-Forwarded-Attr-Ok": "v"})
+        doc = {"version": 1, "fields": {"city": "City\n"}, "users": {"bob": {"city": ["Milan"]}}}
+        self.assertEqual(gg.parse_user_attributes(doc), {})
+
+    def test_rfc3339_rejects_trailing_newline(self):
+        self.assertGreater(gg._parse_rfc3339("2030-01-01T00:00:00Z"), 0)
+        for bad in ("2030-01-01T00:00:00Z\n", "2030-01-01T00:00:00+00:00\n"):
+            with self.assertRaises(ValueError):
+                gg._parse_rfc3339(bad)
 
     def test_attribute_headers_missing_or_corrupt_file_never_denies(self):
         for doc in (None, "{not json", [], {"version": 2, "fields": {}, "users": {}},

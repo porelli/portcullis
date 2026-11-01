@@ -398,13 +398,13 @@ def load_policy_file() -> dict:
 
 # ── Temporary memberships (expiring, policy file v4) ─────────────────
 
-_RFC3339_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$")
+_RFC3339_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})")
 _EXPIRING_CACHE: dict = {"doc": None, "entries": None}
 _EXPIRING_LOCK = threading.Lock()
 
 
 def _parse_rfc3339(value) -> float:
-    if not isinstance(value, str) or not _RFC3339_RE.match(value):
+    if not isinstance(value, str) or not _RFC3339_RE.fullmatch(value):
         raise ValueError("not an RFC 3339 timestamp with an offset")
     text = value[:-1] + "+00:00" if value.endswith("Z") else value
     frac = re.search(r"\.(\d+)", text)
@@ -457,8 +457,9 @@ ATTR_HEADER_PREFIX = "X-Forwarded-Attr-"
 ATTR_VALUE_MAX = 1024  # bytes (UTF-8) per value; longer values are dropped
 # Field names (contract §4.1): '_' only between letters/digits, <= 31 chars,
 # so the header mapping is injective and always a valid header name.
-_ATTR_FIELD_RE = re.compile(r"^(?=.{1,31}$)[a-z][a-z0-9]*(_[a-z0-9]+)*$")
-_ATTR_HEADER_RE = re.compile(r"^[A-Za-z0-9]+(-[A-Za-z0-9]+){0,30}$")
+# Always fullmatch(): "$" also matches before a trailing "\n".
+_ATTR_FIELD_RE = re.compile(r"(?=.{1,31}\Z)[a-z][a-z0-9]*(_[a-z0-9]+)*")
+_ATTR_HEADER_RE = re.compile(r"[A-Za-z0-9]+(-[A-Za-z0-9]+){0,30}")
 _ATTR_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _ATTR_CACHE: dict = {"key": None, "users": {}}
 _ATTR_LOCK = threading.Lock()
@@ -489,7 +490,7 @@ def parse_user_attributes(doc) -> dict:
     seen_headers = {}
     valid = {}
     for name, header in fields.items():
-        if not _ATTR_FIELD_RE.match(name) or not isinstance(header, str) or not _ATTR_HEADER_RE.match(header):
+        if not _ATTR_FIELD_RE.fullmatch(name) or not isinstance(header, str) or not _ATTR_HEADER_RE.fullmatch(header):
             # One bad field doesn't cost every other field its header: it is
             # skipped (logged once per file version: the result is cached).
             print(f"group-gate: skipping invalid attribute field {name!r} -> {header!r} in {ATTRIBUTES_FILE}", flush=True)
@@ -646,7 +647,7 @@ def normalize_path_candidates(raw_uri: str) -> List[str]:
     path = uri.split("?", 1)[0]
     if not path.startswith("/"):
         # Absolute-form ("http://h/p") or garbage: keep only the path part.
-        m = re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/]*(/.*)?$", path)
+        m = re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*://[^/]*(/.*)?", path)
         path = (m.group(1) or "/") if m else "/" + path
     try:
         once = urllib.parse.unquote(path, errors="strict") if "%" in path else path
