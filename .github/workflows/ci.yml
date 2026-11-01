@@ -1025,6 +1025,12 @@ jobs:
       - name: Test passkey-only flows, setup links and the invite APIs
         run: |
           set -o pipefail
+          # The invite IdP is created by configure once enroll runs (Keycloak
+          # resolves http://enroll:8445 to accept it; it is not in the realm
+          # import). Idempotent: the flows were synced by the first run.
+          OUT=$(./portcullis keycloak configure)
+          echo "$OUT" | grep -c "up to date" | grep -qx 3 || { echo "FAIL: flows rebuilt on a second configure"; echo "$OUT"; exit 1; }
+          echo "$OUT" | grep -q "invite identity provider (URLs, client secret): ok" || { echo "FAIL: invite IdP not configured"; echo "$OUT"; exit 1; }
           KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
             --data-urlencode client_id=admin-cli --data-urlencode "username=${KEYCLOAK_ADMIN:-admin}" \
             --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
@@ -1049,8 +1055,6 @@ jobs:
           RM=$(kc "/clients?clientId=realm-management" | jq -r '.[0].id')
           kc "/users/$SA/role-mappings/clients/$RM" | jq -e '[.[].name] | sort == ["manage-users", "view-users"]' >/dev/null \
             || { echo "FAIL: portcullis-enroll service account roles"; exit 1; }
-          # Idempotent: a second run rebuilds nothing.
-          ./portcullis keycloak configure | grep -c "up to date" | grep -qx 3 || { echo "FAIL: flows rebuilt on a second configure"; exit 1; }
           echo "PASS: passkey-only browser flow, hidden invite IdP (link-only), enroll service account; configure idempotent"
 
           # Setup links (CLI → enroll over docker exec; enroll needs no secret on argv).

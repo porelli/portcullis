@@ -307,42 +307,6 @@
       "config": { "default.reference.value": "hwk", "default.reference.maxAge": "36000" }
     }
   ],
-  "identityProviders": [
-    {
-      "alias": "portcullis-invite",
-      "displayName": "Portcullis invite",
-      "providerId": "oidc",
-      "enabled": true,
-      "hideOnLogin": true,
-      "trustEmail": false,
-      "storeToken": false,
-      "addReadTokenRoleOnCreate": false,
-      "linkOnly": false,
-      "firstBrokerLoginFlowAlias": "portcullis-invite-link",
-      "postBrokerLoginFlowAlias": "portcullis-invite-session",
-      "config": {
-        "clientId": "keycloak",
-        "clientSecret": "INVITE_CLIENT_SECRET_PLACEHOLDER",
-        "clientAuthMethod": "client_secret_post",
-        "authorizationUrl": "https://enroll.portcullis.local/invite/authorize",
-        "tokenUrl": "http://enroll:8445/oidc/token",
-        "jwksUrl": "http://enroll:8445/oidc/jwks",
-        "issuer": "https://enroll.portcullis.local/invite",
-        "useJwksUrl": "true",
-        "validateSignature": "true",
-        "pkceEnabled": "true",
-        "pkceMethod": "S256",
-        "disableUserInfo": "true",
-        "defaultScope": "openid",
-        "syncMode": "IMPORT",
-        "loginHint": "false",
-        "backchannelSupported": "false",
-        "acceptsPromptNoneForwardFromClient": "false",
-        "guiOrder": "",
-        "filteredByClaim": "false"
-      }
-    }
-  ],
   "browserFlow": "portcullis-universal",
   "requiredActions": [
     {

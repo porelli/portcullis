@@ -445,6 +445,11 @@ _kc_sync_flow() {
   echo "    $top: rebuilt from realm-export.json"
 }
 
+# Not in realm-export.json: Keycloak validates the http token / JWKS URLs
+# against sslRequired=external by RESOLVING the host (SslRequired.isLocal:
+# loopback / site-local only), and at the first start's --import-realm
+# enroll may not run yet → "The url [token_url] requires secure
+# connections" aborts the import. keycloak/invite-idp.json is created here.
 # _kc_invite_idp — the `portcullis-invite` identity provider (enroll's
 # one-time invite login, enroll/invite.go): created from realm-export.json
 # if missing, URLs (domain) and the client secret
@@ -455,13 +460,16 @@ _kc_invite_idp() {
   [ -r "$secret_file" ] || { warn "    $secret_file missing (./portcullis up creates it) — invite login not configured"; return 0; }
   rep="$(kc_get "/$KC_REALM/identity-provider/instances/portcullis-invite")"
   if ! printf '%s' "$rep" | jq -e '.alias' >/dev/null 2>&1; then
-    rep="$(jq -c '.identityProviders[] | select(.alias == "portcullis-invite")' "$(_kc_export)")"
+    rep="$(jq -c . "$PORTCULLIS_ROOT/keycloak/invite-idp.json")"
     code="$(printf '%s' "$rep" | kc_send POST "/$KC_REALM/identity-provider/instances")"
-    _kc_report "invite identity provider" "$code" 201 || return 0
+    _kc_report "invite identity provider" "$code" 201 || {
+      warn "    Keycloak accepts the http back-channel (http://enroll:8445) only while the name enroll resolves to"
+      warn "    a private address (sslRequired=external): start enroll, then re-run ./portcullis keycloak configure"
+      return 0; }
     rep="$(kc_get "/$KC_REALM/identity-provider/instances/portcullis-invite")"
   fi
   code="$(printf '%s' "$rep" | jq -c --arg d "$domain" --rawfile secret "$secret_file" \
-      --argjson want "$(jq -c '.identityProviders[] | select(.alias == "portcullis-invite")' "$(_kc_export)")" '
+      --argjson want "$(jq -c . "$PORTCULLIS_ROOT/keycloak/invite-idp.json")" '
       . + ($want | {enabled, hideOnLogin, trustEmail, storeToken, linkOnly, firstBrokerLoginFlowAlias, postBrokerLoginFlowAlias})
       | .config = ((.config // {}) + $want.config + {
           clientSecret: ($secret | rtrimstr("\n")),
