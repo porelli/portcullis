@@ -336,7 +336,7 @@ services:
       traefik.http.routers.lldap.rule: Host(`directory.${PORTCULLIS_DOMAIN:-portcullis.local}`)
       traefik.http.routers.lldap.entrypoints: websecure
       traefik.http.routers.lldap.tls.options: authaware@file
-      traefik.http.routers.lldap.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.routers.lldap.middlewares: client-headers@file,portcullis-auth-console@docker,portcullis-groups@docker,security-headers@file
       traefik.http.services.lldap.loadbalancer.server.port: "17170"
     healthcheck:
       test: ["CMD", "/app/lldap", "healthcheck", "--config-file", "/data/lldap_config.toml"]
@@ -509,8 +509,9 @@ services:
       # X-Auth-Request-User / X-Auth-Request-Preferred-Username = LLDAP username
       # (never the user-editable email, nor Keycloak's user id).
       traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,Authorization,X-Forwarded-Access-Token
-      # Keycloak's admin consoles only: the same, minus Authorization (the
-      # console's own bearer token must reach the admin API).
+      # Admin consoles with their own bearer tokens (Keycloak's consoles, the
+      # LLDAP web UI): the same, minus Authorization, so the console's token
+      # reaches its API instead of being replaced by the Keycloak one.
       traefik.http.middlewares.portcullis-auth-console.forwardauth.address: http://forward-auth:4180
       traefik.http.middlewares.portcullis-auth-console.forwardauth.trustForwardHeader: "true"
       traefik.http.middlewares.portcullis-auth-console.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,X-Forwarded-Access-Token
