@@ -17,10 +17,15 @@ This is the **core infrastructure repo**. Related repos:
 
 ### Documentation
 
+All documentation lives in the docs site repo `porelli/portcullis-docs` (published at https://porelli.github.io/portcullis-docs/); its `CLAUDE.md` maps every kind of change to the page to update. This repo keeps only `README.md` (overview + links to the site). `docs/*.md` here are **one-line pointers** to the published pages (kept so old links resolve): never add content to them or new files to `docs/`; code comments that say "see docs/X.md" mean the page that pointer links to.
+
 Every code change MUST have corresponding documentation updates:
 
 - **New app template** → add to `porelli/portcullis-templates`, regenerate docs catalog
-- **Auth changes** → update manifest `auth` section, update `docs/certificates.md` or `group-gate/group-gate-map.conf`
+- **Auth changes** → update manifest `auth` section, `docs/setup/certificates.md` / `docs/operations/auth-policies.md` in the docs repo, or `group-gate/group-gate-map.conf`
+- **Hardening, socket proxies, secrets ownership, header trust** → `docs/operations/hardening.md` in docs repo (authoritative per-service table)
+- **Backups / monitoring** → `docs/operations/backups.md` / `docs/operations/monitoring.md` in docs repo
+- **New or changed `./portcullis` command or option** → `docs/operations/cli.md` in docs repo
 - **Hub UI changes** → make in `porelli/portcullis-hub`, update `docs/operations/hub.md` in docs repo
 - **CI/test changes** → update `docs/operations/testing.md` in docs repo
 - **Group model changes** → update `docs/operations/groups.md` in docs repo
@@ -41,7 +46,7 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 - Admin groups: `admin_<app>` — grants admin privileges
 - Core infrastructure requires `lldap_admin` group (`enroll.<domain>/self` is the one exception: any signed-in user, own cert only)
 - Groups: LLDAP → Keycloak (LDAP sync) → oauth2-proxy → group-gate
-- **Identity = LLDAP username, never the email** (users can edit their own mail in LLDAP): Keycloak LDAP `trustEmail=false` and `cachePolicy=NO_CACHE` (export + `keycloak configure`'s `_kc_ldap_patch`: LLDAP group/attribute changes reach the next token), oauth2-proxy injects `preferred_username` as `X-Auth-Request-User`/`X-Forwarded-User`/`X-Auth-Request-Preferred-Username` (its session user is `sub`; alpha `userIDClaim` is just an alias of `emailClaim` — never use it) + `insecureAllowUnverifiedEmail`; group-gate reads the user ONLY from `X-Auth-Request-Preferred-Username` (denies without it) and returns `X-Forwarded-User` = username and `X-Forwarded-Email` = email. Every identity header must be in the forward-auth middlewares' `authResponseHeaders` (that is what strips client copies). Details: `docs/hardening.md`
+- **Identity = LLDAP username, never the email** (users can edit their own mail in LLDAP): Keycloak LDAP `trustEmail=false` and `cachePolicy=NO_CACHE` (export + `keycloak configure`'s `_kc_ldap_patch`: LLDAP group/attribute changes reach the next token), oauth2-proxy injects `preferred_username` as `X-Auth-Request-User`/`X-Forwarded-User`/`X-Auth-Request-Preferred-Username` (its session user is `sub`; alpha `userIDClaim` is just an alias of `emailClaim` — never use it) + `insecureAllowUnverifiedEmail`; group-gate reads the user ONLY from `X-Auth-Request-Preferred-Username` (denies without it) and returns `X-Forwarded-User` = username and `X-Forwarded-Email` = email. Every identity header must be in the forward-auth middlewares' `authResponseHeaders` (that is what strips client copies). Details: docs repo `docs/operations/hardening.md`
 
 ### Testing
 
@@ -74,8 +79,8 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 - `portcullis-proxy` has fixed IPAM (`PORTCULLIS_PROXY_SUBNET`/`_IP_RANGE`); Traefik is pinned to `PORTCULLIS_TRAEFIK_IP` — header-auth apps trust only that IP
 - `templates/` must exist before `up` (`init`/`up`/`upgrade` create it); the Hub fills it
 - Hub image: `${HUB_IMAGE:-ghcr.io/porelli/portcullis-hub:edge}` (edge = main; releases are semver tags). It needs `HUB_PROXY_SECRET` (contract §5): the `hub-proxy-secret@docker` headers middleware injects it, placed AFTER the forward-auth middlewares so the secret never reaches oauth2-proxy / group-gate
-- **No service mounts `/var/run/docker.sock` except `socket-proxy-traefik` (read-only) and `socket-proxy-hub`** (contract §6), each on its own internal network. Endpoint sets and limits: `docs/hardening.md`
-- Every core image is pinned `tag@sha256:…` (get the index digest from the registry, e.g. `docker manifest inspect` / registry API); every service has `no-new-privileges`, `cap_drop: ALL`, mem/pids limits; read-only root FS + non-root where possible (exceptions in `docs/hardening.md`). CI enforces pins, the socket rule and the hardening baseline
+- **No service mounts `/var/run/docker.sock` except `socket-proxy-traefik` (read-only) and `socket-proxy-hub`** (contract §6), each on its own internal network. Endpoint sets and limits: docs repo `docs/operations/hardening.md`
+- Every core image is pinned `tag@sha256:…` (get the index digest from the registry, e.g. `docker manifest inspect` / registry API); every service has `no-new-privileges`, `cap_drop: ALL`, mem/pids limits; read-only root FS + non-root where possible (exceptions in docs repo `docs/operations/hardening.md`). CI enforces pins, the socket rule and the hardening baseline
 - Keycloak sits on `portcullis-auth` (internal, fixed IPAM `PORTCULLIS_AUTH_*`) with Traefik; `--proxy-trusted-addresses=$PORTCULLIS_AUTH_TRAEFIK_IP` — proxy headers incl. the forwarded client cert (X.509 login, `traefik` lookup provider, `client-cert-pem@file`) are trusted only from there. All `auth.<domain>` routers use `authaware@file`
 - Client certs: `CLIENT_CERT_TTL` (default 720h); `pki setup` rewrites the Vault role every run. Self-service renewal at `enroll.<domain>/self` (router `enroll-self`, `portcullis-self@docker` = group-gate `/authenticated`)
 - Hub auto-clones templates from `porelli/portcullis-templates`. The Hub's LLDAP access is its own service account `portcullis-hub` (`lldap_admin`), reconciled by `init`/`up`/`upgrade` (`lldap_service_account`, scripts/lib/users.sh); credentials are FILES `secrets/hub/lldap/{username,password}` → `/run/portcullis/lldap` (never env vars). Contract §9
@@ -111,7 +116,6 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 | `enroll/invite.go`, `enroll/keycloak.go` | Setup links: invite store, public `/invite/*`, the `portcullis-invite` OIDC IdP (id_token/JWKS via go-jose), Hub invite API, `enroll invite` (CLI); Keycloak service-account client (gocloak). Vault via `hashicorp/vault/api`, LLDAP via `go-ldap` |
 | `scripts/lib/users.sh` | `portcullis invite`, the Hub's LLDAP service account, invite / service-account secret files |
 | `enroll/self.go` | Self-service renewal: same key, current valid unrevoked cert, CN = signed-in user |
-| `docs/hardening.md` | Socket proxies, per-service hardening and exceptions, secrets ownership, header trust |
 | `tests/test_cli.sh` | CLI help / argument parsing / dispatch / `init --env-only` tests (stub `docker`) |
 | `keycloak/realm-export.json` | Keycloak realm with WebAuthn + X.509 flows |
 | `tests/test_shell_libs.sh` | Unit tests for `.env` handling, secret generation, network validation, revoked-serial sync, `pki setup` idempotency (stub `docker`/`vault`) |
@@ -123,6 +127,6 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 | `.github/workflows/release.yml` | Release on `vX.Y.Z` tags |
 | `.github/dependabot.yml` | Weekly grouped dependency updates |
 | `CHANGELOG.md` | Keep a Changelog; release notes come from its `## [X.Y.Z]` section |
-| `docs/backups.md`, `docs/monitoring.md` | Backups (restic, verify, restore), monitoring profile (scrapes, alerts, receivers) |
+| `docs/*.md` | One-line pointers to the docs site (backups, monitoring, hardening, certificates, DNS, app guides); the content lives in `porelli/portcullis-docs` |
 | `monitoring/` | Prometheus config + `alerts.yml` (+ `tests/`), blackbox modules, Grafana provisioning + dashboard; `textfile/` is generated |
 | `vault/policies/metrics.hcl` | Policy of the Prometheus token (read `sys/metrics`) |
