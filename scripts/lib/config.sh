@@ -147,7 +147,8 @@ config_init() {
     [ ! -e "$cfg" ] || fail "config/ already exists. Remove it first to clone fresh."
     git clone "$from" "$cfg"
     ok "Config cloned from $from"
-  elif [ ! -d "$cfg/.git" ]; then
+  elif [ ! -d "$cfg/.git" ] || ! git -C "$cfg" rev-parse -q --verify HEAD >/dev/null 2>&1; then
+    # (also finishes a run that stopped before the first commit)
     info "Creating config/ (a separate git repo for your settings)..."
     (umask 077 && mkdir -p "$cfg/traefik")
     if [ -f "$PORTCULLIS_ROOT/.env" ] && [ ! -L "$PORTCULLIS_ROOT/.env" ]; then
@@ -174,7 +175,11 @@ Settings of one Portcullis instance, kept out of the Portcullis checkout
 `.env` holds every secret: push this repo only to a private remote, or
 add `.env` to `.gitignore` and back it up some other way.
 EOF
-    (cd "$cfg" && git init -q && git add -A && git commit -q -m "initial portcullis config")
+    # A fresh server often has no git identity: commit as "portcullis"
+    # then (only for this commit; the operator's own commits are theirs).
+    local -a ident=()
+    git config user.email >/dev/null 2>&1 || ident=(-c user.name=portcullis -c "user.email=portcullis@${PORTCULLIS_DOMAIN:-localhost}")
+    (cd "$cfg" && git init -q && git add -A && git ${ident[@]+"${ident[@]}"} commit -q -m "initial portcullis config")
     ok "config/ initialised."
   else
     info "config/ already initialised — refreshing symlinks."
