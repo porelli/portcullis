@@ -30,6 +30,8 @@ tag's version as its release notes.
 
 ### Fixed
 
+- group-gate no longer accepts the obsolete `password` policy factor; a policy naming it is denied as malformed (fail closed). The Hub already rewrites such policies.
+
 - Keycloak admin consoles behind forward-auth answered "You do not have permission to access this resource": `portcullis-auth` replaced the console's own `Authorization: Bearer` header with the forward-auth session's token. The `/admin` router uses `portcullis-auth-console` (same, minus `Authorization`). The console's ~40 JS chunks also hit the login rate limit (HTTP 429, "Failed to fetch dynamically imported module"): `/resources/` has its own router with the general limit.
 - `init`, `up` and `upgrade` now run `config apply`, so `ACME_STAGING` and `MTLS_ENABLED` reach Traefik. Previously only the CA bundle was rebuilt, and Traefik always used the production ACME CA. A first flip to staging also clears ACME storage that the compose default (production) had already filled.
 

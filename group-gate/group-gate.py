@@ -22,7 +22,7 @@ Checks, run in order:
      Traefik's entrypoint deletes client-supplied X-Forwarded-Tls-Client-*
      headers, so the header only ever describes a cert Traefik verified.
   1. Auth policy — does the current session's ACR/AMR satisfy the app's
-     required factor set (one of mtls/webauthn/password, with AND/OR
+     required factor set (one of mtls/webauthn, with AND/OR
      semantics)? If not, 403 with a stepup URL so the user can re-auth
      at the needed Level of Authentication.
      mTLS binding: when the policy is satisfied only through the `mtls`
@@ -143,12 +143,13 @@ DENY_USERS = frozenset(u.strip().lower() for u in os.environ.get("GATE_DENY_USER
 FACTOR_TO_AMR = {
     "mtls": "mtls",
     "webauthn": "hwk",
-    "password": "pwd",
 }
+# There is no "password" factor: the browser flow has no password sign-in,
+# and a stored policy naming it is unknown → denied (fail closed). The Hub
+# rewrites such policies on load before publishing.
 
 # Factor → LoA level (must match the realm acr.loa.map).
 FACTOR_TO_LOA = {
-    "password": 1,
     "webauthn": 2,
     "mtls": 3,
 }
@@ -1229,10 +1230,6 @@ def evaluate_policy(policy: dict, acr: str, amr: list) -> Tuple[bool, str, int]:
         return True, "public", 0
 
     amr_set = set(amr or [])
-    # The browser flow has no password: "password" (any first factor) is
-    # met by every hardware factor too.
-    if amr_set & {"hwk", "mtls"}:
-        amr_set.add(FACTOR_TO_AMR["password"])
     needed_amrs = {FACTOR_TO_AMR[f] for f in factors}
 
     if op == "all":

@@ -179,10 +179,6 @@ class GateTest(unittest.TestCase):
         self.assertIn('href="https://enroll.example.com/"', body)
         self.assertNotIn("account-security", body)
 
-    def test_stepup_page_password_factor_redirects(self):
-        body = self.stepup_page({"factors": ["password"], "op": ""}, amr=())
-        self.assertIn('http-equiv="refresh" content="2;url=https://auth.example.com/oauth2/start?', body)
-        self.assertNotIn("No hardware key", body)
 
     def test_stepup_url_is_on_the_auth_host(self):
         # A host-less /oauth2/ router gets 421 from Traefik on tiered hosts.
@@ -221,12 +217,11 @@ class GateTest(unittest.TestCase):
                                               extra={"X-Auth-Request-Preferred-Username": name}), 403)
         self.assertEqual(self.req("hub.example.com", groups="lldap_admin"), 200)
 
-    def test_password_factor_met_by_hardware_factors(self):
-        # No password in the browser flow: hwk / mtls sessions satisfy it.
-        for amr in (["hwk"], ["mtls"], ["pwd"]):
-            self.assertTrue(gg.evaluate_policy({"factors": ["password"], "op": ""}, "", amr)[0], amr)
-        self.assertFalse(gg.evaluate_policy({"factors": ["password"], "op": ""}, "", [])[0])
-        self.assertTrue(gg.evaluate_policy({"factors": ["password", "webauthn"], "op": "all"}, "", ["hwk"])[0])
+    def test_password_factor_is_unknown_and_fails_closed(self):
+        # No password sign-in exists any more: a policy naming it is
+        # malformed, so the request is denied rather than treated as public.
+        for factors in (["password"], ["password", "webauthn"]):
+            self.assertIn("unknown factor", gg.validate_policy({"factors": factors, "op": "any"}) or "")
         self.assertFalse(gg.evaluate_policy({"factors": ["webauthn"], "op": ""}, "", ["mtls"])[0])
 
     def portal(self, groups, doc):
