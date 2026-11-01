@@ -68,9 +68,10 @@ Both methods are phishing-resistant and hardware-backed. Users can have both.
 |-----------|------|-----|
 | **Traefik** | Reverse proxy, wildcard TLS, mTLS, forward auth, dashboard | `traefik.<domain>` |
 | **Enrollment UI** | YubiKey enrollment hub (WebAuthn + mTLS) | `enroll.<domain>` |
-| **Hub** | App catalog — enable/disable templates, manage sources | `hub.<domain>` |
+| **Hub** | App catalog — enable/disable templates, manage sources (admins) | `hub.<domain>` |
+| **People** | The Hub's directory — users, groups, org chart, for every signed-in user (permissions checked per request) | `people.<domain>` |
 | **Keycloak** | WebAuthn, SAML/OIDC IdP, X.509 auth | `auth.<domain>` |
-| **LLDAP** | Lightweight user/group directory with web UI | `directory.<domain>` |
+| **LLDAP** | Lightweight user/group directory (its own UI is break-glass only: `./portcullis lldap-ui`; `directory.<domain>` redirects to `people.<domain>`) | (internal) |
 | **Vault PKI** | Private CA, issues client certificates (30 days, self-service renewal) | `localhost:8200` |
 | **Forward Auth** | OIDC bridge — redirects unauthenticated browser users to Keycloak | (internal) |
 
@@ -95,8 +96,9 @@ link): `./portcullis invite admin --to hub` on the server.
 
 ### 2. Users and their keys
 
-Create users and groups in the Hub (**Users & Groups**, or LLDAP at
-`https://directory.<domain>`, which keeps its own login). Each new user gets
+Create users and groups in the directory at `https://people.<domain>`
+(the Hub's directory; `directory.<domain>` redirects there, and LLDAP's own
+UI is break-glass only: `./portcullis lldap-ui`). Each new user gets
 a setup link (Hub, or `./portcullis invite <user>`): open it, register the
 key, signed in — every later sign-in is one touch ("Sign in with Passkey").
 The link works once, expires after 72 h and replaces earlier links.

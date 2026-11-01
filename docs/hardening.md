@@ -122,6 +122,36 @@ Therefore:
   (the e2e test sends spoofed ones). Header-auth apps must log users in by
   `X-Forwarded-User` as a username and take the email from
   `X-Forwarded-Email`.
+- Attribute headers: on every request group-gate allows (`/` and
+  `/authenticated`, app and core subdomains alike) it also returns
+  `X-Forwarded-Attr-<Header-Name>` for the signed-in user's shared custom
+  fields, read from the Hub's `user-attributes.json` in `hub_data`
+  (contract §4.1/§5): values joined with `, `, control characters
+  (0x00–0x1F, 0x7F) stripped, values over 1 KB dropped and logged, non-ASCII
+  as UTF-8 bytes. A missing or corrupt file (logged) means no attribute
+  headers, never a deny; header names must match
+  `^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$`. `portcullis-groups` forwards them with
+  `authResponseHeadersRegex: ^X-Forwarded-Attr-`. A headers middleware can
+  only delete headers by exact name (and the field names are the Hub's), so
+  client-sent `X-Forwarded-Attr-*` are deleted by the same regex on every
+  forwardAuth middleware (`portcullis-auth`, `-auth-console`, `-groups`,
+  `-self`, `-public-guard`): Traefik removes all request headers matching it
+  before copying the auth server's. Public routers therefore get none, and
+  `_` aliases are dropped by the entrypoints (`aliasHeadersStrategy`). CI
+  sends forged ones through the gated and public test routers.
+- Temporary memberships: the policy file (version 4, the only version
+  group-gate serves) lists `expiring` `{user, group, at}` entries; group-gate
+  treats a membership as absent once `now >= at` — for the subdomain and
+  path-group checks and in the `X-Auth-Request-Groups` it returns —
+  whatever the token says, so expiry holds even while the Hub is down.
+  A malformed entry denies (fail closed).
+- `people.<domain>` (the Hub's directory listener `:8889`, contract §5.1)
+  is open to any signed-in user: `people=*` in `group-gate-map.conf` (`*` is
+  valid only there; in the policy file's `groups` it is ignored, in
+  `path_groups` it is malformed). It has the admin Hub's chain
+  (`client-headers`, `portcullis-auth`, `portcullis-groups`,
+  `hub-proxy-secret`, `security-headers`), and the Hub checks permissions
+  per request and registers no app / policy / Docker endpoint there.
 - enroll identifies the signed-in user by `X-Forwarded-User` as-is (no
   email → username lookup); group-gate's mTLS binding compares the cert CN
   with that same username (and requires the token's `preferred_username`
@@ -174,7 +204,7 @@ Therefore:
   forward-auth: nothing is signed in and no identity header is passed (the
   Hub's strip middleware deletes client copies). Their first middleware,
   `portcullis-public-guard@docker` (group-gate `/public-guard`), returns
-  403 unless the policy file (version 3) publishes the subdomain in
+  403 unless the policy file (version 4) publishes the subdomain in
   `public_paths`, the normalised path is inside one of its patterns
   (prefix / exact / static files; encoded `/`, `\`, NUL or `#` denied, and
   so is any `#` in `X-Forwarded-Uri`: browsers never send fragments), and the

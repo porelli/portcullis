@@ -198,7 +198,7 @@ class GateTest(unittest.TestCase):
         # Cert-only sessions are bound to the cert on the request.
         self.assertTrue(gg.policy_relies_on_mtls(pol, ["mtls"]))
         self.assertFalse(gg.policy_relies_on_mtls(pol, ["hwk", "mtls"]))
-        write_policy({"version": 3, "default": pol})
+        write_policy({"version": 4, "default": pol})
         code, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
         self.assertEqual(code, 403)
         self.assertIn("acr_values=hwk", hdrs.get("X-Stepup-URL", ""))
@@ -264,6 +264,14 @@ class GateTest(unittest.TestCase):
         admin = self.portal("lldap_admin, users_secret", doc)
         self.assertIn("https://hub.example.com/", admin)
         self.assertIn("Secret", admin)
+        self.assertIn('href="https://people.example.com/"', body)  # every signed-in user
+        self.assertNotIn("directory.example.com", admin)
+        # Expired temporary memberships don't list their apps.
+        write_policy({"version": 4, "expiring": [{"user": "bob", "group": "users_secret", "at": "2020-01-01T00:00:00Z"}]})
+        self.assertNotIn("Secret", self.portal("lldap_admin, users_secret", doc))
+        write_policy({"version": 3})
+        self.assertNotIn("Secret", self.portal("users_secret", doc))
+        write_policy(None)
         self.assertIn("not available", self.portal("users_wiki", {"version": 2, "apps": doc["apps"]}))
         self.assertIn("not available", self.portal("users_wiki", None))
         self.assertIn("not available", self.portal("users_wiki", "{broken"))
@@ -343,8 +351,11 @@ class GateTest(unittest.TestCase):
     # ── version ──
 
     def test_policy_version(self):
-        for doc, want in [({"version": 3}, 200), ({"version": 2}, 200), ({"version": 1}, 200), ({}, 200),
-                          ({"version": 4}, 403), ({"version": "2"}, 403), ({"version": True}, 403),
+        # group-gate serves only version 4 (contract §4); a file without
+        # `version` is treated as empty for the missing keys.
+        for doc, want in [({"version": 4}, 200), ({}, 200),
+                          ({"version": 3}, 403), ({"version": 2}, 403), ({"version": 1}, 403),
+                          ({"version": 5}, 403), ({"version": "4"}, 403), ({"version": True}, 403),
                           ({"version": 0}, 403)]:
             with self.subTest(doc=doc):
                 write_policy(doc)
@@ -378,7 +389,7 @@ def token(**claims):
     return f"{b64({'alg': 'RS256', 'typ': 'JWT'})}.{b64(claims)}.c2lnbmF0dXJl"
 
 
-ADMIN_RULES = {"version": 2,
+ADMIN_RULES = {"version": 4,
                "groups": {"vw": "users_vw"},
                "path_groups": {"vw": [{"prefix": "/admin", "group": "admin_vw"},
                                       {"prefix": "/admin/super", "group": "super_vw"},
@@ -511,7 +522,7 @@ def build_crl(serials, with_next_update=True, with_version=True, next_update=Non
 
 
 PUBLIC_DOC = {
-    "version": 3,
+    "version": 4,
     "public_paths": {
         "cloud": {
             "paths": [
@@ -608,13 +619,14 @@ class PublicGuardTest(GateTest):
                 self.assertEqual(self.guard("/s/AbC123?" + q), 403)
 
     def test_fail_closed(self):
-        for doc in [None, {}, {"version": 2, "public_paths": PUBLIC_DOC["public_paths"]}, {"version": 3},
-                    {"version": 3, "public_paths": []},
-                    {"version": 3, "public_paths": {"cloud": {"paths": [{"path": "/s", "match": "prefix"}], "extra": 1}}},
-                    {"version": 3, "public_paths": {"cloud": {"paths": []}}},
-                    {"version": 3, "public_paths": {"cloud": {"paths": [{"path": "/s/{token}", "match": "prefix"}]}}},
-                    {"version": 3, "public_paths": {"cloud": {"paths": [{"path": "/s/../x", "match": "prefix"}]}}},
-                    {"version": 3, "public_paths": {"cloud": {"paths": [{"path": "/s", "match": "regex"}]}}},
+        for doc in [None, {}, {"version": 3, "public_paths": PUBLIC_DOC["public_paths"]},
+                    {"public_paths": PUBLIC_DOC["public_paths"]}, {"version": 4},
+                    {"version": 4, "public_paths": []},
+                    {"version": 4, "public_paths": {"cloud": {"paths": [{"path": "/s", "match": "prefix"}], "extra": 1}}},
+                    {"version": 4, "public_paths": {"cloud": {"paths": []}}},
+                    {"version": 4, "public_paths": {"cloud": {"paths": [{"path": "/s/{token}", "match": "prefix"}]}}},
+                    {"version": 4, "public_paths": {"cloud": {"paths": [{"path": "/s/../x", "match": "prefix"}]}}},
+                    {"version": 4, "public_paths": {"cloud": {"paths": [{"path": "/s", "match": "regex"}]}}},
                     "not json"]:
             with self.subTest(doc=doc):
                 write_policy(doc)
@@ -641,7 +653,7 @@ class PublicGuardTest(GateTest):
                        headers=[("Cookie", "nc_token=CookieSecret"), ("Authorization", "Basic QmFzaWNTZWNyZXQ=")])
             self.guard("/s/SeCrEtToKeN42?apiKey=S3cr3tValue", headers=[("Cookie", "nc_token=CookieSecret")])
             self.guard("/s/SeCrEtToKeN42", headers=[("Authorization", "Basic QmFzaWNTZWNyZXQ=")])
-            write_policy({"version": 2, "path_groups": {"cloud": [{"prefix": "/admin", "group": "admin_x"}]}})
+            write_policy({"version": 4, "path_groups": {"cloud": [{"prefix": "/admin", "group": "admin_x"}]}})
             self.req("cloud.example.com", uri="/admin/SeCrEtToKeN42?apiKey=S3cr3tValue")
             self.req("cloud.example.com", uri="/admin/%2fSeCrEtToKeN42?apiKey=S3cr3tValue")
         out = buf.getvalue()
@@ -656,9 +668,181 @@ class PublicGuardTest(GateTest):
         self.assertFalse([k for k in hdrs if k.lower().startswith(("x-forwarded-user", "x-auth-request"))])
 
 
+ATTRS = os.path.join(TMP, "user-attributes.json")
+
+
+def write_attrs(doc):
+    if doc is None:
+        if os.path.exists(ATTRS):
+            os.remove(ATTRS)
+        return
+    tmp = ATTRS + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(doc if isinstance(doc, str) else json.dumps(doc))
+    os.replace(tmp, ATTRS)
+
+
+PAST = "2020-01-01T00:00:00Z"
+FUTURE = "2999-12-31T23:59:59Z"
+
+
+class PolicyV4Test(GateTest):
+    """Policy file v4 (contract §4): `expiring`; the `*` map value (§5.1)."""
+
+    def setUp(self):
+        super().setUp()
+        write_attrs(None)
+
+    def tearDown(self):
+        write_attrs(None)
+
+    def test_policy_v3_refused(self):
+        for doc in ({"version": 3}, {"version": 3, "groups": {"grafana": "users_grafana"}}):
+            with self.subTest(doc=doc):
+                write_policy(doc)
+                self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), 403)
+                self.assertEqual(self.req("random.example.com", groups=""), 403)
+        write_policy({"version": 4})
+        self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), 200)
+
+    def test_expired_membership_stripped(self):
+        write_policy({"version": 4, "groups": {"app": "b"},
+                      "expiring": [{"user": "bob", "group": "b", "at": PAST}]})
+        self.assertEqual(self.req("app.example.com", groups="a,b"), 403)
+        write_policy({"version": 4, "groups": {"app": "a"},
+                      "expiring": [{"user": "bob", "group": "b", "at": PAST}]})
+        status, hdrs = self.req("app.example.com", groups="a,b", want_headers=True)
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs.get("X-Auth-Request-Groups"), "a")
+        # Usernames in the file are lowercase; the session's case doesn't matter.
+        status, hdrs = self.req("app.example.com", groups="a,b", want_headers=True,
+                                extra={"X-Auth-Request-Preferred-Username": "Bob"})
+        self.assertEqual(hdrs.get("X-Auth-Request-Groups"), "a")
+        # Another user's expiry, or another group's, changes nothing.
+        write_policy({"version": 4, "groups": {"app": "b"},
+                      "expiring": [{"user": "alice", "group": "b", "at": PAST},
+                                   {"user": "bob", "group": "c", "at": PAST}]})
+        status, hdrs = self.req("app.example.com", groups="a,b", want_headers=True)
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs.get("X-Auth-Request-Groups"), "a,b")
+        # Path groups and the core map see the stripped set too.
+        write_policy({"version": 4, "path_groups": {"app": [{"prefix": "/admin", "group": "admin_app"}]},
+                      "expiring": [{"user": "bob", "group": "admin_app", "at": PAST},
+                                   {"user": "bob", "group": "lldap_admin", "at": PAST}]})
+        self.assertEqual(self.req("app.example.com", groups="admin_app", uri="/admin"), 403)
+        self.assertEqual(self.req("hub.example.com", groups="lldap_admin"), 403)
+        # Only every group expired: no X-Auth-Request-Groups at all.
+        status, hdrs = self.req("enroll.example.com", groups="lldap_admin", gate_path="/authenticated",
+                                want_headers=True)
+        self.assertEqual(status, 200)
+        self.assertNotIn("X-Auth-Request-Groups", hdrs)
+
+    def test_not_yet_expired_kept(self):
+        write_policy({"version": 4, "groups": {"app": "b"},
+                      "expiring": [{"user": "bob", "group": "b", "at": FUTURE}]})
+        status, hdrs = self.req("app.example.com", groups="a,b", want_headers=True)
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs.get("X-Auth-Request-Groups"), "a,b")
+        # The boundary: absent once now >= at.
+        doc = {"version": 4, "expiring": [{"user": "bob", "group": "b", "at": "2030-01-01T00:00:00Z"}]}
+        at = 1893456000.0
+        self.assertEqual(gg.expired_groups(doc, "bob", now=at - 1), set())
+        self.assertEqual(gg.expired_groups(doc, "bob", now=at), {"b"})
+
+    def test_malformed_expiring_fails_closed(self):
+        for exp in ({}, ["x"], [{"user": "bob", "group": "b"}], [{"user": "bob", "group": "b", "at": "tomorrow"}],
+                    [{"user": "bob", "group": "b", "at": "2030-01-01T00:00:00"}],  # no offset
+                    [{"user": "bob", "group": "b", "at": 1}], [{"user": "", "group": "b", "at": FUTURE}],
+                    [{"user": "bob", "group": "b", "at": FUTURE, "extra": 1}]):
+            with self.subTest(expiring=exp):
+                write_policy({"version": 4, "expiring": exp})
+                self.assertEqual(self.req("random.example.com", groups="a"), 403)
+
+    def test_star_any_signed_in(self):
+        self.assertEqual(gg.load_static_map().get("people"), "*")
+        self.assertEqual(self.req("people.example.com", groups=""), 200)
+        self.assertEqual(self.req("people.example.com", groups=None), 200)
+        self.assertEqual(self.req("people.example.com", groups="users_x"), 200)
+        # No session (no portcullis-auth username): denied.
+        self.assertEqual(self.req("people.example.com", groups="lldap_admin",
+                                  extra={"X-Auth-Request-Preferred-Username": None}), 403)
+        self.assertEqual(self.req("people.example.com", groups="",
+                                  extra={"X-Auth-Request-Preferred-Username": "portcullis-hub"}), 403)
+        # A core subdomain: the policy file can't restrict or reassign it.
+        write_policy({"version": 4, "groups": {"people": "lldap_admin"},
+                      "path_groups": {"people": [{"prefix": "/", "group": "lldap_admin"}]}})
+        self.assertEqual(self.req("people.example.com", groups="users_x"), 200)
+
+    def test_star_ignored_in_policy_file(self):
+        write_policy({"version": 4, "groups": {"grafana": "*", "newapp": "*"}})
+        # grafana keeps map.conf's group; newapp falls back to no mapping.
+        self.assertEqual(self.req("grafana.example.com", groups="users_x"), 403)
+        self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), 200)
+        self.assertEqual(gg.build_group_map(gg.load_policy_file()).get("newapp"), None)
+        # Holding a group literally named "*" never satisfies anything.
+        self.assertEqual(self.req("grafana.example.com", groups="*"), 403)
+        # In path_groups it is a malformed rule: fail closed.
+        write_policy({"version": 4, "path_groups": {"grafana": [{"prefix": "/x", "group": "*"}]}})
+        self.assertEqual(self.req("grafana.example.com", groups="users_grafana,*", uri="/y"), 403)
+
+    def test_attribute_headers(self):
+        write_attrs({"version": 1,
+                     "fields": {"city": "City", "cost_center": "Cost-Center", "bio": "Bio", "dept": "Dept"},
+                     "users": {"bob": {"city": ["Milan"], "cost_center": ["CC-1", "CC-2"],
+                                       "bio": ["evil\r\nX-Injected: 1\x00\x7f"],
+                                       "dept": ["x" * 1025, "ok"]},
+                               "alice": {"city": ["Berlin"]}}})
+        status, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs.get("X-Forwarded-Attr-City"), "Milan")
+        self.assertEqual(hdrs.get("X-Forwarded-Attr-Cost-Center"), "CC-1, CC-2")
+        self.assertEqual(hdrs.get("X-Forwarded-Attr-Bio"), "evilX-Injected: 1")
+        self.assertNotIn("X-Injected", hdrs)
+        self.assertEqual(hdrs.get("X-Forwarded-Attr-Dept"), "ok")  # > 1 KB value dropped
+        # Core subdomains and /authenticated get them too.
+        for host, groups, path in (("hub.example.com", "lldap_admin", "/"), ("people.example.com", "", "/"),
+                                   ("enroll.example.com", "", "/authenticated")):
+            with self.subTest(host=host):
+                status, hdrs = self.req(host, groups=groups, gate_path=path, want_headers=True)
+                self.assertEqual((status, hdrs.get("X-Forwarded-Attr-City")), (200, "Milan"))
+        # Never on a deny, nor for users absent from the file.
+        status, hdrs = self.req("grafana.example.com", groups="users_x", want_headers=True)
+        self.assertEqual(status, 403)
+        self.assertFalse([k for k in hdrs if k.lower().startswith("x-forwarded-attr-")])
+        status, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True,
+                                extra={"X-Auth-Request-Preferred-Username": "carol"})
+        self.assertEqual(status, 200)
+        self.assertFalse([k for k in hdrs if k.lower().startswith("x-forwarded-attr-")])
+        # Non-ASCII values travel as UTF-8 bytes.
+        write_attrs({"version": 1, "fields": {"city": "City"}, "users": {"bob": {"city": ["Zürich", "東京"]}}})
+        status, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
+        self.assertEqual(hdrs.get("X-Forwarded-Attr-City").encode("latin-1").decode("utf-8"), "Zürich, 東京")
+
+    def test_attribute_headers_missing_or_corrupt_file_never_denies(self):
+        for doc in (None, "{not json", [], {"version": 2, "fields": {}, "users": {}},
+                    {"version": 1, "fields": {"city": "City\r\nX: y"}, "users": {"bob": {"city": ["Milan"]}}},
+                    {"version": 1, "fields": {"city": "City"}, "users": {"bob": {"city": "Milan"}}},
+                    {"version": 1, "fields": {"City!": "City"}, "users": {"bob": {"City!": ["Milan"]}}},
+                    {"version": 1, "fields": [], "users": {}}):
+            with self.subTest(doc=doc):
+                write_attrs(doc)
+                status, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
+                self.assertEqual(status, 200)
+                self.assertFalse([k for k in hdrs if k.lower().startswith("x-forwarded-attr-")])
+
+    def test_no_attribute_headers_on_public_guard(self):
+        write_attrs({"version": 1, "fields": {"city": "City"}, "users": {"bob": {"city": ["Milan"]}}})
+        write_policy(PUBLIC_DOC)
+        status, hdrs = self.req("cloud.example.com", uri="/s/AbC123", gate_path="/public-guard", want_headers=True)
+        self.assertEqual(status, 200)
+        self.assertFalse([k for k in hdrs if k.lower().startswith("x-forwarded-attr-")])
+        write_policy(dict(PUBLIC_DOC, version=3))
+        self.assertEqual(self.req("cloud.example.com", uri="/s/AbC123", gate_path="/public-guard"), 403)
+
+
 class PathFragmentTest(GateTest):
     def test_hash_denied_on_path_rules(self):
-        write_policy({"version": 3, "groups": {"cloud": "users_x"},
+        write_policy({"version": 4, "groups": {"cloud": "users_x"},
                       "path_groups": {"cloud": [{"prefix": "/admin", "group": "admin_x"}]}})
         for uri in ["/x#/admin", "/x%23/../admin", "/admin%23"]:
             with self.subTest(uri=uri):

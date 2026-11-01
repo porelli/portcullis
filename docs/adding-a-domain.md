@@ -18,7 +18,7 @@ Create a single wildcard A record pointing all subdomains to your server:
 *.portcullis.example.com  A  203.0.113.10
 ```
 
-This means `auth.portcullis.example.com`, `directory.portcullis.example.com`,
+This means `auth.portcullis.example.com`, `people.portcullis.example.com`,
 `grafana.portcullis.example.com`, etc. all resolve to your server without
 creating individual records.
 
@@ -38,10 +38,14 @@ portcullis.example.com    A  203.0.113.10
 If you prefer explicit records, create one for each service:
 
 ```
+portcullis.example.com            A  203.0.113.10
 auth.portcullis.example.com       A  203.0.113.10
 directory.portcullis.example.com  A  203.0.113.10
 enroll.portcullis.example.com     A  203.0.113.10
+hub.portcullis.example.com        A  203.0.113.10
+people.portcullis.example.com     A  203.0.113.10
 traefik.portcullis.example.com    A  203.0.113.10
+metrics.portcullis.example.com    A  203.0.113.10   (monitoring profile only)
 ```
 
 You'll need to add a record each time you add a new service.
@@ -200,7 +204,7 @@ For local development without a real domain or ACME:
 3. Add entries to `/etc/hosts`:
 
 ```
-127.0.0.1  auth.portcullis.local directory.portcullis.local enroll.portcullis.local traefik.portcullis.local
+127.0.0.1  portcullis.local auth.portcullis.local directory.portcullis.local enroll.portcullis.local hub.portcullis.local people.portcullis.local traefik.portcullis.local
 ```
 
 4. Import `certs/root-ca.crt` into your browser/OS trust store to avoid certificate warnings

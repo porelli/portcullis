@@ -36,6 +36,9 @@ Checks, run in order:
      group (users_<app>)? If not, 403. The reserved group
      __portcullis_deny__ (published by the Hub for apps whose config is
      unknown) always denies, and so does a user who claims to be in it.
+     The map.conf value `*` (people.<domain>) means any signed-in user.
+     Temporary memberships (`expiring`) are absent once now >= at, for
+     this check, path groups and the returned X-Auth-Request-Groups.
   3. Path groups — for subdomains with `path_groups` rules, the normalised
      X-Forwarded-Uri path is matched against the rule prefixes (segment
      boundaries, longest prefix wins) and that rule's group is required in
@@ -50,7 +53,7 @@ Request paths on group-gate itself (the forwardAuth `address`):
                         the Hub's portcullis-public-<app> routers, no forward-
                         auth): no user, no group, no policy. Allows only if the
                         subdomain has a `public_paths` entry (policy file
-                        version 3), the normalised path is inside one of its
+                        version 4), the normalised path is inside one of its
                         patterns, and the request carries no credential
                         (Authorization, Proxy-Authorization, the app's
                         credential headers, cookies or query parameters,
@@ -65,11 +68,12 @@ Request paths on group-gate itself (the forwardAuth `address`):
                         Traefik's forwardAuth always calls / or /authenticated.
 
 Config sources (both re-read on every request; they are tiny):
-  - /etc/group-gate/map.conf — subdomain=required_group. Authoritative for
-    core subdomains (auth, traefik, hub, directory, enroll, metrics): the Hub policy
-    file can never override those.
+  - /etc/group-gate/map.conf — subdomain=required_group (`*` = any
+    signed-in user, valid only there). Authoritative for core subdomains
+    (auth, traefik, hub, directory, enroll, people, metrics): the Hub
+    policy file can never override those.
   - /hub-data/group-gate-policy.json — written by the Hub (contract §4):
-      {"version": 3,
+      {"version": 4,
        "policies": {"<subdomain>": {"factors": [...], "op": "any|all|"}},
        "default":  {"factors": [...], "op": "..."},
        "groups":   {"<subdomain>": "<required LLDAP group>"},
@@ -77,12 +81,21 @@ Config sources (both re-read on every request; they are tiny):
        "public_paths": {"<subdomain>": {"paths": [{"path": "/s/{token}", "match": "prefix"}],
                         "token_pattern": "^...$", "static_extensions": [...],
                         "credential_headers": [...], "credential_cookies": [...],
-                        "credential_query": [...]}}}
+                        "credential_query": [...]}},
+       "expiring": [{"user": "<lowercase username>", "group": "<LLDAP group>",
+                     "at": "<RFC 3339 UTC>"}]}
     Every map is keyed by the lowercase subdomain the request is for —
     never by template ID. Optional; no file means every app falls through to the group check
     only. Missing keys (incl. `version`) are treated as empty. A file that
-    exists but cannot be parsed, a newer `version` than this gate knows, or
-    a policy with unknown factor names / op / rule shape fails CLOSED (403).
+    exists but cannot be parsed, any `version` other than 4, or a policy /
+    expiry with unknown factor names / op / rule shape fails CLOSED (403).
+  - /hub-data/user-attributes.json — written by the Hub (contract §4.1):
+    {"version": 1, "fields": {"<field>": "<Header-Name>"},
+     "users": {"<user>": {"<field>": ["value", ...]}}}. Every allow on / and
+    /authenticated returns X-Forwarded-Attr-<Header-Name>: values joined
+    with ", ", control characters stripped, values over 1 KB dropped
+    (logged). Missing / corrupt file (logged) = no attribute headers, never
+    a deny.
 
 Host handling: X-Forwarded-Host is normalised (lowercased, port and
 trailing dot stripped) because Traefik's Host() matcher is
@@ -98,6 +111,7 @@ We only decode the payload to read the acr/amr/preferred_username claims.
 from __future__ import annotations
 
 import base64
+import datetime
 import hashlib
 import html
 import json
@@ -126,14 +140,20 @@ CERT_INFO_HEADER = "X-Forwarded-Tls-Client-Cert-Info"
 # Core infrastructure subdomains. Their required group comes only from
 # map.conf / GATE_MAP; Hub-written "groups" entries for them are ignored.
 # If map.conf somehow lacks one, it defaults to lldap_admin (fail closed).
-CORE_SUBDOMAINS = ("auth", "traefik", "hub", "directory", "enroll", "metrics")
+CORE_SUBDOMAINS = ("auth", "traefik", "hub", "directory", "enroll", "people", "metrics")
 CORE_DEFAULT_GROUP = "lldap_admin"
+# map.conf value meaning "any signed-in user" (people.<domain>, contract
+# §5.1). Valid ONLY in map.conf / GATE_MAP: in the policy file's `groups`
+# it is ignored and in `path_groups` it is malformed (fail closed).
+ANY_SIGNED_IN = "*"
 VALID_OPS = ("", "any", "all")
-# Highest policy-file schema version this gate understands (contract §4).
-POLICY_VERSION = 3
-# /public-guard needs a file of exactly this version: an older file has no
-# (or another) public_paths shape, so the guard denies.
-PUBLIC_GUARD_VERSION = 3
+# The one policy-file schema version this gate serves (contract §4): any
+# other `version` denies (an older file lacks `expiring`, so a temporary
+# membership would never end; a newer one may carry restrictions we would
+# drop). A file without `version` is treated as empty for missing keys.
+POLICY_VERSION = 4
+# /public-guard needs a file of exactly this version (no `version` = deny).
+PUBLIC_GUARD_VERSION = 4
 # Reserved group (contract §4): the Hub publishes it for routed apps whose
 # config is unknown. It always denies; nobody may claim membership.
 DENY_GROUP = "__portcullis_deny__"
@@ -201,6 +221,10 @@ def build_group_map(policy_doc: dict) -> dict:
                 continue
             sub, group = sub.strip().lower(), group.strip()
             if not sub or not group:
+                continue
+            if group == ANY_SIGNED_IN:
+                print(f"group-gate: ignoring policy-file group {group!r} for {sub!r} (valid only in map.conf)",
+                      flush=True)
                 continue
             if sub in CORE_SUBDOMAINS:
                 if group != mapping[sub]:
@@ -320,14 +344,14 @@ def render_portal(user: str, groups: set, apps, domain: str) -> bytes:
         app_html = "<ul class=\"grid\">" + "".join(cards) + "</ul>"
     else:
         app_html = "<p class=\"muted\">No apps are available to you yet.</p>"
-    own = [("My passkeys", f"https://auth.{domain}/realms/portcullis/account/account-security/signing-in"),
+    own = [("People (directory)", f"https://people.{domain}/"),
+           ("My passkeys", f"https://auth.{domain}/realms/portcullis/account/account-security/signing-in"),
            ("My client certificate", f"https://enroll.{domain}/self")]
     admin = []
     if "lldap_admin" in groups:
         admin = [("Hub (apps, users &amp; marketplace)", f"https://hub.{domain}/"),
                  ("Keycloak (realm console)", f"https://auth.{domain}/admin/portcullis/console/"),
                  ("Certificates", f"https://enroll.{domain}/"),
-                 ("Directory (LLDAP, own login)", f"https://directory.{domain}/"),
                  ("Traefik", f"https://traefik.{domain}/")]
     def ul(items):
         return "<ul class=\"plain\">" + "".join(f'<li><a href="{e(u)}">{t}</a></li>' for t, u in items) + "</ul>"
@@ -357,10 +381,144 @@ def load_policy_file() -> dict:
     if version is not None:
         if isinstance(version, bool) or not isinstance(version, int) or version < 1:
             raise PolicyError(f"invalid policy file version {version!r}")
-        if version > POLICY_VERSION:
-            # A newer schema may carry restrictions we would silently drop.
-            raise PolicyError(f"policy file version {version} is newer than supported ({POLICY_VERSION})")
+        if version != POLICY_VERSION:
+            raise PolicyError(f"policy file version {version} is not supported (only {POLICY_VERSION})")
     return doc
+
+
+# ── Temporary memberships (expiring, policy file v4) ─────────────────
+
+_RFC3339_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$")
+_EXPIRING_CACHE: dict = {"doc": None, "entries": None}
+_EXPIRING_LOCK = threading.Lock()
+
+
+def _parse_rfc3339(value) -> float:
+    if not isinstance(value, str) or not _RFC3339_RE.match(value):
+        raise ValueError("not an RFC 3339 timestamp with an offset")
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    frac = re.search(r"\.(\d+)", text)
+    if frac and len(frac.group(1)) > 6:  # datetime has microseconds only
+        text = text.replace(frac.group(0), "." + frac.group(1)[:6])
+    return datetime.datetime.fromisoformat(text).timestamp()
+
+
+def expiring_entries(policy_doc: dict) -> List[Tuple[str, str, float]]:
+    """[(lowercase user, group, at as epoch seconds)] of the `expiring`
+    array; raises PolicyError if it is malformed (deny). Cached per parsed
+    policy document."""
+    with _EXPIRING_LOCK:
+        if _EXPIRING_CACHE["doc"] is policy_doc and _EXPIRING_CACHE["entries"] is not None:
+            return _EXPIRING_CACHE["entries"]
+    raw = policy_doc.get("expiring") if isinstance(policy_doc, dict) else None
+    entries = []
+    if raw is not None:
+        if not isinstance(raw, list):
+            raise PolicyError("'expiring' is not a list")
+        for e in raw:
+            if not isinstance(e, dict) or set(e) != {"user", "group", "at"}:
+                raise PolicyError("'expiring' entry is not {user, group, at}")
+            user, group = e["user"], e["group"]
+            if not isinstance(user, str) or not user.strip() or not isinstance(group, str) or not group.strip():
+                raise PolicyError("'expiring' entry has an invalid user or group")
+            try:
+                at = _parse_rfc3339(e["at"])
+            except ValueError as err:
+                raise PolicyError(f"'expiring' entry has an invalid 'at' {e['at']!r}: {err}") from err
+            entries.append((user.strip().lower(), group.strip(), at))
+    with _EXPIRING_LOCK:
+        _EXPIRING_CACHE.update(doc=policy_doc, entries=entries)
+    return entries
+
+
+def expired_groups(policy_doc: dict, username: str, now: Optional[float] = None) -> set:
+    """Groups of `username` whose temporary membership has ended: absent
+    once now >= at, whatever the token says (contract §4)."""
+    now = time.time() if now is None else now
+    user = username.strip().lower()
+    return {g for u, g, at in expiring_entries(policy_doc) if u == user and now >= at}
+
+
+# ── User attributes (user-attributes.json, contract §4.1 / §5) ───────
+
+ATTRIBUTES_FILE = os.environ.get("GATE_ATTRIBUTES_FILE",
+                                 os.path.join(os.path.dirname(POLICY_FILE), "user-attributes.json"))
+ATTR_HEADER_PREFIX = "X-Forwarded-Attr-"
+ATTR_VALUE_MAX = 1024  # bytes (UTF-8) per value; longer values are dropped
+_ATTR_FIELD_RE = re.compile(r"^[a-z][a-z0-9_]{0,30}$")
+_ATTR_HEADER_RE = re.compile(r"^[A-Za-z0-9]+(-[A-Za-z0-9]+){0,30}$")
+_ATTR_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_ATTR_CACHE: dict = {"key": None, "users": {}}
+_ATTR_LOCK = threading.Lock()
+
+
+class AttributesError(Exception):
+    pass
+
+
+def parse_user_attributes(doc) -> dict:
+    """{lowercase user: [(header, value)]} from a user-attributes.json
+    document; raises AttributesError if it is malformed. Control characters
+    are stripped from every value; values longer than ATTR_VALUE_MAX bytes
+    are dropped (logged, never truncated). Values are joined with ", "."""
+    if not isinstance(doc, dict) or doc.get("version") != 1:
+        raise AttributesError("not a version 1 document")
+    fields, users = doc.get("fields", {}), doc.get("users", {})
+    if not isinstance(fields, dict) or not isinstance(users, dict):
+        raise AttributesError("'fields' / 'users' is not an object")
+    for name, header in fields.items():
+        if not _ATTR_FIELD_RE.match(name) or not isinstance(header, str) or not _ATTR_HEADER_RE.match(header):
+            raise AttributesError(f"invalid field {name!r} -> {header!r}")
+    out = {}
+    for user, values in users.items():
+        if not isinstance(values, dict):
+            raise AttributesError(f"values of user {user!r} are not an object")
+        headers = []
+        for name, vals in values.items():
+            if not isinstance(vals, list) or not all(isinstance(v, str) for v in vals):
+                raise AttributesError(f"field {name!r} of user {user!r} is not a list of strings")
+            if name not in fields:
+                continue
+            kept = []
+            for v in vals:
+                v = _ATTR_CTRL_RE.sub("", v)
+                if len(v.encode("utf-8")) > ATTR_VALUE_MAX:
+                    print(f"group-gate: dropping {len(v.encode('utf-8'))}-byte value of field {name!r} "
+                          f"for user {user!r} (limit {ATTR_VALUE_MAX})", flush=True)
+                    continue
+                if v:
+                    kept.append(v)
+            if kept:
+                headers.append((ATTR_HEADER_PREFIX + fields[name], ", ".join(kept)))
+        if headers:
+            out[user.strip().lower()] = headers
+    return out
+
+
+def user_attribute_headers(username: str) -> List[Tuple[str, str]]:
+    """Attribute headers for the user. A missing file means none; an
+    unreadable or malformed one is logged (once per file version) and means
+    none too — never a deny. Cached on (path, inode, mtime, size)."""
+    try:
+        st = os.stat(ATTRIBUTES_FILE)
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        print(f"group-gate: cannot read {ATTRIBUTES_FILE}: {e} (no attribute headers)", flush=True)
+        return []
+    key = (ATTRIBUTES_FILE, st.st_ino, st.st_mtime_ns, st.st_size)
+    with _ATTR_LOCK:
+        if _ATTR_CACHE["key"] != key:
+            try:
+                with open(ATTRIBUTES_FILE, encoding="utf-8") as f:
+                    users = parse_user_attributes(json.load(f))
+            except FileNotFoundError:
+                return []
+            except (OSError, ValueError, AttributesError) as e:
+                print(f"group-gate: ignoring corrupt {ATTRIBUTES_FILE}: {e} (no attribute headers)", flush=True)
+                users = {}
+            _ATTR_CACHE.update(key=key, users=users)
+        return _ATTR_CACHE["users"].get(username.strip().lower(), [])
 
 
 # ── Path rules (path_groups) ──────────────────────────────────────────
@@ -400,7 +558,7 @@ def path_rules_for(policy_doc: dict, subdomain: str) -> List[Tuple[str, str]]:
         prefix, group = rule.get("prefix"), rule.get("group")
         if not isinstance(prefix, str) or not prefix.strip().startswith("/"):
             raise PolicyError(f"path_groups rule for {subdomain!r} has an invalid prefix {prefix!r}")
-        if not isinstance(group, str) or not group.strip():
+        if not isinstance(group, str) or not group.strip() or group.strip() == ANY_SIGNED_IN:
             raise PolicyError(f"path_groups rule for {subdomain!r} has an invalid group {group!r}")
         if any(c in prefix for c in "%?#\\\x00") or "/./" in prefix + "/" or "/../" in prefix + "/":
             raise PolicyError(f"path_groups prefix {prefix!r} for {subdomain!r} is not a normalised path")
@@ -1258,7 +1416,7 @@ def session_username(req_headers) -> str:
     return (req_headers.get(USERNAME_HEADER, "") or "").strip()
 
 
-def identity_headers(req_headers) -> dict:
+def identity_headers(req_headers, groups: Optional[str] = None) -> dict:
     """Identity headers group-gate returns on ALLOW (Traefik copies them onto
     the upstream request: they are this middleware's authResponseHeaders, so
     Traefik first deletes any client-supplied copies).
@@ -1272,7 +1430,8 @@ def identity_headers(req_headers) -> dict:
     out = {}
     user = session_username(req_headers)
     email = (req_headers.get("X-Auth-Request-Email", "") or "").strip()
-    groups = req_headers.get("X-Auth-Request-Groups", "") or ""
+    if groups is None:
+        groups = req_headers.get("X-Auth-Request-Groups", "") or ""
     if user:
         out["X-Forwarded-User"] = user
         out["X-Auth-Request-User"] = user
@@ -1283,7 +1442,8 @@ def identity_headers(req_headers) -> dict:
     # Traefik's forwardAuth deletes every authResponseHeaders entry from the
     # upstream request and only re-adds those present in OUR response: echo
     # the groups oauth2-proxy set (portcullis-auth runs first) so backends
-    # like enroll still see them.
+    # like enroll still see them — minus expired temporary memberships
+    # (the caller passes the filtered list).
     if groups:
         out["X-Auth-Request-Groups"] = groups
     return out
@@ -1302,11 +1462,16 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(f"<h1>{html.escape(title)}</h1>{body_html}".encode())
         print(f"group-gate: {log}", flush=True)
 
-    def _allow(self):
+    def _allow(self, groups_header: Optional[str] = None, username: str = ""):
         METRICS.inc("group_gate_requests_total", endpoint=self._endpoint, result="allow")
         self.send_response(200)
-        for name, value in identity_headers(self.headers).items():
+        for name, value in identity_headers(self.headers, groups_header).items():
             self.send_header(name, value)
+        # Attribute headers (contract §5): only on allow; Traefik forwards
+        # them through authResponseHeadersRegex ^X-Forwarded-Attr- (which
+        # also deletes client-sent copies). Values go out as UTF-8 bytes.
+        for name, value in user_attribute_headers(username) if username else []:
+            self.send_header(name, value.encode("utf-8").decode("latin-1"))
         self.end_headers()
 
     def _deny_policy(self, user: str, host: str, reason: str):
@@ -1413,6 +1578,13 @@ class Handler(BaseHTTPRequestHandler):
         if not user:
             self._deny("Access Denied", "<p>Not signed in.</p>", "DENIED portal reason=no username", "no_user")
             return
+        try:
+            groups -= expired_groups(load_policy_file(), user)
+        except PolicyError as e:
+            # Only a listing (every app enforces access itself): show the
+            # signed-in user nothing group-based rather than deny the page.
+            print(f"group-gate: portal user={user} lists no apps: malformed policy: {e}", flush=True)
+            groups = set()
         if user.lower() in DENY_USERS:
             self._deny("Access Denied", "<p>This account is a service account and cannot sign in.</p>",
                        f"DENIED portal user={user} reason=service account", "service_account")
@@ -1572,12 +1744,21 @@ class Handler(BaseHTTPRequestHandler):
             policy = resolve_policy(policy_doc, subdomain)
             policy_err = validate_policy(policy) if policy else None
             path_rules = path_rules_for(policy_doc, subdomain)
+            expired = expired_groups(policy_doc, username)
         except PolicyError as e:
             self._deny_policy(user, host, str(e))
             return
         if policy_err:
             self._deny_policy(user, host, policy_err)
             return
+
+        # --- Temporary memberships: an expired one is absent, whatever the
+        # token says, for every check below and in X-Auth-Request-Groups.
+        groups_header = None
+        if expired & groups:
+            groups -= expired
+            groups_header = ",".join(g for g in (x.strip() for x in groups_raw.split(",")) if g and g in groups)
+            print(f"group-gate: user={user} expired memberships ignored: {sorted(expired)}", flush=True)
 
         # --- Auth policy check (optional, only when policy is set) ---
         if policy:
@@ -1635,7 +1816,9 @@ class Handler(BaseHTTPRequestHandler):
                     "app_unavailable",
                 )
                 return
-            if not required_group:
+            if required_group == ANY_SIGNED_IN:
+                pass  # map.conf only (people.<domain>): any signed-in user
+            elif not required_group:
                 print(f"group-gate: ALLOW-UNMAPPED user={user} host={host} (no group mapping for {subdomain!r})", flush=True)
             elif required_group not in groups:
                 self._deny(
@@ -1671,7 +1854,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
 
-        self._allow()
+        self._allow(groups_header, username)
 
     def log_message(self, fmt, *args):
         # Default per-request logs are noisy; explicit logging above.

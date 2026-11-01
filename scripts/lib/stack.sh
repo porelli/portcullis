@@ -182,11 +182,12 @@ init_run() {
   cat <<EOF
 
   Portal          https://$d             (your apps; the Hub for admins)
-  Hub             https://hub.$d         (apps, marketplace, users & groups)
+  Hub             https://hub.$d         (apps, marketplace; admins)
+  People          https://people.$d      (users, groups, org chart; every signed-in user)
   Identity        https://auth.$d/admin/portcullis/console/  (realm console for lldap_admin)
   Vault           http://127.0.0.1:8200  (root token: secrets/vault-init.json)
   Break-glass     Keycloak master console https://auth.$d/admin/master/console/
-                  (\$KEYCLOAK_ADMIN / KEYCLOAK_ADMIN_PASSWORD), LLDAP https://directory.$d
+                  (\$KEYCLOAK_ADMIN / KEYCLOAK_ADMIN_PASSWORD), LLDAP: ./portcullis lldap-ui
                   (admin / LLDAP_ADMIN_PASSWORD) — both in .env
 
   Sign-in is passkey-only. Open the link below, register your security key

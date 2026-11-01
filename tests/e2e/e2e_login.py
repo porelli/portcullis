@@ -236,10 +236,13 @@ def main() -> int:
 
         def identity_is_username():
             # Identity = LLDAP username; the (user-editable) email travels
-            # separately. Client-supplied copies of these headers are dropped.
+            # separately. Client-supplied copies of these headers are dropped,
+            # and so are forged attribute headers (CI writes city=Milan for
+            # the user into user-attributes.json).
             spoof = {"X-Forwarded-User": "admin", "X-Forwarded-Email": "admin@" + DOMAIN,
                      "X-Auth-Request-User": "admin", "X-Auth-Request-Email": "admin@" + DOMAIN,
-                     "X-Auth-Request-Preferred-Username": "admin"}
+                     "X-Auth-Request-Preferred-Username": "admin",
+                     "X-Forwarded-Attr-City": "Forged", "X-Forwarded-Attr-Forged": "x"}
             for extra in ({}, spoof):
                 page.set_extra_http_headers(extra)
                 try:
@@ -252,10 +255,12 @@ def main() -> int:
                     name, _, value = line.partition(": ")
                     seen.setdefault(name.strip().lower(), []).append(value.strip())
                 for name, want in (("x-forwarded-user", user), ("x-auth-request-user", user),
-                                   ("x-forwarded-email", f"{user}@{DOMAIN}")):
+                                   ("x-forwarded-email", f"{user}@{DOMAIN}"), ("x-forwarded-attr-city", "Milan")):
                     assert seen.get(name) == [want], f"{name}: {seen.get(name)} (want [{want!r}], spoofed={bool(extra)})"
                 assert "admin" not in seen.get("x-auth-request-preferred-username", [user]), body[:800]
-        check("apps get the username (not the email) as X-Forwarded-User; spoofed identity headers are dropped",
+                assert "x-forwarded-attr-forged" not in seen, body[:800]
+        check("apps get the username (not the email) as X-Forwarded-User and the user's attribute headers; "
+              "spoofed identity / attribute headers are dropped",
               identity_is_username)
 
         if os.environ.get("E2E_METRICS"):

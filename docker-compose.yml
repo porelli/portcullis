@@ -332,8 +332,9 @@ services:
     labels:
       # directory.<domain> is NOT LLDAP's web UI: LLDAP has no SSO, so its UI
       # would need its own password on top of the passkey. People and groups
-      # are managed in the Hub; this router only redirects there. LLDAP's own
-      # UI is break-glass, from the server: ./portcullis lldap-ui.
+      # are managed in the Hub's directory (people.<domain>); this router only
+      # redirects there. LLDAP's own UI is break-glass, from the server:
+      # ./portcullis lldap-ui.
       traefik.enable: "true"
       traefik.docker.network: portcullis
       traefik.http.routers.lldap.rule: Host(`directory.${PORTCULLIS_DOMAIN:-portcullis.local}`)
@@ -341,7 +342,7 @@ services:
       traefik.http.routers.lldap.tls.options: authaware@file
       traefik.http.routers.lldap.middlewares: directory-redirect@docker,security-headers@file
       traefik.http.middlewares.directory-redirect.redirectregex.regex: ^https?://[^/]+(/.*)?$$
-      traefik.http.middlewares.directory-redirect.redirectregex.replacement: https://hub.${PORTCULLIS_DOMAIN:-portcullis.local}/#users
+      traefik.http.middlewares.directory-redirect.redirectregex.replacement: https://people.${PORTCULLIS_DOMAIN:-portcullis.local}/
       traefik.http.services.lldap.loadbalancer.server.port: "17170"
     healthcheck:
       test: ["CMD", "/app/lldap", "healthcheck", "--config-file", "/data/lldap_config.toml"]
@@ -514,11 +515,17 @@ services:
       # X-Auth-Request-User / X-Auth-Request-Preferred-Username = LLDAP username
       # (never the user-editable email, nor Keycloak's user id).
       traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,Authorization,X-Forwarded-Access-Token
+      # Attribute headers (contract §5) come only from group-gate. Traefik
+      # deletes every request header matching the regex before copying the
+      # auth server's matches: oauth2-proxy returns none, so this strips
+      # client-sent X-Forwarded-Attr-* on every forward-auth router.
+      traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeadersRegex: ^X-Forwarded-Attr-
       # Keycloak's admin consoles only: the same, minus Authorization (the
       # console's own bearer token must reach the admin API).
       traefik.http.middlewares.portcullis-auth-console.forwardauth.address: http://forward-auth:4180
       traefik.http.middlewares.portcullis-auth-console.forwardauth.trustForwardHeader: "true"
       traefik.http.middlewares.portcullis-auth-console.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,X-Forwarded-Access-Token
+      traefik.http.middlewares.portcullis-auth-console.forwardauth.authResponseHeadersRegex: ^X-Forwarded-Attr-
       # oauth2-proxy's own endpoints (/oauth2/callback, /oauth2/start for
       # group-gate's step-up, /oauth2/sign_out) live ONLY on auth.<domain>.
       # No host-less PathPrefix(`/oauth2/`) router: Traefik cannot select TLS
@@ -557,6 +564,8 @@ services:
       - ./certs/revocation:/etc/group-gate/revocation:ro
     environment:
       GATE_POLICY_FILE: /hub-data/group-gate-policy.json
+      # The Hub's shared custom fields → X-Forwarded-Attr-* (contract §4.1).
+      GATE_ATTRIBUTES_FILE: /hub-data/user-attributes.json
       # Landing portal (https://<domain>/): the Hub's app list (contract §10).
       GATE_PORTAL_FILE: /hub-data/portal-apps.json
       # Client-cert revocation: requests whose TLS client cert (seen via
@@ -590,16 +599,24 @@ services:
       # group-gate reads the username from X-Auth-Request-Preferred-Username
       # (set by portcullis-auth, which must run first) and denies without it.
       traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email
+      # The user's shared custom fields (user-attributes.json in hub_data,
+      # contract §4.1/§5) on every allowed request; client copies are deleted
+      # first (forwardAuth removes all request headers matching the regex).
+      traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeadersRegex: ^X-Forwarded-Attr-
       # Same checks minus the subdomain group (any signed-in user): for
       # self-service routes such as enroll.<domain>/self.
       traefik.http.middlewares.portcullis-self.forwardauth.address: http://group-gate:8080/authenticated
       traefik.http.middlewares.portcullis-self.forwardauth.trustForwardHeader: "true"
       traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email
+      traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeadersRegex: ^X-Forwarded-Attr-
       # Public exceptions (the Hub's portcullis-public-<app> routers, no
       # forward-auth): allows only published public paths without any
       # credential (contract §5). No authResponseHeaders: nobody is signed in.
+      # The regex only deletes client-sent X-Forwarded-Attr-* (the guard
+      # returns none): public routers have no other forward-auth to do it.
       traefik.http.middlewares.portcullis-public-guard.forwardauth.address: http://group-gate:8080/public-guard
       traefik.http.middlewares.portcullis-public-guard.forwardauth.trustForwardHeader: "true"
+      traefik.http.middlewares.portcullis-public-guard.forwardauth.authResponseHeadersRegex: ^X-Forwarded-Attr-
       # Landing portal at the apex domain: any signed-in user; group-gate's
       # /portal lists the apps of portal-apps.json their groups allow and,
       # for lldap_admin, the Hub and the consoles.
@@ -655,6 +672,10 @@ services:
       # integration contract §5); the Hub refuses to start without it.
       # Generated by ./portcullis init.
       HUB_PROXY_SECRET: ${HUB_PROXY_SECRET:?HUB_PROXY_SECRET is not set — run ./portcullis init}
+      # Second listener: the directory only (users, groups, org chart,
+      # import; per-request permission checks), routed as people.<domain>
+      # for every signed-in user (contract §5.1).
+      HUB_PEOPLE_ADDR: ":8889"
     volumes:
       - .:/project:ro
       # Writable overlay: before every `compose up` the Hub copies each app's
@@ -698,8 +719,18 @@ services:
       # hub-proxy-secret is LAST among the request-modifying middlewares, so
       # the secret is never forwarded to the forwardAuth servers.
       traefik.http.routers.hub.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file
+      traefik.http.routers.hub.service: hub
       traefik.http.middlewares.hub-proxy-secret.headers.customrequestheaders.X-Portcullis-Proxy-Secret: ${HUB_PROXY_SECRET:?HUB_PROXY_SECRET is not set — run ./portcullis init}
       traefik.http.services.hub.loadbalancer.server.port: "8888"
+      # people.<domain>: the Hub's directory listener (:8889), any signed-in
+      # user (group-gate-map.conf people=*); the Hub checks permissions per
+      # request. Same chain and proxy secret as the admin Hub (contract §5.1).
+      traefik.http.routers.people.rule: Host(`people.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.people.entrypoints: websecure
+      traefik.http.routers.people.tls.options: authaware@file
+      traefik.http.routers.people.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file
+      traefik.http.routers.people.service: hub-people
+      traefik.http.services.hub-people.loadbalancer.server.port: "8889"
     depends_on:
       keycloak:
         condition: service_started

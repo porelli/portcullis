@@ -198,11 +198,11 @@ help_lldap_ui() {
 Usage: portcullis lldap-ui
 
 Break-glass access to LLDAP's own web UI. directory.<domain> only redirects
-to the Hub (LLDAP has no single sign-on), so LLDAP's UI is reachable only
-from the server. Prints the SSH tunnel to run on your machine; then open
+to people.<domain>, the Hub's directory (LLDAP has no single sign-on), so
+LLDAP's UI is reachable only from the server. Prints the SSH tunnel to run on your machine; then open
 http://localhost:17170 and sign in as the LLDAP admin (LLDAP_ADMIN_PASSWORD
 in .env). Use it for recovery only: day-to-day, people and groups are
-managed in the Hub.
+managed at people.<domain>.
 EOF
 }
 

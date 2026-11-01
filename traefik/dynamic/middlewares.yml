@@ -8,6 +8,15 @@
 # X-Forwarded-Tls-Client-Cert(-Info) headers (no forwardedHeaders.trustedIPs)
 # and their aliases (aliasHeadersStrategy=delete), so after these
 # middlewares the headers only ever describe a cert Traefik verified.
+#
+# Attribute headers (X-Forwarded-Attr-*, contract §5): a headers middleware
+# can only delete headers by exact name, and the field names are the Hub's.
+# Client-sent copies are deleted by the forwardAuth middlewares instead —
+# portcullis-auth, portcullis-auth-console, portcullis-groups, portcullis-self
+# and portcullis-public-guard all set authResponseHeadersRegex
+# ^X-Forwarded-Attr-, and Traefik removes every request header matching it
+# before copying the auth server's (only group-gate's /, /authenticated
+# return any). The entrypoints' aliasHeadersStrategy=delete drops `_` aliases.
 
 http:
   middlewares:
