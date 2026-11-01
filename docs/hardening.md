@@ -101,6 +101,11 @@ Therefore:
 
 - Keycloak's LDAP federation has `trustEmail=false`: tokens carry
   `email_verified=false` for LLDAP users.
+- Keycloak's LDAP federation has `cachePolicy=NO_CACHE` (realm export +
+  `keycloak configure`): group memberships and attributes are read from
+  LLDAP on every lookup, so a removal or attribute change in LLDAP is in
+  the next token (oauth2-proxy refreshes every minute) instead of a cached
+  copy surviving until eviction or the daily sync.
 - oauth2-proxy's session user is always the token's `sub` (Keycloak's user
   UUID); its alpha `userIDClaim` is only a deprecated alias of
   `emailClaim`, so it is not used (CI rejects it). Instead

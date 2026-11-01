@@ -344,6 +344,7 @@
           "uuidLDAPAttribute": ["uid"],
           "userObjectClasses": ["person"],
           "editMode": ["READ_ONLY"],
+          "cachePolicy": ["NO_CACHE"],
           "trustEmail": ["false"],
           "syncRegistrations": ["false"],
           "importEnabled": ["true"],

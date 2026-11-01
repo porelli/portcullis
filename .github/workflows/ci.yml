@@ -1147,6 +1147,9 @@ jobs:
             || { echo "FAIL: invite identity provider: $(kc /identity-provider/instances/portcullis-invite | jq -c 'del(.config.clientSecret)')"; exit 1; }
           kc /authentication/flows/portcullis-invite-link/executions | jq -e '[.[].providerId] == ["idp-detect-existing-broker-user", "idp-auto-link"]' >/dev/null \
             || { echo "FAIL: invite first-login flow must only link existing users"; exit 1; }
+          # No LDAP user cache: group/attribute changes in LLDAP reach tokens at once.
+          kc "/components?type=org.keycloak.storage.UserStorageProvider" | jq -e '[.[] | select(.providerId == "ldap")][0].config.cachePolicy == ["NO_CACHE"]' >/dev/null \
+            || { echo "FAIL: LDAP federation cachePolicy is not NO_CACHE"; exit 1; }
           ENR=$(kc "/clients?clientId=portcullis-enroll" | jq -r '.[0].id')
           SA=$(kc "/clients/$ENR/service-account-user" | jq -r .id)
           RM=$(kc "/clients?clientId=realm-management" | jq -r '.[0].id')

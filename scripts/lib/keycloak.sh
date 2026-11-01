@@ -58,6 +58,23 @@ _kc_report() {
   return 1
 }
 
+# _kc_ldap_patch <base-dn>: the LDAP federation component (JSON on stdin)
+# with what `keycloak configure` enforces on every run (idempotent): DN +
+# bind credential (env LLDAP_PASS), trustEmail off, the Hub's service
+# account filtered out, and cachePolicy NO_CACHE — Keycloak's default user
+# cache would keep a user's LDAP groups and attributes (attr_* claims)
+# stale until eviction or the daily changed-users sync; with NO_CACHE a
+# group or attribute change in LLDAP is visible at the next token refresh.
+_kc_ldap_patch() {
+  jq --arg b "$1" '
+    .config.usersDn = ["ou=people," + $b] |
+    .config.bindDn = ["uid=admin,ou=people," + $b] |
+    .config.bindCredential = [env.LLDAP_PASS] |
+    .config.trustEmail = ["false"] |
+    .config.customUserSearchFilter = ["(!(uid=portcullis-hub))"] |
+    .config.cachePolicy = ["NO_CACHE"]'
+}
+
 keycloak_configure() {
   local wipe="$1" realm code comp ldap_id mapper fwd_uuid scope_id execs flow
   require_cmd curl jq
@@ -100,13 +117,8 @@ keycloak_configure() {
   comp="$(kc_get "/$KC_REALM/components" | jq '[.[] | select(.providerId == "ldap")][0] // empty')"
   if [ -n "$comp" ]; then
     ldap_id="$(printf '%s' "$comp" | jq -r .id)"
-    code="$(printf '%s' "$comp" | LLDAP_PASS="${LLDAP_ADMIN_PASSWORD:-}" jq --arg b "$base_dn" '
-        .config.usersDn = ["ou=people," + $b] |
-        .config.bindDn = ["uid=admin,ou=people," + $b] |
-        .config.bindCredential = [env.LLDAP_PASS] |
-        .config.trustEmail = ["false"] |
-        .config.customUserSearchFilter = ["(!(uid=portcullis-hub))"]' | kc_send PUT "/$KC_REALM/components/$ldap_id")"
-    _kc_report "LDAP base DN + bind credential, portcullis-hub excluded" "$code" 204 || true
+    code="$(printf '%s' "$comp" | LLDAP_PASS="${LLDAP_ADMIN_PASSWORD:-}" _kc_ldap_patch "$base_dn" | kc_send PUT "/$KC_REALM/components/$ldap_id")"
+    _kc_report "LDAP base DN + bind credential, portcullis-hub excluded, no cache" "$code" 204 || true
     # The Hub's LLDAP service account (lldap_admin) must never sign in
     # through the gateway: the user filter above keeps it out of the
     # federation; drop a copy imported before the filter existed.
