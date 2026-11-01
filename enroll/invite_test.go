@@ -325,3 +325,96 @@ func TestProtectedGroupsFromTheMap(t *testing.T) {
 		t.Fatalf("%v", set)
 	}
 }
+
+// TOCTOU: an API invite for a normal user who becomes an administrator
+// before redeeming it must not hand over the admin account.
+func TestInviteAPIRecheckAfterPromotion(t *testing.T) {
+	s, required := testInvites(t)
+	h := publicMux(s)
+	auth := "Bearer " + testAPISecret
+	groups := map[string][]string{"alice": {"users_wiki"}}
+	lookupFails := false
+	s.userGroups = func(u string) ([]string, error) {
+		if lookupFails {
+			return nil, errors.New("ldap down")
+		}
+		return groups[u], nil
+	}
+	same := map[string]string{"Sec-Fetch-Site": "same-origin"}
+	verifier := "verifier-verifier-verifier-verifier-verifier"
+	sum := sha256.Sum256([]byte(verifier))
+	authz := url.Values{"client_id": {inviteClientID}, "redirect_uri": {s.redirectURI()}, "response_type": {"code"},
+		"state": {"st"}, "code_challenge": {base64.RawURLEncoding.EncodeToString(sum[:])},
+		"code_challenge_method": {"S256"}}.Encode()
+	mint := func() string {
+		w, out := apiCreate(t, s, false, "alice", auth)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("create: %d", w.Code)
+		}
+		return token(out["url"])
+	}
+	redeem := func(tok string) *httptest.ResponseRecorder { return do(h, "POST", "/invite/"+tok, "", same) }
+	authorize := func(c *http.Cookie) *httptest.ResponseRecorder {
+		return do(h, "GET", "/invite/authorize?"+authz, "", map[string]string{"Cookie": c.Name + "=" + c.Value})
+	}
+	exchange := func(code string) *httptest.ResponseRecorder {
+		f := url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {s.redirectURI()},
+			"client_id": {inviteClientID}, "client_secret": {testSecret}, "code_verifier": {verifier}}
+		return do(s.internalHandler(), "POST", "/oidc/token", f.Encode(), map[string]string{"Content-Type": "application/x-www-form-urlencoded"})
+	}
+
+	// 1. Promoted before redeeming: refused, the invite is cancelled, no
+	//    required action was set.
+	tok := mint()
+	groups["alice"] = []string{"users_wiki", "lldap_admin"}
+	if w := redeem(tok); w.Code != http.StatusForbidden {
+		t.Fatalf("redeem after promotion: %d", w.Code)
+	}
+	if len(*required) != 0 {
+		t.Fatalf("required action set for a promoted user: %v", *required)
+	}
+	groups["alice"] = []string{"users_wiki"}
+	if w := redeem(tok); w.Code != http.StatusNotFound {
+		t.Fatalf("the cancelled invite still works: %d", w.Code)
+	}
+
+	// 2. Promoted between redeem and authorize: no code.
+	w := redeem(mint())
+	cookie := w.Result().Cookies()[0]
+	groups["alice"] = []string{"lldap_admin"}
+	if w := authorize(cookie); w.Code != http.StatusForbidden || w.Header().Get("Location") != "" {
+		t.Fatalf("authorize after promotion: %d %s", w.Code, w.Header().Get("Location"))
+	}
+
+	// 3. Promoted between authorize and the token exchange: no id_token.
+	groups["alice"] = []string{"users_wiki"}
+	w = redeem(mint())
+	w = authorize(w.Result().Cookies()[0])
+	cb, _ := url.Parse(w.Header().Get("Location"))
+	groups["alice"] = []string{"lldap_password_manager"}
+	if w := exchange(cb.Query().Get("code")); w.Code != http.StatusBadRequest || strings.Contains(w.Body.String(), "id_token") {
+		t.Fatalf("token after promotion: %d %s", w.Code, w.Body)
+	}
+
+	// 4. Lookup failure at redeem: fail closed, the link stays usable.
+	groups["alice"] = []string{"users_wiki"}
+	tok = mint()
+	lookupFails = true
+	if w := redeem(tok); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("redeem with LLDAP down: %d", w.Code)
+	}
+	lookupFails = false
+	if s.peek(tok) == nil {
+		t.Fatal("link consumed although the group check failed")
+	}
+
+	// 5. A promoted user's server-made (CLI) invite is not affected.
+	groups["alice"] = []string{"lldap_admin"}
+	ltok, _, err := s.Create("alice", "", 0, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := redeem(ltok); w.Code != http.StatusSeeOther {
+		t.Fatalf("CLI invite for an administrator: %d", w.Code)
+	}
+}

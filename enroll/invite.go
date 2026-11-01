@@ -86,19 +86,26 @@ const (
 
 var inviteTokenRe = regexp.MustCompile(inviteTokenPattern)
 
+// APICreated: made through the Hub's API (not the server's CLI). Such an
+// invite must never hand over an administrator, so the user's groups are
+// checked again at every later step (the user may have been added to
+// lldap_admin after the invite was created).
 type invite struct {
-	User    string
-	Landing string
-	Expires time.Time
+	User       string
+	Landing    string
+	Expires    time.Time
+	APICreated bool
 }
 
 type redemption struct {
-	User    string
-	Landing string
-	Expires time.Time
+	User       string
+	Landing    string
+	Expires    time.Time
+	APICreated bool
 }
 
 type authCode struct {
+	APICreated  bool
 	User        string
 	Nonce       string
 	RedirectURI string
@@ -231,21 +238,8 @@ func (s *inviteService) Create(user, landing string, ttl time.Duration, allowAdm
 		return "", time.Time{}, errProtected
 	}
 	if !allowAdmin {
-		// An invite hands over the account: whoever holds the API secret
-		// must not be able to take over an administrator. Fail closed.
-		if s.userGroups == nil {
-			return "", time.Time{}, errGroupCheck
-		}
-		groups, err := s.userGroups(user)
-		if err != nil {
-			log.Printf("INVITE refused user=%s: group lookup: %v", user, err)
-			return "", time.Time{}, errGroupCheck
-		}
-		for _, g := range groups {
-			if s.protectedGroups[g] {
-				log.Printf("INVITE refused user=%s: member of protected group %s (API)", user, g)
-				return "", time.Time{}, errProtected
-			}
+		if err := s.checkNotProtected(user, "create"); err != nil {
+			return "", time.Time{}, err
 		}
 	}
 	if ttl <= 0 {
@@ -275,10 +269,64 @@ func (s *inviteService) Create(user, landing string, ttl time.Duration, allowAdm
 			revoked++
 		}
 	}
-	s.invites[hashKey(token)] = &invite{User: u.Username, Landing: landing, Expires: exp}
+	s.invites[hashKey(token)] = &invite{User: u.Username, Landing: landing, Expires: exp, APICreated: !allowAdmin}
 	s.mu.Unlock()
 	log.Printf("INVITE created user=%s expires=%s landing=%s revoked=%d", u.Username, exp.UTC().Format(time.RFC3339), landing, revoked)
 	return token, exp, nil
+}
+
+// checkNotProtected: nil unless the user is (now) in a protected group
+// (errProtected; the user's outstanding API invites, redemptions and codes
+// are cancelled) or the lookup fails (errGroupCheck, fail closed). An invite
+// hands over the account: whoever holds the API secret must not be able to
+// take over an administrator.
+func (s *inviteService) checkNotProtected(user, step string) error {
+	if user == hubServiceAccount || user == bootstrapAdmin {
+		s.cancelAPI(user)
+		return errProtected
+	}
+	if s.userGroups == nil {
+		return errGroupCheck
+	}
+	groups, err := s.userGroups(user)
+	if err != nil {
+		log.Printf("INVITE refused user=%s step=%s: group lookup: %v", user, step, err)
+		return errGroupCheck
+	}
+	for _, g := range groups {
+		if s.protectedGroups[g] {
+			n := s.cancelAPI(user)
+			log.Printf("INVITE refused user=%s step=%s: member of protected group %s (API invite); cancelled %d pending", user, step, g, n)
+			return errProtected
+		}
+	}
+	return nil
+}
+
+// cancelAPI drops every API-created invite, redemption and code of a user.
+func (s *inviteService) cancelAPI(user string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for k, v := range s.invites {
+		if v.User == user && v.APICreated {
+			delete(s.invites, k)
+			n++
+		}
+	}
+	for k, v := range s.redemptions {
+		if v.User == user && v.APICreated {
+			delete(s.redemptions, k)
+			n++
+		}
+	}
+	for k, v := range s.codes {
+		if v.User == user && v.APICreated {
+			delete(s.codes, k)
+			n++
+		}
+	}
+	return n
 }
 
 func (s *inviteService) peek(token string) *invite {
@@ -337,6 +385,18 @@ func (s *inviteService) page(w http.ResponseWriter, status int, data map[string]
 	render(w, "invite.html", data)
 }
 
+func (s *inviteService) refuseProtected(w http.ResponseWriter, err error) {
+	if errors.Is(err, errGroupCheck) {
+		s.page(w, http.StatusServiceUnavailable, map[string]any{
+			"Error": "The directory is not reachable right now. Try the same link again in a minute.",
+		})
+		return
+	}
+	s.page(w, http.StatusForbidden, map[string]any{
+		"Error": "This link can no longer be used: the account is now an administrator account. Administrators get their setup link from the server (./portcullis invite).",
+	})
+}
+
 func (s *inviteService) gone(w http.ResponseWriter, r *http.Request, why string) {
 	ip := clientIP(r)
 	s.fail(ip)
@@ -375,6 +435,12 @@ func (s *inviteService) handleRedeem(w http.ResponseWriter, r *http.Request) {
 		s.gone(w, r, "unknown, expired or used token (redeem)")
 		return
 	}
+	if inv.APICreated {
+		if err := s.checkNotProtected(inv.User, "redeem"); err != nil {
+			s.refuseProtected(w, err)
+			return
+		}
+	}
 	// Keycloak first: if it is down the link stays usable.
 	if err := s.requirePasskey(inv.User); err != nil {
 		log.Printf("INVITE redeem failed user=%s: keycloak: %v", inv.User, err)
@@ -389,7 +455,7 @@ func (s *inviteService) handleRedeem(w http.ResponseWriter, r *http.Request) {
 	}
 	cookie := randomToken(32)
 	s.mu.Lock()
-	s.redemptions[hashKey(cookie)] = &redemption{User: inv.User, Landing: inv.Landing, Expires: s.now().Add(redemptionTTL)}
+	s.redemptions[hashKey(cookie)] = &redemption{User: inv.User, Landing: inv.Landing, Expires: s.now().Add(redemptionTTL), APICreated: inv.APICreated}
 	s.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{
 		Name: inviteCookie, Value: cookie, Path: "/invite/", MaxAge: int(redemptionTTL.Seconds()),
@@ -432,20 +498,25 @@ func (s *inviteService) handleAuthorize(w http.ResponseWriter, r *http.Request) 
 	k := hashKey(c.Value)
 	red := s.redemptions[k]
 	delete(s.redemptions, k)
-	var code string
-	if red != nil {
-		code = randomToken(32)
-		s.codes[hashKey(code)] = &authCode{
-			User: red.User, Nonce: q.Get("nonce"), RedirectURI: s.redirectURI(),
-			Challenge: q.Get("code_challenge"), Expires: s.now().Add(codeTTL),
-		}
-	}
 	s.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: inviteCookie, Value: "", Path: "/invite/", MaxAge: -1, Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode})
 	if red == nil {
 		s.gone(w, r, "unknown, expired or used redemption")
 		return
 	}
+	if red.APICreated {
+		if err := s.checkNotProtected(red.User, "authorize"); err != nil {
+			s.refuseProtected(w, err)
+			return
+		}
+	}
+	code := randomToken(32)
+	s.mu.Lock()
+	s.codes[hashKey(code)] = &authCode{
+		User: red.User, Nonce: q.Get("nonce"), RedirectURI: s.redirectURI(),
+		Challenge: q.Get("code_challenge"), Expires: s.now().Add(codeTTL), APICreated: red.APICreated,
+	}
+	s.mu.Unlock()
 	log.Printf("INVITE authorize user=%s ip=%s", red.User, ip)
 	noStore(w)
 	http.Redirect(w, r, s.redirectURI()+"?"+url.Values{"code": {code}, "state": {q.Get("state")}}.Encode(), http.StatusFound)
@@ -494,6 +565,12 @@ func (s *inviteService) handleToken(w http.ResponseWriter, r *http.Request) {
 		log.Printf("INVITE token rejected: PKCE verifier mismatch user=%s", ac.User)
 		oidcError(w, http.StatusBadRequest, "invalid_grant")
 		return
+	}
+	if ac.APICreated {
+		if err := s.checkNotProtected(ac.User, "token"); err != nil {
+			oidcError(w, http.StatusBadRequest, "invalid_grant")
+			return
+		}
 	}
 	now := s.now()
 	claims := map[string]any{

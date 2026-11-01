@@ -150,7 +150,10 @@ Therefore:
   to invite an administrator: the Hub API refuses `admin`, `portcullis-hub`
   and every member of `lldap_admin`, `lldap_password_manager` and the
   core-console groups of `group-gate-map.conf` (LLDAP group lookup, fails
-  closed), so a leaked API secret cannot take over an admin account. The invite session is LoA 2 / amr `hwk`:
+  closed), so a leaked API secret cannot take over an admin account. The
+  check is repeated for API-made invites at redeem, at the authorization
+  code and at the token exchange (a user promoted to lldap_admin after the
+  invite was made is refused, and their pending API invites are cancelled). The invite session is LoA 2 / amr `hwk`:
   it cannot finish without the passkey registration (`webauthn-register-passwordless`,
   added by enroll's service account `portcullis-enroll`, realm-management
   view-users + manage-users, when the link is redeemed). enroll already held
