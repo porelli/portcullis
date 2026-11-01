@@ -1,40 +1,51 @@
 package main
 
-// Minimal Keycloak admin client for invites: the confidential client
+// Keycloak admin client for invites (gocloak): the confidential client
 // `portcullis-enroll` (service account, realm-management manage-users +
 // view-users; created by `portcullis keycloak configure`) adds the required
 // action webauthn-register-passwordless to the invited user, so the invite
 // login cannot finish without registering a passkey.
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Nerzal/gocloak/v14"
 )
 
 const passkeyAction = "webauthn-register-passwordless"
 
 type keycloakClient struct {
-	base, realm, clientID string
-	secretFile            string
-	http                  *http.Client
+	realm, clientID string
+	secretFile      string
+	gc              *gocloak.GoCloak
 
 	mu    sync.Mutex
 	token string
 	exp   time.Time
 }
 
+// quietLogger keeps resty (gocloak's HTTP layer) from logging on its own;
+// errors are returned and logged by the caller.
+type quietLogger struct{}
+
+func (quietLogger) Errorf(string, ...any) {}
+func (quietLogger) Warnf(string, ...any)  {}
+func (quietLogger) Debugf(string, ...any) {}
+
 func newKeycloakClient(base, realm, clientID, secretFile string) *keycloakClient {
-	return &keycloakClient{base: strings.TrimRight(base, "/"), realm: realm, clientID: clientID,
-		secretFile: secretFile, http: &http.Client{Timeout: 15 * time.Second}}
+	gc := gocloak.NewClient(strings.TrimRight(base, "/"))
+	gc.RestyClient().SetTimeout(15 * time.Second).SetLogger(quietLogger{})
+	return &keycloakClient{realm: realm, clientID: clientID, secretFile: secretFile, gc: gc}
 }
 
-func (k *keycloakClient) accessToken() (string, error) {
+// accessToken: client-credentials token of the service account, cached
+// until 15 s before it expires. The secret file is re-read for every new
+// token (it may be rotated) and only ever sent in the token request body.
+func (k *keycloakClient) accessToken(ctx context.Context) (string, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if k.token != "" && time.Now().Before(k.exp) {
@@ -44,76 +55,48 @@ func (k *keycloakClient) accessToken() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("client secret %s: %w", k.secretFile, err)
 	}
-	resp, err := k.http.PostForm(k.base+"/realms/"+k.realm+"/protocol/openid-connect/token", url.Values{
-		"grant_type": {"client_credentials"}, "client_id": {k.clientID}, "client_secret": {secret},
-	})
+	tok, err := k.gc.LoginClient(ctx, k.clientID, secret, k.realm)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("token endpoint: %w", err)
 	}
-	defer resp.Body.Close()
-	var tr struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
+	if tok.AccessToken == "" {
+		return "", fmt.Errorf("token endpoint: no access_token")
 	}
-	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&tr) != nil || tr.AccessToken == "" {
-		return "", fmt.Errorf("token endpoint: HTTP %d", resp.StatusCode)
-	}
-	k.token, k.exp = tr.AccessToken, time.Now().Add(time.Duration(tr.ExpiresIn-15)*time.Second)
+	k.token, k.exp = tok.AccessToken, time.Now().Add(time.Duration(tok.ExpiresIn-15)*time.Second)
 	return k.token, nil
-}
-
-func (k *keycloakClient) do(method, path string, body any, out any) error {
-	tok, err := k.accessToken()
-	if err != nil {
-		return err
-	}
-	var rd io.Reader
-	if body != nil {
-		b, _ := json.Marshal(body)
-		rd = strings.NewReader(string(b))
-	}
-	req, _ := http.NewRequest(method, k.base+"/admin/realms/"+k.realm+path, rd)
-	req.Header.Set("Authorization", "Bearer "+tok)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := k.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("%s %s: HTTP %d", method, path, resp.StatusCode)
-	}
-	if out != nil {
-		return json.NewDecoder(resp.Body).Decode(out)
-	}
-	return nil
 }
 
 // RequirePasskey imports the user from LDAP if needed (the exact-username
 // search does that) and adds the passkey registration required action.
 func (k *keycloakClient) RequirePasskey(username string) error {
-	var users []struct {
-		ID       string `json:"id"`
-		Username string `json:"username"`
-	}
-	if err := k.do("GET", "/users?exact=true&username="+url.QueryEscape(username), nil, &users); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	tok, err := k.accessToken(ctx)
+	if err != nil {
 		return err
 	}
-	if len(users) != 1 || users[0].Username != username {
+	users, err := k.gc.GetUsers(ctx, tok, k.realm, gocloak.GetUsersParams{
+		Username: gocloak.StringP(username), Exact: gocloak.BoolP(true)})
+	if err != nil {
+		return fmt.Errorf("user search: %w", err)
+	}
+	if len(users) != 1 || gocloak.PString(users[0].Username) != username || users[0].ID == nil {
 		return fmt.Errorf("user %q not found in Keycloak", username)
 	}
-	var u struct {
-		RequiredActions []string `json:"requiredActions"`
-	}
-	if err := k.do("GET", "/users/"+users[0].ID, nil, &u); err != nil {
-		return err
+	id := *users[0].ID
+	u, err := k.gc.GetUserByID(ctx, tok, k.realm, id)
+	if err != nil {
+		return fmt.Errorf("get user: %w", err)
 	}
 	for _, a := range u.RequiredActions {
 		if a == passkeyAction {
 			return nil
 		}
 	}
-	return k.do("PUT", "/users/"+users[0].ID, map[string]any{"requiredActions": append(u.RequiredActions, passkeyAction)}, nil)
+	// Only id + requiredActions: Keycloak leaves absent fields unchanged.
+	if err := k.gc.UpdateUser(ctx, tok, k.realm, gocloak.User{
+		ID: gocloak.StringP(id), RequiredActions: append(u.RequiredActions, passkeyAction)}); err != nil {
+		return fmt.Errorf("update user: %w", err)
+	}
+	return nil
 }

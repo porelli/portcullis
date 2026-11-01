@@ -106,7 +106,7 @@ Templates live in `porelli/portcullis-templates` (not this repo). The Hub auto-c
 | `tests/test_group_gate.py` | group-gate unit tests (`python3 tests/test_group_gate.py`, needs `group-gate/requirements.txt`) incl. path-bypass and mTLS-binding cases |
 | `tests/e2e/e2e_login.py` | Browser e2e (CI job `e2e`): passkey-only sign-in page, setup link → registration → webauthn app (fails on any password field), single use, one-touch second login, group / path denial, bootstrap admin → portal, X.509 login, mTLS binding, revoked / foreign cert |
 | `tests/e2e/e2e_invite.py` | Setup-link check for CI or a live server (`<link> <landing>`) |
-| `enroll/invite.go`, `enroll/keycloak.go` | Setup links: invite store, public `/invite/*`, the `portcullis-invite` OIDC IdP, Hub invite API, `enroll invite` (CLI); Keycloak service-account client |
+| `enroll/invite.go`, `enroll/keycloak.go` | Setup links: invite store, public `/invite/*`, the `portcullis-invite` OIDC IdP (id_token/JWKS via go-jose), Hub invite API, `enroll invite` (CLI); Keycloak service-account client (gocloak). Vault via `hashicorp/vault/api`, LLDAP via `go-ldap` |
 | `scripts/lib/users.sh` | `portcullis invite`, the Hub's LLDAP service account, invite / service-account secret files |
 | `enroll/self.go` | Self-service renewal: same key, current valid unrevoked cert, CN = signed-in user |
 | `docs/hardening.md` | Socket proxies, per-service hardening and exceptions, secrets ownership, header trust |

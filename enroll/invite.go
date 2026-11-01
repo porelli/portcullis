@@ -56,7 +56,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -65,6 +64,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	jose "github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/jwt"
 )
 
 const (
@@ -594,34 +596,21 @@ func (s *inviteService) handleToken(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func b64(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
-
-func pad32(n *big.Int) []byte {
-	b := n.Bytes()
-	return append(bytes.Repeat([]byte{0}, 32-len(b)), b...)
-}
-
+// signJWT signs the id_token (ES256, kid = the JWKS key's id).
 func (s *inviteService) signJWT(claims map[string]any) (string, error) {
-	h, _ := json.Marshal(map[string]string{"alg": "ES256", "typ": "JWT", "kid": s.kid})
-	p, err := json.Marshal(claims)
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: jose.JSONWebKey{Key: s.key, KeyID: s.kid}},
+		(&jose.SignerOptions{}).WithType("JWT"))
 	if err != nil {
 		return "", err
 	}
-	in := b64(h) + "." + b64(p)
-	sum := sha256.Sum256([]byte(in))
-	r, sg, err := ecdsa.Sign(rand.Reader, s.key, sum[:])
-	if err != nil {
-		return "", err
-	}
-	return in + "." + b64(append(pad32(r), pad32(sg)...)), nil
+	return jwt.Signed(signer).Claims(claims).Serialize()
 }
 
 // GET /oidc/jwks (internal port).
 func (s *inviteService) handleJWKS(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
-		"kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256", "kid": s.kid,
-		"x": b64(pad32(s.key.X)), "y": b64(pad32(s.key.Y)),
+	json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{
+		Key: &s.key.PublicKey, KeyID: s.kid, Algorithm: string(jose.ES256), Use: "sig",
 	}}})
 }
 
