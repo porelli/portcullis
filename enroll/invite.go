@@ -107,8 +107,9 @@ type authCode struct {
 }
 
 var (
-	errNoUser    = errors.New("no such LLDAP user")
-	errProtected = errors.New("protected account: invites for it are created on the server only (./portcullis invite)")
+	errNoUser     = errors.New("no such LLDAP user")
+	errProtected  = errors.New("protected account: administrators are recovered from the server only (./portcullis invite <user>)")
+	errGroupCheck = errors.New("cannot verify the user's groups in LLDAP; refusing the invite")
 )
 
 type inviteService struct {
@@ -116,6 +117,10 @@ type inviteService struct {
 	clientSecret string // Keycloak ⇄ enroll OIDC client secret
 	apiSecret    string // Hub ⇄ enroll invite API bearer secret
 	lookupUser   func(string) (*User, error)
+	// userGroups lists the LLDAP groups of a user; protectedGroups are the
+	// groups whose members only the server may invite (lldap_admin & co.).
+	userGroups      func(string) ([]string, error)
+	protectedGroups map[string]bool
 	// requirePasskey adds webauthn-register-passwordless to the Keycloak user.
 	requirePasskey func(string) error
 	now            func() time.Time
@@ -224,6 +229,24 @@ func (s *inviteService) fail(ip string) {
 func (s *inviteService) Create(user, landing string, ttl time.Duration, allowAdmin bool) (string, time.Time, error) {
 	if user == hubServiceAccount || (user == bootstrapAdmin && !allowAdmin) {
 		return "", time.Time{}, errProtected
+	}
+	if !allowAdmin {
+		// An invite hands over the account: whoever holds the API secret
+		// must not be able to take over an administrator. Fail closed.
+		if s.userGroups == nil {
+			return "", time.Time{}, errGroupCheck
+		}
+		groups, err := s.userGroups(user)
+		if err != nil {
+			log.Printf("INVITE refused user=%s: group lookup: %v", user, err)
+			return "", time.Time{}, errGroupCheck
+		}
+		for _, g := range groups {
+			if s.protectedGroups[g] {
+				log.Printf("INVITE refused user=%s: member of protected group %s (API)", user, g)
+				return "", time.Time{}, errProtected
+			}
+		}
 	}
 	if ttl <= 0 {
 		ttl = inviteDefaultTTL
@@ -572,6 +595,9 @@ func (s *inviteService) handleAPICreate(local bool) http.HandlerFunc {
 		case errors.Is(err, errNoUser):
 			jsonError(w, http.StatusNotFound, err.Error())
 			return
+		case errors.Is(err, errGroupCheck):
+			jsonError(w, http.StatusServiceUnavailable, err.Error())
+			return
 		case err != nil:
 			jsonError(w, http.StatusBadRequest, err.Error())
 			return
@@ -653,4 +679,28 @@ func readInviteSecret(path string) (string, error) {
 		return "", errNoSecret
 	}
 	return s, nil
+}
+
+// protectedGroupSet: lldap_admin, lldap_password_manager, INVITE_PROTECTED_GROUPS
+// (space/comma separated) and the groups of the core subdomains in
+// group-gate-map.conf (consoles), if the file is readable.
+func protectedGroupSet(extra, mapFile string) map[string]bool {
+	set := map[string]bool{"lldap_admin": true, "lldap_password_manager": true}
+	for _, g := range strings.FieldsFunc(extra, func(r rune) bool { return r == ',' || r == ' ' }) {
+		set[g] = true
+	}
+	core := map[string]bool{"auth": true, "traefik": true, "hub": true, "directory": true, "enroll": true, "metrics": true}
+	if b, err := os.ReadFile(mapFile); err == nil {
+		for _, line := range strings.Split(string(b), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			k, v, ok := strings.Cut(line, "=")
+			if ok && core[strings.ToLower(strings.TrimSpace(k))] && strings.TrimSpace(v) != "" {
+				set[strings.TrimSpace(v)] = true
+			}
+		}
+	}
+	return set
 }

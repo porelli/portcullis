@@ -170,6 +170,31 @@ func (cfg *Config) getUser(username string) (*User, error) {
 	}, nil
 }
 
+// userGroups: the LLDAP groups (cn) whose member is the user's DN.
+func (cfg *Config) userGroups(username string) ([]string, error) {
+	l, err := cfg.ldapConn()
+	if err != nil {
+		return nil, err
+	}
+	defer l.Close()
+	dn := fmt.Sprintf("uid=%s,ou=people,%s", ldap.EscapeDN(username), cfg.LDAPBaseDN)
+	result, err := l.Search(ldap.NewSearchRequest(
+		"ou=groups,"+cfg.LDAPBaseDN,
+		ldap.ScopeSingleLevel, ldap.NeverDerefAliases, 0, 0, false,
+		fmt.Sprintf("(member=%s)", ldap.EscapeFilter(dn)),
+		[]string{"cn"},
+		nil,
+	))
+	if err != nil {
+		return nil, err
+	}
+	groups := make([]string, 0, len(result.Entries))
+	for _, e := range result.Entries {
+		groups = append(groups, e.GetAttributeValue("cn"))
+	}
+	return groups, nil
+}
+
 // Vault authentication
 //
 // enroll authenticates with a least-privilege AppRole (policy
@@ -700,6 +725,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("invite service: %v", err)
 	}
+	inv.userGroups = cfg.userGroups
+	inv.protectedGroups = protectedGroupSet(os.Getenv("INVITE_PROTECTED_GROUPS"), envOr("GATE_MAP_FILE", "/etc/group-gate/map.conf"))
 	inv.register(mux)
 	for _, l := range []struct {
 		addr string

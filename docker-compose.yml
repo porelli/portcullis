@@ -755,6 +755,9 @@ services:
       traefik.http.services.enroll.loadbalancer.server.port: "8443"
     volumes:
       - ./secrets/enroll:/run/secrets/portcullis-enroll:ro
+      # Core-console groups (auth, hub, directory, ... entries): the Hub's
+      # invite API refuses their members like lldap_admin's (enroll/invite.go).
+      - ./group-gate/group-gate-map.conf:/etc/group-gate/map.conf:ro
     depends_on:
       vault:
         condition: service_healthy

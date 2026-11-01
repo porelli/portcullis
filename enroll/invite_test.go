@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -28,7 +29,7 @@ func testInvites(t *testing.T) (*inviteService, *[]string) {
 	required := &[]string{}
 	s, err := newInviteService("example.org", testSecret, testAPISecret,
 		func(u string) (*User, error) {
-			if u == "alice" || u == "admin" || u == "bob" || u == "portcullis-hub" {
+			if u == "alice" || u == "admin" || u == "bob" || u == "carol" || u == "dave" || u == "portcullis-hub" {
 				return &User{Username: u}, nil
 			}
 			return nil, errors.New("not found")
@@ -37,6 +38,16 @@ func testInvites(t *testing.T) (*inviteService, *[]string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.userGroups = func(u string) ([]string, error) {
+		switch u {
+		case "carol":
+			return []string{"users_wiki", "lldap_admin"}, nil
+		case "dave":
+			return nil, errors.New("ldap down")
+		}
+		return []string{"users_wiki"}, nil
+	}
+	s.protectedGroups = protectedGroupSet("ops_root", "/nonexistent")
 	return s, required
 }
 
@@ -280,5 +291,37 @@ func TestInviteKeycloakDownKeepsTheLink(t *testing.T) {
 	}
 	if s.peek(tok) == nil {
 		t.Fatal("the link was consumed although Keycloak was down")
+	}
+}
+
+func TestInviteAPIRefusesAdministrators(t *testing.T) {
+	s, _ := testInvites(t)
+	auth := "Bearer " + testAPISecret
+	if w, out := apiCreate(t, s, false, "carol", auth); w.Code != http.StatusConflict || !strings.Contains(out["error"], "./portcullis invite") {
+		t.Fatalf("lldap_admin member via the Hub API: %d %v", w.Code, out)
+	}
+	if w, _ := apiCreate(t, s, false, "dave", auth); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("group lookup failure must fail closed: %d", w.Code)
+	}
+	s.userGroups = func(string) ([]string, error) { return []string{"ops_root"}, nil }
+	if w, _ := apiCreate(t, s, false, "alice", auth); w.Code != http.StatusConflict {
+		t.Fatalf("INVITE_PROTECTED_GROUPS member: %d", w.Code)
+	}
+	s.userGroups = nil
+	if w, _ := apiCreate(t, s, false, "alice", auth); w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no group lookup configured must fail closed: %d", w.Code)
+	}
+	// The server (docker exec) may invite administrators.
+	if w, _ := apiCreate(t, s, true, "carol", ""); w.Code != http.StatusCreated {
+		t.Fatalf("lldap_admin member via exec: %d", w.Code)
+	}
+}
+
+func TestProtectedGroupsFromTheMap(t *testing.T) {
+	f := t.TempDir() + "/map.conf"
+	os.WriteFile(f, []byte("# x\nhub=lldap_admin\nmetrics=grafana_admins\nwiki=users_wiki\n"), 0o600)
+	set := protectedGroupSet("", f)
+	if !set["lldap_admin"] || !set["lldap_password_manager"] || !set["grafana_admins"] || set["users_wiki"] {
+		t.Fatalf("%v", set)
 	}
 }
