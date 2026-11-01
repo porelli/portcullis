@@ -1,5 +1,5 @@
 # python:3.15.2-alpine3.24
-FROM python:3.15.2-alpine3.24@sha256:20a82dbc2783112ddb91d1534603f802d222a3e63e593cd002eb2ac534e70211
+FROM python:3.16.0a1-alpine3.24@sha256:9eaa6cfdd6baecec7581257a99b88f0541de65877e03e3afe9df432bd814c1a0
 # Wheels only (no compiler in the image), every file checked against its hash.
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --root-user-action=ignore --disable-pip-version-check \
