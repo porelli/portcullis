@@ -161,8 +161,10 @@ jobs:
               and $h["traefik.http.routers.people.middlewares"] == "rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file"
               and $h["traefik.http.services.\($h["traefik.http.routers.people.service"]).loadbalancer.server.port"] == "8889"
               and $h["traefik.http.services.\($h["traefik.http.routers.hub.service"]).loadbalancer.server.port"] == "8888"
-              and .services.lldap.labels["traefik.http.middlewares.directory-redirect.redirectregex.replacement"] == "https://people.ci.example.org/"' >/dev/null \
-            || { echo "FAIL: attribute-header regex / people router / directory redirect wiring"; exit 1; }
+              and .services.lldap.labels["traefik.http.middlewares.directory-redirect.redirectregex.replacement"] == "https://people.ci.example.org/"
+              and .services["forward-auth"].environment.OAUTH2_PROXY_COOKIE_REFRESH == "1m"
+              and (.services["forward-auth"].environment.OAUTH2_PROXY_COOKIE_EXPIRE // null) == null' >/dev/null \
+            || { echo "FAIL: attribute-header regex / people router / directory redirect / forward-auth cookie refresh wiring"; exit 1; }
           # Every HTTPS router names its Host: Traefik cannot pick TLS options
           # (authaware / protected / public) for a host-less rule and answers
           # 421 on it (that broke /oauth2/start on app hosts).

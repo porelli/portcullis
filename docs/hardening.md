@@ -152,6 +152,15 @@ Therefore:
   (`client-headers`, `portcullis-auth`, `portcullis-groups`,
   `hub-proxy-secret`, `security-headers`), and the Hub checks permissions
   per request and registers no app / policy / Docker endpoint there.
+- Forward-auth sessions are re-validated every minute
+  (`OAUTH2_PROXY_COOKIE_REFRESH=1m`, a legacy option that still applies
+  with `--alpha-config`): once the session cookie is a minute old,
+  oauth2-proxy redeems the refresh token with Keycloak. A Keycloak logout or
+  a session the Hub revokes (membership removal) then fails the refresh and
+  ends access, and changed groups reach group-gate, within about a minute;
+  without it the 168 h cookie (`cookie_expire`, unchanged) kept the groups
+  of the sign-in. The refresh also ends forward-auth sessions at Keycloak's
+  SSO session limits (8 h idle, 12 h max).
 - enroll identifies the signed-in user by `X-Forwarded-User` as-is (no
   email → username lookup); group-gate's mTLS binding compares the cert CN
   with that same username (and requires the token's `preferred_username`
