@@ -429,6 +429,16 @@ expect_ok "upgrade sync: signal failure = warning with the manual fix" sh -c "pr
 rm -f "$STUB_DIR/sync" "$STUB_DIR/sync2" "$STUB_DIR/kills" "$STUB_DIR/killed" "$STUB_DIR/killfail"
 expect_ok "upgrade: pinned HUB_IMAGE warned" sh -c "printf '%s' \"\$1\" | grep -q 'NOT upgraded'" _ "$(HUB_IMAGE=x hub_pinned_warn 2>&1)"
 expect_eq "upgrade: default HUB_IMAGE not warned" "$(unset HUB_IMAGE; hub_pinned_warn 2>&1)" ""
+# ── restore: never start Keycloak on an empty LLDAP over a database with users ──
+lg_guard() { (RG_LL="$1" RG_KC="$2"; _restore_lldap_count() { echo "$RG_LL"; }; _restore_kc_federated_count() { echo "$RG_KC"; }; _restore_lldap_guard "$3" 2>&1); }
+_rg() { lg_guard "$@" >/dev/null; }
+expect_fail "restore guard: LLDAP without users, Keycloak has 5 = refused" _rg 0 5 false
+expect_fail "restore guard: no LLDAP database, Keycloak has 5 = refused" _rg missing 5 false
+expect_ok "restore guard: --allow-empty-lldap starts anyway" _rg 0 5 true
+expect_ok "restore guard: LLDAP with users = ok" _rg 3 5 false
+expect_ok "restore guard: both empty (fresh) = ok" _rg 0 0 false
+expect_ok "restore guard: Keycloak count unknown = ok" _rg 0 "" false
+expect_ok "restore guard: refusal explains the fix" sh -c "printf '%s' \"\$1\" | grep -q 'passkeys included' && printf '%s' \"\$1\" | grep -q -- '--allow-empty-lldap'" _ "$(lg_guard 0 5 false)"
 B="$WORK/backup"
 mkdir -p "$B/secrets/vault-unseal" "$B/certs"
 echo 'PORTCULLIS_DOMAIN=x' > "$B/.env"

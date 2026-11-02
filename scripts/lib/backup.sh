@@ -119,6 +119,20 @@ print(f"users.db ok: {users} user(s), {groups} group(s)"
       + ("" if "private_key" in names else " (no private_key file: LLDAP_KEY_SEED must be set)"))
 PY
 
+# Runs inside the python image with lldap_data mounted at /data (read-only):
+# prints the number of LLDAP users other than admin and the Hub's service
+# account, or "missing" when there is no readable user database.
+read -r -d '' _BACKUP_PY_COUNT_LLDAP <<'PY' || true
+import sqlite3, sys
+try:
+    c = sqlite3.connect("file:/data/users.db?mode=ro&immutable=1", uri=True)
+    n = c.execute("SELECT count(*) FROM users WHERE user_id NOT IN ('admin', 'portcullis-hub')").fetchone()[0]
+except Exception as e:
+    print("missing")
+    sys.exit(0)
+print(n)
+PY
+
 # ── helpers ────────────────────────────────────────────────
 
 _backup_load_cfg() {
@@ -582,8 +596,50 @@ _restore_secrets() {
 }
 
 # backup_restore <dir> <assume-yes>
+# _restore_lldap_count — LLDAP users besides admin / portcullis-hub in the
+# (stopped) lldap_data volume, or "missing".
+_restore_lldap_count() {
+  local vol
+  vol="$(_volume_name lldap_data)"
+  docker volume inspect "$vol" >/dev/null 2>&1 || { echo missing; return 0; }
+  docker run --rm --network none --read-only --tmpfs /tmp --user "$CT_UID_LLDAP:$CT_UID_LLDAP" --cap-drop ALL \
+    --security-opt no-new-privileges:true -e PYTHONDONTWRITEBYTECODE=1 -v "$vol:/data:ro" "$(_py_image)" \
+    python3 -c "$_BACKUP_PY_COUNT_LLDAP" 2>/dev/null || echo missing
+}
+
+# _restore_kc_federated_count — Keycloak users of the portcullis realm
+# linked to the LDAP federation (the restored database; Postgres is up),
+# besides admin; "" if unknown.
+_restore_kc_federated_count() {
+  dc exec -T postgres psql -U keycloak -d keycloak -tAc \
+    "select count(*) from user_entity u join realm r on r.id = u.realm_id where r.name = 'portcullis' and u.federation_link is not null and u.username <> 'admin'" \
+    2>/dev/null | tr -d '[:space:]'
+}
+
+# _restore_lldap_guard <allow> — refuse (return 1, nothing more started)
+# when LLDAP has no users but Keycloak's restored database has federated
+# ones; <allow> = true (--allow-empty-lldap) only warns.
+_restore_lldap_guard() {
+  local allow="$1" ll kcn
+  ll="$(_restore_lldap_count)"
+  kcn="$(_restore_kc_federated_count)"
+  case "$kcn" in ''|*[!0-9]*) kcn=0 ;; esac
+  if { [ "$ll" = missing ] || [ "$ll" = 0 ]; } && [ "$kcn" -gt 0 ]; then
+    if [ "$allow" = true ]; then
+      warn "LLDAP has no users (${ll}) but the restored Keycloak database has $kcn — starting anyway (--allow-empty-lldap): Keycloak will delete those users' copies, passkeys included, at their next lookup."
+      return 0
+    fi
+    warn "LLDAP has no users (${ll}) but the restored Keycloak database has $kcn federated users."
+    warn "Starting Keycloak now would delete their Keycloak copies — passkeys included — at the next sign-in attempt or Hub sweep."
+    warn "Nothing else was started (Postgres and Vault are up). Restore a backup that includes lldap_data.tar.gz, or re-run with --allow-empty-lldap if the users are really gone."
+    return 1
+  fi
+  [ "$ll" != missing ] || warn "LLDAP has no user database yet (the restored Keycloak database has no federated users either)."
+  return 0
+}
+
 backup_restore() {
-  local dir="$1" yes="$2" pre had_env=false key uid gid full spec proj helper
+  local dir="$1" yes="$2" allow_empty_lldap="${3:-false}" pre had_env=false key uid gid full spec proj helper
   require_cmd docker jq curl tar gzip
   [ -d "$dir" ] || fail "Backup directory not found: $dir"
   dir="$(cd "$dir" && pwd)"
@@ -668,6 +724,12 @@ backup_restore() {
       sh -c "tar xzf '/backup/$key.tar.gz' -C /data && chown $uid:$gid /data" \
       || fail "could not restore volume $key"
   done
+
+  # Keycloak deletes its copy of a federated user — passkeys included —
+  # as soon as a lookup (a sign-in attempt, the Hub's sweep) finds the user
+  # missing in LDAP: never start it on an empty LLDAP over a Keycloak
+  # database that has users.
+  _restore_lldap_guard "$allow_empty_lldap" || return 1
 
   stack_prepare
   config_build_ca_bundle
@@ -812,8 +874,8 @@ EOF
 
 help_restore() {
   cat <<'EOF'
-Usage: portcullis restore [--yes] <backup-dir>
-       portcullis restore [--yes] --from-offsite [SNAPSHOT]
+Usage: portcullis restore [--yes] [--allow-empty-lldap] <backup-dir>
+       portcullis restore [--yes] [--allow-empty-lldap] --from-offsite [SNAPSHOT]
        portcullis restore --list [--offsite]
 
 Stop Portcullis and restore a backup made by `portcullis backup` /
@@ -828,8 +890,16 @@ certs/ are saved to backups/pre-restore-<timestamp>/.
 On a new host without .env, export BACKUP_REPOSITORY, BACKUP_PASSWORD and
 the provider credentials first (the .env comes from the backup).
 
+Before starting Keycloak, restore checks LLDAP: if it has no users (the
+backup had no lldap_data.tar.gz and the volume is empty) while the restored
+Keycloak database has users, it stops with Postgres and Vault up and
+nothing else started — Keycloak would delete those users' copies, passkeys
+included, at their next lookup.
+
 Options:
   -y, --yes          do not ask for confirmation
+  --allow-empty-lldap  start even if LLDAP has no users (their Keycloak
+                     copies and passkeys are then removed)
   --from-offsite     restore from the restic repository
   --list             list local backups (--offsite: restic snapshots)
 EOF
@@ -888,13 +958,14 @@ cmd_backup() {
 }
 
 cmd_restore() {
-  local yes=false dir="" offsite=false list=false snap="" tmp
+  local yes=false dir="" offsite=false list=false snap="" tmp allow=false
   while [ $# -gt 0 ]; do
     case "$1" in
       --list) list=true ;;
       --offsite) offsite=true ;;
       --from-offsite) offsite=true ;;
       -y|--yes) yes=true ;;
+      --allow-empty-lldap) allow=true ;;
       -h|--help) help_restore; return 0 ;;
       -*) usage_error restore "unknown option: $1" ;;
       *) [ -z "$dir" ] || usage_error restore "unexpected argument: $1"; dir="$1" ;;
@@ -914,7 +985,7 @@ cmd_restore() {
     _restic_require
     info "Restoring snapshot $snap from $BACKUP_REPOSITORY into $tmp..."
     dir="$(_restic_restore_to "$snap" "$tmp")"
-    backup_restore "$dir" "$yes"
+    backup_restore "$dir" "$yes" "$allow"
     return
   fi
   [ -n "$dir" ] || usage_error restore "expected <backup-dir> or --from-offsite (see --list)"
@@ -924,5 +995,5 @@ cmd_restore() {
     *) if [ -d "$PORTCULLIS_CALLER_PWD/$dir" ]; then dir="$PORTCULLIS_CALLER_PWD/$dir"; else dir="$PORTCULLIS_ROOT/$dir"; fi ;;
   esac
   need_env
-  backup_restore "$dir" "$yes"
+  backup_restore "$dir" "$yes" "$allow"
 }

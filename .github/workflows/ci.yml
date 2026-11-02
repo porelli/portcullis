@@ -1796,6 +1796,19 @@ jobs:
           ./portcullis status --json | jq -e '.vault.active and .keycloak.realm and .keycloak.forward_auth_client' >/dev/null \
             || { echo "FAIL: status after restore"; ./portcullis status || true; exit 1; }
           echo "PASS: restored from restic into a fresh stack: CA, cert records, revocations, Keycloak, LLDAP"
+          # The restore's LLDAP guard read the real volume and database: LLDAP
+          # users counted, Keycloak's federated users counted, so it passed.
+          GUARD=$(bash -c 'source scripts/lib/common.sh; env_load; source scripts/lib/status.sh; source scripts/lib/backup.sh; _backup_load_cfg
+            printf "%s %s" "$(_restore_lldap_count)" "$(_restore_kc_federated_count)"')
+          echo "restore guard sees: LLDAP $GUARD Keycloak"
+          [[ "$GUARD" =~ ^[1-9][0-9]*\ [1-9][0-9]*$ ]] || { echo "FAIL: restore guard counts: $GUARD"; exit 1; }
+          # An empty LLDAP volume is "missing" (refused while Keycloak has users).
+          docker volume create ci-empty-lldap >/dev/null
+          EMPTY=$(bash -c 'source scripts/lib/common.sh; env_load; source scripts/lib/status.sh; source scripts/lib/backup.sh; _backup_load_cfg
+            _volume_name() { echo ci-empty-lldap; }; _restore_lldap_count')
+          docker volume rm ci-empty-lldap >/dev/null
+          [ "$EMPTY" = missing ] || { echo "FAIL: empty LLDAP volume counted as $EMPTY"; exit 1; }
+          echo "PASS: restore's LLDAP guard counts the real LLDAP and Keycloak users; an empty volume is missing"
 
       - name: Collect service status
         if: always()
