@@ -168,7 +168,11 @@ func (s *Service) obtain(name string, p dnsProvider) (certPEM, keyPEM string, no
 		return "", "", time.Time{}, fmt.Errorf("ACME directory %s: %w", s.cfg.CAServer, err)
 	}
 	skip := false
-	if ps, ok := p.(propagationSkipper); ok {
+	if ps, ok := func() (propagationSkipper, bool) {
+		in, _ := unwrap(p)
+		ps, ok := in.(propagationSkipper)
+		return ps, ok
+	}(); ok {
 		skip = ps.SkipPropagationCheck()
 	}
 	err = client.Challenge.SetDNS01Provider(&challengeProvider{s: s, p: p},

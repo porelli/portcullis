@@ -131,19 +131,71 @@ func contains(list []string, s string) bool {
 	return false
 }
 
+// buildProvider returns the domain's provider behind redacting: every
+// error any provider call returns (records, DNS-01 challenge, delete) has
+// the domain's credentials redacted before anything can log, store or
+// return it — libdns providers may echo tokens or request bodies.
 func buildProvider(d *Domain) (dnsProvider, error) {
 	spec, ok := providers[d.Provider]
 	if !ok {
 		return nil, fmt.Errorf("unknown provider %q", d.Provider)
 	}
-	return spec.build(d.Credentials), nil
+	creds := make(map[string]string, len(d.Credentials))
+	for k, v := range d.Credentials {
+		creds[k] = v
+	}
+	return redacting{inner: spec.build(d.Credentials), creds: creds}, nil
+}
+
+// redacting wraps a provider; its errors carry no credential.
+type redacting struct {
+	inner dnsProvider
+	creds map[string]string
+}
+
+func (r redacting) clean(err error) error {
+	if err == nil {
+		return nil
+	}
+	return errors.New(redact(err.Error(), r.creds))
+}
+
+func (r redacting) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
+	out, err := r.inner.GetRecords(ctx, zone)
+	return out, r.clean(err)
+}
+
+func (r redacting) AppendRecords(ctx context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
+	out, err := r.inner.AppendRecords(ctx, zone, recs)
+	return out, r.clean(err)
+}
+
+func (r redacting) SetRecords(ctx context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
+	out, err := r.inner.SetRecords(ctx, zone, recs)
+	return out, r.clean(err)
+}
+
+func (r redacting) DeleteRecords(ctx context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
+	out, err := r.inner.DeleteRecords(ctx, zone, recs)
+	return out, r.clean(err)
+}
+
+// unwrap returns the provider under redacting (for its optional
+// interfaces) and the error cleaner.
+func unwrap(p dnsProvider) (dnsProvider, func(error) error) {
+	if r, ok := p.(redacting); ok {
+		return r.inner, r.clean
+	}
+	return p, func(err error) error { return err }
 }
 
 // zoneOf finds the zone holding fqdn: the provider's own answer, else a
 // SOA lookup (lego's dns01.FindZoneByFqdn, the resolvers set at start).
 func (s *Service) zoneOf(p dnsProvider, fqdn string) (string, error) {
-	if zf, ok := p.(zoneFinder); ok {
-		return zf.FindZone(fqdn)
+	inner, clean := unwrap(p)
+	if zf, ok := inner.(zoneFinder); ok {
+		z, err := zf.FindZone(fqdn)
+		return z, clean(err)
 	}
 	return s.findZone(dns.Fqdn(fqdn))
 }
@@ -177,7 +229,7 @@ func (s *Service) setRecords(ctx context.Context, p dnsProvider, name string) ([
 		}
 	}
 	if _, err := p.SetRecords(ctx, zone, recs); err != nil {
-		return nil, zone, fmt.Errorf("setting the A/AAAA records of %s and *.%s: %w", name, name, err)
+		return refs, zone, fmt.Errorf("setting the A/AAAA records of %s and *.%s: %w", name, name, err)
 	}
 	if !s.cfg.IPv6.IsValid() {
 		var stale []libdns.Record
@@ -185,7 +237,7 @@ func (s *Service) setRecords(ctx context.Context, p dnsProvider, name string) ([
 			stale = append(stale, libdns.RR{Name: libdns.RelativeName(dns.Fqdn(n), zone), Type: "AAAA"})
 		}
 		if _, err := p.DeleteRecords(ctx, zone, stale); err != nil {
-			return nil, zone, fmt.Errorf("removing old AAAA records of %s (the server has no IPv6): %w", name, err)
+			return refs, zone, fmt.Errorf("removing old AAAA records of %s (the server has no IPv6): %w", name, err)
 		}
 	}
 	return refs, zone, nil

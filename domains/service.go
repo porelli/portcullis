@@ -68,7 +68,7 @@ type Service struct {
 
 	mu   sync.Mutex // guards doc and busy; never held across network calls
 	doc  *storeDoc
-	busy map[string]bool
+	busy map[string]*job // running work per domain name
 	kick chan struct{}
 
 	acmeMu      sync.Mutex // serialises ACME account registration
@@ -106,7 +106,20 @@ func NewService(cfg Config, store *Store) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Service{cfg: cfg, store: store, findZone: legoZoneFinder, doc: doc, busy: map[string]bool{}, kick: make(chan struct{}, 1)}, nil
+	return &Service{cfg: cfg, store: store, findZone: legoZoneFinder, doc: doc, busy: map[string]*job{}, kick: make(chan struct{}, 1)}, nil
+}
+
+// job is one running attempt for a domain. recMu is held while it sets
+// records and records what it set, so a DELETE can wait for that and then
+// remove every record, including ones created after it started.
+type job struct {
+	recMu sync.Mutex
+}
+
+// newGenerationLocked hands out a never-reused generation. Caller holds mu.
+func (s *Service) newGenerationLocked() int {
+	s.doc.NextGeneration++
+	return s.doc.NextGeneration
 }
 
 func (s *Service) logf(format string, args ...any) { s.cfg.Logger.Printf(format, args...) }
@@ -224,7 +237,7 @@ func (s *Service) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, name+" is already enrolled")
 		return
 	}
-	d := &Domain{Name: name, Provider: b.Provider, Credentials: b.Credentials, State: StatePending}
+	d := &Domain{Name: name, Provider: b.Provider, Credentials: b.Credentials, State: StatePending, Generation: s.newGenerationLocked()}
 	s.doc.Domains[name] = d
 	err := s.store.Save(s.doc)
 	if err != nil {
@@ -253,14 +266,14 @@ func (s *Service) handleToken(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	d, exists := s.doc.Domains[name]
-	if !exists {
+	if !exists || d.Deleting {
 		s.mu.Unlock()
 		writeError(w, http.StatusNotFound, name+" is not enrolled")
 		return
 	}
 	old := *d
 	d.Provider, d.Credentials = b.Provider, b.Credentials
-	d.Generation++
+	d.Generation = s.newGenerationLocked()
 	d.State, d.LastError, d.Failures, d.NextAttempt = StatePending, "", 0, time.Time{}
 	err := s.store.Save(s.doc)
 	if err != nil {
@@ -285,15 +298,26 @@ func (s *Service) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	d, exists := s.doc.Domains[name]
-	if !exists {
+	if !exists || d.Deleting {
 		s.mu.Unlock()
 		writeError(w, http.StatusNotFound, name+" is not enrolled")
 		return
 	}
+	// No new work, running work stops at its next step; wait until a
+	// running records step has recorded what it set.
+	d.Deleting = true
+	j := s.busy[name]
+	s.mu.Unlock()
+	if j != nil {
+		j.recMu.Lock()
+		j.recMu.Unlock() //nolint:staticcheck // only waiting for the records step
+	}
+	s.mu.Lock()
 	snap := copyDomain(d)
 	delete(s.doc.Domains, name)
 	err := s.store.Save(s.doc)
 	if err != nil {
+		d.Deleting = false
 		s.doc.Domains[name] = d
 	}
 	s.mu.Unlock()
@@ -404,15 +428,16 @@ func (s *Service) dispatch(ctx context.Context) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for name, d := range s.doc.Domains {
-		if s.busy[name] || !s.dueLocked(d, now) {
+		if s.busy[name] != nil || d.Deleting || !s.dueLocked(d, now) {
 			continue
 		}
-		s.busy[name] = true
+		j := &job{}
+		s.busy[name] = j
 		snap := copyDomain(d)
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
-			s.work(ctx, snap)
+			s.work(ctx, snap, j)
 			s.mu.Lock()
 			delete(s.busy, snap.Name)
 			s.mu.Unlock()
@@ -421,12 +446,19 @@ func (s *Service) dispatch(ctx context.Context) {
 }
 
 // update applies f to the domain if it still exists with the same
-// credentials (generation) and saves; false = the work is stale.
+// generation and isn't being deleted, and saves; false = the work is
+// stale (deleted, re-enrolled or new credentials).
 func (s *Service) update(name string, gen int, f func(d *Domain)) bool {
+	return s.updateIf(name, gen, false, f)
+}
+
+// updateIf: deleting=true also commits while a DELETE waits (only for the
+// records a running records step set).
+func (s *Service) updateIf(name string, gen int, deleting bool, f func(d *Domain)) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	d, ok := s.doc.Domains[name]
-	if !ok || d.Generation != gen {
+	if !ok || d.Generation != gen || (d.Deleting && !deleting) {
 		return false
 	}
 	f(d)
@@ -452,7 +484,7 @@ func backoff(n int) time.Duration {
 // domain's re-check is due), the certificate if there's no valid one or it
 // is within 30 days of expiry, then the records check. Any failure is
 // recorded (redacted) with backoff; a still-valid certificate stays served.
-func (s *Service) work(ctx context.Context, snap *Domain) {
+func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 	name, gen := snap.Name, snap.Generation
 	now := s.cfg.Now()
 	fail := func(err error) {
@@ -472,18 +504,28 @@ func (s *Service) work(ctx context.Context, snap *Domain) {
 	needCert := s.needsCert(snap, now)
 	hasValid := snap.CertNotAfter != nil && servable(snap, s.cfg.MainDomain, now) == nil
 	if !(snap.State == StateReady && !needCert) {
+		j.recMu.Lock()
 		if !s.update(name, gen, func(d *Domain) { d.State = StateRecords }) {
+			j.recMu.Unlock()
 			return
 		}
 		rctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
 		refs, zone, err := s.setRecords(rctx, p, name)
 		cancel()
+		// Recorded even on failure (a partial SetRecords may have created
+		// some) and while a DELETE waits, so DELETE removes them.
+		if zone != "" {
+			s.updateIf(name, gen, true, func(d *Domain) {
+				if d.Zone != "" && d.Zone != zone {
+					return // records live in the earlier zone; keep its refs
+				}
+				d.Records, d.Zone = mergeRecords(d.Records, refs), zone
+			})
+		}
+		j.recMu.Unlock()
 		if err != nil {
 			s.update(name, gen, func(d *Domain) { d.RecordsOK = false })
 			fail(err)
-			return
-		}
-		if !s.update(name, gen, func(d *Domain) { d.Records, d.Zone = mergeRecords(d.Records, refs), zone }) {
 			return
 		}
 	}

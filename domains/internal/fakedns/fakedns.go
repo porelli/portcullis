@@ -96,6 +96,10 @@ type Provider struct {
 	Accept func(token string) bool
 	// ZoneName, if set, is returned by FindZone (the service's zone lookup).
 	ZoneName string
+	// Hook, if set, runs before every call ("get", "append", "set",
+	// "delete") outside the zone lock; an error fails the call (tests:
+	// blocking, provider errors that echo the token).
+	Hook func(op string, recs []libdns.Record) error
 }
 
 // FindZone reports the zone the provider manages for fqdn (the service
@@ -111,7 +115,12 @@ func (p *Provider) FindZone(fqdn string) (string, error) {
 // for lego to ask; Pebble queries the fake DNS server directly.
 func (p *Provider) SkipPropagationCheck() bool { return true }
 
-func (p *Provider) auth() error {
+func (p *Provider) auth(op string, recs []libdns.Record) error {
+	if p.Hook != nil {
+		if err := p.Hook(op, recs); err != nil {
+			return err
+		}
+	}
 	p.Zone.mu.Lock()
 	p.Zone.calls++
 	p.Zone.mu.Unlock()
@@ -123,7 +132,7 @@ func (p *Provider) auth() error {
 
 // GetRecords lists every record of the zone.
 func (p *Provider) GetRecords(_ context.Context, zone string) ([]libdns.Record, error) {
-	if err := p.auth(); err != nil {
+	if err := p.auth("get", nil); err != nil {
 		return nil, err
 	}
 	p.Zone.mu.Lock()
@@ -152,7 +161,7 @@ func parsed(rr libdns.RR) libdns.Record {
 
 // AppendRecords adds records.
 func (p *Provider) AppendRecords(_ context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
-	if err := p.auth(); err != nil {
+	if err := p.auth("append", recs); err != nil {
 		return nil, err
 	}
 	p.Zone.mu.Lock()
@@ -167,7 +176,7 @@ func (p *Provider) AppendRecords(_ context.Context, zone string, recs []libdns.R
 
 // SetRecords makes each input (name, type) RRset exactly the input.
 func (p *Provider) SetRecords(_ context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
-	if err := p.auth(); err != nil {
+	if err := p.auth("set", recs); err != nil {
 		return nil, err
 	}
 	p.Zone.mu.Lock()
@@ -195,7 +204,7 @@ func (p *Provider) SetRecords(_ context.Context, zone string, recs []libdns.Reco
 // DeleteRecords removes matching records (empty type / TTL / data match
 // anything, as libdns specifies).
 func (p *Provider) DeleteRecords(_ context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
-	if err := p.auth(); err != nil {
+	if err := p.auth("delete", recs); err != nil {
 		return nil, err
 	}
 	p.Zone.mu.Lock()

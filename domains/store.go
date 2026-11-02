@@ -46,9 +46,13 @@ type Domain struct {
 	Failures         int       `json:"failures"`
 	NextAttempt      time.Time `json:"next_attempt"`
 	RecordsCheckedAt time.Time `json:"records_checked_at"`
-	// Generation changes when the credentials are replaced: work started
-	// with older credentials doesn't commit its result.
+	// Generation is unique per enrollment and per credentials replacement
+	// (from storeDoc.NextGeneration, never reused — also not after a
+	// delete and re-enroll): work started for an older one never commits.
 	Generation int `json:"generation"`
+	// Deleting: a DELETE is in progress (not persisted). No new work
+	// starts and running work commits nothing but the records it set.
+	Deleting bool `json:"-"`
 }
 
 // RecordRef is a record the service created (relative to Zone).
@@ -67,9 +71,11 @@ type Account struct {
 }
 
 type storeDoc struct {
-	Version int                `json:"version"`
-	Account *Account           `json:"account,omitempty"`
-	Domains map[string]*Domain `json:"domains"`
+	Version int `json:"version"`
+	// NextGeneration: the last Domain.Generation handed out.
+	NextGeneration int                `json:"next_generation"`
+	Account        *Account           `json:"account,omitempty"`
+	Domains        map[string]*Domain `json:"domains"`
 }
 
 // Store reads and writes the encrypted document. Not safe for concurrent
@@ -131,6 +137,11 @@ func (s *Store) Load() (*storeDoc, error) {
 	}
 	if doc.Domains == nil {
 		doc.Domains = map[string]*Domain{}
+	}
+	for _, d := range doc.Domains {
+		if d.Generation > doc.NextGeneration {
+			doc.NextGeneration = d.Generation
+		}
 	}
 	return &doc, nil
 }

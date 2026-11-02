@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"log"
 	"math/big"
@@ -96,6 +97,15 @@ type testEnv struct {
 	id     *age.X25519Identity
 	cancel context.CancelFunc
 	bodies []string // every API response body (checked for credentials)
+	// hook runs before every fake provider call (token = the caller's).
+	hookMu sync.Mutex
+	hook   func(op string, recs []libdns.Record, token string) error
+}
+
+func (e *testEnv) setHook(h func(op string, recs []libdns.Record, token string) error) {
+	e.hookMu.Lock()
+	e.hook = h
+	e.hookMu.Unlock()
 }
 
 // newEnv starts the fake DNS zone and server, an in-process Pebble whose
@@ -117,8 +127,18 @@ func newEnv(t *testing.T, ipv6 bool) *testEnv {
 	pebble := httptest.NewTLSServer(pwfe.Handler())
 	t.Cleanup(pebble.Close)
 
+	e := &testEnv{}
 	providers["fake"] = providerSpec{required: []string{"api_token"}, build: func(c map[string]string) dnsProvider {
-		return &fakedns.Provider{Zone: zone, Token: c["api_token"], Accept: func(tok string) bool { return strings.HasPrefix(tok, "good-") }}
+		return &fakedns.Provider{Zone: zone, Token: c["api_token"], Accept: func(tok string) bool { return strings.HasPrefix(tok, "good-") },
+			Hook: func(op string, recs []libdns.Record) error {
+				e.hookMu.Lock()
+				h := e.hook
+				e.hookMu.Unlock()
+				if h == nil {
+					return nil
+				}
+				return h(op, recs, c["api_token"])
+			}}
 	}}
 	t.Cleanup(func() { delete(providers, "fake") })
 
@@ -146,7 +166,7 @@ func newEnv(t *testing.T, ipv6 bool) *testEnv {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { svc.Run(ctx); close(done) }()
-	e := &testEnv{t: t, svc: svc, api: svc.APIHandler(), zone: zone, logs: logs, clock: clk, dir: dir, id: id, cancel: cancel}
+	e.t, e.svc, e.api, e.zone, e.logs, e.clock, e.dir, e.id, e.cancel = t, svc, svc.APIHandler(), zone, logs, clk, dir, id, cancel
 	t.Cleanup(func() {
 		cancel()
 		<-done
@@ -713,5 +733,122 @@ func TestRedact(t *testing.T) {
 		if out := redact(msg, c); strings.Contains(out, "s3cr3t") {
 			t.Errorf("redact(%q) = %q", msg, out)
 		}
+	}
+}
+
+// TestProviderErrorsRedacted: provider errors on the DNS-01 challenge
+// (Present, CleanUp) and on records echo the token; nothing that logs,
+// stores or answers may carry it.
+func TestProviderErrorsRedacted(t *testing.T) {
+	e := newEnv(t, false)
+	echo := func(op string, tok string) error {
+		return fmt.Errorf("provider said: %s refused for token=%s (request body {\"token\":%q})", op, tok, tok)
+	}
+	// 1. Present fails.
+	e.setHook(func(op string, recs []libdns.Record, tok string) error {
+		if op == "append" && len(recs) > 0 && recs[0].RR().Type == "TXT" {
+			return echo("TXT append", tok)
+		}
+		return nil
+	})
+	e.do("PUT", "/domains/team-j.example.org", creds(goodToken), true)
+	v := e.waitState("team-j.example.org", StateError, 20*time.Second)
+	if !strings.Contains(v.LastError, "TXT append refused") || !strings.Contains(v.LastError, "[redacted]") {
+		t.Fatalf("last_error %q", v.LastError)
+	}
+	// 2. CleanUp fails (lego only logs it), issuance succeeds.
+	e.setHook(func(op string, recs []libdns.Record, tok string) error {
+		if op == "delete" && len(recs) > 0 && recs[0].RR().Type == "TXT" {
+			return echo("TXT delete", tok)
+		}
+		return nil
+	})
+	e.clock.advance(2 * time.Minute)
+	e.svc.Kick()
+	e.waitState("team-j.example.org", StateReady, 30*time.Second)
+	if !strings.Contains(e.logs.String(), "TXT delete refused") {
+		t.Fatalf("CleanUp failure not logged:\n%s", e.logs.String())
+	}
+	// 3. Records fail on a re-check.
+	e.setHook(func(op string, _ []libdns.Record, tok string) error {
+		if op == "set" {
+			return echo("records set", tok)
+		}
+		return nil
+	})
+	e.do("POST", "/domains/team-j.example.org/token", creds(goodToken), true)
+	v = e.waitState("team-j.example.org", StateError, 20*time.Second)
+	if !strings.Contains(v.LastError, "records set refused") {
+		t.Fatalf("last_error %q", v.LastError)
+	}
+	// 4. Delete's record removal fails: the warning is redacted.
+	e.setHook(func(op string, _ []libdns.Record, tok string) error {
+		if op == "delete" {
+			return echo("records delete", tok)
+		}
+		return nil
+	})
+	code, body := e.do("DELETE", "/domains/team-j.example.org", "", true)
+	if code != 200 || !strings.Contains(body, "records delete refused") {
+		t.Fatalf("delete = %d %s", code, body)
+	}
+	// assertNoCredentials (cleanup) checks logs, answers and the store.
+}
+
+// TestStaleWorkNeverCommits: work started for a deleted enrollment can't
+// write into a new enrollment of the same name, and DELETE waits for a
+// running records step so the records it creates are removed too.
+func TestStaleWorkNeverCommits(t *testing.T) {
+	e := newEnv(t, false)
+	inSet, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	e.setHook(func(op string, _ []libdns.Record, tok string) error {
+		if op == "set" && tok == goodToken {
+			once.Do(func() { close(inSet); <-release })
+		}
+		return nil
+	})
+	e.do("PUT", "/domains/team-k.example.org", creds(goodToken), true)
+	<-inSet // the first enrollment's records step is running
+	deleted := make(chan string)
+	go func() {
+		code, body := e.do("DELETE", "/domains/team-k.example.org", "", true)
+		deleted <- fmt.Sprint(code, " ", body)
+	}()
+	select {
+	case r := <-deleted:
+		t.Fatalf("DELETE returned (%s) while the records step was still running", r)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	if r := <-deleted; r != "204 " {
+		t.Fatalf("delete = %s", r)
+	}
+	// The records set by the running step were removed.
+	for _, n := range []string{"team-k.example.org", "*.team-k.example.org"} {
+		if rrs := e.zone.Records(n); len(rrs) != 0 {
+			t.Fatalf("%s: %v left after delete", n, rrs)
+		}
+	}
+	// Re-enroll with a rejected token: the old work (if still running)
+	// must not make the new enrollment ready or give it a certificate.
+	e.do("PUT", "/domains/team-k.example.org", creds(badToken), true)
+	e.waitState("team-k.example.org", StateError, 20*time.Second)
+	e.svc.Wait()
+	v := e.list()["team-k.example.org"]
+	if v.State != StateError || v.CertNotAfter != nil || v.RecordsOK {
+		t.Fatalf("new enrollment got stale results: %+v", v)
+	}
+	e.svc.mu.Lock()
+	d := e.svc.doc.Domains["team-k.example.org"]
+	gen, certPEM := d.Generation, d.CertPEM
+	e.svc.mu.Unlock()
+	if certPEM != "" || gen <= 1 {
+		t.Fatalf("generation %d reused / certificate %v", gen, certPEM != "")
+	}
+	// Generations survive a restart: the next one is still new.
+	doc, err := OpenStore(e.dir, e.id).Load()
+	if err != nil || doc.NextGeneration < gen {
+		t.Fatalf("NextGeneration %d after reload, want >= %d (%v)", doc.NextGeneration, gen, err)
 	}
 }
