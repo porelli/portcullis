@@ -108,7 +108,9 @@ func NewService(cfg Config, store *Store) (*Service, error) {
 	}
 	// Records set to other addresses than the configured ones are due now.
 	for _, d := range doc.Domains {
-		if d.AppliedIPv4 == "" || d.State != StateReady {
+		// An unknown IPv4 (a failed lookup) is no address change: the
+		// records set before stay and renewals go on (work).
+		if d.AppliedIPv4 == "" || d.State != StateReady || !cfg.IPv4.IsValid() {
 			continue
 		}
 		if d.AppliedIPv4 != addrString(cfg.IPv4) || d.AppliedIPv6 != addrString(cfg.IPv6) {
@@ -634,7 +636,14 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 	}
 	needCert := s.needsCert(snap, now)
 	hasValid := snap.CertNotAfter != nil && servable(snap, s.cfg.MainDomain, now) == nil
-	if !(snap.State == StateReady && !needCert) {
+	// The server's IPv4 unknown (./portcullis up couldn't detect it) but
+	// records were set before: keep them and go on (a renewal must not
+	// stall on an address lookup); the check compares with what was set.
+	keepRecords := !s.cfg.IPv4.IsValid() && snap.AppliedIPv4 != ""
+	if keepRecords && !(snap.State == StateReady && !needCert) {
+		s.logf("domain %s: the server's public IPv4 is unknown: keeping the records set for %s (records step skipped)", name, snap.AppliedIPv4)
+	}
+	if !keepRecords && !(snap.State == StateReady && !needCert) {
 		j.lock()
 		if !s.update(name, gen, func(d *Domain) { d.State = StateRecords }) {
 			j.unlock()
@@ -703,11 +712,29 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 	}
 }
 
+// wantAddrs are the addresses <name>'s records must show: the configured
+// ones, or — the IPv4 unknown — the ones the records were last set to.
+func (s *Service) wantAddrs(name string) (netip.Addr, netip.Addr) {
+	if s.cfg.IPv4.IsValid() {
+		return s.cfg.IPv4, s.cfg.IPv6
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.doc.Domains[name]
+	if !ok {
+		return netip.Addr{}, netip.Addr{}
+	}
+	v4, _ := netip.ParseAddr(d.AppliedIPv4)
+	v6, _ := netip.ParseAddr(d.AppliedIPv6)
+	return v4, v6
+}
+
 // waitRecords polls the records check for up to RecordsWait.
 func (s *Service) waitRecords(ctx context.Context, name string) error {
 	deadline := time.Now().Add(s.cfg.RecordsWait)
 	for {
-		err := s.checkRecords(ctx, name)
+		v4, v6 := s.wantAddrs(name)
+		err := s.checkRecords(ctx, name, v4, v6)
 		if err == nil || time.Now().Add(s.cfg.RecordsPoll).After(deadline) {
 			return err
 		}

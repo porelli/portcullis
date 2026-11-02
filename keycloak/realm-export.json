@@ -206,7 +206,7 @@
     },
     {
       "alias": "portcullis-invite-session",
-      "description": "After an invite login: only clients with the portcullis-invite-client scope (portcullis-forward-auth), any other is denied; then LoA 2 + amr=hwk",
+      "description": "After an invite login: only clients with the portcullis-invite-client scope (portcullis-forward-auth), any other is denied; then LoA 1 and 2 + amr=hwk",
       "providerId": "basic-flow",
       "topLevel": true,
       "builtIn": false,
@@ -227,6 +227,12 @@
           "authenticatorFlow": true,
           "requirement": "CONDITIONAL",
           "priority": 30,
+          "flowAlias": "portcullis-invite-loa-1"
+        },
+        {
+          "authenticatorFlow": true,
+          "requirement": "CONDITIONAL",
+          "priority": 40,
           "flowAlias": "portcullis-invite-loa"
         }
       ]
@@ -273,6 +279,29 @@
           "requirement": "REQUIRED",
           "priority": 20,
           "authenticatorConfig": "invite-client-deny"
+        }
+      ]
+    },
+    {
+      "alias": "portcullis-invite-loa-1",
+      "description": "Invite login counts as LoA 1 too (a later mtls step-up then asks only for the certificate)",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "conditional-level-of-authentication",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 10,
+          "authenticatorConfig": "invite-loa-1-config"
+        },
+        {
+          "authenticator": "allow-access-authenticator",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 20,
+          "authenticatorConfig": "amr-hwk-invite-loa1"
         }
       ]
     },
@@ -375,6 +404,14 @@
       "config": {
         "denyErrorMessage": "Setup links work only through the Portcullis sign-in page. Open the link again."
       }
+    },
+    {
+      "alias": "invite-loa-1-config",
+      "config": { "loa-condition-level": "1", "loa-max-age": "36000" }
+    },
+    {
+      "alias": "amr-hwk-invite-loa1",
+      "config": { "default.reference.value": "hwk", "default.reference.maxAge": "36000" }
     },
     {
       "alias": "invite-loa-2-config",

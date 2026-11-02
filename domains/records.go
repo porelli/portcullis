@@ -252,7 +252,7 @@ func route53Preflight(p *route53.Provider) error {
 // records set and the zone.
 func (s *Service) setRecords(ctx context.Context, p dnsProvider, name string) ([]RecordRef, string, error) {
 	if !s.cfg.IPv4.IsValid() {
-		return nil, "", errors.New("the server's public IPv4 is unknown (./portcullis up sets DOMAINS_PUBLIC_IPV4)")
+		return nil, "", errors.New("the server's public IPv4 is unknown (./portcullis up detects it once a domain is enrolled — run it again — or set PORTCULLIS_PUBLIC_IPV4 in .env)")
 	}
 	zone, err := s.zoneOf(p, name)
 	if err != nil {
@@ -311,14 +311,17 @@ const probeLabel = "portcullis-probe"
 // checkRecords reports whether <name> and portcullis-probe.<name> resolve
 // to exactly the server's addresses (A, and AAAA when it has IPv6; no AAAA
 // otherwise) at every configured resolver (contract §12.2 records_ok).
-func (s *Service) checkRecords(ctx context.Context, name string) error {
+func (s *Service) checkRecords(ctx context.Context, name string, v4, v6 netip.Addr) error {
+	if !v4.IsValid() {
+		return errors.New("the server's public IPv4 is unknown (./portcullis up detects it, or set PORTCULLIS_PUBLIC_IPV4 in .env)")
+	}
 	c := &dns.Client{Timeout: 5 * time.Second}
 	for _, resolver := range s.cfg.Resolvers {
 		for _, host := range []string{name, probeLabel + "." + name} {
 			for _, q := range []struct {
 				t    uint16
 				want netip.Addr
-			}{{dns.TypeA, s.cfg.IPv4}, {dns.TypeAAAA, s.cfg.IPv6}} {
+			}{{dns.TypeA, v4}, {dns.TypeAAAA, v6}} {
 				m := new(dns.Msg)
 				m.SetQuestion(dns.Fqdn(host), q.t)
 				m.RecursionDesired = true

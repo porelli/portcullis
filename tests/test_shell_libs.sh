@@ -37,6 +37,8 @@ cat > "$WORK/bin/docker" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$STUB_DIR/calls"
 if [ "$1 $2" = "network inspect" ]; then
+  # $STUB_DIR/ipam-<network> wins for that network.
+  if [ -f "$STUB_DIR/ipam-$3" ]; then cat "$STUB_DIR/ipam-$3"; exit 0; fi
   [ -f "$STUB_DIR/ipam" ] || exit 1
   cat "$STUB_DIR/ipam"
 fi
@@ -213,6 +215,23 @@ expect_eq "state mismatch (no ip_range)" "$(proxy_network_state)" mismatch
 expect_fail "guard: mismatch aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 expect_fail "guard: invalid auth config aborts" bash -c "rm -f '$STUB_DIR/ipam'; PORTCULLIS_AUTH_TRAEFIK_IP=172.31.251.9; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 expect_fail "guard: invalid config aborts" bash -c "PORTCULLIS_TRAEFIK_IP=1.2.3.4; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+# portcullis-domains (final review M2): valid, no overlap, existing IPAM.
+unset PORTCULLIS_DOMAINS_SUBNET
+expect_ok "domains net: default valid" validate_domains_network_config
+check_dom() { PORTCULLIS_DOMAINS_SUBNET="$1" validate_domains_network_config; }
+expect_ok   "domains net: custom valid"            check_dom 10.97.0.0/28
+expect_fail "domains net: invalid CIDR"            check_dom 10.97.0.0/40
+expect_fail "domains net: overlaps portcullis-proxy" check_dom 172.31.250.16/28
+expect_fail "domains net: overlaps portcullis-auth"  check_dom 172.31.251.0/29
+expect_fail "domains net: too small"               check_dom 10.97.0.0/31
+rm -f "$STUB_DIR/ipam"
+printf '%s' '172.31.252.0/28|;' > "$STUB_DIR/ipam-portcullis_portcullis-domains"
+expect_eq "domains net: state ok" "$(domains_network_state)" ok
+expect_ok "guard: domains network matching" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+printf '%s' '172.18.5.0/28|;' > "$STUB_DIR/ipam-portcullis_portcullis-domains"
+expect_fail "guard: domains network mismatch aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+expect_fail "guard: invalid domains subnet aborts" bash -c "rm -f '$STUB_DIR/ipam-portcullis_portcullis-domains'; PORTCULLIS_DOMAINS_SUBNET=172.31.250.0/28; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+rm -f "$STUB_DIR/ipam-portcullis_portcullis-domains"
 expect_fail "network lib has no migration code" grep -Eq 'proxy_network_(migrate|reconnect)|docker network (connect|disconnect)' "$HERE/../scripts/lib/network.sh"
 
 # ══ certs: write_revoked_serials ═══════════════════════════
@@ -361,6 +380,20 @@ expect_eq "metrics_label escapes" "$(metrics_label 'a"b\c')" 'a\"b\\c'
 source "$HERE/../scripts/lib/status.sh"
 # shellcheck source=../scripts/lib/backup.sh
 source "$HERE/../scripts/lib/backup.sh"
+
+# ── upgrade: pinned Hub image, policy file version (final review M1) ──
+# dc stub: exec prints $STUB_DIR/pv (the policy version), logs $STUB_DIR/gglog.
+pv() { (dc() { case "$1" in exec) cat "$STUB_DIR/pv" 2>/dev/null ;; logs) cat "$STUB_DIR/gglog" 2>/dev/null ;; esac; }; sleep() { :; }; "$@"; hub_policy_check 2 2>&1); }
+echo 5 > "$STUB_DIR/pv"; : > "$STUB_DIR/gglog"
+expect_ok "upgrade: matching policy version is fine" sh -c "printf '%s' \"\$1\" | grep -q 'matches group-gate'" _ "$(pv unset HUB_IMAGE)"
+echo 4 > "$STUB_DIR/pv"
+OUT="$(pv export HUB_IMAGE=ghcr.io/porelli/portcullis-hub:v0.1)"
+expect_ok "upgrade: old policy version names the pinned image and the fix" sh -c "printf '%s' \"\$1\" | grep -q 'version 4, this core' && printf '%s' \"\$1\" | grep -q 'remove HUB_IMAGE=ghcr.io/porelli/portcullis-hub:v0.1'" _ "$OUT"
+echo 5 > "$STUB_DIR/pv"; echo "group-gate: deny host=x: policy file version 6 is not supported (only 5)" > "$STUB_DIR/gglog"
+expect_ok "upgrade: group-gate deny log is reported" sh -c "printf '%s' \"\$1\" | grep -q 'denying every app host'" _ "$(pv unset HUB_IMAGE)"
+rm -f "$STUB_DIR/pv" "$STUB_DIR/gglog"
+expect_ok "upgrade: pinned HUB_IMAGE warned" sh -c "printf '%s' \"\$1\" | grep -q 'NOT upgraded'" _ "$(HUB_IMAGE=x hub_pinned_warn 2>&1)"
+expect_eq "upgrade: default HUB_IMAGE not warned" "$(unset HUB_IMAGE; hub_pinned_warn 2>&1)" ""
 B="$WORK/backup"
 mkdir -p "$B/secrets/vault-unseal" "$B/certs"
 echo 'PORTCULLIS_DOMAIN=x' > "$B/.env"
@@ -440,9 +473,14 @@ expect_eq "keycloak configure: placeholder kept when it is the domain" \
 # check + deny-unless-admitted (a missing scope or sub-flow denies), before
 # the LoA step; configure creates the scope (not a realm default).
 EXP="$HERE/../keycloak/realm-export.json"
-expect_eq "realm export: portcullis-invite-session = client check, deny, LoA" \
+expect_eq "realm export: portcullis-invite-session = client check, deny, LoA 1, LoA 2" \
   "$(jq -c '[.authenticationFlows[] | select(.alias == "portcullis-invite-session") | .authenticationExecutions[] | [.priority, .requirement, .flowAlias]]' "$EXP")" \
-  '[[10,"CONDITIONAL","portcullis-invite-client"],[20,"CONDITIONAL","portcullis-invite-deny"],[30,"CONDITIONAL","portcullis-invite-loa"]]'
+  '[[10,"CONDITIONAL","portcullis-invite-client"],[20,"CONDITIONAL","portcullis-invite-deny"],[30,"CONDITIONAL","portcullis-invite-loa-1"],[40,"CONDITIONAL","portcullis-invite-loa"]]'
+# The setup link's session holds LoA 1 too, with amr hwk (as LoA 2): an
+# mtls step-up from it asks only for the certificate.
+expect_eq "realm export: invite LoA 1 and 2 sub-flows (level, amr hwk)" \
+  "$(jq -c '.authenticatorConfig as $c | [.authenticationFlows[] | select(.alias == "portcullis-invite-loa-1" or .alias == "portcullis-invite-loa") | [.alias, [.authenticationExecutions[] | [.authenticator, (.authenticatorConfig as $a | $c[] | select(.alias == $a) | .config)]]]]' "$EXP")" \
+  '[["portcullis-invite-loa-1",[["conditional-level-of-authentication",{"loa-condition-level":"1","loa-max-age":"36000"}],["allow-access-authenticator",{"default.reference.value":"hwk","default.reference.maxAge":"36000"}]]],["portcullis-invite-loa",[["conditional-level-of-authentication",{"loa-condition-level":"2","loa-max-age":"36000"}],["allow-access-authenticator",{"default.reference.value":"hwk","default.reference.maxAge":"36000"}]]]]'
 expect_eq "realm export: invite client check = client scope condition (not negated) + allow" \
   "$(jq -c '.authenticatorConfig as $c | [.authenticationFlows[] | select(.alias == "portcullis-invite-client") | .authenticationExecutions[] | [.requirement, .authenticator, (.authenticatorConfig as $a | $c[] | select(.alias == $a) | .config)]]' "$EXP")" \
   "[[\"REQUIRED\",\"conditional-client-scope\",{\"client_scope\":\"$KC_INVITE_CLIENT_SCOPE\",\"negate\":\"false\"}],[\"REQUIRED\",\"allow-access-authenticator\"]]"
@@ -479,7 +517,10 @@ expect_ok "domains: client cert signed by the endpoint CA" openssl verify -CAfil
 expect_ok "domains: server cert SAN DNS:domains, serverAuth" sh -c "openssl x509 -in '$E/server.crt' -noout -text | grep -q 'DNS:domains' && openssl x509 -in '$E/server.crt' -noout -text | grep -q 'TLS Web Server Authentication'"
 expect_ok "domains: client cert clientAuth" sh -c "openssl x509 -in '$E/client.crt' -noout -text | grep -q 'TLS Web Client Authentication'"
 expect_ok "domains: ECDSA P-256" sh -c "openssl x509 -in '$E/server.crt' -noout -text | grep -qE 'prime256v1|P-256'"
-expect_ok "domains: server/client valid ~1 year" sh -c "openssl x509 -checkend $((360*86400)) -noout -in '$E/server.crt' && ! openssl x509 -checkend $((370*86400)) -noout -in '$E/client.crt'"
+expect_ok "domains: server/client valid until the CA expires (~10 years)" sh -c "openssl x509 -checkend $((3600*86400)) -noout -in '$E/server.crt' && openssl x509 -checkend $((3600*86400)) -noout -in '$E/client.crt' && ! openssl x509 -checkend $((3660*86400)) -noout -in '$E/client.crt'"
+expect_eq "domains: public-ips.env written for compose (env_file)" "$(cat "$DR/secrets/domains/public-ips.env")" "DOMAINS_PUBLIC_IPV4=203.0.113.9
+DOMAINS_PUBLIC_IPV6="
+expect_eq "domains: public-ips.env 0600" "$(file_mode "$DR/secrets/domains/public-ips.env")" 600
 expect_ok "domains: CA valid ~10 years" sh -c "openssl x509 -checkend $((3600*86400)) -noout -in '$E/ca.crt'"
 dom domains_fix_perms >/dev/null 2>&1
 expect_eq "domains: ca.key operator-only" "$(file_mode "$E/ca.key")" 600
@@ -494,7 +535,12 @@ expect_eq "domains: valid certificates are kept" "$RENEWED $(openssl x509 -noout
   && openssl x509 -req -in short.csr -CA ca.crt -CAkey ca.key -set_serial 7 -days 10 -out server.crt 2>/dev/null && mv short.key server.key && rm -f short.csr)
 RENEWED="$(dom eval 'domains_endpoint_certs >/dev/null; echo $DOMAINS_CERTS_RENEWED')"
 expect_eq "domains: expiring server certificate renewed, restart flagged" "$RENEWED" true
-expect_ok "domains: renewed certificate valid ~1 year" openssl x509 -checkend $((300*86400)) -noout -in "$E/server.crt"
+expect_ok "domains: renewed certificate valid until the CA expires" openssl x509 -checkend $((3600*86400)) -noout -in "$E/server.crt"
+# Renewed certificates: domains restarts first, healthy, then traefik.
+# shellcheck disable=SC2034  # read by domains_restart_if_renewed
+expect_eq "domains: restart order after a renewal" "$(dc() { echo "dc $*" >> "$STUB_DIR/restart-calls"; }; wait_healthy() { echo "wait $*" >> "$STUB_DIR/restart-calls"; }
+  rm -f "$STUB_DIR/restart-calls"; DOMAINS_CERTS_RENEWED=true; domains_restart_if_renewed; paste -sd' ' "$STUB_DIR/restart-calls")" \
+  "dc restart domains wait 120 domains dc restart traefik"
 CA1="$(openssl x509 -noout -serial -in "$E/ca.crt")"
 : > "$STUB_DIR/dom-calls"
 dom domains_prepare >/dev/null 2>&1
@@ -536,7 +582,9 @@ for bad in ::1 fe80::1 fd00::1 2001:db8::1 2001::1 ff02::1 '::ffff:1.2.3.4' 3fff
   expect_eq "public ip v6: refuses $bad" "$(detect 6)" ""
 done
 # The domains service: explicit values win; failed detection publishes nothing.
-pubips() { (PATH="$WORK/ipbin:$PATH"; "$@"; domains_public_ips 2>/dev/null; echo "$PORTCULLIS_PUBLIC_IPV4/$PORTCULLIS_PUBLIC_IPV6"); }
+# dc stub: "domains enrolled" answers $STUB_DIR/enrolled (missing = not running).
+pubips() { (PATH="$WORK/ipbin:$PATH"; dc() { [ -f "$STUB_DIR/enrolled" ] && cat "$STUB_DIR/enrolled"; }; "$@"; domains_public_ips 2>/dev/null; echo "$PORTCULLIS_PUBLIC_IPV4/$PORTCULLIS_PUBLIC_IPV6"); }
+rm -f "$STUB_DIR/enrolled"
 ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.9
 expect_eq "domains: no agreed IPv4 = none (no records)" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "/"
 expect_eq "domains: explicit IPv4 wins over detection" "$(pubips export PORTCULLIS_PUBLIC_IPV4=203.0.113.9 PORTCULLIS_PUBLIC_IPV6=)" "203.0.113.9/"
@@ -551,6 +599,20 @@ pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6 >/dev/null
 ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.7
 expect_eq "domains: IPv6 detection failure keeps the last address" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
 expect_eq "domains: explicit empty IPv6 still means none" "$(pubips export PORTCULLIS_PUBLIC_IPV4=203.0.113.9 PORTCULLIS_PUBLIC_IPV6=)" "203.0.113.9/"
+
+# A failed IPv4 lookup keeps the last detected address too (final review I1).
+ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.8
+expect_eq "domains: IPv4 detection failure keeps the last address" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
+expect_eq "domains: the env file has the kept addresses" "$(cat "$PORTCULLIS_ROOT/secrets/domains/public-ips.env")" "DOMAINS_PUBLIC_IPV4=198.51.99.7
+DOMAINS_PUBLIC_IPV6=2a01:4f8::5"
+# No enrolled domain (the service says 0): no lookups, last addresses kept.
+echo 0 > "$STUB_DIR/enrolled"
+: > "$STUB_DIR/ip-calls"
+ipans https://api.ipify.org 198.51.99.20 https://ipv4.icanhazip.com 198.51.99.20
+expect_eq "domains: no enrolled domain = no lookups (last addresses kept)" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6 | tail -n1)/$(wc -l < "$STUB_DIR/ip-calls" | tr -d ' ')" "198.51.99.7/2a01:4f8::5/0"
+echo 2 > "$STUB_DIR/enrolled"
+expect_eq "domains: enrolled domains = lookups" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.20/2a01:4f8::5"
+rm -f "$STUB_DIR/enrolled"
 
 echo ""
 echo "$PASS passed, $FAIL failed"

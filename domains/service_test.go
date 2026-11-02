@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1154,4 +1155,72 @@ func TestShortSecretRefused(t *testing.T) {
 	if err := validateCredentials("cloudflare", map[string]string{"api_token": "short"}); err == nil {
 		t.Fatal("a 5-character token accepted")
 	}
+}
+
+// TestUnknownIPv4StillRenews: a failed public-address lookup (IPv4
+// unknown) doesn't stall a domain whose records were set before: no
+// address change is assumed, the records step is skipped and the
+// certificate is still renewed (final review I1).
+func TestUnknownIPv4StillRenews(t *testing.T) {
+	e := newEnv(t, false)
+	e.do("PUT", "/domains/team-u.example.org", creds(goodToken), true)
+	e.waitState("team-u.example.org", StateReady, 60*time.Second)
+	e.cancel()
+	e.svc.Wait()
+	var sets atomic.Int32
+	e.setHook(func(op string, _ []libdns.Record, _ string) error {
+		if op == "set" {
+			sets.Add(1)
+		}
+		return nil
+	})
+	cfg := e.svc.cfg
+	cfg.IPv4 = netip.Addr{}
+	svc2, err := NewService(cfg, OpenStore(e.dir, e.id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := svc2.doc.Domains["team-u.example.org"].State; st != StateReady {
+		t.Fatalf("state with the IPv4 unknown = %s (no address change)", st)
+	}
+	first := *svc2.doc.Domains["team-u.example.org"].CertNotAfter
+	e.clock.advance(61 * 24 * time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { svc2.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	svc2.Kick()
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		svc2.mu.Lock()
+		d := svc2.doc.Domains["team-u.example.org"]
+		renewed := d.State == StateReady && d.CertNotAfter != nil && !d.CertNotAfter.Equal(first)
+		st, last := d.State, d.LastError
+		svc2.mu.Unlock()
+		if renewed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("not renewed with the IPv4 unknown: %s %q\n%s", st, last, e.logs.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if n := sets.Load(); n != 0 {
+		t.Fatalf("records set %d times with the IPv4 unknown", n)
+	}
+	if !strings.Contains(e.logs.String(), "records step skipped") {
+		t.Fatal("skip not logged")
+	}
+	if c, err := enrolledCount(e.dir, writeKey(t, e.id)); err != nil || c != 1 {
+		t.Fatalf("enrolledCount = %d, %v", c, err)
+	}
+}
+
+func writeKey(t *testing.T, id *age.X25519Identity) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "age.key")
+	if err := os.WriteFile(p, []byte(id.String()+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return p
 }

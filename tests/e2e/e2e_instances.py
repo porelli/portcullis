@@ -178,7 +178,9 @@ def main() -> int:
                 assert c["domain"] == f"echo-a.{EXTRA}" and c["path"] == "/" and c["secure"], c
             assert not [c for c in ctx.cookies() if c["domain"].lstrip(".") == EXTRA], "a cookie for the whole extra domain"
             assert not [c for c in cookies if c["name"] == "_oauth2_proxy"], "main-domain cookie sent to the extra domain"
-            state["creds"] = key.credentials()
+            # The setup link's session (post-broker flow portcullis-invite-session:
+            # LoA 1 and 2 recorded): the mtls step-up below starts from it.
+            state["storage"] = ctx.storage_state()
         check("cross_domain_sso: echo-a on the extra domain opens with no extra WebAuthn assertion "
               "(forward-auth-ext, host-only __Host-portcullis_ext, host callback, PKCE S256)", cross_domain_sso)
 
@@ -206,21 +208,9 @@ def main() -> int:
 
         # ── alice with her client certificate: step-up on echo-c (mtls) ──
         def stepup_once():
-            if "creds" not in state:
-                raise AssertionError("needs alice's passkey")
-            # A returning user: a passkey sign-in in a browser without the
-            # certificate (with it, Keycloak's LoA 1 would take the cert),
-            # then the same session with the certificate available.
-            c1 = new_context("alice-relogin")
-            p1 = c1.new_page()
-            k1 = base.Authenticator(p1, state["creds"])
-            try:
-                p1.goto(PORTAL, wait_until="domcontentloaded")
-                base.passkey_flow(p1, until=PORTAL, label="inst-alice-relogin")
-                assert k1.asserted == 1, f"re-login: {k1.asserted} assertions"
-                storage = c1.storage_state()
-            finally:
-                close(c1, "alice-relogin")
+            if "storage" not in state:
+                raise AssertionError("needs alice's session")
+            storage = state["storage"]
             c2 = new_context("alice-stepup", client_cert=cert, origins=(AUTH, ECHO_C), storage_state=storage)
             p2 = c2.new_page()
             key2 = base.Authenticator(p2)

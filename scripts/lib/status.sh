@@ -197,6 +197,43 @@ hub_image_default() {
   sed -n 's/.*\${HUB_IMAGE:-\([^}]*\)}.*/\1/p' "$PORTCULLIS_HOME/docker-compose.yml" | head -n1
 }
 
+# hub_pinned_warn — before an upgrade: a HUB_IMAGE pinned in .env is not
+# upgraded with core.
+hub_pinned_warn() {
+  [ -n "${HUB_IMAGE:-}" ] || return 0
+  warn "HUB_IMAGE=$HUB_IMAGE is pinned in .env: the Hub is NOT upgraded with core. If this core's group-gate needs a newer policy file, every app host is denied until the Hub matches (checked after the start)."
+}
+
+# hub_policy_check [tries] — after a start: the policy file the Hub wrote
+# must be the version this core's group-gate serves (contract §4), and
+# group-gate must not be denying for an unsupported version. Prints the
+# fix; never fails the run.
+hub_policy_check() {
+  local tries="${1:-20}" want got="" i denied fix
+  want="$(sed -n 's/^POLICY_VERSION = \([0-9][0-9]*\).*/\1/p' "$PORTCULLIS_HOME/group-gate/group-gate.py" | head -n1)"
+  [ -n "$want" ] || return 0
+  for i in $(seq 1 "$tries"); do
+    got="$(dc exec -T group-gate python3 -c 'import json
+try:
+    print(json.load(open("/hub-data/group-gate-policy.json")).get("version"))
+except FileNotFoundError:
+    print("missing")
+except Exception:
+    print("unreadable")' 2>/dev/null | tr -d '[:space:]')" || got=""
+    [ -z "$got" ] || [ "$got" = missing ] || break
+    [ "$i" -eq "$tries" ] || sleep 3
+  done
+  denied="$(dc logs --no-color --since 10m group-gate 2>/dev/null | grep -c 'is not supported (only' || true)"
+  if { [ -n "$got" ] && [ "$got" != missing ] && [ "$got" != "$want" ]; } || [ "${denied:-0}" -gt 0 ]; then
+    fix="run ./portcullis up (it pulls the Hub image this core expects)"
+    [ -z "${HUB_IMAGE:-}" ] || fix="remove HUB_IMAGE=$HUB_IMAGE from .env (or set a Hub release that matches this core), then $fix"
+    warn "group-gate is denying every app host: the Hub's policy file is version ${got:-unknown}, this core's group-gate serves only version $want. Fix: $fix."
+    return 0
+  fi
+  [ "$got" = "$want" ] && echo "    policy file version $got (matches group-gate)"
+  return 0
+}
+
 version_run() {
   local json="$1" ver hub src running="" cid=""
   ver="$(portcullis_version)"

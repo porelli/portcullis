@@ -13,9 +13,10 @@
 #                                     (Traefik) of the certificate endpoint;
 #                                     ca.key stays operator-only (0600)
 #
-# The endpoint certificates are ECDSA P-256: CA 10 years, server/client 1
-# year. A certificate with < 30 days left is renewed (the CA with < 1 year
-# left: all three); after a renewal of existing certificates
+# The endpoint certificates are ECDSA P-256: CA 10 years, server/client
+# until the CA expires (a private CA on internal networks: nothing renews
+# them between ups). A certificate with < 30 days left is renewed (the CA
+# with < 1 year left: all three); after a renewal of existing certificates
 # DOMAINS_CERTS_RENEWED=true and the caller restarts traefik and domains
 # (neither re-reads the files while running).
 
@@ -58,13 +59,18 @@ _domains_expiring() {
 _domains_leaf() {
   local d name="$1" ext="$2" cn="$3" cnf
   d="$(_domains_dir)/certs-endpoint"
+  # Valid until the CA expires (whole days left on it, at least 1).
+  local days end
+  end="$(to_epoch "$(openssl x509 -noout -enddate -in "$d/ca.crt" 2>/dev/null | cut -d= -f2)")"
+  days=$(( (end - $(date +%s)) / 86400 ))
+  [ "$days" -ge 1 ] || days=1
   cnf="$(mktemp)"
   _domains_openssl_cnf > "$cnf"
   (umask 077 \
     && openssl ecparam -name prime256v1 -genkey -noout -out "$d/$name.key.new" 2>/dev/null \
     && openssl req -new -key "$d/$name.key.new" -subj "/CN=$cn" -out "$d/$name.csr" 2>/dev/null \
     && openssl x509 -req -in "$d/$name.csr" -CA "$d/ca.crt" -CAkey "$d/ca.key" -set_serial "0x$(openssl rand -hex 16)" \
-         -days 365 -sha256 -extfile "$cnf" -extensions "$ext" -out "$d/$name.crt.new" 2>/dev/null) \
+         -days "$days" -sha256 -extfile "$cnf" -extensions "$ext" -out "$d/$name.crt.new" 2>/dev/null) \
     || { rm -f "$cnf" "$d/$name.csr" "$d/$name.key.new" "$d/$name.crt.new"; fail "could not create the certificate endpoint's $name certificate (openssl)"; }
   rm -f "$cnf" "$d/$name.csr"
   mv -f "$d/$name.key.new" "$d/$name.key"
@@ -123,33 +129,76 @@ domains_age_keygen() {
   ok "Generated secrets/domains/age.key (encrypts the domains service's DNS credentials; backed up with secrets/)."
 }
 
+# domains_enrolled — false only when the running domains service reports
+# no enrolled domain (unknown — not running, an old image — counts as
+# enrolled: the lookups run).
+domains_enrolled() {
+  local n
+  n="$(dc exec -T domains domains enrolled 2>/dev/null | tr -d '[:space:]')" || return 0
+  [ "$n" != 0 ]
+}
+
+# _domains_last <4|6> [<address>] — the last detected address (stored, or
+# read back: a valid global one only).
+_domains_last() {
+  local f
+  f="$(_domains_dir)/last-public-ipv$1"
+  if [ $# -gt 1 ]; then
+    (umask 077 && printf '%s\n' "$2" > "$f")
+    return 0
+  fi
+  [ -s "$f" ] || return 0
+  local a
+  a="$(head -n1 "$f")"
+  if [ "$1" = 4 ]; then ipv4_is_global "$a" || a=""; else ipv6_is_global "$a" || a=""; fi
+  printf '%s' "$a"
+}
+
 # domains_public_ips — the server's public IPv4 / IPv6 for the domains
 # service's A/AAAA records (contract §12.1). An explicit
 # PORTCULLIS_PUBLIC_IPV4 / _IPV6 (environment or .env; an empty _IPV6 =
 # no IPv6) always wins; otherwise public_ip_detect (HTTPS, two services
-# must agree, global unicast only). No address = the service publishes no
-# record and reports why in the domain's last error (fail closed).
+# must agree, global unicast only) — skipped while no domain is enrolled
+# (domains_enrolled). A failed or skipped lookup keeps the last detected
+# address. No address = the service keeps the records it set and renews
+# certificates, but sets no new records (fail closed). The result is
+# written to secrets/domains/public-ips.env, the domains service's
+# env_file (a manual `docker compose up` gets it too).
 domains_public_ips() {
-  local v4="${PORTCULLIS_PUBLIC_IPV4:-}" v6="${PORTCULLIS_PUBLIC_IPV6:-}"
+  local v4="${PORTCULLIS_PUBLIC_IPV4:-}" v6="${PORTCULLIS_PUBLIC_IPV6:-}" lookup=true
+  if [ -z "$v4" ] || [ -z "${PORTCULLIS_PUBLIC_IPV6+x}" ]; then
+    domains_enrolled || lookup=false
+  fi
   if [ -z "$v4" ]; then
-    v4="$(public_ip_detect 4)"
-    [ -n "$v4" ] || warn "Could not detect the public IPv4 reliably (two HTTPS services must agree on a global address): enrolled domains get no records until it is known — set PORTCULLIS_PUBLIC_IPV4 in .env."
+    [ "$lookup" = false ] || v4="$(public_ip_detect 4)"
+    if [ -n "$v4" ]; then
+      _domains_last 4 "$v4"
+    else
+      v4="$(_domains_last 4)"
+      if [ "$lookup" = true ]; then
+        if [ -n "$v4" ]; then
+          warn "IPv4 detection failed: keeping the last detected address $v4 (set PORTCULLIS_PUBLIC_IPV4 in .env if it changed)."
+        else
+          warn "Could not detect the public IPv4 reliably (two HTTPS services must agree on a global address): enrolled domains keep their records but get no new ones until it is known — set PORTCULLIS_PUBLIC_IPV4 in .env."
+        fi
+      fi
+    fi
   fi
   if [ -z "${PORTCULLIS_PUBLIC_IPV6+x}" ]; then
     # No IPv6 means "remove the AAAA records": a transient detection
     # failure keeps the last detected address instead.
-    local last
-    last="$(_domains_dir)/last-public-ipv6"
-    v6="$(public_ip_detect 6)"
+    v6=""
+    [ "$lookup" = false ] || v6="$(public_ip_detect 6)"
     if [ -n "$v6" ]; then
-      (umask 077 && printf '%s\n' "$v6" > "$last")
-    elif [ -s "$last" ]; then
-      v6="$(head -n1 "$last")"
-      ipv6_is_global "$v6" || v6=""
-      [ -z "$v6" ] || warn "IPv6 detection failed: keeping the last detected address $v6 (set PORTCULLIS_PUBLIC_IPV6= in .env if the server has no IPv6 any more)."
+      _domains_last 6 "$v6"
+    else
+      v6="$(_domains_last 6)"
+      [ -z "$v6" ] || [ "$lookup" = false ] || warn "IPv6 detection failed: keeping the last detected address $v6 (set PORTCULLIS_PUBLIC_IPV6= in .env if the server has no IPv6 any more)."
     fi
   fi
+  [ "$lookup" = true ] || info "No enrolled domain: public address lookups skipped (run ./portcullis up again after enrolling the first domain)."
   export PORTCULLIS_PUBLIC_IPV4="$v4" PORTCULLIS_PUBLIC_IPV6="$v6"
+  (umask 077 && printf 'DOMAINS_PUBLIC_IPV4=%s\nDOMAINS_PUBLIC_IPV6=%s\n' "$v4" "$v6" > "$(_domains_dir)/public-ips.env")
 }
 
 # domains_prepare — every file the domains service, the Hub and Traefik
@@ -184,11 +233,17 @@ domains_fix_perms() {
   done
 }
 
-# domains_restart_if_renewed — after `compose up`: restart traefik and
-# domains when the endpoint certificates were renewed.
+# domains_restart_if_renewed — after `compose up`: restart domains, then
+# traefik, when the endpoint certificates were renewed.
 domains_restart_if_renewed() {
   [ "$DOMAINS_CERTS_RENEWED" = true ] || return 0
-  dc restart traefik domains >/dev/null || warn "could not restart traefik and domains after renewing the endpoint certificates (run: docker compose restart traefik domains)"
+  # domains first (it serves the new server certificate), healthy, then
+  # traefik (its client certificate): never traefik against the old one.
+  if dc restart domains >/dev/null && wait_healthy 120 domains; then
+    dc restart traefik >/dev/null || warn "could not restart traefik after renewing the endpoint certificates (run: docker compose restart traefik)"
+  else
+    warn "could not restart domains after renewing the endpoint certificates (run: docker compose restart domains, then docker compose restart traefik)"
+  fi
   DOMAINS_CERTS_RENEWED=false
 }
 

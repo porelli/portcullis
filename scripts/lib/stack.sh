@@ -231,6 +231,7 @@ upgrade_run() {
   env_require PORTCULLIS_DOMAIN $CORE_SECRETS
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
   network_check
+  hub_pinned_warn
 
   if [ "$skip_backup" = true ]; then
     warn "Skipping the backup (--skip-backup)."
@@ -260,6 +261,8 @@ upgrade_run() {
   lldap_service_account
   # Picks up a FORWARD_AUTH_CLIENT_SECRET generated above, if any.
   dc up -d forward-auth forward-auth-ext >/dev/null
+  info "Checking the Hub's policy file against group-gate..."
+  hub_policy_check
 
   ok "Upgrade complete.${BACKUP_LAST_DIR:+ Backup: $BACKUP_LAST_DIR}"
   echo "    Verify: ./portcullis status"

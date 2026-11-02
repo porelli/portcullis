@@ -241,10 +241,10 @@ keycloak_configure() {
 
   info "Checking factor executors carry AMR reference values..."
   # Each authenticator in portcullis-loa-1-factors / portcullis-loa-3 /
-  # portcullis-invite-loa needs an authenticatorConfig with
+  # portcullis-invite-loa(-1) needs an authenticatorConfig with
   # default.reference.value, or the amr claim is empty and AND-mode policies
   # cannot tell factors apart.
-  for flow in portcullis-loa-1-factors portcullis-loa-3 portcullis-invite-loa; do
+  for flow in portcullis-loa-1-factors portcullis-loa-3 portcullis-invite-loa-1 portcullis-invite-loa; do
     execs="$(kc_get "/$KC_REALM/authentication/flows/$flow/executions")"
     printf '%s' "$execs" | jq -e 'type == "array"' >/dev/null 2>&1 || continue
     while read -r provider cfg; do

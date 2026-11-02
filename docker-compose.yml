@@ -101,7 +101,9 @@ services:
   # info, version, /_ping — with write methods (POST=1 also allows
   # PUT/DELETE on those sections). Denied: build, commit, swarm, nodes,
   # services, tasks, secrets, configs, plugins, system (df/prune), auth,
-  # distribution, container archive/export.
+  # distribution, container export. Container archive (GET/PUT
+  # /containers/{id}/archive) is allowed (ALLOW_ARCHIVE): the Hub's instance
+  # backups / restores copy volume data through never-started helpers.
   socket-proxy-hub:
     image: ghcr.io/linuxserver/socket-proxy:3.4.7@sha256:4e5e59efd3338205561c54262581992036e5a36ccca97d487b1d4ec41f9adc58
     <<: *hardening
@@ -737,6 +739,10 @@ services:
   hub:
     image: ${HUB_IMAGE:-ghcr.io/porelli/portcullis-hub:edge}
     <<: *hardening
+    # Background instance backups / restores / deletes get ~50 s to finish
+    # on stop (the Hub's bounded shutdown wait); longer ones are marked
+    # interrupted at the next start.
+    stop_grace_period: 60s
     # The image runs as uid/gid 10001; it writes only /data (named volume,
     # 10001-owned in the image), /project/templates (chowned to 10001 by
     # ./portcullis up) and the tmpfs paths below.
@@ -945,10 +951,14 @@ services:
       PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
       ACME_EMAIL: ${ACME_EMAIL:-admin@portcullis.local}
       ACME_CA_SERVER: ${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
-      # Detected by ./portcullis up (as `dns setup` does) unless set in .env.
-      DOMAINS_PUBLIC_IPV4: ${PORTCULLIS_PUBLIC_IPV4:-}
-      DOMAINS_PUBLIC_IPV6: ${PORTCULLIS_PUBLIC_IPV6:-}
       DOMAINS_API_SUBNET: ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28}
+    # DOMAINS_PUBLIC_IPV4 / _IPV6: PORTCULLIS_PUBLIC_IPV4 / _IPV6 from .env,
+    # else detected (the last detected address kept when a lookup fails) —
+    # written by ./portcullis up, so a manual `docker compose up` gets them
+    # (missing before the first up: no addresses, no records).
+    env_file:
+      - path: ./secrets/domains/public-ips.env
+        required: false
     volumes:
       - domains_data:/data
       - ./secrets/domains/api-secret:/run/portcullis/domains/api-secret:ro

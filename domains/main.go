@@ -55,8 +55,17 @@ func main() {
 				os.Exit(1)
 			}
 			return
+		case "enrolled":
+			// How many domains the store holds (./portcullis up skips the
+			// public-address lookups while it is 0).
+			n, err := enrolledCount(env("DOMAINS_DATA_DIR", "/data"), env("DOMAINS_AGE_KEY_FILE", "/run/portcullis/domains/age.key"))
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Println(n)
+			return
 		default:
-			fmt.Fprintf(os.Stderr, "usage: domains [keygen|healthcheck]\n")
+			fmt.Fprintf(os.Stderr, "usage: domains [keygen|healthcheck|enrolled]\n")
 			os.Exit(2)
 		}
 	}
@@ -325,4 +334,17 @@ func endpointTLS(caFile, certFile, keyFile string) (*tls.Config, error) {
 		ClientCAs:    pool,
 		MinVersion:   tls.VersionTLS12,
 	}, nil
+}
+
+// enrolledCount is the number of domains in the store under dir.
+func enrolledCount(dir, keyFile string) (int, error) {
+	id, err := loadIdentity(keyFile)
+	if err != nil {
+		return 0, err
+	}
+	doc, err := OpenStore(dir, id).Load()
+	if err != nil {
+		return 0, err
+	}
+	return len(doc.Domains), nil
 }

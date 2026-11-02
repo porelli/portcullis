@@ -17,9 +17,12 @@
 #   PORTCULLIS_AUTH_SUBNET     default 172.31.251.0/28
 #   PORTCULLIS_AUTH_IP_RANGE   default 172.31.251.8/29
 #   PORTCULLIS_AUTH_TRAEFIK_IP default 172.31.251.2
+#   PORTCULLIS_DOMAINS_SUBNET  default 172.31.252.0/28 (portcullis-domains)
 
 PROXY_NETWORK="${PROXY_NETWORK:-portcullis-proxy}"
 AUTH_NETWORK="${AUTH_NETWORK:-portcullis-auth}"
+# Compose names it <project>_portcullis-domains (no explicit name).
+DOMAINS_NETWORK="${DOMAINS_NETWORK:-portcullis_portcullis-domains}"
 
 proxy_subnet()   { echo "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24}"; }
 proxy_ip_range() { echo "${PORTCULLIS_PROXY_IP_RANGE:-172.31.250.128/25}"; }
@@ -27,6 +30,7 @@ proxy_traefik_ip() { echo "${PORTCULLIS_TRAEFIK_IP:-172.31.250.2}"; }
 auth_subnet()    { echo "${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28}"; }
 auth_ip_range()  { echo "${PORTCULLIS_AUTH_IP_RANGE:-172.31.251.8/29}"; }
 auth_traefik_ip() { echo "${PORTCULLIS_AUTH_TRAEFIK_IP:-172.31.251.2}"; }
+domains_subnet() { echo "${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28}"; }
 
 # ip_to_int <a.b.c.d> — prints the address as an integer; fails if invalid.
 ip_to_int() {
@@ -98,6 +102,32 @@ validate_auth_network_config() {
   fi
 }
 
+# _overlaps <cidr> <cidr> — succeed if the two ranges share an address.
+_overlaps() {
+  local af al bf bl
+  read -r af al <<< "$(cidr_bounds "$1" 2>/dev/null)" || true
+  read -r bf bl <<< "$(cidr_bounds "$2" 2>/dev/null)" || true
+  [ -n "${af:-}" ] && [ -n "${bf:-}" ] && [ "$af" -le "$bl" ] && [ "$bf" -le "$al" ]
+}
+
+# validate_domains_network_config — PORTCULLIS_DOMAINS_SUBNET (the domains
+# API answers only connections addressed to it there, contract §12): a
+# valid IPv4 CIDR with room for the gateway and two containers, overlapping
+# neither portcullis-proxy nor portcullis-auth.
+validate_domains_network_config() {
+  local sub sf sl
+  sub="$(domains_subnet)"
+  read -r sf sl <<< "$(cidr_bounds "$sub" 2>/dev/null)" || true
+  [ -n "${sf:-}" ] || { echo "PORTCULLIS_DOMAINS_SUBNET=$sub is not a valid IPv4 CIDR"; return 1; }
+  [ $((sl - sf)) -ge 4 ] || { echo "PORTCULLIS_DOMAINS_SUBNET=$sub is too small (at least a /29)"; return 1; }
+  if _overlaps "$sub" "$(proxy_subnet)"; then
+    echo "PORTCULLIS_DOMAINS_SUBNET=$sub overlaps PORTCULLIS_PROXY_SUBNET=$(proxy_subnet)"; return 1
+  fi
+  if _overlaps "$sub" "$(auth_subnet)"; then
+    echo "PORTCULLIS_DOMAINS_SUBNET=$sub overlaps PORTCULLIS_AUTH_SUBNET=$(auth_subnet)"; return 1
+  fi
+}
+
 # network_state <name> <subnet> <range> — prints one of: missing | ok | mismatch
 # ("mismatch" = network exists without the expected IPAM subnet/ip_range,
 # e.g. after editing the settings in .env; Docker can't change IPAM in place).
@@ -116,6 +146,7 @@ network_state() {
 
 proxy_network_state() { network_state "$PROXY_NETWORK" "$(proxy_subnet)" "$(proxy_ip_range)"; }
 auth_network_state()  { network_state "$AUTH_NETWORK" "$(auth_subnet)" "$(auth_ip_range)"; }
+domains_network_state() { network_state "$DOMAINS_NETWORK" "$(domains_subnet)" ""; }
 
 # network_check — validate the .env settings and refuse to continue if the
 # existing network does not match them (compose would silently keep the old
@@ -124,6 +155,7 @@ network_check() {
   local err
   err="$(validate_proxy_network_config)" || fail "Invalid portcullis-proxy settings in .env: $err"
   err="$(validate_auth_network_config)" || fail "Invalid portcullis-auth settings in .env: $err"
+  err="$(validate_domains_network_config)" || fail "Invalid portcullis-domains settings in .env: $err"
   if [ "$(proxy_network_state)" = mismatch ]; then
     fail "Docker network $PROXY_NETWORK exists with a different IPAM config than .env
        ($(proxy_subnet), range $(proxy_ip_range)). Docker cannot change it in place:
@@ -134,6 +166,11 @@ network_check() {
     fail "Docker network $AUTH_NETWORK exists with a different IPAM config than .env
        ($(auth_subnet), range $(auth_ip_range)). Only core services use it:
        ./portcullis down && ./portcullis up recreates it."
+  fi
+  if [ "$(domains_network_state)" = mismatch ]; then
+    fail "Docker network $DOMAINS_NETWORK exists with a different subnet than
+       PORTCULLIS_DOMAINS_SUBNET=$(domains_subnet) (the domains API would refuse the Hub).
+       Only the Hub and domains use it: ./portcullis down && ./portcullis up recreates it."
   fi
 }
 
