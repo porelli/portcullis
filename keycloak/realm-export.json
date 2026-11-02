@@ -206,7 +206,7 @@
     },
     {
       "alias": "portcullis-invite-session",
-      "description": "After an invite login: LoA 2 + amr=hwk. The session only exists once the webauthn-register-passwordless required action (set with the invite) has registered a passkey",
+      "description": "After an invite login: only for portcullis-forward-auth (the client with the portcullis-invite-client scope; any other client is denied, so an invite never bypasses a client's own browser flow, e.g. the Hub's access-role flows), then LoA 2 + amr=hwk. The session only exists once the webauthn-register-passwordless required action (set with the invite) has registered a passkey",
       "providerId": "basic-flow",
       "topLevel": true,
       "builtIn": false,
@@ -215,7 +215,64 @@
           "authenticatorFlow": true,
           "requirement": "CONDITIONAL",
           "priority": 10,
+          "flowAlias": "portcullis-invite-client"
+        },
+        {
+          "authenticatorFlow": true,
+          "requirement": "CONDITIONAL",
+          "priority": 20,
+          "flowAlias": "portcullis-invite-deny"
+        },
+        {
+          "authenticatorFlow": true,
+          "requirement": "CONDITIONAL",
+          "priority": 30,
           "flowAlias": "portcullis-invite-loa"
+        }
+      ]
+    },
+    {
+      "alias": "portcullis-invite-client",
+      "description": "The client has the portcullis-invite-client scope (only portcullis-forward-auth has it): a missing scope is false",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "conditional-client-scope",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 10,
+          "authenticatorConfig": "invite-client-scope"
+        },
+        {
+          "authenticator": "allow-access-authenticator",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 20
+        }
+      ]
+    },
+    {
+      "alias": "portcullis-invite-deny",
+      "description": "Deny every invite login portcullis-invite-client did not admit (also when that sub-flow is missing or renamed)",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "conditional-sub-flow-executed",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 10,
+          "authenticatorConfig": "invite-client-not-admitted"
+        },
+        {
+          "authenticator": "deny-access-authenticator",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 20,
+          "authenticatorConfig": "invite-client-deny"
         }
       ]
     },
@@ -298,6 +355,26 @@
     {
       "alias": "amr-hwk-loa1",
       "config": { "default.reference.value": "hwk", "default.reference.maxAge": "36000" }
+    },
+    {
+      "alias": "invite-client-scope",
+      "config": {
+        "client_scope": "portcullis-invite-client",
+        "negate": "false"
+      }
+    },
+    {
+      "alias": "invite-client-not-admitted",
+      "config": {
+        "flow_to_check": "portcullis-invite-client",
+        "check_result": "not-executed"
+      }
+    },
+    {
+      "alias": "invite-client-deny",
+      "config": {
+        "denyErrorMessage": "Setup links work only through the Portcullis sign-in page. Open the link again."
+      }
     },
     {
       "alias": "invite-loa-2-config",

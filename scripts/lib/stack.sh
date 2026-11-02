@@ -164,8 +164,8 @@ init_run() {
   config_build_ca_bundle
   # server.key was just written: give Traefik (group 0) read access.
   stack_prepare
-  info "Restarting Traefik, forward-auth and Keycloak to pick up the CA chain..."
-  dc restart traefik forward-auth keycloak
+  info "Restarting Traefik, the forward-auth services and Keycloak to pick up the CA chain..."
+  dc restart traefik forward-auth forward-auth-ext keycloak
   wait_healthy 300 keycloak
 
   keycloak_configure false
@@ -249,15 +249,15 @@ upgrade_run() {
   dc up -d --build
   monitoring_reload
   if [ "$PKI_CREATED" = true ] || [ "${PKI_TRUSTSTORE_CHANGED:-false}" = true ]; then
-    # Traefik, forward-auth and Keycloak read the CA chain only at start-up.
-    dc restart traefik forward-auth keycloak >/dev/null
+    # Traefik, forward-auth(-ext) and Keycloak read the CA chain only at start-up.
+    dc restart traefik forward-auth forward-auth-ext keycloak >/dev/null
   fi
   wait_healthy 300 vault postgres lldap keycloak
   keycloak_configure false
   oidc_register
   lldap_service_account
   # Picks up a FORWARD_AUTH_CLIENT_SECRET generated above, if any.
-  dc up -d forward-auth >/dev/null
+  dc up -d forward-auth forward-auth-ext >/dev/null
 
   ok "Upgrade complete.${BACKUP_LAST_DIR:+ Backup: $BACKUP_LAST_DIR}"
   echo "    Verify: ./portcullis status"

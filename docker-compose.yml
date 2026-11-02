@@ -202,6 +202,12 @@ services:
       - "443:443"
     volumes:
       - ./traefik/dynamic:/etc/traefik/dynamic:ro
+      # Enrolled domains' wildcard certificates + certs.yml, written by the
+      # domains service (contract §12.4). The file provider loads
+      # subdirectories but watches only the top directory: traefik-certs-reload
+      # sends Traefik SIGHUP when certs.yml changes. The mountpoint exists in
+      # the repo (traefik/dynamic/domains/.gitkeep): the bind above is read-only.
+      - domains_certs:/etc/traefik/dynamic/domains:ro
       - ./certs:/certs:ro
       - traefik_acme:/acme
     networks:
@@ -233,6 +239,46 @@ services:
       traefik.http.routers.dashboard.tls.options: authaware@file
       traefik.http.routers.dashboard.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.routers.dashboard.service: api@internal
+    restart: unless-stopped
+
+  # Traefik's file provider watches /etc/traefik/dynamic and its top-level
+  # files only (fsnotify is not recursive; traefik v3 pkg/provider/file):
+  # a new certs.yml in the domains_certs volume (an enrolled domain's
+  # certificate issued, renewed or removed) would be ignored until the next
+  # restart. This sidecar polls its checksum and sends Traefik SIGHUP, on
+  # which the file provider rebuilds its configuration (hitless). It shares
+  # Traefik's PID namespace for that (root, like Traefik: same uid, so no
+  # CAP_KILL), has no network and only the volume, read-only. If Traefik is
+  # restarted the namespace is gone: pidof fails, the sidecar exits and its
+  # restart policy joins the new one.
+  traefik-certs-reload:
+    image: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+    <<: *hardening
+    read_only: true
+    network_mode: none
+    pid: "service:traefik"
+    volumes:
+      - domains_certs:/watch:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -u
+        sum() { sha256sum /watch/certs.yml 2>/dev/null || echo none; }
+        last="$$(sum)"
+        while sleep 10; do
+          pid="$$(pidof traefik)" || { echo "traefik-certs-reload: no traefik process (restarted?), exiting"; exit 1; }
+          cur="$$(sum)"
+          if [ "$$cur" != "$$last" ]; then
+            kill -HUP $$pid && last="$$cur" && echo "traefik-certs-reload: certs.yml changed, sent SIGHUP to traefik ($$pid)"
+          fi
+        done
+    mem_limit: 16m
+    pids_limit: 16
+    depends_on:
+      traefik:
+        condition: service_healthy
+        restart: true
     restart: unless-stopped
 
   postgres:
@@ -548,6 +594,62 @@ services:
       keycloak:
         condition: service_healthy
 
+  # Second oauth2-proxy for extra-domain hosts (contract §5 "Extra-domain
+  # hosts"): one process has one redirect URL and one cookie domain, and
+  # forward-auth's are auth.<domain> / .<domain>, which browsers never send
+  # to another domain. Same Keycloak client, provider config and cookie
+  # secret; the callback is relative (oauth2-proxy builds
+  # https://<request host>/oauth2/callback from X-Forwarded-Host, trusted
+  # from Traefik only), the cookie is host-only and named _portcullis_ext
+  # (a host under an enrolled subdomain of the main domain also receives
+  # forward-auth's .<domain> cookie). No whitelist: every redirect it
+  # accepts is relative, so it lands on the same host. Its routers
+  # (Host(`<host>`) && PathPrefix(`/oauth2/`), service forward-auth-ext) are
+  # the Hub's, one per extra-domain host; core routes it on no host.
+  forward-auth-ext:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.5@sha256:8498b0d0ef0a7b29686414000a08aee467f02d0299c9ed1e006a8f33fc017916
+    <<: *hardening
+    read_only: true
+    extra_hosts:
+      - "auth.${PORTCULLIS_DOMAIN:-portcullis.local}:host-gateway"
+    command: ["--alpha-config=/etc/oauth2-proxy/alpha.yaml"]
+    volumes:
+      - ./certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
+      - ./oauth2-proxy/alpha.yaml:/etc/oauth2-proxy/alpha.yaml:ro
+    environment:
+      PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
+      FORWARD_AUTH_CLIENT_SECRET: ${FORWARD_AUTH_CLIENT_SECRET:?FORWARD_AUTH_CLIENT_SECRET is not set — run ./portcullis init}
+      OAUTH2_PROXY_COOKIE_SECRET: ${FORWARD_AUTH_COOKIE_SECRET:?FORWARD_AUTH_COOKIE_SECRET is not set — run ./portcullis init}
+      OAUTH2_PROXY_COOKIE_NAME: _portcullis_ext
+      OAUTH2_PROXY_COOKIE_SAMESITE: lax
+      OAUTH2_PROXY_COOKIE_REFRESH: 1m
+      OAUTH2_PROXY_EMAIL_DOMAINS: "*"
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_TRUSTED_PROXY_IPS: "172.16.0.0/12,127.0.0.1/32"
+      OAUTH2_PROXY_REDIRECT_URL: /oauth2/callback
+      OAUTH2_PROXY_BACKEND_LOGOUT_URL: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis/protocol/openid-connect/logout?id_token_hint={id_token}
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      OAUTH2_PROXY_SSL_UPSTREAM_INSECURE_SKIP_VERIFY: "true"
+      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+    networks:
+      - portcullis
+    mem_limit: 256m
+    pids_limit: 128
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: portcullis
+      traefik.http.services.forward-auth-ext.loadbalancer.server.port: "4180"
+      # In place of portcullis-auth on every router of an extra-domain host
+      # (rendered by the Hub); the same headers, so the same stripping.
+      traefik.http.middlewares.portcullis-auth-ext.forwardauth.address: http://forward-auth-ext:4180
+      traefik.http.middlewares.portcullis-auth-ext.forwardauth.trustForwardHeader: "true"
+      traefik.http.middlewares.portcullis-auth-ext.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,Authorization,X-Forwarded-Access-Token
+      traefik.http.middlewares.portcullis-auth-ext.forwardauth.authResponseHeadersRegex: ^X-Forwarded-Attr-
+    restart: unless-stopped
+    depends_on:
+      keycloak:
+        condition: service_healthy
+
   group-gate:
     # Built locally like enroll: pinned python base + group-gate/requirements.txt
     # (pip --require-hashes) + the script. Named so ./portcullis backup can run
@@ -584,8 +686,9 @@ services:
       # at its next rebuild — group-gate enforces both.
       GATE_CRL_URL: http://vault:8200/v1/pki_int/crl
       GATE_DELTA_CRL_URL: http://vault:8200/v1/pki_int/crl/delta
-      # Requests whose X-Forwarded-Host is not <label>.<PORTCULLIS_DOMAIN>
-      # (after lowercasing / stripping port) are denied.
+      # Required: core hosts are <sub>.<PORTCULLIS_DOMAIN> (map.conf) and
+      # app hosts <label>.<PORTCULLIS_DOMAIN> or on an enrolled domain
+      # (policy v5 extra_domains); any other X-Forwarded-Host is denied.
       PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
     networks:
       - portcullis
@@ -1001,6 +1104,9 @@ volumes:
   lldap_data:
   hub_data:
   traefik_acme:
+  # Enrolled domains' certificates (contract §12.1): written by the domains
+  # service, read-only in Traefik and traefik-certs-reload.
+  domains_certs:
   prometheus_data:
   alertmanager_data:
   grafana_data:

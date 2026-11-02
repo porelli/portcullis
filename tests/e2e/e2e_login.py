@@ -15,9 +15,10 @@ Sign-in is passkey-only. Every user starts from a one-time setup link
 fails on ANY password field. Then: the session reaches the apps, a second
 login in a fresh browser is one passkey touch, the link is single use, a user
 outside the group is denied, the bootstrap admin's link lands on the portal
-with the Hub link, X.509 login / mtls binding, a cert-only session (no
-authenticator) opens a default-policy app and renews its cert at /self,
-revocation / foreign CA.
+with the Hub link, an unused link cannot sign in to another client through
+the invite identity provider (post-broker deny, contract §8), X.509 login /
+mtls binding, a cert-only session (no authenticator) opens a
+default-policy app and renews its cert at /self, revocation / foreign CA.
 
 Browser: Playwright Chromium with a CDP virtual WebAuthn authenticator
 (CTAP2, USB, resident keys, user verification). The CA must be trusted by
@@ -30,6 +31,9 @@ Environment (all required):
   E2E_INVITE          its setup link (portcullis invite <user> --to https://hwk.<domain>/)
   E2E_OTHER_INVITE    setup link of a user in no group (--to https://app.<domain>/)
   E2E_ADMIN_INVITE    setup link of the bootstrap admin (--to portal)
+  E2E_BYPASS_INVITE   setup link of a user in no group (--to https://app.<domain>/)
+  E2E_BYPASS_CLIENT   a public Keycloak client (redirect https://app.<domain>/bypass-cb)
+                      without the portcullis-invite-client scope
   E2E_CERT / E2E_KEY                client cert for E2E_USER (Vault-issued)
   E2E_FOREIGN_CERT / E2E_FOREIGN_KEY  cert from an unrelated CA, CN=E2E_USER
   E2E_REVOKE_CMD      command (split like a shell would, no shell) that revokes E2E_CERT
@@ -48,6 +52,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.parse
 
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import Page, sync_playwright
@@ -327,6 +332,43 @@ def main() -> int:
             assert admin_key.registered == 1 and admin_key.asserted == 0
         check("bootstrap admin: setup link → key → portal with the Hub (no password)", admin_bootstrap)
         close(ctx, "admin")
+
+        # An unused setup link, redeemed, then steered to ANOTHER client's
+        # authorize endpoint with kc_idp_hint=portcullis-invite: Keycloak's
+        # broker finishes through the invite IdP's post-broker flow (not the
+        # client's browser flow), which must deny every client but
+        # portcullis-forward-auth — no code for the client, no passkey.
+        ctx = new_context(trace_name="bypass")
+        page = ctx.new_page()
+        bypass_key = Authenticator(page)
+
+        def invite_broker_other_client_denied():
+            client = os.environ["E2E_BYPASS_CLIENT"]
+            page.route(re.compile(re.escape(AUTH) + r"/oauth2/start"), lambda route: route.abort())
+            page.goto(os.environ["E2E_BYPASS_INVITE"], wait_until="domcontentloaded")
+            try:
+                page.click("#invite-continue")  # redeem: sets the redemption cookie, then /oauth2/start (aborted)
+                page.wait_for_timeout(1500)
+            except PWError:
+                pass
+            codes = []
+            page.on("request", lambda r: codes.append(r.url) if r.url.startswith(APP + "/bypass-cb") else None)
+            q = urllib.parse.urlencode({"client_id": client, "response_type": "code", "scope": "openid",
+                                        "redirect_uri": APP + "/bypass-cb", "state": "e2e", "nonce": "e2e",
+                                        "kc_idp_hint": "portcullis-invite", "prompt": "login"})
+            page.goto(f"{AUTH}/realms/portcullis/protocol/openid-connect/auth?{q}", wait_until="domcontentloaded")
+            deadline = time.time() + 30
+            while time.time() < deadline and "Setup links work only through" not in page.content():
+                if page.locator("#registerWebAuthn").is_visible():
+                    raise AssertionError("the invite login reached the passkey registration for another client")
+                page.wait_for_timeout(500)
+            shot(page, "bypass-denied")
+            assert "Setup links work only through" in page.content(), f"not denied at {page.url}"
+            assert not codes, f"the client got a redirect: {codes}"
+            assert bypass_key.registered == 0, "a passkey was registered"
+        check("an unused setup link cannot sign in to another client (invite post-broker deny)",
+              invite_broker_other_client_denied)
+        close(ctx, "bypass")
 
         # ── 4. X.509 login through Keycloak, mtls binding, revocation ──
         ctx = new_context(client_cert=cert, trace_name="mtls")

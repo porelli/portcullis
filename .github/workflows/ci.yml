@@ -154,7 +154,8 @@ jobs:
                   $g["traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeadersRegex"],
                   $g["traefik.http.middlewares.portcullis-public-guard.forwardauth.authResponseHeadersRegex"],
                   $f["traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeadersRegex"],
-                  $f["traefik.http.middlewares.portcullis-auth-console.forwardauth.authResponseHeadersRegex"]] | all(. == "^X-Forwarded-Attr-"))
+                  $f["traefik.http.middlewares.portcullis-auth-console.forwardauth.authResponseHeadersRegex"],
+                  .services["forward-auth-ext"].labels["traefik.http.middlewares.portcullis-auth-ext.forwardauth.authResponseHeadersRegex"]] | all(. == "^X-Forwarded-Attr-"))
               and .services.hub.environment.HUB_PEOPLE_ADDR == ":8889"
               and $h["traefik.http.routers.people.rule"] == "Host(`people.\($d)`)"
               and $h["traefik.http.routers.people.tls.options"] == "authaware@file"
@@ -186,6 +187,35 @@ jobs:
           echo "$CFG" | jq -e '.services["group-gate"].labels["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders"]
               | split(",") | index("Authorization") and index("X-Forwarded-Access-Token")' >/dev/null \
             || { echo "FAIL: portcullis-groups does not list Authorization / X-Forwarded-Access-Token"; exit 1; }
+          # Contract §5 "Extra-domain hosts": forward-auth-ext = forward-auth
+          # with a relative callback and a host-only _portcullis_ext cookie;
+          # portcullis-auth-ext strips exactly what portcullis-auth strips.
+          echo "$CFG" | jq -e '.services["forward-auth"] as $m | .services["forward-auth-ext"] as $x
+              | ($m.labels | with_entries(select(.key | startswith("traefik.http.middlewares.portcullis-auth.forwardauth.")) | .key |= sub("portcullis-auth"; "portcullis-auth-ext")) | del(.["traefik.http.middlewares.portcullis-auth-ext.forwardauth.address"])) as $want
+              | $x.image == $m.image and $x.command == $m.command and $x.read_only == true
+              and $x.labels["traefik.http.middlewares.portcullis-auth-ext.forwardauth.address"] == "http://forward-auth-ext:4180"
+              and ($want | to_entries | all(. as $e | $x.labels[$e.key] == $e.value))
+              and ([$x.labels | keys[] | select(test("^traefik\\.http\\.routers\\."))] == [])
+              and $x.environment.OAUTH2_PROXY_REDIRECT_URL == "/oauth2/callback"
+              and $x.environment.OAUTH2_PROXY_COOKIE_NAME == "_portcullis_ext"
+              and ($x.environment.OAUTH2_PROXY_COOKIE_DOMAINS // null) == null
+              and ($x.environment.OAUTH2_PROXY_WHITELIST_DOMAINS // null) == null
+              and $x.environment.OAUTH2_PROXY_COOKIE_SECRET == $m.environment.OAUTH2_PROXY_COOKIE_SECRET
+              and $x.environment.FORWARD_AUTH_CLIENT_SECRET == $m.environment.FORWARD_AUTH_CLIENT_SECRET
+              and $x.environment.OAUTH2_PROXY_TRUSTED_PROXY_IPS == $m.environment.OAUTH2_PROXY_TRUSTED_PROXY_IPS
+              and $x.environment.OAUTH2_PROXY_COOKIE_REFRESH == "1m"
+              and ($x.environment.OAUTH2_PROXY_COOKIE_EXPIRE // null) == null' >/dev/null \
+            || { echo "FAIL: forward-auth-ext / portcullis-auth-ext wiring (contract §5)"; exit 1; }
+          # Enrolled-domain certificates (contract §12.1): read-only in Traefik
+          # under its file provider; the reload sidecar sees only the volume.
+          echo "$CFG" | jq -e '([.services.traefik.volumes[] | select(.source == "domains_certs")] == [{"type": "volume", "source": "domains_certs", "target": "/etc/traefik/dynamic/domains", "read_only": true, "volume": {}}])
+              and .services["traefik-certs-reload"].network_mode == "none"
+              and .services["traefik-certs-reload"].pid == "service:traefik"
+              and .services["traefik-certs-reload"].read_only == true
+              and ([.services["traefik-certs-reload"].volumes[] | [.source, .target, .read_only]] == [["domains_certs", "/watch", true]])
+              and ([.services | to_entries[] | select([.value.volumes[]?.source] | index("domains_certs")) | .key] | sort == ["traefik", "traefik-certs-reload"])' >/dev/null \
+            || { echo "FAIL: domains_certs mounts / traefik-certs-reload: $(echo "$CFG" | jq -c '[.services.traefik.volumes, .services["traefik-certs-reload"]]')"; exit 1; }
+          test -f traefik/dynamic/domains/.gitkeep || { echo "FAIL: traefik/dynamic/domains/ must exist (mountpoint inside a read-only bind)"; exit 1; }
           if grep -nE '^\s*userIDClaim:' oauth2-proxy/alpha.yaml; then echo "FAIL: userIDClaim is an alias of emailClaim in oauth2-proxy v7"; exit 1; fi
           echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring"
 
@@ -920,7 +950,7 @@ jobs:
 
           # path_groups through Traefik: group-gate only sees the path via
           # X-Forwarded-Uri set by Traefik's forwardAuth.
-          printf '%s' '{"version":4,"default":{"factors":[]},"groups":{"gated":"users_ci"},"path_groups":{"gated":[{"prefix":"/admin","group":"admin_ci"}]}}' \
+          printf '%s' '{"version":5,"default":{"factors":[]},"groups":{"gated.portcullis.local":"users_ci"},"path_groups":{"gated.portcullis.local":[{"prefix":"/admin","group":"admin_ci"}]}}' \
             | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
                 sh -c 'cat > /d/group-gate-policy.json && chmod 644 /d/group-gate-policy.json'
           # (the gated router has no forward-auth, so the groups header is the test's)
@@ -931,8 +961,8 @@ jobs:
           [ "$(gated /admin -H 'X-Auth-Request-Groups: users_ci,admin_ci')" = 200 ] || { echo "FAIL: admin_ci denied"; exit 1; }
           [ "$(gated /administrator -H 'X-Auth-Request-Groups: users_ci')" = 200 ] || { echo "FAIL: /administrator denied"; exit 1; }
           [ "$(gated /x%00 --path-as-is -H 'X-Auth-Request-Groups: users_ci')" = 403 ] || { echo "FAIL: NUL path allowed"; exit 1; }
-          [ "$(gated / -H 'X-Auth-Request-Groups: other')" = 403 ] || { echo "FAIL: subdomain group not enforced"; exit 1; }
-          echo '{"version":4}' | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a sh -c 'cat > /d/group-gate-policy.json'
+          [ "$(gated / -H 'X-Auth-Request-Groups: other')" = 403 ] || { echo "FAIL: host group not enforced"; exit 1; }
+          echo '{"version":5}' | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a sh -c 'cat > /d/group-gate-policy.json'
           echo "PASS: path_groups enforced on Traefik's X-Forwarded-Uri (bypass variants denied)"
 
           # Attribute headers (contract §5): group-gate's reach the app, the
@@ -959,12 +989,16 @@ jobs:
                     --resolve "public.portcullis.local:443:127.0.0.1" "${@:2}" "https://public.portcullis.local$1" || true; }
           policy() { docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
                        sh -c 'cat > /d/group-gate-policy.json.tmp && chmod 644 /d/group-gate-policy.json.tmp && mv /d/group-gate-policy.json.tmp /d/group-gate-policy.json'; }
-          # No public_paths entry (or an older file version): denied.
-          echo '{"version":4}' | policy
-          [ "$(pub /s/AbC123)" = 403 ] || { echo "FAIL: public path allowed without a v4 public_paths entry"; exit 1; }
-          echo '{"version":3,"public_paths":{"public":{"paths":[{"path":"/s/{token}","match":"prefix"}],"token_pattern":"^[A-Za-z0-9-]{1,32}$"}}}' | policy
-          [ "$(pub /s/AbC123)" = 403 ] || { echo "FAIL: public path allowed by a version 3 policy file"; exit 1; }
-          jq -n '{version: 4, public_paths: {public: {
+          # No public_paths entry (or an older file version / v4 subdomain keys): denied.
+          echo '{"version":5}' | policy
+          [ "$(pub /s/AbC123)" = 403 ] || { echo "FAIL: public path allowed without a v5 public_paths entry"; exit 1; }
+          for old in '{"version":4,"public_paths":{"public":{"paths":[{"path":"/s/{token}","match":"prefix"}],"token_pattern":"^[A-Za-z0-9-]{1,32}$"}}}' \
+                     '{"version":4,"public_paths":{"public.portcullis.local":{"paths":[{"path":"/s/{token}","match":"prefix"}],"token_pattern":"^[A-Za-z0-9-]{1,32}$"}}}' \
+                     '{"version":5,"public_paths":{"public":{"paths":[{"path":"/s/{token}","match":"prefix"}],"token_pattern":"^[A-Za-z0-9-]{1,32}$"}}}'; do
+            echo "$old" | policy
+            [ "$(pub /s/AbC123)" = 403 ] || { echo "FAIL: public path allowed by $old"; exit 1; }
+          done
+          jq -n '{version: 5, public_paths: {"public.portcullis.local": {
                     paths: [{path: "/s/{token}", match: "prefix"}, {path: "/dist", match: "static"}],
                     token_pattern: "^[A-Za-z0-9-]{1,32}$", static_extensions: ["js", "css"],
                     credential_headers: ["X-Api-Key"], credential_cookies: ["nc_token"], credential_query: ["auth_token"]}}}' | policy
@@ -986,8 +1020,46 @@ jobs:
             -H 'X-Forwarded-Attr-City: Forged' https://public.portcullis.local/s/AbC123 > /tmp/pub-attrs.out || true
           grep -q 'Hostname' /tmp/pub-attrs.out || { echo "FAIL: public path not served"; cat /tmp/pub-attrs.out; exit 1; }
           if grep -qi 'Forged' /tmp/pub-attrs.out; then echo "FAIL: forged X-Forwarded-Attr-* reached a public router's app"; exit 1; fi
-          echo '{"version":4}' | policy
+          echo '{"version":5}' | policy
           echo "PASS: public guard: only published paths, no credentials (PHP-normalised names)"
+
+      - name: Test that Traefik picks up enrolled-domain certificates (domains_certs, no restart)
+        run: |
+          # Traefik's file provider loads subdirectories but watches only the
+          # top directory: traefik-certs-reload must make a new certs.yml in
+          # the domains_certs volume (written like the domains service does,
+          # contract §12.4: the pair first, then certs.yml by rename) take
+          # effect, and dropping it must remove the certificate again.
+          ALPINE=alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+          docker compose up -d traefik-certs-reload
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
+            -subj "/CN=ci-extra.test" -addext "subjectAltName=DNS:ci-extra.test,DNS:*.ci-extra.test" \
+            -keyout /tmp/ext.key -out /tmp/ext.crt 2>/dev/null
+          FP=$(openssl x509 -in /tmp/ext.crt -noout -fingerprint -sha256)
+          served() { openssl s_client -connect 127.0.0.1:443 -servername "$1" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null || true; }
+          certs_yml() { docker run --rm -i --network none -v portcullis_domains_certs:/d "$ALPINE" \
+                          sh -c 'cat > /d/certs.yml.tmp && mv /d/certs.yml.tmp /d/certs.yml'; }
+          [ "$(served x.ci-extra.test)" != "$FP" ] || { echo "FAIL: certificate served before it was published"; exit 1; }
+          STARTED=$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q traefik)")
+          docker run --rm --network none -v portcullis_domains_certs:/d -v /tmp/ext.crt:/s/c:ro -v /tmp/ext.key:/s/k:ro "$ALPINE" \
+            sh -c 'mkdir -p /d/ci-extra.test && cp /s/c /d/ci-extra.test/01.crt && cp /s/k /d/ci-extra.test/01.key && chmod 600 /d/ci-extra.test/01.key'
+          printf 'tls:\n  certificates:\n    - certFile: /etc/traefik/dynamic/domains/ci-extra.test/01.crt\n      keyFile: /etc/traefik/dynamic/domains/ci-extra.test/01.key\n' | certs_yml
+          for i in $(seq 1 20); do
+            [ "$(served x.ci-extra.test)" = "$FP" ] && break
+            [ "$i" -eq 20 ] && { echo "FAIL: Traefik did not pick up certs.yml"; docker compose logs --tail=20 traefik-certs-reload traefik; exit 1; }
+            sleep 2
+          done
+          [ "$(served ci-extra.test)" = "$FP" ] || { echo "FAIL: apex not covered"; exit 1; }
+          docker compose logs traefik-certs-reload | grep -q "sent SIGHUP to traefik" || { echo "FAIL: no SIGHUP logged"; exit 1; }
+          [ "$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q traefik)")" = "$STARTED" ] || { echo "FAIL: Traefik restarted"; exit 1; }
+          printf 'tls: {certificates: []}\n' | certs_yml
+          for i in $(seq 1 20); do
+            [ "$(served x.ci-extra.test)" != "$FP" ] && break
+            [ "$i" -eq 20 ] && { echo "FAIL: Traefik still serves a removed certificate"; exit 1; }
+            sleep 2
+          done
+          docker run --rm --network none -v portcullis_domains_certs:/d "$ALPINE" rm -rf /d/ci-extra.test
+          echo "PASS: enrolled-domain certificates are served and removed without a Traefik restart"
 
       - name: Test the socket proxies
         run: |
@@ -1074,7 +1146,7 @@ jobs:
           hubapi "http://$HUB_IP:8888/api/settings" | jq -e '(.default_auth_policy.factors | sort) == ["mtls", "webauthn"] and .default_auth_policy.op == "any"' >/dev/null \
             || { echo "FAIL: fresh Hub default policy is not any of [mtls, webauthn]: $(hubapi "http://$HUB_IP:8888/api/settings")"; exit 1; }
           for i in $(seq 1 30); do
-            policy_file | jq -e '.version == 4 and (.default.factors | sort) == ["mtls", "webauthn"] and .default.op == "any"' >/dev/null 2>&1 && break
+            policy_file | jq -e '.version == 5 and (.extra_domains | type) == "array" and (.default.factors | sort) == ["mtls", "webauthn"] and .default.op == "any"' >/dev/null 2>&1 && break
             [ "$i" -eq 30 ] && { echo "FAIL: Hub did not publish the any-of [mtls, webauthn] default: $(policy_file)"; docker compose logs --tail=20 hub; exit 1; }
             sleep 2
           done
@@ -1147,6 +1219,33 @@ jobs:
             || { echo "FAIL: invite identity provider: $(kc /identity-provider/instances/portcullis-invite | jq -c 'del(.config.clientSecret)')"; exit 1; }
           kc /authentication/flows/portcullis-invite-link/executions | jq -e '[.[].providerId] == ["idp-detect-existing-broker-user", "idp-auto-link"]' >/dev/null \
             || { echo "FAIL: invite first-login flow must only link existing users"; exit 1; }
+          # Post-broker flow: only portcullis-forward-auth (marker scope), a
+          # positive check then deny-unless-admitted, then LoA 2 (contract §8).
+          kc /authentication/flows/portcullis-invite-session/executions | jq -e '[.[] | select(.level == 0) | [.displayName, .requirement]]
+              == [["portcullis-invite-client", "CONDITIONAL"], ["portcullis-invite-deny", "CONDITIONAL"], ["portcullis-invite-loa", "CONDITIONAL"]]
+              and ([.[] | select(.level == 1) | .providerId] == ["conditional-client-scope", "allow-access-authenticator",
+                     "conditional-sub-flow-executed", "deny-access-authenticator", "conditional-level-of-authentication", "allow-access-authenticator"])' >/dev/null \
+            || { echo "FAIL: invite post-broker flow: $(kc /authentication/flows/portcullis-invite-session/executions | jq -c '[.[] | {displayName, requirement, level}]')"; exit 1; }
+          FWD=$(kc "/clients?clientId=portcullis-forward-auth" | jq -r '.[0].id')
+          SCOPE_ID=$(kc /client-scopes | jq -r '.[] | select(.name == "portcullis-invite-client") | .id')
+          kc "/clients/$FWD/default-client-scopes" | jq -e --arg s "$SCOPE_ID" '[.[] | select(.id == $s)] | length == 1' >/dev/null \
+            || { echo "FAIL: portcullis-forward-auth lacks the portcullis-invite-client scope"; exit 1; }
+          kc /default-default-client-scopes | jq -e --arg s "$SCOPE_ID" 'all(.[]; .id != $s)' >/dev/null \
+            || { echo "FAIL: portcullis-invite-client is a realm default scope"; exit 1; }
+          # configure keeps the Hub's extra-domain callbacks on the forward-auth client (contract §5).
+          kc "/clients/$FWD" | jq '.redirectUris += ["https://grafana.team-b.example.org/oauth2/callback", "https://evil.example.org/*"]' \
+            | curl -sf -X PUT -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") -H 'Content-Type: application/json' --data-binary @- \
+                "http://127.0.0.1:8080/admin/realms/portcullis/clients/$FWD"
+          ./portcullis keycloak configure >/dev/null
+          KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+            --data-urlencode client_id=admin-cli --data-urlencode "username=${KEYCLOAK_ADMIN:-admin}" \
+            --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          kc "/clients/$FWD" | jq -e '.redirectUris | sort == ["https://auth.portcullis.local/oauth2/callback", "https://grafana.team-b.example.org/oauth2/callback"]' >/dev/null \
+            || { echo "FAIL: configure did not keep (only) the extra-domain callbacks: $(kc "/clients/$FWD" | jq -c .redirectUris)"; exit 1; }
+          kc "/clients/$FWD" | jq '.redirectUris = ["https://auth.portcullis.local/oauth2/callback"]' \
+            | curl -sf -X PUT -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") -H 'Content-Type: application/json' --data-binary @- \
+                "http://127.0.0.1:8080/admin/realms/portcullis/clients/$FWD"
+          echo "PASS: invite post-broker flow limited to portcullis-forward-auth; configure keeps extra-domain callbacks"
           # No LDAP user cache: group/attribute changes in LLDAP reach tokens at once.
           kc "/components?type=org.keycloak.storage.UserStorageProvider" | jq -e '[.[] | select(.providerId == "ldap")][0].config.cachePolicy == ["NO_CACHE"]' >/dev/null \
             || { echo "FAIL: LDAP federation cachePolicy is not NO_CACHE"; exit 1; }
@@ -1235,7 +1334,7 @@ jobs:
           # no Hub at all), so only revocation can turn 200 into 403.
           docker run --rm -v portcullis_hub_data:/d:ro alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
               sh -c 'cat /d/group-gate-policy.json 2>/dev/null || echo "{}"' \
-            | jq -e '(.policies.gated // .default // {}) | (.factors // []) == []' >/dev/null \
+            | jq -e '(.policies["gated.portcullis.local"] // .default // {}) | (.factors // []) == []' >/dev/null \
             || { echo "FAIL: precondition: ci-gated is not public in the group-gate policy file"; exit 1; }
 
           # 1) portcullis cert revoke → serial file → immediate denial
@@ -1518,8 +1617,8 @@ jobs:
           ./portcullis keycloak configure
           ./portcullis oidc register
           # oauth2-proxy exits while Keycloak is down; make sure it runs now.
-          docker compose up -d forward-auth
-          docker compose restart forward-auth
+          docker compose up -d forward-auth forward-auth-ext
+          docker compose restart forward-auth forward-auth-ext
           docker compose ps
 
       - name: Users, groups, setup links, policy, test app, certs
@@ -1534,6 +1633,7 @@ jobs:
             | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
           gql 'mutation { createUser(user: {id: "e2e", email: "e2e@portcullis.local"}) { id } }'
           gql 'mutation { createUser(user: {id: "e2e-other", email: "e2e-other@portcullis.local"}) { id } }'
+          gql 'mutation { createUser(user: {id: "e2e-bypass", email: "e2e-bypass@portcullis.local"}) { id } }'
           for g in users_e2e admin_e2e; do
             gql "mutation { createGroup(name: \"$g\") { id } }"
           done
@@ -1546,7 +1646,7 @@ jobs:
           # Nothing is pre-assigned in Keycloak: redeeming the link adds the
           # passkey registration itself.
           for spec in "E2E_INVITE e2e https://hwk.portcullis.local/" "E2E_OTHER_INVITE e2e-other https://app.portcullis.local/" \
-                      "E2E_ADMIN_INVITE admin portal"; do
+                      "E2E_ADMIN_INVITE admin portal" "E2E_BYPASS_INVITE e2e-bypass https://app.portcullis.local/"; do
             read -r var who to <<<"$spec"
             url="$(./portcullis invite "$who" --to "$to" --json | jq -r .url)"
             [[ "$url" =~ ^https://enroll\.portcullis\.local/invite/[A-Za-z0-9_-]{43}$ ]] || { echo "FAIL: setup link for $who: $url"; exit 1; }
@@ -1563,14 +1663,29 @@ jobs:
           [ -n "$KC_UID" ] && [ "$KC_UID" != null ] || { echo "FAIL: e2e not visible in Keycloak (LDAP federation)"; exit 1; }
           kc "http://127.0.0.1:8080/admin/realms/portcullis/users/$KC_UID" | jq -e '(.requiredActions // []) == []' >/dev/null \
             || { echo "FAIL: e2e has required actions before redeeming its link"; exit 1; }
+          # Another client (like a Hub-created app client): no marker scope, so
+          # the invite IdP's post-broker flow must refuse it (e2e_login.py).
+          jq -n '{clientId: "e2e-invite-bypass", enabled: true, protocol: "openid-connect", publicClient: true,
+                  standardFlowEnabled: true, directAccessGrantsEnabled: false,
+                  redirectUris: ["https://app.portcullis.local/bypass-cb"]}' \
+            | kc -X POST --data-binary @- http://127.0.0.1:8080/admin/realms/portcullis/clients >/dev/null
+          echo "E2E_BYPASS_CLIENT=e2e-invite-bypass" >> "$GITHUB_ENV"
+          SCOPE_ID=$(kc http://127.0.0.1:8080/admin/realms/portcullis/client-scopes | jq -r '.[] | select(.name == "portcullis-invite-client") | .id')
+          [ -n "$SCOPE_ID" ] || { echo "FAIL: keycloak configure did not create the portcullis-invite-client scope"; exit 1; }
+          for c in portcullis-forward-auth e2e-invite-bypass; do
+            CID=$(kc "http://127.0.0.1:8080/admin/realms/portcullis/clients?clientId=$c" | jq -r '.[0].id')
+            HAS=$(kc "http://127.0.0.1:8080/admin/realms/portcullis/clients/$CID/default-client-scopes" | jq --arg s "$SCOPE_ID" 'any(.[]; .id == $s)')
+            WANT=false; [ "$c" = portcullis-forward-auth ] && WANT=true
+            [ "$HAS" = "$WANT" ] || { echo "FAIL: $c has the portcullis-invite-client scope: $HAS (want $WANT)"; exit 1; }
+          done
 
           # group-gate policy (normally written by the Hub), with the Hub's
           # fresh-install default: any of [mtls, webauthn]. "app" has no
           # policy of its own (passkey and cert-only sessions must both pass).
-          printf '%s' '{"version": 4, "default": {"factors": ["mtls", "webauthn"], "op": "any"},
-            "policies": {"hwk": {"factors": ["webauthn"], "op": ""}, "mtls": {"factors": ["mtls"], "op": ""}},
-            "groups": {"app": "users_e2e", "hwk": "users_e2e", "mtls": "users_e2e"},
-            "path_groups": {"app": [{"prefix": "/admin", "group": "admin_e2e"}]}}' \
+          printf '%s' '{"version": 5, "default": {"factors": ["mtls", "webauthn"], "op": "any"}, "extra_domains": [],
+            "policies": {"hwk.portcullis.local": {"factors": ["webauthn"], "op": ""}, "mtls.portcullis.local": {"factors": ["mtls"], "op": ""}},
+            "groups": {"app.portcullis.local": "users_e2e", "hwk.portcullis.local": "users_e2e", "mtls.portcullis.local": "users_e2e"},
+            "path_groups": {"app.portcullis.local": [{"prefix": "/admin", "group": "admin_e2e"}]}}' \
             | docker run --rm -i -v portcullis_hub_data:/d "$ALPINE" sh -c 'cat > /d/group-gate-policy.json && chmod 644 /d/group-gate-policy.json'
           # Shared custom fields (normally written by the Hub): e2e_login.py
           # checks the attribute header reaches the app and forged ones don't.

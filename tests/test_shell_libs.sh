@@ -421,6 +421,39 @@ expect_eq "keycloak configure: other provider settings kept" "$(printf '%s' "$P1
   '["x",["READ_ONLY"],["false"],["uid=admin,ou=people,dc=ex,dc=org"],["pw"]]'
 expect_eq "keycloak configure: LDAP patch idempotent" "$(printf '%s' "$P1" | LLDAP_PASS=pw _kc_ldap_patch dc=ex,dc=org | jq -cS .)" "$(printf '%s' "$P1" | jq -cS .)"
 
+# portcullis-forward-auth: configure sets the main callback and keeps the
+# Hub's per-host extra-domain callbacks (forward-auth-ext, contract §5),
+# nothing else; the export's placeholder host goes.
+FWD='{"clientId":"portcullis-forward-auth","attributes":{"x":"1"},"defaultClientScopes":["groups"],"redirectUris":["https://auth.portcullis.local/oauth2/callback","https://grafana.team-b.example.org/oauth2/callback","https://x.team-b.example.org/oauth2/callback","https://evil.example.org/*","https://*.team-b.example.org/oauth2/callback","https://a.example.org/oauth2/callback/x","http://a.example.org/oauth2/callback","https://A.example.org/oauth2/callback","https://a.example.org:8443/oauth2/callback","https://a..example.org/oauth2/callback",7]}'
+F1="$(printf '%s' "$FWD" | _kc_fwd_patch ex.org)"
+expect_eq "keycloak configure: forward-auth redirect URIs = main callback + extra-domain callbacks" \
+  "$(printf '%s' "$F1" | jq -c .redirectUris)" \
+  '["https://auth.ex.org/oauth2/callback","https://grafana.team-b.example.org/oauth2/callback","https://x.team-b.example.org/oauth2/callback"]'
+expect_eq "keycloak configure: forward-auth acr default + scopes kept" \
+  "$(printf '%s' "$F1" | jq -c '[.attributes, .defaultClientScopes]')" '[{"x":"1","default.acr.values":"pwd"},["acr","groups"]]'
+expect_eq "keycloak configure: forward-auth patch idempotent" "$(printf '%s' "$F1" | _kc_fwd_patch ex.org | jq -cS .)" "$(printf '%s' "$F1" | jq -cS .)"
+expect_eq "keycloak configure: placeholder kept when it is the domain" \
+  "$(printf '%s' "$FWD" | _kc_fwd_patch portcullis.local | jq -c '.redirectUris[0:1]')" '["https://auth.portcullis.local/oauth2/callback"]'
+
+# Invite IdP post-broker flow (contract §8): an invite login completes only
+# for a client with the marker scope (portcullis-forward-auth), positive
+# check + deny-unless-admitted (a missing scope or sub-flow denies), before
+# the LoA step; configure creates the scope (not a realm default).
+EXP="$HERE/../keycloak/realm-export.json"
+expect_eq "realm export: portcullis-invite-session = client check, deny, LoA" \
+  "$(jq -c '[.authenticationFlows[] | select(.alias == "portcullis-invite-session") | .authenticationExecutions[] | [.priority, .requirement, .flowAlias]]' "$EXP")" \
+  '[[10,"CONDITIONAL","portcullis-invite-client"],[20,"CONDITIONAL","portcullis-invite-deny"],[30,"CONDITIONAL","portcullis-invite-loa"]]'
+expect_eq "realm export: invite client check = client scope condition (not negated) + allow" \
+  "$(jq -c '.authenticatorConfig as $c | [.authenticationFlows[] | select(.alias == "portcullis-invite-client") | .authenticationExecutions[] | [.requirement, .authenticator, (.authenticatorConfig as $a | $c[] | select(.alias == $a) | .config)]]' "$EXP")" \
+  "[[\"REQUIRED\",\"conditional-client-scope\",{\"client_scope\":\"$KC_INVITE_CLIENT_SCOPE\",\"negate\":\"false\"}],[\"REQUIRED\",\"allow-access-authenticator\"]]"
+expect_eq "realm export: invite deny = not-executed(portcullis-invite-client) + deny" \
+  "$(jq -c '.authenticatorConfig as $c | [.authenticationFlows[] | select(.alias == "portcullis-invite-deny") | .authenticationExecutions[] | [.requirement, .authenticator, (.authenticatorConfig as $a | $c[] | select(.alias == $a) | .config | del(.denyErrorMessage))]]' "$EXP")" \
+  '[["REQUIRED","conditional-sub-flow-executed",{"flow_to_check":"portcullis-invite-client","check_result":"not-executed"}],["REQUIRED","deny-access-authenticator",{}]]'
+expect_eq "realm export: the marker scope is no realm default" \
+  "$(jq -c '[(.defaultDefaultClientScopes // [])[], (.defaultOptionalClientScopes // [])[], (.clients[] | (.defaultClientScopes // [])[], (.optionalClientScopes // [])[])] | map(select(. == "portcullis-invite-client"))' "$EXP")" '[]'
+expect_eq "invite IdP: post-broker flow is portcullis-invite-session" \
+  "$(jq -r .postBrokerLoginFlowAlias "$HERE/../keycloak/invite-idp.json")" portcullis-invite-session
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

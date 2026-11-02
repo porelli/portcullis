@@ -75,6 +75,75 @@ _kc_ldap_patch() {
     .config.cachePolicy = ["NO_CACHE"]'
 }
 
+# _kc_fwd_patch <domain>: the portcullis-forward-auth client (JSON on stdin)
+# as `keycloak configure` wants it: default acr, the acr scope, and the
+# redirect URIs = https://auth.<domain>/oauth2/callback plus every
+# https://<valid hostname>/oauth2/callback already there — the Hub keeps one
+# per extra-domain host (forward-auth-ext, contract §5) and adds / removes
+# only those, so configure must not drop them. The realm export's
+# placeholder host is dropped.
+_kc_fwd_patch() {
+  jq --arg d "$1" '
+    .attributes = ((.attributes // {}) + {"default.acr.values": "pwd"}) |
+    .defaultClientScopes = ((.defaultClientScopes // []) + ["acr"] | unique) |
+    .redirectUris = (["https://auth." + $d + "/oauth2/callback"]
+      + [(.redirectUris // [])[] | strings
+         | select(test("^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?/oauth2/callback$"))
+         | select(length <= 277)
+         | select(. != "https://auth.portcullis.local/oauth2/callback")]
+      | unique)'
+}
+
+# Marker client scope of the invite IdP's post-broker flow
+# (portcullis-invite-session, realm-export.json): an invite login completes
+# only for a client that has it as a default scope, i.e. only for
+# portcullis-forward-auth (where setup links start: enroll/invite.go →
+# auth.<domain>/oauth2/start?kc_idp_hint=portcullis-invite). Keycloak's
+# broker endpoint finishes a brokered login through the post-broker flow,
+# not the client's browser flow, so without it an unused link could sign
+# in once to a client whose own flow would refuse the user (the Hub's
+# access-role clients, contract §8). No mappers, not in tokens.
+KC_INVITE_CLIENT_SCOPE="portcullis-invite-client"
+
+# _kc_invite_client_scope — create the scope if missing; make it a default
+# scope of portcullis-forward-auth and of NO other client (default or
+# optional), and never a realm default (new clients would inherit it).
+_kc_invite_client_scope() {
+  local scope_id code cid fwd kind
+  info "Ensuring the $KC_INVITE_CLIENT_SCOPE client scope (setup links only through forward-auth)..."
+  scope_id="$(kc_get "/$KC_REALM/client-scopes" | jq -r --arg n "$KC_INVITE_CLIENT_SCOPE" '.[]? | select(.name == $n) | .id' | head -n1)"
+  if [ -z "$scope_id" ]; then
+    code="$(jq -nc --arg n "$KC_INVITE_CLIENT_SCOPE" '{name: $n, protocol: "openid-connect",
+        description: "Marker: invite (setup link) logins complete only for clients with this default scope (portcullis-forward-auth)",
+        attributes: {"include.in.token.scope": "false", "display.on.consent.screen": "false"}}' \
+      | kc_send POST "/$KC_REALM/client-scopes")"
+    _kc_report "$KC_INVITE_CLIENT_SCOPE scope" "$code" 201 || return 0
+    scope_id="$(kc_get "/$KC_REALM/client-scopes" | jq -r --arg n "$KC_INVITE_CLIENT_SCOPE" '.[]? | select(.name == $n) | .id' | head -n1)"
+    [ -n "$scope_id" ] || { warn "    $KC_INVITE_CLIENT_SCOPE scope not found after create — setup links are refused"; return 0; }
+  fi
+  for kind in default-default-client-scopes default-optional-client-scopes; do
+    if kc_get "/$KC_REALM/$kind" | jq -e --arg id "$scope_id" 'any(.[]?; .id == $id)' >/dev/null; then
+      code="$(kc_send DELETE "/$KC_REALM/$kind/$scope_id" < /dev/null)"
+      _kc_report "$KC_INVITE_CLIENT_SCOPE: not a realm $kind" "$code" 204 || true
+    fi
+  done
+  fwd="$(kc_get "/$KC_REALM/clients?clientId=portcullis-forward-auth" | jq -r '.[0].id // empty')"
+  for cid in $(kc_get "/$KC_REALM/clients?max=-1" | jq -r '.[]?.id'); do
+    if [ "$cid" = "$fwd" ]; then
+      code="$(kc_send PUT "/$KC_REALM/clients/$cid/default-client-scopes/$scope_id" < /dev/null)"
+      _kc_report "$KC_INVITE_CLIENT_SCOPE: default scope of portcullis-forward-auth" "$code" 204 || true
+      continue
+    fi
+    for kind in default-client-scopes optional-client-scopes; do
+      if kc_get "/$KC_REALM/clients/$cid/$kind" | jq -e --arg id "$scope_id" 'any(.[]?; .id == $id)' >/dev/null; then
+        code="$(kc_send DELETE "/$KC_REALM/clients/$cid/$kind/$scope_id" < /dev/null)"
+        _kc_report "$KC_INVITE_CLIENT_SCOPE: removed from client $cid ($kind)" "$code" 204 || true
+      fi
+    done
+  done
+  [ -n "$fwd" ] || warn "    client portcullis-forward-auth not found (run: ./portcullis oidc register) — setup links are refused until it has the $KC_INVITE_CLIENT_SCOPE scope"
+}
+
 keycloak_configure() {
   local wipe="$1" realm code comp ldap_id mapper fwd_uuid scope_id execs flow
   require_cmd curl jq
@@ -230,15 +299,13 @@ keycloak_configure() {
   info "Granting lldap_admin the $KC_REALM realm console..."
   _kc_admin_roles
 
-  info "Configuring the forward-auth client (acr, groups, redirect URI)..."
+  info "Configuring the forward-auth client (acr, groups, redirect URIs)..."
   fwd_uuid="$(kc_get "/$KC_REALM/clients?clientId=portcullis-forward-auth" | jq -r '.[0].id // empty')"
   if [ -n "$fwd_uuid" ]; then
     # The realm export ships a placeholder host so Keycloak's URL parser
-    # accepts it at import; put the real domain on.
-    code="$(kc_get "/$KC_REALM/clients/$fwd_uuid" | jq --arg d "$domain" '
-        .attributes = ((.attributes // {}) + {"default.acr.values": "pwd"}) |
-        .defaultClientScopes = ((.defaultClientScopes // []) + ["acr"] | unique) |
-        .redirectUris = ["https://auth." + $d + "/oauth2/callback"]' \
+    # accepts it at import; put the real domain on, keep the Hub's
+    # extra-domain callbacks (_kc_fwd_patch).
+    code="$(kc_get "/$KC_REALM/clients/$fwd_uuid" | _kc_fwd_patch "$domain" \
       | kc_send PUT "/$KC_REALM/clients/$fwd_uuid")"
     _kc_report "forward-auth client" "$code" 204 || true
     scope_id="$(kc_get "/$KC_REALM/client-scopes" | jq -r '.[] | select(.name == "groups") | .id' | head -n1)"
@@ -249,6 +316,7 @@ keycloak_configure() {
   else
     warn "    client portcullis-forward-auth not found (run: ./portcullis oidc register)"
   fi
+  _kc_invite_client_scope
 
   info "Ensuring test user..."
   code="$(jq -n '{username: "testuser", email: "testuser@portcullis.local", enabled: true,

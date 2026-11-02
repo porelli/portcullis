@@ -32,33 +32,34 @@ Checks, run in order:
      subject CN equals the session user (the LLDAP username from
      X-Auth-Request-Preferred-Username, which must also match the token's
      preferred_username); otherwise step-up / deny.
-  2. Group — does the user belong to the subdomain's required LLDAP
-     group (users_<app>)? If not, 403. The reserved group
+  2. Group — does the user belong to the host's required LLDAP group
+     (users_<app>)? If not, 403. The reserved group
      __portcullis_deny__ (published by the Hub for apps whose config is
      unknown) always denies, and so does a user who claims to be in it.
      The map.conf value `*` (people.<domain>) means any signed-in user.
      Temporary memberships (`expiring`) are absent once now >= at, for
      this check, path groups and the returned X-Auth-Request-Groups.
-  3. Path groups — for subdomains with `path_groups` rules, the normalised
+  3. Path groups — for hosts with `path_groups` rules, the normalised
      X-Forwarded-Uri path is matched against the rule prefixes (segment
      boundaries, longest prefix wins) and that rule's group is required in
-     addition to the subdomain group. See normalize_path_candidates().
+     addition to the host's group. See normalize_path_candidates().
 
 Request paths on group-gate itself (the forwardAuth `address`):
   /                     full checks (portcullis-groups@docker)
-  /authenticated[/...]  everything except the subdomain group check (step 2):
+  /authenticated[/...]  everything except the host group check (step 2):
                         any authenticated user. Used for self-service routes
                         such as enroll.<domain>/self (portcullis-self@docker).
   /public-guard         public exceptions (portcullis-public-guard@docker, on
-                        the Hub's portcullis-public-<app> routers, no forward-
-                        auth): no user, no group, no policy. Allows only if the
-                        subdomain has a `public_paths` entry (policy file
-                        version 4), the normalised path is inside one of its
-                        patterns, and the request carries no credential
-                        (Authorization, Proxy-Authorization, the app's
-                        credential headers, cookies or query parameters,
-                        names normalised the way PHP does). Otherwise 403.
-                        See public_guard_check().
+                        the Hub's portcullis-public-<instance> routers, no
+                        forward-auth): no user, no group, no policy. Allows
+                        only if the host has a `public_paths` entry (policy
+                        file version 5; never a core host), the normalised
+                        path is inside one of its patterns, and the request
+                        carries no credential (Authorization,
+                        Proxy-Authorization, the app's credential headers,
+                        cookies or query parameters, names normalised the way
+                        PHP does). Otherwise 403. See public_guard_check().
+  /portal               the landing page at https://<domain>/
   /healthz              liveness (no checks, for the container healthcheck)
   /metrics              Prometheus metrics (monitoring profile): decisions by
                         endpoint/result, denials and step-ups by reason,
@@ -68,28 +69,32 @@ Request paths on group-gate itself (the forwardAuth `address`):
                         Traefik's forwardAuth always calls / or /authenticated.
 
 Config sources (both re-read on every request; they are tiny):
-  - /etc/group-gate/map.conf — subdomain=required_group (`*` = any
-    signed-in user, valid only there). Authoritative for core subdomains
-    (auth, traefik, hub, directory, enroll, people, metrics): the Hub
-    policy file can never override those.
+  - /etc/group-gate/map.conf — <sub>=required_group, expanded to
+    <sub>.<PORTCULLIS_DOMAIN> (`*` = any signed-in user, valid only
+    there). Authoritative for the core hosts (<domain> itself and
+    auth, traefik, hub, directory, enroll, people, metrics . <domain>):
+    the Hub policy file can never override those.
   - /hub-data/group-gate-policy.json — written by the Hub (contract §4):
-      {"version": 4,
-       "policies": {"<subdomain>": {"factors": [...], "op": "any|all|"}},
+      {"version": 5,
        "default":  {"factors": [...], "op": "..."},
-       "groups":   {"<subdomain>": "<required LLDAP group>"},
-       "path_groups": {"<subdomain>": [{"prefix": "/admin", "group": "<LLDAP group>"}]},
-       "public_paths": {"<subdomain>": {"paths": [{"path": "/s/{token}", "match": "prefix"}],
+       "extra_domains": ["<enrolled domain>", ...],
+       "policies": {"<hostname>": {"factors": [...], "op": "any|all|"}},
+       "groups":   {"<hostname>": "<required LLDAP group>"},
+       "path_groups": {"<hostname>": [{"prefix": "/admin", "group": "<LLDAP group>"}]},
+       "public_paths": {"<hostname>": {"paths": [{"path": "/s/{token}", "match": "prefix"}],
                         "token_pattern": "^...$", "static_extensions": [...],
                         "credential_headers": [...], "credential_cookies": [...],
                         "credential_query": [...]}},
        "expiring": [{"user": "<lowercase username>", "group": "<LLDAP group>",
                      "at": "<RFC 3339 UTC>"}]}
-    Every map is keyed by the lowercase subdomain the request is for —
-    never by template ID. Optional; no file means every app falls through to the group check
-    only. Missing keys (other than `version`) are treated as empty. A file
-    that exists but cannot be parsed, has no `version` or any `version`
-    other than 4, or a policy / expiry with unknown factor names / op /
-    rule shape fails CLOSED (403).
+    Every map is keyed by the full lowercase hostname the request is for
+    (a valid hostname, see HOSTNAME_RE) — never by template or instance
+    id, never by subdomain. Optional; no file means every app falls
+    through to the group check only. Missing keys (other than `version`)
+    are treated as empty. A file that exists but cannot be parsed, has no
+    `version` or any `version` other than 5, a key that is not a valid
+    hostname, a malformed `extra_domains`, or a policy / expiry with
+    unknown factor names / op / rule shape fails CLOSED (403).
   - /hub-data/user-attributes.json — written by the Hub (contract §4.1):
     {"version": 1, "fields": {"<field>": "<Header-Name>"},
      "users": {"<user>": {"<field>": ["value", ...]}}}. Every allow on / and
@@ -104,10 +109,16 @@ Config sources (both re-read on every request; they are tiny):
     expired membership was stripped for the request — the token still
     names the group, so it is withheld and Traefik deletes it.
 
-Host handling: X-Forwarded-Host is normalised (lowercased, port and
-trailing dot stripped) because Traefik's Host() matcher is
-case-insensitive. When PORTCULLIS_DOMAIN is set, the host must be exactly
-<single-label>.<PORTCULLIS_DOMAIN>, otherwise the request is denied.
+Host handling (contract §4 "Host matching"): the first X-Forwarded-Host
+value is lowercased, a numeric :<port> and trailing dots are stripped,
+and the result must be a valid hostname. It is then looked up EXACTLY
+(no subdomain or parent-domain fallback). A host is served only if it is
+  - a core host (<domain>, <core sub>.<domain>): map.conf only;
+  - an extra-domain host: an `extra_domains` entry <d> itself or
+    <label>.<d> (step-up on the host itself, forward-auth-ext);
+  - a main-domain host: <label>.<domain>.
+Anything else is denied. PORTCULLIS_DOMAIN is required (the gate refuses
+to start without a valid one, and denies every request if it is unset).
 
 Access token is read from X-Forwarded-Access-Token (oauth2-proxy with
 PASS_ACCESS_TOKEN=true). The JWT signature is NOT verified here — it was
@@ -144,11 +155,34 @@ DELTA_CRL_URL = os.environ.get("GATE_DELTA_CRL_URL", "").strip()
 CRL_REFRESH_SECONDS = float(os.environ.get("GATE_CRL_REFRESH_SECONDS", "60"))
 CERT_INFO_HEADER = "X-Forwarded-Tls-Client-Cert-Info"
 
-# Core infrastructure subdomains. Their required group comes only from
-# map.conf / GATE_MAP; Hub-written "groups" entries for them are ignored.
-# If map.conf somehow lacks one, it defaults to lldap_admin (fail closed).
+# A valid hostname (contract §4): lowercase, at least two labels, no port,
+# no trailing dot, no wildcard, at most 253 characters. Always fullmatch():
+# "$" would also match before a trailing "\n".
+HOSTNAME_RE = re.compile(r"(?=.{1,253}\Z)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+LABEL_RE = re.compile(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def valid_hostname(value) -> bool:
+    return isinstance(value, str) and HOSTNAME_RE.fullmatch(value) is not None
+
+
+# The main domain; required (contract §4). Unset or invalid = every request
+# is denied (and __main__ refuses to start).
+DOMAIN_OK = valid_hostname(DOMAIN)
+
+# Core infrastructure subdomains. With <domain> itself they are the core
+# hosts: their required group comes only from map.conf / GATE_MAP;
+# Hub-written entries for them are ignored. If map.conf somehow lacks one,
+# it defaults to lldap_admin (fail closed).
 CORE_SUBDOMAINS = ("auth", "traefik", "hub", "directory", "enroll", "people", "metrics")
 CORE_DEFAULT_GROUP = "lldap_admin"
+
+
+def core_hosts() -> FrozenSet[str]:
+    """<domain> (the portal) and <core sub>.<domain> (contract §4)."""
+    if not DOMAIN_OK:
+        return frozenset()
+    return frozenset([DOMAIN] + [f"{sub}.{DOMAIN}" for sub in CORE_SUBDOMAINS])
 # map.conf value meaning "any signed-in user" (people.<domain>, contract
 # §5.1). Valid ONLY in map.conf / GATE_MAP: in the policy file's `groups`
 # it is ignored and in `path_groups` it is malformed (fail closed).
@@ -159,9 +193,11 @@ VALID_OPS = ("", "any", "all")
 # membership would never end; a newer one may carry restrictions we would
 # drop). A file without `version` denies too; only a missing FILE means
 # "nothing published" (empty policy).
-POLICY_VERSION = 4
+POLICY_VERSION = 5
 # /public-guard needs a file of exactly this version (no `version` = deny).
-PUBLIC_GUARD_VERSION = 4
+PUBLIC_GUARD_VERSION = 5
+# The maps of the policy file keyed by hostname (contract §4).
+HOST_MAPS = ("policies", "groups", "path_groups", "public_paths")
 # Reserved group (contract §4): the Hub publishes it for routed apps whose
 # config is unknown. It always denies; nobody may claim membership.
 DENY_GROUP = "__portcullis_deny__"
@@ -193,8 +229,10 @@ class PolicyError(Exception):
 
 
 def load_static_map() -> dict:
-    """Parse map.conf plus the GATE_MAP env override (subdomain=group)."""
-    mapping = {}
+    """Parse map.conf plus the GATE_MAP env override (<sub>=group), keyed
+    by subdomain label. An entry that is not a single DNS label is skipped
+    (logged): the file names subdomains of the main domain only."""
+    pairs = []
     if os.path.isfile(MAP_FILE):
         with open(MAP_FILE) as f:
             for line in f:
@@ -202,46 +240,50 @@ def load_static_map() -> dict:
                 if not line or line.startswith("#"):
                     continue
                 if "=" in line:
-                    sub, group = line.split("=", 1)
-                    mapping[sub.strip().lower()] = group.strip()
-    env_map = os.environ.get("GATE_MAP", "")
-    for pair in env_map.split(","):
+                    pairs.append(line.split("=", 1))
+    for pair in os.environ.get("GATE_MAP", "").split(","):
         pair = pair.strip()
         if "=" in pair:
-            sub, group = pair.split("=", 1)
-            mapping[sub.strip().lower()] = group.strip()
+            pairs.append(pair.split("=", 1))
+    mapping = {}
+    for sub, group in pairs:
+        sub, group = sub.strip().lower(), group.strip()
+        if not LABEL_RE.fullmatch(sub):
+            print(f"group-gate: ignoring map entry {sub!r} (not a subdomain label)", flush=True)
+            continue
+        mapping[sub] = group
     return mapping
 
 
 def build_group_map(policy_doc: dict) -> dict:
-    """Merge map.conf with the Hub's "groups" key.
+    """Required group per full hostname: map.conf's <sub> entries expanded
+    to <sub>.<domain>, then the Hub's "groups" key.
 
-    Hub entries add/override non-core subdomains; core subdomains always
-    keep the map.conf value (or lldap_admin if map.conf is missing it).
+    Hub entries add/override non-core hosts; core hosts always keep the
+    map.conf value (or lldap_admin if map.conf is missing it). Key shapes
+    were validated by load_policy_file.
     """
-    mapping = load_static_map()
-    for sub in CORE_SUBDOMAINS:
-        mapping.setdefault(sub, CORE_DEFAULT_GROUP)
+    if not DOMAIN_OK:
+        return {}
+    mapping = {f"{sub}.{DOMAIN}": group for sub, group in load_static_map().items()}
+    core = core_hosts()
+    for host in core:
+        mapping.setdefault(host, CORE_DEFAULT_GROUP)
     hub_groups = policy_doc.get("groups") if isinstance(policy_doc, dict) else None
     if isinstance(hub_groups, dict):
-        for sub, group in hub_groups.items():
-            if not isinstance(sub, str) or not isinstance(group, str):
+        for host, group in hub_groups.items():
+            if not isinstance(group, str) or not group.strip():
                 continue
-            sub, group = sub.strip().lower(), group.strip()
-            if not sub or not group:
-                continue
+            group = group.strip()
             if group == ANY_SIGNED_IN:
-                print(f"group-gate: ignoring policy-file group {group!r} for {sub!r} (valid only in map.conf)",
+                print(f"group-gate: ignoring policy-file group {group!r} for {host!r} (valid only in map.conf)",
                       flush=True)
                 continue
-            if sub in CORE_SUBDOMAINS:
-                if group != mapping[sub]:
-                    print(
-                        f"group-gate: ignoring policy-file group {group!r} for core subdomain {sub!r}",
-                        flush=True,
-                    )
+            if host in core:
+                if group != mapping[host]:
+                    print(f"group-gate: ignoring policy-file group {group!r} for core host {host!r}", flush=True)
                 continue
-            mapping[sub] = group
+            mapping[host] = group
     return mapping
 
 
@@ -249,58 +291,103 @@ _POLICY_CACHE: dict = {}
 _POLICY_LOCK = threading.Lock()
 
 
+def validate_policy_doc(doc) -> Optional[str]:
+    """Why a parsed policy file must deny every request, or None.
+
+    Checks what applies to the whole file (contract §4): a JSON object of
+    exactly POLICY_VERSION, every host map an object keyed by valid
+    hostnames, and `extra_domains` a list of valid hostnames none of which
+    is the main domain, a parent of it, or at or under a core host (extra
+    domains never route core services). Per-host entries are validated
+    when a request needs them.
+    """
+    if not isinstance(doc, dict):
+        return "policy file is not a JSON object"
+    version = doc.get("version")
+    if isinstance(version, bool) or version != POLICY_VERSION:
+        return f"policy file version {version!r} is not supported (only {POLICY_VERSION})"
+    for name in HOST_MAPS:
+        m = doc.get(name)
+        if m is None:
+            continue
+        if not isinstance(m, dict):
+            return f"{name!r} is not an object"
+        bad = [k for k in m if not valid_hostname(k)]
+        if bad:
+            return f"{name!r} has keys that are not valid hostnames: {sorted(map(repr, bad))[:5]}"
+    extra = doc.get("extra_domains")
+    if extra is not None:
+        if not isinstance(extra, list):
+            return "'extra_domains' is not a list"
+        core = core_hosts()
+        for d in extra:
+            if not valid_hostname(d):
+                return f"'extra_domains' entry {d!r} is not a valid hostname"
+            # d == a core host, a parent of the main domain, or under a core
+            # subdomain (x.hub.<domain>). <label>.<domain> is fine.
+            if d in core or DOMAIN.endswith("." + d) or any(d.endswith("." + c) for c in core if c != DOMAIN):
+                return f"'extra_domains' entry {d!r} overlaps the main domain's core hosts"
+    return None
+
+
 def _read_policy_doc():
-    """Parsed policy file, cached on (path, inode, mtime, size): the Hub
-    replaces it atomically (rename), so any change gives a new key.
-    None when the file does not exist."""
+    """(parsed policy file, why it must deny or None), cached on (path,
+    inode, mtime, size): the Hub replaces it atomically (rename), so any
+    change gives a new key. (None, None) when the file does not exist."""
     try:
         st = os.stat(POLICY_FILE)
     except FileNotFoundError:
-        return None
+        return None, None
     except OSError as e:
         raise PolicyError(f"cannot read policy file: {e}") from e
     key = (POLICY_FILE, st.st_ino, st.st_mtime_ns, st.st_size)
     with _POLICY_LOCK:
         if _POLICY_CACHE.get("key") == key:
-            return _POLICY_CACHE["doc"]
+            return _POLICY_CACHE["doc"], _POLICY_CACHE["error"]
     try:
         with open(POLICY_FILE) as f:
             doc = json.load(f)
     except FileNotFoundError:
-        return None
+        return None, None
     except (OSError, ValueError) as e:
         raise PolicyError(f"cannot read policy file: {e}") from e
+    error = validate_policy_doc(doc)
     with _POLICY_LOCK:
         _POLICY_CACHE.clear()
-        _POLICY_CACHE.update(key=key, doc=doc)
-    return doc
+        _POLICY_CACHE.update(key=key, doc=doc, error=error)
+    return doc, error
 
 
 PORTAL_FILE = os.environ.get("GATE_PORTAL_FILE", os.path.join(os.path.dirname(POLICY_FILE), "portal-apps.json"))
 
 
 def load_portal_apps():
-    """Apps of the Hub's portal-apps.json (contract §10), or None when the
-    file is missing, unreadable or of an unknown version (show nothing)."""
+    """(apps, domains) of the Hub's portal-apps.json (contract §10); apps is
+    None when the file is missing, unreadable or of an unknown version
+    (show nothing). domains: its valid `domains` entries (enrolled domains
+    with listed hosts); anything else in it is ignored."""
     try:
         with open(PORTAL_FILE) as f:
             doc = json.load(f)
     except (OSError, ValueError):
-        return None
+        return None, []
     if not isinstance(doc, dict) or doc.get("version") != 1 or not isinstance(doc.get("apps"), list):
-        return None
-    return [a for a in doc["apps"] if isinstance(a, dict)]
+        return None, []
+    domains = doc.get("domains")
+    domains = [d for d in domains if valid_hostname(d)] if isinstance(domains, list) else []
+    return [a for a in doc["apps"] if isinstance(a, dict)], domains
 
 
-def _safe_url(u) -> str:
-    """https URLs on the portal domain only (anything else is dropped)."""
-    if not isinstance(u, str):
+def _safe_url(u, domains=()) -> str:
+    """https URLs on the main domain or one of `domains` only (anything
+    else is dropped)."""
+    if not isinstance(u, str) or not DOMAIN_OK:
         return ""
     parts = urllib.parse.urlsplit(u)
     host = (parts.hostname or "").lower()
     if parts.scheme != "https" or parts.username or not host:
         return ""
-    if DOMAIN and not (host == DOMAIN or host.endswith("." + DOMAIN)):
+    if not any(host == d or host.endswith("." + d) for d in (DOMAIN, *domains)):
         return ""
     return u
 
@@ -327,7 +414,7 @@ PORTAL_CSP = ("default-src 'none'; style-src 'sha256-"
               + "'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
-def render_portal(user: str, groups: set, apps, domain: str) -> bytes:
+def render_portal(user: str, groups: set, apps, domain: str, domains=()) -> bytes:
     e = lambda v: html.escape(str(v), quote=True)  # noqa: E731
     cards = []
     for a in apps or []:
@@ -338,7 +425,7 @@ def render_portal(user: str, groups: set, apps, domain: str) -> bytes:
         for u in a.get("urls") or []:
             if not isinstance(u, dict):
                 continue
-            href = _safe_url(u.get("url"))
+            href = _safe_url(u.get("url"), domains)
             if href:
                 links.append(f'<a href="{e(href)}">{e(u.get("label") or href)}</a>')
         if not links:
@@ -380,20 +467,44 @@ def load_policy_file() -> dict:
     """Return the Hub policy doc, {} if the file is absent (nothing
     published yet).
 
-    Raises PolicyError if the file exists but is not a JSON object or its
-    `version` is not exactly POLICY_VERSION (a missing `version` included) —
-    a broken or foreign policy must not silently downgrade apps to "no
-    policy". Callers must not modify the returned (cached) document.
+    Raises PolicyError if the file exists but fails validate_policy_doc()
+    (not a JSON object, a `version` other than POLICY_VERSION — a missing
+    one included —, a key that is not a valid hostname, a malformed
+    `extra_domains`): a broken or foreign policy must not silently
+    downgrade apps to "no policy". Callers must not modify the returned
+    (cached) document.
     """
-    doc = _read_policy_doc()
+    doc, error = _read_policy_doc()
     if doc is None:
         return {}
-    if not isinstance(doc, dict):
-        raise PolicyError("policy file is not a JSON object")
-    version = doc.get("version")
-    if isinstance(version, bool) or version != POLICY_VERSION:
-        raise PolicyError(f"policy file version {version!r} is not supported (only {POLICY_VERSION})")
+    if error:
+        raise PolicyError(error)
     return doc
+
+
+def extra_domains(policy_doc: dict) -> List[str]:
+    """The validated `extra_domains` of a loaded policy document."""
+    return list(policy_doc.get("extra_domains") or []) if isinstance(policy_doc, dict) else []
+
+
+def host_kind(host: str, extra: List[str]) -> Optional[str]:
+    """"core", "extra" (extra-domain host), "main" (main-domain host), or
+    None for a host Portcullis does not serve (contract §4 / §5).
+
+    Core hosts first (they never move to an enrolled domain); then an
+    enrolled domain <d> itself or <label>.<d> — which includes enrolled
+    subdomains of the main domain; then <label>.<domain>.
+    """
+    if not DOMAIN_OK or not valid_hostname(host):
+        return None
+    if host in core_hosts():
+        return "core"
+    for d in extra:
+        if host == d or (host.endswith("." + d) and LABEL_RE.fullmatch(host[: -len(d) - 1])):
+            return "extra"
+    if host.endswith("." + DOMAIN) and LABEL_RE.fullmatch(host[: -len(DOMAIN) - 1]):
+        return "main"
+    return None
 
 
 # ── Temporary memberships (expiring, policy file v4) ─────────────────
@@ -562,39 +673,36 @@ def _normalize_prefix(prefix: str) -> str:
     return prefix.rstrip("/") or "/"
 
 
-def path_rules_for(policy_doc: dict, subdomain: str) -> List[Tuple[str, str]]:
-    """[(prefix, group)] for the subdomain; raises PolicyError if malformed.
+def path_rules_for(policy_doc: dict, host: str) -> List[Tuple[str, str]]:
+    """[(prefix, group)] for the host (exact key); raises PolicyError if
+    malformed.
 
-    Core subdomains never take rules from the Hub file.
+    Core hosts never take rules from the Hub file.
     """
     pg = policy_doc.get("path_groups") if isinstance(policy_doc, dict) else None
     if pg is None:
         return []
     if not isinstance(pg, dict):
         raise PolicyError("'path_groups' is not an object")
-    rules_raw = None
-    for key, value in pg.items():
-        if isinstance(key, str) and key.strip().lower() == subdomain:
-            rules_raw = value
-            break
+    rules_raw = pg.get(host)
     if rules_raw is None:
         return []
-    if subdomain in CORE_SUBDOMAINS:
-        print(f"group-gate: ignoring policy-file path_groups for core subdomain {subdomain!r}", flush=True)
+    if host in core_hosts():
+        print(f"group-gate: ignoring policy-file path_groups for core host {host!r}", flush=True)
         return []
     if not isinstance(rules_raw, list):
-        raise PolicyError(f"path_groups for {subdomain!r} is not a list")
+        raise PolicyError(f"path_groups for {host!r} is not a list")
     rules = []
     for rule in rules_raw:
         if not isinstance(rule, dict):
-            raise PolicyError(f"path_groups rule for {subdomain!r} is not an object")
+            raise PolicyError(f"path_groups rule for {host!r} is not an object")
         prefix, group = rule.get("prefix"), rule.get("group")
         if not isinstance(prefix, str) or not prefix.strip().startswith("/"):
-            raise PolicyError(f"path_groups rule for {subdomain!r} has an invalid prefix {prefix!r}")
+            raise PolicyError(f"path_groups rule for {host!r} has an invalid prefix {prefix!r}")
         if not isinstance(group, str) or not group.strip() or group.strip() == ANY_SIGNED_IN:
-            raise PolicyError(f"path_groups rule for {subdomain!r} has an invalid group {group!r}")
+            raise PolicyError(f"path_groups rule for {host!r} has an invalid group {group!r}")
         if any(c in prefix for c in "%?#\\\x00") or "/./" in prefix + "/" or "/../" in prefix + "/":
-            raise PolicyError(f"path_groups prefix {prefix!r} for {subdomain!r} is not a normalised path")
+            raise PolicyError(f"path_groups prefix {prefix!r} for {host!r} is not a normalised path")
         rules.append((_normalize_prefix(prefix), group.strip()))
     return rules
 
@@ -740,8 +848,9 @@ def _str_list(entry: dict, key: str, rx, sub: str) -> List[str]:
     return v
 
 
-def public_config_for(policy_doc: dict, subdomain: str) -> Optional[PublicConfig]:
-    """The subdomain's public_paths entry, validated (None if absent).
+def public_config_for(policy_doc: dict, host: str) -> Optional[PublicConfig]:
+    """The host's public_paths entry, validated (None if absent; always
+    None for a core host).
 
     Raises PolicyError for a file version other than PUBLIC_GUARD_VERSION or
     any malformed / unknown field: the guard then denies (fail closed).
@@ -754,49 +863,49 @@ def public_config_for(policy_doc: dict, subdomain: str) -> Optional[PublicConfig
         return None
     if not isinstance(pp, dict):
         raise PolicyError("'public_paths' is not an object")
-    if subdomain in CORE_SUBDOMAINS:
+    if host in core_hosts():
         return None
-    entry = pp.get(subdomain)
+    entry = pp.get(host)
     if entry is None:
         return None
     if not isinstance(entry, dict):
-        raise PolicyError(f"public_paths[{subdomain!r}] is not an object")
+        raise PolicyError(f"public_paths[{host!r}] is not an object")
     unknown = set(entry) - PUBLIC_KEYS
     if unknown:
-        raise PolicyError(f"public_paths[{subdomain!r}] has unknown keys {sorted(unknown)}")
+        raise PolicyError(f"public_paths[{host!r}] has unknown keys {sorted(unknown)}")
     raw_paths = entry.get("paths")
     if not isinstance(raw_paths, list) or not raw_paths:
-        raise PolicyError(f"public_paths[{subdomain!r}].paths is empty")
+        raise PolicyError(f"public_paths[{host!r}].paths is empty")
     paths = []
     has_token = False
     for p in raw_paths:
         if not isinstance(p, dict) or set(p) != {"path", "match"}:
-            raise PolicyError(f"public_paths[{subdomain!r}] has a malformed path entry {p!r}")
+            raise PolicyError(f"public_paths[{host!r}] has a malformed path entry {p!r}")
         path, match = p["path"], p["match"]
         if not isinstance(path, str) or not _PUBLIC_PATH_RE.fullmatch(path) or match not in PUBLIC_MATCHES:
-            raise PolicyError(f"public_paths[{subdomain!r}] has an invalid path {path!r} / match {match!r}")
+            raise PolicyError(f"public_paths[{host!r}] has an invalid path {path!r} / match {match!r}")
         segs = path.split("/")[1:]
         if any(seg in (".", "..") or (".." in seg) for seg in segs) or segs.count(_PUBLIC_TOKEN) > 1 \
                 or (match != "prefix" and _PUBLIC_TOKEN in segs):
-            raise PolicyError(f"public_paths[{subdomain!r}] has an invalid path {path!r}")
+            raise PolicyError(f"public_paths[{host!r}] has an invalid path {path!r}")
         has_token = has_token or _PUBLIC_TOKEN in segs
         paths.append((path, match))
     token_re = None
     pat = entry.get("token_pattern", "")
     if not isinstance(pat, str):
-        raise PolicyError(f"public_paths[{subdomain!r}].token_pattern is not a string")
+        raise PolicyError(f"public_paths[{host!r}].token_pattern is not a string")
     if has_token:
         if not (pat.startswith("^") and pat.endswith("$")):
-            raise PolicyError(f"public_paths[{subdomain!r}].token_pattern must be anchored")
+            raise PolicyError(f"public_paths[{host!r}].token_pattern must be anchored")
         try:
             token_re = re.compile(pat)
         except re.error as e:
-            raise PolicyError(f"public_paths[{subdomain!r}].token_pattern: {e}") from e
-    exts = tuple(_str_list(entry, "static_extensions", _EXT_RE, subdomain))
-    headers = {h.lower().replace("_", "-") for h in _str_list(entry, "credential_headers", _HEADER_NAME_RE, subdomain)}
+            raise PolicyError(f"public_paths[{host!r}].token_pattern: {e}") from e
+    exts = tuple(_str_list(entry, "static_extensions", _EXT_RE, host))
+    headers = {h.lower().replace("_", "-") for h in _str_list(entry, "credential_headers", _HEADER_NAME_RE, host)}
     headers.update(ALWAYS_CREDENTIAL_HEADERS)
-    cookies = {php_var_name(n.encode()).lower() for n in _str_list(entry, "credential_cookies", _NAME_RE, subdomain)}
-    query = {php_var_name(n.encode()).lower() for n in _str_list(entry, "credential_query", _NAME_RE, subdomain)}
+    cookies = {php_var_name(n.encode()).lower() for n in _str_list(entry, "credential_cookies", _NAME_RE, host)}
+    query = {php_var_name(n.encode()).lower() for n in _str_list(entry, "credential_query", _NAME_RE, host)}
     return PublicConfig(paths, token_re, exts, headers, cookies, query)
 
 
@@ -917,14 +1026,14 @@ def public_path_allowed(cfg: PublicConfig, path: str) -> bool:
     return False
 
 
-def public_guard_check(policy_doc: dict, subdomain: str, headers, raw_uri: str) -> Optional[str]:
+def public_guard_check(policy_doc: dict, host: str, headers, raw_uri: str) -> Optional[str]:
     """None to allow the public request, else the reason to deny."""
     try:
-        cfg = public_config_for(policy_doc, subdomain)
+        cfg = public_config_for(policy_doc, host)
     except PolicyError as e:
         return f"policy: {e}"
     if cfg is None:
-        return "no public exception for this subdomain"
+        return "no public exception for this host"
     if "#" in (raw_uri or ""):
         return "path: '#' in the request URI"
     raw_path = (raw_uri or "").split("?", 1)[0]
@@ -1261,32 +1370,17 @@ def leaf_cert_cn(raw: str) -> Optional[str]:
     return None
 
 
+_PORT_RE = re.compile(r":[0-9]{1,5}\Z")
+
+
 def normalize_host(raw: str) -> str:
-    """Lowercase, drop port and trailing dot(s)."""
+    """First X-Forwarded-Host value, lowercased, a numeric :<port> and
+    trailing dots stripped (contract §4: `Grafana-A.Team-A.com.:443` ->
+    `grafana-a.team-a.com`). The result still has to pass valid_hostname():
+    an IPv6 literal, a non-numeric port, userinfo, a wildcard... do not."""
     host = (raw or "").split(",")[0].strip().lower()
-    if host.startswith("["):  # IPv6 literal — never a valid app host
-        return host
-    host = host.rsplit(":", 1)[0] if ":" in host else host
+    host = _PORT_RE.sub("", host)
     return host.rstrip(".")
-
-
-def subdomain_for(host: str) -> Optional[str]:
-    """Return the app subdomain, or None if the host is not acceptable.
-
-    With PORTCULLIS_DOMAIN set the host must be exactly <label>.<domain>.
-    Without it (dev/test), fall back to the first label.
-    """
-    if not host:
-        return None
-    if DOMAIN:
-        suffix = "." + DOMAIN
-        if not host.endswith(suffix):
-            return None
-        sub = host[: -len(suffix)]
-        if not sub or "." in sub:
-            return None
-        return sub
-    return host.split(".")[0] or None
 
 
 def decode_jwt_payload(token: str) -> dict:
@@ -1304,17 +1398,19 @@ def decode_jwt_payload(token: str) -> dict:
     return claims if isinstance(claims, dict) else {}
 
 
-def resolve_policy(policy_doc: dict, subdomain: str) -> Optional[dict]:
-    """Return {factors, op} for this app, or None if no policy configured."""
+def resolve_policy(policy_doc: dict, host: str) -> Optional[dict]:
+    """Return {factors, op} for this host (exact key; a core host never
+    takes one from the file), or the default, or None if no policy is
+    configured."""
     if not policy_doc:
         return None
     policies = policy_doc.get("policies") or {}
     if not isinstance(policies, dict):
         raise PolicyError("'policies' is not an object")
-    if subdomain in policies:
-        policy = policies[subdomain]
+    if host in policies and host not in core_hosts():
+        policy = policies[host]
         if not isinstance(policy, dict):
-            raise PolicyError(f"policy for {subdomain!r} is not an object")
+            raise PolicyError(f"policy for {host!r} is not an object")
         return policy
     default = policy_doc.get("default")
     if default is None:
@@ -1391,14 +1487,9 @@ def policy_relies_on_mtls(policy: dict, amr: list) -> bool:
     return not (amr_set & others)
 
 
-def parent_domain(host: str) -> str:
-    """PORTCULLIS_DOMAIN, or (dev/test without it) the host minus its first label."""
-    return DOMAIN or (host.split(".", 1)[1] if "." in host else "")
-
-
-def stepup_url(host: str, needed_loa: int, factors: list) -> str:
+def stepup_url(host: str, needed_loa: int, factors: list, extra: bool = False) -> str:
     """Build a step-up URL that asks oauth2-proxy for a fresh login at the
-    required Level of Authentication.
+    required Level of Authentication (contract §5 "Step-up URL").
 
     We pass `acr_values=<acr>` to /oauth2/start, which oauth2-proxy forwards
     to Keycloak's authorize endpoint. No `prompt=login`: Keycloak's cookie
@@ -1407,12 +1498,17 @@ def stepup_url(host: str, needed_loa: int, factors: list) -> str:
     yet — a full re-authentication would ask again for factors the session
     already has.
 
-    The URL is on auth.<domain> (router oauth2-callback), never on the app's
-    own host: a host-less PathPrefix(`/oauth2/`) router cannot carry the
-    tiers' TLS options, so Traefik serves it with the default options and
-    answers 421 Misdirected Request on every app host (they all use
-    authaware/protected/public). oauth2-proxy's cookie is set for
-    .<domain> and `rd` is in its whitelist, so the user lands back on the app.
+    Main-domain and core hosts: on auth.<domain> (router oauth2-callback,
+    forward-auth), never on the app's own host — a host-less
+    PathPrefix(`/oauth2/`) router cannot carry the tiers' TLS options, so
+    Traefik would serve it with the default options and answer 421
+    Misdirected Request. oauth2-proxy's cookie is set for .<domain> and
+    `rd` is in its whitelist, so the user lands back on the app.
+
+    Extra-domain hosts (`extra`): on the host itself, served by
+    forward-auth-ext through the Hub's Host-scoped sign-in router
+    (portcullis-oauth2-<instance>_<router>); `rd=/` is relative, so it
+    needs no whitelist and can only land on the same host.
 
     No sign_out in the chain: the browser still has oauth2-proxy's cookie
     but we want Keycloak to issue a *new* token reflecting the step-up, not
@@ -1420,12 +1516,10 @@ def stepup_url(host: str, needed_loa: int, factors: list) -> str:
     """
     loa_to_acr = {0: "public", 1: "pwd", 2: "hwk", 3: "mtls"}
     acr = loa_to_acr.get(needed_loa, "pwd")
-    query = urllib.parse.urlencode({
-        "acr_values": acr,
-        "rd": f"https://{host}/",
-    })
-    parent = parent_domain(host)
-    return f"https://auth.{parent}/oauth2/start?{query}" if parent else f"https://{host}/oauth2/start?{query}"
+    if extra:
+        return f"https://{host}/oauth2/start?" + urllib.parse.urlencode({"acr_values": acr, "rd": "/"})
+    query = urllib.parse.urlencode({"acr_values": acr, "rd": f"https://{host}/"})
+    return f"https://auth.{DOMAIN}/oauth2/start?{query}"
 
 
 def safe_factor_name(amr: str) -> str:
@@ -1532,13 +1626,13 @@ class Handler(BaseHTTPRequestHandler):
             "policy_error",
         )
 
-    def _stepup(self, host: str, subdomain: str, user: str, policy: dict, required_loa: int,
+    def _stepup(self, host: str, kind: str, user: str, policy: dict, required_loa: int,
                 acr: str, amr: list, reason: str, detail_html: str = "", metric_reason: str = "policy"):
         METRICS.inc("group_gate_requests_total", endpoint=self._endpoint, result="stepup")
         METRICS.inc("group_gate_stepups_total", reason=metric_reason)
-        url = stepup_url(host, required_loa, policy.get("factors") or [])
+        url = stepup_url(host, required_loa, policy.get("factors") or [], extra=kind == "extra")
         e_url = html.escape(url, quote=True)
-        e_sub = html.escape(subdomain)
+        e_host = html.escape(host)
         self.send_response(403)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("X-Stepup-URL", url)
@@ -1554,7 +1648,7 @@ class Handler(BaseHTTPRequestHandler):
         # have no passkey yet finish the step-up at LoA 1, so they land
         # here again until they register one.
         needs_hardware = any(f in ("mtls", "webauthn") for f in factors)
-        parent = parent_domain(host)
+        parent = DOMAIN  # passkeys and certificates are managed on the main domain only
         enrol = []
         if parent and "webauthn" in factors:
             account_url = f"https://auth.{parent}/realms/portcullis/account/account-security/signing-in"
@@ -1575,7 +1669,7 @@ class Handler(BaseHTTPRequestHandler):
                 "</section>"
             )
         if not detail_html:
-            detail_html = (f"<p><b>{e_sub}</b> requires {html.escape(need_desc)}. "
+            detail_html = (f"<p><b>{e_host}</b> requires {html.escape(need_desc)}. "
                            f"Your current session was authenticated with <code>{html.escape(have)}</code>, "
                            "which does not satisfy the app's policy.</p>")
         if needs_hardware:
@@ -1638,7 +1732,8 @@ class Handler(BaseHTTPRequestHandler):
                        f"DENIED portal user={user} reason=service account", "service_account")
             return
         METRICS.inc("group_gate_requests_total", endpoint="portal", result="allow")
-        body = render_portal(user, groups, load_portal_apps(), DOMAIN)
+        apps, domains = load_portal_apps()
+        body = render_portal(user, groups, apps, DOMAIN, domains)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -1650,22 +1745,23 @@ class Handler(BaseHTTPRequestHandler):
     def _public_guard(self):
         raw_host = self.headers.get("X-Forwarded-Host", "")
         host = normalize_host(raw_host)
-        subdomain = subdomain_for(host)
         raw_uri = self.headers.get("X-Forwarded-Uri", "")
-        reason = "host not under PORTCULLIS_DOMAIN"
         cfg = None
-        if subdomain is not None:
-            try:
-                doc = load_policy_file()
-            except PolicyError as e:
-                doc = None
-                reason = f"policy: {e}"
-            if doc is not None:
-                reason = public_guard_check(doc, subdomain, self.headers, raw_uri)
+        try:
+            doc = load_policy_file()
+        except PolicyError as e:
+            doc = None
+            reason = f"policy: {e}"
+        if doc is not None:
+            kind = host_kind(host, extra_domains(doc))
+            if kind in ("main", "extra"):
+                reason = public_guard_check(doc, host, self.headers, raw_uri)
                 try:
-                    cfg = public_config_for(doc, subdomain)
+                    cfg = public_config_for(doc, host)
                 except PolicyError:
                     cfg = None
+            else:
+                reason = "core host" if kind == "core" else "host not served by Portcullis"
         if reason:
             self._deny(
                 "Access Denied",
@@ -1704,7 +1800,7 @@ class Handler(BaseHTTPRequestHandler):
             self._endpoint = "public_guard"
             self._public_guard()
             return
-        # /authenticated: any authenticated user, no subdomain group check.
+        # /authenticated: any authenticated user, no host group check.
         authenticated_only = gate_path == "/authenticated" or gate_path.startswith("/authenticated/")
         self._endpoint = "authenticated" if authenticated_only else "gate"
 
@@ -1714,16 +1810,16 @@ class Handler(BaseHTTPRequestHandler):
         user = username or "unknown"  # for logs / pages only
         e_user = html.escape(user)
 
-        subdomain = subdomain_for(host)
-        if subdomain is None:
+        if not valid_hostname(host) or not DOMAIN_OK:
             self._deny(
                 "Access Denied",
                 "<p>Unrecognised host.</p>",
-                f"DENIED user={user} host={raw_host!r} reason=host not under PORTCULLIS_DOMAIN={DOMAIN!r}",
+                f"DENIED user={user} host={raw_host!r} reason=not a valid hostname"
+                + ("" if DOMAIN_OK else f" (PORTCULLIS_DOMAIN={DOMAIN!r} is not a valid hostname)"),
                 "host",
             )
             return
-        e_sub = html.escape(subdomain)
+        e_host = html.escape(host)
 
         groups_raw = self.headers.get("X-Auth-Request-Groups", "")
         groups = {g.strip() for g in groups_raw.split(",") if g.strip()}
@@ -1788,16 +1884,28 @@ class Handler(BaseHTTPRequestHandler):
         # change, and both files are tiny.
         try:
             policy_doc = load_policy_file()
+            kind = host_kind(host, extra_domains(policy_doc))
             gate = build_group_map(policy_doc)
-            policy = resolve_policy(policy_doc, subdomain)
+            policy = resolve_policy(policy_doc, host)
             policy_err = validate_policy(policy) if policy else None
-            path_rules = path_rules_for(policy_doc, subdomain)
+            path_rules = path_rules_for(policy_doc, host)
             expired = expired_groups(policy_doc, username)
         except PolicyError as e:
             self._deny_policy(user, host, str(e))
             return
         if policy_err:
             self._deny_policy(user, host, policy_err)
+            return
+        if kind is None:
+            # Neither a core host, nor <label>.<domain>, nor on an enrolled
+            # domain: not served by Portcullis (contract §4, §11.3).
+            self._deny(
+                "Access Denied",
+                "<p>Unrecognised host.</p>",
+                f"DENIED user={user} host={raw_host!r} reason=host not served by Portcullis "
+                f"(domain={DOMAIN!r}, extra_domains={extra_domains(policy_doc)})",
+                "host",
+            )
             return
 
         # --- Temporary memberships: an expired one is absent, whatever the
@@ -1825,7 +1933,7 @@ class Handler(BaseHTTPRequestHandler):
 
             allowed, reason, required_loa = evaluate_policy(policy, acr, amr)
             if not allowed:
-                self._stepup(host, subdomain, user, policy, required_loa, acr, amr, reason)
+                self._stepup(host, kind, user, policy, required_loa, acr, amr, reason)
                 return
 
             # --- mTLS binding: amr=mtls is only as good as the cert used NOW ---
@@ -1844,9 +1952,9 @@ class Handler(BaseHTTPRequestHandler):
                     problem = f"client cert CN {cert_cn!r} != session user {username!r}"
                 if problem:
                     self._stepup(
-                        host, subdomain, user, policy, FACTOR_TO_LOA["mtls"], acr, amr,
+                        host, kind, user, policy, FACTOR_TO_LOA["mtls"], acr, amr,
                         f"mtls binding: {problem}",
-                        "<p><b>" + e_sub + "</b> requires your client certificate (security key) on "
+                        "<p><b>" + e_host + "</b> requires your client certificate (security key) on "
                         "every request, and it must belong to the signed-in user. Insert your "
                         "security key, select its certificate when the browser asks, and sign in again.</p>",
                         metric_reason="mtls_binding",
@@ -1855,11 +1963,11 @@ class Handler(BaseHTTPRequestHandler):
 
         # --- Group check ---
         if not authenticated_only:
-            required_group = gate.get(subdomain)
+            required_group = gate.get(host)
             if required_group == DENY_GROUP:
                 self._deny(
                     "Access Denied",
-                    f"<p>The configuration of <b>{e_sub}</b> is unavailable, so access is denied. "
+                    f"<p>The configuration of <b>{e_host}</b> is unavailable, so access is denied. "
                     "Ask an administrator to check the app in the Hub.</p>",
                     f"DENIED user={user} host={host} reason=app configuration unavailable ({DENY_GROUP})",
                     "app_unavailable",
@@ -1868,18 +1976,18 @@ class Handler(BaseHTTPRequestHandler):
             if required_group == ANY_SIGNED_IN:
                 pass  # map.conf only (people.<domain>): any signed-in user
             elif not required_group:
-                print(f"group-gate: ALLOW-UNMAPPED user={user} host={host} (no group mapping for {subdomain!r})", flush=True)
+                print(f"group-gate: ALLOW-UNMAPPED user={user} host={host} (no group mapping for {host!r})", flush=True)
             elif required_group not in groups:
                 self._deny(
                     "Access Denied",
-                    f"<p>User <b>{e_user}</b> is not authorized to access <b>{e_sub}</b>.</p>"
+                    f"<p>User <b>{e_user}</b> is not authorized to access <b>{e_host}</b>.</p>"
                     f"<p>Required group: <code>{html.escape(required_group)}</code></p>",
                     f"DENIED user={user} host={host} need={required_group} have={sorted(groups)}",
                     "group",
                 )
                 return
 
-        # --- Path groups (in addition to the subdomain group) ---
+        # --- Path groups (in addition to the host's group) ---
         if path_rules:
             raw_uri = self.headers.get("X-Forwarded-Uri", "")
             try:
@@ -1896,7 +2004,7 @@ class Handler(BaseHTTPRequestHandler):
                 if need == DENY_GROUP or need not in groups:
                     self._deny(
                         "Access Denied",
-                        f"<p>User <b>{e_user}</b> is not authorized to access this part of <b>{e_sub}</b>.</p>"
+                        f"<p>User <b>{e_user}</b> is not authorized to access this part of <b>{e_host}</b>.</p>"
                         f"<p>Required group: <code>{html.escape(need)}</code></p>",
                         f"DENIED user={user} host={host} path={log_uri(candidates[0])!r} need={need} have={sorted(groups)}",
                         "path_group",
@@ -1911,9 +2019,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if not DOMAIN_OK:
+        # Required (contract §4): without it no host can be classified.
+        raise SystemExit(f"group-gate: PORTCULLIS_DOMAIN={DOMAIN!r} is not a valid hostname — refusing to start")
     print(
         f"group-gate: listening on :{LISTEN_PORT}, policy_file={POLICY_FILE}, "
-        f"map_file={MAP_FILE}, domain={DOMAIN or '(unset: first-label fallback)'}",
+        f"map_file={MAP_FILE}, domain={DOMAIN}",
         flush=True,
     )
     print(f"group-gate: static group mappings: {load_static_map()}", flush=True)
