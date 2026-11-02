@@ -303,7 +303,7 @@ keycloak_configure() {
   info "Granting lldap_admin the $KC_REALM realm console..."
   _kc_admin_roles
 
-  info "Configuring the forward-auth client (acr, groups, redirect URIs)..."
+  info "Configuring the forward-auth client (acr, PKCE S256, groups, redirect URIs)..."
   fwd_uuid="$(kc_get "/$KC_REALM/clients?clientId=portcullis-forward-auth" | jq -r '.[0].id // empty')"
   if [ -n "$fwd_uuid" ]; then
     # The realm export ships a placeholder host so Keycloak's URL parser
@@ -693,7 +693,9 @@ API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
   - checks AMR reference values, ensures the amr mapper and groups scope
   - ensures the email-unverified scope (email claim, no email_verified) that
     Hub templates opt into with keycloak_clients[].email_verified_claim: false
-  - sets acr/groups scopes and the redirect URI on portcullis-forward-auth
+  - portcullis-forward-auth: acr/groups scopes, requires PKCE S256, the
+    auth.<domain> callback (keeps the Hub's extra-domain callbacks), and the
+    portcullis-invite-client scope (setup links work only through it)
   - creates a credential-less `testuser`, applies PORTAL_DISPLAY_NAME branding
 
 Options:

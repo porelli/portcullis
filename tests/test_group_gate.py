@@ -47,6 +47,11 @@ def write_policy(doc, raw=False, malformed=False):
     # be well-formed unless the test says it is about a broken file.
     if isinstance(doc, dict) and not raw and not malformed:
         err = gg.validate_policy_doc(doc)
+        if err is None:
+            try:
+                gg.expiring_entries(doc)  # `expiring` is checked per request
+            except gg.PolicyError as e:
+                err = str(e)
         assert err is None, f"test policy is malformed ({err}); pass malformed=True if intended"
     if doc is None:
         if os.path.exists(POLICY):
@@ -1036,8 +1041,11 @@ class PolicyExpiringTest(GateTest):
                     [{"user": "bob", "group": "b", "at": 1}], [{"user": "", "group": "b", "at": FUTURE}],
                     [{"user": "bob", "group": "b", "at": FUTURE, "extra": 1}]):
             with self.subTest(expiring=exp):
-                write_policy({"version": 5, "expiring": exp})
+                write_policy({"version": 5, "expiring": exp}, malformed=True)
                 self.assertEqual(self.req("random.example.com", groups="a"), 403)
+        # Positive control: a well-formed `expiring` allows the same request.
+        write_policy({"version": 5, "expiring": [{"user": "bob", "group": "b", "at": FUTURE}]})
+        self.assertEqual(self.req("random.example.com", groups="a"), 200)
 
     def test_star_any_signed_in(self):
         self.assertEqual(gg.load_static_map().get("people"), "*")
