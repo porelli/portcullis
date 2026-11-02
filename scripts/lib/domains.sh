@@ -124,18 +124,19 @@ domains_age_keygen() {
 }
 
 # domains_public_ips — the server's public IPv4 / IPv6 for the domains
-# service's A/AAAA records (contract §12.1), detected as `dns setup` does
-# unless PORTCULLIS_PUBLIC_IPV4 / _IPV6 are set (environment or .env).
+# service's A/AAAA records (contract §12.1). An explicit
+# PORTCULLIS_PUBLIC_IPV4 / _IPV6 (environment or .env; an empty _IPV6 =
+# no IPv6) always wins; otherwise public_ip_detect (HTTPS, two services
+# must agree, global unicast only). No address = the service publishes no
+# record and reports why in the domain's last error (fail closed).
 domains_public_ips() {
   local v4="${PORTCULLIS_PUBLIC_IPV4:-}" v6="${PORTCULLIS_PUBLIC_IPV6:-}"
   if [ -z "$v4" ]; then
-    v4="$(curl -4 -sf --max-time 5 ifconfig.me || curl -4 -sf --max-time 5 icanhazip.com || curl -4 -sf --max-time 5 api.ipify.org || true)"
-    [[ "$v4" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || v4=""
-    [ -n "$v4" ] || warn "Could not detect the public IPv4: enrolled domains get no records until it is known (set PORTCULLIS_PUBLIC_IPV4 in .env)."
+    v4="$(public_ip_detect 4)"
+    [ -n "$v4" ] || warn "Could not detect the public IPv4 reliably (two HTTPS services must agree on a global address): enrolled domains get no records until it is known — set PORTCULLIS_PUBLIC_IPV4 in .env."
   fi
-  if [ -z "${PORTCULLIS_PUBLIC_IPV6+x}" ] && [ -z "$v6" ]; then
-    v6="$(curl -6 -sf --max-time 5 ifconfig.me || curl -6 -sf --max-time 5 icanhazip.com || true)"
-    [[ "$v6" =~ ^[0-9A-Fa-f:]+$ ]] || v6=""
+  if [ -z "${PORTCULLIS_PUBLIC_IPV6+x}" ]; then
+    v6="$(public_ip_detect 6)"
   fi
   export PORTCULLIS_PUBLIC_IPV4="$v4" PORTCULLIS_PUBLIC_IPV6="$v6"
 }

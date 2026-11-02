@@ -136,3 +136,61 @@ network_check() {
        ./portcullis down && ./portcullis up recreates it."
   fi
 }
+
+# ── Public address detection (dns setup, the domains service's records) ──
+#
+# The detected address becomes A/AAAA records, so detection fails closed:
+# HTTPS only (TLS ≥ 1.2, no redirects to http), at least two independent
+# services must answer and all answers must agree, and the address must be
+# global unicast. Anything else prints nothing (and the caller publishes no
+# record). An explicit PORTCULLIS_PUBLIC_IPV4 / _IPV6 always wins (callers).
+PUBLIC_IP_SERVICES_4="https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip"
+PUBLIC_IP_SERVICES_6="https://api6.ipify.org https://ipv6.icanhazip.com https://ifconfig.me/ip"
+
+# ipv4_is_global <a.b.c.d> — not private, shared, loopback, link-local,
+# documentation, benchmark, multicast or reserved.
+ipv4_is_global() {
+  local n c
+  n="$(ip_to_int "$1")" || return 1
+  for c in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.0.0.0/24 \
+           192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4; do
+    ! cidr_contains "$c" "$1" || return 1
+  done
+}
+
+# ipv6_is_global <addr> — inside 2000::/3 (global unicast), outside the
+# IANA special-purpose 2001::/23 (Teredo, benchmarking, ORCHID, ...) and
+# documentation 2001:db8::/32.
+ipv6_is_global() {
+  local ip h1 rest h2 v
+  ip="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [[ "$ip" =~ ^[0-9a-f:]+$ ]] && [[ "$ip" == *:* ]] && [ "${#ip}" -le 39 ] || return 1
+  [[ "$ip" != *:::* ]] || return 1
+  case "$ip" in *::*::*) return 1 ;; esac
+  h1="${ip%%:*}"; rest="${ip#*:}"; h2="${rest%%:*}"
+  [ -n "$h1" ] && [ "${#h1}" -le 4 ] || return 1
+  v=$(( 16#$h1 ))
+  [ $(( v & 0xE000 )) -eq $(( 0x2000 )) ] || return 1
+  # 3fff::/20 documentation (RFC 9637).
+  [ "$v" -ne $(( 0x3fff )) ] || return 1
+  if [ "$v" -eq $(( 0x2001 )) ]; then
+    [ -n "$h2" ] || return 1
+    [ $(( 16#$h2 )) -ge $(( 0x200 )) ] || return 1
+    [ $(( 16#$h2 )) -ne $(( 0xdb8 )) ] || return 1
+  fi
+}
+
+# public_ip_detect <4|6> — the host's public address, or nothing.
+public_ip_detect() {
+  local fam="$1" svc out got="" n=0 services
+  if [ "$fam" = 4 ]; then services="$PUBLIC_IP_SERVICES_4"; else services="$PUBLIC_IP_SERVICES_6"; fi
+  for svc in $services; do
+    out="$(curl "-$fam" --proto '=https' --tlsv1.2 -sf --max-time 5 "$svc" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" || continue
+    [ -n "$out" ] || continue
+    if [ "$fam" = 4 ]; then ipv4_is_global "$out" || return 0; else ipv6_is_global "$out" || return 0; fi
+    if [ -z "$got" ]; then got="$out"; elif [ "$got" != "$out" ]; then return 0; fi
+    n=$((n + 1))
+  done
+  [ "$n" -ge 2 ] || return 0
+  printf '%s' "$got"
+}

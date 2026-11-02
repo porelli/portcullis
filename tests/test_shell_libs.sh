@@ -501,6 +501,48 @@ dom domains_prepare >/dev/null 2>&1
 expect_eq "domains: re-run keeps the CA and age key (no keygen)" "$(openssl x509 -noout -serial -in "$E/ca.crt") $(grep -c keygen "$STUB_DIR/dom-calls")" "$CA1 0"
 expect_eq "domains: public IPs exported for compose" "$(dom eval 'domains_public_ips; echo "$PORTCULLIS_PUBLIC_IPV4/$PORTCULLIS_PUBLIC_IPV6"')" "203.0.113.9/"
 
+# ── public address detection (network.sh public_ip_detect; dns setup + domains) ──
+mkdir -p "$WORK/ipbin" "$STUB_DIR/ip"
+cat > "$WORK/ipbin/curl" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/ip-calls"
+url="${*: -1}"
+f="$STUB_DIR/ip/$(printf '%s' "$url" | tr -c 'A-Za-z0-9' '_')"
+[ -f "$f" ] || exit 22
+cat "$f"
+STUB
+chmod +x "$WORK/ipbin/curl"
+ipans() { rm -f "$STUB_DIR"/ip/*; while [ $# -gt 0 ]; do printf '%s\n' "$2" > "$STUB_DIR/ip/$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; shift 2; done; }
+detect() { (PATH="$WORK/ipbin:$PATH"; public_ip_detect "$1"); }
+ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.7 https://ifconfig.me/ip 198.51.99.7
+expect_eq "public ip: three HTTPS services agree" "$(detect 4)" 198.51.99.7
+expect_ok "public ip: HTTPS only, TLS >= 1.2" sh -c "grep -q -- \"--proto =https --tlsv1.2\" '$STUB_DIR/ip-calls' && ! grep -q 'http://' '$STUB_DIR/ip-calls'"
+ipans https://api.ipify.org 198.51.99.7 https://ifconfig.me/ip 198.51.99.7
+expect_eq "public ip: two agreeing answers suffice" "$(detect 4)" 198.51.99.7
+ipans https://api.ipify.org 198.51.99.7
+expect_eq "public ip: one answer is not enough" "$(detect 4)" ""
+ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.8 https://ifconfig.me/ip 198.51.99.7
+expect_eq "public ip: disagreement = nothing (fail closed)" "$(detect 4)" ""
+for bad in 10.1.2.3 192.168.1.1 172.20.0.1 127.0.0.1 169.254.1.1 100.64.0.1 0.1.2.3 224.0.0.1 255.255.255.255 203.0.113.5 999.1.1.1 '<html>'; do
+  ipans https://api.ipify.org "$bad" https://ipv4.icanhazip.com "$bad"
+  expect_eq "public ip: refuses $bad" "$(detect 4)" ""
+done
+ipans https://api6.ipify.org 2a01:4f8:c0c:1::1 https://ipv6.icanhazip.com 2A01:4F8:C0C:1::1
+expect_eq "public ip v6: agree (case-insensitive)" "$(detect 6)" 2a01:4f8:c0c:1::1
+ipans https://api6.ipify.org 2a01:4f8:c0c:1::1 https://ipv6.icanhazip.com 2a01:4f8:c0c:1::1
+expect_eq "public ip v6: agree" "$(detect 6)" 2a01:4f8:c0c:1::1
+for bad in ::1 fe80::1 fd00::1 2001:db8::1 2001::1 ff02::1 '::ffff:1.2.3.4' 3fff:: '1.2.3.4'; do
+  ipans https://api6.ipify.org "$bad" https://ipv6.icanhazip.com "$bad"
+  expect_eq "public ip v6: refuses $bad" "$(detect 6)" ""
+done
+# The domains service: explicit values win; failed detection publishes nothing.
+pubips() { (PATH="$WORK/ipbin:$PATH"; "$@"; domains_public_ips 2>/dev/null; echo "$PORTCULLIS_PUBLIC_IPV4/$PORTCULLIS_PUBLIC_IPV6"); }
+ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.9
+expect_eq "domains: no agreed IPv4 = none (no records)" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "/"
+expect_eq "domains: explicit IPv4 wins over detection" "$(pubips export PORTCULLIS_PUBLIC_IPV4=203.0.113.9 PORTCULLIS_PUBLIC_IPV6=)" "203.0.113.9/"
+ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.7 https://api6.ipify.org 2a01:4f8::5 https://ipv6.icanhazip.com 2a01:4f8::5
+expect_eq "domains: detected IPv4 + IPv6" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

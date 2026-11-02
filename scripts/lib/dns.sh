@@ -116,9 +116,11 @@ dns_setup() {
   provider="${DNS_PROVIDER:-none}"
 
   info "Detecting public IP..."
-  ip4="$(curl -4 -sf --max-time 10 ifconfig.me || curl -4 -sf --max-time 10 icanhazip.com || curl -4 -sf --max-time 10 api.ipify.org || true)"
-  [ -n "$ip4" ] || fail "Could not detect the public IPv4 address"
-  ip6="$(curl -6 -sf --max-time 10 ifconfig.me || curl -6 -sf --max-time 10 icanhazip.com || true)"
+  # An explicit PORTCULLIS_PUBLIC_IPV4 / _IPV6 wins; else HTTPS detection
+  # where two services must agree on a global address (public_ip_detect).
+  ip4="${PORTCULLIS_PUBLIC_IPV4:-$(public_ip_detect 4)}"
+  [ -n "$ip4" ] || fail "Could not detect the public IPv4 address reliably (two HTTPS services must agree on a global address); set PORTCULLIS_PUBLIC_IPV4 in .env"
+  if [ -n "${PORTCULLIS_PUBLIC_IPV6+x}" ]; then ip6="$PORTCULLIS_PUBLIC_IPV6"; else ip6="$(public_ip_detect 6)"; fi
   ok "Public IPv4: $ip4${ip6:+, IPv6: $ip6}"
 
   if [ "$check_only" = true ]; then
