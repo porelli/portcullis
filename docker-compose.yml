@@ -120,6 +120,10 @@ services:
       VERSION: "1"
       PING: "1"
       ALLOW_LOGS: "1"
+      # The Hub's instance backups / restores copy volumes through the
+      # archive endpoints of never-started helper containers (contract §6;
+      # the proxy denies /containers/{id}/archive without it).
+      ALLOW_ARCHIVE: "1"
       POST: "1"
       DISABLE_IPV6: "1"
       LOG_LEVEL: warning

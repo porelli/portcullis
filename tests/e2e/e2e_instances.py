@@ -159,9 +159,11 @@ def main() -> int:
             assert (key.asserted, key.registered) == before, \
                 f"WebAuthn prompts on the extra domain: assertions {before[0]}→{key.asserted}"
             # Sign-in went through forward-auth-ext on the host itself:
-            # /oauth2/start there, Keycloak with the host's callback + PKCE.
-            starts = traffic.matching(r"^" + re.escape(ECHO_A) + r"/oauth2/start")
-            assert len(starts) == 1, f"/oauth2/start on echo-a: {starts}"
+            # Keycloak with the host's callback + PKCE, one callback on the
+            # host, nothing through auth.<main domain>'s oauth2-proxy.
+            cbs = traffic.matching(r"^" + re.escape(ECHO_A) + r"/oauth2/callback\?")
+            assert len(cbs) == 1, f"callbacks on echo-a: {cbs}"
+            assert not traffic.matching(re.escape(AUTH) + r"/oauth2/"), "sign-in went through auth.<main domain>"
             authz = traffic.matching(re.escape(AUTH) + r"/realms/portcullis/protocol/openid-connect/auth\?")
             assert authz, f"no Keycloak authorize request: {traffic.urls}"
             q = urllib.parse.parse_qs(urllib.parse.urlsplit(authz[0]).query)
@@ -188,8 +190,8 @@ def main() -> int:
             code = settle(page, ECHO_A + "/", seconds=30)
             base.shot(page, "inst-echo-a-stale")
             assert code == 200 and "Hostname" in page.inner_text("body"), f"HTTP {code}"
-            starts = traffic.matching(r"/oauth2/start")
-            assert len(starts) <= 1, f"redirect loop: {len(starts)} sign-in starts: {starts}"
+            rounds = traffic.matching(r"/oauth2/callback\?")
+            assert len(rounds) <= 1, f"redirect loop: {len(rounds)} sign-in rounds: {rounds}"
             assert key.asserted == before, "a stale cookie cost a WebAuthn assertion"
             fresh = [c for c in ctx.cookies([ECHO_A]) if c["name"].startswith(EXT_COOKIE)]
             assert fresh and all(c["value"] != "stale|1700000000|AAAA" for c in fresh), "stale cookie kept"
