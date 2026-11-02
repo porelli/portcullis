@@ -6,6 +6,15 @@
 #
 # It never checks out or runs PR code: every fact comes from the GitHub API.
 #
+# Threat model: Dependabot PRs come from a branch in this repo, and only
+# accounts with write access can push to it — they can already push to main.
+# So the provenance checks (author, web-flow committer + signature, one
+# commit, timeline pushes by dependabot[bot] only) are not a trust boundary
+# against collaborators; they keep a PR that someone (or some automation)
+# also pushed to from being merged as if it were Dependabot's own, untested
+# by a human. Forks are refused outright. The real boundary is that nothing
+# here runs PR code and the merge is pinned to the tested SHA.
+#
 #   decide    read the PR, its head commit and the required workflow runs and
 #             print one JSON decision (also written to $GITHUB_OUTPUT)
 #   pr        act on the PR (merge / label major / close pre-release);
@@ -42,6 +51,7 @@
 set -euo pipefail
 
 BOT='dependabot[bot]'
+BOT_EMAIL='49699333+dependabot[bot]@users.noreply.github.com'
 BASE_BRANCH=${BASE_BRANCH:-main}
 MAJOR_LABEL=major-update
 FAILED_LABEL=update-failed
@@ -128,7 +138,7 @@ skip() { # action reason [pr sha]
 
 decide() {
   : "${REPO:?}" "${REQUIRED_WORKFLOWS:?}"
-  local run sha branch pr_json pr commits msg files runs
+  local run sha branch pr_json pr commits timeline msg files runs
   if [ -n "${RUN_ID:-}" ]; then
     [[ $RUN_ID =~ ^[0-9]+$ ]] || die "RUN_ID must be a number"
     run=$(api "repos/$REPO/actions/runs/$RUN_ID")
@@ -184,6 +194,20 @@ decide() {
                    then "signature \(.commit.verification.verified)/\(.commit.verification.reason // "?")" else empty end)
                 ] | join(", ") end' <<<"$commits")
   [ -z "$got" ] || skip refuse "PR #$pr is not a single GitHub-signed $BOT commit ($got)" "$pr" "$sha"
+  # The commit fields can still be set by anyone with write access (API / web
+  # commits are signed by web-flow with any author), so also read who pushed:
+  # every push to the branch in the PR timeline must be Dependabot's. An
+  # unreadable timeline refuses (fail closed).
+  timeline=$(api --paginate "repos/$REPO/issues/$pr/timeline?per_page=100" | jq -sc 'add // []') \
+    || skip refuse "PR #$pr timeline unreadable (fail closed)" "$pr" "$sha"
+  got=$(jq -r --arg bot "$BOT" --arg email "$BOT_EMAIL" '
+    [.[] | select(
+       ((.event | IN("head_ref_force_pushed", "head_ref_restored")) and .actor.login != $bot)
+       or (.event == "committed" and (.author.email != $email or .committer.email != "noreply@github.com")))
+     | if .event == "committed" then "commit \(.sha[0:12] // "?") by \(.author.email // "?")/\(.committer.email // "?")"
+       else "\(.event) by \(.actor.login // "?")" end] | join(", ")' <<<"$timeline") \
+    || skip refuse "PR #$pr timeline unparseable (fail closed)" "$pr" "$sha"
+  [ -z "$got" ] || skip refuse "PR #$pr has pushes that aren't Dependabot's ($got)" "$pr" "$sha"
   msg=$(jq -r '.[0].commit.message' <<<"$commits")
 
   # ── What changed: dependencies, jumps, update type, app ──
