@@ -37,11 +37,17 @@ gg = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gg)
 
 
-def write_policy(doc, raw=False):
+def write_policy(doc, raw=False, malformed=False):
     # Only version 5 is served: a dict without "version" gets 5 unless the
     # test is about the version itself (raw=True).
     if isinstance(doc, dict) and not raw and "version" not in doc:
         doc = dict(doc, version=5)
+    # A file-level malformed document denies every request, so a test
+    # expecting a deny would pass for the wrong reason: every document must
+    # be well-formed unless the test says it is about a broken file.
+    if isinstance(doc, dict) and not raw and not malformed:
+        err = gg.validate_policy_doc(doc)
+        assert err is None, f"test policy is malformed ({err}); pass malformed=True if intended"
     if doc is None:
         if os.path.exists(POLICY):
             os.remove(POLICY)
@@ -284,7 +290,7 @@ class GateTest(unittest.TestCase):
         # Expired temporary memberships don't list their apps.
         write_policy({"version": 5, "expiring": [{"user": "bob", "group": "users_secret", "at": "2020-01-01T00:00:00Z"}]})
         self.assertNotIn("Secret", self.portal("lldap_admin, users_secret", doc))
-        write_policy({"version": 4})
+        write_policy({"version": 4}, malformed=True)
         self.assertNotIn("Secret", self.portal("users_secret", doc))
         write_policy(None)
         self.assertIn("not available", self.portal("users_wiki", {"version": 2, "apps": doc["apps"]}))
@@ -342,14 +348,17 @@ class GateTest(unittest.TestCase):
     # ── reserved deny group (contract §4) ──
 
     def test_deny_sentinel_group_denies_everyone(self):
-        write_policy({"groups": {"ghost": gg.DENY_GROUP}})
+        write_policy({"groups": {"ghost.example.com": gg.DENY_GROUP, "ok.example.com": "users_ok"}})
         for groups in ("", "users_ghost", "lldap_admin", "users_ghost,lldap_admin"):
             with self.subTest(groups=groups):
                 self.assertEqual(self.req("ghost.example.com", groups=groups), 403)
+        # Positive control: the same file allows another host (not a broken file).
+        self.assertEqual(self.req("ok.example.com", groups="users_ok"), 200)
 
     def test_deny_sentinel_cannot_be_satisfied_by_membership(self):
-        write_policy({"groups": {"ghost": gg.DENY_GROUP}})
+        write_policy({"groups": {"ghost.example.com": gg.DENY_GROUP, "ok.example.com": "users_ok"}})
         self.assertEqual(self.req("ghost.example.com", groups=gg.DENY_GROUP), 403)
+        self.assertEqual(self.req("ok.example.com", groups="users_ok"), 200)
 
     def test_user_claiming_deny_group_is_denied_everywhere(self):
         for host in ("random.example.com", "grafana.example.com", "hub.example.com"):
@@ -371,7 +380,8 @@ class GateTest(unittest.TestCase):
         for doc, want in [({"version": 5}, 200), (None, 200), ({}, 403), ({"groups": {}}, 403),
                           ({"version": 4}, 403), ({"version": 3}, 403), ({"version": 2}, 403),
                           ({"version": 1}, 403), ({"version": 6}, 403), ({"version": "5"}, 403),
-                          ({"version": True}, 403), ({"version": 0}, 403)]:
+                          ({"version": True}, 403), ({"version": 0}, 403), ({"version": 5.0}, 403),
+                          ('{"version": 5.0}', 403), ('{"version": 5e0}', 403)]:
             with self.subTest(doc=doc):
                 write_policy(doc, raw=True)
                 self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), want)
@@ -515,7 +525,7 @@ class PolicyV5Test(GateTest):
                       ["team-b.example.org."], ["example.com"], ["com"], ["hub.example.com"],
                       ["x.hub.example.com"], [None]):
             with self.subTest(extra=extra):
-                write_policy({"extra_domains": extra})
+                write_policy({"extra_domains": extra}, malformed=True)
                 self.assertEqual(self.req("random.example.com", groups=""), 403)
         # An enrolled subdomain of the main domain is fine, and its hosts are
         # extra-domain hosts (contract §5).
@@ -690,7 +700,7 @@ class PathGroupsTest(GateTest):
                    {"vw.example.com": [{"prefix": "/a", "group": ""}]}, {"vw.example.com": ["x"]},
                    {"vw.example.com": [{"prefix": "/a/../b", "group": "g"}]}, {"vw.example.com": [{"prefix": "/%61", "group": "g"}]}):
             with self.subTest(pg=pg):
-                write_policy({"groups": {"vw.example.com": "users_vw"}, "path_groups": pg})
+                write_policy({"groups": {"vw.example.com": "users_vw"}, "path_groups": pg}, malformed=not isinstance(pg, dict))
                 self.assertEqual(self.req("vw.example.com", groups="users_vw", uri="/"), 403)
 
     def test_key_that_is_not_a_valid_hostname_denies(self):
@@ -701,7 +711,7 @@ class PathGroupsTest(GateTest):
                 with self.subTest(key=key, map=m):
                     val = {"path_groups": [{"prefix": "/admin", "group": "admin_vw"}], "groups": "users_vw",
                            "policies": {"factors": []}, "public_paths": {"paths": [{"path": "/s", "match": "prefix"}]}}[m]
-                    write_policy({m: {key: val}})
+                    write_policy({m: {key: val}}, malformed=True)
                     self.assertEqual(self.req("vw.example.com", groups="users_vw,admin_vw", uri="/"), 403)
                     self.assertEqual(self.req("random.example.com", groups=""), 403)
 
@@ -862,6 +872,7 @@ class PublicGuardTest(GateTest):
         for doc in [None, {}, {"version": 3, "public_paths": PUBLIC_DOC["public_paths"]},
                     {"version": 4, "public_paths": PUBLIC_DOC["public_paths"]},
                     {"version": 4, "public_paths": {"cloud": PUBLIC_DOC["public_paths"]["cloud.example.com"]}},
+                    dict(PUBLIC_DOC, version=5.0), '{"version": 5.0, "public_paths": %s}' % json.dumps(PUBLIC_DOC["public_paths"]),
                     {"public_paths": PUBLIC_DOC["public_paths"]}, {"version": 5},
                     {"version": 5, "public_paths": []},
                     {"version": 5, "public_paths": {"cloud.example.com": {"paths": [{"path": "/s", "match": "prefix"}], "extra": 1}}},
@@ -943,7 +954,7 @@ class PolicyExpiringTest(GateTest):
                     {"version": 4, "groups": {"grafana.example.com": "users_grafana"}},
                     {"version": 3}, {"version": 3, "groups": {"grafana.example.com": "users_grafana"}}):
             with self.subTest(doc=doc):
-                write_policy(doc)
+                write_policy(doc, malformed=True)
                 self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), 403)
                 self.assertEqual(self.req("random.example.com", groups=""), 403)
         write_policy({"version": 5})
@@ -1158,7 +1169,7 @@ class PolicyExpiringTest(GateTest):
         status, hdrs = self.req("cloud.example.com", uri="/s/AbC123", gate_path="/public-guard", want_headers=True)
         self.assertEqual(status, 200)
         self.assertFalse([k for k in hdrs if k.lower().startswith("x-forwarded-attr-")])
-        write_policy(dict(PUBLIC_DOC, version=4))
+        write_policy(dict(PUBLIC_DOC, version=4), malformed=True)
         self.assertEqual(self.req("cloud.example.com", uri="/s/AbC123", gate_path="/public-guard"), 403)
 
 

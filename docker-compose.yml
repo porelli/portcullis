@@ -202,12 +202,6 @@ services:
       - "443:443"
     volumes:
       - ./traefik/dynamic:/etc/traefik/dynamic:ro
-      # Enrolled domains' wildcard certificates + certs.yml, written by the
-      # domains service (contract §12.4). The file provider loads
-      # subdirectories but watches only the top directory: traefik-certs-reload
-      # sends Traefik SIGHUP when certs.yml changes. The mountpoint exists in
-      # the repo (traefik/dynamic/domains/.gitkeep): the bind above is read-only.
-      - domains_certs:/etc/traefik/dynamic/domains:ro
       - ./certs:/certs:ro
       - traefik_acme:/acme
     networks:
@@ -239,46 +233,6 @@ services:
       traefik.http.routers.dashboard.tls.options: authaware@file
       traefik.http.routers.dashboard.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.routers.dashboard.service: api@internal
-    restart: unless-stopped
-
-  # Traefik's file provider watches /etc/traefik/dynamic and its top-level
-  # files only (fsnotify is not recursive; traefik v3 pkg/provider/file):
-  # a new certs.yml in the domains_certs volume (an enrolled domain's
-  # certificate issued, renewed or removed) would be ignored until the next
-  # restart. This sidecar polls its checksum and sends Traefik SIGHUP, on
-  # which the file provider rebuilds its configuration (hitless). It shares
-  # Traefik's PID namespace for that (root, like Traefik: same uid, so no
-  # CAP_KILL), has no network and only the volume, read-only. If Traefik is
-  # restarted the namespace is gone: pidof fails, the sidecar exits and its
-  # restart policy joins the new one.
-  traefik-certs-reload:
-    image: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
-    <<: *hardening
-    read_only: true
-    network_mode: none
-    pid: "service:traefik"
-    volumes:
-      - domains_certs:/watch:ro
-    command:
-      - /bin/sh
-      - -c
-      - |
-        set -u
-        sum() { sha256sum /watch/certs.yml 2>/dev/null || echo none; }
-        last="$$(sum)"
-        while sleep 10; do
-          pid="$$(pidof traefik)" || { echo "traefik-certs-reload: no traefik process (restarted?), exiting"; exit 1; }
-          cur="$$(sum)"
-          if [ "$$cur" != "$$last" ]; then
-            kill -HUP $$pid && last="$$cur" && echo "traefik-certs-reload: certs.yml changed, sent SIGHUP to traefik ($$pid)"
-          fi
-        done
-    mem_limit: 16m
-    pids_limit: 16
-    depends_on:
-      traefik:
-        condition: service_healthy
-        restart: true
     restart: unless-stopped
 
   postgres:
@@ -600,8 +554,8 @@ services:
   # to another domain. Same Keycloak client, provider config and cookie
   # secret; the callback is relative (oauth2-proxy builds
   # https://<request host>/oauth2/callback from X-Forwarded-Host, trusted
-  # from Traefik only), the cookie is host-only and named _portcullis_ext
-  # (a host under an enrolled subdomain of the main domain also receives
+  # from Traefik only), the cookie is host-only and named
+  # __Host-portcullis_ext (a host under an enrolled subdomain of the main domain also receives
   # forward-auth's .<domain> cookie). No whitelist: every redirect it
   # accepts is relative, so it lands on the same host. Its routers
   # (Host(`<host>`) && PathPrefix(`/oauth2/`), service forward-auth-ext) are
@@ -620,7 +574,13 @@ services:
       PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
       FORWARD_AUTH_CLIENT_SECRET: ${FORWARD_AUTH_CLIENT_SECRET:?FORWARD_AUTH_CLIENT_SECRET is not set — run ./portcullis init}
       OAUTH2_PROXY_COOKIE_SECRET: ${FORWARD_AUTH_COOKIE_SECRET:?FORWARD_AUTH_COOKIE_SECRET is not set — run ./portcullis init}
-      OAUTH2_PROXY_COOKIE_NAME: _portcullis_ext
+      # __Host- prefix: browsers accept it only Secure, without Domain and
+      # with Path=/ (exactly what this service sets: no COOKIE_DOMAINS),
+      # so neither a sibling host nor plain http can plant or widen it.
+      # The CSRF and split-session cookies inherit the prefix.
+      OAUTH2_PROXY_COOKIE_NAME: __Host-portcullis_ext
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      OAUTH2_PROXY_COOKIE_PATH: /
       OAUTH2_PROXY_COOKIE_SAMESITE: lax
       OAUTH2_PROXY_COOKIE_REFRESH: 1m
       OAUTH2_PROXY_EMAIL_DOMAINS: "*"
@@ -1104,9 +1064,6 @@ volumes:
   lldap_data:
   hub_data:
   traefik_acme:
-  # Enrolled domains' certificates (contract §12.1): written by the domains
-  # service, read-only in Traefik and traefik-certs-reload.
-  domains_certs:
   prometheus_data:
   alertmanager_data:
   grafana_data:

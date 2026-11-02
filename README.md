@@ -252,7 +252,7 @@ cd .. && git pull && ./portcullis upgrade
 |-------------------|--------------------|-----------|
 | Secrets, domain, DNS provider | `.env` | Symlinked to project root |
 | Compose overrides (ports, volumes, limits) | `docker-compose.override.yml` | Docker Compose auto-merges |
-| Custom Traefik routers/middlewares | `traefik/*.yml` | Symlinked into `traefik/dynamic/local/`, hot-reloaded |
+| Custom Traefik routers/middlewares | `traefik/*.yml` | Symlinked into `traefik/dynamic/local/`; loaded when Traefik (re)builds its file configuration — Traefik watches only `traefik/dynamic/` itself, not subdirectories, so apply a change with `docker compose restart traefik` |
 
 Enabled apps and template sources are Hub state (in the `hub_data` volume), managed in the Hub UI.
 

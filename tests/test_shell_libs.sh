@@ -429,8 +429,8 @@ F1="$(printf '%s' "$FWD" | _kc_fwd_patch ex.org)"
 expect_eq "keycloak configure: forward-auth redirect URIs = main callback + extra-domain callbacks" \
   "$(printf '%s' "$F1" | jq -c .redirectUris)" \
   '["https://auth.ex.org/oauth2/callback","https://grafana.team-b.example.org/oauth2/callback","https://x.team-b.example.org/oauth2/callback"]'
-expect_eq "keycloak configure: forward-auth acr default + scopes kept" \
-  "$(printf '%s' "$F1" | jq -c '[.attributes, .defaultClientScopes]')" '[{"x":"1","default.acr.values":"pwd"},["acr","groups"]]'
+expect_eq "keycloak configure: forward-auth acr default, PKCE S256 required, scopes kept" \
+  "$(printf '%s' "$F1" | jq -c '[.attributes, .defaultClientScopes]')" '[{"x":"1","default.acr.values":"pwd","pkce.code.challenge.method":"S256"},["acr","groups"]]'
 expect_eq "keycloak configure: forward-auth patch idempotent" "$(printf '%s' "$F1" | _kc_fwd_patch ex.org | jq -cS .)" "$(printf '%s' "$F1" | jq -cS .)"
 expect_eq "keycloak configure: placeholder kept when it is the domain" \
   "$(printf '%s' "$FWD" | _kc_fwd_patch portcullis.local | jq -c '.redirectUris[0:1]')" '["https://auth.portcullis.local/oauth2/callback"]'

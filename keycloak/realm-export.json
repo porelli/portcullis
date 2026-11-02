@@ -566,7 +566,8 @@
         "+"
       ],
       "attributes": {
-        "default.acr.values": "pwd"
+        "default.acr.values": "pwd",
+        "pkce.code.challenge.method": "S256"
       }
     }
   ],

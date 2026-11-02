@@ -76,15 +76,19 @@ _kc_ldap_patch() {
 }
 
 # _kc_fwd_patch <domain>: the portcullis-forward-auth client (JSON on stdin)
-# as `keycloak configure` wants it: default acr, the acr scope, and the
-# redirect URIs = https://auth.<domain>/oauth2/callback plus every
-# https://<valid hostname>/oauth2/callback already there — the Hub keeps one
-# per extra-domain host (forward-auth-ext, contract §5) and adds / removes
-# only those, so configure must not drop them. The realm export's
+# as `keycloak configure` wants it: default acr, PKCE S256 required (both
+# oauth2-proxy services send it, oauth2-proxy/alpha.yaml: an authorization
+# code sent to a stale or foreign callback is useless without the
+# verifier), the acr scope, and the redirect URIs =
+# https://auth.<domain>/oauth2/callback plus every
+# https://<valid hostname>/oauth2/callback already there. The Hub keeps one
+# per extra-domain host (forward-auth-ext, contract §5) and OWNS pruning
+# them (instance disable/delete, hostname changes): configure can't tell a
+# current one from a stale one, so it keeps them all. The realm export's
 # placeholder host is dropped.
 _kc_fwd_patch() {
   jq --arg d "$1" '
-    .attributes = ((.attributes // {}) + {"default.acr.values": "pwd"}) |
+    .attributes = ((.attributes // {}) + {"default.acr.values": "pwd", "pkce.code.challenge.method": "S256"}) |
     .defaultClientScopes = ((.defaultClientScopes // []) + ["acr"] | unique) |
     .redirectUris = (["https://auth." + $d + "/oauth2/callback"]
       + [(.redirectUris // [])[] | strings

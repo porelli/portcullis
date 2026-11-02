@@ -188,7 +188,7 @@ jobs:
               | split(",") | index("Authorization") and index("X-Forwarded-Access-Token")' >/dev/null \
             || { echo "FAIL: portcullis-groups does not list Authorization / X-Forwarded-Access-Token"; exit 1; }
           # Contract §5 "Extra-domain hosts": forward-auth-ext = forward-auth
-          # with a relative callback and a host-only _portcullis_ext cookie;
+          # with a relative callback and a host-only __Host-portcullis_ext cookie;
           # portcullis-auth-ext strips exactly what portcullis-auth strips.
           echo "$CFG" | jq -e '.services["forward-auth"] as $m | .services["forward-auth-ext"] as $x
               | ($m.labels | with_entries(select(.key | startswith("traefik.http.middlewares.portcullis-auth.forwardauth.")) | .key |= sub("portcullis-auth"; "portcullis-auth-ext")) | del(.["traefik.http.middlewares.portcullis-auth-ext.forwardauth.address"])) as $want
@@ -197,7 +197,8 @@ jobs:
               and ($want | to_entries | all(. as $e | $x.labels[$e.key] == $e.value))
               and ([$x.labels | keys[] | select(test("^traefik\\.http\\.routers\\."))] == [])
               and $x.environment.OAUTH2_PROXY_REDIRECT_URL == "/oauth2/callback"
-              and $x.environment.OAUTH2_PROXY_COOKIE_NAME == "_portcullis_ext"
+              and $x.environment.OAUTH2_PROXY_COOKIE_NAME == "__Host-portcullis_ext"
+              and $x.environment.OAUTH2_PROXY_COOKIE_SECURE == "true" and $x.environment.OAUTH2_PROXY_COOKIE_PATH == "/"
               and ($x.environment.OAUTH2_PROXY_COOKIE_DOMAINS // null) == null
               and ($x.environment.OAUTH2_PROXY_WHITELIST_DOMAINS // null) == null
               and $x.environment.OAUTH2_PROXY_COOKIE_SECRET == $m.environment.OAUTH2_PROXY_COOKIE_SECRET
@@ -206,16 +207,7 @@ jobs:
               and $x.environment.OAUTH2_PROXY_COOKIE_REFRESH == "1m"
               and ($x.environment.OAUTH2_PROXY_COOKIE_EXPIRE // null) == null' >/dev/null \
             || { echo "FAIL: forward-auth-ext / portcullis-auth-ext wiring (contract §5)"; exit 1; }
-          # Enrolled-domain certificates (contract §12.1): read-only in Traefik
-          # under its file provider; the reload sidecar sees only the volume.
-          echo "$CFG" | jq -e '([.services.traefik.volumes[] | select(.source == "domains_certs")] == [{"type": "volume", "source": "domains_certs", "target": "/etc/traefik/dynamic/domains", "read_only": true, "volume": {}}])
-              and .services["traefik-certs-reload"].network_mode == "none"
-              and .services["traefik-certs-reload"].pid == "service:traefik"
-              and .services["traefik-certs-reload"].read_only == true
-              and ([.services["traefik-certs-reload"].volumes[] | [.source, .target, .read_only]] == [["domains_certs", "/watch", true]])
-              and ([.services | to_entries[] | select([.value.volumes[]?.source] | index("domains_certs")) | .key] | sort == ["traefik", "traefik-certs-reload"])' >/dev/null \
-            || { echo "FAIL: domains_certs mounts / traefik-certs-reload: $(echo "$CFG" | jq -c '[.services.traefik.volumes, .services["traefik-certs-reload"]]')"; exit 1; }
-          test -f traefik/dynamic/domains/.gitkeep || { echo "FAIL: traefik/dynamic/domains/ must exist (mountpoint inside a read-only bind)"; exit 1; }
+          grep -qE '^\s+code_challenge_method: S256$' oauth2-proxy/alpha.yaml || { echo "FAIL: oauth2-proxy (both services) must send PKCE S256"; exit 1; }
           if grep -nE '^\s*userIDClaim:' oauth2-proxy/alpha.yaml; then echo "FAIL: userIDClaim is an alias of emailClaim in oauth2-proxy v7"; exit 1; fi
           echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring"
 
@@ -876,8 +868,19 @@ jobs:
         run: |
           # LoA 3 (acr_values=mtls) = X.509 only; with confirmation disabled a
           # successful cert login answers 302 → redirect_uri?code=...
-          AUTHQ='/realms/portcullis/protocol/openid-connect/auth?client_id=portcullis-forward-auth&response_type=code&scope=openid&acr_values=mtls&prompt=login&state=ci&nonce=ci&redirect_uri=https%3A%2F%2Fauth.portcullis.local%2Foauth2%2Fcallback'
+          # portcullis-forward-auth requires PKCE S256 (like oauth2-proxy sends):
+          # S256 of the verifier ci-pkce-verifier-0123456789abcdefghijklmnopqrstuvwxyz.
+          NOPKCE='/realms/portcullis/protocol/openid-connect/auth?client_id=portcullis-forward-auth&response_type=code&scope=openid&acr_values=mtls&prompt=login&state=ci&nonce=ci&redirect_uri=https%3A%2F%2Fauth.portcullis.local%2Foauth2%2Fcallback'
+          AUTHQ="$NOPKCE&code_challenge=83JUujMAYgRhPwEoyXqFBcdcLnEjuT8NyjHlOlacyZo&code_challenge_method=S256"
           got_code() { grep -qiE '^location: .*[?&]code=' "$1"; }
+
+          # 0) Without PKCE the forward-auth client issues no code (a stolen
+          #    code for an extra-domain callback is useless without the verifier).
+          curl -s -o /dev/null -D /tmp/kc-nopkce.h --cacert certs/ca-chain.crt \
+            --cert /tmp/test-client.crt --key /tmp/test-client.key \
+            --resolve "auth.portcullis.local:443:127.0.0.1" "https://auth.portcullis.local$NOPKCE" || true
+          if got_code /tmp/kc-nopkce.h; then echo "FAIL: portcullis-forward-auth issued a code without PKCE"; cat /tmp/kc-nopkce.h; exit 1; fi
+          echo "PASS: portcullis-forward-auth refuses authorization requests without PKCE"
 
           # 1) Positive control: a real TLS client cert through Traefik (also
           #    proves the CRL check + truststore re-validation pass).
@@ -1022,44 +1025,6 @@ jobs:
           if grep -qi 'Forged' /tmp/pub-attrs.out; then echo "FAIL: forged X-Forwarded-Attr-* reached a public router's app"; exit 1; fi
           echo '{"version":5}' | policy
           echo "PASS: public guard: only published paths, no credentials (PHP-normalised names)"
-
-      - name: Test that Traefik picks up enrolled-domain certificates (domains_certs, no restart)
-        run: |
-          # Traefik's file provider loads subdirectories but watches only the
-          # top directory: traefik-certs-reload must make a new certs.yml in
-          # the domains_certs volume (written like the domains service does,
-          # contract §12.4: the pair first, then certs.yml by rename) take
-          # effect, and dropping it must remove the certificate again.
-          ALPINE=alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
-          docker compose up -d traefik-certs-reload
-          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
-            -subj "/CN=ci-extra.test" -addext "subjectAltName=DNS:ci-extra.test,DNS:*.ci-extra.test" \
-            -keyout /tmp/ext.key -out /tmp/ext.crt 2>/dev/null
-          FP=$(openssl x509 -in /tmp/ext.crt -noout -fingerprint -sha256)
-          served() { openssl s_client -connect 127.0.0.1:443 -servername "$1" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null || true; }
-          certs_yml() { docker run --rm -i --network none -v portcullis_domains_certs:/d "$ALPINE" \
-                          sh -c 'cat > /d/certs.yml.tmp && mv /d/certs.yml.tmp /d/certs.yml'; }
-          [ "$(served x.ci-extra.test)" != "$FP" ] || { echo "FAIL: certificate served before it was published"; exit 1; }
-          STARTED=$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q traefik)")
-          docker run --rm --network none -v portcullis_domains_certs:/d -v /tmp/ext.crt:/s/c:ro -v /tmp/ext.key:/s/k:ro "$ALPINE" \
-            sh -c 'mkdir -p /d/ci-extra.test && cp /s/c /d/ci-extra.test/01.crt && cp /s/k /d/ci-extra.test/01.key && chmod 600 /d/ci-extra.test/01.key'
-          printf 'tls:\n  certificates:\n    - certFile: /etc/traefik/dynamic/domains/ci-extra.test/01.crt\n      keyFile: /etc/traefik/dynamic/domains/ci-extra.test/01.key\n' | certs_yml
-          for i in $(seq 1 20); do
-            [ "$(served x.ci-extra.test)" = "$FP" ] && break
-            [ "$i" -eq 20 ] && { echo "FAIL: Traefik did not pick up certs.yml"; docker compose logs --tail=20 traefik-certs-reload traefik; exit 1; }
-            sleep 2
-          done
-          [ "$(served ci-extra.test)" = "$FP" ] || { echo "FAIL: apex not covered"; exit 1; }
-          docker compose logs traefik-certs-reload | grep -q "sent SIGHUP to traefik" || { echo "FAIL: no SIGHUP logged"; exit 1; }
-          [ "$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q traefik)")" = "$STARTED" ] || { echo "FAIL: Traefik restarted"; exit 1; }
-          printf 'tls: {certificates: []}\n' | certs_yml
-          for i in $(seq 1 20); do
-            [ "$(served x.ci-extra.test)" != "$FP" ] && break
-            [ "$i" -eq 20 ] && { echo "FAIL: Traefik still serves a removed certificate"; exit 1; }
-            sleep 2
-          done
-          docker run --rm --network none -v portcullis_domains_certs:/d "$ALPINE" rm -rf /d/ci-extra.test
-          echo "PASS: enrolled-domain certificates are served and removed without a Traefik restart"
 
       - name: Test the socket proxies
         run: |
@@ -1228,6 +1193,8 @@ jobs:
             || { echo "FAIL: invite post-broker flow: $(kc /authentication/flows/portcullis-invite-session/executions | jq -c '[.[] | {displayName, requirement, level}]')"; exit 1; }
           FWD=$(kc "/clients?clientId=portcullis-forward-auth" | jq -r '.[0].id')
           SCOPE_ID=$(kc /client-scopes | jq -r '.[] | select(.name == "portcullis-invite-client") | .id')
+          kc "/clients/$FWD" | jq -e '.attributes["pkce.code.challenge.method"] == "S256"' >/dev/null \
+            || { echo "FAIL: portcullis-forward-auth does not require PKCE S256"; exit 1; }
           kc "/clients/$FWD/default-client-scopes" | jq -e --arg s "$SCOPE_ID" '[.[] | select(.id == $s)] | length == 1' >/dev/null \
             || { echo "FAIL: portcullis-forward-auth lacks the portcullis-invite-client scope"; exit 1; }
           kc /default-default-client-scopes | jq -e --arg s "$SCOPE_ID" 'all(.[]; .id != $s)' >/dev/null \

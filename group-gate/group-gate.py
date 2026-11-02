@@ -304,7 +304,8 @@ def validate_policy_doc(doc) -> Optional[str]:
     if not isinstance(doc, dict):
         return "policy file is not a JSON object"
     version = doc.get("version")
-    if isinstance(version, bool) or version != POLICY_VERSION:
+    # An int exactly: JSON 5.0 (a float) or true (a bool) is not version 5.
+    if type(version) is not int or version != POLICY_VERSION:
         return f"policy file version {version!r} is not supported (only {POLICY_VERSION})"
     for name in HOST_MAPS:
         m = doc.get(name)
@@ -856,7 +857,7 @@ def public_config_for(policy_doc: dict, host: str) -> Optional[PublicConfig]:
     any malformed / unknown field: the guard then denies (fail closed).
     """
     version = policy_doc.get("version")
-    if version != PUBLIC_GUARD_VERSION:
+    if type(version) is not int or version != PUBLIC_GUARD_VERSION:
         raise PolicyError(f"public guard needs policy file version {PUBLIC_GUARD_VERSION}, got {version!r}")
     pp = policy_doc.get("public_paths")
     if pp is None:
