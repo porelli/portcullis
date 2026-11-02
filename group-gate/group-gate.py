@@ -104,8 +104,9 @@ Config sources (both re-read on every request; they are tiny):
     dropped (logged), `%` -> `%25` and `,` -> `%2C` in each value, values
     joined with ", ". On the request's (normalised) host it also returns
     that host's headers for the user: one value, control characters
-    stripped, over 1 KB dropped (logged), no `,` encoding; it replaces a
-    same-named field header. A field whose name or header name is
+    stripped, over 1 KB dropped (logged), no `,` encoding. A header a host
+    declares replaces the same-named field header on that host for every
+    user (with or without a value); two spellings of one user = malformed. A field whose name or header name is
     invalid, a host key that isn't a lowercase valid hostname, or a host
     header with an invalid name is skipped (logged); version 1 or any
     other version, a missing / corrupt file (logged; also two fields on
@@ -580,7 +581,7 @@ ATTR_VALUE_MAX = 1024  # bytes (UTF-8) per value; longer values are dropped
 _ATTR_FIELD_RE = re.compile(r"(?=.{1,31}\Z)[a-z][a-z0-9]*(_[a-z0-9]+)*")
 _ATTR_HEADER_RE = re.compile(r"[A-Za-z0-9]+(-[A-Za-z0-9]+){0,30}")
 _ATTR_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
-_ATTR_CACHE: dict = {"key": None, "users": {}, "hosts": {}}
+_ATTR_CACHE: dict = {"key": None, "users": {}, "hosts": {}, "declared": {}}
 _ATTR_LOCK = threading.Lock()
 
 
@@ -605,10 +606,13 @@ def _attr_clean(value: str, what: str) -> str:
     return value
 
 
-def parse_user_attributes(doc) -> Tuple[dict, dict]:
-    """(users, hosts) from a version 2 user-attributes.json document:
-    users = {lowercase user: [(header, value)]} (the field headers),
-    hosts = {host: {lowercase user: [(header, value)]}} (per-host headers).
+def parse_user_attributes(doc) -> Tuple[dict, dict, dict]:
+    """(users, hosts, declared) from a version 2 user-attributes.json
+    document: users = {lowercase user: [(header, value)]} (the field
+    headers), hosts = {host: {lowercase user: [(header, value)]}} (per-host
+    headers), declared = {host: {lowercase full header name}} (every valid
+    header a host declares, with or without values: on that host it
+    replaces the same-named field header for everybody).
     Raises AttributesError if the document is malformed or not version 2.
 
     Field values: control characters stripped, values longer than
@@ -656,7 +660,7 @@ def parse_user_attributes(doc) -> Tuple[dict, dict]:
                 headers.append((ATTR_HEADER_PREFIX + fields[name], ", ".join(kept)))
         if headers:
             out[user.strip().lower()] = headers
-    out_hosts = {}
+    out_hosts, declared = {}, {}
     for host, by_header in hosts.items():
         if not isinstance(by_header, dict):
             raise AttributesError(f"headers of host {host!r} are not an object")
@@ -679,19 +683,27 @@ def parse_user_attributes(doc) -> Tuple[dict, dict]:
             other = seen.setdefault(header.lower(), header)
             if other != header:
                 raise AttributesError(f"host {host!r} has headers {other!r} and {header!r}")
+            declared.setdefault(host, set()).add((ATTR_HEADER_PREFIX + header).lower())
+            users_seen = set()
             for user, v in by_user.items():
+                folded = user.strip().lower()
+                # Two spellings of one user would give two values.
+                if folded in users_seen:
+                    raise AttributesError(f"header {header!r} of host {host!r} lists user {folded!r} twice")
+                users_seen.add(folded)
                 v = _attr_clean(v, f"header {header!r} of host {host!r} for user {user!r}")
                 if v:
-                    per_user.setdefault(user.strip().lower(), []).append((ATTR_HEADER_PREFIX + header, v))
+                    per_user.setdefault(folded, []).append((ATTR_HEADER_PREFIX + header, v))
         if per_user:
             out_hosts[host] = per_user
-    return out, out_hosts
+    return out, out_hosts, declared
 
 
 def user_attribute_headers(username: str, host: str) -> List[Tuple[str, str]]:
     """Attribute headers for the user on the (normalised) host: the field
-    headers, then the host's headers, which replace a same-named field
-    header. A missing file means none; an unreadable or malformed one is
+    headers, then the host's headers. A header the host declares replaces
+    the same-named field header on that host for every user, also users
+    without a (kept) value for it. A missing file means none; an unreadable or malformed one is
     logged (once per file version) and means none too — never a deny.
     Cached on (path, inode, mtime, size)."""
     try:
@@ -706,17 +718,17 @@ def user_attribute_headers(username: str, host: str) -> List[Tuple[str, str]]:
         if _ATTR_CACHE["key"] != key:
             try:
                 with open(ATTRIBUTES_FILE, encoding="utf-8") as f:
-                    users, hosts = parse_user_attributes(json.load(f))
+                    users, hosts, declared = parse_user_attributes(json.load(f))
             except FileNotFoundError:
                 return []
             except (OSError, ValueError, AttributesError) as e:
                 print(f"group-gate: ignoring corrupt {ATTRIBUTES_FILE}: {e} (no attribute headers)", flush=True)
-                users, hosts = {}, {}
-            _ATTR_CACHE.update(key=key, users=users, hosts=hosts)
+                users, hosts, declared = {}, {}, {}
+            _ATTR_CACHE.update(key=key, users=users, hosts=hosts, declared=declared)
         user = username.strip().lower()
         fields = _ATTR_CACHE["users"].get(user, [])
         on_host = _ATTR_CACHE["hosts"].get(host, {}).get(user, [])
-    replaced = {name.lower() for name, _ in on_host}
+        replaced = _ATTR_CACHE["declared"].get(host, set())
     return [h for h in fields if h[0].lower() not in replaced] + on_host
 
 

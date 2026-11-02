@@ -800,8 +800,9 @@ services:
       # against --project-directory = this checkout). Generated, gitignored.
       - ./templates:/project/templates:rw
       # Settings data files (contract §13.7): the Hub writes
-      # <instance>/<name>.json (+ .secrets.json) here, and templates
-      # bind-mount `./appfiles/<instance>` read-only into their services.
+      # <id>/<name>/<name>.json (+ <name>.secrets.json) here and its
+      # override bind-mounts `./appfiles/<id>/<name>` (the directory, not
+      # the file: renames give a new inode) read-only into the service.
       # Generated from Hub state (not backed up), gitignored.
       - ./appfiles:/project/appfiles:rw
       # The Hub only needs /project/templates, the config file targets and
