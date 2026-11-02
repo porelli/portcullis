@@ -1310,6 +1310,18 @@ jobs:
             || { echo "FAIL: hub runtime (uid / templates / env subset / DOCKER_HOST)"; docker compose logs --tail=20 hub; exit 1; }
           echo "PASS: Hub runs as 10001 without the socket, sees only the env subset, enforces the proxy secret"
 
+          # Template sources: the Hub synced them at start (status file) and
+          # syncs again on SIGHUP — what `./portcullis upgrade` does (hub_sources_sync).
+          OUT="$(bash -c 'source scripts/lib/common.sh; source scripts/lib/status.sh; hub_sources_sync 40' 2>&1)"
+          echo "$OUT"
+          echo "$OUT" | grep -q 'template source portcullis: \(updated to\|up to date\)' \
+            || { echo "FAIL: upgrade's template sync"; docker compose logs --tail=30 hub; exit 1; }
+          docker compose exec -T hub cat /data/source-sync.json | jq -e '.trigger == "signal" and .ok and (.running | not)' >/dev/null \
+            || { echo "FAIL: source-sync.json: $(docker compose exec -T hub cat /data/source-sync.json)"; exit 1; }
+          [ "$(docker inspect -f '{{.State.Running}} {{.RestartCount}}' "$HUB_CID")" = "true 0" ] || { echo "FAIL: the Hub did not survive SIGHUP"; exit 1; }
+          docker compose logs hub | grep -q 'sync on SIGHUP finished (ok=true)' || { echo "FAIL: no SIGHUP sync in the Hub log"; exit 1; }
+          echo "PASS: the Hub syncs its template sources at start and on SIGHUP; upgrade prints the result"
+
           # Product default: on a fresh install (no admin choice yet) the Hub
           # publishes {factors: [mtls, webauthn], op: any} (a hardware factor:
           # passkey or client cert) as the default auth policy, and group-gate
