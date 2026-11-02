@@ -128,7 +128,7 @@ func newEnv(t *testing.T, ipv6 bool) *testEnv {
 	t.Cleanup(pebble.Close)
 
 	e := &testEnv{}
-	providers["fake"] = providerSpec{required: []string{"api_token"}, build: func(c map[string]string) dnsProvider {
+	providers["fake"] = providerSpec{required: []string{"api_token"}, build: func(c map[string]string) (dnsProvider, error) {
 		return &fakedns.Provider{Zone: zone, Token: c["api_token"], Accept: func(tok string) bool { return strings.HasPrefix(tok, "good-") },
 			Hook: func(op string, recs []libdns.Record) error {
 				e.hookMu.Lock()
@@ -138,7 +138,7 @@ func newEnv(t *testing.T, ipv6 bool) *testEnv {
 					return nil
 				}
 				return h(op, recs, c["api_token"])
-			}}
+			}}, nil
 	}}
 	t.Cleanup(func() { delete(providers, "fake") })
 
@@ -538,7 +538,11 @@ func TestStoreEncrypted(t *testing.T) {
 func mkCert(t *testing.T, sans []string, ips []net.IP, notBefore, notAfter time.Time) (string, string) {
 	t.Helper()
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	tpl := &x509.Certificate{SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: "x"},
+	cn := ""
+	if len(sans) > 0 {
+		cn = sans[0]
+	}
+	tpl := &x509.Certificate{SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: cn},
 		DNSNames: sans, IPAddresses: ips, NotBefore: notBefore, NotAfter: notAfter}
 	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
 	if err != nil {
@@ -576,6 +580,18 @@ func TestServesOnlyOwnCertificates(t *testing.T) {
 	_, k2 := mkCert(t, []string{"wrongkey.example.org", "*.wrongkey.example.org"}, nil, nb, na)
 	domains["wrongkey.example.org"] = &Domain{Name: "wrongkey.example.org", CertPEM: c1, KeyPEM: k2, CertNotAfter: &na}
 	domains["nocert.example.org"] = &Domain{Name: "nocert.example.org", State: StatePending}
+	// A common name naming another host (clients that still look at the CN).
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tpl := &x509.Certificate{SerialNumber: big.NewInt(42), Subject: pkix.Name{CommonName: "auth." + testMain},
+		DNSNames: []string{"cn.example.org", "*.cn.example.org"}, NotBefore: nb, NotAfter: na}
+	der, _ := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
+	kder, _ := x509.MarshalECPrivateKey(key)
+	domains["cn.example.org"] = &Domain{Name: "cn.example.org", CertNotAfter: &na,
+		CertPEM: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})),
+		KeyPEM:  string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kder}))}
+	// A domain being deleted is no longer served.
+	add("leaving.example.org", []string{"leaving.example.org", "*.leaving.example.org"}, nil, nb, na)
+	domains["leaving.example.org"].Deleting = true
 
 	doc, dropped := buildDynamic(domains, testMain, now)
 	b, _ := json.Marshal(doc)
@@ -590,7 +606,7 @@ func TestServesOnlyOwnCertificates(t *testing.T) {
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("served %v, want %v", got, want)
 	}
-	if len(dropped) != 11 {
+	if len(dropped) != 12 {
 		t.Fatalf("dropped %d: %v", len(dropped), dropped)
 	}
 	for _, d := range dropped {
@@ -704,10 +720,10 @@ func TestAPIValidation(t *testing.T) {
 			t.Errorf("PUT %s = %d %s", body, code, resp)
 		}
 	}
-	if err := validateCredentials("route53", map[string]string{"access_key_id": "a", "secret_access_key": "b"}); err != nil {
+	if err := validateCredentials("route53", map[string]string{"access_key_id": "AKIAEXAMPLE1", "secret_access_key": "secret-access-key"}); err != nil {
 		t.Fatalf("route53 without hosted_zone_id: %v", err)
 	}
-	if err := validateCredentials("route53", map[string]string{"access_key_id": "a", "secret_access_key": "b", "hosted_zone_id": "Z1"}); err != nil {
+	if err := validateCredentials("route53", map[string]string{"access_key_id": "AKIAEXAMPLE1", "secret_access_key": "secret-access-key", "hosted_zone_id": "Z1"}); err != nil {
 		t.Fatalf("route53 with hosted_zone_id: %v", err)
 	}
 	if code, _ := e.do("PUT", "/domains/x.example.org", creds(goodToken), true); code != 202 {
@@ -863,11 +879,11 @@ func TestZoneChangeThenDelete(t *testing.T) {
 	e.svc.findZone = func(string) (string, error) { zmu.Lock(); defer zmu.Unlock(); return zoneName, nil }
 	other := fakedns.NewZone() // the second zone's storage (not served)
 	accept := func(string) bool { return true }
-	providers["fake-soa"] = providerSpec{required: []string{"api_token"}, build: func(c map[string]string) dnsProvider {
+	providers["fake-soa"] = providerSpec{required: []string{"api_token"}, build: func(c map[string]string) (dnsProvider, error) {
 		return zoneRouter{
 			"team-l.example.org.": &fakedns.Provider{Zone: e.zone, Token: c["api_token"], Accept: accept},
 			"example.org.":        &fakedns.Provider{Zone: other, Token: c["api_token"], Accept: accept},
-		}
+		}, nil
 	}}
 	t.Cleanup(func() { delete(providers, "fake-soa") })
 	body := `{"provider":"fake-soa","credentials":{"api_token":"` + goodToken + `"}}`
@@ -952,4 +968,177 @@ func (z zoneRouter) DeleteRecords(ctx context.Context, zone string, r []libdns.R
 		return nil, err
 	}
 	return p.DeleteRecords(ctx, zone, r)
+}
+
+// TestUnservableNameNoWork: a stored name that breaks the rules gets an
+// error and never records or an ACME order.
+func TestUnservableNameNoWork(t *testing.T) {
+	e := newEnv(t, false)
+	e.svc.mu.Lock()
+	e.svc.doc.Domains["auth."+testMain] = &Domain{Name: "auth." + testMain, Provider: "fake", Credentials: map[string]string{"api_token": goodToken}, State: StatePending, Generation: 99, EnrollID: 99}
+	e.svc.mu.Unlock()
+	e.svc.Kick()
+	v := e.waitState("auth."+testMain, StateError, 5*time.Second)
+	if !strings.Contains(v.LastError, "can't be served") {
+		t.Fatalf("last_error %q", v.LastError)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := e.zone.CallCount(); n != 0 {
+		t.Fatalf("%d provider calls for an unservable name", n)
+	}
+}
+
+// TestIssuedCertUnservableBacksOff: an issued certificate the endpoint
+// would refuse is not stored; the attempt fails with backoff (no loop).
+func TestIssuedCertUnservableBacksOff(t *testing.T) {
+	e := newEnv(t, false)
+	e.clock.advance(-48 * time.Hour) // every new certificate is "not valid yet"
+	e.do("PUT", "/domains/team-m.example.org", creds(goodToken), true)
+	v := e.waitState("team-m.example.org", StateError, 30*time.Second)
+	if !strings.Contains(v.LastError, "can't be served") || v.CertNotAfter != nil {
+		t.Fatalf("view %+v", v)
+	}
+	e.svc.mu.Lock()
+	d := e.svc.doc.Domains["team-m.example.org"]
+	f, cert := d.Failures, d.CertPEM
+	e.svc.mu.Unlock()
+	if f != 1 || cert != "" {
+		t.Fatalf("failures %d, cert stored %v", f, cert != "")
+	}
+	before := e.zone.CallCount()
+	time.Sleep(300 * time.Millisecond)
+	if e.zone.CallCount() != before {
+		t.Fatal("re-issued during backoff")
+	}
+}
+
+// TestRecordsWaitBounded: DELETE and token replacement wait for a running
+// records step only as long as their request allows; then 503, and
+// nothing changed.
+func TestRecordsWaitBounded(t *testing.T) {
+	e := newEnv(t, false)
+	release := make(chan struct{})
+	var once sync.Once
+	inSet := make(chan struct{})
+	e.setHook(func(op string, _ []libdns.Record, _ string) error {
+		if op == "set" {
+			once.Do(func() { close(inSet) })
+			<-release
+		}
+		return nil
+	})
+	defer close(release)
+	e.do("PUT", "/domains/team-n.example.org", creds(goodToken), true)
+	<-inSet
+	for _, c := range []struct{ method, path, body string }{
+		{"DELETE", "/domains/team-n.example.org", ""},
+		{"POST", "/domains/team-n.example.org/token", creds(goodToken)},
+	} {
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		req := httptest.NewRequest(c.method, c.path, strings.NewReader(c.body)).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer "+testSecret)
+		rec := httptest.NewRecorder()
+		e.api.ServeHTTP(rec, req)
+		cancel()
+		if rec.Code != 503 {
+			t.Fatalf("%s while a records step hangs = %d %s", c.method, rec.Code, rec.Body)
+		}
+	}
+	e.svc.mu.Lock()
+	d := e.svc.doc.Domains["team-n.example.org"]
+	gone, deleting := d == nil, d != nil && d.Deleting
+	e.svc.mu.Unlock()
+	if gone || deleting {
+		t.Fatalf("a bounded wait changed the domain (gone %v, deleting %v)", gone, deleting)
+	}
+}
+
+// TestTokenWaitsForRecordsStep: new credentials don't lose the records a
+// running step creates under the old ones.
+func TestTokenWaitsForRecordsStep(t *testing.T) {
+	e := newEnv(t, false)
+	release := make(chan struct{})
+	var once sync.Once
+	inSet := make(chan struct{})
+	e.setHook(func(op string, _ []libdns.Record, _ string) error {
+		if op == "set" {
+			once.Do(func() { close(inSet); <-release })
+		}
+		return nil
+	})
+	e.do("PUT", "/domains/team-o.example.org", creds(goodToken), true)
+	<-inSet
+	done := make(chan int)
+	go func() {
+		code, _ := e.do("POST", "/domains/team-o.example.org/token", creds(goodToken+"2"), true)
+		done <- code
+	}()
+	select {
+	case c := <-done:
+		t.Fatalf("token returned %d while the records step ran", c)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	if c := <-done; c != 202 {
+		t.Fatalf("token = %d", c)
+	}
+	e.svc.mu.Lock()
+	n := len(e.svc.doc.Domains["team-o.example.org"].Records)
+	e.svc.mu.Unlock()
+	if n == 0 {
+		t.Fatal("records of the step under the old credentials were lost")
+	}
+}
+
+// TestAddressChangeMakesRecordsDue: records set to other addresses than
+// the configured ones are redone at start.
+func TestAddressChangeMakesRecordsDue(t *testing.T) {
+	e := newEnv(t, false)
+	e.do("PUT", "/domains/team-p.example.org", creds(goodToken), true)
+	e.waitState("team-p.example.org", StateReady, 60*time.Second)
+	e.cancel()
+	e.svc.Wait()
+	cfg := e.svc.cfg
+	cfg.IPv4 = netip.MustParseAddr("203.0.113.77")
+	svc2, err := NewService(cfg, OpenStore(e.dir, e.id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st := svc2.doc.Domains["team-p.example.org"].State; st != StatePending {
+		t.Fatalf("state after an address change = %s", st)
+	}
+	cfg.IPv4 = netip.MustParseAddr("203.0.113.10")
+	svc3, _ := NewService(cfg, OpenStore(e.dir, e.id))
+	if st := svc3.doc.Domains["team-p.example.org"].State; st != StateReady {
+		t.Fatalf("state with unchanged addresses = %s", st)
+	}
+}
+
+// TestProviderPanicRecovered: a panicking provider library records a
+// failure instead of killing the service.
+func TestProviderPanicRecovered(t *testing.T) {
+	e := newEnv(t, false)
+	e.setHook(func(op string, _ []libdns.Record, _ string) error {
+		if op == "set" {
+			panic("library bug")
+		}
+		return nil
+	})
+	e.do("PUT", "/domains/team-q.example.org", creds(goodToken), true)
+	v := e.waitState("team-q.example.org", StateError, 10*time.Second)
+	if !strings.Contains(v.LastError, "internal error") {
+		t.Fatalf("last_error %q", v.LastError)
+	}
+	e.svc.mu.Lock()
+	busy := e.svc.busy["team-q.example.org"]
+	e.svc.mu.Unlock()
+	if busy != nil {
+		t.Fatal("busy left set after a panic")
+	}
+}
+
+func TestShortSecretRefused(t *testing.T) {
+	if err := validateCredentials("cloudflare", map[string]string{"api_token": "short"}); err == nil {
+		t.Fatal("a 5-character token accepted")
+	}
 }

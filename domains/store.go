@@ -50,6 +50,14 @@ type Domain struct {
 	// (from storeDoc.NextGeneration, never reused — also not after a
 	// delete and re-enroll): work started for an older one never commits.
 	Generation int `json:"generation"`
+	// EnrollID is the generation the enrollment started with (unchanged by
+	// a credentials replacement): records a running step created are
+	// recorded against it, so they are never lost.
+	EnrollID int `json:"enroll_id"`
+	// AppliedIPv4 / AppliedIPv6: the addresses the records were last set
+	// to; a different configured address makes the records due at start.
+	AppliedIPv4 string `json:"applied_ipv4,omitempty"`
+	AppliedIPv6 string `json:"applied_ipv6,omitempty"`
 	// Deleting: a DELETE is in progress (not persisted). No new work
 	// starts and running work commits nothing but the records it set.
 	Deleting bool `json:"-"`

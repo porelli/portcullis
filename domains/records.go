@@ -4,11 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/netip"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/libdns/cloudflare"
 	"github.com/libdns/digitalocean"
@@ -45,7 +50,7 @@ type propagationSkipper interface {
 type providerSpec struct {
 	required []string
 	optional []string
-	build    func(c map[string]string) dnsProvider
+	build    func(c map[string]string) (dnsProvider, error)
 }
 
 // fixedZone is a route53 provider with a hosted zone id: the zone is the
@@ -57,26 +62,31 @@ func (fixedZone) FindZone(fqdn string) (string, error) {
 }
 
 var providers = map[string]providerSpec{
-	"cloudflare": {required: []string{"api_token"}, build: func(c map[string]string) dnsProvider {
-		return &cloudflare.Provider{APIToken: c["api_token"]}
+	"cloudflare": {required: []string{"api_token"}, build: func(c map[string]string) (dnsProvider, error) {
+		return &cloudflare.Provider{APIToken: c["api_token"], HTTPClient: &http.Client{Timeout: providerTimeout}}, nil
 	}},
-	"porkbun": {required: []string{"api_key", "secret_api_key"}, build: func(c map[string]string) dnsProvider {
-		return &porkbun.Provider{APIKey: c["api_key"], APISecretKey: c["secret_api_key"]}
+	"porkbun": {required: []string{"api_key", "secret_api_key"}, build: func(c map[string]string) (dnsProvider, error) {
+		return &porkbun.Provider{APIKey: c["api_key"], APISecretKey: c["secret_api_key"]}, nil
 	}},
-	"route53": {required: []string{"access_key_id", "secret_access_key"}, optional: []string{"hosted_zone_id"}, build: func(c map[string]string) dnsProvider {
+	"route53": {required: []string{"access_key_id", "secret_access_key"}, optional: []string{"hosted_zone_id"}, build: func(c map[string]string) (dnsProvider, error) {
 		// Route 53 is global; the region only selects the API endpoint.
 		p := &route53.Provider{AccessKeyId: c["access_key_id"], SecretAccessKey: c["secret_access_key"],
-			HostedZoneID: c["hosted_zone_id"], Region: "us-east-1"}
-		if c["hosted_zone_id"] != "" {
-			return fixedZone{p}
+			HostedZoneID: c["hosted_zone_id"], Region: "us-east-1", MaxRetries: 5}
+		// The library log.Fatal()s if loading the AWS config fails: load it
+		// here first with the library's exact options and return the error.
+		if err := route53Preflight(p); err != nil {
+			return nil, err
 		}
-		return p
+		if c["hosted_zone_id"] != "" {
+			return fixedZone{p}, nil
+		}
+		return p, nil
 	}},
-	"digitalocean": {required: []string{"auth_token"}, build: func(c map[string]string) dnsProvider {
-		return &digitalocean.Provider{APIToken: c["auth_token"]}
+	"digitalocean": {required: []string{"auth_token"}, build: func(c map[string]string) (dnsProvider, error) {
+		return &digitalocean.Provider{APIToken: c["auth_token"]}, nil
 	}},
-	"hetzner": {required: []string{"api_token"}, build: func(c map[string]string) dnsProvider {
-		return hetzner.New(c["api_token"])
+	"hetzner": {required: []string{"api_token"}, build: func(c map[string]string) (dnsProvider, error) {
+		return hetzner.New(c["api_token"]), nil
 	}},
 }
 
@@ -111,6 +121,11 @@ func validateCredentials(provider string, creds map[string]string) error {
 		if v == "" && !contains(spec.required, k) {
 			return fmt.Errorf("credential key %s must be a non-empty string (or left out)", k)
 		}
+		// Secrets shorter than this couldn't be redacted reliably (and no
+		// provider issues them); hosted_zone_id isn't a secret.
+		if k != "hosted_zone_id" && len(v) < minSecretLen {
+			return fmt.Errorf("credential key %s is too short (at least %d characters)", k, minSecretLen)
+		}
 		if strings.ContainsAny(v, "\r\n") {
 			return fmt.Errorf("credential key %s contains a line break", k)
 		}
@@ -144,7 +159,11 @@ func buildProvider(d *Domain) (dnsProvider, error) {
 	for k, v := range d.Credentials {
 		creds[k] = v
 	}
-	return redacting{inner: spec.build(d.Credentials), creds: creds}, nil
+	inner, err := spec.build(d.Credentials)
+	if err != nil {
+		return nil, errors.New(redact(err.Error(), creds))
+	}
+	return redacting{inner: inner, creds: creds}, nil
 }
 
 // redacting wraps a provider; its errors carry no credential.
@@ -201,6 +220,31 @@ func (s *Service) zoneOf(p dnsProvider, fqdn string) (string, error) {
 }
 
 const recordTTL = 300 * time.Second
+
+// minSecretLen is the shortest credential value accepted (redaction of
+// anything shorter would be unreliable).
+const minSecretLen = 8
+
+// providerTimeout bounds one provider HTTP request where the library lets
+// us set a client (the others use http.DefaultTransport, whose dial, TLS
+// and response-header timeouts main sets at start).
+const providerTimeout = 2 * time.Minute
+
+// route53Preflight loads the AWS config exactly as libdns/route53 does
+// (retryer, region, static credentials) and returns the error the library
+// would log.Fatal on.
+func route53Preflight(p *route53.Provider) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := awsconfig.LoadDefaultConfig(ctx,
+		awsconfig.WithRetryer(func() aws.Retryer { return retry.AddWithMaxAttempts(retry.NewStandard(), p.MaxRetries) }),
+		awsconfig.WithRegion(p.Region),
+		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(p.AccessKeyId, p.SecretAccessKey, p.SessionToken)))
+	if err != nil {
+		return fmt.Errorf("route53: loading the AWS configuration: %w", err)
+	}
+	return nil
+}
 
 // setRecords points <name> and *.<name> at the server (contract §12.4):
 // A to the IPv4 and AAAA to the IPv6 (replacing what is there); without

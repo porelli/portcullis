@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/netip"
 	"os"
@@ -94,8 +95,71 @@ func parseIP(name string, want4 bool) (netip.Addr, error) {
 	return ip, nil
 }
 
+// setHTTPDefaults bounds every HTTP request of libraries that build their
+// own client on http.DefaultTransport / http.DefaultClient (porkbun,
+// hetzner, ...): they ignore contexts, and a hung provider must not hold
+// a records step (and with it DELETE) forever.
+func setHTTPDefaults() {
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		t.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+		t.TLSHandshakeTimeout = 15 * time.Second
+		t.ResponseHeaderTimeout = 60 * time.Second
+		t.ExpectContinueTimeout = 5 * time.Second
+		t.IdleConnTimeout = 90 * time.Second
+	}
+	http.DefaultClient.Timeout = 2 * time.Minute
+}
+
+// subnetListener accepts only connections addressed to the API's own
+// network (portcullis-domains, DOMAINS_API_SUBNET) or loopback (the health
+// check): the API port is also reachable on portcullis-certs (Traefik) and
+// domains-egress (Pebble in CI), which must never talk to it.
+type subnetListener struct {
+	net.Listener
+	allowed netip.Prefix
+	logf    func(string, ...any)
+}
+
+func (l subnetListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if apiLocalAllowed(c.LocalAddr(), l.allowed) {
+			return c, nil
+		}
+		l.logf("domains API: refused a connection to %s (not on the Hub network)", c.LocalAddr())
+		c.Close()
+	}
+}
+
+func apiLocalAllowed(a net.Addr, allowed netip.Prefix) bool {
+	ta, ok := a.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+	ip, ok := netip.AddrFromSlice(ta.IP)
+	if !ok {
+		return false
+	}
+	ip = ip.Unmap()
+	return ip.IsLoopback() || allowed.Contains(ip)
+}
+
+// certExpiryWarning: a warning when the endpoint's own server certificate
+// has less than 30 days left ("" otherwise). ./portcullis up renews it.
+func certExpiryWarning(leaf *x509.Certificate, now time.Time) string {
+	if left := leaf.NotAfter.Sub(now); left < 30*24*time.Hour {
+		return fmt.Sprintf("WARNING: the certificate endpoint's server certificate expires %s (%d days): run ./portcullis up to renew it",
+			leaf.NotAfter.UTC().Format(time.RFC3339), int(left.Hours()/24))
+	}
+	return ""
+}
+
 func run() error {
 	logger := log.New(os.Stderr, "", log.LstdFlags)
+	setHTTPDefaults()
 	// lego logs ACME progress (domains, never DNS credentials: the
 	// challenge provider is ours).
 	legolog.Logger = log.New(os.Stderr, "lego: ", log.LstdFlags)
@@ -119,6 +183,10 @@ func run() error {
 	ip6, err := parseIP("DOMAINS_PUBLIC_IPV6", false)
 	if err != nil {
 		return err
+	}
+	apiNet, err := netip.ParsePrefix(strings.TrimSpace(os.Getenv("DOMAINS_API_SUBNET")))
+	if err != nil {
+		return fmt.Errorf("DOMAINS_API_SUBNET (the portcullis-domains subnet the API answers on) is required: %v", err)
 	}
 	if !ip4.IsValid() {
 		logger.Printf("WARNING: DOMAINS_PUBLIC_IPV4 is not set: records can't be created until ./portcullis up detects it")
@@ -156,6 +224,16 @@ func run() error {
 	if err := startTestProvider(logger); err != nil {
 		return err
 	}
+	if leaf, err := x509.ParseCertificate(certsTLS.Certificates[0].Certificate[0]); err == nil {
+		go func() {
+			for {
+				if w := certExpiryWarning(leaf, time.Now()); w != "" {
+					logger.Print(w)
+				}
+				time.Sleep(24 * time.Hour)
+			}
+		}()
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -165,7 +243,13 @@ func run() error {
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute,
 		ErrorLog: log.New(io.Discard, "", 0)} // TLS handshake failures (no client cert) are expected noise
 	errc := make(chan error, 2)
-	go func() { errc <- api.ListenAndServe() }()
+	apiLn, err := net.Listen("tcp", api.Addr)
+	if err != nil {
+		return err
+	}
+	go func() {
+		errc <- api.Serve(subnetListener{Listener: apiLn, allowed: apiNet.Masked(), logf: logger.Printf})
+	}()
 	go func() { errc <- certs.ListenAndServeTLS("", "") }()
 	go svc.Run(ctx)
 	logger.Printf("domains: API on %s, certificate endpoint on %s (mTLS), main domain %s, ACME %s", api.Addr, certs.Addr, mainDomain, cfg.CAServer)

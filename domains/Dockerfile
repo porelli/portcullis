@@ -20,6 +20,11 @@ COPY --from=builder /domains /usr/local/bin/domains
 # Non-root. Reads /run/portcullis/domains/{api-secret (group 10001: compose
 # adds that group), age.key, certs-endpoint/{ca.crt,server.crt,server.key}}
 # (group 10004, 0640) and writes only /data (domains_data, age-encrypted).
+# No AWS config / credential files and no instance metadata: Route 53
+# credentials come only from the domain's stored credentials.
+ENV AWS_CONFIG_FILE=/dev/null \
+    AWS_SHARED_CREDENTIALS_FILE=/dev/null \
+    AWS_EC2_METADATA_DISABLED=true
 USER 10004:10004
 VOLUME /data
 EXPOSE 8080 8443

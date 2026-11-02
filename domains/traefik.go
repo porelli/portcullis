@@ -51,6 +51,9 @@ func servable(d *Domain, main string, now time.Time) error {
 	if err != nil {
 		return err
 	}
+	if cn := leaf.Subject.CommonName; cn != "" && cn != d.Name && cn != "*."+d.Name {
+		return fmt.Errorf("certificate common name %q is not %s or *.%s", cn, d.Name, d.Name)
+	}
 	if len(leaf.IPAddresses)+len(leaf.EmailAddresses)+len(leaf.URIs) > 0 {
 		return errors.New("certificate has non-DNS names")
 	}
@@ -92,7 +95,7 @@ func buildDynamic(domains map[string]*Domain, main string, now time.Time) (dynam
 	var dropped []string
 	for _, n := range names {
 		d := domains[n]
-		if d.CertPEM == "" {
+		if d.CertPEM == "" || d.Deleting {
 			continue
 		}
 		if d.Name != n {
