@@ -1,0 +1,25 @@
+# CI-only template for the e2e-instances job (.github/workflows/ci.yml):
+# a header-echo app (traefik/whoami) behind Portcullis sign-in, run as
+# several instances on the main and an enrolled extra domain. Not a
+# marketplace template: the job hands it to the Hub as a local source.
+name: Echo
+description: Header echo (CI)
+category: misc
+instances: multi
+auth:
+  method: forward-auth
+  group_access: true
+  access_group: users_echo
+  admin_group: admin_echo
+urls:
+  - label: Echo
+    url: "https://{{HOST_ECHO}}"
+settings:
+  # Stop timeout of the "hold" service, which ignores SIGTERM: a long
+  # value makes a backup (it stops the instance) take longer than
+  # Traefik's default 60 s readTimeout.
+  - key: ECHO_STOP_GRACE
+    label: Stop grace period
+    description: How long compose waits for the hold service to stop.
+    type: text
+    default: 1s

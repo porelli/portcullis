@@ -10,6 +10,10 @@ on:
     paths-ignore: ['**.md', 'docs/**', 'LICENSE']
   # release.yml runs exactly these checks before publishing a tag.
   workflow_call:
+  # Cross-repo feature branches (e.g. `instances`): run by hand with
+  # `gh workflow run ci.yml --ref <branch>`; the Hub is then built from the
+  # Hub repo's same-named branch (.github/actions/hub-image).
+  workflow_dispatch:
 
 
 # A newer push to the same ref supersedes the older run (runners are shared
@@ -238,6 +242,7 @@ jobs:
               and $t.environment.TRAEFIK_PROVIDERS_HTTP_ENDPOINT == "https://domains:8443/traefik/dynamic"
               and $t.environment.TRAEFIK_PROVIDERS_HTTP_POLLINTERVAL == "10s" and $t.environment.TRAEFIK_PROVIDERS_HTTP_POLLTIMEOUT == "5s"
               and $t.environment.TRAEFIK_PROVIDERS_HTTP_MAXRESPONSEBODYSIZE == "4194304"
+              and $t.environment.TRAEFIK_ENTRYPOINTS_WEBSECURE_TRANSPORT_RESPONDINGTIMEOUTS_READTIMEOUT == "15m"
               and ([$t.environment.TRAEFIK_PROVIDERS_HTTP_TLS_CA, $t.environment.TRAEFIK_PROVIDERS_HTTP_TLS_CERT, $t.environment.TRAEFIK_PROVIDERS_HTTP_TLS_KEY] | all(startswith("/run/portcullis/domains-endpoint/")))
               and ([$t.environment | keys[] | select(startswith("TRAEFIK_PROVIDERS_HTTP_HEADERS"))] == [])
               and ([$t.volumes[] | select(.target | startswith("/run/portcullis/domains-endpoint/")) | .read_only] == [true, true, true])
@@ -276,6 +281,8 @@ jobs:
           # Inline compose snippets and docker run images in the workflows.
           if grep -nE '^\s+image: ' .github/workflows/*.yml | grep -v '@sha256:'; then echo "UNPINNED image in a workflow"; bad=1; fi
           if grep -nE '(ALPINE|_IMG|IMAGE): [a-z]' .github/workflows/*.yml | grep -v '@sha256:'; then echo "UNPINNED image variable in a workflow"; bad=1; fi
+          # The CI-only app templates (job e2e-instances).
+          if grep -nE '^\s+image: ' tests/e2e/apps/*/compose.yml | grep -v '@sha256:'; then echo "UNPINNED image in a CI template"; bad=1; fi
           # Actions by full commit SHA.
           if grep -nE '^\s+(- )?uses: ' .github/workflows/*.yml .github/actions/*/action.yml | grep -vE 'uses: (\./|[^@]+@[0-9a-f]{40} # v[0-9]+\.[0-9]+\.[0-9]+$)'; then echo "Action not pinned by commit SHA (# vX.Y.Z)"; bad=1; fi
           [ "$bad" = 0 ] || exit 1
@@ -474,6 +481,8 @@ jobs:
           sbom: false
           cache-from: type=gha,scope=domains-test
           cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=domains-test,mode=max' || '' }}
+      - name: Hub image (same-named Hub branch → built here, else the published one)
+        uses: ./.github/actions/hub-image
 
       - name: Start core services (without Traefik ACME)
         run: docker compose up -d postgres lldap
@@ -1270,7 +1279,7 @@ jobs:
 
       - name: Test the Hub (non-root, socket proxy, proxy secret)
         run: |
-          if ! docker compose pull --quiet hub; then
+          if [ -z "${HUB_LOCAL:-}" ] && ! docker compose pull --quiet hub; then
             echo "::warning::Hub image $(docker compose config --format json | jq -r .services.hub.image) cannot be pulled — skipping the Hub test"
             exit 0
           fi
@@ -1545,7 +1554,7 @@ jobs:
       - name: portcullis up (whole stack) keeps the Hub's LLDAP service account
         run: |
           # `up` starts every service, the Hub included.
-          docker compose pull --quiet hub || { echo "::warning::Hub image cannot be pulled — skipping"; exit 0; }
+          [ -n "${HUB_LOCAL:-}" ] || docker compose pull --quiet hub || { echo "::warning::Hub image cannot be pulled — skipping"; exit 0; }
           ./portcullis up
           LLDAP_TOKEN=$(jq -n --arg p "$LLDAP_ADMIN_PASSWORD" '{username: "admin", password: $p}' \
             | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
@@ -2036,4 +2045,397 @@ jobs:
         if: always()
         run: |
           docker compose -p e2e-app -f /tmp/e2e-app.yml down 2>/dev/null || true
+          docker compose down -v
+
+  # App instances and enrolled extra domains, end to end (contract §5, §11,
+  # §12): the whole stack plus the Hub (built from the Hub repo's same-named
+  # branch when there is one, .github/actions/hub-image), the domains
+  # service against Pebble with the fake DNS provider, the extra domain
+  # team-b.test, and instances of the CI template tests/e2e/apps/echo
+  # created through the Hub's API. tests/e2e/e2e_instances.py documents the
+  # browser scenarios; the instance backup / delete / restore checks run
+  # against a real daemon at the end.
+  e2e-instances:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      E2E_DOMAIN: portcullis.local
+      E2E_EXTRA: team-b.test
+      E2E_ARTIFACTS: e2e-artifacts
+      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      CURL_IMG: curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Generate .env and the CI override (Pebble, fake DNS provider)
+        run: |
+          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+            --email ci@portcullis.local --dns-provider none
+          for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
+            val="$(grep "^$v=" .env | cut -d= -f2-)"
+            [ "$v" = KEYCLOAK_ADMIN ] || echo "::add-mask::$val"
+            echo "$v=$val" >> "$GITHUB_ENV"
+          done
+          cat > docker-compose.ci.yml <<'YML'
+          services:
+            keycloak:
+              ports:
+                - "127.0.0.1:9000:9000"
+            lldap:
+              ports:
+                - "127.0.0.1:17170:17170"
+            domains:
+              build:
+                args:
+                  GO_TAGS: testprovider
+              environment:
+                ACME_CA_SERVER: https://pebble:14000/dir
+                LEGO_CA_CERTIFICATES: /run/ci/pebble.minica.pem
+                DOMAINS_RESOLVERS: 127.0.0.1:8053
+              volumes:
+                - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
+            pebble:
+              image: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
+              command: ["-config", "/test/config/pebble-config.json", "-dnsserver", "domains:8053"]
+              environment:
+                PEBBLE_VA_NOSLEEP: "1"
+                PEBBLE_WFE_NONCEREJECT: "0"
+              networks: [domains-egress]
+          YML
+          sed -i 's/^          //' docker-compose.ci.yml
+          docker compose config -q
+
+      - name: List the images this job runs
+        run: |
+          {
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains)|ghcr\.io/porelli/portcullis-hub:.*'
+            grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
+              | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
+          } | sort -u > "$RUNNER_TEMP/images.txt"
+      - name: Load images (cached, verified)
+        uses: ./.github/actions/cached-images
+        with:
+          images: ${{ runner.temp }}/images.txt
+          name: e2e-instances
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: enroll
+          tags: portcullis-enroll
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=enroll
+          cache-to: ""
+      - name: Build group-gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: group-gate
+          tags: portcullis-group-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=group-gate
+          cache-to: ""
+      - name: Build the domains service (CI test build, buildx layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: domains
+          tags: portcullis-domains
+          build-args: GO_TAGS=testprovider
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=domains-test
+          cache-to: ""
+      - name: Hub image (same-named Hub branch → built here, else the published one)
+        uses: ./.github/actions/hub-image
+
+      - name: Start the whole stack (Hub with the CI template source, domains + Pebble)
+        run: |
+          PEBBLE_IMG=$(docker compose config --format json | jq -r .services.pebble.image)
+          cid="$(docker create "$PEBBLE_IMG")"; docker cp "$cid:/test/certs/pebble.minica.pem" /tmp/pebble.minica.pem; docker rm "$cid" >/dev/null
+          chmod 644 /tmp/pebble.minica.pem
+          docker compose up -d postgres lldap
+          ./portcullis vault init
+          ./portcullis pki setup --with-server-cert
+          ./portcullis config apply --bundle-only
+          printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
+          # The Hub's only template source: the CI echo template as a local
+          # source (a source with a path and no URL is never pulled; with a
+          # source present the Hub doesn't clone the marketplace).
+          docker volume create --label com.docker.compose.project=portcullis --label com.docker.compose.volume=hub_data portcullis_hub_data >/dev/null
+          docker run --rm -v portcullis_hub_data:/data -v "$PWD/tests/e2e/apps:/src:ro" "$ALPINE" sh -c '
+            mkdir -p /data/repos/ci && cp -r /src/echo /data/repos/ci/ &&
+            printf "sources:\n  - name: ci\n    url: \"\"\n    path: /data/repos/ci\n" > /data/state.yaml &&
+            chown -R 10001:10001 /data && chmod 600 /data/state.yaml'
+          ./portcullis up
+          for i in $(seq 1 100); do
+            curl -sf http://127.0.0.1:9000/health/ready >/dev/null && break
+            [ "$i" -eq 100 ] && { echo "FAIL: Keycloak not ready"; docker compose logs --tail=80 keycloak; exit 1; }
+            sleep 3
+          done
+          ./portcullis keycloak configure
+          ./portcullis oidc register
+          docker compose up -d forward-auth forward-auth-ext hub
+          # oauth2-proxy exits while Keycloak is down; the Hub reads its LLDAP files at start.
+          docker compose restart forward-auth forward-auth-ext hub
+          docker compose ps
+          HUB_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q hub)")
+          echo "HUB_IP=$HUB_IP" >> "$GITHUB_ENV"
+          for i in $(seq 1 40); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$HUB_IP:8888/healthz")" = 200 ] && break
+            [ "$i" -eq 40 ] && { echo "FAIL: hub /healthz"; docker compose logs --tail=40 hub; exit 1; }
+            sleep 2
+          done
+
+      - name: Extra domain, instances, users, setup links (through the Hub's API)
+        run: |
+          set -o pipefail
+          SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
+          # The Hub's API as Traefik calls it: proxy secret + the admin's identity.
+          hub() { local m="$1" p="$2"; shift 2
+                  curl -s -X "$m" -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") \
+                    -H 'Content-Type: application/json' "$@" "http://$HUB_IP:8888$p"; }
+          hubc() { hub "$@" -o /tmp/hub.out -w '%{http_code}'; }
+          for i in $(seq 1 30); do
+            hub GET /api/templates | jq -e 'any(.[]; .id == "echo")' >/dev/null 2>&1 && break
+            [ "$i" -eq 30 ] && { echo "FAIL: the Hub did not load the CI template: $(hub GET /api/templates | head -c 400)"; docker compose logs --tail=40 hub; exit 1; }
+            sleep 2
+          done
+
+          # Enrolled domain team-b.test: the Hub accepts only real providers,
+          # so CI enrolls it on the domains service's API with the fake one;
+          # the Hub picks the service's list up (RefreshDomains).
+          code=$(hubc POST /api/domains -d '{"name":"team-b.test","provider":"fake","credentials":{"api_token":"ci-fake-token-0123456789"}}')
+          [ "$code" = 400 ] || { echo "FAIL: the Hub forwarded an unknown provider ($code)"; exit 1; }
+          DSECRET="$(cat secrets/domains/api-secret)"; echo "::add-mask::$DSECRET"
+          dapi() { printf 'Authorization: Bearer %s\n' "$DSECRET" \
+                   | docker run --rm -i --network portcullis_portcullis-domains "$CURL_IMG" -s -H @- -H 'Content-Type: application/json' "$@"; }
+          code=$(dapi -o /dev/null -w '%{http_code}' -X PUT -d '{"provider":"fake","credentials":{"api_token":"ci-fake-token-0123456789"}}' "http://domains:8080/domains/$E2E_EXTRA")
+          [ "$code" = 202 ] || { echo "FAIL: enroll $E2E_EXTRA got $code"; exit 1; }
+          for i in $(seq 1 60); do
+            st="$(hub GET /api/domains | jq -r --arg d "$E2E_EXTRA" '.[]? | select(.name == $d) | .state')"
+            [ "$st" = ready ] && break
+            [ "$i" -eq 60 ] && { echo "FAIL: $E2E_EXTRA in the Hub: $(hub GET /api/domains)"; docker compose logs --tail=60 domains pebble; exit 1; }
+            sleep 3
+          done
+          echo "PASS: $E2E_EXTRA enrolled (Pebble, DNS-01 with the fake provider) and ready in the Hub"
+
+          # Instances: echo-a and echo-c on the extra domain, echo-b on the main one.
+          for spec in "echo-a echo-a.$E2E_EXTRA" "echo-b echo-b.$E2E_DOMAIN" "echo-c echo-c.$E2E_EXTRA"; do
+            read -r id host <<<"$spec"
+            code=$(hubc POST /api/instances -d "$(jq -cn --arg id "$id" --arg h "$host" '{template: "echo", id: $id, hosts: {echo: $h}}')")
+            [ "$code" = 201 ] || { echo "FAIL: create $id: $code $(cat /tmp/hub.out)"; exit 1; }
+          done
+          # A host on a domain that isn't enrolled is refused.
+          code=$(hubc POST /api/instances -d '{"template":"echo","id":"echo-x","hosts":{"echo":"echo-x.not-enrolled.test"}}')
+          case "$code" in 400|409) ;; *) echo "FAIL: a host on an unknown domain got $code"; exit 1 ;; esac
+          # echo-c: policy mtls (a passkey session steps up); echo-b: a slow
+          # stop (its backup takes > 60 s, e2e_instances.py long_backup).
+          code=$(hubc PUT /api/templates/settings/echo-c -d '{"_auth_policy":{"factors":["mtls"],"op":""}}')
+          [ "$code" = 200 ] || { echo "FAIL: echo-c policy: $code $(cat /tmp/hub.out)"; exit 1; }
+          code=$(hubc PUT /api/templates/settings/echo-b -d '{"ECHO_STOP_GRACE":"75s"}')
+          [ "$code" = 200 ] || { echo "FAIL: echo-b settings: $code $(cat /tmp/hub.out)"; exit 1; }
+
+          # Users and the instances' groups (created by the Hub as the admin).
+          LLDAP_TOKEN=$(jq -n --arg p "$LLDAP_ADMIN_PASSWORD" '{username: "admin", password: $p}' \
+            | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          gql() { jq -n --arg q "$1" '{query: $q}' | curl -sf http://127.0.0.1:17170/api/graphql \
+                    -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @-; }
+          for u in alice bob; do
+            gql "mutation { createUser(user: {id: \"$u\", email: \"$u@portcullis.local\"}) { id } }" | jq -e '.errors == null' >/dev/null
+          done
+          GROUPS_JSON="$(gql '{ groups { id displayName } }')"
+          for g in users_echo-a admin_echo-a users_echo-b users_echo-c; do
+            echo "$GROUPS_JSON" | jq -e --arg g "$g" 'any(.data.groups[]; .displayName == $g)' >/dev/null || { echo "FAIL: the Hub did not create $g"; exit 1; }
+          done
+          for m in alice:users_echo-a alice:users_echo-c bob:users_echo-b; do
+            gid=$(echo "$GROUPS_JSON" | jq -r --arg g "${m#*:}" '.data.groups[] | select(.displayName == $g) | .id')
+            gql "mutation { addUserToGroup(userId: \"${m%%:*}\", groupId: $gid) { ok } }" | jq -e '.errors == null' >/dev/null
+          done
+
+          for id in echo-a echo-b echo-c; do
+            code=$(hubc POST /api/templates/enable -d "{\"id\":\"$id\"}")
+            [ "$code" = 200 ] || { echo "FAIL: enable $id: $code $(cat /tmp/hub.out)"; docker compose logs --tail=30 hub; exit 1; }
+          done
+
+          # What the Hub published: policy v5 keyed by hostname, the extra domain.
+          policy_file() { docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" cat /d/group-gate-policy.json; }
+          for i in $(seq 1 30); do
+            policy_file | jq -e --arg x "$E2E_EXTRA" '.version == 5 and .extra_domains == [$x]
+                and .groups["echo-a.\($x)"] == "users_echo-a" and .groups["echo-c.\($x)"] == "users_echo-c"
+                and .groups["echo-b.portcullis.local"] == "users_echo-b"
+                and .policies["echo-c.\($x)"].factors == ["mtls"]' >/dev/null 2>&1 && break
+            [ "$i" -eq 30 ] && { echo "FAIL: policy file: $(policy_file)"; exit 1; }
+            sleep 2
+          done
+          echo "PASS: policy v5: instances keyed by hostname, groups per instance, extra_domains = [$E2E_EXTRA]"
+
+          # The rendered sign-in: forward-auth-ext on extra-domain hosts only.
+          labels() { docker inspect -f '{{json .Config.Labels}}' "$(docker ps -q --filter "label=com.docker.compose.project=portcullis-$1" --filter label=com.docker.compose.service=web)"; }
+          labels echo-a | jq -e --arg h "echo-a.$E2E_EXTRA" '
+              (.["traefik.http.routers.echo-a_echo.middlewares"] | split(",") | index("portcullis-auth-ext@docker") != null and index("portcullis-auth@docker") == null)
+              and .["traefik.http.routers.portcullis-oauth2-echo-a_echo.service"] == "forward-auth-ext@docker"
+              and .["traefik.http.routers.portcullis-oauth2-echo-a_echo.rule"] == "Host(`\($h)`) && PathPrefix(`/oauth2/`)"' >/dev/null \
+            || { echo "FAIL: echo-a labels: $(labels echo-a)"; exit 1; }
+          labels echo-b | jq -e '(.["traefik.http.routers.echo-b_echo.middlewares"] | split(",") | index("portcullis-auth@docker") != null)
+              and ([keys[] | select(startswith("traefik.http.routers.portcullis-oauth2-"))] == [])' >/dev/null \
+            || { echo "FAIL: echo-b labels: $(labels echo-b)"; exit 1; }
+          KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+            --data-urlencode client_id=admin-cli --data-urlencode "username=$KEYCLOAK_ADMIN" \
+            --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") "http://127.0.0.1:8080/admin/realms/portcullis/clients?clientId=portcullis-forward-auth" \
+            | jq -e --arg x "$E2E_EXTRA" '.[0].redirectUris as $u | ($u | index("https://echo-a.\($x)/oauth2/callback") != null)
+                and ($u | index("https://echo-c.\($x)/oauth2/callback") != null) and ($u | index("https://echo-b.portcullis.local/oauth2/callback") == null)' >/dev/null \
+            || { echo "FAIL: forward-auth callbacks"; exit 1; }
+          echo "PASS: extra-domain routers use portcullis-auth-ext + a Host-scoped /oauth2/ router to forward-auth-ext; callbacks registered"
+
+          # Traefik serves the enrolled domain's certificate by SNI; core hosts keep the main one.
+          sni_sans() { openssl s_client -connect 127.0.0.1:443 -servername "$1" </dev/null 2>/dev/null | openssl x509 -noout -ext subjectAltName 2>/dev/null | tail -n +2 | tr -d ' '; }
+          for i in $(seq 1 30); do
+            sni_sans "echo-a.$E2E_EXTRA" | grep -q "DNS:\*\.$E2E_EXTRA" && break
+            [ "$i" -eq 30 ] && { echo "FAIL: no $E2E_EXTRA certificate for echo-a: $(sni_sans "echo-a.$E2E_EXTRA")"; exit 1; }
+            sleep 1
+          done
+          sni_sans "auth.$E2E_DOMAIN" | grep -q 'DNS:\*\.portcullis\.local' || { echo "FAIL: auth.<main> lost the main certificate"; exit 1; }
+          docker run --rm --network portcullis_domains-egress "$CURL_IMG" -sfk https://pebble:15000/roots/0 > /tmp/pebble-root.pem
+          openssl x509 -noout -in /tmp/pebble-root.pem
+          cat certs/ca-chain.crt /tmp/pebble-root.pem > /tmp/e2e-ca-bundle.pem
+          echo "PASS: echo-a.$E2E_EXTRA is served with the enrolled domain's certificate (Pebble); auth.<main> keeps the main one"
+
+          echo "127.0.0.1 portcullis.local auth.portcullis.local enroll.portcullis.local hub.portcullis.local echo-b.portcullis.local echo-a.$E2E_EXTRA echo-c.$E2E_EXTRA" | sudo tee -a /etc/hosts
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --cacert /tmp/e2e-ca-bundle.pem "https://echo-a.$E2E_EXTRA/" || true)
+            case "$code" in 302|401|403) echo "echo-a routed (HTTP $code)"; break ;; esac
+            [ "$i" -eq 40 ] && { echo "FAIL: echo-a not routed ($code)"; docker compose logs --tail=40 traefik forward-auth-ext; exit 1; }
+            sleep 3
+          done
+
+          for spec in "E2E_ALICE_INVITE alice" "E2E_BOB_INVITE bob" "E2E_ADMIN_INVITE admin"; do
+            read -r var who <<<"$spec"
+            url="$(./portcullis invite "$who" --to portal --json | jq -r .url)"
+            [[ "$url" =~ ^https://enroll\.portcullis\.local/invite/[A-Za-z0-9_-]{43}$ ]] || { echo "FAIL: setup link for $who: $url"; exit 1; }
+            echo "::add-mask::$url"
+            echo "$var=$url" >> "$GITHUB_ENV"
+          done
+          # alice's client certificate (echo-c's mtls step-up).
+          VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
+          openssl ecparam -name prime256v1 -genkey -noout -out /tmp/alice.key
+          openssl req -new -key /tmp/alice.key -subj "/CN=alice" -out /tmp/alice.csr
+          docker compose exec -T -e VAULT_TOKEN vault vault write -format=json pki_int/sign/client-cert \
+            csr="$(cat /tmp/alice.csr)" common_name=alice ttl=2h | jq -r .data.certificate > /tmp/alice.crt
+
+      - name: Restore the pip / Playwright browser cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/ms-playwright
+          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+
+      - name: Install Playwright (pinned) and trust core's CA and Pebble's root
+        run: |
+          python3 -m venv /tmp/e2e-venv
+          /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
+          sudo /tmp/e2e-venv/bin/playwright install-deps chromium
+          /tmp/e2e-venv/bin/playwright install chromium
+          sudo apt-get install -y -qq libnss3-tools >/dev/null
+          mkdir -p "$HOME/.pki/nssdb"
+          certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
+          certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
+          certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n pebble-root -i /tmp/pebble-root.pem
+
+      - name: Run the browser tests (cross-domain SSO, two instances, long backup through Traefik)
+        env:
+          E2E_CERT: /tmp/alice.crt
+          E2E_KEY: /tmp/alice.key
+        run: NODE_EXTRA_CA_CERTS=/tmp/e2e-ca-bundle.pem /tmp/e2e-venv/bin/python tests/e2e/e2e_instances.py
+
+      - name: Instance backup → guarded delete → restore into a new id (real daemon)
+        run: |
+          set -o pipefail
+          SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
+          hub() { local m="$1" p="$2"; shift 2
+                  curl -s -X "$m" -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") \
+                    -H 'Content-Type: application/json' "$@" "http://$HUB_IP:8888$p"; }
+          hubc() { hub "$@" -o /tmp/hub.out -w '%{http_code}'; }
+          # Data with owners and modes the restore must keep: a file 4242:4343
+          # 0640 and the volume root 1234:5678 0751.
+          docker run --rm -v portcullis_echo-a-data:/d "$ALPINE" sh -c \
+            'echo instance-data > /d/f && chown 4242:4343 /d/f && chmod 0640 /d/f && mkdir -p /d/sub && chown 4242:4343 /d/sub && chown 1234:5678 /d && chmod 0751 /d'
+          meta() { docker run --rm -v "$1:/d:ro" "$ALPINE" sh -c 'stat -c "%u:%g:%a" /d /d/f /d/sub && cat /d/f'; }
+          WANT="$(meta portcullis_echo-a-data)"
+          # The helper image is pulled by digest (not present beforehand).
+          HELPER="$(grep -o 'PORTCULLIS_HELPER_IMAGE="[^"]*"' scripts/lib/common.sh | cut -d'"' -f2)"
+          docker image rm -f "$HELPER" "${HELPER%@*}" >/dev/null 2>&1 || true
+          if docker image inspect "$HELPER" >/dev/null 2>&1; then echo "FAIL: the helper image is still present"; exit 1; fi
+          code=$(hubc POST /api/instances/echo-a/backups)
+          [ "$code" = 201 ] || { echo "FAIL: backup echo-a: $code $(cat /tmp/hub.out)"; docker compose logs --tail=30 hub; exit 1; }
+          ARCHIVE="$(jq -r .archive /tmp/hub.out)"
+          docker image inspect -f '{{json .RepoDigests}}' "$HELPER" | jq -e --arg d "${HELPER%%:*}@${HELPER#*@}" 'index($d) != null' >/dev/null \
+            || { echo "FAIL: the helper image was not pulled by its digest"; exit 1; }
+          [ -z "$(docker ps -aq --filter label=io.portcullis.hub.helper)" ] || { echo "FAIL: helper containers left behind"; docker ps -a; exit 1; }
+          echo "PASS: backup $ARCHIVE (helper image pulled by digest, never-started helpers removed)"
+
+          # Guarded delete: the id must be typed.
+          for body in '{}' '{"confirm":"echo-b"}' '{"confirm":"ECHO-A"}'; do
+            code=$(hubc DELETE /api/instances/echo-a -d "$body")
+            [ "$code" = 400 ] || { echo "FAIL: delete with $body got $code"; exit 1; }
+          done
+          docker volume inspect portcullis_echo-a-data >/dev/null || { echo "FAIL: a refused delete removed the volume"; exit 1; }
+          code=$(hubc DELETE /api/instances/echo-a -d '{"confirm":"echo-a"}')
+          [ "$code" = 200 ] || { echo "FAIL: delete echo-a: $code $(cat /tmp/hub.out)"; docker compose logs --tail=30 hub; exit 1; }
+          DEL_BACKUP="$(jq -r .backup /tmp/hub.out)"
+          if docker volume inspect portcullis_echo-a-data >/dev/null 2>&1; then echo "FAIL: delete kept the volume"; exit 1; fi
+          [ -z "$(docker ps -aq --filter label=com.docker.compose.project=portcullis-echo-a)" ] || { echo "FAIL: delete kept containers"; exit 1; }
+          hub GET /api/backups | jq -e --arg a "$DEL_BACKUP" 'any(.[]; .archive == $a and .instance == "echo-a" and .instance_exists == false)' >/dev/null \
+            || { echo "FAIL: the delete's backup is not listed: $(hub GET /api/backups)"; exit 1; }
+          code=$(curl -s -o /dev/null -w '%{http_code}' --cacert /tmp/e2e-ca-bundle.pem "https://echo-a.$E2E_EXTRA/" || true)
+          [ "$code" = 404 ] || { echo "FAIL: echo-a still routed after delete ($code)"; exit 1; }
+          echo "PASS: delete needs the typed id, backs up first ($DEL_BACKUP), removes containers, volume and routing"
+
+          # Restore the manual backup into a new instance id.
+          code=$(hubc POST /api/instances/restore -d "$(jq -cn --arg a "$ARCHIVE" '{archive: $a, id: "echo-r"}')")
+          [ "$code" = 201 ] || { echo "FAIL: restore into echo-r: $code $(cat /tmp/hub.out)"; docker compose logs --tail=30 hub; exit 1; }
+          GOT="$(meta portcullis_echo-r-data)"
+          [ "$GOT" = "$WANT" ] || { echo "FAIL: restored volume differs: got $GOT want $WANT"; exit 1; }
+          docker volume inspect -f '{{json .Labels}}' portcullis_echo-r-data | jq -e '.["com.docker.compose.project"] == "portcullis-echo-r"' >/dev/null \
+            || { echo "FAIL: restored volume labels"; exit 1; }
+          hub GET /api/instances | jq -e 'any(.[]; .id == "echo-r" and .template == "echo" and .state == "created")' >/dev/null \
+            || { echo "FAIL: echo-r: $(hub GET /api/instances)"; exit 1; }
+          code=$(hubc POST /api/templates/enable -d '{"id":"echo-r"}')
+          [ "$code" = 200 ] || { echo "FAIL: enable echo-r: $code $(cat /tmp/hub.out)"; exit 1; }
+          docker exec "$(docker ps -q --filter label=com.docker.compose.project=portcullis-echo-r --filter label=com.docker.compose.service=hold)" cat /proc/1/status >/dev/null
+          [ "$(meta portcullis_echo-r-data)" = "$WANT" ] || { echo "FAIL: the running instance changed its data"; exit 1; }
+          echo "PASS: restore into a new id: owners ($WANT) and the volume root's owner / mode kept, labelled for the new project, enables"
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p e2e-artifacts
+          docker compose ps -a > e2e-artifacts/compose-ps.txt 2>&1 || true
+          docker ps -a > e2e-artifacts/docker-ps.txt 2>&1 || true
+          for svc in traefik keycloak forward-auth forward-auth-ext group-gate lldap hub domains pebble socket-proxy-hub; do
+            docker compose logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
+          done
+          docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'cat /d/group-gate-policy.json; ls -la /d /d/overrides; cat /d/overrides/*.yml' > e2e-artifacts/hub-data.txt 2>&1 || true
+
+      - name: Upload screenshots, traces and logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-instances-artifacts
+          path: e2e-artifacts/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          for p in $(docker ps -aq --filter label=com.docker.compose.project | xargs -r docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' | sort -u | grep '^portcullis-echo-'); do
+            docker compose -p "$p" down -v 2>/dev/null || true
+          done
           docker compose down -v

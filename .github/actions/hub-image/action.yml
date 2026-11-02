@@ -1,0 +1,27 @@
+name: Hub image
+description: >-
+  Cross-repo feature branches: when porelli/portcullis-hub has a branch with
+  this run's branch name (not main), build the Hub from it and use that image
+  (HUB_IMAGE=portcullis-hub:ci, HUB_LOCAL=1 for the later steps), so core and
+  Hub changes that must ship together are tested together without publishing
+  an image. Otherwise nothing changes: the compose default (the published
+  edge image) is pulled as before.
+
+runs:
+  using: composite
+  steps:
+    - name: Build the Hub from the same-named branch (if any)
+      shell: bash
+      env:
+        REF: ${{ github.head_ref || github.ref_name }}
+      run: |
+        url=https://github.com/porelli/portcullis-hub
+        if ! [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || [ "$REF" = main ] || [[ "$REF" == v* ]] \
+            || ! git ls-remote --exit-code --heads "$url" "$REF" >/dev/null; then
+          echo "Hub: the published image ($(docker compose config --format json | jq -r .services.hub.image))" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        git clone --quiet --depth=1 --branch "$REF" "$url" "$RUNNER_TEMP/portcullis-hub"
+        echo "Hub: built from portcullis-hub@$REF ($(git -C "$RUNNER_TEMP/portcullis-hub" rev-parse --short HEAD))" | tee -a "$GITHUB_STEP_SUMMARY"
+        docker buildx build --load --provenance=false -t portcullis-hub:ci "$RUNNER_TEMP/portcullis-hub"
+        { echo "HUB_IMAGE=portcullis-hub:ci"; echo "HUB_LOCAL=1"; } >> "$GITHUB_ENV"

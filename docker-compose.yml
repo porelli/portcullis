@@ -175,6 +175,14 @@ services:
       TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_TO: websecure
       TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_SCHEME: https
       TRAEFIK_ENTRYPOINTS_WEBSECURE_ADDRESS: ":443"
+      # Traefik v3 cuts a request after 60 s of readTimeout (the request
+      # context ends with the connection's read deadline, even mid-response).
+      # The Hub's instance backup / restore / delete run synchronously in the
+      # request and can take minutes (contract §11.4-11.6), so websecure
+      # allows 15 min (Traefik v2's default was no limit at all; Go also
+      # applies it to reading headers, as no separate header timeout is set).
+      # CI drives a > 60 s backup through it (job e2e-instances).
+      TRAEFIK_ENTRYPOINTS_WEBSECURE_TRANSPORT_RESPONDINGTIMEOUTS_READTIMEOUT: 15m
       TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_CERTRESOLVER: letsencrypt
       TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_DOMAINS_0_MAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
       TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_DOMAINS_0_SANS: "*.${PORTCULLIS_DOMAIN:-portcullis.local}"
