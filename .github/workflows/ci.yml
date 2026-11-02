@@ -1539,8 +1539,13 @@ jobs:
             | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
           kc "/users?username=testuser&exact=true" | jq -e --arg id "$TEST_ID" '.[0].id == $id' >/dev/null || { echo "FAIL: testuser removed while LLDAP was down"; exit 1; }
           kcgroup lldap_admin || { echo "FAIL: lldap_admin dropped while LLDAP was down"; exit 1; }
-          # Keycloak's pooled LDAP connections were cut: let one sync reconnect.
-          kcpost "/user-storage/$LDAP_ID/sync?action=triggerFullSync" >/dev/null || sleep 5
+          # Keycloak reaches LLDAP again (its JVM caches the failed DNS lookup
+          # for a while; a sync that can't reach LDAP answers 0 updated users).
+          for i in $(seq 1 30); do
+            kcpost "/user-storage/$LDAP_ID/sync?action=triggerFullSync" | jq -e '.updated > 0' >/dev/null 2>&1 && break
+            [ "$i" -eq 30 ] && { echo "FAIL: Keycloak doesn't reach LLDAP again"; exit 1; }
+            sleep 3
+          done
 
           # Deleted straight in LLDAP: the next sync drops the group; the
           # user goes at its next lookup (the Hub lists all users every 15 min).
