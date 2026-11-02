@@ -159,9 +159,10 @@ _domains_last() {
 # PORTCULLIS_PUBLIC_IPV4 / _IPV6 (environment or .env; an empty _IPV6 =
 # no IPv6) always wins; otherwise public_ip_detect (HTTPS, two services
 # must agree, global unicast only) — skipped while no domain is enrolled
-# (domains_enrolled). A failed or skipped lookup keeps the last detected
-# address. No address = the service keeps the records it set and renews
-# certificates, but sets no new records (fail closed). The result is
+# (domains_enrolled): then no address unless .env sets one. A lookup that
+# ran and failed keeps the last detected address. No address = the service
+# keeps the records it set and renews certificates, but sets no new
+# records (fail closed). The result is
 # written to secrets/domains/public-ips.env, the domains service's
 # env_file (a manual `docker compose up` gets it too).
 domains_public_ips() {
@@ -173,14 +174,15 @@ domains_public_ips() {
     [ "$lookup" = false ] || v4="$(public_ip_detect 4)"
     if [ -n "$v4" ]; then
       _domains_last 4 "$v4"
-    else
+    elif [ "$lookup" = true ]; then
+      # Only a lookup that ran and failed falls back to the last address
+      # (a skipped one publishes none: secrets/ restored on a new server
+      # must not hand the old server's address to the first enrollment).
       v4="$(_domains_last 4)"
-      if [ "$lookup" = true ]; then
-        if [ -n "$v4" ]; then
-          warn "IPv4 detection failed: keeping the last detected address $v4 (set PORTCULLIS_PUBLIC_IPV4 in .env if it changed)."
-        else
-          warn "Could not detect the public IPv4 reliably (two HTTPS services must agree on a global address): enrolled domains keep their records but get no new ones until it is known — set PORTCULLIS_PUBLIC_IPV4 in .env."
-        fi
+      if [ -n "$v4" ]; then
+        warn "IPv4 detection failed: keeping the last detected address $v4 (set PORTCULLIS_PUBLIC_IPV4 in .env if it changed)."
+      else
+        warn "Could not detect the public IPv4 reliably (two HTTPS services must agree on a global address): enrolled domains keep their records but get no new ones until it is known — set PORTCULLIS_PUBLIC_IPV4 in .env."
       fi
     fi
   fi
@@ -191,9 +193,9 @@ domains_public_ips() {
     [ "$lookup" = false ] || v6="$(public_ip_detect 6)"
     if [ -n "$v6" ]; then
       _domains_last 6 "$v6"
-    else
+    elif [ "$lookup" = true ]; then
       v6="$(_domains_last 6)"
-      [ -z "$v6" ] || [ "$lookup" = false ] || warn "IPv6 detection failed: keeping the last detected address $v6 (set PORTCULLIS_PUBLIC_IPV6= in .env if the server has no IPv6 any more)."
+      [ -z "$v6" ] || warn "IPv6 detection failed: keeping the last detected address $v6 (set PORTCULLIS_PUBLIC_IPV6= in .env if the server has no IPv6 any more)."
     fi
   fi
   [ "$lookup" = true ] || info "No enrolled domain: public address lookups skipped (run ./portcullis up again after enrolling the first domain)."

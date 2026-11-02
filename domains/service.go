@@ -713,7 +713,9 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 }
 
 // wantAddrs are the addresses <name>'s records must show: the configured
-// ones, or — the IPv4 unknown — the ones the records were last set to.
+// ones, or — the IPv4 unknown — the IPv4 the records were last set to
+// (and the last IPv6 unless a configured one is known: a fresh IPv6
+// always counts).
 func (s *Service) wantAddrs(name string) (netip.Addr, netip.Addr) {
 	if s.cfg.IPv4.IsValid() {
 		return s.cfg.IPv4, s.cfg.IPv6
@@ -725,6 +727,9 @@ func (s *Service) wantAddrs(name string) (netip.Addr, netip.Addr) {
 		return netip.Addr{}, netip.Addr{}
 	}
 	v4, _ := netip.ParseAddr(d.AppliedIPv4)
+	if s.cfg.IPv6.IsValid() {
+		return v4, s.cfg.IPv6
+	}
 	v6, _ := netip.ParseAddr(d.AppliedIPv6)
 	return v4, v6
 }

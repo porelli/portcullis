@@ -1224,3 +1224,20 @@ func writeKey(t *testing.T, id *age.X25519Identity) string {
 	}
 	return p
 }
+
+// TestWantAddrsFreshIPv6: with the IPv4 unknown, the records check wants
+// the applied IPv4 but a configured IPv6 over the applied one.
+func TestWantAddrsFreshIPv6(t *testing.T) {
+	s := &Service{doc: &storeDoc{Domains: map[string]*Domain{"d.example.org": {Name: "d.example.org", AppliedIPv4: "203.0.113.10", AppliedIPv6: "2001:db8::10"}}}}
+	if v4, v6 := s.wantAddrs("d.example.org"); v4.String() != "203.0.113.10" || v6.String() != "2001:db8::10" {
+		t.Fatalf("applied: %v %v", v4, v6)
+	}
+	s.cfg.IPv6 = netip.MustParseAddr("2001:db8::99")
+	if v4, v6 := s.wantAddrs("d.example.org"); v4.String() != "203.0.113.10" || v6.String() != "2001:db8::99" {
+		t.Fatalf("fresh IPv6: %v %v", v4, v6)
+	}
+	s.cfg.IPv4 = netip.MustParseAddr("198.51.100.1")
+	if v4, v6 := s.wantAddrs("d.example.org"); v4.String() != "198.51.100.1" || v6.String() != "2001:db8::99" {
+		t.Fatalf("configured: %v %v", v4, v6)
+	}
+}
