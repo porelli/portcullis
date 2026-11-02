@@ -58,7 +58,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: shellcheck
-        run: shellcheck -S warning portcullis scripts/lib/*.sh tests/*.sh vault/entrypoint.sh
+        run: shellcheck -S warning portcullis scripts/lib/*.sh tests/*.sh vault/entrypoint.sh .github/automerge/*.sh
+      - name: Dependabot auto-merge tests (fake gh + fixtures)
+        run: bash .github/automerge/test.sh
       - name: realm export fits Keycloak's columns
         run: |
           # Most Keycloak columns are varchar(255) (an import with a longer

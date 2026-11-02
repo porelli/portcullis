@@ -1,4 +1,8 @@
 # Dependency updates, weekly, one grouped PR per ecosystem.
+# Merged by .github/workflows/dependabot-automerge.yml once CI passes (patch,
+# minor, digest-only); majors get `major-update` and wait for a manual merge;
+# pre-releases are closed; red CI opens an `update-failed` issue. pip, Go and
+# Actions skip pre-releases by default; docker needs the ranges below.
 # Not covered (update by hand, CI's pin check keeps them tag@sha256): the
 # image constants in scripts/lib/*.sh (PORTCULLIS_HELPER_IMAGE,
 # BACKUP_RESTIC_IMAGE) and the images used inline in .github/workflows/ci.yml.
@@ -22,6 +26,10 @@ updates:
     groups:
       enroll-images:
         patterns: ["*"]
+    # No pre-releases (golang 1.28rc1 = Gem 1.28.rc.1; see the python note).
+    ignore:
+      - dependency-name: "golang"
+        versions: [">= 1.28.a, < 1.28", ">= 1.29.a, < 1.29", ">= 1.30.a, < 1.30"]
 
   # domains/Dockerfile base images (golang, alpine).
   - package-ecosystem: docker
@@ -31,6 +39,10 @@ updates:
     groups:
       domains-images:
         patterns: ["*"]
+    # No pre-releases (golang 1.28rc1 = Gem 1.28.rc.1; see the python note).
+    ignore:
+      - dependency-name: "golang"
+        versions: [">= 1.28.a, < 1.28", ">= 1.29.a, < 1.29", ">= 1.30.a, < 1.30"]
 
   # group-gate/Dockerfile base image (python).
   - package-ecosystem: docker
@@ -40,6 +52,14 @@ updates:
     groups:
       group-gate-images:
         patterns: ["*"]
+    # No pre-releases: Dependabot's own filter let python 3.16.0a1 through
+    # (PR #1). Docker `versions` use Ruby Gem requirement syntax:
+    # ">= X.Y.0.a, < X.Y.0" is exactly X.Y.0's alphas, betas and rcs. Add the
+    # next minor when its pre-releases start; .github/automerge closes any
+    # pre-release PR that still gets through.
+    ignore:
+      - dependency-name: "python"
+        versions: [">= 3.16.0.a, < 3.16.0", ">= 3.17.0.a, < 3.17.0", ">= 3.18.0.a, < 3.18.0"]
 
   # group-gate/requirements.txt (cryptography, PyJWT + deps; pins with hashes).
   - package-ecosystem: pip

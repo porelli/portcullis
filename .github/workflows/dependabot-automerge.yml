@@ -1,0 +1,141 @@
+name: Dependabot auto-merge
+
+# Merges green Dependabot patch / minor / digest-only PRs into main, labels
+# majors `major-update` (never merged), closes pre-releases, and opens or
+# updates one `update-failed` issue per app + version jump when CI is red.
+# Logic and rules: .github/automerge/automerge.sh (tests: test.sh there).
+#
+# Security: workflow_run, never pull_request_target. Runs main's code only
+# (the checkout is the default branch's .github/automerge, never the PR),
+# reads every fact from the API, and checks the PR is dependabot[bot]'s own
+# single signed commit from this repo whose head SHA is the one every required
+# workflow passed on. The merge itself uses --match-head-commit. No branch
+# protection or repo auto-merge setting is needed.
+#
+# A merge made with GITHUB_TOKEN starts no push workflows, so `dispatch`
+# re-runs main's CI with workflow_dispatch (caches are saved by push runs only, so
+# they refresh with the next human push).
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: ["dependabot/**"]
+  # Re-evaluate one PR by hand (e.g. PRs whose CI finished before this
+  # workflow existed). dry_run only prints the decision.
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Dependabot PR number"
+        required: true
+        type: string
+      dry_run:
+        description: "Only print the decision"
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: dependabot-automerge-${{ github.event.workflow_run.head_branch || inputs.pr }}
+  cancel-in-progress: false
+
+env:
+  REPO: ${{ github.repository }}
+  BASE_BRANCH: main
+  # Every one must have succeeded on the PR head SHA.
+  REQUIRED_WORKFLOWS: .github/workflows/ci.yml
+
+jobs:
+  decide:
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request') ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      action: ${{ steps.decide.outputs.action }}
+      issue: ${{ steps.decide.outputs.issue }}
+      decision: ${{ steps.decide.outputs.decision }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          sparse-checkout: .github/automerge
+          persist-credentials: false
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          PR: ${{ inputs.pr }}
+        run: bash .github/automerge/automerge.sh decide
+
+  # Merge / label major / close pre-release. The only job that can write
+  # contents or PRs.
+  pr:
+    needs: decide
+    if: >-
+      contains(fromJSON('["merge","major","prerelease"]'), needs.decide.outputs.action) &&
+      !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          sparse-checkout: .github/automerge
+          persist-credentials: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          DECISION: ${{ needs.decide.outputs.decision }}
+        run: bash .github/automerge/automerge.sh pr
+
+  # Open / update the update-failed issue (red), or close it (merged).
+  issue:
+    needs: [decide, pr]
+    if: >-
+      !cancelled() && needs.decide.result == 'success' &&
+      !(github.event_name == 'workflow_dispatch' && inputs.dry_run) &&
+      (needs.decide.outputs.issue == 'open' ||
+       (needs.decide.outputs.issue == 'close' && needs.pr.result == 'success'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          sparse-checkout: .github/automerge
+          persist-credentials: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          DECISION: ${{ needs.decide.outputs.decision }}
+        run: bash .github/automerge/automerge.sh issue
+
+  # Main's checks after a merge (GITHUB_TOKEN pushes start no workflows).
+  dispatch:
+    needs: [decide, pr]
+    if: needs.decide.outputs.action == 'merge' && needs.pr.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          sparse-checkout: .github/automerge
+          persist-credentials: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          DECISION: ${{ needs.decide.outputs.decision }}
+          POST_MERGE_WORKFLOWS: |
+            ci.yml
+        run: bash .github/automerge/automerge.sh dispatch
