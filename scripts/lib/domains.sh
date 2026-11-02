@@ -136,7 +136,18 @@ domains_public_ips() {
     [ -n "$v4" ] || warn "Could not detect the public IPv4 reliably (two HTTPS services must agree on a global address): enrolled domains get no records until it is known — set PORTCULLIS_PUBLIC_IPV4 in .env."
   fi
   if [ -z "${PORTCULLIS_PUBLIC_IPV6+x}" ]; then
+    # No IPv6 means "remove the AAAA records": a transient detection
+    # failure keeps the last detected address instead.
+    local last
+    last="$(_domains_dir)/last-public-ipv6"
     v6="$(public_ip_detect 6)"
+    if [ -n "$v6" ]; then
+      (umask 077 && printf '%s\n' "$v6" > "$last")
+    elif [ -s "$last" ]; then
+      v6="$(head -n1 "$last")"
+      ipv6_is_global "$v6" || v6=""
+      [ -z "$v6" ] || warn "IPv6 detection failed: keeping the last detected address $v6 (set PORTCULLIS_PUBLIC_IPV6= in .env if the server has no IPv6 any more)."
+    fi
   fi
   export PORTCULLIS_PUBLIC_IPV4="$v4" PORTCULLIS_PUBLIC_IPV6="$v6"
 }

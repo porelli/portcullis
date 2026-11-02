@@ -44,8 +44,13 @@ networks:
     internal: true
   alerting: {}
   # Domains service (contract §12): the Hub ⇄ domains API, only those two.
+  # Fixed subnet: the API answers only connections addressed to it there
+  # (DOMAINS_API_SUBNET), never on portcullis-certs or domains-egress.
   portcullis-domains:
     internal: true
+    ipam:
+      config:
+        - subnet: ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28}
   # domains ⇄ Traefik only: the certificate endpoint (mTLS, contract §12.4).
   portcullis-certs:
     internal: true
@@ -939,6 +944,7 @@ services:
       # Detected by ./portcullis up (as `dns setup` does) unless set in .env.
       DOMAINS_PUBLIC_IPV4: ${PORTCULLIS_PUBLIC_IPV4:-}
       DOMAINS_PUBLIC_IPV6: ${PORTCULLIS_PUBLIC_IPV6:-}
+      DOMAINS_API_SUBNET: ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28}
     volumes:
       - domains_data:/data
       - ./secrets/domains/api-secret:/run/portcullis/domains/api-secret:ro

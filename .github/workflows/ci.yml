@@ -233,6 +233,8 @@ jobs:
               and ([$d.volumes[] | select(.type == "volume") | .source] == ["domains_data"])
               and ([.services | to_entries[] | select([.value.volumes[]? | select(.type == "volume") | .source] | index("domains_data")) | .key] == ["domains"])
               and ([$d.environment | keys[] | select(test("TOKEN|SECRET|KEY|PASSWORD"))] == [])
+              and ($d.environment.DOMAINS_API_SUBNET | length > 0)
+              and $d.environment.DOMAINS_API_SUBNET == .networks["portcullis-domains"].ipam.config[0].subnet
               and $t.environment.TRAEFIK_PROVIDERS_HTTP_ENDPOINT == "https://domains:8443/traefik/dynamic"
               and $t.environment.TRAEFIK_PROVIDERS_HTTP_POLLINTERVAL == "10s" and $t.environment.TRAEFIK_PROVIDERS_HTTP_POLLTIMEOUT == "5s"
               and $t.environment.TRAEFIK_PROVIDERS_HTTP_MAXRESPONSEBODYSIZE == "4194304"
@@ -341,6 +343,8 @@ jobs:
           go vet ./...
           go vet -tags testprovider ./...
           test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
+          # The production build (no tags) never links the fake provider.
+          if go list -deps . | grep -q 'internal/fakedns'; then echo "FAIL: production build links internal/fakedns"; exit 1; fi
           CGO_ENABLED=1 go test -race ./...
       - name: Save the Go module and build cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'
@@ -932,6 +936,10 @@ jobs:
                    | docker run --rm -i --network portcullis_portcullis-domains "$CURL_IMG" -s -H @- -H 'Content-Type: application/json' "$@"; }
           code=$(docker run --rm --network portcullis_portcullis-domains "$CURL_IMG" -s -o /dev/null -w '%{http_code}' http://domains:8080/domains)
           [ "$code" = 401 ] || { echo "FAIL: domains API without the bearer secret got $code"; exit 1; }
+          # The API answers only on portcullis-domains: not to Traefik (portcullis-certs).
+          if docker compose exec -T traefik wget -q -T 5 -O /dev/null http://domains:8080/healthz 2>/dev/null; then
+            echo "FAIL: Traefik reached the domains API"; exit 1
+          fi
           # The certificate endpoint, as Traefik fetches it (client certificate), and without.
           E=secrets/domains/certs-endpoint
           dyn() { docker run --rm --user 0:0 --network portcullis_portcullis-certs -v "$PWD/$E:/c:ro" "$CURL_IMG" \
