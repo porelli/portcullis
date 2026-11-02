@@ -344,13 +344,15 @@ def main() -> int:
 
         def invite_broker_other_client_denied():
             client = os.environ["E2E_BYPASS_CLIENT"]
-            page.route(re.compile(re.escape(AUTH) + r"/oauth2/start"), lambda route: route.abort())
+            # Redeem the link without following its redirect to /oauth2/start
+            # (the browser would finish the forward-auth login and use the
+            # redemption up): the context's request API shares the cookie jar,
+            # so the redemption cookie lands in the browser.
             page.goto(os.environ["E2E_BYPASS_INVITE"], wait_until="domcontentloaded")
-            try:
-                page.click("#invite-continue")  # redeem: sets the redemption cookie, then /oauth2/start (aborted)
-                page.wait_for_timeout(1500)
-            except PWError:
-                pass
+            r = page.request.post(os.environ["E2E_BYPASS_INVITE"], max_redirects=0)
+            assert r.status == 303 and r.headers.get("location", "").startswith(AUTH + "/oauth2/start"), \
+                f"redeem: HTTP {r.status} {r.headers.get('location')}"
+            assert any(c["name"] == "portcullis_invite" for c in ctx.cookies([ENROLL + "/invite/"])), "no redemption cookie"
             codes = []
             page.on("request", lambda r: codes.append(r.url) if r.url.startswith(APP + "/bypass-cb") else None)
             q = urllib.parse.urlencode({"client_id": client, "response_type": "code", "scope": "openid",

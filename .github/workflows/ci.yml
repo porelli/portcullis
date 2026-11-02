@@ -2048,7 +2048,7 @@ jobs:
         run: |
           mkdir -p e2e-artifacts
           docker compose ps -a > e2e-artifacts/compose-ps.txt 2>&1 || true
-          for svc in traefik keycloak forward-auth group-gate lldap vault socket-proxy-traefik prometheus grafana alertmanager blackbox; do
+          for svc in traefik keycloak forward-auth forward-auth-ext group-gate lldap vault enroll socket-proxy-traefik prometheus grafana alertmanager blackbox; do
             docker compose logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
           done
 

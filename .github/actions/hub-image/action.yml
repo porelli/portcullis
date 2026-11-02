@@ -23,5 +23,10 @@ runs:
         fi
         git clone --quiet --depth=1 --branch "$REF" "$url" "$RUNNER_TEMP/portcullis-hub"
         echo "Hub: built from portcullis-hub@$REF ($(git -C "$RUNNER_TEMP/portcullis-hub" rev-parse --short HEAD))" | tee -a "$GITHUB_STEP_SUMMARY"
-        docker buildx build --load --provenance=false -t portcullis-hub:ci "$RUNNER_TEMP/portcullis-hub"
+        # Retried: the module download from proxy.golang.org fails now and then.
+        for i in 1 2 3; do
+          docker buildx build --load --provenance=false -t portcullis-hub:ci "$RUNNER_TEMP/portcullis-hub" && break
+          [ "$i" = 3 ] && { echo "::error::the Hub image did not build"; exit 1; }
+          sleep 20
+        done
         { echo "HUB_IMAGE=portcullis-hub:ci"; echo "HUB_LOCAL=1"; } >> "$GITHUB_ENV"
