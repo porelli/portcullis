@@ -176,6 +176,27 @@ rm -f "$STUB_DIR/calls"
 ct_own "$(id -u):$(id -g)" "$HR/secrets/enroll/role-id"
 expect_fail "ct_own: no-op when already right" test -s "$STUB_DIR/calls"
 
+# ── stack_prepare: appfiles/ (the Hub's settings data files, contract §13.7) ──
+SP_ROOT="$WORK/sp-root"
+mkdir -p "$SP_ROOT"
+rm -f "$STUB_DIR/calls"
+( PORTCULLIS_ROOT="$SP_ROOT"
+  volume_own() { :; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  unset -f users_secret_files monitoring_prepare domains_prepare
+  stack_prepare ) >/dev/null 2>&1
+expect_ok "stack_prepare: creates appfiles/" test -d "$SP_ROOT/appfiles"
+expect_eq "stack_prepare: appfiles/ is 0750" "$(file_mode "$SP_ROOT/appfiles")" 750
+expect_ok "stack_prepare: appfiles/ chowned to the Hub (10001)" \
+  grep -q "src=$SP_ROOT/appfiles,dst=/t/0 .* chown 10001:10001 /t/0\$" "$STUB_DIR/calls"
+# A Hub-owned (or already chowned) appfiles/ is left alone: no chmod as us.
+chmod 700 "$SP_ROOT/appfiles"
+( PORTCULLIS_ROOT="$SP_ROOT"; _owner_of() { echo 10001:10001; }
+  volume_own() { :; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  unset -f users_secret_files monitoring_prepare domains_prepare
+  stack_prepare ) >/dev/null 2>&1
+expect_eq "stack_prepare: a 10001-owned appfiles/ keeps its mode" "$(file_mode "$SP_ROOT/appfiles")" 700
+rm -f "$STUB_DIR/calls"
+
 # ══ network: IP math / validation ══════════════════════════
 expect_eq "ip_to_int" "$(ip_to_int 172.31.250.2)" "$(( (172<<24) | (31<<16) | (250<<8) | 2 ))"
 expect_eq "ip_to_int leading zeros are decimal" "$(ip_to_int 010.0.0.8)" "$(( (10<<24) | 8 ))"
@@ -465,6 +486,26 @@ expect_eq "prune: keeps the newest BACKUP_KEEP_LOCAL, leaves other dirs" "$(cd "
 expect_eq "backup dirs: only timestamped ones" "$(_backup_dirs | tr '\n' ' ')" "20260102-000000 20260103-000000 "
 expect_eq "restic creds: BACKUP_<NAME> wins" "$(AWS_ACCESS_KEY_ID=dns BACKUP_AWS_ACCESS_KEY_ID=bak _backup_cred AWS_ACCESS_KEY_ID)" bak
 expect_eq "restic creds: falls back to <NAME>" "$(B2_ACCOUNT_ID=b2 _backup_cred B2_ACCOUNT_ID)" b2
+
+# backup_create never archives appfiles/: the Hub regenerates it from its
+# state (hub_data), so a copy would only be stale, secret-bearing files.
+BC_ROOT="$WORK/bc-root"
+mkdir -p "$BC_ROOT/appfiles/echo-a" "$BC_ROOT/secrets" "$BC_ROOT/certs" "$BC_ROOT/templates/echo"
+echo 'PORTCULLIS_DOMAIN=x' > "$BC_ROOT/.env"
+echo '{"version":1,"instance":"echo-a","values":{"k":"APPFILE-MARKER"}}' > "$BC_ROOT/appfiles/echo-a/data.json"
+echo k > "$BC_ROOT/secrets/k"
+# shellcheck disable=SC2034  # read by backup_create
+( PORTCULLIS_ROOT="$BC_ROOT" BACKUP_ROOT="$BC_ROOT/backups" BACKUP_FILE_VOLUMES=""
+  _BACKUP_CFG='{"services":{"hub":{"image":"hub:1"}}}'
+  dc() { :; }; wait_healthy() { :; }; vault_wait_active() { :; }; vault_admin_env() { echo t; }
+  _backup_vault_snapshot() { echo snap > "$1"; }; _backup_pg_dump() { echo PGDMP > "$1"; }
+  _backup_metrics() { :; }
+  backup_create ) >/dev/null 2>&1
+BC_DIR="$(find "$BC_ROOT/backups" -mindepth 1 -maxdepth 1 -type d -name '2*' | head -n1)"
+expect_ok "backup: a backup was made" test -f "$BC_DIR/MANIFEST.json"
+expect_ok "backup: secrets/ archived (sanity)" test -f "$BC_DIR/secrets/k"
+expect_fail "backup: appfiles/ not archived" sh -c "find '$BC_DIR' -path '*appfiles*' | grep -q . || grep -rq APPFILE-MARKER '$BC_DIR'"
+expect_eq "backup: appfiles/ not in the manifest" "$(jq -r '.files | keys[] | select(test("appfiles"))' "$BC_DIR/MANIFEST.json")" ""
 
 # Vault snapshot check: a real-sized snapshot (meta.json first, then a large
 # state.bin) under pipefail. `tar -t | grep -q` used to die of SIGPIPE here.

@@ -1183,13 +1183,16 @@ jobs:
 
           # Attribute headers (contract §5): group-gate's reach the app, the
           # client's never do (whoami echoes the request headers).
-          printf '%s' '{"version":1,"fields":{"city":"City"},"users":{"testuser":{"city":["Milan"]}}}' \
+          printf '%s' '{"version":2,"fields":{"city":"City"},"users":{"testuser":{"city":["Milan"]}},"hosts":{"gated.portcullis.local":{"Gated-Role":{"testuser":"Admin, Ops"}},"other.portcullis.local":{"Other-Role":{"testuser":"x"}}}}' \
             | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
                 sh -c 'cat > /d/user-attributes.json && chmod 644 /d/user-attributes.json'
           curl -s --cacert certs/ca-chain.crt --resolve "gated.portcullis.local:443:127.0.0.1" \
             -H 'X-Auth-Request-Preferred-Username: testuser' -H 'X-Forwarded-Attr-City: Forged' -H 'X-Forwarded-Attr-Forged: x' \
             -H 'x-forwarded-attr-lower: x' https://gated.portcullis.local/ > /tmp/attrs.out || true
           grep -qx 'X-Forwarded-Attr-City: Milan' <(tr -d '\r' < /tmp/attrs.out) || { echo "FAIL: attribute header missing"; cat /tmp/attrs.out; exit 1; }
+          # Per-host header (v2 `hosts`): this host's only, sent verbatim.
+          grep -qx 'X-Forwarded-Attr-Gated-Role: Admin, Ops' <(tr -d '\r' < /tmp/attrs.out) || { echo "FAIL: per-host attribute header missing"; cat /tmp/attrs.out; exit 1; }
+          if grep -qi 'Other-Role' /tmp/attrs.out; then echo "FAIL: another host's attribute header reached the app"; cat /tmp/attrs.out; exit 1; fi
           if grep -qi 'Forged\|attr-lower' /tmp/attrs.out; then echo "FAIL: client-sent X-Forwarded-Attr-* reached the app"; cat /tmp/attrs.out; exit 1; fi
           echo "PASS: attribute headers from user-attributes.json; client copies stripped"
 
@@ -1306,7 +1309,7 @@ jobs:
           SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"
           code=$(curl -s -o /dev/null -w '%{http_code}' -H @<(printf 'X-Portcullis-Proxy-Secret: %s\n' "$SECRET") "http://$HUB_IP:8888/")
           case "$code" in 401|403|000) echo "FAIL: hub WITH proxy secret got $code"; docker compose logs --tail=20 hub; exit 1 ;; esac
-          docker compose exec -T hub sh -c 'test "$(id -u)" = 10001 && test -w /project/templates && ! grep -q POSTGRES_PASSWORD /project/.env && docker version >/dev/null' \
+          docker compose exec -T hub sh -c 'test "$(id -u)" = 10001 && test -w /project/templates && test -w /project/appfiles && ! grep -q POSTGRES_PASSWORD /project/.env && docker version >/dev/null' \
             || { echo "FAIL: hub runtime (uid / templates / env subset / DOCKER_HOST)"; docker compose logs --tail=20 hub; exit 1; }
           echo "PASS: Hub runs as 10001 without the socket, sees only the env subset, enforces the proxy secret"
 
@@ -2008,7 +2011,7 @@ jobs:
             | docker run --rm -i -v portcullis_hub_data:/d "$ALPINE" sh -c 'cat > /d/group-gate-policy.json && chmod 644 /d/group-gate-policy.json'
           # Shared custom fields (normally written by the Hub): e2e_login.py
           # checks the attribute header reaches the app and forged ones don't.
-          printf '%s' '{"version": 1, "fields": {"city": "City"}, "users": {"e2e": {"city": ["Milan"]}}}' \
+          printf '%s' '{"version": 2, "fields": {"city": "City"}, "users": {"e2e": {"city": ["Milan"]}}}' \
             | docker run --rm -i -v portcullis_hub_data:/d "$ALPINE" sh -c 'cat > /d/user-attributes.json && chmod 644 /d/user-attributes.json'
 
           # Test app behind the standard forward-auth chain.
@@ -2383,9 +2386,9 @@ jobs:
           case "$code" in 400|409) ;; *) echo "FAIL: a host on an unknown domain got $code"; exit 1 ;; esac
           # echo-c: policy mtls (a passkey session steps up); echo-b: a slow
           # stop (its backup takes > 60 s, e2e_instances.py long_backup).
-          code=$(hubc PUT /api/templates/settings/echo-c -d '{"_auth_policy":{"factors":["mtls"],"op":""}}')
+          code=$(hubc PUT /api/instances/echo-c/settings -d '{"auth_policy":{"factors":["mtls"],"op":""}}')
           [ "$code" = 200 ] || { echo "FAIL: echo-c policy: $code $(cat /tmp/hub.out)"; exit 1; }
-          code=$(hubc PUT /api/templates/settings/echo-b -d '{"ECHO_STOP_GRACE":"75s"}')
+          code=$(hubc PUT /api/instances/echo-b/settings -d '{"values":{"echo_stop_grace":"75s"}}')
           [ "$code" = 200 ] || { echo "FAIL: echo-b settings: $code $(cat /tmp/hub.out)"; exit 1; }
 
           # Users and the instances' groups (created by the Hub as the admin).

@@ -395,10 +395,13 @@ stack_prepare() {
     [ -w "$PORTCULLIS_ROOT/$d" ] || fail "$PORTCULLIS_ROOT/$d is not writable (created by Docker as root?). Fix: sudo chown -R \"$(id -un)\" \"$PORTCULLIS_ROOT/secrets\""
   done
   # templates/: the Hub (uid 10001) copies app template dirs here.
+  # appfiles/: the Hub writes settings data files here (contract §13.7);
+  # 0750, 10001-owned (some hold secrets).
   # backups/: mountpoint of the Hub's tmpfs mask (must exist inside the
   # read-only /project bind). certs/truststore: Keycloak's CA truststore.
   mkdir -p "$PORTCULLIS_ROOT/certs/revocation" "$PORTCULLIS_ROOT/certs/truststore" "$PORTCULLIS_ROOT/templates"
   (umask 077 && mkdir -p "$PORTCULLIS_ROOT/backups")
+  (umask 027 && mkdir -p "$PORTCULLIS_ROOT/appfiles")
   [ -f "$PORTCULLIS_ROOT/certs/revocation/revoked-serials.txt" ] || : > "$PORTCULLIS_ROOT/certs/revocation/revoked-serials.txt"
   # Public material, read by Traefik (root w/o DAC_OVERRIDE), group-gate,
   # Keycloak and forward-auth (non-root).
@@ -407,6 +410,8 @@ stack_prepare() {
   [ ! -f "$PORTCULLIS_ROOT/certs/server.key" ] || ct_group_read "$CT_GID_TRAEFIK" "$PORTCULLIS_ROOT/certs/server.key"
   [ "$(_owner_of "$PORTCULLIS_ROOT/templates")" != "$(id -u):$(id -g)" ] || chmod 755 "$PORTCULLIS_ROOT/templates"
   ct_own "$CT_UID_HUB:$CT_UID_HUB" "$PORTCULLIS_ROOT/templates"
+  [ "$(_owner_of "$PORTCULLIS_ROOT/appfiles")" != "$(id -u):$(id -g)" ] || chmod 750 "$PORTCULLIS_ROOT/appfiles"
+  ct_own "$CT_UID_HUB:$CT_UID_HUB" "$PORTCULLIS_ROOT/appfiles"
   # hub_data is also mounted (read-only) by group-gate, which may create it.
   volume_own hub_data "$CT_UID_HUB:$CT_UID_HUB"
   hub_env_write

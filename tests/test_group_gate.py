@@ -579,7 +579,7 @@ class PolicyV5Test(GateTest):
             return e.read().decode()
 
     def test_attribute_headers_on_extra_domain_host(self):
-        write_attrs({"version": 1, "fields": {"city": "City"}, "users": {"bob": {"city": ["Milan"]}}})
+        write_attrs({"version": 2, "fields": {"city": "City"}, "users": {"bob": {"city": ["Milan"]}}})
         write_policy({"extra_domains": [EXTRA], "groups": {f"grafana.{EXTRA}": "users_b"}})
         status, hdrs = self.req(f"grafana.{EXTRA}", groups="users_b", want_headers=True)
         self.assertEqual((status, hdrs.get("X-Forwarded-Attr-City"), hdrs.get("X-Forwarded-User")), (200, "Milan", "bob"))
@@ -1075,7 +1075,7 @@ class PolicyExpiringTest(GateTest):
         self.assertEqual(self.req("grafana.example.com", groups="users_grafana,*", uri="/y"), 403)
 
     def test_attribute_headers(self):
-        write_attrs({"version": 1,
+        write_attrs({"version": 2,
                      "fields": {"city": "City", "cost_center": "Cost-Center", "bio": "Bio", "dept": "Dept"},
                      "users": {"bob": {"city": ["Milan"], "cost_center": ["CC-1", "CC-2"],
                                        "bio": ["evil\r\nX-Injected: 1\x00\x7f"],
@@ -1104,7 +1104,7 @@ class PolicyExpiringTest(GateTest):
         self.assertFalse([k for k in hdrs if k.lower().startswith("x-forwarded-attr-")])
         # `%` and `,` are percent-encoded in every value (single ones too), so
         # the ", " separator is unambiguous.
-        write_attrs({"version": 1, "fields": {"name": "Name", "quota": "Quota"},
+        write_attrs({"version": 2, "fields": {"name": "Name", "quota": "Quota"},
                      "users": {"bob": {"name": ["Doe, Jane", "Roe,Rick"], "quota": ["100%,%2C"]}}})
         status, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
         self.assertEqual(hdrs.get("X-Forwarded-Attr-Name"), "Doe%2C Jane, Roe%2CRick")
@@ -1112,7 +1112,7 @@ class PolicyExpiringTest(GateTest):
         self.assertEqual([urllib.parse.unquote(v) for v in hdrs["X-Forwarded-Attr-Name"].split(", ")],
                          ["Doe, Jane", "Roe,Rick"])
         # Non-ASCII values travel as UTF-8 bytes.
-        write_attrs({"version": 1, "fields": {"city": "City"}, "users": {"bob": {"city": ["Zürich", "東京"]}}})
+        write_attrs({"version": 2, "fields": {"city": "City"}, "users": {"bob": {"city": ["Zürich", "東京"]}}})
         status, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
         self.assertEqual(hdrs.get("X-Forwarded-Attr-City").encode("latin-1").decode("utf-8"), "Zürich, 東京")
 
@@ -1121,7 +1121,7 @@ class PolicyExpiringTest(GateTest):
         # "A--B", an over-long name) is skipped; the other fields still
         # produce their headers.
         long_name = "a" * 32
-        write_attrs({"version": 1,
+        write_attrs({"version": 2,
                      "fields": {"city": "City", "dept_": "Dept-", "a__b": "A--B", long_name: "A" * 32,
                                 "Bad": "Bad", "ok_1": "Ok-1"},
                      "users": {"bob": {"city": ["Milan"], "dept_": ["x"], "a__b": ["y"], long_name: ["z"],
@@ -1131,24 +1131,24 @@ class PolicyExpiringTest(GateTest):
         attrs = {k: v for k, v in hdrs.items() if k.lower().startswith("x-forwarded-attr-")}
         self.assertEqual(attrs, {"X-Forwarded-Attr-City": "Milan", "X-Forwarded-Attr-Ok-1": "v"})
         self.assertEqual(sorted(gg.parse_user_attributes(
-            {"version": 1, "fields": {"city": "City", "dept_": "Dept-"},
-             "users": {"bob": {"city": ["Milan"], "dept_": ["x"]}}})["bob"]),
+            {"version": 2, "fields": {"city": "City", "dept_": "Dept-"},
+             "users": {"bob": {"city": ["Milan"], "dept_": ["x"]}}})[0]["bob"]),
             [("X-Forwarded-Attr-City", "Milan")])
 
     def test_attribute_field_or_header_with_trailing_newline_skipped(self):
         # Python's "$" also matches before a trailing "\n": validation must
         # use fullmatch, so "city\n" / "City\n" are skipped like any other
         # invalid field, and no header is emitted for them.
-        doc = {"version": 1, "fields": {"city\n": "City", "dept": "Dept\n", "ok": "Ok"},
+        doc = {"version": 2, "fields": {"city\n": "City", "dept": "Dept\n", "ok": "Ok"},
                "users": {"bob": {"city\n": ["Milan"], "dept": ["x"], "ok": ["v"]}}}
-        self.assertEqual(gg.parse_user_attributes(doc)["bob"], [("X-Forwarded-Attr-Ok", "v")])
+        self.assertEqual(gg.parse_user_attributes(doc)[0]["bob"], [("X-Forwarded-Attr-Ok", "v")])
         write_attrs(doc)
         status, hdrs = self.req("grafana.example.com", groups="users_grafana", want_headers=True)
         self.assertEqual(status, 200)
         attrs = {k: v for k, v in hdrs.items() if k.lower().startswith("x-forwarded-attr-")}
         self.assertEqual(attrs, {"X-Forwarded-Attr-Ok": "v"})
-        doc = {"version": 1, "fields": {"city": "City\n"}, "users": {"bob": {"city": ["Milan"]}}}
-        self.assertEqual(gg.parse_user_attributes(doc), {})
+        doc = {"version": 2, "fields": {"city": "City\n"}, "users": {"bob": {"city": ["Milan"]}}}
+        self.assertEqual(gg.parse_user_attributes(doc), ({}, {}))
 
     def test_rfc3339_rejects_trailing_newline(self):
         self.assertGreater(gg._parse_rfc3339("2030-01-01T00:00:00Z"), 0)
@@ -1157,13 +1157,13 @@ class PolicyExpiringTest(GateTest):
                 gg._parse_rfc3339(bad)
 
     def test_attribute_headers_missing_or_corrupt_file_never_denies(self):
-        for doc in (None, "{not json", [], {"version": 2, "fields": {}, "users": {}},
-                    {"version": 1, "fields": {"city": "City\r\nX: y"}, "users": {"bob": {"city": ["Milan"]}}},
-                    {"version": 1, "fields": {"city": "City"}, "users": {"bob": {"city": "Milan"}}},
-                    {"version": 1, "fields": {"City!": "City"}, "users": {"bob": {"City!": ["Milan"]}}},
-                    {"version": 1, "fields": [], "users": {}},
+        for doc in (None, "{not json", [], {"version": 3, "fields": {"city": "City"}, "users": {"bob": {"city": ["Milan"]}}},
+                    {"version": 2, "fields": {"city": "City\r\nX: y"}, "users": {"bob": {"city": ["Milan"]}}},
+                    {"version": 2, "fields": {"city": "City"}, "users": {"bob": {"city": "Milan"}}},
+                    {"version": 2, "fields": {"City!": "City"}, "users": {"bob": {"City!": ["Milan"]}}},
+                    {"version": 2, "fields": [], "users": {}},
                     # two fields on one header (header names are case-insensitive)
-                    {"version": 1, "fields": {"city": "City", "town": "CITY"},
+                    {"version": 2, "fields": {"city": "City", "town": "CITY"},
                      "users": {"bob": {"city": ["Milan"], "town": ["Rome"]}}}):
             with self.subTest(doc=doc):
                 write_attrs(doc)
@@ -1172,13 +1172,144 @@ class PolicyExpiringTest(GateTest):
                 self.assertFalse([k for k in hdrs if k.lower().startswith("x-forwarded-attr-")])
 
     def test_no_attribute_headers_on_public_guard(self):
-        write_attrs({"version": 1, "fields": {"city": "City"}, "users": {"bob": {"city": ["Milan"]}}})
+        write_attrs({"version": 2, "fields": {"city": "City"}, "users": {"bob": {"city": ["Milan"]}}})
         write_policy(PUBLIC_DOC)
         status, hdrs = self.req("cloud.example.com", uri="/s/AbC123", gate_path="/public-guard", want_headers=True)
         self.assertEqual(status, 200)
         self.assertFalse([k for k in hdrs if k.lower().startswith("x-forwarded-attr-")])
         write_policy(dict(PUBLIC_DOC, version=4), malformed=True)
         self.assertEqual(self.req("cloud.example.com", uri="/s/AbC123", gate_path="/public-guard"), 403)
+
+
+    # ── user-attributes.json v2: per-host headers (contract §4.1) ──
+    # (The test domain is example.com: hosts outside it are never served.)
+    GRAFANA = "grafana.example.com"
+
+    def attrs_for(self, user, host, groups="users_grafana,users_other"):
+        status, hdrs = self.req(host, groups=groups, want_headers=True,
+                                extra={"X-Auth-Request-Preferred-Username": user})
+        self.assertEqual(status, 200)
+        return {k: v for k, v in hdrs.items() if k.lower().startswith("x-forwarded-attr-")}
+
+    def logged_parse(self, doc):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = gg.parse_user_attributes(doc)
+        return result, buf.getvalue()
+
+    def test_attributes_v2_host_headers(self):
+        write_attrs({"version": 2, "fields": {"department": "Department"},
+                     "users": {"alice": {"department": ["Engineering"]}},
+                     "hosts": {self.GRAFANA: {"Grafana-Role": {"alice": "Admin", "bob": "Editor"}}}})
+        self.assertEqual(self.attrs_for("alice", self.GRAFANA),
+                         {"X-Forwarded-Attr-Grafana-Role": "Admin", "X-Forwarded-Attr-Department": "Engineering"})
+        # Usernames match case-insensitively; the request host is normalised.
+        self.assertEqual(self.attrs_for("Bob", "Grafana.Example.com.:443"), {"X-Forwarded-Attr-Grafana-Role": "Editor"})
+        # Never on a deny.
+        status, hdrs = self.req(self.GRAFANA, groups="users_x", want_headers=True,
+                                extra={"X-Auth-Request-Preferred-Username": "alice"})
+        self.assertEqual(status, 403)
+        self.assertFalse([k for k in hdrs if k.lower().startswith("x-forwarded-attr-")])
+
+    def test_host_header_only_on_its_host(self):
+        write_attrs({"version": 2, "fields": {"department": "Department"},
+                     "users": {"alice": {"department": ["Engineering"]}},
+                     "hosts": {self.GRAFANA: {"Grafana-Role": {"alice": "Admin"}}}})
+        self.assertEqual(self.attrs_for("alice", "other.example.com"), {"X-Forwarded-Attr-Department": "Engineering"})
+        # A user absent from the host map gets only the field headers there.
+        self.assertEqual(self.attrs_for("carol", self.GRAFANA), {})
+
+    def test_attributes_v1_refused(self):
+        for doc in ({"version": 1, "fields": {"department": "Department"},
+                     "users": {"alice": {"department": ["Engineering"]}}},
+                    {"version": 1, "fields": {"department": "Department"},
+                     "users": {"alice": {"department": ["Engineering"]}},
+                     "hosts": {self.GRAFANA: {"Grafana-Role": {"alice": "Admin"}}}},
+                    {"version": "2", "fields": {}, "users": {}}):
+            with self.subTest(doc=doc):
+                write_attrs(doc)
+                self.assertEqual(self.attrs_for("alice", self.GRAFANA), {})  # still allowed
+                with self.assertRaises(gg.AttributesError):
+                    gg.parse_user_attributes(doc)
+
+    def test_host_header_replaces_field_header(self):
+        write_attrs({"version": 2, "fields": {"role": "Role", "city": "City"},
+                     "users": {"alice": {"role": ["Viewer"], "city": ["Milan"]}},
+                     "hosts": {self.GRAFANA: {"Role": {"alice": "Admin"}}}})
+        # One Role header on the wire (dict(headers) would hide a duplicate).
+        r = urllib.request.Request(f"http://127.0.0.1:{self.port}/", headers={
+            "X-Forwarded-Host": self.GRAFANA, "X-Auth-Request-Groups": "users_grafana",
+            "X-Auth-Request-Preferred-Username": "alice"})
+        with urllib.request.urlopen(r) as resp:
+            self.assertEqual(resp.headers.get_all("X-Forwarded-Attr-Role"), ["Admin"])
+            self.assertEqual(resp.headers.get_all("X-Forwarded-Attr-City"), ["Milan"])
+        # Elsewhere the field header stays.
+        self.assertEqual(self.attrs_for("alice", "other.example.com"),
+                         {"X-Forwarded-Attr-Role": "Viewer", "X-Forwarded-Attr-City": "Milan"})
+        # Header names are case-insensitive: "role" replaces "Role" too.
+        write_attrs({"version": 2, "fields": {"role": "Role"}, "users": {"alice": {"role": ["Viewer"]}},
+                     "hosts": {self.GRAFANA: {"role": {"alice": "Admin"}}}})
+        self.assertEqual(gg.user_attribute_headers("alice", self.GRAFANA), [("X-Forwarded-Attr-role", "Admin")])
+
+    def test_host_header_invalid_name_skipped(self):
+        doc = {"version": 2, "fields": {}, "users": {},
+               "hosts": {self.GRAFANA: {"Grafana-Role": {"alice": "Admin"}, "Bad Name": {"alice": "x"},
+                                        "Trail-": {"alice": "x"}, "Nl\n": {"alice": "x"},
+                                        "X-Forwarded-Attr-": {"alice": "x"}, "Ok_1": {"alice": "x"},
+                                        "Team": {"alice": "Blue"}}}}
+        (users, hosts), out = self.logged_parse(doc)
+        self.assertEqual(hosts, {self.GRAFANA: {"alice": [("X-Forwarded-Attr-Grafana-Role", "Admin"),
+                                                          ("X-Forwarded-Attr-Team", "Blue")]}})
+        for bad in ("Bad Name", "Trail-", "Ok_1", "X-Forwarded-Attr-"):
+            self.assertIn(f"skipping invalid attribute header {bad!r}", out)
+        write_attrs(doc)
+        self.assertEqual(self.attrs_for("alice", self.GRAFANA),
+                         {"X-Forwarded-Attr-Grafana-Role": "Admin", "X-Forwarded-Attr-Team": "Blue"})
+
+    def test_host_header_value_limits(self):
+        doc = {"version": 2, "fields": {}, "users": {},
+               "hosts": {self.GRAFANA: {"Bio": {"alice": "evil\r\nX-Injected: 1\x00\x7f"},
+                                        "Big": {"alice": "x" * 1025, "bob": "y" * 1024},
+                                        "Name": {"alice": "Doe, Jane 100%"},
+                                        "City": {"alice": "Zürich"}}}}
+        (_, hosts), out = self.logged_parse(doc)
+        self.assertIn("dropping 1025-byte value of header 'Big'", out)
+        write_attrs(doc)
+        status, hdrs = self.req(self.GRAFANA, groups="users_grafana", want_headers=True,
+                                extra={"X-Auth-Request-Preferred-Username": "alice"})
+        self.assertEqual(status, 200)
+        self.assertEqual(hdrs.get("X-Forwarded-Attr-Bio"), "evilX-Injected: 1")
+        self.assertNotIn("X-Injected", hdrs)
+        self.assertNotIn("X-Forwarded-Attr-Big", hdrs)            # > 1 KB dropped, not truncated
+        self.assertEqual(hdrs.get("X-Forwarded-Attr-Name"), "Doe, Jane 100%")  # verbatim, no encoding
+        self.assertEqual(hdrs.get("X-Forwarded-Attr-City").encode("latin-1").decode("utf-8"), "Zürich")
+        self.assertEqual(self.attrs_for("bob", self.GRAFANA), {"X-Forwarded-Attr-Big": "y" * 1024})
+
+    def test_host_keys_normalised(self):
+        doc = {"version": 2, "fields": {}, "users": {},
+               "hosts": {"Grafana.Example.com": {"Role": {"alice": "Admin"}},
+                         "grafana.example.com.": {"Role": {"alice": "Admin"}},
+                         "grafana.example.com:443": {"Role": {"alice": "Admin"}},
+                         "other.example.com": {"Role": {"alice": "Editor"}}}}
+        (_, hosts), out = self.logged_parse(doc)
+        self.assertEqual(hosts, {"other.example.com": {"alice": [("X-Forwarded-Attr-Role", "Editor")]}})
+        for bad in ("Grafana.Example.com", "grafana.example.com.", "grafana.example.com:443"):
+            self.assertIn(f"skipping attribute host {bad!r}", out)
+        write_attrs(doc)
+        self.assertEqual(self.attrs_for("alice", self.GRAFANA), {})
+        self.assertEqual(self.attrs_for("alice", "other.example.com"), {"X-Forwarded-Attr-Role": "Editor"})
+
+    def test_host_headers_malformed_file_means_none(self):
+        base = {"version": 2, "fields": {"city": "City"}, "users": {"alice": {"city": ["Milan"]}}}
+        for hosts in ([], {self.GRAFANA: []}, {self.GRAFANA: {"Role": "Admin"}},
+                      {self.GRAFANA: {"Role": {"alice": ["Admin"]}}},
+                      # two headers of one host (case-insensitive)
+                      {self.GRAFANA: {"Role": {"alice": "a"}, "ROLE": {"bob": "b"}}}):
+            with self.subTest(hosts=hosts):
+                write_attrs(dict(base, hosts=hosts))
+                self.assertEqual(self.attrs_for("alice", self.GRAFANA), {})
 
 
 class PathFragmentTest(GateTest):

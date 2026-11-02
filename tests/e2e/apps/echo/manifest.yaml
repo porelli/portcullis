@@ -17,9 +17,13 @@ urls:
 settings:
   # Stop timeout of the "hold" service, which ignores SIGTERM: a long
   # value makes a backup (it stops the instance) take longer than
-  # Traefik's default 60 s readTimeout.
-  - key: ECHO_STOP_GRACE
+  # Traefik's default 60 s readTimeout. A compose duration string, so it
+  # is a `string` with a pattern rather than a `duration` (seconds).
+  - key: echo_stop_grace
     label: Stop grace period
     description: How long compose waits for the hold service to stop.
-    type: text
+    type: string
+    pattern: "^[1-9][0-9]{0,3}s$"
     default: 1s
+    delivery:
+      - env: ECHO_STOP_GRACE

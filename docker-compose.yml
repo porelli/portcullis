@@ -744,8 +744,8 @@ services:
     # interrupted at the next start.
     stop_grace_period: 60s
     # The image runs as uid/gid 10001; it writes only /data (named volume,
-    # 10001-owned in the image), /project/templates (chowned to 10001 by
-    # ./portcullis up) and the tmpfs paths below.
+    # 10001-owned in the image), /project/templates and /project/appfiles
+    # (chowned to 10001 by ./portcullis up) and the tmpfs paths below.
     read_only: true
     tmpfs:
       - /tmp
@@ -799,6 +799,11 @@ services:
       # compose files resolve to real files on the HOST (compose resolves them
       # against --project-directory = this checkout). Generated, gitignored.
       - ./templates:/project/templates:rw
+      # Settings data files (contract §13.7): the Hub writes
+      # <instance>/<name>.json (+ .secrets.json) here, and templates
+      # bind-mount `./appfiles/<instance>` read-only into their services.
+      # Generated from Hub state (not backed up), gitignored.
+      - ./appfiles:/project/appfiles:rw
       # The Hub only needs /project/templates, the config file targets and
       # the core variables templates reference. Mask the Vault root token /
       # unseal key (secrets/) and backups (which contain copies of secrets/

@@ -96,13 +96,20 @@ Config sources (both re-read on every request; they are tiny):
     hostname, a malformed `extra_domains`, or a policy / expiry with
     unknown factor names / op / rule shape fails CLOSED (403).
   - /hub-data/user-attributes.json — written by the Hub (contract §4.1):
-    {"version": 1, "fields": {"<field>": "<Header-Name>"},
-     "users": {"<user>": {"<field>": ["value", ...]}}}. Every allow on / and
-    /authenticated returns X-Forwarded-Attr-<Header-Name>: control
-    characters stripped, values over 1 KB dropped (logged), `%` -> `%25`
-    and `,` -> `%2C` in each value, values joined with ", ". A field whose
-    name or header name is invalid is skipped (logged); missing / corrupt
-    file (logged; also two fields on one header, case-insensitive) = no
+    {"version": 2, "fields": {"<field>": "<Header-Name>"},
+     "users": {"<user>": {"<field>": ["value", ...]}},
+     "hosts": {"<host>": {"<Header-Name>": {"<user>": "value"}}}}. Every
+    allow on / and /authenticated returns X-Forwarded-Attr-<Header-Name>
+    for the user's fields: control characters stripped, values over 1 KB
+    dropped (logged), `%` -> `%25` and `,` -> `%2C` in each value, values
+    joined with ", ". On the request's (normalised) host it also returns
+    that host's headers for the user: one value, control characters
+    stripped, over 1 KB dropped (logged), no `,` encoding; it replaces a
+    same-named field header. A field whose name or header name is
+    invalid, a host key that isn't a lowercase valid hostname, or a host
+    header with an invalid name is skipped (logged); version 1 or any
+    other version, a missing / corrupt file (logged; also two fields on
+    one header, case-insensitive, or two headers of one host) = no
     attribute headers, never a deny.
   - Token headers: Authorization / X-Forwarded-Access-Token are echoed on
     allow (portcullis-groups lists them in authResponseHeaders) unless an
@@ -573,7 +580,7 @@ ATTR_VALUE_MAX = 1024  # bytes (UTF-8) per value; longer values are dropped
 _ATTR_FIELD_RE = re.compile(r"(?=.{1,31}\Z)[a-z][a-z0-9]*(_[a-z0-9]+)*")
 _ATTR_HEADER_RE = re.compile(r"[A-Za-z0-9]+(-[A-Za-z0-9]+){0,30}")
 _ATTR_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
-_ATTR_CACHE: dict = {"key": None, "users": {}}
+_ATTR_CACHE: dict = {"key": None, "users": {}, "hosts": {}}
 _ATTR_LOCK = threading.Lock()
 
 
@@ -587,18 +594,34 @@ def attr_encode(value: str) -> str:
     return value.replace("%", "%25").replace(",", "%2C")
 
 
-def parse_user_attributes(doc) -> dict:
-    """{lowercase user: [(header, value)]} from a user-attributes.json
-    document; raises AttributesError if it is malformed. Control characters
-    are stripped from every value; values longer than ATTR_VALUE_MAX bytes
-    are dropped (logged, never truncated). In every value `%` becomes `%25`
-    and `,` becomes `%2C` (so "Doe, Jane" stays one value), then the values
-    are joined with ", "."""
-    if not isinstance(doc, dict) or doc.get("version") != 1:
-        raise AttributesError("not a version 1 document")
-    fields, users = doc.get("fields", {}), doc.get("users", {})
-    if not isinstance(fields, dict) or not isinstance(users, dict):
-        raise AttributesError("'fields' / 'users' is not an object")
+def _attr_clean(value: str, what: str) -> str:
+    """Control characters stripped; "" (logged) if the result is longer
+    than ATTR_VALUE_MAX bytes (dropped, never truncated)."""
+    value = _ATTR_CTRL_RE.sub("", value)
+    n = len(value.encode("utf-8"))
+    if n > ATTR_VALUE_MAX:
+        print(f"group-gate: dropping {n}-byte value of {what} (limit {ATTR_VALUE_MAX})", flush=True)
+        return ""
+    return value
+
+
+def parse_user_attributes(doc) -> Tuple[dict, dict]:
+    """(users, hosts) from a version 2 user-attributes.json document:
+    users = {lowercase user: [(header, value)]} (the field headers),
+    hosts = {host: {lowercase user: [(header, value)]}} (per-host headers).
+    Raises AttributesError if the document is malformed or not version 2.
+
+    Field values: control characters stripped, values longer than
+    ATTR_VALUE_MAX bytes dropped (logged, never truncated), `%` -> `%25`
+    and `,` -> `%2C` in every value (so "Doe, Jane" stays one value), then
+    joined with ", ". Host values: one value each, control characters
+    stripped, over ATTR_VALUE_MAX dropped (logged), sent verbatim (no `,`
+    encoding)."""
+    if not isinstance(doc, dict) or doc.get("version") != 2:
+        raise AttributesError("not a version 2 document")
+    fields, users, hosts = doc.get("fields", {}), doc.get("users", {}), doc.get("hosts", {})
+    if not isinstance(fields, dict) or not isinstance(users, dict) or not isinstance(hosts, dict):
+        raise AttributesError("'fields' / 'users' / 'hosts' is not an object")
     seen_headers = {}
     valid = {}
     for name, header in fields.items():
@@ -626,24 +649,51 @@ def parse_user_attributes(doc) -> dict:
                 continue
             kept = []
             for v in vals:
-                v = _ATTR_CTRL_RE.sub("", v)
-                if len(v.encode("utf-8")) > ATTR_VALUE_MAX:
-                    print(f"group-gate: dropping {len(v.encode('utf-8'))}-byte value of field {name!r} "
-                          f"for user {user!r} (limit {ATTR_VALUE_MAX})", flush=True)
-                    continue
+                v = _attr_clean(v, f"field {name!r} for user {user!r}")
                 if v:
                     kept.append(attr_encode(v))
             if kept:
                 headers.append((ATTR_HEADER_PREFIX + fields[name], ", ".join(kept)))
         if headers:
             out[user.strip().lower()] = headers
-    return out
+    out_hosts = {}
+    for host, by_header in hosts.items():
+        if not isinstance(by_header, dict):
+            raise AttributesError(f"headers of host {host!r} are not an object")
+        # Keys are full lowercase hostnames, matched exactly against the
+        # normalised request host: anything else could never match (or
+        # could match the wrong host after normalising), so it is skipped.
+        if not valid_hostname(host):
+            print(f"group-gate: skipping attribute host {host!r} in {ATTRIBUTES_FILE} "
+                  "(not a lowercase valid hostname)", flush=True)
+            continue
+        seen = {}
+        per_user = {}
+        for header, by_user in by_header.items():
+            if not isinstance(by_user, dict) or not all(isinstance(v, str) for v in by_user.values()):
+                raise AttributesError(f"header {header!r} of host {host!r} is not an object of strings")
+            if not isinstance(header, str) or not _ATTR_HEADER_RE.fullmatch(header):
+                print(f"group-gate: skipping invalid attribute header {header!r} of host {host!r} "
+                      f"in {ATTRIBUTES_FILE}", flush=True)
+                continue
+            other = seen.setdefault(header.lower(), header)
+            if other != header:
+                raise AttributesError(f"host {host!r} has headers {other!r} and {header!r}")
+            for user, v in by_user.items():
+                v = _attr_clean(v, f"header {header!r} of host {host!r} for user {user!r}")
+                if v:
+                    per_user.setdefault(user.strip().lower(), []).append((ATTR_HEADER_PREFIX + header, v))
+        if per_user:
+            out_hosts[host] = per_user
+    return out, out_hosts
 
 
-def user_attribute_headers(username: str) -> List[Tuple[str, str]]:
-    """Attribute headers for the user. A missing file means none; an
-    unreadable or malformed one is logged (once per file version) and means
-    none too — never a deny. Cached on (path, inode, mtime, size)."""
+def user_attribute_headers(username: str, host: str) -> List[Tuple[str, str]]:
+    """Attribute headers for the user on the (normalised) host: the field
+    headers, then the host's headers, which replace a same-named field
+    header. A missing file means none; an unreadable or malformed one is
+    logged (once per file version) and means none too — never a deny.
+    Cached on (path, inode, mtime, size)."""
     try:
         st = os.stat(ATTRIBUTES_FILE)
     except FileNotFoundError:
@@ -656,14 +706,18 @@ def user_attribute_headers(username: str) -> List[Tuple[str, str]]:
         if _ATTR_CACHE["key"] != key:
             try:
                 with open(ATTRIBUTES_FILE, encoding="utf-8") as f:
-                    users = parse_user_attributes(json.load(f))
+                    users, hosts = parse_user_attributes(json.load(f))
             except FileNotFoundError:
                 return []
             except (OSError, ValueError, AttributesError) as e:
                 print(f"group-gate: ignoring corrupt {ATTRIBUTES_FILE}: {e} (no attribute headers)", flush=True)
-                users = {}
-            _ATTR_CACHE.update(key=key, users=users)
-        return _ATTR_CACHE["users"].get(username.strip().lower(), [])
+                users, hosts = {}, {}
+            _ATTR_CACHE.update(key=key, users=users, hosts=hosts)
+        user = username.strip().lower()
+        fields = _ATTR_CACHE["users"].get(user, [])
+        on_host = _ATTR_CACHE["hosts"].get(host, {}).get(user, [])
+    replaced = {name.lower() for name, _ in on_host}
+    return [h for h in fields if h[0].lower() not in replaced] + on_host
 
 
 # ── Path rules (path_groups) ──────────────────────────────────────────
@@ -1603,7 +1657,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(f"<h1>{html.escape(title)}</h1>{body_html}".encode())
         print(f"group-gate: {log}", flush=True)
 
-    def _allow(self, groups_header: Optional[str] = None, username: str = ""):
+    def _allow(self, groups_header: Optional[str] = None, username: str = "", host: str = ""):
         METRICS.inc("group_gate_requests_total", endpoint=self._endpoint, result="allow")
         self.send_response(200)
         # groups_header is set only when expired memberships were stripped.
@@ -1613,7 +1667,8 @@ class Handler(BaseHTTPRequestHandler):
         # Attribute headers (contract §5): only on allow; Traefik forwards
         # them through authResponseHeadersRegex ^X-Forwarded-Attr- (which
         # also deletes client-sent copies). Values go out as UTF-8 bytes.
-        for name, value in user_attribute_headers(username) if username else []:
+        # `host` is the normalised request host (per-host headers, §4.1).
+        for name, value in user_attribute_headers(username, host) if username else []:
             self.send_header(name, value.encode("utf-8").decode("latin-1"))
         self.end_headers()
 
@@ -2012,7 +2067,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
 
-        self._allow(groups_header, username)
+        self._allow(groups_header, username, host)
 
     def log_message(self, fmt, *args):
         # Default per-request logs are noisy; explicit logging above.
