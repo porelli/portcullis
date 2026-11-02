@@ -1546,8 +1546,16 @@ jobs:
           # user goes at its next lookup (the Hub lists all users every 15 min).
           lg 'mutation { deleteUser(userId: "gone-user") { ok } }'
           lg "mutation { deleteGroup(groupId: $GID) { ok } }"
-          kcpost "/user-storage/$LDAP_ID/sync?action=triggerFullSync" >/dev/null || { echo "FAIL: full sync"; exit 1; }
-          if kcgroup gone-group; then echo "FAIL: gone-group still in Keycloak after the sync"; exit 1; fi
+          lq '{ groups { displayName } }' | jq -e 'all(.data.groups[]; .displayName != "gone-group")' >/dev/null || { echo "FAIL: gone-group still in LLDAP"; exit 1; }
+          SYNC=$(kcpost "/user-storage/$LDAP_ID/sync?action=triggerFullSync") || { echo "FAIL: full sync"; exit 1; }
+          echo "full sync: $SYNC"
+          if kcgroup gone-group; then
+            echo "FAIL: gone-group still in Keycloak after the sync"
+            echo "mapper sync: $(kcpost "/user-storage/$LDAP_ID/mappers/$MAP/sync?direction=fedToKeycloak")"
+            kcgroup gone-group && echo "(still there after a mapper sync too)"
+            docker compose logs --tail=80 keycloak | grep -iE 'ldap|group|sync' | tail -40
+            exit 1
+          fi
           kc "/users?briefRepresentation=true&max=1000" | jq -e 'all(.[]; .username != "gone-user")' >/dev/null \
             || { echo "FAIL: gone-user still listed"; exit 1; }
           [ "$(kcstatus "/users/$UID_GONE")" = 404 ] || { echo "FAIL: Keycloak kept its copy of gone-user"; exit 1; }
