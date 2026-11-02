@@ -77,7 +77,8 @@ setup() {
       user: {login: $u}, head: {sha: $s, ref: $b, repo: {full_name: $hr}}, base: {ref: "main", repo: {full_name: $repo}},
       commits: $c, labels: ($l | map({name: .}))}')
   put "repos/$REPO/pulls/$NUM" "$pr"
-  put "repos/$REPO/pulls?state=open&head=$(enc "${REPO%%/*}:$BRANCH")&per_page=10" "[$pr]"
+  # Like the real API, the list has no `commits` (only GET pulls/<n> does).
+  put "repos/$REPO/pulls?state=open&head=$(enc "${REPO%%/*}:$BRANCH")&per_page=10" "$(jq -c '[del(.commits)]' <<<"$pr")"
   put "repos/$REPO/commits/$PR_SHA" "$(jq -n --arg a "$COMMIT_AUTHOR" --argjson v "$VERIFIED" --arg m "$MSG" \
     '{author: {login: $a}, commit: {message: $m, verification: {verified: $v}}}')"
   put "repos/$REPO/pulls/$NUM/files?per_page=100" "$(jq -c 'map({filename: .})' <<<"$FILES")"

@@ -139,6 +139,8 @@ decide() {
     branch=$(jq -r .head_branch <<<"$run")
     pr_json=$(api "repos/$REPO/pulls?state=open&head=$(uri "${REPO%%/*}:$branch")&per_page=10" | jq -c '.[0] // empty')
     [ -n "$pr_json" ] || skip none "no open PR from $branch (merged, closed, or not a PR run)"
+    # The list omits fields (commits, ...): read the PR itself.
+    pr_json=$(api "repos/$REPO/pulls/$(jq -r .number <<<"$pr_json")")
     [ "$(jq -r .head.sha <<<"$pr_json")" = "$sha" ] \
       || skip refuse "run $RUN_ID tested $sha but PR #$(jq -r .number <<<"$pr_json") head is $(jq -r .head.sha <<<"$pr_json") (stale run or new commits)" "$(jq -r .number <<<"$pr_json")" "$sha"
   elif [ -n "${PR:-}" ]; then
