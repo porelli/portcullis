@@ -234,6 +234,78 @@ except Exception:
   return 0
 }
 
+# hub_started_unix — the running Hub container's start time (epoch
+# seconds; 0: unknown).
+hub_started_unix() {
+  local cid at
+  cid="$(dc ps -q hub 2>/dev/null | head -n1)"
+  [ -n "$cid" ] || { echo 0; return 0; }
+  at="$(docker inspect --format '{{.State.StartedAt}}' "$cid" 2>/dev/null || true)"
+  jq -nr --arg s "$at" '($s | sub("\\.[0-9]+"; "") | fromdateiso8601? // 0)' 2>/dev/null || echo 0
+}
+
+# hub_sync_status — the Hub's last template sync (<data>/source-sync.json,
+# JSON; empty: none).
+hub_sync_status() { dc exec -T hub cat /data/source-sync.json 2>/dev/null || true; }
+
+# hub_sources_sync [tries] — after a start: the Hub fast-forwards its
+# template sources (git) and reports the outcome. A Hub newer than its
+# template checkout rejects the templates it no longer accepts and denies
+# their apps (fail closed) until the sources are synced. The Hub syncs at
+# every start; here it is asked again with SIGHUP (the image may not have
+# changed, so the container wasn't restarted) and the result is printed.
+# A failed pull keeps the previous checkout. Never fails the run.
+hub_sources_sync() {
+  local tries="${1:-100}" i st="" since t0 fix
+  fix="open Hub → Template Sources → Sync All Sources"
+  # Only a Hub that writes the status file (this release on) gets SIGHUP:
+  # the file must be newer than the running container (its start-up sync).
+  since="$(hub_started_unix)"
+  for i in $(seq 1 "$tries"); do
+    st="$(hub_sync_status)"
+    if [ -n "$st" ] && printf '%s' "$st" | jq -e --argjson t "$since" '.started_unix >= ($t - 5) and (.running | not)' >/dev/null 2>&1; then
+      break
+    fi
+    st=""
+    [ "$i" -eq "$tries" ] || sleep 3
+  done
+  if [ -z "$st" ]; then
+    warn "The Hub reported no template sync since it started (an older Hub image, or it is still starting): $fix — until then apps whose templates it rejects stay denied."
+    return 0
+  fi
+  t0="$(date +%s)"
+  if ! dc kill -s HUP hub >/dev/null 2>&1; then
+    warn "Could not signal the Hub to sync its template sources: $fix."
+    return 0
+  fi
+  st=""
+  for i in $(seq 1 "$tries"); do
+    st="$(hub_sync_status)"
+    if [ -n "$st" ] && printf '%s' "$st" | jq -e --argjson t "$t0" '.started_unix >= $t and (.running | not)' >/dev/null 2>&1; then
+      break
+    fi
+    st=""
+    [ "$i" -eq "$tries" ] || sleep 3
+  done
+  if [ -z "$st" ]; then
+    warn "The Hub's template sync did not finish in time: check Hub → Template Sources (the previous templates keep serving meanwhile)."
+    return 0
+  fi
+  printf '%s' "$st" | jq -r '.sources[]? | "    template source \(.name): " +
+      (if .ok then (if .updated then "updated to \(.after[0:12])" else "up to date" end)
+       else "NOT updated — \(.error // "failed")" end)'
+  [ "$(printf '%s' "$st" | jq '.sources | length')" != 0 ] || echo "    no git template sources to sync"
+  if ! printf '%s' "$st" | jq -e '.ok' >/dev/null 2>&1; then
+    warn "Template sync incomplete (the previous versions are kept, see above and the Hub log): $fix after fixing the cause."
+  fi
+  local missing
+  missing="$(printf '%s' "$st" | jq -r '(.missing_templates // []) | join(", ")')"
+  if [ -n "$missing" ]; then
+    warn "Enabled apps without a valid template, denied until fixed: $missing (see the Hub log; a newer Hub or template version may be needed)."
+  fi
+  return 0
+}
+
 version_run() {
   local json="$1" ver hub src running="" cid=""
   ver="$(portcullis_version)"

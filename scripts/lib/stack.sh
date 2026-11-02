@@ -263,6 +263,8 @@ upgrade_run() {
   dc up -d forward-auth forward-auth-ext >/dev/null
   info "Checking the Hub's policy file against group-gate..."
   hub_policy_check
+  info "Syncing the Hub's template sources..."
+  hub_sources_sync
 
   ok "Upgrade complete.${BACKUP_LAST_DIR:+ Backup: $BACKUP_LAST_DIR}"
   echo "    Verify: ./portcullis status"
@@ -332,6 +334,9 @@ Update a running installation after `git pull`:
      role incl. CLIENT_CERT_TTL, Keycloak truststore), CA bundle
   5. docker compose up -d --build, waits for health
   6. keycloak configure, oidc register
+  7. checks the Hub's policy file version, then has the Hub sync its
+     template sources (git pull; a failure keeps the previous version)
+     and prints the result
 
 Options:
   --skip-backup   do not create a backup first

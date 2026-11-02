@@ -65,6 +65,17 @@ _kc_report() {
 # cache would keep a user's LDAP groups and attributes (attr_* claims)
 # stale until eviction or the daily changed-users sync; with NO_CACHE a
 # group or attribute change in LLDAP is visible at the next token refresh.
+# Users and groups deleted straight in LLDAP don't linger in Keycloak:
+# removeInvalidUsersEnabled — Keycloak deletes its copy of a federated user
+# when a lookup finds the LDAP entry gone (Keycloak's LDAP sync itself
+# never removes users; the Hub lists all users every 15 min, so each is
+# looked up); an LDAP error keeps the user. fullSyncPeriod 1 h — every
+# sync runs the group mapper first, which (drop.non.existing.groups.during
+# .sync, _kc_group_mapper_patch) deletes the Keycloak groups LLDAP no
+# longer has. Neither can touch core's own accounts: READ_ONLY never
+# writes LDAP, local (non-federated) users and the master realm's admin
+# are never validated against LDAP, and the Hub's service account is
+# filtered out of the federation on purpose (its copy is removed below).
 _kc_ldap_patch() {
   jq --arg b "$1" '
     .config.usersDn = ["ou=people," + $b] |
@@ -72,7 +83,21 @@ _kc_ldap_patch() {
     .config.bindCredential = [env.LLDAP_PASS] |
     .config.trustEmail = ["false"] |
     .config.customUserSearchFilter = ["(!(uid=portcullis-hub))"] |
-    .config.cachePolicy = ["NO_CACHE"]'
+    .config.cachePolicy = ["NO_CACHE"] |
+    .config.editMode = ["READ_ONLY"] |
+    .config.removeInvalidUsersEnabled = ["true"] |
+    .config.fullSyncPeriod = ["3600"]'
+}
+
+# _kc_group_mapper_patch <base-dn>: the LDAP group mapper (JSON on stdin):
+# groups.dn, READ_ONLY, and Keycloak groups LLDAP no longer has dropped at
+# every sync (the realm has no Keycloak-only groups: every group is an
+# LLDAP group).
+_kc_group_mapper_patch() {
+  jq --arg b "$1" '
+    .config["groups.dn"] = ["ou=groups," + $b] |
+    .config.mode = ["READ_ONLY"] |
+    .config["drop.non.existing.groups.during.sync"] = ["true"]'
 }
 
 # _kc_fwd_patch <domain>: the portcullis-forward-auth client (JSON on stdin)
@@ -191,7 +216,7 @@ keycloak_configure() {
   if [ -n "$comp" ]; then
     ldap_id="$(printf '%s' "$comp" | jq -r .id)"
     code="$(printf '%s' "$comp" | LLDAP_PASS="${LLDAP_ADMIN_PASSWORD:-}" _kc_ldap_patch "$base_dn" | kc_send PUT "/$KC_REALM/components/$ldap_id")"
-    _kc_report "LDAP base DN + bind credential, portcullis-hub excluded, no cache" "$code" 204 || true
+    _kc_report "LDAP base DN + bind credential, portcullis-hub excluded, no cache, users gone from LLDAP removed, hourly sync" "$code" 204 || true
     # The Hub's LLDAP service account (lldap_admin) must never sign in
     # through the gateway: the user filter above keeps it out of the
     # federation; drop a copy imported before the filter existed.
@@ -203,9 +228,9 @@ keycloak_configure() {
     fi
     mapper="$(kc_get "/$KC_REALM/components?parent=$ldap_id" | jq '[.[] | select(.providerId == "group-ldap-mapper")][0] // empty')"
     if [ -n "$mapper" ]; then
-      code="$(printf '%s' "$mapper" | jq --arg b "$base_dn" '.config["groups.dn"] = ["ou=groups," + $b]' \
+      code="$(printf '%s' "$mapper" | _kc_group_mapper_patch "$base_dn" \
         | kc_send PUT "/$KC_REALM/components/$(printf '%s' "$mapper" | jq -r .id)")"
-      _kc_report "group mapper groups.dn" "$code" 204 || true
+      _kc_report "group mapper groups.dn, groups gone from LLDAP dropped at sync" "$code" 204 || true
     fi
   else
     warn "    no LDAP federation component found in realm $KC_REALM"
@@ -680,7 +705,9 @@ Usage: portcullis keycloak configure [--wipe-realm]
 Idempotent post-start configuration of the portcullis realm via the admin
 API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
   - imports keycloak/realm-export.json if the realm does not exist
-  - points the LDAP federation at LLDAP (LLDAP_BASE_DN, LLDAP_ADMIN_PASSWORD)
+  - points the LDAP federation at LLDAP (LLDAP_BASE_DN, LLDAP_ADMIN_PASSWORD);
+    users and groups deleted in LLDAP are removed from Keycloak (hourly sync,
+    removeInvalidUsersEnabled, group mapper drops missing groups)
   - sets the ACR→LoA map, sslRequired=external and browserFlow=portcullis-universal
   - rebuilds every top-level flow of the file whose tree changed (passkey-only
     browser flow, the invite identity provider's first-login / post-login flows)

@@ -459,11 +459,12 @@
           "userObjectClasses": ["person"],
           "editMode": ["READ_ONLY"],
           "cachePolicy": ["NO_CACHE"],
+          "removeInvalidUsersEnabled": ["true"],
           "trustEmail": ["false"],
           "syncRegistrations": ["false"],
           "importEnabled": ["true"],
           "batchSizeForSync": ["1000"],
-          "fullSyncPeriod": ["604800"],
+          "fullSyncPeriod": ["3600"],
           "changedSyncPeriod": ["86400"],
           "searchScope": ["1"],
           "useTruststoreSpi": ["ldapsOnly"],
@@ -525,7 +526,7 @@
                 "membership.attribute.type": ["DN"],
                 "membership.user.ldap.attribute": ["uid"],
                 "mode": ["READ_ONLY"],
-                "drop.non.existing.groups.during.sync": ["false"]
+                "drop.non.existing.groups.during.sync": ["true"]
               }
             }
           ]
