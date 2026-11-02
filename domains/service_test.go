@@ -852,3 +852,104 @@ func TestStaleWorkNeverCommits(t *testing.T) {
 		t.Fatalf("NextGeneration %d after reload, want >= %d (%v)", doc.NextGeneration, gen, err)
 	}
 }
+
+// TestZoneChangeThenDelete: the zone found for a domain changes during its
+// life (e.g. the operator moves it to another hosted zone); records created
+// in both zones are tracked and DELETE removes all of them.
+func TestZoneChangeThenDelete(t *testing.T) {
+	e := newEnv(t, false)
+	zoneName := "team-l.example.org."
+	var zmu sync.Mutex
+	e.svc.findZone = func(string) (string, error) { zmu.Lock(); defer zmu.Unlock(); return zoneName, nil }
+	other := fakedns.NewZone() // the second zone's storage (not served)
+	accept := func(string) bool { return true }
+	providers["fake-soa"] = providerSpec{required: []string{"api_token"}, build: func(c map[string]string) dnsProvider {
+		return zoneRouter{
+			"team-l.example.org.": &fakedns.Provider{Zone: e.zone, Token: c["api_token"], Accept: accept},
+			"example.org.":        &fakedns.Provider{Zone: other, Token: c["api_token"], Accept: accept},
+		}
+	}}
+	t.Cleanup(func() { delete(providers, "fake-soa") })
+	body := `{"provider":"fake-soa","credentials":{"api_token":"` + goodToken + `"}}`
+	e.do("PUT", "/domains/team-l.example.org", body, true)
+	e.waitState("team-l.example.org", StateReady, 60*time.Second)
+	// The zone moves; the records are set again there.
+	zmu.Lock()
+	zoneName = "example.org."
+	zmu.Unlock()
+	e.do("POST", "/domains/team-l.example.org/token", body, true)
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		e.svc.mu.Lock()
+		zones := len(e.svc.doc.Domains["team-l.example.org"].Records)
+		e.svc.mu.Unlock()
+		if zones == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("records tracked in %d zones, want 2", zones)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	e.svc.Wait()
+	for _, z := range []*fakedns.Zone{e.zone, other} {
+		if len(z.Records("team-l.example.org")) == 0 {
+			t.Fatal("setup: records missing in one of the zones")
+		}
+	}
+	if code, body := e.do("DELETE", "/domains/team-l.example.org", "", true); code != 204 {
+		t.Fatalf("delete = %d %s", code, body)
+	}
+	for _, z := range []*fakedns.Zone{e.zone, other} {
+		for _, n := range []string{"team-l.example.org", "*.team-l.example.org"} {
+			if rrs := z.Records(n); len(rrs) != 0 {
+				t.Fatalf("%s: %v left after delete", n, rrs)
+			}
+		}
+	}
+}
+
+// zoneRouter is a provider spanning several zones (no FindZone: the
+// service's SOA lookup, Service.findZone, picks the zone).
+type zoneRouter map[string]*fakedns.Provider
+
+func (z zoneRouter) p(zone string) (*fakedns.Provider, error) {
+	if p, ok := z[zone]; ok {
+		return p, nil
+	}
+	return nil, fmt.Errorf("no zone %s", zone)
+}
+
+func (z zoneRouter) SkipPropagationCheck() bool { return true }
+
+func (z zoneRouter) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
+	p, err := z.p(zone)
+	if err != nil {
+		return nil, err
+	}
+	return p.GetRecords(ctx, zone)
+}
+
+func (z zoneRouter) AppendRecords(ctx context.Context, zone string, r []libdns.Record) ([]libdns.Record, error) {
+	p, err := z.p(zone)
+	if err != nil {
+		return nil, err
+	}
+	return p.AppendRecords(ctx, zone, r)
+}
+
+func (z zoneRouter) SetRecords(ctx context.Context, zone string, r []libdns.Record) ([]libdns.Record, error) {
+	p, err := z.p(zone)
+	if err != nil {
+		return nil, err
+	}
+	return p.SetRecords(ctx, zone, r)
+}
+
+func (z zoneRouter) DeleteRecords(ctx context.Context, zone string, r []libdns.Record) ([]libdns.Record, error) {
+	p, err := z.p(zone)
+	if err != nil {
+		return nil, err
+	}
+	return p.DeleteRecords(ctx, zone, r)
+}

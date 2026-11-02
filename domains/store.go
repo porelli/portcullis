@@ -37,10 +37,10 @@ type Domain struct {
 	CertPEM      string     `json:"cert_pem,omitempty"`
 	KeyPEM       string     `json:"key_pem,omitempty"`
 	CertNotAfter *time.Time `json:"cert_not_after,omitempty"`
-	// Records are the A/AAAA records the service set (DELETE removes them).
-	Records []RecordRef `json:"records,omitempty"`
-	// Zone is the DNS zone the records were created in.
-	Zone string `json:"zone,omitempty"`
+	// Records are the A/AAAA records the service set, per DNS zone (the
+	// zone found for the domain may change over its life); DELETE removes
+	// every one of them.
+	Records map[string][]RecordRef `json:"records,omitempty"`
 	// Failures counts consecutive failed attempts (backoff); NextAttempt
 	// is when work may run again; RecordsCheckedAt is the last records check.
 	Failures         int       `json:"failures"`

@@ -336,7 +336,18 @@ func (s *Service) handleDelete(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	p, perr := buildProvider(snap)
 	if perr == nil {
-		perr = deleteRecords(ctx, p, snap.Zone, snap.Records)
+		zones := make([]string, 0, len(snap.Records))
+		for z := range snap.Records {
+			zones = append(zones, z)
+		}
+		sort.Strings(zones)
+		var errs []error
+		for _, z := range zones {
+			if err := deleteRecords(ctx, p, z, snap.Records[z]); err != nil {
+				errs = append(errs, fmt.Errorf("zone %s: %w", z, err))
+			}
+		}
+		perr = errors.Join(errs...)
 	}
 	if perr != nil {
 		msg := redact(perr.Error(), snap.Credentials)
@@ -353,7 +364,10 @@ func copyDomain(d *Domain) *Domain {
 	for k, v := range d.Credentials {
 		c.Credentials[k] = v
 	}
-	c.Records = append([]RecordRef(nil), d.Records...)
+	c.Records = make(map[string][]RecordRef, len(d.Records))
+	for z, refs := range d.Records {
+		c.Records[z] = append([]RecordRef(nil), refs...)
+	}
 	return &c
 }
 
@@ -516,10 +530,10 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 		// some) and while a DELETE waits, so DELETE removes them.
 		if zone != "" {
 			s.updateIf(name, gen, true, func(d *Domain) {
-				if d.Zone != "" && d.Zone != zone {
-					return // records live in the earlier zone; keep its refs
+				if d.Records == nil {
+					d.Records = map[string][]RecordRef{}
 				}
-				d.Records, d.Zone = mergeRecords(d.Records, refs), zone
+				d.Records[zone] = mergeRecords(d.Records[zone], refs)
 			})
 		}
 		j.recMu.Unlock()
