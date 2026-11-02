@@ -400,7 +400,8 @@ hs() { (hub_started_unix() { echo 1000; }
     exec) if [ -f "$STUB_DIR/killed" ] && [ -f "$STUB_DIR/sync2" ]; then cat "$STUB_DIR/sync2"; else cat "$STUB_DIR/sync" 2>/dev/null; fi ;;
     kill) echo "$*" >> "$STUB_DIR/kills"; [ -f "$STUB_DIR/killfail" ] && return 1; touch "$STUB_DIR/killed" ;;
   esac; }; sleep() { :; }; hub_sources_sync 2 2>&1); }
-NOW="$(date +%s)"
+# A status started after the signal (an hour ahead: the test may cross a second).
+NOW="$(( $(date +%s) + 3600 ))"
 rm -f "$STUB_DIR/kills" "$STUB_DIR/killed"
 OUT="$(hs)"
 expect_ok "upgrade sync: no status file (older Hub) = warning, no signal" sh -c "printf '%s' \"\$1\" | grep -q 'reported no template sync' && [ ! -f \"\$2\" ]" _ "$OUT" "$STUB_DIR/kills"

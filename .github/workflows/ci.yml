@@ -1518,6 +1518,8 @@ jobs:
           UID_GONE=$(kc "/users?username=gone-user&exact=true" | jq -r '.[0].id // empty')
           [ -n "$UID_GONE" ] || { echo "FAIL: gone-user not imported"; exit 1; }
           kcgroup gone-group || { echo "FAIL: gone-group not imported"; exit 1; }
+          # The Hub's service account exists in LLDAP from `up` on (later in this job).
+          HUB_SA=$(lq '{ user(userId: "portcullis-hub") { id } }' | jq -r '.data.user.id // empty')
           # Keycloak ids: a removed-and-reimported user would get a new one.
           ADMIN_ID=$(kc "/users?username=admin&exact=true" | jq -r '.[0].id // empty')
           TEST_ID=$(kc "/users?username=testuser&exact=true" | jq -r '.[0].id // empty')
@@ -1572,7 +1574,7 @@ jobs:
             [ "$(kcstatus "/users/$id")" = 200 ] || { echo "FAIL: Keycloak user $id (admin / testuser) removed"; exit 1; }
           done
           kcgroup lldap_admin || { echo "FAIL: lldap_admin dropped"; exit 1; }
-          lq '{ user(userId: "portcullis-hub") { id } }' | jq -e '.data.user.id == "portcullis-hub"' >/dev/null || { echo "FAIL: the Hub's service account is gone from LLDAP"; exit 1; }
+          [ "$(lq '{ user(userId: "portcullis-hub") { id } }' | jq -r '.data.user.id // empty')" = "$HUB_SA" ] || { echo "FAIL: the Hub's service account changed in LLDAP"; exit 1; }
           lq '{ user(userId: "admin") { id } }' | jq -e '.data.user.id == "admin"' >/dev/null || { echo "FAIL: LLDAP admin gone"; exit 1; }
           [ "$(kc "/users?username=portcullis-hub&exact=true" | jq length)" = 0 ] || { echo "FAIL: the Hub's service account is in Keycloak"; exit 1; }
           [ -n "$(tok)" ] && [ "$(tok)" != null ] || { echo "FAIL: master admin can't sign in"; exit 1; }
