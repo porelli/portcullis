@@ -1396,11 +1396,12 @@ jobs:
           kc /authentication/flows/portcullis-invite-link/executions | jq -e '[.[].providerId] == ["idp-detect-existing-broker-user", "idp-auto-link"]' >/dev/null \
             || { echo "FAIL: invite first-login flow must only link existing users"; exit 1; }
           # Post-broker flow: only portcullis-forward-auth (marker scope), a
-          # positive check then deny-unless-admitted, then LoA 2 (contract §8).
+          # positive check then deny-unless-admitted, then LoA 1 and LoA 2 (contract §8).
           kc /authentication/flows/portcullis-invite-session/executions | jq -e '[.[] | select(.level == 0) | [.displayName, .requirement]]
               == [["portcullis-invite-client", "CONDITIONAL"], ["portcullis-invite-deny", "CONDITIONAL"], ["portcullis-invite-loa-1", "CONDITIONAL"], ["portcullis-invite-loa", "CONDITIONAL"]]
               and ([.[] | select(.level == 1) | .providerId] == ["conditional-client-scope", "allow-access-authenticator",
-                     "conditional-sub-flow-executed", "deny-access-authenticator", "conditional-level-of-authentication", "allow-access-authenticator"])' >/dev/null \
+                     "conditional-sub-flow-executed", "deny-access-authenticator", "conditional-level-of-authentication", "allow-access-authenticator",
+                     "conditional-level-of-authentication", "allow-access-authenticator"])' >/dev/null \
             || { echo "FAIL: invite post-broker flow: $(kc /authentication/flows/portcullis-invite-session/executions | jq -c '[.[] | {displayName, requirement, level}]')"; exit 1; }
           FWD=$(kc "/clients?clientId=portcullis-forward-auth" | jq -r '.[0].id')
           SCOPE_ID=$(kc /client-scopes | jq -r '.[] | select(.name == "portcullis-invite-client") | .id')
