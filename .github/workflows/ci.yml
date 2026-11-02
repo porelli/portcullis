@@ -59,6 +59,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: shellcheck
         run: shellcheck -S warning portcullis scripts/lib/*.sh tests/*.sh vault/entrypoint.sh
+      - name: realm export fits Keycloak's columns
+        run: |
+          # Most Keycloak columns are varchar(255) (an import with a longer
+          # value aborts the first start); a flow description also gets
+          # keycloak configure's " [sync <sha256>]" marker (72 chars).
+          jq -e '([.. | strings | length] | max) <= 255 and ([.authenticationFlows[].description // "" | length] | max) <= 183' keycloak/realm-export.json >/dev/null \
+            || { echo "FAIL: a realm-export.json value is too long for Keycloak"; exit 1; }
       - name: CLI help for every command
         run: |
           ./portcullis help
@@ -242,7 +249,7 @@ jobs:
               and $t.environment.TRAEFIK_PROVIDERS_HTTP_ENDPOINT == "https://domains:8443/traefik/dynamic"
               and $t.environment.TRAEFIK_PROVIDERS_HTTP_POLLINTERVAL == "10s" and $t.environment.TRAEFIK_PROVIDERS_HTTP_POLLTIMEOUT == "5s"
               and $t.environment.TRAEFIK_PROVIDERS_HTTP_MAXRESPONSEBODYSIZE == "4194304"
-              and $t.environment.TRAEFIK_ENTRYPOINTS_WEBSECURE_TRANSPORT_RESPONDINGTIMEOUTS_READTIMEOUT == "15m"
+              and ([$t.environment | keys[] | select(test("RESPONDINGTIMEOUTS"))] == [])
               and ([$t.environment.TRAEFIK_PROVIDERS_HTTP_TLS_CA, $t.environment.TRAEFIK_PROVIDERS_HTTP_TLS_CERT, $t.environment.TRAEFIK_PROVIDERS_HTTP_TLS_KEY] | all(startswith("/run/portcullis/domains-endpoint/")))
               and ([$t.environment | keys[] | select(startswith("TRAEFIK_PROVIDERS_HTTP_HEADERS"))] == [])
               and ([$t.volumes[] | select(.target | startswith("/run/portcullis/domains-endpoint/")) | .read_only] == [true, true, true])
@@ -1774,6 +1781,18 @@ jobs:
           sbom: false
           cache-from: type=gha,scope=group-gate
           cache-to: ""
+      # The production build (no test provider): vault init's age-key
+      # generation runs this image.
+      - name: Build the domains service (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: domains
+          tags: portcullis-domains
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=domains-test
+          cache-to: ""
 
       - name: Start the core stack (Vault, PKI, all services except the Hub)
         run: |
@@ -2172,7 +2191,11 @@ jobs:
             mkdir -p /data/repos/ci && cp -r /src/echo /data/repos/ci/ &&
             printf "sources:\n  - name: ci\n    url: \"\"\n    path: /data/repos/ci\n" > /data/state.yaml &&
             chown -R 10001:10001 /data && chmod 600 /data/state.yaml'
-          ./portcullis up
+          # Keycloak's first start (realm import) outlasts compose's health
+          # wait: start everything but the Hub, configure Keycloak, then
+          # `portcullis up` (the Hub's LLDAP service account, the Hub).
+          # shellcheck disable=SC2046
+          docker compose up -d $(docker compose config --services | grep -vx hub)
           for i in $(seq 1 100); do
             curl -sf http://127.0.0.1:9000/health/ready >/dev/null && break
             [ "$i" -eq 100 ] && { echo "FAIL: Keycloak not ready"; docker compose logs --tail=80 keycloak; exit 1; }
@@ -2180,9 +2203,9 @@ jobs:
           done
           ./portcullis keycloak configure
           ./portcullis oidc register
-          docker compose up -d forward-auth forward-auth-ext hub
-          # oauth2-proxy exits while Keycloak is down; the Hub reads its LLDAP files at start.
-          docker compose restart forward-auth forward-auth-ext hub
+          ./portcullis up
+          # oauth2-proxy exits while Keycloak is down.
+          docker compose restart forward-auth forward-auth-ext
           docker compose ps
           HUB_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q hub)")
           echo "HUB_IP=$HUB_IP" >> "$GITHUB_ENV"
@@ -2363,6 +2386,20 @@ jobs:
                   curl -s -X "$m" -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") \
                     -H 'Content-Type: application/json' "$@" "http://$HUB_IP:8888$p"; }
           hubc() { hub "$@" -o /tmp/hub.out -w '%{http_code}'; }
+          # Long operations: 202 {op_id, poll}, then the op record until done (→ /tmp/op.json).
+          hubop() {
+            local code opid poll
+            code=$(hubc "$@")
+            [ "$code" = 202 ] || { echo "FAIL: $1 $2: $code $(cat /tmp/hub.out)"; docker compose logs --tail=30 hub; return 1; }
+            opid="$(jq -r .op_id /tmp/hub.out)"; poll="$(jq -r .poll /tmp/hub.out)"
+            for _ in $(seq 1 200); do
+              hub GET "$poll" > /tmp/op.json
+              jq -e --arg o "$opid" '.op_id == $o and (.running | not)' /tmp/op.json >/dev/null && break
+              sleep 3
+            done
+            jq -e --arg o "$opid" '.op_id == $o and .ok == true' /tmp/op.json >/dev/null \
+              || { echo "FAIL: $1 $2: $(cat /tmp/op.json)"; docker compose logs --tail=30 hub; return 1; }
+          }
           # Data with owners and modes the restore must keep: a file 4242:4343
           # 0640 and the volume root 1234:5678 0751.
           docker run --rm -v portcullis_echo-a-data:/d "$ALPINE" sh -c \
@@ -2373,9 +2410,8 @@ jobs:
           HELPER="$(grep -o 'PORTCULLIS_HELPER_IMAGE="[^"]*"' scripts/lib/common.sh | cut -d'"' -f2)"
           docker image rm -f "$HELPER" "${HELPER%@*}" >/dev/null 2>&1 || true
           if docker image inspect "$HELPER" >/dev/null 2>&1; then echo "FAIL: the helper image is still present"; exit 1; fi
-          code=$(hubc POST /api/instances/echo-a/backups)
-          [ "$code" = 201 ] || { echo "FAIL: backup echo-a: $code $(cat /tmp/hub.out)"; docker compose logs --tail=30 hub; exit 1; }
-          ARCHIVE="$(jq -r .archive /tmp/hub.out)"
+          hubop POST /api/instances/echo-a/backups
+          ARCHIVE="$(jq -r .result.archive /tmp/op.json)"
           docker image inspect -f '{{json .RepoDigests}}' "$HELPER" | jq -e --arg d "${HELPER%%:*}@${HELPER#*@}" 'index($d) != null' >/dev/null \
             || { echo "FAIL: the helper image was not pulled by its digest"; exit 1; }
           [ -z "$(docker ps -aq --filter label=io.portcullis.hub.helper)" ] || { echo "FAIL: helper containers left behind"; docker ps -a; exit 1; }
@@ -2387,20 +2423,23 @@ jobs:
             [ "$code" = 400 ] || { echo "FAIL: delete with $body got $code"; exit 1; }
           done
           docker volume inspect portcullis_echo-a-data >/dev/null || { echo "FAIL: a refused delete removed the volume"; exit 1; }
-          code=$(hubc DELETE /api/instances/echo-a -d '{"confirm":"echo-a"}')
-          [ "$code" = 200 ] || { echo "FAIL: delete echo-a: $code $(cat /tmp/hub.out)"; docker compose logs --tail=30 hub; exit 1; }
-          DEL_BACKUP="$(jq -r .backup /tmp/hub.out)"
+          hubop DELETE /api/instances/echo-a -d '{"confirm":"echo-a"}'
+          DEL_BACKUP="$(jq -r .result.backup /tmp/op.json)"
           if docker volume inspect portcullis_echo-a-data >/dev/null 2>&1; then echo "FAIL: delete kept the volume"; exit 1; fi
           [ -z "$(docker ps -aq --filter label=com.docker.compose.project=portcullis-echo-a)" ] || { echo "FAIL: delete kept containers"; exit 1; }
           hub GET /api/backups | jq -e --arg a "$DEL_BACKUP" 'any(.[]; .archive == $a and .instance == "echo-a" and .instance_exists == false)' >/dev/null \
             || { echo "FAIL: the delete's backup is not listed: $(hub GET /api/backups)"; exit 1; }
-          code=$(curl -s -o /dev/null -w '%{http_code}' --cacert /tmp/e2e-ca-bundle.pem "https://echo-a.$E2E_EXTRA/" || true)
-          [ "$code" = 404 ] || { echo "FAIL: echo-a still routed after delete ($code)"; exit 1; }
+          for i in $(seq 1 15); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --cacert /tmp/e2e-ca-bundle.pem "https://echo-a.$E2E_EXTRA/" || true)
+            [ "$code" = 404 ] && break
+            [ "$i" -eq 15 ] && { echo "FAIL: echo-a still routed after delete ($code)"; exit 1; }
+            sleep 2
+          done
           echo "PASS: delete needs the typed id, backs up first ($DEL_BACKUP), removes containers, volume and routing"
 
           # Restore the manual backup into a new instance id.
-          code=$(hubc POST /api/instances/restore -d "$(jq -cn --arg a "$ARCHIVE" '{archive: $a, id: "echo-r"}')")
-          [ "$code" = 201 ] || { echo "FAIL: restore into echo-r: $code $(cat /tmp/hub.out)"; docker compose logs --tail=30 hub; exit 1; }
+          hubop POST /api/instances/restore -d "$(jq -cn --arg a "$ARCHIVE" '{archive: $a, id: "echo-r"}')"
+          jq -e '.result.instance == "echo-r"' /tmp/op.json >/dev/null || { echo "FAIL: restore op: $(cat /tmp/op.json)"; exit 1; }
           GOT="$(meta portcullis_echo-r-data)"
           [ "$GOT" = "$WANT" ] || { echo "FAIL: restored volume differs: got $GOT want $WANT"; exit 1; }
           docker volume inspect -f '{{json .Labels}}' portcullis_echo-r-data | jq -e '.["com.docker.compose.project"] == "portcullis-echo-r"' >/dev/null \

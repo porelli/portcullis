@@ -24,8 +24,9 @@ Scenarios (contract §5, §11):
   two_instances     two instances, two groups: alice reaches echo-a only,
                     bob echo-b only (group-gate v5 keyed by hostname).
   long_backup       an admin's backup of echo-b through Traefik
-                    (hub.<domain>) that takes longer than 60 s completes
-                    with 201 (websecure readTimeout).
+                    (hub.<domain>, default timeouts) that takes longer than
+                    60 s: accepted with 202, a concurrent one is 409 busy,
+                    the op record ends ok with the archive.
 
 Environment: E2E_DOMAIN, E2E_EXTRA, E2E_ALICE_INVITE, E2E_BOB_INVITE,
 E2E_ADMIN_INVITE (setup links, --to portal), E2E_CERT / E2E_KEY (alice's
@@ -35,6 +36,7 @@ both up.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -264,18 +266,36 @@ def main() -> int:
             page.goto(os.environ["E2E_ADMIN_INVITE"], wait_until="domcontentloaded")
             base.passkey_flow(page, until=PORTAL, label="inst-admin")
             assert goto_ok(page, HUB + "/"), "admin cannot open the Hub"
+            # The Hub accepts at once (202) and runs the backup in the
+            # background; no request stays open (Traefik's default timeouts).
             t0 = time.time()
             r = page.request.post(HUB + "/api/instances/echo-b/backups", data="{}",
-                                  headers={"Content-Type": "application/json"}, timeout=600_000)
+                                  headers={"Content-Type": "application/json"})
+            assert r.status == 202, f"HTTP {r.status}: {r.text()[:300]}"
+            acc = r.json()
+            assert acc.get("op") == "backup" and acc.get("poll") == "/api/instances/echo-b/op" and acc.get("op_id"), acc
+            assert time.time() - t0 < 30, "the backup request was not answered at once"
+            # A second operation on the instance meanwhile: busy.
+            r2 = page.request.post(HUB + "/api/instances/echo-b/backups", data="{}",
+                                   headers={"Content-Type": "application/json"})
+            assert r2.status == 409, f"concurrent backup: HTTP {r2.status}"
+            rec, deadline = {}, time.time() + 600
+            while time.time() < deadline:
+                p = page.request.get(HUB + acc["poll"])
+                assert p.status == 200, f"poll: HTTP {p.status}"
+                rec = p.json()
+                if rec.get("op_id") == acc["op_id"] and not rec.get("running"):
+                    break
+                time.sleep(3)
             took = time.time() - t0
-            print(f"    backup of echo-b through Traefik: HTTP {r.status} after {took:.0f} s", flush=True)
-            assert r.status == 201, f"HTTP {r.status}: {r.text()[:300]}"
-            entry = r.json()
-            assert entry.get("instance") == "echo-b" and entry.get("archive", "").startswith("echo-b/"), entry
-            assert took > 60, f"the backup took {took:.0f} s: not longer than Traefik's 60 s default (test is vacuous)"
+            print(f"    backup of echo-b through Traefik: {took:.0f} s, record {json.dumps(rec)[:300]}", flush=True)
+            assert rec.get("ok") and rec.get("op") == "backup", rec
+            archive = (rec.get("result") or {}).get("archive", "")
+            assert archive.startswith("echo-b/"), rec
+            assert took > 60, f"the backup took {took:.0f} s: not longer than Traefik's 60 s readTimeout (test is vacuous)"
             listed = page.request.get(HUB + "/api/instances/echo-b/backups")
-            assert listed.status == 200 and any(b.get("archive") == entry["archive"] for b in listed.json()), listed.text()[:300]
-        check("long_backup: an admin's > 60 s backup through Traefik completes (201)", long_backup_through_traefik)
+            assert listed.status == 200 and any(b.get("archive") == archive for b in listed.json()), listed.text()[:300]
+        check("long_backup: an admin's > 60 s backup through Traefik (202, polled) completes; a concurrent one is 409", long_backup_through_traefik)
         close(ctx, "admin")
         browser.close()
 

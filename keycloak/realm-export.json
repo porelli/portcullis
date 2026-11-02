@@ -206,7 +206,7 @@
     },
     {
       "alias": "portcullis-invite-session",
-      "description": "After an invite login: only for portcullis-forward-auth (the client with the portcullis-invite-client scope; any other client is denied, so an invite never bypasses a client's own browser flow, e.g. the Hub's access-role flows), then LoA 2 + amr=hwk. The session only exists once the webauthn-register-passwordless required action (set with the invite) has registered a passkey",
+      "description": "After an invite login: only clients with the portcullis-invite-client scope (portcullis-forward-auth), any other is denied; then LoA 2 + amr=hwk",
       "providerId": "basic-flow",
       "topLevel": true,
       "builtIn": false,
