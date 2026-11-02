@@ -255,6 +255,8 @@ wait_healthy() {
 CT_GID_VAULT=1000     # hashicorp/vault: vault = 100:1000
 CT_UID_HUB=10001      # ghcr.io/porelli/portcullis-hub (USER 10001:10001)
 CT_UID_ENROLL=10002   # enroll/Dockerfile (USER 10002:10002)
+# shellcheck disable=SC2034  # used by domains.sh / backup.sh
+CT_UID_DOMAINS=10004  # domains/Dockerfile (USER 10004:10004)
 CT_GID_TRAEFIK=0      # Traefik runs as root, but without CAP_DAC_OVERRIDE
 # shellcheck disable=SC2034  # used by backup.sh
 CT_UID_LLDAP=1000     # lldap/lldap:*-rootless (lldap_data is 1000-owned)
@@ -338,6 +340,8 @@ secrets_fix_perms() {
     "$s/hub/lldap" "$s/hub/lldap/username" "$s/hub/lldap/password" "$s/hub/invite" "$s/hub/invite/secret"
   # secrets/monitoring/ (scripts/lib/monitoring.sh)
   if declare -F monitoring_fix_perms >/dev/null; then monitoring_fix_perms; fi
+  # secrets/domains/ (scripts/lib/domains.sh)
+  if declare -F domains_fix_perms >/dev/null; then domains_fix_perms; fi
 }
 
 # Core variables the Hub may copy into app .env files (templates reference
@@ -386,8 +390,8 @@ hub_env_write() {
 # need.
 stack_prepare() {
   local d
-  (umask 077 && mkdir -p "$PORTCULLIS_ROOT/secrets/vault-unseal" "$PORTCULLIS_ROOT/secrets/enroll" "$PORTCULLIS_ROOT/secrets/hub")
-  for d in secrets secrets/vault-unseal secrets/enroll secrets/hub; do
+  (umask 077 && mkdir -p "$PORTCULLIS_ROOT/secrets/vault-unseal" "$PORTCULLIS_ROOT/secrets/enroll" "$PORTCULLIS_ROOT/secrets/hub" "$PORTCULLIS_ROOT/secrets/domains")
+  for d in secrets secrets/vault-unseal secrets/enroll secrets/hub secrets/domains; do
     [ -w "$PORTCULLIS_ROOT/$d" ] || fail "$PORTCULLIS_ROOT/$d is not writable (created by Docker as root?). Fix: sudo chown -R \"$(id -un)\" \"$PORTCULLIS_ROOT/secrets\""
   done
   # templates/: the Hub (uid 10001) copies app template dirs here.
@@ -410,6 +414,8 @@ stack_prepare() {
   if declare -F users_secret_files >/dev/null; then users_secret_files; fi
   # Files of the opt-in monitoring profile (scripts/lib/monitoring.sh).
   if declare -F monitoring_prepare >/dev/null; then monitoring_prepare; fi
+  # The domains service's secrets and endpoint certificates (scripts/lib/domains.sh).
+  if declare -F domains_prepare >/dev/null; then domains_prepare; fi
   secrets_fix_perms
 }
 

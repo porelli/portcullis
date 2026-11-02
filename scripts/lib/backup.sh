@@ -13,7 +13,7 @@
 #   secrets/             Vault ROOT TOKEN + UNSEAL KEY, enroll AppRole, ...
 #   vault.snap           Vault raft snapshot (sys/storage/raft/snapshot)
 #   postgres.dump        pg_dump -Fc of the Keycloak database
-#   <volume>.tar.gz      lldap_data, hub_data, traefik_acme: files, with every
+#   <volume>.tar.gz      lldap_data, hub_data, traefik_acme, domains_data (age-encrypted): files, with every
 #                        SQLite database copied through SQLite's online backup
 #                        API (consistent while the service keeps running)
 # Nothing is stopped for a backup. secrets/ + vault.snap can decrypt the CA
@@ -26,7 +26,8 @@ BACKUP_RESTIC_IMAGE="restic/restic:0.19.1@sha256:136600b6ff6843d61d355f7f71f460a
 # Volumes archived as files: <compose volume>:<uid>:<gid> of the service
 # that owns them (the snapshot container runs as that user so SQLite can
 # open WAL databases; restore chowns the volume root back).
-BACKUP_FILE_VOLUMES="lldap_data:$CT_UID_LLDAP:$CT_UID_LLDAP hub_data:$CT_UID_HUB:$CT_UID_HUB traefik_acme:0:0"
+# domains_data holds only the age-encrypted store (contract §12.4).
+BACKUP_FILE_VOLUMES="lldap_data:$CT_UID_LLDAP:$CT_UID_LLDAP hub_data:$CT_UID_HUB:$CT_UID_HUB traefik_acme:0:0 domains_data:$CT_UID_DOMAINS:$CT_UID_DOMAINS"
 # restic: fixed host + path, so snapshots of every run form one series.
 BACKUP_RESTIC_HOST="portcullis"
 BACKUP_SNAPSHOT_PATH="/portcullis-backup"
@@ -747,7 +748,7 @@ Usage: portcullis backup [--offsite] [--list [--json]]
 
 Create a consistent backup in backups/<timestamp>/ (0700) while everything
 keeps running: Vault raft snapshot, pg_dump of the Keycloak database,
-LLDAP / Hub / ACME volumes (SQLite via its online backup API), .env,
+LLDAP / Hub / ACME / domains (age-encrypted) volumes (SQLite via its online backup API), .env,
 certs/, secrets/, config/ and config files, plus MANIFEST.json with the
 sha256 of every file. Keeps the newest BACKUP_KEEP_LOCAL (7) local backups.
 
@@ -815,7 +816,7 @@ Stop Portcullis and restore a backup made by `portcullis backup` /
 `upgrade`: .env, certs/, secrets/, config files, the Vault data (the raft
 snapshot is restored into a fresh Vault, which then unseals with the
 backed-up key), the Keycloak database (pg_restore into a fresh Postgres),
-the LLDAP / Hub / ACME volumes. Then everything is started again. The
+the LLDAP / Hub / ACME / domains volumes. Then everything is started again. The
 backup's checksums are verified first. The current .env, secrets/ and
 certs/ are saved to backups/pre-restore-<timestamp>/.
 

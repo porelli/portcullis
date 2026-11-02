@@ -32,8 +32,14 @@ env:
   COMPOSE_FILE: docker-compose.yml:docker-compose.ci.yml
   VAULT_ADDR: http://127.0.0.1:8200
   TRAEFIK_IP: 172.31.250.2
-  # Go toolchain for the enroll unit tests (same as enroll/Dockerfile's golang image).
+  # Go toolchain for the enroll and domains unit tests (same as their Dockerfiles' golang image).
   GO_VERSION: 1.27.3
+  # The domains service's records point here in CI: no public-IP detection
+  # on the runners (./portcullis up uses these instead).
+  PORTCULLIS_PUBLIC_IPV4: 203.0.113.10
+  PORTCULLIS_PUBLIC_IPV6: ""
+  # Pebble (ACME test CA) for the domains service test (also in the CI override).
+  PEBBLE_IMG: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
 
 # Caches (images, Go, buildx layers, Playwright) are RESTORED by every run but
 # SAVED only by pushes to main (trusted code; also not by release.yml's tag
@@ -209,7 +215,37 @@ jobs:
             || { echo "FAIL: forward-auth-ext / portcullis-auth-ext wiring (contract §5)"; exit 1; }
           grep -qE '^\s+code_challenge_method: S256$' oauth2-proxy/alpha.yaml || { echo "FAIL: oauth2-proxy (both services) must send PKCE S256"; exit 1; }
           if grep -nE '^\s*userIDClaim:' oauth2-proxy/alpha.yaml; then echo "FAIL: userIDClaim is an alias of emailClaim in oauth2-proxy v7"; exit 1; fi
-          echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring"
+          # Contract §12.1 / §12.4: the domains service. portcullis-domains =
+          # {domains, hub}, portcullis-certs = {domains, traefik}, both internal;
+          # domains is never routed, reads its secrets as read-only files, and
+          # Traefik polls it over mTLS with paths only (no key material in env).
+          echo "$CFG" | jq -e '.services.domains as $d | .services.traefik as $t | .services.hub as $h
+              | .networks["portcullis-domains"].internal == true and .networks["portcullis-certs"].internal == true
+              and ([.services | to_entries[] | select((.value.networks // {}) | has("portcullis-domains")) | .key] | sort == ["domains", "hub"])
+              and ([.services | to_entries[] | select((.value.networks // {}) | has("portcullis-certs")) | .key] | sort == ["domains", "traefik"])
+              and ([$d.networks | keys[]] | sort == ["domains-egress", "portcullis-certs", "portcullis-domains"])
+              and ([.services | to_entries[] | select((.value.networks // {}) | has("domains-egress")) | .key] == ["domains"])
+              and ([$d.labels // {} | keys[] | select(startswith("traefik."))] == [])
+              and $d.read_only == true and $d.user == "10004:10004" and $d.group_add == ["10001"]
+              and ([$d.volumes[] | select(.type == "bind") | .read_only] | all)
+              and ([$d.volumes[] | select(.type == "bind") | .target] | sort == ["/run/portcullis/domains/age.key", "/run/portcullis/domains/api-secret",
+                    "/run/portcullis/domains/certs-endpoint/ca.crt", "/run/portcullis/domains/certs-endpoint/server.crt", "/run/portcullis/domains/certs-endpoint/server.key"])
+              and ([$d.volumes[] | select(.type == "volume") | .source] == ["domains_data"])
+              and ([.services | to_entries[] | select([.value.volumes[]? | select(.type == "volume") | .source] | index("domains_data")) | .key] == ["domains"])
+              and ([$d.environment | keys[] | select(test("TOKEN|SECRET|KEY|PASSWORD"))] == [])
+              and $t.environment.TRAEFIK_PROVIDERS_HTTP_ENDPOINT == "https://domains:8443/traefik/dynamic"
+              and $t.environment.TRAEFIK_PROVIDERS_HTTP_POLLINTERVAL == "10s" and $t.environment.TRAEFIK_PROVIDERS_HTTP_POLLTIMEOUT == "5s"
+              and $t.environment.TRAEFIK_PROVIDERS_HTTP_MAXRESPONSEBODYSIZE == "4194304"
+              and ([$t.environment.TRAEFIK_PROVIDERS_HTTP_TLS_CA, $t.environment.TRAEFIK_PROVIDERS_HTTP_TLS_CERT, $t.environment.TRAEFIK_PROVIDERS_HTTP_TLS_KEY] | all(startswith("/run/portcullis/domains-endpoint/")))
+              and ([$t.environment | keys[] | select(startswith("TRAEFIK_PROVIDERS_HTTP_HEADERS"))] == [])
+              and ([$t.volumes[] | select(.target | startswith("/run/portcullis/domains-endpoint/")) | .read_only] == [true, true, true])
+              and ([$t.volumes[] | select(.source | test("certs-endpoint/(ca|server)\\.key$"))] == [])
+              and $h.environment.HUB_DOMAINS_API_URL == "http://domains:8080"
+              and $h.environment.HUB_DOMAINS_SECRET_FILE == "/run/portcullis/domains/api-secret"
+              and ([$h.volumes[] | select(.target == "/run/portcullis/domains/api-secret") | .read_only] == [true])
+              and ([.services | to_entries[] | select([.value.volumes[]? | .source // "" | select(test("secrets/domains/age\\.key$"))] | length > 0) | .key] == ["domains"])' >/dev/null \
+            || { echo "FAIL: domains service wiring (contract §12.1 / §12.4)"; exit 1; }
+          echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring, domains service"
 
       - name: every image is pinned tag@sha256 (all compose files, all profiles, CLI, workflows)
         run: |
@@ -225,7 +261,7 @@ jobs:
             [ "$svc" = hub ] && continue
             [[ "$img" =~ ^[^@[:space:]]+:[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || { echo "UNPINNED: $svc → $img"; bad=1; }
           done < /tmp/images
-          for df in enroll/Dockerfile group-gate/Dockerfile; do
+          for df in enroll/Dockerfile group-gate/Dockerfile domains/Dockerfile; do
             if grep -E '^FROM ' "$df" | grep -v '@sha256:'; then echo "UNPINNED base image in $df"; bad=1; fi
           done
           # group-gate's Python deps: exact pins with hashes, installed with --require-hashes.
@@ -285,9 +321,9 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum') }}-${{ hashFiles('enroll/**/*.go') }}
+          key: go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum') }}-${{ hashFiles('enroll/**/*.go', 'domains/**/*.go') }}
           restore-keys: |
-            go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum') }}-
+            go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum') }}-
       - name: enroll unit tests
         working-directory: enroll
         env:
@@ -298,6 +334,14 @@ jobs:
           go mod verify
           go vet ./...
           go test ./...
+      - name: domains unit tests (in-process Pebble, fake libdns provider + DNS server)
+        working-directory: domains
+        run: |
+          go mod verify
+          go vet ./...
+          go vet -tags testprovider ./...
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
+          CGO_ENABLED=1 go test -race ./...
       - name: Save the Go module and build cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -344,6 +388,31 @@ jobs:
               environment:
                 # Faster CRL refresh so the CRL-only revocation test is quick.
                 GATE_CRL_REFRESH_SECONDS: "3"
+            # The domains service against Pebble with the CI-only fake DNS
+            # provider (build tag testprovider: provider "fake", its DNS on
+            # :8053, which Pebble's DNS-01 validation and the records check use).
+            domains:
+              build:
+                args:
+                  GO_TAGS: testprovider
+              environment:
+                ACME_CA_SERVER: https://pebble:14000/dir
+                LEGO_CA_CERTIFICATES: /run/ci/pebble.minica.pem
+                DOMAINS_RESOLVERS: 127.0.0.1:8053
+              volumes:
+                - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
+            pebble:
+              image: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
+              command: ["-config", "/test/config/pebble-config.json", "-dnsserver", "domains:8053"]
+              environment:
+                PEBBLE_VA_NOSLEEP: "1"
+                PEBBLE_WFE_NONCEREJECT: "0"
+              networks: [domains-egress]
+            traefik:
+              environment:
+                # CI only: Traefik's API on its internal :8080 entrypoint, for
+                # the "no @http object" checks of the domains test.
+                TRAEFIK_API_INSECURE: "true"
           YML
           sed -i 's/^          //' docker-compose.ci.yml
           docker compose config -q
@@ -354,9 +423,9 @@ jobs:
           # edge Hub, pulled by its own test) + the pinned images used inline
           # here and by the CLI (helper, restic, whoami, curl, docker cli).
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/*.sh
-          } > "$RUNNER_TEMP/images.txt"
+          } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         uses: ./.github/actions/cached-images
         with:
@@ -389,6 +458,18 @@ jobs:
           sbom: false
           cache-from: type=gha,scope=group-gate
           cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=group-gate,mode=max' || '' }}
+      - name: Build the domains service (CI test build, buildx layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: domains
+          # compose's image name; the CI override builds the same test variant
+          tags: portcullis-domains
+          build-args: GO_TAGS=testprovider
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=domains-test
+          cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=domains-test,mode=max' || '' }}
 
       - name: Start core services (without Traefik ACME)
         run: docker compose up -d postgres lldap
@@ -831,6 +912,110 @@ jobs:
             if [ "$i" -eq 30 ]; then echo "FAIL: routers not ready (last code $code)"; docker compose logs --tail=40 traefik; exit 1; fi
             sleep 2
           done
+
+      - name: Test the domains service (Pebble, fake DNS provider, Traefik HTTP provider over mTLS)
+        run: |
+          # Contract §12.4 "Checks" / "CI". Pebble's directory TLS root ships in its image.
+          cid="$(docker create "$PEBBLE_IMG")"; docker cp "$cid:/test/certs/pebble.minica.pem" /tmp/pebble.minica.pem; docker rm "$cid" >/dev/null
+          chmod 644 /tmp/pebble.minica.pem
+          docker compose up -d pebble domains
+          for i in $(seq 1 40); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q domains)")" = healthy ] && break
+            [ "$i" -eq 40 ] && { echo "FAIL: domains not healthy"; docker compose logs --tail=40 domains; exit 1; }
+            sleep 3
+          done
+          docker compose exec -T domains sh -c 'test "$(id -u)" = 10004' || { echo "FAIL: domains is not uid 10004"; exit 1; }
+          CURL_IMG=curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+          SECRET="$(cat secrets/domains/api-secret)"; echo "::add-mask::$SECRET"
+          # The API on portcullis-domains (the Hub's network); the bearer comes from stdin.
+          dapi() { printf 'Authorization: Bearer %s\n' "$SECRET" \
+                   | docker run --rm -i --network portcullis_portcullis-domains "$CURL_IMG" -s -H @- -H 'Content-Type: application/json' "$@"; }
+          code=$(docker run --rm --network portcullis_portcullis-domains "$CURL_IMG" -s -o /dev/null -w '%{http_code}' http://domains:8080/domains)
+          [ "$code" = 401 ] || { echo "FAIL: domains API without the bearer secret got $code"; exit 1; }
+          # The certificate endpoint, as Traefik fetches it (client certificate), and without.
+          E=secrets/domains/certs-endpoint
+          dyn() { docker run --rm --user 0:0 --network portcullis_portcullis-certs -v "$PWD/$E:/c:ro" "$CURL_IMG" \
+                    -sf --cacert /c/ca.crt --cert /c/client.crt --key /c/client.key https://domains:8443/traefik/dynamic; }
+          if docker run --rm --network portcullis_portcullis-certs -v "$PWD/$E/ca.crt:/ca.crt:ro" "$CURL_IMG" -sf --cacert /ca.crt https://domains:8443/traefik/dynamic >/dev/null 2>&1; then
+            echo "FAIL: certificate endpoint answered without a client certificate"; exit 1
+          fi
+          dyn | jq -e '. == {"tls": {"certificates": []}}' >/dev/null || { echo "FAIL: empty document: $(dyn)"; exit 1; }
+          # Membership of the internal networks at runtime.
+          docker network inspect portcullis_portcullis-certs | jq -e '[.[0].Containers[].Name | sub("^portcullis-"; "") | sub("-[0-9]+$"; "")] | sort == ["domains", "traefik"]' >/dev/null \
+            || { echo "FAIL: portcullis-certs members: $(docker network inspect portcullis_portcullis-certs | jq -c '[.[0].Containers[].Name]')"; exit 1; }
+          TRAEFIK_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q traefik)")"
+
+          D=team-b.ci-domains.test
+          code=$(dapi -o /dev/null -w '%{http_code}' -X PUT -d '{"provider":"fake","credentials":{"api_token":"ci-fake-token-0123456789"}}' "http://domains:8080/domains/$D")
+          [ "$code" = 202 ] || { echo "FAIL: enroll $D got $code"; exit 1; }
+          code=$(dapi -o /dev/null -w '%{http_code}' -X PUT -d '{"provider":"fake","credentials":{"api_token":"x"}}' "http://domains:8080/domains/auth.portcullis.local")
+          [ "$code" = 400 ] || { echo "FAIL: enrolling a core host got $code"; exit 1; }
+          for i in $(seq 1 60); do
+            st="$(dapi http://domains:8080/domains | jq -r --arg d "$D" '.[] | select(.name == $d) | .state')"
+            [ "$st" = ready ] && break
+            [ "$i" -eq 60 ] && { echo "FAIL: $D state $st: $(dapi http://domains:8080/domains)"; docker compose logs --tail=60 domains pebble; exit 1; }
+            sleep 2
+          done
+          dapi http://domains:8080/domains | jq -e --arg d "$D" '.[] | select(.name == $d) | .records_ok == true and (.cert_not_after | type) == "string" and .last_error == ""' >/dev/null \
+            || { echo "FAIL: domain object: $(dapi http://domains:8080/domains)"; exit 1; }
+          if docker compose logs domains 2>&1 | grep -q 'ci-fake-token-0123456789'; then echo "FAIL: the DNS token is in the domains logs"; exit 1; fi
+          if docker run --rm -v portcullis_domains_data:/d:ro alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a grep -rq 'ci-fake-token-0123456789' /d; then
+            echo "FAIL: the DNS token is in clear in domains_data"; exit 1
+          fi
+
+          # The served document: only tls.certificates with certFile/keyFile;
+          # every certificate's SANs exactly <d> and *.<d> of an enrolled domain.
+          DOC="$(dyn)"
+          echo "$DOC" | jq -e '(keys == ["tls"]) and (.tls | keys == ["certificates"]) and (.tls.certificates | length == 1)
+              and (.tls.certificates | all(keys == ["certFile", "keyFile"]))' >/dev/null \
+            || { echo "FAIL: served document shape: $(echo "$DOC" | jq -c 'walk(if type == "string" then .[0:20] else . end)')"; exit 1; }
+          ENROLLED="$(dapi http://domains:8080/domains | jq -c '[.[].name]')"
+          for i in $(echo "$DOC" | jq -r '.tls.certificates | keys[]'); do
+            SANS="$(echo "$DOC" | jq -r ".tls.certificates[$i].certFile" | openssl x509 -noout -ext subjectAltName | tail -n +2 | tr -d ' ' | tr ',' '\n' | sort | paste -sd,)"
+            name="${SANS##*DNS:}"
+            [ "$SANS" = "DNS:*.$name,DNS:$name" ] || { echo "FAIL: served SANs $SANS"; exit 1; }
+            echo "$ENROLLED" | jq -e --arg n "$name" 'index($n) != null' >/dev/null || { echo "FAIL: served a certificate for $name, not enrolled"; exit 1; }
+            case "$name" in *portcullis.local) echo "FAIL: served a main-domain certificate ($name)"; exit 1 ;; esac
+          done
+          echo "PASS: domains enrolled $D (Pebble, DNS-01), serves only {tls: {certificates}} with SANs {<d>, *.<d>}, mTLS required"
+
+          # Traefik picks it up by SNI through its HTTP provider, without a restart.
+          sni_sans() { openssl s_client -connect 127.0.0.1:443 -servername "$1" </dev/null 2>/dev/null | openssl x509 -noout -ext subjectAltName 2>/dev/null | tail -n +2 | tr -d ' '; }
+          for i in $(seq 1 25); do
+            sni_sans "app.$D" | grep -q "DNS:\*\.$D" && break
+            [ "$i" -eq 25 ] && { echo "FAIL: Traefik does not serve the $D certificate for app.$D: $(sni_sans "app.$D")"; docker compose logs --tail=40 traefik; exit 1; }
+            sleep 1
+          done
+          [ "$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q traefik)")" = "$TRAEFIK_STARTED" ] || { echo "FAIL: Traefik restarted"; exit 1; }
+          for h in auth.portcullis.local hub.portcullis.local portcullis.local; do
+            sni_sans "$h" | grep -q 'DNS:\*\.portcullis\.local' || { echo "FAIL: $h no longer serves the main certificate: $(sni_sans "$h")"; exit 1; }
+          done
+          echo "PASS: the $D certificate is served by SNI within ~25 s without a Traefik restart; auth / hub / the portal keep the main certificate"
+
+          # The HTTP provider contributed nothing but certificates.
+          tapi() { docker run --rm --network portcullis "$CURL_IMG" -sf "http://traefik:8080/api/$1"; }
+          for ep in http/routers http/services http/middlewares tcp/routers tcp/services tcp/middlewares udp/routers udp/services; do
+            tapi "$ep" | jq -e '[.[] | select((.provider // "") == "http" or ((.name // "") | endswith("@http")))] == []' >/dev/null \
+              || { echo "FAIL: @http objects in /api/$ep: $(tapi "$ep" | jq -c '[.[] | select(.provider == "http") | .name]')"; exit 1; }
+          done
+          tapi rawdata | jq -e '[.. | objects | keys[] | select(endswith("@http"))] == []' >/dev/null \
+            || { echo "FAIL: @http keys in /api/rawdata"; exit 1; }
+          echo "PASS: Traefik's API lists no @http router / service / middleware / transport"
+
+          # Delete: the certificate stops being served, the records go.
+          code=$(dapi -o /dev/null -w '%{http_code}' -X DELETE "http://domains:8080/domains/$D")
+          [ "$code" = 204 ] || { echo "FAIL: delete $D got $code"; exit 1; }
+          dyn | jq -e '.tls.certificates == []' >/dev/null || { echo "FAIL: certificate still in the document after delete"; exit 1; }
+          for i in $(seq 1 25); do
+            sni_sans "app.$D" | grep -q "DNS:\*\.$D" || break
+            [ "$i" -eq 25 ] && { echo "FAIL: Traefik still serves the deleted $D certificate"; exit 1; }
+            sleep 1
+          done
+          [ "$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q traefik)")" = "$TRAEFIK_STARTED" ] || { echo "FAIL: Traefik restarted"; exit 1; }
+          # A domain that stays enrolled: the backup / restore test below checks it survives.
+          code=$(dapi -o /dev/null -w '%{http_code}' -X PUT -d '{"provider":"fake","credentials":{"api_token":"ci-fake-token-0123456789"}}' http://domains:8080/domains/keep.ci-domains.test)
+          [ "$code" = 202 ] || { echo "FAIL: enroll keep.ci-domains.test got $code"; exit 1; }
+          echo "PASS: a deleted domain's certificate stops being served (no restart)"
 
       - name: Test mTLS authentication with client cert
         run: |
@@ -1451,6 +1636,11 @@ jobs:
           ./portcullis restore --yes --from-offsite
           VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
           test "$ROOT_CA" = "$(vault read -field=certificate pki/cert/ca | sha256sum)" || { echo "FAIL: CA differs after restore"; exit 1; }
+          # domains_data (age-encrypted) + secrets/domains/age.key came back: the store decrypts.
+          for _ in $(seq 1 40); do [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q domains)" 2>/dev/null)" = healthy ] && break; sleep 3; done
+          printf 'Authorization: Bearer %s\n' "$(cat secrets/domains/api-secret)" \
+            | docker run --rm -i --network portcullis_portcullis-domains curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93 -sf -H @- http://domains:8080/domains \
+            | jq -e 'any(.[]; .name == "keep.ci-domains.test")' >/dev/null || { echo "FAIL: enrolled domain lost by backup/restore"; docker compose logs --tail=20 domains; exit 1; }
           test "$N_CERTS" = "$(vault list -format=json pki_int/certs | jq length)" || { echo "FAIL: issued-cert records lost"; exit 1; }
           vault read -format=json "pki_int/cert/$REVOKED" | jq -e '.data.revocation_time > 0' >/dev/null || { echo "FAIL: revocation lost"; exit 1; }
           # Keycloak realm, client secret and the LLDAP user survived.
@@ -1532,7 +1722,7 @@ jobs:
           # Compose services incl. the monitoring profile (minus enroll and the
           # edge Hub) + the helper alpine, whoami and curl used inline.
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh \
               | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
           } > "$RUNNER_TEMP/images.txt"

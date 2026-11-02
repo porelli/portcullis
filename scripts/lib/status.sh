@@ -148,6 +148,7 @@ status_run() {
   out="$(printf '%s' "$lldap" | jq -r .health)"
   [ "$out" = healthy ] && _st_line ok "lldap healthy" || _st_line fail "lldap $out"
   case "$traefik" in healthy|running) _st_line ok "traefik $traefik" ;; *) _st_line fail "traefik $traefik" ;; esac
+  domains_status_lines
 
   printf '\n%sDomain: %s — run with --json for machine-readable output%s\n\n' "$C_DIM" "${PORTCULLIS_DOMAIN:-?}" "$C_NC"
   return "$problems"

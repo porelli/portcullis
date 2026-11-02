@@ -43,6 +43,14 @@ networks:
   monitoring:
     internal: true
   alerting: {}
+  # Domains service (contract §12): the Hub ⇄ domains API, only those two.
+  portcullis-domains:
+    internal: true
+  # domains ⇄ Traefik only: the certificate endpoint (mTLS, contract §12.4).
+  portcullis-certs:
+    internal: true
+  # domains' egress: ACME, the DNS providers' APIs, the public resolvers.
+  domains-egress: {}
 
 # Hardening defaults (see docs/hardening.md for per-service exceptions).
 x-hardening: &hardening
@@ -173,6 +181,17 @@ services:
       TRAEFIK_PROVIDERS_DOCKER_NETWORK: portcullis-proxy
       TRAEFIK_PROVIDERS_FILE_DIRECTORY: /etc/traefik/dynamic
       TRAEFIK_PROVIDERS_FILE_WATCH: "true"
+      # Enrolled domains' certificates (contract §12.4): polled from the
+      # domains service over portcullis-certs with mutual TLS. The answer
+      # holds only tls.certificates (inline PEM); an unreachable endpoint
+      # keeps the last fetched configuration. Paths only, never key material.
+      TRAEFIK_PROVIDERS_HTTP_ENDPOINT: https://domains:8443/traefik/dynamic
+      TRAEFIK_PROVIDERS_HTTP_POLLINTERVAL: 10s
+      TRAEFIK_PROVIDERS_HTTP_POLLTIMEOUT: 5s
+      TRAEFIK_PROVIDERS_HTTP_MAXRESPONSEBODYSIZE: "4194304"
+      TRAEFIK_PROVIDERS_HTTP_TLS_CA: /run/portcullis/domains-endpoint/ca.crt
+      TRAEFIK_PROVIDERS_HTTP_TLS_CERT: /run/portcullis/domains-endpoint/client.crt
+      TRAEFIK_PROVIDERS_HTTP_TLS_KEY: /run/portcullis/domains-endpoint/client.key
       # ACME (Let's Encrypt)
       TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL: ${ACME_EMAIL:-admin@portcullis.local}
       TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_STORAGE: /acme/acme.json
@@ -204,6 +223,10 @@ services:
       - ./traefik/dynamic:/etc/traefik/dynamic:ro
       - ./certs:/certs:ro
       - traefik_acme:/acme
+      # Client certificate for the domains certificate endpoint (group 0, 0640).
+      - ./secrets/domains/certs-endpoint/ca.crt:/run/portcullis/domains-endpoint/ca.crt:ro
+      - ./secrets/domains/certs-endpoint/client.crt:/run/portcullis/domains-endpoint/client.crt:ro
+      - ./secrets/domains/certs-endpoint/client.key:/run/portcullis/domains-endpoint/client.key:ro
     networks:
       portcullis: {}
       portcullis-proxy:
@@ -211,6 +234,7 @@ services:
       portcullis-auth:
         ipv4_address: ${PORTCULLIS_AUTH_TRAEFIK_IP:-172.31.251.2}
       socket-proxy-traefik: {}
+      portcullis-certs: {}
     healthcheck:
       test: ["CMD", "traefik", "healthcheck", "--ping"]
       interval: 10s
@@ -737,6 +761,10 @@ services:
       INVITE_PROTECTED_GROUPS: ${INVITE_PROTECTED_GROUPS:-}
       HUB_INVITE_API_URL: http://enroll:8444/internal/invites
       HUB_INVITE_SECRET_FILE: /run/portcullis/invite/secret
+      # Enrolled domains (contract §12): the domains service's API over
+      # portcullis-domains, bearer secret from a file.
+      HUB_DOMAINS_API_URL: http://domains:8080
+      HUB_DOMAINS_SECRET_FILE: /run/portcullis/domains/api-secret
       # Host directories an app's custom (Expert) override may bind-mount
       # (colon-separated; empty = /srv:/mnt:/media).
       HUB_OVERRIDE_BIND_ROOTS: ${HUB_OVERRIDE_BIND_ROOTS:-}
@@ -778,9 +806,11 @@ services:
       # secrets/ is masked above; these two subdirectories are the Hub's.
       - ./secrets/hub/lldap:/run/portcullis/lldap:ro
       - ./secrets/hub/invite:/run/portcullis/invite:ro
+      - ./secrets/domains/api-secret:/run/portcullis/domains/api-secret:ro
     networks:
       - portcullis
       - socket-proxy-hub
+      - portcullis-domains
     mem_limit: 1g
     pids_limit: 512
     labels:
@@ -885,6 +915,48 @@ services:
         condition: service_healthy
       lldap:
         condition: service_healthy
+    restart: unless-stopped
+
+  # Enrolled domains (contract §12): DNS credentials (age-encrypted in
+  # domains_data), A/AAAA records and ACME DNS-01 wildcard certificates per
+  # domain; the certificates reach Traefik only through its HTTP provider
+  # (portcullis-certs, mTLS). Never routed by Traefik. The main domain keeps
+  # Traefik's own resolver.
+  domains:
+    build:
+      context: ./domains
+    image: portcullis-domains
+    <<: *hardening
+    read_only: true
+    # USER 10004:10004 in domains/Dockerfile; group 10001 only to read the
+    # API secret it shares with the Hub (secrets/domains/api-secret).
+    user: "10004:10004"
+    group_add: ["10001"]
+    environment:
+      PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
+      ACME_EMAIL: ${ACME_EMAIL:-admin@portcullis.local}
+      ACME_CA_SERVER: ${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
+      # Detected by ./portcullis up (as `dns setup` does) unless set in .env.
+      DOMAINS_PUBLIC_IPV4: ${PORTCULLIS_PUBLIC_IPV4:-}
+      DOMAINS_PUBLIC_IPV6: ${PORTCULLIS_PUBLIC_IPV6:-}
+    volumes:
+      - domains_data:/data
+      - ./secrets/domains/api-secret:/run/portcullis/domains/api-secret:ro
+      - ./secrets/domains/age.key:/run/portcullis/domains/age.key:ro
+      - ./secrets/domains/certs-endpoint/ca.crt:/run/portcullis/domains/certs-endpoint/ca.crt:ro
+      - ./secrets/domains/certs-endpoint/server.crt:/run/portcullis/domains/certs-endpoint/server.crt:ro
+      - ./secrets/domains/certs-endpoint/server.key:/run/portcullis/domains/certs-endpoint/server.key:ro
+    networks:
+      - portcullis-domains
+      - portcullis-certs
+      - domains-egress
+    healthcheck:
+      test: ["CMD", "domains", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    mem_limit: 256m
+    pids_limit: 128
     restart: unless-stopped
 
   # ── Monitoring (opt-in: COMPOSE_PROFILES=monitoring in .env, then
@@ -1064,6 +1136,7 @@ volumes:
   lldap_data:
   hub_data:
   traefik_acme:
+  domains_data:
   prometheus_data:
   alertmanager_data:
   grafana_data:

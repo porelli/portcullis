@@ -23,6 +23,15 @@ updates:
       enroll-images:
         patterns: ["*"]
 
+  # domains/Dockerfile base images (golang, alpine).
+  - package-ecosystem: docker
+    directory: /domains
+    schedule:
+      interval: weekly
+    groups:
+      domains-images:
+        patterns: ["*"]
+
   # group-gate/Dockerfile base image (python).
   - package-ecosystem: docker
     directory: /group-gate
@@ -47,6 +56,15 @@ updates:
       interval: weekly
     groups:
       enroll-go:
+        patterns: ["*"]
+
+  # domains/go.mod (lego, libdns providers, age; Pebble for the tests).
+  - package-ecosystem: gomod
+    directory: /domains
+    schedule:
+      interval: weekly
+    groups:
+      domains-go:
         patterns: ["*"]
 
   # Actions are pinned by commit SHA with a `# vX.Y.Z` comment; Dependabot

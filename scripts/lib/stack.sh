@@ -213,6 +213,7 @@ stack_up() {
   stack_prepare
   config_apply
   dc up -d --build
+  domains_restart_if_renewed
   monitoring_reload
   wait_healthy 300 vault postgres lldap keycloak
   lldap_service_account
@@ -247,6 +248,7 @@ upgrade_run() {
 
   info "Starting services..."
   dc up -d --build
+  domains_restart_if_renewed
   monitoring_reload
   if [ "$PKI_CREATED" = true ] || [ "${PKI_TRUSTSTORE_CHANGED:-false}" = true ]; then
     # Traefik, forward-auth(-ext) and Keycloak read the CA chain only at start-up.
