@@ -15,7 +15,11 @@
 #   postgres.dump        pg_dump -Fc of the Keycloak database
 #   <volume>.tar.gz      lldap_data, hub_data, traefik_acme, domains_data (age-encrypted): files, with every
 #                        SQLite database copied through SQLite's online backup
-#                        API (consistent while the service keeps running)
+#                        API (consistent while the service keeps running);
+#                        hub_data includes the Hub's app instance backups
+#                        (/data/backups/<instance>/<UTC>.tar, contract §11.5:
+#                        0600 files of uid 10001, generated app secrets in
+#                        clear), so --offsite ships them too
 # Nothing is stopped for a backup. secrets/ + vault.snap can decrypt the CA
 # and every secret: a backup is as sensitive as the host. Off-host copies
 # are encrypted by restic with BACKUP_PASSWORD — keep that password offline.
