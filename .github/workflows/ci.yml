@@ -937,9 +937,11 @@ jobs:
           code=$(docker run --rm --network portcullis_portcullis-domains "$CURL_IMG" -s -o /dev/null -w '%{http_code}' http://domains:8080/domains)
           [ "$code" = 401 ] || { echo "FAIL: domains API without the bearer secret got $code"; exit 1; }
           # The API answers only on portcullis-domains: not to Traefik (portcullis-certs).
-          if docker compose exec -T traefik wget -q -T 5 -O /dev/null http://domains:8080/healthz 2>/dev/null; then
-            echo "FAIL: Traefik reached the domains API"; exit 1
-          fi
+          # Positive control from the same container: domains:8443 answers HTTP
+          # (Go's TLS server replies "400 … HTTP request to an HTTPS server").
+          tstatus() { docker compose exec -T traefik wget -q -T 5 -O /dev/null -S "$1" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -n1 | cut -d' ' -f2; }
+          [ "$(tstatus http://domains:8443/)" = 400 ] || { echo "FAIL: positive control: Traefik can't reach domains:8443 ($(tstatus http://domains:8443/))"; exit 1; }
+          [ -z "$(tstatus http://domains:8080/healthz)" ] || { echo "FAIL: Traefik reached the domains API (:8080)"; exit 1; }
           # The certificate endpoint, as Traefik fetches it (client certificate), and without.
           E=secrets/domains/certs-endpoint
           dyn() { docker run --rm --user 0:0 --network portcullis_portcullis-certs -v "$PWD/$E:/c:ro" "$CURL_IMG" \

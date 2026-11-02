@@ -99,15 +99,48 @@ func parseIP(name string, want4 bool) (netip.Addr, error) {
 // own client on http.DefaultTransport / http.DefaultClient (porkbun,
 // hetzner, ...): they ignore contexts, and a hung provider must not hold
 // a records step (and with it DELETE) forever.
-func setHTTPDefaults() {
+func setHTTPDefaults(perRequest time.Duration) {
 	if t, ok := http.DefaultTransport.(*http.Transport); ok {
 		t.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 		t.TLSHandshakeTimeout = 15 * time.Second
 		t.ResponseHeaderTimeout = 60 * time.Second
 		t.ExpectContinueTimeout = 5 * time.Second
 		t.IdleConnTimeout = 90 * time.Second
+		// Libraries that build `&http.Client{}` (porkbun, hetzner) get no
+		// overall timeout from DefaultClient: bound every request, body
+		// included, in the transport itself.
+		http.DefaultTransport = timeoutTransport{base: t, d: perRequest}
 	}
-	http.DefaultClient.Timeout = 2 * time.Minute
+	http.DefaultClient.Timeout = perRequest
+}
+
+// timeoutTransport gives every request a deadline (headers and body);
+// the deadline's context is released when the body is closed.
+type timeoutTransport struct {
+	base http.RoundTripper
+	d    time.Duration
+}
+
+func (t timeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx, cancel := context.WithTimeout(req.Context(), t.d)
+	resp, err := t.base.RoundTrip(req.WithContext(ctx))
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	resp.Body = cancelBody{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+type cancelBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b cancelBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
 }
 
 // subnetListener accepts only connections addressed to the API's own
@@ -159,7 +192,7 @@ func certExpiryWarning(leaf *x509.Certificate, now time.Time) string {
 
 func run() error {
 	logger := log.New(os.Stderr, "", log.LstdFlags)
-	setHTTPDefaults()
+	setHTTPDefaults(2 * time.Minute)
 	// lego logs ACME progress (domains, never DNS credentials: the
 	// challenge provider is ours).
 	legolog.Logger = log.New(os.Stderr, "lego: ", log.LstdFlags)
@@ -238,7 +271,10 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	api := &http.Server{Addr: env("DOMAINS_API_ADDR", ":8080"), Handler: svc.APIHandler(),
-		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 3 * time.Minute, IdleTimeout: 2 * time.Minute}
+		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second,
+		// Budget: DELETE waits ≤ 90 s for a records step + ≤ 60 s removing
+		// records < this < the Hub's 4-min client timeout.
+		WriteTimeout: 3 * time.Minute, IdleTimeout: 2 * time.Minute}
 	certs := &http.Server{Addr: env("DOMAINS_CERTS_ADDR", ":8443"), Handler: svc.CertsHandler(), TLSConfig: certsTLS,
 		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute,
 		ErrorLog: log.New(io.Discard, "", 0)} // TLS handshake failures (no client cert) are expected noise

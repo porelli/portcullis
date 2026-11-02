@@ -127,12 +127,15 @@ func NewService(cfg Config, store *Store) (*Service, error) {
 // started.
 type job struct {
 	rec chan struct{}
+	// held: the worker goroutine holds rec (only that goroutine touches
+	// it, so its recover can release exactly its own slot).
+	held bool
 }
 
 func newJob() *job { return &job{rec: make(chan struct{}, 1)} }
 
-func (j *job) lock()   { j.rec <- struct{}{} }
-func (j *job) unlock() { <-j.rec }
+func (j *job) lock()   { j.rec <- struct{}{}; j.held = true }
+func (j *job) unlock() { j.held = false; <-j.rec }
 
 // waitRecords waits until no records step of j is running (ctx bounds it).
 func (j *job) waitIdle(ctx context.Context) error {
@@ -149,7 +152,12 @@ func (j *job) waitIdle(ctx context.Context) error {
 }
 
 // recordsStepWait bounds how long DELETE / token wait for a records step.
-const recordsStepWait = 3 * time.Minute
+// Budget (DELETE): this wait + recordsDeleteTimeout < the API's 3-min
+// WriteTimeout < the Hub client's 4 min.
+const recordsStepWait = 90 * time.Second
+
+// recordsDeleteTimeout bounds removing a deleted domain's records.
+const recordsDeleteTimeout = 60 * time.Second
 
 func addrString(a netip.Addr) string {
 	if !a.IsValid() {
@@ -393,7 +401,7 @@ func (s *Service) handleDelete(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(r.Context(), recordsDeleteTimeout)
 	defer cancel()
 	p, perr := buildProvider(snap)
 	if perr == nil {
@@ -529,6 +537,11 @@ func (s *Service) dispatch(ctx context.Context) {
 			defer func() {
 				// A panicking provider library must not take the service down.
 				if r := recover(); r != nil {
+					// Release the records step if the panic hit inside it
+					// (a held slot would block DELETE and token for good).
+					if j.held {
+						j.unlock()
+					}
 					s.logf("domain %s: internal error (panic) during work — retried with backoff", snap.Name)
 					s.update(snap.Name, snap.Generation, func(d *Domain) {
 						d.State, d.LastError = StateError, "internal error while working on this domain"

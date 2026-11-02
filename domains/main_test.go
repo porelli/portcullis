@@ -2,7 +2,10 @@ package main
 
 import (
 	"crypto/x509"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"strings"
 	"testing"
@@ -54,5 +57,39 @@ func TestCertExpiryWarning(t *testing.T) {
 	}
 	if w := certExpiryWarning(&x509.Certificate{NotAfter: now.Add(200 * 24 * time.Hour)}, now); w != "" {
 		t.Fatalf("no warning expected: %q", w)
+	}
+}
+
+// TestTimeoutTransport: a server that sends headers and then stalls the
+// body can't hold a request (as porkbun's own http.Client{} would) longer
+// than the per-request deadline.
+func TestTimeoutTransport(t *testing.T) {
+	stall := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		w.WriteHeader(200)
+		w.Write([]byte("partial"))
+		w.(http.Flusher).Flush()
+		select {
+		case <-stall:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(stall)
+	orig := http.DefaultTransport
+	defer func() { http.DefaultTransport = orig; http.DefaultClient.Timeout = 0 }()
+	setHTTPDefaults(300 * time.Millisecond)
+	start := time.Now()
+	resp, err := (&http.Client{}).Get(srv.URL) // like porkbun: no client timeout
+	if err == nil {
+		_, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("a stalled body read succeeded")
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("stalled for %s", d)
 	}
 }

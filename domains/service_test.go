@@ -1135,6 +1135,19 @@ func TestProviderPanicRecovered(t *testing.T) {
 	if busy != nil {
 		t.Fatal("busy left set after a panic")
 	}
+	// The panic hit inside the records step: the service stays usable and
+	// a DELETE goes through (the slot is released in recover; the job is
+	// also dropped from busy).
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req := httptest.NewRequest("DELETE", "/domains/team-q.example.org", nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+testSecret)
+	rec := httptest.NewRecorder()
+	e.setHook(nil)
+	e.api.ServeHTTP(rec, req)
+	if rec.Code != 204 && rec.Code != 200 {
+		t.Fatalf("delete after a panic = %d %s", rec.Code, rec.Body)
+	}
 }
 
 func TestShortSecretRefused(t *testing.T) {
