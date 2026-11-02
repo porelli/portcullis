@@ -12,7 +12,8 @@
 #             needs contents: write + pull-requests: write
 #   issue     open, update or close the `update-failed` issue; issues: write
 #   dispatch  start the post-merge workflows on the base branch (a merge made
-#             with GITHUB_TOKEN starts no push workflows); actions: write
+#             with GITHUB_TOKEN starts no push workflows), skipping any that
+#             is already queued or running there; actions: write
 #   classify FROM TO [docker]   print the update type (tests)
 #   prerelease VERSION          exit 0 if VERSION is a pre-release (tests)
 #
@@ -345,6 +346,14 @@ Opened by .github/workflows/dependabot-automerge.yml. Further failures of the sa
   esac
 }
 
+busy() { # workflow file
+  local s n=0
+  for s in queued in_progress; do
+    n=$((n + $(api "repos/$REPO/actions/workflows/$1/runs?branch=$BASE_BRANCH&status=$s&per_page=1" | jq '.total_count // 0' || echo 0)))
+  done
+  [ "$n" -gt 0 ]
+}
+
 dispatch_act() {
   need_decision
   [ "$(field action)" = merge ] || die "dispatch only follows a merge"
@@ -358,6 +367,10 @@ dispatch_act() {
       if [ "${a#*=}" = "{apps}" ]; then [ -n "$apps" ] && args+=(-f "${a%%=*}=$apps")
       else args+=(-f "$a"); fi
     done
+    # Never start one while a run of it is queued or running on the branch:
+    # the workflows' concurrency groups would cancel that run (e.g. a human
+    # push's cache save or image publish). The merge was tested on the PR.
+    if busy "$wf"; then echo "Skipped $wf: a run is already queued or in progress on $BASE_BRANCH"; continue; fi
     gh workflow run "$wf" -R "$REPO" --ref "$BASE_BRANCH" ${args[@]+"${args[@]}"}
     echo "Dispatched $wf on $BASE_BRANCH ${args[*]-}"
   done <<<"${POST_MERGE_WORKFLOWS:-}"
