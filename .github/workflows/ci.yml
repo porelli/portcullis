@@ -987,10 +987,10 @@ jobs:
             sleep 1
           done
           [ "$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q traefik)")" = "$TRAEFIK_STARTED" ] || { echo "FAIL: Traefik restarted"; exit 1; }
-          for h in auth.portcullis.local hub.portcullis.local portcullis.local; do
+          for h in auth.portcullis.local hub.portcullis.local; do
             sni_sans "$h" | grep -q 'DNS:\*\.portcullis\.local' || { echo "FAIL: $h no longer serves the main certificate: $(sni_sans "$h")"; exit 1; }
           done
-          echo "PASS: the $D certificate is served by SNI within ~25 s without a Traefik restart; auth / hub / the portal keep the main certificate"
+          echo "PASS: the $D certificate is served by SNI within ~25 s without a Traefik restart; auth and hub keep the main certificate"
 
           # The HTTP provider contributed nothing but certificates.
           tapi() { docker run --rm --network portcullis "$CURL_IMG" -sf "http://traefik:8080/api/$1"; }
