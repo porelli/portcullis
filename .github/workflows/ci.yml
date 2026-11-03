@@ -595,7 +595,8 @@ jobs:
       - name: Test enroll AppRole is least-privilege
         run: |
           TOKEN=$(vault write -field=token auth/approle/login \
-            role_id="$(cat secrets/enroll/role-id)" secret_id="$(cat secrets/enroll/secret-id)")
+            role_id=@secrets/enroll/role-id secret_id=@secrets/enroll/secret-id)
+          echo "::add-mask::$TOKEN"
           export VAULT_TOKEN="$TOKEN"
           vault list pki_int/certs >/dev/null || { echo "FAIL: enroll token cannot list certs"; exit 1; }
           for denied in "write -f pki/root/generate/internal common_name=x" \
@@ -664,12 +665,13 @@ jobs:
           TOKEN=$(curl -s http://localhost:8080/realms/master/protocol/openid-connect/token \
             -d "client_id=admin-cli" \
             -d "username=$KEYCLOAK_ADMIN" \
-            -d "password=$KEYCLOAK_ADMIN_PASSWORD" \
-            -d "grant_type=password" | jq -r '.access_token')
+            --data-urlencode password@- \
+            -d "grant_type=password" < <(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD") | jq -r '.access_token')
+          echo "::add-mask::$TOKEN"
 
           # Check realm has WebAuthn policy
           REALM=$(curl -s http://localhost:8080/admin/realms/portcullis \
-            -H "Authorization: Bearer $TOKEN")
+            -H @<(printf 'Authorization: Bearer %s\n' "$TOKEN"))
 
           WEBAUTHN_RP=$(echo "$REALM" | jq -r '.webAuthnPolicyPasswordlessRpEntityName')
           if [ "$WEBAUTHN_RP" = "Portcullis" ]; then
@@ -693,11 +695,12 @@ jobs:
           TOKEN=$(curl -s http://localhost:8080/realms/master/protocol/openid-connect/token \
             -d "client_id=admin-cli" \
             -d "username=$KEYCLOAK_ADMIN" \
-            -d "password=$KEYCLOAK_ADMIN_PASSWORD" \
-            -d "grant_type=password" | jq -r '.access_token')
+            --data-urlencode password@- \
+            -d "grant_type=password" < <(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD") | jq -r '.access_token')
+          echo "::add-mask::$TOKEN"
 
           CLIENT=$(curl -s http://localhost:8080/admin/realms/portcullis/clients \
-            -H "Authorization: Bearer $TOKEN" \
+            -H @<(printf 'Authorization: Bearer %s\n' "$TOKEN") \
             | jq -r '.[] | select(.clientId == "portcullis-forward-auth") | .clientId')
 
           if [ "$CLIENT" = "portcullis-forward-auth" ]; then
@@ -710,19 +713,19 @@ jobs:
           # The realm export ships a placeholder; `oidc register` must have
           # pushed the generated secret from .env.
           UUID=$(curl -s "http://localhost:8080/admin/realms/portcullis/clients?clientId=portcullis-forward-auth" \
-            -H "Authorization: Bearer $TOKEN" | jq -r '.[0].id')
+            -H @<(printf 'Authorization: Bearer %s\n' "$TOKEN") | jq -r '.[0].id')
           KC_SECRET=$(curl -s "http://localhost:8080/admin/realms/portcullis/clients/$UUID/client-secret" \
-            -H "Authorization: Bearer $TOKEN" | jq -r '.value')
+            -H @<(printf 'Authorization: Bearer %s\n' "$TOKEN") | jq -r '.value')
           [ "$KC_SECRET" = "$FORWARD_AUTH_CLIENT_SECRET" ] || { echo "FAIL: Keycloak client secret != .env FORWARD_AUTH_CLIENT_SECRET"; exit 1; }
           echo "PASS: forward-auth client secret in Keycloak matches the generated .env value"
 
       - name: Test LLDAP user creation
         run: |
           # Create a test user via LLDAP GraphQL API
-          LLDAP_TOKEN=$(curl -s http://localhost:17170/auth/simple/login \
-            -H "Content-Type: application/json" \
-            -d "{\"username\":\"admin\",\"password\":\"$LLDAP_ADMIN_PASSWORD\"}" \
+          LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
+            | curl -s http://localhost:17170/auth/simple/login -H "Content-Type: application/json" -d @- \
             | jq -r '.token')
+          echo "::add-mask::$LLDAP_TOKEN"
 
           if [ "$LLDAP_TOKEN" = "null" ] || [ -z "$LLDAP_TOKEN" ]; then
             echo "FAIL: Could not authenticate with LLDAP"
@@ -732,7 +735,7 @@ jobs:
           # Create user
           HTTP_CODE=$(curl -s -o /tmp/lldap-response.json -w "%{http_code}" \
             http://localhost:17170/api/graphql \
-            -H "Authorization: Bearer $LLDAP_TOKEN" \
+            -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") \
             -H "Content-Type: application/json" \
             -d '{"query":"mutation { createUser(user: {id: \"testuser\", email: \"testuser@portcullis.local\"}) { id email } }"}')
 
@@ -758,6 +761,7 @@ jobs:
           KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
             --data-urlencode client_id=admin-cli --data-urlencode "username=$KEYCLOAK_ADMIN" \
             --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          echo "::add-mask::$KC_TOKEN"
           kc() { curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") -H 'Content-Type: application/json' "$@"; }
           A=http://127.0.0.1:8080/admin/realms/portcullis
           SCOPE=$(kc "$A/client-scopes" | jq -c '[.[] | select(.name == "email-unverified")][0] // empty')
@@ -769,16 +773,20 @@ jobs:
           # A throwaway LLDAP user with a password and a direct-grant client
           # that has email-unverified instead of email.
           PW="$(openssl rand -hex 16)Aa1!"; echo "::add-mask::$PW"
-          LLDAP_TOKEN=$(jq -n --arg p "$LLDAP_ADMIN_PASSWORD" '{username: "admin", password: $p}' \
+          LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
             | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          echo "::add-mask::$LLDAP_TOKEN"
           jq -n '{query: "mutation { createUser(user: {id: \"scopecheck\", email: \"scopecheck@portcullis.local\"}) { id } }"}' \
             | curl -sf http://127.0.0.1:17170/api/graphql -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") \
               -H 'Content-Type: application/json' -d @- | jq -e '.errors == null' >/dev/null
-          docker compose exec -T lldap /app/lldap_set_password --base-url http://localhost:17170 \
-            --admin-username admin --admin-password "$LLDAP_ADMIN_PASSWORD" --username scopecheck --password "$PW"
+          # As the CLI does (users.sh): the user's password via LLDAP_USER_PASSWORD,
+          # the admin JWT read from stdin inside the lldap container.
+          { printf '%s\n' "$LLDAP_TOKEN"; printf '%s\n' "$PW"; } | docker compose exec -T lldap sh -c 'read -r T; read -r P; export LLDAP_USER_PASSWORD="$P";
+            exec /app/lldap_set_password --base-url http://localhost:17170 --token "$T" --username "$1"' _ scopecheck # secret-argv-ok: inside the lldap container
           CS="$(openssl rand -hex 24)"; echo "::add-mask::$CS"
-          jq -n --arg s "$CS" '{clientId: "ci-email-unverified", protocol: "openid-connect", publicClient: false,
-              secret: $s, standardFlowEnabled: false, directAccessGrantsEnabled: true,
+          export CS
+          jq -n '{clientId: "ci-email-unverified", protocol: "openid-connect", publicClient: false,
+              secret: env.CS, standardFlowEnabled: false, directAccessGrantsEnabled: true,
               defaultClientScopes: ["basic", "profile", "email-unverified"], optionalClientScopes: []}' \
             | kc -X POST -d @- "$A/clients"
           CU=$(kc "$A/clients?clientId=ci-email-unverified" | jq -r '.[0].id')
@@ -1111,6 +1119,7 @@ jobs:
           KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
             --data-urlencode client_id=admin-cli --data-urlencode "username=$KEYCLOAK_ADMIN" \
             --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          echo "::add-mask::$KC_TOKEN"
           realm_ssl() { printf '{"sslRequired":"%s"}' "$1" | curl -sf -X PUT -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") \
             -H 'Content-Type: application/json' -d @- http://127.0.0.1:8080/admin/realms/portcullis; }
           realm_ssl none
@@ -1396,6 +1405,7 @@ jobs:
           KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
             --data-urlencode client_id=admin-cli --data-urlencode "username=${KEYCLOAK_ADMIN:-admin}" \
             --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          echo "::add-mask::$KC_TOKEN"
           kc() { curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") "http://127.0.0.1:8080/admin/realms/portcullis$1"; }
           # The browser flow has no password factor anywhere; LoA 1 = cert or
           # passkey, LoA 2 needs nothing more; the invite IdP is reachable only
@@ -1436,6 +1446,7 @@ jobs:
           KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
             --data-urlencode client_id=admin-cli --data-urlencode "username=${KEYCLOAK_ADMIN:-admin}" \
             --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          echo "::add-mask::$KC_TOKEN"
           kc "/clients/$FWD" | jq -e '.redirectUris | sort == ["https://auth.portcullis.local/oauth2/callback", "https://grafana.team-b.example.org/oauth2/callback"]' >/dev/null \
             || { echo "FAIL: configure did not keep (only) the extra-domain callbacks: $(kc "/clients/$FWD" | jq -c .redirectUris)"; exit 1; }
           kc "/clients/$FWD" | jq '.redirectUris = ["https://auth.portcullis.local/oauth2/callback"]' \
@@ -1465,13 +1476,14 @@ jobs:
           if ./portcullis invite portcullis-hub >/dev/null 2>&1; then echo "FAIL: invite for the Hub's service account"; exit 1; fi
           ./portcullis invite admin --json | jq -e .url >/dev/null || { echo "FAIL: the server must be able to invite the bootstrap admin"; exit 1; }
           # The Hub's API (contract §9.4): bearer secret from the shared file; admin / portcullis-hub refused.
-          api() { docker compose exec -T enroll sh -c 'wget -S -q -O /dev/null --header "Content-Type: application/json" \
-              --header "Authorization: Bearer $(cat /run/secrets/portcullis-enroll/invite-api-secret)$2" \
-              --post-data "{\"username\":\"$1\"}" http://127.0.0.1:8444/internal/invites 2>&1 | sed -n "s/^ *HTTP\/1.1 \([0-9]*\).*/\1/p"' _ "$1" "${2:-}"; }
+          api() { jq -n --arg u "$1" '{username: $u}' | curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+              -H @<(printf 'Authorization: Bearer %s%s\n' "$(cat secrets/enroll/invite-api-secret)" "${2:-}") \
+              -d @- "http://$ENROLL_IP:8444/internal/invites"; }
           [ "$(api testuser)" = 201 ] || { echo "FAIL: Hub invite API for testuser"; exit 1; }
           # Any lldap_admin member (not just `admin`) is refused: an invite hands over the account.
           LT=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
             | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          echo "::add-mask::$LT"
           lg() { jq -n --arg q "$1" '{query: $q}' | curl -sf http://127.0.0.1:17170/api/graphql \
             -H @<(printf 'Authorization: Bearer %s\n' "$LT") -H 'Content-Type: application/json' -d @- | jq -e '.errors == null' >/dev/null; }
           lg 'mutation { createUser(user: {id: "ciadmin2", email: "ciadmin2@portcullis.local"}) { id } }'
@@ -1494,11 +1506,13 @@ jobs:
             --data-urlencode client_id=admin-cli --data-urlencode "username=${KEYCLOAK_ADMIN:-admin}" \
             --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token; }
           KC_TOKEN=$(tok)
+          echo "::add-mask::$KC_TOKEN"
           kc() { curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") "http://127.0.0.1:8080/admin/realms/portcullis$1"; }
           kcpost() { curl -sf -X POST -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") "http://127.0.0.1:8080/admin/realms/portcullis$1"; }
           kcstatus() { curl -s -o /dev/null -w '%{http_code}' -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") "http://127.0.0.1:8080/admin/realms/portcullis$1"; }
           LT=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
             | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          echo "::add-mask::$LT"
           lq() { jq -n --arg q "$1" '{query: $q}' | curl -sf http://127.0.0.1:17170/api/graphql \
             -H @<(printf 'Authorization: Bearer %s\n' "$LT") -H 'Content-Type: application/json' -d @-; }
           lg() { lq "$1" | jq -e '.errors == null' >/dev/null || { echo "FAIL: LLDAP: $1"; exit 1; }; }
@@ -1540,8 +1554,10 @@ jobs:
             sleep 2
           done
           KC_TOKEN=$(tok)
+          echo "::add-mask::$KC_TOKEN"
           LT=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
             | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          echo "::add-mask::$LT"
           kc "/users?username=testuser&exact=true" | jq -e --arg id "$TEST_ID" '.[0].id == $id' >/dev/null || { echo "FAIL: testuser removed while LLDAP was down"; exit 1; }
           kcgroup lldap_admin || { echo "FAIL: lldap_admin dropped while LLDAP was down"; exit 1; }
           # Keycloak reaches LLDAP again (its JVM caches the failed DNS lookup
@@ -1677,8 +1693,9 @@ jobs:
           # `up` starts every service, the Hub included.
           [ -n "${HUB_LOCAL:-}" ] || docker compose pull --quiet hub || { echo "::warning::Hub image cannot be pulled — skipping"; exit 0; }
           ./portcullis up
-          LLDAP_TOKEN=$(jq -n --arg p "$LLDAP_ADMIN_PASSWORD" '{username: "admin", password: $p}' \
+          LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
             | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          echo "::add-mask::$LLDAP_TOKEN"
           jq -n '{query: "{ user(userId: \"portcullis-hub\") { id groups { displayName } } }"}' | curl -sf http://127.0.0.1:17170/api/graphql \
             -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @- \
             | jq -e 'any(.data.user.groups[]; .displayName == "lldap_admin")' >/dev/null || { echo "FAIL: portcullis-hub not in lldap_admin"; exit 1; }
@@ -1691,12 +1708,13 @@ jobs:
           KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
             --data-urlencode client_id=admin-cli --data-urlencode "username=${KEYCLOAK_ADMIN:-admin}" \
             --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          echo "::add-mask::$KC_TOKEN"
           curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") \
               "http://127.0.0.1:8080/admin/realms/portcullis/users?username=portcullis-hub&exact=true" | jq -e 'length == 0' >/dev/null \
             || { echo "FAIL: portcullis-hub is visible in Keycloak"; exit 1; }
           # A changed password in LLDAP is reset from the file on the next run.
-          docker compose exec -T lldap /app/lldap_set_password --base-url http://localhost:17170 \
-            --admin-username admin --admin-password "$LLDAP_ADMIN_PASSWORD" --username portcullis-hub --password "$(openssl rand -hex 20)" >/dev/null
+          { printf '%s\n' "$LLDAP_TOKEN"; openssl rand -hex 20; } | docker compose exec -T lldap sh -c 'read -r T; read -r P; export LLDAP_USER_PASSWORD="$P";
+            exec /app/lldap_set_password --base-url http://localhost:17170 --token "$T" --username "$1"' _ portcullis-hub >/dev/null # secret-argv-ok: inside the lldap container
           ./portcullis up | grep -q "portcullis-hub: password set from secrets/hub/lldap/password" || { echo "FAIL: password not reconciled"; exit 1; }
           if docker compose ps -q hub | grep -q .; then
             docker compose exec -T hub sh -c 'test "$(cat /run/portcullis/lldap/username)" = portcullis-hub && test -s /run/portcullis/lldap/password && test -s /run/portcullis/invite/secret' \
@@ -1788,11 +1806,13 @@ jobs:
           KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
             --data-urlencode client_id=admin-cli --data-urlencode "username=$KEYCLOAK_ADMIN" \
             --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          echo "::add-mask::$KC_TOKEN"
           kc() { curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") "http://127.0.0.1:8080/admin/realms/portcullis$1"; }
           UUID=$(kc "/clients?clientId=portcullis-forward-auth" | jq -r '.[0].id')
           test "$(kc "/clients/$UUID/client-secret" | jq -r .value)" = "$FORWARD_AUTH_CLIENT_SECRET" || { echo "FAIL: Keycloak client secret after restore"; exit 1; }
-          LLDAP_TOKEN=$(jq -n --arg p "$LLDAP_ADMIN_PASSWORD" '{username: "admin", password: $p}' \
+          LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
             | curl -sf http://localhost:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          echo "::add-mask::$LLDAP_TOKEN"
           jq -n '{query: "{ user(userId: \"testuser\") { id } }"}' | curl -sf http://localhost:17170/api/graphql \
             -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @- \
             | jq -e '.data.user.id == "testuser"' >/dev/null || { echo "FAIL: LLDAP user lost"; exit 1; }
@@ -1951,8 +1971,9 @@ jobs:
               -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @- \
               | tee /dev/stderr | jq -e '.errors == null' >/dev/null
           }
-          LLDAP_TOKEN=$(jq -n --arg p "$LLDAP_ADMIN_PASSWORD" '{username: "admin", password: $p}' \
+          LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
             | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          echo "::add-mask::$LLDAP_TOKEN"
           gql 'mutation { createUser(user: {id: "e2e", email: "e2e@portcullis.local"}) { id } }'
           gql 'mutation { createUser(user: {id: "e2e-other", email: "e2e-other@portcullis.local"}) { id } }'
           gql 'mutation { createUser(user: {id: "e2e-bypass", email: "e2e-bypass@portcullis.local"}) { id } }'
@@ -1980,6 +2001,7 @@ jobs:
           KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
             --data-urlencode client_id=admin-cli --data-urlencode "username=$KEYCLOAK_ADMIN" \
             --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          echo "::add-mask::$KC_TOKEN"
           kc() { curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") -H 'Content-Type: application/json' "$@"; }
           KC_UID=$(kc "http://127.0.0.1:8080/admin/realms/portcullis/users?username=e2e&exact=true" | jq -r '.[0].id')
           [ -n "$KC_UID" ] && [ "$KC_UID" != null ] || { echo "FAIL: e2e not visible in Keycloak (LDAP federation)"; exit 1; }
@@ -2102,6 +2124,7 @@ jobs:
           set -o pipefail
           LT=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
             | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          echo "::add-mask::$LT"
           for u in e2e-spare e2e-lost; do
             jq -n --arg u "$u" '{query: ("mutation { createUser(user: {id: \"" + $u + "\", email: \"" + $u + "@portcullis.local\"}) { id } }")}' \
               | curl -sf http://127.0.0.1:17170/api/graphql -H @<(printf 'Authorization: Bearer %s\n' "$LT") -H 'Content-Type: application/json' -d @- \
@@ -2392,8 +2415,9 @@ jobs:
           [ "$code" = 200 ] || { echo "FAIL: echo-b settings: $code $(cat /tmp/hub.out)"; exit 1; }
 
           # Users and the instances' groups (created by the Hub as the admin).
-          LLDAP_TOKEN=$(jq -n --arg p "$LLDAP_ADMIN_PASSWORD" '{username: "admin", password: $p}' \
+          LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
             | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          echo "::add-mask::$LLDAP_TOKEN"
           gql() { jq -n --arg q "$1" '{query: $q}' | curl -sf http://127.0.0.1:17170/api/graphql \
                     -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @-; }
           for u in alice bob; do
@@ -2438,6 +2462,7 @@ jobs:
           KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
             --data-urlencode client_id=admin-cli --data-urlencode "username=$KEYCLOAK_ADMIN" \
             --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          echo "::add-mask::$KC_TOKEN"
           curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") "http://127.0.0.1:8080/admin/realms/portcullis/clients?clientId=portcullis-forward-auth" \
             | jq -e --arg x "$E2E_EXTRA" '.[0].redirectUris as $u | ($u | index("https://echo-a.\($x)/oauth2/callback") != null)
                 and ($u | index("https://echo-c.\($x)/oauth2/callback") != null) and ($u | index("https://echo-b.portcullis.local/oauth2/callback") == null)' >/dev/null \
@@ -2824,8 +2849,9 @@ jobs:
           echo "PASS: the Hub loaded $TEMPLATES"
 
           # Users (LLDAP, as the admin); everything else through the Hub.
-          LLDAP_TOKEN=$(jq -n --arg p "$LLDAP_ADMIN_PASSWORD" '{username: "admin", password: $p}' \
+          LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
             | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          echo "::add-mask::$LLDAP_TOKEN"
           gql() { jq -n --arg q "$1" '{query: $q}' | curl -sf http://127.0.0.1:17170/api/graphql \
                     -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @-; }
           for u in alice bob carol dave; do
@@ -2864,7 +2890,10 @@ jobs:
           save immich '{"person":{"storage_quota":{"default":"100GiB","resolve":"max","rows":[{"group":"office_milan","value":"10GiB"}]}}}'
           save settings-echo '{"person":{"tier":{"default":"bronze","resolve":"max","rows":[{"group":"office_milan","value":"gold"}]}}}'
           save settings-file '{"person":{"seats":{"default":1,"resolve":"max","rows":[{"group":"office_milan","value":5}]},"level":{"default":"basic","resolve":"max","rows":[{"group":"office_milan","value":"plus"}]}}}'
-          hub GET /api/instances/immich/settings | jq -e '.' >/dev/null || { echo "FAIL: immich settings panel"; exit 1; }
+          code=$(hubc GET /api/instances/immich/settings)
+          want "$code" "immich settings panel"
+          jq -e '(.options | type == "array" and length > 0) and any(.options[]; .key == "storage_quota")' /tmp/hub.out >/dev/null \
+            || { echo "FAIL: immich settings panel has no options: $(head -c 400 /tmp/hub.out)"; exit 1; }
 
           # shellcheck disable=SC2086
           echo "127.0.0.1 portcullis.local auth.portcullis.local enroll.portcullis.local hub.portcullis.local people.portcullis.local $(printf '%s.portcullis.local ' $APP_HOSTS)" | sudo tee -a /etc/hosts

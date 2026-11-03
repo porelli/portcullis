@@ -101,6 +101,9 @@ GIB = 1 << 30
 # Membership deliveries are debounced 60 s per instance (contract §13.13);
 # the slack covers the directory sync, Keycloak and a restart.
 DELIVERY_S = 60 + 120
+# "Exactly one restart" is counted after one more debounce window plus
+# slack, so a second delivery a window later would be seen.
+RESTART_QUIET_S = 75
 ALICE_UID = "0123456789abcdef0123456789abcdef"
 OUTSIDER_UID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -270,9 +273,23 @@ def headers_of(body: str) -> dict:
     return seen
 
 
-def settle(page: Page, url: str, *, seconds: int = 60) -> int:
+def kc_prompt(page: Page) -> bool:
+    """Keycloak (or the setup page) waits for the person: a sign-in prompt,
+    not the silent SSO redirect of a live session."""
+    if not base.on_login_pages(page):
+        return False
+    for sel in ("#authenticateWebAuthnButton", "#registerWebAuthn", "#invite-continue", "input[type=password]"):
+        loc = page.locator(sel)
+        if loc.count() and loc.first.is_visible():
+            return True
+    return False
+
+
+def settle(page: Page, url: str, *, seconds: int = 60, allow_resign: bool = False) -> int:
     """Open url and follow the sign-in redirects until the browser rests on
-    url's host (not on a login page); returns the final HTTP status."""
+    url's host (not on a login page); returns the final HTTP status. A
+    Keycloak prompt (the session ended) fails, unless allow_resign: then the
+    person signs in again with their key."""
     page.goto(url, wait_until="domcontentloaded")
     deadline = time.time() + seconds
     while time.time() < deadline:
@@ -280,13 +297,29 @@ def settle(page: Page, url: str, *, seconds: int = 60) -> int:
         if page.url.startswith(url) and not base.on_login_pages(page):
             resp = page.reload(wait_until="domcontentloaded")
             return resp.status if resp else 0
-        if base.on_login_pages(page):
-            # Keycloak asks for the passkey again (the session's LoA aged):
-            # the person touches their key, as in a browser.
+        if kc_prompt(page):
+            if not allow_resign:
+                base.shot(page, "unexpected-sign-in-prompt")
+                raise AssertionError(f"{url}: Keycloak asked to sign in again (session ended) at {page.url[:200]}")
             base.passkey_flow(page, until=url, label="resign")
             continue
         page.wait_for_timeout(500)
     raise AssertionError(f"{url}: never settled (at {page.url})")
+
+
+def signed_out(page: Page, url: str) -> bool:
+    """True when opening url ends on a Keycloak sign-in prompt (the
+    person's session is gone); False when it lands on the app."""
+    page.goto(url, wait_until="domcontentloaded")
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        page.wait_for_load_state("domcontentloaded")
+        if kc_prompt(page):
+            return True
+        if page.url.startswith(url) and not base.on_login_pages(page):
+            return False
+        page.wait_for_timeout(500)
+    raise AssertionError(f"{url}: neither the app nor a sign-in prompt (at {page.url})")
 
 
 def echo_headers(page: Page) -> dict:
@@ -296,16 +329,25 @@ def echo_headers(page: Page) -> dict:
     return headers_of(body)
 
 
-def immich_sign_in(page: Page, label: str) -> dict:
-    """A fresh Immich OIDC sign-in (Immich's cookies dropped; the Keycloak
-    session stays, so no passkey prompt): returns /api/users/me."""
+def immich_sign_in(page: Page, label: str, *, allow_resign: bool = False, prompted: list | None = None) -> dict:
+    """A fresh Immich OIDC sign-in (Immich's cookies dropped; through the
+    Keycloak session, so no prompt): returns /api/users/me. A Keycloak
+    prompt fails unless allow_resign (then the passkey signs in, and True is
+    appended to `prompted`)."""
     page.context.clear_cookies(domain=PHOTOS_HOST)
     page.goto(PHOTOS + "/auth/login", wait_until="domcontentloaded")
     deadline = time.time() + 90
     while time.time() < deadline:
         page.wait_for_timeout(1000)
-        if base.on_login_pages(page):
+        if kc_prompt(page):
+            if not allow_resign:
+                base.shot(page, f"immich-{label}-unexpected-prompt")
+                raise AssertionError(f"Immich sign-in: Keycloak asked {label} to sign in again (session ended)")
+            if prompted is not None:
+                prompted.append(True)
             base.passkey_flow(page, until=PHOTOS, label=f"immich-{label}")
+            continue
+        if base.on_login_pages(page):
             continue
         sso = page.locator("button:has-text('Login with SSO')")
         if page.url.startswith(PHOTOS + "/auth/login") and sso.count() and sso.first.is_visible():
@@ -342,12 +384,13 @@ def main() -> int:
         def sign_in(who: str) -> Page:
             ctx = browser.new_context()
             ctx.set_default_timeout(TIMEOUT_MS)
-            ctx.tracing.start(screenshots=True, snapshots=True, name=who)
             ctxs[who] = ctx
             page = ctx.new_page()
             base.Authenticator(page)
             page.goto(os.environ[f"E2E_{who.upper()}_INVITE"], wait_until="domcontentloaded")
             base.passkey_flow(page, until=PORTAL, label=f"set-{who}")
+            # Traced from here: the (consumed) setup link stays out of the trace.
+            ctx.tracing.start(screenshots=True, snapshots=True, name=who)
             assert f"Signed in as <strong>{who}</strong>" in page.content(), page.content()[:300]
             return page
 
@@ -443,7 +486,7 @@ def main() -> int:
             assert doc.get("instance") == "firefox-sync", doc
             until("sync_allowed_accounts has alice's uid", lambda: allowed_db() == [ALICE_UID], 60)
             until("firefox-sync-init ran", lambda: starts("firefox-sync", "firefox-sync-init", state["entry_t0"]) >= 1, 120)
-            time.sleep(15)
+            time.sleep(RESTART_QUIET_S)
             n = starts("firefox-sync", "firefox-sync-init", state["entry_t0"])
             assert n == 1, f"firefox-sync-init started {n} times since the entry (want 1)"
             rc, out = sync_insert(ALICE_UID)
@@ -468,22 +511,38 @@ def main() -> int:
 
         def after_batch_immich():
             assert batched, "needs the batch"
-            me = until("alice's next sign-in: 100 GiB",
-                       lambda: (m := immich_sign_in(alice, "alice-2")).get("quotaSizeInBytes") == 100 * GIB and m,
-                       DELIVERY_S, every=15)
-            print(f"    alice after the batch: {time.time() - state['batch_t0']:.0f} s", flush=True)
+            # Removing alice from office_milan signed her out of Keycloak
+            # (contract §9.6): her first sign-in after the batch must prompt
+            # for her key; later ones go through the new session silently.
+            prompted: list = []
+            first = immich_sign_in(alice, "alice-2", allow_resign=True, prompted=prompted)
+            assert prompted, "alice's Keycloak session survived her removal from office_milan (no sign-in prompt)"
+            me = first if first.get("quotaSizeInBytes") == 100 * GIB else until(
+                "alice's next sign-in: 100 GiB",
+                lambda: (m := immich_sign_in(alice, "alice-3")).get("quotaSizeInBytes") == 100 * GIB and m,
+                DELIVERY_S, every=15)
+            took = time.time() - state["batch_t0"]
+            print(f"    alice after the batch: {took:.0f} s", flush=True)
+            # Debounce 60 s + the evaluator interval (60 s, cmd/hub) + slack.
+            assert took <= 60 + 60 + 30, f"alice's 100 GiB took {took:.0f} s (want <= 150 s)"
             assert me.get("isAdmin") is True, f"alice's role did not change on her existing account: {me}"
-        check("membership: alice's next Immich sign-in has the 100 GiB default and isAdmin (role changed "
-              "on an existing account)", after_batch_immich)
+        check("membership: alice's session ended (§9.6 logout); her next Immich sign-in has the 100 GiB default "
+              "within 60 s + the evaluator interval + slack, and isAdmin (role changed on an existing account)",
+              after_batch_immich)
 
         def after_batch_headers():
             assert batched, "needs the batch"
             until("alice's tier bronze", lambda: echo_headers(alice).get("x-forwarded-attr-tier") == ["bronze"],
                   DELIVERY_S, every=10)
-            settle(bob, GRAFANA + "/")
+            # Removing bob from admin_grafana signed him out (contract §9.6):
+            # within oauth2-proxy's 1 min refresh his next request prompts.
+            until("bob's session ended", lambda: signed_out(bob, GRAFANA + "/"), 150, every=10)
+            base.shot(bob, "set-bob-signed-out")
+            assert settle(bob, GRAFANA + "/", allow_resign=True) == 200
             until("bob a Grafana Viewer", lambda: settle(bob, GRAFANA + "/") == 200 and grafana_role(bob) == "Viewer",
                   DELIVERY_S, every=10)
-        check("membership: alice's next request has tier bronze; bob's next Grafana request makes him a Viewer",
+        check("membership: alice's next request has tier bronze; bob's session ended (§9.6 logout), "
+              "signed in again he is a Grafana Viewer",
               after_batch_headers)
 
         def after_batch_file():
@@ -499,7 +558,7 @@ def main() -> int:
             assert h.get("instance") == "settings-file" and h.get("version") == 1, h
             assert {u: p.get("level") for u, p in h["people"].items()} == dict.fromkeys(want, "basic"), h["people"]
             until("settings-file restarted", lambda: starts("settings-file", "app", state["batch_t0"]) >= 1, 120)
-            time.sleep(20)
+            time.sleep(RESTART_QUIET_S)
             n = starts("settings-file", "app", state["batch_t0"])
             assert n == 1, f"settings-file's app started {n} times after 3 joins in one window (want 1)"
         check("file_hook: after the joins people.json lists the 4 people, the hook got the full state "
@@ -528,7 +587,7 @@ def main() -> int:
             until("allowlist.json without alice", lambda: entry_users(allowlist()) == {}, DELIVERY_S)
             until("sync_allowed_accounts empty", lambda: allowed_db() == [], 60)
             until("firefox-sync-init ran", lambda: starts("firefox-sync", "firefox-sync-init", t0) >= 1, 120)
-            time.sleep(15)
+            time.sleep(RESTART_QUIET_S)
             n = starts("firefox-sync", "firefox-sync-init", t0)
             assert n == 1, f"firefox-sync-init started {n} times after alice left (want 1)"
             rc, out = psql("firefoxsync", f"SELECT count(*) FROM users WHERE email LIKE '{ALICE_UID}@%'")
