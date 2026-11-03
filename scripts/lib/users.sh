@@ -4,10 +4,12 @@
 # Hub's LLDAP service account (integration contract §9.1) and the secret
 # files of both.
 #
-# No secret on a host command line: LLDAP calls run inside the lldap
-# container (`docker compose exec -T lldap ...`) with the password / token on
-# stdin; curl expands the bearer token from its environment
-# (--variable/--expand-header) instead of argv.
+# No secret on a command line: LLDAP calls run inside the lldap container
+# (`docker compose exec -T lldap ...`) with the password / token on stdin;
+# curl expands the bearer token from its environment
+# (--variable/--expand-header) instead of argv. One accepted exception: the
+# admin JWT as lldap_set_password's --token (below) — inside the container,
+# but a container process's argv is still visible from the host.
 
 HUB_LLDAP_USER="portcullis-hub"
 
@@ -87,8 +89,9 @@ lldap_service_account() {
   fi
   # lldap_set_password takes the user's password from LLDAP_USER_PASSWORD;
   # it has no env / file option for the admin credential, so the short-lived
-  # admin JWT is its one secret argument — inside the lldap container only,
-  # never on the host's command lines. (secret-argv-ok)
+  # admin JWT is its one secret argument (secret-argv-ok, the accepted
+  # exception): it reaches the lldap container on stdin, but the tool's argv
+  # there is visible from the host (ps) while it runs.
   # shellcheck disable=SC2016
   if { printf '%s\n' "$tok"; cat "$pw"; echo; } | dc exec -T lldap sh -c 'read -r T; read -r P; export LLDAP_USER_PASSWORD="$P";
       exec /app/lldap_set_password --base-url http://localhost:17170 --token "$T" --username "$1"' _ "$HUB_LLDAP_USER" >/dev/null; then # secret-argv-ok: inside the lldap container
