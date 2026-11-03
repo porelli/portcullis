@@ -32,15 +32,17 @@ file_inode()  { stat -c %i "$1" 2>/dev/null || stat -f %i "$1"; }
 # ── stubs ──────────────────────────────────────────────────
 mkdir -p "$WORK/bin" "$WORK/stub"
 export STUB_DIR="$WORK/stub"
-# docker: only `network inspect` matters here ($STUB_DIR/ipam = current IPAM).
+# docker: only `network inspect` matters here ($STUB_DIR/ipam-json[-<network>] = IPAM).
 cat > "$WORK/bin/docker" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$STUB_DIR/calls"
-if [ "$1 $2" = "network inspect" ]; then
-  # $STUB_DIR/ipam-<network> wins for that network.
-  if [ -f "$STUB_DIR/ipam-$3" ]; then cat "$STUB_DIR/ipam-$3"; exit 0; fi
-  [ -f "$STUB_DIR/ipam" ] || exit 1
-  cat "$STUB_DIR/ipam"
+if [ "$1 $2" = "network inspect" ] && [ "$4" = "--format" ]; then
+  if [ "$5" = "{{json .IPAM.Config}}" ]; then
+    net="$3"
+    if [ -f "$STUB_DIR/ipam-json-$net" ]; then cat "$STUB_DIR/ipam-json-$net"; exit 0; fi
+    if [ -f "$STUB_DIR/ipam-json" ]; then cat "$STUB_DIR/ipam-json"; exit 0; fi
+    exit 1
+  fi
 fi
 exit 0
 STUB
@@ -224,19 +226,24 @@ expect_fail "auth: overlaps portcullis-proxy" check_auth 172.31.250.0/28 172.31.
 expect_fail "auth: traefik IP = gateway"      check_auth 172.31.251.0/28 172.31.251.8/29 172.31.251.1
 
 # ══ network: state + guard ═════════════════════════════════
-rm -f "$STUB_DIR/ipam"
+rm -f "$STUB_DIR/ipam-json"
 expect_eq "state missing" "$(proxy_network_state)" missing
 expect_ok "guard: missing network is fine" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
-printf '%s' '172.31.250.0/24|172.31.250.128/25;' > "$STUB_DIR/ipam"
+printf '%s' '[{"Subnet":"172.31.250.0/24","IPRange":"172.31.250.128/25"}]' > "$STUB_DIR/ipam-json"
 expect_eq "state ok" "$(proxy_network_state)" ok
-printf '%s' '172.18.0.0/16|;' > "$STUB_DIR/ipam"
+printf '%s' '[{"Subnet":"172.18.0.0/16"}]' > "$STUB_DIR/ipam-json"
 expect_eq "state mismatch (docker-assigned subnet)" "$(proxy_network_state)" mismatch
-printf '%s' '172.31.250.0/24|;' > "$STUB_DIR/ipam"
+printf '%s' '[{"Subnet":"172.31.250.0/24"}]' > "$STUB_DIR/ipam-json"
 expect_eq "state mismatch (no ip_range)" "$(proxy_network_state)" mismatch
 expect_fail "guard: mismatch aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
-expect_fail "guard: invalid auth config aborts" bash -c "rm -f '$STUB_DIR/ipam'; PORTCULLIS_AUTH_TRAEFIK_IP=172.31.251.9; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+expect_fail "guard: invalid auth config aborts" bash -c "rm -f '$STUB_DIR/ipam-json'; PORTCULLIS_AUTH_TRAEFIK_IP=172.31.251.9; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 expect_fail "guard: invalid config aborts" bash -c "PORTCULLIS_TRAEFIK_IP=1.2.3.4; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+# Docker 29.9.2: "invalid Prefix" for unset IPRange should be treated as no range.
+printf '%s' '[{"Subnet":"172.31.250.0/24","IPRange":"invalid Prefix"}]' > "$STUB_DIR/ipam-json"
+expect_eq "state mismatch (Docker 29 invalid Prefix)" "$(proxy_network_state)" mismatch
 # portcullis-domains (final review M2): valid, no overlap, existing IPAM.
+# Clean up proxy/auth network stubs so network_check passes with just domains.
+rm -f "$STUB_DIR/ipam-json"
 unset PORTCULLIS_DOMAINS_SUBNET
 expect_ok "domains net: default valid" validate_domains_network_config
 check_dom() { PORTCULLIS_DOMAINS_SUBNET="$1" validate_domains_network_config; }
@@ -245,14 +252,17 @@ expect_fail "domains net: invalid CIDR"            check_dom 10.97.0.0/40
 expect_fail "domains net: overlaps portcullis-proxy" check_dom 172.31.250.16/28
 expect_fail "domains net: overlaps portcullis-auth"  check_dom 172.31.251.0/29
 expect_fail "domains net: too small"               check_dom 10.97.0.0/31
-rm -f "$STUB_DIR/ipam"
-printf '%s' '172.31.252.0/28|;' > "$STUB_DIR/ipam-portcullis_portcullis-domains"
+rm -f "$STUB_DIR/ipam-json-portcullis_portcullis-domains"
+printf '%s' '[{"Subnet":"172.31.252.0/28"}]' > "$STUB_DIR/ipam-json-portcullis_portcullis-domains"
 expect_eq "domains net: state ok" "$(domains_network_state)" ok
 expect_ok "guard: domains network matching" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
-printf '%s' '172.18.5.0/28|;' > "$STUB_DIR/ipam-portcullis_portcullis-domains"
+# Docker 29.9.2: "invalid Prefix" for unset IPRange should match empty range.
+printf '%s' '[{"Subnet":"172.31.252.0/28","IPRange":"invalid Prefix"}]' > "$STUB_DIR/ipam-json-portcullis_portcullis-domains"
+expect_eq "domains net: state ok (Docker 29 invalid Prefix)" "$(domains_network_state)" ok
+printf '%s' '[{"Subnet":"172.18.5.0/28"}]' > "$STUB_DIR/ipam-json-portcullis_portcullis-domains"
 expect_fail "guard: domains network mismatch aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
-expect_fail "guard: invalid domains subnet aborts" bash -c "rm -f '$STUB_DIR/ipam-portcullis_portcullis-domains'; PORTCULLIS_DOMAINS_SUBNET=172.31.250.0/28; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
-rm -f "$STUB_DIR/ipam-portcullis_portcullis-domains"
+expect_fail "guard: invalid domains subnet aborts" bash -c "rm -f '$STUB_DIR/ipam-json-portcullis_portcullis-domains'; PORTCULLIS_DOMAINS_SUBNET=172.31.250.0/28; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+rm -f "$STUB_DIR/ipam-json-portcullis_portcullis-domains"
 expect_fail "network lib has no migration code" grep -Eq 'proxy_network_(migrate|reconnect)|docker network (connect|disconnect)' "$HERE/../scripts/lib/network.sh"
 
 # ══ certs: write_revoked_serials ═══════════════════════════

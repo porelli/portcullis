@@ -132,12 +132,15 @@ validate_domains_network_config() {
 # ("mismatch" = network exists without the expected IPAM subnet/ip_range,
 # e.g. after editing the settings in .env; Docker can't change IPAM in place).
 network_state() {
-  local cur
-  if ! cur="$(docker network inspect "$1" --format '{{range .IPAM.Config}}{{.Subnet}}|{{.IPRange}};{{end}}' 2>/dev/null)"; then
+  local config cur_subnet cur_range
+  if ! config="$(docker network inspect "$1" --format '{{json .IPAM.Config}}' 2>/dev/null)"; then
     echo missing
     return 0
   fi
-  if [ "$cur" = "$2|$3;" ]; then
+  cur_subnet="$(printf '%s' "$config" | jq -r '.[0].Subnet // ""')"
+  # IPRange is optional; treat unset, empty, or "invalid Prefix" (Docker 29+) as no range.
+  cur_range="$(printf '%s' "$config" | jq -r '.[0].IPRange // "" | if . == "invalid Prefix" or . == "" then "" else . end')"
+  if [ "$cur_subnet" = "$2" ] && [ "$cur_range" = "$3" ]; then
     echo ok
   else
     echo mismatch
