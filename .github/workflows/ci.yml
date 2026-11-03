@@ -1475,6 +1475,7 @@ jobs:
           # Setup links (CLI → enroll over docker exec; enroll needs no secret on argv).
           L1=$(./portcullis invite testuser --json | jq -r .url)
           L2=$(./portcullis invite testuser --ttl 30m --to hub --json | jq -r .url)
+          for l in "$L1" "$L2"; do [ -z "$l" ] || [ "$l" = null ] || echo "::add-mask::$l"; done
           for l in "$L1" "$L2"; do [[ "$l" =~ ^https://enroll\.portcullis\.local/invite/[A-Za-z0-9_-]{43}$ ]] || { echo "FAIL: link $l"; exit 1; }; done
           page() { curl -s -o /dev/null -w '%{http_code}' "http://$ENROLL_IP:8443/invite/${1##*/}"; }
           [ "$(page "$L1")" = 404 ] || { echo "FAIL: a new link must revoke the older one"; exit 1; }
@@ -2005,8 +2006,9 @@ jobs:
                       "E2E_ADMIN_INVITE admin portal" "E2E_BYPASS_INVITE e2e-bypass https://app.portcullis.local/"; do
             read -r var who to <<<"$spec"
             url="$(./portcullis invite "$who" --to "$to" --json | jq -r .url)"
+            # Masked before anything can print it: a malformed link may still carry a token.
+            [ -z "$url" ] || [ "$url" = null ] || echo "::add-mask::$url"
             [[ "$url" =~ ^https://enroll\.portcullis\.local/invite/[A-Za-z0-9_-]{43}$ ]] || { echo "FAIL: setup link for $who: $url"; exit 1; }
-            echo "::add-mask::$url"
             echo "$var=$url" >> "$GITHUB_ENV"
           done
 
@@ -2507,8 +2509,9 @@ jobs:
           for spec in "E2E_ALICE_INVITE alice" "E2E_BOB_INVITE bob" "E2E_ADMIN_INVITE admin"; do
             read -r var who <<<"$spec"
             url="$(./portcullis invite "$who" --to portal --json | jq -r .url)"
+            # Masked before anything can print it: a malformed link may still carry a token.
+            [ -z "$url" ] || [ "$url" = null ] || echo "::add-mask::$url"
             [[ "$url" =~ ^https://enroll\.portcullis\.local/invite/[A-Za-z0-9_-]{43}$ ]] || { echo "FAIL: setup link for $who: $url"; exit 1; }
-            echo "::add-mask::$url"
             echo "$var=$url" >> "$GITHUB_ENV"
           done
           # alice's client certificate (echo-c's mtls step-up).
@@ -2891,7 +2894,7 @@ jobs:
           done
           for m in alice:users_immich alice:office_milan alice:users_grafana alice:users_settings-echo alice:users_firefox-sync \
                    bob:users_immich bob:admin_immich bob:users_grafana bob:admin_grafana bob:users_settings-echo bob:users_firefox-sync \
-                   carol:users_settings-file; do
+                   carol:users_settings-file carol:office_milan; do
             code=$(hubc POST "/api/directory/groups/${m#*:}/members" -d "$(jq -cn --arg u "${m%%:*}" '{username: $u}')")
             want "$code" "add $m"
           done
@@ -2915,8 +2918,9 @@ jobs:
           for spec in "E2E_ALICE_INVITE alice" "E2E_BOB_INVITE bob" "E2E_CAROL_INVITE carol"; do
             read -r var who <<<"$spec"
             url="$(./portcullis invite "$who" --to portal --json | jq -r .url)"
+            # Masked before anything can print it: a malformed link may still carry a token.
+            [ -z "$url" ] || [ "$url" = null ] || echo "::add-mask::$url"
             [[ "$url" =~ ^https://enroll\.portcullis\.local/invite/[A-Za-z0-9_-]{43}$ ]] || { echo "FAIL: setup link for $who: $url"; exit 1; }
-            echo "::add-mask::$url"
             echo "$var=$url" >> "$GITHUB_ENV"
           done
 

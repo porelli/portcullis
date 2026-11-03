@@ -13,7 +13,7 @@ groups and saved the starting settings through the Hub's API:
          users_firefox-sync
   bob    users_immich admin_immich users_grafana admin_grafana
          users_settings-echo users_firefox-sync
-  carol  users_settings-file
+  carol  users_settings-file office_milan
   dave   (no group)
 
   immich         storage_quota default 100GiB, office_milan 10GiB
@@ -33,10 +33,14 @@ Scenarios (contract §13):
                 quotaSizeInBytes 10 GiB for alice (office_milan), the UI
                 shows 10 GiB; bob (admin_immich) isAdmin.
   headers       Grafana: bob's org role is Admin on his first and later
-                requests, alice's Viewer; settings-echo echoes
+                requests, alice's Viewer once the Hub published her
+                Viewer header (Viewer is also Grafana's auto-assign
+                default, so the header is checked first); settings-echo echoes
                 X-Forwarded-Attr-Tier (gold / bronze) and never another
                 host's header.
-  file_hook     settings-file's people.json lists only the population.
+  file_hook     settings-file's people.json lists only the population
+                (carol, seats 5 from office_milan); the hook sees her
+                level plus.
   people        carol's My apps lists only her app, no other username;
                 /api/instances/immich/settings on people.<domain> is 404.
   entries       alice enters her Mozilla uid on people.<domain>; bob's
@@ -51,8 +55,10 @@ Scenarios (contract §13):
                 plus slack: alice's next Immich sign-in has 100 GiB and
                 isAdmin (role changed on an existing account), her tier is
                 bronze, bob is a Grafana Viewer, people.json lists four
-                people and settings-file restarted exactly once, the hook
-                got the full state with trigger membership_change.
+                people (carol, still in office_milan, seats 5; the rest
+                1) and settings-file restarted exactly once, the hook
+                got the full state with trigger membership_change (carol
+                plus, the rest basic).
   entries_leave alice leaves users_firefox-sync: allowlist.json no longer
                 lists her, the init ran once, her rows are gone and no
                 account can sync (empty allowlist = nobody); she rejoins:
@@ -479,9 +485,13 @@ def main() -> int:
         check("headers: bob (admin_grafana) is a Grafana org Admin on his first and later requests", grafana_bob)
 
         def grafana_alice():
+            # Viewer is also Grafana's auto-assign role: only a published
+            # Viewer header makes her Viewer the delivery's.
+            until("alice's Grafana-Role header published",
+                  lambda: host_header(f"grafana.{DOMAIN}", "Grafana-Role", "alice") == "Viewer", DELIVERY_S)
             assert settle(alice, GRAFANA + "/") == 200
             assert grafana_role(alice) == "Viewer"
-        check("headers: alice (users_grafana only) is a Grafana Viewer (the default)", grafana_alice)
+        check("headers: alice (users_grafana only) is a Grafana Viewer (the default, header published)", grafana_alice)
 
         def echo_tiers():
             ha = until("alice's tier gold", lambda: (h := echo_headers(alice)).get("x-forwarded-attr-tier") == ["gold"] and h,
@@ -499,8 +509,13 @@ def main() -> int:
             doc = until("people.json = carol only", lambda: (d := people_json()).get("people", {}).keys() == {"carol"} and d,
                         DELIVERY_S)
             assert doc.get("instance") == "settings-file" and doc.get("version") == 1, doc
-            assert str(doc["people"]["carol"].get("seats")) == "1", doc
-        check("file_hook: people.json in the container lists only the population (carol, seats 1)", file_population)
+            assert str(doc["people"]["carol"].get("seats")) == "5", doc
+            hooks = until("a hook run with carol at level plus",
+                          lambda: [h for h in hook_inputs() if (h.get("people") or {}).keys() == {"carol"}
+                                   and h["people"]["carol"].get("level") == "plus"], DELIVERY_S)
+            assert hooks[-1].get("instance") == "settings-file", hooks[-1]
+        check("file_hook: people.json in the container lists only the population (carol, seats 5 from office_milan); "
+              "the hook sees her level plus", file_population)
 
         # ── person-entered values (firefox-sync, people.<domain>) ──
         def entries_put():
@@ -591,19 +606,22 @@ def main() -> int:
             want = {"alice", "bob", "carol", "dave"}
             doc = until("people.json = 4 people", lambda: (d := people_json()).get("people", {}).keys() == want and d,
                         DELIVERY_S)
-            assert all(str(v.get("seats")) == "1" for v in doc["people"].values()), doc
+            seats = {u: str(p.get("seats")) for u, p in doc["people"].items()}
+            assert seats == {"alice": "1", "bob": "1", "carol": "5", "dave": "1"}, doc
             hooks = until("a membership_change hook run with 4 people",
                           lambda: [h for h in hook_inputs() if h.get("trigger") == "membership_change"
                                    and (h.get("people") or {}).keys() == want], 60)
             h = hooks[-1]
             assert h.get("instance") == "settings-file" and h.get("version") == 1, h
-            assert {u: p.get("level") for u, p in h["people"].items()} == dict.fromkeys(want, "basic"), h["people"]
+            assert {u: p.get("level") for u, p in h["people"].items()} == \
+                {"alice": "basic", "bob": "basic", "carol": "plus", "dave": "basic"}, h["people"]
             until("settings-file restarted", lambda: starts("settings-file", "app", state["batch_t0"]) >= 1, 120)
             time.sleep(RESTART_QUIET_S)
             n = starts("settings-file", "app", state["batch_t0"])
             assert n == 1, f"settings-file's app started {n} times after 3 joins in one window (want 1)"
-        check("file_hook: after the joins people.json lists the 4 people, the hook got the full state "
-              "(trigger membership_change), one restart for 3 joins", after_batch_file)
+        check("file_hook: after the joins people.json lists the 4 people (carol seats 5, alice left office_milan: 1), "
+              "the hook got the full state (trigger membership_change; carol plus, the rest basic), "
+              "one restart for 3 joins", after_batch_file)
 
         def my_apps_carol():
             r = carol.request.get(PEOPLE + "/api/me/apps")
