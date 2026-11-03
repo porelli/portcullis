@@ -1,0 +1,51 @@
+# CI-only template for the e2e-settings job (.github/workflows/ci.yml):
+# per-person values delivered as a data file (contract §13.7: people.json,
+# restart on membership change) and through a hook (§13.8) that appends
+# its stdin (HookInput) to a log. The app service records every start, so
+# the job can count restarts. Not a marketplace template: the job hands it
+# to the Hub as a local source.
+name: Settings File
+description: Data file and hook deliveries (CI)
+category: misc
+instances: multi
+auth:
+  method: forward-auth
+  group_access: true
+  access_group: users_settings-file
+  admin_group: admin_settings-file
+urls:
+  - label: Echo
+    url: "https://{{HOST_SETTINGS_FILE}}"
+files:
+  - {name: people, service: app, mount: /portcullis, on_membership_change: restart}
+hooks:
+  - name: log
+    service: app
+    command: [sh, /hook.sh]
+    when: [start, settings_change, membership_change]
+    timeout: 20s
+settings:
+  options:
+    - key: seats
+      label: Seats
+      description: Written to people.json for each person with access.
+      type: int
+      min: 1
+      max: 100
+      scope: person
+      default: 1
+      resolve: max
+      applies: restart
+      delivery: [{file: {name: people}}]
+    - key: level
+      label: Level
+      description: Sent to the log hook for each person with access.
+      type: enum
+      options:
+        - {value: basic, label: Basic}
+        - {value: plus, label: Plus}
+      scope: person
+      default: basic
+      resolve: max
+      applies: live
+      delivery: [{hook: log}]

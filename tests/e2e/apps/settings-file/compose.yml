@@ -1,0 +1,32 @@
+services:
+  web:
+    image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+    networks: [default, portcullis-proxy]
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.settings-file.rule: Host(`${PORTCULLIS_HOST_SETTINGS_FILE:-settings-file.portcullis.local}`)
+      traefik.http.routers.settings-file.entrypoints: websecure
+      traefik.http.routers.settings-file.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.settings-file.loadbalancer.server.port: "80"
+  # Reads the Hub's data file (bind-mounted read-only at /portcullis by the
+  # Hub's override); appends one line per start to /log/starts. The hook
+  # (hook.sh) runs here through docker exec.
+  app:
+    image: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+    command: ["sh", "-c", "date -u +%s >> /log/starts; trap 'exit 0' TERM; while :; do sleep 1; done"]
+    network_mode: none
+    # The Hub's data file is 0640 group 10001 (contract §13.7).
+    group_add: ["10001"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - log:/log
+      - ./templates/settings-file/hook.sh:/hook.sh:ro
+
+volumes:
+  log: {}
+
+networks:
+  portcullis-proxy:
+    external: true

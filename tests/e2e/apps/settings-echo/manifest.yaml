@@ -1,0 +1,32 @@
+# CI-only template for the e2e-settings job (.github/workflows/ci.yml): a
+# header echo (traefik/whoami) behind Portcullis sign-in with one per-person
+# option delivered as a header (contract §13.6 header, group-gate
+# user-attributes v2 per-host headers). Not a marketplace template: the job
+# hands it to the Hub as a local source.
+name: Settings Echo
+description: Header echo with a per-person header setting (CI)
+category: misc
+instances: multi
+auth:
+  method: header-auth
+  group_access: true
+  access_group: users_settings-echo
+  admin_group: admin_settings-echo
+urls:
+  - label: Echo
+    url: "https://{{HOST_SETTINGS_ECHO}}"
+settings:
+  options:
+    - key: tier
+      label: Tier
+      description: Echoed back as X-Forwarded-Attr-Tier on every request.
+      type: enum
+      options:
+        - {value: bronze, label: Bronze}
+        - {value: silver, label: Silver}
+        - {value: gold, label: Gold}
+      scope: person
+      default: bronze
+      resolve: max
+      applies: next_request
+      delivery: [{header: {name: X-Forwarded-Attr-Tier}}]
