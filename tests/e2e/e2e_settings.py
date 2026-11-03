@@ -178,7 +178,7 @@ def starts(project: str, service: str, since: float) -> int:
     out = docker("events", "--since", f"{since:.3f}", "--until", f"{time.time():.3f}",
                  "--filter", "type=container", "--filter", "event=start",
                  "--filter", f"label=com.docker.compose.project=portcullis-{project}",
-                 "--filter", f"label=com.docker.compose.service={service}", "--format", "{{.ID}}")
+                 "--filter", f"label=com.docker.compose.service={service}", "--format", "{{.Actor.ID}}")
     return len([line for line in out.splitlines() if line.strip()])
 
 
