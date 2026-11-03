@@ -74,6 +74,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import traceback
 import urllib.error
@@ -173,13 +174,40 @@ def container(project: str, service: str) -> str:
     return ids[0]
 
 
+class StartLog:
+    """Every container start, recorded live from `docker events` (the
+    daemon replays only a short in-memory buffer for --since: a project's
+    down/up elsewhere pushes older starts out of it)."""
+
+    def __init__(self):
+        self.events: list[tuple[float, str, str]] = []
+        self.lock = threading.Lock()
+        fmt = ('{{.TimeNano}} {{index .Actor.Attributes "com.docker.compose.project"}} '
+               '{{index .Actor.Attributes "com.docker.compose.service"}}')
+        self.proc = subprocess.Popen(["docker", "events", "--filter", "type=container", "--filter", "event=start",
+                                      "--format", fmt], stdout=subprocess.PIPE, text=True)
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self) -> None:
+        for line in self.proc.stdout:
+            parts = line.split()
+            if len(parts) == 3:
+                with self.lock:
+                    self.events.append((int(parts[0]) / 1e9, parts[1], parts[2]))
+
+    def count(self, project: str, service: str, since: float) -> int:
+        assert self.proc.poll() is None, f"docker events exited ({self.proc.returncode})"
+        with self.lock:
+            return sum(1 for t, p, sv in self.events if t >= since and p == f"portcullis-{project}" and sv == service)
+
+
+START_LOG: StartLog | None = None
+
+
 def starts(project: str, service: str, since: float) -> int:
     """Container starts of project/service since the unix time `since`."""
-    out = docker("events", "--since", f"{since:.3f}", "--until", f"{time.time():.3f}",
-                 "--filter", "type=container", "--filter", "event=start",
-                 "--filter", f"label=com.docker.compose.project=portcullis-{project}",
-                 "--filter", f"label=com.docker.compose.service={service}", "--format", "{{.Actor.ID}}")
-    return len([line for line in out.splitlines() if line.strip()])
+    assert START_LOG is not None
+    return START_LOG.count(project, service, since)
 
 
 def cp_out(cid: str, path: str) -> str:
@@ -252,6 +280,11 @@ def settle(page: Page, url: str, *, seconds: int = 60) -> int:
         if page.url.startswith(url) and not base.on_login_pages(page):
             resp = page.reload(wait_until="domcontentloaded")
             return resp.status if resp else 0
+        if base.on_login_pages(page):
+            # Keycloak asks for the passkey again (the session's LoA aged):
+            # the person touches their key, as in a browser.
+            base.passkey_flow(page, until=url, label="resign")
+            continue
         page.wait_for_timeout(500)
     raise AssertionError(f"{url}: never settled (at {page.url})")
 
@@ -299,6 +332,9 @@ def put_uid(page: Page, uid: str):
 
 
 def main() -> int:
+    global START_LOG
+    START_LOG = StartLog()
+    time.sleep(1)
     with sync_playwright() as pw_:
         browser = pw_.chromium.launch(args=["--disable-features=WebAuthenticationConditionalUI"])
         ctxs = {}
@@ -406,7 +442,8 @@ def main() -> int:
                         DELIVERY_S)
             assert doc.get("instance") == "firefox-sync", doc
             until("sync_allowed_accounts has alice's uid", lambda: allowed_db() == [ALICE_UID], 60)
-            time.sleep(10)
+            until("firefox-sync-init ran", lambda: starts("firefox-sync", "firefox-sync-init", state["entry_t0"]) >= 1, 120)
+            time.sleep(15)
             n = starts("firefox-sync", "firefox-sync-init", state["entry_t0"])
             assert n == 1, f"firefox-sync-init started {n} times since the entry (want 1)"
             rc, out = sync_insert(ALICE_UID)
@@ -461,7 +498,8 @@ def main() -> int:
             h = hooks[-1]
             assert h.get("instance") == "settings-file" and h.get("version") == 1, h
             assert {u: p.get("level") for u, p in h["people"].items()} == dict.fromkeys(want, "basic"), h["people"]
-            time.sleep(15)
+            until("settings-file restarted", lambda: starts("settings-file", "app", state["batch_t0"]) >= 1, 120)
+            time.sleep(20)
             n = starts("settings-file", "app", state["batch_t0"])
             assert n == 1, f"settings-file's app started {n} times after 3 joins in one window (want 1)"
         check("file_hook: after the joins people.json lists the 4 people, the hook got the full state "
@@ -489,7 +527,8 @@ def main() -> int:
             member("remove", "users_firefox-sync", "alice")
             until("allowlist.json without alice", lambda: entry_users(allowlist()) == {}, DELIVERY_S)
             until("sync_allowed_accounts empty", lambda: allowed_db() == [], 60)
-            time.sleep(10)
+            until("firefox-sync-init ran", lambda: starts("firefox-sync", "firefox-sync-init", t0) >= 1, 120)
+            time.sleep(15)
             n = starts("firefox-sync", "firefox-sync-init", t0)
             assert n == 1, f"firefox-sync-init started {n} times after alice left (want 1)"
             rc, out = psql("firefoxsync", f"SELECT count(*) FROM users WHERE email LIKE '{ALICE_UID}@%'")
