@@ -57,11 +57,17 @@ Scenarios (contract §13):
                 lists her, the init ran once, her rows are gone and no
                 account can sync (empty allowlist = nobody); she rejoins:
                 listed again and syncs.
+  fields        a custom field with '_' (cost_center; LLDAP attribute
+                cost-center, LLDAP refuses '_') created and set on alice
+                through the Hub: the overview shows it, rule group cc_42
+                (cost_center = "CC-42") gets alice, settings-echo gets
+                X-Forwarded-Attr-Cost-Center, Keycloak's example access
+                token for alice on Immich's client has attr_cost_center.
   nextcloud     the first install applied default_quota through the
                 start hook (occ: files default_quota = "10 GB").
 
 Environment: E2E_DOMAIN, E2E_ALICE_INVITE, E2E_BOB_INVITE, E2E_CAROL_INVITE
-(setup links, --to portal), HUB_IP, E2E_HUB_SECRET (the proxy secret; for
+(setup links, --to portal), HUB_IP, KEYCLOAK_ADMIN(_PASSWORD), E2E_HUB_SECRET (the proxy secret; for
 the Hub's admin API, as Traefik calls it), E2E_ARTIFACTS. Chromium trusts
 core's CA (NSS db), Node too (NODE_EXTRA_CA_CERTS).
 """
@@ -78,6 +84,7 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from playwright.sync_api import Page, sync_playwright
@@ -97,6 +104,7 @@ PHOTOS = f"https://{PHOTOS_HOST}"
 GRAFANA = f"https://grafana.{DOMAIN}"
 ECHO = f"https://settings-echo.{DOMAIN}"
 SYNC_HOST = f"firefox-sync.{DOMAIN}"
+KC_LOCAL = "http://127.0.0.1:8080"
 GIB = 1 << 30
 # Membership deliveries are debounced 60 s per instance (contract §13.13);
 # the slack covers the directory sync, Keycloak and a restart.
@@ -330,8 +338,8 @@ def signed_out(page: Page, url: str) -> bool:
     raise AssertionError(f"{url}: neither the app nor a sign-in prompt (at {page.url})")
 
 
-def echo_headers(page: Page) -> dict:
-    code = settle(page, ECHO + "/")
+def echo_headers(page: Page, allow_resign: bool = False) -> dict:
+    code = settle(page, ECHO + "/", allow_resign=allow_resign)
     body = page.inner_text("body")
     assert code == 200 and "Hostname" in body, f"settings-echo: HTTP {code}: {body[:300]}"
     return headers_of(body)
@@ -374,6 +382,26 @@ def grafana_role(page: Page) -> str:
     orgs = r.json()
     assert len(orgs) == 1, orgs
     return orgs[0]["role"]
+
+
+def kc_admin(path: str):
+    """GET on Keycloak's admin API (127.0.0.1:8080, the core publish) as the
+    master admin; the password goes in the request body, from the env."""
+    form = urllib.parse.urlencode({"client_id": "admin-cli", "grant_type": "password",
+                                   "username": os.environ.get("KEYCLOAK_ADMIN", "admin"),
+                                   "password": os.environ["KEYCLOAK_ADMIN_PASSWORD"]}).encode()
+    with urllib.request.urlopen(urllib.request.Request(
+            KC_LOCAL + "/realms/master/protocol/openid-connect/token", data=form), timeout=30) as r:
+        tok = json.loads(r.read())["access_token"]
+    req = urllib.request.Request(KC_LOCAL + "/admin/realms/portcullis" + path, headers={"Authorization": "Bearer " + tok})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def overview_user(name: str) -> dict:
+    code, out = hub("GET", "/api/directory")
+    assert code == 200, f"GET /api/directory: HTTP {code}: {out[:300]}"
+    return next(u for u in json.loads(out)["users"] if u["username"] == name)
 
 
 def put_uid(page: Page, uid: str):
@@ -619,6 +647,46 @@ def main() -> int:
             rc, out = sync_insert(ALICE_UID)
             assert rc == 0 and re.match(r"^\d+", out), f"alice's uid refused after rejoining: {out}"
         check("entries_leave: alice rejoins: listed again, her account syncs", entries_rejoin)
+
+        # ── a custom field with '_' (LLDAP attribute cost-center) ──
+        # Last: it changes alice's details and groups, which nothing after
+        # it counts.
+        def field_underscore():
+            code, out = hub("POST", "/api/directory/fields", {"name": "cost_center", "label": "Cost center",
+                                                               "kind": "text", "share_with_apps": True})
+            assert code == 200, f"create field cost_center: HTTP {code}: {out[:300]}"
+            code, out = hub("PUT", "/api/directory/users/alice/details", {"attrs": {"cost_center": ["CC-42"]}})
+            assert code == 200, f"alice's cost_center: HTTP {code}: {out[:300]}"
+            # (a) the overview reads it back from LLDAP under the field name
+            attrs = overview_user("alice").get("attrs") or {}
+            assert attrs.get("cost_center") == ["CC-42"], f"overview: alice's attrs {attrs}"
+            # (b) a rule group on the field
+            code, out = hub("POST", "/api/directory/groups", {"name": "cc_42"})
+            assert code == 200, f"create cc_42: HTTP {code}: {out[:300]}"
+            rule = 'cost_center = "CC-42"'
+            code, out = hub("POST", "/api/directory/groups/cc_42/convert-preview", {"rule": rule})
+            assert code == 200, f"convert-preview: HTTP {code}: {out[:300]}"
+            code, out = hub("POST", "/api/directory/groups/cc_42/convert", {"rule": rule, "keep": [], "preview": json.loads(out)})
+            assert code == 200, f"convert: HTTP {code}: {out[:300]}"
+            until("alice in rule group cc_42", lambda: "cc_42" in overview_user("alice").get("groups", []), 150, every=10)
+            assert "cc_42" not in overview_user("bob").get("groups", []), "bob (no cost_center) in cc_42"
+            # (c) the shared field's header (group-gate, user-attributes.json)
+            until("X-Forwarded-Attr-Cost-Center: CC-42 for alice",
+                  lambda: echo_headers(alice, allow_resign=True).get("x-forwarded-attr-cost-center") == ["CC-42"],
+                  DELIVERY_S, every=10)
+            # (c') the attr_cost_center claim: Keycloak's example access token
+            # for alice on Immich's client (a Hub client: default scope
+            # portcullis-attributes), whose LDAP mapper reads cost-center.
+            uid = kc_admin("/users?exact=true&username=alice")[0]["id"]
+            cid = kc_admin("/clients?clientId=immich")[0]["id"]
+            until("alice's attr_cost_center claim = CC-42",
+                  lambda: (t := kc_admin(f"/clients/{cid}/evaluate-scopes/generate-example-access-token"
+                                         f"?scope=openid&userId={uid}")).get("attr_cost_center") == "CC-42" or
+                  print(f"    example token claims: {sorted(k for k in t if k.startswith('attr_'))}", flush=True),
+                  DELIVERY_S, every=10)
+        check("fields: a custom field with '_' (cost_center, LLDAP cost-center) is created, set on alice, read back "
+              "in the overview, drives rule group cc_42, reaches settings-echo as X-Forwarded-Attr-Cost-Center and "
+              "Immich's token as claim attr_cost_center", field_underscore)
 
         # ── Nextcloud: the first install's start hook ──
         def nextcloud_quota():
