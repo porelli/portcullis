@@ -233,6 +233,14 @@ def hook_inputs() -> list[dict]:
     return [json.loads(docker("exec", cid, "cat", f"/log/{n}")) for n in sorted(names)]
 
 
+def host_header(host: str, suffix: str, user: str):
+    """The value the Hub published for user under host's header suffix in
+    user-attributes.json (contract §4.1 v2 hosts), or None."""
+    doc = json.loads(docker("run", "--rm", "-v", "portcullis_hub_data:/d:ro", os.environ["ALPINE"],
+                            "cat", "/d/user-attributes.json"))
+    return ((doc.get("hosts") or {}).get(host) or {}).get(suffix, {}).get(user)
+
+
 def allowlist() -> dict:
     return json.loads(cp_out(container("firefox-sync", "firefox-sync-init"), "/portcullis/allowlist.json"))
 
@@ -427,6 +435,11 @@ def main() -> int:
 
         # ── headers (Grafana, settings-echo) ──
         def grafana_bob():
+            # The header delivery is debounced (60 s) after the workflow's
+            # memberships: his FIRST Grafana request waits until the Hub has
+            # published his Role header for Grafana's host (§4.1 hosts).
+            until("bob's Grafana-Role header published",
+                  lambda: host_header(f"grafana.{DOMAIN}", "Grafana-Role", "bob") == "Admin", DELIVERY_S)
             code = settle(bob, GRAFANA + "/")
             assert code == 200, f"grafana: HTTP {code}"
             first = grafana_role(bob)
