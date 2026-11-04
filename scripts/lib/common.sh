@@ -388,6 +388,22 @@ hub_env_write() {
 # Docker creates them root-owned (as directories) and nothing can write
 # them afterwards. Also sets the ownership/modes the non-root containers
 # need.
+# _ensure_secrets_volume — ensure hub_secrets volume exists with 10001:10001 0700.
+# Called by init/upgrade/restore (through stack_prepare) per contract §6.
+_ensure_secrets_volume() {
+  local project="${COMPOSE_PROJECT_NAME:-portcullis}" name="portcullis_hub_secrets"
+  if ! docker volume inspect "$name" >/dev/null 2>&1; then
+    docker volume create --label "com.docker.compose.project=$project" \
+      --label "com.docker.compose.volume=hub_secrets" "$name" >/dev/null \
+      || fail "could not create the Docker volume $name"
+  fi
+  # Ensure 10001:10001 mode 0700 (the Hub checks this at start).
+  docker run --rm --network none --user 0:0 --cap-drop ALL --cap-add CHOWN --cap-add FOWNER \
+    --security-opt no-new-privileges:true --mount "type=volume,src=$name,dst=/v" \
+    "$PORTCULLIS_HELPER_IMAGE" sh -c 'chown 10001:10001 /v && chmod 0700 /v' >/dev/null \
+    || fail "could not set hub_secrets volume to 10001:10001 mode 0700"
+}
+
 stack_prepare() {
   local d
   (umask 077 && mkdir -p "$PORTCULLIS_ROOT/secrets/vault-unseal" "$PORTCULLIS_ROOT/secrets/enroll" "$PORTCULLIS_ROOT/secrets/hub" "$PORTCULLIS_ROOT/secrets/domains")
@@ -414,6 +430,9 @@ stack_prepare() {
   ct_own "$CT_UID_HUB:$CT_UID_HUB" "$PORTCULLIS_ROOT/appfiles"
   # hub_data is also mounted (read-only) by group-gate, which may create it.
   volume_own hub_data "$CT_UID_HUB:$CT_UID_HUB"
+  # hub_secrets: per-person password hashes (contract §6, file sharing). The
+  # Hub checks ownership and mode at start; ensure it here.
+  _ensure_secrets_volume
   hub_env_write
   # Invite / service-account secrets (scripts/lib/users.sh).
   if declare -F users_secret_files >/dev/null; then users_secret_files; fi

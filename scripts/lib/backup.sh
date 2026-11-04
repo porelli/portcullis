@@ -31,6 +31,9 @@ BACKUP_RESTIC_IMAGE="restic/restic:0.19.1@sha256:136600b6ff6843d61d355f7f71f460a
 # that owns them (the snapshot container runs as that user so SQLite can
 # open WAL databases; restore chowns the volume root back).
 # domains_data holds only the age-encrypted store (contract §12.4).
+# hub_secrets is NEVER backed up (offsite would carry password hashes) and
+# is emptied by restore (contract §11.6: a restored hash could revive a
+# leaked password). It is handled separately in cmd_restore.
 BACKUP_FILE_VOLUMES="lldap_data:$CT_UID_LLDAP:$CT_UID_LLDAP hub_data:$CT_UID_HUB:$CT_UID_HUB traefik_acme:0:0 domains_data:$CT_UID_DOMAINS:$CT_UID_DOMAINS"
 # restic: fixed host + path, so snapshots of every run form one series.
 BACKUP_RESTIC_HOST="portcullis"
@@ -724,6 +727,19 @@ backup_restore() {
       sh -c "tar xzf '/backup/$key.tar.gz' -C /data && chown $uid:$gid /data" \
       || fail "could not restore volume $key"
   done
+
+  # Empty hub_secrets (contract §11.6, file sharing): never backed up, and
+  # a restore voids every credential. Remove and recreate with proper ownership.
+  info "Emptying hub_secrets volume..."
+  full="$(_volume_name hub_secrets)"
+  if [ -n "$full" ]; then
+    docker volume rm -f "$full" >/dev/null 2>&1 || true
+    docker volume create --label "com.docker.compose.project=$proj" --label "com.docker.compose.volume=hub_secrets" "$full" >/dev/null
+    # Ensure 10001:10001 0700 (the Hub checks this at start).
+    docker run --rm --network none -v "$full:/data" "$helper" \
+      sh -c "chown $CT_UID_HUB:$CT_UID_HUB /data && chmod 0700 /data" \
+      || fail "could not prepare hub_secrets volume"
+  fi
 
   # Keycloak deletes its copy of a federated user — passkeys included —
   # as soon as a lookup (a sign-in attempt, the Hub's sweep) finds the user

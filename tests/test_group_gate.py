@@ -302,6 +302,25 @@ class GateTest(unittest.TestCase):
         self.assertIn("not available", self.portal("users_wiki", None))
         self.assertIn("not available", self.portal("users_wiki", "{broken"))
 
+    def test_portal_entry_without_url(self):
+        """A portal entry with urls: [] + note should render as a card with the note, no link, content escaped."""
+        doc = {"version": 1, "apps": [
+            {"id": "samba", "name": "File Sharing", "description": "Shared folders", "icon": "📁",
+             "urls": [], "note": "No web page: file sharing over SMB", "access_group": "users_samba"},
+            {"id": "wiki", "name": "Wiki", "urls": [{"label": "Open", "url": "https://wiki.example.com/"}],
+             "access_group": "users_wiki"}]}
+        body = self.portal("users_samba", doc)
+        self.assertIn("File Sharing", body)
+        self.assertIn("No web page: file sharing over SMB", body)
+        self.assertNotIn("<a", body.split("</h3>")[1].split("</li>")[0])  # No link in the samba card
+        self.assertNotIn("Wiki", body)
+        # Check escaping of note
+        doc_xss = {"version": 1, "apps": [
+            {"id": "test", "name": "Test", "urls": [], "note": "<script>alert(1)</script>", "access_group": ""}]}
+        body_xss = self.portal("", doc_xss)
+        self.assertIn("&lt;script&gt;", body_xss)
+        self.assertNotIn("<script>alert", body_xss)
+
     def test_portal_strict_csp_allows_only_its_inline_style(self):
         import base64, hashlib, re as _re
         h = {"X-Auth-Request-Preferred-Username": "bob", "X-Auth-Request-Groups": ""}

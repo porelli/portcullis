@@ -735,6 +735,18 @@ echo 2 > "$STUB_DIR/enrolled"
 expect_eq "domains: enrolled domains = lookups" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.20/2a01:4f8::5"
 rm -f "$STUB_DIR/enrolled"
 
+# ══ backup: hub_secrets volume ═════════════════════════════
+# shellcheck source=../scripts/lib/backup.sh
+source "$HERE/../scripts/lib/backup.sh"
+# hub_secrets volume must NOT be in BACKUP_FILE_VOLUMES (it's never backed up).
+if echo "$BACKUP_FILE_VOLUMES" | grep -q hub_secrets; then
+  t_fail "backup: hub_secrets must not be in BACKUP_FILE_VOLUMES"
+else
+  t_pass "backup: hub_secrets is excluded from backups"
+fi
+# The MANIFEST of a backup must never list hub_secrets as a file.
+expect_ok "backup: BACKUP_FILE_VOLUMES does not contain hub_secrets" bash -c '! echo "$BACKUP_FILE_VOLUMES" | grep -q hub_secrets'
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

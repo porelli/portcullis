@@ -792,6 +792,12 @@ services:
       # import; per-request permission checks), routed as people.<domain>
       # for every signed-in user (contract §5.1).
       HUB_PEOPLE_ADDR: ":8889"
+      # Per-person secrets volume (contract §6, file sharing): the Hub checks
+      # ownership and mode at start; core ensures it.
+      HUB_SECRETS_DIR: /secrets
+      HUB_SECRETS_VOLUME: portcullis_hub_secrets
+      # Keycloak public URL for fresh auth (file sharing, contract §8).
+      HUB_KEYCLOAK_PUBLIC_URL: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}
     volumes:
       - .:/project:ro
       # Writable overlay: before every `compose up` the Hub copies each app's
@@ -828,6 +834,10 @@ services:
       - ./secrets/hub/lldap:/run/portcullis/lldap:ro
       - ./secrets/hub/invite:/run/portcullis/invite:ro
       - ./secrets/domains/api-secret:/run/portcullis/domains/api-secret:ro
+      # Per-person secrets (contract §6): file-share password hashes, never
+      # backed up, emptied by restore. The Hub checks ownership (10001:10001
+      # 0700) at start; ./portcullis init/upgrade/restore ensure it.
+      - hub_secrets:/secrets
     networks:
       - portcullis
       - socket-proxy-hub
@@ -1161,6 +1171,12 @@ volumes:
   vault_data:
   lldap_data:
   hub_data:
+  # Per-person secrets (contract §6, file sharing): password hashes for
+  # person_secret options. Never backed up (offsite would carry hashes);
+  # emptied by restore (a restored hash could revive a leaked password).
+  # init/upgrade/restore ensure 10001:10001 0700; the Hub checks it at start.
+  hub_secrets:
+    name: portcullis_hub_secrets
   traefik_acme:
   domains_data:
   prometheus_data:

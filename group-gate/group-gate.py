@@ -437,12 +437,22 @@ def render_portal(user: str, groups: set, apps, domain: str, domains=()) -> byte
             href = _safe_url(u.get("url"), domains)
             if href:
                 links.append(f'<a href="{e(href)}">{e(u.get("label") or href)}</a>')
-        if not links:
+        # An entry with urls: [] and a note renders as a card with the note, no link (contract §10).
+        note = a.get("note")
+        has_note = isinstance(note, str) and note
+        urls_value = a.get("urls")
+        is_empty_urls = isinstance(urls_value, list) and len(urls_value) == 0
+        if not links and not (is_empty_urls and has_note):
             continue
         icon = a.get("icon") if isinstance(a.get("icon"), str) else ""
+        if links:
+            content = f'<p>{e(a.get("description") or "")}</p><p class="links">{" · ".join(links)}</p>'
+        else:
+            # No links: show the note instead
+            content = f'<p>{e(a.get("description") or "")}</p><p class="note">{e(note)}</p>'
         cards.append(
             f'<li class="card"><h3><span aria-hidden="true">{e(icon[:4])}</span> {e(a.get("name") or a.get("id") or "")}</h3>'
-            f'<p>{e(a.get("description") or "")}</p><p class="links">{" · ".join(links)}</p></li>')
+            f'{content}</li>')
     if apps is None:
         app_html = "<p class=\"muted\">The app list is not available yet.</p>"
     elif cards:
