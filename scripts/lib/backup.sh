@@ -730,16 +730,19 @@ backup_restore() {
 
   # Empty hub_secrets (contract §11.6, file sharing): never backed up, and
   # a restore voids every credential. Remove and recreate with proper ownership.
+  # Fail closed: a removal failure would leave old hashes in place.
   info "Emptying hub_secrets volume..."
   full="$(_volume_name hub_secrets)"
-  if [ -n "$full" ]; then
-    docker volume rm -f "$full" >/dev/null 2>&1 || true
-    docker volume create --label "com.docker.compose.project=$proj" --label "com.docker.compose.volume=hub_secrets" "$full" >/dev/null
-    # Ensure 10001:10001 0700 (the Hub checks this at start).
-    docker run --rm --network none -v "$full:/data" "$helper" \
-      sh -c "chown $CT_UID_HUB:$CT_UID_HUB /data && chmod 0700 /data" \
-      || fail "could not prepare hub_secrets volume"
-  fi
+  [ -n "$full" ] || full="portcullis_hub_secrets"
+  [ -n "$full" ] || fail "hub_secrets volume name is empty (compose config issue)"
+  docker volume rm -f "$full" >/dev/null 2>&1 || true
+  ! docker volume inspect "$full" >/dev/null 2>&1 || fail "cannot remove volume $full (still in use? docker ps -a --filter volume=$full)"
+  docker volume create --label "com.docker.compose.project=$proj" --label "com.docker.compose.volume=hub_secrets" "$full" >/dev/null \
+    || fail "could not create volume $full"
+  # Ensure 10001:10001 0700 (the Hub checks this at start).
+  docker run --rm --network none -v "$full:/data" "$helper" \
+    sh -c "chown $CT_UID_HUB:$CT_UID_HUB /data && chmod 0700 /data" \
+    || fail "could not prepare hub_secrets volume"
 
   # Keycloak deletes its copy of a federated user — passkeys included —
   # as soon as a lookup (a sign-in attempt, the Hub's sweep) finds the user
