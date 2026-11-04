@@ -3139,8 +3139,8 @@ jobs:
         run: |
           set -o pipefail
           sudo apt-get install -y -qq acl >/dev/null
-          findmnt -no FSTYPE,OPTIONS --target /srv | tee /dev/stderr | grep -q '^ext4 ' \
-            || { echo "FAIL: /srv is not on ext4"; exit 1; }
+          fs="$(findmnt -no FSTYPE,OPTIONS --target /srv)"; echo "/srv: $fs"
+          [[ "$fs" == "ext4 "* ]] || { echo "FAIL: /srv is not on ext4"; exit 1; }
           sudo rm -rf "$E2E_MEDIA"
           sudo install -d -o 1000 -g 1000 -m 0750 "$E2E_MEDIA"
           for d in 1 2 3 4 5; do
@@ -3153,7 +3153,7 @@ jobs:
           [ "$(sudo find "$E2E_MEDIA" -type f | wc -l)" = 50 ] && [ "$(sudo find "$E2E_MEDIA" -type d | wc -l)" = 6 ] \
             || { echo "FAIL: the tree"; sudo find "$E2E_MEDIA" -ls; exit 1; }
           # The filesystem takes ACLs (a throwaway file outside the tree).
-          sudo touch /srv/.acl-probe && sudo setfacl -m g:1000:r /srv/.acl-probe && sudo getfacl --skip-base /srv/.acl-probe | grep -q 'group:1000:r--'
+          sudo touch /srv/.acl-probe && sudo setfacl -m g:1000:r /srv/.acl-probe && sudo getfacl --skip-base /srv/.acl-probe | grep 'group:1000:r--' >/dev/null
           sudo rm -f /srv/.acl-probe
 
       - name: Start the whole stack (Hub with the CI template source)
