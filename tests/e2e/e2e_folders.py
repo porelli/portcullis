@@ -224,7 +224,7 @@ def original(entries: dict) -> dict:
 
 def getfacl(rel: str, *flags: str) -> list[str]:
     path = MEDIA if rel == "." else os.path.join(MEDIA, rel)
-    out = sh("getfacl", "--omit-header", "--absolute-names", *flags, path, sudo=True)
+    out = sh("getfacl", "--numeric", "--omit-header", "--absolute-names", *flags, path, sudo=True)
     return [line.split("#")[0].strip() for line in out.splitlines() if line.strip()]
 
 
@@ -242,7 +242,7 @@ def main() -> int:
         bad = {p: e for p, e in t.items() if (e["uid"], e["gid"]) != (1000, 1000)
                or e["mode"] != (0o750 if e["type"] == "d" else 0o640)}
         assert not bad, f"not 1000:1000 0640/0750: {bad}"
-        acl = sh("getfacl", "-R", "--skip-base", "--absolute-names", MEDIA, sudo=True).strip()
+        acl = sh("getfacl", "-R", "--numeric", "--skip-base", "--absolute-names", MEDIA, sudo=True).strip()
         assert acl == "", f"ACLs before anything ran: {acl[:400]}"
         state["before"] = t
     check(f"tree: {MEDIA} has {N_FILES} files 1000:1000 0640 and {N_DIRS} dirs 0750, no ACL", tree_before)

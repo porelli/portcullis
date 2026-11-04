@@ -3153,7 +3153,7 @@ jobs:
           [ "$(sudo find "$E2E_MEDIA" -type f | wc -l)" = 50 ] && [ "$(sudo find "$E2E_MEDIA" -type d | wc -l)" = 6 ] \
             || { echo "FAIL: the tree"; sudo find "$E2E_MEDIA" -ls; exit 1; }
           # The filesystem takes ACLs (a throwaway file outside the tree).
-          sudo touch /srv/.acl-probe && sudo setfacl -m g:1000:r /srv/.acl-probe && sudo getfacl --skip-base /srv/.acl-probe | grep 'group:1000:r--' >/dev/null
+          sudo touch /srv/.acl-probe && sudo setfacl -m g:1000:r /srv/.acl-probe && sudo getfacl --numeric --skip-base /srv/.acl-probe | grep 'group:1000:r--' >/dev/null
           sudo rm -f /srv/.acl-probe
 
       - name: Start the whole stack (Hub with the CI template source)
@@ -3229,7 +3229,7 @@ jobs:
           # shellcheck disable=SC2024
           sudo find "$E2E_MEDIA" -printf '%P %U:%G %m %y\n' > e2e-artifacts/tree.txt 2>&1 || true
           # shellcheck disable=SC2024
-          sudo getfacl -R --absolute-names "$E2E_MEDIA" > e2e-artifacts/getfacl.txt 2>&1 || true
+          sudo getfacl -R --numeric --absolute-names "$E2E_MEDIA" > e2e-artifacts/getfacl.txt 2>&1 || true
           docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'ls -laR /d/folders /d/folder-snapshots /d/doctor; cat /d/doctor/scans.json; ls -la /d/overrides; cat /d/overrides/*.yml' > e2e-artifacts/hub-data.txt 2>&1 || true
 
       - name: Upload logs
