@@ -400,7 +400,7 @@ def main() -> int:
         f = fo[0]
         assert f["severity"] == "warning", f
         assert f.get("fix_kind") == "reapply_folder" and "undo_folder" in (f.get("more_fix_kinds") or []), f
-        assert "1 entries with another group" in f.get("why", ""), f
+        assert "1 entry with another group" in f.get("why", ""), f
         print(f"    {f['title']} {f['why']}", flush=True)
     check("drift: after sudo chgrp 1000 of one file a disk check gives a folder_owner Warning (reapply, undo offered)",
           drift)
