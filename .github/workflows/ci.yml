@@ -2987,3 +2987,264 @@ jobs:
             docker compose -p "$p" down -v 2>/dev/null || true
           done
           docker compose down -v
+
+  # Shared folders and the doctor on a real stack (contract §14): the Hub
+  # (same-named Hub branch) with one local template source = the templates
+  # repo's jellyfin (same-named templates branch, else main: its folder
+  # blocks) and the CI fixture tests/e2e/apps/folder-writer (2001:2001,
+  # umask 022, a folder-write `shared` option, a lan_only port). The tree
+  # /srv/e2e-media (50 files 1000:1000 0640, dirs 0750) is on the runner's
+  # ext4 root with ACLs; the Hub's fixer helper (its own image, root in a
+  # capped container) changes it through core's unchanged socket-proxy-hub.
+  # tests/e2e/e2e_folders.py: check path, create (gid 60000), assign
+  # preview / apply / host verify, doctor drift, undo, lan_only exposure and
+  # rebind, the socket proxy as on main. No browser.
+  e2e-folders:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      E2E_DOMAIN: portcullis.local
+      E2E_ARTIFACTS: e2e-artifacts
+      E2E_MEDIA: /srv/e2e-media
+      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Templates (same-named templates branch, else main)
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          url=https://github.com/porelli/portcullis-templates
+          ref=main
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && [[ "$REF" != v* ]] \
+              && git ls-remote --exit-code --heads "$url" "$REF" >/dev/null; then
+            ref="$REF"
+          fi
+          git clone --quiet --depth=1 --branch "$ref" "$url" "$RUNNER_TEMP/templates"
+          echo "Templates: portcullis-templates@$ref ($(git -C "$RUNNER_TEMP/templates" rev-parse --short HEAD))" | tee -a "$GITHUB_STEP_SUMMARY"
+          # Fail closed: the scenarios need jellyfin's folder block.
+          grep -q '^      folder:' "$RUNNER_TEMP/templates/jellyfin/manifest.yaml" \
+            || { echo "FAIL: jellyfin has no folder block on portcullis-templates@$ref"; exit 1; }
+
+      - name: Generate .env and the CI override (Pebble, fake DNS provider, auth on portcullis-proxy)
+        run: |
+          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+            --email ci@portcullis.local --dns-provider none
+          for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
+            val="$(grep "^$v=" .env | cut -d= -f2-)"
+            [ "$v" = KEYCLOAK_ADMIN ] || echo "::add-mask::$val"
+            echo "$v=$val" >> "$GITHUB_ENV"
+          done
+          # Jellyfin's setup reaches Keycloak at auth.<domain> (public DNS
+          # stand-in, as in e2e-settings).
+          cat > docker-compose.ci.yml <<'YML'
+          services:
+            keycloak:
+              ports:
+                - "127.0.0.1:9000:9000"
+            lldap:
+              ports:
+                - "127.0.0.1:17170:17170"
+            traefik:
+              networks:
+                portcullis-proxy:
+                  ipv4_address: ${PORTCULLIS_TRAEFIK_IP:-172.31.250.2}
+                  aliases:
+                    - auth.portcullis.local
+                    - media.portcullis.local
+            domains:
+              build:
+                args:
+                  GO_TAGS: testprovider
+              environment:
+                ACME_CA_SERVER: https://pebble:14000/dir
+                LEGO_CA_CERTIFICATES: /run/ci/pebble.minica.pem
+                DOMAINS_RESOLVERS: 127.0.0.1:8053
+              volumes:
+                - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
+            pebble:
+              image: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
+              command: ["-config", "/test/config/pebble-config.json", "-dnsserver", "domains:8053"]
+              environment:
+                PEBBLE_VA_NOSLEEP: "1"
+                PEBBLE_WFE_NONCEREJECT: "0"
+              networks: [domains-egress]
+          YML
+          docker compose config -q
+          docker compose config --format json | jq -e '.services.traefik.networks["portcullis-proxy"] | (.aliases | index("auth.portcullis.local")) and .ipv4_address != null' >/dev/null \
+            || { echo "FAIL: Traefik alias override not applied"; exit 1; }
+          # Main's compose file: the socket proxy must be its service, unchanged.
+          git fetch --quiet --depth=1 origin main
+          git show origin/main:docker-compose.yml > /tmp/main-docker-compose.yml
+
+      - name: List the images this job runs
+        run: |
+          {
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains)|ghcr\.io/porelli/portcullis-hub:.*'
+            grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
+              | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
+          } | sort -u > "$RUNNER_TEMP/images.txt"
+      - name: Load images (cached, verified)
+        uses: ./.github/actions/cached-images
+        with:
+          images: ${{ runner.temp }}/images.txt
+          name: e2e-folders
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Pull Jellyfin's images (by digest)
+        run: |
+          set -o pipefail
+          grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' "$RUNNER_TEMP/templates/jellyfin/compose.yml" \
+            | sort -u > "$RUNNER_TEMP/app-images.txt"
+          cat "$RUNNER_TEMP/app-images.txt"
+          while read -r img; do
+            for i in 1 2 3 4; do docker pull -q "$img" >/dev/null && break; [ "$i" = 4 ] && { echo "FAIL: pull $img"; exit 1; }; sleep $((i * 15)); done
+          done < "$RUNNER_TEMP/app-images.txt"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: enroll
+          tags: portcullis-enroll
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=enroll
+          cache-to: ""
+      - name: Build group-gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: group-gate
+          tags: portcullis-group-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=group-gate
+          cache-to: ""
+      - name: Build the domains service (CI test build, buildx layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: domains
+          tags: portcullis-domains
+          build-args: GO_TAGS=testprovider
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=domains-test
+          cache-to: ""
+      - name: Hub image (same-named Hub branch → built here, else the published one)
+        uses: ./.github/actions/hub-image
+
+      - name: The shared folder's tree on the host (ext4, ACLs)
+        run: |
+          set -o pipefail
+          sudo apt-get install -y -qq acl >/dev/null
+          findmnt -no FSTYPE,OPTIONS --target /srv | tee /dev/stderr | grep -q '^ext4 ' \
+            || { echo "FAIL: /srv is not on ext4"; exit 1; }
+          sudo rm -rf "$E2E_MEDIA"
+          sudo install -d -o 1000 -g 1000 -m 0750 "$E2E_MEDIA"
+          for d in 1 2 3 4 5; do
+            sudo install -d -o 1000 -g 1000 -m 0750 "$E2E_MEDIA/d$d"
+            for f in $(seq 1 10); do
+              echo "movie $d.$f" | sudo tee "$E2E_MEDIA/d$d/movie-$f.mkv" >/dev/null
+            done
+          done
+          sudo find "$E2E_MEDIA" -type f -exec chown 1000:1000 {} + -exec chmod 0640 {} +
+          [ "$(sudo find "$E2E_MEDIA" -type f | wc -l)" = 50 ] && [ "$(sudo find "$E2E_MEDIA" -type d | wc -l)" = 6 ] \
+            || { echo "FAIL: the tree"; sudo find "$E2E_MEDIA" -ls; exit 1; }
+          # The filesystem takes ACLs (a throwaway file outside the tree).
+          sudo touch /srv/.acl-probe && sudo setfacl -m g:1000:r /srv/.acl-probe && sudo getfacl --skip-base /srv/.acl-probe | grep -q 'group:1000:r--'
+          sudo rm -f /srv/.acl-probe
+
+      - name: Start the whole stack (Hub with the CI template source)
+        run: |
+          PEBBLE_IMG=$(docker compose config --format json | jq -r .services.pebble.image)
+          cid="$(docker create "$PEBBLE_IMG")"; docker cp "$cid:/test/certs/pebble.minica.pem" /tmp/pebble.minica.pem; docker rm "$cid" >/dev/null
+          chmod 644 /tmp/pebble.minica.pem
+          docker compose up -d postgres lldap
+          ./portcullis vault init
+          ./portcullis pki setup --with-server-cert
+          ./portcullis config apply --bundle-only
+          printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
+          # The Hub's only template source: jellyfin from the templates
+          # checkout and the CI fixture, as a local source (path, no URL).
+          docker volume create --label com.docker.compose.project=portcullis --label com.docker.compose.volume=hub_data portcullis_hub_data >/dev/null
+          docker run --rm -v portcullis_hub_data:/data -v "$PWD/tests/e2e/apps:/src:ro" -v "$RUNNER_TEMP/templates:/tpl:ro" "$ALPINE" sh -c '
+            mkdir -p /data/repos/ci &&
+            cp -r /tpl/jellyfin /src/folder-writer /data/repos/ci/ &&
+            printf "sources:\n  - name: ci\n    url: \"\"\n    path: /data/repos/ci\n" > /data/state.yaml &&
+            chown -R 10001:10001 /data && chmod 600 /data/state.yaml'
+          # shellcheck disable=SC2046
+          docker compose up -d $(docker compose config --services | grep -vx hub)
+          for i in $(seq 1 100); do
+            curl -sf http://127.0.0.1:9000/health/ready >/dev/null && break
+            [ "$i" -eq 100 ] && { echo "FAIL: Keycloak not ready"; docker compose logs --tail=80 keycloak; exit 1; }
+            sleep 3
+          done
+          ./portcullis keycloak configure
+          ./portcullis oidc register
+          ./portcullis up
+          docker compose restart forward-auth forward-auth-ext
+          docker compose ps
+          HUB_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q hub)")
+          echo "HUB_IP=$HUB_IP" >> "$GITHUB_ENV"
+          for i in $(seq 1 40); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$HUB_IP:8888/healthz")" = 200 ] && break
+            [ "$i" -eq 40 ] && { echo "FAIL: hub /healthz"; docker compose logs --tail=40 hub; exit 1; }
+            sleep 2
+          done
+          SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
+          for i in $(seq 1 30); do
+            curl -s -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") "http://$HUB_IP:8888/api/templates" \
+              | jq -e '[.[].id] as $ids | ["jellyfin", "folder-writer"] - $ids == []' >/dev/null 2>&1 && break
+            [ "$i" -eq 30 ] && { echo "FAIL: the Hub did not load jellyfin and folder-writer"; docker compose logs --tail=60 hub; exit 1; }
+            sleep 2
+          done
+          echo "PASS: the Hub loaded jellyfin and folder-writer"
+
+      - name: Run the shared-folder scenarios (check, assign, verify, drift, undo, exposure, socket proxy)
+        run: |
+          E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
+          export E2E_HUB_SECRET
+          python3 tests/e2e/e2e_folders.py
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p e2e-artifacts/apps
+          SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
+          docker compose ps -a > e2e-artifacts/compose-ps.txt 2>&1 || true
+          docker ps -a > e2e-artifacts/docker-ps.txt 2>&1 || true
+          for svc in traefik keycloak lldap hub socket-proxy-hub; do
+            docker compose logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
+          done
+          for c in $(docker ps -aq --filter label=com.docker.compose.project); do
+            name="$(docker inspect -f '{{.Name}}' "$c" | tr -d /)"
+            case "$name" in portcullis-*-*) docker logs "$c" > "e2e-artifacts/apps/$name.log" 2>&1 || true ;; esac
+          done
+          for p in /api/folders /api/doctor /api/doctor/op /api/folders/media/op /api/instances/folder-writer/op /api/instances/jellyfin/op; do
+            curl -s -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") \
+              "http://$HUB_IP:8888$p" > "e2e-artifacts/api$(echo "$p" | tr / _).json" 2>&1 || true
+          done
+          # shellcheck disable=SC2024
+          sudo find "$E2E_MEDIA" -printf '%P %U:%G %m %y\n' > e2e-artifacts/tree.txt 2>&1 || true
+          # shellcheck disable=SC2024
+          sudo getfacl -R --absolute-names "$E2E_MEDIA" > e2e-artifacts/getfacl.txt 2>&1 || true
+          docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'ls -laR /d/folders /d/folder-snapshots /d/doctor; cat /d/doctor/scans.json; ls -la /d/overrides; cat /d/overrides/*.yml' > e2e-artifacts/hub-data.txt 2>&1 || true
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-folders-artifacts
+          path: e2e-artifacts/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          for p in $(docker ps -aq --filter label=com.docker.compose.project | xargs -r docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' | sort -u | grep '^portcullis-.'); do
+            docker compose -p "$p" down -v 2>/dev/null || true
+          done
+          docker compose down -v
+          sudo rm -rf "$E2E_MEDIA"

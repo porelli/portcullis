@@ -1,0 +1,30 @@
+services:
+  web:
+    image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+    networks: [default, portcullis-proxy]
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.folder-writer.rule: Host(`${PORTCULLIS_HOST_FOLDER_WRITER:-folder-writer.portcullis.local}`)
+      traefik.http.routers.folder-writer.entrypoints: websecure
+      traefik.http.routers.folder-writer.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.folder-writer.loadbalancer.server.port: "80"
+  # Writes /shared/new-<start time>.txt once per start, as 2001:2001 with
+  # umask 022 (the Hub's override mounts the shared folder at /shared and
+  # publishes WRITER_PORT); then idles.
+  app:
+    image: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+    user: "2001:2001"
+    command:
+      - sh
+      - -c
+      - >-
+        umask 022; f=/shared/new-$$(date +%s)-$$RANDOM.txt;
+        if echo started > "$$f" 2>/dev/null; then echo "wrote $$f"; else echo "can't write $$f"; fi;
+        trap 'exit 0' TERM; while :; do sleep 1; done
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+networks:
+  portcullis-proxy:
+    external: true

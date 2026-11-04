@@ -1,0 +1,42 @@
+# CI-only template for the e2e-folders job (.github/workflows/ci.yml): a
+# writer on a shared folder (contract §13.15, §14). The app service runs
+# as 2001:2001 with umask 022 and writes /shared/new-<n>.txt at every
+# start (a write it isn't allowed is only logged), so the job sees what a
+# writer creates after an apply: the folder's gid and group write, from
+# the setgid directory and the default ACL, whatever its umask. Its port
+# is lan_only (the doctor's lan_only_exposed and rebind_port). Not a
+# marketplace template: the job hands it to the Hub as a local source.
+name: Folder Writer
+description: Shared-folder writer (CI)
+category: misc
+instances: multi
+auth:
+  method: forward-auth
+  group_access: true
+  access_group: users_folder-writer
+  admin_group: admin_folder-writer
+urls:
+  - label: Echo
+    url: "https://{{HOST_FOLDER_WRITER}}"
+settings:
+  options:
+    - key: shared
+      label: Shared folder
+      description: Where the writer creates a file at every start.
+      type: path
+      target:
+        service: app
+        mount: /shared
+      folder:
+        access: write
+        runs_as: {uid: 2001, gid: 2001}   # compose user: below
+      applies: restart
+ports:
+  - key: WRITER_PORT
+    label: Writer
+    description: A LAN-only port (nothing listens on it).
+    container: 8080
+    protocol: tcp
+    default: 18765
+    service: app
+    lan_only: true
