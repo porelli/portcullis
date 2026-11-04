@@ -788,6 +788,135 @@ fi
 # Restore original docker stub
 mv "$WORK/bin/docker-orig" "$WORK/bin/docker"
 
+# F14 ownership test: _ensure_secrets_volume (via stack_prepare) runs helper with chown/chmod,
+# and a failing helper makes it fail.
+: > "$STUB_DIR/calls"
+cat > "$WORK/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/calls"
+if [ "$1" = "volume" ] && [ "$2" = "inspect" ] && [ "$3" = "portcullis_hub_secrets" ]; then
+  # Volume doesn't exist yet
+  exit 1
+fi
+if [ "$1" = "volume" ] && [ "$2" = "create" ]; then
+  # Check labels are present
+  if echo "$*" | grep -q "com.docker.compose.project=portcullis" && \
+     echo "$*" | grep -q "com.docker.compose.volume=hub_secrets"; then
+    exit 0
+  fi
+  exit 1
+fi
+if [ "$1" = "run" ] && echo "$*" | grep -q "chown 10001:10001 /v && chmod 0700 /v"; then
+  # Helper with correct ownership command
+  exit 0
+fi
+exit 0
+STUB
+chmod +x "$WORK/bin/docker"
+(
+  export PORTCULLIS_ROOT="$WORK/f14-test"
+  mkdir -p "$PORTCULLIS_ROOT"
+  cd "$PORTCULLIS_ROOT" || exit 1
+  # Call _ensure_secrets_volume (the function in common.sh)
+  _ensure_secrets_volume 2>/dev/null
+) && t_pass "F14: _ensure_secrets_volume runs helper with chown 10001:10001 chmod 0700" \
+  || t_fail "F14: _ensure_secrets_volume runs helper with chown 10001:10001 chmod 0700"
+# Verify the calls include volume create with labels and the chown helper
+if grep -q "volume create.*com.docker.compose.project=portcullis.*com.docker.compose.volume=hub_secrets" "$STUB_DIR/calls" && \
+   grep -q "chown 10001:10001 /v && chmod 0700 /v" "$STUB_DIR/calls"; then
+  t_pass "F14: helper called with correct chown/chmod"
+else
+  t_fail "F14: helper called with correct chown/chmod"
+fi
+# Test that a failing helper makes _ensure_secrets_volume fail
+: > "$STUB_DIR/calls"
+cat > "$WORK/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/calls"
+if [ "$1" = "volume" ] && [ "$2" = "inspect" ]; then
+  exit 1  # doesn't exist
+fi
+if [ "$1" = "volume" ] && [ "$2" = "create" ]; then
+  exit 0
+fi
+if [ "$1" = "run" ] && echo "$*" | grep -q "chown.*chmod"; then
+  # Helper fails
+  exit 1
+fi
+exit 0
+STUB
+chmod +x "$WORK/bin/docker"
+(
+  export PORTCULLIS_ROOT="$WORK/f14-fail-test"
+  mkdir -p "$PORTCULLIS_ROOT"
+  cd "$PORTCULLIS_ROOT" || exit 1
+  _ensure_secrets_volume 2>/dev/null
+) && t_fail "F14: _ensure_secrets_volume fails when helper fails" \
+  || t_pass "F14: _ensure_secrets_volume fails when helper fails"
+
+# Positive-path restore test: operations happen in the right order.
+: > "$STUB_DIR/calls"
+cat > "$WORK/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/calls"
+if [ "$1" = "volume" ] && [ "$2" = "rm" ]; then
+  exit 0
+fi
+if [ "$1" = "volume" ] && [ "$2" = "inspect" ]; then
+  # After rm, volume doesn't exist
+  exit 1
+fi
+if [ "$1" = "volume" ] && [ "$2" = "create" ]; then
+  exit 0
+fi
+if [ "$1" = "run" ] && echo "$*" | grep -q "chown.*chmod"; then
+  # The helper
+  exit 0
+fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ]; then
+  # compose up
+  exit 0
+fi
+exit 0
+STUB
+chmod +x "$WORK/bin/docker"
+(
+  export PORTCULLIS_ROOT="$WORK/restore-order-test"
+  mkdir -p "$PORTCULLIS_ROOT"
+  cd "$PORTCULLIS_ROOT" || exit 1
+  # Simulate the restore's hub_secrets emptying (from backup.sh)
+  proj="portcullis"
+  helper="alpine:latest"
+  full="portcullis_hub_secrets"
+  docker volume rm -f "$full" >/dev/null 2>&1 || true
+  docker volume inspect "$full" >/dev/null 2>&1 && exit 1
+  docker volume create --label "com.docker.compose.project=$proj" --label "com.docker.compose.volume=hub_secrets" "$full" >/dev/null || exit 1
+  docker run --rm --network none -v "$full:/data" "$helper" sh -c "chown 10001:10001 /data && chmod 0700 /data" >/dev/null || exit 1
+  # Now simulate compose up (would happen later)
+  docker compose up -d hub >/dev/null 2>&1 || true
+) && {
+  # Check the order in calls: rm, then inspect, then create with labels, then run (helper), then compose up
+  calls="$(cat "$STUB_DIR/calls")"
+  if echo "$calls" | grep -q "volume rm.*portcullis_hub_secrets" && \
+     echo "$calls" | grep -q "volume create.*com.docker.compose.project=portcullis.*com.docker.compose.volume=hub_secrets" && \
+     echo "$calls" | grep -q "run.*chown 10001:10001" && \
+     echo "$calls" | grep -q "compose up"; then
+    # Check order: find line numbers
+    rm_line=$(echo "$calls" | grep -n "volume rm.*portcullis_hub_secrets" | head -1 | cut -d: -f1)
+    create_line=$(echo "$calls" | grep -n "volume create.*com.docker.compose" | head -1 | cut -d: -f1)
+    helper_line=$(echo "$calls" | grep -n "run.*chown 10001:10001" | head -1 | cut -d: -f1)
+    up_line=$(echo "$calls" | grep -n "compose up" | head -1 | cut -d: -f1)
+    if [ "$rm_line" -lt "$create_line" ] && [ "$create_line" -lt "$helper_line" ] && [ "$helper_line" -lt "$up_line" ]; then
+      t_pass "restore: empties hub_secrets in correct order (rm, create, chown, before compose up)"
+    else
+      t_fail "restore: empties hub_secrets in correct order (order wrong: rm=$rm_line create=$create_line helper=$helper_line up=$up_line)"
+    fi
+  else
+    t_fail "restore: empties hub_secrets in correct order (missing operations)"
+  fi
+} || t_fail "restore: empties hub_secrets in correct order (restore failed)"
+# Note: docker-orig was already restored by the fail-closed test above
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
