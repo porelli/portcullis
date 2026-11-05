@@ -19,11 +19,14 @@
 #   PORTCULLIS_AUTH_IP_RANGE   default 172.31.251.8/29
 #   PORTCULLIS_AUTH_TRAEFIK_IP default 172.31.251.2
 #   PORTCULLIS_DOMAINS_SUBNET  default 172.31.252.0/28 (portcullis-domains)
+#   PORTCULLIS_MCP_SUBNET      default 172.31.253.0/28 (portcullis-mcp: mcp-gate,
+#                              Keycloak, the Hub)
 
 PROXY_NETWORK="${PROXY_NETWORK:-portcullis-proxy}"
 AUTH_NETWORK="${AUTH_NETWORK:-portcullis-auth}"
 # Compose names it <project>_portcullis-domains (no explicit name).
 DOMAINS_NETWORK="${DOMAINS_NETWORK:-portcullis_portcullis-domains}"
+MCP_NETWORK="${MCP_NETWORK:-portcullis-mcp}"
 
 proxy_subnet()   { echo "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24}"; }
 proxy_ip_range() { echo "${PORTCULLIS_PROXY_IP_RANGE:-172.31.250.128/25}"; }
@@ -33,6 +36,7 @@ auth_subnet()    { echo "${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28}"; }
 auth_ip_range()  { echo "${PORTCULLIS_AUTH_IP_RANGE:-172.31.251.8/29}"; }
 auth_traefik_ip() { echo "${PORTCULLIS_AUTH_TRAEFIK_IP:-172.31.251.2}"; }
 domains_subnet() { echo "${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28}"; }
+mcp_subnet()     { echo "${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28}"; }
 
 # ip_to_int <a.b.c.d> — prints the address as an integer; fails if invalid.
 ip_to_int() {
@@ -145,6 +149,51 @@ validate_domains_network_config() {
   fi
 }
 
+# validate_mcp_network_config — PORTCULLIS_MCP_SUBNET (portcullis-mcp:
+# mcp-gate ⇄ Keycloak's JWKS and the Hub's :8890, contract §15): a valid
+# IPv4 CIDR with room for the gateway and three containers, overlapping no
+# other fixed core network.
+validate_mcp_network_config() {
+  local sub sf sl other
+  sub="$(mcp_subnet)"
+  read -r sf sl <<< "$(cidr_bounds "$sub" 2>/dev/null)" || true
+  [ -n "${sf:-}" ] || { echo "PORTCULLIS_MCP_SUBNET=$sub is not a valid IPv4 CIDR"; return 1; }
+  [ $((sl - sf)) -ge 7 ] || { echo "PORTCULLIS_MCP_SUBNET=$sub is too small (at least a /29)"; return 1; }
+  for other in "PORTCULLIS_PROXY_SUBNET=$(proxy_subnet)" "PORTCULLIS_AUTH_SUBNET=$(auth_subnet)" "PORTCULLIS_DOMAINS_SUBNET=$(domains_subnet)"; do
+    if _overlaps "$sub" "${other#*=}"; then echo "PORTCULLIS_MCP_SUBNET=$sub overlaps $other"; return 1; fi
+  done
+}
+
+# Every core compose service (all profiles; CI checks the list against
+# docker-compose.yml). No container outside core may answer to one of
+# these names on portcullis-proxy: a core service resolving a peer there
+# could reach the app instead (proxy_dns_shadows).
+CORE_SERVICE_NAMES="socket-proxy-traefik socket-proxy-hub traefik postgres vault lldap keycloak forward-auth forward-auth-ext group-gate hub enroll domains mcp-gate prometheus alertmanager blackbox textfile-exporter grafana"
+
+# proxy_dns_shadows — "<container> <name>" for every container on
+# portcullis-proxy that is not a core one (project label, a core service
+# label and the name compose gives it) yet answers to a core service name:
+# its name, hostname, a network alias or a DNS name there (folded, a
+# trailing dot ignored). Prints nothing when the network is missing.
+proxy_dns_shadows() {
+  local ids id project="${COMPOSE_PROJECT_NAME:-portcullis}"
+  ids="$(docker network inspect "$PROXY_NETWORK" --format '{{range $k, $v := .Containers}}{{$k}} {{end}}' 2>/dev/null)" || return 0
+  for id in $ids; do
+    docker inspect --format '{{json .}}' "$id" 2>/dev/null \
+      | jq -r --arg net "$PROXY_NETWORK" --arg proj "$project" --arg core " $CORE_SERVICE_NAMES " '
+          ((.Name // "") | ltrimstr("/")) as $n
+          | (.Config.Labels // {}) as $l
+          | ($l["com.docker.compose.service"] // "") as $svc
+          | select((($l["com.docker.compose.project"] // "") == $proj
+                    and ($core | contains(" " + $svc + " ")) and $svc != ""
+                    and ($n | test("^" + $proj + "-" + $svc + "-[0-9]+$"))) | not)
+          | [$n, (.Config.Hostname // ""), ((.NetworkSettings.Networks[$net] // {}) | (.Aliases // [])[], (.DNSNames // [])[])]
+          | map(ascii_downcase | rtrimstr(".")) | unique[]
+          | . as $x | select($x != "" and ($core | contains(" " + $x + " ")))
+          | "\($n) \(.)"' 2>/dev/null || true
+  done
+}
+
 # network_state <name> <subnet> <range> — prints one of: missing | ok | mismatch
 # ("mismatch" = network exists without the expected IPAM subnet/ip_range,
 # e.g. after editing the settings in .env; Docker can't change IPAM in place).
@@ -167,6 +216,7 @@ network_state() {
 proxy_network_state() { network_state "$PROXY_NETWORK" "$(proxy_subnet)" "$(proxy_ip_range)"; }
 auth_network_state()  { network_state "$AUTH_NETWORK" "$(auth_subnet)" "$(auth_ip_range)"; }
 domains_network_state() { network_state "$DOMAINS_NETWORK" "$(domains_subnet)" ""; }
+mcp_network_state()   { network_state "$MCP_NETWORK" "$(mcp_subnet)" ""; }
 
 # network_check — validate the .env settings and refuse to continue if the
 # existing network does not match them (compose would silently keep the old
@@ -177,6 +227,7 @@ network_check() {
   err="$(validate_mcp_gate_ip)" || fail "Invalid mcp-gate address in .env: $err"
   err="$(validate_auth_network_config)" || fail "Invalid portcullis-auth settings in .env: $err"
   err="$(validate_domains_network_config)" || fail "Invalid portcullis-domains settings in .env: $err"
+  err="$(validate_mcp_network_config)" || fail "Invalid portcullis-mcp settings in .env: $err"
   if [ "$(proxy_network_state)" = mismatch ]; then
     fail "Docker network $PROXY_NETWORK exists with a different IPAM config than .env
        ($(proxy_subnet), range $(proxy_ip_range)). Docker cannot change it in place:
@@ -192,6 +243,19 @@ network_check() {
     fail "Docker network $DOMAINS_NETWORK exists with a different subnet than
        PORTCULLIS_DOMAINS_SUBNET=$(domains_subnet) (the domains API would refuse the Hub).
        Only the Hub and domains use it: ./portcullis down && ./portcullis up recreates it."
+  fi
+  if [ "$(mcp_network_state)" = mismatch ]; then
+    fail "Docker network $MCP_NETWORK exists with a different subnet than
+       PORTCULLIS_MCP_SUBNET=$(mcp_subnet). Only mcp-gate, Keycloak and the Hub use it:
+       ./portcullis down && ./portcullis up recreates it."
+  fi
+  local shadows
+  shadows="$(proxy_dns_shadows)"
+  if [ -n "$shadows" ]; then
+    fail "containers on $PROXY_NETWORK answer to core service names (a core service
+       resolving that name could reach them instead):
+$(printf '%s\n' "$shadows" | sed 's/^\([^ ]*\) \(.*\)$/         \1 answers to "\2"/')
+       Disable those apps in the Hub (or remove the containers), then run this again."
   fi
 }
 

@@ -11,7 +11,7 @@ import (
 var hostnameRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 
 // coreSubdomains are the core hosts <sub>.<main domain> (contract §4).
-var coreSubdomains = []string{"auth", "traefik", "hub", "directory", "enroll", "people", "metrics"}
+var coreSubdomains = []string{"auth", "traefik", "hub", "directory", "enroll", "people", "metrics", "mcp"}
 
 func validHostname(s string) bool { return len(s) <= 253 && hostnameRe.MatchString(s) }
 

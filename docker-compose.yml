@@ -56,6 +56,15 @@ networks:
     internal: true
   # domains' egress: ACME, the DNS providers' APIs, the public resolvers.
   domains-egress: {}
+  # mcp-gate ⇄ Keycloak (JWKS) and the Hub (:8890) only (contract §15):
+  # the gate resolves `keycloak` and `hub` here, never on a network apps
+  # join. Fixed subnet (network.sh validates PORTCULLIS_MCP_SUBNET).
+  portcullis-mcp:
+    name: portcullis-mcp
+    internal: true
+    ipam:
+      config:
+        - subnet: ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28}
 
 # Hardening defaults (see docs/hardening.md for per-service exceptions).
 x-hardening: &hardening
@@ -438,6 +447,8 @@ services:
     networks:
       - portcullis
       - portcullis-auth
+      # mcp-gate reads the JWKS here (contract §15).
+      - portcullis-mcp
     healthcheck:
       test: ["CMD", "bash", "-c", "{ printf 'HEAD /health/ready HTTP/1.0\\r\\n\\r\\n' >&0; grep 'HTTP/1.0 200'; } 0<>/dev/tcp/localhost/9000"]
       interval: 10s
@@ -857,6 +868,8 @@ services:
       - portcullis
       - socket-proxy-hub
       - portcullis-domains
+      # mcp-gate → the Hub's :8890 listener (contract §15.7).
+      - portcullis-mcp
     mem_limit: 1g
     pids_limit: 512
     labels:
@@ -1018,8 +1031,9 @@ services:
   # cookies; browser routes keep oauth2-proxy, which accepts no bearer).
   # No Docker access, no LLDAP / Keycloak admin credentials. On
   # portcullis-proxy at the pinned PORTCULLIS_MCP_GATE_IP (the only peer
-  # that calls companions); on portcullis for Keycloak's JWKS and the Hub's
-  # :8890 listener.
+  # that calls companions); on portcullis-mcp (internal: only the gate,
+  # Keycloak and the Hub) for Keycloak's JWKS and the Hub's :8890 listener.
+  # Not on portcullis: nothing else is reachable from it.
   mcp-gate:
     build:
       context: ./mcp-gate
@@ -1050,7 +1064,7 @@ services:
       - ./secrets/mcp-gate/age.key:/run/portcullis/mcp-gate/age.key:ro
       - ./secrets/mcp-gate/hub-secret:/run/portcullis/mcp-gate/hub-secret:ro
     networks:
-      portcullis: {}
+      portcullis-mcp: {}
       portcullis-proxy:
         ipv4_address: ${PORTCULLIS_MCP_GATE_IP:-172.31.250.3}
     healthcheck:

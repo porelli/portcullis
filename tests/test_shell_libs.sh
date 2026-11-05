@@ -292,6 +292,72 @@ expect_fail "guard: mcp-gate IP in the dynamic range aborts" bash -c "PORTCULLIS
 expect_fail "guard: mcp-gate IP = Traefik's aborts" bash -c "PORTCULLIS_MCP_GATE_IP=172.31.250.2; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 expect_fail "guard: mcp-gate IP outside the subnet aborts" bash -c "PORTCULLIS_MCP_GATE_IP=10.0.0.3; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 expect_ok "guard: default mcp-gate IP passes" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+# portcullis-mcp (fix round 1): mcp-gate ⇄ Keycloak / the Hub only.
+unset PORTCULLIS_MCP_SUBNET
+expect_eq "mcp net: default subnet" "$(mcp_subnet)" 172.31.253.0/28
+expect_ok "mcp net: default valid" validate_mcp_network_config
+check_mnet() { PORTCULLIS_MCP_SUBNET="$1" validate_mcp_network_config; }
+expect_ok   "mcp net: custom valid"                 check_mnet 10.96.0.0/29
+expect_fail "mcp net: invalid CIDR"                 check_mnet 10.96.0.0/33
+expect_fail "mcp net: too small"                    check_mnet 10.96.0.0/30
+expect_fail "mcp net: overlaps portcullis-proxy"    check_mnet 172.31.250.32/28
+expect_fail "mcp net: overlaps portcullis-auth"     check_mnet 172.31.251.0/28
+expect_fail "mcp net: overlaps portcullis-domains"  check_mnet 172.31.252.0/29
+printf '%s' '[{"Subnet":"172.31.253.0/28"}]' > "$STUB_DIR/ipam-json-portcullis-mcp"
+expect_eq "mcp net: state ok" "$(mcp_network_state)" ok
+expect_ok "guard: mcp network matching" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+printf '%s' '[{"Subnet":"172.18.9.0/28"}]' > "$STUB_DIR/ipam-json-portcullis-mcp"
+expect_fail "guard: mcp network mismatch aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+rm -f "$STUB_DIR/ipam-json-portcullis-mcp"
+expect_fail "guard: invalid mcp subnet aborts" bash -c "PORTCULLIS_MCP_SUBNET=172.31.250.0/28; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+
+# DNS shadowing on portcullis-proxy (fix round 1): a non-core container
+# answering to a core service name (name, hostname, alias, DNS name) stops
+# up / upgrade / init / restore (network_check) and shows in status.
+mkdir -p "$WORK/dnsbin" "$STUB_DIR/dns"
+cat > "$WORK/dnsbin/docker" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1 $2" = "network inspect" ]; then
+  case "$5" in
+    "{{range"*) [ -f "$STUB_DIR/dns/ids" ] && cat "$STUB_DIR/dns/ids"; exit 0 ;;
+    *) exit 1 ;;
+  esac
+fi
+if [ "$1" = inspect ] && [ "$2" = --format ]; then cat "$STUB_DIR/dns/$4.json"; exit 0; fi
+exit 0
+STUB
+chmod +x "$WORK/dnsbin/docker"
+ctr() { # ctr <id> <name> <project> <service> <hostname> <aliases-json> [dnsnames-json]
+  jq -n --arg n "/$2" --arg p "$3" --arg s "$4" --arg h "$5" --argjson a "$6" --argjson d "${7:-[]}" \
+    '{Name: $n, Config: {Hostname: $h, Labels: ({"com.docker.compose.project": $p, "com.docker.compose.service": $s} | with_entries(select(.value != "")))},
+      NetworkSettings: {Networks: {"portcullis-proxy": {Aliases: $a, DNSNames: $d}}}}' > "$STUB_DIR/dns/$1.json"
+}
+ctr c1 portcullis-traefik-1 portcullis traefik abc '["traefik","portcullis-traefik-1"]'
+ctr c2 portcullis-mcp-gate-1 portcullis mcp-gate def '["mcp-gate"]'
+ctr c3 portcullis-gitea-web-1 portcullis-gitea web web1 '["web","portcullis-mcp-gitea--gitea"]' '["portcullis-gitea-web-1","web"]'
+echo "c1 c2 c3" > "$STUB_DIR/dns/ids"
+dns() { (PATH="$WORK/dnsbin:$PATH"; "$@"); }
+expect_eq "dns guard: core containers and a well-behaved app pass" "$(dns proxy_dns_shadows)" ""
+ctr c4 portcullis-evil-web-1 portcullis-evil web web '["web","Keycloak."]'
+ctr c5 hub portcullis-evil2 api x '[]'
+ctr c6 portcullis-evil3-app-1 portcullis-evil3 app LLDAP '[]'
+ctr c7 portcullis-evil4-app-1 portcullis-evil4 app x '[]' '["vault"]'
+# A container claiming core's project label but not a core service / name.
+ctr c8 portcullis-postgres-9x portcullis postgres x '["postgres"]'
+ctr c9 portcullis-fake-1 portcullis fake x '["mcp-gate"]'
+echo "c1 c2 c3 c4 c5 c6 c7 c8 c9" > "$STUB_DIR/dns/ids"
+expect_eq "dns guard: alias (folded, trailing dot), name, hostname, DNS name, forged core labels" \
+  "$(dns proxy_dns_shadows | sort | paste -sd'|' -)" \
+  "hub hub|portcullis-evil-web-1 keycloak|portcullis-evil3-app-1 lldap|portcullis-evil4-app-1 vault|portcullis-fake-1 mcp-gate|portcullis-postgres-9x postgres"
+expect_fail "guard: a container shadowing a core name aborts network_check" \
+  bash -c "PATH='$WORK/dnsbin:$PATH'; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+OUT="$(PATH="$WORK/dnsbin:$PATH" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check" 2>&1)"
+case "$OUT" in *'portcullis-evil-web-1 answers to "keycloak"'*) t_pass "guard: names the container and the core name" ;; *) t_fail "guard message: $OUT" ;; esac
+echo "c1 c2 c3" > "$STUB_DIR/dns/ids"
+expect_ok "guard: passes again once the app is gone" \
+  bash -c "PATH='$WORK/dnsbin:$PATH'; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+rm -f "$STUB_DIR/dns/ids"
+expect_eq "dns guard: no network = nothing" "$(dns proxy_dns_shadows)" ""
 expect_fail "network lib has no migration code" grep -Eq 'proxy_network_(migrate|reconnect)|docker network (connect|disconnect)' "$HERE/../scripts/lib/network.sh"
 
 # ══ certs: write_revoked_serials ═══════════════════════════

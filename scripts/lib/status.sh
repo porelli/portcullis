@@ -85,11 +85,17 @@ status_run() {
   lldap="$(jq -n --arg h "$(container_health lldap)" '{health: $h}')"
   traefik="$(container_health traefik)"
   case "$traefik" in healthy|running) ;; *) problems=1 ;; esac
+  # A non-core container answering to a core service name on portcullis-proxy
+  # (network.sh proxy_dns_shadows; up / upgrade refuse to run while it lasts).
+  local shadows
+  shadows="$(proxy_dns_shadows)"
+  [ -z "$shadows" ] || problems=1
 
   if [ "$json" = true ]; then
     jq -n --arg d "${PORTCULLIS_DOMAIN:-}" --argjson s "$services" --argjson v "$vault_json" \
-      --argjson k "$kc" --argjson l "$lldap" --arg t "$traefik" --argjson p "$problems" \
-      '{domain: $d, ok: ($p == 0), services: $s, vault: $v, keycloak: $k, lldap: $l, traefik: {state: $t}}'
+      --argjson k "$kc" --argjson l "$lldap" --arg t "$traefik" --argjson p "$problems" --arg sh "$shadows" \
+      '{domain: $d, ok: ($p == 0), services: $s, vault: $v, keycloak: $k, lldap: $l, traefik: {state: $t},
+        dns_shadows: [$sh | split("\n")[] | select(. != "") | capture("^(?<container>[^ ]+) (?<name>.+)$")]}'
     return "$problems"
   fi
 
@@ -149,6 +155,11 @@ status_run() {
   [ "$out" = healthy ] && _st_line ok "lldap healthy" || _st_line fail "lldap $out"
   case "$traefik" in healthy|running) _st_line ok "traefik $traefik" ;; *) _st_line fail "traefik $traefik" ;; esac
   domains_status_lines
+  local shadow
+  while read -r shadow; do
+    [ -n "$shadow" ] || continue
+    _st_line fail "portcullis-proxy: container ${shadow%% *} answers to the core name ${shadow#* }"
+  done <<< "$shadows"
 
   printf '\n%sDomain: %s — run with --json for machine-readable output%s\n\n' "$C_DIM" "${PORTCULLIS_DOMAIN:-?}" "$C_NC"
   return "$problems"
