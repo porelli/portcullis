@@ -38,6 +38,8 @@ type gateOptions struct {
 	LogGroup           int
 	Base               http.RoundTripper
 	MintWait, MintPoll time.Duration
+	// Now is the limiter's clock (nil = time.Now; tests freeze it).
+	Now func() time.Time
 }
 
 type gate struct {
@@ -65,7 +67,7 @@ func newGate(o gateOptions) (*gate, error) {
 			return sn.File.Limits
 		}
 		return limits.Defaults
-	}, nil)
+	}, o.Now)
 	m := &hubMinter{hub: o.Hub, lim: lim}
 	conf := &confirm.Gate{Hub: o.Hub, Limits: lim, Snapshot: o.Snapshot}
 	b := bridge.New(bridge.Config{
@@ -263,6 +265,8 @@ func (a *activity) line(ri reqInfo, decision string) accesslog.Line {
 // forwarding it (initialize, notifications, GET, DELETE, refusals).
 func fallbackDecision(status int) string {
 	switch {
+	case status == 0:
+		return "deny:client_gone" // nothing was answered: the client went away
 	case status >= 200 && status < 300:
 		return "allow"
 	case status == http.StatusBadRequest:

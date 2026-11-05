@@ -46,6 +46,8 @@ const (
 	textPending  = "Still waiting for your confirmation in your browser"
 	textDeclined = "You declined this in your browser"
 	textTooMany  = "Too many confirmations requested; try again later"
+
+	textNotConfirmable = "Portcullis can't confirm this tool"
 )
 
 func isError(msg string) *mcp.CallToolResult {
@@ -102,6 +104,13 @@ func (g *Gate) Before(ctx context.Context, c bridge.Call) (bridge.Outcome, error
 		return bridge.Outcome{Answer: isError(textTooMany), Decision: "rate_limited"}, nil
 	case errors.Is(err, hubapi.ErrNotAllowed):
 		return bridge.Outcome{Answer: isError("you don't have access to " + c.Resource.Label), Decision: "deny:population"}, nil
+	// Final answers, never the transient "try again": the Hub won't
+	// confirm this tool (400), or the resource isn't a current companion
+	// of its configuration (404).
+	case errors.Is(err, hubapi.ErrNotConfirmable):
+		return bridge.Outcome{Answer: isError(textNotConfirmable), Decision: "deny:not_confirmable"}, nil
+	case errors.Is(err, hubapi.ErrUnknownResource):
+		return bridge.Outcome{Answer: isError(textNotConfirmable), Decision: "deny:off"}, nil
 	case err != nil:
 		return bridge.Outcome{}, err
 	}

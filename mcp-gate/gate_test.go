@@ -43,6 +43,9 @@ const (
 	peopleConf = "https://people.example.com/confirm/" + confirmID
 )
 
+// frozen is the limiter's clock in the end-to-end tests.
+var frozen = time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)
+
 // signer issues real RS256 tokens the gate's verifier accepts.
 type signer struct {
 	jwks *httptest.Server
@@ -220,6 +223,7 @@ func newEnv(t *testing.T, mut func(f *config.File)) *testEnv {
 		LogPath:   e.logPath,
 		LogGroup:  os.Getgid(),
 		Base:      base,
+		Now:       func() time.Time { return frozen }, // limits never depend on real time
 		MintWait:  3 * time.Second,
 		MintPoll:  20 * time.Millisecond,
 	})
@@ -679,5 +683,66 @@ func TestRefusalFloodKeepsRoomForCalls(t *testing.T) {
 	if !strings.Contains(string(b), `"user":"alice","client":"portcullis-ai-claude","resource":"https://gitea.example.com/mcp","instance":"gitea","companion":"gitea","via":"direct","method":"tools/call","tool":"list_issues"`) ||
 		!strings.Contains(string(b), `"decision":"allow"`) {
 		t.Errorf("the allowed call's line is missing:\n%s", b)
+	}
+}
+
+// Fix round 1: the logged tool and args_sha256 are what the SDK executes:
+// parseCall decodes with the SDK's own params type, and duplicate or
+// case-variant params keys are refused before anything else.
+func TestParseCallStrict(t *testing.T) {
+	m, tool, args, ok := parseCall([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_issues","arguments":{"q":1}}}`))
+	if !ok || m != "tools/call" || tool != "list_issues" || string(args) != `{"q":1}` {
+		t.Errorf("plain: %q %q %s %v", m, tool, args, ok)
+	}
+	for _, params := range []string{
+		`{"name":"list_issues","name":"delete_repo"}`,
+		`{"name":"list_issues","Name":"delete_repo"}`,
+		`{"NAME":"delete_repo"}`,
+		`{"name":"x","Arguments":{"a":1}}`,
+		`{"name":"x","arguments":{},"Arguments":{"a":1}}`,
+		`{"name":"x","arguments":{},"arguments":{"a":1}}`,
+		`{"name":"x","\u006eame":"y"}`,
+		`[1]`,
+	} {
+		if _, _, _, ok := parseCall([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":` + params + `}`)); ok {
+			t.Errorf("%s accepted", params)
+		}
+	}
+	// Unknown keys and _meta are left to the SDK.
+	if _, tool, _, ok := parseCall([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","_meta":{"a":1}}}`)); !ok || tool != "x" {
+		t.Error("_meta refused")
+	}
+	// Other methods and responses are not judged here.
+	if m, _, _, ok := parseCall([]byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)); !ok || m != "tools/list" {
+		t.Error("tools/list")
+	}
+	if m, _, _, ok := parseCall(nil); !ok || m != "" {
+		t.Error("empty body")
+	}
+
+	// Through the handler: refused (400, deny:protocol), never forwarded.
+	sig := newSigner(t)
+	sn := vectorSnapshot(t)
+	deps := testDeps(t, sn)
+	fw := &recordingForwarder{}
+	h := newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", sig.jwks.URL, sig.jwks.Client()), fw, deps)
+	r := httptest.NewRequest("POST", "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_issues","Name":"delete_repo"}}`))
+	r.Host = "gitea.example.com"
+	r.Header.Set("Authorization", "Bearer "+sig.token("alice", giteaURL, "mcp:gitea.gitea"))
+	r.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 400 || fw.n != 0 {
+		t.Errorf("handler: %d, forwarded %d", w.Code, fw.n)
+	}
+}
+
+// Fix round 1: a forwarded request without any answer (the client went
+// away) is deny:client_gone.
+func TestFallbackDecision(t *testing.T) {
+	for st, want := range map[int]string{0: "deny:client_gone", 200: "allow", 202: "allow", 400: "deny:protocol", 403: "deny:population", 404: "deny:session", 503: "deny:off", 500: "deny:refused"} {
+		if got := fallbackDecision(st); got != want {
+			t.Errorf("%d: %s, want %s", st, got, want)
+		}
 	}
 }

@@ -58,8 +58,7 @@ func Arguments(raw json.RawMessage) ([]byte, error) {
 	// JCS writes U+2028 / U+2029 raw; Go's JSON encoder (the SDK client's)
 	// re-escapes them, so the forwarded bytes would differ from the
 	// hashed ones. Refused: the gate forwards exactly what it hashed.
-	if bytes.Contains(c, []byte("\u2028")) || bytes.Contains(c, []byte("\u2029")) ||
-		bytes.ContainsRune(c, '\u2028') || bytes.ContainsRune(c, '\u2029') {
+	if bytes.ContainsRune(c, '\u2028') || bytes.ContainsRune(c, '\u2029') {
 		return nil, ErrArguments
 	}
 	return c, nil

@@ -274,7 +274,15 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 			deps.act.refused(ri, "deny:protocol")
 			return
 		}
-		ri.method, ri.tool, ri.args = parseCall(body)
+		var callOK bool
+		ri.method, ri.tool, ri.args, callOK = parseCall(body)
+		if !callOK {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":null,"error":{"code":%d,"message":%q}}`, mcpsdk.CodeInvalidRequest, "tools/call params must be one object with distinct keys")
+			deps.act.refused(ri, "deny:protocol")
+			return
+		}
 		toolCall := ri.method == "tools/call"
 		// G28: a tools/call that can't be logged is refused; initialize
 		// and the lists go on.
@@ -316,24 +324,25 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 
 // parseCall: the JSON-RPC method of a checked body ("" for a response or
 // an empty body) and, for tools/call, the tool name and raw arguments
-// (only ever hashed).
-func parseCall(body []byte) (method, tool string, args json.RawMessage) {
+// (only ever hashed) as the SDK decodes them (mcpsdk.CallParams). ok is
+// false for tools/call params the SDK could read differently from the
+// gate (repeated or case-variant keys) or can't read at all: refused.
+func parseCall(body []byte) (method, tool string, args json.RawMessage, ok bool) {
 	if len(body) == 0 {
-		return "", "", nil
+		return "", "", nil, true
 	}
 	msg, err := mcpsdk.Decode(body)
 	if err != nil || !msg.IsRequest {
-		return "", "", nil
+		return "", "", nil, true
 	}
 	if msg.Method != "tools/call" {
-		return msg.Method, "", nil
+		return msg.Method, "", nil, true
 	}
-	var p struct {
-		Name      string          `json:"name"`
-		Arguments json.RawMessage `json:"arguments"`
+	name, a, err := mcpsdk.CallParams(msg.Params)
+	if err != nil {
+		return msg.Method, "", nil, false
 	}
-	_ = json.Unmarshal(msg.Params, &p)
-	return msg.Method, p.Name, p.Arguments
+	return msg.Method, name, a, true
 }
 
 func refuse(w http.ResponseWriter, r *http.Request, d authz.Decision) {

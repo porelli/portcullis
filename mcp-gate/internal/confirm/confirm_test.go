@@ -196,8 +196,6 @@ func TestConfirmFailClosed(t *testing.T) {
 	for name, mut := range map[string]func(h *fakeHub){
 		"consume unavailable": func(h *fakeHub) { h.consErr = hubapi.ErrUnavailable },
 		"create unavailable":  func(h *fakeHub) { h.crErr = hubapi.ErrUnavailable },
-		"not confirmable":     func(h *fakeHub) { h.crErr = hubapi.ErrNotConfirmable },
-		"unknown resource":    func(h *fakeHub) { h.crErr = hubapi.ErrUnknownResource },
 		"foreign url":         func(h *fakeHub) { h.url = "https://evil.example/confirm/x" },
 		"hub url":             func(h *fakeHub) { h.url = "https://hub.example.com/confirm/" + h.createID },
 		"other id":            func(h *fakeHub) { h.url = "https://people.example.com/confirm/AAAA" },
@@ -274,5 +272,18 @@ func TestConfirmTooLong(t *testing.T) {
 	}
 	if _, err := Preview(json.RawMessage(`{"a":"` + strings.Repeat("x", 5000) + `"}`)); err == nil {
 		t.Error("Preview clipped instead of refusing")
+	}
+}
+
+// Fix round 1: the Hub refusing to confirm (400) or not knowing the
+// resource (404) is final, never the transient "try again".
+func TestConfirmNotConfirmable(t *testing.T) {
+	for err, dec := range map[error]string{hubapi.ErrNotConfirmable: "deny:not_confirmable", hubapi.ErrUnknownResource: "deny:off"} {
+		g, h, _, c := setup(t)
+		h.crErr = err
+		out, e := g.Before(context.Background(), c)
+		if e != nil || out.Proceed || out.Answer == nil || !out.Answer.IsError || text(out.Answer) != "Portcullis can't confirm this tool" || out.Decision != dec {
+			t.Errorf("%v: %+v %v", err, out, e)
+		}
 	}
 }
