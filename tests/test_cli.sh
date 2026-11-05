@@ -204,7 +204,7 @@ RC=0; CLOUDFLARE_API_TOKEN=tok123 "$CLI" init --env-only --non-interactive --dom
 expect_eq "init with provider creds from env" "$RC:$(get CLOUDFLARE_API_TOKEN):$(get DNS_PROVIDER)" "0:tok123:cloudflare"
 
 # ── keycloak configure never touches the Hub's AI clients or mcp:* scopes
-# (contract §8) and pushes the realm's offline bounds / refresh rotation ──
+# (contract §8) and pushes the realm's offline bounds / refresh-token settings ──
 # A stub curl answers the admin API: every request is logged as one JSON
 # line {m, p, b}; writes answer 201 (POST) / 204, reads from the fixtures
 # below ("[]" for collections, "{}" otherwise).
@@ -266,10 +266,10 @@ expect_eq "keycloak configure listed the clients (the AI client was seen)" \
   "$(jq -sr '[.[] | select(.m == "GET" and .p == "/admin/realms/portcullis/clients?max=-1")] | length > 0' "$WORK/kc/log")" true
 expect_eq "keycloak configure: no write to the portcullis-ai client or the mcp:* scope" \
   "$(jq -sc '[.[] | select(.m != "GET") | select((.p | test("ai-uuid|mcp-id")) or (.b | test("portcullis-ai|mcp:")))] | map(.m + " " + .p)' "$WORK/kc/log")" '[]'
-expect_eq "keycloak configure: realm offline bounds + refresh-token rotation pushed" \
+expect_eq "keycloak configure: realm offline bounds + refresh-token settings pushed" \
   "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis") | .b | fromjson
       | select(has("revokeRefreshToken")) | {offlineSessionIdleTimeout, offlineSessionMaxLifespanEnabled, offlineSessionMaxLifespan, revokeRefreshToken, refreshTokenMaxReuse}] | unique' "$WORK/kc/log")" \
-  '[{"offlineSessionIdleTimeout":2592000,"offlineSessionMaxLifespanEnabled":true,"offlineSessionMaxLifespan":7776000,"revokeRefreshToken":true,"refreshTokenMaxReuse":0}]'
+  '[{"offlineSessionIdleTimeout":2592000,"offlineSessionMaxLifespanEnabled":true,"offlineSessionMaxLifespan":7776000,"revokeRefreshToken":false,"refreshTokenMaxReuse":0}]'
 
 expect_eq "docker was never called" "$(cat "$STUB_CALLS" 2>/dev/null)" ""
 

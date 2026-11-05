@@ -14,8 +14,8 @@ Sign-in is passkey-only. Every user starts from a one-time setup link
 (`portcullis invite`): open it, register the key, land on the app — the test
 fails on ANY password field. Then: the session reaches the apps, a second
 login in a fresh browser is one passkey touch, the link is single use, the
-session survives two refresh-token rotations with concurrent requests
-(refresh_rotation, contract §8), a user
+session survives two refreshes with concurrent requests (refresh_rotation,
+contract §8), a user
 outside the group is denied, the bootstrap admin's link lands on the portal
 with the Hub link, an unused link cannot sign in to another client through
 the invite identity provider (post-broker deny, contract §8), X.509 login /
@@ -271,12 +271,14 @@ def main() -> int:
               identity_is_username)
 
         def refresh_rotation():
-            # Realm-wide refresh-token rotation (AI support, contract §8:
-            # revoke refresh token on, max reuse 0). oauth2-proxy refreshes
-            # the forward-auth session once it is older than a minute
-            # (OAUTH2_PROXY_COOKIE_REFRESH=1m): the session must survive two
-            # refreshes, each with two requests on the same old cookie at
-            # once (concurrent fetches, then two tabs), without a new sign-in.
+            # Refresh tokens and concurrency (contract §8 "Connection length
+            # and rotation", G51). oauth2-proxy refreshes the forward-auth
+            # session once it is older than a minute
+            # (OAUTH2_PROXY_COOKIE_REFRESH=1m, cookie sessions, no lock): the
+            # session must survive two refreshes, each with two requests on
+            # the same old cookie at once (concurrent fetches, then two tabs),
+            # without a new sign-in. Realm-wide rotation (revokeRefreshToken)
+            # fails this: the second request reuses the spent refresh token.
             def session_cookie():
                 return sorted((c["name"], c["value"]) for c in ctx.cookies([APP + "/"])
                               if c["name"].startswith("_oauth2_proxy"))
@@ -312,7 +314,7 @@ def main() -> int:
                     f"after refresh {rnd}: {page.url}"
                 assert session_cookie() != before, f"refresh {rnd}: the session cookie was not rewritten"
             assert key.asserted == asserted, f"{key.asserted - asserted} new passkey sign-ins during the refreshes"
-        check("forward-auth session survives two refresh-token rotations with concurrent requests (no new sign-in)",
+        check("forward-auth session survives two refreshes with concurrent requests (no new sign-in)",
               refresh_rotation)
 
         if os.environ.get("E2E_METRICS"):

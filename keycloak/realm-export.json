@@ -18,7 +18,7 @@
   "offlineSessionIdleTimeout": 2592000,
   "offlineSessionMaxLifespanEnabled": true,
   "offlineSessionMaxLifespan": 7776000,
-  "revokeRefreshToken": true,
+  "revokeRefreshToken": false,
   "refreshTokenMaxReuse": 0,
   "accessTokenLifespan": 300,
   "accessTokenLifespanForImplicitFlow": 300,

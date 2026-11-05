@@ -573,13 +573,15 @@ source "$HERE/../scripts/lib/keycloak.sh"
 expect_eq "realm export: LDAP federation cachePolicy NO_CACHE" \
   "$(jq -r '.components["org.keycloak.storage.UserStorageProvider"][] | select(.providerId == "ldap") | .config.cachePolicy | join(",")' "$HERE/../keycloak/realm-export.json")" NO_CACHE
 # AI support (contract §8 "Connection length and rotation"): the realm's
-# offline upper bounds (the Hub sets shorter per-client values) and rotating
-# refresh tokens, in the export AND pushed onto existing realms by configure.
-expect_eq "realm export: offline session bounds 30 d idle / 90 d max, refresh tokens rotate" \
+# offline upper bounds (the Hub sets shorter per-client values); refresh-token
+# rotation pinned off (realm-wide it breaks concurrent forward-auth
+# refreshes: e2e-login refresh_rotation), in the export AND pushed onto
+# existing realms by configure.
+expect_eq "realm export: offline session bounds 30 d idle / 90 d max, no refresh-token rotation" \
   "$(jq -c '[.offlineSessionIdleTimeout, .offlineSessionMaxLifespanEnabled, .offlineSessionMaxLifespan, .revokeRefreshToken, .refreshTokenMaxReuse]' "$HERE/../keycloak/realm-export.json")" \
-  '[2592000,true,7776000,true,0]'
+  '[2592000,true,7776000,false,0]'
 expect_eq "keycloak configure: the same realm token settings" "$(printf '%s' "$KC_REALM_TOKEN_SETTINGS" | jq -cS .)" \
-  '{"offlineSessionIdleTimeout":2592000,"offlineSessionMaxLifespan":7776000,"offlineSessionMaxLifespanEnabled":true,"refreshTokenMaxReuse":0,"revokeRefreshToken":true}'
+  '{"offlineSessionIdleTimeout":2592000,"offlineSessionMaxLifespan":7776000,"offlineSessionMaxLifespanEnabled":true,"refreshTokenMaxReuse":0,"revokeRefreshToken":false}'
 COMP='{"id":"x","providerId":"ldap","config":{"cachePolicy":["DEFAULT"],"editMode":["READ_ONLY"],"trustEmail":["true"]}}'
 P1="$(printf '%s' "$COMP" | LLDAP_PASS=pw _kc_ldap_patch dc=ex,dc=org)"
 expect_eq "keycloak configure: existing realm patched to NO_CACHE" "$(printf '%s' "$P1" | jq -r '.config.cachePolicy | join(",")')" NO_CACHE
