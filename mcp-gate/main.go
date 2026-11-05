@@ -18,6 +18,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,15 +27,19 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"filippo.io/age"
 
+	"github.com/portcullis/mcp-gate/internal/accesslog"
 	"github.com/portcullis/mcp-gate/internal/authz"
 	"github.com/portcullis/mcp-gate/internal/bridge"
 	"github.com/portcullis/mcp-gate/internal/config"
+	"github.com/portcullis/mcp-gate/internal/hubapi"
+	"github.com/portcullis/mcp-gate/internal/mcpsdk"
 	"github.com/portcullis/mcp-gate/internal/meta"
 )
 
@@ -129,10 +134,16 @@ func serve() error {
 	if err != nil {
 		return err
 	}
-	// Checked at start; the Hub API client (mint, confirmations; plan 4
-	// task 3) uses it. Wherever T3 compares a presented secret with it,
-	// use crypto/subtle.ConstantTimeCompare — never == or bytes.Equal.
-	if _, err := loadHubSecret(env("MCP_GATE_HUB_SECRET_FILE", defaultHubSecret)); err != nil {
+	// The gate only presents the secret (hubapi sends it on every Hub
+	// call); it never receives one to check. Any comparison of a
+	// presented secret with it must use crypto/subtle.ConstantTimeCompare
+	// (the Hub's side does, Task 13), never == or bytes.Equal.
+	hubSecret, err := loadHubSecret(env("MCP_GATE_HUB_SECRET_FILE", defaultHubSecret))
+	if err != nil {
+		return err
+	}
+	hub, err := hubapi.New(env("MCP_GATE_HUB_URL", defaultHubURL), hubSecret)
+	if err != nil {
 		return err
 	}
 	store, err := config.Open(env("MCP_GATE_HUB_DATA", defaultHubData), ident)
@@ -141,15 +152,18 @@ func serve() error {
 	}
 	defer store.Close()
 	v := authz.NewVerifier("", env("MCP_GATE_JWKS_URL", defaultJWKS), nil)
-	// The Hub API client (mint, confirmations), limits and the access log
-	// come with task 3b: until then app_token people without a credential
-	// get "Preparing your access…" (never an anonymous call) and calls
-	// needing a confirmation are refused.
-	b := bridge.New(bridge.Config{Snapshot: store.Snapshot})
-	defer b.Close()
-	go b.Run()
+	g, err := newGate(gateOptions{
+		Snapshot: store.Snapshot, Verifier: v, Hub: hub, HubSecret: hubSecret,
+		LogPath:  filepath.Join(env("MCP_GATE_DATA", defaultData), "access.jsonl"),
+		LogGroup: accesslog.DefaultGroup,
+	})
+	if err != nil {
+		return err
+	}
+	defer g.Close()
+	go g.bridge.Run()
 
-	srv := newServer(env("MCP_GATE_LISTEN", defaultListen), newHandler(store.Snapshot, v, b))
+	srv := newServer(env("MCP_GATE_LISTEN", defaultListen), g.handler)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	go func() {
@@ -199,9 +213,12 @@ type forwarder interface {
 }
 
 // newHandler: /healthz (loopback only), the metadata documents, and every
-// other request through authz; allowed companion requests go to fwd.
-// Nothing here sets or reads a cookie.
-func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder) http.Handler {
+// other request through authz, the body cap, the protocol checks, the
+// unloggable-call refusal (G28) and the limits (§15.9); allowed companion
+// requests go to fwd. Every MCP request gets one access-log line (§15.8):
+// the bridge's for a forwarded one, else the handler's. Nothing here sets
+// or reads a cookie.
+func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, deps *handlerDeps) http.Handler {
 	metaH := meta.Handler(snap)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Only a plain origin-form, unescaped path is routed (fix round 1).
@@ -218,10 +235,15 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder) 
 			metaH.ServeHTTP(w, r)
 			return
 		}
+		ri := reqInfo{start: time.Now()}
 		sn := snap()
 		d := v.Check(r.Context(), sn, authz.FromHTTP(r, time.Now()))
+		ri.d = d
 		if !d.Allowed() {
 			refuse(w, r, d)
+			// Without a valid token: low priority, so floods can't fill
+			// the queue and make tools/call unloggable.
+			deps.act.write(deps.act.line(ri, "deny:"+d.Reason), d.User == "")
 			return
 		}
 		max := sn.File.Limits.MaxRequestBytes
@@ -233,25 +255,50 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder) 
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
 				http.Error(w, "request body too slow", http.StatusRequestTimeout)
+				deps.act.write(deps.act.line(ri, "deny:body_timeout"), false)
 				return
 			}
 			http.Error(w, "cannot read the request", http.StatusBadRequest)
+			deps.act.write(deps.act.line(ri, "deny:protocol"), false)
 			return
 		}
 		if int64(len(body)) > max {
 			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+			deps.act.write(deps.act.line(ri, "deny:too_large"), false)
 			return
 		}
 		if _, perr := authz.CheckProtocol(r.Header, body); perr != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(perr.Status)
 			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":null,"error":{"code":%d,"message":%q}}`, perr.Code, perr.Msg)
+			deps.act.write(deps.act.line(ri, "deny:protocol"), false)
+			return
+		}
+		ri.method, ri.tool, ri.args = parseCall(body)
+		toolCall := ri.method == "tools/call"
+		// G28: a tools/call that can't be logged is refused; initialize
+		// and the lists go on.
+		if toolCall && !deps.act.healthy() {
+			http.Error(w, "AI activity can't be logged right now", http.StatusServiceUnavailable)
+			deps.act.write(deps.act.line(ri, "deny:unloggable"), false)
+			return
+		}
+		if ok, wait := deps.lim.Allow(d.User, d.Resource.URL, toolCall); !ok {
+			w.Header().Set("Retry-After", retryAfter(wait))
+			http.Error(w, "too many requests; try again later", http.StatusTooManyRequests)
+			deps.act.write(deps.act.line(ri, "rate_limited"), false)
 			return
 		}
 		if fwd != nil && d.Resource.Kind == config.KindCompanion {
 			r.Body = io.NopCloser(bytes.NewReader(body))
 			r.ContentLength = int64(len(body))
-			fwd.ServeResource(w, r, d)
+			id, done := deps.act.begin()
+			r.Header.Set(bridge.RequestIDHeader, id) // replaces anything the client sent
+			sw := &statusWriter{ResponseWriter: w}
+			fwd.ServeResource(sw, r, d)
+			if !done() {
+				deps.act.write(deps.act.line(ri, fallbackDecision(sw.status)), false)
+			}
 			return
 		}
 		// The aggregate and the Portcullis resources come with task 5.
@@ -259,7 +306,30 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder) 
 		// without its upstream.
 		log.Printf("mcp-gate: %s %s%q user=%q client=%q allow (no forwarding yet)", r.Method, d.Resource.Host, d.Resource.Path(), d.User, d.Client)
 		http.Error(w, "MCP forwarding is not available in this build", http.StatusServiceUnavailable)
+		deps.act.write(deps.act.line(ri, "deny:unavailable"), false)
 	})
+}
+
+// parseCall: the JSON-RPC method of a checked body ("" for a response or
+// an empty body) and, for tools/call, the tool name and raw arguments
+// (only ever hashed).
+func parseCall(body []byte) (method, tool string, args json.RawMessage) {
+	if len(body) == 0 {
+		return "", "", nil
+	}
+	msg, err := mcpsdk.Decode(body)
+	if err != nil || !msg.IsRequest {
+		return "", "", nil
+	}
+	if msg.Method != "tools/call" {
+		return msg.Method, "", nil
+	}
+	var p struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	_ = json.Unmarshal(msg.Params, &p)
+	return msg.Method, p.Name, p.Arguments
 }
 
 func refuse(w http.ResponseWriter, r *http.Request, d authz.Decision) {

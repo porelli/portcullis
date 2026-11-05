@@ -6,9 +6,11 @@
 // (policy.go). Nothing the client sends is copied upstream: the upstream
 // request is the gate's own SDK client's.
 //
-// Seams for task 3b: Config.OnEvent receives one Event per MCP request (the
-// access log), Config.Minter is the Hub API's mint, Config.Confirm decides
-// calls that need a confirmation. Limits are applied before ServeResource.
+// Config.OnEvent receives one Event per forwarded MCP request (the access
+// log, task 3b), Config.Minter is the Hub API's mint, Config.Confirm
+// decides calls that need a confirmation. Limits, the unloggable-call
+// refusal (G28) and the lines of requests that never reach forward are the
+// handler's, in front of ServeResource (main.go, gate.go).
 package bridge
 
 import (
@@ -33,13 +35,30 @@ import (
 const DefaultIdleTimeout = 10 * time.Minute
 
 // Event is one MCP request (or a refused server-to-client request) for the
-// access log (§15.8; written by task 3b). Args is the raw tools/call
-// arguments, for hashing only: it is never to be written anywhere.
+// access log (§15.8). Args is the raw tools/call arguments, for hashing
+// only (args_sha256): it is never to be written anywhere. RequestID is the
+// gate's id of the HTTP request (RequestIDHeader), empty for events
+// outside one.
 type Event struct {
 	User, Client, Resource, Instance, Companion, Via, Method, Tool, Decision string
+	RequestID                                                                string
 	Args                                                                     json.RawMessage
 	UpstreamStatus                                                           int
 	Duration                                                                 time.Duration
+}
+
+// RequestIDHeader carries the gate's own id of an HTTP request from the
+// handler to the events of that request (the access log writes exactly
+// one line per request). The handler always overwrites it; the upstream
+// never gets it (identity.go's header allowlist).
+const RequestIDHeader = "X-Portcullis-Gate-Request"
+
+// requestID is the gate's id of the HTTP request carrying req.
+func requestID(req mcp.Request) string {
+	if ex := req.GetExtra(); ex != nil && ex.Header != nil {
+		return ex.Header.Get(RequestIDHeader)
+	}
+	return ""
 }
 
 // Call is a tools/call that needs a confirmation (§15.6).
@@ -51,11 +70,21 @@ type Call struct {
 	Reason       string // "confirm" (a confirm pattern) or "destructive" (the annotation)
 }
 
-// Confirmer decides calls that need a confirmation (task 4 / 3b). proceed
-// is true only when a matching approved confirmation was consumed; else
-// answer is what the person's client gets. An error fails closed.
+// Outcome is a Confirmer's decision. Proceed is true only when a matching
+// approved confirmation was consumed; else Answer is what the person's
+// client gets and Decision the access log's (confirm:<id>, rate_limited,
+// deny:<reason>; empty = "confirm").
+type Outcome struct {
+	Proceed  bool
+	Answer   *mcp.CallToolResult
+	Decision string
+}
+
+// Confirmer decides calls that need a confirmation (§15.6; internal/confirm).
+// An error fails closed: "can't check this right now", the upstream never
+// called (G26).
 type Confirmer interface {
-	Before(ctx context.Context, c Call) (proceed bool, answer *mcp.CallToolResult, err error)
+	Before(ctx context.Context, c Call) (Outcome, error)
 }
 
 // Config configures a Bridge.
@@ -531,7 +560,7 @@ func isErrorResult(msg string) *mcp.CallToolResult {
 
 func (b *Bridge) forward(ctx context.Context, k key, method string, req mcp.Request) (res mcp.Result, err error) {
 	start := b.now()
-	ev := Event{User: k.user, Client: clientOf(req), Resource: k.url, Via: "direct", Method: method, Decision: "allow"}
+	ev := Event{User: k.user, Client: clientOf(req), Resource: k.url, Via: "direct", Method: method, Decision: "allow", RequestID: requestID(req)}
 	if p, ok := req.GetParams().(*mcp.CallToolParamsRaw); ok && p != nil {
 		ev.Tool, ev.Args = p.Name, p.Arguments
 	}
@@ -639,6 +668,9 @@ func (b *Bridge) failure(ev *Event, method string, r *config.Resource, l *link, 
 	switch {
 	case errors.As(err, &ie):
 		ev.Decision, ev.UpstreamStatus = "deny:"+ie.Reason, 0
+		if ie.Reason == "rate_limited" {
+			ev.Decision = "rate_limited" // §15.8: not a deny reason
+		}
 		if ie.Tool && method == mcp.MethodCallTool {
 			return isErrorResult(ie.Message), nil
 		}
@@ -796,13 +828,17 @@ func (b *Bridge) callTool(cctx, ctx context.Context, ev *Event, r *config.Resour
 			ev.Decision, ev.UpstreamStatus = "deny:confirm_unavailable", 0
 			return isErrorResult("This needs your confirmation in your browser, which this Portcullis can't ask for yet; nothing was done."), nil
 		}
-		ok, answer, err := b.cfg.Confirm.Before(ctx, Call{User: ev.User, Client: ev.Client, Resource: r, Tool: p.Name, Args: p.Arguments, Reason: reason})
+		out, err := b.cfg.Confirm.Before(ctx, Call{User: ev.User, Client: ev.Client, Resource: r, Tool: p.Name, Args: p.Arguments, Reason: reason})
 		if err != nil {
 			ev.Decision, ev.UpstreamStatus = "deny:hub_unavailable", 0
 			return isErrorResult("can't check this right now; try again"), nil
 		}
-		if !ok {
+		if !out.Proceed {
 			ev.Decision, ev.UpstreamStatus = "confirm", 0
+			if out.Decision != "" {
+				ev.Decision = out.Decision
+			}
+			answer := out.Answer
 			if answer == nil {
 				answer = isErrorResult("This needs your confirmation in your browser.")
 			}

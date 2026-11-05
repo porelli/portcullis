@@ -37,6 +37,8 @@ var (
 	ErrNoAccount  = errors.New("no_account")  // 409 no_account: never signed in to the app
 	ErrMintFailed = errors.New("mint_failed") // 502 mint_failed
 	ErrNotAllowed = errors.New("not_allowed") // 403: not in the population
+	// ErrRateLimited: the gate's own mints_per_minute (task 3b).
+	ErrRateLimited = errors.New("rate_limited")
 )
 
 // DefaultMintWait is how long a request waits for a minted credential.
@@ -238,6 +240,8 @@ func (g *mintGate) await(ctx context.Context, t *IdentityTransport, res *config.
 				return nil, &IdentityError{Reason: "mint_failed", Message: "Preparing your access to " + label + " failed; try again later"}
 			case errors.Is(err, ErrNotAllowed):
 				return nil, &IdentityError{Reason: "population", Message: "you don't have access to " + label}
+			case errors.Is(err, ErrRateLimited):
+				return nil, &IdentityError{Reason: "rate_limited", Message: "Too many requests to prepare your access to " + label + "; try again in a minute", Tool: true}
 			case fctx.Err() != nil:
 				return nil, &IdentityError{Reason: "mint_pending", Message: "Preparing your access to " + label + ", try again in a moment"}
 			}

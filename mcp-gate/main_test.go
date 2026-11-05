@@ -40,7 +40,7 @@ func TestHandler(t *testing.T) {
 	sn := vectorSnapshot(t)
 	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"keys":[]}`)) }))
 	defer jwks.Close()
-	h := newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", jwks.URL, jwks.Client()), nil)
+	h := newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", jwks.URL, jwks.Client()), nil, testDeps(t, sn))
 	var logs bytes.Buffer
 	log.SetOutput(&logs)
 	defer log.SetOutput(os.Stderr)
@@ -101,7 +101,7 @@ func TestHandler(t *testing.T) {
 	}
 	// Off and corrupt → 503 for everything.
 	for _, bad := range []*config.Snapshot{{Off: true}, {Err: os.ErrInvalid}} {
-		h := newHandler(func() *config.Snapshot { return bad }, authz.NewVerifier("", jwks.URL, jwks.Client()), nil)
+		h := newHandler(func() *config.Snapshot { return bad }, authz.NewVerifier("", jwks.URL, jwks.Client()), nil, testDeps(t, sn))
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, req("POST", "gitea.example.com", "/mcp"))
 		if w.Code != 503 {
@@ -134,7 +134,7 @@ func TestBodyReadDeadline(t *testing.T) {
 	old := bodyReadTimeout
 	bodyReadTimeout = 300 * time.Millisecond
 	defer func() { bodyReadTimeout = old }()
-	srv := httptest.NewServer(newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", jwks.URL, jwks.Client()), nil))
+	srv := httptest.NewServer(newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", jwks.URL, jwks.Client()), nil, testDeps(t, sn)))
 	defer srv.Close()
 
 	sg, _ := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: rsaKey}, (&jose.SignerOptions{}).WithHeader("kid", "k1"))
@@ -197,7 +197,7 @@ func TestAllowedCompanionForwarded(t *testing.T) {
 	defer jwks.Close()
 	sn := vectorSnapshot(t)
 	fw := &recordingForwarder{}
-	h := newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", jwks.URL, jwks.Client()), fw)
+	h := newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", jwks.URL, jwks.Client()), fw, testDeps(t, sn))
 	sg, _ := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: rsaKey}, (&jose.SignerOptions{}).WithHeader("kid", "k1"))
 	tok := func(aud, scope string) string {
 		n := time.Now()

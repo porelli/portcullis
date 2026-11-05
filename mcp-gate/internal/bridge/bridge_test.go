@@ -161,6 +161,7 @@ func (m *fakeMinter) count() int {
 }
 
 type harness struct {
+	reqN   atomic.Int64
 	t      *testing.T
 	b      *Bridge
 	sn     atomic.Pointer[config.Snapshot]
@@ -275,6 +276,8 @@ func newHarness(t *testing.T, sn *config.Snapshot, ups map[string]*upstream, twe
 			http.Error(w, "unknown resource", 404)
 			return
 		}
+		h.reqN.Add(1)
+		r.Header.Set(RequestIDHeader, fmt.Sprintf("req-%d", h.reqN.Load()))
 		h.b.ServeResource(w, r, authz.Decision{
 			Status: 200, Reason: "allow", User: r.Header.Get("X-Test-User"),
 			Client: "portcullis-ai-claude", Resource: res,
@@ -791,16 +794,25 @@ type fakeConfirmer struct {
 	mu    sync.Mutex
 	calls []Call
 	ok    bool
+	out   *Outcome
+	err   error
 }
 
-func (f *fakeConfirmer) Before(ctx context.Context, c Call) (bool, *sdk.CallToolResult, error) {
+func (f *fakeConfirmer) Before(ctx context.Context, c Call) (Outcome, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, c)
+	ok, out, err := f.ok, f.out, f.err
 	f.mu.Unlock()
-	if f.ok {
-		return true, nil, nil
+	if err != nil {
+		return Outcome{}, err
 	}
-	return false, &sdk.CallToolResult{IsError: true, Content: []sdk.Content{&sdk.TextContent{Text: "This needs your confirmation in your browser: open https://people.example.com/confirm/X, then ask me to try again."}}}, nil
+	if ok {
+		return Outcome{Proceed: true}, nil
+	}
+	if out != nil {
+		return *out, nil
+	}
+	return Outcome{Answer: &sdk.CallToolResult{IsError: true, Content: []sdk.Content{&sdk.TextContent{Text: "This needs your confirmation in your browser: open https://people.example.com/confirm/X, then ask me to try again."}}}, Decision: "confirm:X"}, nil
 }
 
 func TestAnnotationAddsConfirmThroughGate(t *testing.T) {
