@@ -90,6 +90,10 @@ type Decision struct {
 	Message      string
 	User, Client string
 	Resource     *config.Resource
+	// LoA is the token's acr mapped through the file's acr_loa (0 for an
+	// unknown acr); the aggregate checks it against each upstream's
+	// min_loa (§15.9).
+	LoA int
 }
 
 // Allowed reports a 200.
@@ -214,14 +218,14 @@ func (v *Verifier) Check(ctx context.Context, sn *config.Snapshot, r Request) De
 			user = u
 		}
 	}
-	d := Decision{Status: http.StatusForbidden, Message: "not allowed", User: user, Client: c.Azp, Resource: res}
+	d := Decision{Status: http.StatusForbidden, Message: "not allowed", User: user, Client: c.Azp, Resource: res, LoA: sn.File.ACRLoA[c.Acr]}
 	if !slices.Contains(strings.Fields(c.Scope), res.Scope) {
 		d.Reason = "scope"
 		d.WWWAuthenticate = `Bearer error="insufficient_scope", scope="` + res.Scope + `", resource_metadata="` + meta + `"`
 		d.Message = "insufficient scope"
 		return d
 	}
-	if sn.File.ACRLoA[c.Acr] < res.MinLoA { // an unknown acr is LoA 0
+	if d.LoA < res.MinLoA { // an unknown acr is LoA 0
 		d.Reason = "loa"
 		return d
 	}

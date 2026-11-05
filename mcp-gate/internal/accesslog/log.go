@@ -61,6 +61,9 @@ type Line struct {
 	Decision                                                                   string
 	UpstreamStatus                                                             int
 	DurationMS                                                                 int64
+	// ConfirmationID (§15.8, optional): on a tools/call that consumed a
+	// confirmation, or continued after one, its id; "" = the key is absent.
+	ConfirmationID string
 }
 
 // wire is the JSON form, in the contract's key order.
@@ -78,6 +81,7 @@ type wire struct {
 	Decision       string `json:"decision"`
 	UpstreamStatus int    `json:"upstream_status"`
 	DurationMS     int64  `json:"duration_ms"`
+	ConfirmationID string `json:"confirmation_id,omitempty"`
 }
 
 // ParseLine decodes one line strictly (every key, no other).
@@ -98,7 +102,7 @@ func ParseLine(b []byte) (Line, error) {
 	return Line{
 		Time: t.UTC(), User: w.User, Client: w.Client, Resource: w.Resource, Instance: w.Instance,
 		Companion: w.Companion, Via: w.Via, Method: w.Method, Tool: w.Tool, ArgsSHA256: w.ArgsSHA256,
-		Decision: w.Decision, UpstreamStatus: w.UpstreamStatus, DurationMS: w.DurationMS,
+		Decision: w.Decision, UpstreamStatus: w.UpstreamStatus, DurationMS: w.DurationMS, ConfirmationID: w.ConfirmationID,
 	}, nil
 }
 
@@ -266,6 +270,7 @@ func (l *Log) encode(ln Line) []byte {
 		Instance: clean(ln.Instance, secrets), Companion: clean(ln.Companion, secrets), Via: clean(ln.Via, secrets),
 		Method: clean(ln.Method, secrets), Tool: clean(ln.Tool, secrets), ArgsSHA256: clean(ln.ArgsSHA256, secrets),
 		Decision: clean(ln.Decision, secrets), UpstreamStatus: ln.UpstreamStatus, DurationMS: ln.DurationMS,
+		ConfirmationID: clean(ln.ConfirmationID, secrets),
 	}
 	b, _ := json.Marshal(w) // only strings and ints: never fails
 	return append(b, '\n')

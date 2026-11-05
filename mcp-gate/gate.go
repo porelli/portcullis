@@ -14,12 +14,14 @@ import (
 	"time"
 
 	"github.com/portcullis/mcp-gate/internal/accesslog"
+	"github.com/portcullis/mcp-gate/internal/aggregate"
 	"github.com/portcullis/mcp-gate/internal/authz"
 	"github.com/portcullis/mcp-gate/internal/bridge"
 	"github.com/portcullis/mcp-gate/internal/config"
 	"github.com/portcullis/mcp-gate/internal/confirm"
 	"github.com/portcullis/mcp-gate/internal/hubapi"
 	"github.com/portcullis/mcp-gate/internal/limits"
+	"github.com/portcullis/mcp-gate/internal/portcullis"
 )
 
 // Task 3b wiring: the Hub API client fills the bridge's minter and
@@ -30,10 +32,14 @@ import (
 // gateOptions: serve passes the production values; tests override Base,
 // MintWait/MintPoll and LogGroup.
 type gateOptions struct {
-	Snapshot           func() *config.Snapshot
-	Verifier           *authz.Verifier
-	Hub                *hubapi.Client
-	HubSecret          string
+	Snapshot  func() *config.Snapshot
+	Verifier  *authz.Verifier
+	Hub       *hubapi.Client
+	HubSecret string
+	// HubURL is the Hub's MCP listener (MCP_GATE_HUB_URL) for the
+	// Portcullis resources and the aggregate's people tools; "" = none
+	// (the Portcullis kinds answer 503).
+	HubURL             string
 	LogPath            string
 	LogGroup           int
 	Base               http.RoundTripper
@@ -50,6 +56,8 @@ type gate struct {
 	lim       *limits.Limiter
 	minter    *hubMinter
 	confirmer *confirm.Gate
+	agg       *aggregate.Aggregate
+	hub       *portcullis.Hub
 }
 
 func newGate(o gateOptions) (*gate, error) {
@@ -74,13 +82,29 @@ func newGate(o gateOptions) (*gate, error) {
 		Snapshot: o.Snapshot, Minter: m, Confirm: conf, OnEvent: act.event, Base: o.Base,
 		MintWait: o.MintWait, MintPoll: o.MintPoll,
 	})
-	return &gate{
-		handler: newHandler(o.Snapshot, o.Verifier, b, &handlerDeps{lim: lim, act: act}),
-		bridge:  b, log: alog, act: act, lim: lim, minter: m, confirmer: conf,
-	}, nil
+	deps := &handlerDeps{lim: lim, act: act}
+	g := &gate{bridge: b, log: alog, act: act, lim: lim, minter: m, confirmer: conf}
+	acfg := aggregate.Config{Snapshot: o.Snapshot, Bridge: b, Limits: lim, OnEvent: act.event}
+	if o.HubURL != "" {
+		ph, err := portcullis.New(o.HubURL, o.HubSecret, nil)
+		if err != nil {
+			b.Close()
+			_ = alog.Close()
+			return nil, err
+		}
+		g.hub, deps.hub, acfg.Portcullis = ph, ph, ph
+	}
+	g.agg = aggregate.New(acfg)
+	deps.agg = g.agg
+	g.handler = newHandler(o.Snapshot, o.Verifier, b, deps)
+	return g, nil
 }
 
 func (g *gate) Close() {
+	g.agg.Close()
+	if g.hub != nil {
+		g.hub.Close()
+	}
 	g.bridge.Close()
 	_ = g.log.Close()
 }
@@ -112,10 +136,24 @@ func (m *hubMinter) Mint(ctx context.Context, resource, user string) error {
 	return err
 }
 
-// handlerDeps: the handler's limits and access log.
+// handlerDeps: the handler's limits and access log, and the forwarders
+// of the aggregate and the Portcullis resources (nil = 503).
 type handlerDeps struct {
 	lim *limits.Limiter
 	act *activity
+	agg aggregateServer
+	hub portcullisServer
+}
+
+// aggregateServer serves the aggregate (aggregate.Aggregate).
+type aggregateServer interface {
+	ServeHTTP(w http.ResponseWriter, r *http.Request, d authz.Decision)
+}
+
+// portcullisServer forwards the Portcullis resources (portcullis.Hub) and
+// returns the Hub's HTTP status (0 = not answered).
+type portcullisServer interface {
+	Serve(w http.ResponseWriter, r *http.Request, d authz.Decision) int
 }
 
 // activity writes access-log lines (§15.8) and keeps the pending HTTP
@@ -155,6 +193,10 @@ func (a *activity) secrets() []string {
 }
 
 var methodR = regexp.MustCompile(`^[a-z]+(/[A-Za-z_]+){0,3}$`)
+
+// confirmIDR: a confirmation id as the Hub gives it (§15.6: 26 base32
+// characters, plain or in dashed groups of four).
+var confirmIDR = regexp.MustCompile(`^(?:[A-Z2-7]{26}|(?:[A-Z2-7]{4}-){6}[A-Z2-7]{2})$`)
 
 // logMethod / logTool: only well-formed names reach the log (a client
 // controls them); anything else is "[invalid]".
@@ -217,12 +259,17 @@ func (a *activity) event(ev bridge.Event) {
 		via = "direct"
 	}
 	m := logMethod(ev.Method)
-	a.write(accesslog.Line{
+	l := accesslog.Line{
 		Time: time.Now(), User: ev.User, Client: ev.Client, Resource: ev.Resource,
 		Instance: ev.Instance, Companion: ev.Companion, Via: via, Method: m,
 		Tool: logTool(m, ev.Tool), ArgsSHA256: digestFor(m, ev.Args), Decision: ev.Decision,
 		UpstreamStatus: ev.UpstreamStatus, DurationMS: ev.Duration.Milliseconds(),
-	}, false)
+	}
+	// §15.8: the consumed confirmation's id, on its tools/call only.
+	if m == "tools/call" && confirmIDR.MatchString(ev.Confirmation) {
+		l.ConfirmationID = ev.Confirmation
+	}
+	a.write(l, false)
 }
 
 // begin registers an HTTP request about to be forwarded; done reports

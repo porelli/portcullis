@@ -529,7 +529,7 @@ func (b *Bridge) middleware(k key) mcp.Middleware {
 			switch method {
 			case mcp.MethodListTools, mcp.MethodCallTool, mcp.MethodListResources, mcp.MethodListResourceTemplates,
 				mcp.MethodReadResource, mcp.MethodListPrompts, mcp.MethodGetPrompt:
-				return b.forward(ctx, k, method, req)
+				return b.forward(ctx, k, method, req, route{via: "direct", bound: k.user + "\x00" + k.url})
 			case mcp.MethodComplete, mcp.MethodSubscribe, mcp.MethodUnsubscribe:
 				return nil, &mcp.RPCError{Code: mcp.CodeMethodNotFound, Message: "not supported through Portcullis"}
 			case mcp.MethodInitialize:
@@ -578,9 +578,39 @@ func isErrorResult(msg string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{IsError: true, Content: []mcp.Content{&mcp.TextContent{Text: msg}}}
 }
 
-func (b *Bridge) forward(ctx context.Context, k key, method string, req mcp.Request) (res mcp.Result, err error) {
+// route is how a request reaches forward: directly on the companion's own
+// resource, or through the aggregate (task 5), whose downstream session is
+// bound to the aggregate's URL and whose upstream link is the pooled one
+// (one aggregate session reaches many upstreams).
+type route struct {
+	via   string // "direct" or "aggregate"
+	bound string // the TokenInfo.UserID the downstream session must carry
+}
+
+// Via is the aggregate's request on one companion: User is the person,
+// Bound the aggregate resource's URL their downstream session is bound to.
+type Via struct {
+	User, Bound string
+}
+
+// Forward serves one request of the aggregate (task 5) on companion res,
+// through the same pipeline as a direct request — the current snapshot's
+// resource and membership, the identity, tool policy, annotations,
+// confirmations bound to res's own URL, the result bounds and one Event
+// with Via "aggregate" — on the person's pooled upstream link. req is the
+// aggregate's own request carrying the upstream's names; its session is
+// where the person is asked (elicitations, confirmations). The resource
+// must be aggregated (aggregate: true).
+func (b *Bridge) Forward(ctx context.Context, v Via, res *config.Resource, method string, req mcp.Request) (mcp.Result, error) {
+	if res == nil || v.User == "" || v.Bound == "" {
+		return nil, rpcError(mcp.CodeInvalidParams, "not allowed")
+	}
+	return b.forward(ctx, key{user: v.User, url: res.URL}, method, req, route{via: "aggregate", bound: v.User + "\x00" + v.Bound})
+}
+
+func (b *Bridge) forward(ctx context.Context, k key, method string, req mcp.Request, rt route) (res mcp.Result, err error) {
 	start := b.now()
-	ev := Event{User: k.user, Client: clientOf(req), Resource: k.url, Via: "direct", Method: method, Decision: "allow", RequestID: requestID(req)}
+	ev := Event{User: k.user, Client: clientOf(req), Resource: k.url, Via: rt.via, Method: method, Decision: "allow", RequestID: requestID(req)}
 	if p, ok := req.GetParams().(*mcp.CallToolParamsRaw); ok && p != nil {
 		ev.Tool, ev.Args = p.Name, p.Arguments
 	}
@@ -589,7 +619,7 @@ func (b *Bridge) forward(ctx context.Context, k key, method string, req mcp.Requ
 		b.emit(ev)
 	}()
 	// The session's TokenInfo is bound to this key by the SDK; check it.
-	if ex := req.GetExtra(); ex == nil || ex.TokenInfo == nil || ex.TokenInfo.UserID != k.user+"\x00"+k.url {
+	if ex := req.GetExtra(); ex == nil || ex.TokenInfo == nil || ex.TokenInfo.UserID != rt.bound {
 		ev.Decision = "deny:token"
 		return nil, rpcError(mcp.CodeInvalidParams, "not allowed")
 	}
@@ -598,7 +628,7 @@ func (b *Bridge) forward(ctx context.Context, k key, method string, req mcp.Requ
 	if sn != nil && sn.Err == nil && !sn.Off && sn.File != nil {
 		r = lookupURL(sn, k.url)
 	}
-	if r == nil || r.Kind != config.KindCompanion {
+	if r == nil || r.Kind != config.KindCompanion || (rt.via == "aggregate" && !r.Aggregate) {
 		ev.Decision = "deny:off"
 		return nil, rpcError(mcp.CodeInternalError, "AI support for this app is off")
 	}
@@ -608,7 +638,11 @@ func (b *Bridge) forward(ctx context.Context, k key, method string, req mcp.Requ
 		return nil, rpcError(mcp.CodeInvalidParams, "you no longer have access to "+r.Label)
 	}
 	ss, _ := req.GetSession().(*mcp.ServerSession)
-	l := b.linkFor(k, r, ss)
+	lss := ss
+	if rt.via == "aggregate" {
+		lss = nil // the pooled link: one aggregate session reaches many upstreams
+	}
+	l := b.linkFor(k, r, lss)
 	leave := l.enter(ctx)
 	defer leave()
 

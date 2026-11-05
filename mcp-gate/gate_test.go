@@ -62,10 +62,14 @@ func newSigner(t *testing.T) *signer {
 }
 
 func (s *signer) token(user, aud, scope string) string {
+	return s.tokenFor(user, aud, scope, "portcullis-ai-claude")
+}
+
+func (s *signer) tokenFor(user, aud, scope, azp string) string {
 	n := time.Now()
 	claims, _ := json.Marshal(map[string]any{
 		"iss": "https://auth.example.com/realms/portcullis", "aud": aud,
-		"azp": "portcullis-ai-claude", "typ": "Bearer", "scope": scope, "acr": "hwk",
+		"azp": azp, "typ": "Bearer", "scope": scope, "acr": "hwk",
 		"preferred_username": user, "exp": n.Add(5 * time.Minute).Unix(), "iat": n.Unix(),
 	})
 	obj, _ := s.sg.Sign(claims)
@@ -85,16 +89,51 @@ type fakeHub struct {
 	approved  bool
 	state     string // "pending" / "declined": the consume answer when not approved
 	badSecret int
+	// The Portcullis MCP (/mcp/admin, /mcp/people): paths and headers seen.
+	mcpPaths   []string
+	mcpHeaders []http.Header
+	admin      http.Handler
+	people     http.Handler
+}
+
+// portcullisMCP is a stateless SDK server with the given tools (the Hub's
+// MCP, Task 16, faked).
+func portcullisMCP(tools ...string) http.Handler {
+	s := sdk.NewServer(&sdk.Implementation{Name: "portcullis", Version: "1"}, nil)
+	for _, n := range tools {
+		s.AddTool(&sdk.Tool{Name: n, Description: "does " + n, InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, req *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+			return &sdk.CallToolResult{Content: []sdk.Content{&sdk.TextContent{Text: "hub " + req.Params.Name}}}, nil
+		})
+	}
+	return sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return s }, &sdk.StreamableHTTPOptions{Stateless: true, DisableLocalhostProtection: true})
+}
+
+func (h *fakeHub) seenMCP() ([]string, []http.Header) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.mcpPaths...), append([]http.Header(nil), h.mcpHeaders...)
 }
 
 func newFakeHub(t *testing.T, sn *atomic.Pointer[config.Snapshot]) *fakeHub {
-	h := &fakeHub{sn: sn}
+	h := &fakeHub{sn: sn, admin: portcullisMCP("delete_instance", "list_instances"), people: portcullisMCP("my_apps", "invite_person")}
 	h.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Portcullis-MCP-Secret")), []byte(hubSecret)) != 1 {
 			h.mu.Lock()
 			h.badSecret++
 			h.mu.Unlock()
 			w.WriteHeader(401)
+			return
+		}
+		if r.URL.Path == "/mcp/admin" || r.URL.Path == "/mcp/people" {
+			h.mu.Lock()
+			h.mcpPaths = append(h.mcpPaths, r.URL.Path)
+			h.mcpHeaders = append(h.mcpHeaders, r.Header.Clone())
+			h.mu.Unlock()
+			if r.URL.Path == "/mcp/admin" {
+				h.admin.ServeHTTP(w, r)
+			} else {
+				h.people.ServeHTTP(w, r)
+			}
 			return
 		}
 		var body map[string]any
@@ -226,6 +265,7 @@ func newEnv(t *testing.T, mut func(f *config.File)) *testEnv {
 		Verifier:  authz.NewVerifier("", e.sig.jwks.URL, e.sig.jwks.Client()),
 		Hub:       hub,
 		HubSecret: hubSecret,
+		HubURL:    e.hub.srv.URL,
 		LogPath:   e.logPath,
 		LogGroup:  os.Getgid(),
 		Base:      base,
@@ -418,7 +458,8 @@ func TestGateEndToEnd(t *testing.T) {
 	var decisions []string
 	var sawInit, sawDeny bool
 	for _, l := range lines {
-		if len(l) != len(keys) {
+		// confirmation_id is the one optional key (§15.8).
+		if _, ok := l["confirmation_id"]; len(l) != len(keys) && !(ok && len(l) == len(keys)+1) {
 			t.Errorf("line %v", l)
 		}
 		for _, k := range keys {

@@ -336,3 +336,30 @@ func waitFor(t *testing.T, f func() bool) {
 	}
 	t.Fatal("condition never met")
 }
+
+// §15.8: confirmation_id is the one optional key — last, present only
+// when set, and parsed back.
+func TestConfirmationIDKey(t *testing.T) {
+	l, path, _ := open(t, Options{})
+	with := full
+	with.ConfirmationID = "ABCD-EFGH-IJKL-MNOP-QRST-UVWX-YZ"
+	if err := l.Write(with); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Write(full); err != nil {
+		t.Fatal(err)
+	}
+	flush(t, l)
+	b, _ := os.ReadFile(path)
+	lines := strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+	if len(lines) != 2 || !strings.HasSuffix(lines[0], `"duration_ms":184,"confirmation_id":"ABCD-EFGH-IJKL-MNOP-QRST-UVWX-YZ"}`) {
+		t.Fatalf("with: %s", b)
+	}
+	if strings.Contains(lines[1], "confirmation_id") {
+		t.Errorf("without: %s", lines[1])
+	}
+	got, err := ParseLine([]byte(lines[0]))
+	if err != nil || !reflect.DeepEqual(got, with) {
+		t.Errorf("ParseLine: %+v %v", got, err)
+	}
+}

@@ -189,7 +189,9 @@ func (f *recordingForwarder) ServeResource(w http.ResponseWriter, r *http.Reques
 }
 
 // Task 3a: an allowed companion request goes to the bridge with its body
-// intact and the Decision; other kinds keep the 503 until task 5.
+// intact and the Decision. A kind with no forwarder wired (here: the
+// aggregate, testDeps has none) is a 503, never answered without its
+// upstream.
 func TestAllowedCompanionForwarded(t *testing.T) {
 	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
 	set, _ := json.Marshal(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &rsaKey.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"}}})
@@ -220,7 +222,7 @@ func TestAllowedCompanionForwarded(t *testing.T) {
 	if w.Code != 299 || fw.n != 1 || fw.body != body || fw.d.User != "alice" || fw.d.Client != "portcullis-ai-claude" || fw.d.Resource == nil || fw.d.Resource.Instance != "gitea" {
 		t.Fatalf("%d %+v", w.Code, fw)
 	}
-	// The aggregate isn't the bridge's (task 5): still refused.
+	// The aggregate isn't the bridge's, and nothing else is wired: refused.
 	r = httptest.NewRequest("POST", "/mcp", strings.NewReader(body))
 	r.Host = "mcp.example.com"
 	r.Header.Set("Authorization", "Bearer "+tok("https://mcp.example.com/mcp", "mcp:all"))

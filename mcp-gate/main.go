@@ -153,7 +153,7 @@ func serve() error {
 	defer store.Close()
 	v := authz.NewVerifier("", env("MCP_GATE_JWKS_URL", defaultJWKS), nil)
 	g, err := newGate(gateOptions{
-		Snapshot: store.Snapshot, Verifier: v, Hub: hub, HubSecret: hubSecret,
+		Snapshot: store.Snapshot, Verifier: v, Hub: hub, HubSecret: hubSecret, HubURL: env("MCP_GATE_HUB_URL", defaultHubURL),
 		LogPath:  filepath.Join(env("MCP_GATE_DATA", defaultData), "access.jsonl"),
 		LogGroup: accesslog.DefaultGroup,
 	})
@@ -162,6 +162,7 @@ func serve() error {
 	}
 	defer g.Close()
 	go g.bridge.Run()
+	go g.agg.Run()
 
 	srv := newServer(env("MCP_GATE_LISTEN", defaultListen), g.handler)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
@@ -297,13 +298,15 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 			deps.act.refused(ri, "rate_limited")
 			return
 		}
-		if fwd != nil && d.Resource.Kind == config.KindCompanion {
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			r.ContentLength = int64(len(body))
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+		// Forwarded through the bridge (companions) or the aggregate: one
+		// line per upstream call from their events, else the handler's.
+		viaEvents := func(serve func(w http.ResponseWriter, r *http.Request)) {
 			id, done := deps.act.begin()
 			r.Header.Set(bridge.RequestIDHeader, id) // replaces anything the client sent
 			sw := &statusWriter{ResponseWriter: w}
-			fwd.ServeResource(sw, r, d)
+			serve(sw, r)
 			if !done() {
 				if dec := fallbackDecision(sw.status); dec == "allow" {
 					deps.act.write(deps.act.line(ri, dec), false)
@@ -311,12 +314,34 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 					deps.act.refused(ri, dec)
 				}
 			}
+		}
+		switch k := d.Resource.Kind; {
+		case k == config.KindCompanion && fwd != nil:
+			viaEvents(func(w http.ResponseWriter, r *http.Request) { fwd.ServeResource(w, r, d) })
+			return
+		case k == config.KindAggregate && deps.agg != nil:
+			viaEvents(func(w http.ResponseWriter, r *http.Request) { deps.agg.ServeHTTP(w, r, d) })
+			return
+		case (k == config.KindAdmin || k == config.KindPeople) && deps.hub != nil:
+			// The Portcullis MCP (G25): the same pipeline as above, then
+			// the Hub; one line with the Hub's status.
+			r.Header.Del(bridge.RequestIDHeader)
+			sw := &statusWriter{ResponseWriter: w}
+			ri.upstreamStatus = deps.hub.Serve(sw, r, d)
+			dec := fallbackDecision(sw.status)
+			if ri.upstreamStatus == 0 && sw.status == http.StatusBadGateway {
+				dec = "deny:upstream"
+			}
+			if dec == "allow" {
+				deps.act.write(deps.act.line(ri, dec), false)
+			} else {
+				deps.act.refused(ri, dec)
+			}
 			return
 		}
-		// The aggregate and the Portcullis resources come with task 5.
-		// Until then an allowed request is refused: never answered
-		// without its upstream.
-		log.Printf("mcp-gate: %s %s%q user=%q client=%q allow (no forwarding yet)", r.Method, d.Resource.Host, d.Resource.Path(), d.User, d.Client)
+		// A kind with nothing wired to it: refused, never answered without
+		// its upstream.
+		log.Printf("mcp-gate: %s %s%q user=%q client=%q allow (no forwarding for %s)", r.Method, d.Resource.Host, d.Resource.Path(), d.User, d.Client, d.Resource.Kind)
 		http.Error(w, "MCP forwarding is not available in this build", http.StatusServiceUnavailable)
 		deps.act.refused(ri, "deny:unavailable")
 	})

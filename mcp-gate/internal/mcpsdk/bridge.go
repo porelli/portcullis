@@ -78,6 +78,17 @@ type (
 	Prompt                      = mcp.Prompt
 	RequestExtra                = mcp.RequestExtra
 	RPCError                    = jsonrpc.Error
+	// The aggregate (task 5).
+	InitializeResult     = mcp.InitializeResult
+	DiscoverResult       = mcp.DiscoverResult
+	ListToolsRequest     = mcp.ListToolsRequest
+	ListResourcesRequest = mcp.ListResourcesRequest
+	ListPromptsRequest   = mcp.ListPromptsRequest
+	ReadResourceRequest  = mcp.ReadResourceRequest
+	GetPromptRequest     = mcp.GetPromptRequest
+	ToolHandler          = mcp.ToolHandler
+	ResourceHandler      = mcp.ResourceHandler
+	PromptHandler        = mcp.PromptHandler
 )
 
 // Method names and error codes the bridge uses.
@@ -96,6 +107,7 @@ const (
 	MethodCreateMessage         = "sampling/createMessage"
 	MethodListRoots             = "roots/list"
 	MethodElicit                = "elicitation/create"
+	MethodDiscover              = "server/discover"
 
 	CodeMethodNotFound = jsonrpc.CodeMethodNotFound
 	CodeInvalidParams  = jsonrpc.CodeInvalidParams
