@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"time"
 
@@ -39,7 +40,7 @@ func TestHandler(t *testing.T) {
 	sn := vectorSnapshot(t)
 	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(`{"keys":[]}`)) }))
 	defer jwks.Close()
-	h := newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", jwks.URL, jwks.Client()))
+	h := newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", jwks.URL, jwks.Client()), nil)
 	var logs bytes.Buffer
 	log.SetOutput(&logs)
 	defer log.SetOutput(os.Stderr)
@@ -100,7 +101,7 @@ func TestHandler(t *testing.T) {
 	}
 	// Off and corrupt → 503 for everything.
 	for _, bad := range []*config.Snapshot{{Off: true}, {Err: os.ErrInvalid}} {
-		h := newHandler(func() *config.Snapshot { return bad }, authz.NewVerifier("", jwks.URL, jwks.Client()))
+		h := newHandler(func() *config.Snapshot { return bad }, authz.NewVerifier("", jwks.URL, jwks.Client()), nil)
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, req("POST", "gitea.example.com", "/mcp"))
 		if w.Code != 503 {
@@ -133,7 +134,7 @@ func TestBodyReadDeadline(t *testing.T) {
 	old := bodyReadTimeout
 	bodyReadTimeout = 300 * time.Millisecond
 	defer func() { bodyReadTimeout = old }()
-	srv := httptest.NewServer(newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", jwks.URL, jwks.Client())))
+	srv := httptest.NewServer(newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", jwks.URL, jwks.Client()), nil))
 	defer srv.Close()
 
 	sg, _ := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: rsaKey}, (&jose.SignerOptions{}).WithHeader("kid", "k1"))
@@ -170,5 +171,73 @@ func TestServerTimeouts(t *testing.T) {
 	s := newServer(":0", http.NotFoundHandler())
 	if s.ReadHeaderTimeout <= 0 || s.ReadTimeout <= 0 || s.IdleTimeout <= 0 || s.MaxHeaderBytes <= 0 {
 		t.Errorf("%+v", s)
+	}
+}
+
+type recordingForwarder struct {
+	d    authz.Decision
+	body string
+	n    int
+}
+
+func (f *recordingForwarder) ServeResource(w http.ResponseWriter, r *http.Request, d authz.Decision) {
+	f.n++
+	f.d = d
+	b, _ := io.ReadAll(r.Body)
+	f.body = string(b)
+	w.WriteHeader(299)
+}
+
+// Task 3a: an allowed companion request goes to the bridge with its body
+// intact and the Decision; other kinds keep the 503 until task 5.
+func TestAllowedCompanionForwarded(t *testing.T) {
+	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	set, _ := json.Marshal(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &rsaKey.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"}}})
+	jwks := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write(set) }))
+	defer jwks.Close()
+	sn := vectorSnapshot(t)
+	fw := &recordingForwarder{}
+	h := newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", jwks.URL, jwks.Client()), fw)
+	sg, _ := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: rsaKey}, (&jose.SignerOptions{}).WithHeader("kid", "k1"))
+	tok := func(aud, scope string) string {
+		n := time.Now()
+		claims, _ := json.Marshal(map[string]any{
+			"iss": "https://auth.example.com/realms/portcullis", "aud": aud,
+			"azp": "portcullis-ai-claude", "typ": "Bearer", "scope": scope, "acr": "hwk",
+			"preferred_username": "Alice", "exp": n.Add(5 * time.Minute).Unix(), "iat": n.Unix(),
+		})
+		obj, _ := sg.Sign(claims)
+		s, _ := obj.CompactSerialize()
+		return s
+	}
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
+	r := httptest.NewRequest("POST", "/mcp", strings.NewReader(body))
+	r.Host = "gitea.example.com"
+	r.Header.Set("Authorization", "Bearer "+tok("https://gitea.example.com/mcp", "mcp:gitea.gitea"))
+	r.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 299 || fw.n != 1 || fw.body != body || fw.d.User != "alice" || fw.d.Client != "portcullis-ai-claude" || fw.d.Resource == nil || fw.d.Resource.Instance != "gitea" {
+		t.Fatalf("%d %+v", w.Code, fw)
+	}
+	// The aggregate isn't the bridge's (task 5): still refused.
+	r = httptest.NewRequest("POST", "/mcp", strings.NewReader(body))
+	r.Host = "mcp.example.com"
+	r.Header.Set("Authorization", "Bearer "+tok("https://mcp.example.com/mcp", "mcp:all"))
+	r.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 503 || fw.n != 1 {
+		t.Errorf("aggregate: %d, forwarded %d", w.Code, fw.n)
+	}
+	// A refused token never reaches the bridge.
+	r = httptest.NewRequest("POST", "/mcp", strings.NewReader(body))
+	r.Host = "gitea.example.com"
+	r.Header.Set("Authorization", "Bearer "+tok("https://grafana.example.com/mcp", "mcp:gitea.gitea"))
+	r.Header.Set("MCP-Protocol-Version", "2025-11-25")
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 401 || fw.n != 1 {
+		t.Errorf("wrong audience: %d, forwarded %d", w.Code, fw.n)
 	}
 }

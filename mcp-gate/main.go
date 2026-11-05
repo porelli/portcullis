@@ -33,6 +33,7 @@ import (
 	"filippo.io/age"
 
 	"github.com/portcullis/mcp-gate/internal/authz"
+	"github.com/portcullis/mcp-gate/internal/bridge"
 	"github.com/portcullis/mcp-gate/internal/config"
 	"github.com/portcullis/mcp-gate/internal/meta"
 )
@@ -140,8 +141,15 @@ func serve() error {
 	}
 	defer store.Close()
 	v := authz.NewVerifier("", env("MCP_GATE_JWKS_URL", defaultJWKS), nil)
+	// The Hub API client (mint, confirmations), limits and the access log
+	// come with task 3b: until then app_token people without a credential
+	// get "Preparing your access…" (never an anonymous call) and calls
+	// needing a confirmation are refused.
+	b := bridge.New(bridge.Config{Snapshot: store.Snapshot})
+	defer b.Close()
+	go b.Run()
 
-	srv := newServer(env("MCP_GATE_LISTEN", defaultListen), newHandler(store.Snapshot, v))
+	srv := newServer(env("MCP_GATE_LISTEN", defaultListen), newHandler(store.Snapshot, v, b))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	go func() {
@@ -185,9 +193,15 @@ func isLoopback(remote string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// forwarder serves an allowed request of a companion resource (the bridge).
+type forwarder interface {
+	ServeResource(w http.ResponseWriter, r *http.Request, d authz.Decision)
+}
+
 // newHandler: /healthz (loopback only), the metadata documents, and every
-// other request through authz. Nothing here sets or reads a cookie.
-func newHandler(snap func() *config.Snapshot, v *authz.Verifier) http.Handler {
+// other request through authz; allowed companion requests go to fwd.
+// Nothing here sets or reads a cookie.
+func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder) http.Handler {
 	metaH := meta.Handler(snap)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Only a plain origin-form, unescaped path is routed (fix round 1).
@@ -234,9 +248,15 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier) http.Handler {
 			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":null,"error":{"code":%d,"message":%q}}`, perr.Code, perr.Msg)
 			return
 		}
-		// Forwarding to the resource's upstream comes with the bridge
-		// (plan 4, tasks 3 and 5). Until then an allowed request is
-		// refused: never answered without its upstream.
+		if fwd != nil && d.Resource.Kind == config.KindCompanion {
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			r.ContentLength = int64(len(body))
+			fwd.ServeResource(w, r, d)
+			return
+		}
+		// The aggregate and the Portcullis resources come with task 5.
+		// Until then an allowed request is refused: never answered
+		// without its upstream.
 		log.Printf("mcp-gate: %s %s%q user=%q client=%q allow (no forwarding yet)", r.Method, d.Resource.Host, d.Resource.Path(), d.User, d.Client)
 		http.Error(w, "MCP forwarding is not available in this build", http.StatusServiceUnavailable)
 	})
