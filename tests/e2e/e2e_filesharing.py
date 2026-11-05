@@ -755,8 +755,18 @@ def main() -> int:
             try:
                 until("carol's Family session open", lambda: sessions_of(cid, state["carol_uid"]), 30, every=1)
                 t0 = time.time()
-                hub_ok("PUT", f"/api/instances/{SMB}/settings", {"values": {"share1_writers": []}})
-                until("carol's write session ended", lambda: sessions_gone(cid, state["carol_uid"]), 30, every=0.5)
+                saved = hub_ok("PUT", f"/api/instances/{SMB}/settings", {"values": {"share1_writers": []}})
+                try:
+                    until("carol's write session ended", lambda: sessions_gone(cid, state["carol_uid"]), 30, every=0.5)
+                except AssertionError as e:
+                    # Evidence: what the save delivered, and whether smb.conf changed.
+                    units = {u.get("unit"): {k: u.get(k) for k in ("ok", "skipped", "message", "error")}
+                             for u in ((saved.get("deliveries") or {}).get("units") or {}).values()} \
+                        if isinstance((saved.get("deliveries") or {}).get("units"), dict) else saved.get("deliveries")
+                    tp = docker("exec", cid, "testparm", "-s")
+                    fam = tp.split("[Family]", 1)[1].split("\n[", 1)[0] if "[Family]" in tp else "(no [Family])"
+                    raise AssertionError(f"{e}; the save's deliveries: {json.dumps(units)[:1200]}; "
+                                         f"[Family] now: {' | '.join(ln.strip() for ln in fam.splitlines() if ln.strip())}")
                 took = time.time() - t0
                 summary(f"LATENCY writer demoted to reader (carol, Family): session ended after {took:.1f} s")
             finally:
@@ -780,6 +790,11 @@ def main() -> int:
             measure_revocation("LLDAP-direct removal (bob, users_samba)", state[f"{SMB}_cid"], state[f"{SMB}_ip"],
                                "Home", "bob", state["bob_smb"], state["bob_uid"], remove, LLDAP_SLA_S)
             until("bob revoked in the admin view", lambda: creds(SMB)["bob"]["status"] == "revoked", 30, every=2)
+            op = hub("GET", f"/api/instances/{SMB}/op")[1]
+            if isinstance(op, dict):
+                OBS.append("samba op record after the LLDAP-direct revocation: " + scrub(json.dumps(
+                    {k: op.get(k) for k in ("op", "ok", "error", "output", "hint")}))[:1500])
+                print("    " + OBS[-1], flush=True)
         check(f"revoke_lldap: bob removed from users_samba with LLDAP's GraphQL: his login fails within "
               f"{LLDAP_SLA_S} s and his session is gone", revoke_lldap)
 
@@ -857,11 +872,20 @@ def main() -> int:
 
     # ── 7. core backup / restore voids every credential ──
     def restore_core():
-        needs("carol_smb2")
+        # carol's active password: the one made after the instance restore,
+        # else (that restore refused) her first one.
+        pw_key = "carol_smb2" if "carol_smb2" in state else "carol_smb"
+        needs(pw_key)
         assert creds(SMB)["carol"]["status"] == "active", creds(SMB)["carol"]
-        p = subprocess.run(["docker", "volume", "rm", SECRETS_VOLUME], capture_output=True, text=True, timeout=60)
-        assert p.returncode != 0, "hub_secrets could be removed while the apps run"
-        OBS.append(f"hub_secrets while the apps run: docker volume rm → rc {p.returncode}: {p.stderr.strip()[:200]}")
+        state["carol_active"] = state[pw_key]
+        # The apps hold hub_secrets (read-only subpath mounts): core's
+        # restore stops only the core project, so it can't remove the
+        # volume while they run (it fails closed half-way). Shown, not
+        # attempted; the apps are disabled first.
+        users = docker("ps", "-a", "--filter", f"volume={SECRETS_VOLUME}", "--format", "{{.Names}}").split()
+        apps_holding = sorted(n for n in users if n.startswith(("portcullis-samba", "portcullis-timemachine")))
+        assert apps_holding, f"no app container mounts {SECRETS_VOLUME}: {users}"
+        OBS.append(f"containers mounting {SECRETS_VOLUME} before the core restore: {sorted(users)}")
         print(f"    {OBS[-1]}", flush=True)
         for inst in (SMB, TM):
             hub_ok("POST", "/api/templates/disable", {"id": inst}, timeout=600)
@@ -881,8 +905,13 @@ def main() -> int:
         print(f"    core backup {new[0]}: {len(files)} files, no hash", flush=True)
         state["core_scanned"] = True
         subprocess.run(["./portcullis", "restore", "--yes", new[0]], check=True, timeout=2400)
-        state["hub_ip"] = until("the Hub after the restore", lambda: hub_ip(), 180, every=5)
-        until("the Hub answers", lambda: hub("GET", "/api/directory")[0] == 200, 300, every=5)
+        try:
+            state["hub_ip"] = until("the Hub after the restore", lambda: hub_ip(), 180, every=5)
+            until("the Hub answers", lambda: hub("GET", "/api/directory")[0] == 200, 300, every=5)
+        except AssertionError as e:
+            p = subprocess.run(["docker", "compose", "logs", "--no-color", "--tail=30", "hub"], capture_output=True,
+                               text=True, timeout=60)
+            raise AssertionError(f"{e}; hub logs: {scrub(p.stdout + p.stderr)[-2500:]}")
         row = until("carol voided after the core restore",
                     lambda: (r := creds(SMB).get("carol")) and r["status"] == "voided" and r, 300, every=5)
         assert row.get("reason") == "restore", row
@@ -895,11 +924,11 @@ def main() -> int:
         cid = until("samba running", lambda: app(SMB), 120)
         until("samba healthy", lambda: docker("inspect", "-f", "{{.State.Health.Status}}", cid).strip() == "healthy",
               180, every=5)
-        ok, out = smb(ip_of(cid), "Home", "carol", state["carol_smb2"])
+        ok, out = smb(ip_of(cid), "Home", "carol", state["carol_active"])
         assert not ok, "carol's password still works after the core restore"
         p = subprocess.run(["docker", "logs", container("portcullis", "hub")], capture_output=True, timeout=60)
         assert not hash_hits(p.stdout + p.stderr, "hub logs"), "a hash in the Hub's logs after the restore"
-    check("restore_core: hub_secrets can't be emptied under running apps; with both disabled ./portcullis "
+    check("restore_core: the apps mount hub_secrets (core restore can't empty it under them); with both disabled ./portcullis "
           "backup (no hash in it) → ./portcullis restore voids every credential (epoch missing), no hash file "
           "left; carol's password fails after Samba is enabled again", restore_core)
 
