@@ -3248,3 +3248,276 @@ jobs:
           done
           docker compose down -v
           sudo rm -rf "$E2E_MEDIA"
+
+  # File sharing on a real stack (contract §5.1, §11.6, §13.16, §13.17): the
+  # Hub (same-named Hub branch) with one local template source = the
+  # templates repo's samba and timemachine (same-named templates branch,
+  # else main; the step fails without their person_secret option), the
+  # runner's smbclient (apt, pinned), slot 1 of Samba on a shared folder
+  # (/srv/e2e-family, ext4 with ACLs). tests/e2e/e2e_filesharing.py: the
+  # fresh passkey sign-in popup against real Keycloak (exactly one more
+  # assertion, COOP observed), the password shown once (same code again
+  # 403), SMB3 logins, revocation SLAs (Hub-made ≤ 10 s, LLDAP-direct ≤ 75 s,
+  # measured: `LATENCY` lines and the step summary), a writer demoted to
+  # reader, instance and core restores voiding passwords, no hash in any
+  # archive, docker inspect, log or the hub_data volume. Passwords and
+  # hashes are masked, given to smbclient through PASSWD, never on argv.
+  e2e-filesharing:
+    # The smbclient pin below is the 24.04 package.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      E2E_DOMAIN: portcullis.local
+      E2E_ARTIFACTS: e2e-artifacts
+      E2E_FAMILY: /srv/e2e-family
+      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      # Ubuntu 24.04's Samba 4.19.5 (any security update of it).
+      SMBCLIENT_VERSION: "2:4.19.5+dfsg-4ubuntu9*"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Templates (same-named templates branch, else main)
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          url=https://github.com/porelli/portcullis-templates
+          ref=main
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && [[ "$REF" != v* ]] \
+              && git ls-remote --exit-code --heads "$url" "$REF" >/dev/null; then
+            ref="$REF"
+          fi
+          git clone --quiet --depth=1 --branch "$ref" "$url" "$RUNNER_TEMP/templates"
+          echo "Templates: portcullis-templates@$ref ($(git -C "$RUNNER_TEMP/templates" rev-parse --short HEAD))" | tee -a "$GITHUB_STEP_SUMMARY"
+          # Fail closed: the scenarios need both file-sharing templates.
+          for t in samba timemachine; do
+            grep -q '^      type: person_secret' "$RUNNER_TEMP/templates/$t/manifest.yaml" \
+              || { echo "FAIL: $t has no person_secret option on portcullis-templates@$ref"; exit 1; }
+          done
+
+      - name: Generate .env and the CI override (Pebble, fake DNS provider, auth on portcullis-proxy)
+        run: |
+          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+            --email ci@portcullis.local --dns-provider none
+          for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
+            val="$(grep "^$v=" .env | cut -d= -f2-)"
+            [ "$v" = KEYCLOAK_ADMIN ] || echo "::add-mask::$val"
+            echo "$v=$val" >> "$GITHUB_ENV"
+          done
+          cat > docker-compose.ci.yml <<'YML'
+          services:
+            keycloak:
+              ports:
+                - "127.0.0.1:9000:9000"
+            lldap:
+              ports:
+                - "127.0.0.1:17170:17170"
+            traefik:
+              networks:
+                portcullis-proxy:
+                  ipv4_address: ${PORTCULLIS_TRAEFIK_IP:-172.31.250.2}
+                  aliases:
+                    - auth.portcullis.local
+                    - people.portcullis.local
+            domains:
+              build:
+                args:
+                  GO_TAGS: testprovider
+              environment:
+                ACME_CA_SERVER: https://pebble:14000/dir
+                LEGO_CA_CERTIFICATES: /run/ci/pebble.minica.pem
+                DOMAINS_RESOLVERS: 127.0.0.1:8053
+              volumes:
+                - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
+            pebble:
+              image: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
+              command: ["-config", "/test/config/pebble-config.json", "-dnsserver", "domains:8053"]
+              environment:
+                PEBBLE_VA_NOSLEEP: "1"
+                PEBBLE_WFE_NONCEREJECT: "0"
+              networks: [domains-egress]
+          YML
+          docker compose config -q
+          docker compose config --format json | jq -e '.services.traefik.networks["portcullis-proxy"] | (.aliases | index("auth.portcullis.local")) and .ipv4_address != null' >/dev/null \
+            || { echo "FAIL: Traefik alias override not applied"; exit 1; }
+
+      - name: List the images this job runs
+        run: |
+          {
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains)|ghcr\.io/porelli/portcullis-hub:.*'
+            grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
+              | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
+          } | sort -u > "$RUNNER_TEMP/images.txt"
+      - name: Load images (cached, verified)
+        uses: ./.github/actions/cached-images
+        with:
+          images: ${{ runner.temp }}/images.txt
+          name: e2e-filesharing
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Pull the file-sharing templates' images (by digest)
+        run: |
+          set -o pipefail
+          grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' \
+            "$RUNNER_TEMP"/templates/{samba,timemachine}/compose.yml | sort -u > "$RUNNER_TEMP/app-images.txt"
+          cat "$RUNNER_TEMP/app-images.txt"
+          while read -r img; do
+            for i in 1 2 3 4; do docker pull -q "$img" >/dev/null && break; [ "$i" = 4 ] && { echo "FAIL: pull $img"; exit 1; }; sleep $((i * 15)); done
+          done < "$RUNNER_TEMP/app-images.txt"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: enroll
+          tags: portcullis-enroll
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=enroll
+          cache-to: ""
+      - name: Build group-gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: group-gate
+          tags: portcullis-group-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=group-gate
+          cache-to: ""
+      - name: Build the domains service (CI test build, buildx layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: domains
+          tags: portcullis-domains
+          build-args: GO_TAGS=testprovider
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=domains-test
+          cache-to: ""
+      - name: Hub image (same-named Hub branch → built here, else the published one)
+        uses: ./.github/actions/hub-image
+
+      - name: smbclient (apt, pinned) and the shared folder on the host (ext4, ACLs)
+        run: |
+          set -o pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "smbclient=$SMBCLIENT_VERSION" acl >/dev/null
+          v="$(smbclient --version)"; echo "smbclient: $v ($(dpkg-query -W -f='${Version}' smbclient))" | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ "$v" == "Version 4.19.5"* ]] || { echo "FAIL: smbclient $v is not the pinned 4.19.5"; exit 1; }
+          fs="$(findmnt -no FSTYPE --target /srv)"; [ "$fs" = ext4 ] || { echo "FAIL: /srv is $fs, not ext4"; exit 1; }
+          sudo rm -rf "$E2E_FAMILY"
+          sudo install -d -o 0 -g 0 -m 0755 "$E2E_FAMILY"
+          echo "family photos" | sudo tee "$E2E_FAMILY/readme.txt" >/dev/null
+
+      - name: Start the whole stack (Hub with the CI template source)
+        run: |
+          PEBBLE_IMG=$(docker compose config --format json | jq -r .services.pebble.image)
+          cid="$(docker create "$PEBBLE_IMG")"; docker cp "$cid:/test/certs/pebble.minica.pem" /tmp/pebble.minica.pem; docker rm "$cid" >/dev/null
+          chmod 644 /tmp/pebble.minica.pem
+          docker compose up -d postgres lldap
+          ./portcullis vault init
+          ./portcullis pki setup --with-server-cert
+          ./portcullis config apply --bundle-only
+          printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
+          # The Hub's only template source: samba and timemachine from the
+          # templates checkout, as a local source (path, no URL).
+          docker volume create --label com.docker.compose.project=portcullis --label com.docker.compose.volume=hub_data portcullis_hub_data >/dev/null
+          docker run --rm -v portcullis_hub_data:/data -v "$RUNNER_TEMP/templates:/tpl:ro" "$ALPINE" sh -c '
+            mkdir -p /data/repos/ci &&
+            cp -r /tpl/samba /tpl/timemachine /data/repos/ci/ &&
+            printf "sources:\n  - name: ci\n    url: \"\"\n    path: /data/repos/ci\n" > /data/state.yaml &&
+            chown -R 10001:10001 /data && chmod 600 /data/state.yaml'
+          # shellcheck disable=SC2046
+          docker compose up -d $(docker compose config --services | grep -vx hub)
+          for i in $(seq 1 100); do
+            curl -sf http://127.0.0.1:9000/health/ready >/dev/null && break
+            [ "$i" -eq 100 ] && { echo "FAIL: Keycloak not ready"; docker compose logs --tail=80 keycloak; exit 1; }
+            sleep 3
+          done
+          ./portcullis keycloak configure
+          ./portcullis oidc register
+          ./portcullis up
+          docker compose restart forward-auth forward-auth-ext
+          docker compose ps
+          HUB_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q hub)")
+          echo "HUB_IP=$HUB_IP" >> "$GITHUB_ENV"
+          for i in $(seq 1 40); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$HUB_IP:8888/healthz")" = 200 ] && break
+            [ "$i" -eq 40 ] && { echo "FAIL: hub /healthz"; docker compose logs --tail=40 hub; exit 1; }
+            sleep 2
+          done
+          SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
+          for i in $(seq 1 30); do
+            curl -s -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") "http://$HUB_IP:8888/api/templates" \
+              | jq -e '[.[].id] as $ids | ["samba", "timemachine"] - $ids == []' >/dev/null 2>&1 && break
+            [ "$i" -eq 30 ] && { echo "FAIL: the Hub did not load samba and timemachine"; docker compose logs --tail=60 hub; exit 1; }
+            sleep 2
+          done
+          echo "PASS: the Hub loaded samba and timemachine"
+          echo "127.0.0.1 portcullis.local auth.portcullis.local enroll.portcullis.local hub.portcullis.local people.portcullis.local" | sudo tee -a /etc/hosts
+
+      - name: Restore the pip / Playwright browser cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/ms-playwright
+          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+
+      - name: Install Playwright (pinned) and trust core's CA
+        run: |
+          python3 -m venv /tmp/e2e-venv
+          /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
+          sudo /tmp/e2e-venv/bin/playwright install-deps chromium
+          /tmp/e2e-venv/bin/playwright install chromium
+          sudo apt-get install -y -qq libnss3-tools >/dev/null
+          mkdir -p "$HOME/.pki/nssdb"
+          certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
+          certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
+
+      - name: Run the file-sharing scenarios (fresh auth, shown once, SMB3, revocation SLAs, restores, no hash)
+        run: |
+          E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
+          export E2E_HUB_SECRET
+          /tmp/e2e-venv/bin/python tests/e2e/e2e_filesharing.py
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p e2e-artifacts/apps
+          SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
+          HUB_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q hub)" 2>/dev/null || true)
+          docker compose ps -a > e2e-artifacts/compose-ps.txt 2>&1 || true
+          docker ps -a > e2e-artifacts/docker-ps.txt 2>&1 || true
+          for svc in traefik keycloak forward-auth group-gate lldap hub socket-proxy-hub; do
+            docker compose logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
+          done
+          for c in $(docker ps -aq --filter label=com.docker.compose.project); do
+            name="$(docker inspect -f '{{.Name}}' "$c" | tr -d /)"
+            case "$name" in portcullis-*-*) docker logs "$c" > "e2e-artifacts/apps/$name.log" 2>&1 || true ;; esac
+          done
+          # Metadata only (never a hash or password): credentials views, ops, settings panels, the audit.
+          for p in /api/instances/samba/credentials /api/instances/timemachine/credentials /api/instances/samba/op \
+                   /api/instances/timemachine/op /api/instances/samba/settings /api/instances/timemachine/settings \
+                   /api/folders /api/doctor /api/directory/audit; do
+            curl -s -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") \
+              "http://$HUB_IP:8888$p" > "e2e-artifacts/api$(echo "$p" | tr / _).json" 2>&1 || true
+          done
+
+      - name: Upload screenshots and logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-filesharing-artifacts
+          path: e2e-artifacts/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          for p in $(docker ps -aq --filter label=com.docker.compose.project | xargs -r docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' | sort -u | grep '^portcullis-.'); do
+            docker compose -p "$p" down -v 2>/dev/null || true
+          done
+          docker compose down -v
+          sudo rm -rf "$E2E_FAMILY"
