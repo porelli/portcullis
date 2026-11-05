@@ -385,12 +385,21 @@ func (h *Hub) sweepLocked() {
 	}
 }
 
+// DropClient closes the person's people sessions of one AI client.
+func (h *Hub) DropClient(user, client string) {
+	h.drop(func(k skey) bool { return k.user == user && k.client == client })
+}
+
 // DropUser closes the person's people sessions.
 func (h *Hub) DropUser(user string) {
+	h.drop(func(k skey) bool { return k.user == user })
+}
+
+func (h *Hub) drop(match func(skey) bool) {
 	h.mu.Lock()
 	var gone []*mcp.ClientSession
 	for k, s := range h.sessions {
-		if k.user == user {
+		if match(k) {
 			gone = append(gone, s.cs)
 			delete(h.sessions, k)
 		}

@@ -43,6 +43,9 @@ const (
 	FixedMaxRequestBytes  = 8388608
 	FixedMaxResultBytes   = 16777216
 	FixedUpstreamTimeoutS = 120
+	// MaxFanout: the aggregate calls at most this many upstreams in
+	// parallel per request (§15.9); a larger limits.fanout refuses the file.
+	MaxFanout = 4
 )
 
 // File is mcp-gate.json (§15.4). Field order is the file's key order.
@@ -355,6 +358,9 @@ func (f *File) validate() error {
 		if v <= 0 {
 			return fmt.Errorf("limits.%s: not positive", name)
 		}
+	}
+	if l.Fanout > MaxFanout {
+		return fmt.Errorf("limits.fanout: at most %d", MaxFanout)
 	}
 	if l.MaxRequestBytes != FixedMaxRequestBytes || l.MaxResultBytes != FixedMaxResultBytes || l.UpstreamTimeoutS != FixedUpstreamTimeoutS {
 		return fmt.Errorf("limits: max_request_bytes, max_result_bytes and upstream_timeout_s are fixed in this release")

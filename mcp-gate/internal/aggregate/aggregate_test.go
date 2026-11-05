@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/auth"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/portcullis/mcp-gate/internal/authz"
@@ -103,6 +104,7 @@ type fakeUp struct {
 	delay   time.Duration
 	active  *atomic.Int64
 	release chan struct{} // closed at the test's end: ends every delay
+	lists   atomic.Int64  // tools/list requests served
 	peak    *atomic.Int64
 }
 
@@ -119,10 +121,16 @@ func (u *fakeUp) headers() []http.Header {
 }
 
 func newUpstream(t *testing.T, stateless bool, tools []string, mut func(s *sdk.Server)) *fakeUp {
+	return newUpstreamWith(t, stateless, tools, nil, "", mut)
+}
+
+// newUpstreamWith: opts for the fake's server (e.g. PageSize), pad appended
+// to every tool's description.
+func newUpstreamWith(t *testing.T, stateless bool, tools []string, opts *sdk.ServerOptions, pad string, mut func(s *sdk.Server)) *fakeUp {
 	u := &fakeUp{release: make(chan struct{})}
-	s := sdk.NewServer(&sdk.Implementation{Name: "companion", Version: "1"}, nil)
+	s := sdk.NewServer(&sdk.Implementation{Name: "companion", Version: "1"}, opts)
 	for _, n := range tools {
-		s.AddTool(&sdk.Tool{Name: n, Description: "does " + n, InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, req *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+		s.AddTool(&sdk.Tool{Name: n, Description: "does " + n + pad, InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, req *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
 			u.mu.Lock()
 			u.calls = append(u.calls, req.Params.Name)
 			u.mu.Unlock()
@@ -131,6 +139,9 @@ func newUpstream(t *testing.T, stateless bool, tools []string, mut func(s *sdk.S
 	}
 	s.AddReceivingMiddleware(func(next sdk.MethodHandler) sdk.MethodHandler {
 		return func(ctx context.Context, method string, req sdk.Request) (sdk.Result, error) {
+			if method == "tools/list" {
+				u.lists.Add(1)
+			}
 			if method == "tools/list" && u.active != nil {
 				n := u.active.Add(1)
 				for {
@@ -266,7 +277,16 @@ func newHarness(t *testing.T, f *config.File, ups map[string]*fakeUp, tweak func
 	h := &harness{t: t, ups: ups, conf: &confirmer{}}
 	h.sn.Store(snapshot(f))
 	// The fake Hub: /mcp/people and /mcp/admin are two SDK servers.
-	people := newUpstream(t, true, peopleTools(), nil)
+	people := newUpstream(t, true, peopleTools(), func(s *sdk.Server) {
+		s.AddReceivingMiddleware(func(next sdk.MethodHandler) sdk.MethodHandler {
+			return func(ctx context.Context, method string, req sdk.Request) (sdk.Result, error) {
+				if p, ok := req.GetParams().(*sdk.CallToolParamsRaw); ok && method == "tools/call" && strings.Contains(string(p.Arguments), `"fail"`) {
+					return nil, &jsonrpc.Error{Code: -32603, Message: "the Hub refused"}
+				}
+				return next(ctx, method, req)
+			}
+		})
+	})
 	admin := newUpstream(t, true, []string{"delete_instance"}, nil)
 	h.hub = &fakeUp{}
 	h.hub.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -715,6 +735,15 @@ func TestAggregateFanout(t *testing.T) {
 	if p := peak.Load(); p > 4 || p < 2 {
 		t.Errorf("peak concurrent upstream lists %d", p)
 	}
+	// A fanout above 4 (the validator refuses it; the gate caps it anyway).
+	peak.Store(0)
+	big := snapshot(f)
+	big.File.Limits.Fanout = 10
+	h.sn.Store(big)
+	toolMap(t, h.connect("bob", "2025-11-25", "", nil))
+	if p := peak.Load(); p > 4 {
+		t.Errorf("fanout 10: peak %d", p)
+	}
 
 	// Bounded time: one fakeUp hangs; the endpoint answers in time,
 	// listing it as unavailable.
@@ -953,3 +982,170 @@ func TestForwardChecksClient(t *testing.T) {
 }
 
 type mcpTokenInfo = auth.TokenInfo
+
+// Fix round 1, item 1: the size bounds are checked page by page; an
+// upstream serving many large pages is stopped early, not read whole.
+func TestAggregateListSizeBounded(t *testing.T) {
+	oldUp, oldTotal := maxUpstreamBytes, maxTotalBytes
+	t.Cleanup(func() { maxUpstreamBytes, maxTotalBytes = oldUp, oldTotal })
+	maxUpstreamBytes, maxTotalBytes = 200_000, 8<<20
+	var many []string
+	for i := 0; i < 100; i++ {
+		many = append(many, fmt.Sprintf("tool_%03d", i))
+	}
+	pad := strings.Repeat("x", 10_000) // ~50 KB per page of 5
+	ups := twoApps(t)
+	ups[grafanaUp] = newUpstreamWith(t, false, many, &sdk.ServerOptions{PageSize: 5}, pad, nil)
+	h := newHarness(t, vectorFile(t, nil), ups, nil)
+	cs := h.connect("alice", "2025-11-25", "", nil)
+	if ins := cs.InitializeResult().Instructions; !strings.Contains(ins, "Grafana is unavailable right now") {
+		t.Errorf("instructions %q", ins)
+	}
+	if n := ups[grafanaUp].lists.Load(); n == 0 || n >= 20 {
+		t.Errorf("grafana served %d of 20 pages", n)
+	}
+	if got := names(toolMap(t, cs)); !slices.Contains(got, "gitea__list_issues") {
+		t.Errorf("gitea lost: %v", got)
+	}
+
+	// The running total: each upstream under its own bound, together over.
+	maxUpstreamBytes, maxTotalBytes = 8<<20, 300_000
+	ups = map[string]*fakeUp{
+		giteaUp:   newUpstreamWith(t, false, many[:40], &sdk.ServerOptions{PageSize: 5}, pad, nil),
+		grafanaUp: newUpstreamWith(t, false, many[:40], &sdk.ServerOptions{PageSize: 5}, pad, nil),
+	}
+	h = newHarness(t, vectorFile(t, nil), ups, nil)
+	cs = h.connect("alice", "2025-11-25", "", nil)
+	if ins := cs.InitializeResult().Instructions; !strings.Contains(ins, "is unavailable right now") {
+		t.Errorf("total: instructions %q", ins)
+	}
+	if n := ups[giteaUp].lists.Load() + ups[grafanaUp].lists.Load(); n >= 16 {
+		t.Errorf("total: %d of 16 pages read", n)
+	}
+}
+
+// Item 2: a name the refresh drops while its upstream still admits the
+// person is unknown — never routed with the old table.
+func TestAggregateDroppedToolIsUnknown(t *testing.T) {
+	h := newHarness(t, vectorFile(t, nil), twoApps(t), nil)
+	cs := h.connect("alice", "2025-11-25", "", nil)
+	if _, ok := toolMap(t, cs)["gitea__list_issues"]; !ok {
+		t.Fatal("not listed")
+	}
+	h.ups[giteaUp].server.RemoveTools("list_issues")
+	h.sn.Store(snapshot(vectorFile(t, nil))) // a new snapshot: the call refreshes first
+	if r, err := cs.CallTool(ctx20(t), &sdk.CallToolParams{Name: "gitea__list_issues"}); err == nil && !r.IsError {
+		t.Errorf("answered %+v", r)
+	}
+	evs := h.eventList()
+	last := evs[len(evs)-1]
+	if last.Decision != "deny:unknown" || last.Resource != "https://mcp.example.com/mcp" {
+		t.Errorf("event %+v", last)
+	}
+	for _, e := range evs {
+		if e.Method == "tools/call" && e.Resource == "https://gitea.example.com/mcp" {
+			t.Errorf("routed to gitea: %+v", e)
+		}
+	}
+}
+
+// Item 3: a JSON-RPC error from the Hub is logged deny:upstream.
+func TestAggregateHubRPCError(t *testing.T) {
+	h := newHarness(t, vectorFile(t, nil), twoApps(t), nil)
+	cs := h.connect("alice", "2025-11-25", "", nil)
+	if _, err := cs.CallTool(ctx20(t), &sdk.CallToolParams{Name: "portcullis__my_apps", Arguments: map[string]any{"fail": true}}); err == nil {
+		t.Fatal("no error")
+	}
+	evs := h.eventList()
+	if last := evs[len(evs)-1]; last.Decision != "deny:upstream" || last.Resource != "https://people.example.com/mcp" || last.UpstreamStatus != 200 {
+		t.Errorf("event %+v", last)
+	}
+}
+
+// Item 4: a person's expiring time on one upstream: listed before, then
+// unlisted (the cached list dropped) and refused once now passes it.
+func TestAggregateExpiringPerUpstream(t *testing.T) {
+	var clock atomic.Int64
+	t0 := time.Now()
+	clock.Store(t0.UnixNano())
+	now := func() time.Time { return time.Unix(0, clock.Load()) }
+	at := t0.Add(30 * time.Second).UTC().Truncate(time.Second)
+	f := vectorFile(t, func(f *config.File) { resOf(f, "grafana").Expiring = map[string]config.Time{"alice": {Time: at}} })
+	h := newHarness(t, f, twoApps(t), func(c *Config) { c.Now = now })
+	cs := h.connect("alice", "2025-11-25", "", nil)
+	if _, ok := toolMap(t, cs)["grafana__search_dashboards"]; !ok {
+		t.Fatal("not listed before expiring")
+	}
+	clock.Store(at.Add(time.Second).UnixNano()) // within the 60 s cache, same snapshot
+	// The call first (its name still in the table): refused by grafana's
+	// own expiring, logged so.
+	if r, err := cs.CallTool(ctx20(t), &sdk.CallToolParams{Name: "grafana__search_dashboards"}); err == nil && !r.IsError {
+		t.Errorf("call allowed after expiring")
+	}
+	if c := h.ups[grafanaUp].callList(); len(c) != 0 {
+		t.Errorf("grafana called %v", c)
+	}
+	evs := h.eventList()
+	if last := evs[len(evs)-1]; last.Decision != "deny:population" || last.Resource != "https://grafana.example.com/mcp" {
+		t.Errorf("event %+v", last)
+	}
+	if _, ok := toolMap(t, cs)["grafana__search_dashboards"]; ok {
+		t.Errorf("still listed after expiring")
+	}
+}
+
+// Expiring alone (no call in between): the cached list is dropped when
+// the earliest expiring time passes.
+func TestAggregateExpiringDropsCachedList(t *testing.T) {
+	var clock atomic.Int64
+	t0 := time.Now()
+	clock.Store(t0.UnixNano())
+	at := t0.Add(30 * time.Second).UTC().Truncate(time.Second)
+	f := vectorFile(t, func(f *config.File) { resOf(f, "grafana").Expiring = map[string]config.Time{"alice": {Time: at}} })
+	h := newHarness(t, f, twoApps(t), func(c *Config) { c.Now = func() time.Time { return time.Unix(0, clock.Load()) } })
+	cs := h.connect("alice", "2025-11-25", "", nil)
+	if _, ok := toolMap(t, cs)["grafana__search_dashboards"]; !ok {
+		t.Fatal("not listed before expiring")
+	}
+	clock.Store(at.Add(time.Second).UnixNano())
+	if _, ok := toolMap(t, cs)["grafana__search_dashboards"]; ok {
+		t.Errorf("still listed after expiring")
+	}
+}
+
+// recordingHub records which (person, client) Hub sessions are dropped.
+type recordingHub struct {
+	Portcullis
+	mu    sync.Mutex
+	drops []string
+}
+
+func (r *recordingHub) DropClient(user, client string) {
+	r.mu.Lock()
+	r.drops = append(r.drops, user+"/"+client)
+	r.mu.Unlock()
+	r.Portcullis.DropClient(user, client)
+}
+
+// Item 7: an idle entry drops only its own (person, client) Hub sessions.
+func TestAggregateReconcileDropsByClient(t *testing.T) {
+	var clock atomic.Int64
+	clock.Store(time.Now().UnixNano())
+	now := func() time.Time { return time.Unix(0, clock.Load()) }
+	var rec *recordingHub
+	h := newHarness(t, vectorFile(t, nil), twoApps(t), func(c *Config) {
+		c.Now = now
+		rec = &recordingHub{Portcullis: c.Portcullis}
+		c.Portcullis = rec
+	})
+	h.connectAs("alice", "portcullis-ai-claude", "2026-07-28", "", nil)
+	gen := h.connectAs("alice", "portcullis-ai-generic", "2026-07-28", "", nil)
+	clock.Add(int64(11 * time.Minute))
+	toolMap(t, gen) // generic is in use again; claude stays idle
+	h.a.Reconcile()
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if !slices.Equal(rec.drops, []string{"alice/portcullis-ai-claude"}) {
+		t.Errorf("drops %v", rec.drops)
+	}
+}

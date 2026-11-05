@@ -36,6 +36,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -55,12 +56,17 @@ const (
 
 // Bounds on what one refresh takes from the upstreams.
 const (
-	maxPages           = 100     // list pages per upstream and kind
-	maxItems           = 1000    // tools / resources / prompts per upstream
-	maxUpstreamBytes   = 4 << 20 // encoded tool + resource + prompt definitions per upstream
-	maxTotalBytes      = 8 << 20 // ... for the whole aggregate
-	maxSessionsPerKey  = 16      // live downstream sessions per (person, LoA)
+	maxPages           = 100              // list pages per upstream and kind
+	maxItems           = 1000             // tools / resources / prompts per upstream
+	maxSessionsPerKey  = 16               // live downstream sessions per (person, LoA, client)
+	maxFanout          = config.MaxFanout // parallel upstream calls per request (§15.9)
 	maxResponseMessage = 1024
+)
+
+// Size bounds on one refresh (vars: tests lower them).
+var (
+	maxUpstreamBytes = 4 << 20 // encoded tool + resource + prompt definitions per upstream
+	maxTotalBytes    = 8 << 20 // ... for the whole aggregate
 )
 
 // The delegate tools are only on people.<d>/mcp, never here (G38).
@@ -78,7 +84,8 @@ type Forwarder interface {
 type Portcullis interface {
 	People(ctx context.Context, user, client, resource string) (*mcp.ClientSession, error)
 	Broken(user string, cs *mcp.ClientSession)
-	DropUser(user string)
+	// DropClient closes the person's Hub sessions of one AI client.
+	DropClient(user, client string)
 }
 
 // Limiter is the per-resource rate limit (limits.Limiter).
@@ -141,6 +148,7 @@ type entry struct {
 	stale     bool
 	sn        *config.Snapshot
 	builtAt   time.Time
+	expiresAt time.Time         // the earliest expiring time among its upstreams; zero = none
 	tools     Table             // aggregate name → (upstream URL, upstream name)
 	prompts   Table             // the same for prompts
 	resources map[string]Target // URI → (upstream URL, URI)
@@ -540,7 +548,9 @@ func (a *Aggregate) track(e *entry, ss *mcp.ServerSession) {
 func (a *Aggregate) fresh(e *entry, sn *config.Snapshot, forCall bool) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.built && !e.stale && e.sn == sn && (forCall || a.now().Sub(e.builtAt) < a.cfg.CacheTTL)
+	now := a.now()
+	return e.built && !e.stale && e.sn == sn && (forCall || now.Sub(e.builtAt) < a.cfg.CacheTTL) &&
+		(e.expiresAt.IsZero() || now.Before(e.expiresAt)) // an expiring membership drops the cached lists
 }
 
 // ensure refreshes the person's tables when they are missing, from another
@@ -590,9 +600,11 @@ func (a *Aggregate) refresh(ctx context.Context, e *entry, sn *config.Snapshot, 
 	if usable(sn) && sn.File.Limits.Fanout > 0 {
 		fan = sn.File.Limits.Fanout
 	}
+	fan = min(fan, maxFanout) // §15.9: at most 4, whatever the file says
 	lctx, cancel := context.WithTimeout(ctx, a.cfg.ListTimeout)
 	defer cancel()
 	results := make([]listing, len(ups))
+	var running atomic.Int64 // the running total of every upstream's pages
 	sem := make(chan struct{}, fan)
 	var wg sync.WaitGroup
 	for i, u := range ups {
@@ -607,7 +619,7 @@ func (a *Aggregate) refresh(ctx context.Context, e *entry, sn *config.Snapshot, 
 			}
 			defer func() { <-sem }()
 			done := make(chan listing, 1)
-			go func() { done <- a.list(lctx, u, req, id) }()
+			go func() { done <- a.list(lctx, u, req, id, &sizer{total: &running}) }()
 			select {
 			case l := <-done:
 				results[i] = l
@@ -707,6 +719,12 @@ func (a *Aggregate) refresh(ctx context.Context, e *entry, sn *config.Snapshot, 
 	e.tools, e.prompts, e.resources = tools, prompts, resources
 	e.down = down
 	e.sn, e.builtAt, e.built = sn, a.now(), true
+	e.expiresAt = time.Time{}
+	for _, u := range ups {
+		if at, ok := u.res.Expiring[e.key.user]; ok && (e.expiresAt.IsZero() || at.Before(e.expiresAt)) {
+			e.expiresAt = at.Time
+		}
+	}
 	// A refresh cut short by the person's own request leaves the tables
 	// usable but not cached.
 	e.stale = ctx.Err() != nil
@@ -871,9 +889,24 @@ func (a *Aggregate) event(id ident, req mcp.Request, u upstream, method, tool st
 	a.emit(ev)
 }
 
-func (a *Aggregate) list(ctx context.Context, u upstream, req mcp.Request, id ident) listing {
+// sizer bounds one upstream's listing as it is read, page by page: its
+// own encoded size (maxUpstreamBytes) and the refresh's running total
+// over every upstream (maxTotalBytes).
+type sizer struct {
+	own   int
+	total *atomic.Int64
+}
+
+func (s *sizer) add(v any) bool {
+	n := encodedSize(v)
+	s.own += n
+	t := s.total.Add(int64(n))
+	return s.own <= maxUpstreamBytes && t <= int64(maxTotalBytes)
+}
+
+func (a *Aggregate) list(ctx context.Context, u upstream, req mcp.Request, id ident, sz *sizer) listing {
 	if u.people {
-		return a.listPeople(ctx, u, req, id)
+		return a.listPeople(ctx, u, req, id, sz)
 	}
 	var l listing
 	via := bridge.Via{User: id.user, Bound: id.url}
@@ -896,6 +929,9 @@ func (a *Aggregate) list(ctx context.Context, u upstream, req mcp.Request, id id
 		if !ok {
 			return listing{err: errors.New("not a tools list")}
 		}
+		if !sz.add(lt.Tools) {
+			return listing{err: errTooBig}
+		}
 		l.tools = append(l.tools, lt.Tools...)
 		if lt.NextCursor == "" {
 			break
@@ -911,6 +947,9 @@ func (a *Aggregate) list(ctx context.Context, u upstream, req mcp.Request, id id
 		if err != nil || !ok {
 			break
 		}
+		if !sz.add(lr.Resources) {
+			return listing{err: errTooBig}
+		}
 		l.resources = append(l.resources, lr.Resources...)
 		if lr.NextCursor == "" {
 			break
@@ -923,6 +962,9 @@ func (a *Aggregate) list(ctx context.Context, u upstream, req mcp.Request, id id
 		lp, ok := r.(*mcp.ListPromptsResult)
 		if err != nil || !ok {
 			break
+		}
+		if !sz.add(lp.Prompts) {
+			return listing{err: errTooBig}
 		}
 		l.prompts = append(l.prompts, lp.Prompts...)
 		if lp.NextCursor == "" {
@@ -942,7 +984,7 @@ func capItems[T any](s []T) []T {
 	return s
 }
 
-func (a *Aggregate) listPeople(ctx context.Context, u upstream, req mcp.Request, id ident) listing {
+func (a *Aggregate) listPeople(ctx context.Context, u upstream, req mcp.Request, id ident, sz *sizer) listing {
 	dctx, cancel := detach(ctx)
 	defer cancel()
 	start := a.now()
@@ -969,6 +1011,9 @@ func (a *Aggregate) listPeople(ctx context.Context, u upstream, req mcp.Request,
 			return listing{err: err}
 		}
 		a.event(id, req, u, mcp.MethodListTools, "", nil, "allow", 200, start)
+		if !sz.add(r.Tools) {
+			return listing{err: errTooBig}
+		}
 		for _, t := range r.Tools {
 			if t != nil && bridge.ValidToolName(t.Name) && !isDelegate(t.Name) {
 				l.tools = append(l.tools, t)
@@ -984,6 +1029,9 @@ func (a *Aggregate) listPeople(ctx context.Context, u upstream, req mcp.Request,
 		start := a.now()
 		if r, err := cs.ListResources(dctx, &mcp.ListResourcesParams{}); err == nil {
 			a.event(id, req, u, mcp.MethodListResources, "", nil, "allow", 200, start)
+			if !sz.add(r.Resources) {
+				return listing{err: errTooBig}
+			}
 			l.resources = capItems(r.Resources)
 		}
 	}
@@ -991,6 +1039,9 @@ func (a *Aggregate) listPeople(ctx context.Context, u upstream, req mcp.Request,
 		start := a.now()
 		if r, err := cs.ListPrompts(dctx, &mcp.ListPromptsParams{}); err == nil {
 			a.event(id, req, u, mcp.MethodListPrompts, "", nil, "allow", 200, start)
+			if !sz.add(r.Prompts) {
+				return listing{err: errTooBig}
+			}
 			l.prompts = capItems(r.Prompts)
 		}
 	}
@@ -1052,7 +1103,11 @@ func (a *Aggregate) route(ctx context.Context, e *entry, method string, req mcp.
 	a.ensure(ctx, e, req, id, true)
 	t, found := lookup()
 	if !found && hadBefore {
-		t, found = before, true // admit below refuses it, with its reason
+		// Logged with the old upstream's reason only when that upstream
+		// refuses the person now; otherwise the name is simply gone.
+		if _, reason := a.admit(byURL(a.cfg.Snapshot(), before.URL), e.key); reason != "" {
+			t, found = before, true // refused below, with its reason
+		}
 	}
 	if !found {
 		// Logged on the aggregate itself: no upstream was chosen.
@@ -1168,7 +1223,9 @@ func (a *Aggregate) people(ctx context.Context, req mcp.Request, method string, 
 	if err != nil {
 		var re *mcp.RPCError
 		if errors.As(err, &re) {
-			a.event(id, req, u, method, toolOf(method, name), args, "allow", 200, start)
+			// The Hub answered, with an error: passed on, logged as a
+			// failure of the upstream.
+			a.event(id, req, u, method, toolOf(method, name), args, "deny:upstream", 200, start)
 			return nil, rpcError(re.Code, re.Message)
 		}
 		a.event(id, req, u, method, toolOf(method, name), args, "deny:upstream", 502, start)
@@ -1184,24 +1241,6 @@ func (a *Aggregate) unavailable(method string, u upstream) (mcp.Result, error) {
 }
 
 // ---- keeping in line with the snapshot ----
-
-// Invalidate marks the person's tables stale: the next list refreshes
-// them (population or configuration change).
-func (a *Aggregate) Invalidate(user string) {
-	a.mu.Lock()
-	var es []*entry
-	for k, e := range a.entries {
-		if k.user == user {
-			es = append(es, e)
-		}
-	}
-	a.mu.Unlock()
-	for _, e := range es {
-		e.mu.Lock()
-		e.stale = true
-		e.mu.Unlock()
-	}
-}
 
 // Reconcile applies the current snapshot to every person at once: someone
 // no longer in the aggregate's population loses their sessions; every
@@ -1231,7 +1270,7 @@ func (a *Aggregate) Reconcile() {
 	for _, e := range drop {
 		a.closeEntry(e)
 		if a.cfg.Portcullis != nil {
-			a.cfg.Portcullis.DropUser(e.key.user)
+			a.cfg.Portcullis.DropClient(e.key.user, e.key.client)
 		}
 	}
 	for _, e := range keep {
