@@ -124,7 +124,9 @@ type claims struct {
 	Iat               *jwt.NumericDate `json:"iat"`
 }
 
-var rawUsername = regexp.MustCompile(`^[A-Za-z0-9._@+-]+$`)
+// rawUsername: the token's preferred_username before lowercasing — the
+// Hub's pattern with ASCII upper case allowed (config.ValidUsername after).
+var rawUsername = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 var compactJWS = regexp.MustCompile(`^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$`)
 

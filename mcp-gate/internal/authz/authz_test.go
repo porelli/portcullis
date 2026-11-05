@@ -463,11 +463,20 @@ func TestUsernameASCIIOnly(t *testing.T) {
 		"bok\u0000": 403,
 		"bo k":      403,
 		"":          403,
+		// The Hub's lldap.ValidUsername: ^[a-z0-9][a-z0-9._-]{0,63}$.
+		"a@b":                   403,
+		"a+b":                   403,
+		".bok":                  403,
+		"-bok":                  403,
+		strings.Repeat("a", 65): 403,
 	} {
 		tok := signer{rsaKey, "k1", jose.RS256}.sign(t, with(baseClaims(now), "preferred_username", user))
 		d := v.Check(context.Background(), sn, Request{Host: "gitea.example.com", Path: "/mcp", Authorization: "Bearer " + tok, Now: now})
 		if d.Status != want {
 			t.Errorf("%q: %d %s, want %d", user, d.Status, d.Reason, want)
+		}
+		if want == 403 && d.User != "" {
+			t.Errorf("%q: accepted as user %q", user, d.User)
 		}
 	}
 }

@@ -77,6 +77,11 @@ func TestStrictDecodeRefuses(t *testing.T) {
 		"uppercase user":           {"\"population\": [\n        \"alice\",\n        \"bob\"\n      ],", "\"population\": [\n        \"Alice\",\n        \"bob\"\n      ],"},
 		"Kelvin sign user":         {"\"population\": [\n        \"alice\"\n      ],\n      \"expiring\": {},\n      \"people\"", "\"population\": [\n        \"alice\",\n        \"\u212aim\"\n      ],\n      \"expiring\": {},\n      \"people\""},
 		"non-ASCII user":           {"\"population\": [\n        \"alice\"\n      ],\n      \"expiring\": {},\n      \"people\"", "\"population\": [\n        \"alice\",\n        \"b\u00f6b\"\n      ],\n      \"expiring\": {},\n      \"people\""},
+		"user with @":              {"\"population\": [\n        \"alice\"\n      ],\n      \"expiring\": {},\n      \"people\"", "\"population\": [\n        \"alice\",\n        \"b@b\"\n      ],\n      \"expiring\": {},\n      \"people\""},
+		"user with +":              {"\"population\": [\n        \"alice\"\n      ],\n      \"expiring\": {},\n      \"people\"", "\"population\": [\n        \"alice\",\n        \"b+b\"\n      ],\n      \"expiring\": {},\n      \"people\""},
+		"user leading .":           {"\"population\": [\n        \"alice\"\n      ],\n      \"expiring\": {},\n      \"people\"", "\"population\": [\n        \"alice\",\n        \".bob\"\n      ],\n      \"expiring\": {},\n      \"people\""},
+		"user leading -":           {"\"population\": [\n        \"alice\"\n      ],\n      \"expiring\": {},\n      \"people\"", "\"population\": [\n        \"alice\",\n        \"-bob\"\n      ],\n      \"expiring\": {},\n      \"people\""},
+		"user 65 chars":            {"\"population\": [\n        \"alice\"\n      ],\n      \"expiring\": {},\n      \"people\"", "\"population\": [\n        \"alice\",\n        \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"\n      ],\n      \"expiring\": {},\n      \"people\""},
 		"expiring not UTC":         {`"bob": "2027-03-31T23:59:59Z"`, `"bob": "2027-03-31T23:59:59+02:00"`},
 		"expiring outside pop":     {`"bob": "2027-03-31T23:59:59Z"`, `"zed": "2027-03-31T23:59:59Z"`},
 		"people on app_token":      {`"expiring": {` + "\n        \"bob\"", `"people": {}, "expiring": {` + "\n        \"bob\""},
@@ -489,5 +494,16 @@ func TestAttributes(t *testing.T) {
 	s.poll()
 	if sn := s.Snapshot(); sn.Attrs == nil || len(sn.Attrs.Headers("gitea.example.com", "alice")) != 2 {
 		t.Error("attributes not loaded")
+	}
+}
+
+func TestValidUsernameMatchesHub(t *testing.T) {
+	for u, want := range map[string]bool{
+		"alice": true, "a.b-c_d": true, "0x": true, strings.Repeat("a", 64): true,
+		strings.Repeat("a", 65): false, "a@b": false, "a+b": false, ".a": false, "-a": false, "_a": false, "Alice": false, "": false,
+	} {
+		if got := ValidUsername(u); got != want {
+			t.Errorf("%q: %v, want %v", u, got, want)
+		}
 	}
 }

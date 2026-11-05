@@ -286,10 +286,12 @@ func hasControl(s string) bool {
 	return strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f })
 }
 
-// usernameR: lowercase ASCII LLDAP usernames only. Matching after
-// lowercasing isn't enough: strings.ToLower maps non-ASCII letters (the
-// Kelvin sign U+212A) onto ASCII ones.
-var usernameR = regexp.MustCompile(`^[a-z0-9._@+-]+$`)
+// usernameR is exactly the Hub's lldap.ValidUsername (hub
+// internal/lldap/validate.go): lowercase ASCII. Matching after
+// lowercasing alone isn't enough: strings.ToLower maps non-ASCII letters
+// (the Kelvin sign U+212A) onto ASCII ones, so tokens are also checked
+// before lowercasing (authz).
+var usernameR = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 
 // ValidUsername: a lowercase ASCII username (the population's form).
 func ValidUsername(s string) bool { return usernameR.MatchString(s) }
