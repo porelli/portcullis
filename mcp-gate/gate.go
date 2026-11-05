@@ -196,6 +196,13 @@ func (a *activity) write(l accesslog.Line, low bool) {
 	_ = err // counted by the log; Healthy() turns false when it matters (G28)
 }
 
+// refused writes the line of a request the handler refused: always low
+// priority (≤ 50/s, never the half of the queue kept for the lines of
+// requests that were let through), whoever sent it.
+func (a *activity) refused(ri reqInfo, decision string) {
+	a.write(a.line(ri, decision), true)
+}
+
 // event is the bridge's OnEvent.
 func (a *activity) event(ev bridge.Event) {
 	if ev.RequestID != "" {

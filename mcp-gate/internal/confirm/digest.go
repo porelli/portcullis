@@ -1,37 +1,27 @@
 package confirm
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"unicode/utf8"
+	"errors"
 
-	"github.com/gowebpki/jcs"
+	"github.com/portcullis/mcp-gate/internal/canon"
 )
 
-// maxPreview bounds args_preview (§15.7).
+// maxPreview bounds args_preview (§15.7). Longer arguments are never
+// confirmed: a truncated preview would hide what the person approves.
 const maxPreview = 4 << 10
 
-// canonical is the RFC 8785 canonical JSON of tools/call arguments;
-// absent or null arguments are {} (§15.6).
-func canonical(args json.RawMessage) ([]byte, error) {
-	t := bytes.TrimSpace(args)
-	if len(t) == 0 || bytes.Equal(t, []byte("null")) {
-		return []byte("{}"), nil
-	}
-	c, err := jcs.Transform(t)
-	if err != nil {
-		return nil, fmt.Errorf("arguments are not canonicalisable JSON")
-	}
-	return c, nil
-}
+// ErrTooLong: the canonical arguments don't fit the preview.
+var ErrTooLong = errors.New("these arguments are too long to confirm safely")
 
 // ArgsDigest is args_sha256: the lowercase hex SHA-256 of the arguments'
-// RFC 8785 canonical JSON (gowebpki/jcs); absent / null = "{}".
+// RFC 8785 canonical JSON (canon.Arguments — the same bytes the bridge
+// forwards); absent / null = "{}". Arguments that can't round-trip are an
+// error.
 func ArgsDigest(args json.RawMessage) (string, error) {
-	c, err := canonical(args)
+	c, err := canon.Arguments(args)
 	if err != nil {
 		return "", err
 	}
@@ -39,19 +29,16 @@ func ArgsDigest(args json.RawMessage) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// Preview is args_preview: the canonical JSON clipped to 4 KiB on a rune
-// boundary. It goes only to the Hub (which shows it on the confirmation
-// page, escaped); never to a log.
+// Preview is args_preview: the whole canonical JSON (≤ 4 KiB), else
+// ErrTooLong — never clipped. It goes only to the Hub (which shows it on
+// the confirmation page, escaped); never to a log.
 func Preview(args json.RawMessage) (string, error) {
-	c, err := canonical(args)
+	c, err := canon.Arguments(args)
 	if err != nil {
 		return "", err
 	}
 	if len(c) > maxPreview {
-		c = c[:maxPreview]
-		for len(c) > 0 && !utf8.Valid(c) {
-			c = c[:len(c)-1]
-		}
+		return "", ErrTooLong
 	}
 	return string(c), nil
 }

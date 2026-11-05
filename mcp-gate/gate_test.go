@@ -612,3 +612,72 @@ func testDeps(t *testing.T, sn *config.Snapshot) *handlerDeps {
 	act.log, act.healthy = l, l.Healthy
 	return &handlerDeps{lim: limits.New(nil, nil), act: act}
 }
+
+// Review fix 3: refused requests — signed-in or not — only ever take the
+// low-priority half of the log queue, so a flood of them can't push an
+// allowed tools/call's line out (or make it unloggable, G28).
+func TestRefusalFloodKeepsRoomForCalls(t *testing.T) {
+	sig := newSigner(t)
+	sn := vectorSnapshot(t)
+	release := make(chan struct{})
+	act := &activity{snap: func() *config.Snapshot { return sn }}
+	path := filepath.Join(t.TempDir(), "access.jsonl")
+	l, err := accesslog.OpenWith(path, accesslog.Options{
+		Group: os.Getgid(), Secrets: act.secrets, QueueSize: 16,
+		WriteHook: func() error { <-release; return nil }, // the writer is stalled
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+		_ = l.Close()
+	}()
+	act.log, act.healthy = l, l.Healthy
+	fw := &recordingForwarder{}
+	h := newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", sig.jwks.URL, sig.jwks.Client()), fw,
+		&handlerDeps{lim: limits.New(nil, nil), act: act})
+	do := func(tok, body string) int {
+		r := httptest.NewRequest("POST", "/mcp", strings.NewReader(body))
+		r.Host = "gitea.example.com"
+		r.Header.Set("Authorization", "Bearer "+tok)
+		r.Header.Set("MCP-Protocol-Version", "2025-11-25")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	call := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_issues","arguments":{}}}`
+	// bob is signed in, but his token is for another resource's scope:
+	// valid, refused (403), with a user.
+	bad := sig.token("bob", giteaURL, "mcp:grafana.grafana")
+	for i := 0; i < 40; i++ {
+		if c := do(bad, call); c != 403 {
+			t.Fatalf("refusal %d: %d", i, c)
+		}
+	}
+	// A signed-in person's rate-limited and malformed requests are
+	// refusals too.
+	good := sig.token("alice", giteaURL, "mcp:gitea.gitea")
+	for i := 0; i < 10; i++ {
+		_ = do(good, `{not json`)
+	}
+	if !act.healthy() {
+		t.Fatal("refusals made the log unhealthy")
+	}
+	if c := do(good, call); c != 299 {
+		t.Fatalf("allowed call: %d", c)
+	}
+	close(release)
+	released = true
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = l.Flush(ctx)
+	b, _ := os.ReadFile(path)
+	if !strings.Contains(string(b), `"user":"alice","client":"portcullis-ai-claude","resource":"https://gitea.example.com/mcp","instance":"gitea","companion":"gitea","via":"direct","method":"tools/call","tool":"list_issues"`) ||
+		!strings.Contains(string(b), `"decision":"allow"`) {
+		t.Errorf("the allowed call's line is missing:\n%s", b)
+	}
+}

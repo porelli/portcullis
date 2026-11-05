@@ -7,7 +7,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/portcullis/mcp-gate/internal/bridge"
 	"github.com/portcullis/mcp-gate/internal/config"
@@ -59,10 +58,10 @@ func TestPreview(t *testing.T) {
 	if p, _ := Preview(nil); p != "{}" {
 		t.Errorf("nil: %q", p)
 	}
+	// Never truncated: too long is an error (review fix 2).
 	long := `{"a":"` + strings.Repeat("é", 3000) + `"}`
-	p, err = Preview(json.RawMessage(long))
-	if err != nil || len(p) > 4096 || len(p) < 4090 || !utf8.ValidString(p) {
-		t.Errorf("clipped: %d bytes, valid %v, %v", len(p), utf8.ValidString(p), err)
+	if p, err = Preview(json.RawMessage(long)); err == nil {
+		t.Errorf("clipped preview %d bytes", len(p))
 	}
 }
 
@@ -251,5 +250,29 @@ func TestConfirmRateLimit(t *testing.T) {
 	out, err = g.Before(ctx, c)
 	if err != nil || out.Proceed || out.Decision != "deny:population" || !out.Answer.IsError {
 		t.Errorf("not allowed: %+v %v", out, err)
+	}
+}
+
+// Review fix 2: arguments whose canonical form exceeds the preview are
+// never confirmed with a truncated preview: the call fails, the Hub is
+// never asked.
+func TestConfirmTooLong(t *testing.T) {
+	g, h, _, c := setup(t)
+	c.Args = json.RawMessage(`{"a":"` + strings.Repeat("x", 4090) + `"}`)
+	out, err := g.Before(context.Background(), c)
+	if err != nil || out.Proceed || text(out.Answer) != "these arguments are too long to confirm safely" || !out.Answer.IsError || out.Decision != "deny:too_long" {
+		t.Fatalf("%+v %v", out, err)
+	}
+	if len(h.creates) != 0 || len(h.consumes) != 0 {
+		t.Error("the Hub was asked")
+	}
+	// Exactly 4096 bytes is fine and is the whole preview.
+	c.Args = json.RawMessage(`{"a":"` + strings.Repeat("x", 4096-8) + `"}`)
+	out, err = g.Before(context.Background(), c)
+	if err != nil || len(h.creates) != 1 || len(h.creates[0].ArgsPreview) != 4096 {
+		t.Fatalf("4096: %+v %v", out, err)
+	}
+	if _, err := Preview(json.RawMessage(`{"a":"` + strings.Repeat("x", 5000) + `"}`)); err == nil {
+		t.Error("Preview clipped instead of refusing")
 	}
 }

@@ -66,6 +66,15 @@ func (g *Gate) Before(ctx context.Context, c bridge.Call) (bridge.Outcome, error
 	if err != nil {
 		return bridge.Outcome{}, err
 	}
+	// The whole canonical arguments must fit the preview the person
+	// approves; checked before the Hub is asked at all.
+	preview, err := Preview(c.Args)
+	if errors.Is(err, ErrTooLong) {
+		return bridge.Outcome{Answer: isError(ErrTooLong.Error()), Decision: "deny:too_long"}, nil
+	}
+	if err != nil {
+		return bridge.Outcome{}, err
+	}
 	_, state, err := g.Hub.ConsumeConfirmation(ctx, hubapi.ConsumeRequest{User: c.User, Resource: c.Resource.URL, Tool: c.Tool, ArgsSHA256: digest})
 	if err != nil {
 		return bridge.Outcome{}, err
@@ -83,10 +92,6 @@ func (g *Gate) Before(ctx context.Context, c bridge.Call) (bridge.Outcome, error
 	}
 	if g.Limits != nil && !g.Limits.AllowConfirm(c.User) {
 		return bridge.Outcome{Answer: isError(textTooMany), Decision: "rate_limited"}, nil
-	}
-	preview, err := Preview(c.Args)
-	if err != nil {
-		return bridge.Outcome{}, err
 	}
 	conf, err := g.Hub.CreateConfirmation(ctx, hubapi.ConfirmRequest{
 		User: c.User, Client: c.Client, Resource: c.Resource.URL, Tool: c.Tool,

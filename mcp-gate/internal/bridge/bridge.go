@@ -27,6 +27,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/portcullis/mcp-gate/internal/authz"
+	"github.com/portcullis/mcp-gate/internal/canon"
 	"github.com/portcullis/mcp-gate/internal/config"
 	mcp "github.com/portcullis/mcp-gate/internal/mcpsdk"
 )
@@ -610,6 +611,19 @@ func (b *Bridge) forward(ctx context.Context, k key, method string, req mcp.Requ
 				return nil, rpcError(mcp.CodeInvalidParams, "Portcullis passes only elicitation answers to "+r.Label)
 			}
 		}
+		// The one form of the arguments from here on (security review):
+		// the canonical bytes are what is checked, hashed, confirmed,
+		// logged and forwarded. Arguments that can't round-trip are
+		// refused.
+		c, cerr := canon.Arguments(call.Arguments)
+		if cerr != nil {
+			ev.Decision = "deny:bad_arguments"
+			return nil, rpcError(mcp.CodeInvalidParams, refusal("bad_arguments", call.Name, r.Label))
+		}
+		cp := *call
+		cp.Arguments = c
+		call = &cp
+		ev.Args = c
 		allow, _, reason := CallDecision(r, call.Name, call.Arguments, nil)
 		if !allow {
 			ev.Decision = "deny:" + reason
@@ -658,7 +672,7 @@ func refusal(reason, tool, label string) string {
 	case "bad_tool":
 		return "not a tool name Portcullis passes on"
 	}
-	return "arguments Portcullis can't check (they must be one JSON object without repeated keys)"
+	return "arguments Portcullis can't check (they must be one JSON object without repeated keys, with numbers that keep their exact value)"
 }
 
 // failure words an error for the person and the log.

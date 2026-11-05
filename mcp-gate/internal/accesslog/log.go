@@ -113,6 +113,9 @@ type Options struct {
 	// the hub secret). Called per line; keep it cheap.
 	Secrets func() []string
 	Now     func() time.Time
+	// WriteHook (tests only) runs before each write, under the file lock;
+	// an error fails that write, blocking stalls the writer.
+	WriteHook func() error
 }
 
 // Log is the access log. Safe for concurrent use.
@@ -185,6 +188,8 @@ func OpenWith(path string, o Options) (*Log, error) {
 		q:    make(chan []byte, o.QueueSize),
 		low:  rate.NewLimiter(lowPerSecond, lowPerSecond),
 		stop: make(chan struct{}),
+
+		writeHook: o.WriteHook,
 	}
 	f, err := l.openFile()
 	if err != nil {
@@ -291,9 +296,9 @@ func (l *Log) Write(ln Line) error {
 	}
 }
 
-// WriteLow queues a line of a request refused without a valid token: at
+// WriteLow queues the line of a refused request (signed in or not): at
 // most 50 per second and never into the second half of the queue, so
-// unauthenticated traffic can't make tools/call unloggable. It never
+// a flood of refusals can't make tools/call unloggable. It never
 // waits.
 func (l *Log) WriteLow(ln Line) error {
 	if l.closed.Load() {

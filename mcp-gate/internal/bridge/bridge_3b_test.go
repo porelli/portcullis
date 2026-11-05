@@ -1,11 +1,16 @@
 package bridge
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+
+	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // Task 3b: the confirmer's decision (confirm:<id>, rate_limited, deny:…)
@@ -94,5 +99,65 @@ func TestEventRequestID(t *testing.T) {
 		if hd.Get(RequestIDHeader) != "" {
 			t.Fatal("the request id reached the upstream")
 		}
+	}
+}
+
+// Review fix 1: the upstream gets exactly the canonical bytes the gate
+// hashed; arguments that can't round-trip are refused before anything.
+func TestForwardsCanonicalArguments(t *testing.T) {
+	var mu sync.Mutex
+	var got []string
+	extra := func(u *upstream, s *sdk.Server) {
+		s.AddTool(&sdk.Tool{Name: "echo_args", InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, req *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+			mu.Lock()
+			got = append(got, string(req.Params.Arguments))
+			mu.Unlock()
+			return textResult("ok"), nil
+		})
+	}
+	up := newUpstream(t, nil, extra)
+	fc := &fakeConfirmer{ok: true}
+	h := newHarness(t, baseSnapshot(t, nil), map[string]*upstream{giteaUp: up}, func(c *Config) { c.Confirm = fc })
+	cs, _ := h.connect("alice", clientOpts{version: "2025-11-25"})
+	for _, raw := range []string{`{"b":1.0,"a":"x","n":1e2}`, `{"n":100,"a":"x","b":1}`, `{"h":"<a&b>"}`} {
+		if r, err := call(t, cs, "echo_args", json.RawMessage(raw)); err != nil || r.IsError {
+			t.Fatalf("%s: %v %v", raw, r, err)
+		}
+	}
+	// A confirmed call: the confirmer sees the same canonical bytes.
+	if r, err := call(t, cs, "delete_repo", json.RawMessage(`{"z":1, "a":2.0}`)); err != nil || r.IsError {
+		t.Fatalf("delete_repo: %v %v", r, err)
+	}
+	mu.Lock()
+	if len(got) != 3 || got[0] != `{"a":"x","b":1,"n":100}` || got[1] != got[0] || got[2] != `{"h":"<a&b>"}` {
+		t.Errorf("upstream got %q", got)
+	}
+	mu.Unlock()
+	fc.mu.Lock()
+	if len(fc.calls) != 1 || string(fc.calls[0].Args) != `{"a":2,"z":1}` {
+		t.Errorf("confirmer got %+v", fc.calls)
+	}
+	fc.mu.Unlock()
+	for _, e := range h.eventList() {
+		if e.Tool == "echo_args" && string(e.Args) != `{"a":"x","b":1,"n":100}` && string(e.Args) != `{"h":"<a&b>"}` {
+			t.Errorf("event args %s", e.Args)
+		}
+	}
+	// U+2028 / U+2029 would be re-escaped by the encoder (not the hashed
+	// bytes): refused like precision loss.
+	if _, err := call(t, cs, "echo_args", json.RawMessage(`{"h":"\u2028"}`)); err == nil {
+		t.Error("U+2028 accepted")
+	}
+	// Precision loss → bad_arguments, never forwarded.
+	if _, err := call(t, cs, "echo_args", json.RawMessage(`{"id":12345678901234567890}`)); err == nil {
+		t.Error("a big integer was accepted")
+	}
+	mu.Lock()
+	if len(got) != 3 {
+		t.Errorf("forwarded %q", got)
+	}
+	mu.Unlock()
+	if d := h.decisions("tools/call"); d[len(d)-1] != "deny:bad_arguments" {
+		t.Errorf("decisions %v", d)
 	}
 }

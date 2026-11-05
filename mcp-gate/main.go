@@ -241,9 +241,9 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 		ri.d = d
 		if !d.Allowed() {
 			refuse(w, r, d)
-			// Without a valid token: low priority, so floods can't fill
-			// the queue and make tools/call unloggable.
-			deps.act.write(deps.act.line(ri, "deny:"+d.Reason), d.User == "")
+			// Every refusal is low priority (signed in or not): a flood of
+			// them can't fill the queue and make tools/call unloggable.
+			deps.act.refused(ri, "deny:"+d.Reason)
 			return
 		}
 		max := sn.File.Limits.MaxRequestBytes
@@ -255,23 +255,23 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
 				http.Error(w, "request body too slow", http.StatusRequestTimeout)
-				deps.act.write(deps.act.line(ri, "deny:body_timeout"), false)
+				deps.act.refused(ri, "deny:body_timeout")
 				return
 			}
 			http.Error(w, "cannot read the request", http.StatusBadRequest)
-			deps.act.write(deps.act.line(ri, "deny:protocol"), false)
+			deps.act.refused(ri, "deny:protocol")
 			return
 		}
 		if int64(len(body)) > max {
 			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
-			deps.act.write(deps.act.line(ri, "deny:too_large"), false)
+			deps.act.refused(ri, "deny:too_large")
 			return
 		}
 		if _, perr := authz.CheckProtocol(r.Header, body); perr != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(perr.Status)
 			fmt.Fprintf(w, `{"jsonrpc":"2.0","id":null,"error":{"code":%d,"message":%q}}`, perr.Code, perr.Msg)
-			deps.act.write(deps.act.line(ri, "deny:protocol"), false)
+			deps.act.refused(ri, "deny:protocol")
 			return
 		}
 		ri.method, ri.tool, ri.args = parseCall(body)
@@ -280,13 +280,13 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 		// and the lists go on.
 		if toolCall && !deps.act.healthy() {
 			http.Error(w, "AI activity can't be logged right now", http.StatusServiceUnavailable)
-			deps.act.write(deps.act.line(ri, "deny:unloggable"), false)
+			deps.act.refused(ri, "deny:unloggable")
 			return
 		}
 		if ok, wait := deps.lim.Allow(d.User, d.Resource.URL, toolCall); !ok {
 			w.Header().Set("Retry-After", retryAfter(wait))
 			http.Error(w, "too many requests; try again later", http.StatusTooManyRequests)
-			deps.act.write(deps.act.line(ri, "rate_limited"), false)
+			deps.act.refused(ri, "rate_limited")
 			return
 		}
 		if fwd != nil && d.Resource.Kind == config.KindCompanion {
@@ -297,7 +297,11 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 			sw := &statusWriter{ResponseWriter: w}
 			fwd.ServeResource(sw, r, d)
 			if !done() {
-				deps.act.write(deps.act.line(ri, fallbackDecision(sw.status)), false)
+				if dec := fallbackDecision(sw.status); dec == "allow" {
+					deps.act.write(deps.act.line(ri, dec), false)
+				} else {
+					deps.act.refused(ri, dec)
+				}
 			}
 			return
 		}
@@ -306,7 +310,7 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 		// without its upstream.
 		log.Printf("mcp-gate: %s %s%q user=%q client=%q allow (no forwarding yet)", r.Method, d.Resource.Host, d.Resource.Path(), d.User, d.Client)
 		http.Error(w, "MCP forwarding is not available in this build", http.StatusServiceUnavailable)
-		deps.act.write(deps.act.line(ri, "deny:unavailable"), false)
+		deps.act.refused(ri, "deny:unavailable")
 	})
 }
 
