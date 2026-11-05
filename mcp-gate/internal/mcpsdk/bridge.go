@@ -79,6 +79,7 @@ type (
 
 // Method names and error codes the bridge uses.
 const (
+	MethodInitialize            = "initialize"
 	MethodListTools             = "tools/list"
 	MethodCallTool              = "tools/call"
 	MethodListResources         = "resources/list"

@@ -118,11 +118,43 @@ func TestToolFilter(t *testing.T) {
 		{rw, "bad:name", `{}`, false, false, "bad_tool"},
 		{rw, "", `{}`, false, false, "bad_tool"},
 		{rw, strings.Repeat("a", 129), `{}`, false, false, "bad_tool"},
+		// Fix round 1: a method outside ^[A-Za-z0-9_.-]{1,64}$ takes the
+		// strict path like a non-string.
+		{rw, "repo_write", `{"method":""}`, false, false, "never"},
+		{rw, "repo_write", `{"method":"read "}`, false, false, "never"},
+		{rw, "repo_write", `{"method":"de\u006cete\n"}`, false, false, "never"},
+		{rw, "repo_write", `{"method":"réad"}`, false, false, "never"},
+		{rw, "repo_write", `{"method":"` + strings.Repeat("a", 65) + `"}`, false, false, "never"},
+		{rw, "repo_write", `{"method":"` + strings.Repeat("a", 64) + `"}`, true, false, "allow"},
+		{rw, "repo_write", `{"method":"read.v2-x_y"}`, true, false, "allow"},
 	} {
 		allow, confirm, reason := call(c.res, c.tool, c.args, nil)
 		if allow != c.allow || confirm != c.confrm || reason != c.reason {
 			t.Errorf("%s %s %s: got (%v, %v, %q), want (%v, %v, %q)", c.res.Mode, c.tool, c.args, allow, confirm, reason, c.allow, c.confrm, c.reason)
 		}
+	}
+}
+
+// Fix round 1: a "*" method pattern also matches a missing or empty method.
+func TestStarMethodMatchesMissing(t *testing.T) {
+	res := policyRes("read_write", nil, nil, []string{"x:*"})
+	for _, args := range []string{`{}`, ``, `null`, `{"method":""}`, `{"method":"get"}`, `{"other":1}`} {
+		var raw json.RawMessage
+		if args != "" {
+			raw = json.RawMessage(args)
+		}
+		if allow, _, reason := CallDecision(res, "x", raw, nil); allow || reason != "never" {
+			t.Errorf("x:* against %s: allowed (%s)", args, reason)
+		}
+	}
+	if !Match("x:*", "x", "") || !Match("x:*", "X", "") {
+		t.Error("Match(x:*, x, \"\") is false")
+	}
+	if Match("x:get", "x", "") {
+		t.Error("a literal method matched a missing one")
+	}
+	if allow, _, _ := CallDecision(res, "y", json.RawMessage(`{}`), nil); !allow {
+		t.Error("x:* refused another tool")
 	}
 }
 

@@ -61,13 +61,20 @@ func Match(pattern, tool, method string) bool {
 	if !hasMethod {
 		return true
 	}
-	return method != "" && glob(pm, fold(method))
+	// "*" also matches a missing or empty method (fix round 1); a literal
+	// method never matches one.
+	return glob(pm, fold(method))
 }
+
+// methodR: a method value the policy reads literally. Anything else (not a
+// string, empty, spaces, escapes, non-ASCII, over 64) takes the strict
+// path: it matches every tool:method pattern of the tool.
+var methodR = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
 
 // argInfo is what the policy reads from a call's arguments.
 type argInfo struct {
-	methods []string // string values of every key folding to "method"
-	unknown bool     // such a key holds something else: counts as matching
+	methods []string // values of every key folding to "method", each matching methodR
+	unknown bool     // such a key holds anything else: counts as matching
 }
 
 func (a argInfo) match(pattern, tool string) bool {
@@ -80,6 +87,9 @@ func (a argInfo) match(pattern, tool string) bool {
 	}
 	if a.unknown {
 		return true // fail closed: every list makes the call stricter
+	}
+	if len(a.methods) == 0 {
+		return Match(pattern, tool, "") // no method: only "*" matches
 	}
 	for _, m := range a.methods {
 		if Match(pattern, tool, m) {
@@ -162,7 +172,7 @@ func checkValue(dec *json.Decoder, depth int, info *argInfo) error {
 					return err
 				}
 				var s string
-				if len(v) > 0 && v[0] == '"' && json.Unmarshal(v, &s) == nil {
+				if len(v) > 0 && v[0] == '"' && json.Unmarshal(v, &s) == nil && methodR.MatchString(s) {
 					info.methods = append(info.methods, s)
 				} else {
 					info.unknown = true

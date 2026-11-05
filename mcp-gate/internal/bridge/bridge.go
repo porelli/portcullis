@@ -19,6 +19,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -95,6 +96,7 @@ type Bridge struct {
 	pooled   map[key]*link                // sessionless clients + Upstream
 	sessions map[*mcp.ServerSession]*link // one per downstream session
 	owners   map[*mcp.ServerSession]key   // for DropUser
+	order    map[key][]*mcp.ServerSession // live downstream sessions per key, oldest first
 	lastSn   *config.Snapshot
 	warned   sync.Map
 	stop     chan struct{}
@@ -118,6 +120,7 @@ func New(cfg Config) *Bridge {
 		pooled:   map[key]*link{},
 		sessions: map[*mcp.ServerSession]*link{},
 		owners:   map[*mcp.ServerSession]key{},
+		order:    map[key][]*mcp.ServerSession{},
 		stop:     make(chan struct{}),
 	}
 	if b.base == nil {
@@ -303,19 +306,8 @@ func (b *Bridge) linkFor(k key, res *config.Resource, ss *mcp.ServerSession) *li
 		}
 		l := b.newLink(k, res, ss)
 		b.sessions[ss] = l
-		if _, seen := b.owners[ss]; !seen {
-			b.owners[ss] = k
-			go func() {
-				_ = ss.Wait()
-				b.mu.Lock()
-				l := b.sessions[ss]
-				delete(b.sessions, ss)
-				delete(b.owners, ss)
-				b.mu.Unlock()
-				if l != nil {
-					l.close()
-				}
-			}()
+		if victims := b.trackLocked(k, ss); len(victims) > 0 {
+			go b.evict(victims)
 		}
 		return l
 	}
@@ -491,6 +483,17 @@ func (b *Bridge) middleware(k key) mcp.Middleware {
 				return b.forward(ctx, k, method, req)
 			case mcp.MethodComplete, mcp.MethodSubscribe, mcp.MethodUnsubscribe:
 				return nil, &mcp.RPCError{Code: mcp.CodeMethodNotFound, Message: "not supported through Portcullis"}
+			case mcp.MethodInitialize:
+				res, err := next(ctx, method, req)
+				if ss, ok := req.GetSession().(*mcp.ServerSession); err == nil && ok && ss.ID() != "" {
+					// At most maxSessionsPerKey live sessions per (person,
+					// resource): a new one evicts the oldest.
+					b.mu.Lock()
+					victims := b.trackLocked(k, ss)
+					b.mu.Unlock()
+					b.evict(victims)
+				}
+				return res, err
 			}
 			return next(ctx, method, req) // initialize, ping, discover, notifications
 		}
@@ -567,6 +570,10 @@ func (b *Bridge) forward(ctx context.Context, k key, method string, req mcp.Requ
 		if call == nil {
 			ev.Decision = "deny:bad_arguments"
 			return nil, rpcError(mcp.CodeInvalidParams, "missing params")
+		}
+		if len(call.InputResponses) > maxInputRequests {
+			ev.Decision = "deny:too_many_inputs"
+			return nil, rpcError(mcp.CodeInvalidParams, "too many input responses")
 		}
 		for _, ir := range call.InputResponses {
 			if _, ok := ir.(*mcp.ElicitResult); !ok {
@@ -818,6 +825,10 @@ func (b *Bridge) callTool(cctx, ctx context.Context, ev *Event, r *config.Resour
 		if len(res.InputRequests) == 0 {
 			return nil, rpcError(mcp.CodeInternalError, r.Label+" is busy; try again")
 		}
+		if len(res.InputRequests) > maxInputRequests {
+			ev.Decision = "deny:too_many_inputs"
+			return isErrorResult(fmt.Sprintf("%s asked for more than %d answers at once; Portcullis refused the request", r.Label, maxInputRequests)), nil
+		}
 		declined := false
 		for _, ir := range res.InputRequests {
 			switch x := ir.(type) {
@@ -870,4 +881,74 @@ func (l *link) screenElicitQuiet(p *mcp.ElicitParams) bool {
 		return res != nil && sn != nil && sn.File != nil && urlElicitationAllowed(res, sn.File.MainDomain, p.URL)
 	}
 	return false
+}
+
+// Fix round 1 bounds.
+const (
+	maxSessionsPerKey = 16    // live downstream sessions per (person, resource)
+	maxDestructive    = 10000 // destructive-tool names remembered per link
+	maxInputRequests  = 8     // input requests per round
+)
+
+// liveSessions counts the tracked downstream sessions of a key (tests).
+func (b *Bridge) liveSessions(k key) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.order[k])
+}
+
+// trackLocked registers a downstream session of k (at its initialize, or
+// at its first forwarded call) and returns the sessions evicted past
+// maxSessionsPerKey, oldest first, for the caller to close after
+// unlocking. A waiter forgets the session when it ends.
+func (b *Bridge) trackLocked(k key, ss *mcp.ServerSession) (evicted []*mcp.ServerSession) {
+	if _, seen := b.owners[ss]; seen {
+		return nil
+	}
+	b.owners[ss] = k
+	b.order[k] = append(b.order[k], ss)
+	go func() {
+		_ = ss.Wait()
+		b.mu.Lock()
+		l := b.sessions[ss]
+		b.forgetLocked(ss)
+		b.mu.Unlock()
+		if l != nil {
+			l.close()
+		}
+	}()
+	for len(b.order[k]) > maxSessionsPerKey {
+		old := b.order[k][0]
+		b.order[k] = b.order[k][1:]
+		evicted = append(evicted, old)
+	}
+	return evicted
+}
+
+func (b *Bridge) forgetLocked(ss *mcp.ServerSession) {
+	k, ok := b.owners[ss]
+	delete(b.sessions, ss)
+	delete(b.owners, ss)
+	if ok {
+		if i := slices.Index(b.order[k], ss); i >= 0 {
+			b.order[k] = slices.Delete(b.order[k], i, i+1)
+		}
+		if len(b.order[k]) == 0 {
+			delete(b.order, k)
+		}
+	}
+}
+
+// evict closes evicted downstream sessions and their upstream sessions.
+func (b *Bridge) evict(victims []*mcp.ServerSession) {
+	for _, ss := range victims {
+		b.mu.Lock()
+		l := b.sessions[ss]
+		b.forgetLocked(ss)
+		b.mu.Unlock()
+		if l != nil {
+			l.close()
+		}
+		_ = ss.Close()
+	}
 }

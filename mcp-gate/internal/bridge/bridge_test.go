@@ -1281,3 +1281,173 @@ func TestServeResourceRefusals(t *testing.T) {
 		t.Errorf("snapshot error: %d", w.Code)
 	}
 }
+
+// ---- fix round 1 ----
+
+func TestDestructiveMapBounded(t *testing.T) {
+	b := New(Config{Snapshot: func() *config.Snapshot { return nil }})
+	defer b.Close()
+	l := &link{b: b, destructive: map[string]bool{}, annLoaded: true}
+	yes := true
+	l.recordTools([]*sdk.Tool{
+		{Name: "bad:name", Annotations: &sdk.ToolAnnotations{DestructiveHint: &yes}},
+		{Name: strings.Repeat("a", 200), Annotations: &sdk.ToolAnnotations{DestructiveHint: &yes}},
+		{Name: "wipe", Annotations: &sdk.ToolAnnotations{DestructiveHint: &yes}},
+	})
+	if len(l.destructive) != 1 || !l.destructive["wipe"] {
+		t.Fatalf("recorded %v", l.destructive)
+	}
+	var many []*sdk.Tool
+	for i := 0; i < maxDestructive; i++ {
+		many = append(many, &sdk.Tool{Name: fmt.Sprintf("t%d", i), Annotations: &sdk.ToolAnnotations{DestructiveHint: &yes}})
+	}
+	l.recordTools(many)
+	if len(l.destructive) > maxDestructive {
+		t.Errorf("map grew to %d", len(l.destructive))
+	}
+	if _, err := l.annotation(context.Background(), nil, "list_issues"); err == nil {
+		t.Error("past the cap a call was not refused")
+	}
+}
+
+func TestInputRoundCapped(t *testing.T) {
+	extra := func(u *upstream, s *sdk.Server) {
+		s.AddTool(&sdk.Tool{Name: "flood", InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, req *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+			if req.Params.InputResponses != nil {
+				return textResult("ANSWERED"), nil
+			}
+			m := sdk.InputRequestMap{}
+			for i := 0; i < maxInputRequests+1; i++ {
+				m[fmt.Sprint(i)] = &sdk.ElicitParams{Mode: "form", Message: "q", RequestedSchema: map[string]any{"type": "object"}}
+			}
+			return &sdk.CallToolResult{InputRequests: m, RequestState: "s"}, nil
+		})
+		s.AddTool(&sdk.Tool{Name: "eight", InputSchema: map[string]any{"type": "object"}}, func(ctx context.Context, req *sdk.CallToolRequest) (*sdk.CallToolResult, error) {
+			if req.Params.InputResponses != nil {
+				return textResult(fmt.Sprintf("answered %d", len(req.Params.InputResponses))), nil
+			}
+			m := sdk.InputRequestMap{}
+			for i := 0; i < maxInputRequests; i++ {
+				m[fmt.Sprint(i)] = &sdk.ElicitParams{Mode: "form", Message: "q", RequestedSchema: map[string]any{"type": "object"}}
+			}
+			return &sdk.CallToolResult{InputRequests: m, RequestState: "s"}, nil
+		})
+	}
+	up := newUpstream(t, []string{"2026-07-28"}, extra)
+	sn := baseSnapshot(t, func(f *config.File) { resOf(f, "gitea").Protocol = []string{"2026-07-28"} })
+	h := newHarness(t, sn, map[string]*upstream{giteaUp: up}, nil)
+	for _, v := range []string{"2025-11-25", "2026-07-28"} {
+		var asked atomic.Int64
+		opts := &sdk.ClientOptions{ElicitationHandler: func(context.Context, *sdk.ElicitRequest) (*sdk.ElicitResult, error) {
+			asked.Add(1)
+			return &sdk.ElicitResult{Action: "accept", Content: map[string]any{}}, nil
+		}}
+		cs, _ := h.connect("alice", clientOpts{version: v, opts: opts})
+		r, err := call(t, cs, "flood", nil)
+		if err == nil && (r == nil || !r.IsError || strings.Contains(resultText(r), "ANSWERED")) {
+			t.Errorf("%s: 9 input requests passed: %v", v, resultTextOr(r))
+		}
+		if asked.Load() != 0 {
+			t.Errorf("%s: the person was asked %d times", v, asked.Load())
+		}
+		if r, err := call(t, cs, "eight", nil); err != nil || resultText(r) != "answered 8" {
+			t.Errorf("%s: 8 input requests: %v %v", v, resultTextOr(r), err)
+		}
+	}
+	if d := h.decisions("tools/call"); !slices.Contains(d, "deny:too_many_inputs") {
+		t.Errorf("decisions %v", d)
+	}
+}
+
+func TestDownstreamSessionsCapped(t *testing.T) {
+	up := newUpstream(t, []string{"2025-11-25"}, nil)
+	h := newHarness(t, baseSnapshot(t, nil), map[string]*upstream{giteaUp: up}, nil)
+	var sessions []*sdk.ClientSession
+	for i := 0; i < maxSessionsPerKey; i++ {
+		cs, _ := h.connect("alice", clientOpts{version: "2025-11-25"})
+		if _, err := call(t, cs, "list_issues", nil); err != nil {
+			t.Fatal(err)
+		}
+		sessions = append(sessions, cs)
+	}
+	csb, _ := h.connect("bob", clientOpts{version: "2025-11-25"})
+	h.sn.Load().Creds[config.CredKey{Instance: "gitea", Companion: "gitea", User: "bob"}] = config.Cred{ID: "8", Secret: "b0b"}
+	if n := h.b.livePooled("alice"); n != maxSessionsPerKey {
+		t.Fatalf("alice has %d links", n)
+	}
+	_, _, before := up.snapshot()
+	deletes := func(ms []string) int {
+		n := 0
+		for _, m := range ms {
+			if m == "DELETE" {
+				n++
+			}
+		}
+		return n
+	}
+	// The 17th initialize evicts the oldest session and its upstream session.
+	last, _ := h.connect("alice", clientOpts{version: "2025-11-25"})
+	if _, err := call(t, last, "list_issues", nil); err != nil {
+		t.Fatal(err)
+	}
+	if n := h.b.liveSessions(key{user: "alice", url: "https://gitea.example.com/mcp"}); n != maxSessionsPerKey {
+		t.Errorf("alice has %d live sessions", n)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		_, _, ms := up.snapshot()
+		if deletes(ms) > deletes(before) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the evicted session's upstream session was not closed")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := call(t, sessions[0], "list_issues", nil); err == nil {
+		t.Error("the evicted (oldest) session still works")
+	}
+	for _, cs := range sessions[1:] {
+		if _, err := call(t, cs, "list_issues", nil); err != nil {
+			t.Errorf("a newer session was evicted: %v", err)
+		}
+	}
+	if _, err := call(t, csb, "list_issues", nil); err != nil {
+		t.Errorf("bob was affected: %v", err)
+	}
+}
+
+type countRT struct{ n atomic.Int64 }
+
+func (c *countRT) RoundTrip(r *http.Request) (*http.Response, error) {
+	c.n.Add(1)
+	return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("{}")), Header: http.Header{}, Request: r}, nil
+}
+
+func TestTransportExactUpstreamPath(t *testing.T) {
+	sn := baseSnapshot(t, nil)
+	res := resOf(sn.File, "gitea")
+	base := &countRT{}
+	tr := Transport(base, func() *config.Snapshot { return sn }, res, "alice", nil)
+	for _, u := range []string{
+		"http://portcullis-mcp-gitea--gitea:8080/other",
+		"http://portcullis-mcp-gitea--gitea:8080/mcp/",
+		"http://portcullis-mcp-gitea--gitea:8080/mcp?x=1",
+		"http://portcullis-mcp-gitea--gitea:8080/%6Dcp",
+		"http://portcullis-mcp-gitea--gitea:8080/",
+		"http://portcullis-mcp-gitea--gitea:8081/mcp",
+		"https://portcullis-mcp-gitea--gitea:8080/mcp",
+	} {
+		req, _ := http.NewRequest("POST", u, strings.NewReader("{}"))
+		if _, err := tr.RoundTrip(req); err == nil {
+			t.Errorf("%s: sent", u)
+		}
+	}
+	if base.n.Load() != 0 {
+		t.Fatalf("%d requests reached the base transport", base.n.Load())
+	}
+	req, _ := http.NewRequest("POST", "http://portcullis-mcp-gitea--gitea:8080/mcp", strings.NewReader("{}"))
+	if _, err := tr.RoundTrip(req); err != nil || base.n.Load() != 1 {
+		t.Errorf("the upstream's own path: %v", err)
+	}
+}

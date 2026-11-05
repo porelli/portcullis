@@ -36,7 +36,8 @@ type link struct {
 
 	annMu       sync.Mutex
 	annLoaded   bool
-	destructive map[string]bool // folded name → ever annotated destructive (sticky)
+	destructive map[string]bool // folded name → ever annotated destructive (sticky), ≤ maxDestructive
+	annFull     bool            // the cap was hit: every call through this link is refused
 
 	tooLarge atomic.Bool
 }
@@ -273,9 +274,18 @@ func (l *link) recordTools(tools []*mcp.Tool) {
 	l.annMu.Lock()
 	defer l.annMu.Unlock()
 	for _, t := range tools {
-		if t != nil && t.Annotations != nil && t.Annotations.DestructiveHint != nil && *t.Annotations.DestructiveHint {
-			l.destructive[fold(t.Name)] = true
+		if t == nil || !ValidToolName(t.Name) || t.Annotations == nil || t.Annotations.DestructiveHint == nil || !*t.Annotations.DestructiveHint {
+			continue
 		}
+		n := fold(t.Name)
+		if l.destructive[n] {
+			continue
+		}
+		if len(l.destructive) >= maxDestructive {
+			l.annFull = true // can't remember it: fail closed
+			continue
+		}
+		l.destructive[n] = true
 	}
 }
 
@@ -310,6 +320,9 @@ func (l *link) annotation(ctx context.Context, cs *mcp.ClientSession, tool strin
 	}
 	l.annMu.Lock()
 	defer l.annMu.Unlock()
+	if l.annFull {
+		return nil, &IdentityError{Reason: "too_many_tools", Message: "this app lists more tools than Portcullis can check", Tool: true}
+	}
 	if l.destructive[fold(tool)] {
 		t := true
 		return &mcp.ToolAnnotations{DestructiveHint: &t}, nil

@@ -268,7 +268,11 @@ func (g *mintGate) await(ctx context.Context, t *IdentityTransport, res *config.
 
 // RoundTrip implements http.RoundTripper.
 func (t *IdentityTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if t.upstream == nil || req.URL.Scheme != t.upstream.Scheme || req.URL.Host != t.upstream.Host || req.URL.User != nil {
+	// Exactly the upstream URL: scheme, host, path (unescaped as written),
+	// no query, no userinfo.
+	if t.upstream == nil || req.URL.Scheme != t.upstream.Scheme || req.URL.Host != t.upstream.Host || req.URL.User != nil ||
+		req.URL.Path != t.upstream.Path || req.URL.EscapedPath() != t.upstream.EscapedPath() || req.URL.RawPath != "" ||
+		req.URL.RawQuery != "" || req.URL.ForceQuery || req.URL.Opaque != "" {
 		closeBody(req)
 		return nil, &IdentityError{Reason: "upstream", Message: "refused: not this resource's upstream"}
 	}
