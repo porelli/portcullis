@@ -277,16 +277,17 @@ def main() -> int:
             # (OAUTH2_PROXY_COOKIE_REFRESH=1m, cookie sessions, no lock): the
             # session must survive two refreshes, each with two requests on
             # the same old cookie at once (concurrent fetches, then two tabs),
-            # without a new sign-in. Realm-wide rotation (revokeRefreshToken)
-            # fails this: the second request reuses the spent refresh token.
-            def session_cookie():
-                return sorted((c["name"], c["value"]) for c in ctx.cookies([APP + "/"])
-                              if c["name"].startswith("_oauth2_proxy"))
+            # without a new sign-in. Traefik's forwardAuth doesn't pass
+            # oauth2-proxy's Set-Cookie on to the browser, so the cookie keeps
+            # the first refresh token and every request after the first minute
+            # refreshes with it again: realm-wide rotation (revokeRefreshToken)
+            # fails this at once. The workflow checks oauth2-proxy's log for
+            # the refreshes (and no refresh error) after this script.
             asserted = key.asserted
             page.goto(APP + "/", wait_until="domcontentloaded")
             for rnd in (1, 2):
-                before = session_cookie()
-                assert before, "no forward-auth session cookie"
+                assert any(c["name"].startswith("_oauth2_proxy") for c in ctx.cookies([APP + "/"])), \
+                    "no forward-auth session cookie"
                 page.wait_for_timeout(65_000)
                 if rnd == 1:
                     got = page.evaluate("""async (u) => {
@@ -312,7 +313,6 @@ def main() -> int:
                 shot(page, f"refresh-{rnd}")
                 assert not on_login_pages(page) and "Hostname" in page.inner_text("body"), \
                     f"after refresh {rnd}: {page.url}"
-                assert session_cookie() != before, f"refresh {rnd}: the session cookie was not rewritten"
             assert key.asserted == asserted, f"{key.asserted - asserted} new passkey sign-ins during the refreshes"
         check("forward-auth session survives two refreshes with concurrent requests (no new sign-in)",
               refresh_rotation)

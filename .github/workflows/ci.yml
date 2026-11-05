@@ -2315,7 +2315,15 @@ jobs:
           E2E_KEY: /tmp/e2e.key
           E2E_FOREIGN_CERT: /tmp/foreign.crt
           E2E_FOREIGN_KEY: /tmp/foreign.key
-        run: NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_login.py
+        run: |
+          NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_login.py
+          # refresh_rotation really refreshed (oauth2-proxy → Keycloak), and no refresh failed.
+          docker compose logs forward-auth > /tmp/forward-auth.log 2>&1
+          grep -q 'Refreshing session - User: ' /tmp/forward-auth.log || { echo "FAIL: no forward-auth session refresh during the e2e run"; exit 1; }
+          if grep -iE 'unable to refresh|error (redeeming|refreshing)|refresh token.*(invalid|reuse)' /tmp/forward-auth.log; then
+            echo "FAIL: a forward-auth session refresh failed"; exit 1
+          fi
+          echo "PASS: forward-auth sessions refreshed with Keycloak, none failed"
 
       - name: Re-invite / lost-key recovery (second key, --replace-keys)
         run: |
