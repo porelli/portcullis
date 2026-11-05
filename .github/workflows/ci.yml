@@ -36,7 +36,7 @@ env:
   COMPOSE_FILE: docker-compose.yml:docker-compose.ci.yml
   VAULT_ADDR: http://127.0.0.1:8200
   TRAEFIK_IP: 172.31.250.2
-  # Go toolchain for the enroll and domains unit tests (same as their Dockerfiles' golang image).
+  # Go toolchain for the enroll, domains and mcp-gate unit tests (same as their Dockerfiles' golang image).
   GO_VERSION: 1.27.3
   # The domains service's records point here in CI: no public-IP detection
   # on the runners (./portcullis up uses these instead).
@@ -339,9 +339,9 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum') }}-${{ hashFiles('enroll/**/*.go', 'domains/**/*.go') }}
+          key: go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum', 'mcp-gate/go.sum') }}-${{ hashFiles('enroll/**/*.go', 'domains/**/*.go', 'mcp-gate/**/*.go') }}
           restore-keys: |
-            go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum') }}-
+            go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum', 'mcp-gate/go.sum') }}-
       - name: enroll unit tests
         working-directory: enroll
         env:
@@ -361,6 +361,16 @@ jobs:
           test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
           # The production build (no tags) never links the fake provider.
           if go list -deps . | grep -q 'internal/fakedns'; then echo "FAIL: production build links internal/fakedns"; exit 1; fi
+          CGO_ENABLED=1 go test -race ./...
+      - name: mcp-gate unit tests (config, token checks, resource metadata; contract §15)
+        working-directory: mcp-gate
+        run: |
+          go mod verify
+          go vet ./...
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
+          # The shared test vector (contract §15.4, preflight G47) is
+          # decoded strictly and re-encoded byte for byte by the tests.
+          test -s internal/config/testdata/mcp-gate.json && test -s internal/config/testdata/mcp-credentials.json
           CGO_ENABLED=1 go test -race ./...
       - name: Save the Go module and build cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'

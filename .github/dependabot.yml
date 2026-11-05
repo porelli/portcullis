@@ -87,6 +87,15 @@ updates:
       domains-go:
         patterns: ["*"]
 
+  # mcp-gate/go.mod (MCP go-sdk, go-oidc, go-jose, age).
+  - package-ecosystem: gomod
+    directory: /mcp-gate
+    schedule:
+      interval: weekly
+    groups:
+      mcp-gate-go:
+        patterns: ["*"]
+
   # Actions are pinned by commit SHA with a `# vX.Y.Z` comment; Dependabot
   # updates both (workflows and the local composite actions).
   - package-ecosystem: github-actions

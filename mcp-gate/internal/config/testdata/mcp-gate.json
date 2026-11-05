@@ -1,0 +1,271 @@
+{
+  "version": 1,
+  "enabled": true,
+  "issuer": "https://auth.example.com/realms/portcullis",
+  "main_domain": "example.com",
+  "clients": [
+    "ai-chat-mcp",
+    "portcullis-ai-claude",
+    "portcullis-ai-claude-code",
+    "portcullis-ai-generic"
+  ],
+  "allowed_origins": [],
+  "acr_loa": {
+    "hwk": 2,
+    "mtls": 3,
+    "public": 0,
+    "pwd": 1
+  },
+  "limits": {
+    "resource_rpm": 120,
+    "resource_burst": 30,
+    "person_rpm": 600,
+    "tool_calls_rpm": 60,
+    "confirmations_per_hour": 10,
+    "mints_per_minute": 10,
+    "fanout": 4,
+    "max_request_bytes": 8388608,
+    "max_result_bytes": 16777216,
+    "upstream_timeout_s": 120
+  },
+  "core_hosts": [
+    "auth.example.com",
+    "directory.example.com",
+    "enroll.example.com",
+    "example.com",
+    "hub.example.com",
+    "mcp.example.com",
+    "metrics.example.com",
+    "people.example.com",
+    "traefik.example.com"
+  ],
+  "resources": [
+    {
+      "url": "https://gitea.example.com/mcp",
+      "scope": "mcp:gitea.gitea",
+      "clients": [
+        "portcullis-ai-claude",
+        "portcullis-ai-claude-code",
+        "portcullis-ai-generic"
+      ],
+      "kind": "companion",
+      "instance": "gitea",
+      "companion": "gitea",
+      "label": "Gitea",
+      "host": "gitea.example.com",
+      "hosts": [
+        "gitea.example.com"
+      ],
+      "app_url": "https://gitea.example.com",
+      "min_loa": 2,
+      "upstream": "http://portcullis-mcp-gitea--gitea:8080/mcp",
+      "protocol": [
+        "2026-07-28",
+        "2025-11-25"
+      ],
+      "mode": "read_write",
+      "identity": {
+        "mode": "app_token",
+        "header": "Authorization",
+        "format": "token {credential}",
+        "basic_user": "",
+        "secret_ref": ""
+      },
+      "tools": {
+        "writes": [
+          "*_write",
+          "create_*",
+          "update_*",
+          "merge_*",
+          "delete_*"
+        ],
+        "confirm": [
+          "delete_*",
+          "repo_write:delete"
+        ],
+        "never": []
+      },
+      "aggregate": true,
+      "population": [
+        "alice",
+        "bob"
+      ],
+      "expiring": {
+        "bob": "2027-03-31T23:59:59Z"
+      }
+    },
+    {
+      "url": "https://grafana.example.com/mcp",
+      "scope": "mcp:grafana.grafana",
+      "clients": [
+        "portcullis-ai-claude",
+        "portcullis-ai-claude-code",
+        "portcullis-ai-generic"
+      ],
+      "kind": "companion",
+      "instance": "grafana",
+      "companion": "grafana",
+      "label": "Grafana",
+      "host": "grafana.example.com",
+      "hosts": [
+        "grafana.example.com"
+      ],
+      "app_url": "https://grafana.example.com",
+      "min_loa": 2,
+      "upstream": "http://portcullis-mcp-grafana--grafana:8000/mcp",
+      "protocol": [
+        "2025-11-25"
+      ],
+      "mode": "read_only",
+      "identity": {
+        "mode": "identity_headers",
+        "header": "Authorization",
+        "format": "Bearer {secret}",
+        "basic_user": "",
+        "secret_ref": "grafana/grafana"
+      },
+      "tools": {
+        "writes": [
+          "create_*",
+          "update_*",
+          "delete_*"
+        ],
+        "confirm": [
+          "delete_*"
+        ],
+        "never": []
+      },
+      "aggregate": true,
+      "population": [
+        "alice"
+      ],
+      "expiring": {},
+      "people": {
+        "alice": {
+          "email": "alice@example.org",
+          "groups": [
+            "design",
+            "users_grafana"
+          ]
+        }
+      }
+    },
+    {
+      "url": "https://hub.example.com/mcp",
+      "scope": "mcp:portcullis.admin",
+      "clients": [
+        "portcullis-ai-claude",
+        "portcullis-ai-claude-code"
+      ],
+      "kind": "portcullis_admin",
+      "instance": "",
+      "companion": "",
+      "label": "Portcullis (admin)",
+      "host": "hub.example.com",
+      "hosts": [],
+      "app_url": "",
+      "min_loa": 2,
+      "upstream": "",
+      "protocol": [],
+      "mode": "",
+      "identity": {
+        "mode": "none",
+        "header": "",
+        "format": "",
+        "basic_user": "",
+        "secret_ref": ""
+      },
+      "tools": {
+        "writes": [],
+        "confirm": [],
+        "never": []
+      },
+      "aggregate": false,
+      "population": [
+        "root"
+      ],
+      "expiring": {}
+    },
+    {
+      "url": "https://mcp.example.com/mcp",
+      "scope": "mcp:all",
+      "clients": [
+        "ai-chat-mcp",
+        "portcullis-ai-claude",
+        "portcullis-ai-claude-code",
+        "portcullis-ai-generic"
+      ],
+      "kind": "aggregate",
+      "instance": "",
+      "companion": "",
+      "label": "All my apps",
+      "host": "mcp.example.com",
+      "hosts": [],
+      "app_url": "",
+      "min_loa": 2,
+      "upstream": "",
+      "protocol": [],
+      "mode": "",
+      "identity": {
+        "mode": "none",
+        "header": "",
+        "format": "",
+        "basic_user": "",
+        "secret_ref": ""
+      },
+      "tools": {
+        "writes": [],
+        "confirm": [],
+        "never": []
+      },
+      "aggregate": false,
+      "population": [
+        "alice",
+        "bob",
+        "carol",
+        "root"
+      ],
+      "expiring": {}
+    },
+    {
+      "url": "https://people.example.com/mcp",
+      "scope": "mcp:portcullis.people",
+      "clients": [
+        "portcullis-ai-claude",
+        "portcullis-ai-claude-code",
+        "portcullis-ai-generic"
+      ],
+      "kind": "portcullis_people",
+      "instance": "",
+      "companion": "",
+      "label": "Portcullis",
+      "host": "people.example.com",
+      "hosts": [],
+      "app_url": "",
+      "min_loa": 2,
+      "upstream": "",
+      "protocol": [],
+      "mode": "",
+      "identity": {
+        "mode": "none",
+        "header": "",
+        "format": "",
+        "basic_user": "",
+        "secret_ref": ""
+      },
+      "tools": {
+        "writes": [],
+        "confirm": [],
+        "never": []
+      },
+      "aggregate": true,
+      "population": [
+        "alice",
+        "bob",
+        "carol",
+        "root"
+      ],
+      "expiring": {}
+    }
+  ]
+}
