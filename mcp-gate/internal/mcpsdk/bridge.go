@@ -6,6 +6,9 @@ package mcpsdk
 // SDK version still has one place to change (G18).
 
 import (
+	"encoding/json"
+	"errors"
+
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -112,3 +115,34 @@ var (
 	SupportedSDKProtocols    = mcp.SupportedProtocolVersions
 	MetaKeyServerInfo        = mcp.MetaKeyServerInfo
 )
+
+// ProtocolSessionElicitURL is the one session protocol version with
+// URL-mode elicitation/create (2025-06-18 has none; 2026-07-28 asks through
+// input_required results instead).
+const ProtocolSessionElicitURL = "2025-11-25"
+
+// InputRequired is a tools/call result of resultType "input_required"
+// (SEP-2322) carrying reqs and the opaque state the client echoes back.
+// The SDK keeps the result type unexported, so it is built through the
+// SDK's own decoder.
+func InputRequired(reqs InputRequestMap, state string) (*CallToolResult, error) {
+	if len(reqs) == 0 {
+		return nil, errors.New("input_required without input requests")
+	}
+	b, err := json.Marshal(struct {
+		ResultType    string          `json:"resultType"`
+		InputRequests InputRequestMap `json:"inputRequests"`
+		RequestState  string          `json:"requestState,omitempty"`
+	}{"input_required", reqs, state})
+	if err != nil {
+		return nil, err
+	}
+	var r CallToolResult
+	if err := json.Unmarshal(b, &r); err != nil {
+		return nil, err
+	}
+	if !r.NeedsInput() || len(r.InputRequests) != len(reqs) || r.RequestState != state {
+		return nil, errors.New("input_required result did not round-trip")
+	}
+	return &r, nil
+}

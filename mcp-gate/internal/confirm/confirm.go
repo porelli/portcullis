@@ -5,10 +5,14 @@
 // closed (G26): any Hub error is returned and the bridge answers "can't
 // check this right now; try again" without calling the upstream.
 //
-// Task 3b answers in the text form only ("This needs your confirmation in
-// your browser: open <url>, then ask me to try again."), which §15.6
-// gives every client; task 4 adds the URL-elicitation forms for clients
-// that declared elicitation.url.
+// A new confirmation's Outcome carries the text form ("This needs your
+// confirmation in your browser: open <url>, then ask me to try again."),
+// valid for every client, and the URL-mode elicitation of its page
+// ("<tool> on <companion label> needs your confirmation in your
+// browser."), which the bridge sends to clients that declared
+// elicitation.url, by protocol version (task 4). A 2026-07-28 client's
+// answer to that elicitation comes back as Call.Elicited: anything but
+// accept does nothing and asks the Hub nothing.
 package confirm
 
 import (
@@ -48,6 +52,7 @@ const (
 	textTooMany  = "Too many confirmations requested; try again later"
 
 	textNotConfirmable = "Portcullis can't confirm this tool"
+	textCancelled      = "You cancelled the confirmation; nothing was done"
 )
 
 func isError(msg string) *mcp.CallToolResult {
@@ -76,6 +81,11 @@ func (g *Gate) Before(ctx context.Context, c bridge.Call) (bridge.Outcome, error
 	}
 	if err != nil {
 		return bridge.Outcome{}, err
+	}
+	// The person declined or dismissed the gate's own elicitation: no call,
+	// and an approved confirmation stays unconsumed.
+	if c.Elicited != nil && c.Elicited.Action != "accept" {
+		return bridge.Outcome{Answer: isError(textCancelled), Decision: "deny:declined"}, nil
 	}
 	_, state, err := g.Hub.ConsumeConfirmation(ctx, hubapi.ConsumeRequest{User: c.User, Resource: c.Resource.URL, Tool: c.Tool, ArgsSHA256: digest})
 	if err != nil {
@@ -123,5 +133,11 @@ func (g *Gate) Before(ctx context.Context, c bridge.Call) (bridge.Outcome, error
 	return bridge.Outcome{
 		Answer:   isError("This needs your confirmation in your browser: open " + conf.URL + ", then ask me to try again."),
 		Decision: "confirm:" + conf.ID,
+		Elicit: &mcp.ElicitParams{
+			Mode:          "url",
+			Message:       c.Tool + " on " + c.Resource.Label + " needs your confirmation in your browser.",
+			URL:           conf.URL,
+			ElicitationID: conf.ID,
+		},
 	}, nil
 }

@@ -83,6 +83,7 @@ type fakeHub struct {
 	creates   []map[string]any
 	consumes  []map[string]any
 	approved  bool
+	state     string // "pending" / "declined": the consume answer when not approved
 	badSecret int
 }
 
@@ -126,6 +127,11 @@ func newFakeHub(t *testing.T, sn *atomic.Pointer[config.Snapshot]) *fakeHub {
 			if h.approved {
 				h.approved = false // single use
 				_, _ = fmt.Fprintf(w, `{"id":%q}`, confirmID)
+				return
+			}
+			if h.state != "" && (h.state != "pending" || len(h.creates) > 0) {
+				w.WriteHeader(409)
+				_, _ = fmt.Fprintf(w, `{"state":%q}`, h.state)
 				return
 			}
 			w.WriteHeader(404)

@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -69,16 +70,28 @@ type Call struct {
 	Tool         string
 	Args         json.RawMessage
 	Reason       string // "confirm" (a confirm pattern) or "destructive" (the annotation)
+	// Elicited is the person's answer to the gate's own URL elicitation of
+	// this call's confirmation (a 2026-07-28 retry carrying the gate's
+	// request state); nil otherwise.
+	Elicited *mcp.ElicitResult
 }
 
 // Outcome is a Confirmer's decision. Proceed is true only when a matching
 // approved confirmation was consumed; else Answer is what the person's
 // client gets and Decision the access log's (confirm:<id>, rate_limited,
 // deny:<reason>; empty = "confirm").
+//
+// Elicit, set when a confirmation was just created, is the URL-mode
+// elicitation of its page (§15.6). The bridge sends it to a client that
+// can take one — an input_required result for a 2026-07-28 client that
+// declared elicitation.url, an elicitation/create request on a 2025-11-25
+// session that did — and Answer (the text with the URL) in every other
+// case, and after the elicitation/create. Never form mode.
 type Outcome struct {
 	Proceed  bool
 	Answer   *mcp.CallToolResult
 	Decision string
+	Elicit   *mcp.ElicitParams
 }
 
 // Confirmer decides calls that need a confirmation (§15.6; internal/confirm).
@@ -129,6 +142,7 @@ type Bridge struct {
 	order    map[key][]*mcp.ServerSession // live downstream sessions per key, oldest first
 	lastSn   *config.Snapshot
 	warned   sync.Map
+	states   stateStore // the gate's own 2026-07-28 request states (gatestate.go)
 	stop     chan struct{}
 	stopOnce sync.Once
 }
@@ -735,7 +749,7 @@ func (b *Bridge) dispatch(cctx, ctx context.Context, ev *Event, method string, r
 		if !hasTools {
 			return nil, notFound
 		}
-		return b.callTool(cctx, ctx, ev, r, l, cs, call, ss)
+		return b.callTool(cctx, ctx, ev, req, r, l, cs, call, ss)
 	case mcp.MethodListResources:
 		if !hasRes {
 			return &mcp.ListResourcesResult{Resources: []*mcp.Resource{}}, nil
@@ -823,7 +837,29 @@ const maxInputRounds = 10
 // a URL elicitation outside the allowed hosts is declined, the rest goes
 // to the person — passed down to a 2026-07-28 client as input_required,
 // asked of an older client's session by the gate itself.
-func (b *Bridge) callTool(cctx, ctx context.Context, ev *Event, r *config.Resource, l *link, cs *mcp.ClientSession, p *mcp.CallToolParamsRaw, ss *mcp.ServerSession) (mcp.Result, error) {
+func (b *Bridge) callTool(cctx, ctx context.Context, ev *Event, req mcp.Request, r *config.Resource, l *link, cs *mcp.ClientSession, p *mcp.CallToolParamsRaw, ss *mcp.ServerSession) (mcp.Result, error) {
+	k := key{user: ev.User, url: r.URL}
+	bind := bindingOf(k, p.Name, p.Arguments)
+	// The gate's own request state (gatestate.go): never forwarded, nor
+	// are the input responses that answer the gate.
+	var elicited *mcp.ElicitResult
+	continued := false
+	if strings.HasPrefix(p.RequestState, gateStatePrefix) {
+		st, ok := b.states.take(p.RequestState, bind, b.now())
+		cp := *p
+		cp.RequestState, cp.InputResponses = "", nil
+		switch {
+		case ok && st.kind == stateConfirm:
+			elicited, _ = p.InputResponses[confirmInputKey].(*mcp.ElicitResult)
+			if elicited == nil {
+				elicited = &mcp.ElicitResult{Action: "cancel"} // no answer is no confirmation
+			}
+		case ok && st.kind == stateContinue:
+			cp.RequestState, cp.InputResponses = st.upstream, p.InputResponses
+			continued = true
+		}
+		p = &cp
+	}
 	_, confirm, reason := CallDecision(r, p.Name, p.Arguments, nil)
 	if !confirm {
 		ann, err := l.annotation(cctx, cs, p.Name)
@@ -837,12 +873,16 @@ func (b *Bridge) callTool(cctx, ctx context.Context, ev *Event, r *config.Resour
 			}
 		}
 	}
+	confirmed := false // this call consumed a confirmation (or continues one that did)
+	if confirm && continued {
+		confirm, confirmed = false, true
+	}
 	if confirm {
 		if b.cfg.Confirm == nil {
 			ev.Decision, ev.UpstreamStatus = "deny:confirm_unavailable", 0
 			return isErrorResult("This needs your confirmation in your browser, which this Portcullis can't ask for yet; nothing was done."), nil
 		}
-		out, err := b.cfg.Confirm.Before(ctx, Call{User: ev.User, Client: ev.Client, Resource: r, Tool: p.Name, Args: p.Arguments, Reason: reason})
+		out, err := b.cfg.Confirm.Before(ctx, Call{User: ev.User, Client: ev.Client, Resource: r, Tool: p.Name, Args: p.Arguments, Reason: reason, Elicited: elicited})
 		if err != nil {
 			ev.Decision, ev.UpstreamStatus = "deny:hub_unavailable", 0
 			return isErrorResult("can't check this right now; try again"), nil
@@ -856,8 +896,9 @@ func (b *Bridge) callTool(cctx, ctx context.Context, ev *Event, r *config.Resour
 			if answer == nil {
 				answer = isErrorResult("This needs your confirmation in your browser.")
 			}
-			return answer, nil
+			return b.deliverConfirmation(ctx, req, ss, bind, out.Elicit, answer), nil
 		}
+		confirmed = true
 	}
 	params := &mcp.CallToolParams{Name: p.Name, InputResponses: p.InputResponses, RequestState: p.RequestState}
 	if len(p.Arguments) > 0 {
@@ -895,7 +936,19 @@ func (b *Bridge) callTool(cctx, ctx context.Context, ev *Event, r *config.Resour
 			}
 		}
 		if newClient && !declined && ss != nil {
-			return res, nil // the person's client answers and retries
+			if !confirmed {
+				return res, nil // the person's client answers and retries
+			}
+			// A confirmed call continues on the gate's own single-use
+			// state, which holds the companion's: the retry isn't
+			// confirmed again, and can't be replayed.
+			tok, ok := b.states.put(gateState{kind: stateContinue, bind: bind, upstream: res.RequestState}, b.now())
+			if !ok {
+				return nil, rpcError(mcp.CodeInternalError, "Portcullis is busy; try again")
+			}
+			cp := *res
+			cp.RequestState = tok
+			return &cp, nil
 		}
 		answers := mcp.InputResponseMap{}
 		for id, ir := range res.InputRequests {
@@ -1001,4 +1054,50 @@ func (b *Bridge) evict(victims []*mcp.ServerSession) {
 		}
 		_ = ss.Close()
 	}
+}
+
+// elicitWait bounds the gate's own elicitation/create of a confirmation
+// (the confirmation itself lives 10 minutes).
+const elicitWait = 10 * time.Minute
+
+// deliverConfirmation answers a call that now has a pending confirmation
+// (§15.6): a 2026-07-28 client that declared elicitation.url gets an
+// input_required result with the page's URL-mode elicitation and the
+// gate's single-use state; a 2025-11-25 session that declared it gets an
+// elicitation/create request, then the text; everyone else the text only.
+// Any other version, a missing capability or a failure is the text (fail
+// closed: the text is valid for every client). Never form mode.
+func (b *Bridge) deliverConfirmation(ctx context.Context, req mcp.Request, ss *mcp.ServerSession, bind string, el *mcp.ElicitParams, answer *mcp.CallToolResult) *mcp.CallToolResult {
+	if el == nil || el.Mode != "url" || el.URL == "" || el.RequestedSchema != nil {
+		return answer
+	}
+	cr, ok := req.(*mcp.CallToolRequest)
+	if !ok {
+		return answer
+	}
+	caps := cr.ClientCapabilities()
+	if caps == nil || caps.Elicitation == nil || caps.Elicitation.URL == nil {
+		return answer
+	}
+	sessionless := ss == nil || ss.ID() == ""
+	switch v := cr.ProtocolVersion(); {
+	case v == mcp.ProtocolStateless && sessionless:
+		tok, ok := b.states.put(gateState{kind: stateConfirm, bind: bind}, b.now())
+		if !ok {
+			return answer
+		}
+		res, err := mcp.InputRequired(mcp.InputRequestMap{confirmInputKey: el}, tok)
+		if err != nil {
+			_, _ = b.states.take(tok, bind, b.now())
+			return answer
+		}
+		return res
+	case v == mcp.ProtocolSessionElicitURL && !sessionless:
+		ectx, cancel := context.WithTimeout(ctx, elicitWait)
+		defer cancel()
+		// Whatever the person answers, the call isn't made now: the text
+		// follows, and the retry consumes the approved confirmation.
+		_, _ = ss.Elicit(ectx, el)
+	}
+	return answer
 }

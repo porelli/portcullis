@@ -287,3 +287,64 @@ func TestConfirmNotConfirmable(t *testing.T) {
 		}
 	}
 }
+
+// Task 4 (§15.6): a new confirmation carries, besides the text answer, the
+// URL-mode elicitation a URL-capable client gets (the bridge picks the form
+// by protocol version and capability). Never form mode.
+func TestConfirmationShape(t *testing.T) {
+	g, _, _, c := setup(t)
+	out, err := g.Before(context.Background(), c)
+	if err != nil || out.Proceed {
+		t.Fatalf("%+v %v", out, err)
+	}
+	if text(out.Answer) != "This needs your confirmation in your browser: open https://people.example.com/confirm/7Q2M-K7WX-ABCD-EFGH-IJKL-MNOP-QR, then ask me to try again." || !out.Answer.IsError {
+		t.Errorf("text %q", text(out.Answer))
+	}
+	e := out.Elicit
+	if e == nil {
+		t.Fatal("no URL elicitation offered")
+	}
+	if e.Mode != "url" || e.URL != "https://people.example.com/confirm/7Q2M-K7WX-ABCD-EFGH-IJKL-MNOP-QR" ||
+		e.Message != "delete_repo on Gitea needs your confirmation in your browser." ||
+		e.ElicitationID != "7Q2M-K7WX-ABCD-EFGH-IJKL-MNOP-QR" || e.RequestedSchema != nil {
+		t.Errorf("elicitation %+v", e)
+	}
+	// Answers that aren't a new confirmation offer no elicitation.
+	for _, st := range []string{hubapi.StatePending, hubapi.StateDeclined, hubapi.StateConsumed} {
+		g, h, _, c := setup(t)
+		h.state = st
+		if out, _ := g.Before(context.Background(), c); out.Elicit != nil {
+			t.Errorf("%s: elicitation %+v", st, out.Elicit)
+		}
+	}
+}
+
+// A 2026-07-28 client's answer to the gate's own URL elicitation: decline
+// or cancel → nothing is done and the Hub isn't asked; accept → the usual
+// consume (pending answers "Still waiting").
+func TestConfirmElicitationAnswer(t *testing.T) {
+	for _, action := range []string{"decline", "cancel", "", "weird"} {
+		g, h, _, c := setup(t)
+		h.state = hubapi.StateConsumed // even an approved one isn't used
+		c.Elicited = &mcp.ElicitResult{Action: action}
+		out, err := g.Before(context.Background(), c)
+		if err != nil || out.Proceed || out.Answer == nil || !out.Answer.IsError || out.Decision != "deny:declined" ||
+			text(out.Answer) != "You cancelled the confirmation; nothing was done" {
+			t.Errorf("%q: %+v %v", action, out, err)
+		}
+		if len(h.consumes)+len(h.creates) != 0 {
+			t.Errorf("%q: the Hub was asked", action)
+		}
+	}
+	g, h, _, c := setup(t)
+	h.state = hubapi.StatePending
+	c.Elicited = &mcp.ElicitResult{Action: "accept"}
+	out, _ := g.Before(context.Background(), c)
+	if out.Proceed || text(out.Answer) != "Still waiting for your confirmation in your browser" || len(h.consumes) != 1 {
+		t.Errorf("accept, pending: %+v", out)
+	}
+	h.state = hubapi.StateConsumed
+	if out, _ := g.Before(context.Background(), c); !out.Proceed {
+		t.Errorf("accept, approved: %+v", out)
+	}
+}
