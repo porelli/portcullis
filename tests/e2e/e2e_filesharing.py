@@ -124,6 +124,7 @@ HASHES: set[str] = set()      # every NT hash seen on the secrets volume (upper 
 PASSWORDS: dict[str, str] = {}  # label → password (never printed)
 LATENCY: dict[str, float] = {}
 OBS: list[str] = []           # observations for the report (popup, COOP, …)
+POPUPS: dict[str, int] = {}   # fresh-auth popups per person (signature counter offsets)
 
 
 def check(name: str, fn) -> None:
@@ -604,7 +605,12 @@ def create_password(page: Page, auth, instance: str, who: str, replay: bool = Tr
         with page.context.expect_page(timeout=30_000) as pinfo:
             row.locator('[data-ma-act="cred-create"]').click()
         popup = pinfo.value
-        pauth = base.Authenticator(popup, credentials=auth.credentials())
+        # Each popup gets a copy of the opener's credential; its signature
+        # counter must stay above every earlier copy's (Keycloak refuses a
+        # counter that didn't grow), and the opener's own never moves.
+        n = POPUPS[who] = POPUPS.get(who, 0) + 1
+        copies = [dict(c, signCount=c.get("signCount", 0) + 1000 * (n - 1)) for c in auth.credentials()]
+        pauth = base.Authenticator(popup, credentials=copies)
         seen = drive_popup(popup, f"{who}-{instance}")
         pw_loc = page.locator("dialog[open] [data-ma-pw]")
         try:
