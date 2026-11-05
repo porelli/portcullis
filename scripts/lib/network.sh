@@ -14,6 +14,7 @@
 #   PORTCULLIS_PROXY_SUBNET    default 172.31.250.0/24
 #   PORTCULLIS_PROXY_IP_RANGE  default 172.31.250.128/25
 #   PORTCULLIS_TRAEFIK_IP      default 172.31.250.2
+#   PORTCULLIS_MCP_GATE_IP     default 172.31.250.3 (mcp-gate on portcullis-proxy)
 #   PORTCULLIS_AUTH_SUBNET     default 172.31.251.0/28
 #   PORTCULLIS_AUTH_IP_RANGE   default 172.31.251.8/29
 #   PORTCULLIS_AUTH_TRAEFIK_IP default 172.31.251.2
@@ -27,6 +28,7 @@ DOMAINS_NETWORK="${DOMAINS_NETWORK:-portcullis_portcullis-domains}"
 proxy_subnet()   { echo "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24}"; }
 proxy_ip_range() { echo "${PORTCULLIS_PROXY_IP_RANGE:-172.31.250.128/25}"; }
 proxy_traefik_ip() { echo "${PORTCULLIS_TRAEFIK_IP:-172.31.250.2}"; }
+mcp_gate_ip()    { echo "${PORTCULLIS_MCP_GATE_IP:-172.31.250.3}"; }
 auth_subnet()    { echo "${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28}"; }
 auth_ip_range()  { echo "${PORTCULLIS_AUTH_IP_RANGE:-172.31.251.8/29}"; }
 auth_traefik_ip() { echo "${PORTCULLIS_AUTH_TRAEFIK_IP:-172.31.251.2}"; }
@@ -87,6 +89,21 @@ _validate_net() {
 # validate_proxy_network_config — portcullis-proxy settings.
 validate_proxy_network_config() {
   _validate_net PORTCULLIS_PROXY "$(proxy_subnet)" "$(proxy_ip_range)" "$(proxy_traefik_ip)" PORTCULLIS_TRAEFIK_IP
+}
+
+# validate_mcp_gate_ip — PORTCULLIS_MCP_GATE_IP (contract §2): a static
+# address inside PORTCULLIS_PROXY_SUBNET, outside the dynamic range (no app
+# container can be handed it: companions trust only the gate's caller
+# secret, but the address is the gate's), never Traefik's, never the
+# network / gateway / broadcast address.
+validate_mcp_gate_ip() {
+  local ip
+  ip="$(mcp_gate_ip)"
+  _validate_net PORTCULLIS_PROXY "$(proxy_subnet)" "$(proxy_ip_range)" "$ip" PORTCULLIS_MCP_GATE_IP || return 1
+  if [ "$ip" = "$(proxy_traefik_ip)" ] || [ "$(ip_to_int "$ip")" = "$(ip_to_int "$(proxy_traefik_ip)" 2>/dev/null)" ]; then
+    echo "PORTCULLIS_MCP_GATE_IP=$ip is PORTCULLIS_TRAEFIK_IP (each needs its own address)"
+    return 1
+  fi
 }
 
 # validate_auth_network_config — portcullis-auth settings, and no overlap
@@ -157,6 +174,7 @@ domains_network_state() { network_state "$DOMAINS_NETWORK" "$(domains_subnet)" "
 network_check() {
   local err
   err="$(validate_proxy_network_config)" || fail "Invalid portcullis-proxy settings in .env: $err"
+  err="$(validate_mcp_gate_ip)" || fail "Invalid mcp-gate address in .env: $err"
   err="$(validate_auth_network_config)" || fail "Invalid portcullis-auth settings in .env: $err"
   err="$(validate_domains_network_config)" || fail "Invalid portcullis-domains settings in .env: $err"
   if [ "$(proxy_network_state)" = mismatch ]; then

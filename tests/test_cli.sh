@@ -203,6 +203,74 @@ rm -f "$ENVF"
 RC=0; CLOUDFLARE_API_TOKEN=tok123 "$CLI" init --env-only --non-interactive --domain x.example --dns-provider cloudflare >/dev/null 2>&1 </dev/null || RC=$?
 expect_eq "init with provider creds from env" "$RC:$(get CLOUDFLARE_API_TOKEN):$(get DNS_PROVIDER)" "0:tok123:cloudflare"
 
+# ── keycloak configure never touches the Hub's AI clients or mcp:* scopes
+# (contract §8) and pushes the realm's offline bounds / refresh rotation ──
+# A stub curl answers the admin API: every request is logged as one JSON
+# line {m, p, b}; writes answer 201 (POST) / 204, reads from the fixtures
+# below ("[]" for collections, "{}" otherwise).
+mkdir -p "$WORK/kcbin" "$WORK/kc"
+cp -R "$HERE/../keycloak" "$PORTCULLIS_ROOT/keycloak"
+cat > "$WORK/kc/clients.json" <<'JSON'
+[{"id":"fwd-uuid","clientId":"portcullis-forward-auth","attributes":{}},
+ {"id":"ai-uuid","clientId":"portcullis-ai-claude","attributes":{"portcullis.hub.template":"portcullis-ai"}}]
+JSON
+cat > "$WORK/kc/scopes.json" <<'JSON'
+[{"id":"acr-id","name":"acr"},{"id":"groups-id","name":"groups"},
+ {"id":"invite-id","name":"portcullis-invite-client"},{"id":"emailu-id","name":"email-unverified"},
+ {"id":"mcp-id","name":"mcp:gitea.gitea","attributes":{"include.in.token.scope":"true"}}]
+JSON
+cat > "$WORK/kcbin/curl" <<'STUB'
+#!/usr/bin/env bash
+m=GET url="" w=false body=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -X) m="$2"; shift ;;
+    -w) w=true; shift ;;
+    -o|-H|--max-time|--data-urlencode) shift ;;
+    --data-binary) body=true; shift ;;
+    http://*|https://*) url="$1" ;;
+  esac
+  shift
+done
+p="/${url#*://*/}"
+b=""
+if $body; then b="$(cat)"; fi
+case "$p" in */protocol/openid-connect/token) cat >/dev/null; echo '{"access_token":"stub"}'; exit 0 ;; esac
+jq -nc --arg m "$m" --arg p "$p" --arg b "$b" '{m: $m, p: $p, b: $b}' >> "$KC_LOG"
+if [ "$m" != GET ]; then
+  if [ "$m" = POST ]; then c=201; else c=204; fi
+  if $w; then printf '%s' "$c"; fi
+  exit 0
+fi
+R=/admin/realms/portcullis
+case "$p" in
+  "$R/clients?max=-1") cat "$KC_FIX/clients.json" ;;
+  "$R/clients?clientId=portcullis-forward-auth") jq -c '[.[] | select(.clientId == "portcullis-forward-auth")]' "$KC_FIX/clients.json" ;;
+  "$R/clients/fwd-uuid") jq -c '.[0]' "$KC_FIX/clients.json" ;;
+  "$R/clients/ai-uuid") jq -c '.[1]' "$KC_FIX/clients.json" ;;
+  "$R/client-scopes") cat "$KC_FIX/scopes.json" ;;
+  "$R/client-scopes/mcp-id") jq -c '.[4]' "$KC_FIX/scopes.json" ;;
+  "$R") echo '{"realm":"portcullis","browserFlow":"portcullis-universal","loginTheme":"portcullis"}' ;;
+  *\?*|*/flows|*/executions|*/client-scopes|*/models|*/instances|*-client-scopes|*/roles) echo '[]' ;;
+  *) echo '{}' ;;
+esac
+STUB
+chmod +x "$WORK/kcbin/curl"
+: > "$WORK/kc/log"
+RC=0
+PATH="$WORK/kcbin:$PATH" KC_LOG="$WORK/kc/log" KC_FIX="$WORK/kc" \
+  "$CLI" keycloak configure >"$WORK/out" 2>"$WORK/err" </dev/null || RC=$?
+expect_eq "keycloak configure (stub admin API) exits 0" "$RC" 0
+[ "$RC" = 0 ] || sed 's/^/    /' "$WORK/err" | tail -5
+expect_eq "keycloak configure listed the clients (the AI client was seen)" \
+  "$(jq -sr '[.[] | select(.m == "GET" and .p == "/admin/realms/portcullis/clients?max=-1")] | length > 0' "$WORK/kc/log")" true
+expect_eq "keycloak configure: no write to the portcullis-ai client or the mcp:* scope" \
+  "$(jq -sc '[.[] | select(.m != "GET") | select((.p | test("ai-uuid|mcp-id")) or (.b | test("portcullis-ai|mcp:")))] | map(.m + " " + .p)' "$WORK/kc/log")" '[]'
+expect_eq "keycloak configure: realm offline bounds + refresh-token rotation pushed" \
+  "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis") | .b | fromjson
+      | select(has("revokeRefreshToken")) | {offlineSessionIdleTimeout, offlineSessionMaxLifespanEnabled, offlineSessionMaxLifespan, revokeRefreshToken, refreshTokenMaxReuse}] | unique' "$WORK/kc/log")" \
+  '[{"offlineSessionIdleTimeout":2592000,"offlineSessionMaxLifespanEnabled":true,"offlineSessionMaxLifespan":7776000,"revokeRefreshToken":true,"refreshTokenMaxReuse":0}]'
+
 expect_eq "docker was never called" "$(cat "$STUB_CALLS" 2>/dev/null)" ""
 
 echo ""

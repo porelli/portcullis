@@ -163,6 +163,7 @@ expect_ok   "hub env: domain" grep -qx 'PORTCULLIS_DOMAIN=hub.test' "$HE"
 expect_ok   "hub env: Traefik IP (compose default)" grep -qx 'PORTCULLIS_TRAEFIK_IP=172.31.250.2' "$HE"
 expect_ok   "hub env: VPN client secret by prefix" grep -qx 'HEADSCALE_OIDC_CLIENT_SECRET=hs-secret' "$HE"
 expect_ok   "hub env: HUB_SHARED_ENV" grep -qx 'MY_APP_VAR=shared' "$HE"
+expect_ok   "hub env: mcp-gate IP (compose default, G42)" grep -qx 'PORTCULLIS_MCP_GATE_IP=172.31.250.3' "$HE"
 expect_fail "hub env: never a core secret" grep -Eq 'pg-secret|hub-secret|kc-secret' "$HE"
 INODE_BEFORE="$(file_inode "$HE")"
 hub_env_run
@@ -197,6 +198,17 @@ chmod 700 "$SP_ROOT/appfiles"
   unset -f users_secret_files monitoring_prepare domains_prepare
   stack_prepare ) >/dev/null 2>&1
 expect_eq "stack_prepare: a 10001-owned appfiles/ keeps its mode" "$(file_mode "$SP_ROOT/appfiles")" 700
+# mcp_gate_data: the gate (10005) writes it, the Hub reads it (group 10001);
+# whichever container starts first creates the volume, so it is created and
+# owned before compose runs. The gate's secrets come with every prepare.
+( PORTCULLIS_ROOT="$SP_ROOT"
+  volume_own() { echo "volume_own $*" >> "$STUB_DIR/sp-vol"; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  mcpgate_ensure_secrets() { echo "mcpgate_ensure_secrets" >> "$STUB_DIR/sp-vol"; }
+  unset -f users_secret_files monitoring_prepare domains_prepare
+  stack_prepare ) >/dev/null 2>&1
+expect_ok "stack_prepare: mcp_gate_data owned 10005:10001" grep -qx 'volume_own mcp_gate_data 10005:10001' "$STUB_DIR/sp-vol"
+expect_ok "stack_prepare: mcp-gate secrets ensured" grep -qx 'mcpgate_ensure_secrets' "$STUB_DIR/sp-vol"
+rm -f "$STUB_DIR/sp-vol"
 rm -f "$STUB_DIR/calls"
 
 # ══ network: IP math / validation ══════════════════════════
@@ -263,6 +275,23 @@ printf '%s' '[{"Subnet":"172.18.5.0/28"}]' > "$STUB_DIR/ipam-json-portcullis_por
 expect_fail "guard: domains network mismatch aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 expect_fail "guard: invalid domains subnet aborts" bash -c "rm -f '$STUB_DIR/ipam-json-portcullis_portcullis-domains'; PORTCULLIS_DOMAINS_SUBNET=172.31.250.0/28; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 rm -f "$STUB_DIR/ipam-json-portcullis_portcullis-domains"
+# mcp-gate's pinned address on portcullis-proxy (contract §2 PORTCULLIS_MCP_GATE_IP).
+unset PORTCULLIS_MCP_GATE_IP
+expect_eq "mcp-gate IP: default" "$(mcp_gate_ip)" 172.31.250.3
+expect_ok "mcp-gate IP: default valid" validate_mcp_gate_ip
+check_gate() { PORTCULLIS_MCP_GATE_IP="$1" validate_mcp_gate_ip; }
+expect_ok   "mcp-gate IP: another static address"           check_gate 172.31.250.40
+expect_fail "mcp-gate IP: inside the dynamic range"         check_gate 172.31.250.200
+expect_fail "mcp-gate IP: outside the subnet"               check_gate 172.31.251.3
+expect_fail "mcp-gate IP: equal to Traefik's"               check_gate 172.31.250.2
+expect_fail "mcp-gate IP: the gateway"                      check_gate 172.31.250.1
+expect_fail "mcp-gate IP: the broadcast address"            check_gate 172.31.250.255
+expect_fail "mcp-gate IP: not an address"                   check_gate 172.31.250
+expect_fail "mcp-gate IP: equal to a custom Traefik IP" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; PORTCULLIS_TRAEFIK_IP=172.31.250.9 PORTCULLIS_MCP_GATE_IP=172.31.250.9 validate_mcp_gate_ip"
+expect_fail "guard: mcp-gate IP in the dynamic range aborts" bash -c "PORTCULLIS_MCP_GATE_IP=172.31.250.130; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+expect_fail "guard: mcp-gate IP = Traefik's aborts" bash -c "PORTCULLIS_MCP_GATE_IP=172.31.250.2; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+expect_fail "guard: mcp-gate IP outside the subnet aborts" bash -c "PORTCULLIS_MCP_GATE_IP=10.0.0.3; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+expect_ok "guard: default mcp-gate IP passes" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 expect_fail "network lib has no migration code" grep -Eq 'proxy_network_(migrate|reconnect)|docker network (connect|disconnect)' "$HERE/../scripts/lib/network.sh"
 
 # ══ certs: write_revoked_serials ═══════════════════════════
@@ -543,6 +572,14 @@ expect_fail "backup: non-snapshot body rejected" snap_check "$WORK/bad.snap"
 source "$HERE/../scripts/lib/keycloak.sh"
 expect_eq "realm export: LDAP federation cachePolicy NO_CACHE" \
   "$(jq -r '.components["org.keycloak.storage.UserStorageProvider"][] | select(.providerId == "ldap") | .config.cachePolicy | join(",")' "$HERE/../keycloak/realm-export.json")" NO_CACHE
+# AI support (contract §8 "Connection length and rotation"): the realm's
+# offline upper bounds (the Hub sets shorter per-client values) and rotating
+# refresh tokens, in the export AND pushed onto existing realms by configure.
+expect_eq "realm export: offline session bounds 30 d idle / 90 d max, refresh tokens rotate" \
+  "$(jq -c '[.offlineSessionIdleTimeout, .offlineSessionMaxLifespanEnabled, .offlineSessionMaxLifespan, .revokeRefreshToken, .refreshTokenMaxReuse]' "$HERE/../keycloak/realm-export.json")" \
+  '[2592000,true,7776000,true,0]'
+expect_eq "keycloak configure: the same realm token settings" "$(printf '%s' "$KC_REALM_TOKEN_SETTINGS" | jq -cS .)" \
+  '{"offlineSessionIdleTimeout":2592000,"offlineSessionMaxLifespan":7776000,"offlineSessionMaxLifespanEnabled":true,"refreshTokenMaxReuse":0,"revokeRefreshToken":true}'
 COMP='{"id":"x","providerId":"ldap","config":{"cachePolicy":["DEFAULT"],"editMode":["READ_ONLY"],"trustEmail":["true"]}}'
 P1="$(printf '%s' "$COMP" | LLDAP_PASS=pw _kc_ldap_patch dc=ex,dc=org)"
 expect_eq "keycloak configure: existing realm patched to NO_CACHE" "$(printf '%s' "$P1" | jq -r '.config.cachePolicy | join(",")')" NO_CACHE
@@ -662,6 +699,60 @@ dom domains_prepare >/dev/null 2>&1
 expect_eq "domains: re-run keeps the CA and age key (no keygen)" "$(openssl x509 -noout -serial -in "$E/ca.crt") $(grep -c keygen "$STUB_DIR/dom-calls")" "$CA1 0"
 expect_eq "domains: public IPs exported for compose" "$(dom eval 'domains_public_ips; echo "$PORTCULLIS_PUBLIC_IPV4/$PORTCULLIS_PUBLIC_IPV6"')" "203.0.113.9/"
 
+# ── mcp-gate files (scripts/lib/mcpgate.sh, contract §15 "Service, networks and secrets") ──
+# shellcheck source=../scripts/lib/mcpgate.sh
+source "$HERE/../scripts/lib/mcpgate.sh"
+MR="$WORK/mcproot"; mkdir -p "$MR/secrets"
+mkdir -p "$WORK/mcpbin"
+cat > "$WORK/mcpbin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/mcp-calls"
+case "$*" in
+  *" keygen") printf '# created: 2026-11-05T10:00:00Z\n# public key: age1mcpgatetestrecipientqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\nAGE-SECRET-KEY-1MCPGATETESTQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ\n' ;;
+esac
+exit 0
+STUB
+chmod +x "$WORK/mcpbin/docker"
+mcp() { (set -euo pipefail; PATH="$WORK/mcpbin:$PATH" PORTCULLIS_ROOT="$MR" "$@"); }
+: > "$STUB_DIR/mcp-calls"
+MOUT="$(mcp mcpgate_ensure_secrets 2>&1)"; expect_eq "mcpgate_ensure_secrets succeeds" "$?" 0
+M="$MR/secrets/mcp-gate"
+expect_ok "mcp-gate: age key generated by the mcp-gate image (offline)" grep -q '^AGE-SECRET-KEY-1' "$M/age.key"
+expect_ok "mcp-gate: keygen ran without network, read-only, as 10005" \
+  grep -q -- 'run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --user 10005:10005 portcullis-mcp-gate keygen' "$STUB_DIR/mcp-calls"
+expect_eq "mcp-gate: age.pub = the key's recipient" "$(cat "$M/age.pub")" "age1mcpgatetestrecipientqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+expect_ok "mcp-gate: hub-secret is 48 random [A-Za-z0-9]" grep -Eqx '[A-Za-z0-9]{48}' "$M/hub-secret"
+expect_eq "mcp-gate: secrets/mcp-gate 0700" "$(file_mode "$M")" 700
+expect_eq "mcp-gate: age.key 0640" "$(file_mode "$M/age.key")" 640
+expect_eq "mcp-gate: age.pub 0640" "$(file_mode "$M/age.pub")" 640
+expect_eq "mcp-gate: hub-secret 0640" "$(file_mode "$M/hub-secret")" 640
+# Groups go through the helper container (the stub): key → 10005, pub + secret → 10001.
+expect_ok "mcp-gate: age.key group 10005 (the gate only)" grep -qE "src=$M/age.key,dst=/t/0 .* chown $(id -u):10005 /t/0\$" "$STUB_DIR/mcp-calls"
+expect_ok "mcp-gate: age.pub + hub-secret group 10001 (Hub; the gate through group_add)" \
+  grep -qE "src=$M/age.pub,dst=/t/0 --mount type=bind,src=$M/hub-secret,dst=/t/1 .* chown $(id -u):10001 /t/0 /t/1\$" "$STUB_DIR/mcp-calls"
+expect_fail "mcp-gate: age.key never gets group 10001" grep -qE "src=$M/age.key,.* chown $(id -u):10001 " "$STUB_DIR/mcp-calls"
+SECRET_NOW="$(cat "$M/hub-secret")"; KEY_NOW="$(grep '^AGE-SECRET-KEY-1' "$M/age.key")"
+case "$MOUT" in *"$SECRET_NOW"*|*"$KEY_NOW"*|*AGE-SECRET-KEY*) t_fail "mcp-gate: a secret was printed" ;; *) t_pass "mcp-gate: no secret printed" ;; esac
+: > "$STUB_DIR/mcp-calls"
+MOUT="$(mcp mcpgate_ensure_secrets 2>&1)"
+expect_eq "mcp-gate: re-run keeps the key, recipient and secret (no keygen)" \
+  "$(cat "$M/hub-secret") $(grep '^AGE-SECRET-KEY-1' "$M/age.key") $(cat "$M/age.pub") $(grep -c keygen "$STUB_DIR/mcp-calls")" \
+  "$SECRET_NOW $KEY_NOW age1mcpgatetestrecipientqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq 0"
+case "$MOUT" in *"$SECRET_NOW"*|*AGE-SECRET-KEY*) t_fail "mcp-gate: a secret was printed on re-run" ;; *) t_pass "mcp-gate: no secret printed on re-run" ;; esac
+# A lost or stale recipient is rewritten from the key; a short secret is replaced.
+rm -f "$M/age.pub"; printf 'short' > "$M/hub-secret"
+mcp mcpgate_ensure_secrets >/dev/null 2>&1
+expect_eq "mcp-gate: missing age.pub rebuilt from age.key" "$(cat "$M/age.pub")" "age1mcpgatetestrecipientqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+expect_ok "mcp-gate: a hub-secret under 32 characters is regenerated" grep -Eqx '[A-Za-z0-9]{48}' "$M/hub-secret"
+echo 'age1stale' > "$M/age.pub"
+mcp mcpgate_ensure_secrets >/dev/null 2>&1
+expect_eq "mcp-gate: stale age.pub rewritten" "$(cat "$M/age.pub")" "age1mcpgatetestrecipientqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+# A key without its recipient line: refuse (never guess, never regenerate over it).
+printf 'AGE-SECRET-KEY-1XYZ\n' > "$M/age.key"
+expect_fail "mcp-gate: an age.key without '# public key:' fails" mcp mcpgate_ensure_secrets
+expect_eq "mcp-gate: ... and is kept" "$(cat "$M/age.key")" "AGE-SECRET-KEY-1XYZ"
+expect_eq "mcp-gate: data volume owner = gate uid, Hub group" "$CT_UID_MCP_GATE:$CT_UID_HUB" "10005:10001"
+
 # ── public address detection (network.sh public_ip_detect; dns setup + domains) ──
 mkdir -p "$WORK/ipbin" "$STUB_DIR/ip"
 cat > "$WORK/ipbin/curl" <<'STUB'
@@ -744,6 +835,10 @@ if echo "$BACKUP_FILE_VOLUMES" | grep -q hub_secrets; then
 else
   t_pass "backup: hub_secrets is excluded from backups"
 fi
+case " $BACKUP_FILE_VOLUMES " in
+  *" mcp_gate_data:10005:10001 "*) t_pass "backup: mcp_gate_data (access log) archived as the gate's uid, Hub group" ;;
+  *) t_fail "backup: mcp_gate_data missing from BACKUP_FILE_VOLUMES ($BACKUP_FILE_VOLUMES)" ;;
+esac
 # The MANIFEST of a backup must never list hub_secrets as a file.
 expect_ok "backup: BACKUP_FILE_VOLUMES does not contain hub_secrets" bash -c '! echo "$BACKUP_FILE_VOLUMES" | grep -q hub_secrets'
 

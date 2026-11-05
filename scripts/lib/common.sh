@@ -257,6 +257,8 @@ CT_UID_HUB=10001      # ghcr.io/porelli/portcullis-hub (USER 10001:10001)
 CT_UID_ENROLL=10002   # enroll/Dockerfile (USER 10002:10002)
 # shellcheck disable=SC2034  # used by domains.sh / backup.sh
 CT_UID_DOMAINS=10004  # domains/Dockerfile (USER 10004:10004)
+# shellcheck disable=SC2034  # used by mcpgate.sh / backup.sh
+CT_UID_MCP_GATE=10005 # mcp-gate/Dockerfile (USER 10005:10005, + group 10001)
 CT_GID_TRAEFIK=0      # Traefik runs as root, but without CAP_DAC_OVERRIDE
 # shellcheck disable=SC2034  # used by backup.sh
 CT_UID_LLDAP=1000     # lldap/lldap:*-rootless (lldap_data is 1000-owned)
@@ -342,12 +344,14 @@ secrets_fix_perms() {
   if declare -F monitoring_fix_perms >/dev/null; then monitoring_fix_perms; fi
   # secrets/domains/ (scripts/lib/domains.sh)
   if declare -F domains_fix_perms >/dev/null; then domains_fix_perms; fi
+  # secrets/mcp-gate/ (scripts/lib/mcpgate.sh)
+  if declare -F mcpgate_fix_perms >/dev/null; then mcpgate_fix_perms; fi
 }
 
 # Core variables the Hub may copy into app .env files (templates reference
 # them as ${VAR}); everything else in .env is a core secret the Hub never
 # sees. Operators can add names via HUB_SHARED_ENV="VAR1 VAR2".
-HUB_ENV_VARS="PORTCULLIS_DOMAIN PORTCULLIS_TRAEFIK_IP PORTCULLIS_PROXY_SUBNET PORTCULLIS_PROXY_IP_RANGE PORTAL_DISPLAY_NAME"
+HUB_ENV_VARS="PORTCULLIS_DOMAIN PORTCULLIS_TRAEFIK_IP PORTCULLIS_MCP_GATE_IP PORTCULLIS_PROXY_SUBNET PORTCULLIS_PROXY_IP_RANGE PORTAL_DISPLAY_NAME"
 HUB_ENV_PREFIXES="HEADSCALE_ HEADPLANE_ NETBIRD_ COTURN_"
 
 # hub_env_write — secrets/hub/core.env, mounted read-only as the Hub's
@@ -369,6 +373,7 @@ hub_env_write() {
     case "$v" in
       PORTCULLIS_DOMAIN) val="${PORTCULLIS_DOMAIN:-portcullis.local}" ;;
       PORTCULLIS_TRAEFIK_IP) val="$(proxy_traefik_ip)" ;;
+      PORTCULLIS_MCP_GATE_IP) val="$(mcp_gate_ip)" ;;
       PORTCULLIS_PROXY_SUBNET) val="$(proxy_subnet)" ;;
       PORTCULLIS_PROXY_IP_RANGE) val="$(proxy_ip_range)" ;;
       PORTAL_DISPLAY_NAME) val="${PORTAL_DISPLAY_NAME:-Portcullis}" ;;
@@ -407,8 +412,8 @@ _ensure_secrets_volume() {
 # need.
 stack_prepare() {
   local d
-  (umask 077 && mkdir -p "$PORTCULLIS_ROOT/secrets/vault-unseal" "$PORTCULLIS_ROOT/secrets/enroll" "$PORTCULLIS_ROOT/secrets/hub" "$PORTCULLIS_ROOT/secrets/domains")
-  for d in secrets secrets/vault-unseal secrets/enroll secrets/hub secrets/domains; do
+  (umask 077 && mkdir -p "$PORTCULLIS_ROOT/secrets/vault-unseal" "$PORTCULLIS_ROOT/secrets/enroll" "$PORTCULLIS_ROOT/secrets/hub" "$PORTCULLIS_ROOT/secrets/domains" "$PORTCULLIS_ROOT/secrets/mcp-gate")
+  for d in secrets secrets/vault-unseal secrets/enroll secrets/hub secrets/domains secrets/mcp-gate; do
     [ -w "$PORTCULLIS_ROOT/$d" ] || fail "$PORTCULLIS_ROOT/$d is not writable (created by Docker as root?). Fix: sudo chown -R \"$(id -un)\" \"$PORTCULLIS_ROOT/secrets\""
   done
   # templates/: the Hub (uid 10001) copies app template dirs here.
@@ -431,6 +436,11 @@ stack_prepare() {
   ct_own "$CT_UID_HUB:$CT_UID_HUB" "$PORTCULLIS_ROOT/appfiles"
   # hub_data is also mounted (read-only) by group-gate, which may create it.
   volume_own hub_data "$CT_UID_HUB:$CT_UID_HUB"
+  # mcp_gate_data: the gate writes it (access log), the Hub mounts it
+  # read-only and reads it through group 10001 (contract §15.8). The gate
+  # sets the directory's mode / group itself at start, so the group here is
+  # already the Hub's (never flipped back while the gate runs).
+  volume_own mcp_gate_data "$CT_UID_MCP_GATE:$CT_UID_HUB"
   # hub_secrets: per-person password hashes (contract §6, file sharing). The
   # Hub checks ownership and mode at start; ensure it here.
   _ensure_secrets_volume
@@ -441,6 +451,8 @@ stack_prepare() {
   if declare -F monitoring_prepare >/dev/null; then monitoring_prepare; fi
   # The domains service's secrets and endpoint certificates (scripts/lib/domains.sh).
   if declare -F domains_prepare >/dev/null; then domains_prepare; fi
+  # The MCP gate's age key, recipient and Hub secret (scripts/lib/mcpgate.sh).
+  if declare -F mcpgate_ensure_secrets >/dev/null; then mcpgate_ensure_secrets; fi
   secrets_fix_perms
 }
 

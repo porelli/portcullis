@@ -798,6 +798,16 @@ services:
       HUB_SECRETS_VOLUME: portcullis_hub_secrets
       # Keycloak public URL for fresh auth (file sharing, contract §8).
       HUB_KEYCLOAK_PUBLIC_URL: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}
+      # AI support (contract §15.7): the Hub's third listener, for mcp-gate
+      # only (X-Portcullis-MCP-Secret = the shared hub-secret file, compared
+      # in constant time). Never a Traefik target (CI checks no router
+      # points at 8890); reachable on every Hub network, the secret is the
+      # protection. The Hub encrypts AI credentials to the gate's recipient
+      # (age.pub; it holds no identity) and reads the gate's access log.
+      HUB_MCP_ADDR: ":8890"
+      HUB_MCP_GATE_SECRET_FILE: /run/portcullis/mcp-gate/hub-secret
+      HUB_MCP_GATE_RECIPIENT_FILE: /run/portcullis/mcp-gate/age.pub
+      HUB_MCP_GATE_DATA_DIR: /mcp-gate-data
     volumes:
       - .:/project:ro
       # Writable overlay: before every `compose up` the Hub copies each app's
@@ -834,6 +844,11 @@ services:
       - ./secrets/hub/lldap:/run/portcullis/lldap:ro
       - ./secrets/hub/invite:/run/portcullis/invite:ro
       - ./secrets/domains/api-secret:/run/portcullis/domains/api-secret:ro
+      # mcp-gate (contract §15): the shared secret, the gate's age recipient
+      # and its access log (written by the gate only).
+      - ./secrets/mcp-gate/hub-secret:/run/portcullis/mcp-gate/hub-secret:ro
+      - ./secrets/mcp-gate/age.pub:/run/portcullis/mcp-gate/age.pub:ro
+      - mcp_gate_data:/mcp-gate-data:ro
       # Per-person secrets (contract §6): file-share password hashes, never
       # backed up, emptied by restore. The Hub checks ownership (10001:10001
       # 0700) at start; ./portcullis init/upgrade/restore ensure it.
@@ -993,6 +1008,84 @@ services:
       retries: 3
     mem_limit: 256m
     pids_limit: 128
+    restart: unless-stopped
+
+  # MCP gate (contract §15): terminates every MCP request — the Keycloak
+  # access token for exactly this resource, the person's population, tool
+  # policy, limits, confirmations, the access log — and forwards it with
+  # the person's identity in the template's form; never the token. No
+  # forward-auth on its routers (MCP clients send bearer tokens, never
+  # cookies; browser routes keep oauth2-proxy, which accepts no bearer).
+  # No Docker access, no LLDAP / Keycloak admin credentials. On
+  # portcullis-proxy at the pinned PORTCULLIS_MCP_GATE_IP (the only peer
+  # that calls companions); on portcullis for Keycloak's JWKS and the Hub's
+  # :8890 listener.
+  mcp-gate:
+    build:
+      context: ./mcp-gate
+    image: portcullis-mcp-gate
+    <<: *hardening
+    read_only: true
+    # USER 10005:10005 in mcp-gate/Dockerfile; group 10001 only: the shared
+    # hub-secret, the Hub's files in hub_data (mcp-gate.json,
+    # mcp-credentials.json, user-attributes.json: the only group-readable
+    # files there) and the access log's group (the Hub reads it).
+    user: "10005:10005"
+    group_add: ["10001"]
+    tmpfs:
+      - /tmp
+    environment:
+      MCP_GATE_LISTEN: ":8080"
+      MCP_GATE_HUB_DATA: /hub-data
+      MCP_GATE_DATA: /data
+      MCP_GATE_AGE_KEY_FILE: /run/portcullis/mcp-gate/age.key
+      MCP_GATE_HUB_SECRET_FILE: /run/portcullis/mcp-gate/hub-secret
+      MCP_GATE_JWKS_URL: http://keycloak:8080/realms/portcullis/protocol/openid-connect/certs
+      MCP_GATE_HUB_URL: http://hub:8890
+    volumes:
+      - hub_data:/hub-data:ro
+      # The access log (contract §15.8): access.jsonl 0640 group 10001, the
+      # directory 0750 (the gate refuses to start if it can't set them).
+      - mcp_gate_data:/data
+      - ./secrets/mcp-gate/age.key:/run/portcullis/mcp-gate/age.key:ro
+      - ./secrets/mcp-gate/hub-secret:/run/portcullis/mcp-gate/hub-secret:ro
+    networks:
+      portcullis: {}
+      portcullis-proxy:
+        ipv4_address: ${PORTCULLIS_MCP_GATE_IP:-172.31.250.3}
+    healthcheck:
+      test: ["CMD", "mcp-gate", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    mem_limit: 256m
+    pids_limit: 256
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: portcullis-proxy
+      traefik.http.services.mcp-gate.loadbalancer.server.port: "8080"
+      # "All my apps" (mcp.<domain>/mcp and its RFC 9728 metadata): every
+      # path of the host goes to the gate, which serves only those two.
+      traefik.http.routers.mcp.rule: Host(`mcp.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.mcp.entrypoints: websecure
+      traefik.http.routers.mcp.tls.options: authaware@file
+      traefik.http.routers.mcp.middlewares: rate-limit@file,security-headers@file
+      traefik.http.routers.mcp.service: mcp-gate
+      # The Portcullis MCP (admin on hub.<domain>, people on people.<domain>):
+      # exact paths only, above the hub / people routers, with the SAME TLS
+      # options as those routers (one SNI host, one TLS option; CI checks).
+      traefik.http.routers.hub-mcp.rule: Host(`hub.${PORTCULLIS_DOMAIN:-portcullis.local}`) && (Path(`/mcp`) || Path(`/.well-known/oauth-protected-resource/mcp`))
+      traefik.http.routers.hub-mcp.entrypoints: websecure
+      traefik.http.routers.hub-mcp.tls.options: authaware@file
+      traefik.http.routers.hub-mcp.priority: "200"
+      traefik.http.routers.hub-mcp.middlewares: rate-limit@file,security-headers@file
+      traefik.http.routers.hub-mcp.service: mcp-gate
+      traefik.http.routers.people-mcp.rule: Host(`people.${PORTCULLIS_DOMAIN:-portcullis.local}`) && (Path(`/mcp`) || Path(`/.well-known/oauth-protected-resource/mcp`))
+      traefik.http.routers.people-mcp.entrypoints: websecure
+      traefik.http.routers.people-mcp.tls.options: authaware@file
+      traefik.http.routers.people-mcp.priority: "200"
+      traefik.http.routers.people-mcp.middlewares: rate-limit@file,security-headers@file
+      traefik.http.routers.people-mcp.service: mcp-gate
     restart: unless-stopped
 
   # ── Monitoring (opt-in: COMPOSE_PROFILES=monitoring in .env, then
@@ -1179,6 +1272,8 @@ volumes:
     name: portcullis_hub_secrets
   traefik_acme:
   domains_data:
+  # The MCP gate's access log (contract §15.8); read-only in the Hub.
+  mcp_gate_data:
   prometheus_data:
   alertmanager_data:
   grafana_data:

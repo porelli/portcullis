@@ -68,6 +68,9 @@ LLDAP_BASE_DN=dc=$(printf '%s' "$domain" | sed 's/\./,dc=/g')
 PORTCULLIS_PROXY_SUBNET=172.31.250.0/24
 PORTCULLIS_PROXY_IP_RANGE=172.31.250.128/25
 PORTCULLIS_TRAEFIK_IP=172.31.250.2
+# mcp-gate's static address there (the only caller of AI companions):
+# inside the subnet, outside the range, never Traefik's.
+PORTCULLIS_MCP_GATE_IP=172.31.250.3
 # Traefik <-> Keycloak network; Keycloak trusts proxy headers only from
 # PORTCULLIS_AUTH_TRAEFIK_IP.
 PORTCULLIS_AUTH_SUBNET=172.31.251.0/28

@@ -44,6 +44,18 @@ updates:
       - dependency-name: "golang"
         versions: [">= 1.28.a, < 1.28", ">= 1.29.a, < 1.29", ">= 1.30.a, < 1.30"]
 
+  # mcp-gate/Dockerfile base images (golang, alpine).
+  - package-ecosystem: docker
+    directory: /mcp-gate
+    schedule:
+      interval: weekly
+    groups:
+      mcp-gate-images:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "golang"
+        versions: [">= 1.28.a, < 1.28", ">= 1.29.a, < 1.29", ">= 1.30.a, < 1.30"]
+
   # group-gate/Dockerfile base image (python).
   - package-ecosystem: docker
     directory: /group-gate

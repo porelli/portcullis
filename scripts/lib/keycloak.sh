@@ -10,6 +10,20 @@
 
 KC_REALM="portcullis"
 
+# AI support (contract §8 "Connection length and rotation"): the realm's
+# offline-session upper bounds (30 d idle, 90 d max; the Hub sets shorter
+# values per AI client) and rotating refresh tokens (revoke on use, reuse
+# 0). Keycloak 26.8 has no per-client "revoke refresh token" setting, so
+# rotation is realm-wide: every client (portcullis-forward-auth, the Hub's
+# fresh-auth and app clients) gets a new refresh token on each refresh and
+# the old one stops working (e2e-login: refresh_rotation). Same values as
+# realm-export.json (imported only into a new realm); pushed on every run.
+# Never touched here: the Hub's AI clients (attribute
+# portcullis.hub.template = portcullis-ai) and its mcp:* client scopes —
+# nothing below reads, rewrites or deletes them.
+# shellcheck disable=SC2034  # read by the tests
+KC_REALM_TOKEN_SETTINGS='{"offlineSessionIdleTimeout": 2592000, "offlineSessionMaxLifespanEnabled": true, "offlineSessionMaxLifespan": 7776000, "revokeRefreshToken": true, "refreshTokenMaxReuse": 0}'
+
 kc_url() { echo "${KEYCLOAK_URL:-http://127.0.0.1:8080}"; }
 
 # kc_login — sets KC_TOKEN (admin-cli password grant on the master realm).
@@ -236,15 +250,15 @@ keycloak_configure() {
     warn "    no LDAP federation component found in realm $KC_REALM"
   fi
 
-  info "Setting ACR→LoA map and the browser flow..."
+  info "Setting ACR→LoA map, offline-session bounds, refresh-token rotation and the browser flow..."
   # Only switch browserFlow if it is unset or the realm's built-in value;
   # an operator's custom flow is preserved.
   # sslRequired=external: browsers only reach Keycloak through Traefik
   # (HTTPS; proxy headers trusted from Traefik only), and "all" would also
   # refuse the invite identity provider's back-channel URLs on the private
   # network (http://enroll:8445, Keycloak's URL check resolves the host).
-  code="$(kc_get "/$KC_REALM" | jq '
-      {sslRequired: "external", attributes: {"acr.loa.map": "{\"public\":\"0\",\"pwd\":\"1\",\"hwk\":\"2\",\"mtls\":\"3\"}"}} +
+  code="$(kc_get "/$KC_REALM" | jq --argjson tok "$KC_REALM_TOKEN_SETTINGS" '
+      {sslRequired: "external", attributes: {"acr.loa.map": "{\"public\":\"0\",\"pwd\":\"1\",\"hwk\":\"2\",\"mtls\":\"3\"}"}} + $tok +
       (if ((.browserFlow // "") == "" or .browserFlow == "portcullis-browser-flow")
        then {browserFlow: "portcullis-universal"} else {} end) +
       # Login theme: unique passkey labels, so a second key (recovery) can be
@@ -709,6 +723,9 @@ API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
     users and groups deleted in LLDAP are removed from Keycloak (hourly sync,
     removeInvalidUsersEnabled, group mapper drops missing groups)
   - sets the ACR→LoA map, sslRequired=external and browserFlow=portcullis-universal
+  - offline sessions at most 30 days idle / 90 days total (the Hub sets
+    shorter values on its AI clients) and rotating refresh tokens (revoke
+    refresh token on, max reuse 0: realm-wide, every client)
   - rebuilds every top-level flow of the file whose tree changed (passkey-only
     browser flow, the invite identity provider's first-login / post-login flows)
   - the invite identity provider portcullis-invite (enroll; URLs + client
@@ -724,6 +741,8 @@ API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
     auth.<domain> callback (keeps the Hub's extra-domain callbacks), and the
     portcullis-invite-client scope (setup links work only through it)
   - creates a credential-less `testuser`, applies PORTAL_DISPLAY_NAME branding
+  - never touches the Hub's AI clients (portcullis.hub.template =
+    portcullis-ai) or its mcp:* client scopes
 
 Options:
   --wipe-realm   delete the realm first and re-import it from the file

@@ -13,7 +13,9 @@ plus a whoami test app with three hosts:
 Sign-in is passkey-only. Every user starts from a one-time setup link
 (`portcullis invite`): open it, register the key, land on the app — the test
 fails on ANY password field. Then: the session reaches the apps, a second
-login in a fresh browser is one passkey touch, the link is single use, a user
+login in a fresh browser is one passkey touch, the link is single use, the
+session survives two refresh-token rotations with concurrent requests
+(refresh_rotation, contract §8), a user
 outside the group is denied, the bootstrap admin's link lands on the portal
 with the Hub link, an unused link cannot sign in to another client through
 the invite identity provider (post-broker deny, contract §8), X.509 login /
@@ -267,6 +269,51 @@ def main() -> int:
         check("apps get the username (not the email) as X-Forwarded-User and the user's attribute headers; "
               "spoofed identity / attribute headers are dropped",
               identity_is_username)
+
+        def refresh_rotation():
+            # Realm-wide refresh-token rotation (AI support, contract §8:
+            # revoke refresh token on, max reuse 0). oauth2-proxy refreshes
+            # the forward-auth session once it is older than a minute
+            # (OAUTH2_PROXY_COOKIE_REFRESH=1m): the session must survive two
+            # refreshes, each with two requests on the same old cookie at
+            # once (concurrent fetches, then two tabs), without a new sign-in.
+            def session_cookie():
+                return sorted((c["name"], c["value"]) for c in ctx.cookies([APP + "/"])
+                              if c["name"].startswith("_oauth2_proxy"))
+            asserted = key.asserted
+            page.goto(APP + "/", wait_until="domcontentloaded")
+            for rnd in (1, 2):
+                before = session_cookie()
+                assert before, "no forward-auth session cookie"
+                page.wait_for_timeout(65_000)
+                if rnd == 1:
+                    got = page.evaluate("""async (u) => {
+                        const rs = await Promise.all([0, 1].map(() =>
+                            fetch(u, {credentials: "include", redirect: "manual", cache: "no-store"})));
+                        return Promise.all(rs.map(async r => [r.status, r.type, (await r.text()).includes("Hostname")]));
+                    }""", APP + "/")
+                    assert got == [[200, "basic", True], [200, "basic", True]], f"concurrent refresh: {got}"
+                else:
+                    tabs = [ctx.new_page(), ctx.new_page()]
+                    try:
+                        for t in tabs:
+                            t.evaluate("u => setTimeout(() => location.assign(u), 0)", APP + "/")
+                        for i, t in enumerate(tabs):
+                            t.wait_for_url(APP + "/", wait_until="domcontentloaded", timeout=TIMEOUT_MS)
+                            shot(t, f"refresh-tab{i}")
+                            assert not on_login_pages(t) and "Hostname" in t.inner_text("body"), \
+                                f"tab {i} after the refresh: {t.url}"
+                    finally:
+                        for t in tabs:
+                            t.close()
+                page.goto(APP + "/", wait_until="domcontentloaded")
+                shot(page, f"refresh-{rnd}")
+                assert not on_login_pages(page) and "Hostname" in page.inner_text("body"), \
+                    f"after refresh {rnd}: {page.url}"
+                assert session_cookie() != before, f"refresh {rnd}: the session cookie was not rewritten"
+            assert key.asserted == asserted, f"{key.asserted - asserted} new passkey sign-ins during the refreshes"
+        check("forward-auth session survives two refresh-token rotations with concurrent requests (no new sign-in)",
+              refresh_rotation)
 
         if os.environ.get("E2E_METRICS"):
             def metrics_needs_admin():
