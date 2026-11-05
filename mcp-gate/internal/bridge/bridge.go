@@ -633,6 +633,13 @@ func (b *Bridge) forward(ctx context.Context, k key, method string, req mcp.Requ
 		return nil, rpcError(mcp.CodeInternalError, "AI support for this app is off")
 	}
 	ev.Instance, ev.Companion = r.Instance, r.Companion
+	// The companion's own clients (§15.2): authz checked them for a
+	// direct request; through the aggregate they are checked here too
+	// (security review: defence in depth), never the aggregate's.
+	if !r.AllowsClient(ev.Client) {
+		ev.Decision = "deny:client"
+		return nil, rpcError(mcp.CodeInvalidParams, r.Label+" isn't available to this AI client")
+	}
 	if !r.Member(k.user, b.now()) {
 		ev.Decision = "deny:population"
 		return nil, rpcError(mcp.CodeInvalidParams, "you no longer have access to "+r.Label)

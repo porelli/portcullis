@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/auth"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/portcullis/mcp-gate/internal/authz"
@@ -329,7 +330,11 @@ func newHarness(t *testing.T, f *config.File, ups map[string]*fakeUp, tweak func
 			loa, _ = strconv.Atoi(v)
 		}
 		r.Header.Set(bridge.RequestIDHeader, fmt.Sprintf("req-%d", h.reqN.Add(1)))
-		h.a.ServeHTTP(w, r, authz.Decision{Status: 200, Reason: "allow", User: r.Header.Get("X-Test-User"), Client: "portcullis-ai-claude", Resource: res, LoA: loa})
+		client := "portcullis-ai-claude"
+		if v := r.Header.Get("X-Test-Client"); v != "" {
+			client = v
+		}
+		h.a.ServeHTTP(w, r, authz.Decision{Status: 200, Reason: "allow", User: r.Header.Get("X-Test-User"), Client: client, Resource: res, LoA: loa})
 	}))
 	t.Cleanup(h.gate.Close)
 	return h
@@ -353,7 +358,7 @@ func (h *harness) eventList() []bridge.Event {
 	return slices.Clone(h.events)
 }
 
-type clientRT struct{ user, loa string }
+type clientRT struct{ user, loa, client string }
 
 func (c *clientRT) RoundTrip(r *http.Request) (*http.Response, error) {
 	r = r.Clone(r.Context())
@@ -363,16 +368,24 @@ func (c *clientRT) RoundTrip(r *http.Request) (*http.Response, error) {
 	if c.loa != "" {
 		r.Header.Set("X-Test-LoA", c.loa)
 	}
+	if c.client != "" {
+		r.Header.Set("X-Test-Client", c.client)
+	}
 	r.Header.Set("X-Forwarded-User", "root") // hostile
 	return http.DefaultTransport.RoundTrip(r)
 }
 
 func (h *harness) connect(user, version, loa string, opts *sdk.ClientOptions) *sdk.ClientSession {
 	h.t.Helper()
+	return h.connectAs(user, "", version, loa, opts)
+}
+
+func (h *harness) connectAs(user, client, version, loa string, opts *sdk.ClientOptions) *sdk.ClientSession {
+	h.t.Helper()
 	c := sdk.NewClient(&sdk.Implementation{Name: "person", Version: "1"}, opts)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	cs, err := c.Connect(ctx, &sdk.StreamableClientTransport{Endpoint: h.gate.URL + "/mcp", HTTPClient: &http.Client{Transport: &clientRT{user: user, loa: loa}}, MaxRetries: -1}, &sdk.ClientSessionOptions{ProtocolVersion: version})
+	cs, err := c.Connect(ctx, &sdk.StreamableClientTransport{Endpoint: h.gate.URL + "/mcp", HTTPClient: &http.Client{Transport: &clientRT{user: user, loa: loa, client: client}}, MaxRetries: -1}, &sdk.ClientSessionOptions{ProtocolVersion: version})
 	if err != nil {
 		h.t.Fatalf("connect %s: %v", user, err)
 	}
@@ -842,3 +855,101 @@ func TestAggregateRefusals(t *testing.T) {
 		_, _ = io.Copy(io.Discard, w.Body)
 	}
 }
+
+// Security review: each upstream's own clients (Resource.clients, §15.2 /
+// §15.4) decide per AI client; the aggregate's own clients never stand in.
+func TestAggregateClientPerUpstream(t *testing.T) {
+	const generic = "portcullis-ai-generic"
+	without := func(f *config.File, r *config.Resource) {
+		r.Clients = slices.DeleteFunc(slices.Clone(r.Clients), func(c string) bool { return c == generic })
+	}
+	people := func(f *config.File) *config.Resource {
+		for i := range f.Resources {
+			if f.Resources[i].Kind == config.KindPeople {
+				return &f.Resources[i]
+			}
+		}
+		return nil
+	}
+	f := vectorFile(t, func(f *config.File) { without(f, resOf(f, "gitea")); without(f, people(f)) })
+	h := newHarness(t, f, twoApps(t), nil)
+
+	// generic: gitea and the people resource omit it → hidden and refused;
+	// no admin tool either (its admin flag is off: not in the admin
+	// resource's clients).
+	cs := h.connectAs("alice", generic, "2025-11-25", "", nil)
+	if got := names(toolMap(t, cs)); !slices.Equal(got, []string{"grafana__search_dashboards"}) {
+		t.Errorf("generic: %v", got)
+	}
+	for _, name := range []string{"gitea__list_issues", "portcullis__my_apps", "portcullis__delete_instance"} {
+		if r, err := cs.CallTool(ctx20(t), &sdk.CallToolParams{Name: name}); err == nil && !r.IsError {
+			t.Errorf("generic called %s", name)
+		}
+	}
+	if n := len(h.ups[giteaUp].headers()); n != 0 {
+		t.Errorf("gitea asked %d times for generic", n)
+	}
+	for _, p := range h.hubPaths() {
+		t.Errorf("the Hub was asked %s for generic", p)
+	}
+	// claude is in every list: everything.
+	if got := names(toolMap(t, h.connectAs("alice", "portcullis-ai-claude", "2025-11-25", "", nil))); !slices.Contains(got, "gitea__list_issues") || !slices.Contains(got, "portcullis__my_apps") {
+		t.Errorf("claude: %v", got)
+	}
+
+	// A table built while gitea allowed generic: once gitea's clients drop
+	// it, the call is refused and logged deny:client.
+	h2 := newHarness(t, vectorFile(t, nil), twoApps(t), nil)
+	cs2 := h2.connectAs("alice", generic, "2025-11-25", "", nil)
+	if _, ok := toolMap(t, cs2)["gitea__list_issues"]; !ok {
+		t.Fatal("gitea missing for generic")
+	}
+	h2.sn.Store(snapshot(vectorFile(t, func(f *config.File) { without(f, resOf(f, "gitea")) })))
+	before := len(h2.ups[giteaUp].callList())
+	if r, err := cs2.CallTool(ctx20(t), &sdk.CallToolParams{Name: "gitea__list_issues"}); err == nil && !r.IsError {
+		t.Errorf("call allowed after gitea dropped the client")
+	}
+	if len(h2.ups[giteaUp].callList()) != before {
+		t.Errorf("gitea called")
+	}
+	evs := h2.eventList()
+	if last := evs[len(evs)-1]; last.Decision != "deny:client" || last.Resource != "https://gitea.example.com/mcp" || last.Client != generic {
+		t.Errorf("event %+v", last)
+	}
+	// Reconcile prunes it from the registry too.
+	h2.a.Reconcile()
+	if _, ok := toolMap(t, cs2)["gitea__list_issues"]; ok {
+		t.Errorf("gitea still listed for generic")
+	}
+}
+
+// Defence in depth: bridge.Forward refuses an aggregate request whose
+// client the companion's resource doesn't allow.
+func TestForwardChecksClient(t *testing.T) {
+	f := vectorFile(t, func(f *config.File) {
+		g := resOf(f, "gitea")
+		g.Clients = []string{"portcullis-ai-claude"}
+	})
+	h := newHarness(t, f, twoApps(t), nil)
+	res := resOf(h.sn.Load().File, "gitea")
+	req := &sdk.CallToolRequest{
+		Params: &sdk.CallToolParamsRaw{Name: "list_issues"},
+		Extra: &sdk.RequestExtra{TokenInfo: &mcpTokenInfo{
+			UserID: "alice\x00https://mcp.example.com/mcp", Expiration: time.Now().Add(time.Hour),
+			Extra: map[string]any{"client": "portcullis-ai-generic"},
+		}},
+	}
+	_, err := h.b.Forward(ctx20(t), bridge.Via{User: "alice", Bound: "https://mcp.example.com/mcp"}, res, "tools/call", req)
+	if err == nil {
+		t.Fatal("Forward allowed a client gitea doesn't list")
+	}
+	if c := h.ups[giteaUp].callList(); len(c) != 0 {
+		t.Errorf("gitea called %v", c)
+	}
+	evs := h.eventList()
+	if len(evs) == 0 || evs[len(evs)-1].Decision != "deny:client" {
+		t.Errorf("events %+v", evs)
+	}
+}
+
+type mcpTokenInfo = auth.TokenInfo

@@ -111,15 +111,19 @@ type Aggregate struct {
 	stopOnce sync.Once
 }
 
+// ekey: one entry per (person, LoA, AI client). The client is part of
+// it because each upstream's own clients decide (Resource.clients,
+// §15.2 / §15.4): two clients of one person can see different apps.
 type ekey struct {
-	user string
-	loa  int
+	user   string
+	loa    int
+	client string
 }
 
 // ident is the request's identity, from ServeHTTP to the middleware.
 type ident struct {
 	ekey
-	client, url string // url: the aggregate resource's
+	url string // the aggregate resource's
 }
 
 type identKey struct{}
@@ -291,9 +295,9 @@ func (a *Aggregate) ServeHTTP(w http.ResponseWriter, r *http.Request, d authz.De
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	k := ekey{user: d.User, loa: d.LoA}
+	k := ekey{user: d.User, loa: d.LoA, client: d.Client}
 	e := a.entryFor(k)
-	r = r.WithContext(context.WithValue(r.Context(), identKey{}, ident{ekey: k, client: d.Client, url: res.URL}))
+	r = r.WithContext(context.WithValue(r.Context(), identKey{}, ident{ekey: k, url: res.URL}))
 	if r.Header.Get("Mcp-Protocol-Version") >= mcp.ProtocolStateless {
 		a.stateless.ServeHTTP(w, r)
 		return
@@ -341,9 +345,10 @@ type upstream struct {
 
 func (u upstream) label() string { return u.res.Label }
 
-// eligible: the companions with aggregate: true whose population has the
-// person and whose min_loa the token meets, then the people resource on
-// the same terms (when the Hub is wired). Admin resources never.
+// eligible: the companions with aggregate: true that allow the token's
+// AI client, whose population has the person and whose min_loa the token
+// meets, then the people resource on the same terms (when the Hub is
+// wired). Admin resources never.
 func (a *Aggregate) eligible(sn *config.Snapshot, k ekey) []upstream {
 	if !usable(sn) {
 		return nil
@@ -381,6 +386,10 @@ func (a *Aggregate) admit(r *config.Resource, k ekey) (upstream, string) {
 	switch {
 	case !r.Aggregate:
 		return upstream{}, "off"
+	case !r.AllowsClient(k.client):
+		// The upstream's own clients decide (the per-client admin flag and
+		// offer live there), never the aggregate's.
+		return upstream{}, "client"
 	case !r.Member(k.user, a.now()):
 		return upstream{}, "population"
 	case k.loa < r.MinLoA:
@@ -429,10 +438,10 @@ func identOf(req mcp.Request, e *entry) (ident, bool) {
 	}
 	loa, _ := ex.TokenInfo.Extra["loa"].(int)
 	client, _ := ex.TokenInfo.Extra["client"].(string)
-	if loa != e.key.loa {
+	if loa != e.key.loa || client != e.key.client {
 		return ident{}, false
 	}
-	return ident{ekey: e.key, client: client, url: aggURL}, true
+	return ident{ekey: e.key, url: aggURL}, true
 }
 
 var errNotAllowed = rpcError(mcp.CodeInvalidParams, "not allowed")
@@ -993,6 +1002,7 @@ func (a *Aggregate) listPeople(ctx context.Context, u upstream, req mcp.Request,
 var denyText = map[string]string{
 	"population": "you no longer have access to %s",
 	"loa":        "%s needs a stronger sign-in than this connection has",
+	"client":     "%s isn't available to this AI client",
 	"off":        "AI support for %s is off",
 }
 
@@ -1021,18 +1031,29 @@ func (a *Aggregate) route(ctx context.Context, e *entry, method string, req mcp.
 	default:
 		return nil, rpcError(mcp.CodeInvalidParams, "missing params")
 	}
-	a.ensure(ctx, e, req, id, true)
-	e.mu.Lock()
-	switch method {
-	case mcp.MethodCallTool:
-		tab = e.tools
-	case mcp.MethodGetPrompt:
-		tab = e.prompts
-	default:
-		tab = e.resources
+	lookup := func() (Target, bool) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		switch method {
+		case mcp.MethodCallTool:
+			tab = e.tools
+		case mcp.MethodGetPrompt:
+			tab = e.prompts
+		default:
+			tab = e.resources
+		}
+		t, ok := tab[name]
+		return t, ok
 	}
-	t, found := tab[name]
-	e.mu.Unlock()
+	// The name in the table before a refresh: if the refresh drops it,
+	// the refusal is logged with that upstream's own reason (client,
+	// population, loa, off), not as an unknown name.
+	before, hadBefore := lookup()
+	a.ensure(ctx, e, req, id, true)
+	t, found := lookup()
+	if !found && hadBefore {
+		t, found = before, true // admit below refuses it, with its reason
+	}
 	if !found {
 		// Logged on the aggregate itself: no upstream was chosen.
 		tool := ""
