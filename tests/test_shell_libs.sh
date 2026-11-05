@@ -917,6 +917,34 @@ chmod +x "$WORK/bin/docker"
 } || t_fail "restore: empties hub_secrets in correct order (restore failed)"
 # Note: docker-orig was already restored by the fail-closed test above
 
+# Test that _ensure_secrets_volume uses the fixed name portcullis_hub_secrets (or HUB_SECRETS_VOLUME),
+# not one derived from COMPOSE_PROJECT_NAME (C4).
+(
+  export PORTCULLIS_ROOT="$WORK/esv-test" COMPOSE_PROJECT_NAME="myproject"
+  mkdir -p "$PORTCULLIS_ROOT"
+  : > "$STUB_DIR/calls"
+  _ensure_secrets_volume
+  if grep -q "volume inspect portcullis_hub_secrets" "$STUB_DIR/calls" && \
+     grep -q "volume create.*portcullis_hub_secrets" "$STUB_DIR/calls"; then
+    t_pass "_ensure_secrets_volume: uses portcullis_hub_secrets even with COMPOSE_PROJECT_NAME=myproject"
+  else
+    t_fail "_ensure_secrets_volume: should use portcullis_hub_secrets, not myproject_hub_secrets: $(tr '\n' '|' < "$STUB_DIR/calls")"
+  fi
+) || t_fail "_ensure_secrets_volume: test failed"
+
+(
+  export PORTCULLIS_ROOT="$WORK/esv-test2" HUB_SECRETS_VOLUME="custom_hub_secrets"
+  mkdir -p "$PORTCULLIS_ROOT"
+  : > "$STUB_DIR/calls"
+  _ensure_secrets_volume
+  if grep -q "volume inspect custom_hub_secrets" "$STUB_DIR/calls" && \
+     grep -q "volume create.*custom_hub_secrets" "$STUB_DIR/calls"; then
+    t_pass "_ensure_secrets_volume: uses HUB_SECRETS_VOLUME when set"
+  else
+    t_fail "_ensure_secrets_volume: should use HUB_SECRETS_VOLUME: $(tr '\n' '|' < "$STUB_DIR/calls")"
+  fi
+) || t_fail "_ensure_secrets_volume with HUB_SECRETS_VOLUME: test failed"
+
 # ── restore with file-sharing apps running (contract §11.6) ──
 # Fake docker: $STUB_DIR/rs-ctr lists "<id> <compose project>" of the
 # containers mounting hub_secrets; `compose -p <p> down` removes <p>'s
@@ -931,6 +959,10 @@ case "$1" in
   compose)
     # Handle: compose --project-directory ... stop hub
     if [[ "$*" == *"--project-directory"*"stop hub" ]]; then
+      exit 0
+    fi
+    # Handle: compose --project-directory ... start hub
+    if [[ "$*" == *"--project-directory"*"start hub" ]]; then
       exit 0
     fi
     if [ "$2" = "-p" ] && [ "$4" = "down" ]; then
@@ -968,29 +1000,88 @@ line_of() { grep -n -m1 -e "$1" "$STUB_DIR/calls" | cut -d: -f1; }
 
 rs_setup
 rs_restore; rc=$?
+stop_hub=$(line_of "^compose --project-directory .* stop hub$")
 down_samba=$(line_of '^compose -p portcullis-samba down$')
 down_tm=$(line_of '^compose -p portcullis-timemachine down$')
 down_core=$(line_of "^compose --project-directory .* down$")
 rm_pg=$(line_of '^volume rm -f portcullis_postgres_data')
-if [ "$rc" = 3 ] && [ -n "$down_samba" ] && [ -n "$down_tm" ] && [ -n "$down_core" ] && [ -n "$rm_pg" ] \
+if [ "$rc" = 3 ] && [ -n "$stop_hub" ] && [ -n "$down_samba" ] && [ -n "$down_tm" ] && [ -n "$down_core" ] && [ -n "$rm_pg" ] \
+   && [ "$stop_hub" -lt "$down_samba" ] && [ "$stop_hub" -lt "$down_tm" ] \
    && [ "$down_samba" -lt "$down_core" ] && [ "$down_tm" -lt "$down_core" ] && [ "$down_core" -lt "$rm_pg" ]; then
-  t_pass "restore: apps mounting hub_secrets are taken down (by project) before core, Vault and Postgres are touched"
+  t_pass "restore: Hub stopped, then apps taken down, then core down, then volumes touched (correct order)"
 else
-  t_fail "restore: apps taken down first (rc=$rc samba=$down_samba tm=$down_tm core=$down_core rm_pg=$rm_pg): $(tr '\n' '|' < "$STUB_DIR/calls")"
+  t_fail "restore: order wrong (rc=$rc stop_hub=$stop_hub samba=$down_samba tm=$down_tm core=$down_core rm_pg=$rm_pg): $(tr '\n' '|' < "$STUB_DIR/calls")"
 fi
 expect_eq "restore: each app project downed once, never the core project by -p" \
   "$(grep -c '^compose -p ' "$STUB_DIR/calls")" "2"
 expect_ok "restore: no app down removes volumes" sh -c "! grep -q '^compose -p .* -v' '$STUB_DIR/calls'"
+
+# Test a failing dc stop hub (N2)
+cat > "$WORK/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/calls"
+case "$1" in
+  compose)
+    # Fail on stop hub
+    if [[ "$*" == *"--project-directory"*"stop hub" ]]; then
+      exit 1
+    fi
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+chmod +x "$WORK/bin/docker"
+rs_setup
+rs_restore; rc=$?
+if [ "$rc" != 0 ] && [ "$rc" != 3 ] \
+   && ! grep -q -e "start hub" -e '--project-directory .* down$' -e '^compose -p ' -e '^volume rm' "$STUB_DIR/calls" \
+   && [ "$(cat "$WORK/rs-root/.env")" = "CURRENT=1" ] && [ -z "$(ls "$WORK/rs-root/backups")" ] \
+   && grep -q "could not stop the Hub" "$WORK/rs-out" && grep -q "nothing was restored" "$WORK/rs-out"; then
+  t_pass "restore: a failing dc stop hub aborts before anything changes (N2)"
+else
+  t_fail "restore: failing stop hub should abort early (rc=$rc): $(tr '\n' '|' < "$STUB_DIR/calls") / $(tr '\n' '|' < "$WORK/rs-out")"
+fi
+
+# Restore the normal stub
+cat > "$WORK/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/calls"
+case "$1" in
+  ps) [ "$*" = "ps -aq --filter volume=portcullis_hub_secrets" ] || exit 0
+      [ -f "$STUB_DIR/rs-ctr" ] && cut -d' ' -f1 "$STUB_DIR/rs-ctr"; exit 0 ;;
+  inspect) awk -v i="${*: -1}" '$1 == i { print $2; f = 1 } END { exit !f }' "$STUB_DIR/rs-ctr"; exit ;;
+  compose)
+    # Handle: compose --project-directory ... stop hub
+    if [[ "$*" == *"--project-directory"*"stop hub" ]]; then
+      exit 0
+    fi
+    # Handle: compose --project-directory ... start hub
+    if [[ "$*" == *"--project-directory"*"start hub" ]]; then
+      exit 0
+    fi
+    if [ "$2" = "-p" ] && [ "$4" = "down" ]; then
+      [ -f "$STUB_DIR/rs-fail-$3" ] && exit 1
+      awk -v p="$3" '$2 != p' "$STUB_DIR/rs-ctr" > "$STUB_DIR/rs-ctr.new" && mv "$STUB_DIR/rs-ctr.new" "$STUB_DIR/rs-ctr"
+    fi
+    exit 0 ;;
+  volume) [ "$2" = inspect ] && exit 1; exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$WORK/bin/docker"
 
 rs_setup
 touch "$STUB_DIR/rs-fail-portcullis-timemachine"
 rs_restore; rc=$?
 if [ "$rc" != 0 ] && [ "$rc" != 3 ] && ! grep -q -e '--project-directory .* down$' -e '^volume rm' -e '^run ' "$STUB_DIR/calls" \
    && [ "$(cat "$WORK/rs-root/.env")" = "CURRENT=1" ] && [ -z "$(ls "$WORK/rs-root/backups")" ] \
-   && grep -q "could not take down portcullis-timemachine" "$WORK/rs-out" && grep -q "nothing was restored" "$WORK/rs-out"; then
-  t_pass "restore: a failed app down aborts before anything changes (no core down, no volume touched, .env kept, no pre-restore copy)"
+   && grep -q "could not take down" "$WORK/rs-out" && grep -q "nothing was restored" "$WORK/rs-out" \
+   && grep -q "Hub running again" "$WORK/rs-out" \
+   && grep -q "^compose --project-directory .* stop hub$" "$STUB_DIR/calls" \
+   && grep -q "^compose --project-directory .* start hub$" "$STUB_DIR/calls"; then
+  t_pass "restore: a failed app down restarts the Hub and aborts with nothing changed (N2)"
 else
-  t_fail "restore: failed app down aborts with nothing changed (rc=$rc): $(tr '\n' '|' < "$STUB_DIR/calls") / $(tr '\n' '|' < "$WORK/rs-out")"
+  t_fail "restore: failed app down should restart Hub (rc=$rc): $(tr '\n' '|' < "$STUB_DIR/calls") / $(tr '\n' '|' < "$WORK/rs-out")"
 fi
 
 rs_setup

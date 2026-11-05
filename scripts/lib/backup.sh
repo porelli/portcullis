@@ -641,8 +641,8 @@ _restore_lldap_guard() {
   return 0
 }
 
-# _restore_stop_secret_apps <volume> <core project> — takes down (compose
-# down, volumes kept) every app project with a container mounting the
+# _restore_stop_secret_apps <volume> <core project> [hub_stopped] — takes down
+# (compose down, volumes kept) every app project with a container mounting the
 # hub_secrets volume (the file-sharing apps' read-only subpath mounts):
 # the restore removes that volume, and Docker refuses to remove a volume
 # any container — running or stopped — still references. Run before
@@ -650,16 +650,31 @@ _restore_lldap_guard() {
 # with nothing changed. The projects taken down are left in
 # RESTORE_STOPPED_APPS (space-separated) for the closing message; they are
 # never started again here (the restore voids their credentials).
+# If hub_stopped=true, returns error codes instead of calling fail (so the
+# caller can restart the Hub).
 RESTORE_STOPPED_APPS=""
+_RESTORE_ERROR_MSG=""
 _restore_stop_secret_apps() {
-  local vol="$1" core="$2" ids id p left empty
-  ids="$(docker ps -aq --filter "volume=$vol")" || fail "can't list the containers using $vol (docker ps failed): nothing was restored"
+  local vol="$1" core="$2" hub_stopped="${3:-false}" ids id p left empty
+  _RESTORE_ERROR_MSG=""
+  if ! ids="$(docker ps -aq --filter "volume=$vol")"; then
+    _RESTORE_ERROR_MSG="can't list the containers using $vol (docker ps failed): nothing was restored"
+    [ "$hub_stopped" = true ] && return 1
+    fail "$_RESTORE_ERROR_MSG"
+  fi
   local projects=""
   for id in $ids; do
-    p="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id")" \
-      || fail "can't inspect container $id (it mounts $vol): nothing was restored"
+    if ! p="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id")"; then
+      _RESTORE_ERROR_MSG="can't inspect container $id (it mounts $vol): nothing was restored"
+      [ "$hub_stopped" = true ] && return 1
+      fail "$_RESTORE_ERROR_MSG"
+    fi
     [ "$p" = "$core" ] && continue
-    [ -n "$p" ] || fail "container $id mounts $vol but isn't part of a compose project: remove it (docker rm -f $id), then restore again. Nothing was restored"
+    if [ -z "$p" ]; then
+      _RESTORE_ERROR_MSG="container $id mounts $vol but isn't part of a compose project: remove it (docker rm -f $id), then restore again. Nothing was restored"
+      [ "$hub_stopped" = true ] && return 1
+      fail "$_RESTORE_ERROR_MSG"
+    fi
     case " $projects " in *" $p "*) ;; *) projects="${projects:+$projects }$p" ;; esac
   done
   [ -n "$projects" ] || return 0
@@ -670,7 +685,9 @@ _restore_stop_secret_apps() {
   for p in $projects; do
     if ! (cd "$empty" && env -u COMPOSE_FILE -u COMPOSE_PROJECT_NAME docker compose -p "$p" down); then
       rmdir "$empty" 2>/dev/null || true
-      fail "could not take down $p (docker compose -p $p down failed): nothing was restored${RESTORE_STOPPED_APPS:+ (already taken down: $RESTORE_STOPPED_APPS)}"
+      _RESTORE_ERROR_MSG="could not take down $p (docker compose -p $p down failed): nothing was restored${RESTORE_STOPPED_APPS:+ (already taken down: $RESTORE_STOPPED_APPS)}"
+      [ "$hub_stopped" = true ] && return 1
+      fail "$_RESTORE_ERROR_MSG"
     fi
     RESTORE_STOPPED_APPS="${RESTORE_STOPPED_APPS:+$RESTORE_STOPPED_APPS }$p"
   done
@@ -680,7 +697,11 @@ _restore_stop_secret_apps() {
     p="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id" 2>/dev/null || true)"
     [ "$p" = "$core" ] || left="${left:+$left }$id${p:+ ($p)}"
   done
-  [ -z "$left" ] || fail "containers still mount $vol after the down: $left — remove them, then restore again. Nothing was restored (taken down: $RESTORE_STOPPED_APPS)"
+  if [ -n "$left" ]; then
+    _RESTORE_ERROR_MSG="containers still mount $vol after the down: $left — remove them, then restore again. Nothing was restored (taken down: $RESTORE_STOPPED_APPS)"
+    [ "$hub_stopped" = true ] && return 1
+    fail "$_RESTORE_ERROR_MSG"
+  fi
 }
 
 backup_restore() {
@@ -702,24 +723,45 @@ backup_restore() {
   # Stop the Hub so it can't restart secret apps, then take down the
   # file-sharing apps holding hub_secrets: all before anything changes
   # (contract §11.6; a failure here leaves everything as it was).
+  hub_stopped=false
   if [ "$had_env" = true ]; then
     _backup_load_cfg
     info "Stopping Hub..."
-    dc stop hub
+    dc stop hub || fail "could not stop the Hub: nothing was restored"
+    hub_stopped=true
     full="$(_volume_name hub_secrets)"
-    _restore_stop_secret_apps "${full:-portcullis_hub_secrets}" "$(_project_name)"
+    if ! _restore_stop_secret_apps "${full:-portcullis_hub_secrets}" "$(_project_name)" true; then
+      info "Restarting Hub..."
+      if dc start hub 2>/dev/null; then
+        fail "$_RESTORE_ERROR_MSG, Hub running again"
+      else
+        fail "$_RESTORE_ERROR_MSG, Hub was stopped but could not be restarted"
+      fi
+    fi
   else
-    _restore_stop_secret_apps portcullis_hub_secrets portcullis
+    _restore_stop_secret_apps portcullis_hub_secrets portcullis false
   fi
   pre="$BACKUP_ROOT/pre-restore-$(date +%Y%m%d-%H%M%S)"
   if [ "$had_env" = true ]; then
     info "Saving the current .env, secrets/ and certs/ to $pre..."
-    (umask 077 && mkdir -p "$pre" && cp "$(env_file)" "$pre/.env" \
+    if ! (umask 077 && mkdir -p "$pre" && cp "$(env_file)" "$pre/.env" \
       && { [ ! -d "$PORTCULLIS_ROOT/secrets" ] || cp -a "$PORTCULLIS_ROOT/secrets" "$pre/secrets"; } \
-      && { [ ! -d "$PORTCULLIS_ROOT/certs" ] || cp -a "$PORTCULLIS_ROOT/certs" "$pre/certs"; })
+      && { [ ! -d "$PORTCULLIS_ROOT/certs" ] || cp -a "$PORTCULLIS_ROOT/certs" "$pre/certs"; }); then
+      if [ "$hub_stopped" = true ]; then
+        info "Restarting Hub..."
+        if dc start hub 2>/dev/null; then
+          fail "could not save pre-restore copy: nothing was restored, Hub running again"
+        else
+          fail "could not save pre-restore copy: nothing was restored, Hub was stopped but could not be restarted"
+        fi
+      else
+        fail "could not save pre-restore copy: nothing was restored"
+      fi
+    fi
     _backup_load_cfg
     info "Stopping services..."
     dc down
+    hub_stopped=false  # dc down includes the Hub, so it's not independently stopped anymore
   fi
 
   # .env in place (keeps a symlink into config/ and the Hub's bind mount).
@@ -792,7 +834,7 @@ backup_restore() {
   ! docker volume inspect "$full" >/dev/null 2>&1 || fail "cannot remove volume $full (still in use? docker ps -a --filter volume=$full)"
   docker volume create --label "com.docker.compose.project=$proj" --label "com.docker.compose.volume=hub_secrets" "$full" >/dev/null \
     || fail "could not create volume $full"
-  # Ensure 10001:10001 0700 (the Hub checks this at start).
+  # Ensure CT_UID_HUB:CT_UID_HUB 0700 (the Hub checks this at start).
   docker run --rm --network none -v "$full:/data" "$helper" \
     sh -c "chown $CT_UID_HUB:$CT_UID_HUB /data && chmod 0700 /data" \
     || fail "could not prepare hub_secrets volume"

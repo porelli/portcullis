@@ -321,6 +321,18 @@ class GateTest(unittest.TestCase):
         self.assertIn("&lt;script&gt;", body_xss)
         self.assertNotIn("<script>alert", body_xss)
 
+    def test_portal_entry_without_url_or_note(self):
+        """A portal entry with urls: [] and no note should render with the fallback text 'No web page.', escaped."""
+        doc = {"version": 1, "apps": [
+            {"id": "tm", "name": "Time Machine", "description": "Backups", "icon": "⏰",
+             "urls": [], "access_group": "users_timemachine"}]}
+        body = self.portal("users_timemachine", doc)
+        self.assertIn("Time Machine", body)
+        self.assertIn("No web page.", body)
+        # No <a> tag in the card
+        card_content = body.split("</h3>")[1].split("</li>")[0]
+        self.assertNotIn("<a", card_content)
+
     def test_portal_strict_csp_allows_only_its_inline_style(self):
         import base64, hashlib, re as _re
         h = {"X-Auth-Request-Preferred-Username": "bob", "X-Auth-Request-Groups": ""}

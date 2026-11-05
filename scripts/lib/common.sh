@@ -387,8 +387,8 @@ hub_env_write() {
 # _ensure_secrets_volume — ensure hub_secrets volume exists with CT_UID_HUB:CT_UID_HUB 0700.
 # Called by init/upgrade/restore (through stack_prepare) per contract §6.
 _ensure_secrets_volume() {
+  local name="${HUB_SECRETS_VOLUME:-portcullis_hub_secrets}"
   local project="${COMPOSE_PROJECT_NAME:-portcullis}"
-  local name="${project}_hub_secrets"
   if ! docker volume inspect "$name" >/dev/null 2>&1; then
     docker volume create --label "com.docker.compose.project=$project" \
       --label "com.docker.compose.volume=hub_secrets" "$name" >/dev/null \
