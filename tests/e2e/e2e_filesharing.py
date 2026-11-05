@@ -856,6 +856,10 @@ def main() -> int:
             row = creds(SMB)["carol"]
             assert row["status"] == "voided" and row.get("reason") == "restore", f"carol after the restore: {row}"
             cid = until("samba running again", lambda: app(SMB), 120)
+            # Running is not listening: wait for the healthcheck (smbd up) before
+            # asserting a logon failure, else a refused connection is what we get.
+            until("samba healthy again", lambda: docker("inspect", "-f", "{{.State.Health.Status}}", cid).strip() == "healthy",
+                  180, every=5)
             state[f"{SMB}_cid"], state[f"{SMB}_ip"] = cid, ip_of(cid)
             ok, out = smb(state[f"{SMB}_ip"], "Home", "carol", state["carol_smb"])
             assert not ok, "carol's password still works after the restore"
