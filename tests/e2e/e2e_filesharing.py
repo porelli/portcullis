@@ -171,7 +171,8 @@ def scrub(text: str) -> str:
         text = text.replace(v, "[password]")
     for h in list(HASHES):
         text = re.sub(re.escape(h), "[hash]", text, flags=re.I)
-    return text
+    # Playwright's errors list the request's headers (session cookies).
+    return re.sub(r"(?im)^(\s*-\s*(?:cookie|authorization):).*$", r"\1 [redacted]", text)
 
 
 def save(name: str, data) -> None:

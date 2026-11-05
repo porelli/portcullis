@@ -3480,7 +3480,7 @@ jobs:
         run: |
           E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
           export E2E_HUB_SECRET
-          /tmp/e2e-venv/bin/python tests/e2e/e2e_filesharing.py
+          NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_filesharing.py
 
       - name: Collect logs
         if: failure()
