@@ -128,7 +128,9 @@ func serve() error {
 	if err != nil {
 		return err
 	}
-	// Checked at start; the Hub API client (mint, confirmations) uses it.
+	// Checked at start; the Hub API client (mint, confirmations; plan 4
+	// task 3) uses it. Wherever T3 compares a presented secret with it,
+	// use crypto/subtle.ConstantTimeCompare — never == or bytes.Equal.
 	if _, err := loadHubSecret(env("MCP_GATE_HUB_SECRET_FILE", defaultHubSecret)); err != nil {
 		return err
 	}
@@ -139,13 +141,7 @@ func serve() error {
 	defer store.Close()
 	v := authz.NewVerifier("", env("MCP_GATE_JWKS_URL", defaultJWKS), nil)
 
-	srv := &http.Server{
-		Addr:              env("MCP_GATE_LISTEN", defaultListen),
-		Handler:           newHandler(store.Snapshot, v),
-		ReadHeaderTimeout: 10 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    64 << 10,
-	}
+	srv := newServer(env("MCP_GATE_LISTEN", defaultListen), newHandler(store.Snapshot, v))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 	go func() {
@@ -159,6 +155,25 @@ func serve() error {
 		return err
 	}
 	return nil
+}
+
+// bodyReadTimeout bounds reading an allowed request's body (8 MiB at
+// most), on top of the server's ReadTimeout.
+var bodyReadTimeout = 30 * time.Second
+
+// newServer: headers within 10 s, a whole request (headers + body) within
+// 60 s, idle keep-alive 120 s, 64 KiB of headers. No WriteTimeout: MCP
+// answers may stream (SSE) for up to the upstream timeout (120 s); the
+// bridge (task 3) bounds each response itself.
+func newServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
 }
 
 func isLoopback(remote string) bool {
@@ -175,6 +190,11 @@ func isLoopback(remote string) bool {
 func newHandler(snap func() *config.Snapshot, v *authz.Verifier) http.Handler {
 	metaH := meta.Handler(snap)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only a plain origin-form, unescaped path is routed (fix round 1).
+		if _, ok := authz.Target(r); !ok {
+			http.Error(w, "bad request target", http.StatusBadRequest)
+			return
+		}
 		if r.URL.Path == "/healthz" && isLoopback(r.RemoteAddr) {
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, "ok\n")
@@ -191,8 +211,16 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier) http.Handler {
 			return
 		}
 		max := sn.File.Limits.MaxRequestBytes
+		// A trickling body can't hold the connection: a read deadline per
+		// request (ErrNotSupported only outside a real server, in tests).
+		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(bodyReadTimeout))
 		body, err := io.ReadAll(io.LimitReader(r.Body, max+1))
 		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				http.Error(w, "request body too slow", http.StatusRequestTimeout)
+				return
+			}
 			http.Error(w, "cannot read the request", http.StatusBadRequest)
 			return
 		}

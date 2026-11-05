@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -26,6 +27,31 @@ const (
 	jwksMaxBytes = 1 << 20
 	jwksTimeout  = 10 * time.Second
 )
+
+// jwksClient is the JWKS fetcher's client: never a redirect (the answer
+// must come from the configured URL), and, when the gate builds it, no
+// proxy from the environment and bounded dials. A caller's client is
+// copied, its CheckRedirect replaced.
+func jwksClient(hc *http.Client) *http.Client {
+	var c http.Client
+	if hc != nil {
+		c = *hc
+	} else {
+		c = http.Client{
+			Timeout: jwksTimeout,
+			Transport: &http.Transport{
+				Proxy:                 nil,
+				DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+				TLSHandshakeTimeout:   5 * time.Second,
+				ResponseHeaderTimeout: jwksTimeout,
+				MaxIdleConns:          2,
+				IdleConnTimeout:       90 * time.Second,
+			},
+		}
+	}
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &c
+}
 
 var signingAlgs = []jose.SignatureAlgorithm{jose.RS256, jose.ES256}
 

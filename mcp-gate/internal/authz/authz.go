@@ -36,6 +36,25 @@ const OffMessage = "AI support is off on this Portcullis"
 type Request struct {
 	Host, Path, Authorization, Origin string
 	Now                               time.Time
+	// BadTarget: the request target isn't a plain origin-form path (see
+	// Target); such a request is refused before anything else.
+	BadTarget bool
+}
+
+// Target is the request's path when the request target is in origin
+// form ("/..."; not absolute-form "https://host/...", not "//...") and
+// unescaped: the path as sent equals the decoded path, so "/%6Dcp" never
+// reaches "/mcp". Anything else is ok == false.
+func Target(r *http.Request) (path string, ok bool) {
+	uri := r.RequestURI
+	if !strings.HasPrefix(uri, "/") || strings.HasPrefix(uri, "//") {
+		return "", false
+	}
+	raw, _, _ := strings.Cut(uri, "?")
+	if r.URL.RawPath != "" || r.URL.EscapedPath() != r.URL.Path || raw != r.URL.Path {
+		return "", false
+	}
+	return r.URL.Path, true
 }
 
 // FromHTTP takes the resource from r.Host and r.URL.Path only: the gate
@@ -43,7 +62,8 @@ type Request struct {
 // repeated Authorization header counts as none; a repeated Origin as one
 // that is never allowed.
 func FromHTTP(r *http.Request, now time.Time) Request {
-	req := Request{Host: r.Host, Path: r.URL.Path, Now: now}
+	path, ok := Target(r)
+	req := Request{Host: r.Host, Path: path, Now: now, BadTarget: !ok}
 	if v := r.Header.Values("Authorization"); len(v) == 1 {
 		req.Authorization = v[0]
 	}
@@ -87,11 +107,8 @@ type Verifier struct {
 // issuer pins it as well (a file naming another issuer then refuses every
 // token).
 func NewVerifier(issuer, jwksURL string, hc *http.Client) *Verifier {
-	if hc == nil {
-		hc = &http.Client{Timeout: jwksTimeout}
-	}
 	v := &Verifier{issuer: issuer, now: time.Now}
-	v.keys = &keySet{url: jwksURL, hc: hc, now: func() time.Time { return v.now() }}
+	v.keys = &keySet{url: jwksURL, hc: jwksClient(hc), now: func() time.Time { return v.now() }}
 	return v
 }
 
@@ -107,6 +124,8 @@ type claims struct {
 	Iat               *jwt.NumericDate `json:"iat"`
 }
 
+var rawUsername = regexp.MustCompile(`^[A-Za-z0-9._@+-]+$`)
+
 var compactJWS = regexp.MustCompile(`^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$`)
 
 func bearer(h string) (string, bool) {
@@ -121,6 +140,9 @@ func bearer(h string) (string, bool) {
 // configuration, the resource, the token (401), then what the token's
 // person may do (403).
 func (v *Verifier) Check(ctx context.Context, sn *config.Snapshot, r Request) Decision {
+	if r.BadTarget {
+		return Decision{Status: http.StatusBadRequest, Reason: "bad_target", Message: "bad request target"}
+	}
 	if sn == nil || sn.Err != nil {
 		return Decision{Status: http.StatusServiceUnavailable, Reason: "config", Message: "AI support is unavailable: the gate's configuration can't be read"}
 	}
@@ -182,7 +204,14 @@ func (v *Verifier) Check(ctx context.Context, sn *config.Snapshot, r Request) De
 		return deny401("audience")
 	}
 
-	user := strings.ToLower(c.PreferredUsername)
+	// ASCII only, checked before and after lowercasing: strings.ToLower
+	// folds e.g. the Kelvin sign U+212A to "k" (fix round 1).
+	user := ""
+	if rawUsername.MatchString(c.PreferredUsername) {
+		if u := strings.ToLower(c.PreferredUsername); config.ValidUsername(u) {
+			user = u
+		}
+	}
 	d := Decision{Status: http.StatusForbidden, Message: "not allowed", User: user, Client: c.Azp, Resource: res}
 	if !slices.Contains(strings.Fields(c.Scope), res.Scope) {
 		d.Reason = "scope"

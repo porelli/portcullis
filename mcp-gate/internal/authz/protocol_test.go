@@ -42,6 +42,25 @@ func TestProtocolVersions(t *testing.T) {
 	if _, err := CheckProtocol(hdr("MCP-Protocol-Version", "2025-03-26"), init("2025-11-25")); err == nil {
 		t.Error("initialize with an unsupported header version accepted")
 	}
+	// Fix round 1, item 4: a header on initialize must equal the body's version.
+	if got, err := CheckProtocol(hdr("MCP-Protocol-Version", "2025-11-25"), init("2025-11-25")); err != nil || got != "2025-11-25" {
+		t.Errorf("initialize, equal header: %q %+v", got, err)
+	}
+	if _, err := CheckProtocol(hdr("MCP-Protocol-Version", "2025-06-18"), init("2025-11-25")); err == nil || err.Status != 400 || err.Code != -32020 {
+		t.Errorf("initialize, header 2025-06-18 vs body 2025-11-25: %+v", err)
+	}
+	// _meta is compared against the effective version: initialize without a
+	// header, body 2025-11-25, _meta 2025-11-25 → fine; _meta 2025-06-18 → -32020.
+	initMeta := func(v, meta string) []byte {
+		return []byte(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"` + v +
+			`","capabilities":{},"clientInfo":{"name":"c","version":"1"},"_meta":{"io.modelcontextprotocol/protocolVersion":"` + meta + `"}}}`)
+	}
+	if _, err := CheckProtocol(http.Header{}, initMeta("2025-11-25", "2025-11-25")); err != nil {
+		t.Errorf("initialize _meta equal: %+v", err)
+	}
+	if _, err := CheckProtocol(http.Header{}, initMeta("2025-11-25", "2025-06-18")); err == nil || err.Code != -32020 {
+		t.Errorf("initialize _meta differs: %+v", err)
+	}
 	// No body (GET stream, DELETE): the header alone.
 	if got, err := CheckProtocol(hdr("MCP-Protocol-Version", "2025-06-18"), nil); err != nil || got != "2025-06-18" {
 		t.Errorf("no body: %q %+v", got, err)

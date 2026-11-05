@@ -38,7 +38,8 @@ func TestProtectedResourceMetadata(t *testing.T) {
 	sn := snapshot(t)
 	h := Handler(func() *config.Snapshot { return sn })
 	get := func(host, path string, hdr ...string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest("GET", "http://"+host+path, nil)
+		r := httptest.NewRequest("GET", path, nil)
+		r.Host = host
 		for i := 0; i < len(hdr); i += 2 {
 			r.Header.Set(hdr[i], hdr[i+1])
 		}
@@ -85,17 +86,28 @@ func TestProtectedResourceMetadata(t *testing.T) {
 			t.Errorf("%s%s: %d", c[0], c[1], w.Code)
 		}
 	}
-	r := httptest.NewRequest("POST", "http://gitea.example.com/.well-known/oauth-protected-resource/mcp", nil)
+	r := httptest.NewRequest("POST", "/.well-known/oauth-protected-resource/mcp", nil)
+	r.Host = "gitea.example.com"
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, r)
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Errorf("POST: %d", w.Code)
 	}
+	// An escaped path never names a resource.
+	r = httptest.NewRequest("GET", "/.well-known/oauth-protected-resource/%6Dcp", nil)
+	r.Host = "gitea.example.com"
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("escaped path: %d", w.Code)
+	}
 	// Off or corrupt: nothing is advertised.
 	for _, bad := range []*config.Snapshot{{Off: true}, {Err: errors.New("x")}, nil} {
 		h := Handler(func() *config.Snapshot { return bad })
 		w := httptest.NewRecorder()
-		h.ServeHTTP(w, httptest.NewRequest("GET", "http://gitea.example.com/.well-known/oauth-protected-resource/mcp", nil))
+		r := httptest.NewRequest("GET", "/.well-known/oauth-protected-resource/mcp", nil)
+		r.Host = "gitea.example.com"
+		h.ServeHTTP(w, r)
 		if w.Code != http.StatusServiceUnavailable {
 			t.Errorf("%+v: %d", bad, w.Code)
 		}

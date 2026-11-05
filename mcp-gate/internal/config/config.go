@@ -286,9 +286,15 @@ func hasControl(s string) bool {
 	return strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 || r == 0x7f })
 }
 
-func validUser(s string) bool {
-	return nonEmpty(s) && strings.ToLower(s) == s && !strings.ContainsRune(s, ' ')
-}
+// usernameR: lowercase ASCII LLDAP usernames only. Matching after
+// lowercasing isn't enough: strings.ToLower maps non-ASCII letters (the
+// Kelvin sign U+212A) onto ASCII ones.
+var usernameR = regexp.MustCompile(`^[a-z0-9._@+-]+$`)
+
+// ValidUsername: a lowercase ASCII username (the population's form).
+func ValidUsername(s string) bool { return usernameR.MatchString(s) }
+
+func validUser(s string) bool { return ValidUsername(s) }
 
 // Clients that may never use an MCP resource (§15.2).
 var forbiddenClients = []string{"portcullis-forward-auth", "portcullis-fresh-auth"}

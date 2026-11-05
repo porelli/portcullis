@@ -60,6 +60,9 @@ func CheckProtocol(h http.Header, body []byte) (version string, err *ProtocolErr
 		if err != nil || !slices.Contains(config.SupportedProtocols, v) {
 			return "", unsupported()
 		}
+		if header != "" && header != v {
+			return "", mismatch("MCP-Protocol-Version does not match initialize's protocolVersion")
+		}
 		version = v
 	}
 	if version == "" {
@@ -68,15 +71,15 @@ func CheckProtocol(h http.Header, body []byte) (version string, err *ProtocolErr
 	if !msg.IsRequest {
 		return version, nil
 	}
-	// _meta protocolVersion (SEP-2575) must match the header.
+	// _meta protocolVersion (SEP-2575) must match the effective version.
 	var p struct {
 		Meta map[string]json.RawMessage `json:"_meta"`
 	}
 	if len(msg.Params) > 0 && json.Unmarshal(msg.Params, &p) == nil {
 		if raw, ok := p.Meta[mcpsdk.MetaKeyProtocolVersion]; ok {
 			var mv string
-			if json.Unmarshal(raw, &mv) != nil || mv != header {
-				return "", mismatch("MCP-Protocol-Version does not match _meta protocolVersion")
+			if json.Unmarshal(raw, &mv) != nil || mv != version {
+				return "", mismatch("the protocol version does not match _meta protocolVersion")
 			}
 		}
 	}

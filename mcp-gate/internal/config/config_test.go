@@ -75,6 +75,8 @@ func TestStrictDecodeRefuses(t *testing.T) {
 		"unsupported protocol":     {"\"2026-07-28\",\n        \"2025-11-25\"", "\"2026-07-28\",\n        \"2025-03-26\""},
 		"unsorted population":      {"\"population\": [\n        \"alice\",\n        \"bob\"\n      ],", "\"population\": [\n        \"bob\",\n        \"alice\"\n      ],"},
 		"uppercase user":           {"\"population\": [\n        \"alice\",\n        \"bob\"\n      ],", "\"population\": [\n        \"Alice\",\n        \"bob\"\n      ],"},
+		"Kelvin sign user":         {"\"population\": [\n        \"alice\"\n      ],\n      \"expiring\": {},\n      \"people\"", "\"population\": [\n        \"alice\",\n        \"\u212aim\"\n      ],\n      \"expiring\": {},\n      \"people\""},
+		"non-ASCII user":           {"\"population\": [\n        \"alice\"\n      ],\n      \"expiring\": {},\n      \"people\"", "\"population\": [\n        \"alice\",\n        \"b\u00f6b\"\n      ],\n      \"expiring\": {},\n      \"people\""},
 		"expiring not UTC":         {`"bob": "2027-03-31T23:59:59Z"`, `"bob": "2027-03-31T23:59:59+02:00"`},
 		"expiring outside pop":     {`"bob": "2027-03-31T23:59:59Z"`, `"zed": "2027-03-31T23:59:59Z"`},
 		"people on app_token":      {`"expiring": {` + "\n        \"bob\"", `"people": {}, "expiring": {` + "\n        \"bob\""},

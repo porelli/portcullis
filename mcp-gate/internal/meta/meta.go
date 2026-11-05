@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/portcullis/mcp-gate/internal/authz"
 	"github.com/portcullis/mcp-gate/internal/config"
 )
 
@@ -39,7 +40,12 @@ func Handler(sn func() *config.Snapshot) http.Handler {
 			http.Error(w, "AI support is off on this Portcullis", http.StatusServiceUnavailable)
 			return
 		}
-		path, ok := strings.CutPrefix(r.URL.Path, Prefix)
+		target, ok := authz.Target(r)
+		if !ok {
+			http.Error(w, "bad request target", http.StatusBadRequest)
+			return
+		}
+		path, ok := strings.CutPrefix(target, Prefix)
 		if !ok || path == "" {
 			http.NotFound(w, r)
 			return

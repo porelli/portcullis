@@ -321,7 +321,8 @@ func TestJWKSOnlyPublicSigningKeys(t *testing.T) {
 
 // G22: routing never reads X-Forwarded-*.
 func TestFromHTTPHostOnly(t *testing.T) {
-	r := httptest.NewRequest("POST", "https://gitea.example.com/mcp?access_token=x", nil)
+	r := httptest.NewRequest("POST", "/mcp?access_token=x", nil)
+	r.Host = "gitea.example.com"
 	r.Header.Set("X-Forwarded-Host", "hub.example.com")
 	r.Header.Set("X-Forwarded-Uri", "/other")
 	r.Header.Set("Origin", "https://claude.ai")
@@ -338,5 +339,135 @@ func TestFromHTTPHostOnly(t *testing.T) {
 	}
 	if got.Origin == "https://claude.ai" || got.Origin == "" {
 		t.Error("two Origin headers accepted")
+	}
+}
+
+// Fix round 1, item 5: a token in the query string, through FromHTTP, is
+// no token; a kid of one key type presented with the other algorithm is
+// refused (kid confusion).
+func TestQueryTokenAndKidConfusion(t *testing.T) {
+	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	ecKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	j := newJWKS(t,
+		jose.JSONWebKey{Key: &rsaKey.PublicKey, KeyID: "rsa1", Algorithm: "RS256", Use: "sig"},
+		jose.JSONWebKey{Key: &ecKey.PublicKey, KeyID: "ec1", Algorithm: "ES256", Use: "sig"},
+		// A key without "alg": its type must still match the token's alg.
+		jose.JSONWebKey{Key: &rsaKey.PublicKey, KeyID: "rsa-noalg", Use: "sig"},
+	)
+	v := NewVerifier(issuer, j.srv.URL, j.srv.Client())
+	sn := loadSnapshot(t)
+	good := signer{rsaKey, "rsa1", jose.RS256}.sign(t, baseClaims(now))
+
+	r := httptest.NewRequest("POST", "/mcp?access_token="+good, nil)
+	r.Host = "gitea.example.com"
+	if d := v.Check(context.Background(), sn, FromHTTP(r, now)); d.Status != 401 || d.Reason != "no_token" {
+		t.Errorf("query token: %d %s", d.Status, d.Reason)
+	}
+	r.Header.Set("Authorization", "Bearer "+good)
+	if d := v.Check(context.Background(), sn, FromHTTP(r, now)); d.Status != 200 {
+		t.Fatalf("header token: %d %s", d.Status, d.Reason)
+	}
+	for name, tok := range map[string]string{
+		"RSA kid with ES256":      signer{ecKey, "rsa1", jose.ES256}.sign(t, baseClaims(now)),
+		"EC kid with RS256":       signer{rsaKey, "ec1", jose.RS256}.sign(t, baseClaims(now)),
+		"alg-less RSA kid, ES256": signer{ecKey, "rsa-noalg", jose.ES256}.sign(t, baseClaims(now)),
+	} {
+		d := v.Check(context.Background(), sn, Request{Host: "gitea.example.com", Path: "/mcp", Authorization: "Bearer " + tok, Now: now})
+		if d.Status != 401 || d.Reason != "bad_token" {
+			t.Errorf("%s: %d %s", name, d.Status, d.Reason)
+		}
+	}
+}
+
+// Fix round 1, item 1: the JWKS fetch never follows a redirect.
+func TestJWKSRedirectRefused(t *testing.T) {
+	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	target := newJWKS(t, jose.JSONWebKey{Key: &rsaKey.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"})
+	redir := httptest.NewServer(http.RedirectHandler(target.srv.URL, http.StatusFound))
+	defer redir.Close()
+	tok := signer{rsaKey, "k1", jose.RS256}.sign(t, baseClaims(now))
+	for name, hc := range map[string]*http.Client{"default client": nil, "caller's client": redir.Client()} {
+		v := NewVerifier(issuer, redir.URL, hc)
+		d := v.Check(context.Background(), loadSnapshot(t), Request{Host: "gitea.example.com", Path: "/mcp", Authorization: "Bearer " + tok, Now: now})
+		if d.Status != 401 {
+			t.Errorf("%s: %d %s", name, d.Status, d.Reason)
+		}
+	}
+	if n := target.fetches.Load(); n != 0 {
+		t.Errorf("the redirect was followed (%d fetches)", n)
+	}
+	// The default client never uses a proxy from the environment.
+	c := jwksClient(nil)
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok || tr.Proxy != nil {
+		t.Error("the default JWKS transport may use a proxy")
+	}
+}
+
+// Fix round 1, item 2: only the exact, unescaped origin-form path names a
+// resource; an escaped path or an absolute-form target is refused.
+func TestRequestTargetStrict(t *testing.T) {
+	sn := loadSnapshot(t)
+	v := NewVerifier(issuer, "http://127.0.0.1:1/none", nil)
+	for _, c := range []struct {
+		target string
+		ok     bool
+	}{
+		{"/mcp", true},
+		{"/mcp?x=1", true},
+		{"/%6Dcp", false},
+		{"/mc%70", false},
+		{"/mcp%2F", false},
+		{"https://gitea.example.com/mcp", false},
+		{"http://gitea.example.com/mcp", false},
+		{"//gitea.example.com/mcp", false},
+	} {
+		r := httptest.NewRequest("POST", c.target, nil)
+		r.Host = "gitea.example.com"
+		r.RequestURI = c.target
+		_, ok := Target(r)
+		if ok != c.ok {
+			t.Errorf("%s: Target ok=%v, want %v", c.target, ok, c.ok)
+		}
+		d := v.Check(context.Background(), sn, FromHTTP(r, now))
+		if c.ok && d.Reason != "no_token" {
+			t.Errorf("%s: %d %s, want the token check", c.target, d.Status, d.Reason)
+		}
+		if !c.ok && (d.Status != 400 || d.Reason != "bad_target") {
+			t.Errorf("%s: %d %s, want 400 bad_target", c.target, d.Status, d.Reason)
+		}
+	}
+}
+
+// Fix round 1, item 3: usernames are ASCII on both sides; the Kelvin sign
+// (U+212A) lowercases to "k" and must not reach a "k" user.
+func TestUsernameASCIIOnly(t *testing.T) {
+	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	j := newJWKS(t, jose.JSONWebKey{Key: &rsaKey.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"})
+	v := NewVerifier(issuer, j.srv.URL, j.srv.Client())
+	b, err := os.ReadFile("../config/testdata/mcp-gate.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := config.DecodeFile([]byte(strings.ReplaceAll(string(b), `"bob"`, `"bok"`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sn := &config.Snapshot{File: f}
+	for user, want := range map[string]int{
+		"bok":       200,
+		"BOK":       200,
+		"bo\u212A":  403, // Kelvin sign: ToLower gives "bok"
+		"BO\u212A":  403,
+		"b\u00f6k":  403,
+		"bok\u0000": 403,
+		"bo k":      403,
+		"":          403,
+	} {
+		tok := signer{rsaKey, "k1", jose.RS256}.sign(t, with(baseClaims(now), "preferred_username", user))
+		d := v.Check(context.Background(), sn, Request{Host: "gitea.example.com", Path: "/mcp", Authorization: "Bearer " + tok, Now: now})
+		if d.Status != want {
+			t.Errorf("%q: %d %s, want %d", user, d.Status, d.Reason, want)
+		}
 	}
 }
