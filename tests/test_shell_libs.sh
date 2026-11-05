@@ -791,22 +791,22 @@ mv "$WORK/bin/docker-orig" "$WORK/bin/docker"
 # F14 ownership test: _ensure_secrets_volume (via stack_prepare) runs helper with chown/chmod,
 # and a failing helper makes it fail.
 : > "$STUB_DIR/calls"
-cat > "$WORK/bin/docker" <<'STUB'
+cat > "$WORK/bin/docker" <<STUB
 #!/usr/bin/env bash
-echo "$*" >> "$STUB_DIR/calls"
-if [ "$1" = "volume" ] && [ "$2" = "inspect" ] && [ "$3" = "portcullis_hub_secrets" ]; then
+echo "\$*" >> "\$STUB_DIR/calls"
+if [ "\$1" = "volume" ] && [ "\$2" = "inspect" ] && [ "\$3" = "portcullis_hub_secrets" ]; then
   # Volume doesn't exist yet
   exit 1
 fi
-if [ "$1" = "volume" ] && [ "$2" = "create" ]; then
+if [ "\$1" = "volume" ] && [ "\$2" = "create" ]; then
   # Check labels are present
-  if echo "$*" | grep -q "com.docker.compose.project=portcullis" && \
-     echo "$*" | grep -q "com.docker.compose.volume=hub_secrets"; then
+  if echo "\$*" | grep -q "com.docker.compose.project=portcullis" && \
+     echo "\$*" | grep -q "com.docker.compose.volume=hub_secrets"; then
     exit 0
   fi
   exit 1
 fi
-if [ "$1" = "run" ] && echo "$*" | grep -q "chown 10001:10001 /v && chmod 0700 /v"; then
+if [ "\$1" = "run" ] && echo "\$*" | grep -q "chown $CT_UID_HUB:$CT_UID_HUB /v && chmod 0700 /v"; then
   # Helper with correct ownership command
   exit 0
 fi
@@ -819,32 +819,32 @@ chmod +x "$WORK/bin/docker"
   cd "$PORTCULLIS_ROOT" || exit 1
   # Call _ensure_secrets_volume (the function in common.sh)
   _ensure_secrets_volume 2>/dev/null
-) && t_pass "F14: _ensure_secrets_volume runs helper with chown 10001:10001 chmod 0700" \
-  || t_fail "F14: _ensure_secrets_volume runs helper with chown 10001:10001 chmod 0700"
+) && t_pass "F14: _ensure_secrets_volume runs helper with chown $CT_UID_HUB:$CT_UID_HUB chmod 0700" \
+  || t_fail "F14: _ensure_secrets_volume runs helper with chown $CT_UID_HUB:$CT_UID_HUB chmod 0700"
 # Verify the calls include volume create with labels and the chown helper
 if grep -q "volume create.*com.docker.compose.project=portcullis.*com.docker.compose.volume=hub_secrets" "$STUB_DIR/calls" && \
-   grep -q "chown 10001:10001 /v && chmod 0700 /v" "$STUB_DIR/calls"; then
+   grep -q "chown $CT_UID_HUB:$CT_UID_HUB /v && chmod 0700 /v" "$STUB_DIR/calls"; then
   t_pass "F14: helper called with correct chown/chmod"
 else
   t_fail "F14: helper called with correct chown/chmod"
 fi
 # Test that a failing helper makes _ensure_secrets_volume fail
 : > "$STUB_DIR/calls"
-cat > "$WORK/bin/docker" <<'STUB'
+cat > "$WORK/bin/docker" <<STUB2
 #!/usr/bin/env bash
-echo "$*" >> "$STUB_DIR/calls"
-if [ "$1" = "volume" ] && [ "$2" = "inspect" ]; then
+echo "\$*" >> "\$STUB_DIR/calls"
+if [ "\$1" = "volume" ] && [ "\$2" = "inspect" ]; then
   exit 1  # doesn't exist
 fi
-if [ "$1" = "volume" ] && [ "$2" = "create" ]; then
+if [ "\$1" = "volume" ] && [ "\$2" = "create" ]; then
   exit 0
 fi
-if [ "$1" = "run" ] && echo "$*" | grep -q "chown.*chmod"; then
+if [ "\$1" = "run" ] && echo "\$*" | grep -q "chown.*chmod"; then
   # Helper fails
   exit 1
 fi
 exit 0
-STUB
+STUB2
 chmod +x "$WORK/bin/docker"
 (
   export PORTCULLIS_ROOT="$WORK/f14-fail-test"
@@ -891,7 +891,7 @@ chmod +x "$WORK/bin/docker"
   docker volume rm -f "$full" >/dev/null 2>&1 || true
   docker volume inspect "$full" >/dev/null 2>&1 && exit 1
   docker volume create --label "com.docker.compose.project=$proj" --label "com.docker.compose.volume=hub_secrets" "$full" >/dev/null || exit 1
-  docker run --rm --network none -v "$full:/data" "$helper" sh -c "chown 10001:10001 /data && chmod 0700 /data" >/dev/null || exit 1
+  docker run --rm --network none -v "$full:/data" "$helper" sh -c "chown $CT_UID_HUB:$CT_UID_HUB /data && chmod 0700 /data" >/dev/null || exit 1
   # Now simulate compose up (would happen later)
   docker compose up -d hub >/dev/null 2>&1 || true
 ) && {
@@ -899,12 +899,12 @@ chmod +x "$WORK/bin/docker"
   calls="$(cat "$STUB_DIR/calls")"
   if echo "$calls" | grep -q "volume rm.*portcullis_hub_secrets" && \
      echo "$calls" | grep -q "volume create.*com.docker.compose.project=portcullis.*com.docker.compose.volume=hub_secrets" && \
-     echo "$calls" | grep -q "run.*chown 10001:10001" && \
+     echo "$calls" | grep -q "run.*chown $CT_UID_HUB:$CT_UID_HUB" && \
      echo "$calls" | grep -q "compose up"; then
     # Check order: find line numbers
     rm_line=$(echo "$calls" | grep -n "volume rm.*portcullis_hub_secrets" | head -1 | cut -d: -f1)
     create_line=$(echo "$calls" | grep -n "volume create.*com.docker.compose" | head -1 | cut -d: -f1)
-    helper_line=$(echo "$calls" | grep -n "run.*chown 10001:10001" | head -1 | cut -d: -f1)
+    helper_line=$(echo "$calls" | grep -n "run.*chown $CT_UID_HUB:$CT_UID_HUB" | head -1 | cut -d: -f1)
     up_line=$(echo "$calls" | grep -n "compose up" | head -1 | cut -d: -f1)
     if [ "$rm_line" -lt "$create_line" ] && [ "$create_line" -lt "$helper_line" ] && [ "$helper_line" -lt "$up_line" ]; then
       t_pass "restore: empties hub_secrets in correct order (rm, create, chown, before compose up)"
@@ -929,6 +929,10 @@ case "$1" in
       [ -f "$STUB_DIR/rs-ctr" ] && cut -d' ' -f1 "$STUB_DIR/rs-ctr"; exit 0 ;;
   inspect) awk -v i="${*: -1}" '$1 == i { print $2; f = 1 } END { exit !f }' "$STUB_DIR/rs-ctr"; exit ;;
   compose)
+    # Handle: compose --project-directory ... stop hub
+    if [[ "$*" == *"--project-directory"*"stop hub" ]]; then
+      exit 0
+    fi
     if [ "$2" = "-p" ] && [ "$4" = "down" ]; then
       [ -f "$STUB_DIR/rs-fail-$3" ] && exit 1
       awk -v p="$3" '$2 != p' "$STUB_DIR/rs-ctr" > "$STUB_DIR/rs-ctr.new" && mv "$STUB_DIR/rs-ctr.new" "$STUB_DIR/rs-ctr"
@@ -981,7 +985,7 @@ expect_ok "restore: no app down removes volumes" sh -c "! grep -q '^compose -p .
 rs_setup
 touch "$STUB_DIR/rs-fail-portcullis-timemachine"
 rs_restore; rc=$?
-if [ "$rc" != 0 ] && [ "$rc" != 3 ] && ! grep -q -e '--project-directory' -e '^volume rm' -e '^run ' "$STUB_DIR/calls" \
+if [ "$rc" != 0 ] && [ "$rc" != 3 ] && ! grep -q -e '--project-directory .* down$' -e '^volume rm' -e '^run ' "$STUB_DIR/calls" \
    && [ "$(cat "$WORK/rs-root/.env")" = "CURRENT=1" ] && [ -z "$(ls "$WORK/rs-root/backups")" ] \
    && grep -q "could not take down portcullis-timemachine" "$WORK/rs-out" && grep -q "nothing was restored" "$WORK/rs-out"; then
   t_pass "restore: a failed app down aborts before anything changes (no core down, no volume touched, .env kept, no pre-restore copy)"
@@ -996,7 +1000,7 @@ sed -i.bak 's/awk -v p="$3" .\$2 != p. "$STUB_DIR\/rs-ctr" > "$STUB_DIR\/rs-ctr.
 touch "$STUB_DIR/rs-stick"
 rs_restore; rc=$?
 rm -f "$STUB_DIR/rs-stick"
-if [ "$rc" != 0 ] && [ "$rc" != 3 ] && ! grep -q -e '--project-directory' -e '^volume rm' "$STUB_DIR/calls" \
+if [ "$rc" != 0 ] && [ "$rc" != 3 ] && ! grep -q -e '--project-directory .* down$' -e '^volume rm' "$STUB_DIR/calls" \
    && grep -q "still mount portcullis_hub_secrets" "$WORK/rs-out"; then
   t_pass "restore: a container still mounting hub_secrets after the down aborts with nothing changed"
 else

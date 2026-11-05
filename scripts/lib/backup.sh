@@ -699,10 +699,13 @@ backup_restore() {
   fi
 
   [ -f "$(env_file)" ] && had_env=true
-  # File-sharing apps hold hub_secrets: down before anything changes
+  # Stop the Hub so it can't restart secret apps, then take down the
+  # file-sharing apps holding hub_secrets: all before anything changes
   # (contract §11.6; a failure here leaves everything as it was).
   if [ "$had_env" = true ]; then
     _backup_load_cfg
+    info "Stopping Hub..."
+    dc stop hub
     full="$(_volume_name hub_secrets)"
     _restore_stop_secret_apps "${full:-portcullis_hub_secrets}" "$(_project_name)"
   else
@@ -785,7 +788,6 @@ backup_restore() {
   info "Emptying hub_secrets volume..."
   full="$(_volume_name hub_secrets)"
   [ -n "$full" ] || full="portcullis_hub_secrets"
-  [ -n "$full" ] || fail "hub_secrets volume name is empty (compose config issue)"
   docker volume rm -f "$full" >/dev/null 2>&1 || true
   ! docker volume inspect "$full" >/dev/null 2>&1 || fail "cannot remove volume $full (still in use? docker ps -a --filter volume=$full)"
   docker volume create --label "com.docker.compose.project=$proj" --label "com.docker.compose.volume=hub_secrets" "$full" >/dev/null \
