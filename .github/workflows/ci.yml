@@ -276,6 +276,11 @@ jobs:
               and .networks["portcullis-mcp"].name == "portcullis-mcp" and .networks["portcullis-mcp"].internal == true
               and .networks["portcullis-mcp"].ipam.config[0].subnet == "172.31.253.0/28"
               and ([.services | to_entries[] | select((.value.networks // {}) | has("portcullis-mcp")) | .key] | sort == ["hub", "keycloak", "mcp-gate"])
+              and .networks["portcullis-mcp"].ipam.config[0].ip_range == "172.31.253.8/29"
+              and .services.keycloak.networks["portcullis-mcp"].ipv4_address == "172.31.253.2"
+              and .services.hub.networks["portcullis-mcp"].ipv4_address == "172.31.253.3"
+              and ($g.networks["portcullis-mcp"].ipv4_address // null) == null
+              and ($g.extra_hosts | sort) == ["hub=172.31.253.3", "keycloak=172.31.253.2"]
               and ([.services | to_entries[] | select(.value.networks["portcullis-proxy"].ipv4_address? != null) | "\(.key)=\(.value.networks["portcullis-proxy"].ipv4_address)"] | sort == ["mcp-gate=172.31.250.3", "traefik=172.31.250.2"])
               and $g.user == "10005:10005" and $g.group_add == ["10001"] and $g.read_only == true
               and ($g.tmpfs // [] | index("/tmp")) != null and ($g.ports // []) == []
@@ -324,6 +329,9 @@ jobs:
           diff <(bash -c 'source scripts/lib/common.sh; source scripts/lib/network.sh; printf "%s\n" $CORE_SERVICE_NAMES' | sort) \
                <(docker compose -f docker-compose.yml --profile '*' config --services | sort) \
             || { echo "FAIL: CORE_SERVICE_NAMES (scripts/lib/network.sh) differs from docker-compose.yml's services"; exit 1; }
+          diff <(bash -c 'source scripts/lib/common.sh; source scripts/lib/network.sh; printf "%s\n" $CORE_PROXY_SERVICES' | sort) \
+               <(docker compose -f docker-compose.yml --profile '*' config --format json | jq -r '.services | to_entries[] | select((.value.networks // {}) | has("portcullis-proxy")) | .key' | sort) \
+            || { echo "FAIL: CORE_PROXY_SERVICES (scripts/lib/network.sh) differs from the core services on portcullis-proxy"; exit 1; }
           # oauth2-proxy never accepts bearer tokens on browser routes (contract §5).
           if grep -nE '^\s*skipJwtBearerTokens:\s*true' oauth2-proxy/alpha.yaml \
              || grep -rniE 'skip[-_]jwt[-_]bearer[-_]tokens' docker-compose*.yml oauth2-proxy/; then
@@ -1524,14 +1532,22 @@ jobs:
           # reaches Keycloak's JWKS (and resolves hub) there, and no other core service.
           docker network inspect portcullis-mcp | jq -e '.[0].Internal == true and .[0].IPAM.Config[0].Subnet == "172.31.253.0/28"' >/dev/null \
             || { echo "FAIL: portcullis-mcp network (internal, subnet)"; exit 1; }
+          # keycloak / hub come from /etc/hosts (extra_hosts), pinned to their
+          # portcullis-mcp addresses, which really are theirs.
+          docker exec "$CID" cat /etc/hosts > /tmp/gate-hosts
+          if ! grep -qE '^172\.31\.253\.2[[:space:]]+keycloak$' /tmp/gate-hosts || ! grep -qE '^172\.31\.253\.3[[:space:]]+hub$' /tmp/gate-hosts; then
+            echo "FAIL: the gate's /etc/hosts lacks the pinned keycloak / hub:"; cat /tmp/gate-hosts; exit 1
+          fi
+          for s in keycloak:172.31.253.2 hub:172.31.253.3; do
+            got="$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis-mcp").IPAddress}}' "$(docker compose ps -q "${s%%:*}")")"
+            [ "$got" = "${s#*:}" ] || { echo "FAIL: ${s%%:*} is $got on portcullis-mcp (pinned ${s#*:})"; exit 1; }
+          done
           docker exec "$CID" wget -q -T 5 -O /dev/null http://keycloak:8080/realms/portcullis/protocol/openid-connect/certs \
             || { echo "FAIL: the gate can't read Keycloak's JWKS over portcullis-mcp"; exit 1; }
-          if docker exec "$CID" wget -q -T 3 -O /dev/null http://hub:8890/healthz 2>&1 | grep -q 'bad address'; then
-            echo "FAIL: the gate can't resolve hub"; exit 1
-          fi
+          # No other core service is reachable by name from the gate.
           for other in lldap vault postgres group-gate enroll domains forward-auth socket-proxy-hub; do
-            if ! docker exec "$CID" wget -q -T 3 -O /dev/null "http://$other/" 2>&1 | grep -q 'bad address'; then
-              echo "FAIL: the gate resolves $other (it must reach only Keycloak and the Hub)"; exit 1
+            if out="$(docker exec "$CID" nslookup "$other" 2>&1)"; then
+              echo "FAIL: the gate resolves $other (it must reach only Keycloak and the Hub): $out"; exit 1
             fi
           done
           if docker exec "$CID" sh -c 'touch /x' 2>/dev/null; then echo "FAIL: mcp-gate rootfs is writable"; exit 1; fi

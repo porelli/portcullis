@@ -88,7 +88,8 @@ status_run() {
   # A non-core container answering to a core service name on portcullis-proxy
   # (network.sh proxy_dns_shadows; up / upgrade refuse to run while it lasts).
   local shadows
-  shadows="$(proxy_dns_shadows)"
+  # A docker error is a problem too (fail closed), shown as one line.
+  shadows="$(proxy_dns_shadows)" || shadows="(docker) the containers on portcullis-proxy can't be inspected"
   [ -z "$shadows" ] || problems=1
 
   if [ "$json" = true ]; then
@@ -158,7 +159,10 @@ status_run() {
   local shadow
   while read -r shadow; do
     [ -n "$shadow" ] || continue
-    _st_line fail "portcullis-proxy: container ${shadow%% *} answers to the core name ${shadow#* }"
+    case "$shadow" in
+      "(docker) "*) _st_line fail "portcullis-proxy: ${shadow#(docker) } (core-name check failed closed)" ;;
+      *) _st_line fail "portcullis-proxy: container ${shadow%% *} answers to the core name ${shadow#* }" ;;
+    esac
   done <<< "$shadows"
 
   printf '\n%sDomain: %s — run with --json for machine-readable output%s\n\n' "$C_DIM" "${PORTCULLIS_DOMAIN:-?}" "$C_NC"

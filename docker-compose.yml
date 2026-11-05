@@ -57,14 +57,16 @@ networks:
   # domains' egress: ACME, the DNS providers' APIs, the public resolvers.
   domains-egress: {}
   # mcp-gate ⇄ Keycloak (JWKS) and the Hub (:8890) only (contract §15):
-  # the gate resolves `keycloak` and `hub` here, never on a network apps
-  # join. Fixed subnet (network.sh validates PORTCULLIS_MCP_SUBNET).
+  # Keycloak and the Hub are pinned outside the dynamic range, and the gate
+  # maps both names to those addresses (extra_hosts): it never resolves
+  # them through DNS. network.sh validates PORTCULLIS_MCP_*.
   portcullis-mcp:
     name: portcullis-mcp
     internal: true
     ipam:
       config:
         - subnet: ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28}
+          ip_range: ${PORTCULLIS_MCP_IP_RANGE:-172.31.253.8/29}
 
 # Hardening defaults (see docs/hardening.md for per-service exceptions).
 x-hardening: &hardening
@@ -445,10 +447,11 @@ services:
       - ./keycloak/themes/portcullis:/opt/keycloak/themes/portcullis:ro
       - ./certs/truststore:/opt/keycloak/conf/truststores/portcullis:ro
     networks:
-      - portcullis
-      - portcullis-auth
-      # mcp-gate reads the JWKS here (contract §15).
-      - portcullis-mcp
+      portcullis: {}
+      portcullis-auth: {}
+      # mcp-gate reads the JWKS here (contract §15), at this pinned address.
+      portcullis-mcp:
+        ipv4_address: ${PORTCULLIS_MCP_KEYCLOAK_IP:-172.31.253.2}
     healthcheck:
       test: ["CMD", "bash", "-c", "{ printf 'HEAD /health/ready HTTP/1.0\\r\\n\\r\\n' >&0; grep 'HTTP/1.0 200'; } 0<>/dev/tcp/localhost/9000"]
       interval: 10s
@@ -865,11 +868,12 @@ services:
       # 0700) at start; ./portcullis init/upgrade/restore ensure it.
       - hub_secrets:/secrets
     networks:
-      - portcullis
-      - socket-proxy-hub
-      - portcullis-domains
-      # mcp-gate → the Hub's :8890 listener (contract §15.7).
-      - portcullis-mcp
+      portcullis: {}
+      socket-proxy-hub: {}
+      portcullis-domains: {}
+      # mcp-gate → the Hub's :8890 listener (contract §15.7), at this pinned address.
+      portcullis-mcp:
+        ipv4_address: ${PORTCULLIS_MCP_HUB_IP:-172.31.253.3}
     mem_limit: 1g
     pids_limit: 512
     labels:
@@ -1067,6 +1071,12 @@ services:
       portcullis-mcp: {}
       portcullis-proxy:
         ipv4_address: ${PORTCULLIS_MCP_GATE_IP:-172.31.250.3}
+    # MCP_GATE_JWKS_URL / MCP_GATE_HUB_URL name keycloak and hub: /etc/hosts
+    # pins them to their portcullis-mcp addresses (never DNS, which a
+    # container answering to those names elsewhere could shadow).
+    extra_hosts:
+      - "keycloak:${PORTCULLIS_MCP_KEYCLOAK_IP:-172.31.253.2}"
+      - "hub:${PORTCULLIS_MCP_HUB_IP:-172.31.253.3}"
     healthcheck:
       test: ["CMD", "mcp-gate", "healthcheck"]
       interval: 10s
