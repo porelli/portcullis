@@ -516,7 +516,10 @@ def sign_in(browser, who: str):
 
 
 def open_myapps(page: Page, instance: str):
+    # A fresh load: a goto to the URL the page is already on (only the
+    # hash) wouldn't reload, and the cards would be the old ones.
     page.goto(PEOPLE + "/#myapps", wait_until="domcontentloaded")
+    page.reload(wait_until="domcontentloaded")
     deadline = time.time() + 60
     while time.time() < deadline:
         if base.on_login_pages(page):
@@ -847,6 +850,9 @@ def main() -> int:
             ok, out = smb(state[f"{SMB}_ip"], "Home", "carol", state["carol_smb"])
             assert not ok, "carol's password still works after the restore"
             _, page, _ = ses["carol"]
+            me = page.request.get(PEOPLE + "/api/me/apps")
+            cred = next(c for a in me.json()["apps"] if a["id"] == SMB for c in a["credentials"] if c["key"] == KEY)
+            assert cred["status"] == "voided" and cred.get("reason") == "restore", f"carol's /api/me/apps credential: {cred}"
             card = open_myapps(page, SMB)
             assert card.get_attribute("data-ma-status-kind") == "voided", card.get_attribute("data-ma-status-kind")
             assert "reset by a restore" in card.inner_text(), card.inner_text()
