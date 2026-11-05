@@ -209,7 +209,7 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier) http.Handler {
 		// Forwarding to the resource's upstream comes with the bridge
 		// (plan 4, tasks 3 and 5). Until then an allowed request is
 		// refused: never answered without its upstream.
-		log.Printf("mcp-gate: %s %s%s user=%s client=%s allow (no forwarding yet)", r.Method, d.Resource.Host, d.Resource.Path(), d.User, d.Client)
+		log.Printf("mcp-gate: %s %s%q user=%q client=%q allow (no forwarding yet)", r.Method, d.Resource.Host, d.Resource.Path(), d.User, d.Client)
 		http.Error(w, "MCP forwarding is not available in this build", http.StatusServiceUnavailable)
 	})
 }
@@ -219,6 +219,6 @@ func refuse(w http.ResponseWriter, r *http.Request, d authz.Decision) {
 		w.Header().Set("WWW-Authenticate", d.WWWAuthenticate)
 	}
 	// Never the Authorization header or the token.
-	log.Printf("mcp-gate: %s %s%s %d deny:%s user=%s client=%s", r.Method, config.NormalizeHost(r.Host), r.URL.Path, d.Status, d.Reason, d.User, d.Client)
+	log.Printf("mcp-gate: %s %s%q %d deny:%s user=%q client=%q", r.Method, config.NormalizeHost(r.Host), r.URL.Path, d.Status, d.Reason, d.User, d.Client)
 	http.Error(w, d.Message, d.Status)
 }
