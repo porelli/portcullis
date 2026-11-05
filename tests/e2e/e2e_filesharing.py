@@ -859,7 +859,7 @@ def main() -> int:
             state[f"{SMB}_cid"], state[f"{SMB}_ip"] = cid, ip_of(cid)
             ok, out = smb(state[f"{SMB}_ip"], "Home", "carol", state["carol_smb"])
             assert not ok, "carol's password still works after the restore"
-            assert b"NT_STATUS_LOGON_FAILURE" in out, f"NT_STATUS_LOGON_FAILURE not in output: {out[:500]}"
+            assert "NT_STATUS_LOGON_FAILURE" in out, f"NT_STATUS_LOGON_FAILURE not in output: {out[:500]}"
             _, page, _ = ses["carol"]
             me = page.request.get(PEOPLE + "/api/me/apps")
             cred = next(c for a in me.json()["apps"] if a["id"] == SMB for c in a["credentials"] if c["key"] == KEY)
@@ -990,7 +990,7 @@ def main() -> int:
               180, every=5)
         ok, out = smb(ip_of(cid), "Home", "carol", state["carol_active"])
         assert not ok, "carol's password still works after the core restore"
-        assert b"NT_STATUS_LOGON_FAILURE" in out, f"NT_STATUS_LOGON_FAILURE not in smbclient output: {out[:500]}"
+        assert "NT_STATUS_LOGON_FAILURE" in out, f"NT_STATUS_LOGON_FAILURE not in smbclient output: {out[:500]}"
         p = subprocess.run(["docker", "logs", container("portcullis", "hub")], capture_output=True, timeout=60)
         assert not hash_hits(p.stdout + p.stderr, "hub logs"), "a hash in the Hub's logs after the restore"
     check("restore_core: ./portcullis backup (no hash in it) → ./portcullis restore with both apps running: it takes "
