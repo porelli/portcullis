@@ -917,6 +917,97 @@ chmod +x "$WORK/bin/docker"
 } || t_fail "restore: empties hub_secrets in correct order (restore failed)"
 # Note: docker-orig was already restored by the fail-closed test above
 
+# ── restore with file-sharing apps running (contract §11.6) ──
+# Fake docker: $STUB_DIR/rs-ctr lists "<id> <compose project>" of the
+# containers mounting hub_secrets; `compose -p <p> down` removes <p>'s
+# (fails while $STUB_DIR/rs-fail-<p> exists); every call is logged.
+cat > "$WORK/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/calls"
+case "$1" in
+  ps) [ "$*" = "ps -aq --filter volume=portcullis_hub_secrets" ] || exit 0
+      [ -f "$STUB_DIR/rs-ctr" ] && cut -d' ' -f1 "$STUB_DIR/rs-ctr"; exit 0 ;;
+  inspect) awk -v i="${*: -1}" '$1 == i { print $2; f = 1 } END { exit !f }' "$STUB_DIR/rs-ctr"; exit ;;
+  compose)
+    if [ "$2" = "-p" ] && [ "$4" = "down" ]; then
+      [ -f "$STUB_DIR/rs-fail-$3" ] && exit 1
+      awk -v p="$3" '$2 != p' "$STUB_DIR/rs-ctr" > "$STUB_DIR/rs-ctr.new" && mv "$STUB_DIR/rs-ctr.new" "$STUB_DIR/rs-ctr"
+    fi
+    exit 0 ;;
+  volume) [ "$2" = inspect ] && exit 1; exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$WORK/bin/docker"
+# rs_restore: backup_restore over a fake backup; checks/config stubbed,
+# stops at the first logical restore (_restore_pg exits 3).
+rs_restore() {
+  (
+    export PORTCULLIS_ROOT="$WORK/rs-root" BACKUP_ROOT="$WORK/rs-root/backups"
+    _backup_check_layout() { :; }; _backup_check_manifest() { :; }; network_check() { :; }
+    stack_prepare() { :; }; env_reload() { :; }
+    _backup_load_cfg() {
+      _BACKUP_CFG='{"name":"portcullis","volumes":{"hub_secrets":{"name":"portcullis_hub_secrets"},"postgres_data":{"name":"portcullis_postgres_data"},"vault_data":{"name":"portcullis_vault_data"}}}'
+    }
+    _restore_pg() { exit 3; }
+    backup_restore "$WORK/rs-backup" true false
+  ) >"$WORK/rs-out" 2>&1
+}
+rs_setup() {
+  rm -rf "$WORK/rs-root" "$WORK/rs-backup"; mkdir -p "$WORK/rs-root/backups" "$WORK/rs-backup"
+  echo 'CURRENT=1' > "$WORK/rs-root/.env"; echo 'RESTORED=1' > "$WORK/rs-backup/.env"
+  printf '{"created":"x","domain":"d"}' > "$WORK/rs-backup/MANIFEST.json"
+  printf 'c1 portcullis\nc2 portcullis-samba\nc3 portcullis-timemachine\nc4 portcullis-samba\n' > "$STUB_DIR/rs-ctr"
+  rm -f "$STUB_DIR"/rs-fail-*; : > "$STUB_DIR/calls"
+}
+line_of() { grep -n -m1 -e "$1" "$STUB_DIR/calls" | cut -d: -f1; }
+
+rs_setup
+rs_restore; rc=$?
+down_samba=$(line_of '^compose -p portcullis-samba down$')
+down_tm=$(line_of '^compose -p portcullis-timemachine down$')
+down_core=$(line_of "^compose --project-directory .* down$")
+rm_pg=$(line_of '^volume rm -f portcullis_postgres_data')
+if [ "$rc" = 3 ] && [ -n "$down_samba" ] && [ -n "$down_tm" ] && [ -n "$down_core" ] && [ -n "$rm_pg" ] \
+   && [ "$down_samba" -lt "$down_core" ] && [ "$down_tm" -lt "$down_core" ] && [ "$down_core" -lt "$rm_pg" ]; then
+  t_pass "restore: apps mounting hub_secrets are taken down (by project) before core, Vault and Postgres are touched"
+else
+  t_fail "restore: apps taken down first (rc=$rc samba=$down_samba tm=$down_tm core=$down_core rm_pg=$rm_pg): $(tr '\n' '|' < "$STUB_DIR/calls")"
+fi
+expect_eq "restore: each app project downed once, never the core project by -p" \
+  "$(grep -c '^compose -p ' "$STUB_DIR/calls")" "2"
+expect_ok "restore: no app down removes volumes" sh -c "! grep -q '^compose -p .* -v' '$STUB_DIR/calls'"
+
+rs_setup
+touch "$STUB_DIR/rs-fail-portcullis-timemachine"
+rs_restore; rc=$?
+if [ "$rc" != 0 ] && [ "$rc" != 3 ] && ! grep -q -e '--project-directory' -e '^volume rm' -e '^run ' "$STUB_DIR/calls" \
+   && [ "$(cat "$WORK/rs-root/.env")" = "CURRENT=1" ] && [ -z "$(ls "$WORK/rs-root/backups")" ] \
+   && grep -q "could not take down portcullis-timemachine" "$WORK/rs-out" && grep -q "nothing was restored" "$WORK/rs-out"; then
+  t_pass "restore: a failed app down aborts before anything changes (no core down, no volume touched, .env kept, no pre-restore copy)"
+else
+  t_fail "restore: failed app down aborts with nothing changed (rc=$rc): $(tr '\n' '|' < "$STUB_DIR/calls") / $(tr '\n' '|' < "$WORK/rs-out")"
+fi
+
+rs_setup
+printf 'c1 portcullis\nc9 portcullis-samba\n' > "$STUB_DIR/rs-ctr"
+# A container the down leaves behind (re-created meanwhile): refused.
+sed -i.bak 's/awk -v p="$3" .\$2 != p. "$STUB_DIR\/rs-ctr" > "$STUB_DIR\/rs-ctr.new" \&\& mv "$STUB_DIR\/rs-ctr.new" "$STUB_DIR\/rs-ctr"/[ -f "$STUB_DIR\/rs-stick" ] || &/' "$WORK/bin/docker"
+touch "$STUB_DIR/rs-stick"
+rs_restore; rc=$?
+rm -f "$STUB_DIR/rs-stick"
+if [ "$rc" != 0 ] && [ "$rc" != 3 ] && ! grep -q -e '--project-directory' -e '^volume rm' "$STUB_DIR/calls" \
+   && grep -q "still mount portcullis_hub_secrets" "$WORK/rs-out"; then
+  t_pass "restore: a container still mounting hub_secrets after the down aborts with nothing changed"
+else
+  t_fail "restore: container left after the down aborts (rc=$rc): $(tr '\n' '|' < "$WORK/rs-out")"
+fi
+
+rs_setup
+: > "$STUB_DIR/rs-ctr"; echo 'c1 portcullis' > "$STUB_DIR/rs-ctr"
+rs_restore; rc=$?
+expect_eq "restore: only the core project mounts hub_secrets → no app down" "$(grep -c '^compose -p ' "$STUB_DIR/calls")" "0"
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

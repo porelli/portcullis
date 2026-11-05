@@ -57,11 +57,11 @@ Scenarios:
                test read from the secrets volume during the run.
   visible      docker inspect of both containers, the Hub's and the apps'
                logs contain no hash.
-  restore_core core restore with apps running can't empty hub_secrets (in
-               use: shown, nothing restored); both instances disabled,
-               ./portcullis backup → ./portcullis restore: every credential
-               voided (epoch missing), the volume holds no hash file; Samba
-               enabled again: carol's second password fails.
+  restore_core ./portcullis backup → ./portcullis restore with both apps
+               running: the restore takes them down first (volumes kept),
+               reports them and leaves them down; every credential voided
+               (epoch missing), the volume holds no hash file; Samba
+               restarted from the Hub: carol's password fails.
 
 Latencies (F60) are printed as `LATENCY …` lines and added to the step
 summary.
@@ -900,17 +900,13 @@ def main() -> int:
         needs(pw_key)
         assert creds(SMB)["carol"]["status"] == "active", creds(SMB)["carol"]
         state["carol_active"] = state[pw_key]
-        # The apps hold hub_secrets (read-only subpath mounts): core's
-        # restore stops only the core project, so it can't remove the
-        # volume while they run (it fails closed half-way). Shown, not
-        # attempted; the apps are disabled first.
+        # The apps hold hub_secrets (read-only subpath mounts) and keep
+        # running: ./portcullis restore must take them down itself.
         users = docker("ps", "-a", "--filter", f"volume={SECRETS_VOLUME}", "--format", "{{.Names}}").split()
         apps_holding = sorted(n for n in users if n.startswith(("portcullis-samba", "portcullis-timemachine")))
-        assert apps_holding, f"no app container mounts {SECRETS_VOLUME}: {users}"
+        assert len(apps_holding) == 2, f"both apps should mount {SECRETS_VOLUME}: {users}"
         OBS.append(f"containers mounting {SECRETS_VOLUME} before the core restore: {sorted(users)}")
         print(f"    {OBS[-1]}", flush=True)
-        for inst in (SMB, TM):
-            hub_ok("POST", "/api/templates/disable", {"id": inst}, timeout=600)
         before = set(glob.glob("backups/2*"))
         subprocess.run(["./portcullis", "backup"], check=True, timeout=1800)
         new = sorted(set(glob.glob("backups/2*")) - before)
@@ -926,7 +922,18 @@ def main() -> int:
         assert not hits, f"hash found in the core backup: {hits}"
         print(f"    core backup {new[0]}: {len(files)} files, no hash", flush=True)
         state["core_scanned"] = True
-        subprocess.run(["./portcullis", "restore", "--yes", new[0]], check=True, timeout=2400)
+        p = subprocess.run(["./portcullis", "restore", "--yes", new[0]], capture_output=True, text=True, timeout=2400)
+        out = scrub(p.stdout + p.stderr)
+        print("\n".join("    restore: " + ln for ln in out.splitlines()[-25:]), flush=True)
+        assert p.returncode == 0, f"./portcullis restore with the apps running: rc {p.returncode}"
+        for proj in (f"portcullis-{SMB}", f"portcullis-{TM}"):
+            assert re.search(rf"Taken down for the restore and NOT started again:.*\b{re.escape(proj)}\b", out), \
+                f"the restore didn't report {proj} as taken down"
+            left = docker("ps", "-aq", "--filter", f"label=com.docker.compose.project={proj}").split()
+            assert not left, f"{proj} has containers after the restore (it must stay down): {left}"
+        vols = docker("volume", "ls", "-q").split()
+        assert "portcullis_samba-homes" in vols and "portcullis_timemachine-data" in vols, \
+            f"the apps' volumes were not kept: {vols}"
         try:
             state["hub_ip"] = until("the Hub after the restore", lambda: hub_ip(), 180, every=5)
             until("the Hub answers", lambda: hub("GET", "/api/directory")[0] == 200, 300, every=5)
@@ -942,7 +949,8 @@ def main() -> int:
                       "stat", "-c", "%u:%g %a", "/s").strip() == "10001:10001 700"
         voids = [e for e in audit() if e.get("action") == "credential.void_restore"]
         assert voids, "no credential.void_restore in the audit"
-        hub_ok("POST", "/api/templates/enable", {"id": SMB}, timeout=1500)
+        # Started again by the admin, as the restore's message says.
+        hub_ok("POST", f"/api/templates/restart/{SMB}", {}, timeout=1500)
         cid = until("samba running", lambda: app(SMB), 120)
         until("samba healthy", lambda: docker("inspect", "-f", "{{.State.Health.Status}}", cid).strip() == "healthy",
               180, every=5)
@@ -950,9 +958,9 @@ def main() -> int:
         assert not ok, "carol's password still works after the core restore"
         p = subprocess.run(["docker", "logs", container("portcullis", "hub")], capture_output=True, timeout=60)
         assert not hash_hits(p.stdout + p.stderr, "hub logs"), "a hash in the Hub's logs after the restore"
-    check("restore_core: the apps mount hub_secrets (core restore can't empty it under them); with both disabled ./portcullis "
-          "backup (no hash in it) → ./portcullis restore voids every credential (epoch missing), no hash file "
-          "left; carol's password fails after Samba is enabled again", restore_core)
+    check("restore_core: ./portcullis backup (no hash in it) → ./portcullis restore with both apps running: it takes "
+          "them down (volumes kept, reported, not restarted), voids every credential (epoch missing), no hash file "
+          "left; carol's password fails after Samba is restarted from the Hub", restore_core)
 
     for k, v in LATENCY.items():
         summary(f"F60 {k}: {v:.1f} s")

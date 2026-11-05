@@ -641,6 +641,48 @@ _restore_lldap_guard() {
   return 0
 }
 
+# _restore_stop_secret_apps <volume> <core project> — takes down (compose
+# down, volumes kept) every app project with a container mounting the
+# hub_secrets volume (the file-sharing apps' read-only subpath mounts):
+# the restore removes that volume, and Docker refuses to remove a volume
+# any container — running or stopped — still references. Run before
+# anything changes: a failed down or a container left aborts the restore
+# with nothing changed. The projects taken down are left in
+# RESTORE_STOPPED_APPS (space-separated) for the closing message; they are
+# never started again here (the restore voids their credentials).
+RESTORE_STOPPED_APPS=""
+_restore_stop_secret_apps() {
+  local vol="$1" core="$2" ids id p left empty
+  ids="$(docker ps -aq --filter "volume=$vol")" || fail "can't list the containers using $vol (docker ps failed): nothing was restored"
+  local projects=""
+  for id in $ids; do
+    p="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id")" \
+      || fail "can't inspect container $id (it mounts $vol): nothing was restored"
+    [ "$p" = "$core" ] && continue
+    [ -n "$p" ] || fail "container $id mounts $vol but isn't part of a compose project: remove it (docker rm -f $id), then restore again. Nothing was restored"
+    case " $projects " in *" $p "*) ;; *) projects="${projects:+$projects }$p" ;; esac
+  done
+  [ -n "$projects" ] || return 0
+  info "Taking down the apps that mount $vol (volumes kept): $projects"
+  # By project name alone, from an empty directory: the Hub wrote these
+  # projects' compose files, which aren't readable here.
+  empty="$(mktemp -d)"
+  for p in $projects; do
+    if ! (cd "$empty" && env -u COMPOSE_FILE -u COMPOSE_PROJECT_NAME docker compose -p "$p" down); then
+      rmdir "$empty" 2>/dev/null || true
+      fail "could not take down $p (docker compose -p $p down failed): nothing was restored${RESTORE_STOPPED_APPS:+ (already taken down: $RESTORE_STOPPED_APPS)}"
+    fi
+    RESTORE_STOPPED_APPS="${RESTORE_STOPPED_APPS:+$RESTORE_STOPPED_APPS }$p"
+  done
+  rmdir "$empty" 2>/dev/null || true
+  left=""
+  for id in $(docker ps -aq --filter "volume=$vol"); do
+    p="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id" 2>/dev/null || true)"
+    [ "$p" = "$core" ] || left="${left:+$left }$id${p:+ ($p)}"
+  done
+  [ -z "$left" ] || fail "containers still mount $vol after the down: $left — remove them, then restore again. Nothing was restored (taken down: $RESTORE_STOPPED_APPS)"
+}
+
 backup_restore() {
   local dir="$1" yes="$2" allow_empty_lldap="${3:-false}" pre had_env=false key uid gid full spec proj helper
   require_cmd docker jq curl tar gzip
@@ -657,6 +699,15 @@ backup_restore() {
   fi
 
   [ -f "$(env_file)" ] && had_env=true
+  # File-sharing apps hold hub_secrets: down before anything changes
+  # (contract §11.6; a failure here leaves everything as it was).
+  if [ "$had_env" = true ]; then
+    _backup_load_cfg
+    full="$(_volume_name hub_secrets)"
+    _restore_stop_secret_apps "${full:-portcullis_hub_secrets}" "$(_project_name)"
+  else
+    _restore_stop_secret_apps portcullis_hub_secrets portcullis
+  fi
   pre="$BACKUP_ROOT/pre-restore-$(date +%Y%m%d-%H%M%S)"
   if [ "$had_env" = true ]; then
     info "Saving the current .env, secrets/ and certs/ to $pre..."
@@ -760,6 +811,9 @@ backup_restore() {
   dc up -d || warn "some services did not start — check ./portcullis status"
   wait_healthy 300 vault postgres lldap keycloak
   ok "Restore complete.${pre:+ Previous .env/secrets/certs: $pre.} Verify with ./portcullis status"
+  if [ -n "$RESTORE_STOPPED_APPS" ]; then
+    warn "Taken down for the restore and NOT started again: $RESTORE_STOPPED_APPS. Their file-share passwords were voided by the restore (people create new ones on My apps). Start each one again from the Hub: its drift shows it as not running (resolve the drift there, or restart the app)."
+  fi
 }
 
 # ── schedule ───────────────────────────────────────────────
@@ -904,6 +958,11 @@ backed-up key), the Keycloak database (pg_restore into a fresh Postgres),
 the LLDAP / Hub / ACME / domains volumes. Then everything is started again. The
 backup's checksums are verified first. The current .env, secrets/ and
 certs/ are saved to backups/pre-restore-<timestamp>/.
+
+App projects with a container mounting hub_secrets (file sharing: Samba,
+Time Machine) are taken down first (volumes kept) — a failure there
+changes nothing — and are NOT started again: the restore voids every
+file-share password. Start them again from the Hub.
 
 --from-offsite restores SNAPSHOT (default: latest) from BACKUP_REPOSITORY.
 On a new host without .env, export BACKUP_REPOSITORY, BACKUP_PASSWORD and
