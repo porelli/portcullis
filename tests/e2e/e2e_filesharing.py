@@ -210,6 +210,12 @@ def app(instance: str) -> str:
     return container(f"portcullis-{instance}", instance)
 
 
+def cid_project(cid: str) -> str:
+    """The instance id of an app container (its compose project minus portcullis-)."""
+    return docker("inspect", "-f", '{{index .Config.Labels "com.docker.compose.project"}}', cid).strip() \
+        .removeprefix("portcullis-")
+
+
 def ip_of(cid: str) -> str:
     nets = json.loads(docker("inspect", "-f", "{{json .NetworkSettings.Networks}}", cid))
     ips = [n.get("IPAddress") for n in nets.values() if n.get("IPAddress")]
@@ -434,11 +440,20 @@ def measure_revocation(label: str, cid: str, cip: str, share: str, user: str, pw
                        act, limit: float) -> float:
     """Opens a session, runs act(), then polls until the session is gone
     and a new login fails; returns the latency from act's start."""
+    proj = cid_project(cid)
     ok, out = smb(cip, share, user, pw)
     assert ok, f"{label}: {user} can't log in before the removal: {out[-400:]}"
     s = Session(cip, share, user, pw)
     try:
-        until(f"{label}: {user}'s session open", lambda: sessions_of(cid, uid), 30, every=1)
+        pids = until(f"{label}: {user}'s session open", lambda: sessions_of(cid, uid), 30, every=1)
+        # F58 evidence: can the container's root signal the per-user smbd
+        # with this cap set (no KILL)? kill -0 only checks, sends nothing.
+        p = subprocess.run(["docker", "exec", cid, "kill", "-0", pids[0]], capture_output=True, text=True, timeout=30)
+        ids = subprocess.run(["docker", "exec", cid, "sh", "-c", f"grep -E '^(Uid|Gid):' /proc/{pids[0]}/status"],
+                             capture_output=True, text=True, timeout=30).stdout.split()
+        OBS.append(f"{label}: root in the container → kill -0 of {user}'s smbd: rc {p.returncode} "
+                   f"{p.stderr.strip()[:120]!r}; smbd ids {' '.join(ids)}")
+        print("    " + OBS[-1], flush=True)
         t0 = time.time()
         act()
         t_session = t_login = None
@@ -452,6 +467,13 @@ def measure_revocation(label: str, cid: str, cip: str, share: str, user: str, pw
                 break
             time.sleep(0.5)
         client = "the client saw the disconnect" if s.disconnected() else "the client process did not notice yet"
+        try:
+            now_cid = container(f"portcullis-{proj}", proj)
+        except AssertionError:
+            now_cid = "none"
+        recreated = not now_cid.startswith(cid[:12]) and not cid.startswith(now_cid[:12])
+        OBS.append(f"{label}: the container was {'stopped/recreated (the Hub kill fallback)' if recreated else 'kept (applied live by the hook)'}")
+        print("    " + OBS[-1], flush=True)
         lat = max(t_session or 1e9, t_login or 1e9)
         print(f"    {label}: session gone after {t_session} s, new login refused after {t_login} s ({client})", flush=True)
         assert t_session is not None and t_login is not None, f"{label}: session gone {t_session}, login refused {t_login}"
