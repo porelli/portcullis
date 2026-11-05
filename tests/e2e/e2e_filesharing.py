@@ -253,7 +253,19 @@ def hub_ok(method: str, path: str, body=None, want: int = 200, timeout: float = 
 
 
 def run_op(method: str, path: str, body) -> dict:
-    acc = hub_ok(method, path, body, want=202)
+    # A 409 "in progress" is the Hub's busy answer (another lifecycle
+    # operation holds the instance, e.g. a background restart): try again,
+    # as its message says.
+    deadline = time.time() + 300
+    while True:
+        code, out = hub(method, path, body)
+        if code == 409 and "in progress" in str(out) and time.time() < deadline:
+            print(f"    {method} {path}: busy ({scrub(str(out))[:120]}), retrying", flush=True)
+            time.sleep(5)
+            continue
+        break
+    assert code == 202, f"{method} {path}: HTTP {code} (want 202): {scrub(str(out))[:800]}"
+    acc = out
     op_id, poll = acc.get("op_id"), acc.get("poll")
     assert op_id and poll, f"202 without op_id / poll: {acc}"
     rec = until(f"{acc.get('op')} {op_id} finished",
@@ -902,9 +914,14 @@ def main() -> int:
         state["carol_active"] = state[pw_key]
         # The apps hold hub_secrets (read-only subpath mounts) and keep
         # running: ./portcullis restore must take them down itself.
-        users = docker("ps", "-a", "--filter", f"volume={SECRETS_VOLUME}", "--format", "{{.Names}}").split()
-        apps_holding = sorted(n for n in users if n.startswith(("portcullis-samba", "portcullis-timemachine")))
-        assert len(apps_holding) == 2, f"both apps should mount {SECRETS_VOLUME}: {users}"
+        def holders():
+            users = docker("ps", "--filter", f"volume={SECRETS_VOLUME}", "--format", "{{.Names}}").split()
+            apps = [n for n in users if n.startswith(("portcullis-samba", "portcullis-timemachine"))]
+            return len(apps) == 2 and users
+        # Both running (a restart the Hub queued earlier may still be on its way).
+        users = until(f"both apps running and mounting {SECRETS_VOLUME}", holders, 300, every=5)
+        until("samba healthy", lambda: docker("inspect", "-f", "{{.State.Health.Status}}", app(SMB)).strip() == "healthy",
+              180, every=5)
         OBS.append(f"containers mounting {SECRETS_VOLUME} before the core restore: {sorted(users)}")
         print(f"    {OBS[-1]}", flush=True)
         before = set(glob.glob("backups/2*"))
