@@ -44,9 +44,12 @@ const DefaultIdleTimeout = 10 * time.Minute
 type Event struct {
 	User, Client, Resource, Instance, Companion, Via, Method, Tool, Decision string
 	RequestID                                                                string
-	Args                                                                     json.RawMessage
-	UpstreamStatus                                                           int
-	Duration                                                                 time.Duration
+	// Confirmation is the id of the confirmation this call consumed, also
+	// on every continuation of it (gatestate.go); "" otherwise.
+	Confirmation   string
+	Args           json.RawMessage
+	UpstreamStatus int
+	Duration       time.Duration
 }
 
 // RequestIDHeader carries the gate's own id of an HTTP request from the
@@ -92,6 +95,8 @@ type Outcome struct {
 	Answer   *mcp.CallToolResult
 	Decision string
 	Elicit   *mcp.ElicitParams
+	// ConfirmationID: with Proceed, the id of the consumed confirmation.
+	ConfirmationID string
 }
 
 // Confirmer decides calls that need a confirmation (§15.6; internal/confirm).
@@ -857,6 +862,8 @@ func (b *Bridge) callTool(cctx, ctx context.Context, ev *Event, req mcp.Request,
 		case ok && st.kind == stateContinue:
 			cp.RequestState, cp.InputResponses = st.upstream, p.InputResponses
 			continued = true
+			ev.Confirmation = st.confirmation
+			log.Printf("mcp-gate: %s tool %q user=%q: continues the call that consumed confirmation %s", r.URL, p.Name, ev.User, st.confirmation)
 		}
 		p = &cp
 	}
@@ -899,6 +906,7 @@ func (b *Bridge) callTool(cctx, ctx context.Context, ev *Event, req mcp.Request,
 			return b.deliverConfirmation(ctx, req, ss, bind, out.Elicit, answer), nil
 		}
 		confirmed = true
+		ev.Confirmation = out.ConfirmationID
 	}
 	params := &mcp.CallToolParams{Name: p.Name, InputResponses: p.InputResponses, RequestState: p.RequestState}
 	if len(p.Arguments) > 0 {
@@ -942,7 +950,7 @@ func (b *Bridge) callTool(cctx, ctx context.Context, ev *Event, req mcp.Request,
 			// A confirmed call continues on the gate's own single-use
 			// state, which holds the companion's: the retry isn't
 			// confirmed again, and can't be replayed.
-			tok, ok := b.states.put(gateState{kind: stateContinue, bind: bind, upstream: res.RequestState}, b.now())
+			tok, ok := b.states.put(gateState{kind: stateContinue, user: ev.User, bind: bind, upstream: res.RequestState, confirmation: ev.Confirmation}, b.now())
 			if !ok {
 				return nil, rpcError(mcp.CodeInternalError, "Portcullis is busy; try again")
 			}
@@ -1057,8 +1065,8 @@ func (b *Bridge) evict(victims []*mcp.ServerSession) {
 }
 
 // elicitWait bounds the gate's own elicitation/create of a confirmation
-// (the confirmation itself lives 10 minutes).
-const elicitWait = 10 * time.Minute
+// on a 2025-11-25 session (fix round 1: 60 s; the text follows anyway).
+const elicitWait = 60 * time.Second
 
 // deliverConfirmation answers a call that now has a pending confirmation
 // (§15.6): a 2026-07-28 client that declared elicitation.url gets an
@@ -1082,7 +1090,7 @@ func (b *Bridge) deliverConfirmation(ctx context.Context, req mcp.Request, ss *m
 	sessionless := ss == nil || ss.ID() == ""
 	switch v := cr.ProtocolVersion(); {
 	case v == mcp.ProtocolStateless && sessionless:
-		tok, ok := b.states.put(gateState{kind: stateConfirm, bind: bind}, b.now())
+		tok, ok := b.states.put(gateState{kind: stateConfirm, user: userOfBind(bind), bind: bind}, b.now())
 		if !ok {
 			return answer
 		}

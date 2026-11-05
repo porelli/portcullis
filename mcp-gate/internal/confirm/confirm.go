@@ -87,13 +87,13 @@ func (g *Gate) Before(ctx context.Context, c bridge.Call) (bridge.Outcome, error
 	if c.Elicited != nil && c.Elicited.Action != "accept" {
 		return bridge.Outcome{Answer: isError(textCancelled), Decision: "deny:declined"}, nil
 	}
-	_, state, err := g.Hub.ConsumeConfirmation(ctx, hubapi.ConsumeRequest{User: c.User, Resource: c.Resource.URL, Tool: c.Tool, ArgsSHA256: digest})
+	consumedID, state, err := g.Hub.ConsumeConfirmation(ctx, hubapi.ConsumeRequest{User: c.User, Resource: c.Resource.URL, Tool: c.Tool, ArgsSHA256: digest})
 	if err != nil {
 		return bridge.Outcome{}, err
 	}
 	switch state {
 	case hubapi.StateConsumed:
-		return bridge.Outcome{Proceed: true}, nil
+		return bridge.Outcome{Proceed: true, ConfirmationID: consumedID}, nil
 	case hubapi.StatePending:
 		return bridge.Outcome{Answer: isError(textPending), Decision: "deny:pending"}, nil
 	case hubapi.StateDeclined:

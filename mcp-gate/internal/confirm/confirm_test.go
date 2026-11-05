@@ -348,3 +348,14 @@ func TestConfirmElicitationAnswer(t *testing.T) {
 		t.Errorf("accept, approved: %+v", out)
 	}
 }
+
+// Fix round 1: a consumed confirmation's id goes with the proceed, for the
+// call's (and its continuations') events.
+func TestConsumedConfirmationID(t *testing.T) {
+	g, h, _, c := setup(t)
+	h.state = hubapi.StateConsumed
+	out, err := g.Before(context.Background(), c)
+	if err != nil || !out.Proceed || out.ConfirmationID != h.createID {
+		t.Errorf("%+v %v", out, err)
+	}
+}

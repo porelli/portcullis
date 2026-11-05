@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"sync"
 	"time"
 )
@@ -23,10 +24,11 @@ import (
 //     input by the companion; the entry holds the companion's own state, so
 //     the retry continues that one call without a new confirmation.
 const (
-	gateStatePrefix = "portcullis-gate:"
-	gateStateTTL    = 10 * time.Minute
-	maxGateStates   = 4096
-	confirmInputKey = "portcullis_confirmation"
+	gateStatePrefix  = "portcullis-gate:"
+	gateStateTTL     = 10 * time.Minute
+	maxGateStates    = 4096
+	maxStatesPerUser = 16 // live states per person (fix round 1)
+	confirmInputKey  = "portcullis_confirmation"
 )
 
 type stateKind int
@@ -37,10 +39,12 @@ const (
 )
 
 type gateState struct {
-	kind     stateKind
-	bind     string
-	upstream string // stateContinue: the companion's request state
-	exp      time.Time
+	kind         stateKind
+	user         string
+	bind         string
+	upstream     string // stateContinue: the companion's request state
+	confirmation string // stateContinue: the id of the confirmation the call consumed
+	exp          time.Time
 }
 
 type stateStore struct {
@@ -55,23 +59,30 @@ func bindingOf(k key, tool string, args json.RawMessage) string {
 	return k.user + "\x00" + k.url + "\x00" + tool + "\x00" + hex.EncodeToString(sum[:])
 }
 
-// put stores st and returns its token; false when the store is full of
-// live entries (the caller falls back or refuses).
+// put stores st and returns its token; false when the store holds
+// maxGateStates live entries, or st.user already has maxStatesPerUser (the
+// caller falls back to the text answer or refuses). Expired entries are
+// swept first and never count.
 func (s *stateStore) put(st gateState, now time.Time) (string, bool) {
+	if st.user == "" {
+		return "", false
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.m == nil {
 		s.m = map[string]gateState{}
 	}
-	if len(s.m) >= maxGateStates {
-		for t, e := range s.m {
-			if !now.Before(e.exp) {
-				delete(s.m, t)
-			}
+	mine := 0
+	for t, e := range s.m {
+		switch {
+		case !now.Before(e.exp):
+			delete(s.m, t)
+		case e.user == st.user:
+			mine++
 		}
-		if len(s.m) >= maxGateStates {
-			return "", false
-		}
+	}
+	if len(s.m) >= maxGateStates || mine >= maxStatesPerUser {
+		return "", false
 	}
 	tok := gateStatePrefix + rand.Text()
 	st.exp = now.Add(gateStateTTL)
@@ -89,4 +100,10 @@ func (s *stateStore) take(tok, bind string, now time.Time) (gateState, bool) {
 		return gateState{}, false
 	}
 	return st, true
+}
+
+// userOfBind is the person of a binding (bindingOf).
+func userOfBind(bind string) string {
+	u, _, _ := strings.Cut(bind, "\x00")
+	return u
 }

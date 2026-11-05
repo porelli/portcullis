@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -263,5 +264,166 @@ func TestConfirmContinuation(t *testing.T) {
 	}
 	if _, calls, _ := up.snapshot(); !slices.Equal(calls, []string{"delete_ask", "delete_ask"}) {
 		t.Errorf("upstream calls %v", calls)
+	}
+}
+
+// ---- fix round 1 ----
+
+type testClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *testClock) now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.t }
+func (c *testClock) add(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
+// A state past its 10 minutes is a fresh call: the person's old answer
+// is never applied.
+func TestGateStateExpiry(t *testing.T) {
+	clk := &testClock{t: time.Date(2026, 11, 5, 10, 0, 0, 0, time.UTC)}
+	up := newUpstream(t, nil, stateRecorder)
+	sc := &scriptConfirmer{fn: newConfirmation}
+	h := newHarness(t, baseSnapshot(t, nil), map[string]*upstream{giteaUp: up}, func(c *Config) { c.Confirm = sc; c.Now = clk.now })
+	cs, _ := h.connect("alice", clientOpts{version: "2026-07-28", opts: noMRTR(&sdk.ClientOptions{Capabilities: urlCaps()})})
+	r, err := call(t, cs, "delete_repo", map[string]any{"repo": "x"})
+	if err != nil || !r.NeedsInput() {
+		t.Fatalf("%+v %v", r, err)
+	}
+	clk.add(gateStateTTL + time.Second)
+	if _, err := cs.CallTool(ctx10(t), &sdk.CallToolParams{Name: "delete_repo", Arguments: map[string]any{"repo": "x"},
+		InputResponses: sdk.InputResponseMap{confirmInputKey: &sdk.ElicitResult{Action: "accept"}}, RequestState: r.RequestState}); err != nil {
+		t.Fatal(err)
+	}
+	if last := sc.list()[len(sc.list())-1]; last.Elicited != nil {
+		t.Errorf("an expired state was applied: %+v", last.Elicited)
+	}
+
+	// An expired continuation needs a new confirmation.
+	sc.set(func(Call) Outcome { return Outcome{Proceed: true, ConfirmationID: "C1"} })
+	r, err = call(t, cs, "delete_ask", map[string]any{"repo": "x"})
+	if err != nil || !r.NeedsInput() || r.InputRequests["f"] == nil {
+		t.Fatalf("%+v %v", r, err)
+	}
+	n := len(sc.list())
+	clk.add(gateStateTTL + time.Second)
+	sc.set(newConfirmation)
+	r2, err := cs.CallTool(ctx10(t), &sdk.CallToolParams{Name: "delete_ask", Arguments: map[string]any{"repo": "x"},
+		InputResponses: sdk.InputResponseMap{"f": &sdk.ElicitResult{Action: "accept"}}, RequestState: r.RequestState})
+	if err != nil || len(sc.list()) != n+1 || r2.InputRequests[confirmInputKey] == nil {
+		t.Errorf("expired continuation: %+v %v (confirmer asked %d times)", r2, err, len(sc.list())-n)
+	}
+	if _, calls, _ := up.snapshot(); len(calls) != 1 {
+		t.Errorf("upstream calls %v", calls)
+	}
+}
+
+// fillStates puts n live states for user straight into the store.
+func fillStates(t *testing.T, h *harness, user string, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		if _, ok := h.b.states.put(gateState{kind: stateConfirm, user: user, bind: fmt.Sprint(user, i)}, h.b.now()); !ok {
+			t.Fatalf("put %s %d refused", user, i)
+		}
+	}
+}
+
+// checkFallbacks: a new confirmation falls back to the text, a confirmed
+// call's continuation answers busy; nothing reaches the upstream twice.
+func checkFallbacks(t *testing.T, h *harness, sc *scriptConfirmer, cs *sdk.ClientSession) {
+	t.Helper()
+	sc.set(newConfirmation)
+	r, err := call(t, cs, "delete_repo", map[string]any{"repo": "x"})
+	if err != nil || r.NeedsInput() || !r.IsError || !strings.HasPrefix(resultText(r), "This needs your confirmation in your browser: open ") {
+		t.Errorf("confirmation fallback: %+v %v", r, err)
+	}
+	sc.set(func(Call) Outcome { return Outcome{Proceed: true, ConfirmationID: "C1"} })
+	r, err = call(t, cs, "delete_ask", map[string]any{"repo": "x"})
+	if err == nil || !strings.Contains(err.Error(), "busy") {
+		t.Errorf("continuation fallback: %+v %v", r, err)
+	}
+}
+
+// Fix round 1: at most maxStatesPerUser live states per person; another
+// person's states don't count.
+func TestGateStatePerUserCap(t *testing.T) {
+	up := newUpstream(t, nil, stateRecorder)
+	sc := &scriptConfirmer{fn: newConfirmation}
+	h := newHarness(t, baseSnapshot(t, nil), map[string]*upstream{giteaUp: up}, func(c *Config) { c.Confirm = sc })
+	cs, _ := h.connect("alice", clientOpts{version: "2026-07-28", opts: noMRTR(&sdk.ClientOptions{Capabilities: urlCaps()})})
+	fillStates(t, h, "carol", maxStatesPerUser)
+	if _, ok := h.b.states.put(gateState{kind: stateConfirm, user: "carol", bind: "one more"}, h.b.now()); ok {
+		t.Error("a 17th state for one person")
+	}
+	if r, err := call(t, cs, "delete_repo", map[string]any{"repo": "x"}); err != nil || !r.NeedsInput() {
+		t.Fatalf("someone else's states counted: %+v %v", r, err)
+	}
+	fillStates(t, h, "alice", maxStatesPerUser-1) // with the one just issued: full
+	checkFallbacks(t, h, sc, cs)
+	// Expired ones don't count.
+	h.b.states.mu.Lock()
+	for tok, st := range h.b.states.m {
+		if st.user == "alice" {
+			st.exp = h.b.now().Add(-time.Second)
+			h.b.states.m[tok] = st
+		}
+	}
+	h.b.states.mu.Unlock()
+	sc.set(newConfirmation)
+	if r, err := call(t, cs, "delete_repo", map[string]any{"repo": "x"}); err != nil || !r.NeedsInput() {
+		t.Errorf("expired states counted: %+v %v", r, err)
+	}
+}
+
+// The whole store full of other people's live states: the same fallbacks.
+func TestGateStateStoreFull(t *testing.T) {
+	up := newUpstream(t, nil, stateRecorder)
+	sc := &scriptConfirmer{fn: newConfirmation}
+	h := newHarness(t, baseSnapshot(t, nil), map[string]*upstream{giteaUp: up}, func(c *Config) { c.Confirm = sc })
+	cs, _ := h.connect("alice", clientOpts{version: "2026-07-28", opts: noMRTR(&sdk.ClientOptions{Capabilities: urlCaps()})})
+	for i := 0; i < maxGateStates; i++ {
+		fillStates(t, h, fmt.Sprint("u", i), 1)
+	}
+	checkFallbacks(t, h, sc, cs)
+	if _, calls, _ := up.snapshot(); !slices.Equal(calls, []string{"delete_ask"}) {
+		t.Errorf("upstream calls %v", calls)
+	}
+}
+
+// The 2025-11-25 elicitation/create waits at most 60 s.
+func TestElicitWait(t *testing.T) {
+	if elicitWait != 60*time.Second {
+		t.Errorf("elicitWait %v", elicitWait)
+	}
+}
+
+// Fix round 1: the consumed confirmation's id is in the events of the
+// call that consumed it and of every continuation of that call.
+func TestContinuationLogsConfirmation(t *testing.T) {
+	up := newUpstream(t, nil, stateRecorder)
+	sc := &scriptConfirmer{fn: func(Call) Outcome { return Outcome{Proceed: true, ConfirmationID: "C1"} }}
+	h := newHarness(t, baseSnapshot(t, nil), map[string]*upstream{giteaUp: up}, func(c *Config) { c.Confirm = sc })
+	cs, _ := h.connect("alice", clientOpts{version: "2026-07-28", opts: noMRTR(&sdk.ClientOptions{Capabilities: urlCaps()})})
+	r, err := call(t, cs, "delete_ask", map[string]any{"repo": "x"})
+	if err != nil || !r.NeedsInput() {
+		t.Fatalf("%+v %v", r, err)
+	}
+	sc.set(newConfirmation)
+	r, err = cs.CallTool(ctx10(t), &sdk.CallToolParams{Name: "delete_ask", Arguments: map[string]any{"repo": "x"},
+		InputResponses: sdk.InputResponseMap{"f": &sdk.ElicitResult{Action: "accept"}}, RequestState: r.RequestState})
+	if err != nil || resultText(r) != "done state=up1 f=accept" {
+		t.Fatalf("%v %v", resultTextOr(r), err)
+	}
+	var got []string
+	for _, e := range h.eventList() {
+		if e.Tool == "delete_ask" {
+			got = append(got, e.Decision+"/"+e.Confirmation)
+		}
+	}
+	if !slices.Equal(got, []string{"allow/C1", "allow/C1"}) {
+		t.Errorf("events %v", got)
 	}
 }
