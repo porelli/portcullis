@@ -335,6 +335,9 @@ def main() -> int:
         until("the Hub loaded gitea", lambda: any(t.get("id") == "gitea" for t in json.loads(hub("GET", "/api/templates")[1])), 90)
         hub_ok("POST", "/api/instances", {"template": "gitea", "id": "gitea-b", "hosts": {"gitea": f"gitea-b.{DOMAIN}"}},
                want=(201,))
+        # One host port per instance: gitea keeps 2222 (Git over SSH is off
+        # anyway), gitea-b none (the port's description says so).
+        hub_ok("PUT", "/api/instances/gitea-b/settings", {"ports": {"GITEA_SSH_PORT": ""}})
         for inst in ("gitea", "gitea-b"):
             t0 = time.time()
             out = hub_ok("POST", "/api/templates/enable", {"id": inst}, timeout=1500)
