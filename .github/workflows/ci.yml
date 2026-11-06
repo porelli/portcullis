@@ -2477,7 +2477,12 @@ jobs:
   # browser scenarios; the instance backup / delete / restore checks run
   # against a real daemon at the end.
   e2e-instances:
-    runs-on: ubuntu-latest
+    # ubuntu-26.04 (ubuntu-latest since 2026-11) runs Docker with the
+    # containerd image store, where `docker image rm -f` of an image a
+    # running container uses (the echo fixture's hold service is the helper
+    # image) keeps it: the "helper pulled by digest" check needs the classic
+    # store. Follow-up: give hold its own image, then go back to latest.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
       E2E_DOMAIN: portcullis.local
