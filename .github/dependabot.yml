@@ -99,9 +99,13 @@ updates:
       domains-go:
         patterns: ["*"]
 
-  # mcp-gate/go.mod (MCP go-sdk, go-oidc, go-jose, age).
+  # mcp-gate/go.mod (MCP go-sdk, go-oidc, go-jose, age) and the e2e-ai
+  # job's MCP client (tests/e2e/mcpclient), which pins the same go-sdk:
+  # one group, so both move together.
   - package-ecosystem: gomod
-    directory: /mcp-gate
+    directories:
+      - /mcp-gate
+      - /tests/e2e/mcpclient
     schedule:
       interval: weekly
     groups:
