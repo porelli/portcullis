@@ -3884,7 +3884,6 @@ jobs:
                 PEBBLE_WFE_NONCEREJECT: "0"
               networks: [domains-egress]
           YML
-          sed -i 's/^          //' docker-compose.ci.yml
           docker compose config -q
           docker compose config --format json | jq -e '.services.traefik.networks["portcullis-proxy"] | (.aliases | index("auth.portcullis.local")) and .ipv4_address != null' >/dev/null \
             || { echo "FAIL: Traefik alias override not applied"; exit 1; }
