@@ -352,12 +352,19 @@ def list_my_repos(tf: str) -> str:
             print(f"    tool error: {text_of(res)[:300]}", flush=True)
             return None
         return text_of(res) or json.dumps(res.get("structuredContent"))
-    return until("repo_read list_my_repos answered", once, 90, every=5)
+    return until("repo_read list_my_repos answered", once, 90, every=10)
 
 
 def refused(url: str, tf: str) -> int:
     rc, doc = mcp_call(url, tf)
     return doc.get("http_status", 0) if rc == 2 else 0
+
+
+def gitea_routed() -> None:
+    """Both Gitea instances answer through Traefik (routed once healthy):
+    the login page redirects to Gitea's OAuth2 source."""
+    for base_url in (GITEA, GITEA_B):
+        until(f"{base_url} routed", lambda: https("GET", base_url + "/user/login")[0] in (302, 303, 307), 240, every=5)
 
 
 def main() -> int:
@@ -381,6 +388,8 @@ def main() -> int:
         for m in ("alice:users_gitea", "alice:users_gitea-b", "bob:users_gitea"):
             u, g = m.split(":")
             member("add", g, u)
+        gitea_routed()
+
 
     with sync_playwright() as pw_:
         browser = pw_.chromium.launch(args=["--disable-features=WebAuthenticationConditionalUI"])
@@ -466,7 +475,8 @@ def main() -> int:
                           f"population {c.get('population')} last_error {c.get('last_error')!r}", flush=True)
                     return c.get("status") == "on" and c.get("mode") == "read_write" and c
                 until(f"{inst}'s companion on", companion_on, 180, every=5)
-                container(inst, "gitea-mcp")
+                until(f"{inst}'s gitea-mcp running", lambda: container(inst, "gitea-mcp"), 120, every=5)
+            gitea_routed()
             for url, scope in ((GITEA_MCP, SCOPE_GITEA), (GITEA_B_MCP, "mcp:gitea-b.gitea"), (MCP_ALL, "mcp:all"),
                                (HUB_MCP, "mcp:portcullis.admin"), (PEOPLE_MCP, "mcp:portcullis.people")):
                 host = urllib.parse.urlsplit(url).netloc
@@ -541,11 +551,19 @@ def main() -> int:
         def no_token_crossing():
             tf = fresh_gitea_token()
             bearer = {"Authorization": "Bearer " + token_of(tf)}
-            for url, ok_loc in ((GITEA + "/", ("/user/login", AUTH)), (PEOPLE + "/", (AUTH, "/oauth2/"))):
+            # Pages that need a session: the sign-in redirect, never the page.
+            for url, ok_loc in ((GITEA + "/user/settings", ("/user/login",)), (GITEA + "/alice/alice-private", ("/user/login",)),
+                                (PEOPLE + "/", (AUTH, "/oauth2/"))):
                 code, h, body = https("GET", url, bearer)
                 loc = h.get("Location") or h.get("location") or ""
                 print(f"    bearer on {url}: HTTP {code} → {loc[:100]}", flush=True)
                 assert code in (302, 303, 307) and any(s in loc for s in ok_loc), f"{url}: HTTP {code} {loc!r} {body[:200]}"
+            # Gitea's landing page is public: with the token it is exactly the
+            # anonymous page (nobody signed in).
+            code, _, body = https("GET", GITEA + "/", bearer)
+            anon, _, _ = https("GET", GITEA + "/")
+            print(f"    bearer on {GITEA}/: HTTP {code} (anonymous: {anon})", flush=True)
+            assert code == anon and "alice" not in body, f"Gitea's home with the MCP token: HTTP {code}, 'alice' in page: {'alice' in body}"
             code, _, body = https("GET", GITEA + "/api/v1/user", bearer)
             print(f"    bearer on Gitea's API: HTTP {code}", flush=True)
             assert code == 401, f"Gitea's API with the MCP token: HTTP {code} {body[:200]}"
