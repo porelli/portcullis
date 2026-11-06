@@ -52,6 +52,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from playwright.sync_api import Error as PWError
 from playwright.sync_api import Page, sync_playwright
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -209,6 +210,35 @@ def https(method: str, url: str, headers: dict | None = None, body: bytes | None
 
 # ── the MCP client ──
 
+class NetworkChanged(AssertionError):
+    """Chromium aborted a navigation (net::ERR_NETWORK_CHANGED: a container
+    started or stopped on the runner); the step is safe to repeat."""
+
+
+def check_network(page: Page) -> None:
+    if page.url.startswith("chrome-error://"):
+        raise NetworkChanged(f"browser network error (at {page.url})")
+
+
+def goto(page: Page, url: str) -> None:
+    try:
+        page.goto(url, wait_until="domcontentloaded")
+    except PWError as e:
+        if "ERR_NETWORK_CHANGED" in str(e):
+            raise NetworkChanged(f"browser network error opening {url.split('?')[0]}") from e
+        raise
+
+
+def retry_network(fn, what: str, tries: int = 3):
+    for i in range(tries):
+        try:
+            return fn()
+        except NetworkChanged as e:
+            print(f"    {what}: {e}; again ({i + 1}/{tries})", flush=True)
+            time.sleep(5)
+    return fn()
+
+
 def claims(token_file: str) -> dict:
     tok = json.load(open(token_file))["access_token"]
     payload = tok.split(".")[1]
@@ -234,6 +264,7 @@ def consent(page: Page, label: str) -> None:
         page.wait_for_load_state("domcontentloaded")
         if page.url.startswith(CALLBACK):
             return
+        check_network(page)
         if base.on_login_pages(page):
             accept = page.locator("[name=accept]")
             if accept.count() and accept.first.is_visible():
@@ -258,8 +289,12 @@ def consent(page: Page, label: str) -> None:
 
 
 def mcp_login(page: Page, resource: str, label: str, scope: str | None = None) -> str:
-    """mcpclient login for resource, the browser part in page; returns the
-    token file."""
+    """mcpclient login for resource, the browser part in page (repeated
+    when Chromium's network changed); returns the token file."""
+    return retry_network(lambda: _mcp_login(page, resource, label, scope), f"{label} login")
+
+
+def _mcp_login(page: Page, resource: str, label: str, scope: str | None = None) -> str:
     tf = os.path.join(TOKENS, f"{label}.json")
     if os.path.exists(tf):
         os.remove(tf)
@@ -278,7 +313,7 @@ def mcp_login(page: Page, resource: str, label: str, scope: str | None = None) -
         assert q.get("client_id") == [CLIENT] and q.get("code_challenge_method") == ["S256"] \
             and q.get("resource") == [resource] and q.get("redirect_uri") == [CALLBACK], \
             f"authorize parameters: { {k: v for k, v in q.items() if k not in ('state', 'code_challenge')} }"
-        page.goto(url, wait_until="domcontentloaded")
+        goto(page, url)
         consent(page, label)
         rc = p.wait(60)
         err = p.stderr.read()
@@ -346,8 +381,6 @@ def main() -> int:
         for m in ("alice:users_gitea", "alice:users_gitea-b", "bob:users_gitea"):
             u, g = m.split(":")
             member("add", g, u)
-    check("setup: gitea-b created, gitea + gitea-b enabled, alice in users_gitea + users_gitea-b, bob in users_gitea "
-          "(Hub API as root)", setup_instances)
 
     with sync_playwright() as pw_:
         browser = pw_.chromium.launch(args=["--disable-features=WebAuthenticationConditionalUI"])
@@ -370,12 +403,13 @@ def main() -> int:
             return page
 
         def gitea_sign_in(page: Page, who: str) -> None:
-            page.goto(GITEA + "/user/login", wait_until="domcontentloaded")
+            goto(page, GITEA + "/user/login")
             deadline = time.time() + 90
             while time.time() < deadline:
                 page.wait_for_load_state("domcontentloaded")
                 if page.url.startswith(GITEA) and "/user/login" not in page.url and "/user/oauth2/" not in page.url:
                     break
+                check_network(page)
                 if base.on_login_pages(page) and page.locator("#authenticateWebAuthnButton").is_visible():
                     page.click("#authenticateWebAuthnButton")
                 page.wait_for_timeout(500)
@@ -390,14 +424,24 @@ def main() -> int:
 
         pages: dict[str, Page] = {}
 
-        def people_sign_in():
+        # The setup links first, while the network is quiet: every container
+        # start or stop changes the runner's interfaces, and Chromium then
+        # aborts in-flight requests (net::ERR_NETWORK_CHANGED) — a consumed
+        # setup link can't be retried.
+        def setup_links():
             for who in ("alice", "bob"):
                 pages[who] = sign_in(who)
-                gitea_sign_in(pages[who], who)
-        check("alice and bob: setup link → passkey → portal, then Gitea's OIDC sign-in creates their accounts",
-              people_sign_in)
+        check("alice and bob: setup link → passkey → portal", setup_links)
         if len(pages) != 2:
             return report()
+        check("setup: gitea-b created, gitea + gitea-b enabled, alice in users_gitea + users_gitea-b, bob in users_gitea "
+              "(Hub API as root)", setup_instances)
+
+        def gitea_accounts():
+            for who in ("alice", "bob"):
+                retry_network(lambda: gitea_sign_in(pages[who], who), f"{who}'s Gitea sign-in")
+        check("alice and bob: Gitea's OIDC sign-in (through their Keycloak session) creates their Gitea accounts",
+              gitea_accounts)
         alice = pages["alice"]
 
         def seed():
