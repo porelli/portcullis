@@ -4008,8 +4008,11 @@ jobs:
             [ "$i" -eq 40 ] && { echo "FAIL: hub /healthz"; docker compose logs --tail=40 hub; exit 1; }
             sleep 2
           done
-          [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q mcp-gate)")" = healthy ] \
-            || { echo "FAIL: mcp-gate not healthy"; docker compose logs --tail=40 mcp-gate; exit 1; }
+          for i in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q mcp-gate)")" = healthy ] && break
+            [ "$i" -eq 30 ] && { echo "FAIL: mcp-gate not healthy"; docker compose logs --tail=40 mcp-gate; exit 1; }
+            sleep 2
+          done
 
       - name: CI users (root in lldap_admin, alice, bob) and setup links
         run: |
