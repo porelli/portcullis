@@ -358,6 +358,9 @@ def main() -> int:
             ctx.set_default_timeout(TIMEOUT_MS)
             ctxs[who] = ctx
             page = ctx.new_page()
+            # Failed requests (path only: queries carry codes and states).
+            page.on("requestfailed", lambda r: print(
+                f"    {who}: request failed: {r.method} {r.url.split('?')[0]}: {r.failure}", flush=True))
             base.Authenticator(page)
             page.goto(os.environ[f"E2E_{who.upper()}_INVITE"], wait_until="domcontentloaded")
             base.passkey_flow(page, until=PORTAL, label=f"ai-{who}")

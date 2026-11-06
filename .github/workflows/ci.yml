@@ -958,7 +958,8 @@ jobs:
 
           # Verify the cert
           echo "$CERT" > /tmp/test-client.crt
-          CN=$(openssl x509 -in /tmp/test-client.crt -noout -subject | grep -o 'CN = [^,]*' | sed 's/CN = //')
+          # RFC 2253 form: the same on every OpenSSL (3.x defaults differ between runner images).
+          CN=$(openssl x509 -in /tmp/test-client.crt -noout -subject -nameopt RFC2253 | sed 's/^subject= *//' | tr ',' '\n' | sed -n 's/^CN=//p')
           if [ "$CN" = "testuser" ]; then
             echo "PASS: Certificate CN matches (CN=$CN)"
           else

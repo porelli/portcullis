@@ -40,3 +40,7 @@ ports:
     default: 18765
     service: app
     lan_only: true
+
+# AI support (contract §3.2, required in every manifest): a CI fixture.
+ai:
+  unsupported: "A CI test fixture with no app API for an AI to act through"
