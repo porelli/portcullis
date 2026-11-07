@@ -202,7 +202,7 @@ CORE_PROXY_SERVICES="traefik mcp-gate grafana"
 # nothing when the network doesn't exist.
 proxy_dns_shadows() {
   local ids id core info project="${COMPOSE_PROJECT_NAME:-portcullis}" exempt out line
-  local mcp="" cid cname alias inst members
+  local mcp=""
   if ! ids="$(docker network inspect "$PROXY_NETWORK" --format '{{range $k, $v := .Containers}}{{$k}} {{end}}' 2>/dev/null)"; then
     local listed
     listed="$(docker network ls --format '{{.Name}}' 2>/dev/null)" || return 2
@@ -243,7 +243,7 @@ proxy_dns_shadows() {
            | if $exempt then "F \($n) \($a) (AI companion name on a core container)"
              elif ($own | index($a)) != null then "F \($n) \($a) (AI companion name as container name or hostname)"
              elif $m == null then "F \($n) \($a) (malformed AI companion name)"
-             else "M \($n) \($a) \($m.i)" end)' )" || return 2
+             else "M \($n) \($a) \($m.i) \(if $svc == "" then "-" else $svc end) \((.Config.Labels // {})["com.docker.compose.project.config_files"] // "-")" end)' )" || return 2
     while IFS= read -r line; do
       case "$line" in
         "F "*) printf '%s\n' "${line#F }" ;;
@@ -252,24 +252,83 @@ proxy_dns_shadows() {
     done <<< "$out"
   done
   [ -n "$mcp" ] || return 0
-  # Project membership per instance (compose's own listing, run outside
-  # any compose file), then one container per alias.
-  local seen=""
-  while read -r cid cname alias inst; do
+  _proxy_ai_alias_check "$mcp"
+}
+
+# _proxy_ai_alias_check <lines> — the AI companion part of
+# proxy_dns_shadows, one "<id> <container> <alias> <instance> <service>
+# <config_files>" line per candidate. A candidate passes only if ALL hold:
+#   - `docker compose -p portcullis-<instance> ps -aq` (run from /, outside
+#     any compose file) lists it;
+#   - compose created it from the Hub's override for that instance: its
+#     com.docker.compose.project.config_files names
+#     /data/overrides/<instance>.override.yml (HUB_DATA_DIR in the Hub);
+#   - its compose service is the one that override gives the alias to on
+#     portcullis-proxy (the manifest's `service` of that companion, read
+#     from hub_data by a throwaway read-only helper; no override, or no
+#     service with that alias = flagged);
+#   - no other container answers to the same alias.
+# Residual (outside the threat model): all of this reads labels and
+# membership Docker reports, and anyone with Docker access can create a
+# container with forged compose labels (and could do far worse). The Hub
+# refuses `com.docker.compose.*` labels in templates and custom overrides
+# and names the projects itself, so without Docker access no app can
+# claim another instance's project, override or service.
+_proxy_ai_alias_check() {
+  local mcp="$1" cache rc=0 cid cname alias inst svc files want
+  cache="$(mktemp -d)" || return 2
+  while read -r cid cname alias inst svc files; do
     [ -n "$cid" ] || continue
-    case " $seen " in
-      *" $inst="*) members="$(printf '%s' "$seen" | tr ' ' '\n' | sed -n "s/^$inst=//p" | tr ',' '\n')" ;;
-      *)
-        members="$(cd / && docker compose -p "portcullis-$inst" ps -aq 2>/dev/null)" || return 2
-        seen="$seen $inst=$(printf '%s' "$members" | paste -sd, -)"
-        ;;
-    esac
-    if ! printf '%s\n' "$members" | grep -qxF -- "$cid"; then
+    if [ ! -e "$cache/$inst.members" ]; then
+      (cd / && docker compose -p "portcullis-$inst" ps -aq) > "$cache/$inst.members" 2>/dev/null || { rc=2; break; }
+      local st=0 vol="${COMPOSE_PROJECT_NAME:-portcullis}_hub_data"
+      # Never create the volume (compose would then refuse to own it):
+      # no hub_data = no override.
+      if ! docker volume inspect "$vol" >/dev/null 2>&1; then
+        docker volume ls -q > "$cache/volumes" 2>/dev/null || { rc=2; break; }
+        ! grep -qxF -- "$vol" "$cache/volumes" || { rc=2; break; }
+        st=3
+      else docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+        --user "$CT_UID_HUB:$CT_UID_HUB" -v "$vol:/d:ro" "$PORTCULLIS_HELPER_IMAGE" \
+        sh -c '[ -f "$1" ] || exit 3; cat "$1"' _ "/d/overrides/$inst.override.yml" > "$cache/$inst.override" 2>/dev/null || st=$?
+      fi
+      case "$st" in 0) ;; 3) : > "$cache/$inst.override"; touch "$cache/$inst.nooverride" ;; *) rc=2; break ;; esac
+    fi
+    if ! grep -qxF -- "$cid" "$cache/$inst.members"; then
       printf '%s %s (AI companion name outside project portcullis-%s)\n' "$cname" "$alias" "$inst"
-    elif [ "$(printf '%s' "$mcp" | awk -v a="$alias" '$3 == a' | wc -l)" -gt 1 ]; then
-      printf '%s %s (AI companion name answered by more than one container)\n' "$cname" "$alias"
+    elif ! printf '%s\n' "$files" | tr ',' '\n' | grep -qxF -- "/data/overrides/$inst.override.yml"; then
+      printf '%s %s (AI companion name on a container the Hub did not create)\n' "$cname" "$alias"
+    elif [ -e "$cache/$inst.nooverride" ]; then
+      printf '%s %s (AI companion name with no Hub override for instance %s)\n' "$cname" "$alias" "$inst"
+    else
+      want="$(_override_alias_services "$alias" < "$cache/$inst.override")"
+      if [ "$(printf '%s\n' "$want" | grep -c .)" != 1 ] || [ "$want" != "$svc" ]; then
+        printf '%s %s (AI companion name on service %s, not the companion'"'"'s service)\n' "$cname" "$alias" "$svc"
+      elif [ "$(printf '%s' "$mcp" | awk -v a="$alias" '$3 == a' | wc -l)" -gt 1 ]; then
+        printf '%s %s (AI companion name answered by more than one container)\n' "$cname" "$alias"
+      fi
     fi
   done <<< "$mcp"
+  rm -rf "$cache"
+  return "$rc"
+}
+
+# _override_alias_services <alias> — reads a Hub override (stdin): every
+# service whose portcullis-proxy aliases list <alias> (the Hub writes
+# services at 2 spaces, networks at 6, `aliases:` at 8 and the JSON-quoted
+# items at 10).
+_override_alias_services() {
+  awk -v a="$1" '
+    { match($0, /[^ ]/); ind = RSTART - 1; line = substr($0, ind + 1) }
+    /^[^ ]/ { ins = ($0 == "services:"); svc = ""; net = ""; al = 0; next }
+    !ins || line == "" { next }
+    ind == 2 { svc = line; sub(/:$/, "", svc); gsub(/^"|"$/, "", svc); net = ""; al = 0; next }
+    ind == 6 { net = line; sub(/:.*$/, "", net); gsub(/^"|"$/, "", net); al = 0; next }
+    ind == 8 { al = (net == "portcullis-proxy" && line == "aliases:"); next }
+    ind < 10 { al = 0; next }
+    ind == 10 && al && substr(line, 1, 2) == "- " {
+      v = substr(line, 3); gsub(/^"|"$/, "", v); if (v == a) print svc
+    }'
 }
 
 # network_state <name> <subnet> <range> — prints one of: missing | ok | mismatch

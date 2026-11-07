@@ -1040,6 +1040,27 @@ def main() -> int:
                 assert any(e.get("result") == "ok" and "read_write" in (e.get("detail") or "") for e in hits), hits
             print(f"    switch-on: op records {[(i, o.get('op'), o.get('ok')) for i, o in state['ai_ops'].items()]}, "
                   f"ai.enable {[(e.get('target'), e.get('result'), e.get('detail')) for e in state['ai_audit']]}", flush=True)
+        # ── final review I4: the DNS-shadow guard on AI companion names ──
+        def companion_alias_guard():
+            def shadows() -> list:
+                p = subprocess.run(["./portcullis", "status", "--json"], capture_output=True, text=True, timeout=300)
+                return json.loads(p.stdout)["dns_shadows"]
+            got = shadows()
+            assert got == [], f"the real companions are flagged: {got}"
+            alias = "portcullis-mcp-gitea--gitea"
+            rogue = docker("run", "-d", "--rm", "--network", "portcullis-proxy", "--network-alias", alias, ALPINE, "sleep", "300").strip()
+            try:
+                got = shadows()
+            finally:
+                docker("rm", "-f", rogue, check_rc=False)
+            assert any(h.get("name", "").startswith(alias + " (AI companion name outside project portcullis-gitea)") for h in got), got
+            assert any(h.get("name", "").startswith(alias + " (AI companion name answered by more than one container)") for h in got), got
+            assert shadows() == [], "still flagged once the rogue container is gone"
+            print(f"    rogue alias flagged: {got}", flush=True)
+        check("companion_alias_guard (final review I4): status lists no shadow for the real companions; a container "
+              "outside the instance's project answering to portcullis-mcp-gitea--gitea is flagged (and the real one as shared)",
+              companion_alias_guard)
+
         check("gitea_isolation (T25 carry): gitea-internal only on each project's default network and resolving to its own "
               "Gitea; portcullis-mcp-<id>--gitea resolving to that instance's companion only; no portcullis-hook-* token "
               "left; switch-on's revoke_all succeeded (ai op ok, ai.enable ok)", gitea_isolation)
