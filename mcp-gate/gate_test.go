@@ -26,6 +26,7 @@ import (
 
 	"github.com/portcullis/mcp-gate/internal/accesslog"
 	"github.com/portcullis/mcp-gate/internal/authz"
+	"github.com/portcullis/mcp-gate/internal/bridge"
 	"github.com/portcullis/mcp-gate/internal/config"
 	"github.com/portcullis/mcp-gate/internal/confirm"
 	"github.com/portcullis/mcp-gate/internal/hubapi"
@@ -791,5 +792,164 @@ func TestFallbackDecision(t *testing.T) {
 		if got := fallbackDecision(st); got != want {
 			t.Errorf("%d: %s, want %s", st, got, want)
 		}
+	}
+}
+
+// floodingForwarder fills the access-log queue with allowed lines (list
+// fan-outs, other people's calls) while the call runs upstream, then
+// answers like the bridge would after a tools/call event.
+type floodingForwarder struct {
+	act   *activity
+	event bool
+}
+
+func (f *floodingForwarder) ServeResource(w http.ResponseWriter, r *http.Request, d authz.Decision) {
+	for f.act.log.Write(accesslog.Line{User: "bob", Method: "tools/list", Decision: "allow"}) == nil {
+	}
+	if f.event {
+		f.act.event(bridge.Event{User: d.User, Client: d.Client, Resource: d.Resource.URL, Method: "tools/call", Tool: "list_issues",
+			Decision: "allow", RequestID: r.Header.Get(bridge.RequestIDHeader), UpstreamStatus: 200})
+	}
+	w.WriteHeader(200)
+}
+
+// G28 (final review I2): the access-log slot of a tools/call is taken
+// before it is forwarded. With the writer stalled and the queue filled
+// by allowed lines while the call runs, the call's line (the bridge's
+// event, or the handler's) is still written; once no slot is left, the
+// next tools/call is refused 503 and never forwarded.
+func TestToolCallLineReservedBeforeForwarding(t *testing.T) {
+	for _, viaEvent := range []bool{true, false} {
+		sig := newSigner(t)
+		sn := vectorSnapshot(t)
+		release := make(chan struct{})
+		act := &activity{snap: func() *config.Snapshot { return sn }}
+		path := filepath.Join(t.TempDir(), "access.jsonl")
+		l, err := accesslog.OpenWith(path, accesslog.Options{
+			Group: os.Getgid(), Secrets: act.secrets, QueueSize: 16,
+			WriteHook: func() error { <-release; return nil },
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		act.log, act.healthy = l, l.Healthy
+		fw := &floodingForwarder{act: act, event: viaEvent}
+		h := newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", sig.jwks.URL, sig.jwks.Client()), fw,
+			&handlerDeps{lim: limits.New(nil, nil), act: act})
+		tok := sig.token("alice", giteaURL, "mcp:gitea.gitea")
+		do := func() int {
+			r := httptest.NewRequest("POST", "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_issues","arguments":{}}}`))
+			r.Host = "gitea.example.com"
+			r.Header.Set("Authorization", "Bearer "+tok)
+			r.Header.Set("MCP-Protocol-Version", "2025-11-25")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			return w.Code
+		}
+		if c := do(); c != 200 {
+			t.Fatalf("event %v: call %d", viaEvent, c)
+		}
+		// The queue is full now: the next call can't reserve.
+		if c := do(); c != 503 {
+			t.Errorf("event %v: call with a full queue %d, want 503", viaEvent, c)
+		}
+		close(release)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = l.Flush(ctx)
+		cancel()
+		_ = l.Close()
+		b, _ := os.ReadFile(path)
+		if n := strings.Count(string(b), `"user":"alice","client":"portcullis-ai-claude","resource":"https://gitea.example.com/mcp"`); n != 1 {
+			t.Errorf("event %v: %d lines of the admitted call, want 1:\n%s", viaEvent, n, b)
+		}
+		if !strings.Contains(string(b), `"method":"tools/call","tool":"list_issues"`) {
+			t.Errorf("event %v: the admitted call's line is missing", viaEvent)
+		}
+	}
+}
+
+// blockingForwarder holds every forwarded request until release closes.
+type blockingForwarder struct {
+	in      chan struct{}
+	release chan struct{}
+}
+
+func (f *blockingForwarder) ServeResource(w http.ResponseWriter, r *http.Request, d authz.Decision) {
+	f.in <- struct{}{}
+	<-f.release
+	w.WriteHeader(200)
+}
+
+// Final review I3: N parallel maximum-size bodies. One person gets at
+// most PerPersonInFlight POSTs in flight (the rest 429, never read);
+// across people the gate-wide body budget answers 503 once it is spent.
+func TestParallelMaxBodiesBounded(t *testing.T) {
+	sig := newSigner(t)
+	sn := vectorSnapshot(t)
+	big := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"x":"` + strings.Repeat("a", 8<<20-200) + `"}}`
+	run := func(inf *limits.InFlight, users []string) (codes map[int]int, forwarded int) {
+		deps := testDeps(t, sn)
+		deps.inflight = inf
+		fw := &blockingForwarder{in: make(chan struct{}, len(users)), release: make(chan struct{})}
+		h := newHandler(func() *config.Snapshot { return sn }, authz.NewVerifier("", sig.jwks.URL, sig.jwks.Client()), fw, deps)
+		toks := map[string]string{}
+		for _, u := range users {
+			if toks[u] == "" {
+				toks[u] = sig.token(u, giteaURL, "mcp:gitea.gitea")
+			}
+		}
+		var mu sync.Mutex
+		codes = map[int]int{}
+		var wg sync.WaitGroup
+		for _, u := range users {
+			wg.Add(1)
+			go func(tok string) {
+				defer wg.Done()
+				r := httptest.NewRequest("POST", "/mcp", strings.NewReader(big))
+				r.Host = "gitea.example.com"
+				r.Header.Set("Authorization", "Bearer "+tok)
+				r.Header.Set("MCP-Protocol-Version", "2025-11-25")
+				r.Header.Set("Content-Type", "application/json")
+				r.Header.Set("Accept", "application/json, text/event-stream")
+				w := httptest.NewRecorder()
+				h.ServeHTTP(w, r)
+				mu.Lock()
+				codes[w.Code]++
+				mu.Unlock()
+			}(toks[u])
+		}
+		// Every request either reached the forwarder or was refused.
+		deadline := time.After(20 * time.Second)
+		for {
+			mu.Lock()
+			done := len(fw.in) + codes[429] + codes[503] + codes[403]
+			mu.Unlock()
+			if done == len(users) {
+				break
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("stuck: forwarded %d, codes %v", len(fw.in), codes)
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
+		forwarded = len(fw.in)
+		close(fw.release)
+		wg.Wait()
+		return codes, forwarded
+	}
+	alice := make([]string, limits.PerPersonInFlight+3)
+	for i := range alice {
+		alice[i] = "alice"
+	}
+	codes, fwd := run(limits.NewInFlight(), alice)
+	if fwd != limits.PerPersonInFlight || codes[429] != 3 {
+		t.Errorf("one person: forwarded %d, codes %v", fwd, codes)
+	}
+	// Room for two maximum-size bodies gate-wide: of four requests from
+	// two people, two go through and two get 503 after the bounded wait.
+	codes, fwd = run(limits.NewInFlightWith(limits.PerPersonInFlight, limits.Charge(8<<20)*2, 100*time.Millisecond), []string{"alice", "bob", "alice", "bob"})
+	if fwd != 2 || codes[503] != 2 {
+		t.Errorf("budget: forwarded %d, codes %v", fwd, codes)
 	}
 }

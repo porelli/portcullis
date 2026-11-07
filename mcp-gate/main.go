@@ -39,6 +39,7 @@ import (
 	"github.com/portcullis/mcp-gate/internal/bridge"
 	"github.com/portcullis/mcp-gate/internal/config"
 	"github.com/portcullis/mcp-gate/internal/hubapi"
+	"github.com/portcullis/mcp-gate/internal/limits"
 	"github.com/portcullis/mcp-gate/internal/mcpsdk"
 	"github.com/portcullis/mcp-gate/internal/meta"
 )
@@ -237,6 +238,7 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 			return
 		}
 		ri := reqInfo{start: time.Now()}
+		var ticket *limits.Ticket
 		sn := snap()
 		d := v.Check(r.Context(), sn, authz.FromHTTP(r, time.Now()))
 		ri.d = d
@@ -248,6 +250,28 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 			return
 		}
 		max := sn.File.Limits.MaxRequestBytes
+		// Memory bounds (final review I3): a person's POSTs in flight and
+		// the gate-wide body budget, both taken before the body is read.
+		if r.Method == http.MethodPost && deps.inflight != nil {
+			charge := limits.Charge(max)
+			if r.ContentLength >= 0 && r.ContentLength <= max {
+				charge = limits.Charge(r.ContentLength)
+			}
+			t, err := deps.inflight.Admit(r.Context(), d.User, charge)
+			if err != nil {
+				w.Header().Set("Retry-After", "1")
+				if errors.Is(err, limits.ErrPersonBusy) {
+					http.Error(w, "too many requests in flight; try again later", http.StatusTooManyRequests)
+					deps.act.refused(ri, "rate_limited")
+				} else {
+					http.Error(w, "the gate is busy; try again later", http.StatusServiceUnavailable)
+					deps.act.refused(ri, "deny:busy")
+				}
+				return
+			}
+			defer t.Done()
+			ticket = t
+		}
 		// A trickling body can't hold the connection: a read deadline per
 		// request (ErrNotSupported only outside a real server, in tests).
 		_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(bodyReadTimeout))
@@ -268,6 +292,7 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 			deps.act.refused(ri, "deny:too_large")
 			return
 		}
+		ticket.Shrink(int64(len(body)))
 		if _, perr := authz.CheckProtocol(r.Header, body); perr != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(perr.Status)
@@ -285,13 +310,20 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 			return
 		}
 		toolCall := ri.method == "tools/call"
-		// G28: a tools/call that can't be logged is refused; initialize
-		// and the lists go on.
-		if toolCall && !deps.act.healthy() {
-			http.Error(w, "AI activity can't be logged right now", http.StatusServiceUnavailable)
-			deps.act.refused(ri, "deny:unloggable")
-			return
+		// G28 (final review I2): a tools/call is forwarded only with its
+		// access-log slot reserved first, so its line can't be dropped;
+		// no slot (writer failing or stuck, queue full) = refused.
+		// initialize and the lists go on.
+		var res *accesslog.Reservation
+		if toolCall {
+			if res = deps.act.reserve(); res == nil {
+				http.Error(w, "AI activity can't be logged right now", http.StatusServiceUnavailable)
+				deps.act.refused(ri, "deny:unloggable")
+				return
+			}
 		}
+		// Whatever slot no line used goes back.
+		defer res.Release()
 		if ok, wait := deps.lim.Allow(d.User, d.Resource.URL, toolCall); !ok {
 			w.Header().Set("Retry-After", retryAfter(wait))
 			http.Error(w, "too many requests; try again later", http.StatusTooManyRequests)
@@ -303,11 +335,16 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 		// Forwarded through the bridge (companions) or the aggregate: one
 		// line per upstream call from their events, else the handler's.
 		viaEvents := func(serve func(w http.ResponseWriter, r *http.Request)) {
-			id, done := deps.act.begin()
+			id, done := deps.act.begin(res)
 			r.Header.Set(bridge.RequestIDHeader, id) // replaces anything the client sent
 			sw := &statusWriter{ResponseWriter: w}
 			serve(sw, r)
-			if !done() {
+			wrote, left := done()
+			if left != nil && !wrote {
+				// No event: the handler's line goes in the reserved slot
+				// (a refused call's too). An unused slot goes back (defer).
+				_ = left.Write(deps.act.line(ri, fallbackDecision(sw.status)))
+			} else if !wrote {
 				if dec := fallbackDecision(sw.status); dec == "allow" {
 					deps.act.write(deps.act.line(ri, dec), false)
 				} else {
@@ -332,7 +369,9 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 			if ri.upstreamStatus == 0 && sw.status == http.StatusBadGateway {
 				dec = "deny:upstream"
 			}
-			if dec == "allow" {
+			if res != nil {
+				_ = res.Write(deps.act.line(ri, dec))
+			} else if dec == "allow" {
 				deps.act.write(deps.act.line(ri, dec), false)
 			} else {
 				deps.act.refused(ri, dec)

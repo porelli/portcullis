@@ -363,3 +363,102 @@ func TestConfirmationIDKey(t *testing.T) {
 		t.Errorf("ParseLine: %+v %v", got, err)
 	}
 }
+
+// G28 (final review I2): a reserved line is never dropped. With the
+// writer stalled and the queue then filled by normal lines (list
+// fan-outs, other people's calls), every reserved line still lands;
+// with no slot left, Reserve refuses.
+func TestReservationNeverDropped(t *testing.T) {
+	l, path, _ := open(t, Options{QueueSize: 8})
+	release := make(chan struct{})
+	l.writeHook = func() error { <-release; return nil }
+	_ = l.Write(full) // the writer takes it and stalls
+	waitFor(t, func() bool { return l.writingSince.Load() != 0 })
+	var res []*Reservation
+	for i := 0; i < 3; i++ {
+		r, err := l.Reserve()
+		if err != nil {
+			t.Fatalf("reserve %d: %v", i, err)
+		}
+		res = append(res, r)
+	}
+	for l.Write(full) == nil {
+	}
+	if _, err := l.Reserve(); !errors.Is(err, ErrQueueFull) {
+		t.Errorf("reserve with no slot: %v", err)
+	}
+	call := full
+	call.Method, call.Tool = "tools/call", "delete_repo"
+	for _, r := range res {
+		if err := r.Write(call); err != nil {
+			t.Fatalf("reserved write: %v", err)
+		}
+	}
+	close(release)
+	flush(t, l)
+	n := 0
+	for _, ln := range readLines(t, path) {
+		if ln["tool"] == "delete_repo" {
+			n++
+		}
+	}
+	if n != 3 {
+		t.Errorf("%d of 3 reserved lines written", n)
+	}
+	// Release gives an unused slot back; a used one is not given twice.
+	r, err := l.Reserve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := len(l.slots)
+	r.Release()
+	r.Release()
+	if len(l.slots) != before-1 {
+		t.Errorf("slots %d → %d", before, len(l.slots))
+	}
+}
+
+// G28 (I2): no reservation while the writer is failing at all (not only
+// after 30 s) or stuck on one write for stallAfter.
+func TestReserveRefusedWhileWriterFailsOrStalls(t *testing.T) {
+	l, _, c := open(t, Options{})
+	var fail atomic.Bool
+	block := make(chan struct{})
+	var blocking atomic.Bool
+	l.writeHook = func() error {
+		if blocking.Load() {
+			<-block
+		}
+		if fail.Load() {
+			return errors.New("ENOSPC")
+		}
+		return nil
+	}
+	if r, err := l.Reserve(); err != nil {
+		t.Fatalf("healthy log: %v", err)
+	} else {
+		r.Release()
+	}
+	fail.Store(true)
+	_ = l.Write(full)
+	waitFor(t, func() bool { return l.Errors() > 0 })
+	if _, err := l.Reserve(); !errors.Is(err, ErrUnloggable) {
+		t.Errorf("failing writer: %v", err)
+	}
+	fail.Store(false)
+	waitFor(t, func() bool { return l.failingSince.Load() == 0 })
+	blocking.Store(true)
+	_ = l.Write(full)
+	waitFor(t, func() bool { return l.writingSince.Load() != 0 })
+	if r, err := l.Reserve(); err != nil {
+		t.Errorf("writer busy for 0 s: %v", err)
+	} else {
+		r.Release()
+	}
+	c.add(stallAfter)
+	if _, err := l.Reserve(); !errors.Is(err, ErrUnloggable) {
+		t.Errorf("writer stuck for %v: %v", stallAfter, err)
+	}
+	blocking.Store(false)
+	close(block)
+}

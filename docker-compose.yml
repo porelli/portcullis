@@ -1060,6 +1060,9 @@ services:
       MCP_GATE_HUB_SECRET_FILE: /run/portcullis/mcp-gate/hub-secret
       MCP_GATE_JWKS_URL: http://keycloak:8080/realms/portcullis/protocol/openid-connect/certs
       MCP_GATE_HUB_URL: http://hub:8890
+      # The Go heap stays under mem_limit (final review I3: the gate caps
+      # bodies in flight at 512 MiB gate-wide, 6 POSTs per person).
+      GOMEMLIMIT: 900MiB
     volumes:
       - hub_data:/hub-data:ro
       # The access log (contract §15.8): access.jsonl 0640 group 10001, the
@@ -1082,7 +1085,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
-    mem_limit: 256m
+    mem_limit: 1g
     pids_limit: 256
     labels:
       traefik.enable: "true"

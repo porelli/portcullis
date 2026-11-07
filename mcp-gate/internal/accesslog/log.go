@@ -6,8 +6,10 @@
 // Write never blocks a request for more than 50 ms: lines go through a
 // queue to one writer goroutine, which retries a failed line until it is
 // written. Healthy reports false while the writer has been failing for
-// more than 30 s or the queue is full; the gate then refuses tools/call
-// (G28). Every string field is redacted (the gate's known secrets), then
+// more than 30 s or the queue is full. A tools/call is admitted only with
+// a Reservation (G28, final review I2): a queue slot taken before the
+// call is forwarded, refused while the writer is failing or stuck on one
+// write, so the line of an admitted call can never be dropped. Every string field is redacted (the gate's known secrets), then
 // clipped. A line never carries arguments, results, tokens or credentials:
 // callers pass only the §15.8 fields.
 package accesslog
@@ -46,10 +48,17 @@ const (
 	redacted = "[redacted]"
 	// lowPerSecond bounds lines of refused requests without a valid token.
 	lowPerSecond = 50
+	// stallAfter: a writer stuck this long on one line refuses new
+	// reservations (a hung disk would otherwise pile admitted calls'
+	// lines up in memory).
+	stallAfter = 5 * time.Second
 )
 
 // ErrQueueFull: the line was dropped (counted); the log is unhealthy.
 var ErrQueueFull = errors.New("access log queue full")
+
+// ErrUnloggable: no reservation, the writer is failing or stuck.
+var ErrUnloggable = errors.New("access log writer failing")
 
 // ErrClosed: the log is closed.
 var ErrClosed = errors.New("access log closed")
@@ -132,7 +141,13 @@ type Log struct {
 	torn  bool // a failed write may have left a partial line
 	stale bool // the file was replaced but reopening it failed
 
-	q            chan []byte
+	q chan []byte
+	// slots: one token per line queued or reserved and not yet taken by
+	// the writer (cap = the queue's): a send to q always has its slot, so
+	// it never blocks, and a reserved line always has room.
+	slots        chan struct{}
+	writingSince atomic.Int64 // unix ns (o.Now) of the write in progress; 0 = none
+	lastDropLog  atomic.Int64
 	pending      atomic.Int64
 	failingSince atomic.Int64 // unix ns of the first failure in a row; 0 = fine
 	errs         atomic.Int64
@@ -189,9 +204,10 @@ func OpenWith(path string, o Options) (*Log, error) {
 	}
 	l := &Log{
 		path: path, o: o,
-		q:    make(chan []byte, o.QueueSize),
-		low:  rate.NewLimiter(lowPerSecond, lowPerSecond),
-		stop: make(chan struct{}),
+		q:     make(chan []byte, o.QueueSize),
+		slots: make(chan struct{}, o.QueueSize),
+		low:   rate.NewLimiter(lowPerSecond, lowPerSecond),
+		stop:  make(chan struct{}),
 
 		writeHook: o.WriteHook,
 	}
@@ -283,21 +299,86 @@ func (l *Log) Write(ln Line) error {
 		return ErrClosed
 	}
 	b := l.encode(ln)
-	l.pending.Add(1)
 	select {
-	case l.q <- b:
-		return nil
+	case l.slots <- struct{}{}:
 	default:
+		t := time.NewTimer(writeWait)
+		defer t.Stop()
+		select {
+		case l.slots <- struct{}{}:
+		case <-t.C:
+			l.dropped.Add(1)
+			l.logDrop()
+			return ErrQueueFull
+		}
 	}
-	t := time.NewTimer(writeWait)
-	defer t.Stop()
+	l.enqueue(b)
+	return nil
+}
+
+// enqueue sends a line whose slot is held: never blocks.
+func (l *Log) enqueue(b []byte) {
+	l.pending.Add(1)
+	l.q <- b
+}
+
+// logDrop: a dropped line of a request that was let through is loud (at
+// most one log line per 10 s).
+func (l *Log) logDrop() {
+	if last := l.lastDropLog.Load(); time.Since(time.Unix(0, last)) > 10*time.Second && l.lastDropLog.CompareAndSwap(last, time.Now().UnixNano()) {
+		log.Printf("mcp-gate: ACCESS LOG QUEUE FULL: a line of an allowed request was dropped (%d dropped so far)", l.dropped.Load())
+	}
+}
+
+// Reservation is a queue slot taken before a tools/call is forwarded
+// (G28): its line goes into the slot and is never dropped. Write or
+// Release it exactly once; a second Write is a plain Write.
+type Reservation struct {
+	l    *Log
+	used atomic.Bool
+}
+
+// Reserve takes a slot for the line of a call about to be forwarded. It
+// fails (ErrUnloggable) while the writer is failing at all — not only
+// after FailAfter, so no admitted line waits on a failing disk — or has
+// been stuck on one write for stallAfter, and (ErrQueueFull) when no slot
+// is free. It never waits.
+func (l *Log) Reserve() (*Reservation, error) {
+	if l.closed.Load() {
+		return nil, ErrClosed
+	}
+	if !l.writerOK() {
+		return nil, ErrUnloggable
+	}
 	select {
-	case l.q <- b:
-		return nil
-	case <-t.C:
-		l.pending.Add(-1)
-		l.dropped.Add(1)
-		return ErrQueueFull
+	case l.slots <- struct{}{}:
+		return &Reservation{l: l}, nil
+	default:
+		return nil, ErrQueueFull
+	}
+}
+
+func (l *Log) writerOK() bool {
+	if l.failingSince.Load() != 0 {
+		return false
+	}
+	ws := l.writingSince.Load()
+	return ws == 0 || l.o.Now().Sub(time.Unix(0, ws)) < stallAfter
+}
+
+// Write queues the line into the reserved slot (never dropped).
+func (r *Reservation) Write(ln Line) error {
+	if r.used.Swap(true) {
+		return r.l.Write(ln)
+	}
+	r.l.enqueue(r.l.encode(ln))
+	return nil
+}
+
+// Release gives an unused slot back.
+func (r *Reservation) Release() {
+	if r != nil && !r.used.Swap(true) {
+		<-r.l.slots
 	}
 }
 
@@ -309,17 +390,16 @@ func (l *Log) WriteLow(ln Line) error {
 	if l.closed.Load() {
 		return ErrClosed
 	}
-	if len(l.q) >= cap(l.q)/2 || !l.low.Allow() {
+	if len(l.slots) >= cap(l.slots)/2 || !l.low.Allow() {
 		l.dropped.Add(1)
 		return ErrQueueFull
 	}
 	b := l.encode(ln)
-	l.pending.Add(1)
 	select {
-	case l.q <- b:
+	case l.slots <- struct{}{}:
+		l.enqueue(b)
 		return nil
 	default:
-		l.pending.Add(-1)
 		l.dropped.Add(1)
 		return ErrQueueFull
 	}
@@ -334,7 +414,7 @@ func (l *Log) Healthy() bool {
 	if fs := l.failingSince.Load(); fs != 0 && l.o.Now().Sub(time.Unix(0, fs)) > l.o.FailAfter {
 		return false
 	}
-	return len(l.q) < cap(l.q)
+	return len(l.slots) < cap(l.slots)
 }
 
 // Errors counts failed writes; Dropped counts lines never queued.
@@ -377,9 +457,12 @@ func (l *Log) writer() {
 			return
 		case b = <-l.q:
 		}
+		<-l.slots // the line is the writer's now
 		backoff := 50 * time.Millisecond
 		for {
+			l.writingSince.Store(l.o.Now().UnixNano())
 			err := l.writeLine(b)
+			l.writingSince.Store(0)
 			if err == nil {
 				l.failingSince.Store(0)
 				l.pending.Add(-1)

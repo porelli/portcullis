@@ -82,7 +82,7 @@ func newGate(o gateOptions) (*gate, error) {
 		Snapshot: o.Snapshot, Minter: m, Confirm: conf, OnEvent: act.event, Base: o.Base,
 		MintWait: o.MintWait, MintPoll: o.MintPoll,
 	})
-	deps := &handlerDeps{lim: lim, act: act}
+	deps := &handlerDeps{lim: lim, act: act, inflight: limits.NewInFlight()}
 	g := &gate{bridge: b, log: alog, act: act, lim: lim, minter: m, confirmer: conf}
 	acfg := aggregate.Config{Snapshot: o.Snapshot, Bridge: b, Limits: lim, OnEvent: act.event}
 	if o.HubURL != "" {
@@ -140,9 +140,11 @@ func (m *hubMinter) Mint(ctx context.Context, resource, user string) error {
 // of the aggregate and the Portcullis resources (nil = 503).
 type handlerDeps struct {
 	lim *limits.Limiter
-	act *activity
-	agg aggregateServer
-	hub portcullisServer
+	// inflight bounds memory (nil = no caps: handler-only tests).
+	inflight *limits.InFlight
+	act      *activity
+	agg      aggregateServer
+	hub      portcullisServer
 }
 
 // aggregateServer serves the aggregate (aggregate.Aggregate).
@@ -163,7 +165,7 @@ type activity struct {
 	healthy   func() bool
 	snap      func() *config.Snapshot
 	hubSecret string
-	pending   sync.Map // request id → *atomic.Bool (the bridge wrote its line)
+	pending   sync.Map // request id → *pendingReq
 
 	mu      sync.Mutex
 	cacheSn *config.Snapshot
@@ -247,11 +249,47 @@ func (a *activity) refused(ri reqInfo, decision string) {
 	a.write(a.line(ri, decision), true)
 }
 
+// pendingReq is a forwarded HTTP request: whether the bridge wrote its
+// line, and the access-log slot reserved for its tools/call (G28).
+type pendingReq struct {
+	done atomic.Bool
+	res  atomic.Pointer[accesslog.Reservation]
+}
+
+// reserve takes the access-log slot of a tools/call about to be
+// forwarded (G28, final review I2); nil = unloggable, refuse the call.
+func (a *activity) reserve() *accesslog.Reservation {
+	if a.healthy != nil && !a.healthy() {
+		return nil
+	}
+	r, err := a.log.Reserve()
+	if err != nil {
+		return nil
+	}
+	return r
+}
+
+// writeVia writes a line into res when there is one (it can't be
+// dropped), else as write would.
+func (a *activity) writeVia(res *accesslog.Reservation, l accesslog.Line, low bool) {
+	if res != nil {
+		_ = res.Write(l)
+		return
+	}
+	a.write(l, low)
+}
+
 // event is the bridge's OnEvent.
 func (a *activity) event(ev bridge.Event) {
+	var res *accesslog.Reservation
 	if ev.RequestID != "" {
-		if p, ok := a.pending.Load(ev.RequestID); ok {
-			p.(*atomic.Bool).Store(true)
+		if v, ok := a.pending.Load(ev.RequestID); ok {
+			p := v.(*pendingReq)
+			p.done.Store(true)
+			if ev.Method == "tools/call" {
+				// The call's own line goes into its reserved slot.
+				res = p.res.Swap(nil)
+			}
 		}
 	}
 	via := ev.Via
@@ -269,18 +307,20 @@ func (a *activity) event(ev bridge.Event) {
 	if m == "tools/call" && confirmIDR.MatchString(ev.Confirmation) {
 		l.ConfirmationID = ev.Confirmation
 	}
-	a.write(l, false)
+	a.writeVia(res, l, false)
 }
 
-// begin registers an HTTP request about to be forwarded; done reports
-// whether the bridge wrote its line.
-func (a *activity) begin() (id string, done func() bool) {
+// begin registers an HTTP request about to be forwarded with its
+// reservation (nil unless a tools/call); done reports whether the bridge
+// wrote its line and hands back the reservation no event used.
+func (a *activity) begin(res *accesslog.Reservation) (id string, done func() (bool, *accesslog.Reservation)) {
 	id = rand.Text()
-	flag := new(atomic.Bool)
-	a.pending.Store(id, flag)
-	return id, func() bool {
+	p := new(pendingReq)
+	p.res.Store(res)
+	a.pending.Store(id, p)
+	return id, func() (bool, *accesslog.Reservation) {
 		a.pending.Delete(id)
-		return flag.Load()
+		return p.done.Load(), p.res.Swap(nil)
 	}
 }
 
