@@ -340,6 +340,72 @@ func TestUnknownKidThrottled(t *testing.T) {
 	}
 }
 
+// I1: a key Keycloak stops publishing stops verifying. A known kid
+// re-fetches the set once the last success is older than keyMaxAge; the
+// fetched set replaces the old one. A failed fetch keeps the old set.
+func TestRemovedKeyDropped(t *testing.T) {
+	k1, _ := rsa.GenerateKey(rand.Reader, 2048)
+	k2, _ := rsa.GenerateKey(rand.Reader, 2048)
+	j := newJWKS(t, jose.JSONWebKey{Key: &k1.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"})
+	var failing atomic.Bool
+	inner := j.srv.Config.Handler
+	j.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failing.Load() {
+			j.fetches.Add(1)
+			http.Error(w, "down", http.StatusServiceUnavailable)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	})
+	v := NewVerifier(issuer, j.srv.URL, j.srv.Client())
+	clock := now
+	var clockMu sync.Mutex
+	v.now = func() time.Time { clockMu.Lock(); defer clockMu.Unlock(); return clock }
+	advance := func(d time.Duration) { clockMu.Lock(); clock = clock.Add(d); clockMu.Unlock() }
+	sn := loadSnapshot(t)
+	req := func(s *rsa.PrivateKey, kid string) Decision {
+		tok := signer{s, kid, jose.RS256}.sign(t, baseClaims(now))
+		return v.Check(context.Background(), sn, Request{Host: "gitea.example.com", Path: "/mcp", Authorization: "Bearer " + tok, Now: now})
+	}
+	if d := req(k1, "k1"); d.Status != 200 {
+		t.Fatalf("k1: %d %s", d.Status, d.Reason)
+	}
+	// Keycloak rotates: k2 published, k1 removed.
+	j.mu.Lock()
+	j.keys = []jose.JSONWebKey{{Key: &k2.PublicKey, KeyID: "k2", Algorithm: "RS256", Use: "sig"}}
+	j.mu.Unlock()
+	// Within keyMaxAge the cached k1 still verifies, with no fetch.
+	advance(keyMaxAge - time.Second)
+	before := j.fetches.Load()
+	if d := req(k1, "k1"); d.Status != 200 {
+		t.Fatalf("k1 before max age: %d %s", d.Status, d.Reason)
+	}
+	if j.fetches.Load() != before {
+		t.Fatal("a fresh known kid fetched")
+	}
+	// Past it, the known kid re-fetches first and k1 is refused.
+	advance(2 * time.Second)
+	if d := req(k1, "k1"); d.Status != 401 {
+		t.Fatalf("removed k1 after max age: %d %s", d.Status, d.Reason)
+	}
+	if d := req(k2, "k2"); d.Status != 200 {
+		t.Fatalf("k2: %d %s", d.Status, d.Reason)
+	}
+	// Keycloak down past max age: the last fetched set is kept.
+	failing.Store(true)
+	advance(keyMaxAge + time.Minute)
+	before = j.fetches.Load()
+	if d := req(k2, "k2"); d.Status != 200 {
+		t.Fatalf("k2 with JWKS down: %d %s", d.Status, d.Reason)
+	}
+	if j.fetches.Load() != before+1 {
+		t.Fatalf("stale set: %d fetches, want 1", j.fetches.Load()-before)
+	}
+	if d := req(k1, "k1"); d.Status != 401 {
+		t.Fatalf("k1 with JWKS down: %d", d.Status)
+	}
+}
+
 // A symmetric or private key in the JWKS is never used.
 func TestJWKSOnlyPublicSigningKeys(t *testing.T) {
 	secret := []byte("0123456789abcdef0123456789abcdef")

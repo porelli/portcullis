@@ -24,6 +24,13 @@ import (
 const (
 	refreshEvery = 60 * time.Second
 	refreshEmpty = 5 * time.Second
+	// keyMaxAge bounds how long a key set is used without a successful
+	// fetch being tried again: a token whose kid is known re-fetches the
+	// set first once the last success is older (still within the throttle
+	// above), and the fetched set replaces the old one, so a key Keycloak
+	// stopped publishing (rotated out, disabled, deleted) stops verifying
+	// within keyMaxAge + refreshEvery. A failed fetch keeps the old set.
+	keyMaxAge    = 10 * time.Minute
 	jwksMaxBytes = 1 << 20
 	jwksTimeout  = 10 * time.Second
 )
@@ -68,6 +75,7 @@ type keySet struct {
 	keys    []jose.JSONWebKey
 	fetched bool          // a fetch succeeded once
 	last    time.Time     // last fetch attempt
+	ok      time.Time     // last successful fetch
 	flight  chan struct{} // closed when the fetch in flight ends; nil if none
 }
 
@@ -84,7 +92,7 @@ func (k *keySet) VerifySignature(ctx context.Context, raw string) ([]byte, error
 	if hdr.KeyID == "" {
 		return nil, errors.New("no kid")
 	}
-	if key, ok := k.find(hdr.KeyID, hdr.Algorithm); ok {
+	if key, ok := k.find(hdr.KeyID, hdr.Algorithm); ok && !k.stale() {
 		return jws.Verify(key)
 	}
 	if done, mine := k.refreshSlot(); mine {
@@ -102,6 +110,14 @@ func (k *keySet) VerifySignature(ctx context.Context, raw string) ([]byte, error
 		return jws.Verify(key)
 	}
 	return nil, errors.New("unknown kid")
+}
+
+// stale reports a key set whose last successful fetch is older than
+// keyMaxAge (the known-kid path then re-fetches before verifying).
+func (k *keySet) stale() bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.fetched && k.now().Sub(k.ok) >= keyMaxAge
 }
 
 // find returns a public signing key with that kid usable for alg.
@@ -151,7 +167,9 @@ func (k *keySet) refresh(ctx context.Context, done chan struct{}) {
 	keys, err := k.fetch(ctx)
 	k.mu.Lock()
 	if err == nil {
-		k.keys, k.fetched = keys, true
+		// The fetched set replaces the old one: keys no longer
+		// published are dropped.
+		k.keys, k.fetched, k.ok = keys, true, k.now()
 	}
 	k.flight = nil
 	k.mu.Unlock()
