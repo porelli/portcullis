@@ -438,8 +438,17 @@ func TestResourceMembership(t *testing.T) {
 	if r.Member("bob", at) || r.Member("carol", before) || r.Member("Alice", before) {
 		t.Error("non-member allowed")
 	}
-	if !r.AllowsClient("portcullis-ai-claude") || r.AllowsClient("ai-chat-mcp") {
+	if !r.AllowsClient("portcullis-ai-claude") || !r.AllowsClient("ai-chat-mcp") || r.AllowsClient("portcullis-forward-auth") || r.AllowsClient("gitea") || r.AllowsClient("AI-CHAT-MCP") {
 		t.Error("clients")
+	}
+	// §15.4: the ai_client is on every resource but the admin one.
+	for _, host := range []string{"grafana.example.com", "mcp.example.com", "people.example.com"} {
+		if r, ok := (&Snapshot{File: f}).Resource(host, "/mcp"); !ok || !r.AllowsClient("ai-chat-mcp") {
+			t.Errorf("%s: ai-chat-mcp refused", host)
+		}
+	}
+	if a, ok := (&Snapshot{File: f}).Resource("hub.example.com", "/mcp"); !ok || a.AllowsClient("ai-chat-mcp") || !a.AllowsClient("portcullis-ai-claude") {
+		t.Error("admin resource clients")
 	}
 }
 

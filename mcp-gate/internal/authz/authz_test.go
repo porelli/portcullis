@@ -163,6 +163,7 @@ func TestTokenMatrix(t *testing.T) {
 		reason   string
 		www      string
 		wantUser string
+		client   string // the allowed azp; "" = portcullis-ai-claude
 	}
 	rows := []row{
 		{name: "valid RS256", auth: tok(base), status: 200, reason: "allow", wantUser: "alice"},
@@ -181,7 +182,9 @@ func TestTokenMatrix(t *testing.T) {
 		{name: "no aud", auth: tok(with(base, "aud", nil)), status: 401, reason: "audience"},
 		{name: "azp forward-auth", auth: tok(with(base, "azp", "portcullis-forward-auth")), status: 401, reason: "client", www: challenge},
 		{name: "azp app client", auth: tok(with(base, "azp", "gitea")), status: 401, reason: "client"},
-		{name: "azp ai_client not on this resource", auth: tok(with(base, "azp", "ai-chat-mcp")), status: 401, reason: "client"},
+		// §15.4: the ai_client is on companions, people and the aggregate
+		// (TestAIClientNotOnAdminResource covers the admin resource).
+		{name: "azp ai_client on a companion", auth: tok(with(base, "azp", "ai-chat-mcp")), status: 200, reason: "allow", client: "ai-chat-mcp"},
 		{name: "no azp", auth: tok(with(base, "azp", nil)), status: 401, reason: "client"},
 		{name: "wrong iss", auth: tok(with(base, "iss", "https://auth.evil.example/realms/portcullis")), status: 401, reason: "bad_token"},
 		{name: "expired", auth: tok(with(base, "exp", now.Add(-61*time.Second).Unix())), status: 401, reason: "expired", www: challenge},
@@ -238,13 +241,43 @@ func TestTokenMatrix(t *testing.T) {
 			if c.wantUser != "" && d.User != c.wantUser {
 				t.Errorf("user %q, want %q", d.User, c.wantUser)
 			}
-			if c.status == 200 && (d.Resource == nil || d.Resource.URL != giteaURL || d.Client != "portcullis-ai-claude") {
+			wantClient := c.client
+			if wantClient == "" {
+				wantClient = "portcullis-ai-claude"
+			}
+			if c.status == 200 && (d.Resource == nil || d.Resource.URL != giteaURL || d.Client != wantClient) {
 				t.Errorf("decision %+v", d)
 			}
 			if strings.Contains(fmt.Sprintf("%+v", d), "eyJ") {
 				t.Error("the decision carries the token")
 			}
 		})
+	}
+}
+
+// §15.4: the admin resource is the one resource without the ai_client
+// (ai-chat-mcp): its token is refused as a client, before the audience,
+// scope or population are looked at; a listed client gets past that.
+func TestAIClientNotOnAdminResource(t *testing.T) {
+	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	j := newJWKS(t, jose.JSONWebKey{Key: &rsaKey.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"})
+	v := NewVerifier(issuer, j.srv.URL, j.srv.Client())
+	const hubURL = "https://hub.example.com/mcp"
+	challenge := `Bearer resource_metadata="https://hub.example.com/.well-known/oauth-protected-resource/mcp", scope="mcp:portcullis.admin"`
+	admin := with(baseClaims(now), "aud", []string{hubURL}, "scope", "openid mcp:portcullis.admin", "preferred_username", "root")
+	check := func(azp string) Decision {
+		tok := signer{rsaKey, "k1", jose.RS256}.sign(t, with(admin, "azp", azp))
+		return v.Check(context.Background(), loadSnapshot(t), Request{Host: "hub.example.com", Path: "/mcp", Authorization: "Bearer " + tok, Now: now})
+	}
+	d := check("ai-chat-mcp")
+	if d.Status != 401 || d.Reason != "client" || d.WWWAuthenticate != challenge {
+		t.Fatalf("ai-chat-mcp on the admin resource: %d %q %q", d.Status, d.Reason, d.WWWAuthenticate)
+	}
+	if d.Resource == nil || d.Resource.URL != hubURL {
+		t.Fatalf("resource %+v", d.Resource)
+	}
+	if d := check("portcullis-ai-claude"); d.Status != 200 || d.Reason != "allow" || d.Client != "portcullis-ai-claude" || d.User != "root" {
+		t.Fatalf("portcullis-ai-claude on the admin resource: %d %q", d.Status, d.Reason)
 	}
 }
 

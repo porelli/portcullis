@@ -44,6 +44,7 @@
       "url": "https://gitea.example.com/mcp",
       "scope": "mcp:gitea.gitea",
       "clients": [
+        "ai-chat-mcp",
         "portcullis-ai-claude",
         "portcullis-ai-claude-code",
         "portcullis-ai-generic"
@@ -98,6 +99,7 @@
       "url": "https://grafana.example.com/mcp",
       "scope": "mcp:grafana.grafana",
       "clients": [
+        "ai-chat-mcp",
         "portcullis-ai-claude",
         "portcullis-ai-claude-code",
         "portcullis-ai-generic"
@@ -231,6 +233,7 @@
       "url": "https://people.example.com/mcp",
       "scope": "mcp:portcullis.people",
       "clients": [
+        "ai-chat-mcp",
         "portcullis-ai-claude",
         "portcullis-ai-claude-code",
         "portcullis-ai-generic"
