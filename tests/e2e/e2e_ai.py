@@ -654,11 +654,13 @@ def main() -> int:
             try:
                 both = mcp_login(alice, GITEA_MCP, "alice-both", scope=f"{SCOPE_GITEA} mcp:all")
             except AssertionError as e:
-                print(f"    RESULT both-scopes: Keycloak did not mint one ({e}); the case is dropped", flush=True)
-                return
+                # Contract §8 states this case as verified here (final review
+                # M7): a Keycloak that stops minting it fails the check.
+                raise AssertionError(f"Keycloak did not mint a two-resource token: {e}") from e
             c = show("alice's two-resource token", both)
             aud = c["aud"] if isinstance(c.get("aud"), list) else [c.get("aud")]
             print(f"    RESULT both-scopes: Keycloak minted aud {aud}", flush=True)
+            assert {GITEA_MCP, MCP_ALL} <= set(aud), f"not a two-resource token: aud {aud}"
             got = {url: refused(url, both) for url in (GITEA_MCP, MCP_ALL, GITEA_B_MCP)}
             print(f"    two-resource token: {got}", flush=True)
             assert all(v == 401 for v in got.values()), got

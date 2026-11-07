@@ -1054,6 +1054,20 @@ func TestServerToClientRequestsMultiRoundTrip(t *testing.T) {
 	if !slices.Contains(d, "deny:url_elicitation") || !slices.Contains(d, "deny:sampling") {
 		t.Errorf("decisions %v", d)
 	}
+	// Final review M8: the side-channel lines name the request's AI
+	// client like its own line does.
+	side := 0
+	for _, e := range h.eventList() {
+		if e.Method == "elicitation/create" || e.Method == "sampling/createMessage" {
+			side++
+			if e.Client == "" {
+				t.Errorf("side-channel event without a client: %+v", e)
+			}
+		}
+	}
+	if side == 0 {
+		t.Error("no side-channel event")
+	}
 }
 
 func resultTextOr(r *sdk.CallToolResult) string {

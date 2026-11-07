@@ -31,7 +31,7 @@ type link struct {
 	mu        sync.Mutex
 	cs        *mcp.ClientSession
 	closed    bool
-	active    []context.Context // in-flight downstream requests (newest last)
+	active    []*inflight // in-flight downstream requests (newest last)
 	lastUse   time.Time
 
 	annMu       sync.Mutex
@@ -155,16 +155,24 @@ func (l *link) isClosed() bool {
 	return l.closed
 }
 
+// inflight is one downstream request: its context, and the AI client and
+// gate request id its side-channel lines carry (final review M8).
+type inflight struct {
+	ctx               context.Context
+	client, requestID string
+}
+
 // enter records an in-flight downstream request: in-band requests from
 // the companion go to the newest one (its own response stream).
-func (l *link) enter(ctx context.Context) func() {
+func (l *link) enter(ctx context.Context, client, requestID string) func() {
+	in := &inflight{ctx: ctx, client: client, requestID: requestID}
 	l.mu.Lock()
-	l.active = append(l.active, ctx)
+	l.active = append(l.active, in)
 	l.lastUse = l.b.now()
 	l.mu.Unlock()
 	return func() {
 		l.mu.Lock()
-		if i := slices.Index(l.active, ctx); i >= 0 {
+		if i := slices.Index(l.active, in); i >= 0 {
 			l.active = slices.Delete(l.active, i, i+1)
 		}
 		l.lastUse = l.b.now()
@@ -178,7 +186,7 @@ func (l *link) downstream() (*mcp.ServerSession, context.Context) {
 	if l.ss == nil || len(l.active) == 0 {
 		return nil, nil
 	}
-	return l.ss, l.active[len(l.active)-1]
+	return l.ss, l.active[len(l.active)-1].ctx
 }
 
 func (l *link) resource() *config.Resource {
@@ -192,6 +200,13 @@ func (l *link) resource() *config.Resource {
 func (l *link) event(method, decision string) {
 	res := l.resource()
 	e := Event{User: l.key.user, Resource: l.key.url, Via: "direct", Method: method, Decision: decision}
+	// The request it happened in (the newest in flight): its client and
+	// gate request id (final review M8).
+	l.mu.Lock()
+	if n := len(l.active); n > 0 {
+		e.Client, e.RequestID = l.active[n-1].client, l.active[n-1].requestID
+	}
+	l.mu.Unlock()
 	if res != nil {
 		e.Instance, e.Companion = res.Instance, res.Companion
 	}
@@ -239,7 +254,9 @@ func (l *link) elicit(_ context.Context, req *mcp.ElicitRequest) (*mcp.ElicitRes
 	if ss == nil {
 		return decline, nil // nobody to ask (a sessionless client or no call in flight)
 	}
-	r, err := ss.Elicit(dctx, req.Params)
+	ectx, cancel := context.WithTimeout(dctx, elicitWait) // bounded (M6)
+	defer cancel()
+	r, err := ss.Elicit(ectx, req.Params)
 	if err != nil || r == nil {
 		return decline, nil
 	}

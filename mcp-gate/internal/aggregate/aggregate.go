@@ -921,14 +921,18 @@ func (a *Aggregate) list(ctx context.Context, u upstream, req mcp.Request, id id
 	via := bridge.Via{User: id.user, Bound: id.url}
 	ss, _ := req.GetSession().(*mcp.ServerSession)
 	extra := req.GetExtra()
+	// The upstream's per-resource limits (§15.9), once per refresh for all
+	// three lists (final review M4: not per page, and resources and
+	// prompts count too), so an app with many pages can't rate-limit the
+	// person out of their other apps.
+	if !a.allow(id, u, false) {
+		a.event(id, req, u, mcp.MethodListTools, "", nil, "rate_limited", 0, a.now())
+		return listing{err: errRateLimited}
+	}
 	cursor := ""
 	for page := 0; ; page++ {
 		if page == maxPages || len(l.tools) >= maxItems {
 			return listing{err: errTooBig}
-		}
-		if !a.allow(id, u, false) {
-			a.event(id, req, u, mcp.MethodListTools, "", nil, "rate_limited", 0, a.now())
-			return listing{err: errRateLimited}
 		}
 		r, err := a.cfg.Bridge.Forward(ctx, via, u.res, mcp.MethodListTools, &mcp.ListToolsRequest{Session: ss, Params: &mcp.ListToolsParams{Cursor: cursor}, Extra: extra})
 		if err != nil {

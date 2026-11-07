@@ -650,7 +650,7 @@ func (b *Bridge) forward(ctx context.Context, k key, method string, req mcp.Requ
 		lss = nil // the pooled link: one aggregate session reaches many upstreams
 	}
 	l := b.linkFor(k, r, lss)
-	leave := l.enter(ctx)
+	leave := l.enter(ctx, ev.Client, ev.RequestID)
 	defer leave()
 
 	// Policy first for tools/call: a refused call never needs the upstream.
@@ -1010,7 +1010,12 @@ func (b *Bridge) callTool(cctx, ctx context.Context, ev *Event, req mcp.Request,
 				answers[id] = decline
 				continue
 			}
-			er, err := ss.Elicit(ctx, ep)
+			// Each wait is bounded like deliverConfirmation's (final review
+			// M6): a client that never answers declines, never holds the
+			// request, the link's slot and the upstream state.
+			ectx, cancel := context.WithTimeout(ctx, elicitWait)
+			er, err := ss.Elicit(ectx, ep)
+			cancel()
 			if err != nil || er == nil {
 				answers[id] = decline
 				continue
