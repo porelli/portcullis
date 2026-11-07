@@ -2946,10 +2946,13 @@ jobs:
                              -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @- \
                              | jq -c '[.data.groups[].displayName]'; }
 
-          # Before: the template is loaded, the instance disabled, the image
-          # absent (else the pull is instant and the test vacuous).
-          hub GET /api/instances | jq -e --arg id "$ID" 'any(.[]; .id == $id and .state == "disabled")' >/dev/null \
-            || { echo "FAIL: $ID is not a disabled instance: $(hub GET /api/instances | jq -c '[.[] | {id, state}]')"; exit 1; }
+          # Before: the template is loaded, its default instance never ran
+          # (not listed: no record, not enabled), the image absent (else the
+          # pull is instant and the test vacuous).
+          hub GET /api/templates | jq -e --arg id "$ID" 'any(.[]; .id == $id)' >/dev/null \
+            || { echo "FAIL: the Hub did not load the CI template $ID: $(hub GET /api/templates | jq -c '[.[].id]')"; exit 1; }
+          hub GET /api/instances | jq -e --arg id "$ID" 'all(.[]; .id != $id)' >/dev/null \
+            || { echo "FAIL: $ID before the enable: $(hub GET /api/instances | jq -c --arg id "$ID" '.[] | select(.id == $id)')"; exit 1; }
           if docker image inspect "$IMG" >/dev/null 2>&1; then echo "FAIL: $IMG is already on the runner"; exit 1; fi
           [ "$(kc_clients "$ID")" = 0 ] || { echo "FAIL: a Keycloak client $ID exists before the enable"; exit 1; }
 
