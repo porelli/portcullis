@@ -39,8 +39,20 @@ Scenarios (one function each; screenshots and traces kept on failure):
   6. aggregate_lists            mcp.<d>: carol gitea__* + grafana__* +
                                 portcullis__my_apps, a Grafana call through
                                 the gate; bob no grafana__*; root no admin tool
+  8. companion_confirmation     alice's label_write delete_repo_label → a
+                                people.<d> confirmation (typed check the
+                                instance label); bob 404; approved → runs
+                                once with the canonical args; changed args →
+                                a new one; access log confirmation_id
+  9. url_elicitation_2026       URL elicitation declared: 2026-07-28 →
+                                input_required (Hub D tool and companion);
+                                2025-11-25 → the gate's elicitation/create
+                                mode url, the Hub's text
   2. leaver_refused_and_revoked alice out of users_gitea → 403, her Gitea
                                 portcullis-ai-* token deleted
+  10. gitea_isolation           gitea-internal / companion alias resolution,
+                                no portcullis-hook-* token left, switch-on's
+                                revoke_all ok (T25 carry)
   7. ai_off                     master switch off → every resource 503
 
 Environment: E2E_DOMAIN, HUB_IP, E2E_HUB_SECRET, E2E_HUB_ACTOR (root),
@@ -52,6 +64,7 @@ never printed: only their claims' aud / scope / azp.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -96,6 +109,10 @@ SCOPE_GRAFANA = "mcp:grafana.grafana"
 HUB = f"https://hub.{DOMAIN}"
 # The throwaway instance root deletes through the admin MCP (scenario 5).
 ECHO_DEL = "echo-del"
+# Never deleted: the target of the elicitation-shape checks (scenario 9).
+ECHO_ELICIT = "echo-elicit"
+PEOPLE_CONFIRM_RE = re.compile(r"https://people\.[a-z0-9.-]+/confirm/[A-Za-z0-9_-]+")
+ALPINE = os.environ.get("ALPINE", "")
 CONFIRM_RE = re.compile(r"https://hub\.[a-z0-9.-]+/confirm/[A-Za-z0-9_-]+")
 CLIENT = "portcullis-ai-claude-code"
 CALLBACK = "http://127.0.0.1:33418/callback"
@@ -345,13 +362,24 @@ def _mcp_login(page: Page, resource: str, label: str, scope: str | None = None) 
     return tf
 
 
-def mcp_call(url: str, tf: str, method: str = "tools/list", tool: str | None = None, args: dict | None = None):
+def mcp_call(url: str, tf: str, method: str = "tools/list", tool: str | None = None, args: dict | None = None,
+             protocol: str | None = None, elicitation: bool = False, elicit_answer: str = "accept"):
     argv = [MCPCLIENT, "call", "--url", url, "--token-file", tf, "--method", method, "--ca-file", CA]
     if tool:
         argv += ["--tool", tool, "--args", json.dumps(args or {})]
+    if protocol:
+        argv += ["--protocol", protocol]
+    if elicitation:
+        argv += ["--elicitation", "url", "--elicit-answer", elicit_answer]
     p = subprocess.run(argv, capture_output=True, text=True, timeout=200)
     assert p.returncode in (0, 2), f"mcpclient call {method} {url}: rc {p.returncode}: {p.stderr.strip()[:600]}"
     return p.returncode, json.loads(p.stdout)
+
+
+def canonical(args: dict) -> str:
+    """RFC 8785 for these arguments (strings and small integers only):
+    sorted keys, no whitespace, UTF-8 as is."""
+    return json.dumps(args, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def text_of(result: dict) -> str:
@@ -450,6 +478,8 @@ def main() -> int:
         # Never enabled: only deleted again, through the admin MCP (scenario 5).
         hub_ok("POST", "/api/instances", {"template": "echo", "id": ECHO_DEL, "hosts": {"echo": f"{ECHO_DEL}.{DOMAIN}"}},
                want=(201,))
+        hub_ok("POST", "/api/instances", {"template": "echo", "id": ECHO_ELICIT, "hosts": {"echo": f"{ECHO_ELICIT}.{DOMAIN}"}},
+               want=(201,))
         hub_ok("POST", "/api/instances", {"template": "gitea", "id": "gitea-b", "hosts": {"gitea": f"gitea-b.{DOMAIN}"}},
                want=(201,))
         # One host port per instance: gitea keeps 2222 (Git over SSH is off
@@ -535,7 +565,14 @@ def main() -> int:
                 code, out = gitea_api("gitea", who, "write:repository,write:user", "POST", "/user/repos",
                                       json.dumps({"name": f"{who}-private", "private": True}))
                 assert code == 201, f"{who}-private: HTTP {code}: {out[:300]}"
-        check("seed: alice-private and bob-private (private Gitea repositories)", seed)
+            # Two labels on alice-private: one the companion confirmation
+            # deletes (scenario 8), one that must survive it.
+            for name in ("ci-delete-me", "ci-keep"):
+                code, out = gitea_api("gitea", "alice", "write:repository,write:issue,write:user", "POST",
+                                      "/repos/alice/alice-private/labels", json.dumps({"name": name, "color": "#e11d21"}))
+                assert code == 201, f"label {name}: HTTP {code}: {out[:300]}"
+                state.setdefault("labels", {})[name] = json.loads(out)["id"]
+        check("seed: alice-private and bob-private (private Gitea repositories), two labels on alice-private", seed)
 
         def ai_on():
             v = hub_ok("PUT", "/api/ai/settings", {"enabled": True,
@@ -554,7 +591,9 @@ def main() -> int:
                     return c.get("status") == "on" and c.get("mode") == mode and c
                 until(f"{inst}'s companion on", companion_on, 180, every=5)
                 until(f"{inst}'s {comp}-mcp running", lambda: container(inst, f"{comp}-mcp"), 120, every=5)
+                state.setdefault("ai_ops", {})[inst] = hub_ok("GET", f"/api/instances/{inst}/op")
             gitea_routed()
+            state["ai_audit"] = [e for e in json.loads(hub("GET", "/api/directory/audit")[1]) if e.get("action") == "ai.enable"]
             for url, scope in ((GITEA_MCP, SCOPE_GITEA), (GITEA_B_MCP, "mcp:gitea-b.gitea"), (GRAFANA_MCP, SCOPE_GRAFANA),
                                (MCP_ALL, "mcp:all"),
                                (HUB_MCP, "mcp:portcullis.admin"), (PEOPLE_MCP, "mcp:portcullis.people")):
@@ -791,6 +830,151 @@ def main() -> int:
               "grafana__search_dashboards through the gate (identity_headers, access log allow 200); bob (gitea) sees no "
               "grafana__*; root's aggregate has no admin tool", aggregate_lists)
 
+        popups: dict = {"root": 1}
+
+        def approve(page: Page, who: str, url: str, typed: str) -> None:
+            """who opens the confirmation page, types the check and signs in
+            again in the fresh-auth popup (its own virtual authenticator with
+            a copy of who's credential, counter above every earlier copy)."""
+            goto(page, url)
+            assert page.locator("#confirm").get_attribute("data-state") == "pending"
+            page.fill("#cf-typed", typed)
+            n = popups[who] = popups.get(who, 0) + 1
+            with page.context.expect_page(timeout=30_000) as pinfo:
+                page.click("#cf-approve")
+            popup = pinfo.value
+            base.Authenticator(popup, credentials=[dict(c, signCount=c.get("signCount", 0) + 1000 * n)
+                                                   for c in auths[who].credentials()])
+            drive_popup(popup, f"{who}-confirm-{n}")
+            page.wait_for_selector('#confirm[data-state="approved"]', timeout=60_000)
+            base.shot(page, f"ai-{who}-approved-{n}")
+
+        def labels() -> dict:
+            code, out = gitea_api("gitea", "alice", "read:issue,read:repository", "GET", "/repos/alice/alice-private/labels")
+            assert code == 200, f"labels: HTTP {code}: {out[:300]}"
+            return {x["name"]: x["id"] for x in json.loads(out)}
+
+        # ── 8 ──
+        def companion_confirmation():
+            tf = mcp_login(alice, GITEA_MCP, "alice-gitea-confirm")
+            state["alice_gitea"], state["alice_gitea_at"] = tf, time.time()
+            rc, doc = mcp_call(GITEA_MCP, tf)
+            schema = next(t for t in doc["result"]["tools"] if t["name"] == "label_write")["inputSchema"]
+            props = schema.get("properties") or {}
+            assert {"method", "owner", "repo", "id"} <= set(props), f"label_write's schema: {json.dumps(schema)[:600]}"
+            lid, keep = state["labels"]["ci-delete-me"], state["labels"]["ci-keep"]
+            args = {"method": "delete_repo_label", "owner": "alice", "repo": "alice-private", "id": lid}
+            canon = canonical(args)
+            err, text = call_text(GITEA_MCP, tf, "label_write", args)
+            print(f"    label_write delete_repo_label: isError {err}: {text[:200]}", flush=True)
+            m = PEOPLE_CONFIRM_RE.search(text)
+            assert err and m and text.startswith("This needs your confirmation in your browser: open "), text[:300]
+            url = m.group(0)
+            cid = url.rsplit("/", 1)[1]
+            assert "ci-delete-me" in labels(), "the label went before the confirmation"
+            # bob: people.<d> is open to him; the Hub answers another
+            # person's confirmation with 404.
+            r = bob.request.get(url)
+            print(f"    bob opens alice's confirmation: HTTP {r.status}", flush=True)
+            assert r.status == 404 and "label_write" not in r.text(), f"bob: HTTP {r.status}: {r.text()[:200]}"
+            # alice: the page shows exactly the canonical arguments; the typed
+            # check is the instance label (G75).
+            goto(alice, url)
+            box = alice.locator("#confirm")
+            typed = box.get_attribute("data-typed")
+            shown = (alice.locator("#cf-args").text_content() or "").strip()
+            print(f"    page: typed check {typed!r}, arguments {shown}", flush=True)
+            base.shot(alice, "ai-alice-companion-confirm")
+            assert typed == "Gitea", f"typed check {typed!r} (want the instance label Gitea)"
+            assert json.loads(shown) == args, f"shown arguments {shown!r} (canonical {canon!r})"
+            approve(alice, "alice", url, typed)
+            err2, text2 = call_text(GITEA_MCP, tf, "label_write", args)
+            print(f"    retry after the approval: isError {err2}: {text2[:200]}", flush=True)
+            assert not err2, text2[:400]
+            now = labels()
+            assert "ci-delete-me" not in now and now.get("ci-keep") == keep, f"alice-private's labels after: {now}"
+            # Single use: the same call again needs a new confirmation.
+            err3, text3 = call_text(GITEA_MCP, tf, "label_write", args)
+            m3 = PEOPLE_CONFIRM_RE.search(text3)
+            assert err3 and m3 and m3.group(0) != url, text3[:300]
+            # A changed argument: a new confirmation, nothing deleted.
+            args2 = dict(args, id=keep)
+            err4, text4 = call_text(GITEA_MCP, tf, "label_write", args2)
+            m4 = PEOPLE_CONFIRM_RE.search(text4)
+            print(f"    changed argument: isError {err4}: {text4[:160]}", flush=True)
+            assert err4 and m4 and m4.group(0) not in (url, m3.group(0)), text4[:300]
+            assert labels().get("ci-keep") == keep, "ci-keep went without a confirmation"
+            # The access log: the confirmation and the consuming call.
+            digest = hashlib.sha256(canon.encode()).hexdigest()
+            lines = [x for x in hub_ok("GET", "/api/ai/activity?n=200").get("lines") or []
+                     if x.get("user") == "alice" and x.get("tool") == "label_write"]
+            ran = [x for x in lines if x.get("decision") == "allow" and norm_id(x.get("confirmation_id") or "") == norm_id(cid)]
+            print(f"    access log: {[(x.get('decision'), x.get('confirmation_id'), x.get('args_sha256', '')[:12]) for x in lines]}",
+                  flush=True)
+            assert len(ran) == 1 and ran[0].get("args_sha256") == digest and ran[0].get("upstream_status") == 200, \
+                f"no single allow line with confirmation_id {cid} and args_sha256 {digest}: {json.dumps(lines)[:800]}"
+            assert any(norm_id(x.get("decision") or "") == norm_id(f"confirm:{cid}") for x in lines), "no confirm:<id> line"
+        check("companion_confirmation: alice's label_write delete_repo_label on gitea.<d>/mcp → people.<d>/confirm/<id> "
+              "(typed check the instance label, the canonical arguments shown); bob 404; alice approves with a fresh "
+              "passkey → the retry runs once (the label gone, the other kept); the same call again and a changed argument "
+              "→ new confirmations; access log allow with confirmation_id and the canonical args_sha256", companion_confirmation)
+
+        # ── 9 ──
+        def url_elicitation_2026():
+            def one_url_request(doc: dict, host_re) -> tuple[str, dict]:
+                res = doc.get("result") or {}
+                reqs = res.get("inputRequests") or {}
+                assert len(reqs) == 1 and not res.get("content") and not res.get("isError") and res.get("requestState"), \
+                    f"not an input_required result: {json.dumps(doc)[:600]}"
+                key, req = next(iter(reqs.items()))
+                p = req.get("params") or {}
+                assert req.get("method") == "elicitation/create" and p.get("mode") == "url" and host_re.fullmatch(p.get("url", "")) \
+                    and p.get("elicitationId") and not p.get("requestedSchema"), f"input request: {json.dumps(req)[:400]}"
+                return key, res
+            # The Hub's D tool on hub.<d>/mcp.
+            rtf = mcp_login(root, HUB_MCP, "root-hub-2026")
+            state["root_hub"], state["root_hub_at"] = rtf, time.time()
+            rc, doc = mcp_call(HUB_MCP, rtf, "tools/call", "delete_instance", {"id": ECHO_ELICIT},
+                               protocol="2026-07-28", elicitation=True)
+            print(f"    hub delete_instance (2026-07-28, url): protocol {doc.get('protocol')!r}: {json.dumps(doc.get('result'))[:300]}",
+                  flush=True)
+            assert rc == 0, doc
+            key, res = one_url_request(doc, CONFIRM_RE)
+            assert key == "portcullis_confirmation" and doc.get("elicitations") == [], (key, doc.get("elicitations"))
+            # A companion's D tool through the gate.
+            atf = state["alice_gitea"] if time.time() - state.get("alice_gitea_at", 0) < TOKEN_FRESH_S \
+                else mcp_login(alice, GITEA_MCP, "alice-gitea-2026")
+            args = {"method": "delete_repo_label", "owner": "alice", "repo": "alice-private", "id": 900001}
+            rc, doc = mcp_call(GITEA_MCP, atf, "tools/call", "label_write", args, protocol="2026-07-28", elicitation=True)
+            print(f"    gate label_write (2026-07-28, url): protocol {doc.get('protocol')!r}: {json.dumps(doc.get('result'))[:300]}",
+                  flush=True)
+            assert rc == 0, doc
+            key, res = one_url_request(doc, PEOPLE_CONFIRM_RE)
+            assert key == "portcullis_confirmation" and res["requestState"].startswith("portcullis-gate:"), (key, res["requestState"][:20])
+            # 2025-11-25 session with URL elicitation: the gate sends
+            # elicitation/create (mode url), then the text.
+            args = dict(args, id=900002)
+            rc, doc = mcp_call(GITEA_MCP, atf, "tools/call", "label_write", args, protocol="2025-11-25", elicitation=True)
+            el = doc.get("elicitations") or []
+            print(f"    gate label_write (2025-11-25, url): protocol {doc.get('protocol')!r}, elicitations "
+                  f"{[(e.get('mode'), e.get('url')) for e in el]}, result {text_of(doc.get('result') or {})[:160]}", flush=True)
+            assert rc == 0 and doc.get("protocol") == "2025-11-25", doc
+            assert len(el) == 1 and el[0].get("mode") == "url" and PEOPLE_CONFIRM_RE.fullmatch(el[0].get("url", "")) \
+                and el[0].get("elicitationId"), el
+            text = text_of(doc["result"])
+            assert doc["result"].get("isError") and el[0]["url"] in text, text[:300]
+            # The Hub's MCP is stateless: on 2025-11-25 the text, never an
+            # elicitation/create.
+            rc, doc = mcp_call(HUB_MCP, rtf, "tools/call", "delete_instance", {"id": ECHO_ELICIT},
+                               protocol="2025-11-25", elicitation=True)
+            print(f"    hub delete_instance (2025-11-25, url): elicitations {doc.get('elicitations')}, "
+                  f"{text_of(doc.get('result') or {})[:160]}", flush=True)
+            assert rc == 0 and doc.get("elicitations") == [] and (doc.get("result") or {}).get("isError"), doc
+        check("url_elicitation_2026: with URL elicitation declared on 2026-07-28 the Hub's delete_instance and the gate's "
+              "label_write answer input_required with one url elicitation (hub.<d> / people.<d> /confirm/<id>, no content); "
+              "on 2025-11-25 the gate sends elicitation/create mode url then the text, the stateless Hub the text only",
+              url_elicitation_2026)
+
         # ── 2 (alice leaves) ──
         def leaver_refused_and_revoked():
             tf = mcp_login(alice, GITEA_MCP, "alice-gitea-leave")
@@ -806,6 +990,55 @@ def main() -> int:
             assert refused(GITEA_MCP, tf) == 403, "alice is allowed again"
         check("leaver_refused_and_revoked: alice removed from users_gitea (Hub API) → her next call 403; her Gitea "
               "portcullis-ai-* token deleted (Gitea API)", leaver_refused_and_revoked)
+
+        # ── 10: T25 carry ──
+        def gitea_isolation():
+            def nets(cid: str) -> dict:
+                return json.loads(docker("inspect", "-f", "{{json .NetworkSettings.Networks}}", cid))
+
+            def resolve(network: str, name: str) -> str:
+                p = subprocess.run(["docker", "run", "--rm", "--network", network, ALPINE, "getent", "hosts", name],
+                                   capture_output=True, text=True, timeout=120)
+                return p.stdout.split()[0] if p.returncode == 0 and p.stdout.strip() else ""
+            assert ALPINE, "ALPINE (pinned image) not set"
+            seen = {}
+            for inst in ("gitea", "gitea-b"):
+                g, mcp = container(inst, "gitea"), container(inst, "gitea-mcp")
+                gn, mn = nets(g), nets(mcp)
+                default = f"portcullis-{inst}_default"
+                assert "gitea-internal" in (gn[default].get("Aliases") or []), gn[default]
+                assert "gitea-internal" not in (gn["portcullis-proxy"].get("Aliases") or []) + (gn["portcullis-proxy"].get("DNSNames") or []), \
+                    gn["portcullis-proxy"]
+                alias = f"portcullis-mcp-{inst}--gitea"
+                assert alias in (mn["portcullis-proxy"].get("Aliases") or []), mn.get("portcullis-proxy")
+                # Resolution, as the peers see it.
+                internal = resolve(default, "gitea-internal")
+                assert internal == gn[default]["IPAddress"], f"{inst}: gitea-internal → {internal}, gitea is {gn[default]['IPAddress']}"
+                comp = resolve("portcullis-proxy", alias)
+                assert comp == mn["portcullis-proxy"]["IPAddress"], f"{alias} → {comp}, the companion is {mn['portcullis-proxy']['IPAddress']}"
+                seen[inst] = (internal, comp)
+            assert resolve("portcullis-proxy", "gitea-internal") == "", "gitea-internal resolves on portcullis-proxy"
+            assert seen["gitea"][1] != seen["gitea-b"][1], seen
+            print(f"    gitea-internal / companion alias per instance: {seen}", flush=True)
+            # No hook-local token is ever left behind (every mint and revoke
+            # deletes its own portcullis-hook-* token).
+            for inst in ("gitea", "gitea-b"):
+                n = docker("exec", container(inst, "gitea-db"), "psql", "-X", "-U", "gitea", "-d", "gitea", "-tAc",
+                           "SELECT count(*) FROM access_token WHERE name LIKE 'portcullis-hook-%'").strip()
+                assert n == "0", f"{inst}: {n} portcullis-hook-* tokens left"
+            # Switch-on's revoke_all exited 0: the switch-on is committed only
+            # after it (a failure is a 502 with nothing saved), so the ai op
+            # record is ok and ai.enable audited ok.
+            for inst in ("gitea", "gitea-b"):
+                op = state["ai_ops"][inst]
+                assert op.get("op") == "ai" and op.get("ok") is True, f"{inst}'s op record after the switch-on: {json.dumps(op)[:300]}"
+                hits = [e for e in state["ai_audit"] if (e.get("target") or "").split("/")[0] == inst]
+                assert any(e.get("result") == "ok" and "read_write" in (e.get("detail") or "") for e in hits), hits
+            print(f"    switch-on: op records {[(i, o.get('op'), o.get('ok')) for i, o in state['ai_ops'].items()]}, "
+                  f"ai.enable {[(e.get('target'), e.get('result'), e.get('detail')) for e in state['ai_audit']]}", flush=True)
+        check("gitea_isolation (T25 carry): gitea-internal only on each project's default network and resolving to its own "
+              "Gitea; portcullis-mcp-<id>--gitea resolving to that instance's companion only; no portcullis-hook-* token "
+              "left; switch-on's revoke_all succeeded (ai op ok, ai.enable ok)", gitea_isolation)
 
         # ── 7 (last) ──
         def ai_off():

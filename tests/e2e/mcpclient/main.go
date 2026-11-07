@@ -14,12 +14,21 @@
 // is the caller's: tests/e2e/e2e_ai.py opens the URL in Playwright.
 //
 //	mcpclient call --url <url> --token-file <f> --method tools/list|tools/call \
-//	    [--tool <name> --args <json>] [--ca-file <pem>]
+//	    [--tool <name> --args <json>] [--protocol <version>] \
+//	    [--elicitation url [--elicit-answer accept|decline|cancel]] [--ca-file <pem>]
 //
-// prints one JSON document on stdout: {"result": …} or {"error": {code,
-// message, data}} for a JSON-RPC answer (exit 0), {"http_status": N,
-// "www_authenticate": "…"} when the HTTP layer refused (exit 2). Any other
-// failure exits 1 with the reason on stderr.
+// prints one JSON document on stdout: {"result": …, "protocol": "<negotiated
+// version>", "elicitations": [<elicitation/create params>…]} or {"error":
+// {code, message, data}, …} for a JSON-RPC answer (exit 0), {"http_status":
+// N, "www_authenticate": "…"} when the HTTP layer refused (exit 2). Any
+// other failure exits 1 with the reason on stderr.
+//
+// --protocol asks for that protocol version (default: the SDK's latest).
+// --elicitation url declares URL-mode elicitation (and nothing else) and
+// turns the SDK's automatic multi round-trip retry off, so an
+// input_required result (2026-07-28) is printed as the server sent it
+// (inputRequests, requestState); an elicitation/create request (2025-11-25
+// sessions) is recorded in "elicitations" and answered --elicit-answer.
 //
 // CI only: every host of the test stack resolves to 127.0.0.1, so the HTTP
 // client dials itself (which opts out of the SDK's discovery SSRF checks
@@ -269,7 +278,18 @@ func call(args []string) (int, error) {
 	tool := fs.String("tool", "", "tool name (tools/call)")
 	argJSON := fs.String("args", "{}", "tool arguments, a JSON object (tools/call)")
 	caFile := fs.String("ca-file", "", "extra CA certificates (PEM)")
+	proto := fs.String("protocol", "", "protocol version to ask for (default: the SDK's latest)")
+	elicit := fs.String("elicitation", "", `"url": declare URL-mode elicitation, no automatic retry`)
+	answerAction := fs.String("elicit-answer", "accept", "the answer to an elicitation/create request")
 	_ = fs.Parse(args)
+	if *elicit != "" && *elicit != "url" {
+		return 1, fmt.Errorf("--elicitation: only url")
+	}
+	switch *answerAction {
+	case "accept", "decline", "cancel":
+	default:
+		return 1, fmt.Errorf("--elicit-answer: accept, decline or cancel")
+	}
 	if *endpoint == "" || *tokFile == "" {
 		return 1, errors.New("call needs --url and --token-file")
 	}
@@ -293,17 +313,34 @@ func call(args []string) (int, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
-	client := mcp.NewClient(&mcp.Implementation{Name: "portcullis-e2e", Version: "1"}, nil)
+	out := &callOutput{Elicitations: []*mcp.ElicitParams{}}
+	var opts *mcp.ClientOptions
+	if *elicit == "url" {
+		opts = &mcp.ClientOptions{
+			Capabilities: &mcp.ClientCapabilities{Elicitation: &mcp.ElicitationCapabilities{URL: &mcp.URLElicitationCapabilities{}}},
+			ElicitationHandler: func(_ context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+				out.mu.Lock()
+				out.Elicitations = append(out.Elicitations, req.Params)
+				out.mu.Unlock()
+				return &mcp.ElicitResult{Action: *answerAction}, nil
+			},
+			MultiRoundTrip: &mcp.MultiRoundTripOptions{Disabled: true},
+		}
+	}
+	client := mcp.NewClient(&mcp.Implementation{Name: "portcullis-e2e", Version: "1"}, opts)
 	sess, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: *endpoint, HTTPClient: hc,
-		MaxRetries: -1, DisableStandaloneSSE: true}, nil)
+		MaxRetries: -1, DisableStandaloneSSE: true}, &mcp.ClientSessionOptions{ProtocolVersion: *proto})
 	if err != nil {
-		return answer(rec, nil, err)
+		return answer(rec, out, nil, err)
 	}
 	defer sess.Close()
+	if ir := sess.InitializeResult(); ir != nil {
+		out.Protocol = ir.ProtocolVersion
+	}
 	switch *method {
 	case "tools/list":
 		res, err := sess.ListTools(ctx, nil)
-		return answer(rec, res, err)
+		return answer(rec, out, res, err)
 	case "tools/call":
 		if *tool == "" {
 			return 1, errors.New("tools/call needs --tool")
@@ -313,17 +350,28 @@ func call(args []string) (int, error) {
 			return 1, fmt.Errorf("--args: %v", err)
 		}
 		res, err := sess.CallTool(ctx, &mcp.CallToolParams{Name: *tool, Arguments: a})
-		return answer(rec, res, err)
+		return answer(rec, out, res, err)
 	default:
 		return 1, fmt.Errorf("unknown --method %q", *method)
 	}
 }
 
+// callOutput is call's document (besides the result or error).
+type callOutput struct {
+	mu           sync.Mutex
+	Protocol     string
+	Elicitations []*mcp.ElicitParams
+}
+
 // answer prints the one JSON document call promises.
-func answer(rec *statusRecorder, res any, err error) (int, error) {
+func answer(rec *statusRecorder, out *callOutput, res any, err error) (int, error) {
 	enc := json.NewEncoder(os.Stdout)
+	out.mu.Lock()
+	doc := map[string]any{"protocol": out.Protocol, "elicitations": out.Elicitations}
+	out.mu.Unlock()
 	if err == nil {
-		return 0, enc.Encode(map[string]any{"result": res})
+		doc["result"] = res
+		return 0, enc.Encode(doc)
 	}
 	// An HTTP refusal first: the SDK reports some of them (a 503, say) as
 	// a JSON-RPC error of its own ("rejected by transport"), which the
@@ -339,7 +387,8 @@ func answer(rec *statusRecorder, res any, err error) (int, error) {
 	}
 	var we *jsonrpc.Error
 	if errors.As(err, &we) {
-		return 0, enc.Encode(map[string]any{"error": we})
+		doc["error"] = we
+		return 0, enc.Encode(doc)
 	}
 	return 1, err
 }
