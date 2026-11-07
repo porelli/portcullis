@@ -8,8 +8,8 @@ require (
 	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/gowebpki/jcs v1.0.2
 	github.com/modelcontextprotocol/go-sdk v1.8.0
-	golang.org/x/sync v0.20.0
-	golang.org/x/time v0.15.0
+	golang.org/x/sync v0.24.0
+	golang.org/x/time v0.16.0
 )
 
 require (
