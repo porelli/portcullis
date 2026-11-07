@@ -924,7 +924,10 @@ def main() -> int:
             def one_url_request(doc: dict, host_re) -> tuple[str, dict]:
                 res = doc.get("result") or {}
                 reqs = res.get("inputRequests") or {}
-                assert len(reqs) == 1 and not res.get("content") and not res.get("isError") and res.get("requestState"), \
+                # requestState is optional: the stateless Hub sends none (its
+                # retry is matched by the arguments' digest), the gate its own.
+                assert res.get("resultType") == "input_required" and len(reqs) == 1 and not res.get("content") \
+                    and not res.get("isError"), \
                     f"not an input_required result: {json.dumps(doc)[:600]}"
                 key, req = next(iter(reqs.items()))
                 p = req.get("params") or {}
@@ -950,7 +953,8 @@ def main() -> int:
                   flush=True)
             assert rc == 0, doc
             key, res = one_url_request(doc, PEOPLE_CONFIRM_RE)
-            assert key == "portcullis_confirmation" and res["requestState"].startswith("portcullis-gate:"), (key, res["requestState"][:20])
+            assert key == "portcullis_confirmation" and (res.get("requestState") or "").startswith("portcullis-gate:"), \
+                (key, (res.get("requestState") or "")[:20])
             # 2025-11-25 session with URL elicitation: the gate sends
             # elicitation/create (mode url), then the text.
             args = dict(args, id=900002)
