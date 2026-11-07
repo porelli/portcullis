@@ -40,11 +40,13 @@
 #     `major-update` and left open;
 #   - red: the PR stays open and one issue per app + version jump (label
 #     `update-failed`) gets the failing jobs and run links;
-#   - a merge that fails although CI passed (GitHub's "Base branch was
-#     modified" race, a 5xx, anything) is never retried: the run fails with
-#     the cause and the manual re-run command. No `@dependabot rebase` either:
-#     Dependabot answers comments from github-actions[bot] (and GitHub Apps)
-#     with "only users with push access can use that command".
+#   - a merge that fails although CI passed: only GitHub's "Base branch was
+#     modified" race (another PR merged at the same moment) gets one
+#     re-attempt, after MERGE_RETRY_DELAY seconds (default 10), at the same
+#     tested SHA; anything else (a 5xx, ...), or a second failure, fails the
+#     run with the cause and the manual re-run command. No `@dependabot
+#     rebase`: Dependabot answers comments from github-actions[bot] (and
+#     GitHub Apps) with "only users with push access can use that command".
 #
 # Env: REPO (owner/name), BASE_BRANCH (default main), and
 #   decide:   RUN_ID (triggering workflow run) or PR (number);
@@ -308,12 +310,12 @@ ensure_label() { # name color description
   api -X POST "repos/$REPO/labels" -f name="$1" -f color="$2" -f description="$3" >/dev/null 2>&1 || true
 }
 
-# CI passed but `gh pr merge` failed: say why and how to retry, then fail the
-# run. No automatic retry or rebase request (see Rules in the header).
+# CI passed but `gh pr merge` failed (for "Base branch was modified": on the
+# re-attempt too): say why and how to retry, then fail the run.
 merge_failed() { # pr sha gh-output
   local why retry="gh workflow run dependabot-automerge.yml -f pr=$1 -f dry_run=false"
   if [[ $3 == *"Base branch was modified"* ]]; then
-    why="the base branch moved during the merge (another PR merged at the same moment); the PR head and its CI are unchanged"
+    why="the base branch moved during the merge (another PR merged at the same moment), on the one re-attempt too; the PR head and its CI are unchanged"
   elif [[ $3 =~ (HTTP|status\ code:)\ 5[0-9][0-9] ]]; then
     why="GitHub returned a server error; check the PR first, a 5xx can still have merged it"
   else
@@ -322,10 +324,10 @@ merge_failed() { # pr sha gh-output
   [ -z "$3" ] || printf '%s\n' "$3" >&2
   if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     # shellcheck disable=SC2016  # markdown fence, not an expansion
-    printf '### Merge of #%s failed\n\n%s. Not retried automatically. If the PR is still open, retry by hand (in %s):\n\n```\n%s\n```\n' \
+    printf '### Merge of #%s failed\n\n%s. No further automatic retry. If the PR is still open, retry by hand (in %s):\n\n```\n%s\n```\n' \
       "$1" "$why" "$REPO" "$retry" >> "$GITHUB_STEP_SUMMARY"
   fi
-  die "PR #$1 not merged at $2: $why. Not retried automatically. If the PR is still open, retry by hand (in $REPO, or add -R $REPO): $retry"
+  die "PR #$1 not merged at $2: $why. No further automatic retry. If the PR is still open, retry by hand (in $REPO, or add -R $REPO): $retry"
 }
 
 pr_act() {
@@ -335,10 +337,17 @@ pr_act() {
   case "$(field action)" in
     merge)
       # --match-head-commit: GitHub refuses the merge if the head moved after
-      # the tested SHA.
-      local out
-      out=$(gh pr merge "$pr" -R "$REPO" --squash --match-head-commit "$sha" 2>&1) \
-        || merge_failed "$pr" "$sha" "$out"
+      # the tested SHA. "Base branch was modified" only: one re-attempt at the
+      # same SHA (the race clears once the other merge lands).
+      local out delay=${MERGE_RETRY_DELAY:-10}
+      if ! out=$(gh pr merge "$pr" -R "$REPO" --squash --match-head-commit "$sha" 2>&1); then
+        [[ $out == *"Base branch was modified"* ]] || merge_failed "$pr" "$sha" "$out"
+        printf '%s\n' "$out" >&2
+        echo "::notice title=Dependabot auto-merge::#$pr: base branch was modified during the merge; one re-attempt in ${delay}s at $sha" >&2
+        sleep "$delay"
+        out=$(gh pr merge "$pr" -R "$REPO" --squash --match-head-commit "$sha" 2>&1) \
+          || merge_failed "$pr" "$sha" "$out"
+      fi
       [ -z "$out" ] || echo "$out"
       [[ $branch == dependabot/* ]] && { api -X DELETE "repos/$REPO/git/refs/heads/$branch" >/dev/null 2>&1 || true; }
       echo "Merged #$pr at $sha"
