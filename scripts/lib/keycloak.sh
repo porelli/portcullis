@@ -10,6 +10,23 @@
 
 KC_REALM="portcullis"
 
+# AI support (contract §8 "Connection length and rotation"): the realm's
+# offline-session upper bounds (30 d idle, 90 d max; the Hub sets shorter
+# values per AI client). Refresh-token rotation stays OFF, pinned: Keycloak
+# 26.8 has no per-client "revoke refresh token" (the client-policy executor
+# suppress-refresh-token-rotation only drops the new token from the answer;
+# reuse is still enforced realm-wide), and realm-wide rotation breaks
+# forward-auth: oauth2-proxy's cookie sessions refresh once a minute
+# without a lock, so of two concurrent requests on one cookie the second
+# presents the already-used refresh token and is sent to sign in (CI
+# e2e-login refresh_rotation failed with it on). Same values as
+# realm-export.json (imported only into a new realm); pushed on every run.
+# Never touched here: the Hub's AI clients (attribute
+# portcullis.hub.template = portcullis-ai) and its mcp:* client scopes —
+# nothing below reads, rewrites or deletes them.
+# shellcheck disable=SC2034  # read by the tests
+KC_REALM_TOKEN_SETTINGS='{"offlineSessionIdleTimeout": 2592000, "offlineSessionMaxLifespanEnabled": true, "offlineSessionMaxLifespan": 7776000, "revokeRefreshToken": false, "refreshTokenMaxReuse": 0}'
+
 kc_url() { echo "${KEYCLOAK_URL:-http://127.0.0.1:8080}"; }
 
 # kc_login — sets KC_TOKEN (admin-cli password grant on the master realm).
@@ -76,6 +93,15 @@ _kc_report() {
 # writes LDAP, local (non-federated) users and the master realm's admin
 # are never validated against LDAP, and the Hub's service account is
 # filtered out of the federation on purpose (its copy is removed below).
+# uuidLDAPAttribute entryUUID: Keycloak links its copy of a user (and so
+# the user id = every token's `sub`, sessions, consents, passkeys) to
+# LLDAP's immutable per-account uuid, never the username — an account
+# deleted and re-created under the same name is a new person: the old
+# copy fails validation (LDAP_ID mismatch) and is removed, the new one is
+# imported with a new id. A copy linked by an earlier uuid attribute fails
+# validation the same way and is replaced at its next lookup (the
+# operator procedure for an existing deployment is in the docs repo's
+# hardening page).
 _kc_ldap_patch() {
   jq --arg b "$1" '
     .config.usersDn = ["ou=people," + $b] |
@@ -86,7 +112,8 @@ _kc_ldap_patch() {
     .config.cachePolicy = ["NO_CACHE"] |
     .config.editMode = ["READ_ONLY"] |
     .config.removeInvalidUsersEnabled = ["true"] |
-    .config.fullSyncPeriod = ["3600"]'
+    .config.fullSyncPeriod = ["3600"] |
+    .config.uuidLDAPAttribute = ["entryUUID"]'
 }
 
 # _kc_group_mapper_patch <base-dn>: the LDAP group mapper (JSON on stdin):
@@ -216,7 +243,7 @@ keycloak_configure() {
   if [ -n "$comp" ]; then
     ldap_id="$(printf '%s' "$comp" | jq -r .id)"
     code="$(printf '%s' "$comp" | LLDAP_PASS="${LLDAP_ADMIN_PASSWORD:-}" _kc_ldap_patch "$base_dn" | kc_send PUT "/$KC_REALM/components/$ldap_id")"
-    _kc_report "LDAP base DN + bind credential, portcullis-hub excluded, no cache, users gone from LLDAP removed, hourly sync" "$code" 204 || true
+    _kc_report "LDAP base DN + bind credential, portcullis-hub excluded, no cache, users gone from LLDAP removed, hourly sync, linked by entryUUID" "$code" 204 || true
     # The Hub's LLDAP service account (lldap_admin) must never sign in
     # through the gateway: the user filter above keeps it out of the
     # federation; drop a copy imported before the filter existed.
@@ -236,15 +263,15 @@ keycloak_configure() {
     warn "    no LDAP federation component found in realm $KC_REALM"
   fi
 
-  info "Setting ACR→LoA map and the browser flow..."
+  info "Setting ACR→LoA map, offline-session bounds, refresh-token reuse and the browser flow..."
   # Only switch browserFlow if it is unset or the realm's built-in value;
   # an operator's custom flow is preserved.
   # sslRequired=external: browsers only reach Keycloak through Traefik
   # (HTTPS; proxy headers trusted from Traefik only), and "all" would also
   # refuse the invite identity provider's back-channel URLs on the private
   # network (http://enroll:8445, Keycloak's URL check resolves the host).
-  code="$(kc_get "/$KC_REALM" | jq '
-      {sslRequired: "external", attributes: {"acr.loa.map": "{\"public\":\"0\",\"pwd\":\"1\",\"hwk\":\"2\",\"mtls\":\"3\"}"}} +
+  code="$(kc_get "/$KC_REALM" | jq --argjson tok "$KC_REALM_TOKEN_SETTINGS" '
+      {sslRequired: "external", attributes: {"acr.loa.map": "{\"public\":\"0\",\"pwd\":\"1\",\"hwk\":\"2\",\"mtls\":\"3\"}"}} + $tok +
       (if ((.browserFlow // "") == "" or .browserFlow == "portcullis-browser-flow")
        then {browserFlow: "portcullis-universal"} else {} end) +
       # Login theme: unique passkey labels, so a second key (recovery) can be
@@ -709,6 +736,9 @@ API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
     users and groups deleted in LLDAP are removed from Keycloak (hourly sync,
     removeInvalidUsersEnabled, group mapper drops missing groups)
   - sets the ACR→LoA map, sslRequired=external and browserFlow=portcullis-universal
+  - offline sessions at most 30 days idle / 90 days total (the Hub sets
+    shorter values on its AI clients); refresh-token rotation off (realm-wide
+    rotation would break concurrent forward-auth refreshes)
   - rebuilds every top-level flow of the file whose tree changed (passkey-only
     browser flow, the invite identity provider's first-login / post-login flows)
   - the invite identity provider portcullis-invite (enroll; URLs + client
@@ -724,6 +754,8 @@ API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
     auth.<domain> callback (keeps the Hub's extra-domain callbacks), and the
     portcullis-invite-client scope (setup links work only through it)
   - creates a credential-less `testuser`, applies PORTAL_DISPLAY_NAME branding
+  - never touches the Hub's AI clients (portcullis.hub.template =
+    portcullis-ai) or its mcp:* client scopes
 
 Options:
   --wipe-realm   delete the realm first and re-import it from the file

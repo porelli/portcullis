@@ -72,7 +72,7 @@ Config sources (both re-read on every request; they are tiny):
   - /etc/group-gate/map.conf — <sub>=required_group, expanded to
     <sub>.<PORTCULLIS_DOMAIN> (`*` = any signed-in user, valid only
     there). Authoritative for the core hosts (<domain> itself and
-    auth, traefik, hub, directory, enroll, people, metrics . <domain>):
+    auth, traefik, hub, directory, enroll, people, metrics, mcp . <domain>):
     the Hub policy file can never override those.
   - /hub-data/group-gate-policy.json — written by the Hub (contract §4):
       {"version": 5,
@@ -182,7 +182,10 @@ DOMAIN_OK = valid_hostname(DOMAIN)
 # hosts: their required group comes only from map.conf / GATE_MAP;
 # Hub-written entries for them are ignored. If map.conf somehow lacks one,
 # it defaults to lldap_admin (fail closed).
-CORE_SUBDOMAINS = ("auth", "traefik", "hub", "directory", "enroll", "people", "metrics")
+# `mcp` (AI support, contract §4/§5) is the "all my apps" MCP endpoint: its
+# router has no forward-auth (mcp-gate authorizes), so group-gate never sees
+# its requests; listing it keeps every Hub entry for mcp.<domain> out.
+CORE_SUBDOMAINS = ("auth", "traefik", "hub", "directory", "enroll", "people", "metrics", "mcp")
 CORE_DEFAULT_GROUP = "lldap_admin"
 
 

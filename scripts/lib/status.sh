@@ -3,6 +3,20 @@
 # `portcullis status [--json]` — health overview. Exit status 1 if any
 # core service is not running/healthy or Vault is not active.
 
+# _st_mcp_refusing — the reason mcp-gate refuses every AI request (503),
+# from the last line of its Docker health log (mcp-gate healthcheck prints
+# /healthz's "refusing every AI request (503): …" line: the Hub's files
+# were refused, e.g. credentials not encrypted to secrets/mcp-gate/age.key);
+# nothing when it serves, is off, or isn't running.
+_st_mcp_refusing() {
+  local cid
+  cid="$(dc ps -q mcp-gate 2>/dev/null | head -n1)"
+  [ -n "$cid" ] || return 0
+  docker inspect --format '{{json .State.Health}}' "$cid" 2>/dev/null \
+    | jq -r '((.Log // []) | last | .Output // "") | split("\n")[] | select(startswith("refusing every AI request (503): "))' 2>/dev/null \
+    | head -n1 || true
+}
+
 _st_line() {  # _st_line ok|warn|fail <text>
   case "$1" in
     ok)   printf '  %s✓%s %s\n' "$C_GREEN" "$C_NC" "$2" ;;
@@ -85,11 +99,22 @@ status_run() {
   lldap="$(jq -n --arg h "$(container_health lldap)" '{health: $h}')"
   traefik="$(container_health traefik)"
   case "$traefik" in healthy|running) ;; *) problems=1 ;; esac
+  # A non-core container answering to a core service name on portcullis-proxy
+  # (network.sh proxy_dns_shadows; up / upgrade refuse to run while it lasts).
+  local shadows
+  # A docker error is a problem too (fail closed), shown as one line.
+  shadows="$(proxy_dns_shadows)" || shadows="(docker) the containers on portcullis-proxy can't be inspected"
+  [ -z "$shadows" ] || problems=1
+  local mcp_refusing
+  mcp_refusing="$(_st_mcp_refusing)"
+  [ -z "$mcp_refusing" ] || problems=1
 
   if [ "$json" = true ]; then
     jq -n --arg d "${PORTCULLIS_DOMAIN:-}" --argjson s "$services" --argjson v "$vault_json" \
-      --argjson k "$kc" --argjson l "$lldap" --arg t "$traefik" --argjson p "$problems" \
-      '{domain: $d, ok: ($p == 0), services: $s, vault: $v, keycloak: $k, lldap: $l, traefik: {state: $t}}'
+      --argjson k "$kc" --argjson l "$lldap" --arg t "$traefik" --argjson p "$problems" --arg sh "$shadows" --arg mr "$mcp_refusing" \
+      '{domain: $d, ok: ($p == 0), services: $s, vault: $v, keycloak: $k, lldap: $l, traefik: {state: $t},
+        dns_shadows: [$sh | split("\n")[] | select(. != "") | capture("^(?<container>[^ ]+) (?<name>.+)$")],
+        mcp_gate: {refusing: (if $mr == "" then null else $mr end)}}'
     return "$problems"
   fi
 
@@ -149,6 +174,16 @@ status_run() {
   [ "$out" = healthy ] && _st_line ok "lldap healthy" || _st_line fail "lldap $out"
   case "$traefik" in healthy|running) _st_line ok "traefik $traefik" ;; *) _st_line fail "traefik $traefik" ;; esac
   domains_status_lines
+  local shadow
+  while read -r shadow; do
+    [ -n "$shadow" ] || continue
+    case "$shadow" in
+      "(docker) "*) _st_line fail "portcullis-proxy: ${shadow#(docker) } (core-name check failed closed)" ;;
+      *" (AI companion name"*) _st_line fail "portcullis-proxy: container ${shadow%% *} answers to the AI companion name ${shadow#* }" ;;
+      *) _st_line fail "portcullis-proxy: container ${shadow%% *} answers to the core name ${shadow#* }" ;;
+    esac
+  done <<< "$shadows"
+  [ -z "$mcp_refusing" ] || _st_line fail "mcp-gate: $mcp_refusing"
 
   printf '\n%sDomain: %s — run with --json for machine-readable output%s\n\n' "$C_DIM" "${PORTCULLIS_DOMAIN:-?}" "$C_NC"
   return "$problems"

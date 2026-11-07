@@ -36,7 +36,7 @@ env:
   COMPOSE_FILE: docker-compose.yml:docker-compose.ci.yml
   VAULT_ADDR: http://127.0.0.1:8200
   TRAEFIK_IP: 172.31.250.2
-  # Go toolchain for the enroll and domains unit tests (same as their Dockerfiles' golang image).
+  # Go toolchain for the enroll, domains and mcp-gate unit tests (same as their Dockerfiles' golang image).
   GO_VERSION: 1.27.3
   # The domains service's records point here in CI: no public-IP detection
   # on the runners (./portcullis up uses these instead).
@@ -261,7 +261,83 @@ jobs:
               and ([$h.volumes[] | select(.target == "/run/portcullis/domains/api-secret") | .read_only] == [true])
               and ([.services | to_entries[] | select([.value.volumes[]? | .source // "" | select(test("secrets/domains/age\\.key$"))] | length > 0) | .key] == ["domains"])' >/dev/null \
             || { echo "FAIL: domains service wiring (contract §12.1 / §12.4)"; exit 1; }
-          echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring, domains service"
+          # Contract §15 / §5 / §6: mcp-gate. Networks exactly portcullis +
+          # portcullis-proxy at the pinned address; group 10001 only (G74);
+          # hub_data read-only; mcp_gate_data written by the gate only and
+          # read-only in the Hub; age.key only in the gate; the three MCP
+          # routers have no forward-auth / groups / proxy secret, hub-mcp /
+          # people-mcp outrank hub / people and share their TLS options (G44);
+          # no router targets the Hub's :8890 (G36, every compose file).
+          echo "$CFG" | jq -e --arg d "${PORTCULLIS_DOMAIN:-ci.example.org}" '.services["mcp-gate"] as $g | .services.hub as $h | $g.labels as $l | $h.labels as $hl
+              | def prio($r; $labels): ($labels["traefik.http.routers.\($r).priority"] // ($labels["traefik.http.routers.\($r).rule"] | length) | tonumber);
+                def mounts($src): [.services | to_entries[] | select([.value.volumes[]? | .source // "" | select(test($src))] | length > 0) | .key] | sort;
+              ([$g.networks | keys[]] | sort == ["portcullis-mcp", "portcullis-proxy"])
+              and $g.networks["portcullis-proxy"].ipv4_address == "172.31.250.3"
+              and .networks["portcullis-mcp"].name == "portcullis-mcp" and .networks["portcullis-mcp"].internal == true
+              and .networks["portcullis-mcp"].ipam.config[0].subnet == "172.31.253.0/28"
+              and ([.services | to_entries[] | select((.value.networks // {}) | has("portcullis-mcp")) | .key] | sort == ["hub", "keycloak", "mcp-gate"])
+              and .networks["portcullis-mcp"].ipam.config[0].ip_range == "172.31.253.8/29"
+              and .services.keycloak.networks["portcullis-mcp"].ipv4_address == "172.31.253.2"
+              and .services.hub.networks["portcullis-mcp"].ipv4_address == "172.31.253.3"
+              and ($g.networks["portcullis-mcp"].ipv4_address // null) == null
+              and ($g.extra_hosts | sort) == ["hub=172.31.253.3", "keycloak=172.31.253.2"]
+              and ([.services | to_entries[] | select(.value.networks["portcullis-proxy"].ipv4_address? != null) | "\(.key)=\(.value.networks["portcullis-proxy"].ipv4_address)"] | sort == ["mcp-gate=172.31.250.3", "traefik=172.31.250.2"])
+              and $g.user == "10005:10005" and $g.group_add == ["10001"] and $g.read_only == true
+              and ($g.tmpfs // [] | index("/tmp")) != null and ($g.ports // []) == []
+              and (($g.environment | to_entries | map(select(.key | test("SECRET|KEY|PASSWORD|TOKEN"))) | all(.value | startswith("/run/portcullis/mcp-gate/"))))
+              and $g.environment.MCP_GATE_HUB_URL == "http://hub:8890"
+              and $g.environment.MCP_GATE_JWKS_URL == "http://keycloak:8080/realms/portcullis/protocol/openid-connect/certs"
+              and ([$g.volumes[] | select(.type == "volume") | "\(.source):\(.target):\(.read_only // false)"] | sort == ["hub_data:/hub-data:true", "mcp_gate_data:/data:false"])
+              and ([$g.volumes[] | select(.type == "bind") | "\(.target):\(.read_only // false)"] | sort == ["/run/portcullis/mcp-gate/age.key:true", "/run/portcullis/mcp-gate/hub-secret:true"])
+              and (mounts("secrets/mcp-gate/age\\.key$") == ["mcp-gate"])
+              and (mounts("secrets/mcp-gate/age\\.pub$") == ["hub"])
+              and (mounts("secrets/mcp-gate/hub-secret$") == ["hub", "mcp-gate"])
+              and ([.services | to_entries[] | select([.value.volumes[]? | select(.type == "volume" and .source == "mcp_gate_data")] | length > 0) | .key] | sort == ["hub", "mcp-gate"])
+              and ([$h.volumes[] | select(.source == "mcp_gate_data") | "\(.target):\(.read_only // false)"] == ["/mcp-gate-data:true"])
+              and ([$h.volumes[] | select(.target | startswith("/run/portcullis/mcp-gate/")) | "\(.target):\(.read_only // false)"] | sort == ["/run/portcullis/mcp-gate/age.pub:true", "/run/portcullis/mcp-gate/hub-secret:true"])
+              and $h.environment.HUB_MCP_ADDR == ":8890" and $h.environment.HUB_MCP_GATE_DATA_DIR == "/mcp-gate-data"
+              and $h.environment.HUB_MCP_GATE_SECRET_FILE == "/run/portcullis/mcp-gate/hub-secret"
+              and $h.environment.HUB_MCP_GATE_RECIPIENT_FILE == "/run/portcullis/mcp-gate/age.pub"
+              and $l["traefik.enable"] == "true" and $l["traefik.docker.network"] == "portcullis-proxy"
+              and $l["traefik.http.services.mcp-gate.loadbalancer.server.port"] == "8080"
+              and ([$l | keys[] | capture("^traefik\\.http\\.routers\\.(?<r>[^.]+)\\.rule$").r] | sort == ["hub-mcp", "mcp", "people-mcp"])
+              and $l["traefik.http.routers.mcp.rule"] == "Host(`mcp.\($d)`)"
+              and $l["traefik.http.routers.hub-mcp.rule"] == "Host(`hub.\($d)`) && (Path(`/mcp`) || Path(`/.well-known/oauth-protected-resource/mcp`))"
+              and $l["traefik.http.routers.people-mcp.rule"] == "Host(`people.\($d)`) && (Path(`/mcp`) || Path(`/.well-known/oauth-protected-resource/mcp`))"
+              and (["mcp", "hub-mcp", "people-mcp"] | all(. as $r
+                    | $l["traefik.http.routers.\($r).middlewares"] == "rate-limit@file,security-headers@file"
+                    and $l["traefik.http.routers.\($r).service"] == "mcp-gate"
+                    and $l["traefik.http.routers.\($r).entrypoints"] == "websecure"))
+              and ([$l | to_entries[] | select(.key | test("\\.middlewares$")) | .value | select(test("portcullis-auth|portcullis-groups|portcullis-self|proxy-secret"))] == [])
+              and $l["traefik.http.routers.mcp.tls.options"] == "authaware@file"
+              and $l["traefik.http.routers.hub-mcp.tls.options"] == $hl["traefik.http.routers.hub.tls.options"]
+              and $l["traefik.http.routers.people-mcp.tls.options"] == $hl["traefik.http.routers.people.tls.options"]
+              and prio("hub-mcp"; $l) > prio("hub"; $hl) and prio("people-mcp"; $l) > prio("people"; $hl)' >/dev/null \
+            || { echo "FAIL: mcp-gate wiring (contract §15 / §5, G36 G44 G74)"; exit 1; }
+          grep -qx 'mcp=\*' group-gate/group-gate-map.conf || { echo "FAIL: mcp is not * in the group-gate map (core host, contract §4)"; exit 1; }
+          PORT8890="$(for files in "docker-compose.yml" "docker-compose.yml -f docker-compose.apps.yml" "docker-compose.test.yml"; do
+              # shellcheck disable=SC2086
+              docker compose -f $files --profile '*' config --format json \
+                | jq -r '.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.services\\.[^.]+\\.loadbalancer\\.server\\.port$")) | select(.value == "8890") | .key'
+            done)"
+          [ -z "$PORT8890" ] || { echo "FAIL: a Traefik service targets the Hub's MCP listener :8890: $PORT8890"; exit 1; }
+          # ... nor does the file provider (a server URL, a port, hub:8890).
+          if grep -rnE '(^|[^0-9])8890([^0-9]|$)' traefik/dynamic/; then
+            echo "FAIL: traefik/dynamic references the Hub's MCP listener :8890"; exit 1
+          fi
+          # Every core service name is in the CLI's DNS-shadowing guard (network.sh).
+          diff <(bash -c 'source scripts/lib/common.sh; source scripts/lib/network.sh; printf "%s\n" $CORE_SERVICE_NAMES' | sort) \
+               <(docker compose -f docker-compose.yml --profile '*' config --services | sort) \
+            || { echo "FAIL: CORE_SERVICE_NAMES (scripts/lib/network.sh) differs from docker-compose.yml's services"; exit 1; }
+          diff <(bash -c 'source scripts/lib/common.sh; source scripts/lib/network.sh; printf "%s\n" $CORE_PROXY_SERVICES' | sort) \
+               <(docker compose -f docker-compose.yml --profile '*' config --format json | jq -r '.services | to_entries[] | select((.value.networks // {}) | has("portcullis-proxy")) | .key' | sort) \
+            || { echo "FAIL: CORE_PROXY_SERVICES (scripts/lib/network.sh) differs from the core services on portcullis-proxy"; exit 1; }
+          # oauth2-proxy never accepts bearer tokens on browser routes (contract §5).
+          if grep -nE '^\s*skipJwtBearerTokens:\s*true' oauth2-proxy/alpha.yaml \
+             || grep -rniE 'skip[-_]jwt[-_]bearer[-_]tokens' docker-compose*.yml oauth2-proxy/; then
+            echo "FAIL: oauth2-proxy must not accept JWT bearer tokens"; exit 1
+          fi
+          echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring, domains service, mcp-gate"
 
       - name: every image is pinned tag@sha256 (all compose files, all profiles, CLI, workflows)
         run: |
@@ -277,9 +353,13 @@ jobs:
             [ "$svc" = hub ] && continue
             [[ "$img" =~ ^[^@[:space:]]+:[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || { echo "UNPINNED: $svc → $img"; bad=1; }
           done < /tmp/images
-          for df in enroll/Dockerfile group-gate/Dockerfile domains/Dockerfile; do
+          for df in enroll/Dockerfile group-gate/Dockerfile domains/Dockerfile mcp-gate/Dockerfile; do
             if grep -E '^FROM ' "$df" | grep -v '@sha256:'; then echo "UNPINNED base image in $df"; bad=1; fi
           done
+          # One Go builder (tag and digest) for every locally built Go service.
+          if [ "$(grep -hE '^FROM golang:' enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile | awk '{print $2}' | sort -u | wc -l | tr -d ' ')" != 1 ]; then
+            echo "The Go Dockerfiles pin different golang builders:"; grep -nE '^FROM golang:' enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile; bad=1
+          fi
           # group-gate's Python deps: exact pins with hashes, installed with --require-hashes.
           grep -q -- '--require-hashes' group-gate/Dockerfile || { echo "group-gate/Dockerfile installs without --require-hashes"; bad=1; }
           if grep -vE '^\s*(#|$|--hash=sha256:[0-9a-f]{64})' group-gate/requirements.txt | grep -vE '^[A-Za-z0-9._-]+==[^ ]+( ;.*)? \\$'; then
@@ -339,9 +419,9 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum') }}-${{ hashFiles('enroll/**/*.go', 'domains/**/*.go') }}
+          key: go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum', 'mcp-gate/go.sum') }}-${{ hashFiles('enroll/**/*.go', 'domains/**/*.go', 'mcp-gate/**/*.go') }}
           restore-keys: |
-            go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum') }}-
+            go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum', 'mcp-gate/go.sum') }}-
       - name: enroll unit tests
         working-directory: enroll
         env:
@@ -361,6 +441,16 @@ jobs:
           test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
           # The production build (no tags) never links the fake provider.
           if go list -deps . | grep -q 'internal/fakedns'; then echo "FAIL: production build links internal/fakedns"; exit 1; fi
+          CGO_ENABLED=1 go test -race ./...
+      - name: mcp-gate unit tests (config, token checks, resource metadata; contract §15)
+        working-directory: mcp-gate
+        run: |
+          go mod verify
+          go vet ./...
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
+          # The shared test vector (contract §15.4, preflight G47) is
+          # decoded strictly and re-encoded byte for byte by the tests.
+          test -s internal/config/testdata/mcp-gate.json && test -s internal/config/testdata/mcp-credentials.json
           CGO_ENABLED=1 go test -race ./...
       - name: Save the Go module and build cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'
@@ -443,7 +533,7 @@ jobs:
           # edge Hub, pulled by its own test) + the pinned images used inline
           # here and by the CLI (helper, restic, whoami, curl, docker cli).
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/*.sh
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
@@ -490,6 +580,17 @@ jobs:
           sbom: false
           cache-from: type=gha,scope=domains-test
           cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=domains-test,mode=max' || '' }}
+      - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: mcp-gate
+          # compose's image name for mcp-gate
+          tags: portcullis-mcp-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=mcp-gate
+          cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=mcp-gate,mode=max' || '' }}
       - name: Hub image (same-named Hub branch → built here, else the published one)
         uses: ./.github/actions/hub-image
 
@@ -1384,6 +1485,112 @@ jobs:
           done
           echo "PASS: admin-set public default (PUT /api/settings) published and enforced by group-gate"
 
+      - name: Test the MCP gate (non-root, pinned address, secrets, access log, MCP routes without forward-auth)
+        run: |
+          set -o pipefail
+          ALPINE=alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+          # The CLI of the image: usage on a bad command (exit 2), keygen
+          # prints one identity with its recipient (never kept here).
+          rc=0; docker run --rm --network none --read-only --cap-drop ALL portcullis-mcp-gate --help 2>/tmp/gate-help >/dev/null || rc=$?
+          if [ "$rc" != 2 ] || ! grep -q 'usage: mcp-gate \[serve|keygen|healthcheck\]' /tmp/gate-help; then
+            echo "FAIL: mcp-gate --help (rc=$rc): $(cat /tmp/gate-help)"; exit 1
+          fi
+          docker run --rm --network none --read-only --cap-drop ALL portcullis-mcp-gate keygen \
+            | awk '/^# public key: age1[0-9a-z]+$/ {p++} /^AGE-SECRET-KEY-1[0-9A-Z]+$/ {k++} END {exit !(p == 1 && k == 1)}' \
+            || { echo "FAIL: mcp-gate keygen"; exit 1; }
+          rc=0; docker run --rm --network none --read-only --cap-drop ALL portcullis-mcp-gate healthcheck || rc=$?
+          [ "$rc" = 1 ] || { echo "FAIL: healthcheck without a running gate exited $rc"; exit 1; }
+          # Secrets made by ./portcullis (mcpgate_ensure_secrets): modes, groups, recipient = the key's.
+          test "$(stat -c '%a' secrets/mcp-gate)" = 700 || { echo "FAIL: secrets/mcp-gate is not 0700"; exit 1; }
+          for f in age.key:10005 age.pub:10001 hub-secret:10001; do
+            test "$(stat -c '%a %g' "secrets/mcp-gate/${f%%:*}")" = "640 ${f#*:}" || { echo "FAIL: secrets/mcp-gate/${f%%:*}: $(stat -c '%a %g' "secrets/mcp-gate/${f%%:*}")"; exit 1; }
+          done
+          grep -qx "# public key: $(cat secrets/mcp-gate/age.pub)" secrets/mcp-gate/age.key || { echo "FAIL: age.pub is not age.key's recipient"; exit 1; }
+          [ "$(tr -d '\n' < secrets/mcp-gate/hub-secret | wc -c)" = 48 ] || { echo "FAIL: hub-secret is not 48 characters"; exit 1; }
+          if ! grep -qx 'PORTCULLIS_MCP_GATE_IP=172.31.250.3' secrets/hub/core.env || grep -q 'MCP.*SECRET' secrets/hub/core.env; then
+            echo "FAIL: core.env lacks PORTCULLIS_MCP_GATE_IP (or carries a gate secret)"; exit 1
+          fi
+
+          docker compose up -d mcp-gate
+          for i in $(seq 1 40); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q mcp-gate)")" = healthy ] && break
+            [ "$i" -eq 40 ] && { echo "FAIL: mcp-gate not healthy"; docker compose logs --tail=40 mcp-gate; exit 1; }
+            sleep 3
+          done
+          CID="$(docker compose ps -q mcp-gate)"
+          docker inspect "$CID" | jq -e '.[0] as $c
+              | $c.Config.User == "10005:10005" and $c.HostConfig.GroupAdd == ["10001"]
+              and $c.HostConfig.ReadonlyRootfs == true and $c.HostConfig.CapDrop == ["ALL"]
+              and ($c.HostConfig.SecurityOpt | index("no-new-privileges:true")) != null
+              and ($c.HostConfig.Privileged | not)
+              and ([$c.Mounts[] | select(.Source | test("docker\\.sock"))] == [])
+              and ($c.NetworkSettings.Networks | keys | sort) == ["portcullis-mcp", "portcullis-proxy"]
+              and $c.NetworkSettings.Networks["portcullis-proxy"].IPAddress == "172.31.250.3"
+              and ($c.HostConfig.PortBindings // {} | length) == 0' >/dev/null \
+            || { echo "FAIL: mcp-gate container (user, group 10001 only, read-only, caps, socket, networks, address)"; exit 1; }
+          [ "$(docker exec "$CID" id -G)" = "10005 10001" ] || { echo "FAIL: mcp-gate groups: $(docker exec "$CID" id -G)"; exit 1; }
+          # portcullis-mcp: exactly the gate, Keycloak and the Hub; the gate
+          # reaches Keycloak's JWKS (and resolves hub) there, and no other core service.
+          docker network inspect portcullis-mcp | jq -e '.[0].Internal == true and .[0].IPAM.Config[0].Subnet == "172.31.253.0/28"' >/dev/null \
+            || { echo "FAIL: portcullis-mcp network (internal, subnet)"; exit 1; }
+          # keycloak / hub come from /etc/hosts (extra_hosts), pinned to their
+          # portcullis-mcp addresses, which really are theirs.
+          docker exec "$CID" cat /etc/hosts > /tmp/gate-hosts
+          if ! grep -qE '^172\.31\.253\.2[[:space:]]+keycloak$' /tmp/gate-hosts || ! grep -qE '^172\.31\.253\.3[[:space:]]+hub$' /tmp/gate-hosts; then
+            echo "FAIL: the gate's /etc/hosts lacks the pinned keycloak / hub:"; cat /tmp/gate-hosts; exit 1
+          fi
+          for s in keycloak:172.31.253.2 hub:172.31.253.3; do
+            got="$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis-mcp").IPAddress}}' "$(docker compose ps -q "${s%%:*}")")"
+            [ "$got" = "${s#*:}" ] || { echo "FAIL: ${s%%:*} is $got on portcullis-mcp (pinned ${s#*:})"; exit 1; }
+          done
+          docker exec "$CID" wget -q -T 5 -O /dev/null http://keycloak:8080/realms/portcullis/protocol/openid-connect/certs \
+            || { echo "FAIL: the gate can't read Keycloak's JWKS over portcullis-mcp"; exit 1; }
+          # No other core service is reachable by name from the gate.
+          for other in lldap vault postgres group-gate enroll domains forward-auth socket-proxy-hub; do
+            if out="$(docker exec "$CID" nslookup "$other" 2>&1)"; then
+              echo "FAIL: the gate resolves $other (it must reach only Keycloak and the Hub): $out"; exit 1
+            fi
+          done
+          if docker exec "$CID" sh -c 'touch /x' 2>/dev/null; then echo "FAIL: mcp-gate rootfs is writable"; exit 1; fi
+          docker exec "$CID" mcp-gate healthcheck || { echo "FAIL: mcp-gate healthcheck in the container"; exit 1; }
+          # G29: the access log and its directory (gate-owned, group 10001: the Hub's read-only mount).
+          docker run --rm -v portcullis_mcp_gate_data:/d:ro "$ALPINE" stat -c '%n %a %u %g' /d /d/access.jsonl > /tmp/gate-log-mode
+          [ "$(cat /tmp/gate-log-mode)" = "$(printf '/d 750 10005 10001\n/d/access.jsonl 640 10005 10001')" ] \
+            || { echo "FAIL: access log modes: $(cat /tmp/gate-log-mode)"; exit 1; }
+
+          # Through Traefik: no MCP route runs forward-auth (no sign-in
+          # redirect, no cookie), the gate answers (no mcp-gate.json yet: AI
+          # support off), hub.<d>/mcp and people.<d>/mcp outrank the Hub's
+          # forward-auth routers, every other path of those hosts doesn't
+          # reach the gate.
+          mcp_req() { curl -s -o /tmp/mcp-body -D /tmp/mcp-hdr -w '%{http_code}' --cacert certs/ca-chain.crt \
+                        --resolve "$1:443:127.0.0.1" "${@:3}" "https://$1$2" || true; }
+          for t in mcp.portcullis.local/mcp mcp.portcullis.local/.well-known/oauth-protected-resource/mcp \
+                   hub.portcullis.local/mcp hub.portcullis.local/.well-known/oauth-protected-resource/mcp \
+                   people.portcullis.local/mcp people.portcullis.local/.well-known/oauth-protected-resource/mcp; do
+            code="$(mcp_req "${t%%/*}" "/${t#*/}" -X POST -H 'Content-Type: application/json' -H 'Cookie: _oauth2_proxy=x' --data '{}')"
+            [ "${t#*/}" = mcp ] || code="$(mcp_req "${t%%/*}" "/${t#*/}")"
+            if [ "$code" != 503 ] || ! grep -q 'AI support is off' /tmp/mcp-body; then
+              echo "FAIL: https://$t → $code (want the gate's 503 'AI support is off'): $(head -c 300 /tmp/mcp-body)"; cat /tmp/mcp-hdr; exit 1
+            fi
+            if grep -qi '^set-cookie:' /tmp/mcp-hdr; then echo "FAIL: https://$t set a cookie"; exit 1; fi
+          done
+          for t in hub.portcullis.local/ hub.portcullis.local/mcp/x people.portcullis.local/ people.portcullis.local/.well-known/oauth-protected-resource; do
+            code="$(mcp_req "${t%%/*}" "/${t#*/}")"
+            if [ "$code" = 503 ] && grep -q 'AI support is off' /tmp/mcp-body; then echo "FAIL: https://$t reached the gate"; exit 1; fi
+          done
+          docker compose logs mcp-gate | grep -q 'mcp-gate: listening on :8080' || { echo "FAIL: no listening line"; exit 1; }
+          if docker compose logs mcp-gate | grep -qE 'eyJ|AGE-SECRET-KEY|_oauth2_proxy'; then echo "FAIL: a token, key or cookie in the gate's log"; exit 1; fi
+          # Refusals reach the access log (one line per request, decision deny:off).
+          docker run --rm -v portcullis_mcp_gate_data:/d:ro "$ALPINE" cat /d/access.jsonl > /tmp/gate-access.jsonl
+          jq -se 'length >= 3 and all(.decision == "deny:off" and .user == "" and .client == "")' /tmp/gate-access.jsonl >/dev/null \
+            || { echo "FAIL: access log after the refused requests:"; cat /tmp/gate-access.jsonl; exit 1; }
+          if [ -n "$(docker compose ps -q hub)" ]; then
+            docker compose exec -T hub sh -c 'test -r /run/portcullis/mcp-gate/hub-secret && test -r /run/portcullis/mcp-gate/age.pub && test -r /mcp-gate-data/access.jsonl && ! touch /mcp-gate-data/x 2>/dev/null' \
+              || { echo "FAIL: the Hub's gate files (secret, recipient, read-only access log)"; exit 1; }
+          fi
+          echo "PASS: mcp-gate healthy as 10005 (+10001 only) at 172.31.250.3, read-only, secrets 0640 by group, access log 0640/0750 group 10001 read-only in the Hub, MCP routes reach the gate without forward-auth or cookies"
+
       - name: Test enrollment UI responds
         run: |
           ENROLL_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q enroll)")
@@ -1532,7 +1739,8 @@ jobs:
           # configure (run above, idempotent) set the federation up for it.
           LDAP_ID=$(kc "/components?type=org.keycloak.storage.UserStorageProvider" | jq -r '[.[] | select(.providerId == "ldap")][0].id')
           kc "/components/$LDAP_ID" | jq -e '.config.removeInvalidUsersEnabled == ["true"] and .config.fullSyncPeriod == ["3600"]
-              and .config.editMode == ["READ_ONLY"] and .config.customUserSearchFilter == ["(!(uid=portcullis-hub))"]' >/dev/null \
+              and .config.editMode == ["READ_ONLY"] and .config.customUserSearchFilter == ["(!(uid=portcullis-hub))"]
+              and .config.uuidLDAPAttribute == ["entryUUID"] and .config.usernameLDAPAttribute == ["uid"]' >/dev/null \
             || { echo "FAIL: LDAP federation: $(kc "/components/$LDAP_ID" | jq -c '.config | del(.bindCredential)')"; exit 1; }
           MAP=$(kc "/components?parent=$LDAP_ID&type=org.keycloak.storage.ldap.mappers.LDAPStorageMapper" | jq -r '[.[] | select(.providerId == "group-ldap-mapper")][0].id')
           kc "/components/$MAP" | jq -e '.config["drop.non.existing.groups.during.sync"] == ["true"] and .config.mode == ["READ_ONLY"]' >/dev/null \
@@ -1597,6 +1805,45 @@ jobs:
             || { echo "FAIL: gone-user still listed"; exit 1; }
           [ "$(kcstatus "/users/$UID_GONE")" = 404 ] || { echo "FAIL: Keycloak kept its copy of gone-user"; exit 1; }
 
+          # Linked by LLDAP's immutable entryUUID, never the username: an
+          # account deleted and re-created under the same name straight in
+          # LLDAP (no Keycloak lookup in between) is a new identity — a new
+          # Keycloak id (every token's sub), the old copy (sessions, consents,
+          # passkeys, role grants) removed, not inherited; a full sync first
+          # doesn't re-link it either. LLDAP's admin (read only here) is
+          # linked by its LLDAP uuid.
+          KC_TOKEN=$(tok)
+          [ -z "$KC_TOKEN" ] || [ "$KC_TOKEN" = null ] || echo "::add-mask::$KC_TOKEN"
+          luuid() { lq "{ user(userId: \"$1\") { uuid } }" | jq -r '.data.user.uuid // empty'; }
+          kc "/users/$ADMIN_ID" | jq -e --arg u "$(luuid admin)" --arg l "$LDAP_ID" '$u != "" and .attributes.LDAP_ID == [$u] and .federationLink == $l' >/dev/null \
+            || { echo "FAIL: admin not linked by its LLDAP uuid: $(kc "/users/$ADMIN_ID" | jq -c '[.federationLink, .attributes.LDAP_ID]')"; exit 1; }
+          lg 'mutation { createUser(user: {id: "same-name", email: "same-name@portcullis.local"}) { id } }'
+          U1=$(luuid same-name)
+          K1=$(kc "/users?username=same-name&exact=true" | jq -r '.[0].id // empty')
+          [ -n "$U1" ] && [ -n "$K1" ] || { echo "FAIL: same-name not imported"; exit 1; }
+          kc "/users/$K1" | jq -e --arg u "$U1" '.attributes.LDAP_ID == [$u]' >/dev/null || { echo "FAIL: same-name not linked by its LLDAP uuid"; exit 1; }
+          # A Keycloak-side grant on the old copy stands for its local state.
+          kcjson() { curl -sf -X POST -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") -H 'Content-Type: application/json' -d @- "http://127.0.0.1:8080/admin/realms/portcullis$1"; }
+          echo '{"name": "ci-same-name-marker"}' | kcjson /roles >/dev/null || { echo "FAIL: create the marker role"; exit 1; }
+          kc /roles/ci-same-name-marker | jq -c '[.]' | kcjson "/users/$K1/role-mappings/realm" >/dev/null || { echo "FAIL: grant the marker role"; exit 1; }
+          lg 'mutation { deleteUser(userId: "same-name") { ok } }'
+          lg 'mutation { createUser(user: {id: "same-name", email: "same-name@portcullis.local"}) { id } }'
+          U2=$(luuid same-name)
+          [ -n "$U2" ] && [ "$U2" != "$U1" ] || { echo "FAIL: LLDAP gave the re-created account the same uuid ($U1 / $U2)"; exit 1; }
+          kcpost "/user-storage/$LDAP_ID/sync?action=triggerFullSync" >/dev/null || { echo "FAIL: full sync"; exit 1; }
+          K2=$(kc "/users?username=same-name&exact=true" | jq -r '.[0].id // empty')
+          [ -n "$K2" ] && [ "$K2" != "$K1" ] || { echo "FAIL: the re-created same-name kept Keycloak id $K1 (got '$K2')"; exit 1; }
+          [ "$(kcstatus "/users/$K1")" = 404 ] || { echo "FAIL: Keycloak kept the old same-name copy $K1"; exit 1; }
+          kc "/users/$K2" | jq -e --arg u "$U2" '.attributes.LDAP_ID == [$u]' >/dev/null || { echo "FAIL: re-created same-name not linked by its new uuid"; exit 1; }
+          [ "$(kc "/users?briefRepresentation=true&max=1000" | jq '[.[] | select(.username == "same-name")] | length')" = 1 ] \
+            || { echo "FAIL: same-name duplicated in Keycloak"; exit 1; }
+          kc "/users/$K2/role-mappings/realm" | jq -e 'all(.[]?; .name != "ci-same-name-marker")' >/dev/null \
+            || { echo "FAIL: the re-created same-name inherited the old copy's grant"; exit 1; }
+          curl -sf -X DELETE -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") http://127.0.0.1:8080/admin/realms/portcullis/roles/ci-same-name-marker \
+            || { echo "FAIL: delete the marker role"; exit 1; }
+          lg 'mutation { deleteUser(userId: "same-name") { ok } }'
+          [ "$(kcstatus "/users/$K2")" = 404 ] || { echo "FAIL: Keycloak kept same-name after its deletion"; exit 1; }
+
           # Core's own accounts are untouched: LLDAP's admin + testuser and
           # their groups in Keycloak, the Hub's service account in LLDAP (and
           # never in Keycloak), the master realm's admin.
@@ -1608,7 +1855,7 @@ jobs:
           lq '{ user(userId: "admin") { id } }' | jq -e '.data.user.id == "admin"' >/dev/null || { echo "FAIL: LLDAP admin gone"; exit 1; }
           [ "$(kc "/users?username=portcullis-hub&exact=true" | jq length)" = 0 ] || { echo "FAIL: the Hub's service account is in Keycloak"; exit 1; }
           [ -n "$(tok)" ] && [ "$(tok)" != null ] || { echo "FAIL: master admin can't sign in"; exit 1; }
-          echo "PASS: users and groups deleted in LLDAP leave Keycloak (group at sync, user at lookup); LLDAP outage removes nothing; core's accounts kept"
+          echo "PASS: users and groups deleted in LLDAP leave Keycloak (group at sync, user at lookup); a re-created name is a new Keycloak identity (entryUUID); LLDAP outage removes nothing; core's accounts kept"
 
       - name: Test enrollment API - sign CSR (AppRole token)
         run: |
@@ -1748,7 +1995,7 @@ jobs:
           VAULT_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q vault)")"
           ./portcullis backup
           B=$(find backups -maxdepth 1 -type d -name '2*' | sort | tail -n1)
-          for f in MANIFEST.json .env secrets/vault-init.json secrets/vault-unseal/unseal-key certs/ca-chain.crt vault.snap postgres.dump lldap_data.tar.gz hub_data.tar.gz traefik_acme.tar.gz; do
+          for f in MANIFEST.json .env secrets/vault-init.json secrets/vault-unseal/unseal-key certs/ca-chain.crt vault.snap postgres.dump lldap_data.tar.gz hub_data.tar.gz traefik_acme.tar.gz mcp_gate_data.tar.gz; do
             test -s "$B/$f" || { echo "FAIL: backup lacks $f"; ls -la "$B"; exit 1; }
           done
           test "$(stat -c %a "$B")" = 700 || { echo "FAIL: backup dir is not 0700"; exit 1; }
@@ -1799,6 +2046,15 @@ jobs:
           BACKUP_PASSWORD="$(grep '^BACKUP_PASSWORD=' .env | cut -d= -f2-)"
           echo "::add-mask::$BACKUP_PASSWORD"
           export BACKUP_REPOSITORY BACKUP_PASSWORD
+          cp secrets/mcp-gate/age.pub /tmp/gate-age.pub
+          # LLDAP's admin: its Keycloak id and LLDAP uuid (the link, entryUUID) must survive.
+          KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+            --data-urlencode client_id=admin-cli --data-urlencode "username=$KEYCLOAK_ADMIN" \
+            --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          [ -z "$KC_TOKEN" ] || [ "$KC_TOKEN" = null ] || echo "::add-mask::$KC_TOKEN"
+          ADMIN_KC=$(curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") "http://127.0.0.1:8080/admin/realms/portcullis/users?username=admin&exact=true" \
+            | jq -c '.[0] | {id, link: .attributes.LDAP_ID}')
+          jq -e '.id != null and (.link | length) == 1' <<<"$ADMIN_KC" >/dev/null || { echo "FAIL: admin's Keycloak copy before the backup: $ADMIN_KC"; exit 1; }
           # Everything local is gone: containers, volumes, .env, secrets/, certs/, local backups.
           docker compose -p ci-mtls -f /tmp/ci-mtls.yml down 2>/dev/null || true
           docker compose -p ci-hubproxy down -v 2>/dev/null || true
@@ -1831,9 +2087,26 @@ jobs:
           jq -n '{query: "{ user(userId: \"testuser\") { id } }"}' | curl -sf http://localhost:17170/api/graphql \
             -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @- \
             | jq -e '.data.user.id == "testuser"' >/dev/null || { echo "FAIL: LLDAP user lost"; exit 1; }
+          # Same Keycloak id after the restore and a full sync, still linked to the same LLDAP uuid.
+          LDAPC=$(kc "/components?type=org.keycloak.storage.UserStorageProvider" | jq -r '[.[] | select(.providerId == "ldap")][0].id')
+          curl -sf -X POST -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") "http://127.0.0.1:8080/admin/realms/portcullis/user-storage/$LDAPC/sync?action=triggerFullSync" >/dev/null \
+            || { echo "FAIL: full sync after restore"; exit 1; }
+          jq -n '{query: "{ user(userId: \"admin\") { uuid } }"}' | curl -sf http://localhost:17170/api/graphql \
+            -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @- \
+            | jq -e --argjson b "$ADMIN_KC" '[.data.user.uuid] == $b.link' >/dev/null || { echo "FAIL: LLDAP admin's uuid changed by backup/restore"; exit 1; }
+          [ "$(kc "/users?username=admin&exact=true" | jq -c '.[0] | {id, link: .attributes.LDAP_ID}')" = "$ADMIN_KC" ] \
+            || { echo "FAIL: admin's Keycloak identity changed by backup/restore: $ADMIN_KC → $(kc "/users?username=admin&exact=true" | jq -c '.[0] | {id, link: .attributes.LDAP_ID}')"; exit 1; }
           ./portcullis status --json | jq -e '.vault.active and .keycloak.realm and .keycloak.forward_auth_client' >/dev/null \
             || { echo "FAIL: status after restore"; ./portcullis status || true; exit 1; }
-          echo "PASS: restored from restic into a fresh stack: CA, cert records, revocations, Keycloak, LLDAP"
+          # The gate's key / recipient / secret and its access log came back (G29 modes kept).
+          for _ in $(seq 1 40); do [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q mcp-gate)" 2>/dev/null)" = healthy ] && break; sleep 3; done
+          [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q mcp-gate)")" = healthy ] || { echo "FAIL: mcp-gate after restore"; docker compose logs --tail=30 mcp-gate; exit 1; }
+          cmp -s /tmp/gate-age.pub secrets/mcp-gate/age.pub || { echo "FAIL: the gate's recipient changed by backup/restore"; exit 1; }
+          docker run --rm -v portcullis_mcp_gate_data:/d:ro alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
+            sh -c 'stat -c "%a %u %g" /d /d/access.jsonl && grep -c "deny:off" /d/access.jsonl' > /tmp/gate-restored
+          [ "$(sed -n 1,2p /tmp/gate-restored | paste -sd' ')" = "750 10005 10001 640 10005 10001" ] && [ "$(sed -n 3p /tmp/gate-restored)" -ge 3 ] \
+            || { echo "FAIL: restored access log: $(cat /tmp/gate-restored)"; exit 1; }
+          echo "PASS: restored from restic into a fresh stack: CA, cert records, revocations, Keycloak (admin's id and entryUUID link kept), LLDAP, the MCP gate's key and access log"
           # The restore's LLDAP guard read the real volume and database: LLDAP
           # users counted, Keycloak's federated users counted, so it passed.
           GUARD=$(bash -c 'source scripts/lib/common.sh; env_load; source scripts/lib/status.sh; source scripts/lib/backup.sh; _backup_load_cfg
@@ -1910,9 +2183,9 @@ jobs:
           # Compose services incl. the monitoring profile (minus enroll and the
           # edge Hub) + the helper alpine, whoami and curl used inline.
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh \
-              | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
+              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         uses: ./.github/actions/cached-images
@@ -1954,6 +2227,17 @@ jobs:
           provenance: false
           sbom: false
           cache-from: type=gha,scope=domains-test
+          cache-to: ""
+      - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: mcp-gate
+          # compose's image name for mcp-gate
+          tags: portcullis-mcp-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=mcp-gate
           cache-to: ""
 
       - name: Start the core stack (Vault, PKI, all services except the Hub)
@@ -2134,7 +2418,15 @@ jobs:
           E2E_KEY: /tmp/e2e.key
           E2E_FOREIGN_CERT: /tmp/foreign.crt
           E2E_FOREIGN_KEY: /tmp/foreign.key
-        run: NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_login.py
+        run: |
+          NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_login.py
+          # refresh_rotation really refreshed (oauth2-proxy → Keycloak), and no refresh failed.
+          docker compose logs forward-auth > /tmp/forward-auth.log 2>&1
+          grep -q 'Refreshing session - User: ' /tmp/forward-auth.log || { echo "FAIL: no forward-auth session refresh during the e2e run"; exit 1; }
+          if grep -iE 'unable to refresh|error (redeeming|refreshing)|refresh token.*(invalid|reuse)' /tmp/forward-auth.log; then
+            echo "FAIL: a forward-auth session refresh failed"; exit 1
+          fi
+          echo "PASS: forward-auth sessions refreshed with Keycloak, none failed"
 
       - name: Re-invite / lost-key recovery (second key, --replace-keys)
         run: |
@@ -2242,12 +2534,7 @@ jobs:
   # browser scenarios; the instance backup / delete / restore checks run
   # against a real daemon at the end.
   e2e-instances:
-    # ubuntu-26.04 (ubuntu-latest since 2026-11) runs Docker with the
-    # containerd image store, where `docker image rm -f` of an image a
-    # running container uses (the echo fixture's hold service is the helper
-    # image) keeps it: the "helper pulled by digest" check needs the classic
-    # store. Follow-up: give hold its own image, then go back to latest.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       E2E_DOMAIN: portcullis.local
@@ -2299,9 +2586,9 @@ jobs:
       - name: List the images this job runs
         run: |
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
-              | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
+              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         uses: ./.github/actions/cached-images
@@ -2341,6 +2628,17 @@ jobs:
           provenance: false
           sbom: false
           cache-from: type=gha,scope=domains-test
+          cache-to: ""
+      - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: mcp-gate
+          # compose's image name for mcp-gate
+          tags: portcullis-mcp-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
         uses: ./.github/actions/hub-image
@@ -2756,9 +3054,9 @@ jobs:
       - name: List the images this job runs
         run: |
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
-              | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
+              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         uses: ./.github/actions/cached-images
@@ -2811,6 +3109,17 @@ jobs:
           provenance: false
           sbom: false
           cache-from: type=gha,scope=domains-test
+          cache-to: ""
+      - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: mcp-gate
+          # compose's image name for mcp-gate
+          tags: portcullis-mcp-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
         uses: ./.github/actions/hub-image
@@ -3086,9 +3395,9 @@ jobs:
       - name: List the images this job runs
         run: |
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
-              | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
+              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         uses: ./.github/actions/cached-images
@@ -3137,6 +3446,17 @@ jobs:
           provenance: false
           sbom: false
           cache-from: type=gha,scope=domains-test
+          cache-to: ""
+      - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: mcp-gate
+          # compose's image name for mcp-gate
+          tags: portcullis-mcp-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
         uses: ./.github/actions/hub-image
@@ -3349,9 +3669,9 @@ jobs:
       - name: List the images this job runs
         run: |
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
-              | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
+              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         uses: ./.github/actions/cached-images
@@ -3400,6 +3720,17 @@ jobs:
           provenance: false
           sbom: false
           cache-from: type=gha,scope=domains-test
+          cache-to: ""
+      - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: mcp-gate
+          # compose's image name for mcp-gate
+          tags: portcullis-mcp-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
         uses: ./.github/actions/hub-image
@@ -3527,3 +3858,318 @@ jobs:
           done
           docker compose down -v
           sudo rm -rf "$E2E_FAMILY"
+
+  # AI support end to end (contract §15, plan 4 Task 30): the whole stack +
+  # the Hub (same-named Hub branch) with one local template source = the
+  # templates repo's gitea (app_token: the official gitea-mcp, mint / revoke
+  # hooks) and grafana (identity_headers: mcp-grafana on its trust network)
+  # (same-named templates branch, else main) plus the CI fixture echo (the
+  # admin MCP's throwaway delete); instances gitea, gitea-b, grafana. tests/e2e/mcpclient (the official MCP Go SDK) runs on the
+  # runner host (G60) as Claude Code would: RFC 9728 discovery, Keycloak's
+  # authorization code flow with PKCE and `resource` for
+  # portcullis-ai-claude-code, a loopback callback on 127.0.0.1:33418, then
+  # Streamable HTTP through Traefik → mcp-gate → gitea-mcp → Gitea.
+  # tests/e2e/e2e_ai.py (Playwright, CDP virtual authenticator for the
+  # sign-in and consent): AI set up through the Hub's API as the CI admin
+  # root (never LLDAP's admin), then gitea_as_alice, audience_separation,
+  # no_token_crossing, destructive_confirmation, aggregate_lists,
+  # leaver_refused_and_revoked, ai_off.
+  e2e-ai:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      E2E_DOMAIN: portcullis.local
+      E2E_ARTIFACTS: e2e-artifacts
+      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Templates (same-named templates branch, else main)
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          url=https://github.com/porelli/portcullis-templates
+          ref=main
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && [[ "$REF" != v* ]] \
+              && git ls-remote --exit-code --heads "$url" "$REF" >/dev/null; then
+            ref="$REF"
+          fi
+          git clone --quiet --depth=1 --branch "$ref" "$url" "$RUNNER_TEMP/templates"
+          echo "Templates: portcullis-templates@$ref ($(git -C "$RUNNER_TEMP/templates" rev-parse --short HEAD))" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -q '^ai:' "$RUNNER_TEMP/templates/gitea/manifest.yaml" \
+            || { echo "FAIL: the templates checkout's gitea has no ai: block"; exit 1; }
+          grep -q 'mode: identity_headers' "$RUNNER_TEMP/templates/grafana/manifest.yaml" \
+            || { echo "FAIL: the templates checkout's grafana has no identity_headers companion"; exit 1; }
+
+      - name: Generate .env and the CI override (Pebble, fake DNS provider, app hostnames on Traefik)
+        run: |
+          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+            --email ci@portcullis.local --dns-provider none
+          for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
+            val="$(grep "^$v=" .env | cut -d= -f2-)"
+            [ "$v" = KEYCLOAK_ADMIN ] || echo "::add-mask::$val"
+          done
+          # Public DNS stand-in: on portcullis-proxy auth.<domain> resolves
+          # to Traefik (Gitea's OIDC discovery and token calls), as through
+          # public DNS in production. The static address is restated: the
+          # override replaces the entry.
+          cat > docker-compose.ci.yml <<'YML'
+          services:
+            keycloak:
+              ports:
+                - "127.0.0.1:9000:9000"
+            lldap:
+              ports:
+                - "127.0.0.1:17170:17170"
+            traefik:
+              networks:
+                portcullis-proxy:
+                  ipv4_address: ${PORTCULLIS_TRAEFIK_IP:-172.31.250.2}
+                  aliases:
+                    - auth.portcullis.local
+            domains:
+              build:
+                args:
+                  GO_TAGS: testprovider
+              environment:
+                ACME_CA_SERVER: https://pebble:14000/dir
+                LEGO_CA_CERTIFICATES: /run/ci/pebble.minica.pem
+                DOMAINS_RESOLVERS: 127.0.0.1:8053
+              volumes:
+                - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
+            pebble:
+              image: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
+              command: ["-config", "/test/config/pebble-config.json", "-dnsserver", "domains:8053"]
+              environment:
+                PEBBLE_VA_NOSLEEP: "1"
+                PEBBLE_WFE_NONCEREJECT: "0"
+              networks: [domains-egress]
+          YML
+          docker compose config -q
+          docker compose config --format json | jq -e '.services.traefik.networks["portcullis-proxy"] | (.aliases | index("auth.portcullis.local")) and .ipv4_address != null' >/dev/null \
+            || { echo "FAIL: Traefik alias override not applied"; exit 1; }
+
+      - name: List the images this job runs
+        run: |
+          {
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
+            grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
+              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
+          } | sort -u > "$RUNNER_TEMP/images.txt"
+      - name: Load images (cached, verified)
+        uses: ./.github/actions/cached-images
+        with:
+          images: ${{ runner.temp }}/images.txt
+          name: e2e-ai
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      - name: Pull the template's images (by digest)
+        run: |
+          set -o pipefail
+          grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' "$RUNNER_TEMP"/templates/{gitea,grafana}/compose.yml \
+            | sort -u > "$RUNNER_TEMP/app-images.txt"
+          cat "$RUNNER_TEMP/app-images.txt"
+          pull() { for i in 1 2 3 4; do docker pull -q "$1" >/dev/null && return 0; sleep $((i * 15)); done; echo "FAIL: pull $1"; return 1; }
+          export -f pull
+          # shellcheck disable=SC2016
+          xargs -P 4 -I{} bash -c 'pull "$1"' _ {} < "$RUNNER_TEMP/app-images.txt"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Build the MCP client (tests/e2e/mcpclient, go-sdk pinned in go.mod / go.sum)
+        working-directory: tests/e2e/mcpclient
+        run: |
+          go mod verify
+          go vet ./...
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
+          grep -qx 'require github.com/modelcontextprotocol/go-sdk v1.8.0' go.mod \
+            || { echo "FAIL: mcpclient must pin go-sdk v1.8.0 like mcp-gate"; exit 1; }
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/mcpclient" .
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: enroll
+          tags: portcullis-enroll
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=enroll
+          cache-to: ""
+      - name: Build group-gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: group-gate
+          tags: portcullis-group-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=group-gate
+          cache-to: ""
+      - name: Build the domains service (CI test build, buildx layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: domains
+          tags: portcullis-domains
+          build-args: GO_TAGS=testprovider
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=domains-test
+          cache-to: ""
+      - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: mcp-gate
+          # compose's image name for mcp-gate
+          tags: portcullis-mcp-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=mcp-gate
+          cache-to: ""
+      - name: Hub image (same-named Hub branch → built here, else the published one)
+        uses: ./.github/actions/hub-image
+
+      - name: Start the whole stack (Hub with the gitea / grafana / echo template source)
+        run: |
+          PEBBLE_IMG=$(docker compose config --format json | jq -r .services.pebble.image)
+          cid="$(docker create "$PEBBLE_IMG")"; docker cp "$cid:/test/certs/pebble.minica.pem" /tmp/pebble.minica.pem; docker rm "$cid" >/dev/null
+          chmod 644 /tmp/pebble.minica.pem
+          docker compose up -d postgres lldap
+          ./portcullis vault init
+          ./portcullis pki setup --with-server-cert
+          ./portcullis config apply --bundle-only
+          printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
+          # The Hub's only template source: gitea and grafana from the
+          # templates checkout and the CI fixture echo (the throwaway
+          # instance of the admin MCP's delete), as a local source (path,
+          # no URL: never pulled).
+          docker volume create --label com.docker.compose.project=portcullis --label com.docker.compose.volume=hub_data portcullis_hub_data >/dev/null
+          docker run --rm -v portcullis_hub_data:/data -v "$RUNNER_TEMP/templates:/tpl:ro" -v "$PWD/tests/e2e/apps:/src:ro" "$ALPINE" sh -c '
+            mkdir -p /data/repos/ci && cp -r /tpl/gitea /tpl/grafana /src/echo /data/repos/ci/ &&
+            printf "sources:\n  - name: ci\n    url: \"\"\n    path: /data/repos/ci\n" > /data/state.yaml &&
+            chown -R 10001:10001 /data && chmod 600 /data/state.yaml'
+          # shellcheck disable=SC2046
+          docker compose up -d $(docker compose config --services | grep -vx hub)
+          for i in $(seq 1 100); do
+            curl -sf http://127.0.0.1:9000/health/ready >/dev/null && break
+            [ "$i" -eq 100 ] && { echo "FAIL: Keycloak not ready"; docker compose logs --tail=80 keycloak; exit 1; }
+            sleep 3
+          done
+          ./portcullis keycloak configure
+          ./portcullis oidc register
+          ./portcullis up
+          docker compose restart forward-auth forward-auth-ext
+          docker compose ps
+          HUB_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q hub)")
+          echo "HUB_IP=$HUB_IP" >> "$GITHUB_ENV"
+          for i in $(seq 1 40); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$HUB_IP:8888/healthz")" = 200 ] && break
+            [ "$i" -eq 40 ] && { echo "FAIL: hub /healthz"; docker compose logs --tail=40 hub; exit 1; }
+            sleep 2
+          done
+          for i in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q mcp-gate)")" = healthy ] && break
+            [ "$i" -eq 30 ] && { echo "FAIL: mcp-gate not healthy"; docker compose logs --tail=40 mcp-gate; exit 1; }
+            sleep 2
+          done
+
+      - name: CI users (root in lldap_admin, alice, bob, carol) and setup links
+        run: |
+          set -o pipefail
+          # The users are created with the Hub's own LLDAP service account
+          # (what the Hub uses itself), never LLDAP's bootstrap admin.
+          LLDAP_TOKEN=$(jq -n --rawfile u secrets/hub/lldap/username --rawfile p secrets/hub/lldap/password \
+              '{username: ($u | rtrimstr("\n")), password: ($p | rtrimstr("\n"))}' \
+            | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          [ -z "$LLDAP_TOKEN" ] || [ "$LLDAP_TOKEN" = null ] || echo "::add-mask::$LLDAP_TOKEN"
+          [ -n "$LLDAP_TOKEN" ] && [ "$LLDAP_TOKEN" != null ] || { echo "FAIL: LLDAP login as the Hub's service account"; exit 1; }
+          gql() { jq -n --arg q "$1" '{query: $q}' | curl -sf http://127.0.0.1:17170/api/graphql \
+                    -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @-; }
+          for u in root alice bob carol; do
+            gql "mutation { createUser(user: {id: \"$u\", email: \"$u@portcullis.local\"}) { id } }" | jq -e '.errors == null' >/dev/null
+          done
+          gid=$(gql '{ groups { id displayName } }' | jq -r '.data.groups[] | select(.displayName == "lldap_admin") | .id')
+          gql "mutation { addUserToGroup(userId: \"root\", groupId: $gid) { ok } }" | jq -e '.errors == null' >/dev/null
+          echo "127.0.0.1 portcullis.local auth.portcullis.local enroll.portcullis.local hub.portcullis.local people.portcullis.local mcp.portcullis.local gitea.portcullis.local gitea-b.portcullis.local grafana.portcullis.local" | sudo tee -a /etc/hosts
+          # root is an administrator: only the CLI invites it (the Hub refuses).
+          for spec in "E2E_ROOT_INVITE root" "E2E_ALICE_INVITE alice" "E2E_BOB_INVITE bob" "E2E_CAROL_INVITE carol"; do
+            read -r var who <<<"$spec"
+            url="$(./portcullis invite "$who" --to portal --json | jq -r .url)"
+            # Masked before anything can print it: a malformed link may still carry a token.
+            [ -z "$url" ] || [ "$url" = null ] || echo "::add-mask::$url"
+            [[ "$url" =~ ^https://enroll\.portcullis\.local/invite/[A-Za-z0-9_-]{43}$ ]] || { echo "FAIL: setup link for $who: $url"; exit 1; }
+            echo "$var=$url" >> "$GITHUB_ENV"
+          done
+
+      - name: Restore the pip / Playwright browser cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/ms-playwright
+          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+
+      - name: Install Playwright (pinned) and trust core's CA
+        run: |
+          python3 -m venv /tmp/e2e-venv
+          /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
+          sudo /tmp/e2e-venv/bin/playwright install-deps chromium
+          /tmp/e2e-venv/bin/playwright install chromium
+          sudo apt-get install -y -qq libnss3-tools >/dev/null
+          mkdir -p "$HOME/.pki/nssdb"
+          certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
+          certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
+
+      - name: Run the AI scenarios 1–7 (MCP client through mcp-gate with Keycloak OAuth)
+        env:
+          E2E_HUB_ACTOR: root
+        run: |
+          E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
+          export E2E_HUB_SECRET
+          E2E_TOKEN_DIR="$(mktemp -d)"; export E2E_TOKEN_DIR
+          export E2E_MCPCLIENT="$RUNNER_TEMP/mcpclient" E2E_CA="$PWD/certs/ca-chain.crt"
+          NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_ai.py
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p e2e-artifacts/apps
+          SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
+          docker compose ps -a > e2e-artifacts/compose-ps.txt 2>&1 || true
+          docker ps -a > e2e-artifacts/docker-ps.txt 2>&1 || true
+          for svc in traefik keycloak forward-auth group-gate lldap hub mcp-gate socket-proxy-hub; do
+            docker compose logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
+          done
+          for c in $(docker ps -aq --filter label=com.docker.compose.project); do
+            name="$(docker inspect -f '{{.Name}}' "$c" | tr -d /)"
+            case "$name" in portcullis-*-*) docker logs "$c" > "e2e-artifacts/apps/$name.log" 2>&1 || true ;; esac
+          done
+          # AI state (no credential: the Hub's views carry metadata only; the
+          # gate files' credentials are age-encrypted and not copied).
+          for p in /api/ai/settings /api/instances/gitea/ai /api/instances/gitea-b/ai /api/instances/grafana/ai \
+                   /api/instances/gitea/op /api/instances/gitea-b/op /api/instances/grafana/op /api/instances/echo-del/op \
+                   "/api/ai/activity?n=200" /api/directory/audit; do
+            curl -s -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: root\n' "$SECRET") \
+              "http://$HUB_IP:8888$p" > "e2e-artifacts/api$(echo "${p%%\?*}" | tr / _).json" 2>&1 || true
+          done
+          docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'cat /d/mcp-gate.json; ls -la /d /d/overrides; cat /d/overrides/*.yml' > e2e-artifacts/hub-data.txt 2>&1 || true
+
+      - name: Upload screenshots, traces and logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-ai-artifacts
+          path: e2e-artifacts/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          for p in $(docker ps -aq --filter label=com.docker.compose.project | xargs -r docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' | sort -u | grep '^portcullis-.'); do
+            docker compose -p "$p" down -v 2>/dev/null || true
+          done
+          docker compose down -v

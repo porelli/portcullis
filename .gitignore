@@ -1,5 +1,5 @@
 # User config directory (separate git repo — see ./portcullis config init)
-config/
+/config/
 
 # User config symlinks (point into config/)
 .env

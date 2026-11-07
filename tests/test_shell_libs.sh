@@ -163,6 +163,7 @@ expect_ok   "hub env: domain" grep -qx 'PORTCULLIS_DOMAIN=hub.test' "$HE"
 expect_ok   "hub env: Traefik IP (compose default)" grep -qx 'PORTCULLIS_TRAEFIK_IP=172.31.250.2' "$HE"
 expect_ok   "hub env: VPN client secret by prefix" grep -qx 'HEADSCALE_OIDC_CLIENT_SECRET=hs-secret' "$HE"
 expect_ok   "hub env: HUB_SHARED_ENV" grep -qx 'MY_APP_VAR=shared' "$HE"
+expect_ok   "hub env: mcp-gate IP (compose default, G42)" grep -qx 'PORTCULLIS_MCP_GATE_IP=172.31.250.3' "$HE"
 expect_fail "hub env: never a core secret" grep -Eq 'pg-secret|hub-secret|kc-secret' "$HE"
 INODE_BEFORE="$(file_inode "$HE")"
 hub_env_run
@@ -197,6 +198,17 @@ chmod 700 "$SP_ROOT/appfiles"
   unset -f users_secret_files monitoring_prepare domains_prepare
   stack_prepare ) >/dev/null 2>&1
 expect_eq "stack_prepare: a 10001-owned appfiles/ keeps its mode" "$(file_mode "$SP_ROOT/appfiles")" 700
+# mcp_gate_data: the gate (10005) writes it, the Hub reads it (group 10001);
+# whichever container starts first creates the volume, so it is created and
+# owned before compose runs. The gate's secrets come with every prepare.
+( PORTCULLIS_ROOT="$SP_ROOT"
+  volume_own() { echo "volume_own $*" >> "$STUB_DIR/sp-vol"; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  mcpgate_ensure_secrets() { echo "mcpgate_ensure_secrets" >> "$STUB_DIR/sp-vol"; }
+  unset -f users_secret_files monitoring_prepare domains_prepare
+  stack_prepare ) >/dev/null 2>&1
+expect_ok "stack_prepare: mcp_gate_data owned 10005:10001" grep -qx 'volume_own mcp_gate_data 10005:10001' "$STUB_DIR/sp-vol"
+expect_ok "stack_prepare: mcp-gate secrets ensured" grep -qx 'mcpgate_ensure_secrets' "$STUB_DIR/sp-vol"
+rm -f "$STUB_DIR/sp-vol"
 rm -f "$STUB_DIR/calls"
 
 # ══ network: IP math / validation ══════════════════════════
@@ -263,6 +275,222 @@ printf '%s' '[{"Subnet":"172.18.5.0/28"}]' > "$STUB_DIR/ipam-json-portcullis_por
 expect_fail "guard: domains network mismatch aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 expect_fail "guard: invalid domains subnet aborts" bash -c "rm -f '$STUB_DIR/ipam-json-portcullis_portcullis-domains'; PORTCULLIS_DOMAINS_SUBNET=172.31.250.0/28; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 rm -f "$STUB_DIR/ipam-json-portcullis_portcullis-domains"
+# mcp-gate's pinned address on portcullis-proxy (contract §2 PORTCULLIS_MCP_GATE_IP).
+unset PORTCULLIS_MCP_GATE_IP
+expect_eq "mcp-gate IP: default" "$(mcp_gate_ip)" 172.31.250.3
+expect_ok "mcp-gate IP: default valid" validate_mcp_gate_ip
+check_gate() { PORTCULLIS_MCP_GATE_IP="$1" validate_mcp_gate_ip; }
+expect_ok   "mcp-gate IP: another static address"           check_gate 172.31.250.40
+expect_fail "mcp-gate IP: inside the dynamic range"         check_gate 172.31.250.200
+expect_fail "mcp-gate IP: outside the subnet"               check_gate 172.31.251.3
+expect_fail "mcp-gate IP: equal to Traefik's"               check_gate 172.31.250.2
+expect_fail "mcp-gate IP: the gateway"                      check_gate 172.31.250.1
+expect_fail "mcp-gate IP: the broadcast address"            check_gate 172.31.250.255
+expect_fail "mcp-gate IP: not an address"                   check_gate 172.31.250
+expect_fail "mcp-gate IP: equal to a custom Traefik IP" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; PORTCULLIS_TRAEFIK_IP=172.31.250.9 PORTCULLIS_MCP_GATE_IP=172.31.250.9 validate_mcp_gate_ip"
+expect_fail "guard: mcp-gate IP in the dynamic range aborts" bash -c "PORTCULLIS_MCP_GATE_IP=172.31.250.130; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+expect_fail "guard: mcp-gate IP = Traefik's aborts" bash -c "PORTCULLIS_MCP_GATE_IP=172.31.250.2; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+expect_fail "guard: mcp-gate IP outside the subnet aborts" bash -c "PORTCULLIS_MCP_GATE_IP=10.0.0.3; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+expect_ok "guard: default mcp-gate IP passes" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+# portcullis-mcp (fix round 1): mcp-gate ⇄ Keycloak / the Hub only, fixed
+# IPAM with Keycloak and the Hub pinned (the gate maps both names to them).
+unset PORTCULLIS_MCP_SUBNET PORTCULLIS_MCP_IP_RANGE PORTCULLIS_MCP_KEYCLOAK_IP PORTCULLIS_MCP_HUB_IP
+expect_eq "mcp net: defaults" "$(mcp_subnet) $(mcp_ip_range) $(mcp_keycloak_ip) $(mcp_hub_ip)" "172.31.253.0/28 172.31.253.8/29 172.31.253.2 172.31.253.3"
+expect_ok "mcp net: default valid" validate_mcp_network_config
+check_mnet() { PORTCULLIS_MCP_SUBNET="$1" PORTCULLIS_MCP_IP_RANGE="$2" PORTCULLIS_MCP_KEYCLOAK_IP="$3" PORTCULLIS_MCP_HUB_IP="$4" validate_mcp_network_config; }
+expect_ok   "mcp net: custom valid"                  check_mnet 10.96.0.0/28 10.96.0.8/29 10.96.0.2 10.96.0.3
+expect_fail "mcp net: invalid CIDR"                  check_mnet 10.96.0.0/33 10.96.0.8/29 10.96.0.2 10.96.0.3
+expect_fail "mcp net: range outside the subnet"      check_mnet 10.96.0.0/28 10.96.1.8/29 10.96.0.2 10.96.0.3
+expect_fail "mcp net: Keycloak IP in the range"      check_mnet 10.96.0.0/28 10.96.0.8/29 10.96.0.9 10.96.0.3
+expect_fail "mcp net: Hub IP outside the subnet"     check_mnet 10.96.0.0/28 10.96.0.8/29 10.96.0.2 10.96.1.3
+expect_fail "mcp net: Hub IP = the gateway"          check_mnet 10.96.0.0/28 10.96.0.8/29 10.96.0.2 10.96.0.1
+expect_fail "mcp net: Keycloak and the Hub share an IP" check_mnet 10.96.0.0/28 10.96.0.8/29 10.96.0.2 10.96.0.2
+expect_fail "mcp net: overlaps portcullis-proxy"     check_mnet 172.31.250.32/28 172.31.250.40/29 172.31.250.34 172.31.250.35
+expect_fail "mcp net: overlaps portcullis-auth"      check_mnet 172.31.251.0/28 172.31.251.8/29 172.31.251.3 172.31.251.4
+expect_fail "mcp net: overlaps portcullis-domains"   check_mnet 172.31.252.0/28 172.31.252.8/29 172.31.252.2 172.31.252.3
+printf '%s' '[{"Subnet":"172.31.253.0/28","IPRange":"172.31.253.8/29"}]' > "$STUB_DIR/ipam-json-portcullis-mcp"
+expect_eq "mcp net: state ok" "$(mcp_network_state)" ok
+expect_ok "guard: mcp network matching" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+printf '%s' '[{"Subnet":"172.31.253.0/28"}]' > "$STUB_DIR/ipam-json-portcullis-mcp"
+expect_fail "guard: mcp network without its range aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+rm -f "$STUB_DIR/ipam-json-portcullis-mcp"
+expect_fail "guard: invalid mcp settings abort" bash -c "PORTCULLIS_MCP_HUB_IP=172.31.253.9; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+# The gate never resolves keycloak / hub through DNS: compose maps both
+# names to the pinned addresses (extra_hosts) where they are pinned.
+CF="$HERE/../docker-compose.yml"
+expect_ok "compose: the gate maps keycloak and hub to their pinned portcullis-mcp addresses" \
+  bash -c "grep -qF -- '- \"keycloak:\${PORTCULLIS_MCP_KEYCLOAK_IP:-172.31.253.2}\"' '$CF' && grep -qF -- '- \"hub:\${PORTCULLIS_MCP_HUB_IP:-172.31.253.3}\"' '$CF'"
+expect_eq "compose: keycloak and the hub pinned on portcullis-mcp with the same variables" \
+  "$(grep -cE 'ipv4_address: \$\{PORTCULLIS_MCP_(KEYCLOAK|HUB)_IP:-172\.31\.253\.[23]\}' "$CF")" 2
+
+# DNS shadowing on portcullis-proxy (fix round 1, re-ruled): only the
+# containers `docker compose ps` lists for the core project are core, and
+# each may answer only to its own service, which must be a portcullis-proxy
+# member (CORE_PROXY_SERVICES). Anything else answering to a core name — or
+# claiming a core service label or container name — is flagged; any
+# inspection error fails closed. network_check (init / up / upgrade /
+# restore) refuses, status fails.
+mkdir -p "$WORK/dnsbin" "$STUB_DIR/dns"
+cat > "$WORK/dnsbin/docker" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1 $2" = "network inspect" ]; then
+  case "$5" in
+    "{{range"*) [ -f "$STUB_DIR/dns/net-fail" ] && exit 1; [ -f "$STUB_DIR/dns/ids" ] && cat "$STUB_DIR/dns/ids"; exit 0 ;;
+    *) exit 1 ;;
+  esac
+fi
+if [ "$1 $2" = "network ls" ]; then [ -f "$STUB_DIR/dns/net-listed" ] && echo portcullis-proxy; exit 0; fi
+if [ "$1" = compose ]; then
+  echo "$*" >> "$STUB_DIR/dns/compose-calls"
+  [ -f "$STUB_DIR/dns/compose-fail" ] && exit 1
+  # An instance project (the AI companion check): its own id list.
+  if [ "$2" = -p ] && [ "$3" != portcullis ]; then
+    [ "$*" = "compose -p $3 ps -aq" ] || exit 1
+    [ "$PWD" = / ] || exit 1   # run outside any compose file
+    [ -f "$STUB_DIR/dns/proj-fail" ] && exit 1
+    cat "$STUB_DIR/dns/proj-$3" 2>/dev/null; exit 0
+  fi
+  case "$*" in *" ps -aq") cat "$STUB_DIR/dns/core-ids" 2>/dev/null; exit 0 ;; esac
+  exit 1
+fi
+if [ "$1" = run ]; then   # the hub_data reader: its last argument is the override path
+  echo "$*" >> "$STUB_DIR/dns/run-calls"
+  [ -f "$STUB_DIR/dns/run-fail" ] && exit 1
+  f="$STUB_DIR/dns/override-$(basename "${*: -1}" .override.yml)"
+  [ -f "$f" ] || exit 3
+  cat "$f"; exit 0
+fi
+if [ "$1" = inspect ] && [ "$2" = --format ]; then
+  [ -f "$STUB_DIR/dns/$4.json" ] || exit 1
+  cat "$STUB_DIR/dns/$4.json"; exit 0
+fi
+exit 0
+STUB
+chmod +x "$WORK/dnsbin/docker"
+ctr() { # ctr <id> <name> <project> <service> <hostname> <aliases-json> [dnsnames-json] [config_files]
+  jq -n --arg n "/$2" --arg p "$3" --arg s "$4" --arg h "$5" --argjson a "$6" --argjson d "${7:-[]}" --arg cf "${8:-}" \
+    '{Name: $n, Config: {Hostname: $h, Labels: ({"com.docker.compose.project": $p, "com.docker.compose.service": $s, "com.docker.compose.project.config_files": $cf} | with_entries(select(.value != "")))},
+      NetworkSettings: {Networks: {"portcullis-proxy": {Aliases: $a, DNSNames: $d}}}}' > "$STUB_DIR/dns/$1.json"
+}
+ctr c1 portcullis-traefik-1 portcullis traefik abc '["traefik","portcullis-traefik-1"]' '["portcullis-traefik-1","traefik","abc"]'
+ctr c2 portcullis-mcp-gate-1 portcullis mcp-gate def '["mcp-gate"]'
+GITEA_FILES=/project/templates/gitea/compose.yml,/data/overrides/gitea.override.yml,/data/overrides/gitea.user.yml
+ctr c3 portcullis-gitea-web-1 portcullis-gitea web web1 '["web","portcullis-mcp-gitea--gitea"]' '["portcullis-gitea-web-1","web"]' "$GITEA_FILES"
+# The Hub's override for instance gitea, as override.go writes it: the alias
+# on the companion's service (web), another alias on another service.
+cat > "$STUB_DIR/dns/override-gitea" <<'YML'
+# Auto-generated by Portcullis Hub -- do not edit
+services:
+  db:
+    environment:
+      - "X=1"
+  web:
+    volumes:
+      - ./templates/gitea/x:/x
+    networks:
+      default: {}
+      portcullis-proxy:
+        aliases:
+          - "portcullis-mcp-gitea--gitea"
+    labels: !override
+      "traefik.http.routers.web.tls.options": "authaware@file"
+  other:
+    networks:
+      portcullis-proxy:
+        aliases:
+          - "portcullis-mcp-gitea--other"
+networks:
+  portcullis-proxy:
+    external: true
+YML
+echo "c1 c2 c3" > "$STUB_DIR/dns/ids"; printf 'c1\nc2\n' > "$STUB_DIR/dns/core-ids"; echo c3 > "$STUB_DIR/dns/proj-portcullis-gitea"
+dns() { (PATH="$WORK/dnsbin:$PATH"; "$@"); }
+expect_eq "dns guard: core containers and a well-behaved app pass" "$(dns proxy_dns_shadows)" ""
+expect_ok "dns guard: core ids come from docker compose ps of the core project and file" \
+  grep -qF -- "-p portcullis -f $(cd "$HERE/.." && pwd)/docker-compose.yml --profile * ps -aq" "$STUB_DIR/dns/compose-calls"
+ctr c4 portcullis-evil-web-1 portcullis-evil web web '["web","Keycloak."]'
+ctr c5 hub portcullis-evil2 api x '[]'
+ctr c6 portcullis-evil3-app-1 portcullis-evil3 app LLDAP '[]'
+ctr c7 portcullis-evil4-app-1 portcullis-evil4 app x '[]' '["vault"]'
+# Forged core labels / names, not listed by compose: flagged even with no core alias.
+ctr c8 portcullis-postgres-2 portcullis postgres x '[]'
+ctr c9 portcullis-fake-1 portcullis keycloak x '[]'
+# A real core container answering to ANOTHER core name, and a core service
+# that is not a portcullis-proxy member at all.
+ctr c1 portcullis-traefik-1 portcullis traefik abc '["traefik","hub"]'
+ctr c10 portcullis-lldap-1 portcullis lldap x '["lldap"]'
+echo "c1 c2 c3 c4 c5 c6 c7 c8 c9 c10" > "$STUB_DIR/dns/ids"; printf 'c1\nc2\nc10\n' > "$STUB_DIR/dns/core-ids"
+expect_eq "dns guard: alias, name, hostname, DNS name, forged labels / names, a core container's foreign name, a core service off its networks" \
+  "$(dns proxy_dns_shadows | sort | paste -sd'|' -)" \
+  "hub hub|portcullis-evil-web-1 keycloak|portcullis-evil3-app-1 lldap|portcullis-evil4-app-1 vault|portcullis-fake-1 keycloak (core service label)|portcullis-lldap-1 lldap (core service not on portcullis-proxy)|portcullis-postgres-2 postgres (core service label)|portcullis-traefik-1 hub"
+# Final review I4: AI companion names (mcp-gate sends credentials there).
+# Only a portcullis-proxy alias of a container compose lists for that
+# instance's project, and only one container per name.
+ctr m1 portcullis-evil-web-1 portcullis-evil web web '["web","portcullis-mcp-gitea--gitea"]' '[]' "$GITEA_FILES"
+ctr m2 portcullis-mcp-gitea--gitea other web web '[]'
+ctr m3 portcullis-other-app-1 portcullis-other app portcullis-mcp-other--app '[]'
+ctr m4 portcullis-other-x-1 portcullis-other x x '["portcullis-mcp-Other--x-"]'
+ctr m5 portcullis-mcp-gate-1 portcullis mcp-gate def '["mcp-gate","portcullis-mcp-a--b"]'
+echo c2 > "$STUB_DIR/dns/core-ids"
+echo "c2 c3 m1" > "$STUB_DIR/dns/ids"
+expect_eq "dns guard: an AI companion alias outside the instance's project" \
+  "$(dns proxy_dns_shadows | sort | paste -sd'|' -)" \
+  "portcullis-evil-web-1 portcullis-mcp-gitea--gitea (AI companion name outside project portcullis-gitea)|portcullis-gitea-web-1 portcullis-mcp-gitea--gitea (AI companion name answered by more than one container)"
+# A forged project label: compose lists it, but two containers answer.
+printf 'c3\nm1\n' > "$STUB_DIR/dns/proj-portcullis-gitea"
+expect_eq "dns guard: two containers of the project answering to one AI companion name" \
+  "$(dns proxy_dns_shadows | sort | paste -sd'|' -)" \
+  "portcullis-evil-web-1 portcullis-mcp-gitea--gitea (AI companion name answered by more than one container)|portcullis-gitea-web-1 portcullis-mcp-gitea--gitea (AI companion name answered by more than one container)"
+echo c3 > "$STUB_DIR/dns/proj-portcullis-gitea"
+expect_ok "dns guard: the override is read from hub_data by a read-only, offline helper" \
+  grep -qE -- "run --rm --network none --read-only --cap-drop ALL .*-v portcullis_hub_data:/d:ro .* /d/overrides/gitea.override.yml\$" "$STUB_DIR/dns/run-calls"
+# Coordinator tightening: in the project, but not from the Hub's override;
+# from it, but on another service than the one it gives the alias to; an
+# instance with no override at all; the override unreadable (fail closed).
+ctr m6 portcullis-gitea-web-2 portcullis-gitea web web '["portcullis-mcp-gitea--gitea"]' '[]' "/tmp/compose.yml"
+ctr m7 portcullis-gitea-db-1 portcullis-gitea db db '["portcullis-mcp-gitea--other"]' '[]' "$GITEA_FILES"
+ctr m8 portcullis-nohub-app-1 portcullis-nohub app app '["portcullis-mcp-nohub--app"]' '[]' "/data/overrides/nohub.override.yml"
+printf 'm6\nm7\n' > "$STUB_DIR/dns/proj-portcullis-gitea"; echo m8 > "$STUB_DIR/dns/proj-portcullis-nohub"
+echo "c2 m6 m7 m8" > "$STUB_DIR/dns/ids"
+expect_eq "dns guard: AI companion name not from the Hub's override, on the wrong service, without an override" \
+  "$(dns proxy_dns_shadows | sort | paste -sd'|' -)" \
+  "portcullis-gitea-db-1 portcullis-mcp-gitea--other (AI companion name on service db, not the companion's service)|portcullis-gitea-web-2 portcullis-mcp-gitea--gitea (AI companion name on a container the Hub did not create)|portcullis-nohub-app-1 portcullis-mcp-nohub--app (AI companion name with no Hub override for instance nohub)"
+touch "$STUB_DIR/dns/run-fail"
+expect_fail "dns guard: hub_data unreadable fails closed" dns proxy_dns_shadows
+rm -f "$STUB_DIR/dns/run-fail"
+echo c3 > "$STUB_DIR/dns/proj-portcullis-gitea"
+echo "c2 m2 m3 m4" > "$STUB_DIR/dns/ids"; echo m4 > "$STUB_DIR/dns/proj-portcullis-other"
+expect_eq "dns guard: AI companion names as container name / hostname, malformed after folding" \
+  "$(dns proxy_dns_shadows | sort | paste -sd'|' -)" \
+  "portcullis-mcp-gitea--gitea portcullis-mcp-gitea--gitea (AI companion name as container name or hostname)|portcullis-other-app-1 portcullis-mcp-other--app (AI companion name as container name or hostname)|portcullis-other-x-1 portcullis-mcp-other--x- (malformed AI companion name)"
+printf 'c2\nm5\n' > "$STUB_DIR/dns/core-ids"; echo "m5" > "$STUB_DIR/dns/ids"
+expect_eq "dns guard: a core container never answers to an AI companion name" \
+  "$(dns proxy_dns_shadows)" "portcullis-mcp-gate-1 portcullis-mcp-a--b (AI companion name on a core container)"
+echo c2 > "$STUB_DIR/dns/core-ids"; echo "c2 c3" > "$STUB_DIR/dns/ids"; touch "$STUB_DIR/dns/proj-fail"
+expect_fail "dns guard: an instance project that can't be listed fails closed" dns proxy_dns_shadows
+rm -f "$STUB_DIR/dns/proj-fail"
+printf 'c1\nc2\nc10\n' > "$STUB_DIR/dns/core-ids"
+echo "c1 c2 c3 c4 c5 c6 c7 c8 c9 c10" > "$STUB_DIR/dns/ids"
+expect_fail "guard: a container shadowing a core name aborts network_check" \
+  bash -c "PATH='$WORK/dnsbin:$PATH'; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+OUT="$(PATH="$WORK/dnsbin:$PATH" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check" 2>&1)"
+case "$OUT" in *'portcullis-evil-web-1 answers to "keycloak"'*) t_pass "guard: names the container and the core name" ;; *) t_fail "guard message: $OUT" ;; esac
+ctr c1 portcullis-traefik-1 portcullis traefik abc '["traefik","portcullis-traefik-1"]'
+echo "c1 c2 c3" > "$STUB_DIR/dns/ids"
+expect_ok "guard: passes again once the apps are gone" \
+  bash -c "PATH='$WORK/dnsbin:$PATH'; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+# Fail closed: every docker inspection error aborts.
+for f in compose-fail net-fail; do
+  touch "$STUB_DIR/dns/$f"; touch "$STUB_DIR/dns/net-listed"
+  expect_fail "guard: inspection error ($f) aborts network_check" \
+    bash -c "PATH='$WORK/dnsbin:$PATH'; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+  rm -f "$STUB_DIR/dns/$f" "$STUB_DIR/dns/net-listed"
+done
+echo "c1 c2 c3 gone" > "$STUB_DIR/dns/ids"
+expect_fail "guard: a container that can't be inspected aborts network_check" \
+  bash -c "PATH='$WORK/dnsbin:$PATH'; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+rm -f "$STUB_DIR/dns/ids"
+expect_eq "dns guard: no network = nothing" "$(dns proxy_dns_shadows)" ""
 expect_fail "network lib has no migration code" grep -Eq 'proxy_network_(migrate|reconnect)|docker network (connect|disconnect)' "$HERE/../scripts/lib/network.sh"
 
 # ══ certs: write_revoked_serials ═══════════════════════════
@@ -412,6 +640,18 @@ source "$HERE/../scripts/lib/status.sh"
 # shellcheck source=../scripts/lib/backup.sh
 source "$HERE/../scripts/lib/backup.sh"
 
+# ── status: mcp-gate refusing every AI request (docs review M4) ──
+# dc ps -q mcp-gate → an id; docker inspect → its health JSON.
+mst() { (dc() { [ "$*" = "ps -q mcp-gate" ] && cat "$STUB_DIR/mst-id" 2>/dev/null; }
+         docker() { [ "$1" = inspect ] && cat "$STUB_DIR/mst-health"; }; _st_mcp_refusing); }
+echo cid1 > "$STUB_DIR/mst-id"
+jq -n '{Status: "healthy", Log: [{Output: "ok\nrefusing every AI request (503): old"}, {Output: "ok\nrefusing every AI request (503): mcp-credentials.json: credentials[0]: no identity matched\n"}]}' > "$STUB_DIR/mst-health"
+expect_eq "status: mcp-gate refusing = the last health log's reason" "$(mst)" "refusing every AI request (503): mcp-credentials.json: credentials[0]: no identity matched"
+jq -n '{Status: "healthy", Log: [{Output: "ok\nrefusing every AI request (503): old"}, {Output: "ok\n"}]}' > "$STUB_DIR/mst-health"
+expect_eq "status: mcp-gate serving = nothing" "$(mst)" ""
+rm -f "$STUB_DIR/mst-id"
+expect_eq "status: mcp-gate not running = nothing" "$(mst)" ""
+
 # ── upgrade: pinned Hub image, policy file version (final review M1) ──
 # dc stub: exec prints $STUB_DIR/pv (the policy version), logs $STUB_DIR/gglog.
 pv() { (dc() { case "$1" in exec) cat "$STUB_DIR/pv" 2>/dev/null ;; logs) cat "$STUB_DIR/gglog" 2>/dev/null ;; esac; }; sleep() { :; }; "$@"; hub_policy_check 2 2>&1); }
@@ -543,6 +783,16 @@ expect_fail "backup: non-snapshot body rejected" snap_check "$WORK/bad.snap"
 source "$HERE/../scripts/lib/keycloak.sh"
 expect_eq "realm export: LDAP federation cachePolicy NO_CACHE" \
   "$(jq -r '.components["org.keycloak.storage.UserStorageProvider"][] | select(.providerId == "ldap") | .config.cachePolicy | join(",")' "$HERE/../keycloak/realm-export.json")" NO_CACHE
+# AI support (contract §8 "Connection length and rotation"): the realm's
+# offline upper bounds (the Hub sets shorter per-client values); refresh-token
+# rotation pinned off (realm-wide it breaks concurrent forward-auth
+# refreshes: e2e-login refresh_rotation), in the export AND pushed onto
+# existing realms by configure.
+expect_eq "realm export: offline session bounds 30 d idle / 90 d max, no refresh-token rotation" \
+  "$(jq -c '[.offlineSessionIdleTimeout, .offlineSessionMaxLifespanEnabled, .offlineSessionMaxLifespan, .revokeRefreshToken, .refreshTokenMaxReuse]' "$HERE/../keycloak/realm-export.json")" \
+  '[2592000,true,7776000,false,0]'
+expect_eq "keycloak configure: the same realm token settings" "$(printf '%s' "$KC_REALM_TOKEN_SETTINGS" | jq -cS .)" \
+  '{"offlineSessionIdleTimeout":2592000,"offlineSessionMaxLifespan":7776000,"offlineSessionMaxLifespanEnabled":true,"refreshTokenMaxReuse":0,"revokeRefreshToken":false}'
 COMP='{"id":"x","providerId":"ldap","config":{"cachePolicy":["DEFAULT"],"editMode":["READ_ONLY"],"trustEmail":["true"]}}'
 P1="$(printf '%s' "$COMP" | LLDAP_PASS=pw _kc_ldap_patch dc=ex,dc=org)"
 expect_eq "keycloak configure: existing realm patched to NO_CACHE" "$(printf '%s' "$P1" | jq -r '.config.cachePolicy | join(",")')" NO_CACHE
@@ -563,6 +813,15 @@ expect_eq "realm export: group mapper drops groups gone from LLDAP" \
 expect_eq "keycloak configure: existing realm gets removal + hourly sync + READ_ONLY" \
   "$(printf '%s' '{"config":{"removeInvalidUsersEnabled":["false"],"fullSyncPeriod":["604800"],"editMode":["WRITABLE"]}}' | LLDAP_PASS=pw _kc_ldap_patch dc=ex,dc=org | jq -c '.config | [.removeInvalidUsersEnabled, .fullSyncPeriod, .editMode]')" \
   '[["true"],["3600"],["READ_ONLY"]]'
+# Keycloak links an LDAP user by LLDAP's immutable entryUUID, never the
+# username (a re-created name is a new identity) — in the export and pushed
+# onto existing realms by configure; username / RDN stay uid.
+expect_eq "realm export: users linked by entryUUID, username / RDN uid" \
+  "$(jq -c "$LDAPC | .config | [.uuidLDAPAttribute, .usernameLDAPAttribute, .rdnLDAPAttribute]" "$HERE/../keycloak/realm-export.json")" \
+  '[["entryUUID"],["uid"],["uid"]]'
+expect_eq "keycloak configure: existing realm re-linked by entryUUID, username / RDN kept" \
+  "$(printf '%s' '{"config":{"uuidLDAPAttribute":["uid"],"usernameLDAPAttribute":["uid"],"rdnLDAPAttribute":["uid"]}}' | LLDAP_PASS=pw _kc_ldap_patch dc=ex,dc=org | jq -c '.config | [.uuidLDAPAttribute, .usernameLDAPAttribute, .rdnLDAPAttribute]')" \
+  '[["entryUUID"],["uid"],["uid"]]'
 GM='{"id":"g","providerId":"group-ldap-mapper","config":{"groups.dn":["ou=groups,dc=old"],"drop.non.existing.groups.during.sync":["false"],"group.name.ldap.attribute":["cn"]}}'
 G1="$(printf '%s' "$GM" | _kc_group_mapper_patch dc=ex,dc=org)"
 expect_eq "keycloak configure: group mapper patched" "$(printf '%s' "$G1" | jq -c '.config | [.["groups.dn"], .["drop.non.existing.groups.during.sync"], .mode, .["group.name.ldap.attribute"]]')" \
@@ -662,6 +921,73 @@ dom domains_prepare >/dev/null 2>&1
 expect_eq "domains: re-run keeps the CA and age key (no keygen)" "$(openssl x509 -noout -serial -in "$E/ca.crt") $(grep -c keygen "$STUB_DIR/dom-calls")" "$CA1 0"
 expect_eq "domains: public IPs exported for compose" "$(dom eval 'domains_public_ips; echo "$PORTCULLIS_PUBLIC_IPV4/$PORTCULLIS_PUBLIC_IPV6"')" "203.0.113.9/"
 
+# ── mcp-gate files (scripts/lib/mcpgate.sh, contract §15 "Service, networks and secrets") ──
+# shellcheck source=../scripts/lib/mcpgate.sh
+source "$HERE/../scripts/lib/mcpgate.sh"
+MR="$WORK/mcproot"; mkdir -p "$MR/secrets"
+mkdir -p "$WORK/mcpbin"
+cat > "$WORK/mcpbin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/mcp-calls"
+case "$*" in
+  *" keygen") printf '# created: 2026-11-05T10:00:00Z\n# public key: age1mcpgatetestrecipientqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\nAGE-SECRET-KEY-1MCPGATETESTQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ\n' ;;
+esac
+exit 0
+STUB
+chmod +x "$WORK/mcpbin/docker"
+mcp() { (set -euo pipefail; PATH="$WORK/mcpbin:$PATH" PORTCULLIS_ROOT="$MR" "$@"); }
+: > "$STUB_DIR/mcp-calls"
+MOUT="$(mcp mcpgate_ensure_secrets 2>&1)"; expect_eq "mcpgate_ensure_secrets succeeds" "$?" 0
+M="$MR/secrets/mcp-gate"
+expect_ok "mcp-gate: age key generated by the mcp-gate image (offline)" grep -q '^AGE-SECRET-KEY-1' "$M/age.key"
+expect_ok "mcp-gate: keygen ran without network, read-only, as 10005" \
+  grep -q -- 'run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --user 10005:10005 portcullis-mcp-gate keygen' "$STUB_DIR/mcp-calls"
+expect_eq "mcp-gate: age.pub = the key's recipient" "$(cat "$M/age.pub")" "age1mcpgatetestrecipientqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+expect_ok "mcp-gate: hub-secret is 48 random [A-Za-z0-9]" grep -Eqx '[A-Za-z0-9]{48}' "$M/hub-secret"
+expect_eq "mcp-gate: secrets/mcp-gate 0700" "$(file_mode "$M")" 700
+expect_eq "mcp-gate: age.key 0640" "$(file_mode "$M/age.key")" 640
+expect_eq "mcp-gate: age.pub 0640" "$(file_mode "$M/age.pub")" 640
+expect_eq "mcp-gate: hub-secret 0640" "$(file_mode "$M/hub-secret")" 640
+# Groups go through the helper container (the stub): key → 10005, pub + secret → 10001.
+expect_ok "mcp-gate: age.key group 10005 (the gate only)" grep -qE "src=$M/age.key,dst=/t/0 .* chown $(id -u):10005 /t/0\$" "$STUB_DIR/mcp-calls"
+expect_ok "mcp-gate: age.pub + hub-secret group 10001 (Hub; the gate through group_add)" \
+  grep -qE "src=$M/age.pub,dst=/t/0 --mount type=bind,src=$M/hub-secret,dst=/t/1 .* chown $(id -u):10001 /t/0 /t/1\$" "$STUB_DIR/mcp-calls"
+expect_fail "mcp-gate: age.key never gets group 10001" grep -qE "src=$M/age.key,.* chown $(id -u):10001 " "$STUB_DIR/mcp-calls"
+SECRET_NOW="$(cat "$M/hub-secret")"; KEY_NOW="$(grep '^AGE-SECRET-KEY-1' "$M/age.key")"
+case "$MOUT" in *"$SECRET_NOW"*|*"$KEY_NOW"*|*AGE-SECRET-KEY*) t_fail "mcp-gate: a secret was printed" ;; *) t_pass "mcp-gate: no secret printed" ;; esac
+: > "$STUB_DIR/mcp-calls"
+MOUT="$(mcp mcpgate_ensure_secrets 2>&1)"
+expect_eq "mcp-gate: re-run keeps the key, recipient and secret (no keygen)" \
+  "$(cat "$M/hub-secret") $(grep '^AGE-SECRET-KEY-1' "$M/age.key") $(cat "$M/age.pub") $(grep -c keygen "$STUB_DIR/mcp-calls")" \
+  "$SECRET_NOW $KEY_NOW age1mcpgatetestrecipientqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq 0"
+case "$MOUT" in *"$SECRET_NOW"*|*AGE-SECRET-KEY*) t_fail "mcp-gate: a secret was printed on re-run" ;; *) t_pass "mcp-gate: no secret printed on re-run" ;; esac
+# A lost or stale recipient is rewritten from the key; a short secret is replaced.
+rm -f "$M/age.pub"; printf 'short' > "$M/hub-secret"
+mcp mcpgate_ensure_secrets >/dev/null 2>&1
+expect_eq "mcp-gate: missing age.pub rebuilt from age.key" "$(cat "$M/age.pub")" "age1mcpgatetestrecipientqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+expect_ok "mcp-gate: a hub-secret under 32 characters is regenerated" grep -Eqx '[A-Za-z0-9]{48}' "$M/hub-secret"
+echo 'age1stale' > "$M/age.pub"
+mcp mcpgate_ensure_secrets >/dev/null 2>&1
+expect_eq "mcp-gate: stale age.pub rewritten" "$(cat "$M/age.pub")" "age1mcpgatetestrecipientqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
+# A key without its recipient line: refuse (never guess, never regenerate over it).
+printf 'AGE-SECRET-KEY-1XYZ\n' > "$M/age.key"
+expect_fail "mcp-gate: an age.key without '# public key:' fails" mcp mcpgate_ensure_secrets
+expect_eq "mcp-gate: ... and is kept" "$(cat "$M/age.key")" "AGE-SECRET-KEY-1XYZ"
+case "$(mcp mcpgate_ensure_secrets 2>&1)" in
+  *"never re-keys them"*"every AI resource would answer 503"*) t_pass "mcp-gate: the missing-recipient message says the gate refuses, not that the Hub re-mints" ;;
+  *) t_fail "mcp-gate: missing-recipient message" ;;
+esac
+# A lost key with a recipient left from it: regenerated, with the warning
+# that every AI resource answers 503 (docs review M4).
+rm -f "$M/age.key"
+MOUT="$(mcp mcpgate_ensure_secrets 2>&1)"
+case "$MOUT" in
+  *"was missing and has been regenerated"*"every AI resource answers 503"*"switch each app_token AI companion off and on"*) t_pass "mcp-gate: a regenerated key over an old recipient warns" ;;
+  *) t_fail "mcp-gate: regenerated key warning: $MOUT" ;;
+esac
+case "$MOUT" in *"mints new"*) t_fail "mcp-gate: says the Hub mints new credentials" ;; *) t_pass "mcp-gate: never claims the Hub re-mints" ;; esac
+expect_eq "mcp-gate: data volume owner = gate uid, Hub group" "$CT_UID_MCP_GATE:$CT_UID_HUB" "10005:10001"
+
 # ── public address detection (network.sh public_ip_detect; dns setup + domains) ──
 mkdir -p "$WORK/ipbin" "$STUB_DIR/ip"
 cat > "$WORK/ipbin/curl" <<'STUB'
@@ -744,6 +1070,10 @@ if echo "$BACKUP_FILE_VOLUMES" | grep -q hub_secrets; then
 else
   t_pass "backup: hub_secrets is excluded from backups"
 fi
+case " $BACKUP_FILE_VOLUMES " in
+  *" mcp_gate_data:10005:10001 "*) t_pass "backup: mcp_gate_data (access log) archived as the gate's uid, Hub group" ;;
+  *) t_fail "backup: mcp_gate_data missing from BACKUP_FILE_VOLUMES ($BACKUP_FILE_VOLUMES)" ;;
+esac
 # The MANIFEST of a backup must never list hub_secrets as a file.
 expect_ok "backup: BACKUP_FILE_VOLUMES does not contain hub_secrets" bash -c '! echo "$BACKUP_FILE_VOLUMES" | grep -q hub_secrets'
 

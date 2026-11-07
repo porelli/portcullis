@@ -293,7 +293,7 @@ def main() -> int:
         text = "\n".join(lines)
         print("    " + "\n    ".join(lines), flush=True)
         assert pl.get("gid") == GID, pl.get("gid")
-        assert f"gid {GID} is allocated for this folder (shown as *Media*)." in lines, text
+        assert f'gid {GID} is allocated for this folder (shown as "Media").' in lines, text
         assert f"Group 1000 keeps the access it has now through an ACL on {N_FILES + N_DIRS} entries." in lines, text
         assert f"{N_FILES} files and {N_DIRS} folders change group 1000 → {GID}." in lines, text
         assert sorted(pl.get("restarts") or []) == [WRITER, JELLYFIN], pl.get("restarts")

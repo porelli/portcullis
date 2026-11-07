@@ -518,6 +518,10 @@ class PolicyV5Test(GateTest):
         for sub in gg.CORE_SUBDOMAINS:
             self.assertIn(f"{sub}.example.com", gate)
         self.assertEqual(gate["people.example.com"], "*")
+        # mcp.<domain> (AI support, contract §4/§5): a core host, map entry
+        # `*`; its router has no forward-auth (mcp-gate authorizes).
+        self.assertIn("mcp", gg.CORE_SUBDOMAINS)
+        self.assertEqual(gate["mcp.example.com"], "*")
         self.assertEqual(gate["grafana.example.com"], "users_grafana")
         self.assertEqual(gate["example.com"], "lldap_admin")
         self.assertNotIn("grafana", gate)
