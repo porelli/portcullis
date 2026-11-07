@@ -1,0 +1,26 @@
+services:
+  # The image only has to be big: the CI test stops the enable while it is
+  # still being pulled, so the container is never created. Pinned like
+  # every image (the templates repo's gitlab uses the same one).
+  app:
+    image: gitlab/gitlab-ce:19.5.3-ce.0@sha256:6863d156a1a477bd6f69fc674b671d0163cd8b06bf63bb17cc4a4a803b78b27c
+    environment:
+      SLOWPULL_OIDC_SECRET: ${SLOWPULL_OIDC_SECRET:?SLOWPULL_OIDC_SECRET must be set}
+    networks: [default, portcullis-proxy]
+    volumes:
+      - data:/var/opt/gitlab
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.slowpull.rule: Host(`${PORTCULLIS_HOST_SLOWPULL:-slowpull.portcullis.local}`)
+      traefik.http.routers.slowpull.entrypoints: websecure
+      traefik.http.routers.slowpull.tls.options: authaware@file
+      traefik.http.routers.slowpull.middlewares: client-headers@file,security-headers@file
+      traefik.http.services.slowpull.loadbalancer.server.port: "80"
+    security_opt: ["no-new-privileges:true"]
+
+volumes:
+  data: {}
+
+networks:
+  portcullis-proxy:
+    external: true

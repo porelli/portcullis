@@ -83,6 +83,7 @@ from playwright.sync_api import Page, sync_playwright
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_login as base  # noqa: E402  (Authenticator, passkey_flow, shot)
+import e2e_ops  # noqa: E402  (the op record poll, contract §11.7)
 
 DOMAIN = os.environ["E2E_DOMAIN"]
 ART = os.environ.get("E2E_ARTIFACTS", "e2e-artifacts")
@@ -169,6 +170,18 @@ def hub_ok(method: str, path: str, body=None, want=(200,), timeout: float = 600)
     code, out = hub(method, path, body, timeout)
     assert code in want, f"{method} {path}: HTTP {code}: {out[:600]}"
     return json.loads(out) if out.strip() else {}
+
+
+def hub_get(path: str):
+    code, out = hub("GET", path)
+    return json.loads(out) if code == 200 and out.strip() else out
+
+
+def run_op(method: str, path: str, body, op: str, instance: str, timeout: float) -> dict:
+    """A lifecycle route's 202 (e2e_ops): the record polled until it ended,
+    which must be ok."""
+    acc = e2e_ops.accepted(hub_ok(method, path, body, want=(202,)), op, instance)
+    return e2e_ops.wait_ok(hub_get, acc, timeout)
 
 
 def member(op: str, group: str, user: str) -> None:
@@ -476,19 +489,17 @@ def main() -> int:
         until("the Hub loaded gitea, grafana and echo",
               lambda: {"gitea", "grafana", "echo"} <= {t.get("id") for t in json.loads(hub("GET", "/api/templates")[1])}, 90)
         # Never enabled: only deleted again, through the admin MCP (scenario 5).
-        hub_ok("POST", "/api/instances", {"template": "echo", "id": ECHO_DEL, "hosts": {"echo": f"{ECHO_DEL}.{DOMAIN}"}},
-               want=(201,))
-        hub_ok("POST", "/api/instances", {"template": "echo", "id": ECHO_ELICIT, "hosts": {"echo": f"{ECHO_ELICIT}.{DOMAIN}"}},
-               want=(201,))
-        hub_ok("POST", "/api/instances", {"template": "gitea", "id": "gitea-b", "hosts": {"gitea": f"gitea-b.{DOMAIN}"}},
-               want=(201,))
+        for tmpl, inst in (("echo", ECHO_DEL), ("echo", ECHO_ELICIT), ("gitea", "gitea-b")):
+            run_op("POST", "/api/instances", {"template": tmpl, "id": inst, "hosts": {tmpl: f"{inst}.{DOMAIN}"}},
+                   "create", inst, 300)
         # One host port per instance: gitea keeps 2222 (Git over SSH is off
         # anyway), gitea-b none (the port's description says so).
         hub_ok("PUT", "/api/instances/gitea-b/settings", {"ports": {"GITEA_SSH_PORT": ""}})
         for inst in ("gitea", "gitea-b", "grafana"):
             t0 = time.time()
-            out = hub_ok("POST", "/api/templates/enable", {"id": inst}, timeout=1500)
-            print(f"    enabled {inst} in {time.time() - t0:.0f} s: {json.dumps({k: out.get(k) for k in ('groups_created', 'warnings')})}",
+            out = run_op("POST", "/api/templates/enable", {"id": inst}, "enable", inst, 1500)
+            print(f"    enabled {inst} in {time.time() - t0:.0f} s: "
+                  f"{json.dumps({'groups_created': (out.get('result') or {}).get('groups_created'), 'warnings': out.get('warnings')})}",
                   flush=True)
         for m in ("alice:users_gitea", "alice:users_gitea-b", "bob:users_gitea", "carol:users_gitea", "carol:users_grafana"):
             u, g = m.split(":")
@@ -580,9 +591,11 @@ def main() -> int:
             assert v.get("enabled") is True and v.get("gate_present") is True, f"AI settings: {json.dumps(v)[:600]}"
             for inst, comp, mode in (("gitea", "gitea", "read_write"), ("gitea-b", "gitea", "read_write"),
                                      ("grafana", "grafana", "read_only")):
-                r = hub_ok("PUT", f"/api/instances/{inst}/ai",
-                           {"companions": {comp: {"enabled": True, "mode": mode}}}, timeout=900)
-                print(f"    {inst}: {json.dumps({'restarts': r.get('restarts'), 'warnings': r.get('warnings')})}", flush=True)
+                # An enabled instance: the switch runs in the background (202).
+                r = run_op("PUT", f"/api/instances/{inst}/ai",
+                           {"companions": {comp: {"enabled": True, "mode": mode}}}, "ai", inst, 900)
+                print(f"    {inst}: {json.dumps({'steps': [(x.get('key'), x.get('state')) for x in r.get('steps') or []], 'warnings': r.get('warnings')})}",
+                      flush=True)
 
                 def companion_on():
                     c = hub_ok("GET", f"/api/instances/{inst}/ai")["companions"][0]

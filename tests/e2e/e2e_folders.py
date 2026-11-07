@@ -63,6 +63,9 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import e2e_ops  # noqa: E402  (the op record poll, contract §11.7)
+
 HUB_API = f"http://{os.environ['HUB_IP']}:8888"
 SECRET = os.environ["E2E_HUB_SECRET"]
 MEDIA = os.environ.get("E2E_MEDIA", "/srv/e2e-media")
@@ -142,18 +145,17 @@ def hub_ok(method: str, path: str, body=None, want: int = 200, timeout: float = 
     return out
 
 
-def run_op(method: str, path: str, body) -> dict:
-    """A 202 operation, polled at its `poll` until its record (same op_id)
-    is no longer running; the record must be ok."""
-    acc = hub_ok(method, path, body, want=202)
-    op_id, poll = acc.get("op_id"), acc.get("poll")
-    assert op_id and poll, f"202 without op_id / poll: {acc}"
-    rec = until(f"{acc.get('op')} {op_id} finished",
-                lambda: (r := hub("GET", poll)[1]) and isinstance(r, dict) and r.get("op_id") == op_id
-                and not r.get("running") and r, OP_S, every=2)
-    save(f"op-{acc.get('op')}-{op_id}.json", rec)
-    assert rec.get("ok") is True, f"{acc.get('op')}: {json.dumps(rec)[:1500]}"
-    return rec
+def hub_get(path: str):
+    return hub("GET", path)[1]
+
+
+def run_op(method: str, path: str, body, timeout: float = OP_S) -> dict:
+    """A 202 operation, polled at its `poll` (e2e_ops) until its record
+    (same op_id) is no longer running; the record must be ok."""
+    acc = e2e_ops.accepted(hub_ok(method, path, body, want=202))
+    rec = e2e_ops.wait(hub_get, acc, timeout)
+    save(f"op-{acc.get('op')}-{acc['op_id']}.json", rec)
+    return e2e_ops.check_ok(acc, rec)
 
 
 def doctor() -> dict:
@@ -251,7 +253,7 @@ def main() -> int:
     def enable():
         for inst in (JELLYFIN, WRITER):
             t0 = time.time()
-            out = hub_ok("POST", "/api/templates/enable", {"id": inst}, timeout=1500)
+            out = run_op("POST", "/api/templates/enable", {"id": inst}, timeout=1500)
             print(f"    enabled {inst} in {time.time() - t0:.0f} s: {json.dumps(out.get('warnings'))[:300]}", flush=True)
         container(JELLYFIN, "jellyfin")
         w = container(WRITER, "app")

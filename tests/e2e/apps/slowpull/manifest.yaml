@@ -1,0 +1,39 @@
+# CI-only template for e2e-instances' stop_enable_mid_pull (.github/workflows/ci.yml):
+# its image is large (GitLab CE, ~1.5 GB compressed) and never on the runner
+# beforehand, so an enable is still on its `images` step when the test
+# presses Stop. Native OIDC, so the enable registers a Keycloak client and
+# creates its groups before the pull: the Stop must remove both again. It
+# never runs. Not a marketplace template: the job hands it to the Hub as a
+# local source next to echo.
+name: Slow pull
+description: A large image, stopped while it downloads (CI)
+category: misc
+instances: single
+
+auth:
+  method: native-oidc
+  sso: true
+  group_access: true
+  group_admin: true
+  keycloak_access_role: true
+  access_group: users_slowpull
+  admin_group: admin_slowpull
+
+env:
+  - key: SLOWPULL_OIDC_SECRET
+    description: Sign-in client secret (unused, the app never starts)
+    generate: random
+
+keycloak_clients:
+  - client_id: slowpull
+    secret_env: SLOWPULL_OIDC_SECRET
+    redirect_uri: "https://{{HOST_SLOWPULL}}/oauth/callback"
+    name: Slow pull
+
+urls:
+  - label: Slow pull
+    url: "https://{{HOST_SLOWPULL}}"
+
+# AI support (contract §3.2, required in every manifest): a CI fixture.
+ai:
+  unsupported: "A CI test fixture that never runs"

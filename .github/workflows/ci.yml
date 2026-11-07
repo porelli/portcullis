@@ -58,7 +58,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: shellcheck
-        run: shellcheck -S warning portcullis scripts/lib/*.sh tests/*.sh vault/entrypoint.sh .github/automerge/*.sh
+        run: shellcheck -S warning portcullis scripts/lib/*.sh tests/*.sh tests/e2e/*.sh vault/entrypoint.sh .github/automerge/*.sh
       - name: Dependabot auto-merge tests (fake gh + fixtures)
         run: bash .github/automerge/test.sh
       - name: realm export fits Keycloak's columns
@@ -2653,12 +2653,13 @@ jobs:
           ./portcullis pki setup --with-server-cert
           ./portcullis config apply --bundle-only
           printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
-          # The Hub's only template source: the CI echo template as a local
-          # source (a source with a path and no URL is never pulled; with a
-          # source present the Hub doesn't clone the marketplace).
+          # The Hub's only template source: the CI templates echo and
+          # slowpull (stop_enable_mid_pull) as a local source (a source with
+          # a path and no URL is never pulled; with a source present the Hub
+          # doesn't clone the marketplace).
           docker volume create --label com.docker.compose.project=portcullis --label com.docker.compose.volume=hub_data portcullis_hub_data >/dev/null
           docker run --rm -v portcullis_hub_data:/data -v "$PWD/tests/e2e/apps:/src:ro" "$ALPINE" sh -c '
-            mkdir -p /data/repos/ci && cp -r /src/echo /data/repos/ci/ &&
+            mkdir -p /data/repos/ci && cp -r /src/echo /src/slowpull /data/repos/ci/ &&
             printf "sources:\n  - name: ci\n    url: \"\"\n    path: /data/repos/ci\n" > /data/state.yaml &&
             chown -R 10001:10001 /data && chmod 600 /data/state.yaml'
           # Keycloak's first start (realm import) outlasts compose's health
@@ -2694,6 +2695,8 @@ jobs:
                   curl -s -X "$m" -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") \
                     -H 'Content-Type: application/json' "$@" "http://$HUB_IP:8888$p"; }
           hubc() { hub "$@" -o /tmp/hub.out -w '%{http_code}'; }
+          # hubop: a lifecycle route's 202, then its op record until done.
+          source tests/e2e/hubop.sh
           for i in $(seq 1 30); do
             hub GET /api/templates | jq -e 'any(.[]; .id == "echo")' >/dev/null 2>&1 && break
             [ "$i" -eq 30 ] && { echo "FAIL: the Hub did not load the CI template: $(hub GET /api/templates | head -c 400)"; docker compose logs --tail=40 hub; exit 1; }
@@ -2721,8 +2724,8 @@ jobs:
           # Instances: echo-a and echo-c on the extra domain, echo-b on the main one.
           for spec in "echo-a echo-a.$E2E_EXTRA" "echo-b echo-b.$E2E_DOMAIN" "echo-c echo-c.$E2E_EXTRA"; do
             read -r id host <<<"$spec"
-            code=$(hubc POST /api/instances -d "$(jq -cn --arg id "$id" --arg h "$host" '{template: "echo", id: $id, hosts: {echo: $h}}')")
-            [ "$code" = 201 ] || { echo "FAIL: create $id: $code $(cat /tmp/hub.out)"; exit 1; }
+            hubop POST /api/instances -d "$(jq -cn --arg id "$id" --arg h "$host" '{template: "echo", id: $id, hosts: {echo: $h}}')" \
+              || { echo "FAIL: create $id"; exit 1; }
           done
           # A host on a domain that isn't enrolled is refused.
           code=$(hubc POST /api/instances -d '{"template":"echo","id":"echo-x","hosts":{"echo":"echo-x.not-enrolled.test"}}')
@@ -2753,8 +2756,7 @@ jobs:
           done
 
           for id in echo-a echo-b echo-c; do
-            code=$(hubc POST /api/templates/enable -d "{\"id\":\"$id\"}")
-            [ "$code" = 200 ] || { echo "FAIL: enable $id: $code $(cat /tmp/hub.out)"; docker compose logs --tail=30 hub; exit 1; }
+            hubop POST /api/templates/enable -d "{\"id\":\"$id\"}" || { echo "FAIL: enable $id"; exit 1; }
           done
 
           # What the Hub published: policy v5 keyed by hostname, the extra domain.
@@ -2861,19 +2863,7 @@ jobs:
                     -H 'Content-Type: application/json' "$@" "http://$HUB_IP:8888$p"; }
           hubc() { hub "$@" -o /tmp/hub.out -w '%{http_code}'; }
           # Long operations: 202 {op_id, poll}, then the op record until done (→ /tmp/op.json).
-          hubop() {
-            local code opid poll
-            code=$(hubc "$@")
-            [ "$code" = 202 ] || { echo "FAIL: $1 $2: $code $(cat /tmp/hub.out)"; docker compose logs --tail=30 hub; return 1; }
-            opid="$(jq -r .op_id /tmp/hub.out)"; poll="$(jq -r .poll /tmp/hub.out)"
-            for _ in $(seq 1 200); do
-              hub GET "$poll" > /tmp/op.json
-              jq -e --arg o "$opid" '.op_id == $o and (.running | not)' /tmp/op.json >/dev/null && break
-              sleep 3
-            done
-            jq -e --arg o "$opid" '.op_id == $o and .ok == true' /tmp/op.json >/dev/null \
-              || { echo "FAIL: $1 $2: $(cat /tmp/op.json)"; docker compose logs --tail=30 hub; return 1; }
-          }
+          source tests/e2e/hubop.sh
           # Data with owners and modes the restore must keep: a file 4242:4343
           # 0640 and the volume root 1234:5678 0751.
           docker run --rm -v portcullis_echo-a-data:/d "$ALPINE" sh -c \
@@ -2920,11 +2910,107 @@ jobs:
             || { echo "FAIL: restored volume labels"; exit 1; }
           hub GET /api/instances | jq -e 'any(.[]; .id == "echo-r" and .template == "echo" and .state == "created")' >/dev/null \
             || { echo "FAIL: echo-r: $(hub GET /api/instances)"; exit 1; }
-          code=$(hubc POST /api/templates/enable -d '{"id":"echo-r"}')
-          [ "$code" = 200 ] || { echo "FAIL: enable echo-r: $code $(cat /tmp/hub.out)"; exit 1; }
+          hubop POST /api/templates/enable -d '{"id":"echo-r"}' || { echo "FAIL: enable echo-r"; exit 1; }
           docker exec "$(docker ps -q --filter label=com.docker.compose.project=portcullis-echo-r --filter label=com.docker.compose.service=hold)" cat /proc/1/status >/dev/null
           [ "$(meta portcullis_echo-r-data)" = "$WANT" ] || { echo "FAIL: the running instance changed its data"; exit 1; }
           echo "PASS: restore into a new id: owners ($WANT) and the volume root's owner / mode kept, labelled for the new project, enables"
+
+      # stop_enable_mid_pull (contract §11.7 "Stop"): an enable of the CI
+      # template slowpull (native OIDC; GitLab CE's ~1.5 GB image, never on
+      # the runner: the cached image list takes only alpine / busybox /
+      # whoami / curl) is stopped while its `images` step downloads. The
+      # record ends stopped, and the Stop's undo removed what the enable
+      # made: no containers or volumes, no Keycloak client, no groups; the
+      # instance is disabled again and the Stop is audited.
+      - name: Stop an enable mid-download (stop_enable_mid_pull)
+        run: |
+          set -o pipefail
+          SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
+          hub() { local m="$1" p="$2"; shift 2
+                  curl -s -X "$m" -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") \
+                    -H 'Content-Type: application/json' "$@" "http://$HUB_IP:8888$p"; }
+          hubc() { hub "$@" -o /tmp/hub.out -w '%{http_code}'; }
+          source tests/e2e/hubop.sh
+          ID=slowpull PROJECT=portcullis-slowpull
+          IMG="$(sed -n 's/^ *image: //p' tests/e2e/apps/slowpull/compose.yml)"
+          KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+            --data-urlencode client_id=admin-cli --data-urlencode "username=$KEYCLOAK_ADMIN" \
+            --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          [ -z "$KC_TOKEN" ] || [ "$KC_TOKEN" = null ] || echo "::add-mask::$KC_TOKEN"
+          kc_clients() { curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") \
+                           "http://127.0.0.1:8080/admin/realms/portcullis/clients?clientId=$1" | jq length; }
+          LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
+            | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          [ -z "$LLDAP_TOKEN" ] || [ "$LLDAP_TOKEN" = null ] || echo "::add-mask::$LLDAP_TOKEN"
+          lldap_groups() { jq -n '{query: "{ groups { displayName } }"}' | curl -sf http://127.0.0.1:17170/api/graphql \
+                             -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @- \
+                             | jq -c '[.data.groups[].displayName]'; }
+
+          # Before: the template is loaded, the instance disabled, the image
+          # absent (else the pull is instant and the test vacuous).
+          hub GET /api/instances | jq -e --arg id "$ID" 'any(.[]; .id == $id and .state == "disabled")' >/dev/null \
+            || { echo "FAIL: $ID is not a disabled instance: $(hub GET /api/instances | jq -c '[.[] | {id, state}]')"; exit 1; }
+          if docker image inspect "$IMG" >/dev/null 2>&1; then echo "FAIL: $IMG is already on the runner"; exit 1; fi
+          [ "$(kc_clients "$ID")" = 0 ] || { echo "FAIL: a Keycloak client $ID exists before the enable"; exit 1; }
+
+          # The enable, until its images step runs; then Stop.
+          hubop_start POST /api/templates/enable -d "{\"id\":\"$ID\"}"
+          jq -e --arg id "$ID" '.op == "enable" and .instance == $id' /tmp/hub.out >/dev/null || { echo "FAIL: 202 body $(cat /tmp/hub.out)"; exit 1; }
+          t0=$SECONDS
+          for i in $(seq 1 600); do
+            hub GET "$HUBOP_POLL" > /tmp/op.json || true
+            jq -e --arg o "$HUBOP_ID" '.op_id == $o and any(.steps[]?; .key == "images" and .state == "running")' /tmp/op.json >/dev/null 2>&1 && break
+            if jq -e --arg o "$HUBOP_ID" '.op_id == $o and (.running | not)' /tmp/op.json >/dev/null 2>&1; then
+              echo "FAIL: the enable ended before its images step ran:"; hubop_explain; exit 1
+            fi
+            [ "$i" = 600 ] && { echo "FAIL: images not running after 300 s:"; hubop_explain; exit 1; }
+            sleep 0.5
+          done
+          echo "images running after $((SECONDS - t0)) s: $(jq -c '{stoppable, created, images: [.steps[] | select(.key == "images")][0]}' /tmp/op.json)"
+          code=$(hubc POST "/api/instances/$ID/op/stop" -d '{}')
+          [ "$code" = 202 ] || { echo "FAIL: Stop: HTTP $code $(head -c 1500 /tmp/hub.out)"; exit 1; }
+          jq -e --arg o "$HUBOP_ID" '.op_id == $o and .stopping == true' /tmp/hub.out >/dev/null \
+            || { echo "FAIL: the Stop's answer is not the stopping record: $(head -c 1500 /tmp/hub.out)"; exit 1; }
+          echo "Stop accepted $((SECONDS - t0)) s after the enable"
+          # Still downloading when the Stop was accepted (not a vacuous Stop).
+          if docker image inspect "$IMG" >/dev/null 2>&1; then echo "FAIL: $IMG finished downloading before the Stop"; exit 1; fi
+
+          # The record ends stopped: not running, not ok, no error, stopped_by.
+          hubop_end "$HUBOP_POLL" "$HUBOP_ID" 300 || exit 1
+          cp /tmp/op.json /tmp/op-stopped.json
+          jq -e '.op == "enable" and .ok == false and (.error // "") == "" and .stopped_by == "admin" and .stopped_at != null' /tmp/op.json >/dev/null \
+            || { echo "FAIL: the record didn't end stopped:"; hubop_explain; exit 1; }
+          echo "stopped after $((SECONDS - t0)) s: $(jq -c '{created, steps: [.steps[] | {key, state}]}' /tmp/op.json)"
+
+          # Nothing the enable made is left.
+          left="$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT")"
+          [ -z "$left" ] || { echo "FAIL: containers of $PROJECT left: $(docker ps -a --filter "label=com.docker.compose.project=$PROJECT")"; exit 1; }
+          for v in $(jq -r '.created.volumes[]?' /tmp/op.json); do
+            if docker volume inspect "$v" >/dev/null 2>&1; then echo "FAIL: volume $v (created by the enable) left"; exit 1; fi
+          done
+          vols="$(docker volume ls -q --filter "label=com.docker.compose.project=$PROJECT")"
+          [ -z "$vols" ] || { echo "FAIL: volumes of $PROJECT left: $vols"; exit 1; }
+          jq -e --arg id "$ID" '.created.keycloak_clients | index($id) != null' /tmp/op.json >/dev/null \
+            || { echo "FAIL: the enable's ledger has no Keycloak client $ID (stopped too early?): $(jq -c .created /tmp/op.json)"; exit 1; }
+          for c in $(jq -r '.created.keycloak_clients[]?' /tmp/op.json); do
+            [ "$(kc_clients "$c")" = 0 ] || { echo "FAIL: Keycloak client $c (created by the enable) left"; exit 1; }
+          done
+          jq -e '.created.groups | length > 0' /tmp/op.json >/dev/null \
+            || { echo "FAIL: the enable's ledger has no groups: $(jq -c .created /tmp/op.json)"; exit 1; }
+          GROUPS_NOW="$(lldap_groups)"
+          [ -n "$GROUPS_NOW" ] || { echo "FAIL: LLDAP groups unreadable"; exit 1; }
+          for g in $(jq -r '.created.groups[]?' /tmp/op.json); do
+            echo "$GROUPS_NOW" | jq -e --arg g "$g" 'index($g) == null' >/dev/null || { echo "FAIL: group $g (created by the enable) left in LLDAP"; exit 1; }
+          done
+          hub GET /api/instances | jq -e --arg id "$ID" 'any(.[]; .id == $id and .state == "disabled")' >/dev/null \
+            || { echo "FAIL: $ID after the Stop: $(hub GET /api/instances | jq -c --arg id "$ID" '.[] | select(.id == $id)')"; exit 1; }
+          hub GET /api/directory/audit | jq -e --arg id "$ID" 'any(.[]; .action == "enable.stop" and .result == "ok" and .actor == "admin"
+              and ((.target // "") | split("/")[0]) == $id)' >/dev/null \
+            || { echo "FAIL: no enable.stop in the audit: $(hub GET /api/directory/audit | jq -c --arg id "$ID" '[.[] | select((.target // "") | startswith($id))]')"; exit 1; }
+          echo "PASS: stop_enable_mid_pull: the enable stopped during images; no containers, volumes, Keycloak client $(jq -c .created.keycloak_clients /tmp/op.json) or groups $(jq -c .created.groups /tmp/op.json) left; $ID disabled; enable.stop audited"
+
+          # Cleanup: no half-pulled image (a later run must pull it again).
+          docker image rm -f "$IMG" "${IMG%@*}" >/dev/null 2>&1 || true
 
       - name: Collect logs
         if: failure()
@@ -2935,7 +3021,7 @@ jobs:
           for svc in traefik keycloak forward-auth forward-auth-ext group-gate lldap hub domains pebble socket-proxy-hub; do
             docker compose logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
           done
-          docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'cat /d/group-gate-policy.json; ls -la /d /d/overrides; cat /d/overrides/*.yml' > e2e-artifacts/hub-data.txt 2>&1 || true
+          docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'cat /d/group-gate-policy.json; ls -la /d /d/overrides /d/ops; cat /d/overrides/*.yml /d/ops/*.json' > e2e-artifacts/hub-data.txt 2>&1 || true
 
       - name: Upload screenshots, traces and logs
         if: failure()
@@ -2948,7 +3034,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          for p in $(docker ps -aq --filter label=com.docker.compose.project | xargs -r docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' | sort -u | grep '^portcullis-echo-'); do
+          for p in $(docker ps -aq --filter label=com.docker.compose.project | xargs -r docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' | sort -u | grep -E '^portcullis-(echo-|slowpull$)'); do
             docker compose -p "$p" down -v 2>/dev/null || true
           done
           docker compose down -v
@@ -3171,6 +3257,8 @@ jobs:
                   curl -s -X "$m" -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") \
                     -H 'Content-Type: application/json' "$@" "http://$HUB_IP:8888$p"; }
           hubc() { hub "$@" -o /tmp/hub.out -w '%{http_code}'; }
+          # hubop: a lifecycle route's 202, then its op record until done.
+          source tests/e2e/hubop.sh
           want() { local code="$1" what="$2"; shift 2
                    [ "$code" = 200 ] || { echo "FAIL: $what: HTTP $code $(head -c 600 /tmp/hub.out)"; docker compose logs --tail=40 hub; exit 1; }; }
           TEMPLATES="immich grafana nextcloud firefox-sync settings-echo settings-file"
@@ -3194,9 +3282,8 @@ jobs:
           # Enable every default instance (EnableAs creates users_<id> / admin_<id>).
           for id in grafana settings-echo settings-file firefox-sync immich nextcloud; do
             t0=$SECONDS
-            code=$(hubc POST /api/templates/enable --max-time 1500 -d "{\"id\":\"$id\"}")
-            want "$code" "enable $id"
-            echo "enabled $id in $((SECONDS - t0)) s: $(jq -c '{groups_created, warnings}' /tmp/hub.out 2>/dev/null)"
+            HUBOP_TIMEOUT=1500 hubop POST /api/templates/enable -d "{\"id\":\"$id\"}" || { echo "FAIL: enable $id"; exit 1; }
+            echo "enabled $id in $((SECONDS - t0)) s: $(jq -c '{groups_created: .result.groups_created, warnings}' /tmp/op.json 2>/dev/null)"
           done
           # Groups the scenarios need that EnableAs may not create (P28:
           # admin_grafana; firefox-sync's access group with group_access off).

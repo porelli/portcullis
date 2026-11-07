@@ -97,6 +97,7 @@ from playwright.sync_api import Page, sync_playwright
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_login as base  # noqa: E402  (Authenticator, passkey_flow, shot)
+import e2e_ops  # noqa: E402  (the op record poll, contract §11.7)
 
 DOMAIN = os.environ["E2E_DOMAIN"]
 ART = os.environ.get("E2E_ARTIFACTS", "e2e-artifacts")
@@ -253,28 +254,46 @@ def hub_ok(method: str, path: str, body=None, want: int = 200, timeout: float = 
     return out
 
 
-def run_op(method: str, path: str, body) -> dict:
-    # A 409 "in progress" is the Hub's busy answer (another lifecycle
-    # operation holds the instance, e.g. a background restart): try again,
-    # as its message says.
-    deadline = time.time() + 300
-    while True:
+def hub_get(path: str):
+    return hub("GET", path)[1]
+
+
+def run_op(method: str, path: str, body, timeout: float = OP_S) -> dict:
+    """A 202 operation, polled at its `poll` (e2e_ops) until its record
+    (same op_id) is no longer running; the record must be ok.
+
+    A busy 409 whose record is a running `restart` is the Hub's own queued
+    restart (a membership or settings change restarts the app): that
+    restart must end ok, then the operation is sent once more. Any other
+    409 fails."""
+    code, out = hub(method, path, body)
+    inst = instance_of(path, body)
+    if code == 409 and inst and isinstance(out, dict) and out.get("op") == "restart" and out.get("running") \
+            and out.get("op_id"):
+        print(f"    {method} {path}: busy with the Hub's restart {out['op_id']}: waiting for it", flush=True)
+        busy = {"op": "restart", "op_id": out["op_id"], "instance": inst, "poll": f"/api/instances/{inst}/op"}
+        e2e_ops.wait_ok(hub_get, busy, timeout)
         code, out = hub(method, path, body)
-        if code == 409 and "in progress" in str(out) and time.time() < deadline:
-            print(f"    {method} {path}: busy ({scrub(str(out))[:120]}), retrying", flush=True)
-            time.sleep(5)
-            continue
-        break
     assert code == 202, f"{method} {path}: HTTP {code} (want 202): {scrub(str(out))[:800]}"
-    acc = out
-    op_id, poll = acc.get("op_id"), acc.get("poll")
-    assert op_id and poll, f"202 without op_id / poll: {acc}"
-    rec = until(f"{acc.get('op')} {op_id} finished",
-                lambda: (r := hub("GET", poll)[1]) and isinstance(r, dict) and r.get("op_id") == op_id
-                and not r.get("running") and r, OP_S, every=2)
-    save(f"op-{acc.get('op')}-{op_id}.json", rec)
-    assert rec.get("ok") is True, f"{acc.get('op')}: {scrub(json.dumps(rec))[:1500]}"
-    return rec
+    acc = e2e_ops.accepted(out)
+    rec = e2e_ops.wait(hub_get, acc, timeout)
+    save(f"op-{acc.get('op')}-{acc['op_id']}.json", rec)
+    try:
+        return e2e_ops.check_ok(acc, rec)
+    except AssertionError as e:
+        raise AssertionError(scrub(str(e))) from None
+
+
+def instance_of(path: str, body) -> str | None:
+    """The instance a lifecycle route acts on."""
+    parts = path.split("/")
+    if path.startswith("/api/instances/") and len(parts) > 3 and parts[3] != "restore":
+        return parts[3]
+    if path.startswith("/api/templates/restart/") and len(parts) > 4:
+        return parts[4]
+    if path in ("/api/templates/enable", "/api/templates/disable") and isinstance(body, dict):
+        return body.get("id")
+    return None
 
 
 def member(op: str, group: str, user: str) -> None:
@@ -696,7 +715,7 @@ def setup() -> None:
     assert f'"folder:{FOLDER}"' in panel, "share1_folder isn't folder:family after the assignment"
     for inst in (TM, SMB):
         t0 = time.time()
-        out = hub_ok("POST", "/api/templates/enable", {"id": inst}, timeout=1500)
+        out = run_op("POST", "/api/templates/enable", {"id": inst}, timeout=1500)
         print(f"    enabled {inst} in {time.time() - t0:.0f} s: {json.dumps(out.get('warnings'))[:300]}", flush=True)
     for inst in (TM, SMB):
         cid = until(f"{inst} running", lambda i=inst: app(i), 120)
@@ -988,7 +1007,7 @@ def main() -> int:
         voids = [e for e in audit() if e.get("action") == "credential.void_restore"]
         assert voids, "no credential.void_restore in the audit"
         # Started again by the admin, as the restore's message says.
-        hub_ok("POST", f"/api/templates/restart/{SMB}", {}, timeout=1500)
+        run_op("POST", f"/api/templates/restart/{SMB}", {}, timeout=1500)
         cid = until("samba running", lambda: app(SMB), 120)
         until("samba healthy", lambda: docker("inspect", "-f", "{{.State.Health.Status}}", cid).strip() == "healthy",
               180, every=5)
