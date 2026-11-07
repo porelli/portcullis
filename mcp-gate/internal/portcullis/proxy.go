@@ -51,7 +51,8 @@ const minSecretChars = 32
 const idleTimeout = 10 * time.Minute
 
 // requestHeaders are the client's headers that reach the Hub (§15.5's
-// list for upstreams, plus Mcp-Param-*). Everything else is dropped: the
+// list for upstreams; Mcp-Param-* only from the SDK client of the
+// aggregate's people path, never the client's). Everything else is dropped: the
 // person's token, cookies, every X-Forwarded-*, X-Auth-Request-*, Remote-*
 // and X-Portcullis-* header.
 var requestHeaders = []string{"Content-Type", "Accept", "Mcp-Protocol-Version", "Mcp-Method", "Mcp-Name", "Mcp-Session-Id"}
@@ -179,11 +180,8 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, d authz.Decision) in
 			out.Header[k] = append([]string(nil), v...)
 		}
 	}
-	for k, v := range r.Header {
-		if strings.HasPrefix(http.CanonicalHeaderKey(k), "Mcp-Param-") {
-			out.Header[http.CanonicalHeaderKey(k)] = append([]string(nil), v...)
-		}
-	}
+	// Never the client's Mcp-Param-* (§15.5: those are built from the
+	// checked arguments; the Hub decides on the body, final review M3).
 	out.Header.Set("User-Agent", "portcullis-mcp-gate")
 	h.identity(out.Header, d.User, d.Client, d.Resource.URL)
 	resp, err := h.hc.Do(out)

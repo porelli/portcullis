@@ -37,6 +37,7 @@ import (
 	"github.com/portcullis/mcp-gate/internal/accesslog"
 	"github.com/portcullis/mcp-gate/internal/authz"
 	"github.com/portcullis/mcp-gate/internal/bridge"
+	"github.com/portcullis/mcp-gate/internal/canon"
 	"github.com/portcullis/mcp-gate/internal/config"
 	"github.com/portcullis/mcp-gate/internal/hubapi"
 	"github.com/portcullis/mcp-gate/internal/limits"
@@ -377,6 +378,18 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 			// The Portcullis MCP (G25): the same pipeline as above, then
 			// the Hub; one line with the Hub's status.
 			r.Header.Del(bridge.RequestIDHeader)
+			// One form of the arguments on every resource (final review
+			// M1): what the bridge and the aggregate refuse, the Hub never
+			// gets, and every logged tools/call has its args_sha256.
+			if toolCall {
+				if _, err := canon.Arguments(ri.args); err != nil {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusBadRequest)
+					fmt.Fprintf(w, `{"jsonrpc":"2.0","id":null,"error":{"code":%d,"message":%q}}`, mcpsdk.CodeInvalidParams, "arguments Portcullis can't check (they must be one JSON object without repeated keys, with numbers that keep their exact value)")
+					_ = res.Write(deps.act.line(ri, "deny:bad_arguments"))
+					return
+				}
+			}
 			sw := &statusWriter{ResponseWriter: w}
 			ri.upstreamStatus = deps.hub.Serve(sw, r, d)
 			dec := fallbackDecision(sw.status)

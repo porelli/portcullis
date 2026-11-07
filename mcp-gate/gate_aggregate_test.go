@@ -127,6 +127,27 @@ func TestPortcullisThroughGate(t *testing.T) {
 	if hub < 4 || people < 2 {
 		t.Errorf("lines: hub %d people %d", hub, people)
 	}
+	// Final review M1: arguments the gate can't canonicalise (a repeated
+	// inner key, an unsafe number) never reach the Hub: 400,
+	// deny:bad_arguments.
+	for _, args := range []string{`{"a":{"x":1,"x":2}}`, `{"n":12345678901234567890}`} {
+		resp := e.raw("POST", "hub.example.com", e.sig.token("root", hubURL, "mcp:portcullis.admin"), `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_instances","arguments":`+args+`}}`, nil)
+		if resp.StatusCode != 400 {
+			t.Errorf("%s: %d", args, resp.StatusCode)
+		}
+	}
+	if p, _ := e.hub.seenMCP(); len(p) != len(paths) {
+		t.Errorf("non-canonical arguments reached the Hub")
+	}
+	bad := 0
+	for _, l := range e.lines() {
+		if l["decision"] == "deny:bad_arguments" && l["resource"] == hubURL && l["tool"] == "list_instances" {
+			bad++
+		}
+	}
+	if bad != 2 {
+		t.Errorf("%d deny:bad_arguments lines, want 2", bad)
+	}
 }
 
 // Limits apply to the Portcullis resources' tools/call (G25).

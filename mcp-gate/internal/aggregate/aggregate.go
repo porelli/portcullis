@@ -198,6 +198,12 @@ func New(cfg Config) *Aggregate {
 
 func (a *Aggregate) now() time.Time { return a.cfg.Now() }
 
+// refused logs a request the aggregate refused before any upstream
+// (final review M2): the aggregate resource's line, never "allow".
+func (a *Aggregate) refused(req mcp.Request, id ident, method, decision string) {
+	a.emit(bridge.Event{User: id.user, Client: id.client, Resource: id.url, Via: "direct", Method: method, Decision: decision, RequestID: requestID(req)})
+}
+
 func (a *Aggregate) emit(e bridge.Event) {
 	if a.cfg.OnEvent != nil {
 		a.cfg.OnEvent(e)
@@ -493,6 +499,9 @@ func (a *Aggregate) middleware(e *entry) mcp.Middleware {
 			case mcp.MethodCallTool, mcp.MethodReadResource, mcp.MethodGetPrompt:
 				id, ok := identOf(req, e)
 				if !ok {
+					// Logged as refused, never left to the handler's
+					// fallback (an error in a 200 reads "allow": M2).
+					a.refused(req, ident{ekey: e.key}, method, "deny:token")
 					return nil, errNotAllowed
 				}
 				return a.route(ctx, e, method, req, id)
@@ -1066,20 +1075,24 @@ func (a *Aggregate) route(ctx context.Context, e *entry, method string, req mcp.
 	switch p := req.GetParams().(type) {
 	case *mcp.CallToolParamsRaw:
 		if p == nil {
+			a.refused(req, id, method, "deny:bad_arguments")
 			return nil, rpcError(mcp.CodeInvalidParams, "missing params")
 		}
 		name = p.Name
 	case *mcp.ReadResourceParams:
 		if p == nil {
+			a.refused(req, id, method, "deny:bad_arguments")
 			return nil, rpcError(mcp.CodeInvalidParams, "missing params")
 		}
 		name = p.URI
 	case *mcp.GetPromptParams:
 		if p == nil {
+			a.refused(req, id, method, "deny:bad_arguments")
 			return nil, rpcError(mcp.CodeInvalidParams, "missing params")
 		}
 		name = p.Name
 	default:
+		a.refused(req, id, method, "deny:bad_arguments")
 		return nil, rpcError(mcp.CodeInvalidParams, "missing params")
 	}
 	lookup := func() (Target, bool) {

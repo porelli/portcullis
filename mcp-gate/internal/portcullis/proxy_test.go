@@ -128,6 +128,7 @@ func hostileRequest(host, body string) *http.Request {
 	r.Header.Set("X-Portcullis-AI-Resource", "https://hub.example.com/mcp")
 	r.Header.Set("X-Portcullis-Gate-Request", "req-1")
 	r.Header.Set("Last-Event-Id", "client-made")
+	r.Header.Set("Mcp-Param-Name", "client-made")
 	return r
 }
 
@@ -165,6 +166,13 @@ func TestPortcullisProxy(t *testing.T) {
 		checkHeaders(t, last.header, "alice", "portcullis-ai-claude", res.URL)
 		if last.header.Get("Mcp-Protocol-Version") != "2026-07-28" || last.header.Get("Mcp-Method") != "tools/list" {
 			t.Errorf("%s: MCP headers lost: %v", tc.kind, last.header)
+		}
+		// Final review M3: the client's Mcp-Param-* never reach the Hub on
+		// the direct path (§15.5: built from checked arguments only).
+		for k := range last.header {
+			if strings.HasPrefix(http.CanonicalHeaderKey(k), "Mcp-Param-") {
+				t.Errorf("%s: the Hub got the client's %s", tc.kind, k)
+			}
 		}
 	}
 	if n := len(hub.requests()); n != 2 {
