@@ -67,6 +67,8 @@ func TestStrictDecodeRefuses(t *testing.T) {
 		"forward-auth client":      {"\"portcullis-ai-generic\"\n  ],", "\"portcullis-ai-generic\", \"portcullis-forward-auth\"\n  ],"},
 		"client not top-level":     {`"clients": [` + "\n        \"portcullis-ai-claude\",", `"clients": [` + "\n        \"gitea\", \"portcullis-ai-claude\","},
 		"companion on a core host": {"    \"example.com\",\n", "    \"example.com\",\n    \"gitea.example.com\",\n"},
+		"core_hosts without hub":   {"    \"hub.example.com\",\n    \"mcp.example.com\",\n", "    \"mcp.example.com\",\n"},
+		"core_hosts without apex":  {"    \"example.com\",\n    \"hub.example.com\",\n", "    \"hub.example.com\",\n"},
 		"companion hosts core":     {"\"hosts\": [\n        \"gitea.example.com\"\n      ]", "\"hosts\": [\n        \"gitea.example.com\", \"hub.example.com\"\n      ]"},
 		"bad upstream":             {`"upstream": "http://portcullis-mcp-gitea--gitea:8080/mcp"`, `"upstream": "http://169.254.169.254/latest"`},
 		"fanout 5":                 {`"fanout": 4,`, `"fanout": 5,`},
@@ -126,6 +128,24 @@ func TestStrictDecodeRefuses(t *testing.T) {
 			}
 			t.Log(err)
 		})
+	}
+}
+
+// Final review M5: a companion never sits on a core host, even one the
+// Hub left out of core_hosts.
+func TestCompanionNeverOnFixedCoreHost(t *testing.T) {
+	gate := string(vector(t, "mcp-gate.json"))
+	for _, m := range [][2]string{
+		{"    \"metrics.example.com\",\n", ""},
+		{"\"hosts\": [\n        \"gitea.example.com\"\n      ]", "\"hosts\": [\n        \"gitea.example.com\", \"metrics.example.com\"\n      ]"},
+	} {
+		if !strings.Contains(gate, m[0]) {
+			t.Fatalf("anchor %q not in the vector", m[0])
+		}
+		gate = strings.Replace(gate, m[0], m[1], 1)
+	}
+	if _, err := DecodeFile([]byte(gate)); err == nil || !strings.Contains(err.Error(), "core host") {
+		t.Fatalf("companion on metrics.<d> (not in core_hosts): %v", err)
 	}
 }
 

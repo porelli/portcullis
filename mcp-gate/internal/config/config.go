@@ -368,6 +368,13 @@ func (f *File) validate() error {
 	if err := sortedUnique(f.CoreHosts, "core_hosts", ValidHostname); err != nil {
 		return err
 	}
+	// The gate doesn't trust the list to be complete (final review M5):
+	// the hosts every Portcullis has must be in it.
+	for _, h := range requiredCoreHosts(f.MainDomain) {
+		if !slices.Contains(f.CoreHosts, h) {
+			return fmt.Errorf("core_hosts: %s missing", h)
+		}
+	}
 	f.index = map[string]*Resource{}
 	kinds := map[string]int{}
 	for i := range f.Resources {
@@ -494,7 +501,7 @@ func (r *Resource) validateCompanion(f *File) error {
 		return fmt.Errorf("hosts: must contain host")
 	}
 	for _, h := range r.Hosts {
-		if slices.Contains(f.CoreHosts, h) {
+		if slices.Contains(f.CoreHosts, h) || slices.Contains(fixedCoreHosts(f.MainDomain), h) {
 			return fmt.Errorf("hosts: a core host")
 		}
 	}
@@ -613,4 +620,20 @@ func (f *File) lookup(host, path string) (*Resource, bool) {
 	}
 	r, ok := f.index[host+path]
 	return r, ok
+}
+
+// requiredCoreHosts: hosts core_hosts must list (the main domain and the
+// core hosts the gate itself serves or trusts).
+func requiredCoreHosts(main string) []string {
+	return []string{main, "auth." + main, "hub." + main, "people." + main, "mcp." + main}
+}
+
+// fixedCoreHosts: every core host (contract §4), never a companion's,
+// whatever core_hosts says.
+func fixedCoreHosts(main string) []string {
+	out := []string{main}
+	for _, sub := range []string{"auth", "traefik", "hub", "directory", "enroll", "people", "mcp", "metrics"} {
+		out = append(out, sub+"."+main)
+	}
+	return out
 }
