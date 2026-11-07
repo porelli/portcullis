@@ -460,7 +460,7 @@
           "customUserSearchFilter": ["(!(uid=portcullis-hub))"],
           "usernameLDAPAttribute": ["uid"],
           "rdnLDAPAttribute": ["uid"],
-          "uuidLDAPAttribute": ["uid"],
+          "uuidLDAPAttribute": ["entryUUID"],
           "userObjectClasses": ["person"],
           "editMode": ["READ_ONLY"],
           "cachePolicy": ["NO_CACHE"],

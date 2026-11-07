@@ -93,6 +93,15 @@ _kc_report() {
 # writes LDAP, local (non-federated) users and the master realm's admin
 # are never validated against LDAP, and the Hub's service account is
 # filtered out of the federation on purpose (its copy is removed below).
+# uuidLDAPAttribute entryUUID: Keycloak links its copy of a user (and so
+# the user id = every token's `sub`, sessions, consents, passkeys) to
+# LLDAP's immutable per-account uuid, never the username — an account
+# deleted and re-created under the same name is a new person: the old
+# copy fails validation (LDAP_ID mismatch) and is removed, the new one is
+# imported with a new id. A copy linked by an earlier uuid attribute fails
+# validation the same way and is replaced at its next lookup (the
+# operator procedure for an existing deployment is in the docs repo's
+# hardening page).
 _kc_ldap_patch() {
   jq --arg b "$1" '
     .config.usersDn = ["ou=people," + $b] |
@@ -103,7 +112,8 @@ _kc_ldap_patch() {
     .config.cachePolicy = ["NO_CACHE"] |
     .config.editMode = ["READ_ONLY"] |
     .config.removeInvalidUsersEnabled = ["true"] |
-    .config.fullSyncPeriod = ["3600"]'
+    .config.fullSyncPeriod = ["3600"] |
+    .config.uuidLDAPAttribute = ["entryUUID"]'
 }
 
 # _kc_group_mapper_patch <base-dn>: the LDAP group mapper (JSON on stdin):
@@ -233,7 +243,7 @@ keycloak_configure() {
   if [ -n "$comp" ]; then
     ldap_id="$(printf '%s' "$comp" | jq -r .id)"
     code="$(printf '%s' "$comp" | LLDAP_PASS="${LLDAP_ADMIN_PASSWORD:-}" _kc_ldap_patch "$base_dn" | kc_send PUT "/$KC_REALM/components/$ldap_id")"
-    _kc_report "LDAP base DN + bind credential, portcullis-hub excluded, no cache, users gone from LLDAP removed, hourly sync" "$code" 204 || true
+    _kc_report "LDAP base DN + bind credential, portcullis-hub excluded, no cache, users gone from LLDAP removed, hourly sync, linked by entryUUID" "$code" 204 || true
     # The Hub's LLDAP service account (lldap_admin) must never sign in
     # through the gateway: the user filter above keeps it out of the
     # federation; drop a copy imported before the filter existed.

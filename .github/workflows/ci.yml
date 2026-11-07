@@ -1739,7 +1739,8 @@ jobs:
           # configure (run above, idempotent) set the federation up for it.
           LDAP_ID=$(kc "/components?type=org.keycloak.storage.UserStorageProvider" | jq -r '[.[] | select(.providerId == "ldap")][0].id')
           kc "/components/$LDAP_ID" | jq -e '.config.removeInvalidUsersEnabled == ["true"] and .config.fullSyncPeriod == ["3600"]
-              and .config.editMode == ["READ_ONLY"] and .config.customUserSearchFilter == ["(!(uid=portcullis-hub))"]' >/dev/null \
+              and .config.editMode == ["READ_ONLY"] and .config.customUserSearchFilter == ["(!(uid=portcullis-hub))"]
+              and .config.uuidLDAPAttribute == ["entryUUID"] and .config.usernameLDAPAttribute == ["uid"]' >/dev/null \
             || { echo "FAIL: LDAP federation: $(kc "/components/$LDAP_ID" | jq -c '.config | del(.bindCredential)')"; exit 1; }
           MAP=$(kc "/components?parent=$LDAP_ID&type=org.keycloak.storage.ldap.mappers.LDAPStorageMapper" | jq -r '[.[] | select(.providerId == "group-ldap-mapper")][0].id')
           kc "/components/$MAP" | jq -e '.config["drop.non.existing.groups.during.sync"] == ["true"] and .config.mode == ["READ_ONLY"]' >/dev/null \
@@ -1804,6 +1805,45 @@ jobs:
             || { echo "FAIL: gone-user still listed"; exit 1; }
           [ "$(kcstatus "/users/$UID_GONE")" = 404 ] || { echo "FAIL: Keycloak kept its copy of gone-user"; exit 1; }
 
+          # Linked by LLDAP's immutable entryUUID, never the username: an
+          # account deleted and re-created under the same name straight in
+          # LLDAP (no Keycloak lookup in between) is a new identity — a new
+          # Keycloak id (every token's sub), the old copy (sessions, consents,
+          # passkeys, role grants) removed, not inherited; a full sync first
+          # doesn't re-link it either. LLDAP's admin (read only here) is
+          # linked by its LLDAP uuid.
+          KC_TOKEN=$(tok)
+          [ -z "$KC_TOKEN" ] || [ "$KC_TOKEN" = null ] || echo "::add-mask::$KC_TOKEN"
+          luuid() { lq "{ user(userId: \"$1\") { uuid } }" | jq -r '.data.user.uuid // empty'; }
+          kc "/users/$ADMIN_ID" | jq -e --arg u "$(luuid admin)" --arg l "$LDAP_ID" '$u != "" and .attributes.LDAP_ID == [$u] and .federationLink == $l' >/dev/null \
+            || { echo "FAIL: admin not linked by its LLDAP uuid: $(kc "/users/$ADMIN_ID" | jq -c '[.federationLink, .attributes.LDAP_ID]')"; exit 1; }
+          lg 'mutation { createUser(user: {id: "same-name", email: "same-name@portcullis.local"}) { id } }'
+          U1=$(luuid same-name)
+          K1=$(kc "/users?username=same-name&exact=true" | jq -r '.[0].id // empty')
+          [ -n "$U1" ] && [ -n "$K1" ] || { echo "FAIL: same-name not imported"; exit 1; }
+          kc "/users/$K1" | jq -e --arg u "$U1" '.attributes.LDAP_ID == [$u]' >/dev/null || { echo "FAIL: same-name not linked by its LLDAP uuid"; exit 1; }
+          # A Keycloak-side grant on the old copy stands for its local state.
+          kcjson() { curl -sf -X POST -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") -H 'Content-Type: application/json' -d @- "http://127.0.0.1:8080/admin/realms/portcullis$1"; }
+          echo '{"name": "ci-same-name-marker"}' | kcjson /roles >/dev/null || { echo "FAIL: create the marker role"; exit 1; }
+          kc /roles/ci-same-name-marker | jq -c '[.]' | kcjson "/users/$K1/role-mappings/realm" >/dev/null || { echo "FAIL: grant the marker role"; exit 1; }
+          lg 'mutation { deleteUser(userId: "same-name") { ok } }'
+          lg 'mutation { createUser(user: {id: "same-name", email: "same-name@portcullis.local"}) { id } }'
+          U2=$(luuid same-name)
+          [ -n "$U2" ] && [ "$U2" != "$U1" ] || { echo "FAIL: LLDAP gave the re-created account the same uuid ($U1 / $U2)"; exit 1; }
+          kcpost "/user-storage/$LDAP_ID/sync?action=triggerFullSync" >/dev/null || { echo "FAIL: full sync"; exit 1; }
+          K2=$(kc "/users?username=same-name&exact=true" | jq -r '.[0].id // empty')
+          [ -n "$K2" ] && [ "$K2" != "$K1" ] || { echo "FAIL: the re-created same-name kept Keycloak id $K1 (got '$K2')"; exit 1; }
+          [ "$(kcstatus "/users/$K1")" = 404 ] || { echo "FAIL: Keycloak kept the old same-name copy $K1"; exit 1; }
+          kc "/users/$K2" | jq -e --arg u "$U2" '.attributes.LDAP_ID == [$u]' >/dev/null || { echo "FAIL: re-created same-name not linked by its new uuid"; exit 1; }
+          [ "$(kc "/users?briefRepresentation=true&max=1000" | jq '[.[] | select(.username == "same-name")] | length')" = 1 ] \
+            || { echo "FAIL: same-name duplicated in Keycloak"; exit 1; }
+          kc "/users/$K2/role-mappings/realm" | jq -e 'all(.[]?; .name != "ci-same-name-marker")' >/dev/null \
+            || { echo "FAIL: the re-created same-name inherited the old copy's grant"; exit 1; }
+          curl -sf -X DELETE -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") http://127.0.0.1:8080/admin/realms/portcullis/roles/ci-same-name-marker \
+            || { echo "FAIL: delete the marker role"; exit 1; }
+          lg 'mutation { deleteUser(userId: "same-name") { ok } }'
+          [ "$(kcstatus "/users/$K2")" = 404 ] || { echo "FAIL: Keycloak kept same-name after its deletion"; exit 1; }
+
           # Core's own accounts are untouched: LLDAP's admin + testuser and
           # their groups in Keycloak, the Hub's service account in LLDAP (and
           # never in Keycloak), the master realm's admin.
@@ -1815,7 +1855,7 @@ jobs:
           lq '{ user(userId: "admin") { id } }' | jq -e '.data.user.id == "admin"' >/dev/null || { echo "FAIL: LLDAP admin gone"; exit 1; }
           [ "$(kc "/users?username=portcullis-hub&exact=true" | jq length)" = 0 ] || { echo "FAIL: the Hub's service account is in Keycloak"; exit 1; }
           [ -n "$(tok)" ] && [ "$(tok)" != null ] || { echo "FAIL: master admin can't sign in"; exit 1; }
-          echo "PASS: users and groups deleted in LLDAP leave Keycloak (group at sync, user at lookup); LLDAP outage removes nothing; core's accounts kept"
+          echo "PASS: users and groups deleted in LLDAP leave Keycloak (group at sync, user at lookup); a re-created name is a new Keycloak identity (entryUUID); LLDAP outage removes nothing; core's accounts kept"
 
       - name: Test enrollment API - sign CSR (AppRole token)
         run: |
@@ -2007,6 +2047,14 @@ jobs:
           echo "::add-mask::$BACKUP_PASSWORD"
           export BACKUP_REPOSITORY BACKUP_PASSWORD
           cp secrets/mcp-gate/age.pub /tmp/gate-age.pub
+          # LLDAP's admin: its Keycloak id and LLDAP uuid (the link, entryUUID) must survive.
+          KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+            --data-urlencode client_id=admin-cli --data-urlencode "username=$KEYCLOAK_ADMIN" \
+            --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          [ -z "$KC_TOKEN" ] || [ "$KC_TOKEN" = null ] || echo "::add-mask::$KC_TOKEN"
+          ADMIN_KC=$(curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") "http://127.0.0.1:8080/admin/realms/portcullis/users?username=admin&exact=true" \
+            | jq -c '.[0] | {id, link: .attributes.LDAP_ID}')
+          jq -e '.id != null and (.link | length) == 1' <<<"$ADMIN_KC" >/dev/null || { echo "FAIL: admin's Keycloak copy before the backup: $ADMIN_KC"; exit 1; }
           # Everything local is gone: containers, volumes, .env, secrets/, certs/, local backups.
           docker compose -p ci-mtls -f /tmp/ci-mtls.yml down 2>/dev/null || true
           docker compose -p ci-hubproxy down -v 2>/dev/null || true
@@ -2039,6 +2087,15 @@ jobs:
           jq -n '{query: "{ user(userId: \"testuser\") { id } }"}' | curl -sf http://localhost:17170/api/graphql \
             -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @- \
             | jq -e '.data.user.id == "testuser"' >/dev/null || { echo "FAIL: LLDAP user lost"; exit 1; }
+          # Same Keycloak id after the restore and a full sync, still linked to the same LLDAP uuid.
+          LDAPC=$(kc "/components?type=org.keycloak.storage.UserStorageProvider" | jq -r '[.[] | select(.providerId == "ldap")][0].id')
+          curl -sf -X POST -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") "http://127.0.0.1:8080/admin/realms/portcullis/user-storage/$LDAPC/sync?action=triggerFullSync" >/dev/null \
+            || { echo "FAIL: full sync after restore"; exit 1; }
+          jq -n '{query: "{ user(userId: \"admin\") { uuid } }"}' | curl -sf http://localhost:17170/api/graphql \
+            -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @- \
+            | jq -e --argjson b "$ADMIN_KC" '[.data.user.uuid] == $b.link' >/dev/null || { echo "FAIL: LLDAP admin's uuid changed by backup/restore"; exit 1; }
+          [ "$(kc "/users?username=admin&exact=true" | jq -c '.[0] | {id, link: .attributes.LDAP_ID}')" = "$ADMIN_KC" ] \
+            || { echo "FAIL: admin's Keycloak identity changed by backup/restore: $ADMIN_KC → $(kc "/users?username=admin&exact=true" | jq -c '.[0] | {id, link: .attributes.LDAP_ID}')"; exit 1; }
           ./portcullis status --json | jq -e '.vault.active and .keycloak.realm and .keycloak.forward_auth_client' >/dev/null \
             || { echo "FAIL: status after restore"; ./portcullis status || true; exit 1; }
           # The gate's key / recipient / secret and its access log came back (G29 modes kept).
@@ -2049,7 +2106,7 @@ jobs:
             sh -c 'stat -c "%a %u %g" /d /d/access.jsonl && grep -c "deny:off" /d/access.jsonl' > /tmp/gate-restored
           [ "$(sed -n 1,2p /tmp/gate-restored | paste -sd' ')" = "750 10005 10001 640 10005 10001" ] && [ "$(sed -n 3p /tmp/gate-restored)" -ge 3 ] \
             || { echo "FAIL: restored access log: $(cat /tmp/gate-restored)"; exit 1; }
-          echo "PASS: restored from restic into a fresh stack: CA, cert records, revocations, Keycloak, LLDAP, the MCP gate's key and access log"
+          echo "PASS: restored from restic into a fresh stack: CA, cert records, revocations, Keycloak (admin's id and entryUUID link kept), LLDAP, the MCP gate's key and access log"
           # The restore's LLDAP guard read the real volume and database: LLDAP
           # users counted, Keycloak's federated users counted, so it passed.
           GUARD=$(bash -c 'source scripts/lib/common.sh; env_load; source scripts/lib/status.sh; source scripts/lib/backup.sh; _backup_load_cfg

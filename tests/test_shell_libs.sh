@@ -711,6 +711,15 @@ expect_eq "realm export: group mapper drops groups gone from LLDAP" \
 expect_eq "keycloak configure: existing realm gets removal + hourly sync + READ_ONLY" \
   "$(printf '%s' '{"config":{"removeInvalidUsersEnabled":["false"],"fullSyncPeriod":["604800"],"editMode":["WRITABLE"]}}' | LLDAP_PASS=pw _kc_ldap_patch dc=ex,dc=org | jq -c '.config | [.removeInvalidUsersEnabled, .fullSyncPeriod, .editMode]')" \
   '[["true"],["3600"],["READ_ONLY"]]'
+# Keycloak links an LDAP user by LLDAP's immutable entryUUID, never the
+# username (a re-created name is a new identity) — in the export and pushed
+# onto existing realms by configure; username / RDN stay uid.
+expect_eq "realm export: users linked by entryUUID, username / RDN uid" \
+  "$(jq -c "$LDAPC | .config | [.uuidLDAPAttribute, .usernameLDAPAttribute, .rdnLDAPAttribute]" "$HERE/../keycloak/realm-export.json")" \
+  '[["entryUUID"],["uid"],["uid"]]'
+expect_eq "keycloak configure: existing realm re-linked by entryUUID, username / RDN kept" \
+  "$(printf '%s' '{"config":{"uuidLDAPAttribute":["uid"],"usernameLDAPAttribute":["uid"],"rdnLDAPAttribute":["uid"]}}' | LLDAP_PASS=pw _kc_ldap_patch dc=ex,dc=org | jq -c '.config | [.uuidLDAPAttribute, .usernameLDAPAttribute, .rdnLDAPAttribute]')" \
+  '[["entryUUID"],["uid"],["uid"]]'
 GM='{"id":"g","providerId":"group-ldap-mapper","config":{"groups.dn":["ou=groups,dc=old"],"drop.non.existing.groups.during.sync":["false"],"group.name.ldap.attribute":["cn"]}}'
 G1="$(printf '%s' "$GM" | _kc_group_mapper_patch dc=ex,dc=org)"
 expect_eq "keycloak configure: group mapper patched" "$(printf '%s' "$G1" | jq -c '.config | [.["groups.dn"], .["drop.non.existing.groups.during.sync"], .mode, .["group.name.ldap.attribute"]]')" \
