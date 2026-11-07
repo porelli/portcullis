@@ -2961,7 +2961,7 @@ jobs:
           jq -e --arg id "$ID" '.op == "enable" and .instance == $id' /tmp/hub.out >/dev/null || { echo "FAIL: 202 body $(cat /tmp/hub.out)"; exit 1; }
           t0=$SECONDS
           for i in $(seq 1 600); do
-            hub GET "$HUBOP_POLL" > /tmp/op.json || true
+            hub GET "$HUBOP_POLL" --max-time 30 > /tmp/op.json || true
             jq -e --arg o "$HUBOP_ID" '.op_id == $o and any(.steps[]?; .key == "images" and .state == "running")' /tmp/op.json >/dev/null 2>&1 && break
             if jq -e --arg o "$HUBOP_ID" '.op_id == $o and (.running | not)' /tmp/op.json >/dev/null 2>&1; then
               echo "FAIL: the enable ended before its images step ran:"; hubop_explain; exit 1
@@ -2981,7 +2981,9 @@ jobs:
           # The record ends stopped: not running, not ok, no error, stopped_by.
           hubop_end "$HUBOP_POLL" "$HUBOP_ID" 300 || exit 1
           cp /tmp/op.json /tmp/op-stopped.json
-          jq -e '.op == "enable" and .ok == false and (.error // "") == "" and .stopped_by == "admin" and .stopped_at != null' /tmp/op.json >/dev/null \
+          # Booleans are left out when false: a missing one reads as false.
+          jq -e '.op == "enable" and .ok == false and (.error // "") == "" and .stopped_by == "admin" and .stopped_at != null
+              and (.stopping // false) == false and (.stoppable // false) == false' /tmp/op.json >/dev/null \
             || { echo "FAIL: the record didn't end stopped:"; hubop_explain; exit 1; }
           echo "stopped after $((SECONDS - t0)) s: $(jq -c '{created, steps: [.steps[] | {key, state}]}' /tmp/op.json)"
 
@@ -3007,8 +3009,9 @@ jobs:
           done
           hub GET /api/instances | jq -e --arg id "$ID" 'any(.[]; .id == $id and .state == "disabled")' >/dev/null \
             || { echo "FAIL: $ID after the Stop: $(hub GET /api/instances | jq -c --arg id "$ID" '.[] | select(.id == $id)')"; exit 1; }
+          # The Stop's audit names the step it stopped (images).
           hub GET /api/directory/audit | jq -e --arg id "$ID" 'any(.[]; .action == "enable.stop" and .result == "ok" and .actor == "admin"
-              and ((.target // "") | split("/")[0]) == $id)' >/dev/null \
+              and ((.target // "") | split("/")[0]) == $id and .detail == "images")' >/dev/null \
             || { echo "FAIL: no enable.stop in the audit: $(hub GET /api/directory/audit | jq -c --arg id "$ID" '[.[] | select((.target // "") | startswith($id))]')"; exit 1; }
           echo "PASS: stop_enable_mid_pull: the enable stopped during images; no containers, volumes, Keycloak client $(jq -c .created.keycloak_clients /tmp/op.json) or groups $(jq -c .created.groups /tmp/op.json) left; $ID disabled; enable.stop audited"
 

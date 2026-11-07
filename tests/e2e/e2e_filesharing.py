@@ -265,7 +265,14 @@ def run_op(method: str, path: str, body, timeout: float = OP_S) -> dict:
     A busy 409 whose record is a running `restart` is the Hub's own queued
     restart (a membership or settings change restarts the app): that
     restart must end ok, then the operation is sent once more. Any other
-    409 fails."""
+    409 fails. Every failure message is scrubbed."""
+    try:
+        return _run_op(method, path, body, timeout)
+    except AssertionError as e:
+        raise AssertionError(scrub(str(e))) from None
+
+
+def _run_op(method: str, path: str, body, timeout: float) -> dict:
     code, out = hub(method, path, body)
     inst = instance_of(path, body)
     if code == 409 and inst and isinstance(out, dict) and out.get("op") == "restart" and out.get("running") \
@@ -278,10 +285,7 @@ def run_op(method: str, path: str, body, timeout: float = OP_S) -> dict:
     acc = e2e_ops.accepted(out)
     rec = e2e_ops.wait(hub_get, acc, timeout)
     save(f"op-{acc.get('op')}-{acc['op_id']}.json", rec)
-    try:
-        return e2e_ops.check_ok(acc, rec)
-    except AssertionError as e:
-        raise AssertionError(scrub(str(e))) from None
+    return e2e_ops.check_ok(acc, rec)
 
 
 def instance_of(path: str, body) -> str | None:

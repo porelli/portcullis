@@ -23,7 +23,7 @@ hubop_explain() {
 hubop_end() {
   local poll="$1" opid="$2" limit="$3" t0=$SECONDS
   while :; do
-    hub GET "$poll" > /tmp/op.json || true
+    hub GET "$poll" --max-time 30 > /tmp/op.json || true
     jq -e --arg o "$opid" '.op_id == $o and (.running | not)' /tmp/op.json >/dev/null 2>&1 && return 0
     if (( SECONDS - t0 >= limit )); then
       echo "FAIL: op $opid still running after $limit s:"; hubop_explain; return 1
