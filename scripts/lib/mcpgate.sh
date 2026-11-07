@@ -57,7 +57,7 @@ mcpgate_ensure_secrets() {
     # A recipient already there = there was a key before this one: the
     # Hub's stored AI credentials are encrypted to the old key, and the
     # Hub never re-keys them (only caller secrets).
-    [ ! -s "$d/age.pub" ] || warn "secrets/mcp-gate/age.key was missing and has been regenerated. AI credentials the Hub stored for the old key can't be decrypted: mcp-gate refuses the Hub's files and every AI resource answers 503 (./portcullis status shows it). Restore the old age.key from a backup, or switch each app_token AI companion off and on in the Hub (that drops its credentials; people then connect again)."
+    [ ! -s "$d/age.pub" ] || warn "secrets/mcp-gate/age.key was missing and has been regenerated. AI credentials the Hub stored for the old key can't be decrypted: mcp-gate refuses the Hub's files and every AI resource answers 503 (./portcullis status shows it). Restore the old age.key from a backup, or switch each app_token AI companion off and on in the Hub (that drops its credentials; each person's next AI request mints a new one, and their AI connections are unaffected)."
   fi
   pub="$(sed -n 's/^# public key: \(age1[0-9a-z]*\)$/\1/p' "$d/age.key" | head -n1)"
   [ -n "$pub" ] || fail "secrets/mcp-gate/age.key has no '# public key: age1...' line: restore it from a backup. A new key can't decrypt the AI credentials the Hub stored (the Hub never re-keys them): mcp-gate would refuse its files and every AI resource would answer 503 until each app_token AI companion is switched off and on in the Hub."
