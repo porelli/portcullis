@@ -325,10 +325,9 @@ func answer(rec *statusRecorder, res any, err error) (int, error) {
 	if err == nil {
 		return 0, enc.Encode(map[string]any{"result": res})
 	}
-	var we *jsonrpc.Error
-	if errors.As(err, &we) {
-		return 0, enc.Encode(map[string]any{"error": we})
-	}
+	// An HTTP refusal first: the SDK reports some of them (a 503, say) as
+	// a JSON-RPC error of its own ("rejected by transport"), which the
+	// server never sent.
 	rec.mu.Lock()
 	code, www := rec.code, rec.www
 	rec.mu.Unlock()
@@ -337,6 +336,10 @@ func answer(rec *statusRecorder, res any, err error) (int, error) {
 			return 1, e
 		}
 		return 2, nil
+	}
+	var we *jsonrpc.Error
+	if errors.As(err, &we) {
+		return 0, enc.Encode(map[string]any{"error": we})
 	}
 	return 1, err
 }
