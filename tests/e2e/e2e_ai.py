@@ -9,30 +9,42 @@ client and `mcp:*` scopes) and the Hub (AI settings, companion switch,
 gate files, lazy mint / revoke hooks).
 
 Setup through the Hub's admin API as the CI admin `root` (never LLDAP's
-`admin`): instance `gitea-b` (the cross-app resource), both instances
-enabled, memberships (alice: users_gitea + users_gitea-b; bob:
-users_gitea), master switch on with Claude Code offered (admin flag on, so
-hub.<d>/mcp exists), Gitea's companion on in read_write on both. alice and
-bob sign in through their setup links, then once to Gitea (their accounts
-are created by Gitea's OIDC sign-in, the only way: account linking is
-off); each gets one private repository (Gitea's CLI + API inside the
-container, the token on curl's stdin).
+`admin`): instances `gitea-b` (the cross-app resource) and `echo-del` (a
+throwaway, never enabled), gitea, gitea-b and grafana enabled, memberships
+(alice: users_gitea + users_gitea-b; bob: users_gitea; carol: users_gitea +
+users_grafana), master switch on with Claude Code offered (admin flag on,
+so hub.<d>/mcp exists), Gitea's companion on in read_write on both,
+Grafana's (identity_headers) in read_only. root, alice, bob and carol sign
+in through their setup links before any app starts (container starts
+change the runner's network and Chromium aborts in-flight requests), then
+alice, bob and carol once to Gitea (accounts exist only through its OIDC
+sign-in); alice and bob get one private repository each (Gitea's CLI + API
+inside the container, the token on curl's stdin).
 
 Scenarios (one function each; screenshots and traces kept on failure):
   1. gitea_as_alice             token for https://gitea.<d>/mcp, tools/list,
                                 repo_read list_my_repos → only alice's repos
-  2. leaver_refused_and_revoked alice out of users_gitea → 403, her Gitea
-                                portcullis-ai-* token deleted
   3. audience_separation        her Gitea token at gitea-b, mcp.<d>, hub.<d>,
                                 people.<d> → 401; one token for two
                                 resources → refused at both
   4. no_token_crossing          the MCP token on Gitea's and people's pages
                                 → sign-in redirect / 401, never a page;
                                 browser cookies on /mcp → 401
-Scenario 2 runs last (it removes alice). T30 proper adds 5–7.
+  5. destructive_confirmation   root's delete_instance on hub.<d>/mcp → the
+                                confirmation link; bob can't open it; root
+                                types the id + fresh passkey → approved; the
+                                retry is accepted, a second one needs a new
+                                confirmation; audited via ai with the client
+                                and the confirmation id
+  6. aggregate_lists            mcp.<d>: carol gitea__* + grafana__* +
+                                portcullis__my_apps, a Grafana call through
+                                the gate; bob no grafana__*; root no admin tool
+  2. leaver_refused_and_revoked alice out of users_gitea → 403, her Gitea
+                                portcullis-ai-* token deleted
+  7. ai_off                     master switch off → every resource 503
 
 Environment: E2E_DOMAIN, HUB_IP, E2E_HUB_SECRET, E2E_HUB_ACTOR (root),
-E2E_ALICE_INVITE, E2E_BOB_INVITE, E2E_MCPCLIENT (binary), E2E_CA (PEM the
+E2E_{ROOT,ALICE,BOB,CAROL}_INVITE, E2E_MCPCLIENT (binary), E2E_CA (PEM the
 stack's certificates chain to), E2E_ARTIFACTS. Tokens live only in
 E2E_TOKEN_DIR (default a fresh temp dir, never in the artifacts) and are
 never printed: only their claims' aud / scope / azp.
@@ -42,6 +54,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -52,7 +65,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from playwright.sync_api import Error as PWError
+from playwright.sync_api import Error as PWError  # noqa: F401 (also goto)
 from playwright.sync_api import Page, sync_playwright
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -77,6 +90,13 @@ MCP_ALL = f"https://mcp.{DOMAIN}/mcp"
 HUB_MCP = f"https://hub.{DOMAIN}/mcp"
 PEOPLE = f"https://people.{DOMAIN}"
 PEOPLE_MCP = PEOPLE + "/mcp"
+GRAFANA = f"https://grafana.{DOMAIN}"
+GRAFANA_MCP = GRAFANA + "/mcp"
+SCOPE_GRAFANA = "mcp:grafana.grafana"
+HUB = f"https://hub.{DOMAIN}"
+# The throwaway instance root deletes through the admin MCP (scenario 5).
+ECHO_DEL = "echo-del"
+CONFIRM_RE = re.compile(r"https://hub\.[a-z0-9.-]+/confirm/[A-Za-z0-9_-]+")
 CLIENT = "portcullis-ai-claude-code"
 CALLBACK = "http://127.0.0.1:33418/callback"
 SCOPE_GITEA = "mcp:gitea.gitea"
@@ -360,6 +380,57 @@ def refused(url: str, tf: str) -> int:
     return doc.get("http_status", 0) if rc == 2 else 0
 
 
+def tool_names(url: str, tf: str) -> list[str]:
+    rc, doc = mcp_call(url, tf)
+    assert rc == 0 and "result" in doc, f"tools/list at {url}: {doc}"
+    return sorted(t["name"] for t in doc["result"]["tools"])
+
+
+def call_text(url: str, tf: str, tool: str, args: dict) -> tuple[bool, str]:
+    """(isError, text) of a tools/call answer; a JSON-RPC error or an HTTP
+    refusal fails."""
+    rc, doc = mcp_call(url, tf, "tools/call", tool, args)
+    assert rc == 0 and "result" in doc, f"{tool} at {url}: {doc}"
+    res = doc["result"]
+    return bool(res.get("isError")), text_of(res) or json.dumps(res.get("structuredContent"))
+
+
+def drive_popup(popup: Page, label: str) -> int:
+    """Signs in inside the fresh-auth popup until it closes itself; returns
+    the passkey prompts answered."""
+    prompted, deadline = 0, time.time() + 120
+    while time.time() < deadline:
+        if popup.is_closed():
+            return prompted
+        try:
+            if popup.url.startswith(AUTH + "/realms/"):
+                pw = popup.locator("input[type=password]")
+                if pw.count() and pw.first.is_visible():
+                    base.shot(popup, f"{label}-password-prompt")
+                    raise AssertionError("password prompt in the fresh-auth popup")
+                btn = popup.locator("#authenticateWebAuthnButton")
+                if btn.count() and btn.first.is_visible():
+                    prompted += 1
+                    btn.first.click()
+                    popup.wait_for_timeout(1500)
+                    continue
+                err = popup.locator(".pf-m-danger, .alert-error, #input-error, .kc-feedback-text")
+                if err.count() and err.first.is_visible():
+                    base.shot(popup, f"{label}-kc-error")
+                    raise AssertionError(f"Keycloak error in the popup: {err.first.inner_text()!r}")
+            popup.wait_for_timeout(300)
+        except PWError:
+            if popup.is_closed():
+                return prompted
+            time.sleep(0.3)
+    base.shot(popup, f"{label}-popup-stuck")
+    raise AssertionError(f"the fresh-auth popup didn't finish (at {popup.url.split('?')[0]})")
+
+
+def norm_id(s: str) -> str:
+    return s.replace("-", "").lower()
+
+
 def gitea_routed() -> None:
     """Both Gitea instances answer through Traefik (routed once healthy):
     the login page redirects to Gitea's OAuth2 source."""
@@ -374,26 +445,32 @@ def main() -> int:
 
     # ── setup through the Hub's API ──
     def setup_instances():
-        until("the Hub loaded gitea", lambda: any(t.get("id") == "gitea" for t in json.loads(hub("GET", "/api/templates")[1])), 90)
+        until("the Hub loaded gitea, grafana and echo",
+              lambda: {"gitea", "grafana", "echo"} <= {t.get("id") for t in json.loads(hub("GET", "/api/templates")[1])}, 90)
+        # Never enabled: only deleted again, through the admin MCP (scenario 5).
+        hub_ok("POST", "/api/instances", {"template": "echo", "id": ECHO_DEL, "hosts": {"echo": f"{ECHO_DEL}.{DOMAIN}"}},
+               want=(201,))
         hub_ok("POST", "/api/instances", {"template": "gitea", "id": "gitea-b", "hosts": {"gitea": f"gitea-b.{DOMAIN}"}},
                want=(201,))
         # One host port per instance: gitea keeps 2222 (Git over SSH is off
         # anyway), gitea-b none (the port's description says so).
         hub_ok("PUT", "/api/instances/gitea-b/settings", {"ports": {"GITEA_SSH_PORT": ""}})
-        for inst in ("gitea", "gitea-b"):
+        for inst in ("gitea", "gitea-b", "grafana"):
             t0 = time.time()
             out = hub_ok("POST", "/api/templates/enable", {"id": inst}, timeout=1500)
             print(f"    enabled {inst} in {time.time() - t0:.0f} s: {json.dumps({k: out.get(k) for k in ('groups_created', 'warnings')})}",
                   flush=True)
-        for m in ("alice:users_gitea", "alice:users_gitea-b", "bob:users_gitea"):
+        for m in ("alice:users_gitea", "alice:users_gitea-b", "bob:users_gitea", "carol:users_gitea", "carol:users_grafana"):
             u, g = m.split(":")
             member("add", g, u)
         gitea_routed()
+        until("grafana routed (sign-in redirect)", lambda: https("GET", GRAFANA + "/")[0] in (302, 303, 307), 240, every=5)
 
 
     with sync_playwright() as pw_:
         browser = pw_.chromium.launch(args=["--disable-features=WebAuthenticationConditionalUI"])
         ctxs: dict = {}
+        auths: dict = {}
 
         def sign_in(who: str) -> Page:
             ctx = browser.new_context()
@@ -403,7 +480,7 @@ def main() -> int:
             # Failed requests (path only: queries carry codes and states).
             page.on("requestfailed", lambda r: print(
                 f"    {who}: request failed: {r.method} {r.url.split('?')[0]}: {r.failure}", flush=True))
-            base.Authenticator(page)
+            auths[who] = base.Authenticator(page)
             page.goto(os.environ[f"E2E_{who.upper()}_INVITE"], wait_until="domcontentloaded")
             base.passkey_flow(page, until=PORTAL, label=f"ai-{who}")
             # Traced from here: the (consumed) setup link stays out of the trace.
@@ -438,20 +515,20 @@ def main() -> int:
         # aborts in-flight requests (net::ERR_NETWORK_CHANGED) — a consumed
         # setup link can't be retried.
         def setup_links():
-            for who in ("alice", "bob"):
+            for who in ("root", "alice", "bob", "carol"):
                 pages[who] = sign_in(who)
-        check("alice and bob: setup link → passkey → portal", setup_links)
-        if len(pages) != 2:
+        check("root, alice, bob and carol: setup link → passkey → portal", setup_links)
+        if len(pages) != 4:
             return report()
-        check("setup: gitea-b created, gitea + gitea-b enabled, alice in users_gitea + users_gitea-b, bob in users_gitea "
-              "(Hub API as root)", setup_instances)
+        check("setup: gitea-b and echo-del created, gitea + gitea-b + grafana enabled, alice in users_gitea + users_gitea-b, "
+              "bob in users_gitea, carol in users_gitea + users_grafana (Hub API as root)", setup_instances)
 
         def gitea_accounts():
-            for who in ("alice", "bob"):
+            for who in ("alice", "bob", "carol"):
                 retry_network(lambda: gitea_sign_in(pages[who], who), f"{who}'s Gitea sign-in")
-        check("alice and bob: Gitea's OIDC sign-in (through their Keycloak session) creates their Gitea accounts",
+        check("alice, bob and carol: Gitea's OIDC sign-in (through their Keycloak session) creates their Gitea accounts",
               gitea_accounts)
-        alice = pages["alice"]
+        alice, root, bob, carol = pages["alice"], pages["root"], pages["bob"], pages["carol"]
 
         def seed():
             for who in ("alice", "bob"):
@@ -464,20 +541,22 @@ def main() -> int:
             v = hub_ok("PUT", "/api/ai/settings", {"enabled": True,
                                                     "clients": {"claude_code": {"offered": True, "admin": True}}})
             assert v.get("enabled") is True and v.get("gate_present") is True, f"AI settings: {json.dumps(v)[:600]}"
-            for inst in ("gitea", "gitea-b"):
+            for inst, comp, mode in (("gitea", "gitea", "read_write"), ("gitea-b", "gitea", "read_write"),
+                                     ("grafana", "grafana", "read_only")):
                 r = hub_ok("PUT", f"/api/instances/{inst}/ai",
-                           {"companions": {"gitea": {"enabled": True, "mode": "read_write"}}}, timeout=900)
+                           {"companions": {comp: {"enabled": True, "mode": mode}}}, timeout=900)
                 print(f"    {inst}: {json.dumps({'restarts': r.get('restarts'), 'warnings': r.get('warnings')})}", flush=True)
 
                 def companion_on():
                     c = hub_ok("GET", f"/api/instances/{inst}/ai")["companions"][0]
                     print(f"    {inst} companion: status {c.get('status')} mode {c.get('mode')} "
                           f"population {c.get('population')} last_error {c.get('last_error')!r}", flush=True)
-                    return c.get("status") == "on" and c.get("mode") == "read_write" and c
+                    return c.get("status") == "on" and c.get("mode") == mode and c
                 until(f"{inst}'s companion on", companion_on, 180, every=5)
-                until(f"{inst}'s gitea-mcp running", lambda: container(inst, "gitea-mcp"), 120, every=5)
+                until(f"{inst}'s {comp}-mcp running", lambda: container(inst, f"{comp}-mcp"), 120, every=5)
             gitea_routed()
-            for url, scope in ((GITEA_MCP, SCOPE_GITEA), (GITEA_B_MCP, "mcp:gitea-b.gitea"), (MCP_ALL, "mcp:all"),
+            for url, scope in ((GITEA_MCP, SCOPE_GITEA), (GITEA_B_MCP, "mcp:gitea-b.gitea"), (GRAFANA_MCP, SCOPE_GRAFANA),
+                               (MCP_ALL, "mcp:all"),
                                (HUB_MCP, "mcp:portcullis.admin"), (PEOPLE_MCP, "mcp:portcullis.people")):
                 host = urllib.parse.urlsplit(url).netloc
                 meta = f"https://{host}/.well-known/oauth-protected-resource/mcp"
@@ -489,7 +568,7 @@ def main() -> int:
                 assert doc["resource"] == url and doc["scopes_supported"] == [scope] \
                     and doc["authorization_servers"] == [AUTH + "/realms/portcullis"], doc
         check("ai_on: master switch on (Claude Code offered, admin flag), Gitea's companion on in read_write on gitea and "
-              "gitea-b; every resource's RFC 9728 metadata served", ai_on)
+              "gitea-b, Grafana's (identity_headers) in read_only; every resource's RFC 9728 metadata served", ai_on)
 
         # ── 1 ──
         def gitea_as_alice():
@@ -580,7 +659,139 @@ def main() -> int:
         check("no_token_crossing: the MCP token on Gitea's and people.<d>'s pages → sign-in redirect (Gitea API 401), "
               "never a page; the browser session's cookies on /mcp → 401", no_token_crossing)
 
-        # ── 2 (last: alice leaves) ──
+        # ── 5 ──
+        def destructive_confirmation():
+            tf = mcp_login(root, HUB_MCP, "root-hub")
+            state["root_hub"], state["root_hub_at"] = tf, time.time()
+            c = show("root's admin token", tf)
+            assert c.get("preferred_username") == "root" and "mcp:portcullis.admin" in c.get("scope", "").split(), c
+            assert "delete_instance" in tool_names(HUB_MCP, tf)
+            args = {"id": ECHO_DEL}
+            err, text = call_text(HUB_MCP, tf, "delete_instance", args)
+            m = CONFIRM_RE.search(text)
+            print(f"    delete_instance: isError {err}: {text[:200]}", flush=True)
+            assert err and m and text.startswith("This needs your confirmation in your browser: open "), text[:300]
+            url = m.group(0)
+            cid = url.rsplit("/", 1)[1]
+            # Before the approval the retry is still waiting (no new confirmation).
+            err2, text2 = call_text(HUB_MCP, tf, "delete_instance", args)
+            print(f"    retry while pending: isError {err2}: {text2[:160]}", flush=True)
+            assert err2 and "Still waiting" in text2 and (CONFIRM_RE.search(text2) is None
+                                                          or CONFIRM_RE.search(text2).group(0) == url), text2[:300]
+            # bob: not an administrator, so group-gate never lets him reach
+            # hub.<d>; the Hub itself answers another person's id with 404.
+            r = bob.request.get(url, max_redirects=0)
+            print(f"    bob opens the page through Traefik: HTTP {r.status}", flush=True)
+            assert r.status in (302, 403) and "echo-del" not in r.text(), f"bob got HTTP {r.status}: {r.text()[:200]}"
+            req = urllib.request.Request(f"{HUB_API}/confirm/{cid}", headers={
+                "X-Portcullis-Proxy-Secret": SECRET, "X-Forwarded-User": "bob"})
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    code = resp.status
+            except urllib.error.HTTPError as e:
+                code = e.code
+            print(f"    bob's identity on the Hub's /confirm/<id>: HTTP {code}", flush=True)
+            assert code == 404, f"the Hub showed root's confirmation to bob: HTTP {code}"
+            # root approves: the typed id, then a fresh passkey sign-in.
+            goto(root, url)
+            box = root.locator("#confirm")
+            assert box.get_attribute("data-state") == "pending", box.get_attribute("data-state")
+            assert ECHO_DEL in root.inner_text("body"), "the page doesn't name the instance"
+            base.shot(root, "ai-confirm-page")
+            root.fill("#cf-typed", ECHO_DEL)
+            before = auths["root"].asserted
+            with root.context.expect_page(timeout=30_000) as pinfo:
+                root.click("#cf-approve")
+            popup = pinfo.value
+            copies = [dict(c, signCount=c.get("signCount", 0) + 1000) for c in auths["root"].credentials()]
+            pauth = base.Authenticator(popup, credentials=copies)
+            prompted = drive_popup(popup, "root-confirm")
+            root.wait_for_selector('#confirm[data-state="approved"]', timeout=60_000)
+            base.shot(root, "ai-confirm-approved")
+            print(f"    approved: passkey prompts {prompted}, assertions popup {pauth.asserted} + page "
+                  f"{auths['root'].asserted - before}", flush=True)
+            assert pauth.asserted + auths["root"].asserted - before >= 1, "no fresh authenticator touch"
+            # The retry runs the tool (the Hub answers 202: an accepted op).
+            rc3, doc3 = mcp_call(HUB_MCP, tf, "tools/call", "delete_instance", args)
+            assert rc3 == 0 and "result" in doc3, doc3
+            res3 = doc3["result"]
+            text3 = text_of(res3)
+            print(f"    retry after the approval: isError {res3.get('isError')}: {text3[:200]}", flush=True)
+            assert not res3.get("isError"), text3[:300]
+            op = res3.get("structuredContent") or json.loads(text3)
+            assert op.get("op_id") and op.get("instance") == ECHO_DEL and op.get("poll"), op
+            # The approval was single use: once more = a new confirmation.
+            err4, text4 = call_text(HUB_MCP, tf, "delete_instance", args)
+            m4 = CONFIRM_RE.search(text4)
+            print(f"    a second retry: isError {err4}: {text4[:160]}", flush=True)
+            assert err4 and m4 and m4.group(0) != url, text4[:300]
+            until("echo-del deleted (op record)", lambda: (lambda d: d.get("op_id") == op["op_id"] and not d.get("running")
+                                                           and d)(hub_ok("GET", op["poll"])), 300, every=5)
+            rec = hub_ok("GET", op["poll"])
+            assert rec.get("ok") is True, f"delete op: {json.dumps(rec)[:400]}"
+
+            def audited():
+                es = json.loads(hub("GET", "/api/directory/audit?via=ai")[1])
+                hit = [e for e in es if e.get("action") == "instance.delete" and e.get("target") == ECHO_DEL]
+                return hit and hit[0]
+            e = until("instance.delete audited via ai", audited, 60)
+            print(f"    audit: {json.dumps({k: e.get(k) for k in ('actor', 'action', 'target', 'result', 'via', 'client', 'detail')})}",
+                  flush=True)
+            assert e.get("via") == "ai" and e.get("client") == CLIENT and e.get("actor") == "root" \
+                and e.get("result") == "ok", e
+            assert norm_id(cid) in norm_id(e.get("detail") or ""), f"the confirmation id {cid} isn't in the detail: {e.get('detail')!r}"
+        check("destructive_confirmation: root's delete_instance on hub.<d>/mcp → the confirmation link (text); pending "
+              "retry waits; bob can't open it (group-gate / Hub 404); root types the id + fresh passkey → approved; the "
+              "retry is accepted (202 op); a second retry → a new confirmation; audit instance.delete via ai, client "
+              "portcullis-ai-claude-code, confirmation id", destructive_confirmation)
+
+        # ── 6 ──
+        def aggregate_lists():
+            ctf = mcp_login(carol, MCP_ALL, "carol-all")
+            show("carol's aggregate token", ctf)
+
+            def carol_names():
+                n = tool_names(MCP_ALL, ctf)
+                ok = any(x.startswith("gitea__") for x in n) and any(x.startswith("grafana__") for x in n)
+                if not ok:
+                    print(f"    carol's aggregate so far: {n[:12]}…", flush=True)
+                return ok and n
+            names = until("carol sees gitea__* and grafana__*", carol_names, 120, every=10)
+            print(f"    carol: {len(names)} tools, e.g. {[x for x in names if '__' in x][:8]}", flush=True)
+            assert "portcullis__my_apps" in names, [x for x in names if x.startswith("portcullis__")]
+            assert not any(x.startswith("gitea-b__") for x in names), "carol isn't in gitea-b"
+            # Grafana through the gate as carol (identity_headers: Hub
+            # override, trust network, caller secret, Grafana's auth proxy).
+            err, text = call_text(MCP_ALL, ctf, "grafana__search_dashboards", {"query": ""})
+            print(f"    grafana__search_dashboards as carol: isError {err}: {text[:200]}", flush=True)
+            assert not err, text[:400]
+            act = hub_ok("GET", "/api/ai/activity?n=200")
+            lines = [x for x in act.get("lines") or [] if x.get("user") == "carol" and x.get("instance") == "grafana"
+                     and x.get("tool") == "search_dashboards"]
+            assert any(x.get("decision") == "allow" and x.get("via") == "aggregate" and x.get("upstream_status") == 200
+                       for x in lines), f"access log: {json.dumps(lines)[:600]}"
+            # bob: gitea only.
+            btf = mcp_login(bob, MCP_ALL, "bob-all")
+            bn = until("bob sees gitea__*", lambda: (n := tool_names(MCP_ALL, btf)) and any(x.startswith("gitea__") for x in n) and n,
+                       120, every=10)
+            assert not any(x.startswith("grafana__") for x in bn), [x for x in bn if x.startswith("grafana__")]
+            # root: no admin tool on the aggregate.
+            rtf = mcp_login(root, MCP_ALL, "root-all")
+            rn = tool_names(MCP_ALL, rtf)
+            hub_tf = state.get("root_hub")
+            if not hub_tf or time.time() - state.get("root_hub_at", 0) > TOKEN_FRESH_S:
+                hub_tf = mcp_login(root, HUB_MCP, "root-hub")
+            admin = set(tool_names(HUB_MCP, hub_tf))
+            people = {x.removeprefix("portcullis__") for x in names if x.startswith("portcullis__")}
+            leaked = sorted(x for x in rn if x.startswith("portcullis__") and x.removeprefix("portcullis__") in admin - people)
+            print(f"    root's aggregate: {len(rn)} tools; admin-only tools {len(admin - people)}; leaked {leaked}", flush=True)
+            assert "delete_instance" in admin and not leaked, leaked
+            assert "portcullis__delete_instance" not in rn and "portcullis__my_apps" in rn, rn
+        check("aggregate_lists: carol (gitea + grafana) sees gitea__* + grafana__* + portcullis__my_apps and runs "
+              "grafana__search_dashboards through the gate (identity_headers, access log allow 200); bob (gitea) sees no "
+              "grafana__*; root's aggregate has no admin tool", aggregate_lists)
+
+        # ── 2 (alice leaves) ──
         def leaver_refused_and_revoked():
             tf = mcp_login(alice, GITEA_MCP, "alice-gitea-leave")
             assert "alice-private" in list_my_repos(tf)
@@ -595,6 +806,27 @@ def main() -> int:
             assert refused(GITEA_MCP, tf) == 403, "alice is allowed again"
         check("leaver_refused_and_revoked: alice removed from users_gitea (Hub API) → her next call 403; her Gitea "
               "portcullis-ai-* token deleted (Gitea API)", leaver_refused_and_revoked)
+
+        # ── 7 (last) ──
+        def ai_off():
+            hub_ok("PUT", "/api/ai/settings", {"enabled": False})
+            init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "ci", "version": "1"}}}).encode()
+            urls = (GITEA_MCP, GITEA_B_MCP, GRAFANA_MCP, MCP_ALL, HUB_MCP, PEOPLE_MCP)
+
+            def all_off():
+                got = {u: https("POST", u, {"Content-Type": "application/json",
+                                            "Accept": "application/json, text/event-stream"}, init)[:3:2] for u in urls}
+                print(f"    {[(u, c) for u, (c, _) in got.items()]}", flush=True)
+                return all(c == 503 and "AI support is off" in b for c, b in got.values()) and got
+            until("every MCP resource 503", all_off, 120, every=5)
+            tf = state.get("root_hub")
+            if tf:
+                rc, doc = mcp_call(HUB_MCP, tf)
+                print(f"    root's admin token: {doc}", flush=True)
+                assert rc == 2 and doc.get("http_status") in (401, 503), doc
+        check("ai_off: master switch off → every MCP resource (gitea, gitea-b, grafana, mcp, hub, people) answers 503 "
+              "\"AI support is off\"", ai_off)
 
         failed = any(not ok for _, ok, _ in results)
         for who, ctx in ctxs.items():

@@ -2128,7 +2128,7 @@ jobs:
           {
             docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh \
-              | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
+              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         uses: ./.github/actions/cached-images
@@ -2477,12 +2477,7 @@ jobs:
   # browser scenarios; the instance backup / delete / restore checks run
   # against a real daemon at the end.
   e2e-instances:
-    # ubuntu-26.04 (ubuntu-latest since 2026-11) runs Docker with the
-    # containerd image store, where `docker image rm -f` of an image a
-    # running container uses (the echo fixture's hold service is the helper
-    # image) keeps it: the "helper pulled by digest" check needs the classic
-    # store. Follow-up: give hold its own image, then go back to latest.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       E2E_DOMAIN: portcullis.local
@@ -2536,7 +2531,7 @@ jobs:
           {
             docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
-              | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
+              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         uses: ./.github/actions/cached-images
@@ -3004,7 +2999,7 @@ jobs:
           {
             docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
-              | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
+              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         uses: ./.github/actions/cached-images
@@ -3345,7 +3340,7 @@ jobs:
           {
             docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
-              | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
+              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         uses: ./.github/actions/cached-images
@@ -3619,7 +3614,7 @@ jobs:
           {
             docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
-              | grep -E '^(alpine|traefik/whoami|curlimages/curl):'
+              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         uses: ./.github/actions/cached-images
@@ -3807,12 +3802,12 @@ jobs:
           docker compose down -v
           sudo rm -rf "$E2E_FAMILY"
 
-  # AI support end to end (contract §15, plan 4 Task 30 — the early slice,
-  # preflight G61: scenarios 1–4): the whole stack + the Hub (same-named Hub
-  # branch) with one local template source = the templates repo's gitea
-  # (same-named templates branch, else main: its ai: block, the official
-  # gitea-mcp companion and the mint / revoke hooks), two instances (gitea,
-  # gitea-b). tests/e2e/mcpclient (the official MCP Go SDK) runs on the
+  # AI support end to end (contract §15, plan 4 Task 30): the whole stack +
+  # the Hub (same-named Hub branch) with one local template source = the
+  # templates repo's gitea (app_token: the official gitea-mcp, mint / revoke
+  # hooks) and grafana (identity_headers: mcp-grafana on its trust network)
+  # (same-named templates branch, else main) plus the CI fixture echo (the
+  # admin MCP's throwaway delete); instances gitea, gitea-b, grafana. tests/e2e/mcpclient (the official MCP Go SDK) runs on the
   # runner host (G60) as Claude Code would: RFC 9728 discovery, Keycloak's
   # authorization code flow with PKCE and `resource` for
   # portcullis-ai-claude-code, a loopback callback on 127.0.0.1:33418, then
@@ -3820,10 +3815,11 @@ jobs:
   # tests/e2e/e2e_ai.py (Playwright, CDP virtual authenticator for the
   # sign-in and consent): AI set up through the Hub's API as the CI admin
   # root (never LLDAP's admin), then gitea_as_alice, audience_separation,
-  # no_token_crossing, leaver_refused_and_revoked.
+  # no_token_crossing, destructive_confirmation, aggregate_lists,
+  # leaver_refused_and_revoked, ai_off.
   e2e-ai:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
@@ -3845,6 +3841,8 @@ jobs:
           echo "Templates: portcullis-templates@$ref ($(git -C "$RUNNER_TEMP/templates" rev-parse --short HEAD))" | tee -a "$GITHUB_STEP_SUMMARY"
           grep -q '^ai:' "$RUNNER_TEMP/templates/gitea/manifest.yaml" \
             || { echo "FAIL: the templates checkout's gitea has no ai: block"; exit 1; }
+          grep -q 'mode: identity_headers' "$RUNNER_TEMP/templates/grafana/manifest.yaml" \
+            || { echo "FAIL: the templates checkout's grafana has no identity_headers companion"; exit 1; }
 
       - name: Generate .env and the CI override (Pebble, fake DNS provider, app hostnames on Traefik)
         run: |
@@ -3898,8 +3896,8 @@ jobs:
         run: |
           {
             docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
-            grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh \
-              | grep -E '^(alpine|curlimages/curl):'
+            grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
+              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         uses: ./.github/actions/cached-images
@@ -3910,7 +3908,7 @@ jobs:
       - name: Pull the template's images (by digest)
         run: |
           set -o pipefail
-          grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' "$RUNNER_TEMP/templates/gitea/compose.yml" \
+          grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' "$RUNNER_TEMP"/templates/{gitea,grafana}/compose.yml \
             | sort -u > "$RUNNER_TEMP/app-images.txt"
           cat "$RUNNER_TEMP/app-images.txt"
           pull() { for i in 1 2 3 4; do docker pull -q "$1" >/dev/null && return 0; sleep $((i * 15)); done; echo "FAIL: pull $1"; return 1; }
@@ -3978,7 +3976,7 @@ jobs:
       - name: Hub image (same-named Hub branch → built here, else the published one)
         uses: ./.github/actions/hub-image
 
-      - name: Start the whole stack (Hub with the gitea template source)
+      - name: Start the whole stack (Hub with the gitea / grafana / echo template source)
         run: |
           PEBBLE_IMG=$(docker compose config --format json | jq -r .services.pebble.image)
           cid="$(docker create "$PEBBLE_IMG")"; docker cp "$cid:/test/certs/pebble.minica.pem" /tmp/pebble.minica.pem; docker rm "$cid" >/dev/null
@@ -3988,11 +3986,13 @@ jobs:
           ./portcullis pki setup --with-server-cert
           ./portcullis config apply --bundle-only
           printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
-          # The Hub's only template source: gitea from the templates
-          # checkout, as a local source (path, no URL: never pulled).
+          # The Hub's only template source: gitea and grafana from the
+          # templates checkout and the CI fixture echo (the throwaway
+          # instance of the admin MCP's delete), as a local source (path,
+          # no URL: never pulled).
           docker volume create --label com.docker.compose.project=portcullis --label com.docker.compose.volume=hub_data portcullis_hub_data >/dev/null
-          docker run --rm -v portcullis_hub_data:/data -v "$RUNNER_TEMP/templates:/tpl:ro" "$ALPINE" sh -c '
-            mkdir -p /data/repos/ci && cp -r /tpl/gitea /data/repos/ci/ &&
+          docker run --rm -v portcullis_hub_data:/data -v "$RUNNER_TEMP/templates:/tpl:ro" -v "$PWD/tests/e2e/apps:/src:ro" "$ALPINE" sh -c '
+            mkdir -p /data/repos/ci && cp -r /tpl/gitea /tpl/grafana /src/echo /data/repos/ci/ &&
             printf "sources:\n  - name: ci\n    url: \"\"\n    path: /data/repos/ci\n" > /data/state.yaml &&
             chown -R 10001:10001 /data && chmod 600 /data/state.yaml'
           # shellcheck disable=SC2046
@@ -4020,7 +4020,7 @@ jobs:
             sleep 2
           done
 
-      - name: CI users (root in lldap_admin, alice, bob) and setup links
+      - name: CI users (root in lldap_admin, alice, bob, carol) and setup links
         run: |
           set -o pipefail
           # The users are created with the Hub's own LLDAP service account
@@ -4032,13 +4032,14 @@ jobs:
           [ -n "$LLDAP_TOKEN" ] && [ "$LLDAP_TOKEN" != null ] || { echo "FAIL: LLDAP login as the Hub's service account"; exit 1; }
           gql() { jq -n --arg q "$1" '{query: $q}' | curl -sf http://127.0.0.1:17170/api/graphql \
                     -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @-; }
-          for u in root alice bob; do
+          for u in root alice bob carol; do
             gql "mutation { createUser(user: {id: \"$u\", email: \"$u@portcullis.local\"}) { id } }" | jq -e '.errors == null' >/dev/null
           done
           gid=$(gql '{ groups { id displayName } }' | jq -r '.data.groups[] | select(.displayName == "lldap_admin") | .id')
           gql "mutation { addUserToGroup(userId: \"root\", groupId: $gid) { ok } }" | jq -e '.errors == null' >/dev/null
-          echo "127.0.0.1 portcullis.local auth.portcullis.local enroll.portcullis.local hub.portcullis.local people.portcullis.local mcp.portcullis.local gitea.portcullis.local gitea-b.portcullis.local" | sudo tee -a /etc/hosts
-          for spec in "E2E_ALICE_INVITE alice" "E2E_BOB_INVITE bob"; do
+          echo "127.0.0.1 portcullis.local auth.portcullis.local enroll.portcullis.local hub.portcullis.local people.portcullis.local mcp.portcullis.local gitea.portcullis.local gitea-b.portcullis.local grafana.portcullis.local" | sudo tee -a /etc/hosts
+          # root is an administrator: only the CLI invites it (the Hub refuses).
+          for spec in "E2E_ROOT_INVITE root" "E2E_ALICE_INVITE alice" "E2E_BOB_INVITE bob" "E2E_CAROL_INVITE carol"; do
             read -r var who <<<"$spec"
             url="$(./portcullis invite "$who" --to portal --json | jq -r .url)"
             # Masked before anything can print it: a malformed link may still carry a token.
@@ -4066,7 +4067,7 @@ jobs:
           certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
           certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
 
-      - name: Run the AI scenarios (MCP client through mcp-gate with Keycloak OAuth)
+      - name: Run the AI scenarios 1–7 (MCP client through mcp-gate with Keycloak OAuth)
         env:
           E2E_HUB_ACTOR: root
         run: |
@@ -4092,8 +4093,9 @@ jobs:
           done
           # AI state (no credential: the Hub's views carry metadata only; the
           # gate files' credentials are age-encrypted and not copied).
-          for p in /api/ai/settings /api/instances/gitea/ai /api/instances/gitea-b/ai /api/instances/gitea/op \
-                   /api/instances/gitea-b/op "/api/ai/activity?n=200" /api/directory/audit; do
+          for p in /api/ai/settings /api/instances/gitea/ai /api/instances/gitea-b/ai /api/instances/grafana/ai \
+                   /api/instances/gitea/op /api/instances/gitea-b/op /api/instances/grafana/op /api/instances/echo-del/op \
+                   "/api/ai/activity?n=200" /api/directory/audit; do
             curl -s -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: root\n' "$SECRET") \
               "http://$HUB_IP:8888$p" > "e2e-artifacts/api$(echo "${p%%\?*}" | tr / _).json" 2>&1 || true
           done

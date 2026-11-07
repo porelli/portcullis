@@ -11,8 +11,11 @@ services:
       traefik.http.routers.echo.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.services.echo.loadbalancer.server.port: "80"
   # PID 1 shell that ignores SIGTERM: compose down waits ECHO_STOP_GRACE.
+  # Its own image (never the Hub's helper alpine): e2e-instances removes the
+  # helper image while echo instances run and checks the Hub pulls it by
+  # digest, which Docker's containerd image store refuses for an image in use.
   hold:
-    image: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+    image: busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
     command: ["sh", "-c", "trap '' TERM; while :; do sleep 1; done"]
     stop_grace_period: ${ECHO_STOP_GRACE:-1s}
     network_mode: none
