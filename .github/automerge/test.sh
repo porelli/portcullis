@@ -21,6 +21,8 @@ cat > "$WORK/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 echo "gh $*" >> "$GH_LOG"
 for a in "$@"; do [ "$a" = body=@- ] && { cat >> "$GH_LOG"; echo >> "$GH_LOG"; }; done
+# A failing merge: $FIX/merge.err is what gh prints (exit 1).
+[ "$1 ${2:-}" = "pr merge" ] && [ -f "$FIX/merge.err" ] && { cat "$FIX/merge.err" >&2; exit 1; }
 [ "$1" = api ] || exit 0
 shift; method=GET ep=
 while [ $# -gt 0 ]; do
@@ -346,6 +348,33 @@ setup; decide
 expect "action none (waiting)" '.action == "none" and .issue == "none" and .ci == "pending"'
 defaults; TEST=cancelled; setup; decide
 expect "cancelled = waiting" '.action == "none" and .ci == "pending"'
+
+echo "# green, but the merge itself fails -> no retry, no rebase request, run fails with the manual command"
+HINT="gh workflow run dependabot-automerge.yml -f pr=4 -f dry_run=false"
+merge_fails() { # description gh-error expected-cause
+  defaults; setup; decide
+  printf '%s\n' "$2" > "$FIX/merge.err"
+  local err rc=0
+  err=$(DECISION=$OUT bash "$SCRIPT" pr 2>&1 >/dev/null) || rc=$?
+  [ "$rc" -ne 0 ] && ok "$1: run fails" || bad "$1: run fails" "exit $rc"
+  grep -qF "::error::PR #4 not merged at $SHA: $3" <<<"$err" && ok "$1: cause in the error" || bad "$1: cause in the error" "$err"
+  grep -qF "Not retried automatically" <<<"$err" && grep -qF "$HINT" <<<"$err" \
+    && ok "$1: manual retry command" || bad "$1: manual retry command" "$err"
+  grep -qF "$2" <<<"$err" && ok "$1: gh output kept" || bad "$1: gh output kept" "$err"
+  logged "$1: merge attempted once" "^gh pr merge 4 "
+  [ "$(grep -c '^gh pr merge' "$GH_LOG")" = 1 ] && ok "$1: no retry" || bad "$1: no retry" "$(tr '\n' '|' < "$GH_LOG")"
+  not_logged "$1: no comment (no @dependabot rebase)" "comments|@dependabot"
+  not_logged "$1: branch kept" "DELETE"
+}
+merge_fails "base branch modified" "GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest)" "the base branch moved during the merge"
+merge_fails "base branch modified again (same SHA)" "GraphQL: Base branch was modified. Review and try the merge again. (mergePullRequest)" "the base branch moved during the merge"
+merge_fails "502" 'non-200 OK status code: 502 Bad Gateway body: "<html><head><title>502 Bad Gateway</title></head></html>"' "GitHub returned a server error"
+merge_fails "HTTP 503" "HTTP 503: Service Unavailable (https://api.github.com/graphql)" "GitHub returned a server error"
+merge_fails "other failure" "GraphQL: Pull request is not mergeable (mergePullRequest)" "gh pr merge failed"
+defaults; setup; decide
+SUM=$WORK/summary; : > "$SUM"; printf 'HTTP 502\n' > "$FIX/merge.err"
+GITHUB_STEP_SUMMARY=$SUM DECISION=$OUT bash "$SCRIPT" pr >/dev/null 2>&1 || true
+grep -qF "$HINT" "$SUM" && ok "step summary has the manual command" || bad "step summary has the manual command" "$(cat "$SUM")"
 
 echo "# refusals"
 defaults; AUTHOR=someone; setup; decide

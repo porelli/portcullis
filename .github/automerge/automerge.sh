@@ -39,7 +39,12 @@
 #   - majors (and anything whose type can't be derived) are labelled
 #     `major-update` and left open;
 #   - red: the PR stays open and one issue per app + version jump (label
-#     `update-failed`) gets the failing jobs and run links.
+#     `update-failed`) gets the failing jobs and run links;
+#   - a merge that fails although CI passed (GitHub's "Base branch was
+#     modified" race, a 5xx, anything) is never retried: the run fails with
+#     the cause and the manual re-run command. No `@dependabot rebase` either:
+#     Dependabot answers comments from github-actions[bot] (and GitHub Apps)
+#     with "only users with push access can use that command".
 #
 # Env: REPO (owner/name), BASE_BRANCH (default main), and
 #   decide:   RUN_ID (triggering workflow run) or PR (number);
@@ -303,6 +308,26 @@ ensure_label() { # name color description
   api -X POST "repos/$REPO/labels" -f name="$1" -f color="$2" -f description="$3" >/dev/null 2>&1 || true
 }
 
+# CI passed but `gh pr merge` failed: say why and how to retry, then fail the
+# run. No automatic retry or rebase request (see Rules in the header).
+merge_failed() { # pr sha gh-output
+  local why retry="gh workflow run dependabot-automerge.yml -f pr=$1 -f dry_run=false"
+  if [[ $3 == *"Base branch was modified"* ]]; then
+    why="the base branch moved during the merge (another PR merged at the same moment); the PR head and its CI are unchanged"
+  elif [[ $3 =~ (HTTP|status\ code:)\ 5[0-9][0-9] ]]; then
+    why="GitHub returned a server error; check the PR first, a 5xx can still have merged it"
+  else
+    why="gh pr merge failed"
+  fi
+  [ -z "$3" ] || printf '%s\n' "$3" >&2
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    # shellcheck disable=SC2016  # markdown fence, not an expansion
+    printf '### Merge of #%s failed\n\n%s. Not retried automatically. If the PR is still open, retry by hand (in %s):\n\n```\n%s\n```\n' \
+      "$1" "$why" "$REPO" "$retry" >> "$GITHUB_STEP_SUMMARY"
+  fi
+  die "PR #$1 not merged at $2: $why. Not retried automatically. If the PR is still open, retry by hand (in $REPO, or add -R $REPO): $retry"
+}
+
 pr_act() {
   need_decision
   local pr sha branch
@@ -311,7 +336,10 @@ pr_act() {
     merge)
       # --match-head-commit: GitHub refuses the merge if the head moved after
       # the tested SHA.
-      gh pr merge "$pr" -R "$REPO" --squash --match-head-commit "$sha"
+      local out
+      out=$(gh pr merge "$pr" -R "$REPO" --squash --match-head-commit "$sha" 2>&1) \
+        || merge_failed "$pr" "$sha" "$out"
+      [ -z "$out" ] || echo "$out"
       [[ $branch == dependabot/* ]] && { api -X DELETE "repos/$REPO/git/refs/heads/$branch" >/dev/null 2>&1 || true; }
       echo "Merged #$pr at $sha"
       ;;
