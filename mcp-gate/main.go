@@ -96,12 +96,19 @@ func healthcheck(listen string) int {
 	if err != nil {
 		return 1
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return 1
 	}
+	// The detail line (if any) goes to Docker's health log.
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	_, _ = os.Stdout.Write(b)
 	return 0
 }
+
+// RefusingPrefix starts /healthz's second line while the Hub's files are
+// refused (every AI resource answers 503); scripts/lib/status.sh greps it.
+const RefusingPrefix = "refusing every AI request (503): "
 
 func loadIdentity(path string) (age.Identity, error) {
 	b, err := os.ReadFile(path)
@@ -229,8 +236,15 @@ func newHandler(snap func() *config.Snapshot, v *authz.Verifier, fwd forwarder, 
 			return
 		}
 		if r.URL.Path == "/healthz" && isLoopback(r.RemoteAddr) {
+			// Still 200 (Traefik drops unhealthy containers; the gate's own
+			// 503 says more): the second line is what `mcp-gate
+			// healthcheck` prints into Docker's health log, which
+			// `./portcullis status` shows (final review, docs M4).
 			w.WriteHeader(http.StatusOK)
 			_, _ = io.WriteString(w, "ok\n")
+			if sn := snap(); sn != nil && sn.Err != nil {
+				_, _ = io.WriteString(w, RefusingPrefix+sn.Err.Error()+"\n")
+			}
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, meta.Prefix) {

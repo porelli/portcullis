@@ -186,10 +186,23 @@ CORE_PROXY_SERVICES="traefik mcp-gate grafana"
 # answer only to its own service, which must be in CORE_PROXY_SERVICES. Any
 # other container is flagged for every core name it answers to (container
 # name, hostname, network alias, DNS name; folded, a trailing dot ignored)
-# and for claiming a core service label or a core container name. Exit 2 on
-# any docker error (fail closed); nothing when the network doesn't exist.
+# and for claiming a core service label or a core container name.
+#
+# AI companion names (final review I4): mcp-gate sends app tokens and
+# caller secrets to `portcullis-mcp-<instance>--<companion>` through Docker
+# DNS on portcullis-proxy, so those names (`portcullis-mcp-` with a `--`;
+# core's own portcullis-mcp-gate-1 has none) are guarded too. Such a name is
+# allowed only as a portcullis-proxy network alias of a container that
+# `docker compose -p portcullis-<instance> ps -aq` lists (the Hub's
+# project for that instance), and only ONE container may answer to it (a
+# second one would join Docker's round-robin). A core container, a
+# container name or hostname with that prefix, a malformed name, a
+# container outside that project, and every container sharing a name
+# with another are flagged. Exit 2 on any docker error (fail closed);
+# nothing when the network doesn't exist.
 proxy_dns_shadows() {
-  local ids id core info project="${COMPOSE_PROJECT_NAME:-portcullis}" exempt
+  local ids id core info project="${COMPOSE_PROJECT_NAME:-portcullis}" exempt out line
+  local mcp="" cid cname alias inst members
   if ! ids="$(docker network inspect "$PROXY_NETWORK" --format '{{range $k, $v := .Containers}}{{$k}} {{end}}' 2>/dev/null)"; then
     local listed
     listed="$(docker network ls --format '{{.Name}}' 2>/dev/null)" || return 2
@@ -202,14 +215,20 @@ proxy_dns_shadows() {
     info="$(docker inspect --format '{{json .}}' "$id" 2>/dev/null)" || return 2
     exempt=false
     ! printf '%s\n' "$core" | grep -qxF -- "$id" || exempt=true
-    printf '%s' "$info" | jq -r --arg net "$PROXY_NETWORK" --arg proj "$project" --arg core " $CORE_SERVICE_NAMES " \
+    # "F <container> <name...>": flagged; "M <container> <alias> <instance>":
+    # an AI companion alias whose project membership is checked below.
+    out="$(printf '%s' "$info" | jq -r --arg net "$PROXY_NETWORK" --arg proj "$project" --arg core " $CORE_SERVICE_NAMES " \
         --arg proxy " $CORE_PROXY_SERVICES " --argjson exempt "$exempt" '
         ((.Name // "") | ltrimstr("/")) as $n
         | ((.Config.Labels // {})["com.docker.compose.service"] // "") as $svc
         | ((.Config.Labels // {})["com.docker.compose.project"] // "") as $p
-        | ([$n, (.Config.Hostname // ""), ((.NetworkSettings.Networks[$net] // {}) | (.Aliases // [])[], (.DNSNames // [])[])]
-           | map(ascii_downcase | rtrimstr(".")) | unique | map(select(. as $x | $x != "" and ($core | contains(" " + $x + " "))))) as $hits
-        | if $exempt then
+        | (.NetworkSettings.Networks[$net] // {}) as $nw
+        | ([$n, (.Config.Hostname // ""), ($nw | (.Aliases // [])[], (.DNSNames // [])[])]
+           | map(ascii_downcase | rtrimstr(".")) | unique) as $all
+        | ($all | map(select(. as $x | $x != "" and ($core | contains(" " + $x + " "))))) as $hits
+        | ([$n, (.Config.Hostname // "")] | map(ascii_downcase | rtrimstr("."))) as $own
+        | ($all | map(select(startswith("portcullis-mcp-") and contains("--")))) as $ai
+        | (if $exempt then
             (if ($proxy | contains(" " + $svc + " ")) and $svc != "" then empty
              else "\($n) \($svc) (core service not on portcullis-proxy)" end),
             ($hits[] | select(. != $svc) | "\($n) \(.)")
@@ -218,8 +237,39 @@ proxy_dns_shadows() {
             (if $p == $proj and $svc != "" and ($core | contains(" " + $svc + " ")) then "\($n) \($svc) (core service label)" else empty end),
             ($n | capture("^" + $proj + "-(?<s>.+)-[0-9]+$")? | .s | select(. as $s | $core | contains(" " + $s + " "))
               | select(. != $svc or $p != $proj) | "\($n) \(.) (core container name)")
-          end' || return 2
+          end | "F " + .),
+          ($ai[] as $a
+           | ([$a | capture("^portcullis-mcp-(?<i>[a-z0-9]+(-[a-z0-9]+)*)--[a-z0-9]+(-[a-z0-9]+)*$")?] | .[0]) as $m
+           | if $exempt then "F \($n) \($a) (AI companion name on a core container)"
+             elif ($own | index($a)) != null then "F \($n) \($a) (AI companion name as container name or hostname)"
+             elif $m == null then "F \($n) \($a) (malformed AI companion name)"
+             else "M \($n) \($a) \($m.i)" end)' )" || return 2
+    while IFS= read -r line; do
+      case "$line" in
+        "F "*) printf '%s\n' "${line#F }" ;;
+        "M "*) mcp="$mcp$id ${line#M }"$'\n' ;;
+      esac
+    done <<< "$out"
   done
+  [ -n "$mcp" ] || return 0
+  # Project membership per instance (compose's own listing, run outside
+  # any compose file), then one container per alias.
+  local seen=""
+  while read -r cid cname alias inst; do
+    [ -n "$cid" ] || continue
+    case " $seen " in
+      *" $inst="*) members="$(printf '%s' "$seen" | tr ' ' '\n' | sed -n "s/^$inst=//p" | tr ',' '\n')" ;;
+      *)
+        members="$(cd / && docker compose -p "portcullis-$inst" ps -aq 2>/dev/null)" || return 2
+        seen="$seen $inst=$(printf '%s' "$members" | paste -sd, -)"
+        ;;
+    esac
+    if ! printf '%s\n' "$members" | grep -qxF -- "$cid"; then
+      printf '%s %s (AI companion name outside project portcullis-%s)\n' "$cname" "$alias" "$inst"
+    elif [ "$(printf '%s' "$mcp" | awk -v a="$alias" '$3 == a' | wc -l)" -gt 1 ]; then
+      printf '%s %s (AI companion name answered by more than one container)\n' "$cname" "$alias"
+    fi
+  done <<< "$mcp"
 }
 
 # network_state <name> <subnet> <range> — prints one of: missing | ok | mismatch
@@ -280,8 +330,8 @@ network_check() {
   local shadows
   shadows="$(proxy_dns_shadows)" || fail "could not inspect the containers on $PROXY_NETWORK (docker error): refusing to go on without the core-name check"
   if [ -n "$shadows" ]; then
-    fail "containers on $PROXY_NETWORK answer to core service names (a core service
-       resolving that name could reach them instead):
+    fail "containers on $PROXY_NETWORK answer to core service or AI companion names
+       (a core service or mcp-gate resolving that name could reach them instead):
 $(printf '%s\n' "$shadows" | sed 's/^\([^ ]*\) \(.*\)$/         \1 answers to "\2"/')
        Disable those apps in the Hub (or remove the containers), then run this again."
   fi

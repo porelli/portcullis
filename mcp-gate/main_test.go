@@ -107,6 +107,16 @@ func TestHandler(t *testing.T) {
 		if w.Code != 503 {
 			t.Errorf("%+v: %d", bad, w.Code)
 		}
+		// /healthz stays 200 and, for a refused file only, says why
+		// (Docker's health log, ./portcullis status: docs M4).
+		hr := req("GET", "x", "/healthz")
+		hr.RemoteAddr = "127.0.0.1:5555"
+		w = httptest.NewRecorder()
+		h.ServeHTTP(w, hr)
+		wantRefusing := bad.Err != nil
+		if w.Code != 200 || strings.Contains(w.Body.String(), RefusingPrefix) != wantRefusing || !strings.HasPrefix(w.Body.String(), "ok\n") {
+			t.Errorf("%+v healthz: %d %q", bad, w.Code, w.Body.String())
+		}
 	}
 }
 

@@ -187,7 +187,7 @@ func (s *Store) reload() {
 	}
 	sn := build(p, s.ident)
 	if sn.Err != nil {
-		log.Printf("mcp-gate: refusing every request: %v", sn.Err)
+		log.Printf("mcp-gate: every AI resource answers 503 until this is fixed: %v", sn.Err)
 	}
 	s.cur.Store(sn)
 }
@@ -263,7 +263,9 @@ func loadCreds(path string, ident age.Identity, f *File, sn *Snapshot) error {
 		}
 		secret, err := decrypt(e.Age, ident)
 		if err != nil {
-			return fmt.Errorf("credentials[%d]: %w", i, err)
+			// The Hub re-encrypts caller secrets to a new recipient, never
+			// credentials (final review, docs M4): the operator's way out.
+			return fmt.Errorf("credentials[%d]: %w (not encrypted to this gate's age.key: secrets/mcp-gate/age.key lost or replaced? restore it from a backup, or switch each app_token companion off and on in the Hub, which drops its credentials)", i, err)
 		}
 		sn.Creds[CredKey{e.Instance, e.Companion, e.User}] = Cred{ID: e.ID, MintedAt: e.MintedAt.Time, Secret: secret}
 	}

@@ -343,6 +343,13 @@ if [ "$1 $2" = "network ls" ]; then [ -f "$STUB_DIR/dns/net-listed" ] && echo po
 if [ "$1" = compose ]; then
   echo "$*" >> "$STUB_DIR/dns/compose-calls"
   [ -f "$STUB_DIR/dns/compose-fail" ] && exit 1
+  # An instance project (the AI companion check): its own id list.
+  if [ "$2" = -p ] && [ "$3" != portcullis ]; then
+    [ "$*" = "compose -p $3 ps -aq" ] || exit 1
+    [ "$PWD" = / ] || exit 1   # run outside any compose file
+    [ -f "$STUB_DIR/dns/proj-fail" ] && exit 1
+    cat "$STUB_DIR/dns/proj-$3" 2>/dev/null; exit 0
+  fi
   case "$*" in *" ps -aq") cat "$STUB_DIR/dns/core-ids" 2>/dev/null; exit 0 ;; esac
   exit 1
 fi
@@ -361,7 +368,7 @@ ctr() { # ctr <id> <name> <project> <service> <hostname> <aliases-json> [dnsname
 ctr c1 portcullis-traefik-1 portcullis traefik abc '["traefik","portcullis-traefik-1"]' '["portcullis-traefik-1","traefik","abc"]'
 ctr c2 portcullis-mcp-gate-1 portcullis mcp-gate def '["mcp-gate"]'
 ctr c3 portcullis-gitea-web-1 portcullis-gitea web web1 '["web","portcullis-mcp-gitea--gitea"]' '["portcullis-gitea-web-1","web"]'
-echo "c1 c2 c3" > "$STUB_DIR/dns/ids"; printf 'c1\nc2\n' > "$STUB_DIR/dns/core-ids"
+echo "c1 c2 c3" > "$STUB_DIR/dns/ids"; printf 'c1\nc2\n' > "$STUB_DIR/dns/core-ids"; echo c3 > "$STUB_DIR/dns/proj-portcullis-gitea"
 dns() { (PATH="$WORK/dnsbin:$PATH"; "$@"); }
 expect_eq "dns guard: core containers and a well-behaved app pass" "$(dns proxy_dns_shadows)" ""
 expect_ok "dns guard: core ids come from docker compose ps of the core project and file" \
@@ -381,6 +388,37 @@ echo "c1 c2 c3 c4 c5 c6 c7 c8 c9 c10" > "$STUB_DIR/dns/ids"; printf 'c1\nc2\nc10
 expect_eq "dns guard: alias, name, hostname, DNS name, forged labels / names, a core container's foreign name, a core service off its networks" \
   "$(dns proxy_dns_shadows | sort | paste -sd'|' -)" \
   "hub hub|portcullis-evil-web-1 keycloak|portcullis-evil3-app-1 lldap|portcullis-evil4-app-1 vault|portcullis-fake-1 keycloak (core service label)|portcullis-lldap-1 lldap (core service not on portcullis-proxy)|portcullis-postgres-2 postgres (core service label)|portcullis-traefik-1 hub"
+# Final review I4: AI companion names (mcp-gate sends credentials there).
+# Only a portcullis-proxy alias of a container compose lists for that
+# instance's project, and only one container per name.
+ctr m1 portcullis-evil-web-1 portcullis-evil web web '["web","portcullis-mcp-gitea--gitea"]'
+ctr m2 portcullis-mcp-gitea--gitea other web web '[]'
+ctr m3 portcullis-other-app-1 portcullis-other app portcullis-mcp-other--app '[]'
+ctr m4 portcullis-other-x-1 portcullis-other x x '["portcullis-mcp-Other--x-"]'
+ctr m5 portcullis-mcp-gate-1 portcullis mcp-gate def '["mcp-gate","portcullis-mcp-a--b"]'
+echo c2 > "$STUB_DIR/dns/core-ids"
+echo "c2 c3 m1" > "$STUB_DIR/dns/ids"
+expect_eq "dns guard: an AI companion alias outside the instance's project" \
+  "$(dns proxy_dns_shadows | sort | paste -sd'|' -)" \
+  "portcullis-evil-web-1 portcullis-mcp-gitea--gitea (AI companion name outside project portcullis-gitea)|portcullis-gitea-web-1 portcullis-mcp-gitea--gitea (AI companion name answered by more than one container)"
+# A forged project label: compose lists it, but two containers answer.
+printf 'c3\nm1\n' > "$STUB_DIR/dns/proj-portcullis-gitea"
+expect_eq "dns guard: two containers of the project answering to one AI companion name" \
+  "$(dns proxy_dns_shadows | sort | paste -sd'|' -)" \
+  "portcullis-evil-web-1 portcullis-mcp-gitea--gitea (AI companion name answered by more than one container)|portcullis-gitea-web-1 portcullis-mcp-gitea--gitea (AI companion name answered by more than one container)"
+echo c3 > "$STUB_DIR/dns/proj-portcullis-gitea"
+echo "c2 m2 m3 m4" > "$STUB_DIR/dns/ids"; echo m4 > "$STUB_DIR/dns/proj-portcullis-other"
+expect_eq "dns guard: AI companion names as container name / hostname, malformed after folding" \
+  "$(dns proxy_dns_shadows | sort | paste -sd'|' -)" \
+  "portcullis-mcp-gitea--gitea portcullis-mcp-gitea--gitea (AI companion name as container name or hostname)|portcullis-other-app-1 portcullis-mcp-other--app (AI companion name as container name or hostname)|portcullis-other-x-1 portcullis-mcp-other--x- (malformed AI companion name)"
+printf 'c2\nm5\n' > "$STUB_DIR/dns/core-ids"; echo "m5" > "$STUB_DIR/dns/ids"
+expect_eq "dns guard: a core container never answers to an AI companion name" \
+  "$(dns proxy_dns_shadows)" "portcullis-mcp-gate-1 portcullis-mcp-a--b (AI companion name on a core container)"
+echo c2 > "$STUB_DIR/dns/core-ids"; echo "c2 c3" > "$STUB_DIR/dns/ids"; touch "$STUB_DIR/dns/proj-fail"
+expect_fail "dns guard: an instance project that can't be listed fails closed" dns proxy_dns_shadows
+rm -f "$STUB_DIR/dns/proj-fail"
+printf 'c1\nc2\nc10\n' > "$STUB_DIR/dns/core-ids"
+echo "c1 c2 c3 c4 c5 c6 c7 c8 c9 c10" > "$STUB_DIR/dns/ids"
 expect_fail "guard: a container shadowing a core name aborts network_check" \
   bash -c "PATH='$WORK/dnsbin:$PATH'; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 OUT="$(PATH="$WORK/dnsbin:$PATH" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check" 2>&1)"
@@ -549,6 +587,18 @@ expect_eq "metrics_label escapes" "$(metrics_label 'a"b\c')" 'a\"b\\c'
 source "$HERE/../scripts/lib/status.sh"
 # shellcheck source=../scripts/lib/backup.sh
 source "$HERE/../scripts/lib/backup.sh"
+
+# ── status: mcp-gate refusing every AI request (docs review M4) ──
+# dc ps -q mcp-gate → an id; docker inspect → its health JSON.
+mst() { (dc() { [ "$*" = "ps -q mcp-gate" ] && cat "$STUB_DIR/mst-id" 2>/dev/null; }
+         docker() { [ "$1" = inspect ] && cat "$STUB_DIR/mst-health"; }; _st_mcp_refusing); }
+echo cid1 > "$STUB_DIR/mst-id"
+jq -n '{Status: "healthy", Log: [{Output: "ok\nrefusing every AI request (503): old"}, {Output: "ok\nrefusing every AI request (503): mcp-credentials.json: credentials[0]: no identity matched\n"}]}' > "$STUB_DIR/mst-health"
+expect_eq "status: mcp-gate refusing = the last health log's reason" "$(mst)" "refusing every AI request (503): mcp-credentials.json: credentials[0]: no identity matched"
+jq -n '{Status: "healthy", Log: [{Output: "ok\nrefusing every AI request (503): old"}, {Output: "ok\n"}]}' > "$STUB_DIR/mst-health"
+expect_eq "status: mcp-gate serving = nothing" "$(mst)" ""
+rm -f "$STUB_DIR/mst-id"
+expect_eq "status: mcp-gate not running = nothing" "$(mst)" ""
 
 # ── upgrade: pinned Hub image, policy file version (final review M1) ──
 # dc stub: exec prints $STUB_DIR/pv (the policy version), logs $STUB_DIR/gglog.
@@ -871,6 +921,19 @@ expect_eq "mcp-gate: stale age.pub rewritten" "$(cat "$M/age.pub")" "age1mcpgate
 printf 'AGE-SECRET-KEY-1XYZ\n' > "$M/age.key"
 expect_fail "mcp-gate: an age.key without '# public key:' fails" mcp mcpgate_ensure_secrets
 expect_eq "mcp-gate: ... and is kept" "$(cat "$M/age.key")" "AGE-SECRET-KEY-1XYZ"
+case "$(mcp mcpgate_ensure_secrets 2>&1)" in
+  *"never re-keys them"*"every AI resource would answer 503"*) t_pass "mcp-gate: the missing-recipient message says the gate refuses, not that the Hub re-mints" ;;
+  *) t_fail "mcp-gate: missing-recipient message" ;;
+esac
+# A lost key with a recipient left from it: regenerated, with the warning
+# that every AI resource answers 503 (docs review M4).
+rm -f "$M/age.key"
+MOUT="$(mcp mcpgate_ensure_secrets 2>&1)"
+case "$MOUT" in
+  *"was missing and has been regenerated"*"every AI resource answers 503"*"switch each app_token AI companion off and on"*) t_pass "mcp-gate: a regenerated key over an old recipient warns" ;;
+  *) t_fail "mcp-gate: regenerated key warning: $MOUT" ;;
+esac
+case "$MOUT" in *"mints new"*) t_fail "mcp-gate: says the Hub mints new credentials" ;; *) t_pass "mcp-gate: never claims the Hub re-mints" ;; esac
 expect_eq "mcp-gate: data volume owner = gate uid, Hub group" "$CT_UID_MCP_GATE:$CT_UID_HUB" "10005:10001"
 
 # ── public address detection (network.sh public_ip_detect; dns setup + domains) ──
