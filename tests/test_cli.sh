@@ -271,6 +271,200 @@ expect_eq "keycloak configure: realm offline bounds + refresh-token settings pus
       | select(has("revokeRefreshToken")) | {offlineSessionIdleTimeout, offlineSessionMaxLifespanEnabled, offlineSessionMaxLifespan, revokeRefreshToken, refreshTokenMaxReuse}] | unique' "$WORK/kc/log")" \
   '[{"offlineSessionIdleTimeout":2592000,"offlineSessionMaxLifespanEnabled":true,"offlineSessionMaxLifespan":7776000,"revokeRefreshToken":false,"refreshTokenMaxReuse":0}]'
 
+# ── Hub startup race fix: init starts hub after lldap_service_account,
+# up/upgrade restart hub only when the account changed ──
+# Mock docker compose to track calls: config --services returns the service list,
+# up/restart are logged. lldap_service_account is stubbed to return 0 (unchanged)
+# or 1 (changed) based on a signal file.
+mkdir -p "$WORK/dcbin"
+DC_CALLS="$WORK/dc-calls"
+cat > "$WORK/dcbin/docker" <<DCSTUB
+#!/usr/bin/env bash
+if [ "\$1" != compose ]; then exit 0; fi
+shift
+# Skip --project-directory and its value
+if [ "\$1" = "--project-directory" ]; then shift 2; fi
+# Now \$1 should be the command (config, up, restart, etc.)
+cmd="\$1"
+shift
+# Handle config --services specially
+if [ "\$cmd" = "config" ] && [ "\$1" = "--services" ]; then
+  printf 'vault\nlldap\nkeycloak\nhub\ntraefik\n'
+  exit 0
+fi
+# For other commands, filter out -d and --build, log the rest
+args=""
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -d|--build) shift; continue ;;
+    *) args="\$args \$1"; shift ;;
+  esac
+done
+printf '%s%s\n' "\$cmd" "\$args" >> "$DC_CALLS"
+exit 0
+DCSTUB
+chmod +x "$WORK/dcbin/docker"
+# Stub container_health: returns "healthy" for vault/lldap/keycloak, "running" for hub.
+cat > "$WORK/test-init-stub.sh" <<INITSTUB
+container_health() {
+  case "\$1" in
+    vault|lldap|keycloak|postgres) echo healthy ;;
+    hub) echo running ;;
+    *) echo missing ;;
+  esac
+}
+wait_healthy() {
+  local timeout="\$1"; shift
+  for svc in "\$@"; do
+    [ "\$(container_health "\$svc")" = healthy ] || return 1
+  done
+}
+# Stub the functions init_run calls that touch Vault/Keycloak/DNS.
+vault_init() { :; }
+pki_setup() { :; }
+config_build_ca_bundle() { :; }
+config_apply() { :; }
+keycloak_configure() { :; }
+oidc_register() { :; }
+network_check() { :; }
+stack_prepare() { :; }
+dns_setup() { :; }
+config_init() { :; }
+invite_create() { echo '{"url":"http://test","expires_at":"never"}'; }
+lldap_service_account() {
+  [ -f "\$LLDAP_ACCOUNT_CHANGED" ] && return 1 || return 0
+}
+INITSTUB
+# Source the common + stack libs with the stubs.
+LLDAP_ACCOUNT_CHANGED="$WORK/lldap-changed"
+rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
+(
+  export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED
+  # shellcheck disable=SC1091
+  . "$HERE/../scripts/lib/common.sh"
+  # shellcheck disable=SC1091
+  . "$WORK/test-init-stub.sh"
+  # shellcheck disable=SC1091
+  . "$HERE/../scripts/lib/stack.sh"
+  # Call init_run (env_only=false, skip_dns=true, config_repo=false).
+  init_run ci.example.org admin@ci.example.org none false true false >/dev/null 2>&1 || true
+)
+calls="$(cat "$DC_CALLS" 2>/dev/null || true)"
+expect_eq "init: first up excludes hub" \
+  "$(printf '%s\n' "$calls" | grep -c '^up.*vault.*lldap.*keycloak' || true)" 1
+expect_eq "init: first up does not include hub in the list" \
+  "$(printf '%s\n' "$calls" | grep '^up' | head -1 | grep -c 'hub' || true)" 0
+expect_eq "init: hub started after the service account step" \
+  "$(printf '%s\n' "$calls" | grep -n 'up' | tail -1 | cut -d: -f1)" \
+  "$(printf '%s\n' "$calls" | wc -l | tr -d ' ')"
+expect_eq "init: second up is 'up hub'" \
+  "$(printf '%s\n' "$calls" | tail -1 | tr -s ' ')" "up hub"
+
+# Test stack_up and upgrade_run: restart hub only when lldap_service_account changed.
+# Set up VAULT_INIT_FILE
+VAULT_INIT_FILE="$PORTCULLIS_ROOT/secrets/vault-init.json"
+mkdir -p "$PORTCULLIS_ROOT/secrets"
+echo '{}' > "$VAULT_INIT_FILE"
+cat > "$WORK/test-up-stub.sh" <<UPSTUB
+container_health() {
+  case "\$1" in vault|lldap|keycloak|postgres) echo healthy ;; *) echo running ;; esac
+}
+wait_healthy() {
+  local timeout="\$1"; shift
+  for svc in "\$@"; do [ "\$(container_health "\$svc")" = healthy ] || return 1; done
+}
+vault_init() { :; }
+pki_setup() { PKI_CREATED=false; PKI_TRUSTSTORE_CHANGED=false; }
+config_build_ca_bundle() { :; }
+config_apply() { :; }
+keycloak_configure() { :; }
+oidc_register() { :; }
+network_check() { :; }
+stack_prepare() { :; }
+domains_restart_if_renewed() { :; }
+monitoring_reload() { :; }
+hub_pinned_warn() { :; }
+backup_create() { :; }
+hub_policy_check() { :; }
+hub_sources_sync() { :; }
+lldap_service_account() {
+  [ -f "\$LLDAP_ACCOUNT_CHANGED" ] && return 1 || return 0
+}
+UPSTUB
+# stack_up when account unchanged: no restart.
+rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
+(
+  export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
+  export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
+  export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x HUB_PROXY_SECRET=x
+  # shellcheck disable=SC1091
+  . "$HERE/../scripts/lib/common.sh"
+  # shellcheck disable=SC1091
+  . "$WORK/test-up-stub.sh"
+  # shellcheck disable=SC1091
+  . "$HERE/../scripts/lib/stack.sh"
+  stack_up >/dev/null 2>&1 || true
+)
+expect_eq "up: account unchanged, no hub restart" \
+  "$(grep -c '^restart.*hub' "$DC_CALLS" 2>/dev/null || true)" 0
+
+# stack_up when account changed: restart hub.
+touch "$LLDAP_ACCOUNT_CHANGED"
+rm -f "$DC_CALLS"
+(
+  export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
+  export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
+  export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x HUB_PROXY_SECRET=x
+  # shellcheck disable=SC1091
+  . "$HERE/../scripts/lib/common.sh"
+  # shellcheck disable=SC1091
+  . "$WORK/test-up-stub.sh"
+  # shellcheck disable=SC1091
+  . "$HERE/../scripts/lib/stack.sh"
+  stack_up >/dev/null 2>&1 || true
+)
+expect_eq "up: account changed, hub restarted" \
+  "$(grep -c '^restart.*hub' "$DC_CALLS" 2>/dev/null || true)" 1
+
+# upgrade_run when account changed: restart hub.
+touch "$LLDAP_ACCOUNT_CHANGED"
+rm -f "$DC_CALLS"
+(
+  export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
+  export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
+  export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x HUB_PROXY_SECRET=x
+  # shellcheck disable=SC1091
+  . "$HERE/../scripts/lib/common.sh"
+  # shellcheck disable=SC1091
+  . "$WORK/test-up-stub.sh"
+  # shellcheck disable=SC1091
+  . "$HERE/../scripts/lib/stack.sh"
+  upgrade_run true >/dev/null 2>&1 || true
+)
+expect_eq "upgrade: account changed, hub restarted" \
+  "$(grep -c '^restart.*hub' "$DC_CALLS" 2>/dev/null || true)" 1
+
+# upgrade_run when account unchanged: no restart.
+rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
+(
+  export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
+  export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
+  export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x HUB_PROXY_SECRET=x
+  # shellcheck disable=SC1091
+  . "$HERE/../scripts/lib/common.sh"
+  # shellcheck disable=SC1091
+  . "$WORK/test-up-stub.sh"
+  # shellcheck disable=SC1091
+  . "$HERE/../scripts/lib/stack.sh"
+  upgrade_run true >/dev/null 2>&1 || true
+)
+expect_eq "upgrade: account unchanged, no hub restart" \
+  "$(grep -c '^restart.*hub' "$DC_CALLS" 2>/dev/null || true)" 0
+
 expect_eq "docker was never called" "$(cat "$STUB_CALLS" 2>/dev/null)" ""
 
 echo ""

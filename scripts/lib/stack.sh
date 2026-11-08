@@ -159,7 +159,14 @@ init_run() {
   config_apply
 
   info "Starting services..."
-  dc up -d --build
+  # Start everything except hub (needs LLDAP service account + Keycloak clients first).
+  local all_svcs hub_excluded=""
+  all_svcs="$(dc config --services | tr '\n' ' ')"
+  for s in $all_svcs; do
+    [ "$s" = hub ] || hub_excluded="$hub_excluded $s"
+  done
+  # shellcheck disable=SC2086
+  dc up -d --build $hub_excluded
   wait_healthy 300 vault postgres lldap keycloak
 
   info "Creating the Vault PKI..."
@@ -174,6 +181,17 @@ init_run() {
   keycloak_configure false
   oidc_register
   lldap_service_account
+
+  info "Starting the Hub..."
+  dc up -d hub
+  # Hub has no healthcheck: wait for the container to be running.
+  local i st
+  for ((i = 0; i < 60; i += 2)); do
+    st="$(container_health hub)"
+    [ "$st" = running ] && break
+    sleep 2
+  done
+  [ "$st" = running ] || warn "Hub did not start within 60s (status: $st)"
 
   if [ "$config_repo" = true ]; then
     config_init "" ""
@@ -219,7 +237,15 @@ stack_up() {
   domains_restart_if_renewed
   monitoring_reload
   wait_healthy 300 vault postgres lldap keycloak
-  lldap_service_account
+  # If the service account was created or its password changed, restart the Hub
+  # (which may have started with a stale/missing password).
+  if lldap_service_account; then
+    # Account unchanged: nothing to do.
+    :
+  else
+    info "Restarting the Hub to pick up the updated LLDAP credentials..."
+    dc restart hub >/dev/null
+  fi
   ok "Portcullis is up. Check: ./portcullis status"
 }
 
@@ -261,7 +287,15 @@ upgrade_run() {
   wait_healthy 300 vault postgres lldap keycloak
   keycloak_configure false
   oidc_register
-  lldap_service_account
+  # If the service account was created or its password changed, restart the Hub
+  # (which may have started with a stale/missing password).
+  if lldap_service_account; then
+    # Account unchanged: nothing to do.
+    :
+  else
+    info "Restarting the Hub to pick up the updated LLDAP credentials..."
+    dc restart hub >/dev/null
+  fi
   # Picks up a FORWARD_AUTH_CLIENT_SECRET generated above, if any.
   dc up -d forward-auth forward-auth-ext >/dev/null
   info "Checking the Hub's policy file against group-gate..."
