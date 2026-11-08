@@ -604,7 +604,9 @@ def main() -> int:
                     return c.get("status") == "on" and c.get("mode") == mode and c
                 until(f"{inst}'s companion on", companion_on, 180, every=5)
                 until(f"{inst}'s {comp}-mcp running", lambda: container(inst, f"{comp}-mcp"), 120, every=5)
-                state.setdefault("ai_ops", {})[inst] = hub_ok("GET", f"/api/instances/{inst}/op")
+                # The switch-on's own record (a later restart may have taken
+                # the instance's current one).
+                state.setdefault("ai_ops", {})[inst] = hub_ok("GET", e2e_ops.op_url(inst, r["op_id"]))
             gitea_routed()
             state["ai_audit"] = [e for e in json.loads(hub("GET", "/api/directory/audit")[1]) if e.get("action") == "ai.enable"]
             for url, scope in ((GITEA_MCP, SCOPE_GITEA), (GITEA_B_MCP, "mcp:gitea-b.gitea"), (GRAFANA_MCP, SCOPE_GRAFANA),
@@ -773,7 +775,7 @@ def main() -> int:
             print(f"    retry after the approval: isError {res3.get('isError')}: {text3[:200]}", flush=True)
             assert not res3.get("isError"), text3[:300]
             op = res3.get("structuredContent") or json.loads(text3)
-            assert op.get("op_id") and op.get("instance") == ECHO_DEL and op.get("poll"), op
+            assert op.get("op_id") and op.get("instance") == ECHO_DEL and op.get("poll") == e2e_ops.op_url(ECHO_DEL, op["op_id"]), op
             # The approval was single use: once more = a new confirmation.
             err4, text4 = call_text(HUB_MCP, tf, "delete_instance", args)
             m4 = CONFIRM_RE.search(text4)

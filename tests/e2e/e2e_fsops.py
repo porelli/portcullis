@@ -47,8 +47,8 @@ def run_op(hub: Callable, save: Callable[[str, object], None], method: str, path
 
     A busy 409 whose record is a running `restart` is the Hub's own queued
     restart (a membership or settings change restarts the app): that
-    restart must end ok, then the operation is sent once more. Any other
-    409 fails. Every failure message is scrubbed."""
+    restart, polled by its op_id, must end ok, then the operation is sent
+    once more. Any other 409 fails. Every failure message is scrubbed."""
     try:
         return _run_op(hub, save, method, path, body, timeout)
     except AssertionError as e:
@@ -65,7 +65,7 @@ def _run_op(hub: Callable, save: Callable[[str, object], None], method: str, pat
     if code == 409 and inst and isinstance(out, dict) and out.get("op") == "restart" and out.get("running") \
             and out.get("op_id"):
         print(f"    {method} {path}: busy with the Hub's restart {out['op_id']}: waiting for it", flush=True)
-        busy = {"op": "restart", "op_id": out["op_id"], "instance": inst, "poll": f"/api/instances/{inst}/op"}
+        busy = {"op": "restart", "op_id": out["op_id"], "instance": inst, "poll": e2e_ops.op_url(inst, out["op_id"])}
         e2e_ops.wait_ok(hub_get, busy, timeout)
         code, out = hub(method, path, body)
     assert code == 202, f"{method} {path}: HTTP {code} (want 202): {scrub(str(out))[:800]}"

@@ -5,7 +5,9 @@
 #
 # Every lifecycle route (enable, disable, restart, create, an AI switch on
 # an enabled instance, backup, restore, delete) answers 202
-# {op_id, op, instance, poll}; the record at `poll` is read every 2 s until
+# {op_id, op, instance, poll} with poll = /api/instances/<id>/op?op_id=<op_id>:
+# that op's own record, even after a newer op (the Hub's own queued
+# restart) replaced the instance's current one. It is read every 2 s until
 # it is no longer running, then `ok` decides. Never a retry: a busy 409
 # (the running record) or a failed record fails the step.
 
@@ -19,12 +21,16 @@ hubop_explain() {
 }
 
 # hubop_end <poll> <op_id> <timeout s>: the record (same op_id) once it
-# ended → /tmp/op.json, ok or not (1 only when it is still running).
+# ended → /tmp/op.json, ok or not (1 when it is still running, or when the
+# poll answers another op's record).
 hubop_end() {
   local poll="$1" opid="$2" limit="$3" t0=$SECONDS
   while :; do
     hub GET "$poll" --max-time 30 > /tmp/op.json || true
     jq -e --arg o "$opid" '.op_id == $o and (.running | not)' /tmp/op.json >/dev/null 2>&1 && return 0
+    if jq -e --arg o "$opid" '(.op_id // "") != "" and .op_id != $o' /tmp/op.json >/dev/null 2>&1; then
+      echo "FAIL: $poll answered another op than $opid:"; hubop_explain; return 1
+    fi
     if (( SECONDS - t0 >= limit )); then
       echo "FAIL: op $opid still running after $limit s:"; hubop_explain; return 1
     fi
@@ -49,6 +55,10 @@ hubop_start() {
   [ "$code" = 202 ] || { echo "FAIL: $1 $2: HTTP $code (want 202) $(head -c 1500 /tmp/hub.out)"; docker compose logs --tail=30 hub; return 1; }
   HUBOP_ID="$(jq -r '.op_id // empty' /tmp/hub.out)"; HUBOP_POLL="$(jq -r '.poll // empty' /tmp/hub.out)"
   [ -n "$HUBOP_ID" ] && [ -n "$HUBOP_POLL" ] || { echo "FAIL: $1 $2: 202 without op_id / poll: $(head -c 400 /tmp/hub.out)"; return 1; }
+  case "$HUBOP_POLL" in
+    /api/instances/*/op\?op_id="$HUBOP_ID") ;;
+    *) echo "FAIL: $1 $2: poll $HUBOP_POLL is not op $HUBOP_ID's record"; return 1 ;;
+  esac
 }
 
 # hubop <method> <path> [curl args]: start, then wait up to HUBOP_TIMEOUT

@@ -2974,7 +2974,7 @@ jobs:
             sleep 0.5
           done
           echo "images running after $((SECONDS - t0)) s: $(jq -c '{stoppable, created, images: [.steps[] | select(.key == "images")][0]}' /tmp/op.json)"
-          code=$(hubc POST "/api/instances/$ID/op/stop" -d '{}')
+          code=$(hubc POST "/api/instances/$ID/op/stop" -d "{\"op_id\":\"$HUBOP_ID\"}")
           [ "$code" = 202 ] || { echo "FAIL: Stop: HTTP $code $(head -c 1500 /tmp/hub.out)"; exit 1; }
           jq -e --arg o "$HUBOP_ID" '.op_id == $o and .stopping == true' /tmp/hub.out >/dev/null \
             || { echo "FAIL: the Stop's answer is not the stopping record: $(head -c 1500 /tmp/hub.out)"; exit 1; }

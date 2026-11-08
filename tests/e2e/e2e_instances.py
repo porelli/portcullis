@@ -281,7 +281,7 @@ def main() -> int:
                                   headers={"Content-Type": "application/json"})
             assert r.status == 202, f"HTTP {r.status}: {r.text()[:300]}"
             acc = r.json()
-            assert acc.get("op") == "backup" and acc.get("poll") == "/api/instances/echo-b/op" and acc.get("op_id"), acc
+            assert acc.get("op") == "backup" and acc.get("op_id") and acc.get("poll") == f"/api/instances/echo-b/op?op_id={acc['op_id']}", acc
             assert time.time() - t0 < 30, "the backup request was not answered at once"
             # A second operation on the instance meanwhile: busy.
             r2 = page.request.post(HUB + "/api/instances/echo-b/backups", data="{}",
@@ -292,7 +292,8 @@ def main() -> int:
                 p = page.request.get(HUB + acc["poll"])
                 assert p.status == 200, f"poll: HTTP {p.status}"
                 rec = p.json()
-                if rec.get("op_id") == acc["op_id"] and not rec.get("running"):
+                assert rec.get("op_id") == acc["op_id"], f"poll by op_id answered another op: {json.dumps(rec)[:300]}"
+                if not rec.get("running"):
                     break
                 time.sleep(3)
             took = time.time() - t0
