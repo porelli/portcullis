@@ -56,9 +56,12 @@ _lldap_gql() {
 # portcullis-hub in lldap_admin with the password in
 # secrets/hub/lldap/password. Created if missing, re-added to the group,
 # password reset when it no longer logs in. Needs a running LLDAP.
-# Returns 0 if the account was unchanged, 1 if it was created or modified.
+# Always returns 0 (it runs under set -e); sets LLDAP_SA_CHANGED=true when it
+# created the account, added it to lldap_admin or reset its password.
+# shellcheck disable=SC2034  # LLDAP_SA_CHANGED is read by stack.sh
 lldap_service_account() {
-  local tok out gid pw="$PORTCULLIS_ROOT/secrets/hub/lldap/password" changed=0
+  local tok out gid pw="$PORTCULLIS_ROOT/secrets/hub/lldap/password"
+  LLDAP_SA_CHANGED=false
   info "Ensuring the Hub's LLDAP service account ($HUB_LLDAP_USER)..."
   [ -s "$pw" ] || users_secret_files
   tok="$(_lldap_login)" || true
@@ -71,7 +74,7 @@ lldap_service_account() {
         '{u: {id: $id, email: ($id + "@" + $d), displayName: "Portcullis Hub (service account)"}}')" || true)"
     if printf '%s' "$out" | jq -e '.data.createUser.id' >/dev/null 2>&1; then
       echo "    created $HUB_LLDAP_USER"
-      changed=1
+      LLDAP_SA_CHANGED=true
     else
       warn "    could not create $HUB_LLDAP_USER: $(printf '%s' "$out" | jq -c '.errors // .' 2>/dev/null)"
       return 0
@@ -84,7 +87,7 @@ lldap_service_account() {
       "$(jq -nc --arg u "$HUB_LLDAP_USER" --argjson g "${gid:-0}" '{u: $u, g: $g}')" || true)"
     if printf '%s' "$out" | jq -e '.data.addUserToGroup.ok' >/dev/null 2>&1; then
       echo "    $HUB_LLDAP_USER: added to lldap_admin"
-      changed=1
+      LLDAP_SA_CHANGED=true
     else
       warn "    could not add $HUB_LLDAP_USER to lldap_admin"
     fi
@@ -94,7 +97,7 @@ lldap_service_account() {
       | dc exec -T lldap curl -sf -o /dev/null --max-time 20 http://localhost:17170/auth/simple/login \
           -H 'Content-Type: application/json' -d @-; then
     echo "    $HUB_LLDAP_USER: password matches secrets/hub/lldap/password"
-    return $changed
+    return 0
   fi
   # lldap_set_password takes the user's password from LLDAP_USER_PASSWORD;
   # it has no env / file option for the admin credential, so the short-lived
@@ -105,10 +108,11 @@ lldap_service_account() {
   if { printf '%s\n' "$tok"; cat "$pw"; echo; } | dc exec -T lldap sh -c 'read -r T; read -r P; export LLDAP_USER_PASSWORD="$P";
       exec /app/lldap_set_password --base-url http://localhost:17170 --token "$T" --username "$1"' _ "$HUB_LLDAP_USER" >/dev/null; then # secret-argv-ok: inside the lldap container
     echo "    $HUB_LLDAP_USER: password set from secrets/hub/lldap/password"
-    return 1
+    LLDAP_SA_CHANGED=true
+    return 0
   else
     warn "    could not set the password of $HUB_LLDAP_USER"
-    return $changed
+    return 0
   fi
 }
 

@@ -304,12 +304,12 @@ printf '%s%s\n' "\$cmd" "\$args" >> "$DC_CALLS"
 exit 0
 DCSTUB
 chmod +x "$WORK/dcbin/docker"
-# Stub container_health: returns "healthy" for vault/lldap/keycloak, "running" for hub.
+# Stub container_health: returns "healthy" for vault/lldap/keycloak, "healthy" for hub (its image HEALTHCHECK).
 cat > "$WORK/test-init-stub.sh" <<INITSTUB
 container_health() {
   case "\$1" in
     vault|lldap|keycloak|postgres) echo healthy ;;
-    hub) echo running ;;
+    hub) echo healthy ;;
     *) echo missing ;;
   esac
 }
@@ -332,7 +332,9 @@ dns_setup() { :; }
 config_init() { :; }
 invite_create() { echo '{"url":"http://test","expires_at":"never"}'; }
 lldap_service_account() {
-  [ -f "\$LLDAP_ACCOUNT_CHANGED" ] && return 1 || return 0
+  LLDAP_SA_CHANGED=false
+  [ -f "\$LLDAP_ACCOUNT_CHANGED" ] && LLDAP_SA_CHANGED=true
+  return 0
 }
 INITSTUB
 # Source the common + stack libs with the stubs.
@@ -388,7 +390,9 @@ backup_create() { :; }
 hub_policy_check() { :; }
 hub_sources_sync() { :; }
 lldap_service_account() {
-  [ -f "\$LLDAP_ACCOUNT_CHANGED" ] && return 1 || return 0
+  LLDAP_SA_CHANGED=false
+  [ -f "\$LLDAP_ACCOUNT_CHANGED" ] && LLDAP_SA_CHANGED=true
+  return 0
 }
 UPSTUB
 # stack_up when account unchanged: no restart.
@@ -468,5 +472,13 @@ expect_eq "upgrade: account unchanged, no hub restart" \
 expect_eq "docker was never called" "$(cat "$STUB_CALLS" 2>/dev/null)" ""
 
 echo ""
+# lldap_service_account runs under set -e at init: it must never return
+# non-zero to say "changed" (that would abort init right after creating the
+# account) — it signals LLDAP_SA_CHANGED instead.
+sa_body="$(sed -n '/^lldap_service_account() {/,/^}/p' "$HERE/../scripts/lib/users.sh")"
+expect_eq "lldap_service_account never returns non-zero" "$(printf '%s\n' "$sa_body" | grep -cE 'return [1-9]|return \$' || true)" "0"
+expect_eq "lldap_service_account sets LLDAP_SA_CHANGED" "$(printf '%s\n' "$sa_body" | grep -c 'LLDAP_SA_CHANGED=true' | awk '{print ($1>0)?"yes":"no"}')" "yes"
+
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
+

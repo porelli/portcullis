@@ -184,14 +184,15 @@ init_run() {
 
   info "Starting the Hub..."
   dc up -d hub
-  # Hub has no healthcheck: wait for the container to be running.
-  local i st
-  for ((i = 0; i < 60; i += 2)); do
+  # The Hub's image has a HEALTHCHECK: wait until it reports healthy
+  # (a missing check would show "running"; both count).
+  local i st=""
+  for ((i = 0; i < 120; i += 3)); do
     st="$(container_health hub)"
-    [ "$st" = running ] && break
-    sleep 2
+    case "$st" in healthy|running) break ;; esac
+    sleep 3
   done
-  [ "$st" = running ] || warn "Hub did not start within 60s (status: $st)"
+  case "$st" in healthy|running) ;; *) warn "The Hub isn't healthy after 120s (status: $st): docker compose logs hub" ;; esac
 
   if [ "$config_repo" = true ]; then
     config_init "" ""
@@ -239,10 +240,8 @@ stack_up() {
   wait_healthy 300 vault postgres lldap keycloak
   # If the service account was created or its password changed, restart the Hub
   # (which may have started with a stale/missing password).
-  if lldap_service_account; then
-    # Account unchanged: nothing to do.
-    :
-  else
+  lldap_service_account
+  if [ "${LLDAP_SA_CHANGED:-false}" = true ]; then
     info "Restarting the Hub to pick up the updated LLDAP credentials..."
     dc restart hub >/dev/null
   fi
@@ -289,10 +288,8 @@ upgrade_run() {
   oidc_register
   # If the service account was created or its password changed, restart the Hub
   # (which may have started with a stale/missing password).
-  if lldap_service_account; then
-    # Account unchanged: nothing to do.
-    :
-  else
+  lldap_service_account
+  if [ "${LLDAP_SA_CHANGED:-false}" = true ]; then
     info "Restarting the Hub to pick up the updated LLDAP credentials..."
     dc restart hub >/dev/null
   fi
