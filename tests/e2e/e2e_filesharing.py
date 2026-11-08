@@ -97,7 +97,8 @@ from playwright.sync_api import Page, sync_playwright
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_login as base  # noqa: E402  (Authenticator, passkey_flow, shot)
-import e2e_ops  # noqa: E402  (the op record poll, contract §11.7)
+import e2e_fsops  # noqa: E402  (run_op, scrub; unit-tested without the stack)
+from e2e_fsops import HASHES, PASSWORDS, scrub  # noqa: E402
 
 DOMAIN = os.environ["E2E_DOMAIN"]
 ART = os.environ.get("E2E_ARTIFACTS", "e2e-artifacts")
@@ -121,8 +122,6 @@ OP_S = 900
 
 results: list[tuple[str, bool, str]] = []
 state: dict = {}
-HASHES: set[str] = set()      # every NT hash seen on the secrets volume (upper case)
-PASSWORDS: dict[str, str] = {}  # label → password (never printed)
 LATENCY: dict[str, float] = {}
 OBS: list[str] = []           # observations for the report (popup, COOP, …)
 POPUPS: dict[str, int] = {}   # fresh-auth popups per person (signature counter offsets)
@@ -165,16 +164,6 @@ def mask(value: str) -> None:
     is not shown)."""
     if value and os.environ.get("GITHUB_ACTIONS"):
         print(f"::add-mask::{value}", flush=True)
-
-
-def scrub(text: str) -> str:
-    """Belt and braces: no password or hash in anything this test prints."""
-    for v in list(PASSWORDS.values()):
-        text = text.replace(v, "[password]")
-    for h in list(HASHES):
-        text = re.sub(re.escape(h), "[hash]", text, flags=re.I)
-    # Playwright's errors list the request's headers (session cookies).
-    return re.sub(r"(?im)^(\s*-\s*(?:cookie|authorization):).*$", r"\1 [redacted]", text)
 
 
 def save(name: str, data) -> None:
@@ -259,45 +248,8 @@ def hub_get(path: str):
 
 
 def run_op(method: str, path: str, body, timeout: float = OP_S) -> dict:
-    """A 202 operation, polled at its `poll` (e2e_ops) until its record
-    (same op_id) is no longer running; the record must be ok.
-
-    A busy 409 whose record is a running `restart` is the Hub's own queued
-    restart (a membership or settings change restarts the app): that
-    restart must end ok, then the operation is sent once more. Any other
-    409 fails. Every failure message is scrubbed."""
-    try:
-        return _run_op(method, path, body, timeout)
-    except AssertionError as e:
-        raise AssertionError(scrub(str(e))) from None
-
-
-def _run_op(method: str, path: str, body, timeout: float) -> dict:
-    code, out = hub(method, path, body)
-    inst = instance_of(path, body)
-    if code == 409 and inst and isinstance(out, dict) and out.get("op") == "restart" and out.get("running") \
-            and out.get("op_id"):
-        print(f"    {method} {path}: busy with the Hub's restart {out['op_id']}: waiting for it", flush=True)
-        busy = {"op": "restart", "op_id": out["op_id"], "instance": inst, "poll": f"/api/instances/{inst}/op"}
-        e2e_ops.wait_ok(hub_get, busy, timeout)
-        code, out = hub(method, path, body)
-    assert code == 202, f"{method} {path}: HTTP {code} (want 202): {scrub(str(out))[:800]}"
-    acc = e2e_ops.accepted(out)
-    rec = e2e_ops.wait(hub_get, acc, timeout)
-    save(f"op-{acc.get('op')}-{acc['op_id']}.json", rec)
-    return e2e_ops.check_ok(acc, rec)
-
-
-def instance_of(path: str, body) -> str | None:
-    """The instance a lifecycle route acts on."""
-    parts = path.split("/")
-    if path.startswith("/api/instances/") and len(parts) > 3 and parts[3] != "restore":
-        return parts[3]
-    if path.startswith("/api/templates/restart/") and len(parts) > 4:
-        return parts[4]
-    if path in ("/api/templates/enable", "/api/templates/disable") and isinstance(body, dict):
-        return body.get("id")
-    return None
+    """e2e_fsops.run_op on this script's Hub API (tests/test_e2e_fsops.py)."""
+    return e2e_fsops.run_op(hub, save, method, path, body, timeout)
 
 
 def member(op: str, group: str, user: str) -> None:
