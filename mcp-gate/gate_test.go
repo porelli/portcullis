@@ -228,6 +228,9 @@ type testEnv struct {
 	g       *gate
 	srv     *httptest.Server
 	logPath string
+	// busy counts requests (other than GET, a stream that stays open)
+	// whose handler hasn't returned: lines waits for it to reach 0.
+	busy atomic.Int64
 }
 
 func newEnv(t *testing.T, mut func(f *config.File)) *testEnv {
@@ -278,7 +281,13 @@ func newEnv(t *testing.T, mut func(f *config.File)) *testEnv {
 		t.Fatal(err)
 	}
 	t.Cleanup(e.g.Close)
-	e.srv = httptest.NewServer(e.g.handler)
+	e.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			e.busy.Add(1)
+			defer e.busy.Add(-1)
+		}
+		e.g.handler.ServeHTTP(w, r)
+	}))
 	t.Cleanup(e.srv.Close)
 	return e
 }
@@ -334,10 +343,21 @@ func text(r *sdk.CallToolResult) string {
 	return b.String()
 }
 
+// lines reads the access log once every line of the requests answered
+// so far is written. The gate queues a request's line after the response
+// has gone out, so a client can hold its answer before the line is
+// queued: wait for the handlers to return, then for the writer.
 func (e *testEnv) lines() []map[string]any {
 	e.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	for e.busy.Load() > 0 {
+		select {
+		case <-ctx.Done():
+			e.t.Fatalf("%d requests still being handled", e.busy.Load())
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
 	if err := e.g.log.Flush(ctx); err != nil {
 		e.t.Fatal(err)
 	}
