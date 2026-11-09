@@ -2726,20 +2726,43 @@ jobs:
           echo "PASS: $E2E_EXTRA enrolled (Pebble, DNS-01 with the fake provider) and ready in the Hub"
 
           # Instances: echo-a and echo-c on the extra domain, echo-b on the main one.
-          for spec in "echo-a echo-a.$E2E_EXTRA" "echo-b echo-b.$E2E_DOMAIN" "echo-c echo-c.$E2E_EXTRA"; do
-            read -r id host <<<"$spec"
-            hubop POST /api/instances -d "$(jq -cn --arg id "$id" --arg h "$host" '{template: "echo", id: $id, hosts: {echo: $h}}')" \
+          for spec in "echo-a echo-a.$E2E_EXTRA Team A" "echo-b echo-b.$E2E_DOMAIN Team B" "echo-c echo-c.$E2E_EXTRA Team C"; do
+            read -r id host label <<<"$spec"
+            hubop POST /api/instances -d "$(jq -cn --arg id "$id" --arg l "$label" --arg h "$host" '{template: "echo", id: $id, label: $l, hosts: {echo: $h}}')" \
               || { echo "FAIL: create $id"; exit 1; }
           done
           # A host on a domain that isn't enrolled is refused.
-          code=$(hubc POST /api/instances -d '{"template":"echo","id":"echo-x","hosts":{"echo":"echo-x.not-enrolled.test"}}')
+          code=$(hubc POST /api/instances -d '{"template":"echo","id":"echo-x","label":"X","hosts":{"echo":"echo-x.not-enrolled.test"}}')
           case "$code" in 400|409) ;; *) echo "FAIL: a host on an unknown domain got $code"; exit 1 ;; esac
+          # Every create names its label (contracts §11.9).
+          code=$(hubc POST /api/instances -d "$(jq -cn --arg h "echo-y.$E2E_DOMAIN" '{template: "echo", id: "echo-y", hosts: {echo: $h}}')")
+          [ "$code" = 400 ] || { echo "FAIL: a create without a label got $code $(cat /tmp/hub.out)"; exit 1; }
           # echo-c: policy mtls (a passkey session steps up); echo-b: a slow
           # stop (its backup takes > 60 s, e2e_instances.py long_backup).
           code=$(hubc PUT /api/instances/echo-c/settings -d '{"auth_policy":{"factors":["mtls"],"op":""}}')
           [ "$code" = 200 ] || { echo "FAIL: echo-c policy: $code $(cat /tmp/hub.out)"; exit 1; }
           code=$(hubc PUT /api/instances/echo-b/settings -d '{"values":{"echo_stop_grace":"75s"}}')
           [ "$code" = 200 ] || { echo "FAIL: echo-b settings: $code $(cat /tmp/hub.out)"; exit 1; }
+          # Env overrides (contracts §11.9): a variable of the admin's own is
+          # stored and reset; a Hub variable and a setting's (echo_stop_grace)
+          # are refused; the whole-file Expert route is gone.
+          code=$(hubc PUT /api/instances/echo-b/env/CI_MARKER -d '{"value":"on"}')
+          if [ "$code" != 200 ] || ! jq -e '.row.name == "CI_MARKER" and .row.source == "custom" and .row.value == "on" and .row.overridden' /tmp/hub.out >/dev/null; then
+            echo "FAIL: env override CI_MARKER: $code $(cat /tmp/hub.out)"; exit 1
+          fi
+          hub GET /api/instances/echo-b/env | jq -e 'any(.rows[]; .name == "CI_MARKER" and .value == "on" and .overridden)' >/dev/null \
+            || { echo "FAIL: env rows of echo-b: $(hub GET /api/instances/echo-b/env)"; exit 1; }
+          for n in PORTCULLIS_INSTANCE ECHO_STOP_GRACE; do
+            code=$(hubc PUT "/api/instances/echo-b/env/$n" -d '{"value":"x"}')
+            [ "$code" = 400 ] || { echo "FAIL: env override $n got $code $(cat /tmp/hub.out)"; exit 1; }
+          done
+          code=$(hubc DELETE /api/instances/echo-b/env/CI_MARKER)
+          if [ "$code" != 200 ] || ! jq -e '.row == null' /tmp/hub.out >/dev/null; then
+            echo "FAIL: env reset CI_MARKER: $code $(cat /tmp/hub.out)"; exit 1
+          fi
+          code=$(hubc GET /api/templates/env/echo-b)
+          case "$code" in 404|405) ;; *) echo "FAIL: the removed /api/templates/env/ route answered $code"; exit 1 ;; esac
+          echo "PASS: env overrides: custom variable stored and reset, Hub and setting variables refused, whole-file route gone"
 
           # Users and the instances' groups (created by the Hub as the admin).
           LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \

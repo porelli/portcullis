@@ -489,8 +489,8 @@ def main() -> int:
         until("the Hub loaded gitea, grafana and echo",
               lambda: {"gitea", "grafana", "echo"} <= {t.get("id") for t in json.loads(hub("GET", "/api/templates")[1])}, 90)
         # Never enabled: only deleted again, through the admin MCP (scenario 5).
-        for tmpl, inst in (("echo", ECHO_DEL), ("echo", ECHO_ELICIT), ("gitea", "gitea-b")):
-            run_op("POST", "/api/instances", {"template": tmpl, "id": inst, "hosts": {tmpl: f"{inst}.{DOMAIN}"}},
+        for tmpl, inst, label in (("echo", ECHO_DEL, "Delete me"), ("echo", ECHO_ELICIT, "Elicit"), ("gitea", "gitea-b", "B")):
+            run_op("POST", "/api/instances", {"template": tmpl, "id": inst, "label": label, "hosts": {tmpl: f"{inst}.{DOMAIN}"}},
                    "create", inst, 300)
         # One host port per instance: gitea keeps 2222 (Git over SSH is off
         # anyway), gitea-b none (the port's description says so).
