@@ -176,6 +176,7 @@ init_run() {
   stack_prepare
   info "Restarting Traefik, the forward-auth services and Keycloak to pick up the CA chain..."
   dc restart traefik forward-auth forward-auth-ext keycloak
+  signin_ca_mark
   wait_healthy 300 keycloak
 
   keycloak_configure false
@@ -226,6 +227,38 @@ EOF
   warn "Back up secrets/vault-init.json OFFLINE (Vault root token + unseal key)."
 }
 
+# forward-auth and forward-auth-ext (oauth2-proxy) read certs/ca-bundle.crt
+# only at start-up. config_build_ca_bundle rewrites it in place (system CAs,
+# the internal PKI, the Let's Encrypt staging root), so after a change the
+# running services still trust the old bundle and every sign-in callback
+# fails ("x509: certificate signed by unknown authority"). The sha256 of the
+# bundle they were last started with is kept in certs/.ca-bundle.loaded.
+CA_BUNDLE_LOADED=".ca-bundle.loaded"
+
+_ca_bundle_sum() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum < "$1"; else shasum -a 256 < "$1"; fi | cut -d' ' -f1
+}
+
+# signin_ca_mark — record the bundle the sign-in services just started with.
+signin_ca_mark() {
+  local bundle="$PORTCULLIS_ROOT/certs/ca-bundle.crt"
+  [ -f "$bundle" ] || return 0
+  _ca_bundle_sum "$bundle" > "$PORTCULLIS_ROOT/certs/$CA_BUNDLE_LOADED"
+}
+
+# signin_ca_reload — restart forward-auth(-ext) when the bundle differs from
+# the one they were last started with (or none was recorded), then record it.
+signin_ca_reload() {
+  local bundle="$PORTCULLIS_ROOT/certs/ca-bundle.crt" stamp="$PORTCULLIS_ROOT/certs/$CA_BUNDLE_LOADED" sum
+  [ -f "$bundle" ] || return 0
+  sum="$(_ca_bundle_sum "$bundle")"
+  if [ "$(cat "$stamp" 2>/dev/null)" != "$sum" ]; then
+    info "Restarting the forward-auth services to pick up the new CA bundle..."
+    dc restart forward-auth forward-auth-ext >/dev/null
+  fi
+  printf '%s\n' "$sum" > "$stamp"
+}
+
 stack_up() {
   # shellcheck disable=SC2086
   env_require PORTCULLIS_DOMAIN $CORE_SECRETS
@@ -237,6 +270,7 @@ stack_up() {
   dc up -d --build
   domains_restart_if_renewed
   monitoring_reload
+  signin_ca_reload
   wait_healthy 300 vault postgres lldap keycloak
   # If the service account was created or its password changed, restart the Hub
   # (which may have started with a stale/missing password).
@@ -282,6 +316,7 @@ upgrade_run() {
   if [ "$PKI_CREATED" = true ] || [ "${PKI_TRUSTSTORE_CHANGED:-false}" = true ]; then
     # Traefik, forward-auth(-ext) and Keycloak read the CA chain only at start-up.
     dc restart traefik forward-auth forward-auth-ext keycloak >/dev/null
+    signin_ca_mark
   fi
   wait_healthy 300 vault postgres lldap keycloak
   keycloak_configure false
@@ -295,6 +330,7 @@ upgrade_run() {
   fi
   # Picks up a FORWARD_AUTH_CLIENT_SECRET generated above, if any.
   dc up -d forward-auth forward-auth-ext >/dev/null
+  signin_ca_reload
   info "Checking the Hub's policy file against group-gate..."
   hub_policy_check
   info "Syncing the Hub's template sources..."

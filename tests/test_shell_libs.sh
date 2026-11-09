@@ -1433,6 +1433,47 @@ rs_setup
 rs_restore; rc=$?
 expect_eq "restore: only the core project mounts hub_secrets → no app down" "$(grep -c '^compose -p ' "$STUB_DIR/calls")" "0"
 
+# ── signin_ca_reload: forward-auth(-ext) restart only when the CA bundle changed ──
+ca_run() {
+  # A fresh shell: stack.sh is sourced only here.
+  bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/stack.sh'; $1" >/dev/null 2>&1
+}
+ca_restarts() { grep -c -- '--project-directory .* restart forward-auth forward-auth-ext$' "$STUB_DIR/calls" 2>/dev/null || true; }
+mkdir -p "$PORTCULLIS_ROOT/certs"
+rm -f "$PORTCULLIS_ROOT/certs/.ca-bundle.loaded"
+printf 'bundle-a\n' > "$PORTCULLIS_ROOT/certs/ca-bundle.crt"
+: > "$STUB_DIR/calls"
+ca_run signin_ca_reload
+expect_eq "ca bundle: nothing recorded → forward-auth(-ext) restarted once" "$(ca_restarts)" "1"
+expect_ok "ca bundle: the loaded bundle's sha256 is recorded" test -s "$PORTCULLIS_ROOT/certs/.ca-bundle.loaded"
+: > "$STUB_DIR/calls"
+ca_run signin_ca_reload
+expect_eq "ca bundle: unchanged → no restart" "$(ca_restarts)" "0"
+printf 'bundle-a\nstaging-root\n' > "$PORTCULLIS_ROOT/certs/ca-bundle.crt"
+: > "$STUB_DIR/calls"
+ca_run signin_ca_reload
+expect_eq "ca bundle: changed (e.g. ACME staging switched on) → restarted" "$(ca_restarts)" "1"
+: > "$STUB_DIR/calls"
+ca_run signin_ca_reload
+expect_eq "ca bundle: changed once → restarted once" "$(ca_restarts)" "0"
+printf 'bundle-b\n' > "$PORTCULLIS_ROOT/certs/ca-bundle.crt"
+: > "$STUB_DIR/calls"
+ca_run signin_ca_mark
+ca_run signin_ca_reload
+expect_eq "ca bundle: signin_ca_mark after an explicit restart → no second restart" "$(ca_restarts)" "0"
+rm -f "$PORTCULLIS_ROOT/certs/ca-bundle.crt" "$PORTCULLIS_ROOT/certs/.ca-bundle.loaded"
+: > "$STUB_DIR/calls"
+ca_run signin_ca_reload
+expect_eq "ca bundle: no bundle yet → nothing done" "$(ca_restarts)" "0"
+# A failed restart must not record the new bundle (the next up retries).
+printf 'bundle-c\n' > "$PORTCULLIS_ROOT/certs/ca-bundle.crt"
+printf 'old\n' > "$PORTCULLIS_ROOT/certs/.ca-bundle.loaded"
+cp "$WORK/bin/docker" "$WORK/docker.ok"
+printf '#!/usr/bin/env bash\necho "$*" >> "$STUB_DIR/calls"\ncase "$*" in *restart*) exit 1 ;; esac\nexit 0\n' > "$WORK/bin/docker"
+ca_run 'set -e; signin_ca_reload'
+expect_eq "ca bundle: a failed restart keeps the old record" "$(cat "$PORTCULLIS_ROOT/certs/.ca-bundle.loaded")" "old"
+cp "$WORK/docker.ok" "$WORK/bin/docker"
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

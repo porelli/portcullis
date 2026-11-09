@@ -235,7 +235,9 @@ Apply the toggles in .env:
   MTLS_ENABLED=true|false   (default true) rewrites traefik/dynamic/tls.yml
                             (false: no client certs on any tier — routers that
                             rely only on the protected tier become unauthenticated)
-and rebuild certs/ca-bundle.crt. Then run `portcullis up` to restart Traefik.
+and rebuild certs/ca-bundle.crt. Then run `portcullis up`: it restarts Traefik and,
+when the bundle changed, the two forward-auth services (they read it only
+at start-up).
 
 Options:
   --bundle-only   only rebuild certs/ca-bundle.crt (system CAs + internal
