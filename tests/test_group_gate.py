@@ -821,10 +821,56 @@ class SigninV6Test(GateTest):
         write_policy({"core": dict(BASE["core"], **{"enroll.example.com": "strong"})})
         self.assertEqual(self.page("enroll.example.com", ["spk"], groups="", gate_path="/authenticated")[0], 403)
         self.assertEqual(self.page("enroll.example.com", ["hwk"], groups="", gate_path="/authenticated")[0], 200)
-        # auth.<d> (the Keycloak console's router) takes the default.
-        write_policy({"default": "strong"})
-        self.assertEqual(self.page("auth.example.com", ["spk"], groups="lldap_admin")[0], 403)
+        # auth.<d> (the Keycloak console's router) takes the Hub's template
+        # (core["hub.<d>"]: strong here), never the default.
+        write_policy({"default": "standard"})
+        code, hdrs, body = self.page("auth.example.com", ["spk"], groups="lldap_admin")
+        self.assertEqual(code, 403)
+        self.assertIn("pc_method=security_key", hdrs.get("X-Stepup-URL", ""))
         self.assertEqual(self.page("auth.example.com", ["hwk"], groups="lldap_admin")[0], 200)
+        write_policy({"core": dict(BASE["core"], **{"hub.example.com": "standard"}), "default": "strong"})
+        self.assertEqual(self.page("auth.example.com", ["spk"], groups="lldap_admin")[0], 200)
+        # Without core["hub.<d>"] the console is denied.
+        write_policy({"core": {k: v for k, v in BASE["core"].items() if k != "hub.example.com"}})
+        self.assertEqual(self.page("auth.example.com", ["hwk"], groups="lldap_admin")[0], 403)
+
+    def test_membership_checks_run_before_the_template(self):
+        # Outside the app's group (or a path group) with an unmet template:
+        # the plain group 403, never a page naming the app or its rule.
+        write_policy({"hosts": {"grafana.example.com": "strong"},
+                      "path_groups": {"grafana.example.com": [{"prefix": "/admin", "group": "admin_g"}]}})
+        before = gg.METRICS.get("group_gate_denials_total", reason="group")
+        for groups, uri, reason in (("users_x", "/", "group"), ("users_grafana", "/admin", "path_group")):
+            with self.subTest(groups=groups, uri=uri):
+                h = {"X-Forwarded-Host": "grafana.example.com", "X-Auth-Request-Preferred-Username": "bob",
+                     "X-Auth-Request-Groups": groups, "X-Forwarded-Uri": uri,
+                     "X-Forwarded-Access-Token": token(amr=["spk"], preferred_username="bob")}
+                r = urllib.request.Request(f"http://127.0.0.1:{self.port}/", headers=h)
+                with self.assertRaises(urllib.error.HTTPError) as cm:
+                    urllib.request.urlopen(r)
+                with cm.exception as e:
+                    body, hdrs = e.read().decode(), dict(e.headers)
+                self.assertEqual(cm.exception.code, 403)
+                self.assertNotIn("X-Stepup-URL", hdrs)
+                for marker in ('id="stepup-continue"', 'id="needs-stronger"', 'id="present-certificate"', "pc_method"):
+                    self.assertNotIn(marker, body)
+        self.assertEqual(gg.METRICS.get("group_gate_denials_total", reason="group"), before + 1)
+        # A member gets the step-up.
+        self.assertIn("X-Stepup-URL", self.page("grafana.example.com", ["spk"])[1])
+
+    def test_request_metric_names_each_page(self):
+        m = gg.METRICS
+        write_policy({"hosts": {"grafana.example.com": "strong"}, "people": {"bob": ["passkey_synced"]}})
+        n0 = m.get("group_gate_requests_total", endpoint="gate", result="needs_stronger")
+        self.assertIn('id="needs-stronger"', self.page("grafana.example.com", ["spk"])[2])
+        self.assertEqual(m.get("group_gate_requests_total", endpoint="gate", result="needs_stronger"), n0 + 1)
+        write_policy({"hosts": {"grafana.example.com": "strong"}})
+        s0 = m.get("group_gate_requests_total", endpoint="gate", result="stepup")
+        self.page("grafana.example.com", ["spk"])
+        self.assertEqual(m.get("group_gate_requests_total", endpoint="gate", result="stepup"), s0 + 1)
+        p0 = m.get("group_gate_requests_total", endpoint="gate", result="present_certificate")
+        self.assertIn('id="present-certificate"', self.page("grafana.example.com", ["mtls"])[2])
+        self.assertEqual(m.get("group_gate_requests_total", endpoint="gate", result="present_certificate"), p0 + 1)
 
     def test_portal_uses_its_core_template(self):
         write_policy({"core": dict(BASE["core"], **{"example.com": "strong"})})

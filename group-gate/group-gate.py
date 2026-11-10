@@ -21,7 +21,8 @@ Checks, run in order:
          still applies).
      Traefik's entrypoint deletes client-supplied X-Forwarded-Tls-Client-*
      headers, so the header only ever describes a cert Traefik verified.
-  1. Sign-in template (policy file v6) — the host's compiled rule over
+  1. Sign-in template (policy file v6; checked LAST, after 2. and 3., so a
+     non-member gets the plain 403) — the host's compiled rule over
      sign-in methods (core[host] for a gated core host, else hosts[host],
      else default) must be met by the session's methods: the token's amr
      values mapped through the method table (AMR_TO_METHOD), kept only
@@ -259,7 +260,8 @@ RULE_MAX_LEAVES = 48
 TEMPLATE_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,31}|collision\.[1-9][0-9]*")
 # Core subdomains group-gate gates with a template from `core` (with the
 # apex, the portal). `auth` (the Keycloak admin console's router) takes the
-# default template; `mcp` never reaches group-gate (mcp-gate authorizes).
+# Hub's template (`core["hub.<domain>"]`); `mcp` never reaches group-gate
+# (mcp-gate authorizes).
 GATED_CORE_SUBDOMAINS = ("traefik", "hub", "directory", "enroll", "people", "metrics")
 
 
@@ -1384,7 +1386,7 @@ class Metrics:
     """Tiny thread-safe counter registry (no client library in the image)."""
 
     HELP = {
-        "group_gate_requests_total": ("counter", "Forward-auth decisions by endpoint (gate|authenticated|public_guard) and result (allow|deny|stepup)."),
+        "group_gate_requests_total": ("counter", "Forward-auth decisions by endpoint (gate|authenticated|public_guard|portal) and result (allow|deny|stepup|needs_stronger|present_certificate)."),
         "group_gate_denials_total": ("counter", "Denied requests by reason."),
         "group_gate_stepups_total": ("counter", "Sign-in pages (403) by reason: stepup, present_certificate, needs_stronger."),
         "group_gate_policy_load_errors_total": ("counter", "Requests denied because the Hub policy file or a policy in it is invalid."),
@@ -1688,8 +1690,9 @@ def decode_jwt_payload(token: str) -> dict:
 def rule_for_host(doc: dict, host: str) -> Optional[dict]:
     """The compiled rule of the normalised host's template (contract §4
     "How group-gate decides"): `core[host]` for a gated core host (missing
-    = None: deny), the default for `auth.<domain>` (the Keycloak admin
-    console's router; `core` never lists it), None for `mcp.<domain>`
+    = None: deny), the Hub's (`core["hub.<domain>"]`, missing = deny) for
+    `auth.<domain>` (the Keycloak admin console's router: as powerful as
+    the Hub; `core` never lists it), None for `mcp.<domain>`
     (never gated here); else `hosts[host]`, else `default`. A validated
     document only (every named template exists)."""
     templates = doc["templates"]
@@ -1697,7 +1700,7 @@ def rule_for_host(doc: dict, host: str) -> Optional[dict]:
         if host in gated_core_hosts():
             tid = doc["core"].get(host)
         elif host == f"auth.{DOMAIN}":
-            tid = doc["default"]
+            tid = doc["core"].get(f"hub.{DOMAIN}")
         else:
             tid = None
     else:
@@ -1978,7 +1981,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _signin_answer(self, body: bytes, reason: str, log: str, stepup_url_value: str = ""):
         """403 with a sign-in page (contract §5): never a redirect."""
-        METRICS.inc("group_gate_requests_total", endpoint=self._endpoint, result="stepup")
+        METRICS.inc("group_gate_requests_total", endpoint=self._endpoint, result=reason)
         METRICS.inc("group_gate_stepups_total", reason=reason)
         self.send_response(403)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -2264,12 +2267,6 @@ class Handler(BaseHTTPRequestHandler):
             print(f"group-gate: user={user} expired memberships ignored: {sorted(expired)} "
                   f"(token headers withheld)", flush=True)
 
-        # --- Sign-in template (every route, /authenticated included). A
-        # revoked certificate was denied above, so one that is still here
-        # passed the revocation check.
-        if self._signin_check(policy_doc, host, kind, username, cert_info, bool(cert_serials)):
-            return
-
         # --- Group check ---
         if not authenticated_only:
             required_group = gate.get(host)
@@ -2319,6 +2316,14 @@ class Handler(BaseHTTPRequestHandler):
                         "path_group",
                     )
                     return
+
+        # --- Sign-in template (every route, /authenticated included), only
+        # after the membership checks: someone outside the app's groups gets
+        # the plain 403 above, never a page naming the app's rule. A revoked
+        # certificate was denied at the start, so one still here passed the
+        # revocation check.
+        if self._signin_check(policy_doc, host, kind, username, cert_info, bool(cert_serials)):
+            return
 
         self._allow(groups_header, username, host)
 
