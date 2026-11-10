@@ -1502,6 +1502,31 @@ expect_eq "config_apply with ACME_STAGING=true writes ACME_CA_SERVER staging and
   "ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory:same"
 expect_eq "config_apply prints no MTLS_ENABLED" "$(grep -c MTLS "$WORK/ca-out")" 0
 
+# ── invite --replace-keys deletes every passkey kind (and nothing else) ──
+RK_OUT="$(
+  # shellcheck source=../scripts/lib/common.sh
+  source "$HERE/../scripts/lib/common.sh"
+  # shellcheck source=../scripts/lib/users.sh
+  source "$HERE/../scripts/lib/users.sh"
+  export KC_REALM=portcullis
+  require_cmd() { :; }
+  kc_login() { :; }
+  _kc_report() { :; }
+  kc_get() {
+    case "$1" in
+      */users\?username=*) echo '[{"id":"u1"}]' ;;
+      */users/u1/credentials) echo '[{"id":"c1","type":"webauthn-passwordless"},{"id":"c2","type":"portcullis-security-key"},
+                                    {"id":"c3","type":"portcullis-device-passkey"},{"id":"c4","type":"webauthn"},
+                                    {"id":"c5","type":"password"},{"id":"c6","type":"otp"}]' ;;
+    esac
+  }
+  kc_send() { echo "$1 $2" >&3; echo 204; }
+  invite_replace_keys alice 3>&1 >/dev/null 2>&1
+)"
+expect_eq "invite --replace-keys deletes every passkey kind, never a password / OTP, then signs out" \
+  "$(printf '%s\n' "$RK_OUT" | sort | tr '\n' ' ')" \
+  "DELETE /portcullis/users/u1/credentials/c1 DELETE /portcullis/users/u1/credentials/c2 DELETE /portcullis/users/u1/credentials/c3 DELETE /portcullis/users/u1/credentials/c4 POST /portcullis/users/u1/logout "
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

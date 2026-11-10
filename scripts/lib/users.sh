@@ -128,6 +128,9 @@ invite_create() {
   printf '%s' "$out"
 }
 
+# The credentials `invite --replace-keys` deletes: every passkey kind.
+INVITE_PASSKEY_TYPES_JQ='.[]? | select(.type | IN("webauthn", "webauthn-passwordless", "portcullis-device-passkey", "portcullis-security-key")) | .id'
+
 # invite_replace_keys <user> — delete the user's passkeys / security keys
 # in Keycloak and end their sessions (lost or stolen key), before a new link.
 invite_replace_keys() {
@@ -136,7 +139,9 @@ invite_replace_keys() {
   kc_login
   uid="$(kc_get "/$KC_REALM/users?username=$(jq -rn --arg u "$user" '$u|@uri')&exact=true" | jq -r '.[0].id // empty')"
   [ -n "$uid" ] || fail "$user is not known to Keycloak (no such LLDAP user?)"
-  for cid in $(kc_get "/$KC_REALM/users/$uid/credentials" | jq -r '.[]? | select(.type == "webauthn" or .type == "webauthn-passwordless") | .id'); do
+  # Every passkey kind (contract §8.1 "Methods"): the stock types and the
+  # extension's device-bound / security-key types.
+  for cid in $(kc_get "/$KC_REALM/users/$uid/credentials" | jq -r "$INVITE_PASSKEY_TYPES_JQ"); do
     code="$(kc_send DELETE "/$KC_REALM/users/$uid/credentials/$cid" < /dev/null)"
     [ "$code" = 204 ] || fail "could not delete a key of $user (HTTP $code)"
     n=$((n + 1))
