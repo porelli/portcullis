@@ -1251,6 +1251,32 @@ jobs:
 
       - name: Test mTLS authentication with client cert
         run: |
+          # The Hub isn't running yet: a policy file v6 (contract §4) like the
+          # Hub's fresh install writes (the four starting methods, Standard the
+          # default, every gated core page on Standard; the later steps add
+          # their keys to it). Without a file group-gate denies everything.
+          jq -n '{version: 6, methods: ["passkey_device", "passkey_synced", "security_key", "yubikey_cert"],
+                  templates: {standard: {op: "any", items: [{op: "any", items: ["passkey_synced", "passkey_device", "security_key"]},
+                                                            {op: "any", items: ["yubikey_cert"]}]}},
+                  default: "standard", hosts: {},
+                  core: ([""] + ["directory.", "enroll.", "hub.", "metrics.", "people.", "traefik."]
+                         | map({key: (. + "portcullis.local"), value: "standard"}) | from_entries),
+                  people: {}, add_stronger: false, extra_domains: []}' > /tmp/ci-policy-v6.json
+          docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
+              sh -c 'cat > /d/group-gate-policy.json.tmp && chmod 644 /d/group-gate-policy.json.tmp && mv /d/group-gate-policy.json.tmp /d/group-gate-policy.json' \
+            < /tmp/ci-policy-v6.json
+          # ci-gated has no forward-auth, so the tests send the session headers
+          # portcullis-auth would set, the access token included: group-gate
+          # reads only its amr / preferred_username (oauth2-proxy verified it
+          # upstream), so an unsigned stand-in per sign-in method will do.
+          # mtls counts only with testuser's own unrevoked cert on the request.
+          for m in mtls hwk spk; do
+            printf 'CI_TOKEN_%s=%s\n' "${m^^}" "$(python3 -c 'import base64, json, sys
+          b = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+          print(b({"alg": "HS256", "typ": "JWT"}) + "." + b({"preferred_username": "testuser", "amr": [sys.argv[1]]}) + ".c2ln")' "$m")"
+          done >> "$GITHUB_ENV"
+          # shellcheck disable=SC1090
+          source <(sed 's/^/export /' "$GITHUB_ENV" | grep '^export CI_TOKEN_')
           mtls() { curl -s -o /tmp/mtls.out -w '%{http_code}' --cacert certs/ca-chain.crt \
                      --resolve "$1:443:127.0.0.1" "${@:2}" "https://$1/" || true; }
 
@@ -1278,8 +1304,19 @@ jobs:
           [ "$code" = 403 ] || { echo "FAIL: group-gated router without a username got $code"; cat /tmp/mtls.out; exit 1; }
           echo "PASS: group-gate fails closed without X-Auth-Request-Preferred-Username"
           code=$(mtls gated.portcullis.local --cert /tmp/test-client.crt --key /tmp/test-client.key -H 'X-Auth-Request-Preferred-Username: testuser')
+          if [ "$code" != 403 ] || ! grep -q 'id="stepup-continue"' /tmp/mtls.out; then
+            echo "FAIL: a cert without a session (no amr) got $code, want the step-up page"; cat /tmp/mtls.out; exit 1
+          fi
+          echo "PASS: a client cert alone is no sign-in: the step-up page"
+          code=$(mtls gated.portcullis.local -H 'X-Auth-Request-Preferred-Username: testuser' -H "X-Forwarded-Access-Token: $CI_TOKEN_MTLS")
+          if [ "$code" != 403 ] || ! grep -q 'id="present-certificate"' /tmp/mtls.out; then
+            echo "FAIL: an mtls session without the cert on the request got $code, want the present-certificate page"; cat /tmp/mtls.out; exit 1
+          fi
+          echo "PASS: an mtls session needs the certificate on the request (mTLS binding)"
+          code=$(mtls gated.portcullis.local --cert /tmp/test-client.crt --key /tmp/test-client.key -H 'X-Auth-Request-Preferred-Username: testuser' \
+                   -H "X-Forwarded-Access-Token: $CI_TOKEN_MTLS")
           [ "$code" = 200 ] || { echo "FAIL: group-gated router with valid cert got $code"; cat /tmp/mtls.out; exit 1; }
-          echo "PASS: group-gated router accepts valid, unrevoked cert"
+          echo "PASS: group-gated router accepts valid, unrevoked cert bound to the mtls session"
 
       - name: Test Keycloak X.509 login - via Traefik works, a forged cert header does not
         run: |
@@ -1359,9 +1396,12 @@ jobs:
       - name: Test client-cert headers cannot be spoofed and path rules see X-Forwarded-Uri
         run: |
           # (the gated router has no forward-auth: the username header is the test's)
+          # (a security-key session: the stand-in token of the mTLS step)
           gated() { curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt \
                       --resolve "gated.portcullis.local:443:127.0.0.1" -H 'X-Auth-Request-Preferred-Username: testuser' \
-                      "${@:2}" "https://gated.portcullis.local$1" || true; }
+                      -H "X-Forwarded-Access-Token: $CI_TOKEN_HWK" "${@:2}" "https://gated.portcullis.local$1" || true; }
+          policy() { docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
+                       sh -c 'cat > /d/group-gate-policy.json.tmp && chmod 644 /d/group-gate-policy.json.tmp && mv /d/group-gate-policy.json.tmp /d/group-gate-policy.json'; }
           VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
           echo "::add-mask::$VAULT_TOKEN"
           # Revoke a throwaway cert, then CLAIM it in spoofed headers (no TLS
@@ -1380,9 +1420,8 @@ jobs:
 
           # path_groups through Traefik: group-gate only sees the path via
           # X-Forwarded-Uri set by Traefik's forwardAuth.
-          printf '%s' '{"version":5,"default":{"factors":[]},"groups":{"gated.portcullis.local":"users_ci"},"path_groups":{"gated.portcullis.local":[{"prefix":"/admin","group":"admin_ci"}]}}' \
-            | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
-                sh -c 'cat > /d/group-gate-policy.json && chmod 644 /d/group-gate-policy.json'
+          jq '. + {groups: {"gated.portcullis.local": "users_ci"}, path_groups: {"gated.portcullis.local": [{prefix: "/admin", group: "admin_ci"}]}}' \
+            /tmp/ci-policy-v6.json | policy
           # (the gated router has no forward-auth, so the groups header is the test's)
           for p in /admin /admin/x /%61dmin //admin /x/../admin /ADMIN '/admin;x=1' /admin%2fx; do
             code=$(gated "$p" --path-as-is -H 'X-Auth-Request-Groups: users_ci')
@@ -1392,7 +1431,7 @@ jobs:
           [ "$(gated /administrator -H 'X-Auth-Request-Groups: users_ci')" = 200 ] || { echo "FAIL: /administrator denied"; exit 1; }
           [ "$(gated /x%00 --path-as-is -H 'X-Auth-Request-Groups: users_ci')" = 403 ] || { echo "FAIL: NUL path allowed"; exit 1; }
           [ "$(gated / -H 'X-Auth-Request-Groups: other')" = 403 ] || { echo "FAIL: host group not enforced"; exit 1; }
-          echo '{"version":5}' | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a sh -c 'cat > /d/group-gate-policy.json'
+          policy < /tmp/ci-policy-v6.json
           echo "PASS: path_groups enforced on Traefik's X-Forwarded-Uri (bypass variants denied)"
 
           # Attribute headers (contract §5): group-gate's reach the app, the
@@ -1401,7 +1440,7 @@ jobs:
             | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
                 sh -c 'cat > /d/user-attributes.json && chmod 644 /d/user-attributes.json'
           curl -s --cacert certs/ca-chain.crt --resolve "gated.portcullis.local:443:127.0.0.1" \
-            -H 'X-Auth-Request-Preferred-Username: testuser' -H 'X-Forwarded-Attr-City: Forged' -H 'X-Forwarded-Attr-Forged: x' \
+            -H 'X-Auth-Request-Preferred-Username: testuser' -H "X-Forwarded-Access-Token: $CI_TOKEN_HWK" -H 'X-Forwarded-Attr-City: Forged' -H 'X-Forwarded-Attr-Forged: x' \
             -H 'x-forwarded-attr-lower: x' https://gated.portcullis.local/ > /tmp/attrs.out || true
           grep -qx 'X-Forwarded-Attr-City: Milan' <(tr -d '\r' < /tmp/attrs.out) || { echo "FAIL: attribute header missing"; cat /tmp/attrs.out; exit 1; }
           # Per-host header (v2 `hosts`): this host's only, sent verbatim.
@@ -1422,19 +1461,22 @@ jobs:
                     --resolve "public.portcullis.local:443:127.0.0.1" "${@:2}" "https://public.portcullis.local$1" || true; }
           policy() { docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
                        sh -c 'cat > /d/group-gate-policy.json.tmp && chmod 644 /d/group-gate-policy.json.tmp && mv /d/group-gate-policy.json.tmp /d/group-gate-policy.json'; }
-          # No public_paths entry (or an older file version / v4 subdomain keys): denied.
-          echo '{"version":5}' | policy
-          [ "$(pub /s/AbC123)" = 403 ] || { echo "FAIL: public path allowed without a v5 public_paths entry"; exit 1; }
-          for old in '{"version":4,"public_paths":{"public":{"paths":[{"path":"/s/{token}","match":"prefix"}],"token_pattern":"^[A-Za-z0-9-]{1,32}$"}}}' \
-                     '{"version":4,"public_paths":{"public.portcullis.local":{"paths":[{"path":"/s/{token}","match":"prefix"}],"token_pattern":"^[A-Za-z0-9-]{1,32}$"}}}' \
-                     '{"version":5,"public_paths":{"public":{"paths":[{"path":"/s/{token}","match":"prefix"}],"token_pattern":"^[A-Za-z0-9-]{1,32}$"}}}'; do
+          # No public_paths entry (or an older file version / subdomain keys): denied.
+          policy < /tmp/ci-policy-v6.json
+          [ "$(pub /s/AbC123)" = 403 ] || { echo "FAIL: public path allowed without a v6 public_paths entry"; exit 1; }
+          PP='{"paths":[{"path":"/s/{token}","match":"prefix"}],"token_pattern":"^[A-Za-z0-9-]{1,32}$"}'
+          for old in "{\"version\":4,\"public_paths\":{\"public\":$PP}}" \
+                     "{\"version\":5,\"public_paths\":{\"public.portcullis.local\":$PP}}" \
+                     "$(jq -c --argjson pp "$PP" '. + {version: 5, public_paths: {"public.portcullis.local": $pp}}' /tmp/ci-policy-v6.json)" \
+                     "$(jq -c --argjson pp "$PP" '. + {public_paths: {public: $pp}}' /tmp/ci-policy-v6.json)"; do
             echo "$old" | policy
             [ "$(pub /s/AbC123)" = 403 ] || { echo "FAIL: public path allowed by $old"; exit 1; }
           done
-          jq -n '{version: 5, public_paths: {"public.portcullis.local": {
+          jq '. + {public_paths: {"public.portcullis.local": {
                     paths: [{path: "/s/{token}", match: "prefix"}, {path: "/dist", match: "static"}],
                     token_pattern: "^[A-Za-z0-9-]{1,32}$", static_extensions: ["js", "css"],
-                    credential_headers: ["X-Api-Key"], credential_cookies: ["nc_token"], credential_query: ["auth_token"]}}}' | policy
+                    credential_headers: ["X-Api-Key"], credential_cookies: ["nc_token"], credential_query: ["auth_token"]}}}' \
+            /tmp/ci-policy-v6.json | policy
           for p in /s/AbC123 /s/AbC123/download /dist/core-common.js; do
             [ "$(pub "$p")" = 200 ] || { echo "FAIL: public $p denied"; docker compose logs --tail=10 group-gate; exit 1; }
           done
@@ -1453,7 +1495,7 @@ jobs:
             -H 'X-Forwarded-Attr-City: Forged' https://public.portcullis.local/s/AbC123 > /tmp/pub-attrs.out || true
           grep -q 'Hostname' /tmp/pub-attrs.out || { echo "FAIL: public path not served"; cat /tmp/pub-attrs.out; exit 1; }
           if grep -qi 'Forged' /tmp/pub-attrs.out; then echo "FAIL: forged X-Forwarded-Attr-* reached a public router's app"; exit 1; fi
-          echo '{"version":5}' | policy
+          policy < /tmp/ci-policy-v6.json
           echo "PASS: public guard: only published paths, no credentials (PHP-normalised names)"
 
       - name: Test the socket proxies
@@ -1539,45 +1581,61 @@ jobs:
           docker compose logs hub | grep -q 'sync on SIGHUP finished (ok=true)' || { echo "FAIL: no SIGHUP sync in the Hub log"; exit 1; }
           echo "PASS: the Hub syncs its template sources at start and on SIGHUP; upgrade prints the result"
 
-          # Product default: on a fresh install (no admin choice yet) the Hub
-          # publishes {factors: [mtls, webauthn], op: any} (a hardware factor:
-          # passkey or client cert) as the default auth policy, and group-gate
-          # applies it to every app subdomain without its own policy — here
-          # the ci-gated test app (a cert on the request but no session with
-          # amr mtls / hwk → step-up 403).
-          hubapi() { curl -s -H @<(printf 'X-Portcullis-Proxy-Secret: %s\n' "$SECRET") "$@"; }
+          # Product default (contract §4, §8.1): on a fresh install the Hub
+          # publishes policy file v6 with the four starting methods, Standard
+          # (any passkey or a YubiKey certificate) the default and Strong
+          # (security key or certificate) on hub / people, and group-gate
+          # applies the default to every app host without its own pick — here
+          # the ci-gated test app.
+          hubapi() { curl -s -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") "$@"; }
           policy_file() { docker run --rm -v portcullis_hub_data:/d:ro alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a cat /d/group-gate-policy.json 2>/dev/null; }
           gated() { curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt \
                       --resolve "gated.portcullis.local:443:127.0.0.1" -H 'X-Auth-Request-Preferred-Username: testuser' \
-                      --cert /tmp/test-client.crt --key /tmp/test-client.key https://gated.portcullis.local/ || true; }
-          hubapi "http://$HUB_IP:8888/api/settings" | jq -e '(.default_auth_policy.factors | sort) == ["mtls", "webauthn"] and .default_auth_policy.op == "any"' >/dev/null \
-            || { echo "FAIL: fresh Hub default policy is not any of [mtls, webauthn]: $(hubapi "http://$HUB_IP:8888/api/settings")"; exit 1; }
+                      --cert /tmp/test-client.crt --key /tmp/test-client.key "$@" https://gated.portcullis.local/ || true; }
+          STANDARD='{"op":"any","items":[{"op":"any","items":["passkey_synced","passkey_device","security_key"]},{"op":"any","items":["yubikey_cert"]}]}'
           for i in $(seq 1 30); do
-            policy_file | jq -e '.version == 5 and (.extra_domains | type) == "array" and (.default.factors | sort) == ["mtls", "webauthn"] and .default.op == "any"' >/dev/null 2>&1 && break
-            [ "$i" -eq 30 ] && { echo "FAIL: Hub did not publish the any-of [mtls, webauthn] default: $(policy_file)"; docker compose logs --tail=20 hub; exit 1; }
+            policy_file | jq -e --argjson std "$STANDARD" '.version == 6 and .methods == ["passkey_device", "passkey_synced", "security_key", "yubikey_cert"]
+                and .default == "standard" and .templates.standard == $std
+                and .templates.strong == {op: "any", items: ["security_key", "yubikey_cert"]}
+                and .core["hub.portcullis.local"] == "strong" and .core["people.portcullis.local"] == "strong"
+                and .core["portcullis.local"] == "standard" and (.extra_domains | type) == "array" and .add_stronger == false' >/dev/null 2>&1 && break
+            [ "$i" -eq 30 ] && { echo "FAIL: the Hub did not publish the fresh-install v6 policy: $(policy_file)"; docker compose logs --tail=20 hub; exit 1; }
             sleep 2
           done
+          hubapi "http://$HUB_IP:8888/api/signin" | jq -e '.default == "standard" and ([.methods[] | select(.on) | .id] | sort) == ["passkey_device", "passkey_synced", "security_key", "yubikey_cert"]' >/dev/null \
+            || { echo "FAIL: GET /api/signin on a fresh Hub: $(hubapi "http://$HUB_IP:8888/api/signin" | head -c 600)"; exit 1; }
           code=$(gated)
-          [ "$code" = 403 ] || { echo "FAIL: gated app under the hardware default without an mtls / hwk session got $code"; exit 1; }
-          docker compose logs group-gate 2>&1 | grep -E "STEPUP user=testuser host=gated.portcullis.local policy=\{'factors': \[('mtls', 'webauthn'|'webauthn', 'mtls')\], 'op': 'any'\}" >/dev/null \
-            || { echo "FAIL: group-gate did not step up for the any-of [mtls, webauthn] default"; docker compose logs --tail=10 group-gate; exit 1; }
-          echo "PASS: fresh Hub publishes default auth policy {factors: [mtls, webauthn], op: any}; group-gate steps up apps without their own policy"
+          [ "$code" = 403 ] || { echo "FAIL: gated app under the Standard default without a session got $code"; exit 1; }
+          docker compose logs group-gate 2>&1 | grep -E "STEPUP user=testuser host=gated.portcullis.local amr=\[\] have=\[\] pc_method=(passkey|passkey_synced|passkey_device|security_key|yubikey_cert)$" >/dev/null \
+            || { echo "FAIL: group-gate did not step up under the Standard default"; docker compose logs --tail=10 group-gate; exit 1; }
+          for t in "$CI_TOKEN_SPK" "$CI_TOKEN_HWK" "$CI_TOKEN_MTLS"; do
+            [ "$(gated -H "X-Forwarded-Access-Token: $t")" = 200 ] || { echo "FAIL: a session meeting Standard denied: $(gated -H "X-Forwarded-Access-Token: $t")"; exit 1; }
+          done
+          echo "PASS: fresh Hub publishes policy v6 (Standard the default, Strong on hub / people); group-gate steps up apps without their own pick"
 
-          # The following tests (revocation) drive ci-gated with a client cert
-          # only, i.e. they assume a public default: set it like an admin
-          # would, through the settings API, and wait until group-gate
-          # enforces the new file.
-          printf '%s' '{"default_auth_policy":{"factors":[]}}' \
-            | hubapi -f -X PUT -H 'Content-Type: application/json' --data-binary @- "http://$HUB_IP:8888/api/settings" \
-            | jq -e '.status == "saved"' >/dev/null || { echo "FAIL: PUT /api/settings (public default)"; docker compose logs --tail=20 hub; exit 1; }
-          hubapi "http://$HUB_IP:8888/api/settings" | jq -e '(.default_auth_policy.factors // []) == []' >/dev/null \
-            || { echo "FAIL: Hub did not keep the public default"; exit 1; }
+          # An admin change through the sign-in API reaches group-gate: Strong
+          # as the default refuses the synced passkey (the step-up asks for a
+          # security key or the certificate, or needs-stronger when the Hub's
+          # inventory knows testuser has neither) and keeps the YubiKey
+          # certificate; then back to Standard.
+          setdef() { printf '{"template":"%s"}' "$1" | hubapi -o /tmp/setdef.json -w '%{http_code}' -X PUT -H 'Content-Type: application/json' \
+                       --data-binary @- "http://$HUB_IP:8888/api/signin/default"; }
+          [ "$(setdef strong)" = 200 ] || { echo "FAIL: PUT /api/signin/default strong: $(head -c 400 /tmp/setdef.json)"; exit 1; }
           for i in $(seq 1 30); do
-            policy_file | jq -e '(.default.factors // []) == []' >/dev/null 2>&1 && [ "$(gated)" = 200 ] && break
-            [ "$i" -eq 30 ] && { echo "FAIL: group-gate still enforces the old default ($(gated)): $(policy_file)"; docker compose logs --tail=10 group-gate; exit 1; }
+            policy_file | jq -e '.default == "strong"' >/dev/null 2>&1 && [ "$(gated -H "X-Forwarded-Access-Token: $CI_TOKEN_SPK")" = 403 ] && break
+            [ "$i" -eq 30 ] && { echo "FAIL: group-gate does not enforce the Strong default: $(policy_file)"; docker compose logs --tail=10 group-gate; exit 1; }
             sleep 2
           done
-          echo "PASS: admin-set public default (PUT /api/settings) published and enforced by group-gate"
+          docker compose logs group-gate 2>&1 | grep -E "(STEPUP|NEEDS-STRONGER) user=testuser host=gated.portcullis.local amr=\['spk'\] have=\['passkey_synced'\] (pc_method=(security_key|yubikey_cert)|set_up=.*)$" >/dev/null \
+            || { echo "FAIL: no step-up / needs-stronger page for a synced session under Strong"; docker compose logs --tail=10 group-gate; exit 1; }
+          [ "$(gated -H "X-Forwarded-Access-Token: $CI_TOKEN_MTLS")" = 200 ] || { echo "FAIL: a bound mtls session denied under Strong"; exit 1; }
+          [ "$(setdef standard)" = 200 ] || { echo "FAIL: PUT /api/signin/default standard: $(head -c 400 /tmp/setdef.json)"; exit 1; }
+          for i in $(seq 1 30); do
+            policy_file | jq -e '.default == "standard"' >/dev/null 2>&1 && [ "$(gated -H "X-Forwarded-Access-Token: $CI_TOKEN_SPK")" = 200 ] && break
+            [ "$i" -eq 30 ] && { echo "FAIL: group-gate still enforces Strong: $(policy_file)"; exit 1; }
+            sleep 2
+          done
+          echo "PASS: an admin's default change (PUT /api/signin/default) is published and enforced by group-gate"
 
       - name: Test the MCP gate (non-root, pinned address, secrets, access log, MCP routes without forward-auth)
         run: |
@@ -1783,8 +1841,10 @@ jobs:
               == [["webauthn-register", false], ["webauthn-register-passwordless", true]]' >/dev/null \
             || { echo "FAIL: required actions: webauthn-register-passwordless on, the two-factor webauthn-register off"; exit 1; }
           kc "" | jq -e '.attributes["acr.loa.map"] == "{}" and .bruteForceProtected and .failureFactor == 10 and .waitIncrementSeconds == 60
-              and .maxFailureWaitSeconds == 900 and (.permanentLockout | not) and .webAuthnPolicyPasswordlessAttestationConveyancePreference == "direct"' >/dev/null \
-            || { echo "FAIL: realm sign-in settings: $(kc "" | jq -c '{loa: .attributes["acr.loa.map"], bruteForceProtected, failureFactor, waitIncrementSeconds, maxFailureWaitSeconds, permanentLockout}')"; exit 1; }
+              and .maxFailureWaitSeconds == 900 and (.permanentLockout | not) and .webAuthnPolicyPasswordlessAttestationConveyancePreference == "direct"
+              and .webAuthnPolicyPasswordlessAuthenticatorAttachment == "not specified" and .webAuthnPolicyPasswordlessRequireResidentKey == "Yes"
+              and .webAuthnPolicyPasswordlessUserVerificationRequirement == "required"' >/dev/null \
+            || { echo "FAIL: realm sign-in settings: $(kc "" | jq -c '{loa: .attributes["acr.loa.map"], bruteForceProtected, failureFactor, waitIncrementSeconds, maxFailureWaitSeconds, permanentLockout, att: .webAuthnPolicyPasswordlessAttestationConveyancePreference, attachment: .webAuthnPolicyPasswordlessAuthenticatorAttachment, rk: .webAuthnPolicyPasswordlessRequireResidentKey, uv: .webAuthnPolicyPasswordlessUserVerificationRequirement}')"; exit 1; }
           kc /authentication/flows | jq -e 'any(.[]; .alias == "portcullis-universal" and (.description | test("\\[sync [0-9a-f]{10}\\]$")))' >/dev/null \
             || { echo "FAIL: browser flow not synced from realm-export.json"; exit 1; }
           kc /identity-provider/instances/portcullis-invite | jq -e '.enabled and .hideOnLogin and (.trustEmail | not)
@@ -1809,6 +1869,10 @@ jobs:
           SCOPE_ID=$(kc /client-scopes | jq -r '.[] | select(.name == "portcullis-invite-client") | .id')
           kc "/clients/$FWD" | jq -e '.attributes["pkce.code.challenge.method"] == "S256"' >/dev/null \
             || { echo "FAIL: portcullis-forward-auth does not require PKCE S256"; exit 1; }
+          # No LoA request on the forward-auth client (contract §8.1: the Hub
+          # pushes no default.acr.values; configure clears it).
+          kc "/clients/$FWD" | jq -e '(.attributes["default.acr.values"] // "") == ""' >/dev/null \
+            || { echo "FAIL: portcullis-forward-auth has default.acr.values: $(kc "/clients/$FWD" | jq -c '.attributes["default.acr.values"]')"; exit 1; }
           kc "/clients/$FWD/default-client-scopes" | jq -e --arg s "$SCOPE_ID" '[.[] | select(.id == $s)] | length == 1' >/dev/null \
             || { echo "FAIL: portcullis-forward-auth lacks the portcullis-invite-client scope"; exit 1; }
           kc /default-default-client-scopes | jq -e --arg s "$SCOPE_ID" 'all(.[]; .id != $s)' >/dev/null \
@@ -2053,14 +2117,11 @@ jobs:
           # (the gated router has no forward-auth: the username header is the test's)
           gated() { curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt \
                       --resolve "gated.portcullis.local:443:127.0.0.1" -H 'X-Auth-Request-Preferred-Username: testuser' \
-                      --cert "$1.crt" --key "$1.key" https://gated.portcullis.local/ || true; }
-          # Precondition: ci-gated has no auth policy of its own and the
-          # default is public (set by the Hub test via PUT /api/settings, or
-          # no Hub at all), so only revocation can turn 200 into 403.
-          docker run --rm -v portcullis_hub_data:/d:ro alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
-              sh -c 'cat /d/group-gate-policy.json 2>/dev/null || echo "{}"' \
-            | jq -e '(.policies["gated.portcullis.local"] // .default // {}) | (.factors // []) == []' >/dev/null \
-            || { echo "FAIL: precondition: ci-gated is not public in the group-gate policy file"; exit 1; }
+                      -H "X-Forwarded-Access-Token: $CI_TOKEN_MTLS" --cert "$1.crt" --key "$1.key" https://gated.portcullis.local/ || true; }
+          # Precondition: the cert bound to testuser's mtls session opens
+          # ci-gated (the default template is met), so only revocation can
+          # turn 200 into 403.
+          [ "$(gated /tmp/test-client)" = 200 ] || { echo "FAIL: precondition: ci-gated refuses testuser's bound session before the revocation"; exit 1; }
 
           # 1) portcullis cert revoke → serial file → immediate denial
           SERIAL=$(cat /tmp/test-client.serial)
@@ -2519,6 +2580,15 @@ jobs:
             "groups": {"app.portcullis.local": "users_e2e", "hwk.portcullis.local": "users_e2e", "mtls.portcullis.local": "users_e2e"},
             "path_groups": {"app.portcullis.local": [{"prefix": "/admin", "group": "admin_e2e"}]}}' \
             | docker run --rm -i -v portcullis_hub_data:/d "$ALPINE" sh -c 'cat > /d/group-gate-policy.json && chmod 644 /d/group-gate-policy.json'
+          # The extension's signin-keycloak.json (normally written by the Hub;
+          # without it nobody signs in, contract §8.1): the same methods and
+          # templates, no native-OIDC clients, the CI trust list (Chromium's
+          # virtual authenticator = a security key) and no FIDO list yet.
+          docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" cat /d/group-gate-policy.json \
+            | jq -c --slurpfile auth tests/e2e/fixtures/virtual-authenticators.json \
+                '{version: 1, methods, add_stronger, templates, clients: {}, authenticators: $auth[0],
+                  mds: {serial: 0, next_update: "0001-01-01T00:00:00Z"}}' \
+            | docker run --rm -i -v portcullis_hub_data:/d "$ALPINE" sh -c 'cat > /d/signin-keycloak.json && chmod 644 /d/signin-keycloak.json'
           # Shared custom fields (normally written by the Hub): e2e_login.py
           # checks the attribute header reaches the app and forged ones don't.
           printf '%s' '{"version": 2, "fields": {"city": "City"}, "users": {"e2e": {"city": ["Milan"]}}}' \
@@ -2744,6 +2814,14 @@ jobs:
           done
           cat > docker-compose.ci.yml <<'YML'
           services:
+            # CI only (contract §8.1 "Extra entries"): the Hub's trust list
+            # gets Chromium's virtual authenticator as a security key.
+            hub:
+              environment:
+                HUB_DEV: "1"
+                HUB_SIGNIN_EXTRA_AUTHENTICATORS: /run/portcullis/signin/extra-authenticators.json
+              volumes:
+                - ./tests/e2e/fixtures/virtual-authenticators.json:/run/portcullis/signin/extra-authenticators.json:ro
             keycloak:
               ports:
                 - "127.0.0.1:9000:9000"
@@ -2923,10 +3001,15 @@ jobs:
           # Every create names its label (contracts §11.9).
           code=$(hubc POST /api/instances -d "$(jq -cn --arg h "echo-y.$E2E_DOMAIN" '{template: "echo", id: "echo-y", hosts: {echo: $h}}')")
           [ "$code" = 400 ] || { echo "FAIL: a create without a label got $code $(cat /tmp/hub.out)"; exit 1; }
-          # echo-c: policy mtls (a passkey session steps up); echo-b: a slow
-          # stop (its backup takes > 60 s, e2e_instances.py long_backup).
-          code=$(hubc PUT /api/instances/echo-c/settings -d '{"auth_policy":{"factors":["mtls"],"op":""}}')
-          [ "$code" = 200 ] || { echo "FAIL: echo-c policy: $code $(cat /tmp/hub.out)"; exit 1; }
+          # echo-c: a template of the YubiKey certificate only (a passkey
+          # session steps up, contract §8.1); echo-b: a slow stop (its backup
+          # takes > 60 s, e2e_instances.py long_backup).
+          code=$(hubc POST /api/signin/templates -d '{"id":"e2e-cert","name":"YubiKey certificate only","rule":{"op":"any","items":["yubikey_cert"]}}')
+          [ "$code" = 201 ] || { echo "FAIL: create the e2e-cert template: $code $(cat /tmp/hub.out)"; exit 1; }
+          code=$(hubc PUT /api/instances/echo-c/settings -d '{"sign_in_template":"e2e-cert"}')
+          [ "$code" = 200 ] || { echo "FAIL: echo-c sign-in template: $code $(cat /tmp/hub.out)"; exit 1; }
+          hub GET /api/instances/echo-c/signin | jq -e '.template == "e2e-cert" and (.inherits | not)' >/dev/null \
+            || { echo "FAIL: echo-c's pick: $(hub GET /api/instances/echo-c/signin | head -c 400)"; exit 1; }
           code=$(hubc PUT /api/instances/echo-b/settings -d '{"values":{"echo_stop_grace":"75s"}}')
           [ "$code" = 200 ] || { echo "FAIL: echo-b settings: $code $(cat /tmp/hub.out)"; exit 1; }
           # Env overrides (contracts §11.9): a variable of the admin's own is
@@ -2972,17 +3055,18 @@ jobs:
             hubop POST /api/templates/enable -d "{\"id\":\"$id\"}" || { echo "FAIL: enable $id"; exit 1; }
           done
 
-          # What the Hub published: policy v5 keyed by hostname, the extra domain.
+          # What the Hub published: policy v6 keyed by hostname, the extra domain.
           policy_file() { docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" cat /d/group-gate-policy.json; }
           for i in $(seq 1 30); do
-            policy_file | jq -e --arg x "$E2E_EXTRA" '.version == 5 and .extra_domains == [$x]
+            policy_file | jq -e --arg x "$E2E_EXTRA" '.version == 6 and .extra_domains == [$x]
                 and .groups["echo-a.\($x)"] == "users_echo-a" and .groups["echo-c.\($x)"] == "users_echo-c"
                 and .groups["echo-b.portcullis.local"] == "users_echo-b"
-                and .policies["echo-c.\($x)"].factors == ["mtls"]' >/dev/null 2>&1 && break
+                and .hosts["echo-c.\($x)"] == "e2e-cert" and .templates["e2e-cert"] == {op: "any", items: ["yubikey_cert"]}
+                and (.hosts | has("echo-a.\($x)") | not) and .default == "standard"' >/dev/null 2>&1 && break
             [ "$i" -eq 30 ] && { echo "FAIL: policy file: $(policy_file)"; exit 1; }
             sleep 2
           done
-          echo "PASS: policy v5: instances keyed by hostname, groups per instance, extra_domains = [$E2E_EXTRA]"
+          echo "PASS: policy v6: instances keyed by hostname, groups per instance, echo-c on e2e-cert, extra_domains = [$E2E_EXTRA]"
 
           # The rendered sign-in: forward-auth-ext on extra-domain hosts only.
           labels() { docker inspect -f '{{json .Config.Labels}}' "$(docker ps -q --filter "label=com.docker.compose.project=portcullis-$1" --filter label=com.docker.compose.service=web)"; }
@@ -3315,6 +3399,14 @@ jobs:
           # address is restated: the override replaces the entry.
           cat > docker-compose.ci.yml <<'YML'
           services:
+            # CI only (contract §8.1 "Extra entries"): the Hub's trust list
+            # gets Chromium's virtual authenticator as a security key.
+            hub:
+              environment:
+                HUB_DEV: "1"
+                HUB_SIGNIN_EXTRA_AUTHENTICATORS: /run/portcullis/signin/extra-authenticators.json
+              volumes:
+                - ./tests/e2e/fixtures/virtual-authenticators.json:/run/portcullis/signin/extra-authenticators.json:ro
             keycloak:
               ports:
                 - "127.0.0.1:9000:9000"
@@ -3662,6 +3754,14 @@ jobs:
           # stand-in, as in e2e-settings).
           cat > docker-compose.ci.yml <<'YML'
           services:
+            # CI only (contract §8.1 "Extra entries"): the Hub's trust list
+            # gets Chromium's virtual authenticator as a security key.
+            hub:
+              environment:
+                HUB_DEV: "1"
+                HUB_SIGNIN_EXTRA_AUTHENTICATORS: /run/portcullis/signin/extra-authenticators.json
+              volumes:
+                - ./tests/e2e/fixtures/virtual-authenticators.json:/run/portcullis/signin/extra-authenticators.json:ro
             keycloak:
               ports:
                 - "127.0.0.1:9000:9000"
@@ -3941,6 +4041,14 @@ jobs:
           done
           cat > docker-compose.ci.yml <<'YML'
           services:
+            # CI only (contract §8.1 "Extra entries"): the Hub's trust list
+            # gets Chromium's virtual authenticator as a security key.
+            hub:
+              environment:
+                HUB_DEV: "1"
+                HUB_SIGNIN_EXTRA_AUTHENTICATORS: /run/portcullis/signin/extra-authenticators.json
+              volumes:
+                - ./tests/e2e/fixtures/virtual-authenticators.json:/run/portcullis/signin/extra-authenticators.json:ro
             keycloak:
               ports:
                 - "127.0.0.1:9000:9000"
@@ -4227,6 +4335,14 @@ jobs:
           # override replaces the entry.
           cat > docker-compose.ci.yml <<'YML'
           services:
+            # CI only (contract §8.1 "Extra entries"): the Hub's trust list
+            # gets Chromium's virtual authenticator as a security key.
+            hub:
+              environment:
+                HUB_DEV: "1"
+                HUB_SIGNIN_EXTRA_AUTHENTICATORS: /run/portcullis/signin/extra-authenticators.json
+              volumes:
+                - ./tests/e2e/fixtures/virtual-authenticators.json:/run/portcullis/signin/extra-authenticators.json:ro
             keycloak:
               ports:
                 - "127.0.0.1:9000:9000"

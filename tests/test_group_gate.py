@@ -782,11 +782,25 @@ class SigninV6Test(GateTest):
         self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(hdrs["X-Stepup-URL"]).query),
                          {"pc_method": ["passkey"], "rd": ["https://grafana.example.com/"]})
         self.assertIn("grafana.example.com needs a passkey", body)
-        # A known person: the template's first passkey kind they have set up.
-        write_policy({"templates": {**BASE["templates"], "basic": BASIC_COMPILED}, "default": "basic",
-                      "people": {"bob": ["passkey_device", "security_key"]}})
+        # A setup-link session counts as not known in `people` (contract
+        # §5): its new passkey may not be in the inventory yet, so neither a
+        # stale entry nor an empty one turns the step-up into needs-stronger.
+        for people in ({"bob": ["passkey_device", "security_key"]}, {"bob": []}, {"bob": ["yubikey_cert"]}):
+            with self.subTest(people=people):
+                write_policy({"templates": {**BASE["templates"], "basic": BASIC_COMPILED}, "default": "basic",
+                              "people": people})
+                code, hdrs, body = self.page("grafana.example.com", ["inv"])
+                self.assertEqual(code, 403)
+                self.assertIn('id="stepup-continue"', body)
+                self.assertNotIn('id="needs-stronger"', body)
+                self.assertIn("pc_method=passkey&", hdrs["X-Stepup-URL"])
+        # One passkey candidate: that one, whatever `people` says.
+        write_policy({"hosts": {"grafana.example.com": "strong"}, "people": {"bob": []}})
         code, hdrs, body = self.page("grafana.example.com", ["inv"])
-        self.assertIn("pc_method=passkey_device", hdrs["X-Stepup-URL"])
+        self.assertIn("pc_method=security_key", hdrs["X-Stepup-URL"])
+        # The same person without `inv` and an empty inventory: needs-stronger.
+        code, hdrs, body = self.page("grafana.example.com", ["spk"])
+        self.assertIn('id="needs-stronger"', body)
 
     def test_yubikey_cert_needs_bound_cert(self):
         write_policy({"hosts": {"grafana.example.com": "strong"}})

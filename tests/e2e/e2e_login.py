@@ -5,14 +5,20 @@ Runs in CI (job `e2e` in .github/workflows/ci.yml) against a full core stack
 plus a whoami test app with three hosts:
 
   app.<domain>    users_e2e group; path_groups /admin -> admin_e2e; the
-                  default policy (the Hub's fresh-install default: any of
-                  mtls / webauthn)
-  hwk.<domain>    policy: webauthn
-  mtls.<domain>   policy: mtls (X.509 login through Keycloak + mtls binding)
+                  default template (the Hub's fresh-install Standard: any
+                  passkey or a YubiKey certificate)
+  hwk.<domain>    template any[security_key]
+  mtls.<domain>   template any[yubikey_cert] (X.509 login through Keycloak +
+                  mtls binding)
 
-Sign-in is passkey-only. Every user starts from a one-time setup link
-(`portcullis invite`): open it, register the key, land on the app — the test
-fails on ANY password field. Then: the session reaches the apps, a second
+The workflow writes policy file v6 and signin-keycloak.json (no Hub in this
+job); the latter's trust list holds the CI fixture
+tests/e2e/fixtures/virtual-authenticators.json, so the virtual key registers
+as a security key. Sign-in is passkey-only. Every user starts from a one-time
+setup link (`portcullis invite`): open it, register the key, then group-gate's
+step-up page (a setup-link session, amr inv, meets no template) asks for the
+new key once more, and the browser lands on the app — the test fails on ANY
+password field or a needs-stronger page. Then: the session reaches the apps, a second
 login in a fresh browser is one passkey touch, the link is single use, the
 session survives two refreshes with concurrent requests (refresh_rotation,
 contract §8), a user
@@ -20,7 +26,7 @@ outside the group is denied, the bootstrap admin's link lands on the portal
 with the Hub link, an unused link cannot sign in to another client through
 the invite identity provider (post-broker deny, contract §8), X.509 login /
 mtls binding, a cert-only session (no authenticator) opens a
-default-policy app and renews its cert at /self, revocation / foreign CA.
+default-template app and renews its cert at /self, revocation / foreign CA.
 
 Browser: Playwright Chromium with a CDP virtual WebAuthn authenticator
 (CTAP2, USB, resident keys, user verification). The CA must be trusted by
@@ -117,14 +123,30 @@ def on_login_pages(page: Page) -> bool:
     return page.url.startswith(AUTH + "/realms/") or page.url.startswith(f"https://enroll.{DOMAIN}/invite/")
 
 
-def passkey_flow(page: Page, *, until: str, label: str) -> None:
-    """Drive the setup-link page and Keycloak until the browser lands on
-    `until`. Handles: "Register my key" (setup link), the passkey
-    registration required action, "Sign in with Passkey". Fails at once on a
-    password field or a Keycloak error: there are no passwords any more."""
+def passkey_flow(page: Page, *, until: str, label: str, stepups: list | None = None) -> None:
+    """Drive the setup-link page, Keycloak and group-gate's step-up page
+    until the browser lands on `until`. Handles: "Register my key" (setup
+    link), the passkey registration required action, "Sign in with
+    Passkey", and group-gate's step-up page (#stepup-continue, contract §5:
+    a setup-link session meets no template, so the new passkey is touched
+    once more; each step-up URL is appended to `stepups`). Fails at once on a
+    password field, a Keycloak error, or group-gate's needs-stronger /
+    present-certificate page: there are no passwords any more."""
     deadline = time.time() + 90
     while time.time() < deadline:
         page.wait_for_load_state("domcontentloaded")
+        if not on_login_pages(page):
+            if page.locator("#stepup-continue").count():
+                shot(page, f"{label}-stepup")
+                if stepups is not None:
+                    stepups.append(page.locator("#stepup-continue").get_attribute("href"))
+                page.click("#stepup-continue")
+                page.wait_for_timeout(1500)
+                continue
+            for marker in ("#needs-stronger", "#present-certificate"):
+                if page.locator(marker).count():
+                    shot(page, f"{label}-{marker[1:]}")
+                    raise AssertionError(f"group-gate's {marker} page at {page.url}: {page.inner_text('body')[:300]!r}")
         if page.url.startswith(until) and not on_login_pages(page):
             return
         if not on_login_pages(page):
@@ -214,13 +236,19 @@ def main() -> int:
             page.goto(invite, wait_until="domcontentloaded")
             shot(page, "setup-link")
             assert f"<strong>{user}</strong>" in page.content(), "setup page does not name the user"
-            passkey_flow(page, until=HWK, label="setup")
+            stepups: list = []
+            passkey_flow(page, until=HWK, label="setup", stepups=stepups)
             shot(page, "hwk-after-setup")
             assert key.registered == 1, f"{key.registered} passkeys registered"
-            assert key.asserted == 0, "a passkey login was needed right after the registration"
+            # A setup-link session (amr inv) meets no template: hwk's
+            # (security key only) asks for exactly that, one more touch of
+            # the new key — which only works when Keycloak classified the
+            # virtual key as a security key (the CI trust-list fixture).
+            assert len(stepups) == 1 and "pc_method=security_key&" in stepups[0], f"step-ups: {stepups}"
+            assert key.asserted == 1, f"{key.asserted} passkey assertions after the registration (want the one step-up)"
             assert "Hostname" in page.inner_text("body"), page.url
             saved["creds"] = key.credentials()
-        check("setup link: register the key and land on a webauthn app (no password, no second prompt)",
+        check("setup link: register the key, step up with it, land on a security-key app (no password)",
               setup_link_signs_in)
 
         def setup_link_single_use():
@@ -373,13 +401,18 @@ def main() -> int:
 
         def admin_bootstrap():
             page.goto(admin_invite, wait_until="domcontentloaded")
-            passkey_flow(page, until=PORTAL, label="admin")
+            stepups: list = []
+            passkey_flow(page, until=PORTAL, label="admin", stepups=stepups)
             shot(page, "portal-admin")
             body = page.content()
             assert "Signed in as <strong>admin</strong>" in body, body[:400]
             assert f'href="https://hub.{DOMAIN}/"' in body, "portal has no Hub link for lldap_admin"
-            assert admin_key.registered == 1 and admin_key.asserted == 0
-        check("bootstrap admin: setup link → key → portal with the Hub (no password)", admin_bootstrap)
+            # The portal's template (Standard) after the setup link: one
+            # step-up, any passkey (`people` is ignored for a setup-link session).
+            assert len(stepups) == 1 and "pc_method=passkey&" in stepups[0], f"step-ups: {stepups}"
+            assert (admin_key.registered, admin_key.asserted) == (1, 1), \
+                f"registrations={admin_key.registered} assertions={admin_key.asserted}"
+        check("bootstrap admin: setup link → key → step-up → portal with the Hub (no password)", admin_bootstrap)
         close(ctx, "admin")
 
         # An unused setup link, redeemed, then steered to ANOTHER client's
@@ -433,7 +466,7 @@ def main() -> int:
             body = page.inner_text("body")
             assert "Hostname" in body, body[:500]
             state["storage"] = ctx.storage_state()
-        check("X.509 login via Keycloak satisfies an mtls policy", x509_login)
+        check("X.509 login via Keycloak satisfies a YubiKey-certificate template", x509_login)
 
         def binding_without_cert():
             if "storage" not in state:
@@ -449,13 +482,13 @@ def main() -> int:
         check("mtls session without the cert on the request is refused", binding_without_cert)
 
         # The same browser has a cert and NO authenticator: a cert-only
-        # session (amr=[mtls]) under the Hub's default any of [mtls, webauthn].
+        # session (amr=[mtls]) under the Hub's default, Standard.
         def cert_only_default_app():
             resp = page.goto(APP + "/", wait_until="domcontentloaded")
             shot(page, "cert-only-app")
             assert resp and resp.status == 200 and "Hostname" in page.inner_text("body"), \
-                f"default-policy app for a cert-only session: HTTP {resp and resp.status}"
-        check("cert-only session opens an app with the default policy (any of mtls / webauthn)", cert_only_default_app)
+                f"default-template app for a cert-only session: HTTP {resp and resp.status}"
+        check("cert-only session opens an app with the default template (Standard)", cert_only_default_app)
 
         def cert_only_self_renewal():
             resp = page.goto(ENROLL + "/self", wait_until="domcontentloaded")

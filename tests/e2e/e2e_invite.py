@@ -8,9 +8,12 @@ Get the link on the server with `./portcullis invite <user> --to <hub|portal|URL
 Playwright Chromium and a CDP virtual authenticator it proves, and exits 1
 otherwise:
 
-  1. the link page names the user; one click → passkey registration → the
-     landing URL, with no password field anywhere and no second prompt;
-  2. the token oauth2-proxy holds says acr=hwk, amr=[hwk];
+  1. the link page names the user; one click → passkey registration →
+     group-gate's step-up page (a setup-link session, amr inv, meets no
+     sign-in template, contract §5) → Continue → one touch of the new key →
+     the landing URL, with no password field and no needs-stronger page;
+  2. the token oauth2-proxy holds has a passkey method in its amr (spk, dpk
+     or hwk, whichever kind Keycloak classified the key as);
   3. the link is single use;
   4. a second login in a fresh browser with the same key is ONE passkey
      assertion, no password, straight to the landing URL;
@@ -91,7 +94,8 @@ def one_touch_login(pw, creds, label: str, expect_ok: bool = True) -> None:
 
 
 def drive(page: Page) -> tuple[bool, int]:
-    """Click through until LANDING; returns (reached, password prompts seen)."""
+    """Click through until LANDING (group-gate's step-up page included);
+    returns (reached, password prompts seen). A needs-stronger page fails."""
     deadline = time.time() + 90
     while time.time() < deadline:
         page.wait_for_load_state("networkidle")
@@ -99,9 +103,12 @@ def drive(page: Page) -> tuple[bool, int]:
         if pw.count() and pw.first.is_visible():
             print(f"      password field at {page.url.split('?')[0]}")
             return False, 1
-        if page.url.startswith(LANDING) and "Additional authentication" not in page.title():
+        if page.locator("#needs-stronger, #present-certificate").count():
+            print(f"      group-gate refused at {page.url.split('?')[0]}: {page.locator('body').inner_text()[:200]!r}")
+            return False, 0
+        if page.url.startswith(LANDING) and not page.locator("#stepup-continue").count():
             return True, 0
-        for sel in ("#invite-continue", "#registerWebAuthn", "#authenticateWebAuthnButton"):
+        for sel in ("#invite-continue", "#registerWebAuthn", "#authenticateWebAuthnButton", "#stepup-continue"):
             if page.locator(sel).is_visible():
                 page.click(sel)
                 page.wait_for_timeout(1500)
@@ -129,9 +136,9 @@ with sync_playwright() as pw:
     expect("Set up your passkey" in page.content(), "the setup link shows the setup page")
     reached, prompts = drive(page)
     expect(reached and prompts == 0, f"setup link → passkey registration → {LANDING}, no password")
-    expect(counts == {"registered": 1, "asserted": 0}, f"one registration, no extra touch ({counts})")
+    expect(counts == {"registered": 1, "asserted": 1}, f"one registration, one step-up touch ({counts})")
     c = token_claims(page)
-    expect(c.get("acr") == "hwk" and "hwk" in (c.get("amr") or []), f"token acr/amr: {c.get('acr')} {c.get('amr')}")
+    expect(bool({"spk", "dpk", "hwk"} & set(c.get("amr") or [])), f"token amr has a passkey method: {c.get('amr')}")
     creds = cdp.send("WebAuthn.getCredentials", {"authenticatorId": aid})["credentials"]
     resp = page.goto(LINK, wait_until="domcontentloaded")
     expect(bool(resp) and resp.status == 404, "the link works once")
@@ -152,8 +159,8 @@ with sync_playwright() as pw:
         b, page, cdp, aid, counts = browser_page(pw)  # a NEW authenticator
         page.goto(link2, wait_until="domcontentloaded")
         reached, prompts = drive(page)
-        expect(reached and prompts == 0 and counts == {"registered": 1, "asserted": 0},
-               f"re-invite (recovery): a second key registers and lands ({counts})")
+        expect(reached and prompts == 0 and counts == {"registered": 1, "asserted": 1},
+               f"re-invite (recovery): a second key registers, steps up and lands ({counts})")
         creds2 = cdp.send("WebAuthn.getCredentials", {"authenticatorId": aid})["credentials"]
         b.close()
         one_touch_login(pw, creds2, "the new key")

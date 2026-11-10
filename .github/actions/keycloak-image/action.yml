@@ -5,7 +5,9 @@ description: >-
   the sign-in extension) from it and use that image
   (KEYCLOAK_IMAGE=portcullis-keycloak:ci, KEYCLOAK_LOCAL=1 for the later
   steps), so core and extension changes that must ship together are tested
-  together without publishing an image. Otherwise the compose default (the
+  together without publishing an image. KEYCLOAK_LOCAL is reserved, like
+  HUB_LOCAL: no CI step pulls Keycloak by name today (compose up uses the
+  local image); a step that ever does must skip the pull when it is set. Otherwise the compose default (the
   published edge image) is pulled here and its digest named in the step
   summary.
 

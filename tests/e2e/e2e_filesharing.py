@@ -23,7 +23,7 @@ Scenarios:
                then both enabled through the Hub.
   fresh_auth   alice (signed in with her passkey) opens My apps and clicks
                Create password: the popup goes to Keycloak with
-               prompt=login, max_age=0, acr_values=hwk, asks for the
+               prompt=login, max_age=0 (no ACR request: the pc_fresh claim), asks for the
                passkey again (exactly one more authenticator assertion),
                comes back to people.<domain>/ and hands the code to its
                opener (window.opener survives: Cross-Origin-Opener-Policy
@@ -707,7 +707,7 @@ def main() -> int:
             _, page, auth = ses["alice"]
             state["alice_tm"] = create_password(page, auth, TM, "alice")
             state["n_hashes"] = record_hashes()
-        check("fresh_auth: Create password → popup (prompt=login, max_age=0, acr_values=hwk) → exactly one more "
+        check("fresh_auth: Create password → popup (prompt=login, max_age=0, pc_fresh) → exactly one more "
               "assertion → the password shown once; the same code again 403; gone after the dialog", fresh_auth)
 
         # ── 3. SMB ──

@@ -7,22 +7,23 @@ enrolled domain E2E_EXTRA, and three instances of the CI template
 tests/e2e/apps/echo (traefik/whoami behind Portcullis sign-in) that the
 workflow created through the Hub's API:
 
-  echo-a.<extra>   users_echo-a (alice); default policy; extra domain
-  echo-b.<domain>  users_echo-b (bob);   default policy; main domain;
+  echo-a.<extra>   users_echo-a (alice); the default template; extra domain
+  echo-b.<domain>  users_echo-b (bob);   the default template; main domain;
                    its hold service makes a backup take > 60 s
-  echo-c.<extra>   users_echo-c (alice); policy mtls (step-up from a
-                   passkey session); extra domain
+  echo-c.<extra>   users_echo-c (alice); template e2e-cert = any
+                   [yubikey_cert] (step-up from a passkey session; TLS
+                   option protected); extra domain
 
 Scenarios (contract §5, §11):
   cross_domain_sso  alice signs in on the main domain (setup link, passkey);
                     echo-a on the extra domain opens with NO further
                     WebAuthn assertion through forward-auth-ext (host-only
                     __Host-portcullis_ext cookie, relative callback on the
-                    host, PKCE S256); echo-c (policy mtls) steps up exactly
+                    host, PKCE S256); echo-c (e2e-cert) steps up exactly
                     once and lands on the app; a stale ext cookie signs in
                     again without a redirect loop.
   two_instances     two instances, two groups: alice reaches echo-a only,
-                    bob echo-b only (group-gate v5 keyed by hostname).
+                    bob echo-b only (group-gate v6 keyed by hostname).
   long_backup       an admin's backup of echo-b through Traefik
                     (hub.<domain>, default timeouts) that takes longer than
                     60 s: accepted with 202, a concurrent one is 409 busy,
@@ -178,8 +179,8 @@ def main() -> int:
                 assert c["domain"] == f"echo-a.{EXTRA}" and c["path"] == "/" and c["secure"], c
             assert not [c for c in ctx.cookies() if c["domain"].lstrip(".") == EXTRA], "a cookie for the whole extra domain"
             assert not [c for c in cookies if c["name"] == "_oauth2_proxy"], "main-domain cookie sent to the extra domain"
-            # The setup link's session (post-broker flow portcullis-invite-session:
-            # LoA 1 and 2 recorded): the mtls step-up below starts from it.
+            # The setup link's session (amr inv, plus the passkey of the
+            # portal's step-up): the certificate step-up below starts from it.
             state["storage"] = ctx.storage_state()
         check("cross_domain_sso: echo-a on the extra domain opens with no extra WebAuthn assertion "
               "(forward-auth-ext, host-only __Host-portcullis_ext, host callback, PKCE S256)", cross_domain_sso)
@@ -206,7 +207,7 @@ def main() -> int:
         check("two_instances: alice (users_echo-a) is refused on echo-b", alice_not_on_echo_b)
         close(ctx, "alice")
 
-        # ── alice with her client certificate: step-up on echo-c (mtls) ──
+        # ── alice with her client certificate: step-up on echo-c (e2e-cert) ──
         def stepup_once():
             if "storage" not in state:
                 raise AssertionError("needs alice's session")
@@ -238,13 +239,13 @@ def main() -> int:
                 assert stepups == 1, f"{stepups} step-up pages (want exactly one)"
                 assert p2.url.startswith(ECHO_C) and "Hostname" in p2.inner_text("body"), f"stuck at {p2.url}"
                 assert key2.asserted == 0 and key2.registered == 0, "the mtls step-up asked for a passkey"
-                ext_starts = t2.matching(r"^" + re.escape(ECHO_C) + r"/oauth2/start\?.*acr_values=mtls")
+                ext_starts = t2.matching(r"^" + re.escape(ECHO_C) + r"/oauth2/start\?.*pc_method=yubikey_cert")
                 assert ext_starts, f"step-up did not use the host's /oauth2/start: {t2.urls}"
                 assert not t2.matching(re.escape(AUTH) + r"/oauth2/start"), "step-up went through auth.<domain>"
                 assert headers_of(p2.inner_text("body")).get("x-forwarded-user") == ["alice"]
             finally:
                 close(c2, "alice-stepup")
-        check("cross_domain_sso: echo-c (policy mtls) on the extra domain steps up exactly once", stepup_once)
+        check("cross_domain_sso: echo-c (YubiKey certificate only) on the extra domain steps up exactly once", stepup_once)
 
         # ── bob: his instance only ──
         ctx = new_context("bob")

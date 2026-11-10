@@ -32,7 +32,8 @@ Checks, run in order:
          rule would be met if the YubiKey certificate counted, but this
          request carries no bound certificate;
        - step-up (#stepup-continue, X-Stepup-URL): one missing method can
-         be completed — /oauth2/start?pc_method=<method>;
+         be completed — /oauth2/start?pc_method=<method> (a setup-link
+         session, amr `inv`, counts as not known in `people`);
        - needs-stronger (#needs-stronger): nothing can be completed here.
      mTLS binding: `yubikey_cert` (amr mtls) counts only when the CURRENT
      request presents a client cert (checked for revocation in step 0)
@@ -2033,8 +2034,11 @@ class Handler(BaseHTTPRequestHandler):
                                 f"PRESENT-CERTIFICATE {what} cert_cn={cert_cn!r} "
                                 f"token_user={claims.get('preferred_username')!r} cert_ok={cert_ok}")
             return True
-        people = doc["people"]
-        set_up = people.get(username.lower())
+        # A setup-link session (amr `inv`) is treated as not known in
+        # `people` (contract §5): it has just registered a passkey the
+        # Hub's inventory may not show yet, so a stale entry must never
+        # turn the step-up into the needs-stronger page.
+        set_up = None if "inv" in amr else doc["people"].get(username.lower())
         set_up = set(set_up) if set_up is not None else None
         method = choose_stepup(rule, have, set_up, amr_mtls=amr_mtls)
         if method is not None:
