@@ -232,11 +232,18 @@ hub_image_default() {
   sed -n 's/.*\${HUB_IMAGE:-\([^}]*\)}.*/\1/p' "$PORTCULLIS_HOME/docker-compose.yml" | head -n1
 }
 
-# hub_pinned_warn — before an upgrade: a HUB_IMAGE pinned in .env is not
-# upgraded with core.
+# keycloak_image_default — the KEYCLOAK_IMAGE default in docker-compose.yml.
+keycloak_image_default() {
+  sed -n 's/.*\${KEYCLOAK_IMAGE:-\([^}]*\)}.*/\1/p' "$PORTCULLIS_HOME/docker-compose.yml" | head -n1
+}
+
+# hub_pinned_warn — before an upgrade: a HUB_IMAGE or KEYCLOAK_IMAGE pinned
+# in .env is not upgraded with core (`upgrade` pulls every image of the
+# compose file; a pinned one stays what .env names).
 hub_pinned_warn() {
-  [ -n "${HUB_IMAGE:-}" ] || return 0
-  warn "HUB_IMAGE=$HUB_IMAGE is pinned in .env: the Hub is NOT upgraded with core. If this core's group-gate needs a newer policy file, every app host is denied until the Hub matches (checked after the start)."
+  [ -z "${HUB_IMAGE:-}" ] || warn "HUB_IMAGE=$HUB_IMAGE is pinned in .env: the Hub is NOT upgraded with core. If this core's group-gate needs a newer policy file, every app host is denied until the Hub matches (checked after the start)."
+  [ -z "${KEYCLOAK_IMAGE:-}" ] || warn "KEYCLOAK_IMAGE=$KEYCLOAK_IMAGE is pinned in .env: Keycloak is NOT upgraded with core. This core's realm needs the sign-in extension's providers of a matching portcullis-keycloak image."
+  return 0
 }
 
 # hub_policy_check [tries] — after a start: the policy file the Hub wrote
@@ -342,23 +349,29 @@ hub_sources_sync() {
 }
 
 version_run() {
-  local json="$1" ver hub src running="" cid=""
+  local json="$1" ver hub src running="" cid="" kc kcsrc kcrunning=""
   ver="$(portcullis_version)"
   [ ! -f "$(env_file)" ] || env_load
   if [ -n "${HUB_IMAGE:-}" ]; then hub="$HUB_IMAGE" src="HUB_IMAGE"; else hub="$(hub_image_default)" src="default"; fi
-  # The running Hub, if this is an installation and Docker answers.
+  if [ -n "${KEYCLOAK_IMAGE:-}" ]; then kc="$KEYCLOAK_IMAGE" kcsrc="KEYCLOAK_IMAGE"; else kc="$(keycloak_image_default)" kcsrc="default"; fi
+  # The running Hub and Keycloak, if this is an installation and Docker answers.
   if [ -f "$(env_file)" ] && command -v docker >/dev/null 2>&1; then
     cid="$(dc ps -q hub 2>/dev/null | head -n1 || true)"
     [ -z "$cid" ] || running="$(docker inspect --format '{{.Config.Image}} ({{.Image}})' "$cid" 2>/dev/null || true)"
+    cid="$(dc ps -q keycloak 2>/dev/null | head -n1 || true)"
+    [ -z "$cid" ] || kcrunning="$(docker inspect --format '{{.Config.Image}} ({{.Image}})' "$cid" 2>/dev/null || true)"
   fi
   if [ "$json" = true ]; then
-    jq -n --arg v "$ver" --arg h "$hub" --arg s "$src" --arg r "$running" \
-      '{version: $v, hub_image: $h, hub_image_source: $s, hub_running: (if $r == "" then null else $r end)}'
+    jq -n --arg v "$ver" --arg h "$hub" --arg s "$src" --arg r "$running" --arg k "$kc" --arg ks "$kcsrc" --arg kr "$kcrunning" \
+      '{version: $v, hub_image: $h, hub_image_source: $s, hub_running: (if $r == "" then null else $r end),
+        keycloak_image: $k, keycloak_image_source: $ks, keycloak_running: (if $kr == "" then null else $kr end)}'
     return 0
   fi
-  printf 'portcullis  %s\n' "$ver"
-  printf 'hub image   %s (%s)\n' "$hub" "$src"
-  [ -z "$running" ] || printf 'hub running %s\n' "$running"
+  printf 'portcullis       %s\n' "$ver"
+  printf 'hub image        %s (%s)\n' "$hub" "$src"
+  [ -z "$running" ] || printf 'hub running      %s\n' "$running"
+  printf 'keycloak image   %s (%s)\n' "$kc" "$kcsrc"
+  [ -z "$kcrunning" ] || printf 'keycloak running %s\n' "$kcrunning"
 }
 
 help_version() {
@@ -366,9 +379,10 @@ help_version() {
 Usage: portcullis version [--json]
 
 Print the core version (VERSION in a release tarball, else `git describe`
-of the checkout) and the Hub image in use: HUB_IMAGE from .env or the
-environment, else the default pinned in docker-compose.yml, plus the image
-of the running Hub container if there is one.
+of the checkout) and the Hub and Keycloak images in use: HUB_IMAGE /
+KEYCLOAK_IMAGE from .env or the environment, else the defaults in
+docker-compose.yml, plus the images of the running Hub and Keycloak
+containers if there are any.
 
 Options:
   --json   machine-readable output

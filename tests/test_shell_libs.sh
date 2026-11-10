@@ -700,6 +700,8 @@ expect_ok "upgrade sync: signal failure = warning with the manual fix" sh -c "pr
 rm -f "$STUB_DIR/sync" "$STUB_DIR/sync2" "$STUB_DIR/kills" "$STUB_DIR/killed" "$STUB_DIR/killfail"
 expect_ok "upgrade: pinned HUB_IMAGE warned" sh -c "printf '%s' \"\$1\" | grep -q 'NOT upgraded'" _ "$(HUB_IMAGE=x hub_pinned_warn 2>&1)"
 expect_eq "upgrade: default HUB_IMAGE not warned" "$(unset HUB_IMAGE; hub_pinned_warn 2>&1)" ""
+expect_ok "upgrade: pinned KEYCLOAK_IMAGE warned" sh -c "printf '%s' \"\$1\" | grep -q 'Keycloak is NOT upgraded'" _ "$(KEYCLOAK_IMAGE=x hub_pinned_warn 2>&1)"
+expect_eq "upgrade: default KEYCLOAK_IMAGE not warned" "$(unset HUB_IMAGE KEYCLOAK_IMAGE; hub_pinned_warn 2>&1)" ""
 # ── restore: never start Keycloak on an empty LLDAP over a database with users ──
 lg_guard() { (RG_LL="$1" RG_KC="$2"; _restore_lldap_count() { echo "$RG_LL"; }; _restore_kc_federated_count() { echo "$RG_KC"; }; _restore_lldap_guard "$3" 2>&1); }
 _rg() { lg_guard "$@" >/dev/null; }
@@ -716,11 +718,12 @@ echo 'PORTCULLIS_DOMAIN=x' > "$B/.env"
 echo '{"root_token":"r","unseal_keys_b64":["k"]}' > "$B/secrets/vault-init.json"
 printf k > "$B/secrets/vault-unseal/unseal-key"
 echo snap > "$B/vault.snap"; echo PGDMP > "$B/postgres.dump"; echo 'with space' > "$B/certs/a b.crt"
-_BACKUP_CFG='{"services":{"hub":{"image":"hub:1"}}}'
+_BACKUP_CFG='{"services":{"hub":{"image":"hub:1"},"keycloak":{"image":"kc:2"}}}'
 _backup_manifest "$B"
 expect_eq "manifest: format + every file" "$(jq -c '[.format, (.files | keys)]' "$B/MANIFEST.json")" \
   '[1,[".env","certs/a b.crt","postgres.dump","secrets/vault-init.json","secrets/vault-unseal/unseal-key","vault.snap"]]'
 expect_eq "manifest: hub image recorded" "$(jq -r .hub_image "$B/MANIFEST.json")" hub:1
+expect_eq "manifest: keycloak image recorded" "$(jq -r .keycloak_image "$B/MANIFEST.json")" kc:2
 expect_ok "manifest: checksums verify" _backup_check_manifest "$B"
 echo tampered >> "$B/postgres.dump"
 expect_fail "manifest: a modified file fails" _backup_check_manifest "$B"
@@ -836,8 +839,8 @@ F1="$(printf '%s' "$FWD" | _kc_fwd_patch ex.org)"
 expect_eq "keycloak configure: forward-auth redirect URIs = main callback + extra-domain callbacks" \
   "$(printf '%s' "$F1" | jq -c .redirectUris)" \
   '["https://auth.ex.org/oauth2/callback","https://grafana.team-b.example.org/oauth2/callback","https://x.team-b.example.org/oauth2/callback"]'
-expect_eq "keycloak configure: forward-auth acr default, PKCE S256 required, scopes kept" \
-  "$(printf '%s' "$F1" | jq -c '[.attributes, .defaultClientScopes]')" '[{"x":"1","default.acr.values":"pwd","pkce.code.challenge.method":"S256"},["acr","groups"]]'
+expect_eq "keycloak configure: forward-auth default acr removed (\"\"), PKCE S256 required, scopes kept" \
+  "$(printf '%s' "$F1" | jq -c '[.attributes, .defaultClientScopes]')" '[{"x":"1","default.acr.values":"","pkce.code.challenge.method":"S256"},["acr","groups"]]'
 expect_eq "keycloak configure: forward-auth patch idempotent" "$(printf '%s' "$F1" | _kc_fwd_patch ex.org | jq -cS .)" "$(printf '%s' "$F1" | jq -cS .)"
 expect_eq "keycloak configure: placeholder kept when it is the domain" \
   "$(printf '%s' "$FWD" | _kc_fwd_patch portcullis.local | jq -c '.redirectUris[0:1]')" '["https://auth.portcullis.local/oauth2/callback"]'
@@ -845,16 +848,17 @@ expect_eq "keycloak configure: placeholder kept when it is the domain" \
 # Invite IdP post-broker flow (contract §8): an invite login completes only
 # for a client with the marker scope (portcullis-forward-auth), positive
 # check + deny-unless-admitted (a missing scope or sub-flow denies), before
-# the LoA step; configure creates the scope (not a realm default).
+# the amr inv step; configure creates the scope (not a realm default).
 EXP="$HERE/../keycloak/realm-export.json"
-expect_eq "realm export: portcullis-invite-session = client check, deny, LoA 1, LoA 2" \
-  "$(jq -c '[.authenticationFlows[] | select(.alias == "portcullis-invite-session") | .authenticationExecutions[] | [.priority, .requirement, .flowAlias]]' "$EXP")" \
-  '[[10,"CONDITIONAL","portcullis-invite-client"],[20,"CONDITIONAL","portcullis-invite-deny"],[30,"CONDITIONAL","portcullis-invite-loa-1"],[40,"CONDITIONAL","portcullis-invite-loa"]]'
-# The setup link's session holds LoA 1 too, with amr hwk (as LoA 2): an
-# mtls step-up from it asks only for the certificate.
-expect_eq "realm export: invite LoA 1 and 2 sub-flows (level, amr hwk)" \
-  "$(jq -c '.authenticatorConfig as $c | [.authenticationFlows[] | select(.alias == "portcullis-invite-loa-1" or .alias == "portcullis-invite-loa") | [.alias, [.authenticationExecutions[] | [.authenticator, (.authenticatorConfig as $a | $c[] | select(.alias == $a) | .config)]]]]' "$EXP")" \
-  '[["portcullis-invite-loa-1",[["conditional-level-of-authentication",{"loa-condition-level":"1","loa-max-age":"36000"}],["allow-access-authenticator",{"default.reference.value":"hwk","default.reference.maxAge":"36000"}]]],["portcullis-invite-loa",[["conditional-level-of-authentication",{"loa-condition-level":"2","loa-max-age":"36000"}],["allow-access-authenticator",{"default.reference.value":"hwk","default.reference.maxAge":"36000"}]]]]'
+expect_eq "realm export: portcullis-invite-session = client check, deny, amr inv, template check" \
+  "$(jq -c '[.authenticationFlows[] | select(.alias == "portcullis-invite-session") | .authenticationExecutions[] | [.priority, .requirement, (.flowAlias // .authenticator)]]' "$EXP")" \
+  '[[10,"CONDITIONAL","portcullis-invite-client"],[20,"CONDITIONAL","portcullis-invite-deny"],[30,"REQUIRED","allow-access-authenticator"],[40,"REQUIRED","portcullis-template"]]'
+# The setup link's session gets amr inv (contract §8 "Invite links"): no
+# sign-in method, it meets no template; portcullis-template then writes
+# the fresh note none (no stale pc_fresh) and refuses listed clients.
+expect_eq "realm export: invite amr inv (10 h)" \
+  "$(jq -c '.authenticatorConfig as $c | [.authenticationFlows[] | select(.alias == "portcullis-invite-session") | .authenticationExecutions[] | select(.authenticator == "allow-access-authenticator") | .authenticatorConfig as $a | $c[] | select(.alias == $a) | .config]' "$EXP")" \
+  '[{"default.reference.value":"inv","default.reference.maxAge":"36000"}]'
 expect_eq "realm export: invite client check = client scope condition (not negated) + allow" \
   "$(jq -c '.authenticatorConfig as $c | [.authenticationFlows[] | select(.alias == "portcullis-invite-client") | .authenticationExecutions[] | [.requirement, .authenticator, (.authenticatorConfig as $a | $c[] | select(.alias == $a) | .config)]]' "$EXP")" \
   "[[\"REQUIRED\",\"conditional-client-scope\",{\"client_scope\":\"$KC_INVITE_CLIENT_SCOPE\",\"negate\":\"false\"}],[\"REQUIRED\",\"allow-access-authenticator\"]]"

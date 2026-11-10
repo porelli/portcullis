@@ -400,10 +400,15 @@ services:
     restart: unless-stopped
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332
+    # Portcullis's Keycloak image (porelli/portcullis-keycloak): the official
+    # Keycloak pinned tag@sha256 plus the sign-in extension (contract §8.1).
+    # edge = its main; a core release pins a released tag by digest
+    # (release.yml), like HUB_IMAGE.
+    image: ${KEYCLOAK_IMAGE:-ghcr.io/porelli/portcullis-keycloak:edge}
     <<: *hardening
     # Not read_only: `start` re-augments the server into /opt/keycloak/lib
-    # when build options (the x509 lookup provider) differ from the image's.
+    # when build options (the x509 lookup provider, the extension's
+    # providers) differ from the image's.
     tmpfs:
       - /tmp
     command:
@@ -446,6 +451,9 @@ services:
       # label prompt; keycloak/themes/portcullis).
       - ./keycloak/themes/portcullis:/opt/keycloak/themes/portcullis:ro
       - ./certs/truststore:/opt/keycloak/conf/truststores/portcullis:ro
+      # The Hub's signin-keycloak.json (contract §8.1): the extension reads
+      # /hub-data/signin-keycloak.json; missing or invalid = nobody signs in.
+      - hub_data:/hub-data:ro
     networks:
       portcullis: {}
       portcullis-auth: {}

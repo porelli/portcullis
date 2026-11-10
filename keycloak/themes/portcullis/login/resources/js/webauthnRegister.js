@@ -1,6 +1,8 @@
 // Copy of Keycloak 26.8.1 themes/.../base/login/resources/js/webauthnRegister.js
-// (Apache-2.0); the only change is the label in returnSuccess. Keep in sync
-// when the Keycloak image is upgraded.
+// (Apache-2.0). Portcullis changes: attestation is always `direct` and the
+// WebAuthn `hints` come from the extension's portcullisHints (both below),
+// and the label in returnSuccess. Keep in sync when the Keycloak version of
+// ghcr.io/porelli/portcullis-keycloak is upgraded.
 import { base64url } from "rfc4648";
 
 export async function registerByWebAuthn(input) {
@@ -22,8 +24,17 @@ export async function registerByWebAuthn(input) {
         pubKeyCredParams: getPubKeyCredParams(input.signatureAlgorithms),
     };
 
-    if (input.attestationConveyancePreference !== 'not specified') {
-        publicKey.attestation = input.attestationConveyancePreference;
+    // Portcullis: always `direct`. The sign-in extension classifies the new
+    // passkey from its attestation (contract §8.1); `none` still registers,
+    // as a synced passkey.
+    publicKey.attestation = "direct";
+
+    // Portcullis: WebAuthn hints, in the order the extension's registration
+    // action chose (portcullisHints, a JSON array: the security key first
+    // for lldap_admin members). Only the three known values are passed on.
+    const hints = getHints(input.portcullisHints);
+    if (hints.length > 0) {
+        publicKey.hints = hints;
     }
 
     const authenticatorSelection = {};
@@ -80,6 +91,20 @@ export async function registerByWebAuthn(input) {
 
 function doRegister(publicKey) {
     return navigator.credentials.create({publicKey});
+}
+
+function getHints(portcullisHints) {
+    let parsed;
+    try {
+        parsed = JSON.parse(portcullisHints || "[]");
+    } catch (e) {
+        return [];
+    }
+    if (!Array.isArray(parsed)) {
+        return [];
+    }
+    const known = ["security-key", "client-device", "hybrid"];
+    return parsed.filter((h, i) => known.includes(h) && parsed.indexOf(h) === i);
 }
 
 function getPubKeyCredParams(signatureAlgorithmsList) {

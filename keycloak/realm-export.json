@@ -11,8 +11,10 @@
   "resetPasswordAllowed": false,
   "editUsernameAllowed": false,
   "bruteForceProtected": true,
+  "permanentLockout": false,
+  "failureFactor": 10,
+  "waitIncrementSeconds": 60,
   "maxFailureWaitSeconds": 900,
-  "failureFactor": 5,
   "ssoSessionIdleTimeout": 28800,
   "ssoSessionMaxLifespan": 43200,
   "offlineSessionIdleTimeout": 2592000,
@@ -34,21 +36,42 @@
   "webAuthnPolicyPasswordlessRpEntityName": "Portcullis",
   "webAuthnPolicyPasswordlessSignatureAlgorithms": ["ES256"],
   "webAuthnPolicyPasswordlessRpId": "",
-  "webAuthnPolicyPasswordlessAttestationConveyancePreference": "none",
-  "webAuthnPolicyPasswordlessAuthenticatorAttachment": "cross-platform",
+  "webAuthnPolicyPasswordlessAttestationConveyancePreference": "direct",
+  "webAuthnPolicyPasswordlessAuthenticatorAttachment": "not specified",
   "webAuthnPolicyPasswordlessRequireResidentKey": "Yes",
   "webAuthnPolicyPasswordlessUserVerificationRequirement": "required",
   "webAuthnPolicyPasswordlessCreateTimeout": 60,
   "webAuthnPolicyPasswordlessAvoidSameAuthenticatorRegister": true,
   "attributes": {
-    "acr.loa.map": "{\"public\":\"0\",\"pwd\":\"1\",\"hwk\":\"2\",\"mtls\":\"3\"}"
+    "acr.loa.map": "{}"
   },
   "authenticationFlows": [
     {
       "alias": "portcullis-universal",
-      "description": "Passkey-first, LoA-aware browser flow: SSO cookie, the invite identity provider (only with kc_idp_hint), or the step-up subflow (hwk=passkey or cert, mtls=cert). No password.",
+      "description": "Sign-in methods (contract §8.1): the SSO cookie, the invite identity provider (only with kc_idp_hint) or a sign-in method, then the app's sign-in template",
       "providerId": "basic-flow",
       "topLevel": true,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticatorFlow": true,
+          "requirement": "REQUIRED",
+          "priority": 10,
+          "flowAlias": "portcullis-authenticate"
+        },
+        {
+          "authenticator": "portcullis-template",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 20
+        }
+      ]
+    },
+    {
+      "alias": "portcullis-authenticate",
+      "description": "SSO cookie (unless pc_method asks for a method the session lacks), the invite identity provider, or a sign-in method",
+      "providerId": "basic-flow",
+      "topLevel": false,
       "builtIn": false,
       "authenticationExecutions": [
         {
@@ -67,124 +90,138 @@
           "authenticatorFlow": true,
           "requirement": "ALTERNATIVE",
           "priority": 30,
-          "flowAlias": "portcullis-step-up"
+          "flowAlias": "portcullis-signin"
         }
       ]
     },
     {
-      "alias": "portcullis-step-up",
-      "description": "Runs the LoA subflows up to the acr_values requested by the client",
+      "alias": "portcullis-signin",
+      "description": "YubiKey certificate (automatic when the browser presents one), a passkey, or a password; each only while its method is on",
       "providerId": "basic-flow",
       "topLevel": false,
       "builtIn": false,
       "authenticationExecutions": [
         {
-          "authenticatorFlow": true,
-          "requirement": "CONDITIONAL",
+          "authenticator": "portcullis-x509",
+          "authenticatorFlow": false,
+          "requirement": "ALTERNATIVE",
           "priority": 10,
-          "flowAlias": "portcullis-loa-1"
+          "authenticatorConfig": "x509-config"
+        },
+        {
+          "authenticatorFlow": true,
+          "requirement": "ALTERNATIVE",
+          "priority": 20,
+          "flowAlias": "portcullis-signin-passkey"
+        },
+        {
+          "authenticator": "portcullis-password-form",
+          "authenticatorFlow": false,
+          "requirement": "ALTERNATIVE",
+          "priority": 30,
+          "authenticatorConfig": "password-config"
+        }
+      ]
+    },
+    {
+      "alias": "portcullis-signin-passkey",
+      "description": "A passkey of a kind that is on; its kind decides the amr (hwk, dpk, spk)",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "portcullis-passkey",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 10
         },
         {
           "authenticatorFlow": true,
           "requirement": "CONDITIONAL",
           "priority": 20,
-          "flowAlias": "portcullis-loa-2"
+          "flowAlias": "portcullis-passkey-security-key"
         },
         {
           "authenticatorFlow": true,
           "requirement": "CONDITIONAL",
           "priority": 30,
-          "flowAlias": "portcullis-loa-3"
-        }
-      ]
-    },
-    {
-      "alias": "portcullis-loa-1",
-      "description": "LoA 1: sign in with a hardware factor (client cert or passkey)",
-      "providerId": "basic-flow",
-      "topLevel": false,
-      "builtIn": false,
-      "authenticationExecutions": [
-        {
-          "authenticator": "conditional-level-of-authentication",
-          "authenticatorFlow": false,
-          "requirement": "REQUIRED",
-          "priority": 10,
-          "authenticatorConfig": "loa-1-config"
+          "flowAlias": "portcullis-passkey-device"
         },
         {
           "authenticatorFlow": true,
-          "requirement": "REQUIRED",
-          "priority": 20,
-          "flowAlias": "portcullis-loa-1-factors"
+          "requirement": "CONDITIONAL",
+          "priority": 40,
+          "flowAlias": "portcullis-passkey-synced"
         }
       ]
     },
     {
-      "alias": "portcullis-loa-1-factors",
-      "description": "Client cert (automatic when the browser presents one) or passkey",
+      "alias": "portcullis-passkey-security-key",
+      "description": "The passkey that signed in is a security key: the session gets its amr while the method is on",
       "providerId": "basic-flow",
       "topLevel": false,
       "builtIn": false,
       "authenticationExecutions": [
         {
-          "authenticator": "auth-x509-client-username-form",
+          "authenticator": "portcullis-condition-passkey-kind",
           "authenticatorFlow": false,
-          "requirement": "ALTERNATIVE",
+          "requirement": "REQUIRED",
           "priority": 10,
-          "authenticatorConfig": "x509-config"
+          "authenticatorConfig": "passkey-kind-security-key"
         },
         {
-          "authenticator": "webauthn-authenticator-passwordless",
+          "authenticator": "portcullis-method",
           "authenticatorFlow": false,
-          "requirement": "ALTERNATIVE",
+          "requirement": "REQUIRED",
           "priority": 20,
-          "authenticatorConfig": "amr-hwk-loa1"
+          "authenticatorConfig": "method-security-key"
         }
       ]
     },
     {
-      "alias": "portcullis-loa-2",
-      "description": "LoA 2 (hwk): every LoA 1 factor is already hardware-backed, so reaching LoA 1 in this session is enough; no second touch",
+      "alias": "portcullis-passkey-device",
+      "description": "The passkey that signed in is a device-bound passkey: the session gets its amr while the method is on",
       "providerId": "basic-flow",
       "topLevel": false,
       "builtIn": false,
       "authenticationExecutions": [
         {
-          "authenticator": "conditional-level-of-authentication",
+          "authenticator": "portcullis-condition-passkey-kind",
           "authenticatorFlow": false,
           "requirement": "REQUIRED",
           "priority": 10,
-          "authenticatorConfig": "loa-2-config"
+          "authenticatorConfig": "passkey-kind-device"
         },
         {
-          "authenticator": "allow-access-authenticator",
+          "authenticator": "portcullis-method",
           "authenticatorFlow": false,
           "requirement": "REQUIRED",
-          "priority": 20
+          "priority": 20,
+          "authenticatorConfig": "method-device"
         }
       ]
     },
     {
-      "alias": "portcullis-loa-3",
-      "description": "LoA 3: mTLS client certificate required",
+      "alias": "portcullis-passkey-synced",
+      "description": "The passkey that signed in is a synced passkey: the session gets its amr while the method is on",
       "providerId": "basic-flow",
       "topLevel": false,
       "builtIn": false,
       "authenticationExecutions": [
         {
-          "authenticator": "conditional-level-of-authentication",
+          "authenticator": "portcullis-condition-passkey-kind",
           "authenticatorFlow": false,
           "requirement": "REQUIRED",
           "priority": 10,
-          "authenticatorConfig": "loa-3-config"
+          "authenticatorConfig": "passkey-kind-synced"
         },
         {
-          "authenticator": "auth-x509-client-username-form",
+          "authenticator": "portcullis-method",
           "authenticatorFlow": false,
           "requirement": "REQUIRED",
           "priority": 20,
-          "authenticatorConfig": "x509-config"
+          "authenticatorConfig": "method-synced"
         }
       ]
     },
@@ -211,7 +248,7 @@
     },
     {
       "alias": "portcullis-invite-session",
-      "description": "After an invite login: only clients with the portcullis-invite-client scope (portcullis-forward-auth), any other is denied; then LoA 1 and 2 + amr=hwk",
+      "description": "After an invite login: only clients with the portcullis-invite-client scope (portcullis-forward-auth), any other is denied; then amr inv and the template check",
       "providerId": "basic-flow",
       "topLevel": true,
       "builtIn": false,
@@ -229,16 +266,17 @@
           "flowAlias": "portcullis-invite-deny"
         },
         {
-          "authenticatorFlow": true,
-          "requirement": "CONDITIONAL",
+          "authenticator": "allow-access-authenticator",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
           "priority": 30,
-          "flowAlias": "portcullis-invite-loa-1"
+          "authenticatorConfig": "amr-inv-invite"
         },
         {
-          "authenticatorFlow": true,
-          "requirement": "CONDITIONAL",
-          "priority": 40,
-          "flowAlias": "portcullis-invite-loa"
+          "authenticator": "portcullis-template",
+          "authenticatorFlow": false,
+          "requirement": "REQUIRED",
+          "priority": 40
         }
       ]
     },
@@ -288,52 +326,6 @@
       ]
     },
     {
-      "alias": "portcullis-invite-loa-1",
-      "description": "Invite login counts as LoA 1 too (a later mtls step-up then asks only for the certificate)",
-      "providerId": "basic-flow",
-      "topLevel": false,
-      "builtIn": false,
-      "authenticationExecutions": [
-        {
-          "authenticator": "conditional-level-of-authentication",
-          "authenticatorFlow": false,
-          "requirement": "REQUIRED",
-          "priority": 10,
-          "authenticatorConfig": "invite-loa-1-config"
-        },
-        {
-          "authenticator": "allow-access-authenticator",
-          "authenticatorFlow": false,
-          "requirement": "REQUIRED",
-          "priority": 20,
-          "authenticatorConfig": "amr-hwk-invite-loa1"
-        }
-      ]
-    },
-    {
-      "alias": "portcullis-invite-loa",
-      "description": "Invite login counts as LoA 2",
-      "providerId": "basic-flow",
-      "topLevel": false,
-      "builtIn": false,
-      "authenticationExecutions": [
-        {
-          "authenticator": "conditional-level-of-authentication",
-          "authenticatorFlow": false,
-          "requirement": "REQUIRED",
-          "priority": 10,
-          "authenticatorConfig": "invite-loa-2-config"
-        },
-        {
-          "authenticator": "allow-access-authenticator",
-          "authenticatorFlow": false,
-          "requirement": "REQUIRED",
-          "priority": 20,
-          "authenticatorConfig": "amr-hwk-invite"
-        }
-      ]
-    },
-    {
       "alias": "portcullis-registration-flow",
       "description": "Registration flow (registration is disabled)",
       "providerId": "basic-flow",
@@ -375,20 +367,32 @@
       }
     },
     {
-      "alias": "loa-1-config",
-      "config": { "loa-condition-level": "1", "loa-max-age": "36000" }
+      "alias": "password-config",
+      "config": { "default.reference.value": "pwd", "default.reference.maxAge": "36000" }
     },
     {
-      "alias": "loa-2-config",
-      "config": { "loa-condition-level": "2", "loa-max-age": "36000" }
+      "alias": "passkey-kind-security-key",
+      "config": { "kind": "security_key" }
     },
     {
-      "alias": "loa-3-config",
-      "config": { "loa-condition-level": "3", "loa-max-age": "36000" }
+      "alias": "method-security-key",
+      "config": { "method": "security_key", "default.reference.value": "hwk", "default.reference.maxAge": "36000" }
     },
     {
-      "alias": "amr-hwk-loa1",
-      "config": { "default.reference.value": "hwk", "default.reference.maxAge": "36000" }
+      "alias": "passkey-kind-device",
+      "config": { "kind": "passkey_device" }
+    },
+    {
+      "alias": "method-device",
+      "config": { "method": "passkey_device", "default.reference.value": "dpk", "default.reference.maxAge": "36000" }
+    },
+    {
+      "alias": "passkey-kind-synced",
+      "config": { "kind": "passkey_synced" }
+    },
+    {
+      "alias": "method-synced",
+      "config": { "method": "passkey_synced", "default.reference.value": "spk", "default.reference.maxAge": "36000" }
     },
     {
       "alias": "invite-client-scope",
@@ -411,20 +415,8 @@
       }
     },
     {
-      "alias": "invite-loa-1-config",
-      "config": { "loa-condition-level": "1", "loa-max-age": "36000" }
-    },
-    {
-      "alias": "amr-hwk-invite-loa1",
-      "config": { "default.reference.value": "hwk", "default.reference.maxAge": "36000" }
-    },
-    {
-      "alias": "invite-loa-2-config",
-      "config": { "loa-condition-level": "2", "loa-max-age": "36000" }
-    },
-    {
-      "alias": "amr-hwk-invite",
-      "config": { "default.reference.value": "hwk", "default.reference.maxAge": "36000" }
+      "alias": "amr-inv-invite",
+      "config": { "default.reference.value": "inv", "default.reference.maxAge": "36000" }
     }
   ],
   "browserFlow": "portcullis-universal",
@@ -433,7 +425,7 @@
       "alias": "webauthn-register",
       "name": "WebAuthn Register",
       "providerId": "webauthn-register",
-      "enabled": true,
+      "enabled": false,
       "defaultAction": false,
       "priority": 70
     },
@@ -609,7 +601,6 @@
         "+"
       ],
       "attributes": {
-        "default.acr.values": "pwd",
         "pkce.code.challenge.method": "S256"
       }
     }

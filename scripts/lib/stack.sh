@@ -213,8 +213,8 @@ init_run() {
                   (\$KEYCLOAK_ADMIN / KEYCLOAK_ADMIN_PASSWORD), LLDAP: ./portcullis lldap-ui
                   (admin / LLDAP_ADMIN_PASSWORD) — both in .env
 
-  Sign-in is passkey-only. Open the link below, register your security key
-  (YubiKey) and you land in the Hub as the LLDAP admin. New link any time:
+  admin never signs in with a password. Open the link below, register your
+  security key (YubiKey) and you land in the Hub as the LLDAP admin. New link any time:
   ./portcullis invite admin --to hub
 EOF
   local link

@@ -6,6 +6,9 @@
 # Not covered (update by hand, CI's pin check keeps them tag@sha256): the
 # image constants in scripts/lib/*.sh (PORTCULLIS_HELPER_IMAGE,
 # BACKUP_RESTIC_IMAGE) and the images used inline in .github/workflows/ci.yml.
+# Not tracked either: our own HUB_IMAGE / KEYCLOAK_IMAGE defaults (`edge`,
+# moved by their repos' main; a release pins them by hand, release.yml). The
+# Keycloak version itself is bumped in porelli/portcullis-keycloak.
 version: 2
 updates:
   # docker-compose.yml (all profiles), docker-compose.apps.yml, docker-compose.test.yml:

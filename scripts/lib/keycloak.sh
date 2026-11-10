@@ -27,6 +27,16 @@ KC_REALM="portcullis"
 # shellcheck disable=SC2034  # read by the tests
 KC_REALM_TOKEN_SETTINGS='{"offlineSessionIdleTimeout": 2592000, "offlineSessionMaxLifespanEnabled": true, "offlineSessionMaxLifespan": 7776000, "revokeRefreshToken": false, "refreshTokenMaxReuse": 0}'
 
+# Sign-in methods (contract §8.1, plan D6): no Level-of-Authentication map
+# (the flows have no LoA conditions; the extension's providers decide), and
+# brute-force protection for the password form (a lockout grows by 60 s per
+# failure after 10, up to 15 min; never permanent). The passwordless WebAuthn
+# policy asks for direct attestation (the extension classifies the passkey),
+# allows any attachment, and requires a resident key and user verification.
+# Same values as realm-export.json; pushed on every run.
+# shellcheck disable=SC2034  # read by the tests
+KC_REALM_SIGNIN_SETTINGS='{"attributes": {"acr.loa.map": "{}"}, "bruteForceProtected": true, "permanentLockout": false, "failureFactor": 10, "waitIncrementSeconds": 60, "maxFailureWaitSeconds": 900, "webAuthnPolicyPasswordlessAttestationConveyancePreference": "direct", "webAuthnPolicyPasswordlessAuthenticatorAttachment": "not specified", "webAuthnPolicyPasswordlessRequireResidentKey": "Yes", "webAuthnPolicyPasswordlessUserVerificationRequirement": "required"}'
+
 kc_url() { echo "${KEYCLOAK_URL:-http://127.0.0.1:8080}"; }
 
 # kc_login — sets KC_TOKEN (admin-cli password grant on the master realm).
@@ -128,7 +138,9 @@ _kc_group_mapper_patch() {
 }
 
 # _kc_fwd_patch <domain>: the portcullis-forward-auth client (JSON on stdin)
-# as `keycloak configure` wants it: default acr, PKCE S256 required (both
+# as `keycloak configure` wants it: no default acr (sign-in methods: the
+# step-up asks with pc_method, contract §8.1; "" removes the attribute),
+# PKCE S256 required (both
 # oauth2-proxy services send it, oauth2-proxy/alpha.yaml: an authorization
 # code sent to a stale or foreign callback is useless without the
 # verifier), the acr scope, and the redirect URIs =
@@ -140,7 +152,7 @@ _kc_group_mapper_patch() {
 # placeholder host is dropped.
 _kc_fwd_patch() {
   jq --arg d "$1" '
-    .attributes = ((.attributes // {}) + {"default.acr.values": "pwd", "pkce.code.challenge.method": "S256"}) |
+    .attributes = ((.attributes // {}) + {"default.acr.values": "", "pkce.code.challenge.method": "S256"}) |
     .defaultClientScopes = ((.defaultClientScopes // []) + ["acr"] | unique) |
     .redirectUris = (["https://auth." + $d + "/oauth2/callback"]
       + [(.redirectUris // [])[] | strings
@@ -263,15 +275,15 @@ keycloak_configure() {
     warn "    no LDAP federation component found in realm $KC_REALM"
   fi
 
-  info "Setting ACR→LoA map, offline-session bounds, refresh-token reuse and the browser flow..."
+  info "Setting the sign-in settings (no LoA map, brute force, passkey policy), offline-session bounds, refresh-token reuse and the browser flow..."
   # Only switch browserFlow if it is unset or the realm's built-in value;
   # an operator's custom flow is preserved.
   # sslRequired=external: browsers only reach Keycloak through Traefik
   # (HTTPS; proxy headers trusted from Traefik only), and "all" would also
   # refuse the invite identity provider's back-channel URLs on the private
   # network (http://enroll:8445, Keycloak's URL check resolves the host).
-  code="$(kc_get "/$KC_REALM" | jq --argjson tok "$KC_REALM_TOKEN_SETTINGS" '
-      {sslRequired: "external", attributes: {"acr.loa.map": "{\"public\":\"0\",\"pwd\":\"1\",\"hwk\":\"2\",\"mtls\":\"3\"}"}} + $tok +
+  code="$(kc_get "/$KC_REALM" | jq --argjson tok "$KC_REALM_TOKEN_SETTINGS" --argjson signin "$KC_REALM_SIGNIN_SETTINGS" '
+      {sslRequired: "external"} + $signin + $tok +
       (if ((.browserFlow // "") == "" or .browserFlow == "portcullis-browser-flow")
        then {browserFlow: "portcullis-universal"} else {} end) +
       # Login theme: unique passkey labels, so a second key (recovery) can be
@@ -283,29 +295,39 @@ keycloak_configure() {
   for flow in $KC_EXPORT_FLOWS; do _kc_sync_flow "$flow" || true; done
   _kc_invite_idp
   _kc_enroll_client
-  local ra
-  ra="$(kc_get "/$KC_REALM/authentication/required-actions/webauthn-register-passwordless")"
-  if printf '%s' "$ra" | jq -e '.enabled != true or .defaultAction != false' >/dev/null 2>&1; then
-    code="$(printf '%s' "$ra" | jq -c '.enabled = true | .defaultAction = false' \
-      | kc_send PUT "/$KC_REALM/authentication/required-actions/webauthn-register-passwordless")"
-    _kc_report "webauthn-register-passwordless required action enabled" "$code" 204 || true
-  fi
+  # The extension's registration action (contract §8.1) overrides both
+  # stock ids; Portcullis registers passkeys only through the passwordless
+  # one, so the two-factor webauthn-register stays disabled.
+  local ra want
+  for ra in webauthn-register-passwordless:true webauthn-register:false; do
+    want="${ra#*:}" ra="${ra%%:*}"
+    code="$(kc_get "/$KC_REALM/authentication/required-actions/$ra")"
+    if printf '%s' "$code" | jq -e --argjson w "$want" '.enabled != $w or .defaultAction != false' >/dev/null 2>&1; then
+      code="$(printf '%s' "$code" | jq -c --argjson w "$want" '.enabled = $w | .defaultAction = false' \
+        | kc_send PUT "/$KC_REALM/authentication/required-actions/$ra")"
+      if [ "$want" = true ]; then _kc_report "$ra required action enabled" "$code" 204 || true
+      else _kc_report "$ra (two-factor) required action disabled" "$code" 204 || true; fi
+    fi
+  done
 
-  info "Checking factor executors carry AMR reference values..."
-  # Each authenticator in portcullis-loa-1-factors / portcullis-loa-3 /
-  # portcullis-invite-loa(-1) needs an authenticatorConfig with
-  # default.reference.value, or the amr claim is empty and AND-mode policies
-  # cannot tell factors apart.
-  for flow in portcullis-loa-1-factors portcullis-loa-3 portcullis-invite-loa-1 portcullis-invite-loa; do
+  info "Checking the sign-in executions carry AMR reference values..."
+  # Every portcullis-x509, portcullis-password-form and portcullis-method
+  # execution of the browser flow, and the invite flow's own allow-access
+  # step (amr inv), needs an authenticatorConfig with default.reference.value
+  # and default.reference.maxAge (36000): without it the amr claim lacks the
+  # method and no reader can count it (contract §8.1).
+  for flow in portcullis-universal portcullis-invite-session; do
     execs="$(kc_get "/$KC_REALM/authentication/flows/$flow/executions")"
     printf '%s' "$execs" | jq -e 'type == "array"' >/dev/null 2>&1 || continue
     while read -r provider cfg; do
       if [ "$cfg" = none ]; then
-        warn "    $flow/$provider has no authenticator config → empty amr for this factor"
-      elif [ -z "$(kc_get "/$KC_REALM/authentication/config/$cfg" | jq -r '.config["default.reference.value"] // empty')" ]; then
-        warn "    $flow/$provider config has no default.reference.value → empty amr for this factor"
+        warn "    $flow/$provider has no authenticator config → empty amr for this method"
+      elif ! kc_get "/$KC_REALM/authentication/config/$cfg" \
+          | jq -e '(.config["default.reference.value"] // "") != "" and .config["default.reference.maxAge"] == "36000"' >/dev/null 2>&1; then
+        warn "    $flow/$provider config has no default.reference.value / maxAge 36000 → empty or short-lived amr for this method"
       fi
-    done < <(printf '%s' "$execs" | jq -r '.[] | select(.providerId and (.providerId | startswith("conditional-") | not)) | .providerId + " " + (.authenticationConfig // "none")')
+    done < <(printf '%s' "$execs" | jq -r '.[] | select((.providerId // "" | IN("portcullis-x509", "portcullis-password-form", "portcullis-method"))
+        or (.providerId == "allow-access-authenticator" and .level == 0)) | .providerId + " " + (.authenticationConfig // "none")')
   done
 
   info "Applying the X.509 authenticator config (CRL check, trust re-validation)..."
@@ -313,10 +335,8 @@ keycloak_configure() {
   # authenticator settings onto every existing x509 execution's config.
   local x509_cfg cfg_ids cid
   x509_cfg="$(jq -c '.authenticatorConfig[] | select(.alias == "x509-config") | .config' "$PORTCULLIS_ROOT/keycloak/realm-export.json")"
-  cfg_ids="$(for flow in portcullis-loa-1-factors portcullis-loa-3; do
-      kc_get "/$KC_REALM/authentication/flows/$flow/executions" \
-        | jq -r '.[]? | select(.providerId == "auth-x509-client-username-form") | .authenticationConfig // empty' 2>/dev/null
-    done | sort -u)"
+  cfg_ids="$(kc_get "/$KC_REALM/authentication/flows/portcullis-universal/executions" \
+      | jq -r '.[]? | select(.providerId == "portcullis-x509") | .authenticationConfig // empty' 2>/dev/null | sort -u)"
   for cid in $cfg_ids; do
     code="$(kc_get "/$KC_REALM/authentication/config/$cid" | jq --argjson c "$x509_cfg" '.config = ((.config // {}) + $c)' \
       | kc_send PUT "/$KC_REALM/authentication/config/$cid")"
@@ -355,7 +375,7 @@ keycloak_configure() {
   info "Granting lldap_admin the $KC_REALM realm console..."
   _kc_admin_roles
 
-  info "Configuring the forward-auth client (acr, PKCE S256, groups, redirect URIs)..."
+  info "Configuring the forward-auth client (no default acr, PKCE S256, groups, redirect URIs)..."
   fwd_uuid="$(kc_get "/$KC_REALM/clients?clientId=portcullis-forward-auth" | jq -r '.[0].id // empty')"
   if [ -n "$fwd_uuid" ]; then
     # The realm export ships a placeholder host so Keycloak's URL parser
@@ -721,7 +741,7 @@ help_keycloak() {
   cat <<'EOF'
 Usage: portcullis keycloak configure [--wipe-realm]
 
-  configure   Import/patch the portcullis realm (LDAP, LoA, scopes, branding)
+  configure   Import/patch the portcullis realm (LDAP, sign-in flows, scopes, branding)
 EOF
 }
 
@@ -735,22 +755,29 @@ API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
   - points the LDAP federation at LLDAP (LLDAP_BASE_DN, LLDAP_ADMIN_PASSWORD);
     users and groups deleted in LLDAP are removed from Keycloak (hourly sync,
     removeInvalidUsersEnabled, group mapper drops missing groups)
-  - sets the ACR→LoA map, sslRequired=external and browserFlow=portcullis-universal
+  - sets sslRequired=external, browserFlow=portcullis-universal, no ACR→LoA
+    map, brute-force protection (10 failures, then 60 s more per failure up
+    to 15 min, never permanent) and the passkey policy (direct attestation,
+    any attachment, resident key + user verification required)
   - offline sessions at most 30 days idle / 90 days total (the Hub sets
     shorter values on its AI clients); refresh-token rotation off (realm-wide
     rotation would break concurrent forward-auth refreshes)
-  - rebuilds every top-level flow of the file whose tree changed (passkey-only
-    browser flow, the invite identity provider's first-login / post-login flows)
+  - rebuilds every top-level flow of the file whose tree changed (the browser
+    flow with the sign-in extension's methods and template check, the invite
+    identity provider's first-login / post-login flows)
+  - keeps webauthn-register-passwordless enabled and the two-factor
+    webauthn-register disabled
   - the invite identity provider portcullis-invite (enroll; URLs + client
     secret from secrets/enroll/invite-client-secret) and the service-account
     client portcullis-enroll (view-users, manage-users)
   - lldap_admin = realm-admin of the portcullis realm (realm console)
   - pushes the X.509 authenticator settings from the file (CRL check against
     Vault's pki_int CRL, trust re-validation, clientAuth EKU) to the realm
-  - checks AMR reference values, ensures the amr mapper and groups scope
+  - checks the sign-in executions' AMR reference values (max age 10 h),
+    ensures the amr mapper and groups scope
   - ensures the email-unverified scope (email claim, no email_verified) that
     Hub templates opt into with keycloak_clients[].email_verified_claim: false
-  - portcullis-forward-auth: acr/groups scopes, requires PKCE S256, the
+  - portcullis-forward-auth: acr/groups scopes, no default acr, requires PKCE S256, the
     auth.<domain> callback (keeps the Hub's extra-domain callbacks), and the
     portcullis-invite-client scope (setup links work only through it)
   - creates a credential-less `testuser`, applies PORTAL_DISPLAY_NAME branding

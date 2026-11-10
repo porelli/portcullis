@@ -144,6 +144,10 @@ expect_eq "version without .env exits 0" "$RC" 0
 case "$OUT" in "portcullis "*"hub image "*"ghcr.io/porelli/portcullis-hub:"*"(default)"*) t_pass "version shows core + hub image" ;; *) t_fail "version output: $OUT" ;; esac
 RC=0; OUT="$(HUB_IMAGE=example/hub:1.2.3 "$CLI" version --json </dev/null)" || RC=$?
 expect_eq "version --json honours HUB_IMAGE" "$RC:$(printf '%s' "$OUT" | jq -r '.hub_image + " " + .hub_image_source')" "0:example/hub:1.2.3 HUB_IMAGE"
+run version
+case "$OUT" in *"keycloak image   ghcr.io/porelli/portcullis-keycloak:edge (default)"*) t_pass "version shows the keycloak image" ;; *) t_fail "version keycloak image: $OUT" ;; esac
+RC=0; OUT="$(KEYCLOAK_IMAGE=example/kc:2 "$CLI" version --json </dev/null)" || RC=$?
+expect_eq "version --json honours KEYCLOAK_IMAGE" "$RC:$(printf '%s' "$OUT" | jq -r '.keycloak_image + " " + .keycloak_image_source')" "0:example/kc:2 KEYCLOAK_IMAGE"
 run backup schedule --systemd
 expect_eq "backup schedule --systemd exits 0" "$RC" 0
 case "$OUT" in *"ExecStart=$(cd "$HERE/.." && pwd)/portcullis backup"*"ExecStopPost=-"*"status --textfile"*"OnCalendar=*-*-* 03:15:00"*"Persistent=true"*) t_pass "systemd units: backup + status, daily timer" ;; *) t_fail "systemd units: $OUT" ;; esac
@@ -251,6 +255,9 @@ case "$p" in
   "$R/client-scopes") cat "$KC_FIX/scopes.json" ;;
   "$R/client-scopes/mcp-id") jq -c '.[4]' "$KC_FIX/scopes.json" ;;
   "$R") echo '{"realm":"portcullis","browserFlow":"portcullis-universal","loginTheme":"portcullis"}' ;;
+  "$R/authentication/flows/portcullis-universal/executions")
+    echo '[{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509-id"},{"providerId":"portcullis-method","level":3},{"providerId":"portcullis-template","level":0}]' ;;
+  "$R/authentication/config/x509-id") echo '{"id":"x509-id","alias":"x509-config","config":{"default.reference.value":"mtls","default.reference.maxAge":"36000"}}' ;;
   *\?*|*/flows|*/executions|*/client-scopes|*/models|*/instances|*-client-scopes|*/roles) echo '[]' ;;
   *) echo '{}' ;;
 esac
@@ -270,6 +277,90 @@ expect_eq "keycloak configure: realm offline bounds + refresh-token settings pus
   "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis") | .b | fromjson
       | select(has("revokeRefreshToken")) | {offlineSessionIdleTimeout, offlineSessionMaxLifespanEnabled, offlineSessionMaxLifespan, revokeRefreshToken, refreshTokenMaxReuse}] | unique' "$WORK/kc/log")" \
   '[{"offlineSessionIdleTimeout":2592000,"offlineSessionMaxLifespanEnabled":true,"offlineSessionMaxLifespan":7776000,"revokeRefreshToken":false,"refreshTokenMaxReuse":0}]'
+expect_eq "keycloak configure: the amr check walks the new browser flow (a portcullis-method without config warned, x509 not)" \
+  "$(grep -c 'portcullis-universal/portcullis-method has no authenticator config' "$WORK/err"):$(grep -c 'portcullis-universal/portcullis-x509' "$WORK/err")" "1:0"
+expect_eq "keycloak configure: x509-config pushed onto the portcullis-x509 execution's config" \
+  "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis/authentication/config/x509-id") | .b | fromjson | .config["x509-cert-auth.confirmation-page-disallowed"]]' "$WORK/kc/log")" '["true"]'
+expect_eq "keycloak configure: realm PUT has brute force (D6) and an empty acr.loa.map" \
+  "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis") | .b | fromjson
+      | select(has("bruteForceProtected")) | {bruteForceProtected, failureFactor, waitIncrementSeconds, maxFailureWaitSeconds, permanentLockout, loa: .attributes["acr.loa.map"]}] | unique' "$WORK/kc/log")" \
+  '[{"bruteForceProtected":true,"failureFactor":10,"waitIncrementSeconds":60,"maxFailureWaitSeconds":900,"permanentLockout":false,"loa":"{}"}]'
+expect_eq "keycloak configure: forward-auth client PUT drops default.acr.values" \
+  "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis/clients/fwd-uuid") | .b | fromjson | .attributes["default.acr.values"] // "none"] | unique' "$WORK/kc/log")" '[""]'
+expect_eq "keycloak configure: stock webauthn-register (two-factor) required action disabled" \
+  "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis/authentication/required-actions/webauthn-register") | .b | fromjson | .enabled] | unique' "$WORK/kc/log")" '[false]'
+
+# ── realm-export.json: the sign-in flows of contract §8.1 (D6) ──
+RX="$HERE/../keycloak/realm-export.json"
+# flow <alias> — "<requirement> <authenticator or flowAlias>" per execution, by priority.
+flow() { jq -c --arg a "$1" '[.authenticationFlows[] | select(.alias == $a) | .authenticationExecutions | sort_by(.priority)[]
+    | .requirement + " " + (.authenticator // .flowAlias)]' "$RX"; }
+# cfg <alias> <execution> — the config of an execution (authenticator or flowAlias) of a flow.
+cfg() { jq -c --arg a "$1" --arg e "$2" '.authenticatorConfig as $c | [.authenticationFlows[] | select(.alias == $a) | .authenticationExecutions[]
+    | select((.authenticator // .flowAlias) == $e) | .authenticatorConfig as $n | $c[] | select(.alias == $n) | .config][0]' "$RX"; }
+expect_eq "realm export: portcullis-universal is REQUIRED portcullis-authenticate + REQUIRED portcullis-template" \
+  "$(flow portcullis-universal)" '["REQUIRED portcullis-authenticate","REQUIRED portcullis-template"]'
+expect_eq "realm export: portcullis-universal is the browser flow" "$(jq -r .browserFlow "$RX")" portcullis-universal
+expect_eq "realm export: portcullis-authenticate = cookie | invite redirector | portcullis-signin" \
+  "$(flow portcullis-authenticate)" '["ALTERNATIVE auth-cookie","ALTERNATIVE identity-provider-redirector","ALTERNATIVE portcullis-signin"]'
+expect_eq "realm export: portcullis-signin = x509 | passkey sub-flow | password form" \
+  "$(flow portcullis-signin)" '["ALTERNATIVE portcullis-x509","ALTERNATIVE portcullis-signin-passkey","ALTERNATIVE portcullis-password-form"]'
+expect_eq "realm export: portcullis-signin-passkey = REQUIRED portcullis-passkey + one CONDITIONAL sub-flow per kind" \
+  "$(flow portcullis-signin-passkey)" '["REQUIRED portcullis-passkey","CONDITIONAL portcullis-passkey-security-key","CONDITIONAL portcullis-passkey-device","CONDITIONAL portcullis-passkey-synced"]'
+for k in security-key:security_key:hwk device:passkey_device:dpk synced:passkey_synced:spk; do
+  IFS=: read -r sub kind amr <<<"$k"
+  expect_eq "realm export: portcullis-passkey-$sub = kind condition + portcullis-method" \
+    "$(flow "portcullis-passkey-$sub")" '["REQUIRED portcullis-condition-passkey-kind","REQUIRED portcullis-method"]'
+  expect_eq "realm export: portcullis-passkey-$sub condition kind $kind" \
+    "$(cfg "portcullis-passkey-$sub" portcullis-condition-passkey-kind)" "{\"kind\":\"$kind\"}"
+  expect_eq "realm export: portcullis-passkey-$sub method $kind, reference $amr" \
+    "$(cfg "portcullis-passkey-$sub" portcullis-method | jq -c '{method, ref: .["default.reference.value"]}')" "{\"method\":\"$kind\",\"ref\":\"$amr\"}"
+done
+expect_eq "realm export: portcullis-x509 reference mtls, confirmation page disallowed" \
+  "$(cfg portcullis-signin portcullis-x509 | jq -c '[.["default.reference.value"], .["x509-cert-auth.confirmation-page-disallowed"], .["x509-cert-auth.crl-checking-enabled"]]')" '["mtls","true","true"]'
+expect_eq "realm export: portcullis-password-form reference pwd" \
+  "$(cfg portcullis-signin portcullis-password-form | jq -r '.["default.reference.value"]')" pwd
+expect_eq "no conditional-level-of-authentication anywhere" \
+  "$(jq '[.. | strings | select(test("level-of-authentication|loa-"))] | length' "$RX")" 0
+expect_eq "realm export: acr.loa.map is {}" "$(jq -r '.attributes["acr.loa.map"]' "$RX")" '{}'
+expect_eq "every reference config has maxAge 36000" \
+  "$(jq -c '[.authenticatorConfig[].config | select(has("default.reference.value")) | .["default.reference.maxAge"]] | unique' "$RX")" '["36000"]'
+expect_eq "realm export: every amr of the browser and invite flows has a reference config" \
+  "$(jq -c '[.authenticatorConfig[].config | .["default.reference.value"] // empty] | sort' "$RX")" '["dpk","hwk","inv","mtls","pwd","spk"]'
+expect_eq "realm export: the invite post-broker flow keeps admit / deny, records inv, ends with portcullis-template" \
+  "$(flow portcullis-invite-session)" '["CONDITIONAL portcullis-invite-client","CONDITIONAL portcullis-invite-deny","REQUIRED allow-access-authenticator","REQUIRED portcullis-template"]'
+expect_eq "invite amr configs say inv" \
+  "$(jq -c '.authenticatorConfig as $c | [.authenticationFlows[] | select(.alias | startswith("portcullis-invite")) | .authenticationExecutions[]
+      | .authenticatorConfig // empty | . as $n | $c[] | select(.alias == $n) | .config | .["default.reference.value"] // empty]' "$RX")" '["inv"]'
+expect_eq "realm export: the invite admit / deny sub-flows are unchanged" \
+  "$(flow portcullis-invite-client) $(flow portcullis-invite-deny)" \
+  '["REQUIRED conditional-client-scope","REQUIRED allow-access-authenticator"] ["REQUIRED conditional-sub-flow-executed","REQUIRED deny-access-authenticator"]'
+expect_eq "bruteForceProtected true" \
+  "$(jq -c '[.bruteForceProtected, .failureFactor, .waitIncrementSeconds, .maxFailureWaitSeconds, .permanentLockout]' "$RX")" '[true,10,60,900,false]'
+expect_eq "realm export: passwordless policy direct, any attachment, resident key + UV required" \
+  "$(jq -c '[.webAuthnPolicyPasswordlessAttestationConveyancePreference, .webAuthnPolicyPasswordlessAuthenticatorAttachment, .webAuthnPolicyPasswordlessRequireResidentKey, .webAuthnPolicyPasswordlessUserVerificationRequirement]' "$RX")" \
+  '["direct","not specified","Yes","required"]'
+expect_eq "realm export: stock webauthn-register (two-factor) disabled, passwordless enabled" \
+  "$(jq -c '[.requiredActions[] | select(.alias | startswith("webauthn-register")) | [.alias, .enabled]] | sort' "$RX")" '[["webauthn-register",false],["webauthn-register-passwordless",true]]'
+expect_eq "realm export: forward-auth client has no default.acr.values" \
+  "$(jq -c '.clients[] | select(.clientId == "portcullis-forward-auth") | .attributes | has("default.acr.values")' "$RX")" false
+expect_eq "realm export: every authenticator config is used by exactly one execution" \
+  "$(jq -c '[.authenticationFlows[].authenticationExecutions[].authenticatorConfig // empty] as $u | [.authenticatorConfig[].alias | . as $a | ($u | map(select(. == $a)) | length)] | unique' "$RX")" '[1]'
+expect_eq "realm export: every sub-flow an execution names exists" \
+  "$(jq -c '[.authenticationFlows[].alias] as $f | [.authenticationFlows[].authenticationExecutions[] | .flowAlias // empty | select(. as $x | $f | index($x) | not)]' "$RX")" '[]'
+
+# ── docker-compose.yml: Keycloak is the portcullis-keycloak image ──
+KC_SVC="$(awk '/^  keycloak:$/ {on = 1; next} on && /^  [a-z]/ {exit} on' "$HERE/../docker-compose.yml")"
+# shellcheck disable=SC2016  # a literal ${KEYCLOAK_IMAGE:-...}
+expect_eq 'compose keycloak image is ${KEYCLOAK_IMAGE:-ghcr.io/porelli/portcullis-keycloak:edge}' \
+  "$(printf '%s\n' "$KC_SVC" | sed -n 's/^    image: //p')" '${KEYCLOAK_IMAGE:-ghcr.io/porelli/portcullis-keycloak:edge}'
+expect_eq "keycloak mounts hub_data read-only at /hub-data" \
+  "$(printf '%s\n' "$KC_SVC" | grep -cxF '      - hub_data:/hub-data:ro')" 1
+# The login theme passes the extension's hints to the registration script.
+expect_eq "theme: webauthn-register.ftl hands portcullisHints to webauthnRegister.js" \
+  "$(grep -cF 'portcullisHints : ${(portcullisHints!"[]")?c}' "$HERE/../keycloak/themes/portcullis/login/webauthn-register.ftl" 2>/dev/null || echo 0)" 1
+expect_eq "theme: webauthnRegister.js asks for direct attestation and sets hints" \
+  "$(grep -cE 'attestation = "direct"|publicKey\.hints = ' "$HERE/../keycloak/themes/portcullis/login/resources/js/webauthnRegister.js")" 2
 
 # ── Hub startup race fix: init starts hub after lldap_service_account,
 # up/upgrade restart hub only when the account changed ──

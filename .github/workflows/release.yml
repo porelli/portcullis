@@ -2,9 +2,11 @@ name: Release
 
 # Publishes a GitHub release for a vX.Y.Z tag (integration contract §1):
 #   1. the tag is semver and CHANGELOG.md has a "## [X.Y.Z]" section,
-#   2. the HUB_IMAGE default in docker-compose.yml is a RELEASED Hub tag
-#      pinned by digest (ghcr.io/porelli/portcullis-hub:A.B.C@sha256:...),
-#      and that tag still resolves to that digest,
+#   2. the HUB_IMAGE and KEYCLOAK_IMAGE defaults in docker-compose.yml are
+#      RELEASED tags pinned by digest
+#      (ghcr.io/porelli/portcullis-hub:A.B.C@sha256:...,
+#      ghcr.io/porelli/portcullis-keycloak:D.E.F@sha256:...), and each tag
+#      still resolves to that digest,
 #   3. the full CI (ci.yml) passes on the tagged commit,
 #   4. release notes (the CHANGELOG section + GitHub's generated notes) and
 #      portcullis-X.Y.Z.tar.gz (the checkout without .git, plus VERSION)
@@ -55,6 +57,23 @@ jobs:
           [ "$GOT" = "$HD" ] || { echo "::error::ghcr.io/porelli/portcullis-hub:$HV is $GOT, docker-compose.yml pins $HD"; exit 1; }
           echo "PASS: Hub $HV pinned at $HD"
 
+      - name: KEYCLOAK_IMAGE default is a released portcullis-keycloak tag pinned by digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # shellcheck disable=SC2016  # a literal ${KEYCLOAK_IMAGE:-...} in docker-compose.yml
+          KC="$(sed -n 's/.*\${KEYCLOAK_IMAGE:-\([^}]*\)}.*/\1/p' docker-compose.yml | head -n1)"
+          echo "KEYCLOAK_IMAGE default: $KC"
+          [[ "$KC" =~ ^ghcr\.io/porelli/portcullis-keycloak:([0-9]+\.[0-9]+\.[0-9]+)@(sha256:[0-9a-f]{64})$ ]] \
+            || { echo "::error::KEYCLOAK_IMAGE default must be ghcr.io/porelli/portcullis-keycloak:X.Y.Z@sha256:<digest> (got $KC)"; exit 1; }
+          KV="${BASH_REMATCH[1]}" KD="${BASH_REMATCH[2]}"
+          gh release view "v$KV" -R porelli/portcullis-keycloak --json tagName,isDraft,isPrerelease \
+            | jq -e '.isDraft == false and .isPrerelease == false' >/dev/null \
+            || { echo "::error::v$KV is not a published release of porelli/portcullis-keycloak"; exit 1; }
+          GOT="$(docker buildx imagetools inspect "ghcr.io/porelli/portcullis-keycloak:$KV" --format '{{json .Manifest}}' | jq -r .digest)"
+          [ "$GOT" = "$KD" ] || { echo "::error::ghcr.io/porelli/portcullis-keycloak:$KV is $GOT, docker-compose.yml pins $KD"; exit 1; }
+          echo "PASS: Keycloak image $KV pinned at $KD"
+
   ci:
     needs: preflight
     uses: ./.github/workflows/ci.yml
@@ -97,9 +116,13 @@ jobs:
             on { print }' CHANGELOG.md > notes.md
           # shellcheck disable=SC2016  # a literal ${HUB_IMAGE:-...} in docker-compose.yml
           HUB="$(sed -n 's/.*\${HUB_IMAGE:-\([^}]*\)}.*/\1/p' docker-compose.yml | head -n1)"
+          # shellcheck disable=SC2016  # a literal ${KEYCLOAK_IMAGE:-...} in docker-compose.yml
+          KC="$(sed -n 's/.*\${KEYCLOAK_IMAGE:-\([^}]*\)}.*/\1/p' docker-compose.yml | head -n1)"
           {
             echo
             echo "**Hub image:** \`$HUB\`"
+            echo
+            echo "**Keycloak image:** \`$KC\`"
             echo
             echo "Verify the tarball: \`sha256sum -c portcullis-$V.tar.gz.sha256\`"
           } >> notes.md

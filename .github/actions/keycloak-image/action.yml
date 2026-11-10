@@ -1,0 +1,41 @@
+name: Keycloak image
+description: >-
+  Cross-repo feature branches: when porelli/portcullis-keycloak has a branch
+  with this run's branch name (not main), build the Keycloak image (Keycloak +
+  the sign-in extension) from it and use that image
+  (KEYCLOAK_IMAGE=portcullis-keycloak:ci, KEYCLOAK_LOCAL=1 for the later
+  steps), so core and extension changes that must ship together are tested
+  together without publishing an image. Otherwise the compose default (the
+  published edge image) is pulled here and its digest named in the step
+  summary.
+
+runs:
+  using: composite
+  steps:
+    - name: Build Keycloak from the same-named branch (if any), else pull the published image
+      shell: bash
+      env:
+        REF: ${{ github.head_ref || github.ref_name }}
+      run: |
+        url=https://github.com/porelli/portcullis-keycloak
+        if ! [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || [ "$REF" = main ] || [[ "$REF" == v* ]] \
+            || ! git ls-remote --exit-code --heads "$url" "$REF" >/dev/null; then
+          img="$(docker compose config --format json | jq -r .services.keycloak.image)"
+          # Retried: a registry hiccup now and then.
+          for i in 1 2 3; do
+            docker pull --quiet "$img" >/dev/null && break
+            [ "$i" = 3 ] && { echo "::error::the Keycloak image $img cannot be pulled"; exit 1; }
+            sleep 20
+          done
+          echo "Keycloak: the published image $img ($(docker image inspect --format '{{join .RepoDigests ", "}}' "$img"))" | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 0
+        fi
+        git clone --quiet --depth=1 --branch "$REF" "$url" "$RUNNER_TEMP/portcullis-keycloak"
+        echo "Keycloak: built from portcullis-keycloak@$REF ($(git -C "$RUNNER_TEMP/portcullis-keycloak" rev-parse --short HEAD))" | tee -a "$GITHUB_STEP_SUMMARY"
+        # Retried: the Gradle dependency download fails now and then.
+        for i in 1 2 3; do
+          docker buildx build --load --provenance=false -t portcullis-keycloak:ci "$RUNNER_TEMP/portcullis-keycloak" && break
+          [ "$i" = 3 ] && { echo "::error::the Keycloak image did not build"; exit 1; }
+          sleep 20
+        done
+        { echo "KEYCLOAK_IMAGE=portcullis-keycloak:ci"; echo "KEYCLOAK_LOCAL=1"; } >> "$GITHUB_ENV"

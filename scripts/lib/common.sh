@@ -434,7 +434,8 @@ stack_prepare() {
   ct_own "$CT_UID_HUB:$CT_UID_HUB" "$PORTCULLIS_ROOT/templates"
   [ "$(_owner_of "$PORTCULLIS_ROOT/appfiles")" != "$(id -u):$(id -g)" ] || chmod 750 "$PORTCULLIS_ROOT/appfiles"
   ct_own "$CT_UID_HUB:$CT_UID_HUB" "$PORTCULLIS_ROOT/appfiles"
-  # hub_data is also mounted (read-only) by group-gate, which may create it.
+  # hub_data is also mounted (read-only) by group-gate, mcp-gate and Keycloak,
+  # any of which may create it.
   volume_own hub_data "$CT_UID_HUB:$CT_UID_HUB"
   # mcp_gate_data: the gate writes it (access log), the Hub mounts it
   # read-only and reads it through group 10001 (contract §15.8). The gate

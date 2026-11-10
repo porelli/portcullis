@@ -11,8 +11,9 @@ on:
   # release.yml runs exactly these checks before publishing a tag.
   workflow_call:
   # Cross-repo feature branches (e.g. `instances`): run by hand with
-  # `gh workflow run ci.yml --ref <branch>`; the Hub is then built from the
-  # Hub repo's same-named branch (.github/actions/hub-image).
+  # `gh workflow run ci.yml --ref <branch>`; the Hub and the Keycloak image
+  # are then built from the Hub's / portcullis-keycloak's same-named branch
+  # (.github/actions/hub-image, .github/actions/keycloak-image).
   workflow_dispatch:
 
 
@@ -147,6 +148,13 @@ jobs:
               and ([.services.hub.environment | keys[] | select(test("LLDAP") and test("PASS|SECRET|TOKEN|KEY"))] == [])
               and ([.services.hub.volumes[] | select(.target == "/run/portcullis/lldap" or .target == "/run/portcullis/invite") | .read_only] == [true, true])' >/dev/null \
             || { echo "FAIL: hub proxy-secret middleware / image / LLDAP + invite credentials only as read-only files"; exit 1; }
+          # Contract §1 / §8.1: Keycloak is Portcullis's image (KEYCLOAK_IMAGE,
+          # edge on main) and reads the Hub's signin-keycloak.json read-only.
+          echo "$CFG" | jq -e '(.services.keycloak.image | test("^ghcr.io/porelli/portcullis-keycloak:"))
+              and ([.services.keycloak.volumes[] | select(.type == "volume") | "\(.source):\(.target):\(.read_only // false)"] == ["hub_data:/hub-data:true"])
+              and ([.services | to_entries[] | select([.value.volumes[]? | select(.type == "volume" and .source == "hub_data")] | length > 0) | .key] | sort
+                   == ["group-gate", "hub", "keycloak", "mcp-gate"])' >/dev/null \
+            || { echo "FAIL: keycloak image (ghcr.io/porelli/portcullis-keycloak) / hub_data:/hub-data:ro"; exit 1; }
           # Hardening baseline on every core service (all profiles).
           WEAK="$(echo "$CFG_ALL" | jq -r '.services | to_entries[]
               | select((.value.security_opt // [] | index("no-new-privileges:true") | not) or ((.value.cap_drop // []) != ["ALL"])
@@ -353,8 +361,9 @@ jobs:
               | jq -r '.services | to_entries[] | select(.value.build == null) | "\(.key)\t\(.value.image // "")"'
           done | sort -u > /tmp/images
           while IFS=$'\t' read -r svc img; do
-            # The Hub comes from HUB_IMAGE (edge on main; release.yml requires a pinned release).
-            [ "$svc" = hub ] && continue
+            # The Hub and Keycloak come from HUB_IMAGE / KEYCLOAK_IMAGE (edge on
+            # main; release.yml requires a pinned release of each).
+            case "$svc" in hub|keycloak) continue ;; esac
             [[ "$img" =~ ^[^@[:space:]]+:[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || { echo "UNPINNED: $svc → $img"; bad=1; }
           done < /tmp/images
           for df in enroll/Dockerfile group-gate/Dockerfile domains/Dockerfile mcp-gate/Dockerfile; do
@@ -534,10 +543,10 @@ jobs:
       - name: List the images this job runs
         run: |
           # Compose services (minus the locally built enroll and the unpinned
-          # edge Hub, pulled by its own test) + the pinned images used inline
+          # edge Hub and Keycloak, pulled by their own steps) + the pinned images used inline
           # here and by the CLI (helper, restic, whoami, curl, docker cli).
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/*.sh
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
@@ -597,6 +606,8 @@ jobs:
           cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=mcp-gate,mode=max' || '' }}
       - name: Hub image (same-named Hub branch → built here, else the published one)
         uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        uses: ./.github/actions/keycloak-image
 
       - name: Start core services (without Traefik ACME)
         run: docker compose up -d postgres lldap
@@ -1200,11 +1211,18 @@ jobs:
 
       - name: Test Keycloak X.509 login - via Traefik works, a forged cert header does not
         run: |
-          # LoA 3 (acr_values=mtls) = X.509 only; with confirmation disabled a
-          # successful cert login answers 302 → redirect_uri?code=...
+          # The Hub isn't running yet: write a minimal signin-keycloak.json
+          # (contract §8.1, the starting methods) into hub_data, or the sign-in
+          # extension denies everything (DENY_ALL). The Hub's start replaces it.
+          printf '%s' '{"version":1,"methods":["passkey_device","passkey_synced","security_key","yubikey_cert"],"add_stronger":false,"templates":{"standard":{"op":"any","items":[{"op":"any","items":["passkey_synced","passkey_device","security_key"]},{"op":"any","items":["yubikey_cert"]}]}},"clients":{},"authenticators":{},"mds":{"serial":0,"next_update":"0001-01-01T00:00:00Z"}}' \
+            | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
+                sh -c 'cat > /d/signin-keycloak.json && chmod 644 /d/signin-keycloak.json'
+          # pc_method=yubikey_cert = the YubiKey certificate only (the other
+          # methods step aside); with confirmation disabled a successful cert
+          # login answers 302 → redirect_uri?code=...
           # portcullis-forward-auth requires PKCE S256 (like oauth2-proxy sends):
           # S256 of the verifier ci-pkce-verifier-0123456789abcdefghijklmnopqrstuvwxyz.
-          NOPKCE='/realms/portcullis/protocol/openid-connect/auth?client_id=portcullis-forward-auth&response_type=code&scope=openid&acr_values=mtls&prompt=login&state=ci&nonce=ci&redirect_uri=https%3A%2F%2Fauth.portcullis.local%2Foauth2%2Fcallback'
+          NOPKCE='/realms/portcullis/protocol/openid-connect/auth?client_id=portcullis-forward-auth&response_type=code&scope=openid&pc_method=yubikey_cert&prompt=login&state=ci&nonce=ci&redirect_uri=https%3A%2F%2Fauth.portcullis.local%2Foauth2%2Fcallback'
           AUTHQ="$NOPKCE&code_challenge=83JUujMAYgRhPwEoyXqFBcdcLnEjuT8NyjHlOlacyZo&code_challenge_method=S256"
           got_code() { grep -qiE '^location: .*[?&]code=' "$1"; }
 
@@ -1614,7 +1632,7 @@ jobs:
             || { echo "FAIL: /api/users did not return testuser: $USERS"; exit 1; }
           echo "PASS: Enrollment API returned $(echo "$USERS" | jq length) users"
 
-      - name: Test passkey-only flows, setup links and the invite APIs
+      - name: Test the sign-in flows, setup links and the invite APIs
         run: |
           set -o pipefail
           # The invite IdP is created by configure once enroll runs (Keycloak
@@ -1628,13 +1646,31 @@ jobs:
             --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
           [ -z "$KC_TOKEN" ] || [ "$KC_TOKEN" = null ] || echo "::add-mask::$KC_TOKEN"
           kc() { curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") "http://127.0.0.1:8080/admin/realms/portcullis$1"; }
-          # The browser flow has no password factor anywhere; LoA 1 = cert or
-          # passkey, LoA 2 needs nothing more; the invite IdP is reachable only
-          # with kc_idp_hint (hidden), linking to existing users only.
+          # The browser flow (contract §8.1): only the sign-in extension's
+          # methods (no stock password, passkey or X.509 authenticator, no LoA
+          # condition), ending with the template check; the invite IdP is
+          # reachable only with kc_idp_hint (hidden), linking to existing users only.
           EX=$(kc /authentication/flows/portcullis-universal/executions)
-          echo "$EX" | jq -e '[.[].providerId // empty] | (index("auth-username-password-form") == null) and (index("auth-password-form") == null)
-              and index("identity-provider-redirector") and index("webauthn-authenticator-passwordless") and index("allow-access-authenticator")' >/dev/null \
-            || { echo "FAIL: browser flow: $(echo "$EX" | jq -c '[.[] | {displayName, requirement}]')"; exit 1; }
+          echo "$EX" | jq -e '[.[] | [.level, (if .authenticationFlow then .displayName else .providerId end), .requirement]]
+              == [[0, "portcullis-authenticate", "REQUIRED"], [1, "auth-cookie", "ALTERNATIVE"], [1, "identity-provider-redirector", "ALTERNATIVE"],
+                  [1, "portcullis-signin", "ALTERNATIVE"], [2, "portcullis-x509", "ALTERNATIVE"], [2, "portcullis-signin-passkey", "ALTERNATIVE"],
+                  [3, "portcullis-passkey", "REQUIRED"],
+                  [3, "portcullis-passkey-security-key", "CONDITIONAL"], [4, "portcullis-condition-passkey-kind", "REQUIRED"], [4, "portcullis-method", "REQUIRED"],
+                  [3, "portcullis-passkey-device", "CONDITIONAL"], [4, "portcullis-condition-passkey-kind", "REQUIRED"], [4, "portcullis-method", "REQUIRED"],
+                  [3, "portcullis-passkey-synced", "CONDITIONAL"], [4, "portcullis-condition-passkey-kind", "REQUIRED"], [4, "portcullis-method", "REQUIRED"],
+                  [2, "portcullis-password-form", "ALTERNATIVE"], [0, "portcullis-template", "REQUIRED"]]' >/dev/null \
+            || { echo "FAIL: browser flow: $(echo "$EX" | jq -c '[.[] | [.level, (if .authenticationFlow then .displayName else .providerId end), .requirement]]')"; exit 1; }
+          # Every reference execution keeps its method 10 h in the amr.
+          for c in $(echo "$EX" | jq -r '.[] | select(.providerId // "" | IN("portcullis-x509", "portcullis-password-form", "portcullis-method")) | .authenticationConfig // "none"'); do
+            kc "/authentication/config/$c" | jq -e '(.config["default.reference.value"] | IN("mtls", "pwd", "hwk", "dpk", "spk")) and .config["default.reference.maxAge"] == "36000"' >/dev/null \
+              || { echo "FAIL: reference config $c: $(kc "/authentication/config/$c" | jq -c .config)"; exit 1; }
+          done
+          kc /authentication/required-actions | jq -e '[.[] | select(.alias | startswith("webauthn-register")) | [.alias, .enabled]] | sort
+              == [["webauthn-register", false], ["webauthn-register-passwordless", true]]' >/dev/null \
+            || { echo "FAIL: required actions: webauthn-register-passwordless on, the two-factor webauthn-register off"; exit 1; }
+          kc "" | jq -e '.attributes["acr.loa.map"] == "{}" and .bruteForceProtected and .failureFactor == 10 and .waitIncrementSeconds == 60
+              and .maxFailureWaitSeconds == 900 and (.permanentLockout | not) and .webAuthnPolicyPasswordlessAttestationConveyancePreference == "direct"' >/dev/null \
+            || { echo "FAIL: realm sign-in settings: $(kc "" | jq -c '{loa: .attributes["acr.loa.map"], bruteForceProtected, failureFactor, waitIncrementSeconds, maxFailureWaitSeconds, permanentLockout}')"; exit 1; }
           kc /authentication/flows | jq -e 'any(.[]; .alias == "portcullis-universal" and (.description | test("\\[sync [0-9a-f]{10}\\]$")))' >/dev/null \
             || { echo "FAIL: browser flow not synced from realm-export.json"; exit 1; }
           kc /identity-provider/instances/portcullis-invite | jq -e '.enabled and .hideOnLogin and (.trustEmail | not)
@@ -1644,13 +1680,17 @@ jobs:
           kc /authentication/flows/portcullis-invite-link/executions | jq -e '[.[].providerId] == ["idp-detect-existing-broker-user", "idp-auto-link"]' >/dev/null \
             || { echo "FAIL: invite first-login flow must only link existing users"; exit 1; }
           # Post-broker flow: only portcullis-forward-auth (marker scope), a
-          # positive check then deny-unless-admitted, then LoA 1 and LoA 2 (contract §8).
-          kc /authentication/flows/portcullis-invite-session/executions | jq -e '[.[] | select(.level == 0) | [.displayName, .requirement]]
-              == [["portcullis-invite-client", "CONDITIONAL"], ["portcullis-invite-deny", "CONDITIONAL"], ["portcullis-invite-loa-1", "CONDITIONAL"], ["portcullis-invite-loa", "CONDITIONAL"]]
+          # positive check then deny-unless-admitted, then amr inv and the
+          # template check (contract §8 "Invite links").
+          INV=$(kc /authentication/flows/portcullis-invite-session/executions)
+          echo "$INV" | jq -e '[.[] | select(.level == 0) | [(if .authenticationFlow then .displayName else .providerId end), .requirement]]
+              == [["portcullis-invite-client", "CONDITIONAL"], ["portcullis-invite-deny", "CONDITIONAL"], ["allow-access-authenticator", "REQUIRED"], ["portcullis-template", "REQUIRED"]]
               and ([.[] | select(.level == 1) | .providerId] == ["conditional-client-scope", "allow-access-authenticator",
-                     "conditional-sub-flow-executed", "deny-access-authenticator", "conditional-level-of-authentication", "allow-access-authenticator",
-                     "conditional-level-of-authentication", "allow-access-authenticator"])' >/dev/null \
-            || { echo "FAIL: invite post-broker flow: $(kc /authentication/flows/portcullis-invite-session/executions | jq -c '[.[] | {displayName, requirement, level}]')"; exit 1; }
+                     "conditional-sub-flow-executed", "deny-access-authenticator"])' >/dev/null \
+            || { echo "FAIL: invite post-broker flow: $(echo "$INV" | jq -c '[.[] | {displayName, providerId, requirement, level}]')"; exit 1; }
+          kc "/authentication/config/$(echo "$INV" | jq -r '.[] | select(.level == 0 and .providerId == "allow-access-authenticator") | .authenticationConfig')" \
+            | jq -e '.config["default.reference.value"] == "inv" and .config["default.reference.maxAge"] == "36000"' >/dev/null \
+            || { echo "FAIL: the invite flow's amr is not inv"; exit 1; }
           FWD=$(kc "/clients?clientId=portcullis-forward-auth" | jq -r '.[0].id')
           SCOPE_ID=$(kc /client-scopes | jq -r '.[] | select(.name == "portcullis-invite-client") | .id')
           kc "/clients/$FWD" | jq -e '.attributes["pkce.code.challenge.method"] == "S256"' >/dev/null \
@@ -2187,7 +2227,7 @@ jobs:
           # Compose services incl. the monitoring profile (minus enroll and the
           # edge Hub) + the helper alpine, whoami and curl used inline.
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh \
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } > "$RUNNER_TEMP/images.txt"
@@ -2243,6 +2283,8 @@ jobs:
           sbom: false
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        uses: ./.github/actions/keycloak-image
 
       - name: Start the core stack (Vault, PKI, all services except the Hub)
         run: |
@@ -2590,7 +2632,7 @@ jobs:
       - name: List the images this job runs
         run: |
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
@@ -2646,6 +2688,8 @@ jobs:
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
         uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        uses: ./.github/actions/keycloak-image
 
       - name: Start the whole stack (Hub with the CI template source, domains + Pebble)
         run: |
@@ -3173,7 +3217,7 @@ jobs:
       - name: List the images this job runs
         run: |
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
@@ -3242,6 +3286,8 @@ jobs:
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
         uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        uses: ./.github/actions/keycloak-image
 
       - name: Start the whole stack (Hub with the CI template source)
         run: |
@@ -3515,7 +3561,7 @@ jobs:
       - name: List the images this job runs
         run: |
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
@@ -3580,6 +3626,8 @@ jobs:
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
         uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        uses: ./.github/actions/keycloak-image
 
       - name: The shared folder's tree on the host (ext4, ACLs)
         run: |
@@ -3789,7 +3837,7 @@ jobs:
       - name: List the images this job runs
         run: |
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
@@ -3854,6 +3902,8 @@ jobs:
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
         uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        uses: ./.github/actions/keycloak-image
 
       - name: smbclient (apt, pinned) and the shared folder on the host (ext4, ACLs)
         run: |
@@ -4072,7 +4122,7 @@ jobs:
       - name: List the images this job runs
         run: |
           {
-            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-hub:.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
@@ -4152,6 +4202,8 @@ jobs:
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
         uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        uses: ./.github/actions/keycloak-image
 
       - name: Start the whole stack (Hub with the gitea / grafana / echo template source)
         run: |

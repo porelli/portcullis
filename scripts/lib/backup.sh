@@ -176,9 +176,9 @@ _backup_manifest() {
     || fail "could not checksum $dir"
   jq -n --argjson format "$BACKUP_FORMAT" --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg version "$(portcullis_version)" --arg domain "${PORTCULLIS_DOMAIN:-}" \
-    --arg hub "$(_svc_image hub)" --argjson files "$files" \
+    --arg hub "$(_svc_image hub)" --arg kc "$(_svc_image keycloak)" --argjson files "$files" \
     '{format: $format, created: $created, portcullis_version: $version, domain: $domain,
-      hub_image: $hub, files: $files}' > "$dir/MANIFEST.json"
+      hub_image: $hub, keycloak_image: $kc, files: $files}' > "$dir/MANIFEST.json"
 }
 
 # _backup_check_manifest <dir> — every file listed has its checksum.
