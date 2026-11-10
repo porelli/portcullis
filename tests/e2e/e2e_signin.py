@@ -328,7 +328,11 @@ def published() -> dict:
 
 class Key:
     """A virtual CTAP2 authenticator on a page answering every prompt;
-    backup eligibility 1 makes its passkeys synced."""
+    backup eligibility 1 makes its passkeys synced. Copied credentials
+    start each copy 1000 signatures further on, so no copy's counter ever
+    goes back below what Keycloak stored from an earlier one."""
+
+    copies = 0
 
     def __init__(self, page: Page, *, synced: bool = False, credentials: list | None = None):
         self.cdp = page.context.new_cdp_session(page)
@@ -342,9 +346,11 @@ class Key:
         self.asserted = 0
         self.cdp.on("WebAuthn.credentialAdded", lambda _e: setattr(self, "registered", self.registered + 1))
         self.cdp.on("WebAuthn.credentialAsserted", lambda _e: setattr(self, "asserted", self.asserted + 1))
+        if credentials:
+            Key.copies += 1
         for c in credentials or []:
-            self.cdp.send("WebAuthn.addCredential", {"authenticatorId": self.id,
-                                                     "credential": dict(c, signCount=c.get("signCount", 0) + 1000)})
+            self.cdp.send("WebAuthn.addCredential", {"authenticatorId": self.id, "credential": dict(
+                c, signCount=c.get("signCount", 0) + 1000 * Key.copies)})
 
     def credentials(self) -> list:
         return self.cdp.send("WebAuthn.getCredentials", {"authenticatorId": self.id})["credentials"]
@@ -427,17 +433,16 @@ def drive_kc(page: Page, done, label: str, seconds: int = 60) -> str:
 
 
 class Redirect:
-    """Stops the browser at a client's redirect URI (never reaches the app)
-    and keeps the URLs Keycloak sent it to."""
+    """Keeps the URLs Keycloak sends the browser to at a client's redirect
+    URI (a request event: a page route never saw Keycloak's redirect in
+    CI). The code is redeemed here; what the app host then
+    answers doesn't matter (oidc-all's host may refuse the TLS handshake,
+    people.<d> shows its own page)."""
 
     def __init__(self, page: Page, redirect_uri: str):
         self.urls: list[str] = []
-        self.redirect_uri = redirect_uri
-
-        def handle(route):
-            self.urls.append(route.request.url)
-            route.fulfill(status=200, content_type="text/plain", body="redirect reached")
-        page.route(re.compile("^" + re.escape(redirect_uri) + r"\?"), handle)
+        prefix = redirect_uri + "?"
+        page.on("request", lambda r: self.urls.append(r.url) if r.url.startswith(prefix) else None)
 
     def code(self) -> str | None:
         for u in self.urls:
@@ -662,10 +667,28 @@ def main() -> int:
             assert f"passkey registered for sam: AAGUID {AAGUID}, kind passkey_synced" in kc_log()
             amr = token_claims(page).get("amr") or []
             assert "spk" in amr and "hwk" not in amr, amr
-            state["sam_ctx"], state["sam_page"] = ctx, page
             state["sam_synced"] = key.credentials()
+            ctx.close()
+            # A setup-link session (amr inv) counts as not known in `people`
+            # (contract §5): the needs-stronger page needs a later sign-in.
             wait_people("sam", ["passkey_synced"])
-            resp = goto(page, HUB + "/")
+            ctx = new_context()
+            page = ctx.new_page()
+            key = Key(page, synced=True, credentials=state["sam_synced"])
+            state["sam_ctx"], state["sam_page"] = ctx, page
+            goto(page, HUB + "/")
+            deadline = time.time() + 60
+            while time.time() < deadline and not (page.url.startswith(HUB + "/") and not base.on_login_pages(page)):
+                page.wait_for_load_state("domcontentloaded")
+                if base.on_login_pages(page) and page.locator("#authenticateWebAuthnButton").is_visible():
+                    page.click("#authenticateWebAuthnButton")
+                    page.wait_for_timeout(1500)
+                    continue
+                page.wait_for_timeout(500)
+            assert key.asserted == 1, f"{key.asserted} assertions for sam's sign-in"
+            amr = token_claims(page).get("amr") or []
+            assert "spk" in amr and "inv" not in amr and "hwk" not in amr, amr
+            resp = page.reload(wait_until="domcontentloaded")
             base.shot(page, "sam-hub-needs-stronger")
             assert resp and resp.status == 403, f"hub.<d>: HTTP {resp and resp.status}"
             assert page.locator("#needs-stronger").count() == 1, body(page)[:300]
