@@ -1,8 +1,8 @@
 # oauth2-proxy alpha config.
 #
 # Why alpha config: upstream keeps per-request loginURLParameters out of the
-# legacy env-based config. We need per-request acr_values so group-gate's
-# step-up redirect (/oauth2/start?acr_values=mtls) actually reaches Keycloak.
+# legacy env-based config. We need the per-request pc_method so group-gate's
+# step-up redirect (/oauth2/start?pc_method=security_key) reaches Keycloak.
 # Once --alpha-config is set, providers + upstreams MUST live here; every
 # other knob (cookie, headers, ingress) still comes from OAUTH2_PROXY_* env.
 #
@@ -33,23 +33,27 @@ providers:
         - aud
     # Per-request parameters for Keycloak; `allow` gates accepted values.
     loginURLParameters:
-      # Every sign-in asks for LoA 2 (hwk) by default: the browser flow
-      # has no password, so a passkey (or client cert) touch reaches it in
-      # one step and webauthn-policy apps (the Hub's default) need no
-      # step-up afterwards. group-gate asks for mtls (/oauth2/start?
-      # acr_values=mtls) when an app's policy needs a client cert.
-      - name: acr_values
-        default:
-          - hwk
+      # A step-up asks for one sign-in method (contract §5, plan D7):
+      # group-gate sends /oauth2/start?pc_method=<method id or passkey>;
+      # Keycloak keeps the unknown authorize parameter as the client note
+      # client_request_param_pc_method, which the sign-in extension reads.
+      # No default (a normal sign-in asks for nothing in particular) and no
+      # acr_values: the flows have no LoA levels any more.
+      - name: pc_method
         allow:
-          - value: pwd
-          - value: hwk
-          - value: mtls
+          - value: password
+          - value: passkey_synced
+          - value: browser_cert
+          - value: passkey_device
+          - value: security_key
+          - value: yubikey_cert
+          - value: passkey
       # One-time invite links (enroll/invite.go) start here with
       # kc_idp_hint=portcullis-invite (Keycloak's identity provider
       # redirector) and prompt=login, so an SSO session of whoever used the
       # browser before is not reused. group-gate's step-up never sends
-      # prompt: Keycloak's LoA step-up asks only for the missing level.
+      # prompt: the extension asks only for the one method, on top of the
+      # Keycloak session's.
       - name: kc_idp_hint
         allow:
           - value: portcullis-invite

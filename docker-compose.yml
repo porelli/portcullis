@@ -526,7 +526,7 @@ services:
     volumes:
       - ./certs/ca-bundle.crt:/etc/ssl/certs/ca-certificates.crt:ro
       # provider + upstreams live in alpha config so we can declare
-      # loginURLParameters (per-request acr_values passthrough); everything
+      # loginURLParameters (per-request pc_method passthrough); everything
       # else keeps coming from OAUTH2_PROXY_* env vars below.
       - ./oauth2-proxy/alpha.yaml:/etc/oauth2-proxy/alpha.yaml:ro
     environment:
@@ -538,7 +538,7 @@ services:
       # Re-validate the session with Keycloak (refresh-token grant) once it
       # is older than a minute: a revoked Keycloak session (logout, the
       # Hub removing a membership) ends forward-auth access, and changed
-      # groups / acr reach group-gate, within about a minute instead of the
+      # groups / amr reach group-gate, within about a minute instead of the
       # 168h cookie lifetime (cookie_expire, the default, must stay larger).
       OAUTH2_PROXY_COOKIE_REFRESH: 1m
       OAUTH2_PROXY_EMAIL_DOMAINS: "*"

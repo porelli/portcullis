@@ -21,17 +21,24 @@ Checks, run in order:
          still applies).
      Traefik's entrypoint deletes client-supplied X-Forwarded-Tls-Client-*
      headers, so the header only ever describes a cert Traefik verified.
-  1. Auth policy — does the current session's ACR/AMR satisfy the app's
-     required factor set (one of mtls/webauthn, with AND/OR
-     semantics)? If not, 403 with a stepup URL so the user can re-auth
-     at the needed Level of Authentication.
-     mTLS binding: when the policy is satisfied only through the `mtls`
-     factor (amr=mtls), the token alone is not enough — it may have been
-     obtained with a cert that has since been revoked. The CURRENT request
-     must present a client cert (checked for revocation in step 0) whose
-     subject CN equals the session user (the LLDAP username from
+  1. Sign-in template (policy file v6) — the host's compiled rule over
+     sign-in methods (core[host] for a gated core host, else hosts[host],
+     else default) must be met by the session's methods: the token's amr
+     values mapped through the method table (AMR_TO_METHOD), kept only
+     while the method is switched on (`methods`). If not, 403 with one of
+     three pages (contract §5), never an automatic redirect:
+       - present-certificate (#present-certificate): amr holds mtls and the
+         rule would be met if the YubiKey certificate counted, but this
+         request carries no bound certificate;
+       - step-up (#stepup-continue, X-Stepup-URL): one missing method can
+         be completed — /oauth2/start?pc_method=<method>;
+       - needs-stronger (#needs-stronger): nothing can be completed here.
+     mTLS binding: `yubikey_cert` (amr mtls) counts only when the CURRENT
+     request presents a client cert (checked for revocation in step 0)
+     whose subject CN equals the session user (the LLDAP username from
      X-Auth-Request-Preferred-Username, which must also match the token's
-     preferred_username); otherwise step-up / deny.
+     preferred_username) — the token alone may have been obtained with a
+     cert that has since been revoked.
   2. Group — does the user belong to the host's required LLDAP group
      (users_<app>)? If not, 403. The reserved group
      __portcullis_deny__ (published by the Hub for apps whose config is
@@ -53,7 +60,7 @@ Request paths on group-gate itself (the forwardAuth `address`):
                         the Hub's portcullis-public-<instance> routers, no
                         forward-auth): no user, no group, no policy. Allows
                         only if the host has a `public_paths` entry (policy
-                        file version 5; never a core host), the normalised
+                        file version 6; never a core host), the normalised
                         path is inside one of its patterns, and the request
                         carries no credential (Authorization,
                         Proxy-Authorization, the app's credential headers,
@@ -75,10 +82,15 @@ Config sources (both re-read on every request; they are tiny):
     auth, traefik, hub, directory, enroll, people, metrics, mcp . <domain>):
     the Hub policy file can never override those.
   - /hub-data/group-gate-policy.json — written by the Hub (contract §4):
-      {"version": 5,
-       "default":  {"factors": [...], "op": "..."},
+      {"version": 6,
+       "methods": ["<switched-on method id>", ...],
+       "templates": {"<template id>": {"op": "any|all", "items": ["<method id>" | {group}, ...]}},
+       "default": "<template id>",
+       "hosts": {"<app hostname>": "<template id>"},
+       "core": {"<gated core hostname>": "<template id>"},
+       "people": {"<lowercase username>": ["<method id they have set up>", ...]},
+       "add_stronger": false,
        "extra_domains": ["<enrolled domain>", ...],
-       "policies": {"<hostname>": {"factors": [...], "op": "any|all|"}},
        "groups":   {"<hostname>": "<required LLDAP group>"},
        "path_groups": {"<hostname>": [{"prefix": "/admin", "group": "<LLDAP group>"}]},
        "public_paths": {"<hostname>": {"paths": [{"path": "/s/{token}", "match": "prefix"}],
@@ -87,14 +99,18 @@ Config sources (both re-read on every request; they are tiny):
                         "credential_query": [...]}},
        "expiring": [{"user": "<lowercase username>", "group": "<LLDAP group>",
                      "at": "<RFC 3339 UTC>"}]}
-    Every map is keyed by the full lowercase hostname the request is for
-    (a valid hostname, see HOSTNAME_RE) — never by template or instance
-    id, never by subdomain. Optional; no file means every app falls
-    through to the group check only. Missing keys (other than `version`)
-    are treated as empty. A file that exists but cannot be parsed, has no
-    `version` or any `version` other than 5, a key that is not a valid
-    hostname, a malformed `extra_domains`, or a policy / expiry with
-    unknown factor names / op / rule shape fails CLOSED (403).
+    Every host map is keyed by the full lowercase hostname the request is
+    for (a valid hostname, see HOSTNAME_RE) — never by template or instance
+    id, never by subdomain. The seven v6 keys `methods` … `add_stronger`
+    are required; the others may be missing (= empty). A MISSING file, a
+    file that cannot be parsed, any `version` but 6 (a missing one
+    included), an unknown key, a key that is not a valid hostname, a
+    malformed `extra_domains`, a compiled rule of another shape (unknown op,
+    0 or > 8 items, a leaf that isn't a switched-on method id, > 4 levels,
+    > 48 leaves), a template id `default` / `hosts` / `core` names that
+    `templates` lacks, or a gated core host missing from `core` fails
+    CLOSED (403). `people` and `add_stronger` only word the pages, never
+    an access decision.
   - /hub-data/user-attributes.json — written by the Hub (contract §4.1):
     {"version": 2, "fields": {"<field>": "<Header-Name>"},
      "users": {"<user>": {"<field>": ["value", ...]}},
@@ -131,7 +147,7 @@ to start without a valid one, and denies every request if it is unset).
 Access token is read from X-Forwarded-Access-Token (oauth2-proxy with
 PASS_ACCESS_TOKEN=true). The JWT signature is NOT verified here — it was
 already verified upstream by oauth2-proxy before the request reaches us.
-We only decode the payload to read the acr/amr/preferred_username claims.
+We only decode the payload to read the amr/preferred_username claims.
 """
 
 from __future__ import annotations
@@ -198,17 +214,20 @@ def core_hosts() -> FrozenSet[str]:
 # §5.1). Valid ONLY in map.conf / GATE_MAP: in the policy file's `groups`
 # it is ignored and in `path_groups` it is malformed (fail closed).
 ANY_SIGNED_IN = "*"
-VALID_OPS = ("", "any", "all")
 # The one policy-file schema version this gate serves (contract §4): any
-# other `version` denies (an older file lacks `expiring`, so a temporary
-# membership would never end; a newer one may carry restrictions we would
-# drop). A file without `version` denies too; only a missing FILE means
-# "nothing published" (empty policy).
-POLICY_VERSION = 5
+# other `version` denies (an older file has no sign-in templates, so it
+# can't say which methods an app accepts; a newer one may carry
+# restrictions we would drop). A file without `version` denies too, and so
+# does a missing file (no method is on, no template is known).
+POLICY_VERSION = 6
 # /public-guard needs a file of exactly this version (no `version` = deny).
-PUBLIC_GUARD_VERSION = 5
+PUBLIC_GUARD_VERSION = 6
 # The maps of the policy file keyed by hostname (contract §4).
-HOST_MAPS = ("policies", "groups", "path_groups", "public_paths")
+HOST_MAPS = ("hosts", "groups", "path_groups", "public_paths")
+# The v6 keys the Hub always writes; a file without one of them denies.
+POLICY_REQUIRED_KEYS = ("methods", "templates", "default", "hosts", "core", "people", "add_stronger")
+# Keys that may be missing (= empty, as before v6). Any other key denies.
+POLICY_OPTIONAL_KEYS = ("extra_domains", "groups", "path_groups", "public_paths", "expiring")
 # Reserved group (contract §4): the Hub publishes it for routed apps whose
 # config is unknown. It always denies; nobody may claim membership.
 DENY_GROUP = "__portcullis_deny__"
@@ -216,23 +235,40 @@ DENY_GROUP = "__portcullis_deny__"
 # is in lldap_admin; Keycloak's federation also filters it out).
 DENY_USERS = frozenset(u.strip().lower() for u in os.environ.get("GATE_DENY_USERS", "portcullis-hub").split(",") if u.strip())
 
-# Factor string ↔ AMR value used in tokens (RFC 8176 where possible).
-FACTOR_TO_AMR = {
-    "mtls": "mtls",
-    "webauthn": "hwk",
-}
-# There is no "password" factor: the browser flow has no password sign-in,
-# and a stored policy naming it is unknown → denied (fail closed). The Hub
-# rewrites such policies on load before publishing.
+# ── Sign-in methods (contract §8.1 "Methods"; the same table in the Hub's
+# internal/signin, the Keycloak extension and mcp-gate) ──
 
-# Factor → LoA level (must match the realm acr.loa.map).
-FACTOR_TO_LOA = {
-    "webauthn": 2,
-    "mtls": 3,
-}
+# The six method ids in canonical order (weakest first).
+METHOD_IDS = ("password", "passkey_synced", "browser_cert", "passkey_device", "security_key", "yubikey_cert")
+# amr value → method id. Anything else (`inv`, a setup-link session,
+# included) stands for nothing.
+AMR_TO_METHOD = {"pwd": "password", "spk": "passkey_synced", "file": "browser_cert",
+                 "dpk": "passkey_device", "hwk": "security_key", "mtls": "yubikey_cert"}
+# Strengths in tenths (contract §8.1): only the pages' "Set up …" vs "ask
+# your admin" use them, never an access decision.
+METHOD_TENTHS = {"password": 10, "passkey_synced": 25, "browser_cert": 25,
+                 "passkey_device": 30, "security_key": 35, "yubikey_cert": 40}
+PASSKEY_KINDS = ("passkey_synced", "passkey_device", "security_key")
+# What a step-up may ask for (`pc_method`, oauth2-proxy's allowlist in
+# oauth2-proxy/alpha.yaml): one method id, or `passkey` = any passkey kind.
+STEPUP_METHODS = frozenset(METHOD_IDS) | {"passkey"}
+# Compiled-rule limits (contract §4 / §8.1 "Rules"), the same in every reader.
+RULE_MAX_DEPTH = 4
+RULE_MAX_ITEMS = 8
+RULE_MAX_LEAVES = 48
+TEMPLATE_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,31}|collision\.[1-9][0-9]*")
+# Core subdomains group-gate gates with a template from `core` (with the
+# apex, the portal). `auth` (the Keycloak admin console's router) takes the
+# default template; `mcp` never reaches group-gate (mcp-gate authorizes).
+GATED_CORE_SUBDOMAINS = ("traefik", "hub", "directory", "enroll", "people", "metrics")
 
-# acr string → LoA int (must match realm acr.loa.map).
-ACR_TO_LOA = {"public": 0, "pwd": 1, "hwk": 2, "mtls": 3}
+
+def gated_core_hosts() -> FrozenSet[str]:
+    """The core hosts `core` must list (contract §4): <domain> and
+    <gated core sub>.<domain>."""
+    if not DOMAIN_OK:
+        return frozenset()
+    return frozenset([DOMAIN] + [f"{sub}.{DOMAIN}" for sub in GATED_CORE_SUBDOMAINS])
 
 
 class PolicyError(Exception):
@@ -298,6 +334,131 @@ def build_group_map(policy_doc: dict) -> dict:
     return mapping
 
 
+# ── Compiled sign-in rules (contract §8.1 "Rules") ──────────────────
+
+def _rule_leaves(node) -> int:
+    return sum(1 if isinstance(it, str) else _rule_leaves(it) for it in node["items"])
+
+
+def validate_rule(node, methods: set, depth: int = 1) -> Optional[str]:
+    """Why `node` is not a compiled rule over `methods`, or None.
+
+    A compiled rule is a group {"op": "all"|"any", "items": [...]} with
+    exactly those two keys and 1–8 items, each a method id listed in
+    `methods` (switched on) or a nested group of the same shape; groups nest
+    at most 4 levels (the top group is level 1), with at most 48 leaves.
+    A family, an amr value, `inv` or any other leaf is refused, as is a
+    leaf at the top."""
+    if not isinstance(node, dict):
+        return "a compiled rule must be a group"
+    if depth > RULE_MAX_DEPTH:
+        return f"groups nest at most {RULE_MAX_DEPTH} levels"
+    if set(node) != {"op", "items"}:
+        return 'a group has exactly "op" and "items"'
+    op, items = node["op"], node["items"]
+    if not isinstance(op, str) or op not in ("all", "any"):
+        return f'"op" must be "all" or "any", not {op!r}'
+    if not isinstance(items, list) or not 1 <= len(items) <= RULE_MAX_ITEMS:
+        return f"a group holds 1–{RULE_MAX_ITEMS} items"
+    for it in items:
+        if isinstance(it, str):
+            if it not in METHOD_IDS:
+                return f"{it!r} is not a sign-in method id"
+            if it not in methods:
+                return f"{it!r} is not switched on"
+        elif isinstance(it, dict):
+            err = validate_rule(it, methods, depth + 1)
+            if err:
+                return err
+        else:
+            return f"an item must be a method id or a group, not {it!r}"
+    if depth == 1 and _rule_leaves(node) > RULE_MAX_LEAVES:
+        return f"more than {RULE_MAX_LEAVES} methods in one rule"
+    return None
+
+
+def rule_satisfied(node, have: set) -> bool:
+    """An `all` group is met when every item is, an `any` group when one
+    is; a method when it is among the session's methods. (Validated rules
+    only.)"""
+    met = (it in have if isinstance(it, str) else rule_satisfied(it, have) for it in node["items"])
+    return all(met) if node["op"] == "all" else any(met)
+
+
+_RANK = {m: i for i, m in enumerate(METHOD_IDS)}
+
+
+def _minimal(sets: List[int]) -> List[int]:
+    """Drops duplicates and supersets of another set, keeping the first
+    copy (the Hub's signin.Alternatives / the extension's Rule.minimal)."""
+    out = []
+    for i, s in enumerate(sets):
+        if not any(i != j and o & s == o and (o != s or j < i) for j, o in enumerate(sets)):
+            out.append(s)
+    return out
+
+
+def _alternative_masks(node) -> List[int]:
+    if isinstance(node, str):
+        return [1 << _RANK[node]]
+    if node["op"] == "any":
+        out: List[int] = []
+        for it in node["items"]:
+            out = _minimal(out + _alternative_masks(it))
+        return out
+    out = [0]
+    for it in node["items"]:
+        alts = _alternative_masks(it)
+        out = _minimal([x | y for x in out for y in alts])
+    return out
+
+
+def alternatives(node) -> List[FrozenSet[str]]:
+    """The rule's ways to be met: its minimal any-of-all-of form, in the
+    rule's order (no alternative twice, none containing another)."""
+    return [frozenset(m for m in METHOD_IDS if mask >> _RANK[m] & 1) for mask in _alternative_masks(node)]
+
+
+def session_methods(amr: list, enabled: set, cert_bound: bool) -> set:
+    """The session's methods (contract §8.1 "Session methods"): each amr
+    value through AMR_TO_METHOD (`inv` and unknown values count as
+    nothing), kept only while switched on; `yubikey_cert` only with the
+    mTLS binding on this request (`cert_bound`)."""
+    out = set()
+    for value in amr if isinstance(amr, list) else []:
+        m = AMR_TO_METHOD.get(value) if isinstance(value, str) else None
+        if m and m in enabled and (m != "yubikey_cert" or cert_bound):
+            out.add(m)
+    return out
+
+
+def choose_stepup(node, have: set, set_up: Optional[set], amr_mtls: bool = False) -> Optional[str]:
+    """The method a step-up asks for (contract §5), or None (the
+    needs-stronger page).
+
+    Candidates: for each alternative, in the rule's order, that lacks
+    exactly one method, that method — only ones the person has set up when
+    `people` knows them (`set_up` not None), any when it doesn't — never
+    `yubikey_cert` while the session's amr already holds mtls (that is the
+    present-certificate page). Choice: the first candidate; with the person
+    unknown and two or more passkey-kind candidates, `passkey`."""
+    candidates: List[str] = []
+    for alt in alternatives(node):
+        missing = alt - have
+        if len(missing) != 1:
+            continue
+        (m,) = missing
+        if (m == "yubikey_cert" and amr_mtls) or (set_up is not None and m not in set_up):
+            continue
+        if m not in candidates:
+            candidates.append(m)
+    if not candidates:
+        return None
+    if set_up is None and sum(m in PASSKEY_KINDS for m in candidates) >= 2:
+        return "passkey"
+    return candidates[0]
+
+
 _POLICY_CACHE: dict = {}
 _POLICY_LOCK = threading.Lock()
 
@@ -305,19 +466,65 @@ _POLICY_LOCK = threading.Lock()
 def validate_policy_doc(doc) -> Optional[str]:
     """Why a parsed policy file must deny every request, or None.
 
-    Checks what applies to the whole file (contract §4): a JSON object of
-    exactly POLICY_VERSION, every host map an object keyed by valid
-    hostnames, and `extra_domains` a list of valid hostnames none of which
-    is the main domain, a parent of it, or at or under a core host (extra
-    domains never route core services). Per-host entries are validated
-    when a request needs them.
+    Checks the whole file (contract §4): a JSON object of exactly
+    POLICY_VERSION with only known keys and every v6 key; `methods` a list
+    of distinct method ids; every template id well-formed and its rule a
+    compiled rule over `methods`; `default`, every `hosts` and `core` value
+    a key of `templates`; `core` keyed by gated core hosts; `people` lists
+    of switched-on method ids; `add_stronger` a boolean; every host map an
+    object keyed by valid hostnames; `extra_domains` a list of valid
+    hostnames none of which is the main domain, a parent of it, or at or
+    under a core host (extra domains never route core services). Other
+    per-host entries are validated when a request needs them.
     """
     if not isinstance(doc, dict):
         return "policy file is not a JSON object"
     version = doc.get("version")
-    # An int exactly: JSON 5.0 (a float) or true (a bool) is not version 5.
+    # An int exactly: JSON 6.0 (a float) or true (a bool) is not version 6.
     if type(version) is not int or version != POLICY_VERSION:
         return f"policy file version {version!r} is not supported (only {POLICY_VERSION})"
+    unknown = sorted(k for k in doc if k != "version" and k not in POLICY_REQUIRED_KEYS + POLICY_OPTIONAL_KEYS)
+    if unknown:
+        return f"unknown keys {unknown[:5]}"
+    missing = [k for k in POLICY_REQUIRED_KEYS if k not in doc]
+    if missing:
+        return f"missing keys {missing}"
+    methods = doc["methods"]
+    if (not isinstance(methods, list) or not all(isinstance(m, str) and m in METHOD_IDS for m in methods)
+            or len(set(methods)) != len(methods)):
+        return "'methods' is not a list of distinct sign-in method ids"
+    methods = set(methods)
+    templates = doc["templates"]
+    if not isinstance(templates, dict):
+        return "'templates' is not an object"
+    for tid, rule in templates.items():
+        if not TEMPLATE_ID_RE.fullmatch(tid):
+            return f"template id {tid!r} is not valid"
+        err = validate_rule(rule, methods)
+        if err:
+            return f"template {tid!r}: {err}"
+    if not isinstance(doc["default"], str) or doc["default"] not in templates:
+        return f"'default' {doc['default']!r} is not a published template"
+    for name in ("hosts", "core"):
+        m = doc[name]
+        if not isinstance(m, dict):
+            return f"{name!r} is not an object"
+        bad = sorted(repr(h) for h, tid in m.items() if not isinstance(tid, str) or tid not in templates)
+        if bad:
+            return f"{name!r} names templates that aren't published for {bad[:5]}"
+    gated = gated_core_hosts()
+    bad = sorted(repr(h) for h in doc["core"] if h not in gated)
+    if bad:
+        return f"'core' has keys that are not gated core hosts: {bad[:5]}"
+    people = doc["people"]
+    if not isinstance(people, dict):
+        return "'people' is not an object"
+    for user, ms in people.items():
+        if (not user or user != user.lower() or not isinstance(ms, list)
+                or not all(isinstance(m, str) and m in methods for m in ms)):
+            return f"'people' entry {user!r} is not a lowercase user with a list of switched-on methods"
+    if type(doc["add_stronger"]) is not bool:
+        return "'add_stronger' is not a boolean"
     for name in HOST_MAPS:
         m = doc.get(name)
         if m is None:
@@ -486,19 +693,19 @@ def render_portal(user: str, groups: set, apps, domain: str, domains=()) -> byte
 
 
 def load_policy_file() -> dict:
-    """Return the Hub policy doc, {} if the file is absent (nothing
-    published yet).
+    """Return the validated Hub policy doc.
 
-    Raises PolicyError if the file exists but fails validate_policy_doc()
-    (not a JSON object, a `version` other than POLICY_VERSION — a missing
-    one included —, a key that is not a valid hostname, a malformed
-    `extra_domains`): a broken or foreign policy must not silently
-    downgrade apps to "no policy". Callers must not modify the returned
-    (cached) document.
+    Raises PolicyError if the file is missing (the Hub has never written
+    one, or the volume is gone: no method is on and no template is known,
+    contract §4) or fails validate_policy_doc() (not a JSON object, a
+    `version` other than POLICY_VERSION — a missing one included —, an
+    unknown or missing key, a malformed rule, …): a broken, foreign or
+    absent policy must not silently downgrade apps to "no policy". Callers
+    must not modify the returned (cached) document.
     """
     doc, error = _read_policy_doc()
     if doc is None:
-        return {}
+        raise PolicyError(f"no policy file ({POLICY_FILE}): the Hub has not published one")
     if error:
         raise PolicyError(error)
     return doc
@@ -1179,7 +1386,7 @@ class Metrics:
     HELP = {
         "group_gate_requests_total": ("counter", "Forward-auth decisions by endpoint (gate|authenticated|public_guard) and result (allow|deny|stepup)."),
         "group_gate_denials_total": ("counter", "Denied requests by reason."),
-        "group_gate_stepups_total": ("counter", "Step-up (re-authentication) answers by reason."),
+        "group_gate_stepups_total": ("counter", "Sign-in pages (403) by reason: stepup, present_certificate, needs_stronger."),
         "group_gate_policy_load_errors_total": ("counter", "Requests denied because the Hub policy file or a policy in it is invalid."),
         "group_gate_crl_fetch_failures_total": ("counter", "Failed CRL fetches (the last good CRL is kept)."),
     }
@@ -1478,105 +1685,32 @@ def decode_jwt_payload(token: str) -> dict:
     return claims if isinstance(claims, dict) else {}
 
 
-def resolve_policy(policy_doc: dict, host: str) -> Optional[dict]:
-    """Return {factors, op} for this host (exact key; a core host never
-    takes one from the file), or the default, or None if no policy is
-    configured."""
-    if not policy_doc:
-        return None
-    policies = policy_doc.get("policies") or {}
-    if not isinstance(policies, dict):
-        raise PolicyError("'policies' is not an object")
-    if host in policies and host not in core_hosts():
-        policy = policies[host]
-        if not isinstance(policy, dict):
-            raise PolicyError(f"policy for {host!r} is not an object")
-        return policy
-    default = policy_doc.get("default")
-    if default is None:
-        return None
-    if not isinstance(default, dict):
-        raise PolicyError("'default' is not an object")
-    if default.get("factors") is not None:
-        return default
-    return None
+def rule_for_host(doc: dict, host: str) -> Optional[dict]:
+    """The compiled rule of the normalised host's template (contract §4
+    "How group-gate decides"): `core[host]` for a gated core host (missing
+    = None: deny), the default for `auth.<domain>` (the Keycloak admin
+    console's router; `core` never lists it), None for `mcp.<domain>`
+    (never gated here); else `hosts[host]`, else `default`. A validated
+    document only (every named template exists)."""
+    templates = doc["templates"]
+    if host in core_hosts():
+        if host in gated_core_hosts():
+            tid = doc["core"].get(host)
+        elif host == f"auth.{DOMAIN}":
+            tid = doc["default"]
+        else:
+            tid = None
+    else:
+        tid = doc["hosts"].get(host, doc["default"])
+    return templates.get(tid) if tid is not None else None
 
 
-def validate_policy(policy: dict) -> Optional[str]:
-    """Return an error string if the policy is malformed, else None."""
-    factors = policy.get("factors")
-    if factors is None:
-        factors = []
-    if not isinstance(factors, list):
-        return "'factors' is not a list"
-    unknown = [f for f in factors if not isinstance(f, str) or f not in FACTOR_TO_AMR]
-    if unknown:
-        return f"unknown factor(s) {unknown!r}"
-    op = policy.get("op")
-    if op is None:
-        op = ""
-    if not isinstance(op, str) or op.lower() not in VALID_OPS:
-        return f"unknown op {op!r}"
-    return None
-
-
-def evaluate_policy(policy: dict, acr: str, amr: list) -> Tuple[bool, str, int]:
-    """Return (allowed, reason, required_loa).
-
-    required_loa is the LoA the user needs to reach to satisfy the policy;
-    callers can encode it in a stepup URL when allowed=False.
-    """
-    # Callers must run validate_policy() first; unknown names are not
-    # silently dropped here any more.
-    factors = list(policy.get("factors") or [])
-    op = (policy.get("op") or "").lower() or ("any" if len(factors) > 1 else "")
-
-    # No factors = public, allow.
-    if not factors:
-        return True, "public", 0
-
-    amr_set = set(amr or [])
-    needed_amrs = {FACTOR_TO_AMR[f] for f in factors}
-
-    if op == "all":
-        required_loa = max(FACTOR_TO_LOA[f] for f in factors)
-        if needed_amrs.issubset(amr_set):
-            return True, f"all factors present (amr={sorted(amr_set)})", required_loa
-        missing = sorted(needed_amrs - amr_set)
-        return False, f"need all of {sorted(needed_amrs)}, missing {missing}", required_loa
-
-    # op == "any" (or len == 1)
-    required_loa = min(FACTOR_TO_LOA[f] for f in factors)
-    if amr_set & needed_amrs:
-        return True, f"amr {sorted(amr_set & needed_amrs)} satisfies any-of {sorted(needed_amrs)}", required_loa
-    return False, f"need any of {sorted(needed_amrs)}, have {sorted(amr_set)}", required_loa
-
-
-def policy_relies_on_mtls(policy: dict, amr: list) -> bool:
-    """True if the (already satisfied) policy is satisfied only through the
-    mtls factor: `all` with mtls in it, or `any` where mtls is the only
-    required factor present in amr."""
-    factors = list(policy.get("factors") or [])
-    if "mtls" not in factors:
-        return False
-    op = (policy.get("op") or "").lower() or ("any" if len(factors) > 1 else "")
-    if op == "all" or len(factors) == 1:
-        return True
-    amr_set = set(amr or [])
-    others = {FACTOR_TO_AMR[f] for f in factors if f != "mtls"}
-    return not (amr_set & others)
-
-
-def stepup_url(host: str, needed_loa: int, factors: list, extra: bool = False) -> str:
-    """Build a step-up URL that asks oauth2-proxy for a fresh login at the
-    required Level of Authentication (contract §5 "Step-up URL").
-
-    We pass `acr_values=<acr>` to /oauth2/start, which oauth2-proxy forwards
-    to Keycloak's authorize endpoint. No `prompt=login`: Keycloak's cookie
-    authenticator already runs the flow when the requested LoA is above the
-    session's (LoA step-up), and then asks only for the levels not reached
-    yet — a full re-authentication would ask again for factors the session
-    already has.
+def stepup_url(host: str, method: str, extra: bool) -> str:
+    """The step-up URL (contract §5 "Step-up URL"): oauth2-proxy's
+    /oauth2/start with `pc_method=<method>` (one of the six method ids or
+    `passkey`; oauth2-proxy's loginURLParameters allow exactly those and
+    Keycloak hands it to the extension as a client note), which asks for
+    that one method on top of the Keycloak session's.
 
     Main-domain and core hosts: on auth.<domain> (router oauth2-callback,
     forward-auth), never on the app's own host — a host-less
@@ -1590,23 +1724,158 @@ def stepup_url(host: str, needed_loa: int, factors: list, extra: bool = False) -
     (portcullis-oauth2-<instance>_<router>); `rd=/` is relative, so it
     needs no whitelist and can only land on the same host.
 
-    No sign_out in the chain: the browser still has oauth2-proxy's cookie
-    but we want Keycloak to issue a *new* token reflecting the step-up, not
-    to delete the old session.
+    No sign_out and no prompt=login in the chain: the browser keeps
+    oauth2-proxy's cookie and Keycloak's session, so Keycloak asks only
+    for the one method and issues a new token whose amr has both.
     """
-    loa_to_acr = {0: "public", 1: "pwd", 2: "hwk", 3: "mtls"}
-    acr = loa_to_acr.get(needed_loa, "pwd")
+    if method not in STEPUP_METHODS:
+        raise ValueError(f"not a step-up method: {method!r}")
     if extra:
-        return f"https://{host}/oauth2/start?" + urllib.parse.urlencode({"acr_values": acr, "rd": "/"})
-    query = urllib.parse.urlencode({"acr_values": acr, "rd": f"https://{host}/"})
+        return f"https://{host}/oauth2/start?" + urllib.parse.urlencode({"pc_method": method, "rd": "/"})
+    query = urllib.parse.urlencode({"pc_method": method, "rd": f"https://{host}/"})
     return f"https://auth.{DOMAIN}/oauth2/start?{query}"
 
 
-def safe_factor_name(amr: str) -> str:
-    for factor, amr_value in FACTOR_TO_AMR.items():
-        if amr_value == amr:
-            return factor
-    return amr
+# ── Step-up, present-certificate and needs-stronger pages (contract §5) ──
+# The needs-stronger copy is the Keycloak extension's
+# (portcullis-keycloak: messages_en.properties `portcullis*`,
+# portcullis-needs-stronger.ftl, NeedsStronger.java): same words, same
+# lines, same element ids, so both pages read alike.
+
+# portcullisMethod_<id> (every portcullisArticle_<id> is "a"); "passkey"
+# is the step-up's any-passkey-kind ask.
+METHOD_WORDS = {"password": "password", "passkey_synced": "passkey", "browser_cert": "browser certificate",
+                "passkey_device": "device-bound passkey", "security_key": "security key",
+                "yubikey_cert": "YubiKey certificate", "passkey": "passkey"}
+
+SIGNIN_CSS = PORTAL_CSS + (
+    "h1{margin-bottom:1rem}p{margin:.75rem 0}ul{margin:.5rem 0 .75rem 1.5rem}"
+    ".btn{display:inline-block;background:#2563eb;color:#fff;padding:.5rem 1.1rem;border-radius:.4rem;"
+    "font-weight:600;margin-right:.5rem}.btn:hover{text-decoration:none;background:#1d4ed8}"
+    ".portcullis-sub{color:#94a3b8}"
+)
+SIGNIN_CSP = ("default-src 'none'; style-src 'sha256-"
+              + base64.b64encode(hashlib.sha256(SIGNIN_CSS.encode()).digest()).decode()
+              + "'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+
+
+def _canonical(methods) -> List[str]:
+    return [m for m in METHOD_IDS if m in methods]
+
+
+def _methods_html(methods, bold: bool = False) -> str:
+    """"a <b>password</b> and a <b>security key</b>" (the ftl's `methods`
+    macro: only the method words bold, where asked)."""
+    words = (html.escape(METHOD_WORDS[m]) for m in methods)
+    return " and ".join(f"a <b>{w}</b>" if bold else f"a {w}" for w in words)
+
+
+def account_url(domain: str) -> str:
+    """Keycloak's account console, "Signing in" (passkeys are managed on
+    the main domain only)."""
+    return f"https://auth.{domain}/realms/portcullis/account/account-security/signing-in"
+
+
+def app_name(host: str) -> str:
+    """The app's name from portal-apps.json (the first app with a URL on
+    `host`), else the host."""
+    apps, _ = load_portal_apps()
+    for a in apps or []:
+        for u in a.get("urls") or []:
+            url = u.get("url") if isinstance(u, dict) else None
+            if not isinstance(url, str):
+                continue
+            try:
+                h = (urllib.parse.urlsplit(url).hostname or "").lower()
+            except ValueError:
+                continue
+            name = a.get("name")
+            if h == host and isinstance(name, str) and name.strip():
+                return name
+    return host
+
+
+def _signin_page(title: str, body: str) -> bytes:
+    """A 403 page: no refresh, no script, every value escaped by the caller."""
+    return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+            "<meta name=\"color-scheme\" content=\"dark\">"
+            f"<title>{html.escape(title)}</title><style>{SIGNIN_CSS}</style></head><body>"
+            f"<main class=\"container\"><h1>{html.escape(title)}</h1>{body}</main></body></html>").encode()
+
+
+def render_stepup_page(app: str, method: str, url: str) -> bytes:
+    """"<App> needs <method>" with a Continue button (#stepup-continue) to
+    the step-up URL."""
+    title = f"{app} needs a {METHOD_WORDS[method]}"
+    e_url = html.escape(url, quote=True)
+    return _signin_page(title, f"<p><a id=\"stepup-continue\" class=\"btn\" href=\"{e_url}\" autofocus>Continue</a></p>")
+
+
+def render_certificate_page(app: str) -> bytes:
+    """The present-certificate page (#present-certificate): signing in again
+    can't help, this request must carry the person's own certificate."""
+    return _signin_page(
+        f"{app} needs your YubiKey certificate",
+        "<div id=\"present-certificate\"><p>Insert your YubiKey and reload this page.</p>"
+        "<p class=\"portcullis-sub\">A revoked certificate, or another person&#x27;s, doesn&#x27;t count.</p></div>")
+
+
+def render_needs_page(app: str, have: set, node, set_up: Optional[set], add_stronger: bool, domain: str) -> bytes:
+    """The needs-stronger page (#needs-stronger), NeedsStronger.of's rules:
+    one line per alternative of the rule; "— you don't have one yet" on a
+    line that needs a passkey kind the person hasn't set up (only when
+    `people` knows them: `set_up` None words nothing about it); "Set up a
+    passkey" / "Set up a security key" for a missing passkey kind not set
+    up while `add_stronger` is on or it is no stronger than the session's
+    strongest method, otherwise — and always for passwords and
+    certificates — "or ask your admin"; "Sign-in methods" always."""
+    e = html.escape
+    strongest = max((METHOD_TENTHS[m] for m in have), default=0)
+    known = set_up if set_up is not None else set()
+    lines, missing_all = [], []
+    for alt in alternatives(node):
+        not_set_up = False
+        for m in _canonical(alt):
+            if m in have:
+                continue
+            if m not in missing_all:
+                missing_all.append(m)
+            if m in PASSKEY_KINDS and set_up is not None and m not in known:
+                not_set_up = True
+        sub = " <span class=\"portcullis-sub\">— you don&#x27;t have one yet</span>" if not_set_up else ""
+        lines.append(f"<li>{_methods_html(_canonical(alt))}{sub}</li>")
+    passkey = security_key = ask_admin = False
+    for m in missing_all:
+        if m not in PASSKEY_KINDS:
+            ask_admin = True  # passwords and certificates: only an admin sets them up
+        elif m in known:
+            continue
+        elif add_stronger or METHOD_TENTHS[m] <= strongest:
+            if m == "security_key":
+                security_key = True
+            else:
+                passkey = True
+        else:
+            ask_admin = True
+    e_app = e(app)
+    if have:
+        signed_in = f"You signed in with {_methods_html(_canonical(have), bold=True)}."
+    else:
+        signed_in = f"Your sign-in doesn&#x27;t count for {e_app} yet."
+    acct = e(account_url(domain), quote=True)
+    links = []
+    if passkey:
+        links.append(f"<a id=\"portcullis-set-up-passkey\" class=\"btn\" href=\"{acct}\">Set up a passkey</a>")
+    if security_key:
+        links.append(f"<a id=\"portcullis-set-up-security-key\" class=\"btn\" href=\"{acct}\">Set up a security key</a>")
+    links.append(f"<a id=\"portcullis-sign-in-methods\" href=\"{acct}\">Sign-in methods</a>")
+    if ask_admin:
+        links.append("<span class=\"portcullis-sub\">or ask your admin</span>")
+    return _signin_page(
+        f"{app} needs a stronger sign-in",
+        f"<div id=\"needs-stronger\"><p>{signed_in} {e_app} accepts any one of:</p>"
+        f"<ul>{''.join(lines)}</ul><p>{' '.join(links)}</p></div>")
 
 
 # The one header the signed-in username is read from: set by oauth2-proxy
@@ -1707,87 +1976,81 @@ class Handler(BaseHTTPRequestHandler):
             "policy_error",
         )
 
-    def _stepup(self, host: str, kind: str, user: str, policy: dict, required_loa: int,
-                acr: str, amr: list, reason: str, detail_html: str = "", metric_reason: str = "policy"):
+    def _signin_answer(self, body: bytes, reason: str, log: str, stepup_url_value: str = ""):
+        """403 with a sign-in page (contract §5): never a redirect."""
         METRICS.inc("group_gate_requests_total", endpoint=self._endpoint, result="stepup")
-        METRICS.inc("group_gate_stepups_total", reason=metric_reason)
-        url = stepup_url(host, required_loa, policy.get("factors") or [], extra=kind == "extra")
-        e_url = html.escape(url, quote=True)
-        e_host = html.escape(host)
+        METRICS.inc("group_gate_stepups_total", reason=reason)
         self.send_response(403)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("X-Stepup-URL", url)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", SIGNIN_CSP)
+        self.send_header("Content-Length", str(len(body)))
+        if stepup_url_value:
+            self.send_header("X-Stepup-URL", stepup_url_value)
         self.end_headers()
-        factors = policy.get("factors") or []
-        op = policy.get("op") or "any"
-        have = ", ".join(safe_factor_name(str(a)) for a in amr) or "none"
-        need_desc = f"{op} of: {', '.join(factors)}" if len(factors) > 1 else factors[0] if factors else "authentication"
-        # A hardware factor (passkey / client cert) may be one the user
-        # does not have yet: no auto-redirect then (it would bounce them
-        # straight back into a sign-in they cannot complete), but a
-        # Continue button and, right next to it, how to enrol. Users who
-        # have no passkey yet finish the step-up at LoA 1, so they land
-        # here again until they register one.
-        needs_hardware = any(f in ("mtls", "webauthn") for f in factors)
-        parent = DOMAIN  # passkeys and certificates are managed on the main domain only
-        enrol = []
-        if parent and "webauthn" in factors:
-            account_url = f"https://auth.{parent}/realms/portcullis/account/account-security/signing-in"
-            enrol.append(
-                f"<a href=\"{html.escape(account_url, quote=True)}\" target=\"_blank\" rel=\"noopener\">"
-                "Register a passkey in the account console</a> (Signing in &rarr; Passkey &rarr; Set up)")
-        if parent and "mtls" in factors:
-            enrol.append(
-                f"<a href=\"{html.escape(f'https://enroll.{parent}/', quote=True)}\" target=\"_blank\" rel=\"noopener\">"
-                "Enrol a client certificate</a>")
-        enrollment_block = ""
-        if needs_hardware and enrol:
-            enrollment_block = (
-                "<section aria-labelledby=\"enrol-h\" style=\"background:#fff7ed;border:1px solid #fed7aa;"
-                "padding:.75rem 1rem;border-radius:.5rem;margin-top:1.5rem\">"
-                "<h2 id=\"enrol-h\" style=\"font-size:1.05rem;margin:0 0 .4rem\">No hardware key registered yet?</h2>"
-                f"<p style=\"margin:0\">{' or '.join(enrol)}, then come back and press <b>Continue</b>.</p>"
-                "</section>"
-            )
-        if not detail_html:
-            detail_html = (f"<p><b>{e_host}</b> requires {html.escape(need_desc)}. "
-                           f"Your current session was authenticated with <code>{html.escape(have)}</code>, "
-                           "which does not satisfy the app's policy.</p>")
-        if needs_hardware:
-            refresh = ""
-            action = (f"<p><a id=\"stepup-continue\" class=\"btn\" href=\"{e_url}\" autofocus>Continue</a> "
-                      "to sign in again with the required factor.</p>")
-        else:
-            # Nothing to enrol: bump the user through the fresh authorize
-            # flow after 2 seconds; the link is the accessible fallback.
-            refresh = f"<meta http-equiv=\"refresh\" content=\"2;url={e_url}\">"
-            action = (f"<p>You will be redirected to re-authenticate in a moment. "
-                      f"If nothing happens, <a id=\"stepup-continue\" href=\"{e_url}\">click here</a>.</p>")
-        self.wfile.write(
-            (
-                "<!doctype html><html lang=\"en\"><head>"
-                f"{refresh}"
-                "<title>Additional authentication required</title>"
-                "<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:32rem;"
-                "margin:4rem auto;padding:2rem;color:#1e293b;line-height:1.55}"
-                "h1{font-size:1.5rem;margin:0 0 1rem}"
-                "code{background:#f1f5f9;padding:.15rem .4rem;border-radius:.25rem;font-size:.95em}"
-                "a{color:#1d4ed8}"
-                ".btn{display:inline-block;background:#1d4ed8;color:#fff;padding:.55rem 1.25rem;"
-                "border-radius:.4rem;text-decoration:none;font-weight:600}"
-                ".btn:focus-visible{outline:3px solid #f59e0b;outline-offset:2px}</style></head><body>"
-                "<main><h1>Additional authentication required</h1>"
-                f"{detail_html}"
-                f"{action}"
-                f"{enrollment_block}"
-                "</main></body></html>"
-            ).encode()
-        )
-        print(
-            f"group-gate: STEPUP user={user} host={host} policy={policy} "
-            f"acr={acr!r} amr={amr} reason={reason!r}",
-            flush=True,
-        )
+        self.wfile.write(body)
+        print(f"group-gate: {log}", flush=True)
+
+    def _signin_check(self, doc: dict, host: str, kind: str, username: str,
+                      cert_info: str, cert_ok: bool) -> bool:
+        """The host's sign-in template (contract §4 "How group-gate
+        decides"). True when the request was answered (denied, or one of
+        the step-up / present-certificate / needs-stronger pages); False
+        when the session meets the template.
+
+        `cert_ok`: the request's client certificate (if any) passed the
+        revocation check. `yubikey_cert` counts only when it did, its CN is
+        the session user and the token's preferred_username agrees."""
+        rule = rule_for_host(doc, host)
+        if rule is None:
+            self._deny_policy(username, host, "no sign-in template for this host")
+            return True
+        # Only X-Forwarded-Access-Token: oauth2-proxy sets it on every
+        # forward-auth route and Traefik deletes client copies (it is in
+        # every forwardAuth middleware's authResponseHeaders). Not the
+        # Authorization header: on the Keycloak console's route
+        # (portcullis-auth-console) that one is the client's own, and the
+        # token's signature is not checked here.
+        claims = decode_jwt_payload(self.headers.get("X-Forwarded-Access-Token", "") or "")
+        amr = claims.get("amr")
+        amr = amr if isinstance(amr, list) else []
+        cert_cn = leaf_cert_cn(cert_info) if cert_info else None
+        cert_bound = (cert_ok and bool(cert_info) and claims.get("preferred_username") == username
+                      and cert_cn == username)
+        enabled = set(doc["methods"])
+        have = session_methods(amr, enabled, cert_bound)
+        if rule_satisfied(rule, have):
+            return False
+        app = app_name(host)
+        what = f"user={username} host={host} amr={amr} have={_canonical(have)}"
+        amr_mtls = "mtls" in amr
+        if (amr_mtls and "yubikey_cert" in enabled and not cert_bound
+                and rule_satisfied(rule, have | {"yubikey_cert"})):
+            self._signin_answer(render_certificate_page(app), "present_certificate",
+                                f"PRESENT-CERTIFICATE {what} cert_cn={cert_cn!r} "
+                                f"token_user={claims.get('preferred_username')!r} cert_ok={cert_ok}")
+            return True
+        people = doc["people"]
+        set_up = people.get(username.lower())
+        set_up = set(set_up) if set_up is not None else None
+        method = choose_stepup(rule, have, set_up, amr_mtls=amr_mtls)
+        if method is not None:
+            url = stepup_url(host, method, extra=kind == "extra")
+            self._signin_answer(render_stepup_page(app, method, url), "stepup",
+                                f"STEPUP {what} pc_method={method}", url)
+            return True
+        self._signin_answer(render_needs_page(app, have, rule, set_up, doc["add_stronger"], DOMAIN),
+                            "needs_stronger", f"NEEDS-STRONGER {what} set_up={set_up}")
+        return True
+
+    def _cert_ok(self, cert_serials: List[int]) -> bool:
+        """The presented certificate is not revoked (False when the
+        revocation list can't be read)."""
+        try:
+            revoked = revoked_serials()
+        except RevocationError:
+            return False
+        return bool(cert_serials) and not any(sn in revoked for sn in cert_serials)
 
     _endpoint = "gate"
 
@@ -1801,16 +2064,24 @@ class Handler(BaseHTTPRequestHandler):
         if not user:
             self._deny("Access Denied", "<p>Not signed in.</p>", "DENIED portal reason=no username", "no_user")
             return
-        try:
-            groups -= expired_groups(load_policy_file(), user)
-        except PolicyError as e:
-            # Only a listing (every app enforces access itself): show the
-            # signed-in user nothing group-based rather than deny the page.
-            print(f"group-gate: portal user={user} lists no apps: malformed policy: {e}", flush=True)
-            groups = set()
         if user.lower() in DENY_USERS:
             self._deny("Access Denied", "<p>This account is a service account and cannot sign in.</p>",
                        f"DENIED portal user={user} reason=service account", "service_account")
+            return
+        # The portal is a core page (`core[<domain>]`): its router has no
+        # portcullis-groups, so its template is checked here. A missing or
+        # broken policy file denies (no template is known).
+        cert_info = self.headers.get(CERT_INFO_HEADER, "")
+        try:
+            if not DOMAIN_OK:
+                raise PolicyError(f"PORTCULLIS_DOMAIN={DOMAIN!r} is not a valid hostname")
+            doc = load_policy_file()
+            if self._signin_check(doc, DOMAIN, "core", user, cert_info,
+                                  self._cert_ok(cert_serials_from_info(cert_info)) if cert_info else False):
+                return
+            groups -= expired_groups(doc, user)
+        except PolicyError as e:
+            self._deny_policy(user, DOMAIN, str(e))
             return
         METRICS.inc("group_gate_requests_total", endpoint="portal", result="allow")
         apps, domains = load_portal_apps()
@@ -1967,15 +2238,10 @@ class Handler(BaseHTTPRequestHandler):
             policy_doc = load_policy_file()
             kind = host_kind(host, extra_domains(policy_doc))
             gate = build_group_map(policy_doc)
-            policy = resolve_policy(policy_doc, host)
-            policy_err = validate_policy(policy) if policy else None
             path_rules = path_rules_for(policy_doc, host)
             expired = expired_groups(policy_doc, username)
         except PolicyError as e:
             self._deny_policy(user, host, str(e))
-            return
-        if policy_err:
-            self._deny_policy(user, host, policy_err)
             return
         if kind is None:
             # Neither a core host, nor <label>.<domain>, nor on an enrolled
@@ -1998,49 +2264,11 @@ class Handler(BaseHTTPRequestHandler):
             print(f"group-gate: user={user} expired memberships ignored: {sorted(expired)} "
                   f"(token headers withheld)", flush=True)
 
-        # --- Auth policy check (optional, only when policy is set) ---
-        if policy:
-            access_token = self.headers.get("X-Forwarded-Access-Token", "")
-            if not access_token:
-                auth_header = self.headers.get("Authorization", "")
-                if auth_header.lower().startswith("bearer "):
-                    access_token = auth_header[7:]
-
-            claims = decode_jwt_payload(access_token) if access_token else {}
-            acr = claims.get("acr", "")
-            amr = claims.get("amr") or []
-            if not isinstance(amr, list):
-                amr = []
-
-            allowed, reason, required_loa = evaluate_policy(policy, acr, amr)
-            if not allowed:
-                self._stepup(host, kind, user, policy, required_loa, acr, amr, reason)
-                return
-
-            # --- mTLS binding: amr=mtls is only as good as the cert used NOW ---
-            if policy_relies_on_mtls(policy, amr):
-                # The cert must belong to the same user apps are told about
-                # (X-Forwarded-User = username); the token, from the same
-                # session, must agree.
-                token_user = claims.get("preferred_username")
-                cert_cn = leaf_cert_cn(cert_info) if cert_info else None
-                problem = None
-                if not cert_info or not cert_serials:
-                    problem = "no client certificate on this request"
-                elif token_user != username:
-                    problem = f"token preferred_username {token_user!r} != session user {username!r}"
-                elif cert_cn is None or cert_cn != username:
-                    problem = f"client cert CN {cert_cn!r} != session user {username!r}"
-                if problem:
-                    self._stepup(
-                        host, kind, user, policy, FACTOR_TO_LOA["mtls"], acr, amr,
-                        f"mtls binding: {problem}",
-                        "<p><b>" + e_host + "</b> requires your client certificate (security key) on "
-                        "every request, and it must belong to the signed-in user. Insert your "
-                        "security key, select its certificate when the browser asks, and sign in again.</p>",
-                        metric_reason="mtls_binding",
-                    )
-                    return
+        # --- Sign-in template (every route, /authenticated included). A
+        # revoked certificate was denied above, so one that is still here
+        # passed the revocation check.
+        if self._signin_check(policy_doc, host, kind, username, cert_info, bool(cert_serials)):
+            return
 
         # --- Group check ---
         if not authenticated_only:

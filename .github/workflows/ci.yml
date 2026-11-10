@@ -105,6 +105,37 @@ jobs:
           key: ${{ steps.gg-pip-cache.outputs.cache-primary-key }}
       - name: group-gate unit tests
         run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_group_gate.py
+      # tests/signin_vectors.json drives group-gate's rule evaluator; it must
+      # be a byte copy of the Hub's internal/signin/testdata/vectors.json, on
+      # the same-named Hub branch when it exists (cross-repo feature branches
+      # land together), else main — like portcullis-keycloak's `vectors` job.
+      - name: Shared sign-in vectors match the Hub
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          own=tests/signin_vectors.json
+          url="https://github.com/porelli/portcullis-hub"
+          ref=main
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ]; then
+            # --exit-code: 0 = the branch exists, 2 = it doesn't (then main);
+            # anything else (network, auth) fails rather than comparing main.
+            rc=0
+            git ls-remote --exit-code --heads "$url" "$REF" >/dev/null || rc=$?
+            case "$rc" in
+              0) ref="$REF" ;;
+              2) ;;
+              *) echo "::error::git ls-remote $url $REF failed (exit $rc)"; exit 1 ;;
+            esac
+          fi
+          echo "portcullis-hub: $ref" | tee -a "$GITHUB_STEP_SUMMARY"
+          hub="$RUNNER_TEMP/hub_vectors.json"
+          code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$ref/internal/signin/testdata/vectors.json")
+          [ "$code" = 200 ] || { echo "::error::fetching the Hub's vectors from $ref: HTTP $code"; exit 1; }
+          if ! cmp "$own" "$hub"; then
+            echo "::error::$own differs from portcullis-hub $ref internal/signin/testdata/vectors.json: copy it byte for byte"
+            exit 1
+          fi
+          echo "vectors match portcullis-hub $ref" | tee -a "$GITHUB_STEP_SUMMARY"
       # e2e_filesharing's run_op (busy-409 retry, scrubbing) on a fake Hub:
       # stdlib only, no stack.
       - name: e2e helper unit tests (e2e_fsops)
@@ -2369,11 +2400,21 @@ jobs:
             [ "$HAS" = "$WANT" ] || { echo "FAIL: $c has the portcullis-invite-client scope: $HAS (want $WANT)"; exit 1; }
           done
 
-          # group-gate policy (normally written by the Hub), with the Hub's
-          # fresh-install default: any of [mtls, webauthn]. "app" has no
-          # policy of its own (passkey and cert-only sessions must both pass).
-          printf '%s' '{"version": 5, "default": {"factors": ["mtls", "webauthn"], "op": "any"}, "extra_domains": [],
-            "policies": {"hwk.portcullis.local": {"factors": ["webauthn"], "op": ""}, "mtls.portcullis.local": {"factors": ["mtls"], "op": ""}},
+          # group-gate policy file v6 (normally written by the Hub), with the
+          # Hub's fresh-install methods and Standard default (any passkey or
+          # a YubiKey certificate). "app" has no template of its own
+          # (passkey and cert-only sessions must both pass); every core
+          # page on Standard.
+          printf '%s' '{"version": 6,
+            "methods": ["passkey_device", "passkey_synced", "security_key", "yubikey_cert"],
+            "templates": {"standard": {"op": "any", "items": [{"op": "any", "items": ["passkey_synced", "passkey_device", "security_key"]}, {"op": "any", "items": ["yubikey_cert"]}]},
+                          "e2e-hwk": {"op": "any", "items": ["security_key"]}, "e2e-mtls": {"op": "any", "items": ["yubikey_cert"]}},
+            "default": "standard",
+            "hosts": {"hwk.portcullis.local": "e2e-hwk", "mtls.portcullis.local": "e2e-mtls"},
+            "core": {"portcullis.local": "standard", "directory.portcullis.local": "standard", "enroll.portcullis.local": "standard",
+                     "hub.portcullis.local": "standard", "metrics.portcullis.local": "standard", "people.portcullis.local": "standard",
+                     "traefik.portcullis.local": "standard"},
+            "people": {}, "add_stronger": false, "extra_domains": [],
             "groups": {"app.portcullis.local": "users_e2e", "hwk.portcullis.local": "users_e2e", "mtls.portcullis.local": "users_e2e"},
             "path_groups": {"app.portcullis.local": [{"prefix": "/admin", "group": "admin_e2e"}]}}' \
             | docker run --rm -i -v portcullis_hub_data:/d "$ALPINE" sh -c 'cat > /d/group-gate-policy.json && chmod 644 /d/group-gate-policy.json'
