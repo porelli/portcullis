@@ -12,26 +12,35 @@
 # `signin.reset_core` (actor `cli`); it prints what changed.
 
 # signin_reset_core — the stop / run / start sequence. Never leaves the Hub
-# stopped silently: every failure after the stop starts it again first.
+# stopped silently: every failure (and an interrupt) starts it again first.
 signin_reset_core() {
-  local rc=0
+  local rc=0 out msg
+  out="$(mktemp)"
+  # Set before the stop: an interrupt at any point still starts the Hub.
+  trap 'dc start hub >/dev/null 2>&1 || true; rm -f "$out"; exit 130' INT TERM
   info "Stopping the Hub..."
-  dc stop hub || fail "could not stop the Hub: nothing was reset"
-  # An interrupt between the stop and the start still starts the Hub.
-  trap 'dc start hub >/dev/null 2>&1 || true; exit 130' INT TERM
+  if ! dc stop hub; then
+    dc start hub >/dev/null 2>&1 || true
+    trap - INT TERM; rm -f "$out"
+    fail "could not stop the Hub: the reset didn't run"
+  fi
   info "Resetting the Hub's core sign-in settings (hub signin reset-core)..."
-  dc run --rm --no-deps -T --user "$CT_UID_HUB:$CT_UID_HUB" \
-    --entrypoint /usr/local/bin/hub hub signin reset-core || rc=$?
+  # The one-off carries the service's labels: never a Traefik target.
+  dc run --rm --no-deps -T --user "$CT_UID_HUB:$CT_UID_HUB" --label traefik.enable=false \
+    --entrypoint /usr/local/bin/hub hub signin reset-core >"$out" 2>&1 || rc=$?
+  cat "$out"
+  msg="$(grep -v '^[[:space:]]*$' "$out" | tail -n 1 || true)"
+  rm -f "$out"
   info "Starting the Hub..."
   if ! dc start hub; then
     trap - INT TERM
     if [ "$rc" -ne 0 ]; then
-      fail "hub signin reset-core failed (exit $rc, its message is above) and the Hub could not be started again: run ./portcullis up"
+      fail "hub signin reset-core failed (exit $rc): ${msg:-no message}; the Hub could not be started again: run ./portcullis up"
     fi
     fail "the reset is done, but the Hub could not be started again: run ./portcullis up"
   fi
   trap - INT TERM
-  [ "$rc" -eq 0 ] || fail "hub signin reset-core failed (exit $rc, its message is above): nothing was reset; the Hub is running again"
+  [ "$rc" -eq 0 ] || fail "hub signin reset-core failed (exit $rc): ${msg:-no message}; the Hub was started again"
   ok "Done: hub and people use the Standard template with its methods switched on. Sign in with a passkey or your YubiKey."
 }
 

@@ -1692,24 +1692,40 @@ jobs:
             echo "::warning::the Hub isn't running (its test was skipped) — skipping signin reset-core"; exit 0
           fi
           ALPINE=alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
-          ./portcullis signin reset-core </dev/null >/tmp/reset.out 2>&1 && { echo "FAIL: reset-core without --yes and no tty ran"; exit 1; }
+          SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"
+          hub_ip() { docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q hub)"; }
+          hubadmin() { curl -s -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") "$@"; }
+          method_on() { hubadmin "http://$(hub_ip):8888/api/signin" | jq -r --arg m "$1" '.methods[] | select(.id == $m) | .on'; }
+          # Something for the reset to undo: switch passkey_synced off through the Hub's API
+          # (no administrator has a passkey yet, so the lockout guard lets it through with a warning).
+          code=$(printf '%s' '{"on":false}' | hubadmin -o /tmp/method.json -w '%{http_code}' -X PUT -H 'Content-Type: application/json' \
+                   --data-binary @- "http://$(hub_ip):8888/api/signin/methods/passkey_synced")
+          [ "$code" = 200 ] || { echo "FAIL: switching passkey_synced off answered $code: $(head -c 300 /tmp/method.json)"; exit 1; }
+          [ "$(method_on passkey_synced)" = false ] || { echo "FAIL: passkey_synced still on before the reset"; exit 1; }
+          rc=0; ./portcullis signin reset-core </dev/null >/tmp/reset.out 2>&1 || rc=$?
+          [ "$rc" = 2 ] || { echo "FAIL: reset-core without --yes and no tty exited $rc (want 2)"; cat /tmp/reset.out; exit 1; }
           ./portcullis signin reset-core --yes 2>&1 | tee /tmp/reset.out
-          grep -q 'signin reset-core: nothing to change\|core page \|template standard\|method ' /tmp/reset.out \
-            || { echo "FAIL: reset-core printed nothing of the Hub's"; exit 1; }
+          grep -q 'method passkey_synced: off -> on' /tmp/reset.out || { echo "FAIL: the reset didn't report switching passkey_synced back on"; exit 1; }
+          if grep -q 'nothing to change' /tmp/reset.out; then echo "FAIL: the reset changed nothing"; exit 1; fi
           [ "$(docker inspect -f '{{.State.Running}}' "$(docker compose ps -q hub)")" = true ] || { echo "FAIL: the Hub is not running again"; exit 1; }
-          HUB_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q hub)")
           for i in $(seq 1 30); do
-            [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$HUB_IP:8888/healthz")" = 200 ] && break
+            [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$(hub_ip):8888/healthz")" = 200 ] && break
             [ "$i" -eq 30 ] && { echo "FAIL: hub /healthz after reset-core"; docker compose logs --tail=40 hub; exit 1; }
             sleep 2
           done
-          # Run as the image's user: nothing in hub_data owned by anyone else, and the audit entry.
-          docker run --rm --network none -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'find /d ! -uid 10001 | head -5' > /tmp/not-hub-owned
-          [ ! -s /tmp/not-hub-owned ] || { echo "FAIL: hub_data files not owned by 10001:"; cat /tmp/not-hub-owned; exit 1; }
+          [ "$(method_on passkey_synced)" = true ] || { echo "FAIL: passkey_synced still off after the reset"; exit 1; }
+          # The files the reset wrote (state.yaml is rewritten atomically: a new
+          # inode owned by the run's uid; audit.jsonl appended; the data dir's
+          # lock) must be the Hub user's — a root run would leave them root's.
+          docker run --rm --network none -v portcullis_hub_data:/d:ro "$ALPINE" \
+              stat -c '%n %u:%g' /d/state.yaml /d/audit.jsonl /d/.hub.lock > /tmp/reset-owners
+          cat /tmp/reset-owners
+          [ "$(awk '$2 != "10001:10001"' /tmp/reset-owners)" = "" ] && [ "$(wc -l < /tmp/reset-owners)" = 3 ] \
+            || { echo "FAIL: files the reset wrote aren't owned by 10001:10001"; exit 1; }
           docker run --rm --network none -v portcullis_hub_data:/d:ro "$ALPINE" cat /d/audit.jsonl \
-            | jq -se 'map(select(.action == "signin.reset_core")) | last | .actor == "cli" and .result == "ok"' >/dev/null \
-            || { echo "FAIL: no signin.reset_core audit entry by cli"; exit 1; }
-          echo "PASS: signin reset-core refuses without --yes and a tty, runs as 10001, audits signin.reset_core, starts the Hub again"
+            | jq -se 'map(select(.action == "signin.reset_core")) | last | .actor == "cli" and .result == "ok" and (.detail | contains("method passkey_synced: off -> on"))' >/dev/null \
+            || { echo "FAIL: no signin.reset_core audit entry by cli naming the change"; exit 1; }
+          echo "PASS: signin reset-core refuses without --yes and a tty (exit 2), undoes a method switched off through the API, writes state.yaml / audit.jsonl / .hub.lock as 10001, audits it, starts the Hub again"
 
       - name: Test enrollment UI responds
         run: |

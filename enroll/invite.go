@@ -46,6 +46,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -137,7 +138,7 @@ type inviteService struct {
 	requirePasskey func(string) error
 	// listCertificates lists the issued YubiKey client certificates with
 	// their revocation state (GET /internal/certificates, contract §9.4).
-	listCertificates func() ([]certRecord, error)
+	listCertificates func(context.Context) ([]certRecord, error)
 	now              func() time.Time
 
 	mu          sync.Mutex
@@ -646,10 +647,16 @@ func (s *inviteService) apiAuthorized(w http.ResponseWriter, r *http.Request) bo
 	return true
 }
 
+// certListTimeout bounds one GET /internal/certificates, under the Hub's
+// 20 s client timeout (a var for the tests).
+var certListTimeout = 15 * time.Second
+
 // GET /internal/certificates (contract §9.4): the issued YubiKey (pki_int)
 // client certificates, for the Hub's sign-in inventory. Same bearer as the
 // invite API. Any failure, revocation state included, is a 503: the Hub
 // then treats every certificate as unknown — never a guessed revoked:false.
+// The whole listing runs on the request's context with a certListTimeout
+// deadline; past it the answer is a 503 whatever the listing is doing.
 func (s *inviteService) handleAPICertificates(w http.ResponseWriter, r *http.Request) {
 	if !s.apiAuthorized(w, r) {
 		return
@@ -658,7 +665,27 @@ func (s *inviteService) handleAPICertificates(w http.ResponseWriter, r *http.Req
 		jsonError(w, http.StatusServiceUnavailable, "certificates unavailable")
 		return
 	}
-	certs, err := s.listCertificates()
+	ctx, cancel := context.WithTimeout(r.Context(), certListTimeout)
+	defer cancel()
+	type result struct {
+		certs []certRecord
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		c, err := s.listCertificates(ctx)
+		done <- result{c, err}
+	}()
+	var res result
+	select {
+	case res = <-done:
+	case <-ctx.Done():
+		res.err = fmt.Errorf("listing the certificates: %w", ctx.Err())
+	}
+	certs, err := res.certs, res.err
+	if err == nil && ctx.Err() != nil {
+		err = fmt.Errorf("listing the certificates: %w", ctx.Err())
+	}
 	if err != nil {
 		log.Printf("CERTIFICATES api: %v", err)
 		jsonError(w, http.StatusServiceUnavailable, "cannot read the issued certificates from Vault")

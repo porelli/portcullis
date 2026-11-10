@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/x509"
 	"embed"
 	"encoding/asn1"
@@ -442,11 +443,11 @@ type certRecord struct {
 	Revoked  bool   `json:"revoked"`
 }
 
-func (cfg *Config) issuedCerts() ([]certRecord, error) {
+func (cfg *Config) issuedCerts(ctx context.Context) ([]certRecord, error) {
 	var certs []certRecord
 	err := cfg.vault.do(func(vc *vault.Client) error {
 		var err error
-		certs, err = issuedCertsWith(vc)
+		certs, err = issuedCertsWith(ctx, vc)
 		return err
 	})
 	return certs, err
@@ -458,8 +459,8 @@ func (cfg *Config) issuedCerts() ([]certRecord, error) {
 // a listed serial that can't be read, parsed or whose revocation_time is
 // missing or unreadable fails the whole list, so no certificate is ever
 // reported unrevoked by guess.
-func issuedCertsWith(vc *vault.Client) ([]certRecord, error) {
-	secret, err := vc.Logical().List("pki_int/certs")
+func issuedCertsWith(ctx context.Context, vc *vault.Client) ([]certRecord, error) {
+	secret, err := vc.Logical().ListWithContext(ctx, "pki_int/certs")
 	if err != nil {
 		return nil, fmt.Errorf("list pki_int/certs: %w", err)
 	}
@@ -476,7 +477,10 @@ func issuedCertsWith(vc *vault.Client) ([]certRecord, error) {
 		if !ok || serial == "" || strings.ContainsAny(serial, "/?#") {
 			return nil, fmt.Errorf("list pki_int/certs: unexpected key %v", k)
 		}
-		cs, err := vc.Logical().Read("pki_int/cert/" + serial)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		cs, err := vc.Logical().ReadWithContext(ctx, "pki_int/cert/"+serial)
 		if err != nil {
 			return nil, fmt.Errorf("read pki_int/cert/%s: %w", serial, err)
 		}

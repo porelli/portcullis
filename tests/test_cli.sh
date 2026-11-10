@@ -586,14 +586,42 @@ for r in $ROUTERS; do
 done
 expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:16"
 expect_eq "no other tls.options in docker-compose.yml" "$(grep -E 'tls\.options:' "$ROOT_DIR/docker-compose.yml" | grep -vc 'authaware@file$' || true)" 0
-# The Hub can't write traefik/: /project is read-only and no rw mount goes under traefik/.
+# The Hub can't write traefik/: /project is read-only and no writable mount
+# (short or long syntax: bind, volume, tmpfs) has traefik in its source or
+# target; the writable ones are exactly these.
 HUB_SVC="$(awk '/^  hub:$/ { f = 1; next } f && /^  [a-z][a-z0-9-]*:$/ { exit } f' "$ROOT_DIR/docker-compose.yml")"
+# hub_writable_mounts <compose-file> — one line "<source> -> <target>" per
+# mount of the hub service that is writable: short syntax without :ro,
+# long syntax (bind, volume, tmpfs) without read_only: true.
+hub_writable_mounts() {
+  awk '
+    function flush() { if (inlong && ro != "true") print (src == "" ? "(" typ ")" : src) " -> " tgt; inlong = 0; src = ""; tgt = ""; ro = ""; typ = "" }
+    /^  hub:$/ { svc = 1; next }
+    svc && /^  [a-z][a-z0-9-]*:$/ { flush(); exit }
+    !svc { next }
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    /^    volumes:$/ { vol = 1; next }
+    vol && /^    [a-z_]+:/ { flush(); vol = 0; next }
+    !vol { next }
+    /^      - type:/ { flush(); inlong = 1; typ = $3; next }
+    /^      - / { flush(); m = $0; sub(/^      - /, "", m); sub(/[[:space:]]+#.*$/, "", m); n = split(m, p, ":")
+                  if (p[n] != "ro") print p[1] " -> " p[2]; next }
+    inlong && /^        source:/ { src = $2 } inlong && /^        target:/ { tgt = $2 } inlong && /^        read_only:/ { ro = $2 }
+    END { flush() }' "$1"
+}
 expect_eq "the hub service mounts nothing under traefik/ read-write" \
-  "$(printf '%s\n' "$HUB_SVC" | grep -E '^[[:space:]]+- [^#]*traefik' | grep -vc ':ro$' || true)" 0
+  "$(hub_writable_mounts "$ROOT_DIR/docker-compose.yml" | grep -c traefik || true)" 0
 expect_eq "the hub mounts the checkout read-only" "$(printf '%s\n' "$HUB_SVC" | grep -c '^      - \.:/project:ro$')" 1
-expect_eq "the Hub's only rw bind mounts are templates/ and appfiles/" \
-  "$(printf '%s\n' "$HUB_SVC" | grep -E '^      - \./' | grep -v ':ro$' | sed 's/^ *- //' | sort | tr '\n' ' ')" \
-  "./appfiles:/project/appfiles:rw ./templates:/project/templates:rw "
+expect_eq "the Hub's writable mounts are exactly templates/, appfiles/, its volumes and the masking tmpfs" \
+  "$(hub_writable_mounts "$ROOT_DIR/docker-compose.yml" | LC_ALL=C sort | tr '\n' ';')" \
+  "(tmpfs) -> /project/backups;(tmpfs) -> /project/secrets;./appfiles -> /project/appfiles;./templates -> /project/templates;hub_data -> /data;hub_secrets -> /secrets;"
+# The check itself catches both syntaxes (planted mounts on a copy).
+awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      - ./traefik/dynamic:/project/traefik/dynamic" }' "$ROOT_DIR/docker-compose.yml" > "$WORK/compose-short.yml"
+awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      - type: bind"; print "        source: ./traefik"; print "        target: /etc/x"; print "        read_only: false" }' "$ROOT_DIR/docker-compose.yml" > "$WORK/compose-long.yml"
+awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      - type: bind"; print "        source: ./traefik"; print "        target: /etc/x"; print "        read_only: true" }' "$ROOT_DIR/docker-compose.yml" > "$WORK/compose-long-ro.yml"
+expect_eq "the traefik mount check catches a short-syntax rw bind" "$(hub_writable_mounts "$WORK/compose-short.yml" | grep -c traefik || true)" 1
+expect_eq "the traefik mount check catches a long-syntax rw bind" "$(hub_writable_mounts "$WORK/compose-long.yml" | grep -c traefik || true)" 1
+expect_eq "the traefik mount check passes a long-syntax read-only bind" "$(hub_writable_mounts "$WORK/compose-long-ro.yml" | grep -c traefik || true)" 0
 
 # config apply leaves tls.yml byte-identical and writes no traefik file.
 CA_ROOT="$WORK/ca-root"
@@ -621,7 +649,9 @@ shift
 [ "$1" = --project-directory ] && shift 2
 echo "dc $*" >> "$SR_CALLS"
 case "$1" in
-  run) echo "core page hub: mine -> standard"; exit "${SR_RUN_RC:-0}" ;;
+  run) if [ -n "${SR_RUN_RC:-}" ]; then echo "signin reset-core: the Hub is running on this data directory"; exit "$SR_RUN_RC"; fi
+       echo "core page hub: mine -> standard" ;;
+  stop) exit "${SR_STOP_RC:-0}" ;;
   start) exit "${SR_START_RC:-0}" ;;
 esac
 exit 0
@@ -635,14 +665,18 @@ sr() {
 sr
 expect_eq "signin reset-core without --yes and no tty refuses" "$RC:$(cat "$SR_CALLS")" "2:"
 SR_WANT="dc stop hub
-dc run --rm --no-deps -T --user 10001:10001 --entrypoint /usr/local/bin/hub hub signin reset-core
+dc run --rm --no-deps -T --user 10001:10001 --label traefik.enable=false --entrypoint /usr/local/bin/hub hub signin reset-core
 dc start hub"
 sr --yes
 expect_eq "signin reset-core --yes runs dc stop hub, dc run --rm --no-deps --entrypoint /usr/local/bin/hub hub signin reset-core, dc start hub (stubbed dc)" "$RC:$(cat "$SR_CALLS")" "0:$SR_WANT"
 case "$OUT" in *"core page hub: mine -> standard"*) t_pass "signin reset-core shows the Hub's output" ;; *) t_fail "signin reset-core output: $OUT" ;; esac
 SR_RUN_RC=3 sr --yes
 expect_eq "signin reset-core: a failed run still starts the Hub, then fails" "$RC:$(cat "$SR_CALLS")" "1:$SR_WANT"
-case "$ERR" in *"failed (exit 3"*"Hub is running again"*) t_pass "signin reset-core: the failure names the exit status" ;; *) t_fail "signin reset-core failure: $ERR" ;; esac
+case "$ERR" in *"failed (exit 3): signin reset-core: the Hub is running on this data directory; the Hub was started again"*) t_pass "signin reset-core: the failure names the exit status and the Hub's message" ;; *) t_fail "signin reset-core failure: $ERR" ;; esac
+case "$OUT$ERR" in *"nothing was reset"*) t_fail "signin reset-core: a failed run claims nothing was reset" ;; *) t_pass "signin reset-core: a failed run never claims nothing was reset" ;; esac
+SR_STOP_RC=1 sr --yes
+expect_eq "signin reset-core: a failed stop starts the Hub again and runs nothing" "$RC:$(cat "$SR_CALLS")" "1:dc stop hub
+dc start hub"
 SR_START_RC=1 sr --yes
 expect_eq "signin reset-core: a failed start fails" "$RC" 1
 case "$ERR" in *"could not be started again"*) t_pass "signin reset-core: a failed start says so" ;; *) t_fail "signin reset-core failed start: $ERR" ;; esac

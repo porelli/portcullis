@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -150,7 +151,7 @@ func getCertificates(s *inviteService, auth string) *httptest.ResponseRecorder {
 func TestInternalCertificatesNeedsBearer(t *testing.T) {
 	s, _ := testInvites(t)
 	called := false
-	s.listCertificates = func() ([]certRecord, error) { called = true; return []certRecord{}, nil }
+	s.listCertificates = func(context.Context) ([]certRecord, error) { called = true; return []certRecord{}, nil }
 	for _, auth := range []string{"", "Bearer ", "Bearer wrong", "Basic " + testAPISecret, testAPISecret, "bearer " + testAPISecret, "Bearer " + testAPISecret + "x"} {
 		if w := getCertificates(s, auth); w.Code != http.StatusUnauthorized {
 			t.Errorf("Authorization %q: %d", auth, w.Code)
@@ -193,7 +194,7 @@ func TestInternalCertificatesLists(t *testing.T) {
 	s, _ := testInvites(t)
 	list := func(order ...string) {
 		vc := certVault(t, data, order)
-		s.listCertificates = func() ([]certRecord, error) { return issuedCertsWith(vc) }
+		s.listCertificates = func(ctx context.Context) ([]certRecord, error) { return issuedCertsWith(ctx, vc) }
 	}
 
 	list("1a:2b", "3c:4d", "5e:6f", "7a:8b", "9c:0d")
@@ -233,8 +234,71 @@ func TestInternalCertificatesLists(t *testing.T) {
 			t.Errorf("%s: %d %s", bad, w.Code, w.Body)
 		}
 	}
-	s.listCertificates = func() ([]certRecord, error) { return nil, errors.New("vault sealed") }
+	s.listCertificates = func(context.Context) ([]certRecord, error) { return nil, errors.New("vault sealed") }
 	if w := getCertificates(s, "Bearer "+testAPISecret); w.Code != http.StatusServiceUnavailable {
 		t.Errorf("vault down: %d", w.Code)
+	}
+}
+
+// The whole listing has a deadline (certListTimeout, under the Hub's 20 s
+// client timeout): a Vault that hangs is a 503, and the listing's context
+// is cancelled — the Vault calls run on it.
+func TestInternalCertificatesDeadline(t *testing.T) {
+	if certListTimeout > 15*time.Second || certListTimeout <= 0 {
+		t.Fatalf("certListTimeout = %v, want (0, 15s]", certListTimeout)
+	}
+	old := certListTimeout
+	certListTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { certListTimeout = old })
+	s, _ := testInvites(t)
+
+	// A listing that ignores its context still gets a 503 at the deadline.
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	s.listCertificates = func(context.Context) ([]certRecord, error) { <-release; return []certRecord{}, nil }
+	start := time.Now()
+	w := getCertificates(s, "Bearer "+testAPISecret)
+	if w.Code != http.StatusServiceUnavailable || time.Since(start) > 2*time.Second {
+		t.Errorf("hung listing: %d after %v", w.Code, time.Since(start))
+	}
+
+	// A Vault that never answers: the real listing's calls are cancelled.
+	hang := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-hang:
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(func() { close(hang); srv.Close() })
+	cfg := vault.DefaultConfig()
+	cfg.Address = srv.URL
+	cfg.MaxRetries = 0
+	vc, err := vault.NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vc.SetToken("t")
+	got := make(chan error, 1)
+	s.listCertificates = func(ctx context.Context) ([]certRecord, error) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("the listing's context has no deadline")
+		}
+		c, err := issuedCertsWith(ctx, vc)
+		got <- err
+		return c, err
+	}
+	start = time.Now()
+	w = getCertificates(s, "Bearer "+testAPISecret)
+	if w.Code != http.StatusServiceUnavailable || time.Since(start) > 2*time.Second {
+		t.Errorf("hanging Vault: %d after %v", w.Code, time.Since(start))
+	}
+	select {
+	case err := <-got:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("the Vault call wasn't cancelled by the deadline: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("the Vault call kept running past the deadline")
 	}
 }
