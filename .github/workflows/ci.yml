@@ -115,27 +115,28 @@ jobs:
         run: |
           own=tests/signin_vectors.json
           url="https://github.com/porelli/portcullis-hub"
+          # The Hub's heads, listed once: a failed listing (network, auth)
+          # fails rather than comparing main. The same-named branch only as
+          # exactly refs/heads/<REF> (ls-remote patterns also match
+          # suffixes), else main; the files are fetched at the commit listed,
+          # so a push in between can't change what is compared.
+          heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
           ref=main
-          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ]; then
-            # --exit-code: 0 = the branch exists, 2 = it doesn't (then main);
-            # anything else (network, auth) fails rather than comparing main.
-            rc=0
-            git ls-remote --exit-code --heads "$url" "$REF" >/dev/null || rc=$?
-            case "$rc" in
-              0) ref="$REF" ;;
-              2) ;;
-              *) echo "::error::git ls-remote $url $REF failed (exit $rc)"; exit 1 ;;
-            esac
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] \
+            && awk -v r="refs/heads/$REF" '$2 == r { f = 1 } END { exit !f }' <<<"$heads"; then
+            ref="$REF"
           fi
-          echo "portcullis-hub: $ref" | tee -a "$GITHUB_STEP_SUMMARY"
+          sha=$(awk -v r="refs/heads/$ref" '$2 == r { print $1 }' <<<"$heads")
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::portcullis-hub has no single commit for refs/heads/$ref"; exit 1; }
+          echo "portcullis-hub: $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
           hub="$RUNNER_TEMP/hub_vectors.json"
-          code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$ref/internal/signin/testdata/vectors.json")
-          [ "$code" = 200 ] || { echo "::error::fetching the Hub's vectors from $ref: HTTP $code"; exit 1; }
+          code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/internal/signin/testdata/vectors.json")
+          [ "$code" = 200 ] || { echo "::error::fetching the Hub's vectors from $ref ($sha): HTTP $code"; exit 1; }
           if ! cmp "$own" "$hub"; then
-            echo "::error::$own differs from portcullis-hub $ref internal/signin/testdata/vectors.json: copy it byte for byte"
+            echo "::error::$own differs from portcullis-hub $ref ($sha) internal/signin/testdata/vectors.json: copy it byte for byte"
             exit 1
           fi
-          echo "vectors match portcullis-hub $ref" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
       # e2e_filesharing's run_op (busy-409 retry, scrubbing) on a fake Hub:
       # stdlib only, no stack.
       - name: e2e helper unit tests (e2e_fsops)
@@ -506,19 +507,20 @@ jobs:
           REF: ${{ github.head_ref || github.ref_name }}
         run: |
           url="https://github.com/porelli/portcullis-hub"
+          # The Hub's heads, listed once: a failed listing (network, auth)
+          # fails rather than comparing main. The same-named branch only as
+          # exactly refs/heads/<REF> (ls-remote patterns also match
+          # suffixes), else main; the files are fetched at the commit listed,
+          # so a push in between can't change what is compared.
+          heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
           ref=main
-          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ]; then
-            # --exit-code: 0 = the branch exists, 2 = it doesn't (then main);
-            # anything else (network, auth) fails rather than comparing main.
-            rc=0
-            git ls-remote --exit-code --heads "$url" "$REF" >/dev/null || rc=$?
-            case "$rc" in
-              0) ref="$REF" ;;
-              2) ;;
-              *) echo "::error::git ls-remote $url $REF failed (exit $rc)"; exit 1 ;;
-            esac
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] \
+            && awk -v r="refs/heads/$REF" '$2 == r { f = 1 } END { exit !f }' <<<"$heads"; then
+            ref="$REF"
           fi
-          echo "portcullis-hub (mcp-gate vectors): $ref" | tee -a "$GITHUB_STEP_SUMMARY"
+          sha=$(awk -v r="refs/heads/$ref" '$2 == r { print $1 }' <<<"$heads")
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::portcullis-hub has no single commit for refs/heads/$ref"; exit 1; }
+          echo "portcullis-hub (mcp-gate vectors): $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
           fail=0
           for pair in \
             "mcp-gate/internal/config/testdata/mcp-gate.json internal/aigate/testdata/mcp-gate.json" \
@@ -526,15 +528,15 @@ jobs:
             "mcp-gate/internal/signin/testdata/signin_vectors.json internal/signin/testdata/vectors.json"; do
             read -r own theirs <<<"$pair"
             hub="$RUNNER_TEMP/hub_$(basename "$own")"
-            code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$ref/$theirs")
-            [ "$code" = 200 ] || { echo "::error::fetching the Hub's $theirs from $ref: HTTP $code"; exit 1; }
+            code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/$theirs")
+            [ "$code" = 200 ] || { echo "::error::fetching the Hub's $theirs from $ref ($sha): HTTP $code"; exit 1; }
             if ! cmp "$own" "$hub"; then
-              echo "::error::$own differs from portcullis-hub $ref $theirs: copy it byte for byte"
+              echo "::error::$own differs from portcullis-hub $ref ($sha) $theirs: copy it byte for byte"
               fail=1
             fi
           done
           [ "$fail" = 0 ] || exit 1
-          echo "mcp-gate vectors match portcullis-hub $ref" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "mcp-gate vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Save the Go module and build cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

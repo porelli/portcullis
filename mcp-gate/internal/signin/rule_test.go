@@ -55,11 +55,21 @@ func TestRuleSharedVectors(t *testing.T) {
 	if err := dec.Decode(&f); err != nil {
 		t.Fatal(err)
 	}
+	// The compiled rules exactly as the file has them, to check the
+	// re-encoding against the vector's own bytes.
+	var raws struct {
+		Cases []struct {
+			Compiled json.RawMessage `json:"compiled"`
+		} `json:"cases"`
+	}
+	if err := json.Unmarshal(raw, &raws); err != nil || len(raws.Cases) != len(f.Cases) {
+		t.Fatalf("raw cases: %v", err)
+	}
 	if f.Version != 1 || len(f.Cases) < 25 {
 		t.Fatalf("version %d, %d cases", f.Version, len(f.Cases))
 	}
 	rejects, evaluated := 0, 0
-	for _, c := range f.Cases {
+	for i, c := range f.Cases {
 		if c.Reject {
 			rejects++
 			if c.Compiled == nil {
@@ -83,13 +93,10 @@ func TestRuleSharedVectors(t *testing.T) {
 		if err := Validate(r); err != nil {
 			t.Errorf("%s: Validate: %v", c.Name, err)
 		}
-		// It re-encodes as the Hub wrote it.
-		var orig struct {
-			Compiled json.RawMessage `json:"compiled"`
-		}
-		_ = json.Unmarshal(mustJSON(t, c), &orig)
-		if got := mustJSON(t, r); !bytes.Equal(compact(t, got), compact(t, orig.Compiled)) {
-			t.Errorf("%s: re-encoded %s, want %s", c.Name, got, orig.Compiled)
+		// It re-encodes as the Hub wrote it (the vector's own bytes).
+		want := raws.Cases[i].Compiled
+		if got := mustJSON(t, r); !bytes.Equal(compact(t, got), compact(t, want)) {
+			t.Errorf("%s: re-encoded %s, want %s", c.Name, got, want)
 		}
 		have := amrMethods(*c.Have)
 		if s := r.Satisfied(have); s != *c.Satisfied {

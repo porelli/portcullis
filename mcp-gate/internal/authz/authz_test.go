@@ -629,3 +629,48 @@ func TestTokenNeverCountsCertificates(t *testing.T) {
 		}
 	}
 }
+
+// Fix round 1: membership is checked before the sign-in rule, so a
+// non-member never learns the resource's sign-in requirement; the people
+// and admin resources (Strong in the vector) refuse a token whose methods
+// don't meet their rule.
+func TestPopulationBeforeSignInRule(t *testing.T) {
+	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	j := newJWKS(t, jose.JSONWebKey{Key: &rsaKey.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"})
+	v := NewVerifier(issuer, j.srv.URL, j.srv.Client())
+	rs := signer{rsaKey, "k1", jose.RS256}
+	later := time.Date(2027, 4, 1, 0, 0, 0, 0, time.UTC)
+	for _, c := range []struct {
+		name, host, scope, user string
+		amr                     []string
+		at                      time.Time
+		status                  int
+		reason                  string
+	}{
+		{"companion non-member, rule unmet", "gitea.example.com", "mcp:gitea.gitea", "carol", []string{"pwd"}, now, 403, "population"},
+		{"companion past expiring, rule unmet", "gitea.example.com", "mcp:gitea.gitea", "bob", []string{"mtls"}, later, 403, "population"},
+		{"companion member, rule unmet", "gitea.example.com", "mcp:gitea.gitea", "alice", []string{"pwd"}, now, 403, "sign_in"},
+		{"people, synced passkey", "people.example.com", "mcp:portcullis.people", "alice", []string{"spk"}, now, 403, "sign_in"},
+		{"people, certificate only", "people.example.com", "mcp:portcullis.people", "alice", []string{"mtls"}, now, 403, "sign_in"},
+		{"people, touch", "people.example.com", "mcp:portcullis.people", "alice", []string{"hwk"}, now, 200, "allow"},
+		{"admin, device-bound passkey", "hub.example.com", "mcp:portcullis.admin", "root", []string{"dpk"}, now, 403, "sign_in"},
+		{"admin, certificate only", "hub.example.com", "mcp:portcullis.admin", "root", []string{"mtls"}, now, 403, "sign_in"},
+		{"admin non-member, rule unmet", "hub.example.com", "mcp:portcullis.admin", "alice", []string{"dpk"}, now, 403, "population"},
+		{"admin, touch", "hub.example.com", "mcp:portcullis.admin", "root", []string{"hwk"}, now, 200, "allow"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			url := "https://" + c.host + "/mcp"
+			claims := with(baseClaims(c.at), "aud", []string{url}, "scope", "openid "+c.scope, "preferred_username", c.user, "amr", c.amr)
+			d := v.Check(context.Background(), loadSnapshot(t), Request{Host: c.host, Path: "/mcp", Authorization: "Bearer " + rs.sign(t, claims), Now: c.at})
+			if d.Status != c.status || d.Reason != c.reason {
+				t.Fatalf("got %d %q, want %d %q", d.Status, d.Reason, c.status, c.reason)
+			}
+			if c.reason == "population" && (d.Message != "not allowed" || strings.Contains(d.Message, "sign-in") || d.WWWAuthenticate != "") {
+				t.Errorf("a non-member's refusal: %+v", d)
+			}
+			if c.reason == "sign_in" && (!strings.HasSuffix(d.Message, " needs a stronger sign-in than this connection has") || d.WWWAuthenticate != "") {
+				t.Errorf("refusal %+v", d)
+			}
+		})
+	}
+}

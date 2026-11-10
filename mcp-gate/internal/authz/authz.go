@@ -162,7 +162,7 @@ func bearer(h string) (string, bool) {
 
 // Check decides one request against the snapshot (§15.2). Order: the
 // configuration, the resource, the token (401), then what the token's
-// person may do (403).
+// person may do (403: scope, population, sign-in rule, Origin).
 func (v *Verifier) Check(ctx context.Context, sn *config.Snapshot, r Request) Decision {
 	if r.BadTarget {
 		return Decision{Status: http.StatusBadRequest, Reason: "bad_target", Message: "bad request target"}
@@ -244,6 +244,13 @@ func (v *Verifier) Check(ctx context.Context, sn *config.Snapshot, r Request) De
 		d.Message = "insufficient scope"
 		return d
 	}
+	// Membership first (as group-gate and the aggregate's admit): a
+	// non-member gets the plain refusal, never a text naming the app's
+	// sign-in requirement.
+	if user == "" || !res.Member(user, r.Now) {
+		d.Reason = "population"
+		return d
+	}
 	// The resource's sign-in rule (§15.2): an unknown amr, inv, a
 	// switched-off method and any certificate count as nothing. A 403
 	// like the other refusals of a valid token, no challenge: signing in
@@ -251,10 +258,6 @@ func (v *Verifier) Check(ctx context.Context, sn *config.Snapshot, r Request) De
 	if !res.Rule.Satisfied(d.Methods) {
 		d.Reason = "sign_in"
 		d.Message = res.Label + " needs a stronger sign-in than this connection has"
-		return d
-	}
-	if user == "" || !res.Member(user, r.Now) {
-		d.Reason = "population"
 		return d
 	}
 	if r.Origin != "" && !slices.Contains(sn.File.AllowedOrigins, r.Origin) {

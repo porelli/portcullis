@@ -610,3 +610,29 @@ func TestConfigV2Strict(t *testing.T) {
 		})
 	}
 }
+
+// Fix round 1: a rule that doesn't decode names its path (resource and
+// "rule"), never the value.
+func TestRuleDecodeErrorNamesPath(t *testing.T) {
+	gate := string(vector(t, "mcp-gate.json"))
+	anchor := "\"rule\": {\n        \"op\": \"any\",\n        \"items\": [\n          \"security_key\",\n          \"yubikey_cert\"\n        ]\n      },"
+	if strings.Count(gate, anchor) != 3 {
+		t.Fatalf("anchor count %d", strings.Count(gate, anchor))
+	}
+	for _, js := range []string{
+		`{"op":"zz-value-x","items":["security_key"]}`,
+		`{"op":"any","items":["security_key"],"zz-value-x":1}`,
+		`{"op":"any","items":[{"zz-value-x":true}]}`,
+		`{"op":"any","items":[17]}`,
+		`["zz-value-x"]`,
+	} {
+		// The admin resource is resources[2].
+		_, err := DecodeFile([]byte(strings.Replace(gate, anchor, `"rule": `+js+`,`, 1)))
+		if err == nil {
+			t.Fatalf("%s accepted", js)
+		}
+		if !strings.HasPrefix(err.Error(), "$.resources[2].rule: ") || strings.Contains(err.Error(), "zz-value-x") {
+			t.Errorf("%s: %v", js, err)
+		}
+	}
+}

@@ -24,7 +24,12 @@ func checkShape(raw []byte, t reflect.Type, path string) error {
 		return fmt.Errorf("%s: null", path)
 	}
 	if reflect.PointerTo(t).Implements(unmarshalerType) {
-		return nil // a leaf with its own decoder (Time)
+		// A leaf with its own decoder (Time, signin.Rule): decoded here
+		// so its refusal names the path. Their errors never quote values.
+		if err := reflect.New(t).Interface().(json.Unmarshaler).UnmarshalJSON(raw); err != nil {
+			return fmt.Errorf("%s: %v", path, err)
+		}
+		return nil
 	}
 	switch t.Kind() {
 	case reflect.Struct:
