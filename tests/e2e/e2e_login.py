@@ -167,9 +167,9 @@ def passkey_flow(page: Page, *, until: str, label: str, stepups: list | None = N
             page.click("#authenticateWebAuthnButton")
             page.wait_for_timeout(1500)
             continue
-        err = page.locator(".pf-m-danger, .alert-error, #input-error, .kc-feedback-text, .error")
+        err = page.locator("#kc-error-message, .pf-m-danger, .alert-error, #input-error, .kc-feedback-text, .error")
         if err.count() and err.first.is_visible():
-            raise AssertionError(f"error page: {err.first.inner_text()!r}")
+            raise AssertionError(f"error page at {page.url.split('?')[0]}: {err.first.inner_text()!r}")
         page.wait_for_timeout(500)
     shot(page, f"{label}-timeout")
     raise AssertionError(f"login did not reach {until} (stuck at {page.url})")
@@ -229,6 +229,9 @@ def main() -> int:
             page.wait_for_url(re.compile(re.escape(AUTH) + r"/realms/portcullis/"), timeout=TIMEOUT_MS)
             shot(page, "redirected")
             assert "client_id=portcullis-forward-auth" in page.url or "login-actions" in page.url, page.url
+            assert page.locator("#kc-error-message").count() == 0, \
+                f"Keycloak's error page instead of the sign-in: {page.inner_text('body')[:200]!r}"
+            assert page.locator("#authenticateWebAuthnButton").count() == 1, "the sign-in page offers no passkey"
             assert page.locator("input[type=password]").count() == 0, "the sign-in page has a password field"
         check("unauthenticated request is redirected to a passkey-only sign-in", unauthenticated_redirect)
 

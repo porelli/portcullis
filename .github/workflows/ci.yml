@@ -1551,6 +1551,18 @@ jobs:
             echo "::warning::Hub image $(docker compose config --format json | jq -r .services.hub.image) cannot be pulled — skipping the Hub test"
             exit 0
           fi
+          # The Hub's admin routes (GET /api/signin here, the sign-in API in
+          # reset-core's step) check the actor in LLDAP with the Hub's service
+          # account, which `portcullis up` reconciles later in this job: set
+          # it up now with the same function.
+          # shellcheck disable=SC1090
+          PORTCULLIS_LIB="$PWD/scripts/lib" bash -c 'set -euo pipefail
+            for l in common network vault pki certs keycloak users domains mcpgate dns config status monitoring backup signin stack; do
+              source "$PORTCULLIS_LIB/$l.sh"
+            done
+            lldap_service_account' | tee /tmp/hub-sa.out
+          grep -qE 'portcullis-hub: password (matches|set from) secrets/hub/lldap/password' /tmp/hub-sa.out \
+            || { echo "FAIL: the Hub's LLDAP service account"; exit 1; }
           docker compose up -d hub
           HUB_CID="$(docker compose ps -q hub)"
           test "$(docker inspect -f '{{json .HostConfig.Binds}}' "$HUB_CID" | grep -c docker.sock)" = 0 || { echo "FAIL: hub mounts docker.sock"; exit 1; }
