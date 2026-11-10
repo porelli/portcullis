@@ -496,6 +496,45 @@ jobs:
           # decoded strictly and re-encoded byte for byte by the tests.
           test -s internal/config/testdata/mcp-gate.json && test -s internal/config/testdata/mcp-credentials.json
           CGO_ENABLED=1 go test -race ./...
+      # mcp-gate's shared vectors are byte copies of the Hub's: the gate
+      # files (contract §15.4, internal/aigate/testdata/) and the sign-in
+      # rule vectors (internal/signin/testdata/vectors.json), on the
+      # same-named Hub branch when it exists, else main — like group-gate's
+      # vectors check above.
+      - name: mcp-gate shared vectors match the Hub
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          url="https://github.com/porelli/portcullis-hub"
+          ref=main
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ]; then
+            # --exit-code: 0 = the branch exists, 2 = it doesn't (then main);
+            # anything else (network, auth) fails rather than comparing main.
+            rc=0
+            git ls-remote --exit-code --heads "$url" "$REF" >/dev/null || rc=$?
+            case "$rc" in
+              0) ref="$REF" ;;
+              2) ;;
+              *) echo "::error::git ls-remote $url $REF failed (exit $rc)"; exit 1 ;;
+            esac
+          fi
+          echo "portcullis-hub (mcp-gate vectors): $ref" | tee -a "$GITHUB_STEP_SUMMARY"
+          fail=0
+          for pair in \
+            "mcp-gate/internal/config/testdata/mcp-gate.json internal/aigate/testdata/mcp-gate.json" \
+            "mcp-gate/internal/config/testdata/mcp-credentials.json internal/aigate/testdata/mcp-credentials.json" \
+            "mcp-gate/internal/signin/testdata/signin_vectors.json internal/signin/testdata/vectors.json"; do
+            read -r own theirs <<<"$pair"
+            hub="$RUNNER_TEMP/hub_$(basename "$own")"
+            code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$ref/$theirs")
+            [ "$code" = 200 ] || { echo "::error::fetching the Hub's $theirs from $ref: HTTP $code"; exit 1; }
+            if ! cmp "$own" "$hub"; then
+              echo "::error::$own differs from portcullis-hub $ref $theirs: copy it byte for byte"
+              fail=1
+            fi
+          done
+          [ "$fail" = 0 ] || exit 1
+          echo "mcp-gate vectors match portcullis-hub $ref" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Save the Go module and build cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

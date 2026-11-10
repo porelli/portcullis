@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "enabled": true,
   "issuer": "https://auth.example.com/realms/portcullis",
   "main_domain": "example.com",
@@ -10,12 +10,12 @@
     "portcullis-ai-generic"
   ],
   "allowed_origins": [],
-  "acr_loa": {
-    "hwk": 2,
-    "mtls": 3,
-    "public": 0,
-    "pwd": 1
-  },
+  "methods": [
+    "passkey_device",
+    "passkey_synced",
+    "security_key",
+    "yubikey_cert"
+  ],
   "limits": {
     "resource_rpm": 120,
     "resource_burst": 30,
@@ -58,7 +58,25 @@
         "gitea.example.com"
       ],
       "app_url": "https://gitea.example.com",
-      "min_loa": 2,
+      "rule": {
+        "op": "any",
+        "items": [
+          {
+            "op": "any",
+            "items": [
+              "passkey_synced",
+              "passkey_device",
+              "security_key"
+            ]
+          },
+          {
+            "op": "any",
+            "items": [
+              "yubikey_cert"
+            ]
+          }
+        ]
+      },
       "upstream": "http://portcullis-mcp-gitea--gitea:8080/mcp",
       "protocol": [
         "2026-07-28",
@@ -113,7 +131,25 @@
         "grafana.example.com"
       ],
       "app_url": "https://grafana.example.com",
-      "min_loa": 2,
+      "rule": {
+        "op": "any",
+        "items": [
+          {
+            "op": "any",
+            "items": [
+              "passkey_synced",
+              "passkey_device",
+              "security_key"
+            ]
+          },
+          {
+            "op": "any",
+            "items": [
+              "yubikey_cert"
+            ]
+          }
+        ]
+      },
       "upstream": "http://portcullis-mcp-grafana--grafana:8000/mcp",
       "protocol": [
         "2025-11-25"
@@ -166,7 +202,13 @@
       "host": "hub.example.com",
       "hosts": [],
       "app_url": "",
-      "min_loa": 2,
+      "rule": {
+        "op": "any",
+        "items": [
+          "security_key",
+          "yubikey_cert"
+        ]
+      },
       "upstream": "",
       "protocol": [],
       "mode": "",
@@ -204,7 +246,13 @@
       "host": "mcp.example.com",
       "hosts": [],
       "app_url": "",
-      "min_loa": 2,
+      "rule": {
+        "op": "any",
+        "items": [
+          "security_key",
+          "yubikey_cert"
+        ]
+      },
       "upstream": "",
       "protocol": [],
       "mode": "",
@@ -245,7 +293,13 @@
       "host": "people.example.com",
       "hosts": [],
       "app_url": "",
-      "min_loa": 2,
+      "rule": {
+        "op": "any",
+        "items": [
+          "security_key",
+          "yubikey_cert"
+        ]
+      },
       "upstream": "",
       "protocol": [],
       "mode": "",

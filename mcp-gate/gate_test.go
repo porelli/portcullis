@@ -70,7 +70,7 @@ func (s *signer) tokenFor(user, aud, scope, azp string) string {
 	n := time.Now()
 	claims, _ := json.Marshal(map[string]any{
 		"iss": "https://auth.example.com/realms/portcullis", "aud": aud,
-		"azp": azp, "typ": "Bearer", "scope": scope, "acr": "hwk",
+		"azp": azp, "typ": "Bearer", "scope": scope, "amr": []string{"hwk"},
 		"preferred_username": user, "exp": n.Add(5 * time.Minute).Unix(), "iat": n.Unix(),
 	})
 	obj, _ := s.sg.Sign(claims)

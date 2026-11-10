@@ -22,6 +22,7 @@ import (
 	"github.com/go-jose/go-jose/v4"
 
 	"github.com/portcullis/mcp-gate/internal/config"
+	"github.com/portcullis/mcp-gate/internal/signin"
 )
 
 const (
@@ -103,7 +104,7 @@ func baseClaims(at time.Time) map[string]any {
 		"azp":                "portcullis-ai-claude",
 		"typ":                "Bearer",
 		"scope":              "openid mcp:gitea.gitea profile",
-		"acr":                "hwk",
+		"amr":                []string{"hwk"},
 		"preferred_username": "Alice",
 		"exp":                at.Add(5 * time.Minute).Unix(),
 		"iat":                at.Add(-time.Second).Unix(),
@@ -200,10 +201,23 @@ func TestTokenMatrix(t *testing.T) {
 		{name: "typ ID", auth: tok(with(base, "typ", "ID")), status: 401, reason: "typ"},
 		{name: "missing scope", auth: tok(with(base, "scope", "openid mcp:grafana.grafana")), status: 403, reason: "scope", www: insufficient},
 		{name: "scope prefix only", auth: tok(with(base, "scope", "mcp:gitea.gitea2")), status: 403, reason: "scope"},
-		{name: "acr pwd", auth: tok(with(base, "acr", "pwd")), status: 403, reason: "loa"},
-		{name: "acr unknown", auth: tok(with(base, "acr", "gold")), status: 403, reason: "loa"},
-		{name: "no acr", auth: tok(with(base, "acr", nil)), status: 403, reason: "loa"},
-		{name: "acr mtls", auth: tok(with(base, "acr", "mtls")), status: 200, reason: "allow"},
+		// The sign-in rule (gitea on Standard, §15.2): amr through the
+		// method table, switched-on methods only, never a certificate.
+		{name: "amr spk", auth: tok(with(base, "amr", []string{"spk"})), status: 200, reason: "allow"},
+		{name: "amr dpk + pwd", auth: tok(with(base, "amr", []string{"pwd", "dpk"})), status: 200, reason: "allow"},
+		{name: "amr pwd (off)", auth: tok(with(base, "amr", []string{"pwd"})), status: 403, reason: "sign_in"},
+		{name: "amr unknown", auth: tok(with(base, "amr", []string{"gold", "HWK", "webauthn"})), status: 403, reason: "sign_in"},
+		{name: "amr inv", auth: tok(with(base, "amr", []string{"inv"})), status: 403, reason: "sign_in"},
+		{name: "no amr", auth: tok(with(base, "amr", nil)), status: 403, reason: "sign_in"},
+		{name: "empty amr", auth: tok(with(base, "amr", []string{})), status: 403, reason: "sign_in"},
+		{name: "amr a string", auth: tok(with(base, "amr", "hwk")), status: 403, reason: "sign_in"},
+		{name: "amr with a number", auth: tok(with(base, "amr", []any{"hwk", 5})), status: 403, reason: "sign_in"},
+		{name: "acr hwk without amr", auth: tok(with(base, "amr", nil, "acr", "hwk")), status: 403, reason: "sign_in"},
+		{name: "amr mtls (never counts)", auth: tok(with(base, "amr", []string{"mtls"})), status: 403, reason: "sign_in"},
+		{name: "amr file (never counts)", auth: tok(with(base, "amr", []string{"file"})), status: 403, reason: "sign_in"},
+		{name: "amr spk switched off", auth: tok(with(base, "amr", []string{"spk"})), mod: func(sn *config.Snapshot, _ *Request) {
+			sn.File.Methods = []string{"passkey_device", "security_key", "yubikey_cert"}
+		}, status: 403, reason: "sign_in"},
 		{name: "not in population", auth: tok(with(base, "preferred_username", "carol")), status: 403, reason: "population"},
 		{name: "no username", auth: tok(with(base, "preferred_username", nil)), status: 403, reason: "population"},
 		{name: "expiring in the future", auth: tok(with(base, "preferred_username", "bob")), status: 200, reason: "allow", wantUser: "bob"},
@@ -576,6 +590,42 @@ func TestUsernameASCIIOnly(t *testing.T) {
 		}
 		if want == 403 && d.User != "" {
 			t.Errorf("%q: accepted as user %q", user, d.User)
+		}
+	}
+}
+
+// §15.2: an MCP client presents no certificate, so a yubikey_cert in the
+// token's amr never meets a rule, even one that lists it: amr [mtls] on
+// any[yubikey_cert, security_key] is a 403 (no challenge); the touch
+// meets it.
+func TestTokenNeverCountsCertificates(t *testing.T) {
+	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	j := newJWKS(t, jose.JSONWebKey{Key: &rsaKey.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"})
+	v := NewVerifier(issuer, j.srv.URL, j.srv.Client())
+	rs := signer{rsaKey, "k1", jose.RS256}
+	rule := signin.Rule{Op: signin.OpAny, Items: []signin.Rule{{Leaf: signin.YubiKeyCert}, {Leaf: signin.SecurityKey}}}
+	for _, c := range []struct {
+		amr    []string
+		status int
+	}{
+		{[]string{"mtls"}, 403},
+		{[]string{"mtls", "file", "inv"}, 403},
+		{[]string{"spk", "mtls"}, 403},
+		{[]string{"mtls", "hwk"}, 200},
+	} {
+		sn := loadSnapshot(t)
+		res, _ := sn.Resource("gitea.example.com", "/mcp")
+		res.Rule = rule
+		tok := rs.sign(t, with(baseClaims(now), "amr", c.amr))
+		d := v.Check(context.Background(), sn, Request{Host: "gitea.example.com", Path: "/mcp", Authorization: "Bearer " + tok, Now: now})
+		if d.Status != c.status {
+			t.Errorf("amr %v: %d %s, want %d", c.amr, d.Status, d.Reason, c.status)
+		}
+		if c.status == 403 && (d.Reason != "sign_in" || d.WWWAuthenticate != "" || d.Message != "Gitea needs a stronger sign-in than this connection has") {
+			t.Errorf("amr %v: refusal %+v", c.amr, d)
+		}
+		if d.Methods[signin.YubiKeyCert] || d.Methods[signin.BrowserCert] {
+			t.Errorf("amr %v: the decision counts a certificate: %v", c.amr, d.Methods)
 		}
 	}
 }

@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/portcullis/mcp-gate/internal/signin"
 )
 
 // Names of the files in the Hub's data directory.
@@ -38,6 +40,10 @@ const (
 	KindPeople    = "portcullis_people"
 )
 
+// FileVersion is mcp-gate.json's version (sign-in methods: gate file v2,
+// each resource's compiled sign-in rule; no acr_loa / min_loa).
+const FileVersion = 2
+
 // Fixed limits of this release (§15.4).
 const (
 	FixedMaxRequestBytes  = 8388608
@@ -50,16 +56,16 @@ const (
 
 // File is mcp-gate.json (§15.4). Field order is the file's key order.
 type File struct {
-	Version        int            `json:"version"`
-	Enabled        bool           `json:"enabled"`
-	Issuer         string         `json:"issuer"`
-	MainDomain     string         `json:"main_domain"`
-	Clients        []string       `json:"clients"`
-	AllowedOrigins []string       `json:"allowed_origins"`
-	ACRLoA         map[string]int `json:"acr_loa"`
-	Limits         Limits         `json:"limits"`
-	CoreHosts      []string       `json:"core_hosts"`
-	Resources      []Resource     `json:"resources"`
+	Version        int        `json:"version"`
+	Enabled        bool       `json:"enabled"`
+	Issuer         string     `json:"issuer"`
+	MainDomain     string     `json:"main_domain"`
+	Clients        []string   `json:"clients"`
+	AllowedOrigins []string   `json:"allowed_origins"`
+	Methods        []string   `json:"methods"` // switched-on sign-in method ids, sorted
+	Limits         Limits     `json:"limits"`
+	CoreHosts      []string   `json:"core_hosts"`
+	Resources      []Resource `json:"resources"`
 
 	index map[string]*Resource // host + path → resource
 }
@@ -90,7 +96,7 @@ type Resource struct {
 	Host       string            `json:"host"`
 	Hosts      []string          `json:"hosts"`
 	AppURL     string            `json:"app_url"`
-	MinLoA     int               `json:"min_loa"`
+	Rule       signin.Rule       `json:"rule"` // compiled sign-in rule (§8.1)
 	Upstream   string            `json:"upstream"`
 	Protocol   []string          `json:"protocol"`
 	Mode       string            `json:"mode"`
@@ -321,8 +327,8 @@ func forbiddenHeader(h string) bool {
 }
 
 func (f *File) validate() error {
-	if f.Version != 1 {
-		return fmt.Errorf("version: not 1")
+	if f.Version != FileVersion {
+		return fmt.Errorf("version: not %d", FileVersion)
 	}
 	if !ValidHostname(f.MainDomain) {
 		return fmt.Errorf("main_domain: invalid")
@@ -344,10 +350,8 @@ func (f *File) validate() error {
 	}); err != nil {
 		return err
 	}
-	for k, v := range f.ACRLoA {
-		if !nonEmpty(k) || v < 0 || v > 3 {
-			return fmt.Errorf("acr_loa: invalid entry")
-		}
+	if err := sortedUnique(f.Methods, "methods", signin.Known); err != nil {
+		return err
 	}
 	l := f.Limits
 	for name, v := range map[string]int64{
@@ -419,6 +423,9 @@ func (r *Resource) validate(f *File) error {
 	if !nonEmpty(r.Label) {
 		return fmt.Errorf("label: empty")
 	}
+	if err := validRule(r.Rule, f.Methods); err != nil {
+		return fmt.Errorf("rule: %w", err)
+	}
 	if err := sortedUnique(r.Clients, "clients", func(c string) bool { return slices.Contains(f.Clients, c) }); err != nil {
 		return fmt.Errorf("%w (each client must be in the top-level clients)", err)
 	}
@@ -476,9 +483,6 @@ func (r *Resource) validate(f *File) error {
 	if strconv.FormatBool(r.Aggregate) != w[2] {
 		return fmt.Errorf("aggregate: must be %s", w[2])
 	}
-	if r.MinLoA != 2 {
-		return fmt.Errorf("min_loa: must be 2")
-	}
 	if r.Instance != "" || r.Companion != "" || r.AppURL != "" || r.Upstream != "" || r.Mode != "" ||
 		len(r.Hosts) != 0 || len(r.Protocol) != 0 || r.Identity != (Identity{Mode: "none"}) ||
 		len(r.Tools.Writes)+len(r.Tools.Confirm)+len(r.Tools.Never) != 0 {
@@ -526,8 +530,10 @@ func (r *Resource) validateCompanion(f *File) error {
 	if r.Mode != "read_only" && r.Mode != "read_write" {
 		return fmt.Errorf("mode: not read_only or read_write")
 	}
-	if r.MinLoA < 0 || r.MinLoA > 2 {
-		return fmt.Errorf("min_loa: outside 0..2 (LoA 3 can't get AI support)")
+	if r.Rule.NeedsCertificate() {
+		// §15.2: no MCP client presents a certificate, so no token could
+		// ever meet it; the Hub never lists such a companion.
+		return fmt.Errorf("rule: needs a client certificate on every alternative")
 	}
 	id := r.Identity
 	if !headerTok.MatchString(id.Header) || forbiddenHeader(id.Header) {
@@ -549,6 +555,27 @@ func (r *Resource) validateCompanion(f *File) error {
 		}
 	default:
 		return fmt.Errorf("identity.mode: not app_token or identity_headers")
+	}
+	return nil
+}
+
+// validRule is §15.4's rule check (the Hub's aigate validRule): a
+// compiled rule (signin.Validate: a group at the top, op all / any, 1–8
+// items per group, depth ≤ 4, ≤ 48 leaves, every leaf a method id) whose
+// every leaf is among methods (the switched-on ones). Errors never quote
+// values.
+func validRule(r signin.Rule, methods []string) error {
+	if err := signin.Validate(r); err != nil {
+		return fmt.Errorf("not a compiled rule")
+	}
+	bad := false
+	r.Leaves(func(m string) {
+		if !slices.Contains(methods, m) {
+			bad = true
+		}
+	})
+	if bad {
+		return fmt.Errorf("a method that isn't in methods")
 	}
 	return nil
 }

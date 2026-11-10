@@ -2,10 +2,10 @@
 // task 5): https://mcp.<d>/mcp, served by the gate itself. One connection
 // gives a person the tools, resources and prompts of every companion they
 // can reach (aggregate: true, in its population and not past expiring,
-// its min_loa met by the token's acr) plus the people resource's tools,
+// its sign-in rule met by the token's methods) plus the people resource's tools,
 // never the delegate tools (G38) and never an admin tool.
 //
-// Per (person, LoA) there is one SDK server whose registry holds the
+// Per (person, sign-in methods, AI client) there is one SDK server whose registry holds the
 // person's aggregate names (a Table, G24: names are never parsed back);
 // changing it is what sends notifications/tools/list_changed (also on
 // subscriptions/listen). Its receiving middleware routes every call to its
@@ -14,7 +14,7 @@
 // result bounds and access-log path as a direct request, with via
 // "aggregate" — and the people tools through an SDK client to the Hub's
 // /mcp/people with the identity headers of §15.7. Each upstream's own
-// population, expiring, min_loa and per-resource limits are checked on
+// population, expiring, sign-in rule and per-resource limits are checked on
 // every request; the aggregate's own audience, scope and clients are
 // authz's.
 //
@@ -45,6 +45,7 @@ import (
 	"github.com/portcullis/mcp-gate/internal/canon"
 	"github.com/portcullis/mcp-gate/internal/config"
 	mcp "github.com/portcullis/mcp-gate/internal/mcpsdk"
+	"github.com/portcullis/mcp-gate/internal/signin"
 )
 
 // Defaults (§15.9: the list is cached 60 s per person).
@@ -58,7 +59,7 @@ const (
 const (
 	maxPages           = 100              // list pages per upstream and kind
 	maxItems           = 1000             // tools / resources / prompts per upstream
-	maxSessionsPerKey  = 16               // live downstream sessions per (person, LoA, client)
+	maxSessionsPerKey  = 16               // live downstream sessions per (person, methods, client)
 	maxFanout          = config.MaxFanout // parallel upstream calls per request (§15.9)
 	maxResponseMessage = 1024
 )
@@ -118,14 +119,19 @@ type Aggregate struct {
 	stopOnce sync.Once
 }
 
-// ekey: one entry per (person, LoA, AI client). The client is part of
-// it because each upstream's own clients decide (Resource.clients,
-// §15.2 / §15.4): two clients of one person can see different apps.
+// ekey: one entry per (person, sign-in methods, AI client). The methods
+// (signin.Key of the token's Decision.Methods) are part of it because each
+// upstream's own rule decides: two tokens of one person signed in with
+// different methods can see different apps. So is the client, because
+// each upstream's own clients decide (Resource.clients, §15.2 / §15.4).
 type ekey struct {
-	user   string
-	loa    int
-	client string
+	user    string
+	methods string
+	client  string
 }
+
+// have is the key's method set (what the token counts for, §15.2).
+func (k ekey) have() map[string]bool { return signin.FromKey(k.methods) }
 
 // ident is the request's identity, from ServeHTTP to the middleware.
 type ident struct {
@@ -135,7 +141,7 @@ type ident struct {
 
 type identKey struct{}
 
-// entry is one person's (at one LoA) SDK server, registry and tables.
+// entry is one person's (for one method set) SDK server, registry and tables.
 type entry struct {
 	key     ekey
 	server  *mcp.Server
@@ -229,7 +235,7 @@ func verifier(ctx context.Context, _ string, _ *http.Request) (*mcp.TokenInfo, e
 	return &mcp.TokenInfo{
 		UserID:     id.user + "\x00" + id.url,
 		Expiration: time.Now().Add(time.Hour),
-		Extra:      map[string]any{"client": id.client, "loa": id.loa},
+		Extra:      map[string]any{"client": id.client, "methods": id.methods},
 	}, nil
 }
 
@@ -305,11 +311,11 @@ func (a *Aggregate) ServeHTTP(w http.ResponseWriter, r *http.Request, d authz.De
 		http.Error(w, "not the aggregate", http.StatusServiceUnavailable)
 		return
 	}
-	if !res.Member(d.User, a.now()) || d.LoA < res.MinLoA {
+	if !res.Member(d.User, a.now()) || !res.Rule.Satisfied(d.Methods) {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	k := ekey{user: d.User, loa: d.LoA, client: d.Client}
+	k := ekey{user: d.User, methods: signin.Key(d.Methods), client: d.Client}
 	e := a.entryFor(k)
 	r = r.WithContext(context.WithValue(r.Context(), identKey{}, ident{ekey: k, url: res.URL}))
 	if r.Header.Get("Mcp-Protocol-Version") >= mcp.ProtocolStateless {
@@ -360,8 +366,8 @@ type upstream struct {
 func (u upstream) label() string { return u.res.Label }
 
 // eligible: the companions with aggregate: true that allow the token's
-// AI client, whose population has the person and whose min_loa the token
-// meets, then the people resource on the same terms (when the Hub is
+// AI client, whose population has the person and whose sign-in rule the
+// token's methods meet, then the people resource on the same terms (when the Hub is
 // wired). Admin resources never.
 func (a *Aggregate) eligible(sn *config.Snapshot, k ekey) []upstream {
 	if !usable(sn) {
@@ -406,8 +412,8 @@ func (a *Aggregate) admit(r *config.Resource, k ekey) (upstream, string) {
 		return upstream{}, "client"
 	case !r.Member(k.user, a.now()):
 		return upstream{}, "population"
-	case k.loa < r.MinLoA:
-		return upstream{}, "loa"
+	case !r.Rule.Satisfied(k.have()):
+		return upstream{}, "sign_in"
 	}
 	return u, ""
 }
@@ -450,9 +456,9 @@ func identOf(req mcp.Request, e *entry) (ident, bool) {
 	if !ok || user != e.key.user {
 		return ident{}, false
 	}
-	loa, _ := ex.TokenInfo.Extra["loa"].(int)
+	methods, _ := ex.TokenInfo.Extra["methods"].(string)
 	client, _ := ex.TokenInfo.Extra["client"].(string)
-	if loa != e.key.loa || client != e.key.client {
+	if methods != e.key.methods || client != e.key.client {
 		return ident{}, false
 	}
 	return ident{ekey: e.key, url: aggURL}, true
@@ -1065,7 +1071,7 @@ func (a *Aggregate) listPeople(ctx context.Context, u upstream, req mcp.Request,
 
 var denyText = map[string]string{
 	"population": "you no longer have access to %s",
-	"loa":        "%s needs a stronger sign-in than this connection has",
+	"sign_in":    "%s needs a stronger sign-in than this connection has",
 	"client":     "%s isn't available to this AI client",
 	"off":        "AI support for %s is off",
 }
@@ -1115,7 +1121,7 @@ func (a *Aggregate) route(ctx context.Context, e *entry, method string, req mcp.
 	}
 	// The name in the table before a refresh: if the refresh drops it,
 	// the refusal is logged with that upstream's own reason (client,
-	// population, loa, off), not as an unknown name.
+	// population, sign_in, off), not as an unknown name.
 	before, hadBefore := lookup()
 	a.ensure(ctx, e, req, id, true)
 	t, found := lookup()
@@ -1276,7 +1282,7 @@ func (a *Aggregate) Reconcile() {
 		e.mu.Lock()
 		idle := len(e.order) == 0 && now.Sub(e.lastUse) > a.cfg.IdleTimeout
 		e.mu.Unlock()
-		if agg == nil || !agg.Member(k.user, now) || k.loa < agg.MinLoA || idle {
+		if agg == nil || !agg.Member(k.user, now) || !agg.Rule.Satisfied(k.have()) || idle {
 			drop = append(drop, e)
 			delete(a.entries, k)
 			continue

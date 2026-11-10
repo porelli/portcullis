@@ -151,7 +151,7 @@ func TestBodyReadDeadline(t *testing.T) {
 	n := time.Now()
 	claims, _ := json.Marshal(map[string]any{
 		"iss": "https://auth.example.com/realms/portcullis", "aud": "https://gitea.example.com/mcp",
-		"azp": "portcullis-ai-claude", "typ": "Bearer", "scope": "mcp:gitea.gitea", "acr": "hwk",
+		"azp": "portcullis-ai-claude", "typ": "Bearer", "scope": "mcp:gitea.gitea", "amr": []string{"hwk"},
 		"preferred_username": "alice", "exp": n.Add(5 * time.Minute).Unix(), "iat": n.Unix(),
 	})
 	obj, _ := sg.Sign(claims)
@@ -215,7 +215,7 @@ func TestAllowedCompanionForwarded(t *testing.T) {
 		n := time.Now()
 		claims, _ := json.Marshal(map[string]any{
 			"iss": "https://auth.example.com/realms/portcullis", "aud": aud,
-			"azp": "portcullis-ai-claude", "typ": "Bearer", "scope": scope, "acr": "hwk",
+			"azp": "portcullis-ai-claude", "typ": "Bearer", "scope": scope, "amr": []string{"hwk"},
 			"preferred_username": "Alice", "exp": n.Add(5 * time.Minute).Unix(), "iat": n.Unix(),
 		})
 		obj, _ := sg.Sign(claims)

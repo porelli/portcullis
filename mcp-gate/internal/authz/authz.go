@@ -1,13 +1,15 @@
 // Package authz decides whether an MCP request may reach its resource
 // (integration contract §15.1–§15.2): the resource from the request's Host
 // and path only, then a Keycloak access token that is valid for exactly
-// that resource, then the person's membership right now.
+// that resource and whose sign-in methods meet its rule, then the
+// person's membership right now.
 //
 // Tokens are never logged, stored or put in a Decision.
 package authz
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"regexp"
@@ -19,6 +21,7 @@ import (
 	"github.com/go-jose/go-jose/v4/jwt"
 
 	"github.com/portcullis/mcp-gate/internal/config"
+	"github.com/portcullis/mcp-gate/internal/signin"
 )
 
 var logf = log.Printf
@@ -90,10 +93,11 @@ type Decision struct {
 	Message      string
 	User, Client string
 	Resource     *config.Resource
-	// LoA is the token's acr mapped through the file's acr_loa (0 for an
-	// unknown acr); the aggregate checks it against each upstream's
-	// min_loa (§15.9).
-	LoA int
+	// Methods are the sign-in methods the token counts for on an MCP
+	// request (signin.TokenMethods: its amr through the method table,
+	// switched-on methods only, never a certificate); the aggregate checks
+	// each upstream's rule against them (§15.9).
+	Methods map[string]bool
 }
 
 // Allowed reports a 200.
@@ -121,11 +125,25 @@ type claims struct {
 	Azp               string           `json:"azp"`
 	Aud               jwt.Audience     `json:"aud"`
 	Scope             string           `json:"scope"`
-	Acr               string           `json:"acr"`
+	Amr               amr              `json:"amr"`
 	PreferredUsername string           `json:"preferred_username"`
 	Exp               *jwt.NumericDate `json:"exp"`
 	Nbf               *jwt.NumericDate `json:"nbf"`
 	Iat               *jwt.NumericDate `json:"iat"`
+}
+
+// amr is the token's amr claim: a list of strings. Anything else (a
+// string, a list with a non-string) decodes as no methods at all, so the
+// token meets no rule (403) rather than failing as a bad token.
+type amr []string
+
+func (a *amr) UnmarshalJSON(b []byte) error {
+	var list []string
+	if json.Unmarshal(b, &list) != nil {
+		list = nil
+	}
+	*a = list
+	return nil
 }
 
 // rawUsername: the token's preferred_username before lowercasing — the
@@ -218,15 +236,21 @@ func (v *Verifier) Check(ctx context.Context, sn *config.Snapshot, r Request) De
 			user = u
 		}
 	}
-	d := Decision{Status: http.StatusForbidden, Message: "not allowed", User: user, Client: c.Azp, Resource: res, LoA: sn.File.ACRLoA[c.Acr]}
+	d := Decision{Status: http.StatusForbidden, Message: "not allowed", User: user, Client: c.Azp, Resource: res,
+		Methods: signin.TokenMethods(c.Amr, sn.File.Methods)}
 	if !slices.Contains(strings.Fields(c.Scope), res.Scope) {
 		d.Reason = "scope"
 		d.WWWAuthenticate = `Bearer error="insufficient_scope", scope="` + res.Scope + `", resource_metadata="` + meta + `"`
 		d.Message = "insufficient scope"
 		return d
 	}
-	if d.LoA < res.MinLoA { // an unknown acr is LoA 0
-		d.Reason = "loa"
+	// The resource's sign-in rule (§15.2): an unknown amr, inv, a
+	// switched-off method and any certificate count as nothing. A 403
+	// like the other refusals of a valid token, no challenge: signing in
+	// again with the same methods wouldn't help.
+	if !res.Rule.Satisfied(d.Methods) {
+		d.Reason = "sign_in"
+		d.Message = res.Label + " needs a stronger sign-in than this connection has"
 		return d
 	}
 	if user == "" || !res.Member(user, r.Now) {

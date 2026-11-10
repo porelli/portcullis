@@ -25,6 +25,7 @@ import (
 	"github.com/portcullis/mcp-gate/internal/config"
 	"github.com/portcullis/mcp-gate/internal/limits"
 	"github.com/portcullis/mcp-gate/internal/portcullis"
+	"github.com/portcullis/mcp-gate/internal/signin"
 )
 
 const hubSecret = "test-hub-secret-0123456789abcdefghijkl"
@@ -345,16 +346,17 @@ func newHarness(t *testing.T, f *config.File, ups map[string]*fakeUp, tweak func
 			http.Error(w, "unknown resource", 404)
 			return
 		}
-		loa := 2
-		if v := r.Header.Get("X-Test-LoA"); v != "" {
-			loa, _ = strconv.Atoi(v)
+		amr := []string{"hwk"}
+		if v := r.Header.Get("X-Test-AMR"); v != "" {
+			amr = strings.Split(v, ",")
 		}
 		r.Header.Set(bridge.RequestIDHeader, fmt.Sprintf("req-%d", h.reqN.Add(1)))
 		client := "portcullis-ai-claude"
 		if v := r.Header.Get("X-Test-Client"); v != "" {
 			client = v
 		}
-		h.a.ServeHTTP(w, r, authz.Decision{Status: 200, Reason: "allow", User: r.Header.Get("X-Test-User"), Client: client, Resource: res, LoA: loa})
+		h.a.ServeHTTP(w, r, authz.Decision{Status: 200, Reason: "allow", User: r.Header.Get("X-Test-User"), Client: client, Resource: res,
+			Methods: signin.TokenMethods(amr, s.File.Methods)})
 	}))
 	t.Cleanup(h.gate.Close)
 	return h
@@ -378,15 +380,15 @@ func (h *harness) eventList() []bridge.Event {
 	return slices.Clone(h.events)
 }
 
-type clientRT struct{ user, loa, client string }
+type clientRT struct{ user, amr, client string }
 
 func (c *clientRT) RoundTrip(r *http.Request) (*http.Response, error) {
 	r = r.Clone(r.Context())
 	r.Host = "mcp.example.com"
 	r.Header.Set("Authorization", "Bearer the-persons-token")
 	r.Header.Set("X-Test-User", c.user)
-	if c.loa != "" {
-		r.Header.Set("X-Test-LoA", c.loa)
+	if c.amr != "" {
+		r.Header.Set("X-Test-AMR", c.amr)
 	}
 	if c.client != "" {
 		r.Header.Set("X-Test-Client", c.client)
@@ -395,17 +397,18 @@ func (c *clientRT) RoundTrip(r *http.Request) (*http.Response, error) {
 	return http.DefaultTransport.RoundTrip(r)
 }
 
-func (h *harness) connect(user, version, loa string, opts *sdk.ClientOptions) *sdk.ClientSession {
+// connect: amr is the token's amr values, comma-separated ("" = hwk).
+func (h *harness) connect(user, version, amr string, opts *sdk.ClientOptions) *sdk.ClientSession {
 	h.t.Helper()
-	return h.connectAs(user, "", version, loa, opts)
+	return h.connectAs(user, "", version, amr, opts)
 }
 
-func (h *harness) connectAs(user, client, version, loa string, opts *sdk.ClientOptions) *sdk.ClientSession {
+func (h *harness) connectAs(user, client, version, amr string, opts *sdk.ClientOptions) *sdk.ClientSession {
 	h.t.Helper()
 	c := sdk.NewClient(&sdk.Implementation{Name: "person", Version: "1"}, opts)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	cs, err := c.Connect(ctx, &sdk.StreamableClientTransport{Endpoint: h.gate.URL + "/mcp", HTTPClient: &http.Client{Transport: &clientRT{user: user, loa: loa, client: client}}, MaxRetries: -1}, &sdk.ClientSessionOptions{ProtocolVersion: version})
+	cs, err := c.Connect(ctx, &sdk.StreamableClientTransport{Endpoint: h.gate.URL + "/mcp", HTTPClient: &http.Client{Transport: &clientRT{user: user, amr: amr, client: client}}, MaxRetries: -1}, &sdk.ClientSessionOptions{ProtocolVersion: version})
 	if err != nil {
 		h.t.Fatalf("connect %s: %v", user, err)
 	}
@@ -573,19 +576,25 @@ func TestAggregateDropsAppOnPopulationChange(t *testing.T) {
 	}
 }
 
-// LoA per fakeUp: the fakeUp's own min_loa against the token's acr.
-func TestAggregateLoAPerUpstream(t *testing.T) {
+// The sign-in rule per upstream (§15.2, §15.9): each upstream's own
+// compiled rule against the token's methods; an unmet rule leaves that
+// upstream's tools out and refuses its calls, and certificates never
+// count.
+func TestAggregatePerUpstreamRule(t *testing.T) {
 	f := vectorFile(t, nil)
 	h := newHarness(t, f, twoApps(t), nil)
-	// grafana min_loa 3 (above what any file may say; the check holds
-	// anyway); the token's acr is hwk (2).
+	// grafana needs a device-bound passkey and a YubiKey touch.
+	both := signin.Rule{Op: signin.OpAll, Items: []signin.Rule{{Leaf: signin.PasskeyDevice}, {Leaf: signin.SecurityKey}}}
 	next := vectorFile(t, nil)
-	resOf(next, "grafana").MinLoA = 3
+	resOf(next, "grafana").Rule = both
 	h.sn.Store(snapshot(next))
-	cs := h.connect("alice", "2025-11-25", "2", nil)
+	cs := h.connect("alice", "2025-11-25", "hwk", nil)
 	got := toolMap(t, cs)
 	if _, ok := got["grafana__search_dashboards"]; ok {
 		t.Errorf("grafana listed: %v", names(got))
+	}
+	if _, ok := got["portcullis__my_apps"]; !ok {
+		t.Errorf("the people tools went too: %v", names(got))
 	}
 	r, err := cs.CallTool(ctx20(t), &sdk.CallToolParams{Name: "grafana__search_dashboards"})
 	if err == nil && !r.IsError {
@@ -594,21 +603,50 @@ func TestAggregateLoAPerUpstream(t *testing.T) {
 	if n := len(h.ups[grafanaUp].headers()); n != 0 {
 		t.Errorf("grafana was asked %d times", n)
 	}
+	// Entries are keyed on the method set: the same person signed in
+	// with both methods sees grafana, at the same time.
+	if _, ok := toolMap(t, h.connect("alice", "2025-11-25", "hwk,dpk", nil))["grafana__search_dashboards"]; !ok {
+		t.Error("grafana missing with both methods")
+	}
+	if _, ok := toolMap(t, cs)["grafana__search_dashboards"]; ok {
+		t.Error("the hwk-only session now lists grafana")
+	}
+	// A certificate never counts on an MCP request: a rule only a
+	// certificate meets (the Hub never writes it for a companion) leaves
+	// grafana out whatever the token's amr says.
+	cert := vectorFile(t, nil)
+	resOf(cert, "grafana").Rule = signin.Rule{Op: signin.OpAny, Items: []signin.Rule{{Leaf: signin.YubiKeyCert}}}
+	h.sn.Store(snapshot(cert))
+	if _, ok := toolMap(t, h.connect("alice", "2025-11-25", "hwk,mtls,file", nil))["grafana__search_dashboards"]; ok {
+		t.Error("a certificate amr met grafana's rule")
+	}
 	// A table built while grafana was allowed: the call is still refused
-	// once its min_loa is above the token's.
+	// once its rule asks for more than the token has.
 	h.sn.Store(snapshot(f))
-	cs2 := h.connect("alice", "2025-11-25", "2", nil)
+	cs2 := h.connect("alice", "2025-11-25", "hwk", nil)
 	if _, ok := toolMap(t, cs2)["grafana__search_dashboards"]; !ok {
-		t.Fatal("grafana missing at LoA 2")
+		t.Fatal("grafana missing on Standard")
 	}
 	before := len(h.ups[grafanaUp].callList())
 	h.sn.Store(snapshot(next))
 	r, err = cs2.CallTool(ctx20(t), &sdk.CallToolParams{Name: "grafana__search_dashboards"})
 	if err == nil && !r.IsError {
-		t.Errorf("call allowed after the LoA rose: %+v", r)
+		t.Errorf("call allowed after the rule rose: %+v", r)
 	}
 	if len(h.ups[grafanaUp].callList()) != before {
 		t.Errorf("grafana called")
+	}
+	// The aggregate's own rule (the hub core template, Strong): a
+	// synced passkey alone doesn't reach it.
+	h.sn.Store(snapshot(f))
+	agg := aggregateOf(h.sn.Load())
+	req := httptest.NewRequest("POST", "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`))
+	req.Header.Set("Mcp-Protocol-Version", "2025-11-25")
+	w := httptest.NewRecorder()
+	h.a.ServeHTTP(w, req, authz.Decision{Status: 200, User: "alice", Client: "portcullis-ai-claude", Resource: agg,
+		Methods: signin.TokenMethods([]string{"spk", "mtls"}, f.Methods)})
+	if w.Code != 403 {
+		t.Errorf("aggregate with spk + mtls: %d", w.Code)
 	}
 }
 
@@ -867,12 +905,13 @@ func TestAggregateRefusals(t *testing.T) {
 	}
 	gitea = resOf(f, "gitea")
 	body := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
+	touch := map[string]bool{signin.SecurityKey: true} // meets every rule of the vector
 	for name, d := range map[string]authz.Decision{
-		"refused":     {Status: 403, User: "alice", Resource: agg, LoA: 2},
-		"no user":     {Status: 200, User: "", Resource: agg, LoA: 2},
-		"outsider":    {Status: 200, User: "mallory", Resource: agg, LoA: 2},
-		"companion":   {Status: 200, User: "alice", Resource: gitea, LoA: 2},
-		"no resource": {Status: 200, User: "alice", LoA: 2},
+		"refused":     {Status: 403, User: "alice", Resource: agg, Methods: touch},
+		"no user":     {Status: 200, User: "", Resource: agg, Methods: touch},
+		"outsider":    {Status: 200, User: "mallory", Resource: agg, Methods: touch},
+		"companion":   {Status: 200, User: "alice", Resource: gitea, Methods: touch},
+		"no resource": {Status: 200, User: "alice", Methods: touch},
 	} {
 		r := httptest.NewRequest("POST", "/mcp", strings.NewReader(body))
 		r.Header.Set("Mcp-Protocol-Version", "2025-11-25")

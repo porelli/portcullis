@@ -56,13 +56,13 @@ func TestVectorRoundTrip(t *testing.T) {
 func TestStrictDecodeRefuses(t *testing.T) {
 	gate := string(vector(t, "mcp-gate.json"))
 	for name, mut := range map[string][2]string{
-		"unknown field":            {`"version": 1,`, `"version": 1, "extra": true,`},
-		"case-variant key":         {`"version": 1,`, `"Version": 1,`},
-		"duplicate key":            {`"version": 1,`, `"version": 1, "version": 1,`},
+		"unknown field":            {`"version": 2,`, `"version": 2, "extra": true,`},
+		"case-variant key":         {`"version": 2,`, `"Version": 2,`},
+		"duplicate key":            {`"version": 2,`, `"version": 2, "version": 2,`},
 		"missing field":            {`"main_domain": "example.com",`, ``},
 		"missing resource field":   {`"label": "Gitea",`, ``},
 		"null list":                {`"allowed_origins": [],`, `"allowed_origins": null,`},
-		"other version":            {`"version": 1,`, `"version": 2,`},
+		"other version":            {`"version": 2,`, `"version": 3,`},
 		"issuer not auth.<d>":      {`"issuer": "https://auth.example.com/realms/portcullis"`, `"issuer": "https://evil.example/realms/portcullis"`},
 		"forward-auth client":      {"\"portcullis-ai-generic\"\n  ],", "\"portcullis-ai-generic\", \"portcullis-forward-auth\"\n  ],"},
 		"client not top-level":     {`"clients": [` + "\n        \"portcullis-ai-claude\",", `"clients": [` + "\n        \"gitea\", \"portcullis-ai-claude\","},
@@ -72,8 +72,6 @@ func TestStrictDecodeRefuses(t *testing.T) {
 		"companion hosts core":     {"\"hosts\": [\n        \"gitea.example.com\"\n      ]", "\"hosts\": [\n        \"gitea.example.com\", \"hub.example.com\"\n      ]"},
 		"bad upstream":             {`"upstream": "http://portcullis-mcp-gitea--gitea:8080/mcp"`, `"upstream": "http://169.254.169.254/latest"`},
 		"fanout 5":                 {`"fanout": 4,`, `"fanout": 5,`},
-		"min_loa 3":                {`"min_loa": 2,` + "\n      \"upstream\": \"http://portcullis-mcp-gitea", `"min_loa": 3,` + "\n      \"upstream\": \"http://portcullis-mcp-gitea"},
-		"aggregate min_loa 1":      {`"min_loa": 2,` + "\n      \"upstream\": \"\",\n      \"protocol\": [],\n      \"mode\": \"\",\n      \"identity\": {\n        \"mode\": \"none\",\n        \"header\": \"\",\n        \"format\": \"\",\n        \"basic_user\": \"\",\n        \"secret_ref\": \"\"\n      },\n      \"tools\": {\n        \"writes\": [],\n        \"confirm\": [],\n        \"never\": []\n      },\n      \"aggregate\": false,\n      \"population\": [\n        \"alice\",\n        \"bob\",", `"min_loa": 1,` + "\n      \"upstream\": \"\",\n      \"protocol\": [],\n      \"mode\": \"\",\n      \"identity\": {\n        \"mode\": \"none\",\n        \"header\": \"\",\n        \"format\": \"\",\n        \"basic_user\": \"\",\n        \"secret_ref\": \"\"\n      },\n      \"tools\": {\n        \"writes\": [],\n        \"confirm\": [],\n        \"never\": []\n      },\n      \"aggregate\": false,\n      \"population\": [\n        \"alice\",\n        \"bob\","},
 		"bad scope":                {`"scope": "mcp:gitea.gitea",`, `"scope": "mcp:all",`},
 		"unsupported protocol":     {"\"2026-07-28\",\n        \"2025-11-25\"", "\"2026-07-28\",\n        \"2025-03-26\""},
 		"unsorted population":      {"\"population\": [\n        \"alice\",\n        \"bob\"\n      ],", "\"population\": [\n        \"bob\",\n        \"alice\"\n      ],"},
@@ -535,5 +533,80 @@ func TestValidUsernameMatchesHub(t *testing.T) {
 		if got := ValidUsername(u); got != want {
 			t.Errorf("%q: %v, want %v", u, got, want)
 		}
+	}
+}
+
+// Gate file v2 (sign-in methods, contract §15.4): version 1, the v1 LoA
+// keys and every rule outside the readers' limits refuse the whole file,
+// exactly as the Hub's aigate validator does.
+func TestConfigV2Strict(t *testing.T) {
+	gate := string(vector(t, "mcp-gate.json"))
+	// The first resource (gitea, a companion) is on Standard; the first
+	// "op": "any" with security_key / yubikey_cert is the admin resource.
+	std := "\"rule\": {\n        \"op\": \"any\",\n        \"items\": [\n          {\n            \"op\": \"any\",\n            \"items\": [\n              \"passkey_synced\",\n              \"passkey_device\",\n              \"security_key\"\n            ]\n          },\n          {\n            \"op\": \"any\",\n            \"items\": [\n              \"yubikey_cert\"\n            ]\n          }\n        ]\n      },"
+	strong := "\"rule\": {\n        \"op\": \"any\",\n        \"items\": [\n          \"security_key\",\n          \"yubikey_cert\"\n        ]\n      },"
+	rule := func(js string) [2]string { return [2]string{std, `"rule": ` + js + `,`} }
+	nine := `{"op":"any","items":["passkey_synced","passkey_device","security_key","yubikey_cert","passkey_synced","passkey_device","security_key","yubikey_cert","security_key"]}`
+	g7 := `{"op":"any","items":["security_key","security_key","security_key","security_key","security_key","security_key","security_key"]}`
+	many := `{"op":"any","items":[` + strings.Repeat(g7+",", 7) + `{"op":"all","items":["security_key"]}]}`
+	for name, mut := range map[string][2]string{
+		"version 1":                     {`"version": 2,`, `"version": 1,`},
+		"acr_loa key":                   {`"methods": [`, `"acr_loa": {"hwk": 2}, "methods": [`},
+		"min_loa key":                   {std, std + ` "min_loa": 2,`},
+		"min_loa instead of rule":       {std, `"min_loa": 2,`},
+		"missing methods":               {"\"methods\": [\n    \"passkey_device\",\n    \"passkey_synced\",\n    \"security_key\",\n    \"yubikey_cert\"\n  ],", ``},
+		"methods unsorted":              {"\"passkey_device\",\n    \"passkey_synced\",", "\"passkey_synced\",\n    \"passkey_device\","},
+		"methods unknown":               {"\"methods\": [\n", "\"methods\": [\n    \"otp\",\n"},
+		"methods amr value":             {"\"methods\": [\n", "\"methods\": [\n    \"hwk\",\n"},
+		"methods family":                {"\"methods\": [\n", "\"methods\": [\n    \"family:passkey\",\n"},
+		"leaf not in methods":           rule(`{"op":"any","items":["password","security_key"]}`),
+		"browser_cert not in methods":   rule(`{"op":"any","items":["browser_cert","security_key"]}`),
+		"family leaf":                   rule(`{"op":"any","items":["family:passkey"]}`),
+		"amr leaf":                      rule(`{"op":"any","items":["hwk"]}`),
+		"inv leaf":                      rule(`{"op":"any","items":["inv"]}`),
+		"leaf at the top":               rule(`"security_key"`),
+		"empty group":                   rule(`{"op":"any","items":["security_key",{"op":"all","items":[]}]}`),
+		"group of 9":                    rule(nine),
+		"depth 5":                       rule(`{"op":"any","items":[{"op":"all","items":[{"op":"any","items":[{"op":"all","items":[{"op":"any","items":["security_key"]}]}]}]}]}`),
+		"more than 48 leaves":           rule(many),
+		"unknown op":                    rule(`{"op":"none","items":["security_key"]}`),
+		"unknown rule key":              rule(`{"op":"any","items":["security_key"],"min_loa":2}`),
+		"duplicate op":                  rule(`{"op":"any","op":"all","items":["security_key"]}`),
+		"missing items":                 rule(`{"op":"any"}`),
+		"null rule":                     rule(`null`),
+		"empty leaf":                    rule(`{"op":"any","items":[""]}`),
+		"number leaf":                   rule(`{"op":"any","items":[2]}`),
+		"companion needs a certificate": rule(`{"op":"all","items":["security_key","yubikey_cert"]}`),
+		"companion certificate only":    rule(`{"op":"any","items":["yubikey_cert"]}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !strings.Contains(gate, mut[0]) {
+				t.Fatalf("mutation anchor %q not in the vector", mut[0])
+			}
+			if _, err := DecodeFile([]byte(strings.Replace(gate, mut[0], mut[1], 1))); err == nil {
+				t.Fatal("accepted")
+			} else {
+				t.Log(err)
+			}
+		})
+	}
+	// Accepted: nested rules within the limits, a group of exactly 8, and
+	// a Portcullis resource whose rule needs a certificate (the residual
+	// of §15.2: no token meets it, every request is refused).
+	for name, mut := range map[string][2]string{
+		"group of 8":            rule(`{"op":"any","items":["passkey_synced","passkey_device","security_key","yubikey_cert","passkey_synced","passkey_device","security_key","yubikey_cert"]}`),
+		"depth 4":               rule(`{"op":"any","items":[{"op":"all","items":[{"op":"any","items":[{"op":"all","items":["security_key"]}]}]}]}`),
+		"certificate or touch":  rule(`{"op":"any","items":["yubikey_cert","security_key"]}`),
+		"admin needs a cert":    {strong, `"rule": {"op":"all","items":["security_key","yubikey_cert"]},`},
+		"passkey and touch all": rule(`{"op":"all","items":["passkey_device","security_key"]}`),
+	} {
+		t.Run("ok/"+name, func(t *testing.T) {
+			if !strings.Contains(gate, mut[0]) {
+				t.Fatalf("mutation anchor %q not in the vector", mut[0])
+			}
+			if _, err := DecodeFile([]byte(strings.Replace(gate, mut[0], mut[1], 1))); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
