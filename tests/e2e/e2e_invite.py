@@ -170,8 +170,15 @@ with sync_playwright() as pw:
         b, page, cdp, aid, counts = browser_page(pw)  # a NEW authenticator
         page.goto(link2, wait_until="domcontentloaded")
         reached, prompts = drive(page)
-        expect(reached and prompts == 0 and counts == {"registered": 1, "asserted": 1},
-               f"re-invite (recovery): a second key registers, steps up and lands ({counts})")
+        # One touch either way. With a spare key the account holds two
+        # passkeys, so Keycloak's step-up lists both in allowCredentials and
+        # Chromium first probes the list silently (a user-presence-free
+        # assertion per entry, which CDP also reports as credentialAsserted;
+        # measured: own only = 1 event, own + another = 2). With
+        # --replace-keys the old key is gone: one entry, one event.
+        want = {"registered": 1, "asserted": 1 if REPLACED else 2}
+        expect(reached and prompts == 0 and counts == want,
+               f"re-invite (recovery): a second key registers, steps up and lands ({counts}, want {want})")
         creds2 = cdp.send("WebAuthn.getCredentials", {"authenticatorId": aid})["credentials"]
         b.close()
         one_touch_login(pw, creds2, "the new key")

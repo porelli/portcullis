@@ -1743,8 +1743,11 @@ jobs:
             code="$(mcp_req "${t%%/*}" "/${t#*/}")"
             if [ "$code" = 503 ] && grep -q 'AI support is off' /tmp/mcp-body; then echo "FAIL: https://$t reached the gate"; exit 1; fi
           done
-          docker compose logs mcp-gate | grep -q 'mcp-gate: listening on :8080' || { echo "FAIL: no listening line"; exit 1; }
-          if docker compose logs mcp-gate | grep -qE 'eyJ|AGE-SECRET-KEY|_oauth2_proxy'; then echo "FAIL: a token, key or cookie in the gate's log"; exit 1; fi
+          # To a file first: under pipefail, `logs | grep -q` fails when grep
+          # exits early and compose gets SIGPIPE.
+          docker compose logs mcp-gate > /tmp/mcp-gate.log 2>&1
+          grep -q 'mcp-gate: listening on :8080' /tmp/mcp-gate.log || { echo "FAIL: no listening line"; tail -20 /tmp/mcp-gate.log; exit 1; }
+          if grep -qE 'eyJ|AGE-SECRET-KEY|_oauth2_proxy' /tmp/mcp-gate.log; then echo "FAIL: a token, key or cookie in the gate's log"; exit 1; fi
           # Refusals reach the access log (one line per request, decision deny:off).
           docker run --rm -v portcullis_mcp_gate_data:/d:ro "$ALPINE" cat /d/access.jsonl > /tmp/gate-access.jsonl
           jq -se 'length >= 3 and all(.decision == "deny:off" and .user == "" and .client == "")' /tmp/gate-access.jsonl >/dev/null \
