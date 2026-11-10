@@ -1,0 +1,36 @@
+# CI-only template for the e2e-signin job (.github/workflows/ci.yml): a
+# native-OIDC app whose Keycloak client the Hub registers, so the instance's
+# sign-in template reaches the Keycloak extension (signin-keycloak.json
+# `clients`, contract §8.1 "Native-OIDC apps"). The test talks to Keycloak
+# with the client directly; whoami only answers the redirect URI. Not a
+# marketplace template: the job hands it to the Hub as a local source.
+name: OIDC echo
+description: A native-OIDC client for the sign-in tests (CI)
+category: misc
+instances: multi
+
+auth:
+  method: native-oidc
+  sso: true
+  group_access: true
+  group_admin: false
+  access_group: users_oidc-echo
+
+env:
+  - key: OIDC_ECHO_SECRET
+    description: Sign-in client secret
+    generate: random
+
+keycloak_clients:
+  - client_id: oidc-echo
+    secret_env: OIDC_ECHO_SECRET
+    redirect_uri: "https://{{HOST_OIDC}}/cb"
+    name: OIDC echo
+
+urls:
+  - label: OIDC echo
+    url: "https://{{HOST_OIDC}}"
+
+# AI support (contract §3.2, required in every manifest): a CI fixture.
+ai:
+  unsupported: "A CI test fixture with no app API for an AI to act through"

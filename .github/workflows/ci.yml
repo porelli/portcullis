@@ -1797,6 +1797,8 @@ jobs:
                    --data-binary @- "http://$(hub_ip):8888/api/signin/methods/passkey_synced")
           [ "$code" = 200 ] || { echo "FAIL: switching passkey_synced off answered $code: $(head -c 300 /tmp/method.json)"; exit 1; }
           [ "$(method_on passkey_synced)" = false ] || { echo "FAIL: passkey_synced still on before the reset"; exit 1; }
+          core_picks() { hubadmin "http://$(hub_ip):8888/api/signin" | jq -c '[.core.hub, .core.people]'; }
+          [ "$(core_picks)" = '["strong","strong"]' ] || { echo "FAIL: hub / people before the reset: $(core_picks) (want Strong, the fresh install's)"; exit 1; }
           rc=0; ./portcullis signin reset-core </dev/null >/tmp/reset.out 2>&1 || rc=$?
           [ "$rc" = 2 ] || { echo "FAIL: reset-core without --yes and no tty exited $rc (want 2)"; cat /tmp/reset.out; exit 1; }
           ./portcullis signin reset-core --yes 2>&1 | tee /tmp/reset.out
@@ -1809,6 +1811,8 @@ jobs:
             sleep 2
           done
           [ "$(method_on passkey_synced)" = true ] || { echo "FAIL: passkey_synced still off after the reset"; exit 1; }
+          # The reset puts hub and people on Standard (contract §8.1 "Lockout guard").
+          [ "$(core_picks)" = '["standard","standard"]' ] || { echo "FAIL: hub / people after the reset: $(core_picks) (want standard)"; exit 1; }
           # The files the reset wrote (state.yaml is rewritten atomically: a new
           # inode owned by the run's uid; audit.jsonl appended; the data dir's
           # lock) must be the Hub user's — a root run would leave them root's.
@@ -1820,7 +1824,7 @@ jobs:
           docker run --rm --network none -v portcullis_hub_data:/d:ro "$ALPINE" cat /d/audit.jsonl \
             | jq -se 'map(select(.action == "signin.reset_core")) | last | .actor == "cli" and .result == "ok" and (.detail | contains("method passkey_synced: off -> on"))' >/dev/null \
             || { echo "FAIL: no signin.reset_core audit entry by cli naming the change"; exit 1; }
-          echo "PASS: signin reset-core refuses without --yes and a tty (exit 2), undoes a method switched off through the API, writes state.yaml / audit.jsonl / .hub.lock as 10001, audits it, starts the Hub again"
+          echo "PASS: signin reset-core refuses without --yes and a tty (exit 2), undoes a method switched off through the API, puts hub / people on standard, writes state.yaml / audit.jsonl / .hub.lock as 10001, audits it, starts the Hub again"
 
       - name: Test enrollment UI responds
         run: |
@@ -3379,6 +3383,365 @@ jobs:
             docker compose -p "$p" down -v 2>/dev/null || true
           done
           docker compose down -v
+
+  # Sign-in methods end to end (contract §5, §8, §8.1): the whole stack plus
+  # the Hub (same-named Hub branch; HUB_DEV=1 with the CI trust list fixture,
+  # mounted from a host directory the test rewrites for the reclassification
+  # case) and the Keycloak image (same-named portcullis-keycloak branch), one
+  # local template source = the CI templates tests/e2e/apps/echo
+  # (forward-auth) and tests/e2e/apps/oidc-echo (native OIDC), instances on
+  # Standard, Basic, YubiKey certificate only, Strong and YubiKey +
+  # certificate. tests/e2e/e2e_signin.py documents the cases: methods on and
+  # off, synced / security-key passkeys, the pc_method step-up, passwords,
+  # native-OIDC templates, TLS following the switches, reclassification, the
+  # cross-user certificate and pc_fresh.
+  e2e-signin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      E2E_DOMAIN: portcullis.local
+      E2E_ARTIFACTS: e2e-artifacts
+      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      APP_HOSTS: echo-std echo-basic echo-cert oidc-strong oidc-all
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Generate .env and the CI override (Pebble, fake DNS provider, the trust list fixture from a host directory)
+        run: |
+          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+            --email ci@portcullis.local --dns-provider none
+          for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
+            val="$(grep "^$v=" .env | cut -d= -f2-)"
+            [ "$v" = KEYCLOAK_ADMIN ] || echo "::add-mask::$val"
+            echo "$v=$val" >> "$GITHUB_ENV"
+          done
+          # The fixture is a copy in a directory (mounted ro): the test
+          # rewrites it in place (reclassify) and the Hub sees each new mtime.
+          mkdir -p /tmp/signin-fixture
+          cp tests/e2e/fixtures/virtual-authenticators.json /tmp/signin-fixture/extra-authenticators.json
+          chmod 755 /tmp/signin-fixture; chmod 644 /tmp/signin-fixture/extra-authenticators.json
+          cat > docker-compose.ci.yml <<'YML'
+          services:
+            # CI only (contract §8.1 "Extra entries"): the Hub's trust list
+            # gets Chromium's virtual authenticator as a security key.
+            hub:
+              environment:
+                HUB_DEV: "1"
+                HUB_SIGNIN_EXTRA_AUTHENTICATORS: /run/portcullis/signin/extra-authenticators.json
+              volumes:
+                - /tmp/signin-fixture:/run/portcullis/signin:ro
+            keycloak:
+              ports:
+                - "127.0.0.1:9000:9000"
+            lldap:
+              ports:
+                - "127.0.0.1:17170:17170"
+            domains:
+              build:
+                args:
+                  GO_TAGS: testprovider
+              environment:
+                ACME_CA_SERVER: https://pebble:14000/dir
+                LEGO_CA_CERTIFICATES: /run/ci/pebble.minica.pem
+                DOMAINS_RESOLVERS: 127.0.0.1:8053
+              volumes:
+                - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
+            pebble:
+              image: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
+              command: ["-config", "/test/config/pebble-config.json", "-dnsserver", "domains:8053"]
+              environment:
+                PEBBLE_VA_NOSLEEP: "1"
+                PEBBLE_WFE_NONCEREJECT: "0"
+              networks: [domains-egress]
+          YML
+          sed -i 's/^          //' docker-compose.ci.yml
+          docker compose config -q
+
+      - name: List the images this job runs
+        run: |
+          {
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
+            grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
+              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
+          } | sort -u > "$RUNNER_TEMP/images.txt"
+      - name: Load images (cached, verified)
+        uses: ./.github/actions/cached-images
+        with:
+          images: ${{ runner.temp }}/images.txt
+          name: e2e-signin
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: enroll
+          tags: portcullis-enroll
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=enroll
+          cache-to: ""
+      - name: Build group-gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: group-gate
+          tags: portcullis-group-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=group-gate
+          cache-to: ""
+      - name: Build the domains service (CI test build, buildx layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: domains
+          tags: portcullis-domains
+          build-args: GO_TAGS=testprovider
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=domains-test
+          cache-to: ""
+      - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: mcp-gate
+          # compose's image name for mcp-gate
+          tags: portcullis-mcp-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=mcp-gate
+          cache-to: ""
+      - name: Hub image (same-named Hub branch → built here, else the published one)
+        uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        uses: ./.github/actions/keycloak-image
+
+      - name: Start the whole stack (Hub with the echo / oidc-echo template source)
+        run: |
+          PEBBLE_IMG=$(docker compose config --format json | jq -r .services.pebble.image)
+          cid="$(docker create "$PEBBLE_IMG")"; docker cp "$cid:/test/certs/pebble.minica.pem" /tmp/pebble.minica.pem; docker rm "$cid" >/dev/null
+          chmod 644 /tmp/pebble.minica.pem
+          docker compose up -d postgres lldap
+          ./portcullis vault init
+          ./portcullis pki setup --with-server-cert
+          ./portcullis config apply --bundle-only
+          printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
+          # The Hub's only template source: the CI templates echo and
+          # oidc-echo, as a local source (path, no URL: never pulled).
+          docker volume create --label com.docker.compose.project=portcullis --label com.docker.compose.volume=hub_data portcullis_hub_data >/dev/null
+          docker run --rm -v portcullis_hub_data:/data -v "$PWD/tests/e2e/apps:/src:ro" "$ALPINE" sh -c '
+            mkdir -p /data/repos/ci && cp -r /src/echo /src/oidc-echo /data/repos/ci/ &&
+            printf "sources:\n  - name: ci\n    url: \"\"\n    path: /data/repos/ci\n" > /data/state.yaml &&
+            chown -R 10001:10001 /data && chmod 600 /data/state.yaml'
+          # shellcheck disable=SC2046
+          docker compose up -d $(docker compose config --services | grep -vx hub)
+          for i in $(seq 1 100); do
+            curl -sf http://127.0.0.1:9000/health/ready >/dev/null && break
+            [ "$i" -eq 100 ] && { echo "FAIL: Keycloak not ready"; docker compose logs --tail=80 keycloak; exit 1; }
+            sleep 3
+          done
+          ./portcullis keycloak configure
+          ./portcullis oidc register
+          ./portcullis up
+          # oauth2-proxy exits while Keycloak is down.
+          docker compose restart forward-auth forward-auth-ext
+          docker compose ps
+          HUB_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q hub)")
+          echo "HUB_IP=$HUB_IP" >> "$GITHUB_ENV"
+          for i in $(seq 1 40); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$HUB_IP:8888/healthz")" = 200 ] && break
+            [ "$i" -eq 40 ] && { echo "FAIL: hub /healthz"; docker compose logs --tail=40 hub; exit 1; }
+            sleep 2
+          done
+
+      - name: Users, groups, templates, instances, certificates, a password (through the Hub's API)
+        run: |
+          set -o pipefail
+          SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
+          hub() { local m="$1" p="$2"; shift 2
+                  curl -s -X "$m" -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") \
+                    -H 'Content-Type: application/json' "$@" "http://$HUB_IP:8888$p"; }
+          hubc() { hub "$@" -o /tmp/hub.out -w '%{http_code}'; }
+          want() { local code="$1" what="$2"
+                   case "$code" in 200|201) ;; *) echo "FAIL: $what: HTTP $code $(head -c 600 /tmp/hub.out)"; docker compose logs --tail=40 hub; exit 1 ;; esac; }
+          # hubop: a lifecycle route's 202, then its op record until done.
+          source tests/e2e/hubop.sh
+          for i in $(seq 1 30); do
+            hub GET /api/templates | jq -e '[.[].id] as $ids | ["echo", "oidc-echo"] - $ids == []' >/dev/null 2>&1 && break
+            [ "$i" -eq 30 ] && { echo "FAIL: the Hub did not load the CI templates: $(hub GET /api/templates | jq -c '[.[].id]')"; docker compose logs --tail=60 hub; exit 1; }
+            sleep 2
+          done
+
+          # People, created with the Hub's own LLDAP service account; root and
+          # sam in lldap_admin (only the CLI invites administrators).
+          LLDAP_TOKEN=$(jq -n --rawfile u secrets/hub/lldap/username --rawfile p secrets/hub/lldap/password \
+              '{username: ($u | rtrimstr("\n")), password: ($p | rtrimstr("\n"))}' \
+            | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          [ -z "$LLDAP_TOKEN" ] || [ "$LLDAP_TOKEN" = null ] || echo "::add-mask::$LLDAP_TOKEN"
+          [ -n "$LLDAP_TOKEN" ] && [ "$LLDAP_TOKEN" != null ] || { echo "FAIL: LLDAP login as the Hub's service account"; exit 1; }
+          gql() { jq -n --arg q "$1" '{query: $q}' | curl -sf http://127.0.0.1:17170/api/graphql \
+                    -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @-; }
+          for u in root sam alice bob pat rita; do
+            gql "mutation { createUser(user: {id: \"$u\", email: \"$u@portcullis.local\"}) { id } }" | jq -e '.errors == null' >/dev/null
+          done
+          gid=$(gql '{ groups { id displayName } }' | jq -r '.data.groups[] | select(.displayName == "lldap_admin") | .id')
+          for u in root sam; do
+            gql "mutation { addUserToGroup(userId: \"$u\", groupId: $gid) { ok } }" | jq -e '.errors == null' >/dev/null
+          done
+
+          # Templates: Basic and YubiKey + certificate on (they start
+          # disabled), e2e-cert = YubiKey certificate only.
+          for t in basic yubikey-and-certificate; do
+            code=$(hubc PUT "/api/signin/templates/$t/enabled" -d '{"on":true}'); want "$code" "enable template $t"
+          done
+          code=$(hubc POST /api/signin/templates -d '{"id":"e2e-cert","name":"YubiKey certificate only","rule":{"op":"any","items":["yubikey_cert"]}}')
+          want "$code" "create the e2e-cert template"
+
+          # Instances (all on the main domain) and their picks, then enable.
+          for spec in "echo echo-std Echo-Std" "echo echo-basic Echo-Basic" "echo echo-cert Echo-Cert" \
+                      "oidc-echo oidc-strong OIDC-Strong" "oidc-echo oidc-all OIDC-All"; do
+            read -r tpl id label <<<"$spec"
+            router="echo"; [ "$tpl" = oidc-echo ] && router="oidc"
+            label="${label//-/ }"
+            hubop POST /api/instances -d "$(jq -cn --arg t "$tpl" --arg id "$id" --arg l "$label" --arg r "$router" --arg h "$id.$E2E_DOMAIN" \
+                '{template: $t, id: $id, label: $l, hosts: {($r): $h}}')" || { echo "FAIL: create $id"; exit 1; }
+          done
+          for pick in echo-basic:basic echo-cert:e2e-cert oidc-strong:strong oidc-all:yubikey-and-certificate; do
+            code=$(hubc PUT "/api/instances/${pick%%:*}/settings" -d "$(jq -cn --arg t "${pick#*:}" '{sign_in_template: $t}')")
+            want "$code" "sign-in template of ${pick%%:*}"
+          done
+          for m in alice:users_echo-std alice:users_echo-cert pat:users_echo-basic; do
+            code=$(hubc POST "/api/directory/groups/${m#*:}/members" -d "$(jq -cn --arg u "${m%%:*}" '{username: $u}')")
+            want "$code" "add $m"
+          done
+          for id in echo-std echo-basic echo-cert oidc-strong oidc-all; do
+            hubop POST /api/templates/enable -d "{\"id\":\"$id\"}" || { echo "FAIL: enable $id"; exit 1; }
+          done
+
+          # What the Hub published: the picks in the policy file, the
+          # native-OIDC clients with their templates in signin-keycloak.json.
+          hub_file() { docker run --rm --network none -v portcullis_hub_data:/d:ro "$ALPINE" cat "/d/$1"; }
+          for i in $(seq 1 30); do
+            hub_file group-gate-policy.json | jq -e --arg d "$E2E_DOMAIN" '.version == 6
+                and .hosts["echo-basic.\($d)"] == "basic" and .hosts["echo-cert.\($d)"] == "e2e-cert"
+                and (.hosts | has("echo-std.\($d)") | not) and .default == "standard"
+                and .core["hub.\($d)"] == "strong" and .core["people.\($d)"] == "strong"' >/dev/null 2>&1 \
+              && hub_file signin-keycloak.json | jq -e '.clients["oidc-strong"] == {template: "strong", name: "OIDC echo · OIDC Strong"}
+                and .clients["oidc-all"] == {template: "yubikey-and-certificate", name: "OIDC echo · OIDC All"}
+                and (.authenticators | has("01020304-0506-0708-0102-030405060708"))
+                and (.methods | index("password") == null)' >/dev/null 2>&1 && break
+            [ "$i" -eq 30 ] && { echo "FAIL: published: $(hub_file group-gate-policy.json | jq -c '{hosts, core, default}') $(hub_file signin-keycloak.json | jq -c '{clients, methods, mds}')"; exit 1; }
+            sleep 2
+          done
+          echo "PASS: policy v6 picks (Basic, e2e-cert, Strong core pages) and signin-keycloak.json clients (oidc-strong Strong, oidc-all YubiKey + certificate)"
+
+          # pat: a Hub-set password only (allowed while the method is off),
+          # kept in a 0600 file, never printed.
+          mkdir -m 700 /tmp/e2e-secrets
+          code=$(hubc POST /api/directory/users/pat/password -d '{"generate":true}')
+          want "$code" "set pat's password"
+          ( umask 077; jq -er .password /tmp/hub.out > /tmp/e2e-secrets/pat.password ) || { echo "FAIL: no generated password"; rm -f /tmp/hub.out; exit 1; }
+          rm -f /tmp/hub.out
+          echo "::add-mask::$(cat /tmp/e2e-secrets/pat.password)"
+
+          # Certificates: root's (all[yubikey_cert, security_key]) and bob's
+          # (the cross-user certificate).
+          VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
+          echo "::add-mask::$VAULT_TOKEN"
+          for u in root bob; do
+            openssl ecparam -name prime256v1 -genkey -noout -out "/tmp/e2e-secrets/$u.key"
+            openssl req -new -key "/tmp/e2e-secrets/$u.key" -subj "/CN=$u" -out "/tmp/e2e-secrets/$u.csr"
+            docker compose exec -T -e VAULT_TOKEN vault vault write -format=json pki_int/sign/client-cert \
+              csr="$(cat "/tmp/e2e-secrets/$u.csr")" common_name="$u" ttl=2h | jq -r .data.certificate > "/tmp/e2e-secrets/$u.crt"
+            openssl x509 -noout -subject -in "/tmp/e2e-secrets/$u.crt"
+          done
+
+          # shellcheck disable=SC2086
+          echo "127.0.0.1 portcullis.local auth.portcullis.local enroll.portcullis.local hub.portcullis.local people.portcullis.local $(printf '%s.portcullis.local ' $APP_HOSTS)" | sudo tee -a /etc/hosts
+          for id in echo-std echo-basic; do
+            for i in $(seq 1 40); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt "https://$id.$E2E_DOMAIN/" || true)
+              case "$code" in 302|401|403) echo "$id routed (HTTP $code)"; break ;; esac
+              [ "$i" -eq 40 ] && { echo "FAIL: $id not routed ($code)"; docker compose logs --tail=40 traefik; exit 1; }
+              sleep 3
+            done
+          done
+
+      - name: Restore the pip / Playwright browser cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/ms-playwright
+          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+
+      - name: Install Playwright (pinned) and trust core's CA
+        run: |
+          python3 -m venv /tmp/e2e-venv
+          /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
+          sudo /tmp/e2e-venv/bin/playwright install-deps chromium
+          /tmp/e2e-venv/bin/playwright install chromium
+          sudo apt-get install -y -qq libnss3-tools >/dev/null
+          mkdir -p "$HOME/.pki/nssdb"
+          certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
+          certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
+
+      - name: Run the sign-in scenarios (methods, passkey kinds, pc_method, passwords, native OIDC, TLS, reclassify, pc_fresh)
+        env:
+          E2E_ROOT_CERT: /tmp/e2e-secrets/root.crt
+          E2E_ROOT_KEY: /tmp/e2e-secrets/root.key
+          E2E_BOB_CERT: /tmp/e2e-secrets/bob.crt
+          E2E_BOB_KEY: /tmp/e2e-secrets/bob.key
+          E2E_PAT_PASSWORD_FILE: /tmp/e2e-secrets/pat.password
+          E2E_FIXTURE: /tmp/signin-fixture/extra-authenticators.json
+        run: |
+          E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
+          export E2E_HUB_SECRET
+          NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_signin.py
+
+      # Keycloak's portcullis-needs-stronger.ftl in core's portcullis theme
+      # (a Keycloak page: no secret on it), kept on success too.
+      - name: Upload the Keycloak needs-stronger screenshot
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-signin-needs-stronger
+          path: e2e-artifacts/signin-screens/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p e2e-artifacts
+          docker compose ps -a > e2e-artifacts/compose-ps.txt 2>&1 || true
+          docker ps -a > e2e-artifacts/docker-ps.txt 2>&1 || true
+          for svc in traefik keycloak forward-auth group-gate lldap hub enroll; do
+            docker compose logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
+          done
+          docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'cat /d/group-gate-policy.json; echo; cat /d/signin-keycloak.json; ls -la /d /d/overrides; cat /d/overrides/*.yml' > e2e-artifacts/hub-data.txt 2>&1 || true
+
+      # The screenshots and HTML of the password pages are taken before
+      # anything is typed; no traces are recorded.
+      - name: Upload screenshots and logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-signin-artifacts
+          path: e2e-artifacts/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          for p in $(docker ps -aq --filter label=com.docker.compose.project | xargs -r docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' | sort -u | grep -E '^portcullis-(echo|oidc)-'); do
+            docker compose -p "$p" down -v 2>/dev/null || true
+          done
+          docker compose down -v
+          rm -rf /tmp/e2e-secrets
 
   # The app settings panel's deliveries on a real stack (contract §13): the
   # Hub (same-named Hub branch) with one local template source: the
