@@ -39,6 +39,7 @@ import sys
 import time
 from urllib.parse import urlsplit
 
+from playwright.sync_api import Error as PWError
 from playwright.sync_api import Page, sync_playwright
 
 import shlex
@@ -110,8 +111,18 @@ def drive(page: Page) -> tuple[bool, int]:
             return True, 0
         for sel in ("#invite-continue", "#registerWebAuthn", "#authenticateWebAuthnButton", "#stepup-continue"):
             if page.locator(sel).is_visible():
+                # Each click is one user action: wait until it has left the
+                # page (up to 15 s) before looking again, so a slow form
+                # submit is never answered with a second click (a second
+                # passkey assertion the person didn't make).
+                url = page.url
+                print(f"      click {sel} at {url.split('?')[0]}", flush=True)
                 page.click(sel)
-                page.wait_for_timeout(1500)
+                try:
+                    page.wait_for_url(lambda u, url=url: u != url, timeout=15_000)
+                except PWError:
+                    pass
+                page.wait_for_timeout(500)
                 break
         else:
             if page.locator("#kc-try-again, .error").count():
