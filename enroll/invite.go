@@ -6,6 +6,9 @@ package main
 //	Hub:  POST http://enroll:8444/internal/invites  (Bearer <shared secret file>,
 //	      {"username"} → 201 {"url","expires_at"}; refuses admin and
 //	      portcullis-hub with 409 — integration contract §9.4)
+//	Hub:  GET  http://enroll:8444/internal/certificates (same bearer) → 200
+//	      {"certificates":[{"user","serial","not_after","revoked"}]}, 503 when
+//	      Vault (revocation state included) can't be read
 //	CLI:  portcullis invite <user> → `enroll invite <user>` in this container
 //	      → POST http://127.0.0.1:8446/internal/invites (loopback, no secret:
 //	      reachable only through docker exec; the one way to get a link for
@@ -132,7 +135,10 @@ type inviteService struct {
 	protectedGroups map[string]bool
 	// requirePasskey adds webauthn-register-passwordless to the Keycloak user.
 	requirePasskey func(string) error
-	now            func() time.Time
+	// listCertificates lists the issued YubiKey client certificates with
+	// their revocation state (GET /internal/certificates, contract §9.4).
+	listCertificates func() ([]certRecord, error)
+	now              func() time.Time
 
 	mu          sync.Mutex
 	invites     map[string]*invite     // sha256(token) → invite
@@ -626,18 +632,52 @@ func jsonError(w http.ResponseWriter, status int, msg string) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+// apiAuthorized checks the Hub's bearer secret (constant time) and answers
+// 401 when it is missing, empty, under another scheme or wrong.
+func (s *inviteService) apiAuthorized(w http.ResponseWriter, r *http.Request) bool {
+	h := r.Header.Get("Authorization")
+	got, ok := strings.CutPrefix(h, "Bearer ")
+	if s.apiSecret == "" || !ok || got == "" ||
+		subtle.ConstantTimeCompare([]byte(got), []byte(s.apiSecret)) != 1 {
+		log.Printf("INVITE api rejected: bad or missing bearer secret (%s %s, remote=%s)", r.Method, r.URL.Path, r.RemoteAddr)
+		jsonError(w, http.StatusUnauthorized, "invalid invite API secret")
+		return false
+	}
+	return true
+}
+
+// GET /internal/certificates (contract §9.4): the issued YubiKey (pki_int)
+// client certificates, for the Hub's sign-in inventory. Same bearer as the
+// invite API. Any failure, revocation state included, is a 503: the Hub
+// then treats every certificate as unknown — never a guessed revoked:false.
+func (s *inviteService) handleAPICertificates(w http.ResponseWriter, r *http.Request) {
+	if !s.apiAuthorized(w, r) {
+		return
+	}
+	if s.listCertificates == nil {
+		jsonError(w, http.StatusServiceUnavailable, "certificates unavailable")
+		return
+	}
+	certs, err := s.listCertificates()
+	if err != nil {
+		log.Printf("CERTIFICATES api: %v", err)
+		jsonError(w, http.StatusServiceUnavailable, "cannot read the issued certificates from Vault")
+		return
+	}
+	if certs == nil {
+		certs = []certRecord{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(map[string]any{"certificates": certs})
+}
+
 // POST /internal/invites. local = the loopback listener (docker exec): no
 // secret, may invite the bootstrap admin. Otherwise Bearer <apiSecret>.
 func (s *inviteService) handleAPICreate(local bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !local {
-			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if s.apiSecret == "" || got == r.Header.Get("Authorization") ||
-				subtle.ConstantTimeCompare([]byte(got), []byte(s.apiSecret)) != 1 {
-				log.Printf("INVITE api rejected: bad or missing bearer secret (remote=%s)", r.RemoteAddr)
-				jsonError(w, http.StatusUnauthorized, "invalid invite API secret")
-				return
-			}
+		if !local && !s.apiAuthorized(w, r) {
+			return
 		}
 		var req inviteRequest
 		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
@@ -693,6 +733,10 @@ func (s *inviteService) internalHandler() http.Handler {
 func (s *inviteService) apiHandler(local bool) http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("POST /internal/invites", s.handleAPICreate(local))
+	if !local {
+		// The Hub's listener only: the loopback one takes no secret.
+		m.HandleFunc("GET /internal/certificates", s.handleAPICertificates)
+	}
 	return m
 }
 

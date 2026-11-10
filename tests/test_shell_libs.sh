@@ -1478,6 +1478,30 @@ ca_run 'set -e; signin_ca_reload'
 expect_eq "ca bundle: a failed restart keeps the old record" "$(cat "$PORTCULLIS_ROOT/certs/.ca-bundle.loaded")" "old"
 cp "$WORK/docker.ok" "$WORK/bin/docker"
 
+# ══ config: config_apply (static TLS options, plan D18) ════
+CA_ROOT="$WORK/config-apply"
+mkdir -p "$CA_ROOT/traefik/dynamic" "$WORK/cabin"
+cp "$HERE/../traefik/dynamic/tls.yml" "$CA_ROOT/traefik/dynamic/tls.yml"
+printf '# x\nmiddlewares: {}\n' > "$CA_ROOT/traefik/dynamic/middlewares.yml"
+printf 'PORTCULLIS_DOMAIN=ci.example.org\nACME_STAGING=true\n' > "$CA_ROOT/.env"
+# No network: the staging root download fails (a warning).
+printf '#!/usr/bin/env bash\nexit 7\n' > "$WORK/cabin/curl"
+chmod +x "$WORK/cabin/curl"
+traefik_sums() { find "$CA_ROOT/traefik" -type f -exec cksum {} + | sort; }
+SUMS_BEFORE="$(traefik_sums)"
+RC=0
+(
+  export PORTCULLIS_ROOT="$CA_ROOT" PATH="$WORK/cabin:$PATH"
+  # shellcheck source=../scripts/lib/config.sh
+  source "$HERE/../scripts/lib/config.sh"
+  config_apply
+) >"$WORK/ca-out" 2>&1 || RC=$?
+expect_eq "config_apply with ACME_STAGING=true exits 0" "$RC" 0
+expect_eq "config_apply with ACME_STAGING=true writes ACME_CA_SERVER staging and touches no traefik file" \
+  "$(grep '^ACME_CA_SERVER=' "$CA_ROOT/.env"):$([ "$(traefik_sums)" = "$SUMS_BEFORE" ] && echo same)" \
+  "ACME_CA_SERVER=https://acme-staging-v02.api.letsencrypt.org/directory:same"
+expect_eq "config_apply prints no MTLS_ENABLED" "$(grep -c MTLS "$WORK/ca-out")" 0
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

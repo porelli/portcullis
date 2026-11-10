@@ -1685,6 +1685,32 @@ jobs:
           fi
           echo "PASS: mcp-gate healthy as 10005 (+10001 only) at 172.31.250.3, read-only, secrets 0640 by group, access log 0640/0750 group 10001 read-only in the Hub, MCP routes reach the gate without forward-auth or cookies"
 
+      - name: Test signin reset-core (lockout recovery, as uid 10001)
+        run: |
+          set -o pipefail
+          if [ -z "$(docker compose ps -q hub)" ]; then
+            echo "::warning::the Hub isn't running (its test was skipped) — skipping signin reset-core"; exit 0
+          fi
+          ALPINE=alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+          ./portcullis signin reset-core </dev/null >/tmp/reset.out 2>&1 && { echo "FAIL: reset-core without --yes and no tty ran"; exit 1; }
+          ./portcullis signin reset-core --yes 2>&1 | tee /tmp/reset.out
+          grep -q 'signin reset-core: nothing to change\|core page \|template standard\|method ' /tmp/reset.out \
+            || { echo "FAIL: reset-core printed nothing of the Hub's"; exit 1; }
+          [ "$(docker inspect -f '{{.State.Running}}' "$(docker compose ps -q hub)")" = true ] || { echo "FAIL: the Hub is not running again"; exit 1; }
+          HUB_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q hub)")
+          for i in $(seq 1 30); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$HUB_IP:8888/healthz")" = 200 ] && break
+            [ "$i" -eq 30 ] && { echo "FAIL: hub /healthz after reset-core"; docker compose logs --tail=40 hub; exit 1; }
+            sleep 2
+          done
+          # Run as the image's user: nothing in hub_data owned by anyone else, and the audit entry.
+          docker run --rm --network none -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'find /d ! -uid 10001 | head -5' > /tmp/not-hub-owned
+          [ ! -s /tmp/not-hub-owned ] || { echo "FAIL: hub_data files not owned by 10001:"; cat /tmp/not-hub-owned; exit 1; }
+          docker run --rm --network none -v portcullis_hub_data:/d:ro "$ALPINE" cat /d/audit.jsonl \
+            | jq -se 'map(select(.action == "signin.reset_core")) | last | .actor == "cli" and .result == "ok"' >/dev/null \
+            || { echo "FAIL: no signin.reset_core audit entry by cli"; exit 1; }
+          echo "PASS: signin reset-core refuses without --yes and a tty, runs as 10001, audits signin.reset_core, starts the Hub again"
+
       - name: Test enrollment UI responds
         run: |
           ENROLL_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q enroll)")
@@ -2063,6 +2089,24 @@ jobs:
           echo "FAIL: cert revoked in Vault still accepted after 180s ($code; in Vault CRL: ${seen:-no})"
           vault read -format=json pki_int/config/crl | jq -c .data
           docker compose logs --tail=20 group-gate; exit 1
+
+      - name: Test enroll's certificates API (contract §9.4)
+        run: |
+          certs() { curl -s -o /tmp/certs.json -w '%{http_code}' "$@" "http://$ENROLL_IP:8444/internal/certificates"; }
+          for h in "" "Authorization: Bearer" "Authorization: Bearer wrong" "Authorization: Basic x"; do
+            [ "$(certs ${h:+-H "$h"})" = 401 ] || { echo "FAIL: certificates API with '${h:-no Authorization}'"; exit 1; }
+          done
+          [ "$(certs -H @<(printf 'Authorization: Bearer %s\n' "$(cat secrets/enroll/invite-api-secret)"))" = 200 ] \
+            || { echo "FAIL: certificates API with the bearer: $(head -c 300 /tmp/certs.json)"; exit 1; }
+          SERIAL=$(tr 'A-F' 'a-f' < /tmp/test-client.serial)
+          jq -e --arg s "$SERIAL" '(keys == ["certificates"]) and (.certificates | length > 0)
+              and all(.certificates[]; (keys == ["not_after", "revoked", "serial", "user"]) and (.user == (.user | ascii_downcase))
+                      and (.not_after | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$")) and (.revoked | type == "boolean"))
+              and any(.certificates[]; .serial == $s and .user == "testuser" and .revoked == true)
+              and all(.certificates[]; .user | endswith("portcullis.local") | not)' /tmp/certs.json >/dev/null \
+            || { echo "FAIL: certificates API answer (want testuser's revoked $SERIAL, no server certs):"; jq -c . /tmp/certs.json | head -c 2000; exit 1; }
+          if grep -q 'BEGIN' /tmp/certs.json; then echo "FAIL: PEM in the certificates API answer"; exit 1; fi
+          echo "PASS: certificates API: bearer only, YubiKey client certs with Vault's revocation state ($(jq '.certificates | length' /tmp/certs.json) certs)"
 
       - name: portcullis up (whole stack) keeps the Hub's LLDAP service account
         run: |

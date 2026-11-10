@@ -56,7 +56,6 @@ ACME_EMAIL=$email
 # Let's Encrypt staging (untrusted certs, no rate limits) — change, then
 # run ./portcullis config apply && ./portcullis up
 ACME_STAGING=false
-MTLS_ENABLED=true
 
 DNS_PROVIDER=$provider
 ${creds}
@@ -153,9 +152,9 @@ init_run() {
   stack_prepare
   info "Initialising Vault..."
   vault_init false
-  # ACME_STAGING / MTLS_ENABLED → ACME_CA_SERVER + TLS tiers, and the CA
-  # bundle (forward-auth bind-mounts certs/ca-bundle.crt: it must be a file
-  # before the first `up`; rebuilt below once the internal CA exists).
+  # ACME_STAGING → ACME_CA_SERVER, and the CA bundle (forward-auth
+  # bind-mounts certs/ca-bundle.crt: it must be a file before the first
+  # `up`; rebuilt below once the internal CA exists).
   config_apply
 
   info "Starting services..."

@@ -20,7 +20,7 @@ PORTCULLIS_ROOT="${PORTCULLIS_ROOT:-$PORTCULLIS_HOME}"
 PORTCULLIS_CALLER_PWD="$PWD"
 unset _self _dir
 
-for _lib in common network vault pki certs keycloak users domains mcpgate dns config status monitoring backup stack; do
+for _lib in common network vault pki certs keycloak users domains mcpgate dns config status monitoring backup signin stack; do
   # shellcheck source=/dev/null
   source "$PORTCULLIS_LIB/$_lib.sh"
 done
@@ -45,7 +45,7 @@ Backups:
   restore                     Restore a local or off-host (--from-offsite) backup
 
 Configuration:
-  config apply                Apply ACME_STAGING / MTLS_ENABLED, rebuild the CA bundle
+  config apply                Apply ACME_STAGING, rebuild the CA bundle
   config init                 Keep your settings in config/, a separate git repo
   dns setup                   Create A/AAAA records for the domain and its wildcard
 
@@ -60,6 +60,7 @@ Identity:
   lldap-ui                    Break-glass SSH tunnel to LLDAP's own web UI (server only)
   keycloak configure          Import/patch the portcullis realm
   oidc register               Create core OIDC clients, push their secrets from .env
+  signin reset-core           Lockout recovery: the Hub's core pages back on the Standard sign-in
 
 Client certificates (YubiKey PIV):
   cert enroll                 New key + certificate on a YubiKey
@@ -84,7 +85,7 @@ main() {
   esac
   cd "$PORTCULLIS_ROOT"
   case "$cmd" in
-    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert)
+    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert|signin)
       "cmd_$cmd" "$@" ;;
     lldap-ui) cmd_lldap_ui "$@" ;;
     *)

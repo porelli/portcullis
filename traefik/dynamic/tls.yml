@@ -1,9 +1,15 @@
-# TLS options for the three access tiers.
-# Assign to routers via label: traefik.http.routers.<name>.tls.options=<tier>
+# TLS options (tracked, static: `./portcullis config apply` never writes
+# this file, and the Hub has no write access under traefik/). Contract §5
+# "TLS tier per host".
 #
-# Protected:  RequireAndVerifyClientCert — no cert = TLS handshake fails
-# Auth-aware: VerifyClientCertIfGiven    — cert optional, verified if present
-# Public:     NoClientCert               — no client cert requested
+# The Hub picks one per app router (all routers of a host share it), from
+# the instance's compiled sign-in template and the certificate methods
+# that are switched on. Core routers (auth, hub, people, the portal, the
+# consoles, enroll, directory, mcp) always use authaware.
+#
+# protected: RequireAndVerifyClientCert — no valid client cert = the TLS handshake fails
+# authaware: VerifyClientCertIfGiven    — cert optional, verified if present
+# public:    no clientAuth              — no client cert requested
 
 tls:
   options:

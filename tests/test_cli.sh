@@ -57,7 +57,7 @@ case "$ERR" in *"unknown command 'frobnicate'"*) t_pass "unknown command message
 
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 26 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 26
+expect_eq "help lists 27 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 27
 while IFS= read -r c; do
   # shellcheck disable=SC2086
   run $c --help
@@ -69,7 +69,7 @@ while IFS= read -r c; do
   expect_eq "'help $c' == '$c --help'" "$RC:$OUT" "0:$sub_help"
 done <<< "$COMMANDS"
 
-for g in vault pki keycloak oidc dns cert config; do
+for g in vault pki keycloak oidc dns cert config signin; do
   run "$g";        expect_eq "'$g' without subcommand exits 2" "$RC" 2
   run "$g" --help; expect_eq "'$g --help' exits 0" "$RC" 0
   run "$g" bogus;  expect_eq "'$g bogus' exits 2" "$RC" 2
@@ -128,6 +128,8 @@ invite a --to ftp://x|--to must be hub, portal or an https URL
 invite 'bad;user'|invalid user name
 invite a --frob|unknown option: --frob
 lldap-ui now|unknown argument: now
+signin reset-core --force|unknown argument: --force
+signin reset-core|no terminal to confirm on: pass --yes
 EOF
 
 # ── no secret on a command line (CLAUDE.md: stdin, -H @<(...), key=-, jq
@@ -559,6 +561,95 @@ rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
 )
 expect_eq "upgrade: account unchanged, no hub restart" \
   "$(grep -c '^restart.*hub' "$DC_CALLS" 2>/dev/null || true)" 0
+
+# ── static TLS options (contract §5 "TLS tier per host", plan D18) ──
+ROOT_DIR="$(cd "$HERE/.." && pwd)"
+expect_eq "MTLS_ENABLED appears nowhere in portcullis scripts/lib docker-compose.yml" \
+  "$(grep -l MTLS_ENABLED "$ROOT_DIR/portcullis" "$ROOT_DIR"/scripts/lib/*.sh "$ROOT_DIR/docker-compose.yml" "$ROOT_DIR/.env.example" 2>/dev/null || true)" ""
+TLS_YML="$ROOT_DIR/traefik/dynamic/tls.yml"
+# One line per option: <name> <clientAuthType or none> <caFile> <minVersion> <sniStrict>.
+TLS_GOT="$(awk '
+  /^    [a-z]+:$/ { if (n) print n, (t ? t : "none"), (ca ? ca : "-"), v, s; n = $1; sub(/:$/, "", n); t = ""; ca = ""; v = ""; s = ""; next }
+  /clientAuthType:/ { t = $2 } /- \/certs\// { ca = $2 } /minVersion:/ { v = $2 } /sniStrict:/ { s = $2 }
+  END { if (n) print n, (t ? t : "none"), (ca ? ca : "-"), v, s }' "$TLS_YML")"
+expect_eq "traefik/dynamic/tls.yml defines exactly protected, authaware, public with those clientAuth types" "$TLS_GOT" \
+"protected RequireAndVerifyClientCert /certs/ca-chain.crt VersionTLS12 false
+authaware VerifyClientCertIfGiven /certs/ca-chain.crt VersionTLS12 false
+public none - VersionTLS12 false"
+expect_eq "tls.yml: only the tls.options block" "$(grep -cvE '^[[:space:]]*(#|$)' "$TLS_YML")" 19
+expect_eq "tls.yml is tracked by git" "$(git -C "$ROOT_DIR" ls-files traefik/dynamic/tls.yml)" "traefik/dynamic/tls.yml"
+# Every core router carries authaware@file.
+ROUTERS="$(grep -oE 'traefik\.http\.routers\.[a-z0-9-]+\.rule' "$ROOT_DIR/docker-compose.yml" | sed 's/^traefik\.http\.routers\.//; s/\.rule$//' | sort -u)"
+BAD=""
+for r in $ROUTERS; do
+  grep -qE "^[[:space:]]+traefik\.http\.routers\.$r\.tls\.options: authaware@file$" "$ROOT_DIR/docker-compose.yml" || BAD="$BAD $r"
+done
+expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:16"
+expect_eq "no other tls.options in docker-compose.yml" "$(grep -E 'tls\.options:' "$ROOT_DIR/docker-compose.yml" | grep -vc 'authaware@file$' || true)" 0
+# The Hub can't write traefik/: /project is read-only and no rw mount goes under traefik/.
+HUB_SVC="$(awk '/^  hub:$/ { f = 1; next } f && /^  [a-z][a-z0-9-]*:$/ { exit } f' "$ROOT_DIR/docker-compose.yml")"
+expect_eq "the hub service mounts nothing under traefik/ read-write" \
+  "$(printf '%s\n' "$HUB_SVC" | grep -E '^[[:space:]]+- [^#]*traefik' | grep -vc ':ro$' || true)" 0
+expect_eq "the hub mounts the checkout read-only" "$(printf '%s\n' "$HUB_SVC" | grep -c '^      - \.:/project:ro$')" 1
+expect_eq "the Hub's only rw bind mounts are templates/ and appfiles/" \
+  "$(printf '%s\n' "$HUB_SVC" | grep -E '^      - \./' | grep -v ':ro$' | sed 's/^ *- //' | sort | tr '\n' ' ')" \
+  "./appfiles:/project/appfiles:rw ./templates:/project/templates:rw "
+
+# config apply leaves tls.yml byte-identical and writes no traefik file.
+CA_ROOT="$WORK/ca-root"
+mkdir -p "$CA_ROOT/traefik/dynamic" "$WORK/cabin"
+cp "$TLS_YML" "$CA_ROOT/traefik/dynamic/tls.yml"
+printf 'PORTCULLIS_DOMAIN=ci.example.org\nACME_STAGING=false\n' > "$CA_ROOT/.env"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$WORK/cabin/docker"
+chmod +x "$WORK/cabin/docker"
+SUM_BEFORE="$(cksum < "$CA_ROOT/traefik/dynamic/tls.yml")"
+RC=0; PATH="$WORK/cabin:$PATH" PORTCULLIS_ROOT="$CA_ROOT" "$CLI" config apply >"$WORK/out" 2>"$WORK/err" </dev/null || RC=$?
+expect_eq "config apply exits 0" "$RC" 0
+expect_eq "config apply leaves tls.yml byte-identical" "$(cksum < "$CA_ROOT/traefik/dynamic/tls.yml")" "$SUM_BEFORE"
+expect_eq "config apply writes nothing else under traefik/" "$(find "$CA_ROOT/traefik" -type f | wc -l | tr -d ' ')" 1
+case "$(cat "$WORK/out" "$WORK/err")" in *MTLS*|*mTLS*) t_fail "config apply mentions mTLS" ;; *) t_pass "config apply says nothing about mTLS" ;; esac
+
+# ── signin reset-core (stubbed docker compose) ──
+SR_ROOT="$WORK/sr-root"
+mkdir -p "$SR_ROOT" "$WORK/srbin"
+printf 'PORTCULLIS_DOMAIN=ci.example.org\n' > "$SR_ROOT/.env"
+SR_CALLS="$WORK/sr-calls"
+cat > "$WORK/srbin/docker" <<'STUB'
+#!/usr/bin/env bash
+[ "$1" = compose ] || exit 97
+shift
+[ "$1" = --project-directory ] && shift 2
+echo "dc $*" >> "$SR_CALLS"
+case "$1" in
+  run) echo "core page hub: mine -> standard"; exit "${SR_RUN_RC:-0}" ;;
+  start) exit "${SR_START_RC:-0}" ;;
+esac
+exit 0
+STUB
+chmod +x "$WORK/srbin/docker"
+sr() {
+  RC=0; : > "$SR_CALLS"
+  PATH="$WORK/srbin:$PATH" PORTCULLIS_ROOT="$SR_ROOT" SR_CALLS="$SR_CALLS" "$CLI" signin reset-core "$@" >"$WORK/out" 2>"$WORK/err" </dev/null || RC=$?
+  OUT="$(cat "$WORK/out")"; ERR="$(cat "$WORK/err")"
+}
+sr
+expect_eq "signin reset-core without --yes and no tty refuses" "$RC:$(cat "$SR_CALLS")" "2:"
+SR_WANT="dc stop hub
+dc run --rm --no-deps -T --user 10001:10001 --entrypoint /usr/local/bin/hub hub signin reset-core
+dc start hub"
+sr --yes
+expect_eq "signin reset-core --yes runs dc stop hub, dc run --rm --no-deps --entrypoint /usr/local/bin/hub hub signin reset-core, dc start hub (stubbed dc)" "$RC:$(cat "$SR_CALLS")" "0:$SR_WANT"
+case "$OUT" in *"core page hub: mine -> standard"*) t_pass "signin reset-core shows the Hub's output" ;; *) t_fail "signin reset-core output: $OUT" ;; esac
+SR_RUN_RC=3 sr --yes
+expect_eq "signin reset-core: a failed run still starts the Hub, then fails" "$RC:$(cat "$SR_CALLS")" "1:$SR_WANT"
+case "$ERR" in *"failed (exit 3"*"Hub is running again"*) t_pass "signin reset-core: the failure names the exit status" ;; *) t_fail "signin reset-core failure: $ERR" ;; esac
+SR_START_RC=1 sr --yes
+expect_eq "signin reset-core: a failed start fails" "$RC" 1
+case "$ERR" in *"could not be started again"*) t_pass "signin reset-core: a failed start says so" ;; *) t_fail "signin reset-core failed start: $ERR" ;; esac
+mv "$SR_ROOT/.env" "$SR_ROOT/.env.x"
+sr --yes
+expect_eq "signin reset-core --yes without .env exits 1 before docker" "$RC:$(cat "$SR_CALLS")" "1:"
+mv "$SR_ROOT/.env.x" "$SR_ROOT/.env"
 
 expect_eq "docker was never called" "$(cat "$STUB_CALLS" 2>/dev/null)" ""
 

@@ -50,11 +50,9 @@ config_build_ca_bundle() {
 }
 
 config_apply() {
-  local staging mtls sentinel last ca_server tls="$PORTCULLIS_ROOT/traefik/dynamic/tls.yml"
+  local staging sentinel last ca_server
   staging="$(_bool "$(env_get ACME_STAGING)" false)"
-  mtls="$(_bool "$(env_get MTLS_ENABLED)" true)"
   echo "  ACME_STAGING=$staging"
-  echo "  MTLS_ENABLED=$mtls"
 
   # The ACME account + certs in acme.json are bound to the CA directory URL:
   # on a staging↔production flip clear them, or Traefik keeps reusing the
@@ -85,56 +83,9 @@ config_apply() {
   mkdir -p "$(dirname "$sentinel")"
   echo "$staging" > "$sentinel"
   env_set ACME_CA_SERVER "$ca_server"
-
-  if [ "$mtls" = true ]; then
-    info "mTLS: ENABLED — client certificates requested (PIV/YubiKey)"
-    cat > "$tls" <<'EOF'
-# TLS options for the three access tiers (written by `portcullis config apply`).
-# mTLS ENABLED — client certificates are requested.
-tls:
-  options:
-    protected:
-      clientAuth:
-        caFiles:
-          - /certs/ca-chain.crt
-        clientAuthType: RequireAndVerifyClientCert
-      minVersion: VersionTLS12
-      sniStrict: false
-
-    authaware:
-      clientAuth:
-        caFiles:
-          - /certs/ca-chain.crt
-        clientAuthType: VerifyClientCertIfGiven
-      minVersion: VersionTLS12
-      sniStrict: false
-
-    public:
-      minVersion: VersionTLS12
-      sniStrict: false
-EOF
-  else
-    warn "mTLS: DISABLED — no client certificates (WebAuthn only)"
-    cat > "$tls" <<'EOF'
-# TLS options (written by `portcullis config apply`) — mTLS DISABLED.
-# All tiers use public TLS (no client certificates); authentication is
-# WebAuthn-only via Keycloak.
-tls:
-  options:
-    protected:
-      minVersion: VersionTLS12
-      sniStrict: false
-
-    authaware:
-      minVersion: VersionTLS12
-      sniStrict: false
-
-    public:
-      minVersion: VersionTLS12
-      sniStrict: false
-EOF
-  fi
-  ok "Updated $tls and ACME_CA_SERVER. Apply with: ./portcullis up"
+  # TLS options are static (traefik/dynamic/tls.yml, tracked): the Hub
+  # picks one per app router, core routers use authaware.
+  ok "Updated ACME_CA_SERVER. Apply with: ./portcullis up"
 }
 
 # config_init <remote> <clone-url> — config/ as a separate git repo holding
@@ -217,7 +168,7 @@ help_config() {
   cat <<'EOF'
 Usage: portcullis config <subcommand>
 
-  apply     Apply ACME_STAGING / MTLS_ENABLED from .env (CA bundle, tls.yml)
+  apply     Apply ACME_STAGING from .env (ACME CA server, CA bundle)
   init      Move your settings into config/, a separate git repo, and symlink them
 
 Run 'portcullis config <subcommand> --help' for details.
@@ -228,14 +179,13 @@ help_config_apply() {
   cat <<'EOF'
 Usage: portcullis config apply [--bundle-only]
 
-Apply the toggles in .env:
+Apply the toggle in .env:
   ACME_STAGING=true|false   (default false) Let's Encrypt staging vs production:
                             sets ACME_CA_SERVER in .env; on a flip clears
                             Traefik's acme.json so it re-registers
-  MTLS_ENABLED=true|false   (default true) rewrites traefik/dynamic/tls.yml
-                            (false: no client certs on any tier — routers that
-                            rely only on the protected tier become unauthenticated)
-and rebuild certs/ca-bundle.crt. Then run `portcullis up`: it restarts Traefik and,
+and rebuild certs/ca-bundle.crt. The TLS options in traefik/dynamic/tls.yml
+are static (protected / authaware / public): the Hub picks one per app from
+its sign-in template and the certificate methods switched on. Then run `portcullis up`: it restarts Traefik and,
 when the bundle changed, the two forward-auth services (they read it only
 at start-up).
 

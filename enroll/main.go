@@ -431,6 +431,122 @@ func listCertsWith(vc *vault.Client) ([]CertInfo, error) {
 	return certs, nil
 }
 
+// certRecord is one entry of GET /internal/certificates (contract §9.4).
+// Serial is Vault's form, the key LIST pki_int/certs returns, as
+// `portcullis cert list` and certs/revocation/revoked-serials.txt print it:
+// lowercase hex byte pairs joined by ":" (e.g. "1a:2b:…").
+type certRecord struct {
+	User     string `json:"user"`
+	Serial   string `json:"serial"`
+	NotAfter string `json:"not_after"`
+	Revoked  bool   `json:"revoked"`
+}
+
+func (cfg *Config) issuedCerts() ([]certRecord, error) {
+	var certs []certRecord
+	err := cfg.vault.do(func(vc *vault.Client) error {
+		var err error
+		certs, err = issuedCertsWith(vc)
+		return err
+	})
+	return certs, err
+}
+
+// issuedCertsWith lists the YubiKey client certificates pki_int issued
+// (role client-cert: client auth only, not a CA, a CN), with Vault's
+// per-certificate revocation state. Unlike listCertsWith it fails closed:
+// a listed serial that can't be read, parsed or whose revocation_time is
+// missing or unreadable fails the whole list, so no certificate is ever
+// reported unrevoked by guess.
+func issuedCertsWith(vc *vault.Client) ([]certRecord, error) {
+	secret, err := vc.Logical().List("pki_int/certs")
+	if err != nil {
+		return nil, fmt.Errorf("list pki_int/certs: %w", err)
+	}
+	if secret == nil || secret.Data["keys"] == nil {
+		return []certRecord{}, nil
+	}
+	keys, ok := secret.Data["keys"].([]interface{})
+	if !ok {
+		return nil, errors.New("list pki_int/certs: unexpected response shape")
+	}
+	out := make([]certRecord, 0, len(keys))
+	for _, k := range keys {
+		serial, ok := k.(string)
+		if !ok || serial == "" || strings.ContainsAny(serial, "/?#") {
+			return nil, fmt.Errorf("list pki_int/certs: unexpected key %v", k)
+		}
+		cs, err := vc.Logical().Read("pki_int/cert/" + serial)
+		if err != nil {
+			return nil, fmt.Errorf("read pki_int/cert/%s: %w", serial, err)
+		}
+		if cs == nil || cs.Data == nil {
+			return nil, fmt.Errorf("read pki_int/cert/%s: no data", serial)
+		}
+		certPEM, _ := cs.Data["certificate"].(string)
+		block, _ := pem.Decode([]byte(certPEM))
+		if block == nil {
+			return nil, fmt.Errorf("pki_int/cert/%s: no certificate", serial)
+		}
+		parsed, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("pki_int/cert/%s: %w", serial, err)
+		}
+		if !yubikeyClientCert(parsed) {
+			continue // the CA chain, Traefik's server certificate, …
+		}
+		revoked, err := revocationState(cs.Data["revocation_time"])
+		if err != nil {
+			return nil, fmt.Errorf("pki_int/cert/%s: %w", serial, err)
+		}
+		out = append(out, certRecord{
+			User:     strings.ToLower(parsed.Subject.CommonName),
+			Serial:   strings.ToLower(serial),
+			NotAfter: parsed.NotAfter.UTC().Format(time.RFC3339),
+			Revoked:  revoked,
+		})
+	}
+	return out, nil
+}
+
+// yubikeyClientCert: what the client-cert role issues (client_flag only).
+func yubikeyClientCert(c *x509.Certificate) bool {
+	if c.IsCA || c.Subject.CommonName == "" {
+		return false
+	}
+	client := false
+	for _, u := range c.ExtKeyUsage {
+		switch u {
+		case x509.ExtKeyUsageClientAuth:
+			client = true
+		case x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageAny:
+			return false
+		}
+	}
+	return client
+}
+
+// revocationState reads Vault's revocation_time (0 = not revoked). A
+// missing or unexpected value is an error, never "not revoked".
+func revocationState(v any) (bool, error) {
+	switch rt := v.(type) {
+	case json.Number:
+		n, err := rt.Int64()
+		if err != nil {
+			return false, fmt.Errorf("revocation_time %q unreadable", rt)
+		}
+		return n != 0, nil
+	case float64:
+		return rt != 0, nil
+	case int64:
+		return rt != 0, nil
+	case int:
+		return rt != 0, nil
+	default:
+		return false, fmt.Errorf("revocation_time missing or unreadable (%T)", v)
+	}
+}
+
 // forwardedUser is the LLDAP username of the signed-in user: X-Forwarded-User,
 // set by group-gate from oauth2-proxy's user (the token's preferred_username).
 // Traefik deletes any client-supplied X-Forwarded-User (it is one of
@@ -726,6 +842,7 @@ func main() {
 		log.Fatalf("invite service: %v", err)
 	}
 	inv.userGroups = cfg.userGroups
+	inv.listCertificates = cfg.issuedCerts
 	inv.protectedGroups = protectedGroupSet(os.Getenv("INVITE_PROTECTED_GROUPS"), envOr("GATE_MAP_FILE", "/etc/group-gate/map.conf"))
 	inv.register(mux)
 	for _, l := range []struct {
