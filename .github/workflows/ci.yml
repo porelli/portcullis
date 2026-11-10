@@ -3390,8 +3390,8 @@ jobs:
   # case) and the Keycloak image (same-named portcullis-keycloak branch), one
   # local template source = the CI templates tests/e2e/apps/echo
   # (forward-auth) and tests/e2e/apps/oidc-echo (native OIDC), instances on
-  # Standard, Basic, YubiKey certificate only, Strong and YubiKey +
-  # certificate. tests/e2e/e2e_signin.py documents the cases: methods on and
+  # Standard, Basic, YubiKey certificate only (forward-auth and native
+  # OIDC), Strong and YubiKey + certificate. tests/e2e/e2e_signin.py documents the cases: methods on and
   # off, synced / security-key passkeys, the pc_method step-up, passwords,
   # native-OIDC templates, TLS following the switches, reclassification, the
   # cross-user certificate and pc_fresh.
@@ -3402,7 +3402,7 @@ jobs:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
       ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
-      APP_HOSTS: echo-std echo-basic echo-cert oidc-strong oidc-all
+      APP_HOSTS: echo-std echo-basic echo-cert oidc-strong oidc-all oidc-cert
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -3602,14 +3602,14 @@ jobs:
 
           # Instances (all on the main domain) and their picks, then enable.
           for spec in "echo echo-std Echo-Std" "echo echo-basic Echo-Basic" "echo echo-cert Echo-Cert" \
-                      "oidc-echo oidc-strong OIDC-Strong" "oidc-echo oidc-all OIDC-All"; do
+                      "oidc-echo oidc-strong OIDC-Strong" "oidc-echo oidc-all OIDC-All" "oidc-echo oidc-cert OIDC-Cert"; do
             read -r tpl id label <<<"$spec"
             router="echo"; [ "$tpl" = oidc-echo ] && router="oidc"
             label="${label//-/ }"
             hubop POST /api/instances -d "$(jq -cn --arg t "$tpl" --arg id "$id" --arg l "$label" --arg r "$router" --arg h "$id.$E2E_DOMAIN" \
                 '{template: $t, id: $id, label: $l, hosts: {($r): $h}}')" || { echo "FAIL: create $id"; exit 1; }
           done
-          for pick in echo-basic:basic echo-cert:e2e-cert oidc-strong:strong oidc-all:yubikey-and-certificate; do
+          for pick in echo-basic:basic echo-cert:e2e-cert oidc-strong:strong oidc-all:yubikey-and-certificate oidc-cert:e2e-cert; do
             code=$(hubc PUT "/api/instances/${pick%%:*}/settings" -d "$(jq -cn --arg t "${pick#*:}" '{sign_in_template: $t}')")
             want "$code" "sign-in template of ${pick%%:*}"
           done
@@ -3617,7 +3617,7 @@ jobs:
             code=$(hubc POST "/api/directory/groups/${m#*:}/members" -d "$(jq -cn --arg u "${m%%:*}" '{username: $u}')")
             want "$code" "add $m"
           done
-          for id in echo-std echo-basic echo-cert oidc-strong oidc-all; do
+          for id in echo-std echo-basic echo-cert oidc-strong oidc-all oidc-cert; do
             hubop POST /api/templates/enable -d "{\"id\":\"$id\"}" || { echo "FAIL: enable $id"; exit 1; }
           done
 
@@ -3631,12 +3631,13 @@ jobs:
                 and .core["hub.\($d)"] == "strong" and .core["people.\($d)"] == "strong"' >/dev/null 2>&1 \
               && hub_file signin-keycloak.json | jq -e '.clients["oidc-strong"] == {template: "strong", name: "OIDC echo · OIDC Strong"}
                 and .clients["oidc-all"] == {template: "yubikey-and-certificate", name: "OIDC echo · OIDC All"}
+                and .clients["oidc-cert"] == {template: "e2e-cert", name: "OIDC echo · OIDC Cert"}
                 and (.authenticators | has("01020304-0506-0708-0102-030405060708"))
                 and (.methods | index("password") == null)' >/dev/null 2>&1 && break
             [ "$i" -eq 30 ] && { echo "FAIL: published: $(hub_file group-gate-policy.json | jq -c '{hosts, core, default}') $(hub_file signin-keycloak.json | jq -c '{clients, methods, mds}')"; exit 1; }
             sleep 2
           done
-          echo "PASS: policy v6 picks (Basic, e2e-cert, Strong core pages) and signin-keycloak.json clients (oidc-strong Strong, oidc-all YubiKey + certificate)"
+          echo "PASS: policy v6 picks (Basic, e2e-cert, Strong core pages) and signin-keycloak.json clients (oidc-strong Strong, oidc-all YubiKey + certificate, oidc-cert e2e-cert)"
 
           # pat: a Hub-set password only (allowed while the method is off),
           # kept in a 0600 file, never printed.

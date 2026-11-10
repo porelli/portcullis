@@ -13,6 +13,8 @@ the Hub's API:
   echo-cert.<d>    echo, e2e-cert = any[yubikey_cert]            alice
   oidc-strong.<d>  oidc-echo (client oidc-strong), Strong
   oidc-all.<d>     oidc-echo (client oidc-all), YubiKey + certificate
+  oidc-cert.<d>    oidc-echo (client oidc-cert), e2e-cert (a switch to another
+                   person's certificate would meet it)
 
 and the people root, sam (both lldap_admin), alice, bob (a certificate
 only), pat (a Hub-set password only), rita, plus LLDAP's admin. Certificates
@@ -47,9 +49,11 @@ Cases (in this order; each later case needs only the state it names):
                             shows the passkey prompt only, the token's amr then
                             has spk and hwk
   cross_user_certificate    alice's passkey session presenting bob's
-                            certificate: on echo-cert's yubikey_cert step-up
-                            (portcullis-x509, USER_CONFLICT) and on oidc-all's
-                            template step: refused, never bob, no code
+                            certificate: on echo-cert's yubikey_cert step-up and
+                            on oidc-cert (template step: needs-stronger; a
+                            pc_method=yubikey_cert step: refused by Keycloak's
+                            X.509 user check or the extension's USER_CONFLICT):
+                            never bob, no code
   all_met_step_by_step      root with his certificate on oidc-all
                             (all[yubikey_cert, security_key]): Keycloak asks
                             the security key itself, then issues (amr mtls+hwk)
@@ -61,8 +65,9 @@ Cases (in this order; each later case needs only the state it names):
                             failureFactor 10): refused, not counted by brute
                             force, admin's passkey still signs in
   password_off_not_offered  again after switching it off
-  reclassify (part 2)       within ~6 min rita's credential is
-                            portcullis-security-key (PasskeyReclassified)
+  reclassify (part 2)       rita's credential becomes portcullis-security-key;
+                            the PasskeyReclassified log line is at most 360 s
+                            after the fixture's return
   tls_follows_switch        echo-std / echo-basic / auth.<d> CA names;
                             Standard = any[family:passkey], hub / people →
                             standard, Strong (and the certificate templates)
@@ -91,6 +96,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import Page, sync_playwright
@@ -112,11 +118,13 @@ ECHO_BASIC = f"https://echo-basic.{DOMAIN}"
 ECHO_CERT = f"https://echo-cert.{DOMAIN}"
 OIDC_STRONG = f"https://oidc-strong.{DOMAIN}"
 OIDC_ALL = f"https://oidc-all.{DOMAIN}"
+OIDC_CERT = f"https://oidc-cert.{DOMAIN}"
 REALM = f"{AUTH}/realms/portcullis"
 HUB_API = f"http://{os.environ['HUB_IP']}:8888"
 KC_ADMIN = "http://127.0.0.1:8080"
 AAGUID = "01020304-0506-0708-0102-030405060708"  # Chromium's virtual CTAP2 key
 FIXTURE = os.environ["E2E_FIXTURE"]
+RECLASSIFY_S = 360  # the extension's reclassify task runs every 5 min (D5), plus slack
 
 os.makedirs(SCREENS, exist_ok=True)
 results: list[tuple[str, bool, str]] = []
@@ -146,15 +154,23 @@ ALLOW_RECORDER = """(() => {
 })();"""
 
 
+SETUP_LINK = re.compile(r"(https://enroll\.[^/\s'\"]+/invite/)[A-Za-z0-9_-]+")
+
+
+def redact(text: str) -> str:
+    """Setup links out of failure messages (also masked in the log)."""
+    return SETUP_LINK.sub(r"\1<redacted>", text)
+
+
 def check(name: str, fn) -> None:
     try:
         fn()
         results.append((name, True, ""))
         print(f"PASS: {name}", flush=True)
     except Exception as e:  # noqa: BLE001
-        results.append((name, False, f"{type(e).__name__}: {e}"))
-        print(f"FAIL: {name}: {e}", flush=True)
-        traceback.print_exc()
+        results.append((name, False, redact(f"{type(e).__name__}: {e}")))
+        print(redact(f"FAIL: {name}: {e}"), flush=True)
+        print(redact(traceback.format_exc()), flush=True)
 
 
 def needs(*keys: str) -> None:
@@ -297,6 +313,7 @@ def invite(user: str, to: str) -> str:
     assert out.returncode == 0, f"portcullis invite {user}: exit {out.returncode} {out.stderr[-300:]}"
     url = json.loads(out.stdout)["url"]
     assert re.fullmatch(rf"https://enroll\.{re.escape(DOMAIN)}/invite/[A-Za-z0-9_-]{{43}}", url), "malformed setup link"
+    print(f"::add-mask::{url}", flush=True)  # GitHub Actions hides it from the log from here on
     return url
 
 
@@ -314,10 +331,16 @@ def oidc_secret(instance: str) -> str:
 
 
 def write_fixture(data: bytes) -> None:
-    """In place (the Hub reads it through a read-only directory mount): a
-    new mtime is a new generation of the development mds.serial."""
-    with open(FIXTURE, "wb") as f:
+    """Atomically (a temp file renamed over it in the same directory, which
+    the Hub reads through a read-only mount, so it never sees a partial
+    file): a new mtime is a new generation of the development mds.serial."""
+    tmp = os.path.join(os.path.dirname(FIXTURE), ".extra-authenticators.json.tmp")
+    with open(tmp, "wb") as f:
         f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o644)  # the Hub (uid 10001) reads it
+    os.replace(tmp, FIXTURE)
 
 
 def published() -> dict:
@@ -538,10 +561,15 @@ def main() -> int:
                 assert page.locator("input[type=password]").count() == 0, "a password field"
                 assert page.locator("#try-another-way").count() == 0, "\"Try another way\" offered"
                 # A step-up asking for the password, which is off: still no password form.
+                authz: list = []
+                page.on("request", lambda r: authz.append(r.url)
+                        if r.url.startswith(f"{REALM}/protocol/openid-connect/auth?") else None)
                 goto(page, f"{AUTH}/oauth2/start?" + urllib.parse.urlencode({"pc_method": "password",
                                                                              "rd": ECHO_STD + "/"}))
                 kc_page(page)
                 base.shot(page, f"{label}-pc-method-password")
+                asked = [urllib.parse.parse_qs(urllib.parse.urlsplit(u).query).get("pc_method") for u in authz]
+                assert ["password"] in asked, f"pc_method=password never reached Keycloak's authorize: {asked}"
                 assert page.locator("input[type=password]").count() == 0, "pc_method=password showed a password field"
             finally:
                 ctx.close()
@@ -585,7 +613,6 @@ def main() -> int:
                 base.shot(page, "rita-stepup")
                 assert page.locator("#stepup-continue").count() == 1, f"no step-up page (at {page.url})"
                 assert (key.registered, key.asserted) == (1, 0), (key.registered, key.asserted)
-                state["rita_page"] = (ctx, page)
             except Exception:
                 if ctx:
                     ctx.close()
@@ -598,23 +625,30 @@ def main() -> int:
                 # Every later registration needs the key's entry published.
                 until("signin-keycloak.json lists the key again",
                       lambda: AAGUID in published()["authenticators"], 90)
-            assert kc_types("rita") == ["webauthn-passwordless"], kc_types("rita")
-            assert f"passkey registered for rita: AAGUID {AAGUID}, kind passkey_synced" in kc_log(), \
-                "no registration line for rita as passkey_synced"
+            try:
+                assert kc_types("rita") == ["webauthn-passwordless"], kc_types("rita")
+                assert f"passkey registered for rita: AAGUID {AAGUID}, kind passkey_synced" in kc_log(), \
+                    "no registration line for rita as passkey_synced"
+            except Exception:
+                ctx.close()
+                raise
             state["rita"] = True
+            state["rita_page"] = (ctx, page, key)
         check("reclassify (1): with the key's entry gone from the fixture, a setup-link registration is "
               "webauthn-passwordless (passkey_synced)", reclassify_register)
 
         def pc_fresh_absent_after_setup_link():
             needs("rita_page")
-            ctx, page = state.pop("rita_page")
+            ctx, page, key = state.pop("rita_page")
             try:
+                before = key.asserted
                 c = fresh_auth(page, "rita-fresh")
+                assert key.asserted == before, "the SSO reuse asked for the key"
                 assert c.get("preferred_username") == "rita", c.get("preferred_username")
                 assert "pc_fresh" not in c, f"pc_fresh after a setup link: {c.get('pc_fresh')}"
             finally:
                 ctx.close()
-        check("pc_fresh: absent for a setup-link session (portcullis-fresh-auth, SSO reused)",
+        check("pc_fresh: absent for a setup-link session (portcullis-fresh-auth, SSO reused, no touch)",
               pc_fresh_absent_after_setup_link)
 
         # ── root: a security key, Strong on hub.<d> ──
@@ -667,32 +701,37 @@ def main() -> int:
             assert f"passkey registered for sam: AAGUID {AAGUID}, kind passkey_synced" in kc_log()
             amr = token_claims(page).get("amr") or []
             assert "spk" in amr and "hwk" not in amr, amr
-            state["sam_synced"] = key.credentials()
+            synced_creds = key.credentials()
             ctx.close()
             # A setup-link session (amr inv) counts as not known in `people`
             # (contract §5): the needs-stronger page needs a later sign-in.
             wait_people("sam", ["passkey_synced"])
             ctx = new_context()
             page = ctx.new_page()
-            key = Key(page, synced=True, credentials=state["sam_synced"])
+            key = Key(page, synced=True, credentials=synced_creds)
+            try:
+                goto(page, HUB + "/")
+                deadline = time.time() + 60
+                while time.time() < deadline and not (page.url.startswith(HUB + "/") and not base.on_login_pages(page)):
+                    page.wait_for_load_state("domcontentloaded")
+                    if base.on_login_pages(page) and page.locator("#authenticateWebAuthnButton").is_visible():
+                        page.click("#authenticateWebAuthnButton")
+                        page.wait_for_timeout(1500)
+                        continue
+                    page.wait_for_timeout(500)
+                assert key.asserted == 1, f"{key.asserted} assertions for sam's sign-in"
+                amr = token_claims(page).get("amr") or []
+                assert "spk" in amr and "inv" not in amr and "hwk" not in amr, amr
+                resp = page.reload(wait_until="domcontentloaded")
+                base.shot(page, "sam-hub-needs-stronger")
+                assert resp and resp.status == 403, f"hub.<d>: HTTP {resp and resp.status}"
+                assert page.locator("#needs-stronger").count() == 1, body(page)[:300]
+                assert page.locator("#stepup-continue").count() == 0, "a step-up the synced key can't complete"
+            except Exception:
+                ctx.close()
+                raise
+            state["sam_synced"] = synced_creds
             state["sam_ctx"], state["sam_page"] = ctx, page
-            goto(page, HUB + "/")
-            deadline = time.time() + 60
-            while time.time() < deadline and not (page.url.startswith(HUB + "/") and not base.on_login_pages(page)):
-                page.wait_for_load_state("domcontentloaded")
-                if base.on_login_pages(page) and page.locator("#authenticateWebAuthnButton").is_visible():
-                    page.click("#authenticateWebAuthnButton")
-                    page.wait_for_timeout(1500)
-                    continue
-                page.wait_for_timeout(500)
-            assert key.asserted == 1, f"{key.asserted} assertions for sam's sign-in"
-            amr = token_claims(page).get("amr") or []
-            assert "spk" in amr and "inv" not in amr and "hwk" not in amr, amr
-            resp = page.reload(wait_until="domcontentloaded")
-            base.shot(page, "sam-hub-needs-stronger")
-            assert resp and resp.status == 403, f"hub.<d>: HTTP {resp and resp.status}"
-            assert page.locator("#needs-stronger").count() == 1, body(page)[:300]
-            assert page.locator("#stepup-continue").count() == 0, "a step-up the synced key can't complete"
         check("synced_passkey_refused_on_strong: a synced passkey (backup eligible) is webauthn-passwordless "
               "and gets #needs-stronger on hub.<d>", synced_refused_on_strong)
 
@@ -790,6 +829,14 @@ def main() -> int:
                 ctx.close()
         check("alice: setup link → passkey → portal", alice_signs_up)
 
+        def bob_refused_in(log: str, client: str) -> bool:
+            """Keycloak's X.509 user check (it won't set another user than the
+            step's: a LOGIN_ERROR for bob's certificate with no user) or the
+            extension's USER_CONFLICT (its log line naming alice)."""
+            return "a certificate of another account was presented while alice was signing in" in log or bool(
+                re.search(r'type="LOGIN_ERROR".*clientId="' + re.escape(client) +
+                          r'".*userId="null".*x509_cert_subject_distinguished_name="CN=bob"', log))
+
         def never_bob(page: Page) -> None:
             assert kc_sessions("bob") == [], f"bob has Keycloak sessions: {kc_sessions('bob')}"
             user = token_claims(page).get("preferred_username")
@@ -821,37 +868,45 @@ def main() -> int:
                 base.shot(page, "alice-bobcert-refused")
                 assert page.locator("#kc-error-message").count() == 1, f"not refused at {page.url.split('?')[0]}"
                 assert not callbacks, f"a code reached oauth2-proxy: {len(callbacks)}"
-                # Refused by the extension (its log line) or, before it, by Keycloak's own
-                # X.509 authenticator (setting another user than the step's: a LOGIN_ERROR
-                # naming bob's certificate and no user).
-                log = kc_log()[mark:]
-                assert "a certificate of another account was presented while alice was signing in" in log or \
-                    re.search(r'type="LOGIN_ERROR".*userId="null".*x509_cert_subject_distinguished_name="CN=bob"', log), \
+                assert bob_refused_in(kc_log()[mark:], "portcullis-forward-auth"), \
                     "no refusal of bob's certificate in Keycloak's log"
                 never_bob(page)
             finally:
                 ctx.close()
         check("cross_user_certificate (forward-auth): alice's step-up to yubikey_cert presenting bob's "
-              "certificate is refused (USER_CONFLICT), no code, never bob", cross_user_cert_forward_auth)
+              "certificate is refused by Keycloak's X.509 user check or the extension's USER_CONFLICT, no code, "
+              "never bob", cross_user_cert_forward_auth)
 
         def cross_user_cert_native():
+            # oidc-cert's template is any[yubikey_cert]: a switch to bob's
+            # account would meet it and issue a code.
             needs("alice_storage")
             ctx = new_context(client_cert=bob_cert, origins=(AUTH,), storage_state=state["alice_storage"])
             page = ctx.new_page()
             Key(page, credentials=state["alice_creds"])
             try:
-                rd = Redirect(page, OIDC_ALL + "/cb")
-                goto(page, authorize_url("oidc-all", OIDC_ALL + "/cb"))
-                out = drive_kc(page, lambda: rd.code() is not None, "alice-bobcert-oidc-all")
-                base.shot(page, "alice-bobcert-oidc-all")
-                assert out in ("needs-stronger", "error"), f"{out}: {rd.urls}"
-                assert rd.code() is None and not rd.urls, f"oidc-all got a redirect: {rd.urls}"
+                rd = Redirect(page, OIDC_CERT + "/cb")
+                # The template step: bob's certificate isn't alice's, so it isn't asked for.
+                mark = len(kc_log())
+                goto(page, authorize_url("oidc-cert", OIDC_CERT + "/cb"))
+                out = drive_kc(page, lambda: rd.code() is not None, "alice-bobcert-oidc-cert")
+                assert out == "needs-stronger", f"{out}: {rd.urls}"
+                assert "alice doesn't meet the sign-in template of oidc-cert" in kc_log()[mark:]
+                # A step asking for the certificate itself (pc_method): refused.
+                mark = len(kc_log())
+                goto(page, authorize_url("oidc-cert", OIDC_CERT + "/cb", pc_method="yubikey_cert"))
+                out = drive_kc(page, lambda: rd.code() is not None, "alice-bobcert-oidc-cert-pc-method")
+                assert out == "error", f"{out}: {rd.urls}"
+                assert bob_refused_in(kc_log()[mark:], "oidc-cert"), "no refusal of bob's certificate in Keycloak's log"
+                assert rd.code() is None and not rd.urls, f"oidc-cert got a redirect: {rd.urls}"
                 assert "bob" not in body(page).lower(), body(page)[:300]
                 never_bob(page)
             finally:
                 ctx.close()
-        check("cross_user_certificate (native OIDC): alice on oidc-all (YubiKey + certificate) presenting "
-              "bob's certificate: refused, no code, never bob", cross_user_cert_native)
+        check("cross_user_certificate (native OIDC): alice on oidc-cert (YubiKey certificate only) presenting "
+              "bob's certificate: the template step doesn't take it, a pc_method=yubikey_cert step is refused "
+              "by Keycloak's X.509 user check or the extension's USER_CONFLICT; no code, never bob",
+              cross_user_cert_native)
 
         # ── root: all[yubikey_cert, security_key] met step by step ──
         def all_met_step_by_step():
@@ -929,7 +984,7 @@ def main() -> int:
                     if "Hostname" in body(page):
                         break
                     page.wait_for_timeout(1000)
-                base.shot(page, "pat-echo-basic")
+                # No screenshot: whoami echoes the session cookie and bearer token.
                 assert headers_of(body(page)).get("x-forwarded-user") == ["pat"], body(page)[:400]
                 amr = token_claims(page).get("amr") or []
                 assert "pwd" in amr, amr
@@ -960,8 +1015,14 @@ def main() -> int:
                     text = body(page)
                     assert "Password sign-in isn't available for this account" in text, f"attempt {i + 1}: {text[:300]!r}"
                     assert not page.url.startswith(PORTAL), "signed in with admin's password"
-                bf = kc(f"/attack-detection/brute-force/users/{kc_user_id('admin')}")
-                assert bf.get("numFailures") == 0 and not bf.get("disabled"), f"brute force: {bf}"
+                admin_id = kc_user_id("admin")
+                assert admin_id is not None, "admin isn't in Keycloak"
+                # Read a few times over 10 s: a failure Keycloak counted
+                # asynchronously would show up meanwhile.
+                for _ in range(5):
+                    time.sleep(2)
+                    bf = kc(f"/attack-detection/brute-force/users/{admin_id}")
+                    assert bf.get("numFailures") == 0 and not bf.get("disabled"), f"brute force: {bf}"
             finally:
                 ctx.close()
             ctx = new_context()
@@ -988,55 +1049,78 @@ def main() -> int:
         # ── reclassify, part 2 ──
         def reclassify_upgraded():
             needs("rita", "fixture_back")
-            limit = state["fixture_back"] + 420 - time.time()
+            back = state["fixture_back"]
+            # The extension's task runs every 5 min: 360 s with slack; polled a little longer.
             until("rita's passkey reclassified to portcullis-security-key",
-                  lambda: kc_types("rita") == ["portcullis-security-key"], max(limit, 30), every=10)
-            assert re.search(rf"PasskeyReclassified user rita AAGUID {AAGUID} passkey_synced -> security_key", kc_log()), \
-                "no PasskeyReclassified line for rita"
-        check("reclassify (2): the fixture's entry back (a new mtime → a higher mds.serial): within 6 min "
-              "rita's credential is portcullis-security-key (PasskeyReclassified)", reclassify_upgraded)
+                  lambda: kc_types("rita") == ["portcullis-security-key"], max(back + RECLASSIFY_S + 30 - time.time(), 30),
+                  every=10)
+            out = subprocess.run(["docker", "compose", "logs", "--no-color", "--timestamps", "keycloak"],
+                                 capture_output=True, text=True).stdout
+            m = re.search(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?Z .*PasskeyReclassified user rita AAGUID "
+                          + re.escape(AAGUID) + " passkey_synced -> security_key", out)
+            assert m, "no PasskeyReclassified line for rita"
+            at = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp() \
+                + float("0" + (m.group(2) or ""))
+            took = at - back
+            print(f"    reclassified {took:.0f} s after the fixture came back", flush=True)
+            assert -5 <= took <= RECLASSIFY_S, f"PasskeyReclassified {took:.0f} s after the fixture's return (limit {RECLASSIFY_S})"
+        check(f"reclassify (2): the fixture's entry back (a new mtime → a higher mds.serial): within {RECLASSIFY_S} s "
+              "rita's credential is portcullis-security-key (PasskeyReclassified, its log time)", reclassify_upgraded)
 
         # ── TLS follows the switches (last: it restarts apps) ──
         def tls_follows_switch():
             snap0 = hub_ok("GET", "/api/signin")
             picks0 = {i: hub_ok("GET", f"/api/instances/{i}/signin").get("template", "")
-                      for i in ("echo-cert", "oidc-strong", "oidc-all")}
-            assert picks0 == {"echo-cert": "e2e-cert", "oidc-strong": "strong", "oidc-all": "yubikey-and-certificate"}, picks0
+                      for i in ("echo-cert", "oidc-strong", "oidc-all", "oidc-cert")}
+            assert picks0 == {"echo-cert": "e2e-cert", "oidc-strong": "strong", "oidc-all": "yubikey-and-certificate",
+                              "oidc-cert": "e2e-cert"}, picks0
             std0 = next(t for t in snap0["templates"] if t["id"] == "standard")
             for inst in ("echo-std", "echo-basic"):
                 assert tls_option(inst) == "authaware@file", f"{inst}: {tls_option(inst)}"
                 assert ca_names(f"{inst}.{DOMAIN}"), f"{inst}: no CA names with yubikey_cert on"
             assert ca_names(f"auth.{DOMAIN}"), "auth.<d>: no CA names"
 
-            hub_ok("PUT", "/api/signin/templates/standard",
-                   {"name": std0["name"], "rule": {"op": "any", "items": ["family:passkey"]}})
-            for inst in picks0:
-                hub_ok("PUT", f"/api/instances/{inst}/settings", {"sign_in_template": ""})
-            for page_key in ("hub", "people"):
-                hub_ok("PUT", f"/api/signin/core/{page_key}", {"template": "standard"})
-            for t in ("strong", "yubikey-and-certificate", "e2e-cert"):
-                hub_ok("PUT", f"/api/signin/templates/{t}/enabled", {"on": False})
-            until("echo-std on public@file without CA names (Standard has no certificate any more)",
-                  lambda: tls_option("echo-std") == "public@file" and not ca_names(f"echo-std.{DOMAIN}"), 180, every=5)
-            # Basic still names family:certificate: the method switch alone moves it.
-            assert tls_option("echo-basic") == "authaware@file" and ca_names(f"echo-basic.{DOMAIN}"), \
-                f"echo-basic before the switch: {tls_option('echo-basic')}"
-            hub_ok("PUT", "/api/signin/methods/yubikey_cert", {"on": False})
-            until("echo-basic on public@file without CA names (yubikey_cert off)",
-                  lambda: tls_option("echo-basic") == "public@file" and not ca_names(f"echo-basic.{DOMAIN}"), 180, every=5)
-            assert ca_names(f"auth.{DOMAIN}"), "auth.<d> lost its CA names (core routers stay on authaware)"
-            assert ca_names(f"hub.{DOMAIN}"), "hub.<d> lost its CA names (core routers stay on authaware)"
+            def restore() -> list:
+                """Everything back as it was, each step tried whatever failed before."""
+                errs = []
+                steps = [("PUT", "/api/signin/methods/yubikey_cert", {"on": True}),
+                         ("PUT", "/api/signin/templates/standard", {"name": std0["name"], "rule": std0["rule"]})]
+                steps += [("PUT", f"/api/signin/templates/{t}/enabled",
+                           {"on": next(x for x in snap0["templates"] if x["id"] == t)["enabled"]})
+                          for t in ("strong", "yubikey-and-certificate", "e2e-cert")]
+                steps += [("PUT", f"/api/signin/core/{k}", {"template": snap0["core"][k]}) for k in ("hub", "people")]
+                steps += [("PUT", f"/api/instances/{i}/settings", {"sign_in_template": t}) for i, t in picks0.items()]
+                for method, path, body_ in steps:
+                    try:
+                        hub_ok(method, path, body_)
+                    except Exception as e:  # noqa: BLE001
+                        errs.append(str(e))
+                return errs
 
-            # Everything back as it was.
-            hub_ok("PUT", "/api/signin/methods/yubikey_cert", {"on": True})
-            hub_ok("PUT", "/api/signin/templates/standard", {"name": std0["name"], "rule": std0["rule"]})
-            for t in ("strong", "yubikey-and-certificate", "e2e-cert"):
-                was = next(x for x in snap0["templates"] if x["id"] == t)["enabled"]
-                hub_ok("PUT", f"/api/signin/templates/{t}/enabled", {"on": was})
-            for page_key in ("hub", "people"):
-                hub_ok("PUT", f"/api/signin/core/{page_key}", {"template": snap0["core"][page_key]})
-            for inst, t in picks0.items():
-                hub_ok("PUT", f"/api/instances/{inst}/settings", {"sign_in_template": t})
+            restored: list | None = None
+            try:
+                hub_ok("PUT", "/api/signin/templates/standard",
+                       {"name": std0["name"], "rule": {"op": "any", "items": ["family:passkey"]}})
+                for inst in picks0:
+                    hub_ok("PUT", f"/api/instances/{inst}/settings", {"sign_in_template": ""})
+                for page_key in ("hub", "people"):
+                    hub_ok("PUT", f"/api/signin/core/{page_key}", {"template": "standard"})
+                for t in ("strong", "yubikey-and-certificate", "e2e-cert"):
+                    hub_ok("PUT", f"/api/signin/templates/{t}/enabled", {"on": False})
+                until("echo-std on public@file without CA names (Standard has no certificate any more)",
+                      lambda: tls_option("echo-std") == "public@file" and not ca_names(f"echo-std.{DOMAIN}"), 180, every=5)
+                # Basic still names family:certificate: the method switch alone moves it.
+                assert tls_option("echo-basic") == "authaware@file" and ca_names(f"echo-basic.{DOMAIN}"), \
+                    f"echo-basic before the switch: {tls_option('echo-basic')}"
+                hub_ok("PUT", "/api/signin/methods/yubikey_cert", {"on": False})
+                until("echo-basic on public@file without CA names (yubikey_cert off)",
+                      lambda: tls_option("echo-basic") == "public@file" and not ca_names(f"echo-basic.{DOMAIN}"), 180,
+                      every=5)
+                assert ca_names(f"auth.{DOMAIN}"), "auth.<d> lost its CA names (core routers stay on authaware)"
+                assert ca_names(f"hub.{DOMAIN}"), "hub.<d> lost its CA names (core routers stay on authaware)"
+            finally:
+                restored = restore()
+            assert not restored, f"restore steps failed: {restored}"
             for inst in ("echo-std", "echo-basic"):
                 until(f"{inst} back on authaware@file with CA names",
                       lambda inst=inst: tls_option(inst) == "authaware@file" and ca_names(f"{inst}.{DOMAIN}"), 180, every=5)
@@ -1053,6 +1137,12 @@ def main() -> int:
             if k in state:
                 state.pop(k).close()
         browser.close()
+
+    # The throwaway groups kick() made (best effort).
+    for n in range(1, _kicks[0] + 1):
+        code, out = hub("DELETE", f"/api/directory/groups/ci-kick-{n}", {"confirm": f"ci-kick-{n}"})
+        if code not in (200, 204):
+            print(f"    cleanup: ci-kick-{n}: HTTP {code} {str(out)[:200]}", flush=True)
 
     failed = [r for r in results if not r[1]]
     print(f"\n{len(results) - len(failed)} passed, {len(failed)} failed")
