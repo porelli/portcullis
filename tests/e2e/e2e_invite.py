@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Setup-link check against any running Portcullis (CI or a live server).
 
-  python3 tests/e2e/e2e_invite.py <setup-link> <landing-url> [--reinvite-cmd CMD [--replaced]]
+  python3 tests/e2e/e2e_invite.py <setup-link> <landing-url> [--reinvite-cmd CMD [--replaced]] [--expect-amr AMR]
 
 Get the link on the server with `./portcullis invite <user> --to <hub|portal|URL>`
 (use a throwaway user: the link registers a NEW passkey for it). With a
@@ -49,6 +49,11 @@ LINK, LANDING = sys.argv[1], sys.argv[2]
 _opts = sys.argv[3:]
 REINVITE = shlex.split(_opts[_opts.index("--reinvite-cmd") + 1]) if "--reinvite-cmd" in _opts else None
 REPLACED = "--replaced" in _opts
+# --expect-amr <amr> (CI: hwk, its fixture makes the virtual key a security
+# key): the token's passkey methods must be exactly that one. Without it (a
+# live server, any authenticator) any passkey method will do.
+EXPECT_AMR = _opts[_opts.index("--expect-amr") + 1] if "--expect-amr" in _opts else None
+CLICKS: list[str] = []  # every selector drive() clicked, in order
 DOMAIN = urlsplit(LINK).hostname.split(".", 1)[1]
 AUTH = f"https://auth.{DOMAIN}"
 failures: list[str] = []
@@ -117,6 +122,7 @@ def drive(page: Page) -> tuple[bool, int]:
                 # passkey assertion the person didn't make).
                 url = page.url
                 print(f"      click {sel} at {url.split('?')[0]}", flush=True)
+                CLICKS.append(sel)
                 page.click(sel)
                 try:
                     page.wait_for_url(lambda u, url=url: u != url, timeout=15_000)
@@ -149,7 +155,11 @@ with sync_playwright() as pw:
     expect(reached and prompts == 0, f"setup link → passkey registration → {LANDING}, no password")
     expect(counts == {"registered": 1, "asserted": 1}, f"one registration, one step-up touch ({counts})")
     c = token_claims(page)
-    expect(bool({"spk", "dpk", "hwk"} & set(c.get("amr") or [])), f"token amr has a passkey method: {c.get('amr')}")
+    passkey_amr = {"spk", "dpk", "hwk"} & set(c.get("amr") or [])
+    if EXPECT_AMR:
+        expect(passkey_amr == {EXPECT_AMR}, f"token amr's passkey method is exactly {EXPECT_AMR}: {c.get('amr')}")
+    else:
+        expect(bool(passkey_amr), f"token amr has a passkey method: {c.get('amr')}")
     creds = cdp.send("WebAuthn.getCredentials", {"authenticatorId": aid})["credentials"]
     resp = page.goto(LINK, wait_until="domcontentloaded")
     expect(bool(resp) and resp.status == 404, "the link works once")
@@ -169,7 +179,11 @@ with sync_playwright() as pw:
         link2 = json.loads(out.strip().splitlines()[-1])["url"]
         b, page, cdp, aid, counts = browser_page(pw)  # a NEW authenticator
         page.goto(link2, wait_until="domcontentloaded")
+        CLICKS.clear()
         reached, prompts = drive(page)
+        # One step-up and one passkey click: the person acted once.
+        expect(CLICKS.count("#stepup-continue") == 1 and CLICKS.count("#authenticateWebAuthnButton") == 1,
+               f"re-invite: one step-up click and one passkey click ({CLICKS})")
         # One touch either way. With a spare key the account holds two
         # passkeys, so Keycloak's step-up lists both in allowCredentials and
         # Chromium first probes the list silently (a user-presence-free

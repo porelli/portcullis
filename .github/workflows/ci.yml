@@ -250,6 +250,19 @@ jobs:
           echo "$CFG" | jq -e '.services["group-gate"].labels["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders"]
               | split(",") | index("Authorization") and index("X-Forwarded-Access-Token")' >/dev/null \
             || { echo "FAIL: portcullis-groups does not list Authorization / X-Forwarded-Access-Token"; exit 1; }
+          # Token headers (contract §4 "How group-gate decides" reads amr from
+          # X-Forwarded-Access-Token only): every forwardAuth in front of
+          # group-gate lists it, so Traefik deletes a client's copy and only
+          # oauth2-proxy's reaches group-gate. portcullis-auth and -ext also
+          # strip Authorization; portcullis-auth-console deliberately keeps the
+          # client's Authorization (the Keycloak console's own bearer) but
+          # strips the access token.
+          echo "$CFG" | jq -e '
+              def hdrs($svc; $mw): .services[$svc].labels["traefik.http.middlewares.\($mw).forwardauth.authResponseHeaders"] | split(",");
+              (hdrs("forward-auth"; "portcullis-auth") | index("X-Forwarded-Access-Token") and index("Authorization"))
+              and (hdrs("forward-auth-ext"; "portcullis-auth-ext") | index("X-Forwarded-Access-Token") and index("Authorization"))
+              and (hdrs("forward-auth"; "portcullis-auth-console") | index("X-Forwarded-Access-Token") and (index("Authorization") | not))' >/dev/null \
+            || { echo "FAIL: a forward-auth middleware lets a client's X-Forwarded-Access-Token / Authorization through"; exit 1; }
           # Contract §5 "Extra-domain hosts": forward-auth-ext = forward-auth
           # with a relative callback and a host-only __Host-portcullis_ext cookie;
           # portcullis-auth-ext strips exactly what portcullis-auth strips.
@@ -1325,7 +1338,7 @@ jobs:
           # extension denies everything (DENY_ALL). The Hub's start replaces it.
           printf '%s' '{"version":1,"methods":["passkey_device","passkey_synced","security_key","yubikey_cert"],"add_stronger":false,"templates":{"standard":{"op":"any","items":[{"op":"any","items":["passkey_synced","passkey_device","security_key"]},{"op":"any","items":["yubikey_cert"]}]}},"clients":{},"authenticators":{},"mds":{"serial":0,"next_update":"0001-01-01T00:00:00Z"}}' \
             | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
-                sh -c 'cat > /d/signin-keycloak.json && chmod 644 /d/signin-keycloak.json'
+                sh -c 'cat > /d/signin-keycloak.json.tmp && chmod 644 /d/signin-keycloak.json.tmp && mv /d/signin-keycloak.json.tmp /d/signin-keycloak.json'
           # pc_method=yubikey_cert = the YubiKey certificate only (the other
           # methods step aside); with confirmation disabled a successful cert
           # login answers 302 → redirect_uri?code=...
@@ -1616,9 +1629,15 @@ jobs:
           done
           hubapi "http://$HUB_IP:8888/api/signin" | jq -e '.default == "standard" and ([.methods[] | select(.on) | .id] | sort) == ["passkey_device", "passkey_synced", "security_key", "yubikey_cert"]' >/dev/null \
             || { echo "FAIL: GET /api/signin on a fresh Hub: $(hubapi "http://$HUB_IP:8888/api/signin" | head -c 600)"; exit 1; }
+          # Log lines are counted before and after each request: the mTLS
+          # step already logged the same kind of line for this host.
+          gg_count() { docker compose logs group-gate > /tmp/gg.log 2>&1; grep -cE "$1" /tmp/gg.log || true; }
+          gg_grew() { local i; for i in $(seq 1 10); do [ "$(gg_count "$1")" -gt "$2" ] && return 0; sleep 1; done; return 1; }
+          STEP_RE='STEPUP user=testuser host=gated\.portcullis\.local amr=\[\] have=\[\] pc_method=(passkey|passkey_synced|passkey_device|security_key|yubikey_cert)$'
+          n0=$(gg_count "$STEP_RE")
           code=$(gated)
           [ "$code" = 403 ] || { echo "FAIL: gated app under the Standard default without a session got $code"; exit 1; }
-          docker compose logs group-gate 2>&1 | grep -E "STEPUP user=testuser host=gated.portcullis.local amr=\[\] have=\[\] pc_method=(passkey|passkey_synced|passkey_device|security_key|yubikey_cert)$" >/dev/null \
+          gg_grew "$STEP_RE" "$n0" \
             || { echo "FAIL: group-gate did not step up under the Standard default"; docker compose logs --tail=10 group-gate; exit 1; }
           for t in "$CI_TOKEN_SPK" "$CI_TOKEN_HWK" "$CI_TOKEN_MTLS"; do
             [ "$(gated -H "X-Forwarded-Access-Token: $t")" = 200 ] || { echo "FAIL: a session meeting Standard denied: $(gated -H "X-Forwarded-Access-Token: $t")"; exit 1; }
@@ -1632,15 +1651,18 @@ jobs:
           # certificate; then back to Standard.
           setdef() { printf '{"template":"%s"}' "$1" | hubapi -o /tmp/setdef.json -w '%{http_code}' -X PUT -H 'Content-Type: application/json' \
                        --data-binary @- "http://$HUB_IP:8888/api/signin/default"; }
+          STRONG_RE="(STEPUP|NEEDS-STRONGER) user=testuser host=gated\\.portcullis\\.local amr=\\['spk'\\] have=\\['passkey_synced'\\] (pc_method=(security_key|yubikey_cert)|set_up=.*)$"
+          n0=$(gg_count "$STRONG_RE")
           [ "$(setdef strong)" = 200 ] || { echo "FAIL: PUT /api/signin/default strong: $(head -c 400 /tmp/setdef.json)"; exit 1; }
           for i in $(seq 1 30); do
             policy_file | jq -e '.default == "strong"' >/dev/null 2>&1 && [ "$(gated -H "X-Forwarded-Access-Token: $CI_TOKEN_SPK")" = 403 ] && break
             [ "$i" -eq 30 ] && { echo "FAIL: group-gate does not enforce the Strong default: $(policy_file)"; docker compose logs --tail=10 group-gate; exit 1; }
             sleep 2
           done
-          docker compose logs group-gate 2>&1 | grep -E "(STEPUP|NEEDS-STRONGER) user=testuser host=gated.portcullis.local amr=\['spk'\] have=\['passkey_synced'\] (pc_method=(security_key|yubikey_cert)|set_up=.*)$" >/dev/null \
+          gg_grew "$STRONG_RE" "$n0" \
             || { echo "FAIL: no step-up / needs-stronger page for a synced session under Strong"; docker compose logs --tail=10 group-gate; exit 1; }
           [ "$(gated -H "X-Forwarded-Access-Token: $CI_TOKEN_MTLS")" = 200 ] || { echo "FAIL: a bound mtls session denied under Strong"; exit 1; }
+          [ "$(gated -H "X-Forwarded-Access-Token: $CI_TOKEN_HWK")" = 200 ] || { echo "FAIL: a security-key session denied under Strong"; exit 1; }
           [ "$(setdef standard)" = 200 ] || { echo "FAIL: PUT /api/signin/default standard: $(head -c 400 /tmp/setdef.json)"; exit 1; }
           for i in $(seq 1 30); do
             policy_file | jq -e '.default == "standard"' >/dev/null 2>&1 && [ "$(gated -H "X-Forwarded-Access-Token: $CI_TOKEN_SPK")" = 200 ] && break
@@ -2603,7 +2625,8 @@ jobs:
             | jq -c --slurpfile auth tests/e2e/fixtures/virtual-authenticators.json \
                 '{version: 1, methods, add_stronger, templates, clients: {}, authenticators: $auth[0],
                   mds: {serial: 0, next_update: "0001-01-01T00:00:00Z"}}' \
-            | docker run --rm -i -v portcullis_hub_data:/d "$ALPINE" sh -c 'cat > /d/signin-keycloak.json && chmod 644 /d/signin-keycloak.json'
+            | docker run --rm -i -v portcullis_hub_data:/d "$ALPINE" \
+                sh -c 'cat > /d/signin-keycloak.json.tmp && chmod 644 /d/signin-keycloak.json.tmp && mv /d/signin-keycloak.json.tmp /d/signin-keycloak.json'
           # Shared custom fields (normally written by the Hub): e2e_login.py
           # checks the attribute header reaches the app and forged ones don't.
           printf '%s' '{"version": 2, "fields": {"city": "City"}, "users": {"e2e": {"city": ["Milan"]}}}' \
@@ -2715,10 +2738,10 @@ jobs:
           export NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt"
           # A second key next to the first (both work) ...
           /tmp/e2e-venv/bin/python tests/e2e/e2e_invite.py "$(./portcullis invite e2e-spare --json | jq -r .url)" https://portcullis.local/ \
-            --reinvite-cmd "./portcullis invite e2e-spare --json"
+            --reinvite-cmd "./portcullis invite e2e-spare --json" --expect-amr hwk
           # ... and a lost key replaced (the old one stops working).
           /tmp/e2e-venv/bin/python tests/e2e/e2e_invite.py "$(./portcullis invite e2e-lost --json | jq -r .url)" https://portcullis.local/ \
-            --reinvite-cmd "./portcullis invite e2e-lost --replace-keys --json" --replaced
+            --reinvite-cmd "./portcullis invite e2e-lost --replace-keys --json" --replaced --expect-amr hwk
 
       - name: Monitoring (targets up, probes, rules, alerts, Grafana behind forward-auth)
         run: |

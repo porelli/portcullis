@@ -52,6 +52,7 @@ Against a live server without certs: tests/e2e/e2e_invite.py.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -123,23 +124,29 @@ def on_login_pages(page: Page) -> bool:
     return page.url.startswith(AUTH + "/realms/") or page.url.startswith(f"https://enroll.{DOMAIN}/invite/")
 
 
-def passkey_flow(page: Page, *, until: str, label: str, stepups: list | None = None) -> None:
+def passkey_flow(page: Page, *, until: str, label: str, expect_stepups: int, stepups: list | None = None) -> None:
     """Drive the setup-link page, Keycloak and group-gate's step-up page
     until the browser lands on `until`. Handles: "Register my key" (setup
     link), the passkey registration required action, "Sign in with
     Passkey", and group-gate's step-up page (#stepup-continue, contract §5:
     a setup-link session meets no template, so the new passkey is touched
-    once more; each step-up URL is appended to `stepups`). Fails at once on a
+    once more; each step-up URL is appended to `stepups`). Exactly
+    `expect_stepups` step-up pages must appear: one more fails at once (never
+    a silent second click), fewer fails on arrival. Fails at once on a
     password field, a Keycloak error, or group-gate's needs-stronger /
     present-certificate page: there are no passwords any more."""
+    seen: list = [] if stepups is None else stepups
     deadline = time.time() + 90
     while time.time() < deadline:
         page.wait_for_load_state("domcontentloaded")
         if not on_login_pages(page):
             if page.locator("#stepup-continue").count():
                 shot(page, f"{label}-stepup")
-                if stepups is not None:
-                    stepups.append(page.locator("#stepup-continue").get_attribute("href"))
+                href = page.locator("#stepup-continue").get_attribute("href")
+                if len(seen) >= expect_stepups:
+                    raise AssertionError(f"step-up page #{len(seen) + 1} at {page.url} (want {expect_stepups}): "
+                                         f"{href}; earlier: {seen}")
+                seen.append(href)
                 page.click("#stepup-continue")
                 page.wait_for_timeout(1500)
                 continue
@@ -148,6 +155,8 @@ def passkey_flow(page: Page, *, until: str, label: str, stepups: list | None = N
                     shot(page, f"{label}-{marker[1:]}")
                     raise AssertionError(f"group-gate's {marker} page at {page.url}: {page.inner_text('body')[:300]!r}")
         if page.url.startswith(until) and not on_login_pages(page):
+            if len(seen) != expect_stepups:
+                raise AssertionError(f"reached {until} after {len(seen)} step-up page(s), want {expect_stepups}")
             return
         if not on_login_pages(page):
             page.wait_for_timeout(500)  # oauth2-proxy redirects on its own
@@ -173,6 +182,13 @@ def passkey_flow(page: Page, *, until: str, label: str, stepups: list | None = N
         page.wait_for_timeout(500)
     shot(page, f"{label}-timeout")
     raise AssertionError(f"login did not reach {until} (stuck at {page.url})")
+
+
+def forged_token(user: str, amr: list) -> str:
+    """An unsigned JWT a client could send: header.payload.signature, the
+    payload claiming `amr` for `user`."""
+    b = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()  # noqa: E731
+    return b({"alg": "HS256", "typ": "JWT"}) + "." + b({"preferred_username": user, "amr": amr}) + ".Zm9yZ2Vk"
 
 
 def goto_status(page: Page, url: str) -> int:
@@ -240,7 +256,7 @@ def main() -> int:
             shot(page, "setup-link")
             assert f"<strong>{user}</strong>" in page.content(), "setup page does not name the user"
             stepups: list = []
-            passkey_flow(page, until=HWK, label="setup", stepups=stepups)
+            passkey_flow(page, until=HWK, label="setup", expect_stepups=1, stepups=stepups)
             shot(page, "hwk-after-setup")
             assert key.registered == 1, f"{key.registered} passkeys registered"
             # A setup-link session (amr inv) meets no template: hwk's
@@ -277,10 +293,15 @@ def main() -> int:
             # separately. Client-supplied copies of these headers are dropped,
             # and so are forged attribute headers (CI writes city=Milan for
             # the user into user-attributes.json).
+            # A forged, unsigned access token claiming every method (and the
+            # user's own name) must never reach group-gate or the app: every
+            # forwardAuth lists the token headers, so Traefik deletes them.
+            forged = forged_token(user, ["hwk", "mtls"])
             spoof = {"X-Forwarded-User": "admin", "X-Forwarded-Email": "admin@" + DOMAIN,
                      "X-Auth-Request-User": "admin", "X-Auth-Request-Email": "admin@" + DOMAIN,
                      "X-Auth-Request-Preferred-Username": "admin",
-                     "X-Forwarded-Attr-City": "Forged", "X-Forwarded-Attr-Forged": "x"}
+                     "X-Forwarded-Attr-City": "Forged", "X-Forwarded-Attr-Forged": "x",
+                     "X-Forwarded-Access-Token": forged, "Authorization": "Bearer " + forged}
             for extra in ({}, spoof):
                 page.set_extra_http_headers(extra)
                 try:
@@ -297,8 +318,22 @@ def main() -> int:
                     assert seen.get(name) == [want], f"{name}: {seen.get(name)} (want [{want!r}], spoofed={bool(extra)})"
                 assert "admin" not in seen.get("x-auth-request-preferred-username", [user]), body[:800]
                 assert "x-forwarded-attr-forged" not in seen, body[:800]
+                assert forged not in body, "the forged access token reached the app"
+            # mtls.<d> (YubiKey certificate only): the real session has no
+            # mtls, so group-gate steps up. Had the forged token (amr mtls)
+            # reached it, the page would be present-certificate instead.
+            page.set_extra_http_headers({"X-Forwarded-Access-Token": forged, "Authorization": "Bearer " + forged})
+            try:
+                resp = page.goto(MTLS + "/", wait_until="domcontentloaded")
+                shot(page, "mtls-forged-token")
+                assert resp and resp.status == 403, f"mtls.<d> with a forged token: HTTP {resp and resp.status}"
+                assert page.locator("#stepup-continue").count() == 1, "no step-up page for a forged token"
+                assert page.locator("#present-certificate").count() == 0, "group-gate saw the forged token's amr"
+                assert "pc_method=yubikey_cert" in (page.locator("#stepup-continue").get_attribute("href") or "")
+            finally:
+                page.set_extra_http_headers({})
         check("apps get the username (not the email) as X-Forwarded-User and the user's attribute headers; "
-              "spoofed identity / attribute headers are dropped",
+              "spoofed identity / attribute / access-token headers are dropped (group-gate never sees a forged token)",
               identity_is_username)
 
         def refresh_rotation():
@@ -376,7 +411,7 @@ def main() -> int:
                 raise AssertionError("needs the registered passkey")
             key2 = Authenticator(page, saved["creds"])
             page.goto(HWK + "/", wait_until="domcontentloaded")
-            passkey_flow(page, until=HWK, label="second")
+            passkey_flow(page, until=HWK, label="second", expect_stepups=0)
             shot(page, "hwk-second-login")
             assert "Hostname" in page.inner_text("body"), page.url
             assert (key2.asserted, key2.registered) == (1, 0), f"assertions={key2.asserted} registrations={key2.registered}"
@@ -390,7 +425,7 @@ def main() -> int:
 
         def group_denied():
             page.goto(other_invite, wait_until="domcontentloaded")
-            passkey_flow(page, until=APP, label="other")
+            passkey_flow(page, until=APP, label="other", expect_stepups=0)
             resp = page.reload(wait_until="domcontentloaded")
             shot(page, "other-denied")
             assert resp and resp.status == 403, f"HTTP {resp and resp.status}"
@@ -405,7 +440,7 @@ def main() -> int:
         def admin_bootstrap():
             page.goto(admin_invite, wait_until="domcontentloaded")
             stepups: list = []
-            passkey_flow(page, until=PORTAL, label="admin", stepups=stepups)
+            passkey_flow(page, until=PORTAL, label="admin", expect_stepups=1, stepups=stepups)
             shot(page, "portal-admin")
             body = page.content()
             assert "Signed in as <strong>admin</strong>" in body, body[:400]
@@ -464,7 +499,7 @@ def main() -> int:
 
         def x509_login():
             page.goto(MTLS + "/", wait_until="domcontentloaded")
-            passkey_flow(page, until=MTLS, label="x509")
+            passkey_flow(page, until=MTLS, label="x509", expect_stepups=0)
             shot(page, "mtls-app")
             body = page.inner_text("body")
             assert "Hostname" in body, body[:500]

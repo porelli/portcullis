@@ -523,7 +523,7 @@ def main() -> int:
                 f"    {who}: request failed: {r.method} {r.url.split('?')[0]}: {r.failure}", flush=True))
             auths[who] = base.Authenticator(page)
             page.goto(os.environ[f"E2E_{who.upper()}_INVITE"], wait_until="domcontentloaded")
-            base.passkey_flow(page, until=PORTAL, label=f"ai-{who}")
+            base.passkey_flow(page, until=PORTAL, label=f"ai-{who}", expect_stepups=1)
             # Traced from here: the (consumed) setup link stays out of the trace.
             ctx.tracing.start(screenshots=True, snapshots=True, name=who)
             assert f"Signed in as <strong>{who}</strong>" in page.content(), page.content()[:300]

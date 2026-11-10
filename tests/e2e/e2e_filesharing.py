@@ -490,7 +490,7 @@ def sign_in(browser, who: str):
     page = ctx.new_page()
     auth = base.Authenticator(page)
     page.goto(link, wait_until="domcontentloaded")
-    base.passkey_flow(page, until=PORTAL, label=f"set-{who}")
+    base.passkey_flow(page, until=PORTAL, label=f"set-{who}", expect_stepups=1)
     assert f"Signed in as <strong>{who}</strong>" in page.content(), page.content()[:300]
     return ctx, page, auth
 
@@ -503,7 +503,7 @@ def open_myapps(page: Page, instance: str):
     deadline = time.time() + 60
     while time.time() < deadline:
         if base.on_login_pages(page):
-            base.passkey_flow(page, until=PEOPLE, label="people")
+            base.passkey_flow(page, until=PEOPLE, label="people", expect_stepups=0)
             page.goto(PEOPLE + "/#myapps", wait_until="domcontentloaded")
         row = page.locator(f'[data-ma-cred][data-ma-app="{instance}"][data-ma-key="{KEY}"]')
         if row.count() and row.first.is_visible():

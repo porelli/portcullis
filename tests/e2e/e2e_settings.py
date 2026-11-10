@@ -323,7 +323,7 @@ def settle(page: Page, url: str, *, seconds: int = 60, allow_resign: bool = Fals
             if not allow_resign:
                 base.shot(page, "unexpected-sign-in-prompt")
                 raise AssertionError(f"{url}: Keycloak asked to sign in again (session ended) at {page.url[:200]}")
-            base.passkey_flow(page, until=url, label="resign")
+            base.passkey_flow(page, until=url, label="resign", expect_stepups=0)
             continue
         page.wait_for_timeout(500)
     raise AssertionError(f"{url}: never settled (at {page.url})")
@@ -367,7 +367,7 @@ def immich_sign_in(page: Page, label: str, *, allow_resign: bool = False, prompt
                 raise AssertionError(f"Immich sign-in: Keycloak asked {label} to sign in again (session ended)")
             if prompted is not None:
                 prompted.append(True)
-            base.passkey_flow(page, until=PHOTOS, label=f"immich-{label}")
+            base.passkey_flow(page, until=PHOTOS, label=f"immich-{label}", expect_stepups=0)
             continue
         if base.on_login_pages(page):
             continue
@@ -430,7 +430,7 @@ def main() -> int:
             page = ctx.new_page()
             base.Authenticator(page)
             page.goto(os.environ[f"E2E_{who.upper()}_INVITE"], wait_until="domcontentloaded")
-            base.passkey_flow(page, until=PORTAL, label=f"set-{who}")
+            base.passkey_flow(page, until=PORTAL, label=f"set-{who}", expect_stepups=1)
             # Traced from here: the (consumed) setup link stays out of the trace.
             ctx.tracing.start(screenshots=True, snapshots=True, name=who)
             assert f"Signed in as <strong>{who}</strong>" in page.content(), page.content()[:300]

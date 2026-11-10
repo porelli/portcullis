@@ -801,6 +801,17 @@ class SigninV6Test(GateTest):
         # The same person without `inv` and an empty inventory: needs-stronger.
         code, hdrs, body = self.page("grafana.example.com", ["spk"])
         self.assertIn('id="needs-stronger"', body)
+        # [inv, spk] (a setup-link session that touched its synced passkey):
+        # `people` is still ignored for the wording — a step-up, never
+        # needs-stronger —, and access is decided by the methods alone.
+        code, hdrs, body = self.page("grafana.example.com", ["inv", "spk"])
+        self.assertEqual(code, 403)
+        self.assertIn('id="stepup-continue"', body)
+        self.assertNotIn('id="needs-stronger"', body)
+        self.assertIn("pc_method=security_key", hdrs["X-Stepup-URL"])
+        write_policy({"people": {"bob": []}})  # Standard default
+        self.assertEqual(self.page("grafana.example.com", ["inv", "spk"])[0], 200)
+        self.assertEqual(self.page("grafana.example.com", ["inv"])[0], 403)
 
     def test_yubikey_cert_needs_bound_cert(self):
         write_policy({"hosts": {"grafana.example.com": "strong"}})
