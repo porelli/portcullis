@@ -60,7 +60,7 @@ Identity:
   lldap-ui                    Break-glass SSH tunnel to LLDAP's own web UI (server only)
   keycloak configure          Import/patch the portcullis realm
   oidc register               Create core OIDC clients, push their secrets from .env
-  signin reset-core           Lockout recovery: the Hub's core pages back on the Standard sign-in
+  signin reset-core           Locked out of the Hub: put the Hub and people pages back on Standard
 
 Client certificates (YubiKey PIV):
   cert enroll                 New key + certificate on a YubiKey
