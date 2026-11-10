@@ -271,10 +271,15 @@ def kc_user_id(username: str) -> str | None:
     return users[0]["id"] if users else None
 
 
+PASSKEY_TYPES = {"webauthn", "webauthn-passwordless", "portcullis-device-passkey", "portcullis-security-key"}
+
+
 def kc_types(username: str) -> list:
+    """The person's passkey credential types (Keycloak also lists the LDAP
+    federation's `password`, which isn't a stored credential)."""
     uid = kc_user_id(username)
     assert uid, f"{username} isn't in Keycloak"
-    return sorted(c["type"] for c in kc(f"/users/{uid}/credentials"))
+    return sorted(c["type"] for c in kc(f"/users/{uid}/credentials") if c["type"] in PASSKEY_TYPES)
 
 
 def kc_sessions(username: str) -> list:
@@ -548,14 +553,16 @@ def main() -> int:
         # ── reclassify, part 1: rita registers while the fixture lacks the key ──
         def reclassify_register():
             s0 = published()["mds"]["serial"]
-            write_fixture(b"{}\n")
-            kick()
-            until("signin-keycloak.json without authenticators",
-                  lambda: published()["authenticators"] == {} and published()["mds"]["serial"] > s0, 90)
-            ctx = new_context()
-            page = ctx.new_page()
-            key = Key(page)
+            ctx = None
             try:
+                write_fixture(b"{}\n")
+                kick()
+                # The FIDO MDS's own entries stay; only the fixture's goes.
+                until("signin-keycloak.json without the virtual key's entry",
+                      lambda: AAGUID not in published()["authenticators"] and published()["mds"]["serial"] > s0, 90)
+                ctx = new_context()
+                page = ctx.new_page()
+                key = Key(page)
                 goto(page, invite("rita", "portal"))
                 deadline = time.time() + 90
                 while time.time() < deadline:
@@ -575,15 +582,17 @@ def main() -> int:
                 assert (key.registered, key.asserted) == (1, 0), (key.registered, key.asserted)
                 state["rita_page"] = (ctx, page)
             except Exception:
-                ctx.close()
+                if ctx:
+                    ctx.close()
                 raise
             finally:
                 # The fixture back at once: no other registration sees it empty.
                 write_fixture(original_fixture)
                 kick()
                 state["fixture_back"] = time.time()
-            until("signin-keycloak.json lists the key again",
-                  lambda: AAGUID in published()["authenticators"], 90)
+                # Every later registration needs the key's entry published.
+                until("signin-keycloak.json lists the key again",
+                      lambda: AAGUID in published()["authenticators"], 90)
             assert kc_types("rita") == ["webauthn-passwordless"], kc_types("rita")
             assert f"passkey registered for rita: AAGUID {AAGUID}, kind passkey_synced" in kc_log(), \
                 "no registration line for rita as passkey_synced"
@@ -789,7 +798,13 @@ def main() -> int:
                 base.shot(page, "alice-bobcert-refused")
                 assert page.locator("#kc-error-message").count() == 1, f"not refused at {page.url.split('?')[0]}"
                 assert not callbacks, f"a code reached oauth2-proxy: {len(callbacks)}"
-                assert "a certificate of another account was presented while alice was signing in" in kc_log()[mark:]
+                # Refused by the extension (its log line) or, before it, by Keycloak's own
+                # X.509 authenticator (setting another user than the step's: a LOGIN_ERROR
+                # naming bob's certificate and no user).
+                log = kc_log()[mark:]
+                assert "a certificate of another account was presented while alice was signing in" in log or \
+                    re.search(r'type="LOGIN_ERROR".*userId="null".*x509_cert_subject_distinguished_name="CN=bob"', log), \
+                    "no refusal of bob's certificate in Keycloak's log"
                 never_bob(page)
             finally:
                 ctx.close()
