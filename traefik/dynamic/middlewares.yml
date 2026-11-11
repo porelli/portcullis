@@ -18,7 +18,8 @@
 # portcullis-auth, portcullis-auth-console, portcullis-groups and
 # portcullis-public-guard all set authResponseHeadersRegex
 # ^X-Forwarded-Attr-, and Traefik removes every request header matching it
-# before copying the auth server's (only group-gate's / returns any). The entrypoints' aliasHeadersStrategy=delete drops `_` aliases.
+# before copying the auth server's (only group-gate's / returns any). The
+# entrypoints' aliasHeadersStrategy=delete drops `_` aliases.
 
 http:
   middlewares:

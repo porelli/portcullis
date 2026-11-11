@@ -980,8 +980,9 @@ services:
       # One-time invite links (enroll/invite.go): public, no forward-auth
       # (the user has no passkey yet). The only router on enroll.<domain>
       # (contract §5 "Core routers"): any other path there gets Traefik's
-      # 404. Only /invite/* reaches enroll this way; the token / JWKS (:8445) and invite API (:8444) ports are not
-      # routed by Traefik (Keycloak / the Hub use them on `portcullis`).
+      # 404. Only /invite/* reaches enroll this way; the token / JWKS
+      # (:8445) and invite API (:8444) ports are not routed by Traefik
+      # (Keycloak / the Hub use them on `portcullis`).
       traefik.http.routers.enroll-invite.rule: Host(`enroll.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/invite/`)
       traefik.http.routers.enroll-invite.entrypoints: websecure
       traefik.http.routers.enroll-invite.tls.options: authaware@file

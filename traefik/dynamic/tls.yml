@@ -6,9 +6,12 @@
 # the instance's compiled sign-in template and the certificate methods
 # that are switched on (policy.Tier). Exactly these four options:
 #
-# protected:     RequireAndVerifyClientCert — a YubiKey certificate (root + pki_int
-#                only: certs/ca-chain-yubikey.crt) or the TLS handshake fails;
-#                a browser certificate never passes it.
+# protected:     RequireAndVerifyClientCert — a YubiKey certificate or the TLS
+#                handshake fails. certs/ca-chain-yubikey.crt holds pki_int
+#                ALONE, no root: Go trusts every caFiles certificate as an
+#                anchor and uses the intermediates the client sends, and a
+#                browser .p12 sends pki_file + root, so a root here would
+#                admit browser certificates.
 #                Used by auth.method: mtls apps and templates where every
 #                alternative has yubikey_cert.
 # protected-any: RequireAndVerifyClientCert — a YubiKey or browser certificate

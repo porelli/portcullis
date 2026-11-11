@@ -592,10 +592,10 @@ ROOT_DIR="$(cd "$HERE/.." && pwd)"
 expect_eq "MTLS_ENABLED appears nowhere in portcullis scripts/lib docker-compose.yml" \
   "$(grep -l MTLS_ENABLED "$ROOT_DIR/portcullis" "$ROOT_DIR"/scripts/lib/*.sh "$ROOT_DIR/docker-compose.yml" "$ROOT_DIR/.env.example" 2>/dev/null || true)" ""
 TLS_YML="$ROOT_DIR/traefik/dynamic/tls.yml"
-# One line per option: <name> <clientAuthType or none> <caFile> <minVersion> <sniStrict>.
+# One line per option: <name> <clientAuthType or none> <every caFiles entry, comma-joined> <minVersion> <sniStrict>.
 TLS_GOT="$(awk '
   /^    [a-z-]+:$/ { if (n) print n, (t ? t : "none"), (ca ? ca : "-"), v, s; n = $1; sub(/:$/, "", n); t = ""; ca = ""; v = ""; s = ""; next }
-  /clientAuthType:/ { t = $2 } /- \/certs\// { ca = $2 } /minVersion:/ { v = $2 } /sniStrict:/ { s = $2 }
+  /clientAuthType:/ { t = $2 } /^[[:space:]]*- / { ca = (ca ? ca "," : "") $2 } /minVersion:/ { v = $2 } /sniStrict:/ { s = $2 }
   END { if (n) print n, (t ? t : "none"), (ca ? ca : "-"), v, s }' "$TLS_YML")"
 expect_eq "traefik/dynamic/tls.yml defines exactly protected, protected-any, authaware, public with those clientAuth types and chains" "$TLS_GOT" \
 "protected RequireAndVerifyClientCert /certs/ca-chain-yubikey.crt VersionTLS12 false

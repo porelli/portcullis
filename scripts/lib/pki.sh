@@ -162,17 +162,19 @@ _pki_put() {
 #   yubikey-ca.crt (pki_int), browser-ca.crt (pki_file);
 #   ca-chain.crt = root + pki_int + pki_file (Traefik's protected-any and
 #     authaware options: both kinds);
-#   ca-chain-yubikey.crt = root + pki_int only (Traefik's protected option:
-#     a browser certificate never passes that handshake);
+#   ca-chain-yubikey.crt = pki_int alone, no root (Traefik's protected
+#     option: Go takes each caFiles certificate as an anchor, so with the
+#     root in it a browser certificate sending pki_file would pass);
 #   truststore/ (Keycloak): portcullis-ca-chain.pem, portcullis-yubikey-ca.pem,
 #     portcullis-browser-ca.pem.
 # Refuses when the two intermediates' CNs are equal (every reader tells the
 # kinds apart by issuer). When <rewrite> is true (pki_file was just
 # created) or any chain / truststore file differs from what it should be,
-# all of them are rewritten and PKI_TRUSTSTORE_CHANGED=true (stack.sh then
-# restarts Traefik, Keycloak and group-gate, which read them only at
-# start-up or through a single-file bind mount); a rewritten
-# yubikey-ca.crt / browser-ca.crt sets it too.
+# all of them are rewritten and PKI_TRUSTSTORE_CHANGED=true; a rewritten
+# yubikey-ca.crt / browser-ca.crt sets it too. Restarts don't rest on the
+# flag: up / upgrade compare the files with the stamp the services were
+# started with (stack.sh pki_files_reload) and restart Traefik, Keycloak
+# and group-gate on any difference.
 _pki_export() {
   local certs="$1" rewrite="$2" root int file cn_int cn_file chain chain_yk ts
   root="$(_pki_ca_pem pki)" || exit 1
@@ -193,7 +195,11 @@ _pki_export() {
   _pki_same "$certs/browser-ca.crt" "$file" || { _pki_put "$certs/browser-ca.crt" "$file"; PKI_TRUSTSTORE_CHANGED=true; }
 
   chain="$root"$'\n'"$int"$'\n'"$file"
-  chain_yk="$root"$'\n'"$int"
+  # pki_int ONLY, no root: Go's TLS server takes every caFiles certificate
+  # as a trust anchor and builds paths through the intermediates the client
+  # sends, so a root here would let a browser certificate (whose .p12 sends
+  # pki_file + root) through Traefik's protected option.
+  chain_yk="$int"
   ts="$certs/truststore"
   mkdir -p "$ts"
   chmod 755 "$ts"
@@ -366,8 +372,9 @@ on both intermediates.
 
 Writes certs/root-ca.crt, intermediate-ca.crt, yubikey-ca.crt,
 browser-ca.crt, ca-chain.crt (root + both intermediates: Traefik's
-protected-any and authaware options), ca-chain-yubikey.crt (root + the
-YubiKey CA only: Traefik's protected option) and Keycloak's truststore
+protected-any and authaware options), ca-chain-yubikey.crt (the YubiKey
+CA alone, no root: Traefik's protected option — Go trusts every CA in it
+as an anchor, so a root would also admit browser certificates) and Keycloak's truststore
 (certs/truststore/portcullis-ca-chain.pem, portcullis-yubikey-ca.pem,
 portcullis-browser-ca.pem).
 
@@ -376,7 +383,9 @@ a new CLIENT_CERT_TTL applies to certificates issued from now on); missing
 pieces (the browser certificate CA, CA files, truststore, server cert) are
 recreated; a partial earlier run is redone. When the browser certificate
 CA is created or a chain file is out of date, both chain files and the
-truststore are rewritten and the next `up` restarts Traefik and Keycloak.
+truststore are rewritten. The next `up` or `upgrade` restarts Traefik,
+Keycloak and group-gate whenever these files differ from the ones they
+were started with (certs/.pki-files.loaded, written after the restart).
 Refuses when the two intermediates have the same CN, and refuses to create
 a new CA when Vault has none but certs/ca-chain.crt exists (Vault data
 lost) — restore a backup or use --force.

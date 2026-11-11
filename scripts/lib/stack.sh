@@ -176,6 +176,7 @@ init_run() {
   info "Restarting Traefik, the forward-auth services, Keycloak and group-gate to pick up the CA chain..."
   dc restart traefik forward-auth forward-auth-ext keycloak group-gate
   signin_ca_mark
+  pki_files_mark
   config_mark
   wait_healthy 300 keycloak
 
@@ -257,6 +258,43 @@ signin_ca_reload() {
     dc restart forward-auth forward-auth-ext >/dev/null || return 1
     printf '%s\n' "$sum" > "$stamp"
   fi
+}
+
+# Traefik (both chains), Keycloak (the truststore) and group-gate (the two CA
+# files, single-file bind mounts: an atomic replace is a new inode a running
+# container never sees) read the internal CA's files only at start-up. The
+# hash of the set they were last started with is kept in
+# certs/.pki-files.loaded; up / upgrade restart them whenever it differs (or
+# none was recorded), and the stamp is written only after a successful
+# restart, so a failed or interrupted run restarts them next time.
+PKI_FILES_LOADED=".pki-files.loaded"
+PKI_FILES_SERVICES="traefik keycloak group-gate"
+
+# _pki_files_sum — one hash over the CA / chain / truststore files (a
+# missing file counts as "missing").
+_pki_files_sum() {
+  local c="$PORTCULLIS_ROOT/certs" f
+  for f in ca-chain.crt ca-chain-yubikey.crt yubikey-ca.crt browser-ca.crt \
+           truststore/portcullis-ca-chain.pem truststore/portcullis-yubikey-ca.pem truststore/portcullis-browser-ca.pem; do
+    if [ -f "$c/$f" ]; then printf '%s %s\n' "$f" "$(_ca_bundle_sum "$c/$f")"; else printf '%s missing\n' "$f"; fi
+  done | _ca_bundle_sum /dev/stdin
+}
+
+# pki_files_mark — record the CA files the services just started with.
+pki_files_mark() { _pki_files_sum > "$PORTCULLIS_ROOT/certs/$PKI_FILES_LOADED"; }
+
+# pki_files_reload — restart Traefik, Keycloak and group-gate when the CA
+# files differ from the recorded set (or none was recorded), then record it.
+pki_files_reload() {
+  local stamp="$PORTCULLIS_ROOT/certs/$PKI_FILES_LOADED" sum
+  # No internal CA yet (before the first pki setup): nothing to load.
+  [ -f "$PORTCULLIS_ROOT/certs/ca-chain.crt" ] || return 0
+  sum="$(_pki_files_sum)"
+  [ "$(cat "$stamp" 2>/dev/null)" != "$sum" ] || return 0
+  info "Restarting Traefik, Keycloak and group-gate to pick up the internal CA's files..."
+  # shellcheck disable=SC2086
+  dc restart $PKI_FILES_SERVICES >/dev/null || return 1
+  printf '%s\n' "$sum" > "$stamp"
 }
 
 # Repo-shipped bind-mounted config files and the services that read them only
@@ -358,6 +396,7 @@ stack_up() {
   domains_restart_if_renewed
   monitoring_reload
   signin_ca_reload
+  pki_files_reload
   config_reload
   wait_healthy 300 vault postgres lldap keycloak
   # If the service account was created or its password changed, restart the Hub
@@ -401,14 +440,12 @@ upgrade_run() {
   dc up -d --build
   domains_restart_if_renewed
   monitoring_reload
-  if [ "$PKI_CREATED" = true ] || [ "${PKI_TRUSTSTORE_CHANGED:-false}" = true ]; then
-    # Traefik, forward-auth(-ext) and Keycloak read the CA chain only at
-    # start-up; group-gate bind-mounts the two CA files (an atomic replace
-    # is a new inode its container doesn't see).
-    dc restart traefik forward-auth forward-auth-ext keycloak group-gate >/dev/null
-    signin_ca_mark
-    # config_reload will restart services for config changes and mark them
-  fi
+  # Traefik, Keycloak and group-gate: whenever the CA files differ from the
+  # ones they were started with (the persistent stamp, not this run's
+  # PKI_TRUSTSTORE_CHANGED alone, so an interrupted run is caught up).
+  pki_files_reload
+  # forward-auth(-ext): the CA bundle (signin_ca_reload, also below).
+  signin_ca_reload
   config_reload
   wait_healthy 300 vault postgres lldap keycloak
   keycloak_configure false

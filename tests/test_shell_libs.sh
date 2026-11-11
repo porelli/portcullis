@@ -597,14 +597,31 @@ expect_fail "vault_no_value: empty" vault_no_value ''
 # ══ portcullis pki setup: idempotency / partial runs / guard ═══
 # Real (self-signed) CA certificates, so CNs and the chain order can be checked.
 mkdir -p "$STUB_DIR/pem"
-mkpem() {
+# mkpem <name> <CN> [<issuer name>] — a CA certificate: self-signed, or
+# signed by <issuer> (a real hierarchy: the handshake check below builds
+# paths through it); mkleaf <name> <CN> <issuer> — a client-auth leaf.
+printf '[req]\ndistinguished_name=dn\n[dn]\n[ca]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n' > "$STUB_DIR/pem/req.cnf"
+printf 'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n' > "$STUB_DIR/pem/ca.ext"
+printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > "$STUB_DIR/pem/leaf.ext"
+_mksigned() {  # <name> <CN> <issuer> <ext>
   openssl ecparam -genkey -name prime256v1 -out "$STUB_DIR/pem/$1.key" 2>/dev/null
-  openssl req -new -x509 -key "$STUB_DIR/pem/$1.key" -subj "/CN=$2" -days 2 -out "$STUB_DIR/pem/$1" 2>/dev/null
+  openssl req -new -key "$STUB_DIR/pem/$1.key" -subj "/CN=$2" -out "$STUB_DIR/pem/$1.csr" 2>/dev/null
+  openssl x509 -req -in "$STUB_DIR/pem/$1.csr" -CA "$STUB_DIR/pem/$3" -CAkey "$STUB_DIR/pem/$3.key" \
+    -set_serial "0x$(openssl rand -hex 8)" -days 2 -extfile "$STUB_DIR/pem/$4" -out "$STUB_DIR/pem/$1" 2>/dev/null
 }
+mkpem() {
+  if [ -n "${3:-}" ]; then _mksigned "$1" "$2" "$3" ca.ext; return; fi
+  openssl ecparam -genkey -name prime256v1 -out "$STUB_DIR/pem/$1.key" 2>/dev/null
+  openssl req -new -x509 -key "$STUB_DIR/pem/$1.key" -subj "/CN=$2" -days 2 \
+    -config "$STUB_DIR/pem/req.cnf" -extensions ca -out "$STUB_DIR/pem/$1" 2>/dev/null
+}
+mkleaf() { _mksigned "$1" "$2" "$3" leaf.ext; }
 mkpem root "example.test Root CA"
-mkpem int "example.test Intermediate CA"
-mkpem file "example.test Browser Certificate CA"
-mkpem file-samecn "example.test Intermediate CA"
+mkpem int "example.test Intermediate CA" root
+mkpem file "example.test Browser Certificate CA" root
+mkpem file-samecn "example.test Intermediate CA" root
+mkleaf leaf-yk alice int
+mkleaf leaf-br alice file
 # A scripted vault stub: $PKI_STATE selects which PKI pieces "exist":
 #   none (fresh Vault), complete (pki, pki_int, pki_file), nofile (pki_file
 #   missing), norole (client-cert role missing), samecn (pki_file has
@@ -676,7 +693,9 @@ expect_ok "pki: CRL auto-rebuild configured" grep -q 'pki_int/config/crl .*auto_
 expect_ok "pki: delta CRLs enabled, rebuilt every minute" grep -q 'pki_int/config/crl .*enable_delta=true delta_rebuild_interval=1m' "$STUB_DIR/pki-calls"
 # The three CA files, as pki_setup must export them.
 CHAIN3="$(cat "$STUB_DIR/pem/root" "$STUB_DIR/pem/int" "$STUB_DIR/pem/file")"
-CHAIN2="$(cat "$STUB_DIR/pem/root" "$STUB_DIR/pem/int")"
+# ca-chain-yubikey.crt: pki_int ALONE (review C1: Go trusts every caFiles
+# certificate as an anchor, so a root there would admit browser leaves).
+CHAIN2="$(cat "$STUB_DIR/pem/int")"
 nbegin() { grep -c 'BEGIN CERTIFICATE' "$1"; }
 expect_ok "pki_setup on a fresh Vault enables pki" grep -qx 'secrets enable -path=pki pki' "$STUB_DIR/pki-calls"
 expect_ok "pki_setup on a fresh Vault enables pki_int" grep -qx 'secrets enable -path=pki_int pki' "$STUB_DIR/pki-calls"
@@ -687,7 +706,46 @@ expect_ok "pki_file gets its signed certificate" grep -q 'write pki_file/interme
 expect_ok "pki_file URLs point at pki_file" grep -q 'pki_file/config/urls issuing_certificates=.*/v1/pki_file/ca crl_distribution_points=.*/v1/pki_file/crl' "$STUB_DIR/pki-calls"
 expect_eq "pki: ca-chain.crt has 3 certificates" "$(nbegin "$PKI_ROOT/certs/ca-chain.crt")" 3
 expect_eq "pki: ca-chain.crt is root, pki_int, pki_file in order" "$(cat "$PKI_ROOT/certs/ca-chain.crt")" "$CHAIN3"
-expect_eq "pki: ca-chain-yubikey.crt has exactly root, pki_int" "$(cat "$PKI_ROOT/certs/ca-chain-yubikey.crt")" "$CHAIN2"
+expect_eq "pki: ca-chain-yubikey.crt is pki_int's certificate alone (no root)" "$(cat "$PKI_ROOT/certs/ca-chain-yubikey.crt")" "$CHAIN2"
+expect_eq "pki: ca-chain-yubikey.crt holds exactly 1 certificate" "$(nbegin "$PKI_ROOT/certs/ca-chain-yubikey.crt")" 1
+# The handshake rule (review C1), with Go's semantics: every caFiles
+# certificate is a trust anchor (-partial_chain) and the client's own
+# chain is untrusted input. A browser .p12 sends leaf + pki_file + root.
+BR_SENT="$STUB_DIR/pem/browser-sent"; cat "$STUB_DIR/pem/file" "$STUB_DIR/pem/root" > "$BR_SENT"
+YK_SENT="$STUB_DIR/pem/yubikey-sent"; cat "$STUB_DIR/pem/int" > "$YK_SENT"
+# OpenSSL >= 1.1 (CI's) has -partial_chain; LibreSSL (macOS /usr/bin) doesn't,
+# and an unusable binary must never look like a refusal.
+OSSL=""
+for o in openssl /opt/homebrew/bin/openssl /usr/local/bin/openssl; do
+  if command -v "$o" >/dev/null 2>&1 && "$o" verify -help 2>&1 | grep -q -- -partial_chain; then OSSL="$o"; break; fi
+done
+# hs <caFiles> <chain the client sends, "" for none> <leaf> — "accepted", "refused" or "error".
+hs() {
+  local out
+  [ -n "$OSSL" ] || { echo error; return; }
+  local sent=()
+  [ -z "$2" ] || sent=(-untrusted "$2")
+  if out="$("$OSSL" verify -partial_chain -purpose sslclient -CAfile "$1" "${sent[@]}" "$3" 2>&1)"; then echo accepted
+  elif printf '%s' "$out" | grep -q 'error [0-9]* at [0-9]* depth lookup'; then echo refused
+  else echo error; fi
+}
+expect_eq "handshake check: an OpenSSL with -partial_chain is available" "${OSSL:+yes}" yes
+expect_eq "protected (ca-chain-yubikey.crt) refuses a browser leaf sending pki_file + root" \
+  "$(hs "$PKI_ROOT/certs/ca-chain-yubikey.crt" "$BR_SENT" "$STUB_DIR/pem/leaf-br")" refused
+expect_eq "protected (ca-chain-yubikey.crt) refuses a browser leaf sent alone" \
+  "$(hs "$PKI_ROOT/certs/ca-chain-yubikey.crt" "" "$STUB_DIR/pem/leaf-br")" refused
+expect_eq "protected (ca-chain-yubikey.crt) accepts a YubiKey leaf" \
+  "$(hs "$PKI_ROOT/certs/ca-chain-yubikey.crt" "$YK_SENT" "$STUB_DIR/pem/leaf-yk")" accepted
+expect_eq "protected (ca-chain-yubikey.crt) accepts a YubiKey leaf sent alone" \
+  "$(hs "$PKI_ROOT/certs/ca-chain-yubikey.crt" "" "$STUB_DIR/pem/leaf-yk")" accepted
+expect_eq "protected-any / authaware (ca-chain.crt) accept a browser leaf" \
+  "$(hs "$PKI_ROOT/certs/ca-chain.crt" "$BR_SENT" "$STUB_DIR/pem/leaf-br")" accepted
+expect_eq "protected-any / authaware (ca-chain.crt) accept a YubiKey leaf" \
+  "$(hs "$PKI_ROOT/certs/ca-chain.crt" "$YK_SENT" "$STUB_DIR/pem/leaf-yk")" accepted
+# The check catches the flaw: with the root in the file, the browser leaf passes.
+cat "$STUB_DIR/pem/root" "$STUB_DIR/pem/int" > "$STUB_DIR/pem/old-yk-chain"
+expect_eq "the handshake check detects a root in the YubiKey chain (root + pki_int admits a browser leaf)" \
+  "$(hs "$STUB_DIR/pem/old-yk-chain" "$BR_SENT" "$STUB_DIR/pem/leaf-br")" accepted
 expect_ok "pki: yubikey-ca.crt is pki_int's certificate" cmp -s "$PKI_ROOT/certs/yubikey-ca.crt" "$STUB_DIR/pem/int"
 expect_ok "pki: browser-ca.crt is pki_file's certificate" cmp -s "$PKI_ROOT/certs/browser-ca.crt" "$STUB_DIR/pem/file"
 expect_ok "truststore has portcullis-yubikey-ca.pem" cmp -s "$PKI_ROOT/certs/truststore/portcullis-yubikey-ca.pem" "$STUB_DIR/pem/int"
@@ -763,7 +821,7 @@ expect_ok "pki_setup with pki_int present: pki_file signed by the root" grep -q 
 expect_fail "pki_setup with pki_int present keeps pki_int (no disable / generate on it)" \
   grep -Eq 'secrets disable|pki_int/intermediate/generate|pki/root/generate' "$STUB_DIR/pki-calls"
 expect_eq "pki_setup with pki_int present rewrites ca-chain.crt to 3 certificates" "$(cat "$CERTS/ca-chain.crt")" "$CHAIN3"
-expect_eq "pki_setup with pki_int present writes ca-chain-yubikey.crt" "$(cat "$CERTS/ca-chain-yubikey.crt")" "$CHAIN2"
+expect_eq "pki_setup with pki_int present writes ca-chain-yubikey.crt (pki_int alone)" "$(cat "$CERTS/ca-chain-yubikey.crt")" "$CHAIN2"
 expect_eq "pki_setup with pki_int present rewrites the truststore chain" "$(cat "$CERTS/truststore/portcullis-ca-chain.pem")" "$CHAIN3"
 expect_ok "pki_setup with pki_int present writes the truststore's browser CA" cmp -s "$CERTS/truststore/portcullis-browser-ca.pem" "$STUB_DIR/pem/file"
 expect_ok "pki_setup with pki_int present writes the browser-cert role" grep -q 'write pki_file/roles/browser-cert' "$STUB_DIR/pki-calls"
@@ -855,6 +913,24 @@ jq -n '{Status: "healthy", Log: [{Output: "ok\nrefusing every AI request (503): 
 expect_eq "status: mcp-gate serving = nothing" "$(mst)" ""
 rm -f "$STUB_DIR/mst-id"
 expect_eq "status: mcp-gate not running = nothing" "$(mst)" ""
+
+# ── status --textfile: certificates per person and kind, the browser CA (review M2) ──
+stf() { (status_run() { cat "$STUB_DIR/stf.json"; }; metrics_textfile_write() { cat; }; status_textfile); }
+jq -n '{ok: true, services: [], vault: {active: true, root_ca_expires_epoch: 300, intermediate_ca_expires_epoch: 200, browser_ca_expires_epoch: 100,
+        client_certs: [{cn: "alice", kind: "yubikey", epoch: 10}, {cn: "alice", kind: "browser", epoch: 20}, {cn: "b\"o", kind: "browser", epoch: 30}]}}' > "$STUB_DIR/stf.json"
+STF="$(stf)"
+expect_eq "status --textfile: one certificate series per person and kind (label kind)" \
+  "$(printf '%s\n' "$STF" | grep '^portcullis_client_cert_expiry_timestamp_seconds{')" \
+  'portcullis_client_cert_expiry_timestamp_seconds{cn="alice",kind="yubikey"} 10
+portcullis_client_cert_expiry_timestamp_seconds{cn="alice",kind="browser"} 20
+portcullis_client_cert_expiry_timestamp_seconds{cn="b\"o",kind="browser"} 30'
+expect_eq "status --textfile: root, intermediate (YubiKey) and browser CA series" \
+  "$(printf '%s\n' "$STF" | grep '^portcullis_ca_expiry_timestamp_seconds{')" \
+  'portcullis_ca_expiry_timestamp_seconds{ca="root"} 300
+portcullis_ca_expiry_timestamp_seconds{ca="intermediate"} 200
+portcullis_ca_expiry_timestamp_seconds{ca="browser"} 100'
+jq '.vault.browser_ca_expires_epoch = 0' "$STUB_DIR/stf.json" > "$STUB_DIR/stf2.json" && mv "$STUB_DIR/stf2.json" "$STUB_DIR/stf.json"
+expect_eq "status --textfile: no browser CA series while its expiry is unknown" "$(stf | grep -c 'ca="browser"' || true)" 0
 
 # ── upgrade: pinned Hub image, policy file version (final review M1) ──
 # dc stub: exec prints $STUB_DIR/pv (the policy version), logs $STUB_DIR/gglog.
@@ -1685,6 +1761,49 @@ printf '#!/usr/bin/env bash\necho "$*" >> "$STUB_DIR/calls"\ncase "$*" in *resta
 ca_run 'set -e; signin_ca_reload'
 expect_eq "ca bundle: a failed restart keeps the old record" "$(cat "$PORTCULLIS_ROOT/certs/.ca-bundle.loaded")" "old"
 cp "$WORK/docker.ok" "$WORK/bin/docker"
+
+# ── pki_files_reload (review I1): Traefik, Keycloak and group-gate restart
+# whenever the internal CA's files differ from the persistent stamp ──
+pki_restarts() { grep -c -- '--project-directory .* restart traefik keycloak group-gate$' "$STUB_DIR/calls" 2>/dev/null || true; }
+PC="$PORTCULLIS_ROOT/certs"
+rm -f "$PC/.pki-files.loaded" "$PC/ca-chain.crt"
+: > "$STUB_DIR/calls"
+ca_run pki_files_reload
+expect_eq "pki files: no CA yet → nothing done" "$(pki_restarts):$([ -e "$PC/.pki-files.loaded" ] && echo stamp || echo none)" "0:none"
+mkdir -p "$PC/truststore"
+for f in ca-chain.crt ca-chain-yubikey.crt yubikey-ca.crt browser-ca.crt truststore/portcullis-ca-chain.pem truststore/portcullis-yubikey-ca.pem truststore/portcullis-browser-ca.pem; do
+  printf 'pem %s\n' "$f" > "$PC/$f"
+done
+: > "$STUB_DIR/calls"
+ca_run pki_files_reload
+expect_eq "pki files: nothing recorded → traefik, keycloak, group-gate restarted once" "$(pki_restarts)" "1"
+expect_ok "pki files: the stamp is written after the restart" test -s "$PC/.pki-files.loaded"
+: > "$STUB_DIR/calls"
+ca_run pki_files_reload
+expect_eq "pki files: unchanged → no restart" "$(pki_restarts)" "0"
+for f in ca-chain-yubikey.crt browser-ca.crt truststore/portcullis-browser-ca.pem; do
+  printf 'new\n' >> "$PC/$f"
+  : > "$STUB_DIR/calls"
+  ca_run pki_files_reload
+  expect_eq "pki files: $f changed → restarted" "$(pki_restarts)" "1"
+done
+: > "$STUB_DIR/calls"
+printf 'again\n' >> "$PC/yubikey-ca.crt"
+ca_run pki_files_mark
+ca_run pki_files_reload
+expect_eq "pki files: pki_files_mark after an explicit restart → no second restart" "$(pki_restarts)" "0"
+# A failed restart keeps the old stamp: the next up / upgrade restarts them.
+printf 'old\n' > "$PC/.pki-files.loaded"
+printf 'more\n' >> "$PC/ca-chain.crt"
+printf '#!/usr/bin/env bash\necho "$*" >> "$STUB_DIR/calls"\ncase "$*" in *restart*) exit 1 ;; esac\nexit 0\n' > "$WORK/bin/docker"
+rc=0; ca_run 'set -e; pki_files_reload' || rc=$?
+expect_eq "pki files: a failed restart fails and keeps the old stamp" "$rc:$(cat "$PC/.pki-files.loaded")" "1:old"
+cp "$WORK/docker.ok" "$WORK/bin/docker"
+: > "$STUB_DIR/calls"
+ca_run pki_files_reload
+expect_eq "pki files: the next run restarts them" "$(pki_restarts)" "1"
+rm -rf "$PC/truststore" "$PC/.pki-files.loaded"
+for f in ca-chain.crt ca-chain-yubikey.crt yubikey-ca.crt browser-ca.crt; do rm -f "$PC/$f"; done
 
 # ── config_reload: services restart only when their config files changed ──
 cfg_run() {

@@ -806,12 +806,15 @@ jobs:
           openssl verify -CAfile certs/root-ca.crt certs/yubikey-ca.crt
           openssl verify -CAfile certs/root-ca.crt certs/browser-ca.crt
           openssl verify -CAfile certs/ca-chain.crt certs/server.crt
-          # ca-chain.crt = root + pki_int + pki_file; ca-chain-yubikey.crt = root + pki_int only.
+          # ca-chain.crt = root + pki_int + pki_file; ca-chain-yubikey.crt = pki_int ONLY
+          # (review C1: Go trusts every caFiles certificate as an anchor, so a root
+          # there would let a browser certificate sending pki_file + root through).
           subjects() { openssl crl2pkcs7 -nocrl -certfile "$1" | openssl pkcs7 -print_certs -noout | sed -n 's/^subject=//p'; }
           test "$(subjects certs/ca-chain.crt | tr '\n' '|')" = "$(for f in root-ca yubikey-ca browser-ca; do subjects "certs/$f.crt"; done | tr '\n' '|')" \
             || { echo "FAIL: ca-chain.crt is not root + YubiKey CA + browser CA"; subjects certs/ca-chain.crt; exit 1; }
-          test "$(subjects certs/ca-chain-yubikey.crt | tr '\n' '|')" = "$(for f in root-ca yubikey-ca; do subjects "certs/$f.crt"; done | tr '\n' '|')" \
-            || { echo "FAIL: ca-chain-yubikey.crt is not root + YubiKey CA"; subjects certs/ca-chain-yubikey.crt; exit 1; }
+          test "$(subjects certs/ca-chain-yubikey.crt | tr '\n' '|')" = "$(subjects certs/yubikey-ca.crt | tr '\n' '|')" \
+            || { echo "FAIL: ca-chain-yubikey.crt is not the YubiKey CA alone"; subjects certs/ca-chain-yubikey.crt; exit 1; }
+          cmp -s certs/ca-chain-yubikey.crt certs/yubikey-ca.crt || { echo "FAIL: ca-chain-yubikey.crt differs from yubikey-ca.crt"; exit 1; }
           test "$(subjects certs/yubikey-ca.crt)" != "$(subjects certs/browser-ca.crt)" || { echo "FAIL: the two CAs have the same subject"; exit 1; }
           cmp -s certs/ca-chain.crt certs/truststore/portcullis-ca-chain.pem || { echo "FAIL: truststore chain differs"; exit 1; }
           echo "PASS: Certificate chain is valid"
@@ -1899,24 +1902,27 @@ jobs:
             || { echo "FAIL: no signin.reset_core audit entry by cli naming the change"; exit 1; }
           echo "PASS: signin reset-core refuses without --yes and a tty (exit 2), undoes a method switched off through the API, puts hub / people on standard, writes state.yaml / audit.jsonl / .hub.lock as 10001, audits it, starts the Hub again"
 
-      - name: Test enrollment UI responds
+      # enroll is no longer a site (contract §5 "Core routers", D31): only
+      # /healthz, the setup-link pages (/invite/*) and the internal API on
+      # :8444 (bearer) remain. Its old pages and APIs must be gone.
+      - name: Find enroll; its retired pages and APIs are gone
         run: |
           ENROLL_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q enroll)")
           test -n "$ENROLL_IP" || { echo "FAIL: no enroll IP on the portcullis network"; exit 1; }
           echo "ENROLL_IP=$ENROLL_IP" >> "$GITHUB_ENV"
           for _ in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' "http://$ENROLL_IP:8443/" || true)
-            [ "$code" = 200 ] && { echo "PASS: Enrollment UI is serving pages"; exit 0; }
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://$ENROLL_IP:8443/healthz" || true)
+            [ "$code" = 200 ] && break
             sleep 2
           done
-          echo "FAIL: Enrollment UI returned $code"; docker compose logs --tail=30 enroll; exit 1
-
-      - name: Test enrollment API - list users
-        run: |
-          USERS=$(curl -sf "http://$ENROLL_IP:8443/api/users")
-          echo "$USERS" | jq -e 'type == "array" and any(.[]; .username == "testuser")' >/dev/null \
-            || { echo "FAIL: /api/users did not return testuser: $USERS"; exit 1; }
-          echo "PASS: Enrollment API returned $(echo "$USERS" | jq length) users"
+          [ "$code" = 200 ] || { echo "FAIL: enroll /healthz returned $code"; docker compose logs --tail=30 enroll; exit 1; }
+          for p in / /users /certs /enroll/testuser /api/users /self /api/self/renew; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://$ENROLL_IP:8443$p" || true)
+            [ "$code" = 404 ] || { echo "FAIL: enroll still answers GET $p ($code)"; exit 1; }
+          done
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{}' "http://$ENROLL_IP:8443/api/sign" || true)
+          case "$code" in 404|405) ;; *) echo "FAIL: enroll still answers POST /api/sign ($code)"; exit 1 ;; esac
+          echo "PASS: enroll serves /healthz; its old pages, /api/users, /api/sign and /self are gone"
 
       - name: Test the sign-in flows, setup links and the invite APIs
         run: |
@@ -2193,26 +2199,34 @@ jobs:
           [ -n "$(tok)" ] && [ "$(tok)" != null ] || { echo "FAIL: master admin can't sign in"; exit 1; }
           echo "PASS: users and groups deleted in LLDAP leave Keycloak (group at sync, user at lookup); a re-created name is a new Keycloak identity (entryUUID); LLDAP outage removes nothing; core's accounts kept"
 
-      - name: Test enrollment API - sign CSR (AppRole token)
+      # The admin CSR path that replaced /api/sign (contract §9.4, D23):
+      # enroll's internal API on :8444 with the invite bearer, signed on
+      # pki_int through enroll's own AppRole.
+      - name: Test enroll's YubiKey certificate API - sign a CSR (AppRole token)
         run: |
-          PAYLOAD=$(jq -n --arg csr "$(cat /tmp/test-client.csr)" \
-            '{username:"testuser",email:"testuser@portcullis.local",csr:$csr}')
-          # Direct-to-container call bypasses Traefik, so supply the
-          # header Traefik would set from forward-auth for an admin.
-          RESPONSE=$(curl -s -X POST "http://$ENROLL_IP:8443/api/sign" \
-            -H "Content-Type: application/json" \
-            -H "X-Auth-Request-Groups: lldap_admin" \
-            -d "$PAYLOAD")
-          SERIAL=$(echo "$RESPONSE" | jq -r '.serial // empty' 2>/dev/null || true)
-          if [ -z "$SERIAL" ]; then
-            echo "FAIL: Sign API response: $RESPONSE"; docker compose logs --tail=30 enroll; exit 1
+          api() { curl -s -o /tmp/yk.json -w '%{http_code}' -X POST -H 'Content-Type: application/json' "$@"; }
+          bearer() { printf 'Authorization: Bearer %s\n' "$(cat secrets/enroll/invite-api-secret)"; }
+          PAYLOAD=$(jq -n --arg csr "$(cat /tmp/test-client.csr)" '{user: "testuser", csr: $csr}')
+          code=$(printf '%s' "$PAYLOAD" | api -H @<(bearer) --data-binary @- "http://$ENROLL_IP:8444/internal/yubikey-certificates")
+          [ "$code" = 201 ] || { echo "FAIL: POST /internal/yubikey-certificates got $code: $(head -c 400 /tmp/yk.json)"; docker compose logs --tail=30 enroll; exit 1; }
+          SERIAL=$(jq -r '.serial // empty' /tmp/yk.json)
+          if [ -z "$SERIAL" ] || ! jq -e '.certificate | startswith("-----BEGIN CERTIFICATE-----")' /tmp/yk.json >/dev/null; then
+            echo "FAIL: answer without a PEM certificate / serial: $(head -c 400 /tmp/yk.json)"; exit 1
           fi
-          echo "PASS: Enrollment API signed certificate via its AppRole (serial: $SERIAL)"
-          # Non-admins must be refused
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://$ENROLL_IP:8443/api/sign" \
-            -H "Content-Type: application/json" -H "X-Auth-Request-Groups: users_x" -d "$PAYLOAD")
-          [ "$code" = 403 ] || { echo "FAIL: non-admin sign got $code"; exit 1; }
-          echo "PASS: non-admin sign refused"
+          jq -r .certificate /tmp/yk.json > /tmp/yk-leaf.pem
+          openssl verify -CAfile certs/ca-chain.crt /tmp/yk-leaf.pem >/dev/null \
+            || { echo "FAIL: the signed certificate doesn't chain to the YubiKey CA"; exit 1; }
+          [ "$(openssl x509 -noout -issuer -in /tmp/yk-leaf.pem | sed 's/^issuer= *//')" = "$(openssl x509 -noout -subject -in certs/yubikey-ca.crt | sed 's/^subject= *//')" ] \
+            || { echo "FAIL: not issued by pki_int"; exit 1; }
+          echo "PASS: enroll signed a YubiKey certificate on pki_int via its AppRole (serial: $SERIAL)"
+          # No bearer, a wrong bearer, a CSR for another name: refused.
+          code=$(printf '%s' "$PAYLOAD" | api --data-binary @- "http://$ENROLL_IP:8444/internal/yubikey-certificates")
+          [ "$code" = 401 ] || { echo "FAIL: no bearer got $code"; exit 1; }
+          code=$(printf '%s' "$PAYLOAD" | api -H @<(printf 'Authorization: Bearer %s\n' wrong-wrong-wrong-wrong-wrong-wrong) --data-binary @- "http://$ENROLL_IP:8444/internal/yubikey-certificates")
+          [ "$code" = 401 ] || { echo "FAIL: a wrong bearer got $code"; exit 1; }
+          code=$(jq -n --arg csr "$(cat /tmp/test-client.csr)" '{user: "admin", csr: $csr}' | api -H @<(bearer) --data-binary @- "http://$ENROLL_IP:8444/internal/yubikey-certificates")
+          case "$code" in 400|409) ;; *) echo "FAIL: testuser's CSR signed for admin ($code)"; exit 1 ;; esac
+          echo "PASS: no / wrong bearer refused (401); a CSR is never signed for another account"
 
       - name: Test Vault cert listing
         run: |
