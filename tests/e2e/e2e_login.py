@@ -536,7 +536,7 @@ def main() -> int:
             for path in ("/self", "/api/self/renew"):
                 r = page.request.get(ENROLL + path, max_redirects=0)
                 assert r.status == 404, f"enroll.<d>{path} for a cert-only session: HTTP {r.status}"
-        check("cert-only session: enroll.<d>/self and /api/self/renew are gone (404; the renewal is on the "
+        check("cert-only session: enroll's /self and /api/self/renew are gone (404; the renewal is on the "
               "Sign-in page)", cert_only_self_gone)
 
         def revoked_cert():
