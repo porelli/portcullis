@@ -7,8 +7,11 @@ package main
 //	      {"username"} → 201 {"url","expires_at"}; refuses admin and
 //	      portcullis-hub with 409 — integration contract §9.4)
 //	Hub:  GET  http://enroll:8444/internal/certificates (same bearer) → 200
-//	      {"certificates":[{"user","serial","not_after","revoked"}]}, 503 when
-//	      Vault (revocation state included) can't be read
+//	      {"certificates":[{"user","serial","kind","not_before","not_after",
+//	      "revoked"}]} for both mounts, 503 when Vault (revocation state
+//	      included) can't be read
+//	Hub:  the certificate actions on the same listener and bearer
+//	      (certapi.go): browser certificates, YubiKey issue / renew, revoke
 //	CLI:  portcullis invite <user> → `enroll invite <user>` in this container
 //	      → POST http://127.0.0.1:8446/internal/invites (loopback, no secret:
 //	      reachable only through docker exec; the one way to get a link for
@@ -137,10 +140,17 @@ type inviteService struct {
 	protectedGroups map[string]bool
 	// requirePasskey adds webauthn-register-passwordless to the Keycloak user.
 	requirePasskey func(string) error
-	// listCertificates lists the issued YubiKey client certificates with
-	// their revocation state (GET /internal/certificates, contract §9.4).
+	// listCertificates lists the issued client certificates of both
+	// mounts with their revocation state (GET /internal/certificates,
+	// contract §9.4).
 	listCertificates func(context.Context) ([]certRecord, error)
-	now              func() time.Time
+	// The certificate actions (certapi.go, contract §9.4), injected by
+	// main like listCertificates; nil = 503.
+	issueBrowser func(ctx context.Context, user string, days, maxDays, maxActive int) (*browserCertResult, error)
+	issueYubiKey func(ctx context.Context, user, csrPEM string) (*yubiKeyCertResult, error)
+	renewYubiKey func(ctx context.Context, user, presentedPEM, csrPEM string) (*yubiKeyCertResult, error)
+	revoke       func(ctx context.Context, user, serial string) error
+	now          func() time.Time
 
 	mu          sync.Mutex
 	invites     map[string]*invite     // sha256(token) → invite
@@ -653,7 +663,7 @@ func (s *inviteService) apiAuthorized(w http.ResponseWriter, r *http.Request) bo
 var certListTimeout = 15 * time.Second
 
 // GET /internal/certificates (contract §9.4): the issued YubiKey (pki_int)
-// client certificates, for the Hub's sign-in inventory. Same bearer as the
+// and browser (pki_file) client certificates, for the Hub's sign-in inventory. Same bearer as the
 // invite API. Any failure, revocation state included, is a 503: the Hub
 // then treats every certificate as unknown — never a guessed revoked:false.
 // The whole listing runs on the request's context with a certListTimeout
@@ -662,7 +672,8 @@ func (s *inviteService) handleAPICertificates(w http.ResponseWriter, r *http.Req
 	if !s.apiAuthorized(w, r) {
 		return
 	}
-	if s.listCertificates == nil {
+	list := s.listCertificates
+	if list == nil {
 		jsonError(w, http.StatusServiceUnavailable, "certificates unavailable")
 		return
 	}
@@ -674,7 +685,7 @@ func (s *inviteService) handleAPICertificates(w http.ResponseWriter, r *http.Req
 	}
 	done := make(chan result, 1)
 	go func() {
-		c, err := s.listCertificates(ctx)
+		c, err := list(ctx)
 		done <- result{c, err}
 	}()
 	var res result
@@ -764,6 +775,10 @@ func (s *inviteService) apiHandler(local bool) http.Handler {
 	if !local {
 		// The Hub's listener only: the loopback one takes no secret.
 		m.HandleFunc("GET /internal/certificates", s.handleAPICertificates)
+		m.HandleFunc("POST /internal/browser-certificates", s.handleBrowserCert)
+		m.HandleFunc("POST /internal/yubikey-certificates", s.handleYubiKeyIssue)
+		m.HandleFunc("POST /internal/yubikey-certificates/renew", s.handleYubiKeyRenew)
+		m.HandleFunc("POST /internal/certificates/revoke", s.handleRevoke)
 	}
 	return m
 }
