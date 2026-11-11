@@ -897,11 +897,11 @@ def main() -> int:
                 ctx.set_default_timeout(TIMEOUT_MS)
                 page = ctx.new_page()
                 landed: list[str] = []
-                page.on("request", lambda r: landed.append(r.url) if r.url.startswith(PEOPLE + "/?") else None)
+                page.on("request", lambda r: landed.append(r.url) if r.url.startswith(PEOPLE + "/signin?") else None)
                 verifier, nonce = secrets.token_urlsafe(48), secrets.token_urlsafe(16)
                 challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
                 q = {"client_id": "portcullis-fresh-auth", "response_type": "code", "scope": "openid",
-                     "redirect_uri": PEOPLE + "/", "state": secrets.token_urlsafe(12), "nonce": nonce,
+                     "redirect_uri": PEOPLE + "/signin", "state": secrets.token_urlsafe(12), "nonce": nonce,
                      "code_challenge": challenge, "code_challenge_method": "S256", "prompt": "login", "max_age": "0"}
                 try:
                     page.goto(f"{AUTH}/realms/portcullis/protocol/openid-connect/auth?" + urllib.parse.urlencode(q),
@@ -921,7 +921,7 @@ def main() -> int:
                         if code:
                             break
                         page.wait_for_timeout(500)
-                    assert code, f"{label}: no code at {PEOPLE}/ (at {page.url.split('?')[0]})"
+                    assert code, f"{label}: no code at {PEOPLE}/signin (at {page.url.split('?')[0]})"
                 finally:
                     ctx.close()
                 body = json.dumps({"code": code, "code_verifier": verifier, "nonce": nonce}).encode()

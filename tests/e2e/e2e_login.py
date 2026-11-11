@@ -26,7 +26,8 @@ outside the group is denied, the bootstrap admin's link lands on the portal
 with the Hub link, an unused link cannot sign in to another client through
 the invite identity provider (post-broker deny, contract §8), X.509 login /
 mtls binding, a cert-only session (no authenticator) opens a
-default-template app and renews its cert at /self, revocation / foreign CA.
+default-template app (enroll's /self is gone: the renewal is the Sign-in
+page's, e2e_signin.py), revocation / foreign CA.
 
 Browser: Playwright Chromium with a CDP virtual WebAuthn authenticator
 (CTAP2, USB, resident keys, user verification). The CA must be trusted by
@@ -528,18 +529,15 @@ def main() -> int:
                 f"default-template app for a cert-only session: HTTP {resp and resp.status}"
         check("cert-only session opens an app with the default template (Standard)", cert_only_default_app)
 
-        def cert_only_self_renewal():
-            resp = page.goto(ENROLL + "/self", wait_until="domcontentloaded")
-            shot(page, "cert-only-self")
-            assert resp and resp.status == 200 and "Additional authentication" not in page.content(), \
-                f"/self for a cert-only session: HTTP {resp and resp.status}"
-            csr = subprocess.run(["openssl", "req", "-new", "-key", os.environ["E2E_KEY"], "-subj", f"/CN={user}"],
-                                 check=True, capture_output=True, text=True).stdout
-            r = page.request.post(ENROLL + "/api/self/renew", data=json.dumps({"csr": csr}),
-                                  headers={"Content-Type": "application/json"})
-            assert r.status == 200, f"renewal: HTTP {r.status} {r.text()[:200]}"
-            assert "BEGIN CERTIFICATE" in r.json().get("certificate", ""), r.text()[:200]
-        check("cert-only session renews its own certificate at enroll /self", cert_only_self_renewal)
+        # The cert-only renewal moved with the renewal page to the Sign-in
+        # page (people.<d>, the Hub: D31): e2e_signin.py's yubikey_cert_renew
+        # (this job runs no Hub). enroll.<d> keeps only /invite/*.
+        def cert_only_self_gone():
+            for path in ("/self", "/api/self/renew"):
+                r = page.request.get(ENROLL + path, max_redirects=0)
+                assert r.status == 404, f"enroll.<d>{path} for a cert-only session: HTTP {r.status}"
+        check("cert-only session: enroll.<d>/self and /api/self/renew are gone (404; the renewal is on the "
+              "Sign-in page)", cert_only_self_gone)
 
         def revoked_cert():
             subprocess.run(shlex.split(os.environ["E2E_REVOKE_CMD"]), check=True)
