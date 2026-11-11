@@ -254,9 +254,9 @@ signin_ca_reload() {
   sum="$(_ca_bundle_sum "$bundle")"
   if [ "$(cat "$stamp" 2>/dev/null)" != "$sum" ]; then
     info "Restarting the forward-auth services to pick up the new CA bundle..."
-    dc restart forward-auth forward-auth-ext >/dev/null
+    dc restart forward-auth forward-auth-ext >/dev/null || return 1
+    printf '%s\n' "$sum" > "$stamp"
   fi
-  printf '%s\n' "$sum" > "$stamp"
 }
 
 # Repo-shipped bind-mounted config files and the services that read them only
@@ -314,7 +314,7 @@ config_mark() {
 # config_reload — restart services when their config files differ from the last
 # recorded hashes (or none was recorded), then record the new hashes.
 config_reload() {
-  local path services stamp sum old_sum to_restart="" svc
+  local path services stamp sum old_sum to_restart="" svc pending_stamps=""
   while IFS= read -r path; do
     services="$(_config_services "$path")"
     stamp="$PORTCULLIS_ROOT/secrets/.config-$(printf '%s' "$path" | tr '/' '_').loaded"
@@ -329,14 +329,20 @@ config_reload() {
           *) to_restart="$to_restart $svc" ;;
         esac
       done
+      # Record this stamp for writing after successful restart
+      pending_stamps="$pending_stamps$stamp $sum"$'\n'
     fi
-    printf '%s\n' "$sum" > "$stamp"
   done < <(_config_files)
   if [ -n "$to_restart" ]; then
     # shellcheck disable=SC2086
     info "Restarting services to pick up config changes:$to_restart"
     # shellcheck disable=SC2086
-    dc restart $to_restart >/dev/null
+    dc restart $to_restart >/dev/null || return 1
+    # Write stamps only after successful restart
+    printf '%s' "$pending_stamps" | while IFS=' ' read -r stamp_path sum_val; do
+      [ -n "$stamp_path" ] || continue
+      printf '%s\n' "$sum_val" > "$stamp_path"
+    done
   fi
 }
 
@@ -399,7 +405,7 @@ upgrade_run() {
     # Traefik, forward-auth(-ext) and Keycloak read the CA chain only at start-up.
     dc restart traefik forward-auth forward-auth-ext keycloak >/dev/null
     signin_ca_mark
-    config_mark
+    # config_reload will restart services for config changes and mark them
   fi
   config_reload
   wait_healthy 300 vault postgres lldap keycloak

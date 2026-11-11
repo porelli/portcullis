@@ -1511,6 +1511,15 @@ rm -f "$PORTCULLIS_ROOT/oauth2-proxy/alpha.yaml" "$PORTCULLIS_ROOT/secrets/.conf
 : > "$STUB_DIR/calls"
 cfg_run config_reload
 expect_eq "config reload: missing file → nothing done" "$(cfg_restarts)" ""
+# A failed restart must not record the new hash (the next up retries).
+printf 'alpha-config-v3\n' > "$PORTCULLIS_ROOT/oauth2-proxy/alpha.yaml"
+printf 'old-hash\n' > "$PORTCULLIS_ROOT/secrets/.config-oauth2-proxy_alpha.yaml.loaded"
+cp "$WORK/bin/docker" "$WORK/docker.ok"
+printf '#!/usr/bin/env bash\necho "$*" >> "$STUB_DIR/calls"\ncase "$*" in *restart*) exit 1 ;; esac\nexit 0\n' > "$WORK/bin/docker"
+chmod +x "$WORK/bin/docker"
+cfg_run 'set -e; config_reload'
+expect_eq "config reload: a failed restart keeps the old stamp" "$(cat "$PORTCULLIS_ROOT/secrets/.config-oauth2-proxy_alpha.yaml.loaded")" "old-hash"
+cp "$WORK/docker.ok" "$WORK/bin/docker"
 
 # ══ config: config_apply (static TLS options, plan D18) ════
 CA_ROOT="$WORK/config-apply"
