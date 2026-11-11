@@ -616,3 +616,73 @@ func TestPublicMuxOnlyInvite(t *testing.T) {
 		}
 	}
 }
+
+// Users must be plain LLDAP usernames (lowercase ASCII): no Unicode case
+// folding can turn one into a protected name or someone else's (review I1).
+func TestCertAPIUserGrammar(t *testing.T) {
+	fp, cfg := newFakePKI(t)
+	s := browserService(t, cfg)
+	future := time.Now().Add(24 * time.Hour)
+	_, hubSerial := fp.issue(mountYubiKey, "portcullis-hub", nil, future, false)
+	_, upperSerial := fp.issue(mountBrowser, "Alice", nil, future, false)
+	before := len(fp.callList())
+	for _, user := range []string{"portculliſ-hub", "ADMIN", "Alice", "alicé", "al ice", "-alice", "", strings.Repeat("a", 65)} {
+		u, _ := json.Marshal(user)
+		for path, body := range certRoutes {
+			body = strings.Replace(body, `"alice"`, string(u), 1)
+			if path == "/internal/certificates/revoke" {
+				body = strings.Replace(body, `"01:02"`, `"`+hubSerial+`"`, 1)
+			}
+			w := postAction(s, path, body)
+			if w.Code != http.StatusBadRequest && w.Code != http.StatusConflict {
+				t.Errorf("%s for %q: %d %s", path, user, w.Code, w.Body)
+			}
+		}
+	}
+	if calls := fp.callList()[before:]; len(calls) != 0 {
+		t.Errorf("Vault called for refused names: %v", calls)
+	}
+	// The CN is compared exactly: alice can't revoke a CN "Alice".
+	b, _ := json.Marshal(map[string]string{"user": "alice", "serial": upperSerial})
+	if w := postAction(s, "/internal/certificates/revoke", string(b)); w.Code != http.StatusNotFound {
+		t.Errorf("alice revoking CN Alice: %d", w.Code)
+	}
+	if fp.certs[mountYubiKey][hubSerial].revoked || fp.certs[mountBrowser][upperSerial].revoked || fp.count("PUT ") != 0 {
+		t.Errorf("something was revoked: %v", fp.callList())
+	}
+}
+
+// The signed leaf must certify the CSR's key, on both paths (review M4).
+func TestSignedKeyMatchesCSR(t *testing.T) {
+	fp, cfg := newFakePKI(t)
+	s := browserService(t, cfg)
+	fp.swapKey = true
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	b, _ := json.Marshal(map[string]string{"user": "alice", "csr": csrPEMFor(t, "alice", key)})
+	if w := postAction(s, "/internal/yubikey-certificates", string(b)); w.Code != http.StatusServiceUnavailable || strings.Contains(w.Body.String(), "BEGIN") {
+		t.Errorf("yubikey issue with another key: %d %s", w.Code, w.Body)
+	}
+	cur, _ := fp.issue(mountYubiKey, "alice", &key.PublicKey, time.Now().Add(24*time.Hour), false)
+	if w := postAction(s, "/internal/yubikey-certificates/renew", renewBody("alice", cur, csrPEMFor(t, "alice", key))); w.Code != http.StatusServiceUnavailable {
+		t.Errorf("renewal with another key: %d %s", w.Code, w.Body)
+	}
+	if w := postAction(s, "/internal/browser-certificates", certRoutes["/internal/browser-certificates"]); w.Code != http.StatusServiceUnavailable || strings.Contains(w.Body.String(), "p12") {
+		t.Errorf("browser create with another key: %d %s", w.Code, w.Body)
+	}
+	fp.swapKey = false
+	if w := postAction(s, "/internal/yubikey-certificates", string(b)); w.Code != http.StatusCreated {
+		t.Errorf("matching key: %d %s", w.Code, w.Body)
+	}
+}
+
+// A refusal never echoes the presented certificate's CN (review M3).
+func TestRenewRefusalNoEcho(t *testing.T) {
+	fp, cfg := newFakePKI(t)
+	s := browserService(t, cfg)
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	bobs, _ := fp.issue(mountYubiKey, "bob-secret-cn", &key.PublicKey, time.Now().Add(24*time.Hour), false)
+	w := postAction(s, "/internal/yubikey-certificates/renew", renewBody("alice", bobs, csrPEMFor(t, "alice", key)))
+	if w.Code != http.StatusForbidden || strings.Contains(w.Body.String(), "bob-secret-cn") {
+		t.Errorf("foreign certificate: %d %s", w.Code, w.Body)
+	}
+}

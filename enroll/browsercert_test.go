@@ -108,6 +108,8 @@ type fakePKI struct {
 	signs      []map[string]any
 	failRotate bool
 	signDelay  time.Duration
+	// swapKey makes sign certify a fresh key instead of the CSR's.
+	swapKey bool
 }
 
 func newFakePKI(t *testing.T) (*fakePKI, *Config) {
@@ -284,7 +286,7 @@ func (fp *fakePKI) sign(w http.ResponseWriter, r *http.Request, mount string, ca
 	}
 	fp.mu.Lock()
 	fp.signs = append(fp.signs, body)
-	delay := fp.signDelay
+	delay, swap := fp.signDelay, fp.swapKey
 	fp.mu.Unlock()
 	for k := range body {
 		if k != "csr" && k != "common_name" && k != "ttl" {
@@ -306,7 +308,12 @@ func (fp *fakePKI) sign(w http.ResponseWriter, r *http.Request, mount string, ca
 		return
 	}
 	time.Sleep(delay)
-	c := ca.leaf(fp.t, cn, csr.PublicKey.(*ecdsa.PublicKey), time.Now().Add(-time.Minute), time.Now().Add(ttl))
+	pub := csr.PublicKey.(*ecdsa.PublicKey)
+	if swap {
+		k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		pub = &k.PublicKey
+	}
+	c := ca.leaf(fp.t, cn, pub, time.Now().Add(-time.Minute), time.Now().Add(ttl))
 	s := fp.add(mount, c, false)
 	vaultAnswer(w, 200, map[string]any{"data": map[string]any{
 		"certificate": pemCert(c), "issuing_ca": pemCert(ca.cert),

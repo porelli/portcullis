@@ -83,7 +83,7 @@ func checkRenewal(username string, cert *x509.Certificate, csrPEM, email string,
 		return errors.New("present your current client certificate (security key) to renew it")
 	}
 	if cert.Subject.CommonName != username {
-		return fmt.Errorf("the presented certificate belongs to %q, not to %q", cert.Subject.CommonName, username)
+		return errors.New("the presented certificate belongs to another account")
 	}
 	if now.After(cert.NotAfter) || now.Before(cert.NotBefore) {
 		return errors.New("the presented certificate is not valid now; ask an administrator to re-enroll")

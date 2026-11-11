@@ -200,7 +200,7 @@ func (cfg *Config) revokeCert(ctx context.Context, user, serial string) error {
 	if err != nil {
 		return fmt.Errorf("%s/cert/%s: %w", mount, s, err)
 	}
-	if !clientLeaf(c) || !strings.EqualFold(c.Subject.CommonName, user) {
+	if !clientLeaf(c) || c.Subject.CommonName != user {
 		return notFound
 	}
 	if ic.Revoked {
@@ -255,17 +255,22 @@ func decodeAction(w http.ResponseWriter, r *http.Request, v any) bool {
 	return true
 }
 
-// actionUser is the request's user, trimmed: 400 when empty or not a
-// plain name, 409 "protected account" for admin, portcullis-hub and every
-// portcullis-* name.
+// usernameRe is the LLDAP username grammar the Hub uses
+// (internal/lldap usernameRe): lowercase ASCII only, so no Unicode case
+// folding can make one name match another.
+var usernameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+
+// actionUser is the request's user, trimmed: 409 "protected account" for
+// admin, portcullis-hub and every portcullis-* name (in any case), then
+// 400 unless it is a plain LLDAP username.
 func actionUser(w http.ResponseWriter, user string) (string, bool) {
 	u := strings.TrimSpace(user)
-	if u == "" || len(u) > 128 || strings.IndexFunc(u, func(r rune) bool { return unicode.IsControl(r) || unicode.IsSpace(r) }) >= 0 {
-		jsonError(w, http.StatusBadRequest, "user is required")
-		return "", false
-	}
 	if protectedCertName(u) {
 		jsonError(w, http.StatusConflict, "protected account")
+		return "", false
+	}
+	if !usernameRe.MatchString(u) {
+		jsonError(w, http.StatusBadRequest, "user must be an LLDAP username (a-z, 0-9, . _ -)")
 		return "", false
 	}
 	return u, true

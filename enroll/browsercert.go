@@ -287,7 +287,7 @@ func (cfg *Config) activeBrowserCerts(ctx context.Context, user string) (int, er
 		if err != nil {
 			return 0, err
 		}
-		if strings.EqualFold(r.User, user) && !r.Revoked && now.Before(exp) {
+		if r.User == user && !r.Revoked && now.Before(exp) {
 			n++
 		}
 	}
@@ -334,6 +334,9 @@ func (cfg *Config) signOn(ctx context.Context, mount, role, user, csrPEM, ttl st
 	if leaf.Subject.CommonName != user {
 		return nil, fmt.Errorf("vault sign on %s: the certificate names %q", mount, leaf.Subject.CommonName)
 	}
+	if !sameKey(csrPEM, leaf) {
+		return nil, fmt.Errorf("vault sign on %s: the certificate is for another key than the CSR", mount)
+	}
 	out := &signedCert{Leaf: leaf, Serial: vaultSerial(leaf.SerialNumber)}
 	if list, ok := secret.Data["ca_chain"].([]interface{}); ok {
 		for _, item := range list {
@@ -352,6 +355,21 @@ func (cfg *Config) signOn(ctx context.Context, mount, role, user, csrPEM, ttl st
 		}
 	}
 	return out, nil
+}
+
+// sameKey reports whether leaf certifies the public key of csrPEM.
+func sameKey(csrPEM string, leaf *x509.Certificate) bool {
+	b, _ := pem.Decode([]byte(csrPEM))
+	if b == nil {
+		return false
+	}
+	csr, err := x509.ParseCertificateRequest(b.Bytes)
+	if err != nil {
+		return false
+	}
+	a, err1 := x509.MarshalPKIXPublicKey(csr.PublicKey)
+	c, err2 := x509.MarshalPKIXPublicKey(leaf.PublicKey)
+	return err1 == nil && err2 == nil && string(a) == string(c)
 }
 
 // issuedBy reports whether ca issued c: c's issuer DN is ca's subject and
