@@ -51,6 +51,14 @@ Scenarios:
                no longer works, the admin view says voided (restore), her
                My apps card says "reset by a restore"; she creates a new
                one (works).
+  password_only_template  dave (a Hub-set password only, users_samba),
+               password on: his fresh sign-in through portcullis-fresh-auth
+               with the password (prompt=login, max_age=0) and the proof
+               posted to the people listener: refused (403) while the
+               default (Samba's template: it takes no pick) is Standard,
+               accepted once the default is a password-only template; the
+               audit names the template; his share works. Default,
+               template and password switch restored.
   secrets      the instance archives (hub_data /data/backups/samba/*.tar),
                the core backup (every file, nested archives opened) and
                the whole hub_data volume contain none of the hashes the
@@ -75,12 +83,15 @@ the shown password.
 """
 from __future__ import annotations
 
+import base64
 import glob
 import gzip
+import hashlib
 import io
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tarfile
@@ -859,6 +870,97 @@ def main() -> int:
             until("carol's new password lists Home",
                   lambda: smb(state[f"{SMB}_ip"], "Home", "carol", state["carol_smb2"])[0], 60, every=3)
         check("restore_inst: carol creates a new password after the void (one assertion); it works", carol_again)
+
+        def password_only_template():
+            # Contract §8 "Governing template": a file-share password's fresh
+            # sign-in is governed by the instance's template — Samba takes no
+            # pick, so the default. dave has a Hub-set password only; with
+            # password on, Standard refuses his password sign-in, a
+            # password-only default accepts it (typing the password again).
+            needs("setup")
+            gql(f'mutation {{ createUser(user: {{id: "dave", email: "dave@{DOMAIN}"}}) {{ id }} }}')
+            member("add", "users_samba", "dave")
+            pw = hub_ok("POST", "/api/directory/users/dave/password", {"generate": True})["password"]
+            mask(pw)
+            PASSWORDS["dave-signin"] = pw
+            hub_ok("PUT", "/api/signin/methods/password", {"on": True})
+            code, out = hub("POST", "/api/signin/templates", {"id": "e2e-pw", "name": "Password only",
+                                                              "rule": {"op": "any", "items": ["password"]}})
+            assert code in (200, 201), f"create e2e-pw: HTTP {code} {scrub(str(out))[:300]}"
+            state["pw_template"] = True
+            until("password on in signin-keycloak.json", lambda: "password" in json.loads(docker(
+                "run", "--rm", "--network", "none", "-v", "portcullis_hub_data:/d:ro", ALPINE, "cat",
+                "/d/signin-keycloak.json"))["methods"], 60)
+
+            def create_with_password(label: str) -> tuple[int, str]:
+                ctx = browser.new_context()
+                ctx.set_default_timeout(TIMEOUT_MS)
+                page = ctx.new_page()
+                landed: list[str] = []
+                page.on("request", lambda r: landed.append(r.url) if r.url.startswith(PEOPLE + "/?") else None)
+                verifier, nonce = secrets.token_urlsafe(48), secrets.token_urlsafe(16)
+                challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+                q = {"client_id": "portcullis-fresh-auth", "response_type": "code", "scope": "openid",
+                     "redirect_uri": PEOPLE + "/", "state": secrets.token_urlsafe(12), "nonce": nonce,
+                     "code_challenge": challenge, "code_challenge_method": "S256", "prompt": "login", "max_age": "0"}
+                try:
+                    page.goto(f"{AUTH}/realms/portcullis/protocol/openid-connect/auth?" + urllib.parse.urlencode(q),
+                              wait_until="domcontentloaded")
+                    page.wait_for_selector("#authenticateWebAuthnButton", state="visible")
+                    page.click("#try-another-way")
+                    page.wait_for_load_state("domcontentloaded")
+                    page.get_by_text("Password", exact=True).first.click()
+                    page.wait_for_selector("#password", state="visible")
+                    page.fill("#username", "dave")
+                    page.fill("#password", pw)
+                    page.click("#kc-login")
+                    code = None
+                    for _ in range(60):  # Playwright delivers request events only inside its calls
+                        code = next((c for u in landed for c in urllib.parse.parse_qs(
+                            urllib.parse.urlsplit(u).query).get("code", [])), None)
+                        if code:
+                            break
+                        page.wait_for_timeout(500)
+                    assert code, f"{label}: no code at {PEOPLE}/ (at {page.url.split('?')[0]})"
+                finally:
+                    ctx.close()
+                body = json.dumps({"code": code, "code_verifier": verifier, "nonce": nonce}).encode()
+                req = urllib.request.Request(f"http://{state['hub_ip']}:8889/api/me/apps/{SMB}/credentials/{KEY}",
+                                             data=body, method="POST", headers={
+                                                 "X-Portcullis-Proxy-Secret": SECRET, "X-Forwarded-User": "dave",
+                                                 "Content-Type": "application/json"})
+                try:
+                    with urllib.request.urlopen(req, timeout=120) as r:
+                        return r.status, r.read().decode()
+                except urllib.error.HTTPError as e:
+                    return e.code, e.read().decode()
+
+            code, out = create_with_password("standard")
+            print(f"    Standard (the default) + a password: HTTP {code} {out.strip()[:80]}", flush=True)
+            assert code == 403 and "a fresh sign-in is required" in out, f"Standard + password: HTTP {code} {out[:200]}"
+            hub_ok("PUT", "/api/signin/default", {"template": "e2e-pw"})
+            code, out = create_with_password("password-only")
+            doc = json.loads(out) if code == 200 else {}
+            if doc.get("password"):
+                mask(doc["password"])
+                PASSWORDS["dave"] = doc["password"]
+            print(f"    password-only default + a password: HTTP {code}", flush=True)
+            assert code == 200 and PW_RE.fullmatch(doc.get("password", "")), f"password-only + password: HTTP {code} {scrub(out)[:200]}"
+            record_hashes()
+            hits = [e for e in audit() if e.get("action") == "credential.create" and "user=dave" in (e.get("detail") or "")]
+            assert any("template=e2e-pw" in (e.get("detail") or "") and e.get("result") == "ok" for e in hits), hits
+            assert any("template standard" in (e.get("detail") or "") and e.get("result") == "refused" for e in hits), hits
+            until("dave's new password lists Home",
+                  lambda: smb(state[f"{SMB}_ip"], "Home", "dave", PASSWORDS["dave"])[0], 60, every=3)
+        try:
+            check("password_only_template: Samba governed by the default — Standard refuses dave's password fresh "
+                  "sign-in (403), a password-only default accepts it (the password typed again); audited with the "
+                  "template; the share works", password_only_template)
+        finally:
+            if state.pop("pw_template", False):
+                hub("PUT", "/api/signin/default", {"template": "standard"})
+                hub("DELETE", "/api/signin/templates/e2e-pw", {})
+            hub("PUT", "/api/signin/methods/password", {"on": False})
 
         for who, (ctx, _, _) in ses.items():
             ctx.close()

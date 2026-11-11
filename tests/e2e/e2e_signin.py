@@ -59,6 +59,11 @@ Cases (in this order; each later case needs only the state it names):
                             the security key itself, then issues (amr mtls+hwk)
   pc_fresh_present          root's fresh passkey sign-in: pc_fresh =
                             security_key; an SSO reuse right after: none
+  fresh_follows_hub_template  sam's admin confirmation (delete_group through
+                            the Hub's MCP listener, the gate secret): the hub
+                            core template (Strong) governs it — his synced
+                            passkey's fresh sign-in is refused (403), his
+                            security key's approves; audited "template strong"
   password_on_basic_app     password on: pat signs in with his password on
                             echo-basic; people.<d> (Strong) → #needs-stronger
   admin_password_refused    admin + LLDAP's admin password, 11 times (above
@@ -510,6 +515,52 @@ def fresh_auth(page: Page, label: str, **extra) -> dict:
     return claims_of(tok["id_token"])
 
 
+def fresh_code(page: Page, label: str, redirect_uri: str) -> dict:
+    """The Hub's popup flow on redirect_uri (prompt=login, max_age=0, PKCE
+    S256): the proof the page posts — code, verifier and nonce — not
+    exchanged here (the Hub does it)."""
+    rd = Redirect(page, redirect_uri)
+    verifier, nonce = secrets.token_urlsafe(48), secrets.token_urlsafe(16)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    goto(page, authorize_url("portcullis-fresh-auth", redirect_uri, code_challenge=challenge, code_challenge_method="S256",
+                             nonce=nonce, prompt="login", max_age="0"))
+    out = drive_kc(page, lambda: rd.code() is not None, label)
+    assert out == "done", f"{label}: {out} at {page.url.split('?')[0]}"
+    return {"code": rd.code(), "code_verifier": verifier, "nonce": nonce}
+
+
+def hub_as(user: str, method: str, path: str, body=None):
+    """The Hub listener as Traefik calls it for user (proxy secret)."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(HUB_API + path, data=data, method=method, headers={
+        "X-Portcullis-Proxy-Secret": os.environ["E2E_HUB_SECRET"], "X-Forwarded-User": user,
+        "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            return r.status, r.read().decode()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def hub_mcp_admin(user: str, tool: str, args: dict) -> tuple[bool, str]:
+    """tools/call on the Hub's Portcullis MCP (admin), as mcp-gate calls it
+    (the gate secret from the host file, never printed): (isError, text)."""
+    with open(os.environ.get("E2E_MCP_SECRET_FILE", "secrets/mcp-gate/hub-secret")) as f:
+        mcp_secret = f.read().strip()
+    data = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": tool, "arguments": args}}).encode()
+    req = urllib.request.Request(f"http://{os.environ['HUB_IP']}:8890/mcp/admin", data=data, method="POST", headers={
+        "Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+        "Mcp-Protocol-Version": "2025-11-25", "X-Portcullis-MCP-Secret": mcp_secret, "X-Forwarded-User": user,
+        "X-Portcullis-AI-Client": "portcullis-ai-claude-code", "X-Portcullis-AI-Resource": f"https://hub.{DOMAIN}/mcp"})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        raw = r.read().decode()
+    lines = [ln[6:] for ln in raw.splitlines() if ln.startswith("data: ")]
+    doc = json.loads(lines[-1] if lines else raw)
+    res = doc["result"]
+    return bool(res.get("isError")), "\n".join(c.get("text", "") for c in res.get("content") or [])
+
+
 def ca_names(host: str) -> bool:
     """Traefik asks for a client certificate on host (s_client prints the
     acceptable CA names of a CertificateRequest)."""
@@ -950,6 +1001,49 @@ def main() -> int:
                 ctx.close()
         check("pc_fresh: = security_key after a fresh passkey sign-in; absent when the SSO cookie alone signs in",
               pc_fresh_present)
+
+        def fresh_follows_hub_template():
+            # Contract §8 "Governing template": an admin tool's confirmation
+            # (Hub listener) is governed by the hub core template, Strong
+            # here: sam's synced passkey is refused, his security key approves.
+            needs("sam_synced", "sam_spare")
+            assert hub_ok("GET", "/api/signin")["core"]["hub"] == "strong", "hub.<d> isn't on Strong"
+            group = "ci-fresh-hub"
+            hub_ok("POST", "/api/directory/groups", {"name": group})
+            err, text = hub_mcp_admin("sam", "delete_group", {"group": group})
+            m = re.search(r"https://hub\.[a-z0-9.-]+/confirm/([A-Za-z0-9_-]+)", text)
+            print(f"    delete_group: isError {err}: {text[:160]}", flush=True)
+            assert err and m, text[:300]
+            cid = m.group(1)
+
+            def approve(creds: list, synced: bool, label: str):
+                ctx = new_context()
+                page = ctx.new_page()
+                key = Key(page, synced=synced, credentials=creds)
+                try:
+                    proof = fresh_code(page, label, HUB + "/")
+                    assert key.asserted >= 1, f"{label}: no passkey assertion"
+                finally:
+                    ctx.close()
+                return hub_as("sam", "POST", f"/api/me/confirmations/{cid}",
+                              dict(proof, decision="approve", typed=group))
+
+            code, out = approve(state["sam_synced"], True, "sam-fresh-synced")
+            print(f"    synced passkey: HTTP {code} {out.strip()[:120]}", flush=True)
+            assert code == 403 and "a fresh sign-in is required" in out, f"synced passkey on Strong: HTTP {code} {out[:200]}"
+            code, out = approve(state["sam_spare"], False, "sam-fresh-key")
+            print(f"    security key: HTTP {code} {out.strip()[:120]}", flush=True)
+            assert code == 200 and json.loads(out) == {"state": "approved"}, f"security key on Strong: HTTP {code} {out[:200]}"
+            audit = hub_ok("GET", "/api/directory/audit")
+            mine = [e for e in audit if e.get("action") == "ai.confirm" and cid in (e.get("detail") or "")]
+            details = [(e.get("result"), e.get("detail")) for e in mine]
+            print(f"    audit: {details}", flush=True)
+            assert any(r == "refused" and "doesn't accept" in d and "template strong" in d for r, d in details), details
+            assert any(r == "ok" and d.startswith("approved ") and d.endswith("template strong") for r, d in details), details
+            hub_ok("DELETE", f"/api/directory/groups/{group}", {})
+        check("fresh_follows_hub_template: an admin confirmation (Hub listener, hub core template Strong): sam's "
+              "synced passkey fresh sign-in → 403, his security key → approved; the audit names template strong",
+              fresh_follows_hub_template)
 
         # ── passwords ──
         def password_switch(on: bool) -> None:
