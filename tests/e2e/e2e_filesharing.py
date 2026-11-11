@@ -949,7 +949,8 @@ def main() -> int:
             record_hashes()
             hits = [e for e in audit() if e.get("action") == "credential.create" and "user=dave" in (e.get("detail") or "")]
             assert any("template=e2e-pw" in (e.get("detail") or "") and e.get("result") == "ok" for e in hits), hits
-            assert any("template standard" in (e.get("detail") or "") and e.get("result") == "refused" for e in hits), hits
+            assert any("doesn't accept" in (e.get("detail") or "") and "template standard" in (e.get("detail") or "")
+                       and e.get("result") == "refused" for e in hits), hits
             until("dave's new password lists Home",
                   lambda: smb(state[f"{SMB}_ip"], "Home", "dave", PASSWORDS["dave"])[0], 60, every=3)
         try:

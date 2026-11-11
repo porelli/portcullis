@@ -1010,37 +1010,42 @@ def main() -> int:
             assert hub_ok("GET", "/api/signin")["core"]["hub"] == "strong", "hub.<d> isn't on Strong"
             group = "ci-fresh-hub"
             hub_ok("POST", "/api/directory/groups", {"name": group})
-            err, text = hub_mcp_admin("sam", "delete_group", {"group": group})
-            m = re.search(r"https://hub\.[a-z0-9.-]+/confirm/([A-Za-z0-9_-]+)", text)
-            print(f"    delete_group: isError {err}: {text[:160]}", flush=True)
-            assert err and m, text[:300]
-            cid = m.group(1)
+            try:
+                err, text = hub_mcp_admin("sam", "delete_group", {"group": group})
+                m = re.search(r"https://hub\.[a-z0-9.-]+/confirm/([A-Za-z0-9_-]+)", text)
+                print(f"    delete_group: isError {err}: {text[:160]}", flush=True)
+                assert err and m, text[:300]
+                cid = m.group(1)
 
-            def approve(creds: list, synced: bool, label: str):
-                ctx = new_context()
-                page = ctx.new_page()
-                key = Key(page, synced=synced, credentials=creds)
-                try:
-                    proof = fresh_code(page, label, HUB + "/")
-                    assert key.asserted >= 1, f"{label}: no passkey assertion"
-                finally:
-                    ctx.close()
-                return hub_as("sam", "POST", f"/api/me/confirmations/{cid}",
-                              dict(proof, decision="approve", typed=group))
+                def approve(creds: list, synced: bool, label: str):
+                    ctx = new_context()
+                    page = ctx.new_page()
+                    key = Key(page, synced=synced, credentials=creds)
+                    try:
+                        proof = fresh_code(page, label, HUB + "/")
+                        assert key.asserted >= 1, f"{label}: no passkey assertion"
+                    finally:
+                        ctx.close()
+                    return hub_as("sam", "POST", f"/api/me/confirmations/{cid}",
+                                  dict(proof, decision="approve", typed=group))
 
-            code, out = approve(state["sam_synced"], True, "sam-fresh-synced")
-            print(f"    synced passkey: HTTP {code} {out.strip()[:120]}", flush=True)
-            assert code == 403 and "a fresh sign-in is required" in out, f"synced passkey on Strong: HTTP {code} {out[:200]}"
-            code, out = approve(state["sam_spare"], False, "sam-fresh-key")
-            print(f"    security key: HTTP {code} {out.strip()[:120]}", flush=True)
-            assert code == 200 and json.loads(out) == {"state": "approved"}, f"security key on Strong: HTTP {code} {out[:200]}"
-            audit = hub_ok("GET", "/api/directory/audit")
-            mine = [e for e in audit if e.get("action") == "ai.confirm" and cid in (e.get("detail") or "")]
-            details = [(e.get("result"), e.get("detail")) for e in mine]
-            print(f"    audit: {details}", flush=True)
-            assert any(r == "refused" and "doesn't accept" in d and "template strong" in d for r, d in details), details
-            assert any(r == "ok" and d.startswith("approved ") and d.endswith("template strong") for r, d in details), details
-            hub_ok("DELETE", f"/api/directory/groups/{group}", {"confirm": group})
+                code, out = approve(state["sam_synced"], True, "sam-fresh-synced")
+                print(f"    synced passkey: HTTP {code} {out.strip()[:120]}", flush=True)
+                assert code == 403 and "a fresh sign-in is required" in out, f"synced passkey on Strong: HTTP {code} {out[:200]}"
+                code, out = approve(state["sam_spare"], False, "sam-fresh-key")
+                print(f"    security key: HTTP {code} {out.strip()[:120]}", flush=True)
+                assert code == 200 and json.loads(out) == {"state": "approved"}, f"security key on Strong: HTTP {code} {out[:200]}"
+                audit = hub_ok("GET", "/api/directory/audit")
+                mine = [e for e in audit if e.get("action") == "ai.confirm" and cid in (e.get("detail") or "")]
+                details = [(e.get("result"), e.get("detail")) for e in mine]
+                print(f"    audit: {details}", flush=True)
+                assert any(r == "refused" and "doesn't accept" in d and "template strong" in d for r, d in details), details
+                assert any(r == "ok" and d.startswith("approved ") and d.endswith("template strong") for r, d in details), details
+            finally:
+                dcode, dout = hub("DELETE", f"/api/directory/groups/{group}", {"confirm": group})
+                print(f"    cleanup: DELETE {group}: HTTP {dcode}", flush=True)
+                # Never hides the case's own failure (an exception in flight).
+                assert dcode == 200 or sys.exc_info()[0] is not None, f"deleting {group}: HTTP {dcode} {str(dout)[:200]}"
         check("fresh_follows_hub_template: an admin confirmation (Hub listener, hub core template Strong): sam's "
               "synced passkey fresh sign-in → 403, his security key → approved; the audit names template strong",
               fresh_follows_hub_template)
