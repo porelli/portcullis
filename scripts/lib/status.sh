@@ -58,10 +58,12 @@ status_run() {
     # Both kinds (contract §8.1 "Internal certificate authority"): YubiKey
     # certificates (pki_int) and browser certificates (pki_file).
     for mount in $CERT_MOUNTS; do
-      serials="$(vault list -format=json "$mount/certs" 2>/dev/null)" || { listed=false; continue; }
-      issued=$((issued + $(printf '%s' "$serials" | jq 'length')))
+      # _cert_serials: Vault's "No value found" (nothing issued on that
+      # mount yet, e.g. no browser certificate) is an empty list, not a failure.
+      serials="$(_cert_serials "$mount")" || { listed=false; continue; }
+      issued=$((issued + $(printf '%s' "$serials" | grep -c . || true)))
       kind="$(cert_kind "$mount" | tr '[:upper:]' '[:lower:]')"
-      for s in $(printf '%s' "$serials" | jq -r '.[]'); do
+      for s in $serials; do
         info="$(_cert_info "$mount" "$s")" || continue
         IFS='|' read -r cn end revoked <<< "$info"
         [ "$revoked" = false ] && [ -n "$cn" ] && [ "$cn" != "$server_cn" ] || continue

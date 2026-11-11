@@ -931,6 +931,22 @@ portcullis_ca_expiry_timestamp_seconds{ca="intermediate"} 200
 portcullis_ca_expiry_timestamp_seconds{ca="browser"} 100'
 jq '.vault.browser_ca_expires_epoch = 0' "$STUB_DIR/stf.json" > "$STUB_DIR/stf2.json" && mv "$STUB_DIR/stf2.json" "$STUB_DIR/stf.json"
 expect_eq "status --textfile: no browser CA series while its expiry is unknown" "$(stf | grep -c 'ca="browser"' || true)" 0
+# status --json over both mounts: nothing issued on pki_file yet ("No value
+# found", exit 2) is an empty list, not an unknown count (CI run 43051184972).
+sjson() { (require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
+           proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
+           vault_admin_env() { export VAULT_TOKEN=x; }; vault_use_container_cli() { :; }
+           _cert_info() { echo "testuser|Dec 11 15:51:10 2099 GMT|false"; }
+           vault() { case "$*" in
+                       "list -format=json pki_int/certs") echo '["aa:bb"]' ;;
+                       "list -format=json pki_file/certs") echo "No value found at ${STATUS_FILE_LIST:-pki_file/certs}" >&2; return "${STATUS_FILE_RC:-2}" ;;
+                       *) return 1 ;;
+                     esac; }
+           status_run true 2>/dev/null) || true; }
+expect_eq "status --json: pki_file with nothing issued counts 0 (certs_issued 1, the YubiKey one listed)" \
+  "$(sjson | jq -c '[.vault.certs_issued, [.vault.client_certs[] | .kind]]')" '[1,["yubikey"]]'
+expect_eq "status --json: a failing pki_file list leaves certs_issued unknown" \
+  "$(STATUS_FILE_RC=1 sjson | jq -c '.vault.certs_issued')" null
 
 # ── upgrade: pinned Hub image, policy file version (final review M1) ──
 # dc stub: exec prints $STUB_DIR/pv (the policy version), logs $STUB_DIR/gglog.
