@@ -1905,14 +1905,19 @@ def main() -> int:
               history_entries)
 
         def enroll_site_gone():
+            # Traefik's own 404 (no router): enroll never sees these paths.
             for path in ("/", "/self", "/api/self/renew", "/api/sign", "/api/users", "/users", "/certs"):
-                code, _ = raw_request(ENROLL_HOST, path)
-                assert code == 404, f"enroll.<d>{path}: HTTP {code}"
+                code, text = raw_request(ENROLL_HOST, path)
+                assert code == 404 and text.strip() == "404 page not found", \
+                    f"enroll.<d>{path}: HTTP {code} {text[:120]!r} (want Traefik's 404)"
+            # /invite/* reaches enroll: its invite page for an unusable link.
             code, text = raw_request(ENROLL_HOST, "/invite/" + secrets.token_urlsafe(32))
             print(f"    /invite/<bad token>: HTTP {code}", flush=True)
-            assert "no longer usable" in text, f"/invite/<bad>: HTTP {code} {text[:200]}"
-        check("enroll_site_gone: enroll.<d>/, /self and its old APIs answer 404; /invite/<bad token> shows the "
-              "invite page's \"no longer usable\"", enroll_site_gone)
+            assert code == 404 and "This setup link is invalid, expired or already used" in text, \
+                f"/invite/<bad>: HTTP {code} {text[:200]}"
+        check("enroll_site_gone: enroll.<d>/, /self and its old APIs get Traefik's 404; /invite/<bad token> "
+              "reaches enroll's invite page (\"This setup link is invalid, expired or already used\")",
+              enroll_site_gone)
 
         if "alice_pk" in state:
             state.pop("alice_pk")[0].close()
