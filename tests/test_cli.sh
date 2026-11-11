@@ -685,6 +685,111 @@ sr --yes
 expect_eq "signin reset-core --yes without .env exits 1 before docker" "$RC:$(cat "$SR_CALLS")" "1:"
 mv "$SR_ROOT/.env.x" "$SR_ROOT/.env"
 
+# ── enroll's Vault policy: exactly the D21 paths (contract §8.1) ──
+POLICY_GOT="$(awk '
+  /^[[:space:]]*path[[:space:]]+"/ { p = $2; gsub(/"/, "", p) }
+  /capabilities/ { c = $0; sub(/.*\[/, "", c); sub(/\].*/, "", c); gsub(/[" ]/, "", c); print p " " c }
+' "$HERE/../vault/policies/enroll.hcl" | sort)"
+POLICY_WANT="$(sort <<'EOF'
+pki_int/sign/client-cert update
+pki_file/sign/browser-cert update
+pki_int/certs list
+pki_file/certs list
+pki_int/cert/* read
+pki_file/cert/* read
+pki_int/revoke update
+pki_file/revoke update
+pki_int/crl/rotate read
+pki_file/crl/rotate read
+EOF
+)"
+expect_eq "enroll.hcl grants exactly the D21 paths (sign/client-cert, sign/browser-cert, certs list, cert read, revoke, crl/rotate on both mounts) and nothing else" \
+  "$POLICY_GOT" "$POLICY_WANT"
+expect_eq "enroll.hcl has one path block per grant" \
+  "$(grep -c '^[[:space:]]*path[[:space:]]' "$HERE/../vault/policies/enroll.hcl")" 10
+
+# ── cert list / revoke / enroll over both CAs (stub vault + ykman) ──
+CT_ROOT="$WORK/cert-root"
+CT_BIN="$WORK/cert-bin"
+CT_DATA="$WORK/cert-data"
+mkdir -p "$CT_ROOT/certs/revocation" "$CT_BIN" "$CT_DATA"
+echo "PORTCULLIS_DOMAIN=example.test" > "$CT_ROOT/.env"
+# ct_cert <serial> <cn> <revocation_time> — Vault's JSON for a certificate.
+ct_cert() {
+  openssl ecparam -genkey -name prime256v1 -out "$CT_DATA/$1.key" 2>/dev/null
+  openssl req -new -x509 -key "$CT_DATA/$1.key" -subj "/CN=$2" -days 30 -out "$CT_DATA/$1.pem" 2>/dev/null
+  jq -n --rawfile c "$CT_DATA/$1.pem" --argjson rt "$3" '{data: {certificate: $c, revocation_time: $rt}}' > "$CT_DATA/$1.json"
+}
+ct_cert aa_01 alice 0
+ct_cert bb_02 alice 0
+ct_cert bb_03 bob 1767225600
+cat > "$CT_BIN/vault" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$CT_CALLS"
+case "$*" in
+  "list -format=json pki_int/certs") echo '["aa:01"]' ;;
+  "list -format=json pki_file/certs") echo '["bb:02","bb:03"]' ;;
+  "read -format=json pki_int/cert/aa:01") cat "$CT_DATA/aa_01.json" ;;
+  "read -format=json pki_file/cert/bb:02") cat "$CT_DATA/bb_02.json" ;;
+  "read -format=json pki_file/cert/bb:03") cat "$CT_DATA/bb_03.json" ;;
+  "read -format=json pki_"*/cert/*) echo "No value found at ${3}" >&2; exit 2 ;;
+  "list -format=json pki_int/certs/revoked") echo "No value found" >&2; exit 2 ;;
+  "list -format=json pki_file/certs/revoked") echo '["bb:02","bb:03"]' ;;
+  "write -format=json pki_int/sign/client-cert "*) jq -n --rawfile c "$CT_DATA/aa_01.pem" '{data: {certificate: $c}}' ;;
+  "write pki_"*/revoke\ *|"read -format=json pki_"*/crl/rotate) ;;
+  *) echo "unexpected vault call: $*" >&2; exit 1 ;;
+esac
+STUB
+cat > "$CT_BIN/ykman" <<'STUB'
+#!/usr/bin/env bash
+echo "ykman $*" >> "$CT_CALLS"
+case "$1 $2 $3" in
+  "piv keys generate"|"piv certificates request") eval "out=\${$#}"; echo PEM > "$out" ;;
+esac
+exit 0
+STUB
+chmod +x "$CT_BIN/vault" "$CT_BIN/ykman"
+ct() {
+  RC=0
+  rm -f "$WORK/cert-calls"; touch "$WORK/cert-calls"
+  PATH="$CT_BIN:$PATH" CT_CALLS="$WORK/cert-calls" CT_DATA="$CT_DATA" VAULT_TOKEN=t PORTCULLIS_ROOT="$CT_ROOT" \
+    "$CLI" cert "$@" >"$WORK/out" 2>"$WORK/err" </dev/null || RC=$?
+  OUT="$(cat "$WORK/out")"; ERR="$(cat "$WORK/err")"
+}
+ct list --all
+expect_eq "cert list --all exits 0" "$RC" 0
+expect_eq "cert list --all prints KIND YubiKey / Browser and revoked rows" \
+  "$(printf '%s\n' "$OUT" | awk '{print $1, $2, $3, $4}')" \
+  "SERIAL KIND COMMON NAME
+aa:01 YubiKey alice valid
+bb:02 Browser alice valid
+bb:03 Browser bob revoked"
+ct list
+expect_eq "cert list hides revoked rows" "$(printf '%s\n' "$OUT" | awk 'NR > 1 {print $1}' | tr '\n' ' ')" "aa:01 bb:02 "
+ct revoke --yes bb:02
+expect_eq "cert revoke <pki_file serial> exits 0" "$RC" 0
+expect_eq "cert revoke <pki_file serial> revokes on pki_file and rotates pki_file's CRL" \
+  "$(grep -E '/revoke |crl/rotate' "$WORK/cert-calls")" \
+  "write pki_file/revoke serial_number=bb:02
+read -format=json pki_file/crl/rotate"
+expect_eq "cert revoke looks the serial up on pki_int first" "$(grep -cx 'read -format=json pki_int/cert/bb:02' "$WORK/cert-calls")" 1
+case "$OUT" in *"Browser certificate (pki_file)"*) t_pass "cert revoke names the certificate's kind" ;; *) t_fail "cert revoke kind: $OUT" ;; esac
+expect_eq "cert revoke syncs the union of both CAs' revoked serials" \
+  "$(grep -v '^#' "$CT_ROOT/certs/revocation/revoked-serials.txt" | tr '\n' ' ')" "bb:02 bb:03 "
+ct revoke --yes aa:01
+expect_eq "cert revoke <pki_int serial> revokes on pki_int and rotates pki_int's CRL" \
+  "$(grep -E '/revoke |crl/rotate' "$WORK/cert-calls")" \
+  "write pki_int/revoke serial_number=aa:01
+read -format=json pki_int/crl/rotate"
+ct revoke --yes cc:99
+expect_eq "cert revoke of an unknown serial exits 1" "$RC" 1
+expect_eq "cert revoke of an unknown serial revokes nothing" "$(grep -c '/revoke ' "$WORK/cert-calls")" 0
+ct enroll alice
+expect_eq "cert enroll exits 0 (stub ykman)" "$RC" 0
+case "$OUT" in *"https://people.example.test/signin"*) t_pass "cert enroll's renewal hint names https://people.<domain>/signin" ;; *) t_fail "cert enroll's renewal hint: $OUT" ;; esac
+case "$OUT" in *"enroll.example.test"*) t_fail "cert enroll still names enroll.<domain>" ;; *) t_pass "cert enroll no longer names enroll.<domain>" ;; esac
+expect_eq "cert enroll signs with pki_int's client-cert role" "$(grep -c '^write -format=json pki_int/sign/client-cert .*common_name=alice' "$WORK/cert-calls")" 1
+
 expect_eq "docker was never called" "$(cat "$STUB_CALLS" 2>/dev/null)" ""
 
 echo ""

@@ -765,7 +765,13 @@ jobs:
         run: |
           test -f certs/root-ca.crt || (echo "FAIL: root-ca.crt missing" && exit 1)
           test -f certs/intermediate-ca.crt || (echo "FAIL: intermediate-ca.crt missing" && exit 1)
+          test -f certs/yubikey-ca.crt || (echo "FAIL: yubikey-ca.crt missing" && exit 1)
+          test -f certs/browser-ca.crt || (echo "FAIL: browser-ca.crt missing" && exit 1)
           test -f certs/ca-chain.crt || (echo "FAIL: ca-chain.crt missing" && exit 1)
+          test -f certs/ca-chain-yubikey.crt || (echo "FAIL: ca-chain-yubikey.crt missing" && exit 1)
+          for f in portcullis-ca-chain.pem portcullis-yubikey-ca.pem portcullis-browser-ca.pem; do
+            test -f "certs/truststore/$f" || { echo "FAIL: truststore/$f missing"; exit 1; }
+          done
           test -f certs/server.crt || (echo "FAIL: server.crt missing" && exit 1)
           test -f certs/server.key || (echo "FAIL: server.key missing" && exit 1)
           echo "PASS: All PKI certificates created"
@@ -773,7 +779,17 @@ jobs:
       - name: Verify CA chain is valid
         run: |
           openssl verify -CAfile certs/root-ca.crt certs/intermediate-ca.crt
+          openssl verify -CAfile certs/root-ca.crt certs/yubikey-ca.crt
+          openssl verify -CAfile certs/root-ca.crt certs/browser-ca.crt
           openssl verify -CAfile certs/ca-chain.crt certs/server.crt
+          # ca-chain.crt = root + pki_int + pki_file; ca-chain-yubikey.crt = root + pki_int only.
+          subjects() { openssl crl2pkcs7 -nocrl -certfile "$1" | openssl pkcs7 -print_certs -noout | sed -n 's/^subject=//p'; }
+          test "$(subjects certs/ca-chain.crt | tr '\n' '|')" = "$(for f in root-ca yubikey-ca browser-ca; do subjects "certs/$f.crt"; done | tr '\n' '|')" \
+            || { echo "FAIL: ca-chain.crt is not root + YubiKey CA + browser CA"; subjects certs/ca-chain.crt; exit 1; }
+          test "$(subjects certs/ca-chain-yubikey.crt | tr '\n' '|')" = "$(for f in root-ca yubikey-ca; do subjects "certs/$f.crt"; done | tr '\n' '|')" \
+            || { echo "FAIL: ca-chain-yubikey.crt is not root + YubiKey CA"; subjects certs/ca-chain-yubikey.crt; exit 1; }
+          test "$(subjects certs/yubikey-ca.crt)" != "$(subjects certs/browser-ca.crt)" || { echo "FAIL: the two CAs have the same subject"; exit 1; }
+          cmp -s certs/ca-chain.crt certs/truststore/portcullis-ca-chain.pem || { echo "FAIL: truststore chain differs"; exit 1; }
           echo "PASS: Certificate chain is valid"
 
       - name: Test Vault persistence and auto-unseal across restart
@@ -801,9 +817,15 @@ jobs:
           [ -z "$TOKEN" ] || [ "$TOKEN" = null ] || echo "::add-mask::$TOKEN"
           export VAULT_TOKEN="$TOKEN"
           vault list pki_int/certs >/dev/null || { echo "FAIL: enroll token cannot list certs"; exit 1; }
+          # pki_file may have issued nothing yet: exit 2 ("no value") is fine, a 403 is not.
+          rc=0; vault list pki_file/certs >/dev/null 2>&1 || rc=$?
+          [ "$rc" = 0 ] || [ "$rc" = 2 ] || { echo "FAIL: enroll token cannot list pki_file certs"; exit 1; }
+          vault read -format=json pki_file/crl/rotate >/dev/null || { echo "FAIL: enroll token cannot rotate pki_file's CRL"; exit 1; }
           for denied in "write -f pki/root/generate/internal common_name=x" \
                         "write pki_int/issue/server-cert common_name=x.portcullis.local" \
-                        "write pki_int/revoke serial_number=00" \
+                        "write pki_file/issue/browser-cert common_name=x" \
+                        "write pki_file/roles/browser-cert max_ttl=87600h" \
+                        "write pki_file/config/crl disable=true" \
                         "read sys/auth" \
                         "policy write evil -"; do
             # shellcheck disable=SC2086

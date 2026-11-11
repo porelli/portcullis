@@ -53,7 +53,7 @@ Vault and PKI:
   vault init                  Initialise/unseal Vault, set up the enroll AppRole
   vault unseal                Unseal Vault and wait until it is active
   vault rotate-enroll-secret  Issue a new enroll AppRole secret-id
-  pki setup                   Create the client-certificate CA (idempotent)
+  pki setup                   Create the internal certificate authority (idempotent)
 
 Identity:
   invite                      One-time setup link: register a passkey, signed in (no password)
@@ -62,12 +62,12 @@ Identity:
   oidc register               Create core OIDC clients, push their secrets from .env
   signin reset-core           Locked out of the Hub: put the Hub and people pages back on Standard
 
-Client certificates (YubiKey PIV):
-  cert enroll                 New key + certificate on a YubiKey
-  cert renew                  New certificate for the key already on the YubiKey
-  cert revoke                 Revoke a certificate (enforced by group-gate)
-  cert list                   List issued certificates
-  cert sync                   Rewrite the revoked-serial list from Vault
+YubiKey and browser certificates:
+  cert enroll                 New key + YubiKey certificate on a YubiKey
+  cert renew                  New YubiKey certificate for the key already on the YubiKey
+  cert revoke                 Revoke a YubiKey or browser certificate (enforced by group-gate)
+  cert list                   List issued YubiKey and browser certificates
+  cert sync                   Rewrite the revoked-serial list from Vault (both CAs)
 
 Run 'portcullis <command> --help' for the options of a command.
 EOF

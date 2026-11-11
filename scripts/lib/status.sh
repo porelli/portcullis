@@ -57,7 +57,7 @@ status_run() {
       certs_issued="$(printf '%s' "$serials" | jq 'length')"
       now="$(date +%s)"
       for s in $(printf '%s' "$serials" | jq -r '.[]'); do
-        info="$(_cert_info "$s")" || continue
+        info="$(_cert_info pki_int "$s")" || continue
         IFS='|' read -r cn end revoked <<< "$info"
         [ "$revoked" = false ] && [ -n "$cn" ] && [ "$cn" != "$server_cn" ] || continue
         epoch="$(to_epoch "$end")"

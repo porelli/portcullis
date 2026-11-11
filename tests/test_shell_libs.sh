@@ -46,10 +46,18 @@ if [ "$1 $2" = "network inspect" ] && [ "$4" = "--format" ]; then
 fi
 exit 0
 STUB
-# vault: STUB_VAULT_RC / STUB_VAULT_OUT control `vault list` behaviour.
+# vault: STUB_VAULT_RC / STUB_VAULT_OUT control `vault list` behaviour;
+# calls on pki_file use STUB_VAULT_FILE_RC / STUB_VAULT_FILE_OUT when set.
 cat > "$WORK/bin/vault" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$STUB_DIR/vault-calls"
+case "$*" in
+  *pki_file/*)
+    if [ -n "${STUB_VAULT_FILE_RC:-}" ]; then
+      printf '%s\n' "${STUB_VAULT_FILE_OUT:-}"
+      exit "$STUB_VAULT_FILE_RC"
+    fi ;;
+esac
 printf '%s\n' "${STUB_VAULT_OUT:-}"
 exit "${STUB_VAULT_RC:-0}"
 STUB
@@ -501,7 +509,7 @@ serials_in() { grep -v '^#' "$REV" | paste -sd' ' -; }
 
 STUB_VAULT_RC=0 STUB_VAULT_OUT='["0a:bc","de:ad:be:ef"]' write_revoked_serials "$REV" >/dev/null 2>&1
 expect_eq "sync writes Vault's revoked serials" "$(serials_in)" "0a:bc de:ad:be:ef"
-expect_ok "sync file keeps a header" grep -q '^# Revoked client-cert serials' "$REV"
+expect_ok "sync file keeps a header" grep -q '^# Revoked YubiKey and browser certificate serials' "$REV"
 
 STUB_VAULT_RC=2 STUB_VAULT_OUT='No value found at pki_int/certs/revoked' write_revoked_serials "$REV" >/dev/null 2>&1
 rc=$?
@@ -522,8 +530,45 @@ for case in "1|Error listing pki_int/certs/revoked: Vault is sealed" \
 done
 expect_eq "no temp files left behind" "$(find "$WORK/revocation" -name '.revoked.*' | wc -l | tr -d ' ')" 0
 
+# Both CAs: the union of pki_int/certs/revoked and pki_file/certs/revoked.
+rm -f "$STUB_DIR/vault-calls"
+STUB_VAULT_RC=0 STUB_VAULT_OUT='["0a:bc","11:11"]' STUB_VAULT_FILE_RC=0 STUB_VAULT_FILE_OUT='["ff:01","11:11"]' \
+  write_revoked_serials "$REV" >/dev/null 2>&1
+expect_eq "write_revoked_serials writes the union of both mounts" "$(serials_in)" "0a:bc 11:11 ff:01"
+expect_ok "sync lists pki_int's revoked serials" grep -qx 'list -format=json pki_int/certs/revoked' "$STUB_DIR/vault-calls"
+expect_ok "sync lists pki_file's revoked serials" grep -qx 'list -format=json pki_file/certs/revoked' "$STUB_DIR/vault-calls"
+STUB_VAULT_RC=2 STUB_VAULT_OUT='No value found' STUB_VAULT_FILE_RC=0 STUB_VAULT_FILE_OUT='["ff:02"]' \
+  write_revoked_serials "$REV" >/dev/null 2>&1
+expect_eq "nothing revoked on pki_int + one on pki_file" "$(serials_in)" "ff:02"
+before="$(cat "$REV")"
+for case in "1|Error listing pki_file/certs/revoked: Vault is sealed" "0|not json" '0|{"keys":["ff:03"]}'; do
+  rc=0
+  STUB_VAULT_RC=0 STUB_VAULT_OUT='["0a:bc"]' STUB_VAULT_FILE_RC="${case%%|*}" STUB_VAULT_FILE_OUT="${case#*|}" \
+    write_revoked_serials "$REV" >/dev/null 2>&1 || rc=$?
+  expect_eq "a failing pki_file list ('${case#*|}') → non-zero" "$([ "$rc" -ne 0 ] && echo fail || echo ok)" fail
+  expect_eq "a failing pki_file list ('${case#*|}') leaves the file unchanged" "$(cat "$REV")" "$before"
+done
+rc=0
+STUB_VAULT_RC=1 STUB_VAULT_OUT='sealed' STUB_VAULT_FILE_RC=0 STUB_VAULT_FILE_OUT='["ff:04"]' \
+  write_revoked_serials "$REV" >/dev/null 2>&1 || rc=$?
+expect_eq "a failing pki_int list with a good pki_file one → non-zero" "$([ "$rc" -ne 0 ] && echo fail || echo ok)" fail
+expect_eq "a failing pki_int list leaves the file unchanged" "$(cat "$REV")" "$before"
+
 # ══ portcullis pki setup: idempotency / partial runs / guard ═══
-# A scripted vault stub: $PKI_STATE selects which PKI pieces "exist".
+# Real (self-signed) CA certificates, so CNs and the chain order can be checked.
+mkdir -p "$STUB_DIR/pem"
+mkpem() {
+  openssl ecparam -genkey -name prime256v1 -out "$STUB_DIR/pem/$1.key" 2>/dev/null
+  openssl req -new -x509 -key "$STUB_DIR/pem/$1.key" -subj "/CN=$2" -days 2 -out "$STUB_DIR/pem/$1" 2>/dev/null
+}
+mkpem root "example.test Root CA"
+mkpem int "example.test Intermediate CA"
+mkpem file "example.test Browser Certificate CA"
+mkpem file-samecn "example.test Intermediate CA"
+# A scripted vault stub: $PKI_STATE selects which PKI pieces "exist":
+#   none (fresh Vault), complete (pki, pki_int, pki_file), nofile (pki_file
+#   missing), norole (client-cert role missing), samecn (pki_file has
+#   pki_int's CN), partial (mounts but no issuers), sealed, intbroken.
 mkdir -p "$WORK/pki-bin"
 cat > "$WORK/pki-bin/vault" <<'STUB'
 #!/usr/bin/env bash
@@ -533,16 +578,21 @@ case "$PKI_STATE:$*" in
   *:secrets\ list*)
     case "$PKI_STATE" in
       none) echo '{"secret/":{}}' ;;
-      *) echo '{"pki/":{},"pki_int/":{}}' ;;
+      nofile) echo '{"pki/":{},"pki_int/":{}}' ;;
+      *) echo '{"pki/":{},"pki_int/":{},"pki_file/":{}}' ;;
     esac ;;
-  complete:list*pki_int/issuers*|norole:list*pki_int/issuers*) echo '["abc"]' ;;
+  complete:list*pki_*/issuers*|norole:list*pki_*/issuers*|samecn:list*pki_*/issuers*) echo '["abc"]' ;;
+  nofile:list*pki_int/issuers*) echo '["abc"]' ;;
   intbroken:list*pki_int/issuers*) echo "Error: permission denied" >&2; exit 1 ;;
   *:list*issuers*) echo "No value found" >&2; exit 2 ;;
-  complete:read*pki_int/roles/client-cert*) echo '{"data":{}}' ;;
-  *:read*pki_int/roles/client-cert*) echo "No value found" >&2; exit 2 ;;
-  *:read\ -field=certificate*) echo "-----BEGIN CERTIFICATE-----" ;;
+  norole:read*pki_int/roles/client-cert*) echo "No value found" >&2; exit 2 ;;
+  *:read*/roles/*) echo '{"data":{}}' ;;
+  *:read\ -field=certificate\ pki/cert/ca) cat "$STUB_DIR/pem/root" ;;
+  *:read\ -field=certificate\ pki_int/cert/ca) cat "$STUB_DIR/pem/int" ;;
+  samecn:read\ -field=certificate\ pki_file/cert/ca) cat "$STUB_DIR/pem/file-samecn" ;;
+  *:read\ -field=certificate\ pki_file/cert/ca) cat "$STUB_DIR/pem/file" ;;
   *:write\ -format=json\ pki/root/generate*) echo '{"data":{"certificate":"ROOT"}}' ;;
-  *:write\ -format=json\ pki_int/intermediate/generate*) echo '{"data":{"csr":"CSR"}}' ;;
+  *:write\ -format=json\ pki_*/intermediate/generate*) echo '{"data":{"csr":"CSR"}}' ;;
   *:write\ -format=json\ pki/root/sign-intermediate*) echo '{"data":{"certificate":"INT"}}' ;;
   *:write\ -format=json\ pki_int/issue/server-cert*) echo '{"data":{"certificate":"SRV","private_key":"KEY"}}' ;;
 esac
@@ -568,12 +618,38 @@ expect_ok "pki: fresh install generates a root" grep -q 'root/generate/internal'
 expect_ok "pki: root CN uses PORTCULLIS_DOMAIN" grep -q 'common_name=example.test Root CA' "$STUB_DIR/pki-calls"
 expect_eq "pki: server.key is 0640 (group 0 for Traefik)" "$(file_mode "$PKI_ROOT/certs/server.key")" 640
 expect_ok "pki: server.key chgrp via a helper container" grep -q "chown $(id -u):0 /t/0" "$STUB_DIR/calls"
-expect_ok "pki: ca-chain written" grep -q INT "$PKI_ROOT/certs/ca-chain.crt"
+expect_ok "pki: ca-chain written" grep -q 'BEGIN CERTIFICATE' "$PKI_ROOT/certs/ca-chain.crt"
 expect_ok "pki: Keycloak truststore written" cmp -s "$PKI_ROOT/certs/ca-chain.crt" "$PKI_ROOT/certs/truststore/portcullis-ca-chain.pem"
 expect_ok "pki: client role defaults to 30 days" grep -q 'roles/client-cert .*max_ttl=720h ttl=720h' "$STUB_DIR/pki-calls"
 expect_ok "pki: CRL auto-rebuild configured" grep -q 'pki_int/config/crl .*auto_rebuild=true' "$STUB_DIR/pki-calls"
 # auto_rebuild defers full-CRL rebuilds on revoke: new revocations must go to a delta CRL.
 expect_ok "pki: delta CRLs enabled, rebuilt every minute" grep -q 'pki_int/config/crl .*enable_delta=true delta_rebuild_interval=1m' "$STUB_DIR/pki-calls"
+# The three CA files, as pki_setup must export them.
+CHAIN3="$(cat "$STUB_DIR/pem/root" "$STUB_DIR/pem/int" "$STUB_DIR/pem/file")"
+CHAIN2="$(cat "$STUB_DIR/pem/root" "$STUB_DIR/pem/int")"
+nbegin() { grep -c 'BEGIN CERTIFICATE' "$1"; }
+expect_ok "pki_setup on a fresh Vault enables pki" grep -qx 'secrets enable -path=pki pki' "$STUB_DIR/pki-calls"
+expect_ok "pki_setup on a fresh Vault enables pki_int" grep -qx 'secrets enable -path=pki_int pki' "$STUB_DIR/pki-calls"
+expect_ok "pki_setup on a fresh Vault enables pki_file" grep -qx 'secrets enable -path=pki_file pki' "$STUB_DIR/pki-calls"
+expect_ok "pki_file CN is '<domain> Browser Certificate CA'" grep -q 'pki_file/intermediate/generate/internal common_name=example.test Browser Certificate CA' "$STUB_DIR/pki-calls"
+expect_ok "pki_file is signed by the root (43800h)" grep -q 'pki/root/sign-intermediate csr=CSR format=pem_bundle ttl=43800h' "$STUB_DIR/pki-calls"
+expect_ok "pki_file gets its signed certificate" grep -q 'write pki_file/intermediate/set-signed certificate=INT' "$STUB_DIR/pki-calls"
+expect_ok "pki_file URLs point at pki_file" grep -q 'pki_file/config/urls issuing_certificates=.*/v1/pki_file/ca crl_distribution_points=.*/v1/pki_file/crl' "$STUB_DIR/pki-calls"
+expect_eq "pki: ca-chain.crt has 3 certificates" "$(nbegin "$PKI_ROOT/certs/ca-chain.crt")" 3
+expect_eq "pki: ca-chain.crt is root, pki_int, pki_file in order" "$(cat "$PKI_ROOT/certs/ca-chain.crt")" "$CHAIN3"
+expect_eq "pki: ca-chain-yubikey.crt has exactly root, pki_int" "$(cat "$PKI_ROOT/certs/ca-chain-yubikey.crt")" "$CHAIN2"
+expect_ok "pki: yubikey-ca.crt is pki_int's certificate" cmp -s "$PKI_ROOT/certs/yubikey-ca.crt" "$STUB_DIR/pem/int"
+expect_ok "pki: browser-ca.crt is pki_file's certificate" cmp -s "$PKI_ROOT/certs/browser-ca.crt" "$STUB_DIR/pem/file"
+expect_ok "truststore has portcullis-yubikey-ca.pem" cmp -s "$PKI_ROOT/certs/truststore/portcullis-yubikey-ca.pem" "$STUB_DIR/pem/int"
+expect_ok "truststore has portcullis-browser-ca.pem" cmp -s "$PKI_ROOT/certs/truststore/portcullis-browser-ca.pem" "$STUB_DIR/pem/file"
+expect_ok "browser-cert role written with client_flag=true server_flag=false" \
+  grep -q 'write pki_file/roles/browser-cert .*client_flag=true server_flag=false' "$STUB_DIR/pki-calls"
+expect_ok "browser-cert role: use_csr_common_name=false use_csr_sans=false, any name" \
+  grep -q 'write pki_file/roles/browser-cert .*allow_any_name=true enforce_hostnames=false use_csr_common_name=false use_csr_sans=false' "$STUB_DIR/pki-calls"
+expect_ok "browser-cert role: ec 256, max_ttl=\$CLIENT_CERT_TTL, stored" \
+  grep -q 'write pki_file/roles/browser-cert .*key_type=ec key_bits=256 max_ttl=720h ttl=720h no_store=false' "$STUB_DIR/pki-calls"
+expect_ok "pki_file CRL configured auto_rebuild=true enable_delta=true delta_rebuild_interval=1m" \
+  grep -q 'write pki_file/config/crl expiry=72h auto_rebuild=true auto_rebuild_grace_period=12h enable_delta=true delta_rebuild_interval=1m' "$STUB_DIR/pki-calls"
 expect_eq "pki: complete PKI is a no-op" "$(run_pki complete)" 0
 expect_fail "pki: complete PKI → no generate / disable" grep -Eq 'generate|secrets disable' "$STUB_DIR/pki-calls"
 expect_ok "pki: complete PKI re-exports missing CA files" test -s "$PKI_ROOT/certs/ca-chain.crt"
@@ -582,6 +658,7 @@ expect_ok "pki: complete PKI (re)applies the CRL config incl. delta" grep -q 'pk
 rm -f "$PKI_ROOT/certs/truststore/portcullis-ca-chain.pem"
 expect_eq "pki: CLIENT_CERT_TTL=2160h" "$(CLIENT_CERT_TTL=2160h run_pki complete)" 0
 expect_ok "pki: role uses CLIENT_CERT_TTL" grep -q 'max_ttl=2160h ttl=2160h' "$STUB_DIR/pki-calls"
+expect_ok "pki: browser-cert role uses CLIENT_CERT_TTL" grep -q 'write pki_file/roles/browser-cert .*max_ttl=2160h' "$STUB_DIR/pki-calls"
 expect_ok "pki: complete PKI re-exports the truststore" test -s "$PKI_ROOT/certs/truststore/portcullis-ca-chain.pem"
 expect_eq "pki: invalid CLIENT_CERT_TTL fails" "$(CLIENT_CERT_TTL='30 days' run_pki complete)" 1
 expect_eq "pki: missing role only" "$(run_pki norole)" 0
@@ -589,6 +666,7 @@ expect_ok "pki: missing role is recreated" grep -q 'write pki_int/roles/client-c
 expect_fail "pki: missing role does NOT wipe the CA" grep -Eq 'generate|secrets disable' "$STUB_DIR/pki-calls"
 expect_eq "pki: partial run (no intermediate) is redone" "$(run_pki partial)" 0
 expect_ok "pki: partial run wipes pki_int + pki first" grep -q 'secrets disable pki_int' "$STUB_DIR/pki-calls"
+expect_ok "pki: partial run wipes pki_file too" grep -qx 'secrets disable pki_file' "$STUB_DIR/pki-calls"
 expect_eq "pki: sealed Vault fails" "$(run_pki sealed)" 1
 expect_fail "pki: sealed Vault → nothing generated" grep -q generate "$STUB_DIR/pki-calls"
 expect_eq "pki: read error on issuers fails" "$(run_pki intbroken)" 1
@@ -600,6 +678,58 @@ expect_fail "pki: refusal creates nothing" grep -q generate "$STUB_DIR/pki-calls
 expect_ok "pki: refusal explains --force" grep -q -- '--force' "$WORK/pki-out"
 expect_eq "pki: --force creates a new CA anyway" "$(run_pki none --keep --force)" 0
 expect_ok "pki: --force generated a root" grep -q 'root/generate/internal' "$STUB_DIR/pki-calls"
+expect_eq "pki: --force over a complete PKI" "$(run_pki complete --force)" 0
+expect_ok "pki: --force destroys pki_file" grep -qx 'secrets disable pki_file' "$STUB_DIR/pki-calls"
+expect_ok "pki: --force destroys pki_int" grep -qx 'secrets disable pki_int' "$STUB_DIR/pki-calls"
+
+# PKI_TRUSTSTORE_CHANGED (read by stack.sh) needs pki_setup in this shell.
+# pki_fn <state> — runs pki_setup on the current certs/, prints "<rc> <flag>".
+pki_fn() {
+  rm -f "$STUB_DIR/pki-calls"; touch "$STUB_DIR/pki-calls"
+  PATH="$WORK/pki-bin:$PATH" PKI_STATE="$1" VAULT_TOKEN=t PORTCULLIS_ROOT="$PKI_ROOT" PORTCULLIS_DOMAIN=example.test \
+    bash -c 'set -euo pipefail
+      for l in common vault pki; do source "$1/scripts/lib/$l.sh"; done
+      rc=0; ( pki_setup false false >/dev/null; echo "${PKI_TRUSTSTORE_CHANGED:-unset}" > "$2" ) || rc=$?
+      [ "$rc" = 0 ] || echo error > "$2"
+      echo "$rc $(cat "$2")"' _ "$HERE/.." "$WORK/pki-flag" 2>"$WORK/pki-out"
+}
+CERTS="$PKI_ROOT/certs"
+# pki_int present, no pki_file: the install pki_file is added to.
+rm -rf "$CERTS"; mkdir -p "$CERTS/truststore"
+cp "$STUB_DIR/pem/root" "$CERTS/root-ca.crt"; cp "$STUB_DIR/pem/int" "$CERTS/intermediate-ca.crt"
+printf '%s\n' "$CHAIN2" > "$CERTS/ca-chain.crt"; cp "$CERTS/ca-chain.crt" "$CERTS/truststore/portcullis-ca-chain.pem"
+expect_eq "pki_setup with pki_int present but no pki_file sets PKI_TRUSTSTORE_CHANGED=true" "$(pki_fn nofile)" "0 true"
+expect_ok "pki_setup with pki_int present creates pki_file" grep -qx 'secrets enable -path=pki_file pki' "$STUB_DIR/pki-calls"
+expect_ok "pki_setup with pki_int present: pki_file signed by the root" grep -q 'write pki_file/intermediate/set-signed' "$STUB_DIR/pki-calls"
+expect_fail "pki_setup with pki_int present keeps pki_int (no disable / generate on it)" \
+  grep -Eq 'secrets disable|pki_int/intermediate/generate|pki/root/generate' "$STUB_DIR/pki-calls"
+expect_eq "pki_setup with pki_int present rewrites ca-chain.crt to 3 certificates" "$(cat "$CERTS/ca-chain.crt")" "$CHAIN3"
+expect_eq "pki_setup with pki_int present writes ca-chain-yubikey.crt" "$(cat "$CERTS/ca-chain-yubikey.crt")" "$CHAIN2"
+expect_eq "pki_setup with pki_int present rewrites the truststore chain" "$(cat "$CERTS/truststore/portcullis-ca-chain.pem")" "$CHAIN3"
+expect_ok "pki_setup with pki_int present writes the truststore's browser CA" cmp -s "$CERTS/truststore/portcullis-browser-ca.pem" "$STUB_DIR/pem/file"
+expect_ok "pki_setup with pki_int present writes the browser-cert role" grep -q 'write pki_file/roles/browser-cert' "$STUB_DIR/pki-calls"
+expect_ok "pki_setup with pki_int present configures pki_file's CRLs" grep -q 'write pki_file/config/crl .*enable_delta=true' "$STUB_DIR/pki-calls"
+# All three present, both chains current.
+expect_eq "pki_setup with all three present and both chains current leaves PKI_TRUSTSTORE_CHANGED unset" "$(pki_fn complete)" "0 unset"
+expect_fail "pki_setup with all three present creates nothing" grep -Eq 'secrets (enable|disable)|generate' "$STUB_DIR/pki-calls"
+# All three present, chain current but ca-chain-yubikey.crt missing / holding pki_file.
+rm -f "$CERTS/ca-chain-yubikey.crt"
+expect_eq "pki_setup with ca-chain-yubikey.crt missing sets PKI_TRUSTSTORE_CHANGED=true" "$(pki_fn complete)" "0 true"
+expect_eq "pki_setup with ca-chain-yubikey.crt missing rewrites it" "$(cat "$CERTS/ca-chain-yubikey.crt")" "$CHAIN2"
+printf '%s\n' "$CHAIN3" > "$CERTS/ca-chain-yubikey.crt"
+expect_eq "pki_setup with ca-chain-yubikey.crt holding pki_file sets PKI_TRUSTSTORE_CHANGED=true" "$(pki_fn complete)" "0 true"
+expect_eq "pki_setup with ca-chain-yubikey.crt holding pki_file rewrites it" "$(cat "$CERTS/ca-chain-yubikey.crt")" "$CHAIN2"
+printf '%s\n' "$CHAIN2" > "$CERTS/ca-chain.crt"
+expect_eq "pki_setup with a 2-certificate ca-chain.crt sets PKI_TRUSTSTORE_CHANGED=true" "$(pki_fn complete)" "0 true"
+expect_eq "pki_setup with a 2-certificate ca-chain.crt rewrites it" "$(cat "$CERTS/ca-chain.crt")" "$CHAIN3"
+# Equal CNs: refused, nothing exported.
+cp -p "$CERTS/ca-chain.crt" "$WORK/chain-before"
+rm -f "$CERTS/ca-chain-yubikey.crt"
+expect_eq "pki_setup refuses when the two intermediates' CNs are equal" "$(pki_fn samecn)" "1 error"
+expect_ok "pki_setup's refusal names the same CN" grep -q 'same CN' "$WORK/pki-out"
+expect_ok "pki_setup's refusal leaves ca-chain.crt alone" cmp -s "$CERTS/ca-chain.crt" "$WORK/chain-before"
+expect_fail "pki_setup's refusal writes no ca-chain-yubikey.crt" test -e "$CERTS/ca-chain-yubikey.crt"
+expect_eq "pki setup (CLI) exits 1 on equal CNs" "$(run_pki samecn --keep)" 1
 
 # ══ portcullis cert sync (dispatch through the CLI) ════════
 mkdir -p "$PKI_ROOT/certs/revocation"
