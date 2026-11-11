@@ -739,7 +739,7 @@ def host_kind(host: str, extra: List[str]) -> Optional[str]:
     return None
 
 
-# ── Temporary memberships (expiring, policy file v4) ─────────────────
+# ── Temporary memberships (expiring, policy file) ────────────────────
 
 _RFC3339_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})")
 _EXPIRING_CACHE: dict = {"doc": None, "entries": None}

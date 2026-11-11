@@ -31,8 +31,9 @@ package main
 //
 // Keycloak links the identity to the existing LLDAP user (first broker
 // login: detect existing user + auto link, never create), its post-broker
-// flow marks the session LoA 2 / amr=hwk, and the required action makes the
-// user register a passkey before the session exists. The browser then lands
+// flow records the session with amr `inv` and ends with portcullis-template
+// (contract §8 "Invite links"), and the required action makes the user
+// register a passkey before the session exists. The browser then lands
 // on the invite's landing page.
 //
 // Security: 256-bit tokens, stored as SHA-256 only, single use, expiry

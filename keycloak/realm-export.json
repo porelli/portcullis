@@ -587,7 +587,7 @@
     {
       "clientId": "portcullis-forward-auth",
       "name": "Portcullis Forward Auth",
-      "description": "OIDC client used by Traefik forward auth middleware. ACR/AMR claims surface per-session LoA to group-gate for per-app policy enforcement.",
+      "description": "OIDC client used by Traefik forward auth middleware. AMR claims carry the session's sign-in methods to group-gate (contract §8.1).",
       "enabled": true,
       "protocol": "openid-connect",
       "publicClient": false,
