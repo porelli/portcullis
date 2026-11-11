@@ -2321,8 +2321,11 @@ jobs:
             || { echo "FAIL: certificates API with the bearer: $(head -c 300 /tmp/certs.json)"; exit 1; }
           SERIAL=$(tr 'A-F' 'a-f' < /tmp/test-client.serial)
           jq -e --arg s "$SERIAL" '(keys == ["certificates"]) and (.certificates | length > 0)
-              and all(.certificates[]; (keys == ["not_after", "revoked", "serial", "user"]) and (.user == (.user | ascii_downcase))
-                      and (.not_after | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$")) and (.revoked | type == "boolean"))
+              and all(.certificates[]; (keys == ["kind", "not_after", "not_before", "revoked", "serial", "user"]) and (.user == (.user | ascii_downcase))
+                      and (.kind | IN("yubikey", "browser"))
+                      and (.not_after | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$")) and (.not_before | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$"))
+                      and (.revoked | type == "boolean"))
+              and all(.certificates[] | select(.user == "testuser"); .kind == "yubikey")
               and any(.certificates[]; .serial == $s and .user == "testuser" and .revoked == true)
               and all(.certificates[]; .user | endswith("portcullis.local") | not)' /tmp/certs.json >/dev/null \
             || { echo "FAIL: certificates API answer (want testuser's revoked $SERIAL, no server certs):"; jq -c . /tmp/certs.json | head -c 2000; exit 1; }
