@@ -573,13 +573,13 @@ def fresh_code(page: Page, label: str, redirect_uri: str) -> dict:
     return {"code": rd.code(), "code_verifier": verifier, "nonce": nonce}
 
 
-def hub_as(user: str, method: str, path: str, body=None, base_url: str = HUB_API):
+def hub_as(user: str, method: str, path: str, body=None, base_url: str = HUB_API, headers: dict | None = None):
     """The Hub listener (or base_url: the people listener) as Traefik calls
-    it for user (proxy secret)."""
+    it for user (proxy secret), plus headers."""
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(base_url + path, data=data, method=method, headers={
         "X-Portcullis-Proxy-Secret": os.environ["E2E_HUB_SECRET"], "X-Forwarded-User": user,
-        "Content-Type": "application/json"})
+        "Content-Type": "application/json", **(headers or {})})
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             return r.status, r.read().decode()
@@ -739,9 +739,9 @@ def raw_request(host: str, path: str, cookie: str = "", method: str = "GET") -> 
         conn.close()
 
 
-def people_as(user: str, method: str, path: str, body=None) -> tuple[int, str]:
+def people_as(user: str, method: str, path: str, body=None, headers: dict | None = None) -> tuple[int, str]:
     """The Hub's people listener as Traefik calls it for user."""
-    return hub_as(user, method, path, body, base_url=PEOPLE_API)
+    return hub_as(user, method, path, body, base_url=PEOPLE_API, headers=headers)
 
 
 def people_json(user: str, method: str, path: str, body=None):
@@ -1511,7 +1511,16 @@ def main() -> int:
             full, key = bc_files(0)
             rc, code = curl_tls(f"echo-cert.{DOMAIN}", full, key)
             print(f"    browser certificate + chain on echo-cert: curl exit {rc}, HTTP {code}", flush=True)
-            assert rc != 0 and code == "000", f"protected@file accepted a browser certificate: exit {rc}, HTTP {code}"
+            # 35 (CURLE_SSL_CONNECT_ERROR) / 56 (CURLE_RECV_ERROR: TLS 1.3's
+            # alert after the client's Certificate): the handshake refused,
+            # nothing else (a timeout, DNS, a bad file) counts.
+            assert rc in (35, 56) and code == "000", \
+                f"echo-cert with a browser certificate: curl exit {rc}, HTTP {code} (want a handshake refusal, 35 / 56)"
+            # The same files complete the handshake where browser
+            # certificates are accepted: the refusal above is the option's.
+            rc, code = curl_tls(f"echo-anycert.{DOMAIN}", full, key)
+            print(f"    the same files on echo-anycert: curl exit {rc}, HTTP {code}", flush=True)
+            assert rc == 0 and code != "000", f"the same files on echo-anycert: curl exit {rc}, HTTP {code}"
             # The .p12 itself, as a browser presents it.
             c = state["bc"][0]
             ctx = new_context(client_cert={"pfx": c["p12"], "passphrase": c["pw"]}, origins=(ECHO_CERT,))
@@ -1519,13 +1528,19 @@ def main() -> int:
             try:
                 try:
                     resp = page.goto(ECHO_CERT + "/", wait_until="domcontentloaded")
-                    html_ = page.content()
-                    assert resp is not None and resp.status == 503 and "client-certificate error" in html_, \
-                        f"echo-cert with the .p12: HTTP {resp and resp.status}"
-                    print("    the .p12 on echo-cert: handshake refused (Playwright's client-certificate error)",
-                          flush=True)
                 except PWError as e:
-                    print(f"    the .p12 on echo-cert: navigation failed ({str(e).splitlines()[0]})", flush=True)
+                    # Only Chromium's own client-certificate refusal counts.
+                    if "net::ERR_BAD_SSL_CLIENT_AUTH_CERT" not in str(e):
+                        raise
+                    print(f"    the .p12 on echo-cert: handshake refused ({str(e).splitlines()[0]})", flush=True)
+                else:
+                    # Playwright presents client certificates through its own
+                    # TLS proxy and answers a refused server handshake with a
+                    # synthetic 503 "client-certificate error" page.
+                    text = body(page)
+                    print(f"    the .p12 on echo-cert: HTTP {resp and resp.status}: {text.strip()[:160]!r}", flush=True)
+                    assert resp is not None and resp.status == 503 and "client-certificate error" in page.content(), \
+                        f"echo-cert with the .p12: HTTP {resp and resp.status} {text[:200]!r}"
             finally:
                 ctx.close()
             # Control: root's YubiKey certificate completes the handshake.
@@ -1533,7 +1548,8 @@ def main() -> int:
             print(f"    root's YubiKey certificate on echo-cert: curl exit {rc}, HTTP {code}", flush=True)
             assert rc == 0 and code != "000", f"root's YubiKey certificate refused: exit {rc}, HTTP {code}"
         check("tls_mtls_refuses_browser_cert: a handshake with alice's browser certificate and its full chain "
-              "(leaf + pki_file + root, and the .p12 itself) to echo-cert fails; root's YubiKey certificate passes",
+              "(leaf + pki_file + root, and the .p12 itself) to echo-cert is refused (curl 35 / 56); the same files "
+              "pass on echo-anycert; root's YubiKey certificate passes on echo-cert",
               tls_mtls_refuses_browser_cert)
 
         def tls_protected_any():
@@ -1646,6 +1662,73 @@ def main() -> int:
               "certificate/renew with a CSR for its key → 403 \"present your current YubiKey certificate\", nothing "
               "issued", browser_cert_cannot_renew)
 
+        def browser_cert_off_counts_nothing():
+            # A switched-off method is never accepted (global constraint):
+            # browser_cert off, the same valid .p12 and the same file session
+            # count for nothing; then everything back (in a finally).
+            needs("alice_file")
+            c = state["bc"][0]
+            errs: list = []
+            try:
+                hub_ok("PUT", "/api/instances/echo-file/settings", {"sign_in_template": ""})
+                hub_ok("PUT", "/api/signin/templates/e2e-file/enabled", {"on": False})
+                hub_ok("PUT", "/api/signin/methods/browser_cert", {"on": False})
+                until("browser_cert off in both published files and echo-anycert on authaware@file",
+                      lambda: "browser_cert" not in published()["methods"]
+                      and "browser_cert" not in hub_json("group-gate-policy.json").get("methods", [])
+                      and tls_option("echo-anycert") == "authaware@file", 180, every=5)
+                # Keycloak: the .p12 alone signs nobody in.
+                uid = kc_user_id("alice")
+                t0 = int(time.time() * 1000) - 2000
+                ctx = new_context(client_cert={"pfx": c["p12"], "passphrase": c["pw"]}, origins=(AUTH, ECHO_ANYCERT))
+                page = ctx.new_page()  # no authenticator
+                try:
+                    goto(page, ECHO_ANYCERT + "/")
+                    kc_page(page)
+                    page.wait_for_selector("#authenticateWebAuthnButton", state="visible")
+                    page.wait_for_timeout(5000)
+                    base.shot(page, "alice-bc-off-kc")
+                    assert page.url.startswith(REALM + "/"), f"left Keycloak: {page.url.split('?')[0]}"
+                    assert "Hostname" not in body(page), "echo-anycert opened"
+                finally:
+                    ctx.close()
+                events = [e for e in kc("/events?" + urllib.parse.urlencode({"user": uid, "type": "LOGIN", "max": 20}))
+                          if e.get("time", 0) >= t0]
+                assert not events, f"LOGIN events with browser_cert off: {[(e.get('clientId'), e.get('details')) for e in events]}"
+                # group-gate: the earlier file session (amr file) meets nothing.
+                ctx = new_context(client_cert={"pfx": c["p12"], "passphrase": c["pw"]}, origins=(AUTH, ECHO_ANYCERT),
+                                  storage_state=state["alice_file"])
+                page = ctx.new_page()
+                try:
+                    resp = goto(page, ECHO_ANYCERT + "/")
+                    print(f"    alice's file session on echo-anycert with browser_cert off: HTTP {resp and resp.status}",
+                          flush=True)
+                    assert resp is not None and resp.status == 403 and "Hostname" not in body(page), \
+                        f"echo-anycert with browser_cert off: HTTP {resp and resp.status}"
+                finally:
+                    ctx.close()
+            finally:
+                for method, path, body_ in (("PUT", "/api/signin/methods/browser_cert", {"on": True}),
+                                            ("PUT", "/api/signin/templates/e2e-file/enabled", {"on": True}),
+                                            ("PUT", "/api/instances/echo-file/settings", {"sign_in_template": "e2e-file"})):
+                    try:
+                        hub_ok(method, path, body_)
+                    except Exception as e:  # noqa: BLE001
+                        errs.append(str(e))
+                if not errs:
+                    try:
+                        until("browser_cert back: published, echo-file / echo-anycert on protected-any@file",
+                              lambda: "browser_cert" in published()["methods"]
+                              and tls_option("echo-file") == "protected-any@file"
+                              and tls_option("echo-anycert") == "protected-any@file", 180, every=5)
+                    except Exception as e:  # noqa: BLE001
+                        errs.append(str(e))
+            assert not errs, f"restore failed: {errs}"
+        check("browser_cert_off_counts_nothing: browser_cert switched off — the valid .p12 alone signs nobody in "
+              "(Keycloak keeps the passkey prompt, no LOGIN event) and alice's file session gets 403 on echo-anycert; "
+              "switched back on in a finally (echo-file / echo-anycert back on protected-any@file)",
+              browser_cert_off_counts_nothing)
+
         def yubikey_cert_still_mtls():
             cert, ykey = vault_issue("alice")
             assert cert.issuer == yubikey_ca.subject, cert.issuer.rfc4514_string()
@@ -1719,8 +1802,19 @@ def main() -> int:
             print(f"    forged headers on the renewal: HTTP {r.status} {r.text().strip()[:100]}", flush=True)
             assert r.status == 403 and "present your current YubiKey certificate" in r.text(), \
                 f"HTTP {r.status} {r.text()[:200]}"
+            # Positive control: the same header straight to the Hub's people
+            # listener (no Traefik in between) renews — so the 403 above is
+            # Traefik deleting it, not the Hub refusing the header's form.
+            code, out = people_as("alice", "POST", "/api/me/signin/yubikey-certificate/renew",
+                                  {"csr": csr_for(state["alice_yk"]["key"], "alice")},
+                                  headers={"X-Forwarded-Tls-Client-Cert": forged["X-Forwarded-Tls-Client-Cert"]})
+            print(f"    the same header straight to the people listener: HTTP {code}", flush=True)
+            assert code == 200, f"control (people listener, no Traefik): HTTP {code} {out[:200]}"
+            ctl = x509.load_pem_x509_certificate(json.loads(out)["certificate"].encode())
+            assert cn_of(ctl.subject) == "alice" and ctl.issuer == yubikey_ca.subject, ctl.subject.rfc4514_string()
         check("forged_cert_headers: Traefik deletes a client-sent X-Forwarded-Tls-Client-Cert / -Info — an mtls "
-              "session without the certificate stays on #present-certificate; a renewal with them forged → 403",
+              "session without the certificate stays on #present-certificate; a renewal with them forged → 403 "
+              "through Traefik, while the same header sent straight to the Hub's people listener renews (200)",
               forged_cert_headers_dropped)
 
         def browser_cert_revoked():
@@ -1748,11 +1842,11 @@ def main() -> int:
             assert rows.get(c["serial"], {}).get("status") == "revoked", rows.get(c["serial"])
             # Own route: a YubiKey certificate's serial is 404; her third
             # browser certificate she revokes herself.
-            if "alice_yk" in state:
-                yk_serials = [s for s, x in rows.items() if x["kind"] == "yubikey"]
-                assert yk_serials, rows
-                code, out = people_as("alice", "DELETE", "/api/me/signin/certificates/" + urllib.parse.quote(yk_serials[0], safe=""))
-                assert code == 404, f"own revoke of a YubiKey certificate: HTTP {code} {out[:200]}"
+            needs("alice_yk")
+            yk_serials = [s for s, x in rows.items() if x["kind"] == "yubikey"]
+            assert yk_serials, rows
+            code, out = people_as("alice", "DELETE", "/api/me/signin/certificates/" + urllib.parse.quote(yk_serials[0], safe=""))
+            assert code == 404, f"own revoke of a YubiKey certificate: HTTP {code} {out[:200]}"
             third = state["bc"][2]["serial"]
             code, out = people_as("alice", "DELETE", "/api/me/signin/certificates/" + urllib.parse.quote(third, safe=""))
             assert code == 204, f"revoking the third: HTTP {code} {out[:200]}"
@@ -1887,6 +1981,9 @@ def main() -> int:
             assert page_["unknown"] == [], page_["unknown"]
             assert any(e["kind"] == "sign_in" and e["methods"] == ["browser_cert"] and e["browser"] for e in entries), \
                 [e for e in entries if e["kind"] == "sign_in"][:5]
+            # Her first sign-in, through the setup link: no method did it.
+            assert any(e["kind"] == "sign_in" and e["methods"] == [] and e["detail"] == "Setup link used"
+                       for e in entries), [(e["methods"], e["detail"]) for e in entries if e["kind"] == "sign_in"]
             assert any(e["kind"] == "step_up" for e in entries), "no step_up"
             assert any(e["kind"] == "opened" and "browser_cert" in e["methods"] and "echo" in e["app"].lower()
                        and "file" in e["app"].lower() for e in entries), \
@@ -1900,7 +1997,8 @@ def main() -> int:
             assert any(e["kind"] == "failed" for e in pat["entries"]), sorted({e["kind"] for e in pat["entries"]})
             # carol (sign_in_help) may read alice's history too.
             assert people_json("carol", "GET", "/api/directory/users/alice/signin/history")["entries"]
-        check("history_entries: alice's history has a sign_in [browser_cert] with a browser, a step_up, an opened "
+        check("history_entries: alice's history has her setup-link sign_in (no methods, \"Setup link used\"), a "
+              "sign_in [browser_cert] with a browser, a step_up, an opened "
               "echo-file, help by carol and certificate entries; pat's a failed sign-in (his wrong password)",
               history_entries)
 
@@ -1974,10 +2072,23 @@ def main() -> int:
                 assert tls_option("echo-basic") == "authaware@file" and ca_names(f"echo-basic.{DOMAIN}"), \
                     f"echo-basic before the switch: {tls_option('echo-basic')}"
                 hub_ok("PUT", "/api/signin/methods/yubikey_cert", {"on": False})
-                # browser_cert alone still counts as a certificate there.
-                time.sleep(20)
-                assert tls_option("echo-basic") == "authaware@file" and ca_names(f"echo-basic.{DOMAIN}"), \
-                    f"echo-basic with browser_cert still on: {tls_option('echo-basic')}"
+                # browser_cert alone still counts as a certificate there: once
+                # the Hub has applied the switch (both published files without
+                # yubikey_cert, its own tier for echo-basic authaware, no
+                # echo-basic op running), echo-basic stays authaware with CA
+                # names over several samples.
+                def applied():
+                    pol, kc_ = hub_json("group-gate-policy.json"), published()
+                    tier = hub_ok("GET", "/api/instances/echo-basic/settings").get("tier")
+                    code, op = hub("GET", "/api/instances/echo-basic/op")
+                    running = code == 200 and isinstance(op, dict) and op.get("running")
+                    return ("yubikey_cert" not in pol.get("methods", []) and "yubikey_cert" not in kc_["methods"]
+                            and tier == "authaware@file" and not running)
+                until("the Hub applied yubikey_cert off (published, echo-basic's tier, no op running)", applied, 120)
+                for i in range(6):
+                    assert tls_option("echo-basic") == "authaware@file" and ca_names(f"echo-basic.{DOMAIN}"), \
+                        f"echo-basic with browser_cert still on, sample {i + 1}: {tls_option('echo-basic')}"
+                    time.sleep(5)
                 hub_ok("PUT", "/api/signin/methods/browser_cert", {"on": False})
                 until("echo-basic on public@file without CA names (yubikey_cert and browser_cert off)",
                       lambda: tls_option("echo-basic") == "public@file" and not ca_names(f"echo-basic.{DOMAIN}"), 180,

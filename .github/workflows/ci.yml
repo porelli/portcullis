@@ -3712,6 +3712,10 @@ jobs:
           # Browser certificates (part 2): browser_cert on (off by default),
           # e2e-file = any[browser_cert] and e2e-anycert = any[yubikey_cert,
           # browser_cert] — both protected-any@file.
+          # Off by default (a fresh Hub, part 2 ruling): asserted before the switch.
+          hub GET /api/signin | jq -e '[.methods[] | select(.id == "browser_cert")] | length == 1 and .[0].on == false' >/dev/null \
+            || { echo "FAIL: browser_cert isn't off by default: $(hub GET /api/signin | jq -c '[.methods[] | select(.id == "browser_cert")]')"; exit 1; }
+          echo "PASS: browser_cert is off by default"
           code=$(hubc PUT /api/signin/methods/browser_cert -d '{"on":true}'); want "$code" "switch browser_cert on"
           code=$(hubc POST /api/signin/templates -d '{"id":"e2e-file","name":"Browser certificate only","rule":{"op":"any","items":["browser_cert"]}}')
           want "$code" "create the e2e-file template"
