@@ -22,7 +22,10 @@ Checks, run in order:
          or one is past its nextUpdate by more than an hour, no certificate
          counts as a sign-in method; otherwise fetch errors keep the last
          good CRL. GATE_CRL_URL / GATE_DELTA_CRL_URL (the old one-CA shape)
-         make the gate refuse to start.
+         make the gate refuse to start. Once every list has first been
+         read, a CA file none of whose full (or delta) lists that CA issued
+         is logged as a WARNING (its certificates still count; start-up
+         only, never a refusal).
      Traefik's entrypoint deletes client-supplied X-Forwarded-Tls-Client-*
      headers, so the header only ever describes a cert Traefik verified.
   1. Sign-in template (policy file v6; checked LAST, after 2. and 3., so a
@@ -1793,6 +1796,14 @@ def parse_crl_serials(data: bytes) -> FrozenSet[int]:
     return parse_crl(data)[0]
 
 
+def load_crl(data: bytes) -> x509.CertificateRevocationList:
+    """An X.509 CRL (DER, or PEM); malformed input raises ValueError."""
+    stripped = data.lstrip()
+    if stripped.startswith(b"-----BEGIN"):
+        return x509.load_pem_x509_crl(stripped)
+    return x509.load_der_x509_crl(data)
+
+
 def parse_crl(data: bytes) -> Tuple[FrozenSet[int], Optional[float]]:
     """(revoked serial numbers, nextUpdate epoch or None) from an X.509 CRL
     (DER, or PEM). Malformed input raises ValueError.
@@ -1800,11 +1811,7 @@ def parse_crl(data: bytes) -> Tuple[FrozenSet[int], Optional[float]]:
     The CRL signature is not verified: it is fetched from Vault over the
     internal network, and it can only ever ADD denials.
     """
-    stripped = data.lstrip()
-    if stripped.startswith(b"-----BEGIN"):
-        crl = x509.load_pem_x509_crl(stripped)
-    else:
-        crl = x509.load_der_x509_crl(data)
+    crl = load_crl(data)
     next_update = crl.next_update_utc
     return (frozenset(entry.serial_number for entry in crl),
             next_update.timestamp() if next_update else None)
@@ -1813,8 +1820,10 @@ def parse_crl(data: bytes) -> Tuple[FrozenSet[int], Optional[float]]:
 class CrlSource:
     """One CRL URL: last good serials / nextUpdate, kept across fetch errors."""
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, delta: bool = False):
         self.url = url
+        self.delta = delta                  # a GATE_DELTA_CRL_URLS entry
+        self.issuer: Optional[x509.Name] = None  # the last good CRL's issuer
         self.serials: FrozenSet[int] = frozenset()
         self.last_error: Optional[str] = None
         self.last_success: float = 0.0      # epoch of the last good fetch (0 = never)
@@ -1825,6 +1834,7 @@ class CrlSource:
             with urllib.request.urlopen(self.url, timeout=5) as resp:
                 data = resp.read(16 * 1024 * 1024)
             serials, next_update = parse_crl(data)
+            issuer = load_crl(data).issuer
         except Exception as e:  # noqa: BLE001 — any failure keeps the last good CRL
             METRICS.inc("group_gate_crl_fetch_failures_total")
             err = f"{type(e).__name__}: {e}"
@@ -1837,6 +1847,7 @@ class CrlSource:
             print(f"group-gate: CRL loaded from {self.url}: {len(serials)} revoked serial(s)", flush=True)
         self.serials = serials
         self.next_update = next_update
+        self.issuer = issuer
         self.last_success = time.time()
         self.last_error = None
         return True
@@ -1865,7 +1876,7 @@ class CrlCache:
     """
 
     def __init__(self, urls: List[str], interval: float, delta_urls: List[str] = ()):
-        self.sources = [CrlSource(u) for u in delta_urls] + [CrlSource(u) for u in urls]
+        self.sources = [CrlSource(u, delta=True) for u in delta_urls] + [CrlSource(u) for u in urls]
         self.urls = list(urls)
         self.interval = max(interval, 1.0)
 
@@ -1899,9 +1910,14 @@ class CrlCache:
         results = [src.refresh() for src in self.sources]
         return all(results)
 
-    def run_forever(self):
+    def run_forever(self, on_first_read=None):
+        """Refresh every `interval`; on_first_read() runs once, after the
+        first pass in which every list had been read (start-up checks)."""
         while True:
             self.refresh()
+            if on_first_read is not None and all(src.last_success > 0 for src in self.sources):
+                on_first_read()
+                on_first_read = None
             time.sleep(self.interval)
 
 
@@ -1923,6 +1939,39 @@ def crl_ready() -> bool:
     read and none is stale (CrlCache.ready). No list configured: no
     certificate counts (fail closed)."""
     return CRL_CACHE is not None and CRL_CACHE.ready
+
+
+def crl_coverage_problems(cache: Optional[CrlCache] = None) -> List[str]:
+    """For each CA file whose certificate loads: the configured lists
+    (full: GATE_CRL_URLS, delta: GATE_DELTA_CRL_URLS) none of whose last
+    good CRLs that CA issued (compared by issuer name). crl_ready() needs
+    every configured list, not one per CA, so such a CA's certificates
+    still count, revoked through GATE_REVOKED_FILE alone (and the delta
+    for a missing full list): worth a start-up warning, never a refusal.
+    Meaningful once every list has been read; no cache = no lists (warned
+    about separately)."""
+    cache = CRL_CACHE if cache is None else cache
+    if cache is None:
+        return []
+    out = []
+    for label, path in (("YubiKey", YUBIKEY_CA_FILE), ("browser", BROWSER_CA_FILE)):
+        ca = ca_certificate(path)
+        if ca is None:
+            continue  # no certificate of this kind counts anyway
+        missing = [var for var, delta in (("GATE_CRL_URLS", False), ("GATE_DELTA_CRL_URLS", True))
+                   if not any(src.delta == delta and src.issuer == ca.subject for src in cache.sources)]
+        if missing:
+            left = {2: "GATE_REVOKED_FILE alone",
+                    1: ("its delta CRL and GATE_REVOKED_FILE only" if "GATE_CRL_URLS" in missing
+                        else "its full CRL and GATE_REVOKED_FILE only (until a full rebuild)")}[len(missing)]
+            out.append(f"no list in {' / '.join(missing)} is a CRL of the {label} CA {ca_subject_cn(path)!r} "
+                       f"({path}): its certificates count with revocations from {left}")
+    return out
+
+
+def warn_crl_coverage() -> None:
+    for problem in crl_coverage_problems():
+        print(f"group-gate: WARNING {problem}", flush=True)
 
 
 _SERIAL_RE = re.compile(r'SerialNumber="(\d+)"')
@@ -2892,5 +2941,6 @@ if __name__ == "__main__":
           f"({ca_subject_cn(YUBIKEY_CA_FILE)!r}), "
           f"browser CA={BROWSER_CA_FILE} ({ca_subject_cn(BROWSER_CA_FILE)!r}); opened log={OPENED_DIR}", flush=True)
     if CRL_CACHE is not None:
-        threading.Thread(target=CRL_CACHE.run_forever, daemon=True, name="crl-refresh").start()
+        threading.Thread(target=CRL_CACHE.run_forever, args=(warn_crl_coverage,), daemon=True,
+                         name="crl-refresh").start()
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()

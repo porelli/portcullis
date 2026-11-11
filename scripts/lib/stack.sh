@@ -76,8 +76,16 @@ PORTCULLIS_AUTH_SUBNET=172.31.251.0/28
 PORTCULLIS_AUTH_IP_RANGE=172.31.251.8/29
 PORTCULLIS_AUTH_TRAEFIK_IP=172.31.251.2
 
-# Client certificate lifetime (Vault duration). Revocation is enforced on
-# every request, so this is about renewal cadence; see docs/certificates.md.
+# ── YubiKey and browser certificates ─────────────────────
+# Longest lifetime of the certificates the internal certificate authority
+# issues (Vault duration): YubiKey certificates (pki_int) and browser
+# certificates (pki_file; the Hub's "browser certificate lifetime" setting
+# can't go above it). Revocation is enforced on every request (group-gate)
+# and at the Keycloak sign-in (CRLs), so the lifetime only sets the renewal
+# cadence: people renew their YubiKey certificate, or make a new browser
+# certificate, on the Sign-in page (https://people.<domain>/signin). Applied
+# to new certificates by ./portcullis pki setup / upgrade (rewrites the
+# Vault roles).
 CLIENT_CERT_TTL=720h
 
 # Off-host backups (restic, docs/backups.md): ./portcullis backup --offsite.

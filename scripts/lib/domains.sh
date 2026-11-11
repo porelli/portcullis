@@ -182,7 +182,7 @@ domains_public_ips() {
       if [ -n "$v4" ]; then
         warn "IPv4 detection failed: keeping the last detected address $v4 (set PORTCULLIS_PUBLIC_IPV4 in .env if it changed)."
       else
-        warn "Could not detect the public IPv4 reliably (two HTTPS services must agree on a global address): enrolled domains keep their records but get no new ones until it is known — set PORTCULLIS_PUBLIC_IPV4 in .env."
+        warn "Could not detect the public IPv4 reliably (two HTTPS services must agree on a global address): added domains keep their records but get no new ones until it is known — set PORTCULLIS_PUBLIC_IPV4 in .env."
       fi
     fi
   fi
@@ -198,7 +198,7 @@ domains_public_ips() {
       [ -z "$v6" ] || warn "IPv6 detection failed: keeping the last detected address $v6 (set PORTCULLIS_PUBLIC_IPV6= in .env if the server has no IPv6 any more)."
     fi
   fi
-  [ "$lookup" = true ] || info "No enrolled domain: public address lookups skipped (run ./portcullis up again after enrolling the first domain)."
+  [ "$lookup" = true ] || info "No added domain: public address lookups skipped (run ./portcullis up again after adding the first domain)."
   export PORTCULLIS_PUBLIC_IPV4="$v4" PORTCULLIS_PUBLIC_IPV6="$v6"
   (umask 077 && printf 'DOMAINS_PUBLIC_IPV4=%s\nDOMAINS_PUBLIC_IPV6=%s\n' "$v4" "$v6" > "$(_domains_dir)/public-ips.env")
 }

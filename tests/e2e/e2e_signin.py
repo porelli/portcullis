@@ -1732,6 +1732,16 @@ def main() -> int:
                     return True
                 until("browser_cert off in both published files, echo-anycert on protected@file, echo-file "
                       "(Standard) on authaware@file", switched_off, 180, every=5)
+                # Traefik: on protected@file the browser certificate no longer
+                # finishes the handshake (tls_protected_any had the same files
+                # pass there while the switch was on): 35 / 56 as in
+                # tls_mtls_refuses_browser_cert, nothing else counts.
+                full, key = bc_files(0)
+                rc, code = curl_tls(f"echo-anycert.{DOMAIN}", full, key)
+                print(f"    browser certificate + chain on echo-anycert with browser_cert off: curl exit {rc}, "
+                      f"HTTP {code}", flush=True)
+                assert rc in (35, 56) and code == "000", \
+                    f"echo-anycert with browser_cert off: curl exit {rc}, HTTP {code} (want a handshake refusal, 35 / 56)"
                 # Keycloak: the .p12 alone signs nobody in.
                 uid = kc_user_id("alice")
                 t0 = int(time.time() * 1000) - 2000
@@ -1781,7 +1791,8 @@ def main() -> int:
             assert not errs, f"restore failed: {errs}"
         check("browser_cert_off_counts_nothing: browser_cert switched off — the valid .p12 alone signs nobody in "
               "(Keycloak keeps the passkey prompt, no LOGIN event) and alice's file session gets 403 on echo-file "
-              "(Standard, authaware@file); echo-anycert moves to protected@file; "
+              "(Standard, authaware@file); echo-anycert moves to protected@file, where the browser certificate's "
+              "handshake is refused (curl 35 / 56); "
               "switched back on in a finally (echo-file / echo-anycert back on protected-any@file)",
               browser_cert_off_counts_nothing)
 

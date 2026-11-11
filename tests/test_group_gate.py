@@ -1257,11 +1257,12 @@ def _der_int(n):
     return _der(0x02, n.to_bytes(n.bit_length() // 8 + 1, "big", signed=True))
 
 
-def build_crl(serials, with_next_update=True, with_version=True, next_update=None):
+def build_crl(serials, with_next_update=True, with_version=True, next_update=None, issuer_cn="Test CA"):
     """Structurally valid (unsigned) X.509 v2 CRL. next_update: DER time
-    element (default: the UTCTime used for thisUpdate)."""
+    element (default: the UTCTime used for thisUpdate); issuer: CN
+    issuer_cn (UTF8String, as ca_pair's subjects)."""
     alg = _der(0x30, _der(0x06, bytes.fromhex("2a8648ce3d040302")))  # ecdsa-with-SHA256
-    issuer = _der(0x30, _der(0x31, _der(0x30, _der(0x06, b"\x55\x04\x03") + _der(0x0C, b"Test CA"))))
+    issuer = _der(0x30, _der(0x31, _der(0x30, _der(0x06, b"\x55\x04\x03") + _der(0x0C, issuer_cn.encode()))))
     t = _der(0x17, b"250101000000Z")
     nu = next_update or t
     tbs = (_der_int(1) if with_version else b"") + alg + issuer + t + (nu if with_next_update else b"")
@@ -2610,6 +2611,86 @@ class SigninPart2Test(GateTest):
         _CrlHandler.by_path["/v1/pki_int/crl"] = (200, build_crl([], with_next_update=False))
         self.assertTrue(cache.refresh())
         self.assertFalse(cache.ready)
+
+    def coverage_cache(self, lists):
+        """A CrlCache over a fake Vault serving `lists` (path -> issuer CN;
+        paths ending in /delta are GATE_DELTA_CRL_URLS), every list read."""
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CrlHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        base = f"http://127.0.0.1:{srv.server_address[1]}/v1"
+        _CrlHandler.by_path = {f"/v1/{p}": (200, build_crl([], next_update=FRESH, issuer_cn=cn))
+                               for p, cn in lists.items()}
+        cache = gg.CrlCache([f"{base}/{p}" for p in lists if not p.endswith("/delta")], 60,
+                            delta_urls=[f"{base}/{p}" for p in lists if p.endswith("/delta")])
+        self.assertTrue(cache.refresh())
+        return cache
+
+    def test_crl_coverage_warning(self):
+        # M9: crl_ready() needs every configured list, not one per CA; a
+        # CA no configured list belongs to is a start-up warning.
+        both = {"pki_int/crl": YUBIKEY_CA_CN, "pki_int/crl/delta": YUBIKEY_CA_CN,
+                "pki_file/crl": BROWSER_CA_CN, "pki_file/crl/delta": BROWSER_CA_CN}
+        self.assertEqual(gg.crl_coverage_problems(self.coverage_cache(both)), [])
+        # Only pki_int's lists: the browser CA has neither.
+        cache = self.coverage_cache({"pki_int/crl": YUBIKEY_CA_CN, "pki_int/crl/delta": YUBIKEY_CA_CN})
+        self.assertTrue(cache.ready)  # certificates count: hence the warning
+        got = gg.crl_coverage_problems(cache)
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("GATE_CRL_URLS / GATE_DELTA_CRL_URLS", got[0])
+        self.assertIn(f"browser CA {BROWSER_CA_CN!r}", got[0])
+        self.assertIn("GATE_REVOKED_FILE alone", got[0])
+        # pki_file's delta missing: only the delta list named.
+        got = gg.crl_coverage_problems(self.coverage_cache(
+            {k: v for k, v in both.items() if k != "pki_file/crl/delta"}))
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("no list in GATE_DELTA_CRL_URLS is", got[0])
+        self.assertIn("its full CRL", got[0])
+        # pki_int's full CRL missing: the YubiKey CA, its delta still read.
+        got = gg.crl_coverage_problems(self.coverage_cache({k: v for k, v in both.items() if k != "pki_int/crl"}))
+        self.assertEqual(len(got), 1, got)
+        self.assertIn("no list in GATE_CRL_URLS is", got[0])
+        self.assertIn(f"YubiKey CA {YUBIKEY_CA_CN!r}", got[0])
+        self.assertIn("its delta CRL", got[0])
+        # A list issued by another CA (same URLs) matches nothing.
+        got = gg.crl_coverage_problems(self.coverage_cache({k: "Test CA" for k in both}))
+        self.assertEqual(len(got), 2, got)
+        # A CA file that doesn't load is skipped (no certificate of it counts);
+        # no lists at all are warned about separately.
+        gg.BROWSER_CA_FILE = os.path.join(TMP, "nope.crt")
+        self.assertEqual(gg.crl_coverage_problems(self.coverage_cache(
+            {"pki_int/crl": YUBIKEY_CA_CN, "pki_int/crl/delta": YUBIKEY_CA_CN})), [])
+        gg.CRL_CACHE = None
+        self.assertEqual(gg.crl_coverage_problems(), [])
+
+    def test_crl_coverage_checked_once_after_first_read(self):
+        cache = self.coverage_cache({"pki_int/crl": YUBIKEY_CA_CN, "pki_int/crl/delta": YUBIKEY_CA_CN})
+        calls, sleeps = [], []
+
+        def sleep(_):
+            sleeps.append(1)
+            if len(sleeps) == 3:
+                raise StopIteration
+
+        old_sleep = gg.time.sleep
+        gg.time.sleep = sleep
+        try:
+            with self.assertRaises(StopIteration):
+                cache.run_forever(lambda: calls.append(1))
+        finally:
+            gg.time.sleep = old_sleep
+        self.assertEqual(calls, [1])  # three passes, one check
+        # Never read (nothing listens on port 1): no check yet.
+        unread = gg.CrlCache(["http://127.0.0.1:1/v1/pki_int/crl"], 60)
+        sleeps.clear()
+        gg.time.sleep = sleep
+        try:
+            with self.assertRaises(StopIteration):
+                unread.run_forever(lambda: calls.append(2))
+        finally:
+            gg.time.sleep = old_sleep
+        self.assertEqual(calls, [1])
 
     def test_old_crl_variables_refuse_to_start(self):
         for var in ("GATE_CRL_URL", "GATE_DELTA_CRL_URL"):

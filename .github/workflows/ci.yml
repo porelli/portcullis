@@ -21,8 +21,9 @@ on:
   # are then built from the Hub's / portcullis-keycloak's same-named branch
   # (.github/actions/hub-image, .github/actions/keycloak-image).
   # `-f jobs=build-and-test,e2e-signin` (comma- or space-separated job
-  # names) runs only those jobs; the default `all` runs every job. Push and
-  # pull_request always run everything.
+  # names) runs only those jobs; the default `all` runs every job; an
+  # unknown name fails the run (job `jobs-input`). Push and pull_request
+  # always run everything.
   workflow_dispatch:
     inputs:
       jobs:
@@ -73,7 +74,45 @@ env:
 # .github/actions/cached-images).
 
 jobs:
+  # First, and needed by every other job: a workflow_dispatch `jobs` input
+  # naming a job that doesn't exist fails the run here (a typo would
+  # otherwise skip every job and the run would show green with nothing
+  # run). Empty and `all` run everything; push / pull_request /
+  # workflow_call aren't checked (they always run everything). The known
+  # names are read from this file's own `jobs:` keys, so the list can't
+  # drift from the jobs.
+  jobs-input:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          sparse-checkout: .github/workflows/ci.yml
+          sparse-checkout-cone-mode: false
+      - name: Check the jobs input
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          JOBS: ${{ inputs.jobs }}
+        run: |
+          case "$JOBS" in ''|all) echo "jobs: all"; exit 0 ;; esac
+          known="$(yq -r '.jobs | keys | .[]' .github/workflows/ci.yml | grep -vx 'jobs-input' | paste -sd ' ' -)"
+          [ -n "${known// }" ] || { echo "::error::could not read the job names from ci.yml"; exit 1; }
+          # The jobs' `if`s split on commas and spaces only: anything else
+          # (tabs, newlines) can't match a name either.
+          [[ "$JOBS" != *$'\n'* ]] || { echo "::error::jobs: one line of names separated by commas and/or spaces"; exit 1; }
+          IFS=', ' read -r -a names <<< "$JOBS"
+          picked="" bad=""
+          for n in "${names[@]}"; do
+            [ -n "$n" ] || continue
+            if [[ " $known " == *" $n "* ]]; then picked="$picked $n"; else bad="$bad $n"; fi
+          done
+          [ -z "$bad" ] || { echo "::error::jobs: unknown job name(s):$bad (known: $known; or \`all\` alone)"; exit 1; }
+          [ -n "$picked" ] || { echo "::error::jobs: no job names given (known: $known; or \`all\` alone)"; exit 1; }
+          echo "jobs:$picked"
+
   unit-tests:
+    needs: jobs-input
     # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
     # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
     if: >-
@@ -655,6 +694,7 @@ jobs:
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
 
   build-and-test:
+    needs: jobs-input
     # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
     # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
     if: >-
@@ -2700,6 +2740,7 @@ jobs:
   # Traefik → oauth2-proxy → Keycloak (LLDAP users, WebAuthn, X.509) → group-gate.
   # tests/e2e/e2e_login.py documents every scenario.
   e2e:
+    needs: jobs-input
     # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
     # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
     if: >-
@@ -3066,7 +3107,7 @@ jobs:
           probe() { qq "probe_success{job=\"$1\"}" | jq -r --arg s "$2" '[.data.result[] | select(($s == "") or (.metric.service == $s)) | .value[1]] | join(",")'; }
           for i in $(seq 1 20); do [ "$(probe vault_health '')" = 1 ] && break; sleep 3; done
           [ "$(probe vault_health '')" = 1 ] || { echo "FAIL: vault_health probe"; exit 1; }
-          for svc in enroll forward-auth lldap; do [ "$(probe services "$svc")" = 1 ] || { echo "FAIL: $svc probe"; exit 1; }; done
+          for svc in enroll forward-auth forward-auth-ext lldap; do [ "$(probe services "$svc")" = 1 ] || { echo "FAIL: $svc probe"; exit 1; }; done
           # Textfile metrics were just written: allow a scrape interval or two.
           has() {
             for _ in $(seq 1 15); do [ "$(qq "$1" | jq '.data.result | length')" -gt 0 ] && return 0; sleep 5; done
@@ -3124,6 +3165,7 @@ jobs:
   # browser scenarios; the instance backup / delete / restore checks run
   # against a real daemon at the end.
   e2e-instances:
+    needs: jobs-input
     # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
     # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
     if: >-
@@ -3705,6 +3747,7 @@ jobs:
   # page, forged certificate headers, sign_in_help, the sign-in history and
   # enroll.<d> serving setup links only.
   e2e-signin:
+    needs: jobs-input
     # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
     # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
     if: >-
@@ -4097,6 +4140,7 @@ jobs:
   # people.<domain> (firefox-sync's allowlist and guard.sql on Postgres),
   # membership changes through the Hub, Nextcloud's start hook.
   e2e-settings:
+    needs: jobs-input
     # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
     # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
     if: >-
@@ -4474,6 +4518,7 @@ jobs:
   # preview / apply / host verify, doctor drift, undo, lan_only exposure and
   # rebind, the socket proxy as on main. No browser.
   e2e-folders:
+    needs: jobs-input
     # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
     # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
     if: >-
@@ -4771,6 +4816,7 @@ jobs:
   # archive, docker inspect, log or the hub_data volume. Passwords and
   # hashes are masked, given to smbclient through PASSWD, never on argv.
   e2e-filesharing:
+    needs: jobs-input
     # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
     # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
     if: >-
@@ -5081,6 +5127,7 @@ jobs:
   # no_token_crossing, destructive_confirmation, aggregate_lists,
   # leaver_refused_and_revoked, ai_off.
   e2e-ai:
+    needs: jobs-input
     # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
     # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
     if: >-
