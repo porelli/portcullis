@@ -155,6 +155,11 @@ jobs:
           if HUB_PROXY_SECRET='' docker compose -f docker-compose.yml config -q 2>/dev/null; then
             echo "FAIL: compose accepted an empty HUB_PROXY_SECRET"; exit 1
           fi
+          for v in FORWARD_AUTH_REDIS_PASSWORD FORWARD_AUTH_EXT_REDIS_PASSWORD; do
+            if env "$v=" docker compose -f docker-compose.yml config -q 2>/dev/null; then
+              echo "FAIL: compose accepted an empty $v"; exit 1
+            fi
+          done
           if grep -rn 'portcullis-forward-auth-secret' docker-compose*.yml keycloak/ .env.example; then
             echo "FAIL: public default forward-auth secret is back"; exit 1
           fi
@@ -369,6 +374,47 @@ jobs:
               and $l["traefik.http.routers.people-mcp.tls.options"] == $hl["traefik.http.routers.people.tls.options"]
               and prio("hub-mcp"; $l) > prio("hub"; $hl) and prio("people-mcp"; $l) > prio("people"; $hl)' >/dev/null \
             || { echo "FAIL: mcp-gate wiring (contract §15 / §5, G36 G44 G74)"; exit 1; }
+          # Session store (scripts/lib/sessions.sh; oauth2-proxy #3486): Valkey
+          # pinned, hardened, read-only, non-root, no ports / env / routers,
+          # memory-only on a tmpfs /data; its config only in it, read-only;
+          # portcullis-sessions internal with exactly sessions + the two
+          # oauth2-proxies (like portcullis-mcp's members); each proxy its own
+          # store user and generated password (never shared with any other
+          # service), waits for the store healthy; the cookie name / domain
+          # unchanged.
+          echo "$CFG" | jq -e '.services.sessions as $s | .services["forward-auth"] as $m | .services["forward-auth-ext"] as $x
+              | def members($n): [.services | to_entries[] | select((.value.networks // {}) | has($n)) | .key] | sort;
+              def mounts($src): [.services | to_entries[] | select([.value.volumes[]? | .source // "" | select(test($src))] | length > 0) | .key] | sort;
+              ($s.image | test("^valkey/valkey:[0-9]+\\.[0-9]+\\.[0-9]+(-alpine[0-9.]*)?@sha256:[0-9a-f]{64}$"))
+              and $s.user == "999:1000" and $s.read_only == true
+              and $s.cap_drop == ["ALL"] and ($s.security_opt | index("no-new-privileges:true")) != null
+              and $s.mem_limit != null and $s.pids_limit != null
+              and ($s.tmpfs // [] | index("/data")) != null
+              and ($s.ports // []) == [] and ($s.expose // []) == []
+              and ($s.environment // {}) == {}
+              and ([$s.labels // {} | keys[] | select(startswith("traefik."))] == [])
+              and $s.command == ["valkey-server", "/etc/valkey/valkey.conf"]
+              and ([$s.volumes[] | "\(.type):\(.source | sub("^.*/secrets/"; "secrets/")):\(.target):\(.read_only // false)"]
+                   == ["bind:secrets/sessions/valkey.conf:/etc/valkey/valkey.conf:true"])
+              and (mounts("secrets/sessions/") == ["sessions"])
+              and ($s.healthcheck.test | join(" ") | test("NOAUTH"))
+              and ([$s.networks | keys[]] == ["portcullis-sessions"])
+              and .networks["portcullis-sessions"].internal == true
+              and (members("portcullis-sessions") == ["forward-auth", "forward-auth-ext", "sessions"])
+              and ([$m.networks | keys[]] | sort == ["portcullis", "portcullis-sessions"])
+              and ([$x.networks | keys[]] | sort == ["portcullis", "portcullis-sessions"])
+              and ([$m, $x] | all(.depends_on.sessions.condition == "service_healthy"
+                   and .environment.OAUTH2_PROXY_SESSION_STORE_TYPE == "redis"
+                   and .environment.OAUTH2_PROXY_REDIS_CONNECTION_URL == "redis://sessions:6379"
+                   and (.environment.OAUTH2_PROXY_REDIS_PASSWORD | test("^[A-Za-z0-9]{40}$"))))
+              and $m.environment.OAUTH2_PROXY_REDIS_USERNAME == "forward-auth"
+              and $x.environment.OAUTH2_PROXY_REDIS_USERNAME == "forward-auth-ext"
+              and $m.environment.OAUTH2_PROXY_REDIS_PASSWORD != $x.environment.OAUTH2_PROXY_REDIS_PASSWORD
+              and ($m.environment.OAUTH2_PROXY_COOKIE_NAME // null) == null
+              and $m.environment.OAUTH2_PROXY_COOKIE_DOMAINS == ".\($m.environment.PORTCULLIS_DOMAIN)"
+              and ([.services | to_entries[] | select(.key != "forward-auth" and .key != "forward-auth-ext") | .value.environment // {} | to_entries[]
+                   | select(.value == $m.environment.OAUTH2_PROXY_REDIS_PASSWORD or .value == $x.environment.OAUTH2_PROXY_REDIS_PASSWORD)] == [])' >/dev/null \
+            || { echo "FAIL: session store wiring (sessions, portcullis-sessions, the oauth2-proxies' redis settings)"; exit 1; }
           # Contract §4 "Opened log" / §8.2 (sign-in part 2): group_gate_data is
           # mounted by exactly group-gate (rw at /data, uid 10003 + group 10001
           # only) and the Hub (rw at /group-gate-data, to prune day files);
@@ -418,7 +464,7 @@ jobs:
              || grep -rniE 'skip[-_]jwt[-_]bearer[-_]tokens' docker-compose*.yml oauth2-proxy/; then
             echo "FAIL: oauth2-proxy must not accept JWT bearer tokens"; exit 1
           fi
-          echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring, domains service, mcp-gate"
+          echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring, domains service, mcp-gate, session store"
 
       - name: every image is pinned tag@sha256 (all compose files, all profiles, CLI, workflows)
         run: |
@@ -2365,6 +2411,90 @@ jobs:
               || { echo "FAIL: Hub does not see its LLDAP / invite files"; exit 1; }
           fi
           echo "PASS: portcullis up creates / reconciles portcullis-hub (lldap_admin, password from the 0640 file) and mounts it into the Hub"
+
+      - name: Test the session store (oauth2-proxy sessions in Valkey, a ticket cookie, the ACL)
+        run: |
+          # oauth2-proxy #3486: a session in cookies outgrew one cookie and the
+          # stale unsplit one kept winning. With the store the browser holds one
+          # small ticket and the session lives in `sessions` (Valkey).
+          docker compose up -d sessions forward-auth forward-auth-ext
+          SID="$(docker compose ps -q sessions)"
+          for i in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' "$SID")" = healthy ] && break
+            [ "$i" = 30 ] && { echo "FAIL: sessions not healthy"; docker compose logs --tail=40 sessions; exit 1; }
+            sleep 2
+          done
+          test "$(docker inspect -f '{{.Config.User}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}}' "$SID")" = "999:1000 true [ALL]" \
+            || { echo "FAIL: sessions user / read-only / caps: $(docker inspect -f '{{.Config.User}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}}' "$SID")"; exit 1; }
+          test "$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$SID")" = "portcullis_portcullis-sessions " \
+            || { echo "FAIL: sessions networks: $(docker inspect -f '{{json .NetworkSettings.Networks}}' "$SID" | jq -c keys)"; exit 1; }
+          test "$(stat -c '%a' secrets/sessions) $(stat -c '%a %g' secrets/sessions/valkey.conf)" = "700 640 1000" \
+            || { echo "FAIL: secrets/sessions modes / group"; exit 1; }
+          FA_PW="$(grep '^FORWARD_AUTH_REDIS_PASSWORD=' .env | cut -d= -f2-)"; echo "::add-mask::$FA_PW"
+          FX_PW="$(grep '^FORWARD_AUTH_EXT_REDIS_PASSWORD=' .env | cut -d= -f2-)"; echo "::add-mask::$FX_PW"
+          if grep -qF -e "$FA_PW" -e "$FX_PW" secrets/sessions/valkey.conf; then echo "FAIL: a store password in clear in valkey.conf"; exit 1; fi
+          # No password reaches argv / the container's environment: valkey-cli reads it from VALKEYCLI_AUTH, passed by name.
+          vk() { local pw="$1" user="$2"; shift 2; VALKEYCLI_AUTH="$pw" docker compose exec -T -e VALKEYCLI_AUTH sessions valkey-cli --no-auth-warning --user "$user" "$@" 2>&1; }
+          # shellcheck disable=SC2254  # $want is a glob on purpose
+          expect() { local want="$1" what="$2"; shift 2; local got; got="$("$@")" || true; case "$got" in $want) echo "PASS: $what" ;; *) echo "FAIL: $what: $got"; exit 1 ;; esac; }
+          expect '*NOAUTH*' "the default user is off (unauthenticated PING refused)" docker compose exec -T sessions valkey-cli ping
+          expect '*WRONGPASS*' "a wrong password is refused" vk wrong forward-auth ping
+          expect PONG "forward-auth signs in" vk "$FA_PW" forward-auth ping
+          expect PONG "forward-auth-ext signs in" vk "$FX_PW" forward-auth-ext ping
+          expect OK "forward-auth writes its own keys" vk "$FA_PW" forward-auth set _oauth2_proxy-ci0 x PX 60000
+          expect '*NOPERM*' "forward-auth-ext can't read forward-auth's keys" vk "$FX_PW" forward-auth-ext get _oauth2_proxy-ci0
+          expect '*NOPERM*' "forward-auth can't write forward-auth-ext's keys" vk "$FA_PW" forward-auth set __Host-portcullis_ext-ci0 x
+          expect OK "forward-auth-ext writes its own keys" vk "$FX_PW" forward-auth-ext set __Host-portcullis_ext-ci0 x PX 60000
+          expect '*NOPERM*' "forward-auth can't read forward-auth-ext's keys" vk "$FA_PW" forward-auth get __Host-portcullis_ext-ci0
+          for cmd in "keys *" "scan 0" "flushall" "config get *" "config set maxmemory 0" "acl list" "client list" "info" "shutdown" "script flush"; do
+            # shellcheck disable=SC2086  # the command's words
+            expect '*NOPERM*' "forward-auth may not run '$cmd'" vk "$FA_PW" forward-auth $cmd
+          done
+          expect x "a script reads its own key" vk "$FA_PW" forward-auth eval "return redis.call('get', KEYS[1])" 1 _oauth2_proxy-ci0
+          expect '*NOPERM*' "a script can't read another proxy's key" vk "$FA_PW" forward-auth eval "return redis.call('get', KEYS[1])" 1 __Host-portcullis_ext-ci0
+          expect '*NOPERM*' "a script can't run what the user can't" vk "$FA_PW" forward-auth eval "return redis.call('flushall')" 0
+          expect 1 "forward-auth deletes its own key" vk "$FA_PW" forward-auth del _oauth2_proxy-ci0
+          expect 1 "forward-auth-ext deletes its own key" vk "$FX_PW" forward-auth-ext del __Host-portcullis_ext-ci0
+
+          # A real sign-in through forward-auth (YubiKey certificate, curl's cookie jar = the browser).
+          VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
+          echo "::add-mask::$VAULT_TOKEN"
+          openssl ecparam -name prime256v1 -genkey -noout -out /tmp/sess.key
+          openssl req -new -key /tmp/sess.key -subj "/CN=testuser" -out /tmp/sess.csr
+          vault write -format=json pki_int/sign/client-cert csr=@/tmp/sess.csr common_name=testuser ttl=1h | jq -r .data.certificate > /tmp/sess.crt
+          J=/tmp/sess.jar; rm -f "$J"
+          C=(curl -s --cacert certs/ca-chain.crt --cert /tmp/sess.crt --key /tmp/sess.key --resolve "auth.portcullis.local:443:127.0.0.1" -c "$J" -b "$J")
+          for i in $(seq 1 30); do
+            [ "$("${C[@]}" -o /dev/null -w '%{http_code}' https://auth.portcullis.local/oauth2/auth)" = 401 ] && break
+            [ "$i" = 30 ] && { echo "FAIL: forward-auth does not answer"; docker compose logs --tail=40 forward-auth; exit 1; }
+            sleep 2
+          done
+          # rd = oauth2-proxy's own /oauth2/auth: 202 once the session loads from the store.
+          END="$("${C[@]}" -L --max-redirs 10 -o /dev/null -w '%{http_code} %{url_effective}' \
+            "https://auth.portcullis.local/oauth2/start?pc_method=yubikey_cert&rd=https%3A%2F%2Fauth.portcullis.local%2Foauth2%2Fauth")"
+          [ "${END%% *}" = 202 ] || { echo "FAIL: sign-in through forward-auth ended at ${END%%\?*}"; docker compose logs --tail=40 forward-auth; exit 1; }
+          echo "PASS: a YubiKey-certificate sign-in through forward-auth; /oauth2/auth answers 202"
+          NAMES="$(awk -F'\t' '!/^#/ || /^#HttpOnly_/ { if (NF >= 7) print $6 }' "$J" | grep -E '^_oauth2_proxy(_[0-9]+)?$' | sort | paste -sd' ')"
+          [ "$NAMES" = _oauth2_proxy ] || { echo "FAIL: oauth2-proxy cookies after the sign-in: '$NAMES' (want exactly _oauth2_proxy, no _oauth2_proxy_0…)"; exit 1; }
+          VAL="$(awk -F'\t' '$6 == "_oauth2_proxy" { print $7 }' "$J")"
+          [ "${#VAL}" -lt 512 ] || { echo "FAIL: the session cookie is ${#VAL} bytes (a ticket is ~200)"; exit 1; }
+          # Value = base64url(v2.<base64url(ticket id)>.<base64url(secret)>)|<time>|<signature>.
+          KEY="$(VAL="$VAL" python3 -c 'import base64, os
+          def d(s): return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+          t = d(os.environ["VAL"].split("|")[0]).decode().split(".")
+          assert t[0] == "v2" and len(t) == 3, "not a ticket"
+          print(d(t[1]).decode())')" || { echo "FAIL: the session cookie is not an oauth2-proxy ticket"; exit 1; }
+          [[ "$KEY" =~ ^_oauth2_proxy-[0-9a-f]{32}$ ]] || { echo "FAIL: ticket id '$KEY'"; exit 1; }
+          [ "$(vk "$FA_PW" forward-auth get "$KEY" | wc -c)" -gt 100 ] || { echo "FAIL: the store holds no session for $KEY"; exit 1; }
+          expect '*NOPERM*' "forward-auth-ext can't read the session" vk "$FX_PW" forward-auth-ext get "$KEY"
+          echo "PASS: one small ticket cookie (${#VAL} bytes), the session under $KEY in the store"
+          # Signing out deletes it from the store: the same cookie no longer opens anything.
+          cp "$J" /tmp/sess-before.jar
+          "${C[@]}" -o /dev/null https://auth.portcullis.local/oauth2/sign_out
+          [ "$(vk "$FA_PW" forward-auth get "$KEY" | wc -c)" -le 1 ] || { echo "FAIL: the session survived the sign-out"; exit 1; }
+          code="$(curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt --resolve "auth.portcullis.local:443:127.0.0.1" -b /tmp/sess-before.jar https://auth.portcullis.local/oauth2/auth)"
+          [ "$code" = 401 ] || { echo "FAIL: the signed-out ticket still answers $code"; exit 1; }
+          echo "PASS: sign-out removes the session from the store; the old ticket gets 401"
 
       - name: portcullis status
         run: |

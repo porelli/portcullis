@@ -1288,6 +1288,72 @@ esac
 case "$MOUT" in *"mints new"*) t_fail "mcp-gate: says the Hub mints new credentials" ;; *) t_pass "mcp-gate: never claims the Hub re-mints" ;; esac
 expect_eq "mcp-gate: data volume owner = gate uid, Hub group" "$CT_UID_MCP_GATE:$CT_UID_HUB" "10005:10001"
 
+# ── session store (scripts/lib/sessions.sh, oauth2-proxy #3486) ──
+# shellcheck source=../scripts/lib/sessions.sh
+source "$HERE/../scripts/lib/sessions.sh"
+SR="$WORK/sessroot"; mkdir -p "$SR/secrets" "$WORK/sessbin"
+cat > "$WORK/sessbin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/sess-calls"
+case "$*" in *" ps -q --status running sessions") [ -f "$STUB_DIR/sess-running" ] && echo abc123 ;; esac
+exit 0
+STUB
+chmod +x "$WORK/sessbin/docker"
+SP1="Aa1$(gen_alnum 37)"; SP2="Bb2$(gen_alnum 37)"
+sess() { (set -euo pipefail; PATH="$WORK/sessbin:$PATH" PORTCULLIS_ROOT="$SR" FORWARD_AUTH_REDIS_PASSWORD="$SP1" FORWARD_AUTH_EXT_REDIS_PASSWORD="$SP2" "$@"); }
+: > "$STUB_DIR/sess-calls"
+SOUT="$(sess sessions_prepare 2>&1)"; expect_eq "sessions_prepare succeeds" "$?" 0
+SC="$SR/secrets/sessions/valkey.conf"
+expect_eq "sessions: secrets/sessions 0700, valkey.conf 0640" "$(file_mode "$SR/secrets/sessions") $(file_mode "$SC")" "700 640"
+expect_ok "sessions: valkey.conf group 1000 (the image's valkey group) through the helper" \
+  grep -qE "src=$SC,dst=/t/0 .* chown $(id -u):1000 /t/0\$" "$STUB_DIR/sess-calls"
+H1="$(printf '%s' "$SP1" | openssl dgst -sha256 -r | cut -d' ' -f1)"; H2="$(printf '%s' "$SP2" | openssl dgst -sha256 -r | cut -d' ' -f1)"
+CMDS="-@all +ping +get +set +del +evalsha +eval +msetnx +mset +getrange +pexpire +mget"
+expect_eq "sessions: the default user is off with no password, keys, channels or commands" \
+  "$(grep '^user default ' "$SC")" "user default off resetpass resetkeys resetchannels -@all"
+expect_eq "sessions: forward-auth = its own ticket keys + the commands oauth2-proxy sends, by password hash" \
+  "$(grep '^user forward-auth ' "$SC")" "user forward-auth on resetpass resetkeys resetchannels $CMDS ~_oauth2_proxy-* #$H1"
+expect_eq "sessions: forward-auth-ext = its own (__Host-portcullis_ext) ticket keys, same commands" \
+  "$(grep '^user forward-auth-ext ' "$SC")" "user forward-auth-ext on resetpass resetkeys resetchannels $CMDS ~__Host-portcullis_ext-* #$H2"
+expect_eq "sessions: exactly three users" "$(grep -c '^user ' "$SC")" 3
+expect_eq "sessions: no persistence, bounded memory, TTL eviction" \
+  "$(grep -E '^(save|appendonly|maxmemory|maxmemory-policy|dir|enable-debug-command|enable-module-command) ' "$SC" | paste -sd'|' -)" \
+  'save ""|appendonly no|dir /data|maxmemory 64mb|maxmemory-policy volatile-ttl|enable-debug-command no|enable-module-command no'
+if grep -qiE '(^| )(\+@all|allcommands|allkeys|~\*|nopass|>)|\+(flushall|flushdb|keys|scan|config|debug|acl|client|shutdown|module|script|function|monitor|subscribe|psubscribe|select|swapdb|migrate|restore|replicaof|slaveof|sync|psync|bgsave|save|bgrewriteaof)( |$)' <(grep '^user ' "$SC"); then
+  t_fail "sessions: a broad or dangerous grant in the ACL"
+else
+  t_pass "sessions: no broad / dangerous grant, no cleartext password (>), no nopass"
+fi
+case "$(cat "$SC") $SOUT" in *"$SP1"*|*"$SP2"*) t_fail "sessions: a password in valkey.conf or the output" ;; *) t_pass "sessions: the passwords are neither in valkey.conf nor printed" ;; esac
+rm -f "$SC"
+expect_eq "sessions: a first write flags the change" "$(sess eval 'sessions_prepare >/dev/null; echo $SESSIONS_CONF_CHANGED')" true
+INO="$(file_inode "$SC")"; BEFORE_CONF="$(cat "$SC")"
+expect_eq "sessions: an unchanged config is not rewritten (no restart)" "$(sess eval 'sessions_prepare >/dev/null; echo $SESSIONS_CONF_CHANGED'):$(cat "$SC")" "false:$BEFORE_CONF"
+SP1="Cc3$(gen_alnum 37)"
+expect_eq "sessions: a rotated password rewrites the config and flags it" "$(sess eval 'sessions_prepare >/dev/null; echo $SESSIONS_CONF_CHANGED')" true
+expect_eq "sessions: rewritten in place (same inode: the running container's bind mount)" "$(file_inode "$SC")" "$INO"
+expect_ok "sessions: ... with the new hash" grep -qF "#$(printf '%s' "$SP1" | openssl dgst -sha256 -r | cut -d' ' -f1)" "$SC"
+expect_eq "sessions: no temp file left" "$(find "$SR/secrets/sessions" -name '.valkey.conf.*' | wc -l | tr -d ' ')" 0
+rc=0; (PATH="$WORK/sessbin:$PATH" PORTCULLIS_ROOT="$SR" FORWARD_AUTH_REDIS_PASSWORD='' FORWARD_AUTH_EXT_REDIS_PASSWORD="$SP2" sessions_prepare) >/dev/null 2>&1 || rc=$?
+expect_eq "sessions: a missing password fails (never a default)" "$rc" 1
+# Restart only a running store, only when its config changed, before compose up.
+: > "$STUB_DIR/sess-calls"; rm -f "$STUB_DIR/sess-running"
+sess eval 'SESSIONS_CONF_CHANGED=true; sessions_restart_if_changed' >/dev/null 2>&1
+expect_fail "sessions: a store that isn't running is not restarted" grep -q 'restart sessions' "$STUB_DIR/sess-calls"
+touch "$STUB_DIR/sess-running"
+sess eval 'SESSIONS_CONF_CHANGED=false; sessions_restart_if_changed' >/dev/null 2>&1
+expect_fail "sessions: an unchanged config restarts nothing" grep -q 'restart sessions' "$STUB_DIR/sess-calls"
+sess eval 'SESSIONS_CONF_CHANGED=true; sessions_restart_if_changed' >/dev/null 2>&1
+expect_ok "sessions: a changed config restarts the running store" grep -q 'compose --project-directory .* restart sessions$' "$STUB_DIR/sess-calls"
+rm -f "$STUB_DIR/sess-running"
+# stack_prepare renders it; secrets_fix_perms repairs its modes.
+expect_ok "stack_prepare runs sessions_prepare" grep -q 'declare -F sessions_prepare' "$HERE/../scripts/lib/common.sh"
+chmod 644 "$SC"; chmod 755 "$SR/secrets/sessions"
+sess sessions_fix_perms >/dev/null 2>&1
+expect_eq "sessions: fix_perms restores 0700 / 0640" "$(file_mode "$SR/secrets/sessions") $(file_mode "$SC")" "700 640"
+expect_ok "sessions: the compose user matches CT_UID_SESSIONS:CT_GID_SESSIONS" \
+  grep -qx "    user: \"$CT_UID_SESSIONS:$CT_GID_SESSIONS\"" "$HERE/../docker-compose.yml"
+
 # ── public address detection (network.sh public_ip_detect; dns setup + domains) ──
 mkdir -p "$WORK/ipbin" "$STUB_DIR/ip"
 cat > "$WORK/ipbin/curl" <<'STUB'

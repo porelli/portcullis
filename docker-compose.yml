@@ -67,6 +67,10 @@ networks:
       config:
         - subnet: ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28}
           ip_range: ${PORTCULLIS_MCP_IP_RANGE:-172.31.253.8/29}
+  # The session store and its two clients only: sessions, forward-auth,
+  # forward-auth-ext. No egress, nothing else can reach the store.
+  portcullis-sessions:
+    internal: true
 
 # Hardening defaults (see docs/hardening.md for per-service exceptions).
 x-hardening: &hardening
@@ -517,6 +521,40 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Session store of both oauth2-proxies (Valkey, scripts/lib/sessions.sh):
+  # the browser keeps only a small ticket cookie, the session itself lives
+  # here. oauth2-proxy v7.15.5's cookie store never expires the unsplit
+  # _oauth2_proxy once a session outgrows one cookie (_oauth2_proxy_0..n)
+  # and keeps loading the stale one (upstream #3486; fix #3491 unreleased).
+  # Memory only (no RDB / AOF: a restart signs everyone out), one ACL user
+  # per oauth2-proxy limited to its own ticket keys, the default user off.
+  # The config (with the users' password hashes) is generated from .env.
+  sessions:
+    image: valkey/valkey:9.1.3-alpine3.24@sha256:bf09d58e96d6b4524a15396b65b242bbe18beebbcc15a04d8ee75ddac62fae0b
+    <<: *hardening
+    # The image's valkey user; its entrypoint only drops privileges when
+    # started as root, so it runs valkey-server directly.
+    user: "999:1000"
+    read_only: true
+    tmpfs:
+      - /data
+    command: ["valkey-server", "/etc/valkey/valkey.conf"]
+    volumes:
+      - ./secrets/sessions/valkey.conf:/etc/valkey/valkey.conf:ro
+    networks:
+      - portcullis-sessions
+    # No credentials in the check: an unauthenticated PING must be refused
+    # (NOAUTH), which also proves the default user is off.
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli -h 127.0.0.1 ping 2>&1 | grep -q NOAUTH"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    mem_limit: 128m
+    pids_limit: 64
+    restart: unless-stopped
+
   forward-auth:
     image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.5@sha256:8498b0d0ef0a7b29686414000a08aee467f02d0299c9ed1e006a8f33fc017916
     <<: *hardening
@@ -563,8 +601,17 @@ services:
       OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
       OAUTH2_PROXY_SSL_UPSTREAM_INSECURE_SKIP_VERIFY: "true"
       SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      # Sessions in the `sessions` store; the cookie is only a ticket
+      # (_oauth2_proxy = v2.<ticket id>.<secret>, signed). Keys
+      # _oauth2_proxy-<hex> (+ .lock while a refresh runs), user
+      # forward-auth may touch nothing else.
+      OAUTH2_PROXY_SESSION_STORE_TYPE: redis
+      OAUTH2_PROXY_REDIS_CONNECTION_URL: redis://sessions:6379
+      OAUTH2_PROXY_REDIS_USERNAME: forward-auth
+      OAUTH2_PROXY_REDIS_PASSWORD: ${FORWARD_AUTH_REDIS_PASSWORD:?FORWARD_AUTH_REDIS_PASSWORD is not set — run ./portcullis init}
     networks:
       - portcullis
+      - portcullis-sessions
     mem_limit: 256m
     pids_limit: 128
     labels:
@@ -606,6 +653,8 @@ services:
     restart: unless-stopped
     depends_on:
       keycloak:
+        condition: service_healthy
+      sessions:
         condition: service_healthy
 
   # Second oauth2-proxy for extra-domain hosts (contract §5 "Extra-domain
@@ -651,8 +700,14 @@ services:
       OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
       OAUTH2_PROXY_SSL_UPSTREAM_INSECURE_SKIP_VERIFY: "true"
       SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt
+      # Same store, its own user: keys __Host-portcullis_ext-<hex> only.
+      OAUTH2_PROXY_SESSION_STORE_TYPE: redis
+      OAUTH2_PROXY_REDIS_CONNECTION_URL: redis://sessions:6379
+      OAUTH2_PROXY_REDIS_USERNAME: forward-auth-ext
+      OAUTH2_PROXY_REDIS_PASSWORD: ${FORWARD_AUTH_EXT_REDIS_PASSWORD:?FORWARD_AUTH_EXT_REDIS_PASSWORD is not set — run ./portcullis init}
     networks:
       - portcullis
+      - portcullis-sessions
     mem_limit: 256m
     pids_limit: 128
     labels:
@@ -668,6 +723,8 @@ services:
     restart: unless-stopped
     depends_on:
       keycloak:
+        condition: service_healthy
+      sessions:
         condition: service_healthy
 
   group-gate:

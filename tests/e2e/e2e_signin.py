@@ -1075,6 +1075,20 @@ def main() -> int:
                 ctx.close()
         check("alice: setup link → passkey → portal", alice_signs_up)
 
+        def alice_session_is_one_ticket():
+            """oauth2-proxy #3486: the step-up's session outgrew one cookie,
+            the cookie store wrote _oauth2_proxy_0..n and kept loading the
+            stale unsplit _oauth2_proxy (the step-up page looped). With the
+            session store the browser holds one small ticket."""
+            needs("alice_storage")
+            names = sorted(c["name"] for c in state["alice_storage"]["cookies"]
+                           if re.fullmatch(r"_oauth2_proxy(_\d+)?", c["name"]))
+            assert names == ["_oauth2_proxy"], f"oauth2-proxy cookies after alice's step-up: {names}"
+            (ticket,) = [c for c in state["alice_storage"]["cookies"] if c["name"] == "_oauth2_proxy"]
+            assert len(ticket["value"]) < 512, f"_oauth2_proxy is {len(ticket['value'])} bytes, not a ticket"
+        check("alice's session after the step-up is one small _oauth2_proxy ticket (no _oauth2_proxy_0…, "
+              "oauth2-proxy #3486)", alice_session_is_one_ticket)
+
         def bob_refused_in(log: str, client: str) -> bool:
             """Keycloak's X.509 user check (it won't set another user than the
             step's: a LOGIN_ERROR for bob's certificate with no user) or the

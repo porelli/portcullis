@@ -164,6 +164,7 @@ init_run() {
   for s in $all_svcs; do
     [ "$s" = hub ] || hub_excluded="$hub_excluded $s"
   done
+  sessions_restart_if_changed
   # shellcheck disable=SC2086
   dc up -d --build $hub_excluded
   wait_healthy 300 vault postgres lldap keycloak
@@ -392,6 +393,7 @@ stack_up() {
   network_check
   stack_prepare
   config_apply
+  sessions_restart_if_changed
   dc up -d --build
   domains_restart_if_renewed
   monitoring_reload
@@ -437,6 +439,7 @@ upgrade_run() {
   config_apply
 
   info "Starting services..."
+  sessions_restart_if_changed
   dc up -d --build
   domains_restart_if_renewed
   monitoring_reload
@@ -475,7 +478,8 @@ Usage: portcullis init [options]
 
 First-time setup. Creates .env (0600) with every secret randomly generated
 (Postgres, Keycloak admin, LLDAP admin + JWT, forward-auth client + cookie
-secret, HUB_PROXY_SECRET, BACKUP_PASSWORD for off-host backups), then: DNS records, Vault init + unseal + enroll
+secret, the two forward-auth session-store passwords, HUB_PROXY_SECRET,
+BACKUP_PASSWORD for off-host backups), then: DNS records, Vault init + unseal + enroll
 AppRole, CA bundle, `docker compose up`, Vault PKI (incl. a self-signed
 wildcard server cert for local use), Keycloak realm, OIDC clients, config/.
 

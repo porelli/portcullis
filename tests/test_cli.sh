@@ -184,13 +184,21 @@ expect_eq "domain written" "$(get PORTCULLIS_DOMAIN)" ci.example.org
 expect_eq "email defaults to admin@domain" "$(get ACME_EMAIL)" admin@ci.example.org
 expect_eq "LLDAP base DN from the domain" "$(get LLDAP_BASE_DN)" dc=ci,dc=example,dc=org
 for v in POSTGRES_PASSWORD KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD LLDAP_JWT_SECRET \
-         FORWARD_AUTH_CLIENT_SECRET FORWARD_AUTH_COOKIE_SECRET HUB_PROXY_SECRET; do
+         FORWARD_AUTH_CLIENT_SECRET FORWARD_AUTH_COOKIE_SECRET FORWARD_AUTH_REDIS_PASSWORD \
+         FORWARD_AUTH_EXT_REDIS_PASSWORD HUB_PROXY_SECRET; do
   val="$(get "$v")"
   if [ "${#val}" -ge 24 ]; then t_pass "$v generated"; else t_fail "$v not generated ('$val')"; fi
 done
 expect_eq "HUB_PROXY_SECRET is 64 hex chars" "$(get HUB_PROXY_SECRET | grep -Ec '^[0-9a-f]{64}$')" 1
 expect_eq "no public default forward-auth secret" "$(grep -c 'portcullis-forward-auth-secret' "$ENVF")" 0
 expect_eq "BACKUP_PASSWORD generated (48 chars)" "$(get BACKUP_PASSWORD | grep -Ec '^[A-Za-z0-9]{48}$')" 1
+# The two session-store passwords: 40 random [A-Za-z0-9] each (hashed into
+# secrets/sessions/valkey.conf), never the same.
+expect_eq "FORWARD_AUTH_REDIS_PASSWORD / _EXT_ are 40 [A-Za-z0-9]" \
+  "$(get FORWARD_AUTH_REDIS_PASSWORD | grep -Ec '^[A-Za-z0-9]{40}$')$(get FORWARD_AUTH_EXT_REDIS_PASSWORD | grep -Ec '^[A-Za-z0-9]{40}$')" 11
+if [ "$(get FORWARD_AUTH_REDIS_PASSWORD)" != "$(get FORWARD_AUTH_EXT_REDIS_PASSWORD)" ]; then t_pass "the two session-store passwords differ"; else t_fail "the two session-store passwords are the same"; fi
+expect_eq "the session-store passwords are core secrets (never shared with the Hub) and rotatable (upgrade generates them)" \
+  "$(bash -c '. "$1/scripts/lib/common.sh"; for v in FORWARD_AUTH_REDIS_PASSWORD FORWARD_AUTH_EXT_REDIS_PASSWORD; do case " $CORE_SECRETS " in *" $v "*) ;; *) echo "$v not core";; esac; case " $ROTATABLE_SECRETS " in *" $v "*) ;; *) echo "$v not rotatable";; esac; done' _ "$HERE/..")" ""
 run backup verify --local
 expect_eq "backup verify --local without backups exits 1" "$RC" 1
 case "$ERR" in *"no local backups"*) t_pass "backup verify --local: no local backups" ;; *) t_fail "backup verify --local: $ERR" ;; esac
@@ -446,6 +454,7 @@ keycloak_configure() { :; }
 oidc_register() { :; }
 network_check() { :; }
 stack_prepare() { :; }
+sessions_restart_if_changed() { echo sessions_restart_if_changed >> "$DC_CALLS"; }
 dns_setup() { :; }
 config_init() { :; }
 invite_create() { echo '{"url":"http://test","expires_at":"never"}'; }
@@ -472,6 +481,8 @@ rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
 calls="$(cat "$DC_CALLS" 2>/dev/null || true)"
 expect_eq "init: first up excludes hub" \
   "$(printf '%s\n' "$calls" | grep -c '^up.*vault.*lldap.*keycloak' || true)" 1
+expect_eq "init: the session store's restart check runs before the first up" \
+  "$(printf '%s\n' "$calls" | grep -E '^(sessions_restart_if_changed|up)' | head -n2 | paste -sd' ' - | cut -c1-30)" "sessions_restart_if_changed up"
 expect_eq "init: first up does not include hub in the list" \
   "$(printf '%s\n' "$calls" | grep '^up' | head -1 | grep -c 'hub' || true)" 0
 expect_eq "init: hub started after the service account step" \
@@ -503,6 +514,7 @@ network_check() { :; }
 stack_prepare() { :; }
 domains_restart_if_renewed() { :; }
 monitoring_reload() { :; }
+sessions_restart_if_changed() { echo sessions_restart_if_changed >> "$DC_CALLS"; }
 hub_pinned_warn() { :; }
 backup_create() { :; }
 hub_policy_check() { :; }
@@ -519,7 +531,7 @@ rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
   export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
-  export FORWARD_AUTH_COOKIE_SECRET=x HUB_PROXY_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
   # shellcheck disable=SC1091
   . "$HERE/../scripts/lib/common.sh"
   # shellcheck disable=SC1091
@@ -530,6 +542,9 @@ rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
 )
 expect_eq "up: account unchanged, no hub restart" \
   "$(grep -c '^restart.*hub' "$DC_CALLS" 2>/dev/null || true)" 0
+# A changed session-store config is applied (restart) before compose recreates the oauth2-proxies.
+expect_eq "up: the session store's restart check runs before docker compose up" \
+  "$(grep -E '^(sessions_restart_if_changed|up)' "$DC_CALLS" | head -n2 | paste -sd' ' -)" "sessions_restart_if_changed up"
 
 # stack_up when account changed: restart hub.
 touch "$LLDAP_ACCOUNT_CHANGED"
@@ -538,7 +553,7 @@ rm -f "$DC_CALLS"
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
   export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
-  export FORWARD_AUTH_COOKIE_SECRET=x HUB_PROXY_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
   # shellcheck disable=SC1091
   . "$HERE/../scripts/lib/common.sh"
   # shellcheck disable=SC1091
@@ -557,7 +572,7 @@ rm -f "$DC_CALLS"
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
   export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
-  export FORWARD_AUTH_COOKIE_SECRET=x HUB_PROXY_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
   # shellcheck disable=SC1091
   . "$HERE/../scripts/lib/common.sh"
   # shellcheck disable=SC1091
@@ -575,7 +590,7 @@ rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
   export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
-  export FORWARD_AUTH_COOKIE_SECRET=x HUB_PROXY_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
   # shellcheck disable=SC1091
   . "$HERE/../scripts/lib/common.sh"
   # shellcheck disable=SC1091
@@ -586,6 +601,8 @@ rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
 )
 expect_eq "upgrade: account unchanged, no hub restart" \
   "$(grep -c '^restart.*hub' "$DC_CALLS" 2>/dev/null || true)" 0
+expect_eq "upgrade: the session store's restart check runs before docker compose up" \
+  "$(grep -E '^(sessions_restart_if_changed|up)' "$DC_CALLS" | head -n2 | paste -sd' ' -)" "sessions_restart_if_changed up"
 
 # ── static TLS options (contract §5 "TLS tier per host", plan D18) ──
 ROOT_DIR="$(cd "$HERE/.." && pwd)"

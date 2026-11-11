@@ -16,10 +16,12 @@ KC_REALM="portcullis"
 # 26.8 has no per-client "revoke refresh token" (the client-policy executor
 # suppress-refresh-token-rotation only drops the new token from the answer;
 # reuse is still enforced realm-wide), and realm-wide rotation breaks
-# forward-auth: oauth2-proxy's cookie sessions refresh once a minute
+# forward-auth: oauth2-proxy's cookie sessions refreshed once a minute
 # without a lock, so of two concurrent requests on one cookie the second
-# presents the already-used refresh token and is sent to sign in (CI
-# e2e-login refresh_rotation failed with it on). Same values as
+# presented the already-used refresh token and was sent to sign in (CI
+# e2e-login refresh_rotation failed with it on). The session store
+# (`sessions`) now gives refreshes a lock, but rotation stays off until a
+# run proves it. Same values as
 # realm-export.json (imported only into a new realm); pushed on every run.
 # Never touched here: the Hub's AI clients (attribute
 # portcullis.hub.template = portcullis-ai) and its mcp:* client scopes —
