@@ -4,13 +4,17 @@
 Run: python3 tests/test_group_gate.py
 Starts group-gate in-process on an ephemeral port with temp map/policy files.
 """
+import datetime
 import importlib.util
 import html
 import http.server
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -28,10 +32,43 @@ REVOKED = os.path.join(TMP, "revoked-serials.txt")
 os.environ["GATE_MAP_FILE"] = MAP_PATH
 os.environ["GATE_POLICY_FILE"] = POLICY
 os.environ["GATE_REVOKED_FILE"] = REVOKED
-os.environ.pop("GATE_CRL_URL", None)
-os.environ.pop("GATE_DELTA_CRL_URL", None)
+os.environ.pop("GATE_CRL_URLS", None)
+os.environ.pop("GATE_DELTA_CRL_URLS", None)
+YUBIKEY_CA = os.path.join(TMP, "yubikey-ca.crt")
+BROWSER_CA = os.path.join(TMP, "browser-ca.crt")
+YUBIKEY_CA_CN = "example.com Intermediate CA"        # pki_yubikey_ca_cn (scripts/lib/pki.sh)
+BROWSER_CA_CN = "example.com Browser Certificate CA"  # pki_browser_ca_cn
+os.environ["GATE_YUBIKEY_CA_FILE"] = YUBIKEY_CA
+os.environ["GATE_BROWSER_CA_FILE"] = BROWSER_CA
+OPENED_DIR = os.path.join(TMP, "opened")
+os.environ["GATE_OPENED_DIR"] = OPENED_DIR
+os.environ["GATE_OPENED_GID"] = str(os.getgid())
 os.environ["PORTCULLIS_DOMAIN"] = "example.com"
 os.environ.pop("GATE_MAP", None)
+
+def write_ca(path, cn, ca=True, pem=True):
+    """A self-signed certificate with subject CN `cn` (a CA unless ca=False)."""
+    import datetime
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, cn)])
+    now = datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number()).not_valid_before(now)
+            .not_valid_after(now + datetime.timedelta(days=3650))
+            .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+            .sign(key, hashes.SHA256()))
+    data = cert.public_bytes(serialization.Encoding.PEM if pem else serialization.Encoding.DER)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+write_ca(YUBIKEY_CA, YUBIKEY_CA_CN)
+write_ca(BROWSER_CA, BROWSER_CA_CN)
 
 spec = importlib.util.spec_from_file_location("group_gate", GATE_PATH)
 gg = importlib.util.module_from_spec(spec)
@@ -50,7 +87,7 @@ BASE = {
     "templates": {"standard": STANDARD, "strong": STRONG},
     "default": "standard",
     "hosts": {},
-    "core": {"directory.example.com": "standard", "enroll.example.com": "standard",
+    "core": {"directory.example.com": "standard",
              "hub.example.com": "strong", "metrics.example.com": "standard",
              "people.example.com": "strong", "example.com": "standard",
              "traefik.example.com": "standard"},
@@ -156,7 +193,7 @@ class GateTest(unittest.TestCase):
     def test_no_username_fails_closed_everywhere(self):
         # No portcullis-auth in front (or no preferred_username): deny, even
         # for unmapped apps, and never fall back to sub / email.
-        for gate_path in ("/", "/authenticated"):
+        for gate_path in ("/", "/anything"):
             for extra in ({"X-Auth-Request-Preferred-Username": None},
                           {"X-Auth-Request-Preferred-Username": "  "}):
                 with self.subTest(gate_path=gate_path, extra=extra):
@@ -205,7 +242,7 @@ class GateTest(unittest.TestCase):
                                   extra={"X-Forwarded-Access-Token": None}), 403)
 
     def test_hub_service_account_is_denied(self):
-        for gate_path in ("/", "/authenticated", "/portal"):
+        for gate_path in ("/", "/portal"):
             for name in ("portcullis-hub", "Portcullis-Hub"):
                 with self.subTest(gate_path=gate_path, name=name):
                     self.assertEqual(self.req("hub.example.com", groups="lldap_admin", gate_path=gate_path,
@@ -337,7 +374,7 @@ class GateTest(unittest.TestCase):
         # user (the token's sub), must not become the user: no username = 403.
         for extra in ({"X-Auth-Request-Preferred-Username": None, "X-Auth-Request-Email": "admin@example.com"},
                       {"X-Auth-Request-Preferred-Username": None, "X-Auth-Request-User": "admin"}):
-            for gate_path in ("/", "/authenticated"):
+            for gate_path in ("/",):
                 with self.subTest(extra=extra, gate_path=gate_path):
                     self.assertEqual(self.req("grafana.example.com", groups="users_grafana",
                                               gate_path=gate_path, extra=extra), 403)
@@ -371,8 +408,8 @@ class GateTest(unittest.TestCase):
         for host in ("random.example.com", "grafana.example.com", "hub.example.com"):
             with self.subTest(host=host):
                 self.assertEqual(self.req(host, groups=f"users_grafana,lldap_admin, {gg.DENY_GROUP}"), 403)
-        self.assertEqual(self.req("random.example.com", groups="users_x", gate_path="/authenticated"), 200)
-        self.assertEqual(self.req("random.example.com", groups=gg.DENY_GROUP, gate_path="/authenticated"), 403)
+        self.assertEqual(self.req("random.example.com", groups="users_x"), 200)
+        self.assertEqual(self.req("random.example.com", groups=gg.DENY_GROUP), 403)
 
     def test_deny_sentinel_in_path_groups(self):
         write_policy({"path_groups": {"grafana.example.com": [{"prefix": "/x", "group": gg.DENY_GROUP}]}})
@@ -397,23 +434,21 @@ class GateTest(unittest.TestCase):
                 self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), 403)
                 self.assertEqual(self.req("hub.example.com", groups="lldap_admin"), 403)
 
-    # ── healthz / authenticated-only ──
+    # ── healthz / no /authenticated ──
 
     def test_healthz(self):
         self.assertEqual(self.req("", groups=None, gate_path="/healthz"), 200)
 
-    def test_authenticated_only_skips_group_but_not_other_checks(self):
-        self.assertEqual(self.req("enroll.example.com", groups="users_x"), 403)
-        self.assertEqual(self.req("enroll.example.com", groups="users_x", gate_path="/authenticated"), 200)
-        self.assertEqual(self.req("enroll.example.com", groups="", gate_path="/authenticated/self"), 200)
-        # no user at all
-        self.assertEqual(self.req("enroll.example.com", groups="", gate_path="/authenticated",
-                                  extra={"X-Auth-Request-Email": None, "X-Auth-Request-User": None,
-                                         "X-Auth-Request-Preferred-Username": None}), 403)
-        # host check still applies
-        self.assertEqual(self.req("enroll.evil.com", groups="", gate_path="/authenticated"), 403)
-        # "/authenticatedX" is not the authenticated-only endpoint
-        self.assertEqual(self.req("enroll.example.com", groups="users_x", gate_path="/authenticatedX"), 403)
+    def test_no_authenticated_endpoint(self):
+        # /authenticated is gone (contract §5 "Core routers"): any other
+        # gate path gets the full checks, the host's group included.
+        for gate_path in ("/authenticated", "/authenticated/self", "/authenticatedX"):
+            with self.subTest(gate_path=gate_path):
+                self.assertEqual(self.req("grafana.example.com", groups="users_x", gate_path=gate_path), 403)
+                self.assertEqual(self.req("grafana.example.com", groups="users_grafana", gate_path=gate_path), 200)
+        # enroll.<d> is reserved but no longer gated: no template, deny.
+        for gate_path in ("/", "/authenticated"):
+            self.assertEqual(self.req("enroll.example.com", groups="lldap_admin", gate_path=gate_path), 403)
 
 
 EXTRA = "team-b.example.org"
@@ -737,7 +772,7 @@ class SigninV6Test(GateTest):
                 rule = c["compiled"]
                 self.assertIsNone(gg.validate_rule(rule, set(c["on"])))
                 saw_inv |= "inv" in c["have"]
-                have = gg.session_methods(c["have"], ALL_METHODS, cert_bound=True)
+                have = gg.session_methods(c["have"], ALL_METHODS, bound={"yubikey_cert", "browser_cert"})
                 self.assertEqual(gg.rule_satisfied(rule, have), c["satisfied"], have)
                 got = gg.alternatives(rule)
                 self.assertEqual(set(got), {frozenset(a) for a in c["alternatives"]})
@@ -842,10 +877,9 @@ class SigninV6Test(GateTest):
         write_policy({"core": core})
         self.assertEqual(self.page("people.example.com", ["hwk"], groups="")[0], 403)
         self.assertEqual(self.page("hub.example.com", ["hwk"], groups="lldap_admin")[0], 200)
-        # /authenticated (enroll.<d>/self) applies enroll's template too.
-        write_policy({"core": dict(BASE["core"], **{"enroll.example.com": "strong"})})
-        self.assertEqual(self.page("enroll.example.com", ["spk"], groups="", gate_path="/authenticated")[0], 403)
-        self.assertEqual(self.page("enroll.example.com", ["hwk"], groups="", gate_path="/authenticated")[0], 200)
+        # enroll.<d> is not a gated core host: `core` may not list it.
+        self.assertIn("not gated core hosts", gg.validate_policy_doc(
+            {**BASE, "core": dict(BASE["core"], **{"enroll.example.com": "strong"})}))
         # auth.<d> (the Keycloak console's router) takes the Hub's template
         # (core["hub.<d>"]: strong here), never the default.
         write_policy({"default": "standard"})
@@ -923,7 +957,7 @@ class SigninV6Test(GateTest):
         # Unknown person: the first candidate; never yubikey_cert while amr has mtls.
         self.assertEqual(gg.choose_stepup(STRONG, set(), None), "security_key")
         self.assertEqual(gg.choose_stepup({"op": "any", "items": ["yubikey_cert", "security_key"]}, set(), None,
-                                          amr_mtls=True), "security_key")
+                                          held=frozenset({"yubikey_cert"})), "security_key")
         self.assertEqual(gg.choose_stepup(STANDARD, set(), None), "passkey")
         self.assertEqual(gg.choose_stepup(STANDARD, set(), {"passkey_device", "security_key"}), "passkey_device")
         self.assertIsNone(gg.choose_stepup({"op": "all", "items": ["security_key", "yubikey_cert"]}, set(), None))
@@ -969,7 +1003,7 @@ class SigninV6Test(GateTest):
     def test_needs_page_matches_the_extension(self):
         # portcullis-needs-stronger.ftl / NeedsStronger.java with
         # messages_en.properties: the same words, one line per alternative.
-        acct = "https://auth.example.com/realms/portcullis/account/account-security/signing-in"
+        acct = "https://people.example.com/signin"
         b = gg.render_needs_page("Grafana", {"password"}, STRONG, {"password"}, False, "example.com").decode()
         self.assertIn("<h1>Grafana needs a stronger sign-in</h1>", b)
         self.assertIn('<div id="needs-stronger"><p>You signed in with a <b>password</b>. Grafana accepts any one of:</p>', b)
@@ -1401,8 +1435,7 @@ class PolicyExpiringTest(GateTest):
         self.assertEqual(self.req("app.example.com", groups="admin_app", uri="/admin"), 403)
         self.assertEqual(self.req("hub.example.com", groups="lldap_admin"), 403)
         # Only every group expired: no X-Auth-Request-Groups at all.
-        status, hdrs = self.req("enroll.example.com", groups="lldap_admin", gate_path="/authenticated",
-                                want_headers=True)
+        status, hdrs = self.req("people.example.com", groups="lldap_admin", want_headers=True)
         self.assertEqual(status, 200)
         self.assertNotIn("X-Auth-Request-Groups", hdrs)
 
@@ -1503,9 +1536,8 @@ class PolicyExpiringTest(GateTest):
         self.assertEqual(hdrs.get("X-Forwarded-Attr-Bio"), "evilX-Injected: 1")
         self.assertNotIn("X-Injected", hdrs)
         self.assertEqual(hdrs.get("X-Forwarded-Attr-Dept"), "ok")  # > 1 KB value dropped
-        # Core subdomains and /authenticated get them too.
-        for host, groups, path in (("hub.example.com", "lldap_admin", "/"), ("people.example.com", "", "/"),
-                                   ("enroll.example.com", "", "/authenticated")):
+        # Core subdomains get them too.
+        for host, groups, path in (("hub.example.com", "lldap_admin", "/"), ("people.example.com", "", "/")):
             with self.subTest(host=host):
                 status, hdrs = self.req(host, groups=groups, gate_path=path, want_headers=True)
                 self.assertEqual((status, hdrs.get("X-Forwarded-Attr-City")), (200, "Milan"))
@@ -2002,7 +2034,7 @@ class RevocationGateTest(GateTest):
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
             _CrlHandler.status, _CrlHandler.body = 200, build_crl([0x77])
-            cache = gg.CrlCache(f"http://127.0.0.1:{srv.server_address[1]}/v1/pki_int/crl", 60)
+            cache = gg.CrlCache([f"http://127.0.0.1:{srv.server_address[1]}/v1/pki_int/crl"], 60)
             self.assertTrue(cache.refresh())
             gg.CRL_CACHE = cache
             self.assertEqual(self.req("random.example.com", extra={gg.CERT_INFO_HEADER: cert_info(0x77)}), 403)
@@ -2037,7 +2069,7 @@ class DeltaCrlTest(GateTest):
         write_revoked(None)
         gg.CRL_CACHE = None
         base = f"http://127.0.0.1:{self.crl_srv.server_address[1]}/v1/pki_int"
-        self.cache = gg.CrlCache(base + "/crl", 60, delta_url=base + "/crl/delta")
+        self.cache = gg.CrlCache([base + "/crl"], 60, delta_urls=[base + "/crl/delta"])
 
     def tearDown(self):
         _CrlHandler.by_path = {}
@@ -2102,11 +2134,9 @@ class MetricsTest(GateTest):
         host0 = m.get("group_gate_denials_total", reason="host")
         step0 = m.get("group_gate_stepups_total", reason="stepup")
         pol0 = m.get("group_gate_policy_load_errors_total")
-        auth0 = m.get("group_gate_requests_total", endpoint="authenticated", result="allow")
         self.assertEqual(self.req("grafana.example.com", groups="users_grafana"), 200)
         self.assertEqual(self.req("grafana.example.com", groups="users_x"), 403)
         self.assertEqual(self.req("grafana.evil.com"), 403)
-        self.assertEqual(self.req("hub.example.com", gate_path="/authenticated", groups=""), 200)
         write_policy({"hosts": {"grafana.example.com": "strong"}})
         self.assertEqual(self.req("grafana.example.com", groups="users_grafana",
                                   extra={"X-Forwarded-Access-Token": token(amr=["spk"])}), 403)
@@ -2117,7 +2147,6 @@ class MetricsTest(GateTest):
         self.assertEqual(m.get("group_gate_denials_total", reason="host"), host0 + 1)
         self.assertEqual(m.get("group_gate_stepups_total", reason="stepup"), step0 + 1)
         self.assertEqual(m.get("group_gate_policy_load_errors_total"), pol0 + 1)
-        self.assertEqual(m.get("group_gate_requests_total", endpoint="authenticated", result="allow"), auth0 + 1)
         text = self.scrape()
         self.assertIn('group_gate_denials_total{reason="group"}', text)
         self.assertIn("# TYPE group_gate_requests_total counter", text)
@@ -2147,7 +2176,7 @@ class MetricsTest(GateTest):
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
             _CrlHandler.status, _CrlHandler.body = 200, build_crl([7])
-            cache = gg.CrlCache(f"http://127.0.0.1:{srv.server_address[1]}/crl", 60)
+            cache = gg.CrlCache([f"http://127.0.0.1:{srv.server_address[1]}/crl"], 60)
             gg.CRL_CACHE = cache
             self.assertIn("group_gate_crl_last_success_timestamp_seconds 0\n", self.scrape())
             self.assertTrue(cache.refresh())
@@ -2173,6 +2202,499 @@ class MetricsTest(GateTest):
         # GeneralizedTime (dates from 2050 on)
         gen = _der(0x18, b"20991231235959Z")
         self.assertEqual(gg.parse_crl(build_crl([1], next_update=gen))[1], 4102444799.0)
+
+
+# Traefik's own X-Forwarded-Tls-Client-Cert-Info example (passTLSClientCert
+# docs): Go's url.QueryEscape of Subject="…";Issuer="…";NB;NA;SAN, so a
+# space is "+". Pins the Issuer="…" format leaf_cert_issuer_cn reads.
+TRAEFIK_INFO_FIXTURE = (
+    "Subject%3D%22C%3DFR%2CST%3DIle-de-France%2CL%3DParis%2CO%3DCheese%2CCN%3D%2A.cheese.org%22%3B"
+    "Issuer%3D%22DC%3Dorg%2CDC%3Dcheese%2CC%3DFR%2CC%3DUS%2CST%3DSigning+State%2CST%3DSigning+State+2%2C"
+    "L%3DTOULOUSE%2CL%3DLYON%2CO%3DCheese%2CO%3DCheese+2%2CCN%3DSimple+Signing+CA%22%3B"
+    "NB%3D%221544094616%22%3BNA%3D%221607166616%22%3B"
+    "SAN%3D%22%2A.cheese.org%2C%2A.cheese.net%2Ccheese.in%2Ctest%40cheese.org%2Ctest%40cheese.net%2C10.0.1.0%2C10.0.1.2%22")
+
+
+def leaf_info(cn, serial, issuer=YUBIKEY_CA_CN, chain=True):
+    """Traefik's header for a leaf of `issuer` (client-headers@file: the
+    issuer's CN only), the intermediate after it when `chain`."""
+    parts = [f'Subject="CN={cn}";Issuer="CN={issuer}";SerialNumber="{serial}";NB="1700000000";NA="1700086400"']
+    if chain:
+        parts.append(f'Subject="CN={issuer}";Issuer="CN=example.com Root CA";SerialNumber="987654321";'
+                     'NB="1700000000";NA="1800000000"')
+    return urllib.parse.quote_plus(",".join(parts))
+
+
+ALL_ON = sorted(gg.METHOD_IDS)
+
+
+class SigninPart2Test(GateTest):
+    """Sign-in methods part 2 in group-gate: certificate kinds by issuer,
+    both CAs' CRLs, the Sign-in paths, the opened log, the links (contract
+    §4, §5, §10)."""
+
+    def setUp(self):
+        super().setUp()
+        write_revoked(None)
+        gg.CRL_CACHE = None
+        write_ca(YUBIKEY_CA, YUBIKEY_CA_CN)
+        write_ca(BROWSER_CA, BROWSER_CA_CN)
+        self._old = (gg.YUBIKEY_CA_FILE, gg.BROWSER_CA_FILE, gg.OPENED_LOG)
+        self.log_dir = tempfile.mkdtemp(dir=TMP)
+        gg.OPENED_LOG = gg.OpenedLog(os.path.join(self.log_dir, "opened"), gid=os.getgid())
+
+    def tearDown(self):
+        gg.YUBIKEY_CA_FILE, gg.BROWSER_CA_FILE, gg.OPENED_LOG = self._old
+        gg.CRL_CACHE = None
+        _CrlHandler.by_path = {}
+        _CrlHandler.fetched = []
+        write_revoked(None)
+        write_ca(YUBIKEY_CA, YUBIKEY_CA_CN)
+        write_ca(BROWSER_CA, BROWSER_CA_CN)
+
+    def rules(self, **rules):
+        """Every method on; host grafana.example.com on template "t"."""
+        write_policy({"methods": ALL_ON, "templates": {**BASE["templates"], **rules},
+                      "hosts": {"grafana.example.com": "t"} if "t" in rules else {}})
+
+    def page(self, host="grafana.example.com", amr=("hwk",), user="bob", groups="users_grafana", cert=None,
+             uri=None, gate_path="/", claims=None, extra=None):
+        h = {"X-Forwarded-Host": host, "X-Auth-Request-Preferred-Username": user,
+             "X-Auth-Request-Groups": groups,
+             "X-Forwarded-Access-Token": token(amr=list(amr), preferred_username=user, **(claims or {}))}
+        if cert is not None:
+            h[gg.CERT_INFO_HEADER] = cert
+        if uri is not None:
+            h["X-Forwarded-Uri"] = uri
+        h.update(extra or {})
+        r = urllib.request.Request(f"http://127.0.0.1:{self.port}{gate_path}", headers=h)
+        try:
+            with urllib.request.urlopen(r) as resp:
+                return resp.status, dict(resp.headers), resp.read().decode()
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, dict(e.headers), e.read().decode()
+
+    # ── certificate kinds by issuer (contract §4 "Certificate binding") ──
+
+    def test_leaf_cert_issuer_cn_traefik_format(self):
+        self.assertEqual(gg.leaf_cert_issuer_cn(TRAEFIK_INFO_FIXTURE), "Simple Signing CA")
+        self.assertEqual(gg.leaf_cert_cn(TRAEFIK_INFO_FIXTURE), "*.cheese.org")
+        self.assertEqual(gg.leaf_cert_issuer_cn(leaf_info("bob", 1)), YUBIKEY_CA_CN)
+        self.assertEqual(gg.leaf_cert_issuer_cn(leaf_info("bob", 1, BROWSER_CA_CN)), BROWSER_CA_CN)
+        # Twice escaped (some Traefik versions) reads the same.
+        self.assertEqual(gg.leaf_cert_issuer_cn(urllib.parse.quote_plus(leaf_info("bob", 1))), YUBIKEY_CA_CN)
+        # Only the leaf's own Issuer: a header that doesn't start with the
+        # leaf's Subject;Issuer, or a leaf without an Issuer whose chain has
+        # one, gives None.
+        for bad in ("", 'Issuer="CN=x"', 'SerialNumber="1";Subject="CN=bob";Issuer="CN=x"',
+                    urllib.parse.quote_plus(f'Subject="CN=bob";SerialNumber="1",Subject="CN=i";Issuer="CN={YUBIKEY_CA_CN}"'),
+                    urllib.parse.quote_plus('Subject="CN=bob";Issuer="CN=a,CN=b"'),
+                    urllib.parse.quote_plus('Subject="CN=bob";Issuer="O=x"')):
+            with self.subTest(bad=bad):
+                self.assertIsNone(gg.leaf_cert_issuer_cn(bad))
+
+    def test_ca_subject_cn(self):
+        self.assertEqual(gg.ca_subject_cn(YUBIKEY_CA), YUBIKEY_CA_CN)
+        der = os.path.join(TMP, "der-ca.crt")
+        write_ca(der, "DER CA", pem=False)
+        self.assertEqual(gg.ca_subject_cn(der), "DER CA")
+        write_ca(der, "Not a CA", ca=False)
+        self.assertIsNone(gg.ca_subject_cn(der))  # re-read: (inode, mtime, size) changed
+        with open(der, "w") as f:
+            f.write("garbage")
+        self.assertIsNone(gg.ca_subject_cn(der))
+        self.assertIsNone(gg.ca_subject_cn(os.path.join(TMP, "missing.crt")))
+        self.assertIsNone(gg.ca_subject_cn(TMP))  # a directory
+        os.unlink(der)
+
+    def test_cert_method(self):
+        self.assertEqual(gg.cert_method(leaf_info("bob", 1)), "yubikey_cert")
+        self.assertEqual(gg.cert_method(leaf_info("bob", 1, BROWSER_CA_CN)), "browser_cert")
+        self.assertIsNone(gg.cert_method(leaf_info("bob", 1, "example.com Root CA")))
+        self.assertIsNone(gg.cert_method(leaf_info("bob", 1, "Someone Else CA")))
+        self.assertIsNone(gg.cert_method(""))
+
+    def test_browser_leaf_never_binds_yubikey(self):
+        # amr mtls, but the leaf is a browser certificate (pki_file).
+        self.rules(t={"op": "any", "items": ["yubikey_cert"]})
+        code, hdrs, body = self.page(amr=["mtls"], user="alice", cert=leaf_info("alice", 5, BROWSER_CA_CN))
+        self.assertEqual(code, 403)
+        self.assertIn('id="present-certificate"', body)
+        self.assertIn("needs your YubiKey certificate", body)
+        self.assertEqual(self.page(amr=["mtls"], user="alice", cert=leaf_info("alice", 5))[0], 200)
+
+    def test_yubikey_leaf_binds_only_yubikey(self):
+        cert = leaf_info("bob", 6)
+        self.rules(t={"op": "any", "items": ["yubikey_cert"]})
+        self.assertEqual(self.page(amr=["mtls", "file"], cert=cert)[0], 200)
+        self.rules(t={"op": "any", "items": ["browser_cert"]})
+        code, hdrs, body = self.page(amr=["mtls", "file"], cert=cert)
+        self.assertEqual(code, 403)
+        self.assertIn("needs your browser certificate", body)
+        self.assertIn("Use the browser it is installed in and reload this page.", body)
+        self.assertNotIn("X-Stepup-URL", hdrs)
+        # Both needed: a YubiKey leaf can't be both.
+        self.rules(t={"op": "all", "items": ["yubikey_cert", "browser_cert"]})
+        self.assertEqual(self.page(amr=["mtls", "file"], cert=cert)[0], 403)
+        self.assertEqual(gg.session_methods(["mtls", "file"], set(ALL_ON), {"yubikey_cert"}), {"yubikey_cert"})
+
+    def test_browser_cert_binds_with_file(self):
+        cert = leaf_info("alice", 7, BROWSER_CA_CN)
+        self.rules(t={"op": "any", "items": ["browser_cert"]})
+        self.assertEqual(self.page(amr=["file"], user="alice", cert=cert)[0], 200)
+        # Without the leaf, another person's, or a YubiKey leaf: not bound.
+        self.assertEqual(self.page(amr=["file"], user="alice")[0], 403)
+        self.assertEqual(self.page(amr=["file"], user="alice", cert=leaf_info("bob", 7, BROWSER_CA_CN))[0], 403)
+        self.assertEqual(self.page(amr=["file"], user="alice", cert=leaf_info("alice", 7))[0], 403)
+        # The token's user must agree.
+        code = self.page(amr=["file"], user="alice", cert=cert,
+                         extra={"X-Forwarded-Access-Token": token(amr=["file"], preferred_username="bob")})[0]
+        self.assertEqual(code, 403)
+        self.assertEqual(gg.session_methods(["file"], set(ALL_ON), {"browser_cert"}), {"browser_cert"})
+        # browser_cert off: never counts, bound or not.
+        on = [m for m in ALL_ON if m != "browser_cert"]
+        self.assertEqual(gg.session_methods(["file"], set(on), {"browser_cert"}), set())
+        write_policy({"methods": on, "templates": {**BASE["templates"], "t": {"op": "any", "items": ["security_key"]}},
+                      "hosts": {"grafana.example.com": "t"}})
+        self.assertEqual(self.page(amr=["file"], user="alice", cert=cert)[0], 403)
+
+    def test_equal_or_missing_ca_files_count_nothing(self):
+        self.rules(t={"op": "any", "items": ["yubikey_cert", "browser_cert"]})
+        yk, br = leaf_info("bob", 8), leaf_info("bob", 8, BROWSER_CA_CN)
+        self.assertEqual(self.page(amr=["mtls"], cert=yk)[0], 200)
+        self.assertEqual(self.page(amr=["file"], cert=br)[0], 200)
+        # The same CN in both files: neither kind counts.
+        write_ca(BROWSER_CA, YUBIKEY_CA_CN)
+        self.assertIsNone(gg.cert_method(yk))
+        self.assertEqual(self.page(amr=["mtls"], cert=yk)[0], 403)
+        self.assertEqual(self.page(amr=["file"], cert=br)[0], 403)
+        write_ca(BROWSER_CA, BROWSER_CA_CN)
+        # A missing (or unreadable) file: neither kind counts.
+        for missing in ("yubikey", "browser"):
+            with self.subTest(missing=missing):
+                gg.YUBIKEY_CA_FILE = os.path.join(TMP, "nope.crt") if missing == "yubikey" else YUBIKEY_CA
+                gg.BROWSER_CA_FILE = os.path.join(TMP, "nope.crt") if missing == "browser" else BROWSER_CA
+                self.assertIsNone(gg.cert_method(yk))
+                self.assertIsNone(gg.cert_method(br))
+                self.assertEqual(self.page(amr=["mtls"], cert=yk)[0], 403)
+                self.assertEqual(self.page(amr=["file"], cert=br)[0], 403)
+        gg.YUBIKEY_CA_FILE, gg.BROWSER_CA_FILE = YUBIKEY_CA, BROWSER_CA
+        with open(BROWSER_CA, "w") as f:
+            f.write("not a certificate")
+        self.assertIsNone(gg.cert_method(yk))
+        self.assertEqual(self.page(amr=["mtls"], cert=yk)[0], 403)
+
+    def test_step_up_never_asks_held_cert_method(self):
+        # amr file, no certificate presented: the present-certificate page
+        # (browser), never a step-up to browser_cert.
+        self.rules(t={"op": "any", "items": ["browser_cert"]})
+        code, hdrs, body = self.page(amr=["file"])
+        self.assertEqual(code, 403)
+        self.assertNotIn("X-Stepup-URL", hdrs)
+        self.assertIn('id="present-certificate"', body)
+        self.assertIn("grafana.example.com needs your browser certificate", body)
+        self.assertIsNone(gg.choose_stepup({"op": "any", "items": ["browser_cert"]}, set(), None,
+                                           held=frozenset({"browser_cert"})))
+        self.assertEqual(gg.choose_stepup({"op": "any", "items": ["browser_cert"]}, set(), None,
+                                          held=frozenset({"yubikey_cert"})), "browser_cert")
+        # Signed in with a passkey only: the browser certificate is the step-up.
+        code, hdrs, body = self.page(amr=["spk"])
+        self.assertIn("pc_method=browser_cert", hdrs.get("X-Stepup-URL", ""))
+
+    # ── revocation lists (contract §4 "Revocation lists") ──
+
+    def crl_cache(self, lists):
+        """A CrlCache over a fake Vault: `lists` path -> serials, for the
+        four lists core sets."""
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CrlHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        base = f"http://127.0.0.1:{srv.server_address[1]}/v1"
+        _CrlHandler.by_path = {f"/v1/{p}": (200, build_crl(sns)) for p, sns in lists.items()}
+        return gg.CrlCache([f"{base}/pki_int/crl", f"{base}/pki_file/crl"], 60,
+                           delta_urls=[f"{base}/pki_int/crl/delta", f"{base}/pki_file/crl/delta"])
+
+    def test_revoked_browser_cert_denied_by_pki_file_crl(self):
+        cache = self.crl_cache({"pki_int/crl": [], "pki_int/crl/delta": [], "pki_file/crl": [],
+                                "pki_file/crl/delta": [0x51]})
+        self.assertTrue(cache.refresh())
+        gg.CRL_CACHE = cache
+        self.rules(t={"op": "any", "items": ["browser_cert", "security_key"]})
+        revoked, other = leaf_info("bob", 0x51, BROWSER_CA_CN), leaf_info("bob", 0x52, BROWSER_CA_CN)
+        for host, groups in (("grafana.example.com", "users_grafana"), ("random.example.com", ""),
+                             ("hub.example.com", "lldap_admin"), ("people.example.com", "")):
+            with self.subTest(host=host):
+                code, hdrs, body = self.page(host=host, amr=["hwk"], groups=groups, cert=revoked)
+                self.assertEqual(code, 403)
+                self.assertIn("revoked", body)
+                self.assertEqual(self.page(host=host, amr=["hwk"], groups=groups, cert=other)[0], 200)
+        self.assertEqual(self.page(amr=["file"], cert=other)[0], 200)
+
+    def test_crl_lists_union(self):
+        cache = self.crl_cache({"pki_int/crl": [0x61], "pki_int/crl/delta": [0x62], "pki_file/crl": [0x63],
+                                "pki_file/crl/delta": [0x64]})
+        _CrlHandler.fetched = []
+        self.assertTrue(cache.refresh())
+        # Every delta before every full CRL.
+        self.assertEqual(_CrlHandler.fetched, ["/v1/pki_int/crl/delta", "/v1/pki_file/crl/delta",
+                                               "/v1/pki_int/crl", "/v1/pki_file/crl"])
+        gg.CRL_CACHE = cache
+        write_revoked(["65"])
+        self.assertEqual(gg.revoked_serials(), {0x61, 0x62, 0x63, 0x64, 0x65})
+        for sn in (0x61, 0x62, 0x63, 0x64, 0x65):
+            for issuer in (YUBIKEY_CA_CN, BROWSER_CA_CN):
+                with self.subTest(sn=sn, issuer=issuer):
+                    self.assertEqual(self.page(host="random.example.com", groups="",
+                                               cert=leaf_info("bob", sn, issuer))[0], 403)
+        self.assertEqual(self.page(host="random.example.com", groups="", cert=leaf_info("bob", 0x66))[0], 200)
+        # A list that fails later keeps its last good serials.
+        _CrlHandler.by_path["/v1/pki_file/crl/delta"] = (503, b"sealed")
+        self.assertFalse(cache.refresh())
+        self.assertIn(0x64, cache.serials)
+        self.assertTrue(cache.ready)
+
+    def test_crl_never_read_counts_no_certificate(self):
+        # A list that has never been read: no certificate counts as a
+        # method (an unreadable CRL list fails closed); other methods do.
+        cache = self.crl_cache({"pki_int/crl": [], "pki_int/crl/delta": [], "pki_file/crl": []})
+        _CrlHandler.by_path["/v1/pki_file/crl/delta"] = (500, b"")
+        self.assertFalse(cache.refresh())
+        self.assertFalse(cache.ready)
+        gg.CRL_CACHE = cache
+        self.rules(t={"op": "any", "items": ["yubikey_cert", "security_key"]})
+        code, hdrs, body = self.page(amr=["mtls"], cert=leaf_info("bob", 0x70))
+        self.assertEqual(code, 403)
+        self.assertIn('id="present-certificate"', body)
+        self.assertEqual(self.page(amr=["hwk"], cert=leaf_info("bob", 0x70))[0], 200)
+        _CrlHandler.by_path["/v1/pki_file/crl/delta"] = (200, build_crl([]))
+        self.assertTrue(cache.refresh())
+        self.assertEqual(self.page(amr=["mtls"], cert=leaf_info("bob", 0x70))[0], 200)
+
+    def test_crl_env_lists(self):
+        env = dict(os.environ, GATE_CRL_URLS="http://v/pki_int/crl  http://v/pki_file/crl",
+                   GATE_DELTA_CRL_URLS="http://v/pki_int/crl/delta http://v/pki_file/crl/delta",
+                   GATE_CRL_URL="http://old", GATE_DELTA_CRL_URL="http://old/delta")
+        out = subprocess.run(
+            [sys.executable, "-c", "import importlib.util,sys;"
+             f"s=importlib.util.spec_from_file_location('g',{GATE_PATH!r});m=importlib.util.module_from_spec(s);"
+             "s.loader.exec_module(m);print(m.CRL_URLS, m.DELTA_CRL_URLS, [x.url for x in m.CRL_CACHE.sources])"],
+            env=env, capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out.strip(), "['http://v/pki_int/crl', 'http://v/pki_file/crl'] "
+                         "['http://v/pki_int/crl/delta', 'http://v/pki_file/crl/delta'] "
+                         "['http://v/pki_int/crl/delta', 'http://v/pki_file/crl/delta', "
+                         "'http://v/pki_int/crl', 'http://v/pki_file/crl']")
+        self.assertNotIn("http://old", out)
+
+    # ── the Sign-in paths (contract §4 "Sign-in paths") ──
+
+    def test_signin_paths_exact_after_normalising(self):
+        ok = ("/signin", "/signin?x=1", "/api/me/signin", "/api/me/signin/history",
+              "/api/me/signin/history?before=2026-11-11T00:00:00Z&limit=5",
+              "/api/me/signin/certificates/1a:2b", "/static/a.js", "/static/css/x.css", "/%73ignin")
+        bad = ("/signin/../api/directory", "/static/../api/directory", "/api/me/signinx", "/api/me/signin%2F..%2Fapps",
+               "/Signin", "/", "", "/signin/", "/api/me/signin/", "/static/", "/static", "/api/me/signin/../../apps",
+               "/api/me/signin/x/../../../directory", "/static/%2e%2e/api/directory", "/static/%252e%252e/api/x",
+               "/static\\..\\api\\directory", "/static/a%5c..%5capi", "/api/me/signin/x%2Fy", "/api/me/signin;x/../../apps",
+               "/signin;jsessionid=1", "/signin#x", "/signin%00", "/static/a%0a", "//signin/../hub", "/api/me/apps",
+               "http://evil/signin/../api/x", "/static/./../api")
+        for path in ok:
+            with self.subTest(ok=path):
+                self.assertTrue(gg.signin_path("people.example.com", path))
+                for c in gg.normalize_path_candidates(path):
+                    self.assertTrue(c in ("/signin", "/api/me/signin") or c.startswith(("/api/me/signin/", "/static/")), c)
+        for path in bad:
+            with self.subTest(bad=path):
+                self.assertFalse(gg.signin_path("people.example.com", path))
+        for host in ("hub.example.com", "grafana.example.com", "example.com", "people.example.org",
+                     "people.team-b.example.org", "PEOPLE.example.com"):
+            for path in ok:
+                with self.subTest(host=host, path=path):
+                    self.assertFalse(gg.signin_path(host, path))
+
+    def test_signin_paths_any_switched_on_method(self):
+        # people.<d> on Strong; a password-only session.
+        on = sorted(BASE["methods"] + ["password"])
+        write_policy({"methods": on, "people": {"bob": ["password"]}})
+        for uri in ("/signin", "/api/me/signin/history?limit=5", "/static/mysignin.js"):
+            with self.subTest(uri=uri):
+                self.assertEqual(self.page(host="people.example.com", amr=["pwd"], groups="", uri=uri)[0], 200)
+        # Everywhere else on people.<d> (and the same paths elsewhere), the
+        # host's template applies.
+        for host, uri, groups in (("people.example.com", "/", ""), ("people.example.com", "/api/directory", ""),
+                                  ("people.example.com", "/signin/../api/directory", ""),
+                                  ("people.example.com", "/api/me/signin%2F..%2Fapps", ""),
+                                  ("people.example.com", "/static/%2e%2e/api/me", ""),
+                                  ("people.example.com", "/static/..%5capi", ""),
+                                  ("people.example.com", None, ""),
+                                  ("hub.example.com", "/signin", "lldap_admin"),
+                                  ("grafana.example.com", "/signin", "users_grafana")):
+            with self.subTest(host=host, uri=uri):
+                code, hdrs, body = self.page(host=host, amr=["pwd"], groups=groups, uri=uri)
+                self.assertEqual(code, 403)
+                self.assertIn('id="needs-stronger"', body)
+        # Password off: the session counts nothing, even on /signin.
+        write_policy({"people": {"bob": []}})
+        code, hdrs, body = self.page(host="people.example.com", amr=["pwd"], groups="", uri="/signin")
+        self.assertEqual(code, 403)
+        self.assertIn('id="needs-stronger"', body)
+        # A passkey session reaches /signin though people.<d> asks for more.
+        self.assertEqual(self.page(host="people.example.com", amr=["spk"], groups="", uri="/signin")[0], 200)
+        self.assertEqual(self.page(host="people.example.com", amr=["spk"], groups="", uri="/")[0], 403)
+        # Membership checks still run first: a reserved group, a service
+        # account and a missing user are denied on /signin too.
+        self.assertEqual(self.page(host="people.example.com", amr=["spk"], groups=gg.DENY_GROUP, uri="/signin")[0], 403)
+        self.assertEqual(self.page(host="people.example.com", amr=["spk"], groups="", uri="/signin",
+                                   user="portcullis-hub")[0], 403)
+        # A certificate method still needs its binding on /signin.
+        self.assertEqual(self.page(host="people.example.com", amr=["mtls"], groups="", uri="/signin")[0], 403)
+        self.assertEqual(self.page(host="people.example.com", amr=["mtls"], groups="", uri="/signin",
+                                   cert=leaf_info("bob", 3))[0], 200)
+
+    # ── core hosts ──
+
+    def test_enroll_not_gated_but_reserved(self):
+        self.assertNotIn("enroll", gg.GATED_CORE_SUBDOMAINS)
+        self.assertIn("enroll", gg.CORE_SUBDOMAINS)
+        self.assertEqual(gg.GATED_CORE_SUBDOMAINS, ("traefik", "hub", "directory", "people", "metrics"))
+        self.assertNotIn("enroll.example.com", gg.gated_core_hosts())
+        # Still a core host: no app (Hub entry) can take the name.
+        self.assertIn("enroll.example.com", gg.core_hosts())
+        write_policy({"groups": {"enroll.example.com": "users_x"}, "hosts": {"enroll.example.com": "standard"}})
+        self.assertEqual(self.req("enroll.example.com", groups="users_x"), 403)
+        self.assertIsNotNone(gg.validate_policy_doc({**BASE, "core": dict(BASE["core"], **{"enroll.example.com": "standard"})}))
+
+    # ── the opened log (contract §4 "Opened log") ──
+
+    def opened_lines(self):
+        out = []
+        d = os.path.join(self.log_dir, "opened")
+        for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+            with open(os.path.join(d, name)) as f:
+                out += [(name, json.loads(line)) for line in f if line.strip()]
+        return out
+
+    def test_opened_log_first_request_per_session_host(self):
+        portal = os.path.join(TMP, "portal-apps.json")
+        with open(portal, "w") as f:
+            json.dump({"version": 1, "apps": [{"id": "g", "name": "Grafana", "access_group": "",
+                                               "urls": [{"label": "x", "url": "https://grafana.example.com/"}]}]}, f)
+        self.addCleanup(os.unlink, portal)
+        old = gg.PORTAL_FILE
+        gg.PORTAL_FILE = portal
+        self.addCleanup(setattr, gg, "PORTAL_FILE", old)
+        ua = "Mozilla/5.0 \x01" + "x" * 400
+        extra = {"X-Real-Ip": "203.0.113.7", "User-Agent": ua}
+        claims = {"sid": "sid-1", "auth_time": 1700000000}
+        for _ in range(3):
+            self.assertEqual(self.page(amr=["hwk", "spk"], claims=claims, extra=extra)[0], 200)
+        lines = self.opened_lines()
+        self.assertEqual(len(lines), 1)
+        name, line = lines[0]
+        self.assertRegex(name, r"^\d{4}-\d{2}-\d{2}\.jsonl$")
+        self.assertEqual(set(line), {"time", "user", "session", "host", "app", "methods", "ip", "ua", "act"})
+        self.assertRegex(line["time"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertEqual(name, line["time"][:10] + ".jsonl")
+        self.assertEqual({k: v for k, v in line.items() if k not in ("time", "ua")},
+                         {"user": "bob", "session": "sid-1", "host": "grafana.example.com", "app": "Grafana",
+                          "methods": ["passkey_synced", "security_key"], "ip": "203.0.113.7", "act": ""})
+        self.assertEqual(line["ua"], ("Mozilla/5.0 " + "x" * 400)[:256])
+        self.assertEqual(len(line["ua"]), 256)
+        # Another host: a second line (the app's name falls back to the host).
+        self.assertEqual(self.page(host="random.example.com", groups="", amr=["hwk"], claims=claims, extra=extra)[0], 200)
+        lines = self.opened_lines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual((lines[1][1]["host"], lines[1][1]["app"]), ("random.example.com", "random.example.com"))
+        # No sid: <user>@<auth_time>; the portal logs too; a denied
+        # request never does.
+        self.assertEqual(self.page(host="example.com", groups="", gate_path="/portal",
+                                   claims={"auth_time": 1700000001}, user="Bob")[0], 200)
+        self.assertEqual(self.page(groups="users_x", claims={"sid": "sid-2"})[0], 403)
+        lines = self.opened_lines()
+        self.assertEqual(len(lines), 3)
+        self.assertEqual((lines[2][1]["session"], lines[2][1]["host"], lines[2][1]["user"]),
+                         ("bob@1700000001", "example.com", "bob"))
+        # Never a token or any other header.
+        with open(os.path.join(self.log_dir, "opened", name)) as f:
+            text = f.read()
+        self.assertNotIn("eyJ", text)
+        # Modes the Hub expects: opened/ 2770 with its group, files 0640.
+        st = os.stat(os.path.join(self.log_dir, "opened"))
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o2770)
+        self.assertEqual(st.st_gid, os.getgid())
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.log_dir, "opened", name)).st_mode), 0o640)
+        # An unwritable directory: the request is still allowed, the
+        # failure counted.
+        blocker = os.path.join(self.log_dir, "file")
+        with open(blocker, "w") as f:
+            f.write("x")
+        gg.OPENED_LOG = gg.OpenedLog(os.path.join(blocker, "opened"), gid=os.getgid())
+        before = gg.METRICS.get("group_gate_opened_log_failures_total")
+        self.assertEqual(self.page(amr=["hwk"], claims={"sid": "sid-3"})[0], 200)
+        self.assertEqual(gg.METRICS.get("group_gate_opened_log_failures_total"), before + 1)
+        # Not remembered: the next request tries again.
+        self.assertEqual(self.page(amr=["hwk"], claims={"sid": "sid-3"})[0], 200)
+        self.assertEqual(gg.METRICS.get("group_gate_opened_log_failures_total"), before + 2)
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/metrics") as r:
+            self.assertIn("group_gate_opened_log_failures_total", r.read().decode())
+
+    def test_opened_log_lru_and_bounds(self):
+        log = gg.OpenedLog(os.path.join(self.log_dir, "opened"), capacity=2, gid=os.getgid())
+        for sid in ("a", "b", "a", "c", "a", "b"):
+            log.record("bob", sid, "h.example.com", "H", ["security_key"], "", "")
+        # LRU of 2: the repeated "a" is remembered (and refreshed), so "c"
+        # evicts "b", which then logs again.
+        sessions = [ln["session"] for _, ln in self.opened_lines()]
+        self.assertEqual(sessions, ["a", "b", "c", "b"])
+        # Never raises, whatever it's given; a full day file stops growing.
+        log.record(None, "x", None, None, None, None, None)
+        log.record("bob", "\n\x00", "h", "H", ["nope", "password"], "1.2.3.4\n", "ua ")
+        small = gg.OpenedLog(os.path.join(self.log_dir, "opened"), gid=os.getgid())
+        small.DAY_FILE_MAX = 1
+        before = gg.METRICS.get("group_gate_opened_log_failures_total")
+        small.record("bob", "z", "h.example.com", "H", [], "", "")
+        self.assertEqual(gg.METRICS.get("group_gate_opened_log_failures_total"), before + 1)
+        for _, ln in self.opened_lines():
+            self.assertNotIn("\n", ln["session"] + ln["ip"] + ln["ua"])
+            self.assertEqual(ln["methods"], [m for m in gg.METHOD_IDS if m in ln["methods"]])
+        # A symlinked day file is never written through.
+        d = os.path.join(self.log_dir, "opened")
+        target = os.path.join(self.log_dir, "target")
+        open(target, "w").close()
+        day = datetime.datetime(2030, 1, 2, tzinfo=datetime.timezone.utc)
+        os.symlink(target, os.path.join(d, "2030-01-02.jsonl"))
+        log.record("bob", "s", "h.example.com", "H", [], "", "", now=day)
+        self.assertEqual(os.path.getsize(target), 0)
+
+    # ── links (contract §5, §10) ──
+
+    def test_pages_link_to_signin_page(self):
+        signin = "https://people.example.com/signin"
+        b = gg.render_needs_page("App", set(), {"op": "all", "items": ["passkey_device", "security_key"]}, set(),
+                                 True, "example.com").decode()
+        hrefs = re.findall(r'<a id="([^"]+)"[^>]*href="([^"]*)"', b)
+        self.assertEqual(dict(hrefs), {"portcullis-set-up-passkey": signin, "portcullis-set-up-security-key": signin,
+                                       "portcullis-sign-in-methods": signin})
+        self.assertNotIn("account-security", b)
+        # Through the gate.
+        write_policy({"hosts": {"grafana.example.com": "strong"}, "people": {"bob": ["passkey_synced"]}, "add_stronger": True})
+        code, hdrs, body = self.page(amr=["spk"])
+        self.assertIn(f'href="{signin}"', body)
+        self.assertIn("Set up a security key", body)
+
+    def test_no_enroll_links(self):
+        for groups in (set(), {"lldap_admin"}):
+            b = gg.render_portal("bob", groups, [], "example.com").decode()
+            self.assertNotIn("enroll.", b)
+            self.assertNotIn("/self", b)
+            self.assertIn('href="https://people.example.com/"', b)
+            self.assertIn('<a href="https://people.example.com/signin">Sign-in methods</a>', b)
+        b = gg.render_portal("bob", {"lldap_admin"}, [], "example.com").decode()
+        for href in ("https://hub.example.com/", "https://auth.example.com/admin/portcullis/console/",
+                     "https://traefik.example.com/"):
+            self.assertIn(f'href="{href}"', b)
+        self.assertNotIn("traefik.example.com", gg.render_portal("bob", set(), [], "example.com").decode())
 
 
 class JwtClaimsTest(unittest.TestCase):

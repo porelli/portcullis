@@ -271,7 +271,8 @@ func snapshot(f *config.File) *config.Snapshot {
 }
 
 func peopleTools() []string {
-	return []string{"my_apps", "invite_person", "update_person", "delete_person"}
+	return []string{"my_apps", "invite_person", "update_person", "delete_person",
+		"person_sign_in", "revoke_person_certificate", "remove_passkeys"}
 }
 
 func newHarness(t *testing.T, f *config.File, ups map[string]*fakeUp, tweak func(c *Config)) *harness {
@@ -805,14 +806,15 @@ func TestAggregateNeverHasAdminTools(t *testing.T) {
 	cs := h.connect("root", "2026-07-28", "", nil)
 	got := names(toolMap(t, cs))
 	for _, n := range got {
-		if strings.Contains(n, "delete_instance") || strings.Contains(n, "invite_person") || strings.Contains(n, "update_person") || strings.Contains(n, "delete_person") {
+		if strings.Contains(n, "delete_instance") || slices.ContainsFunc(delegateTools, func(d string) bool { return strings.Contains(n, d) }) {
 			t.Errorf("listed %s", n)
 		}
 	}
 	if !slices.Contains(got, "portcullis__my_apps") {
 		t.Errorf("no people tool: %v", got)
 	}
-	for _, name := range []string{"portcullis__invite_person", "portcullis__update_person", "portcullis__delete_person", "portcullis__delete_instance"} {
+	for _, name := range []string{"portcullis__invite_person", "portcullis__update_person", "portcullis__delete_person",
+		"portcullis__person_sign_in", "portcullis__revoke_person_certificate", "portcullis__remove_passkeys", "portcullis__delete_instance"} {
 		r, err := cs.CallTool(ctx20(t), &sdk.CallToolParams{Name: name})
 		if err == nil && !r.IsError {
 			t.Errorf("%s answered", name)

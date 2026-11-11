@@ -12,13 +12,15 @@ Checks, run in order:
          comments; written by `portcullis cert revoke|sync`), re-read whenever it
          changes. Missing file = none revoked; unreadable file = requests
          that present a cert are denied (fail closed).
-       - GATE_CRL_URL (Vault's full DER CRL, http://vault:8200/v1/pki_int/crl)
-         and GATE_DELTA_CRL_URL (its delta CRL, .../pki_int/crl/delta: with
+       - GATE_CRL_URLS (space-separated: Vault's full DER CRLs of both
+         intermediates, http://vault:8200/v1/pki_int/crl and .../pki_file/crl)
+         and GATE_DELTA_CRL_URLS (their delta CRLs, .../crl/delta: with
          auto_rebuild Vault puts new revocations only there until the next
          full rebuild), re-fetched every GATE_CRL_REFRESH_SECONDS (default
-         60) in the background; the union is enforced. Fetch errors keep
-         the last good CRL (fail open on Vault outages — the serial file
-         still applies).
+         60) in the background; the union of all of them and the file is
+         enforced. Until every list has been read once no certificate counts
+         as a sign-in method; after that, fetch errors keep the last good
+         CRL (the serial file still applies).
      Traefik's entrypoint deletes client-supplied X-Forwarded-Tls-Client-*
      headers, so the header only ever describes a cert Traefik verified.
   1. Sign-in template (policy file v6; checked LAST, after 2. and 3., so a
@@ -28,19 +30,27 @@ Checks, run in order:
      values mapped through the method table (AMR_TO_METHOD), kept only
      while the method is switched on (`methods`). If not, 403 with one of
      three pages (contract §5), never an automatic redirect:
-       - present-certificate (#present-certificate): amr holds mtls and the
-         rule would be met if the YubiKey certificate counted, but this
-         request carries no bound certificate;
+       - present-certificate (#present-certificate): amr holds mtls (file)
+         and the rule would be met if the YubiKey (browser) certificate
+         counted, but this request carries no bound certificate of that kind;
        - step-up (#stepup-continue, X-Stepup-URL): one missing method can
          be completed — /oauth2/start?pc_method=<method> (a setup-link
          session, amr `inv`, counts as not known in `people`);
        - needs-stronger (#needs-stronger): nothing can be completed here.
-     mTLS binding: `yubikey_cert` (amr mtls) counts only when the CURRENT
-     request presents a client cert (checked for revocation in step 0)
-     whose subject CN equals the session user (the LLDAP username from
+     Certificate binding: `yubikey_cert` (amr mtls) counts only when the
+     CURRENT request presents a YubiKey certificate, and `browser_cert`
+     (amr file) only with a browser certificate: the leaf's issuer CN must
+     be the subject CN of GATE_YUBIKEY_CA_FILE (pki_int) or
+     GATE_BROWSER_CA_FILE (pki_file) — equal CNs or an unreadable file: no
+     certificate counts —, it passed the revocation check in step 0, and
+     its subject CN equals the session user (the LLDAP username from
      X-Auth-Request-Preferred-Username, which must also match the token's
      preferred_username) — the token alone may have been obtained with a
-     cert that has since been revoked.
+     certificate that has since been revoked.
+     Sign-in paths: on people.<domain> the Sign-in page's own paths
+     (/signin, /api/me/signin, /api/me/signin/*, /static/*: every
+     normalised reading of the path inside that set) take "any switched-on
+     method" instead of the people template (contract §4).
   2. Group — does the user belong to the host's required LLDAP group
      (users_<app>)? If not, 403. The reserved group
      __portcullis_deny__ (published by the Hub for apps whose config is
@@ -55,9 +65,6 @@ Checks, run in order:
 
 Request paths on group-gate itself (the forwardAuth `address`):
   /                     full checks (portcullis-groups@docker)
-  /authenticated[/...]  everything except the host group check (step 2):
-                        any authenticated user. Used for self-service routes
-                        such as enroll.<domain>/self (portcullis-self@docker).
   /public-guard         public exceptions (portcullis-public-guard@docker, on
                         the Hub's portcullis-public-<instance> routers, no
                         forward-auth): no user, no group, no policy. Allows
@@ -75,13 +82,19 @@ Request paths on group-gate itself (the forwardAuth `address`):
                         policy load errors, CRL freshness (last good fetch,
                         the CRL's nextUpdate), revoked-serial counts. Only
                         reachable on the internal `portcullis` network —
-                        Traefik's forwardAuth always calls / or /authenticated.
+                        Traefik's forwardAuth always calls /.
+
+The opened log: every allowed request on / and /portal whose (session,
+host) this process hasn't logged yet appends a line to
+GATE_OPENED_DIR/<YYYY-MM-DD>.jsonl (OpenedLog; the Hub's sign-in history
+reads it). A failed write is counted, never a deny.
 
 Config sources (both re-read on every request; they are tiny):
   - /etc/group-gate/map.conf — <sub>=required_group, expanded to
     <sub>.<PORTCULLIS_DOMAIN> (`*` = any signed-in user, valid only
     there). Authoritative for the core hosts (<domain> itself and
-    auth, traefik, hub, directory, enroll, people, metrics, mcp . <domain>):
+    auth, traefik, hub, directory, enroll, people, metrics, mcp . <domain>;
+    enroll is reserved but not gated):
     the Hub policy file can never override those.
   - /hub-data/group-gate-policy.json — written by the Hub (contract §4):
       {"version": 6,
@@ -117,7 +130,7 @@ Config sources (both re-read on every request; they are tiny):
     {"version": 2, "fields": {"<field>": "<Header-Name>"},
      "users": {"<user>": {"<field>": ["value", ...]}},
      "hosts": {"<host>": {"<Header-Name>": {"<user>": "value"}}}}. Every
-    allow on / and /authenticated returns X-Forwarded-Attr-<Header-Name>
+    allow on / returns X-Forwarded-Attr-<Header-Name>
     for the user's fields: control characters stripped, values over 1 KB
     dropped (logged), `%` -> `%25` and `,` -> `%2C` in each value, values
     joined with ", ". On the request's (normalised) host it also returns
@@ -155,12 +168,14 @@ We only decode the payload to read the amr/preferred_username claims.
 from __future__ import annotations
 
 import base64
+import collections
 import datetime
 import hashlib
 import html
 import json
 import os
 import re
+import stat
 import threading
 import time
 import urllib.parse
@@ -176,8 +191,18 @@ POLICY_FILE = os.environ.get("GATE_POLICY_FILE", "/hub-data/group-gate-policy.js
 MAP_FILE = os.environ.get("GATE_MAP_FILE", "/etc/group-gate/map.conf")
 DOMAIN = os.environ.get("PORTCULLIS_DOMAIN", "").strip().lower().rstrip(".")
 REVOKED_FILE = os.environ.get("GATE_REVOKED_FILE", "/etc/group-gate/revocation/revoked-serials.txt")
-CRL_URL = os.environ.get("GATE_CRL_URL", "").strip()
-DELTA_CRL_URL = os.environ.get("GATE_DELTA_CRL_URL", "").strip()
+# Space-separated (contract §4 "Revocation lists"): the pki_int and pki_file
+# full CRLs, and their delta CRLs.
+CRL_URLS: List[str] = os.environ.get("GATE_CRL_URLS", "").split()
+DELTA_CRL_URLS: List[str] = os.environ.get("GATE_DELTA_CRL_URLS", "").split()
+# The two intermediates' certificates (contract §4 "Certificate binding"):
+# a leaf's issuer CN says which kind it is.
+YUBIKEY_CA_FILE = os.environ.get("GATE_YUBIKEY_CA_FILE", "/etc/group-gate/ca/yubikey-ca.crt")
+BROWSER_CA_FILE = os.environ.get("GATE_BROWSER_CA_FILE", "/etc/group-gate/ca/browser-ca.crt")
+# The opened log (contract §4 "Opened log"): <dir>/<YYYY-MM-DD>.jsonl.
+OPENED_DIR = os.environ.get("GATE_OPENED_DIR", "/data/opened")
+# The Hub's gid: opened/ is 2770 with this group, its files 0640.
+OPENED_GID = int(os.environ.get("GATE_OPENED_GID", "10001"))
 CRL_REFRESH_SECONDS = float(os.environ.get("GATE_CRL_REFRESH_SECONDS", "60"))
 CERT_INFO_HEADER = "X-Forwarded-Tls-Client-Cert-Info"
 
@@ -263,7 +288,9 @@ TEMPLATE_ID_RE = re.compile(r"[a-z][a-z0-9-]{0,31}|collision\.[1-9][0-9]*")
 # apex, the portal). `auth` (the Keycloak admin console's router) takes the
 # Hub's template (`core["hub.<domain>"]`); `mcp` never reaches group-gate
 # (mcp-gate authorizes).
-GATED_CORE_SUBDOMAINS = ("traefik", "hub", "directory", "enroll", "people", "metrics")
+# `enroll` is a core subdomain (reserved against apps) but not gated: its
+# one router (setup links, /invite/*) has no forward-auth (contract §4).
+GATED_CORE_SUBDOMAINS = ("traefik", "hub", "directory", "people", "metrics")
 
 
 def gated_core_hosts() -> FrozenSet[str]:
@@ -422,27 +449,41 @@ def alternatives(node) -> List[FrozenSet[str]]:
     return [frozenset(m for m in METHOD_IDS if mask >> _RANK[m] & 1) for mask in _alternative_masks(node)]
 
 
-def session_methods(amr: list, enabled: set, cert_bound: bool) -> set:
+# The certificate methods, strongest first, and the amr each one's
+# sign-in leaves in the token (contract §4 "Certificate binding").
+CERT_METHODS = ("yubikey_cert", "browser_cert")
+CERT_AMR = {"yubikey_cert": "mtls", "browser_cert": "file"}
+
+
+def session_methods(amr: list, enabled: set, bound: set) -> set:
     """The session's methods (contract §8.1 "Session methods"): each amr
     value through AMR_TO_METHOD (`inv` and unknown values count as
-    nothing), kept only while switched on; `yubikey_cert` only with the
-    mTLS binding on this request (`cert_bound`)."""
+    nothing), kept only while switched on; a certificate method only when
+    this request binds it (`bound`: the certificate methods the presented
+    leaf binds, cert_method() — at most one)."""
     out = set()
     for value in amr if isinstance(amr, list) else []:
         m = AMR_TO_METHOD.get(value) if isinstance(value, str) else None
-        if m and m in enabled and (m != "yubikey_cert" or cert_bound):
+        if m and m in enabled and (m not in CERT_METHODS or m in bound):
             out.add(m)
     return out
 
 
-def choose_stepup(node, have: set, set_up: Optional[set], amr_mtls: bool = False) -> Optional[str]:
+def held_cert_methods(amr: list) -> FrozenSet[str]:
+    """The certificate methods whose amr the session's token holds."""
+    values = amr if isinstance(amr, list) else []
+    return frozenset(m for m in CERT_METHODS if CERT_AMR[m] in values)
+
+
+def choose_stepup(node, have: set, set_up: Optional[set], held: FrozenSet[str] = frozenset()) -> Optional[str]:
     """The method a step-up asks for (contract §5), or None (the
     needs-stronger page).
 
     Candidates: for each alternative, in the rule's order, that lacks
     exactly one method, that method — only ones the person has set up when
-    `people` knows them (`set_up` not None), any when it doesn't — never
-    `yubikey_cert` while the session's amr already holds mtls (that is the
+    `people` knows them (`set_up` not None), any when it doesn't — never a
+    certificate method whose amr the session already holds (`held`:
+    `yubikey_cert` with mtls, `browser_cert` with file; that is the
     present-certificate page). Choice: the first candidate; with the person
     unknown and two or more passkey-kind candidates, `passkey`."""
     candidates: List[str] = []
@@ -451,7 +492,7 @@ def choose_stepup(node, have: set, set_up: Optional[set], amr_mtls: bool = False
         if len(missing) != 1:
             continue
         (m,) = missing
-        if (m == "yubikey_cert" and amr_mtls) or (set_up is not None and m not in set_up):
+        if m in held or (set_up is not None and m not in set_up):
             continue
         if m not in candidates:
             candidates.append(m)
@@ -672,14 +713,14 @@ def render_portal(user: str, groups: set, apps, domain: str, domains=()) -> byte
         app_html = "<ul class=\"grid\">" + "".join(cards) + "</ul>"
     else:
         app_html = "<p class=\"muted\">No apps are available to you yet.</p>"
-    own = [("People (directory)", f"https://people.{domain}/"),
-           ("My passkeys", f"https://auth.{domain}/realms/portcullis/account/account-security/signing-in"),
-           ("My client certificate", f"https://enroll.{domain}/self")]
+    # Contract §10: People and Sign-in methods for everyone; the Hub, the
+    # Keycloak realm console and Traefik for admins. No enrollment link.
+    own = [("People", f"https://people.{domain}/"),
+           ("Sign-in methods", f"https://people.{domain}/signin")]
     admin = []
     if "lldap_admin" in groups:
         admin = [("Hub (apps, users &amp; marketplace)", f"https://hub.{domain}/"),
                  ("Keycloak (realm console)", f"https://auth.{domain}/admin/portcullis/console/"),
-                 ("Certificates", f"https://enroll.{domain}/"),
                  ("Traefik", f"https://traefik.{domain}/")]
     def ul(items):
         return "<ul class=\"plain\">" + "".join(f'<li><a href="{e(u)}">{t}</a></li>' for t, u in items) + "</ul>"
@@ -1076,6 +1117,35 @@ def normalize_path_candidates(raw_uri: str) -> List[str]:
     return out
 
 
+# The Sign-in page's paths on people.<domain> (contract §4 "Sign-in
+# paths"): exactly these, or under these prefixes.
+SIGNIN_EXACT = ("/signin", "/api/me/signin")
+SIGNIN_PREFIXES = ("/api/me/signin/", "/static/")
+_ENCODED_SEPARATOR_RE = re.compile(r"%(2[fF]|5[cC])")
+
+
+def signin_path(host: str, raw_path: str) -> bool:
+    """True when the request is for the Sign-in page on people.<main
+    domain> (the one host it lives on): normalize_path_candidates(raw_path)
+    doesn't raise and EVERY candidate it returns is exactly /signin or
+    /api/me/signin, or under /api/me/signin/ or /static/. Anything else —
+    another host, a path with an encoded '/' or '\\' or a literal '\\',
+    a '..' leaving the set in any reading — is not (the host's template
+    applies)."""
+    if not DOMAIN_OK or host != f"people.{DOMAIN}":
+        return False
+    path = (raw_path or "").split("?", 1)[0]
+    if "\\" in path or _ENCODED_SEPARATOR_RE.search(path):
+        return False
+    try:
+        candidates = normalize_path_candidates(raw_path)
+    except PathError:
+        return False
+    return bool(candidates) and all(
+        c in SIGNIN_EXACT or any(c.startswith(p) and len(c) > len(p) for p in SIGNIN_PREFIXES)
+        for c in candidates)
+
+
 def _prefix_matches(path: str, prefix: str) -> bool:
     if prefix == "/":
         return True
@@ -1387,11 +1457,12 @@ class Metrics:
     """Tiny thread-safe counter registry (no client library in the image)."""
 
     HELP = {
-        "group_gate_requests_total": ("counter", "Forward-auth decisions by endpoint (gate|authenticated|public_guard|portal) and result (allow|deny|stepup|needs_stronger|present_certificate)."),
+        "group_gate_requests_total": ("counter", "Forward-auth decisions by endpoint (gate|public_guard|portal) and result (allow|deny|stepup|needs_stronger|present_certificate)."),
         "group_gate_denials_total": ("counter", "Denied requests by reason."),
         "group_gate_stepups_total": ("counter", "Sign-in pages (403) by reason: stepup, present_certificate, needs_stronger."),
         "group_gate_policy_load_errors_total": ("counter", "Requests denied because the Hub policy file or a policy in it is invalid."),
         "group_gate_crl_fetch_failures_total": ("counter", "Failed CRL fetches (the last good CRL is kept)."),
+        "group_gate_opened_log_failures_total": ("counter", "Opened-log lines that couldn't be written (the request is still answered)."),
     }
 
     def __init__(self):
@@ -1424,7 +1495,8 @@ class Metrics:
             lines += [f"# HELP {name} {help_text}", f"# TYPE {name} {mtype}"]
             series = sorted((k[1], v) for k, v in values.items() if k[0] == name)
             if not series and mtype == "counter" and name in ("group_gate_policy_load_errors_total",
-                                                               "group_gate_crl_fetch_failures_total"):
+                                                               "group_gate_crl_fetch_failures_total",
+                                                               "group_gate_opened_log_failures_total"):
                 series = [((), 0)]
             lines += [self._fmt(name, labels, v) for labels, v in series]
         crl = CRL_CACHE
@@ -1448,6 +1520,148 @@ class Metrics:
 
 
 METRICS = Metrics()
+
+
+# ── The opened log (contract §4 "Opened log", §8.2) ───────────────────
+
+_LOG_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def _log_field(value, limit: int) -> str:
+    """A string field of a log line: control characters removed, at most
+    `limit` characters."""
+    return _LOG_CTRL_RE.sub("", value if isinstance(value, str) else "")[:limit]
+
+
+class OpenedLog:
+    """group-gate's "app opened" log: the first allowed request per
+    (session, host) this process sees appends one JSON line to
+    <directory>/<YYYY-MM-DD>.jsonl (UTC day), which the Hub reads
+    (internal/signinhistory/opened.go) and prunes.
+
+    - Remembered (session, host) pairs sit in an LRU of `capacity`; a pair
+      is remembered only once its line is written, so a failed write is
+      tried again on the next request.
+    - Append-only: each line is one write(2) on an O_APPEND descriptor
+      opened per line (O_NOFOLLOW: a symlink is never written through) —
+      nothing is buffered across requests and a line is never torn by
+      another writer.
+    - Bounded: every field is cut (ua ≤ 256 characters) and a day file
+      stops growing at DAY_FILE_MAX bytes (later lines count as failures).
+    - Modes: the directory is 2770 with group `gid` (the Hub's), each file
+      0640. The directory's parent must exist (the group_gate_data volume).
+    - Never raises: a failure is logged (once per distinct error) and
+      counted (group_gate_opened_log_failures_total), never a deny.
+    - Holds no secret: no token, cookie or header but the User-Agent.
+    """
+
+    DAY_FILE_MAX = 32 << 20
+    FIELD_MAX = 256
+
+    def __init__(self, directory: str, capacity: int = 10000, gid: Optional[int] = None):
+        self.directory = directory
+        self.capacity = max(int(capacity), 1)
+        self.gid = OPENED_GID if gid is None else gid
+        self._seen: "collections.OrderedDict[Tuple[str, str], None]" = collections.OrderedDict()
+        self._lock = threading.Lock()
+        self._dir_ok = False
+        self._last_error: Optional[str] = None
+
+    def seen(self, session: str, host: str) -> bool:
+        """The pair already has its line (the LRU's view)."""
+        with self._lock:
+            return (session, host) in self._seen
+
+    def _ensure_dir(self):
+        if self._dir_ok:
+            return
+        try:
+            os.mkdir(self.directory, 0o2770)
+        except FileExistsError:
+            pass
+        st = os.lstat(self.directory)
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(f"{self.directory} is not a directory")
+        if st.st_gid != self.gid:
+            os.chown(self.directory, -1, self.gid, follow_symlinks=False)
+        if stat.S_IMODE(st.st_mode) != 0o2770:
+            # mkdir's mode is cut by the umask and may drop the setgid bit.
+            # (lstat said it's a real directory, not a symlink.)
+            os.chmod(self.directory, 0o2770)
+        self._dir_ok = True
+
+    def _write(self, now: datetime.datetime, line: bytes):
+        self._ensure_dir()
+        path = os.path.join(self.directory, now.strftime("%Y-%m-%d") + ".jsonl")
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(path, flags, 0o640)
+        except OSError:
+            self._dir_ok = False  # re-check the directory next time
+            raise
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise OSError(f"{path} is not a regular file")
+            if st.st_size + len(line) > self.DAY_FILE_MAX:
+                raise OSError(f"{path} reached {self.DAY_FILE_MAX} bytes")
+            if stat.S_IMODE(st.st_mode) != 0o640:
+                os.fchmod(fd, 0o640)
+            if st.st_gid != self.gid:
+                os.fchown(fd, -1, self.gid)
+            if os.write(fd, line) != len(line):
+                raise OSError(f"short write to {path}")
+        finally:
+            os.close(fd)
+
+    def record(self, user, session, host, app, methods, ip, ua, act="", now: Optional[datetime.datetime] = None) -> None:
+        """Append the line for (session, host) unless this process already
+        wrote it. Never raises."""
+        try:
+            session = _log_field(session, self.FIELD_MAX)
+            host = _log_field(host, 253).lower()
+            if not session or not host:
+                return
+            key = (session, host)
+            with self._lock:
+                if key in self._seen:
+                    self._seen.move_to_end(key)
+                    return
+                now = (now or datetime.datetime.now(datetime.timezone.utc)).astimezone(datetime.timezone.utc)
+                doc = {"time": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                       "user": _log_field(user, self.FIELD_MAX).lower(),
+                       "session": session, "host": host,
+                       "app": _log_field(app, self.FIELD_MAX),
+                       "methods": [m for m in METHOD_IDS if m in set(methods or ())],
+                       "ip": _log_field(ip, 64), "ua": _log_field(ua, self.FIELD_MAX),
+                       "act": _log_field(act, self.FIELD_MAX)}
+                line = (json.dumps(doc, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+                self._write(now, line)
+                self._seen[key] = None
+                while len(self._seen) > self.capacity:
+                    self._seen.popitem(last=False)
+                self._last_error = None
+        except Exception as e:  # noqa: BLE001 — logging never denies a request
+            METRICS.inc("group_gate_opened_log_failures_total")
+            err = f"{type(e).__name__}: {e}"
+            if err != self._last_error:
+                print(f"group-gate: opened log write failed ({err})", flush=True)
+            self._last_error = err
+
+
+OPENED_LOG = OpenedLog(OPENED_DIR)
+
+
+def log_session_id(claims: dict, user: str) -> str:
+    """The opened log's `session`: the token's `sid`, else
+    <user>@<auth_time>; "" when the token has neither."""
+    sid = claims.get("sid")
+    if isinstance(sid, str) and sid.strip():
+        return sid.strip()
+    auth_time = claims.get("auth_time")
+    if type(auth_time) is int and user:
+        return f"{user.lower()}@{auth_time}"
+    return ""
 
 
 # ── Client-certificate revocation ─────────────────────────────────────
@@ -1551,25 +1765,35 @@ class CrlSource:
 
 
 class CrlCache:
-    """Background-refreshed revoked serials from Vault's CRLs.
+    """Background-refreshed revoked serials from Vault's CRLs: both
+    intermediates' (pki_int, the YubiKey certificates; pki_file, the browser
+    certificates), each a full and a delta CRL (contract §4 "Revocation
+    lists").
 
-    Vault (pki_int/config/crl auto_rebuild=true) does NOT rebuild the full
-    CRL on revoke: new revocations appear in the delta CRL (enable_delta,
-    rebuilt about once a minute) until the next full rebuild, which then
-    clears the delta. So both are fetched and the union is enforced.
+    Vault (config/crl auto_rebuild=true) does NOT rebuild the full CRL on
+    revoke: new revocations appear in the delta CRL (enable_delta, rebuilt
+    about once a minute) until the next full rebuild, which then clears the
+    delta. So every list is fetched and the union is enforced.
 
-    Order: delta first, then full. A full rebuild between the two fetches
-    can then only move a serial from the (already fetched) delta into the
-    (about to be fetched) full CRL — never out of both.
+    Order: every delta first, then every full CRL. A full rebuild between
+    the two fetches can then only move a serial from the (already fetched)
+    delta into the (about to be fetched) full CRL — never out of both.
 
     Freshness for /metrics is the WORST of the sources: oldest successful
-    fetch, earliest nextUpdate.
+    fetch, earliest nextUpdate. `ready`: every list has been read at least
+    once — until then no certificate counts as a sign-in method (an
+    unreadable CRL list fails closed); afterwards a failed fetch keeps the
+    last good list.
     """
 
-    def __init__(self, url: str, interval: float, delta_url: str = ""):
-        self.sources = ([CrlSource(delta_url)] if delta_url else []) + [CrlSource(url)]
-        self.url = url
+    def __init__(self, urls: List[str], interval: float, delta_urls: List[str] = ()):
+        self.sources = [CrlSource(u) for u in delta_urls] + [CrlSource(u) for u in urls]
+        self.urls = list(urls)
         self.interval = max(interval, 1.0)
+
+    @property
+    def ready(self) -> bool:
+        return all(src.last_success > 0 for src in self.sources)
 
     @property
     def serials(self) -> FrozenSet[int]:
@@ -1597,15 +1821,23 @@ class CrlCache:
             time.sleep(self.interval)
 
 
-CRL_CACHE: Optional[CrlCache] = (CrlCache(CRL_URL, CRL_REFRESH_SECONDS, DELTA_CRL_URL)
-                                 if CRL_URL else None)
+CRL_CACHE: Optional[CrlCache] = (CrlCache(CRL_URLS, CRL_REFRESH_SECONDS, DELTA_CRL_URLS)
+                                 if CRL_URLS or DELTA_CRL_URLS else None)
 
 
 def revoked_serials() -> FrozenSet[int]:
+    """The union of the serial file and every CRL. Raises RevocationError
+    when the serial file can't be read."""
     serials = load_revoked_file()
     if CRL_CACHE is not None:
         serials = serials | CRL_CACHE.serials
     return serials
+
+
+def crl_ready() -> bool:
+    """Every configured CRL list has been read (no lists configured: only
+    the serial file applies)."""
+    return CRL_CACHE is None or CRL_CACHE.ready
 
 
 _SERIAL_RE = re.compile(r'SerialNumber="(\d+)"')
@@ -1633,9 +1865,11 @@ _SUBJECT_RE = re.compile(r'Subject="([^"]*)"')
 
 
 def _decode_cert_info(raw: str) -> str:
+    """Traefik's header value decoded: it is Go's url.QueryEscape of the
+    text (a space is "+", a literal "+" is %2B), some versions twice."""
     value = raw or ""
     for _ in range(3):
-        decoded = urllib.parse.unquote(value)
+        decoded = urllib.parse.unquote_plus(value)
         if decoded == value:
             break
         value = decoded
@@ -1657,6 +1891,89 @@ def leaf_cert_cn(raw: str) -> Optional[str]:
         attr = attr.strip()
         if attr.startswith("CN="):
             return attr[3:]
+    return None
+
+
+# The leaf's own fields at the start of the header: Traefik writes each
+# certificate's Subject, then its Issuer (client-headers@file asks for the
+# issuer's commonName only), the leaf first.
+_LEAF_ISSUER_RE = re.compile(r'Subject="[^"]*";Issuer="([^"]*)"')
+
+
+def _dn_cn(dn: str) -> Optional[str]:
+    """The one CN of a Traefik DN text ("C=..,O=..,CN=.."); None when there
+    is none or more than one."""
+    cns = [a.strip()[3:] for a in dn.split(",") if a.strip().startswith("CN=")]
+    return cns[0] if len(cns) == 1 and cns[0] else None
+
+
+def leaf_cert_issuer_cn(raw: str) -> Optional[str]:
+    """Issuer CN of the leaf (first) cert in X-Forwarded-Tls-Client-Cert-Info,
+    or None. Only the leaf's own Issuer counts: the header must start with
+    its Subject="…";Issuer="…" (Traefik's order), so an intermediate's
+    fields later in the chain are never read as the leaf's."""
+    m = _LEAF_ISSUER_RE.match(_decode_cert_info(raw))
+    return _dn_cn(m.group(1)) if m else None
+
+
+_CA_CACHE_LOCK = threading.Lock()
+_CA_CACHE: dict = {}  # path -> ((inode, mtime, size), CN or None)
+
+
+def ca_subject_cn(path: str) -> Optional[str]:
+    """Subject CN of the CA certificate in `path` (PEM, the first block, or
+    DER), read with `cryptography` and cached by (inode, mtime, size).
+    None — no certificate counts — when the file is missing or unreadable,
+    isn't a certificate, isn't a CA (basicConstraints ca) or has no single
+    CN."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (st.st_ino, st.st_mtime_ns, st.st_size)
+    with _CA_CACHE_LOCK:
+        hit = _CA_CACHE.get(path)
+        if hit and hit[0] == key:
+            return hit[1]
+    cn: Optional[str] = None
+    try:
+        with open(path, "rb") as f:
+            data = f.read(1 << 20)
+        if data.lstrip().startswith(b"-----BEGIN"):
+            cert = x509.load_pem_x509_certificate(data)
+        else:
+            cert = x509.load_der_x509_certificate(data)
+        if cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca:
+            names = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+            if len(names) == 1 and isinstance(names[0].value, str) and names[0].value:
+                cn = names[0].value
+    except Exception as e:  # noqa: BLE001 — any failure: the file doesn't count
+        print(f"group-gate: CA file {path} can't be used ({type(e).__name__}: {e}): "
+              f"no certificate of its kind counts", flush=True)
+        cn = None
+    with _CA_CACHE_LOCK:
+        _CA_CACHE[path] = (key, cn)
+    return cn
+
+
+def cert_method(cert_info: str) -> Optional[str]:
+    """The method the presented leaf is a certificate for (contract §4
+    "Certificate binding"): "yubikey_cert" when its issuer CN is the
+    YubiKey CA's (pki_int), "browser_cert" when it is the browser CA's
+    (pki_file), else None. Both CA files must be readable and their CNs
+    different; otherwise no certificate counts (fail closed)."""
+    if not cert_info:
+        return None
+    yubikey, browser = ca_subject_cn(YUBIKEY_CA_FILE), ca_subject_cn(BROWSER_CA_FILE)
+    if yubikey is None or browser is None or yubikey == browser:
+        return None
+    issuer = leaf_cert_issuer_cn(cert_info)
+    if issuer is None:
+        return None
+    if issuer == yubikey:
+        return "yubikey_cert"
+    if issuer == browser:
+        return "browser_cert"
     return None
 
 
@@ -1774,10 +2091,10 @@ def _methods_html(methods, bold: bool = False) -> str:
     return " and ".join(f"a <b>{w}</b>" if bold else f"a {w}" for w in words)
 
 
-def account_url(domain: str) -> str:
-    """Keycloak's account console, "Signing in" (passkeys are managed on
-    the main domain only)."""
-    return f"https://auth.{domain}/realms/portcullis/account/account-security/signing-in"
+def signin_page_url(domain: str) -> str:
+    """The Sign-in page on people.<domain> (contract §5.1): every person's
+    one place for their sign-in methods."""
+    return f"https://people.{domain}/signin"
 
 
 def app_name(host: str) -> str:
@@ -1816,12 +2133,21 @@ def render_stepup_page(app: str, method: str, url: str) -> bytes:
     return _signin_page(title, f"<p><a id=\"stepup-continue\" class=\"btn\" href=\"{e_url}\" autofocus>Continue</a></p>")
 
 
-def render_certificate_page(app: str) -> bytes:
-    """The present-certificate page (#present-certificate): signing in again
-    can't help, this request must carry the person's own certificate."""
+# The present-certificate page's words per certificate method.
+CERTIFICATE_PAGE = {
+    "yubikey_cert": ("YubiKey", "Insert your YubiKey and reload this page."),
+    "browser_cert": ("browser", "Use the browser it is installed in and reload this page."),
+}
+
+
+def render_certificate_page(app: str, method: str) -> bytes:
+    """The present-certificate page (#present-certificate) for `method`
+    (yubikey_cert or browser_cert): signing in again can't help, this
+    request must carry the person's own certificate of that kind."""
+    kind, ask = CERTIFICATE_PAGE[method]
     return _signin_page(
-        f"{app} needs your YubiKey certificate",
-        "<div id=\"present-certificate\"><p>Insert your YubiKey and reload this page.</p>"
+        f"{app} needs your {kind} certificate",
+        f"<div id=\"present-certificate\"><p>{html.escape(ask)}</p>"
         "<p class=\"portcullis-sub\">A revoked certificate, or another person&#x27;s, doesn&#x27;t count.</p></div>")
 
 
@@ -1867,7 +2193,7 @@ def render_needs_page(app: str, have: set, node, set_up: Optional[set], add_stro
         signed_in = f"You signed in with {_methods_html(_canonical(have), bold=True)}."
     else:
         signed_in = f"Your sign-in doesn&#x27;t count for {e_app} yet."
-    acct = e(account_url(domain), quote=True)
+    acct = e(signin_page_url(domain), quote=True)
     links = []
     if passkey:
         links.append(f"<a id=\"portcullis-set-up-passkey\" class=\"btn\" href=\"{acct}\">Set up a passkey</a>")
@@ -1996,16 +2322,31 @@ class Handler(BaseHTTPRequestHandler):
         print(f"group-gate: {log}", flush=True)
 
     def _signin_check(self, doc: dict, host: str, kind: str, username: str,
-                      cert_info: str, cert_ok: bool) -> bool:
+                      cert_info: str, cert_ok: bool, raw_uri: str = "") -> bool:
         """The host's sign-in template (contract §4 "How group-gate
         decides"). True when the request was answered (denied, or one of
         the step-up / present-certificate / needs-stronger pages); False
-        when the session meets the template.
+        when the session meets the template (self._have / self._claims then
+        hold what the opened log records).
 
         `cert_ok`: the request's client certificate (if any) passed the
-        revocation check. `yubikey_cert` counts only when it did, its CN is
-        the session user and the token's preferred_username agrees."""
-        rule = rule_for_host(doc, host)
+        revocation check. A certificate method counts only when it did,
+        every CRL list has been read, the leaf's issuer is that method's CA
+        (cert_method), its CN is the session user and the token's
+        preferred_username agrees (contract §4 "Certificate binding").
+
+        On people.<domain>, the Sign-in page's paths (signin_path(): every
+        normalised reading of `raw_uri` inside the set) take "any
+        switched-on method" instead of the people template; no method on
+        = deny."""
+        if signin_path(host, raw_uri):
+            on = _canonical(doc["methods"])
+            rule = {"op": "any", "items": on} if on else None
+            if rule is None:
+                self._deny_policy(username, host, "no sign-in method is switched on")
+                return True
+        else:
+            rule = rule_for_host(doc, host)
         if rule is None:
             self._deny_policy(username, host, "no sign-in template for this host")
             return True
@@ -2019,20 +2360,31 @@ class Handler(BaseHTTPRequestHandler):
         amr = claims.get("amr")
         amr = amr if isinstance(amr, list) else []
         cert_cn = leaf_cert_cn(cert_info) if cert_info else None
-        cert_bound = (cert_ok and bool(cert_info) and claims.get("preferred_username") == username
-                      and cert_cn == username)
+        kind_of_cert = cert_method(cert_info) if cert_info else None
+        bound = set()
+        if (kind_of_cert and cert_ok and crl_ready() and claims.get("preferred_username") == username
+                and cert_cn == username):
+            bound = {kind_of_cert}
         enabled = set(doc["methods"])
-        have = session_methods(amr, enabled, cert_bound)
+        have = session_methods(amr, enabled, bound)
         if rule_satisfied(rule, have):
+            self._have, self._claims = have, claims
             return False
         app = app_name(host)
         what = f"user={username} host={host} amr={amr} have={_canonical(have)}"
-        amr_mtls = "mtls" in amr
-        if (amr_mtls and "yubikey_cert" in enabled and not cert_bound
-                and rule_satisfied(rule, have | {"yubikey_cert"})):
-            self._signin_answer(render_certificate_page(app), "present_certificate",
-                                f"PRESENT-CERTIFICATE {what} cert_cn={cert_cn!r} "
-                                f"token_user={claims.get('preferred_username')!r} cert_ok={cert_ok}")
+        held = held_cert_methods(amr)
+        # Present-certificate page: a certificate method the token holds,
+        # switched on, not bound on this request, that would meet the rule
+        # (alone, else together with the other held one).
+        unbound = [m for m in CERT_METHODS if m in held and m in enabled and m not in bound]
+        ask = next((m for m in unbound if rule_satisfied(rule, have | {m})), None)
+        if ask is None and unbound and rule_satisfied(rule, have | set(unbound)):
+            ask = unbound[0]
+        if ask is not None:
+            self._signin_answer(render_certificate_page(app, ask), "present_certificate",
+                                f"PRESENT-CERTIFICATE {what} method={ask} cert_kind={kind_of_cert} "
+                                f"cert_cn={cert_cn!r} token_user={claims.get('preferred_username')!r} "
+                                f"cert_ok={cert_ok} crl_ready={crl_ready()}")
             return True
         # A setup-link session (amr `inv`) is treated as not known in
         # `people` (contract §5): it has just registered a passkey the
@@ -2040,7 +2392,7 @@ class Handler(BaseHTTPRequestHandler):
         # turn the step-up into the needs-stronger page.
         set_up = None if "inv" in amr else doc["people"].get(username.lower())
         set_up = set(set_up) if set_up is not None else None
-        method = choose_stepup(rule, have, set_up, amr_mtls=amr_mtls)
+        method = choose_stepup(rule, have, set_up, held=held)
         if method is not None:
             url = stepup_url(host, method, extra=kind == "extra")
             self._signin_answer(render_stepup_page(app, method, url), "stepup",
@@ -2049,6 +2401,20 @@ class Handler(BaseHTTPRequestHandler):
         self._signin_answer(render_needs_page(app, have, rule, set_up, doc["add_stronger"], DOMAIN),
                             "needs_stronger", f"NEEDS-STRONGER {what} set_up={set_up}")
         return True
+
+    def _record_opened(self, username: str, host: str):
+        """The opened log's line for this allowed request (first per
+        (session, host)); never fails the request."""
+        try:
+            claims = getattr(self, "_claims", None) or {}
+            session = log_session_id(claims, username)
+            if not session or OPENED_LOG.seen(session, host):
+                return
+            OPENED_LOG.record(username.lower(), session, host, app_name(host), getattr(self, "_have", set()),
+                              self.headers.get("X-Real-Ip", "") or "", self.headers.get("User-Agent", "") or "")
+        except Exception as e:  # noqa: BLE001
+            METRICS.inc("group_gate_opened_log_failures_total")
+            print(f"group-gate: opened log failed ({type(e).__name__}: {e})", flush=True)
 
     def _cert_ok(self, cert_serials: List[int]) -> bool:
         """The presented certificate is not revoked (False when the
@@ -2091,6 +2457,7 @@ class Handler(BaseHTTPRequestHandler):
             self._deny_policy(user, DOMAIN, str(e))
             return
         METRICS.inc("group_gate_requests_total", endpoint="portal", result="allow")
+        self._record_opened(user, DOMAIN)
         apps, domains = load_portal_apps()
         body = render_portal(user, groups, apps, DOMAIN, domains)
         self.send_response(200)
@@ -2136,6 +2503,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # Per request (a kept-alive connection reuses the handler).
+        self._have, self._claims = set(), {}
         gate_path = urllib.parse.urlsplit(self.path).path
         if gate_path == "/metrics":
             body = METRICS.render().encode()
@@ -2159,9 +2528,8 @@ class Handler(BaseHTTPRequestHandler):
             self._endpoint = "public_guard"
             self._public_guard()
             return
-        # /authenticated: any authenticated user, no host group check.
-        authenticated_only = gate_path == "/authenticated" or gate_path.startswith("/authenticated/")
-        self._endpoint = "authenticated" if authenticated_only else "gate"
+        # Every other path: the full checks (there is no /authenticated).
+        self._endpoint = "gate"
 
         raw_host = self.headers.get("X-Forwarded-Host", "")
         host = normalize_host(raw_host)
@@ -2205,7 +2573,7 @@ class Handler(BaseHTTPRequestHandler):
                 except RevocationError as e:
                     self._deny(
                         "Access Denied",
-                        "<p>The certificate revocation list is unavailable, so client certificates "
+                        "<p>The certificate revocation list is unavailable, so certificates "
                         "cannot be accepted right now.</p>",
                         f"DENIED user={user} host={host} reason=revocation list error: {e}",
                         "revocation_unavailable",
@@ -2215,8 +2583,8 @@ class Handler(BaseHTTPRequestHandler):
                 if hit:
                     self._deny(
                         "Access Denied",
-                        "<p>Your client certificate has been <b>revoked</b>. "
-                        "Ask an administrator to re-enroll your security key.</p>",
+                        "<p>Your certificate has been <b>revoked</b>. Remove it from this browser "
+                        "(or use another YubiKey) and sign in another way.</p>",
                         f"DENIED user={user} host={host} reason=revoked client cert serial={format_serial(hit[0])}",
                         "revoked_cert",
                     )
@@ -2272,34 +2640,33 @@ class Handler(BaseHTTPRequestHandler):
                   f"(token headers withheld)", flush=True)
 
         # --- Group check ---
-        if not authenticated_only:
-            required_group = gate.get(host)
-            if required_group == DENY_GROUP:
-                self._deny(
-                    "Access Denied",
-                    f"<p>The configuration of <b>{e_host}</b> is unavailable, so access is denied. "
-                    "Ask an administrator to check the app in the Hub.</p>",
-                    f"DENIED user={user} host={host} reason=app configuration unavailable ({DENY_GROUP})",
-                    "app_unavailable",
-                )
-                return
-            if required_group == ANY_SIGNED_IN:
-                pass  # map.conf only (people.<domain>): any signed-in user
-            elif not required_group:
-                print(f"group-gate: ALLOW-UNMAPPED user={user} host={host} (no group mapping for {host!r})", flush=True)
-            elif required_group not in groups:
-                self._deny(
-                    "Access Denied",
-                    f"<p>User <b>{e_user}</b> is not authorized to access <b>{e_host}</b>.</p>"
-                    f"<p>Required group: <code>{html.escape(required_group)}</code></p>",
-                    f"DENIED user={user} host={host} need={required_group} have={sorted(groups)}",
-                    "group",
-                )
-                return
+        required_group = gate.get(host)
+        if required_group == DENY_GROUP:
+            self._deny(
+                "Access Denied",
+                f"<p>The configuration of <b>{e_host}</b> is unavailable, so access is denied. "
+                "Ask an administrator to check the app in the Hub.</p>",
+                f"DENIED user={user} host={host} reason=app configuration unavailable ({DENY_GROUP})",
+                "app_unavailable",
+            )
+            return
+        if required_group == ANY_SIGNED_IN:
+            pass  # map.conf only (people.<domain>): any signed-in user
+        elif not required_group:
+            print(f"group-gate: ALLOW-UNMAPPED user={user} host={host} (no group mapping for {host!r})", flush=True)
+        elif required_group not in groups:
+            self._deny(
+                "Access Denied",
+                f"<p>User <b>{e_user}</b> is not authorized to access <b>{e_host}</b>.</p>"
+                f"<p>Required group: <code>{html.escape(required_group)}</code></p>",
+                f"DENIED user={user} host={host} need={required_group} have={sorted(groups)}",
+                "group",
+            )
+            return
 
         # --- Path groups (in addition to the host's group) ---
+        raw_uri = self.headers.get("X-Forwarded-Uri", "")
         if path_rules:
-            raw_uri = self.headers.get("X-Forwarded-Uri", "")
             try:
                 candidates = normalize_path_candidates(raw_uri)
             except PathError as e:
@@ -2321,15 +2688,15 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
 
-        # --- Sign-in template (every route, /authenticated included), only
-        # after the membership checks: someone outside the app's groups gets
-        # the plain 403 above, never a page naming the app's rule. A revoked
-        # certificate was denied at the start, so one still here passed the
-        # revocation check.
-        if self._signin_check(policy_doc, host, kind, username, cert_info, bool(cert_serials)):
+        # --- Sign-in template, only after the membership checks: someone
+        # outside the app's groups gets the plain 403 above, never a page
+        # naming the app's rule. A revoked certificate was denied at the
+        # start, so one still here passed the revocation check.
+        if self._signin_check(policy_doc, host, kind, username, cert_info, bool(cert_serials), raw_uri):
             return
 
         self._allow(groups_header, username, host)
+        self._record_opened(username, host)
 
     def log_message(self, fmt, *args):
         # Default per-request logs are noisy; explicit logging above.
@@ -2346,8 +2713,13 @@ if __name__ == "__main__":
         flush=True,
     )
     print(f"group-gate: static group mappings: {load_static_map()}", flush=True)
-    print(f"group-gate: revocation: file={REVOKED_FILE} crl={CRL_URL or '(disabled)'} "
-          f"delta={DELTA_CRL_URL or '(none)'} refresh={CRL_REFRESH_SECONDS:g}s", flush=True)
+    print(f"group-gate: revocation: file={REVOKED_FILE} crls={' '.join(CRL_URLS) or '(none)'} "
+          f"deltas={' '.join(DELTA_CRL_URLS) or '(none)'} refresh={CRL_REFRESH_SECONDS:g}s", flush=True)
+    if not CRL_URLS or not DELTA_CRL_URLS:
+        print("group-gate: WARNING GATE_CRL_URLS / GATE_DELTA_CRL_URLS unset: only the serial file "
+              "revokes certificates", flush=True)
+    print(f"group-gate: certificate kinds: yubikey CA={YUBIKEY_CA_FILE} ({ca_subject_cn(YUBIKEY_CA_FILE)!r}), "
+          f"browser CA={BROWSER_CA_FILE} ({ca_subject_cn(BROWSER_CA_FILE)!r}); opened log={OPENED_DIR}", flush=True)
     if CRL_CACHE is not None:
         threading.Thread(target=CRL_CACHE.run_forever, daemon=True, name="crl-refresh").start()
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
