@@ -176,6 +176,7 @@ init_run() {
   info "Restarting Traefik, the forward-auth services and Keycloak to pick up the CA chain..."
   dc restart traefik forward-auth forward-auth-ext keycloak
   signin_ca_mark
+  config_mark
   wait_healthy 300 keycloak
 
   keycloak_configure false
@@ -253,9 +254,96 @@ signin_ca_reload() {
   sum="$(_ca_bundle_sum "$bundle")"
   if [ "$(cat "$stamp" 2>/dev/null)" != "$sum" ]; then
     info "Restarting the forward-auth services to pick up the new CA bundle..."
-    dc restart forward-auth forward-auth-ext >/dev/null
+    dc restart forward-auth forward-auth-ext >/dev/null || return 1
+    printf '%s\n' "$sum" > "$stamp"
   fi
-  printf '%s\n' "$sum" > "$stamp"
+}
+
+# Repo-shipped bind-mounted config files and the services that read them only
+# at start. Changes after `git pull` need a restart to take effect.
+# Excluded:
+# - keycloak/realm-export.json: applied by `keycloak configure`, not by restart
+# - traefik/dynamic/*: Traefik's file provider watches them (--watch=true)
+# - hub_data/group-gate-policy.json: group-gate re-reads it on each request
+# - secrets/monitoring/alertmanager/alertmanager.yml: generated, monitoring_reload handles it
+
+# _config_files — list of config files to check, one per line.
+_config_files() {
+  cat <<'EOF'
+oauth2-proxy/alpha.yaml
+group-gate/group-gate-map.conf
+keycloak/themes/portcullis
+monitoring/prometheus
+monitoring/blackbox/blackbox.yml
+EOF
+}
+
+# _config_services <path> — services that read this config file at start only.
+_config_services() {
+  case "$1" in
+    oauth2-proxy/alpha.yaml) echo "forward-auth forward-auth-ext" ;;
+    group-gate/group-gate-map.conf) echo "group-gate enroll" ;;
+    keycloak/themes/portcullis) echo "keycloak" ;;
+    monitoring/prometheus) echo "prometheus" ;;
+    monitoring/blackbox/blackbox.yml) echo "blackbox" ;;
+    *) echo "" ;;
+  esac
+}
+
+# _config_hash <path> — sha256 of a file or directory (sorted files, recursive).
+_config_hash() {
+  local path="$1"
+  if [ -d "$path" ]; then
+    find "$path" -type f 2>/dev/null | sort | xargs cat 2>/dev/null | _ca_bundle_sum /dev/stdin
+  elif [ -f "$path" ]; then
+    _ca_bundle_sum "$path"
+  else
+    echo ""
+  fi
+}
+
+# config_mark — record the hashes of config files the services just started with.
+config_mark() {
+  local path stamp
+  _config_files | while IFS= read -r path; do
+    stamp="$PORTCULLIS_ROOT/secrets/.config-$(printf '%s' "$path" | tr '/' '_').loaded"
+    _config_hash "$PORTCULLIS_ROOT/$path" > "$stamp" 2>/dev/null || true
+  done
+}
+
+# config_reload — restart services when their config files differ from the last
+# recorded hashes (or none was recorded), then record the new hashes.
+config_reload() {
+  local path services stamp sum old_sum to_restart="" svc pending_stamps=""
+  while IFS= read -r path; do
+    services="$(_config_services "$path")"
+    stamp="$PORTCULLIS_ROOT/secrets/.config-$(printf '%s' "$path" | tr '/' '_').loaded"
+    sum="$(_config_hash "$PORTCULLIS_ROOT/$path")"
+    [ -n "$sum" ] || continue
+    old_sum="$(cat "$stamp" 2>/dev/null || true)"
+    if [ "$old_sum" != "$sum" ]; then
+      for svc in $services; do
+        # Deduplicate: only add if not already in the list
+        case " $to_restart " in
+          *" $svc "*) ;;
+          *) to_restart="$to_restart $svc" ;;
+        esac
+      done
+      # Record this stamp for writing after successful restart
+      pending_stamps="$pending_stamps$stamp $sum"$'\n'
+    fi
+  done < <(_config_files)
+  if [ -n "$to_restart" ]; then
+    # shellcheck disable=SC2086
+    info "Restarting services to pick up config changes:$to_restart"
+    # shellcheck disable=SC2086
+    dc restart $to_restart >/dev/null || return 1
+    # Write stamps only after successful restart
+    printf '%s' "$pending_stamps" | while IFS=' ' read -r stamp_path sum_val; do
+      [ -n "$stamp_path" ] || continue
+      printf '%s\n' "$sum_val" > "$stamp_path"
+    done
+  fi
 }
 
 stack_up() {
@@ -270,6 +358,7 @@ stack_up() {
   domains_restart_if_renewed
   monitoring_reload
   signin_ca_reload
+  config_reload
   wait_healthy 300 vault postgres lldap keycloak
   # If the service account was created or its password changed, restart the Hub
   # (which may have started with a stale/missing password).
@@ -316,7 +405,9 @@ upgrade_run() {
     # Traefik, forward-auth(-ext) and Keycloak read the CA chain only at start-up.
     dc restart traefik forward-auth forward-auth-ext keycloak >/dev/null
     signin_ca_mark
+    # config_reload will restart services for config changes and mark them
   fi
+  config_reload
   wait_healthy 300 vault postgres lldap keycloak
   keycloak_configure false
   oidc_register
