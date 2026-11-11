@@ -1945,7 +1945,8 @@ jobs:
           EX=$(kc /authentication/flows/portcullis-universal/executions)
           echo "$EX" | jq -e '[.[] | [.level, (if .authenticationFlow then .displayName else .providerId end), .requirement]]
               == [[0, "portcullis-authenticate", "REQUIRED"], [1, "auth-cookie", "ALTERNATIVE"], [1, "identity-provider-redirector", "ALTERNATIVE"],
-                  [1, "portcullis-signin", "ALTERNATIVE"], [2, "portcullis-x509", "ALTERNATIVE"], [2, "portcullis-signin-passkey", "ALTERNATIVE"],
+                  [1, "portcullis-signin", "ALTERNATIVE"], [2, "portcullis-x509", "ALTERNATIVE"], [2, "portcullis-x509", "ALTERNATIVE"],
+                  [2, "portcullis-signin-passkey", "ALTERNATIVE"],
                   [3, "portcullis-passkey", "REQUIRED"],
                   [3, "portcullis-passkey-security-key", "CONDITIONAL"], [4, "portcullis-condition-passkey-kind", "REQUIRED"], [4, "portcullis-method", "REQUIRED"],
                   [3, "portcullis-passkey-device", "CONDITIONAL"], [4, "portcullis-condition-passkey-kind", "REQUIRED"], [4, "portcullis-method", "REQUIRED"],
@@ -1954,9 +1955,24 @@ jobs:
             || { echo "FAIL: browser flow: $(echo "$EX" | jq -c '[.[] | [.level, (if .authenticationFlow then .displayName else .providerId end), .requirement]]')"; exit 1; }
           # Every reference execution keeps its method 10 h in the amr.
           for c in $(echo "$EX" | jq -r '.[] | select(.providerId // "" | IN("portcullis-x509", "portcullis-password-form", "portcullis-method")) | .authenticationConfig // "none"'); do
-            kc "/authentication/config/$c" | jq -e '(.config["default.reference.value"] | IN("mtls", "pwd", "hwk", "dpk", "spk")) and .config["default.reference.maxAge"] == "36000"' >/dev/null \
+            kc "/authentication/config/$c" | jq -e '(.config["default.reference.value"] | IN("mtls", "file", "pwd", "hwk", "dpk", "spk")) and .config["default.reference.maxAge"] == "36000"' >/dev/null \
               || { echo "FAIL: reference config $c: $(kc "/authentication/config/$c" | jq -c .config)"; exit 1; }
           done
+          # The two x509 executions (contract §8.1, sign-in part 2), in order:
+          # x509-config (YubiKey: pki_int's CA and CRLs, amr mtls), then
+          # x509-browser-config (browser: pki_file's, amr file), as configure pushed them.
+          X509=$(for c in $(echo "$EX" | jq -r '.[] | select(.providerId == "portcullis-x509") | .authenticationConfig'); do
+                   kc "/authentication/config/$c" | jq -c '{alias, m: .config["portcullis.method"], ref: .config["default.reference.value"], ca: .config["portcullis.ca"],
+                       crl: .config["x509-cert-auth.crl-relative-path"], abort: .config["x509-cert-auth-crl-abort-if-non-updated"]}'
+                 done | jq -sc .)
+          T=/opt/keycloak/conf/truststores/portcullis
+          [ "$X509" = "$(jq -nc --arg t "$T" '[{alias: "x509-config", m: "yubikey_cert", ref: "mtls", ca: "\($t)/portcullis-yubikey-ca.pem",
+                crl: "http://vault:8200/v1/pki_int/crl##http://vault:8200/v1/pki_int/crl/delta", abort: "true"},
+              {alias: "x509-browser-config", m: "browser_cert", ref: "file", ca: "\($t)/portcullis-browser-ca.pem",
+                crl: "http://vault:8200/v1/pki_file/crl##http://vault:8200/v1/pki_file/crl/delta", abort: "true"}]')" ] \
+            || { echo "FAIL: the x509 configs: $X509"; exit 1; }
+          kc /events/config | jq -e '.eventsEnabled and ((.enabledEventTypes | sort) == ["LOGIN", "LOGIN_ERROR"]) and .eventsExpiration > 0' >/dev/null \
+            || { echo "FAIL: realm events config: $(kc /events/config | jq -c '{eventsEnabled, enabledEventTypes, eventsExpiration}')"; exit 1; }
           kc /authentication/required-actions | jq -e '[.[] | select(.alias | startswith("webauthn-register")) | [.alias, .enabled]] | sort
               == [["webauthn-register", false], ["webauthn-register-passwordless", true]]' >/dev/null \
             || { echo "FAIL: required actions: webauthn-register-passwordless on, the two-factor webauthn-register off"; exit 1; }
