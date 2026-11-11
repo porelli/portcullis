@@ -1478,6 +1478,40 @@ ca_run 'set -e; signin_ca_reload'
 expect_eq "ca bundle: a failed restart keeps the old record" "$(cat "$PORTCULLIS_ROOT/certs/.ca-bundle.loaded")" "old"
 cp "$WORK/docker.ok" "$WORK/bin/docker"
 
+# ── config_reload: services restart only when their config files changed ──
+cfg_run() {
+  bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/stack.sh'; $1" >/dev/null 2>&1
+}
+cfg_restarts() { grep -- '--project-directory .* restart' "$STUB_DIR/calls" 2>/dev/null | sed 's/.*restart //' | sort | paste -sd' ' -; }
+mkdir -p "$PORTCULLIS_ROOT/oauth2-proxy" "$PORTCULLIS_ROOT/group-gate" "$PORTCULLIS_ROOT/secrets"
+printf 'alpha-config-v1\n' > "$PORTCULLIS_ROOT/oauth2-proxy/alpha.yaml"
+printf 'map-v1\n' > "$PORTCULLIS_ROOT/group-gate/group-gate-map.conf"
+: > "$STUB_DIR/calls"
+cfg_run config_reload
+expect_eq "config reload: no stamps → forward-auth(-ext), group-gate, enroll restarted once" \
+  "$(cfg_restarts)" "forward-auth forward-auth-ext group-gate enroll"
+expect_ok "config reload: stamps written" test -f "$PORTCULLIS_ROOT/secrets/.config-oauth2-proxy_alpha.yaml.loaded"
+: > "$STUB_DIR/calls"
+cfg_run config_reload
+expect_eq "config reload: unchanged → no restart" "$(cfg_restarts)" ""
+printf 'alpha-config-v2\n' > "$PORTCULLIS_ROOT/oauth2-proxy/alpha.yaml"
+: > "$STUB_DIR/calls"
+cfg_run config_reload
+expect_eq "config reload: alpha.yaml changed → forward-auth(-ext) restarted, others not" \
+  "$(cfg_restarts)" "forward-auth forward-auth-ext"
+: > "$STUB_DIR/calls"
+cfg_run config_reload
+expect_eq "config reload: changed once → restarted once" "$(cfg_restarts)" ""
+printf 'map-v2\n' > "$PORTCULLIS_ROOT/group-gate/group-gate-map.conf"
+: > "$STUB_DIR/calls"
+cfg_run config_reload
+expect_eq "config reload: map.conf changed → group-gate, enroll restarted" \
+  "$(cfg_restarts)" "group-gate enroll"
+rm -f "$PORTCULLIS_ROOT/oauth2-proxy/alpha.yaml" "$PORTCULLIS_ROOT/secrets/.config-oauth2-proxy_alpha.yaml.loaded"
+: > "$STUB_DIR/calls"
+cfg_run config_reload
+expect_eq "config reload: missing file → nothing done" "$(cfg_restarts)" ""
+
 # ══ config: config_apply (static TLS options, plan D18) ════
 CA_ROOT="$WORK/config-apply"
 mkdir -p "$CA_ROOT/traefik/dynamic" "$WORK/cabin"
