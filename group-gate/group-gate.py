@@ -18,9 +18,11 @@ Checks, run in order:
          auto_rebuild Vault puts new revocations only there until the next
          full rebuild), re-fetched every GATE_CRL_REFRESH_SECONDS (default
          60) in the background; the union of all of them and the file is
-         enforced. Until every list has been read once no certificate counts
-         as a sign-in method; after that, fetch errors keep the last good
-         CRL (the serial file still applies).
+         enforced. While no list is configured, a list has never been read,
+         or one is past its nextUpdate by more than an hour, no certificate
+         counts as a sign-in method; otherwise fetch errors keep the last
+         good CRL. GATE_CRL_URL / GATE_DELTA_CRL_URL (the old one-CA shape)
+         make the gate refuse to start.
      Traefik's entrypoint deletes client-supplied X-Forwarded-Tls-Client-*
      headers, so the header only ever describes a cert Traefik verified.
   1. Sign-in template (policy file v6; checked LAST, after 2. and 3., so a
@@ -39,14 +41,18 @@ Checks, run in order:
        - needs-stronger (#needs-stronger): nothing can be completed here.
      Certificate binding: `yubikey_cert` (amr mtls) counts only when the
      CURRENT request presents a YubiKey certificate, and `browser_cert`
-     (amr file) only with a browser certificate: the leaf's issuer CN must
-     be the subject CN of GATE_YUBIKEY_CA_FILE (pki_int) or
-     GATE_BROWSER_CA_FILE (pki_file) — equal CNs or an unreadable file: no
-     certificate counts —, it passed the revocation check in step 0, and
-     its subject CN equals the session user (the LLDAP username from
-     X-Auth-Request-Preferred-Username, which must also match the token's
-     preferred_username) — the token alone may have been obtained with a
-     certificate that has since been revoked.
+     (amr file) only with a browser certificate. The leaf is read from
+     X-Forwarded-Tls-Client-Cert (the certificate itself, parsed with
+     `cryptography`; never the Info text, whose Subject / Issuer Traefik
+     doesn't escape): its kind is the CA file (GATE_YUBIKEY_CA_FILE,
+     pki_int; GATE_BROWSER_CA_FILE, pki_file) whose subject is its issuer
+     and whose key verifies its signature — equal subjects or an unusable
+     file: no certificate counts. Its one CN must match the LLDAP username
+     grammar and equal the session user (X-Auth-Request-Preferred-Username,
+     which must also match the token's preferred_username); it must be
+     within its validity, in no revocation list, and every CRL list must
+     be configured, read and fresh — the token alone may have been
+     obtained with a certificate that has since been revoked.
      Sign-in paths: on people.<domain> the Sign-in page's own paths
      (/signin, /api/me/signin, /api/me/signin/*, /static/*: every
      normalised reading of the path inside that set) take "any switched-on
@@ -174,6 +180,7 @@ import hashlib
 import html
 import json
 import os
+import queue
 import re
 import stat
 import threading
@@ -203,6 +210,12 @@ BROWSER_CA_FILE = os.environ.get("GATE_BROWSER_CA_FILE", "/etc/group-gate/ca/bro
 OPENED_DIR = os.environ.get("GATE_OPENED_DIR", "/data/opened")
 # The Hub's gid: opened/ is 2770 with this group, its files 0640.
 OPENED_GID = int(os.environ.get("GATE_OPENED_GID", "10001"))
+# A CRL list this long past its nextUpdate is stale: certificates stop
+# counting until it is read again.
+CRL_STALE_GRACE = 3600.0
+# Variables of the one-CRL shape that no longer exist (the gate refuses to
+# start while one is set).
+OLD_CRL_VARIABLES = ("GATE_CRL_URL", "GATE_DELTA_CRL_URL")
 CRL_REFRESH_SECONDS = float(os.environ.get("GATE_CRL_REFRESH_SECONDS", "60"))
 CERT_INFO_HEADER = "X-Forwarded-Tls-Client-Cert-Info"
 
@@ -1539,38 +1552,66 @@ class OpenedLog:
     <directory>/<YYYY-MM-DD>.jsonl (UTC day), which the Hub reads
     (internal/signinhistory/opened.go) and prunes.
 
+    - Never on the request's path: record() only queues the line (a
+      bounded queue of QUEUE_MAX; full = the line is dropped and counted)
+      and one writer thread does the file I/O, outside the lock. A hung
+      volume stalls only that thread, never a request, and starts no
+      more threads.
     - Remembered (session, host) pairs sit in an LRU of `capacity`; a pair
-      is remembered only once its line is written, so a failed write is
-      tried again on the next request.
+      is remembered once its line is written (while queued it is pending),
+      so a failed write is tried again on a later request.
     - Append-only: each line is one write(2) on an O_APPEND descriptor
-      opened per line (O_NOFOLLOW: a symlink is never written through) —
-      nothing is buffered across requests and a line is never torn by
-      another writer.
+      opened per line (O_NOFOLLOW: a symlink is never written through;
+      O_NONBLOCK: a FIFO in its place doesn't block) — nothing is buffered
+      across lines and a line is never torn by another writer.
     - Bounded: every field is cut (ua ≤ 256 characters) and a day file
-      stops growing at DAY_FILE_MAX bytes (later lines count as failures).
+      stops growing at DAY_FILE_MAX bytes, the Hub's per-day read window
+      (later lines count as failures).
     - Modes: the directory is 2770 with group `gid` (the Hub's), each file
       0640. The directory's parent must exist (the group_gate_data volume).
-    - Never raises: a failure is logged (once per distinct error) and
-      counted (group_gate_opened_log_failures_total), never a deny.
+    - Never raises: a failure is counted (group_gate_opened_log_failures_total)
+      and logged at most once per LOG_EVERY seconds with the number of
+      failures since; never a deny.
     - Holds no secret: no token, cookie or header but the User-Agent.
     """
 
-    DAY_FILE_MAX = 32 << 20
+    DAY_FILE_MAX = 8 << 20
     FIELD_MAX = 256
+    QUEUE_MAX = 1000
+    LOG_EVERY = 60.0
 
     def __init__(self, directory: str, capacity: int = 10000, gid: Optional[int] = None):
         self.directory = directory
         self.capacity = max(int(capacity), 1)
         self.gid = OPENED_GID if gid is None else gid
         self._seen: "collections.OrderedDict[Tuple[str, str], None]" = collections.OrderedDict()
+        self._pending: set = set()
         self._lock = threading.Lock()
+        self._queue: "queue.Queue" = queue.Queue(self.QUEUE_MAX)
+        self._writer: Optional[threading.Thread] = None
         self._dir_ok = False
         self._last_error: Optional[str] = None
+        self._last_log = 0.0
+        self._unlogged = 0
 
     def seen(self, session: str, host: str) -> bool:
-        """The pair already has its line (the LRU's view)."""
+        """The pair has its line, or it is queued (the LRU's view)."""
         with self._lock:
-            return (session, host) in self._seen
+            key = (session, host)
+            return key in self._seen or key in self._pending
+
+    def _failed(self, err: str):
+        """Count a failure; log it at most once per LOG_EVERY seconds."""
+        METRICS.inc("group_gate_opened_log_failures_total")
+        now = time.monotonic()
+        with self._lock:
+            self._last_error = err
+            self._unlogged += 1
+            if self._last_log and now - self._last_log < self.LOG_EVERY:
+                return
+            count, self._unlogged, self._last_log = self._unlogged, 0, now
+        print(f"group-gate: opened log write failed ({err}); {count} failure(s) since the last report",
+              flush=True)
 
     def _ensure_dir(self):
         if self._dir_ok:
@@ -1593,7 +1634,8 @@ class OpenedLog:
     def _write(self, now: datetime.datetime, line: bytes):
         self._ensure_dir()
         path = os.path.join(self.directory, now.strftime("%Y-%m-%d") + ".jsonl")
-        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+                 | getattr(os, "O_CLOEXEC", 0))
         try:
             fd = os.open(path, flags, 0o640)
         except OSError:
@@ -1614,39 +1656,75 @@ class OpenedLog:
         finally:
             os.close(fd)
 
+    def _run(self):
+        while True:
+            key, now, line = self._queue.get()
+            ok = False
+            try:
+                self._write(now, line)
+                ok = True
+            except Exception as e:  # noqa: BLE001 — logging never denies a request
+                self._failed(f"{type(e).__name__}: {e}")
+            finally:
+                with self._lock:
+                    self._pending.discard(key)
+                    if ok:
+                        self._seen[key] = None
+                        while len(self._seen) > self.capacity:
+                            self._seen.popitem(last=False)
+                self._queue.task_done()
+
+    def _start(self):
+        # Under self._lock.
+        if self._writer is None or not self._writer.is_alive():
+            self._writer = threading.Thread(target=self._run, daemon=True, name="opened-log")
+            self._writer.start()
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Wait (up to `timeout`) until every queued line was handled."""
+        deadline = time.monotonic() + timeout
+        while self._queue.unfinished_tasks:
+            if time.monotonic() > deadline:
+                return False
+            time.sleep(0.005)
+        return True
+
     def record(self, user, session, host, app, methods, ip, ua, act="", now: Optional[datetime.datetime] = None) -> None:
-        """Append the line for (session, host) unless this process already
-        wrote it. Never raises."""
+        """Queue the line for (session, host) unless this process already
+        wrote (or queued) it. Never raises, never blocks on the disk."""
         try:
             session = _log_field(session, self.FIELD_MAX)
             host = _log_field(host, 253).lower()
             if not session or not host:
                 return
             key = (session, host)
+            now = (now or datetime.datetime.now(datetime.timezone.utc)).astimezone(datetime.timezone.utc)
+            doc = {"time": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                   "user": _log_field(user, self.FIELD_MAX).lower(),
+                   "session": session, "host": host,
+                   "app": _log_field(app, self.FIELD_MAX),
+                   "methods": [m for m in METHOD_IDS if m in set(methods or ())],
+                   "ip": _log_field(ip, 64), "ua": _log_field(ua, self.FIELD_MAX),
+                   "act": _log_field(act, self.FIELD_MAX)}
+            line = (json.dumps(doc, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
             with self._lock:
                 if key in self._seen:
                     self._seen.move_to_end(key)
                     return
-                now = (now or datetime.datetime.now(datetime.timezone.utc)).astimezone(datetime.timezone.utc)
-                doc = {"time": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                       "user": _log_field(user, self.FIELD_MAX).lower(),
-                       "session": session, "host": host,
-                       "app": _log_field(app, self.FIELD_MAX),
-                       "methods": [m for m in METHOD_IDS if m in set(methods or ())],
-                       "ip": _log_field(ip, 64), "ua": _log_field(ua, self.FIELD_MAX),
-                       "act": _log_field(act, self.FIELD_MAX)}
-                line = (json.dumps(doc, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-                self._write(now, line)
-                self._seen[key] = None
-                while len(self._seen) > self.capacity:
-                    self._seen.popitem(last=False)
-                self._last_error = None
+                if key in self._pending:
+                    return
+                try:
+                    self._queue.put_nowait((key, now, line))
+                except queue.Full:
+                    full = True
+                else:
+                    full = False
+                    self._pending.add(key)
+                    self._start()
+            if full:
+                self._failed(f"queue full ({self.QUEUE_MAX} lines waiting): line dropped")
         except Exception as e:  # noqa: BLE001 — logging never denies a request
-            METRICS.inc("group_gate_opened_log_failures_total")
-            err = f"{type(e).__name__}: {e}"
-            if err != self._last_error:
-                print(f"group-gate: opened log write failed ({err})", flush=True)
-            self._last_error = err
+            self._failed(f"{type(e).__name__}: {e}")
 
 
 OPENED_LOG = OpenedLog(OPENED_DIR)
@@ -1793,7 +1871,13 @@ class CrlCache:
 
     @property
     def ready(self) -> bool:
-        return all(src.last_success > 0 for src in self.sources)
+        """Every list has been read, and none is past its nextUpdate plus
+        CRL_STALE_GRACE (Keycloak's crl-abort-if-non-updated); a list
+        without nextUpdate is never ready."""
+        now = time.time()
+        return bool(self.sources) and all(
+            src.last_success > 0 and src.next_update is not None and now <= src.next_update + CRL_STALE_GRACE
+            for src in self.sources)
 
     @property
     def serials(self) -> FrozenSet[int]:
@@ -1835,9 +1919,10 @@ def revoked_serials() -> FrozenSet[int]:
 
 
 def crl_ready() -> bool:
-    """Every configured CRL list has been read (no lists configured: only
-    the serial file applies)."""
-    return CRL_CACHE is None or CRL_CACHE.ready
+    """Certificates may count: CRL lists are configured, every one has been
+    read and none is stale (CrlCache.ready). No list configured: no
+    certificate counts (fail closed)."""
+    return CRL_CACHE is not None and CRL_CACHE.ready
 
 
 _SERIAL_RE = re.compile(r'SerialNumber="(\d+)"')
@@ -1894,38 +1979,48 @@ def leaf_cert_cn(raw: str) -> Optional[str]:
     return None
 
 
-# The leaf's own fields at the start of the header: Traefik writes each
-# certificate's Subject, then its Issuer (client-headers@file asks for the
-# issuer's commonName only), the leaf first.
-_LEAF_ISSUER_RE = re.compile(r'Subject="[^"]*";Issuer="([^"]*)"')
+# The presented certificates themselves (passTLSClientCert pem: true, the
+# client-headers@file and client-cert-pem@file middlewares): Go's
+# url.QueryEscape of the base64 DER bodies (no BEGIN/END lines), joined
+# with ",", the leaf first (Traefik's entrypoint deletes client copies).
+CERT_PEM_HEADER = "X-Forwarded-Tls-Client-Cert"
+# The header is never bigger than this (a leaf and a short chain).
+CERT_PEM_MAX = 64 * 1024
+# The LLDAP username grammar a certificate's CN must match exactly.
+CERT_USER_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+_B64_RE = re.compile(r"[A-Za-z0-9+/]+={0,2}")
 
 
-def _dn_cn(dn: str) -> Optional[str]:
-    """The one CN of a Traefik DN text ("C=..,O=..,CN=.."); None when there
-    is none or more than one."""
-    cns = [a.strip()[3:] for a in dn.split(",") if a.strip().startswith("CN=")]
-    return cns[0] if len(cns) == 1 and cns[0] else None
-
-
-def leaf_cert_issuer_cn(raw: str) -> Optional[str]:
-    """Issuer CN of the leaf (first) cert in X-Forwarded-Tls-Client-Cert-Info,
-    or None. Only the leaf's own Issuer counts: the header must start with
-    its Subject="…";Issuer="…" (Traefik's order), so an intermediate's
-    fields later in the chain are never read as the leaf's."""
-    m = _LEAF_ISSUER_RE.match(_decode_cert_info(raw))
-    return _dn_cn(m.group(1)) if m else None
+def forwarded_leaf(raw: str) -> Optional[x509.Certificate]:
+    """The leaf certificate of X-Forwarded-Tls-Client-Cert, parsed with
+    `cryptography`, or None (missing, too big, not one URL-unescaping of
+    base64 DER bodies, or not a certificate). The Info header is never
+    used for this: Traefik doesn't escape `"`, `;` or `,` in its Subject /
+    Issuer text, so a crafted CN could fake an Issuer there."""
+    if not raw or len(raw) > CERT_PEM_MAX:
+        return None
+    value = urllib.parse.unquote(raw)  # once: QueryEscape; never '+' -> ' '
+    first = value.split(",", 1)[0].strip()
+    first = first.replace("-----BEGIN CERTIFICATE-----", "").replace("-----END CERTIFICATE-----", "")
+    first = re.sub(r"\s+", "", first)
+    if not _B64_RE.fullmatch(first):
+        return None
+    try:
+        return x509.load_der_x509_certificate(base64.b64decode(first, validate=True))
+    except (ValueError, TypeError):
+        return None
 
 
 _CA_CACHE_LOCK = threading.Lock()
-_CA_CACHE: dict = {}  # path -> ((inode, mtime, size), CN or None)
+_CA_CACHE: dict = {}  # path -> ((inode, mtime, size), certificate or None)
 
 
-def ca_subject_cn(path: str) -> Optional[str]:
-    """Subject CN of the CA certificate in `path` (PEM, the first block, or
-    DER), read with `cryptography` and cached by (inode, mtime, size).
-    None — no certificate counts — when the file is missing or unreadable,
-    isn't a certificate, isn't a CA (basicConstraints ca) or has no single
-    CN."""
+def ca_certificate(path: str) -> Optional[x509.Certificate]:
+    """The CA certificate in `path` (PEM, the first block, or DER), read
+    with `cryptography` and cached by (inode, mtime, size). None — no
+    certificate of its kind counts — when the file is missing or
+    unreadable, isn't a certificate, isn't a CA (basicConstraints ca) or
+    has no single CN."""
     try:
         st = os.stat(path)
     except OSError:
@@ -1935,7 +2030,7 @@ def ca_subject_cn(path: str) -> Optional[str]:
         hit = _CA_CACHE.get(path)
         if hit and hit[0] == key:
             return hit[1]
-    cn: Optional[str] = None
+    cert: Optional[x509.Certificate] = None
     try:
         with open(path, "rb") as f:
             data = f.read(1 << 20)
@@ -1943,38 +2038,93 @@ def ca_subject_cn(path: str) -> Optional[str]:
             cert = x509.load_pem_x509_certificate(data)
         else:
             cert = x509.load_der_x509_certificate(data)
-        if cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca:
-            names = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
-            if len(names) == 1 and isinstance(names[0].value, str) and names[0].value:
-                cn = names[0].value
+        if not cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca:
+            raise ValueError("not a CA certificate")
+        names = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+        if len(names) != 1 or not isinstance(names[0].value, str) or not names[0].value:
+            raise ValueError("no single subject CN")
     except Exception as e:  # noqa: BLE001 — any failure: the file doesn't count
         print(f"group-gate: CA file {path} can't be used ({type(e).__name__}: {e}): "
               f"no certificate of its kind counts", flush=True)
-        cn = None
+        cert = None
     with _CA_CACHE_LOCK:
-        _CA_CACHE[path] = (key, cn)
-    return cn
+        _CA_CACHE[path] = (key, cert)
+    return cert
 
 
-def cert_method(cert_info: str) -> Optional[str]:
-    """The method the presented leaf is a certificate for (contract §4
-    "Certificate binding"): "yubikey_cert" when its issuer CN is the
-    YubiKey CA's (pki_int), "browser_cert" when it is the browser CA's
-    (pki_file), else None. Both CA files must be readable and their CNs
-    different; otherwise no certificate counts (fail closed)."""
-    if not cert_info:
+def ca_subject_cn(path: str) -> Optional[str]:
+    """Subject CN of the CA certificate in `path` (ca_certificate), or None."""
+    cert = ca_certificate(path)
+    return cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value if cert else None
+
+
+def leaf_method(leaf: Optional[x509.Certificate]) -> Optional[str]:
+    """The method `leaf` is a certificate for (contract §4 "Certificate
+    binding"): the CA file whose subject is the leaf's issuer AND whose key
+    verifies the leaf's signature (verify_directly_issued_by) —
+    "yubikey_cert" for GATE_YUBIKEY_CA_FILE (pki_int), "browser_cert" for
+    GATE_BROWSER_CA_FILE (pki_file) — else None. Both CA files must be
+    usable and their subjects (and CNs) different; otherwise no
+    certificate counts (fail closed)."""
+    if leaf is None:
         return None
-    yubikey, browser = ca_subject_cn(YUBIKEY_CA_FILE), ca_subject_cn(BROWSER_CA_FILE)
-    if yubikey is None or browser is None or yubikey == browser:
+    yubikey, browser = ca_certificate(YUBIKEY_CA_FILE), ca_certificate(BROWSER_CA_FILE)
+    if yubikey is None or browser is None or yubikey.subject == browser.subject \
+            or ca_subject_cn(YUBIKEY_CA_FILE) == ca_subject_cn(BROWSER_CA_FILE):
         return None
-    issuer = leaf_cert_issuer_cn(cert_info)
-    if issuer is None:
+    found = None
+    for method, ca in (("yubikey_cert", yubikey), ("browser_cert", browser)):
+        try:
+            leaf.verify_directly_issued_by(ca)
+        except Exception:  # noqa: BLE001 — wrong issuer, bad signature, unsupported key
+            continue
+        if found is not None:
+            return None  # can't be both
+        found = method
+    return found
+
+
+def cert_method(cert_pem: str) -> Optional[str]:
+    """leaf_method() of X-Forwarded-Tls-Client-Cert's leaf."""
+    return leaf_method(forwarded_leaf(cert_pem))
+
+
+def leaf_user(leaf: Optional[x509.Certificate]) -> Optional[str]:
+    """The leaf's one subject CN when it matches the LLDAP username grammar
+    exactly (nothing stripped, unquoted or folded), else None."""
+    if leaf is None:
         return None
-    if issuer == yubikey:
-        return "yubikey_cert"
-    if issuer == browser:
-        return "browser_cert"
-    return None
+    try:
+        names = leaf.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+    except ValueError:
+        return None
+    if len(names) != 1 or not isinstance(names[0].value, str):
+        return None
+    cn = names[0].value
+    return cn if CERT_USER_RE.fullmatch(cn) else None
+
+
+def bound_cert_method(leaf: Optional[x509.Certificate], username: str,
+                      now: Optional[datetime.datetime] = None) -> Optional[str]:
+    """The certificate method `leaf` binds for `username` on this request,
+    or None: its kind (leaf_method), its CN exactly the username
+    (leaf_user), inside its validity, its serial in no revocation list
+    (an unreadable serial file: None) and every CRL list ready
+    (crl_ready: configured, read, not past nextUpdate + grace)."""
+    method = leaf_method(leaf)
+    if method is None or not username or leaf_user(leaf) != username:
+        return None
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if not leaf.not_valid_before_utc <= now <= leaf.not_valid_after_utc:
+        return None
+    if not crl_ready():
+        return None
+    try:
+        if leaf.serial_number in revoked_serials():
+            return None
+    except RevocationError:
+        return None
+    return method
 
 
 _PORT_RE = re.compile(r":[0-9]{1,5}\Z")
@@ -2322,18 +2472,16 @@ class Handler(BaseHTTPRequestHandler):
         print(f"group-gate: {log}", flush=True)
 
     def _signin_check(self, doc: dict, host: str, kind: str, username: str,
-                      cert_info: str, cert_ok: bool, raw_uri: str = "") -> bool:
+                      cert_ok: bool, raw_uri: str = "") -> bool:
         """The host's sign-in template (contract §4 "How group-gate
         decides"). True when the request was answered (denied, or one of
         the step-up / present-certificate / needs-stronger pages); False
         when the session meets the template (self._have / self._claims then
         hold what the opened log records).
 
-        `cert_ok`: the request's client certificate (if any) passed the
-        revocation check. A certificate method counts only when it did,
-        every CRL list has been read, the leaf's issuer is that method's CA
-        (cert_method), its CN is the session user and the token's
-        preferred_username agrees (contract §4 "Certificate binding").
+        `cert_ok`: the request's certificates (if any) passed the
+        revocation check. A certificate method counts only when it did and
+        bound_cert_method() names it (contract §4 "Certificate binding").
 
         On people.<domain>, the Sign-in page's paths (signin_path(): every
         normalised reading of `raw_uri` inside the set) take "any
@@ -2359,11 +2507,12 @@ class Handler(BaseHTTPRequestHandler):
         claims = decode_jwt_payload(self.headers.get("X-Forwarded-Access-Token", "") or "")
         amr = claims.get("amr")
         amr = amr if isinstance(amr, list) else []
-        cert_cn = leaf_cert_cn(cert_info) if cert_info else None
-        kind_of_cert = cert_method(cert_info) if cert_info else None
+        leaf = forwarded_leaf(self.headers.get(CERT_PEM_HEADER, "") or "")
+        cert_cn = leaf_user(leaf)
+        kind_of_cert = leaf_method(leaf)
         bound = set()
-        if (kind_of_cert and cert_ok and crl_ready() and claims.get("preferred_username") == username
-                and cert_cn == username):
+        if cert_ok and kind_of_cert and claims.get("preferred_username") == username \
+                and bound_cert_method(leaf, username) == kind_of_cert:
             bound = {kind_of_cert}
         enabled = set(doc["methods"])
         have = session_methods(amr, enabled, bound)
@@ -2416,6 +2565,15 @@ class Handler(BaseHTTPRequestHandler):
             METRICS.inc("group_gate_opened_log_failures_total")
             print(f"group-gate: opened log failed ({type(e).__name__}: {e})", flush=True)
 
+    def _request_cert_serials(self) -> List[int]:
+        """Every serial the request's certificate headers name: the Info
+        header's (the whole chain) and the PEM leaf's."""
+        serials = cert_serials_from_info(self.headers.get(CERT_INFO_HEADER, "") or "")
+        leaf = forwarded_leaf(self.headers.get(CERT_PEM_HEADER, "") or "")
+        if leaf is not None and leaf.serial_number not in serials:
+            serials.append(leaf.serial_number)
+        return serials
+
     def _cert_ok(self, cert_serials: List[int]) -> bool:
         """The presented certificate is not revoked (False when the
         revocation list can't be read)."""
@@ -2444,13 +2602,12 @@ class Handler(BaseHTTPRequestHandler):
         # The portal is a core page (`core[<domain>]`): its router has no
         # portcullis-groups, so its template is checked here. A missing or
         # broken policy file denies (no template is known).
-        cert_info = self.headers.get(CERT_INFO_HEADER, "")
+        serials = self._request_cert_serials()
         try:
             if not DOMAIN_OK:
                 raise PolicyError(f"PORTCULLIS_DOMAIN={DOMAIN!r} is not a valid hostname")
             doc = load_policy_file()
-            if self._signin_check(doc, DOMAIN, "core", user, cert_info,
-                                  self._cert_ok(cert_serials_from_info(cert_info)) if cert_info else False):
+            if self._signin_check(doc, DOMAIN, "core", user, self._cert_ok(serials) if serials else False):
                 return
             groups -= expired_groups(doc, user)
         except PolicyError as e:
@@ -2561,9 +2718,8 @@ class Handler(BaseHTTPRequestHandler):
 
         # --- Client-cert revocation (before anything else) ---
         cert_info = self.headers.get(CERT_INFO_HEADER, "")
-        cert_serials: List[int] = []
-        if cert_info:
-            cert_serials = cert_serials_from_info(cert_info)
+        cert_serials = self._request_cert_serials()
+        if cert_info or cert_serials:
             if not cert_serials:
                 print(f"group-gate: WARNING {CERT_INFO_HEADER} has no SerialNumber — revocation "
                       f"cannot be checked (enable info.serialNumber in client-headers@file)", flush=True)
@@ -2692,7 +2848,7 @@ class Handler(BaseHTTPRequestHandler):
         # outside the app's groups gets the plain 403 above, never a page
         # naming the app's rule. A revoked certificate was denied at the
         # start, so one still here passed the revocation check.
-        if self._signin_check(policy_doc, host, kind, username, cert_info, bool(cert_serials), raw_uri):
+        if self._signin_check(policy_doc, host, kind, username, bool(cert_serials), raw_uri):
             return
 
         self._allow(groups_header, username, host)
@@ -2703,10 +2859,22 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-if __name__ == "__main__":
+def startup_problem() -> Optional[str]:
+    """Why the gate must not start, or None."""
     if not DOMAIN_OK:
         # Required (contract §4): without it no host can be classified.
-        raise SystemExit(f"group-gate: PORTCULLIS_DOMAIN={DOMAIN!r} is not a valid hostname — refusing to start")
+        return f"PORTCULLIS_DOMAIN={DOMAIN!r} is not a valid hostname"
+    old = [v for v in OLD_CRL_VARIABLES if os.environ.get(v, "").strip()]
+    if old:
+        return (f"{', '.join(old)} no longer exist: set GATE_CRL_URLS / GATE_DELTA_CRL_URLS "
+                f"(space-separated, both CAs' lists) and remove {', '.join(old)}")
+    return None
+
+
+if __name__ == "__main__":
+    problem = startup_problem()
+    if problem:
+        raise SystemExit(f"group-gate: {problem} — refusing to start")
     print(
         f"group-gate: listening on :{LISTEN_PORT}, policy_file={POLICY_FILE}, "
         f"map_file={MAP_FILE}, domain={DOMAIN}",
@@ -2716,9 +2884,10 @@ if __name__ == "__main__":
     print(f"group-gate: revocation: file={REVOKED_FILE} crls={' '.join(CRL_URLS) or '(none)'} "
           f"deltas={' '.join(DELTA_CRL_URLS) or '(none)'} refresh={CRL_REFRESH_SECONDS:g}s", flush=True)
     if not CRL_URLS or not DELTA_CRL_URLS:
-        print("group-gate: WARNING GATE_CRL_URLS / GATE_DELTA_CRL_URLS unset: only the serial file "
-              "revokes certificates", flush=True)
-    print(f"group-gate: certificate kinds: yubikey CA={YUBIKEY_CA_FILE} ({ca_subject_cn(YUBIKEY_CA_FILE)!r}), "
+        print("group-gate: WARNING GATE_CRL_URLS / GATE_DELTA_CRL_URLS unset: no certificate counts "
+              "as a sign-in method", flush=True)
+    print(f"group-gate: certificate kinds (from {CERT_PEM_HEADER}): yubikey CA={YUBIKEY_CA_FILE} "
+          f"({ca_subject_cn(YUBIKEY_CA_FILE)!r}), "
           f"browser CA={BROWSER_CA_FILE} ({ca_subject_cn(BROWSER_CA_FILE)!r}); opened log={OPENED_DIR}", flush=True)
     if CRL_CACHE is not None:
         threading.Thread(target=CRL_CACHE.run_forever, daemon=True, name="crl-refresh").start()

@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -46,25 +47,69 @@ os.environ["GATE_OPENED_GID"] = str(os.getgid())
 os.environ["PORTCULLIS_DOMAIN"] = "example.com"
 os.environ.pop("GATE_MAP", None)
 
-def write_ca(path, cn, ca=True, pem=True):
-    """A self-signed certificate with subject CN `cn` (a CA unless ca=False)."""
-    import datetime
+_CAS: dict = {}  # (cn, ca) -> (certificate, key): one key per CA for the whole run
+
+
+def ca_pair(cn, ca=True):
+    """A self-signed certificate with subject CN `cn` (a CA unless
+    ca=False) and its key, made once per (cn, ca)."""
     from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import ec
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, cn)])
-    now = datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc)
-    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
-            .serial_number(x509.random_serial_number()).not_valid_before(now)
-            .not_valid_after(now + datetime.timedelta(days=3650))
-            .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
-            .sign(key, hashes.SHA256()))
+    if (cn, ca) not in _CAS:
+        key = ec.generate_private_key(ec.SECP256R1())
+        name = x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, cn)])
+        now = datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc)
+        cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+                .serial_number(x509.random_serial_number()).not_valid_before(now)
+                .not_valid_after(now + datetime.timedelta(days=3650))
+                .add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+                .sign(key, hashes.SHA256()))
+        _CAS[(cn, ca)] = (cert, key)
+    return _CAS[(cn, ca)]
+
+
+def write_ca(path, cn, ca=True, pem=True):
+    """Writes ca_pair(cn, ca)'s certificate to `path` (atomically)."""
+    from cryptography.hazmat.primitives import serialization
+    cert, _ = ca_pair(cn, ca)
     data = cert.public_bytes(serialization.Encoding.PEM if pem else serialization.Encoding.DER)
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
         f.write(data)
     os.replace(tmp, path)
+
+
+_LEAVES: dict = {}
+
+
+def issue_leaf(cn, serial, issuer_cn, days=(-1, 30)):
+    """A client certificate with subject CN `cn` (any text), issued and
+    signed by ca_pair(issuer_cn) — an unknown CA when nobody wrote it to a
+    CA file — valid from now+days[0] to now+days[1]."""
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    k = (cn, serial, issuer_cn, days)
+    if k not in _LEAVES:
+        ca, ca_key = ca_pair(issuer_cn)
+        now = datetime.datetime.now(datetime.timezone.utc)
+        _LEAVES[k] = (x509.CertificateBuilder()
+                      .subject_name(x509.Name([x509.NameAttribute(x509.NameOID.COMMON_NAME, cn)]))
+                      .issuer_name(ca.subject).public_key(ec.generate_private_key(ec.SECP256R1()).public_key())
+                      .serial_number(serial).not_valid_before(now + datetime.timedelta(days=days[0]))
+                      .not_valid_after(now + datetime.timedelta(days=days[1]))
+                      .sign(ca_key, hashes.SHA256()))
+    return _LEAVES[k]
+
+
+def pem_header(*certs):
+    """X-Forwarded-Tls-Client-Cert the way Traefik writes it: Go's
+    url.QueryEscape of the base64 DER bodies joined with ","."""
+    import base64
+    from cryptography.hazmat.primitives import serialization
+    return urllib.parse.quote_plus(",".join(base64.b64encode(c.public_bytes(serialization.Encoding.DER)).decode()
+                                            for c in certs))
 
 
 write_ca(YUBIKEY_CA, YUBIKEY_CA_CN)
@@ -124,6 +169,17 @@ def write_policy(doc, raw=False, malformed=False):
     os.replace(tmp, POLICY)
 
 
+class ReadyCrl:
+    """A CRL cache whose lists are all read and fresh, revoking nothing."""
+    serials = frozenset()
+    ready = True
+    last_success = 1.0
+    next_update = 4102444799.0
+
+
+READY_CRL = ReadyCrl()
+
+
 class GateTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -137,6 +193,7 @@ class GateTest(unittest.TestCase):
 
     def setUp(self):
         write_policy({})
+        gg.CRL_CACHE = READY_CRL
 
     def req(self, host, groups="users_x", extra=None, uri=None, gate_path="/", want_headers=False):
         # What portcullis-auth (oauth2-proxy) hands group-gate: User = the
@@ -686,7 +743,7 @@ class SigninV6Test(GateTest):
              "X-Auth-Request-Groups": groups,
              "X-Forwarded-Access-Token": token(amr=amr, preferred_username=user)}
         if cert is not None:
-            h[gg.CERT_INFO_HEADER] = cert
+            h.update(cert) if isinstance(cert, dict) else h.__setitem__(gg.CERT_INFO_HEADER, cert)
         r = urllib.request.Request(f"http://127.0.0.1:{self.port}{gate_path}", headers=h)
         try:
             with urllib.request.urlopen(r) as resp:
@@ -1885,7 +1942,7 @@ class MtlsBindingTest(GateTest):
     def setUp(self):
         super().setUp()
         write_revoked(None)
-        gg.CRL_CACHE = None
+        gg.CRL_CACHE = READY_CRL
 
     def tearDown(self):
         write_revoked(None)
@@ -1899,7 +1956,7 @@ class MtlsBindingTest(GateTest):
         extra = {"X-Forwarded-Access-Token": token(amr=amr, preferred_username=user if token_user is None else token_user),
                  "X-Auth-Request-Preferred-Username": user or None}
         if cert is not None:
-            extra[gg.CERT_INFO_HEADER] = cert
+            extra.update(cert) if isinstance(cert, dict) else extra.__setitem__(gg.CERT_INFO_HEADER, cert)
         return self.req(host, groups="users_grafana", extra=extra, want_headers=True)
 
     def body(self, rule, amr, cert=None):
@@ -1908,7 +1965,7 @@ class MtlsBindingTest(GateTest):
              "X-Auth-Request-Groups": "users_grafana",
              "X-Forwarded-Access-Token": token(amr=amr, preferred_username="bob")}
         if cert is not None:
-            h[gg.CERT_INFO_HEADER] = cert
+            h.update(cert) if isinstance(cert, dict) else h.__setitem__(gg.CERT_INFO_HEADER, cert)
         r = urllib.request.Request(f"http://127.0.0.1:{self.port}/", headers=h)
         with self.assertRaises(urllib.error.HTTPError) as cm:
             urllib.request.urlopen(r)
@@ -1977,30 +2034,39 @@ class MtlsBindingTest(GateTest):
                                     "strong": {"op": "any", "items": ["security_key"]}}})
         self.assertEqual(self.req("grafana.example.com", groups="users_grafana", extra={
             "X-Forwarded-Access-Token": token(amr=["mtls"], preferred_username="bob"),
-            gg.CERT_INFO_HEADER: cert_info_for("bob", 1)}), 403)
+            **cert_info_for("bob", 1)}), 403)
 
     def test_leaf_cert_cn(self):
-        self.assertEqual(gg.leaf_cert_cn(cert_info_for("bob", 1)), "bob")
+        self.assertEqual(gg.leaf_cert_cn(cert_info_for("bob", 1)[gg.CERT_INFO_HEADER]), "bob")
         self.assertEqual(gg.leaf_cert_cn(urllib.parse.quote_plus(
             'Subject="C=DE,O=x,CN=carol";SerialNumber="1",Subject="CN=Intermediate";SerialNumber="2"')), "carol")
         self.assertIsNone(gg.leaf_cert_cn(""))
         self.assertIsNone(gg.leaf_cert_cn('Issuer="CN=x"'))
 
 
-def cert_info_for(cn, serial):
-    return urllib.parse.quote_plus(f'Subject="CN={cn}";Issuer="CN=example.com Intermediate CA";'
-                                   f'SerialNumber="{serial}";NB="1700000000";NA="1700086400"')
+def cert_info_for(cn, serial, issuer=None, chain=False, days=(-1, 30)):
+    """The two certificate headers Traefik (client-headers@file) sends for
+    a leaf with CN `cn` issued by `issuer` (default: the YubiKey CA): the
+    Info text and the certificate itself."""
+    issuer = issuer or YUBIKEY_CA_CN
+    parts = [f'Subject="CN={cn}";Issuer="CN={issuer}";SerialNumber="{serial}";NB="1700000000";NA="1700086400"']
+    certs = [issue_leaf(cn, serial, issuer, days)]
+    if chain:
+        parts.append(f'Subject="CN={issuer}";Issuer="CN=example.com Root CA";SerialNumber="987654321";'
+                     'NB="1700000000";NA="1800000000"')
+        certs.append(ca_pair(issuer)[0])
+    return {gg.CERT_INFO_HEADER: urllib.parse.quote_plus(",".join(parts)), gg.CERT_PEM_HEADER: pem_header(*certs)}
 
 
 class RevocationGateTest(GateTest):
     def setUp(self):
         super().setUp()
         write_revoked(None)
-        gg.CRL_CACHE = None
+        gg.CRL_CACHE = READY_CRL
 
     def tearDown(self):
         write_revoked(None)
-        gg.CRL_CACHE = None
+        gg.CRL_CACHE = READY_CRL
 
     def test_no_cert_unaffected_by_revocations(self):
         write_revoked(["0a:bc"])
@@ -2067,14 +2133,14 @@ class DeltaCrlTest(GateTest):
     def setUp(self):
         super().setUp()
         write_revoked(None)
-        gg.CRL_CACHE = None
+        gg.CRL_CACHE = READY_CRL
         base = f"http://127.0.0.1:{self.crl_srv.server_address[1]}/v1/pki_int"
         self.cache = gg.CrlCache([base + "/crl"], 60, delta_urls=[base + "/crl/delta"])
 
     def tearDown(self):
         _CrlHandler.by_path = {}
         _CrlHandler.fetched = []
-        gg.CRL_CACHE = None
+        gg.CRL_CACHE = READY_CRL
 
     def test_union_of_full_and_delta(self):
         _CrlHandler.by_path = {"/v1/pki_int/crl": (200, build_crl([0x10])),
@@ -2116,11 +2182,11 @@ class MetricsTest(GateTest):
     def setUp(self):
         super().setUp()
         write_revoked(None)
-        gg.CRL_CACHE = None
+        gg.CRL_CACHE = READY_CRL
 
     def tearDown(self):
         write_revoked(None)
-        gg.CRL_CACHE = None
+        gg.CRL_CACHE = READY_CRL
 
     def scrape(self):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/metrics") as r:
@@ -2150,7 +2216,7 @@ class MetricsTest(GateTest):
         text = self.scrape()
         self.assertIn('group_gate_denials_total{reason="group"}', text)
         self.assertIn("# TYPE group_gate_requests_total counter", text)
-        self.assertIn("group_gate_crl_enabled 0", text)
+        self.assertIn("group_gate_crl_enabled 1", text)
         self.assertIn("group_gate_revoked_file_serials 0", text)
 
     def test_revoked_cert_reason_and_unreadable_file_gauge(self):
@@ -2206,7 +2272,8 @@ class MetricsTest(GateTest):
 
 # Traefik's own X-Forwarded-Tls-Client-Cert-Info example (passTLSClientCert
 # docs): Go's url.QueryEscape of Subject="…";Issuer="…";NB;NA;SAN, so a
-# space is "+". Pins the Issuer="…" format leaf_cert_issuer_cn reads.
+# space is "+". The Info text never decides a certificate's kind or user:
+# forwarded_leaf refuses it.
 TRAEFIK_INFO_FIXTURE = (
     "Subject%3D%22C%3DFR%2CST%3DIle-de-France%2CL%3DParis%2CO%3DCheese%2CCN%3D%2A.cheese.org%22%3B"
     "Issuer%3D%22DC%3Dorg%2CDC%3Dcheese%2CC%3DFR%2CC%3DUS%2CST%3DSigning+State%2CST%3DSigning+State+2%2C"
@@ -2216,16 +2283,13 @@ TRAEFIK_INFO_FIXTURE = (
 
 
 def leaf_info(cn, serial, issuer=YUBIKEY_CA_CN, chain=True):
-    """Traefik's header for a leaf of `issuer` (client-headers@file: the
-    issuer's CN only), the intermediate after it when `chain`."""
-    parts = [f'Subject="CN={cn}";Issuer="CN={issuer}";SerialNumber="{serial}";NB="1700000000";NA="1700086400"']
-    if chain:
-        parts.append(f'Subject="CN={issuer}";Issuer="CN=example.com Root CA";SerialNumber="987654321";'
-                     'NB="1700000000";NA="1800000000"')
-    return urllib.parse.quote_plus(",".join(parts))
+    """cert_info_for with the intermediate after the leaf."""
+    return cert_info_for(cn, serial, issuer, chain=chain)
 
 
 ALL_ON = sorted(gg.METHOD_IDS)
+# A CRL nextUpdate far ahead (GeneralizedTime).
+FRESH = _der(0x18, b"20991231235959Z")
 
 
 class SigninPart2Test(GateTest):
@@ -2236,7 +2300,7 @@ class SigninPart2Test(GateTest):
     def setUp(self):
         super().setUp()
         write_revoked(None)
-        gg.CRL_CACHE = None
+        gg.CRL_CACHE = READY_CRL
         write_ca(YUBIKEY_CA, YUBIKEY_CA_CN)
         write_ca(BROWSER_CA, BROWSER_CA_CN)
         self._old = (gg.YUBIKEY_CA_FILE, gg.BROWSER_CA_FILE, gg.OPENED_LOG)
@@ -2245,7 +2309,7 @@ class SigninPart2Test(GateTest):
 
     def tearDown(self):
         gg.YUBIKEY_CA_FILE, gg.BROWSER_CA_FILE, gg.OPENED_LOG = self._old
-        gg.CRL_CACHE = None
+        gg.CRL_CACHE = READY_CRL
         _CrlHandler.by_path = {}
         _CrlHandler.fetched = []
         write_revoked(None)
@@ -2263,7 +2327,7 @@ class SigninPart2Test(GateTest):
              "X-Auth-Request-Groups": groups,
              "X-Forwarded-Access-Token": token(amr=list(amr), preferred_username=user, **(claims or {}))}
         if cert is not None:
-            h[gg.CERT_INFO_HEADER] = cert
+            h.update(cert) if isinstance(cert, dict) else h.__setitem__(gg.CERT_INFO_HEADER, cert)
         if uri is not None:
             h["X-Forwarded-Uri"] = uri
         h.update(extra or {})
@@ -2277,22 +2341,19 @@ class SigninPart2Test(GateTest):
 
     # ── certificate kinds by issuer (contract §4 "Certificate binding") ──
 
-    def test_leaf_cert_issuer_cn_traefik_format(self):
-        self.assertEqual(gg.leaf_cert_issuer_cn(TRAEFIK_INFO_FIXTURE), "Simple Signing CA")
-        self.assertEqual(gg.leaf_cert_cn(TRAEFIK_INFO_FIXTURE), "*.cheese.org")
-        self.assertEqual(gg.leaf_cert_issuer_cn(leaf_info("bob", 1)), YUBIKEY_CA_CN)
-        self.assertEqual(gg.leaf_cert_issuer_cn(leaf_info("bob", 1, BROWSER_CA_CN)), BROWSER_CA_CN)
-        # Twice escaped (some Traefik versions) reads the same.
-        self.assertEqual(gg.leaf_cert_issuer_cn(urllib.parse.quote_plus(leaf_info("bob", 1))), YUBIKEY_CA_CN)
-        # Only the leaf's own Issuer: a header that doesn't start with the
-        # leaf's Subject;Issuer, or a leaf without an Issuer whose chain has
-        # one, gives None.
-        for bad in ("", 'Issuer="CN=x"', 'SerialNumber="1";Subject="CN=bob";Issuer="CN=x"',
-                    urllib.parse.quote_plus(f'Subject="CN=bob";SerialNumber="1",Subject="CN=i";Issuer="CN={YUBIKEY_CA_CN}"'),
-                    urllib.parse.quote_plus('Subject="CN=bob";Issuer="CN=a,CN=b"'),
-                    urllib.parse.quote_plus('Subject="CN=bob";Issuer="O=x"')):
-            with self.subTest(bad=bad):
-                self.assertIsNone(gg.leaf_cert_issuer_cn(bad))
+    def test_forwarded_leaf_traefik_format(self):
+        leaf = issue_leaf("bob", 11, YUBIKEY_CA_CN)
+        ca = ca_pair(YUBIKEY_CA_CN)[0]
+        for raw in (pem_header(leaf), pem_header(leaf, ca), urllib.parse.unquote(pem_header(leaf)),
+                    "-----BEGIN CERTIFICATE-----" + urllib.parse.unquote(pem_header(leaf)) + "-----END CERTIFICATE-----"):
+            with self.subTest(raw=raw[:40]):
+                self.assertEqual(gg.forwarded_leaf(raw), leaf)
+        # Only the leaf (the first entry) is read.
+        self.assertEqual(gg.forwarded_leaf(pem_header(ca, leaf)), ca)
+        for bad in ("", "x", "%%%", "QUJD", urllib.parse.quote_plus(pem_header(leaf)),  # escaped twice
+                    "A" * (gg.CERT_PEM_MAX + 1), TRAEFIK_INFO_FIXTURE):
+            with self.subTest(bad=bad[:40]):
+                self.assertIsNone(gg.forwarded_leaf(bad))
 
     def test_ca_subject_cn(self):
         self.assertEqual(gg.ca_subject_cn(YUBIKEY_CA), YUBIKEY_CA_CN)
@@ -2309,11 +2370,59 @@ class SigninPart2Test(GateTest):
         os.unlink(der)
 
     def test_cert_method(self):
-        self.assertEqual(gg.cert_method(leaf_info("bob", 1)), "yubikey_cert")
-        self.assertEqual(gg.cert_method(leaf_info("bob", 1, BROWSER_CA_CN)), "browser_cert")
-        self.assertIsNone(gg.cert_method(leaf_info("bob", 1, "example.com Root CA")))
-        self.assertIsNone(gg.cert_method(leaf_info("bob", 1, "Someone Else CA")))
+        pem = lambda cn, issuer: cert_info_for(cn, 1, issuer)[gg.CERT_PEM_HEADER]  # noqa: E731
+        self.assertEqual(gg.cert_method(pem("bob", YUBIKEY_CA_CN)), "yubikey_cert")
+        self.assertEqual(gg.cert_method(pem("bob", BROWSER_CA_CN)), "browser_cert")
+        # A leaf signed by an unknown CA, the root, or nothing counts as nothing.
+        self.assertIsNone(gg.cert_method(pem("bob", "example.com Root CA")))
+        self.assertIsNone(gg.cert_method(pem("bob", "Someone Else CA")))
         self.assertIsNone(gg.cert_method(""))
+        # An impostor CA with the YubiKey CA's very name: the issuer name
+        # matches, the signature doesn't verify.
+        from cryptography import x509 as cx
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        k = ec.generate_private_key(ec.SECP256R1())
+        now = datetime.datetime.now(datetime.timezone.utc)
+        forged = (cx.CertificateBuilder().subject_name(cx.Name([cx.NameAttribute(cx.NameOID.COMMON_NAME, "bob")]))
+                  .issuer_name(ca_pair(YUBIKEY_CA_CN)[0].subject).public_key(k.public_key()).serial_number(5)
+                  .not_valid_before(now - datetime.timedelta(days=1)).not_valid_after(now + datetime.timedelta(days=1))
+                  .sign(k, hashes.SHA256()))
+        self.assertIsNone(gg.cert_method(pem_header(forged)))
+        # The Info header alone never makes a certificate count.
+        self.rules(t={"op": "any", "items": ["yubikey_cert"]})
+        info_only = {gg.CERT_INFO_HEADER: cert_info_for("bob", 1)[gg.CERT_INFO_HEADER]}
+        self.assertEqual(self.page(amr=["mtls"], cert=info_only)[0], 403)
+        self.assertEqual(self.page(amr=["mtls"], cert=cert_info_for("bob", 1))[0], 200)
+
+    def test_crafted_cn_never_fakes_the_issuer(self):
+        # Traefik writes Subject="…" unescaped: this CN, signed by pki_file,
+        # makes the Info text read Issuer="CN=<YubiKey CA>" first.
+        crafted = f'alice";Issuer="CN={YUBIKEY_CA_CN}'
+        headers = cert_info_for(crafted, 0x91, BROWSER_CA_CN)
+        info = urllib.parse.unquote_plus(headers[gg.CERT_INFO_HEADER])
+        self.assertTrue(info.startswith(f'Subject="CN=alice";Issuer="CN={YUBIKEY_CA_CN}"'), info)
+        self.assertEqual(gg.cert_method(headers[gg.CERT_PEM_HEADER]), "browser_cert")
+        self.assertIsNone(gg.leaf_user(gg.forwarded_leaf(headers[gg.CERT_PEM_HEADER])))
+        for rule in ({"op": "any", "items": ["yubikey_cert"]}, {"op": "any", "items": ["browser_cert"]}):
+            with self.subTest(rule=rule):
+                self.rules(t=rule)
+                for amr in (["mtls"], ["file"], ["mtls", "file"]):
+                    self.assertEqual(self.page(amr=amr, user="alice", cert=headers)[0], 403)
+
+    def test_cn_must_be_the_username_exactly(self):
+        self.rules(t={"op": "any", "items": ["yubikey_cert"]})
+        self.assertEqual(self.page(amr=["mtls"], user="alice", cert=cert_info_for("alice", 0x92))[0], 200)
+        for cn in ("alice+", "alice ", " alice", "alic%65", "Alice", "alice\x00", "alice,CN=bob", "ali ce"):
+            with self.subTest(cn=cn):
+                headers = cert_info_for(cn, 0x93)
+                self.assertIsNone(gg.bound_cert_method(gg.forwarded_leaf(headers[gg.CERT_PEM_HEADER]), "alice"))
+                self.assertEqual(self.page(amr=["mtls"], user="alice", cert=headers)[0], 403)
+        # Outside its validity: never bound.
+        for days in ((-10, -1), (1, 10)):
+            with self.subTest(days=days):
+                self.assertEqual(self.page(amr=["mtls"], user="alice",
+                                           cert=cert_info_for("alice", 0x94, days=days))[0], 403)
 
     def test_browser_leaf_never_binds_yubikey(self):
         # amr mtls, but the leaf is a browser certificate (pki_file).
@@ -2361,12 +2470,12 @@ class SigninPart2Test(GateTest):
 
     def test_equal_or_missing_ca_files_count_nothing(self):
         self.rules(t={"op": "any", "items": ["yubikey_cert", "browser_cert"]})
-        yk, br = leaf_info("bob", 8), leaf_info("bob", 8, BROWSER_CA_CN)
+        yk, br = leaf_info("bob", 8), leaf_info("bob", 9, BROWSER_CA_CN)
         self.assertEqual(self.page(amr=["mtls"], cert=yk)[0], 200)
         self.assertEqual(self.page(amr=["file"], cert=br)[0], 200)
         # The same CN in both files: neither kind counts.
         write_ca(BROWSER_CA, YUBIKEY_CA_CN)
-        self.assertIsNone(gg.cert_method(yk))
+        self.assertIsNone(gg.cert_method(yk[gg.CERT_PEM_HEADER]))
         self.assertEqual(self.page(amr=["mtls"], cert=yk)[0], 403)
         self.assertEqual(self.page(amr=["file"], cert=br)[0], 403)
         write_ca(BROWSER_CA, BROWSER_CA_CN)
@@ -2375,14 +2484,14 @@ class SigninPart2Test(GateTest):
             with self.subTest(missing=missing):
                 gg.YUBIKEY_CA_FILE = os.path.join(TMP, "nope.crt") if missing == "yubikey" else YUBIKEY_CA
                 gg.BROWSER_CA_FILE = os.path.join(TMP, "nope.crt") if missing == "browser" else BROWSER_CA
-                self.assertIsNone(gg.cert_method(yk))
-                self.assertIsNone(gg.cert_method(br))
+                self.assertIsNone(gg.cert_method(yk[gg.CERT_PEM_HEADER]))
+                self.assertIsNone(gg.cert_method(br[gg.CERT_PEM_HEADER]))
                 self.assertEqual(self.page(amr=["mtls"], cert=yk)[0], 403)
                 self.assertEqual(self.page(amr=["file"], cert=br)[0], 403)
         gg.YUBIKEY_CA_FILE, gg.BROWSER_CA_FILE = YUBIKEY_CA, BROWSER_CA
         with open(BROWSER_CA, "w") as f:
             f.write("not a certificate")
-        self.assertIsNone(gg.cert_method(yk))
+        self.assertIsNone(gg.cert_method(yk[gg.CERT_PEM_HEADER]))
         self.assertEqual(self.page(amr=["mtls"], cert=yk)[0], 403)
 
     def test_step_up_never_asks_held_cert_method(self):
@@ -2412,7 +2521,7 @@ class SigninPart2Test(GateTest):
         self.addCleanup(srv.server_close)
         self.addCleanup(srv.shutdown)
         base = f"http://127.0.0.1:{srv.server_address[1]}/v1"
-        _CrlHandler.by_path = {f"/v1/{p}": (200, build_crl(sns)) for p, sns in lists.items()}
+        _CrlHandler.by_path = {f"/v1/{p}": (200, build_crl(sns, next_update=FRESH)) for p, sns in lists.items()}
         return gg.CrlCache([f"{base}/pki_int/crl", f"{base}/pki_file/crl"], 60,
                            delta_urls=[f"{base}/pki_int/crl/delta", f"{base}/pki_file/crl/delta"])
 
@@ -2468,9 +2577,50 @@ class SigninPart2Test(GateTest):
         self.assertEqual(code, 403)
         self.assertIn('id="present-certificate"', body)
         self.assertEqual(self.page(amr=["hwk"], cert=leaf_info("bob", 0x70))[0], 200)
-        _CrlHandler.by_path["/v1/pki_file/crl/delta"] = (200, build_crl([]))
+        _CrlHandler.by_path["/v1/pki_file/crl/delta"] = (200, build_crl([], next_update=FRESH))
         self.assertTrue(cache.refresh())
         self.assertEqual(self.page(amr=["mtls"], cert=leaf_info("bob", 0x70))[0], 200)
+
+    def test_no_crl_list_counts_no_certificate(self):
+        gg.CRL_CACHE = None
+        self.assertFalse(gg.crl_ready())
+        self.rules(t={"op": "any", "items": ["yubikey_cert", "security_key"]})
+        self.assertEqual(self.page(amr=["mtls"], cert=leaf_info("bob", 0x71))[0], 403)
+        self.assertEqual(self.page(amr=["hwk"])[0], 200)
+
+    def test_stale_crl_counts_no_certificate(self):
+        # Past nextUpdate + 1 h (Keycloak's crl-abort-if-non-updated): not
+        # ready until it is read again with a fresh nextUpdate.
+        def utc(t):
+            return _der(0x18, time.strftime("%Y%m%d%H%M%SZ", time.gmtime(t)).encode())
+        cache = self.crl_cache({"pki_int/crl": [], "pki_int/crl/delta": [], "pki_file/crl": [],
+                                "pki_file/crl/delta": []})
+        _CrlHandler.by_path["/v1/pki_int/crl"] = (200, build_crl([], next_update=utc(time.time() - 3700)))
+        self.assertTrue(cache.refresh())
+        self.assertFalse(cache.ready)
+        gg.CRL_CACHE = cache
+        self.rules(t={"op": "any", "items": ["yubikey_cert"]})
+        self.assertEqual(self.page(amr=["mtls"], cert=leaf_info("bob", 0x72))[0], 403)
+        # Within the grace: ready.
+        _CrlHandler.by_path["/v1/pki_int/crl"] = (200, build_crl([], next_update=utc(time.time() - 3000)))
+        self.assertTrue(cache.refresh())
+        self.assertTrue(cache.ready)
+        self.assertEqual(self.page(amr=["mtls"], cert=leaf_info("bob", 0x72))[0], 200)
+        # No nextUpdate at all: never ready.
+        _CrlHandler.by_path["/v1/pki_int/crl"] = (200, build_crl([], with_next_update=False))
+        self.assertTrue(cache.refresh())
+        self.assertFalse(cache.ready)
+
+    def test_old_crl_variables_refuse_to_start(self):
+        for var in ("GATE_CRL_URL", "GATE_DELTA_CRL_URL"):
+            with self.subTest(var=var):
+                env = dict(os.environ, **{var: "http://vault:8200/v1/pki_int/crl"})
+                r = subprocess.run([sys.executable, GATE_PATH], env=env, capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(f"{var} no longer exist", r.stderr)
+                self.assertIn("GATE_CRL_URLS", r.stderr)
+                self.assertIn("refusing to start", r.stderr)
+        self.assertIsNone(gg.startup_problem())
 
     def test_crl_env_lists(self):
         env = dict(os.environ, GATE_CRL_URLS="http://v/pki_int/crl  http://v/pki_file/crl",
@@ -2567,7 +2717,9 @@ class SigninPart2Test(GateTest):
 
     # ── the opened log (contract §4 "Opened log") ──
 
-    def opened_lines(self):
+    def opened_lines(self, *logs):
+        for log in logs or (gg.OPENED_LOG,):
+            self.assertTrue(log.flush())
         out = []
         d = os.path.join(self.log_dir, "opened")
         for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
@@ -2632,9 +2784,11 @@ class SigninPart2Test(GateTest):
         gg.OPENED_LOG = gg.OpenedLog(os.path.join(blocker, "opened"), gid=os.getgid())
         before = gg.METRICS.get("group_gate_opened_log_failures_total")
         self.assertEqual(self.page(amr=["hwk"], claims={"sid": "sid-3"})[0], 200)
+        self.assertTrue(gg.OPENED_LOG.flush())
         self.assertEqual(gg.METRICS.get("group_gate_opened_log_failures_total"), before + 1)
         # Not remembered: the next request tries again.
         self.assertEqual(self.page(amr=["hwk"], claims={"sid": "sid-3"})[0], 200)
+        self.assertTrue(gg.OPENED_LOG.flush())
         self.assertEqual(gg.METRICS.get("group_gate_opened_log_failures_total"), before + 2)
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/metrics") as r:
             self.assertIn("group_gate_opened_log_failures_total", r.read().decode())
@@ -2643,9 +2797,10 @@ class SigninPart2Test(GateTest):
         log = gg.OpenedLog(os.path.join(self.log_dir, "opened"), capacity=2, gid=os.getgid())
         for sid in ("a", "b", "a", "c", "a", "b"):
             log.record("bob", sid, "h.example.com", "H", ["security_key"], "", "")
+            self.assertTrue(log.flush())
         # LRU of 2: the repeated "a" is remembered (and refreshed), so "c"
         # evicts "b", which then logs again.
-        sessions = [ln["session"] for _, ln in self.opened_lines()]
+        sessions = [ln["session"] for _, ln in self.opened_lines(log)]
         self.assertEqual(sessions, ["a", "b", "c", "b"])
         # Never raises, whatever it's given; a full day file stops growing.
         log.record(None, "x", None, None, None, None, None)
@@ -2654,8 +2809,10 @@ class SigninPart2Test(GateTest):
         small.DAY_FILE_MAX = 1
         before = gg.METRICS.get("group_gate_opened_log_failures_total")
         small.record("bob", "z", "h.example.com", "H", [], "", "")
+        self.assertTrue(small.flush())
         self.assertEqual(gg.METRICS.get("group_gate_opened_log_failures_total"), before + 1)
-        for _, ln in self.opened_lines():
+        self.assertEqual(gg.OpenedLog.DAY_FILE_MAX, 8 << 20)  # the Hub's per-day read window
+        for _, ln in self.opened_lines(log):
             self.assertNotIn("\n", ln["session"] + ln["ip"] + ln["ua"])
             self.assertEqual(ln["methods"], [m for m in gg.METHOD_IDS if m in ln["methods"]])
         # A symlinked day file is never written through.
@@ -2665,7 +2822,51 @@ class SigninPart2Test(GateTest):
         day = datetime.datetime(2030, 1, 2, tzinfo=datetime.timezone.utc)
         os.symlink(target, os.path.join(d, "2030-01-02.jsonl"))
         log.record("bob", "s", "h.example.com", "H", [], "", "", now=day)
+        self.assertTrue(log.flush())
         self.assertEqual(os.path.getsize(target), 0)
+
+    def test_opened_log_never_blocks_on_a_hung_volume(self):
+        # The writer thread is stuck (a hung volume): record() still
+        # returns at once, at most QUEUE_MAX lines wait, the rest are
+        # dropped and counted, and no other thread is started.
+        log = gg.OpenedLog(os.path.join(self.log_dir, "opened"), gid=os.getgid())
+        log.QUEUE_MAX = 3
+        log._queue = gg.queue.Queue(3)
+        release = threading.Event()
+        real = log._write
+        log._write = lambda now, line: (release.wait(10), real(now, line))
+        before = gg.METRICS.get("group_gate_opened_log_failures_total")
+        threads = threading.active_count()
+        t0 = time.monotonic()
+        for i in range(10):
+            log.record("bob", f"s{i}", "h.example.com", "H", [], "", "")
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertLessEqual(threading.active_count(), threads + 1)
+        # One taken by the writer, three queued, six dropped.
+        self.assertGreaterEqual(gg.METRICS.get("group_gate_opened_log_failures_total"), before + 6)
+        release.set()
+        self.assertTrue(log.flush())
+        self.assertEqual(len(self.opened_lines(log)), 10 - (gg.METRICS.get("group_gate_opened_log_failures_total") - before))
+
+    def test_opened_log_failure_logs_are_rate_limited(self):
+        import contextlib
+        import io
+        blocker = os.path.join(self.log_dir, "file")
+        open(blocker, "w").close()
+        log = gg.OpenedLog(os.path.join(blocker, "opened"), gid=os.getgid())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            for i in range(20):
+                log.record("bob", f"s{i}", "h.example.com", "H", [], "", "")
+                self.assertTrue(log.flush())
+        self.assertEqual(out.getvalue().count("opened log write failed"), 1)
+        self.assertIn("NotADirectoryError", log._last_error)
+        log._last_log -= log.LOG_EVERY + 1
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            log.record("bob", "late", "h.example.com", "H", [], "", "")
+            self.assertTrue(log.flush())
+        self.assertIn("20 failure(s) since the last report", out.getvalue())
 
     # ── links (contract §5, §10) ──
 

@@ -701,8 +701,11 @@ services:
       # auto_rebuild=true: Vault adds new revocations to the DELTA CRL
       # (rebuilt about once a minute) and folds them into the full CRL only
       # at its next rebuild — group-gate enforces both.
-      GATE_CRL_URL: http://vault:8200/v1/pki_int/crl
-      GATE_DELTA_CRL_URL: http://vault:8200/v1/pki_int/crl/delta
+      # Both CAs (pki_int: YubiKey certificates, pki_file: browser
+      # certificates), space-separated; the old GATE_CRL_URL /
+      # GATE_DELTA_CRL_URL make group-gate refuse to start.
+      GATE_CRL_URLS: http://vault:8200/v1/pki_int/crl http://vault:8200/v1/pki_file/crl
+      GATE_DELTA_CRL_URLS: http://vault:8200/v1/pki_int/crl/delta http://vault:8200/v1/pki_file/crl/delta
       # Required: core hosts are <sub>.<PORTCULLIS_DOMAIN> (map.conf) and
       # app hosts <label>.<PORTCULLIS_DOMAIN> or on an enrolled domain
       # (policy v5 extra_domains); any other X-Forwarded-Host is denied.
