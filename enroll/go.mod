@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/Nerzal/gocloak/v14 v14.0.4
-	github.com/go-jose/go-jose/v4 v4.1.7
+	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/go-ldap/ldap/v3 v3.4.15
 	github.com/hashicorp/vault/api v1.23.0
 )
