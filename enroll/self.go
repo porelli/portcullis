@@ -80,7 +80,7 @@ func checkRenewal(username string, cert *x509.Certificate, csrPEM, email string,
 		return errors.New("not signed in")
 	}
 	if cert == nil {
-		return errors.New("present your current client certificate (security key) to renew it")
+		return errors.New("present your current YubiKey certificate to renew it")
 	}
 	if cert.Subject.CommonName != username {
 		return errors.New("the presented certificate belongs to another account")

@@ -14,7 +14,8 @@
 #   vault.snap           Vault raft snapshot (sys/storage/raft/snapshot)
 #   postgres.dump        pg_dump -Fc of the Keycloak database
 #   <volume>.tar.gz      lldap_data, hub_data, traefik_acme, domains_data (age-encrypted),
-#                        mcp_gate_data (the MCP gate's access log): files, with every
+#                        mcp_gate_data (the MCP gate's access log), group_gate_data
+#                        (group-gate's opened log, sign-in history): files, with every
 #                        SQLite database copied through SQLite's online backup
 #                        API (consistent while the service keeps running);
 #                        hub_data includes the Hub's app instance backups
@@ -34,10 +35,13 @@ BACKUP_RESTIC_IMAGE="restic/restic:0.19.1@sha256:136600b6ff6843d61d355f7f71f460a
 # domains_data holds only the age-encrypted store (contract §12.4).
 # mcp_gate_data: the gate's access log (contract §15.8; 0640 group 10001,
 # so the volume root goes back as 10005:10001).
+# group_gate_data: group-gate's opened log, the sign-in history's source
+# kept a year (contract §8.2; opened/ 2770 and 0640 day files, group 10001,
+# so the volume root goes back as 10003:10001).
 # hub_secrets is NEVER backed up (offsite would carry password hashes) and
 # is emptied by restore (contract §11.6: a restored hash could revive a
 # leaked password). It is handled separately in cmd_restore.
-BACKUP_FILE_VOLUMES="lldap_data:$CT_UID_LLDAP:$CT_UID_LLDAP hub_data:$CT_UID_HUB:$CT_UID_HUB traefik_acme:0:0 domains_data:$CT_UID_DOMAINS:$CT_UID_DOMAINS mcp_gate_data:$CT_UID_MCP_GATE:$CT_UID_HUB"
+BACKUP_FILE_VOLUMES="lldap_data:$CT_UID_LLDAP:$CT_UID_LLDAP hub_data:$CT_UID_HUB:$CT_UID_HUB traefik_acme:0:0 domains_data:$CT_UID_DOMAINS:$CT_UID_DOMAINS mcp_gate_data:$CT_UID_MCP_GATE:$CT_UID_HUB group_gate_data:$CT_UID_GROUP_GATE:$CT_UID_HUB"
 # restic: fixed host + path, so snapshots of every run form one series.
 BACKUP_RESTIC_HOST="portcullis"
 BACKUP_SNAPSHOT_PATH="/portcullis-backup"

@@ -32,17 +32,19 @@ cert enroll | cert renew | cert revoke | cert list | cert sync
 
 `./portcullis <command> --help` documents each one.
 
-## Two Ways to Authenticate
+## Ways to Sign In
 
-| Method | How it works | Enrollment | Best for |
+| Method | How it works | Setting it up | Best for |
 |--------|-------------|------------|----------|
-| **WebAuthn** | Tap YubiKey in browser → Keycloak login | Visit enrollment page, tap key. Done. | Most users, browser apps |
-| **mTLS** | Client certificate on YubiKey → TLS handshake | CLI script or paste CSR in web UI | APIs, CLI tools, service-to-service |
+| **Passkey / security key** | Tap YubiKey (or use a passkey) in the browser → Keycloak sign-in | Open the setup link, tap key. Done. | Most users, browser apps |
+| **YubiKey certificate** | Certificate in the YubiKey's PIV slot → TLS handshake | `./portcullis cert enroll` (or the admin on the person's Sign-in tab); renewed on the Sign-in page | APIs, CLI tools, service-to-service |
+| **Browser certificate** | A certificate file installed in the browser (off by default) | Made on the Sign-in page (`https://people.<domain>/signin`) | Devices without a security key |
 
-Both methods are phishing-resistant and hardware-backed. Users can have both.
+The admin switches each method on or off (Hub → Settings → Sign-in methods);
+each app's sign-in template says which ones it accepts.
 
-**WebAuthn enrollment** requires zero local software — just a browser and a YubiKey.
-**mTLS enrollment** requires `ykman` CLI to write certificates to the YubiKey's PIV slot.
+**Passkeys** need zero local software — just a browser and a YubiKey.
+**YubiKey certificates** need the `ykman` CLI to write the certificate to the YubiKey's PIV slot.
 
 ## Architecture
 
@@ -53,15 +55,15 @@ Both methods are phishing-resistant and hardware-backed. Users can have both.
                               ▼
                     ┌───────────────────┐
                     │     Traefik       │
-                    │  mTLS + forward   │
+                    │ certs + forward   │
                     │  auth to Keycloak │
                     └────────┬──────────┘
                              │
          ┌───────────┬───────┼───────┬────────────┐
          ▼           ▼       ▼       ▼            ▼
     ┌─────────┐ ┌────────┐ ┌─────┐ ┌──────┐ ┌─────────┐
-    │ Enroll  │ │Keycloak│ │LLDAP│ │ Vault│ │ Your    │
-    │   UI    │ │WebAuthn│ │user │ │ PKI  │ │ apps    │
+    │ People /│ │Keycloak│ │LLDAP│ │ Vault│ │ Your    │
+    │ Sign-in │ │WebAuthn│ │user │ │ PKI  │ │ apps    │
     │         │ │SAML/   │ │dir  │ │  CA  │ │         │
     │         │ │OIDC IdP│ │     │ │      │ │         │
     └─────────┘ └────────┘ └─────┘ └──────┘ └─────────┘
@@ -69,22 +71,23 @@ Both methods are phishing-resistant and hardware-backed. Users can have both.
 
 | Component | Role | URL |
 |-----------|------|-----|
-| **Traefik** | Reverse proxy, wildcard TLS, mTLS, forward auth, dashboard | `traefik.<domain>` |
-| **Enrollment UI** | YubiKey enrollment hub (WebAuthn + mTLS) | `enroll.<domain>` |
+| **Traefik** | Reverse proxy, wildcard TLS, certificates at the TLS handshake, forward auth, dashboard | `traefik.<domain>` |
+| **enroll** | Setup links (`/invite/*`, the only route on `enroll.<domain>`) and certificate issuing for the Hub (internal) | `enroll.<domain>/invite/…` |
 | **Hub** | App catalog — enable/disable templates, manage sources (admins) | `hub.<domain>` |
-| **People** | The Hub's directory — users, groups, org chart, for every signed-in user (permissions checked per request) | `people.<domain>` |
+| **People** | The Hub's directory — users, groups, org chart, for every signed-in user (permissions checked per request) — and the Sign-in page (your passkeys, certificates, password, sign-in history) | `people.<domain>`, `people.<domain>/signin` |
 | **Keycloak** | WebAuthn, SAML/OIDC IdP, X.509 auth | `auth.<domain>` |
 | **LLDAP** | Lightweight user/group directory (its own UI is break-glass only: `./portcullis lldap-ui`; `directory.<domain>` redirects to `people.<domain>`) | (internal) |
-| **Vault PKI** | Private CA, issues client certificates (30 days, self-service renewal) | `localhost:8200` |
+| **Vault PKI** | Internal certificate authority: YubiKey certificates (`pki_int`) and browser certificates (`pki_file`), 30 days, renewed on the Sign-in page | `localhost:8200` |
 | **Forward Auth** | OIDC bridge — redirects unauthenticated browser users to Keycloak | (internal) |
 
 ## Access Tiers
 
 | Tier | How | Use case |
 |------|-----|----------|
-| **mTLS only** | `tls.options=protected` | Requires PIV client cert. High-security admin tools, APIs. |
+| **YubiKey certificate only** | `tls.options=protected` | Requires a YubiKey certificate at the TLS handshake. High-security admin tools, APIs. |
+| **Any certificate** | `tls.options=protected-any` | Requires a YubiKey or browser certificate at the TLS handshake. |
 | **WebAuthn** | `tls.options=public` + `portcullis-auth@docker` | Redirects to Keycloak → tap YubiKey. Browser apps. |
-| **Both** | `tls.options=authaware` + `portcullis-auth@docker` | mTLS if cert present, WebAuthn fallback. Best UX. |
+| **Both** | `tls.options=authaware` + `portcullis-auth@docker` | Certificate if present, WebAuthn fallback. Best UX. |
 | **Public** | `tls.options=public` | No auth. Public pages. |
 
 ## Workflow
@@ -109,15 +112,17 @@ A second link adds another key (a spare); for a lost or stolen key use
 `./portcullis invite <user> --replace-keys`, which removes the old keys first.
 `https://<domain>/` lists the apps a user may open (and the Hub for admins).
 
-**mTLS (CLI — for advanced users):**
+**YubiKey certificate (CLI — for advanced users):**
 ```bash
 ./portcullis cert enroll <username> <email>
 ```
 
-Or use the web UI at `https://enroll.<domain>` → "mTLS Certificate" for a guided flow.
-Certificates last 30 days (`CLIENT_CERT_TTL`); users renew their own at
-`https://enroll.<domain>/self` (same key, cert still valid). With the cert
-selected in the browser, users can also log in to Keycloak by X.509.
+Or, as an admin, issue one from the person's Sign-in tab on `https://people.<domain>`.
+Certificates last 30 days (`CLIENT_CERT_TTL`); people renew their own on the
+Sign-in page, `https://people.<domain>/signin` (same key, certificate still
+valid), where they can also make a browser certificate when that method is
+on. With the certificate selected in the browser, people can also sign in
+to Keycloak with it.
 
 ### 3. Add services
 
@@ -132,7 +137,7 @@ labels:
   traefik.http.services.myapp.loadbalancer.server.port: "8080"
 ```
 
-**mTLS-protected app** (high security):
+**YubiKey-certificate-protected app** (high security):
 ```yaml
 labels:
   traefik.enable: "true"
@@ -143,7 +148,7 @@ labels:
   traefik.http.services.myapp.loadbalancer.server.port: "8080"
 ```
 
-**Both (mTLS if available, WebAuthn fallback):**
+**Both (a certificate if available, WebAuthn fallback):**
 ```yaml
 labels:
   traefik.http.routers.myapp.tls.options: authaware
@@ -163,7 +168,7 @@ All guides are on the [documentation site](https://porelli.github.io/portcullis-
 | Guide | Description |
 |-------|-------------|
 | [DNS Configuration](https://porelli.github.io/portcullis-docs/setup/dns/) | DNS setup, Cloudflare config, wildcard certs, one domain per installation, local dev |
-| [TLS & mTLS](https://porelli.github.io/portcullis-docs/setup/certificates/) | ACME staging/production, client certificates, revocation, Vault PKI and auto-unseal |
+| [Certificates](https://porelli.github.io/portcullis-docs/setup/certificates/) | Website certificates (HTTPS, ACME staging/production), YubiKey and browser certificates, revocation, the internal certificate authority and auto-unseal |
 | [SAML Integration](https://porelli.github.io/portcullis-docs/guides/saml-app/) | Nextcloud walkthrough — register in Keycloak, configure SAML SSO |
 | [Header Auth Pattern](https://porelli.github.io/portcullis-docs/guides/header-auth-app/) | Trusted-header login (`X-Forwarded-User`, Traefik-only trust) for Kanboard, Grafana, Gitea, Wiki.js, pgAdmin, … |
 | [CLI Reference](https://porelli.github.io/portcullis-docs/operations/cli/) | Every `./portcullis` command and option |
@@ -194,14 +199,14 @@ All guides are on the [documentation site](https://porelli.github.io/portcullis-
 ├── vault/                          # Vault server config (raft), auto-unseal entrypoint, enroll policy
 ├── secrets/                        # Vault root token, unseal key, enroll AppRole creds (gitignored, 0700)
 ├── tests/                          # Unit tests (CLI, shell libs, group-gate); e2e/ browser login test (CI)
-├── enroll/                         # Enrollment web UI (Go)
+├── enroll/                         # Setup links + certificate issuing for the Hub (Go)
 │   ├── main.go
 │   ├── Dockerfile
-│   └── web/                        # HTML templates
+│   └── web/                        # The setup-link page
 ├── traefik/                        # Static config: env vars in docker-compose.yml
 │   └── dynamic/
-│       ├── tls.yml                 # TLS options (protected/authaware/public)
-│       ├── middlewares.yml         # Client cert headers, rate limits, security headers
+│       ├── tls.yml                 # TLS options (protected/protected-any/authaware/public)
+│       ├── middlewares.yml         # Certificate headers, rate limits, security headers
 │       ├── external-services.yml   # Non-Docker services
 │       └── local/                  # Your custom routers/middlewares (gitignored)
 └── keycloak/
@@ -265,7 +270,7 @@ Portcullis is an auth layer that works with existing platforms:
 | **YunoHost** | LLDAP as LDAP provider, Keycloak as SAML IdP |
 | **Headscale** | OIDC → Keycloak for node registration, Headplane admin UI behind Traefik |
 | **NetBird** | OIDC → Keycloak for peer auth, dashboard + management behind Traefik |
-| **Coolify** | Traefik mTLS/forward-auth in front, Coolify handles deploys |
+| **Coolify** | Traefik (certificates, forward-auth) in front, Coolify handles deploys |
 | **Kubernetes** | Traefik as Ingress Controller, cert-manager for ACME, Keycloak as OIDC provider |
 | **Any Docker app** | Add Traefik labels to join the network |
 
@@ -273,8 +278,8 @@ Portcullis is an auth layer that works with existing platforms:
 
 - **Vault**: runs in server mode (raft storage) and auto-unseals from `secrets/` on the host — back up `secrets/vault-init.json` (root token + unseal key) **offline**
 - **Secrets**: `portcullis init` generates every password and secret into `.env` (0600); docker compose refuses to start if one is missing — there are no default passwords
-- **Revocation**: `./portcullis cert revoke <serial>` — enforced by group-gate on every request (Traefik itself doesn't check CRLs), by Keycloak's X.509 login (CRL) and by the mTLS binding (an `amr=mtls` session needs the unrevoked cert on every request); see [TLS & mTLS](https://porelli.github.io/portcullis-docs/setup/certificates/#revocation)
-- **Renewal**: client certs live `CLIENT_CERT_TTL` (default 30 days); users renew their own at `https://enroll.<domain>/self` with the cert still valid, `portcullis status` warns 7 days ahead
+- **Revocation**: `./portcullis cert revoke <serial>` — enforced by group-gate on every request (Traefik itself doesn't check CRLs), by Keycloak's certificate sign-in (each CA's CRLs) and by the certificate binding (a session signed in with a YubiKey or browser certificate needs that unrevoked certificate on every request); see [Certificates](https://porelli.github.io/portcullis-docs/setup/certificates/#revocation)
+- **Renewal**: YubiKey and browser certificates live at most `CLIENT_CERT_TTL` (default 30 days); people renew their YubiKey certificate (with it still valid) or make a new browser certificate on the Sign-in page, `https://people.<domain>/signin`; `portcullis status` warns 7 days ahead
 - **Backups**: `./portcullis backup` (also run by `upgrade`) makes a consistent backup without stopping anything (Vault raft snapshot, `pg_dump`, SQLite online backup, `.env`, `certs/`, `secrets/`); `--offsite` uploads it to a restic repository, encrypted with `BACKUP_PASSWORD` — **store that password offline**, the backups contain the Vault root token and unseal key. `backup verify` restores and checks it, `backup schedule --systemd` runs it daily, `restore [--from-offsite]` puts it back; see [Backups](https://porelli.github.io/portcullis-docs/operations/backups/)
 - **Monitoring**: `COMPOSE_PROFILES=monitoring` adds Prometheus, Alertmanager and Grafana (`https://metrics.<domain>`, `lldap_admin`) with alerts for a sealed Vault, expiring certificates, a stale CRL, deny spikes, down services and old backups; see [Monitoring](https://porelli.github.io/portcullis-docs/operations/monitoring/)
 - **Identity**: apps receive the LLDAP **username** as `X-Forwarded-User` and the email separately as `X-Forwarded-Email` — users can edit their own email in LLDAP, so never key accounts on it; see [Security & Hardening](https://porelli.github.io/portcullis-docs/operations/hardening/#header-spoofing-protections)
@@ -284,4 +289,4 @@ Portcullis is an auth layer that works with existing platforms:
 - **Hub image**: `HUB_IMAGE` (default `ghcr.io/porelli/portcullis-hub:edge` on `main`; a core release pins a released Hub tag by digest); `./portcullis version` shows the core version and the Hub and Keycloak images in use. The Hub gets a generated env subset (`secrets/hub/core.env`), never the core `.env`, and no LLDAP credentials
 - **Keycloak image**: `KEYCLOAK_IMAGE` (default `ghcr.io/porelli/portcullis-keycloak:edge` on `main`: the official Keycloak, pinned by digest, plus Portcullis's sign-in extension; a core release pins a released tag by digest)
 - **Releases**: `vX.Y.Z` tags; `release.yml` runs the full CI, requires released, digest-pinned `HUB_IMAGE` and `KEYCLOAK_IMAGE` defaults and a `CHANGELOG.md` section, and publishes notes plus a tarball with its sha256. Dependabot proposes weekly image/action/module updates; CI fails on any unpinned image or action
-- **PIV PIN**: enforce PIN changes from default (123456) for mTLS users
+- **PIV PIN**: enforce PIN changes from default (123456) for YubiKey certificate users

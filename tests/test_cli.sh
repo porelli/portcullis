@@ -258,8 +258,10 @@ case "$p" in
   "$R/client-scopes/mcp-id") jq -c '.[4]' "$KC_FIX/scopes.json" ;;
   "$R") echo '{"realm":"portcullis","browserFlow":"portcullis-universal","loginTheme":"portcullis"}' ;;
   "$R/authentication/flows/portcullis-universal/executions")
-    echo '[{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509-id"},{"providerId":"portcullis-method","level":3},{"providerId":"portcullis-template","level":0}]' ;;
+    echo '[{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509-id"},{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509b-id"},{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509c-id"},{"providerId":"portcullis-method","level":3},{"providerId":"portcullis-template","level":0}]' ;;
   "$R/authentication/config/x509-id") echo '{"id":"x509-id","alias":"x509-config","config":{"default.reference.value":"mtls","default.reference.maxAge":"36000"}}' ;;
+  "$R/authentication/config/x509b-id") echo '{"id":"x509b-id","alias":"x509-browser-config","config":{"default.reference.value":"file","default.reference.maxAge":"36000"}}' ;;
+  "$R/authentication/config/x509c-id") echo '{"id":"x509c-id","alias":"operator-x509","config":{"default.reference.value":"mtls","default.reference.maxAge":"36000"}}' ;;
   *\?*|*/flows|*/executions|*/client-scopes|*/models|*/instances|*-client-scopes|*/roles) echo '[]' ;;
   *) echo '{}' ;;
 esac
@@ -283,6 +285,16 @@ expect_eq "keycloak configure: the amr check walks the new browser flow (a portc
   "$(grep -c 'portcullis-universal/portcullis-method has no authenticator config' "$WORK/err"):$(grep -c 'portcullis-universal/portcullis-x509' "$WORK/err")" "1:0"
 expect_eq "keycloak configure: x509-config pushed onto the portcullis-x509 execution's config" \
   "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis/authentication/config/x509-id") | .b | fromjson | .config["x509-cert-auth.confirmation-page-disallowed"]]' "$WORK/kc/log")" '["true"]'
+# x509_put <config id> — the method, reference, CA and CRL paths keycloak configure PUT there.
+x509_put() { jq -sc --arg p "/admin/realms/portcullis/authentication/config/$1" '[.[] | select(.m == "PUT" and .p == $p) | .b | fromjson
+    | {alias, m: .config["portcullis.method"], ref: .config["default.reference.value"], ca: .config["portcullis.ca"], crl: .config["x509-cert-auth.crl-relative-path"]}]' "$WORK/kc/log"; }
+expect_eq "keycloak configure pushes x509-browser-config onto the browser execution and x509-config onto the YubiKey one (stubbed kc_get / kc_put)" \
+  "$(x509_put x509-id) $(x509_put x509b-id)" \
+  '[{"alias":"x509-config","m":"yubikey_cert","ref":"mtls","ca":"/opt/keycloak/conf/truststores/portcullis/portcullis-yubikey-ca.pem","crl":"http://vault:8200/v1/pki_int/crl##http://vault:8200/v1/pki_int/crl/delta"}] [{"alias":"x509-browser-config","m":"browser_cert","ref":"file","ca":"/opt/keycloak/conf/truststores/portcullis/portcullis-browser-ca.pem","crl":"http://vault:8200/v1/pki_file/crl##http://vault:8200/v1/pki_file/crl/delta"}]'
+expect_eq "keycloak configure: an x509 config with another alias is left alone (warned)" \
+  "$(x509_put x509c-id):$(grep -c 'x509 config operator-x509 is not one of' "$WORK/err")" '[]:1'
+expect_eq "keycloak configure never touches the events config (no events request, no events keys in a realm PUT)" \
+  "$(jq -sc '[.[] | select((.p | test("/events")) or (.m == "PUT" and .p == "/admin/realms/portcullis" and (.b | fromjson | keys | any(test("^(events|enabledEventTypes|adminEvents)")))))] | length' "$WORK/kc/log")" 0
 expect_eq "keycloak configure: realm PUT has brute force (D6) and an empty acr.loa.map" \
   "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis") | .b | fromjson
       | select(has("bruteForceProtected")) | {bruteForceProtected, failureFactor, waitIncrementSeconds, maxFailureWaitSeconds, permanentLockout, loa: .attributes["acr.loa.map"]}] | unique' "$WORK/kc/log")" \
@@ -305,8 +317,21 @@ expect_eq "realm export: portcullis-universal is REQUIRED portcullis-authenticat
 expect_eq "realm export: portcullis-universal is the browser flow" "$(jq -r .browserFlow "$RX")" portcullis-universal
 expect_eq "realm export: portcullis-authenticate = cookie | invite redirector | portcullis-signin" \
   "$(flow portcullis-authenticate)" '["ALTERNATIVE auth-cookie","ALTERNATIVE identity-provider-redirector","ALTERNATIVE portcullis-signin"]'
-expect_eq "realm export: portcullis-signin = x509 | passkey sub-flow | password form" \
-  "$(flow portcullis-signin)" '["ALTERNATIVE portcullis-x509","ALTERNATIVE portcullis-signin-passkey","ALTERNATIVE portcullis-password-form"]'
+expect_eq "realm export: portcullis-signin = x509 | x509 | passkey sub-flow | password form" \
+  "$(flow portcullis-signin)" '["ALTERNATIVE portcullis-x509","ALTERNATIVE portcullis-x509","ALTERNATIVE portcullis-signin-passkey","ALTERNATIVE portcullis-password-form"]'
+expect_eq "realm-export: portcullis-signin = x509 (x509-config, mtls, yubikey CA), x509 (x509-browser-config, file, browser CA), passkey sub-flow, password form, in that order" \
+  "$(jq -c '.authenticatorConfig as $c | [.authenticationFlows[] | select(.alias == "portcullis-signin") | .authenticationExecutions | sort_by(.priority)[]
+      | (.authenticatorConfig // "") as $n | [.priority, (.authenticator // .flowAlias), $n,
+         ([$c[] | select(.alias == $n) | .config | .["default.reference.value"], .["portcullis.method"], .["portcullis.ca"]] | map(. // "") | join(" "))]]' "$RX")" \
+  '[[10,"portcullis-x509","x509-config","mtls yubikey_cert /opt/keycloak/conf/truststores/portcullis/portcullis-yubikey-ca.pem"],[20,"portcullis-x509","x509-browser-config","file browser_cert /opt/keycloak/conf/truststores/portcullis/portcullis-browser-ca.pem"],[30,"portcullis-signin-passkey","",""],[40,"portcullis-password-form","password-config","pwd  "]]'
+expect_eq "realm-export: each x509 config's CRL paths name only its own mount" \
+  "$(jq -c '[.authenticatorConfig[] | select(.config | has("portcullis.method")) | {(.alias): .config["x509-cert-auth.crl-relative-path"]}] | add' "$RX")" \
+  '{"x509-config":"http://vault:8200/v1/pki_int/crl##http://vault:8200/v1/pki_int/crl/delta","x509-browser-config":"http://vault:8200/v1/pki_file/crl##http://vault:8200/v1/pki_file/crl/delta"}'
+expect_eq "realm-export: both x509 configs check CRLs, abort on a stale CRL and keep the same X.509 settings" \
+  "$(jq -c '[.authenticatorConfig[] | select(.config | has("portcullis.method")) | .config
+      | del(.["portcullis.method"], .["portcullis.ca"], .["default.reference.value"], .["x509-cert-auth.crl-relative-path"])] | (unique | length), .[0]["x509-cert-auth.crl-checking-enabled"], .[0]["x509-cert-auth-crl-abort-if-non-updated"]' "$RX" | tr '\n' ' ')" '1 "true" "true" '
+expect_eq "realm-export: events LOGIN, LOGIN_ERROR, expiration 31536000" \
+  "$(jq -c '[.eventsEnabled, (.enabledEventTypes | sort), .eventsExpiration]' "$RX")" '[true,["LOGIN","LOGIN_ERROR"],31536000]'
 expect_eq "realm export: portcullis-signin-passkey = REQUIRED portcullis-passkey + one CONDITIONAL sub-flow per kind" \
   "$(flow portcullis-signin-passkey)" '["REQUIRED portcullis-passkey","CONDITIONAL portcullis-passkey-security-key","CONDITIONAL portcullis-passkey-device","CONDITIONAL portcullis-passkey-synced"]'
 for k in security-key:security_key:hwk device:passkey_device:dpk synced:passkey_synced:spk; do
@@ -328,7 +353,7 @@ expect_eq "realm export: acr.loa.map is {}" "$(jq -r '.attributes["acr.loa.map"]
 expect_eq "every reference config has maxAge 36000" \
   "$(jq -c '[.authenticatorConfig[].config | select(has("default.reference.value")) | .["default.reference.maxAge"]] | unique' "$RX")" '["36000"]'
 expect_eq "realm export: every amr of the browser and invite flows has a reference config" \
-  "$(jq -c '[.authenticatorConfig[].config | .["default.reference.value"] // empty] | sort' "$RX")" '["dpk","hwk","inv","mtls","pwd","spk"]'
+  "$(jq -c '[.authenticatorConfig[].config | .["default.reference.value"] // empty] | sort' "$RX")" '["dpk","file","hwk","inv","mtls","pwd","spk"]'
 expect_eq "realm export: the invite post-broker flow keeps admit / deny, records inv, ends with portcullis-template" \
   "$(flow portcullis-invite-session)" '["CONDITIONAL portcullis-invite-client","CONDITIONAL portcullis-invite-deny","REQUIRED allow-access-authenticator","REQUIRED portcullis-template"]'
 expect_eq "invite amr configs say inv" \
@@ -585,7 +610,7 @@ BAD=""
 for r in $ROUTERS; do
   grep -qE "^[[:space:]]+traefik\.http\.routers\.$r\.tls\.options: authaware@file$" "$ROOT_DIR/docker-compose.yml" || BAD="$BAD $r"
 done
-expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:16"
+expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:14"
 expect_eq "no other tls.options in docker-compose.yml" "$(grep -E 'tls\.options:' "$ROOT_DIR/docker-compose.yml" | grep -vc 'authaware@file$' || true)" 0
 # The Hub can't write traefik/: /project is read-only and no writable mount
 # (short or long syntax: bind, volume, tmpfs) has traefik in its source or
@@ -615,7 +640,7 @@ expect_eq "the hub service mounts nothing under traefik/ read-write" \
 expect_eq "the hub mounts the checkout read-only" "$(printf '%s\n' "$HUB_SVC" | grep -c '^      - \.:/project:ro$')" 1
 expect_eq "the Hub's writable mounts are exactly templates/, appfiles/, its volumes and the masking tmpfs" \
   "$(hub_writable_mounts "$ROOT_DIR/docker-compose.yml" | LC_ALL=C sort | tr '\n' ';')" \
-  "(tmpfs) -> /project/backups;(tmpfs) -> /project/secrets;./appfiles -> /project/appfiles;./templates -> /project/templates;hub_data -> /data;hub_secrets -> /secrets;"
+  "(tmpfs) -> /project/backups;(tmpfs) -> /project/secrets;./appfiles -> /project/appfiles;./templates -> /project/templates;group_gate_data -> /group-gate-data;hub_data -> /data;hub_secrets -> /secrets;"
 # The check itself catches both syntaxes (planted mounts on a copy).
 awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      - ./traefik/dynamic:/project/traefik/dynamic" }' "$ROOT_DIR/docker-compose.yml" > "$WORK/compose-short.yml"
 awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      - type: bind"; print "        source: ./traefik"; print "        target: /etc/x"; print "        read_only: false" }' "$ROOT_DIR/docker-compose.yml" > "$WORK/compose-long.yml"
@@ -623,6 +648,41 @@ awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      
 expect_eq "the traefik mount check catches a short-syntax rw bind" "$(hub_writable_mounts "$WORK/compose-short.yml" | grep -c traefik || true)" 1
 expect_eq "the traefik mount check catches a long-syntax rw bind" "$(hub_writable_mounts "$WORK/compose-long.yml" | grep -c traefik || true)" 1
 expect_eq "the traefik mount check passes a long-syntax read-only bind" "$(hub_writable_mounts "$WORK/compose-long-ro.yml" | grep -c traefik || true)" 0
+
+# ── sign-in part 2 wiring (contract §4, §5 "Core routers", §8.1, §8.2) ──
+DC="$ROOT_DIR/docker-compose.yml"
+# svc <name> — the lines of one compose service.
+svc() { awk -v s="  $1:" '$0 == s { f = 1; next } f && /^  [a-z][a-z0-9-]*:$/ { exit } f' "$DC"; }
+GG_SVC="$(svc group-gate)"
+expect_eq "no router in docker-compose.yml routes enroll.<domain> except enroll-invite (PathPrefix /invite/)" \
+  "$(grep -hE '^[[:space:]]+traefik\.http\.routers\.[a-z0-9-]+\.rule: .*enroll\.' "$DC" "$ROOT_DIR/docker-compose.apps.yml" "$ROOT_DIR/docker-compose.test.yml" | sed 's/^[[:space:]]*//')" \
+  'traefik.http.routers.enroll-invite.rule: Host(`enroll.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/invite/`)'
+expect_eq "no enroll or enroll-self router labels left" \
+  "$(grep -cE 'traefik\.http\.routers\.enroll(-self)?\.' "$DC" || true)" 0
+expect_eq "no portcullis-self middleware and no \"/authenticated\" anywhere" \
+  "$(git -C "$ROOT_DIR" grep -lE 'portcullis-self|/authenticated' -- ':!CHANGELOG.md' ':!tests/test_cli.sh' ':!tests/test_group_gate.py' || true)" ""
+expect_eq "the people router uses client-cert-pem@file, before portcullis-groups@docker" \
+  "$(svc hub | sed -n 's/^      traefik\.http\.routers\.people\.middlewares: //p')" \
+  "rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file"
+expect_eq "group-gate mounts group_gate_data read-write, has group_add 10001, and both CA files read-only; GATE_CRL_URLS lists pki_int and pki_file" \
+  "$(printf '%s\n' "$GG_SVC" | grep -cxE '      - group_gate_data:/data|    group_add: \["10001"\]|      - \./certs/yubikey-ca\.crt:/etc/group-gate/ca/yubikey-ca\.crt:ro|      - \./certs/browser-ca\.crt:/etc/group-gate/ca/browser-ca\.crt:ro|      GATE_YUBIKEY_CA_FILE: /etc/group-gate/ca/yubikey-ca\.crt|      GATE_BROWSER_CA_FILE: /etc/group-gate/ca/browser-ca\.crt|      GATE_OPENED_DIR: /data/opened|      GATE_CRL_URLS: http://vault:8200/v1/pki_int/crl http://vault:8200/v1/pki_file/crl|      GATE_DELTA_CRL_URLS: http://vault:8200/v1/pki_int/crl/delta http://vault:8200/v1/pki_file/crl/delta'):$(printf '%s\n' "$GG_SVC" | grep -cE 'GATE_(DELTA_)?CRL_URL:' || true)" "9:0"
+expect_eq "hub mounts group_gate_data; HUB_CLIENT_CERT_TTL follows CLIENT_CERT_TTL" \
+  "$(svc hub | grep -cxE '      - group_gate_data:/group-gate-data|      HUB_GROUP_GATE_DATA_DIR: /group-gate-data|      HUB_CLIENT_CERT_TTL: \$\{CLIENT_CERT_TTL:-720h\}|      HUB_CERT_EXPIRY_WARN_DAYS: \$\{CERT_EXPIRY_WARN_DAYS:-7\}')" 4
+expect_eq "only group-gate and the Hub mount group_gate_data, and it is a declared volume" \
+  "$(for s in $(grep -E '^  [a-z][a-z0-9-]*:$' "$DC" | tr -d ' :' | sort -u); do svc "$s" | grep -q '^      - group_gate_data:' && echo "$s"; done | tr '\n' ' ')$(awk '/^volumes:$/ { v = 1; next } v && /^  group_gate_data:$/ { print "declared" }' "$DC")" "group-gate hub declared"
+# shellcheck disable=SC2016  # a literal ${PORTCULLIS_DOMAIN:-...}
+expect_eq "keycloak gets PORTCULLIS_SIGNIN_URL = the Sign-in page" \
+  "$(svc keycloak | sed -n 's/^      PORTCULLIS_SIGNIN_URL: //p')" 'https://people.${PORTCULLIS_DOMAIN:-portcullis.local}/signin'
+expect_eq "group-gate-map.conf has no enroll entry" "$(grep -cE '^[[:space:]]*enroll[[:space:]]*=' "$ROOT_DIR/group-gate/group-gate-map.conf" || true)" 0
+expect_eq "no file in the repo matches enroll\\.[^ ]*/self" \
+  "$(git -C "$ROOT_DIR" grep -lE 'enroll\.[^ ]*/self' -- ':!CHANGELOG.md' ':!tests/test_cli.sh' || true)" ""
+# User-facing texts (D34): "YubiKey certificate" / "Browser certificate"; a
+# "client cert" stays only in code comments and contract internals.
+expect_eq "no user-facing text (README, .env.example, docs, monitoring, theme, CLI output / help) says \"client certificate\"" \
+  "$(git -C "$ROOT_DIR" grep -niE 'client cert' -- README.md .env.example docs monitoring keycloak/themes portcullis scripts/lib enroll/web group-gate/group-gate-map.conf \
+      | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)" ""
+expect_eq "tls.yml's header says which option uses which chain and who uses it" \
+  "$(grep -cE '^# (protected|protected-any|authaware|public): ' "$TLS_YML"):$(grep -c 'Used by' "$TLS_YML")" "4:4"
 
 # config apply leaves tls.yml byte-identical and writes no traefik file.
 CA_ROOT="$WORK/ca-root"

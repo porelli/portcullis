@@ -255,6 +255,8 @@ wait_healthy() {
 CT_GID_VAULT=1000     # hashicorp/vault: vault = 100:1000
 CT_UID_HUB=10001      # ghcr.io/porelli/portcullis-hub (USER 10001:10001)
 CT_UID_ENROLL=10002   # enroll/Dockerfile (USER 10002:10002)
+# shellcheck disable=SC2034  # used by backup.sh
+CT_UID_GROUP_GATE=10003 # group-gate/Dockerfile (USER 10003:10003, + group 10001)
 # shellcheck disable=SC2034  # used by domains.sh / backup.sh
 CT_UID_DOMAINS=10004  # domains/Dockerfile (USER 10004:10004)
 # shellcheck disable=SC2034  # used by mcpgate.sh / backup.sh
@@ -425,6 +427,15 @@ stack_prepare() {
   (umask 077 && mkdir -p "$PORTCULLIS_ROOT/backups")
   (umask 027 && mkdir -p "$PORTCULLIS_ROOT/appfiles")
   [ -f "$PORTCULLIS_ROOT/certs/revocation/revoked-serials.txt" ] || : > "$PORTCULLIS_ROOT/certs/revocation/revoked-serials.txt"
+  # group-gate bind-mounts the two CA files (contract §4 "Certificate
+  # binding"): they must be files before the first `up` (Docker would make
+  # directories), empty until ./portcullis pki setup writes them — an empty
+  # or unreadable file means no certificate counts (fail closed).
+  local ca
+  for ca in yubikey-ca.crt browser-ca.crt; do
+    [ ! -d "$PORTCULLIS_ROOT/certs/$ca" ] || fail "$PORTCULLIS_ROOT/certs/$ca is a directory (made by Docker before pki setup): remove it (rmdir) and run again"
+    [ -f "$PORTCULLIS_ROOT/certs/$ca" ] || { : > "$PORTCULLIS_ROOT/certs/$ca"; chmod 644 "$PORTCULLIS_ROOT/certs/$ca"; }
+  done
   # Public material, read by Traefik (root w/o DAC_OVERRIDE), group-gate,
   # Keycloak and forward-auth (non-root).
   chmod 755 "$PORTCULLIS_ROOT/certs" "$PORTCULLIS_ROOT/certs/revocation" "$PORTCULLIS_ROOT/certs/truststore"
@@ -442,6 +453,10 @@ stack_prepare() {
   # sets the directory's mode / group itself at start, so the group here is
   # already the Hub's (never flipped back while the gate runs).
   volume_own mcp_gate_data "$CT_UID_MCP_GATE:$CT_UID_HUB"
+  # group_gate_data: group-gate writes the opened log (opened/ 2770 and
+  # 0640 day files, group 10001, set by group-gate itself); the Hub reads
+  # and prunes it through group 10001 (contract §4 "Opened log", §8.2).
+  volume_own group_gate_data "$CT_UID_GROUP_GATE:$CT_UID_HUB"
   # hub_secrets: per-person password hashes (contract §6, file sharing). The
   # Hub checks ownership and mode at start; ensure it here.
   _ensure_secrets_volume

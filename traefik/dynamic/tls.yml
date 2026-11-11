@@ -4,16 +4,29 @@
 #
 # The Hub picks one per app router (all routers of a host share it), from
 # the instance's compiled sign-in template and the certificate methods
-# that are switched on. Core routers (auth, hub, people, the portal, the
-# consoles, enroll, directory, mcp) always use authaware.
+# that are switched on (policy.Tier). Exactly these four options:
 #
 # protected:     RequireAndVerifyClientCert — a YubiKey certificate (root + pki_int
 #                only: certs/ca-chain-yubikey.crt) or the TLS handshake fails;
-#                a browser certificate never passes it
+#                a browser certificate never passes it.
+#                Used by auth.method: mtls apps and templates where every
+#                alternative has yubikey_cert.
 # protected-any: RequireAndVerifyClientCert — a YubiKey or browser certificate
-#                (certs/ca-chain.crt = root + pki_int + pki_file)
-# authaware:     VerifyClientCertIfGiven    — either kind optional, verified if present
-# public:        no clientAuth              — no client cert requested
+#                (certs/ca-chain.crt = root + pki_int + pki_file).
+#                Used by templates where every alternative has a certificate
+#                method and at least one accepts browser_cert.
+# authaware:     VerifyClientCertIfGiven    — either kind optional, verified if
+#                present (certs/ca-chain.crt).
+#                Used by templates where some alternative has a certificate,
+#                and by every core router (auth, hub, people, the portal, the
+#                consoles, enroll-invite, directory, mcp).
+# public:        no clientAuth              — no certificate requested.
+#                Used by everything else.
+#
+# A public exception turns protected / protected-any into authaware for all
+# of the app's routers (policy.HostTier). Which method a presented
+# certificate counts as is decided by its issuer (group-gate, Keycloak).
+# Traefik's ./certs:/certs:ro mount carries both chain files (pki setup).
 
 tls:
   options:

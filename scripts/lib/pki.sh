@@ -170,7 +170,9 @@ _pki_put() {
 # kinds apart by issuer). When <rewrite> is true (pki_file was just
 # created) or any chain / truststore file differs from what it should be,
 # all of them are rewritten and PKI_TRUSTSTORE_CHANGED=true (stack.sh then
-# restarts Traefik and Keycloak, which read them only at start-up).
+# restarts Traefik, Keycloak and group-gate, which read them only at
+# start-up or through a single-file bind mount); a rewritten
+# yubikey-ca.crt / browser-ca.crt sets it too.
 _pki_export() {
   local certs="$1" rewrite="$2" root int file cn_int cn_file chain chain_yk ts
   root="$(_pki_ca_pem pki)" || exit 1
@@ -183,8 +185,12 @@ _pki_export() {
        certificates could not be told apart. Nothing was exported."
   [ -s "$certs/root-ca.crt" ] || _pki_put "$certs/root-ca.crt" "$root"
   [ -s "$certs/intermediate-ca.crt" ] || _pki_put "$certs/intermediate-ca.crt" "$int"
-  _pki_same "$certs/yubikey-ca.crt" "$int" || _pki_put "$certs/yubikey-ca.crt" "$int"
-  _pki_same "$certs/browser-ca.crt" "$file" || _pki_put "$certs/browser-ca.crt" "$file"
+  # group-gate bind-mounts these two files: a running container keeps the
+  # old inode after an atomic replace, so a change restarts it too.
+  # shellcheck disable=SC2034  # read by stack.sh
+  _pki_same "$certs/yubikey-ca.crt" "$int" || { _pki_put "$certs/yubikey-ca.crt" "$int"; PKI_TRUSTSTORE_CHANGED=true; }
+  # shellcheck disable=SC2034  # read by stack.sh
+  _pki_same "$certs/browser-ca.crt" "$file" || { _pki_put "$certs/browser-ca.crt" "$file"; PKI_TRUSTSTORE_CHANGED=true; }
 
   chain="$root"$'\n'"$int"$'\n'"$file"
   chain_yk="$root"$'\n'"$int"

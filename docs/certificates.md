@@ -1,1 +1,1 @@
-Moved to the documentation site: [TLS & mTLS](https://porelli.github.io/portcullis-docs/setup/certificates/).
+Moved to the documentation site: [Certificates](https://porelli.github.io/portcullis-docs/setup/certificates/).

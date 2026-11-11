@@ -214,7 +214,6 @@ jobs:
           grep -qx 'people=\*' group-gate/group-gate-map.conf || { echo "FAIL: people is not * (any signed-in user) in the group-gate map"; exit 1; }
           echo "$CFG" | jq -e --arg d "${PORTCULLIS_DOMAIN:-ci.example.org}" '.services["group-gate"].labels as $g | .services["forward-auth"].labels as $f | .services.hub.labels as $h
               | ([$g["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeadersRegex"],
-                  $g["traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeadersRegex"],
                   $g["traefik.http.middlewares.portcullis-public-guard.forwardauth.authResponseHeadersRegex"],
                   $f["traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeadersRegex"],
                   $f["traefik.http.middlewares.portcullis-auth-console.forwardauth.authResponseHeadersRegex"],
@@ -222,7 +221,7 @@ jobs:
               and .services.hub.environment.HUB_PEOPLE_ADDR == ":8889"
               and $h["traefik.http.routers.people.rule"] == "Host(`people.\($d)`)"
               and $h["traefik.http.routers.people.tls.options"] == "authaware@file"
-              and $h["traefik.http.routers.people.middlewares"] == "rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file"
+              and $h["traefik.http.routers.people.middlewares"] == "rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file"
               and $h["traefik.http.services.\($h["traefik.http.routers.people.service"]).loadbalancer.server.port"] == "8889"
               and $h["traefik.http.services.\($h["traefik.http.routers.hub.service"]).loadbalancer.server.port"] == "8888"
               and .services.lldap.labels["traefik.http.middlewares.directory-redirect.redirectregex.replacement"] == "https://people.\($d)/"
@@ -241,8 +240,7 @@ jobs:
           # group-gate needs the username header from portcullis-auth and must
           # pass it on; both forward-auth middlewares strip client copies.
           echo "$CFG" | jq -e '[.services["forward-auth"].labels["traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeaders"],
-                 .services["group-gate"].labels["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders"],
-                 .services["group-gate"].labels["traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeaders"]]
+                 .services["group-gate"].labels["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders"]]
               | all(split(",") | index("X-Auth-Request-Preferred-Username") and index("X-Forwarded-User") and index("X-Auth-Request-User"))' >/dev/null \
             || { echo "FAIL: identity headers missing from a forward-auth authResponseHeaders"; exit 1; }
           # Expired memberships: group-gate must be able to withhold the token
@@ -365,12 +363,38 @@ jobs:
                     | $l["traefik.http.routers.\($r).middlewares"] == "rate-limit@file,security-headers@file"
                     and $l["traefik.http.routers.\($r).service"] == "mcp-gate"
                     and $l["traefik.http.routers.\($r).entrypoints"] == "websecure"))
-              and ([$l | to_entries[] | select(.key | test("\\.middlewares$")) | .value | select(test("portcullis-auth|portcullis-groups|portcullis-self|proxy-secret"))] == [])
+              and ([$l | to_entries[] | select(.key | test("\\.middlewares$")) | .value | select(test("portcullis-auth|portcullis-groups|proxy-secret"))] == [])
               and $l["traefik.http.routers.mcp.tls.options"] == "authaware@file"
               and $l["traefik.http.routers.hub-mcp.tls.options"] == $hl["traefik.http.routers.hub.tls.options"]
               and $l["traefik.http.routers.people-mcp.tls.options"] == $hl["traefik.http.routers.people.tls.options"]
               and prio("hub-mcp"; $l) > prio("hub"; $hl) and prio("people-mcp"; $l) > prio("people"; $hl)' >/dev/null \
             || { echo "FAIL: mcp-gate wiring (contract §15 / §5, G36 G44 G74)"; exit 1; }
+          # Contract §4 "Opened log" / §8.2 (sign-in part 2): group_gate_data is
+          # mounted by exactly group-gate (rw at /data, uid 10003 + group 10001
+          # only) and the Hub (rw at /group-gate-data, to prune day files);
+          # group-gate reads both CA files read-only and both CAs' CRL lists;
+          # no enroll / enroll-self router and no self-service middleware —
+          # enroll-invite is the only router on enroll.<domain>.
+          echo "$CFG" | jq -e --arg d "${PORTCULLIS_DOMAIN:-ci.example.org}" '.services["group-gate"] as $g | .services.hub as $h
+              | ([.services | to_entries[] | select([.value.volumes[]? | select(.type == "volume" and .source == "group_gate_data")] | length > 0) | .key] | sort == ["group-gate", "hub"])
+              and ([$g.volumes[] | select(.source == "group_gate_data") | "\(.target):\(.read_only // false)"] == ["/data:false"])
+              and ([$h.volumes[] | select(.source == "group_gate_data") | "\(.target):\(.read_only // false)"] == ["/group-gate-data:false"])
+              and $g.user == "10003:10003" and $g.group_add == ["10001"]
+              and $g.environment.GATE_OPENED_DIR == "/data/opened" and $h.environment.HUB_GROUP_GATE_DATA_DIR == "/group-gate-data"
+              and $g.environment.GATE_YUBIKEY_CA_FILE == "/etc/group-gate/ca/yubikey-ca.crt"
+              and $g.environment.GATE_BROWSER_CA_FILE == "/etc/group-gate/ca/browser-ca.crt"
+              and ([$g.volumes[] | select(.target | startswith("/etc/group-gate/ca/")) | "\(.source | sub("^.*/certs/"; "certs/")):\(.target):\(.read_only // false)"] | sort
+                   == ["certs/browser-ca.crt:/etc/group-gate/ca/browser-ca.crt:true", "certs/yubikey-ca.crt:/etc/group-gate/ca/yubikey-ca.crt:true"])
+              and $g.environment.GATE_CRL_URLS == "http://vault:8200/v1/pki_int/crl http://vault:8200/v1/pki_file/crl"
+              and $g.environment.GATE_DELTA_CRL_URLS == "http://vault:8200/v1/pki_int/crl/delta http://vault:8200/v1/pki_file/crl/delta"
+              and ($g.environment | has("GATE_CRL_URL") or has("GATE_DELTA_CRL_URL") | not)
+              and $h.environment.HUB_CLIENT_CERT_TTL == "720h" and $h.environment.HUB_CERT_EXPIRY_WARN_DAYS == "7"
+              and .services.keycloak.environment.PORTCULLIS_SIGNIN_URL == "https://people.\($d)/signin"
+              and ([.services[].labels // {} | keys[] | select(test("^traefik\\.http\\.middlewares\\.[^.]*-self\\."))] == [])
+              and ([.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.rule$")) | select(.value | test("enroll\\.")) | .key]
+                   == ["traefik.http.routers.enroll-invite.rule"])
+              and .services.enroll.labels["traefik.http.routers.enroll-invite.rule"] == "Host(`enroll.\($d)`) && PathPrefix(`/invite/`)"' >/dev/null \
+            || { echo "FAIL: group_gate_data / group-gate CA files + CRL lists / Hub sign-in env / enroll.<domain> routers (contract §4, §5, §8.2)"; exit 1; }
           grep -qx 'mcp=\*' group-gate/group-gate-map.conf || { echo "FAIL: mcp is not * in the group-gate map (core host, contract §4)"; exit 1; }
           PORT8890="$(for files in "docker-compose.yml" "docker-compose.yml -f docker-compose.apps.yml" "docker-compose.test.yml"; do
               # shellcheck disable=SC2086
@@ -765,8 +789,8 @@ jobs:
         run: |
           test -f certs/root-ca.crt || (echo "FAIL: root-ca.crt missing" && exit 1)
           test -f certs/intermediate-ca.crt || (echo "FAIL: intermediate-ca.crt missing" && exit 1)
-          test -f certs/yubikey-ca.crt || (echo "FAIL: yubikey-ca.crt missing" && exit 1)
-          test -f certs/browser-ca.crt || (echo "FAIL: browser-ca.crt missing" && exit 1)
+          test -s certs/yubikey-ca.crt || (echo "FAIL: yubikey-ca.crt missing or empty" && exit 1)
+          test -s certs/browser-ca.crt || (echo "FAIL: browser-ca.crt missing or empty" && exit 1)
           test -f certs/ca-chain.crt || (echo "FAIL: ca-chain.crt missing" && exit 1)
           test -f certs/ca-chain-yubikey.crt || (echo "FAIL: ca-chain-yubikey.crt missing" && exit 1)
           for f in portcullis-ca-chain.pem portcullis-yubikey-ca.pem portcullis-browser-ca.pem; do
@@ -1321,7 +1345,7 @@ jobs:
                   templates: {standard: {op: "any", items: [{op: "any", items: ["passkey_synced", "passkey_device", "security_key"]},
                                                             {op: "any", items: ["yubikey_cert"]}]}},
                   default: "standard", hosts: {},
-                  core: ([""] + ["directory.", "enroll.", "hub.", "metrics.", "people.", "traefik."]
+                  core: ([""] + ["directory.", "hub.", "metrics.", "people.", "traefik."]
                          | map({key: (. + "portcullis.local"), value: "standard"}) | from_entries),
                   people: {}, add_stronger: false, extra_domains: []}' > /tmp/ci-policy-v6.json
           docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
@@ -2322,7 +2346,7 @@ jobs:
           VAULT_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q vault)")"
           ./portcullis backup
           B=$(find backups -maxdepth 1 -type d -name '2*' | sort | tail -n1)
-          for f in MANIFEST.json .env secrets/vault-init.json secrets/vault-unseal/unseal-key certs/ca-chain.crt vault.snap postgres.dump lldap_data.tar.gz hub_data.tar.gz traefik_acme.tar.gz mcp_gate_data.tar.gz; do
+          for f in MANIFEST.json .env secrets/vault-init.json secrets/vault-unseal/unseal-key certs/ca-chain.crt vault.snap postgres.dump lldap_data.tar.gz hub_data.tar.gz traefik_acme.tar.gz mcp_gate_data.tar.gz group_gate_data.tar.gz certs/yubikey-ca.crt certs/browser-ca.crt; do
             test -s "$B/$f" || { echo "FAIL: backup lacks $f"; ls -la "$B"; exit 1; }
           done
           test "$(stat -c %a "$B")" = 700 || { echo "FAIL: backup dir is not 0700"; exit 1; }
@@ -2663,7 +2687,7 @@ jobs:
                           "e2e-hwk": {"op": "any", "items": ["security_key"]}, "e2e-mtls": {"op": "any", "items": ["yubikey_cert"]}},
             "default": "standard",
             "hosts": {"hwk.portcullis.local": "e2e-hwk", "mtls.portcullis.local": "e2e-mtls"},
-            "core": {"portcullis.local": "standard", "directory.portcullis.local": "standard", "enroll.portcullis.local": "standard",
+            "core": {"portcullis.local": "standard", "directory.portcullis.local": "standard",
                      "hub.portcullis.local": "standard", "metrics.portcullis.local": "standard", "people.portcullis.local": "standard",
                      "traefik.portcullis.local": "standard"},
             "people": {}, "add_stronger": false, "extra_domains": [],

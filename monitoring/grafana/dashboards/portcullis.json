@@ -607,7 +607,7 @@
     {
       "id": 12,
       "type": "table",
-      "title": "Client certificates (newest per user)",
+      "title": "YubiKey and browser certificates (newest per user and kind)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"

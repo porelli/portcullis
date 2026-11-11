@@ -443,6 +443,9 @@ services:
       KC_DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is not set — run ./portcullis init}
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?KEYCLOAK_ADMIN_PASSWORD is not set — run ./portcullis init}
+      # The Sign-in page the extension's needs-stronger page links to
+      # (contract §8.1; unset = the account console).
+      PORTCULLIS_SIGNIN_URL: https://people.${PORTCULLIS_DOMAIN:-portcullis.local}/signin
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -678,6 +681,9 @@ services:
     # Unprivileged uid with no home (USER 10003 in group-gate/Dockerfile):
     # reads only world-readable mounts.
     user: "10003:10003"
+    # Group 10001 (the Hub's): the opened log's directory (opened/, 2770)
+    # and day files (0640) carry it, so the Hub can read and prune them.
+    group_add: ["10001"]
     read_only: true
     tmpfs:
       - /tmp
@@ -685,18 +691,26 @@ services:
       - ./group-gate/group-gate-map.conf:/etc/group-gate/map.conf:ro
       # Hub writes per-app auth policies into this volume under group-gate-policy.json
       - hub_data:/hub-data:ro
-      # Revoked client-cert serials, written by ./portcullis cert revoke|sync.
+      # Revoked certificate serials (both kinds), written by ./portcullis cert revoke|sync.
       - ./certs/revocation:/etc/group-gate/revocation:ro
+      # The two intermediates (./portcullis pki setup): a presented leaf
+      # counts as yubikey_cert or browser_cert only when one of these
+      # issued it (contract §4 "Certificate binding").
+      - ./certs/yubikey-ca.crt:/etc/group-gate/ca/yubikey-ca.crt:ro
+      - ./certs/browser-ca.crt:/etc/group-gate/ca/browser-ca.crt:ro
+      # The opened log (contract §4 "Opened log"): opened/<YYYY-MM-DD>.jsonl,
+      # read and pruned by the Hub (sign-in history, §8.2). 10003:10001.
+      - group_gate_data:/data
     environment:
       GATE_POLICY_FILE: /hub-data/group-gate-policy.json
       # The Hub's shared custom fields → X-Forwarded-Attr-* (contract §4.1).
       GATE_ATTRIBUTES_FILE: /hub-data/user-attributes.json
       # Landing portal (https://<domain>/): the Hub's app list (contract §10).
       GATE_PORTAL_FILE: /hub-data/portal-apps.json
-      # Client-cert revocation: requests whose TLS client cert (seen via
-      # client-headers@file → X-Forwarded-Tls-Client-Cert-Info) has a
-      # revoked serial are denied. Sources: the serial file above (instant)
-      # plus Vault's CRL (unauthenticated endpoint, refreshed periodically).
+      # Certificate revocation: requests whose YubiKey or browser
+      # certificate (seen via client-headers@file) has a revoked serial are
+      # denied. Sources: the serial file above (instant) plus Vault's CRLs
+      # (unauthenticated endpoints, refreshed periodically).
       GATE_REVOKED_FILE: /etc/group-gate/revocation/revoked-serials.txt
       # auto_rebuild=true: Vault adds new revocations to the DELTA CRL
       # (rebuilt about once a minute) and folds them into the full CRL only
@@ -706,6 +720,9 @@ services:
       # GATE_DELTA_CRL_URL make group-gate refuse to start.
       GATE_CRL_URLS: http://vault:8200/v1/pki_int/crl http://vault:8200/v1/pki_file/crl
       GATE_DELTA_CRL_URLS: http://vault:8200/v1/pki_int/crl/delta http://vault:8200/v1/pki_file/crl/delta
+      GATE_YUBIKEY_CA_FILE: /etc/group-gate/ca/yubikey-ca.crt
+      GATE_BROWSER_CA_FILE: /etc/group-gate/ca/browser-ca.crt
+      GATE_OPENED_DIR: /data/opened
       # Required: core hosts are <sub>.<PORTCULLIS_DOMAIN> (map.conf) and
       # app hosts <label>.<PORTCULLIS_DOMAIN> or on an enrolled domain
       # (policy v5 extra_domains); any other X-Forwarded-Host is denied.
@@ -736,12 +753,6 @@ services:
       # contract §4.1/§5) on every allowed request; client copies are deleted
       # first (forwardAuth removes all request headers matching the regex).
       traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeadersRegex: ^X-Forwarded-Attr-
-      # Same checks minus the subdomain group (any signed-in user): for
-      # self-service routes such as enroll.<domain>/self.
-      traefik.http.middlewares.portcullis-self.forwardauth.address: http://group-gate:8080/authenticated
-      traefik.http.middlewares.portcullis-self.forwardauth.trustForwardHeader: "true"
-      traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email
-      traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeadersRegex: ^X-Forwarded-Attr-
       # Public exceptions (the Hub's portcullis-public-<app> routers, no
       # forward-auth): allows only published public paths without any
       # credential (contract §5). No authResponseHeaders: nobody is signed in.
@@ -833,6 +844,14 @@ services:
       HUB_MCP_GATE_SECRET_FILE: /run/portcullis/mcp-gate/hub-secret
       HUB_MCP_GATE_RECIPIENT_FILE: /run/portcullis/mcp-gate/age.pub
       HUB_MCP_GATE_DATA_DIR: /mcp-gate-data
+      # Sign-in part 2 (contract §8.1 "Limits", §8.2, §5.1): the ceiling of a
+      # browser certificate's lifetime (core's grammar; the Hub refuses to
+      # start without it), the days before a certificate shows as expiring
+      # (passed through; the Hub applies core's ^[0-9]+$, else 7), and
+      # group-gate's opened log (read, and day files pruned).
+      HUB_CLIENT_CERT_TTL: ${CLIENT_CERT_TTL:-720h}
+      HUB_CERT_EXPIRY_WARN_DAYS: ${CERT_EXPIRY_WARN_DAYS:-7}
+      HUB_GROUP_GATE_DATA_DIR: /group-gate-data
     volumes:
       - .:/project:ro
       # Writable overlay: before every `compose up` the Hub copies each app's
@@ -874,6 +893,9 @@ services:
       - ./secrets/mcp-gate/hub-secret:/run/portcullis/mcp-gate/hub-secret:ro
       - ./secrets/mcp-gate/age.pub:/run/portcullis/mcp-gate/age.pub:ro
       - mcp_gate_data:/mcp-gate-data:ro
+      # group-gate's opened log (sign-in history, contract §8.2): read-write
+      # only to delete day files older than history_days (never today's).
+      - group_gate_data:/group-gate-data
       # Per-person secrets (contract §6): file-share password hashes, never
       # backed up, emptied by restore. The Hub checks ownership (10001:10001
       # 0700) at start; ./portcullis init/upgrade/restore ensure it.
@@ -901,11 +923,13 @@ services:
       traefik.http.services.hub.loadbalancer.server.port: "8888"
       # people.<domain>: the Hub's directory listener (:8889), any signed-in
       # user (group-gate-map.conf people=*); the Hub checks permissions per
-      # request. Same chain and proxy secret as the admin Hub (contract §5.1).
+      # request. Same chain and proxy secret as the admin Hub (contract §5.1),
+      # with client-cert-pem@file: the YubiKey renewal on the Sign-in page
+      # reads the presented certificate from X-Forwarded-Tls-Client-Cert.
       traefik.http.routers.people.rule: Host(`people.${PORTCULLIS_DOMAIN:-portcullis.local}`)
       traefik.http.routers.people.entrypoints: websecure
       traefik.http.routers.people.tls.options: authaware@file
-      traefik.http.routers.people.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file
+      traefik.http.routers.people.middlewares: rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file
       traefik.http.routers.people.service: hub-people
       traefik.http.services.hub-people.loadbalancer.server.port: "8889"
     depends_on:
@@ -934,8 +958,8 @@ services:
       LLDAP_BIND_DN: uid=admin,ou=people,${LLDAP_BASE_DN:-dc=portcullis,dc=local}
       LLDAP_BIND_PASSWORD: ${LLDAP_ADMIN_PASSWORD:?LLDAP_ADMIN_PASSWORD is not set — run ./portcullis init}
       PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
-      # Lifetime of client certs issued by enroll (admin enrolment and
-      # self-service renewal). Capped by the Vault role (portcullis pki setup).
+      # Longest lifetime of the certificates enroll issues (YubiKey and
+      # browser certificates). Capped by the Vault roles (portcullis pki setup).
       CERT_TTL: ${CLIENT_CERT_TTL:-720h}
       # Invites: Keycloak admin API as the service account portcullis-enroll
       # (secret: secrets/enroll/keycloak-client-secret); the invite OIDC
@@ -953,24 +977,10 @@ services:
     labels:
       traefik.enable: "true"
       traefik.docker.network: portcullis
-      traefik.http.routers.enroll.rule: Host(`enroll.${PORTCULLIS_DOMAIN:-portcullis.local}`)
-      traefik.http.routers.enroll.entrypoints: websecure
-      traefik.http.routers.enroll.tls.options: authaware@file
-      traefik.http.routers.enroll.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
-      traefik.http.routers.enroll.service: enroll
-      # Self-service (/self, /api/self/*): any signed-in user, for THEIR OWN
-      # certificate. client-cert-pem passes the verified cert (PEM) so enroll
-      # can renew exactly that key; portcullis-self still enforces
-      # revocation and host checks.
-      traefik.http.routers.enroll-self.rule: Host(`enroll.${PORTCULLIS_DOMAIN:-portcullis.local}`) && (PathPrefix(`/self`) || PathPrefix(`/api/self/`))
-      traefik.http.routers.enroll-self.entrypoints: websecure
-      traefik.http.routers.enroll-self.tls.options: authaware@file
-      traefik.http.routers.enroll-self.priority: "100"
-      traefik.http.routers.enroll-self.middlewares: rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-self@docker,security-headers@file
-      traefik.http.routers.enroll-self.service: enroll
       # One-time invite links (enroll/invite.go): public, no forward-auth
-      # (the user has no passkey yet). Only /invite/* reaches enroll this
-      # way; the token / JWKS (:8445) and invite API (:8444) ports are not
+      # (the user has no passkey yet). The only router on enroll.<domain>
+      # (contract §5 "Core routers"): any other path there gets Traefik's
+      # 404. Only /invite/* reaches enroll this way; the token / JWKS (:8445) and invite API (:8444) ports are not
       # routed by Traefik (Keycloak / the Hub use them on `portcullis`).
       traefik.http.routers.enroll-invite.rule: Host(`enroll.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/invite/`)
       traefik.http.routers.enroll-invite.entrypoints: websecure
@@ -1312,6 +1322,9 @@ volumes:
   domains_data:
   # The MCP gate's access log (contract §15.8); read-only in the Hub.
   mcp_gate_data:
+  # group-gate's opened log (contract §4, §8.2): written by group-gate,
+  # read and pruned by the Hub. 10003:10001, kept a year, backed up.
+  group_gate_data:
   prometheus_data:
   alertmanager_data:
   grafana_data:

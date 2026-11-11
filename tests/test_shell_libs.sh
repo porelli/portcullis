@@ -216,6 +216,26 @@ expect_eq "stack_prepare: a 10001-owned appfiles/ keeps its mode" "$(file_mode "
   stack_prepare ) >/dev/null 2>&1
 expect_ok "stack_prepare: mcp_gate_data owned 10005:10001" grep -qx 'volume_own mcp_gate_data 10005:10001' "$STUB_DIR/sp-vol"
 expect_ok "stack_prepare: mcp-gate secrets ensured" grep -qx 'mcpgate_ensure_secrets' "$STUB_DIR/sp-vol"
+# group_gate_data (sign-in part 2, contract §4 "Opened log"): group-gate
+# (10003) writes the opened log, the Hub (group 10001) reads and prunes it.
+expect_ok "the stack's volume setup owns group_gate_data 10003:10001" grep -qx 'volume_own group_gate_data 10003:10001' "$STUB_DIR/sp-vol"
+# group-gate bind-mounts both CA files: files (empty until pki setup), never
+# directories Docker would make; a directory is refused.
+expect_eq "stack_prepare: the two CA files exist as empty 0644 files before pki setup" \
+  "$(for f in yubikey-ca.crt browser-ca.crt; do [ -f "$SP_ROOT/certs/$f" ] && [ ! -s "$SP_ROOT/certs/$f" ] && file_mode "$SP_ROOT/certs/$f"; done | tr '\n' ' ')" "644 644 "
+printf 'pem\n' > "$SP_ROOT/certs/yubikey-ca.crt"
+( PORTCULLIS_ROOT="$SP_ROOT"
+  volume_own() { :; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  unset -f users_secret_files monitoring_prepare domains_prepare
+  stack_prepare ) >/dev/null 2>&1
+expect_eq "stack_prepare: an existing CA file is kept" "$(cat "$SP_ROOT/certs/yubikey-ca.crt")" pem
+rm -f "$SP_ROOT/certs/browser-ca.crt"; mkdir "$SP_ROOT/certs/browser-ca.crt"
+rc=0; ( PORTCULLIS_ROOT="$SP_ROOT"
+  volume_own() { :; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  unset -f users_secret_files monitoring_prepare domains_prepare
+  stack_prepare ) >/dev/null 2>&1 || rc=$?
+expect_eq "stack_prepare: a CA file Docker made a directory is refused" "$rc" 1
+rmdir "$SP_ROOT/certs/browser-ca.crt"
 rm -f "$STUB_DIR/sp-vol"
 rm -f "$STUB_DIR/calls"
 
@@ -767,6 +787,12 @@ expect_eq "pki_setup with ca-chain-yubikey.crt holding pki_file rewrites it" "$(
 printf '%s\n' "$CHAIN2" > "$CERTS/ca-chain.crt"
 expect_eq "pki_setup with a 2-certificate ca-chain.crt sets PKI_TRUSTSTORE_CHANGED=true" "$(pki_fn complete)" "0 true"
 expect_eq "pki_setup with a 2-certificate ca-chain.crt rewrites it" "$(cat "$CERTS/ca-chain.crt")" "$CHAIN3"
+# group-gate bind-mounts the CA files: an empty placeholder (stack_prepare)
+# rewritten while the chains are current still restarts it.
+: > "$CERTS/browser-ca.crt"
+expect_eq "pki_setup with an empty browser-ca.crt (chains current) sets PKI_TRUSTSTORE_CHANGED=true" "$(pki_fn complete)" "0 true"
+expect_ok "pki_setup rewrites an empty browser-ca.crt with pki_file's certificate" cmp -s "$CERTS/browser-ca.crt" "$STUB_DIR/pem/file"
+expect_eq "pki_setup with every file current leaves PKI_TRUSTSTORE_CHANGED unset again" "$(pki_fn complete)" "0 unset"
 # Equal CNs: refused, nothing exported.
 cp -p "$CERTS/ca-chain.crt" "$WORK/chain-before"
 rm -f "$CERTS/ca-chain-yubikey.crt"
@@ -1255,6 +1281,10 @@ fi
 case " $BACKUP_FILE_VOLUMES " in
   *" mcp_gate_data:10005:10001 "*) t_pass "backup: mcp_gate_data (access log) archived as the gate's uid, Hub group" ;;
   *) t_fail "backup: mcp_gate_data missing from BACKUP_FILE_VOLUMES ($BACKUP_FILE_VOLUMES)" ;;
+esac
+case " $BACKUP_FILE_VOLUMES " in
+  *" group_gate_data:10003:10001 "*) t_pass "BACKUP_FILE_VOLUMES lists group_gate_data (the opened log, kept a year) as group-gate's uid, Hub group" ;;
+  *) t_fail "BACKUP_FILE_VOLUMES lists group_gate_data ($BACKUP_FILE_VOLUMES)" ;;
 esac
 # The MANIFEST of a backup must never list hub_secrets as a file.
 expect_ok "backup: BACKUP_FILE_VOLUMES does not contain hub_secrets" bash -c '! echo "$BACKUP_FILE_VOLUMES" | grep -q hub_secrets'

@@ -173,8 +173,8 @@ init_run() {
   config_build_ca_bundle
   # server.key was just written: give Traefik (group 0) read access.
   stack_prepare
-  info "Restarting Traefik, the forward-auth services and Keycloak to pick up the CA chain..."
-  dc restart traefik forward-auth forward-auth-ext keycloak
+  info "Restarting Traefik, the forward-auth services, Keycloak and group-gate to pick up the CA chain..."
+  dc restart traefik forward-auth forward-auth-ext keycloak group-gate
   signin_ca_mark
   config_mark
   wait_healthy 300 keycloak
@@ -402,8 +402,10 @@ upgrade_run() {
   domains_restart_if_renewed
   monitoring_reload
   if [ "$PKI_CREATED" = true ] || [ "${PKI_TRUSTSTORE_CHANGED:-false}" = true ]; then
-    # Traefik, forward-auth(-ext) and Keycloak read the CA chain only at start-up.
-    dc restart traefik forward-auth forward-auth-ext keycloak >/dev/null
+    # Traefik, forward-auth(-ext) and Keycloak read the CA chain only at
+    # start-up; group-gate bind-mounts the two CA files (an atomic replace
+    # is a new inode its container doesn't see).
+    dc restart traefik forward-auth forward-auth-ext keycloak group-gate >/dev/null
     signin_ca_mark
     # config_reload will restart services for config changes and mark them
   fi

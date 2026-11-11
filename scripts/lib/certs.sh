@@ -206,7 +206,7 @@ cert_revoke() {
   ok "the default app templates). Sessions that needed the certificate need it on"
   ok "every request, so they stop working too, and Keycloak refuses new sign-ins"
   ok "with it (CRL, refreshed within 60s)."
-  warn "NOT covered: routers relying on the TLS client certificate alone (protected /"
+  warn "NOT covered: routers relying on the certificate at the TLS handshake alone (protected /"
   warn "protected-any options without portcullis-groups@docker) — Traefik does not"
   warn "check CRLs; the certificate keeps working there until it expires. The person's"
   warn "passkey and password sessions are not affected: sign them out in the Keycloak"

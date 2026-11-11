@@ -1965,8 +1965,8 @@ def leaf_cert_cn(raw: str) -> Optional[str]:
     """Subject CN of the leaf (first) cert in X-Forwarded-Tls-Client-Cert-Info.
 
     This header is Traefik's own text format (Subject="C=..,O=..,CN=..",
-    values unescaped — not RFC 4514), not a certificate: client-headers@file
-    sends no PEM, so there is nothing for an X.509 parser to load here.
+    values unescaped — not RFC 4514), not a certificate: the leaf itself
+    comes from X-Forwarded-Tls-Client-Cert (forwarded_leaf).
     """
     value = _decode_cert_info(raw)
     m = _SUBJECT_RE.search(value)
@@ -1980,9 +1980,11 @@ def leaf_cert_cn(raw: str) -> Optional[str]:
 
 
 # The presented certificates themselves (passTLSClientCert pem: true, the
-# client-headers@file and client-cert-pem@file middlewares): Go's
-# url.QueryEscape of the base64 DER bodies (no BEGIN/END lines), joined
-# with ",", the leaf first (Traefik's entrypoint deletes client copies).
+# client-headers@file and client-cert-pem@file middlewares): the base64
+# DER bodies (no BEGIN/END lines), set raw by Traefik, joined with ",", the
+# leaf first (Traefik's entrypoint deletes client copies). forwarded_leaf's
+# single unquote changes nothing in base64 (no '%') and would undo an
+# escaping proxy.
 CERT_PEM_HEADER = "X-Forwarded-Tls-Client-Cert"
 # The header is never bigger than this (a leaf and a short chain).
 CERT_PEM_MAX = 64 * 1024
@@ -1999,7 +2001,7 @@ def forwarded_leaf(raw: str) -> Optional[x509.Certificate]:
     Issuer text, so a crafted CN could fake an Issuer there."""
     if not raw or len(raw) > CERT_PEM_MAX:
         return None
-    value = urllib.parse.unquote(raw)  # once: QueryEscape; never '+' -> ' '
+    value = urllib.parse.unquote(raw)  # once (a no-op on raw base64); never '+' -> ' '
     first = value.split(",", 1)[0].strip()
     first = first.replace("-----BEGIN CERTIFICATE-----", "").replace("-----END CERTIFICATE-----", "")
     first = re.sub(r"\s+", "", first)
@@ -2685,7 +2687,7 @@ class Handler(BaseHTTPRequestHandler):
             self._endpoint = "public_guard"
             self._public_guard()
             return
-        # Every other path: the full checks (there is no /authenticated).
+        # Every other path: the full checks (there is no self-service path).
         self._endpoint = "gate"
 
         raw_host = self.headers.get("X-Forwarded-Host", "")
