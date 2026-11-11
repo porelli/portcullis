@@ -1537,16 +1537,38 @@ def main() -> int:
             assert rc == 0 and code != "000", f"the same files on echo-anycert: curl exit {rc}, HTTP {code}"
             # The .p12 itself, as a browser presents it.
             c = state["bc"][0]
-            ctx = new_context(client_cert={"pfx": c["p12"], "passphrase": c["pw"]}, origins=(ECHO_CERT,))
+            ctx = new_context(client_cert={"pfx": c["p12"], "passphrase": c["pw"]}, origins=(ECHO_CERT, ECHO_ANYCERT))
             page = ctx.new_page()
             try:
                 try:
                     resp = page.goto(ECHO_CERT + "/", wait_until="domcontentloaded")
                 except PWError as e:
-                    # Only Chromium's own client-certificate refusal counts.
-                    if "net::ERR_BAD_SSL_CLIENT_AUTH_CERT" not in str(e):
+                    # Chromium's own client-certificate refusal, or
+                    # net::ERR_HTTP2_PROTOCOL_ERROR: Playwright presents the
+                    # certificate through its own TLS proxy, and with TLS 1.3
+                    # the server's refusal (alert "unknown ca") can arrive
+                    # after the proxy's tls.connect already reported the
+                    # handshake done; the proxy has then answered the browser
+                    # with h2 (Traefik's ALPN) and tears that session down
+                    # when the alert comes (playwright 1.64.1, coreBundle.js
+                    # _establishTlsTunnel: the synthetic 503 below is the same
+                    # refusal when the alert wins the race; run 43101286740).
+                    # That h2 error only counts if the same .p12 in the same
+                    # context gets a real answer from echo-anycert (whose
+                    # protected-any@file accepts it): so it was echo-cert's
+                    # handshake, not Playwright's proxy or h2 in general.
+                    first = str(e).splitlines()[0]
+                    if "net::ERR_BAD_SSL_CLIENT_AUTH_CERT" in str(e):
+                        pass
+                    elif "net::ERR_HTTP2_PROTOCOL_ERROR" in str(e):
+                        ok_resp = page.goto(ECHO_ANYCERT + "/", wait_until="domcontentloaded")
+                        assert ok_resp is not None and ok_resp.status != 503 \
+                            and "client-certificate error" not in page.content(), \
+                            f"the .p12 on echo-anycert (control for {first}): HTTP {ok_resp and ok_resp.status}"
+                        print(f"    the .p12 on echo-anycert (control): HTTP {ok_resp.status}", flush=True)
+                    else:
                         raise
-                    print(f"    the .p12 on echo-cert: handshake refused ({str(e).splitlines()[0]})", flush=True)
+                    print(f"    the .p12 on echo-cert: handshake refused ({first})", flush=True)
                 else:
                     # Playwright presents client certificates through its own
                     # TLS proxy and answers a refused server handshake with a
