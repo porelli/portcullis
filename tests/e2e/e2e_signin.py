@@ -1040,7 +1040,7 @@ def main() -> int:
             print(f"    audit: {details}", flush=True)
             assert any(r == "refused" and "doesn't accept" in d and "template strong" in d for r, d in details), details
             assert any(r == "ok" and d.startswith("approved ") and d.endswith("template strong") for r, d in details), details
-            hub_ok("DELETE", f"/api/directory/groups/{group}", {})
+            hub_ok("DELETE", f"/api/directory/groups/{group}", {"confirm": group})
         check("fresh_follows_hub_template: an admin confirmation (Hub listener, hub core template Strong): sam's "
               "synced passkey fresh sign-in → 403, his security key → approved; the audit names template strong",
               fresh_follows_hub_template)
