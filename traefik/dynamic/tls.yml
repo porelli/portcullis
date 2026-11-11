@@ -7,13 +7,25 @@
 # that are switched on. Core routers (auth, hub, people, the portal, the
 # consoles, enroll, directory, mcp) always use authaware.
 #
-# protected: RequireAndVerifyClientCert — no valid client cert = the TLS handshake fails
-# authaware: VerifyClientCertIfGiven    — cert optional, verified if present
-# public:    no clientAuth              — no client cert requested
+# protected:     RequireAndVerifyClientCert — a YubiKey certificate (root + pki_int
+#                only: certs/ca-chain-yubikey.crt) or the TLS handshake fails;
+#                a browser certificate never passes it
+# protected-any: RequireAndVerifyClientCert — a YubiKey or browser certificate
+#                (certs/ca-chain.crt = root + pki_int + pki_file)
+# authaware:     VerifyClientCertIfGiven    — either kind optional, verified if present
+# public:        no clientAuth              — no client cert requested
 
 tls:
   options:
     protected:
+      clientAuth:
+        caFiles:
+          - /certs/ca-chain-yubikey.crt
+        clientAuthType: RequireAndVerifyClientCert
+      minVersion: VersionTLS12
+      sniStrict: false
+
+    protected-any:
       clientAuth:
         caFiles:
           - /certs/ca-chain.crt

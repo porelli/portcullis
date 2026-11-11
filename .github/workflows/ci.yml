@@ -816,23 +816,50 @@ jobs:
             role_id=@secrets/enroll/role-id secret_id=@secrets/enroll/secret-id)
           [ -z "$TOKEN" ] || [ "$TOKEN" = null ] || echo "::add-mask::$TOKEN"
           export VAULT_TOKEN="$TOKEN"
-          vault list pki_int/certs >/dev/null || { echo "FAIL: enroll token cannot list certs"; exit 1; }
-          # pki_file may have issued nothing yet: exit 2 ("no value") is fine, a 403 is not.
-          rc=0; vault list pki_file/certs >/dev/null 2>&1 || rc=$?
-          [ "$rc" = 0 ] || [ "$rc" = 2 ] || { echo "FAIL: enroll token cannot list pki_file certs"; exit 1; }
-          vault read -format=json pki_file/crl/rotate >/dev/null || { echo "FAIL: enroll token cannot rotate pki_file's CRL"; exit 1; }
-          for denied in "write -f pki/root/generate/internal common_name=x" \
-                        "write pki_int/issue/server-cert common_name=x.portcullis.local" \
-                        "write pki_file/issue/browser-cert common_name=x" \
-                        "write pki_file/roles/browser-cert max_ttl=87600h" \
-                        "write pki_file/config/crl disable=true" \
-                        "read sys/auth" \
-                        "policy write evil -"; do
-            # shellcheck disable=SC2086
-            if echo 'path "*" { capabilities = ["sudo"] }' | vault $denied >/dev/null 2>&1; then
-              echo "FAIL: enroll token was allowed: vault $denied"; exit 1
+          # allowed <vault args>: the policy lets the call through — it may still
+          # fail for other reasons (a bad CSR, an unknown serial), never 403.
+          allowed() {
+            local out
+            out="$(vault "$@" 2>&1 </dev/null)" && return 0
+            case "$out" in *"permission denied"*)
+              echo "FAIL: enroll token was denied: vault $*"; printf '%s\n' "$out"; exit 1 ;;
+            esac
+          }
+          # denied <vault args>: refused by the policy — a non-zero exit AND
+          # "permission denied" (the CLI exits 2 for every API error).
+          denied() {
+            local out rc=0
+            out="$(echo 'path "*" { capabilities = ["sudo"] }' | vault "$@" 2>&1)" || rc=$?
+            if [ "$rc" = 0 ] || [[ "$out" != *"permission denied"* ]]; then
+              echo "FAIL: enroll token was not refused with permission denied: vault $* (exit $rc)"
+              printf '%s\n' "$out"; exit 1
             fi
+          }
+          vault list pki_int/certs >/dev/null || { echo "FAIL: enroll token cannot list certs"; exit 1; }
+          allowed list pki_file/certs
+          allowed read pki_int/cert/ca
+          allowed read pki_file/cert/ca
+          # A bad CSR / unknown serial: Vault answers 400, which proves the policy allowed it.
+          allowed write pki_int/sign/client-cert csr=not-a-csr common_name=ci-policy-check
+          allowed write pki_file/sign/browser-cert csr=not-a-csr common_name=ci-policy-check
+          allowed write pki_int/revoke serial_number=00:00:00:00
+          allowed write pki_file/revoke serial_number=00:00:00:00
+          allowed read -format=json pki_int/crl/rotate
+          allowed read -format=json pki_file/crl/rotate
+          denied write -f pki/root/generate/internal common_name=x
+          denied write pki_int/issue/server-cert common_name=x.portcullis.local
+          denied write pki_file/issue/browser-cert common_name=x
+          denied write pki_file/roles/browser-cert max_ttl=87600h
+          denied write pki_file/config/crl disable=true
+          denied write pki_file/intermediate/set-signed certificate=x
+          # Signing never takes SANs (denied_parameters on both sign paths).
+          for san in alt_names=evil.example ip_sans=10.0.0.1 uri_sans=spiffe://evil other_sans="1.2.3.4;UTF8:evil"; do
+            denied write pki_file/sign/browser-cert csr=not-a-csr common_name=ci-policy-check "$san"
+            denied write pki_int/sign/client-cert csr=not-a-csr common_name=ci-policy-check "$san"
           done
+          denied read sys/auth
+          denied read sys/mounts
+          denied policy write evil -
           TTL=$(vault token lookup -format=json | jq -r .data.ttl)
           [ "$TTL" -gt 0 ] && [ "$TTL" -le 3600 ] || { echo "FAIL: enroll token TTL $TTL not short-lived"; exit 1; }
           echo "PASS: enroll token can only use its PKI paths (ttl ${TTL}s)"

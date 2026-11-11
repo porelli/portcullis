@@ -40,7 +40,8 @@ cert_warn_seconds() {
 # read by group-gate from Vault's authoritative lists: the union of
 # pki_int/certs/revoked and pki_file/certs/revoked. Needs an admin
 # VAULT_TOKEN and a `vault` command. Fails — leaving <file> untouched — on
-# ANY error of either list other than Vault's "nothing to list" (exit 2):
+# ANY answer of either list other than a JSON array or Vault's "No value
+# found" (vault_no_value; the CLI's exit 2 alone is also every API error):
 # an empty list caused by a sealed Vault / bad token / network error must
 # never un-revoke certs.
 write_revoked_serials() {
@@ -58,7 +59,12 @@ write_revoked_serials() {
         [ -z "$got" ] || serials+="$got"$'\n'
         ;;
       2)
-        # vault CLI: exit 2 = no values at that path (no revoked certs).
+        # "No value found" = nothing revoked on that CA; any other exit-2
+        # answer is an API error (403, sealed, unreachable).
+        vault_no_value "$out" && continue
+        echo "ERROR: 'vault list $mount/certs/revoked' failed (exit $rc) — $file left unchanged:" >&2
+        printf '%s\n' "$out" | sed 's/^/    /' >&2
+        return 1
         ;;
       *)
         echo "ERROR: 'vault list $mount/certs/revoked' failed (exit $rc) — $file left unchanged:" >&2
@@ -91,9 +97,10 @@ _cert_read() {
     printf '%s\n' "$out"
     return 0
   fi
-  case "$rc:$out" in
-    0:*|2:*|*"not found"*|*"No value found"*) return 2 ;;
-  esac
+  # Only Vault's own "No value found" (exit 2) means "not on this mount";
+  # every other answer (403, sealed, unreachable, exit 0 without a
+  # certificate) is an error.
+  if [ "$rc" = 2 ] && vault_no_value "$out"; then return 2; fi
   printf '%s\n' "$out" >&2
   return 1
 }
@@ -118,13 +125,15 @@ _cert_info() {
 }
 
 # _cert_serials <mount> — the mount's issued serials, one per line. Vault's
-# exit 2 (nothing issued yet) is an empty list; any other error fails.
+# "No value found" (nothing issued yet) is an empty list; anything but a
+# JSON array fails (a sealed Vault can answer exit 0 with no list at all).
 _cert_serials() {
   local rc=0 out
-  out="$(vault list -format=json "$1/certs" 2>/dev/null)" || rc=$?
+  out="$(vault list -format=json "$1/certs" 2>&1)" || rc=$?
   case "$rc" in
-    0) printf '%s' "$out" | jq -r '.[]' ;;
-    2) return 0 ;;
+    0) printf '%s' "$out" | jq -er 'if type == "array" then .[] else error("not an array") end' 2>/dev/null \
+         || { [ "$(printf '%s' "$out" | jq -c . 2>/dev/null)" = "[]" ]; } ;;
+    2) vault_no_value "$out" ;;
     *) return 1 ;;
   esac
 }

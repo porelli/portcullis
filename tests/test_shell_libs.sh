@@ -518,8 +518,15 @@ expect_eq "exit 2 → empty list" "$(serials_in)" ""
 
 printf '# prev\n0a:bc\n' > "$REV"
 before="$(cat "$REV")"
-for case in "1|Error listing pki_int/certs/revoked: Vault is sealed" \
-            "1|Error making API request. Code: 403. permission denied" \
+# The vault CLI exits 2 for every API error (Vault 1.17): sealed, 403,
+# unmounted, unreachable. Only "No value found at <path>" is "nothing".
+for case in "2|$(printf 'Error listing pki_int/certs/revoked/: Error making API request.\n\nCode: 503. Errors:\n\n* Vault is sealed')" \
+            "2|$(printf 'Error listing pki_int/certs/revoked/: Error making API request.\n\nCode: 403. Errors:\n\n* permission denied')" \
+            "2|$(printf 'Error listing pki_int/certs/revoked/: Error making API request.\n\nCode: 404. Errors:\n\n* no handler for route \"pki_int/certs/revoked\". route entry not found.')" \
+            "2|Error listing pki_int/certs/revoked/: Get \"http://127.0.0.1:8200/v1/pki_int/certs/revoked?list=true\": dial tcp 127.0.0.1:8200: connect: connection refused" \
+            "2|" \
+            "2|No value found at pki_int/certs/revoked plus something else" \
+            "1|Error listing pki_int/certs/revoked: Vault is sealed" \
             "1|dial tcp 127.0.0.1:8200: connect: connection refused" \
             "0|not json at all" \
             '0|{"keys":["0a:bc"]}'; do
@@ -537,11 +544,13 @@ STUB_VAULT_RC=0 STUB_VAULT_OUT='["0a:bc","11:11"]' STUB_VAULT_FILE_RC=0 STUB_VAU
 expect_eq "write_revoked_serials writes the union of both mounts" "$(serials_in)" "0a:bc 11:11 ff:01"
 expect_ok "sync lists pki_int's revoked serials" grep -qx 'list -format=json pki_int/certs/revoked' "$STUB_DIR/vault-calls"
 expect_ok "sync lists pki_file's revoked serials" grep -qx 'list -format=json pki_file/certs/revoked' "$STUB_DIR/vault-calls"
-STUB_VAULT_RC=2 STUB_VAULT_OUT='No value found' STUB_VAULT_FILE_RC=0 STUB_VAULT_FILE_OUT='["ff:02"]' \
+STUB_VAULT_RC=2 STUB_VAULT_OUT='No value found at pki_int/certs/revoked' STUB_VAULT_FILE_RC=0 STUB_VAULT_FILE_OUT='["ff:02"]' \
   write_revoked_serials "$REV" >/dev/null 2>&1
 expect_eq "nothing revoked on pki_int + one on pki_file" "$(serials_in)" "ff:02"
 before="$(cat "$REV")"
-for case in "1|Error listing pki_file/certs/revoked: Vault is sealed" "0|not json" '0|{"keys":["ff:03"]}'; do
+for case in "2|$(printf 'Error listing pki_file/certs/revoked/: Error making API request.\n\nCode: 503. Errors:\n\n* Vault is sealed')" \
+            "2|$(printf 'Error listing pki_file/certs/revoked/: Error making API request.\n\nCode: 403. Errors:\n\n* permission denied')" \
+            "1|Error listing pki_file/certs/revoked: Vault is sealed" "0|not json" '0|{"keys":["ff:03"]}'; do
   rc=0
   STUB_VAULT_RC=0 STUB_VAULT_OUT='["0a:bc"]' STUB_VAULT_FILE_RC="${case%%|*}" STUB_VAULT_FILE_OUT="${case#*|}" \
     write_revoked_serials "$REV" >/dev/null 2>&1 || rc=$?
@@ -549,10 +558,21 @@ for case in "1|Error listing pki_file/certs/revoked: Vault is sealed" "0|not jso
   expect_eq "a failing pki_file list ('${case#*|}') leaves the file unchanged" "$(cat "$REV")" "$before"
 done
 rc=0
-STUB_VAULT_RC=1 STUB_VAULT_OUT='sealed' STUB_VAULT_FILE_RC=0 STUB_VAULT_FILE_OUT='["ff:04"]' \
+STUB_VAULT_RC=2 STUB_VAULT_OUT="$(printf 'Error listing pki_int/certs/revoked/: Error making API request.\n\nCode: 503. Errors:\n\n* Vault is sealed')" STUB_VAULT_FILE_RC=0 STUB_VAULT_FILE_OUT='["ff:04"]' \
   write_revoked_serials "$REV" >/dev/null 2>&1 || rc=$?
 expect_eq "a failing pki_int list with a good pki_file one → non-zero" "$([ "$rc" -ne 0 ] && echo fail || echo ok)" fail
 expect_eq "a failing pki_int list leaves the file unchanged" "$(cat "$REV")" "$before"
+STUB_VAULT_RC=2 STUB_VAULT_OUT='No value found at pki_int/certs/revoked' STUB_VAULT_FILE_RC=2 STUB_VAULT_FILE_OUT='{}' \
+  write_revoked_serials "$REV" >/dev/null 2>&1
+expect_eq "'No value found' + '{}' (both CAs empty) → an empty list" "$(serials_in)" ""
+
+# vault_no_value: only Vault's own "nothing there" answer.
+expect_ok "vault_no_value: 'No value found at <path>'" vault_no_value 'No value found at pki_int/certs/revoked'
+expect_ok "vault_no_value: '{}'" vault_no_value '{}'
+expect_fail "vault_no_value: sealed" vault_no_value "$(printf 'Error reading x: Error making API request.\n\nCode: 503. Errors:\n\n* Vault is sealed')"
+expect_fail "vault_no_value: 403" vault_no_value "$(printf 'Code: 403. Errors:\n\n* permission denied')"
+expect_fail "vault_no_value: command not found" vault_no_value 'vault: command not found'
+expect_fail "vault_no_value: empty" vault_no_value ''
 
 # ══ portcullis pki setup: idempotency / partial runs / guard ═══
 # Real (self-signed) CA certificates, so CNs and the chain order can be checked.
@@ -568,7 +588,9 @@ mkpem file-samecn "example.test Intermediate CA"
 # A scripted vault stub: $PKI_STATE selects which PKI pieces "exist":
 #   none (fresh Vault), complete (pki, pki_int, pki_file), nofile (pki_file
 #   missing), norole (client-cert role missing), samecn (pki_file has
-#   pki_int's CN), partial (mounts but no issuers), sealed, intbroken.
+#   pki_int's CN), partial (mounts but no issuers), sealed, intbroken
+#   (exit 1), int403 (403 on pki_int/issuers, exit 2 like the real CLI),
+#   fileerr (sealed answer on pki_file/issuers, exit 2), roleerr (403 on the role).
 mkdir -p "$WORK/pki-bin"
 cat > "$WORK/pki-bin/vault" <<'STUB'
 #!/usr/bin/env bash
@@ -584,8 +606,16 @@ case "$PKI_STATE:$*" in
   complete:list*pki_*/issuers*|norole:list*pki_*/issuers*|samecn:list*pki_*/issuers*) echo '["abc"]' ;;
   nofile:list*pki_int/issuers*) echo '["abc"]' ;;
   intbroken:list*pki_int/issuers*) echo "Error: permission denied" >&2; exit 1 ;;
-  *:list*issuers*) echo "No value found" >&2; exit 2 ;;
-  norole:read*pki_int/roles/client-cert*) echo "No value found" >&2; exit 2 ;;
+  int403:list*pki_int/issuers*)
+    printf 'Error listing pki_int/issuers/: Error making API request.\n\nCode: 403. Errors:\n\n* permission denied\n' >&2; exit 2 ;;
+  fileerr:list*pki_int/issuers*) echo '["abc"]' ;;
+  roleerr:list*pki_*/issuers*) echo '["abc"]' ;;
+  fileerr:list*pki_file/issuers*)
+    printf 'Error listing pki_file/issuers/: Error making API request.\n\nCode: 503. Errors:\n\n* Vault is sealed\n' >&2; exit 2 ;;
+  *:list*issuers*) echo "No value found at $3" >&2; exit 2 ;;
+  norole:read*pki_int/roles/client-cert*) echo "No value found at $3" >&2; exit 2 ;;
+  roleerr:read*pki_int/roles/client-cert*)
+    printf 'Error reading pki_int/roles/client-cert: Error making API request.\n\nCode: 403. Errors:\n\n* permission denied\n' >&2; exit 2 ;;
   *:read*/roles/*) echo '{"data":{}}' ;;
   *:read\ -field=certificate\ pki/cert/ca) cat "$STUB_DIR/pem/root" ;;
   *:read\ -field=certificate\ pki_int/cert/ca) cat "$STUB_DIR/pem/int" ;;
@@ -648,6 +678,10 @@ expect_ok "browser-cert role: use_csr_common_name=false use_csr_sans=false, any 
   grep -q 'write pki_file/roles/browser-cert .*allow_any_name=true enforce_hostnames=false use_csr_common_name=false use_csr_sans=false' "$STUB_DIR/pki-calls"
 expect_ok "browser-cert role: ec 256, max_ttl=\$CLIENT_CERT_TTL, stored" \
   grep -q 'write pki_file/roles/browser-cert .*key_type=ec key_bits=256 max_ttl=720h ttl=720h no_store=false' "$STUB_DIR/pki-calls"
+expect_ok "browser-cert role: no IP / URI / other SANs" \
+  grep -q 'write pki_file/roles/browser-cert .*allow_ip_sans=false allowed_uri_sans= allowed_other_sans= ' "$STUB_DIR/pki-calls"
+expect_ok "client-cert role: no IP / URI / other SANs either" \
+  grep -q 'write pki_int/roles/client-cert .*allow_ip_sans=false allowed_uri_sans= allowed_other_sans= ' "$STUB_DIR/pki-calls"
 expect_ok "pki_file CRL configured auto_rebuild=true enable_delta=true delta_rebuild_interval=1m" \
   grep -q 'write pki_file/config/crl expiry=72h auto_rebuild=true auto_rebuild_grace_period=12h enable_delta=true delta_rebuild_interval=1m' "$STUB_DIR/pki-calls"
 expect_eq "pki: complete PKI is a no-op" "$(run_pki complete)" 0
@@ -671,6 +705,11 @@ expect_eq "pki: sealed Vault fails" "$(run_pki sealed)" 1
 expect_fail "pki: sealed Vault → nothing generated" grep -q generate "$STUB_DIR/pki-calls"
 expect_eq "pki: read error on issuers fails" "$(run_pki intbroken)" 1
 expect_fail "pki: read error → nothing wiped/generated" grep -Eq 'generate|secrets disable' "$STUB_DIR/pki-calls"
+expect_eq "pki: a 403 on pki_int/issuers (exit 2) fails" "$(run_pki int403)" 1
+expect_fail "pki: a 403 on pki_int/issuers → nothing wiped/generated" grep -Eq 'generate|secrets (enable|disable)' "$STUB_DIR/pki-calls"
+expect_eq "pki: an error on pki_file/issuers (exit 2) fails" "$(run_pki fileerr)" 1
+expect_fail "pki: an error on pki_file/issuers never wipes or re-creates pki_file" grep -Eq 'generate|secrets (enable|disable)' "$STUB_DIR/pki-calls"
+expect_eq "pki: a 403 on the client-cert role (exit 2) fails" "$(run_pki roleerr)" 1
 # Vault lost its data but certs/ca-chain.crt from the old CA is still there.
 mkdir -p "$PKI_ROOT/certs" && echo OLD > "$PKI_ROOT/certs/ca-chain.crt"
 expect_eq "pki: no CA in Vault + old ca-chain → refuses" "$(run_pki none --keep)" 1
@@ -709,6 +748,12 @@ expect_eq "pki_setup with pki_int present rewrites the truststore chain" "$(cat 
 expect_ok "pki_setup with pki_int present writes the truststore's browser CA" cmp -s "$CERTS/truststore/portcullis-browser-ca.pem" "$STUB_DIR/pem/file"
 expect_ok "pki_setup with pki_int present writes the browser-cert role" grep -q 'write pki_file/roles/browser-cert' "$STUB_DIR/pki-calls"
 expect_ok "pki_setup with pki_int present configures pki_file's CRLs" grep -q 'write pki_file/config/crl .*enable_delta=true' "$STUB_DIR/pki-calls"
+# pki_file missing in Vault but browser-ca.crt on disk: never re-created on a guess.
+cp -p "$CERTS/ca-chain.crt" "$WORK/chain-before"
+expect_eq "pki_setup refuses to re-create pki_file when certs/browser-ca.crt exists" "$(pki_fn nofile)" "1 error"
+expect_fail "pki_setup's browser-ca.crt refusal enables / disables nothing" grep -Eq 'secrets (enable|disable)|generate' "$STUB_DIR/pki-calls"
+expect_ok "pki_setup's browser-ca.crt refusal explains --force" grep -q -- '--force' "$WORK/pki-out"
+expect_ok "pki_setup's browser-ca.crt refusal leaves the chain alone" cmp -s "$CERTS/ca-chain.crt" "$WORK/chain-before"
 # All three present, both chains current.
 expect_eq "pki_setup with all three present and both chains current leaves PKI_TRUSTSTORE_CHANGED unset" "$(pki_fn complete)" "0 unset"
 expect_fail "pki_setup with all three present creates nothing" grep -Eq 'secrets (enable|disable)|generate' "$STUB_DIR/pki-calls"
@@ -738,6 +783,9 @@ expect_eq "cli cert sync succeeds" "$rc" 0
 expect_ok "cli cert sync wrote the serial" grep -qx '11:22' "$PKI_ROOT/certs/revocation/revoked-serials.txt"
 rc=0; STUB_VAULT_RC=1 STUB_VAULT_OUT='sealed' VAULT_TOKEN=t PORTCULLIS_ROOT="$PKI_ROOT" "$CLI" cert sync >/dev/null 2>&1 || rc=$?
 expect_eq "cli cert sync fails on Vault error" "$rc" 1
+rc=0; STUB_VAULT_RC=2 STUB_VAULT_OUT="$(printf 'Error listing pki_int/certs/revoked/: Error making API request.\n\nCode: 503. Errors:\n\n* Vault is sealed')" \
+  VAULT_TOKEN=t PORTCULLIS_ROOT="$PKI_ROOT" "$CLI" cert sync >/dev/null 2>&1 || rc=$?
+expect_eq "cli cert sync fails on a sealed Vault (exit 2)" "$rc" 1
 expect_ok "cli cert sync error keeps the list" grep -qx '11:22' "$PKI_ROOT/certs/revocation/revoked-serials.txt"
 
 # ══ monitoring: alertmanager config, textfile metrics ═════

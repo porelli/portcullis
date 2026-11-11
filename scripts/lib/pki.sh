@@ -27,19 +27,26 @@ PKI_CREATED=false              # set to true when a new CA was created
 # `portcullis cert renew`. Browser certificates get at most the same.
 pki_client_ttl() { echo "${CLIENT_CERT_TTL:-720h}"; }
 
-# _vault_probe <vault args...> — 0 = present, 2 = absent ("No value found",
-# vault CLI exit 2); anything else aborts: a sealed Vault or a bad token
-# must never be mistaken for "no PKI yet" (that would create a 2nd CA).
+# _vault_probe <vault args...> — 0 = present, 2 = absent (Vault said "No
+# value found": vault_no_value, or an empty JSON answer); anything else
+# aborts. The vault CLI exits 2 for every API error too, so a sealed Vault,
+# a 403 or an unreachable Vault must never be mistaken for "no PKI yet"
+# (that would create a 2nd CA or wipe one).
 _vault_probe() {
   local rc=0 out
   out="$(vault "$@" 2>&1)" || rc=$?
-  case "$rc" in
-    0) [ -n "$out" ] && return 0 || return 2 ;;
-    2) return 2 ;;
-    *) printf 'ERROR: %s failed (exit %s):\n' "'vault $*'" "$rc" >&2
-       printf '%s\n' "$out" | sed 's/^/    /' >&2
-       exit 1 ;;
-  esac
+  if [ "$rc" = 0 ]; then
+    case "$(printf '%s' "$out" | tr -d '[:space:]')" in
+      "") ;;                 # exit 0 with no answer at all: not trusted
+      "{}"|"[]") return 2 ;;
+      *) return 0 ;;
+    esac
+  elif [ "$rc" = 2 ] && vault_no_value "$out"; then
+    return 2
+  fi
+  printf 'ERROR: %s failed (exit %s):\n' "'vault $*'" "$rc" >&2
+  printf '%s\n' "$out" | sed 's/^/    /' >&2
+  exit 1
 }
 
 _pki_issue_server_cert() {
@@ -74,9 +81,14 @@ _pki_write_role() {
   # (enroll / `portcullis cert enroll` pass the LLDAP username), never the
   # CSR's, and CSR SANs are ignored — a crafted CSR cannot smuggle in a
   # different identity. allow_any_name: usernames are not hostnames.
+  # No SANs of any kind: no IP SANs (allow_ip_sans=false), no URI / other
+  # SANs (allowed_uri_sans / allowed_other_sans empty); alt_names, ip_sans,
+  # uri_sans and other_sans are also denied to enroll by its Vault policy
+  # (vault/policies/enroll.hcl denied_parameters).
   vault write "$mount/roles/$role" \
     allowed_domains="$domain" allow_any_name=true enforce_hostnames=false \
     use_csr_common_name=false use_csr_sans=false \
+    allow_ip_sans=false allowed_uri_sans="" allowed_other_sans="" \
     client_flag=true server_flag=false code_signing_flag=false email_protection_flag=false \
     key_type=ec key_bits=256 max_ttl="$ttl" ttl="$ttl" no_store=false >/dev/null
 }
@@ -233,6 +245,14 @@ pki_setup() {
     # pki_int (no YubiKey certificate depends on it). A mount without an
     # issuer is a partial earlier run: wiped and redone.
     if [ "$file_issuer" != true ]; then
+      # browser-ca.crt on disk = a browser CA existed: never wipe or replace
+      # it on a guess (people's browser certificates depend on it).
+      if [ -s "$certs/browser-ca.crt" ]; then
+        fail "Vault has no browser certificate CA (pki_file) but $certs/browser-ca.crt exists
+       (Vault data lost?). Restore vault_data + secrets/ (./portcullis restore), or create
+       NEW CAs with ./portcullis pki setup --force (destroys both CAs: every YubiKey and
+       browser certificate must be issued again)."
+      fi
       if [ "$have_file" = true ]; then
         warn "Found an INCOMPLETE browser certificate CA (pki_file) — wiping it and starting over."
         vault secrets disable pki_file >/dev/null
@@ -258,8 +278,8 @@ pki_setup() {
   # No CA in Vault, but a complete CA chain on disk: Vault data was lost
   # (or secrets/ belong to another Vault). A new CA silently invalidates
   # every enrolled cert, so that needs an explicit --force.
-  if [ "$force" != true ] && [ -s "$certs/ca-chain.crt" ]; then
-    fail "Vault has no CA but $certs/ca-chain.crt exists (Vault data lost?).
+  if [ "$force" != true ] && { [ -s "$certs/ca-chain.crt" ] || [ -s "$certs/browser-ca.crt" ]; }; then
+    fail "Vault has no CA but $certs/ca-chain.crt or browser-ca.crt exists (Vault data lost?).
        Restore vault_data + secrets/ (./portcullis restore), or create a NEW CA
        with ./portcullis pki setup --force (every YubiKey and browser certificate must be issued again)."
   fi

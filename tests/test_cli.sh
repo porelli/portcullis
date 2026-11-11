@@ -569,14 +569,15 @@ expect_eq "MTLS_ENABLED appears nowhere in portcullis scripts/lib docker-compose
 TLS_YML="$ROOT_DIR/traefik/dynamic/tls.yml"
 # One line per option: <name> <clientAuthType or none> <caFile> <minVersion> <sniStrict>.
 TLS_GOT="$(awk '
-  /^    [a-z]+:$/ { if (n) print n, (t ? t : "none"), (ca ? ca : "-"), v, s; n = $1; sub(/:$/, "", n); t = ""; ca = ""; v = ""; s = ""; next }
+  /^    [a-z-]+:$/ { if (n) print n, (t ? t : "none"), (ca ? ca : "-"), v, s; n = $1; sub(/:$/, "", n); t = ""; ca = ""; v = ""; s = ""; next }
   /clientAuthType:/ { t = $2 } /- \/certs\// { ca = $2 } /minVersion:/ { v = $2 } /sniStrict:/ { s = $2 }
   END { if (n) print n, (t ? t : "none"), (ca ? ca : "-"), v, s }' "$TLS_YML")"
-expect_eq "traefik/dynamic/tls.yml defines exactly protected, authaware, public with those clientAuth types" "$TLS_GOT" \
-"protected RequireAndVerifyClientCert /certs/ca-chain.crt VersionTLS12 false
+expect_eq "traefik/dynamic/tls.yml defines exactly protected, protected-any, authaware, public with those clientAuth types and chains" "$TLS_GOT" \
+"protected RequireAndVerifyClientCert /certs/ca-chain-yubikey.crt VersionTLS12 false
+protected-any RequireAndVerifyClientCert /certs/ca-chain.crt VersionTLS12 false
 authaware VerifyClientCertIfGiven /certs/ca-chain.crt VersionTLS12 false
 public none - VersionTLS12 false"
-expect_eq "tls.yml: only the tls.options block" "$(grep -cvE '^[[:space:]]*(#|$)' "$TLS_YML")" 19
+expect_eq "tls.yml: only the tls.options block" "$(grep -cvE '^[[:space:]]*(#|$)' "$TLS_YML")" 26
 expect_eq "tls.yml is tracked by git" "$(git -C "$ROOT_DIR" ls-files traefik/dynamic/tls.yml)" "traefik/dynamic/tls.yml"
 # Every core router carries authaware@file.
 ROUTERS="$(grep -oE 'traefik\.http\.routers\.[a-z0-9-]+\.rule' "$ROOT_DIR/docker-compose.yml" | sed 's/^traefik\.http\.routers\.//; s/\.rule$//' | sort -u)"
@@ -687,12 +688,17 @@ mv "$SR_ROOT/.env.x" "$SR_ROOT/.env"
 
 # ── enroll's Vault policy: exactly the D21 paths (contract §8.1) ──
 POLICY_GOT="$(awk '
-  /^[[:space:]]*path[[:space:]]+"/ { p = $2; gsub(/"/, "", p) }
-  /capabilities/ { c = $0; sub(/.*\[/, "", c); sub(/\].*/, "", c); gsub(/[" ]/, "", c); print p " " c }
+  function flush() { if (p != "") print p " " c (d != "" ? " deny=" d : ""); p = ""; c = ""; d = "" }
+  /^[[:space:]]*path[[:space:]]+"/ { flush(); p = $2; gsub(/"/, "", p); ind = 0; next }
+  /capabilities/ { c = $0; sub(/.*\[/, "", c); sub(/\].*/, "", c); gsub(/[" ]/, "", c); next }
+  /denied_parameters/ { ind = 1; next }
+  ind && /=[[:space:]]*\[\]/ { k = $1; gsub(/"/, "", k); d = (d == "" ? k : d "," k); next }
+  ind && /^[[:space:]]*}/ { ind = 0; next }
+  END { flush() }
 ' "$HERE/../vault/policies/enroll.hcl" | sort)"
 POLICY_WANT="$(sort <<'EOF'
-pki_int/sign/client-cert update
-pki_file/sign/browser-cert update
+pki_int/sign/client-cert update deny=alt_names,ip_sans,uri_sans,other_sans
+pki_file/sign/browser-cert update deny=alt_names,ip_sans,uri_sans,other_sans
 pki_int/certs list
 pki_file/certs list
 pki_int/cert/* read
@@ -707,6 +713,8 @@ expect_eq "enroll.hcl grants exactly the D21 paths (sign/client-cert, sign/brows
   "$POLICY_GOT" "$POLICY_WANT"
 expect_eq "enroll.hcl has one path block per grant" \
   "$(grep -c '^[[:space:]]*path[[:space:]]' "$HERE/../vault/policies/enroll.hcl")" 10
+expect_eq "enroll.hcl: only capabilities and denied_parameters (no allowed_parameters, no wildcard grants)" \
+  "$(grep -vE '^[[:space:]]*(#|$|path "pki_(int|file)/[a-z/-]+\*?" \{|capabilities = \["(update|list|read)"\]|denied_parameters = \{|"(alt_names|ip_sans|uri_sans|other_sans)" += \[\]|\})' "$HERE/../vault/policies/enroll.hcl")" ""
 
 # ── cert list / revoke / enroll over both CAs (stub vault + ykman) ──
 CT_ROOT="$WORK/cert-root"
@@ -726,14 +734,21 @@ ct_cert bb_03 bob 1767225600
 cat > "$CT_BIN/vault" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$CT_CALLS"
+# Like the real CLI (Vault 1.17), every API error exits 2 with an error
+# text; only "No value found at <path>" means nothing is there.
+# CT_SEALED=1: the lists answer exit 0 with no list (a sealed Vault's empty table).
+if [ -n "${CT_SEALED:-}" ] && [ "$1" = list ]; then exit 0; fi
 case "$*" in
+  "read -format=json pki_int/cert/dd:44")
+    printf 'Error reading pki_int/cert/dd:44: Error making API request.\n\nCode: 403. Errors:\n\n* permission denied\n' >&2; exit 2 ;;
+  "read -format=json pki_file/cert/dd:44") cat "$CT_DATA/bb_02.json" ;;
   "list -format=json pki_int/certs") echo '["aa:01"]' ;;
   "list -format=json pki_file/certs") echo '["bb:02","bb:03"]' ;;
   "read -format=json pki_int/cert/aa:01") cat "$CT_DATA/aa_01.json" ;;
   "read -format=json pki_file/cert/bb:02") cat "$CT_DATA/bb_02.json" ;;
   "read -format=json pki_file/cert/bb:03") cat "$CT_DATA/bb_03.json" ;;
   "read -format=json pki_"*/cert/*) echo "No value found at ${3}" >&2; exit 2 ;;
-  "list -format=json pki_int/certs/revoked") echo "No value found" >&2; exit 2 ;;
+  "list -format=json pki_int/certs/revoked") echo "No value found at pki_int/certs/revoked" >&2; exit 2 ;;
   "list -format=json pki_file/certs/revoked") echo '["bb:02","bb:03"]' ;;
   "write -format=json pki_int/sign/client-cert "*) jq -n --rawfile c "$CT_DATA/aa_01.pem" '{data: {certificate: $c}}' ;;
   "write pki_"*/revoke\ *|"read -format=json pki_"*/crl/rotate) ;;
@@ -752,7 +767,7 @@ chmod +x "$CT_BIN/vault" "$CT_BIN/ykman"
 ct() {
   RC=0
   rm -f "$WORK/cert-calls"; touch "$WORK/cert-calls"
-  PATH="$CT_BIN:$PATH" CT_CALLS="$WORK/cert-calls" CT_DATA="$CT_DATA" VAULT_TOKEN=t PORTCULLIS_ROOT="$CT_ROOT" \
+  PATH="$CT_BIN:$PATH" CT_SEALED="${CT_SEALED:-}" CT_CALLS="$WORK/cert-calls" CT_DATA="$CT_DATA" VAULT_TOKEN=t PORTCULLIS_ROOT="$CT_ROOT" \
     "$CLI" cert "$@" >"$WORK/out" 2>"$WORK/err" </dev/null || RC=$?
   OUT="$(cat "$WORK/out")"; ERR="$(cat "$WORK/err")"
 }
@@ -784,6 +799,12 @@ read -format=json pki_int/crl/rotate"
 ct revoke --yes cc:99
 expect_eq "cert revoke of an unknown serial exits 1" "$RC" 1
 expect_eq "cert revoke of an unknown serial revokes nothing" "$(grep -c '/revoke ' "$WORK/cert-calls")" 0
+ct revoke --yes dd:44
+expect_eq "cert revoke: a 403 on pki_int (exit 2) is an error, not 'look on pki_file'" "$RC" 1
+expect_eq "cert revoke: a 403 on pki_int revokes nothing" "$(grep -c '/revoke ' "$WORK/cert-calls")" 0
+expect_eq "cert revoke: a 403 on pki_int never reads pki_file" "$(grep -c 'pki_file/cert/dd:44' "$WORK/cert-calls")" 0
+CT_SEALED=1 ct list --all
+expect_eq "cert list: a sealed Vault's empty answer (exit 0, no list) fails" "$RC" 1
 ct enroll alice
 expect_eq "cert enroll exits 0 (stub ykman)" "$RC" 0
 case "$OUT" in *"https://people.example.test/signin"*) t_pass "cert enroll's renewal hint names https://people.<domain>/signin" ;; *) t_fail "cert enroll's renewal hint: $OUT" ;; esac
