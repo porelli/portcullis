@@ -8,13 +8,27 @@ on:
   pull_request:
     branches: [main]
     paths-ignore: ['**.md', 'docs/**', 'LICENSE']
-  # release.yml runs exactly these checks before publishing a tag.
+  # release.yml runs exactly these checks before publishing a tag (it
+  # passes no `jobs`: the default `all`).
   workflow_call:
+    inputs:
+      jobs:
+        description: Jobs to run (always all for a release)
+        type: string
+        default: all
   # Cross-repo feature branches (e.g. `instances`): run by hand with
   # `gh workflow run ci.yml --ref <branch>`; the Hub and the Keycloak image
   # are then built from the Hub's / portcullis-keycloak's same-named branch
   # (.github/actions/hub-image, .github/actions/keycloak-image).
+  # `-f jobs=build-and-test,e2e-signin` (comma- or space-separated job
+  # names) runs only those jobs; the default `all` runs every job. Push and
+  # pull_request always run everything.
   workflow_dispatch:
+    inputs:
+      jobs:
+        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai"
+        type: string
+        default: all
 
 
 # A newer push to the same ref supersedes the older run (runners are shared
@@ -60,8 +74,13 @@ env:
 
 jobs:
   unit-tests:
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',unit-tests,') || contains(format(' ,{0}, ', inputs.jobs), ',unit-tests ') || contains(format(' ,{0}, ', inputs.jobs), ' unit-tests,') || contains(format(' ,{0}, ', inputs.jobs), ' unit-tests ')
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: shellcheck
@@ -636,6 +655,11 @@ jobs:
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
 
   build-and-test:
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',build-and-test,') || contains(format(' ,{0}, ', inputs.jobs), ',build-and-test ') || contains(format(' ,{0}, ', inputs.jobs), ' build-and-test,') || contains(format(' ,{0}, ', inputs.jobs), ' build-and-test ')
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -711,6 +735,7 @@ jobs:
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/*.sh
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -721,6 +746,7 @@ jobs:
       # its layer cache too.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -732,6 +758,7 @@ jobs:
           cache-from: type=gha,scope=enroll
           cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=enroll,mode=max' || '' }}
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -743,6 +770,7 @@ jobs:
           cache-from: type=gha,scope=group-gate
           cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=group-gate,mode=max' || '' }}
       - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -755,6 +783,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=domains-test,mode=max' || '' }}
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -766,8 +795,10 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=mcp-gate,mode=max' || '' }}
       - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/hub-image
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: Start core services (without Traefik ACME)
@@ -2458,7 +2489,8 @@ jobs:
           done
           expect x "a script reads its own key" vk "$FA_PW" forward-auth eval "return redis.call('get', KEYS[1])" 1 _oauth2_proxy-ci0
           expect '*NOPERM*' "a script can't read another proxy's key" vk "$FA_PW" forward-auth eval "return redis.call('get', KEYS[1])" 1 __Host-portcullis_ext-ci0
-          expect '*NOPERM*' "a script can't run what the user can't" vk "$FA_PW" forward-auth eval "return redis.call('flushall')" 0
+          # (Valkey words a refused call inside a script "ACL failure in script: ... no permissions to run")
+          expect "*ACL failure in script*forward-auth has no permissions to run the 'flushall' command*" "a script can't run what the user can't" vk "$FA_PW" forward-auth eval "return redis.call('flushall')" 0
           expect 1 "forward-auth deletes its own key" vk "$FA_PW" forward-auth del _oauth2_proxy-ci0
           expect 1 "forward-auth-ext deletes its own key" vk "$FX_PW" forward-auth-ext del __Host-portcullis_ext-ci0
 
@@ -2511,6 +2543,7 @@ jobs:
           echo "PASS: portcullis status --json reports Vault, PKI and Keycloak healthy"
 
       - name: Backup (consistent, nothing stopped) and verify it
+        timeout-minutes: 15
         run: |
           VAULT_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q vault)")"
           ./portcullis backup
@@ -2534,6 +2567,7 @@ jobs:
           echo "PASS: logical backup while running, verify --local, corruption detected, metrics"
 
       - name: Off-host backup (restic, local repository), verify, wrong password
+        timeout-minutes: 15
         run: |
           echo "BACKUP_REPOSITORY=$RUNNER_TEMP/restic-repo" >> .env
           ./portcullis backup --offsite
@@ -2556,6 +2590,7 @@ jobs:
           echo "PASS: restic backup (x2), retention, check + restore + sanity checks, encrypted, wrong password refused"
 
       - name: Restore from off-host into a fresh stack (new host)
+        timeout-minutes: 15
         run: |
           VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
           echo "::add-mask::$VAULT_TOKEN"
@@ -2665,8 +2700,13 @@ jobs:
   # Traefik → oauth2-proxy → Keycloak (LLDAP users, WebAuthn, X.509) → group-gate.
   # tests/e2e/e2e_login.py documents every scenario.
   e2e:
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e ')
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
@@ -2708,6 +2748,7 @@ jobs:
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -2716,6 +2757,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -2727,6 +2769,7 @@ jobs:
           # build-and-test writes the (identical) cache on main.
           cache-to: ""
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -2739,6 +2782,7 @@ jobs:
       # The production build (no test provider): vault init's age-key
       # generation runs this image.
       - name: Build the domains service (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -2749,6 +2793,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ""
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -2760,6 +2805,7 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: Start the core stack (Vault, PKI, all services except the Hub)
@@ -2933,6 +2979,7 @@ jobs:
           key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust the CA
+        timeout-minutes: 10
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
@@ -3054,6 +3101,7 @@ jobs:
           done
 
       - name: Upload screenshots, traces and logs
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -3076,8 +3124,13 @@ jobs:
   # browser scenarios; the instance backup / delete / restore checks run
   # against a real daemon at the end.
   e2e-instances:
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-instances,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-instances ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-instances,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-instances ')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
       E2E_EXTRA: team-b.test
@@ -3141,6 +3194,7 @@ jobs:
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -3149,6 +3203,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -3159,6 +3214,7 @@ jobs:
           cache-from: type=gha,scope=enroll
           cache-to: ""
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -3169,6 +3225,7 @@ jobs:
           cache-from: type=gha,scope=group-gate
           cache-to: ""
       - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -3180,6 +3237,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ""
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -3191,8 +3249,10 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/hub-image
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: Start the whole stack (Hub with the CI template source, domains + Pebble)
@@ -3418,6 +3478,7 @@ jobs:
           key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA and Pebble's root
+        timeout-minutes: 10
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
@@ -3436,6 +3497,7 @@ jobs:
         run: NODE_EXTRA_CA_CERTS=/tmp/e2e-ca-bundle.pem /tmp/e2e-venv/bin/python tests/e2e/e2e_instances.py
 
       - name: Instance backup → guarded delete → restore into a new id (real daemon)
+        timeout-minutes: 15
         run: |
           set -o pipefail
           SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
@@ -3611,6 +3673,7 @@ jobs:
           docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'cat /d/group-gate-policy.json; ls -la /d /d/overrides /d/ops; cat /d/overrides/*.yml /d/ops/*.json' > e2e-artifacts/hub-data.txt 2>&1 || true
 
       - name: Upload screenshots, traces and logs
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -3642,8 +3705,13 @@ jobs:
   # page, forged certificate headers, sign_in_help, the sign-in history and
   # enroll.<d> serving setup links only.
   e2e-signin:
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-signin,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-signin ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-signin,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-signin ')
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 25
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
@@ -3711,6 +3779,7 @@ jobs:
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -3719,6 +3788,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -3729,6 +3799,7 @@ jobs:
           cache-from: type=gha,scope=enroll
           cache-to: ""
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -3739,6 +3810,7 @@ jobs:
           cache-from: type=gha,scope=group-gate
           cache-to: ""
       - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -3750,6 +3822,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ""
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -3761,8 +3834,10 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/hub-image
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: Start the whole stack (Hub with the echo / oidc-echo template source)
@@ -3942,6 +4017,7 @@ jobs:
           key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
+        timeout-minutes: 10
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
@@ -3971,6 +4047,7 @@ jobs:
       # Keycloak's portcullis-needs-stronger.ftl in core's portcullis theme
       # (a Keycloak page: no secret on it), kept on success too.
       - name: Upload the Keycloak needs-stronger screenshot
+        timeout-minutes: 10
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -3993,6 +4070,7 @@ jobs:
       # The screenshots and HTML of the password pages are taken before
       # anything is typed; no traces are recorded.
       - name: Upload screenshots and logs
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -4019,8 +4097,13 @@ jobs:
   # people.<domain> (firefox-sync's allowlist and guard.sql on Postgres),
   # membership changes through the Hub, Nextcloud's start hook.
   e2e-settings:
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-settings,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-settings ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-settings,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-settings ')
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
@@ -4123,6 +4206,7 @@ jobs:
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -4144,6 +4228,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -4154,6 +4239,7 @@ jobs:
           cache-from: type=gha,scope=enroll
           cache-to: ""
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -4164,6 +4250,7 @@ jobs:
           cache-from: type=gha,scope=group-gate
           cache-to: ""
       - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -4175,6 +4262,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ""
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -4186,8 +4274,10 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/hub-image
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: Start the whole stack (Hub with the CI template source)
@@ -4315,6 +4405,7 @@ jobs:
           key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
+        timeout-minutes: 10
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
@@ -4355,6 +4446,7 @@ jobs:
           sudo find appfiles -name '*.json' ! -name '*.secrets.json' -exec sh -c 'echo "== $1"; cat "$1"; echo' _ {} \; > e2e-artifacts/appfiles.txt 2>&1 || true
 
       - name: Upload screenshots, traces and logs
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -4382,8 +4474,13 @@ jobs:
   # preview / apply / host verify, doctor drift, undo, lan_only exposure and
   # rebind, the socket proxy as on main. No browser.
   e2e-folders:
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-folders,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-folders ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-folders,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-folders ')
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
@@ -4475,6 +4572,7 @@ jobs:
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -4492,6 +4590,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -4502,6 +4601,7 @@ jobs:
           cache-from: type=gha,scope=enroll
           cache-to: ""
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -4512,6 +4612,7 @@ jobs:
           cache-from: type=gha,scope=group-gate
           cache-to: ""
       - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -4523,6 +4624,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ""
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -4534,8 +4636,10 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/hub-image
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: The shared folder's tree on the host (ext4, ACLs)
@@ -4636,6 +4740,7 @@ jobs:
           docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'ls -laR /d/folders /d/folder-snapshots /d/doctor; cat /d/doctor/scans.json; ls -la /d/overrides; cat /d/overrides/*.yml' > e2e-artifacts/hub-data.txt 2>&1 || true
 
       - name: Upload logs
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -4666,9 +4771,14 @@ jobs:
   # archive, docker inspect, log or the hub_data volume. Passwords and
   # hashes are masked, given to smbclient through PASSWD, never on argv.
   e2e-filesharing:
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-filesharing,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-filesharing ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-filesharing,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-filesharing ')
     # The smbclient pin below is the 24.04 package.
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
@@ -4759,6 +4869,7 @@ jobs:
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -4776,6 +4887,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -4786,6 +4898,7 @@ jobs:
           cache-from: type=gha,scope=enroll
           cache-to: ""
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -4796,6 +4909,7 @@ jobs:
           cache-from: type=gha,scope=group-gate
           cache-to: ""
       - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -4807,6 +4921,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ""
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -4818,8 +4933,10 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/hub-image
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: smbclient (apt, pinned) and the shared folder on the host (ext4, ACLs)
@@ -4890,6 +5007,7 @@ jobs:
           key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
+        timeout-minutes: 10
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
@@ -4930,6 +5048,7 @@ jobs:
           done
 
       - name: Upload screenshots and logs
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -4962,8 +5081,13 @@ jobs:
   # no_token_crossing, destructive_confirmation, aggregate_lists,
   # leaver_refused_and_revoked, ai_off.
   e2e-ai:
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ai,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ai ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ai,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ai ')
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
@@ -5052,6 +5176,7 @@ jobs:
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -5073,6 +5198,7 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: false
       - name: Build the MCP client (tests/e2e/mcpclient, go-sdk pinned in go.mod / go.sum)
+        timeout-minutes: 15
         working-directory: tests/e2e/mcpclient
         run: |
           go mod verify
@@ -5084,6 +5210,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -5094,6 +5221,7 @@ jobs:
           cache-from: type=gha,scope=enroll
           cache-to: ""
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -5104,6 +5232,7 @@ jobs:
           cache-from: type=gha,scope=group-gate
           cache-to: ""
       - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -5115,6 +5244,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ""
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -5126,8 +5256,10 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/hub-image
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: Start the whole stack (Hub with the gitea / grafana / echo template source)
@@ -5211,6 +5343,7 @@ jobs:
           key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
+        timeout-minutes: 10
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
@@ -5256,6 +5389,7 @@ jobs:
           docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'cat /d/mcp-gate.json; ls -la /d /d/overrides; cat /d/overrides/*.yml' > e2e-artifacts/hub-data.txt 2>&1 || true
 
       - name: Upload screenshots, traces and logs
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
