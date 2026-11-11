@@ -43,6 +43,12 @@ env:
   # on the runners (./portcullis up uses these instead).
   PORTCULLIS_PUBLIC_IPV4: 203.0.113.10
   PORTCULLIS_PUBLIC_IPV6: ""
+  # docker/build-push-action: no build summary / build-record artifact in
+  # its post step. Nothing reads them, and on 2026-11-11 (run 43092132806)
+  # the artifact service answered HTML for each upload: 5 retries ≈ 10.5 min
+  # per build, 30+ minutes after e2e-settings' tests had all passed.
+  DOCKER_BUILD_SUMMARY: "false"
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
   # Pebble (ACME test CA) for the domains service test (also in the CI override).
   PEBBLE_IMG: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
 
@@ -2446,8 +2452,8 @@ jobs:
           expect '*NOPERM*' "forward-auth can't write forward-auth-ext's keys" vk "$FA_PW" forward-auth set __Host-portcullis_ext-ci0 x
           expect OK "forward-auth-ext writes its own keys" vk "$FX_PW" forward-auth-ext set __Host-portcullis_ext-ci0 x PX 60000
           expect '*NOPERM*' "forward-auth can't read forward-auth-ext's keys" vk "$FA_PW" forward-auth get __Host-portcullis_ext-ci0
-          for cmd in "keys *" "scan 0" "flushall" "config get *" "config set maxmemory 0" "acl list" "client list" "info" "shutdown" "script flush"; do
-            # shellcheck disable=SC2086  # the command's words
+          for cmd in "keys x" "scan 0" "flushall" "config get maxmemory" "config set maxmemory 0" "acl list" "client list" "info" "shutdown" "script flush"; do
+            # shellcheck disable=SC2086  # the command's words (no glob characters in them)
             expect '*NOPERM*' "forward-auth may not run '$cmd'" vk "$FA_PW" forward-auth $cmd
           done
           expect x "a script reads its own key" vk "$FA_PW" forward-auth eval "return redis.call('get', KEYS[1])" 1 _oauth2_proxy-ci0

@@ -1679,7 +1679,15 @@ def main() -> int:
         def browser_cert_off_counts_nothing():
             # A switched-off method is never accepted (global constraint):
             # browser_cert off, the same valid .p12 and the same file session
-            # count for nothing; then everything back (in a finally).
+            # count for nothing; then everything back (in a finally). The
+            # switch drops browser_cert from every compiled rule (the Hub's
+            # signin.Compile), so e2e-anycert = any[yubikey_cert, browser_cert]
+            # compiles to any[yubikey_cert] and echo-anycert moves to
+            # protected@file (contract §5: every alternative has
+            # yubikey_cert), where a browser certificate can't even finish
+            # the handshake; echo-file, on the default template (Standard)
+            # meanwhile, is authaware@file, so the .p12 reaches Keycloak and
+            # the file session reaches group-gate there.
             needs("alice_file")
             c = state["bc"][0]
             errs: list = []
@@ -1687,38 +1695,46 @@ def main() -> int:
                 hub_ok("PUT", "/api/instances/echo-file/settings", {"sign_in_template": ""})
                 hub_ok("PUT", "/api/signin/templates/e2e-file/enabled", {"on": False})
                 hub_ok("PUT", "/api/signin/methods/browser_cert", {"on": False})
-                until("browser_cert off in both published files and echo-anycert on authaware@file",
-                      lambda: "browser_cert" not in published()["methods"]
-                      and "browser_cert" not in hub_json("group-gate-policy.json").get("methods", [])
-                      and tls_option("echo-anycert") == "authaware@file", 180, every=5)
+                def switched_off():
+                    got = {"signin-keycloak.json has browser_cert": "browser_cert" in published()["methods"],
+                           "group-gate-policy.json has browser_cert":
+                               "browser_cert" in hub_json("group-gate-policy.json").get("methods", []),
+                           "echo-anycert": tls_option("echo-anycert"), "echo-file": tls_option("echo-file")}
+                    ok = (not got["signin-keycloak.json has browser_cert"]
+                          and not got["group-gate-policy.json has browser_cert"]
+                          and got["echo-anycert"] == "protected@file" and got["echo-file"] == "authaware@file")
+                    assert ok, got  # until() keeps the last state for the failure message
+                    return True
+                until("browser_cert off in both published files, echo-anycert on protected@file, echo-file "
+                      "(Standard) on authaware@file", switched_off, 180, every=5)
                 # Keycloak: the .p12 alone signs nobody in.
                 uid = kc_user_id("alice")
                 t0 = int(time.time() * 1000) - 2000
-                ctx = new_context(client_cert={"pfx": c["p12"], "passphrase": c["pw"]}, origins=(AUTH, ECHO_ANYCERT))
+                ctx = new_context(client_cert={"pfx": c["p12"], "passphrase": c["pw"]}, origins=(AUTH, ECHO_FILE))
                 page = ctx.new_page()  # no authenticator
                 try:
-                    goto(page, ECHO_ANYCERT + "/")
+                    goto(page, ECHO_FILE + "/")
                     kc_page(page)
                     page.wait_for_selector("#authenticateWebAuthnButton", state="visible")
                     page.wait_for_timeout(5000)
                     base.shot(page, "alice-bc-off-kc")
                     assert page.url.startswith(REALM + "/"), f"left Keycloak: {page.url.split('?')[0]}"
-                    assert "Hostname" not in body(page), "echo-anycert opened"
+                    assert "Hostname" not in body(page), "echo-file opened"
                 finally:
                     ctx.close()
                 events = [e for e in kc("/events?" + urllib.parse.urlencode({"user": uid, "type": "LOGIN", "max": 20}))
                           if e.get("time", 0) >= t0]
                 assert not events, f"LOGIN events with browser_cert off: {[(e.get('clientId'), e.get('details')) for e in events]}"
                 # group-gate: the earlier file session (amr file) meets nothing.
-                ctx = new_context(client_cert={"pfx": c["p12"], "passphrase": c["pw"]}, origins=(AUTH, ECHO_ANYCERT),
+                ctx = new_context(client_cert={"pfx": c["p12"], "passphrase": c["pw"]}, origins=(AUTH, ECHO_FILE),
                                   storage_state=state["alice_file"])
                 page = ctx.new_page()
                 try:
-                    resp = goto(page, ECHO_ANYCERT + "/")
-                    print(f"    alice's file session on echo-anycert with browser_cert off: HTTP {resp and resp.status}",
+                    resp = goto(page, ECHO_FILE + "/")
+                    print(f"    alice's file session on echo-file (Standard) with browser_cert off: HTTP {resp and resp.status}",
                           flush=True)
                     assert resp is not None and resp.status == 403 and "Hostname" not in body(page), \
-                        f"echo-anycert with browser_cert off: HTTP {resp and resp.status}"
+                        f"echo-file with browser_cert off: HTTP {resp and resp.status}"
                 finally:
                     ctx.close()
             finally:
@@ -1739,7 +1755,8 @@ def main() -> int:
                         errs.append(str(e))
             assert not errs, f"restore failed: {errs}"
         check("browser_cert_off_counts_nothing: browser_cert switched off — the valid .p12 alone signs nobody in "
-              "(Keycloak keeps the passkey prompt, no LOGIN event) and alice's file session gets 403 on echo-anycert; "
+              "(Keycloak keeps the passkey prompt, no LOGIN event) and alice's file session gets 403 on echo-file "
+              "(Standard, authaware@file); echo-anycert moves to protected@file; "
               "switched back on in a finally (echo-file / echo-anycert back on protected-any@file)",
               browser_cert_off_counts_nothing)
 
