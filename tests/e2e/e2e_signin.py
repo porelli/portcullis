@@ -1561,9 +1561,12 @@ def main() -> int:
                     if "net::ERR_BAD_SSL_CLIENT_AUTH_CERT" in str(e):
                         pass
                     elif "net::ERR_HTTP2_PROTOCOL_ERROR" in str(e):
-                        ok_resp = page.goto(ECHO_ANYCERT + "/", wait_until="domcontentloaded")
+                        # A new page: the failed one still navigates to its
+                        # chrome-error page and would interrupt this goto.
+                        ctl = ctx.new_page()
+                        ok_resp = ctl.goto(ECHO_ANYCERT + "/", wait_until="domcontentloaded")
                         assert ok_resp is not None and ok_resp.status != 503 \
-                            and "client-certificate error" not in page.content(), \
+                            and "client-certificate error" not in ctl.content(), \
                             f"the .p12 on echo-anycert (control for {first}): HTTP {ok_resp and ok_resp.status}"
                         print(f"    the .p12 on echo-anycert (control): HTTP {ok_resp.status}", flush=True)
                     else:
