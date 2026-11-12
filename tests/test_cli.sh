@@ -264,6 +264,11 @@ case "$p" in
   "$R/clients/ai-uuid") jq -c '.[1]' "$KC_FIX/clients.json" ;;
   "$R/client-scopes") cat "$KC_FIX/scopes.json" ;;
   "$R/client-scopes/mcp-id") jq -c '.[4]' "$KC_FIX/scopes.json" ;;
+  # What configure POSTed / PUT before (the Keycloak it talks to keeps it).
+  "$R/client-scopes/acr-id/protocol-mappers/models")
+    jq -sc --arg p "$p" '[.[] | select(.m == "POST" and .p == $p) | .b | fromjson]' "$KC_LOG" ;;
+  "$R/authentication/required-actions/portcullis-impersonation-notice")
+    jq -sc '[.[] | select(.m == "PUT" and (.p | endswith("/required-actions/portcullis-impersonation-notice"))) | .b | fromjson] | last // {}' "$KC_LOG" ;;
   "$R") echo '{"realm":"portcullis","browserFlow":"portcullis-universal","loginTheme":"portcullis"}' ;;
   "$R/authentication/flows/portcullis-universal/executions")
     echo '[{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509-id"},{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509b-id"},{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509c-id"},{"providerId":"portcullis-method","level":3},{"providerId":"portcullis-template","level":0}]' ;;
@@ -329,19 +334,28 @@ imp_configure() {
     . "$HERE/../scripts/lib/keycloak.sh"
     kc_get() {
       case "$1" in
-        */client-scopes/acr-id/protocol-mappers/models) printf '%s' "$KC_IMP_MAPPERS" ;;
+        */client-scopes/acr-id/protocol-mappers/models)
+          # A POST that "took" (KC_IMP_KEEP unset) shows up in the next GET.
+          if [ -z "${KC_IMP_KEEP:-}" ] && grep -q '^POST .*/protocol-mappers/models' "$KC_IMP_LOG"; then
+            jq -c '. + [{"name":"impersonation","protocolMapper":"portcullis-impersonation"}]' <<<"$KC_IMP_MAPPERS"
+          else printf '%s' "$KC_IMP_MAPPERS"; fi ;;
         */authentication/required-actions/portcullis-impersonation-notice)
-          # After a registration Keycloak has it (disabled, its own priority).
-          if grep -q register-required-action "$KC_IMP_LOG"; then
+          if [ -z "${KC_IMP_KEEP:-}" ] && grep -q '^PUT .*/required-actions/' "$KC_IMP_LOG"; then
+            grep '^PUT .*/required-actions/' "$KC_IMP_LOG" | tail -n1 | cut -d' ' -f3-
+          elif grep -q register-required-action "$KC_IMP_LOG"; then
+            # After a registration Keycloak has it (disabled, its own priority).
             echo '{"alias":"portcullis-impersonation-notice","name":"Impersonation notice","providerId":"portcullis-impersonation-notice","enabled":false,"defaultAction":false,"priority":120,"config":{}}'
           else printf '%s' "$KC_IMP_RA"; fi ;;
         *) echo '{}' ;;
       esac
     }
     kc_send() { printf '%s %s %s\n' "$1" "$2" "$(jq -cS . 2>/dev/null)" >> "$KC_IMP_LOG"; if [ "$1" = POST ]; then echo 201; else echo 204; fi; }
-    _kc_impersonation_mapper acr-id >/dev/null 2>&1
-    _kc_impersonation_notice >/dev/null 2>&1
+    rc=0
+    ( _kc_impersonation_mapper acr-id >/dev/null 2>&1 ) || rc=$?
+    [ "$rc" = 0 ] || { cat "$KC_IMP_LOG"; echo "mapper exit $rc"; exit 0; }
+    ( _kc_impersonation_notice >/dev/null 2>&1 ) || rc=$?
     cat "$KC_IMP_LOG"
+    [ "$rc" = 0 ] || echo "notice exit $rc"
   )
 }
 R=/portcullis
@@ -356,6 +370,17 @@ expect_eq "keycloak configure: a mapper with protocolMapper portcullis-impersona
 expect_eq "keycloak configure: the action registered but disabled (or a default action) → one PUT, no registration" \
   "$(imp_configure '[{"protocolMapper":"portcullis-impersonation"}]' "$(jq -c '.enabled = false' <<<"$IMP_RA_ON")" | cut -d' ' -f1-2):$(imp_configure '[{"protocolMapper":"portcullis-impersonation"}]' "$(jq -c '.defaultAction = true' <<<"$IMP_RA_ON")" | jq -Rr 'split(" ")[2:] | join(" ") | fromjson | .defaultAction')" \
   "PUT $R/authentication/required-actions/portcullis-impersonation-notice:false"
+# Fail closed (contract §8.1): configure stops (non-zero) when the mapper
+# or the action isn't there afterwards.
+expect_eq "keycloak configure fails when the impersonation mapper POST doesn't take (the acr scope still lacks it)" \
+  "$(KC_IMP_KEEP=1 imp_configure '[]' "$IMP_RA_ON" | tail -n1)" "mapper exit 1"
+expect_eq "keycloak configure fails when the acr scope's mappers can't be read (never 'present')" \
+  "$(imp_configure '' "$IMP_RA_ON")" "mapper exit 1"
+expect_eq "keycloak configure fails with two portcullis-impersonation mappers on acr" \
+  "$(imp_configure '[{"protocolMapper":"portcullis-impersonation"},{"name":"x","protocolMapper":"portcullis-impersonation"}]' "$IMP_RA_ON")" "mapper exit 1"
+expect_eq "keycloak configure fails when the notice action is still missing or disabled afterwards" \
+  "$(KC_IMP_KEEP=1 imp_configure '[{"protocolMapper":"portcullis-impersonation"}]' "$(jq -c '.enabled = false' <<<"$IMP_RA_ON")" | tail -n1):$(KC_IMP_KEEP=1 imp_configure '[{"protocolMapper":"portcullis-impersonation"}]' '' | tail -n1)" \
+  "notice exit 1:notice exit 1"
 expect_eq "keycloak configure's impersonation steps never touch the events config" \
   "$(imp_configure '[]' '' | grep -c events || true)" 0
 
@@ -443,8 +468,8 @@ expect_eq 'compose keycloak image is ${KEYCLOAK_IMAGE:-ghcr.io/porelli/portculli
   "$(printf '%s\n' "$KC_SVC" | sed -n 's/^    image: //p')" '${KEYCLOAK_IMAGE:-ghcr.io/porelli/portcullis-keycloak:edge}'
 expect_eq "keycloak mounts hub_data read-only at /hub-data" \
   "$(printf '%s\n' "$KC_SVC" | grep -cxF '      - hub_data:/hub-data:ro')" 1
-expect_eq "keycloak command disables the impersonation feature" \
-  "$(printf '%s\n' "$KC_SVC" | grep -cxF -- '      - --features-disabled=impersonation'):$(printf '%s\n' "$KC_SVC" | grep -cE -- '--features(-enabled)?=.*impersonation' || true)" "1:0"
+expect_eq "keycloak command disables the impersonation feature (and no KC_FEATURES* env could re-enable it)" \
+  "$(printf '%s\n' "$KC_SVC" | grep -cxF -- '      - --features-disabled=impersonation'):$(printf '%s\n' "$KC_SVC" | grep -cE -- '--features(-enabled)?=.*impersonation' || true):$(cat "$HERE"/../docker-compose*.yml | grep -cE '^[[:space:]]*-?[[:space:]]*KC_FEATURES' || true)" "1:0:0"
 # shellcheck disable=SC2016  # a literal ${PORTCULLIS_DOMAIN:-...}
 expect_eq "keycloak gets PORTCULLIS_PORTAL_URL = the portal" \
   "$(printf '%s\n' "$KC_SVC" | sed -n 's/^      PORTCULLIS_PORTAL_URL: //p')" 'https://${PORTCULLIS_DOMAIN:-portcullis.local}/'

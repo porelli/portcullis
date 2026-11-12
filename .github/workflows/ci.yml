@@ -323,6 +323,7 @@ jobs:
                | all(index("X-Forwarded-Impersonator") and index("X-Forwarded-Impersonation")))
               and (.services.keycloak.command | index("--features-disabled=impersonation"))
               and ([.services.keycloak.command[] | select(test("^--features(-enabled)?=.*impersonation"))] == [])
+              and ((.services.keycloak.environment // {}) | keys | map(select(test("^KC_FEATURES"))) == [])
               and .services.keycloak.environment.PORTCULLIS_PORTAL_URL == "https://\($d)/"
               and .services["group-gate"].environment.GATE_IMPERSONATION_FILE == "/hub-data/impersonation.json"
               and .services.hub.environment.HUB_IMPERSONATION_MAX_MINUTES == "30"' >/dev/null \
@@ -2222,7 +2223,7 @@ jobs:
       - name: Stock impersonation is off
         run: |
           set -o pipefail
-          TOK=$(mktemp); chmod 600 "$TOK"
+          TOK=$(mktemp); chmod 600 "$TOK"; trap 'rm -f "$TOK"' EXIT
           # The CLI's admin token (admin-cli), kept in a file: never on argv.
           printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
             --data-urlencode client_id=admin-cli --data-urlencode "username=${KEYCLOAK_ADMIN:-admin}" \
@@ -2244,11 +2245,12 @@ jobs:
       - name: acr scope has amr and impersonation
         run: |
           set -o pipefail
-          TOK=$(mktemp); chmod 600 "$TOK"
+          TOK=$(mktemp); chmod 600 "$TOK"; trap 'rm -f "$TOK"' EXIT
           printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
             --data-urlencode client_id=admin-cli --data-urlencode "username=${KEYCLOAK_ADMIN:-admin}" \
             --data-urlencode grant_type=password --data-urlencode password@- \
             | jq -r '"Authorization: Bearer " + .access_token' > "$TOK"
+          grep -q '^Authorization: Bearer [^n]' "$TOK" || { echo "FAIL: no admin token"; exit 1; }
           echo "::add-mask::$(cut -d' ' -f3 "$TOK")"
           kc() { curl -sf -H @"$TOK" "http://127.0.0.1:8080/admin/realms/portcullis$1"; }
           ACR=$(kc /client-scopes | jq -r '.[] | select(.name == "acr") | .id')

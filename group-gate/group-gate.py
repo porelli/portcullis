@@ -2582,12 +2582,14 @@ def render_needs_page(app: str, have: set, node, set_up: Optional[set], add_stro
     if impersonated is not None:
         missing = _canonical({m for alt in alternatives(node) for m in alt if m not in have})
         # Nothing named as missing (e.g. a method switched off): the general words.
-        words = " or ".join(f"a {html.escape(METHOD_WORDS[m])}" for m in missing) or "a stronger sign-in"
+        words = " or ".join(f"a {html.escape(METHOD_WORDS[m])}" for m in missing)
+        didnt = "didn&#x27;t use them" if words else "didn&#x27;t meet it"
+        words = words or "a stronger sign-in"
         stop = e(impersonation_stop_url(domain), quote=True)
         return _signin_page(
             f"{app} needs a stronger sign-in",
             f"<div id=\"needs-stronger\" data-impersonated=\"true\"><p>{e(app)} needs {words}. "
-            f"{e(impersonated['admin'])}&#x27;s sign-in didn&#x27;t use them, and a session as "
+            f"{e(impersonated['admin'])}&#x27;s sign-in {didnt}, and a session as "
             f"{e(impersonated['target'])} can&#x27;t add one: Stop, sign in with them, and start again.</p>"
             f"<p><a id=\"pc-imp-needs-stop\" class=\"btn\" href=\"{stop}\">Stop</a></p></div>",
             render_banner(impersonated, time.time(), domain))

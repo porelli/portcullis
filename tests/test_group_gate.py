@@ -3266,7 +3266,7 @@ class ImpersonationTest(GateTest):
                "ended": None}
         b = gg.render_needs_page("App", {"security_key", "yubikey_cert"}, STRONG, None, False, "example.com",
                                  impersonated=rec).decode()
-        self.assertIn("App needs a stronger sign-in. root&#x27;s sign-in didn&#x27;t use them", b)
+        self.assertIn("App needs a stronger sign-in. root&#x27;s sign-in didn&#x27;t meet it, and a session as alice", b)
         self.assertNotIn("needs .", b)
 
     def test_imp_claims_from_access_token_only(self):

@@ -370,8 +370,10 @@ keycloak_configure() {
     else
       echo "    amr mapper present"
     fi
-    _kc_impersonation_mapper "$scope_id"
   fi
+  # Fail closed (contract §8.1): without the mapper an impersonated session's
+  # tokens carry no act / pc_imp and look like the person's own.
+  _kc_impersonation_mapper "$scope_id"
   _kc_impersonation_notice
 
   info "Ensuring the groups client scope..."
@@ -445,16 +447,27 @@ KC_EMAIL_UNVERIFIED_SCOPE="email-unverified"
 # clientScopes would replace Keycloak's defaults); found by protocolMapper,
 # so a renamed copy isn't added twice.
 _kc_impersonation_mapper() {
-  local scope_id="$1" code
-  if [ "$(kc_get "/$KC_REALM/client-scopes/$scope_id/protocol-mappers/models" \
-      | jq '[.[]? | select(.protocolMapper == "portcullis-impersonation")] | length')" = 0 ]; then
+  local scope_id="$1" code n
+  [ -n "$scope_id" ] || fail "Keycloak has no acr client scope: the impersonation mapper can't be added (an impersonated session would look like the person's own). Fix the realm, then run ./portcullis keycloak configure again."
+  # _kc_imp_mappers — how many portcullis-impersonation mappers the acr
+  # scope has; "?" when the scope can't be read (never "0", never "present").
+  _kc_imp_mappers() {
+    kc_get "/$KC_REALM/client-scopes/$scope_id/protocol-mappers/models" \
+      | jq -e 'if type == "array" then [.[] | select(.protocolMapper? == "portcullis-impersonation")] | length else error end' 2>/dev/null || echo "?"
+  }
+  n="$(_kc_imp_mappers)"
+  if [ "$n" = 0 ]; then
     code="$(jq -n '{name: "impersonation", protocol: "openid-connect", protocolMapper: "portcullis-impersonation",
         config: {"id.token.claim": "true", "access.token.claim": "true", "userinfo.token.claim": "true"}}' \
       | kc_send POST "/$KC_REALM/client-scopes/$scope_id/protocol-mappers/models")"
     _kc_report "impersonation mapper" "$code" 201 || true
-  else
-    echo "    impersonation mapper present"
+    n="$(_kc_imp_mappers)"
   fi
+  if [ "$n" != 1 ]; then
+    if [ "$n" = "?" ]; then n="its mappers can't be read"; else n="it has $n portcullis-impersonation mappers, not exactly one"; fi
+    fail "the impersonation mapper on the acr client scope: $n. An impersonated session would look like the person's own. Check Keycloak (is the portcullis-keycloak image running?), then run ./portcullis keycloak configure again."
+  fi
+  echo "    impersonation mapper present"
 }
 
 # KC_IMP_NOTICE — the notice required action exactly as realm-export.json
@@ -473,17 +486,21 @@ _kc_impersonation_notice() {
   if ! printf '%s' "$cur" | jq -e --arg a "$ra" 'type == "object" and .alias == $a' >/dev/null 2>&1; then
     code="$(jq -c '{providerId, name}' <<<"$KC_IMP_NOTICE" \
       | kc_send POST "/$KC_REALM/authentication/register-required-action")"
-    _kc_report "$ra required action registered" "$code" 204 201 || return 0
+    _kc_report "$ra required action registered" "$code" 204 201 || true
     cur="$(kc_get "/$KC_REALM/authentication/required-actions/$ra")"
   fi
-  if printf '%s' "$cur" | jq -e --argjson w "$KC_IMP_NOTICE" '.enabled == true and .defaultAction == false and .priority == $w.priority' >/dev/null 2>&1; then
-    echo "    $ra required action enabled"
-    return 0
+  if ! printf '%s' "$cur" | jq -e --argjson w "$KC_IMP_NOTICE" '.enabled == true and .defaultAction == false and .priority == $w.priority' >/dev/null 2>&1; then
+    code="$(jq -nc --arg c "$cur" --argjson w "$KC_IMP_NOTICE" \
+        '((try ($c | fromjson) catch {}) | if type == "object" then . else {} end) + ($w | {alias, providerId, enabled, defaultAction, priority})' \
+      | kc_send PUT "/$KC_REALM/authentication/required-actions/$ra")"
+    _kc_report "$ra required action enabled" "$code" 204 || true
+    cur="$(kc_get "/$KC_REALM/authentication/required-actions/$ra")"
   fi
-  code="$(jq -nc --arg c "$cur" --argjson w "$KC_IMP_NOTICE" \
-      '((try ($c | fromjson) catch {}) | if type == "object" then . else {} end) + ($w | {alias, providerId, enabled, defaultAction, priority})' \
-    | kc_send PUT "/$KC_REALM/authentication/required-actions/$ra")"
-  _kc_report "$ra required action enabled" "$code" 204 || true
+  # Fail closed: without it the person is never told an administrator
+  # signed in as them.
+  printf '%s' "$cur" | jq -e --arg a "$ra" 'type == "object" and .alias == $a and .enabled == true' >/dev/null 2>&1 \
+    || fail "the $ra required action is missing or disabled in Keycloak: people wouldn't be told an administrator signed in as them. Check Keycloak (is the portcullis-keycloak image running?), then run ./portcullis keycloak configure again."
+  echo "    $ra required action enabled"
 }
 
 _kc_email_unverified_scope() {
