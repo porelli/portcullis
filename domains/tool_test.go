@@ -102,8 +102,8 @@ func TestToolApplyWait(t *testing.T) {
 	t.Cleanup(func() { toolPollEvery = old })
 	code, out, errs := f.run([]string{"apply", "--wait", "5s"}, toolJSON(nil))
 	var pl dnsplan.Plan
-	if code != 0 || json.Unmarshal([]byte(out), &pl) != nil {
-		t.Fatalf("apply = %d %s %s", code, out, errs)
+	if code != 0 || json.Unmarshal([]byte(out), &pl) != nil || !pl.CanWrite {
+		t.Fatalf("apply = %d %s %s (the final plan is built with the provider: can_write)", code, out, errs)
 	}
 	for _, it := range pl.Items {
 		if (it.Set == dnsplan.SetAddress || it.Set == dnsplan.SetCAA) && it.Status != dnsplan.StatusOK {

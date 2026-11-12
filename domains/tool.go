@@ -209,18 +209,19 @@ func runDNSTool(args []string, e toolEnv) int {
 	}
 	// Wait until the public resolvers show every applied set.
 	deadline := time.Now().Add(wait)
+	// The polls are read-only (public view); the plan printed at the end is
+	// built with the provider, like apply's own (can_write, fix: auto).
 	for {
 		pl := build(base)
 		if appliedVisible(pl, in.Sets) {
-			return printPlan(e, pl, exitOK)
+			return printPlan(e, build(write), exitOK)
 		}
-		if time.Now().Add(toolPollEvery).After(deadline) {
+		if time.Now().Add(toolPollEvery).After(deadline) || ctx.Err() != nil {
 			fmt.Fprintf(e.stderr, "domains dns apply: not every applied record is visible at the public resolvers after %s\n", wait)
-			return printPlan(e, pl, exitProblem)
+			return printPlan(e, build(write), exitProblem)
 		}
 		select {
 		case <-ctx.Done():
-			return printPlan(e, pl, exitProblem)
 		case <-time.After(toolPollEvery):
 		}
 	}
