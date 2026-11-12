@@ -27,7 +27,9 @@ with the Hub link, an unused link cannot sign in to another client through
 the invite identity provider (post-broker deny, contract §8), X.509 login /
 mtls binding, a cert-only session (no authenticator) opens a
 default-template app (enroll's /self is gone: the renewal is the Sign-in
-page's, e2e_signin.py), revocation / foreign CA.
+page's, e2e_signin.py), revocation / foreign CA; the login theme's brand on
+the first sign-in page (login_theme_brand: css/portcullis.css linked, the
+mark as #kc-header-wrapper::before, the favicon = the branding favicon.ico).
 
 Browser: Playwright Chromium with a CDP virtual WebAuthn authenticator
 (CTAP2, USB, resident keys, user verification). The CA must be trusted by
@@ -54,6 +56,7 @@ Against a live server without certs: tests/e2e/e2e_invite.py.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -71,6 +74,8 @@ DOMAIN = os.environ["E2E_DOMAIN"]
 ART = os.environ.get("E2E_ARTIFACTS", "e2e-artifacts")
 TIMEOUT_MS = 30_000
 AUTH = f"https://auth.{DOMAIN}"
+# sha256 of the branding favicon.ico (keycloak/themes/portcullis/login/resources/img/; tests/test_branding.py).
+FAVICON_ICO_SHA256 = "d709cb96a8d612fc471fa02914d674f03972146a1680db98f97f93e46bcea7a1"
 APP = f"https://app.{DOMAIN}"
 HWK = f"https://hwk.{DOMAIN}"
 MTLS = f"https://mtls.{DOMAIN}"
@@ -251,6 +256,24 @@ def main() -> int:
             assert page.locator("#authenticateWebAuthnButton").count() == 1, "the sign-in page offers no passkey"
             assert page.locator("input[type=password]").count() == 0, "the sign-in page has a password field"
         check("unauthenticated request is redirected to a passkey-only sign-in", unauthenticated_redirect)
+
+        def login_theme_brand():
+            # The portcullis login theme's branding (keycloak/themes/portcullis):
+            # its stylesheet loaded after keycloak.v2's, the mark above the
+            # card, and the favicon a byte copy of the branding source's.
+            assert page.locator('link[href$="/css/portcullis.css"]').count() == 1, "portcullis.css is not linked"
+            bg = page.evaluate("getComputedStyle(document.querySelector('#kc-header-wrapper'), '::before')"
+                               ".backgroundImage")
+            assert "portcullis-mark.svg" in bg, f"#kc-header-wrapper::before background-image: {bg!r}"
+            href = page.eval_on_selector("link[rel=icon]", "e => e.href")
+            got = page.evaluate("""async (u) => {
+                const r = await fetch(u, {credentials: "omit"});
+                return {status: r.status, bytes: Array.from(new Uint8Array(await r.arrayBuffer()))};
+            }""", href)
+            assert got["status"] == 200, f"favicon {href}: HTTP {got['status']}"
+            digest = hashlib.sha256(bytes(got["bytes"])).hexdigest()
+            assert digest == FAVICON_ICO_SHA256, f"favicon {href}: sha256 {digest}"
+        check("login_theme_brand", login_theme_brand)
 
         def setup_link_signs_in():
             page.goto(invite, wait_until="domcontentloaded")
