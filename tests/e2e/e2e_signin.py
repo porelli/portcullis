@@ -2811,12 +2811,18 @@ def main() -> int:
                             resp = goto(page, ECHO_STD + "/")
                             base.shot(page, "imp5-expired")
                             text = body(page)
+                            # Ruling: group-gate's ended page, or (oauth2-proxy
+                            # re-authorizes: the token's exp is until) Keycloak's
+                            # sign-in page; never anything as alice.
                             gg = page.locator("#impersonation-ended").count() == 1
                             kce = page.locator("#impersonating[data-mode=ended]").count() == 1
+                            signin = page.url.startswith(REALM + "/") and page.locator("#authenticateWebAuthnButton").count() == 1
                             print(f"    {time.time() - imp_t0[doc['id']]:.0f} s after the start: HTTP {resp and resp.status} at "
-                                  f"{page.url.split('?')[0]} (group-gate ended {gg}, Keycloak ended {kce})", flush=True)
-                            assert "Hostname" not in text, "echo-std opened after the expiry"
-                            assert gg or kce, f"no ended page after the expiry: {page.url.split('?')[0]} {text[:200]!r}"
+                                  f"{page.url.split('?')[0]} (group-gate ended {gg}, Keycloak ended {kce}, sign-in page {signin})",
+                                  flush=True)
+                            assert "Hostname" not in text and "alice" not in text.replace("as alice has ended", ""), \
+                                f"alice's data after the expiry: {text[:200]!r}"
+                            assert gg or kce or signin, f"neither the ended page nor the sign-in page: {page.url.split('?')[0]} {text[:200]!r}"
                             until("alice's impersonated Keycloak session gone", lambda: no_imp_session("alice", sids), 20, every=2)
                     except Exception as e:  # noqa: BLE001
                         errors.append(f"{what}: {e}")
