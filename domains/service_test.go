@@ -36,6 +36,8 @@ import (
 	"github.com/letsencrypt/pebble/v2/wfe"
 	"github.com/libdns/libdns"
 
+	"github.com/portcullis/domains/internal/dnsplan"
+	"github.com/portcullis/domains/internal/dnssec"
 	"github.com/portcullis/domains/internal/fakedns"
 )
 
@@ -1586,5 +1588,218 @@ func TestReadyDomainAppliesDueCAA(t *testing.T) {
 	}
 	if !e.domain(name).CertNotAfter.Equal(first) {
 		t.Fatal("a new certificate was ordered")
+	}
+}
+
+// ── DNS API (Task 6) ──────────────────────────────────────
+
+func (e *testEnv) planOf(path string) dnsplan.Plan {
+	e.t.Helper()
+	code, body := e.do("GET", path, "", true)
+	if code != 200 {
+		e.t.Fatalf("GET %s = %d %s", path, code, body)
+	}
+	var pl dnsplan.Plan
+	if err := json.Unmarshal([]byte(body), &pl); err != nil {
+		e.t.Fatal(err)
+	}
+	return pl
+}
+
+func TestPlanEndpoint(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-pl.example.org"
+	if code, _ := e.do("GET", "/domains/"+name+"/dns", "", true); code != 404 {
+		t.Fatalf("plan of an unknown name = %d", code)
+	}
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	pl := e.planOf("/domains/" + name + "/dns?refresh=1")
+	if !pl.CanWrite || pl.Name != name || !pl.CAA.WouldIssue || pl.CAA.AccountURI != e.storedURI() || pl.CAA.Issuer != "pebble.test" {
+		t.Fatalf("plan %+v", pl)
+	}
+	found := false
+	for _, it := range pl.Items {
+		if it.Set == dnsplan.SetCAA && it.Status == dnsplan.StatusOK {
+			found = true
+		}
+		if it.Set == dnsplan.SetAddress && it.Status != dnsplan.StatusOK {
+			t.Errorf("address item %+v", it)
+		}
+	}
+	if !found || pl.DNSSEC.State != "unsigned" {
+		t.Fatalf("plan %+v", pl)
+	}
+}
+
+func TestPlanRefreshThrottled(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-th.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) })
+	e.clock.advance(31 * time.Second)
+	before := e.zone.CallCount()
+	e.planOf("/domains/" + name + "/dns?refresh=1")
+	e.planOf("/domains/" + name + "/dns?refresh=1")
+	e.planOf("/domains/" + name + "/dns")
+	if n := e.zone.CallCount() - before; n != 1 {
+		t.Fatalf("%d builds (provider reads), want 1", n)
+	}
+	e.clock.advance(31 * time.Second)
+	e.planOf("/domains/" + name + "/dns?refresh=1")
+	if n := e.zone.CallCount() - before; n != 2 {
+		t.Fatalf("%d builds after the window, want 2", n)
+	}
+}
+
+func TestApplyEndpoint(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-ap.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	for _, body := range []string{`{"sets":["bogus"]}`, `{"sets":["nomail"],"x":1}`, `{"sets":[]}`, `{}`, `nope`} {
+		if code, _ := e.do("POST", "/domains/"+name+"/dns/apply", body, true); code != 400 {
+			t.Errorf("%s = %d", body, code)
+		}
+	}
+	if code, _ := e.do("POST", "/domains/nope.example.org/dns/apply", `{"sets":["caa"]}`, true); code != 404 {
+		t.Fatalf("unknown name = %d", code)
+	}
+	code, body := e.do("POST", "/domains/"+name+"/dns/apply", `{"sets":["nomail"]}`, true)
+	if code != 202 || !strings.Contains(body, `"name":"`+name+`"`) {
+		t.Fatalf("apply = %d %s", code, body)
+	}
+	e.waitFor("the null MX", 30*time.Second, func() bool {
+		for _, rr := range e.zone.Records(name) {
+			if rr.Type == "MX" && rr.Data == "0 ." {
+				return true
+			}
+		}
+		return false
+	})
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) })
+	d := e.domain(name)
+	if !contains(d.Sets, "nomail") || len(d.DueSets) != 0 {
+		t.Fatalf("sets %v due %v", d.Sets, d.DueSets)
+	}
+	// DELETE removes the nomail records too.
+	e.do("DELETE", "/domains/"+name, "", true)
+	if rrs := e.zone.Records("_dmarc." + name); len(rrs) != 0 {
+		t.Fatalf("left after delete: %v", rrs)
+	}
+}
+
+func TestDNSSECEndpoint409(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-ns.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	code, body := e.do("POST", "/domains/"+name+"/dnssec", `{"enable":true}`, true)
+	if code != 409 || !strings.Contains(body, "fake can't sign the zone through its API") {
+		t.Fatalf("= %d %s", code, body)
+	}
+	for _, b := range []string{`{"enable":false}`, `{}`, `{"enable":true,"x":1}`} {
+		if code, _ := e.do("POST", "/domains/"+name+"/dnssec", b, true); code != 400 {
+			t.Errorf("%s = %d", b, code)
+		}
+	}
+}
+
+// recordingSigner counts EnableDNSSEC calls (the interface has no way to
+// turn signing off).
+type recordingSigner struct{ enabled *atomic.Int32 }
+
+func (recordingSigner) DNSSECStatus(context.Context, string) (string, []dnssec.DS, error) {
+	return "disabled", nil, nil
+}
+
+func (r recordingSigner) EnableDNSSEC(context.Context, string) error {
+	r.enabled.Add(1)
+	return nil
+}
+
+func TestDNSSECEndpointSigns(t *testing.T) {
+	e := newEnv(t, false)
+	var enabled atomic.Int32
+	providers["fake-signer"] = providerSpec{required: []string{"api_token"}, build: providers["fake"].build,
+		dnssec: func(map[string]string) (dnssec.StatusReader, error) { return recordingSigner{&enabled}, nil }}
+	t.Cleanup(func() { delete(providers, "fake-signer") })
+	const name = "team-sg.example.org"
+	e.do("PUT", "/domains/"+name, `{"provider":"fake-signer","credentials":{"api_token":"`+goodToken+`"}}`, true)
+	e.waitState(name, StateReady, 60*time.Second)
+	if pl := e.planOf("/domains/" + name + "/dns?refresh=1"); !pl.DNSSEC.ProviderCanSign || len(pl.DNSSEC.Steps) == 0 {
+		t.Fatalf("dnssec %+v", pl.DNSSEC)
+	}
+	if code, body := e.do("POST", "/domains/"+name+"/dnssec", `{"enable":true}`, true); code != 202 {
+		t.Fatalf("= %d %s", code, body)
+	}
+	e.waitFor("EnableDNSSEC", 30*time.Second, func() bool { return enabled.Load() == 1 && !e.domain(name).SignRequested && e.idle(name) })
+	time.Sleep(200 * time.Millisecond)
+	if n := enabled.Load(); n != 1 {
+		t.Fatalf("EnableDNSSEC called %d times", n)
+	}
+}
+
+func TestMainPlanReadOnly(t *testing.T) {
+	const traefik = "https://acme-staging-v02.api.letsencrypt.org/acme/acct/42"
+	e := newEnvWith(t, false, func(c *Config) { c.MainAccountURI = traefik })
+	before := e.zone.CallCount()
+	pl := e.planOf("/main/dns?refresh=1")
+	if pl.CanWrite || pl.Name != testMain || pl.CAA.AccountURI != traefik || !pl.CAA.WouldIssue {
+		t.Fatalf("main plan %+v", pl)
+	}
+	for _, it := range pl.Items {
+		if it.Fix == dnsplan.FixAuto {
+			t.Fatalf("auto fix in the main plan: %+v", it)
+		}
+	}
+	if n := e.zone.CallCount(); n != before {
+		t.Fatalf("the main plan called a provider (%d calls)", n-before)
+	}
+}
+
+func TestAccountEndpoint(t *testing.T) {
+	e := newEnv(t, false)
+	var a map[string]string
+	_, body := e.do("GET", "/acme/account", "", true)
+	json.Unmarshal([]byte(body), &a)
+	if a["account_uri"] != "" || a["caa_issuer"] != "pebble.test" || a["ca_server"] != e.svc.cfg.CAServer {
+		t.Fatalf("before registration: %s", body)
+	}
+	e.do("PUT", "/domains/team-ac.example.org", creds(goodToken), true)
+	e.waitState("team-ac.example.org", StateReady, 60*time.Second)
+	_, body = e.do("GET", "/acme/account", "", true)
+	json.Unmarshal([]byte(body), &a)
+	if a["account_uri"] == "" || a["account_uri"] != e.storedURI() {
+		t.Fatalf("after: %s", body)
+	}
+}
+
+func TestNewEndpointsNeedBearer(t *testing.T) {
+	e := newEnv(t, false)
+	for _, r := range [][2]string{{"GET", "/domains/team-x.example.org/dns"}, {"POST", "/domains/team-x.example.org/dns/apply"},
+		{"POST", "/domains/team-x.example.org/dnssec"}, {"GET", "/main/dns"}, {"GET", "/acme/account"}} {
+		if code, _ := e.do(r[0], r[1], `{}`, false); code != 401 {
+			t.Errorf("%s %s = %d", r[0], r[1], code)
+		}
+	}
+}
+
+func TestNoMailNotRecommendedForAlertSender(t *testing.T) {
+	e := newEnvWith(t, false, func(c *Config) { c.MailFrom = "alerts@mx.team-al.example.org" })
+	for _, n := range []string{"team-al.example.org", "team-am.example.org"} {
+		e.do("PUT", "/domains/"+n, creds(goodToken), true)
+	}
+	for n, want := range map[string]bool{"team-al.example.org": false, "team-am.example.org": true} {
+		e.waitState(n, StateReady, 60*time.Second)
+		got := false
+		for _, it := range e.planOf("/domains/" + n + "/dns").Items {
+			if it.Set == dnsplan.SetNoMail {
+				got = true
+			}
+		}
+		if got != want {
+			t.Errorf("%s: nomail recommended %v, want %v", n, got, want)
+		}
 	}
 }

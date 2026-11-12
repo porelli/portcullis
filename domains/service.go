@@ -85,6 +85,10 @@ type Service struct {
 	busy map[string]*job // running work per domain name
 	kick chan struct{}
 
+	// plans caches the last plan per domain name (mainPlanKey: the main
+	// domain), guarded by mu; built outside mu.
+	plans map[string]cachedPlan
+
 	acmeMu      sync.Mutex // serialises ACME account registration
 	lastDropped string     // last logged list of dropped certificates (guarded by mu)
 	wg          sync.WaitGroup
@@ -133,7 +137,8 @@ func NewService(cfg Config, store *Store) (*Service, error) {
 			d.State = StatePending
 		}
 	}
-	return &Service{cfg: cfg, store: store, findZone: legoZoneFinder, doc: doc, busy: map[string]*job{}, kick: make(chan struct{}, 1)}, nil
+	return &Service{cfg: cfg, store: store, findZone: legoZoneFinder, doc: doc, busy: map[string]*job{}, kick: make(chan struct{}, 1),
+		plans: map[string]cachedPlan{}}, nil
 }
 
 // job is one running attempt for a domain. rec (a one-slot semaphore) is
@@ -225,6 +230,11 @@ func (s *Service) APIHandler() http.Handler {
 	mux.HandleFunc("PUT /domains/{name}", s.handleEnroll)
 	mux.HandleFunc("POST /domains/{name}/token", s.handleToken)
 	mux.HandleFunc("DELETE /domains/{name}", s.handleDelete)
+	mux.HandleFunc("GET /domains/{name}/dns", s.handlePlan)
+	mux.HandleFunc("POST /domains/{name}/dns/apply", s.handleApply)
+	mux.HandleFunc("POST /domains/{name}/dnssec", s.handleDNSSEC)
+	mux.HandleFunc("GET /main/dns", s.handleMainPlan)
+	mux.HandleFunc("GET /acme/account", s.handleAccount)
 	want := sha256.Sum256([]byte("Bearer " + s.cfg.Secret))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
@@ -406,6 +416,7 @@ func (s *Service) handleDelete(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	snap := copyDomain(d)
 	delete(s.doc.Domains, name)
+	delete(s.plans, name)
 	err := s.store.Save(s.doc)
 	if err != nil {
 		d.Deleting = false
@@ -854,7 +865,10 @@ func (s *Service) refreshChecks(ctx context.Context, name string, gen int, p dns
 	s.mu.Unlock()
 	pctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	pl := s.buildPlan(pctx, snap, p)
+	pl := s.finishPlan(s.buildPlan(pctx, snap, p))
+	s.mu.Lock()
+	s.plans[name] = cachedPlan{plan: pl, at: s.cfg.Now()}
+	s.mu.Unlock()
 	caaOK := s.cfg.CAA && s.cfg.CAAIssuer != "" && pl.CAA.WouldIssue
 	for _, it := range pl.Items {
 		if it.Set == dnsplan.SetCAA && it.Status != dnsplan.StatusOK && it.Status != dnsplan.StatusForeign {
@@ -862,6 +876,236 @@ func (s *Service) refreshChecks(ctx context.Context, name string, gen int, p dns
 		}
 	}
 	s.update(name, gen, func(d *Domain) { d.CAAOK, d.DNSSEC = caaOK, string(pl.DNSSEC.State) })
+}
+
+// ── DNS plans (contract §12.2) ───────────────────────────
+
+// planRefreshEvery throttles ?refresh=1: one build per name per 30 s.
+const planRefreshEvery = 30 * time.Second
+
+// planTimeout bounds one plan build.
+const planTimeout = 60 * time.Second
+
+// mainPlanKey is the main domain's key in plans (never a valid name).
+const mainPlanKey = "@main"
+
+type cachedPlan struct {
+	plan dnsplan.Plan
+	at   time.Time
+}
+
+// cachedLocked returns the cached plan to answer with, if any: always
+// without refresh, within the throttle window with it. Caller holds mu.
+func (s *Service) cachedLocked(key string, refresh bool) (dnsplan.Plan, bool) {
+	c, ok := s.plans[key]
+	if !ok {
+		return dnsplan.Plan{}, false
+	}
+	if !refresh || s.cfg.Now().Sub(c.at) < planRefreshEvery {
+		return c.plan, true
+	}
+	return dnsplan.Plan{}, false
+}
+
+// errNotEnrolled: plan() for a name the service doesn't hold.
+var errNotEnrolled = errors.New("not enrolled")
+
+// plan is the domain's plan, cached; refresh rebuilds it (throttled).
+func (s *Service) plan(ctx context.Context, name string, refresh bool) (dnsplan.Plan, error) {
+	s.mu.Lock()
+	d, ok := s.doc.Domains[name]
+	if !ok || d.Deleting {
+		s.mu.Unlock()
+		return dnsplan.Plan{}, errNotEnrolled
+	}
+	if pl, ok := s.cachedLocked(name, refresh); ok {
+		s.mu.Unlock()
+		return pl, nil
+	}
+	snap := copyDomain(d)
+	s.mu.Unlock()
+	p, err := buildProvider(snap)
+	if err != nil {
+		p = nil // read-only plan; the records step reports the error
+	}
+	pl := s.finishPlan(s.buildPlan(ctx, snap, p))
+	s.mu.Lock()
+	s.plans[name] = cachedPlan{plan: pl, at: s.cfg.Now()}
+	s.mu.Unlock()
+	return pl, nil
+}
+
+// mainPlan is the main domain's read-only plan (no credentials: public
+// checks only, pinned to Traefik's account URI from main-domain.env).
+func (s *Service) mainPlan(ctx context.Context, refresh bool) dnsplan.Plan {
+	s.mu.Lock()
+	if pl, ok := s.cachedLocked(mainPlanKey, refresh); ok {
+		s.mu.Unlock()
+		return pl
+	}
+	s.mu.Unlock()
+	sp := dnsplan.Spec{Name: s.cfg.MainDomain, IPv4: s.cfg.IPv4, IPv6: s.cfg.IPv6, CAA: s.cfg.CAA, Issuer: s.cfg.CAAIssuer,
+		AccountURI: s.cfg.MainAccountURI, IODEF: s.cfg.CAAIODEF, Main: true}
+	pl := s.finishPlan(dnsplan.Build(ctx, dnsplan.Input{Spec: sp, Resolvers: s.cfg.Resolvers, Now: s.cfg.Now()}))
+	s.mu.Lock()
+	s.plans[mainPlanKey] = cachedPlan{plan: pl, at: s.cfg.Now()}
+	s.mu.Unlock()
+	return pl
+}
+
+// finishPlan drops the nomail recommendation for a name that sends the
+// alert mail (ALERT_SMTP_FROM at it or under it, spec §3).
+func (s *Service) finishPlan(pl dnsplan.Plan) dnsplan.Plan {
+	_, dom, ok := strings.Cut(s.cfg.MailFrom, "@")
+	dom = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(dom), "."))
+	if !ok || dom == "" || (dom != pl.Name && !strings.HasSuffix(dom, "."+pl.Name)) {
+		return pl
+	}
+	items := make([]dnsplan.Item, 0, len(pl.Items))
+	for _, it := range pl.Items {
+		if it.Set == dnsplan.SetNoMail && it.Status == dnsplan.StatusMissing && it.Severity == dnsplan.SevInfo {
+			continue
+		}
+		items = append(items, it)
+	}
+	pl.Items = items
+	return pl
+}
+
+func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
+	name, ok := s.pathName(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), planTimeout)
+	defer cancel()
+	pl, err := s.plan(ctx, name, r.URL.Query().Get("refresh") == "1")
+	if err != nil {
+		writeError(w, http.StatusNotFound, name+" is not enrolled")
+		return
+	}
+	writeJSON(w, http.StatusOK, pl)
+}
+
+func (s *Service) handleMainPlan(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), planTimeout)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mainPlan(ctx, r.URL.Query().Get("refresh") == "1"))
+}
+
+func (s *Service) handleAccount(w http.ResponseWriter, _ *http.Request) {
+	s.mu.Lock()
+	uri := s.accountURILocked()
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]string{"ca_server": s.cfg.CAServer, "account_uri": uri, "caa_issuer": s.cfg.CAAIssuer})
+}
+
+// decodeStrict decodes exactly one JSON object with known fields only.
+func decodeStrict(w http.ResponseWriter, r *http.Request, v any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v) == nil && dec.Decode(&struct{}{}) == io.EOF
+}
+
+func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
+	name, ok := s.pathName(w, r)
+	if !ok {
+		return
+	}
+	var b struct {
+		Sets []string `json:"sets"`
+	}
+	usage := `body must be {"sets": [...]} with sets from ` + strings.Join(dnsplan.Sets, ", ")
+	if !decodeStrict(w, r, &b) || len(b.Sets) == 0 {
+		writeError(w, http.StatusBadRequest, usage)
+		return
+	}
+	for _, set := range b.Sets {
+		if !contains(dnsplan.Sets, set) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown record set %q: %s", set, usage))
+			return
+		}
+	}
+	s.mu.Lock()
+	d, exists := s.doc.Domains[name]
+	if !exists || d.Deleting {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, name+" is not enrolled")
+		return
+	}
+	oldSets, oldDue := d.Sets, d.DueSets
+	for _, set := range b.Sets {
+		if set == dnsplan.SetNoMail && !contains(d.Sets, set) {
+			d.Sets = append(append([]string(nil), d.Sets...), set)
+		}
+		if !contains(d.DueSets, set) {
+			d.DueSets = append(append([]string(nil), d.DueSets...), set)
+		}
+	}
+	d.NextAttempt = time.Time{}
+	err := s.store.Save(s.doc)
+	if err != nil {
+		d.Sets, d.DueSets = oldSets, oldDue
+	}
+	v := s.viewLocked(d)
+	s.mu.Unlock()
+	if err != nil {
+		s.logf("dns apply %s: saving the store failed: %v", name, err)
+		writeError(w, http.StatusInternalServerError, "saving the store failed")
+		return
+	}
+	s.logf("domain %s: record sets due: %s", name, strings.Join(b.Sets, ", "))
+	s.Kick()
+	writeJSON(w, http.StatusAccepted, v)
+}
+
+func (s *Service) handleDNSSEC(w http.ResponseWriter, r *http.Request) {
+	name, ok := s.pathName(w, r)
+	if !ok {
+		return
+	}
+	var b struct {
+		Enable *bool `json:"enable"`
+	}
+	if !decodeStrict(w, r, &b) || b.Enable == nil || !*b.Enable {
+		writeError(w, http.StatusBadRequest, `body must be {"enable": true} (signing is never turned off)`)
+		return
+	}
+	s.mu.Lock()
+	d, exists := s.doc.Domains[name]
+	if !exists || d.Deleting {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, name+" is not enrolled")
+		return
+	}
+	snap := copyDomain(d)
+	s.mu.Unlock()
+	if _, can, err := buildDNSSEC(snap); err != nil || !can {
+		writeError(w, http.StatusConflict, snap.Provider+" can't sign the zone through its API")
+		return
+	}
+	s.mu.Lock()
+	d, exists = s.doc.Domains[name]
+	if !exists || d.Deleting {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, name+" is not enrolled")
+		return
+	}
+	d.SignRequested, d.NextAttempt = true, time.Time{}
+	err := s.store.Save(s.doc)
+	if err != nil {
+		d.SignRequested = false
+	}
+	v := s.viewLocked(d)
+	s.mu.Unlock()
+	if err != nil {
+		s.logf("dnssec %s: saving the store failed: %v", name, err)
+		writeError(w, http.StatusInternalServerError, "saving the store failed")
+		return
+	}
+	s.logf("domain %s: DNSSEC signing requested", name)
+	s.Kick()
+	writeJSON(w, http.StatusAccepted, v)
 }
 
 // buildPlan is d's plan (provider p may be nil: read-only).

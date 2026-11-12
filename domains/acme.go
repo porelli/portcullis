@@ -43,7 +43,10 @@ func (s *Service) legoConfig(u *acmeUser) *lego.Config {
 	cfg.Certificate.KeyType = certcrypto.EC256
 	cfg.UserAgent = "portcullis-domains"
 	if s.cfg.ACMEHTTPClient != nil {
-		cfg.HTTPClient = s.cfg.ACMEHTTPClient
+		// A copy: lego wraps the client's transport in place, so a shared
+		// client would be raced (and re-wrapped) by concurrent orders.
+		hc := *s.cfg.ACMEHTTPClient
+		cfg.HTTPClient = &hc
 	}
 	return cfg
 }
