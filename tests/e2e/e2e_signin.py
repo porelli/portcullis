@@ -133,6 +133,14 @@ Cases (in this order; each later case needs only the state it names):
   imp_next_bound            next in bob's browser → 403, his session intact
   imp_expiry (+ late next)  last, in parallel: expiry after 2 min 10 s; sam's
                             start opened after 125 s → 403
+  cert_and_password_kinds_identified  LOGIN pc_methods yubikey_cert /
+                            browser_cert (alice), password (pat); /api/me/signin rows
+  passkey_kinds_identified  (the job drifted the realm's passwordless policy
+                            and `keycloak configure` restored it) a security
+                            key (rita, invite --replace-keys), synced (bob),
+                            device-bound (pat; fixture kind passkey_device):
+                            type, log kind + AAGUID, /api/me/signin row, amr,
+                            LOGIN pc_methods
   tls_follows_switch        echo-std / echo-basic / auth.<d> CA names;
                             Standard = any[family:passkey], hub / people →
                             standard, Strong (and the certificate templates)
@@ -438,10 +446,10 @@ class Key:
 
     copies = 0
 
-    def __init__(self, page: Page, *, synced: bool = False, credentials: list | None = None):
+    def __init__(self, page: Page, *, synced: bool = False, credentials: list | None = None, transport: str = "usb"):
         self.cdp = page.context.new_cdp_session(page)
         self.cdp.send("WebAuthn.enable", {"enableUI": False})
-        opts = {"protocol": "ctap2", "transport": "usb", "hasResidentKey": True, "hasUserVerification": True,
+        opts = {"protocol": "ctap2", "transport": transport, "hasResidentKey": True, "hasUserVerification": True,
                 "isUserVerified": True, "automaticPresenceSimulation": True}
         if synced:
             opts.update(defaultBackupEligibility=True, defaultBackupState=True)
@@ -1749,6 +1757,8 @@ def main() -> int:
                 methods = [(e.get("details") or {}).get("pc_methods", "") for e in events]
                 print(f"    LOGIN events since: {[(e.get('clientId'), m) for e, m in zip(events, methods)]}", flush=True)
                 assert "browser_cert" in methods and not any("yubikey_cert" in m for m in methods), methods
+                rows = {m["id"]: m for m in people_json("alice", "GET", "/api/me/signin")["methods"]}
+                assert rows["browser_cert"]["state"] == "set", rows["browser_cert"]
                 state["alice_file"] = ctx.storage_state()
             finally:
                 ctx.close()
@@ -2185,6 +2195,25 @@ def main() -> int:
               "echo-file, help by carol and certificate entries; pat's a failed sign-in (his wrong password)",
               history_entries)
 
+        def cert_and_password_kinds_identified():
+            # The LOGIN events' pc_methods of the sign-ins above (the amr was
+            # asserted at each: mtls, file, pwd) and the Sign-in page's rows.
+            got = {}
+            for user in ("alice", "pat"):
+                got[user] = {(e.get("details") or {}).get("pc_methods", "") for e in kc_events(user, "LOGIN")}
+            print(f"    LOGIN pc_methods: alice {sorted(got['alice'])}, pat {sorted(got['pat'])}", flush=True)
+            assert "yubikey_cert" in got["alice"] and "browser_cert" in got["alice"], got["alice"]
+            assert "password" in got["pat"], got["pat"]
+            rows = {m["id"]: m["state"] for m in people_json("alice", "GET", "/api/me/signin")["methods"]}
+            assert rows["yubikey_cert"] == "set", rows
+            rows = {m["id"]: m["state"] for m in people_json("pat", "GET", "/api/me/signin")["methods"]}
+            assert rows["password"] == "set" and all(rows[k] != "set" for k in ("security_key", "passkey_device",
+                                                                                 "passkey_synced", "yubikey_cert",
+                                                                                 "browser_cert")), rows
+        check("cert_and_password_kinds_identified: Keycloak's LOGIN pc_methods name yubikey_cert and browser_cert for "
+              "alice's certificate sign-ins and password for pat's; /api/me/signin lists alice's yubikey_cert and pat's "
+              "password (and nothing else for pat)", cert_and_password_kinds_identified)
+
         def enroll_site_gone():
             # Traefik's own 404 (no router): enroll never sees these paths.
             for path in ("/", "/self", "/api/self/renew", "/api/sign", "/api/users", "/users", "/certs"):
@@ -2613,7 +2642,10 @@ def main() -> int:
                 btn.wait_for(timeout=15_000)
                 base.shot(page, "imp1-stop-page")
                 btn.click()
-                until("/oauth2/sign_out after Stop", lambda: any(u == AUTH + "/oauth2/sign_out" for _, u in seen), 20, every=1)
+                # (Playwright delivers the request events only inside its own
+                # calls: hence the wait_for_timeout.)
+                until("/oauth2/sign_out after Stop", lambda: page.wait_for_timeout(500) or
+                      any(u == AUTH + "/oauth2/sign_out" for _, u in seen), 20, every=0.5)
                 # Then the sign-in: this browser presents root's YubiKey
                 # certificate to auth.<d> (imp_start's step-up), so Keycloak's
                 # X.509 step signs root himself in again and the portal opens
@@ -2949,6 +2981,139 @@ def main() -> int:
         if state.get("ai_on"):
             code, out = hub("PUT", "/api/ai/settings", {"enabled": False})
             print(f"    cleanup: AI off: HTTP {code}", flush=True)
+
+        # ── every passkey kind identified (test server 2026-11-12: a drifted
+        # passwordless policy, conveyance none, registered a YubiKey as
+        # synced; the job drifts it before any registration and expects
+        # `keycloak configure` to restore direct). One credential of each
+        # kind through a real setup link: rita with `./portcullis invite
+        # --replace-keys` (security key), bob (synced) and pat (device-bound:
+        # Chromium's virtual authenticators all share one AAGUID, so the
+        # fixture names it passkey_device while pat registers) through the
+        # Hub's setup link. ──
+        KIND = {"security_key": ("portcullis-security-key", "hwk"), "passkey_device": ("portcullis-device-passkey", "dpk"),
+                "passkey_synced": ("webauthn-passwordless", "spk")}
+
+        def fixture_kind(kind: str) -> None:
+            doc = json.loads(original_fixture)
+            doc[AAGUID] = dict(doc[AAGUID], kind=kind)
+            write_fixture(json.dumps(doc, indent=2).encode() + b"\n")
+            kick()
+            until(f"signin-keycloak.json lists the virtual key as {kind}",
+                  lambda: (published()["authenticators"].get(AAGUID) or {}).get("kind") == kind, 90)
+
+        def hub_setup_link(user: str) -> str:
+            code, out = hub("POST", f"/api/directory/users/{user}/invite", {})
+            m = SETUP_LINK.search(json.dumps(out) if not isinstance(out, str) else out)
+            if m:
+                mask(m.group(0))
+            assert code == 200 and m, f"the Hub's setup link for {user}: HTTP {code} {redact(str(out))[:200]}"
+            raw = (out.get("url") if isinstance(out, dict) else None) or m.group(0)
+            mask(raw)
+            return raw
+
+        def kind_identified(user: str, kind: str, link: str, synced: bool = False, transport: str = "usb",
+                            old: list | None = None) -> None:
+            ctype, amr_code = KIND[kind]
+            mark = len(kc_log())
+            ctx = new_context()
+            try:
+                page = ctx.new_page()
+                key = Key(page, synced=synced, transport=transport)
+                goto(page, link)
+                base.passkey_flow(page, until=PORTAL, label=f"{user}-{kind}", expect_stepups=1)
+                creds = key.credentials()
+                assert key.registered == 1 and len(creds) == 1, (key.registered, creds)
+            finally:
+                ctx.close()
+            types = kc_types(user)
+            print(f"    {user}: Keycloak types {types}", flush=True)
+            assert types == [ctype], f"{user}: {types} (want [{ctype}])"
+            line = re.search(rf"passkey registered for {re.escape(user)}: AAGUID ([0-9a-f-]{{36}}), kind (\w+)", kc_log()[mark:])
+            assert line, f"no registration line for {user}"
+            print(f"    {user}: {line.group(0)}", flush=True)
+            assert line.group(2) == kind, f"{user} registered as {line.group(2)} (want {kind})"
+            if kind != "passkey_synced":
+                assert line.group(1) == AAGUID and set(line.group(1)) != {"0", "-"}, f"AAGUID {line.group(1)}"
+            if old:
+                ids = {raw_id(c["credentialId"]) for c in old}
+                assert raw_id(creds[0]["credentialId"]) not in ids, "--replace-keys kept the old credential"
+            # The Sign-in page: the passkey under its kind only.
+
+            def listed():
+                rows = {m["id"]: m for m in people_json(user, "GET", "/api/me/signin")["methods"]}
+                others = [k for k in KIND if k != kind and (rows[k]["state"] == "set" or rows[k].get("passkeys"))]
+                return rows[kind]["state"] == "set" and len(rows[kind].get("passkeys") or []) == 1 and not others and rows
+            rows = until(f"{user}'s /api/me/signin lists one {kind}", listed, 60, every=3)
+            print(f"    {user}: /api/me/signin {[(k, rows[k]['state']) for k in KIND]}", flush=True)
+            # A sign-in with it: amr and the LOGIN event's pc_methods.
+            t0 = int(time.time() * 1000) - 2000
+            ctx = new_context()
+            try:
+                page = ctx.new_page()
+                Key(page, synced=synced, transport=transport, credentials=creds)
+                goto(page, PORTAL)
+                assert drive_kc(page, lambda: page.url.startswith(PORTAL) and "Signed in as" in body(page),
+                                f"{user}-{kind}-signin") == "done"
+                amr = token_claims(page).get("amr") or []
+            finally:
+                ctx.close()
+            others = {KIND[k][1] for k in KIND if k != kind}
+            assert amr_code in amr and not (others & set(amr)), f"{user}: amr {amr} (want {amr_code}, none of {others})"
+
+            def login():
+                ev = [e for e in kc_events(user, "LOGIN") if e.get("time", 0) >= t0]
+                return [(e.get("details") or {}).get("pc_methods", "") for e in ev]
+            pcm = until(f"{user}'s LOGIN event", login, 20, every=2)
+            print(f"    {user}: amr {amr}, LOGIN pc_methods {pcm}", flush=True)
+            assert kind in pcm and not any(k in m for m in pcm for k in KIND if k != kind), pcm
+
+        def passkey_kinds_identified():
+            pol = kc("")
+            policy = {k: pol.get(k) for k in ("webAuthnPolicyPasswordlessAttestationConveyancePreference",
+                                              "webAuthnPolicyPasswordlessAuthenticatorAttachment",
+                                              "webAuthnPolicyPasswordlessRequireResidentKey",
+                                              "webAuthnPolicyPasswordlessUserVerificationRequirement")}
+            assert list(policy.values()) == ["direct", "not specified", "Yes", "required"], policy
+            errors = []
+            # security_key: the operator's lost-key path.
+            old = kc_types("rita")
+            uid = kc_user_id("rita")
+            old_creds = [c for c in kc(f"/users/{uid}/credentials") if c["type"] in PASSKEY_TYPES]
+            out = subprocess.run(["./portcullis", "invite", "rita", "--replace-keys", "--to", "portal", "--json"],
+                                 capture_output=True, text=True)
+            assert out.returncode == 0, f"portcullis invite --replace-keys rita: exit {out.returncode} {out.stderr[-300:]}"
+            link = json.loads(out.stdout)["url"]
+            mask(link)
+            print(f"    rita before --replace-keys: {old}", flush=True)
+            assert kc_types("rita") == [], f"--replace-keys left {kc_types('rita')}"
+            try:
+                kind_identified("rita", "security_key", link)
+                gone = {c["id"] for c in old_creds} & {c["id"] for c in kc(f"/users/{uid}/credentials")}
+                assert not gone, "rita's old credential is still there"
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"security_key: {redact(str(e))}")
+            try:
+                kind_identified("bob", "passkey_synced", hub_setup_link("bob"), synced=True)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"passkey_synced: {redact(str(e))}")
+            try:
+                fixture_kind("passkey_device")
+                kind_identified("pat", "passkey_device", hub_setup_link("pat"), transport="internal")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"passkey_device: {redact(str(e))}")
+            finally:
+                write_fixture(original_fixture)
+                kick()
+                until("signin-keycloak.json lists the virtual key as security_key again",
+                      lambda: (published()["authenticators"].get(AAGUID) or {}).get("kind") == "security_key", 90)
+            assert not errors, errors
+        check("passkey_kinds_identified: the realm's passwordless policy is direct / not specified / resident key / UV "
+              "(after the job drifted it and configure restored it); a security key (rita, ./portcullis invite "
+              "--replace-keys), a synced passkey (bob) and a device-bound passkey (pat; the fixture's kind "
+              "passkey_device) through setup links: each stored under its Keycloak type, logged with its kind (a "
+              "non-zero AAGUID), listed under its method only on /api/me/signin, signing in with amr hwk / spk / dpk and "
+              "LOGIN pc_methods of its kind", passkey_kinds_identified)
 
         # ── TLS follows the switches (last: it restarts apps) ──
         def tls_follows_switch():

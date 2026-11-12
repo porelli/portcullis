@@ -4033,7 +4033,29 @@ jobs:
             [ "$i" -eq 100 ] && { echo "FAIL: Keycloak not ready"; docker compose logs --tail=80 keycloak; exit 1; }
             sleep 3
           done
+          # Test server 2026-11-12: a realm whose passwordless passkey policy
+          # drifted (conveyance none, attachment cross-platform) registered a
+          # YubiKey as synced, and configure couldn't put it back. Drifted
+          # here before any registration: every later one (and the
+          # passkey_kinds_identified case) needs configure to restore it.
+          kc_tok() { printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+              --data-urlencode client_id=admin-cli --data-urlencode "username=${KEYCLOAK_ADMIN:-admin}" \
+              --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token; }
+          policy() { curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$1") http://127.0.0.1:8080/admin/realms/portcullis \
+              | jq -c '{c: .webAuthnPolicyPasswordlessAttestationConveyancePreference, a: .webAuthnPolicyPasswordlessAuthenticatorAttachment,
+                        r: .webAuthnPolicyPasswordlessRequireResidentKey, u: .webAuthnPolicyPasswordlessUserVerificationRequirement}'; }
+          TOK=$(kc_tok); [ -n "$TOK" ] && [ "$TOK" != null ] || { echo "FAIL: admin token for the passkey-policy drift"; exit 1; }
+          echo "::add-mask::$TOK"
+          echo '{"webAuthnPolicyPasswordlessRpEntityName": "Portcullis", "webAuthnPolicyPasswordlessAttestationConveyancePreference": "none", "webAuthnPolicyPasswordlessAuthenticatorAttachment": "cross-platform"}' \
+            | curl -sf -X PUT -H @<(printf 'Authorization: Bearer %s\n' "$TOK") -H 'Content-Type: application/json' --data-binary @- \
+              http://127.0.0.1:8080/admin/realms/portcullis || { echo "FAIL: drifting the passkey policy"; exit 1; }
+          got="$(policy "$TOK")"; echo "drifted passwordless policy: $got"
+          [ "$got" = '{"c":"none","a":"cross-platform","r":"Yes","u":"required"}' ] || { echo "FAIL: the drift didn't take (the check would prove nothing)"; exit 1; }
           ./portcullis keycloak configure
+          TOK=$(kc_tok); echo "::add-mask::$TOK"
+          got="$(policy "$TOK")"; echo "passwordless policy after configure: $got"
+          [ "$got" = '{"c":"direct","a":"not specified","r":"Yes","u":"required"}' ] || { echo "FAIL: keycloak configure didn't restore the passwordless policy"; exit 1; }
+          unset TOK
           ./portcullis oidc register
           ./portcullis up
           # oauth2-proxy exits while Keycloak is down.

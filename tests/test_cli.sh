@@ -269,7 +269,13 @@ case "$p" in
     jq -sc --arg p "$p" '[.[] | select(.m == "POST" and .p == $p) | .b | fromjson]' "$KC_LOG" ;;
   "$R/authentication/required-actions/portcullis-impersonation-notice")
     jq -sc '[.[] | select(.m == "PUT" and (.p | endswith("/required-actions/portcullis-impersonation-notice"))) | .b | fromjson] | last // {}' "$KC_LOG" ;;
-  "$R") echo '{"realm":"portcullis","browserFlow":"portcullis-universal","loginTheme":"portcullis"}' ;;
+  # A drifted passkey policy (the test server's); the realm PUTs configure
+  # sent are applied on top unless KC_REALM_KEEP is set (Keycloak 26.8
+  # keeping the policy).
+  "$R")
+    base='{"realm":"portcullis","browserFlow":"portcullis-universal","loginTheme":"portcullis","webAuthnPolicyPasswordlessAttestationConveyancePreference":"none","webAuthnPolicyPasswordlessAuthenticatorAttachment":"cross-platform","webAuthnPolicyPasswordlessRequireResidentKey":"Yes","webAuthnPolicyPasswordlessUserVerificationRequirement":"required"}'
+    if [ -n "${KC_REALM_KEEP:-}" ]; then printf '%s' "$base"
+    else jq -sc --argjson b "$base" --arg p "$p" 'reduce (.[] | select(.m == "PUT" and .p == $p) | .b | fromjson) as $x ($b; . + $x)' "$KC_LOG"; fi ;;
   "$R/authentication/flows/portcullis-universal/executions")
     echo '[{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509-id"},{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509b-id"},{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509c-id"},{"providerId":"portcullis-method","level":3},{"providerId":"portcullis-template","level":0}]' ;;
   "$R/authentication/config/x509-id") echo '{"id":"x509-id","alias":"x509-config","config":{"default.reference.value":"mtls","default.reference.maxAge":"36000"}}' ;;
@@ -286,6 +292,20 @@ PATH="$WORK/kcbin:$PATH" KC_LOG="$WORK/kc/log" KC_FIX="$WORK/kc" \
   "$CLI" keycloak configure >"$WORK/out" 2>"$WORK/err" </dev/null || RC=$?
 expect_eq "keycloak configure (stub admin API) exits 0" "$RC" 0
 [ "$RC" = 0 ] || sed 's/^/    /' "$WORK/err" | tail -5
+expect_eq "keycloak configure re-read the realm's passkey policy after its PUT (the drifted one fixed)" \
+  "$(grep -c 'passkey policy: direct attestation' "$WORK/out")" 1
+# Fail closed: Keycloak answered 204 but kept the drifted policy.
+: > "$WORK/kc/log"
+RC=0
+PATH="$WORK/kcbin:$PATH" KC_LOG="$WORK/kc/log" KC_FIX="$WORK/kc" KC_REALM_KEEP=1 \
+  "$CLI" keycloak configure >"$WORK/out2" 2>"$WORK/err2" </dev/null || RC=$?
+expect_eq "keycloak configure fails when the realm keeps a drifted passkey policy after its PUT" \
+  "$RC:$(grep -c "attestation none (wanted direct), attachment cross-platform (wanted not specified)" "$WORK/err2")" "1:1"
+expect_eq "keycloak configure stops at the drifted policy (no flow sync after it)" \
+  "$(jq -sc '[.[] | select(.p | test("/authentication/flows"))] | length' "$WORK/kc/log")" 0
+: > "$WORK/kc/log"
+PATH="$WORK/kcbin:$PATH" KC_LOG="$WORK/kc/log" KC_FIX="$WORK/kc" \
+  "$CLI" keycloak configure >"$WORK/out" 2>"$WORK/err" </dev/null || true
 expect_eq "keycloak configure listed the clients (the AI client was seen)" \
   "$(jq -sr '[.[] | select(.m == "GET" and .p == "/admin/realms/portcullis/clients?max=-1")] | length > 0' "$WORK/kc/log")" true
 expect_eq "keycloak configure: no write to the portcullis-ai client or the mcp:* scope" \
@@ -383,6 +403,67 @@ expect_eq "keycloak configure fails when the notice action is still missing or d
   "notice exit 1:notice exit 1"
 expect_eq "keycloak configure's impersonation steps never touch the events config" \
   "$(imp_configure '[]' '' | grep -c events || true)" 0
+
+# ── status: the realm's passkey policy (contract §8.1 "Passkey kinds"),
+# with kc_get stubbed: a drifted one fails status (a ✗ line, --json
+# keycloak.passkey_policy, the textfile gauge) ──
+PK_REALM_OK='{"realm":"portcullis","webAuthnPolicyPasswordlessAttestationConveyancePreference":"direct","webAuthnPolicyPasswordlessAuthenticatorAttachment":"not specified","webAuthnPolicyPasswordlessRequireResidentKey":"Yes","webAuthnPolicyPasswordlessUserVerificationRequirement":"required"}'
+# pk_status <realm JSON> <two-factor action enabled> <json|text|textfile> — status_run's output, then "rc <n>".
+pk_status() {
+  (
+    export PK_REALM="$1" PK_2FA="$2" KEYCLOAK_ADMIN_PASSWORD=stub
+    for l in common keycloak status; do
+      # shellcheck disable=SC1090
+      . "$HERE/../scripts/lib/$l.sh"
+    done
+    dc() { echo '{"Service":"keycloak","State":"running","Health":"healthy","Status":"Up"}'; }
+    vault_health_code() { echo 200; }
+    vault_admin_env() { return 1; }
+    container_health() { echo healthy; }
+    proxy_dns_shadows() { :; }
+    domains_status_lines() { :; }
+    _st_mcp_refusing() { :; }
+    kc_login() { KC_TOKEN=stub; }
+    metrics_textfile_write() { cat; }
+    kc_get() {
+      case "$1" in
+        /portcullis) printf '%s' "$PK_REALM" ;;
+        /portcullis/users/count) echo 3 ;;
+        "/portcullis/clients?clientId=portcullis-forward-auth") echo '[{"id":"fwd"}]' ;;
+        /portcullis/authentication/required-actions/webauthn-register-passwordless) echo '{"alias":"webauthn-register-passwordless","enabled":true}' ;;
+        /portcullis/authentication/required-actions/webauthn-register) printf '{"alias":"webauthn-register","enabled":%s}' "$PK_2FA" ;;
+        *) echo '{}' ;;
+      esac
+    }
+    rc=0
+    case "$3" in
+      json) status_run true || rc=$? ;;
+      textfile) status_textfile || rc=$? ;;
+      *) status_run false 2>&1 || rc=$? ;;
+    esac
+    echo "rc $rc"
+  )
+}
+expect_eq "status --json: the wanted passkey policy → ok, status ok" \
+  "$(pk_status "$PK_REALM_OK" false json | jq -c 'select(type == "object") | [.ok, .keycloak.passkey_policy]')" '[true,{"ok":true,"problems":[]}]'
+expect_eq "status: the wanted passkey policy → a ✓ line, exit 0" \
+  "$(pk_status "$PK_REALM_OK" false text | grep -c '✓ passkey policy: direct attestation'):$(pk_status "$PK_REALM_OK" false text | tail -n1)" "1:rc 0"
+PK_REALM_BAD="$(jq -c '.webAuthnPolicyPasswordlessAttestationConveyancePreference = "none" | .webAuthnPolicyPasswordlessAuthenticatorAttachment = "cross-platform"' <<<"$PK_REALM_OK")"
+expect_eq "status: attestation none / cross-platform (the test server's drift) → a ✗ line naming both, exit 1" \
+  "$(pk_status "$PK_REALM_BAD" false text | grep -F '✗' | sed 's/\x1b\[[0-9;]*m//g'):$(pk_status "$PK_REALM_BAD" false text | tail -n1)" \
+  "  ✗ passkey policy: attestation none (wanted direct), attachment cross-platform (wanted not specified) — new passkeys can't be told apart; run ./portcullis keycloak configure:rc 1"
+expect_eq "status --json: a drifted policy → ok false, the problems listed" \
+  "$(pk_status "$PK_REALM_BAD" false json | jq -c 'select(type == "object") | [.ok, .keycloak.passkey_policy]')" \
+  '[false,{"ok":false,"problems":["attestation none (wanted direct)","attachment cross-platform (wanted not specified)"]}]'
+expect_eq "status --json: resident key / UV unset, the two-factor webauthn-register on → each a problem" \
+  "$(pk_status "$(jq -c 'del(.webAuthnPolicyPasswordlessRequireResidentKey) | .webAuthnPolicyPasswordlessUserVerificationRequirement = "preferred"' <<<"$PK_REALM_OK")" true json | jq -c 'select(type == "object") | .keycloak.passkey_policy.problems')" \
+  '["resident key unset (wanted Yes)","user verification preferred (wanted required)","required action webauthn-register enabled (wanted disabled)"]'
+expect_eq "status --json: an unreadable realm or action → not ok (fail closed)" \
+  "$(pk_status '' '"x"' json | jq -c 'select(type == "object") | .keycloak.passkey_policy.problems')" \
+  "[\"the realm can't be read\",\"required action webauthn-register can't be read\"]"
+expect_eq "status --textfile: portcullis_keycloak_passkey_policy_ok 1 / 0" \
+  "$(pk_status "$PK_REALM_OK" false textfile | grep '^portcullis_keycloak_passkey_policy_ok '):$(pk_status "$PK_REALM_BAD" false textfile | grep '^portcullis_keycloak_passkey_policy_ok ')" \
+  "portcullis_keycloak_passkey_policy_ok 1:portcullis_keycloak_passkey_policy_ok 0"
 
 # ── realm-export.json: the sign-in flows of contract §8.1 (D6) ──
 RX="$HERE/../keycloak/realm-export.json"

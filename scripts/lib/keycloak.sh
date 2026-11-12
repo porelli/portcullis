@@ -80,6 +80,42 @@ kc_send() {
     "$(kc_url)/admin/realms$2"
 }
 
+# kc_passkey_policy_drift — how the realm's passwordless WebAuthn policy
+# differs from KC_REALM_SIGNIN_SETTINGS (contract §8.1 "Passkey kinds"):
+# one "<setting> <value> (wanted <value>)" line per mismatch (attestation,
+# attachment, resident key, user verification), "the realm can't be read"
+# when it can't be (never empty then); nothing when it matches. With any
+# conveyance but direct the browser zeroes the AAGUID and sends no
+# attestation, so the extension counts every new passkey as synced.
+kc_passkey_policy_drift() {
+  kc_get "/$KC_REALM" 2>/dev/null | jq -r --argjson w "$KC_REALM_SIGNIN_SETTINGS" '
+      if type != "object" or (.realm // "") == "" then "the realm can'"'"'t be read"
+      else
+        [["webAuthnPolicyPasswordlessAttestationConveyancePreference", "attestation"],
+         ["webAuthnPolicyPasswordlessAuthenticatorAttachment", "attachment"],
+         ["webAuthnPolicyPasswordlessRequireResidentKey", "resident key"],
+         ["webAuthnPolicyPasswordlessUserVerificationRequirement", "user verification"]][] as [$k, $l]
+        | select((.[$k] // "") != $w[$k])
+        | "\($l) \(.[$k] // "unset" | if . == "" then "unset" else . end) (wanted \($w[$k]))"
+      end' 2>/dev/null || echo "the realm can't be read"
+}
+
+# kc_passkey_actions_drift — the registration required actions (contract
+# §8.1): webauthn-register-passwordless enabled (the extension's
+# registration), the stock two-factor webauthn-register disabled. One line
+# per mismatch or unreadable action; nothing when both are right.
+kc_passkey_actions_drift() {
+  local ra want
+  for ra in webauthn-register-passwordless:true webauthn-register:false; do
+    want="${ra#*:}" ra="${ra%%:*}"
+    kc_get "/$KC_REALM/authentication/required-actions/$ra" 2>/dev/null | jq -r --arg a "$ra" --argjson w "$want" '
+        def state: if . then "enabled" else "disabled" end;
+        if type != "object" or (.enabled | type) != "boolean" then "required action \($a) can'"'"'t be read"
+        elif .enabled != $w then "required action \($a) \(.enabled | state) (wanted \($w | state))"
+        else empty end' 2>/dev/null || echo "required action $ra can't be read"
+  done
+}
+
 # _kc_report <label> <code> <ok-codes...>
 _kc_report() {
   local label="$1" code="$2" c
@@ -296,6 +332,15 @@ keycloak_configure() {
       # registered; an operator-chosen theme other than the defaults is kept.
       (if ((.loginTheme // "") | IN("", "keycloak", "keycloak.v2")) then {loginTheme: "portcullis"} else {} end)' | kc_send PUT "/$KC_REALM")"
   _kc_report "realm attributes" "$code" 204 || true
+  # Fail closed (contract §8.1 "Passkey kinds"): Keycloak answers 204 even
+  # when it kept the passwordless policy, and with any conveyance but
+  # direct every new passkey counts as synced. Read it back.
+  local drift
+  drift="$(kc_passkey_policy_drift)"
+  if [ -n "$drift" ]; then
+    fail "the realm's passkey policy is still not the one Portcullis needs after the update: $(printf '%s' "$drift" | paste -sd, - | sed 's/,/, /g'). New passkeys can't be told apart (each one counts as synced). Check Keycloak (is the portcullis-keycloak image running?), then run ./portcullis keycloak configure again."
+  fi
+  echo "    passkey policy: direct attestation, any attachment, resident key and user verification required"
 
   info "Syncing the authentication flows from realm-export.json..."
   for flow in $KC_EXPORT_FLOWS; do _kc_sync_flow "$flow" || true; done
