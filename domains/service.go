@@ -948,8 +948,12 @@ func (s *Service) mainPlan(ctx context.Context, refresh bool) dnsplan.Plan {
 
 // finishPlan drops the nomail recommendation for a name that sends the
 // alert mail (ALERT_SMTP_FROM at it or under it, spec §3).
-func (s *Service) finishPlan(pl dnsplan.Plan) dnsplan.Plan {
-	_, dom, ok := strings.Cut(s.cfg.MailFrom, "@")
+func (s *Service) finishPlan(pl dnsplan.Plan) dnsplan.Plan { return dropNoMailFor(pl, s.cfg.MailFrom) }
+
+// dropNoMailFor removes the nomail recommendation when mailFrom's domain
+// is the plan's name or under it (the service and the dns tool).
+func dropNoMailFor(pl dnsplan.Plan, mailFrom string) dnsplan.Plan {
+	_, dom, ok := strings.Cut(mailFrom, "@")
 	dom = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(dom), "."))
 	if !ok || dom == "" || (dom != pl.Name && !strings.HasSuffix(dom, "."+pl.Name)) {
 		return pl

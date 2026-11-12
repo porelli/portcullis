@@ -176,7 +176,7 @@ validate_mcp_network_config() {
 
 # Every core compose service (all profiles; CI checks the list against
 # docker-compose.yml), and the ones that are portcullis-proxy members.
-CORE_SERVICE_NAMES="socket-proxy-traefik socket-proxy-hub traefik postgres vault lldap keycloak sessions forward-auth forward-auth-ext group-gate hub enroll domains mcp-gate prometheus alertmanager blackbox textfile-exporter grafana"
+CORE_SERVICE_NAMES="socket-proxy-traefik socket-proxy-hub traefik postgres vault lldap keycloak sessions forward-auth forward-auth-ext group-gate hub enroll domains dns-tool mcp-gate prometheus alertmanager blackbox textfile-exporter grafana"
 CORE_PROXY_SERVICES="traefik mcp-gate grafana"
 
 # proxy_dns_shadows — one "<container> <name>" line per container on

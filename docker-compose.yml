@@ -1101,12 +1101,23 @@ services:
       ACME_EMAIL: ${ACME_EMAIL:-admin@portcullis.local}
       ACME_CA_SERVER: ${ACME_CA_SERVER:-https://acme-v02.api.letsencrypt.org/directory}
       DOMAINS_API_SUBNET: ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28}
+      # DNS hardening (contract §12.4): the caa set, its issuer for a CA
+      # other than Let's Encrypt, iodef; ALERT_SMTP_FROM's domain gets no
+      # nomail recommendation.
+      DNS_CAA: ${DNS_CAA:-true}
+      DNS_CAA_ISSUER: ${DNS_CAA_ISSUER:-}
+      DNS_CAA_IODEF: ${DNS_CAA_IODEF:-}
+      ALERT_SMTP_FROM: ${ALERT_SMTP_FROM:-}
     # DOMAINS_PUBLIC_IPV4 / _IPV6: PORTCULLIS_PUBLIC_IPV4 / _IPV6 from .env,
     # else detected (the last detected address kept when a lookup fails) —
     # written by ./portcullis up, so a manual `docker compose up` gets them
     # (missing before the first up: no addresses, no records).
     env_file:
       - path: ./secrets/domains/public-ips.env
+        required: false
+      # DOMAINS_MAIN_ACME_ACCOUNT_URI: Traefik's ACME account (written by
+      # ./portcullis up / upgrade), the pin of the read-only main-domain plan.
+      - path: ./secrets/domains/main-domain.env
         required: false
     volumes:
       - domains_data:/data
@@ -1127,6 +1138,25 @@ services:
     mem_limit: 256m
     pids_limit: 128
     restart: unless-stopped
+
+  # The domains image's one-shot DNS tool for the main domain (contract
+  # §12.1): `./portcullis dns plan | setup | check` runs it with
+  # `docker compose run --rm --no-deps -T dns-tool <sub>` and the provider
+  # credentials as JSON on stdin. Internet only (domains-egress: the DNS
+  # provider APIs, the public resolvers); no volumes, no environment, no
+  # secrets, never started by `up` (profile tools).
+  dns-tool:
+    image: portcullis-domains
+    pull_policy: never
+    profiles: [tools]
+    <<: *hardening
+    read_only: true
+    user: "10004:10004"
+    entrypoint: ["domains", "dns"]
+    stdin_open: true
+    networks: [domains-egress]
+    mem_limit: 128m
+    pids_limit: 64
 
   # MCP gate (contract §15): terminates every MCP request — the Keycloak
   # access token for exactly this resource, the person's population, tool

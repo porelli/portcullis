@@ -7,6 +7,9 @@
 //	domains            run the service
 //	domains keygen     print a new age X25519 identity (secrets/domains/age.key)
 //	domains healthcheck  exit 0 if the API answers /healthz (Docker HEALTHCHECK)
+//	domains enrolled   the number of enrolled domains
+//	domains dns …      the one-shot DNS tool (tool.go)
+//	domains traefik-account-uri <acme.json>, domains report --main --json
 package main
 
 import (
@@ -81,8 +84,25 @@ func main() {
 			}
 			fmt.Println(n)
 			return
+		case "dns":
+			// The test build's provider "fake" (and its DNS server) first.
+			if err := startTestProvider(toolLogger()); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(exitFailure)
+			}
+			setHTTPDefaults(2 * time.Minute)
+			os.Exit(runDNSTool(os.Args[2:], toolEnv{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr, resolvers: resolversFromEnv()}))
+		case "traefik-account-uri":
+			os.Exit(runTraefikAccountURI(os.Args[2:], os.Stdout, os.Stderr))
+		case "report":
+			secret, err := readSecret(env("DOMAINS_API_SECRET_FILE", "/run/portcullis/domains/api-secret"))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "domains report: %v\n", err)
+				os.Exit(exitFailure)
+			}
+			os.Exit(runReport(os.Args[2:], "http://127.0.0.1"+env("DOMAINS_API_ADDR", ":8080"), secret, os.Stdout, os.Stderr))
 		default:
-			fmt.Fprintf(os.Stderr, "usage: domains [keygen|healthcheck|enrolled]\n")
+			fmt.Fprintf(os.Stderr, "usage: domains [keygen|healthcheck|enrolled|dns|traefik-account-uri|report]\n")
 			os.Exit(2)
 		}
 	}
