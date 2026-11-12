@@ -2613,11 +2613,30 @@ def main() -> int:
                 btn.wait_for(timeout=15_000)
                 base.shot(page, "imp1-stop-page")
                 btn.click()
-                kc_page(page)
+                until("/oauth2/sign_out after Stop", lambda: any(u == AUTH + "/oauth2/sign_out" for _, u in seen), 20, every=1)
+                # Then the sign-in: this browser presents root's YubiKey
+                # certificate to auth.<d> (imp_start's step-up), so Keycloak's
+                # X.509 step signs root himself in again and the portal opens
+                # as root (run 43234690407); without it, the sign-in page.
+
+                def after_stop():
+                    page.wait_for_load_state("domcontentloaded")
+                    if page.url.startswith(REALM + "/"):
+                        return page.locator("#authenticateWebAuthnButton").count() == 1 and "sign-in page"
+                    if page.url.startswith(PORTAL) and "Signed in as" in body(page):
+                        return "portal as root"
+                    return None
+                landing = until("the sign-in after Stop", after_stop, 30, every=1)
                 base.shot(page, "imp1-after-stop")
+                text = body(page)
+                print(f"    after Stop: {landing}", flush=True)
                 assert ("POST", PEOPLE + "/api/me/impersonation/stop") in seen, [u for _, u in seen][-10:]
-                assert any(u == AUTH + "/oauth2/sign_out" for _, u in seen), [u for _, u in seen][-10:]
-                assert page.locator("#authenticateWebAuthnButton").count() == 1, f"not the sign-in page: {body(page)[:200]!r}"
+                assert IMP_BANNER not in text and "Your session as alice" not in text, text[:200]
+                if landing == "portal as root":
+                    c = token_claims(page)
+                    assert c.get("preferred_username") == "root" and "act" not in c and "pc_imp" not in c, \
+                        f"after Stop: {c.get('preferred_username')} act {c.get('act')} pc_imp {c.get('pc_imp')}"
+                    assert "Signed in as <strong>root</strong>" in page.content(), text[:200]
                 until("alice's impersonated Keycloak session gone", lambda: no_imp_session("alice", imp["sids"]), 20, every=2)
                 code, _ = raw_request(f"echo-std.{DOMAIN}", "/", f"_oauth2_proxy={old}")
                 print(f"    the old _oauth2_proxy cookie on echo-std after Stop: HTTP {code}", flush=True)
