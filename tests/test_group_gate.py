@@ -873,7 +873,16 @@ class SigninV6Test(GateTest):
         self.assertEqual(code, 403)
         self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(hdrs["X-Stepup-URL"]).query),
                          {"pc_method": ["passkey"], "rd": ["https://grafana.example.com/"]})
+        # Just after a setup link the page says the key is set up and asks
+        # to sign in with it — never "needs a passkey" (user report
+        # 2026-11-12: confusing right after registering one).
+        self.assertIn('id="setup-done"', body)
+        self.assertIn("You&#x27;re set up", body)
+        self.assertNotIn("needs a", body)
+        # A normal session that lacks the method still gets "needs a …".
+        code, hdrs, body = self.page("grafana.example.com", ["pwd"])
         self.assertIn("grafana.example.com needs a passkey", body)
+        self.assertNotIn('id="setup-done"', body)
         # A setup-link session counts as not known in `people` (contract
         # §5): its new passkey may not be in the inventory yet, so neither a
         # stale entry nor an empty one turns the step-up into needs-stronger.

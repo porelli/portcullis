@@ -2531,14 +2531,20 @@ def _signin_page(title: str, body: str, banner: str = "") -> bytes:
             f"<main class=\"container\"><h1>{html.escape(title)}</h1>{body}</main></body></html>").encode()
 
 
-def render_stepup_page(app: str, method: str, url: str, banner: str = "") -> bytes:
+def render_stepup_page(app: str, method: str, url: str, banner: str = "", after_setup: bool = False) -> bytes:
     """"<App> needs <method>" with a Continue button (#stepup-continue) to
-    the step-up URL. `banner` is for completeness (every group-gate page
-    takes one): an impersonated request never gets a step-up (D39)."""
-    title = f"{app} needs a {METHOD_WORDS[method]}"
+    the step-up URL. After a setup link (`after_setup`: the session's amr
+    is `inv`, which meets no rule) the person has just added the key, so
+    the page says so and asks them to sign in with it, never "needs a
+    passkey". `banner` is for completeness (every group-gate page takes
+    one): an impersonated request never gets a step-up (D39)."""
     e_url = html.escape(url, quote=True)
-    return _signin_page(title, f"<p><a id=\"stepup-continue\" class=\"btn\" href=\"{e_url}\" autofocus>Continue</a></p>",
-                        banner)
+    button = f"<p><a id=\"stepup-continue\" class=\"btn\" href=\"{e_url}\" autofocus>Continue</a></p>"
+    if after_setup:
+        return _signin_page("You're set up",
+                            f"<p id=\"setup-done\">Now sign in with it once to open {html.escape(app)}.</p>{button}",
+                            banner)
+    return _signin_page(f"{app} needs a {METHOD_WORDS[method]}", button, banner)
 
 
 # The present-certificate page's words per certificate method.
@@ -2899,7 +2905,7 @@ class Handler(BaseHTTPRequestHandler):
         method = choose_stepup(rule, have, set_up, held=held)
         if method is not None:
             url = stepup_url(host, method, extra=kind == "extra")
-            self._signin_answer(render_stepup_page(app, method, url), "stepup",
+            self._signin_answer(render_stepup_page(app, method, url, after_setup="inv" in amr), "stepup",
                                 f"STEPUP {what} pc_method={method}", url)
             return True
         self._signin_answer(render_needs_page(app, have, rule, set_up, doc["add_stronger"], DOMAIN),
