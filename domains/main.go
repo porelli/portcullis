@@ -29,6 +29,8 @@ import (
 	"filippo.io/age"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	legolog "github.com/go-acme/lego/v4/log"
+
+	"github.com/portcullis/domains/internal/dnsplan"
 )
 
 func env(k, def string) string {
@@ -36,6 +38,21 @@ func env(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// envBool reads a true/false variable (unset = def); anything else
+// refuses to start.
+func envBool(k string, def bool) (bool, error) {
+	switch v := strings.TrimSpace(os.Getenv(k)); v {
+	case "":
+		return def, nil
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s=%q must be true or false", k, v)
+	}
 }
 
 func main() {
@@ -243,14 +260,29 @@ func run() error {
 	// the same public resolvers as the records check.
 	_ = dns01.AddRecursiveNameservers(resolvers)(nil)
 
+	caaOn, err := envBool("DNS_CAA", true)
+	if err != nil {
+		return err
+	}
 	cfg := Config{
 		MainDomain: mainDomain,
 		Email:      env("ACME_EMAIL", "admin@"+mainDomain),
 		CAServer:   env("ACME_CA_SERVER", "https://acme-v02.api.letsencrypt.org/directory"),
 		IPv4:       ip4, IPv6: ip6,
-		Resolvers: resolvers,
-		Secret:    secret,
-		Logger:    logger,
+		Resolvers:      resolvers,
+		Secret:         secret,
+		Logger:         logger,
+		CAA:            caaOn,
+		CAAIODEF:       strings.TrimSpace(os.Getenv("DNS_CAA_IODEF")),
+		MainAccountURI: strings.TrimSpace(os.Getenv("DOMAINS_MAIN_ACME_ACCOUNT_URI")),
+		MailFrom:       strings.TrimSpace(os.Getenv("ALERT_SMTP_FROM")),
+	}
+	// The issuer is resolved whatever DNS_CAA says: the checks judge the
+	// live CAA with it; DNS_CAA only decides whether the set is written.
+	if issuer, ok := dnsplan.IssuerFor(cfg.CAServer, os.Getenv("DNS_CAA_ISSUER")); ok {
+		cfg.CAAIssuer = issuer
+	} else if caaOn {
+		logger.Printf("CAA skipped: unknown CA %s (set DNS_CAA_ISSUER)", cfg.CAServer)
 	}
 	svc, err := NewService(cfg, OpenStore(env("DOMAINS_DATA_DIR", "/data"), id))
 	if err != nil {

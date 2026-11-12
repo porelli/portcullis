@@ -48,6 +48,26 @@ func (s *Service) legoConfig(u *acmeUser) *lego.Config {
 	return cfg
 }
 
+// accountCurrentLocked: the stored account matches the configured CA and
+// email (else account() registers a new one). Caller holds mu.
+func (s *Service) accountCurrentLocked() bool {
+	a := s.doc.Account
+	return a != nil && a.CAServer == s.cfg.CAServer && a.Email == s.cfg.Email && len(a.Registration) > 0
+}
+
+// accountURILocked is the stored account's URI ("" = none or stale).
+// Caller holds mu.
+func (s *Service) accountURILocked() string {
+	if !s.accountCurrentLocked() {
+		return ""
+	}
+	var reg registration.Resource
+	if json.Unmarshal(s.doc.Account.Registration, &reg) != nil {
+		return ""
+	}
+	return reg.URI
+}
+
 // account returns the ACME account, creating and registering it on first
 // use (or when ACME_CA_SERVER changed). acmeMu serialises registration;
 // the store lock is never held across the network call.
@@ -157,12 +177,9 @@ func (c *challengeProvider) Timeout() (timeout, interval time.Duration) {
 }
 
 // obtain orders a certificate for <name> and *.<name> (fresh EC P-256 key)
-// and returns the full chain, the key and the expiry.
-func (s *Service) obtain(name string, p dnsProvider) (certPEM, keyPEM string, notAfter time.Time, err error) {
-	u, err := s.account()
-	if err != nil {
-		return "", "", time.Time{}, err
-	}
+// with the account u (registered by the caller before the CAA was pinned
+// to it) and returns the full chain, the key and the expiry.
+func (s *Service) obtain(name string, p dnsProvider, u *acmeUser) (certPEM, keyPEM string, notAfter time.Time, err error) {
 	client, err := lego.NewClient(s.legoConfig(u))
 	if err != nil {
 		return "", "", time.Time{}, fmt.Errorf("ACME directory %s: %w", s.cfg.CAServer, err)

@@ -23,6 +23,7 @@ import (
 	"github.com/libdns/route53"
 	"github.com/miekg/dns"
 
+	"github.com/portcullis/domains/internal/dnsplan"
 	"github.com/portcullis/domains/internal/dnssec"
 )
 
@@ -281,8 +282,6 @@ func (s *Service) zoneOf(p dnsProvider, fqdn string) (string, error) {
 	return s.findZone(dns.Fqdn(fqdn))
 }
 
-const recordTTL = 300 * time.Second
-
 // minSecretLen is the shortest credential value accepted (redaction of
 // anything shorter would be unreliable).
 const minSecretLen = 8
@@ -308,45 +307,89 @@ func route53Preflight(p *route53.Provider) error {
 	return nil
 }
 
-// setRecords points <name> and *.<name> at the server (contract §12.4):
-// A to the IPv4 and AAAA to the IPv6 (replacing what is there); without
-// an IPv6, existing AAAA records at those names are removed. Returns the
-// records set and the zone.
-func (s *Service) setRecords(ctx context.Context, p dnsProvider, name string) ([]RecordRef, string, error) {
-	if !s.cfg.IPv4.IsValid() {
-		return nil, "", errors.New("the server's public IPv4 is unknown (./portcullis up detects it once a domain is enrolled — run it again — or set PORTCULLIS_PUBLIC_IPV4 in .env)")
+// refsToPlan / refsFromPlan convert between the store's RecordRef and
+// dnsplan.Ref (the one conversion point).
+func refsToPlan(refs []RecordRef) []dnsplan.Ref {
+	out := make([]dnsplan.Ref, 0, len(refs))
+	for _, r := range refs {
+		out = append(out, dnsplan.Ref{Name: r.Name, Type: r.Type, Value: r.Value})
 	}
-	zone, err := s.zoneOf(p, name)
-	if err != nil {
-		return nil, "", fmt.Errorf("finding the DNS zone of %s: %w", name, err)
+	return out
+}
+
+func refsFromPlan(refs []dnsplan.Ref) []RecordRef {
+	out := make([]RecordRef, 0, len(refs))
+	for _, r := range refs {
+		out = append(out, RecordRef{Name: r.Name, Type: r.Type, Value: r.Value})
 	}
-	var recs []libdns.Record
-	var refs []RecordRef
-	for _, n := range []string{name, "*." + name} {
-		rel := libdns.RelativeName(dns.Fqdn(n), zone)
-		for _, ip := range []netip.Addr{s.cfg.IPv4, s.cfg.IPv6} {
-			if !ip.IsValid() {
-				continue
+	return out
+}
+
+// spec is what the service wants at d's name (contract §12.4 record
+// sets), pinned to accountURI.
+func (s *Service) spec(d *Domain, accountURI string) dnsplan.Spec {
+	var owned []RecordRef
+	for _, refs := range d.Records {
+		for _, r := range refs {
+			if r.Type == "CAA" {
+				owned = append(owned, r)
 			}
-			a := libdns.Address{Name: rel, TTL: recordTTL, IP: ip}
-			recs = append(recs, a)
-			rr := a.RR()
-			refs = append(refs, RecordRef{Name: rr.Name, Type: rr.Type, Value: rr.Data})
 		}
 	}
-	if _, err := p.SetRecords(ctx, zone, recs); err != nil {
-		return refs, zone, fmt.Errorf("setting the A/AAAA records of %s and *.%s: %w", name, name, err)
+	return dnsplan.Spec{Name: d.Name, IPv4: s.cfg.IPv4, IPv6: s.cfg.IPv6, CAA: s.cfg.CAA, Issuer: s.cfg.CAAIssuer,
+		AccountURI: accountURI, IODEF: s.cfg.CAAIODEF, NoMail: contains(d.Sets, dnsplan.SetNoMail), Owned: refsToPlan(owned)}
+}
+
+// applySets writes the given record sets of d (dnsplan.Apply): the
+// records written (now owned) and removed, and the zone. Owned CAA refs
+// are those of the zone found now.
+func (s *Service) applySets(ctx context.Context, p dnsProvider, d *Domain, sets []string, accountURI string) ([]RecordRef, []RecordRef, string, error) {
+	zone, err := s.zoneOf(p, d.Name)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("finding the DNS zone of %s: %w", d.Name, err)
 	}
-	if !s.cfg.IPv6.IsValid() {
-		var stale []libdns.Record
-		for _, n := range []string{name, "*." + name} {
-			stale = append(stale, libdns.RR{Name: libdns.RelativeName(dns.Fqdn(n), zone), Type: "AAAA"})
-		}
-		if _, err := p.DeleteRecords(ctx, zone, stale); err != nil {
-			return refs, zone, fmt.Errorf("removing old AAAA records of %s (the server has no IPv6): %w", name, err)
+	sp := s.spec(d, accountURI)
+	var owned []RecordRef
+	for _, r := range d.Records[zone] {
+		if r.Type == "CAA" {
+			owned = append(owned, r)
 		}
 	}
-	return refs, zone, nil
+	sp.Owned = refsToPlan(owned)
+	written, removed, err := dnsplan.Apply(ctx, dnsplan.Input{Spec: sp, Zone: zone, Provider: p, Resolvers: s.cfg.Resolvers}, sets)
+	return refsFromPlan(written), refsFromPlan(removed), zone, err
+}
+
+// waitCAA polls until the CA would issue for <name> and *.<name> to
+// accountURI at every resolver, each asked on its own (one may still
+// cache the old pin), bounded by RecordsWait.
+func (s *Service) waitCAA(ctx context.Context, name, accountURI string) error {
+	deadline := time.Now().Add(s.cfg.RecordsWait)
+	check := func() error {
+		for _, r := range s.cfg.Resolvers {
+			for _, n := range []string{name, "*." + name} {
+				_, rrs, err := dnsplan.EffectiveCAA(ctx, []string{r}, n)
+				if err != nil {
+					return err
+				}
+				if !dnsplan.WouldIssue(rrs, s.cfg.CAAIssuer, accountURI, strings.HasPrefix(n, "*.")) {
+					return fmt.Errorf("%s at %s doesn't allow issuance to this ACME account yet", n, r)
+				}
+			}
+		}
+		return nil
+	}
+	for {
+		err := check()
+		if err == nil || time.Now().Add(s.cfg.RecordsPoll).After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Join(err, ctx.Err())
+		case <-time.After(s.cfg.RecordsPoll):
+		}
+	}
 }
 
 // deleteRecords removes exactly the records the service created.
@@ -356,7 +399,9 @@ func deleteRecords(ctx context.Context, p dnsProvider, zone string, refs []Recor
 	}
 	recs := make([]libdns.Record, 0, len(refs))
 	for _, r := range refs {
-		rr := libdns.RR{Name: r.Name, Type: r.Type, Data: r.Value, TTL: recordTTL}
+		// TTL 0 matches any (sets have different TTLs); the data is exact,
+		// so other CAs' CAA entries at the name stay.
+		rr := libdns.RR{Name: r.Name, Type: r.Type, Data: r.Value}
 		if parsed, err := rr.Parse(); err == nil {
 			recs = append(recs, parsed)
 		} else {
