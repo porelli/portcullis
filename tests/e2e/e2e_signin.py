@@ -834,6 +834,10 @@ MAIN = f"https://{DOMAIN}"
 IMP_REASON = "checking quota"
 IMP_BANNER = f"You are signed in as alice (by root) · reason “{IMP_REASON}” ·"
 READ_ONLY = "not while you are signed in as someone else: Stop first"
+# The Sign-in page's (web/mysignin.js) data-msi-act values that change a
+# sign-in method; hidden while someone is signed in as you (Hub Task 5).
+MSI_CHANGING_ACTS = {"pw-change", "pw-remove", "pk-rename", "pk-rename-go", "bc-create", "bc-go", "revoke",
+                     "yk-renew", "yk-renew-go", "yk-issue", "yk-issue-go", "pw-go"}
 AI_CLIENT = "portcullis-ai-claude-code"
 AI_CALLBACK = "http://127.0.0.1:33418/callback"
 PEOPLE_MCP = PEOPLE + "/mcp"
@@ -1239,7 +1243,9 @@ def main() -> int:
             label = lambda cid: f"/api/me/signin/passkeys/{urllib.parse.quote(cid, safe='')}/label"  # noqa: E731
             code, out = people_as("sam", "PUT", label(hwk[0]), {"label": "CI key"})
             assert code == 204, f"rename: HTTP {code} {out[:200]}"
-            stored = {c["id"]: c.get("userLabel") for c in kc(f"/users/{kc_user_id('sam')}/credentials")}
+            # Passkey credentials only: the LDAP federation's password entry has no id.
+            stored = {c["id"]: c.get("userLabel") for c in kc(f"/users/{kc_user_id('sam')}/credentials")
+                      if c.get("type") in PASSKEY_TYPES}
             assert stored.get(hwk[0]) == "CI key", f"Keycloak's userLabel: {stored.get(hwk[0])!r}"
             code, out = people_as("sam", "PUT", label(spk[0]), {"label": "ci KEY"})
             assert code == 409, f"duplicate name: HTTP {code} {out[:200]}"
@@ -2664,10 +2670,17 @@ def main() -> int:
             base.shot(page, "imp1-signin-read-only")
             text = body(page)
             assert "Changes are off while root is signed in as you." in text, text[:400]
-            n = page.locator("[data-msi-act]").count()
-            assert n == 0, f"{n} actions on the Sign-in page while impersonated"
+            # Every control the page offers, printed; the mutating ones
+            # (Set / Change / Remove / Create / Revoke / Renew / Issue / Rename,
+            # and + Add) must be gone. The history's Refresh / Show older and
+            # the impersonation's own Stop change none of alice's methods.
+            acts = page.eval_on_selector_all("[data-msi-act]", "els => els.map(e => [e.dataset.msiAct, e.innerText.trim()])")
+            print(f"    controls while impersonated: {acts}", flush=True)
+            changing = [a for a in acts if a[0] in MSI_CHANGING_ACTS]
+            assert not changing, f"actions on the Sign-in page while impersonated: {changing}"
+            assert "+ Add" not in text, "+ Add offered while impersonated"
         check("imp_signin_page_read_only: the impersonating browser's Sign-in page says \"Changes are off while root "
-              "is signed in as you.\" and offers no action", imp_signin_page_read_only)
+              "is signed in as you.\" and offers no action that changes a method", imp_signin_page_read_only)
 
         def imp_ai_refused():
             needs("imp1", "alice_ai_tf")
