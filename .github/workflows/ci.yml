@@ -4050,7 +4050,9 @@ jobs:
             | curl -sf -X PUT -H @<(printf 'Authorization: Bearer %s\n' "$TOK") -H 'Content-Type: application/json' --data-binary @- \
               http://127.0.0.1:8080/admin/realms/portcullis || { echo "FAIL: drifting the passkey policy"; exit 1; }
           got="$(policy "$TOK")"; echo "drifted passwordless policy: $got"
-          [ "$got" = '{"c":"none","a":"cross-platform","r":"Yes","u":"required"}' ] || { echo "FAIL: the drift didn't take (the check would prove nothing)"; exit 1; }
+          # (Keycloak resets the passwordless fields the body omits to their
+          # defaults, so r drifts to "not specified" too: configure must fix it.)
+          case "$got" in '{"c":"none","a":"cross-platform",'*) ;; *) echo "FAIL: the drift didn't take (the check would prove nothing)"; exit 1 ;; esac
           ./portcullis keycloak configure
           TOK=$(kc_tok); echo "::add-mask::$TOK"
           got="$(policy "$TOK")"; echo "passwordless policy after configure: $got"
