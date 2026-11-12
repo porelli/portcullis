@@ -2979,6 +2979,502 @@ class SigninPart2Test(GateTest):
         self.assertNotIn("traefik.example.com", gg.render_portal("bob", set(), [], "example.com").decode())
 
 
+IMP_ID = "0f3c" + "a" * 28
+IMP_REASON = "checking quota"
+
+
+def rfc3339(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+class ImpersonationTest(GateTest):
+    """Sign-in methods part 3 in group-gate: impersonated requests (contract
+    §4 "Impersonated requests", §5 the headers and the banner, §8.1
+    "Impersonation")."""
+
+    page = SigninPart2Test.page
+    rules = SigninPart2Test.rules
+    opened_lines = SigninPart2Test.opened_lines
+    coverage_cache = SigninPart2Test.coverage_cache
+
+    def setUp(self):
+        super().setUp()
+        write_revoked(None)
+        write_ca(YUBIKEY_CA, YUBIKEY_CA_CN)
+        write_ca(BROWSER_CA, BROWSER_CA_CN)
+        self._old = gg.OPENED_LOG
+        self.log_dir = tempfile.mkdtemp(dir=TMP)
+        gg.OPENED_LOG = gg.OpenedLog(os.path.join(self.log_dir, "opened"), gid=os.getgid())
+        self.imp_file = os.path.join(self.log_dir, "impersonation.json")
+        self._old_imp = gg.IMPERSONATION_FILE
+        gg.IMPERSONATION_FILE = self.imp_file
+        gg._IMP_CACHE.clear()
+        # alice's grafana on Standard; every method on.
+        self.rules(t=STANDARD)
+        self.write_imp()
+
+    def tearDown(self):
+        gg.IMPERSONATION_FILE = self._old_imp
+        gg._IMP_CACHE.clear()
+        gg.OPENED_LOG = self._old
+        gg.CRL_CACHE = READY_CRL
+        _CrlHandler.by_path = {}
+        write_revoked(None)
+
+    def session(self, **kw):
+        now = time.time()
+        rec = {"id": IMP_ID, "admin": "root", "target": "alice", "reason": IMP_REASON,
+               "started": rfc3339(now - 60), "until": rfc3339(now + 1500), "ended": None}
+        rec.update(kw)
+        return rec
+
+    def write_imp(self, sessions=None, allowed=True, written=None, raw=None, **extra):
+        doc = {"version": 1, "allowed": allowed, "written": rfc3339(time.time() if written is None else written),
+               "clients": ["portcullis-forward-auth"], "pending": [],
+               "sessions": [self.session()] if sessions is None else sessions, "notices": {}, **extra}
+        tmp = self.imp_file + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(raw if raw is not None else json.dumps(doc))
+        os.replace(tmp, self.imp_file)
+
+    def claims(self, admin="root", imp_id=IMP_ID, until=None):
+        return {"act": {"sub": admin},
+                "pc_imp": {"id": imp_id, "until": int(time.time() + 1500) if until is None else until}}
+
+    def imp(self, host="grafana.example.com", amr=("hwk",), user="alice", groups="users_grafana", claims=None,
+            **kw):
+        return self.page(host=host, amr=amr, user=user, groups=groups,
+                         claims=self.claims() if claims is None else claims, **kw)
+
+    def assert_ended(self, result, person="alice"):
+        code, hdrs, body = result
+        self.assertEqual(code, 403, body)
+        self.assertIn(f"Your session as {person} has ended.", body)
+        self.assertIn('href="https://auth.example.com/oauth2/sign_out?rd=https%3A%2F%2Fexample.com%2F"', body)
+        for h in gg.IMPERSONATION_HEADERS:
+            self.assertNotIn(h, hdrs)
+        self.assertNotIn("X-Forwarded-User", hdrs)
+
+    def logged(self, fn):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = fn()
+        return result, buf.getvalue()
+
+    # ── the claims ──
+
+    def test_imp_claims_parse(self):
+        good = {"act": {"sub": "root"}, "pc_imp": {"id": IMP_ID, "until": 1800000000}}
+        self.assertEqual(gg.impersonation_claims(good), (True, gg.Impersonation(IMP_ID, "root", 1800000000.0)))
+        self.assertEqual(gg.impersonation_claims({**good, "pc_imp": {"id": IMP_ID, "until": 1.8e9}})[1].until, 1.8e9)
+        self.assertEqual(gg.impersonation_claims({}), (False, None))
+        self.assertEqual(gg.impersonation_claims({"amr": ["hwk"], "sub": "x"}), (False, None))
+        bad = [
+            {"act": good["act"]},                                    # act only
+            {"pc_imp": good["pc_imp"]},                              # pc_imp only
+            {**good, "act": "root"},                                 # act not an object
+            {**good, "act": {"sub": "Root"}},                        # not a username
+            {**good, "act": {"sub": ""}},
+            {**good, "act": {"sub": "root", "x": 1}},                # not exactly the shape
+            {**good, "act": {}},
+            {**good, "act": None},
+            {**good, "pc_imp": None},
+            {**good, "pc_imp": {"id": "XYZ", "until": 1800000000}},
+            {**good, "pc_imp": {"id": IMP_ID.upper(), "until": 1800000000}},
+            {**good, "pc_imp": {"id": IMP_ID + "\n", "until": 1800000000}},
+            {**good, "pc_imp": {"id": IMP_ID, "until": "x"}},
+            {**good, "pc_imp": {"id": IMP_ID, "until": "1800000000"}},
+            {**good, "pc_imp": {"id": IMP_ID, "until": True}},
+            {**good, "pc_imp": {"id": IMP_ID, "until": float("nan")}},
+            {**good, "pc_imp": {"id": IMP_ID, "until": float("inf")}},
+            {**good, "pc_imp": {"id": IMP_ID}},
+            {**good, "pc_imp": {"id": IMP_ID, "until": 1800000000, "reason": "x"}},
+            {**good, "pc_imp": [IMP_ID, 1800000000]},
+        ]
+        for c in bad:
+            with self.subTest(claims=c):
+                self.assertEqual(gg.impersonation_claims(c), (True, None))
+
+    def test_imp_malformed_claims_denied(self):
+        # Task 2 review: pc_imp without act, act without pc_imp, act not a
+        # username, until passed: the ended page, never the person's app.
+        c = self.claims()
+        for claims in ({"pc_imp": c["pc_imp"]}, {"act": c["act"]}, {**c, "act": {"sub": "Root!"}},
+                       self.claims(until=int(time.time()) - 1), self.claims(until=int(time.time()))):
+            with self.subTest(claims=claims):
+                self.assert_ended(self.imp(claims=claims))
+
+    # ── live, headers, ended ──
+
+    def test_imp_live_allows_with_headers(self):
+        code, hdrs, body = self.imp()
+        self.assertEqual(code, 200, body)
+        self.assertEqual(hdrs.get("X-Forwarded-Impersonator"), "root")
+        self.assertEqual(hdrs.get("X-Forwarded-Impersonation"), IMP_ID)
+        self.assertEqual(hdrs.get("X-Forwarded-User"), "alice")
+        # Without the claims alice's own session is untouched.
+        code, hdrs, _ = self.page(user="alice")
+        self.assertEqual(code, 200)
+        for h in gg.IMPERSONATION_HEADERS:
+            self.assertNotIn(h, hdrs)
+
+    def test_imp_ended_denied_at_once(self):
+        self.assertEqual(self.imp()[0], 200)
+        self.assertEqual(self.imp(host="people.example.com", groups="")[0], 200)
+        self.assertEqual(self.imp(host="example.com", groups="", gate_path="/portal")[0], 200)
+        self.write_imp(sessions=[self.session(ended=rfc3339(time.time() - 1))])
+        (result, out) = self.logged(self.imp)
+        self.assert_ended(result)
+        self.assertIn("reason=impersonation_ended", out)
+        self.assertIn("DENIED", out)
+        self.assertNotIn(IMP_REASON, out)
+        self.assert_ended(self.imp(host="people.example.com", groups=""))
+        self.assert_ended(self.imp(host="people.example.com", groups="", uri="/impersonation/stop"))
+        self.assert_ended(self.imp(host="example.com", groups="", gate_path="/portal"))
+        # Dropped from the file, or switched off: the same.
+        for kw in ({"sessions": []}, {"allowed": False}):
+            with self.subTest(**kw):
+                self.write_imp(**kw)
+                self.assert_ended(self.imp())
+                self.assert_ended(self.imp(host="example.com", groups="", gate_path="/portal"))
+
+    def test_imp_portal_path(self):
+        portal = os.path.join(self.log_dir, "portal-apps.json")
+        with open(portal, "w") as f:
+            json.dump({"version": 1, "apps": []}, f)
+        old = gg.PORTAL_FILE
+        gg.PORTAL_FILE = portal
+        self.addCleanup(setattr, gg, "PORTAL_FILE", old)
+        code, hdrs, body = self.imp(host="example.com", groups="", gate_path="/portal")
+        self.assertEqual(code, 200, body)
+        self.assertIn('id="pc-imp-banner"', body)
+        self.assertIn("You are signed in as alice (by root)", body)
+        self.assertIn('href="https://people.example.com/impersonation/stop"', body)
+        self.assertIn("default-src 'none'", hdrs["Content-Security-Policy"])
+        # The portal's own template binds root's certificate, never alice's.
+        write_policy({"methods": ALL_ON, "templates": {**BASE["templates"], "c": {"op": "any", "items": ["yubikey_cert"]}},
+                      "core": {**BASE["core"], "example.com": "c"}})
+        p = dict(host="example.com", groups="", gate_path="/portal", amr=["mtls"])
+        self.assertEqual(self.imp(cert=leaf_info("root", 0x51), **p)[0], 200)
+        code, _, body = self.imp(cert=leaf_info("alice", 0x52), **p)
+        self.assertEqual(code, 403)
+        self.assertIn('id="needs-stronger"', body)
+        self.assertIn('id="pc-imp-banner"', body)
+        self.assertNotIn('id="present-certificate"', body)
+        # Ended: the ended page.
+        self.write_imp(sessions=[self.session(ended=rfc3339(time.time()))])
+        self.assert_ended(self.imp(cert=leaf_info("root", 0x51), **p))
+        # Without a file at all.
+        os.unlink(self.imp_file)
+        self.assert_ended(self.imp(cert=leaf_info("root", 0x51), **p))
+        # alice's own portal (no claims) never reads it.
+        self.assertEqual(self.page(user="alice", cert=leaf_info("alice", 0x52), **p)[0], 200)
+
+    def test_imp_ended_field_validated(self):
+        self.write_imp(sessions=[self.session(ended=None)])
+        self.assertEqual(self.imp()[0], 200)
+        self.write_imp(sessions=[self.session(ended=rfc3339(time.time() + 600))])
+        self.assert_ended(self.imp())
+        for bad in (5, "x", {}, [], True, "", rfc3339(time.time()) + "\n"):
+            with self.subTest(ended=bad):
+                self.write_imp(sessions=[self.session(ended=bad)])
+                self.assert_ended(self.imp())
+        # Missing `ended` is not null.
+        rec = self.session()
+        del rec["ended"]
+        self.write_imp(sessions=[rec])
+        self.assert_ended(self.imp())
+
+    def test_imp_file_shape_validated(self):
+        # Any field group-gate uses outside its rule: the file is invalid,
+        # no impersonation counts; normal requests unaffected.
+        cases = [
+            {"raw": "not json"}, {"raw": "[]"}, {"raw": ""},
+            {"version": 2}, {"version": "1"}, {"version": True},
+            {"allowed": "true"}, {"allowed": 1},
+            {"written": "yesterday"}, {"written": None},
+            {"sessions": None}, {"sessions": {}}, {"sessions": ["x"]},
+            {"sessions": [self.session(), self.session()]},
+            {"sessions": [self.session(id="XYZ")]},
+            {"sessions": [self.session(admin="Root")]}, {"sessions": [self.session(target="")]},
+            {"sessions": [self.session(admin=None)]},
+            {"sessions": [self.session(reason="no")]}, {"sessions": [self.session(reason="a\nb c")]},
+            {"sessions": [self.session(reason="x" * 201)]}, {"sessions": [self.session(reason="ab\u202ecd")]},
+            {"sessions": [self.session(reason=None)]},
+            {"sessions": [self.session(until="soon")]}, {"sessions": [self.session(until=1800000000)]},
+        ]
+        for kw in cases:
+            with self.subTest(**{k: repr(v)[:60] for k, v in kw.items()}):
+                raw = kw.pop("raw", None)
+                if raw is None:
+                    doc = {"version": 1, "allowed": True, "written": rfc3339(time.time()),
+                           "sessions": [self.session()]}
+                    doc.update(kw)
+                    raw = json.dumps(doc)
+                self.write_imp(raw=raw)
+                self.assertIsNone(gg.load_impersonation_file())
+                self.assert_ended(self.imp())
+                self.assertEqual(self.page(user="alice")[0], 200)
+        # A minimal valid file (unused fields absent) is fine.
+        self.write_imp(raw=json.dumps({"version": 1, "allowed": True, "written": rfc3339(time.time()),
+                                       "sessions": [self.session()]}))
+        self.assertEqual(self.imp()[0], 200)
+
+    def test_imp_file_cached_and_failure_logged_once(self):
+        self.write_imp(raw="{")
+        (_, out) = self.logged(lambda: [gg.load_impersonation_file() for _ in range(3)])
+        self.assertEqual(len(out.splitlines()), 1, out)
+        self.assertNotIn(IMP_REASON, out)
+        self.write_imp()
+        self.assertIsNotNone(gg.load_impersonation_file())
+        # Parsed once per (inode, mtime, size).
+        calls = []
+        real = gg.json.load
+        gg.json.load = lambda f: calls.append(1) or real(f)
+        try:
+            for _ in range(3):
+                gg.load_impersonation_file()
+        finally:
+            gg.json.load = real
+        self.assertEqual(calls, [])
+
+    def test_imp_claims_from_access_token_only(self):
+        tok = token(amr=["hwk"], preferred_username="alice", **self.claims(until=int(time.time()) - 5))
+        # In Authorization only (the Keycloak console's route): not read.
+        code, hdrs, _ = self.page(user="alice", extra={"Authorization": f"Bearer {tok}"})
+        self.assertEqual(code, 200)
+        for h in gg.IMPERSONATION_HEADERS:
+            self.assertNotIn(h, hdrs)
+        # In X-Forwarded-Access-Token: read (and here ended).
+        self.assert_ended(self.page(user="alice", extra={"X-Forwarded-Access-Token": tok}))
+
+    def test_imp_until_claim_wins(self):
+        now = time.time()
+        # The file's until later, the claim's passed.
+        self.write_imp(sessions=[self.session(until=rfc3339(now + 1500))])
+        self.assert_ended(self.imp(claims=self.claims(until=int(now) - 1)))
+        # The reverse: the claim later, the file's passed.
+        self.write_imp(sessions=[self.session(until=rfc3339(now - 1))])
+        self.assert_ended(self.imp(claims=self.claims(until=int(now) + 1500)))
+        # Through live_impersonation: now at either until is not live.
+        self.write_imp(sessions=[self.session(until=rfc3339(now + 100))])
+        imp = gg.Impersonation(IMP_ID, "root", float(int(now) + 200))
+        self.assertIsNotNone(gg.live_impersonation(imp, "alice", now))
+        self.assertIsNone(gg.live_impersonation(imp, "alice", gg._parse_rfc3339(rfc3339(now + 100))))
+        self.assertIsNone(gg.live_impersonation(gg.Impersonation(IMP_ID, "root", now + 50), "alice", now + 50))
+
+    def test_imp_stale_file_denies(self):
+        self.write_imp(written=time.time() - 301)
+        (result, out) = self.logged(self.imp)
+        self.assert_ended(result)
+        self.assertIn("300", out)
+        (_, out) = self.logged(self.imp)
+        self.assertNotIn("impersonation.json", out)  # once per change
+        self.assertEqual(self.page(user="alice")[0], 200)
+        self.write_imp(written=time.time() - 200)
+        self.assertEqual(self.imp()[0], 200)
+        # Unreadable.
+        os.chmod(self.imp_file, 0)
+        self.addCleanup(lambda: os.path.exists(self.imp_file) and os.chmod(self.imp_file, 0o644))
+        if os.geteuid() != 0:
+            gg._IMP_CACHE.clear()
+            self.assert_ended(self.imp())
+        os.chmod(self.imp_file, 0o644)
+        # A directory in its place, missing, switched off.
+        os.unlink(self.imp_file)
+        self.assert_ended(self.imp())
+        os.mkdir(self.imp_file)
+        self.assert_ended(self.imp())
+        os.rmdir(self.imp_file)
+        self.write_imp(allowed=False)
+        self.assert_ended(self.imp())
+        self.assertEqual(self.page(user="alice")[0], 200)
+        self.assertEqual(self.page(user="bob")[0], 200)
+
+    def test_imp_admin_or_person_mismatch(self):
+        # act.sub bob, the file's admin root.
+        self.assert_ended(self.imp(claims=self.claims(admin="bob")))
+        # The file's target carol.
+        self.write_imp(sessions=[self.session(target="carol")])
+        self.assert_ended(self.imp())
+        # The token's preferred_username isn't the forward-auth user.
+        self.write_imp()
+        h = {"X-Forwarded-Access-Token": token(amr=["hwk"], preferred_username="carol", **self.claims())}
+        self.assert_ended(self.page(user="alice", extra=h))
+        # Another id.
+        self.assert_ended(self.imp(claims=self.claims(imp_id="b" * 32)))
+        # A pending-only record never counts.
+        self.write_imp(sessions=[], pending=[{"id": IMP_ID, "admin": "root", "target": "alice"}])
+        self.assert_ended(self.imp())
+
+    def test_imp_cert_binds_admin_only(self):
+        self.rules(t={"op": "any", "items": ["yubikey_cert"]})
+        code, hdrs, body = self.imp(amr=["mtls"], cert=leaf_info("root", 0x61))
+        self.assertEqual(code, 200, body)
+        self.assertEqual(hdrs.get("X-Forwarded-Impersonator"), "root")
+        for cert in (leaf_info("alice", 0x62), None):
+            with self.subTest(cert=cert is not None):
+                code, hdrs, body = self.imp(amr=["mtls"], cert=cert)
+                self.assertEqual(code, 403)
+                self.assertIn('id="needs-stronger"', body)
+                self.assertNotIn('id="present-certificate"', body)
+                self.assertNotIn("X-Stepup-URL", hdrs)
+        # root's browser certificate never binds yubikey_cert.
+        code, _, body = self.imp(amr=["mtls", "file"], cert=leaf_info("root", 0x63, issuer=BROWSER_CA_CN))
+        self.assertEqual(code, 403)
+        # root's revoked leaf: denied at the start (revocation runs first,
+        # on every host), never allowed.
+        write_revoked(["61"])
+        code, _, body = self.imp(amr=["mtls"], cert=leaf_info("root", 0x61))
+        self.assertEqual(code, 403)
+        self.assertIn("revoked", body)
+        # A revoked leaf through the template alone (no revocation pass):
+        # needs page.
+        self.assertIsNone(gg.bound_cert_method(issue_leaf("root", 0x61, YUBIKEY_CA_CN), "root"))
+        write_revoked(None)
+        # alice's own session with her certificate is unaffected.
+        self.assertEqual(self.page(user="alice", amr=["mtls"], cert=leaf_info("alice", 0x62))[0], 200)
+
+    def test_imp_never_steps_up(self):
+        # Strong on the host; root's session has a synced passkey only:
+        # a step-up to a security key would be completable for alice.
+        self.rules(t=STRONG)
+        write_policy({"methods": ALL_ON, "templates": {**BASE["templates"], "t": STRONG},
+                      "hosts": {"grafana.example.com": "t"}, "people": {"alice": ["security_key"]},
+                      "add_stronger": True})
+        self.assertIn("X-Stepup-URL", self.page(user="alice", amr=["spk"])[1])  # alice's own
+        code, hdrs, body = self.imp(amr=["spk"])
+        self.assertEqual(code, 403)
+        self.assertNotIn("X-Stepup-URL", hdrs)
+        self.assertNotIn('id="stepup-continue"', body)
+        self.assertIn('id="needs-stronger"', body)
+        self.assertIn("root&#x27;s sign-in didn&#x27;t use them, and a session as alice can&#x27;t add one: "
+                      "Stop, sign in with them, and start again.", body)
+        self.assertIn("grafana.example.com needs a security key or a YubiKey certificate.", body)
+        self.assertNotIn("portcullis-set-up", body)
+        self.assertNotIn("people.example.com/signin", body)
+        self.assertIn('href="https://people.example.com/impersonation/stop"', body)
+        self.assertIn('id="pc-imp-banner"', body)
+
+    def test_imp_signin_paths(self):
+        for p in ("/impersonation/stop", "/api/me/impersonation", "/api/me/impersonation/stop"):
+            with self.subTest(path=p):
+                self.assertTrue(gg.signin_path("people.example.com", p))
+                self.assertFalse(gg.signin_path("hub.example.com", p))
+        for p in ("/impersonation/stop/../api/directory", "/impersonation", "/impersonation/stop/x",
+                  "/api/me/impersonation/", "/api/me/impersonation/stopx", "/impersonation%2Fstop"):
+            with self.subTest(bad=p):
+                self.assertFalse(gg.signin_path("people.example.com", p))
+        self.assertEqual(gg.SIGNIN_EXACT, ("/signin", "/api/me/signin", "/impersonation/stop",
+                                           "/api/me/impersonation", "/api/me/impersonation/stop"))
+        # Stop reachable from a session people.<d>'s template refuses.
+        write_policy({"methods": ALL_ON})
+        self.assertEqual(self.imp(host="people.example.com", groups="", amr=["spk"],
+                                  uri="/api/me/impersonation/stop")[0], 200)
+        self.assertEqual(self.imp(host="people.example.com", groups="", amr=["spk"], uri="/")[0], 403)
+
+    def test_banner_reason_escaped(self):
+        now = 1800000000.0
+        rec = {"id": IMP_ID, "admin": "root", "target": "alice", "reason": "<script>alert(1)</script> & “q”",
+               "until": now + 25 * 60 + 30, "ended": None}
+        b = gg.render_banner(rec, now, "example.com")
+        self.assertIn("You are signed in as alice (by root) · reason “&lt;script&gt;alert(1)&lt;/script&gt; "
+                      "&amp; “q”” · 26 min left", b)
+        self.assertNotIn("<script", b)
+        self.assertIn('href="https://people.example.com/impersonation/stop"', b)
+        self.assertIn(">Stop</a>", b)
+        self.assertIn("· 1 min left", gg.render_banner(dict(rec, until=now + 1), now, "example.com"))
+        self.assertIn("· 1 min left", gg.render_banner(dict(rec, until=now - 5), now, "example.com"))
+        self.assertIn("· 2 min left", gg.render_banner(dict(rec, until=now + 61), now, "example.com"))
+        self.assertIn("· 30 min left", gg.render_banner(dict(rec, until=now + 1800), now, "example.com"))
+        pages = {
+            "portal": gg.render_portal("alice", set(), [], "example.com", banner=b),
+            "needs": gg.render_needs_page("App", set(), STRONG, None, False, "example.com", impersonated=rec),
+            "stepup": gg.render_stepup_page("App", "security_key", "https://auth.example.com/x", banner=b),
+            "certificate": gg.render_certificate_page("App", "yubikey_cert", banner=b),
+        }
+        for name, page in pages.items():
+            with self.subTest(page=name):
+                page = page.decode()
+                self.assertIn('id="pc-imp-banner"', page)
+                self.assertIn("&lt;script&gt;", page)
+                self.assertNotIn("<script", page)
+        # Through the gate (the reason in the file).
+        self.write_imp(sessions=[self.session(reason="<b>x</b> “y”")])
+        self.rules(t={"op": "any", "items": ["yubikey_cert"]})
+        body = self.imp()[2]
+        self.assertIn("reason “&lt;b&gt;x&lt;/b&gt; “y”” ·", body)
+        # Every deny page of a live impersonation carries it.
+        write_policy({"methods": ALL_ON, "groups": {"grafana.example.com": "users_grafana"}})
+        code, _, body = self.imp(groups="users_other")
+        self.assertEqual(code, 403)
+        self.assertIn('id="pc-imp-banner"', body)
+
+    def test_banner_names_validated(self):
+        now = 1800000000.0
+        rec = {"id": IMP_ID, "admin": "root", "target": "alice", "reason": IMP_REASON, "until": now + 60, "ended": None}
+        self.assertTrue(gg.render_banner(rec, now, "example.com"))
+        for k, v in (("admin", "Root"), ("admin", "<b>"), ("target", "al ice"), ("target", ""), ("admin", None),
+                     ("reason", "no"), ("reason", None)):
+            with self.subTest(**{k: v}):
+                self.assertEqual(gg.render_banner(dict(rec, **{k: v}), now, "example.com"), "")
+        # In the file: invalid, so no banner and a deny.
+        for kw in ({"admin": "Ro<ot"}, {"target": "Alice"}):
+            with self.subTest(**kw):
+                self.write_imp(sessions=[self.session(**kw)])
+                result = self.imp()
+                self.assert_ended(result)
+                self.assertNotIn('id="pc-imp-banner"', result[2])
+
+    def test_imp_opened_log_act(self):
+        claims = dict(self.claims(), sid="sid-imp")
+        self.assertEqual(self.imp(claims=claims)[0], 200)
+        self.assertEqual(self.page(user="bob", claims={"sid": "sid-own"})[0], 200)
+        lines = [line for _, line in self.opened_lines()]
+        self.assertEqual([(l["user"], l["session"], l["act"]) for l in lines],
+                         [("alice", "sid-imp", "root"), ("bob", "sid-own", "")])
+        self.assertNotIn(IMP_REASON, json.dumps(lines))
+
+    def test_client_sent_imp_headers_ignored(self):
+        extra = {"X-Forwarded-Impersonator": "root", "X-Forwarded-Impersonation": IMP_ID}
+        code, hdrs, _ = self.page(user="alice", extra=extra)
+        self.assertEqual(code, 200)
+        for h in gg.IMPERSONATION_HEADERS:
+            self.assertNotIn(h, hdrs)
+        self.assertNotIn("X-Forwarded-Impersonator", gg.identity_headers(extra))
+
+    def test_crl_first_read_failure_logged(self):
+        cache = self.coverage_cache({"pki_int/crl": YUBIKEY_CA_CN, "pki_int/crl/delta": YUBIKEY_CA_CN})
+        calls, refreshes = [], []
+        real_refresh = cache.refresh
+
+        def refresh():
+            refreshes.append(1)
+            return real_refresh()
+
+        def boom():
+            calls.append(1)
+            raise RuntimeError("coverage check exploded")
+
+        def sleep(_):
+            if len(refreshes) == 3:
+                raise StopIteration
+
+        cache.refresh = refresh
+        old_sleep = gg.time.sleep
+        gg.time.sleep = sleep
+        try:
+            (_, out) = self.logged(lambda: self.assertRaises(StopIteration, cache.run_forever, boom))
+        finally:
+            gg.time.sleep = old_sleep
+        self.assertEqual(calls, [1])      # tried once, not again
+        self.assertEqual(len(refreshes), 3)  # the loop went on
+        self.assertIn("coverage check exploded", out)
+        self.assertIn("RuntimeError", out)
+
+
 class JwtClaimsTest(unittest.TestCase):
     """decode_jwt_payload: claims only, no verification (oauth2-proxy did it)."""
 

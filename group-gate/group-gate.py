@@ -182,6 +182,7 @@ import datetime
 import hashlib
 import html
 import json
+import math
 import os
 import queue
 import re
@@ -191,7 +192,7 @@ import time
 import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from typing import FrozenSet, List, Optional, Tuple
+from typing import FrozenSet, List, NamedTuple, Optional, Tuple
 
 import jwt  # PyJWT
 from cryptography import x509
@@ -687,13 +688,18 @@ PORTAL_CSS = (
     ".plain{list-style:none}.plain li{padding:.3rem 0;border-bottom:1px solid #0f172a}.plain li:last-child{border-bottom:none}"
     "a{color:#60a5fa;text-decoration:none}a:hover{text-decoration:underline}"
     "a:focus-visible{outline:3px solid #f59e0b;outline-offset:2px;border-radius:.2rem}"
+    # The impersonation banner (contract §5, render_banner).
+    "#pc-imp-banner{background:#78350f;color:#fef3c7;padding:.6rem 1rem;text-align:center;font-size:.9rem}"
+    "#pc-imp-banner a{color:#fff;font-weight:600;margin-left:.75rem}"
 )
 PORTAL_CSP = ("default-src 'none'; style-src 'sha256-"
               + base64.b64encode(hashlib.sha256(PORTAL_CSS.encode()).digest()).decode()
               + "'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
-def render_portal(user: str, groups: set, apps, domain: str, domains=()) -> bytes:
+def render_portal(user: str, groups: set, apps, domain: str, domains=(), banner: str = "") -> bytes:
+    """The portal page; `banner` (render_banner's HTML, already escaped)
+    is the body's first child."""
     e = lambda v: html.escape(str(v), quote=True)  # noqa: E731
     cards = []
     for a in apps or []:
@@ -744,7 +750,7 @@ def render_portal(user: str, groups: set, apps, domain: str, domains=()) -> byte
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         "<meta name=\"color-scheme\" content=\"dark\">"
-        f"<title>{e(domain)}</title><style>{PORTAL_CSS}</style></head><body><main class=\"container\">"
+        f"<title>{e(domain)}</title><style>{PORTAL_CSS}</style></head><body>{banner}<main class=\"container\">"
         f"<header><h1>{e(domain)}</h1><span class=\"user-badge\">Signed in as <strong>{e(user)}</strong></span></header>"
         f"<section><h2>Apps</h2>{app_html}</section>"
         + (f"<section class=\"panel\"><h2>Administration</h2>{ul(admin)}</section>" if admin else "")
@@ -1135,7 +1141,8 @@ def normalize_path_candidates(raw_uri: str) -> List[str]:
 
 # The Sign-in page's paths on people.<domain> (contract §4 "Sign-in
 # paths"): exactly these, or under these prefixes.
-SIGNIN_EXACT = ("/signin", "/api/me/signin")
+SIGNIN_EXACT = ("/signin", "/api/me/signin", "/impersonation/stop", "/api/me/impersonation",
+                "/api/me/impersonation/stop")
 SIGNIN_PREFIXES = ("/api/me/signin/", "/static/")
 _ENCODED_SEPARATOR_RE = re.compile(r"%(2[fF]|5[cC])")
 
@@ -1143,8 +1150,10 @@ _ENCODED_SEPARATOR_RE = re.compile(r"%(2[fF]|5[cC])")
 def signin_path(host: str, raw_path: str) -> bool:
     """True when the request is for the Sign-in page on people.<main
     domain> (the one host it lives on): normalize_path_candidates(raw_path)
-    doesn't raise and EVERY candidate it returns is exactly /signin or
-    /api/me/signin, or under /api/me/signin/ or /static/. Anything else —
+    doesn't raise and EVERY candidate it returns is exactly one of
+    SIGNIN_EXACT (the Sign-in page, and the impersonation Stop page and its
+    two routes, so Stop is always reachable), or under /api/me/signin/ or
+    /static/. Anything else —
     another host, a path with an encoded '/' or '\\' or a literal '\\',
     a '..' leaving the set in any reading — is not (the host's template
     applies)."""
@@ -1538,6 +1547,189 @@ class Metrics:
 METRICS = Metrics()
 
 
+# ── Impersonated requests (contract §4 "Impersonated requests", §8.1
+# "Impersonation") ─────────────────────────────────────────────────────
+
+IMPERSONATION_FILE = os.environ.get("GATE_IMPERSONATION_FILE", "/hub-data/impersonation.json")
+# A file whose `written` is older than this counts as unreadable: a Hub that
+# stopped writing (it rewrites the file every 60 s) ends every impersonation
+# here within 5 minutes.
+IMPERSONATION_STALE = 300.0
+IMPERSONATION_HEADERS = ("X-Forwarded-Impersonator", "X-Forwarded-Impersonation")
+IMPERSONATION_VERSION = 1
+IMP_ID_RE = re.compile(r"[0-9a-f]{32}")
+# Keycloak's ImpersonationFile.hasControlOrBidi: ISO controls, the line and
+# paragraph separators, and the bidi marks / embeddings / isolates.
+_IMP_REASON_BAD_RE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+_IMP_LOCK = threading.Lock()
+# stamp: the file's (dev, inode, mtime ns, size), or None when it can't be
+# stat'ed; doc: its validated content (None = invalid); stale_logged: the
+# stamp whose staleness was logged.
+_IMP_CACHE: dict = {}
+
+
+class Impersonation(NamedTuple):
+    """A token's impersonation claims: pc_imp.id, act.sub, pc_imp.until."""
+    id: str
+    admin: str
+    until: float
+
+
+def valid_username(value) -> bool:
+    """LLDAP's username grammar, exactly (nothing stripped or folded)."""
+    return isinstance(value, str) and CERT_USER_RE.fullmatch(value) is not None
+
+
+def valid_reason(value) -> bool:
+    """An impersonation reason: 3–200 characters on one line, no control
+    or bidi character (the Hub's and Keycloak's rule)."""
+    return isinstance(value, str) and 3 <= len(value) <= 200 and not _IMP_REASON_BAD_RE.search(value)
+
+
+def impersonation_claims(claims: dict) -> Tuple[bool, Optional[Impersonation]]:
+    """(present, parsed) of the token's `act` / `pc_imp` claims. Neither
+    present: (False, None), not impersonated. Both exactly of the shape
+    act = {"sub": <username>}, pc_imp = {"id": <32 lowercase hex>, "until":
+    <finite number>}: (True, Impersonation). Anything else — one claim
+    without the other, another shape, an extra key — is malformed: (True,
+    None), which the caller denies."""
+    if not isinstance(claims, dict) or ("act" not in claims and "pc_imp" not in claims):
+        return False, None
+    act, imp = claims.get("act"), claims.get("pc_imp")
+    if not isinstance(act, dict) or set(act) != {"sub"} or not valid_username(act["sub"]):
+        return True, None
+    if not isinstance(imp, dict) or set(imp) != {"id", "until"}:
+        return True, None
+    imp_id, until = imp["id"], imp["until"]
+    if not isinstance(imp_id, str) or not IMP_ID_RE.fullmatch(imp_id):
+        return True, None
+    if type(until) not in (int, float) or not math.isfinite(until):
+        return True, None
+    return True, Impersonation(imp_id, act["sub"], float(until))
+
+
+def parse_impersonation_doc(doc) -> dict:
+    """The fields group-gate uses of the Hub's impersonation.json, each
+    validated; raises ValueError on any other shape (the whole file is then
+    invalid: no impersonation counts). Returns {"allowed", "written",
+    "sessions": {id: {"id", "admin", "target", "reason", "until",
+    "ended"}}} with times as epoch seconds (`ended` None while running)."""
+    if not isinstance(doc, dict):
+        raise ValueError("not a JSON object")
+    if type(doc.get("version")) is not int or doc["version"] != IMPERSONATION_VERSION:
+        raise ValueError(f"version is not {IMPERSONATION_VERSION}")
+    if type(doc.get("allowed")) is not bool:
+        raise ValueError("allowed is not a boolean")
+    written = _parse_rfc3339(doc.get("written"))
+    sessions = doc.get("sessions")
+    if not isinstance(sessions, list):
+        raise ValueError("sessions is not a list")
+    out = {}
+    for s in sessions:
+        if not isinstance(s, dict):
+            raise ValueError("sessions: an entry is not an object")
+        if not isinstance(s.get("id"), str) or not IMP_ID_RE.fullmatch(s["id"]):
+            raise ValueError("sessions.id: not 32 lowercase hex characters")
+        if not valid_username(s.get("admin")) or not valid_username(s.get("target")):
+            raise ValueError("sessions.admin / target: not a username")
+        if not valid_reason(s.get("reason")):
+            raise ValueError("sessions.reason: not 3-200 characters on one line")
+        until = _parse_rfc3339(s.get("until"))
+        if "ended" not in s:
+            raise ValueError("sessions.ended: missing")
+        # null while running, else an RFC 3339 string; never parse None.
+        ended = None if s["ended"] is None else _parse_rfc3339(s["ended"])
+        if s["id"] in out:
+            raise ValueError("sessions: an id twice")
+        out[s["id"]] = {"id": s["id"], "admin": s["admin"], "target": s["target"], "reason": s["reason"],
+                        "until": until, "ended": ended}
+    return {"allowed": doc["allowed"], "written": written, "sessions": out}
+
+
+def load_impersonation_file(now: Optional[float] = None) -> Optional[dict]:
+    """The validated impersonation file (parse_impersonation_doc), cached by
+    (inode, mtime, size), or None when it is missing, unreadable, invalid,
+    of another version, or its `written` is more than IMPERSONATION_STALE
+    seconds old. A failure is logged once per change of the file (never
+    its content: the reasons stay out of the log)."""
+    now = time.time() if now is None else now
+    try:
+        st = os.stat(IMPERSONATION_FILE)
+        stamp = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError as e:
+        stamp = ("missing", type(e).__name__)
+    with _IMP_LOCK:
+        if _IMP_CACHE.get("stamp") != stamp:
+            doc, err = None, None
+            if stamp[0] == "missing":
+                err = f"can't be read ({stamp[1]})"
+            else:
+                try:
+                    with open(IMPERSONATION_FILE, encoding="utf-8") as f:
+                        doc = parse_impersonation_doc(json.load(f))
+                except OSError as e:
+                    err = f"can't be read ({type(e).__name__})"
+                except ValueError as e:  # json.JSONDecodeError and UnicodeDecodeError are ValueErrors
+                    # Field names and positions only: never a value of the file.
+                    err = f"is invalid ({str(e)[:160]})"
+            _IMP_CACHE.clear()
+            _IMP_CACHE.update(stamp=stamp, doc=doc)
+            if err:
+                print(f"group-gate: {IMPERSONATION_FILE} {err}: no impersonation counts "
+                      f"(impersonated requests are denied)", flush=True)
+        doc = _IMP_CACHE.get("doc")
+        if doc is not None and now - doc["written"] > IMPERSONATION_STALE:
+            if _IMP_CACHE.get("stale_logged") != stamp:
+                _IMP_CACHE["stale_logged"] = stamp
+                print(f"group-gate: {IMPERSONATION_FILE} was written more than {IMPERSONATION_STALE:g} s ago "
+                      f"(is the Hub running?): no impersonation counts", flush=True)
+            return None
+        return doc
+
+
+def live_impersonation(imp: Impersonation, username: str, now: float) -> Optional[dict]:
+    """The file's session record for the token's impersonation when it is
+    live (contract §4 "Live"): the file readable and fresh, `allowed`
+    true, a `sessions` record with the claim's id, not ended, its admin =
+    act.sub and target = the forward-auth username, and now before both
+    the claim's and the record's `until`. The record is returned with
+    `until` = the earlier of the two; None when not live."""
+    doc = load_impersonation_file(now)
+    if doc is None or not doc["allowed"]:
+        return None
+    rec = doc["sessions"].get(imp.id)
+    if rec is None or rec["ended"] is not None:
+        return None
+    if rec["admin"] != imp.admin or rec["target"] != username:
+        return None
+    until = min(rec["until"], imp.until)
+    if not now < until:
+        return None
+    return dict(rec, until=until)
+
+
+def impersonation_stop_url(domain: str) -> str:
+    return f"https://people.{domain}/impersonation/stop"
+
+
+def render_banner(rec: dict, now: float, domain: str) -> str:
+    """The impersonation banner (contract §5, D43): "You are signed in as
+    <person> (by <admin>) · reason “<reason>” · <n> min left" and Stop, n =
+    ceil(remaining / 60 s), at least 1; every value escaped. "" when a name
+    isn't a username or the reason breaks its rule (the caller denies)."""
+    if not isinstance(rec, dict):
+        return ""
+    person, admin, reason, until = rec.get("target"), rec.get("admin"), rec.get("reason"), rec.get("until")
+    if not valid_username(person) or not valid_username(admin) or not valid_reason(reason) \
+            or type(until) not in (int, float):
+        return ""
+    n = max(1, math.ceil((until - now) / 60.0))
+    e = html.escape
+    return (f"<div id=\"pc-imp-banner\" role=\"alert\"><span>You are signed in as {e(person)} (by {e(admin)}) "
+            f"· reason “{e(reason)}” · {n} min left</span> "
+            f"<a id=\"pc-imp-stop\" class=\"btn\" href=\"{e(impersonation_stop_url(domain), quote=True)}\">Stop</a></div>")
+
+
 # ── The opened log (contract §4 "Opened log", §8.2) ───────────────────
 
 _LOG_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
@@ -1912,12 +2104,17 @@ class CrlCache:
 
     def run_forever(self, on_first_read=None):
         """Refresh every `interval`; on_first_read() runs once, after the
-        first pass in which every list had been read (start-up checks)."""
+        first pass in which every list had been read (start-up checks). It
+        failing is logged and never ends the refresh loop."""
         while True:
             self.refresh()
             if on_first_read is not None and all(src.last_success > 0 for src in self.sources):
-                on_first_read()
-                on_first_read = None
+                hook, on_first_read = on_first_read, None
+                try:
+                    hook()
+                except Exception as e:  # noqa: BLE001 — a start-up check never stops the refreshes
+                    print(f"group-gate: the first-read check failed ({type(e).__name__}: {e}); "
+                          f"the revocation lists keep refreshing", flush=True)
             time.sleep(self.interval)
 
 
@@ -2317,21 +2514,23 @@ def app_name(host: str) -> str:
     return host
 
 
-def _signin_page(title: str, body: str) -> bytes:
-    """A 403 page: no refresh, no script, every value escaped by the caller."""
+def _signin_page(title: str, body: str, banner: str = "") -> bytes:
+    """A 403 page: no refresh, no script, every value escaped by the caller
+    (`banner`: render_banner's HTML, the body's first child)."""
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
             "<meta name=\"color-scheme\" content=\"dark\">"
-            f"<title>{html.escape(title)}</title><style>{SIGNIN_CSS}</style></head><body>"
+            f"<title>{html.escape(title)}</title><style>{SIGNIN_CSS}</style></head><body>{banner}"
             f"<main class=\"container\"><h1>{html.escape(title)}</h1>{body}</main></body></html>").encode()
 
 
-def render_stepup_page(app: str, method: str, url: str) -> bytes:
+def render_stepup_page(app: str, method: str, url: str, banner: str = "") -> bytes:
     """"<App> needs <method>" with a Continue button (#stepup-continue) to
     the step-up URL."""
     title = f"{app} needs a {METHOD_WORDS[method]}"
     e_url = html.escape(url, quote=True)
-    return _signin_page(title, f"<p><a id=\"stepup-continue\" class=\"btn\" href=\"{e_url}\" autofocus>Continue</a></p>")
+    return _signin_page(title, f"<p><a id=\"stepup-continue\" class=\"btn\" href=\"{e_url}\" autofocus>Continue</a></p>",
+                        banner)
 
 
 # The present-certificate page's words per certificate method.
@@ -2341,7 +2540,7 @@ CERTIFICATE_PAGE = {
 }
 
 
-def render_certificate_page(app: str, method: str) -> bytes:
+def render_certificate_page(app: str, method: str, banner: str = "") -> bytes:
     """The present-certificate page (#present-certificate) for `method`
     (yubikey_cert or browser_cert): signing in again can't help, this
     request must carry the person's own certificate of that kind."""
@@ -2349,10 +2548,12 @@ def render_certificate_page(app: str, method: str) -> bytes:
     return _signin_page(
         f"{app} needs your {kind} certificate",
         f"<div id=\"present-certificate\"><p>{html.escape(ask)}</p>"
-        "<p class=\"portcullis-sub\">A revoked certificate, or another person&#x27;s, doesn&#x27;t count.</p></div>")
+        "<p class=\"portcullis-sub\">A revoked certificate, or another person&#x27;s, doesn&#x27;t count.</p></div>",
+        banner)
 
 
-def render_needs_page(app: str, have: set, node, set_up: Optional[set], add_stronger: bool, domain: str) -> bytes:
+def render_needs_page(app: str, have: set, node, set_up: Optional[set], add_stronger: bool, domain: str,
+                      impersonated: Optional[dict] = None) -> bytes:
     """The needs-stronger page (#needs-stronger), NeedsStronger.of's rules:
     one line per alternative of the rule; "— you don't have one yet" on a
     line that needs a passkey kind the person hasn't set up (only when
@@ -2360,8 +2561,25 @@ def render_needs_page(app: str, have: set, node, set_up: Optional[set], add_stro
     passkey" / "Set up a security key" for a missing passkey kind not set
     up while `add_stronger` is on or it is no stronger than the session's
     strongest method, otherwise — and always for passwords and
-    certificates — "or ask your admin"; "Sign-in methods" always."""
+    certificates — "or ask your admin"; "Sign-in methods" always.
+
+    `impersonated` (a live impersonation's record, D39): the impersonation
+    form instead — "<App> needs <methods>. <admin>'s sign-in didn't use
+    them, and a session as <person> can't add one: Stop, sign in with them,
+    and start again." (the extension's portcullis-impersonating.ftl, mode
+    needs), with the banner and Stop, no "Set up" or Sign-in methods link."""
     e = html.escape
+    if impersonated is not None:
+        missing = _canonical({m for alt in alternatives(node) for m in alt if m not in have})
+        words = " or ".join(f"a {html.escape(METHOD_WORDS[m])}" for m in missing)
+        stop = e(impersonation_stop_url(domain), quote=True)
+        return _signin_page(
+            f"{app} needs a stronger sign-in",
+            f"<div id=\"needs-stronger\" data-impersonated=\"true\"><p>{e(app)} needs {words}. "
+            f"{e(impersonated['admin'])}&#x27;s sign-in didn&#x27;t use them, and a session as "
+            f"{e(impersonated['target'])} can&#x27;t add one: Stop, sign in with them, and start again.</p>"
+            f"<p><a id=\"pc-imp-needs-stop\" class=\"btn\" href=\"{stop}\">Stop</a></p></div>",
+            render_banner(impersonated, time.time(), domain))
     strongest = max((METHOD_TENTHS[m] for m in have), default=0)
     known = set_up if set_up is not None else set()
     lines, missing_all = [], []
@@ -2407,6 +2625,18 @@ def render_needs_page(app: str, have: set, node, set_up: Optional[set], add_stro
         f"{app} needs a stronger sign-in",
         f"<div id=\"needs-stronger\"><p>{signed_in} {e_app} accepts any one of:</p>"
         f"<ul>{''.join(lines)}</ul><p>{' '.join(links)}</p></div>")
+
+
+def render_ended_page(person: str, domain: str) -> bytes:
+    """The impersonation's ended page (contract §4, D41): "Your session as
+    <person> has ended." with a link to sign out of the forward-auth
+    session (back to the portal)."""
+    rd = urllib.parse.quote(f"https://{domain}/", safe="")
+    sign_out = html.escape(f"https://auth.{domain}/oauth2/sign_out?rd={rd}", quote=True)
+    return _signin_page(
+        "Signed in as someone else: ended",
+        f"<div id=\"impersonation-ended\"><p>Your session as {html.escape(person)} has ended.</p>"
+        f"<p><a id=\"pc-imp-sign-out\" class=\"btn\" href=\"{sign_out}\">Sign out</a></p></div>")
 
 
 # The one header the signed-in username is read from: set by oauth2-proxy
@@ -2479,7 +2709,8 @@ class Handler(BaseHTTPRequestHandler):
         for k, v in (extra_headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
-        self.wfile.write(f"<h1>{html.escape(title)}</h1>{body_html}".encode())
+        banner = getattr(self, "_banner", "")
+        self.wfile.write(f"{banner}<h1>{html.escape(title)}</h1>{body_html}".encode())
         print(f"group-gate: {log}", flush=True)
 
     def _allow(self, groups_header: Optional[str] = None, username: str = "", host: str = ""):
@@ -2495,6 +2726,12 @@ class Handler(BaseHTTPRequestHandler):
         # `host` is the normalised request host (per-host headers, §4.1).
         for name, value in user_attribute_headers(username, host) if username else []:
             self.send_header(name, value.encode("utf-8").decode("latin-1"))
+        # A live impersonation (contract §5 "Impersonation headers"): both
+        # names are authResponseHeaders, so client copies never pass.
+        rec = getattr(self, "_imp", None)
+        if rec is not None:
+            self.send_header(IMPERSONATION_HEADERS[0], rec["admin"])
+            self.send_header(IMPERSONATION_HEADERS[1], rec["id"])
         self.end_headers()
 
     def _deny_policy(self, user: str, host: str, reason: str):
@@ -2522,8 +2759,51 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         print(f"group-gate: {log}", flush=True)
 
+    def _impersonation(self, username: str, host: str = ""):
+        """The request's impersonation (contract §4 "Impersonated
+        requests"), checked after the username checks and before
+        membership, in do_GET and _portal alike. The claims come only from
+        X-Forwarded-Access-Token (never Authorization: on the Keycloak
+        console's route that one is the client's own). Returns:
+
+        - (False, None): not impersonated (neither claim): nothing changes;
+        - (True, rec): live; self._imp / self._banner are set, so every
+          page carries the banner and the allow carries the headers;
+        - (True, None): answered — malformed claims, not live, or a record
+          that can't be shown: the ended page (403) was sent.
+        """
+        self._imp, self._banner = None, ""
+        claims = decode_jwt_payload(self.headers.get("X-Forwarded-Access-Token", "") or "")
+        present, imp = impersonation_claims(claims)
+        if not present:
+            return False, None
+        now = time.time()
+        rec, why = None, "malformed act / pc_imp claims"
+        if imp is not None:
+            why = "not live"
+            # The token is still the person's (contract §4 step 2).
+            if claims.get("preferred_username") == username:
+                rec = live_impersonation(imp, username, now)
+        banner = render_banner(rec, now, DOMAIN) if rec is not None else ""
+        if rec is None or not banner:
+            body = render_ended_page(username, DOMAIN)
+            METRICS.inc("group_gate_requests_total", endpoint=self._endpoint, result="deny")
+            METRICS.inc("group_gate_denials_total", reason="impersonation_ended")
+            self.send_response(403)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Security-Policy", SIGNIN_CSP)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            print(f"group-gate: DENIED user={username} host={host} imp={imp.id if imp else '-'} "
+                  f"act={imp.admin if imp else '-'} reason=impersonation_ended ({why})", flush=True)
+            return True, None
+        self._imp, self._banner = rec, banner
+        return True, rec
+
     def _signin_check(self, doc: dict, host: str, kind: str, username: str,
-                      cert_ok: bool, raw_uri: str = "") -> bool:
+                      cert_ok: bool, raw_uri: str = "", rec: Optional[dict] = None) -> bool:
         """The host's sign-in template (contract §4 "How group-gate
         decides"). True when the request was answered (denied, or one of
         the step-up / present-certificate / needs-stronger pages); False
@@ -2537,7 +2817,12 @@ class Handler(BaseHTTPRequestHandler):
         On people.<domain>, the Sign-in page's paths (signin_path(): every
         normalised reading of `raw_uri` inside the set) take "any
         switched-on method" instead of the people template; no method on
-        = deny."""
+        = deny.
+
+        `rec`: a live impersonation (D39). A certificate binds only for the
+        administrator (`bound_cert_method(leaf, rec["admin"])`), and an
+        unmet template gets the needs page's impersonation form: never a
+        step-up, never the present-certificate page."""
         if signin_path(host, raw_uri):
             on = _canonical(doc["methods"])
             rule = {"op": "any", "items": on} if on else None
@@ -2562,8 +2847,9 @@ class Handler(BaseHTTPRequestHandler):
         cert_cn = leaf_user(leaf)
         kind_of_cert = leaf_method(leaf)
         bound = set()
+        cert_user = rec["admin"] if rec is not None else username
         if cert_ok and kind_of_cert and claims.get("preferred_username") == username \
-                and bound_cert_method(leaf, username) == kind_of_cert:
+                and bound_cert_method(leaf, cert_user) == kind_of_cert:
             bound = {kind_of_cert}
         enabled = set(doc["methods"])
         have = session_methods(amr, enabled, bound)
@@ -2572,6 +2858,11 @@ class Handler(BaseHTTPRequestHandler):
             return False
         app = app_name(host)
         what = f"user={username} host={host} amr={amr} have={_canonical(have)}"
+        if rec is not None:
+            self._signin_answer(render_needs_page(app, have, rule, None, False, DOMAIN, impersonated=rec),
+                                "needs_stronger", f"NEEDS-STRONGER {what} imp={rec['id']} act={rec['admin']} "
+                                f"cert_kind={kind_of_cert} cert_cn={cert_cn!r}")
+            return True
         held = held_cert_methods(amr)
         # Present-certificate page: a certificate method the token holds,
         # switched on, not bound on this request, that would meet the rule
@@ -2610,8 +2901,10 @@ class Handler(BaseHTTPRequestHandler):
             session = log_session_id(claims, username)
             if not session or OPENED_LOG.seen(session, host):
                 return
+            rec = getattr(self, "_imp", None)
             OPENED_LOG.record(username.lower(), session, host, app_name(host), getattr(self, "_have", set()),
-                              self.headers.get("X-Real-Ip", "") or "", self.headers.get("User-Agent", "") or "")
+                              self.headers.get("X-Real-Ip", "") or "", self.headers.get("User-Agent", "") or "",
+                              act=rec["admin"] if rec is not None else "")
         except Exception as e:  # noqa: BLE001
             METRICS.inc("group_gate_opened_log_failures_total")
             print(f"group-gate: opened log failed ({type(e).__name__}: {e})", flush=True)
@@ -2650,6 +2943,9 @@ class Handler(BaseHTTPRequestHandler):
             self._deny("Access Denied", "<p>This account is a service account and cannot sign in.</p>",
                        f"DENIED portal user={user} reason=service account", "service_account")
             return
+        present, rec = self._impersonation(user, DOMAIN)
+        if present and rec is None:
+            return
         # The portal is a core page (`core[<domain>]`): its router has no
         # portcullis-groups, so its template is checked here. A missing or
         # broken policy file denies (no template is known).
@@ -2658,7 +2954,8 @@ class Handler(BaseHTTPRequestHandler):
             if not DOMAIN_OK:
                 raise PolicyError(f"PORTCULLIS_DOMAIN={DOMAIN!r} is not a valid hostname")
             doc = load_policy_file()
-            if self._signin_check(doc, DOMAIN, "core", user, self._cert_ok(serials) if serials else False):
+            if self._signin_check(doc, DOMAIN, "core", user, self._cert_ok(serials) if serials else False,
+                                  rec=rec):
                 return
             groups -= expired_groups(doc, user)
         except PolicyError as e:
@@ -2667,7 +2964,7 @@ class Handler(BaseHTTPRequestHandler):
         METRICS.inc("group_gate_requests_total", endpoint="portal", result="allow")
         self._record_opened(user, DOMAIN)
         apps, domains = load_portal_apps()
-        body = render_portal(user, groups, apps, DOMAIN, domains)
+        body = render_portal(user, groups, apps, DOMAIN, domains, banner=self._banner)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
@@ -2713,6 +3010,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         # Per request (a kept-alive connection reuses the handler).
         self._have, self._claims = set(), {}
+        self._imp, self._banner = None, ""
         gate_path = urllib.parse.urlsplit(self.path).path
         if gate_path == "/metrics":
             body = METRICS.render().encode()
@@ -2814,6 +3112,11 @@ class Handler(BaseHTTPRequestHandler):
                        f"DENIED user={user} host={host} reason=service account", "service_account")
             return
 
+        # --- Impersonation (contract §4): before membership, on every host.
+        present, imp_rec = self._impersonation(username, host)
+        if present and imp_rec is None:
+            return
+
         # Per-request reload — the Hub rewrites the policy file on each
         # change, and both files are tiny.
         try:
@@ -2899,7 +3202,7 @@ class Handler(BaseHTTPRequestHandler):
         # outside the app's groups gets the plain 403 above, never a page
         # naming the app's rule. A revoked certificate was denied at the
         # start, so one still here passed the revocation check.
-        if self._signin_check(policy_doc, host, kind, username, bool(cert_serials), raw_uri):
+        if self._signin_check(policy_doc, host, kind, username, bool(cert_serials), raw_uri, rec=imp_rec):
             return
 
         self._allow(groups_header, username, host)
