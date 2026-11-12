@@ -363,14 +363,6 @@ def kc(path: str, method: str = "GET"):
         return json.loads(raw) if raw else None
 
 
-def kc_put(path: str, doc: dict) -> None:
-    kc("")  # a fresh admin token if needed
-    req = urllib.request.Request(f"{KC_ADMIN}/admin/realms/portcullis{path}", method="PUT", data=json.dumps(doc).encode(),
-                                 headers={"Authorization": "Bearer " + _kc["token"], "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        r.read()
-
-
 def kc_user_id(username: str) -> str | None:
     users = kc("/users?" + urllib.parse.urlencode({"username": username, "exact": "true"}))
     return users[0]["id"] if users else None
@@ -2322,13 +2314,11 @@ def main() -> int:
             print(f"    impersonations: allowed {view.get('allowed')} max_minutes {view.get('max_minutes')} "
                   f"running {len(view.get('running') or [])}", flush=True)
             assert view.get("allowed") is True and view.get("max_minutes") == 2 and not view.get("running"), view
-            # A YubiKey certificate of alice's own (F16): her sign-ins here, and
-            # imp_call5's "the person's certificate never counts".
-            cert, key = vault_issue("alice")
-            state["imp_alice_cert"] = cert_files(cert, key, "alice-imp-yk")
+            # A YubiKey certificate of alice's own (F16, below): her sign-ins
+            # here, and imp_call5's "the person's certificate never counts".
             # carol's remove-passkeys (sign_in_help_actions) left alice the
             # passkey registration action: a start on her is refused (rule 6)
-            # until it's gone; cleared here through Keycloak's admin API.
+            # until she finishes it (below).
             uid = kc_user_id("alice")
             actions = kc(f"/users/{uid}").get("requiredActions") or []
             print(f"    alice's required actions: {actions}", flush=True)
@@ -2336,14 +2326,30 @@ def main() -> int:
                 code, out = imp_post("root", "alice", {"reason": IMP_REASON, "code": "x", "code_verifier": "x", "nonce": "x"})
                 print(f"    a start on alice with {actions}: HTTP {code} {out.strip()[:100]!r}", flush=True)
                 assert code == 409 and "unfinished sign-in step" in out, f"HTTP {code} {out[:200]}"
-                kc_put(f"/users/{uid}", {"requiredActions": []})
-                assert not (kc(f"/users/{uid}").get("requiredActions") or []), "alice's required actions stay"
-            # A token for alice's People MCP, minted before any start.
-            ctx = new_context(client_cert=state["imp_alice_cert"], origins=(AUTH, PEOPLE))
+            # alice signs in with her certificate and finishes the action (a
+            # new security key: an AI token counts no certificate method).
+            cert, key = vault_issue("alice")
+            state["imp_alice_cert"] = cert_files(cert, key, "alice-imp-yk")
+            ctx = new_context(client_cert=state["imp_alice_cert"], origins=(AUTH, ECHO_CERT))
             try:
+                page = ctx.new_page()
+                akey = Key(page)
+                goto(page, ECHO_CERT + "/")
+                base.passkey_flow(page, until=ECHO_CERT, label="alice-imp-register", expect_stepups=0)
+                assert akey.registered == (1 if actions else 0), f"alice registered {akey.registered} passkeys"
+                creds = akey.credentials()
+            finally:
+                ctx.close()
+            assert not (kc(f"/users/{uid}").get("requiredActions") or []), "alice's required actions stay"
+            assert creds, "alice has no passkey"
+            state["alice_imp_creds"] = creds
+            # A token for alice's People MCP, minted before any start.
+            ctx = new_context()
+            try:
+                Key(ctx.new_page(), credentials=state["alice_imp_creds"])
                 until(f"{PEOPLE_MCP}'s metadata served", lambda: ctx.request.get(
                     PEOPLE + "/.well-known/oauth-protected-resource/mcp").status == 200, 120)
-                tf = mcp_login(ctx.new_page(), PEOPLE_MCP, PEOPLE_SCOPE, "alice-people-mcp")
+                tf = mcp_login(ctx.pages[0], PEOPLE_MCP, PEOPLE_SCOPE, "alice-people-mcp")
             finally:
                 ctx.close()
             rc, doc = mcp_tools_list(PEOPLE_MCP, tf)
@@ -2368,10 +2374,33 @@ def main() -> int:
                 (root_sid,) = root_sids
                 alice0 = session_ids("alice")
                 asserted = key.asserted
-                doc = imp_begin(page, "imp1")
+                proof = fresh_code(page, "imp1-fresh", HUB + "/")
                 assert key.asserted > asserted, "the fresh sign-in asked no security key"
                 # F39: the proof's session is still root's one session.
                 assert session_ids("root") == {root_sid}, f"root's session changed across prompt=login: {session_ids('root')}"
+                # Keycloak keeps only the fresh sign-in's methods in the
+                # session after prompt=login (run 43174939742: mtls before,
+                # hwk alone after): shown here, then root steps up to his
+                # YubiKey certificate (step-ups accumulate) so the session
+                # has both for imp_call5.
+                print(f"    root's session amr after the fresh sign-in: {fresh_auth(page, 'imp1-sso').get('amr')}", flush=True)
+                ctxc = new_context(client_cert=root_cert, storage_state=ctx.storage_state(),
+                                   origins=(AUTH, HUB, PEOPLE, MAIN, ECHO_STD, ECHO_CERT, ECHO_FILE))
+                ctx.close()
+                ctx = ctxc
+                page = ctx.new_page()
+                key = Key(page, credentials=state["root_creds"])
+                goto(page, f"{AUTH}/oauth2/start?" + urllib.parse.urlencode({"pc_method": "yubikey_cert", "rd": HUB + "/"}))
+                out = drive_kc(page, lambda: landed(page, HUB), "imp1-stepup-cert")
+                assert out == "done", f"root's step-up to yubikey_cert: {out} at {page.url.split('?')[0]}"
+                amr0 = token_claims(page).get("amr") or []
+                assert {"mtls", "hwk"} <= set(amr0), f"root's amr after the step-up: {amr0}"
+                assert session_ids("root") == {root_sid}, f"root's session changed across the step-up: {session_ids('root')}"
+                code, out = imp_post("root", "alice", dict(proof, reason=IMP_REASON), access_token(page))
+                assert code == 200, f"start root → alice: HTTP {code} {out[:300]}"
+                doc = json.loads(out)
+                assert doc["next"] == f"{REALM}/portcullis-impersonate/start?id={doc['id']}", doc["next"]
+                imp_t0[doc["id"]] = time.time()
                 starts = [e for e in audit_entries("impersonation.start") if (e.get("detail") or "").startswith(doc["id"])]
                 print(f"    start: {[(e.get('actor'), e.get('target'), e.get('result'), e.get('detail')) for e in starts]}", flush=True)
                 assert len(starts) == 1 and starts[0].get("result") == "ok" and starts[0].get("actor") == "root" \
