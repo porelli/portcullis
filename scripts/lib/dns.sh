@@ -217,6 +217,103 @@ dns_setup() {
   dns_check false
 }
 
+# ── lifecycle: the main domain's CAA pin follows Traefik's account ──
+
+# _dns_uri_ok <uri> — an ACME account URI fit for a CAA value and an env
+# file (https, no spaces or quotes).
+_dns_uri_ok() {
+  [[ "$1" =~ ^https://[A-Za-z0-9._~:/?#@!\$\&\(\)*+,\;=%-]+$ ]]
+}
+
+# dns_main_env_write <uri> — secrets/domains/main-domain.env (0600,
+# DOMAINS_MAIN_ACME_ACCOUNT_URI): the pin the domains service's read-only
+# main-domain plan judges against. A change recreates domains.
+dns_main_env_write() {
+  local uri="$1" f d new
+  _dns_uri_ok "$uri" || { warn "not writing main-domain.env: '$uri' is not an ACME account URI"; return 1; }
+  d="$(_domains_dir)"
+  f="$d/main-domain.env"
+  new="DOMAINS_MAIN_ACME_ACCOUNT_URI=$uri"
+  [ "$(cat "$f" 2>/dev/null)" != "$new" ] || return 0
+  mkdir -p "$d"
+  (umask 077; printf '%s\n' "$new" > "$f.tmp") && mv -f "$f.tmp" "$f" && chmod 600 "$f" \
+    || { rm -f "$f.tmp"; warn "could not write $f"; return 1; }
+  info "Traefik's ACME account: $uri (secrets/domains/main-domain.env)"
+  dc up -d domains >/dev/null 2>&1 || warn "could not restart the domains service to read main-domain.env"
+  return 0
+}
+
+# dns_main_env_uri — the URI main-domain.env holds (nothing without it).
+dns_main_env_uri() {
+  sed -n 's/^DOMAINS_MAIN_ACME_ACCOUNT_URI=//p' "$(_domains_dir)/main-domain.env" 2>/dev/null | head -n1
+}
+
+# _dns_caa_live_ok <uri> — the live CAA at the main domain is already
+# pinned to <uri> (public check; any failure = not ok).
+_dns_caa_live_ok() {
+  local out
+  out="$(DNS_ACCOUNT_URI="$1" DNS_SETS=caa DNS_IPS_DONE=1 DNS_IPV4="${PORTCULLIS_PUBLIC_IPV4:-}" DNS_IPV6="${PORTCULLIS_PUBLIC_IPV6:-}" \
+    _dns_tool check 2>/dev/null)" || true
+  [ -n "$out" ] && printf '%s' "$out" | jq -e '.caa.would_issue and ([.items[] | select(.set == "caa" and .status != "ok" and .status != "foreign")] | length == 0)' >/dev/null 2>&1
+}
+
+# dns_tighten_main — after `up` / `upgrade` / `init` (Traefik running):
+# read Traefik's ACME account URI (a first registration may take a while:
+# polled up to 3 min, only when DNS_CAA=true and the provider is
+# automated; otherwise one read), record it in main-domain.env, and pin
+# the main domain's CAA to it when the live pin differs. Only warns:
+# `up` never fails because of it.
+dns_tighten_main() {
+  local caa poll=false uri="" deadline every
+  caa="$(_dns_flag DNS_CAA true 2>/dev/null)" || { warn "DNS_CAA must be true or false: the CAA pin is left alone"; return 0; }
+  [ "$caa" != true ] || ! _dns_automated "${DNS_PROVIDER:-none}" || poll=true
+  if [ "$poll" = true ]; then
+    deadline=$((SECONDS + ${DNS_TIGHTEN_TIMEOUT:-180}))
+    every="${DNS_TIGHTEN_POLL:-5}"
+    while :; do
+      uri="$(dns_traefik_account_uri)"
+      [ -z "$uri" ] || break
+      [ "$SECONDS" -lt "$deadline" ] || break
+      sleep "$every"
+    done
+  else
+    uri="$(dns_traefik_account_uri)"
+  fi
+  if [ -z "$uri" ]; then
+    [ "$poll" != true ] || warn "Traefik has no ACME account yet: the CAA of $PORTCULLIS_DOMAIN stays CA-only (the next ./portcullis up pins it)."
+    return 0
+  fi
+  dns_main_env_write "$uri" || return 0
+  [ "$poll" = true ] || return 0
+  _dns_caa_live_ok "$uri" && return 0
+  info "Pinning the CAA of $PORTCULLIS_DOMAIN to Traefik's ACME account..."
+  if (DNS_ACCOUNT_URI="$uri" DNS_SETS=caa DNS_IPS_DONE=1 DNS_IPV4="${PORTCULLIS_PUBLIC_IPV4:-}" DNS_IPV6="${PORTCULLIS_PUBLIC_IPV6:-}" \
+      _dns_tool apply --wait 5m >/dev/null); then
+    ok "CAA of $PORTCULLIS_DOMAIN pinned to $uri"
+  else
+    warn "could not pin the CAA of $PORTCULLIS_DOMAIN to Traefik's account (fix: ./portcullis dns setup)"
+  fi
+  return 0
+}
+
+# dns_relax_main — before `config apply` clears acme.json (an
+# ACME_STAGING flip): the main domain's CAA back to CA-only, so the new
+# account Traefik registers can order. Only warns.
+dns_relax_main() {
+  info "Relaxing the CAA of ${PORTCULLIS_DOMAIN:-the domain} to CA-only (Traefik registers a new ACME account)..."
+  if ! (DNS_ACCOUNT_URI="" DNS_SETS=caa DNS_IPS_DONE=1 DNS_IPV4="${PORTCULLIS_PUBLIC_IPV4:-}" DNS_IPV6="${PORTCULLIS_PUBLIC_IPV6:-}" \
+      _dns_tool apply >/dev/null); then
+    warn "could not relax the CAA: issuance will fail on CAA until ./portcullis dns setup"
+  fi
+  return 0
+}
+
+# dns_status_json — the domains service's DNS report (main + enrolled
+# plans, loopback API), or nothing when it isn't running.
+dns_status_json() {
+  dc exec -T domains domains report --main --json 2>/dev/null || true
+}
+
 help_dns() {
   cat <<'EOF'
 Usage: portcullis dns plan|setup|check [options]

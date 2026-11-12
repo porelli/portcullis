@@ -231,6 +231,8 @@ domains_fix_perms() {
   [ ! -d "$d/certs-endpoint" ] || chmod 700 "$d/certs-endpoint"
   [ ! -e "$d/certs-endpoint/ca.key" ] || chmod 600 "$d/certs-endpoint/ca.key"
   [ ! -e "$d/certs-endpoint/ca.crt" ] || chmod 644 "$d/certs-endpoint/ca.crt"
+  # Traefik's ACME account URI (dns_main_env_write): compose reads it.
+  [ ! -e "$d/main-domain.env" ] || chmod 600 "$d/main-domain.env"
   local f
   [ ! -e "$d/api-secret" ] || { chmod 640 "$d/api-secret"; ct_own "$(id -u):$CT_UID_HUB" "$d/api-secret"; }
   for f in "$d/age.key" "$d/certs-endpoint/server.crt" "$d/certs-endpoint/server.key"; do

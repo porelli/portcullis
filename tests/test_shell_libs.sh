@@ -2007,7 +2007,7 @@ jq -n '{name: "ci.example.org", checked_at: "2026-11-13T00:00:00Z", can_write: t
         caa: {issuer: "letsencrypt.org", account_uri: "", would_issue: true},
         dnssec: {state: "unsigned", zone: "example.org.", provider_can_sign: false, ds: [], steps: ["Turn on DNSSEC signing"]}}' > "$STUB_DIR/dt/out-default"
 cat > "$WORK/dtenv.sh" <<EOF
-for l in common network domains stack config dns; do source "$HERE/../scripts/lib/\$l.sh"; done
+for l in common network domains stack config dns status; do source "$HERE/../scripts/lib/\$l.sh"; done
 export PORTCULLIS_DOMAIN=ci.example.org PORTCULLIS_PUBLIC_IPV4=203.0.113.10 PORTCULLIS_PUBLIC_IPV6=
 EOF
 # dt <shell commands> — in a fresh shell with the libs, the stub and a
@@ -2090,6 +2090,147 @@ OUT="$(dt 'dns_check false')"
 case "$OUT" in *"CAA: issuer letsencrypt.org, account CA-only"*"DNSSEC: unsigned (zone example.org)"*rc=1) t_pass "dns check: renders the plan, exit 1 on a problem" ;;
   *) t_fail "dns check render/exit: $OUT" ;; esac
 rm -f "$STUB_DIR/dt/rc-check"
+
+# ══ dns lifecycle: Traefik pin, relax on a flip, main-domain.env, status ═══
+touch "$STUB_DIR/dt/acme-volume"
+echo "https://acme-v02.api.letsencrypt.org/acme/acct/77" > "$STUB_DIR/dt/traefik-uri"
+OUT="$(dt 'dns_traefik_account_uri')"
+expect_eq "traefik uri: printed" "$OUT" "https://acme-v02.api.letsencrypt.org/acme/acct/77
+rc=0"
+expect_eq "traefik uri: helper is network none, read-only volume, root" \
+  "$(grep -c -- '^run --rm --network none --read-only --user 0:0 --cap-drop ALL --security-opt no-new-privileges:true -v portcullis_traefik_acme:/acme:ro portcullis-domains traefik-account-uri /acme/acme.json$' "$STUB_DIR/dt/argv")" 1
+echo 'https://evil.test/acct/1 "x' > "$STUB_DIR/dt/traefik-uri"
+OUT="$(dt 'dns_main_env_write "$(dns_traefik_account_uri)"; cat "$PORTCULLIS_ROOT/secrets/domains/main-domain.env" 2>/dev/null')"
+case "$OUT" in *DOMAINS_MAIN*) t_fail "main-domain.env: a URI with quotes / spaces was written" ;; *) t_pass "main-domain.env: only a clean https URI is written" ;; esac
+rm -f "$STUB_DIR/dt/acme-volume"
+OUT="$(dt 'dns_traefik_account_uri')"
+expect_eq "traefik uri: no volume = nothing (and no volume created)" "$OUT:$(grep -c -- '-v portcullis_traefik_acme' "$STUB_DIR/dt/argv")" "rc=0:0"
+
+# tighten: a URI, the live pin differs (check says caa wrong) → pinned.
+touch "$STUB_DIR/dt/acme-volume"
+echo "https://acme-v02.api.letsencrypt.org/acme/acct/77" > "$STUB_DIR/dt/traefik-uri"
+jq '.items = [{set: "caa", name: "ci.example.org", type: "CAA", want: ["x"], live: ["y"], status: "wrong", severity: "problem", fix: "auto", steps: []}] | .caa.would_issue = false' \
+  "$STUB_DIR/dt/out-default" > "$STUB_DIR/dt/out-check"
+rm -rf "$PORTCULLIS_ROOT/secrets/domains/main-domain.env"
+OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_tighten_main')"
+expect_eq "tighten: writes main-domain.env" "$(cat "$PORTCULLIS_ROOT/secrets/domains/main-domain.env")" "DOMAINS_MAIN_ACME_ACCOUNT_URI=https://acme-v02.api.letsencrypt.org/acme/acct/77"
+expect_eq "tighten: main-domain.env is 0600" "$(file_mode "$PORTCULLIS_ROOT/secrets/domains/main-domain.env")" 600
+expect_eq "tighten: domains recreated for the new env file" "$(grep -c ' up -d domains$' "$STUB_DIR/dt/argv")" 1
+expect_eq "tighten: pins when live differs (check, then apply caa with Traefik's URI)" \
+  "$(paste -sd' ' "$STUB_DIR/dt/order"):$(dtin apply '[.sets, .caa.account_uri] | @json')" \
+  'check apply:[["caa"],"https://acme-v02.api.letsencrypt.org/acme/acct/77"]'
+case "$OUT" in *rc=0) t_pass "tighten: returns 0" ;; *) t_fail "tighten: $OUT" ;; esac
+# Live pin already right: no apply, no restart (the file is unchanged).
+jq '.items = [{set: "caa", name: "ci.example.org", type: "CAA", want: ["x"], live: ["x"], status: "ok", severity: "ok", fix: "none", steps: []}] | .caa.would_issue = true' \
+  "$STUB_DIR/dt/out-default" > "$STUB_DIR/dt/out-check"
+dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_tighten_main' >/dev/null
+expect_eq "tighten: live pin right = check only, no restart" "$(paste -sd' ' "$STUB_DIR/dt/order"):$(grep -c ' up -d domains$' "$STUB_DIR/dt/argv" || true)" "check:0"
+# A failing apply only warns.
+jq '.caa.would_issue = false' "$STUB_DIR/dt/out-check" > "$STUB_DIR/dt/out-check2" && mv "$STUB_DIR/dt/out-check2" "$STUB_DIR/dt/out-check"
+echo 3 > "$STUB_DIR/dt/rc-apply"
+OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_tighten_main')"
+case "$OUT" in *"could not pin the CAA"*rc=0) t_pass "tighten: a failed pin warns, returns 0" ;; *) t_fail "tighten failed pin: $OUT" ;; esac
+rm -f "$STUB_DIR/dt/rc-apply" "$STUB_DIR/dt/out-check"
+# No account within the poll window.
+rm -f "$STUB_DIR/dt/acme-volume"
+OUT="$(dt 'DNS_TIGHTEN_TIMEOUT=1 DNS_TIGHTEN_POLL=1 DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_tighten_main')"
+case "$OUT" in *"no ACME account yet"*rc=0) t_pass "tighten: no account within the poll window warns, returns 0" ;; *) t_fail "tighten no account: $OUT" ;; esac
+expect_eq "tighten: polled more than once" "$([ "$(grep -c '^volume inspect portcullis_traefik_acme$' "$STUB_DIR/dt/argv")" -gt 1 ] && echo yes)" yes
+dt 'DNS_PROVIDER=gcloud dns_tighten_main' >/dev/null
+expect_eq "tighten: manual provider reads once, no poll" "$(grep -c '^volume inspect portcullis_traefik_acme$' "$STUB_DIR/dt/argv")" 1
+dt 'DNS_CAA=false DNS_PROVIDER=cloudflare dns_tighten_main' >/dev/null
+expect_eq "tighten: DNS_CAA=false reads once, no poll, no tool" "$(grep -c '^volume inspect portcullis_traefik_acme$' "$STUB_DIR/dt/argv"):$(grep -c dns-tool "$STUB_DIR/dt/argv" || true)" "1:0"
+touch "$STUB_DIR/dt/acme-volume"
+rm -f "$PORTCULLIS_ROOT/secrets/domains/main-domain.env"
+dt 'DNS_CAA=false DNS_PROVIDER=cloudflare dns_tighten_main' >/dev/null
+expect_eq "tighten: DNS_CAA=false still records the URI" "$(cat "$PORTCULLIS_ROOT/secrets/domains/main-domain.env")" "DOMAINS_MAIN_ACME_ACCOUNT_URI=https://acme-v02.api.letsencrypt.org/acme/acct/77"
+
+# config apply on a staging flip: relax before acme.json is removed.
+FL_ROOT="$WORK/flip"; mkdir -p "$FL_ROOT/certs"
+echo false > "$FL_ROOT/certs/.acme-staging-last"
+flip() { # flip <extra shell> — config_apply with ACME_STAGING=true after false
+  printf 'PORTCULLIS_DOMAIN=ci.example.org\nACME_STAGING=true\n' > "$FL_ROOT/.env"
+  echo false > "$FL_ROOT/certs/.acme-staging-last"
+  rm -f "$STUB_DIR/dt/argv" "$STUB_DIR/dt/order"
+  (PATH="$WORK/dtbin:$WORK/cabin:$PATH" PORTCULLIS_ROOT="$FL_ROOT" bash -c ". '$WORK/dtenv.sh'; export PORTCULLIS_ROOT='$FL_ROOT'; config_build_ca_bundle() { :; }; $1; config_apply" 2>&1; echo "rc=$?")
+}
+OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123; dns_relax_main() { echo RELAX >> "$STUB_DIR/dt/argv"; }')"
+RL="$(grep -n '^RELAX$' "$STUB_DIR/dt/argv" | cut -d: -f1)"
+RM="$(grep -n 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv" | cut -d: -f1)"
+expect_eq "config apply flip: relax runs before acme.json is removed" "$([ -n "$RL" ] && [ -n "$RM" ] && [ "$RL" -lt "$RM" ] && echo yes)" yes
+OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123')"
+expect_eq "config apply flip: relax applies caa CA-only" "$(dtin apply '[.sets, .caa.account_uri] | @json')" '[["caa"],""]'
+echo 3 > "$STUB_DIR/dt/rc-apply"
+OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123')"
+case "$OUT" in *"issuance will fail on CAA until ./portcullis dns setup"*rc=0) t_pass "config apply flip: relax failure warns and goes on" ;; *) t_fail "relax failure: $OUT" ;; esac
+expect_eq "config apply flip: acme.json still cleared after a failed relax" "$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv")" 1
+rm -f "$STUB_DIR/dt/rc-apply"
+OUT="$(flip 'export DNS_PROVIDER=gcloud')"
+expect_eq "config apply flip: no relax for a manual provider" "$(grep -c dns-tool "$STUB_DIR/dt/argv" || true)" 0
+expect_eq "config apply: ACME_DNS_PROVIDER written" "$(grep '^ACME_DNS_PROVIDER=' "$FL_ROOT/.env")" "ACME_DNS_PROVIDER=gcloud"
+OUT="$(flip 'export DNS_PROVIDER=hetzner-cloud HETZNER_API_TOKEN=cloud-0123456789')"
+expect_eq "config apply: hetzner-cloud is lego's hetzner" "$(grep '^ACME_DNS_PROVIDER=' "$FL_ROOT/.env")" "ACME_DNS_PROVIDER=hetzner"
+OUT="$(flip 'export DNS_PROVIDER=hetzner HETZNER_API_KEY=legacy-0123456789 HETZNER_API_TOKEN=cloud-0123456789')"
+case "$OUT" in *"HETZNER_API_TOKEN is set"*rc=1) t_pass "config apply: hetzner with HETZNER_API_TOKEN refused" ;; *) t_fail "hetzner + token: $OUT" ;; esac
+OUT="$(flip 'export DNS_PROVIDER=hetzner-cloud HETZNER_API_KEY=legacy-0123456789 HETZNER_API_TOKEN=cloud-0123456789')"
+case "$OUT" in *"HETZNER_API_KEY (the legacy DNS API) is set too"*rc=1) t_pass "config apply: hetzner-cloud with HETZNER_API_KEY refused" ;; *) t_fail "hetzner-cloud + key: $OUT" ;; esac
+rm -f "$STUB_DIR/dt/acme-volume"
+
+# compose: Traefik's DNS-01 provider falls back to DNS_PROVIDER (F18).
+REAL_DOCKER="$(PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v "^$WORK" | paste -sd: -)" command -v docker || true)"
+if [ -n "$REAL_DOCKER" ] && "$REAL_DOCKER" compose version >/dev/null 2>&1; then
+  CMP="$WORK/compose-env"; rm -rf "$CMP"; mkdir -p "$CMP"
+  PORTCULLIS_ROOT="$CMP" "$CLI" init --env-only --non-interactive --domain ci.example.org --dns-provider none >/dev/null 2>&1 </dev/null
+  sed -i.bak '/^DNS_PROVIDER=/d; /^ACME_DNS_PROVIDER=/d' "$CMP/.env"
+  prov() { (cd "$HERE/.." && env -u ACME_DNS_PROVIDER "$@" "$REAL_DOCKER" compose -f docker-compose.yml --env-file "$CMP/.env" config --format json 2>/dev/null \
+    | jq -r '.services.traefik.environment.TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_DNSCHALLENGE_PROVIDER'); }
+  expect_eq "compose: Traefik provider falls back to DNS_PROVIDER" "$(prov DNS_PROVIDER=porkbun)" porkbun
+  expect_eq "compose: ACME_DNS_PROVIDER wins" "$(prov DNS_PROVIDER=hetzner-cloud ACME_DNS_PROVIDER=hetzner)" hetzner
+  expect_eq "compose: cloudflare without either" "$(prov)" cloudflare
+  expect_eq "compose: Traefik gets HETZNER_API_TOKEN" "$(cd "$HERE/.." && HETZNER_API_TOKEN=tk-0123456789 "$REAL_DOCKER" compose -f docker-compose.yml --env-file "$CMP/.env" config --format json 2>/dev/null | jq -r .services.traefik.environment.HETZNER_API_TOKEN)" tk-0123456789
+else
+  t_pass "compose: Traefik provider fallback (skipped: no docker compose)"
+fi
+
+# status: the DNS block from the domains service's report.
+DNSR="$WORK/dns-report.json"
+jq -n '
+  def plan(n; wi; st): {name: n, checked_at: "x", can_write: false,
+    items: [{set: "address", name: n, type: "A", want: ["203.0.113.10"], live: ["203.0.113.10"], status: "ok", severity: "ok", fix: "none", steps: []},
+            {set: "caa", name: n, type: "CAA", want: ["a"], live: ["a"], status: "ok", severity: "ok", fix: "none", steps: []},
+            {set: "address", name: ("old." + n), type: "CNAME", want: [], live: ["gone.test."], status: "foreign", severity: "warning", fix: "manual", steps: []}],
+    caa: {issuer: "letsencrypt.org", account_uri: "https://acme/acct/1", would_issue: wi},
+    dnssec: {state: st, zone: n, provider_can_sign: false, ds: [], steps: []}};
+  {main: plan("ci.example.org"; true; "unsigned"), domains: {"team-b.test": plan("team-b.test"; true; "bogus")}}' > "$DNSR"
+SD="$(dt "_st_dns_json \"\$(cat '$DNSR')\" https://acme/acct/1 https://acme/acct/1")"
+expect_eq "status --json: dns.main summary from a fixture report" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.main | del(.checks)')" \
+  '{"address_ok":true,"caa_ok":true,"would_issue":true,"dnssec":"unsigned","foreign":1,"problems":0,"name":"ci.example.org","lost_account":false}'
+expect_eq "status: dnssec bogus is a problem (enrolled domain)" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.domains["team-b.test"] | [.problems, .checks.dnssec, .checks.foreign]')" '[1,0,0]'
+SD="$(dt "_st_dns_json \"\$(jq '.main.caa.would_issue = false' '$DNSR')\" https://acme/acct/1 https://acme/acct/1")"
+expect_eq "status: CAA would_issue false is a problem (even with the URIs equal)" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.main | [.lost_account, .problems]')" '[true,1]'
+SD="$(dt "_st_dns_json \"\$(cat '$DNSR')\" https://acme/acct/2 https://acme/acct/1")"
+expect_eq "status: stale main-domain.env URI is a problem" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.main | [.lost_account, .problems]')" '[true,1]'
+LINES="$(dt "_st_dns_lines \"\$(_st_dns_json \"\$(cat '$DNSR')\" https://acme/acct/2 https://acme/acct/1)\"")"
+case "$LINES" in *"CAA allows another ACME account than Traefik's — fix: ./portcullis dns setup"*"team-b.test: DNSSEC bogus"*) t_pass "status: the lost-account line and the DNSSEC line" ;; *) t_fail "status lines: $LINES" ;; esac
+LINES="$(dt '_st_dns_lines ""')"
+case "$LINES" in *"DNS checks unavailable"*) t_pass "status: DNS checks unavailable without the report" ;; *) t_fail "status unavailable: $LINES" ;; esac
+expect_eq "status: no report = no dns block" "$(dt '_st_dns_json "" "" ""')" "rc=0"
+STF_DNS="$(dt "_st_dns_json \"\$(cat '$DNSR')\" https://acme/acct/1 https://acme/acct/1" | head -n1)"
+jq -n --argjson d "$STF_DNS" '{ok: true, services: [], vault: {active: true}, dns: $d}' > "$STUB_DIR/stf.json"
+STF="$(stf)"
+expect_eq "textfile: portcullis_dns_check lines" "$(printf '%s\n' "$STF" | grep '^portcullis_dns_check{' | sort | paste -sd'|' -)" \
+  'portcullis_dns_check{name="ci.example.org",check="address"} 1|portcullis_dns_check{name="ci.example.org",check="caa"} 1|portcullis_dns_check{name="ci.example.org",check="dnssec"} 1|portcullis_dns_check{name="ci.example.org",check="foreign"} 0|portcullis_dns_check{name="team-b.test",check="address"} 1|portcullis_dns_check{name="team-b.test",check="caa"} 1|portcullis_dns_check{name="team-b.test",check="dnssec"} 0|portcullis_dns_check{name="team-b.test",check="foreign"} 0'
+expect_eq "textfile: portcullis_dnssec_state lines" "$(printf '%s\n' "$STF" | grep '^portcullis_dnssec_state{' | paste -sd'|' -)" \
+  'portcullis_dnssec_state{name="ci.example.org",state="unsigned"} 1|portcullis_dnssec_state{name="team-b.test",state="bogus"} 1'
+jq -n '{ok: true, services: [], vault: {active: true}, dns: null}' > "$STUB_DIR/stf.json"
+expect_eq "textfile: no dns series without the report" "$(stf | grep -c '^portcullis_dns' || true)" 0
+# status --json carries the block (status_run with the report stubbed).
+SJ="$( (require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
+        proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
+        vault_admin_env() { return 1; }
+        dns_status_json() { cat "$DNSR"; }; dns_traefik_account_uri() { echo https://acme/acct/1; }; dns_main_env_uri() { echo https://acme/acct/1; }
+        status_run true 2>/dev/null) || true)"
+expect_eq "status --json: dns.main / dns.domains" "$(printf '%s' "$SJ" | jq -c '[.dns.main.name, (.dns.domains | keys), .ok]')" '["ci.example.org",["team-b.test"],false]'
 
 echo ""
 echo "$PASS passed, $FAIL failed"

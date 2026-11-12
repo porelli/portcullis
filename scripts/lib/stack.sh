@@ -226,6 +226,9 @@ init_run() {
     config_init "" ""
   fi
 
+  # Traefik has run: pin the CAA (written CA-only above) to its account.
+  dns_tighten_main
+
   local d="$PORTCULLIS_DOMAIN"
   echo ""
   ok "Portcullis is running."
@@ -426,6 +429,8 @@ stack_up() {
   pki_files_reload
   config_reload
   wait_healthy 300 vault postgres lldap keycloak
+  # Traefik is up: pin the main domain's CAA to its ACME account.
+  dns_tighten_main
   # If the service account was created or its password changed, restart the Hub
   # (which may have started with a stale/missing password).
   lldap_service_account
@@ -476,6 +481,7 @@ upgrade_run() {
   signin_ca_reload
   config_reload
   wait_healthy 300 vault postgres lldap keycloak
+  dns_tighten_main
   keycloak_configure false
   oidc_register
   # If the service account was created or its password changed, restart the Hub

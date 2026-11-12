@@ -635,7 +635,7 @@ network_check() { :; }
 stack_prepare() { :; }
 sessions_restart_if_changed() { echo sessions_restart_if_changed >> "$DC_CALLS"; }
 dns_setup() { [ \$# -eq 3 ] || { echo "dns_setup: want 3 arguments" >&2; return 1; }; }
-dns_tighten_main() { :; }
+dns_tighten_main() { wc -l < "$DC_CALLS" | tr -d " " > "$WORK/tighten-at"; }
 config_init() { :; }
 invite_create() { echo '{"url":"http://test","expires_at":"never"}'; }
 lldap_service_account() {
@@ -670,6 +670,7 @@ expect_eq "init: hub started after the service account step" \
   "$(printf '%s\n' "$calls" | wc -l | tr -d ' ')"
 expect_eq "init: second up is 'up hub'" \
   "$(printf '%s\n' "$calls" | tail -1 | tr -s ' ')" "up hub"
+expect_eq "init: tighten runs at the end (after the Hub's up)" "$(cat "$WORK/tighten-at" 2>/dev/null)" "$(printf '%s\n' "$calls" | wc -l | tr -d ' ')"
 
 # Test stack_up and upgrade_run: restart hub only when lldap_service_account changed.
 # Set up VAULT_INIT_FILE
@@ -699,6 +700,7 @@ hub_pinned_warn() { :; }
 backup_create() { :; }
 hub_policy_check() { :; }
 hub_sources_sync() { :; }
+dns_tighten_main() { echo dns_tighten_main >> "$DC_CALLS"; }
 lldap_service_account() {
   LLDAP_SA_CHANGED=false
   [ -f "\$LLDAP_ACCOUNT_CHANGED" ] && LLDAP_SA_CHANGED=true
@@ -744,6 +746,8 @@ rm -f "$DC_CALLS"
 )
 expect_eq "up: account changed, hub restarted" \
   "$(grep -c '^restart.*hub' "$DC_CALLS" 2>/dev/null || true)" 1
+expect_eq "up: the CAA tighten runs once, after compose up" \
+  "$(grep -E '^(up|dns_tighten_main)' "$DC_CALLS" | paste -sd' ' - | cut -c1-2)$(grep -c '^dns_tighten_main$' "$DC_CALLS")" "up1"
 
 # upgrade_run when account changed: restart hub.
 touch "$LLDAP_ACCOUNT_CHANGED"
@@ -763,6 +767,7 @@ rm -f "$DC_CALLS"
 )
 expect_eq "upgrade: account changed, hub restarted" \
   "$(grep -c '^restart.*hub' "$DC_CALLS" 2>/dev/null || true)" 1
+expect_eq "upgrade: the CAA tighten runs once" "$(grep -c '^dns_tighten_main$' "$DC_CALLS")" 1
 
 # upgrade_run when account unchanged: no restart.
 rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
