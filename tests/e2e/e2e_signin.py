@@ -2255,8 +2255,16 @@ def main() -> int:
             return ctx, page, key
 
         def imp_post(caller: str, target: str, body_: dict, token: str = "") -> tuple[int, str]:
+            """The start route on the Hub listener; a refusal's audited
+            detail (the Hub's reason, never a proof value) is printed."""
             headers = {"X-Forwarded-Access-Token": token} if token else {}
-            return hub_as(caller, "POST", f"/api/directory/users/{target}/impersonation", body_, headers=headers)
+            code, out = hub_as(caller, "POST", f"/api/directory/users/{target}/impersonation", body_, headers=headers)
+            if code != 200:
+                last = sorted((e for e in audit_entries("impersonation.start") if e.get("result") == "refused"
+                               and e.get("actor") == caller and e.get("target") == target),
+                              key=lambda e: str(e.get("time") or e.get("at") or ""))[-1:]
+                print(f"    start {caller} → {target} refused (HTTP {code}); audit: {[e.get('detail') for e in last]}", flush=True)
+            return code, out
 
         def imp_begin(page: Page, label: str, caller: str = "root", target: str = "alice") -> dict:
             """The fresh sign-in in page, then the start: {id, next, until}."""
@@ -2380,10 +2388,13 @@ def main() -> int:
                 assert session_ids("root") == {root_sid}, f"root's session changed across prompt=login: {session_ids('root')}"
                 # Keycloak keeps only the fresh sign-in's methods in the
                 # session after prompt=login (run 43174939742: mtls before,
-                # hwk alone after): shown here, then root steps up to his
+                # the impersonation hwk alone; run 43183771383 read the
+                # session's amr with one more fresh-auth authorize here,
+                # ['hwk'] — which also replaced the proof's client session, so
+                # its code then failed: no authorize between the proof and
+                # the start any more), so root then steps up to his
                 # YubiKey certificate (step-ups accumulate) so the session
                 # has both for imp_call5.
-                print(f"    root's session amr after the fresh sign-in: {fresh_auth(page, 'imp1-sso').get('amr')}", flush=True)
                 ctxc = new_context(client_cert=root_cert, storage_state=ctx.storage_state(),
                                    origins=(AUTH, HUB, PEOPLE, MAIN, ECHO_STD, ECHO_CERT, ECHO_FILE))
                 ctx.close()
