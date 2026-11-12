@@ -363,6 +363,14 @@ def kc(path: str, method: str = "GET"):
         return json.loads(raw) if raw else None
 
 
+def kc_put(path: str, doc: dict) -> None:
+    kc("")  # a fresh admin token if needed
+    req = urllib.request.Request(f"{KC_ADMIN}/admin/realms/portcullis{path}", method="PUT", data=json.dumps(doc).encode(),
+                                 headers={"Authorization": "Bearer " + _kc["token"], "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        r.read()
+
+
 def kc_user_id(username: str) -> str | None:
     users = kc("/users?" + urllib.parse.urlencode({"username": username, "exact": "true"}))
     return users[0]["id"] if users else None
@@ -1641,9 +1649,10 @@ def main() -> int:
             rc, code = curl_tls(f"echo-cert.{DOMAIN}", full, key)
             print(f"    browser certificate + chain on echo-cert: curl exit {rc}, HTTP {code}", flush=True)
             # 35 (CURLE_SSL_CONNECT_ERROR) / 56 (CURLE_RECV_ERROR: TLS 1.3's
-            # alert after the client's Certificate): the handshake refused,
+            # alert after the client's Certificate) / 55 (CURLE_SEND_ERROR:
+            # that alert while curl sends the request, run 43173240200): the handshake refused,
             # nothing else (a timeout, DNS, a bad file) counts.
-            assert rc in (35, 56) and code == "000", \
+            assert rc in (35, 55, 56) and code == "000", \
                 f"echo-cert with a browser certificate: curl exit {rc}, HTTP {code} (want a handshake refusal, 35 / 56)"
             # The same files complete the handshake where browser
             # certificates are accepted: the refusal above is the option's.
@@ -1855,7 +1864,7 @@ def main() -> int:
                 rc, code = curl_tls(f"echo-anycert.{DOMAIN}", full, key)
                 print(f"    browser certificate + chain on echo-anycert with browser_cert off: curl exit {rc}, "
                       f"HTTP {code}", flush=True)
-                assert rc in (35, 56) and code == "000", \
+                assert rc in (35, 55, 56) and code == "000", \
                     f"echo-anycert with browser_cert off: curl exit {rc}, HTTP {code} (want a handshake refusal, 35 / 56)"
                 # Keycloak: the .p12 alone signs nobody in.
                 uid = kc_user_id("alice")
@@ -2317,7 +2326,18 @@ def main() -> int:
             # imp_call5's "the person's certificate never counts".
             cert, key = vault_issue("alice")
             state["imp_alice_cert"] = cert_files(cert, key, "alice-imp-yk")
-            assert not (kc(f"/users/{kc_user_id('alice')}").get("requiredActions") or []), "alice has a required action"
+            # carol's remove-passkeys (sign_in_help_actions) left alice the
+            # passkey registration action: a start on her is refused (rule 6)
+            # until it's gone; cleared here through Keycloak's admin API.
+            uid = kc_user_id("alice")
+            actions = kc(f"/users/{uid}").get("requiredActions") or []
+            print(f"    alice's required actions: {actions}", flush=True)
+            if actions:
+                code, out = imp_post("root", "alice", {"reason": IMP_REASON, "code": "x", "code_verifier": "x", "nonce": "x"})
+                print(f"    a start on alice with {actions}: HTTP {code} {out.strip()[:100]!r}", flush=True)
+                assert code == 409 and "unfinished sign-in step" in out, f"HTTP {code} {out[:200]}"
+                kc_put(f"/users/{uid}", {"requiredActions": []})
+                assert not (kc(f"/users/{uid}").get("requiredActions") or []), "alice's required actions stay"
             # A token for alice's People MCP, minted before any start.
             ctx = new_context(client_cert=state["imp_alice_cert"], origins=(AUTH, PEOPLE))
             try:
@@ -2331,14 +2351,13 @@ def main() -> int:
             print(f"    alice's People MCP before the start: rc {rc}, {len(names)} tools", flush=True)
             assert rc == 0 and names, f"alice's People MCP token: {json.dumps(doc)[:300]}"
             state["alice_ai_tf"] = tf
-            # root's earlier sessions out: imp_start then sees his one session end.
-            uid = kc_user_id("root")
-            kc(f"/users/{uid}/logout", "POST")
-            until("root has no Keycloak session", lambda: kc_sessions("root") == [], 20, every=2)
         check("imp_setup: AI on (Claude Code offered); signing in as someone else allowed, max 2 minutes, none "
               "running; alice's People MCP token minted before any start answers tools/list", imp_setup)
 
         def imp_start():
+            # root's earlier sessions out: then his one session ends at the start.
+            kc(f"/users/{kc_user_id('root')}/logout", "POST")
+            until("root has no Keycloak session", lambda: kc_sessions("root") == [], 20, every=2)
             ctx, page, key = root_session("imp1")
             try:
                 before = token_claims(page)
