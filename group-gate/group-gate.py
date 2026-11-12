@@ -1141,19 +1141,22 @@ def normalize_path_candidates(raw_uri: str) -> List[str]:
 
 # The Sign-in page's paths on people.<domain> (contract §4 "Sign-in
 # paths"): exactly these, or under these prefixes.
-SIGNIN_EXACT = ("/signin", "/api/me/signin", "/impersonation/stop", "/api/me/impersonation",
-                "/api/me/impersonation/stop")
+SIGNIN_EXACT = ("/signin", "/api/me/signin")
+# The impersonation Stop page and its two routes join them ONLY for a live
+# impersonation (so Stop is always reachable); for any other session they
+# are ordinary people.<domain> paths under the people template.
+SIGNIN_IMPERSONATION_EXACT = ("/impersonation/stop", "/api/me/impersonation", "/api/me/impersonation/stop")
 SIGNIN_PREFIXES = ("/api/me/signin/", "/static/")
 _ENCODED_SEPARATOR_RE = re.compile(r"%(2[fF]|5[cC])")
 
 
-def signin_path(host: str, raw_path: str) -> bool:
+def signin_path(host: str, raw_path: str, impersonated: bool = False) -> bool:
     """True when the request is for the Sign-in page on people.<main
     domain> (the one host it lives on): normalize_path_candidates(raw_path)
     doesn't raise and EVERY candidate it returns is exactly one of
-    SIGNIN_EXACT (the Sign-in page, and the impersonation Stop page and its
-    two routes, so Stop is always reachable), or under /api/me/signin/ or
-    /static/. Anything else —
+    SIGNIN_EXACT, or under /api/me/signin/ or /static/ — or, only when
+    `impersonated` (a live impersonation), exactly one of
+    SIGNIN_IMPERSONATION_EXACT (the Stop page and its two routes). Anything else —
     another host, a path with an encoded '/' or '\\' or a literal '\\',
     a '..' leaving the set in any reading — is not (the host's template
     applies)."""
@@ -1166,8 +1169,9 @@ def signin_path(host: str, raw_path: str) -> bool:
         candidates = normalize_path_candidates(raw_path)
     except PathError:
         return False
+    exact = SIGNIN_EXACT + (SIGNIN_IMPERSONATION_EXACT if impersonated else ())
     return bool(candidates) and all(
-        c in SIGNIN_EXACT or any(c.startswith(p) and len(c) > len(p) for p in SIGNIN_PREFIXES)
+        c in exact or any(c.startswith(p) and len(c) > len(p) for p in SIGNIN_PREFIXES)
         for c in candidates)
 
 
@@ -2823,7 +2827,7 @@ class Handler(BaseHTTPRequestHandler):
         administrator (`bound_cert_method(leaf, rec["admin"])`), and an
         unmet template gets the needs page's impersonation form: never a
         step-up, never the present-certificate page."""
-        if signin_path(host, raw_uri):
+        if signin_path(host, raw_uri, impersonated=rec is not None):
             on = _canonical(doc["methods"])
             rule = {"op": "any", "items": on} if on else None
             if rule is None:

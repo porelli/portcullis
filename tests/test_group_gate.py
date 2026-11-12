@@ -3359,20 +3359,41 @@ class ImpersonationTest(GateTest):
         self.assertIn('id="pc-imp-banner"', body)
 
     def test_imp_signin_paths(self):
-        for p in ("/impersonation/stop", "/api/me/impersonation", "/api/me/impersonation/stop"):
+        imp_paths = ("/impersonation/stop", "/api/me/impersonation", "/api/me/impersonation/stop")
+        for p in imp_paths:
             with self.subTest(path=p):
-                self.assertTrue(gg.signin_path("people.example.com", p))
-                self.assertFalse(gg.signin_path("hub.example.com", p))
+                self.assertTrue(gg.signin_path("people.example.com", p, impersonated=True))
+                # Only for a live impersonation (security review ruling).
+                self.assertFalse(gg.signin_path("people.example.com", p))
+                self.assertFalse(gg.signin_path("hub.example.com", p, impersonated=True))
         for p in ("/impersonation/stop/../api/directory", "/impersonation", "/impersonation/stop/x",
                   "/api/me/impersonation/", "/api/me/impersonation/stopx", "/impersonation%2Fstop"):
             with self.subTest(bad=p):
-                self.assertFalse(gg.signin_path("people.example.com", p))
-        self.assertEqual(gg.SIGNIN_EXACT, ("/signin", "/api/me/signin", "/impersonation/stop",
-                                           "/api/me/impersonation", "/api/me/impersonation/stop"))
-        # Stop reachable from a session people.<d>'s template refuses.
-        write_policy({"methods": ALL_ON})
-        self.assertEqual(self.imp(host="people.example.com", groups="", amr=["spk"],
-                                  uri="/api/me/impersonation/stop")[0], 200)
+                self.assertFalse(gg.signin_path("people.example.com", p, impersonated=True))
+        # Part 2's set is unchanged; the three are their own list.
+        self.assertEqual(gg.SIGNIN_EXACT, ("/signin", "/api/me/signin"))
+        self.assertEqual(gg.SIGNIN_IMPERSONATION_EXACT, imp_paths)
+        self.assertTrue(gg.signin_path("people.example.com", "/signin"))
+        # Stop reachable from an impersonated session people.<d>'s template
+        # refuses; a weak normal session on the same paths gets the people
+        # template's answer (step-up or needs page), like any other route.
+        write_policy({"methods": ALL_ON, "people": {"alice": ["passkey_synced"], "bob": ["passkey_synced"]}})
+        for p in imp_paths:
+            with self.subTest(live=p):
+                code, hdrs, body = self.imp(host="people.example.com", groups="", amr=["spk"], uri=p)
+                self.assertEqual(code, 200, body)
+                self.assertEqual(hdrs.get("X-Forwarded-Impersonation"), IMP_ID)
+            for user in ("alice", "bob"):
+                with self.subTest(normal=p, user=user):
+                    code, hdrs, body = self.page(host="people.example.com", groups="", amr=["spk"], uri=p, user=user)
+                    self.assertEqual(code, 403)
+                    self.assertTrue('id="needs-stronger"' in body or "X-Stepup-URL" in hdrs, body)
+            with self.subTest(normal_stepup=p):
+                write_policy({"methods": ALL_ON, "people": {"bob": ["passkey_synced", "security_key"]}})
+                code, hdrs, body = self.page(host="people.example.com", groups="", amr=["spk"], uri=p)
+                self.assertEqual(code, 403)
+                self.assertIn("X-Stepup-URL", hdrs)
+                write_policy({"methods": ALL_ON, "people": {"alice": ["passkey_synced"], "bob": ["passkey_synced"]}})
         self.assertEqual(self.imp(host="people.example.com", groups="", amr=["spk"], uri="/")[0], 403)
 
     def test_banner_reason_escaped(self):
