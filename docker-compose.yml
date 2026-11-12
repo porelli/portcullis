@@ -440,6 +440,11 @@ services:
       - --truststore-paths=/opt/keycloak/conf/truststores/portcullis
       # Re-fetch Vault's CRL at least every 60s (default: until nextUpdate).
       - --spi-crl-storage--infinispan--cache-time=60
+      # Keycloak's own impersonation (contract §8 "Stock impersonation off"):
+      # the admin console's "Impersonate" and POST …/users/{id}/impersonation
+      # answer "feature disabled", so no impersonation skips the fresh touch,
+      # the reason or the record (the extension's portcullis-impersonate start).
+      - --features-disabled=impersonation
     environment:
       KC_DB: postgres
       KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
@@ -450,6 +455,9 @@ services:
       # The Sign-in page the extension's needs-stronger page links to
       # (contract §8.1; unset = the account console).
       PORTCULLIS_SIGNIN_URL: https://people.${PORTCULLIS_DOMAIN:-portcullis.local}/signin
+      # Where an impersonation start sends the browser (contract §8, §8.1;
+      # unset or not http(s) = every start refused).
+      PORTCULLIS_PORTAL_URL: https://${PORTCULLIS_DOMAIN:-portcullis.local}/
     ports:
       - "127.0.0.1:8080:8080"
     volumes:
@@ -627,7 +635,7 @@ services:
       # client's request first, so none of them can be spoofed. X-Forwarded-User /
       # X-Auth-Request-User / X-Auth-Request-Preferred-Username = LLDAP username
       # (never the user-editable email, nor Keycloak's user id).
-      traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,Authorization,X-Forwarded-Access-Token
+      traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,Authorization,X-Forwarded-Access-Token,X-Forwarded-Impersonator,X-Forwarded-Impersonation
       # Attribute headers (contract §5) come only from group-gate. Traefik
       # deletes every request header matching the regex before copying the
       # auth server's matches: oauth2-proxy returns none, so this strips
@@ -637,7 +645,7 @@ services:
       # console's own bearer token must reach the admin API).
       traefik.http.middlewares.portcullis-auth-console.forwardauth.address: http://forward-auth:4180
       traefik.http.middlewares.portcullis-auth-console.forwardauth.trustForwardHeader: "true"
-      traefik.http.middlewares.portcullis-auth-console.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,X-Forwarded-Access-Token
+      traefik.http.middlewares.portcullis-auth-console.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,X-Forwarded-Access-Token,X-Forwarded-Impersonator,X-Forwarded-Impersonation
       traefik.http.middlewares.portcullis-auth-console.forwardauth.authResponseHeadersRegex: ^X-Forwarded-Attr-
       # oauth2-proxy's own endpoints (/oauth2/callback, /oauth2/start for
       # group-gate's step-up, /oauth2/sign_out) live ONLY on auth.<domain>.
@@ -718,7 +726,7 @@ services:
       # (rendered by the Hub); the same headers, so the same stripping.
       traefik.http.middlewares.portcullis-auth-ext.forwardauth.address: http://forward-auth-ext:4180
       traefik.http.middlewares.portcullis-auth-ext.forwardauth.trustForwardHeader: "true"
-      traefik.http.middlewares.portcullis-auth-ext.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,Authorization,X-Forwarded-Access-Token
+      traefik.http.middlewares.portcullis-auth-ext.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,Authorization,X-Forwarded-Access-Token,X-Forwarded-Impersonator,X-Forwarded-Impersonation
       traefik.http.middlewares.portcullis-auth-ext.forwardauth.authResponseHeadersRegex: ^X-Forwarded-Attr-
     restart: unless-stopped
     depends_on:
@@ -780,6 +788,10 @@ services:
       GATE_YUBIKEY_CA_FILE: /etc/group-gate/ca/yubikey-ca.crt
       GATE_BROWSER_CA_FILE: /etc/group-gate/ca/browser-ca.crt
       GATE_OPENED_DIR: /data/opened
+      # The Hub's impersonation.json (contract §4 "Impersonated requests",
+      # sign-in part 3): missing, invalid or older than 300 s = no
+      # impersonation counts (impersonated requests denied).
+      GATE_IMPERSONATION_FILE: /hub-data/impersonation.json
       # Required: core hosts are <sub>.<PORTCULLIS_DOMAIN> (map.conf) and
       # app hosts <label>.<PORTCULLIS_DOMAIN> or on an enrolled domain
       # (policy v5 extra_domains); any other X-Forwarded-Host is denied.
@@ -805,7 +817,10 @@ services:
       # unchanged on allow (the Keycloak console keeps its own bearer behind
       # portcullis-auth-console) and withholds both when it stripped an
       # expired membership the token still names — Traefik then deletes them.
-      traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,Authorization,X-Forwarded-Access-Token
+      # X-Forwarded-Impersonator / X-Forwarded-Impersonation (contract §5,
+      # sign-in part 3): group-gate's on a live impersonation only; listed on
+      # all four forward-auth middlewares so a client-sent copy never survives.
+      traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,Authorization,X-Forwarded-Access-Token,X-Forwarded-Impersonator,X-Forwarded-Impersonation
       # The user's shared custom fields (user-attributes.json in hub_data,
       # contract §4.1/§5) on every allowed request; client copies are deleted
       # first (forwardAuth removes all request headers matching the regex).
@@ -909,6 +924,10 @@ services:
       HUB_CLIENT_CERT_TTL: ${CLIENT_CERT_TTL:-720h}
       HUB_CERT_EXPIRY_WARN_DAYS: ${CERT_EXPIRY_WARN_DAYS:-7}
       HUB_GROUP_GATE_DATA_DIR: /group-gate-data
+      # Sign-in part 3 (contract §8.1 "Impersonation"): how long a session
+      # as someone else lasts, 1–30 minutes (default 30; only shortens);
+      # anything else and the Hub refuses to start.
+      HUB_IMPERSONATION_MAX_MINUTES: ${IMPERSONATION_MAX_MINUTES:-30}
     volumes:
       - .:/project:ro
       # Writable overlay: before every `compose up` the Hub copies each app's

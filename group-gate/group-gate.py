@@ -1676,6 +1676,9 @@ def load_impersonation_file(now: Optional[float] = None) -> Optional[dict]:
                 except ValueError as e:  # json.JSONDecodeError and UnicodeDecodeError are ValueErrors
                     # Field names and positions only: never a value of the file.
                     err = f"is invalid ({str(e)[:160]})"
+                except Exception as e:  # RecursionError (deep nesting) and any other parse failure
+                    # Cached like the others: logged once per change, never retried per request.
+                    err = f"is invalid ({type(e).__name__})"
             _IMP_CACHE.clear()
             _IMP_CACHE.update(stamp=stamp, doc=doc)
             if err:
@@ -2530,7 +2533,8 @@ def _signin_page(title: str, body: str, banner: str = "") -> bytes:
 
 def render_stepup_page(app: str, method: str, url: str, banner: str = "") -> bytes:
     """"<App> needs <method>" with a Continue button (#stepup-continue) to
-    the step-up URL."""
+    the step-up URL. `banner` is for completeness (every group-gate page
+    takes one): an impersonated request never gets a step-up (D39)."""
     title = f"{app} needs a {METHOD_WORDS[method]}"
     e_url = html.escape(url, quote=True)
     return _signin_page(title, f"<p><a id=\"stepup-continue\" class=\"btn\" href=\"{e_url}\" autofocus>Continue</a></p>",
@@ -2547,7 +2551,9 @@ CERTIFICATE_PAGE = {
 def render_certificate_page(app: str, method: str, banner: str = "") -> bytes:
     """The present-certificate page (#present-certificate) for `method`
     (yubikey_cert or browser_cert): signing in again can't help, this
-    request must carry the person's own certificate of that kind."""
+    request must carry the person's own certificate of that kind.
+    `banner` is for completeness (every group-gate page takes one): an
+    impersonated request never gets this page (D39)."""
     kind, ask = CERTIFICATE_PAGE[method]
     return _signin_page(
         f"{app} needs your {kind} certificate",
@@ -2575,7 +2581,8 @@ def render_needs_page(app: str, have: set, node, set_up: Optional[set], add_stro
     e = html.escape
     if impersonated is not None:
         missing = _canonical({m for alt in alternatives(node) for m in alt if m not in have})
-        words = " or ".join(f"a {html.escape(METHOD_WORDS[m])}" for m in missing)
+        # Nothing named as missing (e.g. a method switched off): the general words.
+        words = " or ".join(f"a {html.escape(METHOD_WORDS[m])}" for m in missing) or "a stronger sign-in"
         stop = e(impersonation_stop_url(domain), quote=True)
         return _signin_page(
             f"{app} needs a stronger sign-in",

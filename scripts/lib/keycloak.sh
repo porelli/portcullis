@@ -370,7 +370,9 @@ keycloak_configure() {
     else
       echo "    amr mapper present"
     fi
+    _kc_impersonation_mapper "$scope_id"
   fi
+  _kc_impersonation_notice
 
   info "Ensuring the groups client scope..."
   if [ "$(kc_get "/$KC_REALM/client-scopes" | jq '[.[] | select(.name == "groups")] | length')" = 0 ]; then
@@ -435,6 +437,55 @@ KC_EMAIL_UNVERIFIED_SCOPE="email-unverified"
 # _kc_email_unverified_scope — create the scope, or reconcile an existing one
 # to exactly one `email` mapper (any other mapper, e.g. an added
 # "email verified", is deleted).
+# _kc_impersonation_mapper <acr scope id> — the sign-in extension's
+# `impersonation` mapper (protocolMapper portcullis-impersonation: the
+# act / pc_imp claims of a session as someone else, contract §8 / §8.1
+# "Impersonation") on the acr client scope, next to amr, so every client
+# with amr carries it. Only here, never in realm-export.json (its
+# clientScopes would replace Keycloak's defaults); found by protocolMapper,
+# so a renamed copy isn't added twice.
+_kc_impersonation_mapper() {
+  local scope_id="$1" code
+  if [ "$(kc_get "/$KC_REALM/client-scopes/$scope_id/protocol-mappers/models" \
+      | jq '[.[]? | select(.protocolMapper == "portcullis-impersonation")] | length')" = 0 ]; then
+    code="$(jq -n '{name: "impersonation", protocol: "openid-connect", protocolMapper: "portcullis-impersonation",
+        config: {"id.token.claim": "true", "access.token.claim": "true", "userinfo.token.claim": "true"}}' \
+      | kc_send POST "/$KC_REALM/client-scopes/$scope_id/protocol-mappers/models")"
+    _kc_report "impersonation mapper" "$code" 201 || true
+  else
+    echo "    impersonation mapper present"
+  fi
+}
+
+# KC_IMP_NOTICE — the notice required action exactly as realm-export.json
+# has it (contract §8 "The notice required action"; the extension's smoke
+# realm holds the same entry).
+KC_IMP_NOTICE='{"alias":"portcullis-impersonation-notice","name":"Impersonation notice","providerId":"portcullis-impersonation-notice","enabled":true,"defaultAction":false,"priority":90,"config":{}}'
+
+# _kc_impersonation_notice — registers the extension's
+# portcullis-impersonation-notice required action when the realm doesn't
+# have it (a realm imported before it existed) and keeps it enabled, not a
+# default action, at its priority. The events config (IMPERSONATE) is the
+# Hub's: never touched here.
+_kc_impersonation_notice() {
+  local ra=portcullis-impersonation-notice cur code
+  cur="$(kc_get "/$KC_REALM/authentication/required-actions/$ra")"
+  if ! printf '%s' "$cur" | jq -e --arg a "$ra" 'type == "object" and .alias == $a' >/dev/null 2>&1; then
+    code="$(jq -c '{providerId, name}' <<<"$KC_IMP_NOTICE" \
+      | kc_send POST "/$KC_REALM/authentication/register-required-action")"
+    _kc_report "$ra required action registered" "$code" 204 201 || return 0
+    cur="$(kc_get "/$KC_REALM/authentication/required-actions/$ra")"
+  fi
+  if printf '%s' "$cur" | jq -e --argjson w "$KC_IMP_NOTICE" '.enabled == true and .defaultAction == false and .priority == $w.priority' >/dev/null 2>&1; then
+    echo "    $ra required action enabled"
+    return 0
+  fi
+  code="$(jq -nc --arg c "$cur" --argjson w "$KC_IMP_NOTICE" \
+      '((try ($c | fromjson) catch {}) | if type == "object" then . else {} end) + ($w | {alias, providerId, enabled, defaultAction, priority})' \
+    | kc_send PUT "/$KC_REALM/authentication/required-actions/$ra")"
+  _kc_report "$ra required action enabled" "$code" 204 || true
+}
+
 _kc_email_unverified_scope() {
   local scope_id rep mappers mid code
   local mapper='{name: "email", protocol: "openid-connect", protocolMapper: "oidc-usermodel-property-mapper",
@@ -788,7 +839,10 @@ API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
   - pushes the X.509 authenticator settings from the file (CRL check against
     Vault's pki_int CRL, trust re-validation, clientAuth EKU) to the realm
   - checks the sign-in executions' AMR reference values (max age 10 h),
-    ensures the amr mapper and groups scope
+    ensures the amr mapper, the sign-in extension's impersonation mapper
+    (both on the acr scope) and groups scope
+  - registers and enables the portcullis-impersonation-notice required
+    action (the person's notice after an administrator signed in as them)
   - ensures the email-unverified scope (email claim, no email_verified) that
     Hub templates opt into with keycloak_clients[].email_verified_claim: false
   - portcullis-forward-auth: acr/groups scopes, no default acr, requires PKCE S256, the

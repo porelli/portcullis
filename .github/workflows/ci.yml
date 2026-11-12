@@ -312,6 +312,21 @@ jobs:
                  .services["group-gate"].labels["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders"]]
               | all(split(",") | index("X-Auth-Request-Preferred-Username") and index("X-Forwarded-User") and index("X-Auth-Request-User"))' >/dev/null \
             || { echo "FAIL: identity headers missing from a forward-auth authResponseHeaders"; exit 1; }
+          # Sign-in part 3 (contract §5, §8): group-gate's impersonation headers are
+          # listed on all four forward-auth middlewares (Traefik deletes client
+          # copies), Keycloak's own impersonation is off, and the impersonation
+          # file / portal URL / max minutes reach their readers.
+          echo "$CFG" | jq -e --arg d "${PORTCULLIS_DOMAIN:-ci.example.org}" '
+              def hdrs($svc; $mw): .services[$svc].labels["traefik.http.middlewares.\($mw).forwardauth.authResponseHeaders"] | split(",");
+              ([hdrs("forward-auth"; "portcullis-auth"), hdrs("forward-auth"; "portcullis-auth-console"),
+                hdrs("forward-auth-ext"; "portcullis-auth-ext"), hdrs("group-gate"; "portcullis-groups")]
+               | all(index("X-Forwarded-Impersonator") and index("X-Forwarded-Impersonation")))
+              and (.services.keycloak.command | index("--features-disabled=impersonation"))
+              and ([.services.keycloak.command[] | select(test("^--features(-enabled)?=.*impersonation"))] == [])
+              and .services.keycloak.environment.PORTCULLIS_PORTAL_URL == "https://\($d)/"
+              and .services["group-gate"].environment.GATE_IMPERSONATION_FILE == "/hub-data/impersonation.json"
+              and .services.hub.environment.HUB_IMPERSONATION_MAX_MINUTES == "30"' >/dev/null \
+            || { echo "FAIL: impersonation wiring (the four middlewares' headers, --features-disabled=impersonation, PORTCULLIS_PORTAL_URL, GATE_IMPERSONATION_FILE, HUB_IMPERSONATION_MAX_MINUTES)"; exit 1; }
           # Expired memberships: group-gate must be able to withhold the token
           # headers, so portcullis-groups lists them (Traefik deletes unreturned ones).
           echo "$CFG" | jq -e '.services["group-gate"].labels["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders"]
@@ -1653,13 +1668,16 @@ jobs:
                 sh -c 'cat > /d/user-attributes.json && chmod 644 /d/user-attributes.json'
           curl -s --cacert certs/ca-chain.crt --resolve "gated.portcullis.local:443:127.0.0.1" \
             -H 'X-Auth-Request-Preferred-Username: testuser' -H "X-Forwarded-Access-Token: $CI_TOKEN_HWK" -H 'X-Forwarded-Attr-City: Forged' -H 'X-Forwarded-Attr-Forged: x' \
-            -H 'x-forwarded-attr-lower: x' https://gated.portcullis.local/ > /tmp/attrs.out || true
+            -H 'x-forwarded-attr-lower: x' -H 'X-Forwarded-Impersonator: root' -H "X-Forwarded-Impersonation: 0f3c$(printf 'a%.0s' $(seq 28))" \
+            -H 'x-forwarded-impersonation: lower' https://gated.portcullis.local/ > /tmp/attrs.out || true
           grep -qx 'X-Forwarded-Attr-City: Milan' <(tr -d '\r' < /tmp/attrs.out) || { echo "FAIL: attribute header missing"; cat /tmp/attrs.out; exit 1; }
           # Per-host header (v2 `hosts`): this host's only, sent verbatim.
           grep -qx 'X-Forwarded-Attr-Gated-Role: Admin, Ops' <(tr -d '\r' < /tmp/attrs.out) || { echo "FAIL: per-host attribute header missing"; cat /tmp/attrs.out; exit 1; }
           if grep -qi 'Other-Role' /tmp/attrs.out; then echo "FAIL: another host's attribute header reached the app"; cat /tmp/attrs.out; exit 1; fi
           if grep -qi 'Forged\|attr-lower' /tmp/attrs.out; then echo "FAIL: client-sent X-Forwarded-Attr-* reached the app"; cat /tmp/attrs.out; exit 1; fi
-          echo "PASS: attribute headers from user-attributes.json; client copies stripped"
+          # Sign-in part 3 (contract §5): group-gate's impersonation headers only; client copies deleted.
+          if grep -qi 'Impersonat' /tmp/attrs.out; then echo "FAIL: a client-sent X-Forwarded-Impersonat* reached the app"; cat /tmp/attrs.out; exit 1; fi
+          echo "PASS: attribute headers from user-attributes.json; client copies (and of the impersonation headers) stripped"
 
           # directory.<domain> redirects to the Hub's directory (people.<domain>).
           loc=$(curl -s -o /dev/null -w '%{redirect_url}' --cacert certs/ca-chain.crt \
@@ -2094,7 +2112,7 @@ jobs:
               {alias: "x509-browser-config", m: "browser_cert", ref: "file", ca: "\($t)/portcullis-browser-ca.pem",
                 crl: "http://vault:8200/v1/pki_file/crl##http://vault:8200/v1/pki_file/crl/delta", abort: "true"}]')" ] \
             || { echo "FAIL: the x509 configs: $X509"; exit 1; }
-          kc /events/config | jq -e '.eventsEnabled and ((.enabledEventTypes | sort) == ["LOGIN", "LOGIN_ERROR"]) and .eventsExpiration > 0' >/dev/null \
+          kc /events/config | jq -e '.eventsEnabled and ((.enabledEventTypes | sort) == ["IMPERSONATE", "LOGIN", "LOGIN_ERROR"]) and .eventsExpiration > 0' >/dev/null \
             || { echo "FAIL: realm events config: $(kc /events/config | jq -c '{eventsEnabled, enabledEventTypes, eventsExpiration}')"; exit 1; }
           kc /authentication/required-actions | jq -e '[.[] | select(.alias | startswith("webauthn-register")) | [.alias, .enabled]] | sort
               == [["webauthn-register", false], ["webauthn-register-passwordless", true]]' >/dev/null \
@@ -2197,6 +2215,59 @@ jobs:
           docker compose exec -T enroll wget -q -O - http://127.0.0.1:8445/oidc/jwks | jq -e '.keys[0].alg == "ES256"' >/dev/null \
             || { echo "FAIL: invite JWKS"; exit 1; }
           echo "PASS: setup links (single owner, revocation, no consumption on view, same-origin redeem), Hub invite API (§9.4)"
+
+      # Sign-in part 3 (contract §8 "Stock impersonation off"): Keycloak runs
+      # with --features-disabled=impersonation, so its own impersonation
+      # answers "feature disabled" even for the master realm's admin.
+      - name: Stock impersonation is off
+        run: |
+          set -o pipefail
+          TOK=$(mktemp); chmod 600 "$TOK"
+          # The CLI's admin token (admin-cli), kept in a file: never on argv.
+          printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+            --data-urlencode client_id=admin-cli --data-urlencode "username=${KEYCLOAK_ADMIN:-admin}" \
+            --data-urlencode grant_type=password --data-urlencode password@- \
+            | jq -r '"Authorization: Bearer " + .access_token' > "$TOK"
+          grep -q '^Authorization: Bearer [^n]' "$TOK" || { echo "FAIL: no admin token"; exit 1; }
+          echo "::add-mask::$(cut -d' ' -f3 "$TOK")"
+          UID_=$(curl -sf -H @"$TOK" "http://127.0.0.1:8080/admin/realms/portcullis/users?username=testuser&exact=true" | jq -r '.[0].id')
+          [ -n "$UID_" ] && [ "$UID_" != null ] || { echo "FAIL: no Keycloak user testuser"; exit 1; }
+          code=$(curl -s -o /tmp/stock-imp.json -w '%{http_code}' -X POST -H @"$TOK" \
+            "http://127.0.0.1:8080/admin/realms/portcullis/users/$UID_/impersonation")
+          rm -f "$TOK"
+          case "$code" in 2??) echo "FAIL: Keycloak's own impersonation answered $code"; exit 1 ;; esac
+          grep -qi 'feature' /tmp/stock-imp.json || { echo "FAIL: the refusal ($code) doesn't name the feature: $(head -c 300 /tmp/stock-imp.json)"; exit 1; }
+          echo "PASS: POST …/users/{id}/impersonation answers $code: $(head -c 200 /tmp/stock-imp.json)"
+
+      # F5: the impersonation mapper exists only through keycloak configure,
+      # on the live acr scope next to amr; the notice action is enabled.
+      - name: acr scope has amr and impersonation
+        run: |
+          set -o pipefail
+          TOK=$(mktemp); chmod 600 "$TOK"
+          printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+            --data-urlencode client_id=admin-cli --data-urlencode "username=${KEYCLOAK_ADMIN:-admin}" \
+            --data-urlencode grant_type=password --data-urlencode password@- \
+            | jq -r '"Authorization: Bearer " + .access_token' > "$TOK"
+          echo "::add-mask::$(cut -d' ' -f3 "$TOK")"
+          kc() { curl -sf -H @"$TOK" "http://127.0.0.1:8080/admin/realms/portcullis$1"; }
+          ACR=$(kc /client-scopes | jq -r '.[] | select(.name == "acr") | .id')
+          [ -n "$ACR" ] || { echo "FAIL: no acr client scope"; exit 1; }
+          M=$(kc "/client-scopes/$ACR/protocol-mappers/models")
+          echo "$M" | jq -e '([.[] | select(.protocolMapper == "oidc-amr-mapper")] | length) == 1
+              and ([.[] | select(.protocolMapper == "portcullis-impersonation")] | length) == 1
+              and ([.[] | select(.protocolMapper == "portcullis-impersonation") | .config
+                    | .["access.token.claim"] == "true" and .["id.token.claim"] == "true" and .["userinfo.token.claim"] == "true"] | all)' >/dev/null \
+            || { echo "FAIL: the acr scope's mappers: $(echo "$M" | jq -c '[.[] | {name, protocolMapper, config}]')"; exit 1; }
+          RA=$(kc /authentication/required-actions/portcullis-impersonation-notice)
+          echo "$RA" | jq -e '.enabled and (.defaultAction | not) and .providerId == "portcullis-impersonation-notice"' >/dev/null \
+            || { echo "FAIL: the notice required action: $RA"; exit 1; }
+          # Idempotent: a second configure adds no second mapper.
+          ./portcullis keycloak configure >/dev/null
+          [ "$(kc "/client-scopes/$ACR/protocol-mappers/models" | jq '[.[] | select(.protocolMapper == "portcullis-impersonation")] | length')" = 1 ] \
+            || { echo "FAIL: a second keycloak configure added another impersonation mapper"; exit 1; }
+          rm -f "$TOK"
+          echo "PASS: the acr scope has amr and the impersonation mapper (access, ID, userinfo), once; the notice action is enabled"
 
       - name: Test users and groups deleted in LLDAP leave Keycloak
         run: |
@@ -2566,6 +2637,21 @@ jobs:
           [ "$(vk "$FA_PW" forward-auth get "$KEY" | wc -c)" -gt 100 ] || { echo "FAIL: the store holds no session for $KEY"; exit 1; }
           expect '*NOPERM*' "forward-auth-ext can't read the session" vk "$FX_PW" forward-auth-ext get "$KEY"
           echo "PASS: one small ticket cookie (${#VAL} bytes), the session under $KEY in the store"
+          # Sign-in part 3 (contract §5): a client-sent X-Forwarded-Impersonation /
+          # -Impersonator never reaches the Hub through portcullis-auth +
+          # portcullis-groups. If it did, the Hub's read-only rule would answer
+          # every POST but Stop with its "Stop first" text (GET
+          # /api/me/impersonation first: the chain reaches the Hub at all).
+          P=(--resolve "people.portcullis.local:443:127.0.0.1")
+          FORGED=(-H 'X-Forwarded-Impersonator: root' -H "X-Forwarded-Impersonation: 0f3c$(printf 'a%.0s' $(seq 28))")
+          code="$("${C[@]}" "${P[@]}" -o /tmp/imp-get.json -w '%{http_code}' "${FORGED[@]}" https://people.portcullis.local/api/me/impersonation)"
+          if [ "$code" != 200 ] || ! jq -e '.active == null' /tmp/imp-get.json >/dev/null; then
+            echo "FAIL: GET people.<d>/api/me/impersonation with forged headers: $code $(head -c 300 /tmp/imp-get.json)"; docker compose logs --tail=20 group-gate; exit 1
+          fi
+          "${C[@]}" "${P[@]}" -o /tmp/imp-post.txt -X POST -H 'Content-Type: application/json' -d '{}' "${FORGED[@]}" \
+            https://people.portcullis.local/api/me/signin/browser-certificates || true
+          if grep -q 'signed in as someone else' /tmp/imp-post.txt; then echo "FAIL: a client-sent X-Forwarded-Impersonation reached the Hub"; exit 1; fi
+          echo "PASS: client-sent impersonation headers never reach the Hub (people.<d> through forward-auth + group-gate)"
           # Signing out deletes it from the store: the same cookie no longer opens anything.
           cp "$J" /tmp/sess-before.jar
           "${C[@]}" -o /dev/null https://auth.portcullis.local/oauth2/sign_out

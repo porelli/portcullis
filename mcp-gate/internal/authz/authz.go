@@ -130,7 +130,16 @@ type claims struct {
 	Exp               *jwt.NumericDate `json:"exp"`
 	Nbf               *jwt.NumericDate `json:"nbf"`
 	Iat               *jwt.NumericDate `json:"iat"`
+	// Act / PcImp: an impersonated session's claims (§8.1 "Impersonation",
+	// §15.2). Only their presence counts: any value, null included (a
+	// RawMessage keeps the literal null), refuses the token.
+	Act   json.RawMessage `json:"act"`
+	PcImp json.RawMessage `json:"pc_imp"`
 }
+
+// ImpersonatedMessage is the answer to a token of an impersonated session
+// (§15.2).
+const ImpersonatedMessage = "a session as someone else can't use AI tools"
 
 // amr is the token's amr claim: a list of strings. Anything else (a
 // string, a list with a non-string) decodes as no methods at all, so the
@@ -162,7 +171,8 @@ func bearer(h string) (string, bool) {
 
 // Check decides one request against the snapshot (§15.2). Order: the
 // configuration, the resource, the token (401), then what the token's
-// person may do (403: scope, population, sign-in rule, Origin).
+// person may do (403: scope, impersonated, population, sign-in rule,
+// Origin).
 func (v *Verifier) Check(ctx context.Context, sn *config.Snapshot, r Request) Decision {
 	if r.BadTarget {
 		return Decision{Status: http.StatusBadRequest, Reason: "bad_target", Message: "bad request target"}
@@ -242,6 +252,14 @@ func (v *Verifier) Check(ctx context.Context, sn *config.Snapshot, r Request) De
 		d.Reason = "scope"
 		d.WWWAuthenticate = `Bearer error="insufficient_scope", scope="` + res.Scope + `", resource_metadata="` + meta + `"`
 		d.Message = "insufficient scope"
+		return d
+	}
+	// Never impersonated (§15.2, sign-in part 3): a session as someone else
+	// never reaches an AI tool, whatever its population or methods. Before
+	// membership, so the refusal says why.
+	if c.Act != nil || c.PcImp != nil {
+		d.Reason = "impersonated"
+		d.Message = ImpersonatedMessage
 		return d
 	}
 	// Membership first (as group-gate and the aggregate's admit): a

@@ -43,7 +43,7 @@
   "webAuthnPolicyPasswordlessCreateTimeout": 60,
   "webAuthnPolicyPasswordlessAvoidSameAuthenticatorRegister": true,
   "eventsEnabled": true,
-  "enabledEventTypes": ["LOGIN", "LOGIN_ERROR"],
+  "enabledEventTypes": ["LOGIN", "LOGIN_ERROR", "IMPERSONATE"],
   "eventsExpiration": 31536000,
   "attributes": {
     "acr.loa.map": "{}"

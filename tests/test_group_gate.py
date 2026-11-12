@@ -3240,6 +3240,35 @@ class ImpersonationTest(GateTest):
             gg.json.load = real
         self.assertEqual(calls, [])
 
+    def test_imp_file_too_deep_cached_and_logged_once(self):
+        # json.load raises RecursionError (not a ValueError) on deep
+        # nesting: still "invalid", cached, logged once, no crash.
+        self.write_imp(raw="[" * 200000 + "]" * 200000)
+        calls = []
+        real = gg.json.load
+        gg.json.load = lambda f: calls.append(1) or real(f)
+        try:
+            (results, out) = self.logged(lambda: [gg.load_impersonation_file() for _ in range(3)])
+        finally:
+            gg.json.load = real
+        self.assertEqual(results, [None, None, None])
+        self.assertEqual(calls, [1])
+        self.assertEqual(len(out.splitlines()), 1, out)
+        self.assertIn("is invalid", out)
+        self.assert_ended(self.imp())
+        self.assertEqual(self.page(user="alice")[0], 200)
+
+    def test_imp_needs_page_without_missing_methods(self):
+        # Nothing of the rule is missing from `have` (e.g. a switched-off
+        # method): the fallback words, never "needs ." with nothing.
+        now = time.time()
+        rec = {"id": IMP_ID, "admin": "root", "target": "alice", "reason": IMP_REASON, "until": now + 600,
+               "ended": None}
+        b = gg.render_needs_page("App", {"security_key", "yubikey_cert"}, STRONG, None, False, "example.com",
+                                 impersonated=rec).decode()
+        self.assertIn("App needs a stronger sign-in. root&#x27;s sign-in didn&#x27;t use them", b)
+        self.assertNotIn("needs .", b)
+
     def test_imp_claims_from_access_token_only(self):
         tok = token(amr=["hwk"], preferred_username="alice", **self.claims(until=int(time.time()) - 5))
         # In Authorization only (the Keycloak console's route): not read.
