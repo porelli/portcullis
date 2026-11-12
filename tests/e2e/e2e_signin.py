@@ -2206,7 +2206,13 @@ def main() -> int:
             assert "password" in got["pat"], got["pat"]
             rows = {m["id"]: m["state"] for m in people_json("alice", "GET", "/api/me/signin")["methods"]}
             assert rows["yubikey_cert"] == "set", rows
-            rows = {m["id"]: m["state"] for m in people_json("pat", "GET", "/api/me/signin")["methods"]}
+            # The password method is off here ("off" on the row): on for the check.
+            password_switch(True)
+            try:
+                rows = until("pat's /api/me/signin lists his password", lambda: (lambda r: r["password"] == "set" and r)(
+                    {m["id"]: m["state"] for m in people_json("pat", "GET", "/api/me/signin")["methods"]}), 60, every=3)
+            finally:
+                password_switch(False)
             assert rows["password"] == "set" and all(rows[k] != "set" for k in ("security_key", "passkey_device",
                                                                                  "passkey_synced", "yubikey_cert",
                                                                                  "browser_cert")), rows
@@ -3089,7 +3095,9 @@ def main() -> int:
             assert kc_types("rita") == [], f"--replace-keys left {kc_types('rita')}"
             try:
                 kind_identified("rita", "security_key", link)
-                gone = {c["id"] for c in old_creds} & {c["id"] for c in kc(f"/users/{uid}/credentials")}
+                # (the LDAP federation's password entry has no id: passkeys only)
+                gone = {c.get("id") for c in old_creds} & {c.get("id") for c in kc(f"/users/{uid}/credentials")
+                                                          if c.get("type") in PASSKEY_TYPES}
                 assert not gone, "rita's old credential is still there"
             except Exception as e:  # noqa: BLE001
                 errors.append(f"security_key: {redact(str(e))}")
