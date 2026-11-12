@@ -212,9 +212,6 @@ type View struct {
 func (s *Service) viewLocked(d *Domain) View {
 	v := View{Name: d.Name, Provider: d.Provider, RecordsOK: d.RecordsOK, LastError: d.LastError, State: d.State,
 		CAAOK: d.CAAOK, DNSSEC: d.DNSSEC}
-	if v.DNSSEC == "" {
-		v.DNSSEC = string(dnssec.Unknown)
-	}
 	// cert_not_after is the expiry of the certificate actually served.
 	if d.CertNotAfter != nil && servable(d, s.cfg.MainDomain, s.cfg.Now()) == nil {
 		t := d.CertNotAfter.UTC().Format(time.RFC3339)
@@ -869,12 +866,8 @@ func (s *Service) refreshChecks(ctx context.Context, name string, gen int, p dns
 	s.mu.Lock()
 	s.plans[name] = cachedPlan{plan: pl, at: s.cfg.Now()}
 	s.mu.Unlock()
+	// caa_ok (contract §12.2): the CA would issue to the service's account.
 	caaOK := s.cfg.CAA && s.cfg.CAAIssuer != "" && pl.CAA.WouldIssue
-	for _, it := range pl.Items {
-		if it.Set == dnsplan.SetCAA && it.Status != dnsplan.StatusOK && it.Status != dnsplan.StatusForeign {
-			caaOK = false
-		}
-	}
 	s.update(name, gen, func(d *Domain) { d.CAAOK, d.DNSSEC = caaOK, string(pl.DNSSEC.State) })
 }
 

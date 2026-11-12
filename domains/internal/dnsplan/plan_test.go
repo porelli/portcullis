@@ -92,7 +92,7 @@ func TestBuildAllOK(t *testing.T) {
 			t.Errorf("item %+v", it)
 		}
 	}
-	if p.DNSSEC.State != dnssec.Unsigned || p.DNSSEC.Zone != pz {
+	if p.DNSSEC.State != dnssec.Unsigned || p.DNSSEC.Zone != "example.test" {
 		t.Fatalf("dnssec %+v", p.DNSSEC)
 	}
 }

@@ -630,9 +630,11 @@ func nomailItems(ctx context.Context, in Input, d string, fix Fix) []Item {
 				}
 			}
 		}
-		want := []string{"MX " + d + " 0 .", "TXT " + d + " " + spfNone, "TXT _dmarc." + d + " " + dmarcReject}
-		steps := []string{d + " sends no mail: publishing the nomail set (null MX, SPF -all, DMARC reject) stops others sending as it"}
-		return []Item{{Set: SetNoMail, Name: d, Type: "MX", Want: want, Live: []string{}, Status: StatusMissing, Severity: SevInfo, Fix: fix, Steps: steps}}
+		steps := []string{d + " has no MX and no SPF: publishing the nomail set (null MX, SPF -all, DMARC reject) stops others sending mail as it",
+			fmt.Sprintf("add MX %s 0 . (TTL %d)", d, int(TTLNoMail/time.Second)),
+			fmt.Sprintf("add TXT %s %s (TTL %d)", d, spfNone, int(TTLNoMail/time.Second)),
+			fmt.Sprintf("add TXT _dmarc.%s %s (TTL %d)", d, dmarcReject, int(TTLNoMail/time.Second))}
+		return []Item{{Set: SetNoMail, Name: d, Type: "MX", Want: []string{"0 ."}, Live: []string{}, Status: StatusMissing, Severity: SevInfo, Fix: fix, Steps: steps}}
 	}
 	dm := lookup(ctx, in.Resolvers, "_dmarc."+d, dns.TypeTXT)
 	spfOnly := func(v resolverView) resolverView {
@@ -715,7 +717,7 @@ func foreignItems(ctx context.Context, in Input, d string, live []liveRec) []Ite
 
 func dnssecInfo(ctx context.Context, in Input, d string) DNSSECInfo {
 	r := dnssec.Check(ctx, in.Resolvers, d)
-	info := DNSSECInfo{State: r.State, Zone: r.Zone, ProviderCanSign: in.CanSign, DS: r.DS, Steps: []string{}}
+	info := DNSSECInfo{State: r.State, Zone: bare(r.Zone), ProviderCanSign: in.CanSign, DS: r.DS, Steps: []string{}}
 	if in.DNSSEC != nil && r.Zone != "" {
 		if _, ds, err := in.DNSSEC.DNSSECStatus(ctx, r.Zone); err == nil && len(ds) > 0 {
 			info.DS = ds
