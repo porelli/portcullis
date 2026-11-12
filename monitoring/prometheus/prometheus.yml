@@ -85,8 +85,13 @@ scrape_configs:
     static_configs:
       - targets: ["http://enroll:8443/healthz"]
         labels: {service: enroll}
-      - targets: ["http://forward-auth:4180/ping"]
+      # /ready, not /ping: oauth2-proxy (v7.15.5) answers /ready only after
+      # a PING to its session store (the sessions service) succeeds, so a
+      # store that is up but refusing the proxy shows here at once.
+      - targets: ["http://forward-auth:4180/ready"]
         labels: {service: forward-auth}
+      - targets: ["http://forward-auth-ext:4180/ready"]
+        labels: {service: forward-auth-ext}
       - targets: ["http://hub:8888/healthz"]
         labels: {service: hub}
       - targets: ["http://lldap:17170/"]

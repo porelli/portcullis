@@ -71,7 +71,7 @@ groups:
         labels: {severity: critical}
         annotations:
           summary: group-gate cannot read certs/revocation/revoked-serials.txt
-          description: Every request that presents a client certificate is denied until it is readable.
+          description: Every request that presents a YubiKey or browser certificate is denied until it is readable.
 
       - alert: GroupGateDenySpike
         expr: sum(rate(group_gate_denials_total[5m])) > 0.5
@@ -108,22 +108,22 @@ groups:
         expr: portcullis_client_cert_expiry_timestamp_seconds - time() < 7 * 86400
         labels: {severity: info}
         annotations:
-          summary: "Client certificate of {{ $labels.cn }} expires soon"
-          description: "Renew at https://enroll.<domain>/self or with ./portcullis cert renew ({{ $value | humanizeDuration }} left)."
+          summary: "The {{ $labels.kind }} certificate of {{ $labels.cn }} expires soon"
+          description: "YubiKey certificate: renew it on the Sign-in page (https://people.<domain>/signin) or with ./portcullis cert renew; browser certificate: make a new one on the Sign-in page ({{ $value | humanizeDuration }} left)."
 
       - alert: CaExpiring
         expr: portcullis_ca_expiry_timestamp_seconds - time() < 90 * 86400
         labels: {severity: critical}
         annotations:
           summary: "The {{ $labels.ca }} CA expires in less than 90 days"
-          description: Every client certificate stops working when it expires.
+          description: Every YubiKey and browser certificate it issued (for the root, all of them) stops working when it expires.
 
       - alert: PortcullisStatusStale
         expr: time() - portcullis_status_last_run_timestamp_seconds > 36 * 3600
         labels: {severity: warning}
         annotations:
           summary: ./portcullis status --textfile has not run for 36 hours
-          description: Client-cert and CA expiry metrics are out of date (it runs after every scheduled backup).
+          description: Certificate and CA expiry metrics are out of date (it runs after every scheduled backup).
 
       - alert: PortcullisStatusProblems
         expr: portcullis_status_ok == 0

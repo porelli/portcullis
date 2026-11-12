@@ -96,3 +96,50 @@ tests:
             exp_annotations:
               summary: Many requests denied by group-gate
               description: "1 denials/s for 10 minutes. Check the denial reasons on the Portcullis dashboard."
+
+  # Certificates (status --textfile): one series per person and kind. alice's
+  # YubiKey certificate ends at 10 d, her browser certificate at 30 d; bob's
+  # browser certificate at 8 d. At 73 h only alice's YubiKey one and bob's
+  # browser one are under 7 days.
+  - interval: 5m
+    input_series:
+      - series: 'portcullis_client_cert_expiry_timestamp_seconds{job="portcullis",cn="alice",kind="yubikey"}'
+        values: '864000x1000'
+      - series: 'portcullis_client_cert_expiry_timestamp_seconds{job="portcullis",cn="alice",kind="browser"}'
+        values: '2592000x1000'
+      - series: 'portcullis_client_cert_expiry_timestamp_seconds{job="portcullis",cn="bob",kind="browser"}'
+        values: '691200x1000'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: ClientCertExpiring
+        exp_alerts: []
+      - eval_time: 73h
+        alertname: ClientCertExpiring
+        exp_alerts:
+          - exp_labels: {severity: info, job: portcullis, cn: alice, kind: yubikey}
+            exp_annotations:
+              summary: The yubikey certificate of alice expires soon
+              description: "YubiKey certificate: renew it on the Sign-in page (https://people.<domain>/signin) or with ./portcullis cert renew; browser certificate: make a new one on the Sign-in page (6d 23h 0m 0s left)."
+          - exp_labels: {severity: info, job: portcullis, cn: bob, kind: browser}
+            exp_annotations:
+              summary: The browser certificate of bob expires soon
+              description: "YubiKey certificate: renew it on the Sign-in page (https://people.<domain>/signin) or with ./portcullis cert renew; browser certificate: make a new one on the Sign-in page (4d 23h 0m 0s left)."
+
+  # CAs: the browser certificate CA ends at 100 d, the root at 1000 d.
+  - interval: 5m
+    input_series:
+      - series: 'portcullis_ca_expiry_timestamp_seconds{job="portcullis",ca="browser"}'
+        values: '8640000x3200'
+      - series: 'portcullis_ca_expiry_timestamp_seconds{job="portcullis",ca="root"}'
+        values: '86400000x3200'
+    alert_rule_test:
+      - eval_time: 9d
+        alertname: CaExpiring
+        exp_alerts: []
+      - eval_time: 11d
+        alertname: CaExpiring
+        exp_alerts:
+          - exp_labels: {severity: critical, job: portcullis, ca: browser}
+            exp_annotations:
+              summary: The browser CA expires in less than 90 days
+              description: Every YubiKey and browser certificate it issued (for the root, all of them) stops working when it expires.

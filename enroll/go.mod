@@ -7,6 +7,7 @@ require (
 	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/go-ldap/ldap/v3 v3.4.15
 	github.com/hashicorp/vault/api v1.23.0
+	software.sslmate.com/src/go-pkcs12 v0.7.4
 )
 
 require (

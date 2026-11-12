@@ -184,13 +184,21 @@ expect_eq "domain written" "$(get PORTCULLIS_DOMAIN)" ci.example.org
 expect_eq "email defaults to admin@domain" "$(get ACME_EMAIL)" admin@ci.example.org
 expect_eq "LLDAP base DN from the domain" "$(get LLDAP_BASE_DN)" dc=ci,dc=example,dc=org
 for v in POSTGRES_PASSWORD KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD LLDAP_JWT_SECRET \
-         FORWARD_AUTH_CLIENT_SECRET FORWARD_AUTH_COOKIE_SECRET HUB_PROXY_SECRET; do
+         FORWARD_AUTH_CLIENT_SECRET FORWARD_AUTH_COOKIE_SECRET FORWARD_AUTH_REDIS_PASSWORD \
+         FORWARD_AUTH_EXT_REDIS_PASSWORD HUB_PROXY_SECRET; do
   val="$(get "$v")"
   if [ "${#val}" -ge 24 ]; then t_pass "$v generated"; else t_fail "$v not generated ('$val')"; fi
 done
 expect_eq "HUB_PROXY_SECRET is 64 hex chars" "$(get HUB_PROXY_SECRET | grep -Ec '^[0-9a-f]{64}$')" 1
 expect_eq "no public default forward-auth secret" "$(grep -c 'portcullis-forward-auth-secret' "$ENVF")" 0
 expect_eq "BACKUP_PASSWORD generated (48 chars)" "$(get BACKUP_PASSWORD | grep -Ec '^[A-Za-z0-9]{48}$')" 1
+# The two session-store passwords: 40 random [A-Za-z0-9] each (hashed into
+# secrets/sessions/valkey.conf), never the same.
+expect_eq "FORWARD_AUTH_REDIS_PASSWORD / _EXT_ are 40 [A-Za-z0-9]" \
+  "$(get FORWARD_AUTH_REDIS_PASSWORD | grep -Ec '^[A-Za-z0-9]{40}$')$(get FORWARD_AUTH_EXT_REDIS_PASSWORD | grep -Ec '^[A-Za-z0-9]{40}$')" 11
+if [ "$(get FORWARD_AUTH_REDIS_PASSWORD)" != "$(get FORWARD_AUTH_EXT_REDIS_PASSWORD)" ]; then t_pass "the two session-store passwords differ"; else t_fail "the two session-store passwords are the same"; fi
+expect_eq "the session-store passwords are core secrets (never shared with the Hub) and rotatable (upgrade generates them)" \
+  "$(bash -c '. "$1/scripts/lib/common.sh"; for v in FORWARD_AUTH_REDIS_PASSWORD FORWARD_AUTH_EXT_REDIS_PASSWORD; do case " $CORE_SECRETS " in *" $v "*) ;; *) echo "$v not core";; esac; case " $ROTATABLE_SECRETS " in *" $v "*) ;; *) echo "$v not rotatable";; esac; done' _ "$HERE/..")" ""
 run backup verify --local
 expect_eq "backup verify --local without backups exits 1" "$RC" 1
 case "$ERR" in *"no local backups"*) t_pass "backup verify --local: no local backups" ;; *) t_fail "backup verify --local: $ERR" ;; esac
@@ -258,8 +266,10 @@ case "$p" in
   "$R/client-scopes/mcp-id") jq -c '.[4]' "$KC_FIX/scopes.json" ;;
   "$R") echo '{"realm":"portcullis","browserFlow":"portcullis-universal","loginTheme":"portcullis"}' ;;
   "$R/authentication/flows/portcullis-universal/executions")
-    echo '[{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509-id"},{"providerId":"portcullis-method","level":3},{"providerId":"portcullis-template","level":0}]' ;;
+    echo '[{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509-id"},{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509b-id"},{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509c-id"},{"providerId":"portcullis-method","level":3},{"providerId":"portcullis-template","level":0}]' ;;
   "$R/authentication/config/x509-id") echo '{"id":"x509-id","alias":"x509-config","config":{"default.reference.value":"mtls","default.reference.maxAge":"36000"}}' ;;
+  "$R/authentication/config/x509b-id") echo '{"id":"x509b-id","alias":"x509-browser-config","config":{"default.reference.value":"file","default.reference.maxAge":"36000"}}' ;;
+  "$R/authentication/config/x509c-id") echo '{"id":"x509c-id","alias":"operator-x509","config":{"default.reference.value":"mtls","default.reference.maxAge":"36000"}}' ;;
   *\?*|*/flows|*/executions|*/client-scopes|*/models|*/instances|*-client-scopes|*/roles) echo '[]' ;;
   *) echo '{}' ;;
 esac
@@ -283,6 +293,16 @@ expect_eq "keycloak configure: the amr check walks the new browser flow (a portc
   "$(grep -c 'portcullis-universal/portcullis-method has no authenticator config' "$WORK/err"):$(grep -c 'portcullis-universal/portcullis-x509' "$WORK/err")" "1:0"
 expect_eq "keycloak configure: x509-config pushed onto the portcullis-x509 execution's config" \
   "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis/authentication/config/x509-id") | .b | fromjson | .config["x509-cert-auth.confirmation-page-disallowed"]]' "$WORK/kc/log")" '["true"]'
+# x509_put <config id> — the method, reference, CA and CRL paths keycloak configure PUT there.
+x509_put() { jq -sc --arg p "/admin/realms/portcullis/authentication/config/$1" '[.[] | select(.m == "PUT" and .p == $p) | .b | fromjson
+    | {alias, m: .config["portcullis.method"], ref: .config["default.reference.value"], ca: .config["portcullis.ca"], crl: .config["x509-cert-auth.crl-relative-path"]}]' "$WORK/kc/log"; }
+expect_eq "keycloak configure pushes x509-browser-config onto the browser execution and x509-config onto the YubiKey one (stubbed kc_get / kc_put)" \
+  "$(x509_put x509-id) $(x509_put x509b-id)" \
+  '[{"alias":"x509-config","m":"yubikey_cert","ref":"mtls","ca":"/opt/keycloak/conf/truststores/portcullis/portcullis-yubikey-ca.pem","crl":"http://vault:8200/v1/pki_int/crl##http://vault:8200/v1/pki_int/crl/delta"}] [{"alias":"x509-browser-config","m":"browser_cert","ref":"file","ca":"/opt/keycloak/conf/truststores/portcullis/portcullis-browser-ca.pem","crl":"http://vault:8200/v1/pki_file/crl##http://vault:8200/v1/pki_file/crl/delta"}]'
+expect_eq "keycloak configure: an x509 config with another alias is left alone (warned)" \
+  "$(x509_put x509c-id):$(grep -c 'x509 config operator-x509 is not one of' "$WORK/err")" '[]:1'
+expect_eq "keycloak configure never touches the events config (no events request, no events keys in a realm PUT)" \
+  "$(jq -sc '[.[] | select((.p | test("/events")) or (.m == "PUT" and .p == "/admin/realms/portcullis" and (.b | fromjson | keys | any(test("^(events|enabledEventTypes|adminEvents)")))))] | length' "$WORK/kc/log")" 0
 expect_eq "keycloak configure: realm PUT has brute force (D6) and an empty acr.loa.map" \
   "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis") | .b | fromjson
       | select(has("bruteForceProtected")) | {bruteForceProtected, failureFactor, waitIncrementSeconds, maxFailureWaitSeconds, permanentLockout, loa: .attributes["acr.loa.map"]}] | unique' "$WORK/kc/log")" \
@@ -305,8 +325,21 @@ expect_eq "realm export: portcullis-universal is REQUIRED portcullis-authenticat
 expect_eq "realm export: portcullis-universal is the browser flow" "$(jq -r .browserFlow "$RX")" portcullis-universal
 expect_eq "realm export: portcullis-authenticate = cookie | invite redirector | portcullis-signin" \
   "$(flow portcullis-authenticate)" '["ALTERNATIVE auth-cookie","ALTERNATIVE identity-provider-redirector","ALTERNATIVE portcullis-signin"]'
-expect_eq "realm export: portcullis-signin = x509 | passkey sub-flow | password form" \
-  "$(flow portcullis-signin)" '["ALTERNATIVE portcullis-x509","ALTERNATIVE portcullis-signin-passkey","ALTERNATIVE portcullis-password-form"]'
+expect_eq "realm export: portcullis-signin = x509 | x509 | passkey sub-flow | password form" \
+  "$(flow portcullis-signin)" '["ALTERNATIVE portcullis-x509","ALTERNATIVE portcullis-x509","ALTERNATIVE portcullis-signin-passkey","ALTERNATIVE portcullis-password-form"]'
+expect_eq "realm-export: portcullis-signin = x509 (x509-config, mtls, yubikey CA), x509 (x509-browser-config, file, browser CA), passkey sub-flow, password form, in that order" \
+  "$(jq -c '.authenticatorConfig as $c | [.authenticationFlows[] | select(.alias == "portcullis-signin") | .authenticationExecutions | sort_by(.priority)[]
+      | (.authenticatorConfig // "") as $n | [.priority, (.authenticator // .flowAlias), $n,
+         ([$c[] | select(.alias == $n) | .config | .["default.reference.value"], .["portcullis.method"], .["portcullis.ca"]] | map(. // "") | join(" "))]]' "$RX")" \
+  '[[10,"portcullis-x509","x509-config","mtls yubikey_cert /opt/keycloak/conf/truststores/portcullis/portcullis-yubikey-ca.pem"],[20,"portcullis-x509","x509-browser-config","file browser_cert /opt/keycloak/conf/truststores/portcullis/portcullis-browser-ca.pem"],[30,"portcullis-signin-passkey","",""],[40,"portcullis-password-form","password-config","pwd  "]]'
+expect_eq "realm-export: each x509 config's CRL paths name only its own mount" \
+  "$(jq -c '[.authenticatorConfig[] | select(.config | has("portcullis.method")) | {(.alias): .config["x509-cert-auth.crl-relative-path"]}] | add' "$RX")" \
+  '{"x509-config":"http://vault:8200/v1/pki_int/crl##http://vault:8200/v1/pki_int/crl/delta","x509-browser-config":"http://vault:8200/v1/pki_file/crl##http://vault:8200/v1/pki_file/crl/delta"}'
+expect_eq "realm-export: both x509 configs check CRLs, abort on a stale CRL and keep the same X.509 settings" \
+  "$(jq -c '[.authenticatorConfig[] | select(.config | has("portcullis.method")) | .config
+      | del(.["portcullis.method"], .["portcullis.ca"], .["default.reference.value"], .["x509-cert-auth.crl-relative-path"])] | (unique | length), .[0]["x509-cert-auth.crl-checking-enabled"], .[0]["x509-cert-auth-crl-abort-if-non-updated"]' "$RX" | tr '\n' ' ')" '1 "true" "true" '
+expect_eq "realm-export: events LOGIN, LOGIN_ERROR, expiration 31536000" \
+  "$(jq -c '[.eventsEnabled, (.enabledEventTypes | sort), .eventsExpiration]' "$RX")" '[true,["LOGIN","LOGIN_ERROR"],31536000]'
 expect_eq "realm export: portcullis-signin-passkey = REQUIRED portcullis-passkey + one CONDITIONAL sub-flow per kind" \
   "$(flow portcullis-signin-passkey)" '["REQUIRED portcullis-passkey","CONDITIONAL portcullis-passkey-security-key","CONDITIONAL portcullis-passkey-device","CONDITIONAL portcullis-passkey-synced"]'
 for k in security-key:security_key:hwk device:passkey_device:dpk synced:passkey_synced:spk; do
@@ -328,7 +361,7 @@ expect_eq "realm export: acr.loa.map is {}" "$(jq -r '.attributes["acr.loa.map"]
 expect_eq "every reference config has maxAge 36000" \
   "$(jq -c '[.authenticatorConfig[].config | select(has("default.reference.value")) | .["default.reference.maxAge"]] | unique' "$RX")" '["36000"]'
 expect_eq "realm export: every amr of the browser and invite flows has a reference config" \
-  "$(jq -c '[.authenticatorConfig[].config | .["default.reference.value"] // empty] | sort' "$RX")" '["dpk","hwk","inv","mtls","pwd","spk"]'
+  "$(jq -c '[.authenticatorConfig[].config | .["default.reference.value"] // empty] | sort' "$RX")" '["dpk","file","hwk","inv","mtls","pwd","spk"]'
 expect_eq "realm export: the invite post-broker flow keeps admit / deny, records inv, ends with portcullis-template" \
   "$(flow portcullis-invite-session)" '["CONDITIONAL portcullis-invite-client","CONDITIONAL portcullis-invite-deny","REQUIRED allow-access-authenticator","REQUIRED portcullis-template"]'
 expect_eq "invite amr configs say inv" \
@@ -421,6 +454,7 @@ keycloak_configure() { :; }
 oidc_register() { :; }
 network_check() { :; }
 stack_prepare() { :; }
+sessions_restart_if_changed() { echo sessions_restart_if_changed >> "$DC_CALLS"; }
 dns_setup() { :; }
 config_init() { :; }
 invite_create() { echo '{"url":"http://test","expires_at":"never"}'; }
@@ -447,6 +481,8 @@ rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
 calls="$(cat "$DC_CALLS" 2>/dev/null || true)"
 expect_eq "init: first up excludes hub" \
   "$(printf '%s\n' "$calls" | grep -c '^up.*vault.*lldap.*keycloak' || true)" 1
+expect_eq "init: the session store's restart check runs before the first up" \
+  "$(printf '%s\n' "$calls" | grep -E '^(sessions_restart_if_changed|up)' | head -n2 | paste -sd' ' - | cut -c1-30)" "sessions_restart_if_changed up"
 expect_eq "init: first up does not include hub in the list" \
   "$(printf '%s\n' "$calls" | grep '^up' | head -1 | grep -c 'hub' || true)" 0
 expect_eq "init: hub started after the service account step" \
@@ -478,6 +514,7 @@ network_check() { :; }
 stack_prepare() { :; }
 domains_restart_if_renewed() { :; }
 monitoring_reload() { :; }
+sessions_restart_if_changed() { echo sessions_restart_if_changed >> "$DC_CALLS"; }
 hub_pinned_warn() { :; }
 backup_create() { :; }
 hub_policy_check() { :; }
@@ -494,7 +531,7 @@ rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
   export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
-  export FORWARD_AUTH_COOKIE_SECRET=x HUB_PROXY_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
   # shellcheck disable=SC1091
   . "$HERE/../scripts/lib/common.sh"
   # shellcheck disable=SC1091
@@ -505,6 +542,9 @@ rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
 )
 expect_eq "up: account unchanged, no hub restart" \
   "$(grep -c '^restart.*hub' "$DC_CALLS" 2>/dev/null || true)" 0
+# A changed session-store config is applied (restart) before compose recreates the oauth2-proxies.
+expect_eq "up: the session store's restart check runs before docker compose up" \
+  "$(grep -E '^(sessions_restart_if_changed|up)' "$DC_CALLS" | head -n2 | paste -sd' ' -)" "sessions_restart_if_changed up"
 
 # stack_up when account changed: restart hub.
 touch "$LLDAP_ACCOUNT_CHANGED"
@@ -513,7 +553,7 @@ rm -f "$DC_CALLS"
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
   export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
-  export FORWARD_AUTH_COOKIE_SECRET=x HUB_PROXY_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
   # shellcheck disable=SC1091
   . "$HERE/../scripts/lib/common.sh"
   # shellcheck disable=SC1091
@@ -532,7 +572,7 @@ rm -f "$DC_CALLS"
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
   export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
-  export FORWARD_AUTH_COOKIE_SECRET=x HUB_PROXY_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
   # shellcheck disable=SC1091
   . "$HERE/../scripts/lib/common.sh"
   # shellcheck disable=SC1091
@@ -550,7 +590,7 @@ rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
   export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
-  export FORWARD_AUTH_COOKIE_SECRET=x HUB_PROXY_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
   # shellcheck disable=SC1091
   . "$HERE/../scripts/lib/common.sh"
   # shellcheck disable=SC1091
@@ -561,22 +601,25 @@ rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
 )
 expect_eq "upgrade: account unchanged, no hub restart" \
   "$(grep -c '^restart.*hub' "$DC_CALLS" 2>/dev/null || true)" 0
+expect_eq "upgrade: the session store's restart check runs before docker compose up" \
+  "$(grep -E '^(sessions_restart_if_changed|up)' "$DC_CALLS" | head -n2 | paste -sd' ' -)" "sessions_restart_if_changed up"
 
 # ── static TLS options (contract §5 "TLS tier per host", plan D18) ──
 ROOT_DIR="$(cd "$HERE/.." && pwd)"
 expect_eq "MTLS_ENABLED appears nowhere in portcullis scripts/lib docker-compose.yml" \
   "$(grep -l MTLS_ENABLED "$ROOT_DIR/portcullis" "$ROOT_DIR"/scripts/lib/*.sh "$ROOT_DIR/docker-compose.yml" "$ROOT_DIR/.env.example" 2>/dev/null || true)" ""
 TLS_YML="$ROOT_DIR/traefik/dynamic/tls.yml"
-# One line per option: <name> <clientAuthType or none> <caFile> <minVersion> <sniStrict>.
+# One line per option: <name> <clientAuthType or none> <every caFiles entry, comma-joined> <minVersion> <sniStrict>.
 TLS_GOT="$(awk '
-  /^    [a-z]+:$/ { if (n) print n, (t ? t : "none"), (ca ? ca : "-"), v, s; n = $1; sub(/:$/, "", n); t = ""; ca = ""; v = ""; s = ""; next }
-  /clientAuthType:/ { t = $2 } /- \/certs\// { ca = $2 } /minVersion:/ { v = $2 } /sniStrict:/ { s = $2 }
+  /^    [a-z-]+:$/ { if (n) print n, (t ? t : "none"), (ca ? ca : "-"), v, s; n = $1; sub(/:$/, "", n); t = ""; ca = ""; v = ""; s = ""; next }
+  /clientAuthType:/ { t = $2 } /^[[:space:]]*- / { ca = (ca ? ca "," : "") $2 } /minVersion:/ { v = $2 } /sniStrict:/ { s = $2 }
   END { if (n) print n, (t ? t : "none"), (ca ? ca : "-"), v, s }' "$TLS_YML")"
-expect_eq "traefik/dynamic/tls.yml defines exactly protected, authaware, public with those clientAuth types" "$TLS_GOT" \
-"protected RequireAndVerifyClientCert /certs/ca-chain.crt VersionTLS12 false
+expect_eq "traefik/dynamic/tls.yml defines exactly protected, protected-any, authaware, public with those clientAuth types and chains" "$TLS_GOT" \
+"protected RequireAndVerifyClientCert /certs/ca-chain-yubikey.crt VersionTLS12 false
+protected-any RequireAndVerifyClientCert /certs/ca-chain.crt VersionTLS12 false
 authaware VerifyClientCertIfGiven /certs/ca-chain.crt VersionTLS12 false
 public none - VersionTLS12 false"
-expect_eq "tls.yml: only the tls.options block" "$(grep -cvE '^[[:space:]]*(#|$)' "$TLS_YML")" 19
+expect_eq "tls.yml: only the tls.options block" "$(grep -cvE '^[[:space:]]*(#|$)' "$TLS_YML")" 26
 expect_eq "tls.yml is tracked by git" "$(git -C "$ROOT_DIR" ls-files traefik/dynamic/tls.yml)" "traefik/dynamic/tls.yml"
 # Every core router carries authaware@file.
 ROUTERS="$(grep -oE 'traefik\.http\.routers\.[a-z0-9-]+\.rule' "$ROOT_DIR/docker-compose.yml" | sed 's/^traefik\.http\.routers\.//; s/\.rule$//' | sort -u)"
@@ -584,7 +627,7 @@ BAD=""
 for r in $ROUTERS; do
   grep -qE "^[[:space:]]+traefik\.http\.routers\.$r\.tls\.options: authaware@file$" "$ROOT_DIR/docker-compose.yml" || BAD="$BAD $r"
 done
-expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:16"
+expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:14"
 expect_eq "no other tls.options in docker-compose.yml" "$(grep -E 'tls\.options:' "$ROOT_DIR/docker-compose.yml" | grep -vc 'authaware@file$' || true)" 0
 # The Hub can't write traefik/: /project is read-only and no writable mount
 # (short or long syntax: bind, volume, tmpfs) has traefik in its source or
@@ -614,7 +657,7 @@ expect_eq "the hub service mounts nothing under traefik/ read-write" \
 expect_eq "the hub mounts the checkout read-only" "$(printf '%s\n' "$HUB_SVC" | grep -c '^      - \.:/project:ro$')" 1
 expect_eq "the Hub's writable mounts are exactly templates/, appfiles/, its volumes and the masking tmpfs" \
   "$(hub_writable_mounts "$ROOT_DIR/docker-compose.yml" | LC_ALL=C sort | tr '\n' ';')" \
-  "(tmpfs) -> /project/backups;(tmpfs) -> /project/secrets;./appfiles -> /project/appfiles;./templates -> /project/templates;hub_data -> /data;hub_secrets -> /secrets;"
+  "(tmpfs) -> /project/backups;(tmpfs) -> /project/secrets;./appfiles -> /project/appfiles;./templates -> /project/templates;group_gate_data -> /group-gate-data;hub_data -> /data;hub_secrets -> /secrets;"
 # The check itself catches both syntaxes (planted mounts on a copy).
 awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      - ./traefik/dynamic:/project/traefik/dynamic" }' "$ROOT_DIR/docker-compose.yml" > "$WORK/compose-short.yml"
 awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      - type: bind"; print "        source: ./traefik"; print "        target: /etc/x"; print "        read_only: false" }' "$ROOT_DIR/docker-compose.yml" > "$WORK/compose-long.yml"
@@ -622,6 +665,41 @@ awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      
 expect_eq "the traefik mount check catches a short-syntax rw bind" "$(hub_writable_mounts "$WORK/compose-short.yml" | grep -c traefik || true)" 1
 expect_eq "the traefik mount check catches a long-syntax rw bind" "$(hub_writable_mounts "$WORK/compose-long.yml" | grep -c traefik || true)" 1
 expect_eq "the traefik mount check passes a long-syntax read-only bind" "$(hub_writable_mounts "$WORK/compose-long-ro.yml" | grep -c traefik || true)" 0
+
+# ── sign-in part 2 wiring (contract §4, §5 "Core routers", §8.1, §8.2) ──
+DC="$ROOT_DIR/docker-compose.yml"
+# svc <name> — the lines of one compose service.
+svc() { awk -v s="  $1:" '$0 == s { f = 1; next } f && /^  [a-z][a-z0-9-]*:$/ { exit } f' "$DC"; }
+GG_SVC="$(svc group-gate)"
+expect_eq "no router in docker-compose.yml routes enroll.<domain> except enroll-invite (PathPrefix /invite/)" \
+  "$(grep -hE '^[[:space:]]+traefik\.http\.routers\.[a-z0-9-]+\.rule: .*enroll\.' "$DC" "$ROOT_DIR/docker-compose.apps.yml" "$ROOT_DIR/docker-compose.test.yml" | sed 's/^[[:space:]]*//')" \
+  'traefik.http.routers.enroll-invite.rule: Host(`enroll.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/invite/`)'
+expect_eq "no enroll or enroll-self router labels left" \
+  "$(grep -cE 'traefik\.http\.routers\.enroll(-self)?\.' "$DC" || true)" 0
+expect_eq "no portcullis-self middleware and no \"/authenticated\" anywhere" \
+  "$(git -C "$ROOT_DIR" grep -lE 'portcullis-self|/authenticated' -- ':!CHANGELOG.md' ':!tests/test_cli.sh' ':!tests/test_group_gate.py' || true)" ""
+expect_eq "the people router uses client-cert-pem@file, before portcullis-groups@docker" \
+  "$(svc hub | sed -n 's/^      traefik\.http\.routers\.people\.middlewares: //p')" \
+  "rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file"
+expect_eq "group-gate mounts group_gate_data read-write, has group_add 10001, and both CA files read-only; GATE_CRL_URLS lists pki_int and pki_file" \
+  "$(printf '%s\n' "$GG_SVC" | grep -cxE '      - group_gate_data:/data|    group_add: \["10001"\]|      - \./certs/yubikey-ca\.crt:/etc/group-gate/ca/yubikey-ca\.crt:ro|      - \./certs/browser-ca\.crt:/etc/group-gate/ca/browser-ca\.crt:ro|      GATE_YUBIKEY_CA_FILE: /etc/group-gate/ca/yubikey-ca\.crt|      GATE_BROWSER_CA_FILE: /etc/group-gate/ca/browser-ca\.crt|      GATE_OPENED_DIR: /data/opened|      GATE_CRL_URLS: http://vault:8200/v1/pki_int/crl http://vault:8200/v1/pki_file/crl|      GATE_DELTA_CRL_URLS: http://vault:8200/v1/pki_int/crl/delta http://vault:8200/v1/pki_file/crl/delta'):$(printf '%s\n' "$GG_SVC" | grep -cE 'GATE_(DELTA_)?CRL_URL:' || true)" "9:0"
+expect_eq "hub mounts group_gate_data; HUB_CLIENT_CERT_TTL follows CLIENT_CERT_TTL" \
+  "$(svc hub | grep -cxE '      - group_gate_data:/group-gate-data|      HUB_GROUP_GATE_DATA_DIR: /group-gate-data|      HUB_CLIENT_CERT_TTL: \$\{CLIENT_CERT_TTL:-720h\}|      HUB_CERT_EXPIRY_WARN_DAYS: \$\{CERT_EXPIRY_WARN_DAYS:-7\}')" 4
+expect_eq "only group-gate and the Hub mount group_gate_data, and it is a declared volume" \
+  "$(for s in $(grep -E '^  [a-z][a-z0-9-]*:$' "$DC" | tr -d ' :' | sort -u); do svc "$s" | grep -q '^      - group_gate_data:' && echo "$s"; done | tr '\n' ' ')$(awk '/^volumes:$/ { v = 1; next } v && /^  group_gate_data:$/ { print "declared" }' "$DC")" "group-gate hub declared"
+# shellcheck disable=SC2016  # a literal ${PORTCULLIS_DOMAIN:-...}
+expect_eq "keycloak gets PORTCULLIS_SIGNIN_URL = the Sign-in page" \
+  "$(svc keycloak | sed -n 's/^      PORTCULLIS_SIGNIN_URL: //p')" 'https://people.${PORTCULLIS_DOMAIN:-portcullis.local}/signin'
+expect_eq "group-gate-map.conf has no enroll entry" "$(grep -cE '^[[:space:]]*enroll[[:space:]]*=' "$ROOT_DIR/group-gate/group-gate-map.conf" || true)" 0
+expect_eq "no file in the repo matches enroll\\.[^ ]*/self" \
+  "$(git -C "$ROOT_DIR" grep -lE 'enroll\.[^ ]*/self' -- ':!CHANGELOG.md' ':!tests/test_cli.sh' || true)" ""
+# User-facing texts (D34): "YubiKey certificate" / "Browser certificate"; a
+# "client cert" stays only in code comments and contract internals.
+expect_eq "no user-facing text (README, .env.example, docs, monitoring, theme, CLI output / help) says \"client certificate\"" \
+  "$(git -C "$ROOT_DIR" grep -niE 'client cert' -- README.md .env.example docs monitoring keycloak/themes portcullis scripts/lib enroll/web group-gate/group-gate-map.conf \
+      | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)" ""
+expect_eq "tls.yml's header says which option uses which chain and who uses it" \
+  "$(grep -cE '^# (protected|protected-any|authaware|public): ' "$TLS_YML"):$(grep -c 'Used by' "$TLS_YML")" "4:4"
 
 # config apply leaves tls.yml byte-identical and writes no traefik file.
 CA_ROOT="$WORK/ca-root"
@@ -684,6 +762,131 @@ mv "$SR_ROOT/.env" "$SR_ROOT/.env.x"
 sr --yes
 expect_eq "signin reset-core --yes without .env exits 1 before docker" "$RC:$(cat "$SR_CALLS")" "1:"
 mv "$SR_ROOT/.env.x" "$SR_ROOT/.env"
+
+# ── enroll's Vault policy: exactly the D21 paths (contract §8.1) ──
+POLICY_GOT="$(awk '
+  function flush() { if (p != "") print p " " c (d != "" ? " deny=" d : ""); p = ""; c = ""; d = "" }
+  /^[[:space:]]*path[[:space:]]+"/ { flush(); p = $2; gsub(/"/, "", p); ind = 0; next }
+  /capabilities/ { c = $0; sub(/.*\[/, "", c); sub(/\].*/, "", c); gsub(/[" ]/, "", c); next }
+  /denied_parameters/ { ind = 1; next }
+  ind && /=[[:space:]]*\[\]/ { k = $1; gsub(/"/, "", k); d = (d == "" ? k : d "," k); next }
+  ind && /^[[:space:]]*}/ { ind = 0; next }
+  END { flush() }
+' "$HERE/../vault/policies/enroll.hcl" | sort)"
+POLICY_WANT="$(sort <<'EOF'
+pki_int/sign/client-cert update deny=alt_names,ip_sans,uri_sans,other_sans
+pki_file/sign/browser-cert update deny=alt_names,ip_sans,uri_sans,other_sans
+pki_int/certs list
+pki_file/certs list
+pki_int/cert/* read
+pki_file/cert/* read
+pki_int/revoke update
+pki_file/revoke update
+pki_int/crl/rotate read
+pki_file/crl/rotate read
+EOF
+)"
+expect_eq "enroll.hcl grants exactly the D21 paths (sign/client-cert, sign/browser-cert, certs list, cert read, revoke, crl/rotate on both mounts) and nothing else" \
+  "$POLICY_GOT" "$POLICY_WANT"
+expect_eq "enroll.hcl has one path block per grant" \
+  "$(grep -c '^[[:space:]]*path[[:space:]]' "$HERE/../vault/policies/enroll.hcl")" 10
+expect_eq "enroll.hcl: only capabilities and denied_parameters (no allowed_parameters, no wildcard grants)" \
+  "$(grep -vE '^[[:space:]]*(#|$|path "pki_(int|file)/[a-z/-]+\*?" \{|capabilities = \["(update|list|read)"\]|denied_parameters = \{|"(alt_names|ip_sans|uri_sans|other_sans)" += \[\]|\})' "$HERE/../vault/policies/enroll.hcl")" ""
+
+# ── cert list / revoke / enroll over both CAs (stub vault + ykman) ──
+CT_ROOT="$WORK/cert-root"
+CT_BIN="$WORK/cert-bin"
+CT_DATA="$WORK/cert-data"
+mkdir -p "$CT_ROOT/certs/revocation" "$CT_BIN" "$CT_DATA"
+echo "PORTCULLIS_DOMAIN=example.test" > "$CT_ROOT/.env"
+# ct_cert <serial> <cn> <revocation_time> — Vault's JSON for a certificate.
+ct_cert() {
+  openssl ecparam -genkey -name prime256v1 -out "$CT_DATA/$1.key" 2>/dev/null
+  openssl req -new -x509 -key "$CT_DATA/$1.key" -subj "/CN=$2" -days 30 -out "$CT_DATA/$1.pem" 2>/dev/null
+  jq -n --rawfile c "$CT_DATA/$1.pem" --argjson rt "$3" '{data: {certificate: $c, revocation_time: $rt}}' > "$CT_DATA/$1.json"
+}
+ct_cert aa_01 alice 0
+ct_cert bb_02 alice 0
+ct_cert bb_03 bob 1767225600
+cat > "$CT_BIN/vault" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$CT_CALLS"
+# Like the real CLI (Vault 1.17), every API error exits 2 with an error
+# text; only "No value found at <path>" means nothing is there.
+# CT_SEALED=1: the lists answer exit 0 with no list (a sealed Vault's empty table).
+if [ -n "${CT_SEALED:-}" ] && [ "$1" = list ]; then exit 0; fi
+case "$*" in
+  "read -format=json pki_int/cert/dd:44")
+    printf 'Error reading pki_int/cert/dd:44: Error making API request.\n\nCode: 403. Errors:\n\n* permission denied\n' >&2; exit 2 ;;
+  "read -format=json pki_file/cert/dd:44") cat "$CT_DATA/bb_02.json" ;;
+  "list -format=json pki_int/certs") echo '["aa:01"]' ;;
+  "list -format=json pki_file/certs") echo '["bb:02","bb:03"]' ;;
+  "read -format=json pki_int/cert/aa:01") cat "$CT_DATA/aa_01.json" ;;
+  "read -format=json pki_file/cert/bb:02") cat "$CT_DATA/bb_02.json" ;;
+  "read -format=json pki_file/cert/bb:03") cat "$CT_DATA/bb_03.json" ;;
+  "read -format=json pki_"*/cert/*) echo "No value found at ${3}" >&2; exit 2 ;;
+  "list -format=json pki_int/certs/revoked") echo "No value found at pki_int/certs/revoked" >&2; exit 2 ;;
+  "list -format=json pki_file/certs/revoked") echo '["bb:02","bb:03"]' ;;
+  "write -format=json pki_int/sign/client-cert "*) jq -n --rawfile c "$CT_DATA/aa_01.pem" '{data: {certificate: $c}}' ;;
+  "write pki_"*/revoke\ *|"read -format=json pki_"*/crl/rotate) ;;
+  *) echo "unexpected vault call: $*" >&2; exit 1 ;;
+esac
+STUB
+cat > "$CT_BIN/ykman" <<'STUB'
+#!/usr/bin/env bash
+echo "ykman $*" >> "$CT_CALLS"
+case "$1 $2 $3" in
+  "piv keys generate"|"piv certificates request") eval "out=\${$#}"; echo PEM > "$out" ;;
+esac
+exit 0
+STUB
+chmod +x "$CT_BIN/vault" "$CT_BIN/ykman"
+ct() {
+  RC=0
+  rm -f "$WORK/cert-calls"; touch "$WORK/cert-calls"
+  PATH="$CT_BIN:$PATH" CT_SEALED="${CT_SEALED:-}" CT_CALLS="$WORK/cert-calls" CT_DATA="$CT_DATA" VAULT_TOKEN=t PORTCULLIS_ROOT="$CT_ROOT" \
+    "$CLI" cert "$@" >"$WORK/out" 2>"$WORK/err" </dev/null || RC=$?
+  OUT="$(cat "$WORK/out")"; ERR="$(cat "$WORK/err")"
+}
+ct list --all
+expect_eq "cert list --all exits 0" "$RC" 0
+expect_eq "cert list --all prints KIND YubiKey / Browser and revoked rows" \
+  "$(printf '%s\n' "$OUT" | awk '{print $1, $2, $3, $4}')" \
+  "SERIAL KIND COMMON NAME
+aa:01 YubiKey alice valid
+bb:02 Browser alice valid
+bb:03 Browser bob revoked"
+ct list
+expect_eq "cert list hides revoked rows" "$(printf '%s\n' "$OUT" | awk 'NR > 1 {print $1}' | tr '\n' ' ')" "aa:01 bb:02 "
+ct revoke --yes bb:02
+expect_eq "cert revoke <pki_file serial> exits 0" "$RC" 0
+expect_eq "cert revoke <pki_file serial> revokes on pki_file and rotates pki_file's CRL" \
+  "$(grep -E '/revoke |crl/rotate' "$WORK/cert-calls")" \
+  "write pki_file/revoke serial_number=bb:02
+read -format=json pki_file/crl/rotate"
+expect_eq "cert revoke looks the serial up on pki_int first" "$(grep -cx 'read -format=json pki_int/cert/bb:02' "$WORK/cert-calls")" 1
+case "$OUT" in *"Browser certificate (pki_file)"*) t_pass "cert revoke names the certificate's kind" ;; *) t_fail "cert revoke kind: $OUT" ;; esac
+expect_eq "cert revoke syncs the union of both CAs' revoked serials" \
+  "$(grep -v '^#' "$CT_ROOT/certs/revocation/revoked-serials.txt" | tr '\n' ' ')" "bb:02 bb:03 "
+ct revoke --yes aa:01
+expect_eq "cert revoke <pki_int serial> revokes on pki_int and rotates pki_int's CRL" \
+  "$(grep -E '/revoke |crl/rotate' "$WORK/cert-calls")" \
+  "write pki_int/revoke serial_number=aa:01
+read -format=json pki_int/crl/rotate"
+ct revoke --yes cc:99
+expect_eq "cert revoke of an unknown serial exits 1" "$RC" 1
+expect_eq "cert revoke of an unknown serial revokes nothing" "$(grep -c '/revoke ' "$WORK/cert-calls")" 0
+ct revoke --yes dd:44
+expect_eq "cert revoke: a 403 on pki_int (exit 2) is an error, not 'look on pki_file'" "$RC" 1
+expect_eq "cert revoke: a 403 on pki_int revokes nothing" "$(grep -c '/revoke ' "$WORK/cert-calls")" 0
+expect_eq "cert revoke: a 403 on pki_int never reads pki_file" "$(grep -c 'pki_file/cert/dd:44' "$WORK/cert-calls")" 0
+CT_SEALED=1 ct list --all
+expect_eq "cert list: a sealed Vault's empty answer (exit 0, no list) fails" "$RC" 1
+ct enroll alice
+expect_eq "cert enroll exits 0 (stub ykman)" "$RC" 0
+case "$OUT" in *"https://people.example.test/signin"*) t_pass "cert enroll's renewal hint names https://people.<domain>/signin" ;; *) t_fail "cert enroll's renewal hint: $OUT" ;; esac
+case "$OUT" in *"enroll.example.test"*) t_fail "cert enroll still names enroll.<domain>" ;; *) t_pass "cert enroll no longer names enroll.<domain>" ;; esac
+expect_eq "cert enroll signs with pki_int's client-cert role" "$(grep -c '^write -format=json pki_int/sign/client-cert .*common_name=alice' "$WORK/cert-calls")" 1
 
 expect_eq "docker was never called" "$(cat "$STUB_CALLS" 2>/dev/null)" ""
 

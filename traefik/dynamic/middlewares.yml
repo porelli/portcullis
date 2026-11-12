@@ -1,32 +1,43 @@
 # Shared middleware definitions.
 # Assign to routers via label: traefik.http.routers.<name>.middlewares=client-headers@file
 #
-# Traefik's passTLSClientCert middleware extracts client cert info and passes
-# it to backends via the X-Forwarded-Tls-Client-Cert-Info header.
+# Traefik's passTLSClientCert middleware passes the presented YubiKey or
+# browser certificate (and its info) to backends in the
+# X-Forwarded-Tls-Client-Cert(-Info) headers.
 #
 # Spoofing: the websecure entrypoint deletes client-supplied
 # X-Forwarded-Tls-Client-Cert(-Info) headers (no forwardedHeaders.trustedIPs)
 # and their aliases (aliasHeadersStrategy=delete), so after these
-# middlewares the headers only ever describe a cert Traefik verified.
+# middlewares the headers only ever describe a certificate Traefik verified.
+# Never add forwardedHeaders.insecure / trustedIPs on websecure: the
+# certificate headers' integrity depends on Traefik deleting client copies.
 #
 # Attribute headers (X-Forwarded-Attr-*, contract §5): a headers middleware
 # can only delete headers by exact name, and the field names are the Hub's.
 # Client-sent copies are deleted by the forwardAuth middlewares instead —
-# portcullis-auth, portcullis-auth-console, portcullis-groups, portcullis-self
-# and portcullis-public-guard all set authResponseHeadersRegex
+# portcullis-auth, portcullis-auth-console, portcullis-groups and
+# portcullis-public-guard all set authResponseHeadersRegex
 # ^X-Forwarded-Attr-, and Traefik removes every request header matching it
-# before copying the auth server's (only group-gate's /, /authenticated
-# return any). The entrypoints' aliasHeadersStrategy=delete drops `_` aliases.
+# before copying the auth server's (only group-gate's / returns any). The
+# entrypoints' aliasHeadersStrategy=delete drops `_` aliases.
 
 http:
   middlewares:
-    # Passes client certificate details as headers to backends.
+    # Passes the presented certificate's details as headers to backends.
     # Backends receive:
-    #   X-Forwarded-Tls-Client-Cert:      PEM bodies, comma-separated (client-cert-pem only)
+    #   X-Forwarded-Tls-Client-Cert:      the certificates themselves (base64
+    #                                     DER without BEGIN/END lines, set
+    #                                     raw, comma-separated, leaf first)
     #   X-Forwarded-Tls-Client-Cert-Info: Structured info (subject, issuer, serial, etc.)
+    # pem: true because group-gate decides a certificate's kind (YubiKey or
+    # browser) and user from the leaf itself (its signature verified against
+    # each CA, its CN parsed), never from the Info text: Traefik doesn't
+    # escape `"`, `;` or `,` there, so a crafted CN could fake an Issuer.
+    # Every gated router (core's and the templates') uses this middleware
+    # before portcullis-groups, and forwardAuth passes the request headers on.
     client-headers:
       passTLSClientCert:
-        pem: false
+        pem: true
         info:
           notAfter: true
           notBefore: true
@@ -40,10 +51,9 @@ http:
           issuer:
             commonName: true
 
-    # Same, plus the full cert as comma-separated PEM bodies in
-    # X-Forwarded-Tls-Client-Cert (the format Keycloak's `traefik` x509
-    # lookup provider reads). For auth.<domain> (X.509 login) and
-    # enroll.<domain>/self (renewal of the presented cert's key) only.
+    # The same headers (now identical to client-headers): the name the
+    # Keycloak (`traefik` x509 lookup provider) and people routers use for
+    # the PEM they read.
     client-cert-pem:
       passTLSClientCert:
         pem: true

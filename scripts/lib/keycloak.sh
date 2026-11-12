@@ -16,10 +16,12 @@ KC_REALM="portcullis"
 # 26.8 has no per-client "revoke refresh token" (the client-policy executor
 # suppress-refresh-token-rotation only drops the new token from the answer;
 # reuse is still enforced realm-wide), and realm-wide rotation breaks
-# forward-auth: oauth2-proxy's cookie sessions refresh once a minute
+# forward-auth: oauth2-proxy's cookie sessions refreshed once a minute
 # without a lock, so of two concurrent requests on one cookie the second
-# presents the already-used refresh token and is sent to sign in (CI
-# e2e-login refresh_rotation failed with it on). Same values as
+# presented the already-used refresh token and was sent to sign in (CI
+# e2e-login refresh_rotation failed with it on). The session store
+# (`sessions`) now gives refreshes a lock, but rotation stays off until a
+# run proves it. Same values as
 # realm-export.json (imported only into a new realm); pushed on every run.
 # Never touched here: the Hub's AI clients (attribute
 # portcullis.hub.template = portcullis-ai) and its mcp:* client scopes —
@@ -330,19 +332,31 @@ keycloak_configure() {
         or (.providerId == "allow-access-authenticator" and .level == 0)) | .providerId + " " + (.authenticationConfig // "none")')
   done
 
-  info "Applying the X.509 authenticator config (CRL check, trust re-validation)..."
-  # realm-export.json is only imported into a NEW realm; push the x509-config
-  # authenticator settings onto every existing x509 execution's config.
-  local x509_cfg cfg_ids cid
-  x509_cfg="$(jq -c '.authenticatorConfig[] | select(.alias == "x509-config") | .config' "$PORTCULLIS_ROOT/keycloak/realm-export.json")"
+  info "Applying the X.509 authenticator configs (CA, method, CRL check, trust re-validation)..."
+  # realm-export.json is only imported into a NEW realm; push each export
+  # x509 config (x509-config: YubiKey certificates, pki_int; x509-browser-config:
+  # browser certificates, pki_file) onto the execution whose config has that
+  # alias (contract §8.1 "The two x509 executions"). A config with another
+  # alias (a custom flow) is left alone: pushing one CA's settings onto the
+  # other's execution would let it count the wrong kind.
+  local x509_cfgs cfg_ids cid cur alias want pushed=" "
+  x509_cfgs="$(jq -c '[.authenticatorConfig[] | select(.config | has("portcullis.method")) | {key: .alias, value: .config}] | from_entries' "$PORTCULLIS_ROOT/keycloak/realm-export.json")"
   cfg_ids="$(kc_get "/$KC_REALM/authentication/flows/portcullis-universal/executions" \
       | jq -r '.[]? | select(.providerId == "portcullis-x509") | .authenticationConfig // empty' 2>/dev/null | sort -u)"
   for cid in $cfg_ids; do
-    code="$(kc_get "/$KC_REALM/authentication/config/$cid" | jq --argjson c "$x509_cfg" '.config = ((.config // {}) + $c)' \
+    cur="$(kc_get "/$KC_REALM/authentication/config/$cid")"
+    alias="$(printf '%s' "$cur" | jq -r '.alias // empty' 2>/dev/null)"
+    if [ -z "$alias" ] || ! jq -e --arg a "$alias" 'has($a)' <<<"$x509_cfgs" >/dev/null; then
+      warn "    x509 config ${alias:-$cid} is not one of realm-export.json's (custom flow?) — left alone"
+      continue
+    fi
+    code="$(printf '%s' "$cur" | jq --argjson c "$x509_cfgs" --arg a "$alias" '.config = ((.config // {}) + $c[$a])' \
       | kc_send PUT "/$KC_REALM/authentication/config/$cid")"
-    _kc_report "x509 config $cid" "$code" 204 || true
+    _kc_report "x509 config $alias" "$code" 204 && pushed="$pushed$alias "
   done
-  [ -n "$cfg_ids" ] || warn "    no X.509 executions found (custom flows?) — CRL checking not configured"
+  for want in $(jq -r 'keys[]' <<<"$x509_cfgs"); do
+    case "$pushed" in *" $want "*) ;; *) warn "    no X.509 execution with config $want (custom flows?) — that certificate kind's CA / CRL checks not configured" ;; esac
+  done
 
   info "Ensuring the amr mapper on the acr client scope..."
   scope_id="$(kc_get "/$KC_REALM/client-scopes" | jq -r '.[] | select(.name == "acr") | .id' | head -n1)"

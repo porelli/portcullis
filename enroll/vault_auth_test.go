@@ -74,10 +74,18 @@ func setup(t *testing.T, ttl int) (*fakeVault, *Config, *time.Time) {
 	return fv, cfg, &now
 }
 
+// rawSign is one signing call through the AppRole login (vaultAuth.do).
+func rawSign(cfg *Config) error {
+	return cfg.vault.do(func(vc *vault.Client) error {
+		_, err := vc.Logical().Write("pki_int/sign/client-cert", map[string]any{"csr": "csr"})
+		return err
+	})
+}
+
 func TestVaultAuthCachesTokenAndRelogsBeforeExpiry(t *testing.T) {
 	fv, cfg, now := setup(t, 3600)
 	for i := 0; i < 3; i++ {
-		if _, err := cfg.signCSR("alice", "", "csr"); err != nil {
+		if err := rawSign(cfg); err != nil {
 			t.Fatalf("sign %d: %v", i, err)
 		}
 	}
@@ -85,7 +93,7 @@ func TestVaultAuthCachesTokenAndRelogsBeforeExpiry(t *testing.T) {
 		t.Fatalf("logins = %d, want 1 (token should be cached)", got)
 	}
 	*now = now.Add(56 * time.Minute) // inside the refresh margin
-	if _, err := cfg.signCSR("alice", "", "csr"); err != nil {
+	if err := rawSign(cfg); err != nil {
 		t.Fatal(err)
 	}
 	if got := fv.logins.Load(); got != 2 {
@@ -95,11 +103,11 @@ func TestVaultAuthCachesTokenAndRelogsBeforeExpiry(t *testing.T) {
 
 func TestVaultAuthRetriesOnForbidden(t *testing.T) {
 	fv, cfg, _ := setup(t, 3600)
-	if _, err := cfg.signCSR("alice", "", "csr"); err != nil {
+	if err := rawSign(cfg); err != nil {
 		t.Fatal(err)
 	}
 	fv.current.Store("revoked-elsewhere") // cached token no longer valid
-	if _, err := cfg.signCSR("alice", "", "csr"); err != nil {
+	if err := rawSign(cfg); err != nil {
 		t.Fatalf("sign after revocation: %v", err)
 	}
 	if got := fv.logins.Load(); got != 2 {
@@ -110,7 +118,7 @@ func TestVaultAuthRetriesOnForbidden(t *testing.T) {
 func TestVaultAuthNoCredentialsNoFallback(t *testing.T) {
 	_, cfg, _ := setup(t, 3600)
 	os.Remove(cfg.vault.secretIDFile)
-	_, err := cfg.signCSR("alice", "", "csr")
+	err := rawSign(cfg)
 	if err == nil || !strings.Contains(err.Error(), "secret-id") {
 		t.Fatalf("want secret-id error, got %v", err)
 	}

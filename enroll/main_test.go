@@ -61,29 +61,6 @@ func TestValidateCSR(t *testing.T) {
 	}
 }
 
-func TestSignRequiresAdminAndJSON(t *testing.T) {
-	s := &Server{}
-	body := `{"username":"alice","csr":"x"}`
-
-	r := httptest.NewRequest("POST", "/api/sign", strings.NewReader(body))
-	r.Header.Set("Content-Type", "application/json")
-	r.Header.Set("X-Auth-Request-Groups", "users_grafana,lldap_admin_x")
-	w := httptest.NewRecorder()
-	s.handleSign(w, r)
-	if w.Code != 403 {
-		t.Errorf("non-admin: got %d", w.Code)
-	}
-
-	r = httptest.NewRequest("POST", "/api/sign", strings.NewReader(body))
-	r.Header.Set("Content-Type", "text/plain")
-	r.Header.Set("X-Auth-Request-Groups", "users_grafana, lldap_admin")
-	w = httptest.NewRecorder()
-	s.handleSign(w, r)
-	if w.Code != 415 {
-		t.Errorf("text/plain: got %d", w.Code)
-	}
-}
-
 // certPEM issues a test certificate (self-signed: only its fields matter).
 func certPEM(t *testing.T, cn string, isCA bool, usage []x509.ExtKeyUsage, notAfter time.Time) string {
 	t.Helper()
@@ -104,27 +81,44 @@ func certPEM(t *testing.T, cn string, isCA bool, usage []x509.ExtKeyUsage, notAf
 }
 
 // certVault fakes Vault's pki_int/certs list and pki_int/cert/<serial>
-// reads; data maps serial → the read's data (nil = a 500).
+// reads; data maps serial → the read's data (nil = a 500). pki_file is
+// empty.
 func certVault(t *testing.T, data map[string]map[string]any, order []string) *vault.Client {
+	return certVaultMounts(t, map[string]map[string]map[string]any{"pki_int": data}, map[string][]string{"pki_int": order})
+}
+
+// certVaultMounts fakes both mounts' <mount>/certs lists and
+// <mount>/cert/<serial> reads.
+func certVaultMounts(t *testing.T, data map[string]map[string]map[string]any, order map[string][]string) *vault.Client {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/pki_int/certs" && (r.Method == "LIST" || r.URL.Query().Get("list") == "true") {
-			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"keys": order}})
+		for _, mount := range certMounts {
+			if r.URL.Path == "/v1/"+mount+"/certs" && (r.Method == "LIST" || r.URL.Query().Get("list") == "true") {
+				keys := order[mount]
+				if keys == nil {
+					keys = []string{}
+				}
+				json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"keys": keys}})
+				return
+			}
+			serial, ok := strings.CutPrefix(r.URL.Path, "/v1/"+mount+"/cert/")
+			if !ok {
+				continue
+			}
+			if r.Method != http.MethodGet {
+				break
+			}
+			d := data[mount][serial]
+			if d == nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"errors":["internal error"]}`))
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"data": d})
 			return
 		}
-		serial, ok := strings.CutPrefix(r.URL.Path, "/v1/pki_int/cert/")
-		if !ok || r.Method != http.MethodGet {
-			t.Errorf("unexpected request %s %s", r.Method, r.URL)
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		d := data[serial]
-		if d == nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"errors":["internal error"]}`))
-			return
-		}
-		json.NewEncoder(w).Encode(map[string]any{"data": d})
+		t.Errorf("unexpected request %s %s", r.Method, r.URL)
+		w.WriteHeader(http.StatusNotFound)
 	}))
 	t.Cleanup(srv.Close)
 	cfg := vault.DefaultConfig()
@@ -207,8 +201,8 @@ func TestInternalCertificatesLists(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []map[string]any{
-		{"user": "alice", "serial": "1a:2b", "not_after": "2027-01-02T03:04:05Z", "revoked": false},
-		{"user": "bob", "serial": "3c:4d", "not_after": "2027-01-02T04:04:05Z", "revoked": true},
+		{"user": "alice", "serial": "1a:2b", "kind": "yubikey", "not_before": "2027-01-01T03:04:05Z", "not_after": "2027-01-02T03:04:05Z", "revoked": false},
+		{"user": "bob", "serial": "3c:4d", "kind": "yubikey", "not_before": "2027-01-01T04:04:05Z", "not_after": "2027-01-02T04:04:05Z", "revoked": true},
 	}
 	got, _ := json.Marshal(doc["certificates"])
 	exp2, _ := json.Marshal(want)

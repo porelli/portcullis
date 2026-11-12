@@ -7,6 +7,9 @@ RUN pip install --no-cache-dir --root-user-action=ignore --disable-pip-version-c
  && rm /tmp/requirements.txt
 COPY group-gate.py /app/group-gate.py
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+# The group_gate_data mountpoint (the opened log): a fresh volume takes this
+# owner, 10003 with the Hub's group 10001 (./portcullis up also sets it).
+RUN install -d -o 10003 -g 10001 -m 0750 /data
 # Non-root, no home: reads only world-readable mounts (compose: read-only
 # root FS, tmpfs /tmp). No ENTRYPOINT: `./portcullis backup` runs its SQLite
 # helpers as `docker run <this image> python3 -c ...` under the volume owner's uid.

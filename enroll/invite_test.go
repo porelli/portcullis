@@ -51,10 +51,9 @@ func testInvites(t *testing.T) (*inviteService, *[]string) {
 	return s, required
 }
 
-func publicMux(s *inviteService) http.Handler {
-	m := http.NewServeMux()
-	s.register(m)
-	return http.NewCrossOriginProtection().Handler(m)
+// inviteMux is the public listener as main serves it.
+func inviteMux(s *inviteService) http.Handler {
+	return http.NewCrossOriginProtection().Handler(publicMux(&Server{}, s))
 }
 
 func do(h http.Handler, method, target string, body string, hdr map[string]string) *httptest.ResponseRecorder {
@@ -121,7 +120,7 @@ func token(u string) string { return u[strings.LastIndex(u, "/")+1:] }
 
 func TestInviteFullFlow(t *testing.T) {
 	s, required := testInvites(t)
-	h := publicMux(s)
+	h := inviteMux(s)
 	_, first := apiCreate(t, s, false, "alice", "Bearer "+testAPISecret)
 	_, out := apiCreate(t, s, false, "alice", "Bearer "+testAPISecret)
 	tok := token(out["url"])
@@ -286,7 +285,7 @@ func TestInviteKeycloakDownKeepsTheLink(t *testing.T) {
 	s, _ := testInvites(t)
 	s.requirePasskey = func(string) error { return errors.New("down") }
 	tok, _, _ := s.Create("alice", "", 0, false)
-	if w := do(publicMux(s), "POST", "/invite/"+tok, "", map[string]string{"Sec-Fetch-Site": "same-origin"}); w.Code != http.StatusServiceUnavailable {
+	if w := do(inviteMux(s), "POST", "/invite/"+tok, "", map[string]string{"Sec-Fetch-Site": "same-origin"}); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("redeem with Keycloak down: %d", w.Code)
 	}
 	if s.peek(tok) == nil {
@@ -330,7 +329,7 @@ func TestProtectedGroupsFromTheMap(t *testing.T) {
 // before redeeming it must not hand over the admin account.
 func TestInviteAPIRecheckAfterPromotion(t *testing.T) {
 	s, required := testInvites(t)
-	h := publicMux(s)
+	h := inviteMux(s)
 	auth := "Bearer " + testAPISecret
 	groups := map[string][]string{"alice": {"users_wiki"}}
 	lookupFails := false

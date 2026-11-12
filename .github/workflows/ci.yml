@@ -8,13 +8,28 @@ on:
   pull_request:
     branches: [main]
     paths-ignore: ['**.md', 'docs/**', 'LICENSE']
-  # release.yml runs exactly these checks before publishing a tag.
+  # release.yml runs exactly these checks before publishing a tag (it
+  # passes no `jobs`: the default `all`).
   workflow_call:
+    inputs:
+      jobs:
+        description: Jobs to run (always all for a release)
+        type: string
+        default: all
   # Cross-repo feature branches (e.g. `instances`): run by hand with
   # `gh workflow run ci.yml --ref <branch>`; the Hub and the Keycloak image
   # are then built from the Hub's / portcullis-keycloak's same-named branch
   # (.github/actions/hub-image, .github/actions/keycloak-image).
+  # `-f jobs=build-and-test,e2e-signin` (comma- or space-separated job
+  # names) runs only those jobs; the default `all` runs every job; an
+  # unknown name fails the run (job `jobs-input`). Push and pull_request
+  # always run everything.
   workflow_dispatch:
+    inputs:
+      jobs:
+        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai"
+        type: string
+        default: all
 
 
 # A newer push to the same ref supersedes the older run (runners are shared
@@ -43,6 +58,12 @@ env:
   # on the runners (./portcullis up uses these instead).
   PORTCULLIS_PUBLIC_IPV4: 203.0.113.10
   PORTCULLIS_PUBLIC_IPV6: ""
+  # docker/build-push-action: no build summary / build-record artifact in
+  # its post step. Nothing reads them, and on 2026-11-11 (run 43092132806)
+  # the artifact service answered HTML for each upload: 5 retries ≈ 10.5 min
+  # per build, 30+ minutes after e2e-settings' tests had all passed.
+  DOCKER_BUILD_SUMMARY: "false"
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
   # Pebble (ACME test CA) for the domains service test (also in the CI override).
   PEBBLE_IMG: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
 
@@ -53,9 +74,52 @@ env:
 # .github/actions/cached-images).
 
 jobs:
-  unit-tests:
+  # First, and needed by every other job: a workflow_dispatch `jobs` input
+  # naming a job that doesn't exist fails the run here (a typo would
+  # otherwise skip every job and the run would show green with nothing
+  # run). Empty and `all` run everything; push / pull_request /
+  # workflow_call aren't checked (they always run everything). The known
+  # names are read from this file's own `jobs:` keys, so the list can't
+  # drift from the jobs.
+  jobs-input:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          sparse-checkout: .github/workflows/ci.yml
+          sparse-checkout-cone-mode: false
+      - name: Check the jobs input
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          JOBS: ${{ inputs.jobs }}
+        run: |
+          case "$JOBS" in ''|all) echo "jobs: all"; exit 0 ;; esac
+          known="$(yq -r '.jobs | keys | .[]' .github/workflows/ci.yml | grep -vx 'jobs-input' | paste -sd ' ' -)"
+          [ -n "${known// }" ] || { echo "::error::could not read the job names from ci.yml"; exit 1; }
+          # The jobs' `if`s split on commas and spaces only: anything else
+          # (tabs, newlines) can't match a name either.
+          [[ "$JOBS" != *$'\n'* ]] || { echo "::error::jobs: one line of names separated by commas and/or spaces"; exit 1; }
+          IFS=', ' read -r -a names <<< "$JOBS"
+          picked="" bad=""
+          for n in "${names[@]}"; do
+            [ -n "$n" ] || continue
+            if [[ " $known " == *" $n "* ]]; then picked="$picked $n"; else bad="$bad $n"; fi
+          done
+          [ -z "$bad" ] || { echo "::error::jobs: unknown job name(s):$bad (known: $known; or \`all\` alone)"; exit 1; }
+          [ -n "$picked" ] || { echo "::error::jobs: no job names given (known: $known; or \`all\` alone)"; exit 1; }
+          echo "jobs:$picked"
+
+  unit-tests:
+    needs: jobs-input
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',unit-tests,') || contains(format(' ,{0}, ', inputs.jobs), ',unit-tests ') || contains(format(' ,{0}, ', inputs.jobs), ' unit-tests,') || contains(format(' ,{0}, ', inputs.jobs), ' unit-tests ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: shellcheck
@@ -155,6 +219,11 @@ jobs:
           if HUB_PROXY_SECRET='' docker compose -f docker-compose.yml config -q 2>/dev/null; then
             echo "FAIL: compose accepted an empty HUB_PROXY_SECRET"; exit 1
           fi
+          for v in FORWARD_AUTH_REDIS_PASSWORD FORWARD_AUTH_EXT_REDIS_PASSWORD; do
+            if env "$v=" docker compose -f docker-compose.yml config -q 2>/dev/null; then
+              echo "FAIL: compose accepted an empty $v"; exit 1
+            fi
+          done
           if grep -rn 'portcullis-forward-auth-secret' docker-compose*.yml keycloak/ .env.example; then
             echo "FAIL: public default forward-auth secret is back"; exit 1
           fi
@@ -214,7 +283,6 @@ jobs:
           grep -qx 'people=\*' group-gate/group-gate-map.conf || { echo "FAIL: people is not * (any signed-in user) in the group-gate map"; exit 1; }
           echo "$CFG" | jq -e --arg d "${PORTCULLIS_DOMAIN:-ci.example.org}" '.services["group-gate"].labels as $g | .services["forward-auth"].labels as $f | .services.hub.labels as $h
               | ([$g["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeadersRegex"],
-                  $g["traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeadersRegex"],
                   $g["traefik.http.middlewares.portcullis-public-guard.forwardauth.authResponseHeadersRegex"],
                   $f["traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeadersRegex"],
                   $f["traefik.http.middlewares.portcullis-auth-console.forwardauth.authResponseHeadersRegex"],
@@ -222,7 +290,7 @@ jobs:
               and .services.hub.environment.HUB_PEOPLE_ADDR == ":8889"
               and $h["traefik.http.routers.people.rule"] == "Host(`people.\($d)`)"
               and $h["traefik.http.routers.people.tls.options"] == "authaware@file"
-              and $h["traefik.http.routers.people.middlewares"] == "rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file"
+              and $h["traefik.http.routers.people.middlewares"] == "rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file"
               and $h["traefik.http.services.\($h["traefik.http.routers.people.service"]).loadbalancer.server.port"] == "8889"
               and $h["traefik.http.services.\($h["traefik.http.routers.hub.service"]).loadbalancer.server.port"] == "8888"
               and .services.lldap.labels["traefik.http.middlewares.directory-redirect.redirectregex.replacement"] == "https://people.\($d)/"
@@ -241,8 +309,7 @@ jobs:
           # group-gate needs the username header from portcullis-auth and must
           # pass it on; both forward-auth middlewares strip client copies.
           echo "$CFG" | jq -e '[.services["forward-auth"].labels["traefik.http.middlewares.portcullis-auth.forwardauth.authResponseHeaders"],
-                 .services["group-gate"].labels["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders"],
-                 .services["group-gate"].labels["traefik.http.middlewares.portcullis-self.forwardauth.authResponseHeaders"]]
+                 .services["group-gate"].labels["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders"]]
               | all(split(",") | index("X-Auth-Request-Preferred-Username") and index("X-Forwarded-User") and index("X-Auth-Request-User"))' >/dev/null \
             || { echo "FAIL: identity headers missing from a forward-auth authResponseHeaders"; exit 1; }
           # Expired memberships: group-gate must be able to withhold the token
@@ -365,12 +432,79 @@ jobs:
                     | $l["traefik.http.routers.\($r).middlewares"] == "rate-limit@file,security-headers@file"
                     and $l["traefik.http.routers.\($r).service"] == "mcp-gate"
                     and $l["traefik.http.routers.\($r).entrypoints"] == "websecure"))
-              and ([$l | to_entries[] | select(.key | test("\\.middlewares$")) | .value | select(test("portcullis-auth|portcullis-groups|portcullis-self|proxy-secret"))] == [])
+              and ([$l | to_entries[] | select(.key | test("\\.middlewares$")) | .value | select(test("portcullis-auth|portcullis-groups|proxy-secret"))] == [])
               and $l["traefik.http.routers.mcp.tls.options"] == "authaware@file"
               and $l["traefik.http.routers.hub-mcp.tls.options"] == $hl["traefik.http.routers.hub.tls.options"]
               and $l["traefik.http.routers.people-mcp.tls.options"] == $hl["traefik.http.routers.people.tls.options"]
               and prio("hub-mcp"; $l) > prio("hub"; $hl) and prio("people-mcp"; $l) > prio("people"; $hl)' >/dev/null \
             || { echo "FAIL: mcp-gate wiring (contract §15 / §5, G36 G44 G74)"; exit 1; }
+          # Session store (scripts/lib/sessions.sh; oauth2-proxy #3486): Valkey
+          # pinned, hardened, read-only, non-root, no ports / env / routers,
+          # memory-only on a tmpfs /data; its config only in it, read-only;
+          # portcullis-sessions internal with exactly sessions + the two
+          # oauth2-proxies (like portcullis-mcp's members); each proxy its own
+          # store user and generated password (never shared with any other
+          # service), waits for the store healthy; the cookie name / domain
+          # unchanged.
+          echo "$CFG" | jq -e '.services.sessions as $s | .services["forward-auth"] as $m | .services["forward-auth-ext"] as $x
+              | def members($n): [.services | to_entries[] | select((.value.networks // {}) | has($n)) | .key] | sort;
+              def mounts($src): [.services | to_entries[] | select([.value.volumes[]? | .source // "" | select(test($src))] | length > 0) | .key] | sort;
+              ($s.image | test("^valkey/valkey:[0-9]+\\.[0-9]+\\.[0-9]+(-alpine[0-9.]*)?@sha256:[0-9a-f]{64}$"))
+              and $s.user == "999:1000" and $s.read_only == true
+              and $s.cap_drop == ["ALL"] and ($s.security_opt | index("no-new-privileges:true")) != null
+              and $s.mem_limit != null and $s.pids_limit != null
+              and ($s.tmpfs // [] | index("/data")) != null
+              and ($s.ports // []) == [] and ($s.expose // []) == []
+              and ($s.environment // {}) == {}
+              and ([$s.labels // {} | keys[] | select(startswith("traefik."))] == [])
+              and $s.command == ["valkey-server", "/etc/valkey/valkey.conf"]
+              and ([$s.volumes[] | "\(.type):\(.source | sub("^.*/secrets/"; "secrets/")):\(.target):\(.read_only // false)"]
+                   == ["bind:secrets/sessions/valkey.conf:/etc/valkey/valkey.conf:true"])
+              and (mounts("secrets/sessions/") == ["sessions"])
+              and ($s.healthcheck.test | join(" ") | test("NOAUTH"))
+              and ([$s.networks | keys[]] == ["portcullis-sessions"])
+              and .networks["portcullis-sessions"].internal == true
+              and (members("portcullis-sessions") == ["forward-auth", "forward-auth-ext", "sessions"])
+              and ([$m.networks | keys[]] | sort == ["portcullis", "portcullis-sessions"])
+              and ([$x.networks | keys[]] | sort == ["portcullis", "portcullis-sessions"])
+              and ([$m, $x] | all(.depends_on.sessions.condition == "service_healthy"
+                   and .environment.OAUTH2_PROXY_SESSION_STORE_TYPE == "redis"
+                   and .environment.OAUTH2_PROXY_REDIS_CONNECTION_URL == "redis://sessions:6379"
+                   and (.environment.OAUTH2_PROXY_REDIS_PASSWORD | test("^[A-Za-z0-9]{40}$"))))
+              and $m.environment.OAUTH2_PROXY_REDIS_USERNAME == "forward-auth"
+              and $x.environment.OAUTH2_PROXY_REDIS_USERNAME == "forward-auth-ext"
+              and $m.environment.OAUTH2_PROXY_REDIS_PASSWORD != $x.environment.OAUTH2_PROXY_REDIS_PASSWORD
+              and ($m.environment.OAUTH2_PROXY_COOKIE_NAME // null) == null
+              and $m.environment.OAUTH2_PROXY_COOKIE_DOMAINS == ".\($m.environment.PORTCULLIS_DOMAIN)"
+              and ([.services | to_entries[] | select(.key != "forward-auth" and .key != "forward-auth-ext") | .value.environment // {} | to_entries[]
+                   | select(.value == $m.environment.OAUTH2_PROXY_REDIS_PASSWORD or .value == $x.environment.OAUTH2_PROXY_REDIS_PASSWORD)] == [])' >/dev/null \
+            || { echo "FAIL: session store wiring (sessions, portcullis-sessions, the oauth2-proxies' redis settings)"; exit 1; }
+          # Contract §4 "Opened log" / §8.2 (sign-in part 2): group_gate_data is
+          # mounted by exactly group-gate (rw at /data, uid 10003 + group 10001
+          # only) and the Hub (rw at /group-gate-data, to prune day files);
+          # group-gate reads both CA files read-only and both CAs' CRL lists;
+          # no enroll / enroll-self router and no self-service middleware —
+          # enroll-invite is the only router on enroll.<domain>.
+          echo "$CFG" | jq -e --arg d "${PORTCULLIS_DOMAIN:-ci.example.org}" '.services["group-gate"] as $g | .services.hub as $h
+              | ([.services | to_entries[] | select([.value.volumes[]? | select(.type == "volume" and .source == "group_gate_data")] | length > 0) | .key] | sort == ["group-gate", "hub"])
+              and ([$g.volumes[] | select(.source == "group_gate_data") | "\(.target):\(.read_only // false)"] == ["/data:false"])
+              and ([$h.volumes[] | select(.source == "group_gate_data") | "\(.target):\(.read_only // false)"] == ["/group-gate-data:false"])
+              and $g.user == "10003:10003" and $g.group_add == ["10001"]
+              and $g.environment.GATE_OPENED_DIR == "/data/opened" and $h.environment.HUB_GROUP_GATE_DATA_DIR == "/group-gate-data"
+              and $g.environment.GATE_YUBIKEY_CA_FILE == "/etc/group-gate/ca/yubikey-ca.crt"
+              and $g.environment.GATE_BROWSER_CA_FILE == "/etc/group-gate/ca/browser-ca.crt"
+              and ([$g.volumes[] | select(.target | startswith("/etc/group-gate/ca/")) | "\(.source | sub("^.*/certs/"; "certs/")):\(.target):\(.read_only // false)"] | sort
+                   == ["certs/browser-ca.crt:/etc/group-gate/ca/browser-ca.crt:true", "certs/yubikey-ca.crt:/etc/group-gate/ca/yubikey-ca.crt:true"])
+              and $g.environment.GATE_CRL_URLS == "http://vault:8200/v1/pki_int/crl http://vault:8200/v1/pki_file/crl"
+              and $g.environment.GATE_DELTA_CRL_URLS == "http://vault:8200/v1/pki_int/crl/delta http://vault:8200/v1/pki_file/crl/delta"
+              and ($g.environment | has("GATE_CRL_URL") or has("GATE_DELTA_CRL_URL") | not)
+              and $h.environment.HUB_CLIENT_CERT_TTL == "720h" and $h.environment.HUB_CERT_EXPIRY_WARN_DAYS == "7"
+              and .services.keycloak.environment.PORTCULLIS_SIGNIN_URL == "https://people.\($d)/signin"
+              and ([.services[].labels // {} | keys[] | select(test("^traefik\\.http\\.middlewares\\.[^.]*-self\\."))] == [])
+              and ([.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.rule$")) | select(.value | test("enroll\\.")) | .key]
+                   == ["traefik.http.routers.enroll-invite.rule"])
+              and .services.enroll.labels["traefik.http.routers.enroll-invite.rule"] == "Host(`enroll.\($d)`) && PathPrefix(`/invite/`)"' >/dev/null \
+            || { echo "FAIL: group_gate_data / group-gate CA files + CRL lists / Hub sign-in env / enroll.<domain> routers (contract §4, §5, §8.2)"; exit 1; }
           grep -qx 'mcp=\*' group-gate/group-gate-map.conf || { echo "FAIL: mcp is not * in the group-gate map (core host, contract §4)"; exit 1; }
           PORT8890="$(for files in "docker-compose.yml" "docker-compose.yml -f docker-compose.apps.yml" "docker-compose.test.yml"; do
               # shellcheck disable=SC2086
@@ -394,7 +528,7 @@ jobs:
              || grep -rniE 'skip[-_]jwt[-_]bearer[-_]tokens' docker-compose*.yml oauth2-proxy/; then
             echo "FAIL: oauth2-proxy must not accept JWT bearer tokens"; exit 1
           fi
-          echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring, domains service, mcp-gate"
+          echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring, domains service, mcp-gate, session store"
 
       - name: every image is pinned tag@sha256 (all compose files, all profiles, CLI, workflows)
         run: |
@@ -560,6 +694,12 @@ jobs:
           key: ${{ steps.go-cache.outputs.cache-primary-key }}
 
   build-and-test:
+    needs: jobs-input
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',build-and-test,') || contains(format(' ,{0}, ', inputs.jobs), ',build-and-test ') || contains(format(' ,{0}, ', inputs.jobs), ' build-and-test,') || contains(format(' ,{0}, ', inputs.jobs), ' build-and-test ')
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -635,6 +775,7 @@ jobs:
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/*.sh
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -645,6 +786,7 @@ jobs:
       # its layer cache too.
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -656,6 +798,7 @@ jobs:
           cache-from: type=gha,scope=enroll
           cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=enroll,mode=max' || '' }}
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -667,6 +810,7 @@ jobs:
           cache-from: type=gha,scope=group-gate
           cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=group-gate,mode=max' || '' }}
       - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -679,6 +823,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=domains-test,mode=max' || '' }}
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -690,8 +835,10 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=mcp-gate,mode=max' || '' }}
       - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/hub-image
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: Start core services (without Traefik ACME)
@@ -765,7 +912,13 @@ jobs:
         run: |
           test -f certs/root-ca.crt || (echo "FAIL: root-ca.crt missing" && exit 1)
           test -f certs/intermediate-ca.crt || (echo "FAIL: intermediate-ca.crt missing" && exit 1)
+          test -s certs/yubikey-ca.crt || (echo "FAIL: yubikey-ca.crt missing or empty" && exit 1)
+          test -s certs/browser-ca.crt || (echo "FAIL: browser-ca.crt missing or empty" && exit 1)
           test -f certs/ca-chain.crt || (echo "FAIL: ca-chain.crt missing" && exit 1)
+          test -f certs/ca-chain-yubikey.crt || (echo "FAIL: ca-chain-yubikey.crt missing" && exit 1)
+          for f in portcullis-ca-chain.pem portcullis-yubikey-ca.pem portcullis-browser-ca.pem; do
+            test -f "certs/truststore/$f" || { echo "FAIL: truststore/$f missing"; exit 1; }
+          done
           test -f certs/server.crt || (echo "FAIL: server.crt missing" && exit 1)
           test -f certs/server.key || (echo "FAIL: server.key missing" && exit 1)
           echo "PASS: All PKI certificates created"
@@ -773,7 +926,20 @@ jobs:
       - name: Verify CA chain is valid
         run: |
           openssl verify -CAfile certs/root-ca.crt certs/intermediate-ca.crt
+          openssl verify -CAfile certs/root-ca.crt certs/yubikey-ca.crt
+          openssl verify -CAfile certs/root-ca.crt certs/browser-ca.crt
           openssl verify -CAfile certs/ca-chain.crt certs/server.crt
+          # ca-chain.crt = root + pki_int + pki_file; ca-chain-yubikey.crt = pki_int ONLY
+          # (review C1: Go trusts every caFiles certificate as an anchor, so a root
+          # there would let a browser certificate sending pki_file + root through).
+          subjects() { openssl crl2pkcs7 -nocrl -certfile "$1" | openssl pkcs7 -print_certs -noout | sed -n 's/^subject=//p'; }
+          test "$(subjects certs/ca-chain.crt | tr '\n' '|')" = "$(for f in root-ca yubikey-ca browser-ca; do subjects "certs/$f.crt"; done | tr '\n' '|')" \
+            || { echo "FAIL: ca-chain.crt is not root + YubiKey CA + browser CA"; subjects certs/ca-chain.crt; exit 1; }
+          test "$(subjects certs/ca-chain-yubikey.crt | tr '\n' '|')" = "$(subjects certs/yubikey-ca.crt | tr '\n' '|')" \
+            || { echo "FAIL: ca-chain-yubikey.crt is not the YubiKey CA alone"; subjects certs/ca-chain-yubikey.crt; exit 1; }
+          cmp -s certs/ca-chain-yubikey.crt certs/yubikey-ca.crt || { echo "FAIL: ca-chain-yubikey.crt differs from yubikey-ca.crt"; exit 1; }
+          test "$(subjects certs/yubikey-ca.crt)" != "$(subjects certs/browser-ca.crt)" || { echo "FAIL: the two CAs have the same subject"; exit 1; }
+          cmp -s certs/ca-chain.crt certs/truststore/portcullis-ca-chain.pem || { echo "FAIL: truststore chain differs"; exit 1; }
           echo "PASS: Certificate chain is valid"
 
       - name: Test Vault persistence and auto-unseal across restart
@@ -800,17 +966,50 @@ jobs:
             role_id=@secrets/enroll/role-id secret_id=@secrets/enroll/secret-id)
           [ -z "$TOKEN" ] || [ "$TOKEN" = null ] || echo "::add-mask::$TOKEN"
           export VAULT_TOKEN="$TOKEN"
-          vault list pki_int/certs >/dev/null || { echo "FAIL: enroll token cannot list certs"; exit 1; }
-          for denied in "write -f pki/root/generate/internal common_name=x" \
-                        "write pki_int/issue/server-cert common_name=x.portcullis.local" \
-                        "write pki_int/revoke serial_number=00" \
-                        "read sys/auth" \
-                        "policy write evil -"; do
-            # shellcheck disable=SC2086
-            if echo 'path "*" { capabilities = ["sudo"] }' | vault $denied >/dev/null 2>&1; then
-              echo "FAIL: enroll token was allowed: vault $denied"; exit 1
+          # allowed <vault args>: the policy lets the call through — it may still
+          # fail for other reasons (a bad CSR, an unknown serial), never 403.
+          allowed() {
+            local out
+            out="$(vault "$@" 2>&1 </dev/null)" && return 0
+            case "$out" in *"permission denied"*)
+              echo "FAIL: enroll token was denied: vault $*"; printf '%s\n' "$out"; exit 1 ;;
+            esac
+          }
+          # denied <vault args>: refused by the policy — a non-zero exit AND
+          # "permission denied" (the CLI exits 2 for every API error).
+          denied() {
+            local out rc=0
+            out="$(echo 'path "*" { capabilities = ["sudo"] }' | vault "$@" 2>&1)" || rc=$?
+            if [ "$rc" = 0 ] || [[ "$out" != *"permission denied"* ]]; then
+              echo "FAIL: enroll token was not refused with permission denied: vault $* (exit $rc)"
+              printf '%s\n' "$out"; exit 1
             fi
+          }
+          vault list pki_int/certs >/dev/null || { echo "FAIL: enroll token cannot list certs"; exit 1; }
+          allowed list pki_file/certs
+          allowed read pki_int/cert/ca
+          allowed read pki_file/cert/ca
+          # A bad CSR / unknown serial: Vault answers 400, which proves the policy allowed it.
+          allowed write pki_int/sign/client-cert csr=not-a-csr common_name=ci-policy-check
+          allowed write pki_file/sign/browser-cert csr=not-a-csr common_name=ci-policy-check
+          allowed write pki_int/revoke serial_number=00:00:00:00
+          allowed write pki_file/revoke serial_number=00:00:00:00
+          allowed read -format=json pki_int/crl/rotate
+          allowed read -format=json pki_file/crl/rotate
+          denied write -f pki/root/generate/internal common_name=x
+          denied write pki_int/issue/server-cert common_name=x.portcullis.local
+          denied write pki_file/issue/browser-cert common_name=x
+          denied write pki_file/roles/browser-cert max_ttl=87600h
+          denied write pki_file/config/crl disable=true
+          denied write pki_file/intermediate/set-signed certificate=x
+          # Signing never takes SANs (denied_parameters on both sign paths).
+          for san in alt_names=evil.example ip_sans=10.0.0.1 uri_sans=spiffe://evil other_sans="1.2.3.4;UTF8:evil"; do
+            denied write pki_file/sign/browser-cert csr=not-a-csr common_name=ci-policy-check "$san"
+            denied write pki_int/sign/client-cert csr=not-a-csr common_name=ci-policy-check "$san"
           done
+          denied read sys/auth
+          denied read sys/mounts
+          denied policy write evil -
           TTL=$(vault token lookup -format=json | jq -r .data.ttl)
           [ "$TTL" -gt 0 ] && [ "$TTL" -le 3600 ] || { echo "FAIL: enroll token TTL $TTL not short-lived"; exit 1; }
           echo "PASS: enroll token can only use its PKI paths (ttl ${TTL}s)"
@@ -1272,7 +1471,7 @@ jobs:
                   templates: {standard: {op: "any", items: [{op: "any", items: ["passkey_synced", "passkey_device", "security_key"]},
                                                             {op: "any", items: ["yubikey_cert"]}]}},
                   default: "standard", hosts: {},
-                  core: ([""] + ["directory.", "enroll.", "hub.", "metrics.", "people.", "traefik."]
+                  core: ([""] + ["directory.", "hub.", "metrics.", "people.", "traefik."]
                          | map({key: (. + "portcullis.local"), value: "standard"}) | from_entries),
                   people: {}, add_stronger: false, extra_domains: []}' > /tmp/ci-policy-v6.json
           docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
@@ -1826,24 +2025,27 @@ jobs:
             || { echo "FAIL: no signin.reset_core audit entry by cli naming the change"; exit 1; }
           echo "PASS: signin reset-core refuses without --yes and a tty (exit 2), undoes a method switched off through the API, puts hub / people on standard, writes state.yaml / audit.jsonl / .hub.lock as 10001, audits it, starts the Hub again"
 
-      - name: Test enrollment UI responds
+      # enroll is no longer a site (contract §5 "Core routers", D31): only
+      # /healthz, the setup-link pages (/invite/*) and the internal API on
+      # :8444 (bearer) remain. Its old pages and APIs must be gone.
+      - name: Find enroll; its retired pages and APIs are gone
         run: |
           ENROLL_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q enroll)")
           test -n "$ENROLL_IP" || { echo "FAIL: no enroll IP on the portcullis network"; exit 1; }
           echo "ENROLL_IP=$ENROLL_IP" >> "$GITHUB_ENV"
           for _ in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' "http://$ENROLL_IP:8443/" || true)
-            [ "$code" = 200 ] && { echo "PASS: Enrollment UI is serving pages"; exit 0; }
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://$ENROLL_IP:8443/healthz" || true)
+            [ "$code" = 200 ] && break
             sleep 2
           done
-          echo "FAIL: Enrollment UI returned $code"; docker compose logs --tail=30 enroll; exit 1
-
-      - name: Test enrollment API - list users
-        run: |
-          USERS=$(curl -sf "http://$ENROLL_IP:8443/api/users")
-          echo "$USERS" | jq -e 'type == "array" and any(.[]; .username == "testuser")' >/dev/null \
-            || { echo "FAIL: /api/users did not return testuser: $USERS"; exit 1; }
-          echo "PASS: Enrollment API returned $(echo "$USERS" | jq length) users"
+          [ "$code" = 200 ] || { echo "FAIL: enroll /healthz returned $code"; docker compose logs --tail=30 enroll; exit 1; }
+          for p in / /users /certs /enroll/testuser /api/users /self /api/self/renew; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://$ENROLL_IP:8443$p" || true)
+            [ "$code" = 404 ] || { echo "FAIL: enroll still answers GET $p ($code)"; exit 1; }
+          done
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{}' "http://$ENROLL_IP:8443/api/sign" || true)
+          case "$code" in 404|405) ;; *) echo "FAIL: enroll still answers POST /api/sign ($code)"; exit 1 ;; esac
+          echo "PASS: enroll serves /healthz; its old pages, /api/users, /api/sign and /self are gone"
 
       - name: Test the sign-in flows, setup links and the invite APIs
         run: |
@@ -1866,7 +2068,8 @@ jobs:
           EX=$(kc /authentication/flows/portcullis-universal/executions)
           echo "$EX" | jq -e '[.[] | [.level, (if .authenticationFlow then .displayName else .providerId end), .requirement]]
               == [[0, "portcullis-authenticate", "REQUIRED"], [1, "auth-cookie", "ALTERNATIVE"], [1, "identity-provider-redirector", "ALTERNATIVE"],
-                  [1, "portcullis-signin", "ALTERNATIVE"], [2, "portcullis-x509", "ALTERNATIVE"], [2, "portcullis-signin-passkey", "ALTERNATIVE"],
+                  [1, "portcullis-signin", "ALTERNATIVE"], [2, "portcullis-x509", "ALTERNATIVE"], [2, "portcullis-x509", "ALTERNATIVE"],
+                  [2, "portcullis-signin-passkey", "ALTERNATIVE"],
                   [3, "portcullis-passkey", "REQUIRED"],
                   [3, "portcullis-passkey-security-key", "CONDITIONAL"], [4, "portcullis-condition-passkey-kind", "REQUIRED"], [4, "portcullis-method", "REQUIRED"],
                   [3, "portcullis-passkey-device", "CONDITIONAL"], [4, "portcullis-condition-passkey-kind", "REQUIRED"], [4, "portcullis-method", "REQUIRED"],
@@ -1875,9 +2078,24 @@ jobs:
             || { echo "FAIL: browser flow: $(echo "$EX" | jq -c '[.[] | [.level, (if .authenticationFlow then .displayName else .providerId end), .requirement]]')"; exit 1; }
           # Every reference execution keeps its method 10 h in the amr.
           for c in $(echo "$EX" | jq -r '.[] | select(.providerId // "" | IN("portcullis-x509", "portcullis-password-form", "portcullis-method")) | .authenticationConfig // "none"'); do
-            kc "/authentication/config/$c" | jq -e '(.config["default.reference.value"] | IN("mtls", "pwd", "hwk", "dpk", "spk")) and .config["default.reference.maxAge"] == "36000"' >/dev/null \
+            kc "/authentication/config/$c" | jq -e '(.config["default.reference.value"] | IN("mtls", "file", "pwd", "hwk", "dpk", "spk")) and .config["default.reference.maxAge"] == "36000"' >/dev/null \
               || { echo "FAIL: reference config $c: $(kc "/authentication/config/$c" | jq -c .config)"; exit 1; }
           done
+          # The two x509 executions (contract §8.1, sign-in part 2), in order:
+          # x509-config (YubiKey: pki_int's CA and CRLs, amr mtls), then
+          # x509-browser-config (browser: pki_file's, amr file), as configure pushed them.
+          X509=$(for c in $(echo "$EX" | jq -r '.[] | select(.providerId == "portcullis-x509") | .authenticationConfig'); do
+                   kc "/authentication/config/$c" | jq -c '{alias, m: .config["portcullis.method"], ref: .config["default.reference.value"], ca: .config["portcullis.ca"],
+                       crl: .config["x509-cert-auth.crl-relative-path"], abort: .config["x509-cert-auth-crl-abort-if-non-updated"]}'
+                 done | jq -sc .)
+          T=/opt/keycloak/conf/truststores/portcullis
+          [ "$X509" = "$(jq -nc --arg t "$T" '[{alias: "x509-config", m: "yubikey_cert", ref: "mtls", ca: "\($t)/portcullis-yubikey-ca.pem",
+                crl: "http://vault:8200/v1/pki_int/crl##http://vault:8200/v1/pki_int/crl/delta", abort: "true"},
+              {alias: "x509-browser-config", m: "browser_cert", ref: "file", ca: "\($t)/portcullis-browser-ca.pem",
+                crl: "http://vault:8200/v1/pki_file/crl##http://vault:8200/v1/pki_file/crl/delta", abort: "true"}]')" ] \
+            || { echo "FAIL: the x509 configs: $X509"; exit 1; }
+          kc /events/config | jq -e '.eventsEnabled and ((.enabledEventTypes | sort) == ["LOGIN", "LOGIN_ERROR"]) and .eventsExpiration > 0' >/dev/null \
+            || { echo "FAIL: realm events config: $(kc /events/config | jq -c '{eventsEnabled, enabledEventTypes, eventsExpiration}')"; exit 1; }
           kc /authentication/required-actions | jq -e '[.[] | select(.alias | startswith("webauthn-register")) | [.alias, .enabled]] | sort
               == [["webauthn-register", false], ["webauthn-register-passwordless", true]]' >/dev/null \
             || { echo "FAIL: required actions: webauthn-register-passwordless on, the two-factor webauthn-register off"; exit 1; }
@@ -2120,26 +2338,34 @@ jobs:
           [ -n "$(tok)" ] && [ "$(tok)" != null ] || { echo "FAIL: master admin can't sign in"; exit 1; }
           echo "PASS: users and groups deleted in LLDAP leave Keycloak (group at sync, user at lookup); a re-created name is a new Keycloak identity (entryUUID); LLDAP outage removes nothing; core's accounts kept"
 
-      - name: Test enrollment API - sign CSR (AppRole token)
+      # The admin CSR path that replaced /api/sign (contract §9.4, D23):
+      # enroll's internal API on :8444 with the invite bearer, signed on
+      # pki_int through enroll's own AppRole.
+      - name: Test enroll's YubiKey certificate API - sign a CSR (AppRole token)
         run: |
-          PAYLOAD=$(jq -n --arg csr "$(cat /tmp/test-client.csr)" \
-            '{username:"testuser",email:"testuser@portcullis.local",csr:$csr}')
-          # Direct-to-container call bypasses Traefik, so supply the
-          # header Traefik would set from forward-auth for an admin.
-          RESPONSE=$(curl -s -X POST "http://$ENROLL_IP:8443/api/sign" \
-            -H "Content-Type: application/json" \
-            -H "X-Auth-Request-Groups: lldap_admin" \
-            -d "$PAYLOAD")
-          SERIAL=$(echo "$RESPONSE" | jq -r '.serial // empty' 2>/dev/null || true)
-          if [ -z "$SERIAL" ]; then
-            echo "FAIL: Sign API response: $RESPONSE"; docker compose logs --tail=30 enroll; exit 1
+          api() { curl -s -o /tmp/yk.json -w '%{http_code}' -X POST -H 'Content-Type: application/json' "$@"; }
+          bearer() { printf 'Authorization: Bearer %s\n' "$(cat secrets/enroll/invite-api-secret)"; }
+          PAYLOAD=$(jq -n --arg csr "$(cat /tmp/test-client.csr)" '{user: "testuser", csr: $csr}')
+          code=$(printf '%s' "$PAYLOAD" | api -H @<(bearer) --data-binary @- "http://$ENROLL_IP:8444/internal/yubikey-certificates")
+          [ "$code" = 201 ] || { echo "FAIL: POST /internal/yubikey-certificates got $code: $(head -c 400 /tmp/yk.json)"; docker compose logs --tail=30 enroll; exit 1; }
+          SERIAL=$(jq -r '.serial // empty' /tmp/yk.json)
+          if [ -z "$SERIAL" ] || ! jq -e '.certificate | startswith("-----BEGIN CERTIFICATE-----")' /tmp/yk.json >/dev/null; then
+            echo "FAIL: answer without a PEM certificate / serial: $(head -c 400 /tmp/yk.json)"; exit 1
           fi
-          echo "PASS: Enrollment API signed certificate via its AppRole (serial: $SERIAL)"
-          # Non-admins must be refused
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://$ENROLL_IP:8443/api/sign" \
-            -H "Content-Type: application/json" -H "X-Auth-Request-Groups: users_x" -d "$PAYLOAD")
-          [ "$code" = 403 ] || { echo "FAIL: non-admin sign got $code"; exit 1; }
-          echo "PASS: non-admin sign refused"
+          jq -r .certificate /tmp/yk.json > /tmp/yk-leaf.pem
+          openssl verify -CAfile certs/ca-chain.crt /tmp/yk-leaf.pem >/dev/null \
+            || { echo "FAIL: the signed certificate doesn't chain to the YubiKey CA"; exit 1; }
+          [ "$(openssl x509 -noout -issuer -in /tmp/yk-leaf.pem | sed 's/^issuer= *//')" = "$(openssl x509 -noout -subject -in certs/yubikey-ca.crt | sed 's/^subject= *//')" ] \
+            || { echo "FAIL: not issued by pki_int"; exit 1; }
+          echo "PASS: enroll signed a YubiKey certificate on pki_int via its AppRole (serial: $SERIAL)"
+          # No bearer, a wrong bearer, a CSR for another name: refused.
+          code=$(printf '%s' "$PAYLOAD" | api --data-binary @- "http://$ENROLL_IP:8444/internal/yubikey-certificates")
+          [ "$code" = 401 ] || { echo "FAIL: no bearer got $code"; exit 1; }
+          code=$(printf '%s' "$PAYLOAD" | api -H @<(printf 'Authorization: Bearer %s\n' wrong-wrong-wrong-wrong-wrong-wrong) --data-binary @- "http://$ENROLL_IP:8444/internal/yubikey-certificates")
+          [ "$code" = 401 ] || { echo "FAIL: a wrong bearer got $code"; exit 1; }
+          code=$(jq -n --arg csr "$(cat /tmp/test-client.csr)" '{user: "admin", csr: $csr}' | api -H @<(bearer) --data-binary @- "http://$ENROLL_IP:8444/internal/yubikey-certificates")
+          case "$code" in 400|409) ;; *) echo "FAIL: testuser's CSR signed for admin ($code)"; exit 1 ;; esac
+          echo "PASS: no / wrong bearer refused (401); a CSR is never signed for another account"
 
       - name: Test Vault cert listing
         run: |
@@ -2218,8 +2444,11 @@ jobs:
             || { echo "FAIL: certificates API with the bearer: $(head -c 300 /tmp/certs.json)"; exit 1; }
           SERIAL=$(tr 'A-F' 'a-f' < /tmp/test-client.serial)
           jq -e --arg s "$SERIAL" '(keys == ["certificates"]) and (.certificates | length > 0)
-              and all(.certificates[]; (keys == ["not_after", "revoked", "serial", "user"]) and (.user == (.user | ascii_downcase))
-                      and (.not_after | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$")) and (.revoked | type == "boolean"))
+              and all(.certificates[]; (keys == ["kind", "not_after", "not_before", "revoked", "serial", "user"]) and (.user == (.user | ascii_downcase))
+                      and (.kind | IN("yubikey", "browser"))
+                      and (.not_after | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$")) and (.not_before | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$"))
+                      and (.revoked | type == "boolean"))
+              and all(.certificates[] | select(.user == "testuser"); .kind == "yubikey")
               and any(.certificates[]; .serial == $s and .user == "testuser" and .revoked == true)
               and all(.certificates[]; .user | endswith("portcullis.local") | not)' /tmp/certs.json >/dev/null \
             || { echo "FAIL: certificates API answer (want testuser's revoked $SERIAL, no server certs):"; jq -c . /tmp/certs.json | head -c 2000; exit 1; }
@@ -2260,6 +2489,91 @@ jobs:
           fi
           echo "PASS: portcullis up creates / reconciles portcullis-hub (lldap_admin, password from the 0640 file) and mounts it into the Hub"
 
+      - name: Test the session store (oauth2-proxy sessions in Valkey, a ticket cookie, the ACL)
+        run: |
+          # oauth2-proxy #3486: a session in cookies outgrew one cookie and the
+          # stale unsplit one kept winning. With the store the browser holds one
+          # small ticket and the session lives in `sessions` (Valkey).
+          docker compose up -d sessions forward-auth forward-auth-ext
+          SID="$(docker compose ps -q sessions)"
+          for i in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' "$SID")" = healthy ] && break
+            [ "$i" = 30 ] && { echo "FAIL: sessions not healthy"; docker compose logs --tail=40 sessions; exit 1; }
+            sleep 2
+          done
+          test "$(docker inspect -f '{{.Config.User}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}}' "$SID")" = "999:1000 true [ALL]" \
+            || { echo "FAIL: sessions user / read-only / caps: $(docker inspect -f '{{.Config.User}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}}' "$SID")"; exit 1; }
+          test "$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$SID")" = "portcullis_portcullis-sessions " \
+            || { echo "FAIL: sessions networks: $(docker inspect -f '{{json .NetworkSettings.Networks}}' "$SID" | jq -c keys)"; exit 1; }
+          test "$(stat -c '%a' secrets/sessions) $(stat -c '%a %g' secrets/sessions/valkey.conf)" = "700 640 1000" \
+            || { echo "FAIL: secrets/sessions modes / group"; exit 1; }
+          FA_PW="$(grep '^FORWARD_AUTH_REDIS_PASSWORD=' .env | cut -d= -f2-)"; echo "::add-mask::$FA_PW"
+          FX_PW="$(grep '^FORWARD_AUTH_EXT_REDIS_PASSWORD=' .env | cut -d= -f2-)"; echo "::add-mask::$FX_PW"
+          if grep -qF -e "$FA_PW" -e "$FX_PW" secrets/sessions/valkey.conf; then echo "FAIL: a store password in clear in valkey.conf"; exit 1; fi
+          # No password reaches argv / the container's environment: valkey-cli reads it from VALKEYCLI_AUTH, passed by name.
+          vk() { local pw="$1" user="$2"; shift 2; VALKEYCLI_AUTH="$pw" docker compose exec -T -e VALKEYCLI_AUTH sessions valkey-cli --no-auth-warning --user "$user" "$@" 2>&1; }
+          # shellcheck disable=SC2254  # $want is a glob on purpose
+          expect() { local want="$1" what="$2"; shift 2; local got; got="$("$@")" || true; case "$got" in $want) echo "PASS: $what" ;; *) echo "FAIL: $what: $got"; exit 1 ;; esac; }
+          expect '*NOAUTH*' "the default user is off (unauthenticated PING refused)" docker compose exec -T sessions valkey-cli ping
+          expect '*WRONGPASS*' "a wrong password is refused" vk wrong forward-auth ping
+          expect PONG "forward-auth signs in" vk "$FA_PW" forward-auth ping
+          expect PONG "forward-auth-ext signs in" vk "$FX_PW" forward-auth-ext ping
+          expect OK "forward-auth writes its own keys" vk "$FA_PW" forward-auth set _oauth2_proxy-ci0 x PX 60000
+          expect '*NOPERM*' "forward-auth-ext can't read forward-auth's keys" vk "$FX_PW" forward-auth-ext get _oauth2_proxy-ci0
+          expect '*NOPERM*' "forward-auth can't write forward-auth-ext's keys" vk "$FA_PW" forward-auth set __Host-portcullis_ext-ci0 x
+          expect OK "forward-auth-ext writes its own keys" vk "$FX_PW" forward-auth-ext set __Host-portcullis_ext-ci0 x PX 60000
+          expect '*NOPERM*' "forward-auth can't read forward-auth-ext's keys" vk "$FA_PW" forward-auth get __Host-portcullis_ext-ci0
+          for cmd in "keys x" "scan 0" "flushall" "config get maxmemory" "config set maxmemory 0" "acl list" "client list" "info" "shutdown" "script flush"; do
+            # shellcheck disable=SC2086  # the command's words (no glob characters in them)
+            expect '*NOPERM*' "forward-auth may not run '$cmd'" vk "$FA_PW" forward-auth $cmd
+          done
+          expect x "a script reads its own key" vk "$FA_PW" forward-auth eval "return redis.call('get', KEYS[1])" 1 _oauth2_proxy-ci0
+          expect '*NOPERM*' "a script can't read another proxy's key" vk "$FA_PW" forward-auth eval "return redis.call('get', KEYS[1])" 1 __Host-portcullis_ext-ci0
+          # (Valkey words a refused call inside a script "ACL failure in script: ... no permissions to run")
+          expect "*ACL failure in script*forward-auth has no permissions to run the 'flushall' command*" "a script can't run what the user can't" vk "$FA_PW" forward-auth eval "return redis.call('flushall')" 0
+          expect 1 "forward-auth deletes its own key" vk "$FA_PW" forward-auth del _oauth2_proxy-ci0
+          expect 1 "forward-auth-ext deletes its own key" vk "$FX_PW" forward-auth-ext del __Host-portcullis_ext-ci0
+
+          # A real sign-in through forward-auth (YubiKey certificate, curl's cookie jar = the browser).
+          VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
+          echo "::add-mask::$VAULT_TOKEN"
+          openssl ecparam -name prime256v1 -genkey -noout -out /tmp/sess.key
+          openssl req -new -key /tmp/sess.key -subj "/CN=testuser" -out /tmp/sess.csr
+          vault write -format=json pki_int/sign/client-cert csr=@/tmp/sess.csr common_name=testuser ttl=1h | jq -r .data.certificate > /tmp/sess.crt
+          J=/tmp/sess.jar; rm -f "$J"
+          C=(curl -s --cacert certs/ca-chain.crt --cert /tmp/sess.crt --key /tmp/sess.key --resolve "auth.portcullis.local:443:127.0.0.1" -c "$J" -b "$J")
+          for i in $(seq 1 30); do
+            [ "$("${C[@]}" -o /dev/null -w '%{http_code}' https://auth.portcullis.local/oauth2/auth)" = 401 ] && break
+            [ "$i" = 30 ] && { echo "FAIL: forward-auth does not answer"; docker compose logs --tail=40 forward-auth; exit 1; }
+            sleep 2
+          done
+          # rd = oauth2-proxy's own /oauth2/auth: 202 once the session loads from the store.
+          END="$("${C[@]}" -L --max-redirs 10 -o /dev/null -w '%{http_code} %{url_effective}' \
+            "https://auth.portcullis.local/oauth2/start?pc_method=yubikey_cert&rd=https%3A%2F%2Fauth.portcullis.local%2Foauth2%2Fauth")"
+          [ "${END%% *}" = 202 ] || { echo "FAIL: sign-in through forward-auth ended at ${END%%\?*}"; docker compose logs --tail=40 forward-auth; exit 1; }
+          echo "PASS: a YubiKey-certificate sign-in through forward-auth; /oauth2/auth answers 202"
+          NAMES="$(awk -F'\t' '!/^#/ || /^#HttpOnly_/ { if (NF >= 7) print $6 }' "$J" | grep -E '^_oauth2_proxy(_[0-9]+)?$' | sort | paste -sd' ')"
+          [ "$NAMES" = _oauth2_proxy ] || { echo "FAIL: oauth2-proxy cookies after the sign-in: '$NAMES' (want exactly _oauth2_proxy, no _oauth2_proxy_0…)"; exit 1; }
+          VAL="$(awk -F'\t' '$6 == "_oauth2_proxy" { print $7 }' "$J")"
+          [ "${#VAL}" -lt 512 ] || { echo "FAIL: the session cookie is ${#VAL} bytes (a ticket is ~200)"; exit 1; }
+          # Value = base64url(v2.<base64url(ticket id)>.<base64url(secret)>)|<time>|<signature>.
+          KEY="$(VAL="$VAL" python3 -c 'import base64, os
+          def d(s): return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+          t = d(os.environ["VAL"].split("|")[0]).decode().split(".")
+          assert t[0] == "v2" and len(t) == 3, "not a ticket"
+          print(d(t[1]).decode())')" || { echo "FAIL: the session cookie is not an oauth2-proxy ticket"; exit 1; }
+          [[ "$KEY" =~ ^_oauth2_proxy-[0-9a-f]{32}$ ]] || { echo "FAIL: ticket id '$KEY'"; exit 1; }
+          [ "$(vk "$FA_PW" forward-auth get "$KEY" | wc -c)" -gt 100 ] || { echo "FAIL: the store holds no session for $KEY"; exit 1; }
+          expect '*NOPERM*' "forward-auth-ext can't read the session" vk "$FX_PW" forward-auth-ext get "$KEY"
+          echo "PASS: one small ticket cookie (${#VAL} bytes), the session under $KEY in the store"
+          # Signing out deletes it from the store: the same cookie no longer opens anything.
+          cp "$J" /tmp/sess-before.jar
+          "${C[@]}" -o /dev/null https://auth.portcullis.local/oauth2/sign_out
+          [ "$(vk "$FA_PW" forward-auth get "$KEY" | wc -c)" -le 1 ] || { echo "FAIL: the session survived the sign-out"; exit 1; }
+          code="$(curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt --resolve "auth.portcullis.local:443:127.0.0.1" -b /tmp/sess-before.jar https://auth.portcullis.local/oauth2/auth)"
+          [ "$code" = 401 ] || { echo "FAIL: the signed-out ticket still answers $code"; exit 1; }
+          echo "PASS: sign-out removes the session from the store; the old ticket gets 401"
+
       - name: portcullis status
         run: |
           ./portcullis status || true   # hub/forward-auth are not started in CI
@@ -2269,11 +2583,12 @@ jobs:
           echo "PASS: portcullis status --json reports Vault, PKI and Keycloak healthy"
 
       - name: Backup (consistent, nothing stopped) and verify it
+        timeout-minutes: 15
         run: |
           VAULT_STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$(docker compose ps -q vault)")"
           ./portcullis backup
           B=$(find backups -maxdepth 1 -type d -name '2*' | sort | tail -n1)
-          for f in MANIFEST.json .env secrets/vault-init.json secrets/vault-unseal/unseal-key certs/ca-chain.crt vault.snap postgres.dump lldap_data.tar.gz hub_data.tar.gz traefik_acme.tar.gz mcp_gate_data.tar.gz; do
+          for f in MANIFEST.json .env secrets/vault-init.json secrets/vault-unseal/unseal-key certs/ca-chain.crt vault.snap postgres.dump lldap_data.tar.gz hub_data.tar.gz traefik_acme.tar.gz mcp_gate_data.tar.gz group_gate_data.tar.gz certs/yubikey-ca.crt certs/browser-ca.crt; do
             test -s "$B/$f" || { echo "FAIL: backup lacks $f"; ls -la "$B"; exit 1; }
           done
           test "$(stat -c %a "$B")" = 700 || { echo "FAIL: backup dir is not 0700"; exit 1; }
@@ -2292,6 +2607,7 @@ jobs:
           echo "PASS: logical backup while running, verify --local, corruption detected, metrics"
 
       - name: Off-host backup (restic, local repository), verify, wrong password
+        timeout-minutes: 15
         run: |
           echo "BACKUP_REPOSITORY=$RUNNER_TEMP/restic-repo" >> .env
           ./portcullis backup --offsite
@@ -2314,6 +2630,7 @@ jobs:
           echo "PASS: restic backup (x2), retention, check + restore + sanity checks, encrypted, wrong password refused"
 
       - name: Restore from off-host into a fresh stack (new host)
+        timeout-minutes: 15
         run: |
           VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
           echo "::add-mask::$VAULT_TOKEN"
@@ -2423,8 +2740,14 @@ jobs:
   # Traefik → oauth2-proxy → Keycloak (LLDAP users, WebAuthn, X.509) → group-gate.
   # tests/e2e/e2e_login.py documents every scenario.
   e2e:
+    needs: jobs-input
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e ')
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
@@ -2466,6 +2789,7 @@ jobs:
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -2474,6 +2798,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -2485,6 +2810,7 @@ jobs:
           # build-and-test writes the (identical) cache on main.
           cache-to: ""
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -2497,6 +2823,7 @@ jobs:
       # The production build (no test provider): vault init's age-key
       # generation runs this image.
       - name: Build the domains service (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -2507,6 +2834,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ""
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -2518,6 +2846,7 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: Start the core stack (Vault, PKI, all services except the Hub)
@@ -2614,7 +2943,7 @@ jobs:
                           "e2e-hwk": {"op": "any", "items": ["security_key"]}, "e2e-mtls": {"op": "any", "items": ["yubikey_cert"]}},
             "default": "standard",
             "hosts": {"hwk.portcullis.local": "e2e-hwk", "mtls.portcullis.local": "e2e-mtls"},
-            "core": {"portcullis.local": "standard", "directory.portcullis.local": "standard", "enroll.portcullis.local": "standard",
+            "core": {"portcullis.local": "standard", "directory.portcullis.local": "standard",
                      "hub.portcullis.local": "standard", "metrics.portcullis.local": "standard", "people.portcullis.local": "standard",
                      "traefik.portcullis.local": "standard"},
             "people": {}, "add_stronger": false, "extra_domains": [],
@@ -2691,6 +3020,7 @@ jobs:
           key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust the CA
+        timeout-minutes: 10
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
@@ -2777,7 +3107,7 @@ jobs:
           probe() { qq "probe_success{job=\"$1\"}" | jq -r --arg s "$2" '[.data.result[] | select(($s == "") or (.metric.service == $s)) | .value[1]] | join(",")'; }
           for i in $(seq 1 20); do [ "$(probe vault_health '')" = 1 ] && break; sleep 3; done
           [ "$(probe vault_health '')" = 1 ] || { echo "FAIL: vault_health probe"; exit 1; }
-          for svc in enroll forward-auth lldap; do [ "$(probe services "$svc")" = 1 ] || { echo "FAIL: $svc probe"; exit 1; }; done
+          for svc in enroll forward-auth forward-auth-ext lldap; do [ "$(probe services "$svc")" = 1 ] || { echo "FAIL: $svc probe"; exit 1; }; done
           # Textfile metrics were just written: allow a scrape interval or two.
           has() {
             for _ in $(seq 1 15); do [ "$(qq "$1" | jq '.data.result | length')" -gt 0 ] && return 0; sleep 5; done
@@ -2812,6 +3142,7 @@ jobs:
           done
 
       - name: Upload screenshots, traces and logs
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -2834,8 +3165,14 @@ jobs:
   # browser scenarios; the instance backup / delete / restore checks run
   # against a real daemon at the end.
   e2e-instances:
+    needs: jobs-input
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-instances,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-instances ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-instances,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-instances ')
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
       E2E_EXTRA: team-b.test
@@ -2899,6 +3236,7 @@ jobs:
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -2907,6 +3245,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -2917,6 +3256,7 @@ jobs:
           cache-from: type=gha,scope=enroll
           cache-to: ""
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -2927,6 +3267,7 @@ jobs:
           cache-from: type=gha,scope=group-gate
           cache-to: ""
       - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -2938,6 +3279,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ""
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -2949,8 +3291,10 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/hub-image
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: Start the whole stack (Hub with the CI template source, domains + Pebble)
@@ -3176,6 +3520,7 @@ jobs:
           key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA and Pebble's root
+        timeout-minutes: 10
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
@@ -3194,6 +3539,7 @@ jobs:
         run: NODE_EXTRA_CA_CERTS=/tmp/e2e-ca-bundle.pem /tmp/e2e-venv/bin/python tests/e2e/e2e_instances.py
 
       - name: Instance backup → guarded delete → restore into a new id (real daemon)
+        timeout-minutes: 15
         run: |
           set -o pipefail
           SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
@@ -3369,6 +3715,7 @@ jobs:
           docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'cat /d/group-gate-policy.json; ls -la /d /d/overrides /d/ops; cat /d/overrides/*.yml /d/ops/*.json' > e2e-artifacts/hub-data.txt 2>&1 || true
 
       - name: Upload screenshots, traces and logs
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -3394,15 +3741,25 @@ jobs:
   # OIDC), Strong and YubiKey + certificate. tests/e2e/e2e_signin.py documents the cases: methods on and
   # off, synced / security-key passkeys, the pc_method step-up, passwords,
   # native-OIDC templates, TLS following the switches, reclassification, the
-  # cross-user certificate and pc_fresh.
+  # cross-user certificate and pc_fresh; part 2: browser certificates
+  # (create / .p12 / sign-in as file / revoke / the limit), the four TLS
+  # options' CA names and handshakes, the YubiKey renewal on the Sign-in
+  # page, forged certificate headers, sign_in_help, the sign-in history and
+  # enroll.<d> serving setup links only.
   e2e-signin:
+    needs: jobs-input
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-signin,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-signin ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-signin,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-signin ')
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 25
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
       ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
-      APP_HOSTS: echo-std echo-basic echo-cert oidc-strong oidc-all oidc-cert
+      APP_HOSTS: echo-std echo-basic echo-cert echo-file echo-anycert oidc-strong oidc-all oidc-cert
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -3465,6 +3822,7 @@ jobs:
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -3473,6 +3831,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -3483,6 +3842,7 @@ jobs:
           cache-from: type=gha,scope=enroll
           cache-to: ""
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -3493,6 +3853,7 @@ jobs:
           cache-from: type=gha,scope=group-gate
           cache-to: ""
       - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -3504,6 +3865,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ""
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -3515,8 +3877,10 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/hub-image
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: Start the whole stack (Hub with the echo / oidc-echo template source)
@@ -3584,7 +3948,7 @@ jobs:
           [ -n "$LLDAP_TOKEN" ] && [ "$LLDAP_TOKEN" != null ] || { echo "FAIL: LLDAP login as the Hub's service account"; exit 1; }
           gql() { jq -n --arg q "$1" '{query: $q}' | curl -sf http://127.0.0.1:17170/api/graphql \
                     -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @-; }
-          for u in root sam alice bob pat rita; do
+          for u in root sam alice bob pat rita carol; do
             gql "mutation { createUser(user: {id: \"$u\", email: \"$u@portcullis.local\"}) { id } }" | jq -e '.errors == null' >/dev/null
           done
           gid=$(gql '{ groups { id displayName } }' | jq -r '.data.groups[] | select(.displayName == "lldap_admin") | .id')
@@ -3599,9 +3963,22 @@ jobs:
           done
           code=$(hubc POST /api/signin/templates -d '{"id":"e2e-cert","name":"YubiKey certificate only","rule":{"op":"any","items":["yubikey_cert"]}}')
           want "$code" "create the e2e-cert template"
+          # Browser certificates (part 2): browser_cert on (off by default),
+          # e2e-file = any[browser_cert] and e2e-anycert = any[yubikey_cert,
+          # browser_cert] — both protected-any@file.
+          # Off by default (a fresh Hub, part 2 ruling): asserted before the switch.
+          hub GET /api/signin | jq -e '[.methods[] | select(.id == "browser_cert")] | length == 1 and .[0].on == false' >/dev/null \
+            || { echo "FAIL: browser_cert isn't off by default: $(hub GET /api/signin | jq -c '[.methods[] | select(.id == "browser_cert")]')"; exit 1; }
+          echo "PASS: browser_cert is off by default"
+          code=$(hubc PUT /api/signin/methods/browser_cert -d '{"on":true}'); want "$code" "switch browser_cert on"
+          code=$(hubc POST /api/signin/templates -d '{"id":"e2e-file","name":"Browser certificate only","rule":{"op":"any","items":["browser_cert"]}}')
+          want "$code" "create the e2e-file template"
+          code=$(hubc POST /api/signin/templates -d '{"id":"e2e-anycert","name":"Any certificate","rule":{"op":"any","items":["yubikey_cert","browser_cert"]}}')
+          want "$code" "create the e2e-anycert template"
 
           # Instances (all on the main domain) and their picks, then enable.
           for spec in "echo echo-std Echo-Std" "echo echo-basic Echo-Basic" "echo echo-cert Echo-Cert" \
+                      "echo echo-file Echo-File" "echo echo-anycert Echo-Anycert" \
                       "oidc-echo oidc-strong OIDC-Strong" "oidc-echo oidc-all OIDC-All" "oidc-echo oidc-cert OIDC-Cert"; do
             read -r tpl id label <<<"$spec"
             router="echo"; [ "$tpl" = oidc-echo ] && router="oidc"
@@ -3609,15 +3986,16 @@ jobs:
             hubop POST /api/instances -d "$(jq -cn --arg t "$tpl" --arg id "$id" --arg l "$label" --arg r "$router" --arg h "$id.$E2E_DOMAIN" \
                 '{template: $t, id: $id, label: $l, hosts: {($r): $h}}')" || { echo "FAIL: create $id"; exit 1; }
           done
-          for pick in echo-basic:basic echo-cert:e2e-cert oidc-strong:strong oidc-all:yubikey-and-certificate oidc-cert:e2e-cert; do
+          for pick in echo-basic:basic echo-cert:e2e-cert echo-file:e2e-file echo-anycert:e2e-anycert \
+                      oidc-strong:strong oidc-all:yubikey-and-certificate oidc-cert:e2e-cert; do
             code=$(hubc PUT "/api/instances/${pick%%:*}/settings" -d "$(jq -cn --arg t "${pick#*:}" '{sign_in_template: $t}')")
             want "$code" "sign-in template of ${pick%%:*}"
           done
-          for m in alice:users_echo-std alice:users_echo-cert pat:users_echo-basic; do
+          for m in alice:users_echo-std alice:users_echo-cert alice:users_echo-file alice:users_echo-anycert pat:users_echo-basic; do
             code=$(hubc POST "/api/directory/groups/${m#*:}/members" -d "$(jq -cn --arg u "${m%%:*}" '{username: $u}')")
             want "$code" "add $m"
           done
-          for id in echo-std echo-basic echo-cert oidc-strong oidc-all oidc-cert; do
+          for id in echo-std echo-basic echo-cert echo-file echo-anycert oidc-strong oidc-all oidc-cert; do
             hubop POST /api/templates/enable -d "{\"id\":\"$id\"}" || { echo "FAIL: enable $id"; exit 1; }
           done
 
@@ -3627,17 +4005,19 @@ jobs:
           for i in $(seq 1 30); do
             hub_file group-gate-policy.json | jq -e --arg d "$E2E_DOMAIN" '.version == 6
                 and .hosts["echo-basic.\($d)"] == "basic" and .hosts["echo-cert.\($d)"] == "e2e-cert"
+                and .hosts["echo-file.\($d)"] == "e2e-file" and .hosts["echo-anycert.\($d)"] == "e2e-anycert"
+                and (.methods | index("browser_cert") != null)
                 and (.hosts | has("echo-std.\($d)") | not) and .default == "standard"
                 and .core["hub.\($d)"] == "strong" and .core["people.\($d)"] == "strong"' >/dev/null 2>&1 \
               && hub_file signin-keycloak.json | jq -e '.clients["oidc-strong"] == {template: "strong", name: "OIDC echo · OIDC Strong"}
                 and .clients["oidc-all"] == {template: "yubikey-and-certificate", name: "OIDC echo · OIDC All"}
                 and .clients["oidc-cert"] == {template: "e2e-cert", name: "OIDC echo · OIDC Cert"}
                 and (.authenticators | has("01020304-0506-0708-0102-030405060708"))
-                and (.methods | index("password") == null)' >/dev/null 2>&1 && break
+                and (.methods | index("password") == null) and (.methods | index("browser_cert") != null)' >/dev/null 2>&1 && break
             [ "$i" -eq 30 ] && { echo "FAIL: published: $(hub_file group-gate-policy.json | jq -c '{hosts, core, default}') $(hub_file signin-keycloak.json | jq -c '{clients, methods, mds}')"; exit 1; }
             sleep 2
           done
-          echo "PASS: policy v6 picks (Basic, e2e-cert, Strong core pages) and signin-keycloak.json clients (oidc-strong Strong, oidc-all YubiKey + certificate, oidc-cert e2e-cert)"
+          echo "PASS: policy v6 picks (Basic, e2e-cert, e2e-file, e2e-anycert, Strong core pages; browser_cert on) and signin-keycloak.json clients (oidc-strong Strong, oidc-all YubiKey + certificate, oidc-cert e2e-cert)"
 
           # pat: a Hub-set password only (allowed while the method is off),
           # kept in a 0600 file, never printed.
@@ -3680,9 +4060,13 @@ jobs:
           key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
+        timeout-minutes: 10
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
+          # cryptography (group-gate's pinned, hashed wheels): the .p12, CSRs
+          # and the CA checks of the browser-certificate cases.
+          /tmp/e2e-venv/bin/pip install --quiet --require-hashes --only-binary=:all: -r group-gate/requirements.txt
           sudo /tmp/e2e-venv/bin/playwright install-deps chromium
           /tmp/e2e-venv/bin/playwright install chromium
           sudo apt-get install -y -qq libnss3-tools >/dev/null
@@ -3690,7 +4074,7 @@ jobs:
           certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
           certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
 
-      - name: Run the sign-in scenarios (methods, passkey kinds, pc_method, passwords, native OIDC, TLS, reclassify, pc_fresh)
+      - name: Run the sign-in scenarios (methods, passkey kinds, pc_method, passwords, native OIDC, TLS, reclassify, pc_fresh, browser certificates, Sign-in page, help, history)
         env:
           E2E_ROOT_CERT: /tmp/e2e-secrets/root.crt
           E2E_ROOT_KEY: /tmp/e2e-secrets/root.key
@@ -3706,6 +4090,7 @@ jobs:
       # Keycloak's portcullis-needs-stronger.ftl in core's portcullis theme
       # (a Keycloak page: no secret on it), kept on success too.
       - name: Upload the Keycloak needs-stronger screenshot
+        timeout-minutes: 10
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -3728,6 +4113,7 @@ jobs:
       # The screenshots and HTML of the password pages are taken before
       # anything is typed; no traces are recorded.
       - name: Upload screenshots and logs
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -3754,8 +4140,14 @@ jobs:
   # people.<domain> (firefox-sync's allowlist and guard.sql on Postgres),
   # membership changes through the Hub, Nextcloud's start hook.
   e2e-settings:
+    needs: jobs-input
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-settings,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-settings ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-settings,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-settings ')
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
@@ -3858,6 +4250,7 @@ jobs:
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -3879,6 +4272,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -3889,6 +4283,7 @@ jobs:
           cache-from: type=gha,scope=enroll
           cache-to: ""
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -3899,6 +4294,7 @@ jobs:
           cache-from: type=gha,scope=group-gate
           cache-to: ""
       - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -3910,6 +4306,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ""
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -3921,8 +4318,10 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/hub-image
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: Start the whole stack (Hub with the CI template source)
@@ -4050,6 +4449,7 @@ jobs:
           key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
+        timeout-minutes: 10
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
@@ -4090,6 +4490,7 @@ jobs:
           sudo find appfiles -name '*.json' ! -name '*.secrets.json' -exec sh -c 'echo "== $1"; cat "$1"; echo' _ {} \; > e2e-artifacts/appfiles.txt 2>&1 || true
 
       - name: Upload screenshots, traces and logs
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -4117,8 +4518,14 @@ jobs:
   # preview / apply / host verify, doctor drift, undo, lan_only exposure and
   # rebind, the socket proxy as on main. No browser.
   e2e-folders:
+    needs: jobs-input
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-folders,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-folders ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-folders,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-folders ')
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
@@ -4210,6 +4617,7 @@ jobs:
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -4227,6 +4635,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -4237,6 +4646,7 @@ jobs:
           cache-from: type=gha,scope=enroll
           cache-to: ""
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -4247,6 +4657,7 @@ jobs:
           cache-from: type=gha,scope=group-gate
           cache-to: ""
       - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -4258,6 +4669,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ""
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -4269,8 +4681,10 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/hub-image
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: The shared folder's tree on the host (ext4, ACLs)
@@ -4371,6 +4785,7 @@ jobs:
           docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'ls -laR /d/folders /d/folder-snapshots /d/doctor; cat /d/doctor/scans.json; ls -la /d/overrides; cat /d/overrides/*.yml' > e2e-artifacts/hub-data.txt 2>&1 || true
 
       - name: Upload logs
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -4401,9 +4816,15 @@ jobs:
   # archive, docker inspect, log or the hub_data volume. Passwords and
   # hashes are masked, given to smbclient through PASSWD, never on argv.
   e2e-filesharing:
+    needs: jobs-input
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-filesharing,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-filesharing ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-filesharing,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-filesharing ')
     # The smbclient pin below is the 24.04 package.
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
@@ -4494,6 +4915,7 @@ jobs:
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -4511,6 +4933,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -4521,6 +4944,7 @@ jobs:
           cache-from: type=gha,scope=enroll
           cache-to: ""
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -4531,6 +4955,7 @@ jobs:
           cache-from: type=gha,scope=group-gate
           cache-to: ""
       - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -4542,6 +4967,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ""
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -4553,8 +4979,10 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/hub-image
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: smbclient (apt, pinned) and the shared folder on the host (ext4, ACLs)
@@ -4625,6 +5053,7 @@ jobs:
           key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
+        timeout-minutes: 10
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
@@ -4665,6 +5094,7 @@ jobs:
           done
 
       - name: Upload screenshots and logs
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -4697,8 +5127,14 @@ jobs:
   # no_token_crossing, destructive_confirmation, aggregate_lists,
   # leaver_refused_and_revoked, ai_off.
   e2e-ai:
+    needs: jobs-input
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ai,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ai ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ai,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ai ')
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
@@ -4787,6 +5223,7 @@ jobs:
               | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
+        timeout-minutes: 15
         uses: ./.github/actions/cached-images
         with:
           images: ${{ runner.temp }}/images.txt
@@ -4808,6 +5245,7 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: false
       - name: Build the MCP client (tests/e2e/mcpclient, go-sdk pinned in go.mod / go.sum)
+        timeout-minutes: 15
         working-directory: tests/e2e/mcpclient
         run: |
           go mod verify
@@ -4819,6 +5257,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: enroll
@@ -4829,6 +5268,7 @@ jobs:
           cache-from: type=gha,scope=enroll
           cache-to: ""
       - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: group-gate
@@ -4839,6 +5279,7 @@ jobs:
           cache-from: type=gha,scope=group-gate
           cache-to: ""
       - name: Build the domains service (CI test build, buildx layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: domains
@@ -4850,6 +5291,7 @@ jobs:
           cache-from: type=gha,scope=domains-test
           cache-to: ""
       - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: mcp-gate
@@ -4861,8 +5303,10 @@ jobs:
           cache-from: type=gha,scope=mcp-gate
           cache-to: ""
       - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/hub-image
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
       - name: Start the whole stack (Hub with the gitea / grafana / echo template source)
@@ -4946,6 +5390,7 @@ jobs:
           key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
+        timeout-minutes: 10
         run: |
           python3 -m venv /tmp/e2e-venv
           /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
@@ -4991,6 +5436,7 @@ jobs:
           docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'cat /d/mcp-gate.json; ls -la /d /d/overrides; cat /d/overrides/*.yml' > e2e-artifacts/hub-data.txt 2>&1 || true
 
       - name: Upload screenshots, traces and logs
+        timeout-minutes: 10
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

@@ -11,9 +11,7 @@ import (
 	"fmt"
 	"html/template"
 	"log"
-	"mime"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -41,6 +39,25 @@ type Config struct {
 	ListenAddr   string
 	CertTTL      string
 	PKIRole      string
+	// lookupUser replaces the LLDAP lookup (getUser) when set (tests).
+	lookupUser func(string) (*User, error)
+	// now replaces time.Now when set (tests).
+	now func() time.Time
+}
+
+// findUser is the LLDAP user (errNoUser when there is none).
+func (cfg *Config) findUser(username string) (*User, error) {
+	if cfg.lookupUser != nil {
+		return cfg.lookupUser(username)
+	}
+	return cfg.getUser(username)
+}
+
+func (cfg *Config) clock() time.Time {
+	if cfg.now != nil {
+		return cfg.now()
+	}
+	return time.Now()
 }
 
 type User struct {
@@ -49,21 +66,6 @@ type User struct {
 	FirstName string `json:"firstName"`
 	LastName  string `json:"lastName"`
 	DN        string `json:"dn"`
-}
-
-type CertInfo struct {
-	Username  string    `json:"username"`
-	Serial    string    `json:"serial"`
-	NotBefore time.Time `json:"notBefore"`
-	NotAfter  time.Time `json:"notAfter"`
-	Issuer    string    `json:"issuer"`
-}
-
-type SignResponse struct {
-	Certificate string `json:"certificate"`
-	CAChain     string `json:"caChain"`
-	Serial      string `json:"serial"`
-	Expiry      string `json:"expiry"`
 }
 
 func envOr(key, fallback string) string {
@@ -109,37 +111,6 @@ func (cfg *Config) ldapConn() (*ldap.Conn, error) {
 	return l, nil
 }
 
-func (cfg *Config) listUsers() ([]User, error) {
-	l, err := cfg.ldapConn()
-	if err != nil {
-		return nil, err
-	}
-	defer l.Close()
-
-	result, err := l.Search(ldap.NewSearchRequest(
-		"ou=people,"+cfg.LDAPBaseDN,
-		ldap.ScopeSingleLevel, ldap.NeverDerefAliases, 0, 0, false,
-		"(objectClass=person)",
-		[]string{"uid", "mail", "givenName", "sn"},
-		nil,
-	))
-	if err != nil {
-		return nil, fmt.Errorf("ldap search: %w", err)
-	}
-
-	users := make([]User, 0, len(result.Entries))
-	for _, entry := range result.Entries {
-		users = append(users, User{
-			Username:  entry.GetAttributeValue("uid"),
-			Email:     entry.GetAttributeValue("mail"),
-			FirstName: entry.GetAttributeValue("givenName"),
-			LastName:  entry.GetAttributeValue("sn"),
-			DN:        entry.DN,
-		})
-	}
-	return users, nil
-}
-
 func (cfg *Config) getUser(username string) (*User, error) {
 	l, err := cfg.ldapConn()
 	if err != nil {
@@ -158,7 +129,7 @@ func (cfg *Config) getUser(username string) (*User, error) {
 		return nil, err
 	}
 	if len(result.Entries) == 0 {
-		return nil, fmt.Errorf("user not found: %s", username)
+		return nil, fmt.Errorf("%w: %s", errNoUser, username)
 	}
 
 	entry := result.Entries[0]
@@ -200,7 +171,8 @@ func (cfg *Config) userGroups(username string) ([]string, error) {
 //
 // enroll authenticates with a least-privilege AppRole (policy
 // vault/policies/enroll.hcl, created by ./portcullis vault init): it can only
-// sign with the client-cert role and read/list issued certs. There is no
+// sign with the client-cert (pki_int) and browser-cert (pki_file) roles,
+// read/list issued certs, revoke and rotate the CRLs. There is no
 // static token and no fallback. Tokens are short-lived (1h); vaultAuth logs
 // in again shortly before expiry, and immediately when Vault answers 403
 // (token revoked, secret-id rotated, Vault re-initialised), so the token
@@ -316,131 +288,18 @@ func (a *vaultAuth) do(fn func(*vault.Client) error) error {
 
 // Vault PKI operations
 
-func (cfg *Config) signCSR(username, email, csr string) (*SignResponse, error) {
-	var secret *vault.Secret
-	err := cfg.vault.do(func(vc *vault.Client) error {
-		var err error
-		secret, err = vc.Logical().Write("pki_int/sign/"+cfg.PKIRole, map[string]interface{}{
-			"csr":         csr,
-			"common_name": username,
-			"ttl":         cfg.CertTTL,
-		})
-		return err
-	})
-	if err != nil {
-		return nil, fmt.Errorf("vault sign: %w", err)
-	}
-
-	if secret == nil || secret.Data == nil {
-		return nil, errors.New("vault sign: empty response")
-	}
-	cert, ok := secret.Data["certificate"].(string)
-	if !ok || cert == "" {
-		return nil, errors.New("vault sign: response missing certificate")
-	}
-	serial, _ := secret.Data["serial_number"].(string)
-
-	var caChain string
-	if chain, ok := secret.Data["ca_chain"].([]interface{}); ok {
-		parts := make([]string, 0, len(chain))
-		for _, c := range chain {
-			if pemStr, ok := c.(string); ok {
-				parts = append(parts, pemStr)
-			}
-		}
-		caChain = strings.Join(parts, "\n")
-	}
-
-	// Parse cert to get expiry
-	block, _ := pem.Decode([]byte(cert))
-	var expiry string
-	if block != nil {
-		parsed, err := x509.ParseCertificate(block.Bytes)
-		if err == nil {
-			expiry = parsed.NotAfter.Format(time.RFC3339)
-		}
-	}
-
-	return &SignResponse{
-		Certificate: cert,
-		CAChain:     caChain,
-		Serial:      serial,
-		Expiry:      expiry,
-	}, nil
-}
-
-func (cfg *Config) listCerts() ([]CertInfo, error) {
-	var certs []CertInfo
-	err := cfg.vault.do(func(vc *vault.Client) error {
-		var err error
-		certs, err = listCertsWith(vc)
-		return err
-	})
-	return certs, err
-}
-
-func listCertsWith(vc *vault.Client) ([]CertInfo, error) {
-	secret, err := vc.Logical().List("pki_int/certs")
-	if err != nil {
-		return nil, err
-	}
-	if secret == nil || secret.Data["keys"] == nil {
-		return []CertInfo{}, nil
-	}
-
-	keys, ok := secret.Data["keys"].([]interface{})
-	if !ok {
-		return nil, errors.New("vault list: unexpected response shape")
-	}
-	certs := make([]CertInfo, 0, len(keys))
-
-	for _, k := range keys {
-		serial, ok := k.(string)
-		if !ok {
-			continue
-		}
-		certSecret, err := vc.Logical().Read("pki_int/cert/" + serial)
-		if err != nil || certSecret == nil || certSecret.Data == nil {
-			continue
-		}
-
-		certPEM, ok := certSecret.Data["certificate"].(string)
-		if !ok {
-			continue
-		}
-		block, _ := pem.Decode([]byte(certPEM))
-		if block == nil {
-			continue
-		}
-
-		parsed, err := x509.ParseCertificate(block.Bytes)
-		if err != nil {
-			continue
-		}
-
-		// Only include client certs (not CA or server certs)
-		if !parsed.IsCA && parsed.Subject.CommonName != "" {
-			certs = append(certs, CertInfo{
-				Username:  parsed.Subject.CommonName,
-				Serial:    serial,
-				NotBefore: parsed.NotBefore,
-				NotAfter:  parsed.NotAfter,
-				Issuer:    parsed.Issuer.CommonName,
-			})
-		}
-	}
-	return certs, nil
-}
-
 // certRecord is one entry of GET /internal/certificates (contract §9.4).
-// Serial is Vault's form, the key LIST pki_int/certs returns, as
+// Serial is Vault's form, the key LIST <mount>/certs returns, as
 // `portcullis cert list` and certs/revocation/revoked-serials.txt print it:
-// lowercase hex byte pairs joined by ":" (e.g. "1a:2b:…").
+// lowercase hex byte pairs joined by ":" (e.g. "1a:2b:…"). Kind is
+// certKind(mount): "yubikey" (pki_int) or "browser" (pki_file).
 type certRecord struct {
-	User     string `json:"user"`
-	Serial   string `json:"serial"`
-	NotAfter string `json:"not_after"`
-	Revoked  bool   `json:"revoked"`
+	User      string `json:"user"`
+	Serial    string `json:"serial"`
+	Kind      string `json:"kind"`
+	NotBefore string `json:"not_before"`
+	NotAfter  string `json:"not_after"`
+	Revoked   bool   `json:"revoked"`
 }
 
 func (cfg *Config) issuedCerts(ctx context.Context) ([]certRecord, error) {
@@ -453,68 +312,84 @@ func (cfg *Config) issuedCerts(ctx context.Context) ([]certRecord, error) {
 	return certs, err
 }
 
-// issuedCertsWith lists the YubiKey client certificates pki_int issued
-// (role client-cert: client auth only, not a CA, a CN), with Vault's
-// per-certificate revocation state. Unlike listCertsWith it fails closed:
-// a listed serial that can't be read, parsed or whose revocation_time is
-// missing or unreadable fails the whole list, so no certificate is ever
-// reported unrevoked by guess.
+// issuedCertsWith lists the client certificates both mounts issued
+// (pki_int: YubiKey certificates, pki_file: browser certificates; client
+// auth only, not a CA, a CN), with Vault's per-certificate revocation
+// state. It fails closed: a listed serial that can't be read, parsed or
+// whose revocation_time is missing or unreadable fails the whole list, so
+// no certificate is ever reported unrevoked by guess.
 func issuedCertsWith(ctx context.Context, vc *vault.Client) ([]certRecord, error) {
-	secret, err := vc.Logical().ListWithContext(ctx, "pki_int/certs")
+	out := []certRecord{}
+	for _, mount := range certMounts {
+		recs, err := mountCertsWith(ctx, vc, mount)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, recs...)
+	}
+	return out, nil
+}
+
+// mountCertsWith lists one mount's client certificates (see issuedCertsWith).
+func mountCertsWith(ctx context.Context, vc *vault.Client, mount string) ([]certRecord, error) {
+	secret, err := vc.Logical().ListWithContext(ctx, mount+"/certs")
 	if err != nil {
-		return nil, fmt.Errorf("list pki_int/certs: %w", err)
+		return nil, fmt.Errorf("list %s/certs: %w", mount, err)
 	}
 	if secret == nil || secret.Data["keys"] == nil {
 		return []certRecord{}, nil
 	}
 	keys, ok := secret.Data["keys"].([]interface{})
 	if !ok {
-		return nil, errors.New("list pki_int/certs: unexpected response shape")
+		return nil, fmt.Errorf("list %s/certs: unexpected response shape", mount)
 	}
 	out := make([]certRecord, 0, len(keys))
 	for _, k := range keys {
 		serial, ok := k.(string)
 		if !ok || serial == "" || strings.ContainsAny(serial, "/?#") {
-			return nil, fmt.Errorf("list pki_int/certs: unexpected key %v", k)
+			return nil, fmt.Errorf("list %s/certs: unexpected key %v", mount, k)
 		}
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		cs, err := vc.Logical().ReadWithContext(ctx, "pki_int/cert/"+serial)
+		cs, err := vc.Logical().ReadWithContext(ctx, mount+"/cert/"+serial)
 		if err != nil {
-			return nil, fmt.Errorf("read pki_int/cert/%s: %w", serial, err)
+			return nil, fmt.Errorf("read %s/cert/%s: %w", mount, serial, err)
 		}
 		if cs == nil || cs.Data == nil {
-			return nil, fmt.Errorf("read pki_int/cert/%s: no data", serial)
+			return nil, fmt.Errorf("read %s/cert/%s: no data", mount, serial)
 		}
 		certPEM, _ := cs.Data["certificate"].(string)
 		block, _ := pem.Decode([]byte(certPEM))
 		if block == nil {
-			return nil, fmt.Errorf("pki_int/cert/%s: no certificate", serial)
+			return nil, fmt.Errorf("%s/cert/%s: no certificate", mount, serial)
 		}
 		parsed, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			return nil, fmt.Errorf("pki_int/cert/%s: %w", serial, err)
+			return nil, fmt.Errorf("%s/cert/%s: %w", mount, serial, err)
 		}
-		if !yubikeyClientCert(parsed) {
+		if !clientLeaf(parsed) {
 			continue // the CA chain, Traefik's server certificate, …
 		}
 		revoked, err := revocationState(cs.Data["revocation_time"])
 		if err != nil {
-			return nil, fmt.Errorf("pki_int/cert/%s: %w", serial, err)
+			return nil, fmt.Errorf("%s/cert/%s: %w", mount, serial, err)
 		}
 		out = append(out, certRecord{
-			User:     strings.ToLower(parsed.Subject.CommonName),
-			Serial:   strings.ToLower(serial),
-			NotAfter: parsed.NotAfter.UTC().Format(time.RFC3339),
-			Revoked:  revoked,
+			User:      strings.ToLower(parsed.Subject.CommonName),
+			Serial:    strings.ToLower(serial),
+			Kind:      certKind(mount),
+			NotBefore: parsed.NotBefore.UTC().Format(time.RFC3339),
+			NotAfter:  parsed.NotAfter.UTC().Format(time.RFC3339),
+			Revoked:   revoked,
 		})
 	}
 	return out, nil
 }
 
-// yubikeyClientCert: what the client-cert role issues (client_flag only).
-func yubikeyClientCert(c *x509.Certificate) bool {
+// clientLeaf: what the client-cert and browser-cert roles issue
+// (client_flag only, a CN, not a CA).
+func clientLeaf(c *x509.Certificate) bool {
 	if c.IsCA || c.Subject.CommonName == "" {
 		return false
 	}
@@ -549,68 +424,6 @@ func revocationState(v any) (bool, error) {
 	default:
 		return false, fmt.Errorf("revocation_time missing or unreadable (%T)", v)
 	}
-}
-
-// forwardedUser is the LLDAP username of the signed-in user: X-Forwarded-User,
-// set by group-gate from oauth2-proxy's user (the token's preferred_username).
-// Traefik deletes any client-supplied X-Forwarded-User (it is one of
-// group-gate's authResponseHeaders). Never derive the identity from the
-// email: users can edit their own email in LLDAP.
-func forwardedUser(r *http.Request) string {
-	return strings.TrimSpace(r.Header.Get("X-Forwarded-User"))
-}
-
-// Extract authenticated user from forward-auth header or Traefik's client cert header
-func (s *Server) authenticatedUser(r *http.Request) string {
-	if user := forwardedUser(r); user != "" {
-		return user
-	}
-	info := r.Header.Get("X-Forwarded-Tls-Client-Cert-Info")
-	if info == "" {
-		return ""
-	}
-	// Traefik URL-encodes the info header
-	decoded, err := url.QueryUnescape(info)
-	if err != nil {
-		return ""
-	}
-	// Extract CN from Subject="CN=username,..."
-	for _, part := range strings.Split(decoded, ";") {
-		part = strings.TrimSpace(part)
-		if strings.HasPrefix(part, "Subject=\"") {
-			subject := strings.TrimPrefix(part, "Subject=\"")
-			subject = strings.TrimSuffix(subject, "\"")
-			for _, attr := range strings.Split(subject, ",") {
-				attr = strings.TrimSpace(attr)
-				if strings.HasPrefix(attr, "CN=") {
-					return strings.TrimPrefix(attr, "CN=")
-				}
-			}
-		}
-	}
-	return ""
-}
-
-// HTTP handlers
-
-type Server struct {
-	cfg Config
-}
-
-const adminGroup = "lldap_admin"
-
-// isAdmin reports whether the request carries the lldap_admin group.
-// X-Auth-Request-Groups is set by Traefik from the forward-auth response
-// (authResponseHeaders), which overwrites any client-supplied value.
-func isAdmin(r *http.Request) bool {
-	for _, v := range r.Header.Values("X-Auth-Request-Groups") {
-		for _, g := range strings.Split(v, ",") {
-			if strings.TrimSpace(g) == adminGroup {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 var oidEmailAddress = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 1}
@@ -668,137 +481,23 @@ func render(w http.ResponseWriter, name string, data any) {
 	}
 }
 
-func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	user := s.authenticatedUser(r)
-	data := map[string]interface{}{
-		"User":   user,
-		"Domain": s.cfg.Domain,
-	}
-	render(w, "index.html", data)
+// Server is enroll's public listener: only the setup links (/invite/*)
+// and /healthz (contract §9.4; enroll's old certificate site is gone).
+type Server struct {
+	cfg Config
 }
 
-func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
-	users, err := s.cfg.listUsers()
-	if err != nil {
-		log.Printf("list users: %v", err)
-		http.Error(w, "Failed to list users", http.StatusInternalServerError)
-		return
-	}
-
-	data := map[string]interface{}{
-		"User":   s.authenticatedUser(r),
-		"Users":  users,
-		"Domain": s.cfg.Domain,
-	}
-	render(w, "users.html", data)
+func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
+	w.Write([]byte("ok\n"))
 }
 
-func (s *Server) handleCerts(w http.ResponseWriter, r *http.Request) {
-	certs, err := s.cfg.listCerts()
-	if err != nil {
-		log.Printf("list certs: %v", err)
-		http.Error(w, "Failed to list certificates", http.StatusInternalServerError)
-		return
-	}
-
-	data := map[string]interface{}{
-		"User":   s.authenticatedUser(r),
-		"Certs":  certs,
-		"Domain": s.cfg.Domain,
-		"Now":    time.Now(),
-	}
-	render(w, "certs.html", data)
-}
-
-func (s *Server) handleEnroll(w http.ResponseWriter, r *http.Request) {
-	username := r.PathValue("username")
-	user, err := s.cfg.getUser(username)
-	if err != nil {
-		log.Printf("get user %q: %v", username, err)
-		http.Error(w, "User not found", http.StatusNotFound)
-		return
-	}
-
-	data := map[string]interface{}{
-		"User":       s.authenticatedUser(r),
-		"EnrollUser": user,
-		"Domain":     s.cfg.Domain,
-		"TTL":        s.cfg.CertTTL,
-	}
-	render(w, "enroll.html", data)
-}
-
-func (s *Server) handleSign(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	if !isAdmin(r) {
-		log.Printf("sign: denied, caller %q lacks %s", r.Header.Get("X-Forwarded-User"), adminGroup)
-		http.Error(w, "Forbidden: "+adminGroup+" membership required", http.StatusForbidden)
-		return
-	}
-	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
-		http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
-		return
-	}
-
-	var req struct {
-		Username string `json:"username"`
-		Email    string `json:"email"`
-		CSR      string `json:"csr"`
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid request body", http.StatusBadRequest)
-		return
-	}
-
-	if req.CSR == "" || req.Username == "" {
-		http.Error(w, "username and csr are required", http.StatusBadRequest)
-		return
-	}
-
-	// Verify user exists in LDAP
-	user, err := s.cfg.getUser(req.Username)
-	if err != nil {
-		log.Printf("sign: get user %q: %v", req.Username, err)
-		http.Error(w, "User not found in directory", http.StatusNotFound)
-		return
-	}
-
-	// Validate against the directory record, not the client-supplied email.
-	if err := validateCSR(req.CSR, user.Username, user.Email); err != nil {
-		log.Printf("sign: rejected CSR for %q: %v", req.Username, err)
-		http.Error(w, "Invalid CSR: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	resp, err := s.cfg.signCSR(user.Username, user.Email, req.CSR)
-	if err != nil {
-		log.Printf("sign: vault error for %q: %v", req.Username, err)
-		http.Error(w, "Failed to sign CSR", http.StatusInternalServerError)
-		return
-	}
-	log.Printf("sign: issued serial %s for %q (by %q)", resp.Serial, user.Username, r.Header.Get("X-Forwarded-User"))
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-func (s *Server) handleAPIUsers(w http.ResponseWriter, r *http.Request) {
-	users, err := s.cfg.listUsers()
-	if err != nil {
-		log.Printf("api users: %v", err)
-		http.Error(w, "Failed to list users", http.StatusInternalServerError)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(users)
+// publicMux is the public listener's mux: /healthz and the invite pages,
+// nothing else (Traefik routes only /invite/* there, enroll-invite).
+func publicMux(srv *Server, inv *inviteService) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", srv.handleHealthz)
+	inv.register(mux)
+	return mux
 }
 
 func main() {
@@ -814,23 +513,9 @@ func main() {
 		log.Fatalf("Failed to parse templates: %v", err)
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /", srv.handleIndex)
-	mux.HandleFunc("GET /users", srv.handleUsers)
-	mux.HandleFunc("GET /certs", srv.handleCerts)
-	mux.HandleFunc("GET /enroll/{username}", srv.handleEnroll)
-	mux.HandleFunc("POST /api/sign", srv.handleSign)
-	mux.HandleFunc("GET /api/users", srv.handleAPIUsers)
-	// Self-service (any signed-in user, own certificate only; see self.go).
-	mux.HandleFunc("GET /self", srv.handleSelf)
-	mux.HandleFunc("POST /api/self/renew", srv.handleSelfRenew)
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Write([]byte("ok\n"))
-	})
-
 	// One-time invites (invite.go): public /invite/* on this port, the
-	// Keycloak-only OIDC endpoints and the invite API on ports Traefik does
-	// not route.
+	// Keycloak-only OIDC endpoints and the invite / certificate API on
+	// ports Traefik does not route.
 	secretDir := envOr("ENROLL_SECRETS_DIR", "/run/secrets/portcullis-enroll")
 	clientSecret, err := readInviteSecret(secretDir + "/invite-client-secret")
 	if err != nil {
@@ -846,9 +531,15 @@ func main() {
 		log.Fatalf("invite service: %v", err)
 	}
 	inv.userGroups = cfg.userGroups
-	inv.listCertificates = cfg.issuedCerts
 	inv.protectedGroups = protectedGroupSet(os.Getenv("INVITE_PROTECTED_GROUPS"), envOr("GATE_MAP_FILE", "/etc/group-gate/map.conf"))
-	inv.register(mux)
+	// The certificate operations need Vault (contract §9.4): injected here,
+	// a nil one answers 503.
+	inv.listCertificates = cfg.issuedCerts
+	inv.issueBrowser = cfg.issueBrowserCert
+	inv.issueYubiKey = cfg.issueYubiKeyCert
+	inv.renewYubiKey = cfg.renewYubiKeyCert
+	inv.revoke = cfg.revokeCert
+	mux := publicMux(srv, inv)
 	for _, l := range []struct {
 		addr string
 		h    http.Handler
@@ -872,11 +563,9 @@ func main() {
 		log.Printf("Vault AppRole login OK (%s)", cfg.VaultAddr)
 	}
 
-	log.Printf("Portcullis Enrollment UI listening on %s", cfg.ListenAddr)
+	log.Printf("Portcullis enroll (setup links) listening on %s", cfg.ListenAddr)
 	log.Printf("Domain: %s", cfg.Domain)
 	// Reject cross-origin browser POSTs (Sec-Fetch-Site / Origin vs Host).
-	// Together with the application/json requirement on /api/sign this
-	// closes CSRF against the admin's forward-auth session cookie.
 	handler := http.NewCrossOriginProtection().Handler(mux)
 	httpSrv := &http.Server{
 		Addr:              cfg.ListenAddr,

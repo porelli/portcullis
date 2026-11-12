@@ -63,6 +63,17 @@ vault_use_container_cli() {
   vault() { dc exec -T -e VAULT_TOKEN vault vault "$@"; }
 }
 
+# vault_no_value <output> — true when a vault CLI answer is Vault's
+# "nothing there": the single line "No value found at <path>" (or `{}` with
+# -format=json). The CLI exits 2 for that AND for every API error (403,
+# sealed, unmounted, unreachable), so exit 2 alone never means "absent".
+vault_no_value() {
+  local o
+  o="$(printf '%s' "$1" | tr -d '[:space:]')"
+  [ "$o" = "{}" ] && return 0
+  [ "$(printf '%s\n' "$1" | grep -c .)" = 1 ] && printf '%s\n' "$1" | grep -Eq '^No value found at [^[:space:]]+[[:space:]]*$'
+}
+
 # vault_admin — admin token + a `vault` command, or fail.
 vault_admin() {
   vault_admin_env || exit 1

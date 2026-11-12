@@ -46,10 +46,18 @@ if [ "$1 $2" = "network inspect" ] && [ "$4" = "--format" ]; then
 fi
 exit 0
 STUB
-# vault: STUB_VAULT_RC / STUB_VAULT_OUT control `vault list` behaviour.
+# vault: STUB_VAULT_RC / STUB_VAULT_OUT control `vault list` behaviour;
+# calls on pki_file use STUB_VAULT_FILE_RC / STUB_VAULT_FILE_OUT when set.
 cat > "$WORK/bin/vault" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$STUB_DIR/vault-calls"
+case "$*" in
+  *pki_file/*)
+    if [ -n "${STUB_VAULT_FILE_RC:-}" ]; then
+      printf '%s\n' "${STUB_VAULT_FILE_OUT:-}"
+      exit "$STUB_VAULT_FILE_RC"
+    fi ;;
+esac
 printf '%s\n' "${STUB_VAULT_OUT:-}"
 exit "${STUB_VAULT_RC:-0}"
 STUB
@@ -208,6 +216,26 @@ expect_eq "stack_prepare: a 10001-owned appfiles/ keeps its mode" "$(file_mode "
   stack_prepare ) >/dev/null 2>&1
 expect_ok "stack_prepare: mcp_gate_data owned 10005:10001" grep -qx 'volume_own mcp_gate_data 10005:10001' "$STUB_DIR/sp-vol"
 expect_ok "stack_prepare: mcp-gate secrets ensured" grep -qx 'mcpgate_ensure_secrets' "$STUB_DIR/sp-vol"
+# group_gate_data (sign-in part 2, contract §4 "Opened log"): group-gate
+# (10003) writes the opened log, the Hub (group 10001) reads and prunes it.
+expect_ok "the stack's volume setup owns group_gate_data 10003:10001" grep -qx 'volume_own group_gate_data 10003:10001' "$STUB_DIR/sp-vol"
+# group-gate bind-mounts both CA files: files (empty until pki setup), never
+# directories Docker would make; a directory is refused.
+expect_eq "stack_prepare: the two CA files exist as empty 0644 files before pki setup" \
+  "$(for f in yubikey-ca.crt browser-ca.crt; do [ -f "$SP_ROOT/certs/$f" ] && [ ! -s "$SP_ROOT/certs/$f" ] && file_mode "$SP_ROOT/certs/$f"; done | tr '\n' ' ')" "644 644 "
+printf 'pem\n' > "$SP_ROOT/certs/yubikey-ca.crt"
+( PORTCULLIS_ROOT="$SP_ROOT"
+  volume_own() { :; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  unset -f users_secret_files monitoring_prepare domains_prepare
+  stack_prepare ) >/dev/null 2>&1
+expect_eq "stack_prepare: an existing CA file is kept" "$(cat "$SP_ROOT/certs/yubikey-ca.crt")" pem
+rm -f "$SP_ROOT/certs/browser-ca.crt"; mkdir "$SP_ROOT/certs/browser-ca.crt"
+rc=0; ( PORTCULLIS_ROOT="$SP_ROOT"
+  volume_own() { :; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  unset -f users_secret_files monitoring_prepare domains_prepare
+  stack_prepare ) >/dev/null 2>&1 || rc=$?
+expect_eq "stack_prepare: a CA file Docker made a directory is refused" "$rc" 1
+rmdir "$SP_ROOT/certs/browser-ca.crt"
 rm -f "$STUB_DIR/sp-vol"
 rm -f "$STUB_DIR/calls"
 
@@ -501,7 +529,7 @@ serials_in() { grep -v '^#' "$REV" | paste -sd' ' -; }
 
 STUB_VAULT_RC=0 STUB_VAULT_OUT='["0a:bc","de:ad:be:ef"]' write_revoked_serials "$REV" >/dev/null 2>&1
 expect_eq "sync writes Vault's revoked serials" "$(serials_in)" "0a:bc de:ad:be:ef"
-expect_ok "sync file keeps a header" grep -q '^# Revoked client-cert serials' "$REV"
+expect_ok "sync file keeps a header" grep -q '^# Revoked YubiKey and browser certificate serials' "$REV"
 
 STUB_VAULT_RC=2 STUB_VAULT_OUT='No value found at pki_int/certs/revoked' write_revoked_serials "$REV" >/dev/null 2>&1
 rc=$?
@@ -510,8 +538,15 @@ expect_eq "exit 2 → empty list" "$(serials_in)" ""
 
 printf '# prev\n0a:bc\n' > "$REV"
 before="$(cat "$REV")"
-for case in "1|Error listing pki_int/certs/revoked: Vault is sealed" \
-            "1|Error making API request. Code: 403. permission denied" \
+# The vault CLI exits 2 for every API error (Vault 1.17): sealed, 403,
+# unmounted, unreachable. Only "No value found at <path>" is "nothing".
+for case in "2|$(printf 'Error listing pki_int/certs/revoked/: Error making API request.\n\nCode: 503. Errors:\n\n* Vault is sealed')" \
+            "2|$(printf 'Error listing pki_int/certs/revoked/: Error making API request.\n\nCode: 403. Errors:\n\n* permission denied')" \
+            "2|$(printf 'Error listing pki_int/certs/revoked/: Error making API request.\n\nCode: 404. Errors:\n\n* no handler for route \"pki_int/certs/revoked\". route entry not found.')" \
+            "2|Error listing pki_int/certs/revoked/: Get \"http://127.0.0.1:8200/v1/pki_int/certs/revoked?list=true\": dial tcp 127.0.0.1:8200: connect: connection refused" \
+            "2|" \
+            "2|No value found at pki_int/certs/revoked plus something else" \
+            "1|Error listing pki_int/certs/revoked: Vault is sealed" \
             "1|dial tcp 127.0.0.1:8200: connect: connection refused" \
             "0|not json at all" \
             '0|{"keys":["0a:bc"]}'; do
@@ -522,8 +557,77 @@ for case in "1|Error listing pki_int/certs/revoked: Vault is sealed" \
 done
 expect_eq "no temp files left behind" "$(find "$WORK/revocation" -name '.revoked.*' | wc -l | tr -d ' ')" 0
 
+# Both CAs: the union of pki_int/certs/revoked and pki_file/certs/revoked.
+rm -f "$STUB_DIR/vault-calls"
+STUB_VAULT_RC=0 STUB_VAULT_OUT='["0a:bc","11:11"]' STUB_VAULT_FILE_RC=0 STUB_VAULT_FILE_OUT='["ff:01","11:11"]' \
+  write_revoked_serials "$REV" >/dev/null 2>&1
+expect_eq "write_revoked_serials writes the union of both mounts" "$(serials_in)" "0a:bc 11:11 ff:01"
+expect_ok "sync lists pki_int's revoked serials" grep -qx 'list -format=json pki_int/certs/revoked' "$STUB_DIR/vault-calls"
+expect_ok "sync lists pki_file's revoked serials" grep -qx 'list -format=json pki_file/certs/revoked' "$STUB_DIR/vault-calls"
+STUB_VAULT_RC=2 STUB_VAULT_OUT='No value found at pki_int/certs/revoked' STUB_VAULT_FILE_RC=0 STUB_VAULT_FILE_OUT='["ff:02"]' \
+  write_revoked_serials "$REV" >/dev/null 2>&1
+expect_eq "nothing revoked on pki_int + one on pki_file" "$(serials_in)" "ff:02"
+before="$(cat "$REV")"
+for case in "2|$(printf 'Error listing pki_file/certs/revoked/: Error making API request.\n\nCode: 503. Errors:\n\n* Vault is sealed')" \
+            "2|$(printf 'Error listing pki_file/certs/revoked/: Error making API request.\n\nCode: 403. Errors:\n\n* permission denied')" \
+            "1|Error listing pki_file/certs/revoked: Vault is sealed" "0|not json" '0|{"keys":["ff:03"]}'; do
+  rc=0
+  STUB_VAULT_RC=0 STUB_VAULT_OUT='["0a:bc"]' STUB_VAULT_FILE_RC="${case%%|*}" STUB_VAULT_FILE_OUT="${case#*|}" \
+    write_revoked_serials "$REV" >/dev/null 2>&1 || rc=$?
+  expect_eq "a failing pki_file list ('${case#*|}') → non-zero" "$([ "$rc" -ne 0 ] && echo fail || echo ok)" fail
+  expect_eq "a failing pki_file list ('${case#*|}') leaves the file unchanged" "$(cat "$REV")" "$before"
+done
+rc=0
+STUB_VAULT_RC=2 STUB_VAULT_OUT="$(printf 'Error listing pki_int/certs/revoked/: Error making API request.\n\nCode: 503. Errors:\n\n* Vault is sealed')" STUB_VAULT_FILE_RC=0 STUB_VAULT_FILE_OUT='["ff:04"]' \
+  write_revoked_serials "$REV" >/dev/null 2>&1 || rc=$?
+expect_eq "a failing pki_int list with a good pki_file one → non-zero" "$([ "$rc" -ne 0 ] && echo fail || echo ok)" fail
+expect_eq "a failing pki_int list leaves the file unchanged" "$(cat "$REV")" "$before"
+STUB_VAULT_RC=2 STUB_VAULT_OUT='No value found at pki_int/certs/revoked' STUB_VAULT_FILE_RC=2 STUB_VAULT_FILE_OUT='{}' \
+  write_revoked_serials "$REV" >/dev/null 2>&1
+expect_eq "'No value found' + '{}' (both CAs empty) → an empty list" "$(serials_in)" ""
+
+# vault_no_value: only Vault's own "nothing there" answer.
+expect_ok "vault_no_value: 'No value found at <path>'" vault_no_value 'No value found at pki_int/certs/revoked'
+expect_ok "vault_no_value: '{}'" vault_no_value '{}'
+expect_fail "vault_no_value: sealed" vault_no_value "$(printf 'Error reading x: Error making API request.\n\nCode: 503. Errors:\n\n* Vault is sealed')"
+expect_fail "vault_no_value: 403" vault_no_value "$(printf 'Code: 403. Errors:\n\n* permission denied')"
+expect_fail "vault_no_value: command not found" vault_no_value 'vault: command not found'
+expect_fail "vault_no_value: empty" vault_no_value ''
+
 # ══ portcullis pki setup: idempotency / partial runs / guard ═══
-# A scripted vault stub: $PKI_STATE selects which PKI pieces "exist".
+# Real (self-signed) CA certificates, so CNs and the chain order can be checked.
+mkdir -p "$STUB_DIR/pem"
+# mkpem <name> <CN> [<issuer name>] — a CA certificate: self-signed, or
+# signed by <issuer> (a real hierarchy: the handshake check below builds
+# paths through it); mkleaf <name> <CN> <issuer> — a client-auth leaf.
+printf '[req]\ndistinguished_name=dn\n[dn]\n[ca]\nbasicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n' > "$STUB_DIR/pem/req.cnf"
+printf 'basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n' > "$STUB_DIR/pem/ca.ext"
+printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=clientAuth\n' > "$STUB_DIR/pem/leaf.ext"
+_mksigned() {  # <name> <CN> <issuer> <ext>
+  openssl ecparam -genkey -name prime256v1 -out "$STUB_DIR/pem/$1.key" 2>/dev/null
+  openssl req -new -key "$STUB_DIR/pem/$1.key" -subj "/CN=$2" -out "$STUB_DIR/pem/$1.csr" 2>/dev/null
+  openssl x509 -req -in "$STUB_DIR/pem/$1.csr" -CA "$STUB_DIR/pem/$3" -CAkey "$STUB_DIR/pem/$3.key" \
+    -set_serial "0x$(openssl rand -hex 8)" -days 2 -extfile "$STUB_DIR/pem/$4" -out "$STUB_DIR/pem/$1" 2>/dev/null
+}
+mkpem() {
+  if [ -n "${3:-}" ]; then _mksigned "$1" "$2" "$3" ca.ext; return; fi
+  openssl ecparam -genkey -name prime256v1 -out "$STUB_DIR/pem/$1.key" 2>/dev/null
+  openssl req -new -x509 -key "$STUB_DIR/pem/$1.key" -subj "/CN=$2" -days 2 \
+    -config "$STUB_DIR/pem/req.cnf" -extensions ca -out "$STUB_DIR/pem/$1" 2>/dev/null
+}
+mkleaf() { _mksigned "$1" "$2" "$3" leaf.ext; }
+mkpem root "example.test Root CA"
+mkpem int "example.test Intermediate CA" root
+mkpem file "example.test Browser Certificate CA" root
+mkpem file-samecn "example.test Intermediate CA" root
+mkleaf leaf-yk alice int
+mkleaf leaf-br alice file
+# A scripted vault stub: $PKI_STATE selects which PKI pieces "exist":
+#   none (fresh Vault), complete (pki, pki_int, pki_file), nofile (pki_file
+#   missing), norole (client-cert role missing), samecn (pki_file has
+#   pki_int's CN), partial (mounts but no issuers), sealed, intbroken
+#   (exit 1), int403 (403 on pki_int/issuers, exit 2 like the real CLI),
+#   fileerr (sealed answer on pki_file/issuers, exit 2), roleerr (403 on the role).
 mkdir -p "$WORK/pki-bin"
 cat > "$WORK/pki-bin/vault" <<'STUB'
 #!/usr/bin/env bash
@@ -533,16 +637,29 @@ case "$PKI_STATE:$*" in
   *:secrets\ list*)
     case "$PKI_STATE" in
       none) echo '{"secret/":{}}' ;;
-      *) echo '{"pki/":{},"pki_int/":{}}' ;;
+      nofile) echo '{"pki/":{},"pki_int/":{}}' ;;
+      *) echo '{"pki/":{},"pki_int/":{},"pki_file/":{}}' ;;
     esac ;;
-  complete:list*pki_int/issuers*|norole:list*pki_int/issuers*) echo '["abc"]' ;;
+  complete:list*pki_*/issuers*|norole:list*pki_*/issuers*|samecn:list*pki_*/issuers*) echo '["abc"]' ;;
+  nofile:list*pki_int/issuers*) echo '["abc"]' ;;
   intbroken:list*pki_int/issuers*) echo "Error: permission denied" >&2; exit 1 ;;
-  *:list*issuers*) echo "No value found" >&2; exit 2 ;;
-  complete:read*pki_int/roles/client-cert*) echo '{"data":{}}' ;;
-  *:read*pki_int/roles/client-cert*) echo "No value found" >&2; exit 2 ;;
-  *:read\ -field=certificate*) echo "-----BEGIN CERTIFICATE-----" ;;
+  int403:list*pki_int/issuers*)
+    printf 'Error listing pki_int/issuers/: Error making API request.\n\nCode: 403. Errors:\n\n* permission denied\n' >&2; exit 2 ;;
+  fileerr:list*pki_int/issuers*) echo '["abc"]' ;;
+  roleerr:list*pki_*/issuers*) echo '["abc"]' ;;
+  fileerr:list*pki_file/issuers*)
+    printf 'Error listing pki_file/issuers/: Error making API request.\n\nCode: 503. Errors:\n\n* Vault is sealed\n' >&2; exit 2 ;;
+  *:list*issuers*) echo "No value found at $3" >&2; exit 2 ;;
+  norole:read*pki_int/roles/client-cert*) echo "No value found at $3" >&2; exit 2 ;;
+  roleerr:read*pki_int/roles/client-cert*)
+    printf 'Error reading pki_int/roles/client-cert: Error making API request.\n\nCode: 403. Errors:\n\n* permission denied\n' >&2; exit 2 ;;
+  *:read*/roles/*) echo '{"data":{}}' ;;
+  *:read\ -field=certificate\ pki/cert/ca) cat "$STUB_DIR/pem/root" ;;
+  *:read\ -field=certificate\ pki_int/cert/ca) cat "$STUB_DIR/pem/int" ;;
+  samecn:read\ -field=certificate\ pki_file/cert/ca) cat "$STUB_DIR/pem/file-samecn" ;;
+  *:read\ -field=certificate\ pki_file/cert/ca) cat "$STUB_DIR/pem/file" ;;
   *:write\ -format=json\ pki/root/generate*) echo '{"data":{"certificate":"ROOT"}}' ;;
-  *:write\ -format=json\ pki_int/intermediate/generate*) echo '{"data":{"csr":"CSR"}}' ;;
+  *:write\ -format=json\ pki_*/intermediate/generate*) echo '{"data":{"csr":"CSR"}}' ;;
   *:write\ -format=json\ pki/root/sign-intermediate*) echo '{"data":{"certificate":"INT"}}' ;;
   *:write\ -format=json\ pki_int/issue/server-cert*) echo '{"data":{"certificate":"SRV","private_key":"KEY"}}' ;;
 esac
@@ -568,12 +685,83 @@ expect_ok "pki: fresh install generates a root" grep -q 'root/generate/internal'
 expect_ok "pki: root CN uses PORTCULLIS_DOMAIN" grep -q 'common_name=example.test Root CA' "$STUB_DIR/pki-calls"
 expect_eq "pki: server.key is 0640 (group 0 for Traefik)" "$(file_mode "$PKI_ROOT/certs/server.key")" 640
 expect_ok "pki: server.key chgrp via a helper container" grep -q "chown $(id -u):0 /t/0" "$STUB_DIR/calls"
-expect_ok "pki: ca-chain written" grep -q INT "$PKI_ROOT/certs/ca-chain.crt"
+expect_ok "pki: ca-chain written" grep -q 'BEGIN CERTIFICATE' "$PKI_ROOT/certs/ca-chain.crt"
 expect_ok "pki: Keycloak truststore written" cmp -s "$PKI_ROOT/certs/ca-chain.crt" "$PKI_ROOT/certs/truststore/portcullis-ca-chain.pem"
 expect_ok "pki: client role defaults to 30 days" grep -q 'roles/client-cert .*max_ttl=720h ttl=720h' "$STUB_DIR/pki-calls"
 expect_ok "pki: CRL auto-rebuild configured" grep -q 'pki_int/config/crl .*auto_rebuild=true' "$STUB_DIR/pki-calls"
 # auto_rebuild defers full-CRL rebuilds on revoke: new revocations must go to a delta CRL.
 expect_ok "pki: delta CRLs enabled, rebuilt every minute" grep -q 'pki_int/config/crl .*enable_delta=true delta_rebuild_interval=1m' "$STUB_DIR/pki-calls"
+# The three CA files, as pki_setup must export them.
+CHAIN3="$(cat "$STUB_DIR/pem/root" "$STUB_DIR/pem/int" "$STUB_DIR/pem/file")"
+# ca-chain-yubikey.crt: pki_int ALONE (review C1: Go trusts every caFiles
+# certificate as an anchor, so a root there would admit browser leaves).
+CHAIN2="$(cat "$STUB_DIR/pem/int")"
+nbegin() { grep -c 'BEGIN CERTIFICATE' "$1"; }
+expect_ok "pki_setup on a fresh Vault enables pki" grep -qx 'secrets enable -path=pki pki' "$STUB_DIR/pki-calls"
+expect_ok "pki_setup on a fresh Vault enables pki_int" grep -qx 'secrets enable -path=pki_int pki' "$STUB_DIR/pki-calls"
+expect_ok "pki_setup on a fresh Vault enables pki_file" grep -qx 'secrets enable -path=pki_file pki' "$STUB_DIR/pki-calls"
+expect_ok "pki_file CN is '<domain> Browser Certificate CA'" grep -q 'pki_file/intermediate/generate/internal common_name=example.test Browser Certificate CA' "$STUB_DIR/pki-calls"
+expect_ok "pki_file is signed by the root (43800h)" grep -q 'pki/root/sign-intermediate csr=CSR format=pem_bundle ttl=43800h' "$STUB_DIR/pki-calls"
+expect_ok "pki_file gets its signed certificate" grep -q 'write pki_file/intermediate/set-signed certificate=INT' "$STUB_DIR/pki-calls"
+expect_ok "pki_file URLs point at pki_file" grep -q 'pki_file/config/urls issuing_certificates=.*/v1/pki_file/ca crl_distribution_points=.*/v1/pki_file/crl' "$STUB_DIR/pki-calls"
+expect_eq "pki: ca-chain.crt has 3 certificates" "$(nbegin "$PKI_ROOT/certs/ca-chain.crt")" 3
+expect_eq "pki: ca-chain.crt is root, pki_int, pki_file in order" "$(cat "$PKI_ROOT/certs/ca-chain.crt")" "$CHAIN3"
+expect_eq "pki: ca-chain-yubikey.crt is pki_int's certificate alone (no root)" "$(cat "$PKI_ROOT/certs/ca-chain-yubikey.crt")" "$CHAIN2"
+expect_eq "pki: ca-chain-yubikey.crt holds exactly 1 certificate" "$(nbegin "$PKI_ROOT/certs/ca-chain-yubikey.crt")" 1
+# The handshake rule (review C1), with Go's semantics: every caFiles
+# certificate is a trust anchor (-partial_chain) and the client's own
+# chain is untrusted input. A browser .p12 sends leaf + pki_file + root.
+BR_SENT="$STUB_DIR/pem/browser-sent"; cat "$STUB_DIR/pem/file" "$STUB_DIR/pem/root" > "$BR_SENT"
+YK_SENT="$STUB_DIR/pem/yubikey-sent"; cat "$STUB_DIR/pem/int" > "$YK_SENT"
+# OpenSSL >= 1.1 (CI's) has -partial_chain; LibreSSL (macOS /usr/bin) doesn't,
+# and an unusable binary must never look like a refusal.
+OSSL=""
+for o in openssl /opt/homebrew/bin/openssl /usr/local/bin/openssl; do
+  if command -v "$o" >/dev/null 2>&1 && "$o" verify -help 2>&1 | grep -q -- -partial_chain; then OSSL="$o"; break; fi
+done
+# hs <caFiles> <chain the client sends, "" for none> <leaf> — "accepted", "refused" or "error".
+hs() {
+  local out
+  [ -n "$OSSL" ] || { echo error; return; }
+  local sent=()
+  [ -z "$2" ] || sent=(-untrusted "$2")
+  if out="$("$OSSL" verify -partial_chain -purpose sslclient -CAfile "$1" "${sent[@]}" "$3" 2>&1)"; then echo accepted
+  elif printf '%s' "$out" | grep -q 'error [0-9]* at [0-9]* depth lookup'; then echo refused
+  else echo error; fi
+}
+expect_eq "handshake check: an OpenSSL with -partial_chain is available" "${OSSL:+yes}" yes
+expect_eq "protected (ca-chain-yubikey.crt) refuses a browser leaf sending pki_file + root" \
+  "$(hs "$PKI_ROOT/certs/ca-chain-yubikey.crt" "$BR_SENT" "$STUB_DIR/pem/leaf-br")" refused
+expect_eq "protected (ca-chain-yubikey.crt) refuses a browser leaf sent alone" \
+  "$(hs "$PKI_ROOT/certs/ca-chain-yubikey.crt" "" "$STUB_DIR/pem/leaf-br")" refused
+expect_eq "protected (ca-chain-yubikey.crt) accepts a YubiKey leaf" \
+  "$(hs "$PKI_ROOT/certs/ca-chain-yubikey.crt" "$YK_SENT" "$STUB_DIR/pem/leaf-yk")" accepted
+expect_eq "protected (ca-chain-yubikey.crt) accepts a YubiKey leaf sent alone" \
+  "$(hs "$PKI_ROOT/certs/ca-chain-yubikey.crt" "" "$STUB_DIR/pem/leaf-yk")" accepted
+expect_eq "protected-any / authaware (ca-chain.crt) accept a browser leaf" \
+  "$(hs "$PKI_ROOT/certs/ca-chain.crt" "$BR_SENT" "$STUB_DIR/pem/leaf-br")" accepted
+expect_eq "protected-any / authaware (ca-chain.crt) accept a YubiKey leaf" \
+  "$(hs "$PKI_ROOT/certs/ca-chain.crt" "$YK_SENT" "$STUB_DIR/pem/leaf-yk")" accepted
+# The check catches the flaw: with the root in the file, the browser leaf passes.
+cat "$STUB_DIR/pem/root" "$STUB_DIR/pem/int" > "$STUB_DIR/pem/old-yk-chain"
+expect_eq "the handshake check detects a root in the YubiKey chain (root + pki_int admits a browser leaf)" \
+  "$(hs "$STUB_DIR/pem/old-yk-chain" "$BR_SENT" "$STUB_DIR/pem/leaf-br")" accepted
+expect_ok "pki: yubikey-ca.crt is pki_int's certificate" cmp -s "$PKI_ROOT/certs/yubikey-ca.crt" "$STUB_DIR/pem/int"
+expect_ok "pki: browser-ca.crt is pki_file's certificate" cmp -s "$PKI_ROOT/certs/browser-ca.crt" "$STUB_DIR/pem/file"
+expect_ok "truststore has portcullis-yubikey-ca.pem" cmp -s "$PKI_ROOT/certs/truststore/portcullis-yubikey-ca.pem" "$STUB_DIR/pem/int"
+expect_ok "truststore has portcullis-browser-ca.pem" cmp -s "$PKI_ROOT/certs/truststore/portcullis-browser-ca.pem" "$STUB_DIR/pem/file"
+expect_ok "browser-cert role written with client_flag=true server_flag=false" \
+  grep -q 'write pki_file/roles/browser-cert .*client_flag=true server_flag=false' "$STUB_DIR/pki-calls"
+expect_ok "browser-cert role: use_csr_common_name=false use_csr_sans=false, any name" \
+  grep -q 'write pki_file/roles/browser-cert .*allow_any_name=true enforce_hostnames=false use_csr_common_name=false use_csr_sans=false' "$STUB_DIR/pki-calls"
+expect_ok "browser-cert role: ec 256, max_ttl=\$CLIENT_CERT_TTL, stored" \
+  grep -q 'write pki_file/roles/browser-cert .*key_type=ec key_bits=256 max_ttl=720h ttl=720h no_store=false' "$STUB_DIR/pki-calls"
+expect_ok "browser-cert role: no IP / URI / other SANs" \
+  grep -q 'write pki_file/roles/browser-cert .*allow_ip_sans=false allowed_uri_sans= allowed_other_sans= ' "$STUB_DIR/pki-calls"
+expect_ok "client-cert role: no IP / URI / other SANs either" \
+  grep -q 'write pki_int/roles/client-cert .*allow_ip_sans=false allowed_uri_sans= allowed_other_sans= ' "$STUB_DIR/pki-calls"
+expect_ok "pki_file CRL configured auto_rebuild=true enable_delta=true delta_rebuild_interval=1m" \
+  grep -q 'write pki_file/config/crl expiry=72h auto_rebuild=true auto_rebuild_grace_period=12h enable_delta=true delta_rebuild_interval=1m' "$STUB_DIR/pki-calls"
 expect_eq "pki: complete PKI is a no-op" "$(run_pki complete)" 0
 expect_fail "pki: complete PKI → no generate / disable" grep -Eq 'generate|secrets disable' "$STUB_DIR/pki-calls"
 expect_ok "pki: complete PKI re-exports missing CA files" test -s "$PKI_ROOT/certs/ca-chain.crt"
@@ -582,6 +770,7 @@ expect_ok "pki: complete PKI (re)applies the CRL config incl. delta" grep -q 'pk
 rm -f "$PKI_ROOT/certs/truststore/portcullis-ca-chain.pem"
 expect_eq "pki: CLIENT_CERT_TTL=2160h" "$(CLIENT_CERT_TTL=2160h run_pki complete)" 0
 expect_ok "pki: role uses CLIENT_CERT_TTL" grep -q 'max_ttl=2160h ttl=2160h' "$STUB_DIR/pki-calls"
+expect_ok "pki: browser-cert role uses CLIENT_CERT_TTL" grep -q 'write pki_file/roles/browser-cert .*max_ttl=2160h' "$STUB_DIR/pki-calls"
 expect_ok "pki: complete PKI re-exports the truststore" test -s "$PKI_ROOT/certs/truststore/portcullis-ca-chain.pem"
 expect_eq "pki: invalid CLIENT_CERT_TTL fails" "$(CLIENT_CERT_TTL='30 days' run_pki complete)" 1
 expect_eq "pki: missing role only" "$(run_pki norole)" 0
@@ -589,10 +778,16 @@ expect_ok "pki: missing role is recreated" grep -q 'write pki_int/roles/client-c
 expect_fail "pki: missing role does NOT wipe the CA" grep -Eq 'generate|secrets disable' "$STUB_DIR/pki-calls"
 expect_eq "pki: partial run (no intermediate) is redone" "$(run_pki partial)" 0
 expect_ok "pki: partial run wipes pki_int + pki first" grep -q 'secrets disable pki_int' "$STUB_DIR/pki-calls"
+expect_ok "pki: partial run wipes pki_file too" grep -qx 'secrets disable pki_file' "$STUB_DIR/pki-calls"
 expect_eq "pki: sealed Vault fails" "$(run_pki sealed)" 1
 expect_fail "pki: sealed Vault → nothing generated" grep -q generate "$STUB_DIR/pki-calls"
 expect_eq "pki: read error on issuers fails" "$(run_pki intbroken)" 1
 expect_fail "pki: read error → nothing wiped/generated" grep -Eq 'generate|secrets disable' "$STUB_DIR/pki-calls"
+expect_eq "pki: a 403 on pki_int/issuers (exit 2) fails" "$(run_pki int403)" 1
+expect_fail "pki: a 403 on pki_int/issuers → nothing wiped/generated" grep -Eq 'generate|secrets (enable|disable)' "$STUB_DIR/pki-calls"
+expect_eq "pki: an error on pki_file/issuers (exit 2) fails" "$(run_pki fileerr)" 1
+expect_fail "pki: an error on pki_file/issuers never wipes or re-creates pki_file" grep -Eq 'generate|secrets (enable|disable)' "$STUB_DIR/pki-calls"
+expect_eq "pki: a 403 on the client-cert role (exit 2) fails" "$(run_pki roleerr)" 1
 # Vault lost its data but certs/ca-chain.crt from the old CA is still there.
 mkdir -p "$PKI_ROOT/certs" && echo OLD > "$PKI_ROOT/certs/ca-chain.crt"
 expect_eq "pki: no CA in Vault + old ca-chain → refuses" "$(run_pki none --keep)" 1
@@ -600,6 +795,70 @@ expect_fail "pki: refusal creates nothing" grep -q generate "$STUB_DIR/pki-calls
 expect_ok "pki: refusal explains --force" grep -q -- '--force' "$WORK/pki-out"
 expect_eq "pki: --force creates a new CA anyway" "$(run_pki none --keep --force)" 0
 expect_ok "pki: --force generated a root" grep -q 'root/generate/internal' "$STUB_DIR/pki-calls"
+expect_eq "pki: --force over a complete PKI" "$(run_pki complete --force)" 0
+expect_ok "pki: --force destroys pki_file" grep -qx 'secrets disable pki_file' "$STUB_DIR/pki-calls"
+expect_ok "pki: --force destroys pki_int" grep -qx 'secrets disable pki_int' "$STUB_DIR/pki-calls"
+
+# PKI_TRUSTSTORE_CHANGED (read by stack.sh) needs pki_setup in this shell.
+# pki_fn <state> — runs pki_setup on the current certs/, prints "<rc> <flag>".
+pki_fn() {
+  rm -f "$STUB_DIR/pki-calls"; touch "$STUB_DIR/pki-calls"
+  PATH="$WORK/pki-bin:$PATH" PKI_STATE="$1" VAULT_TOKEN=t PORTCULLIS_ROOT="$PKI_ROOT" PORTCULLIS_DOMAIN=example.test \
+    bash -c 'set -euo pipefail
+      for l in common vault pki; do source "$1/scripts/lib/$l.sh"; done
+      rc=0; ( pki_setup false false >/dev/null; echo "${PKI_TRUSTSTORE_CHANGED:-unset}" > "$2" ) || rc=$?
+      [ "$rc" = 0 ] || echo error > "$2"
+      echo "$rc $(cat "$2")"' _ "$HERE/.." "$WORK/pki-flag" 2>"$WORK/pki-out"
+}
+CERTS="$PKI_ROOT/certs"
+# pki_int present, no pki_file: the install pki_file is added to.
+rm -rf "$CERTS"; mkdir -p "$CERTS/truststore"
+cp "$STUB_DIR/pem/root" "$CERTS/root-ca.crt"; cp "$STUB_DIR/pem/int" "$CERTS/intermediate-ca.crt"
+printf '%s\n' "$CHAIN2" > "$CERTS/ca-chain.crt"; cp "$CERTS/ca-chain.crt" "$CERTS/truststore/portcullis-ca-chain.pem"
+expect_eq "pki_setup with pki_int present but no pki_file sets PKI_TRUSTSTORE_CHANGED=true" "$(pki_fn nofile)" "0 true"
+expect_ok "pki_setup with pki_int present creates pki_file" grep -qx 'secrets enable -path=pki_file pki' "$STUB_DIR/pki-calls"
+expect_ok "pki_setup with pki_int present: pki_file signed by the root" grep -q 'write pki_file/intermediate/set-signed' "$STUB_DIR/pki-calls"
+expect_fail "pki_setup with pki_int present keeps pki_int (no disable / generate on it)" \
+  grep -Eq 'secrets disable|pki_int/intermediate/generate|pki/root/generate' "$STUB_DIR/pki-calls"
+expect_eq "pki_setup with pki_int present rewrites ca-chain.crt to 3 certificates" "$(cat "$CERTS/ca-chain.crt")" "$CHAIN3"
+expect_eq "pki_setup with pki_int present writes ca-chain-yubikey.crt (pki_int alone)" "$(cat "$CERTS/ca-chain-yubikey.crt")" "$CHAIN2"
+expect_eq "pki_setup with pki_int present rewrites the truststore chain" "$(cat "$CERTS/truststore/portcullis-ca-chain.pem")" "$CHAIN3"
+expect_ok "pki_setup with pki_int present writes the truststore's browser CA" cmp -s "$CERTS/truststore/portcullis-browser-ca.pem" "$STUB_DIR/pem/file"
+expect_ok "pki_setup with pki_int present writes the browser-cert role" grep -q 'write pki_file/roles/browser-cert' "$STUB_DIR/pki-calls"
+expect_ok "pki_setup with pki_int present configures pki_file's CRLs" grep -q 'write pki_file/config/crl .*enable_delta=true' "$STUB_DIR/pki-calls"
+# pki_file missing in Vault but browser-ca.crt on disk: never re-created on a guess.
+cp -p "$CERTS/ca-chain.crt" "$WORK/chain-before"
+expect_eq "pki_setup refuses to re-create pki_file when certs/browser-ca.crt exists" "$(pki_fn nofile)" "1 error"
+expect_fail "pki_setup's browser-ca.crt refusal enables / disables nothing" grep -Eq 'secrets (enable|disable)|generate' "$STUB_DIR/pki-calls"
+expect_ok "pki_setup's browser-ca.crt refusal explains --force" grep -q -- '--force' "$WORK/pki-out"
+expect_ok "pki_setup's browser-ca.crt refusal leaves the chain alone" cmp -s "$CERTS/ca-chain.crt" "$WORK/chain-before"
+# All three present, both chains current.
+expect_eq "pki_setup with all three present and both chains current leaves PKI_TRUSTSTORE_CHANGED unset" "$(pki_fn complete)" "0 unset"
+expect_fail "pki_setup with all three present creates nothing" grep -Eq 'secrets (enable|disable)|generate' "$STUB_DIR/pki-calls"
+# All three present, chain current but ca-chain-yubikey.crt missing / holding pki_file.
+rm -f "$CERTS/ca-chain-yubikey.crt"
+expect_eq "pki_setup with ca-chain-yubikey.crt missing sets PKI_TRUSTSTORE_CHANGED=true" "$(pki_fn complete)" "0 true"
+expect_eq "pki_setup with ca-chain-yubikey.crt missing rewrites it" "$(cat "$CERTS/ca-chain-yubikey.crt")" "$CHAIN2"
+printf '%s\n' "$CHAIN3" > "$CERTS/ca-chain-yubikey.crt"
+expect_eq "pki_setup with ca-chain-yubikey.crt holding pki_file sets PKI_TRUSTSTORE_CHANGED=true" "$(pki_fn complete)" "0 true"
+expect_eq "pki_setup with ca-chain-yubikey.crt holding pki_file rewrites it" "$(cat "$CERTS/ca-chain-yubikey.crt")" "$CHAIN2"
+printf '%s\n' "$CHAIN2" > "$CERTS/ca-chain.crt"
+expect_eq "pki_setup with a 2-certificate ca-chain.crt sets PKI_TRUSTSTORE_CHANGED=true" "$(pki_fn complete)" "0 true"
+expect_eq "pki_setup with a 2-certificate ca-chain.crt rewrites it" "$(cat "$CERTS/ca-chain.crt")" "$CHAIN3"
+# group-gate bind-mounts the CA files: an empty placeholder (stack_prepare)
+# rewritten while the chains are current still restarts it.
+: > "$CERTS/browser-ca.crt"
+expect_eq "pki_setup with an empty browser-ca.crt (chains current) sets PKI_TRUSTSTORE_CHANGED=true" "$(pki_fn complete)" "0 true"
+expect_ok "pki_setup rewrites an empty browser-ca.crt with pki_file's certificate" cmp -s "$CERTS/browser-ca.crt" "$STUB_DIR/pem/file"
+expect_eq "pki_setup with every file current leaves PKI_TRUSTSTORE_CHANGED unset again" "$(pki_fn complete)" "0 unset"
+# Equal CNs: refused, nothing exported.
+cp -p "$CERTS/ca-chain.crt" "$WORK/chain-before"
+rm -f "$CERTS/ca-chain-yubikey.crt"
+expect_eq "pki_setup refuses when the two intermediates' CNs are equal" "$(pki_fn samecn)" "1 error"
+expect_ok "pki_setup's refusal names the same CN" grep -q 'same CN' "$WORK/pki-out"
+expect_ok "pki_setup's refusal leaves ca-chain.crt alone" cmp -s "$CERTS/ca-chain.crt" "$WORK/chain-before"
+expect_fail "pki_setup's refusal writes no ca-chain-yubikey.crt" test -e "$CERTS/ca-chain-yubikey.crt"
+expect_eq "pki setup (CLI) exits 1 on equal CNs" "$(run_pki samecn --keep)" 1
 
 # ══ portcullis cert sync (dispatch through the CLI) ════════
 mkdir -p "$PKI_ROOT/certs/revocation"
@@ -608,6 +867,9 @@ expect_eq "cli cert sync succeeds" "$rc" 0
 expect_ok "cli cert sync wrote the serial" grep -qx '11:22' "$PKI_ROOT/certs/revocation/revoked-serials.txt"
 rc=0; STUB_VAULT_RC=1 STUB_VAULT_OUT='sealed' VAULT_TOKEN=t PORTCULLIS_ROOT="$PKI_ROOT" "$CLI" cert sync >/dev/null 2>&1 || rc=$?
 expect_eq "cli cert sync fails on Vault error" "$rc" 1
+rc=0; STUB_VAULT_RC=2 STUB_VAULT_OUT="$(printf 'Error listing pki_int/certs/revoked/: Error making API request.\n\nCode: 503. Errors:\n\n* Vault is sealed')" \
+  VAULT_TOKEN=t PORTCULLIS_ROOT="$PKI_ROOT" "$CLI" cert sync >/dev/null 2>&1 || rc=$?
+expect_eq "cli cert sync fails on a sealed Vault (exit 2)" "$rc" 1
 expect_ok "cli cert sync error keeps the list" grep -qx '11:22' "$PKI_ROOT/certs/revocation/revoked-serials.txt"
 
 # ══ monitoring: alertmanager config, textfile metrics ═════
@@ -651,6 +913,40 @@ jq -n '{Status: "healthy", Log: [{Output: "ok\nrefusing every AI request (503): 
 expect_eq "status: mcp-gate serving = nothing" "$(mst)" ""
 rm -f "$STUB_DIR/mst-id"
 expect_eq "status: mcp-gate not running = nothing" "$(mst)" ""
+
+# ── status --textfile: certificates per person and kind, the browser CA (review M2) ──
+stf() { (status_run() { cat "$STUB_DIR/stf.json"; }; metrics_textfile_write() { cat; }; status_textfile); }
+jq -n '{ok: true, services: [], vault: {active: true, root_ca_expires_epoch: 300, intermediate_ca_expires_epoch: 200, browser_ca_expires_epoch: 100,
+        client_certs: [{cn: "alice", kind: "yubikey", epoch: 10}, {cn: "alice", kind: "browser", epoch: 20}, {cn: "b\"o", kind: "browser", epoch: 30}]}}' > "$STUB_DIR/stf.json"
+STF="$(stf)"
+expect_eq "status --textfile: one certificate series per person and kind (label kind)" \
+  "$(printf '%s\n' "$STF" | grep '^portcullis_client_cert_expiry_timestamp_seconds{')" \
+  'portcullis_client_cert_expiry_timestamp_seconds{cn="alice",kind="yubikey"} 10
+portcullis_client_cert_expiry_timestamp_seconds{cn="alice",kind="browser"} 20
+portcullis_client_cert_expiry_timestamp_seconds{cn="b\"o",kind="browser"} 30'
+expect_eq "status --textfile: root, intermediate (YubiKey) and browser CA series" \
+  "$(printf '%s\n' "$STF" | grep '^portcullis_ca_expiry_timestamp_seconds{')" \
+  'portcullis_ca_expiry_timestamp_seconds{ca="root"} 300
+portcullis_ca_expiry_timestamp_seconds{ca="intermediate"} 200
+portcullis_ca_expiry_timestamp_seconds{ca="browser"} 100'
+jq '.vault.browser_ca_expires_epoch = 0' "$STUB_DIR/stf.json" > "$STUB_DIR/stf2.json" && mv "$STUB_DIR/stf2.json" "$STUB_DIR/stf.json"
+expect_eq "status --textfile: no browser CA series while its expiry is unknown" "$(stf | grep -c 'ca="browser"' || true)" 0
+# status --json over both mounts: nothing issued on pki_file yet ("No value
+# found", exit 2) is an empty list, not an unknown count (CI run 43051184972).
+sjson() { (require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
+           proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
+           vault_admin_env() { export VAULT_TOKEN=x; }; vault_use_container_cli() { :; }
+           _cert_info() { echo "testuser|Dec 11 15:51:10 2099 GMT|false"; }
+           vault() { case "$*" in
+                       "list -format=json pki_int/certs") echo '["aa:bb"]' ;;
+                       "list -format=json pki_file/certs") echo "No value found at ${STATUS_FILE_LIST:-pki_file/certs}" >&2; return "${STATUS_FILE_RC:-2}" ;;
+                       *) return 1 ;;
+                     esac; }
+           status_run true 2>/dev/null) || true; }
+expect_eq "status --json: pki_file with nothing issued counts 0 (certs_issued 1, the YubiKey one listed)" \
+  "$(sjson | jq -c '[.vault.certs_issued, [.vault.client_certs[] | .kind]]')" '[1,["yubikey"]]'
+expect_eq "status --json: a failing pki_file list leaves certs_issued unknown" \
+  "$(STATUS_FILE_RC=1 sjson | jq -c '.vault.certs_issued')" null
 
 # ── upgrade: pinned Hub image, policy file version (final review M1) ──
 # dc stub: exec prints $STUB_DIR/pv (the policy version), logs $STUB_DIR/gglog.
@@ -992,6 +1288,72 @@ esac
 case "$MOUT" in *"mints new"*) t_fail "mcp-gate: says the Hub mints new credentials" ;; *) t_pass "mcp-gate: never claims the Hub re-mints" ;; esac
 expect_eq "mcp-gate: data volume owner = gate uid, Hub group" "$CT_UID_MCP_GATE:$CT_UID_HUB" "10005:10001"
 
+# ── session store (scripts/lib/sessions.sh, oauth2-proxy #3486) ──
+# shellcheck source=../scripts/lib/sessions.sh
+source "$HERE/../scripts/lib/sessions.sh"
+SR="$WORK/sessroot"; mkdir -p "$SR/secrets" "$WORK/sessbin"
+cat > "$WORK/sessbin/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/sess-calls"
+case "$*" in *" ps -q --status running sessions") [ -f "$STUB_DIR/sess-running" ] && echo abc123 ;; esac
+exit 0
+STUB
+chmod +x "$WORK/sessbin/docker"
+SP1="Aa1$(gen_alnum 37)"; SP2="Bb2$(gen_alnum 37)"
+sess() { (set -euo pipefail; PATH="$WORK/sessbin:$PATH" PORTCULLIS_ROOT="$SR" FORWARD_AUTH_REDIS_PASSWORD="$SP1" FORWARD_AUTH_EXT_REDIS_PASSWORD="$SP2" "$@"); }
+: > "$STUB_DIR/sess-calls"
+SOUT="$(sess sessions_prepare 2>&1)"; expect_eq "sessions_prepare succeeds" "$?" 0
+SC="$SR/secrets/sessions/valkey.conf"
+expect_eq "sessions: secrets/sessions 0700, valkey.conf 0640" "$(file_mode "$SR/secrets/sessions") $(file_mode "$SC")" "700 640"
+expect_ok "sessions: valkey.conf group 1000 (the image's valkey group) through the helper" \
+  grep -qE "src=$SC,dst=/t/0 .* chown $(id -u):1000 /t/0\$" "$STUB_DIR/sess-calls"
+H1="$(printf '%s' "$SP1" | openssl dgst -sha256 -r | cut -d' ' -f1)"; H2="$(printf '%s' "$SP2" | openssl dgst -sha256 -r | cut -d' ' -f1)"
+CMDS="-@all +ping +get +set +del +evalsha +eval +msetnx +mset +getrange +pexpire +mget"
+expect_eq "sessions: the default user is off with no password, keys, channels or commands" \
+  "$(grep '^user default ' "$SC")" "user default off resetpass resetkeys resetchannels -@all"
+expect_eq "sessions: forward-auth = its own ticket keys + the commands oauth2-proxy sends, by password hash" \
+  "$(grep '^user forward-auth ' "$SC")" "user forward-auth on resetpass resetkeys resetchannels $CMDS ~_oauth2_proxy-* #$H1"
+expect_eq "sessions: forward-auth-ext = its own (__Host-portcullis_ext) ticket keys, same commands" \
+  "$(grep '^user forward-auth-ext ' "$SC")" "user forward-auth-ext on resetpass resetkeys resetchannels $CMDS ~__Host-portcullis_ext-* #$H2"
+expect_eq "sessions: exactly three users" "$(grep -c '^user ' "$SC")" 3
+expect_eq "sessions: no persistence, bounded memory, TTL eviction" \
+  "$(grep -E '^(save|appendonly|maxmemory|maxmemory-policy|dir|enable-debug-command|enable-module-command) ' "$SC" | paste -sd'|' -)" \
+  'save ""|appendonly no|dir /data|maxmemory 64mb|maxmemory-policy volatile-ttl|enable-debug-command no|enable-module-command no'
+if grep -qiE '(^| )(\+@all|allcommands|allkeys|~\*|nopass|>)|\+(flushall|flushdb|keys|scan|config|debug|acl|client|shutdown|module|script|function|monitor|subscribe|psubscribe|select|swapdb|migrate|restore|replicaof|slaveof|sync|psync|bgsave|save|bgrewriteaof)( |$)' <(grep '^user ' "$SC"); then
+  t_fail "sessions: a broad or dangerous grant in the ACL"
+else
+  t_pass "sessions: no broad / dangerous grant, no cleartext password (>), no nopass"
+fi
+case "$(cat "$SC") $SOUT" in *"$SP1"*|*"$SP2"*) t_fail "sessions: a password in valkey.conf or the output" ;; *) t_pass "sessions: the passwords are neither in valkey.conf nor printed" ;; esac
+rm -f "$SC"
+expect_eq "sessions: a first write flags the change" "$(sess eval 'sessions_prepare >/dev/null; echo $SESSIONS_CONF_CHANGED')" true
+INO="$(file_inode "$SC")"; BEFORE_CONF="$(cat "$SC")"
+expect_eq "sessions: an unchanged config is not rewritten (no restart)" "$(sess eval 'sessions_prepare >/dev/null; echo $SESSIONS_CONF_CHANGED'):$(cat "$SC")" "false:$BEFORE_CONF"
+SP1="Cc3$(gen_alnum 37)"
+expect_eq "sessions: a rotated password rewrites the config and flags it" "$(sess eval 'sessions_prepare >/dev/null; echo $SESSIONS_CONF_CHANGED')" true
+expect_eq "sessions: rewritten in place (same inode: the running container's bind mount)" "$(file_inode "$SC")" "$INO"
+expect_ok "sessions: ... with the new hash" grep -qF "#$(printf '%s' "$SP1" | openssl dgst -sha256 -r | cut -d' ' -f1)" "$SC"
+expect_eq "sessions: no temp file left" "$(find "$SR/secrets/sessions" -name '.valkey.conf.*' | wc -l | tr -d ' ')" 0
+rc=0; (PATH="$WORK/sessbin:$PATH" PORTCULLIS_ROOT="$SR" FORWARD_AUTH_REDIS_PASSWORD='' FORWARD_AUTH_EXT_REDIS_PASSWORD="$SP2" sessions_prepare) >/dev/null 2>&1 || rc=$?
+expect_eq "sessions: a missing password fails (never a default)" "$rc" 1
+# Restart only a running store, only when its config changed, before compose up.
+: > "$STUB_DIR/sess-calls"; rm -f "$STUB_DIR/sess-running"
+sess eval 'SESSIONS_CONF_CHANGED=true; sessions_restart_if_changed' >/dev/null 2>&1
+expect_fail "sessions: a store that isn't running is not restarted" grep -q 'restart sessions' "$STUB_DIR/sess-calls"
+touch "$STUB_DIR/sess-running"
+sess eval 'SESSIONS_CONF_CHANGED=false; sessions_restart_if_changed' >/dev/null 2>&1
+expect_fail "sessions: an unchanged config restarts nothing" grep -q 'restart sessions' "$STUB_DIR/sess-calls"
+sess eval 'SESSIONS_CONF_CHANGED=true; sessions_restart_if_changed' >/dev/null 2>&1
+expect_ok "sessions: a changed config restarts the running store" grep -q 'compose --project-directory .* restart sessions$' "$STUB_DIR/sess-calls"
+rm -f "$STUB_DIR/sess-running"
+# stack_prepare renders it; secrets_fix_perms repairs its modes.
+expect_ok "stack_prepare runs sessions_prepare" grep -q 'declare -F sessions_prepare' "$HERE/../scripts/lib/common.sh"
+chmod 644 "$SC"; chmod 755 "$SR/secrets/sessions"
+sess sessions_fix_perms >/dev/null 2>&1
+expect_eq "sessions: fix_perms restores 0700 / 0640" "$(file_mode "$SR/secrets/sessions") $(file_mode "$SC")" "700 640"
+expect_ok "sessions: the compose user matches CT_UID_SESSIONS:CT_GID_SESSIONS" \
+  grep -qx "    user: \"$CT_UID_SESSIONS:$CT_GID_SESSIONS\"" "$HERE/../docker-compose.yml"
+
 # ── public address detection (network.sh public_ip_detect; dns setup + domains) ──
 mkdir -p "$WORK/ipbin" "$STUB_DIR/ip"
 cat > "$WORK/ipbin/curl" <<'STUB'
@@ -1077,6 +1439,10 @@ fi
 case " $BACKUP_FILE_VOLUMES " in
   *" mcp_gate_data:10005:10001 "*) t_pass "backup: mcp_gate_data (access log) archived as the gate's uid, Hub group" ;;
   *) t_fail "backup: mcp_gate_data missing from BACKUP_FILE_VOLUMES ($BACKUP_FILE_VOLUMES)" ;;
+esac
+case " $BACKUP_FILE_VOLUMES " in
+  *" group_gate_data:10003:10001 "*) t_pass "BACKUP_FILE_VOLUMES lists group_gate_data (the opened log, kept a year) as group-gate's uid, Hub group" ;;
+  *) t_fail "BACKUP_FILE_VOLUMES lists group_gate_data ($BACKUP_FILE_VOLUMES)" ;;
 esac
 # The MANIFEST of a backup must never list hub_secrets as a file.
 expect_ok "backup: BACKUP_FILE_VOLUMES does not contain hub_secrets" bash -c '! echo "$BACKUP_FILE_VOLUMES" | grep -q hub_secrets'
@@ -1477,6 +1843,49 @@ printf '#!/usr/bin/env bash\necho "$*" >> "$STUB_DIR/calls"\ncase "$*" in *resta
 ca_run 'set -e; signin_ca_reload'
 expect_eq "ca bundle: a failed restart keeps the old record" "$(cat "$PORTCULLIS_ROOT/certs/.ca-bundle.loaded")" "old"
 cp "$WORK/docker.ok" "$WORK/bin/docker"
+
+# ── pki_files_reload (review I1): Traefik, Keycloak and group-gate restart
+# whenever the internal CA's files differ from the persistent stamp ──
+pki_restarts() { grep -c -- '--project-directory .* restart traefik keycloak group-gate$' "$STUB_DIR/calls" 2>/dev/null || true; }
+PC="$PORTCULLIS_ROOT/certs"
+rm -f "$PC/.pki-files.loaded" "$PC/ca-chain.crt"
+: > "$STUB_DIR/calls"
+ca_run pki_files_reload
+expect_eq "pki files: no CA yet → nothing done" "$(pki_restarts):$([ -e "$PC/.pki-files.loaded" ] && echo stamp || echo none)" "0:none"
+mkdir -p "$PC/truststore"
+for f in ca-chain.crt ca-chain-yubikey.crt yubikey-ca.crt browser-ca.crt truststore/portcullis-ca-chain.pem truststore/portcullis-yubikey-ca.pem truststore/portcullis-browser-ca.pem; do
+  printf 'pem %s\n' "$f" > "$PC/$f"
+done
+: > "$STUB_DIR/calls"
+ca_run pki_files_reload
+expect_eq "pki files: nothing recorded → traefik, keycloak, group-gate restarted once" "$(pki_restarts)" "1"
+expect_ok "pki files: the stamp is written after the restart" test -s "$PC/.pki-files.loaded"
+: > "$STUB_DIR/calls"
+ca_run pki_files_reload
+expect_eq "pki files: unchanged → no restart" "$(pki_restarts)" "0"
+for f in ca-chain-yubikey.crt browser-ca.crt truststore/portcullis-browser-ca.pem; do
+  printf 'new\n' >> "$PC/$f"
+  : > "$STUB_DIR/calls"
+  ca_run pki_files_reload
+  expect_eq "pki files: $f changed → restarted" "$(pki_restarts)" "1"
+done
+: > "$STUB_DIR/calls"
+printf 'again\n' >> "$PC/yubikey-ca.crt"
+ca_run pki_files_mark
+ca_run pki_files_reload
+expect_eq "pki files: pki_files_mark after an explicit restart → no second restart" "$(pki_restarts)" "0"
+# A failed restart keeps the old stamp: the next up / upgrade restarts them.
+printf 'old\n' > "$PC/.pki-files.loaded"
+printf 'more\n' >> "$PC/ca-chain.crt"
+printf '#!/usr/bin/env bash\necho "$*" >> "$STUB_DIR/calls"\ncase "$*" in *restart*) exit 1 ;; esac\nexit 0\n' > "$WORK/bin/docker"
+rc=0; ca_run 'set -e; pki_files_reload' || rc=$?
+expect_eq "pki files: a failed restart fails and keeps the old stamp" "$rc:$(cat "$PC/.pki-files.loaded")" "1:old"
+cp "$WORK/docker.ok" "$WORK/bin/docker"
+: > "$STUB_DIR/calls"
+ca_run pki_files_reload
+expect_eq "pki files: the next run restarts them" "$(pki_restarts)" "1"
+rm -rf "$PC/truststore" "$PC/.pki-files.loaded"
+for f in ca-chain.crt ca-chain-yubikey.crt yubikey-ca.crt browser-ca.crt; do rm -f "$PC/$f"; done
 
 # ── config_reload: services restart only when their config files changed ──
 cfg_run() {

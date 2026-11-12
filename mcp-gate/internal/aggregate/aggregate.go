@@ -70,8 +70,10 @@ var (
 	maxTotalBytes    = 8 << 20 // ... for the whole aggregate
 )
 
-// The delegate tools are only on people.<d>/mcp, never here (G38).
-var delegateTools = []string{"invite_person", "update_person", "delete_person"}
+// The delegate tools are only on people.<d>/mcp, never here (G38): the
+// Hub's peopleDelegateTools, help to reset (sign_in_help) included.
+var delegateTools = []string{"invite_person", "update_person", "delete_person",
+	"person_sign_in", "revoke_person_certificate", "remove_passkeys"}
 
 func isDelegate(name string) bool { return slices.Contains(delegateTools, strings.ToLower(name)) }
 
