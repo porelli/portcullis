@@ -1204,7 +1204,7 @@ def main() -> int:
             needs("sam_synced", "sam_spare")
             ctx = new_context()
             page = ctx.new_page()
-            Key(page, synced=True, credentials=state["sam_synced"])
+            synced = Key(page, synced=True, credentials=state["sam_synced"])
             want = f"https://hub.{DOMAIN}/?from=stepup"
             try:
                 goto(page, HUB + "/?from=stepup#x")
@@ -1220,7 +1220,10 @@ def main() -> int:
                 href = page.locator("#stepup-continue").get_attribute("href") or ""
                 rd = urllib.parse.parse_qs(urllib.parse.urlsplit(href).query).get("rd")
                 assert rd == [want], f"step-up rd {rd} (href {href})"
-                # The security key joins only now: the step-up asks for it alone.
+                # The security key replaces the synced authenticator now: with
+                # both on the page, the one without a matching credential can
+                # answer first ("not allowed"), so only one is ever present.
+                synced.cdp.send("WebAuthn.removeVirtualAuthenticator", {"authenticatorId": synced.id})
                 Key(page, credentials=state["sam_spare"])
                 out = drive_kc(page, lambda: (page.url.startswith(want) and not base.on_login_pages(page)
                                               and page.locator("#stepup-continue").count() == 0), "sam-stepup-return")
