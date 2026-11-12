@@ -264,7 +264,19 @@ case "$p" in
   "$R/clients/ai-uuid") jq -c '.[1]' "$KC_FIX/clients.json" ;;
   "$R/client-scopes") cat "$KC_FIX/scopes.json" ;;
   "$R/client-scopes/mcp-id") jq -c '.[4]' "$KC_FIX/scopes.json" ;;
-  "$R") echo '{"realm":"portcullis","browserFlow":"portcullis-universal","loginTheme":"portcullis"}' ;;
+  # What configure POSTed / PUT before (the Keycloak it talks to keeps it).
+  "$R/client-scopes/acr-id/protocol-mappers/models")
+    jq -sc --arg p "$p" '[.[] | select(.m == "POST" and .p == $p) | .b | fromjson]' "$KC_LOG" ;;
+  "$R/authentication/required-actions/portcullis-impersonation-notice")
+    jq -sc '[.[] | select(.m == "PUT" and (.p | endswith("/required-actions/portcullis-impersonation-notice"))) | .b | fromjson] | last
+      // {"alias":"portcullis-impersonation-notice","name":"Impersonation notice","providerId":"portcullis-impersonation-notice","enabled":false,"defaultAction":false,"priority":90,"config":{}}' "$KC_LOG" ;;
+  # A drifted passkey policy (the test server's); the realm PUTs configure
+  # sent are applied on top unless KC_REALM_KEEP is set (Keycloak 26.8
+  # keeping the policy).
+  "$R")
+    base='{"realm":"portcullis","browserFlow":"portcullis-universal","loginTheme":"portcullis","webAuthnPolicyPasswordlessAttestationConveyancePreference":"none","webAuthnPolicyPasswordlessAuthenticatorAttachment":"cross-platform","webAuthnPolicyPasswordlessRequireResidentKey":"Yes","webAuthnPolicyPasswordlessUserVerificationRequirement":"required"}'
+    if [ -n "${KC_REALM_KEEP:-}" ]; then printf '%s' "$base"
+    else jq -sc --argjson b "$base" --arg p "$p" 'reduce (.[] | select(.m == "PUT" and .p == $p) | .b | fromjson) as $x ($b; . + $x)' "$KC_LOG"; fi ;;
   "$R/authentication/flows/portcullis-universal/executions")
     echo '[{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509-id"},{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509b-id"},{"providerId":"portcullis-x509","level":2,"authenticationConfig":"x509c-id"},{"providerId":"portcullis-method","level":3},{"providerId":"portcullis-template","level":0}]' ;;
   "$R/authentication/config/x509-id") echo '{"id":"x509-id","alias":"x509-config","config":{"default.reference.value":"mtls","default.reference.maxAge":"36000"}}' ;;
@@ -281,6 +293,20 @@ PATH="$WORK/kcbin:$PATH" KC_LOG="$WORK/kc/log" KC_FIX="$WORK/kc" \
   "$CLI" keycloak configure >"$WORK/out" 2>"$WORK/err" </dev/null || RC=$?
 expect_eq "keycloak configure (stub admin API) exits 0" "$RC" 0
 [ "$RC" = 0 ] || sed 's/^/    /' "$WORK/err" | tail -5
+expect_eq "keycloak configure re-read the realm's passkey policy after its PUT (the drifted one fixed)" \
+  "$(grep -c 'passkey policy: direct attestation' "$WORK/out")" 1
+# Fail closed: Keycloak answered 204 but kept the drifted policy.
+: > "$WORK/kc/log"
+RC=0
+PATH="$WORK/kcbin:$PATH" KC_LOG="$WORK/kc/log" KC_FIX="$WORK/kc" KC_REALM_KEEP=1 \
+  "$CLI" keycloak configure >"$WORK/out2" 2>"$WORK/err2" </dev/null || RC=$?
+expect_eq "keycloak configure fails when the realm keeps a drifted passkey policy after its PUT" \
+  "$RC:$(grep -c "attestation none (wanted direct), attachment cross-platform (wanted not specified)" "$WORK/err2")" "1:1"
+expect_eq "keycloak configure stops at the drifted policy (no flow sync after it)" \
+  "$(jq -sc '[.[] | select(.p | test("/authentication/flows"))] | length' "$WORK/kc/log")" 0
+: > "$WORK/kc/log"
+PATH="$WORK/kcbin:$PATH" KC_LOG="$WORK/kc/log" KC_FIX="$WORK/kc" \
+  "$CLI" keycloak configure >"$WORK/out" 2>"$WORK/err" </dev/null || true
 expect_eq "keycloak configure listed the clients (the AI client was seen)" \
   "$(jq -sr '[.[] | select(.m == "GET" and .p == "/admin/realms/portcullis/clients?max=-1")] | length > 0' "$WORK/kc/log")" true
 expect_eq "keycloak configure: no write to the portcullis-ai client or the mcp:* scope" \
@@ -311,6 +337,133 @@ expect_eq "keycloak configure: forward-auth client PUT drops default.acr.values"
   "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis/clients/fwd-uuid") | .b | fromjson | .attributes["default.acr.values"] // "none"] | unique' "$WORK/kc/log")" '[""]'
 expect_eq "keycloak configure: stock webauthn-register (two-factor) required action disabled" \
   "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis/authentication/required-actions/webauthn-register") | .b | fromjson | .enabled] | unique' "$WORK/kc/log")" '[false]'
+expect_eq "keycloak configure (stub admin API): the impersonation mapper POSTed onto the acr scope, the disabled notice action enabled (never registered)" \
+  "$(jq -sc '[.[] | select(.m != "GET") | select(.p | test("acr-id/protocol-mappers|required-actions/portcullis-impersonation-notice")) | .m + " " + .p + " " + (.b | fromjson | .protocolMapper // (.enabled | tostring))]' "$WORK/kc/log")" \
+  '["POST /admin/realms/portcullis/client-scopes/acr-id/protocol-mappers/models oidc-amr-mapper","POST /admin/realms/portcullis/client-scopes/acr-id/protocol-mappers/models portcullis-impersonation","PUT /admin/realms/portcullis/authentication/required-actions/portcullis-impersonation-notice true"]'
+
+# ── keycloak configure: the impersonation mapper and the notice action
+# (contract §8, sign-in part 3; F5), with kc_get / kc_send stubbed ──
+# imp_configure <mappers JSON> <required action JSON> — runs the two steps
+# against the fixtures; prints one line per write "<METHOD> <path> <body>".
+imp_configure() {
+  (
+    export KC_IMP_MAPPERS="$1" KC_IMP_RA="$2" KC_IMP_LOG="$WORK/imp-log"
+    : > "$KC_IMP_LOG"
+    # shellcheck disable=SC1091
+    . "$HERE/../scripts/lib/common.sh"
+    # shellcheck disable=SC1091
+    . "$HERE/../scripts/lib/keycloak.sh"
+    kc_get() {
+      case "$1" in
+        */client-scopes/acr-id/protocol-mappers/models)
+          # A POST that "took" (KC_IMP_KEEP unset) shows up in the next GET.
+          if [ -z "${KC_IMP_KEEP:-}" ] && grep -q '^POST .*/protocol-mappers/models' "$KC_IMP_LOG"; then
+            jq -c '. + [{"name":"impersonation","protocolMapper":"portcullis-impersonation"}]' <<<"$KC_IMP_MAPPERS"
+          else printf '%s' "$KC_IMP_MAPPERS"; fi ;;
+        */authentication/required-actions/portcullis-impersonation-notice)
+          if [ -z "${KC_IMP_KEEP:-}" ] && grep -q '^PUT .*/required-actions/' "$KC_IMP_LOG"; then
+            grep '^PUT .*/required-actions/' "$KC_IMP_LOG" | tail -n1 | cut -d' ' -f3-
+          else printf '%s' "$KC_IMP_RA"; fi ;;
+        *) echo '{}' ;;
+      esac
+    }
+    kc_send() { printf '%s %s %s\n' "$1" "$2" "$(jq -cS . 2>/dev/null)" >> "$KC_IMP_LOG"; if [ "$1" = POST ]; then echo 201; else echo 204; fi; }
+    rc=0
+    ( _kc_impersonation_mapper acr-id >/dev/null 2>&1 ) || rc=$?
+    [ "$rc" = 0 ] || { cat "$KC_IMP_LOG"; echo "mapper exit $rc"; exit 0; }
+    ( _kc_impersonation_notice >/dev/null 2>&1 ) || rc=$?
+    cat "$KC_IMP_LOG"
+    [ "$rc" = 0 ] || echo "notice exit $rc"
+  )
+}
+R=/portcullis
+IMP_RA_ON='{"alias":"portcullis-impersonation-notice","name":"Impersonation notice","providerId":"portcullis-impersonation-notice","enabled":true,"defaultAction":false,"priority":90,"config":{}}'
+expect_eq "keycloak configure ensures the impersonation mapper on acr (once, by protocolMapper) and the required action (stubbed kc_get / kc_send): no mapper, the action disabled at another priority → mapper POSTed, action enabled at 90" \
+  "$(imp_configure '[{"name":"amr","protocolMapper":"oidc-amr-mapper"}]' "$(jq -c '.enabled = false | .priority = 120' <<<"$IMP_RA_ON")")" \
+  "POST $R/client-scopes/acr-id/protocol-mappers/models {\"config\":{\"access.token.claim\":\"true\",\"id.token.claim\":\"true\",\"userinfo.token.claim\":\"true\"},\"name\":\"impersonation\",\"protocol\":\"openid-connect\",\"protocolMapper\":\"portcullis-impersonation\"}
+PUT $R/authentication/required-actions/portcullis-impersonation-notice {\"alias\":\"portcullis-impersonation-notice\",\"config\":{},\"defaultAction\":false,\"enabled\":true,\"name\":\"Impersonation notice\",\"priority\":90,\"providerId\":\"portcullis-impersonation-notice\"}"
+expect_eq "keycloak configure fails, without registering or PUTting it, when the realm lacks the notice action (a fresh realm import has it)" \
+  "$(imp_configure '[{"protocolMapper":"portcullis-impersonation"}]' '' | tail -n1):$(imp_configure '[{"protocolMapper":"portcullis-impersonation"}]' '{}' | grep -c required-action || true)" \
+  "notice exit 1:0"
+expect_eq "keycloak configure: a mapper with protocolMapper portcullis-impersonation (any name) and the enabled action → no write" \
+  "$(imp_configure '[{"name":"amr","protocolMapper":"oidc-amr-mapper"},{"name":"renamed","protocolMapper":"portcullis-impersonation"}]' "$IMP_RA_ON")" ""
+expect_eq "keycloak configure: the action registered but disabled (or a default action) → one PUT, no registration" \
+  "$(imp_configure '[{"protocolMapper":"portcullis-impersonation"}]' "$(jq -c '.enabled = false' <<<"$IMP_RA_ON")" | cut -d' ' -f1-2):$(imp_configure '[{"protocolMapper":"portcullis-impersonation"}]' "$(jq -c '.defaultAction = true' <<<"$IMP_RA_ON")" | jq -Rr 'split(" ")[2:] | join(" ") | fromjson | .defaultAction')" \
+  "PUT $R/authentication/required-actions/portcullis-impersonation-notice:false"
+# Fail closed (contract §8.1): configure stops (non-zero) when the mapper
+# or the action isn't there afterwards.
+expect_eq "keycloak configure fails when the impersonation mapper POST doesn't take (the acr scope still lacks it)" \
+  "$(KC_IMP_KEEP=1 imp_configure '[]' "$IMP_RA_ON" | tail -n1)" "mapper exit 1"
+expect_eq "keycloak configure fails when the acr scope's mappers can't be read (never 'present')" \
+  "$(imp_configure '' "$IMP_RA_ON")" "mapper exit 1"
+expect_eq "keycloak configure fails with two portcullis-impersonation mappers on acr" \
+  "$(imp_configure '[{"protocolMapper":"portcullis-impersonation"},{"name":"x","protocolMapper":"portcullis-impersonation"}]' "$IMP_RA_ON")" "mapper exit 1"
+expect_eq "keycloak configure fails when the notice action is still missing or disabled afterwards" \
+  "$(KC_IMP_KEEP=1 imp_configure '[{"protocolMapper":"portcullis-impersonation"}]' "$(jq -c '.enabled = false' <<<"$IMP_RA_ON")" | tail -n1):$(KC_IMP_KEEP=1 imp_configure '[{"protocolMapper":"portcullis-impersonation"}]' '' | tail -n1)" \
+  "notice exit 1:notice exit 1"
+expect_eq "keycloak configure's impersonation steps never touch the events config" \
+  "$(imp_configure '[]' '' | grep -c events || true)" 0
+
+# ── status: the realm's passkey policy (contract §8.1 "Passkey kinds"),
+# with kc_get stubbed: a drifted one fails status (a ✗ line, --json
+# keycloak.passkey_policy, the textfile gauge) ──
+PK_REALM_OK='{"realm":"portcullis","webAuthnPolicyPasswordlessAttestationConveyancePreference":"direct","webAuthnPolicyPasswordlessAuthenticatorAttachment":"not specified","webAuthnPolicyPasswordlessRequireResidentKey":"Yes","webAuthnPolicyPasswordlessUserVerificationRequirement":"required"}'
+# pk_status <realm JSON> <two-factor action enabled> <json|text|textfile> — status_run's output, then "rc <n>".
+pk_status() {
+  (
+    export PK_REALM="$1" PK_2FA="$2" KEYCLOAK_ADMIN_PASSWORD=stub
+    for l in common keycloak status; do
+      # shellcheck disable=SC1090
+      . "$HERE/../scripts/lib/$l.sh"
+    done
+    dc() { echo '{"Service":"keycloak","State":"running","Health":"healthy","Status":"Up"}'; }
+    vault_health_code() { echo 200; }
+    vault_admin_env() { return 1; }
+    container_health() { echo healthy; }
+    proxy_dns_shadows() { :; }
+    domains_status_lines() { :; }
+    _st_mcp_refusing() { :; }
+    kc_login() { :; }
+    metrics_textfile_write() { cat; }
+    kc_get() {
+      case "$1" in
+        /portcullis) printf '%s' "$PK_REALM" ;;
+        /portcullis/users/count) echo 3 ;;
+        "/portcullis/clients?clientId=portcullis-forward-auth") echo '[{"id":"fwd"}]' ;;
+        /portcullis/authentication/required-actions/webauthn-register-passwordless) echo '{"alias":"webauthn-register-passwordless","enabled":true}' ;;
+        /portcullis/authentication/required-actions/webauthn-register) printf '{"alias":"webauthn-register","enabled":%s}' "$PK_2FA" ;;
+        *) echo '{}' ;;
+      esac
+    }
+    rc=0
+    case "$3" in
+      json) status_run true || rc=$? ;;
+      textfile) status_textfile || rc=$? ;;
+      *) status_run false 2>&1 || rc=$? ;;
+    esac
+    echo "rc $rc"
+  )
+}
+expect_eq "status --json: the wanted passkey policy → ok, status ok" \
+  "$(pk_status "$PK_REALM_OK" false json | jq -c 'select(type == "object") | [.ok, .keycloak.passkey_policy]')" '[true,{"ok":true,"problems":[]}]'
+expect_eq "status: the wanted passkey policy → a ✓ line, exit 0" \
+  "$(pk_status "$PK_REALM_OK" false text | grep -c '✓ passkey policy: direct attestation'):$(pk_status "$PK_REALM_OK" false text | tail -n1)" "1:rc 0"
+PK_REALM_BAD="$(jq -c '.webAuthnPolicyPasswordlessAttestationConveyancePreference = "none" | .webAuthnPolicyPasswordlessAuthenticatorAttachment = "cross-platform"' <<<"$PK_REALM_OK")"
+expect_eq "status: attestation none / cross-platform (the test server's drift) → a ✗ line naming both, exit 1" \
+  "$(pk_status "$PK_REALM_BAD" false text | grep -F '✗' | sed 's/\x1b\[[0-9;]*m//g'):$(pk_status "$PK_REALM_BAD" false text | tail -n1)" \
+  "  ✗ passkey policy: attestation none (wanted direct), attachment cross-platform (wanted not specified) — new passkeys can't be told apart; run ./portcullis keycloak configure:rc 1"
+expect_eq "status --json: a drifted policy → ok false, the problems listed" \
+  "$(pk_status "$PK_REALM_BAD" false json | jq -c 'select(type == "object") | [.ok, .keycloak.passkey_policy]')" \
+  '[false,{"ok":false,"problems":["attestation none (wanted direct)","attachment cross-platform (wanted not specified)"]}]'
+expect_eq "status --json: resident key / UV unset, the two-factor webauthn-register on → each a problem" \
+  "$(pk_status "$(jq -c 'del(.webAuthnPolicyPasswordlessRequireResidentKey) | .webAuthnPolicyPasswordlessUserVerificationRequirement = "preferred"' <<<"$PK_REALM_OK")" true json | jq -c 'select(type == "object") | .keycloak.passkey_policy.problems')" \
+  '["resident key unset (wanted Yes)","user verification preferred (wanted required)","required action webauthn-register enabled (wanted disabled)"]'
+expect_eq "status --json: an unreadable realm or action → not ok (fail closed)" \
+  "$(pk_status '' '"x"' json | jq -c 'select(type == "object") | .keycloak.passkey_policy.problems')" \
+  "[\"the realm can't be read\",\"required action webauthn-register can't be read\"]"
+expect_eq "status --textfile: portcullis_keycloak_passkey_policy_ok 1 / 0" \
+  "$(pk_status "$PK_REALM_OK" false textfile | grep '^portcullis_keycloak_passkey_policy_ok '):$(pk_status "$PK_REALM_BAD" false textfile | grep '^portcullis_keycloak_passkey_policy_ok ')" \
+  "portcullis_keycloak_passkey_policy_ok 1:portcullis_keycloak_passkey_policy_ok 0"
 
 # ── realm-export.json: the sign-in flows of contract §8.1 (D6) ──
 RX="$HERE/../keycloak/realm-export.json"
@@ -338,8 +491,13 @@ expect_eq "realm-export: each x509 config's CRL paths name only its own mount" \
 expect_eq "realm-export: both x509 configs check CRLs, abort on a stale CRL and keep the same X.509 settings" \
   "$(jq -c '[.authenticatorConfig[] | select(.config | has("portcullis.method")) | .config
       | del(.["portcullis.method"], .["portcullis.ca"], .["default.reference.value"], .["x509-cert-auth.crl-relative-path"])] | (unique | length), .[0]["x509-cert-auth.crl-checking-enabled"], .[0]["x509-cert-auth-crl-abort-if-non-updated"]' "$RX" | tr '\n' ' ')" '1 "true" "true" '
-expect_eq "realm-export: events LOGIN, LOGIN_ERROR, expiration 31536000" \
-  "$(jq -c '[.eventsEnabled, (.enabledEventTypes | sort), .eventsExpiration]' "$RX")" '[true,["LOGIN","LOGIN_ERROR"],31536000]'
+expect_eq "realm-export: events LOGIN, LOGIN_ERROR, IMPERSONATE, expiration 31536000" \
+  "$(jq -c '[.eventsEnabled, (.enabledEventTypes | sort), .eventsExpiration]' "$RX")" '[true,["IMPERSONATE","LOGIN","LOGIN_ERROR"],31536000]'
+expect_eq "realm-export: requiredActions has exactly the pinned portcullis-impersonation-notice entry; enabledEventTypes ⊇ LOGIN, LOGIN_ERROR, IMPERSONATE; no clientScopes" \
+  "$(jq -cS '[.requiredActions[] | select(.alias == "portcullis-impersonation-notice" or .providerId == "portcullis-impersonation-notice")]' "$RX"):$(jq '.enabledEventTypes | contains(["LOGIN","LOGIN_ERROR","IMPERSONATE"])' "$RX"):$(jq 'has("clientScopes")' "$RX")" \
+  "$(jq -cS '[.]' <<<'{"alias":"portcullis-impersonation-notice","name":"Impersonation notice","providerId":"portcullis-impersonation-notice","enabled":true,"defaultAction":false,"priority":90,"config":{}}'):true:false"
+expect_eq "realm-export: no impersonation mapper anywhere (keycloak configure adds it, F5)" \
+  "$(jq '[.. | objects | select(.protocolMapper? == "portcullis-impersonation")] | length' "$RX")" 0
 expect_eq "realm export: portcullis-signin-passkey = REQUIRED portcullis-passkey + one CONDITIONAL sub-flow per kind" \
   "$(flow portcullis-signin-passkey)" '["REQUIRED portcullis-passkey","CONDITIONAL portcullis-passkey-security-key","CONDITIONAL portcullis-passkey-device","CONDITIONAL portcullis-passkey-synced"]'
 for k in security-key:security_key:hwk device:passkey_device:dpk synced:passkey_synced:spk; do
@@ -375,6 +533,9 @@ expect_eq "bruteForceProtected true" \
 expect_eq "realm export: passwordless policy direct, any attachment, resident key + UV required" \
   "$(jq -c '[.webAuthnPolicyPasswordlessAttestationConveyancePreference, .webAuthnPolicyPasswordlessAuthenticatorAttachment, .webAuthnPolicyPasswordlessRequireResidentKey, .webAuthnPolicyPasswordlessUserVerificationRequirement]' "$RX")" \
   '["direct","not specified","Yes","required"]'
+expect_eq "keycloak configure's sign-in settings name the passwordless RP (Keycloak applies the policy only then) as the export does" \
+  "$(PORTCULLIS_LIB="$HERE/../scripts/lib" bash -c 'source "$PORTCULLIS_LIB/keycloak.sh" 2>/dev/null; printf "%s" "$KC_REALM_SIGNIN_SETTINGS"' | jq -r .webAuthnPolicyPasswordlessRpEntityName)" \
+  "$(jq -r .webAuthnPolicyPasswordlessRpEntityName "$RX")"
 expect_eq "realm export: stock webauthn-register (two-factor) disabled, passwordless enabled" \
   "$(jq -c '[.requiredActions[] | select(.alias | startswith("webauthn-register")) | [.alias, .enabled]] | sort' "$RX")" '[["webauthn-register",false],["webauthn-register-passwordless",true]]'
 expect_eq "realm export: forward-auth client has no default.acr.values" \
@@ -391,6 +552,18 @@ expect_eq 'compose keycloak image is ${KEYCLOAK_IMAGE:-ghcr.io/porelli/portculli
   "$(printf '%s\n' "$KC_SVC" | sed -n 's/^    image: //p')" '${KEYCLOAK_IMAGE:-ghcr.io/porelli/portcullis-keycloak:edge}'
 expect_eq "keycloak mounts hub_data read-only at /hub-data" \
   "$(printf '%s\n' "$KC_SVC" | grep -cxF '      - hub_data:/hub-data:ro')" 1
+expect_eq "keycloak command disables the impersonation feature (and no KC_FEATURES* env could re-enable it)" \
+  "$(printf '%s\n' "$KC_SVC" | grep -cxF -- '      - --features-disabled=impersonation'):$(printf '%s\n' "$KC_SVC" | grep -cE -- '--features(-enabled)?=.*impersonation' || true):$(cat "$HERE"/../docker-compose*.yml | grep -cE '^[[:space:]]*-?[[:space:]]*KC_FEATURES' || true)" "1:0:0"
+# shellcheck disable=SC2016  # a literal ${PORTCULLIS_DOMAIN:-...}
+expect_eq "keycloak gets PORTCULLIS_PORTAL_URL = the portal" \
+  "$(printf '%s\n' "$KC_SVC" | sed -n 's/^      PORTCULLIS_PORTAL_URL: //p')" 'https://${PORTCULLIS_DOMAIN:-portcullis.local}/'
+expect_eq "every forward-auth middleware's authResponseHeaders lists X-Forwarded-Impersonator and X-Forwarded-Impersonation" \
+  "$(sed -n 's/^      traefik\.http\.middlewares\.\([a-z-]*\)\.forwardauth\.authResponseHeaders: \(.*\)$/\1 \2/p' "$HERE/../docker-compose.yml" \
+      | while read -r mw hdrs; do
+          if printf ',%s,' "$hdrs" | grep -q ',X-Forwarded-Impersonator,' && printf ',%s,' "$hdrs" | grep -q ',X-Forwarded-Impersonation,'; then
+            echo "$mw"
+          else echo "$mw: missing an impersonation header"; fi
+        done | sort | tr '\n' ' ')" "portcullis-auth portcullis-auth-console portcullis-auth-ext portcullis-groups "
 # The login theme passes the extension's hints to the registration script.
 expect_eq "theme: webauthn-register.ftl hands portcullisHints to webauthnRegister.js" \
   "$(grep -cF 'portcullisHints : ${(portcullisHints!"[]")?c}' "$HERE/../keycloak/themes/portcullis/login/webauthn-register.ftl" 2>/dev/null || echo 0)" 1
@@ -683,6 +856,10 @@ expect_eq "the people router uses client-cert-pem@file, before portcullis-groups
   "rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file"
 expect_eq "group-gate mounts group_gate_data read-write, has group_add 10001, and both CA files read-only; GATE_CRL_URLS lists pki_int and pki_file" \
   "$(printf '%s\n' "$GG_SVC" | grep -cxE '      - group_gate_data:/data|    group_add: \["10001"\]|      - \./certs/yubikey-ca\.crt:/etc/group-gate/ca/yubikey-ca\.crt:ro|      - \./certs/browser-ca\.crt:/etc/group-gate/ca/browser-ca\.crt:ro|      GATE_YUBIKEY_CA_FILE: /etc/group-gate/ca/yubikey-ca\.crt|      GATE_BROWSER_CA_FILE: /etc/group-gate/ca/browser-ca\.crt|      GATE_OPENED_DIR: /data/opened|      GATE_CRL_URLS: http://vault:8200/v1/pki_int/crl http://vault:8200/v1/pki_file/crl|      GATE_DELTA_CRL_URLS: http://vault:8200/v1/pki_int/crl/delta http://vault:8200/v1/pki_file/crl/delta'):$(printf '%s\n' "$GG_SVC" | grep -cE 'GATE_(DELTA_)?CRL_URL:' || true)" "9:0"
+# shellcheck disable=SC2016  # a literal ${IMPERSONATION_MAX_MINUTES:-30}
+expect_eq "group-gate has GATE_IMPERSONATION_FILE under /hub-data; hub has HUB_IMPERSONATION_MAX_MINUTES" \
+  "$(printf '%s\n' "$GG_SVC" | sed -n 's/^      GATE_IMPERSONATION_FILE: //p'):$(printf '%s\n' "$GG_SVC" | grep -cxF '      - hub_data:/hub-data:ro'):$(svc hub | sed -n 's/^      HUB_IMPERSONATION_MAX_MINUTES: //p')" \
+  '/hub-data/impersonation.json:1:${IMPERSONATION_MAX_MINUTES:-30}'
 expect_eq "hub mounts group_gate_data; HUB_CLIENT_CERT_TTL follows CLIENT_CERT_TTL" \
   "$(svc hub | grep -cxE '      - group_gate_data:/group-gate-data|      HUB_GROUP_GATE_DATA_DIR: /group-gate-data|      HUB_CLIENT_CERT_TTL: \$\{CLIENT_CERT_TTL:-720h\}|      HUB_CERT_EXPIRY_WARN_DAYS: \$\{CERT_EXPIRY_WARN_DAYS:-7\}')" 4
 expect_eq "only group-gate and the Hub mount group_gate_data, and it is a declared volume" \

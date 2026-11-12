@@ -92,7 +92,7 @@ status_run() {
   fi
 
   # ── keycloak (health on the unpublished management port → docker health) ──
-  local kc_health users=null realm=false fwd=false
+  local kc_health users=null realm=false fwd=false passkey=null
   kc_health="$(container_health keycloak)"
   [ "$kc_health" = healthy ] || problems=1
   if [ "$kc_health" = healthy ] && [ -n "${KEYCLOAK_ADMIN_PASSWORD:-}" ] && (kc_login >/dev/null 2>&1); then
@@ -101,9 +101,13 @@ status_run() {
     users="$(kc_get "/$KC_REALM/users/count" 2>/dev/null)"
     [[ "$users" =~ ^[0-9]+$ ]] || users=null
     [ -n "$(kc_get "/$KC_REALM/clients?clientId=portcullis-forward-auth" | jq -r '.[0].id // empty' 2>/dev/null)" ] && fwd=true
+    # The passkey policy and registration actions (contract §8.1 "Passkey
+    # kinds"): a drifted one silently classifies every new passkey as synced.
+    passkey="$( { kc_passkey_policy_drift; kc_passkey_actions_drift; } | jq -Rsc 'split("\n") | map(select(. != "")) | {ok: (length == 0), problems: .}')"
+    [ "$(printf '%s' "$passkey" | jq -r .ok)" = true ] || problems=1
   fi
-  kc="$(jq -n --arg h "$kc_health" --argjson r "$realm" --argjson u "$users" --argjson f "$fwd" \
-    '{health: $h, realm: $r, users: $u, forward_auth_client: $f}')"
+  kc="$(jq -n --arg h "$kc_health" --argjson r "$realm" --argjson u "$users" --argjson f "$fwd" --argjson pk "$passkey" \
+    '{health: $h, realm: $r, users: $u, forward_auth_client: $f, passkey_policy: $pk}')"
 
   # ── lldap / traefik ──
   lldap="$(jq -n --arg h "$(container_health lldap)" '{health: $h}')"
@@ -175,6 +179,13 @@ status_run() {
     else
       [ "$realm" = true ] && _st_line ok "realm $KC_REALM exists, $users user(s)" || _st_line fail "realm $KC_REALM missing (./portcullis keycloak configure)"
       [ "$fwd" = true ] && _st_line ok "OIDC client portcullis-forward-auth" || _st_line fail "OIDC client portcullis-forward-auth missing (./portcullis oidc register)"
+      if [ "$passkey" != null ]; then
+        if [ "$(printf '%s' "$passkey" | jq -r .ok)" = true ]; then
+          _st_line ok "passkey policy: direct attestation, any attachment, resident key and user verification required; passkeys registered by the passwordless action only"
+        else
+          _st_line fail "passkey policy: $(printf '%s' "$passkey" | jq -r '.problems | join(", ")') — new passkeys can't be told apart; run ./portcullis keycloak configure"
+        fi
+      fi
     fi
   else
     _st_line fail "$kc_health"
@@ -217,6 +228,8 @@ status_textfile() {
     (.services[] | "portcullis_service_up{service=\"\(.name | esc)\"} \(up)"),
     g("portcullis_vault_active"; "1 if Vault is initialised, unsealed and active."),
     "portcullis_vault_active \(if .vault.active then 1 else 0 end)",
+    g("portcullis_keycloak_passkey_policy_ok"; "1 if the realm passkey policy and registration actions are the ones Portcullis needs (absent: not checked)."),
+    (if .keycloak.passkey_policy == null then empty else "portcullis_keycloak_passkey_policy_ok \(if .keycloak.passkey_policy.ok then 1 else 0 end)" end),
     g("portcullis_ca_expiry_timestamp_seconds"; "Expiry of the CAs of the internal certificate authority (Vault)."),
     (if (.vault.root_ca_expires_epoch // 0) > 0 then "portcullis_ca_expiry_timestamp_seconds{ca=\"root\"} \(.vault.root_ca_expires_epoch)" else empty end),
     (if (.vault.intermediate_ca_expires_epoch // 0) > 0 then "portcullis_ca_expiry_timestamp_seconds{ca=\"intermediate\"} \(.vault.intermediate_ca_expires_epoch)" else empty end),
@@ -421,7 +434,10 @@ Usage: portcullis status [--json | --textfile]
 Health overview: compose services, Vault (sealed/active, CA expiry, issued
 certs, YubiKey and browser certificates expiring within
 CERT_EXPIRY_WARN_DAYS = 7 days),
-Keycloak (realm, users, forward-auth client),
+Keycloak (realm, users, forward-auth client, the passkey policy: attestation
+direct, any attachment, resident key and user verification required, only
+the passwordless registration action on — anything else fails: new passkeys
+couldn't be told apart),
 LLDAP and Traefik. Exits 1 if a core service is down/unhealthy or Vault is
 not active, 0 otherwise.
 
@@ -429,8 +445,8 @@ Options:
   --json       machine-readable output (same exit status)
   --textfile   write the same as Prometheus metrics to
                monitoring/textfile/status.prom for the monitoring profile
-               (service health, Vault active, CA and per-user YubiKey /
-               browser certificate expiry); run after every scheduled backup
+               (service health, Vault active, the passkey policy, CA and
+               per-user YubiKey / browser certificate expiry); run after every scheduled backup
 EOF
 }
 

@@ -674,3 +674,49 @@ func TestPopulationBeforeSignInRule(t *testing.T) {
 		})
 	}
 }
+
+// Sign-in part 3 (§15.2): a token with an `act` or a `pc_imp` claim (any
+// value, null included) is refused "impersonated", after the scope and
+// before the population check.
+func TestImpersonatedTokenRefused(t *testing.T) {
+	rsaKey, _ := rsa.GenerateKey(rand.Reader, 2048)
+	j := newJWKS(t, jose.JSONWebKey{Key: &rsaKey.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"})
+	v := NewVerifier(issuer, j.srv.URL, j.srv.Client())
+	rs := signer{rsaKey, "k1", jose.RS256}
+	imp := map[string]any{"id": "0f3c" + strings.Repeat("a", 28), "until": now.Add(10 * time.Minute).Unix()}
+	null := json.RawMessage("null")
+	for _, c := range []struct {
+		name   string
+		kv     []any
+		status int
+		reason string
+	}{
+		{"act and pc_imp", []any{"act", map[string]any{"sub": "root"}, "pc_imp", imp}, 403, "impersonated"},
+		{"act only", []any{"act", map[string]any{"sub": "root"}}, 403, "impersonated"},
+		{"pc_imp only", []any{"pc_imp", imp}, 403, "impersonated"},
+		{"act null", []any{"act", null}, 403, "impersonated"},
+		{"pc_imp null", []any{"pc_imp", null}, 403, "impersonated"},
+		{"act a string", []any{"act", "root"}, 403, "impersonated"},
+		{"act empty object", []any{"act", map[string]any{}}, 403, "impersonated"},
+		{"non-member with act", []any{"act", map[string]any{"sub": "root"}, "preferred_username", "carol"}, 403, "impersonated"},
+		{"act without the scope", []any{"act", map[string]any{"sub": "root"}, "scope", "openid"}, 403, "scope"},
+		{"no act or pc_imp", nil, 200, "allow"},
+		{"non-member without act", []any{"preferred_username", "carol"}, 403, "population"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			tok := rs.sign(t, with(baseClaims(now), c.kv...))
+			d := v.Check(context.Background(), loadSnapshot(t), Request{Host: "gitea.example.com", Path: "/mcp", Authorization: "Bearer " + tok, Now: now})
+			if d.Status != c.status || d.Reason != c.reason {
+				t.Fatalf("got %d %q, want %d %q", d.Status, d.Reason, c.status, c.reason)
+			}
+			if c.reason == "impersonated" {
+				if d.Message != "a session as someone else can't use AI tools" || d.WWWAuthenticate != "" {
+					t.Errorf("refusal %+v", d)
+				}
+				if d.Client != "portcullis-ai-claude" || d.Resource == nil || d.Resource.URL != giteaURL || d.User == "" {
+					t.Errorf("decision fields %+v", d)
+				}
+			}
+		})
+	}
+}

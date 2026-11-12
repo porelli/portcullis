@@ -37,7 +37,11 @@ KC_REALM_TOKEN_SETTINGS='{"offlineSessionIdleTimeout": 2592000, "offlineSessionM
 # allows any attachment, and requires a resident key and user verification.
 # Same values as realm-export.json; pushed on every run.
 # shellcheck disable=SC2034  # read by the tests
-KC_REALM_SIGNIN_SETTINGS='{"attributes": {"acr.loa.map": "{}"}, "bruteForceProtected": true, "permanentLockout": false, "failureFactor": 10, "waitIncrementSeconds": 60, "maxFailureWaitSeconds": 900, "webAuthnPolicyPasswordlessAttestationConveyancePreference": "direct", "webAuthnPolicyPasswordlessAuthenticatorAttachment": "not specified", "webAuthnPolicyPasswordlessRequireResidentKey": "Yes", "webAuthnPolicyPasswordlessUserVerificationRequirement": "required"}'
+# webAuthnPolicyPasswordlessRpEntityName must be in the body: Keycloak 26.8's
+# realm update applies the passwordless policy only when it is set and
+# non-empty (DefaultExportImportManager.updateRealm), else the whole policy
+# is silently kept (a 204 all the same).
+KC_REALM_SIGNIN_SETTINGS='{"attributes": {"acr.loa.map": "{}"}, "bruteForceProtected": true, "permanentLockout": false, "failureFactor": 10, "waitIncrementSeconds": 60, "maxFailureWaitSeconds": 900, "webAuthnPolicyPasswordlessRpEntityName": "Portcullis", "webAuthnPolicyPasswordlessAttestationConveyancePreference": "direct", "webAuthnPolicyPasswordlessAuthenticatorAttachment": "not specified", "webAuthnPolicyPasswordlessRequireResidentKey": "Yes", "webAuthnPolicyPasswordlessUserVerificationRequirement": "required"}'
 
 kc_url() { echo "${KEYCLOAK_URL:-http://127.0.0.1:8080}"; }
 
@@ -74,6 +78,42 @@ kc_send() {
     -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") \
     -H 'Content-Type: application/json' --data-binary @- \
     "$(kc_url)/admin/realms$2"
+}
+
+# kc_passkey_policy_drift — how the realm's passwordless WebAuthn policy
+# differs from KC_REALM_SIGNIN_SETTINGS (contract §8.1 "Passkey kinds"):
+# one "<setting> <value> (wanted <value>)" line per mismatch (attestation,
+# attachment, resident key, user verification), "the realm can't be read"
+# when it can't be (never empty then); nothing when it matches. With any
+# conveyance but direct the browser zeroes the AAGUID and sends no
+# attestation, so the extension counts every new passkey as synced.
+kc_passkey_policy_drift() {
+  kc_get "/$KC_REALM" 2>/dev/null | jq -rs --argjson w "$KC_REALM_SIGNIN_SETTINGS" '
+      .[0] | if type != "object" or (.realm // "") == "" then "the realm can'"'"'t be read"
+      else
+        [["webAuthnPolicyPasswordlessAttestationConveyancePreference", "attestation"],
+         ["webAuthnPolicyPasswordlessAuthenticatorAttachment", "attachment"],
+         ["webAuthnPolicyPasswordlessRequireResidentKey", "resident key"],
+         ["webAuthnPolicyPasswordlessUserVerificationRequirement", "user verification"]][] as [$k, $l]
+        | select((.[$k] // "") != $w[$k])
+        | "\($l) \(.[$k] // "unset" | if . == "" then "unset" else . end) (wanted \($w[$k]))"
+      end' 2>/dev/null || echo "the realm can't be read"
+}
+
+# kc_passkey_actions_drift — the registration required actions (contract
+# §8.1): webauthn-register-passwordless enabled (the extension's
+# registration), the stock two-factor webauthn-register disabled. One line
+# per mismatch or unreadable action; nothing when both are right.
+kc_passkey_actions_drift() {
+  local ra want
+  for ra in webauthn-register-passwordless:true webauthn-register:false; do
+    want="${ra#*:}" ra="${ra%%:*}"
+    kc_get "/$KC_REALM/authentication/required-actions/$ra" 2>/dev/null | jq -rs --arg a "$ra" --argjson w "$want" '
+        def state: if . then "enabled" else "disabled" end;
+        .[0] | if type != "object" or (.enabled | type) != "boolean" then "required action \($a) can'"'"'t be read"
+        elif .enabled != $w then "required action \($a) \(.enabled | state) (wanted \($w | state))"
+        else empty end' 2>/dev/null || echo "required action $ra can't be read"
+  done
 }
 
 # _kc_report <label> <code> <ok-codes...>
@@ -292,6 +332,15 @@ keycloak_configure() {
       # registered; an operator-chosen theme other than the defaults is kept.
       (if ((.loginTheme // "") | IN("", "keycloak", "keycloak.v2")) then {loginTheme: "portcullis"} else {} end)' | kc_send PUT "/$KC_REALM")"
   _kc_report "realm attributes" "$code" 204 || true
+  # Fail closed (contract §8.1 "Passkey kinds"): Keycloak answers 204 even
+  # when it kept the passwordless policy, and with any conveyance but
+  # direct every new passkey counts as synced. Read it back.
+  local drift
+  drift="$(kc_passkey_policy_drift)"
+  if [ -n "$drift" ]; then
+    fail "the realm's passkey policy is still not the one Portcullis needs after the update: $(printf '%s' "$drift" | paste -sd, - | sed 's/,/, /g'). New passkeys can't be told apart (each one counts as synced). Check Keycloak (is the portcullis-keycloak image running?), then run ./portcullis keycloak configure again."
+  fi
+  echo "    passkey policy: direct attestation, any attachment, resident key and user verification required"
 
   info "Syncing the authentication flows from realm-export.json..."
   for flow in $KC_EXPORT_FLOWS; do _kc_sync_flow "$flow" || true; done
@@ -371,6 +420,10 @@ keycloak_configure() {
       echo "    amr mapper present"
     fi
   fi
+  # Fail closed (contract §8.1): without the mapper an impersonated session's
+  # tokens carry no act / pc_imp and look like the person's own.
+  _kc_impersonation_mapper "$scope_id"
+  _kc_impersonation_notice
 
   info "Ensuring the groups client scope..."
   if [ "$(kc_get "/$KC_REALM/client-scopes" | jq '[.[] | select(.name == "groups")] | length')" = 0 ]; then
@@ -422,6 +475,66 @@ keycloak_configure() {
 
   ok "Keycloak configured. Admin console: https://auth.$domain/admin/master/console/"
   echo "    SAML metadata: https://auth.$domain/realms/$KC_REALM/protocol/saml/descriptor"
+}
+
+# _kc_impersonation_mapper <acr scope id> — the sign-in extension's
+# `impersonation` mapper (protocolMapper portcullis-impersonation: the
+# act / pc_imp claims of a session as someone else, contract §8 / §8.1
+# "Impersonation") on the acr client scope, next to amr, so every client
+# with amr carries it. Only here, never in realm-export.json (its
+# clientScopes would replace Keycloak's defaults); found by protocolMapper,
+# so a renamed copy isn't added twice.
+_kc_impersonation_mapper() {
+  local scope_id="$1" code n
+  [ -n "$scope_id" ] || fail "Keycloak has no acr client scope: the impersonation mapper can't be added (an impersonated session would look like the person's own). Fix the realm, then run ./portcullis keycloak configure again."
+  # _kc_imp_mappers — how many portcullis-impersonation mappers the acr
+  # scope has; "?" when the scope can't be read (never "0", never "present").
+  _kc_imp_mappers() {
+    kc_get "/$KC_REALM/client-scopes/$scope_id/protocol-mappers/models" \
+      | jq -e 'if type == "array" then [.[] | select(.protocolMapper? == "portcullis-impersonation")] | length else error end' 2>/dev/null || echo "?"
+  }
+  n="$(_kc_imp_mappers)"
+  if [ "$n" = 0 ]; then
+    code="$(jq -n '{name: "impersonation", protocol: "openid-connect", protocolMapper: "portcullis-impersonation",
+        config: {"id.token.claim": "true", "access.token.claim": "true", "userinfo.token.claim": "true"}}' \
+      | kc_send POST "/$KC_REALM/client-scopes/$scope_id/protocol-mappers/models")"
+    _kc_report "impersonation mapper" "$code" 201 || true
+    n="$(_kc_imp_mappers)"
+  fi
+  if [ "$n" != 1 ]; then
+    if [ "$n" = "?" ]; then n="its mappers can't be read"; else n="it has $n portcullis-impersonation mappers, not exactly one"; fi
+    fail "the impersonation mapper on the acr client scope: $n. An impersonated session would look like the person's own. Check Keycloak (is the portcullis-keycloak image running?), then run ./portcullis keycloak configure again."
+  fi
+  echo "    impersonation mapper present"
+}
+
+# KC_IMP_NOTICE — the notice required action exactly as realm-export.json
+# has it (contract §8 "The notice required action"; the extension's smoke
+# realm holds the same entry).
+KC_IMP_NOTICE='{"alias":"portcullis-impersonation-notice","name":"Impersonation notice","providerId":"portcullis-impersonation-notice","enabled":true,"defaultAction":false,"priority":90,"config":{}}'
+
+# _kc_impersonation_notice — keeps the extension's
+# portcullis-impersonation-notice required action (realm-export.json has
+# it) enabled, not a default action, at its priority; fails when the realm
+# lacks it or it can't be enabled. The events config (IMPERSONATE) is the
+# Hub's: never touched here.
+_kc_impersonation_notice() {
+  local ra=portcullis-impersonation-notice cur code
+  cur="$(kc_get "/$KC_REALM/authentication/required-actions/$ra")"
+  printf '%s' "$cur" | jq -e --arg a "$ra" 'type == "object" and .alias == $a' >/dev/null 2>&1 \
+    || fail "the realm lacks the $ra required action (a fresh realm import has it): people wouldn't be told an administrator signed in as them. Check Keycloak (is the portcullis-keycloak image running?)."
+  if ! printf '%s' "$cur" | jq -e --argjson w "$KC_IMP_NOTICE" '.enabled == true and .defaultAction == false and .priority == $w.priority' >/dev/null 2>&1; then
+    code="$(jq -nc --arg c "$cur" --argjson w "$KC_IMP_NOTICE" \
+        '((try ($c | fromjson) catch {}) | if type == "object" then . else {} end) + ($w | {alias, providerId, enabled, defaultAction, priority})' \
+      | kc_send PUT "/$KC_REALM/authentication/required-actions/$ra")"
+    _kc_report "$ra required action enabled" "$code" 204 || true
+    cur="$(kc_get "/$KC_REALM/authentication/required-actions/$ra")"
+  fi
+  # Fail closed: without it the person is never told an administrator
+  # signed in as them.
+  printf '%s' "$cur" | jq -e --arg a "$ra" 'type == "object" and .alias == $a and .enabled == true' >/dev/null 2>&1 \
+    || fail "the $ra required action can't be enabled in Keycloak: people wouldn't be told an administrator signed in as them. Check Keycloak (is the portcullis-keycloak image running?), then run ./portcullis keycloak configure again."
+  echo "    $ra required action enabled"
 }
 
 # Client scope that carries `email` but never `email_verified`. LLDAP lets
@@ -788,7 +901,10 @@ API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
   - pushes the X.509 authenticator settings from the file (CRL check against
     Vault's pki_int CRL, trust re-validation, clientAuth EKU) to the realm
   - checks the sign-in executions' AMR reference values (max age 10 h),
-    ensures the amr mapper and groups scope
+    ensures the amr mapper, the sign-in extension's impersonation mapper
+    (both on the acr scope) and groups scope
+  - registers and enables the portcullis-impersonation-notice required
+    action (the person's notice after an administrator signed in as them)
   - ensures the email-unverified scope (email claim, no email_verified) that
     Hub templates opt into with keycloak_clients[].email_verified_claim: false
   - portcullis-forward-auth: acr/groups scopes, no default acr, requires PKCE S256, the

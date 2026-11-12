@@ -104,6 +104,43 @@ Cases (in this order; each later case needs only the state it names):
   history_entries           sign_in [browser_cert], step_up, opened, help,
                             certificate; pat's failed
   enroll_site_gone          enroll.<d> serves /invite/* only
+  part 3, signing in as someone else (the job's .env sets
+  IMPERSONATION_MAX_MINUTES=2; AI switched on for the CI AI client; each
+  start: root's YubiKey-certificate session, then in a copy of that browser
+  his fresh security-key sign-in and the start route on the Hub listener):
+  imp_stock_endpoint_off    Keycloak's own impersonation endpoint non-2xx
+  imp_setup                 AI on; alice's People MCP token before any start
+  imp_start                 next → portal as alice: act root, pc_imp, amr =
+                            root's + hwk; root no session, alice one
+  imp_banner_everywhere     portal, people.<d>/ and /signin, group-gate's
+                            needs page (echo-file), the extension's page
+  imp_call5                 echo-cert with root's certificate (impersonation
+                            headers; forged copies deleted), alice's own
+                            certificate → needs page, no step-up; oidc-strong
+                            with act / pc_act
+  imp_people_read_only      PUT / POST / DELETE → 403, GET 200
+  imp_ai_refused            the AI client's authorize → #impersonating, no
+                            code; alice's pre-start token still works
+  imp_refused_concurrent    second start / person taken → 409; next reused → 403
+  imp_stop                  Stop page → sign_out; session gone, cookie dead,
+                            refresh invalid_grant; audit and history
+  imp_notice_next_signin    alice's next sign-in: the notice once
+  imp_stop_elsewhere        sam's stop_impersonation → ended page within 5 s
+  imp_refused_proofs        synced, no touch, bob's, browser certificate →
+                            403; reason "ab" → 400
+  imp_refused_targets       root, sam, portcullis-hub, admin → 409; carol
+                            403; the switch off ends one and refuses starts
+  imp_next_bound            next in bob's browser → 403, his session intact
+  imp_expiry (+ late next)  last, in parallel: expiry after 2 min 10 s; sam's
+                            start opened after 125 s → 403
+  cert_and_password_kinds_identified  LOGIN pc_methods yubikey_cert /
+                            browser_cert (alice), password (pat); /api/me/signin rows
+  passkey_kinds_identified  (the job drifted the realm's passwordless policy
+                            and `keycloak configure` restored it) a security
+                            key (rita, invite --replace-keys), synced (bob),
+                            device-bound (pat; fixture kind passkey_device):
+                            type, log kind + AAGUID, /api/me/signin row, amr,
+                            LOGIN pc_methods
   tls_follows_switch        echo-std / echo-basic / auth.<d> CA names;
                             Standard = any[family:passkey], hub / people →
                             standard, Strong (and the certificate templates)
@@ -113,7 +150,8 @@ Cases (in this order; each later case needs only the state it names):
 Environment: E2E_DOMAIN, HUB_IP, E2E_HUB_SECRET, KEYCLOAK_ADMIN,
 KEYCLOAK_ADMIN_PASSWORD, LLDAP_ADMIN_PASSWORD, E2E_ROOT_CERT / _KEY,
 E2E_BOB_CERT / _KEY, E2E_PAT_PASSWORD_FILE, E2E_FIXTURE (the host file the
-Hub's HUB_SIGNIN_EXTRA_AUTHENTICATORS is), ALPINE, E2E_ARTIFACTS. Secrets
+Hub's HUB_SIGNIN_EXTRA_AUTHENTICATORS is), E2E_MCPCLIENT (tests/e2e/mcpclient,
+built), ALPINE, E2E_ARTIFACTS. Secrets
 come only from the environment or files and are never printed; no
 Playwright traces (a DOM snapshot would carry a typed password).
 """
@@ -317,6 +355,7 @@ _kc = {"t": 0.0, "token": ""}
 
 
 def kc(path: str, method: str = "GET"):
+    """Keycloak's admin API (portcullis realm); a POST / PUT sends an empty body."""
     if time.time() - _kc["t"] > 30:
         body = urllib.parse.urlencode({"grant_type": "password", "client_id": "admin-cli",
                                        "username": os.environ["KEYCLOAK_ADMIN"],
@@ -325,6 +364,7 @@ def kc(path: str, method: str = "GET"):
                 f"{KC_ADMIN}/realms/master/protocol/openid-connect/token", data=body), timeout=30) as r:
             _kc["token"], _kc["t"] = json.loads(r.read())["access_token"], time.time()
     req = urllib.request.Request(f"{KC_ADMIN}/admin/realms/portcullis{path}", method=method,
+                                 data=b"" if method in ("POST", "PUT") else None,
                                  headers={"Authorization": "Bearer " + _kc["token"]})
     with urllib.request.urlopen(req, timeout=30) as r:
         raw = r.read()
@@ -406,10 +446,10 @@ class Key:
 
     copies = 0
 
-    def __init__(self, page: Page, *, synced: bool = False, credentials: list | None = None):
+    def __init__(self, page: Page, *, synced: bool = False, credentials: list | None = None, transport: str = "usb"):
         self.cdp = page.context.new_cdp_session(page)
         self.cdp.send("WebAuthn.enable", {"enableUI": False})
-        opts = {"protocol": "ctap2", "transport": "usb", "hasResidentKey": True, "hasUserVerification": True,
+        opts = {"protocol": "ctap2", "transport": transport, "hasResidentKey": True, "hasUserVerification": True,
                 "isUserVerified": True, "automaticPresenceSimulation": True}
         if synced:
             opts.update(defaultBackupEligibility=True, defaultBackupState=True)
@@ -559,15 +599,17 @@ def fresh_auth(page: Page, label: str, **extra) -> dict:
     return claims_of(tok["id_token"])
 
 
-def fresh_code(page: Page, label: str, redirect_uri: str) -> dict:
+def fresh_code(page: Page, label: str, redirect_uri: str, fresh: bool = True) -> dict:
     """The Hub's popup flow on redirect_uri (prompt=login, max_age=0, PKCE
     S256): the proof the page posts — code, verifier and nonce — not
-    exchanged here (the Hub does it)."""
+    exchanged here (the Hub does it). fresh=False: the same without
+    prompt=login / max_age (the SSO cookie alone, no touch)."""
     rd = Redirect(page, redirect_uri)
     verifier, nonce = secrets.token_urlsafe(48), secrets.token_urlsafe(16)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    extra = {"prompt": "login", "max_age": "0"} if fresh else {}
     goto(page, authorize_url("portcullis-fresh-auth", redirect_uri, code_challenge=challenge, code_challenge_method="S256",
-                             nonce=nonce, prompt="login", max_age="0"))
+                             nonce=nonce, **extra))
     out = drive_kc(page, lambda: rd.code() is not None, label)
     assert out == "done", f"{label}: {out} at {page.url.split('?')[0]}"
     return {"code": rd.code(), "code_verifier": verifier, "nonce": nonce}
@@ -775,6 +817,87 @@ def forged_cert_headers(cert: x509.Certificate) -> dict:
     info = f'Subject="CN={cn_of(cert.subject)}";Issuer="CN={cn_of(cert.issuer)}";SerialNumber="{cert.serial_number}"'
     return {"X-Forwarded-Tls-Client-Cert": urllib.parse.quote(b64, safe=""),
             "X-Forwarded-Tls-Client-Cert-Info": urllib.parse.quote(info, safe="")}
+
+
+# ── part 3: signing in as someone else ──
+
+MAIN = f"https://{DOMAIN}"
+IMP_REASON = "checking quota"
+IMP_BANNER = f"You are signed in as alice (by root) · reason “{IMP_REASON}” ·"
+READ_ONLY = "not while you are signed in as someone else: Stop first"
+AI_CLIENT = "portcullis-ai-claude-code"
+AI_CALLBACK = "http://127.0.0.1:33418/callback"
+PEOPLE_MCP = PEOPLE + "/mcp"
+PEOPLE_SCOPE = "mcp:portcullis.people"
+MCPCLIENT = os.environ.get("E2E_MCPCLIENT", "")
+
+
+def access_token(page: Page) -> str:
+    """The raw access token oauth2-proxy holds for this browser (never printed)."""
+    return page.request.get(f"{AUTH}/oauth2/auth").headers.get("x-auth-request-access-token", "")
+
+
+def audit_entries(action: str) -> list:
+    return [e for e in hub_ok("GET", "/api/directory/audit") if e.get("action") == action]
+
+
+def kc_events(user: str, kind: str, **extra) -> list:
+    uid = kc_user_id(user)
+    return kc("/events?" + urllib.parse.urlencode(dict({"user": uid, "type": kind, "max": 100}, **extra))) if uid else []
+
+
+def session_ids(user: str) -> set:
+    return {x["id"] for x in kc_sessions(user)}
+
+
+def mcp_login(page: Page, resource: str, scope: str, label: str) -> str:
+    """tests/e2e/mcpclient login (as e2e_ai.py): the authorize URL it prints
+    opened in page, the consent approved; the token file (0600, never
+    printed)."""
+    assert MCPCLIENT, "E2E_MCPCLIENT isn't set"
+    tf = os.path.join(SECRET_DIR, f"{label}.token.json")
+    p = subprocess.Popen([MCPCLIENT, "login", "--client-id", AI_CLIENT, "--callback-port", "33418", "--resource", resource,
+                          "--scope", scope, "--token-file", tf, "--ca-file", CA_CHAIN, "--timeout", "3m"],
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        url = p.stdout.readline().strip()
+        assert url.startswith(REALM + "/protocol/openid-connect/auth?"), \
+            f"mcpclient login printed {url[:80]!r}: {p.stderr.read()[:400] if p.poll() is not None else ''}"
+        goto(page, url)
+        deadline = time.time() + 90
+        while time.time() < deadline and not page.url.startswith(AI_CALLBACK):
+            try:
+                page.wait_for_load_state("domcontentloaded")
+                if page.url.startswith(AUTH + "/"):
+                    accept = page.locator("[name=accept]")
+                    if accept.count() and accept.first.is_visible():
+                        accept.first.click()
+                        page.wait_for_timeout(1000)
+                        continue
+                    if page.locator("#authenticateWebAuthnButton").is_visible():
+                        page.click("#authenticateWebAuthnButton")
+                        page.wait_for_timeout(1500)
+                        continue
+                    if page.locator("#kc-error-message, #impersonating").count():
+                        raise AssertionError(f"{label}: Keycloak refused: {body(page)[:300]!r}")
+            except PWError as e:
+                if "ERR_NETWORK_CHANGED" not in str(e) and "Execution context was destroyed" not in str(e):
+                    raise
+            page.wait_for_timeout(500)
+        rc = p.wait(60)
+        assert rc == 0, f"mcpclient login: rc {rc}: {p.stderr.read()[:600]}"
+    finally:
+        if p.poll() is None:
+            p.kill()
+    assert os.path.exists(tf), "mcpclient wrote no token file"
+    return tf
+
+
+def mcp_tools_list(url: str, tf: str) -> tuple[int, dict]:
+    out = subprocess.run([MCPCLIENT, "call", "--url", url, "--token-file", tf, "--method", "tools/list",
+                          "--ca-file", CA_CHAIN], capture_output=True, text=True, timeout=120)
+    assert out.returncode in (0, 2), f"mcpclient call: rc {out.returncode}: {out.stderr.strip()[:400]}"
+    return out.returncode, json.loads(out.stdout)
 
 
 def main() -> int:
@@ -1526,9 +1649,10 @@ def main() -> int:
             rc, code = curl_tls(f"echo-cert.{DOMAIN}", full, key)
             print(f"    browser certificate + chain on echo-cert: curl exit {rc}, HTTP {code}", flush=True)
             # 35 (CURLE_SSL_CONNECT_ERROR) / 56 (CURLE_RECV_ERROR: TLS 1.3's
-            # alert after the client's Certificate): the handshake refused,
+            # alert after the client's Certificate) / 55 (CURLE_SEND_ERROR:
+            # that alert while curl sends the request, run 43173240200): the handshake refused,
             # nothing else (a timeout, DNS, a bad file) counts.
-            assert rc in (35, 56) and code == "000", \
+            assert rc in (35, 55, 56) and code == "000", \
                 f"echo-cert with a browser certificate: curl exit {rc}, HTTP {code} (want a handshake refusal, 35 / 56)"
             # The same files complete the handshake where browser
             # certificates are accepted: the refusal above is the option's.
@@ -1633,6 +1757,8 @@ def main() -> int:
                 methods = [(e.get("details") or {}).get("pc_methods", "") for e in events]
                 print(f"    LOGIN events since: {[(e.get('clientId'), m) for e, m in zip(events, methods)]}", flush=True)
                 assert "browser_cert" in methods and not any("yubikey_cert" in m for m in methods), methods
+                rows = {m["id"]: m for m in people_json("alice", "GET", "/api/me/signin")["methods"]}
+                assert rows["browser_cert"]["state"] == "set", rows["browser_cert"]
                 state["alice_file"] = ctx.storage_state()
             finally:
                 ctx.close()
@@ -1740,7 +1866,7 @@ def main() -> int:
                 rc, code = curl_tls(f"echo-anycert.{DOMAIN}", full, key)
                 print(f"    browser certificate + chain on echo-anycert with browser_cert off: curl exit {rc}, "
                       f"HTTP {code}", flush=True)
-                assert rc in (35, 56) and code == "000", \
+                assert rc in (35, 55, 56) and code == "000", \
                     f"echo-anycert with browser_cert off: curl exit {rc}, HTTP {code} (want a handshake refusal, 35 / 56)"
                 # Keycloak: the .p12 alone signs nobody in.
                 uid = kc_user_id("alice")
@@ -2069,6 +2195,31 @@ def main() -> int:
               "echo-file, help by carol and certificate entries; pat's a failed sign-in (his wrong password)",
               history_entries)
 
+        def cert_and_password_kinds_identified():
+            # The LOGIN events' pc_methods of the sign-ins above (the amr was
+            # asserted at each: mtls, file, pwd) and the Sign-in page's rows.
+            got = {}
+            for user in ("alice", "pat"):
+                got[user] = {(e.get("details") or {}).get("pc_methods", "") for e in kc_events(user, "LOGIN")}
+            print(f"    LOGIN pc_methods: alice {sorted(got['alice'])}, pat {sorted(got['pat'])}", flush=True)
+            assert "yubikey_cert" in got["alice"] and "browser_cert" in got["alice"], got["alice"]
+            assert "password" in got["pat"], got["pat"]
+            rows = {m["id"]: m["state"] for m in people_json("alice", "GET", "/api/me/signin")["methods"]}
+            assert rows["yubikey_cert"] == "set", rows
+            # The password method is off here ("off" on the row): on for the check.
+            password_switch(True)
+            try:
+                rows = until("pat's /api/me/signin lists his password", lambda: (lambda r: r["password"] == "set" and r)(
+                    {m["id"]: m["state"] for m in people_json("pat", "GET", "/api/me/signin")["methods"]}), 60, every=3)
+            finally:
+                password_switch(False)
+            assert rows["password"] == "set" and all(rows[k] != "set" for k in ("security_key", "passkey_device",
+                                                                                 "passkey_synced", "yubikey_cert",
+                                                                                 "browser_cert")), rows
+        check("cert_and_password_kinds_identified: Keycloak's LOGIN pc_methods name yubikey_cert and browser_cert for "
+              "alice's certificate sign-ins and password for pat's; /api/me/signin lists alice's yubikey_cert and pat's "
+              "password (and nothing else for pat)", cert_and_password_kinds_identified)
+
         def enroll_site_gone():
             # Traefik's own 404 (no router): enroll never sees these paths.
             for path in ("/", "/self", "/api/self/renew", "/api/sign", "/api/users", "/users", "/certs"):
@@ -2086,6 +2237,891 @@ def main() -> int:
 
         if "alice_pk" in state:
             state.pop("alice_pk")[0].close()
+
+        # ── part 3: signing in as someone else (IMPERSONATION_MAX_MINUTES=2) ──
+        # Every start: root signs in with his YubiKey certificate (amr mtls),
+        # then, in a copy of that browser that presents the certificate only
+        # to the apps, a fresh sign-in with his security key (the proof,
+        # pc_fresh security_key, the same Keycloak session: F39) and the
+        # start route on the Hub listener with his access token (its sid).
+        imp_t0: dict = {}
+
+        def landed(page: Page, origin: str) -> bool:
+            return (page.url.startswith(origin + "/") and not page.url.startswith(AUTH + "/")
+                    and page.locator("#stepup-continue, #needs-stronger, #present-certificate, #impersonation-ended").count() == 0)
+
+        def cert_files(cert, key, name: str) -> dict:
+            return {"certPath": write_secret(f"{name}.crt", pem(cert)), "keyPath": write_secret(f"{name}.key", key_pem(key))}
+
+        def cert_goto(page: Page, url: str):
+            """goto with a client certificate: Playwright's TLS proxy may
+            answer net::ERR_HTTP2_PROTOCOL_ERROR when it loses the race with
+            the server's handshake (see tls_mtls_refuses_browser_cert); the
+            same URL again in a new page of the same context is the control
+            (every certificate here completes the handshake). Returns (page,
+            response)."""
+            for i in range(3):
+                try:
+                    return page, goto(page, url)
+                except PWError as e:
+                    if "net::ERR_HTTP2_PROTOCOL_ERROR" not in str(e) or i == 2:
+                        raise
+                    print(f"    {url}: {str(e).splitlines()[0]} — again in a new page", flush=True)
+                    page = page.context.new_page()
+
+        def root_session(label: str, origins=None):
+            """root signed in (YubiKey certificate, hub.<d>), then a context
+            with that session presenting his certificate to `origins` (not
+            auth.<d>) and his security key: (ctx, page, key)."""
+            needs("root_creds")
+            ctxa = new_context(client_cert=root_cert, origins=(AUTH, HUB))
+            try:
+                pa = ctxa.new_page()  # no authenticator: the certificate signs in (amr mtls)
+                goto(pa, HUB + "/")
+                out = drive_kc(pa, lambda: landed(pa, HUB), f"{label}-root")
+                assert out == "done", f"{label}: root's sign-in: {out} at {pa.url.split('?')[0]}"
+                storage = ctxa.storage_state()
+            finally:
+                ctxa.close()
+            ctx = new_context(client_cert=root_cert, storage_state=storage,
+                              origins=origins or (HUB, PEOPLE, MAIN, ECHO_STD, ECHO_CERT, ECHO_FILE))
+            page = ctx.new_page()
+            key = Key(page, credentials=state["root_creds"])
+            return ctx, page, key
+
+        def imp_post(caller: str, target: str, body_: dict, token: str = "") -> tuple[int, str]:
+            """The start route on the Hub listener; a refusal's audited
+            detail (the Hub's reason, never a proof value) is printed."""
+            headers = {"X-Forwarded-Access-Token": token} if token else {}
+            code, out = hub_as(caller, "POST", f"/api/directory/users/{target}/impersonation", body_, headers=headers)
+            if code != 200:
+                last = sorted((e for e in audit_entries("impersonation.start") if e.get("result") == "refused"
+                               and e.get("actor") == caller and e.get("target") == target),
+                              key=lambda e: str(e.get("time") or e.get("at") or ""))[-1:]
+                print(f"    start {caller} → {target} refused (HTTP {code}); audit: {[e.get('detail') for e in last]}", flush=True)
+            return code, out
+
+        def imp_begin(page: Page, label: str, caller: str = "root", target: str = "alice") -> dict:
+            """The fresh sign-in in page, then the start: {id, next, until}."""
+            tok = access_token(page)
+            assert tok, f"{label}: no access token for {caller}"
+            proof = fresh_code(page, f"{label}-fresh", HUB + "/")
+            code, out = imp_post(caller, target, dict(proof, reason=IMP_REASON), tok)
+            assert code == 200, f"{label}: start {caller} → {target}: HTTP {code} {out[:300]}"
+            doc = json.loads(out)
+            assert re.fullmatch(r"[0-9a-f]{32}", doc["id"]), doc
+            assert doc["next"] == f"{REALM}/portcullis-impersonate/start?id={doc['id']}", doc["next"]
+            imp_t0[doc["id"]] = time.time()
+            return doc
+
+        def imp_open(page: Page, doc: dict, label: str) -> None:
+            goto(page, doc["next"])
+            page.wait_for_url(re.compile("^" + re.escape(PORTAL)), timeout=TIMEOUT_MS)
+            page.wait_for_load_state("domcontentloaded")
+            base.shot(page, f"{label}-portal")
+            assert "alice" in body(page) and IMP_BANNER in body(page), f"{label}: portal: {body(page)[:300]!r}"
+
+        def imp_stop_admin(target: str = "alice") -> int:
+            code, _ = hub("POST", f"/api/directory/users/{target}/impersonation/stop", {})
+            return code
+
+        def imp_elapsed(imp_id: str) -> str:
+            return f"{time.time() - imp_t0.get(imp_id, time.time()):.0f} s after the start"
+
+        def ended_page(page: Page, url: str) -> bool:
+            resp = goto(page, url)
+            return resp is not None and resp.status == 403 and page.locator("#impersonation-ended").count() == 1
+
+        def no_imp_session(user: str, sids: set) -> bool:
+            return not (session_ids(user) & sids)
+
+        def imp_stock_endpoint_off():
+            uid = kc_user_id("alice")
+            assert uid, "alice isn't in Keycloak"
+            try:
+                kc(f"/users/{uid}/impersonation", "POST")
+                raise AssertionError("Keycloak's own impersonation endpoint answered 2xx")
+            except urllib.error.HTTPError as e:
+                print(f"    POST /admin/realms/portcullis/users/<alice>/impersonation: HTTP {e.code}", flush=True)
+                assert e.code >= 300, e.code
+        check("imp_stock_endpoint_off: Keycloak's own admin impersonation endpoint answers non-2xx "
+              "(--features-disabled=impersonation)", imp_stock_endpoint_off)
+
+        def imp_setup():
+            # The CI AI client and People MCP (imp_ai_refused): AI on, Claude Code offered.
+            v = hub_ok("PUT", "/api/ai/settings", {"enabled": True,
+                                                    "clients": {"claude_code": {"offered": True, "admin": True}}})
+            assert v.get("enabled") is True and v.get("gate_present") is True, f"AI settings: {json.dumps(v)[:400]}"
+            state["ai_on"] = True
+            view = hub_ok("GET", "/api/impersonations")
+            print(f"    impersonations: allowed {view.get('allowed')} max_minutes {view.get('max_minutes')} "
+                  f"running {len(view.get('running') or [])}", flush=True)
+            assert view.get("allowed") is True and view.get("max_minutes") == 2 and not view.get("running"), view
+            # A YubiKey certificate of alice's own (F16, below): her sign-ins
+            # here, and imp_call5's "the person's certificate never counts".
+            # carol's remove-passkeys (sign_in_help_actions) left alice the
+            # passkey registration action: a start on her is refused (rule 6)
+            # until she finishes it (below).
+            uid = kc_user_id("alice")
+            actions = kc(f"/users/{uid}").get("requiredActions") or []
+            print(f"    alice's required actions: {actions}", flush=True)
+            if actions:
+                code, out = imp_post("root", "alice", {"reason": IMP_REASON, "code": "x", "code_verifier": "x", "nonce": "x"})
+                print(f"    a start on alice with {actions}: HTTP {code} {out.strip()[:100]!r}", flush=True)
+                assert code == 409 and "unfinished sign-in step" in out, f"HTTP {code} {out[:200]}"
+            # alice signs in with her certificate and finishes the action (a
+            # new security key: an AI token counts no certificate method).
+            cert, key = vault_issue("alice")
+            state["imp_alice_cert"] = cert_files(cert, key, "alice-imp-yk")
+            ctx = new_context(client_cert=state["imp_alice_cert"], origins=(AUTH, ECHO_CERT))
+            try:
+                page = ctx.new_page()
+                akey = Key(page)
+                goto(page, ECHO_CERT + "/")
+                base.passkey_flow(page, until=ECHO_CERT, label="alice-imp-register", expect_stepups=0)
+                assert akey.registered == (1 if actions else 0), f"alice registered {akey.registered} passkeys"
+                creds = akey.credentials()
+            finally:
+                ctx.close()
+            assert not (kc(f"/users/{uid}").get("requiredActions") or []), "alice's required actions stay"
+            assert creds, "alice has no passkey"
+            state["alice_imp_creds"] = creds
+            # A token for alice's People MCP, minted before any start.
+            ctx = new_context()
+            try:
+                Key(ctx.new_page(), credentials=state["alice_imp_creds"])
+                until(f"{PEOPLE_MCP}'s metadata served", lambda: ctx.request.get(
+                    PEOPLE + "/.well-known/oauth-protected-resource/mcp").status == 200, 120)
+                tf = mcp_login(ctx.pages[0], PEOPLE_MCP, PEOPLE_SCOPE, "alice-people-mcp")
+            finally:
+                ctx.close()
+            rc, doc = mcp_tools_list(PEOPLE_MCP, tf)
+            names = [t.get("name") for t in ((doc.get("result") or {}).get("tools") or [])]
+            print(f"    alice's People MCP before the start: rc {rc}, {len(names)} tools", flush=True)
+            assert rc == 0 and names, f"alice's People MCP token: {json.dumps(doc)[:300]}"
+            state["alice_ai_tf"] = tf
+        check("imp_setup: AI on (Claude Code offered); signing in as someone else allowed, max 2 minutes, none "
+              "running; alice's People MCP token minted before any start answers tools/list", imp_setup)
+
+        def imp_start():
+            # root's earlier sessions out: then his one session ends at the start.
+            kc(f"/users/{kc_user_id('root')}/logout", "POST")
+            until("root has no Keycloak session", lambda: kc_sessions("root") == [], 20, every=2)
+            ctx, page, key = root_session("imp1")
+            try:
+                before = token_claims(page)
+                amr0 = before.get("amr") or []
+                assert before.get("preferred_username") == "root" and "mtls" in amr0, f"root's session: {before.get('preferred_username')} {amr0}"
+                root_sids = session_ids("root")
+                assert len(root_sids) == 1, f"root's sessions: {root_sids}"
+                (root_sid,) = root_sids
+                alice0 = session_ids("alice")
+                asserted = key.asserted
+                proof = fresh_code(page, "imp1-fresh", HUB + "/")
+                assert key.asserted > asserted, "the fresh sign-in asked no security key"
+                # F39: the proof's session is still root's one session.
+                assert session_ids("root") == {root_sid}, f"root's session changed across prompt=login: {session_ids('root')}"
+                # Keycloak keeps only the fresh sign-in's methods in the
+                # session after prompt=login (run 43174939742: mtls before,
+                # the impersonation hwk alone; run 43183771383 read the
+                # session's amr with one more fresh-auth authorize here,
+                # ['hwk'] — which also replaced the proof's client session, so
+                # its code then failed: no authorize between the proof and
+                # the start any more), so root then steps up to his
+                # YubiKey certificate (step-ups accumulate) so the session
+                # has both for imp_call5.
+                ctxc = new_context(client_cert=root_cert, storage_state=ctx.storage_state(),
+                                   origins=(AUTH, HUB, PEOPLE, MAIN, ECHO_STD, ECHO_CERT, ECHO_FILE))
+                ctx.close()
+                ctx = ctxc
+                page = ctx.new_page()
+                key = Key(page, credentials=state["root_creds"])
+                goto(page, f"{AUTH}/oauth2/start?" + urllib.parse.urlencode({"pc_method": "yubikey_cert", "rd": HUB + "/"}))
+                out = drive_kc(page, lambda: landed(page, HUB), "imp1-stepup-cert")
+                assert out == "done", f"root's step-up to yubikey_cert: {out} at {page.url.split('?')[0]}"
+                amr0 = token_claims(page).get("amr") or []
+                assert {"mtls", "hwk"} <= set(amr0), f"root's amr after the step-up: {amr0}"
+                assert session_ids("root") == {root_sid}, f"root's session changed across the step-up: {session_ids('root')}"
+                code, out = imp_post("root", "alice", dict(proof, reason=IMP_REASON), access_token(page))
+                assert code == 200, f"start root → alice: HTTP {code} {out[:300]}"
+                doc = json.loads(out)
+                assert doc["next"] == f"{REALM}/portcullis-impersonate/start?id={doc['id']}", doc["next"]
+                imp_t0[doc["id"]] = time.time()
+                starts = [e for e in audit_entries("impersonation.start") if (e.get("detail") or "").startswith(doc["id"])]
+                print(f"    start: {[(e.get('actor'), e.get('target'), e.get('result'), e.get('detail')) for e in starts]}", flush=True)
+                assert len(starts) == 1 and starts[0].get("result") == "ok" and starts[0].get("actor") == "root" \
+                    and starts[0].get("target") == "alice" and starts[0]["detail"] == f"{doc['id']} · security_key · {IMP_REASON}", starts
+                imp_open(page, doc, "imp1")
+                c = token_claims(page)
+                amr = c.get("amr") or []
+                print(f"    root's amr before {amr0}, as alice {amr}; act {c.get('act')}", flush=True)
+                assert c.get("preferred_username") == "alice", c.get("preferred_username")
+                assert c.get("act") == {"sub": "root"}, c.get("act")
+                assert (c.get("pc_imp") or {}).get("id") == doc["id"], c.get("pc_imp")
+                assert set(amr) == set(amr0) | {"hwk"}, f"amr {amr} (root's {amr0} + hwk)"
+                assert IMP_REASON not in json.dumps(c), "the reason in the token"
+                until("root's Keycloak session is gone", lambda: kc_sessions("root") == [], 10, every=1)
+                new = session_ids("alice") - alice0
+                assert len(new) == 1, f"alice's new sessions: {new}"
+                ev = [e for e in kc_events("alice", "IMPERSONATE") if (e.get("details") or {}).get("pc_imp") == doc["id"]]
+                assert len(ev) == 1 and ev[0]["details"].get("pc_act") == "root", f"IMPERSONATE events: {ev}"
+                state["imp1"] = {"ctx": ctx, "page": page, "key": key, "doc": doc, "sids": new}
+            except Exception:
+                ctx.close()
+                raise
+        check("imp_start: root's fresh security-key sign-in + reason → the start (audited, security_key); next lands "
+              "root's browser on the portal as alice: preferred_username alice, act.sub root, pc_imp.id, amr = root's + "
+              "hwk; root has no Keycloak session, alice one more (IMPERSONATE pc_act root)", imp_start)
+
+        def imp_banner_everywhere():
+            needs("imp1")
+            imp = state["imp1"]
+            page = imp["page"]
+            goto(page, PORTAL)
+            html_ = page.content()
+            assert IMP_BANNER in body(page) and "min left" in body(page), f"portal: {body(page)[:300]!r}"
+            assert page.locator("#pc-imp-banner #pc-imp-stop").count() == 1, "no Stop on the portal's banner"
+            assert "/impersonation/stop" in html_, "the portal's Stop doesn't lead to the Stop page"
+            for path in ("/", "/signin"):
+                goto(page, PEOPLE + path)
+                page.wait_for_selector("#pc-imp-banner", timeout=15_000)
+                text = page.inner_text("#pc-imp-banner")
+                base.shot(page, f"imp1-people{path.replace('/', '-')}")
+                assert IMP_BANNER in text and "min left" in text and "Stop" in text, f"people.<d>{path}: {text!r}"
+                assert page.locator("#pc-imp-banner button, #pc-imp-banner a").count() >= 1, f"people.<d>{path}: no Stop"
+            # group-gate's needs page: echo-file (any[browser_cert]), root's session can't meet it.
+            page, resp = cert_goto(page, ECHO_FILE + "/")
+            imp["page"] = page
+            base.shot(page, "imp1-needs")
+            assert resp and resp.status == 403, f"echo-file: HTTP {resp and resp.status}"
+            assert page.locator("#needs-stronger[data-impersonated=true]").count() == 1, body(page)[:300]
+            assert IMP_BANNER in body(page) and "min left" in body(page), body(page)[:300]
+            assert page.locator("#pc-imp-stop").count() == 1 and page.locator("#stepup-continue").count() == 0
+            assert "x-stepup-url" not in resp.headers, resp.headers.get("x-stepup-url")
+            # The extension's page: a client not in the file's clients (the Hub's fresh-auth).
+            rd = Redirect(page, HUB + "/")
+            resp = goto(page, authorize_url("portcullis-fresh-auth", HUB + "/", code_challenge="x" * 43,
+                                            code_challenge_method="S256"))
+            base.shot(page, "imp1-kc-refused")
+            assert resp and resp.status == 403 and page.locator("#impersonating[data-mode=refused]").count() == 1, \
+                f"fresh-auth while impersonating: HTTP {resp and resp.status} {body(page)[:200]!r}"
+            text = page.inner_text("#portcullis-impersonation-banner")
+            assert IMP_BANNER in text and "min left" in text, text
+            assert page.locator("#portcullis-impersonation-stop-banner, #portcullis-impersonation-stop").count() >= 1
+            assert rd.code() is None, "fresh-auth issued a code while impersonating"
+            print(f"    banners checked {imp_elapsed(imp['doc']['id'])}", flush=True)
+        check("imp_banner_everywhere: \"You are signed in as alice (by root) · reason “checking quota” · … min left\" "
+              "with Stop on the portal, people.<d>/ and /signin (impersonation.js), group-gate's needs page (echo-file; "
+              "no step-up, no X-Stepup-URL) and the extension's page (fresh-auth refused, no code)", imp_banner_everywhere)
+
+        def imp_call5():
+            needs("imp1", "imp_alice_cert")
+            imp = state["imp1"]
+            imp_id = imp["doc"]["id"]
+            page, resp = cert_goto(imp["page"], ECHO_CERT + "/")
+            imp["page"] = page
+            assert resp and resp.status == 200, f"echo-cert with root's certificate: HTTP {resp and resp.status}"
+            seen = headers_of(body(page))
+            assert seen.get("x-forwarded-user") == ["alice"], seen.get("x-forwarded-user")
+            assert seen.get("x-forwarded-impersonator") == ["root"] and seen.get("x-forwarded-impersonation") == [imp_id], \
+                (seen.get("x-forwarded-impersonator"), seen.get("x-forwarded-impersonation"))
+            # Client-sent copies: Traefik deletes them, the app sees group-gate's only.
+            r = page.request.get(ECHO_CERT + "/", headers={"X-Forwarded-Impersonator": "sam",
+                                                           "X-Forwarded-Impersonation": "0" * 32})
+            seen = headers_of(r.text())
+            assert r.status == 200 and seen.get("x-forwarded-impersonator") == ["root"] \
+                and seen.get("x-forwarded-impersonation") == [imp_id], \
+                f"forged headers: HTTP {r.status} {seen.get('x-forwarded-impersonator')} {seen.get('x-forwarded-impersonation')}"
+            # alice's own YubiKey certificate in the same session: never counts.
+            ctx = new_context(client_cert=state["imp_alice_cert"], origins=(ECHO_CERT,),
+                              storage_state=imp["ctx"].storage_state())
+            try:
+                pc, resp = cert_goto(ctx.new_page(), ECHO_CERT + "/")
+                base.shot(pc, "imp1-alice-cert")
+                assert resp and resp.status == 403, f"echo-cert with alice's certificate: HTTP {resp and resp.status}"
+                assert pc.locator("#needs-stronger[data-impersonated=true]").count() == 1, body(pc)[:300]
+                assert "x-stepup-url" not in resp.headers and pc.locator("#stepup-continue, #present-certificate").count() == 0
+                assert "Hostname" not in body(pc), "echo-cert opened with alice's certificate"
+            finally:
+                ctx.close()
+            # Strong: people.<d> (core, Strong) opened above; a native-OIDC app on Strong, with pc_act.
+            print(f"    alice's own methods: {people_methods('alice')}", flush=True)
+            rd = Redirect(page, OIDC_STRONG + "/cb")
+            t0 = int(time.time() * 1000) - 2000
+            goto(page, authorize_url("oidc-strong", OIDC_STRONG + "/cb"))
+            out = drive_kc(page, lambda: rd.code() is not None, "imp1-oidc-strong", seconds=30)
+            assert out == "done", f"oidc-strong: {out}"
+            tok = exchange(page, "oidc-strong", OIDC_STRONG + "/cb", rd.code(), secret=oidc_secret("oidc-strong"))
+            c = claims_of(tok["id_token"])
+            assert c.get("preferred_username") == "alice" and c.get("act") == {"sub": "root"} \
+                and (c.get("pc_imp") or {}).get("id") == imp_id, (c.get("preferred_username"), c.get("act"), c.get("pc_imp"))
+            assert tok.get("refresh_token"), "oidc-strong got no refresh token"
+            imp["refresh"] = tok["refresh_token"]
+            logins = until("oidc-strong's LOGIN with pc_act root", lambda: [
+                e for e in kc_events("alice", "LOGIN", client="oidc-strong")
+                if e.get("time", 0) >= t0 and (e.get("details") or {}).get("pc_act") == "root"], 20, every=2)
+            print(f"    oidc-strong LOGIN details: {logins[0].get('details')}; {imp_elapsed(imp_id)}", flush=True)
+        check("imp_call5: echo-cert (any[yubikey_cert]) opens with root's YubiKey certificate (X-Forwarded-Impersonator "
+              "root / -Impersonation id; forged copies deleted); with alice's own certificate the impersonation needs "
+              "page, no step-up; oidc-strong (Strong) issues alice's tokens with act root, its LOGIN has pc_act root",
+              imp_call5)
+
+        def imp_people_read_only():
+            needs("imp1")
+            page = state["imp1"]["page"]
+            for method, path, body_ in (("PUT", "/api/me/signin/password", {}),
+                                        ("POST", "/api/me/signin/browser-certificates", {"days": 1}),
+                                        ("DELETE", "/api/me/ai/connections/x", None)):
+                r = people_req(page, method, path, body_)
+                print(f"    {method} {path}: HTTP {r.status} {r.text().strip()[:80]!r}", flush=True)
+                assert r.status == 403 and READ_ONLY in r.text(), f"{method} {path}: HTTP {r.status} {r.text()[:200]}"
+                # Control: alice herself (no impersonation header) isn't refused that way.
+                code, out = people_as("alice", method, path, body_)
+                assert READ_ONLY not in out, f"control {method} {path} as alice: HTTP {code} {out[:200]}"
+            r = people_req(page, "GET", "/api/me/apps")
+            assert r.status == 200, f"GET /api/me/apps: HTTP {r.status}"
+            r = people_req(page, "GET", "/api/me/impersonation")
+            active = r.json().get("active") or {}
+            assert active.get("person") == "alice" and active.get("admin") == "root" and active.get("reason") == IMP_REASON, active
+        check("imp_people_read_only: while impersonated PUT /api/me/signin/password, POST /api/me/signin/browser-"
+              "certificates, DELETE /api/me/ai/connections/x → 403 \"not while you are signed in as someone else: Stop "
+              "first\" (alice herself: not that refusal); GET /api/me/apps 200", imp_people_read_only)
+
+        def imp_ai_refused():
+            needs("imp1", "alice_ai_tf")
+            page = state["imp1"]["page"]
+            rd = Redirect(page, AI_CALLBACK)
+            verifier = secrets.token_urlsafe(48)
+            challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+            resp = goto(page, authorize_url(AI_CLIENT, AI_CALLBACK, scope=f"openid {PEOPLE_SCOPE}", resource=PEOPLE_MCP,
+                                            code_challenge=challenge, code_challenge_method="S256"))
+            page.wait_for_timeout(1000)
+            base.shot(page, "imp1-ai-authorize")
+            assert page.locator("#impersonating").count() == 1, f"the AI client's authorize: {page.url.split('?')[0]} {body(page)[:200]!r}"
+            assert resp and resp.status == 403, f"HTTP {resp and resp.status}"
+            assert IMP_BANNER in body(page), body(page)[:300]
+            assert rd.code() is None and not rd.urls, "a code for the AI client while impersonating"
+            rc, doc = mcp_tools_list(PEOPLE_MCP, state["alice_ai_tf"])
+            print(f"    alice's pre-start People MCP token during the impersonation: rc {rc}, "
+                  f"{len((doc.get('result') or {}).get('tools') or [])} tools", flush=True)
+            assert rc == 0 and (doc.get("result") or {}).get("tools"), f"alice's own token: {json.dumps(doc)[:300]}"
+        check("imp_ai_refused: the CI AI client's authorize in the impersonating browser shows #impersonating (403, "
+              "banner), no code; alice's People MCP token minted before the start still works", imp_ai_refused)
+
+        def imp_refused_concurrent():
+            needs("imp1")
+            body_ = {"reason": IMP_REASON, "code": "x", "code_verifier": "x", "nonce": "x"}
+            code, out = imp_post("root", "pat", body_)
+            print(f"    root → pat while root runs one: HTTP {code} {out.strip()[:100]!r}", flush=True)
+            assert code == 409 and "Stop it first" in out, f"HTTP {code} {out[:200]}"
+            code, out = imp_post("sam", "alice", body_)
+            print(f"    sam → alice while root runs one: HTTP {code} {out.strip()[:100]!r}", flush=True)
+            assert code == 409 and "root is signed in as alice right now" in out, f"HTTP {code} {out[:200]}"
+            # The used next once more in root's (now alice's) browser: refused, no new session.
+            imp = state["imp1"]
+            before = session_ids("alice")
+            resp = goto(imp["page"], imp["doc"]["next"])
+            base.shot(imp["page"], "imp1-next-again")
+            assert resp and resp.status == 403 and imp["page"].locator("#impersonating[data-mode=refused]").count() == 1, \
+                f"next again: HTTP {resp and resp.status} {body(imp['page'])[:200]!r}"
+            assert session_ids("alice") == before, f"alice's sessions changed: {before} → {session_ids('alice')}"
+            print(f"    {imp_elapsed(imp['doc']['id'])}", flush=True)
+        check("imp_refused_concurrent + imp_next_bound (reuse): a second start by root → 409 \"Stop it first\", sam on "
+              "alice → 409 \"root is signed in as alice right now\"; the used next again → 403 page, no session",
+              imp_refused_concurrent)
+
+        def imp_stop():
+            needs("imp1")
+            imp = state.pop("imp1")
+            ctx, page, doc = imp["ctx"], imp["page"], imp["doc"]
+            try:
+                old = next(c["value"] for c in ctx.cookies(AUTH) if c["name"] == "_oauth2_proxy")
+                code, _ = raw_request(f"echo-std.{DOMAIN}", "/", f"_oauth2_proxy={old}")
+                assert code == 200, f"control: the session's cookie on echo-std before Stop: HTTP {code}"
+                print(f"    Stop pressed {imp_elapsed(doc['id'])}", flush=True)
+                seen: list = []
+                page.on("request", lambda r: seen.append((r.method, r.url.split("?")[0])))
+                goto(page, PORTAL)
+                page.click("#pc-imp-stop")
+                page.wait_for_url(re.compile("^" + re.escape(PEOPLE + "/impersonation/stop")), timeout=TIMEOUT_MS)
+                btn = page.get_by_role("button", name="Stop signing in as alice")
+                btn.wait_for(timeout=15_000)
+                base.shot(page, "imp1-stop-page")
+                btn.click()
+                # (Playwright delivers the request events only inside its own
+                # calls: hence the wait_for_timeout.)
+                until("/oauth2/sign_out after Stop", lambda: page.wait_for_timeout(500) or
+                      any(u == AUTH + "/oauth2/sign_out" for _, u in seen), 20, every=0.5)
+                # Then the sign-in: this browser presents root's YubiKey
+                # certificate to auth.<d> (imp_start's step-up), so Keycloak's
+                # X.509 step signs root himself in again and the portal opens
+                # as root (run 43234690407); without it, the sign-in page.
+
+                def after_stop():
+                    page.wait_for_load_state("domcontentloaded")
+                    if page.url.startswith(REALM + "/"):
+                        return page.locator("#authenticateWebAuthnButton").count() == 1 and "sign-in page"
+                    if page.url.startswith(PORTAL) and "Signed in as" in body(page):
+                        return "portal as root"
+                    return None
+                landing = until("the sign-in after Stop", after_stop, 30, every=1)
+                base.shot(page, "imp1-after-stop")
+                text = body(page)
+                print(f"    after Stop: {landing}", flush=True)
+                assert ("POST", PEOPLE + "/api/me/impersonation/stop") in seen, [u for _, u in seen][-10:]
+                assert IMP_BANNER not in text and "Your session as alice" not in text, text[:200]
+                if landing == "portal as root":
+                    c = token_claims(page)
+                    assert c.get("preferred_username") == "root" and "act" not in c and "pc_imp" not in c, \
+                        f"after Stop: {c.get('preferred_username')} act {c.get('act')} pc_imp {c.get('pc_imp')}"
+                    assert "Signed in as <strong>root</strong>" in page.content(), text[:200]
+                until("alice's impersonated Keycloak session gone", lambda: no_imp_session("alice", imp["sids"]), 20, every=2)
+                code, _ = raw_request(f"echo-std.{DOMAIN}", "/", f"_oauth2_proxy={old}")
+                print(f"    the old _oauth2_proxy cookie on echo-std after Stop: HTTP {code}", flush=True)
+                assert code in (302, 401, 403), f"the old cookie after Stop: HTTP {code}"
+                r = page.request.post(f"{REALM}/protocol/openid-connect/token", form={
+                    "grant_type": "refresh_token", "client_id": "oidc-strong", "client_secret": oidc_secret("oidc-strong"),
+                    "refresh_token": imp["refresh"]})
+                assert r.status == 400 and r.json().get("error") == "invalid_grant", f"refresh after Stop: HTTP {r.status} {r.text()[:200]}"
+            finally:
+                ctx.close()
+            start = [e for e in audit_entries("impersonation.start") if (e.get("detail") or "").startswith(doc["id"])]
+            assert start and IMP_REASON in start[0]["detail"], start
+
+            def ended():
+                e = [x for x in audit_entries("impersonation.end") if (x.get("detail") or "").startswith(doc["id"])]
+                return e and e[0]
+            end = until("impersonation.end in the audit", ended, 60, every=3)
+            print(f"    end: {end.get('actor')} {end.get('detail')!r}", flush=True)
+            assert end.get("actor") == "root" and re.fullmatch(
+                re.escape(doc["id"]) + r" · stopped · \d+ min · apps opened: (?!none).+", end["detail"]), end
+
+            def entry():
+                h = people_json("alice", "GET", "/api/me/signin/history?limit=100")["entries"]
+                got = [e for e in h if e["kind"] == "impersonation" and e.get("by") == "root" and e.get("reason") == IMP_REASON
+                       and "stopped by root" in (e.get("detail") or "")]
+                return got and got[0]
+            e = until("alice's history has the impersonation entry", entry, 60, every=3)
+            print(f"    history: {e.get('detail')!r}", flush=True)
+            assert "apps opened:" in e["detail"] and "apps opened: none" not in e["detail"], e["detail"]
+            state["imp1_done"] = doc
+        check("imp_stop: Stop on the portal → the Stop page POSTs, /oauth2/sign_out, the sign-in page; within 20 s alice "
+              "has no impersonated Keycloak session; the old _oauth2_proxy cookie (200 before) isn't 200; oidc-strong's "
+              "refresh token invalid_grant; audit start (reason) and end \"stopped\" by root with the apps; alice's "
+              "history has the impersonation entry by root with the reason and the apps", imp_stop)
+
+        def imp_notice_next_signin():
+            needs("imp1_done", "imp_alice_cert")
+            uid = kc_user_id("alice")
+            until("alice has the notice action", lambda: "portcullis-impersonation-notice" in
+                  (kc(f"/users/{uid}").get("requiredActions") or []), 60, every=3)
+            ctx = new_context(client_cert=state["imp_alice_cert"], origins=(AUTH, ECHO_CERT))
+            try:
+                page = ctx.new_page()
+                goto(page, ECHO_CERT + "/")
+                page.wait_for_selector("#portcullis-impersonation-notice", timeout=TIMEOUT_MS)
+                base.shot(page, "alice-notice")
+                lines = [x.strip() for x in page.locator(".portcullis-notice-line").all_inner_texts()]
+                print(f"    notice: {lines}", flush=True)
+                assert len(lines) == 1 and re.match(
+                    r"root signed in as you on \d{1,2} [A-Z][a-z]{2} \d{4} \d\d:\d\d UTC for \d+ min: checking quota\. "
+                    r"Apps opened: (?!none)", lines[0]), lines
+                page.click("#portcullis-notice-continue")
+                page.wait_for_url(re.compile("^" + re.escape(ECHO_CERT) + "/"), timeout=TIMEOUT_MS)
+                until("echo-cert opened for alice", lambda: "Hostname" in body(page), 20, every=1)
+                assert headers_of(body(page)).get("x-forwarded-user") == ["alice"]
+                # Her own session: forged impersonation headers don't reach the app.
+                r = page.request.get(ECHO_CERT + "/", headers={"X-Forwarded-Impersonator": "root",
+                                                               "X-Forwarded-Impersonation": "0" * 32})
+                seen = headers_of(r.text())
+                assert r.status == 200 and "x-forwarded-impersonator" not in seen and "x-forwarded-impersonation" not in seen, \
+                    f"forged headers on alice's own session: {seen.get('x-forwarded-impersonator')} {seen.get('x-forwarded-impersonation')}"
+                c = token_claims(page)
+                assert "act" not in c and "pc_imp" not in c, "alice's own token has act / pc_imp"
+            finally:
+                ctx.close()
+            assert "portcullis-impersonation-notice" not in (kc(f"/users/{uid}").get("requiredActions") or [])
+            ctx = new_context(client_cert=state["imp_alice_cert"], origins=(AUTH, ECHO_CERT))
+            try:
+                page = ctx.new_page()
+                shown: list = []
+                page.on("request", lambda r: shown.append(r.url) if "portcullis-impersonation-notice" in r.url else None)
+                goto(page, ECHO_CERT + "/")
+                page.wait_for_url(re.compile("^" + re.escape(ECHO_CERT) + "/"), timeout=TIMEOUT_MS)
+                until("echo-cert opened for alice again", lambda: "Hostname" in body(page), 20, every=1)
+                assert not shown and page.locator("#portcullis-impersonation-notice").count() == 0, "the notice again"
+            finally:
+                ctx.close()
+        check("imp_notice_next_signin: alice's own next sign-in shows \"root signed in as you on … UTC for … min: "
+              "checking quota. Apps opened: …\" once; Continue reaches echo-cert (forged impersonation headers deleted on "
+              "her own session); her next sign-in shows no notice", imp_notice_next_signin)
+
+        def imp_stop_elsewhere():
+            ctx, page, _ = root_session("imp2")
+            try:
+                doc = imp_begin(page, "imp2")
+                before = session_ids("alice")
+                imp_open(page, doc, "imp2")
+                sids = session_ids("alice") - before
+                err, text = hub_mcp_admin("sam", "stop_impersonation", {"user": "alice"})
+                print(f"    sam's stop_impersonation: isError {err}: {text[:120]!r}", flush=True)
+                assert not err, text[:300]
+                t0 = time.time()
+                until("root's browser gets the ended page", lambda: ended_page(page, ECHO_STD + "/"), 5, every=1)
+                print(f"    ended page {time.time() - t0:.1f} s after the stop", flush=True)
+                base.shot(page, "imp2-ended")
+                until("alice's impersonated Keycloak session gone", lambda: no_imp_session("alice", sids), 20, every=2)
+                end = until("impersonation.end by sam", lambda: [x for x in audit_entries("impersonation.end")
+                                                                 if (x.get("detail") or "").startswith(doc["id"] + " · stopped")], 30)
+                assert end[0].get("actor") == "sam", end
+            finally:
+                ctx.close()
+                imp_stop_admin()
+        check("imp_stop_elsewhere: sam's stop_impersonation {user: alice} (Hub MCP) ends it; root's browser gets "
+              "group-gate's ended page within 5 s; Keycloak's session gone; audited stopped by sam", imp_stop_elsewhere)
+
+        def imp_switch_off():
+            body_ = {"reason": IMP_REASON, "code": "x", "code_verifier": "x", "nonce": "x"}
+            # The switch off ends a running one, and refuses a start.
+            ctx, page, _ = root_session("imp3")
+            switched = False
+            try:
+                doc = imp_begin(page, "imp3")
+                before = session_ids("alice")
+                imp_open(page, doc, "imp3")
+                sids = session_ids("alice") - before
+                v = hub_ok("PUT", "/api/signin/impersonation", {"allowed": False})
+                switched = True
+                assert v.get("allowed") is False, v
+                until("root's browser gets the ended page", lambda: ended_page(page, ECHO_STD + "/"), 10, every=1)
+                until("alice's impersonated Keycloak session gone", lambda: no_imp_session("alice", sids), 20, every=2)
+                code, out = imp_post("root", "alice", body_)
+                assert code == 409 and "switched off" in out, f"start while off: HTTP {code} {out[:200]}"
+                recent = {x["id"]: x for x in hub_ok("GET", "/api/impersonations").get("recent") or []}
+                assert recent.get(doc["id"], {}).get("how") == "switched_off", recent.get(doc["id"])
+            finally:
+                ctx.close()
+                if switched:
+                    hub_ok("PUT", "/api/signin/impersonation", {"allowed": True})
+                imp_stop_admin()
+        check("imp_refused_targets (switch): the switch off ends the running one (ended page, Keycloak's session "
+              "gone, how switched_off) and a start → 409; switched back on", imp_switch_off)
+
+        def imp_next_bound():
+            needs("root_creds")
+            bctx = new_context(client_cert=bob_cert, origins=(AUTH, MAIN))
+            ctx, page, _ = root_session("imp4")
+            try:
+                bpage = bctx.new_page()
+                goto(bpage, PORTAL)
+                assert drive_kc(bpage, lambda: landed(bpage, MAIN), "imp4-bob") == "done"
+                bob0 = session_ids("bob")
+                assert bob0, "bob has no Keycloak session"
+                doc = imp_begin(page, "imp4")
+                alice0 = session_ids("alice")
+                resp = goto(bpage, doc["next"])
+                base.shot(bpage, "imp4-bob-next")
+                assert resp and resp.status == 403 and bpage.locator("#impersonating[data-mode=refused]").count() == 1, \
+                    f"next in bob's browser: HTTP {resp and resp.status} {body(bpage)[:200]!r}"
+                assert session_ids("bob") == bob0, f"bob's sessions: {bob0} → {session_ids('bob')}"
+                goto(bpage, PORTAL)
+                assert landed(bpage, MAIN) and "bob" in body(bpage), f"bob's session after: {bpage.url.split('?')[0]}"
+                assert session_ids("alice") == alice0, "alice got a session"
+            finally:
+                bctx.close()
+                ctx.close()
+                imp_stop_admin()
+        check("imp_next_bound: next opened in bob's signed-in browser → 403 page, bob's session intact, alice none",
+              imp_next_bound)
+
+        # Last, in parallel: the expiry (root as alice, max 2 minutes) and a
+        # start whose next is opened after 125 s (sam as pat: root runs the
+        # other one, and alice is taken).
+        def imp_expiry_and_late_next():
+            needs("sam_spare")
+            ctx, page, _ = root_session("imp5")
+            sctx = new_context()
+            try:
+                doc = imp_begin(page, "imp5")
+                before = session_ids("alice")
+                imp_open(page, doc, "imp5")
+                sids = session_ids("alice") - before
+                spage = sctx.new_page()
+                Key(spage, credentials=state["sam_spare"])
+                goto(spage, HUB + "/")
+                assert drive_kc(spage, lambda: landed(spage, HUB), "imp6-sam") == "done"
+                late = imp_begin(spage, "imp6", caller="sam", target="pat")
+                pat0 = session_ids("pat")
+                t_exp, t_late = imp_t0[doc["id"]] + 130, imp_t0[late["id"]] + 125
+                errors = []
+                for at, what in sorted([(t_exp, "expiry"), (t_late, "late")]):
+                    time.sleep(max(0, at - time.time()))
+                    try:
+                        if what == "late":
+                            resp = goto(spage, late["next"])
+                            base.shot(spage, "imp6-late-next")
+                            print(f"    sam's next after {time.time() - imp_t0[late['id']]:.0f} s: HTTP {resp and resp.status}", flush=True)
+                            assert resp and resp.status == 403 and spage.locator("#impersonating[data-mode=refused]").count() == 1, \
+                                f"late next: HTTP {resp and resp.status} {body(spage)[:200]!r}"
+                            assert session_ids("pat") == pat0, "pat got a session"
+                        else:
+                            resp = goto(page, ECHO_STD + "/")
+                            base.shot(page, "imp5-expired")
+                            text = body(page)
+                            # Ruling: group-gate's ended page, or (oauth2-proxy
+                            # re-authorizes: the token's exp is until) Keycloak's
+                            # sign-in page; never anything as alice.
+                            gg = page.locator("#impersonation-ended").count() == 1
+                            kce = page.locator("#impersonating[data-mode=ended]").count() == 1
+                            signin = page.url.startswith(REALM + "/") and page.locator("#authenticateWebAuthnButton").count() == 1
+                            print(f"    {time.time() - imp_t0[doc['id']]:.0f} s after the start: HTTP {resp and resp.status} at "
+                                  f"{page.url.split('?')[0]} (group-gate ended {gg}, Keycloak ended {kce}, sign-in page {signin})",
+                                  flush=True)
+                            assert "Hostname" not in text and "alice" not in text.replace("as alice has ended", ""), \
+                                f"alice's data after the expiry: {text[:200]!r}"
+                            assert gg or kce or signin, f"neither the ended page nor the sign-in page: {page.url.split('?')[0]} {text[:200]!r}"
+                            until("alice's impersonated Keycloak session gone", lambda: no_imp_session("alice", sids), 20, every=2)
+                    except Exception as e:  # noqa: BLE001
+                        errors.append(f"{what}: {e}")
+                end = until("impersonation.end expired", lambda: [x for x in audit_entries("impersonation.end")
+                                                                  if (x.get("detail") or "").startswith(doc["id"] + " · expired")], 30)
+                print(f"    end: {end[0].get('actor')} {end[0].get('detail')!r}", flush=True)
+                assert end[0].get("actor") == "portcullis", end
+                assert not errors, errors
+            finally:
+                ctx.close()
+                sctx.close()
+                imp_stop_admin()
+                imp_stop_admin("pat")
+        check("imp_expiry + imp_next_bound (late): after 2 min 10 s root's browser gets the ended page, within 20 s more "
+              "Keycloak has no impersonated session, the audit has \"expired\" by portcullis; meanwhile sam's start "
+              "opened after 125 s → 403 page, pat gets no session", imp_expiry_and_late_next)
+
+        # The refusals last: every refused start counts toward the caller's
+        # limit (10 a minute, then 429: run 43187789128), and root still
+        # had starts to make before.
+        def imp_refused_proofs():
+            needs("sam_synced")
+            # Reason first (rule 4, before the proof).
+            code, out = imp_post("root", "alice", {"reason": "ab", "code": "x", "code_verifier": "x", "nonce": "x"})
+            assert code == 400 and "type a reason" in out, f"reason ab: HTTP {code} {out[:200]}"
+
+            def refused(caller: str, page: Page, proof: dict, what: str) -> None:
+                code, out = imp_post(caller, "alice", dict(proof, reason=IMP_REASON), access_token(page))
+                print(f"    {what}: HTTP {code} {out.strip()[:100]!r}", flush=True)
+                assert code == 403 and "a fresh sign-in is required" in out, f"{what}: HTTP {code} {out[:200]}"
+            alice0 = session_ids("alice")
+            # sam's synced passkey.
+            ctx = new_context()
+            try:
+                page = ctx.new_page()
+                Key(page, synced=True, credentials=state["sam_synced"])
+                goto(page, PORTAL)
+                assert drive_kc(page, lambda: landed(page, MAIN), "imp-sam-synced") == "done"
+                refused("sam", page, fresh_code(page, "imp-sam-synced-fresh", HUB + "/"), "sam's synced-passkey proof")
+            finally:
+                ctx.close()
+            # root's browser certificate (created for this, revoked after).
+            rctx, rpage, rkey = root_session("imp-rootbc")
+            try:
+                proof = fresh_code(rpage, "imp-root-bc-create", PEOPLE + "/signin")
+                code, out = people_as("root", "POST", "/api/me/signin/browser-certificates", dict(proof, days=1))
+                assert code == 200, f"root's browser certificate: HTTP {code} {out[:200]}"
+                doc = json.loads(out)
+                mask(doc["password"])
+                state["imp_root_bc"] = doc["certificate"]["serial"]
+                # No touch: the SSO cookie alone (no prompt=login) in root's own session.
+                refused("root", rpage, fresh_code(rpage, "imp-root-sso", HUB + "/", fresh=False), "root's proof without a touch")
+                # bob's proof (another person's) with root's session.
+                bctx = new_context(client_cert=bob_cert, origins=(AUTH, MAIN))
+                try:
+                    bpage = bctx.new_page()
+                    goto(bpage, PORTAL)
+                    assert drive_kc(bpage, lambda: landed(bpage, MAIN), "imp-bob") == "done"
+                    bob_proof = fresh_code(bpage, "imp-bob-fresh", HUB + "/")
+                finally:
+                    bctx.close()
+                refused("root", rpage, bob_proof, "bob's proof with root's session")
+            finally:
+                rctx.close()
+            pctx = new_context(client_cert={"pfx": base64.b64decode(doc["p12"]), "passphrase": doc["password"]},
+                               origins=(AUTH, MAIN))
+            try:
+                ppage = pctx.new_page()
+                goto(ppage, PORTAL)
+                assert drive_kc(ppage, lambda: landed(ppage, MAIN), "imp-root-bc") == "done"
+                assert "file" in (token_claims(ppage).get("amr") or []), token_claims(ppage).get("amr")
+                refused("root", ppage, fresh_code(ppage, "imp-root-bc-fresh", HUB + "/"), "root's browser-certificate proof")
+            finally:
+                pctx.close()
+            assert session_ids("alice") <= alice0, "alice got a session"
+            assert not hub_ok("GET", "/api/impersonations").get("running"), "an impersonation runs"
+            refusals = [e for e in audit_entries("impersonation.start") if e.get("result") == "refused"]
+            assert len(refusals) >= 5, [(e.get("actor"), e.get("detail")) for e in refusals]
+        check("imp_refused_proofs: sam's synced-passkey proof, root's proof without a touch (SSO), bob's proof with root's "
+              "session and root's browser-certificate proof → 403 \"a fresh sign-in is required\"; reason \"ab\" → 400; "
+              "nothing started, refusals audited", imp_refused_proofs)
+
+        def imp_refused_targets():
+            body_ = {"reason": IMP_REASON, "code": "x", "code_verifier": "x", "nonce": "x"}
+            for target, want in (("root", "you can't sign in as yourself"), ("sam", "administrators can't be signed in as"),
+                                 ("portcullis-hub", "this account can't be signed in as"),
+                                 ("admin", "this account can't be signed in as")):
+                code, out = imp_post("root", target, body_)
+                print(f"    root → {target}: HTTP {code} {out.strip()[:80]!r}", flush=True)
+                assert code == 409 and want in out, f"{target}: HTTP {code} {out[:200]}"
+            needs("helped")  # carol holds sign_in_help (group hr)
+            for listener in (HUB_API, PEOPLE_API):
+                code, out = hub_as("carol", "POST", "/api/directory/users/alice/impersonation", body_, base_url=listener)
+                assert code == 403, f"carol (sign_in_help) on {listener}: HTTP {code} {out[:200]}"
+            view = people_json("carol", "GET", "/api/directory/users/alice/signin")
+            assert view["can"].get("impersonate") is False and view.get("impersonation") is None, view["can"]
+
+        check("imp_refused_targets: root on himself, on sam (an administrator), on portcullis-hub and admin → 409; carol "
+              "(sign_in_help) → 403 on both listeners", imp_refused_targets)
+
+        # Part 3's leftovers: root's browser certificate, AI off.
+        if "imp_root_bc" in state:
+            code, out = people_as("root", "DELETE", "/api/me/signin/certificates/" + urllib.parse.quote(state["imp_root_bc"], safe=""))
+            print(f"    cleanup: root's browser certificate: HTTP {code}", flush=True)
+        if state.get("ai_on"):
+            code, out = hub("PUT", "/api/ai/settings", {"enabled": False})
+            print(f"    cleanup: AI off: HTTP {code}", flush=True)
+
+        # ── every passkey kind identified (test server 2026-11-12: a drifted
+        # passwordless policy, conveyance none, registered a YubiKey as
+        # synced; the job drifts it before any registration and expects
+        # `keycloak configure` to restore direct). One credential of each
+        # kind through a real setup link: rita with `./portcullis invite
+        # --replace-keys` (security key), bob (synced) and pat (device-bound:
+        # Chromium's virtual authenticators all share one AAGUID, so the
+        # fixture names it passkey_device while pat registers) through the
+        # Hub's setup link. ──
+        KIND = {"security_key": ("portcullis-security-key", "hwk"), "passkey_device": ("portcullis-device-passkey", "dpk"),
+                "passkey_synced": ("webauthn-passwordless", "spk")}
+
+        def fixture_kind(kind: str) -> None:
+            doc = json.loads(original_fixture)
+            doc[AAGUID] = dict(doc[AAGUID], kind=kind)
+            write_fixture(json.dumps(doc, indent=2).encode() + b"\n")
+            kick()
+            until(f"signin-keycloak.json lists the virtual key as {kind}",
+                  lambda: (published()["authenticators"].get(AAGUID) or {}).get("kind") == kind, 90)
+
+        def hub_setup_link(user: str) -> str:
+            code, out = hub("POST", f"/api/directory/users/{user}/invite", {})
+            m = SETUP_LINK.search(json.dumps(out) if not isinstance(out, str) else out)
+            if m:
+                mask(m.group(0))
+            assert code == 200 and m, f"the Hub's setup link for {user}: HTTP {code} {redact(str(out))[:200]}"
+            raw = (out.get("url") if isinstance(out, dict) else None) or m.group(0)
+            mask(raw)
+            return raw
+
+        def kind_identified(user: str, kind: str, link: str, synced: bool = False, transport: str = "usb",
+                            old: list | None = None) -> None:
+            ctype, amr_code = KIND[kind]
+            mark = len(kc_log())
+            ctx = new_context()
+            try:
+                page = ctx.new_page()
+                key = Key(page, synced=synced, transport=transport)
+                goto(page, link)
+                base.passkey_flow(page, until=PORTAL, label=f"{user}-{kind}", expect_stepups=1)
+                creds = key.credentials()
+                assert key.registered == 1 and len(creds) == 1, (key.registered, creds)
+            finally:
+                ctx.close()
+            types = kc_types(user)
+            print(f"    {user}: Keycloak types {types}", flush=True)
+            assert types == [ctype], f"{user}: {types} (want [{ctype}])"
+            line = re.search(rf"passkey registered for {re.escape(user)}: AAGUID ([0-9a-f-]{{36}}), kind (\w+)", kc_log()[mark:])
+            assert line, f"no registration line for {user}"
+            print(f"    {user}: {line.group(0)}", flush=True)
+            assert line.group(2) == kind, f"{user} registered as {line.group(2)} (want {kind})"
+            if kind != "passkey_synced":
+                assert line.group(1) == AAGUID and set(line.group(1)) != {"0", "-"}, f"AAGUID {line.group(1)}"
+            if old:
+                ids = {raw_id(c["credentialId"]) for c in old}
+                assert raw_id(creds[0]["credentialId"]) not in ids, "--replace-keys kept the old credential"
+            # The Sign-in page: the passkey under its kind only.
+
+            def listed():
+                rows = {m["id"]: m for m in people_json(user, "GET", "/api/me/signin")["methods"]}
+                others = [k for k in KIND if k != kind and (rows[k]["state"] == "set" or rows[k].get("passkeys"))]
+                return rows[kind]["state"] == "set" and len(rows[kind].get("passkeys") or []) == 1 and not others and rows
+            rows = until(f"{user}'s /api/me/signin lists one {kind}", listed, 60, every=3)
+            print(f"    {user}: /api/me/signin {[(k, rows[k]['state']) for k in KIND]}", flush=True)
+            # A sign-in with it: amr and the LOGIN event's pc_methods.
+            t0 = int(time.time() * 1000) - 2000
+            ctx = new_context()
+            try:
+                page = ctx.new_page()
+                Key(page, synced=synced, transport=transport, credentials=creds)
+                goto(page, PORTAL)
+                assert drive_kc(page, lambda: page.url.startswith(PORTAL) and "Signed in as" in body(page),
+                                f"{user}-{kind}-signin") == "done"
+                amr = token_claims(page).get("amr") or []
+            finally:
+                ctx.close()
+            others = {KIND[k][1] for k in KIND if k != kind}
+            assert amr_code in amr and not (others & set(amr)), f"{user}: amr {amr} (want {amr_code}, none of {others})"
+
+            def login():
+                ev = [e for e in kc_events(user, "LOGIN") if e.get("time", 0) >= t0]
+                return [(e.get("details") or {}).get("pc_methods", "") for e in ev]
+            pcm = until(f"{user}'s LOGIN event", login, 20, every=2)
+            print(f"    {user}: amr {amr}, LOGIN pc_methods {pcm}", flush=True)
+            assert kind in pcm and not any(k in m for m in pcm for k in KIND if k != kind), pcm
+
+        def passkey_kinds_identified():
+            pol = kc("")
+            policy = {k: pol.get(k) for k in ("webAuthnPolicyPasswordlessAttestationConveyancePreference",
+                                              "webAuthnPolicyPasswordlessAuthenticatorAttachment",
+                                              "webAuthnPolicyPasswordlessRequireResidentKey",
+                                              "webAuthnPolicyPasswordlessUserVerificationRequirement")}
+            assert list(policy.values()) == ["direct", "not specified", "Yes", "required"], policy
+            errors = []
+            # security_key: the operator's lost-key path.
+            old = kc_types("rita")
+            uid = kc_user_id("rita")
+            old_creds = [c for c in kc(f"/users/{uid}/credentials") if c["type"] in PASSKEY_TYPES]
+            out = subprocess.run(["./portcullis", "invite", "rita", "--replace-keys", "--to", "portal", "--json"],
+                                 capture_output=True, text=True)
+            assert out.returncode == 0, f"portcullis invite --replace-keys rita: exit {out.returncode} {out.stderr[-300:]}"
+            link = json.loads(out.stdout)["url"]
+            mask(link)
+            print(f"    rita before --replace-keys: {old}", flush=True)
+            assert kc_types("rita") == [], f"--replace-keys left {kc_types('rita')}"
+            try:
+                kind_identified("rita", "security_key", link)
+                # (the LDAP federation's password entry has no id: passkeys only)
+                gone = {c.get("id") for c in old_creds} & {c.get("id") for c in kc(f"/users/{uid}/credentials")
+                                                          if c.get("type") in PASSKEY_TYPES}
+                assert not gone, "rita's old credential is still there"
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"security_key: {redact(str(e))}")
+            try:
+                kind_identified("bob", "passkey_synced", hub_setup_link("bob"), synced=True)
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"passkey_synced: {redact(str(e))}")
+            try:
+                fixture_kind("passkey_device")
+                kind_identified("pat", "passkey_device", hub_setup_link("pat"), transport="internal")
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"passkey_device: {redact(str(e))}")
+            finally:
+                write_fixture(original_fixture)
+                kick()
+                until("signin-keycloak.json lists the virtual key as security_key again",
+                      lambda: (published()["authenticators"].get(AAGUID) or {}).get("kind") == "security_key", 90)
+            assert not errors, errors
+        check("passkey_kinds_identified: the realm's passwordless policy is direct / not specified / resident key / UV "
+              "(after the job drifted it and configure restored it); a security key (rita, ./portcullis invite "
+              "--replace-keys), a synced passkey (bob) and a device-bound passkey (pat; the fixture's kind "
+              "passkey_device) through setup links: each stored under its Keycloak type, logged with its kind (a "
+              "non-zero AAGUID), listed under its method only on /api/me/signin, signing in with amr hwk / spk / dpk and "
+              "LOGIN pc_methods of its kind", passkey_kinds_identified)
 
         # ── TLS follows the switches (last: it restarts apps) ──
         def tls_follows_switch():
