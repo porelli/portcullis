@@ -268,7 +268,8 @@ case "$p" in
   "$R/client-scopes/acr-id/protocol-mappers/models")
     jq -sc --arg p "$p" '[.[] | select(.m == "POST" and .p == $p) | .b | fromjson]' "$KC_LOG" ;;
   "$R/authentication/required-actions/portcullis-impersonation-notice")
-    jq -sc '[.[] | select(.m == "PUT" and (.p | endswith("/required-actions/portcullis-impersonation-notice"))) | .b | fromjson] | last // {}' "$KC_LOG" ;;
+    jq -sc '[.[] | select(.m == "PUT" and (.p | endswith("/required-actions/portcullis-impersonation-notice"))) | .b | fromjson] | last
+      // {"alias":"portcullis-impersonation-notice","name":"Impersonation notice","providerId":"portcullis-impersonation-notice","enabled":false,"defaultAction":false,"priority":90,"config":{}}' "$KC_LOG" ;;
   # A drifted passkey policy (the test server's); the realm PUTs configure
   # sent are applied on top unless KC_REALM_KEEP is set (Keycloak 26.8
   # keeping the policy).
@@ -336,9 +337,9 @@ expect_eq "keycloak configure: forward-auth client PUT drops default.acr.values"
   "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis/clients/fwd-uuid") | .b | fromjson | .attributes["default.acr.values"] // "none"] | unique' "$WORK/kc/log")" '[""]'
 expect_eq "keycloak configure: stock webauthn-register (two-factor) required action disabled" \
   "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis/authentication/required-actions/webauthn-register") | .b | fromjson | .enabled] | unique' "$WORK/kc/log")" '[false]'
-expect_eq "keycloak configure (stub admin API): the impersonation mapper POSTed onto the acr scope, the notice action registered" \
-  "$(jq -sc '[.[] | select(.m == "POST") | select(.p | test("acr-id/protocol-mappers|register-required-action")) | .p + " " + (.b | fromjson | .protocolMapper // .providerId)]' "$WORK/kc/log")" \
-  '["/admin/realms/portcullis/client-scopes/acr-id/protocol-mappers/models oidc-amr-mapper","/admin/realms/portcullis/client-scopes/acr-id/protocol-mappers/models portcullis-impersonation","/admin/realms/portcullis/authentication/register-required-action portcullis-impersonation-notice"]'
+expect_eq "keycloak configure (stub admin API): the impersonation mapper POSTed onto the acr scope, the disabled notice action enabled (never registered)" \
+  "$(jq -sc '[.[] | select(.m != "GET") | select(.p | test("acr-id/protocol-mappers|required-actions/portcullis-impersonation-notice")) | .m + " " + .p + " " + (.b | fromjson | .protocolMapper // (.enabled | tostring))]' "$WORK/kc/log")" \
+  '["POST /admin/realms/portcullis/client-scopes/acr-id/protocol-mappers/models oidc-amr-mapper","POST /admin/realms/portcullis/client-scopes/acr-id/protocol-mappers/models portcullis-impersonation","PUT /admin/realms/portcullis/authentication/required-actions/portcullis-impersonation-notice true"]'
 
 # ── keycloak configure: the impersonation mapper and the notice action
 # (contract §8, sign-in part 3; F5), with kc_get / kc_send stubbed ──
@@ -362,9 +363,6 @@ imp_configure() {
         */authentication/required-actions/portcullis-impersonation-notice)
           if [ -z "${KC_IMP_KEEP:-}" ] && grep -q '^PUT .*/required-actions/' "$KC_IMP_LOG"; then
             grep '^PUT .*/required-actions/' "$KC_IMP_LOG" | tail -n1 | cut -d' ' -f3-
-          elif grep -q register-required-action "$KC_IMP_LOG"; then
-            # After a registration Keycloak has it (disabled, its own priority).
-            echo '{"alias":"portcullis-impersonation-notice","name":"Impersonation notice","providerId":"portcullis-impersonation-notice","enabled":false,"defaultAction":false,"priority":120,"config":{}}'
           else printf '%s' "$KC_IMP_RA"; fi ;;
         *) echo '{}' ;;
       esac
@@ -380,11 +378,13 @@ imp_configure() {
 }
 R=/portcullis
 IMP_RA_ON='{"alias":"portcullis-impersonation-notice","name":"Impersonation notice","providerId":"portcullis-impersonation-notice","enabled":true,"defaultAction":false,"priority":90,"config":{}}'
-expect_eq "keycloak configure ensures the impersonation mapper on acr (once, by protocolMapper) and the required action (stubbed kc_get / kc_send): nothing there → mapper POSTed, action registered and enabled" \
-  "$(imp_configure '[{"name":"amr","protocolMapper":"oidc-amr-mapper"}]' '')" \
+expect_eq "keycloak configure ensures the impersonation mapper on acr (once, by protocolMapper) and the required action (stubbed kc_get / kc_send): no mapper, the action disabled at another priority → mapper POSTed, action enabled at 90" \
+  "$(imp_configure '[{"name":"amr","protocolMapper":"oidc-amr-mapper"}]' "$(jq -c '.enabled = false | .priority = 120' <<<"$IMP_RA_ON")")" \
   "POST $R/client-scopes/acr-id/protocol-mappers/models {\"config\":{\"access.token.claim\":\"true\",\"id.token.claim\":\"true\",\"userinfo.token.claim\":\"true\"},\"name\":\"impersonation\",\"protocol\":\"openid-connect\",\"protocolMapper\":\"portcullis-impersonation\"}
-POST $R/authentication/register-required-action {\"name\":\"Impersonation notice\",\"providerId\":\"portcullis-impersonation-notice\"}
 PUT $R/authentication/required-actions/portcullis-impersonation-notice {\"alias\":\"portcullis-impersonation-notice\",\"config\":{},\"defaultAction\":false,\"enabled\":true,\"name\":\"Impersonation notice\",\"priority\":90,\"providerId\":\"portcullis-impersonation-notice\"}"
+expect_eq "keycloak configure fails, without registering or PUTting it, when the realm lacks the notice action (a fresh realm import has it)" \
+  "$(imp_configure '[{"protocolMapper":"portcullis-impersonation"}]' '' | tail -n1):$(imp_configure '[{"protocolMapper":"portcullis-impersonation"}]' '{}' | grep -c required-action || true)" \
+  "notice exit 1:0"
 expect_eq "keycloak configure: a mapper with protocolMapper portcullis-impersonation (any name) and the enabled action → no write" \
   "$(imp_configure '[{"name":"amr","protocolMapper":"oidc-amr-mapper"},{"name":"renamed","protocolMapper":"portcullis-impersonation"}]' "$IMP_RA_ON")" ""
 expect_eq "keycloak configure: the action registered but disabled (or a default action) → one PUT, no registration" \

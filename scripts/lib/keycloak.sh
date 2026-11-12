@@ -477,17 +477,6 @@ keycloak_configure() {
   echo "    SAML metadata: https://auth.$domain/realms/$KC_REALM/protocol/saml/descriptor"
 }
 
-# Client scope that carries `email` but never `email_verified`. LLDAP lets
-# users edit their own mail, so the built-in `email` scope always says
-# email_verified=false; apps that refuse that value but accept the claim
-# being absent (Vaultwarden SSO signups) get this scope instead of `email`
-# (Hub: keycloak_clients[].email_verified_claim: false). Identity stays the
-# sub / username; the email is still unverified, just not labelled.
-KC_EMAIL_UNVERIFIED_SCOPE="email-unverified"
-
-# _kc_email_unverified_scope — create the scope, or reconcile an existing one
-# to exactly one `email` mapper (any other mapper, e.g. an added
-# "email verified", is deleted).
 # _kc_impersonation_mapper <acr scope id> — the sign-in extension's
 # `impersonation` mapper (protocolMapper portcullis-impersonation: the
 # act / pc_imp claims of a session as someone else, contract §8 / §8.1
@@ -524,20 +513,16 @@ _kc_impersonation_mapper() {
 # realm holds the same entry).
 KC_IMP_NOTICE='{"alias":"portcullis-impersonation-notice","name":"Impersonation notice","providerId":"portcullis-impersonation-notice","enabled":true,"defaultAction":false,"priority":90,"config":{}}'
 
-# _kc_impersonation_notice — registers the extension's
-# portcullis-impersonation-notice required action when the realm doesn't
-# have it (a realm imported before it existed) and keeps it enabled, not a
-# default action, at its priority. The events config (IMPERSONATE) is the
+# _kc_impersonation_notice — keeps the extension's
+# portcullis-impersonation-notice required action (realm-export.json has
+# it) enabled, not a default action, at its priority; fails when the realm
+# lacks it or it can't be enabled. The events config (IMPERSONATE) is the
 # Hub's: never touched here.
 _kc_impersonation_notice() {
   local ra=portcullis-impersonation-notice cur code
   cur="$(kc_get "/$KC_REALM/authentication/required-actions/$ra")"
-  if ! printf '%s' "$cur" | jq -e --arg a "$ra" 'type == "object" and .alias == $a' >/dev/null 2>&1; then
-    code="$(jq -c '{providerId, name}' <<<"$KC_IMP_NOTICE" \
-      | kc_send POST "/$KC_REALM/authentication/register-required-action")"
-    _kc_report "$ra required action registered" "$code" 204 201 || true
-    cur="$(kc_get "/$KC_REALM/authentication/required-actions/$ra")"
-  fi
+  printf '%s' "$cur" | jq -e --arg a "$ra" 'type == "object" and .alias == $a' >/dev/null 2>&1 \
+    || fail "the realm lacks the $ra required action (a fresh realm import has it): people wouldn't be told an administrator signed in as them. Check Keycloak (is the portcullis-keycloak image running?)."
   if ! printf '%s' "$cur" | jq -e --argjson w "$KC_IMP_NOTICE" '.enabled == true and .defaultAction == false and .priority == $w.priority' >/dev/null 2>&1; then
     code="$(jq -nc --arg c "$cur" --argjson w "$KC_IMP_NOTICE" \
         '((try ($c | fromjson) catch {}) | if type == "object" then . else {} end) + ($w | {alias, providerId, enabled, defaultAction, priority})' \
@@ -548,10 +533,21 @@ _kc_impersonation_notice() {
   # Fail closed: without it the person is never told an administrator
   # signed in as them.
   printf '%s' "$cur" | jq -e --arg a "$ra" 'type == "object" and .alias == $a and .enabled == true' >/dev/null 2>&1 \
-    || fail "the $ra required action is missing or disabled in Keycloak: people wouldn't be told an administrator signed in as them. Check Keycloak (is the portcullis-keycloak image running?), then run ./portcullis keycloak configure again."
+    || fail "the $ra required action can't be enabled in Keycloak: people wouldn't be told an administrator signed in as them. Check Keycloak (is the portcullis-keycloak image running?), then run ./portcullis keycloak configure again."
   echo "    $ra required action enabled"
 }
 
+# Client scope that carries `email` but never `email_verified`. LLDAP lets
+# users edit their own mail, so the built-in `email` scope always says
+# email_verified=false; apps that refuse that value but accept the claim
+# being absent (Vaultwarden SSO signups) get this scope instead of `email`
+# (Hub: keycloak_clients[].email_verified_claim: false). Identity stays the
+# sub / username; the email is still unverified, just not labelled.
+KC_EMAIL_UNVERIFIED_SCOPE="email-unverified"
+
+# _kc_email_unverified_scope — create the scope, or reconcile an existing one
+# to exactly one `email` mapper (any other mapper, e.g. an added
+# "email verified", is deleted).
 _kc_email_unverified_scope() {
   local scope_id rep mappers mid code
   local mapper='{name: "email", protocol: "openid-connect", protocolMapper: "oidc-usermodel-property-mapper",

@@ -2534,7 +2534,8 @@ def _signin_page(title: str, body: str, banner: str = "") -> bytes:
 def render_stepup_page(app: str, method: str, url: str, banner: str = "", after_setup: bool = False) -> bytes:
     """"<App> needs <method>" with a Continue button (#stepup-continue) to
     the step-up URL. After a setup link (`after_setup`: the session's amr
-    is `inv`, which meets no rule) the person has just added the key, so
+    is `inv`, which meets no rule, and the step-up asks for a passkey)
+    the person has just added the key, so
     the page says so and asks them to sign in with it, never "needs a
     passkey". `banner` is for completeness (every group-gate page takes
     one): an impersonated request never gets a step-up (D39)."""
@@ -2905,7 +2906,10 @@ class Handler(BaseHTTPRequestHandler):
         method = choose_stepup(rule, have, set_up, held=held)
         if method is not None:
             url = stepup_url(host, method, extra=kind == "extra")
-            self._signin_answer(render_stepup_page(app, method, url, after_setup="inv" in amr), "stepup",
+            # "You're set up" only when the step-up asks for a passkey (the
+            # kind the setup link just added), never for a password.
+            after_setup = "inv" in amr and method in (*PASSKEY_KINDS, "passkey")
+            self._signin_answer(render_stepup_page(app, method, url, after_setup=after_setup), "stepup",
                                 f"STEPUP {what} pc_method={method}", url)
             return True
         self._signin_answer(render_needs_page(app, have, rule, set_up, doc["add_stronger"], DOMAIN),

@@ -883,6 +883,17 @@ class SigninV6Test(GateTest):
         code, hdrs, body = self.page("grafana.example.com", ["pwd"])
         self.assertIn("grafana.example.com needs a passkey", body)
         self.assertNotIn('id="setup-done"', body)
+        # A setup-link session asked for something that isn't a passkey
+        # (here a password) gets the normal "needs a …" page.
+        write_policy({"methods": sorted(BASE["methods"] + ["password"]),
+                      "templates": {**BASE["templates"], "basic": {"op": "any", "items": ["password"]}},
+                      "default": "basic"})
+        code, hdrs, body = self.page("grafana.example.com", ["inv"])
+        self.assertEqual(code, 403)
+        self.assertIn("pc_method=password", hdrs.get("X-Stepup-URL", ""))
+        self.assertIn("grafana.example.com needs a password", body)
+        self.assertNotIn('id="setup-done"', body)
+        write_policy({"templates": {**BASE["templates"], "basic": BASIC_COMPILED}, "default": "basic"})
         # A setup-link session counts as not known in `people` (contract
         # §5): its new passkey may not be in the inventory yet, so neither a
         # stale entry nor an empty one turns the step-up into needs-stronger.
