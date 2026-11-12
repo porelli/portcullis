@@ -310,7 +310,14 @@ def main() -> int:
         def domains_dns_panel():
             # Settings → Domains: the enrolled domain's DNS panel (contract
             # §12.3): its CAA rows are ok and the CA would issue.
-            assert goto_ok(page, HUB + "/#settings/domains"), "admin cannot open Settings"
+            # A full load of the Hub page (a goto that only changes the hash
+            # is a same-document navigation with no response), then the
+            # Settings tab.
+            assert goto_ok(page, HUB + "/"), "admin cannot open the Hub"
+            # (showTab: the tab's own handler; a click can wait on the
+            # list's periodic re-render.)
+            page.wait_for_function("typeof showTab === 'function'", timeout=TIMEOUT_MS)
+            page.evaluate("() => showTab('settings')")
             btn = page.locator(f'[data-domain-dns="{EXTRA}"]')
             btn.wait_for(timeout=TIMEOUT_MS)
             btn.click()
