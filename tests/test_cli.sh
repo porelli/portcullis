@@ -423,7 +423,7 @@ pk_status() {
     proxy_dns_shadows() { :; }
     domains_status_lines() { :; }
     _st_mcp_refusing() { :; }
-    kc_login() { KC_TOKEN=stub; }
+    kc_login() { :; }
     metrics_textfile_write() { cat; }
     kc_get() {
       case "$1" in

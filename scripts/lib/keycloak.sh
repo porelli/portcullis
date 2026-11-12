@@ -88,8 +88,8 @@ kc_send() {
 # conveyance but direct the browser zeroes the AAGUID and sends no
 # attestation, so the extension counts every new passkey as synced.
 kc_passkey_policy_drift() {
-  kc_get "/$KC_REALM" 2>/dev/null | jq -r --argjson w "$KC_REALM_SIGNIN_SETTINGS" '
-      if type != "object" or (.realm // "") == "" then "the realm can'"'"'t be read"
+  kc_get "/$KC_REALM" 2>/dev/null | jq -rs --argjson w "$KC_REALM_SIGNIN_SETTINGS" '
+      .[0] | if type != "object" or (.realm // "") == "" then "the realm can'"'"'t be read"
       else
         [["webAuthnPolicyPasswordlessAttestationConveyancePreference", "attestation"],
          ["webAuthnPolicyPasswordlessAuthenticatorAttachment", "attachment"],
@@ -108,9 +108,9 @@ kc_passkey_actions_drift() {
   local ra want
   for ra in webauthn-register-passwordless:true webauthn-register:false; do
     want="${ra#*:}" ra="${ra%%:*}"
-    kc_get "/$KC_REALM/authentication/required-actions/$ra" 2>/dev/null | jq -r --arg a "$ra" --argjson w "$want" '
+    kc_get "/$KC_REALM/authentication/required-actions/$ra" 2>/dev/null | jq -rs --arg a "$ra" --argjson w "$want" '
         def state: if . then "enabled" else "disabled" end;
-        if type != "object" or (.enabled | type) != "boolean" then "required action \($a) can'"'"'t be read"
+        .[0] | if type != "object" or (.enabled | type) != "boolean" then "required action \($a) can'"'"'t be read"
         elif .enabled != $w then "required action \($a) \(.enabled | state) (wanted \($w | state))"
         else empty end' 2>/dev/null || echo "required action $ra can't be read"
   done
