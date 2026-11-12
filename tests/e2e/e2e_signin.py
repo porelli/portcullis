@@ -2723,82 +2723,8 @@ def main() -> int:
         check("imp_stop_elsewhere: sam's stop_impersonation {user: alice} (Hub MCP) ends it; root's browser gets "
               "group-gate's ended page within 5 s; Keycloak's session gone; audited stopped by sam", imp_stop_elsewhere)
 
-        def imp_refused_proofs():
-            needs("sam_synced")
-            # Reason first (rule 4, before the proof).
-            code, out = imp_post("root", "alice", {"reason": "ab", "code": "x", "code_verifier": "x", "nonce": "x"})
-            assert code == 400 and "type a reason" in out, f"reason ab: HTTP {code} {out[:200]}"
-
-            def refused(caller: str, page: Page, proof: dict, what: str) -> None:
-                code, out = imp_post(caller, "alice", dict(proof, reason=IMP_REASON), access_token(page))
-                print(f"    {what}: HTTP {code} {out.strip()[:100]!r}", flush=True)
-                assert code == 403 and "a fresh sign-in is required" in out, f"{what}: HTTP {code} {out[:200]}"
-            alice0 = session_ids("alice")
-            # sam's synced passkey.
-            ctx = new_context()
-            try:
-                page = ctx.new_page()
-                Key(page, synced=True, credentials=state["sam_synced"])
-                goto(page, PORTAL)
-                assert drive_kc(page, lambda: landed(page, MAIN), "imp-sam-synced") == "done"
-                refused("sam", page, fresh_code(page, "imp-sam-synced-fresh", HUB + "/"), "sam's synced-passkey proof")
-            finally:
-                ctx.close()
-            # root's browser certificate (created for this, revoked after).
-            rctx, rpage, rkey = root_session("imp-rootbc")
-            try:
-                proof = fresh_code(rpage, "imp-root-bc-create", PEOPLE + "/signin")
-                code, out = people_as("root", "POST", "/api/me/signin/browser-certificates", dict(proof, days=1))
-                assert code == 200, f"root's browser certificate: HTTP {code} {out[:200]}"
-                doc = json.loads(out)
-                mask(doc["password"])
-                state["imp_root_bc"] = doc["certificate"]["serial"]
-                # No touch: the SSO cookie alone (no prompt=login) in root's own session.
-                refused("root", rpage, fresh_code(rpage, "imp-root-sso", HUB + "/", fresh=False), "root's proof without a touch")
-                # bob's proof (another person's) with root's session.
-                bctx = new_context(client_cert=bob_cert, origins=(AUTH, MAIN))
-                try:
-                    bpage = bctx.new_page()
-                    goto(bpage, PORTAL)
-                    assert drive_kc(bpage, lambda: landed(bpage, MAIN), "imp-bob") == "done"
-                    bob_proof = fresh_code(bpage, "imp-bob-fresh", HUB + "/")
-                finally:
-                    bctx.close()
-                refused("root", rpage, bob_proof, "bob's proof with root's session")
-            finally:
-                rctx.close()
-            pctx = new_context(client_cert={"pfx": base64.b64decode(doc["p12"]), "passphrase": doc["password"]},
-                               origins=(AUTH, MAIN))
-            try:
-                ppage = pctx.new_page()
-                goto(ppage, PORTAL)
-                assert drive_kc(ppage, lambda: landed(ppage, MAIN), "imp-root-bc") == "done"
-                assert "file" in (token_claims(ppage).get("amr") or []), token_claims(ppage).get("amr")
-                refused("root", ppage, fresh_code(ppage, "imp-root-bc-fresh", HUB + "/"), "root's browser-certificate proof")
-            finally:
-                pctx.close()
-            assert session_ids("alice") <= alice0, "alice got a session"
-            assert not hub_ok("GET", "/api/impersonations").get("running"), "an impersonation runs"
-            refusals = [e for e in audit_entries("impersonation.start") if e.get("result") == "refused"]
-            assert len(refusals) >= 5, [(e.get("actor"), e.get("detail")) for e in refusals]
-        check("imp_refused_proofs: sam's synced-passkey proof, root's proof without a touch (SSO), bob's proof with root's "
-              "session and root's browser-certificate proof → 403 \"a fresh sign-in is required\"; reason \"ab\" → 400; "
-              "nothing started, refusals audited", imp_refused_proofs)
-
-        def imp_refused_targets():
+        def imp_switch_off():
             body_ = {"reason": IMP_REASON, "code": "x", "code_verifier": "x", "nonce": "x"}
-            for target, want in (("root", "you can't sign in as yourself"), ("sam", "administrators can't be signed in as"),
-                                 ("portcullis-hub", "this account can't be signed in as"),
-                                 ("admin", "this account can't be signed in as")):
-                code, out = imp_post("root", target, body_)
-                print(f"    root → {target}: HTTP {code} {out.strip()[:80]!r}", flush=True)
-                assert code == 409 and want in out, f"{target}: HTTP {code} {out[:200]}"
-            needs("helped")  # carol holds sign_in_help (group hr)
-            for listener in (HUB_API, PEOPLE_API):
-                code, out = hub_as("carol", "POST", "/api/directory/users/alice/impersonation", body_, base_url=listener)
-                assert code == 403, f"carol (sign_in_help) on {listener}: HTTP {code} {out[:200]}"
-            view = people_json("carol", "GET", "/api/directory/users/alice/signin")
-            assert view["can"].get("impersonate") is False and view.get("impersonation") is None, view["can"]
             # The switch off ends a running one, and refuses a start.
             ctx, page, _ = root_session("imp3")
             switched = False
@@ -2821,9 +2747,8 @@ def main() -> int:
                 if switched:
                     hub_ok("PUT", "/api/signin/impersonation", {"allowed": True})
                 imp_stop_admin()
-        check("imp_refused_targets: root on himself, on sam (an administrator), on portcullis-hub and admin → 409; carol "
-              "(sign_in_help) → 403 on both listeners; the switch off ends the running one (ended page, session gone, "
-              "how switched_off) and a start → 409; switched back on", imp_refused_targets)
+        check("imp_refused_targets (switch): the switch off ends the running one (ended page, Keycloak's session "
+              "gone, how switched_off) and a start → 409; switched back on", imp_switch_off)
 
         def imp_next_bound():
             needs("root_creds")
@@ -2908,6 +2833,89 @@ def main() -> int:
         check("imp_expiry + imp_next_bound (late): after 2 min 10 s root's browser gets the ended page, within 20 s more "
               "Keycloak has no impersonated session, the audit has \"expired\" by portcullis; meanwhile sam's start "
               "opened after 125 s → 403 page, pat gets no session", imp_expiry_and_late_next)
+
+        # The refusals last: every refused start counts toward the caller's
+        # limit (10 a minute, then 429: run 43187789128), and root still
+        # had starts to make before.
+        def imp_refused_proofs():
+            needs("sam_synced")
+            # Reason first (rule 4, before the proof).
+            code, out = imp_post("root", "alice", {"reason": "ab", "code": "x", "code_verifier": "x", "nonce": "x"})
+            assert code == 400 and "type a reason" in out, f"reason ab: HTTP {code} {out[:200]}"
+
+            def refused(caller: str, page: Page, proof: dict, what: str) -> None:
+                code, out = imp_post(caller, "alice", dict(proof, reason=IMP_REASON), access_token(page))
+                print(f"    {what}: HTTP {code} {out.strip()[:100]!r}", flush=True)
+                assert code == 403 and "a fresh sign-in is required" in out, f"{what}: HTTP {code} {out[:200]}"
+            alice0 = session_ids("alice")
+            # sam's synced passkey.
+            ctx = new_context()
+            try:
+                page = ctx.new_page()
+                Key(page, synced=True, credentials=state["sam_synced"])
+                goto(page, PORTAL)
+                assert drive_kc(page, lambda: landed(page, MAIN), "imp-sam-synced") == "done"
+                refused("sam", page, fresh_code(page, "imp-sam-synced-fresh", HUB + "/"), "sam's synced-passkey proof")
+            finally:
+                ctx.close()
+            # root's browser certificate (created for this, revoked after).
+            rctx, rpage, rkey = root_session("imp-rootbc")
+            try:
+                proof = fresh_code(rpage, "imp-root-bc-create", PEOPLE + "/signin")
+                code, out = people_as("root", "POST", "/api/me/signin/browser-certificates", dict(proof, days=1))
+                assert code == 200, f"root's browser certificate: HTTP {code} {out[:200]}"
+                doc = json.loads(out)
+                mask(doc["password"])
+                state["imp_root_bc"] = doc["certificate"]["serial"]
+                # No touch: the SSO cookie alone (no prompt=login) in root's own session.
+                refused("root", rpage, fresh_code(rpage, "imp-root-sso", HUB + "/", fresh=False), "root's proof without a touch")
+                # bob's proof (another person's) with root's session.
+                bctx = new_context(client_cert=bob_cert, origins=(AUTH, MAIN))
+                try:
+                    bpage = bctx.new_page()
+                    goto(bpage, PORTAL)
+                    assert drive_kc(bpage, lambda: landed(bpage, MAIN), "imp-bob") == "done"
+                    bob_proof = fresh_code(bpage, "imp-bob-fresh", HUB + "/")
+                finally:
+                    bctx.close()
+                refused("root", rpage, bob_proof, "bob's proof with root's session")
+            finally:
+                rctx.close()
+            pctx = new_context(client_cert={"pfx": base64.b64decode(doc["p12"]), "passphrase": doc["password"]},
+                               origins=(AUTH, MAIN))
+            try:
+                ppage = pctx.new_page()
+                goto(ppage, PORTAL)
+                assert drive_kc(ppage, lambda: landed(ppage, MAIN), "imp-root-bc") == "done"
+                assert "file" in (token_claims(ppage).get("amr") or []), token_claims(ppage).get("amr")
+                refused("root", ppage, fresh_code(ppage, "imp-root-bc-fresh", HUB + "/"), "root's browser-certificate proof")
+            finally:
+                pctx.close()
+            assert session_ids("alice") <= alice0, "alice got a session"
+            assert not hub_ok("GET", "/api/impersonations").get("running"), "an impersonation runs"
+            refusals = [e for e in audit_entries("impersonation.start") if e.get("result") == "refused"]
+            assert len(refusals) >= 5, [(e.get("actor"), e.get("detail")) for e in refusals]
+        check("imp_refused_proofs: sam's synced-passkey proof, root's proof without a touch (SSO), bob's proof with root's "
+              "session and root's browser-certificate proof → 403 \"a fresh sign-in is required\"; reason \"ab\" → 400; "
+              "nothing started, refusals audited", imp_refused_proofs)
+
+        def imp_refused_targets():
+            body_ = {"reason": IMP_REASON, "code": "x", "code_verifier": "x", "nonce": "x"}
+            for target, want in (("root", "you can't sign in as yourself"), ("sam", "administrators can't be signed in as"),
+                                 ("portcullis-hub", "this account can't be signed in as"),
+                                 ("admin", "this account can't be signed in as")):
+                code, out = imp_post("root", target, body_)
+                print(f"    root → {target}: HTTP {code} {out.strip()[:80]!r}", flush=True)
+                assert code == 409 and want in out, f"{target}: HTTP {code} {out[:200]}"
+            needs("helped")  # carol holds sign_in_help (group hr)
+            for listener in (HUB_API, PEOPLE_API):
+                code, out = hub_as("carol", "POST", "/api/directory/users/alice/impersonation", body_, base_url=listener)
+                assert code == 403, f"carol (sign_in_help) on {listener}: HTTP {code} {out[:200]}"
+            view = people_json("carol", "GET", "/api/directory/users/alice/signin")
+            assert view["can"].get("impersonate") is False and view.get("impersonation") is None, view["can"]
+
+        check("imp_refused_targets: root on himself, on sam (an administrator), on portcullis-hub and admin → 409; carol "
+              "(sign_in_help) → 403 on both listeners", imp_refused_targets)
 
         # Part 3's leftovers: root's browser certificate, AI off.
         if "imp_root_bc" in state:
