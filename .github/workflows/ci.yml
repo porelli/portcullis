@@ -3848,7 +3848,8 @@ jobs:
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-signin,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-signin ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-signin,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-signin ')
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 40 (part 3): the impersonation cases add the 2 min 10 s expiry wait.
+    timeout-minutes: 40
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
@@ -3861,6 +3862,9 @@ jobs:
         run: |
           ./portcullis init --env-only --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
+          # Signing in as someone else lasts at most 2 minutes in this job
+          # (every case; imp_expiry waits for it).
+          echo "IMPERSONATION_MAX_MINUTES=2" >> .env
           for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
             val="$(grep "^$v=" .env | cut -d= -f2-)"
             [ "$v" = KEYCLOAK_ADMIN ] || echo "::add-mask::$val"
@@ -3922,6 +3926,18 @@ jobs:
           images: ${{ runner.temp }}/images.txt
           name: e2e-signin
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      # imp_ai_refused: an AI token minted for alice before a start.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Build the MCP client (tests/e2e/mcpclient, go-sdk pinned in go.mod / go.sum)
+        timeout-minutes: 15
+        working-directory: tests/e2e/mcpclient
+        run: |
+          go mod verify
+          CGO_ENABLED=0 go build -trimpath -o "$RUNNER_TEMP/mcpclient" .
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Build enrollment UI (buildx, GitHub Actions layer cache)
@@ -4168,7 +4184,7 @@ jobs:
           certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
           certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
 
-      - name: Run the sign-in scenarios (methods, passkey kinds, pc_method, passwords, native OIDC, TLS, reclassify, pc_fresh, browser certificates, Sign-in page, help, history)
+      - name: Run the sign-in scenarios (methods, passkey kinds, pc_method, passwords, native OIDC, TLS, reclassify, pc_fresh, browser certificates, Sign-in page, help, history, signing in as someone else)
         env:
           E2E_ROOT_CERT: /tmp/e2e-secrets/root.crt
           E2E_ROOT_KEY: /tmp/e2e-secrets/root.key
@@ -4176,6 +4192,7 @@ jobs:
           E2E_BOB_KEY: /tmp/e2e-secrets/bob.key
           E2E_PAT_PASSWORD_FILE: /tmp/e2e-secrets/pat.password
           E2E_FIXTURE: /tmp/signin-fixture/extra-authenticators.json
+          E2E_MCPCLIENT: ${{ runner.temp }}/mcpclient
         run: |
           E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
           export E2E_HUB_SECRET
@@ -4199,7 +4216,7 @@ jobs:
           mkdir -p e2e-artifacts
           docker compose ps -a > e2e-artifacts/compose-ps.txt 2>&1 || true
           docker ps -a > e2e-artifacts/docker-ps.txt 2>&1 || true
-          for svc in traefik keycloak forward-auth group-gate lldap hub enroll; do
+          for svc in traefik keycloak forward-auth group-gate lldap hub enroll mcp-gate; do
             docker compose logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
           done
           docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" sh -c 'cat /d/group-gate-policy.json; echo; cat /d/signin-keycloak.json; ls -la /d /d/overrides; cat /d/overrides/*.yml' > e2e-artifacts/hub-data.txt 2>&1 || true
