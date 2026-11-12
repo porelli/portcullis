@@ -474,6 +474,15 @@
       "enabled": true,
       "defaultAction": false,
       "priority": 80
+    },
+    {
+      "alias": "portcullis-impersonation-notice",
+      "name": "Impersonation notice",
+      "providerId": "portcullis-impersonation-notice",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 90,
+      "config": {}
     }
   ],
   "components": {
