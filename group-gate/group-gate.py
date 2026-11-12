@@ -672,6 +672,38 @@ def _safe_url(u, domains=()) -> str:
     return u
 
 
+# The Raised-gate mark (branding concept-1-mark-dark.svg: every group-gate
+# page is dark) and the favicon (branding favicon.svg), byte copies of the
+# branding sources (tests/test_group_gate.py BrandingTest pins their
+# sha256). group-gate serves no static files: the favicon is a data: URL
+# (img-src data:) and the mark is inline SVG at the start of each <h1>.
+MARK_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <title>Portcullis:  (for dark backgrounds)</title>
+    <path fill="#e3ac52" d="M5 11h22v2H5z M5 17h22v2H5z M9 7h2v14l-1 2.5-1-2.5z M15 4h2v17l-1 2.5-1-2.5z M21 7h2v14l-1 2.5-1-2.5z"/>
+    <path fill="#e8edf5" d="M2 30V16a14 14 0 0 1 28 0v14h-3V16a11 11 0 0 0-22 0v14z"/>
+</svg>
+"""
+FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="32" height="32">
+  <title>Portcullis</title>
+  <!-- Concept 1, redrawn on a 16 px grid so tab icons stay crisp at 1x and 2x.
+       Light tabs: iron arch, brass gate. Dark tabs: mist arch, lantern gate. -->
+  <style>
+    .arch { fill: #1c2738; }
+    .gate { fill: #c48a2c; }
+    @media (prefers-color-scheme: dark) {
+      .arch { fill: #e8edf5; }
+      .gate { fill: #e3ac52; }
+    }
+  </style>
+  <path class="gate" d="M3 6h10v1H3z M3 9h10v1H3z M5 3h1v8H5z M7 2h2v9H7z M10 3h1v8h-1z"/>
+  <path class="arch" d="M1 15V8a7 7 0 0 1 14 0v7h-2V8a5 5 0 0 0-10 0v7z"/>
+</svg>
+"""
+FAVICON_LINK = ('<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,'
+                + base64.b64encode(FAVICON_SVG.encode()).decode() + '">')
+MARK_HTML = '<span class="pc-mark" aria-hidden="true">' + MARK_SVG.strip() + '</span>'
+
+
 # Same dark look as enroll's pages (enroll/web/*.html). Inline only, no
 # external assets; allowed by PORTAL_CSP through its hash.
 PORTAL_CSS = (
@@ -691,10 +723,13 @@ PORTAL_CSS = (
     # The impersonation banner (contract §5, render_banner).
     "#pc-imp-banner{background:#78350f;color:#fef3c7;padding:.6rem 1rem;text-align:center;font-size:.9rem}"
     "#pc-imp-banner a{color:#fff;font-weight:600;margin-left:.75rem}"
+    # The mark at the start of every <h1> (MARK_HTML).
+    ".pc-mark{display:inline-block;width:1.75rem;height:1.75rem;vertical-align:-.3rem;margin-right:.5rem}"
+    ".pc-mark svg{width:100%;height:100%}"
 )
 PORTAL_CSP = ("default-src 'none'; style-src 'sha256-"
               + base64.b64encode(hashlib.sha256(PORTAL_CSS.encode()).digest()).decode()
-              + "'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+              + "'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
 def render_portal(user: str, groups: set, apps, domain: str, domains=(), banner: str = "") -> bytes:
@@ -750,8 +785,8 @@ def render_portal(user: str, groups: set, apps, domain: str, domains=(), banner:
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         "<meta name=\"color-scheme\" content=\"dark\">"
-        f"<title>{e(domain)}</title><style>{PORTAL_CSS}</style></head><body>{banner}<main class=\"container\">"
-        f"<header><h1>{e(domain)}</h1><span class=\"user-badge\">Signed in as <strong>{e(user)}</strong></span></header>"
+        f"<title>{e(domain)}</title>{FAVICON_LINK}<style>{PORTAL_CSS}</style></head><body>{banner}<main class=\"container\">"
+        f"<header><h1>{MARK_HTML}{e(domain)}</h1><span class=\"user-badge\">Signed in as <strong>{e(user)}</strong></span></header>"
         f"<section><h2>Apps</h2>{app_html}</section>"
         + (f"<section class=\"panel\"><h2>Administration</h2>{ul(admin)}</section>" if admin else "")
         + f"<section class=\"panel\"><h2>Your account</h2>{ul(own)}</section></main></body></html>")
@@ -2431,24 +2466,47 @@ def rule_for_host(doc: dict, host: str) -> Optional[dict]:
     return templates.get(tid) if tid is not None else None
 
 
-def stepup_url(host: str, method: str, extra: bool) -> str:
+# The longest path+query a step-up returns to (contract §5 "Step-up URL").
+RETURN_PATH_MAX = 2048
+
+
+def return_path(raw_uri: str, method: str) -> str:
+    """The path+query the step-up returns to (contract §5 "Step-up URL"):
+    the request's X-Forwarded-Uri when it is a GET and plainly a path on
+    the same host — starts with `/` but not `//`, no `\\` and no `%5c`
+    (any case: browsers read both as `/`, turning the path into another
+    host), every byte printable ASCII (0x21–0x7e: no space, tab, newline
+    or non-ASCII) and at most RETURN_PATH_MAX bytes; otherwise "/"."""
+    uri = raw_uri or ""
+    if method != "GET" or not uri.startswith("/") or uri.startswith("//"):
+        return "/"
+    if "\\" in uri or "%5c" in uri.lower():
+        return "/"
+    if any(not 0x21 <= ord(c) <= 0x7e for c in uri) or len(uri.encode()) > RETURN_PATH_MAX:
+        return "/"
+    return uri
+
+
+def stepup_url(host: str, method: str, extra: bool, path: str = "/") -> str:
     """The step-up URL (contract §5 "Step-up URL"): oauth2-proxy's
     /oauth2/start with `pc_method=<method>` (one of the six method ids or
     `passkey`; oauth2-proxy's loginURLParameters allow exactly those and
     Keycloak hands it to the extension as a client note), which asks for
-    that one method on top of the Keycloak session's.
+    that one method on top of the Keycloak session's. `rd` returns to
+    `path` (return_path's: the requested page, or "/") on the same host.
 
     Main-domain and core hosts: on auth.<domain> (router oauth2-callback,
     forward-auth), never on the app's own host — a host-less
     PathPrefix(`/oauth2/`) router cannot carry the tiers' TLS options, so
     Traefik would serve it with the default options and answer 421
     Misdirected Request. oauth2-proxy's cookie is set for .<domain> and
-    `rd` is in its whitelist, so the user lands back on the app.
+    `rd` = `https://<host><path>` passes its `.<domain>` whitelist, so the
+    user lands back on the page.
 
     Extra-domain hosts (`extra`): on the host itself, served by
     forward-auth-ext through the Hub's Host-scoped sign-in router
-    (portcullis-oauth2-<instance>_<router>); `rd=/` is relative, so it
-    needs no whitelist and can only land on the same host.
+    (portcullis-oauth2-<instance>_<router>); `rd` = `path` stays
+    relative, so it needs no whitelist and can only land on the same host.
 
     No sign_out and no prompt=login in the chain: the browser keeps
     oauth2-proxy's cookie and Keycloak's session, so Keycloak asks only
@@ -2457,8 +2515,8 @@ def stepup_url(host: str, method: str, extra: bool) -> str:
     if method not in STEPUP_METHODS:
         raise ValueError(f"not a step-up method: {method!r}")
     if extra:
-        return f"https://{host}/oauth2/start?" + urllib.parse.urlencode({"pc_method": method, "rd": "/"})
-    query = urllib.parse.urlencode({"pc_method": method, "rd": f"https://{host}/"})
+        return f"https://{host}/oauth2/start?" + urllib.parse.urlencode({"pc_method": method, "rd": path})
+    query = urllib.parse.urlencode({"pc_method": method, "rd": f"https://{host}{path}"})
     return f"https://auth.{DOMAIN}/oauth2/start?{query}"
 
 
@@ -2482,7 +2540,7 @@ SIGNIN_CSS = PORTAL_CSS + (
 )
 SIGNIN_CSP = ("default-src 'none'; style-src 'sha256-"
               + base64.b64encode(hashlib.sha256(SIGNIN_CSS.encode()).digest()).decode()
-              + "'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+              + "'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
 def _canonical(methods) -> List[str]:
@@ -2527,8 +2585,8 @@ def _signin_page(title: str, body: str, banner: str = "") -> bytes:
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
             "<meta name=\"color-scheme\" content=\"dark\">"
-            f"<title>{html.escape(title)}</title><style>{SIGNIN_CSS}</style></head><body>{banner}"
-            f"<main class=\"container\"><h1>{html.escape(title)}</h1>{body}</main></body></html>").encode()
+            f"<title>{html.escape(title)}</title>{FAVICON_LINK}<style>{SIGNIN_CSS}</style></head><body>{banner}"
+            f"<main class=\"container\"><h1>{MARK_HTML}{html.escape(title)}</h1>{body}</main></body></html>").encode()
 
 
 def render_stepup_page(app: str, method: str, url: str, banner: str = "", after_setup: bool = False) -> bytes:
@@ -2730,7 +2788,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
         banner = getattr(self, "_banner", "")
-        self.wfile.write(f"{banner}<h1>{html.escape(title)}</h1>{body_html}".encode())
+        self.wfile.write(f"{FAVICON_LINK}{banner}<h1>{MARK_HTML}{html.escape(title)}</h1>{body_html}".encode())
         print(f"group-gate: {log}", flush=True)
 
     def _allow(self, groups_header: Optional[str] = None, username: str = "", host: str = ""):
@@ -2905,7 +2963,8 @@ class Handler(BaseHTTPRequestHandler):
         set_up = set(set_up) if set_up is not None else None
         method = choose_stepup(rule, have, set_up, held=held)
         if method is not None:
-            url = stepup_url(host, method, extra=kind == "extra")
+            url = stepup_url(host, method, extra=kind == "extra",
+                             path=return_path(raw_uri, self.headers.get("X-Forwarded-Method", "")))
             # "You're set up" only when the step-up asks for a passkey (the
             # kind the setup link just added), never for a password.
             after_setup = "inv" in amr and method in (*PASSKEY_KINDS, "passkey")

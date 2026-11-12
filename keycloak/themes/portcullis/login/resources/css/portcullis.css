@@ -1,0 +1,4 @@
+/* Portcullis: the Raised-gate mark (img/portcullis-mark.svg, the dark
+   variant: Keycloak's login header is dark) above the login card. Loaded
+   after keycloak.v2's css/styles.css (theme.properties `styles`). */
+#kc-header-wrapper::before{content:"";display:block;width:64px;height:64px;margin:0 auto 12px;background:url("../img/portcullis-mark.svg") center/contain no-repeat}

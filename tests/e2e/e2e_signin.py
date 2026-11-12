@@ -48,6 +48,12 @@ Cases (in this order; each later case needs only the state it names):
                             hub.<d>: step-up pc_method=security_key, Keycloak
                             shows the passkey prompt only, the token's amr then
                             has spk and hwk
+  stepup_returns_to_page    sam's synced session on hub.<d>/?from=stepup#x:
+                            rd = https://hub.<d>/?from=stepup, back there
+                            after the security-key touch
+  passkey_rename            sam renames his security key "CI key" (204,
+                            Keycloak userLabel); "ci KEY" on his synced key
+                            409; root's credential id 404; audited
   cross_user_certificate    alice's passkey session presenting bob's
                             certificate: on echo-cert's yubikey_cert step-up and
                             on oidc-cert (template step: needs-stronger; a
@@ -119,6 +125,9 @@ Cases (in this order; each later case needs only the state it names):
                             certificate → needs page, no step-up; oidc-strong
                             with act / pc_act
   imp_people_read_only      PUT / POST / DELETE → 403, GET 200
+  imp_signin_page_read_only  people.<d>/signin in the impersonating browser:
+                            "Changes are off while root is signed in as
+                            you.", no action
   imp_ai_refused            the AI client's authorize → #impersonating, no
                             code; alice's pre-start token still works
   imp_refused_concurrent    second start / person taken → 409; next reused → 403
@@ -825,6 +834,10 @@ MAIN = f"https://{DOMAIN}"
 IMP_REASON = "checking quota"
 IMP_BANNER = f"You are signed in as alice (by root) · reason “{IMP_REASON}” ·"
 READ_ONLY = "not while you are signed in as someone else: Stop first"
+# The Sign-in page's (web/mysignin.js) data-msi-act values that change a
+# sign-in method; hidden while someone is signed in as you (Hub Task 5).
+MSI_CHANGING_ACTS = {"pw-change", "pw-remove", "pk-rename", "pk-rename-go", "bc-create", "bc-go", "revoke",
+                     "yk-renew", "yk-renew-go", "yk-issue", "yk-issue-go", "pw-go"}
 AI_CLIENT = "portcullis-ai-claude-code"
 AI_CALLBACK = "http://127.0.0.1:33418/callback"
 PEOPLE_MCP = PEOPLE + "/mcp"
@@ -1183,6 +1196,71 @@ def main() -> int:
         check("pc_method_reaches_keycloak + amr_accumulates: a synced session steps up on hub.<d> with "
               "pc_method=security_key, Keycloak shows the passkey prompt only (no other way, no password), "
               "the token's amr then has spk and hwk", pc_method_reaches_keycloak)
+
+        def stepup_returns_to_page():
+            # A fresh synced sign-in for sam on hub.<d>/?from=stepup (Strong):
+            # the step-up's rd is that page (the fragment never reaches the
+            # server), and after the security-key touch the browser is back on it.
+            needs("sam_synced", "sam_spare")
+            ctx = new_context()
+            page = ctx.new_page()
+            synced = Key(page, synced=True, credentials=state["sam_synced"])
+            want = f"https://hub.{DOMAIN}/?from=stepup"
+            try:
+                goto(page, HUB + "/?from=stepup#x")
+                deadline = time.time() + 60
+                while time.time() < deadline and not page.locator("#stepup-continue").count():
+                    page.wait_for_load_state("domcontentloaded")
+                    if base.on_login_pages(page) and page.locator("#authenticateWebAuthnButton").is_visible():
+                        page.click("#authenticateWebAuthnButton")
+                        page.wait_for_timeout(1500)
+                        continue
+                    page.wait_for_timeout(500)
+                base.shot(page, "sam-stepup-return")
+                href = page.locator("#stepup-continue").get_attribute("href") or ""
+                rd = urllib.parse.parse_qs(urllib.parse.urlsplit(href).query).get("rd")
+                assert rd == [want], f"step-up rd {rd} (href {href})"
+                # The security key replaces the synced authenticator now: with
+                # both on the page, the one without a matching credential can
+                # answer first ("not allowed"), so only one is ever present.
+                synced.cdp.send("WebAuthn.removeVirtualAuthenticator", {"authenticatorId": synced.id})
+                Key(page, credentials=state["sam_spare"])
+                out = drive_kc(page, lambda: (page.url.startswith(want) and not base.on_login_pages(page)
+                                              and page.locator("#stepup-continue").count() == 0), "sam-stepup-return")
+                assert out == "done", f"{out}: {page.url.split('?')[0]} {body(page)[:300]!r}"
+                assert page.url.startswith(want), page.url
+            finally:
+                ctx.close()
+        check("stepup_returns_to_page: sam's synced session on hub.<d>/?from=stepup#x steps up with rd = "
+              "https://hub.<d>/?from=stepup and lands back there after the security-key touch", stepup_returns_to_page)
+
+        def passkey_rename():
+            # Renaming your own passkey (Keycloak userLabel) on the people
+            # listener: 204 and stored; another of yours with the same name in
+            # another case 409; someone else's id 404; audited.
+            needs("sam_spare")
+            rows = {m["id"]: m for m in people_json("sam", "GET", "/api/me/signin")["methods"]}
+            hwk = [k["id"] for k in rows["security_key"].get("passkeys") or []]
+            spk = [k["id"] for k in rows["passkey_synced"].get("passkeys") or []]
+            assert len(hwk) == 1 and len(spk) == 1, f"sam's passkeys: {rows.get('security_key')} {rows.get('passkey_synced')}"
+            label = lambda cid: f"/api/me/signin/passkeys/{urllib.parse.quote(cid, safe='')}/label"  # noqa: E731
+            code, out = people_as("sam", "PUT", label(hwk[0]), {"label": "CI key"})
+            assert code == 204, f"rename: HTTP {code} {out[:200]}"
+            # Passkey credentials only: the LDAP federation's password entry has no id.
+            stored = {c["id"]: c.get("userLabel") for c in kc(f"/users/{kc_user_id('sam')}/credentials")
+                      if c.get("type") in PASSKEY_TYPES}
+            assert stored.get(hwk[0]) == "CI key", f"Keycloak's userLabel: {stored.get(hwk[0])!r}"
+            code, out = people_as("sam", "PUT", label(spk[0]), {"label": "ci KEY"})
+            assert code == 409, f"duplicate name: HTTP {code} {out[:200]}"
+            root = [c["id"] for c in kc(f"/users/{kc_user_id('root')}/credentials") if c.get("type") in PASSKEY_TYPES]
+            assert root, "root has no passkey"
+            code, out = people_as("sam", "PUT", label(root[0]), {"label": "Mine now"})
+            assert code == 404, f"root's credential id: HTTP {code} {out[:200]}"
+            assert any((e.get("detail") or "").endswith("→ CI key") for e in audit_entries("signin.passkey.label")), \
+                [(e.get("result"), e.get("detail")) for e in audit_entries("signin.passkey.label")][-5:]
+        check("passkey_rename: PUT /api/me/signin/passkeys/<id>/label \"CI key\" → 204 and Keycloak's userLabel; "
+              "\"ci KEY\" on the synced key → 409; root's credential id → 404; audited signin.passkey.label",
+              passkey_rename)
 
         # ── alice (passkey) presenting bob's certificate ──
         def alice_signs_up():
@@ -2586,6 +2664,26 @@ def main() -> int:
         check("imp_people_read_only: while impersonated PUT /api/me/signin/password, POST /api/me/signin/browser-"
               "certificates, DELETE /api/me/ai/connections/x → 403 \"not while you are signed in as someone else: Stop "
               "first\" (alice herself: not that refusal); GET /api/me/apps 200", imp_people_read_only)
+
+        def imp_signin_page_read_only():
+            needs("imp1")
+            page = state["imp1"]["page"]
+            goto(page, PEOPLE + "/signin")
+            page.wait_for_selector("[data-msi-readonly]", timeout=TIMEOUT_MS)
+            base.shot(page, "imp1-signin-read-only")
+            text = body(page)
+            assert "Changes are off while root is signed in as you." in text, text[:400]
+            # Every control the page offers, printed; the mutating ones
+            # (Set / Change / Remove / Create / Revoke / Renew / Issue / Rename,
+            # and + Add) must be gone. The history's Refresh / Show older and
+            # the impersonation's own Stop change none of alice's methods.
+            acts = page.eval_on_selector_all("[data-msi-act]", "els => els.map(e => [e.dataset.msiAct, e.innerText.trim()])")
+            print(f"    controls while impersonated: {acts}", flush=True)
+            changing = [a for a in acts if a[0] in MSI_CHANGING_ACTS]
+            assert not changing, f"actions on the Sign-in page while impersonated: {changing}"
+            assert "+ Add" not in text, "+ Add offered while impersonated"
+        check("imp_signin_page_read_only: the impersonating browser's Sign-in page says \"Changes are off while root "
+              "is signed in as you.\" and offers no action that changes a method", imp_signin_page_read_only)
 
         def imp_ai_refused():
             needs("imp1", "alice_ai_tf")
