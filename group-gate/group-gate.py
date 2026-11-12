@@ -2431,24 +2431,47 @@ def rule_for_host(doc: dict, host: str) -> Optional[dict]:
     return templates.get(tid) if tid is not None else None
 
 
-def stepup_url(host: str, method: str, extra: bool) -> str:
+# The longest path+query a step-up returns to (contract §5 "Step-up URL").
+RETURN_PATH_MAX = 2048
+
+
+def return_path(raw_uri: str, method: str) -> str:
+    """The path+query the step-up returns to (contract §5 "Step-up URL"):
+    the request's X-Forwarded-Uri when it is a GET and plainly a path on
+    the same host — starts with `/` but not `//`, no `\\` and no `%5c`
+    (any case: browsers read both as `/`, turning the path into another
+    host), every byte printable ASCII (0x21–0x7e: no space, tab, newline
+    or non-ASCII) and at most RETURN_PATH_MAX bytes; otherwise "/"."""
+    uri = raw_uri or ""
+    if method != "GET" or not uri.startswith("/") or uri.startswith("//"):
+        return "/"
+    if "\\" in uri or "%5c" in uri.lower():
+        return "/"
+    if any(not 0x21 <= ord(c) <= 0x7e for c in uri) or len(uri.encode()) > RETURN_PATH_MAX:
+        return "/"
+    return uri
+
+
+def stepup_url(host: str, method: str, extra: bool, path: str = "/") -> str:
     """The step-up URL (contract §5 "Step-up URL"): oauth2-proxy's
     /oauth2/start with `pc_method=<method>` (one of the six method ids or
     `passkey`; oauth2-proxy's loginURLParameters allow exactly those and
     Keycloak hands it to the extension as a client note), which asks for
-    that one method on top of the Keycloak session's.
+    that one method on top of the Keycloak session's. `rd` returns to
+    `path` (return_path's: the requested page, or "/") on the same host.
 
     Main-domain and core hosts: on auth.<domain> (router oauth2-callback,
     forward-auth), never on the app's own host — a host-less
     PathPrefix(`/oauth2/`) router cannot carry the tiers' TLS options, so
     Traefik would serve it with the default options and answer 421
     Misdirected Request. oauth2-proxy's cookie is set for .<domain> and
-    `rd` is in its whitelist, so the user lands back on the app.
+    `rd` = `https://<host><path>` passes its `.<domain>` whitelist, so the
+    user lands back on the page.
 
     Extra-domain hosts (`extra`): on the host itself, served by
     forward-auth-ext through the Hub's Host-scoped sign-in router
-    (portcullis-oauth2-<instance>_<router>); `rd=/` is relative, so it
-    needs no whitelist and can only land on the same host.
+    (portcullis-oauth2-<instance>_<router>); `rd` = `path` stays
+    relative, so it needs no whitelist and can only land on the same host.
 
     No sign_out and no prompt=login in the chain: the browser keeps
     oauth2-proxy's cookie and Keycloak's session, so Keycloak asks only
@@ -2457,8 +2480,8 @@ def stepup_url(host: str, method: str, extra: bool) -> str:
     if method not in STEPUP_METHODS:
         raise ValueError(f"not a step-up method: {method!r}")
     if extra:
-        return f"https://{host}/oauth2/start?" + urllib.parse.urlencode({"pc_method": method, "rd": "/"})
-    query = urllib.parse.urlencode({"pc_method": method, "rd": f"https://{host}/"})
+        return f"https://{host}/oauth2/start?" + urllib.parse.urlencode({"pc_method": method, "rd": path})
+    query = urllib.parse.urlencode({"pc_method": method, "rd": f"https://{host}{path}"})
     return f"https://auth.{DOMAIN}/oauth2/start?{query}"
 
 
@@ -2905,7 +2928,8 @@ class Handler(BaseHTTPRequestHandler):
         set_up = set(set_up) if set_up is not None else None
         method = choose_stepup(rule, have, set_up, held=held)
         if method is not None:
-            url = stepup_url(host, method, extra=kind == "extra")
+            url = stepup_url(host, method, extra=kind == "extra",
+                             path=return_path(raw_uri, self.headers.get("X-Forwarded-Method", "")))
             # "You're set up" only when the step-up asks for a passkey (the
             # kind the setup link just added), never for a password.
             after_setup = "inv" in amr and method in (*PASSKEY_KINDS, "passkey")

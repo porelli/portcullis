@@ -738,12 +738,15 @@ class SigninV6Test(GateTest):
     """Policy file v6 sign-in templates (contract §4 "How group-gate
     decides", §5 "Step-up and the needs-stronger page", §8.1)."""
 
-    def page(self, host, amr, user="bob", groups="users_grafana", gate_path="/", cert=None):
+    def page(self, host, amr, user="bob", groups="users_grafana", gate_path="/", cert=None, uri=None, extra=None):
         h = {"X-Forwarded-Host": host, "X-Auth-Request-Preferred-Username": user,
              "X-Auth-Request-Groups": groups,
              "X-Forwarded-Access-Token": token(amr=amr, preferred_username=user)}
         if cert is not None:
             h.update(cert) if isinstance(cert, dict) else h.__setitem__(gg.CERT_INFO_HEADER, cert)
+        if uri is not None:
+            h["X-Forwarded-Uri"] = uri
+        h.update(extra or {})
         r = urllib.request.Request(f"http://127.0.0.1:{self.port}{gate_path}", headers=h)
         try:
             with urllib.request.urlopen(r) as resp:
@@ -1015,6 +1018,44 @@ class SigninV6Test(GateTest):
         self.assertIn("pc_method=security_key", hdrs["X-Stepup-URL"])
         self.assertIn("rd=https%3A%2F%2Fexample.com%2F", hdrs["X-Stepup-URL"])
         self.assertEqual(self.page("example.com", ["hwk"], groups="", gate_path="/portal")[0], 200)
+
+    def stepup_rd(self, host, uri, method="GET", groups="users_grafana"):
+        """The step-up's `rd` for a request to `host` + `uri` (the
+        X-Stepup-URL header's and the page's href, which must agree)."""
+        extra = {} if method is None else {"X-Forwarded-Method": method}
+        code, hdrs, body = self.page(host, ["spk"], groups=groups, uri=uri, extra=extra)
+        self.assertEqual(code, 403)
+        url = hdrs["X-Stepup-URL"]
+        self.assertIn(f'href="{html.escape(url, quote=True)}"', body)
+        return urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["rd"]
+
+    def test_stepup_returns_to_page(self):
+        write_policy({"hosts": {"grafana.example.com": "strong"}, "people": {"bob": ["passkey_synced", "security_key"]}})
+        uri = "/d/abc?orgId=1&x=%20y"
+        self.assertEqual(self.stepup_rd("grafana.example.com", uri), [f"https://grafana.example.com{uri}"])
+        # An extra-domain host: the same path, relative.
+        write_policy({"extra_domains": [EXTRA], "hosts": {f"grafana.{EXTRA}": "strong"},
+                      "people": {"bob": ["passkey_synced", "security_key"]}})
+        self.assertEqual(self.stepup_rd(f"grafana.{EXTRA}", uri, groups=""), [uri])
+
+    def test_stepup_return_rejects_offhost_paths(self):
+        write_policy({"extra_domains": [EXTRA], "hosts": {"grafana.example.com": "strong", f"grafana.{EXTRA}": "strong"},
+                      "people": {"bob": ["passkey_synced", "security_key"]}})
+        cases = [("POST", "/d/abc"), ("HEAD", "/d/abc"), (None, "/d/abc")]
+        cases += [("GET", u) for u in ("//evil.example/x", "/\\evil.example", "/%5Cevil", "/%5cevil", "/a\tb",
+                                       "/a b", "/\u00e9", "/" + "a" * 2048, "", "x")]
+        for method, uri in cases:
+            with self.subTest(method=method, uri=uri):
+                self.assertEqual(gg.return_path(uri, method or ""), "/")
+                if any(c in uri for c in "\t\u00e9"):
+                    continue  # not sendable as an HTTP header by urllib; return_path covers it
+                self.assertEqual(self.stepup_rd("grafana.example.com", uri, method), ["https://grafana.example.com/"])
+                self.assertEqual(self.stepup_rd(f"grafana.{EXTRA}", uri, method, groups=""), ["/"])
+        # 2048 bytes is still kept.
+        self.assertEqual(gg.return_path("/" + "a" * 2047, "GET"), "/" + "a" * 2047)
+        self.assertEqual(gg.return_path("/d/abc?orgId=1&x=%20y", "GET"), "/d/abc?orgId=1&x=%20y")
+        self.assertEqual(gg.stepup_url("grafana.example.com", "security_key", extra=False, path="/x?y=1"),
+                         "https://auth.example.com/oauth2/start?pc_method=security_key&rd=https%3A%2F%2Fgrafana.example.com%2Fx%3Fy%3D1")
 
     def test_stepup_one_method(self):
         write_policy({"hosts": {"grafana.example.com": "strong"}, "people": {"bob": ["passkey_synced", "security_key"]}})
