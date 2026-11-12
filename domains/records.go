@@ -16,12 +16,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	"github.com/libdns/cloudflare"
-	"github.com/libdns/digitalocean"
 	"github.com/libdns/hetzner"
+	hetznercloud "github.com/libdns/hetzner/v2"
 	"github.com/libdns/libdns"
 	"github.com/libdns/porkbun"
 	"github.com/libdns/route53"
 	"github.com/miekg/dns"
+
+	"github.com/portcullis/domains/internal/dnssec"
 )
 
 // DNS providers (contract §12.2): the ones core's `dns setup` supports,
@@ -51,6 +53,9 @@ type providerSpec struct {
 	required []string
 	optional []string
 	build    func(c map[string]string) (dnsProvider, error)
+	// dnssec, if set, reads the zone's DNSSEC status from the provider's
+	// API; a dnssec.Signer can also turn signing on (nil = neither).
+	dnssec func(c map[string]string) (dnssec.StatusReader, error)
 }
 
 // fixedZone is a route53 provider with a hosted zone id: the zone is the
@@ -64,7 +69,7 @@ func (fixedZone) FindZone(fqdn string) (string, error) {
 var providers = map[string]providerSpec{
 	"cloudflare": {required: []string{"api_token"}, build: func(c map[string]string) (dnsProvider, error) {
 		return &cloudflare.Provider{APIToken: c["api_token"], HTTPClient: &http.Client{Timeout: providerTimeout}}, nil
-	}},
+	}, dnssec: newCloudflareDNSSEC},
 	"porkbun": {required: []string{"api_key", "secret_api_key"}, build: func(c map[string]string) (dnsProvider, error) {
 		return &porkbun.Provider{APIKey: c["api_key"], APISecretKey: c["secret_api_key"]}, nil
 	}},
@@ -81,12 +86,17 @@ var providers = map[string]providerSpec{
 			return fixedZone{p}, nil
 		}
 		return p, nil
-	}},
+	}, dnssec: func(c map[string]string) (dnssec.StatusReader, error) { return newRoute53DNSSEC(c, ""), nil }},
 	"digitalocean": {required: []string{"auth_token"}, build: func(c map[string]string) (dnsProvider, error) {
-		return &digitalocean.Provider{APIToken: c["auth_token"]}, nil
+		return newDOProvider(c["auth_token"]), nil
 	}},
+	// hetzner: the legacy DNS API (dns.hetzner.com); hetzner-cloud: DNS in
+	// the Hetzner Cloud API (libdns/hetzner/v2, a Cloud API token).
 	"hetzner": {required: []string{"api_token"}, build: func(c map[string]string) (dnsProvider, error) {
 		return hetzner.New(c["api_token"]), nil
+	}},
+	"hetzner-cloud": {required: []string{"api_token"}, build: func(c map[string]string) (dnsProvider, error) {
+		return hetznercloud.New(c["api_token"]), nil
 	}},
 }
 
@@ -164,6 +174,58 @@ func buildProvider(d *Domain) (dnsProvider, error) {
 		return nil, errors.New(redact(err.Error(), creds))
 	}
 	return redacting{inner: inner, creds: creds}, nil
+}
+
+// buildDNSSEC returns the domain's DNSSEC status reader (nil when the
+// provider has none) behind redaction, and whether it can turn signing on.
+func buildDNSSEC(d *Domain) (dnssec.StatusReader, bool, error) {
+	spec, ok := providers[d.Provider]
+	if !ok {
+		return nil, false, fmt.Errorf("unknown provider %q", d.Provider)
+	}
+	if spec.dnssec == nil {
+		return nil, false, nil
+	}
+	creds := make(map[string]string, len(d.Credentials))
+	for k, v := range d.Credentials {
+		creds[k] = v
+	}
+	inner, err := spec.dnssec(creds)
+	if err != nil {
+		return nil, false, errors.New(redact(err.Error(), creds))
+	}
+	r := redactingDNSSEC{inner: inner, creds: creds}
+	if s, ok := inner.(dnssec.Signer); ok {
+		return redactingSigner{redactingDNSSEC: r, signer: s}, true, nil
+	}
+	return r, false, nil
+}
+
+// redactingDNSSEC wraps a status reader; its errors carry no credential.
+type redactingDNSSEC struct {
+	inner dnssec.StatusReader
+	creds map[string]string
+}
+
+func (r redactingDNSSEC) DNSSECStatus(ctx context.Context, zone string) (string, []dnssec.DS, error) {
+	st, ds, err := r.inner.DNSSECStatus(ctx, zone)
+	if err != nil {
+		return st, ds, errors.New(redact(err.Error(), r.creds))
+	}
+	return st, ds, nil
+}
+
+// redactingSigner: a redacting reader that can also turn signing on.
+type redactingSigner struct {
+	redactingDNSSEC
+	signer dnssec.Signer
+}
+
+func (r redactingSigner) EnableDNSSEC(ctx context.Context, zone string) error {
+	if err := r.signer.EnableDNSSEC(ctx, zone); err != nil {
+		return errors.New(redact(err.Error(), r.creds))
+	}
+	return nil
 }
 
 // redacting wraps a provider; its errors carry no credential.
