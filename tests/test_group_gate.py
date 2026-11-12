@@ -1123,7 +1123,7 @@ class SigninV6Test(GateTest):
         # messages_en.properties: the same words, one line per alternative.
         acct = "https://people.example.com/signin"
         b = gg.render_needs_page("Grafana", {"password"}, STRONG, {"password"}, False, "example.com").decode()
-        self.assertIn("<h1>Grafana needs a stronger sign-in</h1>", b)
+        self.assertIn("<h1>" + gg.MARK_HTML + "Grafana needs a stronger sign-in</h1>", b)
         self.assertIn('<div id="needs-stronger"><p>You signed in with a <b>password</b>. Grafana accepts any one of:</p>', b)
         self.assertIn("<li>a security key <span class=\"portcullis-sub\">— you don&#x27;t have one yet</span></li>", b)
         self.assertIn("<li>a YubiKey certificate</li>", b)
@@ -3584,6 +3584,73 @@ class ImpersonationTest(GateTest):
         self.assertEqual(len(refreshes), 3)  # the loop went on
         self.assertIn("coverage check exploded", out)
         self.assertIn("RuntimeError", out)
+
+
+class BrandingTest(GateTest):
+    """The Raised-gate mark and favicon on every group-gate page (polish
+    batch 1): inline only — a data: favicon (img-src data:) and the inline
+    SVG mark —, never an external load."""
+
+    MARK_SHA256 = "a63ddab1ce0eac394cdbc7547f9fcbc9bf6947060601dd5202527222cef97bfa"  # concept-1-mark-dark.svg
+    FAVICON_SHA256 = "8c07f90ac5371f5742ca1837b45ff450f56674c8773ddbcd0b4b03fa17fd2352"  # favicon.svg
+
+    def deny_body(self):
+        """A live _deny answer: a non-admin on the Hub."""
+        h = {"X-Forwarded-Host": "hub.example.com", "X-Auth-Request-Preferred-Username": "bob",
+             "X-Auth-Request-Groups": "users_grafana",
+             "X-Forwarded-Access-Token": token(amr=["hwk"], preferred_username="bob")}
+        r = urllib.request.Request(f"http://127.0.0.1:{self.port}/", headers=h)
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(r)
+        with cm.exception as e:
+            self.assertEqual(e.code, 403)
+            return e.read().decode()
+
+    def pages(self):
+        now = time.time()
+        rec = {"id": IMP_ID, "admin": "root", "target": "alice", "reason": IMP_REASON, "until": now + 600,
+               "ended": None}
+        return {
+            "portal": gg.render_portal("alice", {"lldap_admin"}, [], "example.com").decode(),
+            "stepup": gg.render_stepup_page("App", "security_key", "https://auth.example.com/x").decode(),
+            "certificate": gg.render_certificate_page("App", "yubikey_cert").decode(),
+            "needs": gg.render_needs_page("App", {"passkey_synced"}, STRONG, None, False, "example.com").decode(),
+            "needs-impersonated": gg.render_needs_page("App", set(), STRONG, None, False, "example.com",
+                                                       impersonated=rec).decode(),
+            "ended": gg.render_ended_page("alice", "example.com").decode(),
+            "deny": self.deny_body(),
+        }
+
+    def test_bytes_pinned(self):
+        import hashlib
+        self.assertEqual(hashlib.sha256(gg.MARK_SVG.encode()).hexdigest(), self.MARK_SHA256)
+        self.assertEqual(hashlib.sha256(gg.FAVICON_SVG.encode()).hexdigest(), self.FAVICON_SHA256)
+        import base64
+        self.assertEqual(gg.FAVICON_LINK, '<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,'
+                         + base64.b64encode(gg.FAVICON_SVG.encode()).decode() + '">')
+        self.assertEqual(gg.MARK_HTML, '<span class="pc-mark" aria-hidden="true">' + gg.MARK_SVG.strip() + "</span>")
+
+    def test_every_page_has_mark_and_favicon(self):
+        for name, page in self.pages().items():
+            with self.subTest(page=name):
+                self.assertIn(gg.FAVICON_LINK, page)
+                self.assertIn(gg.MARK_HTML, page)
+                # The mark opens the page's heading.
+                self.assertIn("<h1>" + gg.MARK_HTML, page)
+
+    def test_csp_allows_data_images(self):
+        for csp in (gg.PORTAL_CSP, gg.SIGNIN_CSP):
+            self.assertIn("img-src data:", csp)
+        self.assertIn(".pc-mark{", gg.PORTAL_CSS)
+        self.assertTrue(gg.SIGNIN_CSS.startswith(gg.PORTAL_CSS))
+
+    def test_no_external_loads(self):
+        for name, page in self.pages().items():
+            with self.subTest(page=name):
+                self.assertNotIn('src="http', page)
+                self.assertNotIn("url(", page)
+                for tag in re.findall(r'<(\w+)[^>]*\shref="http', page):
+                    self.assertEqual(tag, "a")
 
 
 class JwtClaimsTest(unittest.TestCase):

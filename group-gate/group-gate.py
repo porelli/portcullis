@@ -672,6 +672,38 @@ def _safe_url(u, domains=()) -> str:
     return u
 
 
+# The Raised-gate mark (branding concept-1-mark-dark.svg: every group-gate
+# page is dark) and the favicon (branding favicon.svg), byte copies of the
+# branding sources (tests/test_group_gate.py BrandingTest pins their
+# sha256). group-gate serves no static files: the favicon is a data: URL
+# (img-src data:) and the mark is inline SVG at the start of each <h1>.
+MARK_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <title>Portcullis:  (for dark backgrounds)</title>
+    <path fill="#e3ac52" d="M5 11h22v2H5z M5 17h22v2H5z M9 7h2v14l-1 2.5-1-2.5z M15 4h2v17l-1 2.5-1-2.5z M21 7h2v14l-1 2.5-1-2.5z"/>
+    <path fill="#e8edf5" d="M2 30V16a14 14 0 0 1 28 0v14h-3V16a11 11 0 0 0-22 0v14z"/>
+</svg>
+"""
+FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="32" height="32">
+  <title>Portcullis</title>
+  <!-- Concept 1, redrawn on a 16 px grid so tab icons stay crisp at 1x and 2x.
+       Light tabs: iron arch, brass gate. Dark tabs: mist arch, lantern gate. -->
+  <style>
+    .arch { fill: #1c2738; }
+    .gate { fill: #c48a2c; }
+    @media (prefers-color-scheme: dark) {
+      .arch { fill: #e8edf5; }
+      .gate { fill: #e3ac52; }
+    }
+  </style>
+  <path class="gate" d="M3 6h10v1H3z M3 9h10v1H3z M5 3h1v8H5z M7 2h2v9H7z M10 3h1v8h-1z"/>
+  <path class="arch" d="M1 15V8a7 7 0 0 1 14 0v7h-2V8a5 5 0 0 0-10 0v7z"/>
+</svg>
+"""
+FAVICON_LINK = ('<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,'
+                + base64.b64encode(FAVICON_SVG.encode()).decode() + '">')
+MARK_HTML = '<span class="pc-mark" aria-hidden="true">' + MARK_SVG.strip() + '</span>'
+
+
 # Same dark look as enroll's pages (enroll/web/*.html). Inline only, no
 # external assets; allowed by PORTAL_CSP through its hash.
 PORTAL_CSS = (
@@ -691,10 +723,13 @@ PORTAL_CSS = (
     # The impersonation banner (contract §5, render_banner).
     "#pc-imp-banner{background:#78350f;color:#fef3c7;padding:.6rem 1rem;text-align:center;font-size:.9rem}"
     "#pc-imp-banner a{color:#fff;font-weight:600;margin-left:.75rem}"
+    # The mark at the start of every <h1> (MARK_HTML).
+    ".pc-mark{display:inline-block;width:1.75rem;height:1.75rem;vertical-align:-.3rem;margin-right:.5rem}"
+    ".pc-mark svg{width:100%;height:100%}"
 )
 PORTAL_CSP = ("default-src 'none'; style-src 'sha256-"
               + base64.b64encode(hashlib.sha256(PORTAL_CSS.encode()).digest()).decode()
-              + "'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+              + "'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
 def render_portal(user: str, groups: set, apps, domain: str, domains=(), banner: str = "") -> bytes:
@@ -750,8 +785,8 @@ def render_portal(user: str, groups: set, apps, domain: str, domains=(), banner:
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
         "<meta name=\"color-scheme\" content=\"dark\">"
-        f"<title>{e(domain)}</title><style>{PORTAL_CSS}</style></head><body>{banner}<main class=\"container\">"
-        f"<header><h1>{e(domain)}</h1><span class=\"user-badge\">Signed in as <strong>{e(user)}</strong></span></header>"
+        f"<title>{e(domain)}</title>{FAVICON_LINK}<style>{PORTAL_CSS}</style></head><body>{banner}<main class=\"container\">"
+        f"<header><h1>{MARK_HTML}{e(domain)}</h1><span class=\"user-badge\">Signed in as <strong>{e(user)}</strong></span></header>"
         f"<section><h2>Apps</h2>{app_html}</section>"
         + (f"<section class=\"panel\"><h2>Administration</h2>{ul(admin)}</section>" if admin else "")
         + f"<section class=\"panel\"><h2>Your account</h2>{ul(own)}</section></main></body></html>")
@@ -2505,7 +2540,7 @@ SIGNIN_CSS = PORTAL_CSS + (
 )
 SIGNIN_CSP = ("default-src 'none'; style-src 'sha256-"
               + base64.b64encode(hashlib.sha256(SIGNIN_CSS.encode()).digest()).decode()
-              + "'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+              + "'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
 def _canonical(methods) -> List[str]:
@@ -2550,8 +2585,8 @@ def _signin_page(title: str, body: str, banner: str = "") -> bytes:
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
             "<meta name=\"color-scheme\" content=\"dark\">"
-            f"<title>{html.escape(title)}</title><style>{SIGNIN_CSS}</style></head><body>{banner}"
-            f"<main class=\"container\"><h1>{html.escape(title)}</h1>{body}</main></body></html>").encode()
+            f"<title>{html.escape(title)}</title>{FAVICON_LINK}<style>{SIGNIN_CSS}</style></head><body>{banner}"
+            f"<main class=\"container\"><h1>{MARK_HTML}{html.escape(title)}</h1>{body}</main></body></html>").encode()
 
 
 def render_stepup_page(app: str, method: str, url: str, banner: str = "", after_setup: bool = False) -> bytes:
@@ -2753,7 +2788,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.end_headers()
         banner = getattr(self, "_banner", "")
-        self.wfile.write(f"{banner}<h1>{html.escape(title)}</h1>{body_html}".encode())
+        self.wfile.write(f"{FAVICON_LINK}{banner}<h1>{MARK_HTML}{html.escape(title)}</h1>{body_html}".encode())
         print(f"group-gate: {log}", flush=True)
 
     def _allow(self, groups_header: Optional[str] = None, username: str = "", host: str = ""):

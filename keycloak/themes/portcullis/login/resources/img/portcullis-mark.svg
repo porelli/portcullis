@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <title>Portcullis:  (for dark backgrounds)</title>
+    <path fill="#e3ac52" d="M5 11h22v2H5z M5 17h22v2H5z M9 7h2v14l-1 2.5-1-2.5z M15 4h2v17l-1 2.5-1-2.5z M21 7h2v14l-1 2.5-1-2.5z"/>
+    <path fill="#e8edf5" d="M2 30V16a14 14 0 0 1 28 0v14h-3V16a11 11 0 0 0-22 0v14z"/>
+</svg>
