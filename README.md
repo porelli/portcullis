@@ -24,7 +24,7 @@ Everything else goes through the same command — `./portcullis help`:
 ```
 init | up | down | upgrade | status [--json|--textfile] | version
 backup [--offsite] | backup verify [--local] | backup schedule --systemd | restore [--from-offsite]
-config apply [--bundle-only] | config init | dns setup [--check]
+config apply [--bundle-only] | config init | dns plan | dns setup | dns check
 vault init | vault unseal | vault rotate-enroll-secret | pki setup [--force] [--with-server-cert]
 keycloak configure | oidc register | invite | signin reset-core
 cert enroll | cert renew | cert revoke | cert list | cert sync

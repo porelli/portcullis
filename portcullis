@@ -47,7 +47,9 @@ Backups:
 Configuration:
   config apply                Apply ACME_STAGING, rebuild the CA bundle
   config init                 Keep your settings in config/, a separate git repo
-  dns setup                   Create A/AAAA records for the domain and its wildcard
+  dns plan                    The domain's DNS plan: records, CAA pin, DNSSEC (changes nothing)
+  dns setup                   Write the planned records (A/AAAA, CAA) through the DNS provider
+  dns check                   Public DNS checks only (no credentials); exit 1 on a problem
 
 Vault and PKI:
   vault init                  Initialise/unseal Vault, set up the enroll AppRole

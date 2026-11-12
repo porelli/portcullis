@@ -1979,6 +1979,118 @@ expect_eq "invite --replace-keys deletes every passkey kind, never a password / 
   "$(printf '%s\n' "$RK_OUT" | sort | tr '\n' ' ')" \
   "DELETE /portcullis/users/u1/credentials/c1 DELETE /portcullis/users/u1/credentials/c2 DELETE /portcullis/users/u1/credentials/c3 DELETE /portcullis/users/u1/credentials/c4 POST /portcullis/users/u1/logout "
 
+# ══ dns: plan / setup / check on the domains image's dns tool ═══
+# docker stub: argv of every call → $STUB_DIR/dt/argv (one line each);
+# the stdin of each `compose ... run ... dns-tool <sub>` → dt/stdin-<sub>;
+# its stdout from dt/out-<sub> (default {} plan), exit from dt/rc-<sub>.
+mkdir -p "$WORK/dtbin" "$STUB_DIR/dt"
+cat > "$WORK/dtbin/docker" <<'STUB'
+#!/usr/bin/env bash
+d="$STUB_DIR/dt"
+echo "$*" >> "$d/argv"
+case "$*" in
+  "image inspect "*) exit 0 ;;
+  "volume inspect portcullis_traefik_acme") [ -f "$d/acme-volume" ]; exit ;;
+  run\ --rm\ --network\ none*traefik-account-uri*) cat "$d/traefik-uri" 2>/dev/null; exit 0 ;;
+  compose\ *\ run\ *dns-tool*)
+    sub="$(printf '%s\n' "$@" | sed -n '/^dns-tool$/{n;p;}')"
+    cat > "$d/stdin-$sub"
+    echo "$sub" >> "$d/order"
+    if [ -f "$d/out-$sub" ]; then cat "$d/out-$sub"; else cat "$d/out-default"; fi
+    exit "$(cat "$d/rc-$sub" 2>/dev/null || echo 0)" ;;
+esac
+exit 0
+STUB
+chmod +x "$WORK/dtbin/docker"
+jq -n '{name: "ci.example.org", checked_at: "2026-11-13T00:00:00Z", can_write: true,
+        items: [{set: "address", name: "ci.example.org", type: "A", want: ["203.0.113.10"], live: [], status: "missing", severity: "problem", fix: "auto", steps: ["add A ci.example.org 203.0.113.10 (TTL 300)"]}],
+        caa: {issuer: "letsencrypt.org", account_uri: "", would_issue: true},
+        dnssec: {state: "unsigned", zone: "example.org.", provider_can_sign: false, ds: [], steps: ["Turn on DNSSEC signing"]}}' > "$STUB_DIR/dt/out-default"
+cat > "$WORK/dtenv.sh" <<EOF
+for l in common network domains stack config dns; do source "$HERE/../scripts/lib/\$l.sh"; done
+export PORTCULLIS_DOMAIN=ci.example.org PORTCULLIS_PUBLIC_IPV4=203.0.113.10 PORTCULLIS_PUBLIC_IPV6=
+EOF
+# dt <shell commands> — in a fresh shell with the libs, the stub and a
+# clean log; prints the output (stderr too) and "rc=<n>".
+dt() {
+  rm -f "$STUB_DIR/dt/argv" "$STUB_DIR/dt/order" "$STUB_DIR/dt"/stdin-*
+  (unset CLOUDFLARE_API_TOKEN AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_HOSTED_ZONE_ID HETZNER_API_KEY HETZNER_API_TOKEN \
+      ACME_CA_SERVER ACME_STAGING DNS_CAA DNS_NOMAIL DNS_ACCOUNT_URI DNS_SETS DNS_PROVIDER
+   PATH="$WORK/dtbin:$PATH" bash -c ". '$WORK/dtenv.sh'; $1" 2>&1; echo "rc=$?")
+}
+dtin() { jq -r "$2" "$STUB_DIR/dt/stdin-$1" 2>/dev/null; }
+
+OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup true false ""')"
+expect_eq "dns tool: credentials only on stdin (never in argv)" "$(grep -c 'tok-SECRET-123' "$STUB_DIR/dt/argv")" 0
+expect_eq "dns tool: the token is the apply input's credentials.api_token" "$(dtin apply .credentials.api_token)" tok-SECRET-123
+expect_eq "dns tool: the token never reaches the output" "$(printf '%s' "$OUT" | grep -c 'tok-SECRET-123')" 0
+expect_eq "dns setup --yes: plan then apply then check, in that order" "$(paste -sd' ' "$STUB_DIR/dt/order")" "plan apply check"
+expect_eq "dns setup: apply waits 5 minutes" "$(grep -c 'dns-tool apply --wait 5m$' "$STUB_DIR/dt/argv")" 1
+expect_eq "dns setup: the default sets are address and caa" "$(dtin apply '.sets | join(",")')" "address,caa"
+expect_eq "dns setup: the input's snake_case keys" "$(dtin apply '[keys[]] | join(",")')" "ca_server,caa,credentials,ipv4,ipv6,mail_from,name,nomail,provider,sets"
+expect_eq "dns setup: caa block" "$(dtin apply '.caa | [.enabled, .account_uri, .issuer] | @json')" '[true,"",""]'
+expect_eq "dns check: runs without credentials" "$(dtin check 'has("credentials"), .provider' | paste -sd' ' -)" 'false '
+
+dt 'DNS_PROVIDER=route53 AWS_ACCESS_KEY_ID=AKIA-0123456789 AWS_SECRET_ACCESS_KEY=sec-0123456789 AWS_HOSTED_ZONE_ID=Z123 _dns_tool apply' >/dev/null
+expect_eq "dns tool: route53 mapping" "$(dtin apply '.credentials | to_entries | map("\(.key)=\(.value)") | join(" ")')" \
+  "access_key_id=AKIA-0123456789 secret_access_key=sec-0123456789 hosted_zone_id=Z123"
+dt 'DNS_PROVIDER=route53 AWS_ACCESS_KEY_ID=AKIA-0123456789 AWS_SECRET_ACCESS_KEY=sec-0123456789 _dns_tool apply' >/dev/null
+expect_eq "dns tool: route53 without the optional zone id" "$(dtin apply '.credentials | keys | join(",")')" "access_key_id,secret_access_key"
+dt 'DNS_PROVIDER=hetzner HETZNER_API_KEY=legacy-0123456789 HETZNER_API_TOKEN=cloud-0123456789 _dns_tool apply' >/dev/null
+expect_eq "dns tool: hetzner maps HETZNER_API_KEY" "$(dtin apply '[.provider, .credentials.api_token] | join(" ")')" "hetzner legacy-0123456789"
+dt 'DNS_PROVIDER=hetzner-cloud HETZNER_API_KEY=legacy-0123456789 HETZNER_API_TOKEN=cloud-0123456789 _dns_tool apply' >/dev/null
+expect_eq "dns tool: hetzner-cloud maps HETZNER_API_TOKEN" "$(dtin apply '[.provider, .credentials.api_token] | join(" ")')" "hetzner-cloud cloud-0123456789"
+
+OUT="$(dt 'DNS_PROVIDER=cloudflare dns_setup true false ""')"
+case "$OUT" in *"CLOUDFLARE_API_TOKEN is not set in .env (needed for DNS_PROVIDER=cloudflare)"*rc=1) t_pass "dns setup: missing CLOUDFLARE_API_TOKEN names the variable" ;;
+  *) t_fail "dns setup: missing CLOUDFLARE_API_TOKEN: $OUT" ;; esac
+expect_eq "dns setup: missing credential — the tool never ran" "$(grep -c 'dns-tool' "$STUB_DIR/dt/argv" 2>/dev/null || true)" 0
+OUT="$(dt 'DNS_PROVIDER=cloudflare dns_check false')"
+case "$OUT" in *rc=0) t_pass "dns check: works without credentials" ;; *) t_fail "dns check without credentials: $OUT" ;; esac
+
+OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup false false "" </dev/null')"
+case "$OUT" in *"non-interactive: pass --yes"*rc=1) t_pass "dns setup: non-interactive without --yes refuses" ;; *) t_fail "dns setup non-interactive: $OUT" ;; esac
+expect_eq "dns setup: non-interactive refusal applies nothing" "$(paste -sd' ' "$STUB_DIR/dt/order")" "plan"
+
+OUT="$(dt 'DNS_PROVIDER=gcloud dns_setup true false ""')"
+case "$OUT" in *"create these records by hand"*"add A ci.example.org 203.0.113.10"*rc=0) t_pass "dns setup: manual provider prints steps, exit 0" ;;
+  *) t_fail "dns setup manual provider: $OUT" ;; esac
+expect_eq "dns setup: manual provider — plan only, read-only" "$(paste -sd' ' "$STUB_DIR/dt/order"):$(dtin plan 'has("credentials")')" "plan:false"
+
+RC=0; "$CLI" dns setup --only bogus >/dev/null 2>"$WORK/dterr" </dev/null || RC=$?
+expect_eq "dns setup --only bogus: usage error" "$RC:$(grep -c -- '--only must be address, caa or nomail' "$WORK/dterr")" "2:1"
+dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup true false caa' >/dev/null
+expect_eq "dns setup --only caa: only that set" "$(dtin apply '.sets | join(",")')" "caa"
+dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 DNS_NOMAIL=true dns_setup true false ""' >/dev/null
+expect_eq "dns setup: DNS_NOMAIL=true adds nomail" "$(dtin apply '[.sets, .nomail] | @json')" '[["address","caa","nomail"],true]'
+OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 DNS_CAA=yes dns_setup true false ""')"
+case "$OUT" in *"DNS_CAA=yes must be true or false"*rc=1) t_pass "dns: DNS_CAA must be true or false" ;; *) t_fail "dns DNS_CAA=yes: $OUT" ;; esac
+
+touch "$STUB_DIR/dt/acme-volume"
+echo "https://acme-staging-v02.api.letsencrypt.org/acme/acct/42" > "$STUB_DIR/dt/traefik-uri"
+dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup true false ""' >/dev/null
+expect_eq "dns setup keeps Traefik's pin (apply)" "$(dtin apply .caa.account_uri)" "https://acme-staging-v02.api.letsencrypt.org/acme/acct/42"
+expect_eq "dns check judges Traefik's pin" "$(dtin check .caa.account_uri)" "https://acme-staging-v02.api.letsencrypt.org/acme/acct/42"
+: > "$STUB_DIR/dt/traefik-uri"
+dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup true false ""' >/dev/null
+expect_eq "dns setup: no Traefik account = CA-only" "$(dtin apply .caa.account_uri)" ""
+dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 DNS_ACCOUNT_URI=https://x.test/acct/1 dns_plan true' >/dev/null
+expect_eq "dns plan: a caller's DNS_ACCOUNT_URI wins" "$(dtin plan .caa.account_uri)" "https://x.test/acct/1"
+rm -f "$STUB_DIR/dt/acme-volume"
+
+dt 'ACME_STAGING=true dns_check true' >/dev/null
+expect_eq "dns tool: ca_server from ACME_STAGING=true when ACME_CA_SERVER is empty" "$(dtin check .ca_server)" "https://acme-staging-v02.api.letsencrypt.org/directory"
+dt 'ACME_STAGING=false dns_check true' >/dev/null
+expect_eq "dns tool: ca_server from ACME_STAGING=false" "$(dtin check .ca_server)" "https://acme-v02.api.letsencrypt.org/directory"
+dt 'ACME_CA_SERVER=https://pebble:14000/dir ACME_STAGING=true dns_check true' >/dev/null
+expect_eq "dns tool: ACME_CA_SERVER wins" "$(dtin check .ca_server)" "https://pebble:14000/dir"
+
+echo 1 > "$STUB_DIR/dt/rc-check"
+OUT="$(dt 'dns_check false')"
+case "$OUT" in *"CAA: issuer letsencrypt.org, account CA-only"*"DNSSEC: unsigned (zone example.org)"*rc=1) t_pass "dns check: renders the plan, exit 1 on a problem" ;;
+  *) t_fail "dns check render/exit: $OUT" ;; esac
+rm -f "$STUB_DIR/dt/rc-check"
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

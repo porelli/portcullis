@@ -57,7 +57,7 @@ case "$ERR" in *"unknown command 'frobnicate'"*) t_pass "unknown command message
 
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 27 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 27
+expect_eq "help lists 29 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 29
 while IFS= read -r c; do
   # shellcheck disable=SC2086
   run $c --help
@@ -119,6 +119,12 @@ config apply --force|unknown argument
 config init --remote|--remote needs a value
 config init --remote a --from b|mutually exclusive
 dns setup --fix|unknown argument
+dns plan --bogus|unknown argument
+dns check --bogus|unknown argument
+dns setup --only x|--only
+dns setup --only|--only needs a value
+dns setup --check|dns check
+dns plan --yes|unknown argument
 keycloak configure --wipe|unknown argument
 oidc register now|unknown argument
 invite|missing <user>
@@ -628,7 +634,8 @@ oidc_register() { :; }
 network_check() { :; }
 stack_prepare() { :; }
 sessions_restart_if_changed() { echo sessions_restart_if_changed >> "$DC_CALLS"; }
-dns_setup() { :; }
+dns_setup() { [ \$# -eq 3 ] || { echo "dns_setup: want 3 arguments" >&2; return 1; }; }
+dns_tighten_main() { :; }
 config_init() { :; }
 invite_create() { echo '{"url":"http://test","expires_at":"never"}'; }
 lldap_service_account() {
