@@ -101,3 +101,25 @@ func TestFindZoneClimbs(t *testing.T) {
 		t.Fatalf("%q %v", z, err)
 	}
 }
+
+// TestCheckInsecureParent: the DS matches but the resolver doesn't
+// validate the parent either (a non-validating resolver here): unknown,
+// never bogus.
+func TestCheckInsecureParent(t *testing.T) {
+	z := fakedns.NewZone()
+	z.SetSOA("team.test")
+	z.Set("team.test", libdns.RR{Name: "@", Type: "A", Data: "203.0.113.10"})
+	k, err := z.Sign("team.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	z.PublishDS("team.test", k.ToDS(dns.SHA256))
+	s, err := fakedns.ServeWith(z, "127.0.0.1:0", fakedns.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	if r := Check(context.Background(), []string{s.Addr}, "team.test"); r.State != Unknown || !strings.Contains(r.Err, "parent zone test.") {
+		t.Fatalf("%+v", r)
+	}
+}

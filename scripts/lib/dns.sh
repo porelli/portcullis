@@ -90,19 +90,31 @@ _dns_tool() {
   printf '%s' "$input" | dc run --rm --no-deps -T dns-tool "$@"
 }
 
+# _dns_uri_ok <uri> — an ACME account URI fit for a CAA value and an env
+# file: https, a host, no spaces, quotes or ';' (the CAA parameter
+# separator). The Go side's dnsplan.ValidAccountURI is the same rule.
+_dns_uri_ok() {
+  [[ "$1" =~ ^https://[A-Za-z0-9._~-]+(:[0-9]+)?(/[A-Za-z0-9._~:/?#@!\$\&\(\)*+,=%-]*)?$ ]]
+}
+
 # dns_traefik_account_uri — the URI of Traefik's ACME account, read from
 # acme.json (.letsencrypt.Account.Registration.uri) by the domains image
 # in a throwaway container: root (the file is 0600 root), no network, the
 # volume read-only. Only that string leaves (the file holds private
 # keys). Nothing when there is no account yet (fail closed: CA-only CAA).
+# Exit 1 (nothing printed) when the volume exists but couldn't be read.
 dns_traefik_account_uri() {
-  local uri
+  local uri rc=0
   docker volume inspect portcullis_traefik_acme >/dev/null 2>&1 || return 0
-  docker image inspect "$DOMAINS_IMAGE_NAME" >/dev/null 2>&1 || domains_image_ensure "to read Traefik's ACME account"
+  if ! docker image inspect "$DOMAINS_IMAGE_NAME" >/dev/null 2>&1; then
+    (domains_image_ensure "to read Traefik's ACME account") >&2 || return 1
+  fi
   uri="$(docker run --rm --network none --read-only --user 0:0 --cap-drop ALL --security-opt no-new-privileges:true \
-    -v portcullis_traefik_acme:/acme:ro "$DOMAINS_IMAGE_NAME" traefik-account-uri /acme/acme.json 2>/dev/null | head -n1)" || return 0
-  case "$uri" in https://*[!\ ]*) printf '%s\n' "$uri" ;; esac
-  return 0
+    -v portcullis_traefik_acme:/acme:ro "$DOMAINS_IMAGE_NAME" traefik-account-uri /acme/acme.json 2>/dev/null | head -n1)" || rc=$?
+  # traefik-account-uri exits 3 for "no account in the file".
+  case "$rc" in 0) ;; 3) return 0 ;; *) return 1 ;; esac
+  if _dns_uri_ok "$uri"; then printf '%s\n' "$uri"; return 0; fi
+  return 1
 }
 
 # _dns_prepare — what plan / setup / check need: the domain, the
@@ -112,8 +124,13 @@ _dns_prepare() {
   env_require PORTCULLIS_DOMAIN
   require_cmd docker jq
   _dns_ips
+  DNS_TRAEFIK_UNREADABLE=""
   if [ -z "${DNS_ACCOUNT_URI+x}" ]; then
-    DNS_ACCOUNT_URI="$(dns_traefik_account_uri)"
+    if ! DNS_ACCOUNT_URI="$(dns_traefik_account_uri)"; then
+      DNS_ACCOUNT_URI=""
+      DNS_TRAEFIK_UNREADABLE=1
+      warn "Traefik's ACME account couldn't be read (its volume exists): the plan shows the CA-only pin, and dns setup leaves the live CAA alone"
+    fi
   fi
   export DNS_ACCOUNT_URI
 }
@@ -179,6 +196,11 @@ dns_setup() {
   local yes="$1" dnssec="$2" only="$3" provider="${DNS_PROVIDER:-none}" out rc=0 reply
   _dns_prepare
   DNS_SETS="${only:-$(_dns_default_sets)}"
+  # Never replace a live pin with CA-only because the account read failed.
+  if [ -n "${DNS_TRAEFIK_UNREADABLE:-}" ]; then
+    DNS_SETS="$(printf '%s' "$DNS_SETS" | tr ' ' '\n' | grep -vx caa | paste -sd' ' -)"
+    [ -n "$DNS_SETS" ] || { warn "Nothing to apply: the caa set needs Traefik's ACME account."; return 1; }
+  fi
   export DNS_SETS
   if ! _dns_automated "$provider"; then
     warn "No automatic DNS for provider '$provider': create these records by hand."
@@ -218,12 +240,6 @@ dns_setup() {
 }
 
 # ── lifecycle: the main domain's CAA pin follows Traefik's account ──
-
-# _dns_uri_ok <uri> — an ACME account URI fit for a CAA value and an env
-# file (https, no spaces or quotes).
-_dns_uri_ok() {
-  [[ "$1" =~ ^https://[A-Za-z0-9._~:/?#@!\$\&\(\)*+,\;=%-]+$ ]]
-}
 
 # dns_main_env_write <uri> — secrets/domains/main-domain.env (0600,
 # DOMAINS_MAIN_ACME_ACCOUNT_URI): the pin the domains service's read-only
@@ -271,13 +287,13 @@ dns_tighten_main() {
     deadline=$((SECONDS + ${DNS_TIGHTEN_TIMEOUT:-180}))
     every="${DNS_TIGHTEN_POLL:-5}"
     while :; do
-      uri="$(dns_traefik_account_uri)"
+      uri="$(dns_traefik_account_uri)" || uri=""
       [ -z "$uri" ] || break
       [ "$SECONDS" -lt "$deadline" ] || break
       sleep "$every"
     done
   else
-    uri="$(dns_traefik_account_uri)"
+    uri="$(dns_traefik_account_uri)" || uri=""
   fi
   if [ -z "$uri" ]; then
     [ "$poll" != true ] || warn "Traefik has no ACME account yet: the CAA of $PORTCULLIS_DOMAIN stays CA-only (the next ./portcullis up pins it)."

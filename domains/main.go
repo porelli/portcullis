@@ -297,6 +297,9 @@ func run() error {
 		MainAccountURI: strings.TrimSpace(os.Getenv("DOMAINS_MAIN_ACME_ACCOUNT_URI")),
 		MailFrom:       strings.TrimSpace(os.Getenv("ALERT_SMTP_FROM")),
 	}
+	if u := cfg.MainAccountURI; u != "" && !dnsplan.ValidAccountURI(u) {
+		return fmt.Errorf("DOMAINS_MAIN_ACME_ACCOUNT_URI=%q is not an ACME account URI (secrets/domains/main-domain.env)", u)
+	}
 	// The issuer is resolved whatever DNS_CAA says: the checks judge the
 	// live CAA with it; DNS_CAA only decides whether the set is written.
 	if issuer, ok := dnsplan.IssuerFor(cfg.CAServer, os.Getenv("DNS_CAA_ISSUER")); ok {

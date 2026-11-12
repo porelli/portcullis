@@ -812,9 +812,10 @@ func TestProviderErrorsRedacted(t *testing.T) {
 	if !strings.Contains(e.logs.String(), "TXT delete refused") {
 		t.Fatalf("CleanUp failure not logged:\n%s", e.logs.String())
 	}
-	// 3. Records fail on a re-check.
-	e.setHook(func(op string, _ []libdns.Record, tok string) error {
-		if op == "set" {
+	// 3. Records fail on a re-check (the records already there: the
+	// step only reads them, and that read fails).
+	e.setHook(func(op string, recs []libdns.Record, tok string) error {
+		if op == "get" {
 			return echo("records set", tok)
 		}
 		return nil
@@ -845,8 +846,8 @@ func TestStaleWorkNeverCommits(t *testing.T) {
 	e := newEnv(t, false)
 	inSet, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
-	e.setHook(func(op string, _ []libdns.Record, tok string) error {
-		if op == "set" && tok == goodToken {
+	e.setHook(func(op string, recs []libdns.Record, tok string) error {
+		if recordsWrite(op, recs) && tok == goodToken {
 			once.Do(func() { close(inSet); <-release })
 		}
 		return nil
@@ -1047,8 +1048,8 @@ func TestRecordsWaitBounded(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once
 	inSet := make(chan struct{})
-	e.setHook(func(op string, _ []libdns.Record, _ string) error {
-		if op == "set" {
+	e.setHook(func(op string, recs []libdns.Record, _ string) error {
+		if recordsWrite(op, recs) {
 			once.Do(func() { close(inSet) })
 			<-release
 		}
@@ -1087,8 +1088,8 @@ func TestTokenWaitsForRecordsStep(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once
 	inSet := make(chan struct{})
-	e.setHook(func(op string, _ []libdns.Record, _ string) error {
-		if op == "set" {
+	e.setHook(func(op string, recs []libdns.Record, _ string) error {
+		if recordsWrite(op, recs) {
 			once.Do(func() { close(inSet); <-release })
 		}
 		return nil
@@ -1145,8 +1146,8 @@ func TestAddressChangeMakesRecordsDue(t *testing.T) {
 // failure instead of killing the service.
 func TestProviderPanicRecovered(t *testing.T) {
 	e := newEnv(t, false)
-	e.setHook(func(op string, _ []libdns.Record, _ string) error {
-		if op == "set" {
+	e.setHook(func(op string, recs []libdns.Record, _ string) error {
+		if recordsWrite(op, recs) {
 			panic("library bug")
 		}
 		return nil
@@ -1194,8 +1195,8 @@ func TestUnknownIPv4StillRenews(t *testing.T) {
 	e.cancel()
 	e.svc.Wait()
 	var sets atomic.Int32
-	e.setHook(func(op string, _ []libdns.Record, _ string) error {
-		if op == "set" {
+	e.setHook(func(op string, recs []libdns.Record, _ string) error {
+		if recordsWrite(op, recs) {
 			sets.Add(1)
 		}
 		return nil
@@ -1353,7 +1354,7 @@ func TestCAAWrittenAfterRegisterBeforeOrder(t *testing.T) {
 		mu.Lock()
 		defer mu.Unlock()
 		switch rr := recs[0].RR(); {
-		case op == "set" && rr.Type == "CAA" && caaQ < 0:
+		case op == "append" && rr.Type == "CAA" && caaQ < 0:
 			e.svc.mu.Lock()
 			acct, uri := e.svc.doc.Account, e.svc.accountURILocked()
 			e.svc.mu.Unlock()
@@ -1575,7 +1576,7 @@ func TestReadyDomainAppliesDueCAA(t *testing.T) {
 	var addrSets atomic.Int32
 	e.setHook(func(op string, recs []libdns.Record, _ string) error {
 		for _, r := range recs {
-			if t := r.RR().Type; (op == "set" || op == "delete") && (t == "A" || t == "AAAA") {
+			if t := r.RR().Type; (op == "append" || op == "delete") && (t == "A" || t == "AAAA") {
 				addrSets.Add(1)
 			}
 		}
@@ -1802,4 +1803,86 @@ func TestNoMailNotRecommendedForAlertSender(t *testing.T) {
 			t.Errorf("%s: nomail recommended %v, want %v", n, got, want)
 		}
 	}
+}
+
+// ── review fixes (I1, I3) ─────────────────────────────────
+
+// TestApplyCAARestoresDeletedPin (I1): on a ready domain with a current
+// pin, a hand-deleted CAA comes back with POST …/dns/apply caa; the due
+// set is cleared.
+func TestApplyCAARestoresDeletedPin(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-rs.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) })
+	var keep []libdns.RR
+	for _, rr := range e.zone.Records(name) {
+		if rr.Type != "CAA" {
+			keep = append(keep, rr)
+		}
+	}
+	e.zone.Set(name, keep...)
+	if code, body := e.do("POST", "/domains/"+name+"/dns/apply", `{"sets":["caa"]}`, true); code != 202 {
+		t.Fatalf("apply = %d %s", code, body)
+	}
+	e.waitFor("the restored pin", 30*time.Second, func() bool {
+		d := e.domain(name)
+		return len(caaValues(e.zone, name)) == 2 && len(d.DueSets) == 0 && e.idle(name)
+	})
+	for _, v := range caaValues(e.zone, name) {
+		if !strings.Contains(v, "accounturi="+e.storedURI()) {
+			t.Fatalf("live %v", caaValues(e.zone, name))
+		}
+	}
+}
+
+// TestUnapplicableDueSetCleared (I1): a requested set that can't apply
+// (unknown CA) is cleared and logged, not retried every tick.
+func TestUnapplicableDueSetCleared(t *testing.T) {
+	e := newEnvWith(t, false, func(c *Config) { c.CAAIssuer = "" })
+	const name = "team-ua.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) })
+	e.do("POST", "/domains/"+name+"/dns/apply", `{"sets":["caa"]}`, true)
+	e.waitFor("the due set cleared", 30*time.Second, func() bool { return len(e.domain(name).DueSets) == 0 && e.idle(name) })
+	if !strings.Contains(e.logs.String(), "record set caa requested but not applicable now (unknown CA") {
+		t.Fatalf("not logged:\n%s", e.logs.String())
+	}
+	before := e.zone.CallCount()
+	time.Sleep(300 * time.Millisecond) // several ticks
+	if n := e.zone.CallCount() - before; n != 0 {
+		t.Fatalf("%d provider calls while nothing is due", n)
+	}
+}
+
+// TestCAAOffDropsGoneRefs (I3): with CAA off, owned CAA refs that are no
+// longer live (deleted by hand) are dropped; the domain isn't due forever.
+func TestCAAOffDropsGoneRefs(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-gr.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) })
+	var keep []libdns.RR
+	for _, rr := range e.zone.Records(name) {
+		if rr.Type != "CAA" {
+			keep = append(keep, rr)
+		}
+	}
+	e.zone.Set(name, keep...)
+	e.restart(func(c *Config) { c.CAA = false })
+	e.waitFor("the refs dropped", 30*time.Second, func() bool { d := e.domain(name); return !hasCAARefs(&d) && e.idle(name) })
+	before := e.zone.CallCount()
+	time.Sleep(300 * time.Millisecond)
+	if n := e.zone.CallCount() - before; n != 0 {
+		t.Fatalf("%d provider calls while nothing is due", n)
+	}
+}
+
+// recordsWrite: a records-step write (the sets are appended, never
+// SetRecords; the DNS-01 TXT appends come later, in the order).
+func recordsWrite(op string, recs []libdns.Record) bool {
+	return op == "append" && len(recs) > 0 && recs[0].RR().Type != "TXT"
 }

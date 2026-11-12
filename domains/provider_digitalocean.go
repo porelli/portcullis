@@ -174,19 +174,8 @@ func (p *doProvider) SetRecords(ctx context.Context, zone string, recs []libdns.
 				have = append(have, l)
 			}
 		}
-		for _, h := range have {
-			keep := false
-			for _, w := range want[k] {
-				if w.Data == h.rr.Data && w.TTL == h.rr.TTL {
-					keep = true
-				}
-			}
-			if !keep {
-				if _, err := p.client.Domains.DeleteRecord(ctx, doDomain(zone), h.id); err != nil {
-					return out, fmt.Errorf("digitalocean: replacing %s %s: %w", k.t, k.n, err)
-				}
-			}
-		}
+		// Create the missing records first, then delete the stale ones:
+		// never a moment without the new entries (a CAA pin).
 		for _, w := range want[k] {
 			exists := false
 			for _, h := range have {
@@ -200,6 +189,19 @@ func (p *doProvider) SetRecords(ctx context.Context, zone string, recs []libdns.
 				}
 			}
 			out = append(out, parsedRR(w))
+		}
+		for _, h := range have {
+			keep := false
+			for _, w := range want[k] {
+				if w.Data == h.rr.Data && w.TTL == h.rr.TTL {
+					keep = true
+				}
+			}
+			if !keep {
+				if _, err := p.client.Domains.DeleteRecord(ctx, doDomain(zone), h.id); err != nil {
+					return out, fmt.Errorf("digitalocean: replacing %s %s: %w", k.t, k.n, err)
+				}
+			}
 		}
 	}
 	return out, nil

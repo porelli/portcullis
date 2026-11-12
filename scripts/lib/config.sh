@@ -78,7 +78,9 @@ config_apply() {
     # The new account Traefik registers can't order while the CAA is
     # pinned to the old one: back to CA-only first (dns_tighten_main pins
     # the new account after `up`).
-    if [ "$(_bool "${DNS_CAA:-true}" false)" = true ] && _dns_automated "${DNS_PROVIDER:-none}"; then
+    local caa
+    caa="$(_dns_flag DNS_CAA true)" || exit 1
+    if [ "$caa" = true ] && _dns_automated "${DNS_PROVIDER:-none}"; then
       dns_relax_main
     fi
     if docker volume inspect portcullis_traefik_acme >/dev/null 2>&1; then

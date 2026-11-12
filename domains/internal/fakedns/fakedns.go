@@ -92,6 +92,12 @@ type Provider struct {
 	// "delete") outside the zone lock; an error fails the call (tests:
 	// blocking, provider errors that echo the token).
 	Hook func(op string, recs []libdns.Record) error
+	// SetMode mimics real libdns providers' SetRecords: "" replaces each
+	// (name, type) RRset (libdns semantics); "cloudflare" (libdns/cloudflare
+	// v0.2.2) and "porkbun" (v1.1.0) handle each input record alone — no
+	// same-name/type record: create; one (cloudflare) / the first
+	// (porkbun): update it in place; several: cloudflare errors.
+	SetMode string
 }
 
 // FindZone reports the zone the provider manages for fqdn (the service
@@ -173,6 +179,27 @@ func (p *Provider) SetRecords(_ context.Context, zone string, recs []libdns.Reco
 	}
 	p.Zone.mu.Lock()
 	defer p.Zone.mu.Unlock()
+	if p.SetMode != "" {
+		for _, r := range recs {
+			rr := r.RR()
+			n := abs(rr.Name, zone)
+			var idx []int
+			for i, old := range p.Zone.recs[n] {
+				if old.Type == rr.Type {
+					idx = append(idx, i)
+				}
+			}
+			switch {
+			case len(idx) == 0:
+				p.Zone.recs[n] = append(p.Zone.recs[n], rr)
+			case len(idx) > 1 && p.SetMode == "cloudflare":
+				return nil, fmt.Errorf("expected only one record with name %q and type %s, but got %d", rr.Name, rr.Type, len(idx))
+			default:
+				p.Zone.recs[n][idx[0]] = rr
+			}
+		}
+		return recs, nil
+	}
 	type key struct{ n, t string }
 	cleared := map[key]bool{}
 	for _, r := range recs {

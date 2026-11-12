@@ -271,10 +271,8 @@ func (in toolInput) spec() (dnsplan.Spec, error) {
 	if err != nil {
 		return dnsplan.Spec{}, err
 	}
-	if u := in.CAA.AccountURI; u != "" {
-		if pu, err := url.Parse(u); err != nil || pu.Scheme != "https" || pu.Host == "" || strings.ContainsAny(u, " \t\"") {
-			return dnsplan.Spec{}, fmt.Errorf("caa.account_uri %q is not an https URL", u)
-		}
+	if u := in.CAA.AccountURI; u != "" && !dnsplan.ValidAccountURI(u) {
+		return dnsplan.Spec{}, fmt.Errorf("caa.account_uri %q is not an ACME account URI (https, no spaces, quotes or ';')", u)
 	}
 	issuer, _ := dnsplan.IssuerFor(in.CAServer, in.CAA.Issuer)
 	return dnsplan.Spec{Name: name, IPv4: v4, IPv6: v6, CAA: in.CAA.Enabled, Issuer: issuer, AccountURI: in.CAA.AccountURI,
@@ -361,7 +359,7 @@ func runTraefikAccountURI(args []string, stdout, stderr io.Writer) int {
 		return none()
 	}
 	u := doc.Letsencrypt.Account.Registration.URI
-	if pu, err := url.Parse(u); err != nil || pu.Scheme != "https" || pu.Host == "" || strings.ContainsAny(u, " \t\r\n\"") {
+	if !dnsplan.ValidAccountURI(u) {
 		return none()
 	}
 	fmt.Fprintln(stdout, u)

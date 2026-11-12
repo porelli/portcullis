@@ -698,7 +698,8 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 	// can be pinned to its URI before any order (contract §12.4).
 	var u *acmeUser
 	uri := ""
-	if needCert || caaDue {
+	// An explicitly due caa set (POST …/dns/apply) needs the account too.
+	if needCert || caaDue || contains(snap.DueSets, dnsplan.SetCAA) {
 		if u, err = s.account(); err != nil {
 			fail(err)
 			return
@@ -726,6 +727,13 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 				sets = append(sets, set)
 			}
 		}
+		// Due sets this step can't apply are cleared (logged), never
+		// retried every tick.
+		for _, x := range snap.DueSets {
+			if !contains(sets, x) {
+				s.logf("domain %s: record set %s requested but not applicable now (%s): skipped", name, x, s.whyNotApplicable(x, keepRecords, snap))
+			}
+		}
 		j.lock()
 		if !s.update(name, gen, func(d *Domain) { d.State = StateRecords }) {
 			j.unlock()
@@ -736,6 +744,26 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 		var zone string
 		if len(sets) > 0 {
 			written, removed, zone, err = s.applySets(rctx, p, snap, sets, uri)
+		}
+		// CAA off: the CAA entries recorded in other zones (the zone found
+		// changed) are removed there too, best effort, and dropped.
+		var otherZones []string
+		if err == nil && !s.cfg.CAA && contains(sets, dnsplan.SetCAA) {
+			for z, refs := range snap.Records {
+				var caa []RecordRef
+				for _, r := range refs {
+					if r.Type == "CAA" {
+						caa = append(caa, r)
+					}
+				}
+				if z == zone || len(caa) == 0 {
+					continue
+				}
+				if derr := deleteRecords(rctx, p, z, caa); derr != nil {
+					s.logf("domain %s: removing its CAA records in zone %s failed (dropped anyway): %s", name, z, redact(derr.Error(), snap.Credentials))
+				}
+				otherZones = append(otherZones, z)
+			}
 		}
 		if err == nil && snap.SignRequested {
 			err = s.enableSigning(rctx, snap)
@@ -749,6 +777,15 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 					d.Records = map[string][]RecordRef{}
 				}
 				d.Records[zone] = mergeRecords(dropRecords(d.Records[zone], removed), written)
+				for _, z := range otherZones {
+					var keep []RecordRef
+					for _, r := range d.Records[z] {
+						if r.Type != "CAA" {
+							keep = append(keep, r)
+						}
+					}
+					d.Records[z] = keep
+				}
 				if err == nil && contains(sets, dnsplan.SetAddress) {
 					d.AppliedIPv4, d.AppliedIPv6 = addrString(s.cfg.IPv4), addrString(s.cfg.IPv6)
 				}
@@ -760,11 +797,11 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 			fail(err)
 			return
 		}
-		applied := sets
+		requested := snap.DueSets
 		s.update(name, gen, func(d *Domain) {
 			var left []string
 			for _, x := range d.DueSets {
-				if !contains(applied, x) {
+				if !contains(requested, x) { // requested meanwhile: next step
 					left = append(left, x)
 				}
 			}
@@ -772,7 +809,7 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 			if snap.SignRequested {
 				d.SignRequested = false
 			}
-			if contains(applied, dnsplan.SetCAA) && !s.cfg.CAA {
+			if contains(sets, dnsplan.SetCAA) && !s.cfg.CAA {
 				d.CAAAccountURI, d.CAAOK = "", false
 			}
 		})
@@ -826,6 +863,19 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 	}) && snap.State != StateReady {
 		s.logf("domain %s: ready", name)
 	}
+}
+
+// whyNotApplicable says why a requested set isn't applied in this step.
+func (s *Service) whyNotApplicable(set string, keepRecords bool, d *Domain) string {
+	switch {
+	case set == dnsplan.SetAddress && keepRecords:
+		return "the server's public IPv4 is unknown"
+	case set == dnsplan.SetCAA && s.cfg.CAA && s.cfg.CAAIssuer == "":
+		return "unknown CA: set DNS_CAA_ISSUER"
+	case set == dnsplan.SetCAA && !s.cfg.CAA:
+		return "DNS_CAA=false and no CAA entries of Portcullis' are recorded"
+	}
+	return "not opted in"
 }
 
 // enableSigning turns DNSSEC signing on for d's zone (SignRequested).

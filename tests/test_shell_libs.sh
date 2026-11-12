@@ -1991,7 +1991,10 @@ echo "$*" >> "$d/argv"
 case "$*" in
   "image inspect "*) exit 0 ;;
   "volume inspect portcullis_traefik_acme") [ -f "$d/acme-volume" ]; exit ;;
-  run\ --rm\ --network\ none*traefik-account-uri*) cat "$d/traefik-uri" 2>/dev/null; exit 0 ;;
+  run\ --rm\ --network\ none*traefik-account-uri*)
+    [ ! -f "$d/traefik-fail" ] || exit 125
+    [ -s "$d/traefik-uri" ] || exit 3   # the tool: no account in acme.json
+    cat "$d/traefik-uri"; exit 0 ;;
   compose\ *\ run\ *dns-tool*)
     sub="$(printf '%s\n' "$@" | sed -n '/^dns-tool$/{n;p;}')"
     cat > "$d/stdin-$sub"
@@ -2074,6 +2077,18 @@ expect_eq "dns check judges Traefik's pin" "$(dtin check .caa.account_uri)" "htt
 : > "$STUB_DIR/dt/traefik-uri"
 dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup true false ""' >/dev/null
 expect_eq "dns setup: no Traefik account = CA-only" "$(dtin apply .caa.account_uri)" ""
+touch "$STUB_DIR/dt/traefik-fail"
+OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup true false ""')"
+expect_eq "dns setup: an unreadable Traefik account leaves the live CAA alone" "$(dtin apply '.sets | join(",")')" "address"
+case "$OUT" in *"couldn't be read"*) t_pass "dns setup: an unreadable Traefik account warns" ;; *) t_fail "unreadable account: $OUT" ;; esac
+OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup true false caa')"
+case "$OUT" in *"Nothing to apply"*rc=1) t_pass "dns setup --only caa: refused while the account can't be read" ;; *) t_fail "only caa unreadable: $OUT" ;; esac
+rm -f "$STUB_DIR/dt/traefik-fail"
+for bad in 'https://x.test/acct;validationmethods=http-01' 'http://x.test/acct' 'https://x.test/a b'; do
+  printf '%s\n' "$bad" > "$STUB_DIR/dt/traefik-uri"
+  expect_eq "traefik uri: '$bad' is refused" "$(dt 'dns_traefik_account_uri')" "rc=1"
+done
+: > "$STUB_DIR/dt/traefik-uri"
 dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 DNS_ACCOUNT_URI=https://x.test/acct/1 dns_plan true' >/dev/null
 expect_eq "dns plan: a caller's DNS_ACCOUNT_URI wins" "$(dtin plan .caa.account_uri)" "https://x.test/acct/1"
 rm -f "$STUB_DIR/dt/acme-volume"
@@ -2165,6 +2180,8 @@ OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123'
 case "$OUT" in *"issuance will fail on CAA until ./portcullis dns setup"*rc=0) t_pass "config apply flip: relax failure warns and goes on" ;; *) t_fail "relax failure: $OUT" ;; esac
 expect_eq "config apply flip: acme.json still cleared after a failed relax" "$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv")" 1
 rm -f "$STUB_DIR/dt/rc-apply"
+OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 DNS_CAA=yes')"
+case "$OUT" in *"DNS_CAA=yes must be true or false"*rc=1) t_pass "config apply flip: DNS_CAA must be true or false" ;; *) t_fail "flip DNS_CAA=yes: $OUT" ;; esac
 OUT="$(flip 'export DNS_PROVIDER=gcloud')"
 expect_eq "config apply flip: no relax for a manual provider" "$(grep -c dns-tool "$STUB_DIR/dt/argv" || true)" 0
 expect_eq "config apply: ACME_DNS_PROVIDER written" "$(grep '^ACME_DNS_PROVIDER=' "$FL_ROOT/.env")" "ACME_DNS_PROVIDER=gcloud"

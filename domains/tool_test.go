@@ -113,14 +113,15 @@ func TestToolApplyWait(t *testing.T) {
 	if !pl.CAA.WouldIssue || len(f.zone.Records("portcullis.example.test")) != 3 { // A + issue + issuewild
 		t.Fatalf("caa %+v records %v", pl.CAA, f.zone.Records("portcullis.example.test"))
 	}
-	// Records that never become visible: exit 1 at the deadline.
-	f.hook = func(op string, _ []libdns.Record) error {
-		if op == "set" {
-			f.zone.Set("portcullis.example.test") // the write "doesn't propagate"
-		}
-		return nil
+	// Records that never become visible (the resolvers answer from an
+	// empty zone): exit 1 at the deadline.
+	empty, err := fakedns.Serve(fakedns.NewZone(), "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if code, _, _ := f.run([]string{"apply", "--wait", "200ms"}, toolJSON(func(m map[string]any) { m["ipv4"] = "203.0.113.99" })); code != exitProblem {
+	defer empty.Close()
+	f.resolvers = []string{empty.Addr}
+	if code, _, _ := f.run([]string{"apply", "--wait", "200ms"}, toolJSON(nil)); code != exitProblem {
 		t.Fatalf("apply --wait not visible = %d", code)
 	}
 }

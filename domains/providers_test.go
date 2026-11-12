@@ -179,6 +179,7 @@ type doFake struct {
 	recs   map[int]map[string]any
 	posts  []string
 	dels   []int
+	ops    []string
 }
 
 func (f *doFake) handler() http.Handler {
@@ -199,6 +200,7 @@ func (f *doFake) handler() http.Handler {
 		case r.Method == "POST" && r.URL.Path == base:
 			b, _ := io.ReadAll(r.Body)
 			f.posts = append(f.posts, string(b))
+			f.ops = append(f.ops, "post")
 			var rec map[string]any
 			json.Unmarshal(b, &rec)
 			f.nextID++
@@ -210,6 +212,7 @@ func (f *doFake) handler() http.Handler {
 			var id int
 			fmt.Sscanf(strings.TrimPrefix(r.URL.Path, base+"/"), "%d", &id)
 			f.dels = append(f.dels, id)
+			f.ops = append(f.ops, "del")
 			delete(f.recs, id)
 			w.WriteHeader(204)
 		default:
@@ -275,6 +278,10 @@ func TestDigitalOceanNonCAAPassesThrough(t *testing.T) {
 	}
 	if len(f.dels) != 1 || f.dels[0] != 1 {
 		t.Fatalf("the old A wasn't replaced: dels %v", f.dels)
+	}
+	// Create before delete per RRset (review I2): the new A, then the old one goes.
+	if strings.Join(f.ops, ",") != "post,post,del,post,post" {
+		t.Fatalf("ops %v", f.ops)
 	}
 	all := strings.Join(f.posts, "\n")
 	for _, want := range []string{`"type":"A","name":"team","data":"203.0.113.10"`, `"type":"MX","name":"team","data":".","priority":0`, `"type":"TXT","name":"_acme-challenge.team","data":"tok"`} {

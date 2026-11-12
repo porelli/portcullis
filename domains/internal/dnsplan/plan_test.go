@@ -250,12 +250,12 @@ func TestApplyWritesSetsTTLs(t *testing.T) {
 	check(pd, "AAAA")
 	check(pd, "CAA", `0 issue "`+v+`" 5m0s`, `0 issuewild "`+v+`" 5m0s`)
 	check(pd, "MX", "0 . 1h0m0s")
-	check(pd, "TXT", "v=spf1 -all 1h0m0s", "keep-me 1h0m0s")
+	check(pd, "TXT", "v=spf1 -all 1h0m0s", "keep-me 1m0s") // other TXT untouched
 	check("_dmarc."+pd, "TXT", "v=DMARC1; p=reject; 1h0m0s")
 	if len(written) != 2+2+3 {
 		t.Fatalf("written %v", written)
 	}
-	if len(removed) != 1 || removed[0].Type != "AAAA" || removed[0].Name != "portcullis" {
+	if len(removed) != 2 || removed[0].Type != "AAAA" || removed[0].Name != "portcullis" || removed[1].Value != "v=spf1 include:old -all" {
 		t.Fatalf("removed %v", removed)
 	}
 	for _, r := range written {
@@ -375,5 +375,110 @@ func TestBuildLookupFailureUnknown(t *testing.T) {
 	}
 	if p.CAA.WouldIssue || p.DNSSEC.State != dnssec.Unknown {
 		t.Fatalf("caa %+v dnssec %+v", p.CAA, p.DNSSEC)
+	}
+}
+
+// TestApplyPerRecordProviders (review C1): providers whose SetRecords
+// updates one same-name/type record per input (cloudflare, porkbun) must
+// still end with every entry: DigiCert kept, issue AND issuewild ours,
+// the user's TXT and our SPF both present.
+func TestApplyPerRecordProviders(t *testing.T) {
+	for _, mode := range []string{"cloudflare", "porkbun"} {
+		t.Run(mode, func(t *testing.T) {
+			e := newPlanEnv(t)
+			e.in.Provider = &fakedns.Provider{Zone: e.zone, ZoneName: pz, SetMode: mode}
+			e.in.Spec.NoMail = true
+			e.zone.Set(pd, libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issue", Value: "digicert.com"}.RR(),
+				libdns.TXT{Name: "portcullis", TTL: time.Hour, Text: "google-site-verification=abc"}.RR(),
+				libdns.RR{Name: "portcullis", Type: "A", Data: "198.51.100.1"}, libdns.RR{Name: "portcullis", Type: "A", Data: "198.51.100.2"})
+			if _, _, err := Apply(context.Background(), e.in, []string{SetAddress, SetCAA, SetNoMail}); err != nil {
+				t.Fatal(err)
+			}
+			v := CAAValue("letsencrypt.org", acct)
+			caa := rrs(e.zone, pd, "CAA")
+			if strings.Join(caa, "|") != `0 issue "digicert.com" 1h0m0s|0 issue "`+v+`" 5m0s|0 issuewild "`+v+`" 5m0s` {
+				t.Fatalf("CAA %v", caa)
+			}
+			if txt := rrs(e.zone, pd, "TXT"); strings.Join(txt, "|") != "google-site-verification=abc 1h0m0s|v=spf1 -all 1h0m0s" {
+				t.Fatalf("TXT %v", txt)
+			}
+			if a := rrs(e.zone, pd, "A"); strings.Join(a, "|") != ipv4+" 5m0s" {
+				t.Fatalf("A %v", a)
+			}
+			// An account switch: the new pin is appended before the old one
+			// goes (never a moment without issue / issuewild).
+			var minIssue = 99
+			e.in.Provider = &fakedns.Provider{Zone: e.zone, ZoneName: pz, SetMode: mode, Hook: func(op string, _ []libdns.Record) error {
+				n := 0
+				for _, c := range rrs(e.zone, pd, "CAA") {
+					if strings.Contains(c, "letsencrypt.org") {
+						n++
+					}
+				}
+				if op != "get" && n < minIssue {
+					minIssue = n
+				}
+				return nil
+			}}
+			e.in.Spec.AccountURI = "https://acme-v02.api.letsencrypt.org/acme/acct/456"
+			if _, _, err := Apply(context.Background(), e.in, []string{SetCAA}); err != nil {
+				t.Fatal(err)
+			}
+			if minIssue < 2 {
+				t.Fatalf("a moment with %d of our entries during the switch", minIssue)
+			}
+			if c := rrs(e.zone, pd, "CAA"); len(c) != 3 || strings.Contains(strings.Join(c, "|"), "acct/123") {
+				t.Fatalf("after the switch %v", c)
+			}
+		})
+	}
+}
+
+func TestApplyRejectsBadAccountURI(t *testing.T) {
+	e := newPlanEnv(t)
+	for _, u := range []string{"https://x/acct; validationmethods=http-01", `https://x/"a`, "http://x/acct", "https:///acct", "https://x/a b"} {
+		e.in.Spec.AccountURI = u
+		if _, _, err := Apply(context.Background(), e.in, []string{SetCAA}); err == nil {
+			t.Errorf("%q accepted", u)
+		}
+	}
+	if len(rrs(e.zone, pd, "CAA")) != 0 {
+		t.Fatal("a CAA was written")
+	}
+}
+
+// TestWouldIssueEveryResolver (review I4): a resolver still serving an
+// old pin makes would_issue false.
+func TestWouldIssueEveryResolver(t *testing.T) {
+	e := newPlanEnv(t)
+	e.ourCAA()
+	stale := fakedns.NewZone()
+	old := CAAValue("letsencrypt.org", "https://acme-v02.api.letsencrypt.org/acme/acct/1")
+	stale.Set(pd, libdns.CAA{Name: "portcullis", Tag: "issue", Value: old}.RR(), libdns.CAA{Name: "portcullis", Tag: "issuewild", Value: old}.RR())
+	e.in.Provider = nil
+	if p := Build(context.Background(), e.in); !p.CAA.WouldIssue {
+		t.Fatal("setup: one resolver doesn't issue")
+	}
+	e.in.Resolvers = append(e.in.Resolvers, serveZone(t, stale)...)
+	if p := Build(context.Background(), e.in); p.CAA.WouldIssue {
+		t.Fatal("would_issue with a resolver showing the old pin")
+	}
+}
+
+func TestPlanStepsReplace(t *testing.T) {
+	e := newPlanEnv(t)
+	e.in.Spec.NoMail = true
+	e.zone.Set(pd, libdns.TXT{Name: "portcullis", Text: "v=spf1 include:mail.test -all"}.RR(),
+		libdns.MX{Name: "portcullis", Preference: 10, Target: "mx.mail.test."}.RR(),
+		libdns.CAA{Name: "portcullis", Tag: "issue", Value: "letsencrypt.org"}.RR())
+	all := ""
+	for _, it := range Build(context.Background(), e.in).Items {
+		all += strings.Join(it.Steps, "\n") + "\n"
+	}
+	for _, want := range []string{"replaces your SPF record v=spf1 include:mail.test -all", "replaces the MX record 10 mx.mail.test.",
+		`replaces the letsencrypt.org entries already there (0 issue "letsencrypt.org")`} {
+		if !strings.Contains(all, want) {
+			t.Errorf("no %q in\n%s", want, all)
+		}
 	}
 }

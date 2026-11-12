@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
 
@@ -31,6 +32,16 @@ func IssuerFor(caServer, override string) (string, bool) {
 		return i, true
 	}
 	return "", false
+}
+
+// ValidAccountURI: an ACME account URI fit for a CAA value (https, a
+// host, nothing a CAA parameter or a quoted string can't hold).
+func ValidAccountURI(u string) bool {
+	if u == "" || strings.ContainsAny(u, " \t\r\n\";") {
+		return false
+	}
+	pu, err := url.Parse(u)
+	return err == nil && pu.Scheme == "https" && pu.Host != ""
 }
 
 // CAAValue is the issue / issuewild value Portcullis writes: pinned to an
@@ -138,7 +149,7 @@ func removalCAA(live []libdns.CAA, s Spec) []libdns.CAA {
 			continue
 		}
 		for _, r := range s.Owned {
-			if r.Type == "CAA" && r.Value == c.RR().Data {
+			if r.Type == "CAA" && dataKey("CAA", r.Value) == dataKey("CAA", c.RR().Data) {
 				out = append(out, c)
 				break
 			}

@@ -133,7 +133,7 @@ type Spec struct {
 // Provider is what the plan needs from a libdns provider.
 type Provider interface {
 	libdns.RecordGetter
-	libdns.RecordSetter
+	libdns.RecordAppender
 	libdns.RecordDeleter
 }
 
@@ -339,19 +339,21 @@ func Build(ctx context.Context, in Input) Plan {
 	return p
 }
 
+// wouldIssue: the CA would issue for <d> and *.<d> at EVERY resolver,
+// each asked on its own (one may still cache an old pin), as waitCAA.
 func wouldIssue(ctx context.Context, resolvers []string, d, issuer, uri string) bool {
-	if issuer == "" {
+	if issuer == "" || len(resolvers) == 0 || (uri != "" && !ValidAccountURI(uri)) {
 		return false
 	}
-	_, rrs, err := EffectiveCAA(ctx, resolvers, d)
-	if err != nil {
-		return false
+	for _, r := range resolvers {
+		for _, n := range []string{d, "*." + d} {
+			_, rrs, err := EffectiveCAA(ctx, []string{r}, n)
+			if err != nil || !WouldIssue(rrs, issuer, uri, strings.HasPrefix(n, "*.")) {
+				return false
+			}
+		}
 	}
-	_, wrrs, err := EffectiveCAA(ctx, resolvers, "*."+d)
-	if err != nil {
-		return false
-	}
-	return WouldIssue(rrs, issuer, uri, false) && WouldIssue(wrrs, issuer, uri, true)
+	return true
 }
 
 // diffSteps: the lines that make live equal want.
@@ -584,6 +586,18 @@ func caaItems(ctx context.Context, in Input, d, zone string, fix Fix, live []liv
 		it.Severity, it.Fix = SevProblem, fix
 		it.Steps = diffSteps("CAA", d, it.Want, it.Live, TTLCAA)
 	}
+	if st != StatusOK {
+		var users []string
+		for _, c := range cur {
+			if ours(c, s.Issuer) && !contains(it.Want, c.RR().Data) {
+				users = append(users, c.RR().Data)
+			}
+		}
+		if len(users) > 0 {
+			it.Steps = append(it.Steps, fmt.Sprintf("replaces the %s entries already there (%s): Portcullis owns %s's entries at %s from now on, and DNS_CAA=false doesn't bring them back",
+				s.Issuer, strings.Join(users, ", "), s.Issuer, d))
+		}
+	}
 	if bare(zone) == d && !s.Main && st != StatusOK {
 		it.Steps = append(it.Steps, "this CAA is at the zone apex: it covers every name in the zone that has no CAA of its own")
 	}
@@ -671,6 +685,19 @@ func nomailItems(ctx context.Context, in Input, d string, fix Fix) []Item {
 		default:
 			it.Severity, it.Fix = SevWarning, fix
 			it.Steps = diffSteps(r.typ, r.name, it.Want, it.Live, TTLNoMail)
+			for _, l := range it.Live {
+				if l == r.want {
+					continue
+				}
+				switch {
+				case r.typ == "MX":
+					it.Steps = append(it.Steps, fmt.Sprintf("replaces the MX record %s: %s then receives no mail", l, d))
+				case r.name == d:
+					it.Steps = append(it.Steps, "replaces your SPF record "+l+" (other TXT records stay)")
+				default:
+					it.Steps = append(it.Steps, "replaces your DMARC record "+l)
+				}
+			}
 		}
 		out = append(out, it)
 	}
@@ -791,14 +818,88 @@ func rel(r libdns.Record, zone string) libdns.Record {
 	return rr
 }
 
+// dataKey normalises record data for comparison (providers format it
+// differently: case, trailing dots, quoting): the parsed fields.
+func dataKey(typ, data string) string {
+	r, err := libdns.RR{Type: typ, Data: data}.Parse()
+	if err != nil {
+		return typ + " " + strings.TrimSpace(data)
+	}
+	switch v := r.(type) {
+	case libdns.Address:
+		return typ + " " + v.IP.String()
+	case libdns.CAA:
+		return fmt.Sprintf("CAA %d %s %s", v.Flags, strings.ToLower(v.Tag), strings.TrimSpace(v.Value))
+	case libdns.MX:
+		return fmt.Sprintf("MX %d %s", v.Preference, fqdn(v.Target))
+	case libdns.TXT:
+		return "TXT " + v.Text
+	case libdns.CNAME:
+		return "CNAME " + fqdn(v.Target)
+	}
+	return typ + " " + strings.TrimSpace(data)
+}
+
+// syncSet makes the (name, type) RRset at name equal want WITHOUT
+// libdns SetRecords: several libdns providers (cloudflare v0.2.2, porkbun
+// v1.1.0) update one same-name/type record per input record instead of
+// replacing the RRset, so a multi-value set would overwrite itself. The
+// missing entries are appended FIRST and the stale ones deleted by exact
+// data afterwards: there is never a moment without the new entries (a
+// CAA pin never disappears in between). Returns the deleted records.
+func syncSet(ctx context.Context, p Provider, zone, name, typ string, want []libdns.Record, live []liveRec) ([]libdns.Record, error) {
+	have := pick(live, name, typ)
+	haveKeys := map[string]bool{}
+	for _, rr := range have {
+		haveKeys[dataKey(typ, rr.Data)] = true
+	}
+	wantKeys := map[string]bool{}
+	var add []libdns.Record
+	for _, w := range want {
+		k := dataKey(typ, w.RR().Data)
+		wantKeys[k] = true
+		if !haveKeys[k] {
+			add = append(add, rel(w, zone))
+		}
+	}
+	if len(add) > 0 {
+		if _, err := p.AppendRecords(ctx, zone, add); err != nil {
+			return nil, err
+		}
+	}
+	var stale []libdns.Record
+	for _, rr := range have {
+		if !wantKeys[dataKey(typ, rr.Data)] {
+			rr.Name = libdns.RelativeName(dns.Fqdn(name), zone)
+			stale = append(stale, parsedRR(rr))
+		}
+	}
+	if len(stale) == 0 {
+		return nil, nil
+	}
+	return p.DeleteRecords(ctx, zone, stale)
+}
+
+func parsedRR(rr libdns.RR) libdns.Record {
+	if r, err := rr.Parse(); err == nil {
+		return r
+	}
+	return rr
+}
+
 // Apply writes the given sets through the provider: written are the
 // records Portcullis now owns (refs for tracking), removed the ones it
-// deleted. It touches only <d>, *.<d> and _dmarc.<d>, never NS / SOA.
+// deleted (or, CAA off, owned refs that are no longer live). It touches
+// only <d>, *.<d> and _dmarc.<d>, never NS / SOA, and never uses libdns
+// SetRecords (see syncSet).
 func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref, err error) {
 	if in.Provider == nil {
 		return nil, nil, errors.New("no provider: the records must be created by hand")
 	}
 	s := in.Spec
+	if s.AccountURI != "" && !ValidAccountURI(s.AccountURI) {
+		return nil, nil, fmt.Errorf("the ACME account URI %q can't go into a CAA value", s.AccountURI)
+	}
 	d := fqdn(s.Name)
 	zone := in.Zone
 	if zone == "" {
@@ -810,6 +911,11 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 	live, err := providerRecords(ctx, in.Provider, zone, d)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading the records of %s: %w", bare(d), err)
+	}
+	gone := func(recs []libdns.Record) {
+		for _, g := range recs {
+			removed = append(removed, RefOf(g, zone))
+		}
 	}
 	want := Wanted(s)
 	for _, set := range sets {
@@ -823,25 +929,22 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 			if !s.IPv4.IsValid() {
 				return written, removed, errors.New("the server's public IPv4 is unknown (./portcullis up detects it once a domain is enrolled — run it again — or set PORTCULLIS_PUBLIC_IPV4 in .env)")
 			}
-			var recs []libdns.Record
 			for _, r := range want[SetAddress] {
-				recs = append(recs, rel(r, zone))
 				written = append(written, RefOf(r, zone))
 			}
-			if _, err := in.Provider.SetRecords(ctx, zone, recs); err != nil {
-				return written, removed, fmt.Errorf("setting the A/AAAA records of %s and *.%s: %w", bare(d), bare(d), err)
-			}
-			if !s.IPv6.IsValid() {
-				var stale []libdns.Record
-				for _, n := range []string{d, "*." + d} {
-					stale = append(stale, libdns.RR{Name: libdns.RelativeName(n, zone), Type: "AAAA"})
-				}
-				gone, err := in.Provider.DeleteRecords(ctx, zone, stale)
-				for _, g := range gone {
-					removed = append(removed, RefOf(g, zone))
-				}
-				if err != nil {
-					return written, removed, fmt.Errorf("removing old AAAA records of %s (the server has no IPv6): %w", bare(d), err)
+			for _, n := range []string{d, "*." + d} {
+				for _, typ := range []string{"A", "AAAA"} {
+					var w []libdns.Record
+					for _, r := range want[SetAddress] {
+						if r.RR().Name == n && r.RR().Type == typ {
+							w = append(w, r)
+						}
+					}
+					del, err := syncSet(ctx, in.Provider, zone, n, typ, w, live)
+					gone(del)
+					if err != nil {
+						return written, removed, fmt.Errorf("setting the %s records of %s: %w", typ, bare(n), err)
+					}
 				}
 			}
 		case SetCAA:
@@ -855,6 +958,22 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 			}
 			if !s.CAA {
 				rm := removalCAA(cur, s)
+				// Owned refs no longer live (deleted by hand, another
+				// format) are dropped from tracking too.
+				for _, r := range s.Owned {
+					if r.Type != "CAA" {
+						continue
+					}
+					found := false
+					for _, c := range cur {
+						if dataKey("CAA", c.RR().Data) == dataKey("CAA", r.Value) {
+							found = true
+						}
+					}
+					if !found {
+						removed = append(removed, r)
+					}
+				}
 				if len(rm) == 0 {
 					continue
 				}
@@ -863,10 +982,8 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 					c.Name = libdns.RelativeName(d, zone)
 					recs = append(recs, c)
 				}
-				gone, err := in.Provider.DeleteRecords(ctx, zone, recs)
-				for _, g := range gone {
-					removed = append(removed, RefOf(g, zone))
-				}
+				del, err := in.Provider.DeleteRecords(ctx, zone, recs)
+				gone(del)
 				if err != nil {
 					return written, removed, fmt.Errorf("removing the CAA records of %s: %w", bare(d), err)
 				}
@@ -876,48 +993,46 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 				continue // unknown CA: nothing written
 			}
 			next, _ := MergeCAA(cur, s)
-			var recs []libdns.Record
+			var w []libdns.Record
 			for _, c := range next {
-				c.Name = libdns.RelativeName(d, zone)
-				recs = append(recs, c)
+				c.Name = d
+				w = append(w, c)
 			}
 			for _, r := range want[SetCAA] {
 				written = append(written, RefOf(r, zone))
 			}
-			for _, c := range cur {
-				if ours(c, s.Issuer) || (s.IODEF != "" && strings.EqualFold(c.Tag, "iodef")) {
-					c.Name = libdns.RelativeName(d, zone)
-					if ref := RefOf(c, zone); !refIn(written, ref) {
-						removed = append(removed, ref)
-					}
-				}
-			}
-			if !sameSet(caaData(next), caaData(cur)) {
-				if _, err := in.Provider.SetRecords(ctx, zone, recs); err != nil {
-					return written, removed, fmt.Errorf("setting the CAA records of %s: %w", bare(d), err)
-				}
+			del, err := syncSet(ctx, in.Provider, zone, d, "CAA", w, live)
+			gone(del)
+			if err != nil {
+				return written, removed, fmt.Errorf("setting the CAA records of %s: %w", bare(d), err)
 			}
 		case SetNoMail:
 			if !s.NoMail {
 				continue
 			}
-			// Other TXT records at <d> (site verifications) stay.
-			txt := []libdns.Record{libdns.TXT{Name: libdns.RelativeName(d, zone), TTL: TTLNoMail, Text: spfNone}}
-			for _, rr := range pick(live, d, "TXT") {
-				if !isSPF(rr.Data) {
-					txt = append(txt, libdns.TXT{Name: libdns.RelativeName(d, zone), TTL: TTLNoMail, Text: rr.Data})
-				}
-			}
-			recs := []libdns.Record{
-				libdns.MX{Name: libdns.RelativeName(d, zone), TTL: TTLNoMail, Preference: 0, Target: "."},
-				libdns.TXT{Name: libdns.RelativeName("_dmarc."+d, zone), TTL: TTLNoMail, Text: dmarcReject},
-			}
-			recs = append(recs, txt...)
 			for _, r := range want[SetNoMail] {
 				written = append(written, RefOf(r, zone))
 			}
-			if _, err := in.Provider.SetRecords(ctx, zone, recs); err != nil {
-				return written, removed, fmt.Errorf("setting the nomail records of %s: %w", bare(d), err)
+			// MX at <d>: exactly the null MX. TXT at <d>: our SPF replaces
+			// any other SPF; other TXT records (site verifications) stay
+			// untouched. _dmarc.<d>: exactly our DMARC record.
+			mx := []libdns.Record{libdns.MX{Name: d, TTL: TTLNoMail, Preference: 0, Target: "."}}
+			txt := []libdns.Record{libdns.TXT{Name: d, TTL: TTLNoMail, Text: spfNone}}
+			for _, rr := range pick(live, d, "TXT") {
+				if !isSPF(rr.Data) {
+					txt = append(txt, libdns.TXT{Name: d, TTL: rr.TTL, Text: rr.Data})
+				}
+			}
+			dmarc := []libdns.Record{libdns.TXT{Name: "_dmarc." + d, TTL: TTLNoMail, Text: dmarcReject}}
+			for _, x := range []struct {
+				name, typ string
+				want      []libdns.Record
+			}{{d, "MX", mx}, {d, "TXT", txt}, {"_dmarc." + d, "TXT", dmarc}} {
+				del, err := syncSet(ctx, in.Provider, zone, x.name, x.typ, x.want, live)
+				gone(del)
+				if err != nil {
+					return written, removed, fmt.Errorf("setting the nomail records of %s: %w", bare(d), err)
+				}
 			}
 		default:
 			return written, removed, fmt.Errorf("unknown record set %q (one of %s)", set, strings.Join(Sets, ", "))

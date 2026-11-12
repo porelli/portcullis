@@ -182,7 +182,7 @@ status_run() {
   # ── DNS (the domains service's plans; Traefik's account for the pin) ──
   local dns_json traefik_uri=""
   dns_json="$(dns_status_json)"
-  [ -z "$dns_json" ] || traefik_uri="$(dns_traefik_account_uri)"
+  [ -z "$dns_json" ] || traefik_uri="$(dns_traefik_account_uri)" || traefik_uri=""
   dns_json="$(_st_dns_json "$dns_json" "$traefik_uri" "$(dns_main_env_uri)")"
   if [ -n "$dns_json" ] && [ "$(printf '%s' "$dns_json" | jq '[.main.problems, (.domains[] | .problems)] | add')" != 0 ]; then
     problems=1

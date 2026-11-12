@@ -210,6 +210,16 @@ func Check(ctx context.Context, resolvers []string, name string) Result {
 			return res
 		}
 		if !a.AuthenticatedData {
+			// No AD although the DS matches: a signed zone under a parent
+			// the resolver doesn't validate (an insecure chain) is no
+			// Problem of this zone — reported as unknown, not bogus.
+			if parent := parentOf(zone); parent != "" {
+				if pa, err := exchange(ctx, r, parent, dns.TypeSOA, false); err == nil && pa.Rcode == dns.RcodeSuccess && !pa.AuthenticatedData {
+					res.State = Unknown
+					res.Err = fmt.Sprintf("%s doesn't validate the parent zone %s: the chain to %s can't be checked", r, parent, zone)
+					return res
+				}
+			}
 			res.State = Bogus
 			res.Err = fmt.Sprintf("%s doesn't validate %s (no AD)", r, dns.Fqdn(name))
 			return res
@@ -217,6 +227,15 @@ func Check(ctx context.Context, resolvers []string, name string) Result {
 	}
 	res.State = Secure
 	return res
+}
+
+// parentOf is the zone one label up ("" at a TLD).
+func parentOf(zone string) string {
+	i, end := dns.NextLabel(zone, 0)
+	if end || zone[i:] == "." {
+		return ""
+	}
+	return zone[i:]
 }
 
 // dsMatches: some parent DS equals a DS computed from a zone key with the
