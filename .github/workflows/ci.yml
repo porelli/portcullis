@@ -2072,6 +2072,22 @@ jobs:
           # The invite IdP is created by configure once enroll runs (Keycloak
           # resolves http://enroll:8445 to accept it; it is not in the realm
           # import). Idempotent: the flows were synced by the first run.
+          # Regression (test server 2026-11-12): a realm whose passwordless
+          # passkey policy drifted (conveyance none, attachment cross-platform)
+          # must be put back by configure — the checks below expect direct.
+          PRE_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
+            --data-urlencode client_id=admin-cli --data-urlencode "username=${KEYCLOAK_ADMIN:-admin}" \
+            --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
+          [ -n "$PRE_TOKEN" ] && [ "$PRE_TOKEN" != null ] || { echo "FAIL: admin token for the passkey-policy drift check"; exit 1; }
+          echo "::add-mask::$PRE_TOKEN"
+          echo '{"webAuthnPolicyPasswordlessRpEntityName": "Portcullis", "webAuthnPolicyPasswordlessAttestationConveyancePreference": "none", "webAuthnPolicyPasswordlessAuthenticatorAttachment": "cross-platform"}' \
+            | curl -sf -X PUT -H @<(printf 'Authorization: Bearer %s\n' "$PRE_TOKEN") -H 'Content-Type: application/json' --data-binary @- \
+              http://127.0.0.1:8080/admin/realms/portcullis \
+            || { echo "FAIL: drifting the passkey policy"; exit 1; }
+          curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$PRE_TOKEN") http://127.0.0.1:8080/admin/realms/portcullis \
+            | jq -e '.webAuthnPolicyPasswordlessAttestationConveyancePreference == "none"' >/dev/null \
+            || { echo "FAIL: the drift didn't take (the check would prove nothing)"; exit 1; }
+          unset PRE_TOKEN
           OUT=$(./portcullis keycloak configure)
           echo "$OUT" | grep -c "up to date" | grep -qx 3 || { echo "FAIL: flows rebuilt on a second configure"; echo "$OUT"; exit 1; }
           echo "$OUT" | grep -q "invite identity provider (URLs, client secret): ok" || { echo "FAIL: invite IdP not configured"; echo "$OUT"; exit 1; }

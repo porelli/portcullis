@@ -37,7 +37,11 @@ KC_REALM_TOKEN_SETTINGS='{"offlineSessionIdleTimeout": 2592000, "offlineSessionM
 # allows any attachment, and requires a resident key and user verification.
 # Same values as realm-export.json; pushed on every run.
 # shellcheck disable=SC2034  # read by the tests
-KC_REALM_SIGNIN_SETTINGS='{"attributes": {"acr.loa.map": "{}"}, "bruteForceProtected": true, "permanentLockout": false, "failureFactor": 10, "waitIncrementSeconds": 60, "maxFailureWaitSeconds": 900, "webAuthnPolicyPasswordlessAttestationConveyancePreference": "direct", "webAuthnPolicyPasswordlessAuthenticatorAttachment": "not specified", "webAuthnPolicyPasswordlessRequireResidentKey": "Yes", "webAuthnPolicyPasswordlessUserVerificationRequirement": "required"}'
+# webAuthnPolicyPasswordlessRpEntityName must be in the body: Keycloak 26.8's
+# realm update applies the passwordless policy only when it is set and
+# non-empty (DefaultExportImportManager.updateRealm), else the whole policy
+# is silently kept (a 204 all the same).
+KC_REALM_SIGNIN_SETTINGS='{"attributes": {"acr.loa.map": "{}"}, "bruteForceProtected": true, "permanentLockout": false, "failureFactor": 10, "waitIncrementSeconds": 60, "maxFailureWaitSeconds": 900, "webAuthnPolicyPasswordlessRpEntityName": "Portcullis", "webAuthnPolicyPasswordlessAttestationConveyancePreference": "direct", "webAuthnPolicyPasswordlessAuthenticatorAttachment": "not specified", "webAuthnPolicyPasswordlessRequireResidentKey": "Yes", "webAuthnPolicyPasswordlessUserVerificationRequirement": "required"}'
 
 kc_url() { echo "${KEYCLOAK_URL:-http://127.0.0.1:8080}"; }
 

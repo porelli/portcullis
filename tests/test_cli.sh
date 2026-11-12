@@ -452,6 +452,9 @@ expect_eq "bruteForceProtected true" \
 expect_eq "realm export: passwordless policy direct, any attachment, resident key + UV required" \
   "$(jq -c '[.webAuthnPolicyPasswordlessAttestationConveyancePreference, .webAuthnPolicyPasswordlessAuthenticatorAttachment, .webAuthnPolicyPasswordlessRequireResidentKey, .webAuthnPolicyPasswordlessUserVerificationRequirement]' "$RX")" \
   '["direct","not specified","Yes","required"]'
+expect_eq "keycloak configure's sign-in settings name the passwordless RP (Keycloak applies the policy only then) as the export does" \
+  "$(PORTCULLIS_LIB="$HERE/../scripts/lib" bash -c 'source "$PORTCULLIS_LIB/keycloak.sh" 2>/dev/null; printf "%s" "$KC_REALM_SIGNIN_SETTINGS"' | jq -r .webAuthnPolicyPasswordlessRpEntityName)" \
+  "$(jq -r .webAuthnPolicyPasswordlessRpEntityName "$RX")"
 expect_eq "realm export: stock webauthn-register (two-factor) disabled, passwordless enabled" \
   "$(jq -c '[.requiredActions[] | select(.alias | startswith("webauthn-register")) | [.alias, .enabled]] | sort' "$RX")" '[["webauthn-register",false],["webauthn-register-passwordless",true]]'
 expect_eq "realm export: forward-auth client has no default.acr.values" \
