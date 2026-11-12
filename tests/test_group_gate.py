@@ -738,12 +738,15 @@ class SigninV6Test(GateTest):
     """Policy file v6 sign-in templates (contract §4 "How group-gate
     decides", §5 "Step-up and the needs-stronger page", §8.1)."""
 
-    def page(self, host, amr, user="bob", groups="users_grafana", gate_path="/", cert=None):
+    def page(self, host, amr, user="bob", groups="users_grafana", gate_path="/", cert=None, uri=None, extra=None):
         h = {"X-Forwarded-Host": host, "X-Auth-Request-Preferred-Username": user,
              "X-Auth-Request-Groups": groups,
              "X-Forwarded-Access-Token": token(amr=amr, preferred_username=user)}
         if cert is not None:
             h.update(cert) if isinstance(cert, dict) else h.__setitem__(gg.CERT_INFO_HEADER, cert)
+        if uri is not None:
+            h["X-Forwarded-Uri"] = uri
+        h.update(extra or {})
         r = urllib.request.Request(f"http://127.0.0.1:{self.port}{gate_path}", headers=h)
         try:
             with urllib.request.urlopen(r) as resp:
@@ -1016,6 +1019,44 @@ class SigninV6Test(GateTest):
         self.assertIn("rd=https%3A%2F%2Fexample.com%2F", hdrs["X-Stepup-URL"])
         self.assertEqual(self.page("example.com", ["hwk"], groups="", gate_path="/portal")[0], 200)
 
+    def stepup_rd(self, host, uri, method="GET", groups="users_grafana"):
+        """The step-up's `rd` for a request to `host` + `uri` (the
+        X-Stepup-URL header's and the page's href, which must agree)."""
+        extra = {} if method is None else {"X-Forwarded-Method": method}
+        code, hdrs, body = self.page(host, ["spk"], groups=groups, uri=uri, extra=extra)
+        self.assertEqual(code, 403)
+        url = hdrs["X-Stepup-URL"]
+        self.assertIn(f'href="{html.escape(url, quote=True)}"', body)
+        return urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["rd"]
+
+    def test_stepup_returns_to_page(self):
+        write_policy({"hosts": {"grafana.example.com": "strong"}, "people": {"bob": ["passkey_synced", "security_key"]}})
+        uri = "/d/abc?orgId=1&x=%20y"
+        self.assertEqual(self.stepup_rd("grafana.example.com", uri), [f"https://grafana.example.com{uri}"])
+        # An extra-domain host: the same path, relative.
+        write_policy({"extra_domains": [EXTRA], "hosts": {f"grafana.{EXTRA}": "strong"},
+                      "people": {"bob": ["passkey_synced", "security_key"]}})
+        self.assertEqual(self.stepup_rd(f"grafana.{EXTRA}", uri, groups=""), [uri])
+
+    def test_stepup_return_rejects_offhost_paths(self):
+        write_policy({"extra_domains": [EXTRA], "hosts": {"grafana.example.com": "strong", f"grafana.{EXTRA}": "strong"},
+                      "people": {"bob": ["passkey_synced", "security_key"]}})
+        cases = [("POST", "/d/abc"), ("HEAD", "/d/abc"), (None, "/d/abc")]
+        cases += [("GET", u) for u in ("//evil.example/x", "/\\evil.example", "/%5Cevil", "/%5cevil", "/a\tb",
+                                       "/a b", "/\u00e9", "/" + "a" * 2048, "", "x")]
+        for method, uri in cases:
+            with self.subTest(method=method, uri=uri):
+                self.assertEqual(gg.return_path(uri, method or ""), "/")
+                if any(c in uri for c in "\t\u00e9"):
+                    continue  # not sendable as an HTTP header by urllib; return_path covers it
+                self.assertEqual(self.stepup_rd("grafana.example.com", uri, method), ["https://grafana.example.com/"])
+                self.assertEqual(self.stepup_rd(f"grafana.{EXTRA}", uri, method, groups=""), ["/"])
+        # 2048 bytes is still kept.
+        self.assertEqual(gg.return_path("/" + "a" * 2047, "GET"), "/" + "a" * 2047)
+        self.assertEqual(gg.return_path("/d/abc?orgId=1&x=%20y", "GET"), "/d/abc?orgId=1&x=%20y")
+        self.assertEqual(gg.stepup_url("grafana.example.com", "security_key", extra=False, path="/x?y=1"),
+                         "https://auth.example.com/oauth2/start?pc_method=security_key&rd=https%3A%2F%2Fgrafana.example.com%2Fx%3Fy%3D1")
+
     def test_stepup_one_method(self):
         write_policy({"hosts": {"grafana.example.com": "strong"}, "people": {"bob": ["passkey_synced", "security_key"]}})
         code, hdrs, body = self.page("grafana.example.com", ["spk"])
@@ -1082,7 +1123,7 @@ class SigninV6Test(GateTest):
         # messages_en.properties: the same words, one line per alternative.
         acct = "https://people.example.com/signin"
         b = gg.render_needs_page("Grafana", {"password"}, STRONG, {"password"}, False, "example.com").decode()
-        self.assertIn("<h1>Grafana needs a stronger sign-in</h1>", b)
+        self.assertIn("<h1>" + gg.MARK_HTML + "Grafana needs a stronger sign-in</h1>", b)
         self.assertIn('<div id="needs-stronger"><p>You signed in with a <b>password</b>. Grafana accepts any one of:</p>', b)
         self.assertIn("<li>a security key <span class=\"portcullis-sub\">— you don&#x27;t have one yet</span></li>", b)
         self.assertIn("<li>a YubiKey certificate</li>", b)
@@ -3543,6 +3584,73 @@ class ImpersonationTest(GateTest):
         self.assertEqual(len(refreshes), 3)  # the loop went on
         self.assertIn("coverage check exploded", out)
         self.assertIn("RuntimeError", out)
+
+
+class BrandingTest(GateTest):
+    """The Raised-gate mark and favicon on every group-gate page (polish
+    batch 1): inline only — a data: favicon (img-src data:) and the inline
+    SVG mark —, never an external load."""
+
+    MARK_SHA256 = "a63ddab1ce0eac394cdbc7547f9fcbc9bf6947060601dd5202527222cef97bfa"  # concept-1-mark-dark.svg
+    FAVICON_SHA256 = "8c07f90ac5371f5742ca1837b45ff450f56674c8773ddbcd0b4b03fa17fd2352"  # favicon.svg
+
+    def deny_body(self):
+        """A live _deny answer: a non-admin on the Hub."""
+        h = {"X-Forwarded-Host": "hub.example.com", "X-Auth-Request-Preferred-Username": "bob",
+             "X-Auth-Request-Groups": "users_grafana",
+             "X-Forwarded-Access-Token": token(amr=["hwk"], preferred_username="bob")}
+        r = urllib.request.Request(f"http://127.0.0.1:{self.port}/", headers=h)
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(r)
+        with cm.exception as e:
+            self.assertEqual(e.code, 403)
+            return e.read().decode()
+
+    def pages(self):
+        now = time.time()
+        rec = {"id": IMP_ID, "admin": "root", "target": "alice", "reason": IMP_REASON, "until": now + 600,
+               "ended": None}
+        return {
+            "portal": gg.render_portal("alice", {"lldap_admin"}, [], "example.com").decode(),
+            "stepup": gg.render_stepup_page("App", "security_key", "https://auth.example.com/x").decode(),
+            "certificate": gg.render_certificate_page("App", "yubikey_cert").decode(),
+            "needs": gg.render_needs_page("App", {"passkey_synced"}, STRONG, None, False, "example.com").decode(),
+            "needs-impersonated": gg.render_needs_page("App", set(), STRONG, None, False, "example.com",
+                                                       impersonated=rec).decode(),
+            "ended": gg.render_ended_page("alice", "example.com").decode(),
+            "deny": self.deny_body(),
+        }
+
+    def test_bytes_pinned(self):
+        import hashlib
+        self.assertEqual(hashlib.sha256(gg.MARK_SVG.encode()).hexdigest(), self.MARK_SHA256)
+        self.assertEqual(hashlib.sha256(gg.FAVICON_SVG.encode()).hexdigest(), self.FAVICON_SHA256)
+        import base64
+        self.assertEqual(gg.FAVICON_LINK, '<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,'
+                         + base64.b64encode(gg.FAVICON_SVG.encode()).decode() + '">')
+        self.assertEqual(gg.MARK_HTML, '<span class="pc-mark" aria-hidden="true">' + gg.MARK_SVG.strip() + "</span>")
+
+    def test_every_page_has_mark_and_favicon(self):
+        for name, page in self.pages().items():
+            with self.subTest(page=name):
+                self.assertIn(gg.FAVICON_LINK, page)
+                self.assertIn(gg.MARK_HTML, page)
+                # The mark opens the page's heading.
+                self.assertIn("<h1>" + gg.MARK_HTML, page)
+
+    def test_csp_allows_data_images(self):
+        for csp in (gg.PORTAL_CSP, gg.SIGNIN_CSP):
+            self.assertIn("img-src data:", csp)
+        self.assertIn(".pc-mark{", gg.PORTAL_CSS)
+        self.assertTrue(gg.SIGNIN_CSS.startswith(gg.PORTAL_CSS))
+
+    def test_no_external_loads(self):
+        for name, page in self.pages().items():
+            with self.subTest(page=name):
+                self.assertNotIn('src="http', page)
+                self.assertNotIn("url(", page)
+                for tag in re.findall(r'<(\w+)[^>]*\shref="http', page):
+                    self.assertEqual(tag, "a")
 
 
 class JwtClaimsTest(unittest.TestCase):

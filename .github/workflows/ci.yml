@@ -169,6 +169,10 @@ jobs:
           key: ${{ steps.gg-pip-cache.outputs.cache-primary-key }}
       - name: group-gate unit tests
         run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_group_gate.py
+      # The Keycloak login theme's favicon and mark are byte copies of the
+      # branding sources (sha256 pinned in the test).
+      - name: branding copies
+        run: PYTHONDONTWRITEBYTECODE=1 python3 tests/test_branding.py
       # tests/signin_vectors.json drives group-gate's rule evaluator; it must
       # be a byte copy of the Hub's internal/signin/testdata/vectors.json, on
       # the same-named Hub branch when it exists (cross-repo feature branches
