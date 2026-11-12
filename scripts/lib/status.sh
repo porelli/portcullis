@@ -509,15 +509,20 @@ Keycloak (realm, users, forward-auth client, the passkey policy: attestation
 direct, any attachment, resident key and user verification required, only
 the passwordless registration action on — anything else fails: new passkeys
 couldn't be told apart),
-LLDAP and Traefik. Exits 1 if a core service is down/unhealthy or Vault is
-not active, 0 otherwise.
+LLDAP, Traefik and DNS (per name, from the domains service: A/AAAA point
+at this server, CAA as planned and allowing Traefik's ACME account, DNSSEC
+state, records that aren't Portcullis'; a warning if the domains service
+isn't running). Exits 1 if a core service is down/unhealthy, Vault is not
+active, or DNS has a problem (a wrong or missing record, DNSSEC bogus or DS
+mismatch, CAA locking out Traefik's account), 0 otherwise.
 
 Options:
   --json       machine-readable output (same exit status)
   --textfile   write the same as Prometheus metrics to
                monitoring/textfile/status.prom for the monitoring profile
                (service health, Vault active, the passkey policy, CA and
-               per-user YubiKey / browser certificate expiry); run after every scheduled backup
+               per-user YubiKey / browser certificate expiry, per-name DNS
+               checks and DNSSEC state); run after every scheduled backup
 EOF
 }
 
