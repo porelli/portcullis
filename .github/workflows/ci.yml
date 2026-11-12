@@ -2646,7 +2646,13 @@ jobs:
           # /api/me/impersonation first: the chain reaches the Hub at all).
           P=(--resolve "people.portcullis.local:443:127.0.0.1")
           FORGED=(-H 'X-Forwarded-Impersonator: root' -H "X-Forwarded-Impersonation: 0f3c$(printf 'a%.0s' $(seq 28))")
-          code="$("${C[@]}" "${P[@]}" -o /tmp/imp-get.json -w '%{http_code}' "${FORGED[@]}" https://people.portcullis.local/api/me/impersonation)"
+          # Retried: `portcullis up` may have just restarted the Hub, and Traefik
+          # routes to it only once it is healthy (Traefik's own 404 until then).
+          for i in $(seq 1 30); do
+            code="$("${C[@]}" "${P[@]}" -o /tmp/imp-get.json -w '%{http_code}' "${FORGED[@]}" https://people.portcullis.local/api/me/impersonation)"
+            [ "$code" = 404 ] || break
+            sleep 2
+          done
           if [ "$code" != 200 ] || ! jq -e '.active == null' /tmp/imp-get.json >/dev/null; then
             echo "FAIL: GET people.<d>/api/me/impersonation with forged headers: $code $(head -c 300 /tmp/imp-get.json)"; docker compose logs --tail=20 group-gate; exit 1
           fi
