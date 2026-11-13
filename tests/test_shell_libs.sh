@@ -2834,9 +2834,62 @@ echo '# signal (receive) set=(term) peer=podman,' > "$AA/local/usr.bin.pasta"
 expect_eq "AppArmor check: a commented-out rule → fail" "$(aa aa-on)" fail
 echo 'signal (receive) set=(term) peer=podman,' > "$AA/local/usr.bin.pasta"
 expect_eq "AppArmor check: the rule in local/usr.bin.pasta → ok" "$(aa aa-on)" ok
+printf 'profile pasta /usr/bin/pasta {\n  include <abstractions/pasta>\n}\n' > "$AA/usr.bin.pasta"
+expect_eq "AppArmor check: a local rule the profile doesn't include → fail" "$(aa aa-on)" fail
+printf 'profile pasta /usr/bin/pasta {\n  include if exists <local/usr.bin.pasta>\n}\n' > "$AA/usr.bin.pasta"
+touch -t 202601010000 "$WORK/rt/aa-policy"
+expect_eq "AppArmor check: a profile file newer than the readable loaded policy → warn (reload it)" \
+  "$(rt "CONTAINER_RUNTIME=podman RT_APPARMOR_DIR='$AA' RT_APPARMOR_ENABLED='$WORK/rt/aa-on' RT_APPARMOR_POLICY='$WORK/rt/aa-policy'; _rt_apparmor_pasta_check" | head -n1 | cut -f1)" warn
 rm -f "$AA/local/usr.bin.pasta"
 printf 'profile pasta /usr/bin/pasta {\n  signal receive set=(term hup kill int quit) peer=podman,\n}\n' > "$AA/usr.bin.pasta"
 expect_eq "AppArmor check: the rule in the profile itself → ok" "$(aa aa-on)" ok
+
+# ── lldap-ui under rootless Podman: a loopback-only forwarder, never a
+# container-IP tunnel (the address is inside the rootless netns) ──
+mkdir -p "$WORK/luibin" "$WORK/lui-root"
+cat > "$WORK/luibin/docker" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1" = version ]; then
+  case "${DOCKER_HOST:-}" in *podman.sock) echo '[{"Name":"Podman Engine","Version":"5.7.0"}]' ;; *) echo '[{"Name":"Engine","Version":"29.0.0"}]' ;; esac
+  exit 0
+fi
+echo "$*" >> "$STUB_DIR/lui-calls"
+case "$*" in
+  "compose --project-directory "*" ps -q lldap") echo lldapcid ;;
+  "inspect -f {{with index .NetworkSettings.Networks \"portcullis\"}}{{.IPAddress}}{{end}} lldapcid") echo 10.88.0.7 ;;
+  "inspect -f {{.State.Running}} "*) echo false ;;
+esac
+exit 0
+STUB
+chmod +x "$WORK/luibin/docker"
+lui() {
+  rm -f "$STUB_DIR/lui-calls"
+  (unset CONTAINER_RUNTIME DOCKER_HOST COMPOSE_FILE PORTCULLIS_ENGINE_SOCKET _RT_CHECKED
+   export PATH="$WORK/luibin:$PATH" PORTCULLIS_ROOT="$WORK/lui-root" XDG_RUNTIME_DIR="$RT_XDG"
+   bash -c 'for l in common network users; do . "$1/scripts/lib/$l.sh"; done; getenforce() { echo Disabled; }; cmd_lldap_ui' _ "$HERE/..") 2>&1
+}
+printf 'CONTAINER_RUNTIME=podman\nPORTCULLIS_ENGINE_SOCKET=%s\n' "$RT_PSOCK" > "$WORK/lui-root/.env"
+LUI="$(lui)"
+case "$LUI" in *"ssh -N -L 17170:127.0.0.1:17170 "*) t_pass "lldap-ui on podman: the tunnel targets the server's 127.0.0.1:17170" ;; *) t_fail "lldap-ui podman tunnel: $LUI" ;; esac
+case "$LUI" in *10.88.0.7*) t_fail "lldap-ui on podman printed a container-IP tunnel" ;; *) t_pass "lldap-ui on podman: never a container-IP tunnel" ;; esac
+expect_eq "lldap-ui on podman: the forwarder (socat, read-only, no capabilities, loopback publish), removed at exit" \
+  "$(grep -c "^run -d --rm --name portcullis-lldap-ui-[0-9]* --network portcullis -p 127.0.0.1:17170:17170 --read-only --cap-drop ALL --security-opt no-new-privileges:true --user 65534:65534 --memory 32m --pids-limit 32 docker.io/alpine/socat:[^ ]*@sha256:[0-9a-f]\{64\} TCP-LISTEN:17170,fork,reuseaddr TCP:lldap:17170$" "$STUB_DIR/lui-calls"):$(grep -c '^rm -f portcullis-lldap-ui-' "$STUB_DIR/lui-calls")" "1:1"
+printf 'CONTAINER_RUNTIME=docker\n' > "$WORK/lui-root/.env"
+LUI="$(lui)"
+case "$LUI" in *"ssh -N -L 17170:10.88.0.7:17170 "*) t_pass "lldap-ui on docker: the container-IP tunnel (unchanged)" ;; *) t_fail "lldap-ui docker: $LUI" ;; esac
+expect_eq "lldap-ui on docker: no forwarder" "$(grep -c '^run ' "$STUB_DIR/lui-calls")" 0
+rm -f "$WORK/lui-root/.env"
+case "$(lui)" in *"not found. Run ./portcullis init first"*) t_pass "lldap-ui needs .env (need_env, the runtime check)" ;; *) t_fail "lldap-ui without .env" ;; esac
+
+OUT="$(rt "$RT_HOST; id() { case \"\$1\" in -un) echo \"o'brien\" ;; *) command id \"\$@\" ;; esac; }; export STUB_UID_MAP=''; runtime_host_checks")"
+case "$OUT" in *"--add-subgids 100000-165535 'o'\\''brien', then podman system migrate"*) t_pass "runtime_host_checks: the usermod hint single-quotes the user" ;; *) t_fail "usermod hint: $(printf '%s' "$OUT" | grep subuid)" ;; esac
+
+# A restarted podman.socket leaves the proxies on a dead inode: up restarts
+# the unhealthy ones (podman only).
+expect_eq "runtime_proxies_refresh on podman: restarts the unhealthy proxy only" \
+  "$( (CONTAINER_RUNTIME=podman; container_health() { [ "$1" = socket-proxy-hub ] && echo unhealthy || echo healthy; }; dc() { echo "dc $*" >> "$WORK/prx-calls"; }; rm -f "$WORK/prx-calls"; runtime_proxies_refresh) 2>/dev/null; cat "$WORK/prx-calls")" "dc restart socket-proxy-hub"
+expect_eq "runtime_proxies_refresh on docker: nothing" \
+  "$( (CONTAINER_RUNTIME=docker; container_health() { echo unhealthy; }; dc() { echo "dc $*"; }; runtime_proxies_refresh) 2>/dev/null)" ""
 
 echo ""
 echo "$PASS passed, $FAIL failed"

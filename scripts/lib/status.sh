@@ -245,6 +245,12 @@ status_run() {
       _st_line fail "$n ${C_DIM}($stat)${C_NC}"
     fi
   done < <(printf '%s' "$services" | jq -r '.[] | [.name, .state, .health, .status] | @tsv')
+  # Rootless Podman: the proxies bind-mount the socket FILE; a restarted
+  # podman.socket leaves them on the old, dead inode (their /_ping then fails).
+  if [ "$(printf '%s' "$rt_json" | jq -r .name)" = podman ] \
+     && printf '%s' "$services" | jq -e 'any(.[]; (.name | startswith("socket-proxy-")) and .state == "running" and .health == "unhealthy")' >/dev/null; then
+    _st_line fail "a socket proxy is unhealthy: after podman.socket restarts the proxies keep the old socket's inode; ./portcullis up restarts them"
+  fi
 
   printf '\n%sVault%s\n' "$C_CYAN" "$C_NC"
   case "$vault_code" in

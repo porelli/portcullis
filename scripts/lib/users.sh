@@ -216,6 +216,10 @@ cmd_invite() {
   fi
 }
 
+# The forwarder lldap-ui runs under rootless Podman (container addresses
+# live in the rootless network namespace, unreachable from the host).
+LLDAP_UI_FORWARD_IMAGE="docker.io/alpine/socat:1.8.1.3@sha256:e8a6e8868a8e6e01d9c2c321a8f8d4474d2d741d962462e5c5a124a8e66a0055"
+
 help_lldap_ui() {
   cat <<'EOF'
 Usage: portcullis lldap-ui
@@ -226,7 +230,34 @@ LLDAP's UI is reachable only from the server. Prints the SSH tunnel to run on yo
 http://localhost:17170 and sign in as the LLDAP admin (LLDAP_ADMIN_PASSWORD
 in .env). Use it for recovery only: day-to-day, people and groups are
 managed at people.<domain>.
+
+Under rootless Podman (CONTAINER_RUNTIME=podman) the container's address
+isn't reachable from the host: lldap-ui runs a forwarder container
+(socat, read-only, no capabilities) publishing LLDAP on
+127.0.0.1:17170 of the server (LLDAP_UI_PORT to change it) while it runs
+(Ctrl-C stops and removes it), and the tunnel targets that port.
 EOF
+}
+
+# _lldap_ui_podman — the forwarder on the portcullis network, published on
+# the server's loopback only, removed when the command ends.
+_lldap_ui_podman() {
+  local port="${LLDAP_UI_PORT:-17170}" name="portcullis-lldap-ui-$$"
+  [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] \
+    || fail "LLDAP_UI_PORT=$port is not a port between 1024 and 65535"
+  # shellcheck disable=SC2064  # $name is fixed now
+  trap "docker rm -f '$name' >/dev/null 2>&1 || true" EXIT
+  trap 'exit 130' INT TERM
+  docker run -d --rm --name "$name" --network portcullis -p "127.0.0.1:$port:17170" \
+    --read-only --cap-drop ALL --security-opt no-new-privileges:true --user 65534:65534 \
+    --memory 32m --pids-limit 32 "$LLDAP_UI_FORWARD_IMAGE" \
+    TCP-LISTEN:17170,fork,reuseaddr TCP:lldap:17170 >/dev/null \
+    || fail "could not start the LLDAP forwarder (is 127.0.0.1:$port free? set LLDAP_UI_PORT)"
+  ok "LLDAP's web UI is forwarded to 127.0.0.1:$port on this server while this runs (Ctrl-C stops it). On your machine run:"
+  printf '\n  ssh -N -L 17170:127.0.0.1:%s %s@%s\n\n' "$port" "$(id -un)" "$(hostname -f 2>/dev/null || hostname)"
+  echo "    then open http://localhost:17170 and sign in as the LLDAP admin (LLDAP_ADMIN_PASSWORD in .env)."
+  while [ "$(docker inspect -f '{{.State.Running}}' "$name" 2>/dev/null)" = true ]; do sleep 5; done
+  fail "the LLDAP forwarder stopped"
 }
 
 cmd_lldap_ui() {
@@ -236,10 +267,15 @@ cmd_lldap_ui() {
       *) usage_error lldap-ui "unknown argument: $1" ;;
     esac
   done
+  need_env
   require_cmd docker
   local id ip
   id="$(dc ps -q lldap 2>/dev/null || true)"
   [ -n "$id" ] || fail "LLDAP is not running (portcullis up)"
+  if _rt_is_podman; then
+    _lldap_ui_podman
+    return
+  fi
   ip="$(docker inspect -f '{{with index .NetworkSettings.Networks "portcullis"}}{{.IPAddress}}{{end}}' "$id")"
   [ -n "$ip" ] || fail "LLDAP has no address on the portcullis network"
   ok "LLDAP's web UI listens on $ip:17170 (reachable from this server only). On your machine run:"

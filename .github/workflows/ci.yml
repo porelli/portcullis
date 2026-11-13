@@ -5998,6 +5998,16 @@ jobs:
             echo "$f: $(grep "^$me:" "$f")"
           done
           sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80
+          # The SELinux overlay's layout for the whole Podman phase (the Hub's
+          # /project a tmpfs, long-syntax z / Z binds, label=disable on the
+          # proxies): a getenforce stub saying Enforcing, first on PATH from
+          # the next step on (GITHUB_PATH; the Docker phase is over). Ubuntu
+          # has no SELinux, so the labels themselves are no-ops here: Fedora
+          # enforcing stays a manual release check (CLAUDE.md).
+          mkdir -p "$RUNNER_TEMP/selinux-stub"
+          printf '#!/bin/sh\necho Enforcing\n' > "$RUNNER_TEMP/selinux-stub/getenforce"
+          chmod +x "$RUNNER_TEMP/selinux-stub/getenforce"
+          echo "$RUNNER_TEMP/selinux-stub" >> "$GITHUB_PATH"
           # Ubuntu's AppArmor (bug 2154379): pasta's profile refuses podman's
           # SIGTERM, so removing a network's last container fails ("rootless
           # netns: kill network process: permission denied"). The host-prep
@@ -6059,6 +6069,21 @@ jobs:
           fi
           status_wait 240
           jq -c '.runtime' /tmp/status.json | tee -a "$GITHUB_STEP_SUMMARY"
+          # The SELinux overlay's layout is in use (getenforce stub): the CLI's
+          # COMPOSE_FILE has it, the Hub's /project is a tmpfs, the map file
+          # bound into it, the proxies carry label=disable.
+          [ "$(getenforce)" = Enforcing ] || { echo "FAIL: the getenforce stub isn't on PATH"; exit 1; }
+          CF="$(bash -c 'source scripts/lib/common.sh; env_load; runtime_export; printf "%s" "$COMPOSE_FILE"')"
+          case "$CF" in *docker-compose.podman.yml*docker-compose.podman-selinux.yml*) ;; *) echo "FAIL: the CLI's COMPOSE_FILE lacks the podman overlays: $CF"; exit 1 ;; esac
+          docker inspect -f '{{json .Mounts}}' "$(docker compose ps -q hub)" | jq -e '
+              (map(select(.Destination == "/project")) | length == 1 and .[0].Type == "tmpfs")
+              and (map(select(.Destination == "/project/group-gate/group-gate-map.conf")) | length == 1)' >/dev/null \
+            || { echo "FAIL: the Hub's /project isn't the overlay's tmpfs + map bind"; docker inspect -f '{{json .Mounts}}' "$(docker compose ps -q hub)"; exit 1; }
+          for p in socket-proxy-traefik socket-proxy-hub; do
+            docker inspect -f '{{json .HostConfig.SecurityOpt}}' "$(docker compose ps -q "$p")" | jq -e 'any(.[]?; test("^label[=:]disable$"))' >/dev/null \
+              || { echo "FAIL: $p has no label=disable"; exit 1; }
+          done
+          echo "PASS: the SELinux overlay's layout runs (Hub /project tmpfs + map bind, label=disable on the proxies)"
           echo "PASS: init --runtime podman; status clean (runtime podman, ports ≥ $(jq .runtime.port_start /tmp/status.json))"
 
       - name: Every SELinux-overlay bind source exists after a full up (monitoring profile)
@@ -6131,6 +6156,13 @@ jobs:
           done
           [ "$(tp --post-data='{}' --header 'Content-Type: application/json' http://socket-proxy-traefik:2375/containers/create)" = 403 ] \
             || { echo "FAIL: traefik proxy allowed a POST"; exit 1; }
+          # Traversal / encoded paths into libpod (Podman's router isn't
+          # dockerd's): never a 2xx through the proxy (a 403, or a redirect
+          # the proxy then denies).
+          for odd in "/containers/../libpod/info" "/containers/%2e%2e/libpod/info" "/containers%2F..%2Flibpod%2Finfo" "/v1.41/build" "/v5.0.0/libpod/info"; do
+            c="$(tp "http://socket-proxy-traefik:2375$odd")"
+            case "$c" in 2*) echo "FAIL: traefik proxy answered $c for $odd"; exit 1 ;; esac
+          done
           echo "PASS: socket-proxy-traefik is read-only and minimal (libpod and /build denied)"
           NET="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$(docker compose ps -q socket-proxy-hub)")"
           mkdir -p /tmp/hubproj && cat > /tmp/hubproj/compose.yml <<'YML'
@@ -6159,6 +6191,10 @@ jobs:
           hp() { docker run --rm --network "$NET" --entrypoint wget \
                    docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb \
                    -q -O /dev/null -S "$@" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -n1 | cut -d' ' -f2; }
+          for odd in "/containers/../libpod/info" "/containers/%2e%2e/libpod/info" "/containers%2F..%2Flibpod%2Finfo" "/v1.41/build" "/v5.0.0/libpod/info"; do
+            c="$(hp "http://socket-proxy-hub:2375$odd")"
+            case "$c" in 2*) echo "FAIL: socket-proxy-hub answered $c for $odd"; exit 1 ;; esac
+          done
           for denied in /libpod/info /libpod/play/kube /v5.0.0/libpod/containers/json /build; do
             [ "$(hp "http://socket-proxy-hub:2375$denied")" = 403 ] || { echo "FAIL: socket-proxy-hub allowed GET $denied"; exit 1; }
             [ "$(hp --post-data='{}' --header 'Content-Type: application/json' "http://socket-proxy-hub:2375$denied")" = 403 ] \

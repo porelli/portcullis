@@ -258,7 +258,7 @@ runtime_host_checks() {
   if runtime_id_maps; then
     _rt_chk ok "user namespace: uid 0 = $user, subuid $_RT_UID_START+$_RT_UID_N, subgid $_RT_GID_START+$_RT_GID_N"
   else
-    _rt_chk fail "subuid/subgid: podman unshare must map 0 to $user and 1… to one range of at least $RT_MIN_IDS ids in /etc/subuid and /etc/subgid (usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $user, then podman system migrate)"
+    _rt_chk fail "subuid/subgid: podman unshare must map 0 to $user and 1… to one range of at least $RT_MIN_IDS ids in /etc/subuid and /etc/subgid (sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $(_sq "$user"), then podman system migrate)"
   fi
   um="$(podman unshare cat /proc/self/uid_map 2>/dev/null | _rt_map_norm || true)"
   cm="$(docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true \
@@ -343,17 +343,34 @@ runtime_host_checks() {
 # permission denied"), e.g. ./portcullis down / restore after a boot.
 # Overridable for tests: RT_APPARMOR_ENABLED, RT_APPARMOR_DIR.
 _rt_apparmor_pasta_check() {
-  local d="${RT_APPARMOR_DIR:-/etc/apparmor.d}" en
+  local d="${RT_APPARMOR_DIR:-/etc/apparmor.d}" en files policy newest f
   en="$(cat "${RT_APPARMOR_ENABLED:-/sys/module/apparmor/parameters/enabled}" 2>/dev/null || true)"
   if [ "$en" != Y ] || [ ! -f "$d/podman" ] || [ ! -f "$d/usr.bin.pasta" ]; then
     _rt_chk ok "AppArmor: no podman / pasta profile pair to reconcile"
     return 0
   fi
-  if { cat "$d/usr.bin.pasta" 2>/dev/null; cat "$d/local/usr.bin.pasta" 2>/dev/null; true; } | sed 's/#.*//' \
+  # The local file counts only when the profile includes it.
+  files=("$d/usr.bin.pasta")
+  if sed 's/#.*//' "$d/usr.bin.pasta" | grep -Eq 'include[[:space:]]+(if[[:space:]]+exists[[:space:]]+)?<local/usr\.bin\.pasta>'; then
+    files+=("$d/local/usr.bin.pasta")
+  fi
+  if { for f in "${files[@]}"; do cat "$f" 2>/dev/null; done; true; } | sed 's/#.*//' \
        | grep -Eq 'signal[^,]*receive[^,]*peer="?podman"?[[:space:]]*,'; then
-    _rt_chk ok "AppArmor: pasta accepts podman's SIGTERM"
+    # Best effort: a profile file newer than the loaded policy wasn't reloaded
+    # (the policy tree is readable only by root on most hosts: then unchecked).
+    policy="${RT_APPARMOR_POLICY:-/sys/kernel/security/apparmor/policy}"
+    newest=""
+    for f in "${files[@]}"; do
+      [ -f "$f" ] || continue
+      if [ -z "$newest" ] || [ "$f" -nt "$newest" ]; then newest="$f"; fi
+    done
+    if [ -r "$policy" ] && [ -n "$newest" ] && [ "$newest" -nt "$policy" ]; then
+      _rt_chk warn "AppArmor: $newest looks newer than the loaded policy: if it wasn't reloaded, run sudo apparmor_parser -r $d/usr.bin.pasta"
+    else
+      _rt_chk ok "AppArmor: pasta accepts podman's SIGTERM (in the profile files; reload them with apparmor_parser -r after an edit)"
+    fi
   else
-    _rt_chk fail "AppArmor: pasta's profile refuses podman's SIGTERM (Ubuntu bug 2154379), so removing the last container of a network fails: add 'signal (receive) set=(term) peer=podman,' to $d/local/usr.bin.pasta (or to $d/usr.bin.pasta if it has no local include), then sudo apparmor_parser -r $d/usr.bin.pasta"
+    _rt_chk fail "AppArmor: pasta's profile refuses podman's SIGTERM (Ubuntu bug 2154379), so removing the last container of a network fails: add 'signal (receive) set=(term) peer=podman,' to $d/local/usr.bin.pasta (when $d/usr.bin.pasta includes <local/usr.bin.pasta>; else to $d/usr.bin.pasta itself), then sudo apparmor_parser -r $d/usr.bin.pasta"
   fi
 }
 
@@ -425,6 +442,22 @@ stack_compose_up() {
     dc up -d --build "$@" || rc=$?
   fi
   [ "$rc" -eq 0 ] || { compose_health_report; return "$rc"; }
+}
+
+# runtime_proxies_refresh — rootless Podman: the socket proxies bind-mount
+# the user socket FILE, so a restarted podman.socket (a new inode) leaves
+# them talking to a dead one while they keep running (their /_ping health
+# check fails). Restart each unhealthy proxy: a restart mounts the current
+# socket. Docker: no-op (dockerd recreates its socket only with them).
+runtime_proxies_refresh() {
+  local svc
+  _rt_is_podman || return 0
+  for svc in socket-proxy-traefik socket-proxy-hub; do
+    if [ "$(container_health "$svc")" = unhealthy ]; then
+      warn "$svc is unhealthy (podman.socket restarted?): restarting it on the current socket"
+      dc restart "$svc" >/dev/null || fail "could not restart $svc"
+    fi
+  done
 }
 
 # compose_health_report — after a failed `up`: each core container whose

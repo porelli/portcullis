@@ -465,6 +465,7 @@ stack_up() {
   config_apply
   sessions_restart_if_changed
   stack_compose_up
+  runtime_proxies_refresh
   domains_restart_if_renewed
   monitoring_reload
   signin_ca_reload
@@ -515,6 +516,7 @@ upgrade_run() {
   info "Starting services..."
   sessions_restart_if_changed
   stack_compose_up
+  runtime_proxies_refresh
   domains_restart_if_renewed
   monitoring_reload
   # Traefik, Keycloak and group-gate: whenever the CA files differ from the
