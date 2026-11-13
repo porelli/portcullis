@@ -27,7 +27,7 @@ _mcpgate_keygen() {
   local f="$1" tmp
   if ! docker image inspect "$MCPGATE_IMAGE_NAME" >/dev/null 2>&1; then
     info "Building the mcp-gate image (needed to generate its age key)..."
-    dc build mcp-gate >/dev/null || fail "could not build the mcp-gate image"
+    runtime_build_service mcp-gate >/dev/null || fail "could not build the mcp-gate image"
   fi
   tmp="$(mktemp "$f.XXXXXX")"
   chmod 600 "$tmp"

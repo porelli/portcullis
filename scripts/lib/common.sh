@@ -138,10 +138,24 @@ env_set() {
   rm -f "$tmp"
 }
 
-# need_env — load .env (fail if missing).
+# env_unset <key> [file] — remove every KEY= line, in place (like env_set).
+env_unset() {
+  local key="$1" file="${2:-$(env_file)}" tmp
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail "env_unset: bad key '$key'"
+  [ -f "$file" ] || return 0
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" || return 0
+  tmp="$(mktemp)"
+  KEY="$key" awk 'BEGIN { k = ENVIRON["KEY"] } $0 !~ "^[[:space:]]*(export[[:space:]]+)?" k "=" { print }' "$file" > "$tmp"
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
+# need_env — load .env (fail if missing), then check the container runtime
+# (CONTAINER_RUNTIME, the engine behind it: scripts/lib/runtime.sh).
 need_env() {
   [ -f "$(env_file)" ] || fail "$(env_file) not found. Run ./portcullis init first."
   env_load
+  runtime_check
 }
 
 # env_require <var>... — fail listing every unset/empty variable.
@@ -380,6 +394,8 @@ hub_env_write() {
     [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
     case " $CORE_SECRETS " in *" $v "*) warn "HUB_SHARED_ENV: refusing to share core secret $v with the Hub"; continue ;; esac
     case "$content" in "$v="*|*$'\n'"$v="*) continue ;; esac
+    # Written below from the host (podman only), never shared by name.
+    [ "$v" != PORTCULLIS_UNPRIVILEGED_PORT_START ] || continue
     case "$v" in
       PORTCULLIS_DOMAIN) val="${PORTCULLIS_DOMAIN:-portcullis.local}" ;;
       PORTCULLIS_TRAEFIK_IP) val="$(proxy_traefik_ip)" ;;
@@ -391,6 +407,11 @@ hub_env_write() {
     esac
     content+="$v=$val"$'\n'
   done
+  # Rootless Podman: the host's ip_unprivileged_port_start (a per-netns
+  # sysctl the Hub can't read from inside its container; RootlessCompat).
+  if _rt_is_podman; then
+    content+="PORTCULLIS_UNPRIVILEGED_PORT_START=$(runtime_port_start)"$'\n'
+  fi
   (umask 077 && mkdir -p "$(dirname "$f")")
   [ -e "$f" ] || (umask 077 && : > "$f")
   {
@@ -486,3 +507,8 @@ stack_prepare() {
 to_epoch() {
   date -d "$1" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$1" +%s 2>/dev/null || echo 0
 }
+
+# The container runtime (CONTAINER_RUNTIME, runtime_check, ...): every
+# caller of common.sh gets it.
+# shellcheck source=runtime.sh
+source "$PORTCULLIS_LIB/runtime.sh"

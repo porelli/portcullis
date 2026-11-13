@@ -123,7 +123,8 @@ _vault_start_and_status() {
   local i rc status=""
   if [ -z "$(dc ps -q --status running vault 2>/dev/null)" ]; then
     info "Starting vault container..."
-    dc up -d --no-deps vault
+    # shellcheck disable=SC2046  # nothing or --no-build
+    dc up -d $(runtime_no_build) --no-deps vault
   fi
   info "Waiting for the Vault API..."
   for ((i = 1; i <= 60; i++)); do

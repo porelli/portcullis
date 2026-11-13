@@ -11,7 +11,10 @@ set -uo pipefail
 
 # The shell environment wins over .env (like docker compose): make sure
 # the caller's (e.g. CI's workflow-level) settings cannot leak in.
-unset PORTCULLIS_DOMAIN VAULT_ADDR VAULT_TOKEN COMPOSE_FILE KEYCLOAK_URL
+unset PORTCULLIS_DOMAIN VAULT_ADDR VAULT_TOKEN COMPOSE_FILE KEYCLOAK_URL DOCKER_HOST XDG_RUNTIME_DIR PORTCULLIS_ENGINE_SOCKET
+# Every fixture is a Docker install (scripts/lib/runtime.sh: no default);
+# the runtime tests below set their own.
+export CONTAINER_RUNTIME=docker
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CLI="$HERE/../portcullis"
@@ -31,10 +34,19 @@ file_inode()  { stat -c %i "$1" 2>/dev/null || stat -f %i "$1"; }
 
 # ── stubs ──────────────────────────────────────────────────
 mkdir -p "$WORK/bin" "$WORK/stub"
+# The engine's /version components (runtime_check): a Docker Engine.
+cat > "$WORK/stub-version" <<'STUBV'
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
+STUBV
 export STUB_DIR="$WORK/stub"
 # docker: only `network inspect` matters here ($STUB_DIR/ipam-json[-<network>] = IPAM).
 cat > "$WORK/bin/docker" <<'STUB'
 #!/usr/bin/env bash
+# The engine's components (runtime_check): Docker Engine unless the test
+# says otherwise. Not logged in calls.
+if [ "$1" = version ] && [ "$3" = "{{json .Server.Components}}" ]; then
+  echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0
+fi
 echo "$*" >> "$STUB_DIR/calls"
 if [ "$1 $2" = "network inspect" ] && [ "$4" = "--format" ]; then
   if [ "$5" = "{{json .IPAM.Config}}" ]; then
@@ -361,6 +373,7 @@ expect_eq "compose: keycloak and the hub pinned on portcullis-mcp with the same 
 mkdir -p "$WORK/dnsbin" "$STUB_DIR/dns"
 cat > "$WORK/dnsbin/docker" <<'STUB'
 #!/usr/bin/env bash
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
 if [ "$1 $2" = "network inspect" ]; then
   case "$5" in
     "{{range"*) [ -f "$STUB_DIR/dns/net-fail" ] && exit 1; [ -f "$STUB_DIR/dns/ids" ] && cat "$STUB_DIR/dns/ids"; exit 0 ;;
@@ -1020,6 +1033,7 @@ expect_eq "manifest: format + every file" "$(jq -c '[.format, (.files | keys)]' 
   '[1,[".env","certs/a b.crt","postgres.dump","secrets/vault-init.json","secrets/vault-unseal/unseal-key","vault.snap"]]'
 expect_eq "manifest: hub image recorded" "$(jq -r .hub_image "$B/MANIFEST.json")" hub:1
 expect_eq "manifest: keycloak image recorded" "$(jq -r .keycloak_image "$B/MANIFEST.json")" kc:2
+expect_eq "MANIFEST.json records runtime {name, version}" "$(jq -c .runtime "$B/MANIFEST.json")" '{"name":"docker","version":"29.0.0"}'
 expect_ok "manifest: checksums verify" _backup_check_manifest "$B"
 echo tampered >> "$B/postgres.dump"
 expect_fail "manifest: a modified file fails" _backup_check_manifest "$B"
@@ -1173,6 +1187,7 @@ DR="$WORK/domroot"; mkdir -p "$DR/secrets"
 mkdir -p "$WORK/dombin"
 cat > "$WORK/dombin/docker" <<'STUB'
 #!/usr/bin/env bash
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
 echo "$*" >> "$STUB_DIR/dom-calls"
 case "$*" in
   *" keygen") printf '# created: x\n# public key: age1x\nAGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ\n' ;;
@@ -1228,6 +1243,7 @@ MR="$WORK/mcproot"; mkdir -p "$MR/secrets"
 mkdir -p "$WORK/mcpbin"
 cat > "$WORK/mcpbin/docker" <<'STUB'
 #!/usr/bin/env bash
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
 echo "$*" >> "$STUB_DIR/mcp-calls"
 case "$*" in
   *" keygen") printf '# created: 2026-11-05T10:00:00Z\n# public key: age1mcpgatetestrecipientqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\nAGE-SECRET-KEY-1MCPGATETESTQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ\n' ;;
@@ -1294,6 +1310,7 @@ source "$HERE/../scripts/lib/sessions.sh"
 SR="$WORK/sessroot"; mkdir -p "$SR/secrets" "$WORK/sessbin"
 cat > "$WORK/sessbin/docker" <<'STUB'
 #!/usr/bin/env bash
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
 echo "$*" >> "$STUB_DIR/sess-calls"
 case "$*" in *" ps -q --status running sessions") [ -f "$STUB_DIR/sess-running" ] && echo abc123 ;; esac
 exit 0
@@ -1452,6 +1469,7 @@ expect_ok "backup: BACKUP_FILE_VOLUMES does not contain hub_secrets" bash -c '! 
 mv "$WORK/bin/docker" "$WORK/bin/docker-orig"
 cat > "$WORK/bin/docker" <<'STUB'
 #!/usr/bin/env bash
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
 echo "$*" >> "$STUB_DIR/calls"
 # Simulate docker volume rm succeeding (returns 0) but the volume still existing
 # (docker volume inspect still finds it, meaning the rm actually failed).
@@ -1493,6 +1511,7 @@ mv "$WORK/bin/docker-orig" "$WORK/bin/docker"
 : > "$STUB_DIR/calls"
 cat > "$WORK/bin/docker" <<STUB
 #!/usr/bin/env bash
+[ "\$1 \$3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
 echo "\$*" >> "\$STUB_DIR/calls"
 if [ "\$1" = "volume" ] && [ "\$2" = "inspect" ] && [ "\$3" = "portcullis_hub_secrets" ]; then
   # Volume doesn't exist yet
@@ -1532,6 +1551,7 @@ fi
 : > "$STUB_DIR/calls"
 cat > "$WORK/bin/docker" <<STUB2
 #!/usr/bin/env bash
+[ "\$1 \$3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
 echo "\$*" >> "\$STUB_DIR/calls"
 if [ "\$1" = "volume" ] && [ "\$2" = "inspect" ]; then
   exit 1  # doesn't exist
@@ -1558,6 +1578,7 @@ chmod +x "$WORK/bin/docker"
 : > "$STUB_DIR/calls"
 cat > "$WORK/bin/docker" <<'STUB'
 #!/usr/bin/env bash
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
 echo "$*" >> "$STUB_DIR/calls"
 if [ "$1" = "volume" ] && [ "$2" = "rm" ]; then
   exit 0
@@ -1651,6 +1672,7 @@ chmod +x "$WORK/bin/docker"
 # (fails while $STUB_DIR/rs-fail-<p> exists); every call is logged.
 cat > "$WORK/bin/docker" <<'STUB'
 #!/usr/bin/env bash
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
 echo "$*" >> "$STUB_DIR/calls"
 case "$1" in
   ps) [ "$*" = "ps -aq --filter volume=portcullis_hub_secrets" ] || exit 0
@@ -1719,6 +1741,7 @@ expect_ok "restore: no app down removes volumes" sh -c "! grep -q '^compose -p .
 # Test a failing dc stop hub (N2)
 cat > "$WORK/bin/docker" <<'STUB'
 #!/usr/bin/env bash
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
 echo "$*" >> "$STUB_DIR/calls"
 case "$1" in
   compose)
@@ -1745,6 +1768,7 @@ fi
 # Restore the normal stub
 cat > "$WORK/bin/docker" <<'STUB'
 #!/usr/bin/env bash
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
 echo "$*" >> "$STUB_DIR/calls"
 case "$1" in
   ps) [ "$*" = "ps -aq --filter volume=portcullis_hub_secrets" ] || exit 0
@@ -1839,7 +1863,7 @@ expect_eq "ca bundle: no bundle yet → nothing done" "$(ca_restarts)" "0"
 printf 'bundle-c\n' > "$PORTCULLIS_ROOT/certs/ca-bundle.crt"
 printf 'old\n' > "$PORTCULLIS_ROOT/certs/.ca-bundle.loaded"
 cp "$WORK/bin/docker" "$WORK/docker.ok"
-printf '#!/usr/bin/env bash\necho "$*" >> "$STUB_DIR/calls"\ncase "$*" in *restart*) exit 1 ;; esac\nexit 0\n' > "$WORK/bin/docker"
+{ printf '#!/usr/bin/env bash\n'; cat "$WORK/stub-version"; printf 'echo "$*" >> "$STUB_DIR/calls"\ncase "$*" in *restart*) exit 1 ;; esac\nexit 0\n'; } > "$WORK/bin/docker"
 ca_run 'set -e; signin_ca_reload'
 expect_eq "ca bundle: a failed restart keeps the old record" "$(cat "$PORTCULLIS_ROOT/certs/.ca-bundle.loaded")" "old"
 cp "$WORK/docker.ok" "$WORK/bin/docker"
@@ -1877,7 +1901,7 @@ expect_eq "pki files: pki_files_mark after an explicit restart → no second res
 # A failed restart keeps the old stamp: the next up / upgrade restarts them.
 printf 'old\n' > "$PC/.pki-files.loaded"
 printf 'more\n' >> "$PC/ca-chain.crt"
-printf '#!/usr/bin/env bash\necho "$*" >> "$STUB_DIR/calls"\ncase "$*" in *restart*) exit 1 ;; esac\nexit 0\n' > "$WORK/bin/docker"
+{ printf '#!/usr/bin/env bash\n'; cat "$WORK/stub-version"; printf 'echo "$*" >> "$STUB_DIR/calls"\ncase "$*" in *restart*) exit 1 ;; esac\nexit 0\n'; } > "$WORK/bin/docker"
 rc=0; ca_run 'set -e; pki_files_reload' || rc=$?
 expect_eq "pki files: a failed restart fails and keeps the old stamp" "$rc:$(cat "$PC/.pki-files.loaded")" "1:old"
 cp "$WORK/docker.ok" "$WORK/bin/docker"
@@ -1924,7 +1948,7 @@ expect_eq "config reload: missing file → nothing done" "$(cfg_restarts)" ""
 printf 'alpha-config-v3\n' > "$PORTCULLIS_ROOT/oauth2-proxy/alpha.yaml"
 printf 'old-hash\n' > "$PORTCULLIS_ROOT/secrets/.config-oauth2-proxy_alpha.yaml.loaded"
 cp "$WORK/bin/docker" "$WORK/docker.ok"
-printf '#!/usr/bin/env bash\necho "$*" >> "$STUB_DIR/calls"\ncase "$*" in *restart*) exit 1 ;; esac\nexit 0\n' > "$WORK/bin/docker"
+{ printf '#!/usr/bin/env bash\n'; cat "$WORK/stub-version"; printf 'echo "$*" >> "$STUB_DIR/calls"\ncase "$*" in *restart*) exit 1 ;; esac\nexit 0\n'; } > "$WORK/bin/docker"
 chmod +x "$WORK/bin/docker"
 cfg_run 'set -e; config_reload'
 expect_eq "config reload: a failed restart keeps the old stamp" "$(cat "$PORTCULLIS_ROOT/secrets/.config-oauth2-proxy_alpha.yaml.loaded")" "old-hash"
@@ -1988,6 +2012,7 @@ expect_eq "invite --replace-keys deletes every passkey kind, never a password / 
 mkdir -p "$WORK/dtbin" "$STUB_DIR/dt"
 cat > "$WORK/dtbin/docker" <<'STUB'
 #!/usr/bin/env bash
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
 d="$STUB_DIR/dt"
 echo "$*" >> "$d/argv"
 case "$*" in
@@ -2298,6 +2323,267 @@ SJ="$( (require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; };
         dns_status_json() { cat "$DNSR"; }; dns_traefik_account_uri() { echo https://acme/acct/1; }; dns_main_env_uri() { echo https://acme/acct/1; }
         status_run true 2>/dev/null) || true)"
 expect_eq "status --json: dns.main / dns.domains" "$(printf '%s' "$SJ" | jq -c '[.dns.main.name, (.dns.domains | keys), .ok]')" '["ci.example.org",["team-b.test"],false]'
+expect_eq "status --json has runtime{}" "$(printf '%s' "$SJ" | jq -c '[.runtime.name, .runtime.version, .runtime.rootless, .runtime.checks, (.problems | type)]')" '["docker","29.0.0",false,[],"number"]'
+
+# ══ runtime: CONTAINER_RUNTIME (scripts/lib/runtime.sh) ═════
+# docker stub: the engine's components by DOCKER_HOST — the rootless Podman
+# socket answers STUB_PODMAN_SOCK_ENGINE, anything else
+# STUB_DOCKER_SOCK_ENGINE (Engine | Podman Engine | down); `compose ...
+# config --format json` prints $STUB_DIR/rt-config.json; the host-check
+# probes answer from STUB_CT_UID_MAP / STUB_CT_LIMITS. podman stub: unshare
+# cat uid_map / gid_map (STUB_UID_MAP / STUB_GID_MAP), version
+# (STUB_PODMAN_VERSION), build (logged).
+mkdir -p "$WORK/rtbin" "$WORK/rt"
+cat > "$WORK/rtbin/docker" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1" = version ] && [ "$3" = "{{json .Server.Components}}" ]; then
+  echo "version DOCKER_HOST=${DOCKER_HOST:-}" >> "$STUB_DIR/rt-calls"
+  case "${DOCKER_HOST:-}" in
+    *podman/podman.sock) e="${STUB_PODMAN_SOCK_ENGINE:-down}" ;;
+    *) e="${STUB_DOCKER_SOCK_ENGINE:-Engine}" ;;
+  esac
+  case "$e" in
+    down) exit 1 ;;
+    "Podman Engine") echo '[{"Name":"Podman Engine","Version":"5.4.2"}]' ;;
+    *) echo '[{"Name":"Engine","Version":"29.0.0"}]' ;;
+  esac
+  exit 0
+fi
+echo "$*" >> "$STUB_DIR/rt-calls"
+case "$*" in
+  "compose --project-directory "*" config --format json") cat "$STUB_DIR/rt-config.json" ;;
+  "compose version --short") echo 2.40.0 ;;
+  "run "*" cat /proc/self/uid_map") printf '%b' "${STUB_CT_UID_MAP:-$STUB_UID_MAP}" ;;
+  "create "*) echo probe1 ;;
+  "inspect --format {{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} probe1") echo "${STUB_CT_LIMITS:-16777216 8}" ;;
+  "image inspect "*) exit 1 ;;
+  "volume inspect "*) exit 1 ;;
+esac
+exit 0
+STUB
+cat > "$WORK/rtbin/podman" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_DIR/podman-calls"
+case "$*" in
+  "unshare cat /proc/self/uid_map") printf '%b' "$STUB_UID_MAP" ;;
+  "unshare cat /proc/self/gid_map") printf '%b' "$STUB_GID_MAP" ;;
+  "version --format {{.Client.Version}}") echo "${STUB_PODMAN_VERSION:-5.4.2}" ;;
+esac
+exit 0
+STUB
+chmod +x "$WORK/rtbin/docker" "$WORK/rtbin/podman"
+mksock() { python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$1"; }
+RT_XDG="$WORK/rt/xdg"; mkdir -p "$RT_XDG/podman"; mksock "$RT_XDG/podman/podman.sock"
+RT_PSOCK="$RT_XDG/podman/podman.sock"
+mksock "$WORK/rt/docker.sock"
+RT_UID="$(id -u)" RT_GID="$(id -g)"
+export STUB_UID_MAP="         0       $RT_UID          1\n         1     100000      65536\n"
+export STUB_GID_MAP="         0       $RT_GID          1\n         1     100000      65536\n"
+# rt <shell code> — in a subshell with the runtime stubs, no runtime chosen;
+# prints the code's output (stderr too), then "rc=<n>".
+rt() {
+  rm -f "$STUB_DIR/rt-calls" "$STUB_DIR/podman-calls"
+  (unset CONTAINER_RUNTIME DOCKER_HOST COMPOSE_FILE PORTCULLIS_ENGINE_SOCKET _RT_CHECKED _RT_HOST_OK
+   export PATH="$WORK/rtbin:$PATH" RT_DOCKER_SOCK="$WORK/rt/nosuch.sock" XDG_RUNTIME_DIR="$RT_XDG"
+   eval "$1") 2>&1
+  echo "rc=$?"
+}
+
+expect_eq "runtime_detect: docker socket without Podman component → docker" \
+  "$(rt "RT_DOCKER_SOCK='$WORK/rt/docker.sock' runtime_detect")" "docker
+rc=0"
+expect_eq "runtime_detect: both present → docker" \
+  "$(rt "RT_DOCKER_SOCK='$WORK/rt/docker.sock' STUB_PODMAN_SOCK_ENGINE='Podman Engine' runtime_detect")" "docker
+rc=0"
+expect_eq "runtime_detect: only the user's Podman socket answers → podman" \
+  "$(rt "STUB_PODMAN_SOCK_ENGINE='Podman Engine' runtime_detect")" "podman
+rc=0"
+expect_eq "runtime_detect: a Docker socket whose engine is Podman is not docker" \
+  "$(rt "RT_DOCKER_SOCK='$WORK/rt/docker.sock' STUB_DOCKER_SOCK_ENGINE='Podman Engine' STUB_PODMAN_SOCK_ENGINE='Podman Engine' runtime_detect")" "podman
+rc=0"
+expect_eq "runtime_detect: --runtime podman → podman" "$(rt 'runtime_detect podman')" "podman
+rc=0"
+expect_eq "runtime_detect: CONTAINER_RUNTIME from the environment" "$(rt 'CONTAINER_RUNTIME=podman runtime_detect')" "podman
+rc=0"
+OUT="$(rt "id() { if [ \"\$1\" = -u ]; then echo 0; else command id \"\$@\"; fi; }; STUB_PODMAN_SOCK_ENGINE='Podman Engine' runtime_detect")"
+case "$OUT" in *"rootless Podman only"*"rc=1") t_pass "runtime_detect: podman as root → refused" ;; *) t_fail "runtime_detect as root: $OUT" ;; esac
+OUT="$(rt "id() { if [ \"\$1\" = -u ]; then echo 0; else command id \"\$@\"; fi; }; runtime_detect podman")"
+case "$OUT" in *"rootless Podman only"*"rc=1") t_pass "runtime_detect: --runtime podman as root → refused" ;; *) t_fail "runtime_detect --runtime podman as root: $OUT" ;; esac
+OUT="$(rt 'runtime_detect')"
+case "$OUT" in *"no container engine answers: pass --runtime docker|podman"*"/etc/subuid"*"enable-linger"*"podman.socket podman-restart.service"*"ip_unprivileged_port_start=80"*"rc=1") t_pass "runtime_detect: nothing answers → fails with the host-prep hints" ;; *) t_fail "runtime_detect nothing: $OUT" ;; esac
+expect_eq "runtime_detect: an unknown runtime → refused" "$(rt 'runtime_detect lxc >/dev/null 2>&1')" "rc=1"
+
+OUT="$(rt 'runtime_name')"
+case "$OUT" in *"CONTAINER_RUNTIME is not set in .env (docker or podman): ./portcullis init writes it"*"rc=1") t_pass "runtime_name: unset → refused naming the variable" ;; *) t_fail "runtime_name unset: $OUT" ;; esac
+OUT="$(rt 'CONTAINER_RUNTIME=Docker runtime_name')"
+case "$OUT" in *"CONTAINER_RUNTIME=Docker is neither docker nor podman"*"rc=1") t_pass "runtime_name: another value → refused naming it" ;; *) t_fail "runtime_name bad: $OUT" ;; esac
+OUT="$(rt 'CONTAINER_RUNTIME=docker STUB_DOCKER_SOCK_ENGINE="Podman Engine" runtime_check')"
+case "$OUT" in *"CONTAINER_RUNTIME=docker but the engine is Podman Engine"*"rc=1") t_pass "runtime_check: CONTAINER_RUNTIME=docker but the engine is Podman → fails" ;; *) t_fail "runtime_check docker/podman: $OUT" ;; esac
+OUT="$(rt "CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET='$RT_PSOCK' STUB_PODMAN_SOCK_ENGINE=Engine runtime_check")"
+case "$OUT" in *"CONTAINER_RUNTIME=podman but the engine is Docker Engine"*"rc=1") t_pass "runtime_check: CONTAINER_RUNTIME=podman but the engine is Docker → fails" ;; *) t_fail "runtime_check podman/docker: $OUT" ;; esac
+OUT="$(rt 'CONTAINER_RUNTIME=docker STUB_DOCKER_SOCK_ENGINE=down runtime_check')"
+case "$OUT" in *"the container engine doesn't answer"*"rc=1") t_pass "runtime_check: no engine → fails" ;; *) t_fail "runtime_check down: $OUT" ;; esac
+expect_eq "runtime_check: podman exports DOCKER_HOST=unix://<XDG>/podman/podman.sock" \
+  "$(rt "CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET='$RT_PSOCK' STUB_PODMAN_SOCK_ENGINE='Podman Engine' runtime_check; echo \"\$DOCKER_HOST\"")" "unix://$RT_PSOCK
+rc=0"
+expect_eq "runtime_check: once per run" \
+  "$(rt "CONTAINER_RUNTIME=docker; runtime_check; runtime_check; grep -c '^version' \"\$STUB_DIR/rt-calls\"")" "1
+rc=0"
+OUT="$(rt "CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET=/tmp/other.sock STUB_PODMAN_SOCK_ENGINE='Podman Engine' runtime_check")"
+case "$OUT" in *"PORTCULLIS_ENGINE_SOCKET=/tmp/other.sock, but the rootless Podman socket is $RT_PSOCK"*"rc=1") t_pass "runtime_check: podman with another PORTCULLIS_ENGINE_SOCKET → fails" ;; *) t_fail "runtime_check socket: $OUT" ;; esac
+OUT="$(rt "CONTAINER_RUNTIME=podman STUB_PODMAN_SOCK_ENGINE='Podman Engine' runtime_check")"
+case "$OUT" in *"PORTCULLIS_ENGINE_SOCKET is not set"*"rc=1") t_pass "runtime_check: podman without PORTCULLIS_ENGINE_SOCKET → fails" ;; *) t_fail "runtime_check no socket: $OUT" ;; esac
+OUT="$(rt "CONTAINER_RUNTIME=docker PORTCULLIS_ENGINE_SOCKET='$WORK/rt' runtime_check")"
+case "$OUT" in *"is not a socket"*"rc=1") t_pass "runtime_check: docker with a PORTCULLIS_ENGINE_SOCKET that isn't a socket → fails" ;; *) t_fail "runtime_check docker socket: $OUT" ;; esac
+OUT="$(rt "CONTAINER_RUNTIME=podman DOCKER_HOST=tcp://elsewhere:2375 PORTCULLIS_ENGINE_SOCKET='$RT_PSOCK' runtime_check")"
+case "$OUT" in *"DOCKER_HOST=tcp://elsewhere:2375"*"unset DOCKER_HOST"*"rc=1") t_pass "runtime_export: podman refuses another DOCKER_HOST" ;; *) t_fail "runtime_export DOCKER_HOST: $OUT" ;; esac
+expect_eq "runtime_podman_socket falls back to /run/user/<uid>" "$(rt 'unset XDG_RUNTIME_DIR; runtime_podman_socket')" "/run/user/$RT_UID/podman/podman.sock
+rc=0"
+
+RX="$WORK/rt/root"; mkdir -p "$RX"; touch "$RX/docker-compose.override.yml"
+expect_eq "runtime_export keeps docker-compose.override.yml beside the SELinux overlay" \
+  "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman; getenforce() { echo Enforcing; }; runtime_export; runtime_export; echo \"\$COMPOSE_FILE\"")" \
+  "docker-compose.yml:docker-compose.override.yml:docker-compose.podman-selinux.yml
+rc=0"
+expect_eq "runtime_export: an existing COMPOSE_FILE gets the overlay once" \
+  "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman COMPOSE_FILE=docker-compose.yml:ci.yml; getenforce() { echo Enforcing; }; runtime_export; runtime_export; echo \"\$COMPOSE_FILE\"")" \
+  "docker-compose.yml:ci.yml:docker-compose.podman-selinux.yml
+rc=0"
+expect_eq "runtime_export: SELinux permissive → no overlay" \
+  "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman; getenforce() { echo Permissive; }; runtime_export; echo \"[\${COMPOSE_FILE:-}]\"")" "[]
+rc=0"
+expect_eq "runtime_export: docker on an SELinux host → no overlay, no DOCKER_HOST" \
+  "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=docker; getenforce() { echo Enforcing; }; runtime_export; echo \"[\${COMPOSE_FILE:-}][\${DOCKER_HOST:-}]\"")" "[][]
+rc=0"
+
+expect_eq "runtime_id_maps: the default shape" \
+  "$(rt 'runtime_id_maps && echo "$_RT_UID_OP $_RT_UID_START $_RT_UID_N $_RT_GID_OP $_RT_GID_START $_RT_GID_N"')" "$RT_UID 100000 65536 $RT_GID 100000 65536
+rc=0"
+expect_eq "runtime_id_maps: 65535 subuids → refused" \
+  "$(rt "STUB_UID_MAP='0 $RT_UID 1\n1 100000 65535\n' runtime_id_maps")" "rc=1"
+expect_eq "runtime_id_maps: another shape (keep-id) → refused" \
+  "$(rt "STUB_UID_MAP='0 100000 $RT_UID\n$RT_UID $RT_UID 1\n$((RT_UID + 1)) $((100000 + RT_UID)) 65536\n' runtime_id_maps")" "rc=1"
+expect_eq "runtime_id_maps: an unreadable map → refused" "$(rt "STUB_UID_MAP='' runtime_id_maps")" "rc=1"
+expect_ok "_ver_ge 5.4.2 5.4" _ver_ge 5.4.2 5.4
+expect_ok "_ver_ge 5.10.0 5.4" _ver_ge 5.10.0 5.4
+expect_fail "_ver_ge 5.3.9 5.4" _ver_ge 5.3.9 5.4
+expect_fail "_ver_ge '' 5.4" _ver_ge "" 5.4
+echo 80 > "$WORK/rt/port80"; echo 1024 > "$WORK/rt/port1024"; echo junk > "$WORK/rt/portjunk"
+expect_eq "runtime_port_start reads the sysctl" "$(RT_PROC_PORT_START="$WORK/rt/port80" runtime_port_start)" 80
+expect_eq "runtime_port_start: unreadable or not a number → 1024" \
+  "$(RT_PROC_PORT_START="$WORK/rt/nope" runtime_port_start) $(RT_PROC_PORT_START="$WORK/rt/portjunk" runtime_port_start)" "1024 1024"
+
+# A prepared host: every † item ok (functions stand in for the host tools).
+CG="$WORK/rt/cgroup"; mkdir -p "$CG/user.slice/user-$RT_UID.slice/user@$RT_UID.service"
+echo "cpuset cpu io memory pids" > "$CG/user.slice/user-$RT_UID.slice/user@$RT_UID.service/cgroup.controllers"
+RT_HOST="CONTAINER_RUNTIME=podman RT_CGROUP_ROOT='$CG' RT_PROC_PORT_START='$WORK/rt/port80'
+  loginctl() { echo yes; }; systemctl() { echo enabled; }; nft() { :; }; passt() { :; }; getenforce() { echo Enforcing; }"
+OUT="$(rt "$RT_HOST; runtime_host_checks")"
+expect_eq "runtime_host_checks: a prepared host → no fail line" "$(printf '%s\n' "$OUT" | grep -c '^fail' || true)" 0
+case "$OUT" in *"ok	SELinux Enforcing"*"rc=0") t_pass "runtime_host_checks: SELinux mode is an ok line" ;; *) t_fail "runtime_host_checks prepared: $OUT" ;; esac
+OUT="$(rt "$RT_HOST; RT_PROC_PORT_START='$WORK/rt/port1024'; runtime_host_checks")"
+case "$OUT" in *"fail	net.ipv4.ip_unprivileged_port_start = 1024"*) t_pass "runtime_host_checks: port start 1024 → fail line naming ip_unprivileged_port_start" ;; *) t_fail "runtime_host_checks port: $OUT" ;; esac
+echo "cpuset cpu io memory" > "$CG/user.slice/user-$RT_UID.slice/user@$RT_UID.service/cgroup.controllers"
+OUT="$(rt "$RT_HOST; runtime_host_checks")"
+case "$OUT" in *"fail	cgroup v2: memory and pids aren't both delegated"*) t_pass "runtime_host_checks: no pids in cgroup.controllers → fail" ;; *) t_fail "runtime_host_checks pids: $OUT" ;; esac
+echo "memory pids" > "$CG/user.slice/user-$RT_UID.slice/user@$RT_UID.service/cgroup.controllers"
+OUT="$(rt "$RT_HOST; export STUB_CT_LIMITS='0 0'; runtime_host_checks")"
+case "$OUT" in *"fail	cgroup v2: a probe container"*) t_pass "runtime_host_checks: a probe without Memory/PidsLimit → fail" ;; *) t_fail "runtime_host_checks probe: $OUT" ;; esac
+OUT="$(rt "$RT_HOST; export STUB_CT_UID_MAP='0 100000 65536\n'; runtime_host_checks")"
+case "$OUT" in *"fail	containers don't run in the user's default user namespace"*) t_pass "runtime_host_checks: a container map ≠ the unshare map (userns=auto) → fail" ;; *) t_fail "runtime_host_checks userns: $OUT" ;; esac
+OUT="$(rt "$RT_HOST; loginctl() { echo no; }; systemctl() { echo disabled; }; export STUB_PODMAN_VERSION=5.3.1; runtime_host_checks")"
+case "$OUT" in *"fail	linger is off"*"fail	user unit podman.socket is not enabled"*"fail	user unit podman-restart.service is not enabled"*"fail	podman 5.3.1"*) t_pass "runtime_host_checks: linger, user units, podman < 5.4 → fail lines" ;; *) t_fail "runtime_host_checks linger/units/version: $OUT" ;; esac
+OUT="$(rt "$RT_HOST; nft() { return 1; }; unset -f nft; PATH=\"$WORK/rtbin:/usr/bin:/bin\"; command -v nft >/dev/null || command -v iptables >/dev/null || runtime_host_checks")"
+case "$OUT" in *"warn	neither nft nor iptables"*|"rc=0") t_pass "runtime_host_checks: no nft / iptables → warn (or the host has one)" ;; *) t_fail "runtime_host_checks nft: $OUT" ;; esac
+expect_eq "runtime_host_checks: docker → nothing" "$(rt 'CONTAINER_RUNTIME=docker runtime_host_checks')" "rc=0"
+OUT="$(rt "$RT_HOST; loginctl() { echo no; }; RT_PROC_PORT_START='$WORK/rt/port1024'; runtime_require_host")"
+case "$OUT" in *"isn't prepared for rootless Podman"*"  - linger is off"*"  - net.ipv4.ip_unprivileged_port_start = 1024"*"rc=1") t_pass "runtime_require_host: lists every failed item, refuses" ;; *) t_fail "runtime_require_host: $OUT" ;; esac
+expect_eq "runtime_require_host: docker → no-op" "$(rt 'CONTAINER_RUNTIME=docker runtime_require_host')" "rc=0"
+OUT="$(rt "$RT_HOST; export STUB_PODMAN_SOCK_ENGINE='Podman Engine'; runtime_export; runtime_status_json")"
+expect_eq "runtime_status_json: podman" "$(printf '%s\n' "$OUT" | head -n1 | jq -c '[.name, .version, .rootless, .subuid_start, .subuid_count, .subgid_count, .port_start, (.checks | length > 5), ([.checks[] | select(.status == "fail")] | length)]')" \
+  '["podman","5.4.2",true,100000,65536,65536,80,true,0]'
+expect_eq "runtime_status_json: docker" "$(rt 'CONTAINER_RUNTIME=docker runtime_status_json' | head -n1 | jq -c '[.name, .version, .rootless, .checks]')" '["docker","29.0.0",false,[]]'
+
+# Local images: podman build from the merged config, never the compat /build.
+cat > "$STUB_DIR/rt-config.json" <<'JSON'
+{"name":"portcullis","services":{
+ "domains":{"image":"portcullis-domains","build":{"context":"/src/domains","dockerfile":"Dockerfile","args":{"GO_TAGS":"testprovider"}}},
+ "enroll":{"build":{"context":"/src/enroll","dockerfile":"Dockerfile"}},
+ "mcp-gate":{"image":"portcullis-mcp-gate","build":{"context":"/src/mcp-gate","dockerfile":"/src/mcp-gate/Dockerfile.x"}},
+ "dns-tool":{"image":"portcullis-domains"},
+ "vault":{"image":"hashicorp/vault:2"}}}
+JSON
+OUT="$(rt "CONTAINER_RUNTIME=podman; stack_compose_up >/dev/null 2>&1; echo \"\$?\"; sort \"\$STUB_DIR/podman-calls\"; grep -E '^compose .* (up|build)( |$)' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'")"
+expect_eq "stack_compose_up on podman builds with podman build and runs up --no-build" "$OUT" "0
+build -t portcullis-domains -f /src/domains/Dockerfile --build-arg GO_TAGS=testprovider /src/domains
+build -t portcullis-enroll -f /src/enroll/Dockerfile /src/enroll
+build -t portcullis-mcp-gate -f /src/mcp-gate/Dockerfile.x /src/mcp-gate
+compose up -d --no-build
+rc=0"
+OUT="$(rt "CONTAINER_RUNTIME=docker; stack_compose_up hub >/dev/null 2>&1; grep -E '^compose ' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'; test ! -e \"\$STUB_DIR/podman-calls\"")"
+expect_eq "stack_compose_up on docker: up -d --build (unchanged), no podman" "$OUT" "compose up -d --build hub
+rc=0"
+expect_eq "runtime_no_build: --no-build under podman, nothing under docker" \
+  "[$(CONTAINER_RUNTIME=podman runtime_no_build)][$(CONTAINER_RUNTIME=docker runtime_no_build)]" "[--no-build][]"
+OUT="$(rt "CONTAINER_RUNTIME=podman PORTCULLIS_ROOT='$RX'; domains_image_ensure >/dev/null 2>&1; echo \"\$?\"; cat \"\$STUB_DIR/podman-calls\"; grep -c ' build' \"\$STUB_DIR/rt-calls\"; true")"
+expect_eq "domains_image_ensure on podman runs podman build, never dc build" "$OUT" "0
+build -t portcullis-domains -f /src/domains/Dockerfile --build-arg GO_TAGS=testprovider /src/domains
+0
+rc=0"
+OUT="$(rt "CONTAINER_RUNTIME=docker PORTCULLIS_ROOT='$RX'; domains_image_ensure >/dev/null 2>&1; grep -E '^compose ' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'")"
+expect_eq "domains_image_ensure on docker: dc build --quiet domains (unchanged)" "$OUT" "compose build --quiet domains
+rc=0"
+expect_eq "runtime_build_local: an unknown service → refused" "$(rt 'CONTAINER_RUNTIME=podman; runtime_build_local nope >/dev/null 2>&1')" "rc=1"
+
+# hub_env_write: the port start for the Hub's RootlessCompat, podman only.
+PH="$WORK/rt/hubroot"; mkdir -p "$PH"; echo 'PORTCULLIS_DOMAIN=hub.test' > "$PH/.env"
+expect_eq "hub_env_write: PORTCULLIS_UNPRIVILEGED_PORT_START only under podman" \
+  "$(rt "PORTCULLIS_ROOT='$PH' RT_PROC_PORT_START='$WORK/rt/port80'; CONTAINER_RUNTIME=podman hub_env_write; grep -c '^PORTCULLIS_UNPRIVILEGED_PORT_START=80$' '$PH/secrets/hub/core.env'; CONTAINER_RUNTIME=docker hub_env_write; grep -c '^PORTCULLIS_UNPRIVILEGED_PORT_START=' '$PH/secrets/hub/core.env'; true")" "1
+0
+rc=0"
+expect_eq "hub_env_write: HUB_SHARED_ENV can't inject PORTCULLIS_UNPRIVILEGED_PORT_START" \
+  "$(rt "PORTCULLIS_ROOT='$PH' RT_PROC_PORT_START='$WORK/rt/port80' PORTCULLIS_UNPRIVILEGED_PORT_START=1 HUB_SHARED_ENV=PORTCULLIS_UNPRIVILEGED_PORT_START; CONTAINER_RUNTIME=docker hub_env_write; grep -c '^PORTCULLIS_UNPRIVILEGED_PORT_START=' '$PH/secrets/hub/core.env'; true")" "0
+rc=0"
+expect_eq "need_env: no CONTAINER_RUNTIME → refused naming the variable" \
+  "$(rt "PORTCULLIS_ROOT='$PH'; need_env 2>&1 | grep -c 'CONTAINER_RUNTIME is not set in .env'; true")" "1
+rc=0"
+
+# Restores keep this host's runtime keys, never the backup's (P6).
+# rr <current .env|-> <backup .env> [code] — backup_restore over a fake
+# backup (stops at the first logical restore), then the restored .env.
+rr() {
+  rm -rf "$WORK/rr-root" "$WORK/rr-backup"; mkdir -p "$WORK/rr-root/backups" "$WORK/rr-backup"
+  [ "$1" = - ] || printf '%b' "$1" > "$WORK/rr-root/.env"
+  printf '%b' "$2" > "$WORK/rr-backup/.env"
+  printf '{"created":"x","domain":"d"}' > "$WORK/rr-backup/MANIFEST.json"
+  rt "export PORTCULLIS_ROOT='$WORK/rr-root' BACKUP_ROOT='$WORK/rr-root/backups'
+    _backup_check_layout() { :; }; _backup_check_manifest() { :; }; network_check() { :; }
+    stack_prepare() { :; }; runtime_require_host() { echo require_host >> \"\$STUB_DIR/rt-calls\"; }
+    _backup_load_cfg() { _BACKUP_CFG='{\"name\":\"portcullis\",\"volumes\":{\"hub_secrets\":{\"name\":\"portcullis_hub_secrets\"},\"postgres_data\":{\"name\":\"portcullis_postgres_data\"},\"vault_data\":{\"name\":\"portcullis_vault_data\"}}}'; }
+    _restore_pg() { exit 3; }
+    ${3:-}
+    [ ! -f \"\$PORTCULLIS_ROOT/.env\" ] || env_load
+    backup_restore '$WORK/rr-backup' true false >/dev/null 2>&1" >/dev/null
+  grep -E '^(CONTAINER_RUNTIME|PORTCULLIS_ENGINE_SOCKET|RESTORED)=' "$WORK/rr-root/.env" | sort | paste -sd' ' -
+}
+expect_eq "restore keeps the host's runtime keys (a Docker backup's .env without them over podman)" \
+  "$(rr "CONTAINER_RUNTIME=podman\nPORTCULLIS_ENGINE_SOCKET=$RT_PSOCK\n" 'RESTORED=1\n' "export STUB_PODMAN_SOCK_ENGINE='Podman Engine'")" \
+  "CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET=$RT_PSOCK RESTORED=1"
+expect_eq "restore keeps the host's runtime keys (the backup says docker)" \
+  "$(rr "CONTAINER_RUNTIME=podman\nPORTCULLIS_ENGINE_SOCKET=$RT_PSOCK\n" 'RESTORED=1\nCONTAINER_RUNTIME=docker\n' "export STUB_PODMAN_SOCK_ENGINE='Podman Engine'")" \
+  "CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET=$RT_PSOCK RESTORED=1"
+expect_eq "restore onto docker drops a podman backup's PORTCULLIS_ENGINE_SOCKET" \
+  "$(rr 'CONTAINER_RUNTIME=docker\n' "RESTORED=1\nCONTAINER_RUNTIME=podman\nPORTCULLIS_ENGINE_SOCKET=/run/user/1001/podman/podman.sock\n")" \
+  "CONTAINER_RUNTIME=docker RESTORED=1"
+expect_eq "restore without .env detects the runtime before any docker call" \
+  "$(rr - 'RESTORED=1\n' "export RT_DOCKER_SOCK='$WORK/rt/docker.sock'"):$(head -n1 "$STUB_DIR/rt-calls" | cut -d' ' -f1):$(grep -v '^version' "$STUB_DIR/rt-calls" | head -n1)" \
+  "CONTAINER_RUNTIME=docker RESTORED=1:version:require_host"
+expect_eq "restore without .env onto podman writes the rootless socket" \
+  "$(rr - 'RESTORED=1\nCONTAINER_RUNTIME=docker\n' "export STUB_PODMAN_SOCK_ENGINE='Podman Engine'")" \
+  "CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET=$RT_PSOCK RESTORED=1"
+expect_eq "restore: a host that isn't prepared for podman is refused before anything stops" \
+  "$(rr "CONTAINER_RUNTIME=podman\nPORTCULLIS_ENGINE_SOCKET=$RT_PSOCK\n" 'RESTORED=1\n' "export STUB_PODMAN_SOCK_ENGINE='Podman Engine'; runtime_require_host() { exit 1; }"):$(grep -c 'stop hub' "$STUB_DIR/rt-calls")" \
+  "CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET=$RT_PSOCK:0"
 
 echo ""
 echo "$PASS passed, $FAIL failed"

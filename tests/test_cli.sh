@@ -25,13 +25,35 @@ expect_eq() { if [ "$2" = "$3" ]; then t_pass "$1"; else t_fail "$1 (got '$2', w
 file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 
 mkdir -p "$WORK/bin"
-cat > "$WORK/bin/docker" <<'STUB'
-#!/usr/bin/env bash
+# The engine's /version components (runtime_check): a Docker Engine.
+cat > "$WORK/stub-version" <<'STUBV'
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
+STUBV
+# Only the engine's version answers (runtime_check, not logged); anything
+# else is logged and fails loudly.
+{ printf '#!/usr/bin/env bash\n'; cat "$WORK/stub-version"; cat <<'STUB'
 echo "docker must not be called: $*" >&2
 echo "$*" >> "$STUB_CALLS"
 exit 99
 STUB
+} > "$WORK/bin/docker"
 chmod +x "$WORK/bin/docker"
+# Only the version answers; nothing else is logged (version with an .env).
+mkdir -p "$WORK/quietbin"
+{ printf '#!/usr/bin/env bash\n'; cat "$WORK/stub-version"; printf 'exit 1\n'; } > "$WORK/quietbin/docker"
+chmod +x "$WORK/quietbin/docker"
+# runtime_detect's rootful socket: a real unix socket here (the main stub
+# answers as a Docker Engine), never the host's.
+python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$WORK/docker.sock"
+export RT_DOCKER_SOCK="$WORK/docker.sock"
+# No engine at all: every call (the version too) is logged and fails.
+mkdir -p "$WORK/noengine"
+cat > "$WORK/noengine/docker" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$STUB_CALLS_NOENGINE"
+exit 99
+STUB
+chmod +x "$WORK/noengine/docker"
 export PATH="$WORK/bin:$PATH" STUB_CALLS="$WORK/docker-calls"
 # An empty root: commands must not touch the real checkout.
 export PORTCULLIS_ROOT="$WORK/root"
@@ -76,6 +98,23 @@ while IFS= read -r c; do
   expect_eq "'help $c' == '$c --help'" "$RC:$OUT" "0:$sub_help"
 done <<< "$COMMANDS"
 
+# Every --help works with no engine (and never asks one), even next to an
+# .env without CONTAINER_RUNTIME.
+NE_ROOT="$WORK/ne-root"
+mkdir -p "$NE_ROOT"
+echo 'PORTCULLIS_DOMAIN=ne.example' > "$NE_ROOT/.env"
+NE_BAD=""
+: > "$WORK/noengine-calls"
+while IFS= read -r c; do
+  # shellcheck disable=SC2086
+  PATH="$WORK/noengine:$PATH" PORTCULLIS_ROOT="$NE_ROOT" STUB_CALLS_NOENGINE="$WORK/noengine-calls" \
+    "$CLI" $c --help >/dev/null 2>&1 </dev/null || NE_BAD="$NE_BAD $c"
+done <<< "$COMMANDS"
+expect_eq "every --help works with no engine" "$NE_BAD" ""
+expect_eq "every --help works with no engine: the engine was never asked" "$(cat "$WORK/noengine-calls")" ""
+run init --help
+case "$OUT" in *"--runtime docker|podman"*"CONTAINER_RUNTIME"*"never switched"*) t_pass "init --help documents --runtime" ;; *) t_fail "init --help lacks --runtime" ;; esac
+
 for g in vault pki keycloak oidc dns cert config signin; do
   run "$g";        expect_eq "'$g' without subcommand exits 2" "$RC" 2
   run "$g" --help; expect_eq "'$g --help' exits 0" "$RC" 0
@@ -111,6 +150,8 @@ status --json --bogus|unknown argument: --bogus
 init --domain|--domain needs a value
 init --domain --email|--domain needs a value
 init --frob|unknown argument: --frob
+init --runtime|--runtime needs a value
+init --runtime lxc|--runtime must be docker or podman
 vault init --rotate-enroll-secret|unknown argument
 pki setup --with-server-certs|unknown argument
 cert enroll|expected <username> [email]
@@ -164,6 +205,14 @@ case "$OUT" in *"keycloak image   ghcr.io/porelli/portcullis-keycloak:edge (defa
 RC=0; OUT="$(KEYCLOAK_IMAGE=example/kc:2 "$CLI" version --json </dev/null)" || RC=$?
 expect_eq "version --json honours KEYCLOAK_IMAGE" "$RC:$(printf '%s' "$OUT" | jq -r '.keycloak_image + " " + .keycloak_image_source')" "0:example/kc:2 KEYCLOAK_IMAGE"
 run backup schedule --systemd
+expect_eq "backup schedule --systemd without .env exits 1" "$RC" 1
+case "$ERR" in *"CONTAINER_RUNTIME"*) t_pass "backup schedule without .env names CONTAINER_RUNTIME" ;; *) t_fail "backup schedule without .env: $ERR" ;; esac
+echo 'PORTCULLIS_DOMAIN=x' > "$PORTCULLIS_ROOT/.env"
+run backup schedule --systemd
+expect_eq "backup schedule with .env but no CONTAINER_RUNTIME exits 1" "$RC" 1
+case "$ERR" in *"CONTAINER_RUNTIME is not set in .env"*) t_pass "backup schedule: no CONTAINER_RUNTIME → refused naming the variable" ;; *) t_fail "backup schedule without CONTAINER_RUNTIME: $ERR" ;; esac
+printf 'PORTCULLIS_DOMAIN=x\nCONTAINER_RUNTIME=docker\n' > "$PORTCULLIS_ROOT/.env"
+run backup schedule --systemd
 expect_eq "backup schedule --systemd exits 0" "$RC" 0
 case "$OUT" in *"ExecStart=$(cd "$HERE/.." && pwd)/portcullis backup"*"ExecStopPost=-"*"status --textfile"*"OnCalendar=*-*-* 03:15:00"*"Persistent=true"*) t_pass "systemd units: backup + status, daily timer" ;; *) t_fail "systemd units: $OUT" ;; esac
 case "$OUT" in *"backup --offsite"*) t_fail "no BACKUP_REPOSITORY → no --offsite" ;; *) t_pass "no BACKUP_REPOSITORY → local backup only" ;; esac
@@ -174,6 +223,21 @@ expect_eq "timer written with OnCalendar" "$(grep -c '^OnCalendar=Sun 04:00$' "$
 expect_eq "service written" "$(grep -c "^ExecStart=" "$WORK/units/portcullis-backup.service" 2>/dev/null)" 1
 RC=0; OUT="$(BACKUP_REPOSITORY=/srv/restic "$CLI" backup schedule --systemd </dev/null)" || RC=$?
 case "$OUT" in *"portcullis backup --offsite"*) t_pass "BACKUP_REPOSITORY → backup --offsite" ;; *) t_fail "no --offsite: $OUT" ;; esac
+# version with an .env: its runtime; without CONTAINER_RUNTIME refused (P7).
+RC=0; OUT="$(PATH="$WORK/quietbin:$PATH" "$CLI" version </dev/null)" || RC=$?
+case "$RC:$OUT" in "0:"*"runtime          docker 29.0.0"*) t_pass "version with .env shows the runtime" ;; *) t_fail "version runtime: $RC $OUT" ;; esac
+RC=0; OUT="$(PATH="$WORK/quietbin:$PATH" "$CLI" version --json </dev/null)" || RC=$?
+expect_eq "version --json: runtime + runtime_version" "$RC:$(printf '%s' "$OUT" | jq -r '.runtime + " " + .runtime_version')" "0:docker 29.0.0"
+RC=0; OUT="$(PATH="$WORK/noengine:$PATH" STUB_CALLS_NOENGINE="$WORK/noengine-calls2" "$CLI" version </dev/null)" || RC=$?
+case "$RC:$OUT" in "0:"*"runtime          docker (engine not reachable)"*) t_pass "version: an engine that doesn't answer is only noted" ;; *) t_fail "version without engine: $RC $OUT" ;; esac
+echo 'PORTCULLIS_DOMAIN=x' > "$PORTCULLIS_ROOT/.env"
+run version
+expect_eq "version with .env but no CONTAINER_RUNTIME → refused" "$RC" 1
+case "$ERR" in *"CONTAINER_RUNTIME is not set in .env"*) t_pass "version names CONTAINER_RUNTIME" ;; *) t_fail "version without CONTAINER_RUNTIME: $ERR" ;; esac
+# need_env: every command needing the runtime refuses without it.
+run status
+expect_eq "need_env: no CONTAINER_RUNTIME → refused naming the variable" "$RC:$(printf '%s' "$ERR" | grep -c 'CONTAINER_RUNTIME is not set in .env (docker or podman)')" "1:1"
+rm -f "$PORTCULLIS_ROOT/.env"
 run restore --from-offsite
 expect_eq "restore --from-offsite without a repository exits 1" "$RC" 1
 case "$ERR" in *"BACKUP_REPOSITORY is not set"*) t_pass "restore --from-offsite explains BACKUP_REPOSITORY" ;; *) t_fail "restore --from-offsite: $ERR" ;; esac
@@ -188,12 +252,24 @@ run init --env-only --non-interactive
 expect_eq "init --non-interactive without a domain exits 2" "$RC" 2
 run init --env-only --non-interactive --domain 'bad domain'
 expect_eq "init rejects an invalid domain" "$RC" 1
-run init --env-only --non-interactive --domain ci.example.org --dns-provider none
+RC=0; PATH="$WORK/noengine:$PATH" STUB_CALLS_NOENGINE="$WORK/noengine-calls3" "$CLI" init --env-only --non-interactive --domain ci.example.org --dns-provider none >"$WORK/out" 2>"$WORK/err" </dev/null || RC=$?
+expect_eq "init --env-only: no engine and no --runtime → refused" "$RC:$(grep -c 'no container engine answers: pass --runtime docker|podman' "$WORK/err")" "1:1"
+expect_eq "init --env-only: refused → no .env written" "$(test -e "$PORTCULLIS_ROOT/.env" && echo yes || echo no)" no
+RC=0; CONTAINER_RUNTIME=podman "$CLI" init --env-only --non-interactive --domain ci.example.org --dns-provider none --runtime docker >/dev/null 2>"$WORK/err" </dev/null || RC=$?
+expect_eq "init: --runtime contradicting CONTAINER_RUNTIME in the environment → refused" "$RC" 1
+rm -f "$PORTCULLIS_ROOT/.env"
+RC=0; XDG_RUNTIME_DIR=/run/user/4242 "$CLI" init --env-only --non-interactive --domain ci.example.org --dns-provider none --runtime podman >/dev/null 2>"$WORK/err" </dev/null || RC=$?
+expect_eq "init --env-only writes CONTAINER_RUNTIME=podman and the rootless PORTCULLIS_ENGINE_SOCKET with --runtime podman" \
+  "$RC:$(grep -c '^CONTAINER_RUNTIME=podman$' "$PORTCULLIS_ROOT/.env"):$(grep -c '^PORTCULLIS_ENGINE_SOCKET=/run/user/4242/podman/podman.sock$' "$PORTCULLIS_ROOT/.env")" "0:1:1"
+rm -f "$PORTCULLIS_ROOT/.env"
+run init --env-only --non-interactive --domain ci.example.org --dns-provider none --runtime docker
 expect_eq "init --env-only succeeds" "$RC" 0
 ENVF="$PORTCULLIS_ROOT/.env"
 expect_eq ".env is 0600" "$(file_mode "$ENVF")" 600
 get() { grep "^$1=" "$ENVF" | tail -n1 | cut -d= -f2-; }
 expect_eq "domain written" "$(get PORTCULLIS_DOMAIN)" ci.example.org
+expect_eq "CONTAINER_RUNTIME=docker written, no engine socket" "$(get CONTAINER_RUNTIME):$(grep -c '^PORTCULLIS_ENGINE_SOCKET=' "$ENVF")" "docker:0"
+expect_eq ".env says the runtime is never switched" "$(grep -c 'never switched' "$ENVF")" 1
 expect_eq "email defaults to admin@domain" "$(get ACME_EMAIL)" admin@ci.example.org
 expect_eq "LLDAP base DN from the domain" "$(get LLDAP_BASE_DN)" dc=ci,dc=example,dc=org
 for v in POSTGRES_PASSWORD KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD LLDAP_JWT_SECRET \
@@ -225,9 +301,20 @@ sed 's/^HUB_PROXY_SECRET=.*/HUB_PROXY_SECRET=/' "$ENVF" > "$WORK/e" && cat "$WOR
 run init --env-only --non-interactive
 expect_eq "init fills a blank secret" "$(get HUB_PROXY_SECRET | grep -Ec '^[0-9a-f]{64}$')" 1
 expect_eq "init keeps the other secrets" "$(get POSTGRES_PASSWORD)" "$(printf '%s\n' "$BEFORE" | grep '^POSTGRES_PASSWORD=' | cut -d= -f2-)"
+run init --env-only --non-interactive --runtime podman
+expect_eq "init: CONTAINER_RUNTIME=docker in .env, --runtime podman → refused" \
+  "$RC:$(printf '%s' "$ERR" | grep -c 'CONTAINER_RUNTIME is docker in .env and is never switched (backup → fresh init → restore)')" "1:1"
+RC=0; CONTAINER_RUNTIME=podman "$CLI" init --env-only --non-interactive >/dev/null 2>"$WORK/err" </dev/null || RC=$?
+expect_eq "init: CONTAINER_RUNTIME=podman in the environment over a docker .env → refused" "$RC" 1
+expect_eq "init: the refusals left CONTAINER_RUNTIME=docker" "$(get CONTAINER_RUNTIME)" docker
+# A copied .env.example: no CONTAINER_RUNTIME → the detected value (P0).
+sed '/^CONTAINER_RUNTIME=/d' "$ENVF" > "$WORK/e" && cat "$WORK/e" > "$ENVF"
+run init --env-only --non-interactive
+expect_eq "init: an existing .env without CONTAINER_RUNTIME gets the detected value" \
+  "$RC:$(get CONTAINER_RUNTIME):$(printf '%s' "$OUT" | grep -c 'Set CONTAINER_RUNTIME=docker in .env')" "0:docker:1"
 # DNS credentials come from the environment, not argv.
 rm -f "$ENVF"
-RC=0; CLOUDFLARE_API_TOKEN=tok123 "$CLI" init --env-only --non-interactive --domain x.example --dns-provider cloudflare >/dev/null 2>&1 </dev/null || RC=$?
+RC=0; CLOUDFLARE_API_TOKEN=tok123 "$CLI" init --env-only --non-interactive --domain x.example --dns-provider cloudflare --runtime docker >/dev/null 2>&1 </dev/null || RC=$?
 expect_eq "init with provider creds from env" "$RC:$(get CLOUDFLARE_API_TOKEN):$(get DNS_PROVIDER)" "0:tok123:cloudflare"
 
 # ── keycloak configure never touches the Hub's AI clients or mcp:* scopes
@@ -424,7 +511,7 @@ PK_REALM_OK='{"realm":"portcullis","webAuthnPolicyPasswordlessAttestationConveya
 # pk_status <realm JSON> <two-factor action enabled> <json|text|textfile> — status_run's output, then "rc <n>".
 pk_status() {
   (
-    export PK_REALM="$1" PK_2FA="$2" KEYCLOAK_ADMIN_PASSWORD=stub
+    export PK_REALM="$1" PK_2FA="$2" KEYCLOAK_ADMIN_PASSWORD=stub CONTAINER_RUNTIME=docker
     for l in common keycloak status; do
       # shellcheck disable=SC1090
       . "$HERE/../scripts/lib/$l.sh"
@@ -592,6 +679,7 @@ mkdir -p "$WORK/dcbin"
 DC_CALLS="$WORK/dc-calls"
 cat > "$WORK/dcbin/docker" <<DCSTUB
 #!/usr/bin/env bash
+[ "\$1 \$3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
 if [ "\$1" != compose ]; then exit 0; fi
 shift
 # Skip --project-directory and its value
@@ -718,7 +806,7 @@ UPSTUB
 rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
 (
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
-  export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
+  export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x CONTAINER_RUNTIME=docker
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
   export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
   # shellcheck disable=SC1091
@@ -740,7 +828,7 @@ touch "$LLDAP_ACCOUNT_CHANGED"
 rm -f "$DC_CALLS"
 (
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
-  export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
+  export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x CONTAINER_RUNTIME=docker
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
   export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
   # shellcheck disable=SC1091
@@ -761,7 +849,7 @@ touch "$LLDAP_ACCOUNT_CHANGED"
 rm -f "$DC_CALLS"
 (
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
-  export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
+  export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x CONTAINER_RUNTIME=docker
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
   export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
   # shellcheck disable=SC1091
@@ -780,7 +868,7 @@ expect_eq "upgrade: the CAA tighten runs once" "$(grep -c '^dns_tighten_main$' "
 rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
 (
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
-  export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x
+  export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x CONTAINER_RUNTIME=docker
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
   export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
   # shellcheck disable=SC1091
@@ -901,8 +989,8 @@ expect_eq "tls.yml's header says which option uses which chain and who uses it" 
 CA_ROOT="$WORK/ca-root"
 mkdir -p "$CA_ROOT/traefik/dynamic" "$WORK/cabin"
 cp "$TLS_YML" "$CA_ROOT/traefik/dynamic/tls.yml"
-printf 'PORTCULLIS_DOMAIN=ci.example.org\nACME_STAGING=false\n' > "$CA_ROOT/.env"
-printf '#!/usr/bin/env bash\nexit 1\n' > "$WORK/cabin/docker"
+printf 'PORTCULLIS_DOMAIN=ci.example.org\nACME_STAGING=false\nCONTAINER_RUNTIME=docker\n' > "$CA_ROOT/.env"
+{ printf '#!/usr/bin/env bash\n'; cat "$WORK/stub-version"; printf 'exit 1\n'; } > "$WORK/cabin/docker"
 chmod +x "$WORK/cabin/docker"
 SUM_BEFORE="$(cksum < "$CA_ROOT/traefik/dynamic/tls.yml")"
 RC=0; PATH="$WORK/cabin:$PATH" PORTCULLIS_ROOT="$CA_ROOT" "$CLI" config apply >"$WORK/out" 2>"$WORK/err" </dev/null || RC=$?
@@ -914,10 +1002,11 @@ case "$(cat "$WORK/out" "$WORK/err")" in *MTLS*|*mTLS*) t_fail "config apply men
 # ── signin reset-core (stubbed docker compose) ──
 SR_ROOT="$WORK/sr-root"
 mkdir -p "$SR_ROOT" "$WORK/srbin"
-printf 'PORTCULLIS_DOMAIN=ci.example.org\n' > "$SR_ROOT/.env"
+printf 'PORTCULLIS_DOMAIN=ci.example.org\nCONTAINER_RUNTIME=docker\n' > "$SR_ROOT/.env"
 SR_CALLS="$WORK/sr-calls"
 cat > "$WORK/srbin/docker" <<'STUB'
 #!/usr/bin/env bash
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
 [ "$1" = compose ] || exit 97
 shift
 [ "$1" = --project-directory ] && shift 2
@@ -994,7 +1083,7 @@ CT_ROOT="$WORK/cert-root"
 CT_BIN="$WORK/cert-bin"
 CT_DATA="$WORK/cert-data"
 mkdir -p "$CT_ROOT/certs/revocation" "$CT_BIN" "$CT_DATA"
-echo "PORTCULLIS_DOMAIN=example.test" > "$CT_ROOT/.env"
+printf 'PORTCULLIS_DOMAIN=example.test\nCONTAINER_RUNTIME=docker\n' > "$CT_ROOT/.env"
 # ct_cert <serial> <cn> <revocation_time> — Vault's JSON for a certificate.
 ct_cert() {
   openssl ecparam -genkey -name prime256v1 -out "$CT_DATA/$1.key" 2>/dev/null
