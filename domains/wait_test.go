@@ -113,7 +113,7 @@ func TestToolWaitAutoPorkbunTTL(t *testing.T) {
 	if len(w.Pending) != 1 || w.Pending[0] != addr {
 		t.Fatalf("pending %v, want [%s]", w.Pending, addr)
 	}
-	for _, want := range []string{"were written", "not visible yet at " + addr, "TTL 600 s"} {
+	for _, want := range []string{"written; not yet stable at " + addr, "TTL 600 s"} {
 		if !strings.Contains(errs, want) {
 			t.Errorf("stderr %q lacks %q", errs, want)
 		}
@@ -132,7 +132,8 @@ func TestToolWaitAutoVisibleAtOnce(t *testing.T) {
 		t.Fatalf("apply --wait auto = %d %s %s", code, out, errs)
 	}
 	w := decodeApply(t, out).Wait
-	if !w.Visible || w.Waited != 0 || w.TTL != 600 || len(w.Pending) != 0 {
+	// Visible at the first round, stable after 4 clean rounds over 30 s.
+	if !w.Visible || w.Waited != 30 || w.TTL != 600 || len(w.Pending) != 0 {
 		t.Fatalf("wait report %+v", *w)
 	}
 }
@@ -165,8 +166,8 @@ func TestToolWaitAutoFollowsResolverTTL(t *testing.T) {
 	if code != exitOK {
 		t.Fatalf("apply --wait auto with a resolver caching for 750 s = %d %s %s", code, out, errs)
 	}
-	if w := decodeApply(t, out).Wait; !w.Visible || w.Waited != 750 || w.TTL != 600 {
-		t.Fatalf("wait report %+v: want visible after 750 s", *w)
+	if w := decodeApply(t, out).Wait; !w.Visible || w.Waited != 780 || w.TTL != 600 {
+		t.Fatalf("wait report %+v: want visible at 750 s, stable 30 s later", *w)
 	}
 }
 
@@ -200,10 +201,10 @@ func TestToolWaitSettle(t *testing.T) {
 	if w := decodeApply(t, out).Wait; !w.Visible || !w.Settled || w.Waited != 660 || w.ClearsIn != 0 {
 		t.Fatalf("wait report %+v: want settled after 660 s", *w)
 	}
-	// Without --settle: done as soon as it is visible.
+	// Without --settle: done as soon as it is stably visible (30 s).
 	pinAt(f.zone, oldAcct, 600*time.Second)
 	code, out, _ = f.run([]string{"apply", "--wait", "auto"}, toolJSON(caaOnly("")))
-	if w := decodeApply(t, out).Wait; code != exitOK || w.Waited != 0 {
+	if w := decodeApply(t, out).Wait; code != exitOK || w.Waited != 30 {
 		t.Fatalf("apply without --settle = %d, %+v", code, *w)
 	}
 }
@@ -219,10 +220,10 @@ func TestToolWaitSettleBeyondCap(t *testing.T) {
 		t.Fatalf("= %d %s %s", code, out, errs)
 	}
 	w := decodeApply(t, out).Wait
-	if !w.Visible || w.Settled || w.Waited != 0 || w.ClearsIn != 3660 {
-		t.Fatalf("wait report %+v: want visible, not settled, clears in 3660 s, no wait", *w)
+	if w.Settled || !w.BeyondCap || w.Waited != 0 || w.ClearsIn != 3660 || w.SettleCause != "ttl" {
+		t.Fatalf("wait report %+v: want not settled, beyond the cap (the TTL), clears in 3660 s, no wait", *w)
 	}
-	for _, want := range []string{"were written", "TTL 3600 s, longer than one run waits", "lower the TTL at the provider"} {
+	for _, want := range []string{"written;", "stored TTL (3600 s) is above what one run waits", "lowering the TTL at the provider"} {
 		if !strings.Contains(errs, want) {
 			t.Errorf("stderr %q lacks %q", errs, want)
 		}
@@ -481,10 +482,261 @@ func TestToolWaitMessages(t *testing.T) {
 	pinAt(f.zone, oldAcct, time.Hour)
 	c := useVirtualClock(t)
 	_, _, errs := f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
-	clear := c.now.Add(3660 * time.Second).UTC().Format("15:04 MST")
-	for _, want := range []string{"written; waiting up to 15m0s for " + f.resolvers[0], "TTL 3600 s, longer than one run waits (15m0s)", "after " + clear, "lower the TTL at the provider"} {
+	clear := c.now.Add(3660 * time.Second).UTC().Format("2006-01-02 15:04 MST")
+	for _, want := range []string{"written; waiting up to 15m0s for " + f.resolvers[0], "stored TTL (3600 s) is above what one run waits (15m0s)", "goes ahead after " + clear, "lowering the TTL at the provider"} {
 		if !strings.Contains(errs, want) {
 			t.Errorf("stderr %q lacks %q", errs, want)
 		}
+	}
+}
+
+// flapper: a resolver like an anycast pool (8.8.8.8): every other poll
+// lands on a shard still holding the old pin, whose remaining TTL counts
+// down from left; once that runs out, every shard serves what the zone
+// holds.
+type flapper struct {
+	stale *fakedns.Zone
+	addr  string
+	left  time.Duration
+	polls int
+	// fresh: the stale shard re-caches the old pin with this full TTL on
+	// every odd poll (G: Google's layers re-serving it long after).
+	fresh time.Duration
+}
+
+func newFlapper(t *testing.T, left time.Duration) *flapper {
+	t.Helper()
+	fl := &flapper{stale: fakedns.NewZone(), left: left}
+	fl.stale.SetSOA("example.test")
+	srv, err := fakedns.Serve(fl.stale, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	fl.addr = srv.Addr
+	return fl
+}
+
+// step: after a sleep of d, the next poll's answer.
+func (fl *flapper) step(z *fakedns.Zone, d time.Duration) {
+	fl.polls++
+	fl.left -= d
+	switch {
+	case fl.fresh > 0 && fl.polls%2 == 1:
+		pinAt(fl.stale, oldAcct, fl.fresh)
+	case fl.left > 0 && fl.polls%2 == 1:
+		pinAt(fl.stale, oldAcct, fl.left)
+	default:
+		fl.stale.Set("portcullis.example.test", z.Records("portcullis.example.test")...)
+	}
+}
+
+// E: one resolver flaps between the new pin and a shard still holding the
+// old one. The plain wait (dns setup, the tighten) is not done on the
+// first round where every resolver shows the new pin: only once the old
+// pin's remaining TTL that resolver reported has run out, and then every
+// resolver showed the new pin in 4 rounds in a row, spanning 30 s.
+func TestToolWaitStableFlapping(t *testing.T) {
+	f := newToolFixture(t)
+	f.deleteMode = "porkbun"
+	pinAt(f.zone, oldAcct, 600*time.Second)
+	fl := newFlapper(t, 500*time.Second)
+	pinAt(fl.stale, newAcct, 600*time.Second) // the first poll hits a fresh shard
+	c := useVirtualClock(t)
+	c.onSleep = func(d time.Duration) { fl.step(f.zone, d) }
+	f.resolvers = append(f.resolvers, fl.addr)
+	code, out, errs := f.run([]string{"apply", "--wait", "auto"}, toolJSON(caaOnly(newAcct)))
+	w := decodeApply(t, out).Wait
+	if code != exitOK || !w.Visible || len(w.Pending) != 0 {
+		t.Fatalf("apply --wait auto, one resolver flapping = %d %+v %s", code, *w, errs)
+	}
+	// The last old answer: poll 49 (t = 490 s, 10 s left); the pin's
+	// remaining TTL runs out at 500 s; then 4 clean rounds over 30 s.
+	if w.Waited != 530 {
+		t.Fatalf("waited %d s, want 530 (old TTL out at 500 s + 30 s of clean rounds)", w.Waited)
+	}
+}
+
+// E: every resolver shows the new pin at once, but 8.8.8.8 re-serves the
+// old one once, with a near-fresh TTL (G): the wait follows that TTL.
+func TestToolWaitStableReServed(t *testing.T) {
+	f := newToolFixture(t)
+	f.deleteMode = "porkbun"
+	pinAt(f.zone, oldAcct, 600*time.Second)
+	fl := newFlapper(t, 0)
+	c := useVirtualClock(t)
+	f.resolvers = append(f.resolvers, fl.addr)
+	polls := 0
+	c.onSleep = func(time.Duration) {
+		polls++
+		if polls == 2 { // t = 20 s
+			pinAt(fl.stale, oldAcct, 547*time.Second)
+			return
+		}
+		fl.stale.Set("portcullis.example.test", f.zone.Records("portcullis.example.test")...)
+	}
+	pinAt(fl.stale, newAcct, 600*time.Second)
+	code, out, errs := f.run([]string{"apply", "--wait", "auto"}, toolJSON(caaOnly(newAcct)))
+	w := decodeApply(t, out).Wait
+	if code != exitOK || !w.Visible || w.Waited != 570 {
+		t.Fatalf("= %d %+v %s: want visible after 570 s (old pin re-served at 20 s with TTL 547)", code, *w, errs)
+	}
+}
+
+// E: the bound holds. A resolver that keeps re-serving the old pin: the
+// wait stops at 15 minutes, says the records were written and are not yet
+// stable there, with the remaining-TTL estimate — never that it failed.
+func TestToolWaitStableBound(t *testing.T) {
+	f := newToolFixture(t)
+	f.deleteMode = "porkbun"
+	pinAt(f.zone, oldAcct, 600*time.Second)
+	fl := newFlapper(t, 0)
+	fl.fresh = 600 * time.Second
+	pinAt(fl.stale, newAcct, 600*time.Second)
+	c := useVirtualClock(t)
+	c.onSleep = func(d time.Duration) { fl.step(f.zone, d) }
+	f.resolvers = append(f.resolvers, fl.addr)
+	code, out, errs := f.run([]string{"apply", "--wait", "auto"}, toolJSON(caaOnly(newAcct)))
+	w := decodeApply(t, out).Wait
+	if code != exitProblem || w.Visible || w.Waited != 900 || len(w.Pending) != 1 || w.Pending[0] != fl.addr {
+		t.Fatalf("= %d %+v %s: want not stable at %s after 900 s", code, *w, errs, fl.addr)
+	}
+	if w.HeldFor < 500 || len(w.HeldBy) != 1 || w.HeldBy[0] != fl.addr {
+		t.Fatalf("held %v for %d s, want %s for about 590 s", w.HeldBy, w.HeldFor, fl.addr)
+	}
+	for _, want := range []string{"written; not yet stable at " + fl.addr, "for up to "} {
+		if !strings.Contains(errs, want) {
+			t.Errorf("stderr %q lacks %q", errs, want)
+		}
+	}
+	if strings.Contains(errs, "fail") || strings.Contains(errs, "could not") {
+		t.Errorf("a wait that hit its bound reads as a failure: %q", errs)
+	}
+}
+
+// E: a fixed limit too short for the clean rounds: not yet stable, named.
+func TestToolWaitStableFixedTooShort(t *testing.T) {
+	f := newToolFixture(t)
+	useVirtualClock(t)
+	code, out, errs := f.run([]string{"apply", "--wait", "20s"}, toolJSON(caaOnly(newAcct)))
+	w := decodeApply(t, out).Wait
+	if code != exitProblem || w.Visible || w.Waited != 20 || len(w.Pending) != 1 {
+		t.Fatalf("= %d %+v %s", code, *w, errs)
+	}
+	if !strings.Contains(errs, "not yet stable at "+f.resolvers[0]) {
+		t.Errorf("stderr %q", errs)
+	}
+}
+
+// F: a settle that can't finish in one run names its cause: (a) the
+// stored TTL above the cap; (b) a resolver still serving the old pin, with
+// the seconds it has left; (c) a settle point an earlier run saved. Each
+// gives the time after which a rerun goes ahead.
+func TestToolSettleBeyondCapCauses(t *testing.T) {
+	// (a)
+	f := newToolFixture(t)
+	pinAt(f.zone, oldAcct, time.Hour)
+	c := useVirtualClock(t)
+	_, out, errs := f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
+	w := decodeApply(t, out).Wait
+	at := clockAt(w.SettleAt)
+	if w.SettleCause != "ttl" || !strings.Contains(errs, "stored TTL (3600 s) is above what one run waits (15m0s)") || !strings.Contains(errs, "rerun goes ahead after "+at) {
+		t.Fatalf("(a) cause %q: %s", w.SettleCause, errs)
+	}
+	if strings.Contains(errs, "still serves") {
+		t.Errorf("(a) names a resolver: %s", errs)
+	}
+	// (b) the F run: TTL 600; 8 min in, 8.8.8.8 re-serves the old pin with
+	// TTL 547 → the settle point moves past the run's 15 minutes.
+	f = newToolFixture(t)
+	f.deleteMode = "porkbun"
+	pinAt(f.zone, oldAcct, 600*time.Second)
+	fl := newFlapper(t, 0)
+	c = useVirtualClock(t)
+	f.resolvers = append(f.resolvers, fl.addr)
+	start := c.now
+	c.onSleep = func(d time.Duration) {
+		now := c.now.Add(d)
+		if now.Sub(start) == 480*time.Second {
+			pinAt(fl.stale, oldAcct, 547*time.Second)
+			return
+		}
+		fl.stale.Set("portcullis.example.test", f.zone.Records("portcullis.example.test")...)
+	}
+	pinAt(fl.stale, "", 600*time.Second)
+	code, out, errs := f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
+	w = decodeApply(t, out).Wait
+	at = clockAt(w.SettleAt)
+	if code != exitProblem || !w.BeyondCap || w.SettleCause != "resolver" || len(w.HeldBy) != 1 || w.HeldBy[0] != fl.addr {
+		t.Fatalf("(b) = %d %+v %s", code, *w, errs)
+	}
+	for _, want := range []string{fl.addr + " still serves the old records (", " s left)", "rerun goes ahead after " + at} {
+		if !strings.Contains(errs, want) {
+			t.Errorf("(b) stderr %q lacks %q", errs, want)
+		}
+	}
+	if strings.Contains(errs, "longer than one run waits") || strings.Contains(errs, "stored TTL") {
+		t.Errorf("(b) blames the stored TTL: %s", errs)
+	}
+	// (c) a saved point beyond the cap, nothing changed by this write.
+	f = newToolFixture(t)
+	pinAt(f.zone, "", 300*time.Second)
+	c = useVirtualClock(t)
+	after := c.now.Add(2 * time.Hour).Unix()
+	_, out, errs = f.run([]string{"apply", "--wait", "auto", "--settle", "--settle-after", fmt.Sprint(after)}, toolJSON(caaOnly("")))
+	w = decodeApply(t, out).Wait
+	if w.SettleCause != "saved" || w.SettleAt != after || !strings.Contains(errs, "an earlier run's settle point") {
+		t.Fatalf("(c) %+v %s", *w, errs)
+	}
+}
+
+// Ruling on concern 2: the tighten (not a safety step) caps its stability
+// wait with --wait-max 3m; on reaching it the records were written, not yet
+// stable. --wait-max needs --wait auto and never goes with --settle.
+func TestToolWaitMax(t *testing.T) {
+	f := newToolFixture(t)
+	f.deleteMode = "porkbun"
+	pinAt(f.zone, oldAcct, 600*time.Second)
+	fl := newFlapper(t, 0)
+	fl.fresh = 600 * time.Second
+	pinAt(fl.stale, newAcct, 600*time.Second)
+	c := useVirtualClock(t)
+	c.onSleep = func(d time.Duration) { fl.step(f.zone, d) }
+	f.resolvers = append(f.resolvers, fl.addr)
+	code, out, errs := f.run([]string{"apply", "--wait", "auto", "--wait-max", "3m"}, toolJSON(caaOnly(newAcct)))
+	w := decodeApply(t, out).Wait
+	if code != exitProblem || w.Visible || w.Waited != 180 || w.Limit > 180 {
+		t.Fatalf("--wait-max 3m, a resolver re-serving the old pin = %d %+v %s: want stopped at 180 s", code, *w, errs)
+	}
+	if !strings.Contains(errs, "waiting up to 3m0s") || !strings.Contains(errs, "written; not yet stable at "+fl.addr) {
+		t.Fatalf("stderr %q", errs)
+	}
+	// Records stable at once: done at 30 s as without it.
+	f2 := newToolFixture(t)
+	code, out, _ = f2.run([]string{"apply", "--wait", "auto", "--wait-max", "3m"}, toolJSON(caaOnly(newAcct)))
+	if w := decodeApply(t, out).Wait; code != exitOK || w.Waited != 30 {
+		t.Fatalf("--wait-max 3m, stable at once = %d %+v", code, *w)
+	}
+	for _, args := range [][]string{
+		{"apply", "--wait", "auto", "--wait-max", "3m", "--settle"},
+		{"apply", "--wait", "60s", "--wait-max", "3m"},
+		{"apply", "--wait-max", "3m"},
+		{"apply", "--wait", "auto", "--wait-max", "soon"},
+		{"apply", "--wait", "auto", "--wait-max", "20m"},
+	} {
+		if code, _, _ := f.run(args, toolJSON(caaOnly(newAcct))); code != exitUsage {
+			t.Errorf("%v = %d, want usage", args, code)
+		}
+	}
+}
+
+// I2: every settle time printed is rounded up to the minute and dated.
+func TestClockAt(t *testing.T) {
+	at := time.Date(2026, 11, 13, 23, 59, 1, 0, time.UTC).Unix()
+	if got := clockAt(at); got != "2026-11-14 00:00 UTC" {
+		t.Fatalf("clockAt = %q, want 2026-11-14 00:00 UTC (rounded up, dated)", got)
+	}
+	if got := clockAt(time.Date(2026, 11, 13, 8, 15, 0, 0, time.UTC).Unix()); got != "2026-11-13 08:15 UTC" {
+		t.Fatalf("clockAt on the minute = %q", got)
 	}
 }

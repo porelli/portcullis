@@ -151,9 +151,9 @@ func TestToolCheckRefusesCredentials(t *testing.T) {
 
 func TestToolApplyWait(t *testing.T) {
 	f := newToolFixture(t)
-	old := toolPollEvery
-	toolPollEvery = 50 * time.Millisecond
-	t.Cleanup(func() { toolPollEvery = old })
+	old, oldSpan := toolPollEvery, toolStableSpan
+	toolPollEvery, toolStableSpan = 50*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { toolPollEvery, toolStableSpan = old, oldSpan })
 	code, out, errs := f.run([]string{"apply", "--wait", "5s"}, toolJSON(nil))
 	var pl dnsplan.Plan
 	if code != 0 || json.Unmarshal([]byte(out), &pl) != nil || !pl.CanWrite {
@@ -429,5 +429,37 @@ func TestMainPlanGivesUpNothingCached(t *testing.T) {
 	e.svc.handleMainPlan(rec, req)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("GET /main/dns, gave up, nothing cached = %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// M23: when the CA wouldn't issue, check says how long caches may hold the
+// CAA at the name (the TTL its authoritative servers serve), so the
+// flip's refusal can say how long to wait after removing a pin by hand.
+func TestToolCheckCAATTL(t *testing.T) {
+	f := newToolFixture(t)
+	other := dnsplan.CAAValue("letsencrypt.org", "https://acme-v02.api.letsencrypt.org/acme/acct/999")
+	f.zone.Set("portcullis.example.test", libdns.RR{Name: "portcullis", Type: "A", Data: "203.0.113.10"},
+		libdns.CAA{Name: "portcullis", TTL: 1800 * time.Second, Tag: "issue", Value: other}.RR(),
+		libdns.CAA{Name: "portcullis", TTL: 1800 * time.Second, Tag: "issuewild", Value: other}.RR())
+	caOnly := func(m map[string]any) {
+		readOnly(m)
+		m["sets"] = []string{"caa"}
+		m["caa"].(map[string]any)["account_uri"] = ""
+	}
+	var r struct {
+		WouldIssue struct {
+			V bool `json:"would_issue"`
+		} `json:"caa"`
+		TTL *int `json:"caa_ttl"`
+	}
+	code, out, _ := f.run([]string{"check"}, toolJSON(caOnly))
+	if code != exitProblem || json.Unmarshal([]byte(out), &r) != nil || r.WouldIssue.V || r.TTL == nil || *r.TTL != 1800 {
+		t.Fatalf("check, a live pin = %d %s: want would_issue false, caa_ttl 1800", code, out)
+	}
+	// It would issue: no caa_ttl.
+	f.zone.Set("portcullis.example.test", libdns.RR{Name: "portcullis", Type: "A", Data: "203.0.113.10"})
+	r.TTL = nil
+	if _, out, _ = f.run([]string{"check"}, toolJSON(caOnly)); json.Unmarshal([]byte(out), &r) != nil || r.TTL != nil {
+		t.Fatalf("check, no pin: %s", out)
 	}
 }
