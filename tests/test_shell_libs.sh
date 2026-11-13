@@ -2445,16 +2445,20 @@ expect_eq "runtime_podman_socket falls back to /run/user/<uid>" "$(rt 'unset XDG
 rc=0"
 
 RX="$WORK/rt/root"; mkdir -p "$RX"; touch "$RX/docker-compose.override.yml"
-expect_eq "runtime_export keeps docker-compose.override.yml beside the SELinux overlay" \
+RH="$(cd "$HERE/.." && pwd)"
+expect_eq "runtime_export keeps docker-compose.override.yml beside the podman and SELinux overlays (absolute paths)" \
   "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman; getenforce() { echo Enforcing; }; runtime_export; runtime_export; echo \"\$COMPOSE_FILE\"")" \
-  "docker-compose.yml:docker-compose.override.yml:docker-compose.podman-selinux.yml
+  "$RX/docker-compose.yml:$RX/docker-compose.override.yml:$RH/docker-compose.podman.yml:$RH/docker-compose.podman-selinux.yml
 rc=0"
 expect_eq "runtime_export: an existing COMPOSE_FILE gets the overlay once" \
   "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman COMPOSE_FILE=docker-compose.yml:ci.yml; getenforce() { echo Enforcing; }; runtime_export; runtime_export; echo \"\$COMPOSE_FILE\"")" \
-  "docker-compose.yml:ci.yml:docker-compose.podman-selinux.yml
+  "docker-compose.yml:ci.yml:$RH/docker-compose.podman.yml:$RH/docker-compose.podman-selinux.yml
 rc=0"
-expect_eq "runtime_export: SELinux permissive → no overlay" \
-  "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman; getenforce() { echo Permissive; }; runtime_export; echo \"[\${COMPOSE_FILE:-}]\"")" "[]
+expect_eq "runtime_export: SELinux permissive → only the podman overlay (restart: always)" \
+  "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman; getenforce() { echo Permissive; }; runtime_export; echo \"[\${COMPOSE_FILE:-}]\"")" "[$RX/docker-compose.yml:$RX/docker-compose.override.yml:$RH/docker-compose.podman.yml]
+rc=0"
+expect_eq "runtime_export: a COMPOSE_FILE naming the overlays by basename isn't extended again" \
+  "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman COMPOSE_FILE=docker-compose.yml:docker-compose.podman.yml; getenforce() { echo Permissive; }; runtime_export; echo \"\$COMPOSE_FILE\"")" "docker-compose.yml:docker-compose.podman.yml
 rc=0"
 expect_eq "runtime_export: docker on an SELinux host → no overlay, no DOCKER_HOST" \
   "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=docker; getenforce() { echo Enforcing; }; runtime_export; echo \"[\${COMPOSE_FILE:-}][\${DOCKER_HOST:-}]\"")" "[][]

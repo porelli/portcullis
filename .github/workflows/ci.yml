@@ -217,6 +217,17 @@ jobs:
           # Healthchecks that behave the same on Podman (its compat API
           # re-splits CMD arguments on whitespace).
           tests/lint_healthchecks.sh .env
+          # The podman overlay: restart: always (what podman-restart.service
+          # starts at boot) on exactly the core services that have a restart
+          # policy, nothing else; Docker keeps unless-stopped.
+          docker compose -f docker-compose.yml -f docker-compose.podman.yml --profile '*' config -q
+          WANT_RS="$(docker compose -f docker-compose.yml --profile '*' config --format json | jq -c '[.services | to_entries[] | select(.value.restart != null) | .key] | sort')"
+          GOT_RS="$(yq -o=json '.services' docker-compose.podman.yml | jq -c '[to_entries[] | select(.value == {"restart": "always"}) | .key] | sort')"
+          ALL_RS="$(yq -o=json '.services' docker-compose.podman.yml | jq -c 'keys | sort')"
+          [ "$WANT_RS" = "$GOT_RS" ] && [ "$GOT_RS" = "$ALL_RS" ] \
+            || { echo "FAIL: docker-compose.podman.yml must set only restart: always on every core service with a restart policy (want $WANT_RS, got $GOT_RS / $ALL_RS)"; exit 1; }
+          docker compose -f docker-compose.yml --profile '*' config --format json | jq -e '[.services[] | select(.restart != null) | .restart] | unique == ["unless-stopped"]' >/dev/null \
+            || { echo "FAIL: Docker's restart policy is unless-stopped everywhere"; exit 1; }
           docker compose -f docker-compose.yml --profile monitoring config -q
           docker compose -f docker-compose.yml --profile '*' config -q
           docker compose -f docker-compose.yml -f docker-compose.apps.yml config -q
@@ -6228,18 +6239,33 @@ jobs:
           done
           python3 tests/e2e/e2e_podman.py
 
-      - name: Reboot simulation (user manager restarted, podman-restart.service)
+      - name: Reboot simulation (user manager and /run/user/<uid> recreated, podman-restart.service)
         timeout-minutes: 10
         run: |
           # shellcheck source=/dev/null
           source "$RUNNER_TEMP/podlib.sh"
+          uid="$(id -u)"
           before="$(docker compose ps -q | wc -l)"
-          sudo systemctl restart "user@$(id -u).service"
+          # shellcheck disable=SC2046  # one id per word
+          docker inspect -f '{{.Name}} {{.HostConfig.RestartPolicy.Name}}' $(docker compose ps -q) | awk '$2 != "always" { print; bad = 1 } END { exit bad }' \
+            || { echo "FAIL: core containers without restart: always (podman-restart.service starts only those)"; exit 1; }
+          # A reboot: everything of this user stops and /run/user/<uid> is a
+          # fresh tmpfs. Restarting user@ alone keeps the old runtime dir with
+          # a stale rootless pause-process record, which no real boot has.
+          sudo systemctl stop "user@$uid.service"
+          # The rootless pause process the runner's own podman CLI calls left
+          # (outside the user manager) would not survive a reboot either.
+          pkill -u "$uid" -x catatonit || true
+          sudo systemctl stop "user-runtime-dir@$uid.service" \
+            || { echo "FAIL: /run/user/$uid can't be unmounted"; sudo fuser -vm "/run/user/$uid" || true; exit 1; }
+          [ ! -e "/run/user/$uid/podman" ] || { echo "FAIL: /run/user/$uid survived"; exit 1; }
+          sudo systemctl start "user@$uid.service"
           for _ in $(seq 1 30); do [ -S "$XDG_RUNTIME_DIR/podman/podman.sock" ] && break; sleep 1; done
+          systemctl --user is-active podman-restart.service || { systemctl --user status podman-restart.service --no-pager || true; }
           status_wait 180
           after="$(docker compose ps -q | wc -l)"
           [ "$after" = "$before" ] || { echo "FAIL: $before core containers before, $after after"; exit 1; }
-          echo "PASS: after user@$(id -u).service restarted, podman-restart.service brought every container back; status clean"
+          echo "PASS: after a simulated reboot (user manager and /run/user/$uid recreated), podman-restart.service brought every container back; status clean"
 
       - name: Docker → Podman round trip (restore the Docker phase's backup)
         timeout-minutes: 40

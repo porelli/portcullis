@@ -125,26 +125,34 @@ _rt_selinux_enforcing() {
 }
 
 # runtime_export — under podman: DOCKER_HOST=unix://<user socket> for every
-# docker / docker compose call (a different DOCKER_HOST is refused), and on
-# an SELinux-enforcing host the overlay docker-compose.podman-selinux.yml
-# added to COMPOSE_FILE (the current list, or docker-compose.yml plus
-# docker-compose.override.yml when it exists: compose stops auto-loading
-# the override once COMPOSE_FILE is set), without duplicates. Docker: no-op.
+# docker / docker compose call (a different DOCKER_HOST is refused), and the
+# podman overlays added to COMPOSE_FILE: docker-compose.podman.yml always
+# (restart: always, the policy podman-restart.service starts at boot), and
+# on an SELinux-enforcing host docker-compose.podman-selinux.yml. The list is
+# the current COMPOSE_FILE, or docker-compose.yml plus
+# docker-compose.override.yml when it exists (compose stops auto-loading
+# the override once COMPOSE_FILE is set), without duplicates; the entries
+# added here are absolute (compose resolves COMPOSE_FILE against the
+# working directory, not --project-directory). Docker: no-op.
 runtime_export() {
-  local sock files overlay=docker-compose.podman-selinux.yml
+  local sock files f
+  local -a add
   _rt_is_podman || return 0
   sock="$(runtime_podman_socket)"
   if [ -n "${DOCKER_HOST:-}" ] && [ "$DOCKER_HOST" != "unix://$sock" ]; then
     fail "DOCKER_HOST=$DOCKER_HOST, but CONTAINER_RUNTIME=podman talks to unix://$sock: unset DOCKER_HOST"
   fi
   export DOCKER_HOST="unix://$sock"
-  _rt_selinux_enforcing || return 0
+  add=("$PORTCULLIS_HOME/docker-compose.podman.yml")
+  if _rt_selinux_enforcing; then add+=("$PORTCULLIS_HOME/docker-compose.podman-selinux.yml"); fi
   files="${COMPOSE_FILE:-}"
   if [ -z "$files" ]; then
-    files=docker-compose.yml
-    [ ! -f "$PORTCULLIS_ROOT/docker-compose.override.yml" ] || files="$files:docker-compose.override.yml"
+    files="$PORTCULLIS_ROOT/docker-compose.yml"
+    [ ! -f "$PORTCULLIS_ROOT/docker-compose.override.yml" ] || files="$files:$PORTCULLIS_ROOT/docker-compose.override.yml"
   fi
-  case ":$files:" in *":$overlay:"*) ;; *) files="$files:$overlay" ;; esac
+  for f in "${add[@]}"; do
+    case ":$files:" in *":$f:"*|*":${f##*/}:"*) ;; *) files="$files:$f" ;; esac
+  done
   export COMPOSE_FILE="$files"
 }
 

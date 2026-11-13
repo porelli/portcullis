@@ -19,7 +19,7 @@ set -uo pipefail
 env_file="$(cd "$(dirname "${1:?usage: lint_healthchecks.sh <env-file> [file set...]}")" && pwd)/$(basename "$1")"
 shift
 cd "$(dirname "$0")/.." || exit 2
-sets=("docker-compose.yml" "docker-compose.yml -f docker-compose.podman-selinux.yml"
+sets=("docker-compose.yml" "docker-compose.yml -f docker-compose.podman.yml -f docker-compose.podman-selinux.yml"
       "docker-compose.yml -f docker-compose.apps.yml" "docker-compose.test.yml")
 [ "$#" -eq 0 ] || sets=("$@")
 bad=0

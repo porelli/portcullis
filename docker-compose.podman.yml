@@ -1,0 +1,52 @@
+# Rootless Podman only: ./portcullis adds this file to COMPOSE_FILE whenever
+# CONTAINER_RUNTIME=podman (scripts/lib/runtime.sh runtime_export). Never on
+# Docker, never by hand.
+#
+# restart: always instead of unless-stopped. After a reboot only the user's
+# podman-restart.service starts containers, and it starts exactly those with
+# restart-policy=always (`podman start --all --filter restart-policy=always`):
+# unless-stopped ones would stay down. Docker keeps unless-stopped
+# (docker-compose.yml). CI checks that this file names every core service
+# that has a restart policy, with always, and nothing else.
+
+services:
+  alertmanager:
+    restart: always
+  blackbox:
+    restart: always
+  domains:
+    restart: always
+  enroll:
+    restart: always
+  forward-auth:
+    restart: always
+  forward-auth-ext:
+    restart: always
+  grafana:
+    restart: always
+  group-gate:
+    restart: always
+  hub:
+    restart: always
+  keycloak:
+    restart: always
+  lldap:
+    restart: always
+  mcp-gate:
+    restart: always
+  postgres:
+    restart: always
+  prometheus:
+    restart: always
+  sessions:
+    restart: always
+  socket-proxy-hub:
+    restart: always
+  socket-proxy-traefik:
+    restart: always
+  textfile-exporter:
+    restart: always
+  traefik:
+    restart: always
+  vault:
+    restart: always

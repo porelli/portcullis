@@ -288,6 +288,8 @@ docker-compose.yml:13: postgres:18@sha256:00
 rc=1"
 expect_eq "the SELinux overlay adds only label=disable to security_opt (compose appends: a repeated no-new-privileges is a duplicate newer compose refuses)" \
   "$(grep -v '^[[:space:]]*#' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml" | grep -c 'no-new-privileges'):$(grep -c '^    security_opt: \["label=disable"\]$' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" "0:2"
+expect_eq "docker-compose.podman.yml sets restart: always and nothing else (podman-restart.service starts only those at boot)" \
+  "$(grep -vE '^[[:space:]]*(#|$)|^services:$|^  [a-z][a-z0-9-]*:$|^    restart: always$' "$ROOT_DIR_SOCK/docker-compose.podman.yml"):$(grep -c '^    restart: always$' "$ROOT_DIR_SOCK/docker-compose.podman.yml" | awk '{print ($1 >= 20)}')" ":1"
 expect_eq "the SELinux overlay never names the engine socket" "$(grep -c 'docker.sock\|ENGINE_SOCKET' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" 0
 expect_eq "no ct_own \"\$(id -u)… in the CLI (ct_operator_id)" "$(grep -rnF 'ct_own "$(id -u)' "$HERE/../scripts/lib" "$HERE/../portcullis" || true)" ""
 case "$(printf '%s\n' '  jq -n --arg p "$(cat "$f")" x' '  jq --arg pass "$LLDAP_ADMIN_PASSWORD"' | grep -cE -e "$ARGV_RE")" in
