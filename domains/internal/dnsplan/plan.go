@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -201,6 +202,44 @@ type liveRec struct {
 	rr  libdns.RR
 }
 
+// CanonicalCAAValue is a CAA value as we model it: one a provider
+// returns with its surrounding double quotes (libdns/porkbun v1.1.0 keeps
+// them: `0 issue "x"` reads as Value "\"x\"") unquoted (strconv.Unquote,
+// else the quotes trimmed). Anything else is returned as is.
+func CanonicalCAAValue(v string) string {
+	if len(v) < 2 || !strings.HasPrefix(v, `"`) || !strings.HasSuffix(v, `"`) {
+		return v
+	}
+	if u, err := strconv.Unquote(v); err == nil {
+		return u
+	}
+	return v[1 : len(v)-1]
+}
+
+// CanonicalRR is a provider record as we model it: a CAA with its value
+// canonical (CanonicalCAAValue) and re-rendered; anything else as is.
+func CanonicalRR(rr libdns.RR) libdns.RR {
+	if !strings.EqualFold(rr.Type, "CAA") {
+		return rr
+	}
+	r, err := rr.Parse()
+	if err != nil {
+		return rr
+	}
+	c, ok := r.(libdns.CAA)
+	if !ok {
+		return rr
+	}
+	if cv := CanonicalCAAValue(c.Value); cv != c.Value {
+		c.Value = cv
+		return c.RR()
+	}
+	return rr
+}
+
+// providerRecords is the provider's records under name, each canonical
+// (CanonicalRR): the one point where provider records enter the plan, so
+// planning, matching and deletes all see the same values.
 func providerRecords(ctx context.Context, p Provider, zone, name string) ([]liveRec, error) {
 	recs, err := p.GetRecords(ctx, zone)
 	if err != nil {
@@ -209,7 +248,7 @@ func providerRecords(ctx context.Context, p Provider, zone, name string) ([]live
 	d := bare(name)
 	var out []liveRec
 	for _, r := range recs {
-		rr := r.RR()
+		rr := CanonicalRR(r.RR())
 		abs := bare(libdns.AbsoluteName(rr.Name, zone))
 		if abs == d || strings.HasSuffix(abs, "."+d) {
 			out = append(out, liveRec{abs: abs, rr: rr})
@@ -459,7 +498,7 @@ func addressItems(ctx context.Context, in Input, d string, fix Fix, cnameAt func
 				it.Want = []string{}
 				// Info, not Warning: nothing failed (never a failed lookup).
 				it.Status, it.Severity, it.Fix = StatusUnknown, SevInfo, FixNone
-				it.Steps = []string{"the server's public addresses are unknown (./portcullis up detects them once a domain is enrolled, or set PORTCULLIS_PUBLIC_IPV4 / _IPV6 in .env)"}
+				it.Steps = []string{"the server's public addresses are unknown (./portcullis up detects them, or set PORTCULLIS_PUBLIC_IPV4 / _IPV6 in .env)"}
 				out = append(out, it)
 				continue
 			}
@@ -827,7 +866,8 @@ func rel(r libdns.Record, zone string) libdns.Record {
 }
 
 // DataKey normalises record data for comparison (providers format it
-// differently: case, trailing dots, quoting): the parsed fields.
+// differently: case, trailing dots, quoting): the parsed fields, a CAA
+// value canonical (CanonicalCAAValue).
 func DataKey(typ, data string) string {
 	r, err := libdns.RR{Type: typ, Data: data}.Parse()
 	if err != nil {
@@ -837,7 +877,7 @@ func DataKey(typ, data string) string {
 	case libdns.Address:
 		return typ + " " + v.IP.String()
 	case libdns.CAA:
-		return fmt.Sprintf("CAA %d %s %s", v.Flags, strings.ToLower(v.Tag), strings.TrimSpace(v.Value))
+		return fmt.Sprintf("CAA %d %s %s", v.Flags, strings.ToLower(v.Tag), strings.TrimSpace(CanonicalCAAValue(v.Value)))
 	case libdns.MX:
 		return fmt.Sprintf("MX %d %s", v.Preference, fqdn(v.Target))
 	case libdns.TXT:
@@ -937,7 +977,7 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 				}
 			}
 			if !s.IPv4.IsValid() {
-				return written, removed, errors.New("the server's public IPv4 is unknown (./portcullis up detects it once a domain is enrolled — run it again — or set PORTCULLIS_PUBLIC_IPV4 in .env)")
+				return written, removed, errors.New("the server's public IPv4 is unknown (./portcullis up detects it — run it again — or set PORTCULLIS_PUBLIC_IPV4 in .env)")
 			}
 			for _, r := range want[SetAddress] {
 				written = append(written, RefOf(r, zone))

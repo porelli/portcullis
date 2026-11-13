@@ -52,8 +52,9 @@ func newByIDDelete(lib dnsProvider, api recordAPI) dnsProvider {
 	return byIDDelete{dnsProvider: lib, api: api}
 }
 
-// matchKey compares data on parsed fields (dnsplan.DataKey); TXT values
-// some APIs return quoted compare unquoted.
+// matchKey compares data on parsed fields (dnsplan.DataKey, a CAA value
+// canonical: libdns/porkbun reads it quoted); TXT values some APIs return
+// quoted compare unquoted.
 func matchKey(typ, data string) string {
 	if typ == "TXT" && len(data) >= 2 && strings.HasPrefix(data, `"`) && strings.HasSuffix(data, `"`) {
 		if u, err := strconv.Unquote(data); err == nil {
@@ -76,6 +77,11 @@ func (p byIDDelete) DeleteRecords(ctx context.Context, zone string, recs []libdn
 	live, err := p.api.listIDs(ctx, zone)
 	if err != nil {
 		return nil, err
+	}
+	// The listing enters our model canonical (as GetRecords' records do in
+	// dnsplan); the delete itself goes by the provider's record ID.
+	for i := range live {
+		live[i].rr = dnsplan.CanonicalRR(live[i].rr)
 	}
 	rel := func(n string) string { return libdns.RelativeName(libdns.AbsoluteName(n, zone), zone) }
 	var out []libdns.Record

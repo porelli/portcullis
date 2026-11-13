@@ -346,3 +346,151 @@ func TestHetznerAPIZoneNameChecked(t *testing.T) {
 		t.Fatalf("err %v", err)
 	}
 }
+
+// ── BUG 1 (deploy 2026-11-13): libdns/porkbun v1.1.0 reads a CAA value
+// with its quotes ("\"letsencrypt.org; …\""). The fake's porkbun mode
+// reads the same way (fakedns porkbunCAA); every CAA step must still see
+// the canonical value.
+
+// porkbunCAAs is the zone's CAA set, each checked for nested quotes.
+func porkbunCAAs(t *testing.T, z *fakedns.Zone) []string {
+	t.Helper()
+	got := sortedRRs(z, bname, "CAA")
+	for _, c := range got {
+		if strings.Contains(c, `\"`) || strings.Contains(c, `""`) {
+			t.Fatalf("nested quotes in %q (all %v)", c, got)
+		}
+	}
+	return got
+}
+
+func TestPorkbunReadsCAAQuoted(t *testing.T) {
+	z := fakedns.NewZone()
+	z.Set(bname, libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issue", Value: "digicert.com"}.RR())
+	recs, err := (&fakedns.Provider{Zone: z, DeleteMode: "porkbun"}).GetRecords(context.Background(), bzone)
+	if err != nil || len(recs) != 1 {
+		t.Fatalf("%v %v", recs, err)
+	}
+	if c, ok := recs[0].(libdns.CAA); !ok || c.Value != `"digicert.com"` {
+		t.Fatalf("read %#v, want the library's quoted value", recs[0])
+	}
+}
+
+// A second setup on a pinned zone writes and removes nothing.
+func TestPorkbunSecondSetupNoop(t *testing.T) {
+	const acct = "https://acme-v02.api.letsencrypt.org/acme/acct/123"
+	z := fakedns.NewZone()
+	z.Set(bname, libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issue", Value: "digicert.com"}.RR())
+	var writes []string
+	raw := &fakedns.Provider{Zone: z, ZoneName: bzone, DeleteMode: "porkbun", Hook: func(op string, recs []libdns.Record) error {
+		if op == "append" || op == "set" || op == "delete" {
+			for _, r := range recs {
+				writes = append(writes, op+" "+r.RR().Type+" "+r.RR().Data)
+			}
+		}
+		return nil
+	}}
+	in := dnsplan.Input{Spec: bspec(acct), Zone: bzone, Provider: newByIDDelete(raw, fakeIDs{raw})}
+	if _, _, err := dnsplan.Apply(context.Background(), in, []string{dnsplan.SetAddress, dnsplan.SetCAA}); err != nil {
+		t.Fatal(err)
+	}
+	first := porkbunCAAs(t, z)
+	if len(first) != 3 {
+		t.Fatalf("CAA after the first setup %v", first)
+	}
+	for i := 0; i < 2; i++ {
+		writes = nil
+		_, r, err := dnsplan.Apply(context.Background(), in, []string{dnsplan.SetAddress, dnsplan.SetCAA})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(writes) != 0 || len(r) != 0 {
+			t.Fatalf("setup %d on a pinned zone wrote %v, removed %v", i+2, writes, r)
+		}
+	}
+	if got := porkbunCAAs(t, z); strings.Join(got, "|") != strings.Join(first, "|") {
+		t.Fatalf("CAA after more setups %v, want %v", got, first)
+	}
+}
+
+// relax (CA-only) then tighten (a new account) ends with exactly the
+// planned set: the old pin gone, no CA-only leftover, DigiCert kept.
+func TestPorkbunRelaxThenTighten(t *testing.T) {
+	const old, cur = "https://acme-staging-v02.api.letsencrypt.org/acme/acct/111", "https://acme-v02.api.letsencrypt.org/acme/acct/222"
+	z := fakedns.NewZone()
+	ov := dnsplan.CAAValue("letsencrypt.org", old)
+	z.Set(bname, libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issue", Value: "digicert.com"}.RR(),
+		libdns.CAA{Name: "portcullis", TTL: dnsplan.TTLCAA, Tag: "issue", Value: ov}.RR(),
+		libdns.CAA{Name: "portcullis", TTL: dnsplan.TTLCAA, Tag: "issuewild", Value: ov}.RR())
+	apply := func(uri string) []string {
+		t.Helper()
+		in := dnsplan.Input{Spec: bspec(uri), Zone: bzone, Provider: modeProvider(z, "porkbun")}
+		if _, _, err := dnsplan.Apply(context.Background(), in, []string{dnsplan.SetCAA}); err != nil {
+			t.Fatal(err)
+		}
+		return porkbunCAAs(t, z)
+	}
+	want := func(v string) string {
+		w := []string{`0 issue "digicert.com"`, `0 issue "` + v + `"`, `0 issuewild "` + v + `"`}
+		sort.Strings(w)
+		return strings.Join(w, "|")
+	}
+	if got := apply(""); strings.Join(got, "|") != want(dnsplan.CAAValue("letsencrypt.org", "")) {
+		t.Fatalf("after relax %v, want %s", got, want(dnsplan.CAAValue("letsencrypt.org", "")))
+	}
+	if got := apply(cur); strings.Join(got, "|") != want(dnsplan.CAAValue("letsencrypt.org", cur)) {
+		t.Fatalf("after tighten %v, want %s", got, want(dnsplan.CAAValue("letsencrypt.org", cur)))
+	}
+}
+
+// Another CA's quoted entry is kept: never deleted, never doubled.
+func TestPorkbunForeignCAAKept(t *testing.T) {
+	z := fakedns.NewZone()
+	z.Set(bname, libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issue", Value: "digicert.com; cansignhttpexchanges=yes"}.RR(),
+		libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issuewild", Value: "sectigo.com"}.RR())
+	in := dnsplan.Input{Spec: bspec("https://acme-v02.api.letsencrypt.org/acme/acct/123"), Zone: bzone, Provider: modeProvider(z, "porkbun")}
+	for i := 0; i < 2; i++ {
+		if _, _, err := dnsplan.Apply(context.Background(), in, []string{dnsplan.SetCAA}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := strings.Join(porkbunCAAs(t, z), "|")
+	for _, keep := range []string{`0 issue "digicert.com; cansignhttpexchanges=yes"`, `0 issuewild "sectigo.com"`} {
+		if strings.Count(got, keep) != 1 {
+			t.Fatalf("%s not kept exactly once: %s", keep, got)
+		}
+	}
+	if n := len(strings.Split(got, "|")); n != 4 {
+		t.Fatalf("CAA %s", got)
+	}
+}
+
+// matchKey compares the canonical CAA value: quoted or not, the same.
+func TestMatchKeyCanonicalCAA(t *testing.T) {
+	v := dnsplan.CAAValue("letsencrypt.org", "https://acme-v02.api.letsencrypt.org/acme/acct/123")
+	clean := libdns.CAA{Tag: "issue", Value: v}.RR().Data
+	quoted := libdns.CAA{Tag: "issue", Value: `"` + v + `"`}.RR().Data
+	if matchKey("CAA", clean) != matchKey("CAA", quoted) {
+		t.Fatalf("%q and %q differ", clean, quoted)
+	}
+	if matchKey("CAA", clean) == matchKey("CAA", libdns.CAA{Tag: "issue", Value: "digicert.com"}.RR().Data) {
+		t.Fatal("different CAs match")
+	}
+}
+
+// A delete of a record read the library's way (value quoted) finds its
+// record ID by the canonical value, and only that record goes.
+func TestPorkbunDeleteQuotedByID(t *testing.T) {
+	z := fakedns.NewZone()
+	v := dnsplan.CAAValue("letsencrypt.org", "https://acme-v02.api.letsencrypt.org/acme/acct/123")
+	z.Set(bname, libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issue", Value: "digicert.com"}.RR(),
+		libdns.CAA{Name: "portcullis", TTL: dnsplan.TTLCAA, Tag: "issue", Value: v}.RR())
+	del, err := modeProvider(z, "porkbun").DeleteRecords(context.Background(), bzone,
+		[]libdns.Record{libdns.CAA{Name: "portcullis", Tag: "issue", Value: `"` + v + `"`}})
+	if err != nil || len(del) != 1 || del[0].RR().Data != `0 issue "`+v+`"` {
+		t.Fatalf("deleted %v, %v", del, err)
+	}
+	if got := porkbunCAAs(t, z); strings.Join(got, "|") != `0 issue "digicert.com"` {
+		t.Fatalf("CAA %v", got)
+	}
+}
