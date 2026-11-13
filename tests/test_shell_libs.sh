@@ -2757,6 +2757,63 @@ case "$HC_OUT" in
 esac
 case "$HC_OUT" in *vault-1*|*"exit 1: old"*) t_fail "stack_compose_up health report: a healthy container or an old check listed: $HC_OUT" ;; *) t_pass "stack_compose_up health report: healthy containers and older checks left out" ;; esac
 
+# ── network_state under rootless Podman: its compat inspect has no IPRange
+# (Podman keeps the range as a lease range: first+1 .. last); the range is
+# read from the host's `podman network inspect` (libpod JSON) ──
+mkdir -p "$WORK/nsbin"
+cat > "$WORK/nsbin/podman" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1 $2" = "network inspect" ] && [ "$4 $5" = "--format json" ]; then
+  [ -f "$STUB_DIR/libpod-json-$3" ] || exit 125
+  cat "$STUB_DIR/libpod-json-$3"; exit 0
+fi
+exit 0
+STUB
+{ printf '#!/usr/bin/env bash\n'; cat "$WORK/stub-version"; cat <<'STUB'
+if [ "$1 $2" = "network inspect" ] && [ "$4 $5" = "--format {{json .IPAM.Config}}" ]; then
+  if [ -f "$STUB_DIR/ipam-json-$3" ]; then cat "$STUB_DIR/ipam-json-$3"; exit 0; fi
+  [ "$3" = portcullis-proxy ] && [ -f "$STUB_DIR/ipam-json" ] && { cat "$STUB_DIR/ipam-json"; exit 0; }
+  exit 1
+fi
+exit 0
+STUB
+} > "$WORK/nsbin/docker"
+chmod +x "$WORK/nsbin/podman" "$WORK/nsbin/docker"
+ns() { (PATH="$WORK/nsbin:$PATH" CONTAINER_RUNTIME=podman; "$@") 2>/dev/null; }
+rm -f "$STUB_DIR"/libpod-json-* "$STUB_DIR/ipam-json"
+# Podman's compat shape: Subnet + Gateway, no IPRange.
+printf '%s' '[{"Subnet":"172.31.250.0/24","Gateway":"172.31.250.1"}]' > "$STUB_DIR/ipam-json"
+printf '%s' '[{"name":"portcullis-proxy","subnets":[{"subnet":"172.31.250.0/24","gateway":"172.31.250.1","lease_range":{"start_ip":"172.31.250.129","end_ip":"172.31.250.255"}}]}]' > "$STUB_DIR/libpod-json-portcullis-proxy"
+expect_eq "podman net: compat inspect without IPRange + the libpod lease range of the .env range → ok" "$(ns proxy_network_state)" ok
+printf '%s' '[{"name":"portcullis-proxy","subnets":[{"subnet":"172.31.250.0/24","gateway":"172.31.250.1","lease_range":{"start_ip":"172.31.250.65","end_ip":"172.31.250.127"}}]}]' > "$STUB_DIR/libpod-json-portcullis-proxy"
+expect_eq "podman net: another lease range → mismatch" "$(ns proxy_network_state)" mismatch
+printf '%s' '[{"name":"portcullis-proxy","subnets":[{"subnet":"172.31.250.0/24","gateway":"172.31.250.1"}]}]' > "$STUB_DIR/libpod-json-portcullis-proxy"
+expect_eq "podman net: no lease range where .env sets one → mismatch" "$(ns proxy_network_state)" mismatch
+printf '%s' '[{"Subnet":"10.89.0.0/24","Gateway":"10.89.0.1"}]' > "$STUB_DIR/ipam-json"
+expect_eq "podman net: another subnet → mismatch (never subnet-blind)" "$(ns proxy_network_state)" mismatch
+printf '%s' '[{"Subnet":"172.31.250.0/24","Gateway":"172.31.250.1"}]' > "$STUB_DIR/ipam-json"
+rm -f "$STUB_DIR/libpod-json-portcullis-proxy"
+expect_eq "podman net: the libpod inspect fails → unknown" "$(ns proxy_network_state)" unknown
+OUT="$(PATH="$WORK/nsbin:$PATH" CONTAINER_RUNTIME=podman bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; proxy_dns_shadows() { :; }; network_check" 2>&1)"
+case "$OUT" in *"can't read the IP range of portcullis-proxy"*) t_pass "podman net: network_check refuses an unreadable range (fail closed)" ;; *) t_fail "podman net unknown: $OUT" ;; esac
+printf '%s' '[{"Subnet":"172.31.252.0/28","Gateway":"172.31.252.1"}]' > "$STUB_DIR/ipam-json-portcullis_portcullis-domains"
+printf '%s' '[{"subnets":[{"subnet":"172.31.252.0/28","gateway":"172.31.252.1"}]}]' > "$STUB_DIR/libpod-json-portcullis_portcullis-domains"
+expect_eq "podman net: domains (no range expected, none set) → ok" "$(ns domains_network_state)" ok
+printf '%s' '[{"subnets":[{"subnet":"172.31.252.0/28","gateway":"172.31.252.1","lease_range":{"start_ip":"172.31.252.9","end_ip":"172.31.252.15"}}]}]' > "$STUB_DIR/libpod-json-portcullis_portcullis-domains"
+expect_eq "podman net: domains with a lease range nobody asked for → mismatch" "$(ns domains_network_state)" mismatch
+expect_eq "docker net: the Docker shape is unchanged (IPRange compared)" \
+  "$(printf '%s' '[{"Subnet":"172.31.250.0/24","IPRange":"172.31.250.128/25"}]' > "$STUB_DIR/ipam-json"; PATH="$WORK/nsbin:$PATH" CONTAINER_RUNTIME=docker proxy_network_state)|$(printf '%s' '[{"Subnet":"172.31.250.0/24","IPRange":"172.31.250.0/25"}]' > "$STUB_DIR/ipam-json"; PATH="$WORK/nsbin:$PATH" CONTAINER_RUNTIME=docker proxy_network_state)" "ok|mismatch"
+expect_eq "int_to_ip / the /32 lease rule" "$(int_to_ip "$(ip_to_int 172.31.250.129)")" 172.31.250.129
+rm -f "$STUB_DIR"/libpod-json-* "$STUB_DIR/ipam-json" "$STUB_DIR/ipam-json-portcullis_portcullis-domains"
+
+# hub_started_unix: Podman reports StartedAt in the host's local time.
+HS() { (dc() { echo cid; }; docker() { echo "$HS_AT"; }; hub_started_unix); }
+expect_eq "hub_started_unix: Docker's UTC Z form" "$(HS_AT=2026-11-13T04:12:06.123456789Z HS)" 1794543126
+if date -u -d 2026-11-13T05:12:06+01:00 +%s >/dev/null 2>&1; then
+  expect_eq "hub_started_unix: an RFC 3339 offset (Podman, local time)" "$(HS_AT=2026-11-13T05:12:06.5+01:00 HS)" 1794543126
+fi
+expect_eq "hub_started_unix: no StartedAt → 0" "$(HS_AT='' HS)" 0
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -413,7 +413,10 @@ hub_started_unix() {
   cid="$(dc ps -q hub 2>/dev/null | head -n1)"
   [ -n "$cid" ] || { echo 0; return 0; }
   at="$(docker inspect --format '{{.State.StartedAt}}' "$cid" 2>/dev/null || true)"
-  jq -nr --arg s "$at" '($s | sub("\\.[0-9]+"; "") | fromdateiso8601? // 0)' 2>/dev/null || echo 0
+  [ -n "$at" ] || { echo 0; return 0; }
+  # GNU date reads any RFC 3339 offset (Podman reports the host's local
+  # time); jq's fromdateiso8601 only a Z suffix (BSD date, Docker's UTC).
+  date -u -d "$at" +%s 2>/dev/null || jq -nr --arg s "$at" '($s | sub("\\.[0-9]+"; "") | fromdateiso8601? // 0)' 2>/dev/null || echo 0
 }
 
 # hub_sync_status — the Hub's last template sync (<data>/source-sync.json,

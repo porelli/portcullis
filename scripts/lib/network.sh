@@ -66,6 +66,11 @@ cidr_bounds() {
   echo "$(( base & mask )) $(( (base & mask) | (~mask & 0xFFFFFFFF) ))"
 }
 
+# int_to_ip <n> — the dotted address of an integer.
+int_to_ip() {
+  echo "$(( ($1 >> 24) & 255 )).$(( ($1 >> 16) & 255 )).$(( ($1 >> 8) & 255 )).$(( $1 & 255 ))"
+}
+
 # cidr_contains <cidr> <ip> — succeed if ip is inside cidr.
 cidr_contains() {
   local first last n
@@ -331,9 +336,16 @@ _override_alias_services() {
     }'
 }
 
-# network_state <name> <subnet> <range> — prints one of: missing | ok | mismatch
-# ("mismatch" = network exists without the expected IPAM subnet/ip_range,
-# e.g. after editing the settings in .env; Docker can't change IPAM in place).
+# network_state <name> <subnet> <range> — prints one of: missing | ok |
+# mismatch | unknown ("mismatch" = network exists without the expected IPAM
+# subnet/ip_range, e.g. after editing the settings in .env; Docker can't
+# change IPAM in place; "unknown" = the range can't be read: refused too).
+# Docker: the compat inspect's Subnet and IPRange. Rootless Podman: its
+# Docker-compatible inspect never reports IPRange (it keeps the range as a
+# lease range: compat create maps ip_range <cidr> to first+1 .. last), so
+# the subnet comes from that inspect and the range from the host's
+# `podman network inspect` (libpod: subnets[].lease_range), which must be
+# exactly the expected one (and absent when none is expected).
 network_state() {
   local config cur_subnet cur_range
   if ! config="$(docker network inspect "$1" --format '{{json .IPAM.Config}}' 2>/dev/null)"; then
@@ -341,6 +353,11 @@ network_state() {
     return 0
   fi
   cur_subnet="$(printf '%s' "$config" | jq -r '.[0].Subnet // ""')"
+  if _rt_is_podman; then
+    [ "$cur_subnet" = "$2" ] || { echo mismatch; return 0; }
+    _podman_lease_state "$1" "$2" "$3"
+    return 0
+  fi
   # IPRange is optional; treat unset, empty, or "invalid Prefix" (Docker 29+) as no range.
   cur_range="$(printf '%s' "$config" | jq -r '.[0].IPRange // "" | if . == "invalid Prefix" or . == "" then "" else . end')"
   if [ "$cur_subnet" = "$2" ] && [ "$cur_range" = "$3" ]; then
@@ -348,6 +365,27 @@ network_state() {
   else
     echo mismatch
   fi
+}
+
+# _podman_lease_state <name> <subnet> <range> — ok | mismatch | unknown:
+# the libpod lease range of <subnet> against <range> (Podman's compat
+# create: start = the range's first address + 1 (itself for a /32), end =
+# its last address).
+_podman_lease_state() {
+  local j got want="" first last start
+  if ! j="$(podman network inspect "$1" --format json 2>/dev/null)"; then echo unknown; return 0; fi
+  got="$(printf '%s' "$j" | jq -r --arg s "$2" '
+      [.[0].subnets[]? | select(.subnet == $s)]
+      | if length != 1 then "no-such-subnet"
+        else (.[0].lease_range // null) | if . == null then "" else "\(.start_ip // "")-\(.end_ip // "")" end end' 2>/dev/null)" \
+    || { echo unknown; return 0; }
+  if [ -n "$3" ]; then
+    read -r first last <<< "$(cidr_bounds "$3")" || { echo unknown; return 0; }
+    [ -n "$last" ] || { echo unknown; return 0; }
+    start=$(( first == last ? first : first + 1 ))
+    want="$(int_to_ip "$start")-$(int_to_ip "$last")"
+  fi
+  if [ "$got" = "$want" ]; then echo ok; else echo mismatch; fi
 }
 
 proxy_network_state() { network_state "$PROXY_NETWORK" "$(proxy_subnet)" "$(proxy_ip_range)"; }
@@ -359,29 +397,37 @@ mcp_network_state()   { network_state "$MCP_NETWORK" "$(mcp_subnet)" "$(mcp_ip_r
 # existing network does not match them (compose would silently keep the old
 # one and Traefik would not get its static IP).
 network_check() {
-  local err
+  local err st
   err="$(validate_proxy_network_config)" || fail "Invalid portcullis-proxy settings in .env: $err"
   err="$(validate_mcp_gate_ip)" || fail "Invalid mcp-gate address in .env: $err"
   err="$(validate_auth_network_config)" || fail "Invalid portcullis-auth settings in .env: $err"
   err="$(validate_domains_network_config)" || fail "Invalid portcullis-domains settings in .env: $err"
   err="$(validate_mcp_network_config)" || fail "Invalid portcullis-mcp settings in .env: $err"
-  if [ "$(proxy_network_state)" = mismatch ]; then
+  st="$(proxy_network_state)"
+  [ "$st" != unknown ] || fail "can't read the IP range of $PROXY_NETWORK (podman network inspect failed): refusing to go on unverified"
+  if [ "$st" = mismatch ]; then
     fail "Docker network $PROXY_NETWORK exists with a different IPAM config than .env
        ($(proxy_subnet), range $(proxy_ip_range)). Docker cannot change it in place:
        disable the apps in the Hub, run ./portcullis down, then
        docker network rm $PROXY_NETWORK && ./portcullis up"
   fi
-  if [ "$(auth_network_state)" = mismatch ]; then
+  st="$(auth_network_state)"
+  [ "$st" != unknown ] || fail "can't read the IP range of $AUTH_NETWORK (podman network inspect failed): refusing to go on unverified"
+  if [ "$st" = mismatch ]; then
     fail "Docker network $AUTH_NETWORK exists with a different IPAM config than .env
        ($(auth_subnet), range $(auth_ip_range)). Only core services use it:
        ./portcullis down && ./portcullis up recreates it."
   fi
-  if [ "$(domains_network_state)" = mismatch ]; then
+  st="$(domains_network_state)"
+  [ "$st" != unknown ] || fail "can't read the IP range of $DOMAINS_NETWORK (podman network inspect failed): refusing to go on unverified"
+  if [ "$st" = mismatch ]; then
     fail "Docker network $DOMAINS_NETWORK exists with a different subnet than
        PORTCULLIS_DOMAINS_SUBNET=$(domains_subnet) (the domains API would refuse the Hub).
        Only the Hub and domains use it: ./portcullis down && ./portcullis up recreates it."
   fi
-  if [ "$(mcp_network_state)" = mismatch ]; then
+  st="$(mcp_network_state)"
+  [ "$st" != unknown ] || fail "can't read the IP range of $MCP_NETWORK (podman network inspect failed): refusing to go on unverified"
+  if [ "$st" = mismatch ]; then
     fail "Docker network $MCP_NETWORK exists with a different IPAM config than .env
        ($(mcp_subnet), range $(mcp_ip_range)). Only mcp-gate, Keycloak and the Hub use it:
        ./portcullis down && ./portcullis up recreates it."
