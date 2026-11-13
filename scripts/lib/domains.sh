@@ -135,13 +135,18 @@ domains_age_keygen() {
   ok "Generated secrets/domains/age.key (encrypts the domains service's DNS credentials; backed up with secrets/)."
 }
 
-# domains_enrolled — true only when the running domains service confirms
-# at least one enrolled domain (unknown — not running, an old image, an
-# odd answer — counts as NOT enrolled: fail closed, no stale address).
-domains_enrolled() {
+# domains_enrolled_state — what the running domains service says about
+# enrolled domains: "enrolled" (≥ 1), "none" (a confirmed 0) or "unknown"
+# (not running — e.g. during `up` after a `down` —, an error, odd output).
+domains_enrolled_state() {
   local n
-  n="$(dc exec -T domains domains enrolled 2>/dev/null | tr -d '[:space:]')" || return 1
-  [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ]
+  if ! n="$(dc exec -T domains domains enrolled 2>/dev/null | tr -d '[:space:]')" || ! [[ "$n" =~ ^[0-9]+$ ]]; then
+    echo unknown
+  elif [ "$n" -gt 0 ]; then
+    echo enrolled
+  else
+    echo none
+  fi
 }
 
 # _domains_last <4|6> [<address>] — the last detected address (stored, or
@@ -167,20 +172,23 @@ _domains_last() {
 # or .env; an empty _IPV6 = no IPv6) always wins; otherwise
 # public_ip_detect (HTTPS, two services must agree, global unicast only).
 # The last detected address (last-public-ipv4 / -ipv6) is saved, and a
-# failed lookup falls back to it, only while the running domains service
-# confirms an enrolled domain (domains_enrolled; unknown = not enrolled):
-# secrets/ restored on a new server must not hand the old server's
-# address to the first enrollment.
+# failed lookup falls back to it ("no IPv6" would remove the AAAA
+# records), unless the running domains service confirms 0 domains
+# (domains_enrolled_state "none"); "unknown" (not running during `up`
+# after a `down`, an error) keeps the fallback, so a transient IPv6
+# failure never removes AAAA records. The files are host-specific: backups
+# leave them out and restore deletes them (backup.sh), so restored
+# secrets/ never hand the old server's address to the first enrollment.
 # No address = the service keeps the records it set and renews
 # certificates, but sets no new records (fail closed). The result is
 # written to secrets/domains/public-ips.env, the domains service's
 # env_file (a manual `docker compose up` gets it too).
 domains_public_ips() {
-  local v4="${PORTCULLIS_PUBLIC_IPV4:-}" v6="${PORTCULLIS_PUBLIC_IPV6:-}" enrolled=""
-  # _enrolled — domains_enrolled, asked once.
+  local v4="${PORTCULLIS_PUBLIC_IPV4:-}" v6="${PORTCULLIS_PUBLIC_IPV6:-}" state=""
+  # _enrolled — false only for a confirmed 0 (domains_enrolled_state, asked once).
   _enrolled() {
-    [ -n "$enrolled" ] || { if domains_enrolled; then enrolled=true; else enrolled=false; fi; }
-    [ "$enrolled" = true ]
+    [ -n "$state" ] || state="$(domains_enrolled_state)"
+    [ "$state" != none ]
   }
   if [ -z "$v4" ]; then
     v4="$(public_ip_detect 4)"

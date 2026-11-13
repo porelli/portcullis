@@ -317,6 +317,8 @@ backup_create() {
   [ ! -d "$PORTCULLIS_ROOT/config" ] || cp -a "$PORTCULLIS_ROOT/config" "$work/config"
   [ ! -d "$PORTCULLIS_ROOT/certs" ] || cp -a "$PORTCULLIS_ROOT/certs" "$work/certs"
   [ ! -d "$PORTCULLIS_ROOT/secrets" ] || cp -a "$PORTCULLIS_ROOT/secrets" "$work/secrets"
+  # Host-specific (the last detected public addresses): never archived.
+  _strip_host_files "$work/secrets"
 
   printf '  %-26s' "vault (raft snapshot)"; _backup_vault_snapshot "$work/vault.snap"; printf ' %sdone%s\n' "$C_GREEN" "$C_NC"
   printf '  %-26s' "postgres (pg_dump)"; _backup_pg_dump "$work/postgres.dump"; printf ' %sdone%s\n' "$C_GREEN" "$C_NC"
@@ -597,10 +599,19 @@ _restore_vault() {
   ok "Vault restored and unsealed with the original key."
 }
 
+# _strip_host_files <secrets dir> — removes what belongs to one host, not
+# the install: the last detected public addresses (domains.sh
+# domains_public_ips falls back to them). A backup never carries them, a
+# restore deletes them (older backups, or the same host: can't tell).
+_strip_host_files() {
+  rm -f "$1/domains/last-public-ipv4" "$1/domains/last-public-ipv6"
+}
+
 _restore_secrets() {
   local dir="$1"
   (umask 077 && rm -rf "$PORTCULLIS_ROOT/secrets.restore-tmp" && cp -a "$dir/secrets" "$PORTCULLIS_ROOT/secrets.restore-tmp")
   rm -rf "$PORTCULLIS_ROOT/secrets" && mv "$PORTCULLIS_ROOT/secrets.restore-tmp" "$PORTCULLIS_ROOT/secrets"
+  _strip_host_files "$PORTCULLIS_ROOT/secrets"
   chmod 700 "$PORTCULLIS_ROOT/secrets"
   secrets_fix_perms
 }

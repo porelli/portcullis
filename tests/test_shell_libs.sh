@@ -1043,6 +1043,9 @@ mkdir -p "$BC_ROOT/appfiles/echo-a" "$BC_ROOT/secrets" "$BC_ROOT/certs" "$BC_ROO
 echo 'PORTCULLIS_DOMAIN=x' > "$BC_ROOT/.env"
 echo '{"version":1,"instance":"echo-a","values":{"k":"APPFILE-MARKER"}}' > "$BC_ROOT/appfiles/echo-a/data.json"
 echo k > "$BC_ROOT/secrets/k"
+mkdir -p "$BC_ROOT/secrets/domains"
+echo 198.51.99.7 > "$BC_ROOT/secrets/domains/last-public-ipv4"; echo 2a01:4f8::5 > "$BC_ROOT/secrets/domains/last-public-ipv6"
+echo s > "$BC_ROOT/secrets/domains/api-secret"
 # shellcheck disable=SC2034  # read by backup_create
 ( PORTCULLIS_ROOT="$BC_ROOT" BACKUP_ROOT="$BC_ROOT/backups" BACKUP_FILE_VOLUMES=""
   _BACKUP_CFG='{"services":{"hub":{"image":"hub:1"}}}'
@@ -1053,6 +1056,9 @@ echo k > "$BC_ROOT/secrets/k"
 BC_DIR="$(find "$BC_ROOT/backups" -mindepth 1 -maxdepth 1 -type d -name '2*' | head -n1)"
 expect_ok "backup: a backup was made" test -f "$BC_DIR/MANIFEST.json"
 expect_ok "backup: secrets/ archived (sanity)" test -f "$BC_DIR/secrets/k"
+expect_eq "backup: last-public-ipv* never archived (host-specific), the rest of secrets/domains is" \
+  "$(find "$BC_DIR/secrets/domains" -name 'last-public-*' | wc -l | tr -d ' '):$(cat "$BC_DIR/secrets/domains/api-secret"):$(jq -r '.files | keys[] | select(test("last-public"))' "$BC_DIR/MANIFEST.json")" "0:s:"
+expect_ok "backup: the live last-public-ipv* stay" test -f "$BC_ROOT/secrets/domains/last-public-ipv4"
 expect_fail "backup: appfiles/ not archived" sh -c "find '$BC_DIR' -path '*appfiles*' | grep -q . || grep -rq APPFILE-MARKER '$BC_DIR'"
 expect_eq "backup: appfiles/ not in the manifest" "$(jq -r '.files | keys[] | select(test("appfiles"))' "$BC_DIR/MANIFEST.json")" ""
 
@@ -1399,25 +1405,36 @@ ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.7 h
 expect_eq "domains: detected IPv4 + IPv6" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
 
 # The last detected address (last-public-ipv4 / -ipv6) is saved and used
-# only while the running domains service confirms an enrolled domain:
-# secrets/ restored on a new server (the service down, or no domain) must
-# never hand the old server's address to the first enrollment.
+# unless the running domains service confirms 0 domains; "unknown" (not
+# running — `up` after a `down` —, an error) keeps it, so a transient IPv6
+# failure never removes the AAAA records. Restore deletes the files
+# (backup.sh _strip_host_files, tested with the backup below).
 LASTD="$PORTCULLIS_ROOT/secrets/domains"
 mkdir -p "$LASTD"
 rm -f "$LASTD/last-public-ipv4" "$LASTD/last-public-ipv6"
 lastn() { local n=0 f; for f in "$LASTD"/last-public-*; do [ -e "$f" ] && n=$((n + 1)); done; echo "$n"; }
-# Not running (no stub file) / no domain: a successful lookup saves nothing.
-ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.7 https://api6.ipify.org 2a01:4f8::5 https://ipv6.icanhazip.com 2a01:4f8::5
-expect_eq "domains: service down, detected IPv4 + IPv6 published" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
-expect_eq "domains: service down, no last-* written" "$(lastn)" 0
+expect_eq "domains: enrolled state: not running = unknown" "$(dc() { return 1; }; domains_enrolled_state)" unknown
+expect_eq "domains: enrolled state: odd output = unknown" "$(dc() { echo 'oops'; }; domains_enrolled_state)" unknown
+expect_eq "domains: enrolled state: 0 = none" "$(dc() { echo 0; }; domains_enrolled_state)" none
+expect_eq "domains: enrolled state: 3 = enrolled" "$(dc() { echo 3; }; domains_enrolled_state)" enrolled
+# A confirmed 0: a successful lookup saves nothing, a failed one publishes none.
 echo 0 > "$STUB_DIR/enrolled"
-expect_eq "domains: no enrolled domain, detected addresses published" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
+: > "$STUB_DIR/ip-calls"
+ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.7 https://api6.ipify.org 2a01:4f8::5 https://ipv6.icanhazip.com 2a01:4f8::5
+expect_eq "domains: no enrolled domain = lookups run, detected addresses published" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
+expect_ok "domains: no enrolled domain = IPv4 and IPv6 looked up" sh -c "grep -q api.ipify.org '$STUB_DIR/ip-calls' && grep -q api6.ipify.org '$STUB_DIR/ip-calls'"
 expect_eq "domains: no enrolled domain, no last-* written" "$(lastn)" 0
 # Enrolled: a successful lookup saves them.
 echo 2 > "$STUB_DIR/enrolled"
 pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6 >/dev/null
 expect_eq "domains: enrolled, last-* saved" "$(cat "$LASTD/last-public-ipv4")/$(cat "$LASTD/last-public-ipv6")" "198.51.99.7/2a01:4f8::5"
+echo 0 > "$STUB_DIR/enrolled"
+ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.8
+expect_eq "domains: confirmed 0, failed lookups = no address (not the last one)" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6 | tail -n1)" "/"
+expect_eq "domains: confirmed 0, failed lookups write empty addresses" "$(cat "$PORTCULLIS_ROOT/secrets/domains/public-ips.env")" "DOMAINS_PUBLIC_IPV4=
+DOMAINS_PUBLIC_IPV6="
 # Enrolled, a transient IPv6 / IPv4 detection failure keeps the last address.
+echo 2 > "$STUB_DIR/enrolled"
 ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.7
 expect_eq "domains: enrolled, IPv6 detection failure keeps the last address" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
 expect_eq "domains: explicit empty IPv6 still means none" "$(pubips export PORTCULLIS_PUBLIC_IPV4=203.0.113.9 PORTCULLIS_PUBLIC_IPV6=)" "203.0.113.9/"
@@ -1425,28 +1442,31 @@ ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.8
 expect_eq "domains: enrolled, IPv4 detection failure keeps the last address" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
 expect_eq "domains: the env file has the kept addresses" "$(cat "$PORTCULLIS_ROOT/secrets/domains/public-ips.env")" "DOMAINS_PUBLIC_IPV4=198.51.99.7
 DOMAINS_PUBLIC_IPV6=2a01:4f8::5"
-# A restored secrets/ (last-* present), the service down, failed lookups:
-# no address at all (fail closed), never the old server's.
+# `down` then `up` of an enrolled server: domains_prepare runs before the
+# service starts (unknown); a transient IPv6 failure keeps the last IPv6
+# (an empty one would remove the AAAA records at <d> and *.<d>).
 rm -f "$STUB_DIR/enrolled"
+ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.7
+expect_eq "domains: down/up (service unreachable), IPv6 failure keeps the last IPv6" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
+ipans https://api.ipify.org 198.51.99.30 https://ipv4.icanhazip.com 198.51.99.30 https://api6.ipify.org 2a01:4f8::30 https://ipv6.icanhazip.com 2a01:4f8::30
+pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6 >/dev/null
+expect_eq "domains: service unreachable, a successful lookup updates last-*" "$(cat "$LASTD/last-public-ipv4")/$(cat "$LASTD/last-public-ipv6")" "198.51.99.30/2a01:4f8::30"
+# A restored secrets/ (restore deleted last-*), the service down, failed
+# lookups: no address at all, never the old server's.
+# (an older backup still carrying them, restored into its own root)
+mkdir -p "$WORK/rsec-backup/secrets/domains" "$WORK/rsec-root/secrets/domains"
+cp "$LASTD/last-public-ipv4" "$LASTD/last-public-ipv6" "$WORK/rsec-backup/secrets/domains/"
+echo keep > "$WORK/rsec-backup/secrets/domains/api-secret"
+(PORTCULLIS_ROOT="$WORK/rsec-root"; secrets_fix_perms() { :; }; _restore_secrets "$WORK/rsec-backup")
+expect_eq "restore: last-public-ipv* deleted, the rest of secrets/ installed" \
+  "$(find "$WORK/rsec-root/secrets" -name 'last-public-*' | wc -l | tr -d ' '):$(cat "$WORK/rsec-root/secrets/domains/api-secret")" "0:keep"
+# The same on this root (what restore leaves), then the first `up`.
+_strip_host_files "$PORTCULLIS_ROOT/secrets"
 ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.8
 expect_eq "domains: restored secrets/, service down, failed lookups = no address" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6 | tail -n1)" "/"
-expect_eq "domains: restored secrets/, service down: empty env file" "$(cat "$PORTCULLIS_ROOT/secrets/domains/public-ips.env")" "DOMAINS_PUBLIC_IPV4=
-DOMAINS_PUBLIC_IPV6="
-# No enrolled domain (the service says 0): the lookups still run (the
-# main-domain plan checks A/AAAA against them, deploy 2026-11-13 BUG 2);
-# a failed one publishes no address either.
-echo 0 > "$STUB_DIR/enrolled"
 : > "$STUB_DIR/ip-calls"
-ipans https://api.ipify.org 198.51.99.20 https://ipv4.icanhazip.com 198.51.99.20
-expect_eq "domains: no enrolled domain = lookups run, detected IPv4 published" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6 | tail -n1)" "198.51.99.20/"
-expect_ok "domains: no enrolled domain = IPv4 and IPv6 looked up" sh -c "grep -q api.ipify.org '$STUB_DIR/ip-calls' && grep -q api6.ipify.org '$STUB_DIR/ip-calls'"
-expect_eq "domains: no enrolled domain, the last address untouched" "$(cat "$LASTD/last-public-ipv4")" "198.51.99.7"
-ipans https://api.ipify.org 198.51.99.20 https://ipv4.icanhazip.com 198.51.99.21
-expect_eq "domains: no enrolled domain, failed lookups = no address (not the last one)" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6 | tail -n1)" "/"
-: > "$STUB_DIR/ip-calls"
-expect_eq "domains: no enrolled domain, .env set = .env" "$(pubips export PORTCULLIS_PUBLIC_IPV4=203.0.113.44 PORTCULLIS_PUBLIC_IPV6=2a01:4f8::44 | tail -n1)" "203.0.113.44/2a01:4f8::44"
+expect_eq "domains: .env set = .env" "$(pubips export PORTCULLIS_PUBLIC_IPV4=203.0.113.44 PORTCULLIS_PUBLIC_IPV6=2a01:4f8::44 | tail -n1)" "203.0.113.44/2a01:4f8::44"
 expect_eq "domains: .env set = no lookups" "$(wc -l < "$STUB_DIR/ip-calls" | tr -d ' ')" 0
-rm -f "$STUB_DIR/enrolled"
 
 # ══ backup: hub_secrets volume ═════════════════════════════
 # shellcheck source=../scripts/lib/backup.sh
