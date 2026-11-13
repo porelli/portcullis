@@ -222,6 +222,42 @@ expect_eq "selinux_bad_sources catches ., ./secrets, ./backups, ./.env and a par
   "$(selinux_bad_sources "$WORK/bad-overlay.yml" | paste -sd' ' -)" ". ./secrets ./backups ./.env .."
 expect_eq "the SELinux overlay: the Hub's /project root is a tmpfs, not the checkout" \
   "$(grep -c '{type: tmpfs, target: /project,' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml"):$(grep -cE 'source: \.[,}]|source: \./?, ' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" "1:0"
+# Healthchecks behave the same on Docker and Podman (whose compat API
+# re-splits CMD arguments on whitespace): tests/lint_healthchecks.sh.
+mkdir -p "$WORK/hl-root"
+PORTCULLIS_ROOT="$WORK/hl-root" "$CLI" init --env-only --runtime docker --non-interactive --domain ci.example.org --dns-provider none >/dev/null 2>&1 </dev/null
+expect_eq "every core healthcheck test: no CMD argument with whitespace, no newline, CMD-SHELL one string" \
+  "$(PATH="${PATH#"$WORK/bin:"}" "$HERE/lint_healthchecks.sh" "$WORK/hl-root/.env" 2>&1; echo "rc=$?")" "rc=0"
+mkdir -p "$WORK/hl/tests" "$WORK/hl/.github/workflows"
+cp "$HERE/lint_healthchecks.sh" "$WORK/hl/tests/"
+cat > "$WORK/hl/docker-compose.yml" <<'YML'
+services:
+  a:
+    image: docker.io/library/alpine:3
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import x; x.y()"]
+  b:
+    image: docker.io/library/alpine:3
+    healthcheck:
+      test: ["CMD-SHELL", "true", "false"]
+  c:
+    image: docker.io/library/alpine:3
+    healthcheck:
+      test: ["CMD-SHELL", "a\nb"]
+  d:
+    image: docker.io/library/alpine:3
+    healthcheck:
+      test: ["CMD", "wget", "-q", "http://127.0.0.1/"]
+YML
+printf '      test: ["CMD", "bash", "-c", "a b"]\n' > "$WORK/hl/.github/workflows/x.yml"
+expect_eq "lint_healthchecks.sh flags a spaced CMD argument, a split CMD-SHELL, a newline and an inline workflow override (a plain CMD passes)" \
+  "$(PATH="${PATH#"$WORK/bin:"}" "$WORK/hl/tests/lint_healthchecks.sh" "$WORK/hl-root/.env" docker-compose.yml 2>&1 | sed 's/:[0-9]*:.*//' ; echo "rc=${PIPESTATUS[0]}")" "docker-compose.yml: a: a CMD argument has whitespace (Podman re-splits it): use one CMD-SHELL string
+docker-compose.yml: b: CMD-SHELL needs exactly one command string
+docker-compose.yml: c: a test element has a newline
+a workflow's inline compose override has a CMD healthcheck argument with whitespace:
+.github/workflows/x.yml
+rc=1"
+
 # Fully qualified base images (rootless Podman: podman build never relies
 # on registries.conf short names): tests/lint_images.sh, also in CI.
 expect_eq "every Dockerfile FROM and compose image: is fully qualified" "$("$HERE/lint_images.sh" 2>&1; echo "rc=$?")" "rc=0"

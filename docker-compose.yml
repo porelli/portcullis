@@ -483,7 +483,10 @@ services:
       portcullis-mcp:
         ipv4_address: ${PORTCULLIS_MCP_KEYCLOAK_IP:-172.31.253.2}
     healthcheck:
-      test: ["CMD", "bash", "-c", "{ printf 'HEAD /health/ready HTTP/1.0\\r\\n\\r\\n' >&0; grep 'HTTP/1.0 200'; } 0<>/dev/tcp/localhost/9000"]
+      # One CMD-SHELL string: Podman's compat API re-splits exec-form (CMD)
+      # arguments on whitespace (a `bash -c '<script>'` reached the
+      # container as `bash -c '{'`), so no CMD argument may contain a space.
+      test: ["CMD-SHELL", "bash -c '{ printf \"HEAD /health/ready HTTP/1.0\\r\\n\\r\\n\" >&0; grep \"HTTP/1.0 200\"; } 0<>/dev/tcp/localhost/9000'"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -806,7 +809,8 @@ services:
     networks:
       - portcullis
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      # One CMD-SHELL string (Podman re-splits CMD arguments on whitespace).
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)\""]
       interval: 10s
       timeout: 5s
       retries: 3

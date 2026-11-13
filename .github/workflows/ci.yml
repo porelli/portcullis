@@ -214,6 +214,9 @@ jobs:
           ./portcullis init --env-only --runtime docker --non-interactive --domain ci.example.org --dns-provider none
           docker compose -f docker-compose.yml config -q
           docker compose -f docker-compose.yml -f docker-compose.podman-selinux.yml --profile '*' config -q
+          # Healthchecks that behave the same on Podman (its compat API
+          # re-splits CMD arguments on whitespace).
+          tests/lint_healthchecks.sh .env
           docker compose -f docker-compose.yml --profile monitoring config -q
           docker compose -f docker-compose.yml --profile '*' config -q
           docker compose -f docker-compose.yml -f docker-compose.apps.yml config -q
