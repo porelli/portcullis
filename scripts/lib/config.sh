@@ -116,12 +116,17 @@ config_apply() {
     # Only where Portcullis manages the CAA (DNS_CAA=true, an automated
     # provider with its credentials): anywhere else there is no pin of
     # ours to relax, so no relax, no settle point and no wait.
+    local relaxed=""
     if [ "$caa" = true ] && _dns_automated "${DNS_PROVIDER:-none}" && _dns_creds_present "${DNS_PROVIDER:-none}"; then
+      relaxed=1
       # The dns tool must understand this CLI's arguments (an `up` after a
       # `git pull` runs this before its own rebuild).
       domains_image_build "for the CAA relax"
       dns_relax_main || fail "The ACME_STAGING flip is not finished (see above): Traefik runs on with its current ACME account and storage, so nothing is ordered against the old CAA pin, and the settle point is saved: running it again early just waits or stops again."
     fi
+    # Every flip, managed or not: a saved settle point in the future, or a
+    # public CAA a NEW account couldn't order under, stops it here (N2).
+    dns_flip_guard "$ca_server" "$relaxed" || fail "The ACME_STAGING flip is not finished (see above): nothing changed, Traefik runs on with its current ACME account."
     CFG_FLIP_TRAEFIK_WAS="$(dc ps -q --status running traefik 2>/dev/null || true)"
     # From the stop until Traefik runs on the new CA, any way out — an
     # interrupt (INT / TERM / HUP: an SSH drop), a `fail`, set -e — starts
@@ -132,7 +137,10 @@ config_apply() {
     trap '_cfg_flip_traefik_back; exit 130' INT TERM HUP
     info "Stopping Traefik..."
     # acme.json is never cleared under a running Traefik (M15).
-    dc stop traefik >/dev/null 2>&1 || fail "could not stop Traefik: the ACME_STAGING flip is not finished; run the same command again"
+    # No container at all (after `down`) is nothing to stop (M20).
+    if ! dc stop traefik >/dev/null 2>&1 && [ -n "$(dc ps -aq traefik 2>/dev/null || echo unknown)" ]; then
+      fail "could not stop Traefik: the ACME_STAGING flip is not finished; run the same command again"
+    fi
     if docker volume inspect portcullis_traefik_acme >/dev/null 2>&1; then
       info "Clearing Traefik's ACME storage (acme.json)..."
       docker run --rm --network none -v portcullis_traefik_acme:/acme "$PORTCULLIS_HELPER_IMAGE" rm -f /acme/acme.json >/dev/null 2>&1 \

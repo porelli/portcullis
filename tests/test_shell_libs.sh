@@ -2069,6 +2069,9 @@ case "$*" in
     cat "$d/report-out" 2>/dev/null; exit 0 ;;
   compose\ *\ exec\ -T\ domains\ domains\ report\ --main\ --json)
     cat "$d/report-out" 2>/dev/null; exit 0 ;;
+  compose\ *\ ps\ -aq\ traefik)
+    [ ! -f "$d/traefik-exists" ] || echo c0ffee
+    exit 0 ;;
   compose\ *\ stop\ traefik)
     [ ! -f "$d/stop-fail" ] || exit 1
     exit 0 ;;
@@ -2108,7 +2111,7 @@ OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup
 expect_eq "dns tool: credentials only on stdin (never in argv)" "$(grep -c 'tok-SECRET-123' "$STUB_DIR/dt/argv")" 0
 expect_eq "dns tool: the token is the apply input's credentials.api_token" "$(dtin apply .credentials.api_token)" tok-SECRET-123
 expect_eq "dns tool: the token never reaches the output" "$(printf '%s' "$OUT" | grep -c 'tok-SECRET-123')" 0
-expect_eq "dns setup --yes: plan, apply, the service's main plan refreshed, check" "$(paste -sd' ' "$STUB_DIR/dt/order")" "plan apply refresh check"
+expect_eq "dns setup --yes: plan, apply, the service's main plan refreshed, check" "$(paste -sd' ' "$STUB_DIR/dt/order")" "plan ttl apply refresh check"
 expect_eq "dns setup: apply waits by the stored TTL (--wait auto)" "$(grep -c 'dns-tool apply --wait auto$' "$STUB_DIR/dt/argv")" 1
 expect_eq "dns setup: the default sets are address and caa" "$(dtin apply '.sets | join(",")')" "address,caa"
 expect_eq "dns setup: the input's snake_case keys" "$(dtin apply '[keys[]] | join(",")')" "ca_server,caa,credentials,ipv4,ipv6,mail_from,name,nomail,provider,sets"
@@ -2319,7 +2322,7 @@ echo '{"ttl": 600}' > "$STUB_DIR/dt/out-ttl"
 touch "$STUB_DIR/dt/traefik-running"
 OUT="$(flip "$FCF")"
 expect_eq "config apply flip: relax applies caa CA-only" "$(dtin apply '[.sets, .caa.account_uri] | @json')" '[["caa"],""]'
-expect_eq "config apply flip: the old pin's TTL read first, the domains image rebuilt before (I4)" "$(paste -sd' ' "$STUB_DIR/dt/order")" "build ttl apply refresh"
+expect_eq "config apply flip: the old pin's TTL read first, the domains image rebuilt before (I4), the public check last (N2)" "$(paste -sd' ' "$STUB_DIR/dt/order")" "build ttl apply refresh check"
 expect_eq "config apply flip: relax settles past the saved point (--wait auto --settle --settle-after)" "$(grep -c 'dns-tool apply --wait auto --settle --settle-after [0-9][0-9]*$' "$STUB_DIR/dt/argv")" 1
 expect_eq "config apply flip: settled relax → acme.json cleared, sentinel written, state removed" \
   "$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv"):$(cat "$FL_ROOT/certs/.acme-staging-last"):$([ -e "$RELAXF" ] && echo kept || echo gone):${OUT##*rc=}" "1:true:gone:0"
@@ -2408,10 +2411,15 @@ expect_eq "config apply flip: HUP after the stop starts Traefik again, sentinel 
 rm -f "$STUB_DIR/dt/rm-hup"
 # M15: Traefik doesn't stop → fail before the clear (acme.json is never
 # cleared under a running Traefik), Traefik started again.
-touch "$STUB_DIR/dt/stop-fail"
+touch "$STUB_DIR/dt/stop-fail" "$STUB_DIR/dt/traefik-exists"
 OUT="$(flip "$FCF")"
 expect_eq "config apply flip: a failed stop → rc 1, no clear, sentinel unchanged" \
   "${OUT##*rc=}:$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last")" "1:0:false"
+# M20: no Traefik container at all (after `down`): a failing stop isn't a failure.
+rm -f "$STUB_DIR/dt/traefik-exists"
+OUT="$(flip "$FCF")"
+expect_eq "config apply flip: stop fails but no Traefik container exists → the flip goes on" \
+  "${OUT##*rc=}:$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last")" "0:1:true"
 rm -f "$STUB_DIR/dt/stop-fail"
 # M16: no container to start (a recreate removed it) → the trap recreates it.
 touch "$STUB_DIR/dt/rm-term" "$STUB_DIR/dt/start-fail"
@@ -2468,6 +2476,16 @@ rm -f "$STUB_DIR/dt/out-check" "$RELAXF"
 # I6: no saved point (lost, corrupt) but the CAA is already CA-only: the
 # old pin's TTL can't be known → now + 24 h, saved, with the time.
 echo '{"ttl": 600, "caa_relaxed": true}' > "$STUB_DIR/dt/out-ttl"
+MDE="$FL_ROOT/secrets/domains/main-domain.env"
+# M19: Portcullis never pinned (main-domain.env never held an account URI):
+# no old pin to wait out — no 24 h point; the public check guards the rest.
+rm -f "$MDE" "$RELAXF"
+echo '{"ttl": 0, "caa_relaxed": true}' > "$STUB_DIR/dt/out-ttl"
+T0="$(date +%s)"; wait_out true true 0
+OUT="$(flip "$FCF")"
+case "$OUT" in *"24 h"*) t_fail "never pinned: 24 h: $OUT" ;; *rc=0) t_pass "relax: never pinned (no account URI ever recorded) → no 24 h, the flip goes on" ;; *) t_fail "never pinned: $OUT" ;; esac
+echo '{"ttl": 600, "caa_relaxed": true}' > "$STUB_DIR/dt/out-ttl"
+mkdir -p "$(dirname "$MDE")"; echo "DOMAINS_MAIN_ACME_ACCOUNT_URI=https://acme-v02.api.letsencrypt.org/acme/acct/77" > "$MDE"
 for st in missing corrupt; do
   printf 'PORTCULLIS_DOMAIN=ci.example.org\nACME_STAGING=true\n' > "$FL_ROOT/.env"
   touch "$STUB_DIR/dt/keep-state"; rm -f "$RELAXF"
@@ -2532,7 +2550,7 @@ OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 
 case "$OUT" in *"DNS_CAA=yes must be true or false"*rc=1) t_pass "config apply flip: DNS_CAA must be true or false" ;; *) t_fail "flip DNS_CAA=yes: $OUT" ;; esac
 expect_eq "config apply flip: a bad DNS_CAA refuses before Traefik is stopped" "$(cat "$STUB_DIR/dt/argv" 2>/dev/null | grep -c 'stop traefik' || true)" 0
 OUT="$(flip 'export DNS_PROVIDER=gcloud')"
-expect_eq "config apply flip: no relax for a manual provider" "$(grep -c dns-tool "$STUB_DIR/dt/argv" || true)" 0
+expect_eq "config apply flip: no relax for a manual provider" "$(grep -c -e 'dns-tool apply' -e 'dns-tool ttl' "$STUB_DIR/dt/argv" || true)" 0
 # Where Portcullis doesn't manage the CAA — DNS_CAA=false, no or a manual
 # provider, an automated one without its credentials — a flip does no
 # relax, no settle, no wait and no 24 h point: stop, clear, Traefik back
@@ -2543,10 +2561,47 @@ for unmanaged in 'export DNS_CAA=false DNS_PROVIDER=cloudflare CLOUDFLARE_API_TO
   rm -f "$RELAXF"
   OUT="$(flip "$unmanaged")"
   expect_eq "config apply flip, CAA not managed ($unmanaged): no relax, no build, no settle point; cleared, new CA, done" \
-    "${OUT##*rc=}:$(grep -c -e dns-tool -e 'build domains' "$STUB_DIR/dt/argv" || true):$([ -e "$RELAXF" ] && echo saved):$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv"):$(cat "$STUB_DIR/dt/traefik-up" 2>/dev/null):$(cat "$FL_ROOT/certs/.acme-staging-last")" \
-    "0:0::1:CA=https://acme-staging-v02.api.letsencrypt.org/directory sentinel=false:true"
+    "${OUT##*rc=}:$(grep -c -e 'dns-tool apply' -e 'dns-tool ttl' -e 'build domains' "$STUB_DIR/dt/argv" || true):$(paste -sd' ' "$STUB_DIR/dt/order"):$([ -e "$RELAXF" ] && echo saved):$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv"):$(cat "$STUB_DIR/dt/traefik-up" 2>/dev/null):$(cat "$FL_ROOT/certs/.acme-staging-last")" \
+    "0:0:check::1:CA=https://acme-staging-v02.api.letsencrypt.org/directory sentinel=false:true"
   case "$OUT" in *"24 h"*|*"Relaxing"*) t_fail "unmanaged flip ($unmanaged) waits: $OUT" ;; *) t_pass "config apply flip, CAA not managed ($unmanaged): no wait message" ;; esac
 done
+expect_eq "flip: the public check asks for a NEW account (CA-only) at the NEW CA, without credentials" \
+  "$(dtin check '[.caa.account_uri, .ca_server, has("credentials")] | @json')" '["","https://acme-staging-v02.api.letsencrypt.org/directory",false]'
+# N2: a pin is live (or cached) where Portcullis can't relax it — refused
+# before anything changes, the pin named, what to do said.
+jq '.items = [{set: "caa", name: "ci.example.org", type: "CAA", want: [], live: ["0 issue \"letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/5; validationmethods=dns-01\""], status: "wrong", severity: "problem", fix: "manual", steps: []}] | .caa.would_issue = false' \
+  "$STUB_DIR/dt/out-default" > "$STUB_DIR/dt/out-check"
+for pinned in 'export DNS_PROVIDER=none' 'export DNS_CAA=false DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123' 'unset CLOUDFLARE_API_TOKEN; export DNS_PROVIDER=cloudflare'; do
+  OUT="$(flip "$pinned")"
+  case "$OUT" in *"acct/5"*"remove that pin at"*"run it again"*rc=1) t_pass "flip refused, a live pin Portcullis can't relax ($pinned)" ;; *) t_fail "flip with a live pin ($pinned): $OUT" ;; esac
+  expect_eq "flip with a live pin ($pinned): nothing changed (no stop, no clear, sentinel unchanged)" \
+    "$(grep -c -e 'stop traefik' -e 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last")" "0:false"
+done
+# A failed or unknown lookup refuses too (fail closed).
+rm -f "$STUB_DIR/dt/out-check"; printf '' > "$STUB_DIR/dt/out-check"; echo 3 > "$STUB_DIR/dt/rc-check"
+OUT="$(flip 'export DNS_PROVIDER=none')"
+case "$OUT" in *"couldn't check"*rc=1) t_pass "flip: a failed public check refuses" ;; *) t_fail "flip failed check: $OUT" ;; esac
+expect_eq "flip: a failed public check changes nothing" "$(grep -c 'stop traefik' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last")" "0:false"
+rm -f "$STUB_DIR/dt/out-check" "$STUB_DIR/dt/rc-check"
+# N2: DNS_CAA=false after a pin; `dns setup` removes it and saves a settle
+# point (from the progress line); a flip right after refuses until then,
+# managed or not.
+rm -f "$RELAXF"
+echo '{"ttl": 3600, "caa_relaxed": false}' > "$STUB_DIR/dt/out-ttl"
+SA=$(( $(date +%s) + 3660 ))
+echo "domains dns apply: written; waiting up to 15m0s for 1.1.1.1:53 (TTL 3600 s); written_at=$(date +%s) settle_at=$SA" > "$STUB_DIR/dt/err-apply"
+wait_out true true 0
+(PATH="$WORK/dtbin:$PATH" PORTCULLIS_ROOT="$FL_ROOT" bash -c ". '$WORK/dtenv.sh'; export PORTCULLIS_ROOT='$FL_ROOT'; export DNS_CAA=false DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123; dns_setup true false caa" >/dev/null 2>&1)
+expect_eq "dns setup removing a pin saves the settle point (0600)" "$(sed -n 's/^RELAX_NOT_BEFORE=//p' "$RELAXF" 2>/dev/null):$(file_mode "$RELAXF" 2>/dev/null)" "$SA:600"
+rm -f "$STUB_DIR/dt/err-apply"
+touch "$STUB_DIR/dt/keep-state"
+OUT="$(flip 'export DNS_CAA=false DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123')"
+case "$OUT" in *"after $(jq -rn --argjson t "$SA" '$t | strftime("%H:%M UTC")')"*rc=1) t_pass "flip right after dns setup removed a pin: refused until the saved point" ;; *) t_fail "flip after removal: $OUT" ;; esac
+expect_eq "flip refused by a saved point: nothing changed" "$(grep -c -e 'stop traefik' -e 'dns-tool check' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last")" "0:false"
+OUT="$(flip 'export DNS_PROVIDER=none')"
+case "$OUT" in *"after "*rc=1) t_pass "flip, unmanaged: a saved point in the future refuses too" ;; *) t_fail "unmanaged flip with a saved point: $OUT" ;; esac
+rm -f "$STUB_DIR/dt/keep-state" "$RELAXF"
+echo '{"ttl": 600}' > "$STUB_DIR/dt/out-ttl"
 rm -f "$STUB_DIR/dt/traefik-running"
 OUT="$(flip 'export DNS_PROVIDER=gcloud')"
 expect_eq "config apply: ACME_DNS_PROVIDER written" "$(grep '^ACME_DNS_PROVIDER=' "$FL_ROOT/.env")" "ACME_DNS_PROVIDER=gcloud"

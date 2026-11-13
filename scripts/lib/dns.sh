@@ -261,12 +261,26 @@ dns_setup() {
     read -rp "$q [y/N] " reply
     case "$reply" in y|Y|yes|YES) ;; *) info "Nothing changed."; return 0 ;; esac
   fi
+  # Writing the caa set over a live Portcullis pin (removing it with
+  # DNS_CAA=false, or replacing it) leaves caches holding that pin for its
+  # TTL: save a settle point every later flip honours (N2), from the
+  # tool's progress line the moment the write is accepted. Whether a pin
+  # is live is read first; unreadable counts as live.
+  local settle_hook=""
+  if [[ " $DNS_SETS " == *" caa "* ]]; then
+    local pre prc=0
+    pre="$(_dns_tool ttl 2>/dev/null)" || prc=$?
+    if [ "$prc" -ne 0 ] || [ "$(printf '%s' "$pre" | jq -r '.caa_relaxed // false' 2>/dev/null)" != true ]; then
+      settle_hook=_dns_relax_note
+    fi
+  fi
   info "Applying the record sets: $DNS_SETS (then waiting for the public resolvers: the TTL the provider stored + 1 min, at most 15 min)..."
   rc=0
-  out="$(_dns_apply_quiet --wait auto)" || rc=$?
+  out="$(DNS_ON_SETTLE="$settle_hook" _dns_apply_quiet --wait auto)" || rc=$?
+  [ "$rc" -ne 4 ] || { dns_main_refresh; fail "the records were written, but the flip's settle point couldn't be saved ($(_dns_relax_file)): don't flip ACME_STAGING before the old CAA pin's TTL has passed"; }
   # A pin written again while a flip's settle point is saved (ACME_STAGING
   # reverted mid-flip) only moves the point later (I10).
-  if { [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; } && [ -n "${DNS_ACCOUNT_URI:-}" ] && [[ " $DNS_SETS " == *" caa "* ]]; then
+  if { [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; } && [ -n "${DNS_ACCOUNT_URI:-}" ] && [[ " $DNS_SETS " == *" caa "* ]] && [ "$(_dns_flag DNS_CAA true)" = true ]; then
     _dns_relax_repin
   fi
   case "$rc" in
@@ -472,6 +486,63 @@ _dns_relax_repin() {
   return 0
 }
 
+# _dns_relax_note <unix> — a caa write over a live pin (dns setup): save
+# <unix> as the settle point, or raise the saved one to it. An unreadable
+# file is left as it is (a flip then waits 24 h). Fails when it can't be
+# written.
+_dns_relax_note() {
+  local now
+  if [ -e "$(_dns_relax_file)" ]; then
+    [ -n "$(_dns_relax_point)" ] || return 0
+    _dns_relax_raise "$1"
+    return
+  fi
+  now="$(date +%s)"
+  _dns_relax_put "$now" "$(( $1 > now + 60 ? $1 - now - 60 : 0 ))" "$1"
+}
+
+# dns_flip_guard <ca_server> [relaxed] — before any flip stops Traefik, managed CAA
+# or not (N2): a saved settle point still in the future refuses (with its
+# time), and so does a public CAA the CA wouldn't let a NEW account order
+# under at every resolver — a live (or still cached) pin. A failed lookup
+# refuses too (fail closed). Nothing has changed when it refuses.
+dns_flip_guard() {
+  local ca="$1" relaxed="${2:-}" d="${PORTCULLIS_DOMAIN:-the domain}" nb now out live why
+  now="$(date +%s)"
+  # (relaxed: dns_relax_main just settled past the saved point itself)
+  if [ -z "$relaxed" ] && [ -e "$(_dns_relax_file)" ]; then
+    nb="$(_dns_relax_point)"
+    if [ -z "$nb" ]; then
+      nb=$((now + 86400))
+      _dns_relax_put "$now" 86400 "$nb" || { warn "could not save the settle point ($(_dns_relax_file))"; return 1; }
+      warn "The saved settle point ($(_dns_relax_file)) is unreadable: how long caches may still hold an old CAA pin of $d can't be known, so the flip waits 24 h. Run it again after $(jq -rn --argjson t "$nb" '$t | strftime("%Y-%m-%d %H:%M UTC")')."
+      return 1
+    fi
+    if [ "$nb" -gt "$now" ]; then
+      warn "An old CAA pin of $d may still be cached until $(jq -rn --argjson t "$nb" '$t | strftime("%H:%M UTC")') (saved when it was replaced or removed: $(_dns_relax_file)): run it again after $(jq -rn --argjson t "$nb" '$t | strftime("%H:%M UTC")')."
+      return 1
+    fi
+  fi
+  out="$(ACME_CA_SERVER="$ca" DNS_CAA=true DNS_ACCOUNT_URI="" DNS_SETS=caa DNS_IPS_DONE=1 DNS_IPV4="${PORTCULLIS_PUBLIC_IPV4:-}" DNS_IPV6="${PORTCULLIS_PUBLIC_IPV6:-}" \
+    _dns_tool check 2>/dev/null)" || true
+  if [ -z "$out" ] || ! printf '%s' "$out" | jq -e 'type == "object" and (.caa | type == "object")' >/dev/null 2>&1; then
+    warn "couldn't check the public CAA of $d (would $ca let Traefik's new ACME account order?): nothing changed. Run it again when the public resolvers answer."
+    return 1
+  fi
+  [ "$(printf '%s' "$out" | jq -r '.caa.would_issue')" = true ] && return 0
+  live="$(printf '%s' "$out" | jq -r '[.items[] | select(.set == "caa") | (.live // [])[]] | unique | join("; ")' 2>/dev/null || true)"
+  if [ "$(_dns_flag DNS_CAA true 2>/dev/null)" != true ]; then why="DNS_CAA=false"
+  elif ! _dns_automated "${DNS_PROVIDER:-none}"; then why="DNS_PROVIDER=${DNS_PROVIDER:-none} has no automation"
+  elif ! _dns_creds_present "${DNS_PROVIDER:-none}"; then why="the ${DNS_PROVIDER} credentials aren't set in .env"
+  else why=""; fi
+  if [ -n "$why" ]; then
+    warn "The public CAA of $d wouldn't let Traefik's new ACME account order (${live:-the CAA at $d or a parent}), and Portcullis can't relax it ($why): remove that pin at ${DNS_PROVIDER:-your DNS provider} (or run ./portcullis dns setup with DNS_CAA=false and the credentials), then run it again after its TTL. Nothing changed."
+  else
+    warn "The public CAA of $d still wouldn't let Traefik's new ACME account order (${live:-the CAA at $d or a parent}): nothing changed; run it again once the resolvers show the CA-only form (./portcullis dns check)."
+  fi
+  return 1
+}
+
 # dns_relax_done — the flip finished (acme.json cleared, Traefik on the
 # new CA, sentinel written): the settle point goes. Nothing else ever
 # deletes it (I10).
@@ -521,7 +592,10 @@ dns_relax_main() {
       warn "could not read how long caches hold the CAA of $d (no TTL in the dns tool's answer): nothing changed. Set an explicit TTL at ${DNS_PROVIDER:-the provider}, then run it again."
       return 3
     fi
-    if [ "$relaxed" = true ]; then
+    # M19: main-domain.env never held an account URI = Portcullis never
+    # pinned: no old pin to wait out (the flip's public check guards a
+    # foreign one).
+    if [ "$relaxed" = true ] && [ -n "$(dns_main_env_uri)" ]; then
       # Already CA-only and no valid settle point (lost, corrupt, edited):
       # the old pin's TTL can't be known any more. Assume a day, the
       # longest resolvers commonly cache (I6).
