@@ -280,7 +280,7 @@ _proxy_ai_alias_check() {
   while read -r cid cname alias inst svc files; do
     [ -n "$cid" ] || continue
     if [ ! -e "$cache/$inst.members" ]; then
-      (cd / && docker compose -p "portcullis-$inst" ps -aq) > "$cache/$inst.members" 2>/dev/null || { rc=2; break; }
+      (cd / && env -u COMPOSE_FILE docker compose -p "portcullis-$inst" ps -aq) > "$cache/$inst.members" 2>/dev/null || { rc=2; break; }
       local st=0 vol="${COMPOSE_PROJECT_NAME:-portcullis}_hub_data"
       # Never create the volume (compose would then refuse to own it):
       # no hub_data = no override.

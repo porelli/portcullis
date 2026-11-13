@@ -390,6 +390,9 @@ _restic() {
   local -a args=(run --rm -i --user "$user" --cap-drop ALL --security-opt no-new-privileges:true
     --read-only --tmpfs /tmp -e HOME=/tmp -e RESTIC_CACHE_DIR=/cache -v "$BACKUP_ROOT/.restic-cache:/cache"
     -e RESTIC_REPOSITORY -e RESTIC_PASSWORD -e RESTIC_PROGRESS_FPS=0.2)
+  # Rootless Podman: a CLI helper bind-mounting host paths runs unlabelled
+  # (common.sh ct_run), never with z / Z on backups/.
+  if _rt_is_podman; then args+=(--security-opt label=disable); fi
   (umask 077 && mkdir -p "$BACKUP_ROOT/.restic-cache")
   case "$repo" in
     /*|local:/*)
@@ -874,7 +877,7 @@ backup_restore() {
     docker volume rm -f "$full" >/dev/null 2>&1 || true
     docker volume create --label "com.docker.compose.project=$proj" --label "com.docker.compose.volume=$key" "$full" >/dev/null
     # tar as root keeps the archived ownership; the volume root belongs to the service user.
-    docker run --rm --network none -v "$full:/data" -v "$dir:/backup:ro" "$helper" \
+    ct_run --rm --network none -v "$full:/data" -v "$dir:/backup:ro" "$helper" \
       sh -c "tar xzf '/backup/$key.tar.gz' -C /data && chown $uid:$gid /data" \
       || fail "could not restore volume $key"
   done
@@ -979,9 +982,9 @@ EOF
     ok "Wrote $out/portcullis-backup.service and portcullis-backup.timer"
     if [ "$podman" = true ]; then
       cat <<EOF
-Install (as $user, user units; linger must be on: sudo loginctl enable-linger $user):
+Install (as $user, user units; linger must be on: sudo loginctl enable-linger $(_sq "$user")):
   mkdir -p ~/.config/systemd/user
-  install -m 0644 $out/portcullis-backup.service $out/portcullis-backup.timer ~/.config/systemd/user/
+  install -m 0644 $(_sq "$out/portcullis-backup.service") $(_sq "$out/portcullis-backup.timer") ~/.config/systemd/user/
   systemctl --user daemon-reload && systemctl --user enable --now portcullis-backup.timer
   systemctl --user start portcullis-backup.service   # run once now; journalctl --user -u portcullis-backup
 EOF
@@ -989,7 +992,7 @@ EOF
     fi
     cat <<EOF
 Install (as root):
-  install -m 0644 $out/portcullis-backup.service $out/portcullis-backup.timer /etc/systemd/system/
+  install -m 0644 $(_sq "$out/portcullis-backup.service") $(_sq "$out/portcullis-backup.timer") /etc/systemd/system/
   systemctl daemon-reload && systemctl enable --now portcullis-backup.timer
   systemctl start portcullis-backup.service   # run once now; journalctl -u portcullis-backup
 EOF

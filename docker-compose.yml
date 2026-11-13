@@ -162,7 +162,7 @@ services:
     restart: unless-stopped
 
   traefik:
-    image: traefik:v3.7.17@sha256:f4bb143d1135a579b630ed491e17ec50f6f7c9c6a30585ff3d385471d2a86f5a
+    image: docker.io/library/traefik:v3.7.17@sha256:f4bb143d1135a579b630ed491e17ec50f6f7c9c6a30585ff3d385471d2a86f5a
     <<: *hardening
     # Runs as root (binds :80/:443, owns the ACME volume) but with no
     # capability except binding low ports; root without CAP_DAC_OVERRIDE
@@ -293,7 +293,7 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:18.6-alpine3.24@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
+    image: docker.io/library/postgres:18.6-alpine3.24@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
     <<: *hardening
     # The image's postgres user. /var/lib/postgresql is postgres-owned in
     # the image, so a fresh volume inherits it and the entrypoint needs no
@@ -327,7 +327,7 @@ services:
     restart: unless-stopped
 
   vault:
-    image: hashicorp/vault:2.2.1@sha256:962a92876e168d68eaaa24b0b8b49bbce1cb63024060a67bba95cd158a366fc2
+    image: docker.io/hashicorp/vault:2.2.1@sha256:962a92876e168d68eaaa24b0b8b49bbce1cb63024060a67bba95cd158a366fc2
     <<: *hardening
     # The image's vault user (uid 100, gid 1000). secrets/vault-unseal is
     # group 1000, mode 0750/0640 (./portcullis vault init|up).
@@ -370,7 +370,7 @@ services:
 
   lldap:
     # -rootless: runs as lldap (uid 1000), /data is lldap-owned in the image.
-    image: lldap/lldap:v0.6.3-alpine-rootless@sha256:ba2c50930ea998eefd5454aa678a7977448019248b1827da87d330df0b71c284
+    image: docker.io/lldap/lldap:v0.6.3-alpine-rootless@sha256:ba2c50930ea998eefd5454aa678a7977448019248b1827da87d330df0b71c284
     <<: *hardening
     read_only: true
     tmpfs:
@@ -545,7 +545,7 @@ services:
   # per oauth2-proxy limited to its own ticket keys, the default user off.
   # The config (with the users' password hashes) is generated from .env.
   sessions:
-    image: valkey/valkey:9.1.3-alpine3.24@sha256:bf09d58e96d6b4524a15396b65b242bbe18beebbcc15a04d8ee75ddac62fae0b
+    image: docker.io/valkey/valkey:9.1.3-alpine3.24@sha256:bf09d58e96d6b4524a15396b65b242bbe18beebbcc15a04d8ee75ddac62fae0b
     <<: *hardening
     # The image's valkey user; its entrypoint only drops privileges when
     # started as root, so it runs valkey-server directly.
@@ -1261,7 +1261,7 @@ services:
   # ./portcullis up). docs/monitoring.md. Config: monitoring/; generated
   # files and the Vault metrics token: secrets/monitoring/ (./portcullis up).
   prometheus:
-    image: prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
+    image: docker.io/prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
     profiles: [monitoring]
     <<: *hardening
     user: "65534:65534"
@@ -1288,7 +1288,7 @@ services:
     restart: unless-stopped
 
   alertmanager:
-    image: prom/alertmanager:v0.35.0@sha256:e638797febd034838eca8b98cdbd46f951e9bf7f178777aa8669167406a9946c
+    image: docker.io/prom/alertmanager:v0.35.0@sha256:e638797febd034838eca8b98cdbd46f951e9bf7f178777aa8669167406a9946c
     profiles: [monitoring]
     <<: *hardening
     user: "65534:65534"
@@ -1314,7 +1314,7 @@ services:
     restart: unless-stopped
 
   blackbox:
-    image: prom/blackbox-exporter:v0.29.1@sha256:ea1c7aa3ef3f307cd03e85f34abb604478ccb90b567fc690da0cd9776da76b13
+    image: docker.io/prom/blackbox-exporter:v0.29.1@sha256:ea1c7aa3ef3f307cd03e85f34abb604478ccb90b567fc690da0cd9776da76b13
     profiles: [monitoring]
     <<: *hardening
     user: "65534:65534"
@@ -1342,7 +1342,7 @@ services:
   # ./portcullis status --textfile): backup age, client-cert / CA expiry.
   # Only the textfile collector — no host metrics, no host mounts.
   textfile-exporter:
-    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    image: docker.io/prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
     profiles: [monitoring]
     <<: *hardening
     user: "65534:65534"
@@ -1365,7 +1365,7 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
+    image: docker.io/grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
     profiles: [monitoring]
     <<: *hardening
     user: "472:472"

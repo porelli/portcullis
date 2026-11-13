@@ -355,18 +355,41 @@ _owner_of_ct() {
   fi
 }
 
-# ct_hint_chown <uid:gid> <path>... — the command that fixes an owner by hand.
+# _sq <string> — the string single-quoted for a POSIX shell (each embedded
+# ' as '\''), so a pasted hint never runs anything but the command.
+_sq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+# ct_hint_chown <uid:gid> <path>... — the command that fixes an owner by
+# hand, every path single-quoted.
 ct_hint_chown() {
-  local spec="$1"
+  local spec="$1" p out=""
   shift
-  if _rt_is_podman; then echo "podman unshare chown $spec $*"; else echo "sudo chown $spec $*"; fi
+  for p in "$@"; do out+=" $(_sq "$p")"; done
+  if _rt_is_podman; then echo "podman unshare chown $spec$out"; else echo "sudo chown $spec$out"; fi
+}
+
+# ct_run <docker run args...> — `docker run` for the CLI's own short-lived
+# helper containers that bind-mount host files (restores, restic). Under
+# rootless Podman they run with `--security-opt label=disable`: on an
+# SELinux-enforcing host a confined helper can't touch checkout files, and
+# relabelling backups/ or secrets/ (z / Z) is forbidden. These are our own
+# pinned images, run on the operator's command for seconds; long-running
+# compose services never get label=disable (only the two socket proxies,
+# docker-compose.podman-selinux.yml, CI-linted). Docker: unchanged.
+ct_run() {
+  if _rt_is_podman; then
+    docker run --security-opt label=disable "$@"
+  else
+    docker run "$@"
+  fi
 }
 
 # ct_own <uid:gid> <path>... — chown the paths to these CONTAINER ids (no-op
 # for those already right). Docker: as root directly, otherwise via a
 # throwaway root container with only CAP_CHOWN and no network. Rootless
-# Podman: always the throwaway container (it runs in the user namespace, so
-# chown 10001 writes the host's subuid+10000), never chown directly.
+# Podman: `podman unshare chown` (the same user namespace as every
+# container, so 10001 writes the host's subuid+10000; no container, no bind
+# mount, nothing relabelled), never chown directly.
 ct_own() {
   local spec="$1" p i=0 podman=false todo=() mounts=() targets=()
   shift
@@ -380,7 +403,12 @@ ct_own() {
     fi
   done
   [ "${#todo[@]}" -gt 0 ] || return 0
-  if [ "$podman" = false ] && [ "$(id -u)" = 0 ]; then
+  if [ "$podman" = true ]; then
+    podman unshare chown -- "$spec" "${todo[@]}" >/dev/null \
+      || fail "could not chown ${todo[*]} to $spec (try: $(ct_hint_chown "$spec" "${todo[@]}"))"
+    return
+  fi
+  if [ "$(id -u)" = 0 ]; then
     chown "$spec" "${todo[@]}"
     return
   fi
@@ -543,6 +571,12 @@ stack_prepare() {
   # binding"): they must be files before the first `up` (Docker would make
   # directories), empty until ./portcullis pki setup writes them — an empty
   # or unreadable file means no certificate counts (fail closed).
+  # forward-auth(-ext) bind-mount certs/ca-bundle.crt: a file before the
+  # first `up` (rootless Podman + SELinux: the overlay's long-syntax binds
+  # never create a missing source), empty — trusting nothing — until
+  # config apply builds it.
+  [ ! -d "$PORTCULLIS_ROOT/certs/ca-bundle.crt" ] || fail "$PORTCULLIS_ROOT/certs/ca-bundle.crt is a directory (made by Docker before config apply): remove it (rmdir) and run again"
+  [ -f "$PORTCULLIS_ROOT/certs/ca-bundle.crt" ] || { : > "$PORTCULLIS_ROOT/certs/ca-bundle.crt"; chmod 644 "$PORTCULLIS_ROOT/certs/ca-bundle.crt"; }
   local ca
   for ca in yubikey-ca.crt browser-ca.crt; do
     [ ! -d "$PORTCULLIS_ROOT/certs/$ca" ] || fail "$PORTCULLIS_ROOT/certs/$ca is a directory (made by Docker before pki setup): remove it (rmdir) and run again"

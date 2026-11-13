@@ -222,6 +222,21 @@ expect_eq "selinux_bad_sources catches ., ./secrets, ./backups, ./.env and a par
   "$(selinux_bad_sources "$WORK/bad-overlay.yml" | paste -sd' ' -)" ". ./secrets ./backups ./.env .."
 expect_eq "the SELinux overlay: the Hub's /project root is a tmpfs, not the checkout" \
   "$(grep -c '{type: tmpfs, target: /project,' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml"):$(grep -cE 'source: \.[,}]|source: \./?, ' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" "1:0"
+# Fully qualified base images (rootless Podman: podman build never relies
+# on registries.conf short names): tests/lint_images.sh, also in CI.
+expect_eq "every Dockerfile FROM and compose image: is fully qualified" "$("$HERE/lint_images.sh" 2>&1; echo "rc=$?")" "rc=0"
+mkdir -p "$WORK/lint/tests" "$WORK/lint/svc"
+cp "$HERE/lint_images.sh" "$WORK/lint/tests/"
+printf 'FROM alpine:3.24@sha256:00 AS build\nFROM build\nFROM docker.io/library/alpine:3.24@sha256:00\nFROM golang:1@sha256:00\n' > "$WORK/lint/svc/Dockerfile"
+printf 'services:\n  a:\n    image: traefik/whoami:v1@sha256:00\n  b:\n    image: docker.io/library/nginx:1@sha256:00\n  c:\n    image: portcullis-domains\n  d:\n    image: ${HUB_IMAGE:-ghcr.io/x/y:edge}\n  e:\n    image: quay.io/x/y:1\n  f:\n    image: postgres:18@sha256:00\n' > "$WORK/lint/docker-compose.yml"
+expect_eq "lint_images.sh flags alpine / golang FROMs and traefik/whoami / postgres images (a stage, docker.io/…, portcullis-*, \${VAR}, quay.io pass)" \
+  "$("$WORK/lint/tests/lint_images.sh"; echo "rc=$?")" "svc/Dockerfile:1: alpine:3.24@sha256:00
+svc/Dockerfile:4: golang:1@sha256:00
+docker-compose.yml:3: traefik/whoami:v1@sha256:00
+docker-compose.yml:13: postgres:18@sha256:00
+rc=1"
+expect_eq "the SELinux overlay adds only label=disable to security_opt (compose appends: a repeated no-new-privileges is a duplicate newer compose refuses)" \
+  "$(grep -v '^[[:space:]]*#' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml" | grep -c 'no-new-privileges'):$(grep -c '^    security_opt: \["label=disable"\]$' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" "0:2"
 expect_eq "the SELinux overlay never names the engine socket" "$(grep -c 'docker.sock\|ENGINE_SOCKET' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" 0
 expect_eq "no ct_own \"\$(id -u)… in the CLI (ct_operator_id)" "$(grep -rnF 'ct_own "$(id -u)' "$HERE/../scripts/lib" "$HERE/../portcullis" || true)" ""
 case "$(printf '%s\n' '  jq -n --arg p "$(cat "$f")" x' '  jq --arg pass "$LLDAP_ADMIN_PASSWORD"' | grep -cE -e "$ARGV_RE")" in

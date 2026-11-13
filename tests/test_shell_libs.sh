@@ -2437,6 +2437,10 @@ OUT="$(rt "CONTAINER_RUNTIME=docker PORTCULLIS_ENGINE_SOCKET='$WORK/rt' runtime_
 case "$OUT" in *"is not a socket"*"rc=1") t_pass "runtime_check: docker with a PORTCULLIS_ENGINE_SOCKET that isn't a socket → fails" ;; *) t_fail "runtime_check docker socket: $OUT" ;; esac
 OUT="$(rt "CONTAINER_RUNTIME=podman DOCKER_HOST=tcp://elsewhere:2375 PORTCULLIS_ENGINE_SOCKET='$RT_PSOCK' runtime_check")"
 case "$OUT" in *"DOCKER_HOST=tcp://elsewhere:2375"*"unset DOCKER_HOST"*"rc=1") t_pass "runtime_export: podman refuses another DOCKER_HOST" ;; *) t_fail "runtime_export DOCKER_HOST: $OUT" ;; esac
+OUT="$(rt "CONTAINER_RUNTIME=docker PORTCULLIS_ENGINE_SOCKET='$RT_PSOCK' STUB_PODMAN_SOCK_ENGINE='Podman Engine' runtime_check")"
+case "$OUT" in *"CONTAINER_RUNTIME=docker but PORTCULLIS_ENGINE_SOCKET=$RT_PSOCK is Podman Engine"*"rc=1") t_pass "runtime_check: docker with a PORTCULLIS_ENGINE_SOCKET that is a Podman socket → fails" ;; *) t_fail "runtime_check docker/podman socket: $OUT" ;; esac
+expect_eq "runtime_check: docker with a PORTCULLIS_ENGINE_SOCKET whose engine is Docker → ok" \
+  "$(rt "CONTAINER_RUNTIME=docker PORTCULLIS_ENGINE_SOCKET='$WORK/rt/docker.sock' runtime_check")" "rc=0"
 expect_eq "runtime_podman_socket falls back to /run/user/<uid>" "$(rt 'unset XDG_RUNTIME_DIR; runtime_podman_socket')" "/run/user/$RT_UID/podman/podman.sock
 rc=0"
 
@@ -2614,22 +2618,31 @@ unmapped
 rc=0"
 expect_eq "_owner_of_ct: docker → the host ids" "$(rt "CONTAINER_RUNTIME=docker; $OWN_STAT; _owner_of_ct /x/hub")" "110000:110000
 rc=0"
-expect_eq "ct_hint_chown: sudo chown (docker), podman unshare chown (podman)" \
-  "$(CONTAINER_RUNTIME=docker ct_hint_chown 1000:10001 /a /b)|$(CONTAINER_RUNTIME=podman ct_hint_chown 0:10001 /a)" "sudo chown 1000:10001 /a /b|podman unshare chown 0:10001 /a"
+expect_eq "ct_hint_chown: sudo chown (docker), podman unshare chown (podman), every path single-quoted" \
+  "$(CONTAINER_RUNTIME=docker ct_hint_chown 1000:10001 /a /b)|$(CONTAINER_RUNTIME=podman ct_hint_chown 0:10001 /a)" "sudo chown 1000:10001 '/a' '/b'|podman unshare chown 0:10001 '/a'"
+# shellcheck disable=SC2016  # $(id) is the literal path under test
+HINT_PATH='/srv/my dir/it'"'"'s $(id)'
+HINT="$(CONTAINER_RUNTIME=docker ct_hint_chown 0:0 "$HINT_PATH")"
+# shellcheck disable=SC2016
+expect_eq "ct_hint_chown: a path with a space, a ' and \$(id) is one quoted word" "$HINT" "sudo chown 0:0 '/srv/my dir/it'\''s \$(id)'"
+mkdir -p "$WORK/rt/hint"
+expect_eq "ct_hint_chown: the hint, run by a shell, sees exactly that path (nothing runs)" \
+  "$(cd "$WORK/rt/hint" && sudo() { shift; printf '%s\n' "$@"; }; eval "${HINT}" | tail -n1)" "$HINT_PATH"
 
 OWN_F="$WORK/rt/own"; mkdir -p "$OWN_F"; : > "$OWN_F/op"; : > "$OWN_F/hub"
 OWN_STAT2="stat() { case \"\${*: -1}\" in */hub) echo 110000:110000 ;; *) echo $RT_UID:$RT_GID ;; esac; }"
 OUT="$(rt "CONTAINER_RUNTIME=podman; export STUB_UID_MAP='0 0 1\n1 100000 65536\n'; $OWN_STAT2; id() { if [ \"\$1\" = -u ]; then echo 0; else command id \"\$@\"; fi; }; chown() { echo direct-chown >> \"\$STUB_DIR/rt-calls\"; }
-  ct_own 0:10001 '$OWN_F/op' '$OWN_F/hub'; grep -c 'run --rm --network none --user 0:0 --cap-drop ALL --cap-add CHOWN.* chown 0:10001 /t/0 /t/1$' \"\$STUB_DIR/rt-calls\"; grep -c direct-chown \"\$STUB_DIR/rt-calls\"; true")"
-expect_eq "ct_own on podman always runs the helper (never chown directly, even as uid 0)" "$OUT" "1
+  getenforce() { echo Enforcing; }
+  ct_own 0:10001 '$OWN_F/op' '$OWN_F/hub'; grep -cx 'unshare chown -- 0:10001 $OWN_F/op $OWN_F/hub' \"\$STUB_DIR/podman-calls\"; cat \"\$STUB_DIR/rt-calls\" 2>/dev/null | grep -c 'direct-chown\|^run '; true")"
+expect_eq "ct_own on podman (SELinux enforcing) runs podman unshare chown: no helper container, no bind mount, never chown directly (even as uid 0)" "$OUT" "1
 0
 rc=0"
 OUT="$(rt "CONTAINER_RUNTIME=podman; $OWN_STAT2; ct_own 10001:10001 '$OWN_F/hub'; ct_own 0:0 '$OWN_F/op'; test ! -e \"\$STUB_DIR/rt-calls\" && echo none")"
 expect_eq "ct_own on podman is a no-op when _owner_of_ct matches" "$OUT" "none
 rc=0"
-OUT="$(rt "CONTAINER_RUNTIME=podman; $OWN_STAT2; docker() { return 1; }; ct_own 10001:10001 '$OWN_F/op'")"
-case "$OUT" in *"try: podman unshare chown 10001:10001 $OWN_F/op"*"rc=1") t_pass "ct_own on podman: the failure hint is podman unshare chown" ;; *) t_fail "ct_own podman hint: $OUT" ;; esac
-OUT="$(rt "CONTAINER_RUNTIME=podman; $OWN_STAT2; ct_group_read 10002 '$OWN_F/hub'; grep -c 'chown 0:10002 /t/0$' \"\$STUB_DIR/rt-calls\"; true")"
+OUT="$(rt "CONTAINER_RUNTIME=podman; $OWN_STAT2; podman() { case \"\$1 \$2\" in 'unshare chown') return 1 ;; esac; command podman \"\$@\"; }; ct_own 10001:10001 '$OWN_F/op'")"
+case "$OUT" in *"try: podman unshare chown 10001:10001 '$OWN_F/op'"*"rc=1") t_pass "ct_own on podman: the failure hint is podman unshare chown" ;; *) t_fail "ct_own podman hint: $OUT" ;; esac
+OUT="$(rt "CONTAINER_RUNTIME=podman; $OWN_STAT2; ct_group_read 10002 '$OWN_F/hub'; grep -cx 'unshare chown -- 0:10002 $OWN_F/hub' \"\$STUB_DIR/podman-calls\"; true")"
 expect_eq "ct_group_read on podman passes 0:<gid>" "$OUT" "1
 rc=0"
 OUT="$(rt "CONTAINER_RUNTIME=docker; ct_group_read 10002 '$OWN_F/op'; grep -c 'chown $RT_UID:10002 /t/0$' \"\$STUB_DIR/rt-calls\"; true")"
@@ -2642,8 +2655,20 @@ case "$OUT" in *"is not writable"*"Fix: podman unshare chown -R 0:0 \"$WORK/rt/s
 # restic as container root = the operator, without capabilities.
 OUT="$(rt "CONTAINER_RUNTIME=podman BACKUP_REPOSITORY='$WORK/rt/repo' BACKUP_ROOT='$WORK/rt/bk' BACKUP_PASSWORD=x; _restic snapshots >/dev/null 2>&1; grep -E '^run ' \"\$STUB_DIR/rt-calls\"")"
 case "$OUT" in "run --rm -i --user 0:0 --cap-drop ALL "*) t_pass "_restic on podman runs --user 0:0 --cap-drop ALL" ;; *) t_fail "_restic podman: $OUT" ;; esac
+case "$OUT" in *" --security-opt label=disable "*) t_pass "_restic on podman: label=disable (a CLI helper bind-mounting backups/)" ;; *) t_fail "_restic podman label: $OUT" ;; esac
+case "$OUT" in *:[zZ]" "*|*:[zZ]|*,[zZ]" "*|*"ro,z"*|*"ro,Z"*|*:z,*|*:Z,*) t_fail "_restic on podman relabels a bind: $OUT" ;; *) t_pass "_restic on podman: no :z / :Z on its binds" ;; esac
 OUT="$(rt "CONTAINER_RUNTIME=docker BACKUP_REPOSITORY='$WORK/rt/repo' BACKUP_ROOT='$WORK/rt/bk' BACKUP_PASSWORD=x; _restic snapshots >/dev/null 2>&1; grep -E '^run ' \"\$STUB_DIR/rt-calls\"")"
 case "$OUT" in "run --rm -i --user $RT_UID:$RT_GID --cap-drop ALL "*) t_pass "_restic on docker runs as the operator (unchanged)" ;; *) t_fail "_restic docker: $OUT" ;; esac
+case "$OUT" in *label=disable*) t_fail "_restic on docker carries label=disable: $OUT" ;; *) t_pass "_restic on docker: no label option (unchanged)" ;; esac
+expect_eq "ct_run on podman: --security-opt label=disable, the binds as given (no :z / :Z)" \
+  "$(rt "CONTAINER_RUNTIME=podman; ct_run --rm --network none -v '$WORK/rt/bk:/backup:ro' alpine true; cat \"\$STUB_DIR/rt-calls\"")" "run --security-opt label=disable --rm --network none -v $WORK/rt/bk:/backup:ro alpine true
+rc=0"
+expect_eq "ct_run on docker: plain docker run (unchanged)" \
+  "$(rt "CONTAINER_RUNTIME=docker; ct_run --rm --network none -v '$WORK/rt/bk:/backup:ro' alpine true; cat \"\$STUB_DIR/rt-calls\"")" "run --rm --network none -v $WORK/rt/bk:/backup:ro alpine true
+rc=0"
+expect_eq "every CLI helper that bind-mounts a host path goes through ct_run / ct_own / _restic (no bare docker run with a host bind)" \
+  "$(grep -nE 'docker run .*(-v "\$(dir|path|BACKUP_ROOT|PORTCULLIS_ROOT)|--mount "type=bind)' "$HERE"/../scripts/lib/*.sh | grep -v 'scripts/lib/common.sh:.*mounts+=' || true)" ""
+expect_eq "no CLI bind ever relabels (:z / :Z / selinux)" "$(grep -nE '(-v|--volume) "[^"]*:[zZ](,|")|,[zZ]"|selinux=' "$HERE"/../scripts/lib/*.sh || true)" ""
 OUT="$(rt "CONTAINER_RUNTIME=podman; backup_schedule_systemd '*-*-* 03:15:00' ''")"
 case "$OUT" in *"After=network-online.target podman.socket"*"Requires=podman.socket"*"WantedBy=default.target"*) t_pass "backup schedule --systemd on podman writes user units (Requires=podman.socket, WantedBy=default.target)" ;; *) t_fail "schedule podman: $OUT" ;; esac
 case "$OUT" in *"User="*|*"docker.service"*) t_fail "backup schedule on podman: no User=, no docker.service" ;; *) t_pass "backup schedule on podman: no User=, no docker.service" ;; esac
@@ -2651,6 +2676,38 @@ OUT="$(rt "CONTAINER_RUNTIME=podman; backup_schedule_systemd 'Sun 04:00' '$WORK/
 case "$OUT" in *"~/.config/systemd/user"*"systemctl --user daemon-reload"*"systemctl --user enable --now portcullis-backup.timer"*) t_pass "backup schedule --output on podman: user-unit install commands" ;; *) t_fail "schedule podman output: $OUT" ;; esac
 OUT="$(rt "CONTAINER_RUNTIME=docker; backup_schedule_systemd '*-*-* 03:15:00' ''")"
 case "$OUT" in *"Requires=docker.service"*"User=$(id -un)"*"WantedBy=timers.target"*) t_pass "backup schedule on docker: system units (unchanged)" ;; *) t_fail "schedule docker: $OUT" ;; esac
+
+# Every bind source of the SELinux overlay exists before `up`: in git, or
+# made by stack_prepare (the overlay's long-syntax binds never create a
+# missing source). A real stack_prepare in a fresh root, docker stubbed.
+SPX="$WORK/spx-root"; mkdir -p "$SPX" "$WORK/spxbin"
+{ printf '#!/usr/bin/env bash\n'; cat "$WORK/stub-version"; cat <<'STUB'
+case "$*" in
+  *" keygen") printf '# created: x\n# public key: age1qqqq\nAGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ\n' ;;
+esac
+exit 0
+STUB
+} > "$WORK/spxbin/docker"
+chmod +x "$WORK/spxbin/docker"
+SPX_OUT="$(PATH="$WORK/spxbin:$PATH" PORTCULLIS_ROOT="$SPX" bash -c '
+  set -euo pipefail
+  for l in common network vault pki certs keycloak users domains mcpgate sessions dns config status monitoring backup signin stack; do
+    # shellcheck disable=SC1090
+    . "$1/scripts/lib/$l.sh"
+  done
+  export CONTAINER_RUNTIME=docker PORTCULLIS_PUBLIC_IPV4=203.0.113.9 PORTCULLIS_PUBLIC_IPV6= \
+    FORWARD_AUTH_REDIS_PASSWORD=a FORWARD_AUTH_EXT_REDIS_PASSWORD=b PORTCULLIS_DOMAIN=ci.example.org
+  stack_prepare' _ "$HERE/.." 2>&1)"; SPX_RC=$?
+expect_eq "stack_prepare in a fresh root (docker stubbed) succeeds" "$SPX_RC" 0
+[ "$SPX_RC" = 0 ] || printf '%s\n' "$SPX_OUT" | tail -n 5
+SPX_MISSING=""
+while IFS= read -r src; do
+  src="${src#./}"
+  if [ -n "$(git -C "$HERE/.." ls-files -- "$src" | head -n1)" ] || [ -e "$SPX/$src" ]; then continue; fi
+  SPX_MISSING="$SPX_MISSING $src"
+done < <(sed -n 's/.*type: bind, source: *\([^,}]*\).*/\1/p' "$HERE/../docker-compose.podman-selinux.yml" | sort -u)
+expect_eq "every SELinux-overlay bind source is in git or made by stack_prepare" "$SPX_MISSING" ""
+expect_eq "the overlay has bind sources to check" "$(grep -c 'type: bind, source:' "$HERE/../docker-compose.podman-selinux.yml" | awk '{print ($1 >= 45)}')" 1
 
 echo ""
 echo "$PASS passed, $FAIL failed"

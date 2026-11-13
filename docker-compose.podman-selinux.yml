@@ -20,7 +20,14 @@
 #   bound into it; its other /project paths are their own mounts
 #   (templates/, appfiles/, .env = secrets/hub/core.env).
 # - The two socket proxies get `label=disable`: container_t can't connectto
-#   the operator's Podman socket. No other service gets it (CI checks both).
+#   the operator's Podman socket. No other compose service gets it (CI checks
+#   both). This rule is for long-running services: the CLI's own short-lived
+#   helpers that bind-mount host files (scripts/lib/common.sh ct_run, restic)
+#   run with label=disable under Podman instead of relabelling backups/ or
+#   secrets/, and ct_own uses `podman unshare chown` (no container).
+#   security_opt lists: compose appends the overlay's items to the base's, so
+#   only `label=disable` is listed here (repeating no-new-privileges:true is a
+#   duplicate item newer compose refuses).
 #
 # Keep in sync with docker-compose.yml: CI fails when a project bind there
 # has no entry here (or a different read_only / label rule), when a label
@@ -29,10 +36,10 @@
 
 services:
   socket-proxy-traefik:
-    security_opt: ["no-new-privileges:true", "label=disable"]
+    security_opt: ["label=disable"]
 
   socket-proxy-hub:
-    security_opt: ["no-new-privileges:true", "label=disable"]
+    security_opt: ["label=disable"]
 
   traefik:
     volumes:

@@ -1,5 +1,5 @@
 # python:3.15.2-alpine3.24
-FROM python:3.15.2-alpine3.24@sha256:20a82dbc2783112ddb91d1534603f802d222a3e63e593cd002eb2ac534e70211
+FROM docker.io/library/python:3.15.2-alpine3.24@sha256:20a82dbc2783112ddb91d1534603f802d222a3e63e593cd002eb2ac534e70211
 # Wheels only (no compiler in the image), every file checked against its hash.
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir --root-user-action=ignore --disable-pip-version-check \

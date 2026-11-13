@@ -268,6 +268,8 @@ jobs:
           # Hub's `.:/project` becomes a tmpfs with group-gate's map bound in;
           # nothing outside the checkout relabelled (never the engine socket);
           # no service the base lacks; label=disable on the two proxies only
+          # (compose services; the CLI's short-lived helpers — ct_run, restic —
+          # run label=disable under Podman instead of relabelling host files)
           # (each keeping no-new-privileges); the base itself relabels nothing.
           OV_ALL="$(docker compose -f docker-compose.yml -f docker-compose.podman-selinux.yml --profile '*' config --format json)"
           binds() {  # <config json> — "service target read_only selinux" of every project bind
@@ -553,7 +555,7 @@ jobs:
           echo "$CFG" | jq -e '.services.sessions as $s | .services["forward-auth"] as $m | .services["forward-auth-ext"] as $x
               | def members($n): [.services | to_entries[] | select((.value.networks // {}) | has($n)) | .key] | sort;
               def mounts($src): [.services | to_entries[] | select([.value.volumes[]? | .source // "" | select(test($src))] | length > 0) | .key] | sort;
-              ($s.image | test("^valkey/valkey:[0-9]+\\.[0-9]+\\.[0-9]+(-alpine[0-9.]*)?@sha256:[0-9a-f]{64}$"))
+              ($s.image | test("^docker.io/valkey/valkey:[0-9]+\\.[0-9]+\\.[0-9]+(-alpine[0-9.]*)?@sha256:[0-9a-f]{64}$"))
               and $s.user == "999:1000" and $s.read_only == true
               and $s.cap_drop == ["ALL"] and ($s.security_opt | index("no-new-privileges:true")) != null
               and $s.mem_limit != null and $s.pids_limit != null
@@ -655,9 +657,15 @@ jobs:
             if grep -E '^FROM ' "$df" | grep -v '@sha256:'; then echo "UNPINNED base image in $df"; bad=1; fi
           done
           # One Go builder (tag and digest) for every locally built Go service.
-          if [ "$(grep -hE '^FROM golang:' enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile | awk '{print $2}' | sort -u | wc -l | tr -d ' ')" != 1 ]; then
-            echo "The Go Dockerfiles pin different golang builders:"; grep -nE '^FROM golang:' enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile; bad=1
+          if [ "$(grep -hE '^FROM docker.io/library/golang:' enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile | awk '{print $2}' | sort -u | wc -l | tr -d ' ')" != 1 ]; then
+            echo "The Go Dockerfiles pin different golang builders:"; grep -nE '^FROM docker.io/library/golang:' enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile; bad=1
           fi
+          # Fully qualified registry names (docker.io/library/…, docker.io/<org>/…):
+          # podman build / pull never depend on registries.conf short-name
+          # resolution (rootless Podman). Local images (portcullis-*) and the
+          # HUB_IMAGE / KEYCLOAK_IMAGE defaults are exempt.
+          UNQ="$(tests/lint_images.sh)" || true
+          [ -z "$UNQ" ] || { echo "UNQUALIFIED image names (use docker.io/library/… or <registry>/…):"; echo "$UNQ"; bad=1; }
           # group-gate's Python deps: exact pins with hashes, installed with --require-hashes.
           grep -q -- '--require-hashes' group-gate/Dockerfile || { echo "group-gate/Dockerfile installs without --require-hashes"; bad=1; }
           if grep -vE '^\s*(#|$|--hash=sha256:[0-9a-f]{64})' group-gate/requirements.txt | grep -vE '^[A-Za-z0-9._-]+==[^ ]+( ;.*)? \\$'; then
@@ -5973,9 +5981,6 @@ jobs:
           for i in $(seq 1 30); do [ -S "$XDG_RUNTIME_DIR/bus" ] && break; [ "$i" -eq 30 ] && { echo "FAIL: no user manager for $me"; exit 1; }; sleep 1; done
           export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
           { echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"; echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"; } >> "$GITHUB_ENV"
-          # The local images' Dockerfiles use Docker Hub short names.
-          mkdir -p ~/.config/containers
-          printf 'unqualified-search-registries = ["docker.io"]\nshort-name-mode = "permissive"\n' > ~/.config/containers/registries.conf
           podman system migrate
           systemctl --user enable --now podman.socket podman-restart.service
           DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock"
@@ -6019,6 +6024,25 @@ jobs:
           status_wait 240
           jq -c '.runtime' /tmp/status.json | tee -a "$GITHUB_STEP_SUMMARY"
           echo "PASS: init --runtime podman; status clean (runtime podman, ports ≥ $(jq .runtime.port_start /tmp/status.json))"
+
+      - name: Every SELinux-overlay bind source exists after a full up (monitoring profile)
+        timeout-minutes: 15
+        run: |
+          set -o pipefail
+          # The overlay's long-syntax binds never create a missing source
+          # (rootless Podman + SELinux): after a full `up` with every profile
+          # this job can start, each must exist (also checked statically
+          # against stack_prepare in tests/test_shell_libs.sh).
+          COMPOSE_PROFILES=monitoring ./portcullis up
+          missing=""
+          while IFS= read -r src; do
+            [ -e "$src" ] || missing="$missing $src"
+          done < <(docker compose -f docker-compose.yml -f docker-compose.podman-selinux.yml --profile '*' config --format json \
+                     | jq -r '[.services[].volumes[]? | select(.type == "bind" and .bind.selinux != null) | .source] | unique[]')
+          [ -z "$missing" ] || { echo "FAIL: overlay bind sources missing after up:$missing"; exit 1; }
+          echo "PASS: every SELinux-overlay bind source exists after a full up with the monitoring profile"
+          # Back to the default profile for the rest of the job.
+          COMPOSE_PROFILES=monitoring docker compose rm -sf prometheus alertmanager blackbox textfile-exporter grafana
 
       - name: Pinned networks, addresses and limits
         run: |

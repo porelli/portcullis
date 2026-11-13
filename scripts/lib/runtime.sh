@@ -164,8 +164,12 @@ runtime_check() {
     [ -n "${PORTCULLIS_ENGINE_SOCKET:-}" ] || fail "PORTCULLIS_ENGINE_SOCKET is not set in .env (./portcullis init writes $sock)"
     [ "$PORTCULLIS_ENGINE_SOCKET" = "$sock" ] || fail "PORTCULLIS_ENGINE_SOCKET=$PORTCULLIS_ENGINE_SOCKET, but the rootless Podman socket is $sock"
     [ -S "$PORTCULLIS_ENGINE_SOCKET" ] || fail "PORTCULLIS_ENGINE_SOCKET=$PORTCULLIS_ENGINE_SOCKET is not a socket (systemctl --user enable --now podman.socket)"
-  elif [ -n "${PORTCULLIS_ENGINE_SOCKET:-}" ] && [ ! -S "$PORTCULLIS_ENGINE_SOCKET" ]; then
-    fail "PORTCULLIS_ENGINE_SOCKET=$PORTCULLIS_ENGINE_SOCKET is not a socket"
+  elif [ -n "${PORTCULLIS_ENGINE_SOCKET:-}" ]; then
+    # Docker with a set socket: the proxies mount it, so it must be the
+    # same kind of engine the CLI verified (never, e.g., a Podman socket).
+    [ -S "$PORTCULLIS_ENGINE_SOCKET" ] || fail "PORTCULLIS_ENGINE_SOCKET=$PORTCULLIS_ENGINE_SOCKET is not a socket"
+    _rt_engine_probe "unix://$PORTCULLIS_ENGINE_SOCKET" || fail "PORTCULLIS_ENGINE_SOCKET=$PORTCULLIS_ENGINE_SOCKET doesn't answer"
+    [ "$_RT_ENGINE" = docker ] || fail "CONTAINER_RUNTIME=docker but PORTCULLIS_ENGINE_SOCKET=$PORTCULLIS_ENGINE_SOCKET is $(_rt_engine_label "$_RT_ENGINE")"
   fi
   _RT_CHECKED=1
 }
@@ -278,7 +282,7 @@ runtime_host_checks() {
   if [ "$lin" = yes ]; then
     _rt_chk ok "linger enabled for $user"
   else
-    _rt_chk fail "linger is off for $user: healthchecks and the start at boot need it (sudo loginctl enable-linger $user)"
+    _rt_chk fail "linger is off for $user: healthchecks and the start at boot need it (sudo loginctl enable-linger $(_sq "$user"))"
   fi
   for u in podman.socket podman-restart.service; do
     st="$(systemctl --user is-enabled "$u" 2>/dev/null || true)"
