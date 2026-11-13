@@ -457,7 +457,8 @@ func addressItems(ctx context.Context, in Input, d string, fix Fix, cnameAt func
 			// "wrong" just because the service doesn't know it.
 			if !s.IPv4.IsValid() {
 				it.Want = []string{}
-				it.Status, it.Severity, it.Fix = StatusUnknown, SevWarning, FixNone
+				// Info, not Warning: nothing failed (never a failed lookup).
+				it.Status, it.Severity, it.Fix = StatusUnknown, SevInfo, FixNone
 				it.Steps = []string{"the server's public addresses are unknown (./portcullis up detects them once a domain is enrolled, or set PORTCULLIS_PUBLIC_IPV4 / _IPV6 in .env)"}
 				out = append(out, it)
 				continue
@@ -789,6 +790,8 @@ func dnssecInfo(ctx context.Context, in Input, d string) DNSSECInfo {
 		if r.Err != "" {
 			info.Steps = append(info.Steps, r.Err)
 		}
+	case dnssec.Insecure:
+		info.Steps = []string{"The zone is signed and its DS matches, but the resolvers don't validate the parent zone above it, so the chain can't be checked (nothing to fix in this zone): " + r.Err}
 	case dnssec.Unknown:
 		info.Steps = []string{"DNSSEC lookups failed (retry): " + r.Err}
 	}

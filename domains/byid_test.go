@@ -295,3 +295,54 @@ func TestHetznerAPIDeletesByID(t *testing.T) {
 		t.Fatal("no error without the zone")
 	}
 }
+
+// TestChallengeCleanupPorkbun (re-review 2): porkbun raises a TTL under
+// 600 s on append, so the DNS-01 cleanup must not match on the TTL it
+// asked for (60 s): the challenge TXT goes, the other one stays.
+func TestChallengeCleanupPorkbun(t *testing.T) {
+	for _, mode := range deleteModes() {
+		t.Run(mode, func(t *testing.T) {
+			z := fakedns.NewZone()
+			p := modeProvider(z, mode)
+			s := &Service{findZone: func(string) (string, error) { return bzone, nil }}
+			c := &challengeProvider{s: s, p: p}
+			if err := c.Present(bname, "tok", "key-a"); err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Present(bname, "tok", "key-b"); err != nil {
+				t.Fatal(err)
+			}
+			n := "_acme-challenge." + bname
+			if got := len(sortedRRs(z, n, "TXT")); got != 2 {
+				t.Fatalf("%d challenge TXT after Present", got)
+			}
+			if err := c.CleanUp(bname, "tok", "key-a"); err != nil {
+				t.Fatal(err)
+			}
+			if got := sortedRRs(z, n, "TXT"); len(got) != 1 {
+				t.Fatalf("challenge TXT after one CleanUp %v", got)
+			}
+		})
+	}
+}
+
+// TestHetznerAPIZoneNameChecked (re-review 4): a zone answer for another
+// name is refused.
+func TestHetznerAPIZoneNameChecked(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/zones":
+			io.WriteString(w, `{"zones":[{"id":"z1","name":"other.net"}]}`)
+		case "/records":
+			io.WriteString(w, `{"records":[{"id":"a","type":"TXT","name":"portcullis","value":"x","ttl":60}]}`)
+		default:
+			io.WriteString(w, `{}`)
+		}
+	}))
+	defer srv.Close()
+	api := newHetznerAPI("tok-cccccccc")
+	api.base = srv.URL
+	if _, err := api.listIDs(context.Background(), bzone); err == nil || !strings.Contains(err.Error(), "other.net") {
+		t.Fatalf("err %v", err)
+	}
+}

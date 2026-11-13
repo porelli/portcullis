@@ -2251,13 +2251,18 @@ LINES="$(dt "_st_dns_lines \"\$(_st_dns_json \"\$(cat '$DNSR')\" https://acme/ac
 case "$LINES" in *"! ci.example.org: the domains service doesn't know Traefik's ACME account yet"*) t_pass "status: missing main-domain.env warns" ;; *) t_fail "status missing env: $LINES" ;; esac
 case "$LINES" in *"CAA allows another ACME account"*|*"team-b.test: the domains service doesn't know"*) t_fail "status missing env: lost / per-domain line: $LINES" ;; *) t_pass "status: missing main-domain.env — no lost-account line, main domain only" ;; esac
 # I1: address items unknown (no server addresses) = a warning line, not ✗.
-jq '.main.items = [.main.items[] | if .set == "address" and .status == "ok" then .status = "unknown" | .severity = "warning" | .want = [] else . end]
-    + [{set: "address", name: "ci.example.org", type: "AAAA", want: [], live: ["2001:db8::10"], status: "unknown", severity: "warning", fix: "none", steps: []}]' "$DNSR" > "$WORK/dns-report-unknown.json"
+jq '.main.items = [.main.items[] | if .set == "address" and .status == "ok" then .status = "unknown" | .severity = "info" | .want = [] else . end]
+    + [{set: "address", name: "ci.example.org", type: "AAAA", want: [], live: ["2001:db8::10"], status: "unknown", severity: "info", fix: "none", steps: []}]' "$DNSR" > "$WORK/dns-report-unknown.json"
 SD="$(dt "_st_dns_json \"\$(cat '$WORK/dns-report-unknown.json')\" https://acme/acct/1 https://acme/acct/1")"
 expect_eq "status: unknown addresses — address_ok false, address_unknown true, no problem" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.main | [.address_ok, .address_unknown, .problems]')" '[false,true,0]'
 LINES="$(dt "_st_dns_lines \"\$(_st_dns_json \"\$(cat '$WORK/dns-report-unknown.json')\" https://acme/acct/1 https://acme/acct/1)\"")"
 case "$LINES" in *"! ci.example.org: A/AAAA can't be checked"*) t_pass "status: unknown addresses warn" ;; *) t_fail "status unknown addresses: $LINES" ;; esac
 case "$LINES" in *"ci.example.org: A/AAAA records wrong"*) t_fail "status unknown addresses: a ✗ line: $LINES" ;; *) t_pass "status: unknown addresses — no ✗ line" ;; esac
+# insecure (a signed zone under an unvalidated parent): no problem, dnssec check 1, a ✓ line.
+SD="$(dt "_st_dns_json \"\$(jq '.main.dnssec.state = \"insecure\"' '$DNSR')\" https://acme/acct/1 https://acme/acct/1")"
+expect_eq "status: dnssec insecure is no problem (check 1)" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.main | [.problems, .checks.dnssec]')" '[0,1]'
+LINES="$(dt "_st_dns_lines \"\$(_st_dns_json \"\$(jq '.main.dnssec.state = \"insecure\"' '$DNSR')\" https://acme/acct/1 https://acme/acct/1)\"")"
+case "$LINES" in *"✓ ci.example.org: DNSSEC signed, under a parent zone that isn't validated"*) t_pass "status: dnssec insecure is a ✓ line" ;; *) t_fail "status insecure: $LINES" ;; esac
 LINES="$(dt '_st_dns_lines ""')"
 case "$LINES" in *"DNS checks unavailable"*) t_pass "status: DNS checks unavailable without the report" ;; *) t_fail "status unavailable: $LINES" ;; esac
 expect_eq "status: no report = no dns block" "$(dt '_st_dns_json "" "" ""')" "rc=0"

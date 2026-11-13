@@ -45,7 +45,7 @@ _st_dns_json() {
       checks: {
         address: (if [.items[] | select(.set == "address" and .status != "foreign") | select(bad)] | length > 0 then 0 else 1 end),
         caa: (if ([.items[] | select(.set == "caa") | select(bad)] | length > 0) or ((.caa.issuer // "") != "" and (.caa.would_issue | not)) then 0 else 1 end),
-        dnssec: (if (.dnssec.state == "secure" or .dnssec.state == "unsigned") then 1 else 0 end),
+        dnssec: (if (.dnssec.state == "secure" or .dnssec.state == "unsigned" or .dnssec.state == "insecure") then 1 else 0 end),
         foreign: (if [.items[] | select(.status == "foreign") | select(bad)] | length > 0 then 0 else 1 end)}};
     (.main | summary) as $m
     # Lost account (F5): the CA would not issue to the pin, or the pin the
@@ -89,6 +89,7 @@ _st_dns_lines() {
     case "$sec" in
       secure) _st_line ok "$name: DNSSEC secure" ;;
       unsigned) _st_line ok "$name: DNSSEC unsigned (./portcullis dns plan shows how to sign)" ;;
+      insecure) _st_line ok "$name: DNSSEC signed, under a parent zone that isn't validated (nothing to fix here)" ;;
       bogus|ds_mismatch) _st_line fail "$name: DNSSEC $sec — validating resolvers can't reach it (./portcullis dns plan)" ;;
       *) _st_line warn "$name: DNSSEC $sec (./portcullis dns plan)" ;;
     esac

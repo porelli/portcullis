@@ -25,6 +25,10 @@ const (
 	DSMismatch State = "ds_mismatch"
 	Bogus      State = "bogus"
 	Unknown    State = "unknown"
+	// Insecure: the zone is signed and its DS matches, but the parent
+	// isn't validated (an insecure delegation above): nothing to fix in
+	// this zone, and no failed lookup.
+	Insecure State = "insecure"
 )
 
 // DS is one delegation signer record.
@@ -212,10 +216,10 @@ func Check(ctx context.Context, resolvers []string, name string) Result {
 		if !a.AuthenticatedData {
 			// No AD although the DS matches: a signed zone under a parent
 			// the resolver doesn't validate (an insecure chain) is no
-			// Problem of this zone — reported as unknown, not bogus.
+			// Problem of this zone — reported as insecure, not bogus.
 			if parent := parentOf(zone); parent != "" {
 				if pa, err := exchange(ctx, r, parent, dns.TypeSOA, false); err == nil && pa.Rcode == dns.RcodeSuccess && !pa.AuthenticatedData {
-					res.State = Unknown
+					res.State = Insecure
 					res.Err = fmt.Sprintf("%s doesn't validate the parent zone %s: the chain to %s can't be checked", r, parent, zone)
 					return res
 				}

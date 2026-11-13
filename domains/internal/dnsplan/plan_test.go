@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/libdns/libdns"
+	"github.com/miekg/dns"
 
 	"github.com/portcullis/domains/internal/dnssec"
 	"github.com/portcullis/domains/internal/fakedns"
@@ -485,7 +486,8 @@ func TestPlanStepsReplace(t *testing.T) {
 
 // TestNoServerAddressesUnknown (final review I1): without the server's
 // IPv4 (the main plan before any enrolment) every address item is
-// unknown / Warning — a published AAAA is not judged wrong.
+// unknown / Info — a published AAAA is not judged wrong, and nothing
+// failed (re-review 1: Info never counts as a failed lookup).
 func TestNoServerAddressesUnknown(t *testing.T) {
 	e := newPlanEnv(t)
 	e.in.Provider = nil
@@ -497,8 +499,23 @@ func TestNoServerAddressesUnknown(t *testing.T) {
 		t.Fatal("no address items")
 	}
 	for _, it := range its {
-		if it.Status != StatusUnknown || it.Severity != SevWarning {
+		if it.Status != StatusUnknown || it.Severity != SevInfo {
 			t.Errorf("%s %s: %s / %s", it.Name, it.Type, it.Status, it.Severity)
 		}
+	}
+}
+
+// TestDNSSECInsecureInfo (re-review 3): a signed zone under a parent the
+// resolvers don't validate is "insecure", with a step that says so.
+func TestDNSSECInsecureInfo(t *testing.T) {
+	e := newPlanEnv(t)
+	k, err := e.zone.Sign(pz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.zone.PublishDS(pz, k.ToDS(dns.SHA256))
+	info := Build(context.Background(), e.in).DNSSEC
+	if info.State != dnssec.Insecure || len(info.Steps) != 1 || !strings.Contains(info.Steps[0], "parent zone") {
+		t.Fatalf("%+v", info)
 	}
 }

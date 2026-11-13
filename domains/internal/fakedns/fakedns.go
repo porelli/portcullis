@@ -104,7 +104,8 @@ type Provider struct {
 	// with the input's name and type, whatever its data; "hetzner"
 	// (libdns/hetzner v1.0.0, findRecordID) deletes the FIRST record with
 	// the input's name and type, from one listing taken at the start (the
-	// same record twice fails, as the API's 404 would).
+	// same record twice fails, as the API's 404 would). Mode "porkbun"
+	// also raises a TTL under 600 s to 600 on append, as the library does.
 	DeleteMode string
 }
 
@@ -174,6 +175,9 @@ func (p *Provider) AppendRecords(_ context.Context, zone string, recs []libdns.R
 	defer p.Zone.mu.Unlock()
 	for _, r := range recs {
 		rr := r.RR()
+		if p.DeleteMode == "porkbun" && rr.TTL < 600*time.Second {
+			rr.TTL = 600 * time.Second // libdns/porkbun v1.1.0's AppendRecords
+		}
 		n := abs(rr.Name, zone)
 		p.Zone.recs[n] = append(p.Zone.recs[n], rr)
 	}

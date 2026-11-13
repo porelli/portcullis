@@ -103,8 +103,8 @@ func TestFindZoneClimbs(t *testing.T) {
 }
 
 // TestCheckInsecureParent: the DS matches but the resolver doesn't
-// validate the parent either (a non-validating resolver here): unknown,
-// never bogus.
+// validate the parent either (a non-validating resolver here): insecure
+// (a settled state, not a failed lookup), never bogus or unknown.
 func TestCheckInsecureParent(t *testing.T) {
 	z := fakedns.NewZone()
 	z.SetSOA("team.test")
@@ -119,7 +119,7 @@ func TestCheckInsecureParent(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { s.Close() })
-	if r := Check(context.Background(), []string{s.Addr}, "team.test"); r.State != Unknown || !strings.Contains(r.Err, "parent zone test.") {
+	if r := Check(context.Background(), []string{s.Addr}, "team.test"); r.State != Insecure || !strings.Contains(r.Err, "parent zone test.") {
 		t.Fatalf("%+v", r)
 	}
 }

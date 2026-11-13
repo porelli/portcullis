@@ -170,6 +170,9 @@ func (c *challengeProvider) CleanUp(domain, _, keyAuth string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	// TTL 0 matches any: providers may store another TTL than asked
+	// (porkbun raises anything under 600 s); the key-auth value is unique.
+	rec.TTL = 0
 	_, err = c.p.DeleteRecords(ctx, zone, []libdns.Record{rec})
 	return err
 }

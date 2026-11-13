@@ -262,6 +262,9 @@ func (a hetznerAPI) listIDs(ctx context.Context, zone string) ([]idRecord, error
 	if len(zs.Zones) != 1 || zs.Zones[0].ID == "" {
 		return nil, fmt.Errorf("hetzner: %d zones named %s", len(zs.Zones), name)
 	}
+	if got := strings.TrimSuffix(strings.ToLower(zs.Zones[0].Name), "."); got != strings.ToLower(name) {
+		return nil, fmt.Errorf("hetzner: asked for the zone %s, got %s", name, got)
+	}
 	var rs struct {
 		Records []struct {
 			ID    string `json:"id"`
