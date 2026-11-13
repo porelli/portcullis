@@ -6254,6 +6254,29 @@ jobs:
           source "$RUNNER_TEMP/podlib.sh"
           uid="$(id -u)"
           before="$(docker compose ps -q | wc -l)"
+          # An enabled app instance must come back too (the Hub sets
+          # restart: always on instance services under podman): folder-writer
+          # from e2e_podman.py, enabled through the Hub's API if it isn't.
+          SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
+          hub() { local m="$1" p="$2"; shift 2
+                  curl -s -X "$m" -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") \
+                    -H 'Content-Type: application/json' "$@" "$HUB_API$p"; }
+          hubc() { hub "$@" -o /tmp/hub.out -w '%{http_code}'; }
+          # shellcheck source=/dev/null
+          source tests/e2e/hubop.sh
+          APP=portcullis-folder-writer
+          app_ids() { docker ps -q --filter "label=com.docker.compose.project=$APP"; }
+          if [ -z "$(app_ids)" ]; then
+            if ! hub GET /api/instances | jq -e 'any(.[]; .id == "folder-writer")' >/dev/null; then
+              hubop POST /api/instances -d '{"template":"folder-writer","id":"folder-writer","label":"Folder Writer"}' || exit 1
+            fi
+            HUBOP_TIMEOUT=900 hubop POST /api/templates/enable -d '{"id":"folder-writer"}' || exit 1
+          fi
+          app_before="$(app_ids | wc -l)"
+          [ "$app_before" -gt 0 ] || { echo "FAIL: no running container of $APP before the reboot"; exit 1; }
+          # shellcheck disable=SC2046  # one id per word
+          docker inspect -f '{{.Name}} {{.HostConfig.RestartPolicy.Name}}' $(app_ids) | awk '$2 != "always" { print; bad = 1 } END { exit bad }' \
+            || { echo "FAIL: $APP containers without restart: always (the Hub must set it under podman)"; exit 1; }
           # shellcheck disable=SC2046  # one id per word
           docker inspect -f '{{.Name}} {{.HostConfig.RestartPolicy.Name}}' $(docker compose ps -q) | awk '$2 != "always" { print; bad = 1 } END { exit bad }' \
             || { echo "FAIL: core containers without restart: always (podman-restart.service starts only those)"; exit 1; }
@@ -6284,6 +6307,18 @@ jobs:
           echo "After: this user's podman processes and their user namespaces (one tree expected):"; podns
           after="$(docker compose ps -q | wc -l)"
           [ "$after" = "$before" ] || { echo "FAIL: $before core containers before, $after after"; exit 1; }
+          # The instance: the same number of containers running, none unhealthy.
+          for i in $(seq 1 36); do
+            n=0 bad=""
+            for c in $(app_ids); do
+              st="$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$c")"
+              case "$st" in "running healthy"|"running none") n=$((n + 1)) ;; *) bad="$bad $c($st)" ;; esac
+            done
+            [ "$n" = "$app_before" ] && [ -z "$bad" ] && break
+            [ "$i" -eq 36 ] && { echo "FAIL: $APP after the reboot: $n of $app_before running and healthy$bad"; docker ps -a --filter "label=com.docker.compose.project=$APP"; exit 1; }
+            sleep 5
+          done
+          echo "PASS: $APP's $app_before containers (restart: always) came back running and healthy"
           echo "PASS: after a simulated reboot (user manager and /run/user/$uid recreated), podman-restart.service brought every container back; status clean"
 
       - name: Docker → Podman round trip (restore the Docker phase's backup)
