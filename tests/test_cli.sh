@@ -200,6 +200,28 @@ expect_eq "the engine-socket mount appears exactly twice in docker-compose.yml" 
   "$(grep -cF -- '- ${PORTCULLIS_ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro' "$ROOT_DIR_SOCK/docker-compose.yml")" 2
 expect_eq "no literal /var/run/docker.sock:/var/run/docker.sock mount anywhere" \
   "$(git -C "$ROOT_DIR_SOCK" grep -nF '/var/run/docker.sock:/var/run/docker.sock' -- . ':!tests/test_cli.sh' || true)" ""
+# The SELinux overlay never labels the checkout, secrets/, backups/ or .env
+# (or a parent of them): an escaped container_t process could read every
+# secret. selinux_bad_sources <file> — each offending labelled source.
+selinux_bad_sources() {
+  sed -n 's/.*source: *\([^,}]*\).*selinux: *[zZ].*/\1/p' "$1" | while IFS= read -r src; do
+    src="${src%/}"
+    case "$src" in
+      .|./secrets|./backups|./.env|.env|..|../*|/*|*/..|*/../*|"") echo "$src" ;;
+      ./*) ;;
+      *) echo "$src" ;;
+    esac
+  done
+}
+expect_eq "the SELinux overlay labels no checkout root, secrets/, backups/, .env or a parent" \
+  "$(selinux_bad_sources "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" ""
+printf '%s\n' '      - {type: bind, source: ., target: /p, bind: {selinux: z}}' '      - {type: bind, source: ./secrets/, target: /s, bind: {selinux: Z}}' \
+  '      - {type: bind, source: ./backups, target: /b, bind: {selinux: z}}' '      - {type: bind, source: ./.env, target: /e, bind: {selinux: Z}}' \
+  '      - {type: bind, source: .., target: /u, bind: {selinux: z}}' '      - {type: bind, source: ./secrets/hub/core.env, target: /ok, bind: {selinux: Z}}' > "$WORK/bad-overlay.yml"
+expect_eq "selinux_bad_sources catches ., ./secrets, ./backups, ./.env and a parent (and passes a per-file secret)" \
+  "$(selinux_bad_sources "$WORK/bad-overlay.yml" | paste -sd' ' -)" ". ./secrets ./backups ./.env .."
+expect_eq "the SELinux overlay: the Hub's /project root is a tmpfs, not the checkout" \
+  "$(grep -c '{type: tmpfs, target: /project,' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml"):$(grep -cE 'source: \.[,}]|source: \./?, ' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" "1:0"
 expect_eq "the SELinux overlay never names the engine socket" "$(grep -c 'docker.sock\|ENGINE_SOCKET' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" 0
 expect_eq "no ct_own \"\$(id -u)… in the CLI (ct_operator_id)" "$(grep -rnF 'ct_own "$(id -u)' "$HERE/../scripts/lib" "$HERE/../portcullis" || true)" ""
 case "$(printf '%s\n' '  jq -n --arg p "$(cat "$f")" x' '  jq --arg pass "$LLDAP_ADMIN_PASSWORD"' | grep -cE -e "$ARGV_RE")" in

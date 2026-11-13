@@ -258,12 +258,17 @@ jobs:
           # Core stays userspace (VPN cross-reference): no NET_ADMIN / SYS_ADMIN.
           CAPS="$(echo "$CFG_ALL" | jq -r '.services | to_entries[] | select((.value.cap_add // []) | any(. == "NET_ADMIN" or . == "SYS_ADMIN")) | .key')"
           [ -z "$CAPS" ] || { echo "FAIL: core services with NET_ADMIN / SYS_ADMIN: $CAPS"; exit 1; }
-          # The rootless Podman SELinux overlay (P10): every project bind
-          # (source inside the checkout) re-declared with selinux z and the
-          # base's target / read_only, nothing else relabelled (never the
-          # engine socket), no service the base lacks, label=disable on the two
-          # proxies only (each keeping no-new-privileges); the base itself
-          # relabels nothing.
+          # The rootless Podman SELinux overlay (P10 + the controller's
+          # narrowing): every project bind (source inside the checkout)
+          # re-declared with the base's target / read_only and a label — Z
+          # when one service mounts the path, z only when several services
+          # mount it or a path above / below it (or templates/ / appfiles/,
+          # which the Hub's app instances mount) —; never a label on the
+          # checkout, secrets/, backups/ or .env (or a parent of them): the
+          # Hub's `.:/project` becomes a tmpfs with group-gate's map bound in;
+          # nothing outside the checkout relabelled (never the engine socket);
+          # no service the base lacks; label=disable on the two proxies only
+          # (each keeping no-new-privileges); the base itself relabels nothing.
           OV_ALL="$(docker compose -f docker-compose.yml -f docker-compose.podman-selinux.yml --profile '*' config --format json)"
           binds() {  # <config json> — "service target read_only selinux" of every project bind
             printf '%s' "$1" | jq -r --arg p "$PWD" '.services | to_entries[] | .key as $s | (.value.volumes // [])[]
@@ -273,11 +278,24 @@ jobs:
           [ -z "$(binds "$CFG_ALL" | awk '$4 != "-"')" ] || { echo "FAIL: docker-compose.yml relabels a bind (selinux): only the overlay may"; exit 1; }
           NBINDS="$(binds "$CFG_ALL" | wc -l | tr -d ' ')"
           [ "$NBINDS" = 45 ] || { echo "FAIL: expected 45 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
-          diff <(binds "$CFG_ALL" | awk '{print $1, $2, $3, "z"}') <(binds "$OV_ALL") \
-            || { echo "FAIL: docker-compose.podman-selinux.yml must re-declare every project bind with selinux z and the same target / read_only"; exit 1; }
-          echo "$OV_ALL" | jq -e --arg p "$PWD" '[.services[].volumes[]? | select(.bind.selinux != null) | select(.source != $p and (.source | startswith($p + "/") | not))] == []
-              and ([.services[].volumes[]? | select(.target == "/var/run/docker.sock") | .bind.selinux // null] == [null, null])' >/dev/null \
-            || { echo "FAIL: the overlay relabels something outside the checkout (or the engine socket)"; exit 1; }
+          diff <({ binds "$CFG_ALL" | grep -vx 'hub /project true -' | awk '{print $1, $2, $3}'; echo "hub /project/group-gate/group-gate-map.conf true"; } | sort) \
+               <(binds "$OV_ALL" | awk '{print $1, $2, $3}' | sort) \
+            || { echo "FAIL: docker-compose.podman-selinux.yml must re-declare every project bind (but the Hub's /project root) with the same target / read_only, plus the Hub's map file"; exit 1; }
+          echo "$OV_ALL" | jq -e '[.services.hub.volumes[] | select(.target == "/project") | .type] == ["tmpfs"]' >/dev/null \
+            || { echo "FAIL: the overlay must turn the Hub's /project root into a tmpfs (never relabel the checkout)"; exit 1; }
+          BADLABEL="$(echo "$OV_ALL" | jq -r --arg p "$PWD" '
+              def inside($a; $b): $a == $b or ($a | startswith($b + "/"));
+              [.services | to_entries[] | .key as $s | (.value.volumes // [])[] | select(.type == "bind") | {s: $s, src: .source, lab: (.bind.selinux // null)}] as $all
+              | ($all | map(select(.lab != null))) as $lab
+              | ($lab[] | select(inside(.src; $p) | not) | "\(.s) \(.src): a label outside the checkout"),
+                ($lab[] | select(.src as $x | ([$p, $p + "/secrets", $p + "/backups", $p + "/.env"] | any(inside(.; $x)))) | "\(.s) \(.src): never label the checkout, secrets/, backups/ or .env (or a parent)"),
+                ($lab[] | . as $b
+                  | ([$all[] | select(.s != $b.s and (inside(.src; $b.src) or inside($b.src; .src)))] | length > 0
+                     or inside($b.src; $p + "/templates") or inside($b.src; $p + "/appfiles")) as $shared
+                  | select(($shared and .lab != "z") or (($shared | not) and .lab != "Z"))
+                  | "\(.s) \(.src): \(.lab), want \(if $shared then "z (shared)" else "Z (one service)" end)"),
+                ([.services[].volumes[]? | select(.target == "/var/run/docker.sock") | .bind.selinux // empty][] | "the engine socket is relabelled")')"
+          [ -z "$BADLABEL" ] || { echo "FAIL: SELinux labels in docker-compose.podman-selinux.yml:"; echo "$BADLABEL"; exit 1; }
           EXTRA="$(comm -23 <(yq -r '.services | keys | .[]' docker-compose.podman-selinux.yml | sort) <(docker compose -f docker-compose.yml --profile '*' config --services | sort))"
           [ -z "$EXTRA" ] || { echo "FAIL: docker-compose.podman-selinux.yml names services docker-compose.yml lacks: $EXTRA"; exit 1; }
           if ! echo "$OV_ALL" | jq -e '([.services | to_entries[] | select((.value.security_opt // []) | index("label=disable")) | .key] | sort == ["socket-proxy-hub", "socket-proxy-traefik"])
