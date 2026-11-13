@@ -1,6 +1,6 @@
 services:
   web:
-    image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+    image: docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
     networks: [default, portcullis-proxy]
     volumes:
       - data:/data
@@ -15,7 +15,7 @@ services:
   # helper image while echo instances run and checks the Hub pulls it by
   # digest, which Docker's containerd image store refuses for an image in use.
   hold:
-    image: busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
+    image: docker.io/library/busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
     command: ["sh", "-c", "trap '' TERM; while :; do sleep 1; done"]
     stop_grace_period: ${ECHO_STOP_GRACE:-1s}
     network_mode: none

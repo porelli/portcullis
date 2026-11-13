@@ -3,7 +3,7 @@ services:
   # still being pulled, so the container is never created. Pinned like
   # every image (the templates repo's gitlab uses the same one).
   app:
-    image: gitlab/gitlab-ce:19.5.3-ce.0@sha256:6863d156a1a477bd6f69fc674b671d0163cd8b06bf63bb17cc4a4a803b78b27c
+    image: docker.io/gitlab/gitlab-ce:19.5.3-ce.0@sha256:6863d156a1a477bd6f69fc674b671d0163cd8b06bf63bb17cc4a4a803b78b27c
     environment:
       SLOWPULL_OIDC_SECRET: ${SLOWPULL_OIDC_SECRET:?SLOWPULL_OIDC_SECRET must be set}
     networks: [default, portcullis-proxy]

@@ -28,7 +28,7 @@
 
 BACKUP_ROOT="${BACKUP_ROOT:-$PORTCULLIS_ROOT/backups}"
 BACKUP_FORMAT=1
-BACKUP_RESTIC_IMAGE="restic/restic:0.19.1@sha256:136600b6ff6843d61d355f7f71f460a166429f35de6fd11b568fece3c9a4d510"
+BACKUP_RESTIC_IMAGE="docker.io/restic/restic:0.19.1@sha256:136600b6ff6843d61d355f7f71f460a166429f35de6fd11b568fece3c9a4d510"
 # Volumes archived as files: <compose volume>:<uid>:<gid> of the service
 # that owns them (the snapshot container runs as that user so SQLite can
 # open WAL databases; restore chowns the volume root back).
@@ -56,11 +56,20 @@ BACKUP_LAST_DIR=""
 _BACKUP_CFG=""
 _RESTIC_MOUNTS=()
 
+# The python helpers mount a volume at BACKUP_PY_MOUNT, a path the
+# group-gate image does NOT have: Docker copies an image's mountpoint owner
+# and mode onto an EMPTY named volume at every mount (its /data is
+# 10003:10001 0750), which turned an empty domains_data into group-gate's
+# and locked the domains service (uid 10004) out of it (test server,
+# 2026-11-13). Nothing at the path, nothing copied, on either runtime.
+BACKUP_PY_MOUNT="/vol"
+
 # Runs inside group-gate's (locally built) python image, as the volume owner:
-# /data → gzipped tar on stdout; SQLite files via the online backup API.
+# the volume (BACKUP_PY_MOUNT) → gzipped tar on stdout; SQLite files via the
+# online backup API.
 read -r -d '' _BACKUP_PY_SNAPSHOT <<'PY' || true
 import os, sqlite3, sys, tarfile, tempfile
-SRC = "/data"
+SRC = "/vol"
 def is_sqlite(p):
     try:
         with open(p, "rb") as f:
@@ -129,13 +138,13 @@ print(f"users.db ok: {users} user(s), {groups} group(s)"
       + ("" if "private_key" in names else " (no private_key file: LLDAP_KEY_SEED must be set)"))
 PY
 
-# Runs inside the python image with lldap_data mounted at /data (read-only):
+# Runs inside the python image with lldap_data mounted at BACKUP_PY_MOUNT (read-only):
 # prints the number of LLDAP users other than admin and the Hub's service
 # account, or "missing" when there is no readable user database.
 read -r -d '' _BACKUP_PY_COUNT_LLDAP <<'PY' || true
 import sqlite3, sys
 try:
-    c = sqlite3.connect("file:/data/users.db?mode=ro&immutable=1", uri=True)
+    c = sqlite3.connect("file:/vol/users.db?mode=ro&immutable=1", uri=True)
     n = c.execute("SELECT count(*) FROM users WHERE user_id NOT IN ('admin', 'portcullis-hub')").fetchone()[0]
 except Exception as e:
     print("missing")
@@ -240,7 +249,7 @@ _backup_volume_files() {
   local img
   img="$(_py_image)" || return 1
   docker run --rm --network none --user "$2:$3" --cap-drop ALL --security-opt no-new-privileges:true \
-    --read-only --tmpfs /tmp -e PYTHONDONTWRITEBYTECODE=1 -v "$1:/data" \
+    --read-only --tmpfs /tmp -e PYTHONDONTWRITEBYTECODE=1 -v "$1:$BACKUP_PY_MOUNT" \
     "$img" python3 -c "$_BACKUP_PY_SNAPSHOT"
 }
 
@@ -645,7 +654,7 @@ _restore_lldap_count() {
   vol="$(_volume_name lldap_data)"
   docker volume inspect "$vol" >/dev/null 2>&1 || { echo missing; return 0; }
   docker run --rm --network none --read-only --tmpfs /tmp --user "$CT_UID_LLDAP:$CT_UID_LLDAP" --cap-drop ALL \
-    --security-opt no-new-privileges:true -e PYTHONDONTWRITEBYTECODE=1 -v "$vol:/data:ro" "$(_py_image)" \
+    --security-opt no-new-privileges:true -e PYTHONDONTWRITEBYTECODE=1 -v "$vol:$BACKUP_PY_MOUNT:ro" "$(_py_image)" \
     python3 -c "$_BACKUP_PY_COUNT_LLDAP" 2>/dev/null || echo missing
 }
 
@@ -931,10 +940,11 @@ backup_restore() {
   vault_init false
   # The core must come up; a non-core service (e.g. a Hub image that cannot
   # be pulled right now) must not abort a restore.
-  # Rootless Podman: the local images with podman build (compose never builds).
-  if _rt_is_podman; then runtime_build_local; fi
-  # shellcheck disable=SC2046  # nothing or --no-build
-  dc up -d $(runtime_no_build) || warn "some services did not start — check ./portcullis status"
+  # The local images are built on both runtimes, as up / upgrade do
+  # (stack_compose_up: docker --build, podman podman build + --no-build), so
+  # a restore never starts a container from an image older than this
+  # checkout; compose recreates a container whose image content changed.
+  stack_compose_up || warn "some services did not start — check ./portcullis status"
   wait_healthy 300 vault postgres lldap keycloak
   ok "Restore complete.${pre:+ Previous .env/secrets/certs: $pre.} Verify with ./portcullis status"
   if [ -n "$RESTORE_STOPPED_APPS" ]; then

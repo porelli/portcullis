@@ -434,7 +434,16 @@ runtime_no_build() {
 }
 
 # stack_compose_up [service...] — `dc up -d` with the local images built:
-# docker → --build, podman → runtime_build_local, then --no-build.
+# docker → --build, podman → runtime_build_local, then --no-build. Never
+# --no-recreate / --force-recreate: compose recreates exactly the containers
+# whose config or image changed. It compares the image's runnable content
+# (its com.docker.compose.image label: under Docker's containerd store the
+# platform manifest digest, not the image ID — that index digest also covers
+# the provenance attestation and changes on every build, so a container's
+# .Image differing from its tag's .Id is NOT a stale container; under
+# Podman the image ID, which a fully cached `podman build` keeps). CI
+# (build-and-test after an upgrade, e2e-podman after an up) checks that a
+# changed image reaches its container and an unchanged one isn't recreated.
 stack_compose_up() {
   local rc=0
   if _rt_is_podman; then

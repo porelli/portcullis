@@ -286,7 +286,7 @@ CT_GID_SESSIONS=1000
 CT_UID_LLDAP=1000     # lldap/lldap:*-rootless (lldap_data is 1000-owned)
 # Throwaway container used to chown/chgrp when not running as root (the
 # operator can run docker, i.e. is root-equivalent anyway).
-PORTCULLIS_HELPER_IMAGE="alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a"
+PORTCULLIS_HELPER_IMAGE="docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a"
 
 # _owner_of <path> — "uid:gid" on the host (GNU or BSD stat).
 _owner_of() { stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1"; }
