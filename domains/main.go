@@ -7,6 +7,9 @@
 //	domains            run the service
 //	domains keygen     print a new age X25519 identity (secrets/domains/age.key)
 //	domains healthcheck  exit 0 if the API answers /healthz (Docker HEALTHCHECK)
+//	domains enrolled   the number of enrolled domains
+//	domains dns …      the one-shot DNS tool (tool.go)
+//	domains traefik-account-uri <acme.json>, domains report --main --json
 package main
 
 import (
@@ -29,6 +32,8 @@ import (
 	"filippo.io/age"
 	"github.com/go-acme/lego/v4/challenge/dns01"
 	legolog "github.com/go-acme/lego/v4/log"
+
+	"github.com/portcullis/domains/internal/dnsplan"
 )
 
 func env(k, def string) string {
@@ -36,6 +41,21 @@ func env(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// envBool reads a true/false variable (unset = def); anything else
+// refuses to start.
+func envBool(k string, def bool) (bool, error) {
+	switch v := strings.TrimSpace(os.Getenv(k)); v {
+	case "":
+		return def, nil
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s=%q must be true or false", k, v)
+	}
 }
 
 func main() {
@@ -64,8 +84,25 @@ func main() {
 			}
 			fmt.Println(n)
 			return
+		case "dns":
+			// The test build's provider "fake" (and its DNS server) first.
+			if err := startTestProvider(toolLogger()); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(exitFailure)
+			}
+			setHTTPDefaults(2 * time.Minute)
+			os.Exit(runDNSTool(os.Args[2:], toolEnv{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr, resolvers: resolversFromEnv()}))
+		case "traefik-account-uri":
+			os.Exit(runTraefikAccountURI(os.Args[2:], os.Stdout, os.Stderr))
+		case "report":
+			secret, err := readSecret(env("DOMAINS_API_SECRET_FILE", "/run/portcullis/domains/api-secret"))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "domains report: %v\n", err)
+				os.Exit(exitFailure)
+			}
+			os.Exit(runReport(os.Args[2:], "http://127.0.0.1"+env("DOMAINS_API_ADDR", ":8080"), secret, os.Stdout, os.Stderr))
 		default:
-			fmt.Fprintf(os.Stderr, "usage: domains [keygen|healthcheck|enrolled]\n")
+			fmt.Fprintf(os.Stderr, "usage: domains [keygen|healthcheck|enrolled|dns|traefik-account-uri|report]\n")
 			os.Exit(2)
 		}
 	}
@@ -243,14 +280,32 @@ func run() error {
 	// the same public resolvers as the records check.
 	_ = dns01.AddRecursiveNameservers(resolvers)(nil)
 
+	caaOn, err := envBool("DNS_CAA", true)
+	if err != nil {
+		return err
+	}
 	cfg := Config{
 		MainDomain: mainDomain,
 		Email:      env("ACME_EMAIL", "admin@"+mainDomain),
 		CAServer:   env("ACME_CA_SERVER", "https://acme-v02.api.letsencrypt.org/directory"),
 		IPv4:       ip4, IPv6: ip6,
-		Resolvers: resolvers,
-		Secret:    secret,
-		Logger:    logger,
+		Resolvers:      resolvers,
+		Secret:         secret,
+		Logger:         logger,
+		CAA:            caaOn,
+		CAAIODEF:       strings.TrimSpace(os.Getenv("DNS_CAA_IODEF")),
+		MainAccountURI: strings.TrimSpace(os.Getenv("DOMAINS_MAIN_ACME_ACCOUNT_URI")),
+		MailFrom:       strings.TrimSpace(os.Getenv("ALERT_SMTP_FROM")),
+	}
+	if u := cfg.MainAccountURI; u != "" && !dnsplan.ValidAccountURI(u) {
+		return fmt.Errorf("DOMAINS_MAIN_ACME_ACCOUNT_URI=%q is not an ACME account URI (secrets/domains/main-domain.env)", u)
+	}
+	// The issuer is resolved whatever DNS_CAA says: the checks judge the
+	// live CAA with it; DNS_CAA only decides whether the set is written.
+	if issuer, ok := dnsplan.IssuerFor(cfg.CAServer, os.Getenv("DNS_CAA_ISSUER")); ok {
+		cfg.CAAIssuer = issuer
+	} else if caaOn {
+		logger.Printf("CAA skipped: unknown CA %s (set DNS_CAA_ISSUER)", cfg.CAServer)
 	}
 	svc, err := NewService(cfg, OpenStore(env("DOMAINS_DATA_DIR", "/data"), id))
 	if err != nil {

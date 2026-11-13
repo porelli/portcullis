@@ -55,9 +55,16 @@ expect_eq "no command prints help on stderr" "$ERR" "$HELP"
 run frobnicate; expect_eq "unknown command exits 2" "$RC" 2
 case "$ERR" in *"unknown command 'frobnicate'"*) t_pass "unknown command message" ;; *) t_fail "unknown command message: $ERR" ;; esac
 
+# init --help names every DNS provider `dns setup` supports (stack.sh DNS_PROVIDERS).
+run init --help
+INIT_PROVIDERS="$(printf '%s\n' "$OUT" | sed -n '/--dns-provider NAME/,/another lego provider/p' | tr -s ' |\n' '\n\n\n' | sort -u | paste -sd' ' -)"
+for p in $(sed -n 's/^DNS_PROVIDERS="\(.*\)"$/\1/p' "$HERE/../scripts/lib/stack.sh"); do
+  case " $INIT_PROVIDERS " in *" $p "*) t_pass "init --help lists the DNS provider $p" ;; *) t_fail "init --help misses the DNS provider $p" ;; esac
+done
+
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 27 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 27
+expect_eq "help lists 29 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 29
 while IFS= read -r c; do
   # shellcheck disable=SC2086
   run $c --help
@@ -119,6 +126,12 @@ config apply --force|unknown argument
 config init --remote|--remote needs a value
 config init --remote a --from b|mutually exclusive
 dns setup --fix|unknown argument
+dns plan --bogus|unknown argument
+dns check --bogus|unknown argument
+dns setup --only x|--only
+dns setup --only|--only needs a value
+dns setup --check|dns check
+dns plan --yes|unknown argument
 keycloak configure --wipe|unknown argument
 oidc register now|unknown argument
 invite|missing <user>
@@ -628,7 +641,8 @@ oidc_register() { :; }
 network_check() { :; }
 stack_prepare() { :; }
 sessions_restart_if_changed() { echo sessions_restart_if_changed >> "$DC_CALLS"; }
-dns_setup() { :; }
+dns_setup() { [ \$# -eq 3 ] || { echo "dns_setup: want 3 arguments" >&2; return 1; }; }
+dns_tighten_main() { wc -l < "$DC_CALLS" | tr -d " " > "$WORK/tighten-at"; }
 config_init() { :; }
 invite_create() { echo '{"url":"http://test","expires_at":"never"}'; }
 lldap_service_account() {
@@ -663,6 +677,7 @@ expect_eq "init: hub started after the service account step" \
   "$(printf '%s\n' "$calls" | wc -l | tr -d ' ')"
 expect_eq "init: second up is 'up hub'" \
   "$(printf '%s\n' "$calls" | tail -1 | tr -s ' ')" "up hub"
+expect_eq "init: tighten runs at the end (after the Hub's up)" "$(cat "$WORK/tighten-at" 2>/dev/null)" "$(printf '%s\n' "$calls" | wc -l | tr -d ' ')"
 
 # Test stack_up and upgrade_run: restart hub only when lldap_service_account changed.
 # Set up VAULT_INIT_FILE
@@ -692,6 +707,7 @@ hub_pinned_warn() { :; }
 backup_create() { :; }
 hub_policy_check() { :; }
 hub_sources_sync() { :; }
+dns_tighten_main() { echo dns_tighten_main >> "$DC_CALLS"; }
 lldap_service_account() {
   LLDAP_SA_CHANGED=false
   [ -f "\$LLDAP_ACCOUNT_CHANGED" ] && LLDAP_SA_CHANGED=true
@@ -737,6 +753,8 @@ rm -f "$DC_CALLS"
 )
 expect_eq "up: account changed, hub restarted" \
   "$(grep -c '^restart.*hub' "$DC_CALLS" 2>/dev/null || true)" 1
+expect_eq "up: the CAA tighten runs once, after compose up" \
+  "$(grep -E '^(up|dns_tighten_main)' "$DC_CALLS" | paste -sd' ' - | cut -c1-2)$(grep -c '^dns_tighten_main$' "$DC_CALLS")" "up1"
 
 # upgrade_run when account changed: restart hub.
 touch "$LLDAP_ACCOUNT_CHANGED"
@@ -756,6 +774,7 @@ rm -f "$DC_CALLS"
 )
 expect_eq "upgrade: account changed, hub restarted" \
   "$(grep -c '^restart.*hub' "$DC_CALLS" 2>/dev/null || true)" 1
+expect_eq "upgrade: the CAA tighten runs once" "$(grep -c '^dns_tighten_main$' "$DC_CALLS")" 1
 
 # upgrade_run when account unchanged: no restart.
 rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"

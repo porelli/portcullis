@@ -2,18 +2,33 @@
 #
 # `portcullis init | up | down | upgrade` — stack lifecycle.
 
-DNS_PROVIDERS="cloudflare porkbun route53 digitalocean hetzner none"
+DNS_PROVIDERS="cloudflare porkbun route53 digitalocean hetzner hetzner-cloud none"
+
+# _dns_cred_keys <provider> — "ENV_VAR:key" lines: the .env variables
+# holding the provider's credentials and the domains provider's credential
+# key each maps to (contract §12.2). AWS_HOSTED_ZONE_ID is optional.
+_dns_cred_keys() {
+  case "$1" in
+    cloudflare) echo "CLOUDFLARE_API_TOKEN:api_token" ;;
+    porkbun) printf '%s\n' PORKBUN_API_KEY:api_key PORKBUN_SECRET_API_KEY:secret_api_key ;;
+    route53) printf '%s\n' AWS_ACCESS_KEY_ID:access_key_id AWS_SECRET_ACCESS_KEY:secret_access_key AWS_HOSTED_ZONE_ID:hosted_zone_id ;;
+    digitalocean) echo "DO_AUTH_TOKEN:auth_token" ;;
+    hetzner) echo "HETZNER_API_KEY:api_token" ;;
+    hetzner-cloud) echo "HETZNER_API_TOKEN:api_token" ;;
+  esac
+  return 0
+}
 
 # _dns_cred_vars <provider> — .env variables holding the provider's credentials.
 _dns_cred_vars() {
-  case "$1" in
-    cloudflare) echo "CLOUDFLARE_API_TOKEN" ;;
-    porkbun) echo "PORKBUN_API_KEY PORKBUN_SECRET_API_KEY" ;;
-    route53) echo "AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_HOSTED_ZONE_ID" ;;
-    digitalocean) echo "DO_AUTH_TOKEN" ;;
-    hetzner) echo "HETZNER_API_KEY" ;;
-    *) echo "" ;;
-  esac
+  _dns_cred_keys "$1" | cut -d: -f1 | paste -sd' ' -
+}
+
+# _dns_automated <provider> — the records can be written through its API
+# (the domains image's dns tool); any other provider: records by hand.
+_dns_automated() {
+  case "$1" in cloudflare|porkbun|route53|digitalocean|hetzner|hetzner-cloud) return 0 ;; esac
+  return 1
 }
 
 # _prompt <var> <question> <default> — interactive value unless already set.
@@ -154,7 +169,9 @@ init_run() {
   if [ "$skip_dns" = true ] || [ "${DNS_PROVIDER:-none}" = none ]; then
     info "Skipping DNS record setup."
   else
-    dns_setup false
+    # CA-only CAA: Traefik has no ACME account yet (dns_tighten_main pins
+    # it at the end).
+    dns_setup true false "" || warn "The DNS records aren't all correct yet: check later with ./portcullis dns check"
   fi
 
   stack_prepare
@@ -208,6 +225,9 @@ init_run() {
   if [ "$config_repo" = true ]; then
     config_init "" ""
   fi
+
+  # Traefik has run: pin the CAA (written CA-only above) to its account.
+  dns_tighten_main
 
   local d="$PORTCULLIS_DOMAIN"
   echo ""
@@ -409,6 +429,8 @@ stack_up() {
   pki_files_reload
   config_reload
   wait_healthy 300 vault postgres lldap keycloak
+  # Traefik is up: pin the main domain's CAA to its ACME account.
+  dns_tighten_main
   # If the service account was created or its password changed, restart the Hub
   # (which may have started with a stale/missing password).
   lldap_service_account
@@ -459,6 +481,7 @@ upgrade_run() {
   signin_ca_reload
   config_reload
   wait_healthy 300 vault postgres lldap keycloak
+  dns_tighten_main
   keycloak_configure false
   oidc_register
   # If the service account was created or its password changed, restart the Hub
@@ -497,7 +520,8 @@ Every step is idempotent, so init can be re-run after a failure.
 Options:
   --domain DOMAIN         base domain (default: $PORTCULLIS_DOMAIN or prompt)
   --email EMAIL           Let's Encrypt account email (default: admin@DOMAIN)
-  --dns-provider NAME     cloudflare|porkbun|route53|digitalocean|hetzner|none
+  --dns-provider NAME     cloudflare|porkbun|route53|digitalocean|hetzner|
+                          hetzner-cloud|none
                           or another lego provider name (default: cloudflare)
   --non-interactive       never prompt; DNS credentials must be in the
                           environment (e.g. CLOUDFLARE_API_TOKEN=...)

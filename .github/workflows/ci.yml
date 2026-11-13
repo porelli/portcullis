@@ -405,6 +405,19 @@ jobs:
               and ([$h.volumes[] | select(.target == "/run/portcullis/domains/api-secret") | .read_only] == [true])
               and ([.services | to_entries[] | select([.value.volumes[]? | .source // "" | select(test("secrets/domains/age\\.key$"))] | length > 0) | .key] == ["domains"])' >/dev/null \
             || { echo "FAIL: domains service wiring (contract §12.1 / §12.4)"; exit 1; }
+          # Contract §12.1: the one-shot dns tool (profile tools) — the domains
+          # image on domains-egress only, read-only, no volumes, no environment
+          # or env file (credentials reach it on stdin only).
+          echo "$CFG_ALL" | jq -e '.services["dns-tool"] as $t
+              | $t.image == "portcullis-domains" and $t.profiles == ["tools"]
+              and ([$t.networks | keys[]] == ["domains-egress"])
+              and (($t.volumes // []) == []) and ($t.environment == null) and ($t.env_file == null)
+              and $t.read_only == true and $t.user == "10004:10004"
+              and $t.entrypoint == ["domains", "dns"] and ($t.ports // []) == []
+              and $t.healthcheck.disable == true
+              and ([$t.labels // {} | keys[] | select(startswith("traefik."))] == [])
+              and ([.services | to_entries[] | select((.value.networks // {}) | has("domains-egress")) | .key] | sort == ["dns-tool", "domains"])' >/dev/null \
+            || { echo "FAIL: dns-tool wiring (contract §12.1: egress only, no volumes / env, credentials on stdin)"; exit 1; }
           # Contract §15 / §5 / §6: mcp-gate. Networks exactly portcullis +
           # portcullis-proxy at the pinned address; group 10001 only (G74);
           # hub_data read-only; mcp_gate_data written by the gate only and
@@ -563,6 +576,8 @@ jobs:
             # The Hub and Keycloak come from HUB_IMAGE / KEYCLOAK_IMAGE (edge on
             # main; release.yml requires a pinned release of each).
             case "$svc" in hub|keycloak) continue ;; esac
+            # dns-tool runs the locally built domains image (no build of its own).
+            [ "$svc:$img" != dns-tool:portcullis-domains ] || continue
             [[ "$img" =~ ^[^@[:space:]]+:[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || { echo "UNPINNED: $svc → $img"; bad=1; }
           done < /tmp/images
           for df in enroll/Dockerfile group-gate/Dockerfile domains/Dockerfile mcp-gate/Dockerfile; do
@@ -767,6 +782,8 @@ jobs:
                 ACME_CA_SERVER: https://pebble:14000/dir
                 LEGO_CA_CERTIFICATES: /run/ci/pebble.minica.pem
                 DOMAINS_RESOLVERS: 127.0.0.1:8053
+                # Pebble is no Let's Encrypt: its CAA issuer domain (caa set on).
+                DNS_CAA_ISSUER: pebble.test
               volumes:
                 - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
             pebble:
@@ -776,6 +793,11 @@ jobs:
                 PEBBLE_VA_NOSLEEP: "1"
                 PEBBLE_WFE_NONCEREJECT: "0"
               networks: [domains-egress]
+            # The one-shot dns tool asks its own fake DNS (the testprovider
+            # build serves provider "fake" in the tool's process).
+            dns-tool:
+              environment:
+                DOMAINS_RESOLVERS: 127.0.0.1:8053
             traefik:
               environment:
                 # CI only: Traefik's API on its internal :8080 entrypoint, for
@@ -1442,6 +1464,43 @@ jobs:
             case "$name" in *portcullis.local) echo "FAIL: served a main-domain certificate ($name)"; exit 1 ;; esac
           done
           echo "PASS: domains enrolled $D (Pebble, DNS-01), serves only {tls: {certificates}} with SANs {<d>, *.<d>}, mTLS required"
+
+          # DNS hardening (contract §12.2 / §12.4): the caa set of $D is pinned
+          # to the service's own ACME account (Pebble's, DNS_CAA_ISSUER=pebble.test).
+          ACCT="$(dapi http://domains:8080/acme/account)"
+          echo "$ACCT" | jq -e '.caa_issuer == "pebble.test" and (.account_uri | startswith("https://")) and .ca_server == "https://pebble:14000/dir"' >/dev/null \
+            || { echo "FAIL: /acme/account: $ACCT"; exit 1; }
+          PLAN="$(dapi "http://domains:8080/domains/$D/dns?refresh=1")"
+          echo "$PLAN" | jq -e --argjson a "$ACCT" '.can_write == true and .caa.would_issue == true and .caa.account_uri == $a.account_uri
+              and ([.items[] | select(.set == "caa" and .status != "foreign")] | length == 1 and all(.status == "ok"))
+              and ([.items[] | select(.set == "address" and .status != "foreign")] | all(.status == "ok"))' >/dev/null \
+            || { echo "FAIL: the plan of $D: $PLAN"; exit 1; }
+          dapi http://domains:8080/domains | jq -e --arg d "$D" '.[] | select(.name == $d) | .caa_ok == true' >/dev/null \
+            || { echo "FAIL: caa_ok of $D: $(dapi http://domains:8080/domains)"; exit 1; }
+          dapi http://domains:8080/main/dns | jq -e '.can_write == false and .name == "portcullis.local"' >/dev/null \
+            || { echo "FAIL: the main-domain plan: $(dapi http://domains:8080/main/dns)"; exit 1; }
+          docker compose exec -T domains domains report --main --json | jq -e --arg d "$D" '.main.name == "portcullis.local" and (.domains | keys == [$d])' >/dev/null \
+            || { echo "FAIL: domains report --main --json"; exit 1; }
+          # The one-shot dns tool (profile tools): apply in its own fake zone
+          # (the testprovider build), the credentials on stdin only.
+          TOOL_IN="$(jq -n '{name: "tool.ci-domains.test", provider: "fake", credentials: {api_token: "ci-fake-token-0123456789"},
+              ipv4: "203.0.113.10", ipv6: "", ca_server: "https://pebble:14000/dir",
+              caa: {enabled: true, issuer: "pebble.test", account_uri: "", iodef: ""}, nomail: false, sets: ["address", "caa"], mail_from: ""}')"
+          printf '%s' "$TOOL_IN" | docker compose run --rm -T dns-tool apply --wait 60s > /tmp/dns-tool-apply.json \
+            || { echo "FAIL: dns-tool apply: $(cat /tmp/dns-tool-apply.json)"; exit 1; }
+          jq -e '.can_write == true and .caa.would_issue == true
+              and ([.items[] | select((.set == "address" or .set == "caa") and .status != "foreign" and .severity != "info")] | length >= 3 and all(.status == "ok"))' /tmp/dns-tool-apply.json >/dev/null \
+            || { echo "FAIL: dns-tool apply plan: $(cat /tmp/dns-tool-apply.json)"; exit 1; }
+          # check without credentials, against the domains service's fake DNS:
+          # the enrolled $D, pinned to the service's account, exits 0.
+          IP4="$(echo "$PLAN" | jq -r '[.items[] | select(.set == "address" and .type == "A")][0].want[0]')"
+          jq -n --arg d "$D" --arg ip "$IP4" --argjson a "$ACCT" '{name: $d, provider: "", ipv4: $ip, ipv6: "", ca_server: $a.ca_server,
+              caa: {enabled: true, issuer: "pebble.test", account_uri: $a.account_uri, iodef: ""}, nomail: false, sets: [], mail_from: ""}' \
+            | docker compose run --rm -T -e DOMAINS_RESOLVERS=domains:8053 dns-tool check > /tmp/dns-tool-check.json \
+            || { echo "FAIL: dns-tool check: $(cat /tmp/dns-tool-check.json)"; exit 1; }
+          jq -e '.can_write == false and .caa.would_issue == true' /tmp/dns-tool-check.json >/dev/null || { echo "FAIL: dns-tool check plan: $(cat /tmp/dns-tool-check.json)"; exit 1; }
+          if printf '%s' "$TOOL_IN" | docker compose run --rm -T dns-tool check >/dev/null 2>&1; then echo "FAIL: dns-tool check accepted credentials"; exit 1; fi
+          echo "PASS: dns plan of $D pinned to the service's account; dns-tool apply / check (stdin credentials)"
 
           # Traefik picks it up by SNI through its HTTP provider, without a restart.
           sni_sans() { openssl s_client -connect 127.0.0.1:443 -servername "$1" </dev/null 2>/dev/null | openssl x509 -noout -ext subjectAltName 2>/dev/null | tail -n +2 | tr -d ' '; }
@@ -3329,6 +3388,8 @@ jobs:
                 ACME_CA_SERVER: https://pebble:14000/dir
                 LEGO_CA_CERTIFICATES: /run/ci/pebble.minica.pem
                 DOMAINS_RESOLVERS: 127.0.0.1:8053
+                # Pebble is no Let's Encrypt: its CAA issuer domain (caa set on).
+                DNS_CAA_ISSUER: pebble.test
               volumes:
                 - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
             pebble:

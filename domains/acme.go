@@ -43,9 +43,32 @@ func (s *Service) legoConfig(u *acmeUser) *lego.Config {
 	cfg.Certificate.KeyType = certcrypto.EC256
 	cfg.UserAgent = "portcullis-domains"
 	if s.cfg.ACMEHTTPClient != nil {
-		cfg.HTTPClient = s.cfg.ACMEHTTPClient
+		// A copy: lego wraps the client's transport in place, so a shared
+		// client would be raced (and re-wrapped) by concurrent orders.
+		hc := *s.cfg.ACMEHTTPClient
+		cfg.HTTPClient = &hc
 	}
 	return cfg
+}
+
+// accountCurrentLocked: the stored account matches the configured CA and
+// email (else account() registers a new one). Caller holds mu.
+func (s *Service) accountCurrentLocked() bool {
+	a := s.doc.Account
+	return a != nil && a.CAServer == s.cfg.CAServer && a.Email == s.cfg.Email && len(a.Registration) > 0
+}
+
+// accountURILocked is the stored account's URI ("" = none or stale).
+// Caller holds mu.
+func (s *Service) accountURILocked() string {
+	if !s.accountCurrentLocked() {
+		return ""
+	}
+	var reg registration.Resource
+	if json.Unmarshal(s.doc.Account.Registration, &reg) != nil {
+		return ""
+	}
+	return reg.URI
 }
 
 // account returns the ACME account, creating and registering it on first
@@ -147,6 +170,9 @@ func (c *challengeProvider) CleanUp(domain, _, keyAuth string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+	// TTL 0 matches any: providers may store another TTL than asked
+	// (porkbun raises anything under 600 s); the key-auth value is unique.
+	rec.TTL = 0
 	_, err = c.p.DeleteRecords(ctx, zone, []libdns.Record{rec})
 	return err
 }
@@ -157,12 +183,9 @@ func (c *challengeProvider) Timeout() (timeout, interval time.Duration) {
 }
 
 // obtain orders a certificate for <name> and *.<name> (fresh EC P-256 key)
-// and returns the full chain, the key and the expiry.
-func (s *Service) obtain(name string, p dnsProvider) (certPEM, keyPEM string, notAfter time.Time, err error) {
-	u, err := s.account()
-	if err != nil {
-		return "", "", time.Time{}, err
-	}
+// with the account u (registered by the caller before the CAA was pinned
+// to it) and returns the full chain, the key and the expiry.
+func (s *Service) obtain(name string, p dnsProvider, u *acmeUser) (certPEM, keyPEM string, notAfter time.Time, err error) {
 	client, err := lego.NewClient(s.legoConfig(u))
 	if err != nil {
 		return "", "", time.Time{}, fmt.Errorf("ACME directory %s: %w", s.cfg.CAServer, err)

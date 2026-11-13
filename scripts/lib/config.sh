@@ -51,6 +51,18 @@ config_build_ca_bundle() {
 
 config_apply() {
   local staging sentinel last ca_server
+  # lego's hetzner provider prefers HETZNER_API_TOKEN (the Cloud API) over
+  # HETZNER_API_KEY (the legacy DNS API): both set = the wrong API.
+  if [ "${DNS_PROVIDER:-}" = hetzner ] && [ -n "${HETZNER_API_TOKEN:-}" ]; then
+    fail "DNS_PROVIDER=hetzner (the legacy DNS API, HETZNER_API_KEY) but HETZNER_API_TOKEN is set: Traefik's lego would use the Cloud API. Remove HETZNER_API_TOKEN, or set DNS_PROVIDER=hetzner-cloud"
+  fi
+  if [ "${DNS_PROVIDER:-}" = hetzner-cloud ] && [ -n "${HETZNER_API_KEY:-}" ]; then
+    fail "DNS_PROVIDER=hetzner-cloud uses HETZNER_API_TOKEN, but HETZNER_API_KEY (the legacy DNS API) is set too: remove it"
+  fi
+  # Strict DNS_CAA (a typo must not switch CAA off), checked before
+  # anything changes: the flip below stops Traefik.
+  local caa
+  caa="$(_dns_flag DNS_CAA true)" || exit 1
   staging="$(_bool "$(env_get ACME_STAGING)" false)"
   echo "  ACME_STAGING=$staging"
 
@@ -67,6 +79,12 @@ config_apply() {
   if [ -n "$last" ] && [ "$last" != "$staging" ]; then
     warn "ACME_STAGING flipped ($last → $staging): clearing Traefik's ACME storage."
     dc stop traefik >/dev/null 2>&1 || true
+    # The new account Traefik registers can't order while the CAA is
+    # pinned to the old one: back to CA-only first (dns_tighten_main pins
+    # the new account after `up`).
+    if [ "$caa" = true ] && _dns_automated "${DNS_PROVIDER:-none}"; then
+      dns_relax_main
+    fi
     if docker volume inspect portcullis_traefik_acme >/dev/null 2>&1; then
       docker run --rm --network none -v portcullis_traefik_acme:/acme "$PORTCULLIS_HELPER_IMAGE" rm -f /acme/acme.json >/dev/null 2>&1 \
         || warn "could not clear acme.json"
@@ -83,6 +101,12 @@ config_apply() {
   mkdir -p "$(dirname "$sentinel")"
   echo "$staging" > "$sentinel"
   env_set ACME_CA_SERVER "$ca_server"
+  # Traefik's DNS-01 provider (lego): hetzner-cloud is lego's hetzner with
+  # HETZNER_API_TOKEN (lego v5's hetznerv1, Traefik v3.7.17).
+  local acme_dns="${DNS_PROVIDER:-}"
+  [ "$acme_dns" != hetzner-cloud ] || acme_dns=hetzner
+  env_set ACME_DNS_PROVIDER "$acme_dns"
+  export ACME_DNS_PROVIDER="$acme_dns"
   # TLS options are static (traefik/dynamic/tls.yml, tracked): the Hub
   # picks one per app router, core routers use authaware.
   ok "Updated ACME_CA_SERVER. Apply with: ./portcullis up"

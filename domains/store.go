@@ -37,7 +37,8 @@ type Domain struct {
 	CertPEM      string     `json:"cert_pem,omitempty"`
 	KeyPEM       string     `json:"key_pem,omitempty"`
 	CertNotAfter *time.Time `json:"cert_not_after,omitempty"`
-	// Records are the A/AAAA records the service set, per DNS zone (the
+	// Records are the records the service set (A/AAAA, its CAA entries,
+	// opted-in sets), per DNS zone (the
 	// zone found for the domain may change over its life); DELETE removes
 	// every one of them.
 	Records map[string][]RecordRef `json:"records,omitempty"`
@@ -58,6 +59,20 @@ type Domain struct {
 	// to; a different configured address makes the records due at start.
 	AppliedIPv4 string `json:"applied_ipv4,omitempty"`
 	AppliedIPv6 string `json:"applied_ipv6,omitempty"`
+	// CAAAccountURI: the ACME account URI the live CAA pin was written
+	// with ("" = none written); another current URI makes caa due.
+	CAAAccountURI string `json:"caa_account_uri,omitempty"`
+	// CAAOK: the last check found our CAA in place and the CA would issue
+	// for <d> and *.<d> (false with CAA off or an unknown CA).
+	CAAOK bool `json:"caa_ok"`
+	// DNSSEC: the last chain check's state (dnssec.State).
+	DNSSEC string `json:"dnssec"`
+	// Sets: the optional record sets opted in (nomail); DueSets: sets to
+	// apply on the next records step (POST /domains/{name}/dns/apply).
+	Sets    []string `json:"sets,omitempty"`
+	DueSets []string `json:"due_sets,omitempty"`
+	// SignRequested: turn DNSSEC signing on in the next records step.
+	SignRequested bool `json:"sign_requested,omitempty"`
 	// Deleting: a DELETE is in progress (not persisted). No new work
 	// starts and running work commits nothing but the records it set.
 	Deleting bool `json:"-"`

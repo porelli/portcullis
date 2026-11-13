@@ -25,6 +25,78 @@ _st_line() {  # _st_line ok|warn|fail <text>
   esac
 }
 
+# _st_dns_json <report> <traefik-uri> <env-uri> — the `dns` block of
+# status from the domains service's report ({main, domains}): one summary
+# per name, and the lost-account check. "" = no report.
+_st_dns_json() {
+  local report="$1" traefik_uri="$2" env_uri="$3"
+  [ -n "$report" ] && printf '%s' "$report" | jq -e 'type == "object" and has("main")' >/dev/null 2>&1 || return 0
+  printf '%s' "$report" | jq -c --arg t "$traefik_uri" --arg e "$env_uri" '
+    def bad: .severity == "warning" or .severity == "problem";
+    def summary: {
+      address_ok: ([.items[] | select(.set == "address" and .status != "foreign")] | all(.status == "ok")),
+      # Not ok only because the server addresses (or a lookup) are unknown.
+      address_unknown: ([.items[] | select(.set == "address" and .status != "foreign")] | (any(.status != "ok") and all(.status == "ok" or .status == "unknown"))),
+      caa_ok: ([.items[] | select(.set == "caa" and .status != "foreign")] | all(.status == "ok")),
+      would_issue: .caa.would_issue,
+      dnssec: .dnssec.state,
+      foreign: ([.items[] | select(.status == "foreign")] | length),
+      problems: (if ([.items[] | select(.severity == "problem")] | length) > 0 or (.dnssec.state == "bogus" or .dnssec.state == "ds_mismatch") then 1 else 0 end),
+      checks: {
+        address: (if [.items[] | select(.set == "address" and .status != "foreign") | select(bad)] | length > 0 then 0 else 1 end),
+        caa: (if ([.items[] | select(.set == "caa") | select(bad)] | length > 0) or ((.caa.issuer // "") != "" and (.caa.would_issue | not)) then 0 else 1 end),
+        dnssec: (if (.dnssec.state == "secure" or .dnssec.state == "unsigned" or .dnssec.state == "insecure") then 1 else 0 end),
+        foreign: (if [.items[] | select(.status == "foreign") | select(bad)] | length > 0 then 0 else 1 end)}};
+    (.main | summary) as $m
+    # Lost account (F5): the CA would not issue to the pin, or the pin the
+    # service judges (main-domain.env) is another account than Traefik'"'"'s
+    # current one. No main-domain.env yet (Traefik registered after the
+    # last up) is not lost: _st_dns_lines warns.
+    | ((($m.would_issue | not) and ((.main.caa.issuer // "") != "")) or ($t != "" and $e != "" and $e != $t)) as $lost
+    | {main: ($m + {name: .main.name, lost_account: $lost, problems: (if $lost then 1 else $m.problems end)}),
+       domains: ((.domains // {}) | map_values(summary + {name: .name}))}'
+}
+
+# _st_dns_lines <dns-json> [<traefik-uri> <env-uri>] — the DNS block of
+# `status`.
+_st_dns_lines() {
+  local dns="$1" traefik_uri="${2:-}" env_uri="${3:-}" name addr addr_unknown caa wi sec foreign lost main=true
+  printf '\n%sDNS%s\n' "$C_CYAN" "$C_NC"
+  if [ -z "$dns" ]; then
+    _st_line warn "DNS checks unavailable (the domains service isn't running)"
+    return 0
+  fi
+  while IFS=$'\t' read -r name addr addr_unknown caa wi sec foreign lost; do
+    [ -n "$name" ] || continue
+    if [ "$addr" = true ]; then
+      _st_line ok "$name: A/AAAA point at this server"
+    elif [ "$addr_unknown" = true ]; then
+      _st_line warn "$name: A/AAAA can't be checked: the server's addresses (or a lookup) are unknown (./portcullis dns plan)"
+    else
+      _st_line fail "$name: A/AAAA records wrong or missing (./portcullis dns plan)"
+    fi
+    if [ "$main" = true ] && [ -n "$traefik_uri" ] && [ -z "$env_uri" ]; then
+      _st_line warn "$name: the domains service doesn't know Traefik's ACME account yet (secrets/domains/main-domain.env) — ./portcullis dns check records it"
+    fi
+    main=false
+    if [ "$lost" = true ]; then
+      _st_line fail "$name: CAA allows another ACME account than Traefik's — fix: ./portcullis dns setup"
+    elif [ "$caa" = true ] && [ "$wi" = true ]; then
+      _st_line ok "$name: CAA pinned, the CA would issue"
+    else
+      _st_line warn "$name: CAA not as planned (./portcullis dns plan)"
+    fi
+    case "$sec" in
+      secure) _st_line ok "$name: DNSSEC secure" ;;
+      unsigned) _st_line ok "$name: DNSSEC unsigned (./portcullis dns plan shows how to sign)" ;;
+      insecure) _st_line ok "$name: DNSSEC signed, under a parent zone that isn't validated (nothing to fix here)" ;;
+      bogus|ds_mismatch) _st_line fail "$name: DNSSEC $sec — validating resolvers can't reach it (./portcullis dns plan)" ;;
+      *) _st_line warn "$name: DNSSEC $sec (./portcullis dns plan)" ;;
+    esac
+    [ "$foreign" = 0 ] || _st_line warn "$name: $foreign record(s) under it aren't Portcullis' (./portcullis dns plan)"
+  done < <(printf '%s' "$dns" | jq -r '([.main] + [.domains[]])[] | [.name, .address_ok, (.address_unknown // false), .caa_ok, .would_issue, .dnssec, .foreign, (.lost_account // false)] | @tsv')
+}
+
 status_run() {
   local json="$1" problems=0 out
   local services="[]" svc_raw vault_code vault_json='{}' kc='{}' lldap='{}' traefik
@@ -123,12 +195,24 @@ status_run() {
   mcp_refusing="$(_st_mcp_refusing)"
   [ -z "$mcp_refusing" ] || problems=1
 
+  # ── DNS (the domains service's plans; Traefik's account for the pin) ──
+  local dns_json traefik_uri=""
+  dns_json="$(dns_status_json)"
+  [ -z "$dns_json" ] || traefik_uri="$(dns_traefik_account_uri)" || traefik_uri=""
+  local env_uri
+  env_uri="$(dns_main_env_uri)" || env_uri=""
+  dns_json="$(_st_dns_json "$dns_json" "$traefik_uri" "$env_uri")"
+  if [ -n "$dns_json" ] && [ "$(printf '%s' "$dns_json" | jq '[.main.problems, (.domains[] | .problems)] | add')" != 0 ]; then
+    problems=1
+  fi
+
   if [ "$json" = true ]; then
     jq -n --arg d "${PORTCULLIS_DOMAIN:-}" --argjson s "$services" --argjson v "$vault_json" \
-      --argjson k "$kc" --argjson l "$lldap" --arg t "$traefik" --argjson p "$problems" --arg sh "$shadows" --arg mr "$mcp_refusing" \
+      --argjson k "$kc" --argjson l "$lldap" --arg t "$traefik" --argjson p "$problems" --arg sh "$shadows" --arg mr "$mcp_refusing" --arg dn "$dns_json" \
       '{domain: $d, ok: ($p == 0), services: $s, vault: $v, keycloak: $k, lldap: $l, traefik: {state: $t},
         dns_shadows: [$sh | split("\n")[] | select(. != "") | capture("^(?<container>[^ ]+) (?<name>.+)$")],
-        mcp_gate: {refusing: (if $mr == "" then null else $mr end)}}'
+        mcp_gate: {refusing: (if $mr == "" then null else $mr end)},
+        dns: (if $dn == "" then null else ($dn | fromjson) end)}'
     return "$problems"
   fi
 
@@ -206,6 +290,7 @@ status_run() {
     esac
   done <<< "$shadows"
   [ -z "$mcp_refusing" ] || _st_line fail "mcp-gate: $mcp_refusing"
+  _st_dns_lines "$dns_json" "$traefik_uri" "$env_uri"
 
   printf '\n%sDomain: %s — run with --json for machine-readable output%s\n\n' "$C_DIM" "${PORTCULLIS_DOMAIN:-?}" "$C_NC"
   return "$problems"
@@ -235,7 +320,11 @@ status_textfile() {
     (if (.vault.intermediate_ca_expires_epoch // 0) > 0 then "portcullis_ca_expiry_timestamp_seconds{ca=\"intermediate\"} \(.vault.intermediate_ca_expires_epoch)" else empty end),
     (if (.vault.browser_ca_expires_epoch // 0) > 0 then "portcullis_ca_expiry_timestamp_seconds{ca=\"browser\"} \(.vault.browser_ca_expires_epoch)" else empty end),
     g("portcullis_client_cert_expiry_timestamp_seconds"; "Expiry of the newest valid, unrevoked YubiKey and browser certificate of each user."),
-    ((.vault.client_certs // [])[] | "portcullis_client_cert_expiry_timestamp_seconds{cn=\"\(.cn | esc)\",kind=\"\(.kind | esc)\"} \(.epoch)")
+    ((.vault.client_certs // [])[] | "portcullis_client_cert_expiry_timestamp_seconds{cn=\"\(.cn | esc)\",kind=\"\(.kind | esc)\"} \(.epoch)"),
+    g("portcullis_dns_check"; "1 if the DNS check (address, caa, dnssec, foreign) of the name has no Warning or Problem (absent: DNS checks unavailable)."),
+    (if .dns == null then empty else ([.dns.main] + [.dns.domains[]])[] | . as $d | ($d.checks | to_entries[] | "portcullis_dns_check{name=\"\($d.name | esc)\",check=\"\(.key)\"} \(.value)") end),
+    g("portcullis_dnssec_state"; "1 for the current DNSSEC state of the name."),
+    (if .dns == null then empty else ([.dns.main] + [.dns.domains[]])[] | select((.dnssec // "") != "") | "portcullis_dnssec_state{name=\"\(.name | esc)\",state=\"\(.dnssec | esc)\"} 1" end)
   ' | metrics_textfile_write status
   return "$rc"
 }
@@ -438,15 +527,20 @@ Keycloak (realm, users, forward-auth client, the passkey policy: attestation
 direct, any attachment, resident key and user verification required, only
 the passwordless registration action on — anything else fails: new passkeys
 couldn't be told apart),
-LLDAP and Traefik. Exits 1 if a core service is down/unhealthy or Vault is
-not active, 0 otherwise.
+LLDAP, Traefik and DNS (per name, from the domains service: A/AAAA point
+at this server, CAA as planned and allowing Traefik's ACME account, DNSSEC
+state, records that aren't Portcullis'; a warning if the domains service
+isn't running). Exits 1 if a core service is down/unhealthy, Vault is not
+active, or DNS has a problem (a wrong or missing record, DNSSEC bogus or DS
+mismatch, CAA locking out Traefik's account), 0 otherwise.
 
 Options:
   --json       machine-readable output (same exit status)
   --textfile   write the same as Prometheus metrics to
                monitoring/textfile/status.prom for the monitoring profile
                (service health, Vault active, the passkey policy, CA and
-               per-user YubiKey / browser certificate expiry); run after every scheduled backup
+               per-user YubiKey / browser certificate expiry, per-name DNS
+               checks and DNSSEC state); run after every scheduled backup
 EOF
 }
 

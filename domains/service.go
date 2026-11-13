@@ -15,6 +15,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/portcullis/domains/internal/dnsplan"
+	"github.com/portcullis/domains/internal/dnssec"
 )
 
 // Domain states (contract §12.2).
@@ -53,6 +56,17 @@ type Config struct {
 	RecheckEvery time.Duration
 	// Tick: how often the worker looks for due work.
 	Tick time.Duration
+	// CAA: the caa record set is on (DNS_CAA). CAAIssuer is the CA's CAA
+	// issuer domain (dnsplan.IssuerFor at start; "" = unknown CA: nothing
+	// written, nothing judged). CAAIODEF: optional iodef (DNS_CAA_IODEF).
+	CAA       bool
+	CAAIssuer string
+	CAAIODEF  string
+	// MainAccountURI: Traefik's ACME account URI (main-domain.env), the
+	// pin the read-only main-domain plan judges against.
+	MainAccountURI string
+	// MailFrom: ALERT_SMTP_FROM (no nomail recommendation for its domain).
+	MailFrom string
 	// ACMEHTTPClient overrides lego's HTTP client (tests: Pebble's TLS).
 	ACMEHTTPClient *http.Client
 	Now            func() time.Time
@@ -70,6 +84,12 @@ type Service struct {
 	doc  *storeDoc
 	busy map[string]*job // running work per domain name
 	kick chan struct{}
+
+	// plans caches the last plan per domain name (mainPlanKey: the main
+	// domain), guarded by mu; built outside mu.
+	plans map[string]cachedPlan
+	// mainBuilding: the worker's main-plan rebuild is running (guarded by mu).
+	mainBuilding bool
 
 	acmeMu      sync.Mutex // serialises ACME account registration
 	lastDropped string     // last logged list of dropped certificates (guarded by mu)
@@ -119,7 +139,8 @@ func NewService(cfg Config, store *Store) (*Service, error) {
 			d.State = StatePending
 		}
 	}
-	return &Service{cfg: cfg, store: store, findZone: legoZoneFinder, doc: doc, busy: map[string]*job{}, kick: make(chan struct{}, 1)}, nil
+	return &Service{cfg: cfg, store: store, findZone: legoZoneFinder, doc: doc, busy: map[string]*job{}, kick: make(chan struct{}, 1),
+		plans: map[string]cachedPlan{}}, nil
 }
 
 // job is one running attempt for a domain. rec (a one-slot semaphore) is
@@ -186,10 +207,13 @@ type View struct {
 	CertNotAfter *string `json:"cert_not_after"`
 	LastError    string  `json:"last_error"`
 	State        string  `json:"state"`
+	CAAOK        bool    `json:"caa_ok"`
+	DNSSEC       string  `json:"dnssec"`
 }
 
 func (s *Service) viewLocked(d *Domain) View {
-	v := View{Name: d.Name, Provider: d.Provider, RecordsOK: d.RecordsOK, LastError: d.LastError, State: d.State}
+	v := View{Name: d.Name, Provider: d.Provider, RecordsOK: d.RecordsOK, LastError: d.LastError, State: d.State,
+		CAAOK: d.CAAOK, DNSSEC: d.DNSSEC}
 	// cert_not_after is the expiry of the certificate actually served.
 	if d.CertNotAfter != nil && servable(d, s.cfg.MainDomain, s.cfg.Now()) == nil {
 		t := d.CertNotAfter.UTC().Format(time.RFC3339)
@@ -205,6 +229,11 @@ func (s *Service) APIHandler() http.Handler {
 	mux.HandleFunc("PUT /domains/{name}", s.handleEnroll)
 	mux.HandleFunc("POST /domains/{name}/token", s.handleToken)
 	mux.HandleFunc("DELETE /domains/{name}", s.handleDelete)
+	mux.HandleFunc("GET /domains/{name}/dns", s.handlePlan)
+	mux.HandleFunc("POST /domains/{name}/dns/apply", s.handleApply)
+	mux.HandleFunc("POST /domains/{name}/dnssec", s.handleDNSSEC)
+	mux.HandleFunc("GET /main/dns", s.handleMainPlan)
+	mux.HandleFunc("GET /acme/account", s.handleAccount)
 	want := sha256.Sum256([]byte("Bearer " + s.cfg.Secret))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
@@ -386,6 +415,7 @@ func (s *Service) handleDelete(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	snap := copyDomain(d)
 	delete(s.doc.Domains, name)
+	delete(s.plans, name)
 	err := s.store.Save(s.doc)
 	if err != nil {
 		d.Deleting = false
@@ -480,6 +510,7 @@ func (s *Service) Run(ctx context.Context) {
 	defer t.Stop()
 	for {
 		s.dispatch(ctx)
+		s.refreshMainPlan(ctx)
 		select {
 		case <-ctx.Done():
 			s.wg.Wait()
@@ -502,9 +533,36 @@ func (s *Service) dueLocked(d *Domain, now time.Time) bool {
 		return false
 	}
 	if d.State == StateReady {
-		return s.needsCert(d, now) || now.Sub(d.RecordsCheckedAt) >= s.cfg.RecheckEvery
+		return s.needsCert(d, now) || now.Sub(d.RecordsCheckedAt) >= s.cfg.RecheckEvery ||
+			s.caaDueLocked(d, s.accountURILocked()) || len(d.DueSets) > 0 || d.SignRequested
 	}
 	return true
+}
+
+// caaDueLocked: the caa set must be applied — CAA on with a known issuer
+// and the live pin written for another account URI than uri (or the
+// stored account no longer matches the configured CA / email, so a new
+// one registers first); or CAA off while CAA entries we wrote are still
+// recorded (removal). Caller holds mu.
+func (s *Service) caaDueLocked(d *Domain, uri string) bool {
+	if !s.cfg.CAA {
+		return hasCAARefs(d)
+	}
+	if s.cfg.CAAIssuer == "" {
+		return false
+	}
+	return d.CAAAccountURI == "" || d.CAAAccountURI != uri || !s.accountCurrentLocked()
+}
+
+func hasCAARefs(d *Domain) bool {
+	for _, refs := range d.Records {
+		for _, r := range refs {
+			if r.Type == "CAA" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // dispatch starts work for every due domain that isn't already busy.
@@ -636,31 +694,102 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 	}
 	needCert := s.needsCert(snap, now)
 	hasValid := snap.CertNotAfter != nil && servable(snap, s.cfg.MainDomain, now) == nil
+	s.mu.Lock()
+	caaDue := s.caaDueLocked(snap, s.accountURILocked())
+	s.mu.Unlock()
+	// The account first (registration is never CAA-checked), so the CAA
+	// can be pinned to its URI before any order (contract §12.4).
+	var u *acmeUser
+	uri := ""
+	// An explicitly due caa set (POST …/dns/apply) needs the account too.
+	if needCert || caaDue || contains(snap.DueSets, dnsplan.SetCAA) {
+		if u, err = s.account(); err != nil {
+			fail(err)
+			return
+		}
+		uri = u.reg.URI
+	}
 	// The server's IPv4 unknown (./portcullis up couldn't detect it) but
 	// records were set before: keep them and go on (a renewal must not
 	// stall on an address lookup); the check compares with what was set.
 	keepRecords := !s.cfg.IPv4.IsValid() && snap.AppliedIPv4 != ""
-	if keepRecords && !(snap.State == StateReady && !needCert) {
-		s.logf("domain %s: the server's public IPv4 is unknown: keeping the records set for %s (records step skipped)", name, snap.AppliedIPv4)
-	}
-	if !keepRecords && !(snap.State == StateReady && !needCert) {
+	recordsStep := !(snap.State == StateReady && !needCert) || caaDue || len(snap.DueSets) > 0 || snap.SignRequested
+	if recordsStep {
+		var sets []string
+		for _, set := range dnsplan.Sets {
+			switch {
+			case set == dnsplan.SetAddress && keepRecords:
+				s.logf("domain %s: the server's public IPv4 is unknown: keeping the records set for %s (records step skipped)", name, snap.AppliedIPv4)
+			case set == dnsplan.SetAddress:
+				sets = append(sets, set)
+			case set == dnsplan.SetCAA:
+				if u != nil && (s.cfg.CAA && s.cfg.CAAIssuer != "" || !s.cfg.CAA && hasCAARefs(snap)) {
+					sets = append(sets, set)
+				}
+			case contains(snap.Sets, set) || contains(snap.DueSets, set):
+				sets = append(sets, set)
+			}
+		}
+		// Due sets this step can't apply are cleared (logged), never
+		// retried every tick.
+		for _, x := range snap.DueSets {
+			if !contains(sets, x) {
+				s.logf("domain %s: record set %s requested but not applicable now (%s): skipped", name, x, s.whyNotApplicable(x, keepRecords, snap))
+			}
+		}
 		j.lock()
 		if !s.update(name, gen, func(d *Domain) { d.State = StateRecords }) {
 			j.unlock()
 			return
 		}
 		rctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
-		refs, zone, err := s.setRecords(rctx, p, name)
+		var written, removed []RecordRef
+		var zone string
+		if len(sets) > 0 {
+			written, removed, zone, err = s.applySets(rctx, p, snap, sets, uri)
+		}
+		// CAA off: the CAA entries recorded in other zones (the zone found
+		// changed) are removed there too, best effort, and dropped.
+		var otherZones []string
+		if err == nil && !s.cfg.CAA && contains(sets, dnsplan.SetCAA) {
+			for z, refs := range snap.Records {
+				var caa []RecordRef
+				for _, r := range refs {
+					if r.Type == "CAA" {
+						caa = append(caa, r)
+					}
+				}
+				if z == zone || len(caa) == 0 {
+					continue
+				}
+				if derr := deleteRecords(rctx, p, z, caa); derr != nil {
+					s.logf("domain %s: removing its CAA records in zone %s failed (dropped anyway): %s", name, z, redact(derr.Error(), snap.Credentials))
+				}
+				otherZones = append(otherZones, z)
+			}
+		}
+		if err == nil && snap.SignRequested {
+			err = s.enableSigning(rctx, snap)
+		}
 		cancel()
-		// Recorded even on failure (a partial SetRecords may have created
+		// Recorded even on failure (a partial apply may have created
 		// some) and while a DELETE waits, so DELETE removes them.
 		if zone != "" {
 			s.updateRecords(name, snap.EnrollID, func(d *Domain) {
 				if d.Records == nil {
 					d.Records = map[string][]RecordRef{}
 				}
-				d.Records[zone] = mergeRecords(d.Records[zone], refs)
-				if err == nil {
+				d.Records[zone] = mergeRecords(dropRecords(d.Records[zone], removed), written)
+				for _, z := range otherZones {
+					var keep []RecordRef
+					for _, r := range d.Records[z] {
+						if r.Type != "CAA" {
+							keep = append(keep, r)
+						}
+					}
+					d.Records[z] = keep
+				}
+				if err == nil && contains(sets, dnsplan.SetAddress) {
 					d.AppliedIPv4, d.AppliedIPv6 = addrString(s.cfg.IPv4), addrString(s.cfg.IPv6)
 				}
 			})
@@ -670,6 +799,32 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 			s.update(name, gen, func(d *Domain) { d.RecordsOK = false })
 			fail(err)
 			return
+		}
+		requested := snap.DueSets
+		s.update(name, gen, func(d *Domain) {
+			var left []string
+			for _, x := range d.DueSets {
+				if !contains(requested, x) { // requested meanwhile: next step
+					left = append(left, x)
+				}
+			}
+			d.DueSets = left
+			if snap.SignRequested {
+				d.SignRequested = false
+			}
+			if contains(sets, dnsplan.SetCAA) && !s.cfg.CAA {
+				d.CAAAccountURI, d.CAAOK = "", false
+			}
+		})
+		// Pinned: wait until every resolver lets the CA issue to this
+		// account, and only then order.
+		if contains(sets, dnsplan.SetCAA) && s.cfg.CAA {
+			if err := s.waitCAA(ctx, name, uri); err != nil {
+				s.update(name, gen, func(d *Domain) { d.CAAOK = false })
+				fail(fmt.Errorf("CAA not visible at the public resolvers yet: %w", err))
+				return
+			}
+			s.update(name, gen, func(d *Domain) { d.CAAAccountURI = uri })
 		}
 	}
 	if needCert {
@@ -681,7 +836,7 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 			return
 		}
 		s.logf("domain %s: %s a certificate for %s and *.%s", name, map[bool]string{true: "renewing", false: "requesting"}[hasValid], name, name)
-		certPEM, keyPEM, notAfter, err := s.obtain(name, p)
+		certPEM, keyPEM, notAfter, err := s.obtain(name, p, u)
 		if err != nil {
 			fail(err)
 			return
@@ -705,11 +860,363 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 		fail(fmt.Errorf("records not visible at the public resolvers yet: %w", err))
 		return
 	}
+	s.refreshChecks(ctx, name, gen, p)
 	if s.update(name, gen, func(d *Domain) {
 		d.State, d.LastError, d.Failures, d.NextAttempt = StateReady, "", 0, time.Time{}
 	}) && snap.State != StateReady {
 		s.logf("domain %s: ready", name)
 	}
+}
+
+// whyNotApplicable says why a requested set isn't applied in this step.
+func (s *Service) whyNotApplicable(set string, keepRecords bool, d *Domain) string {
+	switch {
+	case set == dnsplan.SetAddress && keepRecords:
+		return "the server's public IPv4 is unknown"
+	case set == dnsplan.SetCAA && s.cfg.CAA && s.cfg.CAAIssuer == "":
+		return "unknown CA: set DNS_CAA_ISSUER"
+	case set == dnsplan.SetCAA && !s.cfg.CAA:
+		return "DNS_CAA=false and no CAA entries of Portcullis' are recorded"
+	}
+	return "not opted in"
+}
+
+// enableSigning turns DNSSEC signing on for d's zone (SignRequested).
+func (s *Service) enableSigning(ctx context.Context, d *Domain) error {
+	r, _, err := buildDNSSEC(d)
+	if err != nil {
+		return err
+	}
+	signer, ok := r.(dnssec.Signer)
+	if !ok {
+		return fmt.Errorf("%s can't sign the zone through its API", d.Provider)
+	}
+	zone, err := dnssec.FindZone(ctx, s.cfg.Resolvers, d.Name)
+	if err != nil {
+		return fmt.Errorf("finding the DNS zone of %s: %w", d.Name, err)
+	}
+	if err := signer.EnableDNSSEC(ctx, zone); err != nil {
+		return fmt.Errorf("turning on DNSSEC signing for %s: %w", strings.TrimSuffix(zone, "."), err)
+	}
+	s.logf("domain %s: DNSSEC signing turned on for the zone %s", d.Name, strings.TrimSuffix(zone, "."))
+	return nil
+}
+
+// refreshChecks builds the domain's plan (public checks + provider view)
+// and records caa_ok and dnssec from it.
+func (s *Service) refreshChecks(ctx context.Context, name string, gen int, p dnsProvider) {
+	s.mu.Lock()
+	d, ok := s.doc.Domains[name]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	snap := copyDomain(d)
+	s.mu.Unlock()
+	pctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	pl := s.finishPlan(s.buildPlan(pctx, snap, p))
+	s.mu.Lock()
+	s.plans[name] = cachedPlan{plan: pl, at: s.cfg.Now()}
+	s.mu.Unlock()
+	// caa_ok (contract §12.2): the CA would issue to the service's account.
+	caaOK := s.cfg.CAA && s.cfg.CAAIssuer != "" && pl.CAA.WouldIssue
+	s.update(name, gen, func(d *Domain) { d.CAAOK, d.DNSSEC = caaOK, string(pl.DNSSEC.State) })
+}
+
+// ── DNS plans (contract §12.2) ───────────────────────────
+
+// planRefreshEvery throttles ?refresh=1: one build per name per 30 s.
+const planRefreshEvery = 30 * time.Second
+
+// planTimeout bounds one plan build.
+const planTimeout = 60 * time.Second
+
+// mainPlanKey is the main domain's key in plans (never a valid name).
+const mainPlanKey = "@main"
+
+type cachedPlan struct {
+	plan dnsplan.Plan
+	at   time.Time
+}
+
+// cachedLocked returns the cached plan to answer with, if any: always
+// without refresh, within the throttle window with it. Caller holds mu.
+func (s *Service) cachedLocked(key string, refresh bool) (dnsplan.Plan, bool) {
+	c, ok := s.plans[key]
+	if !ok {
+		return dnsplan.Plan{}, false
+	}
+	if !refresh || s.cfg.Now().Sub(c.at) < planRefreshEvery {
+		return c.plan, true
+	}
+	return dnsplan.Plan{}, false
+}
+
+// errNotEnrolled: plan() for a name the service doesn't hold.
+var errNotEnrolled = errors.New("not enrolled")
+
+// plan is the domain's plan, cached; refresh rebuilds it (throttled).
+func (s *Service) plan(ctx context.Context, name string, refresh bool) (dnsplan.Plan, error) {
+	s.mu.Lock()
+	d, ok := s.doc.Domains[name]
+	if !ok || d.Deleting {
+		s.mu.Unlock()
+		return dnsplan.Plan{}, errNotEnrolled
+	}
+	if pl, ok := s.cachedLocked(name, refresh); ok {
+		s.mu.Unlock()
+		return pl, nil
+	}
+	snap := copyDomain(d)
+	s.mu.Unlock()
+	p, err := buildProvider(snap)
+	if err != nil {
+		p = nil // read-only plan; the records step reports the error
+	}
+	pl := s.finishPlan(s.buildPlan(ctx, snap, p))
+	s.mu.Lock()
+	s.plans[name] = cachedPlan{plan: pl, at: s.cfg.Now()}
+	s.mu.Unlock()
+	return pl, nil
+}
+
+// refreshMainPlan rebuilds the main domain's plan in the background when
+// there is none or it is RecheckEvery old (as enrolled domains' plans are
+// rebuilt by their records check), so every reader sees a fresh plan.
+func (s *Service) refreshMainPlan(ctx context.Context) {
+	s.mu.Lock()
+	c, ok := s.plans[mainPlanKey]
+	if s.mainBuilding || (ok && s.cfg.Now().Sub(c.at) < s.cfg.RecheckEvery) {
+		s.mu.Unlock()
+		return
+	}
+	s.mainBuilding = true
+	s.mu.Unlock()
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				s.logf("main domain plan: panic recovered: %v", r)
+			}
+			s.mu.Lock()
+			s.mainBuilding = false
+			s.mu.Unlock()
+		}()
+		pctx, cancel := context.WithTimeout(ctx, planTimeout)
+		defer cancel()
+		if pl := s.buildMainPlan(pctx); ctx.Err() == nil {
+			s.mu.Lock()
+			s.plans[mainPlanKey] = cachedPlan{plan: pl, at: s.cfg.Now()}
+			s.mu.Unlock()
+		}
+	}()
+}
+
+// mainPlan is the main domain's read-only plan (no credentials: public
+// checks only, pinned to Traefik's account URI from main-domain.env).
+func (s *Service) mainPlan(ctx context.Context, refresh bool) dnsplan.Plan {
+	s.mu.Lock()
+	if pl, ok := s.cachedLocked(mainPlanKey, refresh); ok {
+		s.mu.Unlock()
+		return pl
+	}
+	s.mu.Unlock()
+	pl := s.buildMainPlan(ctx)
+	s.mu.Lock()
+	s.plans[mainPlanKey] = cachedPlan{plan: pl, at: s.cfg.Now()}
+	s.mu.Unlock()
+	return pl
+}
+
+// buildMainPlan builds the main domain's read-only plan (no cache).
+func (s *Service) buildMainPlan(ctx context.Context) dnsplan.Plan {
+	sp := dnsplan.Spec{Name: s.cfg.MainDomain, IPv4: s.cfg.IPv4, IPv6: s.cfg.IPv6, CAA: s.cfg.CAA, Issuer: s.cfg.CAAIssuer,
+		AccountURI: s.cfg.MainAccountURI, IODEF: s.cfg.CAAIODEF, Main: true}
+	return s.finishPlan(dnsplan.Build(ctx, dnsplan.Input{Spec: sp, Resolvers: s.cfg.Resolvers, Now: s.cfg.Now()}))
+}
+
+// finishPlan drops the nomail recommendation for a name that sends the
+// alert mail (ALERT_SMTP_FROM at it or under it, spec §3).
+func (s *Service) finishPlan(pl dnsplan.Plan) dnsplan.Plan { return dropNoMailFor(pl, s.cfg.MailFrom) }
+
+// dropNoMailFor removes the nomail recommendation when mailFrom's domain
+// is the plan's name or under it (the service and the dns tool).
+func dropNoMailFor(pl dnsplan.Plan, mailFrom string) dnsplan.Plan {
+	_, dom, ok := strings.Cut(mailFrom, "@")
+	dom = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(dom), "."))
+	if !ok || dom == "" || (dom != pl.Name && !strings.HasSuffix(dom, "."+pl.Name)) {
+		return pl
+	}
+	items := make([]dnsplan.Item, 0, len(pl.Items))
+	for _, it := range pl.Items {
+		if it.Set == dnsplan.SetNoMail && it.Status == dnsplan.StatusMissing && it.Severity == dnsplan.SevInfo {
+			continue
+		}
+		items = append(items, it)
+	}
+	pl.Items = items
+	return pl
+}
+
+func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
+	name, ok := s.pathName(w, r)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), planTimeout)
+	defer cancel()
+	pl, err := s.plan(ctx, name, r.URL.Query().Get("refresh") == "1")
+	if err != nil {
+		writeError(w, http.StatusNotFound, name+" is not enrolled")
+		return
+	}
+	writeJSON(w, http.StatusOK, pl)
+}
+
+func (s *Service) handleMainPlan(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), planTimeout)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mainPlan(ctx, r.URL.Query().Get("refresh") == "1"))
+}
+
+func (s *Service) handleAccount(w http.ResponseWriter, _ *http.Request) {
+	s.mu.Lock()
+	uri := s.accountURILocked()
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]string{"ca_server": s.cfg.CAServer, "account_uri": uri, "caa_issuer": s.cfg.CAAIssuer})
+}
+
+// decodeStrict decodes exactly one JSON object with known fields only.
+func decodeStrict(w http.ResponseWriter, r *http.Request, v any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v) == nil && dec.Decode(&struct{}{}) == io.EOF
+}
+
+func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
+	name, ok := s.pathName(w, r)
+	if !ok {
+		return
+	}
+	var b struct {
+		Sets []string `json:"sets"`
+	}
+	usage := `body must be {"sets": [...]} with sets from ` + strings.Join(dnsplan.Sets, ", ")
+	if !decodeStrict(w, r, &b) || len(b.Sets) == 0 {
+		writeError(w, http.StatusBadRequest, usage)
+		return
+	}
+	for _, set := range b.Sets {
+		if !contains(dnsplan.Sets, set) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown record set %q: %s", set, usage))
+			return
+		}
+	}
+	s.mu.Lock()
+	d, exists := s.doc.Domains[name]
+	if !exists || d.Deleting {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, name+" is not enrolled")
+		return
+	}
+	oldSets, oldDue := d.Sets, d.DueSets
+	for _, set := range b.Sets {
+		if set == dnsplan.SetNoMail && !contains(d.Sets, set) {
+			d.Sets = append(append([]string(nil), d.Sets...), set)
+		}
+		if !contains(d.DueSets, set) {
+			d.DueSets = append(append([]string(nil), d.DueSets...), set)
+		}
+	}
+	d.NextAttempt = time.Time{}
+	err := s.store.Save(s.doc)
+	if err != nil {
+		d.Sets, d.DueSets = oldSets, oldDue
+	}
+	v := s.viewLocked(d)
+	s.mu.Unlock()
+	if err != nil {
+		s.logf("dns apply %s: saving the store failed: %v", name, err)
+		writeError(w, http.StatusInternalServerError, "saving the store failed")
+		return
+	}
+	s.logf("domain %s: record sets due: %s", name, strings.Join(b.Sets, ", "))
+	s.Kick()
+	writeJSON(w, http.StatusAccepted, v)
+}
+
+func (s *Service) handleDNSSEC(w http.ResponseWriter, r *http.Request) {
+	name, ok := s.pathName(w, r)
+	if !ok {
+		return
+	}
+	var b struct {
+		Enable *bool `json:"enable"`
+	}
+	if !decodeStrict(w, r, &b) || b.Enable == nil || !*b.Enable {
+		writeError(w, http.StatusBadRequest, `body must be {"enable": true} (signing is never turned off)`)
+		return
+	}
+	s.mu.Lock()
+	d, exists := s.doc.Domains[name]
+	if !exists || d.Deleting {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, name+" is not enrolled")
+		return
+	}
+	snap := copyDomain(d)
+	s.mu.Unlock()
+	if _, can, err := buildDNSSEC(snap); err != nil || !can {
+		writeError(w, http.StatusConflict, snap.Provider+" can't sign the zone through its API")
+		return
+	}
+	s.mu.Lock()
+	d, exists = s.doc.Domains[name]
+	if !exists || d.Deleting {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, name+" is not enrolled")
+		return
+	}
+	d.SignRequested, d.NextAttempt = true, time.Time{}
+	err := s.store.Save(s.doc)
+	if err != nil {
+		d.SignRequested = false
+	}
+	v := s.viewLocked(d)
+	s.mu.Unlock()
+	if err != nil {
+		s.logf("dnssec %s: saving the store failed: %v", name, err)
+		writeError(w, http.StatusInternalServerError, "saving the store failed")
+		return
+	}
+	s.logf("domain %s: DNSSEC signing requested", name)
+	s.Kick()
+	writeJSON(w, http.StatusAccepted, v)
+}
+
+// buildPlan is d's plan (provider p may be nil: read-only).
+func (s *Service) buildPlan(ctx context.Context, d *Domain, p dnsProvider) dnsplan.Plan {
+	s.mu.Lock()
+	// The pin wanted is the current account's (an account switch shows
+	// the old pin as wrong); before any registration, the one written.
+	uri := s.accountURILocked()
+	if uri == "" {
+		uri = d.CAAAccountURI
+	}
+	s.mu.Unlock()
+	in := dnsplan.Input{Spec: s.spec(d, uri), ProviderName: d.Provider, Resolvers: s.cfg.Resolvers, Now: s.cfg.Now()}
+	if p != nil {
+		in.Provider = p
+		if zone, err := s.zoneOf(p, d.Name); err == nil {
+			in.Zone = zone
+		}
+		if r, can, err := buildDNSSEC(d); err == nil {
+			in.DNSSEC, in.CanSign = r, can
+		}
+	}
+	return dnsplan.Build(ctx, in)
 }
 
 // wantAddrs are the addresses <name>'s records must show: the configured
@@ -749,6 +1256,26 @@ func (s *Service) waitRecords(ctx context.Context, name string) error {
 		case <-time.After(s.cfg.RecordsPoll):
 		}
 	}
+}
+
+// dropRecords removes refs from list.
+func dropRecords(list, refs []RecordRef) []RecordRef {
+	var out []RecordRef
+	for _, r := range list {
+		if !containsRef(refs, r) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func containsRef(list []RecordRef, r RecordRef) bool {
+	for _, x := range list {
+		if x == r {
+			return true
+		}
+	}
+	return false
 }
 
 func mergeRecords(old, add []RecordRef) []RecordRef {

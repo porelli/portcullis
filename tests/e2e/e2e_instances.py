@@ -306,6 +306,33 @@ def main() -> int:
             listed = page.request.get(HUB + "/api/instances/echo-b/backups")
             assert listed.status == 200 and any(b.get("archive") == archive for b in listed.json()), listed.text()[:300]
         check("long_backup: an admin's > 60 s backup through Traefik (202, polled) completes; a concurrent one is 409", long_backup_through_traefik)
+
+        def domains_dns_panel():
+            # Settings → Domains: the enrolled domain's DNS panel (contract
+            # §12.3): its CAA rows are ok and the CA would issue.
+            # A full load of the Hub page (a goto that only changes the hash
+            # is a same-document navigation with no response), then the
+            # Settings tab.
+            assert goto_ok(page, HUB + "/"), "admin cannot open the Hub"
+            # (showTab: the tab's own handler; a click can wait on the
+            # list's periodic re-render.)
+            page.wait_for_function("typeof showTab === 'function'", timeout=TIMEOUT_MS)
+            page.evaluate("() => showTab('settings')")
+            btn = page.locator(f'[data-domain-dns="{EXTRA}"]')
+            btn.wait_for(timeout=TIMEOUT_MS)
+            btn.click()
+            row = page.locator(f'[data-dns-row="{EXTRA}"]')
+            rows = row.locator('[data-dns-item^="caa:"]')
+            rows.first.wait_for(timeout=TIMEOUT_MS)
+            base.shot(page, "inst-admin-dns-panel")
+            n = rows.count()
+            assert n > 0, "no caa rows"
+            for i in range(n):
+                status = rows.nth(i).locator("td").nth(5).inner_text().strip()
+                assert status.startswith("ok"), f"caa row {i}: {rows.nth(i).inner_text()[:300]}"
+            caa = row.locator("[data-dns-caa]").inner_text()
+            assert "would issue: yes" in caa, caa
+        check("domains_dns_panel: the enrolled domain's DNS panel shows its CAA ok and would issue: yes", domains_dns_panel)
         close(ctx, "admin")
         browser.close()
 

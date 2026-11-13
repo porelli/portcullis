@@ -36,6 +36,8 @@ import (
 	"github.com/letsencrypt/pebble/v2/wfe"
 	"github.com/libdns/libdns"
 
+	"github.com/portcullis/domains/internal/dnsplan"
+	"github.com/portcullis/domains/internal/dnssec"
 	"github.com/portcullis/domains/internal/fakedns"
 )
 
@@ -92,6 +94,7 @@ type testEnv struct {
 	svc    *Service
 	api    http.Handler
 	zone   *fakedns.Zone
+	srv    *fakedns.Server
 	logs   *syncBuf
 	clock  *clock
 	dir    string
@@ -111,10 +114,16 @@ func (e *testEnv) setHook(h func(op string, recs []libdns.Record, token string) 
 
 // newEnv starts the fake DNS zone and server, an in-process Pebble whose
 // VA resolves through it, and the service with a running worker.
-func newEnv(t *testing.T, ipv6 bool) *testEnv {
+func newEnv(t *testing.T, ipv6 bool) *testEnv { t.Helper(); return newEnvWith(t, ipv6, nil) }
+
+// newEnvWith: newEnv with the configuration changed by mod before start.
+func newEnvWith(t *testing.T, ipv6 bool, mod func(*Config)) *testEnv {
 	t.Helper()
 	zone := fakedns.NewZone()
-	dnsSrv, err := fakedns.Serve(zone, "127.0.0.1:0")
+	// The test domains live under example.org (the SOA the DNSSEC check
+	// finds); the fake provider writes each domain as its own zone.
+	zone.SetSOA("example.org")
+	dnsSrv, err := fakedns.ServeWith(zone, "127.0.0.1:0", fakedns.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,9 +165,13 @@ func newEnv(t *testing.T, ipv6 bool) *testEnv {
 		IPv4: netip.MustParseAddr("203.0.113.10"), Resolvers: []string{dnsSrv.Addr}, Secret: testSecret,
 		PropagationTimeout: 30 * time.Second, PropagationInterval: 50 * time.Millisecond, RecordsWait: 2 * time.Second, RecordsPoll: 50 * time.Millisecond,
 		Tick: 50 * time.Millisecond, ACMEHTTPClient: pebble.Client(), Now: clk.now, Logger: log.New(logs, "", 0),
+		CAA: true, CAAIssuer: "pebble.test",
 	}
 	if ipv6 {
 		cfg.IPv6 = netip.MustParseAddr("2001:db8::10")
+	}
+	if mod != nil {
+		mod(&cfg)
 	}
 	svc, err := NewService(cfg, OpenStore(dir, id))
 	if err != nil {
@@ -167,7 +180,7 @@ func newEnv(t *testing.T, ipv6 bool) *testEnv {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { svc.Run(ctx); close(done) }()
-	e.t, e.svc, e.api, e.zone, e.logs, e.clock, e.dir, e.id, e.cancel = t, svc, svc.APIHandler(), zone, logs, clk, dir, id, cancel
+	e.t, e.svc, e.api, e.zone, e.srv, e.logs, e.clock, e.dir, e.id, e.cancel = t, svc, svc.APIHandler(), zone, dnsSrv, logs, clk, dir, id, cancel
 	t.Cleanup(func() {
 		cancel()
 		<-done
@@ -385,7 +398,9 @@ func TestRecordsCreatedAAndAAAA(t *testing.T) {
 	for _, n := range []string{"team-d.example.org", "*.team-d.example.org"} {
 		var got []string
 		for _, rr := range e.zone.Records(n) {
-			got = append(got, rr.Type+" "+rr.Data+" "+rr.TTL.String())
+			if rr.Type != "CAA" { // the caa set (TestCAA*)
+				got = append(got, rr.Type+" "+rr.Data+" "+rr.TTL.String())
+			}
 		}
 		sort.Strings(got)
 		want := []string{"A 203.0.113.10 5m0s", "AAAA 2001:db8::10 5m0s"}
@@ -414,10 +429,21 @@ func TestRecordsWithoutIPv6DropAAAA(t *testing.T) {
 	e.do("PUT", "/domains/team-e.example.org", creds(goodToken), true)
 	e.waitState("team-e.example.org", StateReady, 60*time.Second)
 	for _, n := range []string{"team-e.example.org", "*.team-e.example.org"} {
-		if rrs := e.zone.Records(n); len(rrs) != 1 || rrs[0].Type != "A" || rrs[0].Data != "203.0.113.10" {
+		if rrs := addrRecords(e.zone, n); len(rrs) != 1 || rrs[0].Type != "A" || rrs[0].Data != "203.0.113.10" {
 			t.Errorf("%s: %v, want only A 203.0.113.10", n, rrs)
 		}
 	}
+}
+
+// addrRecords are the A/AAAA records at name.
+func addrRecords(z *fakedns.Zone, name string) []libdns.RR {
+	var out []libdns.RR
+	for _, rr := range z.Records(name) {
+		if rr.Type == "A" || rr.Type == "AAAA" {
+			out = append(out, rr)
+		}
+	}
+	return out
 }
 
 func TestRecordsNotVisibleIsError(t *testing.T) {
@@ -786,9 +812,10 @@ func TestProviderErrorsRedacted(t *testing.T) {
 	if !strings.Contains(e.logs.String(), "TXT delete refused") {
 		t.Fatalf("CleanUp failure not logged:\n%s", e.logs.String())
 	}
-	// 3. Records fail on a re-check.
-	e.setHook(func(op string, _ []libdns.Record, tok string) error {
-		if op == "set" {
+	// 3. Records fail on a re-check (the records already there: the
+	// step only reads them, and that read fails).
+	e.setHook(func(op string, recs []libdns.Record, tok string) error {
+		if op == "get" {
 			return echo("records set", tok)
 		}
 		return nil
@@ -819,8 +846,8 @@ func TestStaleWorkNeverCommits(t *testing.T) {
 	e := newEnv(t, false)
 	inSet, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
-	e.setHook(func(op string, _ []libdns.Record, tok string) error {
-		if op == "set" && tok == goodToken {
+	e.setHook(func(op string, recs []libdns.Record, tok string) error {
+		if recordsWrite(op, recs) && tok == goodToken {
 			once.Do(func() { close(inSet); <-release })
 		}
 		return nil
@@ -1021,8 +1048,8 @@ func TestRecordsWaitBounded(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once
 	inSet := make(chan struct{})
-	e.setHook(func(op string, _ []libdns.Record, _ string) error {
-		if op == "set" {
+	e.setHook(func(op string, recs []libdns.Record, _ string) error {
+		if recordsWrite(op, recs) {
 			once.Do(func() { close(inSet) })
 			<-release
 		}
@@ -1061,8 +1088,8 @@ func TestTokenWaitsForRecordsStep(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once
 	inSet := make(chan struct{})
-	e.setHook(func(op string, _ []libdns.Record, _ string) error {
-		if op == "set" {
+	e.setHook(func(op string, recs []libdns.Record, _ string) error {
+		if recordsWrite(op, recs) {
 			once.Do(func() { close(inSet); <-release })
 		}
 		return nil
@@ -1119,8 +1146,8 @@ func TestAddressChangeMakesRecordsDue(t *testing.T) {
 // failure instead of killing the service.
 func TestProviderPanicRecovered(t *testing.T) {
 	e := newEnv(t, false)
-	e.setHook(func(op string, _ []libdns.Record, _ string) error {
-		if op == "set" {
+	e.setHook(func(op string, recs []libdns.Record, _ string) error {
+		if recordsWrite(op, recs) {
 			panic("library bug")
 		}
 		return nil
@@ -1168,8 +1195,8 @@ func TestUnknownIPv4StillRenews(t *testing.T) {
 	e.cancel()
 	e.svc.Wait()
 	var sets atomic.Int32
-	e.setHook(func(op string, _ []libdns.Record, _ string) error {
-		if op == "set" {
+	e.setHook(func(op string, recs []libdns.Record, _ string) error {
+		if recordsWrite(op, recs) {
 			sets.Add(1)
 		}
 		return nil
@@ -1239,5 +1266,647 @@ func TestWantAddrsFreshIPv6(t *testing.T) {
 	s.cfg.IPv4 = netip.MustParseAddr("198.51.100.1")
 	if v4, v6 := s.wantAddrs("d.example.org"); v4.String() != "198.51.100.1" || v6.String() != "2001:db8::99" {
 		t.Fatalf("configured: %v %v", v4, v6)
+	}
+}
+
+// ── record sets, CAA, DNSSEC (Task 5) ─────────────────────
+
+// restart stops the running service and starts a new one on the same
+// store with the configuration changed by mod; e.svc / e.api follow it.
+func (e *testEnv) restart(mod func(*Config)) {
+	e.t.Helper()
+	e.cancel()
+	e.svc.Wait()
+	cfg := e.svc.cfg
+	if mod != nil {
+		mod(&cfg)
+	}
+	svc, err := NewService(cfg, OpenStore(e.dir, e.id))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { svc.Run(ctx); close(done) }()
+	e.t.Cleanup(func() { cancel(); <-done })
+	e.svc, e.api, e.cancel = svc, svc.APIHandler(), cancel
+	svc.Kick()
+}
+
+// idle: name is ready and no work runs for it (a restart now cancels
+// nothing).
+func (e *testEnv) idle(name string) bool {
+	e.svc.mu.Lock()
+	defer e.svc.mu.Unlock()
+	d, ok := e.svc.doc.Domains[name]
+	return ok && d.State == StateReady && e.svc.busy[name] == nil
+}
+
+func caaValues(z *fakedns.Zone, name string) []string {
+	var out []string
+	for _, rr := range z.Records(name) {
+		if rr.Type == "CAA" {
+			out = append(out, rr.Data)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (e *testEnv) storedURI() string {
+	e.svc.mu.Lock()
+	defer e.svc.mu.Unlock()
+	return e.svc.accountURILocked()
+}
+
+func (e *testEnv) domain(name string) Domain {
+	e.svc.mu.Lock()
+	defer e.svc.mu.Unlock()
+	d, ok := e.svc.doc.Domains[name]
+	if !ok {
+		return Domain{}
+	}
+	return *copyDomain(d)
+}
+
+// waitFor polls cond for up to timeout.
+func (e *testEnv) waitFor(what string, timeout time.Duration, cond func() bool) {
+	e.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			e.t.Fatalf("timed out waiting for %s\nlogs:\n%s", what, e.logs.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func TestCAAWrittenAfterRegisterBeforeOrder(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-ca.example.org"
+	var mu sync.Mutex
+	var events []string
+	caaQ, txtQ := -1, -1
+	e.setHook(func(op string, recs []libdns.Record, _ string) error {
+		if len(recs) == 0 {
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		switch rr := recs[0].RR(); {
+		case op == "append" && rr.Type == "CAA" && caaQ < 0:
+			e.svc.mu.Lock()
+			acct, uri := e.svc.doc.Account, e.svc.accountURILocked()
+			e.svc.mu.Unlock()
+			if acct == nil || uri == "" || !strings.Contains(rr.Data, "accounturi="+uri) {
+				events = append(events, fmt.Sprintf("bad CAA set: account %v, uri %q, data %q", acct != nil, uri, rr.Data))
+			}
+			caaQ = len(e.srv.Queries())
+			events = append(events, "caa")
+		case op == "append" && rr.Type == "TXT" && txtQ < 0:
+			txtQ = len(e.srv.Queries())
+			events = append(events, "txt")
+		}
+		return nil
+	})
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(events, ",") != "caa,txt" {
+		t.Fatalf("events %v", events)
+	}
+	seen := false
+	for _, q := range e.srv.Queries()[caaQ:txtQ] {
+		if q == "CAA "+name {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatalf("no CAA lookup between the CAA set and the first TXT append: %v", e.srv.Queries()[caaQ:txtQ])
+	}
+	if d := e.domain(name); d.CAAAccountURI != e.storedURI() || !d.CAAOK {
+		t.Fatalf("caa_account_uri %q (account %q), caa_ok %v", d.CAAAccountURI, e.storedURI(), d.CAAOK)
+	}
+}
+
+func TestAccountSwitchRepins(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-sw.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	old := e.domain(name).CAAAccountURI
+	if old == "" {
+		t.Fatal("no pin after ready")
+	}
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) })
+	e.restart(func(c *Config) { c.Email = "other@example.org" })
+	e.waitFor("the new pin", 60*time.Second, func() bool {
+		d := e.domain(name)
+		return d.CAAAccountURI != "" && d.CAAAccountURI != old && d.State == StateReady
+	})
+	uri := e.domain(name).CAAAccountURI
+	if uri != e.storedURI() {
+		t.Fatalf("pinned %q, account %q", uri, e.storedURI())
+	}
+	live := caaValues(e.zone, name)
+	if len(live) != 2 {
+		t.Fatalf("live CAA %v", live)
+	}
+	for _, v := range live {
+		if !strings.Contains(v, "accounturi="+uri) || strings.Contains(v, old) {
+			t.Fatalf("live CAA %v", live)
+		}
+	}
+}
+
+func TestWaitCAABothResolvers(t *testing.T) {
+	const name = "team-wr.example.org"
+	// The second resolver serves its own copy: the addresses, and the old
+	// pin until the test copies the new one over.
+	zone2 := fakedns.NewZone()
+	old := `0 issue "pebble.test; accounturi=https://old.example/acct/1; validationmethods=dns-01"`
+	for _, n := range []string{name, "*." + name} {
+		zone2.Set(n, libdns.RR{Name: "@", Type: "A", Data: "203.0.113.10", TTL: time.Minute})
+	}
+	zone2.Set(name, append(zone2.Records(name), libdns.RR{Name: "@", Type: "CAA", Data: old},
+		libdns.RR{Name: "@", Type: "CAA", Data: strings.Replace(old, "issue", "issuewild", 1)})...)
+	srv2, err := fakedns.Serve(zone2, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv2.Close() })
+	e := newEnvWith(t, false, func(c *Config) {
+		c.Resolvers = append(c.Resolvers, srv2.Addr)
+		c.RecordsWait = 20 * time.Second
+	})
+	var mu sync.Mutex
+	var firstTXT time.Time
+	e.setHook(func(op string, recs []libdns.Record, _ string) error {
+		if op == "append" && len(recs) > 0 && recs[0].RR().Type == "TXT" {
+			mu.Lock()
+			if firstTXT.IsZero() {
+				firstTXT = time.Now()
+			}
+			mu.Unlock()
+		}
+		return nil
+	})
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitFor("the pin at the first resolver", 30*time.Second, func() bool { return len(caaValues(e.zone, name)) == 2 })
+	time.Sleep(500 * time.Millisecond) // several CAA polls
+	mu.Lock()
+	early := !firstTXT.IsZero()
+	mu.Unlock()
+	if early {
+		t.Fatal("ordered while the second resolver still showed the old pin")
+	}
+	copied := time.Now()
+	var rrs []libdns.RR
+	for _, rr := range zone2.Records(name) {
+		if rr.Type != "CAA" {
+			rrs = append(rrs, rr)
+		}
+	}
+	for _, rr := range e.zone.Records(name) {
+		if rr.Type == "CAA" {
+			rrs = append(rrs, rr)
+		}
+	}
+	zone2.Set(name, rrs...)
+	e.waitState(name, StateReady, 60*time.Second)
+	mu.Lock()
+	defer mu.Unlock()
+	if firstTXT.Before(copied) {
+		t.Fatalf("first TXT append %s before the second resolver saw the pin (%s)", firstTXT, copied)
+	}
+}
+
+func TestDeleteRemovesCAA(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-dc.example.org"
+	e.zone.Set(name, libdns.CAA{Name: "@", TTL: time.Hour, Tag: "issue", Value: "digicert.com"}.RR())
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	if live := caaValues(e.zone, name); len(live) != 3 {
+		t.Fatalf("live CAA %v", live)
+	}
+	if code, body := e.do("DELETE", "/domains/"+name, "", true); code != 204 {
+		t.Fatalf("delete = %d %s", code, body)
+	}
+	if live := caaValues(e.zone, name); strings.Join(live, "|") != `0 issue "digicert.com"` {
+		t.Fatalf("after delete %v", live)
+	}
+}
+
+func TestCAAOffRemovesOwned(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-off.example.org"
+	e.zone.Set(name, libdns.CAA{Name: "@", TTL: time.Hour, Tag: "issue", Value: "digicert.com"}.RR())
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) })
+	e.restart(func(c *Config) { c.CAA = false })
+	e.waitFor("the CAA removal", 30*time.Second, func() bool {
+		d := e.domain(name)
+		return !hasCAARefs(&d) && d.State == StateReady
+	})
+	if live := caaValues(e.zone, name); strings.Join(live, "|") != `0 issue "digicert.com"` {
+		t.Fatalf("live %v", live)
+	}
+	if v := e.list()[name]; v.CAAOK || e.domain(name).CAAAccountURI != "" {
+		t.Fatalf("view %+v", v)
+	}
+}
+
+func TestUnknownCASkipsCAAWrite(t *testing.T) {
+	e := newEnvWith(t, false, func(c *Config) { c.CAAIssuer = "" })
+	const name = "team-uc.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	v := e.waitState(name, StateReady, 60*time.Second)
+	if v.CertNotAfter == nil || v.CAAOK {
+		t.Fatalf("view %+v", v)
+	}
+	if live := caaValues(e.zone, name); len(live) != 0 {
+		t.Fatalf("CAA written for an unknown CA: %v", live)
+	}
+}
+
+func TestViewHasCAAAndDNSSEC(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-v.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	v := e.waitState(name, StateReady, 60*time.Second)
+	if !v.CAAOK || v.DNSSEC != "unsigned" {
+		t.Fatalf("view %+v", v)
+	}
+	_, body := e.do("GET", "/domains", "", true)
+	if !strings.Contains(body, `"caa_ok":true`) || !strings.Contains(body, `"dnssec":"unsigned"`) {
+		t.Fatalf("body %s", body)
+	}
+}
+
+func TestReadyDomainAppliesDueCAA(t *testing.T) {
+	e := newEnvWith(t, false, func(c *Config) { c.CAA = false })
+	const name = "team-rd.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	if live := caaValues(e.zone, name); len(live) != 0 {
+		t.Fatalf("CAA with CAA off: %v", live)
+	}
+	first := *e.domain(name).CertNotAfter
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) })
+	pinned := func() bool {
+		d := e.domain(name)
+		return d.CAAAccountURI != "" && d.CAAOK && e.idle(name)
+	}
+	// A ready domain with a valid certificate gets its CAA, no new order.
+	e.restart(func(c *Config) { c.CAA = true })
+	e.waitFor("the CAA on a ready domain", 30*time.Second, pinned)
+	if live := caaValues(e.zone, name); len(live) != 2 {
+		t.Fatalf("live %v", live)
+	}
+	if !e.domain(name).CertNotAfter.Equal(first) {
+		t.Fatal("a new certificate was ordered")
+	}
+	// Off again (removed), then on with the IPv4 unknown: the caa set
+	// still applies, the address set doesn't.
+	e.restart(func(c *Config) { c.CAA = false })
+	e.waitFor("the removal", 30*time.Second, func() bool { d := e.domain(name); return !hasCAARefs(&d) && e.idle(name) })
+	var addrSets atomic.Int32
+	e.setHook(func(op string, recs []libdns.Record, _ string) error {
+		for _, r := range recs {
+			if t := r.RR().Type; (op == "append" || op == "delete") && (t == "A" || t == "AAAA") {
+				addrSets.Add(1)
+			}
+		}
+		return nil
+	})
+	e.restart(func(c *Config) { c.CAA, c.IPv4 = true, netip.Addr{} })
+	e.waitFor("the CAA with the IPv4 unknown", 30*time.Second, pinned)
+	if n := addrSets.Load(); n != 0 {
+		t.Fatalf("address records touched %d times with the IPv4 unknown", n)
+	}
+	if !e.domain(name).CertNotAfter.Equal(first) {
+		t.Fatal("a new certificate was ordered")
+	}
+}
+
+// ── DNS API (Task 6) ──────────────────────────────────────
+
+func (e *testEnv) planOf(path string) dnsplan.Plan {
+	e.t.Helper()
+	code, body := e.do("GET", path, "", true)
+	if code != 200 {
+		e.t.Fatalf("GET %s = %d %s", path, code, body)
+	}
+	var pl dnsplan.Plan
+	if err := json.Unmarshal([]byte(body), &pl); err != nil {
+		e.t.Fatal(err)
+	}
+	return pl
+}
+
+func TestPlanEndpoint(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-pl.example.org"
+	if code, _ := e.do("GET", "/domains/"+name+"/dns", "", true); code != 404 {
+		t.Fatalf("plan of an unknown name = %d", code)
+	}
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	pl := e.planOf("/domains/" + name + "/dns?refresh=1")
+	if !pl.CanWrite || pl.Name != name || !pl.CAA.WouldIssue || pl.CAA.AccountURI != e.storedURI() || pl.CAA.Issuer != "pebble.test" {
+		t.Fatalf("plan %+v", pl)
+	}
+	found := false
+	for _, it := range pl.Items {
+		if it.Set == dnsplan.SetCAA && it.Status == dnsplan.StatusOK {
+			found = true
+		}
+		if it.Set == dnsplan.SetAddress && it.Status != dnsplan.StatusOK {
+			t.Errorf("address item %+v", it)
+		}
+	}
+	if !found || pl.DNSSEC.State != "unsigned" {
+		t.Fatalf("plan %+v", pl)
+	}
+}
+
+func TestPlanRefreshThrottled(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-th.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) })
+	e.clock.advance(31 * time.Second)
+	before := e.zone.CallCount()
+	e.planOf("/domains/" + name + "/dns?refresh=1")
+	e.planOf("/domains/" + name + "/dns?refresh=1")
+	e.planOf("/domains/" + name + "/dns")
+	if n := e.zone.CallCount() - before; n != 1 {
+		t.Fatalf("%d builds (provider reads), want 1", n)
+	}
+	e.clock.advance(31 * time.Second)
+	e.planOf("/domains/" + name + "/dns?refresh=1")
+	if n := e.zone.CallCount() - before; n != 2 {
+		t.Fatalf("%d builds after the window, want 2", n)
+	}
+}
+
+func TestApplyEndpoint(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-ap.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	for _, body := range []string{`{"sets":["bogus"]}`, `{"sets":["nomail"],"x":1}`, `{"sets":[]}`, `{}`, `nope`} {
+		if code, _ := e.do("POST", "/domains/"+name+"/dns/apply", body, true); code != 400 {
+			t.Errorf("%s = %d", body, code)
+		}
+	}
+	if code, _ := e.do("POST", "/domains/nope.example.org/dns/apply", `{"sets":["caa"]}`, true); code != 404 {
+		t.Fatalf("unknown name = %d", code)
+	}
+	code, body := e.do("POST", "/domains/"+name+"/dns/apply", `{"sets":["nomail"]}`, true)
+	if code != 202 || !strings.Contains(body, `"name":"`+name+`"`) {
+		t.Fatalf("apply = %d %s", code, body)
+	}
+	e.waitFor("the null MX", 30*time.Second, func() bool {
+		for _, rr := range e.zone.Records(name) {
+			if rr.Type == "MX" && rr.Data == "0 ." {
+				return true
+			}
+		}
+		return false
+	})
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) })
+	d := e.domain(name)
+	if !contains(d.Sets, "nomail") || len(d.DueSets) != 0 {
+		t.Fatalf("sets %v due %v", d.Sets, d.DueSets)
+	}
+	// DELETE removes the nomail records too.
+	e.do("DELETE", "/domains/"+name, "", true)
+	if rrs := e.zone.Records("_dmarc." + name); len(rrs) != 0 {
+		t.Fatalf("left after delete: %v", rrs)
+	}
+}
+
+func TestDNSSECEndpoint409(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-ns.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	code, body := e.do("POST", "/domains/"+name+"/dnssec", `{"enable":true}`, true)
+	if code != 409 || !strings.Contains(body, "fake can't sign the zone through its API") {
+		t.Fatalf("= %d %s", code, body)
+	}
+	for _, b := range []string{`{"enable":false}`, `{}`, `{"enable":true,"x":1}`} {
+		if code, _ := e.do("POST", "/domains/"+name+"/dnssec", b, true); code != 400 {
+			t.Errorf("%s = %d", b, code)
+		}
+	}
+}
+
+// recordingSigner counts EnableDNSSEC calls (the interface has no way to
+// turn signing off).
+type recordingSigner struct{ enabled *atomic.Int32 }
+
+func (recordingSigner) DNSSECStatus(context.Context, string) (string, []dnssec.DS, error) {
+	return "disabled", nil, nil
+}
+
+func (r recordingSigner) EnableDNSSEC(context.Context, string) error {
+	r.enabled.Add(1)
+	return nil
+}
+
+func TestDNSSECEndpointSigns(t *testing.T) {
+	e := newEnv(t, false)
+	var enabled atomic.Int32
+	providers["fake-signer"] = providerSpec{required: []string{"api_token"}, build: providers["fake"].build,
+		dnssec: func(map[string]string) (dnssec.StatusReader, error) { return recordingSigner{&enabled}, nil }}
+	t.Cleanup(func() { delete(providers, "fake-signer") })
+	const name = "team-sg.example.org"
+	e.do("PUT", "/domains/"+name, `{"provider":"fake-signer","credentials":{"api_token":"`+goodToken+`"}}`, true)
+	e.waitState(name, StateReady, 60*time.Second)
+	if pl := e.planOf("/domains/" + name + "/dns?refresh=1"); !pl.DNSSEC.ProviderCanSign || len(pl.DNSSEC.Steps) == 0 {
+		t.Fatalf("dnssec %+v", pl.DNSSEC)
+	}
+	if code, body := e.do("POST", "/domains/"+name+"/dnssec", `{"enable":true}`, true); code != 202 {
+		t.Fatalf("= %d %s", code, body)
+	}
+	e.waitFor("EnableDNSSEC", 30*time.Second, func() bool { return enabled.Load() == 1 && !e.domain(name).SignRequested && e.idle(name) })
+	time.Sleep(200 * time.Millisecond)
+	if n := enabled.Load(); n != 1 {
+		t.Fatalf("EnableDNSSEC called %d times", n)
+	}
+}
+
+func TestMainPlanReadOnly(t *testing.T) {
+	const traefik = "https://acme-staging-v02.api.letsencrypt.org/acme/acct/42"
+	e := newEnvWith(t, false, func(c *Config) { c.MainAccountURI = traefik })
+	before := e.zone.CallCount()
+	pl := e.planOf("/main/dns?refresh=1")
+	if pl.CanWrite || pl.Name != testMain || pl.CAA.AccountURI != traefik || !pl.CAA.WouldIssue {
+		t.Fatalf("main plan %+v", pl)
+	}
+	for _, it := range pl.Items {
+		if it.Fix == dnsplan.FixAuto {
+			t.Fatalf("auto fix in the main plan: %+v", it)
+		}
+	}
+	if n := e.zone.CallCount(); n != before {
+		t.Fatalf("the main plan called a provider (%d calls)", n-before)
+	}
+}
+
+func TestAccountEndpoint(t *testing.T) {
+	e := newEnv(t, false)
+	var a map[string]string
+	_, body := e.do("GET", "/acme/account", "", true)
+	json.Unmarshal([]byte(body), &a)
+	if a["account_uri"] != "" || a["caa_issuer"] != "pebble.test" || a["ca_server"] != e.svc.cfg.CAServer {
+		t.Fatalf("before registration: %s", body)
+	}
+	e.do("PUT", "/domains/team-ac.example.org", creds(goodToken), true)
+	e.waitState("team-ac.example.org", StateReady, 60*time.Second)
+	_, body = e.do("GET", "/acme/account", "", true)
+	json.Unmarshal([]byte(body), &a)
+	if a["account_uri"] == "" || a["account_uri"] != e.storedURI() {
+		t.Fatalf("after: %s", body)
+	}
+}
+
+func TestNewEndpointsNeedBearer(t *testing.T) {
+	e := newEnv(t, false)
+	for _, r := range [][2]string{{"GET", "/domains/team-x.example.org/dns"}, {"POST", "/domains/team-x.example.org/dns/apply"},
+		{"POST", "/domains/team-x.example.org/dnssec"}, {"GET", "/main/dns"}, {"GET", "/acme/account"}} {
+		if code, _ := e.do(r[0], r[1], `{}`, false); code != 401 {
+			t.Errorf("%s %s = %d", r[0], r[1], code)
+		}
+	}
+}
+
+func TestNoMailNotRecommendedForAlertSender(t *testing.T) {
+	e := newEnvWith(t, false, func(c *Config) { c.MailFrom = "alerts@mx.team-al.example.org" })
+	for _, n := range []string{"team-al.example.org", "team-am.example.org"} {
+		e.do("PUT", "/domains/"+n, creds(goodToken), true)
+	}
+	for n, want := range map[string]bool{"team-al.example.org": false, "team-am.example.org": true} {
+		e.waitState(n, StateReady, 60*time.Second)
+		got := false
+		for _, it := range e.planOf("/domains/" + n + "/dns").Items {
+			if it.Set == dnsplan.SetNoMail {
+				got = true
+			}
+		}
+		if got != want {
+			t.Errorf("%s: nomail recommended %v, want %v", n, got, want)
+		}
+	}
+}
+
+// ── review fixes (I1, I3) ─────────────────────────────────
+
+// TestApplyCAARestoresDeletedPin (I1): on a ready domain with a current
+// pin, a hand-deleted CAA comes back with POST …/dns/apply caa; the due
+// set is cleared.
+func TestApplyCAARestoresDeletedPin(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-rs.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) })
+	var keep []libdns.RR
+	for _, rr := range e.zone.Records(name) {
+		if rr.Type != "CAA" {
+			keep = append(keep, rr)
+		}
+	}
+	e.zone.Set(name, keep...)
+	if code, body := e.do("POST", "/domains/"+name+"/dns/apply", `{"sets":["caa"]}`, true); code != 202 {
+		t.Fatalf("apply = %d %s", code, body)
+	}
+	e.waitFor("the restored pin", 30*time.Second, func() bool {
+		d := e.domain(name)
+		return len(caaValues(e.zone, name)) == 2 && len(d.DueSets) == 0 && e.idle(name)
+	})
+	for _, v := range caaValues(e.zone, name) {
+		if !strings.Contains(v, "accounturi="+e.storedURI()) {
+			t.Fatalf("live %v", caaValues(e.zone, name))
+		}
+	}
+}
+
+// TestUnapplicableDueSetCleared (I1): a requested set that can't apply
+// (unknown CA) is cleared and logged, not retried every tick.
+func TestUnapplicableDueSetCleared(t *testing.T) {
+	e := newEnvWith(t, false, func(c *Config) { c.CAAIssuer = "" })
+	const name = "team-ua.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) })
+	e.do("POST", "/domains/"+name+"/dns/apply", `{"sets":["caa"]}`, true)
+	e.waitFor("the due set cleared", 30*time.Second, func() bool { return len(e.domain(name).DueSets) == 0 && e.idle(name) })
+	if !strings.Contains(e.logs.String(), "record set caa requested but not applicable now (unknown CA") {
+		t.Fatalf("not logged:\n%s", e.logs.String())
+	}
+	before := e.zone.CallCount()
+	time.Sleep(300 * time.Millisecond) // several ticks
+	if n := e.zone.CallCount() - before; n != 0 {
+		t.Fatalf("%d provider calls while nothing is due", n)
+	}
+}
+
+// TestCAAOffDropsGoneRefs (I3): with CAA off, owned CAA refs that are no
+// longer live (deleted by hand) are dropped; the domain isn't due forever.
+func TestCAAOffDropsGoneRefs(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-gr.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) })
+	var keep []libdns.RR
+	for _, rr := range e.zone.Records(name) {
+		if rr.Type != "CAA" {
+			keep = append(keep, rr)
+		}
+	}
+	e.zone.Set(name, keep...)
+	e.restart(func(c *Config) { c.CAA = false })
+	e.waitFor("the refs dropped", 30*time.Second, func() bool { d := e.domain(name); return !hasCAARefs(&d) && e.idle(name) })
+	before := e.zone.CallCount()
+	time.Sleep(300 * time.Millisecond)
+	if n := e.zone.CallCount() - before; n != 0 {
+		t.Fatalf("%d provider calls while nothing is due", n)
+	}
+}
+
+// recordsWrite: a records-step write (the sets are appended, never
+// SetRecords; the DNS-01 TXT appends come later, in the order).
+func recordsWrite(op string, recs []libdns.Record) bool {
+	return op == "append" && len(recs) > 0 && recs[0].RR().Type != "TXT"
+}
+
+// TestMainPlanRefreshedByWorker (final review I2): the worker builds the
+// main domain's plan itself and rebuilds it every RecheckEvery, so a
+// reader without ?refresh=1 (domains report, status, the Hub) never gets
+// a plan older than that.
+func TestMainPlanRefreshedByWorker(t *testing.T) {
+	e := newEnv(t, false)
+	cached := func() (time.Time, bool) {
+		e.svc.mu.Lock()
+		defer e.svc.mu.Unlock()
+		c, ok := e.svc.plans[mainPlanKey]
+		return c.plan.CheckedAt, ok
+	}
+	e.waitFor("the worker's first main plan", 10*time.Second, func() bool { _, ok := cached(); return ok })
+	first, _ := cached()
+	if got := e.planOf("/main/dns").CheckedAt; !got.Equal(first) {
+		t.Fatalf("GET /main/dns checked_at %v, want the worker's %v", got, first)
+	}
+	e.clock.advance(e.svc.cfg.RecheckEvery + time.Second)
+	e.waitFor("a rebuilt main plan", 10*time.Second, func() bool { at, _ := cached(); return at.After(first) })
+	if got := e.planOf("/main/dns").CheckedAt; !got.After(first) {
+		t.Fatalf("GET /main/dns still answers the old plan (%v)", got)
 	}
 }
