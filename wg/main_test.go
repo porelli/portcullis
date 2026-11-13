@@ -159,6 +159,7 @@ func TestLoadConfig(t *testing.T) {
 		"upstream":        {"WG_DNS_UPSTREAM": "dns.google"},
 		"domain":          {"WG_PEOPLE": "on", "WG_DOMAIN": ""},
 		"metrics":         {"WG_METRICS": "9100"},
+		"core subnets":    {"WG_CORE_SUBNETS": "172.31.250.0/24 nonsense"},
 	} {
 		if _, err := loadConfig(get(over)); err == nil {
 			t.Errorf("%s: accepted", name)

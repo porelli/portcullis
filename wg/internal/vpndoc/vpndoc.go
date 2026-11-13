@@ -49,6 +49,16 @@ const (
 // map alive longer than any legal refresh allows.
 const MaxStaleSpan = 3 * 10 * time.Minute
 
+// reserved are ranges no provider may claim: Docker's default bridge pools
+// (every core network lives there) plus the fixed core subnets the service
+// is given (Reserve). A file whose provider range overlaps one is refused
+// whole (security ruling: such an address could arrive from a container,
+// not a tunnel).
+var reserved = []netip.Prefix{netip.MustParsePrefix("172.16.0.0/12"), netip.MustParsePrefix("192.168.0.0/16")}
+
+// Reserve adds core subnets to the reserved ranges (startup only).
+func Reserve(ps ...netip.Prefix) { reserved = append(reserved, ps...) }
+
 // MaxSize bounds the file (the Hub caps 10 000 devices per provider).
 const MaxSize = 64 << 20
 
@@ -186,6 +196,11 @@ func (d *Doc) validate() error {
 			pr, err := netip.ParsePrefix(r)
 			if err != nil || !pr.Addr().Is4() || pr.Masked() != pr || pr.Bits() < 8 || pr.Bits() > 30 {
 				return fmt.Errorf("providers[%d].ranges[%d]: not an IPv4 prefix between /8 and /30", i, j)
+			}
+			for _, rp := range reserved {
+				if rp.Overlaps(pr) {
+					return fmt.Errorf("providers[%d].ranges[%d]: overlaps a Docker or core network", i, j)
+				}
 			}
 			for k, o := range all {
 				if o.Overlaps(pr) {

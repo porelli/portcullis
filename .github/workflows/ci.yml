@@ -749,7 +749,22 @@ jobs:
                      and ($l["traefik.http.routers.people-vpn-enrol.priority"] | tonumber) > ($l["traefik.http.routers.people.rule"] | length))
                 and $g.labels["traefik.http.middlewares.vpn-required-path.replacepath.path"] == "/vpn-required"
                 and $g.environment.GATE_VPN_FILE == "/vpn-doc/vpn.json"
-                and ([.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.entrypoints$")) | .value] | unique == ["websecure,vpnsecure"])' >/dev/null
+                and $g.environment.GATE_CORE_SUBNETS == $w.environment.WG_CORE_SUBNETS
+                and ($g.environment.GATE_CORE_SUBNETS | split(" ") | sort) == ([.networks[] | .ipam.config[0].subnet? // empty] | sort)
+                and $g.labels["traefik.http.middlewares.portcullis-groups-vpn.forwardauth.address"] == "http://group-gate:8080/auth/vpn"
+                and $g.labels["traefik.http.middlewares.portcullis-public-guard-vpn.forwardauth.address"] == "http://group-gate:8080/public-guard/vpn"
+                and $g.labels["traefik.http.middlewares.portal-vpn-path.replacepath.path"] == "/portal/vpn"
+                and $g.labels["traefik.http.middlewares.portcullis-groups-vpn.forwardauth.authResponseHeaders"] == $g.labels["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders"]
+                and $t.environment.TRAEFIK_ENTRYPOINTS_PARKED_ADDRESS == "127.0.0.1:8441"
+                and ([.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.entrypoints$")) | .value] | unique == ["vpnsecure", "websecure", "websecure,vpnsecure"])
+                and ([.services[].labels // {}] | add) as $L
+                    | ([.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.middlewares$"))
+                        | (.key | sub("\\.middlewares$"; ".entrypoints")) as $ek | (.value | split(",")) as $m
+                        | if ($m | index("portcullis-groups-vpn@docker") or index("portal-vpn-path@docker") or index("portcullis-public-guard-vpn@docker"))
+                          then ($L[$ek] == "vpnsecure")
+                          elif ($m | index("portcullis-groups@docker") or index("portal-path@docker") or index("portcullis-public-guard@docker"))
+                          then ($L[$ek] | split(",") | index("vpnsecure") | not)
+                          else true end] | all)' >/dev/null
           }
           # With the monitoring profile, Prometheus is wg's metrics network's only other member.
           echo "$CFG_ALL" | jq -e '[.services | to_entries[] | select((.value.networks // {}) | has("portcullis-metrics-wg")) | .key] | sort == ["prometheus", "wg"]' >/dev/null \
@@ -764,9 +779,9 @@ jobs:
           echo "$CFG_PODMAN_ALL" | jq -e '.services.wg.restart == "always"' >/dev/null || { echo "FAIL: docker-compose.podman.yml must name wg"; exit 1; }
           # Each router's entrypoints is exactly its class variable: with the
           # three set to distinct values, every router shows its own class.
-          EP_ROUTERS="$(PORTCULLIS_EP_CORE=x-core PORTCULLIS_EP_ADMIN=x-admin PORTCULLIS_EP_ENROL=x-enrol docker compose -f docker-compose.yml --profile '*' config --format json \
+          EP_ROUTERS="$(PORTCULLIS_EP_CORE=x-core PORTCULLIS_EP_ADMIN=x-admin PORTCULLIS_EP_ENROL=x-enrol PORTCULLIS_WEB_CORE=w-core PORTCULLIS_WEB_ADMIN=w-admin PORTCULLIS_WEB_ENROL=w-enrol docker compose -f docker-compose.yml --profile '*' config --format json \
               | jq -r '[.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.entrypoints$")) | "\(.key | split(".")[3])=\(.value)"] | sort | join(" ")')"
-          WANT_EP="dashboard=x-admin enroll-invite=x-enrol grafana-metrics=x-admin hub-mcp=x-admin hub=x-admin keycloak-admin=x-admin keycloak-resources=x-enrol keycloak=x-enrol lldap=x-admin mcp=x-admin oauth2-callback=x-enrol people-mcp=x-admin people-vpn-enrol=x-enrol people=x-core portal=x-core"
+          WANT_EP="core-vpn-required=websecure dashboard-vpn=vpnsecure dashboard=w-admin enroll-invite=x-enrol grafana-metrics-vpn=vpnsecure grafana-metrics=w-admin hub-mcp=x-admin hub-vpn=vpnsecure hub=w-admin keycloak-admin-vpn-required=websecure keycloak-admin-vpn=vpnsecure keycloak-admin=w-admin keycloak-resources=x-enrol keycloak=x-enrol lldap=x-admin mcp=x-admin oauth2-callback=x-enrol people-mcp=x-admin people-vpn-enrol-vpn=vpnsecure people-vpn-enrol=w-enrol people-vpn=vpnsecure people=w-core portal-vpn=vpnsecure portal=w-core"
           [ "$EP_ROUTERS" = "$WANT_EP" ] || { echo "FAIL: core router entrypoint classes: got $EP_ROUTERS, want $WANT_EP"; exit 1; }
           echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring, domains service, mcp-gate, session store"
 

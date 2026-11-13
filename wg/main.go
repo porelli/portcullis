@@ -239,6 +239,7 @@ type config struct {
 	Domain                         string
 	Mode                           string
 	Metrics                        string // host:port, "" = off
+	CoreSubnets                    []netip.Prefix
 }
 
 func loadConfig(getenv func(string) string) (*config, error) {
@@ -285,6 +286,13 @@ func loadConfig(getenv func(string) string) (*config, error) {
 		return nil, errors.New("WG_DNS_UPSTREAM must be a comma-separated list of IP addresses")
 	}
 	c.Upstreams = ups
+	for _, f := range strings.Fields(getenv("WG_CORE_SUBNETS")) {
+		pr, err := netip.ParsePrefix(f)
+		if err != nil || !pr.Addr().Is4() {
+			return nil, errors.New("WG_CORE_SUBNETS must be IPv4 networks, space-separated")
+		}
+		c.CoreSubnets = append(c.CoreSubnets, pr.Masked())
+	}
 	switch m := envOr(getenv, "WG_MODE", "apps"); m {
 	case "apps", "admin", "server":
 		c.Mode = m
@@ -377,6 +385,8 @@ func lookupIPs(h string) ([]netip.Addr, error) {
 
 // serve runs the roles until ctx ends.
 func serve(ctx context.Context, cfg *config) error {
+	// No provider may claim a core network's addresses (vpn.json refused).
+	vpndoc.Reserve(cfg.CoreSubnets...)
 	var doc atomic.Pointer[vpndoc.Doc]
 	var docErr atomic.Value // string
 	docErr.Store("vpn.json: not read yet")

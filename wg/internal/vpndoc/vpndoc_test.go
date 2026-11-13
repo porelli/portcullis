@@ -334,3 +334,24 @@ func TestSourceRules(t *testing.T) {
 		t.Fatal("an unknown source counted as fresh")
 	}
 }
+
+// TestReservedRanges: a provider range overlapping a Docker or core network
+// refuses the file (security ruling).
+func TestReservedRanges(t *testing.T) {
+	doc := func(r string) string {
+		return `{"version":2,"providers":[{"id":"p","source":"static","ranges":["` + r + `"],"edge_port":9001,"gateway_ip":"172.31.254.16","stale":false}],"devices":[]}`
+	}
+	for _, r := range []string{"172.31.250.0/24", "172.17.0.0/16", "172.0.0.0/8", "192.168.10.0/24"} {
+		if _, err := Parse([]byte(doc(r))); err == nil {
+			t.Errorf("%s: parsed", r)
+		}
+	}
+	if _, err := Parse([]byte(doc("10.99.0.0/16"))); err != nil {
+		t.Fatalf("10.99.0.0/16: %v", err)
+	}
+	Reserve(netip.MustParsePrefix("10.99.0.0/16"))
+	defer func() { reserved = reserved[:2] }()
+	if _, err := Parse([]byte(doc("10.99.0.0/16"))); err == nil {
+		t.Fatal("a reserved core subnet accepted")
+	}
+}

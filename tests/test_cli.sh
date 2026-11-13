@@ -801,7 +801,7 @@ expect_eq "every forward-auth middleware's authResponseHeaders lists X-Forwarded
           if printf ',%s,' "$hdrs" | grep -q ',X-Forwarded-Impersonator,' && printf ',%s,' "$hdrs" | grep -q ',X-Forwarded-Impersonation,'; then
             echo "$mw"
           else echo "$mw: missing an impersonation header"; fi
-        done | sort | tr '\n' ' ')" "portcullis-auth portcullis-auth-console portcullis-auth-ext portcullis-groups "
+        done | sort | tr '\n' ' ')" "portcullis-auth portcullis-auth-console portcullis-auth-ext portcullis-groups portcullis-groups-vpn "
 # The login theme passes the extension's hints to the registration script.
 expect_eq "theme: webauthn-register.ftl hands portcullisHints to webauthnRegister.js" \
   "$(grep -cF 'portcullisHints : ${(portcullisHints!"[]")?c}' "$HERE/../keycloak/themes/portcullis/login/webauthn-register.ftl" 2>/dev/null || echo 0)" 1
@@ -1045,21 +1045,55 @@ BAD=""
 for r in $ROUTERS; do
   grep -qE "^[[:space:]]+traefik\.http\.routers\.$r\.tls\.options: authaware@file$" "$ROOT_DIR/docker-compose.yml" || BAD="$BAD $r"
 done
-expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:15"
+expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:24"
 expect_eq "no other tls.options in docker-compose.yml" "$(grep -E 'tls\.options:' "$ROOT_DIR/docker-compose.yml" | grep -vc 'authaware@file$' || true)" 0
-# VPN (contract §16): every core router's entrypoints label is literally
-# one of the three class variables, each router in its class; vpnsecure
-# trusts PROXY only from wg's pinned address and never forwarded headers.
+# VPN (contract §16, security ruling): every core router's entrypoints
+# label is literally its class: routers without group-gate take
+# PORTCULLIS_EP_* (websecure,vpnsecure or vpnsecure); routers through
+# group-gate are split — the websecure one takes PORTCULLIS_WEB_* (websecure
+# or parked, never vpnsecure) with portcullis-groups@docker, its -vpn twin is
+# on vpnsecure only with portcullis-groups-vpn@docker (group-gate's VPN path,
+# the only one a VPN binding is satisfied on); the two friendly routers sit
+# on websecure. vpnsecure trusts PROXY only from wg's edge address.
 EP_GOT="$(sed -n 's/^[[:space:]]*traefik\.http\.routers\.\([a-z0-9-]*\)\.entrypoints: \(.*\)$/\1 \2/p' "$ROOT_DIR/docker-compose.yml" | LC_ALL=C sort | tr '\n' ';')"
 EP_WANT=""
-for r in dashboard lldap keycloak-admin hub grafana-metrics mcp hub-mcp people-mcp; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ADMIN:-websecure,vpnsecure}"$'\n'; done
-for r in keycloak keycloak-resources oauth2-callback enroll-invite people-vpn-enrol; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ENROL:-websecure,vpnsecure}"$'\n'; done
-for r in portal people; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_CORE:-websecure,vpnsecure}"$'\n'; done
+for r in dashboard keycloak-admin hub grafana-metrics; do EP_WANT="$EP_WANT$r \${PORTCULLIS_WEB_ADMIN:-websecure}"$'\n'; done
+for r in portal people; do EP_WANT="$EP_WANT$r \${PORTCULLIS_WEB_CORE:-websecure}"$'\n'; done
+EP_WANT="${EP_WANT}people-vpn-enrol \${PORTCULLIS_WEB_ENROL:-websecure}"$'\n'
+for r in lldap mcp hub-mcp people-mcp; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ADMIN:-websecure,vpnsecure}"$'\n'; done
+for r in keycloak keycloak-resources oauth2-callback enroll-invite; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ENROL:-websecure,vpnsecure}"$'\n'; done
+for r in dashboard keycloak-admin hub grafana-metrics portal people people-vpn-enrol; do EP_WANT="$EP_WANT$r-vpn vpnsecure"$'\n'; done
+for r in core-vpn-required keycloak-admin-vpn-required; do EP_WANT="$EP_WANT$r websecure"$'\n'; done
 EP_WANT="$(printf '%s' "$EP_WANT" | LC_ALL=C sort | tr '\n' ';')"
-expect_eq "every core router's entrypoints is its class variable (admin / enrol / core)" "$EP_GOT" "$EP_WANT"
+expect_eq "every core router's entrypoints is its class (EP_* without group-gate, WEB_* + a -vpn twin through it)" "$EP_GOT" "$EP_WANT"
 expect_eq "every core router with a rule has an entrypoints label" \
   "$(printf '%s\n' "$ROUTERS" | LC_ALL=C sort | tr '\n' ' ')" \
   "$(printf '%s' "$EP_GOT" | tr ';' '\n' | awk 'NF {print $1}' | LC_ALL=C sort | tr '\n' ' ')"
+# The VPN middlewares only on vpnsecure-only routers; the normal ones never on vpnsecure.
+MW_BAD=""
+while read -r r mw; do
+  ep="$(sed -n "s/^[[:space:]]*traefik\.http\.routers\.$r\.entrypoints: //p" "$ROOT_DIR/docker-compose.yml")"
+  case ",$mw," in
+    *,portcullis-groups-vpn@docker,*|*,portal-vpn-path@docker,*|*,portcullis-public-guard-vpn@docker,*)
+      [ "$ep" = vpnsecure ] || MW_BAD="$MW_BAD $r:$ep" ;;
+    *,portcullis-groups@docker,*|*,portal-path@docker,*|*,portcullis-public-guard@docker,*)
+      case "$ep" in *vpnsecure*) MW_BAD="$MW_BAD $r:$ep" ;; esac ;;
+  esac
+done < <(sed -n 's/^[[:space:]]*traefik\.http\.routers\.\([a-z0-9-]*\)\.middlewares: \(.*\)$/\1 \2/p' "$ROOT_DIR/docker-compose.yml")
+expect_eq "the VPN gate middlewares are on vpnsecure-only routers, the normal ones never on vpnsecure" "${MW_BAD:-none}" none
+# Each -vpn twin is its router with only the gate swapped.
+TWIN_BAD=""
+for r in dashboard keycloak-admin hub grafana-metrics portal people people-vpn-enrol; do
+  for a in rule tls.options service priority; do
+    [ "$(sed -n "s/^[[:space:]]*traefik\.http\.routers\.$r\.$a: //p" "$ROOT_DIR/docker-compose.yml")" = \
+      "$(sed -n "s/^[[:space:]]*traefik\.http\.routers\.$r-vpn\.$a: //p" "$ROOT_DIR/docker-compose.yml")" ] || TWIN_BAD="$TWIN_BAD $r.$a"
+  done
+  [ "$(sed -n "s/^[[:space:]]*traefik\.http\.routers\.$r\.middlewares: //p" "$ROOT_DIR/docker-compose.yml" | sed 's/portcullis-groups@docker/portcullis-groups-vpn@docker/; s/portal-path@docker/portal-vpn-path@docker/')" = \
+    "$(sed -n "s/^[[:space:]]*traefik\.http\.routers\.$r-vpn\.middlewares: //p" "$ROOT_DIR/docker-compose.yml")" ] || TWIN_BAD="$TWIN_BAD $r.middlewares"
+done
+expect_eq "each core -vpn twin = its router with portcullis-groups-vpn / portal-vpn-path" "${TWIN_BAD:-none}" none
+expect_eq "the VPN gate paths and the parked entrypoint (Traefik's container loopback)" \
+  "$(grep -cxE '      (traefik\.http\.middlewares\.portcullis-groups-vpn\.forwardauth\.address: http://group-gate:8080/auth/vpn|traefik\.http\.middlewares\.portcullis-public-guard-vpn\.forwardauth\.address: http://group-gate:8080/public-guard/vpn|traefik\.http\.middlewares\.portal-vpn-path\.replacepath\.path: /portal/vpn|TRAEFIK_ENTRYPOINTS_PARKED_ADDRESS: 127\.0\.0\.1:8441)' "$ROOT_DIR/docker-compose.yml")" 4
 expect_eq "vpnsecure trusts PROXY from wg's portcullis-vpn-edge address only" \
   "$(grep -cF 'TRAEFIK_ENTRYPOINTS_VPNSECURE_PROXYPROTOCOL_TRUSTEDIPS: ${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}/32' "$ROOT_DIR/docker-compose.yml"):$(grep -cF 'ipv4_address: ${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}' "$ROOT_DIR/docker-compose.yml"):$(grep -c 'PROXYPROTOCOL_TRUSTEDIPS' "$ROOT_DIR/docker-compose.yml")" "1:1:1"
 expect_eq "Traefik is not on portcullis-vpn (gateways are)" \

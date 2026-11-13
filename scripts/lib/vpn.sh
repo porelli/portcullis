@@ -27,21 +27,34 @@ VPN_LINK_SUBNET="10.214.0.0/24"
 # is only a warning; a Local network an admin entered refuses.
 VPN_DEFAULT_LOCAL_NETWORKS="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10"
 
-# vpn_entrypoints <mode> <public_enrol> — the three entrypoint classes of
-# the core routers (contract §5): apps → all websecure,vpnsecure; admin →
-# the admin surfaces vpnsecure only; server → core and admin vpnsecure only,
-# enrolment public only with public enrolment on.
+# vpn_entrypoints <mode> <public_enrol> — the core routers' entrypoint
+# classes (contract §5, security ruling): PORTCULLIS_EP_* for the routers
+# without group-gate (websecure,vpnsecure, or vpnsecure when VPN-only) and
+# PORTCULLIS_WEB_* for the websecure twins of the routers through group-gate
+# (websecure, or parked when VPN-only; their -vpn twins are always on
+# vpnsecure with portcullis-groups-vpn@docker). apps → everything open;
+# admin → the admin surfaces VPN-only; server → core and admin VPN-only,
+# enrolment open only with public enrolment on.
 vpn_entrypoints() {
-  local both="websecure,vpnsecure" core admin enrol
+  local both="websecure,vpnsecure" core=open admin=open enrol=open c
   case "$1" in
-    apps) core="$both" admin="$both" enrol="$both" ;;
-    admin) core="$both" admin=vpnsecure enrol="$both" ;;
-    server)
-      core=vpnsecure admin=vpnsecure
-      if [ "$2" = true ]; then enrol="$both"; else enrol=vpnsecure; fi ;;
+    apps) ;;
+    admin) admin=vpn ;;
+    server) core=vpn admin=vpn; [ "$2" = true ] || enrol=vpn ;;
     *) return 1 ;;
   esac
-  printf 'PORTCULLIS_EP_CORE=%s\nPORTCULLIS_EP_ADMIN=%s\nPORTCULLIS_EP_ENROL=%s\n' "$core" "$admin" "$enrol"
+  for c in CORE ADMIN ENROL; do
+    case "$c" in CORE) v="$core" ;; ADMIN) v="$admin" ;; ENROL) v="$enrol" ;; esac
+    if [ "$v" = open ]; then printf 'PORTCULLIS_EP_%s=%s
+' "$c" "$both"; else printf 'PORTCULLIS_EP_%s=vpnsecure
+' "$c"; fi
+  done
+  for c in CORE ADMIN ENROL; do
+    case "$c" in CORE) v="$core" ;; ADMIN) v="$admin" ;; ENROL) v="$enrol" ;; esac
+    if [ "$v" = open ]; then printf 'PORTCULLIS_WEB_%s=websecure
+' "$c"; else printf 'PORTCULLIS_WEB_%s=parked
+' "$c"; fi
+  done
 }
 
 # _vpn_profiles_has_wg — COMPOSE_PROFILES (as compose sees it) names wg.
@@ -271,7 +284,8 @@ Which core surfaces answer only over the VPN (Traefik's vpnsecure):
           people.<domain>/vpn/), and those too with --public-enrol false
 
 Writes PORTCULLIS_VPN_MODE, PORTCULLIS_VPN_PUBLIC_ENROL and the routers'
-entrypoint classes, then recreates core. admin and server refuse unless an
+entrypoint classes (PORTCULLIS_EP_* and PORTCULLIS_WEB_*), then recreates
+core. A VPN-only core page answers /vpn-required on the internet. admin and server refuse unless an
 administrator's VPN device was online in the last 10 minutes (the Hub
 checks); --force skips that check.
 

@@ -3736,9 +3736,10 @@ class VpnTest(GateTest):
         write_vpn(vpn_doc())
         self.addCleanup(write_vpn, None)
 
-    def get(self, host, xff, user="bob", groups="users_app", uri="/", gate_path="/"):
+    def get(self, host, xff, user="bob", groups="users_app", uri="/", gate_path="/auth/vpn"):
         """(status, body, headers) of a forward-auth request from client
-        address `xff` (the X-Forwarded-For Traefik sends)."""
+        address `xff` (the X-Forwarded-For Traefik sends), by default on the
+        VPN path (portcullis-groups-vpn@docker, vpnsecure routers only)."""
         h = {"X-Forwarded-Host": host, "X-Forwarded-Uri": uri,
              "X-Auth-Request-Preferred-Username": user, "X-Auth-Request-User": "id-" + user,
              "X-Auth-Request-Groups": groups,
@@ -3987,14 +3988,53 @@ class VpnTest(GateTest):
         self.assertEqual(self.get("people.example.com", "10.213.0.5", groups="", uri="/signin")[0], 200)
         self.assertEqual(self.get("hub.example.com", "203.0.113.9", groups="lldap_admin")[0], 403)
         # V17: the portal (a group-gate backend) checks class core too.
-        st, _, _ = self.get("example.com", "203.0.113.9", groups="lldap_admin", gate_path="/portal")
+        st, _, _ = self.get("example.com", "203.0.113.9", groups="lldap_admin", gate_path="/portal/vpn")
         self.assertEqual(st, 403)
-        st, _, _ = self.get("example.com", "10.213.0.5", groups="lldap_admin", gate_path="/portal")
+        st, _, _ = self.get("example.com", "10.213.0.5", groups="lldap_admin", gate_path="/portal/vpn")
         self.assertEqual(st, 200)
+        # The portal's normal path (the websecure router): denied even from a device's address.
+        st, _, _ = self.get("example.com", "10.213.0.5", groups="lldap_admin", gate_path="/portal")
+        self.assertEqual(st, 403)
         # public_enrol off: /vpn/ goes VPN-only too.
         write_policy(vpn_policy(server_mode=True, public_enrol=False))
         self.assertEqual(self.get("people.example.com", "203.0.113.9", groups="", uri="/vpn/")[0], 403)
         self.assertEqual(self.get("people.example.com", "10.213.0.5", groups="", uri="/vpn/")[0], 200)
+
+    def test_normal_path_never_satisfies_a_binding(self):
+        # Security ruling: X-Forwarded-For is whatever a websecure client
+        # sends (or its LAN / CGNAT address): on group-gate's normal path
+        # (portcullis-groups@docker) a VPN-only host is always denied with
+        # the /vpn-required page, a device's address and owner included.
+        self.vpn_only()
+        for xff in ("10.213.0.5", "100.64.0.7", "203.0.113.9, 10.213.0.5"):
+            with self.subTest(xff=xff):
+                st, body, _ = self.get("app.example.com", xff, gate_path="/")
+                self.assertEqual(st, 403)
+                self.assertIn(html.escape(REQUIRED_TEXT), body)
+                st, _, _ = self.get("app.example.com", xff, gate_path="/anything")
+                self.assertEqual(st, 403)
+        # The same address on the VPN path: satisfied.
+        self.assertEqual(self.get("app.example.com", "10.213.0.5", gate_path="/auth/vpn")[0], 200)
+        # Paths that merely look like it aren't it.
+        for p in ("/auth/vpn/", "/auth/vpnx", "/AUTH/VPN", "/auth/vpn/../vpn"):
+            with self.subTest(path=p):
+                self.assertEqual(self.get("app.example.com", "10.213.0.5", gate_path=p)[0], 403)
+        # Core classes too: admin_only, hub from a bound device on the normal path.
+        write_policy(vpn_policy(admin_only=True))
+        self.assertEqual(self.get("hub.example.com", "10.213.0.5", groups="lldap_admin", gate_path="/")[0], 403)
+        self.assertEqual(self.get("hub.example.com", "10.213.0.5", groups="lldap_admin")[0], 200)
+        # A host that isn't VPN-only: the normal path ignores the address.
+        self.assertEqual(self.get("other.example.com", "10.213.0.6", groups="", gate_path="/")[0], 200)
+
+    def test_reserved_ranges_refused(self):
+        # Security ruling: a provider range overlapping a Docker or core
+        # network refuses the whole file (the edge and group-gate deny).
+        good = vpn_doc()
+        for r in ("172.31.250.0/24", "172.31.254.0/26", "172.17.0.0/16", "172.16.0.0/12", "192.168.10.0/24", "172.0.0.0/8"):
+            with self.subTest(range=r):
+                doc = dict(good, providers=[good["providers"][0], dict(good["providers"][1], ranges=[r])], devices=[])
+                with self.assertRaises(ValueError):
+                    gg.parse_vpn_doc(json.loads(json.dumps(doc), object_pairs_hook=gg._vpn_pairs))
 
     def test_core_hosts_never_vpn_host_keys(self):
         self.assertIsNotNone(gg.validate_vpn_section(dict(BASE["vpn"], hosts={"hub.example.com": {"via": ["*"]}})))
@@ -4005,9 +4045,9 @@ class VpnTest(GateTest):
         write_policy(dict(PUBLIC_DOC, **vpn_policy({"cloud.example.com": {"via": ["*"]}})))
         import http.client
 
-        def guard(xff):
+        def guard(xff, path="/public-guard/vpn"):
             c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-            c.putrequest("GET", "/public-guard", skip_accept_encoding=True)
+            c.putrequest("GET", path, skip_accept_encoding=True)
             c.putheader("X-Forwarded-Host", "cloud.example.com")
             c.putheader("X-Forwarded-Uri", "/s/AbC123")
             if xff is not None:
@@ -4022,6 +4062,7 @@ class VpnTest(GateTest):
         self.assertEqual(guard("10.213.0.9"), 403)    # step 2: no device
         self.assertEqual(guard("10.213.0.5"), 200)    # a device: no person to bind
         self.assertEqual(guard("10.213.0.6"), 200)    # step 3 isn't enforced
+        self.assertEqual(guard("10.213.0.5", path="/public-guard"), 403)  # the websecure guard: never
         write_vpn(vpn_doc(hs_stale=True))
         self.assertEqual(guard("100.64.0.7"), 403)
         write_vpn(None)

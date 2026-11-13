@@ -3566,24 +3566,32 @@ vt() {
 vte() { cat "$WORK/vt/root/.env"; }
 VT_HOSTINFO_DEFAULT='{"local_networks":["10.0.0.0/8","192.168.0.0/16"],"provider_ranges":[],"admin_device_seen":false}'
 
-expect_eq "vpn_entrypoints: apps, public enrolment on" "$(vpn_entrypoints apps true)" \
-  "PORTCULLIS_EP_CORE=websecure,vpnsecure
-PORTCULLIS_EP_ADMIN=websecure,vpnsecure
-PORTCULLIS_EP_ENROL=websecure,vpnsecure"
+VE_OPEN_EP=$'PORTCULLIS_EP_CORE=websecure,vpnsecure\nPORTCULLIS_EP_ADMIN=websecure,vpnsecure\nPORTCULLIS_EP_ENROL=websecure,vpnsecure'
+VE_OPEN_WEB=$'PORTCULLIS_WEB_CORE=websecure\nPORTCULLIS_WEB_ADMIN=websecure\nPORTCULLIS_WEB_ENROL=websecure'
+expect_eq "vpn_entrypoints: apps, public enrolment on" "$(vpn_entrypoints apps true)" "$VE_OPEN_EP"$'\n'"$VE_OPEN_WEB"
 expect_eq "vpn_entrypoints: apps, public enrolment off" "$(vpn_entrypoints apps false)" "$(vpn_entrypoints apps true)"
 expect_eq "vpn_entrypoints: admin, public enrolment on" "$(vpn_entrypoints admin true)" \
   "PORTCULLIS_EP_CORE=websecure,vpnsecure
 PORTCULLIS_EP_ADMIN=vpnsecure
-PORTCULLIS_EP_ENROL=websecure,vpnsecure"
+PORTCULLIS_EP_ENROL=websecure,vpnsecure
+PORTCULLIS_WEB_CORE=websecure
+PORTCULLIS_WEB_ADMIN=parked
+PORTCULLIS_WEB_ENROL=websecure"
 expect_eq "vpn_entrypoints: admin, public enrolment off" "$(vpn_entrypoints admin false)" "$(vpn_entrypoints admin true)"
 expect_eq "vpn_entrypoints: server, public enrolment on" "$(vpn_entrypoints server true)" \
   "PORTCULLIS_EP_CORE=vpnsecure
 PORTCULLIS_EP_ADMIN=vpnsecure
-PORTCULLIS_EP_ENROL=websecure,vpnsecure"
+PORTCULLIS_EP_ENROL=websecure,vpnsecure
+PORTCULLIS_WEB_CORE=parked
+PORTCULLIS_WEB_ADMIN=parked
+PORTCULLIS_WEB_ENROL=websecure"
 expect_eq "vpn_entrypoints: server, public enrolment off" "$(vpn_entrypoints server false)" \
   "PORTCULLIS_EP_CORE=vpnsecure
 PORTCULLIS_EP_ADMIN=vpnsecure
-PORTCULLIS_EP_ENROL=vpnsecure"
+PORTCULLIS_EP_ENROL=vpnsecure
+PORTCULLIS_WEB_CORE=parked
+PORTCULLIS_WEB_ADMIN=parked
+PORTCULLIS_WEB_ENROL=parked"
 expect_fail "vpn_entrypoints: an unknown mode" vpn_entrypoints everything true
 
 OUT="$(VT_DOCKER_SUBNETS=$'172.17.0.0/16\n10.213.0.0/24' vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
@@ -3625,12 +3633,12 @@ OUT="$(VT_HUB_DOWN=1 vt 'vpn_mode admin true false' 2>&1)"; RC=$?
 expect_eq "vpn mode admin with the Hub down → refused naming --force" "$RC:$(printf '%s' "$OUT" | grep -c -- '--force')" "1:1"
 OUT="$(VT_HOSTINFO='{"local_networks":[],"provider_ranges":[],"admin_device_seen":true}' vt 'vpn_mode server false false' 2>&1)"; RC=$?
 expect_eq "vpn mode server with an admin device: mode, enrolment and the classes written, core recreated" \
-  "$RC:$(vte | grep -cxE 'PORTCULLIS_VPN_MODE=server|PORTCULLIS_VPN_PUBLIC_ENROL=false|PORTCULLIS_EP_CORE=vpnsecure|PORTCULLIS_EP_ADMIN=vpnsecure|PORTCULLIS_EP_ENROL=vpnsecure'):$(grep -cx 'stack_compose_up ' "$WORK/vt/log")" "0:5:1"
+  "$RC:$(vte | grep -cxE 'PORTCULLIS_VPN_MODE=server|PORTCULLIS_VPN_PUBLIC_ENROL=false|PORTCULLIS_EP_(CORE|ADMIN|ENROL)=vpnsecure|PORTCULLIS_WEB_(CORE|ADMIN|ENROL)=parked'):$(grep -cx 'stack_compose_up ' "$WORK/vt/log")" "0:8:1"
 OUT="$(VT_HUB_DOWN=1 VT_ENV=$'PORTCULLIS_VPN_MODE=server\nPORTCULLIS_EP_CORE=vpnsecure' vt 'vpn_mode server true true' 2>&1)"; RC=$?
 expect_eq "vpn mode server --force with the Hub down: no check, written" "$RC:$(grep -c 'host-info' "$WORK/vt/log" || true):$(vte | grep -cx 'PORTCULLIS_VPN_MODE=server')" "0:0:1"
-OUT="$(VT_HUB_DOWN=1 VT_ENV=$'PORTCULLIS_VPN_MODE=server\nPORTCULLIS_EP_CORE=vpnsecure\nPORTCULLIS_EP_ADMIN=vpnsecure\nPORTCULLIS_EP_ENROL=vpnsecure' vt 'vpn_mode apps true false' 2>&1)"; RC=$?
+OUT="$(VT_HUB_DOWN=1 VT_ENV=$'PORTCULLIS_VPN_MODE=server\nPORTCULLIS_EP_CORE=vpnsecure\nPORTCULLIS_EP_ADMIN=vpnsecure\nPORTCULLIS_EP_ENROL=vpnsecure\nPORTCULLIS_WEB_CORE=parked\nPORTCULLIS_WEB_ADMIN=parked\nPORTCULLIS_WEB_ENROL=parked' vt 'vpn_mode apps true false' 2>&1)"; RC=$?
 expect_eq "vpn mode apps with wg and hub down → writes and recreates" \
-  "$RC:$(grep -c '^dc exec' "$WORK/vt/log" || true):$(vte | grep -cxE 'PORTCULLIS_VPN_MODE=apps|PORTCULLIS_EP_(CORE|ADMIN|ENROL)=websecure,vpnsecure'):$(grep -cx 'stack_compose_up ' "$WORK/vt/log")" "0:0:4:1"
+  "$RC:$(grep -c '^dc exec' "$WORK/vt/log" || true):$(vte | grep -cxE 'PORTCULLIS_VPN_MODE=apps|PORTCULLIS_EP_(CORE|ADMIN|ENROL)=websecure,vpnsecure|PORTCULLIS_WEB_(CORE|ADMIN|ENROL)=websecure'):$(grep -cx 'stack_compose_up ' "$WORK/vt/log")" "0:0:7:1"
 
 OUT="$(vt 'vpn_add_device alice laptop' 2>&1)"; RC=$?
 ALL_ARGV="$(cat "$WORK/vt/log" "$WORK/vt/jq" 2>/dev/null)"

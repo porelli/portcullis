@@ -1535,6 +1535,34 @@ def log_uri(raw_uri: str, cfg: Optional[PublicConfig] = None) -> str:
 # address that isn't IPv4.
 
 VPN_FILE = os.environ.get("GATE_VPN_FILE", "/vpn-doc/vpn.json")
+# The forwardAuth / backend paths of the vpnsecure routers only (contract
+# §4/§5): Traefik's VPN middlewares call these addresses, so a client never
+# chooses them (the client's path travels in X-Forwarded-Uri). A VPN
+# binding is satisfied ONLY on these; on the normal paths a VPN-only host
+# is always denied with the /vpn-required page, whatever X-Forwarded-For
+# says (websecure clients can send any address, e.g. one in a provider's
+# range on the LAN).
+VPN_AUTH_PATH = "/auth/vpn"
+VPN_PORTAL_PATH = "/portal/vpn"
+VPN_PUBLIC_GUARD_PATH = "/public-guard/vpn"
+# Ranges no provider may claim (the vpn.json readers refuse the whole file):
+# Docker's default bridge pools, where every core network lives (the fixed
+# ones and the dynamic ones), plus the fixed core subnets compose passes in
+# GATE_CORE_SUBNETS (space-separated).
+VPN_RESERVED_DEFAULT = ("172.16.0.0/12", "192.168.0.0/16")
+
+
+def _reserved_nets() -> List[ipaddress.IPv4Network]:
+    out = []
+    for text in list(VPN_RESERVED_DEFAULT) + os.environ.get("GATE_CORE_SUBNETS", "").split():
+        try:
+            out.append(ipaddress.IPv4Network(text, strict=False))
+        except ValueError:
+            raise SystemExit(f"group-gate: GATE_CORE_SUBNETS entry {text!r} is not an IPv4 network — refusing to start")
+    return out
+
+
+VPN_RESERVED = _reserved_nets()
 VPN_DEVICES_FILE = "vpn.json"
 VPN_DOC_VERSION = 2
 VPN_BUILTIN = "builtin"
@@ -1715,6 +1743,8 @@ def parse_vpn_doc(doc) -> dict:
         own = []
         for j, r in enumerate(ranges):
             n = _vpn_net(r, f"{w}.ranges[{j}]")
+            if any(n.overlaps(core) for core in VPN_RESERVED):
+                raise ValueError(f"{w}.ranges[{j}]: overlaps a Docker or core network")
             for other, oid in nets:
                 if other.overlaps(n):
                     raise ValueError(f"{w}.ranges[{j}]: overlaps a range of {oid}")
@@ -1897,12 +1927,17 @@ def _vpn_required(policy_doc: dict, host: str, kind: str, raw_uri: str) -> Optio
 
 
 def vpn_binding(policy_doc: dict, vpn_doc: Optional[dict], host: str, kind: str, path: str,
-                addr, username: Optional[str], now: float):
+                addr, username: Optional[str], now: float, vpn_path: bool = True):
     """(reason, page text, device): reason None = allowed (device set when
-    the binding ran). username None skips step 3 (the public guard)."""
+    the binding ran). username None skips step 3 (the public guard).
+    vpn_path: the request came through a VPN path (VPN_AUTH_PATH, …); on
+    any other path a VPN-only host is denied (vpn_not_vpn) before the
+    address is even looked at."""
     via = _vpn_required(policy_doc, host, kind, path)
     if via is None:
         return None, "", None
+    if not vpn_path:
+        return "vpn_not_vpn", VPN_REQUIRED_TEXT, None
     if vpn_doc is None:
         return "vpn_no_doc", VPN_REQUIRED_TEXT, None
     p = vpn_provider_of(vpn_doc, addr) if addr is not None else None
@@ -1922,9 +1957,10 @@ def vpn_binding(policy_doc: dict, vpn_doc: Optional[dict], host: str, kind: str,
     return None, "", d
 
 
-def vpn_check(policy_doc, vpn_doc, host, kind, path, addr, username, now) -> Optional[Tuple[str, str]]:
+def vpn_check(policy_doc, vpn_doc, host, kind, path, addr, username, now,
+              vpn_path: bool = True) -> Optional[Tuple[str, str]]:
     """None = allowed; else (reason, page_text) (contract §4 binding)."""
-    reason, text, _ = vpn_binding(policy_doc, vpn_doc, host, kind, path, addr, username, now)
+    reason, text, _ = vpn_binding(policy_doc, vpn_doc, host, kind, path, addr, username, now, vpn_path)
     return None if reason is None else (reason, text)
 
 
@@ -3412,20 +3448,22 @@ class Handler(BaseHTTPRequestHandler):
         print(f"group-gate: {log}", flush=True)
 
     def _vpn_gate(self, policy_doc: dict, host: str, kind: str, raw_uri: str,
-                  username: Optional[str]) -> bool:
+                  username: Optional[str], vpn_path: bool = False) -> bool:
         """The VPN binding (contract §4); True when the request was denied.
         Sets self._vpn to the bound device for the opened log."""
         self._vpn = None
         addr = client_address(self.headers)
         try:
             needed = _vpn_required(policy_doc, host, kind, raw_uri) is not None
-            vdoc = load_vpn_file() if needed else None
-            reason, text, dev = vpn_binding(policy_doc, vdoc, host, kind, raw_uri, addr, username, time.time())
+            vdoc = load_vpn_file() if needed and vpn_path else None
+            reason, text, dev = vpn_binding(policy_doc, vdoc, host, kind, raw_uri, addr, username, time.time(),
+                                            vpn_path)
         except Exception as e:  # noqa: BLE001 — fail closed on anything unexpected
             reason, text, dev = "vpn_no_doc", VPN_REQUIRED_TEXT, None
             print(f"group-gate: VPN check failed ({type(e).__name__}): denied", flush=True)
         if reason is not None:
-            self._vpn_answer(reason, text, f"DENIED user={username or '-'} host={host} addr={addr} reason={reason}")
+            self._vpn_answer(reason, text, f"DENIED user={username or '-'} host={host} addr={addr} "
+                                           f"vpn_path={vpn_path} reason={reason}")
             return True
         self._vpn = dev
         return False
@@ -3479,7 +3517,7 @@ class Handler(BaseHTTPRequestHandler):
 
     _endpoint = "gate"
 
-    def _portal(self):
+    def _portal(self, vpn_path: bool = False):
         """Landing page at https://<domain>/ (router `portal`: portcullis-auth,
         then replacePath /portal). Lists the apps of portal-apps.json the
         user's groups allow (contract §10) and, for lldap_admin, the core
@@ -3506,7 +3544,7 @@ class Handler(BaseHTTPRequestHandler):
             doc = load_policy_file()
             # V17: the portal is a group-gate backend, not forward-auth: the
             # VPN binding of class core is checked here too.
-            if self._vpn_gate(doc, DOMAIN, "core", "/", user):
+            if self._vpn_gate(doc, DOMAIN, "core", "/", user, vpn_path):
                 return
             if self._signin_check(doc, DOMAIN, "core", user, self._cert_ok(serials) if serials else False,
                                   rec=rec):
@@ -3527,7 +3565,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _public_guard(self):
+    def _public_guard(self, vpn_path: bool = False):
         raw_host = self.headers.get("X-Forwarded-Host", "")
         host = normalize_host(raw_host)
         raw_uri = self.headers.get("X-Forwarded-Uri", "")
@@ -3545,9 +3583,10 @@ class Handler(BaseHTTPRequestHandler):
                     # A VPN-only app host: steps 1 and 2 only (V17: nobody
                     # is signed in on a public path, so no owner to bind).
                     try:
-                        vdoc = load_vpn_file() if _vpn_required(doc, host, kind, raw_uri) is not None else None
+                        need = _vpn_required(doc, host, kind, raw_uri) is not None
+                        vdoc = load_vpn_file() if need and vpn_path else None
                         vr, _, _ = vpn_binding(doc, vdoc, host, kind, raw_uri, client_address(self.headers),
-                                               None, time.time())
+                                               None, time.time(), vpn_path)
                     except Exception as e:  # noqa: BLE001
                         vr = f"vpn check failed ({type(e).__name__})"
                     if vr:
@@ -3592,19 +3631,22 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"ok\n")
             return
-        if gate_path == "/portal":
+        if gate_path in ("/portal", VPN_PORTAL_PATH):
             self._endpoint = "portal"
-            self._portal()
+            self._portal(vpn_path=gate_path == VPN_PORTAL_PATH)
             return
-        if gate_path == "/public-guard":
+        if gate_path in ("/public-guard", VPN_PUBLIC_GUARD_PATH):
             self._endpoint = "public_guard"
-            self._public_guard()
+            self._public_guard(vpn_path=gate_path == VPN_PUBLIC_GUARD_PATH)
             return
         if gate_path == "/vpn-required":
             self._vpn_required_page()
             return
         # Every other path: the full checks (there is no self-service path).
+        # Only VPN_AUTH_PATH (portcullis-groups-vpn@docker, on vpnsecure
+        # routers only) can satisfy a VPN binding.
         self._endpoint = "gate"
+        vpn_path = gate_path == VPN_AUTH_PATH
 
         raw_host = self.headers.get("X-Forwarded-Host", "")
         host = normalize_host(raw_host)
@@ -3712,7 +3754,7 @@ class Handler(BaseHTTPRequestHandler):
         # --- VPN binding (contract §4): after the identity checks, before
         # the membership checks; only VPN-only hosts (and core classes the
         # mode makes VPN-only) need it.
-        if self._vpn_gate(policy_doc, host, kind, self.headers.get("X-Forwarded-Uri", ""), username):
+        if self._vpn_gate(policy_doc, host, kind, self.headers.get("X-Forwarded-Uri", ""), username, vpn_path):
             return
 
         # --- Temporary memberships: an expired one is absent, whatever the

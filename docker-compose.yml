@@ -244,6 +244,12 @@ services:
       TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_CERTRESOLVER: letsencrypt
       TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_DOMAINS_0_MAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
       TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_DOMAINS_0_SANS: "*.${PORTCULLIS_DOMAIN:-portcullis.local}"
+      # Where `./portcullis vpn mode admin|server` parks the websecure twins
+      # of VPN-only core routers (PORTCULLIS_WEB_*=parked): Traefik's own
+      # loopback inside its container, never published, so those routers
+      # answer nobody; websecure then falls through to the low-priority
+      # core-vpn-required routers (group-gate's /vpn-required).
+      TRAEFIK_ENTRYPOINTS_PARKED_ADDRESS: 127.0.0.1:8441
       # Providers
       TRAEFIK_PROVIDERS_DOCKER: "true"
       # No socket mount: read-only API through its own proxy (contract §6).
@@ -325,7 +331,7 @@ services:
     labels:
       traefik.enable: "true"
       traefik.http.routers.dashboard.rule: Host(`traefik.${PORTCULLIS_DOMAIN:-portcullis.local}`)
-      traefik.http.routers.dashboard.entrypoints: ${PORTCULLIS_EP_ADMIN:-websecure,vpnsecure}
+      traefik.http.routers.dashboard.entrypoints: ${PORTCULLIS_WEB_ADMIN:-websecure}
       traefik.http.routers.dashboard.tls: "true"
       traefik.http.routers.dashboard.tls.certresolver: letsencrypt
       traefik.http.routers.dashboard.tls.domains[0].main: ${PORTCULLIS_DOMAIN:-portcullis.local}
@@ -333,6 +339,13 @@ services:
       traefik.http.routers.dashboard.tls.options: authaware@file
       traefik.http.routers.dashboard.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.routers.dashboard.service: api@internal
+      # dashboard's vpnsecure twin: the same router through group-gate's VPN path.
+      traefik.http.routers.dashboard-vpn.rule: Host(`traefik.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.dashboard-vpn.entrypoints: vpnsecure
+      traefik.http.routers.dashboard-vpn.tls: "true"
+      traefik.http.routers.dashboard-vpn.tls.options: authaware@file
+      traefik.http.routers.dashboard-vpn.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups-vpn@docker,security-headers@file
+      traefik.http.routers.dashboard-vpn.service: api@internal
     restart: unless-stopped
 
   postgres:
@@ -565,7 +578,7 @@ services:
       # the admin API over the internal network (http://keycloak:8080 or the
       # 127.0.0.1:8080 publish), which bypasses Traefik.
       traefik.http.routers.keycloak-admin.rule: Host(`auth.${PORTCULLIS_DOMAIN:-portcullis.local}`) && (PathPrefix(`/admin`) || PathPrefix(`/realms/master`))
-      traefik.http.routers.keycloak-admin.entrypoints: ${PORTCULLIS_EP_ADMIN:-websecure,vpnsecure}
+      traefik.http.routers.keycloak-admin.entrypoints: ${PORTCULLIS_WEB_ADMIN:-websecure}
       traefik.http.routers.keycloak-admin.tls.options: authaware@file
       # portcullis-auth-console, not portcullis-auth: the admin console sends
       # its own `Authorization: Bearer <console token>` to /admin/realms/...;
@@ -575,6 +588,13 @@ services:
       traefik.http.routers.keycloak-admin.middlewares: rate-limit-auth@file,client-cert-pem@file,portcullis-auth-console@docker,portcullis-groups@docker,security-headers@file
       traefik.http.routers.keycloak-admin.priority: "10"
       traefik.http.routers.keycloak-admin.service: keycloak
+      # keycloak-admin's vpnsecure twin: the same router through group-gate's VPN path.
+      traefik.http.routers.keycloak-admin-vpn.rule: Host(`auth.${PORTCULLIS_DOMAIN:-portcullis.local}`) && (PathPrefix(`/admin`) || PathPrefix(`/realms/master`))
+      traefik.http.routers.keycloak-admin-vpn.entrypoints: vpnsecure
+      traefik.http.routers.keycloak-admin-vpn.tls.options: authaware@file
+      traefik.http.routers.keycloak-admin-vpn.middlewares: rate-limit-auth@file,client-cert-pem@file,portcullis-auth-console@docker,portcullis-groups-vpn@docker,security-headers@file
+      traefik.http.routers.keycloak-admin-vpn.priority: "10"
+      traefik.http.routers.keycloak-admin-vpn.service: keycloak
     depends_on:
       postgres:
         condition: service_healthy
@@ -852,6 +872,9 @@ services:
       # 10007): the device ↔ person binding of VPN-only hosts. Missing or
       # invalid = every VPN-only request is denied.
       GATE_VPN_FILE: /vpn-doc/vpn.json
+      # Ranges no VPN provider may claim (plus Docker's default pools): the
+      # fixed core subnets. vpn.json naming one is refused whole.
+      GATE_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28}"
       # Required: core hosts are <sub>.<PORTCULLIS_DOMAIN> (map.conf) and
       # app hosts <label>.<PORTCULLIS_DOMAIN> or on an enrolled domain
       # (policy v5 extra_domains); any other X-Forwarded-Host is denied.
@@ -894,18 +917,54 @@ services:
       traefik.http.middlewares.portcullis-public-guard.forwardauth.address: http://group-gate:8080/public-guard
       traefik.http.middlewares.portcullis-public-guard.forwardauth.trustForwardHeader: "true"
       traefik.http.middlewares.portcullis-public-guard.forwardauth.authResponseHeadersRegex: ^X-Forwarded-Attr-
+      # The VPN twins (contract §4/§5, security ruling): the same checks on
+      # group-gate's VPN paths, the only ones that can satisfy a VPN binding.
+      # Used ONLY by routers on the vpnsecure entrypoint (CI checks it):
+      # there the client address is the edge's PROXY source; on websecure
+      # X-Forwarded-For is whatever the client's network gives.
+      traefik.http.middlewares.portcullis-groups-vpn.forwardauth.address: http://group-gate:8080/auth/vpn
+      traefik.http.middlewares.portcullis-groups-vpn.forwardauth.trustForwardHeader: "true"
+      traefik.http.middlewares.portcullis-groups-vpn.forwardauth.authResponseHeaders: X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,Authorization,X-Forwarded-Access-Token,X-Forwarded-Impersonator,X-Forwarded-Impersonation
+      traefik.http.middlewares.portcullis-groups-vpn.forwardauth.authResponseHeadersRegex: ^X-Forwarded-Attr-
+      traefik.http.middlewares.portcullis-public-guard-vpn.forwardauth.address: http://group-gate:8080/public-guard/vpn
+      traefik.http.middlewares.portcullis-public-guard-vpn.forwardauth.trustForwardHeader: "true"
+      traefik.http.middlewares.portcullis-public-guard-vpn.forwardauth.authResponseHeadersRegex: ^X-Forwarded-Attr-
       # Landing portal at the apex domain: any signed-in user; group-gate's
       # /portal lists the apps of portal-apps.json their groups allow and,
       # for lldap_admin, the Hub and the consoles.
       traefik.http.routers.portal.rule: Host(`${PORTCULLIS_DOMAIN:-portcullis.local}`)
-      traefik.http.routers.portal.entrypoints: ${PORTCULLIS_EP_CORE:-websecure,vpnsecure}
+      traefik.http.routers.portal.entrypoints: ${PORTCULLIS_WEB_CORE:-websecure}
       traefik.http.routers.portal.tls.options: authaware@file
       traefik.http.routers.portal.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portal-path@docker,security-headers@file
       traefik.http.routers.portal.service: group-gate
       traefik.http.middlewares.portal-path.replacepath.path: /portal
+      # The portal's vpnsecure twin: group-gate's VPN portal path.
+      traefik.http.routers.portal-vpn.rule: Host(`${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.portal-vpn.entrypoints: vpnsecure
+      traefik.http.routers.portal-vpn.tls.options: authaware@file
+      traefik.http.routers.portal-vpn.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portal-vpn-path@docker,security-headers@file
+      traefik.http.routers.portal-vpn.service: group-gate
+      traefik.http.middlewares.portal-vpn-path.replacepath.path: /portal/vpn
       # VPN-only instances' friendly routers (the Hub's portcullis-vpnonly-<id>
       # on websecure, contract §5): group-gate's static /vpn-required page.
       traefik.http.middlewares.vpn-required-path.replacepath.path: /vpn-required
+      # websecure, lowest priority: what the core hosts answer there while
+      # their routers are parked (vpn mode admin|server): /vpn-required. In
+      # apps mode every core host's own router wins.
+      traefik.http.routers.core-vpn-required.rule: Host(`${PORTCULLIS_DOMAIN:-portcullis.local}`) || Host(`traefik.${PORTCULLIS_DOMAIN:-portcullis.local}`) || Host(`hub.${PORTCULLIS_DOMAIN:-portcullis.local}`) || Host(`directory.${PORTCULLIS_DOMAIN:-portcullis.local}`) || Host(`metrics.${PORTCULLIS_DOMAIN:-portcullis.local}`) || Host(`people.${PORTCULLIS_DOMAIN:-portcullis.local}`) || Host(`mcp.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.core-vpn-required.entrypoints: websecure
+      traefik.http.routers.core-vpn-required.priority: "1"
+      traefik.http.routers.core-vpn-required.tls.options: authaware@file
+      traefik.http.routers.core-vpn-required.middlewares: rate-limit@file,vpn-required-path@docker,security-headers@file
+      traefik.http.routers.core-vpn-required.service: group-gate
+      # Keycloak's console paths: under keycloak-admin (10), above keycloak
+      # (1), so a parked console never falls through to the sign-in router.
+      traefik.http.routers.keycloak-admin-vpn-required.rule: Host(`auth.${PORTCULLIS_DOMAIN:-portcullis.local}`) && (PathPrefix(`/admin`) || PathPrefix(`/realms/master`))
+      traefik.http.routers.keycloak-admin-vpn-required.entrypoints: websecure
+      traefik.http.routers.keycloak-admin-vpn-required.priority: "9"
+      traefik.http.routers.keycloak-admin-vpn-required.tls.options: authaware@file
+      traefik.http.routers.keycloak-admin-vpn-required.middlewares: rate-limit-auth@file,vpn-required-path@docker,security-headers@file
+      traefik.http.routers.keycloak-admin-vpn-required.service: group-gate
     restart: unless-stopped
 
   hub:
@@ -1070,12 +1129,18 @@ services:
       traefik.enable: "true"
       traefik.docker.network: portcullis
       traefik.http.routers.hub.rule: Host(`hub.${PORTCULLIS_DOMAIN:-portcullis.local}`)
-      traefik.http.routers.hub.entrypoints: ${PORTCULLIS_EP_ADMIN:-websecure,vpnsecure}
+      traefik.http.routers.hub.entrypoints: ${PORTCULLIS_WEB_ADMIN:-websecure}
       traefik.http.routers.hub.tls.options: authaware@file
       # hub-proxy-secret is LAST among the request-modifying middlewares, so
       # the secret is never forwarded to the forwardAuth servers.
       traefik.http.routers.hub.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file
       traefik.http.routers.hub.service: hub
+      # hub's vpnsecure twin: the same router through group-gate's VPN path.
+      traefik.http.routers.hub-vpn.rule: Host(`hub.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.hub-vpn.entrypoints: vpnsecure
+      traefik.http.routers.hub-vpn.tls.options: authaware@file
+      traefik.http.routers.hub-vpn.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups-vpn@docker,hub-proxy-secret@docker,security-headers@file
+      traefik.http.routers.hub-vpn.service: hub
       traefik.http.middlewares.hub-proxy-secret.headers.customrequestheaders.X-Portcullis-Proxy-Secret: ${HUB_PROXY_SECRET:?HUB_PROXY_SECRET is not set — run ./portcullis init}
       traefik.http.services.hub.loadbalancer.server.port: "8888"
       # people.<domain>: the Hub's directory listener (:8889), any signed-in
@@ -1084,21 +1149,34 @@ services:
       # with client-cert-pem@file: the YubiKey renewal on the Sign-in page
       # reads the presented certificate from X-Forwarded-Tls-Client-Cert.
       traefik.http.routers.people.rule: Host(`people.${PORTCULLIS_DOMAIN:-portcullis.local}`)
-      traefik.http.routers.people.entrypoints: ${PORTCULLIS_EP_CORE:-websecure,vpnsecure}
+      traefik.http.routers.people.entrypoints: ${PORTCULLIS_WEB_CORE:-websecure}
       traefik.http.routers.people.tls.options: authaware@file
       traefik.http.routers.people.middlewares: rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file
       traefik.http.routers.people.service: hub-people
+      # people's vpnsecure twin: the same router through group-gate's VPN path.
+      traefik.http.routers.people-vpn.rule: Host(`people.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.people-vpn.entrypoints: vpnsecure
+      traefik.http.routers.people-vpn.tls.options: authaware@file
+      traefik.http.routers.people-vpn.middlewares: rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups-vpn@docker,hub-proxy-secret@docker,security-headers@file
+      traefik.http.routers.people-vpn.service: hub-people
       traefik.http.services.hub-people.loadbalancer.server.port: "8889"
       # The VPN device page and its API (contract §5.1): the people chain and
       # service, but its own entrypoint class (enrol), so in server mode
       # with public enrolment /vpn/ stays on the internet while the rest of
       # people.<domain> goes VPN-only.
       traefik.http.routers.people-vpn-enrol.rule: Host(`people.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/vpn/`)
-      traefik.http.routers.people-vpn-enrol.entrypoints: ${PORTCULLIS_EP_ENROL:-websecure,vpnsecure}
+      traefik.http.routers.people-vpn-enrol.entrypoints: ${PORTCULLIS_WEB_ENROL:-websecure}
       traefik.http.routers.people-vpn-enrol.priority: "190"
       traefik.http.routers.people-vpn-enrol.tls.options: authaware@file
       traefik.http.routers.people-vpn-enrol.middlewares: rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file
       traefik.http.routers.people-vpn-enrol.service: hub-people
+      # people-vpn-enrol's vpnsecure twin: the same router through group-gate's VPN path.
+      traefik.http.routers.people-vpn-enrol-vpn.rule: Host(`people.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/vpn/`)
+      traefik.http.routers.people-vpn-enrol-vpn.entrypoints: vpnsecure
+      traefik.http.routers.people-vpn-enrol-vpn.priority: "190"
+      traefik.http.routers.people-vpn-enrol-vpn.tls.options: authaware@file
+      traefik.http.routers.people-vpn-enrol-vpn.middlewares: rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups-vpn@docker,hub-proxy-secret@docker,security-headers@file
+      traefik.http.routers.people-vpn-enrol-vpn.service: hub-people
     depends_on:
       keycloak:
         condition: service_started
@@ -1368,6 +1446,8 @@ services:
       WG_SUBNET: ${PORTCULLIS_VPN_SUBNET:-10.213.0.0/22}
       WG_VPN_ADDR: ${PORTCULLIS_VPN_WG_IP:-172.31.254.3}
       WG_EDGE_ADDR: ${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}
+      # Ranges no provider may claim (plus Docker's default pools).
+      WG_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28}"
       WG_TRAEFIK: ${PORTCULLIS_VPN_EDGE_TRAEFIK_IP:-172.31.254.66}:8443
       WG_DNS_UPSTREAM: ${PORTCULLIS_VPN_DNS_UPSTREAM:-1.1.1.1,9.9.9.9}
       WG_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
@@ -1563,9 +1643,14 @@ services:
       traefik.enable: "true"
       traefik.docker.network: portcullis-proxy
       traefik.http.routers.grafana-metrics.rule: Host(`metrics.${PORTCULLIS_DOMAIN:-portcullis.local}`)
-      traefik.http.routers.grafana-metrics.entrypoints: ${PORTCULLIS_EP_ADMIN:-websecure,vpnsecure}
+      traefik.http.routers.grafana-metrics.entrypoints: ${PORTCULLIS_WEB_ADMIN:-websecure}
       traefik.http.routers.grafana-metrics.tls.options: authaware@file
       traefik.http.routers.grafana-metrics.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      # grafana-metrics's vpnsecure twin: the same router through group-gate's VPN path.
+      traefik.http.routers.grafana-metrics-vpn.rule: Host(`metrics.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.grafana-metrics-vpn.entrypoints: vpnsecure
+      traefik.http.routers.grafana-metrics-vpn.tls.options: authaware@file
+      traefik.http.routers.grafana-metrics-vpn.middlewares: rate-limit@file,client-headers@file,portcullis-auth@docker,portcullis-groups-vpn@docker,security-headers@file
       traefik.http.services.grafana-metrics.loadbalancer.server.port: "3000"
     restart: unless-stopped
 
