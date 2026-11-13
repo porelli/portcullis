@@ -2585,6 +2585,73 @@ expect_eq "restore: a host that isn't prepared for podman is refused before anyt
   "$(rr "CONTAINER_RUNTIME=podman\nPORTCULLIS_ENGINE_SOCKET=$RT_PSOCK\n" 'RESTORED=1\n' "export STUB_PODMAN_SOCK_ENGINE='Podman Engine'; runtime_require_host() { exit 1; }"):$(grep -c 'stop hub' "$STUB_DIR/rt-calls")" \
   "CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET=$RT_PSOCK:0"
 
+# ══ ownership under the user namespace (rootless Podman) ═══
+# Container id c: 0 → the operator, 1 ≤ c < 65536 → subuid_start + c − 1.
+expect_eq "ct_operator_id: docker → the operator's uid, podman → 0" \
+  "$(CONTAINER_RUNTIME=docker ct_operator_id) $(rt 'CONTAINER_RUNTIME=podman ct_operator_id' | head -n1)" "$RT_UID 0"
+expect_eq "ct_host_id: 0 → operator, 10001 → subuid+10000, 70000 → error" \
+  "$(rt 'CONTAINER_RUNTIME=podman; ct_host_id 0; ct_host_id 10001; ct_host_id 65536 2>/dev/null || echo e65536; ct_host_id 70000 2>/dev/null || echo e70000')" "$RT_UID
+110000
+e65536
+e70000
+rc=0"
+expect_eq "ct_host_gid: 0 → the operator's group, 10001 → subgid+10000" \
+  "$(rt 'CONTAINER_RUNTIME=podman; ct_host_gid 0; ct_host_gid 10001')" "$RT_GID
+110000
+rc=0"
+expect_eq "ct_host_id: docker → the same id" "$(rt 'CONTAINER_RUNTIME=docker ct_host_id 10001')" "10001
+rc=0"
+expect_eq "ct_host_id: an unreadable id map → refused" \
+  "$(rt "CONTAINER_RUNTIME=podman STUB_UID_MAP=''; ct_host_id 10001 2>&1 | grep -c 'podman unshare'; true")" "1
+rc=0"
+OWN_STAT="stat() { case \"\${*: -1}\" in */op) echo $RT_UID:$RT_GID ;; */hub) echo 110000:110000 ;; */root) echo 0:0 ;; */mixed) echo $RT_UID:0 ;; */big) echo 165536:110000 ;; esac; }"
+expect_eq "_owner_of_ct: host operator → 0, subuid+10000 → 10001, host root → unmapped" \
+  "$(rt "CONTAINER_RUNTIME=podman; $OWN_STAT; _owner_of_ct /x/op; _owner_of_ct /x/hub; _owner_of_ct /x/root; _owner_of_ct /x/mixed; _owner_of_ct /x/big")" "0:0
+10001:10001
+unmapped
+unmapped
+unmapped
+rc=0"
+expect_eq "_owner_of_ct: docker → the host ids" "$(rt "CONTAINER_RUNTIME=docker; $OWN_STAT; _owner_of_ct /x/hub")" "110000:110000
+rc=0"
+expect_eq "ct_hint_chown: sudo chown (docker), podman unshare chown (podman)" \
+  "$(CONTAINER_RUNTIME=docker ct_hint_chown 1000:10001 /a /b)|$(CONTAINER_RUNTIME=podman ct_hint_chown 0:10001 /a)" "sudo chown 1000:10001 /a /b|podman unshare chown 0:10001 /a"
+
+OWN_F="$WORK/rt/own"; mkdir -p "$OWN_F"; : > "$OWN_F/op"; : > "$OWN_F/hub"
+OWN_STAT2="stat() { case \"\${*: -1}\" in */hub) echo 110000:110000 ;; *) echo $RT_UID:$RT_GID ;; esac; }"
+OUT="$(rt "CONTAINER_RUNTIME=podman; export STUB_UID_MAP='0 0 1\n1 100000 65536\n'; $OWN_STAT2; id() { if [ \"\$1\" = -u ]; then echo 0; else command id \"\$@\"; fi; }; chown() { echo direct-chown >> \"\$STUB_DIR/rt-calls\"; }
+  ct_own 0:10001 '$OWN_F/op' '$OWN_F/hub'; grep -c 'run --rm --network none --user 0:0 --cap-drop ALL --cap-add CHOWN.* chown 0:10001 /t/0 /t/1$' \"\$STUB_DIR/rt-calls\"; grep -c direct-chown \"\$STUB_DIR/rt-calls\"; true")"
+expect_eq "ct_own on podman always runs the helper (never chown directly, even as uid 0)" "$OUT" "1
+0
+rc=0"
+OUT="$(rt "CONTAINER_RUNTIME=podman; $OWN_STAT2; ct_own 10001:10001 '$OWN_F/hub'; ct_own 0:0 '$OWN_F/op'; test ! -e \"\$STUB_DIR/rt-calls\" && echo none")"
+expect_eq "ct_own on podman is a no-op when _owner_of_ct matches" "$OUT" "none
+rc=0"
+OUT="$(rt "CONTAINER_RUNTIME=podman; $OWN_STAT2; docker() { return 1; }; ct_own 10001:10001 '$OWN_F/op'")"
+case "$OUT" in *"try: podman unshare chown 10001:10001 $OWN_F/op"*"rc=1") t_pass "ct_own on podman: the failure hint is podman unshare chown" ;; *) t_fail "ct_own podman hint: $OUT" ;; esac
+OUT="$(rt "CONTAINER_RUNTIME=podman; $OWN_STAT2; ct_group_read 10002 '$OWN_F/hub'; grep -c 'chown 0:10002 /t/0$' \"\$STUB_DIR/rt-calls\"; true")"
+expect_eq "ct_group_read on podman passes 0:<gid>" "$OUT" "1
+rc=0"
+OUT="$(rt "CONTAINER_RUNTIME=docker; ct_group_read 10002 '$OWN_F/op'; grep -c 'chown $RT_UID:10002 /t/0$' \"\$STUB_DIR/rt-calls\"; true")"
+expect_eq "ct_group_read on docker passes <operator uid>:<gid> (unchanged)" "$OUT" "1
+rc=0"
+OUT="$(rt "CONTAINER_RUNTIME=podman; PORTCULLIS_ROOT='$WORK/rt/sp'; mkdir -p '$WORK/rt/sp/secrets/hub'; chmod 500 '$WORK/rt/sp/secrets/hub'; stack_prepare")"
+chmod 700 "$WORK/rt/sp/secrets/hub"
+case "$OUT" in *"is not writable"*"Fix: podman unshare chown -R 0:0 \"$WORK/rt/sp/secrets\""*"rc=1") t_pass "stack_prepare on podman: the writability hint is podman unshare chown -R 0:0" ;; *) t_fail "stack_prepare podman hint: $OUT" ;; esac
+
+# restic as container root = the operator, without capabilities.
+OUT="$(rt "CONTAINER_RUNTIME=podman BACKUP_REPOSITORY='$WORK/rt/repo' BACKUP_ROOT='$WORK/rt/bk' BACKUP_PASSWORD=x; _restic snapshots >/dev/null 2>&1; grep -E '^run ' \"\$STUB_DIR/rt-calls\"")"
+case "$OUT" in "run --rm -i --user 0:0 --cap-drop ALL "*) t_pass "_restic on podman runs --user 0:0 --cap-drop ALL" ;; *) t_fail "_restic podman: $OUT" ;; esac
+OUT="$(rt "CONTAINER_RUNTIME=docker BACKUP_REPOSITORY='$WORK/rt/repo' BACKUP_ROOT='$WORK/rt/bk' BACKUP_PASSWORD=x; _restic snapshots >/dev/null 2>&1; grep -E '^run ' \"\$STUB_DIR/rt-calls\"")"
+case "$OUT" in "run --rm -i --user $RT_UID:$RT_GID --cap-drop ALL "*) t_pass "_restic on docker runs as the operator (unchanged)" ;; *) t_fail "_restic docker: $OUT" ;; esac
+OUT="$(rt "CONTAINER_RUNTIME=podman; backup_schedule_systemd '*-*-* 03:15:00' ''")"
+case "$OUT" in *"After=network-online.target podman.socket"*"Requires=podman.socket"*"WantedBy=default.target"*) t_pass "backup schedule --systemd on podman writes user units (Requires=podman.socket, WantedBy=default.target)" ;; *) t_fail "schedule podman: $OUT" ;; esac
+case "$OUT" in *"User="*|*"docker.service"*) t_fail "backup schedule on podman: no User=, no docker.service" ;; *) t_pass "backup schedule on podman: no User=, no docker.service" ;; esac
+OUT="$(rt "CONTAINER_RUNTIME=podman; backup_schedule_systemd 'Sun 04:00' '$WORK/rt/units'")"
+case "$OUT" in *"~/.config/systemd/user"*"systemctl --user daemon-reload"*"systemctl --user enable --now portcullis-backup.timer"*) t_pass "backup schedule --output on podman: user-unit install commands" ;; *) t_fail "schedule podman output: $OUT" ;; esac
+OUT="$(rt "CONTAINER_RUNTIME=docker; backup_schedule_systemd '*-*-* 03:15:00' ''")"
+case "$OUT" in *"Requires=docker.service"*"User=$(id -un)"*"WantedBy=timers.target"*) t_pass "backup schedule on docker: system units (unchanged)" ;; *) t_fail "schedule docker: $OUT" ;; esac
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

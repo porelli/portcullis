@@ -74,7 +74,14 @@ write_revoked_serials() {
     esac
   done
   mkdir -p "$dir" || return 1
-  [ -w "$dir" ] || { echo "ERROR: $dir is not writable (fix: sudo chown \"$(id -un)\" \"$dir\")" >&2; return 1; }
+  if [ ! -w "$dir" ]; then
+    if _rt_is_podman; then
+      echo "ERROR: $dir is not writable (fix: podman unshare chown 0:0 \"$dir\")" >&2
+    else
+      echo "ERROR: $dir is not writable (fix: sudo chown \"$(id -un)\" \"$dir\")" >&2
+    fi
+    return 1
+  fi
   tmp="$(mktemp "$dir/.revoked.XXXXXX")" || return 1
   {
     echo "# Revoked YubiKey and browser certificate serials (Vault pki_int + pki_file),"

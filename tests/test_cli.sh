@@ -191,6 +191,9 @@ EOF
 ARGV_RE='--arg(json)? [A-Za-z_]+ "?\$\(cat|--arg(json)? [A-Za-z_]+ "?\$\{?[A-Za-z_]*(PASSWORD|SECRET|TOKEN|PASS)\b|--(admin-)?password[ =]"?\$|--token[ =]"?\$|(PASSWORD|SECRET|TOKEN)=[^ ]*\$\(cat '
 HITS="$(grep -nE -e "$ARGV_RE" "$HERE/../portcullis" "$HERE"/../scripts/lib/*.sh | grep -v 'secret-argv-ok' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
 expect_eq "no secrets on argv in the CLI" "$HITS" ""
+# Container root is the operator under rootless Podman: an operator-owned
+# file is chowned to ct_operator_id, never $(id -u) (a subuid there).
+expect_eq "no ct_own \"\$(id -u)… in the CLI (ct_operator_id)" "$(grep -rnF 'ct_own "$(id -u)' "$HERE/../scripts/lib" "$HERE/../portcullis" || true)" ""
 case "$(printf '%s\n' '  jq -n --arg p "$(cat "$f")" x' '  jq --arg pass "$LLDAP_ADMIN_PASSWORD"' | grep -cE -e "$ARGV_RE")" in
   2) t_pass "argv secret pattern catches --arg \"\$(cat ...)\" and secret variables" ;; *) t_fail "argv secret pattern" ;; esac
 

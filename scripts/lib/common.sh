@@ -288,21 +288,99 @@ CT_UID_LLDAP=1000     # lldap/lldap:*-rootless (lldap_data is 1000-owned)
 # operator can run docker, i.e. is root-equivalent anyway).
 PORTCULLIS_HELPER_IMAGE="alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a"
 
-# _owner_of <path> — "uid:gid" (GNU or BSD stat).
+# _owner_of <path> — "uid:gid" on the host (GNU or BSD stat).
 _owner_of() { stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1"; }
 
-# ct_own <uid:gid> <path>... — chown the paths (no-op for those already
-# right). As root directly, otherwise via a throwaway root container with
-# only CAP_CHOWN and no network.
-ct_own() {
-  local spec="$1" p i=0 todo=() mounts=() targets=()
+# Container ids vs host ids. Docker (rootful): the same. Rootless Podman:
+# every container shares the operator's default user namespace, so
+# container id 0 is the operator and 1 ≤ c < 65536 is subuid_start + c − 1
+# (scripts/lib/runtime.sh runtime_id_maps, from the live map — never a
+# guess). Container root is the OPERATOR there: files the operator must
+# keep are chowned to "$(ct_operator_id):<gid>", never "$(id -u):…" (that
+# would hand them to a subordinate id).
+
+# ct_operator_id — the container uid that is the operator on the host.
+ct_operator_id() {
+  if _rt_is_podman; then echo 0; else id -u; fi
+}
+
+# _ct_maps — the rootless id map (cached); an unreadable or unexpected map refuses.
+_ct_maps() {
+  [ -z "${_RT_UID_START:-}" ] || return 0
+  runtime_id_maps || fail "can't read the rootless id map (podman unshare cat /proc/self/uid_map and gid_map): 0 must map to the operator and 1… to one range of at least $RT_MIN_IDS subordinate ids (/etc/subuid, /etc/subgid)"
+}
+
+# _ct_to_host <op> <start> <count> <container id> — the host id, or exit 1.
+_ct_to_host() {
+  case "$4" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$4" -eq 0 ]; then echo "$1"
+  elif [ "$4" -le "$3" ] && [ "$4" -lt 65536 ]; then echo $(($2 + $4 - 1))
+  else return 1; fi
+}
+
+# ct_host_id <c> / ct_host_gid <c> — the host uid / gid of container id c
+# (docker: c itself); an id outside the map exits 1.
+ct_host_id() {
+  if ! _rt_is_podman; then echo "$1"; return 0; fi
+  _ct_maps
+  _ct_to_host "$_RT_UID_OP" "$_RT_UID_START" "$_RT_UID_N" "$1" || { echo "container uid $1 is outside the rootless id map" >&2; return 1; }
+}
+ct_host_gid() {
+  if ! _rt_is_podman; then echo "$1"; return 0; fi
+  _ct_maps
+  _ct_to_host "$_RT_GID_OP" "$_RT_GID_START" "$_RT_GID_N" "$1" || { echo "container gid $1 is outside the rootless id map" >&2; return 1; }
+}
+
+# _ct_from_host <op> <start> <count> <host id> — the container id, or exit 1.
+_ct_from_host() {
+  if [ "$4" = "$1" ]; then echo 0
+  elif [ "$4" -ge "$2" ] && [ "$4" -lt $(($2 + $3)) ] && [ $(($4 - $2 + 1)) -lt 65536 ]; then echo $(($4 - $2 + 1))
+  else return 1; fi
+}
+
+# _owner_of_ct <path> — "uid:gid" in container ids (docker: the host ids);
+# "unmapped" when either side is outside the rootless map (host root,
+# another account: shown as 65534 inside).
+_owner_of_ct() {
+  local own u g cu cg
+  own="$(_owner_of "$1")" || return 1
+  _rt_is_podman || { echo "$own"; return 0; }
+  _ct_maps
+  u="${own%%:*}" g="${own#*:}"
+  if cu="$(_ct_from_host "$_RT_UID_OP" "$_RT_UID_START" "$_RT_UID_N" "$u")" \
+     && cg="$(_ct_from_host "$_RT_GID_OP" "$_RT_GID_START" "$_RT_GID_N" "$g")"; then
+    echo "$cu:$cg"
+  else
+    echo unmapped
+  fi
+}
+
+# ct_hint_chown <uid:gid> <path>... — the command that fixes an owner by hand.
+ct_hint_chown() {
+  local spec="$1"
   shift
+  if _rt_is_podman; then echo "podman unshare chown $spec $*"; else echo "sudo chown $spec $*"; fi
+}
+
+# ct_own <uid:gid> <path>... — chown the paths to these CONTAINER ids (no-op
+# for those already right). Docker: as root directly, otherwise via a
+# throwaway root container with only CAP_CHOWN and no network. Rootless
+# Podman: always the throwaway container (it runs in the user namespace, so
+# chown 10001 writes the host's subuid+10000), never chown directly.
+ct_own() {
+  local spec="$1" p i=0 podman=false todo=() mounts=() targets=()
+  shift
+  if _rt_is_podman; then podman=true; _ct_maps; fi
   for p in "$@"; do
     [ -e "$p" ] || continue
-    [ "$(_owner_of "$p")" = "$spec" ] || todo+=("$p")
+    if [ "$podman" = true ]; then
+      [ "$(_owner_of_ct "$p")" = "$spec" ] || todo+=("$p")
+    else
+      [ "$(_owner_of "$p")" = "$spec" ] || todo+=("$p")
+    fi
   done
   [ "${#todo[@]}" -gt 0 ] || return 0
-  if [ "$(id -u)" = 0 ]; then
+  if [ "$podman" = false ] && [ "$(id -u)" = 0 ]; then
     chown "$spec" "${todo[@]}"
     return
   fi
@@ -315,7 +393,7 @@ ct_own() {
   docker run --rm --network none --user 0:0 --cap-drop ALL --cap-add CHOWN \
     --security-opt no-new-privileges:true "${mounts[@]}" "$PORTCULLIS_HELPER_IMAGE" \
     chown "$spec" "${targets[@]}" >/dev/null \
-    || fail "could not chown ${todo[*]} to $spec (try: sudo chown $spec ${todo[*]})"
+    || fail "could not chown ${todo[*]} to $spec (try: $(ct_hint_chown "$spec" "${todo[@]}"))"
 }
 
 # volume_own <volume> <uid:gid> — make sure the compose named volume exists
@@ -348,7 +426,7 @@ ct_group_read() {
     [ -e "$p" ] || continue
     if [ -d "$p" ]; then chmod 750 "$p"; else chmod 640 "$p"; fi
   done
-  ct_own "$(id -u):$gid" "$@"
+  ct_own "$(ct_operator_id):$gid" "$@"
 }
 
 # secrets_fix_perms — ownership/modes of everything under secrets/ that a
@@ -445,7 +523,12 @@ stack_prepare() {
   local d
   (umask 077 && mkdir -p "$PORTCULLIS_ROOT/secrets/vault-unseal" "$PORTCULLIS_ROOT/secrets/enroll" "$PORTCULLIS_ROOT/secrets/hub" "$PORTCULLIS_ROOT/secrets/domains" "$PORTCULLIS_ROOT/secrets/mcp-gate")
   for d in secrets secrets/vault-unseal secrets/enroll secrets/hub secrets/domains secrets/mcp-gate; do
-    [ -w "$PORTCULLIS_ROOT/$d" ] || fail "$PORTCULLIS_ROOT/$d is not writable (created by Docker as root?). Fix: sudo chown -R \"$(id -un)\" \"$PORTCULLIS_ROOT/secrets\""
+    if [ ! -w "$PORTCULLIS_ROOT/$d" ]; then
+      if _rt_is_podman; then
+        fail "$PORTCULLIS_ROOT/$d is not writable (owned by a subordinate id?). Fix: podman unshare chown -R 0:0 \"$PORTCULLIS_ROOT/secrets\""
+      fi
+      fail "$PORTCULLIS_ROOT/$d is not writable (created by Docker as root?). Fix: sudo chown -R \"$(id -un)\" \"$PORTCULLIS_ROOT/secrets\""
+    fi
   done
   # templates/: the Hub (uid 10001) copies app template dirs here.
   # appfiles/: the Hub writes settings data files here (contract §13.7);

@@ -234,12 +234,12 @@ domains_fix_perms() {
   # Traefik's ACME account URI (dns_main_env_write): compose reads it.
   [ ! -e "$d/main-domain.env" ] || chmod 600 "$d/main-domain.env"
   local f
-  [ ! -e "$d/api-secret" ] || { chmod 640 "$d/api-secret"; ct_own "$(id -u):$CT_UID_HUB" "$d/api-secret"; }
+  [ ! -e "$d/api-secret" ] || { chmod 640 "$d/api-secret"; ct_own "$(ct_operator_id):$CT_UID_HUB" "$d/api-secret"; }
   for f in "$d/age.key" "$d/certs-endpoint/server.crt" "$d/certs-endpoint/server.key"; do
-    [ ! -e "$f" ] || { chmod 640 "$f"; ct_own "$(id -u):$CT_UID_DOMAINS" "$f"; }
+    [ ! -e "$f" ] || { chmod 640 "$f"; ct_own "$(ct_operator_id):$CT_UID_DOMAINS" "$f"; }
   done
   for f in "$d/certs-endpoint/client.crt" "$d/certs-endpoint/client.key"; do
-    [ ! -e "$f" ] || { chmod 640 "$f"; ct_own "$(id -u):$CT_GID_TRAEFIK" "$f"; }
+    [ ! -e "$f" ] || { chmod 640 "$f"; ct_own "$(ct_operator_id):$CT_GID_TRAEFIK" "$f"; }
   done
 }
 

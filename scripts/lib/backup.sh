@@ -378,13 +378,16 @@ _restic_require() {
 }
 
 # _restic <restic args...> — restic in its pinned image, as the operator
-# (files stay operator-owned), read-only root FS, no capabilities. Repo
+# (files stay operator-owned; rootless Podman: container root without any
+# capability IS the operator, reading by owner and mode only), read-only
+# root FS, no capabilities. Repo
 # password and provider credentials are passed by NAME (-e VAR), in a
 # subshell, so they never reach argv or this shell's later commands.
 # Extra mounts: _RESTIC_MOUNTS=(-v src:dst ...).
 _restic() {
-  local repo="$BACKUP_REPOSITORY" path v
-  local -a args=(run --rm -i --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges:true
+  local repo="$BACKUP_REPOSITORY" path v user
+  if _rt_is_podman; then user=0:0; else user="$(id -u):$(id -g)"; fi
+  local -a args=(run --rm -i --user "$user" --cap-drop ALL --security-opt no-new-privileges:true
     --read-only --tmpfs /tmp -e HOME=/tmp -e RESTIC_CACHE_DIR=/cache -v "$BACKUP_ROOT/.restic-cache:/cache"
     -e RESTIC_REPOSITORY -e RESTIC_PASSWORD -e RESTIC_PROGRESS_FPS=0.2)
   (umask 077 && mkdir -p "$BACKUP_ROOT/.restic-cache")
@@ -917,10 +920,19 @@ backup_restore() {
 
 # ── schedule ───────────────────────────────────────────────
 
-# backup_schedule_systemd <on-calendar> <output-dir|"">
+# backup_schedule_systemd <on-calendar> <output-dir|""> — system units
+# (docker: User=, After/Requires docker.service), or under rootless Podman
+# the operator's user units (After/Requires podman.socket, no User=,
+# WantedBy=default.target; they run while linger keeps the user manager up).
 backup_schedule_systemd() {
-  local cal="$1" out="$2" user offsite="" svc timer env_line=""
+  local cal="$1" out="$2" user offsite="" svc timer env_line="" after requires user_line wanted podman=false
   user="$(id -un)"
+  if _rt_is_podman; then podman=true; fi
+  if [ "$podman" = true ]; then
+    after="network-online.target podman.socket" requires="podman.socket" user_line="" wanted="default.target"
+  else
+    after="network-online.target docker.service" requires="docker.service" user_line="User=$user" wanted="timers.target"
+  fi
   [ -z "${BACKUP_REPOSITORY:-}" ] || offsite=" --offsite"
   [ "$PORTCULLIS_ROOT" = "$PORTCULLIS_HOME" ] || env_line="Environment=PORTCULLIS_ROOT=$PORTCULLIS_ROOT"
   svc="$(cat <<EOF
@@ -928,13 +940,13 @@ backup_schedule_systemd() {
 [Unit]
 Description=Portcullis backup$( [ -n "$offsite" ] && echo " (local + off-host, restic)" || echo " (local only: BACKUP_REPOSITORY is not set)")
 Wants=network-online.target
-After=network-online.target docker.service
-Requires=docker.service
+After=$after
+Requires=$requires
 
 [Service]
 Type=oneshot
-User=$user
-WorkingDirectory=$PORTCULLIS_ROOT
+${user_line:+$user_line
+}WorkingDirectory=$PORTCULLIS_ROOT
 Environment=NO_COLOR=1
 ${env_line}
 ExecStart=$PORTCULLIS_HOME/portcullis backup$offsite
@@ -957,7 +969,7 @@ RandomizedDelaySec=30m
 Persistent=true
 
 [Install]
-WantedBy=timers.target
+WantedBy=$wanted
 EOF
 )"
   if [ -n "$out" ]; then
@@ -965,6 +977,16 @@ EOF
     printf '%s\n' "$svc" > "$out/portcullis-backup.service"
     printf '%s\n' "$timer" > "$out/portcullis-backup.timer"
     ok "Wrote $out/portcullis-backup.service and portcullis-backup.timer"
+    if [ "$podman" = true ]; then
+      cat <<EOF
+Install (as $user, user units; linger must be on: sudo loginctl enable-linger $user):
+  mkdir -p ~/.config/systemd/user
+  install -m 0644 $out/portcullis-backup.service $out/portcullis-backup.timer ~/.config/systemd/user/
+  systemctl --user daemon-reload && systemctl --user enable --now portcullis-backup.timer
+  systemctl --user start portcullis-backup.service   # run once now; journalctl --user -u portcullis-backup
+EOF
+      return 0
+    fi
     cat <<EOF
 Install (as root):
   install -m 0644 $out/portcullis-backup.service $out/portcullis-backup.timer /etc/systemd/system/
@@ -1034,6 +1056,9 @@ Print (or write to DIR) a systemd service + timer that run
 `portcullis backup --offsite` (just `backup` while BACKUP_REPOSITORY is
 unset) as the current user, followed by `portcullis status --textfile`
 (metrics for the monitoring profile). The user must be able to run docker.
+Under rootless Podman (CONTAINER_RUNTIME=podman) they are the operator's
+user units (~/.config/systemd/user, after podman.socket, no User=).
+Needs .env (its CONTAINER_RUNTIME).
 
 Options:
   --systemd           generate systemd units (the only scheduler supported)

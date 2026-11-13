@@ -78,6 +78,6 @@ mcpgate_fix_perms() {
   for f in "$d/age.key" "$d/age.pub" "$d/hub-secret"; do
     [ ! -e "$f" ] || chmod 640 "$f"
   done
-  [ ! -e "$d/age.key" ] || ct_own "$(id -u):$CT_UID_MCP_GATE" "$d/age.key"
-  ct_own "$(id -u):$CT_UID_HUB" "$d/age.pub" "$d/hub-secret"
+  [ ! -e "$d/age.key" ] || ct_own "$(ct_operator_id):$CT_UID_MCP_GATE" "$d/age.key"
+  ct_own "$(ct_operator_id):$CT_UID_HUB" "$d/age.pub" "$d/hub-secret"
 }
