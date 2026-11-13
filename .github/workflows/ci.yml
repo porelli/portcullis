@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       jobs:
-        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman"
+        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn"
         type: string
         default: all
 
@@ -928,6 +928,13 @@ jobs:
           go vet ./...
           test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
           CGO_ENABLED=0 go build -o /dev/null .
+          CGO_ENABLED=1 go test -race ./...
+      - name: VPN client unit tests (tests/e2e/vpn-client, the e2e jobs' WireGuard client)
+        working-directory: tests/e2e/vpn-client
+        run: |
+          go mod verify
+          go vet ./...
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
           CGO_ENABLED=1 go test -race ./...
       # mcp-gate's shared vectors are byte copies of the Hub's: the gate
       # files (contract §15.4, internal/aigate/testdata/) and the sign-in
@@ -2326,6 +2333,102 @@ jobs:
               || { echo "FAIL: the Hub's gate files (secret, recipient, read-only access log)"; exit 1; }
           fi
           echo "PASS: mcp-gate healthy as 10005 (+10001 only) at 172.31.250.3, read-only, secrets 0640 by group, access log 0640/0750 group 10001 read-only in the Hub, MCP routes reach the gate without forward-auth or cookies"
+
+      # The VPN service (contract §16): wg up through `./portcullis vpn init`
+      # (rootful Docker here; e2e-podman runs it rootless), userspace only,
+      # least privilege; vpnsecure honours PROXY v2 only from wg's address on
+      # portcullis-vpn-edge; client-sent X-Forwarded-For / X-Real-Ip never
+      # reach a backend. The full built-in and Headscale paths: job e2e-vpn.
+      - name: Test the VPN service (wg userspace, least privilege; vpnsecure trusts only wg's PROXY)
+        timeout-minutes: 15
+        run: |
+          set -o pipefail
+          CURL_IMG=docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+          ./portcullis vpn init
+          grep -qx 'COMPOSE_PROFILES=wg' .env || { echo "FAIL: vpn init did not add wg to COMPOSE_PROFILES"; grep '^COMPOSE_PROFILES' .env; exit 1; }
+          WG_CID="$(docker compose ps -q wg)"
+          [ -n "$WG_CID" ] || { echo "FAIL: no wg container"; exit 1; }
+          docker inspect "$WG_CID" | jq -e '.[0] | .Config.User == "10006:10006"
+              and (.HostConfig.CapAdd // [] | length) == 0 and .HostConfig.CapDrop == ["ALL"]
+              and (.HostConfig.Privileged | not) and (.HostConfig.Devices // [] | length) == 0
+              and .HostConfig.GroupAdd == ["10007"] and .HostConfig.ReadonlyRootfs
+              and ([.Mounts[] | select(.Source | test("docker\\.sock|podman\\.sock"))] == [])
+              and (.State.Health.Status == "healthy")' >/dev/null \
+            || { echo "FAIL: wg container: $(docker inspect "$WG_CID" | jq -c '.[0] | {User: .Config.User, CapAdd: .HostConfig.CapAdd, GroupAdd: .HostConfig.GroupAdd, Health: .State.Health.Status}')"; docker compose logs --tail=40 wg; exit 1; }
+          docker compose exec -T wg sh -c 'id -u; id -G; stat -c "%a %u %g" /data /data/status.json' > /tmp/wg-ids.txt
+          [ "$(cat /tmp/wg-ids.txt | tr '\n' '|')" = "10006|10006 10007|2750 10006 10001|640 10006 10001|" ] \
+            || { echo "FAIL: wg's ids / wg_data modes: $(cat /tmp/wg-ids.txt | tr '\n' '|')"; exit 1; }
+          for i in $(seq 1 40); do
+            docker compose exec -T wg /wg status | jq -e '.version == 1 and .people.ok and .edge.ok and (.people.public_key | length) == 44
+                and .people.port == 51820 and .people.subnet == "10.213.0.0/22" and .people.mtu == 1280' >/dev/null 2>&1 && break
+            [ "$i" -eq 40 ] && { echo "FAIL: wg status: $(docker compose exec -T wg /wg status)"; docker compose logs --tail=40 wg hub; exit 1; }
+            sleep 3
+          done
+          # The Hub reads status.json read-only through group 10001, never the engine.
+          docker compose exec -T hub sh -c 'test -r /wg-data/status.json && ! test -w /wg-data/status.json && test -w /vpn-doc' \
+            || { echo "FAIL: the Hub's wg_data / vpn_doc access"; exit 1; }
+          # The people key: 0640 group 10006, never printed (a 44-character base64 key).
+          [ "$(stat -c '%a %g %s' secrets/wg/people.key)" = "640 10006 45" ] || { echo "FAIL: people.key $(stat -c '%a %g %s' secrets/wg/people.key)"; exit 1; }
+          echo "PASS: vpn init: wg healthy as 10006 (group 10007 only), no capability / device / privilege, wg_data 2750 10006:10001, status.json 0640 group 10001, the people role on"
+
+          # A whoami on both entrypoints (no middleware): it echoes what a backend gets.
+          cat > /tmp/ci-vpnecho.yml <<'YML'
+          services:
+            whoami:
+              image: docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+              networks: [portcullis-proxy]
+              labels:
+                traefik.enable: "true"
+                traefik.http.services.ci-vpnecho.loadbalancer.server.port: "80"
+                traefik.http.routers.ci-vpnecho.rule: Host(`vpnecho.portcullis.local`)
+                traefik.http.routers.ci-vpnecho.entrypoints: websecure,vpnsecure
+                traefik.http.routers.ci-vpnecho.tls.options: authaware@file
+                traefik.http.routers.ci-vpnecho.service: ci-vpnecho
+          networks:
+            portcullis-proxy:
+              external: true
+          YML
+          sed -i 's/^          //' /tmp/ci-vpnecho.yml
+          docker compose -p ci-vpnecho -f /tmp/ci-vpnecho.yml up -d
+          echo_web() { curl -s --cacert certs/ca-chain.crt --resolve "vpnecho.portcullis.local:443:127.0.0.1" "$@" https://vpnecho.portcullis.local/ || true; }
+          for i in $(seq 1 30); do echo_web | grep -q '^Hostname:' && break; [ "$i" -eq 30 ] && { echo "FAIL: vpnecho not routed"; exit 1; }; sleep 2; done
+          # Spoofed client addresses on websecure: Traefik drops them (no
+          # forwarded-header trust), the backend sees the real peer only.
+          OUT="$(echo_web -H 'X-Forwarded-For: 10.213.0.5' -H 'X-Real-Ip: 10.213.0.5' -H 'X_Forwarded_For: 10.213.0.5')"
+          if printf '%s' "$OUT" | grep -qi '10\.213\.0\.5'; then echo "FAIL: a spoofed address reached the backend on websecure:"; printf '%s\n' "$OUT"; exit 1; fi
+          printf '%s' "$OUT" | grep -qiE '^X-Forwarded-For: [0-9.]+$' || { echo "FAIL: no single X-Forwarded-For: $OUT"; exit 1; }
+          # group-gate's normal path never binds: the spoofed headers on a
+          # gated route are logged with the real address, never 10.213.0.5.
+          curl -s -o /dev/null --cacert certs/ca-chain.crt --resolve "gated.portcullis.local:443:127.0.0.1" \
+            -H 'X-Forwarded-For: 10.213.0.5' -H 'X-Real-Ip: 10.213.0.5' https://gated.portcullis.local/ || true
+          if docker compose logs --since 2m group-gate | grep -q 'addr=10\.213\.0\.5'; then echo "FAIL: group-gate saw a spoofed address"; exit 1; fi
+          echo "PASS: spoofed X-Forwarded-For / X-Real-Ip on websecure never reach a backend or group-gate"
+
+          # A PROXY header to vpnsecure from anything but wg: from a gateway's
+          # network (portcullis-vpn) Traefik isn't reachable at all; from the
+          # edge network (only wg and Traefik belong there: a throwaway
+          # container stands in for an intruder) the header isn't honoured.
+          EDGE_TRAEFIK=172.31.254.66
+          if docker run --rm --network portcullis-vpn --ip 172.31.254.20 "$CURL_IMG" -s --max-time 8 -k -o /dev/null \
+               --haproxy-protocol --haproxy-clientip 10.213.0.5 --resolve "vpnecho.portcullis.local:8443:$EDGE_TRAEFIK" \
+               https://vpnecho.portcullis.local:8443/; then
+            echo "FAIL: a container on portcullis-vpn reached vpnsecure"; exit 1
+          fi
+          OUT="$(docker run --rm --network portcullis-vpn-edge --ip 172.31.254.70 "$CURL_IMG" -s --max-time 8 -k \
+                   --haproxy-protocol --haproxy-clientip 10.213.0.5 --resolve "vpnecho.portcullis.local:8443:$EDGE_TRAEFIK" \
+                   https://vpnecho.portcullis.local:8443/ || true)"
+          if printf '%s' "$OUT" | grep -q '10\.213\.0\.5'; then echo "FAIL: vpnsecure honoured a PROXY header from 172.31.254.70:"; printf '%s\n' "$OUT"; exit 1; fi
+          printf '%s' "$OUT" | grep -qE '^X-Forwarded-For: 172\.31\.254\.70$' || [ -z "$OUT" ] \
+            || { echo "FAIL: unexpected answer on vpnsecure: $OUT"; exit 1; }
+          echo "PASS: vpnsecure honours PROXY only from wg (portcullis-vpn can't reach it; another edge address is ignored)"
+          # Nothing listens on the edge's provider ports without a wired provider.
+          if docker run --rm --network portcullis-vpn --ip 172.31.254.21 "$CURL_IMG" -s --max-time 5 -o /dev/null telnet://172.31.254.3:9001 </dev/null; then
+            echo "FAIL: an edge port answers with no provider wired"; exit 1
+          fi
+          docker compose -p ci-vpnecho -f /tmp/ci-vpnecho.yml down
+          # wg stays on (profile wg) for the rest of the job: up, upgrade,
+          # backup and restore run with it (secrets/wg is backed up).
+          echo "PASS: the VPN service"
 
       - name: Test signin reset-core (lockout recovery, as uid 10001)
         run: |
@@ -6538,6 +6641,71 @@ jobs:
           done
           python3 tests/e2e/e2e_podman.py
 
+      # V25: the VPN service under rootless Podman, as on Docker: vpn init,
+      # wg healthy as 10006 with no capability, one built-in device's
+      # handshake and a GET through the tunnel (userspace WireGuard, no TUN:
+      # the people port goes through rootlessport / pasta). The reboot step
+      # below then also brings wg back (restart: always).
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Build the VPN client (tests/e2e/vpn-client)
+        working-directory: tests/e2e/vpn-client
+        run: |
+          go mod verify
+          CGO_ENABLED=0 go build -o "$RUNNER_TEMP/vpn-client" .
+      - name: The VPN service on rootless Podman (vpn init, wg as 10006 without capabilities, a built-in device through the tunnel)
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          # shellcheck source=/dev/null
+          source "$RUNNER_TEMP/podlib.sh"
+          ./portcullis vpn init 2>&1 | redact
+          WG_CID="$(docker compose ps -q wg)"
+          docker inspect "$WG_CID" | jq -e '.[0] | .Config.User == "10006:10006" and (.HostConfig.CapAdd // [] | length) == 0
+              and (.HostConfig.Privileged | not) and (.HostConfig.Devices // [] | length) == 0' >/dev/null \
+            || { echo "FAIL: wg on Podman: $(docker inspect "$WG_CID" | jq -c '.[0] | {User: .Config.User, CapAdd: .HostConfig.CapAdd, Privileged: .HostConfig.Privileged}')"; exit 1; }
+          [ "$(docker compose exec -T wg id -u)" = 10006 ] || { echo "FAIL: wg's uid in its container"; exit 1; }
+          for i in $(seq 1 40); do
+            docker compose exec -T wg /wg status | jq -e '.people.ok and .edge.ok' >/dev/null 2>&1 && break
+            [ "$i" -eq 40 ] && { echo "FAIL: wg status: $(docker compose exec -T wg /wg status)"; docker compose logs --tail=40 wg hub; exit 1; }
+            sleep 3
+          done
+          # A person for the device (LLDAP; the Hub's VPN users group is everyone by default).
+          LLDAP_ADMIN_PASSWORD="$(grep '^LLDAP_ADMIN_PASSWORD=' .env | cut -d= -f2-)"; echo "::add-mask::$LLDAP_ADMIN_PASSWORD"
+          LT=$(LLDAP_ADMIN_PASSWORD="$LLDAP_ADMIN_PASSWORD" jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
+            | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          echo "::add-mask::$LT"
+          jq -n '{query: "mutation { createUser(user: {id: \"vpn-ci\", email: \"vpn-ci@portcullis.local\"}) { id } }"}' \
+            | curl -sf http://127.0.0.1:17170/api/graphql -H @<(printf 'Authorization: Bearer %s\n' "$LT") -H 'Content-Type: application/json' -d @- \
+            | jq -e '.errors == null' >/dev/null || { echo "FAIL: LLDAP user vpn-ci"; exit 1; }
+          # The device: the host CLI prints the config once (the private key
+          # goes to a 0600 file in RUNNER_TEMP for the client, never an artifact).
+          umask 077
+          for i in $(seq 1 20); do
+            ./portcullis vpn add-device vpn-ci laptop > "$RUNNER_TEMP/vpn-ci.out" 2>&1 && break
+            [ "$i" -eq 20 ] && { echo "FAIL: vpn add-device: $(grep -v PrivateKey "$RUNNER_TEMP/vpn-ci.out")"; exit 1; }
+            sleep 6
+          done
+          sed -n '/^\[Interface\]/,/^PersistentKeepalive/p' "$RUNNER_TEMP/vpn-ci.out" > "$RUNNER_TEMP/vpn-ci.conf"
+          grep -qx 'AllowedIPs = 10.213.0.1/32' "$RUNNER_TEMP/vpn-ci.conf" || { echo "FAIL: the config has no AllowedIPs = 10.213.0.1/32"; exit 1; }
+          # The tunnel: handshake over the published UDP port, then people.<d>
+          # through the edge and vpnsecure: forward-auth still asks to sign in.
+          for i in $(seq 1 10); do
+            "$RUNNER_TEMP/vpn-client" --endpoint 127.0.0.1:51820 --ca-file certs/ca-chain.crt \
+              --resolve "people.$E2E_DOMAIN:443:10.213.0.1" --get "https://people.$E2E_DOMAIN/" < "$RUNNER_TEMP/vpn-ci.conf" > /tmp/vpn-get.json || true
+            jq -e --arg d "$E2E_DOMAIN" '.handshake and (.status == 302 or .status == 401) and ((.location // "") | startswith("https://auth.\($d)/") or . == "")' /tmp/vpn-get.json >/dev/null && break
+            [ "$i" -eq 10 ] && { echo "FAIL: through the tunnel: $(jq -c 'del(.body)' /tmp/vpn-get.json)"; docker compose logs --tail=40 wg traefik; exit 1; }
+            sleep 5
+          done
+          "$RUNNER_TEMP/vpn-client" --endpoint 127.0.0.1:51820 --dns "people.$E2E_DOMAIN" < "$RUNNER_TEMP/vpn-ci.conf" > /tmp/vpn-dns.json || true
+          jq -e '.handshake' /tmp/vpn-dns.json >/dev/null || { echo "FAIL: DNS through the tunnel: $(cat /tmp/vpn-dns.json)"; exit 1; }
+          rm -f "$RUNNER_TEMP/vpn-ci.conf" "$RUNNER_TEMP/vpn-ci.out"
+          jq -c '{status, location, handshake}' /tmp/vpn-get.json | tee -a "$GITHUB_STEP_SUMMARY"
+          status_wait 120
+          echo "PASS: wg on rootless Podman: 10006, no capability, a built-in device's handshake and a request through the edge and vpnsecure"
+
       - name: Reboot simulation (user manager and /run/user/<uid> recreated, podman-restart.service)
         timeout-minutes: 10
         run: |
@@ -6717,3 +6885,358 @@ jobs:
           name: e2e-podman-artifacts
           path: e2e-artifacts/
           retention-days: 7
+
+  # VPN-only access end to end (contract §4, §5, §16): the whole stack with
+  # the VPN service (profile wg, `./portcullis vpn init`), the Hub (same-named
+  # Hub branch) and one local template source = the CI template
+  # tests/e2e/apps/echo and the templates repo's headscale (same-named
+  # templates branch, else main; the step fails without its vpn: block).
+  # Clients without privileges: tests/e2e/vpn-client (wireguard-go netstack)
+  # for the built-in VPN, userspace tailscaled containers for the tailnet. A
+  # CoreDNS stub is the built-in resolver's upstream (portcullis.local has no
+  # public records: it answers this server's CI addresses). tests/e2e/e2e_vpn.py
+  # documents the cases. Keys, configs and cookies stay in a temp dir; the
+  # artifacts are logs only.
+  e2e-vpn:
+    needs: jobs-input
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-vpn,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-vpn ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-vpn,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-vpn ')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      E2E_DOMAIN: portcullis.local
+      E2E_ARTIFACTS: e2e-artifacts
+      # Let's Encrypt staging (no ACME in CI: Traefik serves the Vault wildcard).
+      ACME_STAGING: "true"
+      COMPOSE_PROFILES: wg
+      ALPINE: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      CURL_IMG: docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+      TS_IMG: docker.io/tailscale/tailscale:v1.104.7@sha256:72c1e19e0aedca96b8533bbb0b4368564410ff20b17e53b804eb6c1f04a31be4
+      PY_IMG: docker.io/library/python:3.15.2-alpine@sha256:a0f2e268f2ce8f3709611a90054ec6a8ae31f6251f5896b8648b9bb99835e30a
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Templates (same-named templates branch, else main)
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          url=https://github.com/porelli/portcullis-templates
+          ref=main
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && [[ "$REF" != v* ]] \
+              && git ls-remote --exit-code --heads "$url" "$REF" >/dev/null; then
+            ref="$REF"
+          fi
+          git clone --quiet --depth=1 --branch "$ref" "$url" "$RUNNER_TEMP/templates"
+          echo "Templates: portcullis-templates@$ref ($(git -C "$RUNNER_TEMP/templates" rev-parse --short HEAD))" | tee -a "$GITHUB_STEP_SUMMARY"
+          # Fail closed: the scenarios need headscale's vpn: block.
+          grep -q '^vpn:' "$RUNNER_TEMP/templates/headscale/manifest.yaml" \
+            || { echo "FAIL: headscale has no vpn: block on portcullis-templates@$ref"; exit 1; }
+
+      - name: Generate .env and the CI override (the trust list fixture, a CoreDNS stub upstream)
+        run: |
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
+            --email ci@portcullis.local --dns-provider none
+          for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
+            val="$(grep "^$v=" .env | cut -d= -f2-)"
+            [ "$v" = KEYCLOAK_ADMIN ] || echo "::add-mask::$val"
+            echo "$v=$val" >> "$GITHUB_ENV"
+          done
+          # The built-in resolver's upstream in CI: portcullis.local (every
+          # name) points at this server's CI addresses, everything else is
+          # forwarded.
+          cat > /tmp/Corefile <<'EOF'
+          portcullis.local {
+            template IN A { answer "{{ .Name }} 60 IN A 203.0.113.10" }
+            template IN AAAA { answer "{{ .Name }} 60 IN AAAA 2001:db8::10" }
+          }
+          . {
+            forward . 1.1.1.1 9.9.9.9
+          }
+          EOF
+          sed -i 's/^          //' /tmp/Corefile
+          cat > docker-compose.ci.yml <<'YML'
+          services:
+            # CI only (contract §8.1 "Extra entries"): Chromium's virtual
+            # authenticator is a security key.
+            hub:
+              environment:
+                HUB_DEV: "1"
+                HUB_SIGNIN_EXTRA_AUTHENTICATORS: /run/portcullis/signin/extra-authenticators.json
+              volumes:
+                - ./tests/e2e/fixtures/virtual-authenticators.json:/run/portcullis/signin/extra-authenticators.json:ro
+            keycloak:
+              ports:
+                - "127.0.0.1:9000:9000"
+            lldap:
+              ports:
+                - "127.0.0.1:17170:17170"
+            wg:
+              environment:
+                WG_DNS_UPSTREAM: 172.30.99.53
+            ci-dns:
+              image: docker.io/coredns/coredns:1.15.0@sha256:0a9d8c8ddf34347eb59aad9a8784f0710de88d6d112726d11d271f9bc6daca26
+              command: ["-conf", "/Corefile"]
+              volumes:
+                - /tmp/Corefile:/Corefile:ro
+              networks:
+                wg-egress:
+                  ipv4_address: 172.30.99.53
+          networks:
+            wg-egress:
+              ipam:
+                config:
+                  - subnet: 172.30.99.0/24
+          YML
+          sed -i 's/^          //' docker-compose.ci.yml
+          docker compose config -q
+
+      - name: List the images this job runs
+        run: |
+          {
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate|wg)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
+            grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
+              | grep -E '^docker\.io/(library/(alpine|busybox|python)|traefik/whoami|curlimages/curl|tailscale/tailscale|coredns/coredns):'
+          } | sort -u > "$RUNNER_TEMP/images.txt"
+      - name: Load images (cached, verified)
+        timeout-minutes: 15
+        uses: ./.github/actions/cached-images
+        with:
+          images: ${{ runner.temp }}/images.txt
+          name: e2e-vpn
+          save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: enroll
+          tags: portcullis-enroll
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=enroll
+          cache-to: ""
+      - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: group-gate
+          tags: portcullis-group-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=group-gate
+          cache-to: ""
+      - name: Build the domains service (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: domains
+          tags: portcullis-domains
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=domains
+          cache-to: ""
+      - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: mcp-gate
+          tags: portcullis-mcp-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=mcp-gate
+          cache-to: ""
+      - name: Build the VPN service (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: wg
+          tags: portcullis-wg
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=wg
+          cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=wg,mode=max' || '' }}
+      - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/keycloak-image
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Build the VPN client (tests/e2e/vpn-client)
+        working-directory: tests/e2e/vpn-client
+        run: |
+          go mod verify
+          CGO_ENABLED=0 go build -o "$RUNNER_TEMP/vpn-client" .
+
+      - name: Start the whole stack (Hub with the echo / headscale template source), vpn init
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          docker compose up -d postgres lldap
+          ./portcullis vault init
+          ./portcullis pki setup --with-server-cert
+          ./portcullis config apply --bundle-only
+          printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
+          docker volume create --label com.docker.compose.project=portcullis --label com.docker.compose.volume=hub_data portcullis_hub_data >/dev/null
+          docker run --rm -v portcullis_hub_data:/data -v "$PWD/tests/e2e/apps:/src:ro" -v "$RUNNER_TEMP/templates:/tpl:ro" "$ALPINE" sh -c '
+            mkdir -p /data/repos/ci && cp -r /src/echo /tpl/headscale /data/repos/ci/ &&
+            printf "sources:\n  - name: ci\n    url: \"\"\n    path: /data/repos/ci\n" > /data/state.yaml &&
+            chown -R 10001:10001 /data && chmod 600 /data/state.yaml'
+          # shellcheck disable=SC2046
+          docker compose up -d $(docker compose config --services | grep -vxE 'hub|wg')
+          for i in $(seq 1 100); do
+            curl -sf http://127.0.0.1:9000/health/ready >/dev/null && break
+            [ "$i" -eq 100 ] && { echo "FAIL: Keycloak not ready"; docker compose logs --tail=80 keycloak; exit 1; }
+            sleep 3
+          done
+          ./portcullis keycloak configure
+          ./portcullis oidc register
+          ./portcullis up
+          docker compose restart forward-auth forward-auth-ext
+          HUB_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q hub)")
+          echo "HUB_IP=$HUB_IP" >> "$GITHUB_ENV"
+          for i in $(seq 1 40); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' "http://$HUB_IP:8888/healthz")" = 200 ] && break
+            [ "$i" -eq 40 ] && { echo "FAIL: hub /healthz"; docker compose logs --tail=40 hub; exit 1; }
+            sleep 2
+          done
+          ./portcullis vpn init
+          docker compose exec -T wg /wg status | jq -c '{edge, people: (.people | {ok, port, subnet})}'
+          echo "127.0.0.1 portcullis.local auth.portcullis.local enroll.portcullis.local hub.portcullis.local people.portcullis.local echo-vpn.portcullis.local vpn.portcullis.local vpn-admin.portcullis.local" | sudo tee -a /etc/hosts
+
+      - name: Instances, users, the headscale provider (through the Hub's API), setup links
+        timeout-minutes: 15
+        run: |
+          set -o pipefail
+          SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
+          echo "E2E_HUB_SECRET=$SECRET" >> "$GITHUB_ENV"
+          hub() { local m="$1" p="$2"; shift 2
+                  curl -s -X "$m" -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") \
+                    -H 'Content-Type: application/json' "$@" "http://$HUB_IP:8888$p"; }
+          hubc() { hub "$@" -o /tmp/hub.out -w '%{http_code}'; }
+          source tests/e2e/hubop.sh
+          for i in $(seq 1 30); do
+            hub GET /api/templates | jq -e '[.[].id] as $ids | ["echo", "headscale"] - $ids == []' >/dev/null 2>&1 && break
+            [ "$i" -eq 30 ] && { echo "FAIL: the Hub did not load echo and headscale: $(hub GET /api/templates | head -c 400)"; docker compose logs --tail=60 hub; exit 1; }
+            sleep 2
+          done
+          hubop POST /api/instances -d '{"template":"echo","id":"echo-vpn","label":"VPN echo","hosts":{"echo":"echo-vpn.portcullis.local"}}' \
+            || { echo "FAIL: create echo-vpn"; exit 1; }
+          hubop POST /api/instances -d '{"template":"headscale","id":"headscale","label":"Tailnet","hosts":{"headscale":"vpn.portcullis.local","headplane":"vpn-admin.portcullis.local"}}' \
+            || { echo "FAIL: create headscale"; exit 1; }
+          LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
+            | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
+          echo "::add-mask::$LLDAP_TOKEN"
+          gql() { jq -n --arg q "$1" '{query: $q}' | curl -sf http://127.0.0.1:17170/api/graphql \
+                    -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @-; }
+          for u in alice bob; do
+            gql "mutation { createUser(user: {id: \"$u\", email: \"$u@portcullis.local\"}) { id } }" | jq -e '.errors == null' >/dev/null
+          done
+          GROUPS_JSON="$(gql '{ groups { id displayName } }')"
+          for m in alice:users_echo-vpn bob:users_echo-vpn alice:users_headscale; do
+            gid=$(echo "$GROUPS_JSON" | jq -r --arg g "${m#*:}" '.data.groups[] | select(.displayName == $g) | .id')
+            [ -n "$gid" ] || { echo "FAIL: the Hub did not create ${m#*:}"; exit 1; }
+            gql "mutation { addUserToGroup(userId: \"${m%%:*}\", groupId: $gid) { ok } }" | jq -e '.errors == null' >/dev/null
+          done
+          for id in echo-vpn headscale; do
+            hubop POST /api/templates/enable -d "{\"id\":\"$id\"}" || { echo "FAIL: enable $id"; exit 1; }
+          done
+          # Headscale's API key (the identity and DNS hooks, the gateway's
+          # pre-auth key): created in the container, never printed, kept in a
+          # 0600 file for the test's restore.
+          umask 077
+          for i in $(seq 1 30); do
+            docker exec portcullis-headscale-headscale-1 headscale apikeys create --expiration 1d > "$RUNNER_TEMP/hs-api-key" 2>/dev/null && break
+            [ "$i" -eq 30 ] && { echo "FAIL: headscale apikeys create"; docker logs --tail=40 portcullis-headscale-headscale-1; exit 1; }
+            sleep 3
+          done
+          KEY="$(tail -n1 "$RUNNER_TEMP/hs-api-key")"; echo "::add-mask::$KEY"
+          printf '%s\n' "$KEY" > "$RUNNER_TEMP/hs-api-key"
+          echo "E2E_HS_API_KEY_FILE=$RUNNER_TEMP/hs-api-key" >> "$GITHUB_ENV"
+          KEY="$KEY" jq -n '{values: {api_key: env.KEY}}' | hubc PUT /api/instances/headscale/settings -d @- > /tmp/code
+          case "$(cat /tmp/code)" in 200|202) ;; *) echo "FAIL: headscale api_key: $(cat /tmp/code) $(cat /tmp/hub.out)"; exit 1 ;; esac
+          code=$(hubc PUT /api/instances/headscale/vpn-provider -d '{"wired": true, "refresh": "15s"}')
+          case "$code" in 200|202) ;; *) echo "FAIL: wire headscale: $code $(cat /tmp/hub.out)"; exit 1 ;; esac
+          hub GET /api/vpn | jq -c '{mode, wg, providers: [.providers[] | {id, wired, stale, devices}]}'
+          for spec in "E2E_ALICE_INVITE alice" "E2E_BOB_INVITE bob"; do
+            read -r var who <<<"$spec"
+            url="$(./portcullis invite "$who" --to portal --json | jq -r .url)"
+            [ -z "$url" ] || [ "$url" = null ] || echo "::add-mask::$url"
+            [[ "$url" =~ ^https://enroll\.portcullis\.local/invite/[A-Za-z0-9_-]{43}$ ]] || { echo "FAIL: setup link for $who"; exit 1; }
+            echo "$var=$url" >> "$GITHUB_ENV"
+          done
+
+      - name: Restore the pip / Playwright browser cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.cache/ms-playwright
+          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+
+      - name: Install Playwright (pinned) and trust core's CA
+        timeout-minutes: 10
+        run: |
+          python3 -m venv /tmp/e2e-venv
+          /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
+          # cryptography (X25519 keys), from group-gate's hashed pins.
+          /tmp/e2e-venv/bin/pip install --quiet --require-hashes --only-binary=:all: -r group-gate/requirements.txt
+          sudo /tmp/e2e-venv/bin/playwright install-deps chromium
+          /tmp/e2e-venv/bin/playwright install chromium
+          sudo apt-get install -y -qq libnss3-tools >/dev/null
+          mkdir -p "$HOME/.pki/nssdb"
+          certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
+          certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
+
+      - name: Run the VPN scenarios (built-in and headscale, modes, revocation, DNS)
+        timeout-minutes: 25
+        env:
+          E2E_VPN_CLIENT: ${{ runner.temp }}/vpn-client
+        run: /tmp/e2e-venv/bin/python tests/e2e/e2e_vpn.py
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p e2e-artifacts
+          docker compose ps -a > e2e-artifacts/compose-ps.txt 2>&1 || true
+          docker ps -a > e2e-artifacts/docker-ps.txt 2>&1 || true
+          for svc in wg traefik keycloak forward-auth group-gate hub ci-dns; do
+            docker compose logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
+          done
+          for c in portcullis-headscale-headscale-1 portcullis-headscale-gateway-1 portcullis-headscale-vpn-glue-1 ts-alice ts-local; do
+            docker logs "$c" > "e2e-artifacts/$c.log" 2>&1 || true
+          done
+          # Status only (public data): never vpn.json devices' keys, .env, secrets/ or configs.
+          docker compose exec -T wg /wg status > e2e-artifacts/wg-status.json 2>&1 || true
+          docker compose exec -T wg /wg providers > e2e-artifacts/wg-providers.json 2>&1 || true
+
+      - name: Upload logs
+        timeout-minutes: 10
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-vpn-artifacts
+          path: e2e-artifacts/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/hs-api-key"
+          docker rm -f ts-alice ts-local 2>/dev/null || true
+          for p in $(docker ps -aq --filter label=com.docker.compose.project | xargs -r docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' | sort -u | grep -E '^portcullis-(echo-vpn|headscale)$'); do
+            docker compose -p "$p" down -v 2>/dev/null || true
+          done
+          docker compose down -v
