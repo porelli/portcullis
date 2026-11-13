@@ -158,7 +158,7 @@ services:
     restart: unless-stopped
 
   traefik:
-    image: traefik:v3.7.17@sha256:30ff62491aacdb862ceb8c9edcf2627da638d7deafdd4b6dab32fe34f8aa3e90
+    image: traefik:v3.7.17@sha256:f4bb143d1135a579b630ed491e17ec50f6f7c9c6a30585ff3d385471d2a86f5a
     <<: *hardening
     # Runs as root (binds :80/:443, owns the ACME volume) but with no
     # capability except binding low ports; root without CAP_DAC_OVERRIDE
@@ -567,7 +567,7 @@ services:
     restart: unless-stopped
 
   forward-auth:
-    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.5@sha256:8498b0d0ef0a7b29686414000a08aee467f02d0299c9ed1e006a8f33fc017916
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.6@sha256:c3415e8660af553f5e18f5d90db050614c02493c0ac6260ac59442f6d9b12048
     <<: *hardening
     # distroless, runs as nonroot (65532). No healthcheck: the image has
     # no shell/HTTP client (Traefik and `portcullis status` see it fail).
@@ -681,7 +681,7 @@ services:
   # (Host(`<host>`) && PathPrefix(`/oauth2/`), service forward-auth-ext) are
   # the Hub's, one per extra-domain host; core routes it on no host.
   forward-auth-ext:
-    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.5@sha256:8498b0d0ef0a7b29686414000a08aee467f02d0299c9ed1e006a8f33fc017916
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.15.6@sha256:c3415e8660af553f5e18f5d90db050614c02493c0ac6260ac59442f6d9b12048
     <<: *hardening
     read_only: true
     extra_hosts:
@@ -1254,7 +1254,7 @@ services:
   # ./portcullis up). docs/monitoring.md. Config: monitoring/; generated
   # files and the Vault metrics token: secrets/monitoring/ (./portcullis up).
   prometheus:
-    image: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+    image: prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
     profiles: [monitoring]
     <<: *hardening
     user: "65534:65534"
@@ -1281,7 +1281,7 @@ services:
     restart: unless-stopped
 
   alertmanager:
-    image: prom/alertmanager:v0.34.2@sha256:39d8bb3966c694a124428a3a88fbcffd40bd069129ecd47c059f8a3f17c55f3b
+    image: prom/alertmanager:v0.35.0@sha256:e638797febd034838eca8b98cdbd46f951e9bf7f178777aa8669167406a9946c
     profiles: [monitoring]
     <<: *hardening
     user: "65534:65534"
