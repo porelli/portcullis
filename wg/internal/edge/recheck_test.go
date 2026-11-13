@@ -63,10 +63,15 @@ func (f *fixture) advance(d time.Duration) {
 	f.mu.Unlock()
 }
 
-func newFixture(t *testing.T, doc string) *fixture {
+// newFixture serves doc; set runs on the edge before it starts serving
+// (its limits are read without a lock, as in production).
+func newFixture(t *testing.T, doc string, set ...func(*Edge)) *fixture {
 	f := &fixture{t: t, now: now0}
 	f.doc.Store(mustDoc(t, doc))
 	f.e = New(echoTraefik(t), netip.MustParseAddr("127.0.0.1"), f.doc.Load, f.clock)
+	for _, fn := range set {
+		fn(f.e)
+	}
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -338,8 +343,7 @@ func TestEdgeReboundClosesOldIngress(t *testing.T) {
 // (busy); one closes, a new one is admitted again. The provider cap counts
 // connections from accept, before their header.
 func TestEdgeCaps(t *testing.T) {
-	f := newFixture(t, docJSON("127.0.0.1", false))
-	f.e.MaxPerClient = 2
+	f := newFixture(t, docJSON("127.0.0.1", false), func(e *Edge) { e.MaxPerClient = 2 })
 	c1, br1 := f.open("100.64.0.7:40001")
 	f.open("100.64.0.7:40002")
 	raw := func(src string) (net.Conn, *bufio.Reader) {
@@ -365,8 +369,7 @@ func TestEdgeCaps(t *testing.T) {
 	}
 	f.open("100.64.0.7:40004") // a slot again
 
-	g := newFixture(t, docJSON("127.0.0.1", false))
-	g.e.MaxPerProvider = 1
+	g := newFixture(t, docJSON("127.0.0.1", false), func(e *Edge) { e.MaxPerProvider = 1 })
 	idle, err := net.Dial("tcp4", g.addr) // accepted, no header yet: it counts
 	if err != nil {
 		t.Fatal(err)
@@ -392,5 +395,70 @@ func TestEdgeCaps(t *testing.T) {
 	closedSoon(t, c, bufio.NewReader(c))
 	if v := testutil.ToFloat64(g.e.rejected.WithLabelValues("hs", "busy")); v != 1 {
 		t.Fatalf("provider cap: rejected{busy} = %v", v)
+	}
+}
+
+// threeDevices: alice has two tailnet devices (.7, .8), bob one (.9).
+func threeDevices() string {
+	return strings.Replace(docJSON("127.0.0.1", false), `"devices":[`,
+		`"devices":[{"ip":"100.64.0.8","provider":"hs","user":"alice","device_id":"hs:2","name":"b","expires":null},`+
+			`{"ip":"100.64.0.9","provider":"hs","user":"bob","device_id":"hs:3","name":"c","expires":null},`, 1)
+}
+
+func rawConn(t *testing.T, addr, src string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	c, err := net.Dial("tcp4", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c.Close() })
+	c.Write(v2Header(src))
+	c.Write([]byte("ping\n"))
+	return c, bufio.NewReader(c)
+}
+
+// TestEdgeUserCap: one person's connections are capped across all of
+// their devices; another person is unaffected.
+func TestEdgeUserCap(t *testing.T) {
+	f := newFixture(t, threeDevices(), func(e *Edge) { e.MaxPerUser = 2 })
+	f.open("100.64.0.7:40001")
+	f.open("100.64.0.8:40002") // alice's other device: the same budget
+	c, br := rawConn(t, f.addr, "100.64.0.8:40003")
+	closedSoon(t, c, br)
+	if v := testutil.ToFloat64(f.e.rejected.WithLabelValues("hs", "busy")); v != 1 {
+		t.Fatalf("rejected{busy} = %v", v)
+	}
+	f.open("100.64.0.9:40004") // bob still gets in
+}
+
+// TestEdgePressureEvictsHeaviestIdle: above PressurePercent of the
+// provider cap, a new connection closes the heaviest user's sessions idle
+// for PressureIdle (reason pressure), never an active one, never another
+// user's.
+func TestEdgePressureEvictsHeaviestIdle(t *testing.T) {
+	// The fixture's hook provider is fresh until 10:03 (now0 10:01): an
+	// idle threshold of 1 min, 90 s of idleness.
+	f := newFixture(t, threeDevices(), func(e *Edge) { e.MaxPerProvider, e.PressurePercent, e.PressureIdle = 4, 50, time.Minute })
+	a1, br1 := f.open("100.64.0.7:40001")
+	a2, br2 := f.open("100.64.0.8:40002")
+	b1, bb1 := f.open("100.64.0.9:40003")
+	f.advance(90 * time.Second)
+	f.ping(a1, br1) // alice's first session is active again
+	f.ping(b1, bb1)
+	f.open("100.64.0.9:40004") // 3 of 4 > 50 %: relieve first
+	closedSoon(t, a2, br2)
+	if v := f.closed("pressure"); v != 1 {
+		t.Fatalf("closed{pressure} = %v", v)
+	}
+	f.ping(a1, br1)
+	f.ping(b1, bb1)
+	// Below the threshold nothing is evicted, however idle.
+	g := newFixture(t, threeDevices(), func(e *Edge) { e.MaxPerProvider, e.PressurePercent = 8, 90 })
+	c1, cb1 := g.open("100.64.0.7:40001")
+	g.advance(90 * time.Second)
+	g.open("100.64.0.9:40002")
+	g.ping(c1, cb1)
+	if v := g.closed("pressure"); v != 0 {
+		t.Fatalf("closed{pressure} below the threshold = %v", v)
 	}
 }

@@ -240,6 +240,45 @@ type config struct {
 	Mode                           string
 	Metrics                        string // host:port, "" = off
 	CoreSubnets                    []netip.Prefix
+	// The edge's connection caps and pressure eviction (contract §16).
+	MaxPerProvider, MaxPerUser, MaxPerClient, PressurePercent int
+	PressureIdle                                              time.Duration
+}
+
+// edgeLimits reads WG_EDGE_MAX_PER_PROVIDER / _USER / _CLIENT,
+// WG_EDGE_PRESSURE_PERCENT and WG_EDGE_PRESSURE_IDLE (defaults 1024, 128,
+// 32, 90, 2m). Positive integers with client <= user <= provider, a
+// percent 1–100, an idle of at least 1 s; anything else refuses the start.
+func edgeLimits(getenv func(string) string, c *config) error {
+	num := func(k string, def int) (int, error) {
+		n, err := strconv.Atoi(envOr(getenv, k, strconv.Itoa(def)))
+		if err != nil || n < 1 {
+			return 0, fmt.Errorf("%s must be a positive integer", k)
+		}
+		return n, nil
+	}
+	var err error
+	if c.MaxPerProvider, err = num("WG_EDGE_MAX_PER_PROVIDER", edge.DefaultMaxPerProvider); err != nil {
+		return err
+	}
+	if c.MaxPerUser, err = num("WG_EDGE_MAX_PER_USER", edge.DefaultMaxPerUser); err != nil {
+		return err
+	}
+	if c.MaxPerClient, err = num("WG_EDGE_MAX_PER_CLIENT", edge.DefaultMaxPerClient); err != nil {
+		return err
+	}
+	if c.MaxPerClient > c.MaxPerUser || c.MaxPerUser > c.MaxPerProvider {
+		return errors.New("WG_EDGE_MAX_PER_CLIENT <= WG_EDGE_MAX_PER_USER <= WG_EDGE_MAX_PER_PROVIDER")
+	}
+	if c.PressurePercent, err = num("WG_EDGE_PRESSURE_PERCENT", edge.DefaultPressurePercent); err != nil || c.PressurePercent > 100 {
+		return errors.New("WG_EDGE_PRESSURE_PERCENT must be 1–100")
+	}
+	d, err := time.ParseDuration(envOr(getenv, "WG_EDGE_PRESSURE_IDLE", edge.DefaultPressureIdle.String()))
+	if err != nil || d < time.Second {
+		return errors.New("WG_EDGE_PRESSURE_IDLE must be a duration of at least 1s")
+	}
+	c.PressureIdle = d
+	return nil
 }
 
 func loadConfig(getenv func(string) string) (*config, error) {
@@ -313,6 +352,9 @@ func loadConfig(getenv func(string) string) (*config, error) {
 			return nil, errors.New("WG_METRICS must be <host>:<port> or off")
 		}
 		c.Metrics = m
+	}
+	if err := edgeLimits(getenv, c); err != nil {
+		return nil, err
 	}
 	return c, nil
 }
@@ -395,6 +437,8 @@ func serve(ctx context.Context, cfg *config) error {
 	// only one vpnsecure trusts PROXY headers from (gateways can't reach
 	// that network at all).
 	e := edge.New(cfg.Traefik, cfg.EdgeAddr, doc.Load, time.Now)
+	e.MaxPerProvider, e.MaxPerUser, e.MaxPerClient = cfg.MaxPerProvider, cfg.MaxPerUser, cfg.MaxPerClient
+	e.PressurePercent, e.PressureIdle = cfg.PressurePercent, cfg.PressureIdle
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(e.Collectors()...)

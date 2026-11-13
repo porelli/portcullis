@@ -1468,6 +1468,15 @@ services:
       # Metrics only on its address on portcullis-metrics-wg (the alias
       # below; that network holds just Prometheus and wg).
       WG_METRICS: wg-metrics:9100
+      # Edge connection caps (contract §16): per provider (from accept),
+      # per person across their devices, per client address; above the
+      # percent of the provider cap, the heaviest person's sessions idle
+      # that long are closed first (reason pressure).
+      WG_EDGE_MAX_PER_PROVIDER: ${PORTCULLIS_VPN_EDGE_MAX_PER_PROVIDER:-1024}
+      WG_EDGE_MAX_PER_USER: ${PORTCULLIS_VPN_EDGE_MAX_PER_USER:-128}
+      WG_EDGE_MAX_PER_CLIENT: ${PORTCULLIS_VPN_EDGE_MAX_PER_CLIENT:-32}
+      WG_EDGE_PRESSURE_PERCENT: ${PORTCULLIS_VPN_EDGE_PRESSURE_PERCENT:-90}
+      WG_EDGE_PRESSURE_IDLE: ${PORTCULLIS_VPN_EDGE_PRESSURE_IDLE:-2m}
     volumes:
       - vpn_doc:/vpn-doc:ro
       - wg_data:/data

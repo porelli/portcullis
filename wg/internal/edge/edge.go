@@ -61,14 +61,21 @@ type Edge struct {
 	// IdleTimeout closes a connection with no byte either way for this
 	// long (default 1 h; WebSocket apps ping well within it).
 	IdleTimeout time.Duration
-	// MaxPerProvider caps a provider's connections, from accept (so the
-	// ones still sending their header count) to close (default 1024): a
-	// flood through one gateway or from built-in peers can't exhaust wg's
-	// memory and drop every VPN user. MaxPerClient caps one client
-	// address's admitted connections (default 128). Over a cap: rejected,
-	// reason busy.
-	MaxPerProvider int
-	MaxPerClient   int
+	// Connection caps (contract §16), so one person can't lock a
+	// provider out: MaxPerProvider counts a provider's connections from
+	// accept (the ones still sending their header too) to close (default
+	// 1024); MaxPerUser one person's admitted connections across all of
+	// their devices and providers (default 128); MaxPerClient one client
+	// address's (default 32). Over a cap: rejected, reason busy. Above
+	// PressurePercent (default 90) of MaxPerProvider, a new connection
+	// first closes the sessions of the provider's heaviest user idle for
+	// PressureIdle (default 2 min), reason pressure: filling a provider
+	// takes 1024/128 = 8 different people.
+	MaxPerProvider  int
+	MaxPerUser      int
+	MaxPerClient    int
+	PressurePercent int
+	PressureIdle    time.Duration
 
 	rejected *prometheus.CounterVec
 	accepted *prometheus.CounterVec
@@ -80,6 +87,7 @@ type Edge struct {
 	capMu     sync.Mutex
 	perProv   map[string]int
 	perClient map[clientKey]int
+	perUser   map[string]int
 }
 
 type clientKey struct {
@@ -87,10 +95,13 @@ type clientKey struct {
 	client   netip.Addr
 }
 
-// Defaults for the connection caps.
+// Defaults for the connection caps and the pressure eviction.
 const (
-	DefaultMaxPerProvider = 1024
-	DefaultMaxPerClient   = 128
+	DefaultMaxPerProvider  = 1024
+	DefaultMaxPerUser      = 128
+	DefaultMaxPerClient    = 32
+	DefaultPressurePercent = 90
+	DefaultPressureIdle    = 2 * time.Minute
 )
 
 func capOr(v, def int) int {
@@ -120,6 +131,69 @@ func (e *Edge) dropProvider(provider string) {
 	}
 }
 
+func (e *Edge) takeUser(user string) bool {
+	e.capMu.Lock()
+	defer e.capMu.Unlock()
+	if e.perUser[user] >= capOr(e.MaxPerUser, DefaultMaxPerUser) {
+		return false
+	}
+	e.perUser[user]++
+	return true
+}
+
+func (e *Edge) dropUser(user string) {
+	e.capMu.Lock()
+	defer e.capMu.Unlock()
+	if e.perUser[user]--; e.perUser[user] <= 0 {
+		delete(e.perUser, user)
+	}
+}
+
+// relieve makes room on a provider above PressurePercent of its cap: it
+// closes the sessions of the provider's heaviest user (the most admitted
+// sessions; ties: the smallest name) that have been idle for at least
+// PressureIdle, reason pressure. A busy session is never closed.
+func (e *Edge) relieve(provider string) {
+	limit := capOr(e.MaxPerProvider, DefaultMaxPerProvider)
+	pct := capOr(e.PressurePercent, DefaultPressurePercent)
+	e.capMu.Lock()
+	n := e.perProv[provider]
+	e.capMu.Unlock()
+	if n*100 <= limit*pct {
+		return
+	}
+	idle := e.PressureIdle
+	if idle <= 0 {
+		idle = DefaultPressureIdle
+	}
+	now := e.now()
+	e.mu.Lock()
+	counts := map[string]int{}
+	for s := range e.sessions {
+		if s.provider == provider {
+			counts[s.user]++
+		}
+	}
+	heaviest, most := "", 0
+	for u, c := range counts {
+		if c > most || (c == most && u < heaviest) {
+			heaviest, most = u, c
+		}
+	}
+	var victims []*session
+	for s := range e.sessions {
+		if s.provider == provider && s.user == heaviest && now.Sub(time.Unix(0, s.last.Load())) >= idle {
+			victims = append(victims, s)
+		}
+	}
+	e.mu.Unlock()
+	for _, s := range victims {
+		if s.close() {
+			e.closed.WithLabelValues(provider, ClosedPressure).Inc()
+		}
+	}
+}
+
 func (e *Edge) takeClient(k clientKey) bool {
 	e.capMu.Lock()
 	defer e.capMu.Unlock()
@@ -142,7 +216,8 @@ func (e *Edge) dropClient(k clientKey) {
 const (
 	ClosedNoDoc         = "no_doc"
 	ClosedExpired       = "expired"
-	ClosedRebound       = "rebound" // the provider's edge port or gateway changed
+	ClosedRebound       = "rebound"  // the provider's edge port or gateway changed
+	ClosedPressure      = "pressure" // idle, the heaviest user's, while the provider was nearly full
 	ClosedOutsideRanges = "outside_ranges"
 	ClosedStale         = "stale"
 	ClosedRevoked       = "revoked"
@@ -151,7 +226,7 @@ const (
 )
 
 // CloseReasons lists every close reason.
-var CloseReasons = []string{ClosedNoDoc, ClosedExpired, ClosedRebound, ClosedOutsideRanges, ClosedStale, ClosedRevoked, ClosedLifetime, ClosedIdle}
+var CloseReasons = []string{ClosedNoDoc, ClosedExpired, ClosedRebound, ClosedPressure, ClosedOutsideRanges, ClosedStale, ClosedRevoked, ClosedLifetime, ClosedIdle}
 
 // Defaults for the session limits.
 const (
@@ -200,6 +275,7 @@ func New(traefik netip.AddrPort, local netip.Addr, doc func() *vpndoc.Doc, now f
 		sessions:      map[*session]struct{}{},
 		perProv:       map[string]int{},
 		perClient:     map[clientKey]int{},
+		perUser:       map[string]int{},
 		closed: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "wg_edge_closed_total",
 			Help: "Admitted connections the edge closed on a re-check, by provider and reason.",
@@ -260,6 +336,7 @@ func addrPortOf(a net.Addr) netip.AddrPort {
 }
 
 func (e *Edge) serveGateway(c net.Conn, providerID string) {
+	e.relieve(providerID)
 	if !e.takeProvider(providerID) {
 		e.reject(c, providerID, Busy)
 		return
@@ -324,6 +401,7 @@ func (e *Edge) serveGateway(c net.Conn, providerID string) {
 // Handle checks and forwards a connection whose client address is known
 // in-process (the built-in people stack, provider "builtin").
 func (e *Edge) Handle(c net.Conn, providerID string, client netip.Addr) {
+	e.relieve(providerID)
 	if !e.takeProvider(providerID) {
 		e.reject(c, providerID, Busy)
 		return
@@ -369,6 +447,11 @@ func (e *Edge) forward(c net.Conn, d *vpndoc.Doc, providerID string, client neti
 		return
 	}
 	defer e.dropClient(ck)
+	if !e.takeUser(dev.User) {
+		e.reject(c, providerID, Busy)
+		return
+	}
+	defer e.dropUser(dev.User)
 	dialer := net.Dialer{Timeout: e.DialTimeout}
 	if e.local.IsValid() {
 		dialer.LocalAddr = &net.TCPAddr{IP: e.local.AsSlice()}

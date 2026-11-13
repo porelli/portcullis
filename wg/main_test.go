@@ -141,8 +141,14 @@ func TestLoadConfig(t *testing.T) {
 	}
 	if c.People || c.Port != 51820 || c.Subnet != netip.MustParsePrefix("10.213.0.0/22") || c.Mode != "apps" ||
 		c.VPNFile != "/vpn-doc/vpn.json" || c.EdgeAddr != netip.MustParseAddr("172.31.254.67") || c.StatusFile != "/data/status.json" || c.PeopleKey != "/run/portcullis/wg/people.key" ||
-		len(c.Upstreams) != 2 || c.Metrics != "wg-metrics:9100" {
+		len(c.Upstreams) != 2 || c.Metrics != "wg-metrics:9100" ||
+		c.MaxPerProvider != 1024 || c.MaxPerUser != 128 || c.MaxPerClient != 32 || c.PressurePercent != 90 || c.PressureIdle != 2*time.Minute {
 		t.Fatalf("defaults %+v", c)
+	}
+	c, err = loadConfig(get(map[string]string{"WG_EDGE_MAX_PER_PROVIDER": "2048", "WG_EDGE_MAX_PER_USER": "64",
+		"WG_EDGE_MAX_PER_CLIENT": "16", "WG_EDGE_PRESSURE_PERCENT": "80", "WG_EDGE_PRESSURE_IDLE": "5m"}))
+	if err != nil || c.MaxPerProvider != 2048 || c.MaxPerUser != 64 || c.MaxPerClient != 16 || c.PressurePercent != 80 || c.PressureIdle != 5*time.Minute {
+		t.Fatalf("caps from env: %+v %v", c, err)
 	}
 	for name, over := range map[string]map[string]string{
 		"people bogus":    {"WG_PEOPLE": "yes"},
@@ -160,6 +166,14 @@ func TestLoadConfig(t *testing.T) {
 		"domain":          {"WG_PEOPLE": "on", "WG_DOMAIN": ""},
 		"metrics":         {"WG_METRICS": "9100"},
 		"core subnets":    {"WG_CORE_SUBNETS": "172.31.250.0/24 nonsense"},
+		"provider cap 0":  {"WG_EDGE_MAX_PER_PROVIDER": "0"},
+		"user cap text":   {"WG_EDGE_MAX_PER_USER": "lots"},
+		"client > user":   {"WG_EDGE_MAX_PER_CLIENT": "200"},
+		"user > provider": {"WG_EDGE_MAX_PER_USER": "2000"},
+		"percent 0":       {"WG_EDGE_PRESSURE_PERCENT": "0"},
+		"percent 101":     {"WG_EDGE_PRESSURE_PERCENT": "101"},
+		"idle text":       {"WG_EDGE_PRESSURE_IDLE": "soon"},
+		"idle under 1 s":  {"WG_EDGE_PRESSURE_IDLE": "500ms"},
 	} {
 		if _, err := loadConfig(get(over)); err == nil {
 			t.Errorf("%s: accepted", name)

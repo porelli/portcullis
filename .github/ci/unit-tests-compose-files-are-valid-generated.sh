@@ -479,6 +479,9 @@ vpn_rule() {  # <config json>
       and $w.environment.WG_EDGE_ADDR == $w.networks["portcullis-vpn-edge"].ipv4_address
       and $w.environment.WG_TRAEFIK == "\($t.networks["portcullis-vpn-edge"].ipv4_address):8443"
       and $w.environment.WG_METRICS == "wg-metrics:9100"
+      and $w.environment.WG_EDGE_MAX_PER_PROVIDER == "1024" and $w.environment.WG_EDGE_MAX_PER_USER == "128"
+      and $w.environment.WG_EDGE_MAX_PER_CLIENT == "32" and $w.environment.WG_EDGE_PRESSURE_PERCENT == "90"
+      and $w.environment.WG_EDGE_PRESSURE_IDLE == "2m"
       and ([$w.environment | keys[] | select(test("KEY$|SECRET|TOKEN|PASSWORD"))] == ["WG_PEOPLE_KEY"])
       and $w.environment.WG_PEOPLE_KEY == "/run/portcullis/wg/people.key"
       and $t.environment.TRAEFIK_ENTRYPOINTS_VPNSECURE_PROXYPROTOCOL_TRUSTEDIPS == "\($w.networks["portcullis-vpn-edge"].ipv4_address)/32"
