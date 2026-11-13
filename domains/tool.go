@@ -2,13 +2,14 @@ package main
 
 // One-shot subcommands of the domains image (contract §12.1):
 //
-//	domains dns plan|apply [--wait <dur>]|check|dnssec-enable
+//	domains dns plan|apply [--wait auto|<dur>] [--settle [--settle-after <unix>]]|ttl|check|dnssec-enable
 //	    the main domain's DNS plan, run by ./portcullis as the compose
 //	    service dns-tool (egress only, no volumes, no environment). Input:
 //	    one JSON object on stdin — the provider credentials only ever
 //	    arrive there. Output: the plan JSON on stdout. Exit 0 ok; 1 check
-//	    found a problem / apply --wait timed out before every applied set
-//	    was visible; 2 usage or input; 3 provider or lookup failure (the
+//	    found a problem / apply --wait ended before every applied set was
+//	    visible (or, --settle, before the old records' caches expired: the
+//	    records were written either way, see wait.go); 2 usage or input; 3 provider or lookup failure (the
 //	    message on stderr, redacted).
 //	domains traefik-account-uri <acme.json>
 //	    prints exactly Traefik's ACME account URI (the file holds private
@@ -29,6 +30,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -91,29 +93,50 @@ func resolversFromEnv() []string {
 // runDNSTool is `domains dns <args>`.
 func runDNSTool(args []string, e toolEnv) int {
 	usage := func(msg string) int {
-		fmt.Fprintf(e.stderr, "domains dns: %s\nusage: domains dns plan|apply [--wait <duration>]|check|dnssec-enable  (input: one JSON object on stdin)\n", msg)
+		fmt.Fprintf(e.stderr, "domains dns: %s\nusage: domains dns plan|apply [--wait auto|<duration>] [--settle [--settle-after <unix>]]|ttl|check|dnssec-enable  (input: one JSON object on stdin)\n", msg)
 		return exitUsage
 	}
 	if len(args) == 0 {
 		return usage("missing subcommand")
 	}
 	sub, rest := args[0], args[1:]
-	var wait time.Duration
+	var wait waitOpts
 	switch sub {
-	case "plan", "check", "dnssec-enable":
+	case "plan", "check", "dnssec-enable", "ttl":
 		if len(rest) > 0 {
 			return usage("unexpected argument " + rest[0])
 		}
 	case "apply":
 		for len(rest) > 0 {
-			if rest[0] != "--wait" || len(rest) < 2 {
+			switch {
+			case rest[0] == "--settle":
+				wait.settle, rest = true, rest[1:]
+			case rest[0] == "--settle-after" && len(rest) >= 2:
+				n, err := strconv.ParseInt(rest[1], 10, 64)
+				if err != nil || n <= 0 {
+					return usage("--settle-after needs a Unix time")
+				}
+				wait.settleAfter, rest = n, rest[2:]
+			case rest[0] == "--wait" && len(rest) >= 2:
+				if rest[1] == "auto" {
+					wait.auto, wait.fixed = true, 0
+				} else {
+					d, err := time.ParseDuration(rest[1])
+					if err != nil || d <= 0 {
+						return usage("--wait needs auto or a duration (e.g. 5m)")
+					}
+					wait.auto, wait.fixed = false, d
+				}
+				rest = rest[2:]
+			default:
 				return usage("unexpected argument " + rest[0])
 			}
-			d, err := time.ParseDuration(rest[1])
-			if err != nil || d <= 0 {
-				return usage("--wait needs a duration (e.g. 5m)")
-			}
-			wait, rest = d, rest[2:]
+		}
+		if wait.settle && !wait.on() {
+			return usage("--settle needs --wait")
+		}
+		if wait.settleAfter > 0 && !wait.settle {
+			return usage("--settle-after needs --settle")
 		}
 	default:
 		return usage("unknown subcommand " + sub)
@@ -133,10 +156,10 @@ func runDNSTool(args []string, e toolEnv) int {
 	if sub == "check" && len(in.Credentials) > 0 {
 		return fail(exitUsage, errors.New("check takes no credentials"))
 	}
-	if (sub == "apply" || sub == "dnssec-enable") && in.Provider == "" {
+	if (sub == "apply" || sub == "dnssec-enable" || sub == "ttl") && in.Provider == "" {
 		return fail(exitUsage, errors.New(sub+" needs a provider and its credentials"))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute+wait)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute+wait.ctxBudget())
 	defer cancel()
 	base := dnsplan.Input{Spec: spec, ProviderName: in.Provider, Resolvers: e.resolvers}
 	write := base
@@ -156,7 +179,7 @@ func runDNSTool(args []string, e toolEnv) int {
 		write.Provider, write.DNSSEC, write.CanSign = p, r, can
 		if z, err := toolZone(ctx, p, spec.Name, e.resolvers); err == nil {
 			write.Zone = z
-		} else if sub == "apply" {
+		} else if sub == "apply" || sub == "ttl" {
 			return fail(exitFailure, err)
 		}
 	}
@@ -167,6 +190,32 @@ func runDNSTool(args []string, e toolEnv) int {
 	switch sub {
 	case "plan":
 		return printPlan(e, build(write), exitOK)
+	case "ttl":
+		// How long caches may hold the sets' current records (read before
+		// a write: the shell saves it before the relax, contract §12.1).
+		if err := checkSets(in.Sets); err != nil {
+			return fail(exitUsage, err)
+		}
+		// Fail closed (I7): a TTL nobody reports can't be a settle point.
+		cur, err := dnsplan.Stored(ctx, write.Provider, write.Zone, spec.Name, in.Sets)
+		if err != nil {
+			return fail(exitFailure, fmt.Errorf("reading the records of %s failed (nothing changed): %w", spec.Name, err))
+		}
+		auth := toolAuthServers(ctx, e.resolvers, write.Zone)
+		eff, unknown := effectiveTTLs(ctx, cur, auth)
+		if len(unknown) > 0 {
+			return fail(exitFailure, unknownTTLError(spec.Name, in.Provider, unknown))
+		}
+		relaxed := false
+		if contains(in.Sets, dnsplan.SetCAA) && spec.Issuer != "" {
+			if relaxed, err = dnsplan.Relaxed(ctx, write.Provider, write.Zone, spec.Name, spec.Issuer); err != nil {
+				return fail(exitFailure, fmt.Errorf("reading the CAA of %s failed (nothing changed): %w", spec.Name, err))
+			}
+		}
+		return printJSON(e, struct {
+			TTL     int  `json:"ttl"`
+			Relaxed bool `json:"caa_relaxed"`
+		}{secs(ttlBound(eff, nil, 0)), relaxed}, exitOK)
 	case "check":
 		pl := build(base)
 		code := exitOK
@@ -189,38 +238,89 @@ func runDNSTool(args []string, e toolEnv) int {
 		return printPlan(e, build(write), exitOK)
 	}
 	// apply
-	if len(in.Sets) == 0 {
-		return fail(exitUsage, errors.New("apply needs sets (address, caa, nomail)"))
+	if err := checkSets(in.Sets); err != nil {
+		return fail(exitUsage, err)
 	}
-	for _, s := range in.Sets {
-		if !contains(dnsplan.Sets, s) {
-			return fail(exitUsage, fmt.Errorf("unknown record set %q (one of %s)", s, strings.Join(dnsplan.Sets, ", ")))
+	// The RRsets as the provider stores them before and after the write,
+	// and as the authoritative servers serve them: their TTLs bound the
+	// wait. A failed read assumes the worst (the whole cap).
+	var before map[string]dnsplan.RRset
+	var readErr error
+	var auth []string
+	var beforeTTL map[string]time.Duration
+	if wait.on() {
+		auth = toolAuthServers(ctx, e.resolvers, write.Zone)
+		before, readErr = dnsplan.Stored(ctx, write.Provider, write.Zone, spec.Name, in.Sets)
+		var unknown []string
+		beforeTTL, unknown = effectiveTTLs(ctx, before, auth)
+		// --settle fails closed before the write (I7): its settle point is
+		// saved and trusted by every rerun, so it must never be a guess.
+		if wait.settle && readErr != nil {
+			return fail(exitFailure, fmt.Errorf("reading the records of %s before the write failed (nothing changed): %w", spec.Name, readErr))
+		}
+		if wait.settle && len(unknown) > 0 {
+			return fail(exitFailure, unknownTTLError(spec.Name, in.Provider, unknown))
 		}
 	}
 	if _, _, err := dnsplan.Apply(ctx, write, in.Sets); err != nil {
 		return fail(exitFailure, err)
 	}
-	if wait == 0 {
+	if !wait.on() {
 		return printPlan(e, build(write), exitOK)
 	}
-	// Wait until the public resolvers show every applied set.
-	deadline := time.Now().Add(wait)
+	writtenAt := toolNow()
+	after, err := dnsplan.Stored(ctx, write.Provider, write.Zone, spec.Name, in.Sets)
+	afterTTL, _ := effectiveTTLs(ctx, after, auth)
+	ttl := ttlBound(beforeTTL, afterTTL, dnsplan.NegativeTTL(ctx, auth, e.resolvers, write.Zone))
+	// A guess only sets how long a plain wait lasts; under --settle the
+	// old records' TTL (read before) is what counts.
+	if (readErr != nil || err != nil) && !wait.settle {
+		ttl = max(ttl, unknownTTL)
+	}
+	changed := readErr != nil || err != nil || !sameRRsets(before, after)
+	fmt.Fprintln(e.stderr, progressMessage(wait, ttl, e.resolvers, writtenAt, changed))
 	// The polls are read-only (public view); the plan printed at the end is
 	// built with the provider, like apply's own (can_write, fix: auto).
-	for {
-		pl := build(base)
-		if appliedVisible(pl, in.Sets) {
-			return printPlan(e, build(write), exitOK)
-		}
-		if time.Now().Add(toolPollEvery).After(deadline) || ctx.Err() != nil {
-			fmt.Fprintf(e.stderr, "domains dns apply: not every applied record is visible at the public resolvers after %s\n", wait)
-			return printPlan(e, build(write), exitProblem)
-		}
-		select {
-		case <-ctx.Done():
-		case <-time.After(toolPollEvery):
+	rep, ok := waitApplied(ctx, e, build, base, in.Sets, wait, ttl, writtenAt, changed)
+	code := exitOK
+	if !ok {
+		fmt.Fprintln(e.stderr, waitMessage(rep))
+		code = exitProblem
+	}
+	return printJSON(e, applyOutput{Plan: build(write), Wait: rep}, code)
+}
+
+// unknownTTLError: --settle / ttl refuse a TTL nobody reports.
+func unknownTTLError(name, provider string, keys []string) error {
+	return fmt.Errorf("can't tell how long caches hold %s of %s: %s reports no TTL (0 or 1: \"auto\" / the zone default) and no nameserver serves it — set an explicit TTL at %s (nothing changed)",
+		strings.Join(keys, ", "), name, provider, provider)
+}
+
+// checkSets: apply and ttl need known sets.
+func checkSets(sets []string) error {
+	if len(sets) == 0 {
+		return errors.New("needs sets (address, caa, nomail)")
+	}
+	for _, s := range sets {
+		if !contains(dnsplan.Sets, s) {
+			return fmt.Errorf("unknown record set %q (one of %s)", s, strings.Join(dnsplan.Sets, ", "))
 		}
 	}
+	return nil
+}
+
+// sameRRsets: the same RRsets with the same data (TTLs aside).
+func sameRRsets(a, b map[string]dnsplan.RRset) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, x := range a {
+		y, ok := b[k]
+		if !ok || strings.Join(x.Data, "\x00") != strings.Join(y.Data, "\x00") {
+			return false
+		}
+	}
+	return true
 }
 
 func readToolInput(r io.Reader) (toolInput, error) {
@@ -314,8 +414,10 @@ func appliedVisible(pl dnsplan.Plan, sets []string) bool {
 	return true
 }
 
-func printPlan(e toolEnv, pl dnsplan.Plan, code int) int {
-	b, err := json.Marshal(pl)
+func printPlan(e toolEnv, pl dnsplan.Plan, code int) int { return printJSON(e, pl, code) }
+
+func printJSON(e toolEnv, v any, code int) int {
+	b, err := json.Marshal(v)
 	if err != nil {
 		fmt.Fprintln(e.stderr, err)
 		return exitFailure
@@ -363,13 +465,22 @@ func runTraefikAccountURI(args []string, stdout, stderr io.Writer) int {
 	return exitOK
 }
 
-// runReport is `domains report --main --json` against base (the API);
+// reportFreshTimeout bounds report --fresh's rebuild of the main plan
+// (public lookups); past it the cached plan is used (tests shorten it).
+var reportFreshTimeout = 20 * time.Second
+
+// runReport is `domains report --main --json [--fresh]` against base (the
+// API): --fresh asks for the main plan rebuilt unless it is under 30 s old
+// (GET /main/dns?refresh=1, the service's throttle), so a CAA changed
+// outside Portcullis shows at once; if that fails or takes longer than
+// reportFreshTimeout, the cached plan, and "main_fresh": false says so;
 // `domains report --main --refresh` drops the service's cached main plan
 // and has it rebuilt (POST /main/dns/refresh: after the dns tool wrote
 // the main domain's records), printing nothing.
 func runReport(args []string, base, secret string, stdout, stderr io.Writer) int {
-	if len(args) != 2 || args[0] != "--main" || (args[1] != "--json" && args[1] != "--refresh") {
-		fmt.Fprintln(stderr, "usage: domains report --main --json|--refresh")
+	fresh := len(args) == 3 && args[1] == "--json" && args[2] == "--fresh"
+	if !(len(args) == 2 || fresh) || args[0] != "--main" || (args[1] != "--json" && args[1] != "--refresh") {
+		fmt.Fprintln(stderr, "usage: domains report --main --json [--fresh] | --main --refresh")
 		return exitUsage
 	}
 	c := &http.Client{Timeout: 3 * time.Minute}
@@ -393,7 +504,7 @@ func runReport(args []string, base, secret string, stdout, stderr io.Writer) int
 		}
 		return exitOK
 	}
-	get := func(path string, out any) error {
+	getWith := func(c *http.Client, path string, out any) error {
 		req, err := http.NewRequest(http.MethodGet, base+path, nil)
 		if err != nil {
 			return err
@@ -409,14 +520,27 @@ func runReport(args []string, base, secret string, stdout, stderr io.Writer) int
 		}
 		return json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(out)
 	}
+	get := func(path string, out any) error { return getWith(c, path, out) }
 	var report struct {
-		Main    json.RawMessage            `json:"main"`
-		Domains map[string]json.RawMessage `json:"domains"`
+		Main json.RawMessage `json:"main"`
+		// MainFresh: main was rebuilt for this report (--fresh) or is
+		// under 30 s old; false = the cached plan, possibly stale.
+		MainFresh bool                       `json:"main_fresh"`
+		Domains   map[string]json.RawMessage `json:"domains"`
 	}
 	report.Domains = map[string]json.RawMessage{}
-	if err := get("/main/dns", &report.Main); err != nil {
-		fmt.Fprintf(stderr, "domains report: %v\n", err)
-		return exitFailure
+	if fresh {
+		err := getWith(&http.Client{Timeout: reportFreshTimeout}, "/main/dns?refresh=1", &report.Main)
+		report.MainFresh = err == nil
+		if err != nil {
+			fmt.Fprintf(stderr, "domains report: the main plan couldn't be rebuilt (%v): using the cached one\n", err)
+		}
+	}
+	if !report.MainFresh {
+		if err := get("/main/dns", &report.Main); err != nil {
+			fmt.Fprintf(stderr, "domains report: %v\n", err)
+			return exitFailure
+		}
 	}
 	var list []View
 	if err := get("/domains", &list); err != nil {

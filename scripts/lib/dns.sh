@@ -75,19 +75,56 @@ _dns_tool_input() {
        else {provider: ""} end)'
 }
 
-# _dns_tool <plan|apply|check|dnssec-enable> [args] — run the one-shot
-# tool (compose service dns-tool) with the input on stdin. plan, apply and
-# dnssec-enable take the credentials (plan only for an automated
+# _dns_tool <plan|apply|ttl|check|dnssec-enable> [args] — run the one-shot
+# tool (compose service dns-tool) with the input on stdin. plan, apply, ttl
+# and dnssec-enable take the credentials (plan only for an automated
 # provider); check never does.
 _dns_tool() {
   local sub="$1" mode="read" input
   case "$sub" in
-    apply|dnssec-enable) mode="write" ;;
+    apply|dnssec-enable|ttl) mode="write" ;;
     plan) ! _dns_automated "${DNS_PROVIDER:-none}" || mode="write" ;;
   esac
   input="$(_dns_tool_input "$mode")" || exit 1
   domains_image_ensure "for the dns tool"
   printf '%s' "$input" | dc run --rm --no-deps -T dns-tool "$@"
+}
+
+# _dns_dur <seconds> — "45 s", "10 min", "5 min 24 s".
+_dns_dur() {
+  local s="${1:-0}"
+  if [ "$s" -lt 60 ]; then printf '%d s' "$s"
+  elif [ $((s % 60)) -eq 0 ]; then printf '%d min' $((s / 60))
+  else printf '%d min %d s' $((s / 60)) $((s % 60)); fi
+}
+
+# _dns_wait_text <apply output> <lead> [it] [what] — the sentence after
+# `apply --wait` ended early (exit 1: the records were written), from the
+# tool's wait report (contract §12.1): "<lead>, but [it is ]not visible
+# yet at <resolvers>: those caches clear within <t> (by HH:MM UTC)", or,
+# visible but not settled, "<lead>; every resolver checked shows it, but
+# the CA's resolvers may cache <what> (the old records) for up to <t>".
+_dns_wait_text() {
+  local w vis pend clears at lead="$2" it="${3:+$3 is }" what="${4:-the old records}"
+  w="$(printf '%s' "$1" | jq -c '.wait // empty' 2>/dev/null)" || w=""
+  if [ -z "$w" ]; then printf '%s, but %snot visible at the public resolvers yet' "$lead" "$it"; return 0; fi
+  vis="$(jq -r '.visible' <<<"$w")"
+  pend="$(jq -r '.pending // [] | map(sub(":53$"; "")) | join(", ")' <<<"$w")"
+  clears="$(jq -r '.clears_in // 0' <<<"$w")"
+  at="$(_dns_wait_at "$1")"
+  if [ "$vis" = true ]; then
+    printf "%s; every resolver checked shows it, but the CA's resolvers may cache %s for up to %s%s" "$lead" "$what" "$(_dns_dur "$clears")" "${at:+ (until $at)}"
+  elif [ "$clears" -gt 0 ]; then
+    printf '%s, but %snot visible yet at %s: those caches clear within %s%s' "$lead" "$it" "$pend" "$(_dns_dur "$clears")" "${at:+ (by $at)}"
+  else
+    printf '%s, but %snot visible yet at %s: their caches should have expired by now (TTL %s s)' "$lead" "$it" "$pend" "$(jq -r '.ttl' <<<"$w")"
+  fi
+}
+
+# _dns_wait_at <apply output> — the report's settle point as "HH:MM UTC"
+# (nothing without one).
+_dns_wait_at() {
+  printf '%s' "$1" | jq -r '.wait.settle_at // 0 | if . > 0 then strftime("%H:%M UTC") else empty end' 2>/dev/null || true
 }
 
 # _dns_uri_ok <uri> — an ACME account URI fit for a CAA value and an env
@@ -224,12 +261,32 @@ dns_setup() {
     read -rp "$q [y/N] " reply
     case "$reply" in y|Y|yes|YES) ;; *) info "Nothing changed."; return 0 ;; esac
   fi
-  info "Applying the record sets: $DNS_SETS (waiting up to 5 minutes for the public resolvers)..."
+  # Writing the caa set over a live Portcullis pin (removing it with
+  # DNS_CAA=false, or replacing it) leaves caches holding that pin for its
+  # TTL: save a settle point every later flip honours (N2), from the
+  # tool's progress line the moment the write is accepted. Whether a pin
+  # is live is read first; unreadable counts as live.
+  local settle_hook=""
+  if [[ " $DNS_SETS " == *" caa "* ]]; then
+    local pre prc=0
+    pre="$(_dns_tool ttl 2>/dev/null)" || prc=$?
+    if [ "$prc" -ne 0 ] || [ "$(printf '%s' "$pre" | jq -r '.caa_relaxed // false' 2>/dev/null)" != true ]; then
+      settle_hook=_dns_relax_note
+    fi
+  fi
+  info "Applying the record sets: $DNS_SETS (then waiting for the public resolvers: the TTL the provider stored + 1 min, at most 15 min)..."
   rc=0
-  out="$(_dns_tool apply --wait 5m)" || rc=$?
+  out="$(DNS_ON_SETTLE="$settle_hook" _dns_apply_quiet --wait auto)" || rc=$?
+  [ "$rc" -ne 4 ] || { dns_main_refresh; fail "the records were written, but the flip's settle point couldn't be saved ($(_dns_relax_file)): don't flip ACME_STAGING before the old CAA pin's TTL has passed"; }
+  # A pin written again while a flip's settle point is saved (ACME_STAGING
+  # reverted mid-flip) only moves the point later (I10).
+  if { [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; } && [ -n "${DNS_ACCOUNT_URI:-}" ] && [[ " $DNS_SETS " == *" caa "* ]] && [ "$(_dns_flag DNS_CAA true)" = true ]; then
+    _dns_relax_repin
+  fi
   case "$rc" in
     0) ok "Applied: $DNS_SETS" ;;
-    1) warn "Applied, but not everything is visible at the public resolvers yet (normal, can take longer)." ;;
+    1) warn "$(_dns_wait_text "$out" Applied) (./portcullis dns check after that)." ;;
+    2) dns_main_refresh; fail "the dns tool refused the arguments: the domains image is older than this CLI (docker compose build domains, then run it again)" ;;
     *) dns_main_refresh; fail "applying the DNS records failed (exit $rc; the message is above)" ;;
   esac
   if [ "$dnssec" = true ]; then
@@ -318,28 +375,267 @@ dns_tighten_main() {
   [ "$poll" = true ] || return 0
   _dns_caa_live_ok "$uri" && return 0
   info "Pinning the CAA of $PORTCULLIS_DOMAIN to Traefik's ACME account..."
-  if (DNS_ACCOUNT_URI="$uri" DNS_SETS=caa DNS_IPS_DONE=1 DNS_IPV4="${PORTCULLIS_PUBLIC_IPV4:-}" DNS_IPV6="${PORTCULLIS_PUBLIC_IPV6:-}" \
-      _dns_tool apply --wait 5m >/dev/null); then
-    ok "CAA of $PORTCULLIS_DOMAIN pinned to $uri"
-  else
-    warn "could not pin the CAA of $PORTCULLIS_DOMAIN to Traefik's account (fix: ./portcullis dns setup)"
-  fi
+  local out rc=0
+  out="$(_dns_caa_apply "$uri")" || rc=$?
+  case "$rc" in
+    0) ok "CAA of $PORTCULLIS_DOMAIN pinned to $uri"; _dns_relax_repin ;;
+    1) warn "$(_dns_wait_text "$out" "The CAA pin of $PORTCULLIS_DOMAIN was written" it). Nothing to do: ./portcullis status shows it as planned once those caches have cleared."; _dns_relax_repin ;;
+    2) warn "could not pin the CAA of $PORTCULLIS_DOMAIN: the dns tool refused the arguments, the domains image is older than this CLI (docker compose build domains, then ./portcullis dns setup)" ;;
+    *) warn "could not pin the CAA of $PORTCULLIS_DOMAIN to Traefik's account: the write failed (the message is above; fix: ./portcullis dns setup)" ;;
+  esac
   dns_main_refresh
   return 0
 }
 
-# dns_relax_main — before `config apply` clears acme.json (an
-# ACME_STAGING flip): the main domain's CAA back to CA-only, so the new
-# account Traefik registers can order; waits up to 2 min for the public
-# resolvers (Traefik orders as soon as it restarts). Only warns.
-dns_relax_main() {
-  info "Relaxing the CAA of ${PORTCULLIS_DOMAIN:-the domain} to CA-only (Traefik registers a new ACME account)..."
-  if ! (DNS_ACCOUNT_URI="" DNS_SETS=caa DNS_IPS_DONE=1 DNS_IPV4="${PORTCULLIS_PUBLIC_IPV4:-}" DNS_IPV6="${PORTCULLIS_PUBLIC_IPV6:-}" \
-      _dns_tool apply --wait 2m >/dev/null); then
-    warn "could not relax the CAA, or the public resolvers don't show it yet (they may cache the old pin for up to 5 minutes): issuance may fail on CAA until then (./portcullis dns setup)"
-  fi
-  dns_main_refresh
+# _dns_apply_quiet [args] — `_dns_tool apply [args]`, its stderr shown as
+# it comes (the progress line after the write, a failure's message) except
+# its own timeout line ("the records were written, but …"): the callers
+# word that from the wait report. The tool's exit status.
+# With DNS_ON_SETTLE=<function> set, the progress line's settle point
+# (printed right after the write, before the wait: "… settle_at=<unix>")
+# is handed to it at once (I8); a failing handler makes the whole call
+# return 4 once the tool is done.
+_dns_apply_quiet() {
+  local rc mark
+  mark="$(mktemp)"
+  { _dns_tool apply "$@" 2>&1 1>&3 3>&- | _dns_apply_filter "$mark" >&2; rc="${PIPESTATUS[0]}"; } 3>&1
+  if [ -s "$mark" ]; then rc=4; fi
+  rm -f "$mark"
+  return "$rc"
+}
+
+# _dns_apply_filter <mark> — the tool's stderr, line by line (see above).
+_dns_apply_filter() {
+  local line at
+  while IFS= read -r line; do
+    case "$line" in
+      "domains dns apply: the records were written"*) continue ;;
+    esac
+    printf '%s\n' "$line"
+    if [ -n "${DNS_ON_SETTLE:-}" ] && [[ "$line" =~ settle_at=([0-9]+) ]]; then
+      at="${BASH_REMATCH[1]}"
+      "$DNS_ON_SETTLE" "$at" || echo failed > "$1"
+    fi
+  done
+}
+
+# _dns_caa_apply <uri> [args] — write the main domain's caa set pinned to
+# <uri> ("" = CA-only) and wait for it (apply --wait auto [args]: the
+# stored / served TTL bounds the wait, contract §12.1). Prints the tool's
+# output; its exit: 0 visible (settled), 1 written but not yet, 2 the tool
+# refused the arguments (an older domains image), 3 the write failed.
+_dns_caa_apply() {
+  (DNS_ACCOUNT_URI="$1" DNS_SETS=caa DNS_IPS_DONE=1 DNS_IPV4="${PORTCULLIS_PUBLIC_IPV4:-}" DNS_IPV6="${PORTCULLIS_PUBLIC_IPV6:-}" \
+    _dns_apply_quiet --wait auto "${@:2}")
+}
+
+# _dns_relax_file — the pending flip's settle point (0600): when the relax
+# was first written, the old pin's TTL, and the time before which no cache
+# can be trusted to have dropped the old pin. It describes live DNS caches, not the host: never backed
+# up; a restore keeps the live one (backup.sh _restore_secrets).
+_dns_relax_file() { printf '%s/acme-relax.env' "$(_domains_dir)"; }
+
+# _dns_relax_get <KEY> — a value of the settle point (nothing without one).
+_dns_relax_get() {
+  sed -n "s/^RELAX_$1=//p" "$(_dns_relax_file)" 2>/dev/null | head -n1 || true
+}
+
+# _dns_relax_put <written_at> <old_ttl> <not_before> — (re)write it, 0600.
+_dns_relax_put() {
+  local f d
+  f="$(_dns_relax_file)"; d="$(dirname "$f")"
+  mkdir -p "$d"
+  (umask 077; printf 'RELAX_WRITTEN_AT=%s\nRELAX_OLD_TTL=%s\nRELAX_NOT_BEFORE=%s\n' "$1" "$2" "$3" > "$f.tmp") && mv -f "$f.tmp" "$f" && chmod 600 "$f"
+}
+
+# _dns_relax_point — the saved settle point, never earlier than any field
+# says: max(NOT_BEFORE, WRITTEN_AT + OLD_TTL + 60). Nothing when the file
+# is missing or a field isn't a number (unreadable: I6).
+_dns_relax_point() {
+  local nb w t
+  nb="$(_dns_relax_get NOT_BEFORE)" w="$(_dns_relax_get WRITTEN_AT)" t="$(_dns_relax_get OLD_TTL)"
+  [[ "$nb" =~ ^[0-9]+$ && "$w" =~ ^[0-9]+$ && "$t" =~ ^[0-9]+$ ]] || return 0
+  [ $((w + t + 60)) -le "$nb" ] || nb=$((w + t + 60))
+  printf '%s' "$nb"
+}
+
+# _dns_relax_raise <unix> — move the saved settle point later (never
+# earlier); a failed write fails.
+_dns_relax_raise() {
+  local nb
+  nb="$(_dns_relax_point)"
+  [ -n "$nb" ] || return 1
+  [ "$1" -gt "$nb" ] || return 0
+  _dns_relax_put "$(_dns_relax_get WRITTEN_AT)" "$(_dns_relax_get OLD_TTL)" "$1"
+}
+
+# _dns_relax_repin — a pin was written again (the tighten, dns setup)
+# while a flip's settle point is saved: it is never deleted here — caches
+# may still hold the original, longer-TTL pin, and a later relax would
+# only see this pin's TTL — and only ever moves later: max(saved, now +
+# OLD_TTL + 60) (I10). An unreadable file is left as it is (the next relax
+# then waits 24 h). A failed write only warns: the saved point is still
+# the original one.
+_dns_relax_repin() {
+  local nb t
+  [ -e "$(_dns_relax_file)" ] || return 0
+  nb="$(_dns_relax_point)"
+  [ -n "$nb" ] || return 0
+  t="$(_dns_relax_get OLD_TTL)"
+  _dns_relax_raise "$(( $(date +%s) + t + 60 ))" || warn "could not update the pending flip's settle point ($(_dns_relax_file))"
   return 0
+}
+
+# _dns_relax_note <unix> — a caa write over a live pin (dns setup): save
+# <unix> as the settle point, or raise the saved one to it. An unreadable
+# file is left as it is (a flip then waits 24 h). Fails when it can't be
+# written.
+_dns_relax_note() {
+  local now
+  if [ -e "$(_dns_relax_file)" ]; then
+    [ -n "$(_dns_relax_point)" ] || return 0
+    _dns_relax_raise "$1"
+    return
+  fi
+  now="$(date +%s)"
+  _dns_relax_put "$now" "$(( $1 > now + 60 ? $1 - now - 60 : 0 ))" "$1"
+}
+
+# dns_flip_guard <ca_server> [relaxed] — before any flip stops Traefik, managed CAA
+# or not (N2): a saved settle point still in the future refuses (with its
+# time), and so does a public CAA the CA wouldn't let a NEW account order
+# under at every resolver — a live (or still cached) pin. A failed lookup
+# refuses too (fail closed). Nothing has changed when it refuses.
+dns_flip_guard() {
+  local ca="$1" relaxed="${2:-}" d="${PORTCULLIS_DOMAIN:-the domain}" nb now out live why
+  now="$(date +%s)"
+  # (relaxed: dns_relax_main just settled past the saved point itself)
+  if [ -z "$relaxed" ] && [ -e "$(_dns_relax_file)" ]; then
+    nb="$(_dns_relax_point)"
+    if [ -z "$nb" ]; then
+      nb=$((now + 86400))
+      _dns_relax_put "$now" 86400 "$nb" || { warn "could not save the settle point ($(_dns_relax_file))"; return 1; }
+      warn "The saved settle point ($(_dns_relax_file)) is unreadable: how long caches may still hold an old CAA pin of $d can't be known, so the flip waits 24 h. Run it again after $(jq -rn --argjson t "$nb" '$t | strftime("%Y-%m-%d %H:%M UTC")')."
+      return 1
+    fi
+    if [ "$nb" -gt "$now" ]; then
+      warn "An old CAA pin of $d may still be cached until $(jq -rn --argjson t "$nb" '$t | strftime("%H:%M UTC")') (saved when it was replaced or removed: $(_dns_relax_file)): run it again after $(jq -rn --argjson t "$nb" '$t | strftime("%H:%M UTC")')."
+      return 1
+    fi
+  fi
+  out="$(ACME_CA_SERVER="$ca" DNS_CAA=true DNS_ACCOUNT_URI="" DNS_SETS=caa DNS_IPS_DONE=1 DNS_IPV4="${PORTCULLIS_PUBLIC_IPV4:-}" DNS_IPV6="${PORTCULLIS_PUBLIC_IPV6:-}" \
+    _dns_tool check 2>/dev/null)" || true
+  if [ -z "$out" ] || ! printf '%s' "$out" | jq -e 'type == "object" and (.caa | type == "object")' >/dev/null 2>&1; then
+    warn "couldn't check the public CAA of $d (would $ca let Traefik's new ACME account order?): nothing changed. Run it again when the public resolvers answer."
+    return 1
+  fi
+  [ "$(printf '%s' "$out" | jq -r '.caa.would_issue')" = true ] && return 0
+  live="$(printf '%s' "$out" | jq -r '[.items[] | select(.set == "caa") | (.live // [])[]] | unique | join("; ")' 2>/dev/null || true)"
+  if [ "$(_dns_flag DNS_CAA true 2>/dev/null)" != true ]; then why="DNS_CAA=false"
+  elif ! _dns_automated "${DNS_PROVIDER:-none}"; then why="DNS_PROVIDER=${DNS_PROVIDER:-none} has no automation"
+  elif ! _dns_creds_present "${DNS_PROVIDER:-none}"; then why="the ${DNS_PROVIDER} credentials aren't set in .env"
+  else why=""; fi
+  if [ -n "$why" ]; then
+    warn "The public CAA of $d wouldn't let Traefik's new ACME account order (${live:-the CAA at $d or a parent}), and Portcullis can't relax it ($why): remove that pin at ${DNS_PROVIDER:-your DNS provider} (or run ./portcullis dns setup with DNS_CAA=false and the credentials), then run it again after its TTL. Nothing changed."
+  else
+    warn "The public CAA of $d still wouldn't let Traefik's new ACME account order (${live:-the CAA at $d or a parent}): nothing changed; run it again once the resolvers show the CA-only form (./portcullis dns check)."
+  fi
+  return 1
+}
+
+# dns_relax_done — the flip finished (acme.json cleared, Traefik on the
+# new CA, sentinel written): the settle point goes. Nothing else ever
+# deletes it (I10).
+dns_relax_done() { rm -f "$(_dns_relax_file)"; }
+
+# dns_relax_main — on an ACME_STAGING flip, before `config apply` stops
+# Traefik and clears acme.json: the main domain's CAA back to CA-only, so
+# the new account Traefik registers can order, then wait until no cache
+# anywhere (the CA's resolvers too) can still hold the old pin. Traefik
+# keeps running meanwhile: CA-only allows its current account too.
+# The settle point survives the run (C1): the first relax reads the old
+# pin's TTL (`dns-tool ttl`, before anything is written) and saves
+# written-at + TTL + 1 min (_dns_relax_file); every run passes it
+# (--settle-after) and only ever moves it later, so a rerun — which sees
+# only the CA-only records the first run wrote — can't settle early.
+# Exit 0 only when settled; 1 written but not settled yet; 2 the dns tool
+# refused the arguments (an older domains image); 3 a failure.
+dns_relax_main() {
+  local d="${PORTCULLIS_DOMAIN:-the domain}" out rc=0 ttl now nb relaxed at
+  local -a env=(DNS_ACCOUNT_URI="" DNS_SETS=caa DNS_IPS_DONE=1 DNS_IPV4="${PORTCULLIS_PUBLIC_IPV4:-}" DNS_IPV6="${PORTCULLIS_PUBLIC_IPV6:-}")
+  nb="$(_dns_relax_point)"
+  if [ -z "$nb" ] && [ -e "$(_dns_relax_file)" ]; then
+    # A file that can't be read means a relax happened once and its point
+    # is lost: how long caches may still hold that pin can't be known,
+    # also if the CAA was pinned again since. A day, the longest resolvers
+    # commonly cache (I6).
+    now="$(date +%s)"
+    nb=$((now + 86400))
+    _dns_relax_put "$now" 86400 "$nb" || { warn "could not save the relax's settle point ($(_dns_relax_file))"; return 3; }
+    warn "The saved settle point of a relax of the CAA of $d ($(_dns_relax_file)) is unreadable: how long caches may still hold the old pin can't be known, so the flip waits 24 h, until $(jq -rn --argjson t "$nb" '$t | strftime("%Y-%m-%d %H:%M UTC")'). Run it again after that time."
+  fi
+  if [ -z "$nb" ]; then
+    # No usable saved point: read the CAA's TTL (and whether it is already
+    # CA-only) before anything is written. Fail closed (I7): a TTL that
+    # can't be read is never guessed.
+    now="$(date +%s)"
+    # (a subshell: the exports stay in it)
+    out="$(export "${env[@]}"; _dns_tool ttl)" || rc=$?
+    case "$rc" in
+      0) ;;
+      2) warn "could not relax the CAA of $d: the dns tool refused the arguments, the domains image is older than this CLI (docker compose build domains)."; return 2 ;;
+      *) warn "could not read how long caches hold the CAA of $d (the message is above): nothing changed. If ${DNS_PROVIDER:-the provider} reports no TTL for it, set an explicit TTL there; then run it again."; return 3 ;;
+    esac
+    ttl="$(printf '%s' "$out" | jq -r '.ttl // empty' 2>/dev/null || true)"
+    relaxed="$(printf '%s' "$out" | jq -r '.caa_relaxed // false' 2>/dev/null || echo false)"
+    if ! [[ "$ttl" =~ ^[0-9]+$ ]]; then
+      warn "could not read how long caches hold the CAA of $d (no TTL in the dns tool's answer): nothing changed. Set an explicit TTL at ${DNS_PROVIDER:-the provider}, then run it again."
+      return 3
+    fi
+    # M19: main-domain.env never held an account URI = Portcullis never
+    # pinned: no old pin to wait out (the flip's public check guards a
+    # foreign one).
+    if [ "$relaxed" = true ] && [ -n "$(dns_main_env_uri)" ]; then
+      # Already CA-only and no valid settle point (lost, corrupt, edited):
+      # the old pin's TTL can't be known any more. Assume a day, the
+      # longest resolvers commonly cache (I6).
+      nb=$((now + 86400))
+      _dns_relax_put "$now" 86400 "$nb" || { warn "could not save the relax's settle point ($(_dns_relax_file))"; return 3; }
+      warn "No Portcullis pin of $d is live (the CAA is CA-only or has none of its entries, e.g. Traefik never registered, so it was never pinned) and no settle record exists ($(_dns_relax_file)), so the old pin's lifetime is unknown: the flip waits 24 h and can go ahead after $(jq -rn --argjson t "$nb" '$t | strftime("%Y-%m-%d %H:%M UTC")') (run it again then)."
+    else
+      nb=$((now + ttl + 60))
+      _dns_relax_put "$now" "$ttl" "$nb" || { warn "could not save the relax's settle point ($(_dns_relax_file))"; return 3; }
+    fi
+  fi
+  info "Relaxing the CAA of $d to CA-only (Traefik registers a new ACME account), then waiting until no cache can hold the old pin (the TTL caches got + 1 min, at most 15 min; Traefik keeps running meanwhile)..."
+  rc=0
+  # The tool's settle point is saved the moment it prints it, right after
+  # the write (I8); a failed save fails.
+  out="$(DNS_ON_SETTLE=_dns_relax_raise _dns_caa_apply "" --settle --settle-after "$nb")" || rc=$?
+  at="$(printf '%s' "$out" | jq -r '.wait.settle_at // 0' 2>/dev/null || echo 0)"
+  if [[ "$at" =~ ^[0-9]+$ ]] && [ "$at" -gt 0 ] && ! _dns_relax_raise "$at"; then rc=4; fi
+  dns_main_refresh
+  if [ "$rc" -eq 4 ]; then
+    warn "could not save the relax's settle point ($(_dns_relax_file)): the flip can't go on safely."
+    return 3
+  fi
+  # Exit 0 counts only with the report saying settled (defence in depth).
+  if [ "$rc" -eq 0 ] && [ "$(printf '%s' "$out" | jq -r '.wait.settled // false' 2>/dev/null)" != true ]; then rc=1; fi
+  at="$(_dns_wait_at "$out")"
+  case "$rc" in
+    0) ok "The CAA of $d is CA-only, and every cache of the old pin has expired."; return 0 ;;
+    1)
+      if [ "$(printf '%s' "$out" | jq -r '.wait.beyond_cap // false' 2>/dev/null)" = true ]; then
+        ttl="$(printf '%s' "$out" | jq -r '.wait.ttl')"
+        warn "The CAA of $d was relaxed to CA-only, but the old pin is stored with TTL $ttl s ($(_dns_dur "$ttl")), longer than one run waits (15 min): caches (the CA's too) may hold it until $at. Run ./portcullis config apply (or the up / upgrade you ran) again after $at, or lower the CAA TTL at ${DNS_PROVIDER:-the provider} first to shorten it."
+      else
+        warn "$(_dns_wait_text "$out" "The CAA of $d was relaxed to CA-only" it "the old pin"). Run ./portcullis config apply (or the up / upgrade you ran) again${at:+ after $at}."
+      fi
+      return 1 ;;
+    2) warn "could not relax the CAA of $d: the dns tool refused the arguments, the domains image is older than this CLI (docker compose build domains)."; return 2 ;;
+    3) warn "could not relax the CAA of $d to CA-only: the write failed (the message is above; check the provider access: ./portcullis dns plan)."; return 3 ;;
+    *) warn "the relax of the CAA of $d was interrupted (exit $rc): its settle point is saved; run it again."; return 3 ;;
+  esac
 }
 
 # dns_main_refresh — after the dns tool wrote the main domain's records
@@ -352,9 +648,23 @@ dns_main_refresh() {
 }
 
 # dns_status_json — the domains service's DNS report (main + enrolled
-# plans, loopback API), or nothing when it isn't running.
+# plans, loopback API), or nothing when it isn't running. --fresh: the
+# main plan rebuilt for it (public lookups; the service rebuilds at most
+# once per 30 s, and the report waits at most 20 s for it), so a CAA
+# changed outside Portcullis shows at once; otherwise the cached plan
+# with "main_fresh": false.
+# An older running image refuses --fresh (usage, exit 2): its cached
+# report then, marked image_old (status names it; M10).
 dns_status_json() {
-  dc exec -T domains domains report --main --json 2>/dev/null || true
+  local out rc=0
+  out="$(dc exec -T domains domains report --main --json --fresh 2>/dev/null)" || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    out="$(dc exec -T domains domains report --main --json 2>/dev/null)" || return 0
+    printf '%s' "$out" | jq -c '. + {main_fresh: false, image_old: true}' 2>/dev/null || true
+    return 0
+  fi
+  [ "$rc" -eq 0 ] || return 0
+  printf '%s\n' "$out"
 }
 
 help_dns() {

@@ -31,6 +31,20 @@ _dns_automated() {
   return 1
 }
 
+# _dns_creds_present <provider> — every credential the provider needs is
+# set (AWS_HOSTED_ZONE_ID is optional): without them Portcullis can't
+# write its records, so it doesn't manage the CAA either.
+_dns_creds_present() {
+  local line var
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    var="${line%%:*}"
+    [ "$var" != AWS_HOSTED_ZONE_ID ] || continue
+    [ -n "${!var:-}" ] || return 1
+  done < <(_dns_cred_keys "$1")
+  return 0
+}
+
 # _prompt <var> <question> <default> — interactive value unless already set.
 _prompt() {
   local var="$1" q="$2" def="$3" reply

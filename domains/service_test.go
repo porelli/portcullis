@@ -2060,3 +2060,22 @@ func TestMainPlanRecheckAge(t *testing.T) {
 	e.clock.advance(e.svc.cfg.RecheckEvery)
 	e.waitFor("the healthy plan rebuilt after RecheckEvery", 10*time.Second, func() bool { at, _, _ := cached(); return at.After(healthyAt) })
 }
+
+// TestPlanHealthyWouldIssue (deploy finding C): every item ok but the CA
+// would not issue (or that is unknown) is not healthy, so the worker
+// rebuilds it after min(RecheckEvery, 5m), not an hour later.
+func TestPlanHealthyWouldIssue(t *testing.T) {
+	pl := dnsplan.Plan{Items: []dnsplan.Item{{Set: dnsplan.SetCAA, Status: dnsplan.StatusOK, Severity: dnsplan.SevOK}},
+		CAA: dnsplan.CAAInfo{Issuer: "letsencrypt.org", WouldIssue: true}}
+	if !planHealthy(pl) {
+		t.Fatal("an ok plan that would issue is not healthy")
+	}
+	pl.CAA.WouldIssue = false
+	if planHealthy(pl) {
+		t.Fatal("would_issue false counts as healthy")
+	}
+	pl.CAA.Issuer = "" // unknown CA: would_issue can't be judged
+	if planHealthy(pl) {
+		t.Fatal("an unknown would_issue counts as healthy")
+	}
+}
