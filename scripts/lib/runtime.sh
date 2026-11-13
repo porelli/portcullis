@@ -322,6 +322,7 @@ runtime_host_checks() {
   else
     _rt_chk fail "passt is missing (rootless networking): install passt"
   fi
+  _rt_apparmor_pasta_check
   if v="$(docker compose version --short 2>/dev/null)" && [ -n "$v" ]; then
     _rt_chk ok "docker compose $v"
   else
@@ -331,6 +332,28 @@ runtime_host_checks() {
     _rt_chk ok "SELinux $(getenforce 2>/dev/null || echo unknown)"
   else
     _rt_chk ok "SELinux not present"
+  fi
+}
+
+# _rt_apparmor_pasta_check — one host-check line. Ubuntu's AppArmor (26.04:
+# Launchpad #2154379, unfixed) runs podman under its stub profile "podman"
+# while pasta's profile only accepts signals from unconfined processes, so
+# podman's SIGTERM to the rootless-netns pasta is denied: removing the last
+# container of a network fails ("rootless netns: kill network process:
+# permission denied"), e.g. ./portcullis down / restore after a boot.
+# Overridable for tests: RT_APPARMOR_ENABLED, RT_APPARMOR_DIR.
+_rt_apparmor_pasta_check() {
+  local d="${RT_APPARMOR_DIR:-/etc/apparmor.d}" en
+  en="$(cat "${RT_APPARMOR_ENABLED:-/sys/module/apparmor/parameters/enabled}" 2>/dev/null || true)"
+  if [ "$en" != Y ] || [ ! -f "$d/podman" ] || [ ! -f "$d/usr.bin.pasta" ]; then
+    _rt_chk ok "AppArmor: no podman / pasta profile pair to reconcile"
+    return 0
+  fi
+  if { cat "$d/usr.bin.pasta" 2>/dev/null; cat "$d/local/usr.bin.pasta" 2>/dev/null; true; } | sed 's/#.*//' \
+       | grep -Eq 'signal[^,]*receive[^,]*peer="?podman"?[[:space:]]*,'; then
+    _rt_chk ok "AppArmor: pasta accepts podman's SIGTERM"
+  else
+    _rt_chk fail "AppArmor: pasta's profile refuses podman's SIGTERM (Ubuntu bug 2154379), so removing the last container of a network fails: add 'signal (receive) set=(term) peer=podman,' to $d/local/usr.bin.pasta (or to $d/usr.bin.pasta if it has no local include), then sudo apparmor_parser -r $d/usr.bin.pasta"
   fi
 }
 

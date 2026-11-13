@@ -5998,6 +5998,20 @@ jobs:
             echo "$f: $(grep "^$me:" "$f")"
           done
           sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80
+          # Ubuntu's AppArmor (bug 2154379): pasta's profile refuses podman's
+          # SIGTERM, so removing a network's last container fails ("rootless
+          # netns: kill network process: permission denied"). The host-prep
+          # rule (runtime_host_checks refuses init / up without it).
+          if [ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = Y ] && [ -f /etc/apparmor.d/usr.bin.pasta ]; then
+            grep -n 'include\|signal' /etc/apparmor.d/usr.bin.pasta || true
+            if grep -q 'local/usr.bin.pasta' /etc/apparmor.d/usr.bin.pasta; then
+              echo 'signal (receive) set=(term) peer=podman,' | sudo tee -a /etc/apparmor.d/local/usr.bin.pasta >/dev/null
+            else
+              sudo sed -i 's/^}$/  signal (receive) set=(term) peer=podman,\n}/' /etc/apparmor.d/usr.bin.pasta
+            fi
+            sudo apparmor_parser -r /etc/apparmor.d/usr.bin.pasta
+            echo "AppArmor: pasta now accepts podman's SIGTERM"
+          fi
           sudo loginctl enable-linger "$me"
           XDG_RUNTIME_DIR="/run/user/$(id -u)"
           for i in $(seq 1 30); do [ -S "$XDG_RUNTIME_DIR/bus" ] && break; [ "$i" -eq 30 ] && { echo "FAIL: no user manager for $me"; exit 1; }; sleep 1; done

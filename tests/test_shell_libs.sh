@@ -2484,7 +2484,8 @@ expect_eq "runtime_port_start: unreadable or not a number → 1024" \
 # A prepared host: every † item ok (functions stand in for the host tools).
 CG="$WORK/rt/cgroup"; mkdir -p "$CG/user.slice/user-$RT_UID.slice/user@$RT_UID.service"
 echo "cpuset cpu io memory pids" > "$CG/user.slice/user-$RT_UID.slice/user@$RT_UID.service/cgroup.controllers"
-RT_HOST="CONTAINER_RUNTIME=podman RT_CGROUP_ROOT='$CG' RT_PROC_PORT_START='$WORK/rt/port80'
+mkdir -p "$WORK/rt/aa/local"; echo N > "$WORK/rt/aa-off"; echo Y > "$WORK/rt/aa-on"
+RT_HOST="CONTAINER_RUNTIME=podman RT_CGROUP_ROOT='$CG' RT_PROC_PORT_START='$WORK/rt/port80' RT_APPARMOR_DIR='$WORK/rt/aa' RT_APPARMOR_ENABLED='$WORK/rt/aa-off'
   loginctl() { echo yes; }; systemctl() { echo enabled; }; nft() { :; }; passt() { :; }; getenforce() { echo Enforcing; }"
 OUT="$(rt "$RT_HOST; runtime_host_checks")"
 expect_eq "runtime_host_checks: a prepared host → no fail line" "$(printf '%s\n' "$OUT" | grep -c '^fail' || true)" 0
@@ -2817,6 +2818,25 @@ if date -u -d 2026-11-13T05:12:06+01:00 +%s >/dev/null 2>&1; then
   expect_eq "hub_started_unix: an RFC 3339 offset (Podman, local time)" "$(HS_AT=2026-11-13T05:12:06.5+01:00 HS)" 1794543126
 fi
 expect_eq "hub_started_unix: no StartedAt → 0" "$(HS_AT='' HS)" 0
+
+# AppArmor (Ubuntu bug 2154379): pasta must accept podman's SIGTERM.
+AA="$WORK/rt/aa"
+aa() { rt "CONTAINER_RUNTIME=podman RT_APPARMOR_DIR='$AA' RT_APPARMOR_ENABLED='$WORK/rt/$1'; _rt_apparmor_pasta_check" | head -n1 | cut -f1; }
+rm -f "$AA/podman" "$AA/usr.bin.pasta" "$AA/local/usr.bin.pasta"
+expect_eq "AppArmor check: disabled → ok" "$(aa aa-off)" ok
+expect_eq "AppArmor check: enabled, no podman / pasta profiles → ok" "$(aa aa-on)" ok
+printf 'profile podman /usr/bin/podman flags=(unconfined) {\n}\n' > "$AA/podman"
+printf 'profile pasta /usr/bin/pasta{,.avx2} flags=(attach_disconnected) {\n  include <abstractions/pasta>\n  include if exists <local/usr.bin.pasta>\n}\n' > "$AA/usr.bin.pasta"
+expect_eq "AppArmor check: Ubuntu's profiles without the rule → fail" "$(aa aa-on)" fail
+case "$(rt "CONTAINER_RUNTIME=podman RT_APPARMOR_DIR='$AA' RT_APPARMOR_ENABLED='$WORK/rt/aa-on'; _rt_apparmor_pasta_check")" in
+  *"signal (receive) set=(term) peer=podman,"*"apparmor_parser -r"*) t_pass "AppArmor check: the fail line gives the rule and the reload" ;; *) t_fail "AppArmor check hint" ;; esac
+echo '# signal (receive) set=(term) peer=podman,' > "$AA/local/usr.bin.pasta"
+expect_eq "AppArmor check: a commented-out rule → fail" "$(aa aa-on)" fail
+echo 'signal (receive) set=(term) peer=podman,' > "$AA/local/usr.bin.pasta"
+expect_eq "AppArmor check: the rule in local/usr.bin.pasta → ok" "$(aa aa-on)" ok
+rm -f "$AA/local/usr.bin.pasta"
+printf 'profile pasta /usr/bin/pasta {\n  signal receive set=(term hup kill int quit) peer=podman,\n}\n' > "$AA/usr.bin.pasta"
+expect_eq "AppArmor check: the rule in the profile itself → ok" "$(aa aa-on)" ok
 
 echo ""
 echo "$PASS passed, $FAIL failed"
