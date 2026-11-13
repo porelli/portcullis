@@ -92,6 +92,13 @@ type Service struct {
 	mainBuilding bool
 	// mainGen counts main-plan invalidations (guarded by mu).
 	mainGen int
+	// mainFlight: a request's main-plan build in progress (guarded by
+	// mu): later requests join it, and it finishes and is stored even when
+	// the request that started it gave up (M9).
+	mainFlight *planFlight
+	// runCtx: Run's context (guarded by mu), the parent of detached
+	// builds, so a shutdown ends them.
+	runCtx context.Context
 
 	acmeMu      sync.Mutex // serialises ACME account registration
 	lastDropped string     // last logged list of dropped certificates (guarded by mu)
@@ -509,6 +516,9 @@ func (s *Service) Kick() {
 // Run is the worker loop; it returns once ctx is done and running work
 // has finished.
 func (s *Service) Run(ctx context.Context) {
+	s.mu.Lock()
+	s.runCtx = ctx
+	s.mu.Unlock()
 	t := time.NewTicker(s.cfg.Tick)
 	defer t.Stop()
 	for {
@@ -1081,23 +1091,68 @@ func (s *Service) handleMainRefresh(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.mainPlan(ctx, false))
 }
 
+// planFlight is one main-plan build shared by the requests waiting on it.
+type planFlight struct {
+	gen  int
+	done chan struct{}
+	pl   dnsplan.Plan
+}
+
 // mainPlan is the main domain's read-only plan (no credentials: public
 // checks only, pinned to Traefik's account URI from main-domain.env).
+// A build runs detached from ctx (single flight, planTimeout): when ctx
+// ends first (a `status` that stopped waiting) the answer is the cached
+// plan, and the build still finishes and is stored, so the refresh
+// throttle engages for the next reader.
 func (s *Service) mainPlan(ctx context.Context, refresh bool) dnsplan.Plan {
 	s.mu.Lock()
 	if pl, ok := s.cachedLocked(mainPlanKey, refresh); ok {
 		s.mu.Unlock()
 		return pl
 	}
-	gen := s.mainGen
-	s.mu.Unlock()
-	pl := s.buildMainPlan(ctx)
-	// A build cut short (the client gave up, the deadline) is a plan of
-	// failed lookups: answer it, but keep the cached one.
-	if ctx.Err() == nil {
-		s.storeMainPlan(gen, pl)
+	parent := s.runCtx
+	if parent == nil {
+		parent = context.Background()
 	}
-	return pl
+	f := s.mainFlight
+	if f == nil || f.gen != s.mainGen {
+		f = &planFlight{gen: s.mainGen, done: make(chan struct{})}
+		s.mainFlight = f
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer close(f.done)
+			defer func() {
+				if r := recover(); r != nil {
+					s.logf("main domain plan: panic recovered: %v", r)
+				}
+				s.mu.Lock()
+				if s.mainFlight == f {
+					s.mainFlight = nil
+				}
+				s.mu.Unlock()
+			}()
+			bctx, cancel := context.WithTimeout(parent, planTimeout)
+			defer cancel()
+			f.pl = s.buildMainPlan(bctx)
+			// A build cut short is a plan of failed lookups: never cached.
+			if bctx.Err() == nil {
+				s.storeMainPlan(f.gen, f.pl)
+			}
+		}()
+	}
+	s.mu.Unlock()
+	select {
+	case <-f.done:
+		return f.pl
+	case <-ctx.Done():
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if c, ok := s.plans[mainPlanKey]; ok {
+			return c.plan
+		}
+		return dnsplan.Plan{Name: s.cfg.MainDomain, Items: []dnsplan.Item{}}
+	}
 }
 
 // buildMainPlan builds the main domain's read-only plan (no cache).

@@ -385,22 +385,28 @@ func TestReportFresh(t *testing.T) {
 }
 
 // A main-plan build cut short (the client gave up) never replaces the
-// cached plan: it would be a plan of failed lookups.
+// cached plan with failed lookups (M9: it goes on, detached from the
+// request, and stores its plan when it finishes, so the 30 s throttle
+// engages for the next status).
 func TestMainPlanCanceledNotStored(t *testing.T) {
 	e := newEnv(t, false)
-	cachedAt := func() (time.Time, bool) {
+	cachedAt := func() (time.Time, dnsplan.Plan, bool) {
 		e.svc.mu.Lock()
 		defer e.svc.mu.Unlock()
 		c, ok := e.svc.plans[mainPlanKey]
-		return c.at, ok
+		return c.at, c.plan, ok
 	}
-	e.waitFor("the worker's first main plan", 10*time.Second, func() bool { _, ok := cachedAt(); return ok })
-	before, _ := cachedAt()
+	e.waitFor("the worker's first main plan", 10*time.Second, func() bool { _, _, ok := cachedAt(); return ok })
+	before, _, _ := cachedAt()
 	e.clock.advance(time.Minute)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	e.svc.mainPlan(ctx, true)
-	if after, ok := cachedAt(); !ok || !after.Equal(before) {
-		t.Fatalf("a canceled build replaced the cached plan (%v → %v, %v)", before, after, ok)
+	e.waitFor("the detached build stored", 10*time.Second, func() bool { at, _, _ := cachedAt(); return at.After(before) })
+	_, pl, _ := cachedAt()
+	for _, it := range pl.Items {
+		if it.Status == dnsplan.StatusUnknown && it.Severity == dnsplan.SevWarning {
+			t.Fatalf("a canceled request's lookups were stored: %+v", it)
+		}
 	}
 }

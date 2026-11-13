@@ -342,12 +342,88 @@ func TestToolStoredTTLUnknown(t *testing.T) {
 	if w := decodeApply(t, out).Wait; code != exitOK || w.TTL != 300 {
 		t.Fatalf("stored 1, served 300 = %d %+v", code, *w)
 	}
-	// No authoritative answer either: unknown is the whole cap, never 0.
+	// No authoritative answer either: unknown. A plain wait (dns setup,
+	// the tighten) assumes the whole cap; --settle refuses before writing
+	// (I7: a guess would become the saved settle point).
 	toolAuthServers = func(context.Context, []string, string) []string { return nil }
 	pinAt(f.zone, oldAcct, 300*time.Second)
-	code, out, _ = f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
-	if w := decodeApply(t, out).Wait; code != exitOK || w.TTL != secs(unknownTTL) || w.Waited != 900 {
-		t.Fatalf("stored 1, nothing served = %d %+v", code, *w)
+	code, out, _ = f.run([]string{"apply", "--wait", "auto"}, toolJSON(caaOnly(newAcct)))
+	if w := decodeApply(t, out).Wait; code != exitOK || w.TTL != secs(unknownTTL) {
+		t.Fatalf("stored 1, nothing served, no --settle = %d %+v", code, *w)
+	}
+	pinAt(f.zone, oldAcct, 300*time.Second)
+	code, out, errs := f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
+	if code != exitFailure || out != "" || !strings.Contains(errs, "set an explicit TTL at fake-tool") {
+		t.Fatalf("stored 1, nothing served, --settle = %d %q %s", code, out, errs)
+	}
+	if rr := f.zone.Records("portcullis.example.test"); len(rr) != 2 || !strings.Contains(rr[0].Data, "acct/1") {
+		t.Fatalf("--settle with an unknown TTL wrote: %v", rr)
+	}
+	if code, _, errs := f.run([]string{"ttl"}, toolJSON(caaOnly(""))); code != exitFailure || !strings.Contains(errs, "set an explicit TTL") {
+		t.Fatalf("ttl with an unknown TTL = %d %s", code, errs)
+	}
+}
+
+// I7: under --settle a failed read before the write refuses: nothing
+// written. Without --settle the wait just assumes the cap.
+func TestToolSettlePreWriteReadFails(t *testing.T) {
+	f := newToolFixture(t)
+	pinAt(f.zone, oldAcct, 600*time.Second)
+	useVirtualClock(t)
+	gets := 0
+	f.hook = func(op string, _ []libdns.Record) error {
+		if op == "get" {
+			gets++
+			if gets == 1 {
+				return errors.New("provider flaked")
+			}
+		}
+		return nil
+	}
+	code, out, errs := f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
+	if code != exitFailure || out != "" || !strings.Contains(errs, "nothing changed") {
+		t.Fatalf("--settle, pre-write read failed = %d %q %s", code, out, errs)
+	}
+	if rr := f.zone.Records("portcullis.example.test"); len(rr) != 2 || !strings.Contains(rr[0].Data, "acct/1") {
+		t.Fatalf("written although the read failed: %v", rr)
+	}
+	gets = 0
+	if code, out, _ := f.run([]string{"apply", "--wait", "auto"}, toolJSON(caaOnly(newAcct))); code == exitFailure {
+		t.Fatalf("no --settle, pre-write read failed = %d %s", code, out)
+	}
+}
+
+// I8: right after the write, before the wait, the progress line carries
+// the settle point (written_at + TTL + margin) for the shell to save.
+func TestToolProgressSettlePoint(t *testing.T) {
+	f := newToolFixture(t)
+	pinAt(f.zone, oldAcct, 600*time.Second)
+	c := useVirtualClock(t)
+	start := c.now
+	_, _, errs := f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
+	want := fmt.Sprintf("settle_at=%d", start.Add(660*time.Second).Unix())
+	first, _, _ := strings.Cut(errs, "\n")
+	if !strings.HasPrefix(first, "domains dns apply: written;") || !strings.Contains(first, "written_at=") || !strings.Contains(errs, want) {
+		t.Fatalf("progress line %q (want %s on the first line)", errs, want)
+	}
+}
+
+// I6: ttl says whether the caa set is already CA-only (a relax happened).
+func TestToolTTLRelaxed(t *testing.T) {
+	f := newToolFixture(t)
+	pinAt(f.zone, oldAcct, 600*time.Second)
+	var r struct {
+		TTL     int  `json:"ttl"`
+		Relaxed bool `json:"caa_relaxed"`
+	}
+	_, out, _ := f.run([]string{"ttl"}, toolJSON(caaOnly("")))
+	if json.Unmarshal([]byte(out), &r) != nil || r.Relaxed || r.TTL != 600 {
+		t.Fatalf("pinned: %s", out)
+	}
+	pinAt(f.zone, "", 600*time.Second)
+	_, out, _ = f.run([]string{"ttl"}, toolJSON(caaOnly("")))
+	if json.Unmarshal([]byte(out), &r) != nil || !r.Relaxed {
+		t.Fatalf("CA-only: %s", out)
 	}
 }
 

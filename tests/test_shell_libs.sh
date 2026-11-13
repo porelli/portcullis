@@ -1461,9 +1461,10 @@ mkdir -p "$WORK/rsec-backup/secrets/domains" "$WORK/rsec-root/secrets/domains"
 cp "$LASTD/last-public-ipv4" "$LASTD/last-public-ipv6" "$WORK/rsec-backup/secrets/domains/"
 echo keep > "$WORK/rsec-backup/secrets/domains/api-secret"
 echo RELAX_NOT_BEFORE=1 > "$WORK/rsec-backup/secrets/domains/acme-relax.env"
+echo RELAX_NOT_BEFORE=1900000000 > "$WORK/rsec-root/secrets/domains/acme-relax.env"
 (PORTCULLIS_ROOT="$WORK/rsec-root"; secrets_fix_perms() { :; }; _restore_secrets "$WORK/rsec-backup")
-expect_eq "restore: last-public-ipv* and acme-relax.env deleted, the rest of secrets/ installed" \
-  "$(find "$WORK/rsec-root/secrets" -name 'last-public-*' -o -name 'acme-relax.env' | wc -l | tr -d ' '):$(cat "$WORK/rsec-root/secrets/domains/api-secret")" "0:keep"
+expect_eq "restore: last-public-ipv* deleted, the live acme-relax.env kept (live DNS: a restore doesn't change it), the rest installed" \
+  "$(find "$WORK/rsec-root/secrets" -name 'last-public-*' | wc -l | tr -d ' '):$(cat "$WORK/rsec-root/secrets/domains/acme-relax.env"):$(cat "$WORK/rsec-root/secrets/domains/api-secret")" "0:RELAX_NOT_BEFORE=1900000000:keep"
 # The same on this root (what restore leaves), then the first `up`.
 _strip_host_files "$PORTCULLIS_ROOT/secrets"
 ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.8
@@ -2051,11 +2052,23 @@ case "$*" in
     exit "$(cat "$d/rc-$sub" 2>/dev/null || echo 0)" ;;
   run\ --rm\ --network\ none\ -v\ portcullis_traefik_acme:/acme\ *rm\ -f\ /acme/acme.json)
     [ ! -f "$d/rm-term" ] || kill -TERM "$PPID"
+    [ ! -f "$d/rm-hup" ] || kill -HUP "$PPID"
     [ ! -f "$d/rm-fail" ] || exit 1
     exit 0 ;;
   compose\ *\ build\ domains)
     echo build >> "$d/order"
     exit 0 ;;
+  compose\ *\ up\ -d\ --no-deps\ traefik)
+    # What compose would interpolate: the shell's ACME_CA_SERVER wins over
+    # .env (N1), and the sentinel at that moment.
+    echo "CA=${ACME_CA_SERVER:-} sentinel=$(cat "$PORTCULLIS_ROOT/certs/.acme-staging-last" 2>/dev/null)" >> "$d/traefik-up"
+    [ ! -f "$d/up-fail" ] || exit 1
+    exit 0 ;;
+  compose\ *\ exec\ -T\ domains\ domains\ report\ --main\ --json\ --fresh)
+    [ ! -f "$d/report-old" ] || { echo "usage: domains report --main --json|--refresh" >&2; exit 2; }
+    cat "$d/report-out" 2>/dev/null; exit 0 ;;
+  compose\ *\ exec\ -T\ domains\ domains\ report\ --main\ --json)
+    cat "$d/report-out" 2>/dev/null; exit 0 ;;
   compose\ *\ ps\ -q\ --status\ running\ traefik)
     [ ! -f "$d/traefik-running" ] || echo c0ffee
     exit 0 ;;
@@ -2283,7 +2296,8 @@ flip() { # flip <extra shell> — config_apply with ACME_STAGING=true after fals
   echo false > "$FL_ROOT/certs/.acme-staging-last"
   rm -f "$STUB_DIR/dt/argv" "$STUB_DIR/dt/order"
   [ -f "$STUB_DIR/dt/keep-state" ] || rm -f "$FL_ROOT/secrets/domains/acme-relax.env"
-  (PATH="$WORK/dtbin:$WORK/cabin:$PATH" PORTCULLIS_ROOT="$FL_ROOT" bash -c ". '$WORK/dtenv.sh'; export PORTCULLIS_ROOT='$FL_ROOT'; config_build_ca_bundle() { :; }; $1; config_apply" 2>&1; echo "rc=$?")
+  rm -f "$STUB_DIR/dt/traefik-up"
+  (PATH="$WORK/dtbin:$WORK/cabin:$PATH" PORTCULLIS_ROOT="$FL_ROOT" bash -c ". '$WORK/dtenv.sh'; export PORTCULLIS_ROOT='$FL_ROOT' ACME_CA_SERVER=https://acme-v02.api.letsencrypt.org/directory; config_build_ca_bundle() { echo BUNDLE >> \"\$STUB_DIR/dt/argv\"; [ ! -f \"\$STUB_DIR/dt/bundle-fail\" ] || fail bundle; }; $1; config_apply" 2>&1; echo "rc=$?")
 }
 FCF='export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123'
 RELAXF="$FL_ROOT/secrets/domains/acme-relax.env"
@@ -2311,6 +2325,20 @@ O1="$(ord 'ACME_STAGING flipped')" O2="$(ord 'Relaxing the CAA')" O3="$(ord 'eve
 expect_eq "config apply flip: messages in the order things happen" \
   "$([ -n "$O1" ] && [ -n "$O6" ] && [ "$O1" -lt "$O2" ] && [ "$O2" -lt "$O3" ] && [ "$O3" -lt "$O4" ] && [ "$O4" -lt "$O5" ] && [ "$O5" -lt "$O6" ] && echo yes)" yes
 expect_eq "config apply flip: the flip line doesn't claim the clearing" "$(printf '%s' "$OUT" | grep 'ACME_STAGING flipped' | grep -c clearing || true)" 0
+# N1: compose recreates Traefik with the NEW CA (the shell's variable wins
+# over .env), and the sentinel is written only after that start.
+expect_eq "config apply flip: Traefik recreated on the new CA, before the sentinel says done" \
+  "$(cat "$STUB_DIR/dt/traefik-up" 2>/dev/null)" "CA=https://acme-staging-v02.api.letsencrypt.org/directory sentinel=false"
+# I9: the CA bundle (it may download) is built before Traefik stops.
+B1="$(argn '^BUNDLE$')" B2="$(argn 'stop traefik')"
+expect_eq "config apply flip: CA bundle before the stop" "$([ -n "$B1" ] && [ -n "$B2" ] && [ "$B1" -lt "$B2" ] && echo yes)" yes
+# I9: Traefik doesn't start on the new CA → fail, Traefik started again
+# (EXIT trap), the flip stays pending.
+touch "$STUB_DIR/dt/up-fail"
+OUT="$(flip "$FCF")"
+expect_eq "config apply flip: a failed start after the clear → rc 1, sentinel unchanged, Traefik started again" \
+  "${OUT##*rc=}:$(cat "$FL_ROOT/certs/.acme-staging-last"):$(grep -c ' start traefik$' "$STUB_DIR/dt/argv" || true)" "1:false:1"
+rm -f "$STUB_DIR/dt/up-fail"
 # M5: exit 0 without settled: true is not settled.
 wait_out true false 0
 OUT="$(flip "$FCF")"
@@ -2360,12 +2388,23 @@ case "$OUT" in *"could not clear Traefik's ACME storage"*rc=1) t_pass "config ap
 expect_eq "config apply flip: failed clear → sentinel unchanged, state kept, Traefik started again" \
   "$(cat "$FL_ROOT/certs/.acme-staging-last"):$([ -e "$RELAXF" ] && echo kept):$(grep -c ' start traefik$' "$STUB_DIR/dt/argv" || true)" "false:kept:1"
 rm -f "$STUB_DIR/dt/rm-fail"
-# I2: interrupted after the stop → the trap starts Traefik again.
+# I2: interrupted after the stop → the trap starts Traefik again (once).
 touch "$STUB_DIR/dt/rm-term"
 OUT="$(flip "$FCF")"
 expect_eq "config apply flip: TERM after the stop starts Traefik again, sentinel unchanged" \
   "$(grep -c ' start traefik$' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last")" "1:false"
-rm -f "$STUB_DIR/dt/rm-term" "$STUB_DIR/dt/traefik-running"
+rm -f "$STUB_DIR/dt/rm-term"
+# I9: an SSH drop (HUP) too.
+touch "$STUB_DIR/dt/rm-hup"
+OUT="$(flip "$FCF")"
+expect_eq "config apply flip: HUP after the stop starts Traefik again, sentinel unchanged" \
+  "$(grep -c ' start traefik$' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last")" "1:false"
+rm -f "$STUB_DIR/dt/rm-hup" "$STUB_DIR/dt/traefik-running"
+# I9: a failure before the stop (the CA bundle) leaves Traefik alone.
+touch "$STUB_DIR/dt/bundle-fail"
+OUT="$(flip "$FCF")"
+expect_eq "config apply flip: a failed CA bundle → rc 1, Traefik never stopped" "${OUT##*rc=}:$(grep -c 'stop traefik' "$STUB_DIR/dt/argv" || true)" "1:0"
+rm -f "$STUB_DIR/dt/bundle-fail"
 # Traefik wasn't running: it isn't started.
 OUT="$(flip "$FCF")"
 expect_eq "config apply flip: Traefik not started when it wasn't running" "$(grep -c -e ' start traefik$' -e 'up -d --no-deps traefik' "$STUB_DIR/dt/argv" || true):${OUT##*rc=}" "0:0"
@@ -2383,10 +2422,65 @@ case "$OUT" in *"the write failed"*) t_fail "exit 2 reads as a failed write: $OU
 mkdir -p "$(dirname "$RELAXF")"; echo RELAX_NOT_BEFORE=1 > "$RELAXF"
 printf 'PORTCULLIS_DOMAIN=ci.example.org\nACME_STAGING=true\n' > "$FL_ROOT/.env"; echo true > "$FL_ROOT/certs/.acme-staging-last"
 (PATH="$WORK/dtbin:$WORK/cabin:$PATH" PORTCULLIS_ROOT="$FL_ROOT" bash -c ". '$WORK/dtenv.sh'; export PORTCULLIS_ROOT='$FL_ROOT'; config_build_ca_bundle() { :; }; $FCF; config_apply" >/dev/null 2>&1)
-expect_eq "config apply: no flip pending → a leftover settle point removed" "$([ -e "$RELAXF" ] && echo kept || echo gone)" gone
+expect_eq "config apply: ACME_STAGING reverted mid-flip → the settle point stays in force" "$([ -e "$RELAXF" ] && echo kept || echo gone)" kept
+# … until a pin is written again (the tighten re-pins Traefik's account).
+touch "$STUB_DIR/dt/acme-volume"; echo "https://acme-v02.api.letsencrypt.org/acme/acct/77" > "$STUB_DIR/dt/traefik-uri"
+jq '.items = [{set: "caa", name: "ci.example.org", type: "CAA", want: ["x"], live: ["y"], status: "wrong", severity: "problem", fix: "auto", steps: []}] | .caa.would_issue = false' "$STUB_DIR/dt/out-default" > "$STUB_DIR/dt/out-check"
+rm -f "$STUB_DIR/dt/rc-apply"; wait_out true true 0
+(PATH="$WORK/dtbin:$PATH" PORTCULLIS_ROOT="$FL_ROOT" bash -c ". '$WORK/dtenv.sh'; export PORTCULLIS_ROOT='$FL_ROOT'; $FCF; dns_tighten_main" >/dev/null 2>&1)
+expect_eq "tighten: a pin written ends the pending relax (settle point removed)" "$([ -e "$RELAXF" ] && echo kept || echo gone)" gone
+rm -f "$STUB_DIR/dt/out-check"
+# I6: no saved point (lost, corrupt) but the CAA is already CA-only: the
+# old pin's TTL can't be known → now + 24 h, saved, with the time.
+echo '{"ttl": 600, "caa_relaxed": true}' > "$STUB_DIR/dt/out-ttl"
+for st in missing corrupt; do
+  printf 'PORTCULLIS_DOMAIN=ci.example.org\nACME_STAGING=true\n' > "$FL_ROOT/.env"
+  touch "$STUB_DIR/dt/keep-state"; rm -f "$RELAXF"
+  [ "$st" = missing ] || { mkdir -p "$(dirname "$RELAXF")"; echo 'RELAX_NOT_BEFORE=soon' > "$RELAXF"; }
+  T0="$(date +%s)"
+  WAIT_EXTRA='{"beyond_cap":true,"settle_at":1}' wait_out true false 86400; echo 1 > "$STUB_DIR/dt/rc-apply"
+  OUT="$(flip "$FCF")"
+  NB="$(sed -n 's/^RELAX_NOT_BEFORE=//p' "$RELAXF" 2>/dev/null)"
+  case "$OUT" in *"already CA-only"*"can't be known"*"24 h"*rc=1) t_pass "relax: $st settle point, CAA already relaxed → 24 h, said" ;; *) t_fail "relax $st: $OUT" ;; esac
+  expect_eq "relax: $st settle point → now + 24 h saved, passed on" \
+    "$([ "${NB:-0}" -ge $((T0 + 86400)) ] 2>/dev/null && echo ok):$(grep -c "settle-after $NB\$" "$STUB_DIR/dt/argv")" "ok:1"
+done
+rm -f "$STUB_DIR/dt/keep-state" "$STUB_DIR/dt/rc-apply"
+# One edited field can't move the point earlier: max(NOT_BEFORE, WRITTEN_AT + OLD_TTL + 60).
+touch "$STUB_DIR/dt/keep-state"
+printf 'RELAX_WRITTEN_AT=1900000000\nRELAX_OLD_TTL=3600\nRELAX_NOT_BEFORE=5\n' > "$RELAXF"
+WAIT_EXTRA='{"beyond_cap":true}' wait_out true false 3600; echo 1 > "$STUB_DIR/dt/rc-apply"
+OUT="$(flip "$FCF")"
+expect_eq "relax: the saved point is max(NOT_BEFORE, WRITTEN_AT + OLD_TTL + 60)" "$(grep -c 'settle-after 1900003660$' "$STUB_DIR/dt/argv")" 1
+rm -f "$STUB_DIR/dt/keep-state" "$STUB_DIR/dt/rc-apply"
+# I7: the old pin's TTL can't be read (or isn't a number): refuse before
+# any write, nothing saved.
+for bad in rc3 nonum; do
+  rm -f "$RELAXF"
+  if [ "$bad" = rc3 ]; then echo 3 > "$STUB_DIR/dt/rc-ttl"; else echo '{"ttl": null}' > "$STUB_DIR/dt/out-ttl"; fi
+  OUT="$(flip "$FCF")"
+  case "$OUT" in *"could not read how long caches hold the CAA of ci.example.org"*"nothing changed"*rc=1) t_pass "relax: TTL unreadable ($bad) refuses" ;; *) t_fail "relax ttl $bad: $OUT" ;; esac
+  expect_eq "relax: TTL unreadable ($bad) → no apply, nothing saved" "$(grep -c 'dns-tool apply' "$STUB_DIR/dt/argv" || true):$([ -e "$RELAXF" ] && echo saved)" "0:"
+  rm -f "$STUB_DIR/dt/rc-ttl"
+done
+# I8: the settle point from the tool's progress line (written right after
+# the write) is saved at once — also when the run dies during the wait.
+echo '{"ttl": 600, "caa_relaxed": false}' > "$STUB_DIR/dt/out-ttl"
+rm -f "$RELAXF"
+echo "domains dns apply: written; waiting up to 11m0s for 1.1.1.1:53 (TTL 600 s); written_at=1899999340 settle_at=1900000000" > "$STUB_DIR/dt/err-apply"
+echo 130 > "$STUB_DIR/dt/rc-apply"
+OUT="$(flip "$FCF")"
+expect_eq "relax: the progress line's settle point is saved even when the wait dies" "$(sed -n 's/^RELAX_NOT_BEFORE=//p' "$RELAXF" 2>/dev/null):${OUT##*rc=}" "1900000000:1"
+# … and a failed save is a failure.
+rm -f "$RELAXF"; chmod 500 "$(dirname "$RELAXF")"
+OUT="$(flip "$FCF")"
+chmod 700 "$(dirname "$RELAXF")"
+case "$OUT" in *"could not save the relax's settle point"*rc=1) t_pass "relax: a failed save fails" ;; *) t_fail "relax failed save: $OUT" ;; esac
+rm -f "$STUB_DIR/dt/err-apply" "$STUB_DIR/dt/rc-apply" "$RELAXF"
 rm -f "$STUB_DIR/dt/out-ttl"
-rm -f "$STUB_DIR/dt/rc-apply"
+rm -f "$STUB_DIR/dt/rc-apply" "$RELAXF"
 wait_out true true 0
+echo '{"ttl": 600}' > "$STUB_DIR/dt/out-ttl"
 OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 DNS_CAA=yes')"
 case "$OUT" in *"DNS_CAA=yes must be true or false"*rc=1) t_pass "config apply flip: DNS_CAA must be true or false" ;; *) t_fail "flip DNS_CAA=yes: $OUT" ;; esac
 expect_eq "config apply flip: a bad DNS_CAA refuses before Traefik is stopped" "$(cat "$STUB_DIR/dt/argv" 2>/dev/null | grep -c 'stop traefik' || true)" 0
@@ -2399,7 +2493,7 @@ OUT="$(flip 'export DNS_PROVIDER=hetzner HETZNER_API_KEY=legacy-0123456789 HETZN
 case "$OUT" in *"HETZNER_API_TOKEN is set"*rc=1) t_pass "config apply: hetzner with HETZNER_API_TOKEN refused" ;; *) t_fail "hetzner + token: $OUT" ;; esac
 OUT="$(flip 'export DNS_PROVIDER=hetzner-cloud HETZNER_API_KEY=legacy-0123456789 HETZNER_API_TOKEN=cloud-0123456789')"
 case "$OUT" in *"HETZNER_API_KEY (the legacy DNS API) is set too"*rc=1) t_pass "config apply: hetzner-cloud with HETZNER_API_KEY refused" ;; *) t_fail "hetzner-cloud + key: $OUT" ;; esac
-rm -f "$STUB_DIR/dt/acme-volume" "$STUB_DIR/dt/out-apply"
+rm -f "$STUB_DIR/dt/acme-volume" "$STUB_DIR/dt/out-apply" "$STUB_DIR/dt/out-ttl"
 
 # compose: Traefik's DNS-01 provider falls back to DNS_PROVIDER (F18).
 REAL_DOCKER="$(PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v "^$WORK" | paste -sd: -)" command -v docker || true)"
@@ -2438,9 +2532,20 @@ case "$LINES" in *stale*) t_fail "status: a fresh plan said stale: $LINES" ;; *"
 LINES="$(dt "_st_dns_lines \"\$(_st_dns_json \"\$(jq '.main_fresh = false' '$DNSR')\" https://acme/acct/1 https://acme/acct/1)\"")"
 case "$LINES" in *"! ci.example.org: the DNS plan couldn't be refreshed: the lines below are from x and may be stale"*"✓ ci.example.org: CAA pinned, the CA would issue (as of x, may be stale)"*) t_pass "status: a cached plan is flagged, and so is every clean line" ;; *) t_fail "status stale: $LINES" ;; esac
 case "$LINES" in *"team-b.test: CAA pinned, the CA would issue (as of"*) t_fail "status stale: an enrolled domain flagged: $LINES" ;; *) t_pass "status: only the main plan is flagged stale" ;; esac
+# M13: the lost-account ✗ on stale data says so too.
+LINES="$(dt "_st_dns_lines \"\$(_st_dns_json \"\$(jq '.main_fresh = false | .main.caa.would_issue = false' '$DNSR')\" https://acme/acct/1 https://acme/acct/1)\"")"
+case "$LINES" in *"CAA allows another ACME account than Traefik's — fix: ./portcullis dns setup (as of x, may be stale)"*) t_pass "status: the lost-account line on stale data says so" ;; *) t_fail "status stale lost: $LINES" ;; esac
+# M10: an older domains image refuses --fresh: the cached report, and status
+# says why, never "isn't running".
+cp "$DNSR" "$STUB_DIR/dt/report-out"; touch "$STUB_DIR/dt/report-old"
+SJ="$(dt 'dns_status_json' | head -n1)"
+expect_eq "status: an old image's report → the cached one, image_old, not fresh" "$(printf '%s' "$SJ" | jq -c '[.image_old, .main_fresh]')" '[true,false]'
+LINES="$(dt "_st_dns_lines \"\$(_st_dns_json \"\$(dns_status_json)\" https://acme/acct/1 https://acme/acct/1)\"")"
+case "$LINES" in *"isn't running"*) t_fail "status old image: $LINES" ;; *"the domains image is older than this CLI (run ./portcullis up)"*) t_pass "status: an old domains image is named" ;; *) t_fail "status old image: $LINES" ;; esac
+rm -f "$STUB_DIR/dt/report-old" "$STUB_DIR/dt/report-out"
 SD="$(dt "_st_dns_json \"\$(cat '$DNSR')\" https://acme/acct/1 https://acme/acct/1")"
 expect_eq "status --json: dns.main summary from a fixture report" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.main | del(.checks)')" \
-  '{"address_ok":true,"address_unknown":false,"caa_ok":true,"would_issue":true,"dnssec":"unsigned","foreign":1,"problems":0,"name":"ci.example.org","lost_account":false,"fresh":true,"checked_at":"x"}'
+  '{"address_ok":true,"address_unknown":false,"caa_ok":true,"would_issue":true,"dnssec":"unsigned","foreign":1,"problems":0,"name":"ci.example.org","lost_account":false,"fresh":true,"checked_at":"x","image_old":false}'
 expect_eq "status: dnssec bogus is a problem (enrolled domain)" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.domains["team-b.test"] | [.problems, .checks.dnssec, .checks.foreign]')" '[1,0,0]'
 SD="$(dt "_st_dns_json \"\$(jq '.main.caa.would_issue = false' '$DNSR')\" https://acme/acct/1 https://acme/acct/1")"
 expect_eq "status: CAA would_issue false is a problem (even with the URIs equal)" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.main | [.lost_account, .problems]')" '[true,1]'

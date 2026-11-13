@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/libdns/libdns"
 	"github.com/miekg/dns"
 )
 
@@ -197,4 +198,32 @@ func ServedTTL(ctx context.Context, servers []string, name, typ string) (time.Du
 		}
 	}
 	return best, found
+}
+
+// Relaxed reports whether the provider's CAA at name is the CA-only form
+// for issuer: at least one of issuer's issue / issuewild entries, none of
+// them pinned to an account (a relax happened, or nothing was ever
+// pinned).
+func Relaxed(ctx context.Context, p Provider, zone, name, issuer string) (bool, error) {
+	d := bare(name)
+	live, err := providerRecords(ctx, p, dns.Fqdn(zone), d)
+	if err != nil {
+		return false, err
+	}
+	n := 0
+	for _, rr := range pick(live, d, "CAA") {
+		r, err := rr.Parse()
+		if err != nil {
+			continue
+		}
+		c, ok := r.(libdns.CAA)
+		if !ok || !ours(c, issuer) {
+			continue
+		}
+		if _, pinned := parseValue(c.Value).params["accounturi"]; pinned {
+			return false, nil
+		}
+		n++
+	}
+	return n > 0, nil
 }

@@ -21,6 +21,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -106,8 +107,9 @@ const unknownTTL = waitCap - waitMargin
 // the stored TTL (0 or 1 s is "auto" / "the zone default": unknown), or
 // the TTL the authoritative servers serve when longer; unknown and not
 // served = unknownTTL.
-func effectiveTTLs(ctx context.Context, stored map[string]dnsplan.RRset, servers []string) map[string]time.Duration {
+func effectiveTTLs(ctx context.Context, stored map[string]dnsplan.RRset, servers []string) (map[string]time.Duration, []string) {
 	out := map[string]time.Duration{}
+	var unknown []string
 	for k, rs := range stored {
 		ttl := rs.TTL
 		if ttl <= time.Second {
@@ -119,10 +121,26 @@ func effectiveTTLs(ctx context.Context, stored map[string]dnsplan.RRset, servers
 		}
 		if ttl == 0 {
 			ttl = unknownTTL
+			unknown = append(unknown, k)
 		}
 		out[k] = ttl
 	}
-	return out
+	sort.Strings(unknown)
+	return out, unknown
+}
+
+// settlePoint: the write + ttl + the margin; with --settle-after, that
+// one when this write changed nothing (the records are the ones the
+// earlier run wrote), else the later of the two.
+func settlePoint(o waitOpts, ttl time.Duration, writtenAt time.Time, changed bool) time.Time {
+	at := writtenAt.Add(ttl + waitMargin)
+	if o.settleAfter > 0 {
+		after := time.Unix(o.settleAfter, 0)
+		if !changed || after.After(at) {
+			at = after
+		}
+	}
+	return at
 }
 
 // ttlBound: the longest a cache may keep what it had before the write
@@ -165,13 +183,7 @@ func waitApplied(ctx context.Context, e toolEnv, build func(dnsplan.Input) dnspl
 	if o.auto {
 		hardStop = start.Add(waitCap)
 	}
-	settleAt := writtenAt.Add(ttl + waitMargin)
-	if o.settleAfter > 0 {
-		after := time.Unix(o.settleAfter, 0)
-		if !changed || after.After(settleAt) {
-			settleAt = after
-		}
-	}
+	settleAt := settlePoint(o, ttl, writtenAt, changed)
 	rep := &waitReport{TTL: secs(ttl), Pending: []string{}, WrittenAt: writtenAt.Unix()}
 	for {
 		now := toolNow()
@@ -231,13 +243,17 @@ func waitApplied(ctx context.Context, e toolEnv, build func(dnsplan.Input) dnspl
 	}
 }
 
-// progressMessage: the stderr line right after the write.
-func progressMessage(o waitOpts, ttl time.Duration, resolvers []string) string {
+// progressMessage: the stderr line right after the write, before the
+// wait. It ends with "written_at=<unix> settle_at=<unix>" (contract
+// §12.1): the shell saves the settle point from it at once, so an
+// interrupted wait can't lose it.
+func progressMessage(o waitOpts, ttl time.Duration, resolvers []string, writtenAt time.Time, changed bool) string {
 	limit := o.fixed
 	if o.auto {
 		limit = min(ttl+waitMargin, waitCap)
 	}
-	return fmt.Sprintf("domains dns apply: written; waiting up to %s for %s (TTL %d s)", limit, strings.Join(resolvers, ", "), secs(ttl))
+	return fmt.Sprintf("domains dns apply: written; waiting up to %s for %s (TTL %d s); written_at=%d settle_at=%d",
+		limit, strings.Join(resolvers, ", "), secs(ttl), writtenAt.Unix(), settlePoint(o, ttl, writtenAt, changed).Unix())
 }
 
 // waitMessage: the stderr line after a wait that didn't finish. The

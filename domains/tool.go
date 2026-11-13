@@ -196,12 +196,26 @@ func runDNSTool(args []string, e toolEnv) int {
 		if err := checkSets(in.Sets); err != nil {
 			return fail(exitUsage, err)
 		}
+		// Fail closed (I7): a TTL nobody reports can't be a settle point.
 		cur, err := dnsplan.Stored(ctx, write.Provider, write.Zone, spec.Name, in.Sets)
 		if err != nil {
-			return fail(exitFailure, err)
+			return fail(exitFailure, fmt.Errorf("reading the records of %s failed (nothing changed): %w", spec.Name, err))
 		}
 		auth := toolAuthServers(ctx, e.resolvers, write.Zone)
-		return printJSON(e, map[string]int{"ttl": secs(ttlBound(effectiveTTLs(ctx, cur, auth), nil, 0))}, exitOK)
+		eff, unknown := effectiveTTLs(ctx, cur, auth)
+		if len(unknown) > 0 {
+			return fail(exitFailure, unknownTTLError(spec.Name, in.Provider, unknown))
+		}
+		relaxed := false
+		if contains(in.Sets, dnsplan.SetCAA) && spec.Issuer != "" {
+			if relaxed, err = dnsplan.Relaxed(ctx, write.Provider, write.Zone, spec.Name, spec.Issuer); err != nil {
+				return fail(exitFailure, fmt.Errorf("reading the CAA of %s failed (nothing changed): %w", spec.Name, err))
+			}
+		}
+		return printJSON(e, struct {
+			TTL     int  `json:"ttl"`
+			Relaxed bool `json:"caa_relaxed"`
+		}{secs(ttlBound(eff, nil, 0)), relaxed}, exitOK)
 	case "check":
 		pl := build(base)
 		code := exitOK
@@ -237,7 +251,16 @@ func runDNSTool(args []string, e toolEnv) int {
 	if wait.on() {
 		auth = toolAuthServers(ctx, e.resolvers, write.Zone)
 		before, readErr = dnsplan.Stored(ctx, write.Provider, write.Zone, spec.Name, in.Sets)
-		beforeTTL = effectiveTTLs(ctx, before, auth)
+		var unknown []string
+		beforeTTL, unknown = effectiveTTLs(ctx, before, auth)
+		// --settle fails closed before the write (I7): its settle point is
+		// saved and trusted by every rerun, so it must never be a guess.
+		if wait.settle && readErr != nil {
+			return fail(exitFailure, fmt.Errorf("reading the records of %s before the write failed (nothing changed): %w", spec.Name, readErr))
+		}
+		if wait.settle && len(unknown) > 0 {
+			return fail(exitFailure, unknownTTLError(spec.Name, in.Provider, unknown))
+		}
 	}
 	if _, _, err := dnsplan.Apply(ctx, write, in.Sets); err != nil {
 		return fail(exitFailure, err)
@@ -247,12 +270,15 @@ func runDNSTool(args []string, e toolEnv) int {
 	}
 	writtenAt := toolNow()
 	after, err := dnsplan.Stored(ctx, write.Provider, write.Zone, spec.Name, in.Sets)
-	ttl := ttlBound(beforeTTL, effectiveTTLs(ctx, after, auth), dnsplan.NegativeTTL(ctx, auth, e.resolvers, write.Zone))
-	if readErr != nil || err != nil {
+	afterTTL, _ := effectiveTTLs(ctx, after, auth)
+	ttl := ttlBound(beforeTTL, afterTTL, dnsplan.NegativeTTL(ctx, auth, e.resolvers, write.Zone))
+	// A guess only sets how long a plain wait lasts; under --settle the
+	// old records' TTL (read before) is what counts.
+	if (readErr != nil || err != nil) && !wait.settle {
 		ttl = max(ttl, unknownTTL)
 	}
 	changed := readErr != nil || err != nil || !sameRRsets(before, after)
-	fmt.Fprintln(e.stderr, progressMessage(wait, ttl, e.resolvers))
+	fmt.Fprintln(e.stderr, progressMessage(wait, ttl, e.resolvers, writtenAt, changed))
 	// The polls are read-only (public view); the plan printed at the end is
 	// built with the provider, like apply's own (can_write, fix: auto).
 	rep, ok := waitApplied(ctx, e, build, base, in.Sets, wait, ttl, writtenAt, changed)
@@ -262,6 +288,12 @@ func runDNSTool(args []string, e toolEnv) int {
 		code = exitProblem
 	}
 	return printJSON(e, applyOutput{Plan: build(write), Wait: rep}, code)
+}
+
+// unknownTTLError: --settle / ttl refuse a TTL nobody reports.
+func unknownTTLError(name, provider string, keys []string) error {
+	return fmt.Errorf("can't tell how long caches hold %s of %s: %s reports no TTL (0 or 1: \"auto\" / the zone default) and no nameserver serves it — set an explicit TTL at %s (nothing changed)",
+		strings.Join(keys, ", "), name, provider, provider)
 }
 
 // checkSets: apply and ttl need known sets.
