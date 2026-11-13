@@ -775,11 +775,24 @@ def main() -> int:
             # once the refreshed map drops the node (no WireGuard peer in wg here).
             until("alice's open tailnet connection closed (revoked)", lambda: edge_metric("closed", HS, "revoked") > before,
                   25 + 15, every=2)
-            assert time.time() - t0 <= 25 + 15, f"closed after {time.time() - t0:.0f} s (refresh 15 s + 10 s)"
-            r = held_result(held, 120)
-            print(f"    the held tailnet connection: {r}", flush=True)
+            t_closed = time.time() - t0
+            # Contract §3.3: within refresh (15 s) + 10 s; + 5 s for this poll
+            # (every 2 s, each a metrics fetch in a container).
+            assert t_closed <= 25 + 5, f"closed after {t_closed:.0f} s (refresh 15 s + 10 s)"
             until("alice's deleted node denied", lambda: not opens(*ts_get("alice", cookie_file=state["alice_cookie"])), 40, every=2)
-            assert time.time() - t0 <= 25 + 15 + 20, f"took {time.time() - t0:.0f} s (refresh 15 s + 10 s, + a probe)"
+            t_denied = time.time() - t0
+            print(f"    closed after {t_closed:.0f} s, a new request denied after {t_denied:.0f} s", flush=True)
+            assert t_denied <= 25 + 5 + 20, f"took {t_denied:.0f} s (refresh 15 s + 10 s, + one 20 s probe)"
+            # Only now the held client: its FIN can't come back over a
+            # tailnet that dropped the node, so it would sit out its whole
+            # hold; it is stopped, never waited for inside the measured time.
+            held.terminate()
+            try:
+                r = held_result(held, 20)
+            except subprocess.TimeoutExpired:
+                held.kill()
+                r = {"error": "the held client didn't stop"}
+            print(f"    the held tailnet connection: {r}", flush=True)
             state.pop("ts_alice")
         check("tailnet_node_deleted: a deleted Headscale node is denied within refresh + 10 s", tailnet_node_deleted)
 
