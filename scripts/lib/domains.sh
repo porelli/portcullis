@@ -135,13 +135,13 @@ domains_age_keygen() {
   ok "Generated secrets/domains/age.key (encrypts the domains service's DNS credentials; backed up with secrets/)."
 }
 
-# domains_enrolled — false only when the running domains service reports
-# no enrolled domain (unknown — not running, an old image — counts as
-# enrolled: the lookups run).
+# domains_enrolled — true only when the running domains service confirms
+# at least one enrolled domain (unknown — not running, an old image, an
+# odd answer — counts as NOT enrolled: fail closed, no stale address).
 domains_enrolled() {
   local n
-  n="$(dc exec -T domains domains enrolled 2>/dev/null | tr -d '[:space:]')" || return 0
-  [ "$n" != 0 ]
+  n="$(dc exec -T domains domains enrolled 2>/dev/null | tr -d '[:space:]')" || return 1
+  [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ]
 }
 
 # _domains_last <4|6> [<address>] — the last detected address (stored, or
@@ -166,16 +166,18 @@ _domains_last() {
 # enrolled too). An explicit PORTCULLIS_PUBLIC_IPV4 / _IPV6 (environment
 # or .env; an empty _IPV6 = no IPv6) always wins; otherwise
 # public_ip_detect (HTTPS, two services must agree, global unicast only).
-# A lookup that failed keeps the last detected address — only while a
-# domain is enrolled (domains_enrolled): secrets/ restored on a new
-# server must not hand the old server's address to the first enrollment.
+# The last detected address (last-public-ipv4 / -ipv6) is saved, and a
+# failed lookup falls back to it, only while the running domains service
+# confirms an enrolled domain (domains_enrolled; unknown = not enrolled):
+# secrets/ restored on a new server must not hand the old server's
+# address to the first enrollment.
 # No address = the service keeps the records it set and renews
 # certificates, but sets no new records (fail closed). The result is
 # written to secrets/domains/public-ips.env, the domains service's
 # env_file (a manual `docker compose up` gets it too).
 domains_public_ips() {
   local v4="${PORTCULLIS_PUBLIC_IPV4:-}" v6="${PORTCULLIS_PUBLIC_IPV6:-}" enrolled=""
-  # _enrolled — domains_enrolled, asked once and only when a lookup failed.
+  # _enrolled — domains_enrolled, asked once.
   _enrolled() {
     [ -n "$enrolled" ] || { if domains_enrolled; then enrolled=true; else enrolled=false; fi; }
     [ "$enrolled" = true ]
@@ -183,7 +185,7 @@ domains_public_ips() {
   if [ -z "$v4" ]; then
     v4="$(public_ip_detect 4)"
     if [ -n "$v4" ]; then
-      _domains_last 4 "$v4"
+      if _enrolled; then _domains_last 4 "$v4"; fi
     elif _enrolled; then
       v4="$(_domains_last 4)"
       if [ -n "$v4" ]; then
@@ -200,7 +202,7 @@ domains_public_ips() {
     # failure keeps the last detected address instead.
     v6="$(public_ip_detect 6)"
     if [ -n "$v6" ]; then
-      _domains_last 6 "$v6"
+      if _enrolled; then _domains_last 6 "$v6"; fi
     elif _enrolled; then
       v6="$(_domains_last 6)"
       [ -z "$v6" ] || warn "IPv6 detection failed: keeping the last detected address $v6 (set PORTCULLIS_PUBLIC_IPV6= in .env if the server has no IPv6 any more)."

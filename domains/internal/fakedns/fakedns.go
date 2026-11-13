@@ -110,11 +110,11 @@ type Provider struct {
 	DeleteMode string
 }
 
-// porkbunReads: SetMode or DeleteMode "porkbun" also reads records as
-// libdns/porkbun v1.1.0's toLibdnsRecord does: a CAA's content split on
-// the first two spaces, the value kept as is, quotes included
+// porkbunReads: DeleteMode "porkbun" (the whole library) also reads
+// records as libdns/porkbun v1.1.0's toLibdnsRecord does: a CAA's content
+// split on the first two spaces, the value kept as is, quotes included
 // (`0 issue "letsencrypt.org"` reads back as Value "\"letsencrypt.org\"").
-func (p *Provider) porkbunReads() bool { return p.SetMode == "porkbun" || p.DeleteMode == "porkbun" }
+func (p *Provider) porkbunReads() bool { return p.DeleteMode == "porkbun" }
 
 // porkbunCAA is a stored CAA read the porkbun library's way.
 func porkbunCAA(rr libdns.RR) (libdns.Record, bool) {

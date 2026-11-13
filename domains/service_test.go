@@ -2019,3 +2019,44 @@ func TestMainPlanStaleBuildDiscarded(t *testing.T) {
 		t.Fatalf("cached %+v", e.svc.plans[mainPlanKey].plan.Name)
 	}
 }
+
+// TestMainPlanRecheckAge (deploy 2026-11-13, concern 2): the worker
+// rebuilds a main plan that isn't healthy after min(RecheckEvery, 5m)
+// (a negative-cached CAA clears within minutes); a healthy one only
+// every RecheckEvery.
+func TestMainPlanRecheckAge(t *testing.T) {
+	e := newEnv(t, false)
+	cached := func() (time.Time, dnsplan.Plan, bool) {
+		e.svc.mu.Lock()
+		defer e.svc.mu.Unlock()
+		c, ok := e.svc.plans[mainPlanKey]
+		return c.at, c.plan, ok
+	}
+	e.waitFor("the worker's first main plan", 10*time.Second, func() bool { _, _, ok := cached(); return ok })
+	first, pl, _ := cached()
+	if planHealthy(pl) {
+		t.Fatalf("an empty zone's main plan is healthy: %+v", pl.Items)
+	}
+	e.clock.advance(mainRecheckUnhealthy + time.Second)
+	e.waitFor("the unhealthy plan rebuilt after 5 min", 10*time.Second, func() bool { at, _, _ := cached(); return at.After(first) })
+
+	// Healthy: the addresses and the CA-only CAA in place.
+	v := dnsplan.CAAValue("pebble.test", "")
+	e.zone.Set(testMain, libdns.RR{Name: "@", Type: "A", TTL: dnsplan.TTLAddress, Data: "203.0.113.10"},
+		libdns.CAA{Name: "@", TTL: dnsplan.TTLCAA, Tag: "issue", Value: v}.RR(), libdns.CAA{Name: "@", TTL: dnsplan.TTLCAA, Tag: "issuewild", Value: v}.RR())
+	e.zone.Set("*."+testMain, libdns.RR{Name: "*", Type: "A", TTL: dnsplan.TTLAddress, Data: "203.0.113.10"})
+	if code, body := e.do("POST", "/main/dns/refresh", "", true); code != 200 {
+		t.Fatalf("refresh = %d %s", code, body)
+	}
+	healthyAt, pl, _ := cached()
+	if !planHealthy(pl) {
+		t.Fatalf("main plan not healthy: %+v", pl.Items)
+	}
+	e.clock.advance(mainRecheckUnhealthy + time.Second)
+	time.Sleep(10 * e.svc.cfg.Tick)
+	if at, _, _ := cached(); !at.Equal(healthyAt) {
+		t.Fatal("a healthy main plan was rebuilt before RecheckEvery")
+	}
+	e.clock.advance(e.svc.cfg.RecheckEvery)
+	e.waitFor("the healthy plan rebuilt after RecheckEvery", 10*time.Second, func() bool { at, _, _ := cached(); return at.After(healthyAt) })
+}

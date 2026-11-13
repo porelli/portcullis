@@ -750,11 +750,6 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 		var zone string
 		if len(sets) > 0 {
 			written, removed, zone, err = s.applySets(rctx, p, snap, sets, uri)
-			// The cached plan predates the write: dropped (the next read
-			// rebuilds it; a successful step caches a fresh one below).
-			s.mu.Lock()
-			delete(s.plans, name)
-			s.mu.Unlock()
 		}
 		// CAA off: the CAA entries recorded in other zones (the zone found
 		// changed) are removed there too, best effort, and dropped.
@@ -780,6 +775,14 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 			err = s.enableSigning(rctx, snap)
 		}
 		cancel()
+		// The cached plan predates this step's writes (records, other
+		// zones' CAA, signing): dropped (the next read rebuilds it; a
+		// successful step caches a fresh one below).
+		if len(sets) > 0 || len(otherZones) > 0 || snap.SignRequested {
+			s.mu.Lock()
+			delete(s.plans, name)
+			s.mu.Unlock()
+		}
 		// Recorded even on failure (a partial apply may have created
 		// some) and while a DELETE waits, so DELETE removes them.
 		if zone != "" {
@@ -989,13 +992,41 @@ func (s *Service) plan(ctx context.Context, name string, refresh bool) (dnsplan.
 	return pl, nil
 }
 
+// mainRecheckUnhealthy bounds the age of a main plan that isn't healthy
+// (planHealthy): a fix — by hand, or a resolver's negative cache of a
+// fresh CAA expiring (RFC 2308, up to the SOA minimum) — shows within
+// minutes, not RecheckEvery. Public lookups only: cheap.
+const mainRecheckUnhealthy = 5 * time.Minute
+
+// planHealthy: no item above Info and the DNSSEC chain not broken.
+func planHealthy(pl dnsplan.Plan) bool {
+	if pl.DNSSEC.State == dnssec.Bogus || pl.DNSSEC.State == dnssec.DSMismatch {
+		return false
+	}
+	for _, it := range pl.Items {
+		if it.Severity == dnsplan.SevWarning || it.Severity == dnsplan.SevProblem {
+			return false
+		}
+	}
+	return true
+}
+
+// mainMaxAge is how old the cached main plan may get: RecheckEvery when
+// healthy, else min(RecheckEvery, mainRecheckUnhealthy).
+func (s *Service) mainMaxAge(pl dnsplan.Plan) time.Duration {
+	if planHealthy(pl) {
+		return s.cfg.RecheckEvery
+	}
+	return min(s.cfg.RecheckEvery, mainRecheckUnhealthy)
+}
+
 // refreshMainPlan rebuilds the main domain's plan in the background when
-// there is none or it is RecheckEvery old (as enrolled domains' plans are
-// rebuilt by their records check), so every reader sees a fresh plan.
+// there is none or it is too old (mainMaxAge; as enrolled domains' plans
+// are rebuilt by their records check), so every reader sees a fresh plan.
 func (s *Service) refreshMainPlan(ctx context.Context) {
 	s.mu.Lock()
 	c, ok := s.plans[mainPlanKey]
-	if s.mainBuilding || (ok && s.cfg.Now().Sub(c.at) < s.cfg.RecheckEvery) {
+	if s.mainBuilding || (ok && s.cfg.Now().Sub(c.at) < s.mainMaxAge(c.plan)) {
 		s.mu.Unlock()
 		return
 	}

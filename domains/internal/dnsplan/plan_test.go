@@ -98,32 +98,6 @@ func TestBuildAllOK(t *testing.T) {
 	}
 }
 
-// TestBuildPorkbunQuotedCAA (deploy 2026-11-13, BUG 1): libdns/porkbun
-// v1.1.0 reads CAA values with their quotes (the fake's porkbun mode
-// too). Our pin is still ours (CAA ok, nothing to add), another CA's
-// entry is named without quotes.
-func TestBuildPorkbunQuotedCAA(t *testing.T) {
-	e := newPlanEnv(t)
-	e.in.Provider = &fakedns.Provider{Zone: e.zone, ZoneName: pz, SetMode: "porkbun", DeleteMode: "porkbun"}
-	e.ourCAA()
-	e.zone.Set(pd, append(e.zone.Records(pd), libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issue", Value: "digicert.com"}.RR(),
-		libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issuewild", Value: "digicert.com"}.RR())...)
-	p := Build(context.Background(), e.in)
-	c := find(t, p, SetCAA, pd, "CAA", StatusOK)
-	for _, w := range c.Want {
-		if strings.Contains(w, `\"`) {
-			t.Fatalf("nested quotes in want %v", c.Want)
-		}
-	}
-	if len(c.Want) != 4 {
-		t.Fatalf("want %v", c.Want)
-	}
-	f := find(t, p, SetCAA, pd, "CAA", StatusForeign)
-	if strings.Join(f.Steps, "|") != "other CAs may also issue for "+pd+": digicert.com" {
-		t.Fatalf("foreign steps %v", f.Steps)
-	}
-}
-
 func TestBuildMissingAndWrong(t *testing.T) {
 	e := newPlanEnv(t)
 	e.addr(pd, "198.51.100.1")

@@ -1398,42 +1398,54 @@ expect_eq "domains: explicit IPv4 wins over detection" "$(pubips export PORTCULL
 ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.7 https://api6.ipify.org 2a01:4f8::5 https://ipv6.icanhazip.com 2a01:4f8::5
 expect_eq "domains: detected IPv4 + IPv6" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
 
-# A transient IPv6 detection failure keeps the last detected address.
-rm -f "$PORTCULLIS_ROOT/secrets/domains/last-public-ipv6"
-mkdir -p "$PORTCULLIS_ROOT/secrets/domains"
+# The last detected address (last-public-ipv4 / -ipv6) is saved and used
+# only while the running domains service confirms an enrolled domain:
+# secrets/ restored on a new server (the service down, or no domain) must
+# never hand the old server's address to the first enrollment.
+LASTD="$PORTCULLIS_ROOT/secrets/domains"
+mkdir -p "$LASTD"
+rm -f "$LASTD/last-public-ipv4" "$LASTD/last-public-ipv6"
+lastn() { local n=0 f; for f in "$LASTD"/last-public-*; do [ -e "$f" ] && n=$((n + 1)); done; echo "$n"; }
+# Not running (no stub file) / no domain: a successful lookup saves nothing.
 ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.7 https://api6.ipify.org 2a01:4f8::5 https://ipv6.icanhazip.com 2a01:4f8::5
+expect_eq "domains: service down, detected IPv4 + IPv6 published" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
+expect_eq "domains: service down, no last-* written" "$(lastn)" 0
+echo 0 > "$STUB_DIR/enrolled"
+expect_eq "domains: no enrolled domain, detected addresses published" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
+expect_eq "domains: no enrolled domain, no last-* written" "$(lastn)" 0
+# Enrolled: a successful lookup saves them.
+echo 2 > "$STUB_DIR/enrolled"
 pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6 >/dev/null
+expect_eq "domains: enrolled, last-* saved" "$(cat "$LASTD/last-public-ipv4")/$(cat "$LASTD/last-public-ipv6")" "198.51.99.7/2a01:4f8::5"
+# Enrolled, a transient IPv6 / IPv4 detection failure keeps the last address.
 ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.7
-expect_eq "domains: IPv6 detection failure keeps the last address" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
+expect_eq "domains: enrolled, IPv6 detection failure keeps the last address" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
 expect_eq "domains: explicit empty IPv6 still means none" "$(pubips export PORTCULLIS_PUBLIC_IPV4=203.0.113.9 PORTCULLIS_PUBLIC_IPV6=)" "203.0.113.9/"
-
-# A failed IPv4 lookup keeps the last detected address too (final review I1).
 ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.8
-expect_eq "domains: IPv4 detection failure keeps the last address" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
+expect_eq "domains: enrolled, IPv4 detection failure keeps the last address" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
 expect_eq "domains: the env file has the kept addresses" "$(cat "$PORTCULLIS_ROOT/secrets/domains/public-ips.env")" "DOMAINS_PUBLIC_IPV4=198.51.99.7
 DOMAINS_PUBLIC_IPV6=2a01:4f8::5"
-# No enrolled domain (the service says 0): the lookups still run — the
-# domains service's main-domain plan checks A/AAAA against them (deploy
-# 2026-11-13, BUG 2) — but a failed one publishes NO address, never the
-# last detected one (secrets/ restored on a new server would publish the
-# old server's address at the first enrollment), unless .env sets it.
+# A restored secrets/ (last-* present), the service down, failed lookups:
+# no address at all (fail closed), never the old server's.
+rm -f "$STUB_DIR/enrolled"
+ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.8
+expect_eq "domains: restored secrets/, service down, failed lookups = no address" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6 | tail -n1)" "/"
+expect_eq "domains: restored secrets/, service down: empty env file" "$(cat "$PORTCULLIS_ROOT/secrets/domains/public-ips.env")" "DOMAINS_PUBLIC_IPV4=
+DOMAINS_PUBLIC_IPV6="
+# No enrolled domain (the service says 0): the lookups still run (the
+# main-domain plan checks A/AAAA against them, deploy 2026-11-13 BUG 2);
+# a failed one publishes no address either.
 echo 0 > "$STUB_DIR/enrolled"
 : > "$STUB_DIR/ip-calls"
 ipans https://api.ipify.org 198.51.99.20 https://ipv4.icanhazip.com 198.51.99.20
 expect_eq "domains: no enrolled domain = lookups run, detected IPv4 published" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6 | tail -n1)" "198.51.99.20/"
 expect_ok "domains: no enrolled domain = IPv4 and IPv6 looked up" sh -c "grep -q api.ipify.org '$STUB_DIR/ip-calls' && grep -q api6.ipify.org '$STUB_DIR/ip-calls'"
-expect_eq "domains: no enrolled domain, the env file has the detected IPv4" "$(cat "$PORTCULLIS_ROOT/secrets/domains/public-ips.env")" "DOMAINS_PUBLIC_IPV4=198.51.99.20
-DOMAINS_PUBLIC_IPV6="
+expect_eq "domains: no enrolled domain, the last address untouched" "$(cat "$LASTD/last-public-ipv4")" "198.51.99.7"
 ipans https://api.ipify.org 198.51.99.20 https://ipv4.icanhazip.com 198.51.99.21
 expect_eq "domains: no enrolled domain, failed lookups = no address (not the last one)" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6 | tail -n1)" "/"
-expect_eq "domains: failed lookups without a domain write empty addresses" "$(cat "$PORTCULLIS_ROOT/secrets/domains/public-ips.env")" "DOMAINS_PUBLIC_IPV4=
-DOMAINS_PUBLIC_IPV6="
 : > "$STUB_DIR/ip-calls"
 expect_eq "domains: no enrolled domain, .env set = .env" "$(pubips export PORTCULLIS_PUBLIC_IPV4=203.0.113.44 PORTCULLIS_PUBLIC_IPV6=2a01:4f8::44 | tail -n1)" "203.0.113.44/2a01:4f8::44"
 expect_eq "domains: .env set = no lookups" "$(wc -l < "$STUB_DIR/ip-calls" | tr -d ' ')" 0
-ipans https://api.ipify.org 198.51.99.20 https://ipv4.icanhazip.com 198.51.99.20
-echo 2 > "$STUB_DIR/enrolled"
-expect_eq "domains: enrolled domains = lookups" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.20/2a01:4f8::5"
 rm -f "$STUB_DIR/enrolled"
 
 # ══ backup: hub_secrets volume ═════════════════════════════
