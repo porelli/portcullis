@@ -50,7 +50,8 @@ done
 KEY="$(tail -n1 "$RUNNER_TEMP/hs-api-key")"; echo "::add-mask::$KEY"
 printf '%s\n' "$KEY" > "$RUNNER_TEMP/hs-api-key"
 echo "E2E_HS_API_KEY_FILE=$RUNNER_TEMP/hs-api-key" >> "$GITHUB_ENV"
-KEY="$KEY" jq -n '{values: {api_key: env.KEY}}' | hubc PUT /api/instances/headscale/settings -d @- > /tmp/code
+# A secret setting: the Hub's secrets form (contract §13.12), on stdin only.
+KEY="$KEY" jq -n '{secrets: {api_key: {value: env.KEY}}}' | hubc PUT /api/instances/headscale/settings -d @- > /tmp/code
 case "$(cat /tmp/code)" in 200|202) ;; *) echo "FAIL: headscale api_key: $(cat /tmp/code) $(cat /tmp/hub.out)"; exit 1 ;; esac
 code=$(hubc PUT /api/instances/headscale/vpn-provider -d '{"wired": true, "refresh": "15s"}')
 case "$code" in 200|202) ;; *) echo "FAIL: wire headscale: $code $(cat /tmp/hub.out)"; exit 1 ;; esac

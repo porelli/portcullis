@@ -188,9 +188,7 @@ func (e *Edge) relieve(provider string) {
 	}
 	e.mu.Unlock()
 	for _, s := range victims {
-		if s.close() {
-			e.closed.WithLabelValues(provider, ClosedPressure).Inc()
-		}
+		s.close(func() { e.closed.WithLabelValues(provider, ClosedPressure).Inc() })
 	}
 }
 
@@ -252,11 +250,16 @@ type session struct {
 	once sync.Once
 }
 
-// close closes both conns once; true for the call that did it.
-func (s *session) close() bool {
+// close closes both conns once; true for the call that did it. counted,
+// if set, runs first (the metric), so a close a client can observe is
+// always counted already.
+func (s *session) close(counted ...func()) bool {
 	did := false
 	s.once.Do(func() {
 		did = true
+		for _, f := range counted {
+			f()
+		}
 		s.a.Close()
 		s.b.Close()
 	})
@@ -536,9 +539,7 @@ func (e *Edge) Revalidate() {
 	}
 	e.mu.Unlock()
 	for _, v := range vs {
-		if v.s.close() {
-			e.closed.WithLabelValues(v.s.provider, v.reason).Inc()
-		}
+		v.s.close(func() { e.closed.WithLabelValues(v.s.provider, v.reason).Inc() })
 	}
 }
 

@@ -680,7 +680,8 @@ def main() -> int:
 
         def identity_hook_broken():
             needs("hs_wired", "alice_conf", "alice_cookie")
-            hub_ok("PUT", f"/api/instances/{HS}/settings", {"values": {"api_key": ""}})
+            # A secret setting (contract §13.12): cleared, never set as a plain value.
+            hub_ok("PUT", f"/api/instances/{HS}/settings", {"secrets": {"api_key": {"clear": True}}})
             try:
                 until("the tailnet provider stale", lambda: provider(HS).get("stale"), 3 * 60 + 15, every=5)
                 r = tunnel(state["alice_conf"], cookie_file=state["alice_cookie"])
@@ -689,7 +690,7 @@ def main() -> int:
                 key = os.environ.get("E2E_HS_API_KEY_FILE")
                 if key:
                     with open(key) as f:
-                        hub_ok("PUT", f"/api/instances/{HS}/settings", {"values": {"api_key": f.read().strip()}})
+                        hub_ok("PUT", f"/api/instances/{HS}/settings", {"secrets": {"api_key": {"value": f.read().strip()}}})
         check("identity_hook_broken: the API key cleared → the tailnet provider goes stale (≤ 3 min 15 s), the built-in unaffected",
               identity_hook_broken)
 
