@@ -183,7 +183,7 @@ expect_ok   "hub env: domain" grep -qx 'PORTCULLIS_DOMAIN=hub.test' "$HE"
 expect_ok   "hub env: Traefik IP (compose default)" grep -qx 'PORTCULLIS_TRAEFIK_IP=172.31.250.2' "$HE"
 expect_ok   "hub env: VPN client secret by prefix" grep -qx 'HEADSCALE_OIDC_CLIENT_SECRET=hs-secret' "$HE"
 expect_ok   "hub env: the VPN reserved ranges (what wg / group-gate refuse) for the Hub" \
-  grep -qx 'PORTCULLIS_VPN_RESERVED_RANGES=172.16.0.0/12 192.168.0.0/16 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28' "$HE"
+  grep -qx 'PORTCULLIS_VPN_RESERVED_RANGES=172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28' "$HE"
 expect_ok   "hub env: HUB_SHARED_ENV" grep -qx 'MY_APP_VAR=shared' "$HE"
 expect_ok   "hub env: mcp-gate IP (compose default, G42)" grep -qx 'PORTCULLIS_MCP_GATE_IP=172.31.250.3' "$HE"
 expect_fail "hub env: never a core secret" grep -Eq 'pg-secret|hub-secret|kc-secret' "$HE"
@@ -3539,9 +3539,9 @@ vt() {
     dc() {
       echo "dc $*" >> "$L"
       case "$*" in
-        "exec -T hub hub vpn host-info") [ "${VT_HUB_DOWN:-}" != 1 ] || return 1; printf '%s' "${VT_HOSTINFO:-$VT_HOSTINFO_DEFAULT}" ;;
+        "exec -T -u 10001:10001 hub hub vpn host-info") [ "${VT_HUB_DOWN:-}" != 1 ] || return 1; printf '%s' "${VT_HOSTINFO:-$VT_HOSTINFO_DEFAULT}" ;;
         "exec -T wg /wg keypair") printf '{"private_key":"%s","public_key":"%s"}\n' "$VPN_PRIV" "$VPN_PUB" ;;
-        "exec -T hub hub vpn add-device "*) cat >> "$WORK/vt/stdin"; echo '{"address":"10.213.0.5","server_public_key":"U2VydmVy","endpoint":"vpn.example.org:51820","allowed_ips":"10.213.0.1/32","dns":"10.213.0.1","mtu":1280}' ;;
+        "exec -T -u 10001:10001 hub hub vpn add-device "*) cat >> "$WORK/vt/stdin"; echo '{"address":"10.213.0.5","server_public_key":"U2VydmVy","endpoint":"vpn.example.org:51820","allowed_ips":"10.213.0.1/32","dns":"10.213.0.1","mtu":1280}' ;;
         "exec -T wg /wg qr") cat >> "$WORK/vt/qr"; echo QR ;;
         "ps -q --status running wg") echo cid ;;
       esac
@@ -3658,7 +3658,11 @@ expect_eq "vpn add-device: only the public key on the Hub's stdin" "$(cat "$WORK
 expect_eq "vpn add-device: the config has AllowedIPs = 10.213.0.1/32" \
   "$(printf '%s' "$OUT" | grep -cxE 'AllowedIPs = 10\.213\.0\.1/32|Address = 10\.213\.0\.5/32|DNS = 10\.213\.0\.1|PrivateKey = '"$VPN_PRIV"'|Endpoint = vpn\.example\.org:51820|MTU = 1280')" 6
 expect_eq "vpn add-device: the QR code is drawn from the same config on stdin" "$(grep -c '^PrivateKey = ' "$WORK/vt/qr"):$(printf '%s' "$OUT" | grep -cx QR)" "1:1"
-expect_eq "vpn add-device: the Hub call names the user and device" "$(grep -c '^dc exec -T hub hub vpn add-device --user alice --name laptop$' "$WORK/vt/log")" 1
+expect_eq "vpn add-device: the Hub call names the user and device" "$(grep -c '^dc exec -T -u 10001:10001 hub hub vpn add-device --user alice --name laptop$' "$WORK/vt/log")" 1
+expect_eq "vpn add-device: the Hub call is hub vpn as uid 10001 (the Hub's control socket is 0600, its own)" \
+  "$(grep -c '^dc exec .*hub hub vpn' "$WORK/vt/log"):$(grep -c '^dc exec -T -u 10001:10001 hub hub vpn ' "$WORK/vt/log")" "1:1"
+expect_eq "vpn.sh: the Hub is reached only through _vpn_hub" \
+  "$(grep -cE 'exec [^|]*hub hub ' "$HERE/../scripts/lib/vpn.sh")" 1
 expect_ok "vpn add-device: keys stay in variables (no temp file, no -v mount)" bash -c "! grep -nE 'mktemp|> *\"?\\\$[a-z]*(key|kp)|--mount' <(sed -n '/^vpn_add_device()/,/^}/p' '$HERE/../scripts/lib/vpn.sh')"
 
 OUT="$(vt 'vpn_builtin off; vpn_builtin on' 2>&1)"; RC=$?

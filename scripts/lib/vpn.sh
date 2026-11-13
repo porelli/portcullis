@@ -20,8 +20,8 @@
 
 VPN_DEFAULT_PORT=51820
 VPN_DEFAULT_SUBNET="10.213.0.0/22"
-# Reserved for the multi-server link role (contract §16): never the built-in's.
-VPN_LINK_SUBNET="10.214.0.0/24"
+# VPN_LINK_SUBNET (the multi-server link role's 10.214.0.0/24) is in
+# network.sh: it is one of vpn_reserved_ranges.
 # The Hub's default Local networks (contract §14.7): broad private ranges
 # that contain any built-in subnet a site would pick. An overlap with them
 # is only a warning; a Local network an admin entered refuses.
@@ -86,10 +86,17 @@ _vpn_docker_subnets() {
   docker network inspect --format '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' $ids | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' || true
 }
 
+# _vpn_hub <args> — `hub vpn <args>` in the Hub container as its user 10001:
+# the Hub's control socket /tmp/hub-host.sock (0600) answers that uid only.
+# Arguments are names and ids; the public key goes on stdin.
+_vpn_hub() {
+  dc exec -T -u "$CT_UID_HUB:$CT_UID_HUB" hub hub vpn "$@"
+}
+
 # _vpn_host_info — the Hub's `hub vpn host-info` JSON (Local networks,
 # provider ranges, admin_device_seen), or exit 1 when the Hub doesn't answer.
 _vpn_host_info() {
-  dc exec -T hub hub vpn host-info 2>/dev/null
+  _vpn_hub host-info 2>/dev/null
 }
 
 # vpn_overlaps <subnet> <docker subnets> <host-info json> — one line
@@ -101,11 +108,11 @@ vpn_overlaps() {
   done
   ! _overlaps "$sub" "$VPN_LINK_SUBNET" || echo "$VPN_LINK_SUBNET (reserved for server links)"
   # What wg and group-gate refuse in vpn.json (vpn_reserved_ranges): the
-  # VPN networks are reported above.
+  # VPN networks and the link subnet are reported above.
   for c in $(vpn_reserved_ranges); do
     case "$c" in
       172.16.0.0/12|192.168.0.0/16) ! _overlaps "$sub" "$c" || echo "$c (Docker's default address pool)" ;;
-      "$(vpn_net)"|"$(vpn_edge_subnet)") ;;
+      "$(vpn_net)"|"$(vpn_edge_subnet)"|"$VPN_LINK_SUBNET") ;;
       *) ! _overlaps "$sub" "$c" || echo "$c (a Portcullis core network)" ;;
     esac
   done
@@ -427,7 +434,7 @@ vpn_add_device() {
   [ -n "$(dc ps -q --status running wg 2>/dev/null)" ] || fail "wg isn't running: ./portcullis vpn init first"
   kp="$(dc exec -T wg /wg keypair)" || fail "wg keypair failed"
   pub="$(KP="$kp" jq -rn 'env.KP | fromjson | .public_key')" || { unset kp; fail "wg keypair: unexpected output"; }
-  cfg="$(printf '%s\n' "$pub" | dc exec -T hub hub vpn add-device --user "$user" --name "$name")" \
+  cfg="$(printf '%s\n' "$pub" | _vpn_hub add-device --user "$user" --name "$name")" \
     || { unset kp; fail "the Hub refused the device (see above)"; }
   conf="$(KP="$kp" CFG="$cfg" jq -rn '
     (env.KP | fromjson) as $k | (env.CFG | fromjson) as $c
@@ -443,7 +450,7 @@ vpn_devices() {
   local user="$1" json="$2" out
   local -a args=()
   [ -z "$user" ] || args=(--user "$user")
-  out="$(dc exec -T hub hub vpn devices "${args[@]}")" || fail "the Hub didn't list the devices (is it running?)"
+  out="$(_vpn_hub devices "${args[@]}")" || fail "the Hub didn't list the devices (is it running?)"
   if [ "$json" = true ]; then printf '%s\n' "$out"; return 0; fi
   printf '%s' "$out" | jq -r '
     (if type == "array" then . else (.devices // []) end) as $d
@@ -454,7 +461,7 @@ vpn_devices() {
 }
 
 vpn_revoke() {
-  dc exec -T hub hub vpn revoke "$1" || fail "the Hub didn't remove device $1"
+  _vpn_hub revoke "$1" || fail "the Hub didn't remove device $1"
   ok "Removed VPN device $1."
 }
 

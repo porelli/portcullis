@@ -4030,13 +4030,13 @@ class VpnTest(GateTest):
         # Security ruling: a provider range overlapping a Docker or core
         # network refuses the whole file (the edge and group-gate deny).
         good = vpn_doc()
-        for r in ("172.31.250.0/24", "172.31.254.0/26", "172.17.0.0/16", "172.16.0.0/12", "192.168.10.0/24", "192.168.0.0/16", "172.0.0.0/8"):
+        for r in ("172.31.250.0/24", "172.31.254.0/26", "172.17.0.0/16", "172.16.0.0/12", "192.168.10.0/24", "192.168.0.0/16", "10.214.0.0/24", "10.214.0.128/25", "172.0.0.0/8"):
             with self.subTest(range=r):
                 doc = dict(good, providers=[good["providers"][0], dict(good["providers"][1], ranges=[r])], devices=[])
                 with self.assertRaises(ValueError):
                     gg.parse_vpn_doc(json.loads(json.dumps(doc), object_pairs_hook=gg._vpn_pairs))
         # Docker's default address pools (app-instance networks come from them).
-        self.assertEqual([str(n) for n in gg.VPN_RESERVED[:2]], ["172.16.0.0/12", "192.168.0.0/16"])
+        self.assertEqual([str(n) for n in gg.VPN_RESERVED[:3]], ["172.16.0.0/12", "192.168.0.0/16", "10.214.0.0/24"])
 
     def test_core_hosts_never_vpn_host_keys(self):
         self.assertIsNotNone(gg.validate_vpn_section(dict(BASE["vpn"], hosts={"hub.example.com": {"via": ["*"]}})))

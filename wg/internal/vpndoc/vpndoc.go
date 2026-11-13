@@ -51,13 +51,14 @@ const MaxStaleSpan = 3 * 10 * time.Minute
 
 // reserved are ranges no provider may claim: Docker's default address pools
 // 172.16.0.0/12 and 192.168.0.0/16 (Docker allocates networks, app
-// instances' included, from them) plus the fixed core subnets the service is
+// instances' included, from them), the multi-server link subnet
+// 10.214.0.0/24, plus the fixed core subnets the service is
 // given (Reserve;
 // the Hub refuses the same list first, core.env's
 // PORTCULLIS_VPN_RESERVED_RANGES). A file whose provider range overlaps one is refused
 // whole (security ruling: such an address could arrive from a container,
 // not a tunnel).
-var reserved = []netip.Prefix{netip.MustParsePrefix("172.16.0.0/12"), netip.MustParsePrefix("192.168.0.0/16")}
+var reserved = []netip.Prefix{netip.MustParsePrefix("172.16.0.0/12"), netip.MustParsePrefix("192.168.0.0/16"), netip.MustParsePrefix("10.214.0.0/24")}
 
 // Reserve adds core subnets to the reserved ranges (startup only).
 func Reserve(ps ...netip.Prefix) { reserved = append(reserved, ps...) }

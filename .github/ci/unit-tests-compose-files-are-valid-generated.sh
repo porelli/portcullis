@@ -562,7 +562,7 @@ for over in "" "PORTCULLIS_PROXY_SUBNET=10.80.0.0/24 PORTCULLIS_PROXY_IP_RANGE=1
   # shellcheck disable=SC2086
   READERS="$(env $over docker compose -f docker-compose.yml --profile '*' config --format json \
       | jq -r '.services["group-gate"].environment.GATE_CORE_SUBNETS as $g | .services.wg.environment.WG_CORE_SUBNETS as $w
-               | if $g == $w then "172.16.0.0/12 192.168.0.0/16 " + $g else "MISMATCH" end')"
+               | if $g == $w then "172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 " + $g else "MISMATCH" end')"
   [ "$HUBLIST" = "$READERS" ] || { echo "FAIL: core.env PORTCULLIS_VPN_RESERVED_RANGES ($HUBLIST) != what wg / group-gate refuse ($READERS)"; exit 1; }
 done
 # shellcheck disable=SC2016  # expanded by the inner bash

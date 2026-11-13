@@ -873,7 +873,7 @@ services:
       # invalid = every VPN-only request is denied.
       GATE_VPN_FILE: /vpn-doc/vpn.json
       # Ranges no VPN provider may claim (plus Docker's default pools
-      # 172.16.0.0/12 and 192.168.0.0/16): the fixed core
+      # 172.16.0.0/12 and 192.168.0.0/16, and the link subnet 10.214.0.0/24): the fixed core
       # subnets, = network.sh vpn_reserved_ranges (the Hub's core.env
       # PORTCULLIS_VPN_RESERVED_RANGES; CI compares). vpn.json naming one is
       # refused whole.
@@ -1450,7 +1450,8 @@ services:
       WG_SUBNET: ${PORTCULLIS_VPN_SUBNET:-10.213.0.0/22}
       WG_VPN_ADDR: ${PORTCULLIS_VPN_WG_IP:-172.31.254.3}
       WG_EDGE_ADDR: ${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}
-      # Ranges no provider may claim (plus 172.16.0.0/12 and 192.168.0.0/16;
+      # Ranges no provider may claim (plus 172.16.0.0/12, 192.168.0.0/16 and
+      # the link subnet 10.214.0.0/24;
       # = GATE_CORE_SUBNETS).
       WG_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28}"
       WG_TRAEFIK: ${PORTCULLIS_VPN_EDGE_TRAEFIK_IP:-172.31.254.66}:8443
