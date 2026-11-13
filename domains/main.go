@@ -76,8 +76,9 @@ func main() {
 			}
 			return
 		case "enrolled":
-			// How many domains the store holds (./portcullis up skips the
-			// public-address lookups while it is 0).
+			// How many domains the store holds (./portcullis up keeps the
+			// last detected public address after a failed lookup only
+			// while it isn't 0).
 			n, err := enrolledCount(env("DOMAINS_DATA_DIR", "/data"), env("DOMAINS_AGE_KEY_FILE", "/run/portcullis/domains/age.key"))
 			if err != nil {
 				log.Fatal(err)

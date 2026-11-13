@@ -161,50 +161,52 @@ _domains_last() {
 }
 
 # domains_public_ips — the server's public IPv4 / IPv6 for the domains
-# service's A/AAAA records (contract §12.1). An explicit
-# PORTCULLIS_PUBLIC_IPV4 / _IPV6 (environment or .env; an empty _IPV6 =
-# no IPv6) always wins; otherwise public_ip_detect (HTTPS, two services
-# must agree, global unicast only) — skipped while no domain is enrolled
-# (domains_enrolled): then no address unless .env sets one. A lookup that
-# ran and failed keeps the last detected address. No address = the service
-# keeps the records it set and renews certificates, but sets no new
-# records (fail closed). The result is
+# service: its enrolled domains' A/AAAA records (contract §12.1) and the
+# main-domain plan's A/AAAA check (so the lookups run with no domain
+# enrolled too). An explicit PORTCULLIS_PUBLIC_IPV4 / _IPV6 (environment
+# or .env; an empty _IPV6 = no IPv6) always wins; otherwise
+# public_ip_detect (HTTPS, two services must agree, global unicast only).
+# A lookup that failed keeps the last detected address — only while a
+# domain is enrolled (domains_enrolled): secrets/ restored on a new
+# server must not hand the old server's address to the first enrollment.
+# No address = the service keeps the records it set and renews
+# certificates, but sets no new records (fail closed). The result is
 # written to secrets/domains/public-ips.env, the domains service's
 # env_file (a manual `docker compose up` gets it too).
 domains_public_ips() {
-  local v4="${PORTCULLIS_PUBLIC_IPV4:-}" v6="${PORTCULLIS_PUBLIC_IPV6:-}" lookup=true
-  if [ -z "$v4" ] || [ -z "${PORTCULLIS_PUBLIC_IPV6+x}" ]; then
-    domains_enrolled || lookup=false
-  fi
+  local v4="${PORTCULLIS_PUBLIC_IPV4:-}" v6="${PORTCULLIS_PUBLIC_IPV6:-}" enrolled=""
+  # _enrolled — domains_enrolled, asked once and only when a lookup failed.
+  _enrolled() {
+    [ -n "$enrolled" ] || { if domains_enrolled; then enrolled=true; else enrolled=false; fi; }
+    [ "$enrolled" = true ]
+  }
   if [ -z "$v4" ]; then
-    [ "$lookup" = false ] || v4="$(public_ip_detect 4)"
+    v4="$(public_ip_detect 4)"
     if [ -n "$v4" ]; then
       _domains_last 4 "$v4"
-    elif [ "$lookup" = true ]; then
-      # Only a lookup that ran and failed falls back to the last address
-      # (a skipped one publishes none: secrets/ restored on a new server
-      # must not hand the old server's address to the first enrollment).
+    elif _enrolled; then
       v4="$(_domains_last 4)"
       if [ -n "$v4" ]; then
         warn "IPv4 detection failed: keeping the last detected address $v4 (set PORTCULLIS_PUBLIC_IPV4 in .env if it changed)."
       else
         warn "Could not detect the public IPv4 reliably (two HTTPS services must agree on a global address): added domains keep their records but get no new ones until it is known — set PORTCULLIS_PUBLIC_IPV4 in .env."
       fi
+    else
+      warn "Could not detect the public IPv4 reliably (two HTTPS services must agree on a global address): the A/AAAA records of ${PORTCULLIS_DOMAIN:-the domain} can't be checked — set PORTCULLIS_PUBLIC_IPV4 in .env."
     fi
   fi
   if [ -z "${PORTCULLIS_PUBLIC_IPV6+x}" ]; then
     # No IPv6 means "remove the AAAA records": a transient detection
     # failure keeps the last detected address instead.
-    v6=""
-    [ "$lookup" = false ] || v6="$(public_ip_detect 6)"
+    v6="$(public_ip_detect 6)"
     if [ -n "$v6" ]; then
       _domains_last 6 "$v6"
-    elif [ "$lookup" = true ]; then
+    elif _enrolled; then
       v6="$(_domains_last 6)"
       [ -z "$v6" ] || warn "IPv6 detection failed: keeping the last detected address $v6 (set PORTCULLIS_PUBLIC_IPV6= in .env if the server has no IPv6 any more)."
     fi
   fi
-  [ "$lookup" = true ] || info "No added domain: public address lookups skipped (run ./portcullis up again after adding the first domain)."
+  unset -f _enrolled
   export PORTCULLIS_PUBLIC_IPV4="$v4" PORTCULLIS_PUBLIC_IPV6="$v6"
   (umask 077 && printf 'DOMAINS_PUBLIC_IPV4=%s\nDOMAINS_PUBLIC_IPV6=%s\n' "$v4" "$v6" > "$(_domains_dir)/public-ips.env")
 }
