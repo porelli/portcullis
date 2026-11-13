@@ -31,6 +31,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -158,6 +159,24 @@ type result struct {
 	Rcode     string            `json:"rcode,omitempty"`
 	AD        bool              `json:"ad,omitempty"`
 	Error     string            `json:"error,omitempty"`
+	// --hold: the connection was closed by the far end (the edge, or
+	// anything on the way) HeldS seconds after the response, or not
+	// within --hold (Closed false).
+	Closed bool    `json:"closed,omitempty"`
+	HeldS  float64 `json:"held_s,omitempty"`
+}
+
+// closeConn tells when the HTTP transport closes its connection (it does
+// when the far end closes an idle keep-alive connection).
+type closeConn struct {
+	net.Conn
+	once   sync.Once
+	closed chan struct{}
+}
+
+func (c *closeConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
 }
 
 func main() { os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)) }
@@ -174,6 +193,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	dnsName := fs.String("dns", "", "a name to look up through the tunnel")
 	dnsType := fs.String("type", "A", "A or AAAA")
 	dnsServer := fs.String("server", "", "resolver (default: the config's DNS, port 53)")
+	hold := fs.Duration("hold", 0, "after the --get response, keep the connection open this long and report when the far end closes it")
 	var resolve multi
 	fs.Var(&resolve, "resolve", "host:port:addr (repeatable), like curl")
 	if err := fs.Parse(args); err != nil {
@@ -229,7 +249,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		return emit(0)
 	}
-	if err := fetch(ctx, tnet, *get, res, *caFile, *headerFile, &out); err != nil {
+	if err := fetch(ctx, tnet, *get, res, *caFile, *headerFile, *hold, &out); err != nil {
 		out.Error = err.Error()
 		return emit(3)
 	}
@@ -292,7 +312,7 @@ func waitHandshake(dev *device.Device, tnet *netstack.Net, peer netip.Addr, wait
 	return false
 }
 
-func fetch(ctx context.Context, tnet *netstack.Net, url string, res map[string]string, caFile, headerFile string, out *result) error {
+func fetch(ctx context.Context, tnet *netstack.Net, url string, res map[string]string, caFile, headerFile string, hold time.Duration, out *result) error {
 	if !strings.HasPrefix(url, "https://") {
 		return errors.New("--get: an https:// URL")
 	}
@@ -306,12 +326,18 @@ func fetch(ctx context.Context, tnet *netstack.Net, url string, res map[string]s
 			return errors.New("--ca-file: no PEM certificates")
 		}
 	}
+	var held *closeConn
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
 			if to, ok := res[addr]; ok {
 				addr = to
 			}
-			return tnet.DialContext(ctx, "tcp", addr)
+			c, err := tnet.DialContext(ctx, "tcp", addr)
+			if err != nil {
+				return nil, err
+			}
+			held = &closeConn{Conn: c, closed: make(chan struct{})}
+			return held, nil
 		},
 		TLSClientConfig:   &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
 		ForceAttemptHTTP2: false,
@@ -338,6 +364,8 @@ func fetch(ctx context.Context, tnet *netstack.Net, url string, res map[string]s
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
+	io.Copy(io.Discard, resp.Body) // all of it: the connection goes back to the idle pool
+	resp.Body.Close()
 	out.Status = resp.StatusCode
 	out.Location = resp.Header.Get("Location")
 	out.Headers = map[string]string{}
@@ -347,6 +375,15 @@ func fetch(ctx context.Context, tnet *netstack.Net, url string, res map[string]s
 		}
 	}
 	out.Body = string(body)
+	if hold > 0 && held != nil {
+		t0 := time.Now()
+		select {
+		case <-held.closed:
+			out.Closed = true
+		case <-time.After(hold):
+		}
+		out.HeldS = time.Since(t0).Seconds()
+	}
 	return nil
 }
 

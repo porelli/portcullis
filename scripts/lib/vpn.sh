@@ -144,6 +144,7 @@ vpn_overlaps() {
   for c in $(vpn_reserved_ranges); do
     case "$c" in
       172.16.0.0/12|192.168.0.0/16) ! _overlaps "$sub" "$c" || echo "$c (Docker's default address pool)" ;;
+      10.88.0.0/16|10.89.0.0/16) ! _overlaps "$sub" "$c" || echo "$c (Podman's address pool)" ;;
       "$(vpn_net)"|"$(vpn_edge_subnet)"|"$VPN_LINK_SUBNET") ;;
       *) ! _overlaps "$sub" "$c" || echo "$c (a Portcullis core network)" ;;
     esac
@@ -398,6 +399,10 @@ vpn_init() {
         *"(Docker's default address pool)"*)
           printf "172.16.0.0/12 and 192.168.0.0/16 are reserved: Docker allocates networks (app instances' too) from these ranges, so an address there could be a container's, not a VPN device's.\n" >&2 ;;
       esac
+      case "$conflicts" in
+        *"(Podman's address pool)"*)
+          printf "10.88.0.0/16 and 10.89.0.0/16 are reserved: Podman allocates networks (app instances' too) from these ranges, so an address there could be a container's, not a VPN device's.\n" >&2 ;;
+      esac
       if [ -n "$suggestion" ]; then
         printf 'Try: ./portcullis vpn init --subnet %s\n' "$suggestion" >&2
       fi
@@ -444,6 +449,9 @@ vpn_mode() {
 
 vpn_builtin() {
   local key="$PORTCULLIS_ROOT/secrets/wg/people.key"
+  # Naming wg to compose activates its profile: without wg in
+  # COMPOSE_PROFILES it would run outside the stack's checks.
+  _vpn_profiles_has_wg || fail "the VPN service isn't set up: run ./portcullis vpn init first"
   case "$1" in
     on)
       [ -s "$key" ] || { info "Generating the built-in VPN's key..."; vpn_genkey; } ;;

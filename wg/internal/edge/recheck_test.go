@@ -309,3 +309,88 @@ func TestEdgeValidUntilClosesAndRejects(t *testing.T) {
 		t.Fatalf("rejected{expired} = %v", v)
 	}
 }
+
+// TestEdgeReboundClosesOldIngress: when the Hub moves a provider's
+// gateway (or re-slots its edge port), sessions admitted through the old
+// ingress close on the next re-check.
+func TestEdgeReboundClosesOldIngress(t *testing.T) {
+	f := newFixture(t, docJSON("127.0.0.1", false))
+	c, br := f.open("100.64.0.7:40000")
+	f.e.Revalidate()
+	f.ping(c, br) // the same gateway: kept
+	f.doc.Store(mustDoc(t, docJSON("127.0.0.2", false)))
+	f.e.Revalidate()
+	closedSoon(t, c, br)
+	if v := f.closed("rebound"); v != 1 {
+		t.Fatalf("closed{rebound} = %v", v)
+	}
+	f2 := newFixture(t, docJSON("127.0.0.1", false))
+	c2, br2 := f2.open("100.64.0.7:40000")
+	f2.doc.Store(mustDoc(t, strings.Replace(docJSON("127.0.0.1", false), `"edge_port":9001`, `"edge_port":9002`, 1)))
+	f2.e.Revalidate()
+	closedSoon(t, c2, br2)
+	if v := f2.closed("rebound"); v != 1 {
+		t.Fatalf("closed{rebound} after a re-slot = %v", v)
+	}
+}
+
+// TestEdgeCaps: past the per-client cap a new connection is rejected
+// (busy); one closes, a new one is admitted again. The provider cap counts
+// connections from accept, before their header.
+func TestEdgeCaps(t *testing.T) {
+	f := newFixture(t, docJSON("127.0.0.1", false))
+	f.e.MaxPerClient = 2
+	c1, br1 := f.open("100.64.0.7:40001")
+	f.open("100.64.0.7:40002")
+	raw := func(src string) (net.Conn, *bufio.Reader) {
+		c, err := net.Dial("tcp4", f.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		c.Write(v2Header(src))
+		c.Write([]byte("ping\n"))
+		return c, bufio.NewReader(c)
+	}
+	c3, br3 := raw("100.64.0.7:40003")
+	closedSoon(t, c3, br3)
+	if v := testutil.ToFloat64(f.e.rejected.WithLabelValues("hs", "busy")); v != 1 {
+		t.Fatalf("rejected{busy} = %v", v)
+	}
+	c1.Close()
+	closedSoon(t, c1, br1)
+	deadline := time.Now().Add(2 * time.Second)
+	for f.e.Sessions() != 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	f.open("100.64.0.7:40004") // a slot again
+
+	g := newFixture(t, docJSON("127.0.0.1", false))
+	g.e.MaxPerProvider = 1
+	idle, err := net.Dial("tcp4", g.addr) // accepted, no header yet: it counts
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer idle.Close()
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		g.e.capMu.Lock()
+		n := g.e.perProv["hs"]
+		g.e.capMu.Unlock()
+		if n == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c, err := net.Dial("tcp4", g.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Write(v2Header("100.64.0.7:40005"))
+	c.Write([]byte("ping\n"))
+	closedSoon(t, c, bufio.NewReader(c))
+	if v := testutil.ToFloat64(g.e.rejected.WithLabelValues("hs", "busy")); v != 1 {
+		t.Fatalf("provider cap: rejected{busy} = %v", v)
+	}
+}

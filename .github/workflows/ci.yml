@@ -4287,8 +4287,19 @@ jobs:
           for i in $(seq 1 30); do [ -S "$XDG_RUNTIME_DIR/bus" ] && break; [ "$i" -eq 30 ] && { echo "FAIL: no user manager for $me"; exit 1; }; sleep 1; done
           export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
           { echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"; echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"; } >> "$GITHUB_ENV"
+          # Podman's address pools, pinned (I3 ruling; runtime_host_checks
+          # refuses init / up without the exact line): every network lies in
+          # 10.88.0.0/16 (the default one) or 10.89.0.0/16, both reserved
+          # against VPN provider ranges.
+          mkdir -p "$HOME/.config/containers"
+          [ ! -f "$HOME/.config/containers/containers.conf" ] || { echo "FAIL: an existing containers.conf on the runner"; cat "$HOME/.config/containers/containers.conf"; exit 1; }
+          printf '[network]\ndefault_subnet_pools = [{"base" = "10.89.0.0/16", "size" = 24}]\n' > "$HOME/.config/containers/containers.conf"
           podman system migrate
           systemctl --user enable --now podman.socket podman-restart.service
+          podman network create ci-pool-probe >/dev/null
+          probe="$(podman network inspect ci-pool-probe --format '{{range .Subnets}}{{.Subnet}} {{end}}')"
+          podman network rm ci-pool-probe >/dev/null
+          case "$probe" in 10.89.*) echo "Podman networks come from 10.89.0.0/16 ($probe)" ;; *) echo "FAIL: a new Podman network got $probe, not 10.89.0.0/16"; exit 1 ;; esac
           DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock"
           export DOCKER_HOST
           echo "DOCKER_HOST=$DOCKER_HOST" >> "$GITHUB_ENV"

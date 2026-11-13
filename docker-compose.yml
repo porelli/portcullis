@@ -877,11 +877,13 @@ services:
       # invalid = every VPN-only request is denied.
       GATE_VPN_FILE: /vpn-doc/vpn.json
       # Ranges no VPN provider may claim (plus Docker's default pools
-      # 172.16.0.0/12 and 192.168.0.0/16, and the link subnet 10.214.0.0/24): the fixed core
+      # 172.16.0.0/12 and 192.168.0.0/16, the link subnet 10.214.0.0/24 and,
+      # under podman, Podman's pools 10.88.0.0/16 10.89.0.0/16 —
+      # PORTCULLIS_VPN_RUNTIME_POOLS, exported by the CLI): the fixed core
       # subnets, = network.sh vpn_reserved_ranges (the Hub's core.env
       # PORTCULLIS_VPN_RESERVED_RANGES; CI compares). vpn.json naming one is
       # refused whole.
-      GATE_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28}"
+      GATE_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28} ${PORTCULLIS_VPN_RUNTIME_POOLS:-}"
       # Required: core hosts are <sub>.<PORTCULLIS_DOMAIN> (map.conf) and
       # app hosts <label>.<PORTCULLIS_DOMAIN> or on an enrolled domain
       # (policy v5 extra_domains); any other X-Forwarded-Host is denied.
@@ -1455,9 +1457,10 @@ services:
       WG_VPN_ADDR: ${PORTCULLIS_VPN_WG_IP:-172.31.254.3}
       WG_EDGE_ADDR: ${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}
       # Ranges no provider may claim (plus 172.16.0.0/12, 192.168.0.0/16 and
-      # the link subnet 10.214.0.0/24;
+      # the link subnet 10.214.0.0/24; under podman ending in Podman's pools
+      # 10.88.0.0/16 10.89.0.0/16, PORTCULLIS_VPN_RUNTIME_POOLS from the CLI;
       # = GATE_CORE_SUBNETS).
-      WG_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28}"
+      WG_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28} ${PORTCULLIS_VPN_RUNTIME_POOLS:-}"
       WG_TRAEFIK: ${PORTCULLIS_VPN_EDGE_TRAEFIK_IP:-172.31.254.66}:8443
       WG_DNS_UPSTREAM: ${PORTCULLIS_VPN_DNS_UPSTREAM:-1.1.1.1,9.9.9.9}
       WG_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}

@@ -137,7 +137,13 @@ _rt_selinux_enforcing() {
 runtime_export() {
   local sock files f
   local -a add
+  # Podman's address pools (10.88.0.0/16, its default network, and the
+  # pinned 10.89.0.0/16): reserved against VPN provider ranges by wg and
+  # group-gate (compose appends them to WG_CORE_SUBNETS / GATE_CORE_SUBNETS)
+  # and by the Hub (vpn_reserved_ranges). Never taken from outside.
+  export PORTCULLIS_VPN_RUNTIME_POOLS=""
   _rt_is_podman || return 0
+  export PORTCULLIS_VPN_RUNTIME_POOLS="$RT_PODMAN_POOLS"
   sock="$(runtime_podman_socket)"
   if [ -n "${DOCKER_HOST:-}" ] && [ "$DOCKER_HOST" != "unix://$sock" ]; then
     fail "DOCKER_HOST=$DOCKER_HOST, but CONTAINER_RUNTIME=podman talks to unix://$sock: unset DOCKER_HOST"
@@ -243,6 +249,36 @@ _ver_ge() {
 
 _rt_chk() { printf '%s\t%s\n' "$1" "$2"; }
 
+# Podman's address pools, pinned (I3 ruling): every network Podman creates
+# lies in its default network 10.88.0.0/16 or in 10.89.0.0/16 (/24s), both
+# reserved against VPN provider ranges (vpn_reserved_ranges). Its stock
+# pools reach 10.89–10.255.
+RT_POOL_LINE='default_subnet_pools = [{"base" = "10.89.0.0/16", "size" = 24}]'
+RT_PODMAN_POOLS="10.88.0.0/16 10.89.0.0/16"
+
+# _rt_pool_check — one host-check line: the operator's containers.conf
+# ([network], RT_CONTAINERS_CONF_DIR, default ~/.config/containers) sets
+# exactly RT_POOL_LINE, and no containers.conf.d drop-in sets another.
+_rt_pool_check() {
+  local dir="${RT_CONTAINERS_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/containers}" want got f why=""
+  want="$(printf '%s' "$RT_POOL_LINE" | tr -d ' \t')"
+  got="$(awk '/^[[:space:]]*\[/ { sec = $0; gsub(/[[:space:]]/, "", sec); next }
+              sec == "[network]" && /^[[:space:]]*default_subnet_pools[[:space:]]*=/ { gsub(/[[:space:]]/, ""); print }' \
+         "$dir/containers.conf" 2>/dev/null | tail -n1)"
+  [ "$got" = "$want" ] || why="it isn't set to exactly this"
+  for f in "$dir"/containers.conf.d/*.conf; do
+    [ -f "$f" ] || continue
+    if grep -qE '^[[:space:]]*default_subnet_pools[[:space:]]*=' "$f"; then
+      why="$f overrides it: remove that line"
+    fi
+  done
+  if [ -z "$why" ]; then
+    _rt_chk ok "containers.conf: default_subnet_pools = 10.89.0.0/16 (/24 networks)"
+  else
+    _rt_chk fail "containers.conf: Podman's network pools aren't pinned ($why; they must stay in 10.89.0.0/16, reserved against VPN ranges): add under [network] in $dir/containers.conf: $RT_POOL_LINE"
+  fi
+}
+
 # runtime_host_checks — the host preparation for rootless Podman, one
 # "ok|warn|fail<TAB>text" line per item (fail = a † item: init, up,
 # upgrade and restore refuse). Prints nothing under docker.
@@ -323,6 +359,7 @@ runtime_host_checks() {
     _rt_chk fail "passt is missing (rootless networking): install passt"
   fi
   _rt_apparmor_pasta_check
+  _rt_pool_check
   if v="$(docker compose version --short 2>/dev/null)" && [ -n "$v" ]; then
     _rt_chk ok "docker compose $v"
   else

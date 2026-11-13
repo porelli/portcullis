@@ -37,10 +37,11 @@ const (
 	Stale         = "stale"
 	NoDoc         = "no_doc"
 	Expired       = "expired" // vpn.json past its valid_until
+	Busy          = "busy"    // the provider's or the client's connection cap is reached
 )
 
 // Reasons lists every rejection reason.
-var Reasons = []string{WrongPort, WrongGateway, NoHeader, SlowHeader, OutsideRanges, NotInMap, Stale, NoDoc, Expired}
+var Reasons = []string{WrongPort, WrongGateway, NoHeader, SlowHeader, OutsideRanges, NotInMap, Stale, NoDoc, Expired, Busy}
 
 // Edge checks and forwards connections.
 type Edge struct {
@@ -60,6 +61,14 @@ type Edge struct {
 	// IdleTimeout closes a connection with no byte either way for this
 	// long (default 1 h; WebSocket apps ping well within it).
 	IdleTimeout time.Duration
+	// MaxPerProvider caps a provider's connections, from accept (so the
+	// ones still sending their header count) to close (default 1024): a
+	// flood through one gateway or from built-in peers can't exhaust wg's
+	// memory and drop every VPN user. MaxPerClient caps one client
+	// address's admitted connections (default 128). Over a cap: rejected,
+	// reason busy.
+	MaxPerProvider int
+	MaxPerClient   int
 
 	rejected *prometheus.CounterVec
 	accepted *prometheus.CounterVec
@@ -67,12 +76,73 @@ type Edge struct {
 
 	mu       sync.Mutex
 	sessions map[*session]struct{}
+
+	capMu     sync.Mutex
+	perProv   map[string]int
+	perClient map[clientKey]int
+}
+
+type clientKey struct {
+	provider string
+	client   netip.Addr
+}
+
+// Defaults for the connection caps.
+const (
+	DefaultMaxPerProvider = 1024
+	DefaultMaxPerClient   = 128
+)
+
+func capOr(v, def int) int {
+	if v <= 0 {
+		return def
+	}
+	return v
+}
+
+// takeProvider counts one more connection of provider; false (nothing
+// counted) at the cap.
+func (e *Edge) takeProvider(provider string) bool {
+	e.capMu.Lock()
+	defer e.capMu.Unlock()
+	if e.perProv[provider] >= capOr(e.MaxPerProvider, DefaultMaxPerProvider) {
+		return false
+	}
+	e.perProv[provider]++
+	return true
+}
+
+func (e *Edge) dropProvider(provider string) {
+	e.capMu.Lock()
+	defer e.capMu.Unlock()
+	if e.perProv[provider]--; e.perProv[provider] <= 0 {
+		delete(e.perProv, provider)
+	}
+}
+
+func (e *Edge) takeClient(k clientKey) bool {
+	e.capMu.Lock()
+	defer e.capMu.Unlock()
+	if e.perClient[k] >= capOr(e.MaxPerClient, DefaultMaxPerClient) {
+		return false
+	}
+	e.perClient[k]++
+	return true
+}
+
+func (e *Edge) dropClient(k clientKey) {
+	e.capMu.Lock()
+	defer e.capMu.Unlock()
+	if e.perClient[k]--; e.perClient[k] <= 0 {
+		delete(e.perClient, k)
+	}
 }
 
 // Close reasons of admitted connections (wg_edge_closed_total).
 const (
 	ClosedNoDoc         = "no_doc"
 	ClosedExpired       = "expired"
+	ClosedRebound       = "rebound" // the provider's edge port or gateway changed
 	ClosedOutsideRanges = "outside_ranges"
 	ClosedStale         = "stale"
 	ClosedRevoked       = "revoked"
@@ -81,7 +151,7 @@ const (
 )
 
 // CloseReasons lists every close reason.
-var CloseReasons = []string{ClosedNoDoc, ClosedExpired, ClosedOutsideRanges, ClosedStale, ClosedRevoked, ClosedLifetime, ClosedIdle}
+var CloseReasons = []string{ClosedNoDoc, ClosedExpired, ClosedRebound, ClosedOutsideRanges, ClosedStale, ClosedRevoked, ClosedLifetime, ClosedIdle}
 
 // Defaults for the session limits.
 const (
@@ -94,6 +164,10 @@ const (
 type session struct {
 	provider string
 	client   netip.Addr
+	// The ingress it was admitted through: a gateway session's edge port
+	// and gateway address (zero for the built-in, which arrives in-process).
+	gateway  netip.Addr
+	edgePort int
 	deviceID string
 	user     string
 	started  time.Time
@@ -124,6 +198,8 @@ func New(traefik netip.AddrPort, local netip.Addr, doc func() *vpndoc.Doc, now f
 		MaxLifetime:   DefaultMaxLifetime,
 		IdleTimeout:   DefaultIdleTimeout,
 		sessions:      map[*session]struct{}{},
+		perProv:       map[string]int{},
+		perClient:     map[clientKey]int{},
 		closed: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "wg_edge_closed_total",
 			Help: "Admitted connections the edge closed on a re-check, by provider and reason.",
@@ -184,6 +260,11 @@ func addrPortOf(a net.Addr) netip.AddrPort {
 }
 
 func (e *Edge) serveGateway(c net.Conn, providerID string) {
+	if !e.takeProvider(providerID) {
+		e.reject(c, providerID, Busy)
+		return
+	}
+	defer e.dropProvider(providerID)
 	d := e.doc()
 	if d == nil {
 		e.reject(c, providerID, NoDoc)
@@ -236,17 +317,29 @@ func (e *Edge) serveGateway(c net.Conn, providerID string) {
 	}
 	client := src.AddrPort()
 	// The document may have changed while the header was read.
-	e.forward(&bufConn{Conn: c, r: br}, e.doc(), providerID, netip.AddrPortFrom(client.Addr().Unmap(), client.Port()))
+	in := ingress{gateway: addrPortOf(c.RemoteAddr()).Addr().Unmap(), port: int(addrPortOf(c.LocalAddr()).Port())}
+	e.forward(&bufConn{Conn: c, r: br}, e.doc(), providerID, netip.AddrPortFrom(client.Addr().Unmap(), client.Port()), in)
 }
 
 // Handle checks and forwards a connection whose client address is known
 // in-process (the built-in people stack, provider "builtin").
 func (e *Edge) Handle(c net.Conn, providerID string, client netip.Addr) {
+	if !e.takeProvider(providerID) {
+		e.reject(c, providerID, Busy)
+		return
+	}
+	defer e.dropProvider(providerID)
 	port := addrPortOf(c.RemoteAddr()).Port()
-	e.forward(c, e.doc(), providerID, netip.AddrPortFrom(client.Unmap(), port))
+	e.forward(c, e.doc(), providerID, netip.AddrPortFrom(client.Unmap(), port), ingress{})
 }
 
-func (e *Edge) forward(c net.Conn, d *vpndoc.Doc, providerID string, client netip.AddrPort) {
+// ingress is where a gateway connection came in (zero for the built-in).
+type ingress struct {
+	gateway netip.Addr
+	port    int
+}
+
+func (e *Edge) forward(c net.Conn, d *vpndoc.Doc, providerID string, client netip.AddrPort, in ingress) {
 	if d == nil {
 		e.reject(c, providerID, NoDoc)
 		return
@@ -270,6 +363,12 @@ func (e *Edge) forward(c net.Conn, d *vpndoc.Doc, providerID string, client neti
 		e.reject(c, providerID, NotInMap)
 		return
 	}
+	ck := clientKey{providerID, client.Addr()}
+	if !e.takeClient(ck) {
+		e.reject(c, providerID, Busy)
+		return
+	}
+	defer e.dropClient(ck)
 	dialer := net.Dialer{Timeout: e.DialTimeout}
 	if e.local.IsValid() {
 		dialer.LocalAddr = &net.TCPAddr{IP: e.local.AsSlice()}
@@ -285,7 +384,8 @@ func (e *Edge) forward(c net.Conn, d *vpndoc.Doc, providerID string, client neti
 		c.Close()
 		return
 	}
-	s := &session{provider: providerID, client: client.Addr(), deviceID: dev.DeviceID, user: dev.User, started: now, a: c, b: up}
+	s := &session{provider: providerID, client: client.Addr(), gateway: in.gateway, edgePort: in.port,
+		deviceID: dev.DeviceID, user: dev.User, started: now, a: c, b: up}
 	s.last.Store(now.UnixNano())
 	e.mu.Lock()
 	e.sessions[s] = struct{}{}
@@ -311,6 +411,11 @@ func (e *Edge) recheck(s *session, d *vpndoc.Doc, now time.Time) string {
 	p := d.ProviderByID(s.provider)
 	if p == nil || d.ProviderOf(s.client) != p {
 		return ClosedOutsideRanges
+	}
+	if s.gateway.IsValid() && (p.ID == vpndoc.BuiltinID || p.EdgePort != s.edgePort || p.Gateway() != s.gateway) {
+		// Re-slotted to another edge port, or its gateway moved: a
+		// session admitted through the old ingress can't stay open.
+		return ClosedRebound
 	}
 	if !p.Fresh(now) {
 		return ClosedStale

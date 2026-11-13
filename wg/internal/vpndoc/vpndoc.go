@@ -526,10 +526,14 @@ func (w *Watcher) Run(ctx context.Context, fn func(*Doc, error)) {
 func checkShape(raw []byte, t reflect.Type, path string) error {
 	raw = bytes.TrimSpace(raw)
 	if bytes.Equal(raw, []byte("null")) {
-		if path == "$" {
-			return errors.New("$: null")
+		// null only where the contract allows it: the optional times
+		// (expires, refreshed_at, stale_after; a null valid_until is then
+		// refused by validate) and builtin. A null string, list, number or
+		// bool is refused, as the other readers do (no zero-value decode).
+		if path == "$" || t.Kind() != reflect.Pointer {
+			return fmt.Errorf("%s: null", path)
 		}
-		return nil // null leaves are checked by validate (pointers / zero values)
+		return nil
 	}
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()

@@ -3051,6 +3051,15 @@ expect_eq "runtime_export keeps docker-compose.override.yml beside the podman an
   "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman; getenforce() { echo Enforcing; }; runtime_export; runtime_export; echo \"\$COMPOSE_FILE\"")" \
   "$RX/docker-compose.yml:$RX/docker-compose.override.yml:$RH/docker-compose.podman.yml:$RH/docker-compose.podman-selinux.yml
 rc=0"
+expect_eq "runtime_export: Podman's pools for the VPN readers (podman: 10.88/16 + the pinned 10.89/16; docker: empty, even if set outside)" \
+  "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman; getenforce() { echo Permissive; }; runtime_export; echo \"[\$PORTCULLIS_VPN_RUNTIME_POOLS]\"")|$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=docker PORTCULLIS_VPN_RUNTIME_POOLS=10.0.0.0/8; runtime_export; echo \"[\$PORTCULLIS_VPN_RUNTIME_POOLS]\"")" \
+  "[10.88.0.0/16 10.89.0.0/16]
+rc=0|[]
+rc=0"
+expect_eq "vpn_reserved_ranges: under podman Podman's pools follow the core subnets" \
+  "$(rt "CONTAINER_RUNTIME=podman; getenforce() { echo Permissive; }; runtime_export; vpn_reserved_ranges")" \
+  "172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28 10.88.0.0/16 10.89.0.0/16
+rc=0"
 expect_eq "runtime_export: an existing COMPOSE_FILE gets the overlay once" \
   "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman COMPOSE_FILE=docker-compose.yml:ci.yml; getenforce() { echo Enforcing; }; runtime_export; runtime_export; echo \"\$COMPOSE_FILE\"")" \
   "docker-compose.yml:ci.yml:$RH/docker-compose.podman.yml:$RH/docker-compose.podman-selinux.yml
@@ -3086,7 +3095,9 @@ expect_eq "runtime_port_start: unreadable or not a number → 1024" \
 CG="$WORK/rt/cgroup"; mkdir -p "$CG/user.slice/user-$RT_UID.slice/user@$RT_UID.service"
 echo "cpuset cpu io memory pids" > "$CG/user.slice/user-$RT_UID.slice/user@$RT_UID.service/cgroup.controllers"
 mkdir -p "$WORK/rt/aa/local"; echo N > "$WORK/rt/aa-off"; echo Y > "$WORK/rt/aa-on"
-RT_HOST="CONTAINER_RUNTIME=podman RT_CGROUP_ROOT='$CG' RT_PROC_PORT_START='$WORK/rt/port80' RT_APPARMOR_DIR='$WORK/rt/aa' RT_APPARMOR_ENABLED='$WORK/rt/aa-off'
+mkdir -p "$WORK/rt/cc"
+printf '[engine]\nevents_logger = "file"\n\n[network]\ndefault_subnet_pools = [{"base" = "10.89.0.0/16", "size" = 24}]\n' > "$WORK/rt/cc/containers.conf"
+RT_HOST="CONTAINER_RUNTIME=podman RT_CGROUP_ROOT='$CG' RT_PROC_PORT_START='$WORK/rt/port80' RT_APPARMOR_DIR='$WORK/rt/aa' RT_APPARMOR_ENABLED='$WORK/rt/aa-off' RT_CONTAINERS_CONF_DIR='$WORK/rt/cc'
   loginctl() { echo yes; }; systemctl() { echo enabled; }; nft() { :; }; passt() { :; }; getenforce() { echo Enforcing; }"
 OUT="$(rt "$RT_HOST; runtime_host_checks")"
 expect_eq "runtime_host_checks: a prepared host → no fail line" "$(printf '%s\n' "$OUT" | grep -c '^fail' || true)" 0
@@ -3105,6 +3116,25 @@ OUT="$(rt "$RT_HOST; loginctl() { echo no; }; systemctl() { echo disabled; }; ex
 case "$OUT" in *"fail	linger is off"*"fail	user unit podman.socket is not enabled"*"fail	user unit podman-restart.service is not enabled"*"fail	podman 5.3.1"*) t_pass "runtime_host_checks: linger, user units, podman < 5.4 → fail lines" ;; *) t_fail "runtime_host_checks linger/units/version: $OUT" ;; esac
 OUT="$(rt "$RT_HOST; nft() { return 1; }; unset -f nft; PATH=\"$WORK/rtbin:/usr/bin:/bin\"; command -v nft >/dev/null || command -v iptables >/dev/null || runtime_host_checks")"
 case "$OUT" in *"warn	neither nft nor iptables"*|"rc=0") t_pass "runtime_host_checks: no nft / iptables → warn (or the host has one)" ;; *) t_fail "runtime_host_checks nft: $OUT" ;; esac
+# Podman's address pools (I3 ruling): the operator's containers.conf pins
+# default_subnet_pools to 10.89.0.0/16 (/24s), so every Podman network
+# lies in 10.88.0.0/16 (the default network) or 10.89.0.0/16, both
+# reserved against VPN provider ranges.
+POOL_LINE='default_subnet_pools = [{"base" = "10.89.0.0/16", "size" = 24}]'
+OUT="$(rt "$RT_HOST; runtime_host_checks")"
+case "$OUT" in *"ok	containers.conf: default_subnet_pools = 10.89.0.0/16 (/24 networks)"*) t_pass "runtime_host_checks: the pinned Podman pool is an ok line" ;; *) t_fail "runtime_host_checks pool ok: $OUT" ;; esac
+for cc in "" '[network]\ndefault_subnet_pools = [{"base" = "10.128.0.0/9", "size" = 24}]\n' \
+          'default_subnet_pools = [{"base" = "10.89.0.0/16", "size" = 24}]\n' \
+          '[network]\n# default_subnet_pools = [{"base" = "10.89.0.0/16", "size" = 24}]\n'; do
+  rm -rf "$WORK/rt/cc2"; mkdir -p "$WORK/rt/cc2"
+  [ -z "$cc" ] || printf "$cc" > "$WORK/rt/cc2/containers.conf"
+  OUT="$(rt "$RT_HOST; RT_CONTAINERS_CONF_DIR='$WORK/rt/cc2'; runtime_host_checks")"
+  case "$OUT" in *"fail	containers.conf: Podman's network pools aren't pinned"*"[network] in $WORK/rt/cc2/containers.conf: $POOL_LINE"*) t_pass "runtime_host_checks: pools not pinned ($(printf "${cc:-no file}" | head -2 | tr '\n' ' ')) → fail with the exact line" ;; *) t_fail "runtime_host_checks pool: $OUT" ;; esac
+done
+mkdir -p "$WORK/rt/cc3/containers.conf.d"; cp "$WORK/rt/cc/containers.conf" "$WORK/rt/cc3/"
+printf '[network]\ndefault_subnet_pools = [{"base" = "10.128.0.0/9", "size" = 24}]\n' > "$WORK/rt/cc3/containers.conf.d/50-pools.conf"
+OUT="$(rt "$RT_HOST; RT_CONTAINERS_CONF_DIR='$WORK/rt/cc3'; runtime_host_checks")"
+case "$OUT" in *"fail	containers.conf: Podman's network pools aren't pinned"*"containers.conf.d/50-pools.conf overrides"*) t_pass "runtime_host_checks: a drop-in overriding the pools → fail naming it" ;; *) t_fail "runtime_host_checks pool drop-in: $OUT" ;; esac
 expect_eq "runtime_host_checks: docker → nothing" "$(rt 'CONTAINER_RUNTIME=docker runtime_host_checks')" "rc=0"
 OUT="$(rt "$RT_HOST; loginctl() { echo no; }; RT_PROC_PORT_START='$WORK/rt/port1024'; runtime_require_host")"
 case "$OUT" in *"isn't prepared for rootless Podman"*"  - linger is off"*"  - net.ipv4.ip_unprivileged_port_start = 1024"*"rc=1") t_pass "runtime_require_host: lists every failed item, refuses" ;; *) t_fail "runtime_require_host: $OUT" ;; esac
@@ -3620,6 +3650,11 @@ for s in 192.168.4.0/22 172.20.0.0/22; do
   expect_eq "vpn init: $s, in Docker's default address pools → refused, saying Docker allocates networks there" \
     "$RC:$(printf '%s' "$OUT" | grep -c "(Docker's default address pool)"):$(printf '%s' "$OUT" | grep -c 'Docker allocates networks (app instances'"'"' too) from these ranges')" "1:1:1"
 done
+OUT="$(PORTCULLIS_VPN_RUNTIME_POOLS="10.88.0.0/16 10.89.0.0/16" vt 'vpn_init on 51820 10.89.4.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init under podman: a subnet in Podman's pool → refused, saying Podman allocates networks there" \
+  "$RC:$(printf '%s' "$OUT" | grep -c "10.89.0.0/16 (Podman's address pool)"):$(printf '%s' "$OUT" | grep -c 'Podman allocates networks')" "1:1:1"
+OUT="$(PORTCULLIS_VPN_RUNTIME_POOLS="10.88.0.0/16 10.89.0.0/16" vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init under podman: the default 10.213.0.0/22 is outside both pools" "$RC:$(printf '%s' "$OUT" | grep -c "address pool" || true)" "0:0"
 OUT="$(PORTCULLIS_AUTH_SUBNET=10.213.8.0/28 vt 'vpn_init on 51820 10.213.8.0/22' 2>&1)"; RC=$?
 expect_eq "vpn init: a fixed core subnet (moved into 10.213/16) → refused" "$RC:$(printf '%s' "$OUT" | grep -c '10.213.8.0/28 (a Portcullis core network)')" "1:1"
 OUT="$(vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
@@ -3707,10 +3742,13 @@ expect_eq "vpn.sh: the Hub is reached only through _vpn_hub" \
   "$(grep -cE 'exec [^|]*hub hub ' "$HERE/../scripts/lib/vpn.sh")" 1
 expect_ok "vpn add-device: keys stay in variables (no temp file, no -v mount)" bash -c "! grep -nE 'mktemp|> *\"?\\\$[a-z]*(key|kp)|--mount' <(sed -n '/^vpn_add_device()/,/^}/p' '$HERE/../scripts/lib/vpn.sh')"
 
-OUT="$(vt 'vpn_builtin off; vpn_builtin on' 2>&1)"; RC=$?
+OUT="$(vt 'vpn_builtin on' 2>&1)"; RC=$?
+expect_eq "vpn builtin before vpn init (wg not in COMPOSE_PROFILES) → refused, nothing written or started" \
+  "$RC:$(printf '%s' "$OUT" | grep -c 'run ./portcullis vpn init first'):$(vte | grep -c PORTCULLIS_VPN_BUILTIN || true):$(cat "$WORK/vt/log" 2>/dev/null | grep -cE 'ct_run|dc up|dc restart' || true)" "1:1:0:0"
+OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=vpn.example.org\nCOMPOSE_PROFILES=wg' vt 'vpn_builtin off; vpn_builtin on' 2>&1)"; RC=$?
 expect_eq "vpn builtin off empties the key, on makes a new one; wg recreated and restarted (it reads the key at start) both times" \
   "$RC:$(grep -c '^ct_run' "$WORK/vt/log"):$(grep -c '^dc up -d --no-deps.* wg$' "$WORK/vt/log"):$(grep -c '^dc restart wg$' "$WORK/vt/log"):$(vte | grep -cx 'PORTCULLIS_VPN_BUILTIN=on')" "0:1:2:2:1"
-OUT="$(vt 'printf KEY > "$PORTCULLIS_ROOT/secrets/wg/people.key"; vpn_builtin off; wc -c < "$PORTCULLIS_ROOT/secrets/wg/people.key"' 2>&1)"
+OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=vpn.example.org\nCOMPOSE_PROFILES=wg' vt 'printf KEY > "$PORTCULLIS_ROOT/secrets/wg/people.key"; vpn_builtin off; wc -c < "$PORTCULLIS_ROOT/secrets/wg/people.key"' 2>&1)"
 expect_eq "vpn builtin off: the key file emptied in place" "$(printf '%s' "$OUT" | tail -n1 | tr -d ' ')" 0
 
 # status: the vpn block, the textfile gauge.

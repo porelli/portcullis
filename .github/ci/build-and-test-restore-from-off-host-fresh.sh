@@ -14,6 +14,10 @@ BACKUP_PASSWORD="$(grep '^BACKUP_PASSWORD=' .env | cut -d= -f2-)"
 echo "::add-mask::$BACKUP_PASSWORD"
 export BACKUP_REPOSITORY BACKUP_PASSWORD
 cp secrets/mcp-gate/age.pub /tmp/gate-age.pub
+# The built-in VPN's server key (secrets/wg/people.key) must survive: a
+# new key would break every built-in device's config.
+WG_PUB="$(docker compose exec -T wg /wg status | jq -r '.people.public_key // empty')"
+[ -n "$WG_PUB" ] || { echo "FAIL: no built-in VPN public key before the backup"; exit 1; }
 # LLDAP's admin: its Keycloak id and LLDAP uuid (the link, entryUUID) must survive.
 KC_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8080/realms/master/protocol/openid-connect/token \
   --data-urlencode client_id=admin-cli --data-urlencode "username=$KEYCLOAK_ADMIN" \
@@ -69,11 +73,17 @@ jq -n '{query: "{ user(userId: \"admin\") { uuid } }"}' | curl -sf http://localh
 for _ in $(seq 1 40); do [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q mcp-gate)" 2>/dev/null)" = healthy ] && break; sleep 3; done
 [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q mcp-gate)")" = healthy ] || { echo "FAIL: mcp-gate after restore"; docker compose logs --tail=30 mcp-gate; exit 1; }
 cmp -s /tmp/gate-age.pub secrets/mcp-gate/age.pub || { echo "FAIL: the gate's recipient changed by backup/restore"; exit 1; }
+for _ in $(seq 1 30); do
+  GOT="$(docker compose exec -T wg /wg status 2>/dev/null | jq -r '.people.public_key // empty' || true)"
+  [ -n "$GOT" ] && break
+  sleep 2
+done
+[ "$GOT" = "$WG_PUB" ] || { echo "FAIL: the built-in VPN's server key changed by backup/restore ($WG_PUB → ${GOT:-none})"; exit 1; }
 docker run --rm -v portcullis_mcp_gate_data:/d:ro docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
   sh -c 'stat -c "%a %u %g" /d /d/access.jsonl && grep -c "deny:off" /d/access.jsonl' > /tmp/gate-restored
 [ "$(sed -n 1,2p /tmp/gate-restored | paste -sd' ')" = "750 10005 10001 640 10005 10001" ] && [ "$(sed -n 3p /tmp/gate-restored)" -ge 3 ] \
   || { echo "FAIL: restored access log: $(cat /tmp/gate-restored)"; exit 1; }
-echo "PASS: restored from restic into a fresh stack: CA, cert records, revocations, Keycloak (admin's id and entryUUID link kept), LLDAP, the MCP gate's key and access log"
+echo "PASS: restored from restic into a fresh stack: CA, cert records, revocations, Keycloak (admin's id and entryUUID link kept), LLDAP, the MCP gate's key and access log, the built-in VPN's server key"
 # The restore's LLDAP guard read the real volume and database: LLDAP
 # users counted, Keycloak's federated users counted, so it passed.
 GUARD=$(bash -c 'source scripts/lib/common.sh; env_load; source scripts/lib/status.sh; source scripts/lib/backup.sh; _backup_load_cfg

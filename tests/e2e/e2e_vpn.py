@@ -22,8 +22,18 @@ Cases, each `FAIL: <what>` on failure:
   gateway_claims_builtin    a raw PROXY v2 header claiming a built-in address on the
                             headscale edge port, from the gateway: closed,
                             wg_edge_rejected_total{reason="outside_ranges"} grows
-  builtin_revoked           bob's device revoked: its handshake fails within 5 s
-  tailnet_node_deleted      alice's node deleted in Headscale: denied within refresh + 10 s
+  gateway_wrong_source      a valid PROXY header to the headscale edge port from another
+                            portcullis-vpn address: closed, rejected{wrong_gateway} grows
+  gateway_wrong_port        from the gateway, every other edge port: nothing listens
+  valid_until_expired       the Hub stopped, vpn.json past its valid_until: an open
+                            built-in connection closed (closed{expired}), no new one
+                            (no handshake; a tailnet request rejected{expired})
+  builtin_revoked           bob's device revoked: an already-open connection through the
+                            edge closed (closed{builtin,revoked}), its handshake fails
+                            within 5 s (+ one 3 s probe)
+  tailnet_node_deleted      alice's node deleted in Headscale: an already-open connection
+                            through the gateway closed (closed{headscale,revoked}),
+                            denied within refresh + 10 s
   gateway_stopped           the gateway down: only tailnet devices fail
   identity_hook_broken      the API key cleared: tailnet denied once stale, the built-in unaffected
   wg_stopped                wg down: echo-vpn unreachable on both paths, no internet fallback
@@ -198,6 +208,87 @@ def tunnel_dns(conf: str, name: str, typ: str) -> dict:
         p = subprocess.run([VPN_CLIENT, "--endpoint", "127.0.0.1:51820", "--dns", name, "--type", typ],
                            stdin=f, capture_output=True, text=True, timeout=60)
     return json.loads(p.stdout.strip().splitlines()[-1])
+
+
+def edge_metric(kind: str, prov: str, reason: str | None = None) -> float:
+    """wg_edge_<kind>_total{provider[,reason]} from wg's metrics (their own
+    network, portcullis-metrics-wg)."""
+    out = sh("docker", "run", "--rm", "--network", "portcullis_portcullis-metrics-wg", CURL_IMG, "-s",
+             "http://wg-metrics:9100/metrics")[1]
+    labels = f'provider="{prov}"' + (f',reason="{reason}"' if reason else "")
+    m = re.search(r"wg_edge_%s_total\{%s\} (\d+)" % (kind, re.escape(labels)), out)
+    return float(m.group(1)) if m else 0.0
+
+
+def tunnel_hold(conf: str, hold: str = "60s") -> subprocess.Popen:
+    """A built-in connection through the edge held open after one request
+    (vpn-client --hold): the JSON reports whether and when it was closed."""
+    f = open(conf)
+    return subprocess.Popen([VPN_CLIENT, "--endpoint", "127.0.0.1:51820", "--ca-file", CA, "--resolve",
+                             f"{ECHO}:443:10.213.0.1", "--get", f"https://{ECHO}/", "--hold", hold],
+                            stdin=f, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+TS_HOLD = r"""
+import json, socket, ssl, struct, sys, time
+host, hold = sys.argv[1], float(sys.argv[2])
+s = socket.create_connection(("127.0.0.1", 1055), 10)
+s.sendall(b"\x05\x01\x00"); assert s.recv(2) == b"\x05\x00"
+s.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host.encode() + struct.pack("!H", 443))
+r = s.recv(4); assert r[1] == 0, r
+s.recv({1: 6, 4: 18}[r[3]] if r[3] in (1, 4) else s.recv(1)[0] + 2)
+ctx = ssl.create_default_context(cafile="/ca.pem")
+t = ctx.wrap_socket(s, server_hostname=host)
+t.sendall(f"GET / HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n".encode())
+buf = b""
+while b"\r\n\r\n" not in buf:
+    buf += t.recv(4096)
+head, _, body = buf.partition(b"\r\n\r\n")
+status = int(head.split()[1])
+n = next((int(l.split(b":")[1]) for l in head.split(b"\r\n") if l.lower().startswith(b"content-length:")), 0)
+while len(body) < n:
+    body += t.recv(4096)
+print("HELD", flush=True)
+t.settimeout(hold)
+t0, closed = time.time(), False
+try:
+    closed = t.recv(1) == b""
+except (socket.timeout, TimeoutError):
+    closed = False
+except OSError:
+    closed = True
+print(json.dumps({"status": status, "closed": closed, "held_s": time.time() - t0}), flush=True)
+"""
+
+
+def ts_hold(node: str, hold: int = 60) -> subprocess.Popen:
+    """The same through node's tailscaled (SOCKS5) and the gateway."""
+    return subprocess.Popen(["docker", "run", "--rm", "-i", "--network", f"container:ts-{node}", "-v",
+                             f"{os.path.abspath(CA)}:/ca.pem:ro", PY_IMG, "python3", "-c", TS_HOLD, ECHO, str(hold)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def held_result(p: subprocess.Popen, timeout: float) -> dict:
+    out, err = p.communicate(timeout=timeout)
+    for line in reversed(out.strip().splitlines()):
+        if line.startswith("{"):
+            return json.loads(line)
+    return {"error": f"exit {p.returncode}: {(out + err)[-300:]}"}
+
+
+PROXY_PROBE = ("import socket,struct,sys\n"
+               "port,src=int(sys.argv[1]),sys.argv[2]\n"
+               "s=socket.create_connection(('172.31.254.3',port),5)\n"
+               "sig=b'\\r\\n\\r\\n\\x00\\r\\nQUIT\\n'\n"
+               "addr=socket.inet_aton(src)+socket.inet_aton('172.31.254.3')+struct.pack('!HH',40000,port)\n"
+               "s.sendall(sig+bytes([0x21,0x11])+struct.pack('!H',len(addr))+addr+b'GET / HTTP/1.0\\r\\n\\r\\n')\n"
+               "s.settimeout(5)\n"
+               "print(len(s.recv(100)))\n")
+
+
+def hs_edge_port() -> int:
+    vpn_json = sh("docker", "run", "--rm", "-v", "portcullis_vpn_doc:/d:ro", os.environ["ALPINE"], "cat", "/d/vpn.json")[1]
+    return next(x["edge_port"] for x in json.loads(vpn_json)["providers"] if x["id"] == HS)
 
 
 def ts_get(node: str, host: str = ECHO, path: str = "/", cookie_file: str | None = None) -> tuple[int, str]:
@@ -468,25 +559,111 @@ def main() -> int:
         check("gateway_claims_builtin: a PROXY header claiming a built-in address on the headscale edge port is closed (outside_ranges)",
               gateway_claims_builtin)
 
+        def gateway_wrong_source():
+            needs("hs_wired")
+            port = hs_edge_port()
+            before = edge_metric("rejected", HS, "wrong_gateway")
+            # Another container on portcullis-vpn (not the provider's
+            # gateway_ip), a well-formed PROXY header for a tailnet address.
+            rc, out = sh("docker", "run", "--rm", "--network", "portcullis-vpn", "--ip", "172.31.254.20", PY_IMG,
+                         "python3", "-c", PROXY_PROBE, str(port), "100.64.0.7", timeout=60)
+            assert out.strip().endswith("0") or rc != 0, f"the edge answered another source: {out[-200:]}"
+            until("wrong_gateway counted", lambda: edge_metric("rejected", HS, "wrong_gateway") > before, 30, every=2)
+        check("gateway_wrong_source: a PROXY header to the headscale edge port from another portcullis-vpn address is closed (wrong_gateway)",
+              gateway_wrong_source)
+
+        def gateway_wrong_port():
+            needs("hs_wired")
+            port = hs_edge_port()
+            gw = f"portcullis-{HS}-gateway-1"
+            script = ("import socket\n"
+                      "for p in range(9001, 9017):\n"
+                      "    if p == %d: continue\n"
+                      "    try:\n"
+                      "        socket.create_connection(('172.31.254.3', p), 3).close(); print('OPEN', p)\n"
+                      "    except OSError: pass\n"
+                      "print('DONE')\n") % port
+            rc, out = sh("docker", "run", "--rm", "--network", f"container:{gw}", PY_IMG, "python3", "-c", script, timeout=90)
+            assert "DONE" in out and "OPEN" not in out, f"from the gateway another edge port answers: {out[-300:]}"
+        check("gateway_wrong_port: from the gateway every other edge port is closed (only its own provider's port listens)",
+              gateway_wrong_port)
+
+        def valid_until_expired():
+            needs("alice_conf")
+            vol = ["-v", "portcullis_vpn_doc:/d"]
+            rc, mode = sh("docker", "run", "--rm", *vol, os.environ["ALPINE"], "stat", "-c", "%u:%g %a", "/d/vpn.json")
+            owner, perm = mode.strip().split()
+            orig = sh("docker", "run", "--rm", *vol, os.environ["ALPINE"], "cat", "/d/vpn.json")[1]
+            doc = json.loads(orig)
+            doc["valid_until"] = "2020-01-01T00:00:00Z"
+
+            def write(text: str) -> None:
+                rc, out = sh("docker", "run", "--rm", "-i", *vol, os.environ["ALPINE"], "sh", "-c",
+                             f"cat > /d/.vpn.json.ci && chown {owner} /d/.vpn.json.ci && chmod {perm} /d/.vpn.json.ci "
+                             "&& mv /d/.vpn.json.ci /d/vpn.json", stdin=text)
+                assert rc == 0, f"writing vpn.json: {out[-200:]}"
+            before_acc = edge_metric("accepted", "builtin")
+            before = edge_metric("closed", "builtin", "expired")
+            held = tunnel_hold(state["alice_conf"], "60s")
+            until("the held connection admitted", lambda: edge_metric("accepted", "builtin") > before_acc, 40, every=1)
+            sh("docker", "stop", "portcullis-hub-1", timeout=120)
+            try:
+                write(json.dumps(doc))
+                until("the open connection closed (expired)", lambda: edge_metric("closed", "builtin", "expired") > before, 20, every=1)
+                r = tunnel(state["alice_conf"], wait="5s")
+                assert not r.get("status"), f"a new built-in request past valid_until: {r}"
+                if "ts_alice" in state:
+                    rb = edge_metric("rejected", HS, "expired")
+                    ts_get("alice")
+                    until("a tailnet request rejected (expired)", lambda: edge_metric("rejected", HS, "expired") > rb, 20, every=2)
+            finally:
+                write(orig)
+                sh("docker", "start", "portcullis-hub-1", timeout=120)
+                held_result(held, 90)
+            until("the built-in back once vpn.json is valid", lambda: tunnel(state["alice_conf"]).get("status"), 180, every=5)
+        check("valid_until_expired: the Hub stopped and vpn.json past valid_until → an open connection closed (expired), "
+              "no new one on either path", valid_until_expired)
+
         def builtin_revoked():
             needs("bob_conf", "bob_device")
+            before_acc = edge_metric("accepted", "builtin")
+            before = edge_metric("closed", "builtin", "revoked")
+            held = tunnel_hold(state["bob_conf"], "60s")
+            until("bob's held connection admitted", lambda: edge_metric("accepted", "builtin") > before_acc, 40, every=1)
             rc, out = sh("./portcullis", "vpn", "revoke", state["bob_device"])
             assert rc == 0, f"vpn revoke: {out[-300:]}"
             t0 = time.time()
+            # The edge closes the already-open connection (its FIN can't
+            # reach a client whose peer is gone: the counter is the proof).
+            until("bob's open connection closed (revoked)", lambda: edge_metric("closed", "builtin", "revoked") > before, 20, every=1)
             until("bob's handshake refused", lambda: not tunnel(state["bob_conf"], wait="3s").get("handshake"), 15, every=1)
+            # 5 s (the brief) + one 3 s handshake probe of slack.
             assert time.time() - t0 <= 8, f"took {time.time() - t0:.0f} s"
-        check("builtin_revoked: a revoked built-in device's handshake fails within 5 s", builtin_revoked)
+            held_result(held, 90)
+        check("builtin_revoked: a revoked built-in device's open connection is closed (closed{revoked}) and its handshake "
+              "fails within 5 s", builtin_revoked)
 
         def tailnet_node_deleted():
             needs("ts_alice")
             hs = f"portcullis-{HS}-headscale-1"
             nodes = json.loads(sh("docker", "exec", hs, "headscale", "nodes", "list", "-o", "json")[1])
             nid = next(n["id"] for n in nodes if n.get("given_name", n.get("givenName", "")) == "alice-laptop" or n.get("name") == "alice-laptop")
+            before = edge_metric("closed", HS, "revoked")
+            held = ts_hold("alice", 90)
+            first = held.stdout.readline()
+            assert first.strip() == "HELD", f"no held tailnet connection: {first!r} {held.stderr.read()[-300:] if held.poll() is not None else ''}"
             t0 = time.time()
             rc, out = sh("docker", "exec", hs, "headscale", "nodes", "delete", "-i", str(nid), "--force")
             assert rc == 0, out[-300:]
+            # The already-open connection through the gateway: the edge closes it
+            # once the refreshed map drops the node (no WireGuard peer in wg here).
+            until("alice's open tailnet connection closed (revoked)", lambda: edge_metric("closed", HS, "revoked") > before,
+                  25 + 15, every=2)
+            assert time.time() - t0 <= 25 + 15, f"closed after {time.time() - t0:.0f} s (refresh 15 s + 10 s)"
+            r = held_result(held, 120)
+            print(f"    the held tailnet connection: {r}", flush=True)
             until("alice's deleted node denied", lambda: not opens(*ts_get("alice", cookie_file=state["alice_cookie"])), 40, every=2)
-            assert time.time() - t0 <= 25 + 15, f"took {time.time() - t0:.0f} s (refresh 15 s + 10 s)"
+            assert time.time() - t0 <= 25 + 15 + 20, f"took {time.time() - t0:.0f} s (refresh 15 s + 10 s, + a probe)"
             state.pop("ts_alice")
         check("tailnet_node_deleted: a deleted Headscale node is denied within refresh + 10 s", tailnet_node_deleted)
 

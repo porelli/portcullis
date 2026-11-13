@@ -520,7 +520,7 @@ vpn_rule() {  # <config json>
       and $g.labels["traefik.http.middlewares.vpn-required-path.replacepath.path"] == "/vpn-required"
       and $g.environment.GATE_VPN_FILE == "/vpn-doc/vpn.json"
       and $g.environment.GATE_CORE_SUBNETS == $w.environment.WG_CORE_SUBNETS
-      and ($g.environment.GATE_CORE_SUBNETS | split(" ") | sort) == ([.networks[] | .ipam.config[0].subnet? // empty] | sort)
+      and ($g.environment.GATE_CORE_SUBNETS | split(" ") | map(select(. != "")) | sort) == ([.networks[] | .ipam.config[0].subnet? // empty] | sort)
       and $g.labels["traefik.http.middlewares.portcullis-groups-vpn.forwardauth.address"] == "http://group-gate:8080/auth/vpn"
       and $g.labels["traefik.http.middlewares.portcullis-public-guard-vpn.forwardauth.address"] == "http://group-gate:8080/public-guard/vpn"
       and $g.labels["traefik.http.middlewares.portal-vpn-path.replacepath.path"] == "/portal/vpn"
@@ -556,16 +556,22 @@ done
 echo "$CFG_PODMAN_ALL" | jq -e '.services.wg.restart == "always"' >/dev/null || { echo "FAIL: docker-compose.podman.yml must name wg"; exit 1; }
 # The Hub's reserved list (core.env PORTCULLIS_VPN_RESERVED_RANGES,
 # vpn_reserved_ranges) is exactly what wg and group-gate refuse: Docker's
-# default address pools 172.16.0.0/12 and 192.168.0.0/16 + their
-# *_CORE_SUBNETS, with the defaults and with every subnet moved.
-for over in "" "PORTCULLIS_PROXY_SUBNET=10.80.0.0/24 PORTCULLIS_PROXY_IP_RANGE=10.80.0.128/25 PORTCULLIS_TRAEFIK_IP=10.80.0.2 PORTCULLIS_AUTH_SUBNET=10.81.0.0/28 PORTCULLIS_DOMAINS_SUBNET=10.82.0.0/28 PORTCULLIS_MCP_SUBNET=10.83.0.0/28 PORTCULLIS_VPN_NET=10.84.0.0/26 PORTCULLIS_VPN_EDGE_SUBNET=10.85.0.0/28"; do
-  # shellcheck disable=SC2086  # VAR=value words
-  HUBLIST="$(env $over bash -c 'source scripts/lib/common.sh; source scripts/lib/network.sh; vpn_reserved_ranges')"
-  # shellcheck disable=SC2086
-  READERS="$(env $over docker compose -f docker-compose.yml --profile '*' config --format json \
-      | jq -r '.services["group-gate"].environment.GATE_CORE_SUBNETS as $g | .services.wg.environment.WG_CORE_SUBNETS as $w
-               | if $g == $w then "172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 " + $g else "MISMATCH" end')"
-  [ "$HUBLIST" = "$READERS" ] || { echo "FAIL: core.env PORTCULLIS_VPN_RESERVED_RANGES ($HUBLIST) != what wg / group-gate refuse ($READERS)"; exit 1; }
+# default address pools 172.16.0.0/12 and 192.168.0.0/16, the link subnet
+# + their *_CORE_SUBNETS (under podman ending in Podman's pools,
+# PORTCULLIS_VPN_RUNTIME_POOLS: runtime_export, test_shell_libs), with the
+# defaults and with every subnet moved. Compared word by word.
+for pools in "" "10.88.0.0/16 10.89.0.0/16"; do
+  for over in "" "PORTCULLIS_PROXY_SUBNET=10.80.0.0/24 PORTCULLIS_PROXY_IP_RANGE=10.80.0.128/25 PORTCULLIS_TRAEFIK_IP=10.80.0.2 PORTCULLIS_AUTH_SUBNET=10.81.0.0/28 PORTCULLIS_DOMAINS_SUBNET=10.82.0.0/28 PORTCULLIS_MCP_SUBNET=10.83.0.0/28 PORTCULLIS_VPN_NET=10.84.0.0/26 PORTCULLIS_VPN_EDGE_SUBNET=10.85.0.0/28"; do
+    # shellcheck disable=SC2086  # VAR=value words
+    HUBLIST="$(env $over PORTCULLIS_VPN_RUNTIME_POOLS="$pools" bash -c 'source scripts/lib/common.sh; source scripts/lib/network.sh; vpn_reserved_ranges')"
+    # shellcheck disable=SC2086
+    READERS="$(env $over PORTCULLIS_VPN_RUNTIME_POOLS="$pools" docker compose -f docker-compose.yml --profile '*' config --format json \
+        | jq -r '.services["group-gate"].environment.GATE_CORE_SUBNETS as $g | .services.wg.environment.WG_CORE_SUBNETS as $w
+                 | if $g == $w then "172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 " + ($g | split(" ") | map(select(. != "")) | join(" ")) else "MISMATCH" end')"
+    [ "$HUBLIST" = "$READERS" ] || { echo "FAIL: core.env PORTCULLIS_VPN_RESERVED_RANGES ($HUBLIST) != what wg / group-gate refuse ($READERS)"; exit 1; }
+    case " $READERS " in *" 10.88.0.0/16 10.89.0.0/16 "*) [ -n "$pools" ] ;; *) [ -z "$pools" ] ;; esac \
+      || { echo "FAIL: Podman's pools reserved ($READERS) without PORTCULLIS_VPN_RUNTIME_POOLS, or missing with it"; exit 1; }
+  done
 done
 # shellcheck disable=SC2016  # expanded by the inner bash
 bash -c 'source scripts/lib/common.sh; source scripts/lib/network.sh; env_load; export PORTCULLIS_ROOT="$(mktemp -d)"; hub_env_write
