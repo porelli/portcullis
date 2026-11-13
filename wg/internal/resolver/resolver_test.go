@@ -202,3 +202,56 @@ func TestForwarder(t *testing.T) {
 		t.Fatalf("dead upstream: %+v", got)
 	}
 }
+
+// TestCIUpstream reproduces e2e-vpn's input: the CI stub (CoreDNS
+// templates) answers every name under portcullis.local with A
+// 203.0.113.10 and AAAA 2001:db8::10; wg learns its server addresses from
+// the apex through the same upstream, then echo-vpn.portcullis.local is
+// A 10.213.0.1 and AAAA NODATA. With the stub down (a broken Corefile)
+// the answer is SERVFAIL, never a guess.
+func TestCIUpstream(t *testing.T) {
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, q *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(q)
+		n := q.Question[0].Name
+		if strings.HasSuffix(strings.ToLower(n), "portcullis.local.") {
+			switch q.Question[0].Qtype {
+			case dns.TypeA:
+				m.Answer = append(m.Answer, rr(t, n+" 60 IN A 203.0.113.10"))
+			case dns.TypeAAAA:
+				m.Answer = append(m.Answer, rr(t, n+" 60 IN AAAA 2001:db8::10"))
+			}
+		}
+		w.WriteMsg(m)
+	})}
+	go up.ActivateAndServe()
+	defer up.Shutdown()
+	ups := []string{pc.LocalAddr().String()}
+	srv := &ServerAddrs{Apex: "portcullis.local", Upstreams: ups}
+	if err := srv.Refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.Get(); len(got) != 2 {
+		t.Fatalf("server addresses %v", got)
+	}
+	f := &Forwarder{Upstreams: ups, Timeout: 2 * time.Second, Rewriter: func() *Rewriter {
+		return &Rewriter{Domains: []string{"portcullis.local"}, Server: srv.Get(), Self: netip.MustParseAddr("10.213.0.1")}
+	}}
+	a, err := f.Exchange(context.Background(), query("echo-vpn.portcullis.local", dns.TypeA))
+	if err != nil || a.Rcode != dns.RcodeSuccess || len(answers(a)) != 1 || !strings.HasSuffix(answers(a)[0], "IN A 10.213.0.1") || a.AuthenticatedData {
+		t.Fatalf("A: %v %v", answers(a), err)
+	}
+	aaaa, err := f.Exchange(context.Background(), query("echo-vpn.portcullis.local", dns.TypeAAAA))
+	if err != nil || aaaa.Rcode != dns.RcodeSuccess || len(aaaa.Answer) != 0 {
+		t.Fatalf("AAAA: %v %v", answers(aaaa), err)
+	}
+	up.Shutdown()
+	dead := &Forwarder{Upstreams: ups, Timeout: 300 * time.Millisecond, Rewriter: f.Rewriter}
+	if got, _ := dead.Exchange(context.Background(), query("echo-vpn.portcullis.local", dns.TypeA)); got == nil || got.Rcode != dns.RcodeServerFailure {
+		t.Fatalf("the stub down: %+v", got)
+	}
+}

@@ -4876,9 +4876,16 @@ jobs:
           # name) points at this server's CI addresses, everything else is
           # forwarded.
           cat > /tmp/Corefile <<'EOF'
+          # One directive per line: CoreDNS refuses a one-line block
+          # ("Wrong argument count") and ci-dns crash-loops (wg's resolver
+          # then has no upstream: SERVFAIL).
           portcullis.local {
-            template IN A { answer "{{ .Name }} 60 IN A 203.0.113.10" }
-            template IN AAAA { answer "{{ .Name }} 60 IN AAAA 2001:db8::10" }
+            template IN A {
+              answer "{{ .Name }} 60 IN A 203.0.113.10"
+            }
+            template IN AAAA {
+              answer "{{ .Name }} 60 IN AAAA 2001:db8::10"
+            }
           }
           . {
             forward . 1.1.1.1 9.9.9.9

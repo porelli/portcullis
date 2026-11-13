@@ -510,6 +510,15 @@ def main() -> int:
                 # client (its sign-in template): the virtual authenticator answers.
                 if page.url.startswith(AUTH) and page.locator("#authenticateWebAuthnButton").is_visible():
                     page.click("#authenticateWebAuthnButton")
+                # Headscale >= 0.29 asks the signed-in person to confirm the
+                # node ("Confirm node registration", "Registered to alice").
+                if page.url.startswith(f"https://{HS_HOST}/register/confirm/"):
+                    btn = page.get_by_role("button", name="Confirm registration")
+                    if not btn.count():
+                        btn = page.get_by_text("Confirm registration", exact=True)
+                    if btn.count() and btn.first.is_visible():
+                        btn.first.click()
+                        page.wait_for_load_state("domcontentloaded")
                 st = sh("docker", "exec", "ts-alice", "tailscale", "--socket=/tmp/ts.sock", "status", "--json")[1]
                 return '"Online": true' in st or 'BackendState": "Running' in st
             try:

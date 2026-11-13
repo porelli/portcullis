@@ -33,6 +33,14 @@ for i in $(seq 1 40); do
   [ "$i" -eq 40 ] && { echo "FAIL: hub /healthz"; docker compose logs --tail=40 hub; exit 1; }
   sleep 2
 done
+# wg's resolver upstream in CI (ci-dns on wg-egress) must answer before
+# the DNS scenarios: a broken Corefile makes it crash-loop, silently.
+for i in $(seq 1 20); do
+  out="$(docker run --rm --network portcullis_wg-egress "$ALPINE" nslookup -type=A echo-vpn.portcullis.local 172.30.99.53 2>&1 || true)"
+  printf '%s' "$out" | grep -q '203.0.113.10' && break
+  [ "$i" -eq 20 ] && { echo "FAIL: ci-dns doesn't answer: $out"; docker compose logs --tail=20 ci-dns; exit 1; }
+  sleep 2
+done
 # vpn init needs the Hub (hub vpn host-info; it waits up to 120 s for an
 # answer): show its state first.
 docker inspect --format 'Hub: {{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} restarts={{.RestartCount}}' "$(docker compose ps -q hub)" \
