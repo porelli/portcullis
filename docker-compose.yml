@@ -1060,7 +1060,8 @@ services:
       # VPN (contract §16): wg's status (roles, the built-in server key,
       # handshakes); older than 30 s = wg down. vpn.json goes to vpn_doc.
       HUB_VPN_STATUS_FILE: /wg-data/status.json
-      HUB_VPN_FILE: /vpn-doc/vpn.json
+      HUB_VPN_DOC_DIR: /vpn-doc
+      HUB_VPN_DOC_GID: "10007"
     volumes:
       - .:/project:ro
       # Writable overlay: before every `compose up` the Hub copies each app's

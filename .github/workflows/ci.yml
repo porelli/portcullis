@@ -739,7 +739,7 @@ jobs:
                 and vmount("group-gate"; "vpn_doc") == ["/vpn-doc:true"]
                 and ($h.group_add // [] | index("10007")) != null and ($g.group_add | sort) == ["10001", "10007"]
                 and ([.services | to_entries[] | select((.value.group_add // []) | index("10007")) | .key] | sort == ["group-gate", "hub", "wg"])
-                and $h.environment.HUB_VPN_STATUS_FILE == "/wg-data/status.json" and $h.environment.HUB_VPN_FILE == "/vpn-doc/vpn.json"
+                and $h.environment.HUB_VPN_STATUS_FILE == "/wg-data/status.json" and $h.environment.HUB_VPN_DOC_DIR == "/vpn-doc" and $h.environment.HUB_VPN_DOC_GID == "10007"
                 and ([$h.networks | keys[]] | (index("portcullis-vpn") or index("portcullis-vpn-edge")) | not)
                 and ($h.labels as $l
                      | $l["traefik.http.routers.people-vpn-enrol.rule"] == ($l["traefik.http.routers.people.rule"] + " && PathPrefix(`/vpn/`)")
