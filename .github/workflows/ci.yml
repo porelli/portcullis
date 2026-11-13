@@ -239,6 +239,8 @@ jobs:
       # stdlib only, no stack.
       - name: e2e helper unit tests (e2e_fsops)
         run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_e2e_fsops.py
+      - name: Tool versions (the compose / jq checks depend on them)
+        run: docker compose version && jq --version && yq --version
       - name: compose files are valid with a generated .env
         run: bash .github/ci/unit-tests-compose-files-are-valid-generated.sh
 

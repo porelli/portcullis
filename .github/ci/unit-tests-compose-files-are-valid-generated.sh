@@ -456,7 +456,10 @@ fi
 # people-vpn-enrol = people's chain on /vpn/.
 vpn_rule() {  # <config json>
   printf '%s' "$1" | jq -e '.services.wg as $w | .services.traefik as $t | .services.hub as $h | .services["group-gate"] as $g
-      | def members($n): [.services | to_entries[] | select((.value.networks // {}) | has($n)) | .key] | sort;
+      | def lab: .labels | if . == null then {} elif type == "object" then . else error("labels: not a map") end;
+        def nets: .networks | if . == null then {} elif type == "object" then . else error("networks: not a map") end;
+        def gids: .group_add | if . == null then [] elif type == "array" then . else error("group_add: not a list") end;
+        def members($n): [.services | to_entries[] | select(.value | nets | has($n)) | .key] | sort;
         def mounts($src): [.services | to_entries[] | select([.value.volumes[]? | select(.type == "volume" and .source == $src)] | length > 0) | .key] | sort;
         def vmount($svc; $src): [.services[$svc].volumes[]? | select(.type == "volume" and .source == $src) | "\(.target):\(.read_only // false)"];
       ($w.cap_add // []) == [] and ($w.devices // []) == [] and ($w.sysctls // {}) == {}
@@ -502,8 +505,8 @@ vpn_rule() {  # <config json>
       and (mounts("vpn_doc") == ["group-gate", "hub", "wg"])
       and vmount("hub"; "vpn_doc") == ["/vpn-doc:false"] and vmount("wg"; "vpn_doc") == ["/vpn-doc:true"]
       and vmount("group-gate"; "vpn_doc") == ["/vpn-doc:true"]
-      and ($h.group_add // [] | index("10007")) != null and ($g.group_add | sort) == ["10001", "10007"]
-      and ([.services | to_entries[] | select((.value.group_add // []) | index("10007")) | .key] | sort == ["group-gate", "hub", "wg"])
+      and ($h | gids | any(.[]; . == "10007")) and ($g | gids | sort) == ["10001", "10007"]
+      and ([.services | to_entries[] | select(.value | gids | any(.[]; . == "10007")) | .key] | sort == ["group-gate", "hub", "wg"])
       and $h.environment.HUB_VPN_STATUS_FILE == "/wg-data/status.json" and $h.environment.HUB_VPN_DOC_DIR == "/vpn-doc" and $h.environment.HUB_VPN_DOC_GID == "10007"
       and ([$h.networks | keys[]] | (index("portcullis-vpn") or index("portcullis-vpn-edge")) | not)
       and ($h.labels as $l
@@ -521,15 +524,22 @@ vpn_rule() {  # <config json>
       and $g.labels["traefik.http.middlewares.portal-vpn-path.replacepath.path"] == "/portal/vpn"
       and $g.labels["traefik.http.middlewares.portcullis-groups-vpn.forwardauth.authResponseHeaders"] == $g.labels["traefik.http.middlewares.portcullis-groups.forwardauth.authResponseHeaders"]
       and $t.environment.TRAEFIK_ENTRYPOINTS_PARKED_ADDRESS == "127.0.0.1:8441"
-      and ([.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.entrypoints$")) | .value] | unique == ["vpnsecure", "websecure", "websecure,vpnsecure"])
-      and ([.services[].labels // {}] | add) as $L
-          | ([.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.middlewares$"))
-              | (.key | sub("\\.middlewares$"; ".entrypoints")) as $ek | (.value | split(",")) as $m
-              | if ($m | index("portcullis-groups-vpn@docker") or index("portal-vpn-path@docker") or index("portcullis-public-guard-vpn@docker"))
-                then ($L[$ek] == "vpnsecure")
-                elif ($m | index("portcullis-groups@docker") or index("portal-path@docker") or index("portcullis-public-guard@docker"))
-                then ($L[$ek] | split(",") | index("vpnsecure") | not)
-                else true end] | all)' >/dev/null
+      and ([.services[] | lab | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.entrypoints$")) | .value] | unique == ["vpnsecure", "websecure", "websecure,vpnsecure"])
+      # Parenthesised: jq 1.8 binds `A and B as $x | C` as `(A and B) as $x`
+      # (1.7: `A and (B as $x | C)`). Every gate router must be on its class:
+      # VPN middlewares only on vpnsecure, the normal ones never on it; both
+      # kinds must be present, so the check never passes on an empty set.
+      and (([.services[] | lab] | add) as $L
+           | [$L | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.middlewares$"))
+              | (.key | sub("\\.middlewares$"; ".entrypoints")) as $ek
+              | (.value | if type == "string" then split(",") else error("\(.): middlewares not a string") end) as $m
+              | def ep: $L[$ek] | if type == "string" then split(",") else error("\($ek): no entrypoints") end;
+                if any($m[]; . == "portcullis-groups-vpn@docker" or . == "portal-vpn-path@docker" or . == "portcullis-public-guard-vpn@docker")
+                then {vpn: true, ok: (ep == ["vpnsecure"])}
+                elif any($m[]; . == "portcullis-groups@docker" or . == "portal-path@docker" or . == "portcullis-public-guard@docker")
+                then {vpn: false, ok: (any(ep[]; . == "vpnsecure") | not)}
+                else empty end]
+           | (map(select(.vpn)) | length) > 0 and (map(select(.vpn | not)) | length) > 0 and all(.[]; .ok))' >/dev/null
 }
 # With the monitoring profile, Prometheus is wg's metrics network's only other member.
 echo "$CFG_ALL" | jq -e '[.services | to_entries[] | select((.value.networks // {}) | has("portcullis-metrics-wg")) | .key] | sort == ["prometheus", "wg"]' >/dev/null \
