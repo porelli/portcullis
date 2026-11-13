@@ -224,6 +224,14 @@ validate_vpn_network_config() {
   done
 }
 
+# vpn_reserved_ranges — the ranges no VPN provider may claim, as wg and
+# group-gate refuse them (Docker's default bridge pool + compose's
+# WG_CORE_SUBNETS / GATE_CORE_SUBNETS, in that order); the Hub gets it as
+# core.env's PORTCULLIS_VPN_RESERVED_RANGES and refuses them first.
+vpn_reserved_ranges() {
+  echo "172.16.0.0/12 $(proxy_subnet) $(auth_subnet) $(domains_subnet) $(mcp_subnet) $(vpn_net) $(vpn_edge_subnet)"
+}
+
 # validate_vpn_edge_network_config — portcullis-vpn-edge (contract §16):
 # exactly wg and Traefik's vpnsecure; Traefik trusts PROXY headers from
 # wg's address here only, and no gateway can reach this network. Both

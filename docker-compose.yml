@@ -872,8 +872,10 @@ services:
       # 10007): the device ↔ person binding of VPN-only hosts. Missing or
       # invalid = every VPN-only request is denied.
       GATE_VPN_FILE: /vpn-doc/vpn.json
-      # Ranges no VPN provider may claim (plus Docker's default pools): the
-      # fixed core subnets. vpn.json naming one is refused whole.
+      # Ranges no VPN provider may claim (plus 172.16.0.0/12): the fixed core
+      # subnets, = network.sh vpn_reserved_ranges (the Hub's core.env
+      # PORTCULLIS_VPN_RESERVED_RANGES; CI compares). vpn.json naming one is
+      # refused whole.
       GATE_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28}"
       # Required: core hosts are <sub>.<PORTCULLIS_DOMAIN> (map.conf) and
       # app hosts <label>.<PORTCULLIS_DOMAIN> or on an enrolled domain
@@ -1447,7 +1449,7 @@ services:
       WG_SUBNET: ${PORTCULLIS_VPN_SUBNET:-10.213.0.0/22}
       WG_VPN_ADDR: ${PORTCULLIS_VPN_WG_IP:-172.31.254.3}
       WG_EDGE_ADDR: ${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}
-      # Ranges no provider may claim (plus Docker's default pools).
+      # Ranges no provider may claim (plus 172.16.0.0/12; = GATE_CORE_SUBNETS).
       WG_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28}"
       WG_TRAEFIK: ${PORTCULLIS_VPN_EDGE_TRAEFIK_IP:-172.31.254.66}:8443
       WG_DNS_UPSTREAM: ${PORTCULLIS_VPN_DNS_UPSTREAM:-1.1.1.1,9.9.9.9}

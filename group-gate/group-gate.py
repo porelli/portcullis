@@ -1545,11 +1545,12 @@ VPN_FILE = os.environ.get("GATE_VPN_FILE", "/vpn-doc/vpn.json")
 VPN_AUTH_PATH = "/auth/vpn"
 VPN_PORTAL_PATH = "/portal/vpn"
 VPN_PUBLIC_GUARD_PATH = "/public-guard/vpn"
-# Ranges no provider may claim (the vpn.json readers refuse the whole file):
-# Docker's default bridge pools, where every core network lives (the fixed
-# ones and the dynamic ones), plus the fixed core subnets compose passes in
-# GATE_CORE_SUBNETS (space-separated).
-VPN_RESERVED_DEFAULT = ("172.16.0.0/12", "192.168.0.0/16")
+# Ranges no provider may claim (the vpn.json readers refuse the whole file,
+# a backstop: the Hub refuses them first, from core.env's
+# PORTCULLIS_VPN_RESERVED_RANGES = this default + the same subnets):
+# Docker's default bridge pool 172.16.0.0/12, plus the fixed core subnets
+# compose passes in GATE_CORE_SUBNETS (space-separated, from .env).
+VPN_RESERVED_DEFAULT = ("172.16.0.0/12",)
 
 
 def _reserved_nets() -> List[ipaddress.IPv4Network]:

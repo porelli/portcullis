@@ -777,6 +777,23 @@ jobs:
             vpn_rule "${!c}" || { echo "FAIL: VPN wiring (wg userspace only and least privilege, vpnsecure PROXY trust on portcullis-vpn-edge, network members, vpn_doc / wg_data, people-vpn-enrol, entrypoint classes) in $c"; exit 1; }
           done
           echo "$CFG_PODMAN_ALL" | jq -e '.services.wg.restart == "always"' >/dev/null || { echo "FAIL: docker-compose.podman.yml must name wg"; exit 1; }
+          # The Hub's reserved list (core.env PORTCULLIS_VPN_RESERVED_RANGES,
+          # vpn_reserved_ranges) is exactly what wg and group-gate refuse:
+          # 172.16.0.0/12 + their *_CORE_SUBNETS, with the defaults and with
+          # every subnet moved.
+          for over in "" "PORTCULLIS_PROXY_SUBNET=10.80.0.0/24 PORTCULLIS_PROXY_IP_RANGE=10.80.0.128/25 PORTCULLIS_TRAEFIK_IP=10.80.0.2 PORTCULLIS_AUTH_SUBNET=10.81.0.0/28 PORTCULLIS_DOMAINS_SUBNET=10.82.0.0/28 PORTCULLIS_MCP_SUBNET=10.83.0.0/28 PORTCULLIS_VPN_NET=10.84.0.0/26 PORTCULLIS_VPN_EDGE_SUBNET=10.85.0.0/28"; do
+            # shellcheck disable=SC2086  # VAR=value words
+            HUBLIST="$(env $over bash -c 'source scripts/lib/common.sh; source scripts/lib/network.sh; vpn_reserved_ranges')"
+            # shellcheck disable=SC2086
+            READERS="$(env $over docker compose -f docker-compose.yml --profile '*' config --format json \
+                | jq -r '.services["group-gate"].environment.GATE_CORE_SUBNETS as $g | .services.wg.environment.WG_CORE_SUBNETS as $w
+                         | if $g == $w then "172.16.0.0/12 " + $g else "MISMATCH" end')"
+            [ "$HUBLIST" = "$READERS" ] || { echo "FAIL: core.env PORTCULLIS_VPN_RESERVED_RANGES ($HUBLIST) != what wg / group-gate refuse ($READERS)"; exit 1; }
+          done
+          # shellcheck disable=SC2016  # expanded by the inner bash
+          bash -c 'source scripts/lib/common.sh; source scripts/lib/network.sh; env_load; export PORTCULLIS_ROOT="$(mktemp -d)"; hub_env_write
+                   grep -qx "PORTCULLIS_VPN_RESERVED_RANGES=$(vpn_reserved_ranges)" "$PORTCULLIS_ROOT/secrets/hub/core.env"' \
+            || { echo "FAIL: hub_env_write does not give the Hub PORTCULLIS_VPN_RESERVED_RANGES"; exit 1; }
           # Each router's entrypoints is exactly its class variable: with the
           # three set to distinct values, every router shows its own class.
           EP_ROUTERS="$(PORTCULLIS_EP_CORE=x-core PORTCULLIS_EP_ADMIN=x-admin PORTCULLIS_EP_ENROL=x-enrol PORTCULLIS_WEB_CORE=w-core PORTCULLIS_WEB_ADMIN=w-admin PORTCULLIS_WEB_ENROL=w-enrol docker compose -f docker-compose.yml --profile '*' config --format json \

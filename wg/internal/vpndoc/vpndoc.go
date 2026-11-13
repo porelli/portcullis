@@ -49,12 +49,13 @@ const (
 // map alive longer than any legal refresh allows.
 const MaxStaleSpan = 3 * 10 * time.Minute
 
-// reserved are ranges no provider may claim: Docker's default bridge pools
-// (every core network lives there) plus the fixed core subnets the service
-// is given (Reserve). A file whose provider range overlaps one is refused
+// reserved are ranges no provider may claim: Docker's default bridge pool
+// 172.16.0.0/12 plus the fixed core subnets the service is given (Reserve;
+// the Hub refuses the same list first, core.env's
+// PORTCULLIS_VPN_RESERVED_RANGES). A file whose provider range overlaps one is refused
 // whole (security ruling: such an address could arrive from a container,
 // not a tunnel).
-var reserved = []netip.Prefix{netip.MustParsePrefix("172.16.0.0/12"), netip.MustParsePrefix("192.168.0.0/16")}
+var reserved = []netip.Prefix{netip.MustParsePrefix("172.16.0.0/12")}
 
 // Reserve adds core subnets to the reserved ranges (startup only).
 func Reserve(ps ...netip.Prefix) { reserved = append(reserved, ps...) }

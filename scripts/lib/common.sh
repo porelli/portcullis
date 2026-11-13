@@ -497,7 +497,7 @@ secrets_fix_perms() {
 # Core variables the Hub may copy into app .env files (templates reference
 # them as ${VAR}); everything else in .env is a core secret the Hub never
 # sees. Operators can add names via HUB_SHARED_ENV="VAR1 VAR2".
-HUB_ENV_VARS="PORTCULLIS_DOMAIN PORTCULLIS_TRAEFIK_IP PORTCULLIS_MCP_GATE_IP PORTCULLIS_PROXY_SUBNET PORTCULLIS_PROXY_IP_RANGE PORTAL_DISPLAY_NAME PORTCULLIS_VPN_MODE PORTCULLIS_VPN_PUBLIC_ENROL PORTCULLIS_VPN_NET PORTCULLIS_VPN_BUILTIN"
+HUB_ENV_VARS="PORTCULLIS_DOMAIN PORTCULLIS_TRAEFIK_IP PORTCULLIS_MCP_GATE_IP PORTCULLIS_PROXY_SUBNET PORTCULLIS_PROXY_IP_RANGE PORTAL_DISPLAY_NAME PORTCULLIS_VPN_MODE PORTCULLIS_VPN_PUBLIC_ENROL PORTCULLIS_VPN_NET PORTCULLIS_VPN_BUILTIN PORTCULLIS_VPN_RESERVED_RANGES"
 HUB_ENV_PREFIXES="HEADSCALE_ HEADPLANE_ NETBIRD_ COTURN_"
 
 # hub_env_write — secrets/hub/core.env, mounted read-only as the Hub's
@@ -531,6 +531,8 @@ hub_env_write() {
       PORTCULLIS_VPN_PUBLIC_ENROL) val="${PORTCULLIS_VPN_PUBLIC_ENROL:-true}" ;;
       PORTCULLIS_VPN_NET) val="$(vpn_net)" ;;
       PORTCULLIS_VPN_BUILTIN) val="${PORTCULLIS_VPN_BUILTIN:-off}" ;;
+      # Derived, never from .env: what wg and group-gate refuse (network.sh).
+      PORTCULLIS_VPN_RESERVED_RANGES) val="$(vpn_reserved_ranges)" ;;
       *) val="${!v:-}" ;;
     esac
     content+="$v=$val"$'\n'
