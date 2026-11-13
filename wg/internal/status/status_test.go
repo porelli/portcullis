@@ -92,3 +92,13 @@ func TestStatusDocument(t *testing.T) {
 		t.Fatalf("Read: %+v %v", got, err)
 	}
 }
+
+func TestCheckDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := CheckDir(dir); err == nil {
+		t.Fatal("a plain temp dir passed (no group 10001 / setgid)")
+	}
+	if err := CheckDir(filepath.Join(dir, "none")); err == nil {
+		t.Fatal("a missing dir passed")
+	}
+}

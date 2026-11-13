@@ -71,11 +71,11 @@ networks:
   # forward-auth-ext. No egress, nothing else can reach the store.
   portcullis-sessions:
     internal: true
-  # VPN (contract §16): Traefik's vpnsecure entrypoint and wg (the edge, its
-  # only PROXY v2 client) at pinned addresses, wired providers' gateways at
-  # .16–.62 (the Hub pins each in the provider's override). No egress. The
-  # dynamic range (nobody should need it) can't take a pinned address.
-  # network.sh validates PORTCULLIS_VPN_*.
+  # VPN (contract §16): wg's edge ports at its pinned address, wired
+  # providers' gateways at .16–.62 (the Hub pins each in the provider's
+  # override). Traefik is NOT on it: a gateway with NET_RAW could spoof
+  # wg's address here. No egress. The dynamic range (nobody should need
+  # it) can't take a pinned address. network.sh validates PORTCULLIS_VPN_*.
   portcullis-vpn:
     name: portcullis-vpn
     internal: true
@@ -83,9 +83,22 @@ networks:
       config:
         - subnet: ${PORTCULLIS_VPN_NET:-172.31.254.0/26}
           ip_range: ${PORTCULLIS_VPN_IP_RANGE:-172.31.254.8/29}
+  # wg → Traefik's vpnsecure only: exactly those two, pinned. vpnsecure
+  # trusts PROXY headers from wg's address HERE only, where no gateway or
+  # app can be.
+  portcullis-vpn-edge:
+    name: portcullis-vpn-edge
+    internal: true
+    ipam:
+      config:
+        - subnet: ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28}
+          ip_range: ${PORTCULLIS_VPN_EDGE_IP_RANGE:-172.31.254.72/29}
   # wg's egress: the published WireGuard UDP port and the built-in
   # resolver's upstream queries.
   wg-egress: {}
+  # Prometheus → wg's metrics only (monitoring profile + profile wg).
+  portcullis-metrics-wg:
+    internal: true
 
 # Hardening defaults (see docs/hardening.md for per-service exceptions).
 x-hardening: &hardening
@@ -218,15 +231,15 @@ services:
       TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_CERTRESOLVER: letsencrypt
       TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_DOMAINS_0_MAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
       TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_DOMAINS_0_SANS: "*.${PORTCULLIS_DOMAIN:-portcullis.local}"
-      # VPN entrypoint (contract §16): on Traefik's portcullis-vpn address
-      # only (not published). PROXY v2 is trusted from wg's pinned address
-      # ONLY — the edge, which checks every client address against its
-      # provider's ranges and device map; gateways on the same network are
-      # never trusted. Never forwardedHeaders.trustedIPs / insecure here
-      # either. Always defined, so routers naming it never break; with no
-      # wg nothing connects to it (fail closed).
-      TRAEFIK_ENTRYPOINTS_VPNSECURE_ADDRESS: ${PORTCULLIS_VPN_TRAEFIK_IP:-172.31.254.2}:8443
-      TRAEFIK_ENTRYPOINTS_VPNSECURE_PROXYPROTOCOL_TRUSTEDIPS: ${PORTCULLIS_VPN_WG_IP:-172.31.254.3}/32
+      # VPN entrypoint (contract §16): on Traefik's portcullis-vpn-edge
+      # address only (not published; that network holds just wg and
+      # Traefik). PROXY v2 is trusted from wg's address there ONLY — the
+      # edge, which checks every client address against its provider's
+      # ranges and device map. Never forwardedHeaders.trustedIPs / insecure
+      # here either. Always defined, so routers naming it never break; with
+      # no wg nothing connects to it (fail closed).
+      TRAEFIK_ENTRYPOINTS_VPNSECURE_ADDRESS: ${PORTCULLIS_VPN_EDGE_TRAEFIK_IP:-172.31.254.66}:8443
+      TRAEFIK_ENTRYPOINTS_VPNSECURE_PROXYPROTOCOL_TRUSTEDIPS: ${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}/32
       TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_ALIASHEADERSSTRATEGY: delete
       TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_CERTRESOLVER: letsencrypt
       TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_DOMAINS_0_MAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
@@ -296,8 +309,8 @@ services:
         ipv4_address: ${PORTCULLIS_AUTH_TRAEFIK_IP:-172.31.251.2}
       socket-proxy-traefik: {}
       portcullis-certs: {}
-      portcullis-vpn:
-        ipv4_address: ${PORTCULLIS_VPN_TRAEFIK_IP:-172.31.254.2}
+      portcullis-vpn-edge:
+        ipv4_address: ${PORTCULLIS_VPN_EDGE_TRAEFIK_IP:-172.31.254.66}
     healthcheck:
       test: ["CMD", "traefik", "healthcheck", "--ping"]
       interval: 10s
@@ -788,7 +801,8 @@ services:
     user: "10003:10003"
     # Group 10001 (the Hub's): the opened log's directory (opened/, 2770)
     # and day files (0640) carry it, so the Hub can read and prune them.
-    group_add: ["10001"]
+    # Group 10007: vpn.json in vpn_doc (the device ↔ person binding).
+    group_add: ["10001", "10007"]
     read_only: true
     tmpfs:
       - /tmp
@@ -796,6 +810,8 @@ services:
       - ./group-gate/group-gate-map.conf:/etc/group-gate/map.conf:ro
       # Hub writes per-app auth policies into this volume under group-gate-policy.json
       - hub_data:/hub-data:ro
+      # vpn.json (contract §4/§16), the Hub's, group 10007.
+      - vpn_doc:/vpn-doc:ro
       # Revoked certificate serials (both kinds), written by ./portcullis cert revoke|sync.
       - ./certs/revocation:/etc/group-gate/revocation:ro
       # The two intermediates (./portcullis pki setup): a presented leaf
@@ -979,8 +995,9 @@ services:
       # anything else and the Hub refuses to start.
       HUB_IMPERSONATION_MAX_MINUTES: ${IMPERSONATION_MAX_MINUTES:-30}
       # VPN (contract §16): wg's status (roles, the built-in server key,
-      # handshakes); older than 30 s = wg down.
+      # handshakes); older than 30 s = wg down. vpn.json goes to vpn_doc.
       HUB_VPN_STATUS_FILE: /wg-data/status.json
+      HUB_VPN_FILE: /vpn-doc/vpn.json
     volumes:
       - .:/project:ro
       # Writable overlay: before every `compose up` the Hub copies each app's
@@ -1027,6 +1044,9 @@ services:
       - group_gate_data:/group-gate-data
       # wg's status.json (written by wg only; group 10001).
       - wg_data:/wg-data:ro
+      # vpn.json (contract §4/§16): written by the Hub only (0640, group
+      # 10007, read by wg and group-gate).
+      - vpn_doc:/vpn-doc
       # Per-person secrets (contract §6): file-share password hashes, never
       # backed up, emptied by restore. The Hub checks ownership (10001:10001
       # 0700) at start; ./portcullis init/upgrade/restore ensure it.
@@ -1038,6 +1058,8 @@ services:
       # mcp-gate → the Hub's :8890 listener (contract §15.7), at this pinned address.
       portcullis-mcp:
         ipv4_address: ${PORTCULLIS_MCP_HUB_IP:-172.31.253.3}
+    # vpn.json's group (vpn_doc, 10007): shared with wg and group-gate only.
+    group_add: ["10007"]
     mem_limit: 1g
     pids_limit: 512
     labels:
@@ -1328,35 +1350,38 @@ services:
     image: portcullis-wg
     <<: *hardening
     profiles: [wg]
+    # Its own uid and group, plus 10007 for vpn.json (vpn_doc); never the
+    # Hub's 10001, no hub_data: it is the internet-exposed service.
     user: "10006:10006"
-    # Group 10001 (the Hub's): reads vpn.json (0640 group 10001) and writes
-    # status.json with that group for the Hub.
-    group_add: ["10001"]
+    group_add: ["10007"]
     read_only: true
     environment:
-      WG_VPN_FILE: /hub-data/vpn.json
+      WG_VPN_FILE: /vpn-doc/vpn.json
       WG_STATUS_FILE: /data/status.json
       WG_PEOPLE_KEY: /run/portcullis/wg/people.key
       WG_PEOPLE: ${PORTCULLIS_VPN_BUILTIN:-off}
       WG_PORT: ${PORTCULLIS_VPN_PORT:-51820}
       WG_SUBNET: ${PORTCULLIS_VPN_SUBNET:-10.213.0.0/22}
       WG_VPN_ADDR: ${PORTCULLIS_VPN_WG_IP:-172.31.254.3}
-      WG_TRAEFIK: ${PORTCULLIS_VPN_TRAEFIK_IP:-172.31.254.2}:8443
+      WG_EDGE_ADDR: ${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}
+      WG_TRAEFIK: ${PORTCULLIS_VPN_EDGE_TRAEFIK_IP:-172.31.254.66}:8443
       WG_DNS_UPSTREAM: ${PORTCULLIS_VPN_DNS_UPSTREAM:-1.1.1.1,9.9.9.9}
       WG_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
       WG_MODE: ${PORTCULLIS_VPN_MODE:-apps}
-      # Metrics only on the address of the portcullis-only alias below (never
-      # portcullis-vpn, where gateways sit).
+      # Metrics only on its address on portcullis-metrics-wg (the alias
+      # below; that network holds just Prometheus and wg).
       WG_METRICS: wg-metrics:9100
     volumes:
-      - hub_data:/hub-data:ro
+      - vpn_doc:/vpn-doc:ro
       - wg_data:/data
       - ./secrets/wg/people.key:/run/portcullis/wg/people.key:ro
     networks:
       portcullis-vpn:
         ipv4_address: ${PORTCULLIS_VPN_WG_IP:-172.31.254.3}
+      portcullis-vpn-edge:
+        ipv4_address: ${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}
       wg-egress: {}
-      portcullis:
+      portcullis-metrics-wg:
         aliases: [wg-metrics]
     ports:
       - "${PORTCULLIS_VPN_PORT:-51820}:${PORTCULLIS_VPN_PORT:-51820}/udp"
@@ -1387,6 +1412,8 @@ services:
     networks:
       - monitoring
       - portcullis
+      # wg's metrics (profile wg), the only other member.
+      - portcullis-metrics-wg
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
       interval: 15s
@@ -1559,6 +1586,10 @@ volumes:
   # wg's status.json (contract §16): written by wg (10006), read by the Hub
   # (group 10001). Status only, not backed up.
   wg_data:
+  # vpn.json (contract §4/§16): written by the Hub (10001:10007, 2750),
+  # read by wg and group-gate through group 10007. Regenerated by the Hub
+  # from its state: not backed up.
+  vpn_doc:
   prometheus_data:
   alertmanager_data:
   grafana_data:

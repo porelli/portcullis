@@ -1034,12 +1034,14 @@ expect_eq "every core router's entrypoints is its class variable (admin / enrol 
 expect_eq "every core router with a rule has an entrypoints label" \
   "$(printf '%s\n' "$ROUTERS" | LC_ALL=C sort | tr '\n' ' ')" \
   "$(printf '%s' "$EP_GOT" | tr ';' '\n' | awk 'NF {print $1}' | LC_ALL=C sort | tr '\n' ' ')"
-expect_eq "vpnsecure trusts PROXY from wg's pinned address only" \
-  "$(grep -cF 'TRAEFIK_ENTRYPOINTS_VPNSECURE_PROXYPROTOCOL_TRUSTEDIPS: ${PORTCULLIS_VPN_WG_IP:-172.31.254.3}/32' "$ROOT_DIR/docker-compose.yml"):$(grep -cF 'ipv4_address: ${PORTCULLIS_VPN_WG_IP:-172.31.254.3}' "$ROOT_DIR/docker-compose.yml")" "1:1"
+expect_eq "vpnsecure trusts PROXY from wg's portcullis-vpn-edge address only" \
+  "$(grep -cF 'TRAEFIK_ENTRYPOINTS_VPNSECURE_PROXYPROTOCOL_TRUSTEDIPS: ${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}/32' "$ROOT_DIR/docker-compose.yml"):$(grep -cF 'ipv4_address: ${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}' "$ROOT_DIR/docker-compose.yml"):$(grep -c 'PROXYPROTOCOL_TRUSTEDIPS' "$ROOT_DIR/docker-compose.yml")" "1:1:1"
+expect_eq "Traefik is not on portcullis-vpn (gateways are)" \
+  "$(awk '/^  traefik:$/ {on = 1; next} on && /^  [a-z][a-z0-9-]*:$/ {exit} on' "$ROOT_DIR/docker-compose.yml" | grep -c '^      portcullis-vpn:$' || true)" 0
 expect_eq "no forwardedHeaders trust and no PROXY insecure on vpnsecure (or anywhere)" \
   "$(grep -ciE 'TRAEFIK_ENTRYPOINTS_[A-Z]+_(FORWARDEDHEADERS|PROXYPROTOCOL_INSECURE)' "$ROOT_DIR/docker-compose.yml" || true)" 0
-expect_eq "vpnsecure is bound to Traefik's portcullis-vpn address and drops header aliases" \
-  "$(grep -cE '^      TRAEFIK_ENTRYPOINTS_VPNSECURE_(ADDRESS: \$\{PORTCULLIS_VPN_TRAEFIK_IP:-172\.31\.254\.2\}:8443|HTTP_ALIASHEADERSSTRATEGY: delete)$' "$ROOT_DIR/docker-compose.yml")" 2
+expect_eq "vpnsecure is bound to Traefik's portcullis-vpn-edge address and drops header aliases" \
+  "$(grep -cE '^      TRAEFIK_ENTRYPOINTS_VPNSECURE_(ADDRESS: \$\{PORTCULLIS_VPN_EDGE_TRAEFIK_IP:-172\.31\.254\.66\}:8443|HTTP_ALIASHEADERSSTRATEGY: delete)$' "$ROOT_DIR/docker-compose.yml")" 2
 # The Hub can't write traefik/: /project is read-only and no writable mount
 # (short or long syntax: bind, volume, tmpfs) has traefik in its source or
 # target; the writable ones are exactly these.
@@ -1068,7 +1070,7 @@ expect_eq "the hub service mounts nothing under traefik/ read-write" \
 expect_eq "the hub mounts the checkout read-only" "$(printf '%s\n' "$HUB_SVC" | grep -c '^      - \.:/project:ro$')" 1
 expect_eq "the Hub's writable mounts are exactly templates/, appfiles/, its volumes and the masking tmpfs" \
   "$(hub_writable_mounts "$ROOT_DIR/docker-compose.yml" | LC_ALL=C sort | tr '\n' ';')" \
-  "(tmpfs) -> /project/backups;(tmpfs) -> /project/secrets;./appfiles -> /project/appfiles;./templates -> /project/templates;group_gate_data -> /group-gate-data;hub_data -> /data;hub_secrets -> /secrets;"
+  "(tmpfs) -> /project/backups;(tmpfs) -> /project/secrets;./appfiles -> /project/appfiles;./templates -> /project/templates;group_gate_data -> /group-gate-data;hub_data -> /data;hub_secrets -> /secrets;vpn_doc -> /vpn-doc;"
 # The check itself catches both syntaxes (planted mounts on a copy).
 awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      - ./traefik/dynamic:/project/traefik/dynamic" }' "$ROOT_DIR/docker-compose.yml" > "$WORK/compose-short.yml"
 awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      - type: bind"; print "        source: ./traefik"; print "        target: /etc/x"; print "        read_only: false" }' "$ROOT_DIR/docker-compose.yml" > "$WORK/compose-long.yml"
@@ -1092,8 +1094,8 @@ expect_eq "no portcullis-self middleware and no \"/authenticated\" anywhere" \
 expect_eq "the people router uses client-cert-pem@file, before portcullis-groups@docker" \
   "$(svc hub | sed -n 's/^      traefik\.http\.routers\.people\.middlewares: //p')" \
   "rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file"
-expect_eq "group-gate mounts group_gate_data read-write, has group_add 10001, and both CA files read-only; GATE_CRL_URLS lists pki_int and pki_file" \
-  "$(printf '%s\n' "$GG_SVC" | grep -cxE '      - group_gate_data:/data|    group_add: \["10001"\]|      - \./certs/yubikey-ca\.crt:/etc/group-gate/ca/yubikey-ca\.crt:ro|      - \./certs/browser-ca\.crt:/etc/group-gate/ca/browser-ca\.crt:ro|      GATE_YUBIKEY_CA_FILE: /etc/group-gate/ca/yubikey-ca\.crt|      GATE_BROWSER_CA_FILE: /etc/group-gate/ca/browser-ca\.crt|      GATE_OPENED_DIR: /data/opened|      GATE_CRL_URLS: http://vault:8200/v1/pki_int/crl http://vault:8200/v1/pki_file/crl|      GATE_DELTA_CRL_URLS: http://vault:8200/v1/pki_int/crl/delta http://vault:8200/v1/pki_file/crl/delta'):$(printf '%s\n' "$GG_SVC" | grep -cE 'GATE_(DELTA_)?CRL_URL:' || true)" "9:0"
+expect_eq "group-gate mounts group_gate_data read-write, has group_add 10001 (+ 10007 for vpn.json), and both CA files read-only; GATE_CRL_URLS lists pki_int and pki_file" \
+  "$(printf '%s\n' "$GG_SVC" | grep -cxE '      - group_gate_data:/data|    group_add: \["10001", "10007"\]|      - \./certs/yubikey-ca\.crt:/etc/group-gate/ca/yubikey-ca\.crt:ro|      - \./certs/browser-ca\.crt:/etc/group-gate/ca/browser-ca\.crt:ro|      GATE_YUBIKEY_CA_FILE: /etc/group-gate/ca/yubikey-ca\.crt|      GATE_BROWSER_CA_FILE: /etc/group-gate/ca/browser-ca\.crt|      GATE_OPENED_DIR: /data/opened|      GATE_CRL_URLS: http://vault:8200/v1/pki_int/crl http://vault:8200/v1/pki_file/crl|      GATE_DELTA_CRL_URLS: http://vault:8200/v1/pki_int/crl/delta http://vault:8200/v1/pki_file/crl/delta'):$(printf '%s\n' "$GG_SVC" | grep -cE 'GATE_(DELTA_)?CRL_URL:' || true)" "9:0"
 # shellcheck disable=SC2016  # a literal ${IMPERSONATION_MAX_MINUTES:-30}
 expect_eq "group-gate has GATE_IMPERSONATION_FILE under /hub-data; hub has HUB_IMPERSONATION_MAX_MINUTES" \
   "$(printf '%s\n' "$GG_SVC" | sed -n 's/^      GATE_IMPERSONATION_FILE: //p'):$(printf '%s\n' "$GG_SVC" | grep -cxF '      - hub_data:/hub-data:ro'):$(svc hub | sed -n 's/^      HUB_IMPERSONATION_MAX_MINUTES: //p')" \

@@ -25,6 +25,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -143,7 +144,7 @@ func cli(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			fmt.Fprint(stderr, "usage: wg providers\n")
 			return 2
 		}
-		return providers(envOr(getenv, "WG_VPN_FILE", "/hub-data/vpn.json"), stdout, stderr)
+		return providers(envOr(getenv, "WG_VPN_FILE", "/vpn-doc/vpn.json"), stdout, stderr)
 	case "run":
 		if len(rest) != 0 {
 			fmt.Fprint(stderr, "usage: wg run\n")
@@ -231,7 +232,8 @@ type config struct {
 	People                         bool
 	Port                           int
 	Subnet                         netip.Prefix
-	VPNAddr                        netip.Addr
+	VPNAddr                        netip.Addr // portcullis-vpn: the edge ports gateways connect to
+	EdgeAddr                       netip.Addr // portcullis-vpn-edge: the only source Traefik trusts PROXY from
 	Traefik                        netip.AddrPort
 	Upstreams                      []string
 	Domain                         string
@@ -241,7 +243,7 @@ type config struct {
 
 func loadConfig(getenv func(string) string) (*config, error) {
 	c := &config{
-		VPNFile:    envOr(getenv, "WG_VPN_FILE", "/hub-data/vpn.json"),
+		VPNFile:    envOr(getenv, "WG_VPN_FILE", "/vpn-doc/vpn.json"),
 		StatusFile: envOr(getenv, "WG_STATUS_FILE", "/data/status.json"),
 		PeopleKey:  envOr(getenv, "WG_PEOPLE_KEY", "/run/portcullis/wg/people.key"),
 		Domain:     strings.ToLower(strings.TrimSpace(getenv("WG_DOMAIN"))),
@@ -268,9 +270,14 @@ func loadConfig(getenv func(string) string) (*config, error) {
 		return nil, errors.New("WG_VPN_ADDR must be wg's IPv4 address on portcullis-vpn")
 	}
 	c.VPNAddr = a
+	ea, err := netip.ParseAddr(getenv("WG_EDGE_ADDR"))
+	if err != nil || !ea.Is4() || ea == a {
+		return nil, errors.New("WG_EDGE_ADDR must be wg's IPv4 address on portcullis-vpn-edge (not its portcullis-vpn one)")
+	}
+	c.EdgeAddr = ea
 	tr, err := netip.ParseAddrPort(getenv("WG_TRAEFIK"))
 	if err != nil || !tr.Addr().Is4() {
-		return nil, errors.New("WG_TRAEFIK must be Traefik's vpnsecure <ipv4>:<port>")
+		return nil, errors.New("WG_TRAEFIK must be Traefik's vpnsecure <ipv4>:<port> on portcullis-vpn-edge")
 	}
 	c.Traefik = tr
 	ups, err := resolver.Upstreams(envOr(getenv, "WG_DNS_UPSTREAM", "1.1.1.1,9.9.9.9"))
@@ -302,11 +309,12 @@ func loadConfig(getenv func(string) string) (*config, error) {
 	return c, nil
 }
 
-// metricsAddr picks the metrics listen address (V23): the one address
-// the host part resolves to, which must be one of the container's own and
-// never the portcullis-vpn address (gateways on that network must not
-// reach metrics) or loopback.
-func metricsAddr(hostport string, lookup func(string) ([]netip.Addr, error), local []netip.Addr, vpn netip.Addr) (netip.AddrPort, error) {
+// metricsAddr picks the metrics listen address: the one address the host
+// part (the alias wg has on portcullis-metrics-wg, shared with Prometheus
+// only) resolves to, which must be one of the container's own, never
+// loopback and never one of never (the portcullis-vpn address, where
+// gateways sit, and the edge one).
+func metricsAddr(hostport string, lookup func(string) ([]netip.Addr, error), local []netip.Addr, never ...netip.Addr) (netip.AddrPort, error) {
 	h, port, err := net.SplitHostPort(hostport)
 	if err != nil {
 		return netip.AddrPortFrom(netip.Addr{}, 0), err
@@ -329,8 +337,13 @@ func metricsAddr(hostport string, lookup func(string) ([]netip.Addr, error), loc
 		return netip.AddrPort{}, fmt.Errorf("%s resolves to %d IPv4 addresses, want 1", h, len(v4))
 	}
 	ip := v4[0]
-	if ip == vpn || ip.IsLoopback() {
+	if ip.IsLoopback() {
 		return netip.AddrPort{}, fmt.Errorf("%s resolves to an address metrics may not use", h)
+	}
+	for _, n := range never {
+		if ip == n {
+			return netip.AddrPort{}, fmt.Errorf("%s resolves to an address metrics may not use", h)
+		}
 	}
 	for _, l := range local {
 		if l == ip {
@@ -368,7 +381,10 @@ func serve(ctx context.Context, cfg *config) error {
 	var docErr atomic.Value // string
 	docErr.Store("vpn.json: not read yet")
 
-	e := edge.New(cfg.Traefik, cfg.VPNAddr, doc.Load, time.Now)
+	// Connections to Traefik leave from the edge network's address: the
+	// only one vpnsecure trusts PROXY headers from (gateways can't reach
+	// that network at all).
+	e := edge.New(cfg.Traefik, cfg.EdgeAddr, doc.Load, time.Now)
 
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(e.Collectors()...)
@@ -498,6 +514,9 @@ func serve(ctx context.Context, cfg *config) error {
 		}
 		return st
 	}
+	if err := status.CheckDir(filepath.Dir(cfg.StatusFile)); err != nil {
+		log.Printf("wg: %v", err)
+	}
 	status.Run(ctx, cfg.StatusFile, status.Interval, build, time.Now, func(err error) {
 		log.Printf("wg: writing the status file failed: %v", err)
 	})
@@ -515,7 +534,7 @@ func serveMetrics(ctx context.Context, cfg *config, reg *prometheus.Registry) {
 	var addr netip.AddrPort
 	var err error
 	for i := 0; i < 30; i++ {
-		addr, err = metricsAddr(cfg.Metrics, lookupIPs, localAddrs(), cfg.VPNAddr)
+		addr, err = metricsAddr(cfg.Metrics, lookupIPs, localAddrs(), cfg.VPNAddr, cfg.EdgeAddr)
 		if err == nil {
 			break
 		}

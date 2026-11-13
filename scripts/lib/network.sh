@@ -24,11 +24,15 @@
 #   PORTCULLIS_MCP_IP_RANGE    default 172.31.253.8/29 (the gate's dynamic address)
 #   PORTCULLIS_MCP_KEYCLOAK_IP default 172.31.253.2 (pinned; the gate's /etc/hosts)
 #   PORTCULLIS_MCP_HUB_IP      default 172.31.253.3 (pinned; the gate's /etc/hosts)
-#   PORTCULLIS_VPN_NET         default 172.31.254.0/26 (portcullis-vpn: Traefik's
-#                              vpnsecure, wg, wired providers' gateways .16–.62)
+#   PORTCULLIS_VPN_NET         default 172.31.254.0/26 (portcullis-vpn: wg's edge
+#                              ports, wired providers' gateways .16–.62; no Traefik)
 #   PORTCULLIS_VPN_IP_RANGE    default 172.31.254.8/29 (dynamic; none of the pinned)
-#   PORTCULLIS_VPN_TRAEFIK_IP  default 172.31.254.2 (vpnsecure)
-#   PORTCULLIS_VPN_WG_IP       default 172.31.254.3 (the only PROXY-trusted address)
+#   PORTCULLIS_VPN_WG_IP       default 172.31.254.3 (wg, where gateways connect)
+#   PORTCULLIS_VPN_EDGE_SUBNET default 172.31.254.64/28 (portcullis-vpn-edge:
+#                              exactly wg and Traefik's vpnsecure)
+#   PORTCULLIS_VPN_EDGE_IP_RANGE    default 172.31.254.72/29
+#   PORTCULLIS_VPN_EDGE_TRAEFIK_IP  default 172.31.254.66 (vpnsecure)
+#   PORTCULLIS_VPN_EDGE_WG_IP       default 172.31.254.67 (the only PROXY-trusted address)
 
 PROXY_NETWORK="${PROXY_NETWORK:-portcullis-proxy}"
 AUTH_NETWORK="${AUTH_NETWORK:-portcullis-auth}"
@@ -36,6 +40,7 @@ AUTH_NETWORK="${AUTH_NETWORK:-portcullis-auth}"
 DOMAINS_NETWORK="${DOMAINS_NETWORK:-portcullis_portcullis-domains}"
 MCP_NETWORK="${MCP_NETWORK:-portcullis-mcp}"
 VPN_NETWORK="${VPN_NETWORK:-portcullis-vpn}"
+VPN_EDGE_NETWORK="${VPN_EDGE_NETWORK:-portcullis-vpn-edge}"
 
 proxy_subnet()   { echo "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24}"; }
 proxy_ip_range() { echo "${PORTCULLIS_PROXY_IP_RANGE:-172.31.250.128/25}"; }
@@ -51,8 +56,11 @@ mcp_keycloak_ip() { echo "${PORTCULLIS_MCP_KEYCLOAK_IP:-172.31.253.2}"; }
 mcp_hub_ip()     { echo "${PORTCULLIS_MCP_HUB_IP:-172.31.253.3}"; }
 vpn_net()        { echo "${PORTCULLIS_VPN_NET:-172.31.254.0/26}"; }
 vpn_ip_range()   { echo "${PORTCULLIS_VPN_IP_RANGE:-172.31.254.8/29}"; }
-vpn_traefik_ip() { echo "${PORTCULLIS_VPN_TRAEFIK_IP:-172.31.254.2}"; }
 vpn_wg_ip()      { echo "${PORTCULLIS_VPN_WG_IP:-172.31.254.3}"; }
+vpn_edge_subnet()     { echo "${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28}"; }
+vpn_edge_ip_range()   { echo "${PORTCULLIS_VPN_EDGE_IP_RANGE:-172.31.254.72/29}"; }
+vpn_edge_traefik_ip() { echo "${PORTCULLIS_VPN_EDGE_TRAEFIK_IP:-172.31.254.66}"; }
+vpn_edge_wg_ip()      { echo "${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}"; }
 
 # ip_to_int <a.b.c.d> — prints the address as an integer; fails if invalid.
 ip_to_int() {
@@ -189,36 +197,50 @@ validate_mcp_network_config() {
   done
 }
 
-# validate_vpn_network_config — portcullis-vpn (contract §16): Traefik's
-# vpnsecure address and wg's (the only PROXY-trusted one) pinned inside the
-# subnet, apart, outside the dynamic range; the Hub pins wired providers'
-# gateways at .16–.62 (Config.VPNNet), so the subnet is a /26 at least and
-# neither the range nor the two pinned addresses reach that window; no
-# overlap with the other fixed core networks.
+# validate_vpn_network_config — portcullis-vpn (contract §16): wg's
+# address (its edge ports) pinned inside the subnet, outside the dynamic
+# range; the Hub pins wired providers' gateways at .16–.62 (Config.VPNNet),
+# so the subnet is a /26 at least and neither the range nor wg reach that
+# window; no overlap with the other fixed core networks. Traefik is never
+# on it (gateways share it): vpnsecure lives on portcullis-vpn-edge.
 validate_vpn_network_config() {
-  local sub range sf sl rf rl n ip var other
+  local sub range sf sl rf rl n other
   sub="$(vpn_net)"; range="$(vpn_ip_range)"
-  _validate_net PORTCULLIS_VPN "$sub" "$range" "$(vpn_traefik_ip)" PORTCULLIS_VPN_TRAEFIK_IP || return 1
   _validate_net PORTCULLIS_VPN "$sub" "$range" "$(vpn_wg_ip)" PORTCULLIS_VPN_WG_IP || return 1
-  if [ "$(ip_to_int "$(vpn_traefik_ip)")" = "$(ip_to_int "$(vpn_wg_ip)")" ]; then
-    echo "PORTCULLIS_VPN_TRAEFIK_IP and PORTCULLIS_VPN_WG_IP are the same address ($(vpn_wg_ip))"; return 1
-  fi
   read -r sf sl <<< "$(cidr_bounds "$sub")"
   [ $((sl - sf + 1)) -ge 64 ] || { echo "PORTCULLIS_VPN_NET=$sub is too small (at least a /26: gateways take .16–.62)"; return 1; }
   read -r rf rl <<< "$(cidr_bounds "$range")"
   if [ "$rl" -ge $((sf + 16)) ] && [ "$rf" -le $((sf + 62)) ]; then
     echo "PORTCULLIS_VPN_IP_RANGE=$range reaches the gateway addresses .16–.62 of PORTCULLIS_VPN_NET"; return 1
   fi
-  for var in PORTCULLIS_VPN_TRAEFIK_IP PORTCULLIS_VPN_WG_IP; do
-    if [ "$var" = PORTCULLIS_VPN_TRAEFIK_IP ]; then ip="$(vpn_traefik_ip)"; else ip="$(vpn_wg_ip)"; fi
-    n="$(ip_to_int "$ip")"
-    if [ "$n" -ge $((sf + 16)) ] && [ "$n" -le $((sf + 62)) ]; then
-      echo "$var=$ip is one of the gateway addresses .16–.62 of PORTCULLIS_VPN_NET"; return 1
-    fi
-  done
+  n="$(ip_to_int "$(vpn_wg_ip)")"
+  if [ "$n" -ge $((sf + 16)) ] && [ "$n" -le $((sf + 62)) ]; then
+    echo "PORTCULLIS_VPN_WG_IP=$(vpn_wg_ip) is one of the gateway addresses .16–.62 of PORTCULLIS_VPN_NET"; return 1
+  fi
   for other in "PORTCULLIS_PROXY_SUBNET=$(proxy_subnet)" "PORTCULLIS_AUTH_SUBNET=$(auth_subnet)" \
-               "PORTCULLIS_DOMAINS_SUBNET=$(domains_subnet)" "PORTCULLIS_MCP_SUBNET=$(mcp_subnet)"; do
+               "PORTCULLIS_DOMAINS_SUBNET=$(domains_subnet)" "PORTCULLIS_MCP_SUBNET=$(mcp_subnet)" \
+               "PORTCULLIS_VPN_EDGE_SUBNET=$(vpn_edge_subnet)"; do
     if _overlaps "$sub" "${other#*=}"; then echo "PORTCULLIS_VPN_NET=$sub overlaps $other"; return 1; fi
+  done
+}
+
+# validate_vpn_edge_network_config — portcullis-vpn-edge (contract §16):
+# exactly wg and Traefik's vpnsecure; Traefik trusts PROXY headers from
+# wg's address here only, and no gateway can reach this network. Both
+# pinned inside the subnet, outside the dynamic range, apart; no overlap
+# with any other fixed core network.
+validate_vpn_edge_network_config() {
+  local sub range other
+  sub="$(vpn_edge_subnet)"; range="$(vpn_edge_ip_range)"
+  _validate_net PORTCULLIS_VPN_EDGE "$sub" "$range" "$(vpn_edge_traefik_ip)" PORTCULLIS_VPN_EDGE_TRAEFIK_IP || return 1
+  _validate_net PORTCULLIS_VPN_EDGE "$sub" "$range" "$(vpn_edge_wg_ip)" PORTCULLIS_VPN_EDGE_WG_IP || return 1
+  if [ "$(ip_to_int "$(vpn_edge_traefik_ip)")" = "$(ip_to_int "$(vpn_edge_wg_ip)")" ]; then
+    echo "PORTCULLIS_VPN_EDGE_TRAEFIK_IP and PORTCULLIS_VPN_EDGE_WG_IP are the same address ($(vpn_edge_wg_ip))"; return 1
+  fi
+  for other in "PORTCULLIS_PROXY_SUBNET=$(proxy_subnet)" "PORTCULLIS_AUTH_SUBNET=$(auth_subnet)" \
+               "PORTCULLIS_DOMAINS_SUBNET=$(domains_subnet)" "PORTCULLIS_MCP_SUBNET=$(mcp_subnet)" \
+               "PORTCULLIS_VPN_NET=$(vpn_net)"; do
+    if _overlaps "$sub" "${other#*=}"; then echo "PORTCULLIS_VPN_EDGE_SUBNET=$sub overlaps $other"; return 1; fi
   done
 }
 
@@ -436,6 +458,7 @@ auth_network_state()  { network_state "$AUTH_NETWORK" "$(auth_subnet)" "$(auth_i
 domains_network_state() { network_state "$DOMAINS_NETWORK" "$(domains_subnet)" ""; }
 mcp_network_state()   { network_state "$MCP_NETWORK" "$(mcp_subnet)" "$(mcp_ip_range)"; }
 vpn_network_state()   { network_state "$VPN_NETWORK" "$(vpn_net)" "$(vpn_ip_range)"; }
+vpn_edge_network_state() { network_state "$VPN_EDGE_NETWORK" "$(vpn_edge_subnet)" "$(vpn_edge_ip_range)"; }
 
 # network_check — validate the .env settings and refuse to continue if the
 # existing network does not match them (compose would silently keep the old
@@ -448,6 +471,7 @@ network_check() {
   err="$(validate_domains_network_config)" || fail "Invalid portcullis-domains settings in .env: $err"
   err="$(validate_mcp_network_config)" || fail "Invalid portcullis-mcp settings in .env: $err"
   err="$(validate_vpn_network_config)" || fail "Invalid portcullis-vpn settings in .env: $err"
+  err="$(validate_vpn_edge_network_config)" || fail "Invalid portcullis-vpn-edge settings in .env: $err"
   st="$(proxy_network_state)"
   [ "$st" != unknown ] || fail "can't read the IP range of $PROXY_NETWORK (podman network inspect failed): refusing to go on unverified"
   if [ "$st" = mismatch ]; then
@@ -484,6 +508,13 @@ network_check() {
        ($(vpn_net), range $(vpn_ip_range)). Wired VPN gateways join it: unwire the
        VPN providers in the Hub, run ./portcullis down, then
        docker network rm $VPN_NETWORK && ./portcullis up"
+  fi
+  st="$(vpn_edge_network_state)"
+  [ "$st" != unknown ] || fail "can't read the IP range of $VPN_EDGE_NETWORK (podman network inspect failed): refusing to go on unverified"
+  if [ "$st" = mismatch ]; then
+    fail "Docker network $VPN_EDGE_NETWORK exists with a different IPAM config than .env
+       ($(vpn_edge_subnet), range $(vpn_edge_ip_range)). Only wg and Traefik use it:
+       ./portcullis down && ./portcullis up recreates it."
   fi
   local shadows
   shadows="$(proxy_dns_shadows)" || fail "could not inspect the containers on $PROXY_NETWORK (docker error): refusing to go on without the core-name check"

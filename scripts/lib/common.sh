@@ -277,7 +277,10 @@ CT_UID_GROUP_GATE=10003 # group-gate/Dockerfile (USER 10003:10003, + group 10001
 CT_UID_DOMAINS=10004  # domains/Dockerfile (USER 10004:10004)
 # shellcheck disable=SC2034  # used by mcpgate.sh / backup.sh
 CT_UID_MCP_GATE=10005 # mcp-gate/Dockerfile (USER 10005:10005, + group 10001)
-CT_UID_WG=10006      # wg/Dockerfile (USER 10006:10006, + group 10001)
+CT_UID_WG=10006      # wg/Dockerfile (USER 10006:10006; no other group)
+# vpn_doc's group (vpn.json, contract §16): the Hub (writer), wg and
+# group-gate (readers) only — never the Hub's own 10001.
+CT_GID_VPN_DOC=10007
 CT_GID_TRAEFIK=0      # Traefik runs as root, but without CAP_DAC_OVERRIDE
 # shellcheck disable=SC2034  # used by sessions.sh
 CT_UID_SESSIONS=999   # valkey/valkey alpine: valkey = 999:1000 (compose user: "999:1000")
@@ -624,8 +627,14 @@ stack_prepare() {
   [ -f "$PORTCULLIS_ROOT/secrets/wg/people.key" ] || (umask 027 && : > "$PORTCULLIS_ROOT/secrets/wg/people.key")
   chmod 640 "$PORTCULLIS_ROOT/secrets/wg/people.key"
   # wg_data: wg (10006) writes status.json, the Hub reads it through group
-  # 10001 (V5); setgid so every file wg makes there carries the group.
+  # 10001 (V5); setgid, so every file wg makes there carries 10001 although
+  # wg isn't in that group.
   volume_own wg_data "$CT_UID_WG:$CT_UID_HUB" 2750
+  # vpn_doc: the Hub writes vpn.json (0640) there; wg and group-gate read it
+  # through group 10007 (their group_add), the only group they share with
+  # the Hub for it. setgid so the Hub's files carry 10007. Not backed up:
+  # the Hub rewrites it from its state.
+  volume_own vpn_doc "$CT_UID_HUB:$CT_GID_VPN_DOC" 2750
   # hub_secrets: per-person password hashes (contract §6, file sharing). The
   # Hub checks ownership and mode at start; ensure it here.
   _ensure_secrets_volume

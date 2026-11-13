@@ -7,8 +7,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -52,8 +54,9 @@ type Doc struct {
 }
 
 // Write replaces path atomically (temp file in the same directory +
-// rename), mode 0640, group 10001 (wg is a member; wg_data is setgid
-// 10001 too).
+// rename), mode 0640. Its group (10001, the Hub's) comes from the
+// directory: wg_data is 10006:10001 setgid 2750 (stack_prepare), and wg
+// itself is in no group but its own.
 func Write(path string, d Doc, now time.Time) error {
 	d.Version = Version
 	d.Written = now.UTC().Truncate(time.Second)
@@ -78,14 +81,27 @@ func Write(path string, d Doc, now time.Time) error {
 		f.Close()
 		return err
 	}
-	// wg is a member of 10001, so this needs no capability; outside the
-	// container (tests) it fails with EPERM and the directory's group
-	// applies.
-	_ = f.Chown(-1, SharedGID)
 	if err := f.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// CheckDir reports why the Hub couldn't read files written in dir: it
+// must have group SharedGID and the setgid bit (nil when it does).
+func CheckDir(dir string) error {
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return errors.New("status: the status directory is missing")
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil
+	}
+	if int(st.Gid) != SharedGID || fi.Mode()&os.ModeSetgid == 0 {
+		return fmt.Errorf("status: %s must be group %d with the setgid bit (2750; ./portcullis up sets it), or the Hub can't read status.json", dir, SharedGID)
+	}
+	return nil
 }
 
 // Read parses a status file.

@@ -125,7 +125,7 @@ func TestHealthcheckAndStatus(t *testing.T) {
 
 func TestLoadConfig(t *testing.T) {
 	base := map[string]string{
-		"WG_VPN_ADDR": "172.31.254.3", "WG_TRAEFIK": "172.31.254.2:8443", "WG_DOMAIN": "example.org",
+		"WG_VPN_ADDR": "172.31.254.3", "WG_EDGE_ADDR": "172.31.254.67", "WG_TRAEFIK": "172.31.254.66:8443", "WG_DOMAIN": "example.org",
 	}
 	get := func(over map[string]string) func(string) string {
 		return func(k string) string {
@@ -140,7 +140,7 @@ func TestLoadConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.People || c.Port != 51820 || c.Subnet != netip.MustParsePrefix("10.213.0.0/22") || c.Mode != "apps" ||
-		c.VPNFile != "/hub-data/vpn.json" || c.StatusFile != "/data/status.json" || c.PeopleKey != "/run/portcullis/wg/people.key" ||
+		c.VPNFile != "/vpn-doc/vpn.json" || c.EdgeAddr != netip.MustParseAddr("172.31.254.67") || c.StatusFile != "/data/status.json" || c.PeopleKey != "/run/portcullis/wg/people.key" ||
 		len(c.Upstreams) != 2 || c.Metrics != "wg-metrics:9100" {
 		t.Fatalf("defaults %+v", c)
 	}
@@ -152,6 +152,8 @@ func TestLoadConfig(t *testing.T) {
 		"subnet unmasked": {"WG_SUBNET": "10.213.0.1/22"},
 		"subnet /31":      {"WG_SUBNET": "10.213.0.0/31"},
 		"vpn addr":        {"WG_VPN_ADDR": ""},
+		"edge addr":       {"WG_EDGE_ADDR": ""},
+		"edge = vpn addr": {"WG_EDGE_ADDR": "172.31.254.3"},
 		"traefik":         {"WG_TRAEFIK": "traefik:8443"},
 		"mode":            {"WG_MODE": "everything"},
 		"upstream":        {"WG_DNS_UPSTREAM": "dns.google"},
@@ -173,7 +175,8 @@ func TestLoadConfig(t *testing.T) {
 // and never the portcullis-vpn one.
 func TestMetricsAddr(t *testing.T) {
 	vpn := netip.MustParseAddr("172.31.254.3")
-	local := []netip.Addr{netip.MustParseAddr("127.0.0.1"), vpn, netip.MustParseAddr("172.18.0.5"), netip.MustParseAddr("172.19.0.7")}
+	edgeA := netip.MustParseAddr("172.31.254.67")
+	local := []netip.Addr{netip.MustParseAddr("127.0.0.1"), vpn, edgeA, netip.MustParseAddr("172.18.0.5"), netip.MustParseAddr("172.19.0.7")}
 	look := func(ips ...string) func(string) ([]netip.Addr, error) {
 		return func(string) ([]netip.Addr, error) {
 			var out []netip.Addr
@@ -183,19 +186,20 @@ func TestMetricsAddr(t *testing.T) {
 			return out, nil
 		}
 	}
-	got, err := metricsAddr("wg-metrics:9100", look("172.18.0.5"), local, vpn)
+	got, err := metricsAddr("wg-metrics:9100", look("172.18.0.5"), local, vpn, edgeA)
 	if err != nil || got != netip.MustParseAddrPort("172.18.0.5:9100") {
 		t.Fatalf("%v %v", got, err)
 	}
 	for name, l := range map[string]func(string) ([]netip.Addr, error){
 		"vpn address":  look("172.31.254.3"),
+		"edge address": look("172.31.254.67"),
 		"not local":    look("10.1.1.1"),
 		"two answers":  look("172.18.0.5", "172.19.0.7"),
 		"no answer":    look(),
 		"ipv6 answer":  look("fd00::5"),
 		"loopback too": look("127.0.0.1"),
 	} {
-		if _, err := metricsAddr("wg-metrics:9100", l, local, vpn); err == nil {
+		if _, err := metricsAddr("wg-metrics:9100", l, local, vpn, edgeA); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
 	}
