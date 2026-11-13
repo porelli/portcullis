@@ -601,10 +601,11 @@ _restore_vault() {
 
 # _strip_host_files <secrets dir> — removes what belongs to one host, not
 # the install: the last detected public addresses (domains.sh
-# domains_public_ips falls back to them). A backup never carries them, a
+# domains_public_ips falls back to them) and a pending ACME flip's settle
+# point (acme-relax.env, dns.sh). A backup never carries them, a
 # restore deletes them (older backups, or the same host: can't tell).
 _strip_host_files() {
-  rm -f "$1/domains/last-public-ipv4" "$1/domains/last-public-ipv6"
+  rm -f "$1/domains/last-public-ipv4" "$1/domains/last-public-ipv6" "$1/domains/acme-relax.env"
 }
 
 _restore_secrets() {

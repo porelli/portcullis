@@ -53,7 +53,8 @@ _st_dns_json() {
     # current one. No main-domain.env yet (Traefik registered after the
     # last up) is not lost: _st_dns_lines warns.
     | ((($m.would_issue | not) and ((.main.caa.issuer // "") != "")) or ($t != "" and $e != "" and $e != $t)) as $lost
-    | {main: ($m + {name: .main.name, lost_account: $lost, problems: (if $lost then 1 else $m.problems end)}),
+    | {main: ($m + {name: .main.name, lost_account: $lost, problems: (if $lost then 1 else $m.problems end),
+             fresh: (.main_fresh // false), checked_at: (.main.checked_at // "")}),
        domains: ((.domains // {}) | map_values(summary + {name: .name}))}'
 }
 
@@ -66,10 +67,18 @@ _st_dns_lines() {
     _st_line warn "DNS checks unavailable (the domains service isn't running)"
     return 0
   fi
-  while IFS=$'\t' read -r name addr addr_unknown caa wi sec foreign lost; do
+  local fresh at stale
+  while IFS=$'\t' read -r name addr addr_unknown caa wi sec foreign lost fresh at; do
     [ -n "$name" ] || continue
+    # The main plan couldn't be rebuilt for this status (finding A): say
+    # so, and on every clean line, never a bare ✓ on old data.
+    stale=""
+    if [ "$fresh" = false ]; then
+      _st_line warn "$name: the DNS plan couldn't be refreshed: the lines below are from ${at:-an earlier check} and may be stale (./portcullis dns check asks now)"
+      stale=" (as of ${at:-an earlier check}, may be stale)"
+    fi
     if [ "$addr" = true ]; then
-      _st_line ok "$name: A/AAAA point at this server"
+      _st_line ok "$name: A/AAAA point at this server$stale"
     elif [ "$addr_unknown" = true ]; then
       _st_line warn "$name: A/AAAA can't be checked: the server's addresses (or a lookup) are unknown (./portcullis dns plan)"
     else
@@ -82,19 +91,19 @@ _st_dns_lines() {
     if [ "$lost" = true ]; then
       _st_line fail "$name: CAA allows another ACME account than Traefik's — fix: ./portcullis dns setup"
     elif [ "$caa" = true ] && [ "$wi" = true ]; then
-      _st_line ok "$name: CAA pinned, the CA would issue"
+      _st_line ok "$name: CAA pinned, the CA would issue$stale"
     else
       _st_line warn "$name: CAA not as planned (./portcullis dns plan)"
     fi
     case "$sec" in
-      secure) _st_line ok "$name: DNSSEC secure" ;;
-      unsigned) _st_line ok "$name: DNSSEC unsigned (./portcullis dns plan shows how to sign)" ;;
-      insecure) _st_line ok "$name: DNSSEC signed, under a parent zone that isn't validated (nothing to fix here)" ;;
+      secure) _st_line ok "$name: DNSSEC secure$stale" ;;
+      unsigned) _st_line ok "$name: DNSSEC unsigned (./portcullis dns plan shows how to sign)$stale" ;;
+      insecure) _st_line ok "$name: DNSSEC signed, under a parent zone that isn't validated (nothing to fix here)$stale" ;;
       bogus|ds_mismatch) _st_line fail "$name: DNSSEC $sec — validating resolvers can't reach it (./portcullis dns plan)" ;;
       *) _st_line warn "$name: DNSSEC $sec (./portcullis dns plan)" ;;
     esac
     [ "$foreign" = 0 ] || _st_line warn "$name: $foreign record(s) under it aren't Portcullis' (./portcullis dns plan)"
-  done < <(printf '%s' "$dns" | jq -r '([.main] + [.domains[]])[] | [.name, .address_ok, (.address_unknown // false), .caa_ok, .would_issue, .dnssec, .foreign, (.lost_account // false)] | @tsv')
+  done < <(printf '%s' "$dns" | jq -r '([.main] + [.domains[]])[] | [.name, .address_ok, (.address_unknown // false), .caa_ok, .would_issue, .dnssec, .foreign, (.lost_account // false), (if has("fresh") then .fresh else true end), (.checked_at // "")] | @tsv')
 }
 
 status_run() {

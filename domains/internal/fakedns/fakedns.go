@@ -111,13 +111,10 @@ type Provider struct {
 	DeleteMode string
 }
 
-// porkbunReads: DeleteMode "porkbun" (the whole library) also reads
+// porkbunLib: DeleteMode "porkbun" plays the whole library: it also reads
 // records as libdns/porkbun v1.1.0's toLibdnsRecord does: a CAA's content
 // split on the first two spaces, the value kept as is, quotes included
 // (`0 issue "letsencrypt.org"` reads back as Value "\"letsencrypt.org\"").
-func (p *Provider) porkbunReads() bool { return p.porkbunLib() }
-
-// porkbunLib: DeleteMode "porkbun" plays the whole library.
 func (p *Provider) porkbunLib() bool { return p.DeleteMode == "porkbun" }
 
 // porkbunCAA is a stored CAA read the porkbun library's way.
@@ -185,7 +182,7 @@ func (p *Provider) GetRecords(_ context.Context, zone string) ([]libdns.Record, 
 		}
 		for _, rr := range rrs {
 			rr.Name = libdns.RelativeName(name+".", zone)
-			if c, ok := porkbunCAA(rr); ok && p.porkbunReads() {
+			if c, ok := porkbunCAA(rr); ok && p.porkbunLib() {
 				out = append(out, c)
 				continue
 			}

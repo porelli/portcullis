@@ -3,16 +3,20 @@ package main
 // apply --wait: how long to wait for the public resolvers after a write,
 // from the TTLs the provider actually stored (contract §12.1).
 //
-// A resolver may keep what it fetched before the write for the old
-// records' TTL (or, for an RRset that was empty, the zone's negative TTL);
-// the provider may store a longer TTL than Portcullis asks for (porkbun
-// raises anything under 600 s to 600). So --wait auto waits up to that
-// TTL + waitMargin (the authoritative servers' own lag and one poll),
-// longer while a resolver's answer shows it still holds the old data for
-// longer (its remaining TTL), never past waitCap. --settle (the CAA relax
-// before an ACME flip) also waits until every cache that may hold the old
-// records — the CA's resolvers too, which nobody can ask — has expired:
-// the write + that TTL + waitMargin.
+// A cache may keep what it fetched before the write for the old records'
+// TTL — the longer of what the provider stores (0 or 1 s = "auto" / the
+// zone default: unknown) and what the authoritative servers serve — or,
+// for an RRset that was empty, the zone's negative TTL; the provider may
+// store a longer TTL than Portcullis asks for (porkbun raises anything
+// under 600 s to 600). So --wait auto waits up to that TTL + waitMargin
+// (the authoritative servers' own lag and one poll), longer while a
+// resolver's answer shows it still holds the old data for longer (its
+// remaining TTL), never past waitCap. --settle (the CAA relax before an
+// ACME flip) also waits until every cache that may hold the old records —
+// the CA's resolvers too, which nobody can ask — has expired: the write +
+// that TTL + waitMargin, later if a resolver held on longer. A rerun
+// passes the settle point an earlier run reported (--settle-after): it
+// only sees the records that run wrote, not the old ones.
 
 import (
 	"context"
@@ -28,7 +32,7 @@ const (
 	waitMargin = time.Minute
 )
 
-// The wait's clock (tests replace both).
+// The wait's clock and the zone's authoritative servers (tests replace them).
 var (
 	toolNow   = time.Now
 	toolSleep = func(ctx context.Context, d time.Duration) {
@@ -39,18 +43,21 @@ var (
 		case <-t.C:
 		}
 	}
+	toolAuthServers = dnsplan.AuthServers
 )
 
-// waitReport is apply --wait's "wait" object (all durations in seconds).
+// waitReport is apply --wait's "wait" object (durations in seconds,
+// times in Unix seconds).
 type waitReport struct {
 	// Visible: every resolver shows every applied set.
 	Visible bool `json:"visible"`
-	// Settled: every cache that may hold the records from before the
-	// write has expired (the write + ttl + the margin are past).
+	// Settled: visible, and every cache that may hold the records from
+	// before the write has expired (settle_at is past).
 	Settled bool `json:"settled"`
-	// TTL: the longest TTL the provider holds for the applied sets'
-	// RRsets, before or after the write (or the zone's negative TTL for
-	// an RRset that was empty).
+	// TTL: the longest TTL caches may hold the applied sets' RRsets for,
+	// before or after the write: the provider's stored TTL (0 or 1 =
+	// unknown), the authoritative servers' served one when longer, the
+	// zone's negative TTL for an RRset that was empty.
 	TTL int `json:"ttl"`
 	// Limit: how long the tool would wait at most; Waited: how long it did.
 	Limit  int `json:"limit"`
@@ -60,6 +67,12 @@ type waitReport struct {
 	// ClearsIn: when every cache of the old records has expired at the
 	// latest, from now (0 = already).
 	ClearsIn int `json:"clears_in"`
+	// WrittenAt: this run's write; SettleAt: when every cache of the old
+	// records has expired at the latest (with --settle-after, never
+	// earlier than it); BeyondCap: SettleAt is past what one run waits.
+	WrittenAt int64 `json:"written_at"`
+	SettleAt  int64 `json:"settle_at"`
+	BeyondCap bool  `json:"beyond_cap"`
 }
 
 // applyOutput is apply's stdout: the plan, plus "wait" with --wait.
@@ -68,11 +81,12 @@ type applyOutput struct {
 	Wait *waitReport `json:"wait,omitempty"`
 }
 
-// waitOpts: --wait auto | <duration>, --settle.
+// waitOpts: --wait auto | <duration>, --settle, --settle-after <unix>.
 type waitOpts struct {
-	auto   bool
-	fixed  time.Duration
-	settle bool
+	auto        bool
+	fixed       time.Duration
+	settle      bool
+	settleAfter int64
 }
 
 func (o waitOpts) on() bool { return o.auto || o.fixed > 0 }
@@ -85,16 +99,42 @@ func (o waitOpts) ctxBudget() time.Duration {
 	return o.fixed
 }
 
-// ttlBound: the longest a resolver may keep what it had before the write
-// (before / after: the provider's RRsets around the write; neg: the zone's
+// unknownTTL stands in for a TTL nobody reports: the whole cap.
+const unknownTTL = waitCap - waitMargin
+
+// effectiveTTLs: per RRset (Stored's keys), how long caches may hold it:
+// the stored TTL (0 or 1 s is "auto" / "the zone default": unknown), or
+// the TTL the authoritative servers serve when longer; unknown and not
+// served = unknownTTL.
+func effectiveTTLs(ctx context.Context, stored map[string]dnsplan.RRset, servers []string) map[string]time.Duration {
+	out := map[string]time.Duration{}
+	for k, rs := range stored {
+		ttl := rs.TTL
+		if ttl <= time.Second {
+			ttl = 0
+		}
+		name, typ, _ := strings.Cut(k, " ")
+		if served, ok := dnsplan.ServedTTL(ctx, servers, name, typ); ok {
+			ttl = max(ttl, served)
+		}
+		if ttl == 0 {
+			ttl = unknownTTL
+		}
+		out[k] = ttl
+	}
+	return out
+}
+
+// ttlBound: the longest a cache may keep what it had before the write
+// (before / after: the RRsets' effective TTLs around it; neg: the zone's
 // negative TTL, for RRsets that were empty).
-func ttlBound(before, after map[string]dnsplan.RRset, neg time.Duration) time.Duration {
+func ttlBound(before, after map[string]time.Duration, neg time.Duration) time.Duration {
 	var ttl time.Duration
 	for _, b := range before {
-		ttl = max(ttl, b.TTL)
+		ttl = max(ttl, b)
 	}
 	for k, a := range after {
-		ttl = max(ttl, a.TTL)
+		ttl = max(ttl, a)
 		if _, ok := before[k]; !ok {
 			ttl = max(ttl, neg)
 		}
@@ -111,9 +151,11 @@ func secs(d time.Duration) int {
 
 // waitApplied polls every resolver on its own until each shows every
 // applied set (and, with settle, the old records' caches have expired),
-// or the limit. ok = done in time.
+// or the limit. changed: this run's write changed an RRset (else, with
+// --settle-after, the earlier run's settle point is the one that counts:
+// the current records are the ones that run wrote). ok = done in time.
 func waitApplied(ctx context.Context, e toolEnv, build func(dnsplan.Input) dnsplan.Plan, base dnsplan.Input,
-	sets []string, o waitOpts, ttl time.Duration, writtenAt time.Time) (*waitReport, bool) {
+	sets []string, o waitOpts, ttl time.Duration, writtenAt time.Time, changed bool) (*waitReport, bool) {
 	start := toolNow()
 	limit := o.fixed
 	if o.auto {
@@ -124,7 +166,13 @@ func waitApplied(ctx context.Context, e toolEnv, build func(dnsplan.Input) dnspl
 		hardStop = start.Add(waitCap)
 	}
 	settleAt := writtenAt.Add(ttl + waitMargin)
-	rep := &waitReport{TTL: secs(ttl), Pending: []string{}}
+	if o.settleAfter > 0 {
+		after := time.Unix(o.settleAfter, 0)
+		if !changed || after.After(settleAt) {
+			settleAt = after
+		}
+	}
+	rep := &waitReport{TTL: secs(ttl), Pending: []string{}, WrittenAt: writtenAt.Unix()}
 	for {
 		now := toolNow()
 		var observed time.Time // the latest a pending resolver says it keeps its answer
@@ -146,26 +194,30 @@ func waitApplied(ctx context.Context, e toolEnv, build func(dnsplan.Input) dnspl
 				}
 			}
 		}
-		if o.auto && !observed.IsZero() {
-			if ext := observed.Add(waitMargin); ext.After(deadline) {
+		if !observed.IsZero() {
+			// A resolver holding the old data that long means caches
+			// anywhere (the CA's) may: the settle point moves too.
+			ext := observed.Add(waitMargin)
+			if ext.After(settleAt) {
+				settleAt = ext
+			}
+			if o.auto && ext.After(deadline) {
 				deadline = ext
 				if deadline.After(hardStop) {
 					deadline = hardStop
 				}
 			}
 		}
-		clearsAt := settleAt
-		if observed.After(clearsAt) {
-			clearsAt = observed
-		}
 		rep.Visible = len(rep.Pending) == 0
 		rep.Settled = rep.Visible && !now.Before(settleAt)
-		rep.Limit, rep.Waited, rep.ClearsIn = secs(deadline.Sub(start)), secs(now.Sub(start)), secs(clearsAt.Sub(now))
+		rep.SettleAt = settleAt.Unix()
+		rep.BeyondCap = settleAt.After(hardStop)
+		rep.Limit, rep.Waited, rep.ClearsIn = secs(deadline.Sub(start)), secs(now.Sub(start)), secs(settleAt.Sub(now))
 		if rep.Visible && (!o.settle || rep.Settled) {
 			return rep, true
 		}
-		// Settling can't happen in time: say so now rather than wait.
-		if rep.Visible && settleAt.After(hardStop) {
+		// Settling can't happen in this run: say so now rather than wait.
+		if rep.Visible && o.settle && rep.BeyondCap {
 			return rep, false
 		}
 		if !now.Before(deadline) || ctx.Err() != nil {
@@ -179,17 +231,31 @@ func waitApplied(ctx context.Context, e toolEnv, build func(dnsplan.Input) dnspl
 	}
 }
 
+// progressMessage: the stderr line right after the write.
+func progressMessage(o waitOpts, ttl time.Duration, resolvers []string) string {
+	limit := o.fixed
+	if o.auto {
+		limit = min(ttl+waitMargin, waitCap)
+	}
+	return fmt.Sprintf("domains dns apply: written; waiting up to %s for %s (TTL %d s)", limit, strings.Join(resolvers, ", "), secs(ttl))
+}
+
 // waitMessage: the stderr line after a wait that didn't finish. The
 // records were written (a failed write never gets here).
 func waitMessage(rep *waitReport) string {
-	clears := fmt.Sprintf("those caches clear within %s", time.Duration(rep.ClearsIn)*time.Second)
+	at := time.Unix(rep.SettleAt, 0).UTC().Format("15:04 MST")
+	if rep.BeyondCap && rep.Visible {
+		return fmt.Sprintf("domains dns apply: the records were written and every resolver checked shows them, but the old records are stored with TTL %d s, longer than one run waits (%s): caches (the CA's too) may hold them until %s. Run again after %s, or lower the TTL at the provider first to shorten it",
+			rep.TTL, waitCap, at, at)
+	}
+	clears := fmt.Sprintf("those caches clear within %s (by %s)", time.Duration(rep.ClearsIn)*time.Second, at)
 	if rep.ClearsIn == 0 {
 		clears = "those caches should have expired by now"
 	}
 	if !rep.Visible {
-		return fmt.Sprintf("domains dns apply: the records were written, but they are not visible yet at %s after %s (the provider stored TTL %d s; %s)",
+		return fmt.Sprintf("domains dns apply: the records were written, but they are not visible yet at %s after %s (TTL %d s; %s)",
 			strings.Join(rep.Pending, ", "), time.Duration(rep.Waited)*time.Second, rep.TTL, clears)
 	}
-	return fmt.Sprintf("domains dns apply: the records were written and every resolver checked shows them, but other resolvers (the CA's) may still cache the old records for up to %s (the provider stored TTL %d s)",
-		time.Duration(rep.ClearsIn)*time.Second, rep.TTL)
+	return fmt.Sprintf("domains dns apply: the records were written and every resolver checked shows them, but other resolvers (the CA's) may still cache the old records for up to %s (TTL %d s; by %s)",
+		time.Duration(rep.ClearsIn)*time.Second, rep.TTL, at)
 }

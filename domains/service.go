@@ -998,9 +998,11 @@ func (s *Service) plan(ctx context.Context, name string, refresh bool) (dnsplan.
 // minutes, not RecheckEvery. Public lookups only: cheap.
 const mainRecheckUnhealthy = 5 * time.Minute
 
-// planHealthy: no item above Info and the DNSSEC chain not broken.
+// planHealthy: no item above Info, the CA would issue (false or unknown
+// — no issuer — is not healthy: status reads it as a lost account) and
+// the DNSSEC chain not broken.
 func planHealthy(pl dnsplan.Plan) bool {
-	if pl.DNSSEC.State == dnssec.Bogus || pl.DNSSEC.State == dnssec.DSMismatch {
+	if pl.DNSSEC.State == dnssec.Bogus || pl.DNSSEC.State == dnssec.DSMismatch || !pl.CAA.WouldIssue {
 		return false
 	}
 	for _, it := range pl.Items {
@@ -1090,7 +1092,11 @@ func (s *Service) mainPlan(ctx context.Context, refresh bool) dnsplan.Plan {
 	gen := s.mainGen
 	s.mu.Unlock()
 	pl := s.buildMainPlan(ctx)
-	s.storeMainPlan(gen, pl)
+	// A build cut short (the client gave up, the deadline) is a plan of
+	// failed lookups: answer it, but keep the cached one.
+	if ctx.Err() == nil {
+		s.storeMainPlan(gen, pl)
+	}
 	return pl
 }
 

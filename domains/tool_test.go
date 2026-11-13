@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -26,6 +28,10 @@ type toolFixture struct {
 	// deleteMode: the fake provider's DeleteMode ("porkbun": its 600 s TTL
 	// floor and delete-by-name/type, as libdns/porkbun v1.1.0).
 	deleteMode string
+	// storedTTL, if set, is the TTL the provider's API reports for every
+	// record (Cloudflare's 1 = "auto", Hetzner's 0 = the zone default),
+	// whatever the zone serves.
+	storedTTL *time.Duration
 }
 
 // newToolFixture: zone example.test on a fake DNS server and provider
@@ -40,6 +46,10 @@ func newToolFixture(t *testing.T) *toolFixture {
 	}
 	t.Cleanup(func() { srv.Close() })
 	f.resolvers = []string{srv.Addr}
+	// The fake server is also the zone's authoritative server.
+	oldAuth := toolAuthServers
+	toolAuthServers = func(context.Context, []string, string) []string { return []string{srv.Addr} }
+	t.Cleanup(func() { toolAuthServers = oldAuth })
 	providers["fake-tool"] = providerSpec{required: []string{"api_token"}, build: func(c map[string]string) (dnsProvider, error) {
 		raw := &fakedns.Provider{Zone: f.zone, Token: c["api_token"], ZoneName: "example.test", DeleteMode: f.deleteMode,
 			Hook: func(op string, recs []libdns.Record) error {
@@ -51,10 +61,39 @@ func newToolFixture(t *testing.T) *toolFixture {
 		if f.deleteMode == "porkbun" { // wrapped as buildProvider wraps the real one
 			return zoneKnown{newPorkbunProvider(raw, fakeIDs{raw}), "example.test."}, nil
 		}
+		if f.storedTTL != nil {
+			return zoneKnown{ttlReport{raw, *f.storedTTL}, "example.test."}, nil
+		}
 		return raw, nil
 	}}
 	t.Cleanup(func() { delete(providers, "fake-tool") })
 	return f
+}
+
+// ttlReport: a provider whose API reports ttl for every record.
+type ttlReport struct {
+	dnsProvider
+	ttl time.Duration
+}
+
+func (p ttlReport) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
+	recs, err := p.dnsProvider.GetRecords(ctx, zone)
+	for i, r := range recs {
+		rr := r.RR()
+		rr.TTL = p.ttl
+		recs[i] = rr
+	}
+	return recs, err
+}
+
+// DeleteRecords matches on data, not on the TTL it reported.
+func (p ttlReport) DeleteRecords(ctx context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
+	for i, r := range recs {
+		rr := r.RR()
+		rr.TTL = 0
+		recs[i] = rr
+	}
+	return p.dnsProvider.DeleteRecords(ctx, zone, recs)
 }
 
 // zoneKnown: a wrapped fake that still names its zone (no SOA lookup).
@@ -281,5 +320,87 @@ func TestReportShape(t *testing.T) {
 	}
 	if code := runReport([]string{"--main", "--refresh"}, srv.URL, "wrong-secret-wrong-secret-wrong-secret", &out, &errb); code != exitFailure {
 		t.Fatalf("--refresh, wrong secret = %d", code)
+	}
+}
+
+// TestReportFresh (deploy finding A): `domains report --main --json
+// --fresh` asks for a main plan rebuilt unless one is under 30 s old
+// (GET /main/dns?refresh=1, the service's throttle), so status sees a CAA
+// changed outside Portcullis; when that doesn't answer in time it falls
+// back to the cached plan and says so (main_fresh false).
+func TestReportFresh(t *testing.T) {
+	e := newEnv(t, false)
+	srv := httptest.NewServer(e.api)
+	defer srv.Close()
+	var out, errb bytes.Buffer
+	report := func(args ...string) (int, map[string]json.RawMessage) {
+		out.Reset()
+		errb.Reset()
+		code := runReport(append([]string{"--main", "--json"}, args...), srv.URL, testSecret, &out, &errb)
+		var r map[string]json.RawMessage
+		json.Unmarshal(out.Bytes(), &r)
+		return code, r
+	}
+	if code, r := report(); code != 0 || string(r["main_fresh"]) != "false" {
+		t.Fatalf("--json alone = %d main_fresh %s", code, r["main_fresh"])
+	}
+	// A CAA written outside Portcullis: --fresh shows it at once.
+	e.clock.advance(time.Minute) // past the 30 s throttle
+	v := dnsplan.CAAValue("pebble.test", "https://elsewhere.test/acct/9")
+	e.zone.Set(testMain, libdns.CAA{Name: "@", TTL: dnsplan.TTLCAA, Tag: "issue", Value: v}.RR())
+	code, r := report("--fresh")
+	var pl dnsplan.Plan
+	json.Unmarshal(r["main"], &pl)
+	if code != 0 || string(r["main_fresh"]) != "true" {
+		t.Fatalf("--fresh = %d %s %s", code, out.String(), errb.String())
+	}
+	live := false
+	for _, it := range pl.Items {
+		if it.Set == dnsplan.SetCAA && len(it.Live) > 0 && strings.Contains(it.Live[0], "acct/9") {
+			live = true
+		}
+	}
+	if !live {
+		t.Fatalf("--fresh plan doesn't show the outside CAA: %+v", pl.Items)
+	}
+	// The rebuild doesn't answer in time: the cached plan, main_fresh false.
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("refresh") == "1" {
+			time.Sleep(2 * time.Second)
+		}
+		e.api.ServeHTTP(w, r)
+	}))
+	defer slow.Close()
+	old := reportFreshTimeout
+	reportFreshTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { reportFreshTimeout = old })
+	out.Reset()
+	if code := runReport([]string{"--main", "--json", "--fresh"}, slow.URL, testSecret, &out, &errb); code != 0 ||
+		!strings.Contains(out.String(), `"main_fresh":false`) || !strings.Contains(out.String(), `"main":{`) {
+		t.Fatalf("slow --fresh = %d %s %s", code, out.String(), errb.String())
+	}
+	if code := runReport([]string{"--main", "--refresh", "--fresh"}, srv.URL, testSecret, &out, &errb); code != exitUsage {
+		t.Fatalf("--refresh --fresh = %d", code)
+	}
+}
+
+// A main-plan build cut short (the client gave up) never replaces the
+// cached plan: it would be a plan of failed lookups.
+func TestMainPlanCanceledNotStored(t *testing.T) {
+	e := newEnv(t, false)
+	cachedAt := func() (time.Time, bool) {
+		e.svc.mu.Lock()
+		defer e.svc.mu.Unlock()
+		c, ok := e.svc.plans[mainPlanKey]
+		return c.at, ok
+	}
+	e.waitFor("the worker's first main plan", 10*time.Second, func() bool { _, ok := cachedAt(); return ok })
+	before, _ := cachedAt()
+	e.clock.advance(time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	e.svc.mainPlan(ctx, true)
+	if after, ok := cachedAt(); !ok || !after.Equal(before) {
+		t.Fatalf("a canceled build replaced the cached plan (%v → %v, %v)", before, after, ok)
 	}
 }

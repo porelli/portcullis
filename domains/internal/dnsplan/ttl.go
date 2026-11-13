@@ -2,6 +2,7 @@ package dnsplan
 
 import (
 	"context"
+	"net"
 	"sort"
 	"strings"
 	"time"
@@ -63,25 +64,36 @@ func Stored(ctx context.Context, p Provider, zone, name string, sets []string) (
 }
 
 // NegativeTTL is how long a resolver may cache "no such record" in zone
-// (RFC 2308: the lower of the SOA's TTL and its MINIMUM), the longest any
-// resolver answers; 0 when no resolver answers a SOA.
-func NegativeTTL(ctx context.Context, resolvers []string, zone string) time.Duration {
-	var best time.Duration
-	for _, r := range resolvers {
-		in, err := exchange(ctx, r, zone, dns.TypeSOA)
-		if err != nil {
-			continue
-		}
-		for _, rr := range append(in.Answer, in.Ns...) {
-			if soa, ok := rr.(*dns.SOA); ok {
-				t := min(soa.Hdr.Ttl, soa.Minttl)
-				if d := time.Duration(t) * time.Second; d > best {
-					best = d
+// (RFC 2308: the lower of the SOA's TTL and its MINIMUM). From the
+// authoritative servers when given (a resolver's SOA TTL counts down);
+// otherwise the MINIMUM a resolver answers (it doesn't count down; an
+// upper bound). The longest answer wins; 0 when none answers a SOA.
+func NegativeTTL(ctx context.Context, auth, resolvers []string, zone string) time.Duration {
+	ask := func(servers []string, full bool) time.Duration {
+		var best time.Duration
+		for _, r := range servers {
+			in, err := exchange(ctx, r, zone, dns.TypeSOA)
+			if err != nil {
+				continue
+			}
+			for _, rr := range append(in.Answer, in.Ns...) {
+				if soa, ok := rr.(*dns.SOA); ok {
+					t := soa.Minttl
+					if full {
+						t = min(soa.Hdr.Ttl, soa.Minttl)
+					}
+					if d := time.Duration(t) * time.Second; d > best {
+						best = d
+					}
 				}
 			}
 		}
+		return best
 	}
-	return best
+	if d := ask(auth, true); d > 0 {
+		return d
+	}
+	return ask(resolvers, false)
 }
 
 // RemainingTTL is how long resolver still keeps its current answer for
@@ -116,4 +128,73 @@ func RemainingTTL(ctx context.Context, resolver string, it Item) (time.Duration,
 		}
 	}
 	return time.Duration(ttl) * time.Second, found
+}
+
+// AuthServers are the zone's authoritative nameservers (host:53), found
+// through the resolvers (NS, then each target's A and AAAA); at most 4.
+// Nothing when they can't be found.
+func AuthServers(ctx context.Context, resolvers []string, zone string) []string {
+	var out []string
+	for _, r := range resolvers {
+		in, err := exchange(ctx, r, zone, dns.TypeNS)
+		if err != nil {
+			continue
+		}
+		for _, rr := range in.Answer {
+			ns, ok := rr.(*dns.NS)
+			if !ok {
+				continue
+			}
+			for _, qt := range []uint16{dns.TypeA, dns.TypeAAAA} {
+				a, err := exchange(ctx, r, ns.Ns, qt)
+				if err != nil {
+					continue
+				}
+				for _, x := range a.Answer {
+					var ip string
+					switch v := x.(type) {
+					case *dns.A:
+						ip = v.A.String()
+					case *dns.AAAA:
+						ip = v.AAAA.String()
+					default:
+						continue
+					}
+					if hp := net.JoinHostPort(ip, "53"); !contains(out, hp) && len(out) < 4 {
+						out = append(out, hp)
+					}
+				}
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return out
+}
+
+// ServedTTL is the longest TTL the servers (authoritative: what caches
+// got) serve for the RRset (name, typ); false when none answers it.
+func ServedTTL(ctx context.Context, servers []string, name, typ string) (time.Duration, bool) {
+	qt, ok := dns.StringToType[strings.ToUpper(typ)]
+	if !ok {
+		return 0, false
+	}
+	var best time.Duration
+	found := false
+	for _, s := range servers {
+		in, err := exchange(ctx, s, name, qt)
+		if err != nil {
+			continue
+		}
+		for _, rr := range in.Answer {
+			if rr.Header().Rrtype == qt {
+				found = true
+				if d := time.Duration(rr.Header().Ttl) * time.Second; d > best {
+					best = d
+				}
+			}
+		}
+	}
+	return best, found
 }

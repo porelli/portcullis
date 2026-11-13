@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -221,7 +222,7 @@ func TestToolWaitSettleBeyondCap(t *testing.T) {
 	if !w.Visible || w.Settled || w.Waited != 0 || w.ClearsIn != 3660 {
 		t.Fatalf("wait report %+v: want visible, not settled, clears in 3660 s, no wait", *w)
 	}
-	for _, want := range []string{"were written", "may still cache the old records", "1h1m0s"} {
+	for _, want := range []string{"were written", "TTL 3600 s, longer than one run waits", "lower the TTL at the provider"} {
 		if !strings.Contains(errs, want) {
 			t.Errorf("stderr %q lacks %q", errs, want)
 		}
@@ -259,5 +260,142 @@ func TestToolWaitUnreadableTTL(t *testing.T) {
 	}
 	if w := decodeApply(t, out).Wait; w.TTL != 840 || w.Limit != 900 {
 		t.Fatalf("wait report %+v: want the cap", *w)
+	}
+}
+
+// C1: a rerun after an unsettled relax must not forget the old pin's TTL.
+// Run 1 (old pin at TTL 3600) exits 1 at once; the zone now holds CA-only
+// at TTL 300. Run 2 with the settle point run 1 reported
+// (--settle-after) also refuses, until the clock passes it.
+func TestToolSettleAfterRerun(t *testing.T) {
+	f := newToolFixture(t)
+	pinAt(f.zone, oldAcct, time.Hour)
+	c := useVirtualClock(t)
+	code, out, _ := f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
+	w1 := decodeApply(t, out).Wait
+	if code != exitProblem || !w1.BeyondCap || w1.SettleAt != c.now.Add(3660*time.Second).Unix() {
+		t.Fatalf("run 1 = %d %+v", code, *w1)
+	}
+	after := fmt.Sprint(w1.SettleAt)
+	code, out, errs := f.run([]string{"apply", "--wait", "auto", "--settle", "--settle-after", after}, toolJSON(caaOnly("")))
+	w2 := decodeApply(t, out).Wait
+	if code != exitProblem || w2.Settled || w2.SettleAt != w1.SettleAt || w2.Waited != 0 {
+		t.Fatalf("run 2 right away = %d %+v %s (would order against the old pin)", code, *w2, errs)
+	}
+	// Without --settle-after the rerun only sees the CA-only TTL: that is
+	// what the shell's saved settle point is for.
+	c.mu.Lock()
+	c.now = c.now.Add(3600 * time.Second)
+	c.mu.Unlock()
+	code, out, errs = f.run([]string{"apply", "--wait", "auto", "--settle", "--settle-after", after}, toolJSON(caaOnly("")))
+	if w3 := decodeApply(t, out).Wait; code != exitOK || !w3.Settled || w3.Waited != 60 {
+		t.Fatalf("run 3, 60 s before the settle point = %d %+v %s", code, *w3, errs)
+	}
+}
+
+// I1: a pending resolver showing a longer remaining TTL than the stored
+// one moves the settle point (the CA's caches may hold as long).
+func TestToolSettleFollowsResolverTTL(t *testing.T) {
+	f := newToolFixture(t)
+	f.deleteMode = "porkbun"
+	pinAt(f.zone, oldAcct, 600*time.Second)
+	stale := fakedns.NewZone()
+	left := 750 * time.Second
+	pinAt(stale, oldAcct, left)
+	srv, err := fakedns.Serve(stale, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	c := useVirtualClock(t)
+	c.onSleep = func(d time.Duration) {
+		left -= d
+		if left > 0 {
+			pinAt(stale, oldAcct, left)
+			return
+		}
+		stale.Set("portcullis.example.test", f.zone.Records("portcullis.example.test")...)
+	}
+	f.resolvers = append(f.resolvers, srv.Addr)
+	code, out, errs := f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
+	if w := decodeApply(t, out).Wait; code != exitOK || !w.Settled || w.Waited < 810 {
+		t.Fatalf("= %d %+v %s: want settled no earlier than 750 + 60 s", code, *w, errs)
+	}
+}
+
+// I1: a stored TTL of 0 or 1 (Cloudflare's "auto", Hetzner's zone
+// default) is unknown: the TTL the authoritative servers serve counts.
+func TestToolStoredTTLUnknown(t *testing.T) {
+	f := newToolFixture(t)
+	pinAt(f.zone, oldAcct, 3600*time.Second) // what the nameservers serve
+	zero := time.Duration(0)
+	f.storedTTL = &zero
+	useVirtualClock(t)
+	code, out, _ := f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
+	if w := decodeApply(t, out).Wait; code != exitProblem || w.TTL != 3600 || !w.BeyondCap {
+		t.Fatalf("stored 0, served 3600 = %d %+v", code, *w)
+	}
+	one := time.Second
+	f.storedTTL = &one
+	pinAt(f.zone, oldAcct, 300*time.Second)
+	code, out, _ = f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
+	if w := decodeApply(t, out).Wait; code != exitOK || w.TTL != 300 {
+		t.Fatalf("stored 1, served 300 = %d %+v", code, *w)
+	}
+	// No authoritative answer either: unknown is the whole cap, never 0.
+	toolAuthServers = func(context.Context, []string, string) []string { return nil }
+	pinAt(f.zone, oldAcct, 300*time.Second)
+	code, out, _ = f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
+	if w := decodeApply(t, out).Wait; code != exitOK || w.TTL != secs(unknownTTL) || w.Waited != 900 {
+		t.Fatalf("stored 1, nothing served = %d %+v", code, *w)
+	}
+}
+
+// The served TTL counts when it is longer than the stored one.
+func TestToolServedTTLLonger(t *testing.T) {
+	f := newToolFixture(t)
+	pinAt(f.zone, oldAcct, 1200*time.Second)
+	short := 300 * time.Second
+	f.storedTTL = &short
+	useVirtualClock(t)
+	code, out, _ := f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
+	if w := decodeApply(t, out).Wait; code != exitProblem || w.TTL != 1200 {
+		t.Fatalf("stored 300, served 1200 = %d %+v", code, *w)
+	}
+}
+
+// `dns ttl`: the TTL caches may hold the sets' current records for,
+// read before any write (the shell saves it before the relax).
+func TestToolTTL(t *testing.T) {
+	f := newToolFixture(t)
+	pinAt(f.zone, oldAcct, 1800*time.Second)
+	code, out, errs := f.run([]string{"ttl"}, toolJSON(caaOnly("")))
+	var r struct {
+		TTL int `json:"ttl"`
+	}
+	if code != exitOK || json.Unmarshal([]byte(out), &r) != nil || r.TTL != 1800 {
+		t.Fatalf("ttl = %d %q %s", code, out, errs)
+	}
+	if len(f.zone.Records("portcullis.example.test")) != 2 || !strings.Contains(f.zone.Records("portcullis.example.test")[0].Data, "acct/1") {
+		t.Fatal("ttl wrote something")
+	}
+	if code, _, _ := f.run([]string{"ttl"}, toolJSON(readOnly)); code != exitUsage {
+		t.Fatalf("ttl without a provider = %d", code)
+	}
+}
+
+// I5 + M1: the beyond-cap message names the cause, the time the caches
+// clear and the way to shorten it; after the write one progress line says
+// how long this run waits.
+func TestToolWaitMessages(t *testing.T) {
+	f := newToolFixture(t)
+	pinAt(f.zone, oldAcct, time.Hour)
+	c := useVirtualClock(t)
+	_, _, errs := f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
+	clear := c.now.Add(3660 * time.Second).UTC().Format("15:04 MST")
+	for _, want := range []string{"written; waiting up to 15m0s for " + f.resolvers[0], "TTL 3600 s, longer than one run waits (15m0s)", "after " + clear, "lower the TTL at the provider"} {
+		if !strings.Contains(errs, want) {
+			t.Errorf("stderr %q lacks %q", errs, want)
+		}
 	}
 }
