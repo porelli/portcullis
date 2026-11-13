@@ -2044,6 +2044,9 @@ case "$*" in
     echo "$sub" >> "$d/order"
     if [ -f "$d/out-$sub" ]; then cat "$d/out-$sub"; else cat "$d/out-default"; fi
     exit "$(cat "$d/rc-$sub" 2>/dev/null || echo 0)" ;;
+  compose\ *\ ps\ -q\ --status\ running\ traefik)
+    [ ! -f "$d/traefik-running" ] || echo c0ffee
+    exit 0 ;;
   compose\ *\ exec\ -T\ domains\ domains\ report\ --main\ --refresh)
     echo refresh >> "$d/order"
     [ ! -f "$d/refresh-fail" ] || exit 1
@@ -2075,11 +2078,24 @@ expect_eq "dns tool: credentials only on stdin (never in argv)" "$(grep -c 'tok-
 expect_eq "dns tool: the token is the apply input's credentials.api_token" "$(dtin apply .credentials.api_token)" tok-SECRET-123
 expect_eq "dns tool: the token never reaches the output" "$(printf '%s' "$OUT" | grep -c 'tok-SECRET-123')" 0
 expect_eq "dns setup --yes: plan, apply, the service's main plan refreshed, check" "$(paste -sd' ' "$STUB_DIR/dt/order")" "plan apply refresh check"
-expect_eq "dns setup: apply waits 5 minutes" "$(grep -c 'dns-tool apply --wait 5m$' "$STUB_DIR/dt/argv")" 1
+expect_eq "dns setup: apply waits by the stored TTL (--wait auto)" "$(grep -c 'dns-tool apply --wait auto$' "$STUB_DIR/dt/argv")" 1
 expect_eq "dns setup: the default sets are address and caa" "$(dtin apply '.sets | join(",")')" "address,caa"
 expect_eq "dns setup: the input's snake_case keys" "$(dtin apply '[keys[]] | join(",")')" "ca_server,caa,credentials,ipv4,ipv6,mail_from,name,nomail,provider,sets"
 expect_eq "dns setup: caa block" "$(dtin apply '.caa | [.enabled, .account_uri, .issuer] | @json')" '[true,"",""]'
 expect_eq "dns check: runs without credentials" "$(dtin check 'has("credentials"), .provider' | paste -sd' ' -)" 'false '
+# wait_out <visible> <settled> <clears_in> <pending...> — the apply output
+# with the tool's wait report (TTL 600 s, as Porkbun stores it).
+wait_out() {
+  local v="$1" st="$2" c="$3"; shift 3
+  jq --argjson v "$v" --argjson s "$st" --argjson c "$c" --args '. + {wait: {visible: $v, settled: $s, ttl: 600, limit: 660, waited: 660, pending: $ARGS.positional, clears_in: $c}}' \
+    "$@" < "$STUB_DIR/dt/out-default" > "$STUB_DIR/dt/out-apply"
+}
+wait_out false false 324 8.8.8.8:53
+echo 1 > "$STUB_DIR/dt/rc-apply"
+OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup true false ""')"
+case "$OUT" in *"Applied, but not visible yet at 8.8.8.8: those caches clear within 5 min 24 s"*) t_pass "dns setup: a wait timeout names the resolvers and when their caches clear" ;;
+  *) t_fail "dns setup wait timeout: $OUT" ;; esac
+rm -f "$STUB_DIR/dt/rc-apply" "$STUB_DIR/dt/out-apply"
 
 dt 'DNS_PROVIDER=route53 AWS_ACCESS_KEY_ID=AKIA-0123456789 AWS_SECRET_ACCESS_KEY=sec-0123456789 AWS_HOSTED_ZONE_ID=Z123 _dns_tool apply' >/dev/null
 expect_eq "dns tool: route53 mapping" "$(dtin apply '.credentials | to_entries | map("\(.key)=\(.value)") | join(" ")')" \
@@ -2188,6 +2204,7 @@ OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_tight
 expect_eq "tighten: writes main-domain.env" "$(cat "$PORTCULLIS_ROOT/secrets/domains/main-domain.env")" "DOMAINS_MAIN_ACME_ACCOUNT_URI=https://acme-v02.api.letsencrypt.org/acme/acct/77"
 expect_eq "tighten: main-domain.env is 0600" "$(file_mode "$PORTCULLIS_ROOT/secrets/domains/main-domain.env")" 600
 expect_eq "tighten: domains recreated for the new env file" "$(grep -c ' up -d domains$' "$STUB_DIR/dt/argv")" 1
+expect_eq "tighten: waits by the stored TTL (--wait auto, no --settle)" "$(grep -c 'dns-tool apply --wait auto$' "$STUB_DIR/dt/argv")" 1
 expect_eq "tighten: pins when live differs (check, then apply caa with Traefik's URI)" \
   "$(paste -sd' ' "$STUB_DIR/dt/order"):$(dtin apply '[.sets, .caa.account_uri] | @json')" \
   'check apply refresh:[["caa"],"https://acme-v02.api.letsencrypt.org/acme/acct/77"]'
@@ -2201,8 +2218,16 @@ expect_eq "tighten: live pin right = check only, no restart" "$(paste -sd' ' "$S
 jq '.caa.would_issue = false' "$STUB_DIR/dt/out-check" > "$STUB_DIR/dt/out-check2" && mv "$STUB_DIR/dt/out-check2" "$STUB_DIR/dt/out-check"
 echo 3 > "$STUB_DIR/dt/rc-apply"
 OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_tighten_main')"
-case "$OUT" in *"could not pin the CAA"*rc=0) t_pass "tighten: a failed pin warns, returns 0" ;; *) t_fail "tighten failed pin: $OUT" ;; esac
+case "$OUT" in *"could not pin the CAA of ci.example.org to Traefik's account: the write failed"*rc=0) t_pass "tighten: a failed pin warns, returns 0" ;; *) t_fail "tighten failed pin: $OUT" ;; esac
 expect_eq "tighten: a failed pin still refreshes the main plan (a partial write)" "$(paste -sd' ' "$STUB_DIR/dt/order")" "check apply refresh"
+# Written but not visible yet (Porkbun's 600 s TTL): honest, never "could not pin".
+wait_out false false 324 8.8.8.8:53 1.1.1.1:53
+echo 1 > "$STUB_DIR/dt/rc-apply"
+OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_tighten_main')"
+case "$OUT" in *"could not"*) t_fail "tighten timeout reads as a failure: $OUT" ;;
+  *"The CAA pin of ci.example.org was written, but it is not visible yet at 8.8.8.8, 1.1.1.1: those caches clear within 5 min 24 s"*rc=0) t_pass "tighten: a wait timeout says written, where, and when caches clear" ;;
+  *) t_fail "tighten timeout: $OUT" ;; esac
+rm -f "$STUB_DIR/dt/rc-apply" "$STUB_DIR/dt/out-apply"
 # The refresh is best effort: the domains service down only skips it.
 touch "$STUB_DIR/dt/refresh-fail"
 rm -f "$STUB_DIR/dt/rc-apply"
@@ -2240,14 +2265,49 @@ OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123;
 RL="$(grep -n '^RELAX$' "$STUB_DIR/dt/argv" | cut -d: -f1)"
 RM="$(grep -n 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv" | cut -d: -f1)"
 expect_eq "config apply flip: relax runs before acme.json is removed" "$([ -n "$RL" ] && [ -n "$RM" ] && [ "$RL" -lt "$RM" ] && echo yes)" yes
+wait_out true true 0
 OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123')"
 expect_eq "config apply flip: relax applies caa CA-only" "$(dtin apply '[.sets, .caa.account_uri] | @json')" '[["caa"],""]'
-expect_eq "config apply flip: relax waits for the resolvers (2 min)" "$(grep -c 'dns-tool apply --wait 2m$' "$STUB_DIR/dt/argv")" 1
+expect_eq "config apply flip: relax waits until the old pin's caches expired (--wait auto --settle)" "$(grep -c 'dns-tool apply --wait auto --settle$' "$STUB_DIR/dt/argv")" 1
 expect_eq "config apply flip: relax refreshes the service's main plan after the apply" "$(paste -sd' ' "$STUB_DIR/dt/order")" "apply refresh"
+expect_eq "config apply flip: settled relax → acme.json cleared, sentinel written" \
+  "$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv"):$(cat "$FL_ROOT/certs/.acme-staging-last"):${OUT##*rc=}" "1:true:0"
+# The messages come in the order things happen: flip, stop, relax, its
+# result, and the clearing only right before the rm.
+ord() { printf '%s\n' "$OUT" | grep -n -m1 -F "$1" | cut -d: -f1; }
+O1="$(ord 'ACME_STAGING flipped')" O2="$(ord 'Stopping Traefik')" O3="$(ord 'Relaxing the CAA')" O4="$(ord 'every cache of the old pin has expired')" O5="$(ord "Clearing Traefik's ACME storage")"
+expect_eq "config apply flip: messages in the order things happen" \
+  "$([ -n "$O1" ] && [ -n "$O5" ] && [ "$O1" -lt "$O2" ] && [ "$O2" -lt "$O3" ] && [ "$O3" -lt "$O4" ] && [ "$O4" -lt "$O5" ] && echo yes)" yes
+expect_eq "config apply flip: the flip line doesn't claim the clearing" "$(printf '%s' "$OUT" | grep 'ACME_STAGING flipped' | grep -c clearing || true)" 0
+# Written but not settled (a cache may still hold the old pin): fail safe —
+# acme.json kept, sentinel unchanged (the next run redoes the flip),
+# Traefik back on its old account (allowed by CA-only), exit 1.
+wait_out false false 540 8.8.8.8:53
+echo 1 > "$STUB_DIR/dt/rc-apply"
+touch "$STUB_DIR/dt/traefik-running"
+OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123')"
+case "$OUT" in *"could not relax"*) t_fail "relax timeout reads as a failure: $OUT" ;;
+  *"was relaxed to CA-only, but it is not visible yet at 8.8.8.8: those caches clear within 9 min"*"flip is not finished"*rc=1) t_pass "config apply flip: an unsettled relax refuses to go on, honestly worded" ;;
+  *) t_fail "relax timeout: $OUT" ;; esac
+expect_eq "config apply flip: unsettled → acme.json kept, sentinel unchanged" \
+  "$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last")" "0:false"
+expect_eq "config apply flip: unsettled → Traefik started again (it was running)" "$(grep -c ' start traefik$' "$STUB_DIR/dt/argv" || true)" 1
+expect_eq "config apply flip: nothing claims Traefik's storage was cleared" "$(printf '%s' "$OUT" | grep -c "Clearing Traefik" || true)" 0
+# Visible at the resolvers, but the CA's may still cache the old pin.
+wait_out true false 3000
+OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123')"
+case "$OUT" in *"every resolver checked shows it, but other resolvers (the CA's) may cache the old pin for up to 50 min"*rc=1) t_pass "config apply flip: visible but unsettled refuses too" ;;
+  *) t_fail "relax visible-unsettled: $OUT" ;; esac
+rm -f "$STUB_DIR/dt/traefik-running"
+# Traefik wasn't running: it stays stopped.
+OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123')"
+expect_eq "config apply flip: unsettled → Traefik not started when it wasn't running" "$(grep -c ' start traefik$' "$STUB_DIR/dt/argv" || true):${OUT##*rc=}" "0:1"
+# A failed write: a different message, same fail-safe stop.
 echo 3 > "$STUB_DIR/dt/rc-apply"
 OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123')"
-case "$OUT" in *"issuance may fail on CAA until then (./portcullis dns setup)"*rc=0) t_pass "config apply flip: relax failure warns and goes on" ;; *) t_fail "relax failure: $OUT" ;; esac
-expect_eq "config apply flip: acme.json still cleared after a failed relax" "$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv")" 1
+case "$OUT" in *"could not relax the CAA of ci.example.org to CA-only: the write failed"*"flip is not finished"*rc=1) t_pass "config apply flip: a failed relax refuses to go on" ;; *) t_fail "relax failure: $OUT" ;; esac
+expect_eq "config apply flip: acme.json kept after a failed relax" "$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last")" "0:false"
+rm -f "$STUB_DIR/dt/out-apply"
 rm -f "$STUB_DIR/dt/rc-apply"
 OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 DNS_CAA=yes')"
 case "$OUT" in *"DNS_CAA=yes must be true or false"*rc=1) t_pass "config apply flip: DNS_CAA must be true or false" ;; *) t_fail "flip DNS_CAA=yes: $OUT" ;; esac

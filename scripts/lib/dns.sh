@@ -90,6 +90,36 @@ _dns_tool() {
   printf '%s' "$input" | dc run --rm --no-deps -T dns-tool "$@"
 }
 
+# _dns_dur <seconds> — "45 s", "10 min", "5 min 24 s".
+_dns_dur() {
+  local s="${1:-0}"
+  if [ "$s" -lt 60 ]; then printf '%d s' "$s"
+  elif [ $((s % 60)) -eq 0 ]; then printf '%d min' $((s / 60))
+  else printf '%d min %d s' $((s / 60)) $((s % 60)); fi
+}
+
+# _dns_wait_text <apply output> [it] — why `apply --wait` ended early (exit 1;
+# the records were written): "not visible yet at <resolvers>: those
+# caches clear within <t>", or, visible but not settled, "visible at
+# every resolver checked, but other resolvers (the CA's) may cache the
+# old records for up to <t>". With "it", the not-visible clause starts
+# "it is not visible". From the tool's wait report (contract §12.1).
+_dns_wait_text() {
+  local w vis pend clears it="${2:+$2 is }"
+  w="$(printf '%s' "$1" | jq -c '.wait // empty' 2>/dev/null)" || w=""
+  if [ -z "$w" ]; then printf '%snot visible at the public resolvers yet' "$it"; return 0; fi
+  vis="$(jq -r '.visible' <<<"$w")"
+  pend="$(jq -r '.pending // [] | map(sub(":53$"; "")) | join(", ")' <<<"$w")"
+  clears="$(jq -r '.clears_in // 0' <<<"$w")"
+  if [ "$vis" = true ]; then
+    printf "every resolver checked shows it, but other resolvers (the CA's) may cache the old records for up to %s" "$(_dns_dur "$clears")"
+  elif [ "$clears" -gt 0 ]; then
+    printf '%snot visible yet at %s: those caches clear within %s' "$it" "$pend" "$(_dns_dur "$clears")"
+  else
+    printf '%snot visible yet at %s: their caches should have expired by now (TTL %s s)' "$it" "$pend" "$(jq -r '.ttl' <<<"$w")"
+  fi
+}
+
 # _dns_uri_ok <uri> — an ACME account URI fit for a CAA value and an env
 # file: https, a host, no spaces, quotes or ';' (the CAA parameter
 # separator). The Go side's dnsplan.ValidAccountURI is the same rule.
@@ -224,12 +254,12 @@ dns_setup() {
     read -rp "$q [y/N] " reply
     case "$reply" in y|Y|yes|YES) ;; *) info "Nothing changed."; return 0 ;; esac
   fi
-  info "Applying the record sets: $DNS_SETS (waiting up to 5 minutes for the public resolvers)..."
+  info "Applying the record sets: $DNS_SETS (then waiting for the public resolvers: the TTL the provider stored + 1 min, at most 15 min)..."
   rc=0
-  out="$(_dns_tool apply --wait 5m)" || rc=$?
+  out="$(_dns_tool apply --wait auto)" || rc=$?
   case "$rc" in
     0) ok "Applied: $DNS_SETS" ;;
-    1) warn "Applied, but not everything is visible at the public resolvers yet (normal, can take longer)." ;;
+    1) warn "Applied, but $(_dns_wait_text "$out") (./portcullis dns check after that)." ;;
     *) dns_main_refresh; fail "applying the DNS records failed (exit $rc; the message is above)" ;;
   esac
   if [ "$dnssec" = true ]; then
@@ -318,28 +348,51 @@ dns_tighten_main() {
   [ "$poll" = true ] || return 0
   _dns_caa_live_ok "$uri" && return 0
   info "Pinning the CAA of $PORTCULLIS_DOMAIN to Traefik's ACME account..."
-  if (DNS_ACCOUNT_URI="$uri" DNS_SETS=caa DNS_IPS_DONE=1 DNS_IPV4="${PORTCULLIS_PUBLIC_IPV4:-}" DNS_IPV6="${PORTCULLIS_PUBLIC_IPV6:-}" \
-      _dns_tool apply --wait 5m >/dev/null); then
-    ok "CAA of $PORTCULLIS_DOMAIN pinned to $uri"
-  else
-    warn "could not pin the CAA of $PORTCULLIS_DOMAIN to Traefik's account (fix: ./portcullis dns setup)"
-  fi
+  local out rc=0
+  out="$(_dns_caa_apply "$uri")" || rc=$?
+  case "$rc" in
+    0) ok "CAA of $PORTCULLIS_DOMAIN pinned to $uri" ;;
+    1) warn "The CAA pin of $PORTCULLIS_DOMAIN was written, but $(_dns_wait_text "$out" it). Nothing to do: ./portcullis status shows it as planned once those caches have cleared." ;;
+    *) warn "could not pin the CAA of $PORTCULLIS_DOMAIN to Traefik's account: the write failed (the message is above; fix: ./portcullis dns setup)" ;;
+  esac
   dns_main_refresh
   return 0
 }
 
+# _dns_caa_apply <uri> [--settle] — write the main domain's caa set pinned
+# to <uri> ("" = CA-only) and wait for it (apply --wait auto: the stored
+# TTL bounds the wait, contract §12.1). Prints the tool's output; its
+# exit: 0 visible (settled), 1 written but not yet, ≥ 2 the write failed
+# (the tool's message on stderr). The tool's own timeout line is dropped:
+# the callers word it.
+_dns_caa_apply() {
+  local errf rc=0
+  errf="$(mktemp)"
+  (DNS_ACCOUNT_URI="$1" DNS_SETS=caa DNS_IPS_DONE=1 DNS_IPV4="${PORTCULLIS_PUBLIC_IPV4:-}" DNS_IPV6="${PORTCULLIS_PUBLIC_IPV6:-}" \
+    _dns_tool apply --wait auto "${@:2}") 2>"$errf" || rc=$?
+  [ "$rc" -eq 1 ] || cat "$errf" >&2
+  rm -f "$errf"
+  return "$rc"
+}
+
 # dns_relax_main — before `config apply` clears acme.json (an
 # ACME_STAGING flip): the main domain's CAA back to CA-only, so the new
-# account Traefik registers can order; waits up to 2 min for the public
-# resolvers (Traefik orders as soon as it restarts). Only warns.
+# account Traefik registers can order, then wait until no cache anywhere
+# (the CA's resolvers too) can still hold the old pin: apply --wait auto
+# --settle (the write + the TTL the provider stored + 1 min, at most
+# 15 min). Exit 0 only then; 1 written but not settled yet; 2 the write
+# failed. config_apply stops the flip on anything but 0 (fail safe: never
+# order against the old pin).
 dns_relax_main() {
-  info "Relaxing the CAA of ${PORTCULLIS_DOMAIN:-the domain} to CA-only (Traefik registers a new ACME account)..."
-  if ! (DNS_ACCOUNT_URI="" DNS_SETS=caa DNS_IPS_DONE=1 DNS_IPV4="${PORTCULLIS_PUBLIC_IPV4:-}" DNS_IPV6="${PORTCULLIS_PUBLIC_IPV6:-}" \
-      _dns_tool apply --wait 2m >/dev/null); then
-    warn "could not relax the CAA, or the public resolvers don't show it yet (they may cache the old pin for up to 5 minutes): issuance may fail on CAA until then (./portcullis dns setup)"
-  fi
+  local d="${PORTCULLIS_DOMAIN:-the domain}" out rc=0
+  info "Relaxing the CAA of $d to CA-only (Traefik registers a new ACME account), then waiting until no cache can hold the old pin (the TTL the provider stored + 1 min, at most 15 min)..."
+  out="$(_dns_caa_apply "" --settle)" || rc=$?
   dns_main_refresh
-  return 0
+  case "$rc" in
+    0) ok "The CAA of $d is CA-only, and every cache of the old pin has expired."; return 0 ;;
+    1) warn "The CAA of $d was relaxed to CA-only, but $(_dns_wait_text "$out" it | sed 's/the old records/the old pin/')."; return 1 ;;
+    *) warn "could not relax the CAA of $d to CA-only: the write failed (the message is above; check the provider access: ./portcullis dns plan)."; return 2 ;;
+  esac
 }
 
 # dns_main_refresh — after the dns tool wrote the main domain's records

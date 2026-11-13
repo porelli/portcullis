@@ -77,15 +77,29 @@ config_apply() {
     last=false
   fi
   if [ -n "$last" ] && [ "$last" != "$staging" ]; then
-    warn "ACME_STAGING flipped ($last → $staging): clearing Traefik's ACME storage."
+    warn "ACME_STAGING flipped ($last → $staging): Traefik needs a new ACME account and new certificates."
+    local traefik_was=""
+    traefik_was="$(dc ps -q --status running traefik 2>/dev/null || true)"
+    info "Stopping Traefik..."
     dc stop traefik >/dev/null 2>&1 || true
     # The new account Traefik registers can't order while the CAA is
-    # pinned to the old one: back to CA-only first (dns_tighten_main pins
-    # the new account after `up`).
+    # pinned to the old one: back to CA-only first, and only once no cache
+    # (the CA's either) can hold the old pin is the storage cleared
+    # (dns_tighten_main pins the new account after `up`). Anything else
+    # stops here, fail safe: acme.json and the sentinel stay, so nothing
+    # orders against the old pin and the next run redoes the flip;
+    # Traefik goes back on its old account (CA-only allows it too).
     if [ "$caa" = true ] && _dns_automated "${DNS_PROVIDER:-none}"; then
-      dns_relax_main
+      if ! dns_relax_main; then
+        if [ -n "$traefik_was" ]; then
+          info "Starting Traefik again on its current ACME account..."
+          dc start traefik >/dev/null 2>&1 || warn "could not start Traefik again (./portcullis up)"
+        fi
+        fail "The ACME_STAGING flip is not finished: Traefik's ACME storage is kept, so nothing is ordered against the old CAA pin. Run the same command again (./portcullis config apply, or the up / upgrade you ran) once the caches have cleared: it relaxes again, waits, then clears the storage."
+      fi
     fi
     if docker volume inspect portcullis_traefik_acme >/dev/null 2>&1; then
+      info "Clearing Traefik's ACME storage (acme.json)..."
       docker run --rm --network none -v portcullis_traefik_acme:/acme "$PORTCULLIS_HELPER_IMAGE" rm -f /acme/acme.json >/dev/null 2>&1 \
         || warn "could not clear acme.json"
     fi

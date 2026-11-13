@@ -23,6 +23,9 @@ type toolFixture struct {
 	zone      *fakedns.Zone
 	resolvers []string
 	hook      func(op string, recs []libdns.Record) error
+	// deleteMode: the fake provider's DeleteMode ("porkbun": its 600 s TTL
+	// floor and delete-by-name/type, as libdns/porkbun v1.1.0).
+	deleteMode string
 }
 
 // newToolFixture: zone example.test on a fake DNS server and provider
@@ -38,17 +41,29 @@ func newToolFixture(t *testing.T) *toolFixture {
 	t.Cleanup(func() { srv.Close() })
 	f.resolvers = []string{srv.Addr}
 	providers["fake-tool"] = providerSpec{required: []string{"api_token"}, build: func(c map[string]string) (dnsProvider, error) {
-		return &fakedns.Provider{Zone: f.zone, Token: c["api_token"], ZoneName: "example.test",
+		raw := &fakedns.Provider{Zone: f.zone, Token: c["api_token"], ZoneName: "example.test", DeleteMode: f.deleteMode,
 			Hook: func(op string, recs []libdns.Record) error {
 				if f.hook != nil {
 					return f.hook(op, recs)
 				}
 				return nil
-			}}, nil
+			}}
+		if f.deleteMode == "porkbun" { // wrapped as buildProvider wraps the real one
+			return zoneKnown{newPorkbunProvider(raw, fakeIDs{raw}), "example.test."}, nil
+		}
+		return raw, nil
 	}}
 	t.Cleanup(func() { delete(providers, "fake-tool") })
 	return f
 }
+
+// zoneKnown: a wrapped fake that still names its zone (no SOA lookup).
+type zoneKnown struct {
+	dnsProvider
+	zone string
+}
+
+func (z zoneKnown) FindZone(string) (string, error) { return z.zone, nil }
 
 func toolJSON(mod func(m map[string]any)) string {
 	m := map[string]any{"name": "portcullis.example.test", "provider": "fake-tool", "credentials": map[string]string{"api_token": toolToken},
