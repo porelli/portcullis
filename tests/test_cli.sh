@@ -248,12 +248,27 @@ services:
     image: docker.io/library/alpine:3
     healthcheck:
       test: ["CMD", "wget", "-q", "http://127.0.0.1/"]
+    tmpfs:
+      - /tmp
+      - /run:mode=1777,size=1m
+  e:
+    image: docker.io/library/alpine:3
+    tmpfs:
+      - /home/x:uid=10001,gid=10001,mode=0700
+  f:
+    image: docker.io/library/alpine:3
+    volumes:
+      - {type: volume, source: v, target: /v, volume: {nocopy: true}}
+volumes:
+  v: {}
 YML
 printf '      test: ["CMD", "wget", "-q", "http://127.0.0.1/"]\n      test: ["CMD", "bash", "-c", "a b"]\n' > "$WORK/hl/.github/workflows/x.yml"
-expect_eq "lint_healthchecks.sh flags a spaced CMD argument, a split CMD-SHELL, a newline and an inline workflow override (a plain CMD passes)" \
+expect_eq "lint_healthchecks.sh flags a spaced CMD argument, a split CMD-SHELL, a newline, a tmpfs uid= option, volume nocopy and an inline workflow override (a plain CMD, tmpfs mode / size pass)" \
   "$(PATH="${PATH#"$WORK/bin:"}" "$WORK/hl/tests/lint_healthchecks.sh" "$WORK/hl-root/.env" docker-compose.yml 2>&1 | sed 's/:[0-9]*:.*//' ; echo "rc=${PIPESTATUS[0]}")" "docker-compose.yml: a: a CMD argument has whitespace (Podman re-splits it): use one CMD-SHELL string
 docker-compose.yml: b: CMD-SHELL needs exactly one command string
 docker-compose.yml: c: a test element has a newline
+docker-compose.yml: e: tmpfs /home/x:uid=10001,gid=10001,mode=0700 has an option Podman refuses (only size / mode / ro / rw / noexec / nosuid / nodev)
+docker-compose.yml: f: volume nocopy on /v
 a workflow's inline compose override has a CMD healthcheck argument with whitespace:
 .github/workflows/x.yml:2
 rc=1"

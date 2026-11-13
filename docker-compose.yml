@@ -866,9 +866,12 @@ services:
     # 10001-owned in the image), /project/templates and /project/appfiles
     # (chowned to 10001 by ./portcullis up) and the tmpfs paths below.
     read_only: true
+    # /home/hub ($HOME of the image's user 10001): sticky world-writable
+    # instead of uid=/gid= options, which Podman's compat API refuses
+    # ("unknown mount option uid=10001"); only uid 10001 runs in here.
     tmpfs:
       - /tmp
-      - /home/hub:uid=10001,gid=10001,mode=0700
+      - /home/hub:mode=1777
     environment:
       PROJECT_DIR: /project
       PROJECT_HOST_DIR: ${PWD:-.}
