@@ -5867,6 +5867,14 @@ jobs:
               sleep 5
             done
           }
+          # podns: this user's podman-family processes with their user
+          # namespace and cgroup (two namespace trees = two pause processes).
+          podns() {
+            local p
+            for p in $(pgrep -u "$(id -u)" -f '(^|/)(podman|conmon|pasta|pasta\.avx2|catatonit|rootlessport|aardvark-dns|netavark)( |$)'); do
+              printf '  %s %s %s %s\n' "$p" "$(readlink "/proc/$p/ns/user" 2>/dev/null)" "$(cut -d: -f3 "/proc/$p/cgroup" 2>/dev/null | head -n1)" "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | cut -c1-120)"
+            done
+          }
           # redact: setup links in init's output (masked from logs).
           redact() { sed -E 's#(/invite/)[A-Za-z0-9_-]+#\1<redacted>#g'; }
           # to_keycloak <url>: follows the redirects (Traefik on the runner's
@@ -6252,10 +6260,20 @@ jobs:
           # A reboot: everything of this user stops and /run/user/<uid> is a
           # fresh tmpfs. Restarting user@ alone keeps the old runtime dir with
           # a stale rootless pause-process record, which no real boot has.
+          echo "Before: this user's podman processes and their user namespaces:"; podns
           sudo systemctl stop "user@$uid.service"
-          # The rootless pause process the runner's own podman CLI calls left
-          # (outside the user manager) would not survive a reboot either.
-          pkill -u "$uid" -x catatonit || true
+          # Nothing of this user survives a reboot. The runner's own podman
+          # CLI calls (outside the user manager) leave a pause process and
+          # can leave pasta / rootlessport / conmon / aardvark-dns holding
+          # the old user namespace: kill every one, then make sure none is
+          # left (the job's own bash and the runner are not podman processes).
+          for _ in 1 2 3; do
+            pkill -KILL -u "$uid" -f '(^|/)(podman|conmon|pasta|pasta\.avx2|catatonit|rootlessport|aardvark-dns|netavark)( |$)' || true
+            sleep 1
+          done
+          if pgrep -u "$uid" -f '(^|/)(podman|conmon|pasta|pasta\.avx2|catatonit|rootlessport|aardvark-dns|netavark)( |$)' >/dev/null; then
+            echo "FAIL: podman processes of $uid survived the simulated shutdown:"; podns; exit 1
+          fi
           sudo systemctl stop "user-runtime-dir@$uid.service" \
             || { echo "FAIL: /run/user/$uid can't be unmounted"; sudo fuser -vm "/run/user/$uid" || true; exit 1; }
           [ ! -e "/run/user/$uid/podman" ] || { echo "FAIL: /run/user/$uid survived"; exit 1; }
@@ -6263,6 +6281,7 @@ jobs:
           for _ in $(seq 1 30); do [ -S "$XDG_RUNTIME_DIR/podman/podman.sock" ] && break; sleep 1; done
           systemctl --user is-active podman-restart.service || { systemctl --user status podman-restart.service --no-pager || true; }
           status_wait 180
+          echo "After: this user's podman processes and their user namespaces (one tree expected):"; podns
           after="$(docker compose ps -q | wc -l)"
           [ "$after" = "$before" ] || { echo "FAIL: $before core containers before, $after after"; exit 1; }
           echo "PASS: after a simulated reboot (user manager and /run/user/$uid recreated), podman-restart.service brought every container back; status clean"
@@ -6325,6 +6344,8 @@ jobs:
             case "$name" in portcullis-*-*) docker logs "$c" > "e2e-artifacts/apps/$name.log" 2>&1 || true ;; esac
           done
           podman info > e2e-artifacts/podman-info.txt 2>&1 || true
+          # shellcheck source=/dev/null
+          { source "$RUNNER_TEMP/podlib.sh"; podns; } > e2e-artifacts/podman-processes.txt 2>&1 || true
           for net in $(podman network ls --format '{{.Name}}' 2>/dev/null); do
             { echo "== $net (compat)"; docker network inspect "$net" --format '{{json .IPAM}}'; echo "== $net (libpod)"; podman network inspect "$net" --format json; } >> e2e-artifacts/networks.txt 2>&1 || true
           done
