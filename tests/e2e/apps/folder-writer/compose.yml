@@ -1,5 +1,6 @@
 services:
   web:
+    restart: unless-stopped
     image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
     networks: [default, portcullis-proxy]
     labels:
@@ -12,6 +13,7 @@ services:
   # umask 022 (the Hub's override mounts the shared folder at /shared and
   # publishes WRITER_PORT); then idles.
   app:
+    restart: unless-stopped
     image: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
     user: "2001:2001"
     command:
