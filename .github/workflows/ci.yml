@@ -3879,7 +3879,10 @@ jobs:
           if docker image inspect "$HELPER" >/dev/null 2>&1; then echo "FAIL: the helper image is still present"; exit 1; fi
           hubop POST /api/instances/echo-a/backups
           ARCHIVE="$(jq -r .result.archive /tmp/op.json)"
-          docker image inspect -f '{{json .RepoDigests}}' "$HELPER" | jq -e --arg d "${HELPER%%:*}@${HELPER#*@}" 'index($d) != null' >/dev/null \
+          # RepoDigests names a docker.io image either way: docker.io/library/alpine@… or alpine@….
+          REPO="${HELPER%%:*}" SHORT="${REPO#docker.io/}"; SHORT="${SHORT#library/}"
+          docker image inspect -f '{{json .RepoDigests}}' "$HELPER" \
+            | jq -e --arg d "$REPO@${HELPER#*@}" --arg s "$SHORT@${HELPER#*@}" 'any(.[]; . == $d or . == $s)' >/dev/null \
             || { echo "FAIL: the helper image was not pulled by its digest"; exit 1; }
           [ -z "$(docker ps -aq --filter label=io.portcullis.hub.helper)" ] || { echo "FAIL: helper containers left behind"; docker ps -a; exit 1; }
           echo "PASS: backup $ARCHIVE (helper image pulled by digest, never-started helpers removed)"
