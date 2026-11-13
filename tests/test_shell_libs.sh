@@ -2476,7 +2476,7 @@ for st in missing corrupt; do
   WAIT_EXTRA='{"beyond_cap":true,"settle_at":1}' wait_out true false 86400; echo 1 > "$STUB_DIR/dt/rc-apply"
   OUT="$(flip "$FCF")"
   NB="$(sed -n 's/^RELAX_NOT_BEFORE=//p' "$RELAXF" 2>/dev/null)"
-  case "$st:$OUT" in missing:*"already CA-only"*"can't be known"*"24 h"*rc=1|corrupt:*"unreadable"*"can't be known"*"24 h"*rc=1) t_pass "relax: $st settle point, CAA already relaxed → 24 h, said" ;; *) t_fail "relax $st: $OUT" ;; esac
+  case "$st:$OUT" in missing:*"No Portcullis pin of ci.example.org is live"*"no settle record exists"*"the old pin's lifetime is unknown"*"24 h"*"can go ahead after"*rc=1|corrupt:*"unreadable"*"can't be known"*"24 h"*rc=1) t_pass "relax: $st settle point, CAA already relaxed → 24 h, said" ;; *) t_fail "relax $st: $OUT" ;; esac
   case "$OUT" in *"dns setup"*|*"pin the CAA again"*) t_fail "relax $st: the 24 h warning suggests a re-pin: $OUT" ;; *) t_pass "relax: $st — the 24 h warning offers no re-pin way around it" ;; esac
   expect_eq "relax: $st settle point → now + 24 h saved, passed on" \
     "$([ "${NB:-0}" -ge $((T0 + 86400)) ] 2>/dev/null && echo ok):$(grep -c "settle-after $NB\$" "$STUB_DIR/dt/argv")" "ok:1"
@@ -2533,6 +2533,22 @@ case "$OUT" in *"DNS_CAA=yes must be true or false"*rc=1) t_pass "config apply f
 expect_eq "config apply flip: a bad DNS_CAA refuses before Traefik is stopped" "$(cat "$STUB_DIR/dt/argv" 2>/dev/null | grep -c 'stop traefik' || true)" 0
 OUT="$(flip 'export DNS_PROVIDER=gcloud')"
 expect_eq "config apply flip: no relax for a manual provider" "$(grep -c dns-tool "$STUB_DIR/dt/argv" || true)" 0
+# Where Portcullis doesn't manage the CAA — DNS_CAA=false, no or a manual
+# provider, an automated one without its credentials — a flip does no
+# relax, no settle, no wait and no 24 h point: stop, clear, Traefik back
+# on the new CA, sentinel (as before this branch, plus N1's export).
+touch "$STUB_DIR/dt/traefik-running"
+for unmanaged in 'export DNS_CAA=false DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123' 'export DNS_PROVIDER=none' \
+    'export DNS_PROVIDER=gcloud' 'unset CLOUDFLARE_API_TOKEN; export DNS_PROVIDER=cloudflare'; do
+  rm -f "$RELAXF"
+  OUT="$(flip "$unmanaged")"
+  expect_eq "config apply flip, CAA not managed ($unmanaged): no relax, no build, no settle point; cleared, new CA, done" \
+    "${OUT##*rc=}:$(grep -c -e dns-tool -e 'build domains' "$STUB_DIR/dt/argv" || true):$([ -e "$RELAXF" ] && echo saved):$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv"):$(cat "$STUB_DIR/dt/traefik-up" 2>/dev/null):$(cat "$FL_ROOT/certs/.acme-staging-last")" \
+    "0:0::1:CA=https://acme-staging-v02.api.letsencrypt.org/directory sentinel=false:true"
+  case "$OUT" in *"24 h"*|*"Relaxing"*) t_fail "unmanaged flip ($unmanaged) waits: $OUT" ;; *) t_pass "config apply flip, CAA not managed ($unmanaged): no wait message" ;; esac
+done
+rm -f "$STUB_DIR/dt/traefik-running"
+OUT="$(flip 'export DNS_PROVIDER=gcloud')"
 expect_eq "config apply: ACME_DNS_PROVIDER written" "$(grep '^ACME_DNS_PROVIDER=' "$FL_ROOT/.env")" "ACME_DNS_PROVIDER=gcloud"
 OUT="$(flip 'export DNS_PROVIDER=hetzner-cloud HETZNER_API_TOKEN=cloud-0123456789')"
 expect_eq "config apply: hetzner-cloud is lego's hetzner" "$(grep '^ACME_DNS_PROVIDER=' "$FL_ROOT/.env")" "ACME_DNS_PROVIDER=hetzner"

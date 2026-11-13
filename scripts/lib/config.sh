@@ -113,7 +113,10 @@ config_apply() {
     # account renew. Anything short of settled stops here, fail safe:
     # acme.json, the sentinel and the saved settle point stay, so nothing
     # orders against the old pin and the next run redoes the flip.
-    if [ "$caa" = true ] && _dns_automated "${DNS_PROVIDER:-none}"; then
+    # Only where Portcullis manages the CAA (DNS_CAA=true, an automated
+    # provider with its credentials): anywhere else there is no pin of
+    # ours to relax, so no relax, no settle point and no wait.
+    if [ "$caa" = true ] && _dns_automated "${DNS_PROVIDER:-none}" && _dns_creds_present "${DNS_PROVIDER:-none}"; then
       # The dns tool must understand this CLI's arguments (an `up` after a
       # `git pull` runs this before its own rebuild).
       domains_image_build "for the CAA relax"

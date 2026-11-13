@@ -527,7 +527,7 @@ dns_relax_main() {
       # longest resolvers commonly cache (I6).
       nb=$((now + 86400))
       _dns_relax_put "$now" 86400 "$nb" || { warn "could not save the relax's settle point ($(_dns_relax_file))"; return 3; }
-      warn "The CAA of $d is already CA-only (or has none of its entries), but no settle point is saved ($(_dns_relax_file)): how long caches may still hold the old pin can't be known, so the flip waits 24 h, until $(jq -rn --argjson t "$nb" '$t | strftime("%Y-%m-%d %H:%M UTC")'). Run it again after that time."
+      warn "No Portcullis pin of $d is live (the CAA is CA-only or has none of its entries, e.g. Traefik never registered, so it was never pinned) and no settle record exists ($(_dns_relax_file)), so the old pin's lifetime is unknown: the flip waits 24 h and can go ahead after $(jq -rn --argjson t "$nb" '$t | strftime("%Y-%m-%d %H:%M UTC")') (run it again then)."
     else
       nb=$((now + ttl + 60))
       _dns_relax_put "$now" "$ttl" "$nb" || { warn "could not save the relax's settle point ($(_dns_relax_file))"; return 3; }
