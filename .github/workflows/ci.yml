@@ -6075,15 +6075,38 @@ jobs:
           [ "$(getenforce)" = Enforcing ] || { echo "FAIL: the getenforce stub isn't on PATH"; exit 1; }
           CF="$(bash -c 'source scripts/lib/common.sh; env_load; runtime_export; printf "%s" "$COMPOSE_FILE"')"
           case "$CF" in *docker-compose.podman.yml*docker-compose.podman-selinux.yml*) ;; *) echo "FAIL: the CLI's COMPOSE_FILE lacks the podman overlays: $CF"; exit 1 ;; esac
-          docker inspect -f '{{json .Mounts}}' "$(docker compose ps -q hub)" | jq -e '
-              (map(select(.Destination == "/project")) | length == 1 and .[0].Type == "tmpfs")
+          # Podman's inspect lists no tmpfs under Mounts: the mount table of
+          # the Hub's own process is the evidence (/project a tmpfs, no bind of
+          # the checkout; the map file bound into it).
+          HUB_CID="$(docker compose ps -q hub)"
+          docker inspect -f '{{json .Mounts}}' "$HUB_CID" | jq -e --arg p "$PWD" '
+              (map(select(.Destination == "/project")) | length == 0)
+              and (map(select(.Source == $p)) | length == 0)
               and (map(select(.Destination == "/project/group-gate/group-gate-map.conf")) | length == 1)' >/dev/null \
-            || { echo "FAIL: the Hub's /project isn't the overlay's tmpfs + map bind"; docker inspect -f '{{json .Mounts}}' "$(docker compose ps -q hub)"; exit 1; }
+            || { echo "FAIL: the Hub's mounts aren't the overlay's (no checkout bind, the map file bound)"; docker inspect -f '{{json .Mounts}}' "$HUB_CID"; exit 1; }
+          HUB_PID="$(docker inspect -f '{{.State.Pid}}' "$HUB_CID")"
+          podman unshare awk '$5 == "/project" { for (i = 7; i <= NF; i++) if ($i == "-") { print $(i + 1); exit } }' "/proc/$HUB_PID/mountinfo" | grep -qx tmpfs \
+            || { echo "FAIL: the Hub's /project is not a tmpfs:"; podman unshare grep ' /project' "/proc/$HUB_PID/mountinfo"; exit 1; }
           for p in socket-proxy-traefik socket-proxy-hub; do
             docker inspect -f '{{json .HostConfig.SecurityOpt}}' "$(docker compose ps -q "$p")" | jq -e 'any(.[]?; test("^label[=:]disable$"))' >/dev/null \
               || { echo "FAIL: $p has no label=disable"; exit 1; }
           done
           echo "PASS: the SELinux overlay's layout runs (Hub /project tmpfs + map bind, label=disable on the proxies)"
+          # Local images keep their Dockerfile HEALTHCHECK (podman build
+          # --format docker: the OCI format drops it), and every core
+          # container with a healthcheck (compose or image) reports a health.
+          for df in */Dockerfile; do
+            grep -q '^HEALTHCHECK' "$df" || continue
+            img="portcullis-${df%%/*}"
+            podman image inspect "$img" | jq -e '.[0] | (.Healthcheck // .Config.Healthcheck // null) | .Test | length > 0' >/dev/null \
+              || { echo "FAIL: $img has no Healthcheck (built in OCI format?)"; podman image inspect "$img" | jq '.[0] | {Healthcheck, Config}'; exit 1; }
+            echo "  $img keeps its HEALTHCHECK"
+          done
+          for cid in $(docker compose ps -q); do
+            read -r name hc st < <(docker inspect -f '{{.Name}} {{if .Config.Healthcheck}}{{len .Config.Healthcheck.Test}}{{else}}0{{end}} {{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}' "$cid")
+            [ "$hc" = 0 ] || [ "$st" != - ] || { echo "FAIL: ${name#/} has a healthcheck but reports no health"; exit 1; }
+          done
+          echo "PASS: local images keep their HEALTHCHECK; every core container with a healthcheck reports a health"
           echo "PASS: init --runtime podman; status clean (runtime podman, ports ≥ $(jq .runtime.port_start /tmp/status.json))"
 
       - name: Every SELinux-overlay bind source exists after a full up (monitoring profile)

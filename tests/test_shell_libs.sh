@@ -2524,9 +2524,9 @@ cat > "$STUB_DIR/rt-config.json" <<'JSON'
 JSON
 OUT="$(rt "CONTAINER_RUNTIME=podman; stack_compose_up >/dev/null 2>&1; echo \"\$?\"; sort \"\$STUB_DIR/podman-calls\"; grep -E '^compose .* (up|build)( |$)' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'")"
 expect_eq "stack_compose_up on podman builds with podman build and runs up --no-build" "$OUT" "0
-build -t portcullis-domains -f /src/domains/Dockerfile --build-arg GO_TAGS=testprovider /src/domains
-build -t portcullis-enroll -f /src/enroll/Dockerfile /src/enroll
-build -t portcullis-mcp-gate -f /src/mcp-gate/Dockerfile.x /src/mcp-gate
+build --format docker -t portcullis-domains -f /src/domains/Dockerfile --build-arg GO_TAGS=testprovider /src/domains
+build --format docker -t portcullis-enroll -f /src/enroll/Dockerfile /src/enroll
+build --format docker -t portcullis-mcp-gate -f /src/mcp-gate/Dockerfile.x /src/mcp-gate
 compose up -d --no-build
 rc=0"
 OUT="$(rt "CONTAINER_RUNTIME=docker; stack_compose_up hub >/dev/null 2>&1; grep -E '^compose ' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'; test ! -e \"\$STUB_DIR/podman-calls\"")"
@@ -2536,7 +2536,7 @@ expect_eq "runtime_no_build: --no-build under podman, nothing under docker" \
   "[$(CONTAINER_RUNTIME=podman runtime_no_build)][$(CONTAINER_RUNTIME=docker runtime_no_build)]" "[--no-build][]"
 OUT="$(rt "CONTAINER_RUNTIME=podman PORTCULLIS_ROOT='$RX'; domains_image_ensure >/dev/null 2>&1; echo \"\$?\"; cat \"\$STUB_DIR/podman-calls\"; grep -c ' build' \"\$STUB_DIR/rt-calls\"; true")"
 expect_eq "domains_image_ensure on podman runs podman build, never dc build" "$OUT" "0
-build -t portcullis-domains -f /src/domains/Dockerfile --build-arg GO_TAGS=testprovider /src/domains
+build --format docker -t portcullis-domains -f /src/domains/Dockerfile --build-arg GO_TAGS=testprovider /src/domains
 0
 rc=0"
 OUT="$(rt "CONTAINER_RUNTIME=docker PORTCULLIS_ROOT='$RX'; domains_image_ensure >/dev/null 2>&1; grep -E '^compose ' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'")"
@@ -2821,14 +2821,14 @@ expect_eq "hub_started_unix: no StartedAt → 0" "$(HS_AT='' HS)" 0
 
 # AppArmor (Ubuntu bug 2154379): pasta must accept podman's SIGTERM.
 AA="$WORK/rt/aa"
-aa() { rt "CONTAINER_RUNTIME=podman RT_APPARMOR_DIR='$AA' RT_APPARMOR_ENABLED='$WORK/rt/$1'; _rt_apparmor_pasta_check" | head -n1 | cut -f1; }
+aa() { rt "CONTAINER_RUNTIME=podman RT_APPARMOR_DIR='$AA' RT_APPARMOR_ENABLED='$WORK/rt/$1' RT_APPARMOR_POLICY='${AA_POLICY:-$WORK/rt/aa-nopolicy}'; _rt_apparmor_pasta_check" | head -n1 | cut -f1; }
 rm -f "$AA/podman" "$AA/usr.bin.pasta" "$AA/local/usr.bin.pasta"
 expect_eq "AppArmor check: disabled → ok" "$(aa aa-off)" ok
 expect_eq "AppArmor check: enabled, no podman / pasta profiles → ok" "$(aa aa-on)" ok
 printf 'profile podman /usr/bin/podman flags=(unconfined) {\n}\n' > "$AA/podman"
 printf 'profile pasta /usr/bin/pasta{,.avx2} flags=(attach_disconnected) {\n  include <abstractions/pasta>\n  include if exists <local/usr.bin.pasta>\n}\n' > "$AA/usr.bin.pasta"
 expect_eq "AppArmor check: Ubuntu's profiles without the rule → fail" "$(aa aa-on)" fail
-case "$(rt "CONTAINER_RUNTIME=podman RT_APPARMOR_DIR='$AA' RT_APPARMOR_ENABLED='$WORK/rt/aa-on'; _rt_apparmor_pasta_check")" in
+case "$(rt "CONTAINER_RUNTIME=podman RT_APPARMOR_DIR='$AA' RT_APPARMOR_ENABLED='$WORK/rt/aa-on' RT_APPARMOR_POLICY='$WORK/rt/aa-nopolicy'; _rt_apparmor_pasta_check")" in
   *"signal (receive) set=(term) peer=podman,"*"apparmor_parser -r"*) t_pass "AppArmor check: the fail line gives the rule and the reload" ;; *) t_fail "AppArmor check hint" ;; esac
 echo '# signal (receive) set=(term) peer=podman,' > "$AA/local/usr.bin.pasta"
 expect_eq "AppArmor check: a commented-out rule → fail" "$(aa aa-on)" fail
@@ -2837,9 +2837,13 @@ expect_eq "AppArmor check: the rule in local/usr.bin.pasta → ok" "$(aa aa-on)"
 printf 'profile pasta /usr/bin/pasta {\n  include <abstractions/pasta>\n}\n' > "$AA/usr.bin.pasta"
 expect_eq "AppArmor check: a local rule the profile doesn't include → fail" "$(aa aa-on)" fail
 printf 'profile pasta /usr/bin/pasta {\n  include if exists <local/usr.bin.pasta>\n}\n' > "$AA/usr.bin.pasta"
-touch -t 202601010000 "$WORK/rt/aa-policy"
-expect_eq "AppArmor check: a profile file newer than the readable loaded policy → warn (reload it)" \
-  "$(rt "CONTAINER_RUNTIME=podman RT_APPARMOR_DIR='$AA' RT_APPARMOR_ENABLED='$WORK/rt/aa-on' RT_APPARMOR_POLICY='$WORK/rt/aa-policy'; _rt_apparmor_pasta_check" | head -n1 | cut -f1)" warn
+echo 'signal (receive) set=(term) peer=podman,' > "$AA/local/usr.bin.pasta"
+touch -t 202601010000 "$WORK/rt/aa-policy-old"; : > "$WORK/rt/aa-policy-new"
+expect_eq "AppArmor check: the loaded policy older than the profile files (stale) → warn (reload it)" "$(AA_POLICY="$WORK/rt/aa-policy-old" aa aa-on)" warn
+touch "$AA/usr.bin.pasta" "$AA/local/usr.bin.pasta"; sleep 1; touch "$WORK/rt/aa-policy-new"
+expect_eq "AppArmor check: the loaded policy newer than the profile files (fresh) → ok" "$(AA_POLICY="$WORK/rt/aa-policy-new" aa aa-on)" ok
+expect_eq "AppArmor check: the loaded policy unreadable (no root) → ok, unchecked" "$(AA_POLICY="$WORK/rt/aa-nopolicy" aa aa-on)" ok
+rm -f "$AA/local/usr.bin.pasta"
 rm -f "$AA/local/usr.bin.pasta"
 printf 'profile pasta /usr/bin/pasta {\n  signal receive set=(term hup kill int quit) peer=podman,\n}\n' > "$AA/usr.bin.pasta"
 expect_eq "AppArmor check: the rule in the profile itself → ok" "$(aa aa-on)" ok

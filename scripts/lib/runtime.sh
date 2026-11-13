@@ -398,7 +398,9 @@ runtime_build_local() {
   while IFS=$'\t' read -r svc img ctx df args target; do
     [ -n "$svc" ] || continue
     case "$df" in /*) ;; *) df="$ctx/$df" ;; esac
-    cmd=(podman build -t "$img" -f "$df")
+    # --format docker: the OCI format drops the Dockerfile's HEALTHCHECK
+    # ("not supported for OCI image format and will be ignored").
+    cmd=(podman build --format docker -t "$img" -f "$df")
     while IFS= read -r a; do
       [ -n "$a" ] && cmd+=(--build-arg "$a")
     done < <(printf '%s' "$args" | jq -r 'to_entries[] | if .value == null then .key else "\(.key)=\(.value)" end')
