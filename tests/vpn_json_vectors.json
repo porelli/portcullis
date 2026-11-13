@@ -27,6 +27,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -36,6 +37,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -119,6 +121,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -128,6 +131,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -208,6 +212,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -217,6 +222,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -297,6 +303,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -306,6 +313,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -385,6 +393,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -394,6 +403,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -473,6 +483,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -482,6 +493,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10",
@@ -562,6 +574,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -571,6 +584,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -658,6 +672,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -667,6 +682,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -742,6 +758,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -751,6 +768,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -826,6 +844,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -835,6 +854,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -889,6 +909,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -898,6 +919,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -977,6 +999,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -986,6 +1009,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -1065,6 +1089,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -1074,6 +1099,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -1148,6 +1174,7 @@
       "providers": [
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -1207,6 +1234,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -1216,6 +1244,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -1303,6 +1332,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -1312,6 +1342,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"
@@ -1324,6 +1355,7 @@
         },
         {
           "id": "netbird",
+          "source": "hook",
           "label": "NetBird",
           "ranges": [
             "100.64.0.0/16"
@@ -1403,6 +1435,7 @@
       "providers": [
         {
           "id": "builtin",
+          "source": "builtin",
           "ranges": [
             "10.213.0.0/22"
           ],
@@ -1412,6 +1445,7 @@
         },
         {
           "id": "headscale",
+          "source": "hook",
           "label": "Headscale tailnet",
           "ranges": [
             "100.64.0.0/10"

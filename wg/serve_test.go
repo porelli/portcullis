@@ -66,14 +66,14 @@ func TestServeEndToEnd(t *testing.T) {
 	os.WriteFile(vpnFile, []byte(fmt.Sprintf(`{"version":2,
  "builtin":{"subnet":"10.213.0.0/22","server_public_key":%q,"domains":[],
   "peers":[{"ip":"10.213.0.5","public_key":%q,"device_id":"d1","expires":null}]},
- "providers":[{"id":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],
+ "providers":[{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],
  "devices":[{"ip":"10.213.0.5","provider":"builtin","user":"alice","device_id":"d1","name":"p","expires":null}]}`,
 		tunnel.KeyString(tunnel.PublicKeyOf(srvKey)), tunnel.KeyString(tunnel.PublicKeyOf(cliKey)))), 0o640)
 	statusFile := filepath.Join(dir, "status.json")
 	port := udpPort(t)
 	env := map[string]string{
 		"WG_VPN_FILE": vpnFile, "WG_STATUS_FILE": statusFile, "WG_PEOPLE_KEY": keyFile, "WG_PEOPLE": "on",
-		"WG_PORT": fmt.Sprint(port), "WG_VPN_ADDR": "127.0.0.1", "WG_TRAEFIK": tr.Addr().String(),
+		"WG_PORT": fmt.Sprint(port), "WG_VPN_ADDR": "127.0.0.3", "WG_EDGE_ADDR": "127.0.0.1", "WG_TRAEFIK": tr.Addr().String(),
 		"WG_DNS_UPSTREAM": "127.0.0.1:1", "WG_DOMAIN": "example.org", "WG_METRICS": "off",
 	}
 	cfg, err := loadConfig(func(k string) string { return env[k] })

@@ -78,7 +78,7 @@ func doc(t *testing.T, serverKey string, peers ...string) *vpndoc.Doc {
 func docRaw(t *testing.T, serverKey, peers string) *vpndoc.Doc {
 	t.Helper()
 	d, err := vpndoc.Parse([]byte(`{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + serverKey +
-		`","domains":[],"peers":[` + peers + `]},"providers":[{"id":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`))
+		`","domains":[],"peers":[` + peers + `]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`))
 	if err != nil {
 		t.Fatalf("fixture: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestPeopleRoleSyncsPeers(t *testing.T) {
 		t.Fatalf("status %v %q", ok, e)
 	}
 	// Another subnet than this role's: refused.
-	d, err := vpndoc.Parse([]byte(`{"version":2,"builtin":{"subnet":"10.99.0.0/22","server_public_key":"` + s.PublicKey() + `","domains":[],"peers":[]},"providers":[{"id":"builtin","ranges":["10.99.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`))
+	d, err := vpndoc.Parse([]byte(`{"version":2,"builtin":{"subnet":"10.99.0.0/22","server_public_key":"` + s.PublicKey() + `","domains":[],"peers":[]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.99.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}

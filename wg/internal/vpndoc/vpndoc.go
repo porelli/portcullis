@@ -29,6 +29,14 @@ const Version = 2
 // BuiltinID is the provider id of the built-in people role.
 const BuiltinID = "builtin"
 
+// Provider sources: the built-in role, a hook-sourced map (refreshed by the
+// Hub, goes stale) and an admin's static map (never stale).
+const (
+	SourceBuiltin = "builtin"
+	SourceHook    = "hook"
+	SourceStatic  = "static"
+)
+
 // Edge ports: 9001 + slot, slots 0–46 (gateways .16–.62).
 const (
 	EdgePortFirst = 9001
@@ -71,6 +79,7 @@ type Peer struct {
 
 type Provider struct {
 	ID          string     `json:"id"`
+	Source      string     `json:"source"`
 	Label       string     `json:"label"`
 	Ranges      []string   `json:"ranges"`
 	EdgePort    int        `json:"edge_port"`
@@ -187,6 +196,14 @@ func (d *Doc) validate() error {
 			owner = append(owner, p.ID)
 			p.prefixes = append(p.prefixes, pr)
 		}
+		switch p.Source {
+		case SourceBuiltin, SourceHook, SourceStatic:
+		default:
+			return fmt.Errorf("providers[%d].source: builtin, hook or static", i)
+		}
+		if (p.ID == BuiltinID) != (p.Source == SourceBuiltin) {
+			return fmt.Errorf("providers[%d]: the builtin id and source go together", i)
+		}
 		if p.ID == BuiltinID {
 			if d.Builtin == nil {
 				return errors.New("providers: builtin provider without a builtin section")
@@ -194,8 +211,8 @@ func (d *Doc) validate() error {
 			if len(p.prefixes) != 1 || p.prefixes[0] != d.Builtin.subnet {
 				return errors.New("providers: builtin ranges differ from builtin.subnet")
 			}
-			if p.EdgePort != 0 || p.GatewayIP != "" {
-				return errors.New("providers: builtin has an edge port or gateway")
+			if p.EdgePort != 0 || p.GatewayIP != "" || p.RefreshedAt != nil || p.StaleAfter != nil {
+				return errors.New("providers: builtin has an edge port, a gateway, refreshed_at or stale_after")
 			}
 			continue
 		}
@@ -203,11 +220,15 @@ func (d *Doc) validate() error {
 			return fmt.Errorf("providers[%d].edge_port: outside %d–%d or duplicate", i, EdgePortFirst, EdgePortLast)
 		}
 		ports[p.EdgePort] = true
-		if p.RefreshedAt == nil || p.StaleAfter == nil {
-			return fmt.Errorf("providers[%d]: refreshed_at and stale_after are required", i)
-		}
-		if span := p.StaleAfter.Sub(*p.RefreshedAt); span <= 0 || span > MaxStaleSpan {
-			return fmt.Errorf("providers[%d].stale_after: not within %s after refreshed_at", i, MaxStaleSpan)
+		if p.Source == SourceHook {
+			if p.RefreshedAt == nil || p.StaleAfter == nil {
+				return fmt.Errorf("providers[%d]: a hook provider needs refreshed_at and stale_after", i)
+			}
+			if span := p.StaleAfter.Sub(*p.RefreshedAt); span <= 0 || span > MaxStaleSpan {
+				return fmt.Errorf("providers[%d].stale_after: not within %s after refreshed_at", i, MaxStaleSpan)
+			}
+		} else if p.RefreshedAt != nil || p.StaleAfter != nil {
+			return fmt.Errorf("providers[%d]: a static provider carries no refreshed_at or stale_after", i)
 		}
 		g, err := netip.ParseAddr(p.GatewayIP)
 		if err != nil || !g.Is4() {
@@ -285,18 +306,21 @@ func (p *Provider) Prefixes() []netip.Prefix { return p.prefixes }
 // (invalid for the built-in).
 func (p *Provider) Gateway() netip.Addr { return p.gateway }
 
-// Fresh reports whether the provider's map may be used at now: not marked
-// stale by the Hub and, for a marketplace provider, before stale_after (a
-// missing stale_after is never fresh; Parse refuses it anyway). The
-// built-in map is the Hub's own device list, with no refresh.
+// Fresh reports whether the provider's map may be used at now: never when
+// the Hub marked it stale; a hook provider only before its stale_after
+// (none = never fresh; Parse refuses that anyway); the built-in and a
+// static map have no refresh. An unknown source is never fresh.
 func (p *Provider) Fresh(now time.Time) bool {
 	if p.Stale {
 		return false
 	}
-	if p.ID == BuiltinID {
+	switch p.Source {
+	case SourceBuiltin, SourceStatic:
 		return true
+	case SourceHook:
+		return p.StaleAfter != nil && now.Before(*p.StaleAfter)
 	}
-	return p.StaleAfter != nil && now.Before(*p.StaleAfter)
+	return false
 }
 
 // ProviderOf is the provider whose ranges hold a (ranges are disjoint).

@@ -35,8 +35,8 @@ func docJSON(gateway string, stale bool) string {
 	return `{"version":2,
  "builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],
   "peers":[{"ip":"10.213.0.5","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d1","expires":null}]},
- "providers":[{"id":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false},
-  {"id":"hs","label":"t","ranges":["100.64.0.0/10"],"edge_port":9001,"gateway_ip":"` + gateway + `",
+ "providers":[{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false},
+  {"id":"hs","source":"hook","label":"t","ranges":["100.64.0.0/10"],"edge_port":9001,"gateway_ip":"` + gateway + `",
    "refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":` + st + `}],
  "devices":[{"ip":"100.64.0.7","provider":"hs","user":"alice","device_id":"hs:1","name":"a","expires":null},
   {"ip":"10.213.0.5","provider":"builtin","user":"bob","device_id":"d1","name":"p","expires":null}]}`
