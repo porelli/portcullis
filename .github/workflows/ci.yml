@@ -5065,7 +5065,9 @@ jobs:
           docker events --format '{{.Time}} {{.Type}} {{.Action}} {{.Actor.Attributes.name}}' > e2e-artifacts/docker-events.txt 2>&1 &
           ev=$!
           rc=0
-          /tmp/e2e-venv/bin/python tests/e2e/e2e_vpn.py || rc=$?
+          # Playwright's request context (Node) trusts the CI CA, as the other
+          # e2e jobs (the browser has it in its NSS database).
+          NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_vpn.py || rc=$?
           kill "$ev" 2>/dev/null || true
           exit "$rc"
 

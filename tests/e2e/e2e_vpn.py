@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import html
 import json
 import os
 import re
@@ -457,8 +458,10 @@ def main() -> int:
         def builtin_not_yours():
             needs("bob_conf", "alice_cookie", "vpn_only")
             r = tunnel(state["bob_conf"], cookie_file=state["alice_cookie"])
-            assert r.get("status") == 403 and NOT_YOURS in r.get("body", ""), f"{r.get('status')} {r.get('body', '')[:200]}"
-            assert "bob" not in r["body"] and "alice" not in r["body"], "the page names a person"
+            # The page HTML-escapes its text (isn&#x27;t): compare the text.
+            page_text = html.unescape(re.sub(r"<[^>]+>", " ", r.get("body", "")))
+            assert r.get("status") == 403 and NOT_YOURS in page_text, f"{r.get('status')} {page_text[-300:]}"
+            assert "bob" not in page_text and "alice" not in page_text, "the page names a person"
         check("builtin_not_yours: bob's device with alice's session → 403 \"this device isn't yours\"", builtin_not_yours)
 
         def builtin_dns():
@@ -501,10 +504,23 @@ def main() -> int:
                 sh("docker", "exec", "ts-alice", "cat", "/tmp/up.log")[1]), 60)
             _, page, _ = sessions["alice"]
             goto(page, url)
-            until("alice's node registered", lambda: '"Online": true' in sh(
-                "docker", "exec", "ts-alice", "tailscale", "--socket=/tmp/ts.sock", "status", "--json")[1]
-                or "BackendState\": \"Running" in sh("docker", "exec", "ts-alice", "tailscale", "--socket=/tmp/ts.sock",
-                                                      "status", "--json")[1], 120)
+
+            def registered():
+                # Keycloak may ask alice's passkey again for headscale's
+                # client (its sign-in template): the virtual authenticator answers.
+                if page.url.startswith(AUTH) and page.locator("#authenticateWebAuthnButton").is_visible():
+                    page.click("#authenticateWebAuthnButton")
+                st = sh("docker", "exec", "ts-alice", "tailscale", "--socket=/tmp/ts.sock", "status", "--json")[1]
+                return '"Online": true' in st or 'BackendState": "Running' in st
+            try:
+                until("alice's node registered", registered, 120)
+            except AssertionError:
+                # Where it stopped: the browser (page, text), tailscaled, headscale.
+                base.shot(page, "tailnet-register")
+                print(f"    browser at {page.url.split('?')[0]}: {page.inner_text('body')[:600]!r}", flush=True)
+                print("    tailscale up: " + redact(sh("docker", "exec", "ts-alice", "cat", "/tmp/up.log")[1])[-800:], flush=True)
+                print("    headscale: " + redact(sh("docker", "logs", "--tail", "40", f"portcullis-{HS}-headscale-1")[1])[-2500:], flush=True)
+                raise
             state["ts_alice"] = True
         check("tailnet_register: a userspace tailscaled node registered as alice through Keycloak", tailnet_register)
 
