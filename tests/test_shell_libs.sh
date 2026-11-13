@@ -181,7 +181,12 @@ hub_env_run
 HE="$HR/secrets/hub/core.env"
 expect_ok   "hub env: domain" grep -qx 'PORTCULLIS_DOMAIN=hub.test' "$HE"
 expect_ok   "hub env: Traefik IP (compose default)" grep -qx 'PORTCULLIS_TRAEFIK_IP=172.31.250.2' "$HE"
-expect_ok   "hub env: VPN client secret by prefix" grep -qx 'HEADSCALE_OIDC_CLIENT_SECRET=hs-secret' "$HE"
+expect_ok   "hub env: an app variable by prefix (NETBIRD_)" grep -qx 'NETBIRD_OIDC_CLIENT_SECRET=nb-secret' "$HE"
+expect_fail "hub env: no HEADSCALE_ / HEADPLANE_ prefix any more (core carries no Headscale)" grep -q '^HEADSCALE_\|^HEADPLANE_' "$HE"
+expect_ok   "hub env: wg's portcullis-vpn address (compose default; the Hub's PORTCULLIS_VPN_EDGE for gateways)" \
+  grep -qx 'PORTCULLIS_VPN_WG_IP=172.31.254.3' "$HE"
+expect_ok   "hub env: the VPN reserved ranges (what wg / group-gate refuse) for the Hub" \
+  grep -qx 'PORTCULLIS_VPN_RESERVED_RANGES=172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28' "$HE"
 expect_ok   "hub env: HUB_SHARED_ENV" grep -qx 'MY_APP_VAR=shared' "$HE"
 expect_ok   "hub env: mcp-gate IP (compose default, G42)" grep -qx 'PORTCULLIS_MCP_GATE_IP=172.31.250.3' "$HE"
 expect_fail "hub env: never a core secret" grep -Eq 'pg-secret|hub-secret|kc-secret' "$HE"
@@ -228,6 +233,28 @@ expect_eq "stack_prepare: a 10001-owned appfiles/ keeps its mode" "$(file_mode "
   stack_prepare ) >/dev/null 2>&1
 expect_ok "stack_prepare: mcp_gate_data owned 10005:10001" grep -qx 'volume_own mcp_gate_data 10005:10001' "$STUB_DIR/sp-vol"
 expect_ok "stack_prepare: mcp-gate secrets ensured" grep -qx 'mcpgate_ensure_secrets' "$STUB_DIR/sp-vol"
+# wg_data (VPN, V5): wg (10006) writes status.json, the Hub reads it
+# through group 10001; setgid 2750 so new files carry 10001.
+expect_ok "stack_prepare: wg_data owned 10006:10001, mode 2750" grep -qx 'volume_own wg_data 10006:10001 2750' "$STUB_DIR/sp-vol"
+# vpn_doc (security ruling): the Hub writes vpn.json there, wg and
+# group-gate read it through group 10007 only (not the Hub's 10001).
+expect_ok "stack_prepare: vpn_doc owned 10001:10007, mode 2750" grep -qx 'volume_own vpn_doc 10001:10007 2750' "$STUB_DIR/sp-vol"
+# secrets/wg/people.key: an empty placeholder (people role off) so the
+# bind never makes a directory and the SELinux overlay's source exists.
+expect_ok "stack_prepare: secrets/wg/people.key is an empty file" bash -c "[ -f '$SP_ROOT/secrets/wg/people.key' ] && [ ! -s '$SP_ROOT/secrets/wg/people.key' ]"
+expect_eq "stack_prepare: people.key placeholder 0640" "$(file_mode "$SP_ROOT/secrets/wg/people.key")" 640
+printf 'KEY\n' > "$SP_ROOT/secrets/wg/people.key"
+( PORTCULLIS_ROOT="$SP_ROOT"
+  volume_own() { :; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  unset -f users_secret_files monitoring_prepare domains_prepare
+  stack_prepare ) >/dev/null 2>&1
+expect_eq "stack_prepare: an existing people.key is kept" "$(cat "$SP_ROOT/secrets/wg/people.key")" KEY
+( PORTCULLIS_ROOT="$SP_ROOT"
+  ct_group_read() { echo "ct_group_read $*" >> "$STUB_DIR/sfp-wg"; }
+  unset -f monitoring_fix_perms domains_fix_perms mcpgate_fix_perms sessions_fix_perms
+  secrets_fix_perms ) >/dev/null 2>&1
+expect_ok "secrets_fix_perms: secrets/wg and people.key group 10006" \
+  grep -qx "ct_group_read 10006 $SP_ROOT/secrets/wg $SP_ROOT/secrets/wg/people.key" "$STUB_DIR/sfp-wg"
 # group_gate_data (sign-in part 2, contract §4 "Opened log"): group-gate
 # (10003) writes the opened log, the Hub (group 10001) reads and prunes it.
 expect_ok "the stack's volume setup owns group_gate_data 10003:10001" grep -qx 'volume_own group_gate_data 10003:10001' "$STUB_DIR/sp-vol"
@@ -355,6 +382,57 @@ printf '%s' '[{"Subnet":"172.31.253.0/28"}]' > "$STUB_DIR/ipam-json-portcullis-m
 expect_fail "guard: mcp network without its range aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 rm -f "$STUB_DIR/ipam-json-portcullis-mcp"
 expect_fail "guard: invalid mcp settings abort" bash -c "PORTCULLIS_MCP_HUB_IP=172.31.253.9; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+# portcullis-vpn (contract §16): wg's edge ports, pinned outside the
+# dynamic range; the Hub's gateway window .16–.62 outside both; a /26 at
+# least; no overlap with the other fixed core networks. Traefik isn't on it.
+unset PORTCULLIS_VPN_NET PORTCULLIS_VPN_IP_RANGE PORTCULLIS_VPN_WG_IP
+expect_eq "vpn net: defaults" "$(vpn_net) $(vpn_ip_range) $(vpn_wg_ip)" "172.31.254.0/26 172.31.254.8/29 172.31.254.3"
+expect_ok "vpn net: default valid" validate_vpn_network_config
+check_vnet() { PORTCULLIS_VPN_NET="$1" PORTCULLIS_VPN_IP_RANGE="$2" PORTCULLIS_VPN_WG_IP="$3" validate_vpn_network_config; }
+expect_ok   "vpn net: custom valid"                         check_vnet 10.97.0.0/26 10.97.0.8/29 10.97.0.3
+expect_ok   "vpn net: a /24 is fine"                        check_vnet 10.97.0.0/24 10.97.0.8/29 10.97.0.3
+expect_fail "validate_vpn_network_config: wg ip outside the subnet → fail" check_vnet 10.97.0.0/26 10.97.0.8/29 10.97.1.3
+expect_fail "validate_vpn_network_config: wg ip inside the ip_range → fail" check_vnet 10.97.0.0/26 10.97.0.8/29 10.97.0.9
+expect_fail "validate_vpn_network_config: overlap with the proxy subnet → fail" check_vnet 172.31.250.0/26 172.31.250.8/29 172.31.250.3
+expect_fail "vpn net: overlaps portcullis-auth"             check_vnet 172.31.251.0/26 172.31.251.8/29 172.31.251.5
+expect_fail "vpn net: overlaps portcullis-domains"          check_vnet 172.31.252.0/26 172.31.252.8/29 172.31.252.5
+expect_fail "vpn net: overlaps portcullis-mcp"              check_vnet 172.31.253.0/26 172.31.253.8/29 172.31.253.5
+expect_fail "vpn net: overlaps portcullis-vpn-edge"         check_vnet 172.31.254.64/26 172.31.254.72/29 172.31.254.67
+expect_fail "vpn net: smaller than a /26"                   check_vnet 10.97.0.0/27 10.97.0.8/29 10.97.0.3
+expect_fail "vpn net: wg = the gateway"                     check_vnet 10.97.0.0/26 10.97.0.8/29 10.97.0.1
+expect_fail "vpn net: the range reaches the gateway window" check_vnet 10.97.0.0/26 10.97.0.16/29 10.97.0.3
+expect_fail "vpn net: wg inside the gateway window"         check_vnet 10.97.0.0/26 10.97.0.8/29 10.97.0.20
+expect_fail "vpn net: invalid CIDR"                         check_vnet 10.97.0.0/33 10.97.0.8/29 10.97.0.3
+# portcullis-vpn-edge (security ruling): exactly wg and Traefik, internal,
+# pinned outside the dynamic range, apart; vpnsecure trusts PROXY from wg's
+# address here only. No overlap with any other fixed core network.
+unset PORTCULLIS_VPN_EDGE_SUBNET PORTCULLIS_VPN_EDGE_IP_RANGE PORTCULLIS_VPN_EDGE_TRAEFIK_IP PORTCULLIS_VPN_EDGE_WG_IP
+expect_eq "vpn edge net: defaults" "$(vpn_edge_subnet) $(vpn_edge_ip_range) $(vpn_edge_traefik_ip) $(vpn_edge_wg_ip)" "172.31.254.64/28 172.31.254.72/29 172.31.254.66 172.31.254.67"
+expect_ok "vpn edge net: default valid" validate_vpn_edge_network_config
+check_enet() { PORTCULLIS_VPN_EDGE_SUBNET="$1" PORTCULLIS_VPN_EDGE_IP_RANGE="$2" PORTCULLIS_VPN_EDGE_TRAEFIK_IP="$3" PORTCULLIS_VPN_EDGE_WG_IP="$4" validate_vpn_edge_network_config; }
+expect_ok   "vpn edge net: custom valid"                   check_enet 10.98.0.0/28 10.98.0.8/29 10.98.0.2 10.98.0.3
+expect_fail "vpn edge net: wg outside the subnet"          check_enet 10.98.0.0/28 10.98.0.8/29 10.98.0.2 10.98.1.3
+expect_fail "vpn edge net: Traefik in the dynamic range"   check_enet 10.98.0.0/28 10.98.0.8/29 10.98.0.9 10.98.0.3
+expect_fail "vpn edge net: Traefik and wg share an address" check_enet 10.98.0.0/28 10.98.0.8/29 10.98.0.2 10.98.0.2
+expect_fail "vpn edge net: overlaps portcullis-vpn"        check_enet 172.31.254.0/28 172.31.254.8/29 172.31.254.2 172.31.254.3
+expect_fail "vpn edge net: overlaps portcullis-proxy"      check_enet 172.31.250.0/28 172.31.250.8/29 172.31.250.4 172.31.250.5
+expect_fail "vpn edge net: overlaps portcullis-mcp"        check_enet 172.31.253.0/28 172.31.253.8/29 172.31.253.4 172.31.253.5
+expect_fail "vpn edge net: invalid CIDR"                   check_enet 10.98.0.0/33 10.98.0.8/29 10.98.0.2 10.98.0.3
+printf '%s' '[{"Subnet":"172.31.254.0/26","IPRange":"172.31.254.8/29"}]' > "$STUB_DIR/ipam-json-portcullis-vpn"
+printf '%s' '[{"Subnet":"172.31.254.64/28","IPRange":"172.31.254.72/29"}]' > "$STUB_DIR/ipam-json-portcullis-vpn-edge"
+expect_eq "vpn net: state ok" "$(vpn_network_state)" ok
+expect_eq "vpn edge net: state ok" "$(vpn_edge_network_state)" ok
+expect_ok "guard: vpn networks matching" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+printf '%s' '[{"Subnet":"172.31.254.0/24","IPRange":"172.31.254.8/29"}]' > "$STUB_DIR/ipam-json-portcullis-vpn"
+expect_fail "guard: vpn network mismatch aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+printf '%s' '[{"Subnet":"172.31.254.0/26","IPRange":"172.31.254.8/29"}]' > "$STUB_DIR/ipam-json-portcullis-vpn"
+printf '%s' '[{"Subnet":"172.31.254.64/28"}]' > "$STUB_DIR/ipam-json-portcullis-vpn-edge"
+expect_fail "guard: vpn edge network mismatch aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+rm -f "$STUB_DIR/ipam-json-portcullis-vpn" "$STUB_DIR/ipam-json-portcullis-vpn-edge"
+expect_fail "guard: invalid vpn settings abort" bash -c "PORTCULLIS_VPN_WG_IP=172.31.254.9; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+expect_fail "guard: invalid vpn edge settings abort" bash -c "PORTCULLIS_VPN_EDGE_WG_IP=172.31.254.66; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+expect_ok "CORE_SERVICE_NAMES has wg" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; case \" \$CORE_SERVICE_NAMES \" in *' wg '*) exit 0;; esac; exit 1"
+
 # The gate never resolves keycloak / hub through DNS: compose maps both
 # names to the pinned addresses (extra_hosts) where they are pinned.
 CF="$HERE/../docker-compose.yml"
@@ -964,12 +1042,12 @@ expect_eq "status --json: a failing pki_file list leaves certs_issued unknown" \
 # ── upgrade: pinned Hub image, policy file version (final review M1) ──
 # dc stub: exec prints $STUB_DIR/pv (the policy version), logs $STUB_DIR/gglog.
 pv() { (dc() { case "$1" in exec) cat "$STUB_DIR/pv" 2>/dev/null ;; logs) cat "$STUB_DIR/gglog" 2>/dev/null ;; esac; }; sleep() { :; }; "$@"; hub_policy_check 2 2>&1); }
-echo 6 > "$STUB_DIR/pv"; : > "$STUB_DIR/gglog"
+echo 7 > "$STUB_DIR/pv"; : > "$STUB_DIR/gglog"
 expect_ok "upgrade: matching policy version is fine" sh -c "printf '%s' \"\$1\" | grep -q 'matches group-gate'" _ "$(pv unset HUB_IMAGE)"
-echo 5 > "$STUB_DIR/pv"
+echo 6 > "$STUB_DIR/pv"
 OUT="$(pv export HUB_IMAGE=ghcr.io/porelli/portcullis-hub:v0.1)"
-expect_ok "upgrade: old policy version names the pinned image and the fix" sh -c "printf '%s' \"\$1\" | grep -q 'version 5, this core' && printf '%s' \"\$1\" | grep -q 'remove HUB_IMAGE=ghcr.io/porelli/portcullis-hub:v0.1'" _ "$OUT"
-echo 6 > "$STUB_DIR/pv"; echo "group-gate: deny host=x: policy file version 7 is not supported (only 6)" > "$STUB_DIR/gglog"
+expect_ok "upgrade: old policy version names the pinned image and the fix" sh -c "printf '%s' \"\$1\" | grep -q 'version 6, this core' && printf '%s' \"\$1\" | grep -q 'remove HUB_IMAGE=ghcr.io/porelli/portcullis-hub:v0.1'" _ "$OUT"
+echo 7 > "$STUB_DIR/pv"; echo "group-gate: deny host=x: policy file version 8 is not supported (only 7)" > "$STUB_DIR/gglog"
 expect_ok "upgrade: group-gate deny log is reported" sh -c "printf '%s' \"\$1\" | grep -q 'denying every app host'" _ "$(pv unset HUB_IMAGE)"
 rm -f "$STUB_DIR/pv" "$STUB_DIR/gglog"
 # ── upgrade: the Hub syncs its template sources (SIGHUP, status file) ──
@@ -2881,6 +2959,9 @@ case "$*" in
   "compose version --short") echo 2.40.0 ;;
   "run "*" cat /proc/self/uid_map") printf '%b' "${STUB_CT_UID_MAP:-$STUB_UID_MAP}" ;;
   "create "*) echo probe1 ;;
+  "network create "*) [ "${STUB_POOL_CREATE:-ok}" = ok ] || exit 1; echo net1 ;;
+  "network inspect "*) echo "${STUB_POOL_SUBNET:-10.89.3.0/24} " ;;
+  "network rm "*) exit 0 ;;
   "inspect --format {{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} probe1") echo "${STUB_CT_LIMITS:-16777216 8}" ;;
   "image inspect "*) exit 1 ;;
   "volume inspect "*) exit 1 ;;
@@ -2976,6 +3057,15 @@ expect_eq "runtime_export keeps docker-compose.override.yml beside the podman an
   "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman; getenforce() { echo Enforcing; }; runtime_export; runtime_export; echo \"\$COMPOSE_FILE\"")" \
   "$RX/docker-compose.yml:$RX/docker-compose.override.yml:$RH/docker-compose.podman.yml:$RH/docker-compose.podman-selinux.yml
 rc=0"
+expect_eq "runtime_export: Podman's pools for the VPN readers (podman: 10.88/16 + the pinned 10.89/16; docker: empty, even if set outside)" \
+  "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman; getenforce() { echo Permissive; }; runtime_export; echo \"[\$PORTCULLIS_VPN_RUNTIME_POOLS]\"")|$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=docker PORTCULLIS_VPN_RUNTIME_POOLS=10.0.0.0/8; runtime_export; echo \"[\$PORTCULLIS_VPN_RUNTIME_POOLS]\"")" \
+  "[10.88.0.0/16 10.89.0.0/16]
+rc=0|[]
+rc=0"
+expect_eq "vpn_reserved_ranges: under podman Podman's pools follow the core subnets" \
+  "$(rt "CONTAINER_RUNTIME=podman; getenforce() { echo Permissive; }; runtime_export; vpn_reserved_ranges")" \
+  "172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28 10.88.0.0/16 10.89.0.0/16
+rc=0"
 expect_eq "runtime_export: an existing COMPOSE_FILE gets the overlay once" \
   "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman COMPOSE_FILE=docker-compose.yml:ci.yml; getenforce() { echo Enforcing; }; runtime_export; runtime_export; echo \"\$COMPOSE_FILE\"")" \
   "docker-compose.yml:ci.yml:$RH/docker-compose.podman.yml:$RH/docker-compose.podman-selinux.yml
@@ -3030,6 +3120,27 @@ OUT="$(rt "$RT_HOST; loginctl() { echo no; }; systemctl() { echo disabled; }; ex
 case "$OUT" in *"fail	linger is off"*"fail	user unit podman.socket is not enabled"*"fail	user unit podman-restart.service is not enabled"*"fail	podman 5.3.1"*) t_pass "runtime_host_checks: linger, user units, podman < 5.4 → fail lines" ;; *) t_fail "runtime_host_checks linger/units/version: $OUT" ;; esac
 OUT="$(rt "$RT_HOST; nft() { return 1; }; unset -f nft; PATH=\"$WORK/rtbin:/usr/bin:/bin\"; command -v nft >/dev/null || command -v iptables >/dev/null || runtime_host_checks")"
 case "$OUT" in *"warn	neither nft nor iptables"*|"rc=0") t_pass "runtime_host_checks: no nft / iptables → warn (or the host has one)" ;; *) t_fail "runtime_host_checks nft: $OUT" ;; esac
+# Podman's address pools (I3 ruling): the operator's containers.conf pins
+# default_subnet_pools to 10.89.0.0/16 (/24s), so every Podman network
+# lies in 10.88.0.0/16 (the default network) or 10.89.0.0/16, both
+# reserved against VPN provider ranges.
+POOL_LINE='default_subnet_pools = [{"base" = "10.89.0.0/16", "size" = 24}]'
+# Podman's effective pool (M5 ruling): a probe network shows where Podman
+# allocates, whatever config set it ($CONTAINERS_CONF, an override, the
+# system or the user file). Outside 10.89.0.0/16: fail with the wg profile
+# on (VPN wiring needs it), warn with it off.
+OUT="$(rt "$RT_HOST; runtime_host_checks")"
+case "$OUT" in *"ok	Podman networks come from 10.89.0.0/16 (a probe network got 10.89.3.0/24)"*) t_pass "runtime_host_checks: the pinned Podman pool is an ok line" ;; *) t_fail "runtime_host_checks pool ok: $OUT" ;; esac
+expect_eq "runtime_host_checks: the probe network is created, inspected and removed" \
+  "$(rt "$RT_HOST; runtime_host_checks >/dev/null; grep -cE '^network (create|inspect|rm) .*portcullis-pool-probe-' \"\$STUB_DIR/rt-calls\"")" "3
+rc=0"
+OUT="$(rt "$RT_HOST; export STUB_POOL_SUBNET=10.128.5.0/24 COMPOSE_PROFILES=monitoring,wg; runtime_host_checks")"
+case "$OUT" in *"fail	Podman's network pool isn't pinned (a probe network got 10.128.5.0/24, outside 10.89.0.0/16"*"$POOL_LINE"*) t_pass "runtime_host_checks: an unpinned pool with the wg profile on → fail with the exact line" ;; *) t_fail "runtime_host_checks pool wg: $OUT" ;; esac
+OUT="$(rt "$RT_HOST; export STUB_POOL_SUBNET=10.128.5.0/24 COMPOSE_PROFILES=monitoring; runtime_host_checks")"
+case "$OUT" in *"warn	Podman's network pool isn't pinned (a probe network got 10.128.5.0/24"*) t_pass "runtime_host_checks: an unpinned pool without the wg profile → warn" ;; *) t_fail "runtime_host_checks pool no wg: $OUT" ;; esac
+case "$OUT" in *"fail	Podman's network pool"*) t_fail "runtime_host_checks pool no wg: a fail line" ;; *) t_pass "runtime_host_checks: without the wg profile the pool never refuses" ;; esac
+OUT="$(rt "$RT_HOST; export STUB_POOL_CREATE=no COMPOSE_PROFILES=wg; runtime_host_checks")"
+case "$OUT" in *"fail	Podman's network pool isn't pinned (no probe network could be created"*) t_pass "runtime_host_checks: no probe network with wg on → fail (never assumed pinned)" ;; *) t_fail "runtime_host_checks pool probe failed: $OUT" ;; esac
 expect_eq "runtime_host_checks: docker → nothing" "$(rt 'CONTAINER_RUNTIME=docker runtime_host_checks')" "rc=0"
 OUT="$(rt "$RT_HOST; loginctl() { echo no; }; RT_PROC_PORT_START='$WORK/rt/port1024'; runtime_require_host")"
 case "$OUT" in *"isn't prepared for rootless Podman"*"  - linger is off"*"  - net.ipv4.ip_unprivileged_port_start = 1024"*"rc=1") t_pass "runtime_require_host: lists every failed item, refuses" ;; *) t_fail "runtime_require_host: $OUT" ;; esac
@@ -3442,6 +3553,243 @@ expect_eq "runtime_proxies_refresh on podman: restarts the unhealthy proxy only"
   "$( (CONTAINER_RUNTIME=podman; container_health() { [ "$1" = socket-proxy-hub ] && echo unhealthy || echo healthy; }; dc() { echo "dc $*" >> "$WORK/prx-calls"; }; rm -f "$WORK/prx-calls"; runtime_proxies_refresh) 2>/dev/null; cat "$WORK/prx-calls")" "dc restart socket-proxy-hub"
 expect_eq "runtime_proxies_refresh on docker: nothing" \
   "$( (CONTAINER_RUNTIME=docker; container_health() { echo unhealthy; }; dc() { echo "dc $*"; }; runtime_proxies_refresh) 2>/dev/null)" ""
+
+# ══ vpn: ./portcullis vpn … (scripts/lib/vpn.sh, contract §16) ═══════
+# shellcheck source=../scripts/lib/vpn.sh
+source "$HERE/../scripts/lib/vpn.sh"
+VPN_PRIV="cHJpdmF0ZS1rZXktb2YtdGhlLXRlc3Qtc3R1Yi0wMDAwMDA="
+VPN_PUB="cHVibGljLWtleS1vZi10aGUtdGVzdC1zdHViLTAwMDAwMDA="
+# vt <script> — runs <script> in a subshell with a fresh root (.env from
+# $VT_ENV), every engine / Hub call stubbed and logged to $WORK/vt/log
+# (argv), Hub stdin to $WORK/vt/stdin, jq argv to $WORK/vt/jq.
+vt() {
+  rm -rf "$WORK/vt"; mkdir -p "$WORK/vt/root/secrets/wg" "$WORK/vt/root/secrets/monitoring/prometheus"
+  printf '%s\n' "${VT_ENV:-PORTCULLIS_DOMAIN=vpn.example.org}" > "$WORK/vt/root/.env"
+  : > "$WORK/vt/root/secrets/wg/people.key"
+  (
+    export PORTCULLIS_ROOT="$WORK/vt/root" MONITORING_SECRETS="$WORK/vt/root/secrets/monitoring"
+    unset COMPOSE_PROFILES PORTCULLIS_VPN_MODE PORTCULLIS_VPN_PUBLIC_ENROL PORTCULLIS_VPN_BUILTIN PORTCULLIS_VPN_PORT PORTCULLIS_VPN_SUBNET \
+      PORTCULLIS_EP_CORE PORTCULLIS_EP_ADMIN PORTCULLIS_EP_ENROL
+    env_load
+    L="$WORK/vt/log"
+    dc() {
+      echo "dc $*" >> "$L"
+      case "$*" in
+        "exec -T -u 10001:10001 hub hub vpn host-info")
+          [ "${VT_HUB_DOWN:-}" != 1 ] || return 1
+          # VT_HUB_ANSWER_AFTER=n: the first n-1 calls fail (a Hub still starting).
+          echo x >> "$WORK/vt/hostinfo-calls"
+          [ "$(wc -l < "$WORK/vt/hostinfo-calls")" -ge "${VT_HUB_ANSWER_AFTER:-1}" ] || return 1
+          printf '%s' "${VT_HOSTINFO:-$VT_HOSTINFO_DEFAULT}" ;;
+        "exec -T wg /wg keypair") printf '{"private_key":"%s","public_key":"%s"}\n' "$VPN_PRIV" "$VPN_PUB" ;;
+        "exec -T -u 10001:10001 hub hub vpn add-device "*) cat >> "$WORK/vt/stdin"; echo '{"address":"10.213.0.5","server_public_key":"U2VydmVy","endpoint":"vpn.example.org:51820","allowed_ips":"10.213.0.1/32","dns":"10.213.0.1","mtu":1280}' ;;
+        "exec -T wg /wg qr") cat >> "$WORK/vt/qr"; echo QR ;;
+        "ps -q --status running wg") echo cid ;;
+      esac
+    }
+    docker() {
+      echo "docker $*" >> "$L"
+      case "$1 $2" in
+        "network ls") echo n1 ;;
+        "network inspect") printf '%s\n' "${VT_DOCKER_SUBNETS:-172.17.0.0/16}" ;;
+      esac
+    }
+    ct_run() { echo "ct_run $*" >> "$L"; local a; for a in "$@"; do case "$a" in type=bind,src=*) a="${a#type=bind,src=}"; printf 'S0VZ\n' > "${a%%,dst=*}" ;; esac; done; }
+    runtime_build_service() { echo "runtime_build_service $*" >> "$L"; }
+    stack_compose_up() { echo "stack_compose_up $*" >> "$L"; }
+    hub_env_write() { echo "hub_env_write" >> "$L"; }
+    ct_group_read() { echo "ct_group_read $*" >> "$L"; }
+    monitoring_fix_perms() { :; }
+    container_health() { echo "${VT_HUB_HEALTH:-healthy}"; }
+    wait_healthy() { echo "wait_healthy $*" >> "$L"; }
+    jq() { printf '%s\n' "$*" >> "$WORK/vt/jq"; command jq "$@"; }
+    eval "$1"
+  )
+}
+vte() { cat "$WORK/vt/root/.env"; }
+VT_HOSTINFO_DEFAULT='{"local_networks":["10.0.0.0/8","192.168.0.0/16"],"provider_ranges":[],"admin_device_seen":false}'
+
+VE_OPEN_EP=$'PORTCULLIS_EP_CORE=websecure,vpnsecure\nPORTCULLIS_EP_ADMIN=websecure,vpnsecure\nPORTCULLIS_EP_ENROL=websecure,vpnsecure'
+VE_OPEN_WEB=$'PORTCULLIS_WEB_CORE=websecure\nPORTCULLIS_WEB_ADMIN=websecure\nPORTCULLIS_WEB_ENROL=websecure'
+expect_eq "vpn_entrypoints: apps, public enrolment on" "$(vpn_entrypoints apps true)" "$VE_OPEN_EP"$'\n'"$VE_OPEN_WEB"
+expect_eq "vpn_entrypoints: apps, public enrolment off" "$(vpn_entrypoints apps false)" "$(vpn_entrypoints apps true)"
+expect_eq "vpn_entrypoints: admin, public enrolment on" "$(vpn_entrypoints admin true)" \
+  "PORTCULLIS_EP_CORE=websecure,vpnsecure
+PORTCULLIS_EP_ADMIN=vpnsecure
+PORTCULLIS_EP_ENROL=websecure,vpnsecure
+PORTCULLIS_WEB_CORE=websecure
+PORTCULLIS_WEB_ADMIN=parked
+PORTCULLIS_WEB_ENROL=websecure"
+expect_eq "vpn_entrypoints: admin, public enrolment off" "$(vpn_entrypoints admin false)" "$(vpn_entrypoints admin true)"
+expect_eq "vpn_entrypoints: server, public enrolment on" "$(vpn_entrypoints server true)" \
+  "PORTCULLIS_EP_CORE=vpnsecure
+PORTCULLIS_EP_ADMIN=vpnsecure
+PORTCULLIS_EP_ENROL=websecure,vpnsecure
+PORTCULLIS_WEB_CORE=parked
+PORTCULLIS_WEB_ADMIN=parked
+PORTCULLIS_WEB_ENROL=websecure"
+expect_eq "vpn_entrypoints: server, public enrolment off" "$(vpn_entrypoints server false)" \
+  "PORTCULLIS_EP_CORE=vpnsecure
+PORTCULLIS_EP_ADMIN=vpnsecure
+PORTCULLIS_EP_ENROL=vpnsecure
+PORTCULLIS_WEB_CORE=parked
+PORTCULLIS_WEB_ADMIN=parked
+PORTCULLIS_WEB_ENROL=parked"
+expect_fail "vpn_entrypoints: an unknown mode" vpn_entrypoints everything true
+
+OUT="$(VT_DOCKER_SUBNETS=$'172.17.0.0/16\n10.213.0.0/24' vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: subnet overlapping a Docker network → refused with a suggestion" \
+  "$RC:$(printf '%s' "$OUT" | grep -c '10.213.0.0/24 (a Docker network)'):$(printf '%s' "$OUT" | grep -c 'Try: ./portcullis vpn init --subnet 10.213.4.0/22')" "1:1:1"
+expect_eq "vpn init: a refusal writes nothing" "$(vte | grep -c 'PORTCULLIS_VPN\|COMPOSE_PROFILES' || true)" 0
+OUT="$(VT_HOSTINFO='{"local_networks":["10.0.0.0/8","10.213.0.0/24"],"provider_ranges":[],"admin_device_seen":false}' vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: overlapping a Local network from hub vpn host-info → refused" \
+  "$RC:$(printf '%s' "$OUT" | grep -c '10.213.0.0/24 (a Local network')" "1:1"
+OUT="$(VT_HOSTINFO='{"local_networks":[],"provider_ranges":["10.213.0.0/16"],"admin_device_seen":false}' vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: overlapping a wired provider's range → refused, no free /22 suggested in it" \
+  "$RC:$(printf '%s' "$OUT" | grep -c "a wired VPN provider's range"):$(printf '%s' "$OUT" | grep -c 'Try:' || true)" "1:1:0"
+OUT="$(vt 'vpn_init on 51820 10.214.0.0/23' 2>&1)"; RC=$?
+expect_eq "vpn init: the reserved link subnet → refused" "$RC:$(printf '%s' "$OUT" | grep -c 'reserved for server links')" "1:1"
+OUT="$(vt 'vpn_init on 51820 172.31.254.0/24' 2>&1)"; RC=$?
+expect_eq "vpn init: portcullis-vpn / -edge → refused" "$RC:$(printf '%s' "$OUT" | grep -c 'a Portcullis VPN network')" "1:2"
+for s in 192.168.4.0/22 172.20.0.0/22; do
+  OUT="$(vt "vpn_init on 51820 $s" 2>&1)"; RC=$?
+  expect_eq "vpn init: $s, in Docker's default address pools → refused, saying Docker allocates networks there" \
+    "$RC:$(printf '%s' "$OUT" | grep -c "(Docker's default address pool)"):$(printf '%s' "$OUT" | grep -c 'Docker allocates networks (app instances'"'"' too) from these ranges')" "1:1:1"
+done
+OUT="$(PORTCULLIS_VPN_RUNTIME_POOLS="10.88.0.0/16 10.89.0.0/16" vt 'vpn_init on 51820 10.89.4.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init under podman: a subnet in Podman's pool → refused, saying Podman allocates networks there" \
+  "$RC:$(printf '%s' "$OUT" | grep -c "10.89.0.0/16 (Podman's address pool)"):$(printf '%s' "$OUT" | grep -c 'Podman allocates networks')" "1:1:1"
+OUT="$(PORTCULLIS_VPN_RUNTIME_POOLS="10.88.0.0/16 10.89.0.0/16" vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init under podman: the default 10.213.0.0/22 is outside both pools" "$RC:$(printf '%s' "$OUT" | grep -c "address pool" || true)" "0:0"
+OUT="$(PORTCULLIS_AUTH_SUBNET=10.213.8.0/28 vt 'vpn_init on 51820 10.213.8.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: a fixed core subnet (moved into 10.213/16) → refused" "$RC:$(printf '%s' "$OUT" | grep -c '10.213.8.0/28 (a Portcullis core network)')" "1:1"
+OUT="$(vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: the default subnet clears the reserved ranges" "$(printf '%s' "$OUT" | grep -c "address pool\|core network" || true)" 0
+# Under Podman an image HEALTHCHECK may not apply: the Hub is "running"
+# (as ./portcullis up accepts); its answer to hub vpn host-info is the check.
+OUT="$(vt 'CONTAINER_RUNTIME=podman; _rt_pool_check() { printf "fail\tPodman'"'"'s network pool isn'"'"'t pinned (stub)\n"; }; vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init under podman with Podman's pool unpinned → refused before anything is written" \
+  "$RC:$(printf '%s' "$OUT" | grep -c "network pool isn't pinned"):$(vte | grep -c 'PORTCULLIS_VPN\|COMPOSE_PROFILES' || true)" "1:1:0"
+OUT="$(vt 'CONTAINER_RUNTIME=podman; _rt_pool_check() { printf "ok\tPodman networks come from 10.89.0.0/16\n"; }; vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init under podman with the pool pinned → goes on" "$RC" 0
+OUT="$(VT_HUB_HEALTH=running vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: a Hub without a health status (running) that answers host-info → goes on" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running" || true)" "0:0"
+OUT="$(VT_HUB_HEALTH=running VT_HUB_DOWN=1 VPN_HUB_WAIT=1 vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: a running Hub that never answers host-info → refused after the wait" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub didn't answer hub vpn host-info within 1 s (state: running)")" "1:1"
+OUT="$(VT_HUB_HEALTH=unhealthy vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: an unhealthy Hub → refused at once" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running (state: unhealthy)"):$(cat "$WORK/vt/log" 2>/dev/null | grep -c 'hub vpn host-info' || true)" "1:1:0"
+for st in missing exited; do
+  OUT="$(VT_HUB_HEALTH=$st vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+  expect_eq "vpn init: no Hub ($st) → refused at once" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running (state: $st): ./portcullis up first")" "1:1"
+done
+# The Hub just restarted by ./portcullis up: health "starting" while it
+# already answers, or answers after a few tries: vpn init waits for it.
+OUT="$(VT_HUB_HEALTH=starting VT_HUB_ANSWER_AFTER=3 vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: a starting Hub that answers on the third try → goes on" "$RC:$(grep -c 'hub vpn host-info' "$WORK/vt/log")" "0:3"
+OUT="$(VT_HUB_HEALTH=starting VT_HUB_DOWN=1 VPN_HUB_WAIT=1 vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: a starting Hub that never answers → refused after the wait, nothing written" \
+  "$RC:$(printf '%s' "$OUT" | grep -c "didn't answer hub vpn host-info within 1 s (state: starting)"):$(vte | grep -c 'PORTCULLIS_VPN\|COMPOSE_PROFILES' || true)" "1:1:0"
+
+OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=vpn.example.org\nCOMPOSE_PROFILES=monitoring' vt 'vpn_init on 51820 10.213.0.0/22; vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init writes the keys, adds wg to COMPOSE_PROFILES once" \
+  "$RC:$(vte | grep -cx 'COMPOSE_PROFILES=monitoring,wg'):$(vte | grep -cx 'PORTCULLIS_VPN_BUILTIN=on'):$(vte | grep -cx 'PORTCULLIS_VPN_PORT=51820'):$(vte | grep -cx 'PORTCULLIS_VPN_SUBNET=10.213.0.0/22')" "0:1:1:1:1"
+expect_eq "vpn init: the key generated once (a re-run keeps it), through ct_run in the wg image as the file's owner" \
+  "$(grep -c '^ct_run ' "$WORK/vt/log"):$(grep -c "^ct_run --rm --network none --user $(id -u):10006 --cap-drop ALL --security-opt no-new-privileges:true --read-only --mount type=bind,src=$WORK/vt/root/secrets/wg/people.key,dst=/k --entrypoint /wg portcullis-wg genkey /k\$" "$WORK/vt/log"):$(cat "$WORK/vt/root/secrets/wg/people.key")" "1:1:S0VZ"
+expect_eq "vpn init: the wg image is built before the key, then wg can read it, core.env refreshed, wg + Traefik + Hub started" \
+  "$(grep -E '^(runtime_build_service|ct_run|ct_group_read|hub_env_write|stack_compose_up)' "$WORK/vt/log" | head -n5 | cut -d' ' -f1-2 | tr '\n' ';')" \
+  "runtime_build_service wg;ct_run --rm;ct_group_read 10006;hub_env_write;stack_compose_up wg;"
+expect_eq "vpn init: the wg Prometheus target once the profile is on" "$(jq -c '.[0].targets' "$WORK/vt/root/secrets/monitoring/prometheus/wg-targets.json")" '["wg-metrics:9100"]'
+OUT="$(vt 'vpn_init off 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init --builtin off: no key, PORTCULLIS_VPN_BUILTIN=off, the profile on" \
+  "$RC:$(grep -c '^ct_run' "$WORK/vt/log" || true):$(vte | grep -cx 'PORTCULLIS_VPN_BUILTIN=off'):$(vte | grep -cx 'COMPOSE_PROFILES=wg')" "0:0:1:1"
+expect_eq "vpn_prom_targets: no target without the profile (no TargetDown)" \
+  "$(vt 'vpn_prom_targets; cat "$PORTCULLIS_ROOT/secrets/monitoring/prometheus/wg-targets.json"')" "[]"
+
+OUT="$(vt 'vpn_mode server true false' 2>&1)"; RC=$?
+expect_eq "vpn mode server without an admin device → refused naming --force" \
+  "$RC:$(printf '%s' "$OUT" | grep -c -- '--force'):$(vte | grep -c PORTCULLIS_VPN_MODE || true):$(grep -c stack_compose_up "$WORK/vt/log" || true)" "1:1:0:0"
+OUT="$(VT_HUB_DOWN=1 VPN_HUB_WAIT=1 vt 'vpn_mode admin true false' 2>&1)"; RC=$?
+expect_eq "vpn mode admin with the Hub not answering → refused after the wait, naming --force, nothing written" \
+  "$RC:$(printf '%s' "$OUT" | grep -c "didn't answer hub vpn host-info within 1 s"):$(printf '%s' "$OUT" | grep -c -- '--force'):$(vte | grep -c PORTCULLIS_VPN_MODE || true)" "1:1:1:0"
+OUT="$(VT_HUB_HEALTH=starting VT_HUB_ANSWER_AFTER=3 VT_HOSTINFO='{"local_networks":[],"provider_ranges":[],"admin_device_seen":true}' vt 'vpn_mode admin true false' 2>&1)"; RC=$?
+expect_eq "vpn mode admin: a starting Hub that answers on the third try → waited for, mode written" \
+  "$RC:$(grep -c 'hub vpn host-info' "$WORK/vt/log"):$(vte | grep -cx 'PORTCULLIS_VPN_MODE=admin')" "0:3:1"
+OUT="$(VT_HUB_HEALTH=exited vt 'vpn_mode admin true false' 2>&1)"; RC=$?
+expect_eq "vpn mode admin: no Hub (exited) → refused at once, naming --force" \
+  "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running (state: exited)"):$(printf '%s' "$OUT" | grep -c -- '--force'):$(cat "$WORK/vt/log" 2>/dev/null | grep -c 'host-info' || true)" "1:1:1:0"
+OUT="$(VT_HOSTINFO='{"local_networks":[],"provider_ranges":[],"admin_device_seen":true}' vt 'vpn_mode server false false' 2>&1)"; RC=$?
+expect_eq "vpn mode server with an admin device: mode, enrolment and the classes written, core recreated" \
+  "$RC:$(vte | grep -cxE 'PORTCULLIS_VPN_MODE=server|PORTCULLIS_VPN_PUBLIC_ENROL=false|PORTCULLIS_EP_(CORE|ADMIN|ENROL)=vpnsecure|PORTCULLIS_WEB_(CORE|ADMIN|ENROL)=parked'):$(grep -cx 'stack_compose_up ' "$WORK/vt/log")" "0:8:1"
+OUT="$(VT_HUB_DOWN=1 VT_ENV=$'PORTCULLIS_VPN_MODE=server\nPORTCULLIS_EP_CORE=vpnsecure' vt 'vpn_mode server true true' 2>&1)"; RC=$?
+expect_eq "vpn mode server --force with the Hub down: no check, written" "$RC:$(grep -c 'host-info' "$WORK/vt/log" || true):$(vte | grep -cx 'PORTCULLIS_VPN_MODE=server')" "0:0:1"
+OUT="$(VT_HUB_DOWN=1 VT_ENV=$'PORTCULLIS_VPN_MODE=server\nPORTCULLIS_EP_CORE=vpnsecure\nPORTCULLIS_EP_ADMIN=vpnsecure\nPORTCULLIS_EP_ENROL=vpnsecure\nPORTCULLIS_WEB_CORE=parked\nPORTCULLIS_WEB_ADMIN=parked\nPORTCULLIS_WEB_ENROL=parked' vt 'vpn_mode apps true false' 2>&1)"; RC=$?
+expect_eq "vpn mode apps with wg and hub down → writes and recreates" \
+  "$RC:$(grep -c '^dc exec' "$WORK/vt/log" || true):$(vte | grep -cxE 'PORTCULLIS_VPN_MODE=apps|PORTCULLIS_EP_(CORE|ADMIN|ENROL)=websecure,vpnsecure|PORTCULLIS_WEB_(CORE|ADMIN|ENROL)=websecure'):$(grep -cx 'stack_compose_up ' "$WORK/vt/log")" "0:0:7:1"
+
+OUT="$(vt 'vpn_add_device alice laptop' 2>&1)"; RC=$?
+ALL_ARGV="$(cat "$WORK/vt/log" "$WORK/vt/jq" 2>/dev/null)"
+expect_eq "vpn add-device: the private key never on argv" "$RC:$(printf '%s' "$ALL_ARGV" | grep -c "$VPN_PRIV" || true)" "0:0"
+expect_eq "vpn add-device: only the public key on the Hub's stdin" "$(cat "$WORK/vt/stdin")" "$VPN_PUB"
+expect_eq "vpn add-device: the config has AllowedIPs = 10.213.0.1/32" \
+  "$(printf '%s' "$OUT" | grep -cxE 'AllowedIPs = 10\.213\.0\.1/32|Address = 10\.213\.0\.5/32|DNS = 10\.213\.0\.1|PrivateKey = '"$VPN_PRIV"'|Endpoint = vpn\.example\.org:51820|MTU = 1280')" 6
+expect_eq "vpn add-device: the QR code is drawn from the same config on stdin" "$(grep -c '^PrivateKey = ' "$WORK/vt/qr"):$(printf '%s' "$OUT" | grep -cx QR)" "1:1"
+expect_eq "vpn add-device: the Hub call names the user and device" "$(grep -c '^dc exec -T -u 10001:10001 hub hub vpn add-device --user alice --name laptop$' "$WORK/vt/log")" 1
+expect_eq "vpn add-device: the Hub calls (host-info readiness, add-device) are hub vpn as uid 10001 (the Hub's control socket is 0600, its own)" \
+  "$(grep -c '^dc exec .*hub hub vpn' "$WORK/vt/log"):$(grep -c '^dc exec -T -u 10001:10001 hub hub vpn ' "$WORK/vt/log")" "2:2"
+# Every vpn subcommand that calls the Hub waits for it the same way
+# (_vpn_hub_wait): a starting Hub is waited for, a stopped one refused at
+# once — before wg makes a key pair.
+for c in 'vpn_add_device alice laptop' 'vpn_devices "" false' 'vpn_revoke b1'; do
+  OUT="$(VT_HUB_HEALTH=starting VT_HUB_ANSWER_AFTER=2 vt "$c" 2>&1)"; RC=$?
+  expect_eq "$c: a starting Hub → host-info until it answers, then the call" \
+    "$RC:$(grep -c 'hub vpn host-info' "$WORK/vt/log"):$(grep -cE 'hub vpn (add-device|devices|revoke)' "$WORK/vt/log")" "0:2:1"
+  OUT="$(VT_HUB_HEALTH=missing vt "$c" 2>&1)"; RC=$?
+  expect_eq "$c: no Hub → refused at once, no Hub call, no key pair" \
+    "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running (state: missing)"):$(cat "$WORK/vt/log" 2>/dev/null | grep -cE 'hub vpn|wg keypair' || true)" "1:1:0"
+done
+expect_eq "vpn.sh: host-info is read only through _vpn_hub_wait" \
+  "$(grep -c '_vpn_host_info' "$HERE/../scripts/lib/vpn.sh"):$(sed -n '/^_vpn_hub_wait()/,/^}/p' "$HERE/../scripts/lib/vpn.sh" | grep -c '_vpn_host_info')" "3:1"
+expect_eq "vpn.sh: the Hub is reached only through _vpn_hub" \
+  "$(grep -cE 'exec [^|]*hub hub ' "$HERE/../scripts/lib/vpn.sh")" 1
+expect_ok "vpn add-device: keys stay in variables (no temp file, no -v mount)" bash -c "! grep -nE 'mktemp|> *\"?\\\$[a-z]*(key|kp)|--mount' <(sed -n '/^vpn_add_device()/,/^}/p' '$HERE/../scripts/lib/vpn.sh')"
+
+OUT="$(vt 'vpn_builtin on' 2>&1)"; RC=$?
+expect_eq "vpn builtin before vpn init (wg not in COMPOSE_PROFILES) → refused, nothing written or started" \
+  "$RC:$(printf '%s' "$OUT" | grep -c 'run ./portcullis vpn init first'):$(vte | grep -c PORTCULLIS_VPN_BUILTIN || true):$(cat "$WORK/vt/log" 2>/dev/null | grep -cE 'ct_run|dc up|dc restart' || true)" "1:1:0:0"
+OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=vpn.example.org\nCOMPOSE_PROFILES=wg' vt 'vpn_builtin off; vpn_builtin on' 2>&1)"; RC=$?
+expect_eq "vpn builtin off empties the key, on makes a new one; wg recreated and restarted (it reads the key at start) both times" \
+  "$RC:$(grep -c '^ct_run' "$WORK/vt/log"):$(grep -c '^dc up -d --no-deps.* wg$' "$WORK/vt/log"):$(grep -c '^dc restart wg$' "$WORK/vt/log"):$(vte | grep -cx 'PORTCULLIS_VPN_BUILTIN=on')" "0:1:2:2:1"
+OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=vpn.example.org\nCOMPOSE_PROFILES=wg' vt 'printf KEY > "$PORTCULLIS_ROOT/secrets/wg/people.key"; vpn_builtin off; wc -c < "$PORTCULLIS_ROOT/secrets/wg/people.key"' 2>&1)"
+expect_eq "vpn builtin off: the key file emptied in place" "$(printf '%s' "$OUT" | tail -n1 | tr -d ' ')" 0
+
+# status: the vpn block, the textfile gauge.
+SJ="$(vt 'export COMPOSE_PROFILES=wg PORTCULLIS_VPN_MODE=server
+  dc() { case "$*" in
+           "exec -T wg /wg status") printf "{\"version\":1,\"written\":\"%s\",\"mode\":\"server\",\"edge\":{\"ok\":true,\"error\":\"\"},\"people\":null}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ;;
+           "exec -T wg /wg providers") echo "{\"providers\":[{\"id\":\"hs\",\"label\":\"Tailnet\",\"ranges\":[\"100.64.0.0/10\"],\"devices\":3,\"refreshed_at\":null,\"fresh\":false}]}" ;;
+         esac; }
+  vpn_status_json')"
+expect_eq "vpn_status_json: mode, up, providers, no problem while wg is up" \
+  "$(printf '%s' "$SJ" | jq -c '[.enabled, .mode, .up, .problem, (.providers | length), .status.edge.ok]')" '[true,"server",true,false,1,true]'
+SJ="$(vt 'export COMPOSE_PROFILES=wg PORTCULLIS_VPN_MODE=server; dc() { return 1; }; vpn_status_json')"
+expect_eq "vpn_status_json: mode server with wg down → a problem" "$(printf '%s' "$SJ" | jq -c '[.up, .problem]')" '[false,true]'
+SJ="$(vt 'dc() { return 1; }; vpn_status_json')"
+expect_eq "vpn_status_json: apps without wg → not set up, no problem" "$(printf '%s' "$SJ" | jq -c '[.enabled, .mode, .problem]')" '[false,"apps",false]'
+SJ="$( (require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
+        proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
+        vault_admin_env() { return 1; }; dns_status_json() { :; }
+        vpn_status_json() { echo '{"enabled":true,"mode":"admin","public_enrol":true,"up":false,"providers":[],"problem":true}'; }
+        status_run true 2>/dev/null) || true)"
+expect_eq "status --json has vpn{}" "$(printf '%s' "$SJ" | jq -c '[.vpn.mode, .vpn.problem, .ok]')" '["admin",true,false]'
+jq -n '{ok: true, services: [], vault: {active: true}, dns: null, vpn: {mode: "server"}}' > "$STUB_DIR/stf.json"
+expect_eq "status textfile has portcullis_vpn_mode_restricted" "$(stf | grep '^portcullis_vpn_mode_restricted ')" "portcullis_vpn_mode_restricted 1"
+jq -n '{ok: true, services: [], vault: {active: true}, dns: null, vpn: {mode: "apps"}}' > "$STUB_DIR/stf.json"
+expect_eq "status textfile: apps → portcullis_vpn_mode_restricted 0" "$(stf | grep '^portcullis_vpn_mode_restricted ')" "portcullis_vpn_mode_restricted 0"
+
+# Core's headscale leftovers are gone (V14: the template owns them).
+expect_eq "keycloak.sh registers no headscale client" "$(grep -ciE 'headscale|headplane' "$HERE/../scripts/lib/keycloak.sh" || true)" 0
+expect_eq "backup has no headscale-config.yaml" "$(grep -c 'headscale' "$HERE/../scripts/lib/backup.sh" || true)" 0
+expect_eq "no headscale/ directory, nothing in the apps file" "$( [ -e "$HERE/../headscale" ] && echo dir || echo none):$(grep -ciE 'headscale|headplane' "$HERE/../docker-compose.apps.yml" || true)" "none:0"
 
 echo ""
 echo "$PASS passed, $FAIL failed"

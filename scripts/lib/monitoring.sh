@@ -74,6 +74,8 @@ monitoring_prepare() {
   # tls-targets.json: the public endpoint (Traefik's ACME certificate).
   jq -n --arg d "${PORTCULLIS_DOMAIN:-portcullis.local}" \
     '[{targets: ["auth." + $d + ":443"], labels: {probe: "public-cert"}}]' > "$m/prometheus/tls-targets.json"
+  # wg-targets.json: the wg job's target only while the profile is on (V13).
+  if declare -F vpn_prom_targets >/dev/null; then vpn_prom_targets; fi
   alertmanager_config > "$m/alertmanager/alertmanager.yml.tmp"
   if ! cmp -s "$m/alertmanager/alertmanager.yml.tmp" "$m/alertmanager/alertmanager.yml"; then
     cat "$m/alertmanager/alertmanager.yml.tmp" > "$m/alertmanager/alertmanager.yml"

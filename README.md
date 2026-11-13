@@ -183,8 +183,6 @@ All guides are on the [documentation site](https://porelli.github.io/portcullis-
 ├── docker-compose.override.example.yml  # Override template (copy to config/)
 ├── docker-compose.apps.yml         # Example apps (all tiers + VPN)
 ├── config/                         # YOUR config (separate git repo, gitignored)
-├── headscale/
-│   └── config.yaml                # Headscale config (OIDC → Keycloak)
 ├── docs/                           # Pointers to https://porelli.github.io/portcullis-docs/
 ├── portcullis                     # The admin CLI (./portcullis help)
 ├── monitoring/                     # Prometheus config + alert rules (+ tests), blackbox, Grafana provisioning/dashboard
@@ -268,7 +266,7 @@ Portcullis is an auth layer that works with existing platforms:
 | Platform | How to integrate |
 |----------|-----------------|
 | **YunoHost** | LLDAP as LDAP provider, Keycloak as SAML IdP |
-| **Headscale** | OIDC → Keycloak for node registration, Headplane admin UI behind Traefik |
+| **Headscale** | The marketplace template: OIDC → Keycloak for node registration; wire it as a Portcullis VPN provider (`./portcullis vpn init`) |
 | **NetBird** | OIDC → Keycloak for peer auth, dashboard + management behind Traefik |
 | **Coolify** | Traefik (certificates, forward-auth) in front, Coolify handles deploys |
 | **Kubernetes** | Traefik as Ingress Controller, cert-manager for ACME, Keycloak as OIDC provider |

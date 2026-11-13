@@ -7,7 +7,7 @@
 # A backup (backups/<YYYYmmdd-HHMMSS>/, 0700; built in <dir>.partial and
 # renamed when complete) contains:
 #   MANIFEST.json        format, creation time, versions, sha256 of every file
-#   .env, realm-export.json, headscale-config.yaml, docker-compose.override.yml,
+#   .env, realm-export.json, docker-compose.override.yml,
 #   config/              whichever exist
 #   certs/               CA chain, server cert/key, revoked-serial list
 #   secrets/             Vault ROOT TOKEN + UNSEAL KEY, enroll AppRole, ...
@@ -325,7 +325,6 @@ backup_create() {
   chmod 700 "$BACKUP_ROOT" "$work"
   cp "$(env_file)" "$work/.env"
   [ ! -f "$PORTCULLIS_ROOT/keycloak/realm-export.json" ] || cp "$PORTCULLIS_ROOT/keycloak/realm-export.json" "$work/realm-export.json"
-  [ ! -f "$PORTCULLIS_ROOT/headscale/config.yaml" ] || cp "$PORTCULLIS_ROOT/headscale/config.yaml" "$work/headscale-config.yaml"
   [ ! -f "$PORTCULLIS_ROOT/docker-compose.override.yml" ] || cp -L "$PORTCULLIS_ROOT/docker-compose.override.yml" "$work/docker-compose.override.yml"
   [ ! -d "$PORTCULLIS_ROOT/config" ] || cp -a "$PORTCULLIS_ROOT/config" "$work/config"
   [ ! -d "$PORTCULLIS_ROOT/certs" ] || cp -a "$PORTCULLIS_ROOT/certs" "$work/certs"
@@ -857,10 +856,6 @@ backup_restore() {
   chmod 600 "$(env_file)" 2>/dev/null || true
   _restore_runtime_keys
   [ ! -f "$dir/realm-export.json" ] || cp "$dir/realm-export.json" "$PORTCULLIS_ROOT/keycloak/realm-export.json"
-  if [ -f "$dir/headscale-config.yaml" ]; then
-    mkdir -p "$PORTCULLIS_ROOT/headscale"
-    cp "$dir/headscale-config.yaml" "$PORTCULLIS_ROOT/headscale/config.yaml"
-  fi
   if [ -d "$dir/config" ]; then
     if [ -e "$PORTCULLIS_ROOT/config" ]; then
       warn "config/ exists — kept as is (the backup's copy: $dir/config)"

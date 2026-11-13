@@ -20,7 +20,7 @@ PORTCULLIS_ROOT="${PORTCULLIS_ROOT:-$PORTCULLIS_HOME}"
 PORTCULLIS_CALLER_PWD="$PWD"
 unset _self _dir
 
-for _lib in common network vault pki certs keycloak users domains mcpgate sessions dns config status monitoring backup signin stack; do
+for _lib in common network vault pki certs keycloak users domains mcpgate sessions dns config status monitoring backup signin vpn stack; do
   # shellcheck source=/dev/null
   source "$PORTCULLIS_LIB/$_lib.sh"
 done
@@ -64,6 +64,14 @@ Identity:
   oidc register               Create core OIDC clients, push their secrets from .env
   signin reset-core           Locked out of the Hub: put the Hub and people pages back on Standard
 
+VPN:
+  vpn init                    Set up the VPN service (wg) and the built-in WireGuard VPN
+  vpn mode                    Which core surfaces are VPN-only: apps, admin or server (break-glass: apps)
+  vpn builtin                 Switch the built-in VPN on or off
+  vpn add-device              Make a built-in VPN device for a person (config + QR, shown once)
+  vpn devices                 List VPN devices of every provider
+  vpn revoke                  Remove a built-in VPN device
+
 YubiKey and browser certificates:
   cert enroll                 New key + YubiKey certificate on a YubiKey
   cert renew                  New YubiKey certificate for the key already on the YubiKey
@@ -87,7 +95,7 @@ main() {
   esac
   cd "$PORTCULLIS_ROOT"
   case "$cmd" in
-    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert|signin)
+    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert|signin|vpn)
       "cmd_$cmd" "$@" ;;
     lldap-ui) cmd_lldap_ui "$@" ;;
     *)

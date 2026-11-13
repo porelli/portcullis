@@ -55,6 +55,14 @@ scrape_configs:
     static_configs:
       - targets: ["grafana:3000"]
 
+  # The VPN service (profile wg, contract §16): over portcullis-metrics-wg.
+  # file_sd, written by ./portcullis (up / vpn init): the target only while
+  # the profile is on, so an install without the VPN has no wg target and
+  # no TargetDown for it.
+  - job_name: wg
+    file_sd_configs:
+      - files: [/etc/portcullis/wg-targets.json]
+
   # Textfile metrics written by ./portcullis (backup age, client-cert and CA
   # expiry, `portcullis status` service health).
   - job_name: portcullis

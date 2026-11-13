@@ -57,47 +57,6 @@ services:
       traefik.http.services.wiki.loadbalancer.server.port: "3000"
 
   # ============================================================
-  # HEADSCALE — self-hosted Tailscale control server
-  # OIDC via Keycloak → YubiKey WebAuthn at node registration.
-  # Admin UI protected by mTLS + WebAuthn fallback.
-  # ============================================================
-  headscale:
-    image: docker.io/headscale/headscale:v0.29.7@sha256:11f81665e842809db9fe3006a38c56a66e968baa5abd4bac498e86445572b970
-    command: serve
-    volumes:
-      - headscale-data:/var/lib/headscale
-      - ./headscale/config.yaml:/etc/headscale/config.yaml:ro
-    networks:
-      - portcullis-proxy
-    labels:
-      traefik.enable: "true"
-      # Main control server — public TLS so Tailscale clients can reach it
-      traefik.http.routers.headscale.rule: Host(`vpn.${PORTCULLIS_DOMAIN:-portcullis.local}`)
-      traefik.http.routers.headscale.entrypoints: websecure
-      traefik.http.routers.headscale.tls.options: public@file
-      traefik.http.routers.headscale.middlewares: security-headers@file
-      traefik.http.services.headscale.loadbalancer.server.port: "8080"
-
-  headplane:
-    image: ghcr.io/tale/headplane:0.8.2@sha256:b053a0a6699d0a67be3f0d9bae8e7dbe35ed67ae8448412adcbad7ea49866faa
-    environment:
-      HEADSCALE_URL: http://headscale:8080
-      OIDC_ISSUER: https://auth.${PORTCULLIS_DOMAIN:-portcullis.local}/realms/portcullis
-      OIDC_CLIENT_ID: headplane
-      OIDC_CLIENT_SECRET: ${HEADPLANE_OIDC_CLIENT_SECRET:-headplane-oidc-secret}
-      ROOT_URL: https://vpn-admin.${PORTCULLIS_DOMAIN:-portcullis.local}
-    networks:
-      - portcullis-proxy
-    labels:
-      traefik.enable: "true"
-      # Admin UI — mTLS if cert present, WebAuthn fallback
-      traefik.http.routers.headplane.rule: Host(`vpn-admin.${PORTCULLIS_DOMAIN:-portcullis.local}`)
-      traefik.http.routers.headplane.entrypoints: websecure
-      traefik.http.routers.headplane.tls.options: authaware@file
-      traefik.http.routers.headplane.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
-      traefik.http.services.headplane.loadbalancer.server.port: "3000"
-
-  # ============================================================
   # NETBIRD — mesh VPN + zero-trust networking
   # OIDC via Keycloak → YubiKey WebAuthn at peer registration.
   # Management API and dashboard protected by WebAuthn.
@@ -196,7 +155,6 @@ services:
       traefik.http.services.docs.loadbalancer.server.port: "80"
 
 volumes:
-  headscale-data:
   netbird-mgmt:
   coturn-data:
 

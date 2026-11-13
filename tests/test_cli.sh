@@ -86,7 +86,7 @@ done
 
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 29 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 29
+expect_eq "help lists 35 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 35
 while IFS= read -r c; do
   # shellcheck disable=SC2086
   run $c --help
@@ -115,7 +115,7 @@ expect_eq "every --help works with no engine: the engine was never asked" "$(cat
 run init --help
 case "$OUT" in *"--runtime docker|podman"*"CONTAINER_RUNTIME"*"never switched"*) t_pass "init --help documents --runtime" ;; *) t_fail "init --help lacks --runtime" ;; esac
 
-for g in vault pki keycloak oidc dns cert config signin; do
+for g in vault pki keycloak oidc dns cert config signin vpn; do
   run "$g";        expect_eq "'$g' without subcommand exits 2" "$RC" 2
   run "$g" --help; expect_eq "'$g --help' exits 0" "$RC" 0
   run "$g" bogus;  expect_eq "'$g bogus' exits 2" "$RC" 2
@@ -184,6 +184,32 @@ invite a --frob|unknown option: --frob
 lldap-ui now|unknown argument: now
 signin reset-core --force|unknown argument: --force
 signin reset-core|no terminal to confirm on: pass --yes
+vpn init extra|unexpected argument: extra
+vpn init --builtin|--builtin needs a value
+vpn init --builtin maybe|--builtin must be on or off
+vpn init --port 0|--port must be a UDP port number
+vpn init --port x|--port must be a UDP port number
+vpn init --subnet 10.213.0.1/22|--subnet must be an IPv4 network
+vpn init --subnet 10.213.0.0/31|--subnet must be an IPv4 network
+vpn init --subnet fd00::/64|--subnet must be an IPv4 network
+vpn init --frob|unknown option: --frob
+vpn mode|expected apps, admin or server
+vpn mode everything|expected apps, admin or server
+vpn mode apps admin|expected apps, admin or server
+vpn mode server --public-enrol maybe|--public-enrol must be true or false
+vpn mode server --public-enrol|--public-enrol needs a value
+vpn builtin|expected on or off
+vpn builtin maybe|expected on or off
+vpn add-device alice|expected <user> <name>
+vpn add-device 'Bad;user' phone|invalid user name
+vpn add-device alice phone extra|expected <user> <name>
+vpn devices --user|--user needs a value
+vpn devices --user Alice|invalid user name
+vpn devices bob|unexpected argument: bob
+vpn revoke|expected exactly one <device-id>
+vpn revoke a b|expected exactly one <device-id>
+vpn revoke 'x;y'|invalid device id
+vpn revoke --all|unknown option: --all
 EOF
 
 # ── no secret on a command line (CLAUDE.md: stdin, -H @<(...), key=-, jq
@@ -273,6 +299,32 @@ a workflow's inline compose override has a CMD healthcheck argument with whitesp
 .github/workflows/x.yml:2
 rc=1"
 
+# GitHub refuses a workflow file over 500 KB (startup_failure, no jobs):
+# tests/lint_ci_size.sh keeps ci.yml under 450,000 bytes, also in CI.
+expect_eq "ci.yml is under 450,000 bytes" "$("$HERE/lint_ci_size.sh" 2>&1; echo "rc=$?")" "rc=0"
+head -c 450000 /dev/zero > "$WORK/ci-450000.yml"
+head -c 450001 /dev/zero > "$WORK/ci-450001.yml"
+expect_eq "lint_ci_size.sh passes 450,000 bytes and fails 450,001" \
+  "$("$HERE/lint_ci_size.sh" "$WORK/ci-450000.yml" >/dev/null; echo "rc=$?"):$("$HERE/lint_ci_size.sh" "$WORK/ci-450001.yml" >/dev/null; echo "rc=$?")" "rc=0:rc=1"
+# Same-named branch lookups (Hub, Keycloak, templates): release tags are
+# vX.Y.Z only — a `v*` glob also caught the branch vpn1 and quietly tested
+# main / the published images — and the heads are listed once (a failed
+# listing fails the step) and matched exactly (ls-remote patterns match
+# suffixes too).
+expect_eq "CI's same-named branch lookups: no v* tag glob, no ls-remote pattern lookup" \
+  "$(grep -rnE '"\$REF" *(==|!=) *v\*|ls-remote --exit-code' "$HERE/../.github" | wc -l | tr -d ' ')" 0
+expect_eq "CI's same-named branch lookups: every one lists the heads once and fails loudly" \
+  "$(grep -cF 'heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }' "$HERE/../.github/workflows/ci.yml" "$HERE/../.github/actions/hub-image/action.yml" "$HERE/../.github/actions/keycloak-image/action.yml" | awk -F: '{ s += $2 } END { print s }')" 11
+# Client forwarded / address headers Traefik doesn't manage are deleted on
+# every websecure and vpnsecure router (entrypoint http.middlewares).
+expect_eq "strip-client-forwarded@file deletes Forwarded, X-Real-Ip's look-alikes and every unmanaged X-Forwarded-*" \
+  "$(yq -o=json '.http.middlewares["strip-client-forwarded"].headers.customRequestHeaders' "$HERE/../traefik/dynamic/middlewares.yml" \
+     | jq -c '[to_entries[] | select(.value != "") | .key] as $bad
+              | ["Forwarded", "Forwarded-For", "X-Forwarded", "X-Forwarded-Prefix", "X-Forwarded-Uri", "X-Forwarded-Method", "X-Forwarded-Scheme",
+                 "X-Forwarded-Ssl", "X-Forwarded-Protocol", "X-Url-Scheme", "X-Original-Forwarded-For", "X-Client-Ip", "True-Client-Ip",
+                 "Cf-Connecting-Ip", "Fastly-Client-Ip", "X-Cluster-Client-Ip"] - keys | {missing: ., bad: $bad}')" '{"missing":[],"bad":[]}'
+expect_eq "websecure and vpnsecure run strip-client-forwarded@file first" \
+  "$(grep -cE '^      TRAEFIK_ENTRYPOINTS_(WEBSECURE|VPNSECURE)_HTTP_MIDDLEWARES: strip-client-forwarded@file$' "$HERE/../docker-compose.yml")" 2
 # Fully qualified base images (rootless Podman: podman build never relies
 # on registries.conf short names): tests/lint_images.sh, also in CI.
 expect_eq "every Dockerfile FROM and compose image: is fully qualified" "$("$HERE/lint_images.sh" 2>&1; echo "rc=$?")" "rc=0"
@@ -775,7 +827,7 @@ expect_eq "every forward-auth middleware's authResponseHeaders lists X-Forwarded
           if printf ',%s,' "$hdrs" | grep -q ',X-Forwarded-Impersonator,' && printf ',%s,' "$hdrs" | grep -q ',X-Forwarded-Impersonation,'; then
             echo "$mw"
           else echo "$mw: missing an impersonation header"; fi
-        done | sort | tr '\n' ' ')" "portcullis-auth portcullis-auth-console portcullis-auth-ext portcullis-groups "
+        done | sort | tr '\n' ' ')" "portcullis-auth portcullis-auth-console portcullis-auth-ext portcullis-groups portcullis-groups-vpn "
 # The login theme passes the extension's hints to the registration script.
 expect_eq "theme: webauthn-register.ftl hands portcullisHints to webauthnRegister.js" \
   "$(grep -cF 'portcullisHints : ${(portcullisHints!"[]")?c}' "$HERE/../keycloak/themes/portcullis/login/webauthn-register.ftl" 2>/dev/null || echo 0)" 1
@@ -1019,8 +1071,63 @@ BAD=""
 for r in $ROUTERS; do
   grep -qE "^[[:space:]]+traefik\.http\.routers\.$r\.tls\.options: authaware@file$" "$ROOT_DIR/docker-compose.yml" || BAD="$BAD $r"
 done
-expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:14"
+expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:24"
 expect_eq "no other tls.options in docker-compose.yml" "$(grep -E 'tls\.options:' "$ROOT_DIR/docker-compose.yml" | grep -vc 'authaware@file$' || true)" 0
+# VPN (contract §16, security ruling): every core router's entrypoints
+# label is literally its class: routers without group-gate take
+# PORTCULLIS_EP_* (websecure,vpnsecure or vpnsecure); routers through
+# group-gate are split — the websecure one takes PORTCULLIS_WEB_* (websecure
+# or parked, never vpnsecure) with portcullis-groups@docker, its -vpn twin is
+# on vpnsecure only with portcullis-groups-vpn@docker (group-gate's VPN path,
+# the only one a VPN binding is satisfied on); the two friendly routers sit
+# on websecure. vpnsecure trusts PROXY only from wg's edge address.
+EP_GOT="$(sed -n 's/^[[:space:]]*traefik\.http\.routers\.\([a-z0-9-]*\)\.entrypoints: \(.*\)$/\1 \2/p' "$ROOT_DIR/docker-compose.yml" | LC_ALL=C sort | tr '\n' ';')"
+EP_WANT=""
+for r in dashboard keycloak-admin hub grafana-metrics; do EP_WANT="$EP_WANT$r \${PORTCULLIS_WEB_ADMIN:-websecure}"$'\n'; done
+for r in portal people; do EP_WANT="$EP_WANT$r \${PORTCULLIS_WEB_CORE:-websecure}"$'\n'; done
+EP_WANT="${EP_WANT}people-vpn-enrol \${PORTCULLIS_WEB_ENROL:-websecure}"$'\n'
+for r in lldap mcp hub-mcp people-mcp; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ADMIN:-websecure,vpnsecure}"$'\n'; done
+for r in keycloak keycloak-resources oauth2-callback enroll-invite; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ENROL:-websecure,vpnsecure}"$'\n'; done
+for r in dashboard keycloak-admin hub grafana-metrics portal people people-vpn-enrol; do EP_WANT="$EP_WANT$r-vpn vpnsecure"$'\n'; done
+for r in core-vpn-required keycloak-admin-vpn-required; do EP_WANT="$EP_WANT$r websecure"$'\n'; done
+EP_WANT="$(printf '%s' "$EP_WANT" | LC_ALL=C sort | tr '\n' ';')"
+expect_eq "every core router's entrypoints is its class (EP_* without group-gate, WEB_* + a -vpn twin through it)" "$EP_GOT" "$EP_WANT"
+expect_eq "every core router with a rule has an entrypoints label" \
+  "$(printf '%s\n' "$ROUTERS" | LC_ALL=C sort | tr '\n' ' ')" \
+  "$(printf '%s' "$EP_GOT" | tr ';' '\n' | awk 'NF {print $1}' | LC_ALL=C sort | tr '\n' ' ')"
+# The VPN middlewares only on vpnsecure-only routers; the normal ones never on vpnsecure.
+MW_BAD=""
+while read -r r mw; do
+  ep="$(sed -n "s/^[[:space:]]*traefik\.http\.routers\.$r\.entrypoints: //p" "$ROOT_DIR/docker-compose.yml")"
+  case ",$mw," in
+    *,portcullis-groups-vpn@docker,*|*,portal-vpn-path@docker,*|*,portcullis-public-guard-vpn@docker,*)
+      [ "$ep" = vpnsecure ] || MW_BAD="$MW_BAD $r:$ep" ;;
+    *,portcullis-groups@docker,*|*,portal-path@docker,*|*,portcullis-public-guard@docker,*)
+      case "$ep" in *vpnsecure*) MW_BAD="$MW_BAD $r:$ep" ;; esac ;;
+  esac
+done < <(sed -n 's/^[[:space:]]*traefik\.http\.routers\.\([a-z0-9-]*\)\.middlewares: \(.*\)$/\1 \2/p' "$ROOT_DIR/docker-compose.yml")
+expect_eq "the VPN gate middlewares are on vpnsecure-only routers, the normal ones never on vpnsecure" "${MW_BAD:-none}" none
+# Each -vpn twin is its router with only the gate swapped.
+TWIN_BAD=""
+for r in dashboard keycloak-admin hub grafana-metrics portal people people-vpn-enrol; do
+  for a in rule tls.options service priority; do
+    [ "$(sed -n "s/^[[:space:]]*traefik\.http\.routers\.$r\.$a: //p" "$ROOT_DIR/docker-compose.yml")" = \
+      "$(sed -n "s/^[[:space:]]*traefik\.http\.routers\.$r-vpn\.$a: //p" "$ROOT_DIR/docker-compose.yml")" ] || TWIN_BAD="$TWIN_BAD $r.$a"
+  done
+  [ "$(sed -n "s/^[[:space:]]*traefik\.http\.routers\.$r\.middlewares: //p" "$ROOT_DIR/docker-compose.yml" | sed 's/portcullis-groups@docker/portcullis-groups-vpn@docker/; s/portal-path@docker/portal-vpn-path@docker/')" = \
+    "$(sed -n "s/^[[:space:]]*traefik\.http\.routers\.$r-vpn\.middlewares: //p" "$ROOT_DIR/docker-compose.yml")" ] || TWIN_BAD="$TWIN_BAD $r.middlewares"
+done
+expect_eq "each core -vpn twin = its router with portcullis-groups-vpn / portal-vpn-path" "${TWIN_BAD:-none}" none
+expect_eq "the VPN gate paths and the parked entrypoint (Traefik's container loopback)" \
+  "$(grep -cxE '      (traefik\.http\.middlewares\.portcullis-groups-vpn\.forwardauth\.address: http://group-gate:8080/auth/vpn|traefik\.http\.middlewares\.portcullis-public-guard-vpn\.forwardauth\.address: http://group-gate:8080/public-guard/vpn|traefik\.http\.middlewares\.portal-vpn-path\.replacepath\.path: /portal/vpn|TRAEFIK_ENTRYPOINTS_PARKED_ADDRESS: 127\.0\.0\.1:8441)' "$ROOT_DIR/docker-compose.yml")" 4
+expect_eq "vpnsecure trusts PROXY from wg's portcullis-vpn-edge address only" \
+  "$(grep -cF 'TRAEFIK_ENTRYPOINTS_VPNSECURE_PROXYPROTOCOL_TRUSTEDIPS: ${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}/32' "$ROOT_DIR/docker-compose.yml"):$(grep -cF 'ipv4_address: ${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}' "$ROOT_DIR/docker-compose.yml"):$(grep -c 'PROXYPROTOCOL_TRUSTEDIPS' "$ROOT_DIR/docker-compose.yml")" "1:1:1"
+expect_eq "Traefik is not on portcullis-vpn (gateways are)" \
+  "$(awk '/^  traefik:$/ {on = 1; next} on && /^  [a-z][a-z0-9-]*:$/ {exit} on' "$ROOT_DIR/docker-compose.yml" | grep -c '^      portcullis-vpn:$' || true)" 0
+expect_eq "no forwardedHeaders trust and no PROXY insecure on vpnsecure (or anywhere)" \
+  "$(grep -ciE 'TRAEFIK_ENTRYPOINTS_[A-Z]+_(FORWARDEDHEADERS|PROXYPROTOCOL_INSECURE)' "$ROOT_DIR/docker-compose.yml" || true)" 0
+expect_eq "vpnsecure is bound to Traefik's portcullis-vpn-edge address and drops header aliases" \
+  "$(grep -cE '^      TRAEFIK_ENTRYPOINTS_VPNSECURE_(ADDRESS: \$\{PORTCULLIS_VPN_EDGE_TRAEFIK_IP:-172\.31\.254\.66\}:8443|HTTP_ALIASHEADERSSTRATEGY: delete)$' "$ROOT_DIR/docker-compose.yml")" 2
 # The Hub can't write traefik/: /project is read-only and no writable mount
 # (short or long syntax: bind, volume, tmpfs) has traefik in its source or
 # target; the writable ones are exactly these.
@@ -1049,7 +1156,7 @@ expect_eq "the hub service mounts nothing under traefik/ read-write" \
 expect_eq "the hub mounts the checkout read-only" "$(printf '%s\n' "$HUB_SVC" | grep -c '^      - \.:/project:ro$')" 1
 expect_eq "the Hub's writable mounts are exactly templates/, appfiles/, its volumes and the masking tmpfs" \
   "$(hub_writable_mounts "$ROOT_DIR/docker-compose.yml" | LC_ALL=C sort | tr '\n' ';')" \
-  "(tmpfs) -> /project/backups;(tmpfs) -> /project/secrets;./appfiles -> /project/appfiles;./templates -> /project/templates;group_gate_data -> /group-gate-data;hub_data -> /data;hub_secrets -> /secrets;"
+  "(tmpfs) -> /project/backups;(tmpfs) -> /project/secrets;./appfiles -> /project/appfiles;./templates -> /project/templates;group_gate_data -> /group-gate-data;hub_data -> /data;hub_secrets -> /secrets;vpn_doc -> /vpn-doc;"
 # The check itself catches both syntaxes (planted mounts on a copy).
 awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      - ./traefik/dynamic:/project/traefik/dynamic" }' "$ROOT_DIR/docker-compose.yml" > "$WORK/compose-short.yml"
 awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      - type: bind"; print "        source: ./traefik"; print "        target: /etc/x"; print "        read_only: false" }' "$ROOT_DIR/docker-compose.yml" > "$WORK/compose-long.yml"
@@ -1073,8 +1180,10 @@ expect_eq "no portcullis-self middleware and no \"/authenticated\" anywhere" \
 expect_eq "the people router uses client-cert-pem@file, before portcullis-groups@docker" \
   "$(svc hub | sed -n 's/^      traefik\.http\.routers\.people\.middlewares: //p')" \
   "rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file"
-expect_eq "group-gate mounts group_gate_data read-write, has group_add 10001, and both CA files read-only; GATE_CRL_URLS lists pki_int and pki_file" \
-  "$(printf '%s\n' "$GG_SVC" | grep -cxE '      - group_gate_data:/data|    group_add: \["10001"\]|      - \./certs/yubikey-ca\.crt:/etc/group-gate/ca/yubikey-ca\.crt:ro|      - \./certs/browser-ca\.crt:/etc/group-gate/ca/browser-ca\.crt:ro|      GATE_YUBIKEY_CA_FILE: /etc/group-gate/ca/yubikey-ca\.crt|      GATE_BROWSER_CA_FILE: /etc/group-gate/ca/browser-ca\.crt|      GATE_OPENED_DIR: /data/opened|      GATE_CRL_URLS: http://vault:8200/v1/pki_int/crl http://vault:8200/v1/pki_file/crl|      GATE_DELTA_CRL_URLS: http://vault:8200/v1/pki_int/crl/delta http://vault:8200/v1/pki_file/crl/delta'):$(printf '%s\n' "$GG_SVC" | grep -cE 'GATE_(DELTA_)?CRL_URL:' || true)" "9:0"
+expect_eq "group-gate mounts group_gate_data read-write, has group_add 10001 (+ 10007 for vpn.json), and both CA files read-only; GATE_CRL_URLS lists pki_int and pki_file" \
+  "$(printf '%s\n' "$GG_SVC" | grep -cxE '      - group_gate_data:/data|    group_add: \["10001", "10007"\]|      - \./certs/yubikey-ca\.crt:/etc/group-gate/ca/yubikey-ca\.crt:ro|      - \./certs/browser-ca\.crt:/etc/group-gate/ca/browser-ca\.crt:ro|      GATE_YUBIKEY_CA_FILE: /etc/group-gate/ca/yubikey-ca\.crt|      GATE_BROWSER_CA_FILE: /etc/group-gate/ca/browser-ca\.crt|      GATE_OPENED_DIR: /data/opened|      GATE_CRL_URLS: http://vault:8200/v1/pki_int/crl http://vault:8200/v1/pki_file/crl|      GATE_DELTA_CRL_URLS: http://vault:8200/v1/pki_int/crl/delta http://vault:8200/v1/pki_file/crl/delta'):$(printf '%s\n' "$GG_SVC" | grep -cE 'GATE_(DELTA_)?CRL_URL:' || true)" "9:0"
+expect_eq "group-gate reads vpn.json from vpn_doc (read-only)" \
+  "$(printf '%s\n' "$GG_SVC" | grep -cxE '      GATE_VPN_FILE: /vpn-doc/vpn\.json|      - vpn_doc:/vpn-doc:ro')" 2
 # shellcheck disable=SC2016  # a literal ${IMPERSONATION_MAX_MINUTES:-30}
 expect_eq "group-gate has GATE_IMPERSONATION_FILE under /hub-data; hub has HUB_IMPERSONATION_MAX_MINUTES" \
   "$(printf '%s\n' "$GG_SVC" | sed -n 's/^      GATE_IMPERSONATION_FILE: //p'):$(printf '%s\n' "$GG_SVC" | grep -cxF '      - hub_data:/hub-data:ro'):$(svc hub | sed -n 's/^      HUB_IMPERSONATION_MAX_MINUTES: //p')" \

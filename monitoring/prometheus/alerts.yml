@@ -125,6 +125,29 @@ groups:
           summary: ./portcullis status --textfile has not run for 36 hours
           description: Certificate and CA expiry metrics are out of date (it runs after every scheduled backup).
 
+      # VPN (contract §16): in admin / server mode the VPN-only core surfaces
+      # need wg; with it down (or never scraped) they are unreachable.
+      - alert: PortcullisVPNDown
+        expr: portcullis_vpn_mode_restricted == 1 and on() (absent(up{job="wg"}) or up{job="wg"} == 0)
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: The VPN service is down while core surfaces are VPN-only
+          description: >-
+            VPN mode is admin or server and wg can't be scraped: the VPN-only core
+            surfaces are unreachable. Run ./portcullis status on the host; break-glass:
+            ./portcullis vpn mode apps.
+
+      - alert: PortcullisVPNProviderStale
+        expr: wg_provider_stale == 1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "The VPN provider {{ $labels.provider }} has a stale device map"
+          description: >-
+            Its devices are denied until the Hub publishes a fresh map (the identity
+            hook fails or the gateway is down). See the instance's VPN tab in the Hub.
+
       - alert: PortcullisStatusProblems
         expr: portcullis_status_ok == 0
         for: 1h

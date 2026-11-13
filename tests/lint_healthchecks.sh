@@ -57,6 +57,6 @@ inline=""
 while IFS= read -r hit; do
   arr="$(printf '%s' "${hit#*:*:}" | sed -E 's/^[^[]*//')"
   printf '%s' "$arr" | jq -e '.[0] == "CMD" and any(.[1:][]; test("\\s"))' >/dev/null 2>&1 && inline+="${hit%%:*}:$(printf '%s' "$hit" | cut -d: -f2)"$'\n'
-done < <(grep -HnE '^[[:space:]]*test:[[:space:]]*\[' .github/workflows/*.yml 2>/dev/null)
+done < <(grep -HnE '^[[:space:]]*test:[[:space:]]*\[' .github/workflows/*.yml .github/ci/*.sh 2>/dev/null)
 [ -z "$inline" ] || { echo "a workflow's inline compose override has a CMD healthcheck argument with whitespace:"; printf '%s' "$inline"; bad=1; }
 exit "$bad"

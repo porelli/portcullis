@@ -143,3 +143,74 @@ tests:
             exp_annotations:
               summary: The browser CA expires in less than 90 days
               description: Every YubiKey and browser certificate it issued (for the root, all of them) stops working when it expires.
+
+  # VPN: mode server, wg scraped then gone → PortcullisVPNDown after 2m.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_vpn_mode_restricted{job="portcullis"}'
+        values: '1x20'
+      - series: 'up{job="wg",instance="wg-metrics:9100"}'
+        values: '1 1 1 0 0 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: PortcullisVPNDown
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: PortcullisVPNDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: portcullis}
+            exp_annotations:
+              summary: The VPN service is down while core surfaces are VPN-only
+              description: >-
+                VPN mode is admin or server and wg can't be scraped: the VPN-only core surfaces are unreachable. Run ./portcullis status on the host; break-glass: ./portcullis vpn mode apps.
+
+  # VPN: mode server and wg never scraped (no target) → PortcullisVPNDown.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_vpn_mode_restricted{job="portcullis"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PortcullisVPNDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: portcullis}
+            exp_annotations:
+              summary: The VPN service is down while core surfaces are VPN-only
+              description: >-
+                VPN mode is admin or server and wg can't be scraped: the VPN-only core surfaces are unreachable. Run ./portcullis status on the host; break-glass: ./portcullis vpn mode apps.
+
+  # VPN: apps mode, wg up → nothing; the profile off (no wg series at all,
+  # apps mode) → neither PortcullisVPNDown nor TargetDown (V13).
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_vpn_mode_restricted{job="portcullis"}'
+        values: '0x10'
+      - series: 'up{job="portcullis",instance="textfile-exporter:9100"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: PortcullisVPNDown
+        exp_alerts: []
+      - eval_time: 9m
+        alertname: TargetDown
+        exp_alerts: []
+
+  # VPN: a provider's map goes stale → PortcullisVPNProviderStale after 5m.
+  - interval: 1m
+    input_series:
+      - series: 'wg_provider_stale{job="wg",instance="wg-metrics:9100",provider="headscale"}'
+        values: '0 0 1 1 1 1 1 1 1 1'
+      - series: 'wg_provider_stale{job="wg",instance="wg-metrics:9100",provider="builtin"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: PortcullisVPNProviderStale
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: PortcullisVPNProviderStale
+        exp_alerts:
+          - exp_labels: {severity: warning, job: wg, instance: "wg-metrics:9100", provider: headscale}
+            exp_annotations:
+              summary: "The VPN provider headscale has a stale device map"
+              description: >-
+                Its devices are denied until the Hub publishes a fresh map (the identity hook fails or the gateway is down). See the instance's VPN tab in the Hub.

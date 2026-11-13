@@ -277,6 +277,10 @@ CT_UID_GROUP_GATE=10003 # group-gate/Dockerfile (USER 10003:10003, + group 10001
 CT_UID_DOMAINS=10004  # domains/Dockerfile (USER 10004:10004)
 # shellcheck disable=SC2034  # used by mcpgate.sh / backup.sh
 CT_UID_MCP_GATE=10005 # mcp-gate/Dockerfile (USER 10005:10005, + group 10001)
+CT_UID_WG=10006      # wg/Dockerfile (USER 10006:10006; no other group)
+# vpn_doc's group (vpn.json, contract §16): the Hub (writer), wg and
+# group-gate (readers) only — never the Hub's own 10001.
+CT_GID_VPN_DOC=10007
 CT_GID_TRAEFIK=0      # Traefik runs as root, but without CAP_DAC_OVERRIDE
 # shellcheck disable=SC2034  # used by sessions.sh
 CT_UID_SESSIONS=999   # valkey/valkey alpine: valkey = 999:1000 (compose user: "999:1000")
@@ -424,25 +428,35 @@ ct_own() {
     || fail "could not chown ${todo[*]} to $spec (try: $(ct_hint_chown "$spec" "${todo[@]}"))"
 }
 
-# volume_own <volume> <uid:gid> — make sure the compose named volume exists
-# and its top directory belongs to <uid:gid>. Needed for volumes shared by
+# volume_own <volume> <uid:gid> [mode] — make sure the compose named volume
+# exists and its top directory belongs to <uid:gid> (with [mode], e.g. 2750). Needed for volumes shared by
 # several services: whichever container starts first creates the volume, and
 # if its image lacks the mountpoint (e.g. group-gate mounting hub_data
 # read-only) the volume starts root-owned and Docker never copies the owning
 # image's ownership in. Created with compose's labels so compose adopts it.
 volume_own() {
-  local vol="$1" spec="$2" project="${COMPOSE_PROJECT_NAME:-portcullis}" name
+  local vol="$1" spec="$2" mode="${3:-}" project="${COMPOSE_PROJECT_NAME:-portcullis}" name
   name="${project}_$vol"
   if ! docker volume inspect "$name" >/dev/null 2>&1; then
     docker volume create --label "com.docker.compose.project=$project" \
       --label "com.docker.compose.volume=$vol" "$name" >/dev/null \
       || fail "could not create the Docker volume $name"
   fi
-  # shellcheck disable=SC2016  # $1 is expanded by the container's sh
-  docker run --rm --network none --user 0:0 --cap-drop ALL --cap-add CHOWN \
+  if [ -z "$mode" ]; then
+    # shellcheck disable=SC2016  # $1 is expanded by the container's sh
+    docker run --rm --network none --user 0:0 --cap-drop ALL --cap-add CHOWN \
+      --security-opt no-new-privileges:true --mount "type=volume,src=$name,dst=/v" \
+      "$PORTCULLIS_HELPER_IMAGE" sh -c '[ "$(stat -c %u:%g /v)" = "$1" ] || chown "$1" /v' _ "$spec" >/dev/null \
+      || fail "could not set the owner of volume $name to $spec"
+    return 0
+  fi
+  # With a mode (e.g. 2750: setgid, so new files carry the group): FOWNER to
+  # chmod a directory root no longer owns, FSETID to keep the setgid bit.
+  # shellcheck disable=SC2016  # $1 / $2 are expanded by the container's sh
+  docker run --rm --network none --user 0:0 --cap-drop ALL --cap-add CHOWN --cap-add FOWNER --cap-add FSETID \
     --security-opt no-new-privileges:true --mount "type=volume,src=$name,dst=/v" \
-    "$PORTCULLIS_HELPER_IMAGE" sh -c '[ "$(stat -c %u:%g /v)" = "$1" ] || chown "$1" /v' _ "$spec" >/dev/null \
-    || fail "could not set the owner of volume $name to $spec"
+    "$PORTCULLIS_HELPER_IMAGE" sh -c '[ "$(stat -c %u:%g:%a /v)" = "$1:$2" ] || { chown "$1" /v && chmod "$2" /v; }' _ "$spec" "$mode" >/dev/null \
+    || fail "could not set the owner of volume $name to $spec mode $mode"
 }
 
 # ct_group_read <gid> <path>... — operator-owned, group <gid>: dirs 0750,
@@ -476,13 +490,15 @@ secrets_fix_perms() {
   if declare -F mcpgate_fix_perms >/dev/null; then mcpgate_fix_perms; fi
   # secrets/sessions/ (scripts/lib/sessions.sh)
   if declare -F sessions_fix_perms >/dev/null; then sessions_fix_perms; fi
+  # secrets/wg/: the built-in people VPN's key (contract §16), wg reads it.
+  ct_group_read "$CT_UID_WG" "$s/wg" "$s/wg/people.key"
 }
 
 # Core variables the Hub may copy into app .env files (templates reference
 # them as ${VAR}); everything else in .env is a core secret the Hub never
 # sees. Operators can add names via HUB_SHARED_ENV="VAR1 VAR2".
-HUB_ENV_VARS="PORTCULLIS_DOMAIN PORTCULLIS_TRAEFIK_IP PORTCULLIS_MCP_GATE_IP PORTCULLIS_PROXY_SUBNET PORTCULLIS_PROXY_IP_RANGE PORTAL_DISPLAY_NAME"
-HUB_ENV_PREFIXES="HEADSCALE_ HEADPLANE_ NETBIRD_ COTURN_"
+HUB_ENV_VARS="PORTCULLIS_DOMAIN PORTCULLIS_TRAEFIK_IP PORTCULLIS_MCP_GATE_IP PORTCULLIS_PROXY_SUBNET PORTCULLIS_PROXY_IP_RANGE PORTAL_DISPLAY_NAME PORTCULLIS_VPN_MODE PORTCULLIS_VPN_PUBLIC_ENROL PORTCULLIS_VPN_NET PORTCULLIS_VPN_WG_IP PORTCULLIS_VPN_BUILTIN PORTCULLIS_VPN_RESERVED_RANGES"
+HUB_ENV_PREFIXES="NETBIRD_ COTURN_"
 
 # hub_env_write — secrets/hub/core.env, mounted read-only as the Hub's
 # /project/.env. Values as compose sees them (environment over .env, compose
@@ -509,6 +525,17 @@ hub_env_write() {
       PORTCULLIS_PROXY_SUBNET) val="$(proxy_subnet)" ;;
       PORTCULLIS_PROXY_IP_RANGE) val="$(proxy_ip_range)" ;;
       PORTAL_DISPLAY_NAME) val="${PORTAL_DISPLAY_NAME:-Portcullis}" ;;
+      # VPN (contract §16): what the Hub shows read-only and passes into the
+      # policy; none is a template variable (the prefix is reserved).
+      # wg's portcullis-vpn address: the Hub sets PORTCULLIS_VPN_EDGE
+      # (<this>:<edge port>) for every wired gateway from it.
+      PORTCULLIS_VPN_WG_IP) val="$(vpn_wg_ip)" ;;
+      PORTCULLIS_VPN_MODE) val="${PORTCULLIS_VPN_MODE:-apps}" ;;
+      PORTCULLIS_VPN_PUBLIC_ENROL) val="${PORTCULLIS_VPN_PUBLIC_ENROL:-true}" ;;
+      PORTCULLIS_VPN_NET) val="$(vpn_net)" ;;
+      PORTCULLIS_VPN_BUILTIN) val="${PORTCULLIS_VPN_BUILTIN:-off}" ;;
+      # Derived, never from .env: what wg and group-gate refuse (network.sh).
+      PORTCULLIS_VPN_RESERVED_RANGES) val="$(vpn_reserved_ranges)" ;;
       *) val="${!v:-}" ;;
     esac
     content+="$v=$val"$'\n'
@@ -549,8 +576,8 @@ _ensure_secrets_volume() {
 # need.
 stack_prepare() {
   local d
-  (umask 077 && mkdir -p "$PORTCULLIS_ROOT/secrets/vault-unseal" "$PORTCULLIS_ROOT/secrets/enroll" "$PORTCULLIS_ROOT/secrets/hub" "$PORTCULLIS_ROOT/secrets/domains" "$PORTCULLIS_ROOT/secrets/mcp-gate")
-  for d in secrets secrets/vault-unseal secrets/enroll secrets/hub secrets/domains secrets/mcp-gate; do
+  (umask 077 && mkdir -p "$PORTCULLIS_ROOT/secrets/vault-unseal" "$PORTCULLIS_ROOT/secrets/enroll" "$PORTCULLIS_ROOT/secrets/hub" "$PORTCULLIS_ROOT/secrets/domains" "$PORTCULLIS_ROOT/secrets/mcp-gate" "$PORTCULLIS_ROOT/secrets/wg")
+  for d in secrets secrets/vault-unseal secrets/enroll secrets/hub secrets/domains secrets/mcp-gate secrets/wg; do
     if [ ! -w "$PORTCULLIS_ROOT/$d" ]; then
       if _rt_is_podman; then
         fail "$PORTCULLIS_ROOT/$d is not writable (owned by a subordinate id?). Fix: podman unshare chown -R 0:0 \"$PORTCULLIS_ROOT/secrets\""
@@ -603,6 +630,22 @@ stack_prepare() {
   # 0640 day files, group 10001, set by group-gate itself); the Hub reads
   # and prunes it through group 10001 (contract §4 "Opened log", §8.2).
   volume_own group_gate_data "$CT_UID_GROUP_GATE:$CT_UID_HUB"
+  # wg's people key (contract §16): an empty placeholder until ./portcullis
+  # vpn init writes one (empty = the people role is off), so the bind never
+  # makes a directory and the SELinux overlay's source exists. The key
+  # itself is rewritten in place (the single-file bind pins the inode).
+  [ ! -d "$PORTCULLIS_ROOT/secrets/wg/people.key" ] || fail "$PORTCULLIS_ROOT/secrets/wg/people.key is a directory (made by Docker): remove it (rmdir) and run again"
+  [ -f "$PORTCULLIS_ROOT/secrets/wg/people.key" ] || (umask 027 && : > "$PORTCULLIS_ROOT/secrets/wg/people.key")
+  chmod 640 "$PORTCULLIS_ROOT/secrets/wg/people.key"
+  # wg_data: wg (10006) writes status.json, the Hub reads it through group
+  # 10001 (V5); setgid, so every file wg makes there carries 10001 although
+  # wg isn't in that group.
+  volume_own wg_data "$CT_UID_WG:$CT_UID_HUB" 2750
+  # vpn_doc: the Hub writes vpn.json (0640) there; wg and group-gate read it
+  # through group 10007 (their group_add), the only group they share with
+  # the Hub for it. setgid so the Hub's files carry 10007. Not backed up:
+  # the Hub rewrites it from its state.
+  volume_own vpn_doc "$CT_UID_HUB:$CT_GID_VPN_DOC" 2750
   # hub_secrets: per-person password hashes (contract §6, file sharing). The
   # Hub checks ownership and mode at start; ensure it here.
   _ensure_secrets_volume
