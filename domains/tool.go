@@ -222,6 +222,17 @@ func runDNSTool(args []string, e toolEnv) int {
 		if planHasProblem(pl) {
 			code = exitProblem
 		}
+		// M23: the CA wouldn't issue: how long caches may hold the CAA at
+		// the name (what its authoritative servers serve), for the flip's
+		// refusal ("wait its TTL after removing it").
+		if contains(in.Sets, dnsplan.SetCAA) && !pl.CAA.WouldIssue {
+			if zone, err := dnssec.FindZone(ctx, e.resolvers, spec.Name); err == nil {
+				if ttl, ok := dnsplan.ServedTTL(ctx, toolAuthServers(ctx, e.resolvers, zone), spec.Name, "CAA"); ok {
+					t := secs(ttl)
+					return printJSON(e, checkOutput{Plan: pl, CAATTL: &t}, code)
+				}
+			}
+		}
 		return printPlan(e, pl, code)
 	case "dnssec-enable":
 		signer, ok := write.DNSSEC.(dnssec.Signer)
@@ -284,10 +295,17 @@ func runDNSTool(args []string, e toolEnv) int {
 	rep, ok := waitApplied(ctx, e, build, base, in.Sets, wait, ttl, writtenAt, changed)
 	code := exitOK
 	if !ok {
-		fmt.Fprintln(e.stderr, waitMessage(rep))
+		fmt.Fprintln(e.stderr, waitMessage(rep, wait.settle))
 		code = exitProblem
 	}
 	return printJSON(e, applyOutput{Plan: build(write), Wait: rep}, code)
+}
+
+// checkOutput is check's stdout: the plan, plus caa_ttl (seconds) when the
+// CA wouldn't issue and the CAA at the name has a served TTL.
+type checkOutput struct {
+	dnsplan.Plan
+	CAATTL *int `json:"caa_ttl,omitempty"`
 }
 
 // unknownTTLError: --settle / ttl refuse a TTL nobody reports.

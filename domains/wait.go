@@ -74,6 +74,14 @@ type waitReport struct {
 	WrittenAt int64 `json:"written_at"`
 	SettleAt  int64 `json:"settle_at"`
 	BeyondCap bool  `json:"beyond_cap"`
+	// SettleCause: what set SettleAt: "ttl" (the write + the TTL + the
+	// margin), "resolver" (a resolver's remaining TTL for the old records
+	// moved it later), "saved" (--settle-after, an earlier run's point).
+	SettleCause string `json:"settle_cause"`
+	// HeldBy: the resolvers whose reported remaining TTL for an old CAA
+	// answer hasn't run out yet; HeldFor: the longest of those, from now.
+	HeldBy  []string `json:"held_by"`
+	HeldFor int      `json:"held_for"`
 }
 
 // applyOutput is apply's stdout: the plan, plus "wait" with --wait.
@@ -167,11 +175,24 @@ func secs(d time.Duration) int {
 	return int((d + time.Second - 1) / time.Second)
 }
 
-// waitApplied polls every resolver on its own until each shows every
-// applied set (and, with settle, the old records' caches have expired),
-// or the limit. changed: this run's write changed an RRset (else, with
-// --settle-after, the earlier run's settle point is the one that counts:
-// the current records are the ones that run wrote). ok = done in time.
+// A resolver is a pool (anycast, many caches): one round where it shows
+// the new records says little, the next may hit a cache still holding the
+// old ones. So "visible" means stable: every resolver showed every applied
+// set in stableRounds rounds in a row, spanning at least toolStableSpan
+// (at the 10 s poll: 4 rounds, 30 s), and every remaining TTL a resolver
+// reported for an old CAA answer has run out (G: 8.8.8.8 re-served an old
+// pin with a near-fresh TTL long after the change).
+const stableRounds = 4
+
+// toolStableSpan: how long the clean rounds must span (tests shorten it).
+var toolStableSpan = 30 * time.Second
+
+// waitApplied polls every resolver on its own until each stably shows
+// every applied set (and, with settle, the old records' caches have
+// expired), or the limit. changed: this run's write changed an RRset
+// (else, with --settle-after, the earlier run's settle point is the one
+// that counts: the current records are the ones that run wrote). ok =
+// done in time.
 func waitApplied(ctx context.Context, e toolEnv, build func(dnsplan.Input) dnsplan.Plan, base dnsplan.Input,
 	sets []string, o waitOpts, ttl time.Duration, writtenAt time.Time, changed bool) (*waitReport, bool) {
 	start := toolNow()
@@ -184,11 +205,19 @@ func waitApplied(ctx context.Context, e toolEnv, build func(dnsplan.Input) dnspl
 		hardStop = start.Add(waitCap)
 	}
 	settleAt := settlePoint(o, ttl, writtenAt, changed)
-	rep := &waitReport{TTL: secs(ttl), Pending: []string{}, WrittenAt: writtenAt.Unix()}
+	cause := "ttl"
+	if !settleAt.Equal(writtenAt.Add(ttl + waitMargin)) {
+		cause = "saved"
+	}
+	rep := &waitReport{TTL: secs(ttl), Pending: []string{}, HeldBy: []string{}, WrittenAt: writtenAt.Unix()}
+	held := map[string]time.Time{} // per resolver: until when it said it keeps an old CAA answer
+	var streakStart time.Time      // the first of the clean rounds in a row
+	streak := 0
+	var unsteady []string // the resolvers behind the last round that wasn't clean
 	for {
 		now := toolNow()
 		var observed time.Time // the latest a pending resolver says it keeps its answer
-		rep.Pending = []string{}
+		var pending []string
 		for _, r := range e.resolvers {
 			in := base
 			in.Resolvers = []string{r}
@@ -196,13 +225,21 @@ func waitApplied(ctx context.Context, e toolEnv, build func(dnsplan.Input) dnspl
 			if appliedVisible(pl, sets) {
 				continue
 			}
-			rep.Pending = append(rep.Pending, r)
+			pending = append(pending, r)
 			for _, it := range pl.Items {
 				if !contains(sets, it.Set) || it.Status == dnsplan.StatusForeign || it.Severity == dnsplan.SevInfo || it.Status == dnsplan.StatusOK {
 					continue
 				}
-				if rem, ok := dnsplan.RemainingTTL(ctx, r, it); ok && now.Add(rem).After(observed) {
-					observed = now.Add(rem)
+				rem, ok := dnsplan.RemainingTTL(ctx, r, it)
+				if !ok {
+					continue
+				}
+				until := now.Add(rem)
+				if until.After(observed) {
+					observed = until
+				}
+				if it.Set == dnsplan.SetCAA && until.After(held[r]) {
+					held[r] = until
 				}
 			}
 		}
@@ -211,25 +248,60 @@ func waitApplied(ctx context.Context, e toolEnv, build func(dnsplan.Input) dnspl
 			// anywhere (the CA's) may: the settle point moves too.
 			ext := observed.Add(waitMargin)
 			if ext.After(settleAt) {
-				settleAt = ext
+				settleAt, cause = ext, "resolver"
 			}
 			if o.auto && ext.After(deadline) {
-				deadline = ext
-				if deadline.After(hardStop) {
-					deadline = hardStop
+				deadline = earliest(ext, hardStop)
+			}
+		}
+		seen := len(pending) == 0 // every resolver shows it this round
+		if seen {
+			if streak == 0 {
+				streakStart = now
+			}
+			streak++
+		} else {
+			streak, unsteady = 0, pending
+		}
+		steady := seen && streak >= stableRounds && now.Sub(streakStart) >= toolStableSpan
+		if o.auto && seen && !steady {
+			// The clean rounds still fit in the run: wait for them.
+			if need := streakStart.Add(toolStableSpan); need.After(deadline) {
+				deadline = earliest(need, hardStop)
+			}
+		}
+		var heldUntil time.Time
+		rep.HeldBy = []string{}
+		for _, r := range e.resolvers {
+			if held[r].After(now) {
+				rep.HeldBy = append(rep.HeldBy, r)
+				if held[r].After(heldUntil) {
+					heldUntil = held[r]
 				}
 			}
 		}
-		rep.Visible = len(rep.Pending) == 0
+		rep.Visible = steady && len(rep.HeldBy) == 0
+		rep.Pending = []string{}
+		if !rep.Visible {
+			for _, r := range e.resolvers {
+				if contains(pending, r) || (!steady && contains(unsteady, r)) || contains(rep.HeldBy, r) {
+					rep.Pending = append(rep.Pending, r)
+				}
+			}
+			if len(rep.Pending) == 0 { // clean so far, just not for long enough
+				rep.Pending = append(rep.Pending, e.resolvers...)
+			}
+		}
 		rep.Settled = rep.Visible && !now.Before(settleAt)
-		rep.SettleAt = settleAt.Unix()
+		rep.SettleAt, rep.SettleCause = settleAt.Unix(), cause
 		rep.BeyondCap = settleAt.After(hardStop)
+		rep.HeldFor = secs(heldUntil.Sub(now))
 		rep.Limit, rep.Waited, rep.ClearsIn = secs(deadline.Sub(start)), secs(now.Sub(start)), secs(settleAt.Sub(now))
 		if rep.Visible && (!o.settle || rep.Settled) {
 			return rep, true
 		}
 		// Settling can't happen in this run: say so now rather than wait.
-		if rep.Visible && o.settle && rep.BeyondCap {
+		if seen && o.settle && rep.BeyondCap {
 			return rep, false
 		}
 		if !now.Before(deadline) || ctx.Err() != nil {
@@ -241,6 +313,19 @@ func waitApplied(ctx context.Context, e toolEnv, build func(dnsplan.Input) dnspl
 		}
 		toolSleep(ctx, d)
 	}
+}
+
+// clockAt: a Unix time as "HH:MM UTC", rounded up to the minute (so
+// "after HH:MM" is never early).
+func clockAt(unix int64) string {
+	return time.Unix((unix+59)/60*60, 0).UTC().Format("15:04 MST")
+}
+
+func earliest(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }
 
 // progressMessage: the stderr line right after the write, before the
@@ -257,21 +342,36 @@ func progressMessage(o waitOpts, ttl time.Duration, resolvers []string, writtenA
 }
 
 // waitMessage: the stderr line after a wait that didn't finish. The
-// records were written (a failed write never gets here).
-func waitMessage(rep *waitReport) string {
-	at := time.Unix(rep.SettleAt, 0).UTC().Format("15:04 MST")
-	if rep.BeyondCap && rep.Visible {
-		return fmt.Sprintf("domains dns apply: the records were written and every resolver checked shows them, but the old records are stored with TTL %d s, longer than one run waits (%s): caches (the CA's too) may hold them until %s. Run again after %s, or lower the TTL at the provider first to shorten it",
-			rep.TTL, waitCap, at, at)
-	}
-	clears := fmt.Sprintf("those caches clear within %s (by %s)", time.Duration(rep.ClearsIn)*time.Second, at)
-	if rep.ClearsIn == 0 {
-		clears = "those caches should have expired by now"
+// records were written (a failed write never gets here): it says so, and
+// never that anything failed. A settle point past what one run waits
+// names its cause; each gives the time after which a rerun goes ahead.
+func waitMessage(rep *waitReport, settle bool) string {
+	at := clockAt(rep.SettleAt)
+	if settle && rep.BeyondCap {
+		switch rep.SettleCause {
+		case "resolver":
+			who := strings.Join(rep.HeldBy, ", ")
+			if who == "" {
+				who = "a resolver"
+			}
+			return fmt.Sprintf("domains dns apply: written; %s still serves the old records (%d s left), so caches (the CA's too) may hold them until %s. A rerun goes ahead after %s",
+				who, rep.HeldFor, at, at)
+		case "saved":
+			return fmt.Sprintf("domains dns apply: written; an earlier run's settle point is %s, past what one run waits (%s). A rerun goes ahead after %s",
+				at, waitCap, at)
+		default:
+			return fmt.Sprintf("domains dns apply: written; the old records' stored TTL (%d s) is above what one run waits (%s): caches (the CA's too) may hold them until %s. A rerun goes ahead after %s; lowering the TTL at the provider first shortens it",
+				rep.TTL, waitCap, at, at)
+		}
 	}
 	if !rep.Visible {
-		return fmt.Sprintf("domains dns apply: the records were written, but they are not visible yet at %s after %s (TTL %d s; %s)",
-			strings.Join(rep.Pending, ", "), time.Duration(rep.Waited)*time.Second, rep.TTL, clears)
+		left := fmt.Sprintf("they may serve the old records for up to %s more (until %s)", time.Duration(rep.ClearsIn)*time.Second, at)
+		if rep.ClearsIn == 0 {
+			left = "their caches of the old records should have expired by now"
+		}
+		return fmt.Sprintf("domains dns apply: written; not yet stable at %s after %s (TTL %d s; %s)",
+			strings.Join(rep.Pending, ", "), time.Duration(rep.Waited)*time.Second, rep.TTL, left)
 	}
-	return fmt.Sprintf("domains dns apply: the records were written and every resolver checked shows them, but other resolvers (the CA's) may still cache the old records for up to %s (TTL %d s; by %s)",
+	return fmt.Sprintf("domains dns apply: written; every resolver checked shows them, but other resolvers (the CA's) may still cache the old records for up to %s (TTL %d s; until %s)",
 		time.Duration(rep.ClearsIn)*time.Second, rep.TTL, at)
 }

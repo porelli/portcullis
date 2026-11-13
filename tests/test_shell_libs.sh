@@ -2127,15 +2127,20 @@ wait_out() {
 wait_out false false 324 8.8.8.8:53
 echo 1 > "$STUB_DIR/dt/rc-apply"
 OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup true false ""')"
-case "$OUT" in *"Applied, but not visible yet at 8.8.8.8: those caches clear within 5 min 24 s"*) t_pass "dns setup: a wait timeout names the resolvers and when their caches clear" ;;
+case "$OUT" in *"DNS records (address caa) written; not yet stable at 8.8.8.8: it may serve the old records for up to 5 min 24 s more (until 08:11 UTC)"*) t_pass "dns setup: a wait that hit its bound says written, not yet stable where, and for how long" ;;
   *) t_fail "dns setup wait timeout: $OUT" ;; esac
+# E: written but not yet stable is no failure: no trailing check (it would
+# hit a stale cache and say "problems"), exit 0, never "failed".
+case "$OUT" in *"found problems"*|*"failed"*|*"could not"*) t_fail "dns setup not yet stable reads as a failure: $OUT" ;;
+  *"dns check after 08:11 UTC"*rc=0) t_pass "dns setup: not yet stable → exit 0, check after the time said" ;; *) t_fail "dns setup not yet stable: $OUT" ;; esac
+expect_eq "dns setup: not yet stable → no trailing check" "$(paste -sd' ' "$STUB_DIR/dt/order")" "plan ttl apply refresh"
 # M1 / M2: the tool's progress line shows; its own timeout line doesn't
 # (the shell words it once).
 printf '%s\n' "domains dns apply: written; waiting up to 11m0s for 1.1.1.1:53, 8.8.8.8:53 (TTL 600 s)" \
-  "domains dns apply: the records were written, but they are not visible yet at 8.8.8.8:53 after 11m0s" > "$STUB_DIR/dt/err-apply"
+  "domains dns apply: written; not yet stable at 8.8.8.8:53 after 11m0s (TTL 600 s; …)" > "$STUB_DIR/dt/err-apply"
 OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup true false ""')"
-case "$OUT" in *"domains dns apply: the records were written"*) t_fail "dns setup: the timeout printed twice: $OUT" ;;
-  *"written; waiting up to 11m0s for 1.1.1.1:53, 8.8.8.8:53"*"Applied, but not visible yet"*) t_pass "dns setup: progress shown, the timeout once" ;; *) t_fail "dns setup progress: $OUT" ;; esac
+case "$OUT" in *"domains dns apply: written; not yet stable"*) t_fail "dns setup: the timeout printed twice: $OUT" ;;
+  *"written; waiting up to 11m0s for 1.1.1.1:53, 8.8.8.8:53"*"written; not yet stable at 8.8.8.8"*) t_pass "dns setup: progress shown, the timeout once" ;; *) t_fail "dns setup progress: $OUT" ;; esac
 rm -f "$STUB_DIR/dt/rc-apply" "$STUB_DIR/dt/out-apply" "$STUB_DIR/dt/err-apply"
 
 dt 'DNS_PROVIDER=route53 AWS_ACCESS_KEY_ID=AKIA-0123456789 AWS_SECRET_ACCESS_KEY=sec-0123456789 AWS_HOSTED_ZONE_ID=Z123 _dns_tool apply' >/dev/null
@@ -2270,7 +2275,7 @@ wait_out false false 324 8.8.8.8:53 1.1.1.1:53
 echo 1 > "$STUB_DIR/dt/rc-apply"
 OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_tighten_main')"
 case "$OUT" in *"could not"*) t_fail "tighten timeout reads as a failure: $OUT" ;;
-  *"The CAA pin of ci.example.org was written, but it is not visible yet at 8.8.8.8, 1.1.1.1: those caches clear within 5 min 24 s"*rc=0) t_pass "tighten: a wait timeout says written, where, and when caches clear" ;;
+  *"The CAA pin of ci.example.org written; not yet stable at 8.8.8.8, 1.1.1.1: they may serve the old records for up to 5 min 24 s more (until 08:11 UTC)"*rc=0) t_pass "tighten: a wait timeout says written, not yet stable where, and for how long" ;;
   *) t_fail "tighten timeout: $OUT" ;; esac
 rm -f "$STUB_DIR/dt/rc-apply" "$STUB_DIR/dt/out-apply"
 # The refresh is best effort: the domains service down only skips it.
@@ -2358,7 +2363,7 @@ wait_out false false 540 8.8.8.8:53
 echo 1 > "$STUB_DIR/dt/rc-apply"
 OUT="$(flip "$FCF")"
 case "$OUT" in *"could not relax"*) t_fail "relax timeout reads as a failure: $OUT" ;;
-  *"was relaxed to CA-only, but it is not visible yet at 8.8.8.8: those caches clear within 9 min"*"after 08:11 UTC"*"flip is not finished"*rc=1) t_pass "config apply flip: an unsettled relax refuses to go on, honestly worded, with the time to rerun" ;;
+  *"The CA-only CAA of ci.example.org written; not yet stable at 8.8.8.8: it may serve the old pin for up to 9 min more (until 08:11 UTC)"*"after 08:11 UTC"*"flip is not finished"*rc=1) t_pass "config apply flip: an unsettled relax refuses to go on, honestly worded, with the time to rerun" ;;
   *) t_fail "relax timeout: $OUT" ;; esac
 expect_eq "config apply flip: unsettled → acme.json kept, sentinel unchanged, Traefik never stopped" \
   "$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last"):$(grep -c 'stop traefik' "$STUB_DIR/dt/argv" || true)" "0:false:0"
@@ -2366,13 +2371,26 @@ expect_eq "config apply flip: nothing claims Traefik's storage was cleared" "$(p
 # M3: visible but not settled, one "but".
 wait_out true false 3000
 OUT="$(flip "$FCF")"
-case "$OUT" in *"relaxed to CA-only; every resolver checked shows it, but the CA's resolvers may cache the old pin for up to 50 min"*rc=1) t_pass "config apply flip: visible but unsettled refuses too" ;;
+case "$OUT" in *"CA-only CAA of ci.example.org written; every resolver checked shows it, but the CA's resolvers may cache the old pin for up to 50 min"*rc=1) t_pass "config apply flip: visible but unsettled refuses too" ;;
   *) t_fail "relax visible-unsettled: $OUT" ;; esac
-# I5: beyond the cap — names the stored TTL, when to rerun, and the TTL fix.
-WAIT_EXTRA='{"ttl":3600,"beyond_cap":true,"settle_at":1800003660}' wait_out true false 3660
+# I5 + F: beyond the cap — each cause worded on its own, with the time
+# after which a rerun goes ahead. (a) The stored TTL is above the cap.
+WAIT_EXTRA='{"ttl":3600,"beyond_cap":true,"settle_at":1800003660,"settle_cause":"ttl"}' wait_out true false 3660
 OUT="$(flip "$FCF")"
-case "$OUT" in *"the old pin is stored with TTL 3600 s (60 min), longer than one run waits (15 min)"*"again after 09:01 UTC"*"or lower the CAA TTL at cloudflare first"*rc=1) t_pass "config apply flip: beyond the cap names the cause and the time" ;;
-  *) t_fail "relax beyond cap: $OUT" ;; esac
+case "$OUT" in *"the old pin's stored TTL (3600 s, 60 min) is above what one run waits (15 min)"*"goes ahead after 09:01 UTC"*"lowering the CAA TTL at cloudflare first shortens it"*rc=1) t_pass "config apply flip: beyond the cap, the stored TTL named as the cause, and the time" ;;
+  *) t_fail "relax beyond cap (ttl): $OUT" ;; esac
+# (b) The F run: TTL 600 (below the cap), but 8.8.8.8 still serves the old
+# pin with 547 s left — never "TTL 600 s, longer than one run waits".
+WAIT_EXTRA='{"ttl":600,"beyond_cap":true,"settle_at":1800001115,"settle_cause":"resolver","held_by":["8.8.8.8:53"],"held_for":547}' wait_out true false 1115
+OUT="$(flip "$FCF")"
+case "$OUT" in *"longer than one run waits"*|*"stored TTL"*) t_fail "relax beyond cap (resolver) blames the TTL: $OUT" ;;
+  *"but 8.8.8.8 still serves the old pin (547 s left), so caches (the CA's too) may hold it until 08:19 UTC"*"goes ahead after 08:19 UTC"*rc=1) t_pass "config apply flip: beyond the cap because a resolver holds the old pin: named, with the seconds left and the time" ;;
+  *) t_fail "relax beyond cap (resolver): $OUT" ;; esac
+# (c) An earlier run's saved settle point is past what one run waits.
+WAIT_EXTRA='{"ttl":300,"beyond_cap":true,"settle_at":1800003600,"settle_cause":"saved"}' wait_out true false 3600
+OUT="$(flip "$FCF")"
+case "$OUT" in *"the settle point saved earlier"*"goes ahead after 2027-01-15 09:00 UTC"*rc=1) t_pass "config apply flip: beyond the cap because of the saved settle point: said, with the time" ;;
+  *) t_fail "relax beyond cap (saved): $OUT" ;; esac
 # C1: the settle point is saved (0600) before the write, from the old pin's
 # TTL; a rerun passes it and never lowers it, even if the tool, seeing
 # only the CA-only records it wrote, reports an earlier one.
@@ -2573,7 +2591,7 @@ jq '.items = [{set: "caa", name: "ci.example.org", type: "CAA", want: [], live: 
   "$STUB_DIR/dt/out-default" > "$STUB_DIR/dt/out-check"
 for pinned in 'export DNS_PROVIDER=none' 'export DNS_CAA=false DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123' 'unset CLOUDFLARE_API_TOKEN; export DNS_PROVIDER=cloudflare'; do
   OUT="$(flip "$pinned")"
-  case "$OUT" in *"acct/5"*"remove that pin at"*"run it again"*rc=1) t_pass "flip refused, a live pin Portcullis can't relax ($pinned)" ;; *) t_fail "flip with a live pin ($pinned): $OUT" ;; esac
+  case "$OUT" in *"acct/5"*"remove that pin at"*"wait its TTL after removing it before running it again"*rc=1) t_pass "flip refused, a live pin Portcullis can't relax ($pinned)" ;; *) t_fail "flip with a live pin ($pinned): $OUT" ;; esac
   expect_eq "flip with a live pin ($pinned): nothing changed (no stop, no clear, sentinel unchanged)" \
     "$(grep -c -e 'stop traefik' -e 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last")" "0:false"
 done
@@ -2583,6 +2601,25 @@ OUT="$(flip 'export DNS_PROVIDER=none')"
 case "$OUT" in *"couldn't check"*rc=1) t_pass "flip: a failed public check refuses" ;; *) t_fail "flip failed check: $OUT" ;; esac
 expect_eq "flip: a failed public check changes nothing" "$(grep -c 'stop traefik' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last")" "0:false"
 rm -f "$STUB_DIR/dt/out-check" "$STUB_DIR/dt/rc-check"
+# M22: the check ran but its CAA lookups failed (would_issue false, the
+# caa item unknown): "couldn't check", never "wouldn't let … order"; still
+# refused.
+jq '.items = [{set: "caa", name: "ci.example.org", type: "CAA", want: [], live: [], status: "unknown", severity: "warning", fix: "none", steps: ["lookup failed (retry): i/o timeout"]}] | .caa.would_issue = false' \
+  "$STUB_DIR/dt/out-default" > "$STUB_DIR/dt/out-check"
+for how in 'export DNS_PROVIDER=none' 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123'; do
+  OUT="$(flip "$how")"
+  case "$OUT" in *"wouldn't let"*) t_fail "flip, lookups failed ($how): worded as a refusal by the CAA: $OUT" ;;
+    *"couldn't check the public CAA of ci.example.org (DNS lookups failed)"*"nothing changed"*rc=1) t_pass "flip, lookups failed ($how): \"couldn't check\", refused" ;;
+    *) t_fail "flip, lookups failed ($how): $OUT" ;; esac
+  expect_eq "flip, lookups failed ($how): nothing changed" "$(grep -c -e 'stop traefik' -e 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last")" "0:false"
+done
+# M23: the refusal on a live pin says how long its TTL is, to wait after
+# removing it by hand.
+jq '.items = [{set: "caa", name: "ci.example.org", type: "CAA", want: [], live: ["0 issue \"letsencrypt.org; accounturi=https://acme-v02.api.letsencrypt.org/acme/acct/5; validationmethods=dns-01\""], status: "wrong", severity: "problem", fix: "manual", steps: []}] | .caa.would_issue = false | .caa_ttl = 1800' \
+  "$STUB_DIR/dt/out-default" > "$STUB_DIR/dt/out-check"
+OUT="$(flip 'export DNS_PROVIDER=none')"
+case "$OUT" in *"acct/5"*"remove that pin at"*"wait its TTL (1800 s, 30 min) after removing it"*rc=1) t_pass "flip refused on a live pin: the pin's TTL printed" ;; *) t_fail "flip live pin TTL: $OUT" ;; esac
+rm -f "$STUB_DIR/dt/out-check"
 # N2: DNS_CAA=false after a pin; `dns setup` removes it and saves a settle
 # point (from the progress line); a flip right after refuses until then,
 # managed or not.
@@ -2601,6 +2638,19 @@ expect_eq "flip refused by a saved point: nothing changed" "$(grep -c -e 'stop t
 OUT="$(flip 'export DNS_PROVIDER=none')"
 case "$OUT" in *"after "*rc=1) t_pass "flip, unmanaged: a saved point in the future refuses too" ;; *) t_fail "unmanaged flip with a saved point: $OUT" ;; esac
 rm -f "$STUB_DIR/dt/keep-state" "$RELAXF"
+# M24: dns setup can't read the old pin's TTL before writing (a hand-made
+# pin with an "auto" / zone-default TTL, or the read failed): the 24 h
+# settle point is saved before the write, and the progress line's guess
+# (write + 840 + 60) never lowers it.
+echo 3 > "$STUB_DIR/dt/rc-ttl"
+T0="$(date +%s)"
+echo "domains dns apply: written; waiting up to 15m0s for 1.1.1.1:53 (TTL 840 s); written_at=$T0 settle_at=$((T0 + 900))" > "$STUB_DIR/dt/err-apply"
+OUT="$(PATH="$WORK/dtbin:$PATH" PORTCULLIS_ROOT="$FL_ROOT" bash -c ". '$WORK/dtenv.sh'; export PORTCULLIS_ROOT='$FL_ROOT'; export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123; dns_setup true false caa" 2>&1; echo "rc=$?")"
+NB="$(sed -n 's/^RELAX_NOT_BEFORE=//p' "$RELAXF" 2>/dev/null)"
+expect_eq "dns setup, the old pin's TTL unreadable: the 24 h settle point saved (0600), not the 840 s guess" \
+  "$([ "${NB:-0}" -ge $((T0 + 86400)) ] 2>/dev/null && echo ok):$(file_mode "$RELAXF" 2>/dev/null)" "ok:600"
+case "$OUT" in *"24 h"*) t_pass "dns setup, TTL unreadable: the 24 h wait is said" ;; *) t_fail "dns setup TTL unreadable: $OUT" ;; esac
+rm -f "$STUB_DIR/dt/rc-ttl" "$STUB_DIR/dt/err-apply" "$RELAXF"
 echo '{"ttl": 600}' > "$STUB_DIR/dt/out-ttl"
 rm -f "$STUB_DIR/dt/traefik-running"
 OUT="$(flip 'export DNS_PROVIDER=gcloud')"
