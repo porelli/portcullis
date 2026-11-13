@@ -200,17 +200,17 @@ func ServedTTL(ctx context.Context, servers []string, name, typ string) (time.Du
 	return best, found
 }
 
-// Relaxed reports whether the provider's CAA at name is the CA-only form
-// for issuer: at least one of issuer's issue / issuewild entries, none of
-// them pinned to an account (a relax happened, or nothing was ever
-// pinned).
+// Relaxed reports whether no CAA entry of issuer at name is pinned to an
+// account at the provider: the CA-only form, or none of issuer's entries
+// at all (a relax cut short by a provider that deletes first, a CAA
+// removed by hand: no pin is live, and when the last one went can't be
+// known — M14).
 func Relaxed(ctx context.Context, p Provider, zone, name, issuer string) (bool, error) {
 	d := bare(name)
 	live, err := providerRecords(ctx, p, dns.Fqdn(zone), d)
 	if err != nil {
 		return false, err
 	}
-	n := 0
 	for _, rr := range pick(live, d, "CAA") {
 		r, err := rr.Parse()
 		if err != nil {
@@ -223,7 +223,6 @@ func Relaxed(ctx context.Context, p Provider, zone, name, issuer string) (bool, 
 		if _, pinned := parseValue(c.Value).params["accounturi"]; pinned {
 			return false, nil
 		}
-		n++
 	}
-	return n > 0, nil
+	return true, nil
 }

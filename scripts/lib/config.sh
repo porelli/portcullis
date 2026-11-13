@@ -58,7 +58,8 @@ _cfg_flip_traefik_back() {
   trap - EXIT INT TERM HUP
   [ -n "${CFG_FLIP_TRAEFIK_WAS:-}" ] || return 0
   info "Starting Traefik again..."
-  dc start traefik >/dev/null 2>&1 || warn "could not start Traefik again (./portcullis up)"
+  # No container to start (a recreate removed it): create it (M16).
+  dc start traefik >/dev/null 2>&1 || dc up -d --no-deps traefik >/dev/null 2>&1 || warn "could not start Traefik again (./portcullis up)"
 }
 
 config_apply() {
@@ -127,7 +128,8 @@ config_apply() {
     trap '_cfg_flip_traefik_back' EXIT
     trap '_cfg_flip_traefik_back; exit 130' INT TERM HUP
     info "Stopping Traefik..."
-    dc stop traefik >/dev/null 2>&1 || true
+    # acme.json is never cleared under a running Traefik (M15).
+    dc stop traefik >/dev/null 2>&1 || fail "could not stop Traefik: the ACME_STAGING flip is not finished; run the same command again"
     if docker volume inspect portcullis_traefik_acme >/dev/null 2>&1; then
       info "Clearing Traefik's ACME storage (acme.json)..."
       docker run --rm --network none -v portcullis_traefik_acme:/acme "$PORTCULLIS_HELPER_IMAGE" rm -f /acme/acme.json >/dev/null 2>&1 \

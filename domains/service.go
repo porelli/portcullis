@@ -1088,7 +1088,17 @@ func (s *Service) handleMainRefresh(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	ctx, cancel := context.WithTimeout(r.Context(), planTimeout)
 	defer cancel()
-	writeJSON(w, http.StatusOK, s.mainPlan(ctx, false))
+	s.writeMainPlan(w, ctx, false)
+}
+
+// writeMainPlan answers the main plan, or 503 when there is none in time.
+func (s *Service) writeMainPlan(w http.ResponseWriter, ctx context.Context, refresh bool) {
+	pl, err := s.mainPlan(ctx, refresh)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, pl)
 }
 
 // planFlight is one main-plan build shared by the requests waiting on it.
@@ -1104,11 +1114,11 @@ type planFlight struct {
 // ends first (a `status` that stopped waiting) the answer is the cached
 // plan, and the build still finishes and is stored, so the refresh
 // throttle engages for the next reader.
-func (s *Service) mainPlan(ctx context.Context, refresh bool) dnsplan.Plan {
+func (s *Service) mainPlan(ctx context.Context, refresh bool) (dnsplan.Plan, error) {
 	s.mu.Lock()
 	if pl, ok := s.cachedLocked(mainPlanKey, refresh); ok {
 		s.mu.Unlock()
-		return pl
+		return pl, nil
 	}
 	parent := s.runCtx
 	if parent == nil {
@@ -1144,16 +1154,21 @@ func (s *Service) mainPlan(ctx context.Context, refresh bool) dnsplan.Plan {
 	s.mu.Unlock()
 	select {
 	case <-f.done:
-		return f.pl
+		return f.pl, nil
 	case <-ctx.Done():
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		if c, ok := s.plans[mainPlanKey]; ok {
-			return c.plan
+			return c.plan, nil
 		}
-		return dnsplan.Plan{Name: s.cfg.MainDomain, Items: []dnsplan.Item{}}
+		// Nothing to answer with: unavailable, never an empty plan that
+		// could read as clean (M17).
+		return dnsplan.Plan{}, errMainUnavailable
 	}
 }
+
+// errMainUnavailable: no main plan in time and none cached (503).
+var errMainUnavailable = errors.New("the main domain's DNS plan isn't ready yet: try again")
 
 // buildMainPlan builds the main domain's read-only plan (no cache).
 func (s *Service) buildMainPlan(ctx context.Context) dnsplan.Plan {
@@ -1203,7 +1218,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handleMainPlan(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), planTimeout)
 	defer cancel()
-	writeJSON(w, http.StatusOK, s.mainPlan(ctx, r.URL.Query().Get("refresh") == "1"))
+	s.writeMainPlan(w, ctx, r.URL.Query().Get("refresh") == "1")
 }
 
 func (s *Service) handleAccount(w http.ResponseWriter, _ *http.Request) {

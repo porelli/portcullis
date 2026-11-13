@@ -425,6 +425,19 @@ func TestToolTTLRelaxed(t *testing.T) {
 	if json.Unmarshal([]byte(out), &r) != nil || !r.Relaxed {
 		t.Fatalf("CA-only: %s", out)
 	}
+	// M14: none of our entries at all (a relax cut short by a provider that
+	// deletes first, a CAA removed by hand) counts as relaxed too: no pin
+	// is live, and when it went can't be known.
+	f.zone.Set("portcullis.example.test", libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issue", Value: "digicert.com"}.RR())
+	_, out, _ = f.run([]string{"ttl"}, toolJSON(caaOnly("")))
+	if json.Unmarshal([]byte(out), &r) != nil || !r.Relaxed {
+		t.Fatalf("only another CA's entry: %s", out)
+	}
+	f.zone.Set("portcullis.example.test")
+	_, out, _ = f.run([]string{"ttl"}, toolJSON(caaOnly("")))
+	if json.Unmarshal([]byte(out), &r) != nil || !r.Relaxed {
+		t.Fatalf("no CAA at all: %s", out)
+	}
 }
 
 // The served TTL counts when it is longer than the stored one.

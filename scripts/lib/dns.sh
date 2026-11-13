@@ -264,10 +264,10 @@ dns_setup() {
   info "Applying the record sets: $DNS_SETS (then waiting for the public resolvers: the TTL the provider stored + 1 min, at most 15 min)..."
   rc=0
   out="$(_dns_apply_quiet --wait auto)" || rc=$?
-  # A pin written again ends a pending flip's relax (ACME_STAGING
-  # reverted mid-flip): the next relax reads this pin's TTL.
+  # A pin written again while a flip's settle point is saved (ACME_STAGING
+  # reverted mid-flip) only moves the point later (I10).
   if { [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; } && [ -n "${DNS_ACCOUNT_URI:-}" ] && [[ " $DNS_SETS " == *" caa "* ]]; then
-    dns_relax_done
+    _dns_relax_repin
   fi
   case "$rc" in
     0) ok "Applied: $DNS_SETS" ;;
@@ -364,8 +364,8 @@ dns_tighten_main() {
   local out rc=0
   out="$(_dns_caa_apply "$uri")" || rc=$?
   case "$rc" in
-    0) ok "CAA of $PORTCULLIS_DOMAIN pinned to $uri"; dns_relax_done ;;
-    1) warn "$(_dns_wait_text "$out" "The CAA pin of $PORTCULLIS_DOMAIN was written" it). Nothing to do: ./portcullis status shows it as planned once those caches have cleared."; dns_relax_done ;;
+    0) ok "CAA of $PORTCULLIS_DOMAIN pinned to $uri"; _dns_relax_repin ;;
+    1) warn "$(_dns_wait_text "$out" "The CAA pin of $PORTCULLIS_DOMAIN was written" it). Nothing to do: ./portcullis status shows it as planned once those caches have cleared."; _dns_relax_repin ;;
     2) warn "could not pin the CAA of $PORTCULLIS_DOMAIN: the dns tool refused the arguments, the domains image is older than this CLI (docker compose build domains, then ./portcullis dns setup)" ;;
     *) warn "could not pin the CAA of $PORTCULLIS_DOMAIN to Traefik's account: the write failed (the message is above; fix: ./portcullis dns setup)" ;;
   esac
@@ -455,10 +455,26 @@ _dns_relax_raise() {
   _dns_relax_put "$(_dns_relax_get WRITTEN_AT)" "$(_dns_relax_get OLD_TTL)" "$1"
 }
 
+# _dns_relax_repin — a pin was written again (the tighten, dns setup)
+# while a flip's settle point is saved: it is never deleted here — caches
+# may still hold the original, longer-TTL pin, and a later relax would
+# only see this pin's TTL — and only ever moves later: max(saved, now +
+# OLD_TTL + 60) (I10). An unreadable file is left as it is (the next relax
+# then waits 24 h). A failed write only warns: the saved point is still
+# the original one.
+_dns_relax_repin() {
+  local nb t
+  [ -e "$(_dns_relax_file)" ] || return 0
+  nb="$(_dns_relax_point)"
+  [ -n "$nb" ] || return 0
+  t="$(_dns_relax_get OLD_TTL)"
+  _dns_relax_raise "$(( $(date +%s) + t + 60 ))" || warn "could not update the pending flip's settle point ($(_dns_relax_file))"
+  return 0
+}
+
 # dns_relax_done — the flip finished (acme.json cleared, Traefik on the
-# new CA, sentinel written), or a pin was written again (tighten, dns
-# setup: the relax is undone, the next one reads the new pin's TTL): the
-# settle point goes.
+# new CA, sentinel written): the settle point goes. Nothing else ever
+# deletes it (I10).
 dns_relax_done() { rm -f "$(_dns_relax_file)"; }
 
 # dns_relax_main — on an ACME_STAGING flip, before `config apply` stops
@@ -477,6 +493,16 @@ dns_relax_main() {
   local d="${PORTCULLIS_DOMAIN:-the domain}" out rc=0 ttl now nb relaxed at
   local -a env=(DNS_ACCOUNT_URI="" DNS_SETS=caa DNS_IPS_DONE=1 DNS_IPV4="${PORTCULLIS_PUBLIC_IPV4:-}" DNS_IPV6="${PORTCULLIS_PUBLIC_IPV6:-}")
   nb="$(_dns_relax_point)"
+  if [ -z "$nb" ] && [ -e "$(_dns_relax_file)" ]; then
+    # A file that can't be read means a relax happened once and its point
+    # is lost: how long caches may still hold that pin can't be known,
+    # also if the CAA was pinned again since. A day, the longest resolvers
+    # commonly cache (I6).
+    now="$(date +%s)"
+    nb=$((now + 86400))
+    _dns_relax_put "$now" 86400 "$nb" || { warn "could not save the relax's settle point ($(_dns_relax_file))"; return 3; }
+    warn "The saved settle point of a relax of the CAA of $d ($(_dns_relax_file)) is unreadable: how long caches may still hold the old pin can't be known, so the flip waits 24 h, until $(jq -rn --argjson t "$nb" '$t | strftime("%Y-%m-%d %H:%M UTC")'). Run it again after that time."
+  fi
   if [ -z "$nb" ]; then
     # No usable saved point: read the CAA's TTL (and whether it is already
     # CA-only) before anything is written. Fail closed (I7): a TTL that
@@ -501,7 +527,7 @@ dns_relax_main() {
       # longest resolvers commonly cache (I6).
       nb=$((now + 86400))
       _dns_relax_put "$now" 86400 "$nb" || { warn "could not save the relax's settle point ($(_dns_relax_file))"; return 3; }
-      warn "The CAA of $d is already CA-only, but the saved settle point ($(_dns_relax_file)) is missing or unreadable: how long caches may still hold the old pin can't be known, so the flip waits 24 h, until $(jq -rn --argjson t "$nb" '$t | strftime("%Y-%m-%d %H:%M UTC")') (or pin the CAA again with ./portcullis dns setup and flip later)."
+      warn "The CAA of $d is already CA-only (or has none of its entries), but no settle point is saved ($(_dns_relax_file)): how long caches may still hold the old pin can't be known, so the flip waits 24 h, until $(jq -rn --argjson t "$nb" '$t | strftime("%Y-%m-%d %H:%M UTC")'). Run it again after that time."
     else
       nb=$((now + ttl + 60))
       _dns_relax_put "$now" "$ttl" "$nb" || { warn "could not save the relax's settle point ($(_dns_relax_file))"; return 3; }

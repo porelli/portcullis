@@ -68,7 +68,9 @@ _st_dns_lines() {
     return 0
   fi
   local fresh at stale old
-  while IFS=$'\t' read -r name addr addr_unknown caa wi sec foreign lost fresh at old; do
+  # \x1f, not a tab: a tab is IFS whitespace, so an empty field (an empty
+  # checked_at) would shift the ones after it (M18).
+  while IFS=$'\x1f' read -r name addr addr_unknown caa wi sec foreign lost fresh at old; do
     [ -n "$name" ] || continue
     # The main plan couldn't be rebuilt for this status (finding A): say
     # so, and on every clean line, never a bare ✓ on old data.
@@ -106,7 +108,7 @@ _st_dns_lines() {
       *) _st_line warn "$name: DNSSEC $sec (./portcullis dns plan)" ;;
     esac
     [ "$foreign" = 0 ] || _st_line warn "$name: $foreign record(s) under it aren't Portcullis' (./portcullis dns plan)"
-  done < <(printf '%s' "$dns" | jq -r '([.main] + [.domains[]])[] | [.name, .address_ok, (.address_unknown // false), .caa_ok, .would_issue, .dnssec, .foreign, (.lost_account // false), (if has("fresh") then .fresh else true end), (.checked_at // ""), (.image_old // false)] | @tsv')
+  done < <(printf '%s' "$dns" | jq -r '([.main] + [.domains[]])[] | [.name, .address_ok, (.address_unknown // false), .caa_ok, .would_issue, .dnssec, .foreign, (.lost_account // false), (if has("fresh") then .fresh else true end), (.checked_at // ""), (.image_old // false)] | map(tostring) | join("\u001f")')
 }
 
 status_run() {

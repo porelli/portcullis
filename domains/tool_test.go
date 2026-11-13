@@ -401,12 +401,33 @@ func TestMainPlanCanceledNotStored(t *testing.T) {
 	e.clock.advance(time.Minute)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	e.svc.mainPlan(ctx, true)
+	_, _ = e.svc.mainPlan(ctx, true)
 	e.waitFor("the detached build stored", 10*time.Second, func() bool { at, _, _ := cachedAt(); return at.After(before) })
 	_, pl, _ := cachedAt()
 	for _, it := range pl.Items {
 		if it.Status == dnsplan.StatusUnknown && it.Severity == dnsplan.SevWarning {
 			t.Fatalf("a canceled request's lookups were stored: %+v", it)
 		}
+	}
+}
+
+// M17: a main-plan request that gives up with nothing cached answers 503
+// (unavailable), never an empty 200 that could read as clean.
+func TestMainPlanGivesUpNothingCached(t *testing.T) {
+	e := newEnv(t, false)
+	e.svc.mu.Lock()
+	e.svc.mainGen++
+	delete(e.svc.plans, mainPlanKey)
+	e.svc.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := e.svc.mainPlan(ctx, false); err == nil {
+		t.Fatal("a request that gave up with nothing cached got a plan")
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/main/dns", nil).WithContext(ctx)
+	e.svc.handleMainPlan(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET /main/dns, gave up, nothing cached = %d %s", rec.Code, rec.Body.String())
 	}
 }

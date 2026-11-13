@@ -2069,6 +2069,12 @@ case "$*" in
     cat "$d/report-out" 2>/dev/null; exit 0 ;;
   compose\ *\ exec\ -T\ domains\ domains\ report\ --main\ --json)
     cat "$d/report-out" 2>/dev/null; exit 0 ;;
+  compose\ *\ stop\ traefik)
+    [ ! -f "$d/stop-fail" ] || exit 1
+    exit 0 ;;
+  compose\ *\ start\ traefik)
+    [ ! -f "$d/start-fail" ] || exit 1
+    exit 0 ;;
   compose\ *\ ps\ -q\ --status\ running\ traefik)
     [ ! -f "$d/traefik-running" ] || echo c0ffee
     exit 0 ;;
@@ -2399,7 +2405,20 @@ touch "$STUB_DIR/dt/rm-hup"
 OUT="$(flip "$FCF")"
 expect_eq "config apply flip: HUP after the stop starts Traefik again, sentinel unchanged" \
   "$(grep -c ' start traefik$' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last")" "1:false"
-rm -f "$STUB_DIR/dt/rm-hup" "$STUB_DIR/dt/traefik-running"
+rm -f "$STUB_DIR/dt/rm-hup"
+# M15: Traefik doesn't stop → fail before the clear (acme.json is never
+# cleared under a running Traefik), Traefik started again.
+touch "$STUB_DIR/dt/stop-fail"
+OUT="$(flip "$FCF")"
+expect_eq "config apply flip: a failed stop → rc 1, no clear, sentinel unchanged" \
+  "${OUT##*rc=}:$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv" || true):$(cat "$FL_ROOT/certs/.acme-staging-last")" "1:0:false"
+rm -f "$STUB_DIR/dt/stop-fail"
+# M16: no container to start (a recreate removed it) → the trap recreates it.
+touch "$STUB_DIR/dt/rm-term" "$STUB_DIR/dt/start-fail"
+OUT="$(flip "$FCF")"
+S1="$(argn ' start traefik$')" S2="$(grep -n 'up -d --no-deps traefik' "$STUB_DIR/dt/argv" | tail -n1 | cut -d: -f1)"
+expect_eq "config apply flip: dc start fails → the trap falls back to up -d --no-deps traefik" "$([ -n "$S1" ] && [ -n "$S2" ] && [ "$S1" -lt "$S2" ] && echo yes)" yes
+rm -f "$STUB_DIR/dt/rm-term" "$STUB_DIR/dt/start-fail" "$STUB_DIR/dt/traefik-running"
 # I9: a failure before the stop (the CA bundle) leaves Traefik alone.
 touch "$STUB_DIR/dt/bundle-fail"
 OUT="$(flip "$FCF")"
@@ -2423,13 +2442,29 @@ mkdir -p "$(dirname "$RELAXF")"; echo RELAX_NOT_BEFORE=1 > "$RELAXF"
 printf 'PORTCULLIS_DOMAIN=ci.example.org\nACME_STAGING=true\n' > "$FL_ROOT/.env"; echo true > "$FL_ROOT/certs/.acme-staging-last"
 (PATH="$WORK/dtbin:$WORK/cabin:$PATH" PORTCULLIS_ROOT="$FL_ROOT" bash -c ". '$WORK/dtenv.sh'; export PORTCULLIS_ROOT='$FL_ROOT'; config_build_ca_bundle() { :; }; $FCF; config_apply" >/dev/null 2>&1)
 expect_eq "config apply: ACME_STAGING reverted mid-flip → the settle point stays in force" "$([ -e "$RELAXF" ] && echo kept || echo gone)" kept
-# … until a pin is written again (the tighten re-pins Traefik's account).
+# I10: a pin written again (the tighten after `up`, `dns setup`) never
+# deletes it — caches may still hold the original long-TTL pin — and may
+# only move it later: max(saved, now + OLD_TTL + 60). The next flip, still
+# within the old TTL, passes it on.
 touch "$STUB_DIR/dt/acme-volume"; echo "https://acme-v02.api.letsencrypt.org/acme/acct/77" > "$STUB_DIR/dt/traefik-uri"
 jq '.items = [{set: "caa", name: "ci.example.org", type: "CAA", want: ["x"], live: ["y"], status: "wrong", severity: "problem", fix: "auto", steps: []}] | .caa.would_issue = false' "$STUB_DIR/dt/out-default" > "$STUB_DIR/dt/out-check"
 rm -f "$STUB_DIR/dt/rc-apply"; wait_out true true 0
-(PATH="$WORK/dtbin:$PATH" PORTCULLIS_ROOT="$FL_ROOT" bash -c ". '$WORK/dtenv.sh'; export PORTCULLIS_ROOT='$FL_ROOT'; $FCF; dns_tighten_main" >/dev/null 2>&1)
-expect_eq "tighten: a pin written ends the pending relax (settle point removed)" "$([ -e "$RELAXF" ] && echo kept || echo gone)" gone
-rm -f "$STUB_DIR/dt/out-check"
+for how in tighten setup; do
+  T0="$(date +%s)"
+  printf 'RELAX_WRITTEN_AT=%s\nRELAX_OLD_TTL=3600\nRELAX_NOT_BEFORE=%s\n' "$((T0 - 10))" "$((T0 + 3650))" > "$RELAXF"
+  if [ "$how" = tighten ]; then cmd=dns_tighten_main; else cmd='dns_setup true false ""'; fi
+  (PATH="$WORK/dtbin:$PATH" PORTCULLIS_ROOT="$FL_ROOT" bash -c ". '$WORK/dtenv.sh'; export PORTCULLIS_ROOT='$FL_ROOT'; $FCF; $cmd" >/dev/null 2>&1)
+  NB="$(sed -n 's/^RELAX_NOT_BEFORE=//p' "$RELAXF" 2>/dev/null)"
+  expect_eq "$how: a re-pin keeps the settle point, moved to ≥ now + OLD_TTL + 60" "$([ -n "$NB" ] && [ "$NB" -ge $((T0 + 3660)) ] && echo ok)" ok
+  # Then a flip, still within the old pin's TTL: the saved point is passed.
+  touch "$STUB_DIR/dt/keep-state"
+  WAIT_EXTRA='{"settle_at":1}' wait_out true false 3600; echo 1 > "$STUB_DIR/dt/rc-apply"
+  OUT="$(flip "$FCF")"
+  expect_eq "$how, then a flip: the relax passes the saved point (no fresh TTL read)" \
+    "$(grep -c "settle-after $NB\$" "$STUB_DIR/dt/argv"):$(grep -c 'dns-tool ttl' "$STUB_DIR/dt/argv" || true)" "1:0"
+  rm -f "$STUB_DIR/dt/keep-state" "$STUB_DIR/dt/rc-apply"; wait_out true true 0
+done
+rm -f "$STUB_DIR/dt/out-check" "$RELAXF"
 # I6: no saved point (lost, corrupt) but the CAA is already CA-only: the
 # old pin's TTL can't be known → now + 24 h, saved, with the time.
 echo '{"ttl": 600, "caa_relaxed": true}' > "$STUB_DIR/dt/out-ttl"
@@ -2441,11 +2476,23 @@ for st in missing corrupt; do
   WAIT_EXTRA='{"beyond_cap":true,"settle_at":1}' wait_out true false 86400; echo 1 > "$STUB_DIR/dt/rc-apply"
   OUT="$(flip "$FCF")"
   NB="$(sed -n 's/^RELAX_NOT_BEFORE=//p' "$RELAXF" 2>/dev/null)"
-  case "$OUT" in *"already CA-only"*"can't be known"*"24 h"*rc=1) t_pass "relax: $st settle point, CAA already relaxed → 24 h, said" ;; *) t_fail "relax $st: $OUT" ;; esac
+  case "$st:$OUT" in missing:*"already CA-only"*"can't be known"*"24 h"*rc=1|corrupt:*"unreadable"*"can't be known"*"24 h"*rc=1) t_pass "relax: $st settle point, CAA already relaxed → 24 h, said" ;; *) t_fail "relax $st: $OUT" ;; esac
+  case "$OUT" in *"dns setup"*|*"pin the CAA again"*) t_fail "relax $st: the 24 h warning suggests a re-pin: $OUT" ;; *) t_pass "relax: $st — the 24 h warning offers no re-pin way around it" ;; esac
   expect_eq "relax: $st settle point → now + 24 h saved, passed on" \
     "$([ "${NB:-0}" -ge $((T0 + 86400)) ] 2>/dev/null && echo ok):$(grep -c "settle-after $NB\$" "$STUB_DIR/dt/argv")" "ok:1"
 done
 rm -f "$STUB_DIR/dt/keep-state" "$STUB_DIR/dt/rc-apply"
+# A file that exists but can't be read means a relax happened once: 24 h
+# even when the CAA is pinned now (a re-pin since), never a fresh read.
+echo '{"ttl": 300, "caa_relaxed": false}' > "$STUB_DIR/dt/out-ttl"
+touch "$STUB_DIR/dt/keep-state"; echo 'RELAX_NOT_BEFORE=soon' > "$RELAXF"
+T0="$(date +%s)"
+WAIT_EXTRA='{"beyond_cap":true,"settle_at":1}' wait_out true false 86400; echo 1 > "$STUB_DIR/dt/rc-apply"
+OUT="$(flip "$FCF")"
+NB="$(sed -n 's/^RELAX_NOT_BEFORE=//p' "$RELAXF" 2>/dev/null)"
+expect_eq "relax: unreadable settle point, CAA pinned now → 24 h too" "$([ "${NB:-0}" -ge $((T0 + 86400)) ] 2>/dev/null && echo ok)" ok
+rm -f "$STUB_DIR/dt/keep-state" "$STUB_DIR/dt/rc-apply"
+echo '{"ttl": 600, "caa_relaxed": true}' > "$STUB_DIR/dt/out-ttl"
 # One edited field can't move the point earlier: max(NOT_BEFORE, WRITTEN_AT + OLD_TTL + 60).
 touch "$STUB_DIR/dt/keep-state"
 printf 'RELAX_WRITTEN_AT=1900000000\nRELAX_OLD_TTL=3600\nRELAX_NOT_BEFORE=5\n' > "$RELAXF"
@@ -2543,6 +2590,9 @@ expect_eq "status: an old image's report → the cached one, image_old, not fres
 LINES="$(dt "_st_dns_lines \"\$(_st_dns_json \"\$(dns_status_json)\" https://acme/acct/1 https://acme/acct/1)\"")"
 case "$LINES" in *"isn't running"*) t_fail "status old image: $LINES" ;; *"the domains image is older than this CLI (run ./portcullis up)"*) t_pass "status: an old domains image is named" ;; *) t_fail "status old image: $LINES" ;; esac
 rm -f "$STUB_DIR/dt/report-old" "$STUB_DIR/dt/report-out"
+# M18: an empty field (checked_at) doesn't shift the ones after it.
+LINES="$(dt "_st_dns_lines \"\$(_st_dns_json \"\$(jq '.main.checked_at = \"\" | .main_fresh = false | .image_old = true' '$DNSR')\" https://acme/acct/1 https://acme/acct/1)\"")"
+case "$LINES" in *"the domains image is older than this CLI (run ./portcullis up): the DNS lines below are from an earlier check"*) t_pass "status: an empty checked_at keeps the fields in place" ;; *) t_fail "status empty checked_at: $LINES" ;; esac
 SD="$(dt "_st_dns_json \"\$(cat '$DNSR')\" https://acme/acct/1 https://acme/acct/1")"
 expect_eq "status --json: dns.main summary from a fixture report" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.main | del(.checks)')" \
   '{"address_ok":true,"address_unknown":false,"caa_ok":true,"would_issue":true,"dnssec":"unsigned","foreign":1,"problems":0,"name":"ci.example.org","lost_account":false,"fresh":true,"checked_at":"x","image_old":false}'
