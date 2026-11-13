@@ -51,10 +51,33 @@ KEY="$(tail -n1 "$RUNNER_TEMP/hs-api-key")"; echo "::add-mask::$KEY"
 printf '%s\n' "$KEY" > "$RUNNER_TEMP/hs-api-key"
 echo "E2E_HS_API_KEY_FILE=$RUNNER_TEMP/hs-api-key" >> "$GITHUB_ENV"
 # A secret setting: the Hub's secrets form (contract §13.12), on stdin only.
+T_PUT="$(date -u +%s)"
 KEY="$KEY" jq -n '{secrets: {api_key: {value: env.KEY}}}' | hubc PUT /api/instances/headscale/settings -d @- > /tmp/code
 case "$(cat /tmp/code)" in 200|202) ;; *) echo "FAIL: headscale api_key: $(cat /tmp/code) $(cat /tmp/hub.out)"; exit 1 ;; esac
 code=$(hubc PUT /api/instances/headscale/vpn-provider -d '{"wired": true, "refresh": "15s"}')
 case "$code" in 200|202) ;; *) echo "FAIL: wire headscale: $code $(cat /tmp/hub.out)"; exit 1 ;; esac
+# Settle before the setup links are spent (the browser runs next): the
+# Hub restarts headscale for the new API key (applies: restart) and
+# attaches the gateway in the background, and a container start or
+# network attach on the runner makes Chromium abort in-flight requests
+# (net::ERR_NETWORK_CHANGED; a setup link can't be retried).
+for i in $(seq 1 60); do
+  read -r started running < <(docker inspect -f '{{.State.StartedAt}} {{.State.Running}}' portcullis-headscale-headscale-1)
+  [ "$running" = true ] && [ "$(date -u -d "$started" +%s)" -ge "$T_PUT" ] && break
+  [ "$i" -eq 60 ] && { echo "FAIL: headscale wasn't restarted for its API key"; docker logs --tail=30 portcullis-headscale-headscale-1; exit 1; }
+  sleep 3
+done
+for i in $(seq 1 80); do
+  hub GET /api/vpn | jq -e 'any(.providers[]; .id == "headscale" and .wired and (.stale | not))' >/dev/null && break
+  [ "$i" -eq 80 ] && { echo "FAIL: headscale's map isn't fresh: $(hub GET /api/vpn | jq -c .providers)"; exit 1; }
+  sleep 3
+done
+for i in $(seq 1 60); do
+  n="$(docker events --since 20s --until "$(date +%s)" --filter event=start --filter event=connect --format '{{.Type}} {{.Action}} {{.Actor.Attributes.name}}' | wc -l)"
+  [ "$n" -eq 0 ] && break
+  [ "$i" -eq 60 ] && { echo "FAIL: the engine never went 20 s without a container start or network attach"; exit 1; }
+  sleep 3
+done
 hub GET /api/vpn | jq -c '{mode, wg, providers: [.providers[] | {id, wired, stale, devices}]}'
 for spec in "E2E_ALICE_INVITE alice" "E2E_BOB_INVITE bob"; do
   read -r var who <<<"$spec"

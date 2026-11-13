@@ -5057,7 +5057,17 @@ jobs:
         timeout-minutes: 25
         env:
           E2E_VPN_CLIENT: ${{ runner.temp }}/vpn-client
-        run: /tmp/e2e-venv/bin/python tests/e2e/e2e_vpn.py
+        run: |
+          # The engine's events (container starts, network attaches) beside
+          # the scenarios: a browser step aborted by net::ERR_NETWORK_CHANGED
+          # can be matched to what changed the runner's network.
+          mkdir -p e2e-artifacts
+          docker events --format '{{.Time}} {{.Type}} {{.Action}} {{.Actor.Attributes.name}}' > e2e-artifacts/docker-events.txt 2>&1 &
+          ev=$!
+          rc=0
+          /tmp/e2e-venv/bin/python tests/e2e/e2e_vpn.py || rc=$?
+          kill "$ev" 2>/dev/null || true
+          exit "$rc"
 
       - name: Collect logs
         if: failure()

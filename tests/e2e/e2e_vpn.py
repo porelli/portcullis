@@ -164,7 +164,8 @@ def hub(method: str, path: str, body=None, timeout: float = 300):
 
 def hub_ok(method: str, path: str, body=None):
     code, out = hub(method, path, body)
-    assert code in (200, 201, 202), f"{method} {path}: HTTP {code} {str(out)[:400]}"
+    # 204: a change with no body (e.g. PUT …/reach).
+    assert code in (200, 201, 202, 204), f"{method} {path}: HTTP {code} {str(out)[:400]}"
     return out
 
 
@@ -334,6 +335,24 @@ def wg_conf(priv: str, cfg: dict) -> str:
             f"AllowedIPs = {cfg['allowed_ips']}\nPersistentKeepalive = 25\n")
 
 
+def goto(page: Page, url: str) -> None:
+    """page.goto, retried on Chromium's net::ERR_NETWORK_CHANGED (a
+    container start or network attach on the runner aborts in-flight
+    requests). Only for repeatable navigations: setup links are spent
+    before any app container starts (the setup step waits for a quiet
+    engine)."""
+    for i in range(3):
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+            if not page.url.startswith("chrome-error://"):
+                return
+        except Exception as e:  # noqa: BLE001
+            if "ERR_NETWORK_CHANGED" not in str(e) or i == 2:
+                raise
+        page.wait_for_timeout(2000)
+    raise AssertionError(f"{url.split('?')[0]}: still a Chromium error page")
+
+
 def fresh_proof(page: Page, label: str, redirect_uri: str) -> dict:
     """The /vpn/ page's fresh-auth popup flow (contract §5.1): prompt=login,
     max_age=0, PKCE S256 on the fresh-auth client; the proof it posts."""
@@ -344,7 +363,7 @@ def fresh_proof(page: Page, label: str, redirect_uri: str) -> dict:
     q = {"client_id": "portcullis-fresh-auth", "response_type": "code", "scope": "openid", "redirect_uri": redirect_uri,
          "state": secrets.token_urlsafe(12), "nonce": nonce, "code_challenge": challenge,
          "code_challenge_method": "S256", "prompt": "login", "max_age": "0"}
-    page.goto(f"{REALM}/protocol/openid-connect/auth?" + urllib.parse.urlencode(q), wait_until="domcontentloaded")
+    goto(page, f"{REALM}/protocol/openid-connect/auth?" + urllib.parse.urlencode(q))
     deadline = time.time() + 60
     while time.time() < deadline:
         for u in seen:
@@ -481,7 +500,7 @@ def main() -> int:
             url = until("a registration URL", lambda: (lambda o: (re.search(r"https://\S+/register/\S+", o) or [None])[0])(
                 sh("docker", "exec", "ts-alice", "cat", "/tmp/up.log")[1]), 60)
             _, page, _ = sessions["alice"]
-            page.goto(url, wait_until="domcontentloaded")
+            goto(page, url)
             until("alice's node registered", lambda: '"Online": true' in sh(
                 "docker", "exec", "ts-alice", "tailscale", "--socket=/tmp/ts.sock", "status", "--json")[1]
                 or "BackendState\": \"Running" in sh("docker", "exec", "ts-alice", "tailscale", "--socket=/tmp/ts.sock",
