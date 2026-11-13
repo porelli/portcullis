@@ -26,11 +26,13 @@ LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
 echo "::add-mask::$LLDAP_TOKEN"
 gql() { jq -n --arg q "$1" '{query: $q}' | curl -sf http://127.0.0.1:17170/api/graphql \
           -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") -H 'Content-Type: application/json' -d @-; }
-for u in alice bob; do
+# carol: an LLDAP administrator, for the break-glass case (an admin
+# surface on websecure after vpn mode apps with the Hub down).
+for u in alice bob carol; do
   gql "mutation { createUser(user: {id: \"$u\", email: \"$u@portcullis.local\"}) { id } }" | jq -e '.errors == null' >/dev/null
 done
 GROUPS_JSON="$(gql '{ groups { id displayName } }')"
-for m in alice:users_echo-vpn bob:users_echo-vpn alice:users_headscale; do
+for m in alice:users_echo-vpn bob:users_echo-vpn alice:users_headscale carol:lldap_admin; do
   gid=$(echo "$GROUPS_JSON" | jq -r --arg g "${m#*:}" '.data.groups[] | select(.displayName == $g) | .id')
   [ -n "$gid" ] || { echo "FAIL: the Hub did not create ${m#*:}"; exit 1; }
   gql "mutation { addUserToGroup(userId: \"${m%%:*}\", groupId: $gid) { ok } }" | jq -e '.errors == null' >/dev/null
@@ -79,7 +81,7 @@ for i in $(seq 1 60); do
   sleep 3
 done
 hub GET /api/vpn | jq -c '{mode, wg, providers: [.providers[] | {id, wired, stale, devices}]}'
-for spec in "E2E_ALICE_INVITE alice" "E2E_BOB_INVITE bob"; do
+for spec in "E2E_ALICE_INVITE alice" "E2E_BOB_INVITE bob" "E2E_CAROL_INVITE carol"; do
   read -r var who <<<"$spec"
   url="$(./portcullis invite "$who" --to portal --json | jq -r .url)"
   [ -z "$url" ] || [ "$url" = null ] || echo "::add-mask::$url"

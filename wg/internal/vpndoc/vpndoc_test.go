@@ -31,6 +31,13 @@ type vector struct {
 	} `json:"deny"`
 }
 
+// TestMain pins Parse's clock to the fixtures' day: their valid_until is
+// 2026-11-13 11:00, within the 1 h 5 min bound of 10:00.
+func TestMain(m *testing.M) {
+	clock = func() time.Time { return time.Date(2026, 11, 13, 10, 0, 0, 0, time.UTC) }
+	os.Exit(m.Run())
+}
+
 func TestVectors(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join("..", "..", "..", "tests", "vpn_json_vectors.json"))
 	if err != nil {
@@ -53,7 +60,7 @@ func TestVectors(t *testing.T) {
 			if v.Raw != "" {
 				raw = []byte(v.Raw)
 			}
-			d, err := Parse(raw)
+			d, err := ParseAt(raw, v.Now)
 			if v.Want != "ok" {
 				if err == nil {
 					t.Fatalf("parsed; want a refusal (%s)", v.Want)
@@ -87,7 +94,7 @@ func TestVectors(t *testing.T) {
 	}
 }
 
-const docOK = `{"version":2,"valid_until":"2099-01-01T00:00:00Z",
+const docOK = `{"version":2,"valid_until":"2026-11-13T11:00:00Z",
  "builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":["example.org"],
   "peers":[{"ip":"10.213.0.5","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d1","expires":null}]},
  "providers":[{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false},
@@ -122,21 +129,21 @@ func TestParseRefusals(t *testing.T) {
 	for name, doc := range map[string]string{
 		"empty":            ``,
 		"null":             `null`,
-		"trailing":         `{"version":2,"valid_until":"2099-01-01T00:00:00Z","providers":[],"devices":[]} {}`,
-		"ipv6 range":       `{"version":2,"valid_until":"2099-01-01T00:00:00Z","providers":[{"id":"a","source":"hook","ranges":["fd00::/64"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
-		"unmasked range":   `{"version":2,"valid_until":"2099-01-01T00:00:00Z","providers":[{"id":"a","source":"hook","ranges":["100.64.0.1/10"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
-		"dup provider":     `{"version":2,"valid_until":"2099-01-01T00:00:00Z","providers":[{"id":"a","source":"hook","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false},{"id":"a","source":"hook","ranges":["100.65.0.0/16"],"edge_port":9002,"gateway_ip":"172.31.254.17","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
-		"dup edge port":    `{"version":2,"valid_until":"2099-01-01T00:00:00Z","providers":[{"id":"a","source":"hook","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false},{"id":"b","source":"hook","ranges":["100.65.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.17","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
-		"bad edge port":    `{"version":2,"valid_until":"2099-01-01T00:00:00Z","providers":[{"id":"a","source":"hook","ranges":["100.64.0.0/16"],"edge_port":80,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
-		"no gateway":       `{"version":2,"valid_until":"2099-01-01T00:00:00Z","providers":[{"id":"a","source":"hook","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"","stale":false}],"devices":[]}`,
-		"unknown provider": `{"version":2,"valid_until":"2099-01-01T00:00:00Z","providers":[],"devices":[{"ip":"100.64.0.7","provider":"x","user":"a","device_id":"1","name":"a","expires":null}]}`,
-		"no user":          `{"version":2,"valid_until":"2099-01-01T00:00:00Z","providers":[{"id":"a","source":"hook","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[{"ip":"100.64.0.7","provider":"a","user":"","device_id":"1","name":"a","expires":null}]}`,
-		"bad peer key":     `{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"short","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
-		"peer outside":     `{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[{"ip":"10.9.0.5","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
-		"peer is server":   `{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[{"ip":"10.213.0.1","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
-		"dup peer key":     `{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d","expires":null},{"ip":"10.213.0.6","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"e","expires":null}]},"providers":[],"devices":[]}`,
+		"trailing":         `{"version":2,"valid_until":"2026-11-13T11:00:00Z","providers":[],"devices":[]} {}`,
+		"ipv6 range":       `{"version":2,"valid_until":"2026-11-13T11:00:00Z","providers":[{"id":"a","source":"hook","ranges":["fd00::/64"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
+		"unmasked range":   `{"version":2,"valid_until":"2026-11-13T11:00:00Z","providers":[{"id":"a","source":"hook","ranges":["100.64.0.1/10"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
+		"dup provider":     `{"version":2,"valid_until":"2026-11-13T11:00:00Z","providers":[{"id":"a","source":"hook","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false},{"id":"a","source":"hook","ranges":["100.65.0.0/16"],"edge_port":9002,"gateway_ip":"172.31.254.17","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
+		"dup edge port":    `{"version":2,"valid_until":"2026-11-13T11:00:00Z","providers":[{"id":"a","source":"hook","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false},{"id":"b","source":"hook","ranges":["100.65.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.17","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
+		"bad edge port":    `{"version":2,"valid_until":"2026-11-13T11:00:00Z","providers":[{"id":"a","source":"hook","ranges":["100.64.0.0/16"],"edge_port":80,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
+		"no gateway":       `{"version":2,"valid_until":"2026-11-13T11:00:00Z","providers":[{"id":"a","source":"hook","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"","stale":false}],"devices":[]}`,
+		"unknown provider": `{"version":2,"valid_until":"2026-11-13T11:00:00Z","providers":[],"devices":[{"ip":"100.64.0.7","provider":"x","user":"a","device_id":"1","name":"a","expires":null}]}`,
+		"no user":          `{"version":2,"valid_until":"2026-11-13T11:00:00Z","providers":[{"id":"a","source":"hook","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[{"ip":"100.64.0.7","provider":"a","user":"","device_id":"1","name":"a","expires":null}]}`,
+		"bad peer key":     `{"version":2,"valid_until":"2026-11-13T11:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"short","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
+		"peer outside":     `{"version":2,"valid_until":"2026-11-13T11:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[{"ip":"10.9.0.5","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
+		"peer is server":   `{"version":2,"valid_until":"2026-11-13T11:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[{"ip":"10.213.0.1","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
+		"dup peer key":     `{"version":2,"valid_until":"2026-11-13T11:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d","expires":null},{"ip":"10.213.0.6","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"e","expires":null}]},"providers":[],"devices":[]}`,
 		"case key":         `{"Version":2,"providers":[],"devices":[]}`,
-		"builtin range":    `{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.99.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`,
+		"builtin range":    `{"version":2,"valid_until":"2026-11-13T11:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.99.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`,
 	} {
 		if _, err := Parse([]byte(doc)); err == nil {
 			t.Errorf("%s: parsed, want refusal", name)
@@ -195,7 +202,7 @@ func TestWatcher(t *testing.T) {
 // stale_after the Hub must write, at most MaxStaleSpan after refreshed_at.
 func TestStaleAfterRules(t *testing.T) {
 	prov := func(extra string) string {
-		return `{"version":2,"valid_until":"2099-01-01T00:00:00Z","providers":[{"id":"hs","source":"hook","ranges":["100.64.0.0/10"],"edge_port":9001,"gateway_ip":"172.31.254.16",` +
+		return `{"version":2,"valid_until":"2026-11-13T11:00:00Z","providers":[{"id":"hs","source":"hook","ranges":["100.64.0.0/10"],"edge_port":9001,"gateway_ip":"172.31.254.16",` +
 			extra + `"stale":false}],"devices":[{"ip":"100.64.0.7","provider":"hs","user":"alice","device_id":"1","name":"a","expires":null}]}`
 	}
 	for name, extra := range map[string]string{
@@ -239,18 +246,18 @@ func TestHubAlignedRules(t *testing.T) {
 	const peerKey = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="
 	bp := `{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}`
 	for name, doc := range map[string]string{
-		"empty server key":    `{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"","domains":[],"peers":[]},"providers":[` + bp + `],"devices":[]}`,
-		"peer device_id":      `{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + key + `","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"` + peerKey + `","device_id":"","expires":null}]},"providers":[` + bp + `],"devices":[]}`,
-		"device device_id":    `{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + key + `","domains":[],"peers":[]},"providers":[` + bp + `],"devices":[{"ip":"10.213.0.5","provider":"builtin","user":"a","device_id":"","name":"n","expires":null}]}`,
-		"builtin stale_after": `{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + key + `","domains":[],"peers":[]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale_after":"2026-11-13T12:00:00Z","stale":false}],"devices":[]}`,
-		"orphan builtin":      `{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + key + `","domains":[],"peers":[]},"providers":[],"devices":[]}`,
+		"empty server key":    `{"version":2,"valid_until":"2026-11-13T11:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"","domains":[],"peers":[]},"providers":[` + bp + `],"devices":[]}`,
+		"peer device_id":      `{"version":2,"valid_until":"2026-11-13T11:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + key + `","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"` + peerKey + `","device_id":"","expires":null}]},"providers":[` + bp + `],"devices":[]}`,
+		"device device_id":    `{"version":2,"valid_until":"2026-11-13T11:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + key + `","domains":[],"peers":[]},"providers":[` + bp + `],"devices":[{"ip":"10.213.0.5","provider":"builtin","user":"a","device_id":"","name":"n","expires":null}]}`,
+		"builtin stale_after": `{"version":2,"valid_until":"2026-11-13T11:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + key + `","domains":[],"peers":[]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale_after":"2026-11-13T12:00:00Z","stale":false}],"devices":[]}`,
+		"orphan builtin":      `{"version":2,"valid_until":"2026-11-13T11:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + key + `","domains":[],"peers":[]},"providers":[],"devices":[]}`,
 	} {
 		if _, err := Parse([]byte(doc)); err == nil {
 			t.Errorf("%s: parsed", name)
 		}
 	}
 	// A built-in device needs its peer (same ip and device_id), unexpired.
-	doc := `{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + key + `","domains":[],
+	doc := `{"version":2,"valid_until":"2026-11-13T11:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + key + `","domains":[],
 	 "peers":[{"ip":"10.213.0.5","public_key":"` + peerKey + `","device_id":"d1","expires":"2026-11-13T12:00:00Z"}]},
 	 "providers":[` + bp + `],
 	 "devices":[{"ip":"10.213.0.5","provider":"builtin","user":"a","device_id":"d1","name":"n","expires":null},
@@ -259,7 +266,7 @@ func TestHubAlignedRules(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	at := time.Date(2026, 11, 13, 11, 0, 0, 0, time.UTC)
+	at := time.Date(2026, 11, 13, 10, 30, 0, 0, time.UTC) // before valid_until (11:00)
 	if d.Device(BuiltinID, netip.MustParseAddr("10.213.0.5"), at) == nil {
 		t.Fatal("device with its peer denied")
 	}
@@ -296,7 +303,7 @@ func TestProviderFromIngress(t *testing.T) {
 func TestSourceRules(t *testing.T) {
 	dev := `"devices":[{"ip":"100.64.0.7","provider":"p","user":"alice","device_id":"1","name":"a","expires":null}]}`
 	prov := func(fields string) string {
-		return `{"version":2,"valid_until":"2099-01-01T00:00:00Z","providers":[{"id":"p",` + fields + `"ranges":["100.64.0.0/10"],"edge_port":9001,"gateway_ip":"172.31.254.16","stale":false}],` + dev
+		return `{"version":2,"valid_until":"2026-11-13T11:00:00Z","providers":[{"id":"p",` + fields + `"ranges":["100.64.0.0/10"],"edge_port":9001,"gateway_ip":"172.31.254.16","stale":false}],` + dev
 	}
 	times := `"refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z",`
 	for name, doc := range map[string]string{
@@ -307,7 +314,7 @@ func TestSourceRules(t *testing.T) {
 		"static with stale_after":  prov(`"source":"static",` + times),
 		"static with refreshed_at": prov(`"source":"static","refreshed_at":"2026-11-13T10:00:00Z",`),
 		"hook without times":       prov(`"source":"hook",`),
-		"builtin id, hook source": `{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[]},` +
+		"builtin id, hook source": `{"version":2,"valid_until":"2026-11-13T11:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[]},` +
 			`"providers":[{"id":"builtin","source":"hook","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`,
 	} {
 		if _, err := Parse([]byte(doc)); err == nil {
@@ -319,7 +326,9 @@ func TestSourceRules(t *testing.T) {
 		t.Fatalf("static provider refused: %v", err)
 	}
 	a := netip.MustParseAddr("100.64.0.7")
-	far := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	// Long after any hook refresh window, still before the file's own
+	// valid_until (which bounds every provider alike).
+	far := time.Date(2026, 11, 13, 10, 59, 0, 0, time.UTC)
 	if d.Device("p", a, far) == nil {
 		t.Fatal("a static map never goes stale by the clock")
 	}
@@ -339,7 +348,7 @@ func TestSourceRules(t *testing.T) {
 // refuses the file (security ruling).
 func TestReservedRanges(t *testing.T) {
 	doc := func(r string) string {
-		return `{"version":2,"valid_until":"2099-01-01T00:00:00Z","providers":[{"id":"p","source":"static","ranges":["` + r + `"],"edge_port":9001,"gateway_ip":"172.31.254.16","stale":false}],"devices":[]}`
+		return `{"version":2,"valid_until":"2026-11-13T11:00:00Z","providers":[{"id":"p","source":"static","ranges":["` + r + `"],"edge_port":9001,"gateway_ip":"172.31.254.16","stale":false}],"devices":[]}`
 	}
 	for _, r := range []string{"172.31.250.0/24", "172.17.0.0/16", "172.0.0.0/8", "192.168.10.0/24", "192.168.0.0/16", "10.214.0.0/24", "10.214.0.128/25"} {
 		if _, err := Parse([]byte(doc(r))); err == nil {

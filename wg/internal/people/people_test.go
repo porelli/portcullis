@@ -75,10 +75,13 @@ func doc(t *testing.T, serverKey string, peers ...string) *vpndoc.Doc {
 	return docRaw(t, serverKey, strings.Join(ps, ","))
 }
 
+// pt0 is the clock the fixtures are parsed at (valid_until 11:00).
+var pt0 = time.Date(2026, 11, 13, 10, 0, 0, 0, time.UTC)
+
 func docRaw(t *testing.T, serverKey, peers string) *vpndoc.Doc {
 	t.Helper()
-	d, err := vpndoc.Parse([]byte(`{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + serverKey +
-		`","domains":[],"peers":[` + peers + `]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`))
+	d, err := vpndoc.ParseAt([]byte(`{"version":2,"valid_until":"2026-11-13T11:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"`+serverKey+
+		`","domains":[],"peers":[`+peers+`]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`), pt0)
 	if err != nil {
 		t.Fatalf("fixture: %v", err)
 	}
@@ -120,7 +123,7 @@ func TestPeopleRoleSyncsPeers(t *testing.T) {
 		t.Fatalf("status %v %q", ok, e)
 	}
 	// Another subnet than this role's: refused.
-	d, err := vpndoc.Parse([]byte(`{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.99.0.0/22","server_public_key":"` + s.PublicKey() + `","domains":[],"peers":[]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.99.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`))
+	d, err := vpndoc.ParseAt([]byte(`{"version":2,"valid_until":"2026-11-13T11:00:00Z","builtin":{"subnet":"10.99.0.0/22","server_public_key":"`+s.PublicKey()+`","domains":[],"peers":[]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.99.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`), pt0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,8 +210,8 @@ func TestPeersDroppedAtValidUntil(t *testing.T) {
 	c := &clock{t: time.Date(2026, 11, 13, 10, 0, 0, 0, time.UTC)}
 	r, s := newRole(t, c)
 	a := keyPair(t)
-	d, err := vpndoc.Parse([]byte(`{"version":2,"valid_until":"2026-11-13T10:00:05Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + s.PublicKey() +
-		`","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"` + a + `","device_id":"d1","expires":null}]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`))
+	d, err := vpndoc.ParseAt([]byte(`{"version":2,"valid_until":"2026-11-13T10:00:05Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"`+s.PublicKey()+
+		`","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"`+a+`","device_id":"d1","expires":null}]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`), pt0)
 	if err != nil {
 		t.Fatalf("fixture: %v", err)
 	}

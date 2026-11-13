@@ -181,7 +181,10 @@ hub_env_run
 HE="$HR/secrets/hub/core.env"
 expect_ok   "hub env: domain" grep -qx 'PORTCULLIS_DOMAIN=hub.test' "$HE"
 expect_ok   "hub env: Traefik IP (compose default)" grep -qx 'PORTCULLIS_TRAEFIK_IP=172.31.250.2' "$HE"
-expect_ok   "hub env: VPN client secret by prefix" grep -qx 'HEADSCALE_OIDC_CLIENT_SECRET=hs-secret' "$HE"
+expect_ok   "hub env: an app variable by prefix (NETBIRD_)" grep -qx 'NETBIRD_OIDC_CLIENT_SECRET=nb-secret' "$HE"
+expect_fail "hub env: no HEADSCALE_ / HEADPLANE_ prefix any more (core carries no Headscale)" grep -q '^HEADSCALE_\|^HEADPLANE_' "$HE"
+expect_ok   "hub env: wg's portcullis-vpn address (compose default; the Hub's PORTCULLIS_VPN_EDGE for gateways)" \
+  grep -qx 'PORTCULLIS_VPN_WG_IP=172.31.254.3' "$HE"
 expect_ok   "hub env: the VPN reserved ranges (what wg / group-gate refuse) for the Hub" \
   grep -qx 'PORTCULLIS_VPN_RESERVED_RANGES=172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28' "$HE"
 expect_ok   "hub env: HUB_SHARED_ENV" grep -qx 'MY_APP_VAR=shared' "$HE"
@@ -2956,6 +2959,9 @@ case "$*" in
   "compose version --short") echo 2.40.0 ;;
   "run "*" cat /proc/self/uid_map") printf '%b' "${STUB_CT_UID_MAP:-$STUB_UID_MAP}" ;;
   "create "*) echo probe1 ;;
+  "network create "*) [ "${STUB_POOL_CREATE:-ok}" = ok ] || exit 1; echo net1 ;;
+  "network inspect "*) echo "${STUB_POOL_SUBNET:-10.89.3.0/24} " ;;
+  "network rm "*) exit 0 ;;
   "inspect --format {{.HostConfig.Memory}} {{.HostConfig.PidsLimit}} probe1") echo "${STUB_CT_LIMITS:-16777216 8}" ;;
   "image inspect "*) exit 1 ;;
   "volume inspect "*) exit 1 ;;
@@ -3095,9 +3101,7 @@ expect_eq "runtime_port_start: unreadable or not a number → 1024" \
 CG="$WORK/rt/cgroup"; mkdir -p "$CG/user.slice/user-$RT_UID.slice/user@$RT_UID.service"
 echo "cpuset cpu io memory pids" > "$CG/user.slice/user-$RT_UID.slice/user@$RT_UID.service/cgroup.controllers"
 mkdir -p "$WORK/rt/aa/local"; echo N > "$WORK/rt/aa-off"; echo Y > "$WORK/rt/aa-on"
-mkdir -p "$WORK/rt/cc"
-printf '[engine]\nevents_logger = "file"\n\n[network]\ndefault_subnet_pools = [{"base" = "10.89.0.0/16", "size" = 24}]\n' > "$WORK/rt/cc/containers.conf"
-RT_HOST="CONTAINER_RUNTIME=podman RT_CGROUP_ROOT='$CG' RT_PROC_PORT_START='$WORK/rt/port80' RT_APPARMOR_DIR='$WORK/rt/aa' RT_APPARMOR_ENABLED='$WORK/rt/aa-off' RT_CONTAINERS_CONF_DIR='$WORK/rt/cc'
+RT_HOST="CONTAINER_RUNTIME=podman RT_CGROUP_ROOT='$CG' RT_PROC_PORT_START='$WORK/rt/port80' RT_APPARMOR_DIR='$WORK/rt/aa' RT_APPARMOR_ENABLED='$WORK/rt/aa-off'
   loginctl() { echo yes; }; systemctl() { echo enabled; }; nft() { :; }; passt() { :; }; getenforce() { echo Enforcing; }"
 OUT="$(rt "$RT_HOST; runtime_host_checks")"
 expect_eq "runtime_host_checks: a prepared host → no fail line" "$(printf '%s\n' "$OUT" | grep -c '^fail' || true)" 0
@@ -3121,20 +3125,22 @@ case "$OUT" in *"warn	neither nft nor iptables"*|"rc=0") t_pass "runtime_host_ch
 # lies in 10.88.0.0/16 (the default network) or 10.89.0.0/16, both
 # reserved against VPN provider ranges.
 POOL_LINE='default_subnet_pools = [{"base" = "10.89.0.0/16", "size" = 24}]'
+# Podman's effective pool (M5 ruling): a probe network shows where Podman
+# allocates, whatever config set it ($CONTAINERS_CONF, an override, the
+# system or the user file). Outside 10.89.0.0/16: fail with the wg profile
+# on (VPN wiring needs it), warn with it off.
 OUT="$(rt "$RT_HOST; runtime_host_checks")"
-case "$OUT" in *"ok	containers.conf: default_subnet_pools = 10.89.0.0/16 (/24 networks)"*) t_pass "runtime_host_checks: the pinned Podman pool is an ok line" ;; *) t_fail "runtime_host_checks pool ok: $OUT" ;; esac
-for cc in "" '[network]\ndefault_subnet_pools = [{"base" = "10.128.0.0/9", "size" = 24}]\n' \
-          'default_subnet_pools = [{"base" = "10.89.0.0/16", "size" = 24}]\n' \
-          '[network]\n# default_subnet_pools = [{"base" = "10.89.0.0/16", "size" = 24}]\n'; do
-  rm -rf "$WORK/rt/cc2"; mkdir -p "$WORK/rt/cc2"
-  [ -z "$cc" ] || printf "$cc" > "$WORK/rt/cc2/containers.conf"
-  OUT="$(rt "$RT_HOST; RT_CONTAINERS_CONF_DIR='$WORK/rt/cc2'; runtime_host_checks")"
-  case "$OUT" in *"fail	containers.conf: Podman's network pools aren't pinned"*"[network] in $WORK/rt/cc2/containers.conf: $POOL_LINE"*) t_pass "runtime_host_checks: pools not pinned ($(printf "${cc:-no file}" | head -2 | tr '\n' ' ')) → fail with the exact line" ;; *) t_fail "runtime_host_checks pool: $OUT" ;; esac
-done
-mkdir -p "$WORK/rt/cc3/containers.conf.d"; cp "$WORK/rt/cc/containers.conf" "$WORK/rt/cc3/"
-printf '[network]\ndefault_subnet_pools = [{"base" = "10.128.0.0/9", "size" = 24}]\n' > "$WORK/rt/cc3/containers.conf.d/50-pools.conf"
-OUT="$(rt "$RT_HOST; RT_CONTAINERS_CONF_DIR='$WORK/rt/cc3'; runtime_host_checks")"
-case "$OUT" in *"fail	containers.conf: Podman's network pools aren't pinned"*"containers.conf.d/50-pools.conf overrides"*) t_pass "runtime_host_checks: a drop-in overriding the pools → fail naming it" ;; *) t_fail "runtime_host_checks pool drop-in: $OUT" ;; esac
+case "$OUT" in *"ok	Podman networks come from 10.89.0.0/16 (a probe network got 10.89.3.0/24)"*) t_pass "runtime_host_checks: the pinned Podman pool is an ok line" ;; *) t_fail "runtime_host_checks pool ok: $OUT" ;; esac
+expect_eq "runtime_host_checks: the probe network is created, inspected and removed" \
+  "$(rt "$RT_HOST; runtime_host_checks >/dev/null; grep -cE '^network (create|inspect|rm) .*portcullis-pool-probe-' \"\$STUB_DIR/rt-calls\"")" "3
+rc=0"
+OUT="$(rt "$RT_HOST; export STUB_POOL_SUBNET=10.128.5.0/24 COMPOSE_PROFILES=monitoring,wg; runtime_host_checks")"
+case "$OUT" in *"fail	Podman's network pool isn't pinned (a probe network got 10.128.5.0/24, outside 10.89.0.0/16"*"$POOL_LINE"*) t_pass "runtime_host_checks: an unpinned pool with the wg profile on → fail with the exact line" ;; *) t_fail "runtime_host_checks pool wg: $OUT" ;; esac
+OUT="$(rt "$RT_HOST; export STUB_POOL_SUBNET=10.128.5.0/24 COMPOSE_PROFILES=monitoring; runtime_host_checks")"
+case "$OUT" in *"warn	Podman's network pool isn't pinned (a probe network got 10.128.5.0/24"*) t_pass "runtime_host_checks: an unpinned pool without the wg profile → warn" ;; *) t_fail "runtime_host_checks pool no wg: $OUT" ;; esac
+case "$OUT" in *"fail	Podman's network pool"*) t_fail "runtime_host_checks pool no wg: a fail line" ;; *) t_pass "runtime_host_checks: without the wg profile the pool never refuses" ;; esac
+OUT="$(rt "$RT_HOST; export STUB_POOL_CREATE=no COMPOSE_PROFILES=wg; runtime_host_checks")"
+case "$OUT" in *"fail	Podman's network pool isn't pinned (no probe network could be created"*) t_pass "runtime_host_checks: no probe network with wg on → fail (never assumed pinned)" ;; *) t_fail "runtime_host_checks pool probe failed: $OUT" ;; esac
 expect_eq "runtime_host_checks: docker → nothing" "$(rt 'CONTAINER_RUNTIME=docker runtime_host_checks')" "rc=0"
 OUT="$(rt "$RT_HOST; loginctl() { echo no; }; RT_PROC_PORT_START='$WORK/rt/port1024'; runtime_require_host")"
 case "$OUT" in *"isn't prepared for rootless Podman"*"  - linger is off"*"  - net.ipv4.ip_unprivileged_port_start = 1024"*"rc=1") t_pass "runtime_require_host: lists every failed item, refuses" ;; *) t_fail "runtime_require_host: $OUT" ;; esac
@@ -3661,6 +3667,11 @@ OUT="$(vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
 expect_eq "vpn init: the default subnet clears the reserved ranges" "$(printf '%s' "$OUT" | grep -c "address pool\|core network" || true)" 0
 # Under Podman an image HEALTHCHECK may not apply: the Hub is "running"
 # (as ./portcullis up accepts); its answer to hub vpn host-info is the check.
+OUT="$(vt 'CONTAINER_RUNTIME=podman; _rt_pool_check() { printf "fail\tPodman'"'"'s network pool isn'"'"'t pinned (stub)\n"; }; vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init under podman with Podman's pool unpinned → refused before anything is written" \
+  "$RC:$(printf '%s' "$OUT" | grep -c "network pool isn't pinned"):$(vte | grep -c 'PORTCULLIS_VPN\|COMPOSE_PROFILES' || true)" "1:1:0"
+OUT="$(vt 'CONTAINER_RUNTIME=podman; _rt_pool_check() { printf "ok\tPodman networks come from 10.89.0.0/16\n"; }; vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init under podman with the pool pinned → goes on" "$RC" 0
 OUT="$(VT_HUB_HEALTH=running vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
 expect_eq "vpn init: a Hub without a health status (running) that answers host-info → goes on" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running" || true)" "0:0"
 OUT="$(VT_HUB_HEALTH=running VT_HUB_DOWN=1 VPN_HUB_WAIT=1 vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?

@@ -1608,8 +1608,10 @@ def validate_vpn_section(v) -> Optional[str]:
             return f"'hosts' key {h!r} is not a valid hostname"
         if h in core:
             return f"'hosts' key {h!r} is a core host"
-        if not isinstance(entry, dict) or set(entry) != {"via"}:
-            return f"'hosts' entry {h!r} is not exactly {{\"via\": [...]}}"
+        if not isinstance(entry, dict) or set(entry) != {"via", "public_links"}:
+            return f"'hosts' entry {h!r} is not exactly {{\"via\": [...], \"public_links\": true|false}}"
+        if type(entry["public_links"]) is not bool:
+            return f"'hosts' entry {h!r}: 'public_links' is not true or false"
         via = entry["via"]
         if not isinstance(via, list):
             return f"'hosts' entry {h!r}: 'via' is not a list"
@@ -1684,7 +1686,14 @@ def _vpn_key_ok(text) -> bool:
     return len(raw) == 32 and base64.b64encode(raw).decode() == text
 
 
-def parse_vpn_doc(doc) -> dict:
+# Clock bounds (ruling M4), as wg's reader: a valid_until more than
+# 1 h 5 min ahead (the Hub writes now + 1 h) and a refreshed_at more than
+# 2 min in the future refuse the file.
+VPN_MAX_VALID_AHEAD = 3900
+VPN_MAX_CLOCK_SKEW = 120
+
+
+def parse_vpn_doc(doc, now: Optional[float] = None) -> dict:
     """The validated vpn.json v2 (contract §4), or ValueError: unknown or
     duplicate keys (the caller's json.loads uses _vpn_pairs), a version
     other than 2, overlapping ranges, duplicate addresses or keys, a device
@@ -1785,7 +1794,8 @@ def parse_vpn_doc(doc) -> dict:
                     raise ValueError(f"{w}.stale_after: not within 30 min after refreshed_at")
             elif refreshed is not None or stale_after is not None:
                 raise ValueError(f"{w}: a static provider carries no refreshed_at or stale_after")
-        providers[pid] = {"id": pid, "source": source, "nets": own, "stale": stale, "stale_after": stale_after}
+        providers[pid] = {"id": pid, "source": source, "nets": own, "stale": stale, "stale_after": stale_after,
+                          "refreshed_at": refreshed}
     if builtin is not None and VPN_BUILTIN not in providers:
         raise ValueError("builtin: a builtin section without a builtin provider")
     dlist = doc.get("devices", [])
@@ -1806,6 +1816,12 @@ def parse_vpn_doc(doc) -> dict:
         devices[str(a)] = {"ip": str(a), "provider": pid, "user": _vpn_str(d, "user", w, nonempty=True),
                            "device_id": _vpn_str(d, "device_id", w, nonempty=True),
                            "name": _vpn_str(d, "name", w), "expires": _vpn_time(d, "expires", w)}
+    now = time.time() if now is None else now
+    if valid_until > now + VPN_MAX_VALID_AHEAD:
+        raise ValueError("valid_until: more than 1h5m ahead")
+    for pid, p in providers.items():
+        if p.get("refreshed_at") is not None and p["refreshed_at"] > now + VPN_MAX_CLOCK_SKEW:
+            raise ValueError(f"providers[{pid}].refreshed_at: in the future (more than 2m)")
     return {"valid_until": valid_until, "providers": providers, "nets": nets, "devices": devices, "peers": peers}
 
 
@@ -1929,14 +1945,56 @@ def core_class(host: str, raw_uri: str) -> Optional[str]:
     return cls
 
 
+VPN_MODES = ("apps", "admin", "server")
+
+
+def vpn_mode_from_env(env) -> Tuple[str, bool]:
+    """(mode, public_enrol) from GATE_VPN_MODE (apps | admin | server,
+    unset = apps) and GATE_VPN_PUBLIC_ENROL (true | false, unset = true):
+    compose sets both from .env's PORTCULLIS_VPN_MODE / _PUBLIC_ENROL, the
+    same values the core routers' entrypoints follow. Anything else is
+    ValueError (group-gate refuses to start)."""
+    mode = env.get("GATE_VPN_MODE", "apps")
+    if mode not in VPN_MODES:
+        raise ValueError("GATE_VPN_MODE must be apps, admin or server")
+    pe = env.get("GATE_VPN_PUBLIC_ENROL", "true")
+    if pe not in ("true", "false"):
+        raise ValueError("GATE_VPN_PUBLIC_ENROL must be true or false")
+    return mode, pe == "true"
+
+
+# The core VPN mode is group-gate's own (I3 ruling): `./portcullis vpn mode`
+# recreates core with it, so `vpn mode apps` is a break-glass even with the
+# Hub down (its policy file may still say server). The policy's mode is
+# compared only, with a warning once per disagreement.
+try:
+    VPN_MODE, VPN_PUBLIC_ENROL = vpn_mode_from_env(os.environ)
+except ValueError as _e:
+    raise SystemExit(f"group-gate: {_e}") from None
+_VPN_MODE_WARNED: set = set()
+
+
+def _policy_mode(v: dict) -> str:
+    return "server" if v["server_mode"] else "admin" if v["admin_only"] else "apps"
+
+
 def _vpn_required(policy_doc: dict, host: str, kind: str, raw_uri: str) -> Optional[List[str]]:
-    """The `via` of a request that needs the binding, or None (internet)."""
+    """The `via` of a request that needs the binding, or None (internet).
+    Core hosts follow GATE_VPN_MODE (group-gate's env), never the policy."""
     v = policy_doc["vpn"]
     if kind == "core":
+        mode, pe = VPN_MODE, VPN_PUBLIC_ENROL
+        theirs = (_policy_mode(v), bool(v["public_enrol"]))
+        if theirs != (mode, pe) and theirs not in _VPN_MODE_WARNED:
+            _VPN_MODE_WARNED.add(theirs)
+            onoff = lambda b: "on" if b else "off"  # noqa: E731
+            print(f"group-gate: WARNING: the policy's VPN mode ({theirs[0]}, public enrolment {onoff(theirs[1])}) "
+                  f"differs from GATE_VPN_MODE ({mode}, public enrolment {onoff(pe)}): using GATE_VPN_MODE "
+                  "(./portcullis vpn mode sets it; the Hub catches up when it runs)", flush=True)
         cls = core_class(host, raw_uri)
-        on = ((cls == "admin" and (v["admin_only"] or v["server_mode"]))
-              or (cls == "core" and v["server_mode"])
-              or (cls == "enrol" and v["server_mode"] and not v["public_enrol"]))
+        on = ((cls == "admin" and mode in ("admin", "server"))
+              or (cls == "core" and mode == "server")
+              or (cls == "enrol" and mode == "server" and not pe))
         return ["*"] if on else None
     entry = v["hosts"].get(host)
     return list(entry["via"]) if entry is not None else None
@@ -3597,6 +3655,16 @@ class Handler(BaseHTTPRequestHandler):
             kind = host_kind(host, extra_domains(doc))
             if kind in ("main", "extra"):
                 reason = public_guard_check(doc, host, self.headers, raw_uri)
+                if not reason and not vpn_path:
+                    # M3 ruling: on websecure a VPN-only host's public paths
+                    # pass only when its policy entry opts in (public_links:
+                    # true), not on the Hub's router placement alone.
+                    try:
+                        entry = doc["vpn"]["hosts"].get(host)
+                        if entry is not None and entry.get("public_links") is not True:
+                            reason = "VPN: public links aren't published for this VPN-only host"
+                    except Exception as e:  # noqa: BLE001
+                        reason = f"vpn check failed ({type(e).__name__})"
                 if not reason and vpn_path:
                     # A VPN-only app host on vpnsecure: steps 1 and 2 only
                     # (V17: nobody is signed in on a public path, so no

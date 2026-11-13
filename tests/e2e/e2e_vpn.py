@@ -40,7 +40,11 @@ Cases, each `FAIL: <what>` on failure:
   server_mode               vpn mode server --force: on websecure only the public set
                             answers; vpn mode apps with wg stopped restores everything
 
-Environment: E2E_DOMAIN, HUB_IP, E2E_HUB_SECRET, E2E_ALICE_INVITE,
+  break_glass_hub_down      vpn mode admin, the Hub stopped (its policy still admin),
+                            vpn mode apps: carol (lldap_admin) reaches Keycloak's console
+                            on websecure; group-gate warns about the stale policy
+
+Environment: E2E_DOMAIN, HUB_IP, E2E_HUB_SECRET, E2E_CAROL_INVITE, E2E_ALICE_INVITE,
 E2E_BOB_INVITE, E2E_VPN_CLIENT (built), TS_IMG, PY_IMG, CURL_IMG, ALPINE,
 E2E_ARTIFACTS. Keys, configs and cookies live in a 0700 temp directory,
 never in artifacts or the log; setup links are masked; no Playwright traces.
@@ -415,7 +419,7 @@ def main() -> int:
 
         # ── sessions: alice and bob from their setup links ──
         sessions = {}
-        for who in ("alice", "bob"):
+        for who in ("alice", "bob", "carol"):
             def signs_in(who=who):
                 ctx = new_context()
                 page = ctx.new_page()
@@ -859,6 +863,39 @@ def main() -> int:
             sh("docker", "start", "portcullis-wg-1")
         check("server_mode: only the public set on websecure (headscale's control router, auth sign-in pages, enroll, "
               "people.<d>/vpn/), not keycloak-admin or hub; vpn mode apps with wg stopped restores them", server_mode)
+
+        def break_glass_hub_down():
+            # I3 ruling: group-gate's GATE_VPN_MODE (from .env) decides the
+            # core classes, so `vpn mode apps` restores the admin surfaces on
+            # websecure although the Hub is down and its policy still says admin.
+            needs("carol_cookie")
+            console = "/admin/master/console/"
+            rc, out = sh("./portcullis", "vpn", "mode", "admin", "--force", timeout=600)
+            assert rc == 0, f"vpn mode admin --force: {redact(out)[-500:]}"
+            until("Keycloak's console VPN-only on websecure", lambda: (lambda c, b: c == 403 and REQUIRED in b)(
+                *web(f"auth.{DOMAIN}", console, cookie_file=state["carol_cookie"])), 180)
+            pol = lambda: sh("docker", "run", "--rm", "-v", "portcullis_hub_data:/d:ro", os.environ["ALPINE"],  # noqa: E731
+                             "cat", "/d/group-gate-policy.json")[1]
+            until("the Hub's policy says admin", lambda: json.loads(pol()).get("vpn", {}).get("admin_only") is True, 120)
+            sh("docker", "stop", "portcullis-hub-1", timeout=120)
+            # The Hub stays down for the break-glass: an overlay puts it
+            # behind a profile nobody enables (a Hub that can't start).
+            nohub = secret_file("no-hub.yml", "services:\n  hub:\n    profiles: [ci-hub-down]\n")
+            env = dict(os.environ, COMPOSE_FILE=os.environ.get("COMPOSE_FILE", "docker-compose.yml") + ":" + nohub)
+            try:
+                p = subprocess.run(["./portcullis", "vpn", "mode", "apps"], env=env, capture_output=True, text=True, timeout=600)
+                assert p.returncode == 0, f"vpn mode apps with the Hub down: {redact(p.stdout + p.stderr)[-500:]}"
+                assert sh("docker", "inspect", "-f", "{{.State.Running}}", "portcullis-hub-1")[1].strip() != "true", "the Hub started"
+                assert json.loads(pol()).get("vpn", {}).get("admin_only") is True, "the policy changed without the Hub"
+                until("carol reaches Keycloak's console on websecure", lambda: web(
+                    f"auth.{DOMAIN}", console, cookie_file=state["carol_cookie"])[0] == 200, 180)
+                gg_log = sh("docker", "compose", "logs", "--since", "10m", "group-gate")[1]
+                assert "differs from GATE_VPN_MODE (apps" in gg_log, "group-gate didn't report the stale policy"
+            finally:
+                sh("./portcullis", "up", timeout=900)
+            until("hub.<d> back on websecure", lambda: web(f"hub.{DOMAIN}")[0] in (302, 303), 240)
+        check("break_glass_hub_down: vpn mode apps with the Hub down restores Keycloak's console on websecure "
+              "(group-gate follows GATE_VPN_MODE, not the stale policy)", break_glass_hub_down)
 
         for ctx, _, _ in sessions.values():
             ctx.close()

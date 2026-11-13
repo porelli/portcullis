@@ -290,7 +290,7 @@ func TestEdgeConcurrentClose(t *testing.T) {
 // valid_until (the Hub stopped republishing), every admitted connection
 // closes and a new one is rejected, although nothing else changed.
 func TestEdgeValidUntilClosesAndRejects(t *testing.T) {
-	doc := strings.Replace(docJSON("127.0.0.1", false), `"valid_until":"2099-01-01T00:00:00Z"`, `"valid_until":"2026-11-13T10:02:00Z"`, 1)
+	doc := strings.Replace(docJSON("127.0.0.1", false), `"valid_until":"2026-11-13T11:00:00Z"`, `"valid_until":"2026-11-13T10:02:00Z"`, 1)
 	f := newFixture(t, doc)
 	c, br := f.open("100.64.0.7:40000")
 	f.ping(c, br)

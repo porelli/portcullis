@@ -256,27 +256,27 @@ _rt_chk() { printf '%s\t%s\n' "$1" "$2"; }
 RT_POOL_LINE='default_subnet_pools = [{"base" = "10.89.0.0/16", "size" = 24}]'
 RT_PODMAN_POOLS="10.88.0.0/16 10.89.0.0/16"
 
-# _rt_pool_check — one host-check line: the operator's containers.conf
-# ([network], RT_CONTAINERS_CONF_DIR, default ~/.config/containers) sets
-# exactly RT_POOL_LINE, and no containers.conf.d drop-in sets another.
+# _rt_pool_check — one host-check line: where Podman really allocates
+# networks (M5 ruling). A probe network is created, its subnet read and
+# the network removed, so every config source counts ($CONTAINERS_CONF,
+# $CONTAINERS_CONF_OVERRIDE, /etc/containers/containers.conf, the
+# operator's file and drop-ins). Inside 10.89.0.0/16: ok. Outside (or no
+# probe possible): fail with the wg profile on (VPN wiring relies on the
+# reserved pools), warn with it off; the line to add is named either way.
 _rt_pool_check() {
-  local dir="${RT_CONTAINERS_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/containers}" want got f why=""
-  want="$(printf '%s' "$RT_POOL_LINE" | tr -d ' \t')"
-  got="$(awk '/^[[:space:]]*\[/ { sec = $0; gsub(/[[:space:]]/, "", sec); next }
-              sec == "[network]" && /^[[:space:]]*default_subnet_pools[[:space:]]*=/ { gsub(/[[:space:]]/, ""); print }' \
-         "$dir/containers.conf" 2>/dev/null | tail -n1)"
-  [ "$got" = "$want" ] || why="it isn't set to exactly this"
-  for f in "$dir"/containers.conf.d/*.conf; do
-    [ -f "$f" ] || continue
-    if grep -qE '^[[:space:]]*default_subnet_pools[[:space:]]*=' "$f"; then
-      why="$f overrides it: remove that line"
-    fi
-  done
-  if [ -z "$why" ]; then
-    _rt_chk ok "containers.conf: default_subnet_pools = 10.89.0.0/16 (/24 networks)"
-  else
-    _rt_chk fail "containers.conf: Podman's network pools aren't pinned ($why; they must stay in 10.89.0.0/16, reserved against VPN ranges): add under [network] in $dir/containers.conf: $RT_POOL_LINE"
+  local net="portcullis-pool-probe-$$" subnet="" why sev=warn
+  case ",${COMPOSE_PROFILES:-}," in *,wg,*) sev=fail ;; esac
+  if docker network create --label com.portcullis.pool-probe=1 "$net" >/dev/null 2>&1; then
+    subnet="$(docker network inspect --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$net" 2>/dev/null | awk '{print $1}')"
+    docker network rm "$net" >/dev/null 2>&1 || true
   fi
+  # Inside 10.89.0.0/16: a 10.89.x.y network of /16 or longer.
+  if [[ "$subnet" =~ ^10\.89\.[0-9]{1,3}\.[0-9]{1,3}/(1[6-9]|2[0-9]|3[0-2])$ ]]; then
+    _rt_chk ok "Podman networks come from 10.89.0.0/16 (a probe network got $subnet)"
+    return 0
+  fi
+  if [ -n "$subnet" ]; then why="a probe network got $subnet, outside 10.89.0.0/16"; else why="no probe network could be created"; fi
+  _rt_chk "$sev" "Podman's network pool isn't pinned ($why; VPN provider ranges are kept out of 10.88.0.0/16 and 10.89.0.0/16 only): add under [network] in ${CONTAINERS_CONF_OVERRIDE:-${XDG_CONFIG_HOME:-$HOME/.config}/containers/containers.conf}: $RT_POOL_LINE"
 }
 
 # runtime_host_checks — the host preparation for rootless Podman, one

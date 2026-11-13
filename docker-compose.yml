@@ -876,6 +876,12 @@ services:
       # 10007): the device ↔ person binding of VPN-only hosts. Missing or
       # invalid = every VPN-only request is denied.
       GATE_VPN_FILE: /vpn-doc/vpn.json
+      # The core VPN mode, authoritative for the core-host classes (I3
+      # ruling): the same .env values the core routers' entrypoints follow,
+      # so `./portcullis vpn mode apps` is a break-glass with the Hub down.
+      # The policy file's mode is only compared (a warning).
+      GATE_VPN_MODE: ${PORTCULLIS_VPN_MODE:-apps}
+      GATE_VPN_PUBLIC_ENROL: ${PORTCULLIS_VPN_PUBLIC_ENROL:-true}
       # Ranges no VPN provider may claim (plus Docker's default pools
       # 172.16.0.0/12 and 192.168.0.0/16, the link subnet 10.214.0.0/24 and,
       # under podman, Podman's pools 10.88.0.0/16 10.89.0.0/16 —

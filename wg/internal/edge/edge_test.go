@@ -20,7 +20,7 @@ var now0 = time.Date(2026, 11, 13, 10, 1, 0, 0, time.UTC)
 
 func mustDoc(t *testing.T, s string) *vpndoc.Doc {
 	t.Helper()
-	d, err := vpndoc.Parse([]byte(s))
+	d, err := vpndoc.ParseAt([]byte(s), now0) // the fixture's clock (valid_until 11:00)
 	if err != nil {
 		t.Fatalf("fixture: %v", err)
 	}
@@ -32,7 +32,7 @@ func docJSON(gateway string, stale bool) string {
 	if stale {
 		st = "true"
 	}
-	return `{"version":2,"valid_until":"2099-01-01T00:00:00Z",
+	return `{"version":2,"valid_until":"2026-11-13T11:00:00Z",
  "builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],
   "peers":[{"ip":"10.213.0.5","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d1","expires":null}]},
  "providers":[{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false},
@@ -238,7 +238,7 @@ func TestEdgeNoDocDeniesAll(t *testing.T) {
 		t.Fatalf("no_doc = %v", v)
 	}
 	// A parse error is the same nil doc: the caller keeps nothing.
-	if _, err := vpndoc.Parse([]byte(`{"version":2,"valid_until":"2099-01-01T00:00:00Z","bogus":1}`)); err == nil {
+	if _, err := vpndoc.Parse([]byte(`{"version":2,"valid_until":"2026-11-13T11:00:00Z","bogus":1}`)); err == nil {
 		t.Fatal("bogus doc parsed")
 	}
 }

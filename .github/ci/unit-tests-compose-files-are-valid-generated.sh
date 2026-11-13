@@ -522,6 +522,7 @@ vpn_rule() {  # <config json>
            and ($l["traefik.http.routers.people-vpn-enrol.priority"] | tonumber) > ($l["traefik.http.routers.people.rule"] | length))
       and $g.labels["traefik.http.middlewares.vpn-required-path.replacepath.path"] == "/vpn-required"
       and $g.environment.GATE_VPN_FILE == "/vpn-doc/vpn.json"
+      and $g.environment.GATE_VPN_MODE == "apps" and $g.environment.GATE_VPN_PUBLIC_ENROL == "true"
       and $g.environment.GATE_CORE_SUBNETS == $w.environment.WG_CORE_SUBNETS
       and ($g.environment.GATE_CORE_SUBNETS | split(" ") | map(select(. != "")) | sort) == ([.networks[] | .ipam.config[0].subnet? // empty] | sort)
       and $g.labels["traefik.http.middlewares.portcullis-groups-vpn.forwardauth.address"] == "http://group-gate:8080/auth/vpn"
@@ -557,6 +558,11 @@ for c in CFG_ALL CFG_PODMAN_ALL OV_ALL OV_PODMAN_ALL; do
   vpn_rule "${!c}" || { echo "FAIL: VPN wiring (wg userspace only and least privilege, vpnsecure PROXY trust on portcullis-vpn-edge, network members, vpn_doc / wg_data, people-vpn-enrol, entrypoint classes) in $c"; exit 1; }
 done
 echo "$CFG_PODMAN_ALL" | jq -e '.services.wg.restart == "always"' >/dev/null || { echo "FAIL: docker-compose.podman.yml must name wg"; exit 1; }
+# group-gate's VPN mode follows .env (I3 ruling: authoritative for the
+# core classes, so vpn mode apps is a break-glass with the Hub down).
+PORTCULLIS_VPN_MODE=server PORTCULLIS_VPN_PUBLIC_ENROL=false docker compose -f docker-compose.yml config --format json \
+  | jq -e '.services["group-gate"].environment | .GATE_VPN_MODE == "server" and .GATE_VPN_PUBLIC_ENROL == "false"' >/dev/null \
+  || { echo "FAIL: group-gate's GATE_VPN_MODE / GATE_VPN_PUBLIC_ENROL don't follow PORTCULLIS_VPN_MODE / _PUBLIC_ENROL"; exit 1; }
 # The Hub's reserved list (core.env PORTCULLIS_VPN_RESERVED_RANGES,
 # vpn_reserved_ranges) is exactly what wg and group-gate refuse: Docker's
 # default address pools 172.16.0.0/12 and 192.168.0.0/16, the link subnet

@@ -131,9 +131,25 @@ type BuiltinPeer struct {
 	DeviceID  string
 }
 
-// Parse decodes and validates a vpn.json document. Errors name JSON paths,
-// never values.
-func Parse(b []byte) (*Doc, error) {
+// Clock bounds (ruling M4): the Hub writes valid_until = now + 1 h, so a
+// valid_until further ahead than MaxValidAhead is refused (a Hub bug or a
+// skewed clock could otherwise keep a revoked device valid for years), and
+// so is a refreshed_at more than MaxClockSkew in the future (it would make
+// the 30-min stale window meaningless).
+const (
+	MaxValidAhead = time.Hour + 5*time.Minute
+	MaxClockSkew  = 2 * time.Minute
+)
+
+// Parse decodes and validates a vpn.json document against the current
+// time (ParseAt). Errors name JSON paths, never values.
+func Parse(b []byte) (*Doc, error) { return ParseAt(b, clock()) }
+
+// clock is Parse's time source (a test pins it).
+var clock = time.Now
+
+// ParseAt is Parse with the clock bounds checked against now.
+func ParseAt(b []byte, now time.Time) (*Doc, error) {
 	if len(b) > MaxSize {
 		return nil, errors.New("vpn.json: too large")
 	}
@@ -150,6 +166,14 @@ func Parse(b []byte) (*Doc, error) {
 	}
 	if err := d.validate(); err != nil {
 		return nil, fmt.Errorf("vpn.json: %w", err)
+	}
+	if d.ValidUntil.After(now.Add(MaxValidAhead)) {
+		return nil, fmt.Errorf("vpn.json: valid_until: more than %s ahead", MaxValidAhead)
+	}
+	for i := range d.Providers {
+		if r := d.Providers[i].RefreshedAt; r != nil && r.After(now.Add(MaxClockSkew)) {
+			return nil, fmt.Errorf("vpn.json: providers[%d].refreshed_at: in the future (more than %s)", i, MaxClockSkew)
+		}
 	}
 	return &d, nil
 }

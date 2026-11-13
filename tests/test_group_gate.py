@@ -3737,6 +3737,19 @@ class VpnTest(GateTest):
         super().setUp()
         write_vpn(vpn_doc())
         self.addCleanup(write_vpn, None)
+        self.addCleanup(self.set_mode, "apps", True)
+
+    def set_mode(self, mode, public_enrol=True):
+        """The core VPN mode as compose gives it (GATE_VPN_MODE /
+        GATE_VPN_PUBLIC_ENROL, from .env): authoritative for the core
+        classes, whatever the policy says (I3 ruling)."""
+        gg.VPN_MODE, gg.VPN_PUBLIC_ENROL = mode, public_enrol
+
+    def mode(self, mode, public_enrol=True, hosts=None, base=None):
+        """The env mode and a policy that agrees with it."""
+        self.set_mode(mode, public_enrol)
+        write_policy(dict(base or {}, **vpn_policy(hosts, server_mode=mode == "server", admin_only=mode == "admin",
+                                                  public_enrol=public_enrol)))
 
     def get(self, host, xff, user="bob", groups="users_app", uri="/", gate_path="/auth/vpn"):
         """(status, body, headers) of a forward-auth request from client
@@ -3769,7 +3782,7 @@ class VpnTest(GateTest):
                     raw = v["raw"]
                 now = gg._parse_rfc3339(v["now"])
                 try:
-                    doc = gg.parse_vpn_doc(json.loads(raw, object_pairs_hook=gg._vpn_pairs))
+                    doc = gg.parse_vpn_doc(json.loads(raw, object_pairs_hook=gg._vpn_pairs), now)
                 except ValueError:
                     doc = None
                 if v["want"] != "ok":
@@ -3818,13 +3831,17 @@ class VpnTest(GateTest):
 
     def test_vpn_unknown_key_denies(self):
         for vpn in ({**BASE["vpn"], "extra": 1}, {k: v for k, v in BASE["vpn"].items() if k != "public_enrol"},
-                    dict(BASE["vpn"], hosts={"app.example.com": {"via": ["*"], "x": 1}}),
-                    dict(BASE["vpn"], hosts={"app.example.com": {"via": "*"}}),
-                    dict(BASE["vpn"], hosts={"app.example.com": {"via": None}}),
-                    dict(BASE["vpn"], hosts={"App..example.com": {"via": ["*"]}}),
-                    dict(BASE["vpn"], hosts={"app.example.com": {"via": ["a"] * 9}}),
-                    dict(BASE["vpn"], hosts={"app.example.com": {"via": ["*", "builtin"]}}),
-                    dict(BASE["vpn"], hosts={"app.example.com": {"via": ["Bad Id"]}}),
+                    dict(BASE["vpn"], hosts={"app.example.com": {"via": ["*"], "x": 1, "public_links": False}}),
+                    dict(BASE["vpn"], hosts={"app.example.com": {"via": ["*"]}}),
+                    dict(BASE["vpn"], hosts={"app.example.com": {"via": ["*"], "public_links": "true"}}),
+                    dict(BASE["vpn"], hosts={"app.example.com": {"via": ["*"], "public_links": 1}}),
+                    dict(BASE["vpn"], hosts={"app.example.com": {"via": ["*"], "public_links": None}}),
+                    dict(BASE["vpn"], hosts={"app.example.com": {"via": "*", "public_links": False}}),
+                    dict(BASE["vpn"], hosts={"app.example.com": {"via": None, "public_links": False}}),
+                    dict(BASE["vpn"], hosts={"App..example.com": {"via": ["*"], "public_links": False}}),
+                    dict(BASE["vpn"], hosts={"app.example.com": {"via": ["a"] * 9, "public_links": False}}),
+                    dict(BASE["vpn"], hosts={"app.example.com": {"via": ["*", "builtin"], "public_links": False}}),
+                    dict(BASE["vpn"], hosts={"app.example.com": {"via": ["Bad Id"], "public_links": False}}),
                     dict(BASE["vpn"], server_mode="yes"), [], None):
             with self.subTest(vpn=vpn):
                 self.assertIsNotNone(gg.validate_vpn_section(vpn))
@@ -3841,7 +3858,7 @@ class VpnTest(GateTest):
     # ── the binding, one test each ──
 
     def vpn_only(self, via=("*",)):
-        write_policy(vpn_policy({"app.example.com": {"via": list(via)}}))
+        write_policy(vpn_policy({"app.example.com": {"via": list(via), "public_links": False}}))
 
     def assert_denied(self, xff, text, user="bob", host="app.example.com"):
         st, body, _ = self.get(host, xff, user=user)
@@ -3881,13 +3898,13 @@ class VpnTest(GateTest):
         # Contract: via [] is valid and names no provider: every address is
         # denied, the built-in's and a hook provider's alike. Only an
         # explicit ["*"] means any provider.
-        self.assertIsNone(gg.validate_vpn_section(dict(BASE["vpn"], hosts={"app.example.com": {"via": []}})))
+        self.assertIsNone(gg.validate_vpn_section(dict(BASE["vpn"], hosts={"app.example.com": {"via": [], "public_links": False}})))
         self.vpn_only(via=[])
         self.assert_denied("10.213.0.5", REQUIRED_TEXT)
         self.assert_denied("100.64.0.7", REQUIRED_TEXT)
         self.assertEqual(self.get("app.example.com", "203.0.113.9", gate_path="/auth")[0], 403)
         doc = gg.parse_vpn_doc(json.loads(json.dumps(vpn_doc()), object_pairs_hook=gg._vpn_pairs))
-        pol = dict(BASE, **vpn_policy({"app.example.com": {"via": []}}))
+        pol = dict(BASE, **vpn_policy({"app.example.com": {"via": [], "public_links": False}}))
         self.assertEqual(gg.vpn_check(pol, doc, "app.example.com", "main", "/", gg.ipaddress.IPv4Address("10.213.0.5"),
                                       "bob", time.time())[0], "vpn_via")
 
@@ -3903,7 +3920,7 @@ class VpnTest(GateTest):
         doc = gg.parse_vpn_doc(json.loads(json.dumps(vpn_doc(now=now, valid_for=30)), object_pairs_hook=gg._vpn_pairs))
         self.assertIsNotNone(gg.vpn_device(doc, "builtin", "10.213.0.5", now + 29))
         self.assertIsNone(gg.vpn_device(doc, "builtin", "10.213.0.5", now + 30))
-        pol = dict(BASE, **vpn_policy({"app.example.com": {"via": ["*"]}}))
+        pol = dict(BASE, **vpn_policy({"app.example.com": {"via": ["*"], "public_links": False}}))
         self.assertEqual(gg.vpn_check(pol, doc, "app.example.com", "main", "/", gg.ipaddress.IPv4Address("10.213.0.5"),
                                       "bob", now + 30)[0], "vpn_doc_expired")
         for bad in ({k: v for k, v in vpn_doc().items() if k != "valid_until"},
@@ -3961,7 +3978,7 @@ class VpnTest(GateTest):
         # Review Focus 4: the Hub is stopped, the file never changes.
         t = time.time()
         doc = gg.parse_vpn_doc(json.loads(json.dumps(vpn_doc(now=t, bob_expires=t + 60)), object_pairs_hook=gg._vpn_pairs))
-        policy = dict(BASE, **vpn_policy({"app.example.com": {"via": ["*"]}}))
+        policy = dict(BASE, **vpn_policy({"app.example.com": {"via": ["*"], "public_links": False}}))
         ip = gg.ipaddress.IPv4Address("10.213.0.5")
         self.assertIsNone(gg.vpn_check(policy, doc, "app.example.com", "main", "/", ip, "bob", t + 59))
         self.assertEqual(gg.vpn_check(policy, doc, "app.example.com", "main", "/", ip, "bob", t + 60)[0], "vpn_expired")
@@ -3974,7 +3991,7 @@ class VpnTest(GateTest):
         t = time.time()
         doc = gg.parse_vpn_doc(json.loads(json.dumps(vpn_doc(now=t)), object_pairs_hook=gg._vpn_pairs))
         A = gg.ipaddress.IPv4Address
-        pol = lambda via: dict(BASE, **vpn_policy({"app.example.com": {"via": via}}))
+        pol = lambda via: dict(BASE, **vpn_policy({"app.example.com": {"via": via, "public_links": False}}))
         check = lambda p, d, ip, user="bob": gg.vpn_check(p, d, "app.example.com", "main", "/", ip, user, t)
         self.assertEqual(check(pol(["*"]), None, A("10.213.0.5"))[0], "vpn_no_doc")
         self.assertEqual(check(pol(["*"]), doc, None)[0], "vpn_not_vpn")
@@ -4006,7 +4023,7 @@ class VpnTest(GateTest):
     # ── core-host classes ──
 
     def test_admin_only(self):
-        write_policy(vpn_policy(admin_only=True))
+        self.mode("admin")
         self.assertEqual(self.get("hub.example.com", "203.0.113.9", groups="lldap_admin")[0], 403)
         self.assertEqual(self.get("hub.example.com", "10.213.0.5", groups="lldap_admin")[0], 200)
         # Another person's device: the binding fails for core hosts too.
@@ -4018,7 +4035,7 @@ class VpnTest(GateTest):
         self.assertEqual(self.get("people.example.com", "203.0.113.9", groups="")[0], 200)
 
     def test_server_mode(self):
-        write_policy(vpn_policy(server_mode=True, public_enrol=True))
+        self.mode("server", True)
         self.assertEqual(self.get("people.example.com", "203.0.113.9", groups="", uri="/vpn/")[0], 200)
         self.assertEqual(self.get("people.example.com", "203.0.113.9", groups="", uri="/vpn/api/devices")[0], 200)
         for uri in ("/signin", "/", "/vpn", "/vpn/../signin", "/vpn/%2e%2e/signin", "/vpnx/"):
@@ -4035,9 +4052,47 @@ class VpnTest(GateTest):
         st, _, _ = self.get("example.com", "10.213.0.5", groups="lldap_admin", gate_path="/portal")
         self.assertEqual(st, 403)
         # public_enrol off: /vpn/ goes VPN-only too.
-        write_policy(vpn_policy(server_mode=True, public_enrol=False))
+        self.mode("server", False)
         self.assertEqual(self.get("people.example.com", "203.0.113.9", groups="", uri="/vpn/")[0], 403)
         self.assertEqual(self.get("people.example.com", "10.213.0.5", groups="", uri="/vpn/")[0], 200)
+
+    def test_env_mode_is_authoritative(self):
+        # I3 ruling: group-gate's own GATE_VPN_MODE (from .env) decides the
+        # core classes; the policy's mode is only compared, with a warning.
+        # So `./portcullis vpn mode apps` is a break-glass with the Hub down
+        # (its policy file still says server).
+        import contextlib
+        import io
+        self.set_mode("apps")
+        write_policy(vpn_policy(server_mode=True))
+        self.assertEqual(self.get("hub.example.com", "203.0.113.9", groups="lldap_admin", gate_path="/")[0], 200)
+        self.assertEqual(self.get("people.example.com", "203.0.113.9", groups="", gate_path="/")[0], 200)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            gg._VPN_MODE_WARNED.clear()
+            pol = dict(BASE, **vpn_policy(server_mode=True))
+            gg._vpn_required(pol, "hub.example.com", "core", "/")
+            gg._vpn_required(pol, "hub.example.com", "core", "/")
+        self.assertEqual(buf.getvalue().count("WARNING: the policy's VPN mode (server, public enrolment on) "
+                                              "differs from GATE_VPN_MODE (apps, public enrolment on)"), 1)
+        # The other way: the env is stricter than a stale policy.
+        self.set_mode("admin")
+        write_policy(vpn_policy())
+        self.assertEqual(self.get("hub.example.com", "203.0.113.9", groups="lldap_admin")[0], 403)
+        self.assertEqual(self.get("hub.example.com", "10.213.0.5", groups="lldap_admin")[0], 200)
+        self.set_mode("server", False)
+        self.assertEqual(self.get("people.example.com", "203.0.113.9", groups="", uri="/vpn/")[0], 403)
+
+    def test_env_mode_parsing(self):
+        for env, want in (({}, ("apps", True)), ({"GATE_VPN_MODE": "server", "GATE_VPN_PUBLIC_ENROL": "false"}, ("server", False)),
+                          ({"GATE_VPN_MODE": "admin", "GATE_VPN_PUBLIC_ENROL": "true"}, ("admin", True))):
+            with self.subTest(env=env):
+                self.assertEqual(gg.vpn_mode_from_env(env), want)
+        for env in ({"GATE_VPN_MODE": "everything"}, {"GATE_VPN_MODE": ""}, {"GATE_VPN_MODE": "Server"},
+                    {"GATE_VPN_PUBLIC_ENROL": "yes"}, {"GATE_VPN_PUBLIC_ENROL": ""}):
+            with self.subTest(env=env):
+                with self.assertRaises(ValueError):
+                    gg.vpn_mode_from_env(env)
 
     def test_normal_path_never_satisfies_a_binding(self):
         # Security ruling: X-Forwarded-For is whatever a websecure client
@@ -4058,8 +4113,8 @@ class VpnTest(GateTest):
         for p in ("/auth/vpn/", "/auth/vpnx", "/AUTH/VPN", "/auth/vpn/../vpn"):
             with self.subTest(path=p):
                 self.assertEqual(self.get("app.example.com", "10.213.0.5", gate_path=p)[0], 403)
-        # Core classes too: admin_only, hub from a bound device on the normal path.
-        write_policy(vpn_policy(admin_only=True))
+        # Core classes too: admin mode, hub from a bound device on the normal path.
+        self.mode("admin")
         self.assertEqual(self.get("hub.example.com", "10.213.0.5", groups="lldap_admin", gate_path="/")[0], 403)
         self.assertEqual(self.get("hub.example.com", "10.213.0.5", groups="lldap_admin")[0], 200)
         # A host that isn't VPN-only: the normal path ignores the address.
@@ -4078,12 +4133,12 @@ class VpnTest(GateTest):
         self.assertEqual([str(n) for n in gg.VPN_RESERVED[:3]], ["172.16.0.0/12", "192.168.0.0/16", "10.214.0.0/24"])
 
     def test_core_hosts_never_vpn_host_keys(self):
-        self.assertIsNotNone(gg.validate_vpn_section(dict(BASE["vpn"], hosts={"hub.example.com": {"via": ["*"]}})))
+        self.assertIsNotNone(gg.validate_vpn_section(dict(BASE["vpn"], hosts={"hub.example.com": {"via": ["*"], "public_links": False}})))
 
     # ── the public guard (V17: steps 1 and 2 only) ──
 
     def test_public_guard_vpn_steps_1_2(self):
-        write_policy(dict(PUBLIC_DOC, **vpn_policy({"cloud.example.com": {"via": ["*"]}})))
+        write_policy(dict(PUBLIC_DOC, **vpn_policy({"cloud.example.com": {"via": ["*"], "public_links": False}})))
         import http.client
 
         def guard(xff, path="/public-guard/vpn"):
@@ -4113,7 +4168,7 @@ class VpnTest(GateTest):
         # (portcullis-public-guard@docker) admits the host's published
         # public paths with no VPN check: public links are public by design.
         # Anything else on the host still needs the VPN (/auth/vpn).
-        write_policy(dict(PUBLIC_DOC, **vpn_policy({"cloud.example.com": {"via": ["*"]}}, server_mode=True)))
+        self.mode("server", hosts={"cloud.example.com": {"via": ["*"], "public_links": True}}, base=PUBLIC_DOC)
         import http.client
 
         def guard(uri, xff="203.0.113.9", path="/public-guard"):
@@ -4141,8 +4196,14 @@ class VpnTest(GateTest):
         # The rest of the host: the normal gate path denies, the VPN path binds.
         self.assertEqual(self.get("cloud.example.com", "203.0.113.9", uri="/index.php/apps/files", gate_path="/auth")[0], 403)
         self.assertEqual(self.get("cloud.example.com", "203.0.113.9", uri="/index.php/apps/files")[0], 403)
+        # M3 ruling: only a host whose policy entry says public_links: true
+        # gets its public paths on websecure (defence in depth on top of
+        # the Hub's router placement): false → denied, even a public path.
+        self.mode("server", hosts={"cloud.example.com": {"via": ["*"], "public_links": False}}, base=PUBLIC_DOC)
+        self.assertEqual(guard("/s/AbC123"), 403)
+        self.assertEqual(guard("/dist/app.js"), 403)
         # A VPN host without public_paths: the websecure guard still denies.
-        write_policy(dict(BASE, **vpn_policy({"app.example.com": {"via": ["*"]}}, server_mode=True)))
+        self.mode("server", hosts={"app.example.com": {"via": ["*"], "public_links": False}}, base=BASE)
         c_status = guard("/s/AbC123")
         self.assertEqual(c_status, 403)
 

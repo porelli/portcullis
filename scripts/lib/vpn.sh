@@ -388,6 +388,14 @@ EOF
 vpn_init() {
   local builtin="$1" port="$2" subnet="$3" info subnets conflicts suggestion warns
   info "Checking the Hub and the VPN subnet..."
+  # Rootless Podman: wiring needs Podman's pinned pool (reserved against
+  # provider ranges); with wg in the profile the host check would refuse
+  # the next up anyway, so refuse now, before anything is written.
+  if [ "${CONTAINER_RUNTIME:-docker}" = podman ]; then
+    local pool
+    pool="$(COMPOSE_PROFILES="$(_vpn_profiles_with_wg)" _rt_pool_check)"
+    case "$pool" in fail*) fail "${pool#fail$'\t'}" ;; esac
+  fi
   info="$(_vpn_hub_wait)" || exit 1  # _vpn_hub_wait printed why
   subnets="$(_vpn_docker_subnets)" || fail "could not list the Docker networks' subnets"
   if [ "$builtin" = on ]; then
