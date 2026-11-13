@@ -98,6 +98,14 @@ type Provider struct {
 	// same-name/type record: create; one (cloudflare) / the first
 	// (porkbun): update it in place; several: cloudflare errors.
 	SetMode string
+	// DeleteMode mimics real libdns providers' DeleteRecords: "" deletes
+	// exactly the matching records (libdns semantics); "porkbun"
+	// (libdns/porkbun v1.1.0, /dns/deleteByNameType) deletes EVERY record
+	// with the input's name and type, whatever its data; "hetzner"
+	// (libdns/hetzner v1.0.0, findRecordID) deletes the FIRST record with
+	// the input's name and type, from one listing taken at the start (the
+	// same record twice fails, as the API's 404 would).
+	DeleteMode string
 }
 
 // FindZone reports the zone the provider manages for fqdn (the service
@@ -221,7 +229,7 @@ func (p *Provider) SetRecords(_ context.Context, zone string, recs []libdns.Reco
 }
 
 // DeleteRecords removes matching records (empty type / TTL / data match
-// anything, as libdns specifies).
+// anything, as libdns specifies), or as DeleteMode says.
 func (p *Provider) DeleteRecords(_ context.Context, zone string, recs []libdns.Record) ([]libdns.Record, error) {
 	if err := p.auth("delete", recs); err != nil {
 		return nil, err
@@ -229,6 +237,60 @@ func (p *Provider) DeleteRecords(_ context.Context, zone string, recs []libdns.R
 	p.Zone.mu.Lock()
 	defer p.Zone.mu.Unlock()
 	var deleted []libdns.Record
+	switch p.DeleteMode {
+	case "porkbun":
+		for _, r := range recs {
+			want := r.RR()
+			n := abs(want.Name, zone)
+			var keep []libdns.RR
+			for _, old := range p.Zone.recs[n] {
+				if old.Type == want.Type {
+					continue
+				}
+				keep = append(keep, old)
+			}
+			p.Zone.recs[n] = keep
+			deleted = append(deleted, r)
+		}
+		return deleted, nil
+	case "hetzner":
+		type ref struct {
+			n string
+			i int
+		}
+		snap := map[string][]libdns.RR{}
+		for n, rrs := range p.Zone.recs {
+			snap[n] = append([]libdns.RR(nil), rrs...)
+		}
+		gone := map[ref]bool{}
+		for _, r := range recs {
+			want := r.RR()
+			n := abs(want.Name, zone)
+			idx := -1
+			for i, old := range snap[n] {
+				if old.Type == want.Type {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				return deleted, fmt.Errorf("record ID not found: %s", want.Name)
+			}
+			if gone[ref{n, idx}] {
+				return deleted, errors.New("Not Found (404)")
+			}
+			gone[ref{n, idx}] = true
+			victim := snap[n][idx]
+			for i, old := range p.Zone.recs[n] {
+				if old == victim {
+					p.Zone.recs[n] = append(p.Zone.recs[n][:i:i], p.Zone.recs[n][i+1:]...)
+					break
+				}
+			}
+			deleted = append(deleted, r)
+		}
+		return deleted, nil
+	}
 	for _, r := range recs {
 		want := r.RR()
 		n := abs(want.Name, zone)
@@ -243,6 +305,58 @@ func (p *Provider) DeleteRecords(_ context.Context, zone string, recs []libdns.R
 		p.Zone.recs[n] = keep
 	}
 	return deleted, nil
+}
+
+// IDRecord is a record with a provider record ID (ListIDs / DeleteID: the
+// record-ID API real providers have beside their libdns package). Name is
+// relative to the zone ("@" at the apex).
+type IDRecord struct {
+	ID string
+	RR libdns.RR
+}
+
+func recordID(name string, rr libdns.RR) string {
+	return fmt.Sprintf("%s|%s|%s|%d", name, rr.Type, rr.Data, rr.TTL/time.Second)
+}
+
+// ListIDs lists every record of the zone with its ID (op "get").
+func (p *Provider) ListIDs(_ context.Context, zone string) ([]IDRecord, error) {
+	if err := p.auth("get", nil); err != nil {
+		return nil, err
+	}
+	p.Zone.mu.Lock()
+	defer p.Zone.mu.Unlock()
+	suffix := strings.ToLower(strings.TrimSuffix(zone, "."))
+	var out []IDRecord
+	for name, rrs := range p.Zone.recs {
+		if name != suffix && !strings.HasSuffix(name, "."+suffix) {
+			continue
+		}
+		for _, rr := range rrs {
+			id := recordID(name, rr)
+			rr.Name = libdns.RelativeName(name+".", zone)
+			out = append(out, IDRecord{ID: id, RR: rr})
+		}
+	}
+	return out, nil
+}
+
+// DeleteID deletes one record by its ID (op "delete"); an unknown ID fails.
+func (p *Provider) DeleteID(_ context.Context, zone, id string) error {
+	if err := p.auth("delete", nil); err != nil {
+		return err
+	}
+	p.Zone.mu.Lock()
+	defer p.Zone.mu.Unlock()
+	for name, rrs := range p.Zone.recs {
+		for i, rr := range rrs {
+			if recordID(name, rr) == id {
+				p.Zone.recs[name] = append(rrs[:i:i], rrs[i+1:]...)
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("record %s not found", id)
 }
 
 func norm(name string) string { return strings.ToLower(strings.TrimSuffix(name, ".")) }

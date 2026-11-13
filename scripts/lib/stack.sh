@@ -520,7 +520,8 @@ Every step is idempotent, so init can be re-run after a failure.
 Options:
   --domain DOMAIN         base domain (default: $PORTCULLIS_DOMAIN or prompt)
   --email EMAIL           Let's Encrypt account email (default: admin@DOMAIN)
-  --dns-provider NAME     cloudflare|porkbun|route53|digitalocean|hetzner|none
+  --dns-provider NAME     cloudflare|porkbun|route53|digitalocean|hetzner|
+                          hetzner-cloud|none
                           or another lego provider name (default: cloudflare)
   --non-interactive       never prompt; DNS credentials must be in the
                           environment (e.g. CLOUDFLARE_API_TOKEN=...)

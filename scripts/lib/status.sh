@@ -35,6 +35,8 @@ _st_dns_json() {
     def bad: .severity == "warning" or .severity == "problem";
     def summary: {
       address_ok: ([.items[] | select(.set == "address" and .status != "foreign")] | all(.status == "ok")),
+      # Not ok only because the server addresses (or a lookup) are unknown.
+      address_unknown: ([.items[] | select(.set == "address" and .status != "foreign")] | (any(.status != "ok") and all(.status == "ok" or .status == "unknown"))),
       caa_ok: ([.items[] | select(.set == "caa" and .status != "foreign")] | all(.status == "ok")),
       would_issue: .caa.would_issue,
       dnssec: .dnssec.state,
@@ -47,23 +49,36 @@ _st_dns_json() {
         foreign: (if [.items[] | select(.status == "foreign") | select(bad)] | length > 0 then 0 else 1 end)}};
     (.main | summary) as $m
     # Lost account (F5): the CA would not issue to the pin, or the pin the
-    # service judges (main-domain.env) is not Traefik'"'"'s current account.
-    | ((($m.would_issue | not) and ((.main.caa.issuer // "") != "")) or ($t != "" and $e != $t)) as $lost
+    # service judges (main-domain.env) is another account than Traefik'"'"'s
+    # current one. No main-domain.env yet (Traefik registered after the
+    # last up) is not lost: _st_dns_lines warns.
+    | ((($m.would_issue | not) and ((.main.caa.issuer // "") != "")) or ($t != "" and $e != "" and $e != $t)) as $lost
     | {main: ($m + {name: .main.name, lost_account: $lost, problems: (if $lost then 1 else $m.problems end)}),
        domains: ((.domains // {}) | map_values(summary + {name: .name}))}'
 }
 
-# _st_dns_lines <dns-json> — the DNS block of `status`.
+# _st_dns_lines <dns-json> [<traefik-uri> <env-uri>] — the DNS block of
+# `status`.
 _st_dns_lines() {
-  local dns="$1" name addr caa wi sec foreign lost
+  local dns="$1" traefik_uri="${2:-}" env_uri="${3:-}" name addr addr_unknown caa wi sec foreign lost main=true
   printf '\n%sDNS%s\n' "$C_CYAN" "$C_NC"
   if [ -z "$dns" ]; then
     _st_line warn "DNS checks unavailable (the domains service isn't running)"
     return 0
   fi
-  while IFS=$'\t' read -r name addr caa wi sec foreign lost; do
+  while IFS=$'\t' read -r name addr addr_unknown caa wi sec foreign lost; do
     [ -n "$name" ] || continue
-    [ "$addr" = true ] && _st_line ok "$name: A/AAAA point at this server" || _st_line fail "$name: A/AAAA records wrong or missing (./portcullis dns plan)"
+    if [ "$addr" = true ]; then
+      _st_line ok "$name: A/AAAA point at this server"
+    elif [ "$addr_unknown" = true ]; then
+      _st_line warn "$name: A/AAAA can't be checked: the server's addresses (or a lookup) are unknown (./portcullis dns plan)"
+    else
+      _st_line fail "$name: A/AAAA records wrong or missing (./portcullis dns plan)"
+    fi
+    if [ "$main" = true ] && [ -n "$traefik_uri" ] && [ -z "$env_uri" ]; then
+      _st_line warn "$name: the domains service doesn't know Traefik's ACME account yet (secrets/domains/main-domain.env) — ./portcullis dns check records it"
+    fi
+    main=false
     if [ "$lost" = true ]; then
       _st_line fail "$name: CAA allows another ACME account than Traefik's — fix: ./portcullis dns setup"
     elif [ "$caa" = true ] && [ "$wi" = true ]; then
@@ -78,7 +93,7 @@ _st_dns_lines() {
       *) _st_line warn "$name: DNSSEC $sec (./portcullis dns plan)" ;;
     esac
     [ "$foreign" = 0 ] || _st_line warn "$name: $foreign record(s) under it aren't Portcullis' (./portcullis dns plan)"
-  done < <(printf '%s' "$dns" | jq -r '([.main] + [.domains[]])[] | [.name, .address_ok, .caa_ok, .would_issue, .dnssec, .foreign, (.lost_account // false)] | @tsv')
+  done < <(printf '%s' "$dns" | jq -r '([.main] + [.domains[]])[] | [.name, .address_ok, (.address_unknown // false), .caa_ok, .would_issue, .dnssec, .foreign, (.lost_account // false)] | @tsv')
 }
 
 status_run() {
@@ -183,7 +198,9 @@ status_run() {
   local dns_json traefik_uri=""
   dns_json="$(dns_status_json)"
   [ -z "$dns_json" ] || traefik_uri="$(dns_traefik_account_uri)" || traefik_uri=""
-  dns_json="$(_st_dns_json "$dns_json" "$traefik_uri" "$(dns_main_env_uri)")"
+  local env_uri
+  env_uri="$(dns_main_env_uri)"
+  dns_json="$(_st_dns_json "$dns_json" "$traefik_uri" "$env_uri")"
   if [ -n "$dns_json" ] && [ "$(printf '%s' "$dns_json" | jq '[.main.problems, (.domains[] | .problems)] | add')" != 0 ]; then
     problems=1
   fi
@@ -272,7 +289,7 @@ status_run() {
     esac
   done <<< "$shadows"
   [ -z "$mcp_refusing" ] || _st_line fail "mcp-gate: $mcp_refusing"
-  _st_dns_lines "$dns_json"
+  _st_dns_lines "$dns_json" "$traefik_uri" "$env_uri"
 
   printf '\n%sDomain: %s — run with --json for machine-readable output%s\n\n' "$C_DIM" "${PORTCULLIS_DOMAIN:-?}" "$C_NC"
   return "$problems"
@@ -306,7 +323,7 @@ status_textfile() {
     g("portcullis_dns_check"; "1 if the DNS check (address, caa, dnssec, foreign) of the name has no Warning or Problem (absent: DNS checks unavailable)."),
     (if .dns == null then empty else ([.dns.main] + [.dns.domains[]])[] | . as $d | ($d.checks | to_entries[] | "portcullis_dns_check{name=\"\($d.name | esc)\",check=\"\(.key)\"} \(.value)") end),
     g("portcullis_dnssec_state"; "1 for the current DNSSEC state of the name."),
-    (if .dns == null then empty else ([.dns.main] + [.dns.domains[]])[] | "portcullis_dnssec_state{name=\"\(.name | esc)\",state=\"\(.dnssec | esc)\"} 1" end)
+    (if .dns == null then empty else ([.dns.main] + [.dns.domains[]])[] | select((.dnssec // "") != "") | "portcullis_dnssec_state{name=\"\(.name | esc)\",state=\"\(.dnssec | esc)\"} 1" end)
   ' | metrics_textfile_write status
   return "$rc"
 }

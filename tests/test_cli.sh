@@ -55,6 +55,13 @@ expect_eq "no command prints help on stderr" "$ERR" "$HELP"
 run frobnicate; expect_eq "unknown command exits 2" "$RC" 2
 case "$ERR" in *"unknown command 'frobnicate'"*) t_pass "unknown command message" ;; *) t_fail "unknown command message: $ERR" ;; esac
 
+# init --help names every DNS provider `dns setup` supports (stack.sh DNS_PROVIDERS).
+run init --help
+INIT_PROVIDERS="$(printf '%s\n' "$OUT" | sed -n '/--dns-provider NAME/,/another lego provider/p' | tr -s ' |\n' '\n\n\n' | sort -u | paste -sd' ' -)"
+for p in $(sed -n 's/^DNS_PROVIDERS="\(.*\)"$/\1/p' "$HERE/../scripts/lib/stack.sh"); do
+  case " $INIT_PROVIDERS " in *" $p "*) t_pass "init --help lists the DNS provider $p" ;; *) t_fail "init --help misses the DNS provider $p" ;; esac
+done
+
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
 expect_eq "help lists 29 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 29

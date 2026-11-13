@@ -482,3 +482,23 @@ func TestPlanStepsReplace(t *testing.T) {
 		}
 	}
 }
+
+// TestNoServerAddressesUnknown (final review I1): without the server's
+// IPv4 (the main plan before any enrolment) every address item is
+// unknown / Warning — a published AAAA is not judged wrong.
+func TestNoServerAddressesUnknown(t *testing.T) {
+	e := newPlanEnv(t)
+	e.in.Provider = nil
+	e.in.Spec.IPv4 = netip.Addr{}
+	e.addr(pd, "203.0.113.10")
+	e.zone.Set(pd, append(e.zone.Records(pd), libdns.RR{Name: "portcullis", Type: "AAAA", Data: "2001:db8::10", TTL: TTLAddress})...)
+	its := items(Build(context.Background(), e.in), SetAddress)
+	if len(its) == 0 {
+		t.Fatal("no address items")
+	}
+	for _, it := range its {
+		if it.Status != StatusUnknown || it.Severity != SevWarning {
+			t.Errorf("%s %s: %s / %s", it.Name, it.Type, it.Status, it.Severity)
+		}
+	}
+}

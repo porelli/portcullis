@@ -1946,6 +1946,8 @@ RC=0
   export PORTCULLIS_ROOT="$CA_ROOT" PATH="$WORK/cabin:$PATH"
   # shellcheck source=../scripts/lib/config.sh
   source "$HERE/../scripts/lib/config.sh"
+  # shellcheck source=../scripts/lib/dns.sh
+  source "$HERE/../scripts/lib/dns.sh"
   config_apply
 ) >"$WORK/ca-out" 2>&1 || RC=$?
 expect_eq "config_apply with ACME_STAGING=true exits 0" "$RC" 0
@@ -2091,6 +2093,16 @@ done
 : > "$STUB_DIR/dt/traefik-uri"
 dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 DNS_ACCOUNT_URI=https://x.test/acct/1 dns_plan true' >/dev/null
 expect_eq "dns plan: a caller's DNS_ACCOUNT_URI wins" "$(dtin plan .caa.account_uri)" "https://x.test/acct/1"
+echo "https://acme-v02.api.letsencrypt.org/acme/acct/88" > "$STUB_DIR/dt/traefik-uri"
+rm -f "$PORTCULLIS_ROOT/secrets/domains/main-domain.env"
+OUT="$(dt 'dns_check true')"
+expect_eq "dns check records Traefik's account in main-domain.env" "$(cat "$PORTCULLIS_ROOT/secrets/domains/main-domain.env" 2>/dev/null)" "DOMAINS_MAIN_ACME_ACCOUNT_URI=https://acme-v02.api.letsencrypt.org/acme/acct/88"
+expect_eq "dns check --json: stdout is the plan alone" "$(printf '%s\n' "$OUT" | sed '$d' | grep -v '^==>' | jq -r .name 2>/dev/null)" "ci.example.org"
+expect_eq "dns check: domains not running = not started for the new file" "$(grep -c ' up -d domains$' "$STUB_DIR/dt/argv" || true)" 0
+rm -f "$PORTCULLIS_ROOT/secrets/domains/main-domain.env"
+dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 DNS_ACCOUNT_URI=https://x.test/acct/1 dns_plan true' >/dev/null
+expect_eq "dns plan: a caller's DNS_ACCOUNT_URI isn't recorded" "$(cat "$PORTCULLIS_ROOT/secrets/domains/main-domain.env" 2>/dev/null || echo none)" none
+: > "$STUB_DIR/dt/traefik-uri"
 rm -f "$STUB_DIR/dt/acme-volume"
 
 dt 'ACME_STAGING=true dns_check true' >/dev/null
@@ -2175,13 +2187,15 @@ RM="$(grep -n 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv" | cut -d: -f1)"
 expect_eq "config apply flip: relax runs before acme.json is removed" "$([ -n "$RL" ] && [ -n "$RM" ] && [ "$RL" -lt "$RM" ] && echo yes)" yes
 OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123')"
 expect_eq "config apply flip: relax applies caa CA-only" "$(dtin apply '[.sets, .caa.account_uri] | @json')" '[["caa"],""]'
+expect_eq "config apply flip: relax waits for the resolvers (2 min)" "$(grep -c 'dns-tool apply --wait 2m$' "$STUB_DIR/dt/argv")" 1
 echo 3 > "$STUB_DIR/dt/rc-apply"
 OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123')"
-case "$OUT" in *"issuance will fail on CAA until ./portcullis dns setup"*rc=0) t_pass "config apply flip: relax failure warns and goes on" ;; *) t_fail "relax failure: $OUT" ;; esac
+case "$OUT" in *"issuance may fail on CAA until then (./portcullis dns setup)"*rc=0) t_pass "config apply flip: relax failure warns and goes on" ;; *) t_fail "relax failure: $OUT" ;; esac
 expect_eq "config apply flip: acme.json still cleared after a failed relax" "$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv")" 1
 rm -f "$STUB_DIR/dt/rc-apply"
 OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 DNS_CAA=yes')"
 case "$OUT" in *"DNS_CAA=yes must be true or false"*rc=1) t_pass "config apply flip: DNS_CAA must be true or false" ;; *) t_fail "flip DNS_CAA=yes: $OUT" ;; esac
+expect_eq "config apply flip: a bad DNS_CAA refuses before Traefik is stopped" "$(cat "$STUB_DIR/dt/argv" 2>/dev/null | grep -c 'stop traefik' || true)" 0
 OUT="$(flip 'export DNS_PROVIDER=gcloud')"
 expect_eq "config apply flip: no relax for a manual provider" "$(grep -c dns-tool "$STUB_DIR/dt/argv" || true)" 0
 expect_eq "config apply: ACME_DNS_PROVIDER written" "$(grep '^ACME_DNS_PROVIDER=' "$FL_ROOT/.env")" "ACME_DNS_PROVIDER=gcloud"
@@ -2221,7 +2235,7 @@ jq -n '
   {main: plan("ci.example.org"; true; "unsigned"), domains: {"team-b.test": plan("team-b.test"; true; "bogus")}}' > "$DNSR"
 SD="$(dt "_st_dns_json \"\$(cat '$DNSR')\" https://acme/acct/1 https://acme/acct/1")"
 expect_eq "status --json: dns.main summary from a fixture report" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.main | del(.checks)')" \
-  '{"address_ok":true,"caa_ok":true,"would_issue":true,"dnssec":"unsigned","foreign":1,"problems":0,"name":"ci.example.org","lost_account":false}'
+  '{"address_ok":true,"address_unknown":false,"caa_ok":true,"would_issue":true,"dnssec":"unsigned","foreign":1,"problems":0,"name":"ci.example.org","lost_account":false}'
 expect_eq "status: dnssec bogus is a problem (enrolled domain)" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.domains["team-b.test"] | [.problems, .checks.dnssec, .checks.foreign]')" '[1,0,0]'
 SD="$(dt "_st_dns_json \"\$(jq '.main.caa.would_issue = false' '$DNSR')\" https://acme/acct/1 https://acme/acct/1")"
 expect_eq "status: CAA would_issue false is a problem (even with the URIs equal)" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.main | [.lost_account, .problems]')" '[true,1]'
@@ -2229,6 +2243,21 @@ SD="$(dt "_st_dns_json \"\$(cat '$DNSR')\" https://acme/acct/2 https://acme/acct
 expect_eq "status: stale main-domain.env URI is a problem" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.main | [.lost_account, .problems]')" '[true,1]'
 LINES="$(dt "_st_dns_lines \"\$(_st_dns_json \"\$(cat '$DNSR')\" https://acme/acct/2 https://acme/acct/1)\"")"
 case "$LINES" in *"CAA allows another ACME account than Traefik's — fix: ./portcullis dns setup"*"team-b.test: DNSSEC bogus"*) t_pass "status: the lost-account line and the DNSSEC line" ;; *) t_fail "status lines: $LINES" ;; esac
+# I3: no main-domain.env yet (Traefik registered after the last up) is a
+# warning, not a lost account.
+SD="$(dt "_st_dns_json \"\$(cat '$DNSR')\" https://acme/acct/1 ''")"
+expect_eq "status: missing main-domain.env is not a lost account" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.main | [.lost_account, .problems]')" '[false,0]'
+LINES="$(dt "_st_dns_lines \"\$(_st_dns_json \"\$(cat '$DNSR')\" https://acme/acct/1 '')\" https://acme/acct/1 ''")"
+case "$LINES" in *"! ci.example.org: the domains service doesn't know Traefik's ACME account yet"*) t_pass "status: missing main-domain.env warns" ;; *) t_fail "status missing env: $LINES" ;; esac
+case "$LINES" in *"CAA allows another ACME account"*|*"team-b.test: the domains service doesn't know"*) t_fail "status missing env: lost / per-domain line: $LINES" ;; *) t_pass "status: missing main-domain.env — no lost-account line, main domain only" ;; esac
+# I1: address items unknown (no server addresses) = a warning line, not ✗.
+jq '.main.items = [.main.items[] | if .set == "address" and .status == "ok" then .status = "unknown" | .severity = "warning" | .want = [] else . end]
+    + [{set: "address", name: "ci.example.org", type: "AAAA", want: [], live: ["2001:db8::10"], status: "unknown", severity: "warning", fix: "none", steps: []}]' "$DNSR" > "$WORK/dns-report-unknown.json"
+SD="$(dt "_st_dns_json \"\$(cat '$WORK/dns-report-unknown.json')\" https://acme/acct/1 https://acme/acct/1")"
+expect_eq "status: unknown addresses — address_ok false, address_unknown true, no problem" "$(printf '%s\n' "$SD" | head -n1 | jq -c '.main | [.address_ok, .address_unknown, .problems]')" '[false,true,0]'
+LINES="$(dt "_st_dns_lines \"\$(_st_dns_json \"\$(cat '$WORK/dns-report-unknown.json')\" https://acme/acct/1 https://acme/acct/1)\"")"
+case "$LINES" in *"! ci.example.org: A/AAAA can't be checked"*) t_pass "status: unknown addresses warn" ;; *) t_fail "status unknown addresses: $LINES" ;; esac
+case "$LINES" in *"ci.example.org: A/AAAA records wrong"*) t_fail "status unknown addresses: a ✗ line: $LINES" ;; *) t_pass "status: unknown addresses — no ✗ line" ;; esac
 LINES="$(dt '_st_dns_lines ""')"
 case "$LINES" in *"DNS checks unavailable"*) t_pass "status: DNS checks unavailable without the report" ;; *) t_fail "status unavailable: $LINES" ;; esac
 expect_eq "status: no report = no dns block" "$(dt '_st_dns_json "" "" ""')" "rc=0"
@@ -2239,6 +2268,9 @@ expect_eq "textfile: portcullis_dns_check lines" "$(printf '%s\n' "$STF" | grep 
   'portcullis_dns_check{name="ci.example.org",check="address"} 1|portcullis_dns_check{name="ci.example.org",check="caa"} 1|portcullis_dns_check{name="ci.example.org",check="dnssec"} 1|portcullis_dns_check{name="ci.example.org",check="foreign"} 0|portcullis_dns_check{name="team-b.test",check="address"} 1|portcullis_dns_check{name="team-b.test",check="caa"} 1|portcullis_dns_check{name="team-b.test",check="dnssec"} 0|portcullis_dns_check{name="team-b.test",check="foreign"} 0'
 expect_eq "textfile: portcullis_dnssec_state lines" "$(printf '%s\n' "$STF" | grep '^portcullis_dnssec_state{' | paste -sd'|' -)" \
   'portcullis_dnssec_state{name="ci.example.org",state="unsigned"} 1|portcullis_dnssec_state{name="team-b.test",state="bogus"} 1'
+jq --argjson d "$STF_DNS" -n '{ok: true, services: [], vault: {active: true}, dns: ($d | .main.dnssec = "")}' > "$STUB_DIR/stf.json"
+expect_eq "textfile: no portcullis_dnssec_state for an empty state" "$(stf | grep '^portcullis_dnssec_state{' | paste -sd'|' -)" \
+  'portcullis_dnssec_state{name="team-b.test",state="bogus"} 1'
 jq -n '{ok: true, services: [], vault: {active: true}, dns: null}' > "$STUB_DIR/stf.json"
 expect_eq "textfile: no dns series without the report" "$(stf | grep -c '^portcullis_dns' || true)" 0
 # status --json carries the block (status_run with the report stubbed).

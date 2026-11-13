@@ -414,6 +414,7 @@ jobs:
               and (($t.volumes // []) == []) and ($t.environment == null) and ($t.env_file == null)
               and $t.read_only == true and $t.user == "10004:10004"
               and $t.entrypoint == ["domains", "dns"] and ($t.ports // []) == []
+              and $t.healthcheck.disable == true
               and ([$t.labels // {} | keys[] | select(startswith("traefik."))] == [])
               and ([.services | to_entries[] | select((.value.networks // {}) | has("domains-egress")) | .key] | sort == ["dns-tool", "domains"])' >/dev/null \
             || { echo "FAIL: dns-tool wiring (contract §12.1: egress only, no volumes / env, credentials on stdin)"; exit 1; }

@@ -1154,6 +1154,10 @@ services:
     user: "10004:10004"
     entrypoint: ["domains", "dns"]
     stdin_open: true
+    # The image's HEALTHCHECK (domains healthcheck → :8080) is the
+    # service's; a one-shot run serves nothing.
+    healthcheck:
+      disable: true
     networks: [domains-egress]
     mem_limit: 128m
     pids_limit: 64

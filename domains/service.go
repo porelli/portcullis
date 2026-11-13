@@ -88,6 +88,8 @@ type Service struct {
 	// plans caches the last plan per domain name (mainPlanKey: the main
 	// domain), guarded by mu; built outside mu.
 	plans map[string]cachedPlan
+	// mainBuilding: the worker's main-plan rebuild is running (guarded by mu).
+	mainBuilding bool
 
 	acmeMu      sync.Mutex // serialises ACME account registration
 	lastDropped string     // last logged list of dropped certificates (guarded by mu)
@@ -508,6 +510,7 @@ func (s *Service) Run(ctx context.Context) {
 	defer t.Stop()
 	for {
 		s.dispatch(ctx)
+		s.refreshMainPlan(ctx)
 		select {
 		case <-ctx.Done():
 			s.wg.Wait()
@@ -978,6 +981,39 @@ func (s *Service) plan(ctx context.Context, name string, refresh bool) (dnsplan.
 	return pl, nil
 }
 
+// refreshMainPlan rebuilds the main domain's plan in the background when
+// there is none or it is RecheckEvery old (as enrolled domains' plans are
+// rebuilt by their records check), so every reader sees a fresh plan.
+func (s *Service) refreshMainPlan(ctx context.Context) {
+	s.mu.Lock()
+	c, ok := s.plans[mainPlanKey]
+	if s.mainBuilding || (ok && s.cfg.Now().Sub(c.at) < s.cfg.RecheckEvery) {
+		s.mu.Unlock()
+		return
+	}
+	s.mainBuilding = true
+	s.mu.Unlock()
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				s.logf("main domain plan: panic recovered: %v", r)
+			}
+			s.mu.Lock()
+			s.mainBuilding = false
+			s.mu.Unlock()
+		}()
+		pctx, cancel := context.WithTimeout(ctx, planTimeout)
+		defer cancel()
+		if pl := s.buildMainPlan(pctx); ctx.Err() == nil {
+			s.mu.Lock()
+			s.plans[mainPlanKey] = cachedPlan{plan: pl, at: s.cfg.Now()}
+			s.mu.Unlock()
+		}
+	}()
+}
+
 // mainPlan is the main domain's read-only plan (no credentials: public
 // checks only, pinned to Traefik's account URI from main-domain.env).
 func (s *Service) mainPlan(ctx context.Context, refresh bool) dnsplan.Plan {
@@ -987,13 +1023,18 @@ func (s *Service) mainPlan(ctx context.Context, refresh bool) dnsplan.Plan {
 		return pl
 	}
 	s.mu.Unlock()
-	sp := dnsplan.Spec{Name: s.cfg.MainDomain, IPv4: s.cfg.IPv4, IPv6: s.cfg.IPv6, CAA: s.cfg.CAA, Issuer: s.cfg.CAAIssuer,
-		AccountURI: s.cfg.MainAccountURI, IODEF: s.cfg.CAAIODEF, Main: true}
-	pl := s.finishPlan(dnsplan.Build(ctx, dnsplan.Input{Spec: sp, Resolvers: s.cfg.Resolvers, Now: s.cfg.Now()}))
+	pl := s.buildMainPlan(ctx)
 	s.mu.Lock()
 	s.plans[mainPlanKey] = cachedPlan{plan: pl, at: s.cfg.Now()}
 	s.mu.Unlock()
 	return pl
+}
+
+// buildMainPlan builds the main domain's read-only plan (no cache).
+func (s *Service) buildMainPlan(ctx context.Context) dnsplan.Plan {
+	sp := dnsplan.Spec{Name: s.cfg.MainDomain, IPv4: s.cfg.IPv4, IPv6: s.cfg.IPv6, CAA: s.cfg.CAA, Issuer: s.cfg.CAAIssuer,
+		AccountURI: s.cfg.MainAccountURI, IODEF: s.cfg.CAAIODEF, Main: true}
+	return s.finishPlan(dnsplan.Build(ctx, dnsplan.Input{Spec: sp, Resolvers: s.cfg.Resolvers, Now: s.cfg.Now()}))
 }
 
 // finishPlan drops the nomail recommendation for a name that sends the

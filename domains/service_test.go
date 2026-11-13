@@ -1886,3 +1886,27 @@ func TestCAAOffDropsGoneRefs(t *testing.T) {
 func recordsWrite(op string, recs []libdns.Record) bool {
 	return op == "append" && len(recs) > 0 && recs[0].RR().Type != "TXT"
 }
+
+// TestMainPlanRefreshedByWorker (final review I2): the worker builds the
+// main domain's plan itself and rebuilds it every RecheckEvery, so a
+// reader without ?refresh=1 (domains report, status, the Hub) never gets
+// a plan older than that.
+func TestMainPlanRefreshedByWorker(t *testing.T) {
+	e := newEnv(t, false)
+	cached := func() (time.Time, bool) {
+		e.svc.mu.Lock()
+		defer e.svc.mu.Unlock()
+		c, ok := e.svc.plans[mainPlanKey]
+		return c.plan.CheckedAt, ok
+	}
+	e.waitFor("the worker's first main plan", 10*time.Second, func() bool { _, ok := cached(); return ok })
+	first, _ := cached()
+	if got := e.planOf("/main/dns").CheckedAt; !got.Equal(first) {
+		t.Fatalf("GET /main/dns checked_at %v, want the worker's %v", got, first)
+	}
+	e.clock.advance(e.svc.cfg.RecheckEvery + time.Second)
+	e.waitFor("a rebuilt main plan", 10*time.Second, func() bool { at, _ := cached(); return at.After(first) })
+	if got := e.planOf("/main/dns").CheckedAt; !got.After(first) {
+		t.Fatalf("GET /main/dns still answers the old plan (%v)", got)
+	}
+}

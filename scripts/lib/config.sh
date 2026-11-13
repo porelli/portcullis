@@ -59,6 +59,10 @@ config_apply() {
   if [ "${DNS_PROVIDER:-}" = hetzner-cloud ] && [ -n "${HETZNER_API_KEY:-}" ]; then
     fail "DNS_PROVIDER=hetzner-cloud uses HETZNER_API_TOKEN, but HETZNER_API_KEY (the legacy DNS API) is set too: remove it"
   fi
+  # Strict DNS_CAA (a typo must not switch CAA off), checked before
+  # anything changes: the flip below stops Traefik.
+  local caa
+  caa="$(_dns_flag DNS_CAA true)" || exit 1
   staging="$(_bool "$(env_get ACME_STAGING)" false)"
   echo "  ACME_STAGING=$staging"
 
@@ -78,8 +82,6 @@ config_apply() {
     # The new account Traefik registers can't order while the CAA is
     # pinned to the old one: back to CA-only first (dns_tighten_main pins
     # the new account after `up`).
-    local caa
-    caa="$(_dns_flag DNS_CAA true)" || exit 1
     if [ "$caa" = true ] && _dns_automated "${DNS_PROVIDER:-none}"; then
       dns_relax_main
     fi

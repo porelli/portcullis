@@ -131,6 +131,10 @@ _dns_prepare() {
       DNS_TRAEFIK_UNREADABLE=1
       warn "Traefik's ACME account couldn't be read (its volume exists): the plan shows the CA-only pin, and dns setup leaves the live CAA alone"
     fi
+    # Record what was read (Traefik may have registered after the last
+    # up): the service's main plan and status judge against it. Stdout
+    # stays the plan's (--json).
+    [ -z "$DNS_ACCOUNT_URI" ] || dns_main_env_write "$DNS_ACCOUNT_URI" if-running >&2 || true
   fi
   export DNS_ACCOUNT_URI
 }
@@ -215,7 +219,9 @@ dns_setup() {
   printf '%s' "$out" | _dns_render
   if [ "$yes" != true ]; then
     [ -t 0 ] || fail "non-interactive: pass --yes"
-    read -rp "Apply these changes? [y/N] " reply
+    local q="Apply these changes?"
+    [ "$dnssec" != true ] || q="Apply these changes and turn on DNSSEC signing for the whole zone ($provider)?"
+    read -rp "$q [y/N] " reply
     case "$reply" in y|Y|yes|YES) ;; *) info "Nothing changed."; return 0 ;; esac
   fi
   info "Applying the record sets: $DNS_SETS (waiting up to 5 minutes for the public resolvers)..."
@@ -241,11 +247,12 @@ dns_setup() {
 
 # ── lifecycle: the main domain's CAA pin follows Traefik's account ──
 
-# dns_main_env_write <uri> — secrets/domains/main-domain.env (0600,
-# DOMAINS_MAIN_ACME_ACCOUNT_URI): the pin the domains service's read-only
-# main-domain plan judges against. A change recreates domains.
+# dns_main_env_write <uri> [if-running] — secrets/domains/main-domain.env
+# (0600, DOMAINS_MAIN_ACME_ACCOUNT_URI): the pin the domains service's
+# read-only main-domain plan judges against. A change recreates domains
+# (if-running: only when it runs — dns plan / check never start the stack).
 dns_main_env_write() {
-  local uri="$1" f d new
+  local uri="$1" when="${2:-always}" f d new
   _dns_uri_ok "$uri" || { warn "not writing main-domain.env: '$uri' is not an ACME account URI"; return 1; }
   d="$(_domains_dir)"
   f="$d/main-domain.env"
@@ -255,6 +262,9 @@ dns_main_env_write() {
   (umask 077; printf '%s\n' "$new" > "$f.tmp") && mv -f "$f.tmp" "$f" && chmod 600 "$f" \
     || { rm -f "$f.tmp"; warn "could not write $f"; return 1; }
   info "Traefik's ACME account: $uri (secrets/domains/main-domain.env)"
+  if [ "$when" = if-running ] && [ -z "$(dc ps -q --status running domains 2>/dev/null)" ]; then
+    return 0
+  fi
   dc up -d domains >/dev/null 2>&1 || warn "could not restart the domains service to read main-domain.env"
   return 0
 }
@@ -314,12 +324,13 @@ dns_tighten_main() {
 
 # dns_relax_main — before `config apply` clears acme.json (an
 # ACME_STAGING flip): the main domain's CAA back to CA-only, so the new
-# account Traefik registers can order. Only warns.
+# account Traefik registers can order; waits up to 2 min for the public
+# resolvers (Traefik orders as soon as it restarts). Only warns.
 dns_relax_main() {
   info "Relaxing the CAA of ${PORTCULLIS_DOMAIN:-the domain} to CA-only (Traefik registers a new ACME account)..."
   if ! (DNS_ACCOUNT_URI="" DNS_SETS=caa DNS_IPS_DONE=1 DNS_IPV4="${PORTCULLIS_PUBLIC_IPV4:-}" DNS_IPV6="${PORTCULLIS_PUBLIC_IPV6:-}" \
-      _dns_tool apply >/dev/null); then
-    warn "could not relax the CAA: issuance will fail on CAA until ./portcullis dns setup"
+      _dns_tool apply --wait 2m >/dev/null); then
+    warn "could not relax the CAA, or the public resolvers don't show it yet (they may cache the old pin for up to 5 minutes): issuance may fail on CAA until then (./portcullis dns setup)"
   fi
   return 0
 }

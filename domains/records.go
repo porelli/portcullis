@@ -72,7 +72,9 @@ var providers = map[string]providerSpec{
 		return &cloudflare.Provider{APIToken: c["api_token"], HTTPClient: &http.Client{Timeout: providerTimeout}}, nil
 	}, dnssec: newCloudflareDNSSEC},
 	"porkbun": {required: []string{"api_key", "secret_api_key"}, build: func(c map[string]string) (dnsProvider, error) {
-		return &porkbun.Provider{APIKey: c["api_key"], APISecretKey: c["secret_api_key"]}, nil
+		// Deletes by record ID (provider_byid.go): the library deletes by name and type.
+		return newByIDDelete(&porkbun.Provider{APIKey: c["api_key"], APISecretKey: c["secret_api_key"]},
+			newPorkbunAPI(c["api_key"], c["secret_api_key"])), nil
 	}},
 	"route53": {required: []string{"access_key_id", "secret_access_key"}, optional: []string{"hosted_zone_id"}, build: func(c map[string]string) (dnsProvider, error) {
 		// Route 53 is global; the region only selects the API endpoint.
@@ -94,7 +96,8 @@ var providers = map[string]providerSpec{
 	// hetzner: the legacy DNS API (dns.hetzner.com); hetzner-cloud: DNS in
 	// the Hetzner Cloud API (libdns/hetzner/v2, a Cloud API token).
 	"hetzner": {required: []string{"api_token"}, build: func(c map[string]string) (dnsProvider, error) {
-		return hetzner.New(c["api_token"]), nil
+		// Deletes by record ID (provider_byid.go): the library deletes the first name/type match.
+		return newByIDDelete(hetzner.New(c["api_token"]), newHetznerAPI(c["api_token"])), nil
 	}},
 	"hetzner-cloud": {required: []string{"api_token"}, build: func(c map[string]string) (dnsProvider, error) {
 		return hetznercloud.New(c["api_token"]), nil
@@ -400,7 +403,8 @@ func deleteRecords(ctx context.Context, p dnsProvider, zone string, refs []Recor
 	recs := make([]libdns.Record, 0, len(refs))
 	for _, r := range refs {
 		// TTL 0 matches any (sets have different TTLs); the data is exact,
-		// so other CAs' CAA entries at the name stay.
+		// so other CAs' CAA entries at the name stay (every provider's
+		// DeleteRecords matches data; porkbun / hetzner through byIDDelete).
 		rr := libdns.RR{Name: r.Name, Type: r.Type, Data: r.Value}
 		if parsed, err := rr.Parse(); err == nil {
 			recs = append(recs, parsed)

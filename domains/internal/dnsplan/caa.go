@@ -149,7 +149,7 @@ func removalCAA(live []libdns.CAA, s Spec) []libdns.CAA {
 			continue
 		}
 		for _, r := range s.Owned {
-			if r.Type == "CAA" && dataKey("CAA", r.Value) == dataKey("CAA", c.RR().Data) {
+			if r.Type == "CAA" && DataKey("CAA", r.Value) == DataKey("CAA", c.RR().Data) {
 				out = append(out, c)
 				break
 			}

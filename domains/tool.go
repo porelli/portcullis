@@ -159,10 +159,6 @@ func runDNSTool(args []string, e toolEnv) int {
 		} else if sub == "apply" {
 			return fail(exitFailure, err)
 		}
-	} else {
-		// check (or a plan without a provider): the provider only names the
-		// DNSSEC guidance; nothing is read from it. v1 signer: cloudflare.
-		base.CanSign = in.Provider == "cloudflare"
 	}
 	build := func(in2 dnsplan.Input) dnsplan.Plan {
 		in2.Now = time.Now()

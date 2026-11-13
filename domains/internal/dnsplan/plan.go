@@ -451,9 +451,14 @@ func addressItems(ctx context.Context, in Input, d string, fix Fix, cnameAt func
 			if t.ip.IsValid() {
 				it.Want = []string{t.ip.String()}
 			}
-			if t.typ == "A" && !s.IPv4.IsValid() {
+			// Without the IPv4 the server's addresses are unknown (the
+			// service gets none until a domain is enrolled): A and AAAA
+			// alike can't be judged — an IPv6 published by hand isn't
+			// "wrong" just because the service doesn't know it.
+			if !s.IPv4.IsValid() {
+				it.Want = []string{}
 				it.Status, it.Severity, it.Fix = StatusUnknown, SevWarning, FixNone
-				it.Steps = []string{"the server's public IPv4 is unknown (./portcullis up detects it, or set PORTCULLIS_PUBLIC_IPV4 in .env)"}
+				it.Steps = []string{"the server's public addresses are unknown (./portcullis up detects them once a domain is enrolled, or set PORTCULLIS_PUBLIC_IPV4 / _IPV6 in .env)"}
 				out = append(out, it)
 				continue
 			}
@@ -818,9 +823,9 @@ func rel(r libdns.Record, zone string) libdns.Record {
 	return rr
 }
 
-// dataKey normalises record data for comparison (providers format it
+// DataKey normalises record data for comparison (providers format it
 // differently: case, trailing dots, quoting): the parsed fields.
-func dataKey(typ, data string) string {
+func DataKey(typ, data string) string {
 	r, err := libdns.RR{Type: typ, Data: data}.Parse()
 	if err != nil {
 		return typ + " " + strings.TrimSpace(data)
@@ -845,18 +850,20 @@ func dataKey(typ, data string) string {
 // v1.1.0) update one same-name/type record per input record instead of
 // replacing the RRset, so a multi-value set would overwrite itself. The
 // missing entries are appended FIRST and the stale ones deleted by exact
-// data afterwards: there is never a moment without the new entries (a
-// CAA pin never disappears in between). Returns the deleted records.
+// data afterwards (the provider must delete by data: porkbun v1.1.0 and
+// hetzner v1.0.0 come wrapped, domains/provider_byid.go): there is never
+// a moment without the new entries (a CAA pin never disappears in
+// between). Returns the deleted records.
 func syncSet(ctx context.Context, p Provider, zone, name, typ string, want []libdns.Record, live []liveRec) ([]libdns.Record, error) {
 	have := pick(live, name, typ)
 	haveKeys := map[string]bool{}
 	for _, rr := range have {
-		haveKeys[dataKey(typ, rr.Data)] = true
+		haveKeys[DataKey(typ, rr.Data)] = true
 	}
 	wantKeys := map[string]bool{}
 	var add []libdns.Record
 	for _, w := range want {
-		k := dataKey(typ, w.RR().Data)
+		k := DataKey(typ, w.RR().Data)
 		wantKeys[k] = true
 		if !haveKeys[k] {
 			add = append(add, rel(w, zone))
@@ -869,7 +876,7 @@ func syncSet(ctx context.Context, p Provider, zone, name, typ string, want []lib
 	}
 	var stale []libdns.Record
 	for _, rr := range have {
-		if !wantKeys[dataKey(typ, rr.Data)] {
+		if !wantKeys[DataKey(typ, rr.Data)] {
 			rr.Name = libdns.RelativeName(dns.Fqdn(name), zone)
 			stale = append(stale, parsedRR(rr))
 		}
@@ -966,7 +973,7 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 					}
 					found := false
 					for _, c := range cur {
-						if dataKey("CAA", c.RR().Data) == dataKey("CAA", r.Value) {
+						if DataKey("CAA", c.RR().Data) == DataKey("CAA", r.Value) {
 							found = true
 						}
 					}
