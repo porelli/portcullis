@@ -421,9 +421,14 @@ func serve(ctx context.Context, cfg *config) error {
 		if role != nil {
 			role.SetDoc(d, err)
 		}
+		// Admitted connections are re-checked against every reload (and
+		// every 2 s by e.Run): a revoked, expired or stale device, or no
+		// document at all, closes them.
+		e.Revalidate()
 	}
 	w := &vpndoc.Watcher{Path: cfg.VPNFile, Every: 2 * time.Second}
 	go w.Run(ctx, onDoc)
+	go e.Run(ctx, 2*time.Second)
 
 	if role != nil {
 		go role.Run(ctx, time.Second)

@@ -14,10 +14,10 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"io"
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -52,9 +52,64 @@ type Edge struct {
 	HeaderTimeout time.Duration
 	// DialTimeout bounds the connection to Traefik (default 5 s).
 	DialTimeout time.Duration
+	// MaxLifetime closes a connection this long after it was admitted
+	// (default 12 h, Keycloak's maximum session: no sign-in it carries
+	// outlives that anyway; long enough for WebSockets and big downloads).
+	MaxLifetime time.Duration
+	// IdleTimeout closes a connection with no byte either way for this
+	// long (default 1 h; WebSocket apps ping well within it).
+	IdleTimeout time.Duration
 
 	rejected *prometheus.CounterVec
 	accepted *prometheus.CounterVec
+	closed   *prometheus.CounterVec
+
+	mu       sync.Mutex
+	sessions map[*session]struct{}
+}
+
+// Close reasons of admitted connections (wg_edge_closed_total).
+const (
+	ClosedNoDoc         = "no_doc"
+	ClosedOutsideRanges = "outside_ranges"
+	ClosedStale         = "stale"
+	ClosedRevoked       = "revoked"
+	ClosedLifetime      = "lifetime"
+	ClosedIdle          = "idle"
+)
+
+// CloseReasons lists every close reason.
+var CloseReasons = []string{ClosedNoDoc, ClosedOutsideRanges, ClosedStale, ClosedRevoked, ClosedLifetime, ClosedIdle}
+
+// Defaults for the session limits.
+const (
+	DefaultMaxLifetime = 12 * time.Hour
+	DefaultIdleTimeout = time.Hour
+)
+
+// session is one admitted, spliced connection and the facts it was
+// admitted on. close is its single owner of both conns.
+type session struct {
+	provider string
+	client   netip.Addr
+	deviceID string
+	user     string
+	started  time.Time
+	last     atomic.Int64 // unix ns of the last byte either way
+
+	a, b net.Conn
+	once sync.Once
+}
+
+// close closes both conns once; true for the call that did it.
+func (s *session) close() bool {
+	did := false
+	s.once.Do(func() {
+		did = true
+		s.a.Close()
+		s.b.Close()
+	})
+	return did
 }
 
 // New makes an edge that forwards to traefik (vpnsecure) from local (wg's
@@ -64,6 +119,13 @@ func New(traefik netip.AddrPort, local netip.Addr, doc func() *vpndoc.Doc, now f
 		traefik: traefik, local: local, doc: doc, now: now,
 		HeaderTimeout: 5 * time.Second,
 		DialTimeout:   5 * time.Second,
+		MaxLifetime:   DefaultMaxLifetime,
+		IdleTimeout:   DefaultIdleTimeout,
+		sessions:      map[*session]struct{}{},
+		closed: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wg_edge_closed_total",
+			Help: "Admitted connections the edge closed on a re-check, by provider and reason.",
+		}, []string{"provider", "reason"}),
 		rejected: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "wg_edge_rejected_total",
 			Help: "Connections the edge closed, by provider and reason.",
@@ -77,7 +139,7 @@ func New(traefik netip.AddrPort, local netip.Addr, doc func() *vpndoc.Doc, now f
 
 // Collectors are the edge's metrics.
 func (e *Edge) Collectors() []prometheus.Collector {
-	return []prometheus.Collector{e.rejected, e.accepted}
+	return []prometheus.Collector{e.rejected, e.accepted, e.closed}
 }
 
 func (e *Edge) reject(c net.Conn, provider, reason string) {
@@ -197,7 +259,8 @@ func (e *Edge) forward(c net.Conn, d *vpndoc.Doc, providerID string, client neti
 		e.reject(c, providerID, Stale)
 		return
 	}
-	if d.Device(providerID, client.Addr(), now) == nil {
+	dev := d.Device(providerID, client.Addr(), now)
+	if dev == nil {
 		e.reject(c, providerID, NotInMap)
 		return
 	}
@@ -216,8 +279,123 @@ func (e *Edge) forward(c net.Conn, d *vpndoc.Doc, providerID string, client neti
 		c.Close()
 		return
 	}
+	s := &session{provider: providerID, client: client.Addr(), deviceID: dev.DeviceID, user: dev.User, started: now, a: c, b: up}
+	s.last.Store(now.UnixNano())
+	e.mu.Lock()
+	e.sessions[s] = struct{}{}
+	e.mu.Unlock()
 	e.accepted.WithLabelValues(providerID).Inc()
-	Splice(c, up)
+	e.splice(s)
+	e.mu.Lock()
+	delete(e.sessions, s)
+	e.mu.Unlock()
+}
+
+// recheck is the admission check again, for an admitted session: the
+// same document rules (provider present and owning the address, fresh,
+// the device still there, unexpired, with the same id and owner), plus
+// the lifetime and idle limits. "" = keep.
+func (e *Edge) recheck(s *session, d *vpndoc.Doc, now time.Time) string {
+	if d == nil {
+		return ClosedNoDoc
+	}
+	p := d.ProviderByID(s.provider)
+	if p == nil || d.ProviderOf(s.client) != p {
+		return ClosedOutsideRanges
+	}
+	if !p.Fresh(now) {
+		return ClosedStale
+	}
+	dev := d.Device(s.provider, s.client, now)
+	if dev == nil || dev.DeviceID != s.deviceID || dev.User != s.user {
+		return ClosedRevoked
+	}
+	if e.MaxLifetime > 0 && now.Sub(s.started) >= e.MaxLifetime {
+		return ClosedLifetime
+	}
+	if e.IdleTimeout > 0 && now.Sub(time.Unix(0, s.last.Load())) >= e.IdleTimeout {
+		return ClosedIdle
+	}
+	return ""
+}
+
+// Revalidate re-runs the admission checks on every admitted connection
+// against the current document and clock, closing the ones that fail
+// (all of them when the document is unavailable). Called on every
+// vpn.json reload and by Run.
+func (e *Edge) Revalidate() {
+	d := e.doc()
+	now := e.now()
+	type victim struct {
+		s      *session
+		reason string
+	}
+	var vs []victim
+	e.mu.Lock()
+	for s := range e.sessions {
+		if r := e.recheck(s, d, now); r != "" {
+			vs = append(vs, victim{s, r})
+		}
+	}
+	e.mu.Unlock()
+	for _, v := range vs {
+		if v.s.close() {
+			e.closed.WithLabelValues(v.s.provider, v.reason).Inc()
+		}
+	}
+}
+
+// Run revalidates every interval until ctx ends.
+func (e *Edge) Run(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			e.Revalidate()
+		}
+	}
+}
+
+// Sessions is the number of admitted connections open now.
+func (e *Edge) Sessions() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return len(e.sessions)
+}
+
+// splice copies both ways with half-close, recording activity; the
+// session's close (here or from Revalidate) is the only one.
+func (e *Edge) splice(s *session) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	cp := func(dst, src net.Conn) {
+		defer wg.Done()
+		buf := make([]byte, 32<<10)
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				s.last.Store(e.now().UnixNano())
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
+		} else {
+			s.close()
+		}
+	}
+	go cp(s.a, s.b)
+	go cp(s.b, s.a)
+	wg.Wait()
+	s.close()
 }
 
 // bufConn reads what the header reader already buffered first.
@@ -233,24 +411,4 @@ func (b *bufConn) CloseWrite() error {
 		return cw.CloseWrite()
 	}
 	return b.Conn.Close()
-}
-
-// Splice copies both ways with half-close and closes both when done.
-func Splice(a, b net.Conn) {
-	var wg sync.WaitGroup
-	wg.Add(2)
-	cp := func(dst, src net.Conn) {
-		defer wg.Done()
-		io.Copy(dst, src)
-		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
-			cw.CloseWrite()
-		} else {
-			dst.Close()
-		}
-	}
-	go cp(a, b)
-	go cp(b, a)
-	wg.Wait()
-	a.Close()
-	b.Close()
 }
