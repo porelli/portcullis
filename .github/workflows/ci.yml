@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       jobs:
-        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai"
+        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman"
         type: string
         default: all
 
@@ -211,8 +211,23 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_e2e_fsops.py
       - name: compose files are valid with a generated .env
         run: |
-          ./portcullis init --env-only --non-interactive --domain ci.example.org --dns-provider none
+          ./portcullis init --env-only --runtime docker --non-interactive --domain ci.example.org --dns-provider none
           docker compose -f docker-compose.yml config -q
+          docker compose -f docker-compose.yml -f docker-compose.podman-selinux.yml --profile '*' config -q
+          # Healthchecks that behave the same on Podman (its compat API
+          # re-splits CMD arguments on whitespace).
+          tests/lint_healthchecks.sh .env
+          # The podman overlay: restart: always (what podman-restart.service
+          # starts at boot) on exactly the core services that have a restart
+          # policy, nothing else; Docker keeps unless-stopped.
+          docker compose -f docker-compose.yml -f docker-compose.podman.yml --profile '*' config -q
+          WANT_RS="$(docker compose -f docker-compose.yml --profile '*' config --format json | jq -c '[.services | to_entries[] | select(.value.restart != null) | .key] | sort')"
+          GOT_RS="$(yq -o=json '.services' docker-compose.podman.yml | jq -c '[to_entries[] | select(.value == {"restart": "always"}) | .key] | sort')"
+          ALL_RS="$(yq -o=json '.services' docker-compose.podman.yml | jq -c 'keys | sort')"
+          [ "$WANT_RS" = "$GOT_RS" ] && [ "$GOT_RS" = "$ALL_RS" ] \
+            || { echo "FAIL: docker-compose.podman.yml must set only restart: always on every core service with a restart policy (want $WANT_RS, got $GOT_RS / $ALL_RS)"; exit 1; }
+          docker compose -f docker-compose.yml --profile '*' config --format json | jq -e '[.services[] | select(.restart != null) | .restart] | unique == ["unless-stopped"]' >/dev/null \
+            || { echo "FAIL: Docker's restart policy is unless-stopped everywhere"; exit 1; }
           docker compose -f docker-compose.yml --profile monitoring config -q
           docker compose -f docker-compose.yml --profile '*' config -q
           docker compose -f docker-compose.yml -f docker-compose.apps.yml config -q
@@ -234,9 +249,81 @@ jobs:
           CFG="$(docker compose -f docker-compose.yml config --format json)"
           # Every profile (monitoring, ...): same pin + hardening rules.
           CFG_ALL="$(docker compose -f docker-compose.yml --profile '*' config --format json)"
-          # Contract §6: only the socket proxies mount the Docker socket.
-          echo "$CFG" | jq -e '[.services | to_entries[] | select([.value.volumes[]?.source] | index("/var/run/docker.sock")) | .key] | sort == ["socket-proxy-hub", "socket-proxy-traefik"]' >/dev/null \
-            || { echo "FAIL: a service other than the socket proxies mounts docker.sock"; exit 1; }
+          # Contract §6: only the socket proxies mount the engine socket —
+          # rootful Docker's, or the operator's rootless Podman socket
+          # (PORTCULLIS_ENGINE_SOCKET) — read-only at /var/run/docker.sock;
+          # the Hub gets the runtime as HUB_CONTAINER_RUNTIME.
+          socket_rule() {  # <config json> <runtime>
+            printf '%s' "$1" | jq -e --arg rt "$2" '(env.PORTCULLIS_ENGINE_SOCKET // "/var/run/docker.sock") as $src
+                | ([.services | to_entries[] | select([.value.volumes[]?.source] | index($src)) | .key] | sort == ["socket-proxy-hub", "socket-proxy-traefik"])
+                and ([.services["socket-proxy-traefik", "socket-proxy-hub"].volumes[] | select(.source == $src) | "\(.target):\(.read_only)"] == ["/var/run/docker.sock:true", "/var/run/docker.sock:true"])
+                and ([.services[].volumes[]? | select(.source == "/var/run/docker.sock" or .target == "/var/run/docker.sock")] | length == 2)
+                and .services.hub.environment.HUB_CONTAINER_RUNTIME == $rt' >/dev/null
+          }
+          socket_rule "$CFG" docker || { echo "FAIL: the engine socket (docker): only the two proxies, read-only; HUB_CONTAINER_RUNTIME=docker"; exit 1; }
+          export PODMAN_SOCK=/run/user/1001/podman/podman.sock
+          CFG_PODMAN="$(CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET="$PODMAN_SOCK" docker compose -f docker-compose.yml config --format json)"
+          PORTCULLIS_ENGINE_SOCKET="$PODMAN_SOCK" socket_rule "$CFG_PODMAN" podman \
+            || { echo "FAIL: the engine socket (podman): only the two proxies mount $PODMAN_SOCK read-only; HUB_CONTAINER_RUNTIME=podman"; exit 1; }
+          # No default runtime (P0): compose refuses an empty CONTAINER_RUNTIME.
+          if CONTAINER_RUNTIME='' docker compose -f docker-compose.yml config -q 2>/dev/null; then
+            echo "FAIL: compose accepted an empty CONTAINER_RUNTIME"; exit 1
+          fi
+          # Core stays userspace (VPN cross-reference): no NET_ADMIN / SYS_ADMIN.
+          CAPS="$(echo "$CFG_ALL" | jq -r '.services | to_entries[] | select((.value.cap_add // []) | any(. == "NET_ADMIN" or . == "SYS_ADMIN")) | .key')"
+          [ -z "$CAPS" ] || { echo "FAIL: core services with NET_ADMIN / SYS_ADMIN: $CAPS"; exit 1; }
+          # The rootless Podman SELinux overlay (P10 + the controller's
+          # narrowing): every project bind (source inside the checkout)
+          # re-declared with the base's target / read_only and a label — Z
+          # when one service mounts the path, z only when several services
+          # mount it or a path above / below it (or templates/ / appfiles/,
+          # which the Hub's app instances mount) —; never a label on the
+          # checkout, secrets/, backups/ or .env (or a parent of them): the
+          # Hub's `.:/project` becomes a tmpfs with group-gate's map bound in;
+          # nothing outside the checkout relabelled (never the engine socket);
+          # no service the base lacks; label=disable on the two proxies only
+          # (compose services; the CLI's short-lived helpers — ct_run, restic —
+          # run label=disable under Podman instead of relabelling host files)
+          # (each keeping no-new-privileges); the base itself relabels nothing.
+          OV_ALL="$(docker compose -f docker-compose.yml -f docker-compose.podman-selinux.yml --profile '*' config --format json)"
+          binds() {  # <config json> — "service target read_only selinux" of every project bind
+            printf '%s' "$1" | jq -r --arg p "$PWD" '.services | to_entries[] | .key as $s | (.value.volumes // [])[]
+                | select(.type == "bind" and (.source == $p or (.source | startswith($p + "/"))))
+                | "\($s) \(.target) \(.read_only // false) \(.bind.selinux // "-")"' | sort
+          }
+          [ -z "$(binds "$CFG_ALL" | awk '$4 != "-"')" ] || { echo "FAIL: docker-compose.yml relabels a bind (selinux): only the overlay may"; exit 1; }
+          NBINDS="$(binds "$CFG_ALL" | wc -l | tr -d ' ')"
+          [ "$NBINDS" = 45 ] || { echo "FAIL: expected 45 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
+          diff <({ binds "$CFG_ALL" | grep -vx 'hub /project true -' | awk '{print $1, $2, $3}'; echo "hub /project/group-gate/group-gate-map.conf true"; } | sort) \
+               <(binds "$OV_ALL" | awk '{print $1, $2, $3}' | sort) \
+            || { echo "FAIL: docker-compose.podman-selinux.yml must re-declare every project bind (but the Hub's /project root) with the same target / read_only, plus the Hub's map file"; exit 1; }
+          echo "$OV_ALL" | jq -e '[.services.hub.volumes[] | select(.target == "/project") | .type] == ["tmpfs"]' >/dev/null \
+            || { echo "FAIL: the overlay must turn the Hub's /project root into a tmpfs (never relabel the checkout)"; exit 1; }
+          BADLABEL="$(echo "$OV_ALL" | jq -r --arg p "$PWD" '
+              def inside($a; $b): $a == $b or ($a | startswith($b + "/"));
+              [.services | to_entries[] | .key as $s | (.value.volumes // [])[] | select(.type == "bind") | {s: $s, src: .source, lab: (.bind.selinux // null)}] as $all
+              | ($all | map(select(.lab != null))) as $lab
+              | ($lab[] | select(inside(.src; $p) | not) | "\(.s) \(.src): a label outside the checkout"),
+                ($lab[] | select(.src as $x | ([$p, $p + "/secrets", $p + "/backups", $p + "/.env"] | any(inside(.; $x)))) | "\(.s) \(.src): never label the checkout, secrets/, backups/ or .env (or a parent)"),
+                ($lab[] | . as $b
+                  | ([$all[] | select(.s != $b.s and (inside(.src; $b.src) or inside($b.src; .src)))] | length > 0
+                     or inside($b.src; $p + "/templates") or inside($b.src; $p + "/appfiles")) as $shared
+                  | select(($shared and .lab != "z") or (($shared | not) and .lab != "Z"))
+                  | "\(.s) \(.src): \(.lab), want \(if $shared then "z (shared)" else "Z (one service)" end)"),
+                ([.services[].volumes[]? | select(.target == "/var/run/docker.sock") | .bind.selinux // empty][] | "the engine socket is relabelled")')"
+          [ -z "$BADLABEL" ] || { echo "FAIL: SELinux labels in docker-compose.podman-selinux.yml:"; echo "$BADLABEL"; exit 1; }
+          EXTRA="$(comm -23 <(yq -r '.services | keys | .[]' docker-compose.podman-selinux.yml | sort) <(docker compose -f docker-compose.yml --profile '*' config --services | sort))"
+          [ -z "$EXTRA" ] || { echo "FAIL: docker-compose.podman-selinux.yml names services docker-compose.yml lacks: $EXTRA"; exit 1; }
+          if ! echo "$OV_ALL" | jq -e '([.services | to_entries[] | select((.value.security_opt // []) | index("label=disable")) | .key] | sort == ["socket-proxy-hub", "socket-proxy-traefik"])
+                 and ([.services["socket-proxy-traefik", "socket-proxy-hub"].security_opt | index("no-new-privileges:true")] | all(. != null))' >/dev/null \
+             || ! echo "$CFG_ALL" | jq -e '[.services[].security_opt[]? | select(startswith("label"))] == []' >/dev/null; then
+            echo "FAIL: label=disable must be on exactly the two socket proxies, only in the overlay, next to no-new-privileges"; exit 1
+          fi
+          # The hardening baseline holds with the overlay merged too.
+          WEAK="$(echo "$OV_ALL" | jq -r '.services | to_entries[]
+              | select((.value.security_opt // [] | index("no-new-privileges:true") | not) or ((.value.cap_drop // []) != ["ALL"])
+                       or (.value.mem_limit == null) or (.value.pids_limit == null)) | .key')"
+          [ -z "$WEAK" ] || { echo "FAIL: with the SELinux overlay, services without no-new-privileges/cap_drop ALL/limits: $WEAK"; exit 1; }
           echo "$CFG" | jq -e '.services.traefik.environment.TRAEFIK_PROVIDERS_DOCKER_ENDPOINT == "tcp://socket-proxy-traefik:2375"
               and .services.hub.environment.DOCKER_HOST == "tcp://socket-proxy-hub:2375"
               and .services["socket-proxy-traefik"].environment.POST == "0"
@@ -482,7 +569,7 @@ jobs:
           echo "$CFG" | jq -e '.services.sessions as $s | .services["forward-auth"] as $m | .services["forward-auth-ext"] as $x
               | def members($n): [.services | to_entries[] | select((.value.networks // {}) | has($n)) | .key] | sort;
               def mounts($src): [.services | to_entries[] | select([.value.volumes[]? | .source // "" | select(test($src))] | length > 0) | .key] | sort;
-              ($s.image | test("^valkey/valkey:[0-9]+\\.[0-9]+\\.[0-9]+(-alpine[0-9.]*)?@sha256:[0-9a-f]{64}$"))
+              ($s.image | test("^docker.io/valkey/valkey:[0-9]+\\.[0-9]+\\.[0-9]+(-alpine[0-9.]*)?@sha256:[0-9a-f]{64}$"))
               and $s.user == "999:1000" and $s.read_only == true
               and $s.cap_drop == ["ALL"] and ($s.security_opt | index("no-new-privileges:true")) != null
               and $s.mem_limit != null and $s.pids_limit != null
@@ -584,9 +671,15 @@ jobs:
             if grep -E '^FROM ' "$df" | grep -v '@sha256:'; then echo "UNPINNED base image in $df"; bad=1; fi
           done
           # One Go builder (tag and digest) for every locally built Go service.
-          if [ "$(grep -hE '^FROM golang:' enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile | awk '{print $2}' | sort -u | wc -l | tr -d ' ')" != 1 ]; then
-            echo "The Go Dockerfiles pin different golang builders:"; grep -nE '^FROM golang:' enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile; bad=1
+          if [ "$(grep -hE '^FROM docker.io/library/golang:' enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile | awk '{print $2}' | sort -u | wc -l | tr -d ' ')" != 1 ]; then
+            echo "The Go Dockerfiles pin different golang builders:"; grep -nE '^FROM docker.io/library/golang:' enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile; bad=1
           fi
+          # Fully qualified registry names (docker.io/library/…, docker.io/<org>/…):
+          # podman build / pull never depend on registries.conf short-name
+          # resolution (rootless Podman). Local images (portcullis-*) and the
+          # HUB_IMAGE / KEYCLOAK_IMAGE defaults are exempt.
+          UNQ="$(tests/lint_images.sh)" || true
+          [ -z "$UNQ" ] || { echo "UNQUALIFIED image names (use docker.io/library/… or <registry>/…):"; echo "$UNQ"; bad=1; }
           # group-gate's Python deps: exact pins with hashes, installed with --require-hashes.
           grep -q -- '--require-hashes' group-gate/Dockerfile || { echo "group-gate/Dockerfile installs without --require-hashes"; bad=1; }
           if grep -vE '^\s*(#|$|--hash=sha256:[0-9a-f]{64})' group-gate/requirements.txt | grep -vE '^[A-Za-z0-9._-]+==[^ ]+( ;.*)? \\$'; then
@@ -743,7 +836,7 @@ jobs:
 
       - name: Generate .env (portcullis init --env-only)
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           test "$(stat -c %a .env)" = 600 || { echo "FAIL: .env is not 0600"; exit 1; }
           # Make the generated values available to the test steps below.
@@ -1804,7 +1897,12 @@ jobs:
           done
           [ "$(tp --post-data='{}' --header 'Content-Type: application/json' http://socket-proxy-traefik:2375/containers/create)" = 403 ] \
             || { echo "FAIL: traefik proxy allowed a POST"; exit 1; }
-          echo "PASS: socket-proxy-traefik is read-only and minimal"
+          # The libpod API (rootless Podman's native API: play kube, generate,
+          # ...) and /build never pass either proxy (contract §6).
+          for denied in /libpod/info /libpod/play/kube /v5.0.0/libpod/containers/json /build; do
+            [ "$(tp "http://socket-proxy-traefik:2375$denied")" = 403 ] || { echo "FAIL: traefik proxy allowed $denied"; exit 1; }
+          done
+          echo "PASS: socket-proxy-traefik is read-only and minimal (libpod and /build denied)"
 
           # Hub's proxy: run real `docker compose` through it, like the Hub does.
           docker compose up -d socket-proxy-hub
@@ -1837,7 +1935,17 @@ jobs:
             # shellcheck disable=SC2086
             if dcli $denied >/dev/null 2>&1; then echo "FAIL: socket-proxy-hub allowed: $denied"; exit 1; fi
           done
-          echo "PASS: docker compose up/ps/logs/restart/down -v work through socket-proxy-hub; swarm/system/plugins/secrets/nodes denied"
+          # The libpod API and /build: 403 on the Hub's proxy too, GET and POST
+          # (its POST=1 allows writes only on the allowed sections).
+          hp() { docker run --rm --network "$NET" --entrypoint wget \
+                   docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb \
+                   -q -O /dev/null -S "$@" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -n1 | cut -d' ' -f2; }
+          for denied in /libpod/info /libpod/play/kube /v5.0.0/libpod/containers/json /build; do
+            [ "$(hp "http://socket-proxy-hub:2375$denied")" = 403 ] || { echo "FAIL: socket-proxy-hub allowed GET $denied"; exit 1; }
+            [ "$(hp --post-data='{}' --header 'Content-Type: application/json' "http://socket-proxy-hub:2375$denied")" = 403 ] \
+              || { echo "FAIL: socket-proxy-hub allowed POST $denied"; exit 1; }
+          done
+          echo "PASS: docker compose up/ps/logs/restart/down -v work through socket-proxy-hub; swarm/system/plugins/secrets/nodes, libpod and /build denied"
 
       - name: Test the Hub (non-root, socket proxy, proxy secret)
         run: |
@@ -2933,7 +3041,7 @@ jobs:
 
       - name: Generate .env and the CI override
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
             val="$(grep "^$v=" .env | cut -d= -f2-)"
@@ -3357,7 +3465,7 @@ jobs:
 
       - name: Generate .env and the CI override (Pebble, fake DNS provider)
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
             val="$(grep "^$v=" .env | cut -d= -f2-)"
@@ -3941,7 +4049,7 @@ jobs:
 
       - name: Generate .env and the CI override (Pebble, fake DNS provider, the trust list fixture from a host directory)
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           # Signing in as someone else lasts at most 2 minutes in this job
           # (every case; imp_expiry waits for it).
@@ -4396,7 +4504,7 @@ jobs:
 
       - name: Generate .env and the CI override (Pebble, fake DNS provider, app hostnames on Traefik)
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
             val="$(grep "^$v=" .env | cut -d= -f2-)"
@@ -4768,7 +4876,7 @@ jobs:
 
       - name: Generate .env and the CI override (Pebble, fake DNS provider, auth on portcullis-proxy)
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
             val="$(grep "^$v=" .env | cut -d= -f2-)"
@@ -5071,7 +5179,7 @@ jobs:
 
       - name: Generate .env and the CI override (Pebble, fake DNS provider, auth on portcullis-proxy)
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
             val="$(grep "^$v=" .env | cut -d= -f2-)"
@@ -5377,7 +5485,7 @@ jobs:
 
       - name: Generate .env and the CI override (Pebble, fake DNS provider, app hostnames on Traefik)
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
             val="$(grep "^$v=" .env | cut -d= -f2-)"
@@ -5667,3 +5775,727 @@ jobs:
             docker compose -p "$p" down -v 2>/dev/null || true
           done
           docker compose down -v
+
+  # Rootless Podman end to end (spec 2026-11-13-rootless-podman, contract
+  # §6): the whole stack under CONTAINER_RUNTIME=podman, the runner user as
+  # the operator, Docker stopped. First a Docker phase (P11): init on Docker,
+  # one LLDAP person, a backup copied to $RUNNER_TEMP/rt-backup (0700, never
+  # an artifact), the CA chain's sha256; then Docker is stopped and removed
+  # from the picture, rootless Podman installed and prepared (subuid/subgid,
+  # ip_unprivileged_port_start=80, linger, the user's podman.socket and
+  # podman-restart.service), and `init --runtime podman`. Asserts: status
+  # clean (runtime podman, ports ≥ ≤ 80, every host-prep check), the pinned
+  # networks' IPAM and addresses, Memory / PidsLimit on every core
+  # container, the socket proxies (libpod and /build denied), Traefik's
+  # docker provider, secrets operator-owned (0:10001 inside the namespace),
+  # an mTLS sign-in and the portal, tests/e2e/e2e_podman.py (/api/runtime,
+  # an echo instance's lifecycle with forward-auth through host-gateway,
+  # the folder fixer on /srv/e2e-pod, scrutiny refused), a simulated reboot
+  # (user@<uid>.service restarted, podman-restart.service brings everything
+  # back), and the Docker → Podman restore of the Docker phase's backup.
+  # Failure artifacts: logs and API views only, never .env or secrets/.
+  e2e-podman:
+    needs: jobs-input
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-podman,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-podman ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-podman,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-podman ')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    env:
+      E2E_DOMAIN: portcullis.local
+      E2E_ARTIFACTS: e2e-artifacts
+      E2E_POD: /srv/e2e-pod
+      # Let's Encrypt staging (no real certificates in CI: Traefik serves the
+      # Vault wildcard certificate from traefik/dynamic/ci-certs.yml).
+      ACME_STAGING: "true"
+      # The Hub's admin listener, published on the runner's loopback by the
+      # CI override (rootless container addresses aren't reachable from the
+      # host).
+      HUB_API: http://127.0.0.1:18888
+      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Templates (same-named templates branch, else main)
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          url=https://github.com/porelli/portcullis-templates
+          ref=main
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && [[ "$REF" != v* ]] \
+              && git ls-remote --exit-code --heads "$url" "$REF" >/dev/null; then
+            ref="$REF"
+          fi
+          git clone --quiet --depth=1 --branch "$ref" "$url" "$RUNNER_TEMP/templates"
+          echo "Templates: portcullis-templates@$ref ($(git -C "$RUNNER_TEMP/templates" rev-parse --short HEAD))" | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -q 'SYS_RAWIO' "$RUNNER_TEMP/templates/scrutiny/compose.yml" \
+            || { echo "FAIL: scrutiny has no SYS_RAWIO on portcullis-templates@$ref"; exit 1; }
+
+      - name: Shared helpers (status clean, redaction)
+        run: |
+          cat > "$RUNNER_TEMP/podlib.sh" <<'SH'
+          # shellcheck shell=bash
+          # status_ok: ./portcullis status --json is clean — runtime podman,
+          # ports ≥ ≤ 80, no failed host check, every service running and
+          # healthy, Vault, Keycloak (realm, forward-auth client, passkey
+          # policy), no DNS shadow, mcp-gate serving; `problems` 0, or only the
+          # DNS block's (portcullis.local has no public records in CI).
+          status_ok() {
+            local out
+            out="$(./portcullis status --json 2>/dev/null)" || true
+            printf '%s' "$out" > /tmp/status.json
+            printf '%s' "$out" | jq -e '(.runtime.name == "podman") and (.runtime.port_start <= 80)
+                and ([.runtime.checks[] | select(.status == "fail")] == [])
+                and (.services | length > 0)
+                and ([.services[] | select(.state != "running" or (.health != "healthy" and .health != "n/a"))] == [])
+                and .vault.active and .keycloak.health == "healthy" and .keycloak.realm and .keycloak.forward_auth_client
+                and (.keycloak.passkey_policy.ok // false)
+                and .dns_shadows == [] and .mcp_gate.refusing == null
+                and (.problems == 0 or (.dns != null and ([.dns.main.problems, (.dns.domains[]? | .problems)] | add) > 0))' >/dev/null 2>&1
+          }
+          # status_wait <seconds>: status_ok within the time, else the last status.
+          status_wait() {
+            local t0=$SECONDS
+            until status_ok; do
+              if (( SECONDS - t0 >= $1 )); then
+                echo "FAIL: status not clean after $1 s:"; jq . /tmp/status.json 2>/dev/null || cat /tmp/status.json
+                ./portcullis status || true
+                return 1
+              fi
+              sleep 5
+            done
+          }
+          # podns: this user's podman-family processes with their user
+          # namespace and cgroup (two namespace trees = two pause processes).
+          podns() {
+            local p
+            for p in $(pgrep -u "$(id -u)" -f '(^|/)(podman|conmon|pasta|pasta\.avx2|catatonit|rootlessport|aardvark-dns|netavark)( |$)'); do
+              printf '  %s %s %s %s\n' "$p" "$(readlink "/proc/$p/ns/user" 2>/dev/null)" "$(cut -d: -f3 "/proc/$p/cgroup" 2>/dev/null | head -n1)" "$(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | cut -c1-120)"
+            done
+          }
+          # redact: setup links in init's output (masked from logs).
+          redact() { sed -E 's#(/invite/)[A-Za-z0-9_-]+#\1<redacted>#g'; }
+          # to_keycloak <url>: follows the redirects (Traefik on the runner's
+          # :443) until Keycloak's authorization endpoint; 1 if never.
+          to_keycloak() {
+            local url="$1" h code loc
+            for _ in 1 2 3 4; do
+              h="${url#https://}"; h="${h%%/*}"
+              read -r code loc < <(curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' --max-time 20 \
+                --cacert certs/ca-chain.crt --resolve "$h:443:127.0.0.1" "$url" || true)
+              echo "  $code $url"
+              case "$code" in 301|302|303|307) ;; *) return 1 ;; esac
+              url="$loc"
+              case "$url" in "https://auth.$E2E_DOMAIN/realms/portcullis/protocol/openid-connect/auth"*) echo "  → $url" | cut -c1-120; return 0 ;; esac
+            done
+            return 1
+          }
+          SH
+
+      # ── Docker phase (P11): init, one person, a backup ──
+      - name: Docker phase — .env and the CI override
+        run: |
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
+            --email ci@portcullis.local --dns-provider none
+          # The same override for both phases: the management / LLDAP ports
+          # and the Hub's listener on loopback, Traefik's API (CI only).
+          cat > docker-compose.ci.yml <<'YML'
+          services:
+            keycloak:
+              ports:
+                - "127.0.0.1:9000:9000"
+            lldap:
+              ports:
+                - "127.0.0.1:17170:17170"
+            hub:
+              ports:
+                - "127.0.0.1:18888:8888"
+            traefik:
+              environment:
+                TRAEFIK_API_INSECURE: "true"
+          YML
+          # No ACME in CI: Traefik serves the Vault-issued wildcard certificate.
+          printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
+          docker compose config -q
+          docker compose config --format json | jq -e '.services.hub.environment.HUB_CONTAINER_RUNTIME == "docker"' >/dev/null \
+            || { echo "FAIL: HUB_CONTAINER_RUNTIME is not docker in the Docker phase"; exit 1; }
+
+      - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/keycloak-image
+
+      - name: Docker phase — init, one LLDAP person, backup, wipe
+        timeout-minutes: 30
+        run: |
+          set -o pipefail
+          # shellcheck source=/dev/null
+          source "$RUNNER_TEMP/podlib.sh"
+          ./portcullis init --runtime docker --non-interactive --domain portcullis.local \
+            --email ci@portcullis.local --dns-provider none --no-config-repo 2>&1 | redact
+          grep -qx 'CONTAINER_RUNTIME=docker' .env || { echo "FAIL: init --runtime docker wrote no CONTAINER_RUNTIME=docker"; exit 1; }
+          LLDAP_ADMIN_PASSWORD="$(grep '^LLDAP_ADMIN_PASSWORD=' .env | cut -d= -f2-)"; echo "::add-mask::$LLDAP_ADMIN_PASSWORD"
+          export LLDAP_ADMIN_PASSWORD
+          for i in $(seq 1 30); do
+            LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
+              | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token) && [ "$LLDAP_TOKEN" != null ] && break
+            [ "$i" -eq 30 ] && { echo "FAIL: LLDAP login"; exit 1; }
+            sleep 2
+          done
+          echo "::add-mask::$LLDAP_TOKEN"
+          jq -n '{query: "mutation { createUser(user: {id: \"rt-person\", email: \"rt-person@portcullis.local\"}) { id } }"}' \
+            | curl -sf http://127.0.0.1:17170/api/graphql -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") \
+                -H 'Content-Type: application/json' -d @- | jq -e '.errors == null' >/dev/null \
+            || { echo "FAIL: create the LLDAP person rt-person"; exit 1; }
+          ./portcullis backup
+          B="$(find backups -mindepth 1 -maxdepth 1 -type d -name '2*' | sort | tail -n1)"
+          [ -n "$B" ] && [ -f "$B/MANIFEST.json" ] || { echo "FAIL: no backup in backups/"; ls -la backups; exit 1; }
+          jq -e '.runtime.name == "docker"' "$B/MANIFEST.json" >/dev/null || { echo "FAIL: MANIFEST.json runtime: $(jq -c .runtime "$B/MANIFEST.json")"; exit 1; }
+          (umask 077 && cp -r --preserve=mode,timestamps "$B" "$RUNNER_TEMP/rt-backup")
+          chmod 700 "$RUNNER_TEMP/rt-backup"
+          sha256sum certs/ca-chain.crt | cut -d' ' -f1 > "$RUNNER_TEMP/rt-ca.sha256"
+          echo "PASS: Docker phase: init, rt-person, backup $B (copied to \$RUNNER_TEMP/rt-backup, 0700)"
+          ./portcullis down
+          docker volume ls -q --filter label=com.docker.compose.project=portcullis | xargs -r docker volume rm
+          sudo rm -rf .env secrets certs templates appfiles backups/2*
+          git checkout -- secrets/.gitkeep backups/.gitkeep
+          [ -z "$(docker ps -aq)" ] || { echo "FAIL: containers left after the Docker phase"; docker ps -a; exit 1; }
+
+      - name: Save the CI-built Hub / Keycloak images for Podman
+        run: |
+          : > "$RUNNER_TEMP/pod-images.txt"
+          if [ -n "${HUB_LOCAL:-}" ]; then docker save -o "$RUNNER_TEMP/img-hub.tar" "$HUB_IMAGE"; echo "$RUNNER_TEMP/img-hub.tar $HUB_IMAGE" >> "$RUNNER_TEMP/pod-images.txt"; fi
+          if [ -n "${KEYCLOAK_LOCAL:-}" ]; then docker save -o "$RUNNER_TEMP/img-kc.tar" "$KEYCLOAK_IMAGE"; echo "$RUNNER_TEMP/img-kc.tar $KEYCLOAK_IMAGE" >> "$RUNNER_TEMP/pod-images.txt"; fi
+          cat "$RUNNER_TEMP/pod-images.txt"
+
+      - name: Stop Docker
+        run: |
+          sudo systemctl disable --now docker.service docker.socket
+          if curl -s --max-time 5 --unix-socket /var/run/docker.sock http://localhost/_ping; then
+            echo "FAIL: /var/run/docker.sock still answers"; exit 1
+          fi
+          echo "PASS: Docker is stopped and disabled (its socket doesn't answer)"
+
+      # ── Podman phase ──
+      - name: Install and prepare rootless Podman (one-time host preparation)
+        timeout-minutes: 15
+        run: |
+          set -o pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq podman passt uidmap acl >/dev/null
+          podman --version
+          me="$(id -un)"
+          for f in /etc/subuid /etc/subgid; do
+            if ! grep -q "^$me:" "$f"; then
+              case "$f" in */subuid) sudo usermod --add-subuids 100000-165535 "$me" ;; *) sudo usermod --add-subgids 100000-165535 "$me" ;; esac
+            fi
+            n="$(awk -F: -v u="$me" '$1 == u { s += $3 } END { print s + 0 }' "$f")"
+            [ "$n" -ge 65536 ] || { echo "FAIL: $f gives $me $n ids"; exit 1; }
+            echo "$f: $(grep "^$me:" "$f")"
+          done
+          sudo sysctl -w net.ipv4.ip_unprivileged_port_start=80
+          # The SELinux overlay's layout for the whole Podman phase (the Hub's
+          # /project a tmpfs, long-syntax z / Z binds, label=disable on the
+          # proxies): a getenforce stub saying Enforcing, first on PATH from
+          # the next step on (GITHUB_PATH; the Docker phase is over). Ubuntu
+          # has no SELinux, so the labels themselves are no-ops here: Fedora
+          # enforcing stays a manual release check (CLAUDE.md).
+          mkdir -p "$RUNNER_TEMP/selinux-stub"
+          printf '#!/bin/sh\necho Enforcing\n' > "$RUNNER_TEMP/selinux-stub/getenforce"
+          chmod +x "$RUNNER_TEMP/selinux-stub/getenforce"
+          echo "$RUNNER_TEMP/selinux-stub" >> "$GITHUB_PATH"
+          # Ubuntu's AppArmor (bug 2154379): pasta's profile refuses podman's
+          # SIGTERM, so removing a network's last container fails ("rootless
+          # netns: kill network process: permission denied"). The host-prep
+          # rule (runtime_host_checks refuses init / up without it).
+          if [ "$(cat /sys/module/apparmor/parameters/enabled 2>/dev/null)" = Y ] && [ -f /etc/apparmor.d/usr.bin.pasta ]; then
+            grep -n 'include\|signal' /etc/apparmor.d/usr.bin.pasta || true
+            if grep -q 'local/usr.bin.pasta' /etc/apparmor.d/usr.bin.pasta; then
+              echo 'signal (receive) set=(term) peer=podman,' | sudo tee -a /etc/apparmor.d/local/usr.bin.pasta >/dev/null
+            else
+              sudo sed -i 's/^}$/  signal (receive) set=(term) peer=podman,\n}/' /etc/apparmor.d/usr.bin.pasta
+            fi
+            sudo apparmor_parser -r /etc/apparmor.d/usr.bin.pasta
+            echo "AppArmor: pasta now accepts podman's SIGTERM"
+          fi
+          sudo loginctl enable-linger "$me"
+          XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          for i in $(seq 1 30); do [ -S "$XDG_RUNTIME_DIR/bus" ] && break; [ "$i" -eq 30 ] && { echo "FAIL: no user manager for $me"; exit 1; }; sleep 1; done
+          export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          { echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"; echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS"; } >> "$GITHUB_ENV"
+          podman system migrate
+          systemctl --user enable --now podman.socket podman-restart.service
+          DOCKER_HOST="unix://$XDG_RUNTIME_DIR/podman/podman.sock"
+          export DOCKER_HOST
+          echo "DOCKER_HOST=$DOCKER_HOST" >> "$GITHUB_ENV"
+          docker version --format '{{json .Server.Components}}' | jq -e 'any(.[]; .Name == "Podman Engine")' >/dev/null \
+            || { echo "FAIL: the Docker CLI doesn't reach Podman: $(docker version 2>&1 | tail -5)"; exit 1; }
+          while read -r tar img; do
+            podman load -i "$tar"
+            docker image inspect "$img" >/dev/null || { echo "FAIL: $img isn't visible through the compat API after podman load"; podman images; exit 1; }
+          done < "$RUNNER_TEMP/pod-images.txt"
+          podman unshare cat /proc/self/uid_map
+          echo "PASS: rootless Podman $(podman version --format '{{.Client.Version}}') on the user socket"
+
+      - name: Podman phase — template sources, /srv/e2e-pod, init --runtime podman
+        timeout-minutes: 40
+        run: |
+          set -o pipefail
+          # shellcheck source=/dev/null
+          source "$RUNNER_TEMP/podlib.sh"
+          # The Hub's only template source: echo, folder-writer and scrutiny
+          # as a local source (path, no URL), seeded before the first start.
+          docker volume create --label com.docker.compose.project=portcullis --label com.docker.compose.volume=hub_data portcullis_hub_data >/dev/null
+          docker run --rm -v portcullis_hub_data:/data -v "$PWD/tests/e2e/apps:/src:ro" -v "$RUNNER_TEMP/templates:/tpl:ro" "$ALPINE" sh -c '
+            mkdir -p /data/repos/ci &&
+            cp -r /tpl/scrutiny /src/echo /src/folder-writer /data/repos/ci/ &&
+            printf "sources:\n  - name: ci\n    url: \"\"\n    path: /data/repos/ci\n" > /data/state.yaml &&
+            chown -R 10001:10001 /data && chmod 600 /data/state.yaml'
+          # The fixer's tree: operator-owned, with one host-root child.
+          fs="$(findmnt -no FSTYPE --target /srv)"; [ "$fs" = ext4 ] || { echo "FAIL: /srv is $fs, not ext4"; exit 1; }
+          me="$(id -un)"
+          sudo rm -rf "$E2E_POD"
+          sudo install -d -o "$me" -g "$me" -m 0750 "$E2E_POD" "$E2E_POD/ok" "$E2E_POD/rooted"
+          for f in 1 2 3; do echo "pod $f" > "$E2E_POD/ok/file-$f.txt"; echo "rooted $f" > "$E2E_POD/rooted/file-$f.txt"; done
+          sudo install -d -o root -g root -m 0755 "$E2E_POD/rooted/root-owned"
+          ./portcullis init --runtime podman --non-interactive --domain portcullis.local \
+            --email ci@portcullis.local --dns-provider none --no-config-repo 2>&1 | redact
+          if ! grep -qx 'CONTAINER_RUNTIME=podman' .env || ! grep -qx "PORTCULLIS_ENGINE_SOCKET=$XDG_RUNTIME_DIR/podman/podman.sock" .env; then
+            echo "FAIL: .env lacks CONTAINER_RUNTIME=podman / the rootless socket"; grep -E '^(CONTAINER_RUNTIME|PORTCULLIS_ENGINE_SOCKET)=' .env; exit 1
+          fi
+          status_wait 240
+          jq -c '.runtime' /tmp/status.json | tee -a "$GITHUB_STEP_SUMMARY"
+          # The SELinux overlay's layout is in use (getenforce stub): the CLI's
+          # COMPOSE_FILE has it, the Hub's /project is a tmpfs, the map file
+          # bound into it, the proxies carry label=disable.
+          [ "$(getenforce)" = Enforcing ] || { echo "FAIL: the getenforce stub isn't on PATH"; exit 1; }
+          CF="$(bash -c 'source scripts/lib/common.sh; env_load; runtime_export; printf "%s" "$COMPOSE_FILE"')"
+          case "$CF" in *docker-compose.podman.yml*docker-compose.podman-selinux.yml*) ;; *) echo "FAIL: the CLI's COMPOSE_FILE lacks the podman overlays: $CF"; exit 1 ;; esac
+          # Podman's inspect lists no tmpfs under Mounts: the mount table of
+          # the Hub's own process is the evidence (/project a tmpfs, no bind of
+          # the checkout; the map file bound into it).
+          HUB_CID="$(docker compose ps -q hub)"
+          docker inspect -f '{{json .Mounts}}' "$HUB_CID" | jq -e --arg p "$PWD" '
+              (map(select(.Destination == "/project")) | length == 0)
+              and (map(select(.Source == $p)) | length == 0)
+              and (map(select(.Destination == "/project/group-gate/group-gate-map.conf")) | length == 1)' >/dev/null \
+            || { echo "FAIL: the Hub's mounts aren't the overlay's (no checkout bind, the map file bound)"; docker inspect -f '{{json .Mounts}}' "$HUB_CID"; exit 1; }
+          HUB_PID="$(docker inspect -f '{{.State.Pid}}' "$HUB_CID")"
+          podman unshare awk '$5 == "/project" { for (i = 7; i <= NF; i++) if ($i == "-") { print $(i + 1); exit } }' "/proc/$HUB_PID/mountinfo" | grep -qx tmpfs \
+            || { echo "FAIL: the Hub's /project is not a tmpfs:"; podman unshare grep ' /project' "/proc/$HUB_PID/mountinfo"; exit 1; }
+          for p in socket-proxy-traefik socket-proxy-hub; do
+            docker inspect -f '{{json .HostConfig.SecurityOpt}}' "$(docker compose ps -q "$p")" | jq -e 'any(.[]?; test("^label[=:]disable$"))' >/dev/null \
+              || { echo "FAIL: $p has no label=disable"; exit 1; }
+          done
+          echo "PASS: the SELinux overlay's layout runs (Hub /project tmpfs + map bind, label=disable on the proxies)"
+          # Local images keep their Dockerfile HEALTHCHECK (podman build
+          # --format docker: the OCI format drops it), and every core
+          # container with a healthcheck (compose or image) reports a health.
+          for df in */Dockerfile; do
+            grep -q '^HEALTHCHECK' "$df" || continue
+            img="portcullis-${df%%/*}"
+            podman image inspect "$img" | jq -e '.[0] | (.Healthcheck // .Config.Healthcheck // null) | .Test | length > 0' >/dev/null \
+              || { echo "FAIL: $img has no Healthcheck (built in OCI format?)"; podman image inspect "$img" | jq '.[0] | {Healthcheck, Config}'; exit 1; }
+            echo "  $img keeps its HEALTHCHECK"
+          done
+          for cid in $(docker compose ps -q); do
+            read -r name hc st < <(docker inspect -f '{{.Name}} {{if .Config.Healthcheck}}{{len .Config.Healthcheck.Test}}{{else}}0{{end}} {{if .State.Health}}{{.State.Health.Status}}{{else}}-{{end}}' "$cid")
+            [ "$hc" = 0 ] || [ "$st" != - ] || { echo "FAIL: ${name#/} has a healthcheck but reports no health"; exit 1; }
+          done
+          echo "PASS: local images keep their HEALTHCHECK; every core container with a healthcheck reports a health"
+          echo "PASS: init --runtime podman; status clean (runtime podman, ports ≥ $(jq .runtime.port_start /tmp/status.json))"
+
+      - name: Every SELinux-overlay bind source exists after a full up (monitoring profile)
+        timeout-minutes: 15
+        run: |
+          set -o pipefail
+          # The overlay's long-syntax binds never create a missing source
+          # (rootless Podman + SELinux): after a full `up` with every profile
+          # this job can start, each must exist (also checked statically
+          # against stack_prepare in tests/test_shell_libs.sh).
+          COMPOSE_PROFILES=monitoring ./portcullis up
+          missing=""
+          while IFS= read -r src; do
+            [ -e "$src" ] || missing="$missing $src"
+          done < <(docker compose -f docker-compose.yml -f docker-compose.podman-selinux.yml --profile '*' config --format json \
+                     | jq -r '[.services[].volumes[]? | select(.type == "bind" and .bind.selinux != null) | .source] | unique[]')
+          [ -z "$missing" ] || { echo "FAIL: overlay bind sources missing after up:$missing"; exit 1; }
+          echo "PASS: every SELinux-overlay bind source exists after a full up with the monitoring profile"
+          # Back to the default profile for the rest of the job.
+          COMPOSE_PROFILES=monitoring docker compose rm -sf prometheus alertmanager blackbox textfile-exporter grafana
+
+      - name: Pinned networks, addresses and limits
+        run: |
+          set -o pipefail
+          envv() { local v; v="$(grep "^$1=" .env | tail -n1 | cut -d= -f2-)"; printf '%s' "${v:-$2}"; }
+          # shellcheck source=/dev/null
+          source scripts/lib/common.sh
+          # shellcheck source=/dev/null
+          source scripts/lib/network.sh
+          # The subnet from the compat inspect; the range from libpod (Podman's
+          # compat inspect never reports IPRange: compat create keeps an
+          # ip_range <cidr> as the lease range first+1 .. last).
+          ipam() { docker network inspect "$1" --format '{{json .IPAM.Config}}' | jq -r '.[0].Subnet'; }
+          lease() { podman network inspect "$1" --format json | jq -r --arg s "$2" '[.[0].subnets[] | select(.subnet == $s) | (.lease_range // null)] | if length != 1 then "no-subnet" elif .[0] == null then "-" else "\(.[0].start_ip)-\(.[0].end_ip)" end'; }
+          for spec in "portcullis-proxy PORTCULLIS_PROXY 172.31.250.0/24 172.31.250.128/25" "portcullis-auth PORTCULLIS_AUTH 172.31.251.0/28 172.31.251.8/29" \
+                      "portcullis-mcp PORTCULLIS_MCP 172.31.253.0/28 172.31.253.8/29" "portcullis_portcullis-domains PORTCULLIS_DOMAINS 172.31.252.0/28 -"; do
+            read -r net pre sub rng <<<"$spec"
+            sub="$(envv "${pre}_SUBNET" "$sub")"
+            want=-
+            if [ "$rng" != - ]; then
+              read -r first last <<<"$(cidr_bounds "$(envv "${pre}_IP_RANGE" "$rng")")"
+              want="$(int_to_ip $((first + 1)))-$(int_to_ip "$last")"
+            fi
+            got="$(ipam "$net") $(lease "$net" "$sub")"
+            [ "$got" = "$sub $want" ] || { echo "FAIL: $net IPAM '$got', want '$sub $want'"; docker network inspect "$net"; podman network inspect "$net"; exit 1; }
+            echo "  $net: subnet $sub, lease range $want"
+          done
+          n=0
+          while read -r svc net ip; do
+            got="$(docker inspect -f '{{json .NetworkSettings.Networks}}' "$(docker compose ps -q "$svc")" | jq -r --arg n "$net" '.[$n].IPAddress // empty')"
+            [ "$got" = "$ip" ] || { echo "FAIL: $svc on $net at '$got', want $ip"; exit 1; }
+            echo "  $svc on $net: $got"; n=$((n + 1))
+          done < <(docker compose config --format json | jq -r '.services | to_entries[] | .key as $s | (.value.networks // {}) | to_entries[] | select(.value.ipv4_address != null) | "\($s) \(.key) \(.value.ipv4_address)"')
+          [ "$n" -ge 5 ] || { echo "FAIL: only $n pinned addresses (traefik ×2, mcp-gate, keycloak, hub)"; exit 1; }
+          bad=""
+          for cid in $(docker compose ps -q); do
+            read -r name mem pids < <(docker inspect -f '{{.Name}} {{.HostConfig.Memory}} {{.HostConfig.PidsLimit}}' "$cid")
+            { [ "${mem:-0}" -gt 0 ] && [ "${pids:-0}" -gt 0 ]; } || bad="$bad $name(mem=$mem,pids=$pids)"
+          done
+          [ -z "$bad" ] || { echo "FAIL: core containers without Memory / PidsLimit:$bad"; exit 1; }
+          echo "PASS: IPAM round-trips, $n pinned addresses, Memory and PidsLimit on every core container"
+
+      - name: The socket proxies on the Podman API (libpod and /build denied)
+        run: |
+          tp() { docker compose exec -T traefik wget -q -O /dev/null -S "$@" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -n1 | cut -d' ' -f2; }
+          [ "$(tp http://socket-proxy-traefik:2375/version)" = 200 ] || { echo "FAIL: traefik proxy /version"; exit 1; }
+          [ "$(tp http://socket-proxy-traefik:2375/containers/json)" = 200 ] || { echo "FAIL: traefik proxy /containers/json"; exit 1; }
+          for denied in /images/json /info /volumes /secrets /swarm /system/df /libpod/info /libpod/play/kube /v5.0.0/libpod/containers/json /build; do
+            [ "$(tp "http://socket-proxy-traefik:2375$denied")" = 403 ] || { echo "FAIL: traefik proxy allowed $denied"; exit 1; }
+          done
+          [ "$(tp --post-data='{}' --header 'Content-Type: application/json' http://socket-proxy-traefik:2375/containers/create)" = 403 ] \
+            || { echo "FAIL: traefik proxy allowed a POST"; exit 1; }
+          # Traversal / encoded paths into libpod (Podman's router isn't
+          # dockerd's): never a 2xx through the proxy (a 403, or a redirect
+          # the proxy then denies).
+          for odd in "/containers/../libpod/info" "/containers/%2e%2e/libpod/info" "/containers%2F..%2Flibpod%2Finfo" "/v1.41/build" "/v5.0.0/libpod/info"; do
+            c="$(tp "http://socket-proxy-traefik:2375$odd")"
+            case "$c" in 2*) echo "FAIL: traefik proxy answered $c for $odd"; exit 1 ;; esac
+          done
+          echo "PASS: socket-proxy-traefik is read-only and minimal (libpod and /build denied)"
+          NET="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$(docker compose ps -q socket-proxy-hub)")"
+          mkdir -p /tmp/hubproj && cat > /tmp/hubproj/compose.yml <<'YML'
+          services:
+            web:
+              image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+              volumes: [data:/data]
+              networks: [portcullis-proxy, default]
+          volumes:
+            data:
+          networks:
+            portcullis-proxy:
+              external: true
+          YML
+          dcli() { docker run --rm --network "$NET" -e DOCKER_HOST=tcp://socket-proxy-hub:2375 -v /tmp/hubproj:/p:ro -w /p \
+                     docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb "$@"; }
+          dcli docker compose -p ci-hubproxy up -d --pull missing || { docker compose logs --tail=30 socket-proxy-hub; echo "FAIL: compose up through socket-proxy-hub"; exit 1; }
+          dcli docker compose -p ci-hubproxy ps --format json | grep -q '"State":"running"' || { echo "FAIL: compose ps"; exit 1; }
+          dcli docker compose -p ci-hubproxy logs web >/dev/null || { echo "FAIL: compose logs"; exit 1; }
+          dcli docker compose -p ci-hubproxy restart web || { echo "FAIL: compose restart"; exit 1; }
+          dcli docker compose -p ci-hubproxy down -v || { echo "FAIL: compose down -v"; exit 1; }
+          for denied in "docker swarm init" "docker system df" "docker plugin ls" "docker secret ls" "docker node ls"; do
+            # shellcheck disable=SC2086
+            if dcli $denied >/dev/null 2>&1; then echo "FAIL: socket-proxy-hub allowed: $denied"; exit 1; fi
+          done
+          hp() { docker run --rm --network "$NET" --entrypoint wget \
+                   docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb \
+                   -q -O /dev/null -S "$@" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -n1 | cut -d' ' -f2; }
+          for odd in "/containers/../libpod/info" "/containers/%2e%2e/libpod/info" "/containers%2F..%2Flibpod%2Finfo" "/v1.41/build" "/v5.0.0/libpod/info"; do
+            c="$(hp "http://socket-proxy-hub:2375$odd")"
+            case "$c" in 2*) echo "FAIL: socket-proxy-hub answered $c for $odd"; exit 1 ;; esac
+          done
+          for denied in /libpod/info /libpod/play/kube /v5.0.0/libpod/containers/json /build; do
+            [ "$(hp "http://socket-proxy-hub:2375$denied")" = 403 ] || { echo "FAIL: socket-proxy-hub allowed GET $denied"; exit 1; }
+            [ "$(hp --post-data='{}' --header 'Content-Type: application/json' "http://socket-proxy-hub:2375$denied")" = 403 ] \
+              || { echo "FAIL: socket-proxy-hub allowed POST $denied"; exit 1; }
+          done
+          # The engine socket: only the two proxies mount it (the user socket).
+          for cid in $(docker compose ps -q); do
+            name="$(docker inspect -f '{{.Name}}' "$cid" | tr -d /)"
+            if docker inspect -f '{{json .Mounts}}' "$cid" | jq -e --arg s "$XDG_RUNTIME_DIR/podman/podman.sock" 'any(.[]; .Source == $s or .Destination == "/var/run/docker.sock")' >/dev/null; then
+              case "$name" in *socket-proxy-traefik*|*socket-proxy-hub*) ;; *) echo "FAIL: $name mounts the engine socket"; exit 1 ;; esac
+            fi
+          done
+          echo "PASS: compose through socket-proxy-hub on Podman; swarm/system/plugins/secrets/nodes, libpod and /build denied; only the proxies mount the engine socket"
+
+      - name: Traefik's docker provider sees the core routers
+        run: |
+          for i in $(seq 1 30); do
+            R="$(docker compose exec -T traefik wget -q -O - http://127.0.0.1:8080/api/http/routers 2>/dev/null || true)"
+            printf '%s' "$R" | jq -e '[.[].name] | index("hub@docker") and index("people@docker")' >/dev/null 2>&1 && break
+            [ "$i" -eq 30 ] && { echo "FAIL: Traefik's API lacks hub@docker / people@docker: $(printf '%s' "$R" | jq -c '[.[].name]' 2>/dev/null || printf '%s' "$R" | head -c 400)"; exit 1; }
+            sleep 2
+          done
+          echo "PASS: Traefik's docker provider lists hub@docker and people@docker"
+
+      - name: Secrets are operator-owned (0:<gid> inside the user namespace)
+        run: |
+          [ "$(stat -c %u secrets/hub/core.env)" = "$(id -u)" ] || { echo "FAIL: secrets/hub/core.env host owner $(stat -c %u:%g secrets/hub/core.env)"; exit 1; }
+          [ "$(podman unshare stat -c %u:%g secrets/hub/core.env)" = 0:10001 ] \
+            || { echo "FAIL: secrets/hub/core.env inside the namespace: $(podman unshare stat -c %u:%g secrets/hub/core.env)"; exit 1; }
+          left="$(find secrets -not -user "$(id -u)" -printf '%P %u:%g\n')"
+          [ -z "$left" ] || { echo "FAIL: secrets/ entries not owned by the operator: $left"; exit 1; }
+          echo "PASS: secrets/ operator-owned on the host; core.env is 0:10001 inside the namespace"
+
+      - name: Sign-in with a client certificate (mTLS) and the portal
+        run: |
+          set -o pipefail
+          # shellcheck source=/dev/null
+          source "$RUNNER_TEMP/podlib.sh"
+          VAULT_TOKEN="$(jq -r .root_token secrets/vault-init.json)"; echo "::add-mask::$VAULT_TOKEN"
+          openssl ecparam -name prime256v1 -genkey -noout -out /tmp/test-client.key
+          openssl req -new -key /tmp/test-client.key -out /tmp/test-client.csr -subj "/CN=testuser"
+          jq -n --rawfile csr /tmp/test-client.csr '{csr: $csr, common_name: "testuser", ttl: "1h"}' \
+            | curl -sf -X POST -H @<(printf 'X-Vault-Token: %s\n' "$VAULT_TOKEN") --data-binary @- \
+                http://127.0.0.1:8200/v1/pki_int/sign/client-cert | jq -r .data.certificate > /tmp/test-client.crt
+          openssl verify -CAfile certs/ca-chain.crt /tmp/test-client.crt
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+            -keyout /tmp/foreign.key -out /tmp/foreign.crt -subj "/CN=testuser" -days 1 2>/dev/null
+          cat > /tmp/ci-mtls.yml <<'YML'
+          services:
+            whoami:
+              image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+              networks: [portcullis-proxy]
+              labels:
+                traefik.enable: "true"
+                traefik.http.services.ci-whoami.loadbalancer.server.port: "80"
+                traefik.http.routers.ci-mtls.rule: Host(`mtls.portcullis.local`)
+                traefik.http.routers.ci-mtls.entrypoints: websecure
+                traefik.http.routers.ci-mtls.tls.options: protected@file
+                traefik.http.routers.ci-mtls.middlewares: client-headers@file
+                traefik.http.routers.ci-mtls.service: ci-whoami
+          networks:
+            portcullis-proxy:
+              external: true
+          YML
+          env -u COMPOSE_FILE docker compose -p ci-mtls -f /tmp/ci-mtls.yml up -d
+          mtls() { curl -s -o /tmp/mtls.out -w '%{http_code}' --cacert certs/ca-chain.crt \
+                     --resolve "mtls.portcullis.local:443:127.0.0.1" "$@" "https://mtls.portcullis.local/" || true; }
+          for i in $(seq 1 30); do
+            code=$(mtls --cert /tmp/test-client.crt --key /tmp/test-client.key)
+            [ "$code" = 200 ] && break
+            [ "$i" -eq 30 ] && { echo "FAIL: the mTLS router (last $code)"; docker compose logs --tail=40 traefik; exit 1; }
+            sleep 2
+          done
+          [ "$(mtls)" = 000 ] || { echo "FAIL: the protected tier accepted a request without a client certificate"; exit 1; }
+          [ "$(mtls --cert /tmp/foreign.crt --key /tmp/foreign.key)" = 000 ] || { echo "FAIL: the protected tier accepted a foreign-CA certificate"; exit 1; }
+          grep -qi '^X-Forwarded-Tls-Client-Cert-Info:.*SerialNumber' /tmp/mtls.out || { echo "FAIL: no cert info at the backend"; cat /tmp/mtls.out; exit 1; }
+          TRAEFIK_IP="$(grep '^PORTCULLIS_TRAEFIK_IP=' .env | cut -d= -f2-)"
+          grep -q "^RemoteAddr: ${TRAEFIK_IP:-172.31.250.2}:" /tmp/mtls.out || { echo "FAIL: the backend saw a non-Traefik address"; cat /tmp/mtls.out; exit 1; }
+          echo "PASS: mTLS: the internal CA's client certificate signs in, none / a foreign one is refused, the backend sees Traefik's pinned address"
+          echo "The portal without a session:"
+          to_keycloak "https://$E2E_DOMAIN/" || { echo "FAIL: the portal doesn't send a visitor to Keycloak's sign-in"; exit 1; }
+          echo "PASS: the portal sends a visitor without a session to Keycloak's sign-in"
+          env -u COMPOSE_FILE docker compose -p ci-mtls -f /tmp/ci-mtls.yml down
+
+      - name: The Hub on Podman (e2e_podman.py)
+        timeout-minutes: 30
+        run: |
+          E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
+          export E2E_HUB_SECRET
+          for i in $(seq 1 40); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' "$HUB_API/healthz")" = 200 ] && break
+            [ "$i" -eq 40 ] && { echo "FAIL: the Hub's /healthz on $HUB_API"; docker compose logs --tail=40 hub; exit 1; }
+            sleep 3
+          done
+          for i in $(seq 1 30); do
+            curl -s -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$E2E_HUB_SECRET") "$HUB_API/api/templates" \
+              | jq -e '[.[].id] as $ids | ["echo", "folder-writer", "scrutiny"] - $ids == []' >/dev/null 2>&1 && break
+            [ "$i" -eq 30 ] && { echo "FAIL: the Hub did not load echo, folder-writer and scrutiny"; docker compose logs --tail=60 hub; exit 1; }
+            sleep 2
+          done
+          python3 tests/e2e/e2e_podman.py
+
+      - name: Reboot simulation (user manager and /run/user/<uid> recreated, podman-restart.service)
+        timeout-minutes: 10
+        run: |
+          # shellcheck source=/dev/null
+          source "$RUNNER_TEMP/podlib.sh"
+          uid="$(id -u)"
+          before="$(docker compose ps -q | wc -l)"
+          # An enabled app instance must come back too (the Hub sets
+          # restart: always on instance services under podman): folder-writer
+          # from e2e_podman.py, enabled through the Hub's API if it isn't.
+          SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
+          hub() { local m="$1" p="$2"; shift 2
+                  curl -s -X "$m" -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") \
+                    -H 'Content-Type: application/json' "$@" "$HUB_API$p"; }
+          hubc() { hub "$@" -o /tmp/hub.out -w '%{http_code}'; }
+          # shellcheck source=/dev/null
+          source tests/e2e/hubop.sh
+          APP=portcullis-folder-writer
+          app_ids() { docker ps -q --filter "label=com.docker.compose.project=$APP"; }
+          if [ -z "$(app_ids)" ]; then
+            if ! hub GET /api/instances | jq -e 'any(.[]; .id == "folder-writer")' >/dev/null; then
+              hubop POST /api/instances -d '{"template":"folder-writer","id":"folder-writer","label":"Folder Writer"}' || exit 1
+            fi
+            HUBOP_TIMEOUT=900 hubop POST /api/templates/enable -d '{"id":"folder-writer"}' || exit 1
+          fi
+          app_before="$(app_ids | wc -l)"
+          [ "$app_before" -gt 0 ] || { echo "FAIL: no running container of $APP before the reboot"; exit 1; }
+          # shellcheck disable=SC2046  # one id per word
+          docker inspect -f '{{.Name}} {{.HostConfig.RestartPolicy.Name}}' $(app_ids) | awk '$2 != "always" { print; bad = 1 } END { exit bad }' \
+            || { echo "FAIL: $APP containers without restart: always (the Hub must set it under podman)"; exit 1; }
+          # shellcheck disable=SC2046  # one id per word
+          docker inspect -f '{{.Name}} {{.HostConfig.RestartPolicy.Name}}' $(docker compose ps -q) | awk '$2 != "always" { print; bad = 1 } END { exit bad }' \
+            || { echo "FAIL: core containers without restart: always (podman-restart.service starts only those)"; exit 1; }
+          # A reboot: everything of this user stops and /run/user/<uid> is a
+          # fresh tmpfs. Restarting user@ alone keeps the old runtime dir with
+          # a stale rootless pause-process record, which no real boot has.
+          echo "Before: this user's podman processes and their user namespaces:"; podns
+          sudo systemctl stop "user@$uid.service"
+          # Nothing of this user survives a reboot. The runner's own podman
+          # CLI calls (outside the user manager) leave a pause process and
+          # can leave pasta / rootlessport / conmon / aardvark-dns holding
+          # the old user namespace: kill every one, then make sure none is
+          # left (the job's own bash and the runner are not podman processes).
+          for _ in 1 2 3; do
+            pkill -KILL -u "$uid" -f '(^|/)(podman|conmon|pasta|pasta\.avx2|catatonit|rootlessport|aardvark-dns|netavark)( |$)' || true
+            sleep 1
+          done
+          if pgrep -u "$uid" -f '(^|/)(podman|conmon|pasta|pasta\.avx2|catatonit|rootlessport|aardvark-dns|netavark)( |$)' >/dev/null; then
+            echo "FAIL: podman processes of $uid survived the simulated shutdown:"; podns; exit 1
+          fi
+          sudo systemctl stop "user-runtime-dir@$uid.service" \
+            || { echo "FAIL: /run/user/$uid can't be unmounted"; sudo fuser -vm "/run/user/$uid" || true; exit 1; }
+          [ ! -e "/run/user/$uid/podman" ] || { echo "FAIL: /run/user/$uid survived"; exit 1; }
+          sudo systemctl start "user@$uid.service"
+          for _ in $(seq 1 30); do [ -S "$XDG_RUNTIME_DIR/podman/podman.sock" ] && break; sleep 1; done
+          systemctl --user is-active podman-restart.service || { systemctl --user status podman-restart.service --no-pager || true; }
+          status_wait 180
+          echo "After: this user's podman processes and their user namespaces (one tree expected):"; podns
+          after="$(docker compose ps -q | wc -l)"
+          [ "$after" = "$before" ] || { echo "FAIL: $before core containers before, $after after"; exit 1; }
+          # The instance: the same number of containers running, none unhealthy.
+          for i in $(seq 1 36); do
+            n=0 bad=""
+            for c in $(app_ids); do
+              st="$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$c")"
+              case "$st" in "running healthy"|"running none") n=$((n + 1)) ;; *) bad="$bad $c($st)" ;; esac
+            done
+            [ "$n" = "$app_before" ] && [ -z "$bad" ] && break
+            [ "$i" -eq 36 ] && { echo "FAIL: $APP after the reboot: $n of $app_before running and healthy$bad"; docker ps -a --filter "label=com.docker.compose.project=$APP"; exit 1; }
+            sleep 5
+          done
+          echo "PASS: $APP's $app_before containers (restart: always) came back running and healthy"
+          echo "PASS: after a simulated reboot (user manager and /run/user/$uid recreated), podman-restart.service brought every container back; status clean"
+
+      - name: Docker → Podman round trip (restore the Docker phase's backup)
+        timeout-minutes: 40
+        run: |
+          set -o pipefail
+          # shellcheck source=/dev/null
+          source "$RUNNER_TEMP/podlib.sh"
+          empty="$(mktemp -d)"
+          for p in $(docker ps -aq --filter label=com.docker.compose.project | xargs -r docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' | sort -u | grep '^portcullis-.' || true); do
+            (cd "$empty" && env -u COMPOSE_FILE docker compose -p "$p" down -v)
+          done
+          ./portcullis down
+          docker volume ls -q --filter label=com.docker.compose.project=portcullis | xargs -r docker volume rm
+          podman unshare rm -rf .env secrets certs templates appfiles
+          rm -rf backups/2*
+          git checkout -- secrets/.gitkeep
+          ./portcullis init --runtime podman --non-interactive --domain portcullis.local \
+            --email ci@portcullis.local --dns-provider none --no-config-repo 2>&1 | redact
+          ./portcullis restore --yes "$RUNNER_TEMP/rt-backup" 2>&1 | redact
+          if ! grep -qx 'CONTAINER_RUNTIME=podman' .env || ! grep -qx "PORTCULLIS_ENGINE_SOCKET=$XDG_RUNTIME_DIR/podman/podman.sock" .env \
+             || [ "$(grep -c '^CONTAINER_RUNTIME=' .env)" != 1 ]; then
+            echo "FAIL: the restored .env lost this host's runtime keys"; grep -E '^(CONTAINER_RUNTIME|PORTCULLIS_ENGINE_SOCKET)=' .env; exit 1
+          fi
+          status_wait 300
+          [ "$(sha256sum certs/ca-chain.crt | cut -d' ' -f1)" = "$(cat "$RUNNER_TEMP/rt-ca.sha256")" ] \
+            || { echo "FAIL: certs/ca-chain.crt differs from the Docker phase's"; exit 1; }
+          LLDAP_ADMIN_PASSWORD="$(grep '^LLDAP_ADMIN_PASSWORD=' .env | cut -d= -f2-)"; echo "::add-mask::$LLDAP_ADMIN_PASSWORD"
+          export LLDAP_ADMIN_PASSWORD
+          for i in $(seq 1 30); do
+            LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
+              | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token) && [ "$LLDAP_TOKEN" != null ] && break
+            [ "$i" -eq 30 ] && { echo "FAIL: LLDAP login after the restore"; exit 1; }
+            sleep 2
+          done
+          echo "::add-mask::$LLDAP_TOKEN"
+          jq -n '{query: "{ user(userId: \"rt-person\") { id } }"}' \
+            | curl -sf http://127.0.0.1:17170/api/graphql -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") \
+                -H 'Content-Type: application/json' -d @- | jq -e '.data.user.id == "rt-person"' >/dev/null \
+            || { echo "FAIL: the Docker phase's LLDAP person rt-person is not in the restored LLDAP"; exit 1; }
+          left="$(find secrets -not -user "$(id -u)" -printf '%P %u:%g\n')"
+          [ -z "$left" ] || { echo "FAIL: restored secrets/ entries not owned by the operator: $left"; exit 1; }
+          echo "PASS: Docker → Podman: the .env kept CONTAINER_RUNTIME=podman and the rootless socket, status clean, the CA chain and rt-person are the Docker phase's, secrets/ operator-owned"
+
+      - name: Collect logs
+        if: failure()
+        run: |
+          mkdir -p e2e-artifacts/apps
+          ./portcullis status > e2e-artifacts/status.txt 2>&1 || true
+          cp /tmp/status.json e2e-artifacts/status.json 2>/dev/null || true
+          docker compose ps -a > e2e-artifacts/compose-ps.txt 2>&1 || true
+          docker ps -a > e2e-artifacts/docker-ps.txt 2>&1 || true
+          for svc in $(docker compose config --services 2>/dev/null); do
+            docker compose logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
+          done
+          for c in $(docker ps -aq --filter label=com.docker.compose.project 2>/dev/null); do
+            name="$(docker inspect -f '{{.Name}}' "$c" | tr -d /)"
+            case "$name" in portcullis-*-*) docker logs "$c" > "e2e-artifacts/apps/$name.log" 2>&1 || true ;; esac
+          done
+          podman info > e2e-artifacts/podman-info.txt 2>&1 || true
+          # shellcheck source=/dev/null
+          { source "$RUNNER_TEMP/podlib.sh"; podns; } > e2e-artifacts/podman-processes.txt 2>&1 || true
+          for net in $(podman network ls --format '{{.Name}}' 2>/dev/null); do
+            { echo "== $net (compat)"; docker network inspect "$net" --format '{{json .IPAM}}'; echo "== $net (libpod)"; podman network inspect "$net" --format json; } >> e2e-artifacts/networks.txt 2>&1 || true
+          done
+          journalctl --user -n 5000 --no-pager > e2e-artifacts/user-journal.txt 2>&1 || true
+          # Every container's health (status, streak, the last checks' exit
+          # codes and output), also into the run log; podman logs of each
+          # container that isn't healthy.
+          for c in $(docker ps -aq 2>/dev/null); do
+            name="$(docker inspect -f '{{.Name}}' "$c" | tr -d /)"
+            h="$(docker inspect -f '{{json .State.Health}}' "$c" 2>/dev/null || echo null)"
+            printf '%s %s\n' "$name" "$h" >> e2e-artifacts/health.txt
+            st="$(printf '%s' "$h" | jq -r '.Status // "none"' 2>/dev/null || echo none)"
+            case "$st" in healthy|none) ;; *)
+              echo "::group::$name is $st"
+              printf '%s' "$h" | jq -r '"failing streak \(.FailingStreak)", ((.Log // [])[-5:][] | "  \(.Start) exit \(.ExitCode): \(.Output | .[0:400])")' 2>/dev/null || printf '%s\n' "$h"
+              docker inspect -f '{{json .Config.Healthcheck}}' "$c" 2>/dev/null || true
+              echo "::endgroup::"
+              podman logs --tail 200 "$c" > "e2e-artifacts/podman-logs-$name.txt" 2>&1 || true ;;
+            esac
+          done
+          # Keycloak's probe by hand (its compose healthcheck), and its
+          # readiness from the runner through the CI-only :9000 publish.
+          kc="$(docker compose ps -q keycloak 2>/dev/null | head -n1)"
+          if [ -n "$kc" ]; then
+            {
+              echo "== /etc/hosts"; docker exec "$kc" cat /etc/hosts
+              echo "== the healthcheck, by hand (rc, seconds)"
+              t0=$SECONDS
+              timeout 15 docker exec "$kc" bash -c "{ printf 'HEAD /health/ready HTTP/1.0\\r\\n\\r\\n' >&0; grep 'HTTP/1.0 200'; } 0<>/dev/tcp/localhost/9000"; echo "rc=$? $((SECONDS - t0))s"
+              echo "== the same against 127.0.0.1"
+              timeout 15 docker exec "$kc" bash -c "{ printf 'HEAD /health/ready HTTP/1.0\\r\\n\\r\\n' >&0; cat; } 0<>/dev/tcp/127.0.0.1/9000"; echo "rc=$?"
+              echo "== GET /health/ready from the runner"
+              curl -s -m 10 -i http://127.0.0.1:9000/health/ready; echo
+            } > e2e-artifacts/keycloak-probe.txt 2>&1 || true
+            cat e2e-artifacts/keycloak-probe.txt
+          fi
+
+      - name: Upload logs
+        timeout-minutes: 10
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-podman-artifacts
+          path: e2e-artifacts/
+          retention-days: 7

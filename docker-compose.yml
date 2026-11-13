@@ -98,7 +98,9 @@ services:
       DISABLE_IPV6: "1"
       LOG_LEVEL: warning
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # The engine socket (contract §6): rootful Docker's, or the operator's
+      # rootless Podman socket (PORTCULLIS_ENGINE_SOCKET, written by init).
+      - ${PORTCULLIS_ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
     networks:
       - socket-proxy-traefik
     healthcheck:
@@ -145,7 +147,9 @@ services:
       DISABLE_IPV6: "1"
       LOG_LEVEL: warning
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # The engine socket (contract §6): rootful Docker's, or the operator's
+      # rootless Podman socket (PORTCULLIS_ENGINE_SOCKET, written by init).
+      - ${PORTCULLIS_ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
     networks:
       - socket-proxy-hub
     healthcheck:
@@ -158,7 +162,7 @@ services:
     restart: unless-stopped
 
   traefik:
-    image: traefik:v3.7.17@sha256:f4bb143d1135a579b630ed491e17ec50f6f7c9c6a30585ff3d385471d2a86f5a
+    image: docker.io/library/traefik:v3.7.17@sha256:f4bb143d1135a579b630ed491e17ec50f6f7c9c6a30585ff3d385471d2a86f5a
     <<: *hardening
     # Runs as root (binds :80/:443, owns the ACME volume) but with no
     # capability except binding low ports; root without CAP_DAC_OVERRIDE
@@ -289,7 +293,7 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: postgres:18.6-alpine3.24@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
+    image: docker.io/library/postgres:18.6-alpine3.24@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
     <<: *hardening
     # The image's postgres user. /var/lib/postgresql is postgres-owned in
     # the image, so a fresh volume inherits it and the entrypoint needs no
@@ -323,7 +327,7 @@ services:
     restart: unless-stopped
 
   vault:
-    image: hashicorp/vault:2.2.1@sha256:962a92876e168d68eaaa24b0b8b49bbce1cb63024060a67bba95cd158a366fc2
+    image: docker.io/hashicorp/vault:2.2.1@sha256:962a92876e168d68eaaa24b0b8b49bbce1cb63024060a67bba95cd158a366fc2
     <<: *hardening
     # The image's vault user (uid 100, gid 1000). secrets/vault-unseal is
     # group 1000, mode 0750/0640 (./portcullis vault init|up).
@@ -366,7 +370,7 @@ services:
 
   lldap:
     # -rootless: runs as lldap (uid 1000), /data is lldap-owned in the image.
-    image: lldap/lldap:v0.6.3-alpine-rootless@sha256:ba2c50930ea998eefd5454aa678a7977448019248b1827da87d330df0b71c284
+    image: docker.io/lldap/lldap:v0.6.3-alpine-rootless@sha256:ba2c50930ea998eefd5454aa678a7977448019248b1827da87d330df0b71c284
     <<: *hardening
     read_only: true
     tmpfs:
@@ -479,7 +483,10 @@ services:
       portcullis-mcp:
         ipv4_address: ${PORTCULLIS_MCP_KEYCLOAK_IP:-172.31.253.2}
     healthcheck:
-      test: ["CMD", "bash", "-c", "{ printf 'HEAD /health/ready HTTP/1.0\\r\\n\\r\\n' >&0; grep 'HTTP/1.0 200'; } 0<>/dev/tcp/localhost/9000"]
+      # One CMD-SHELL string: Podman's compat API re-splits exec-form (CMD)
+      # arguments on whitespace (a `bash -c '<script>'` reached the
+      # container as `bash -c '{'`), so no CMD argument may contain a space.
+      test: ["CMD-SHELL", "bash -c '{ printf \"HEAD /health/ready HTTP/1.0\\r\\n\\r\\n\" >&0; grep \"HTTP/1.0 200\"; } 0<>/dev/tcp/localhost/9000'"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -541,7 +548,7 @@ services:
   # per oauth2-proxy limited to its own ticket keys, the default user off.
   # The config (with the users' password hashes) is generated from .env.
   sessions:
-    image: valkey/valkey:9.1.3-alpine3.24@sha256:bf09d58e96d6b4524a15396b65b242bbe18beebbcc15a04d8ee75ddac62fae0b
+    image: docker.io/valkey/valkey:9.1.3-alpine3.24@sha256:bf09d58e96d6b4524a15396b65b242bbe18beebbcc15a04d8ee75ddac62fae0b
     <<: *hardening
     # The image's valkey user; its entrypoint only drops privileges when
     # started as root, so it runs valkey-server directly.
@@ -802,7 +809,8 @@ services:
     networks:
       - portcullis
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)"]
+      # One CMD-SHELL string (Podman re-splits CMD arguments on whitespace).
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)\""]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -858,15 +866,21 @@ services:
     # 10001-owned in the image), /project/templates and /project/appfiles
     # (chowned to 10001 by ./portcullis up) and the tmpfs paths below.
     read_only: true
+    # /home/hub ($HOME of the image's user 10001): sticky world-writable
+    # instead of uid=/gid= options, which Podman's compat API refuses
+    # ("unknown mount option uid=10001"); only uid 10001 runs in here.
     tmpfs:
       - /tmp
-      - /home/hub:uid=10001,gid=10001,mode=0700
+      - /home/hub:mode=1777
     environment:
       PROJECT_DIR: /project
       PROJECT_HOST_DIR: ${PWD:-.}
       HUB_DATA_DIR: /data
       # No socket mount: Engine API + `docker compose` via its proxy (contract §6).
       DOCKER_HOST: tcp://socket-proxy-hub:2375
+      # docker | podman (rootless): the Hub verifies the engine's /version
+      # against it and refuses every engine operation on a mismatch (503).
+      HUB_CONTAINER_RUNTIME: ${CONTAINER_RUNTIME:?CONTAINER_RUNTIME must be set in .env (./portcullis init writes it)}
       PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
       DEFAULT_TEMPLATES_URL: https://github.com/porelli/portcullis-templates.git
       PORTAL_DISPLAY_NAME: ${PORTAL_DISPLAY_NAME:-Portcullis}
@@ -1254,7 +1268,7 @@ services:
   # ./portcullis up). docs/monitoring.md. Config: monitoring/; generated
   # files and the Vault metrics token: secrets/monitoring/ (./portcullis up).
   prometheus:
-    image: prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
+    image: docker.io/prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
     profiles: [monitoring]
     <<: *hardening
     user: "65534:65534"
@@ -1281,7 +1295,7 @@ services:
     restart: unless-stopped
 
   alertmanager:
-    image: prom/alertmanager:v0.35.0@sha256:e638797febd034838eca8b98cdbd46f951e9bf7f178777aa8669167406a9946c
+    image: docker.io/prom/alertmanager:v0.35.0@sha256:e638797febd034838eca8b98cdbd46f951e9bf7f178777aa8669167406a9946c
     profiles: [monitoring]
     <<: *hardening
     user: "65534:65534"
@@ -1307,7 +1321,7 @@ services:
     restart: unless-stopped
 
   blackbox:
-    image: prom/blackbox-exporter:v0.29.1@sha256:ea1c7aa3ef3f307cd03e85f34abb604478ccb90b567fc690da0cd9776da76b13
+    image: docker.io/prom/blackbox-exporter:v0.29.1@sha256:ea1c7aa3ef3f307cd03e85f34abb604478ccb90b567fc690da0cd9776da76b13
     profiles: [monitoring]
     <<: *hardening
     user: "65534:65534"
@@ -1335,7 +1349,7 @@ services:
   # ./portcullis status --textfile): backup age, client-cert / CA expiry.
   # Only the textfile collector — no host metrics, no host mounts.
   textfile-exporter:
-    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    image: docker.io/prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
     profiles: [monitoring]
     <<: *hardening
     user: "65534:65534"
@@ -1358,7 +1372,7 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
+    image: docker.io/grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
     profiles: [monitoring]
     <<: *hardening
     user: "472:472"

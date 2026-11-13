@@ -361,7 +361,8 @@ dns_main_env_write() {
   if [ "$when" = if-running ] && [ -z "$(dc ps -q --status running domains 2>/dev/null)" ]; then
     return 0
   fi
-  dc up -d domains >/dev/null 2>&1 || warn "could not restart the domains service to read main-domain.env"
+  # shellcheck disable=SC2046  # nothing or --no-build
+  dc up -d $(runtime_no_build) domains >/dev/null 2>&1 || warn "could not restart the domains service to read main-domain.env"
   return 0
 }
 

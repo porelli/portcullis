@@ -1,0 +1,136 @@
+# Rootless Podman on an SELinux-enforcing host only: ./portcullis adds this
+# file to COMPOSE_FILE when CONTAINER_RUNTIME=podman and `getenforce` says
+# Enforcing (scripts/lib/runtime.sh runtime_export). Never on Docker, never
+# by hand.
+#
+# - Every bind mount whose source is inside the checkout, re-declared in long
+#   syntax with an SELinux label and the same target and read_only as
+#   docker-compose.yml (compose merges service volumes by target):
+#   `Z` (private to that container) when only that service mounts the path,
+#   `z` (shared) only when several services mount it or a path above /
+#   below it, and on templates/ and appfiles/, whose subdirectories the
+#   Hub's app instances mount (the Hub's renderer labels those binds z).
+#   create_host_path stays unset: a missing source fails here
+#   instead of being created (stack_prepare makes every source before `up`).
+# - Never relabelled: the checkout itself, secrets/ and backups/ as trees,
+#   .env (each secret stays a per-file / per-directory mount labelled for
+#   its readers), user data (/srv, /mnt, /media, homes) and the engine
+#   socket. So the Hub's `.:/project:ro` becomes a 1 MiB tmpfs here, with
+#   the one core file it reads from the checkout root (group-gate's map)
+#   bound into it; its other /project paths are their own mounts
+#   (templates/, appfiles/, .env = secrets/hub/core.env).
+# - The two socket proxies get `label=disable`: container_t can't connectto
+#   the operator's Podman socket. No other compose service gets it (CI checks
+#   both). This rule is for long-running services: the CLI's own short-lived
+#   helpers that bind-mount host files (scripts/lib/common.sh ct_run, restic)
+#   run with label=disable under Podman instead of relabelling backups/ or
+#   secrets/, and ct_own uses `podman unshare chown` (no container).
+#   security_opt lists: compose appends the overlay's items to the base's, so
+#   only `label=disable` is listed here (repeating no-new-privileges:true is a
+#   duplicate item newer compose refuses).
+#
+# Keep in sync with docker-compose.yml: CI fails when a project bind there
+# has no entry here (or a different read_only / label rule), when a label
+# lands on the checkout, secrets/, backups/ or .env (or a parent of them),
+# or when this file names a service the base doesn't have.
+
+services:
+  socket-proxy-traefik:
+    security_opt: ["label=disable"]
+
+  socket-proxy-hub:
+    security_opt: ["label=disable"]
+
+  traefik:
+    volumes:
+      - {type: bind, source: ./traefik/dynamic, target: /etc/traefik/dynamic, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./certs, target: /certs, read_only: true, bind: {selinux: z}}
+      - {type: bind, source: ./secrets/domains/certs-endpoint/ca.crt, target: /run/portcullis/domains-endpoint/ca.crt, read_only: true, bind: {selinux: z}}
+      - {type: bind, source: ./secrets/domains/certs-endpoint/client.crt, target: /run/portcullis/domains-endpoint/client.crt, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/domains/certs-endpoint/client.key, target: /run/portcullis/domains-endpoint/client.key, read_only: true, bind: {selinux: Z}}
+
+  vault:
+    volumes:
+      - {type: bind, source: ./vault, target: /vault/portcullis, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/vault-unseal, target: /vault/unseal, read_only: true, bind: {selinux: Z}}
+
+  keycloak:
+    volumes:
+      - {type: bind, source: ./keycloak/realm-export.json, target: /opt/keycloak/data/import/realm-export.json, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./keycloak/themes/portcullis, target: /opt/keycloak/themes/portcullis, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./certs/truststore, target: /opt/keycloak/conf/truststores/portcullis, read_only: true, bind: {selinux: z}}
+
+  sessions:
+    volumes:
+      - {type: bind, source: ./secrets/sessions/valkey.conf, target: /etc/valkey/valkey.conf, read_only: true, bind: {selinux: Z}}
+
+  forward-auth:
+    volumes:
+      - {type: bind, source: ./certs/ca-bundle.crt, target: /etc/ssl/certs/ca-certificates.crt, read_only: true, bind: {selinux: z}}
+      - {type: bind, source: ./oauth2-proxy/alpha.yaml, target: /etc/oauth2-proxy/alpha.yaml, read_only: true, bind: {selinux: z}}
+
+  forward-auth-ext:
+    volumes:
+      - {type: bind, source: ./certs/ca-bundle.crt, target: /etc/ssl/certs/ca-certificates.crt, read_only: true, bind: {selinux: z}}
+      - {type: bind, source: ./oauth2-proxy/alpha.yaml, target: /etc/oauth2-proxy/alpha.yaml, read_only: true, bind: {selinux: z}}
+
+  group-gate:
+    volumes:
+      - {type: bind, source: ./group-gate/group-gate-map.conf, target: /etc/group-gate/map.conf, read_only: true, bind: {selinux: z}}
+      - {type: bind, source: ./certs/revocation, target: /etc/group-gate/revocation, read_only: true, bind: {selinux: z}}
+      - {type: bind, source: ./certs/yubikey-ca.crt, target: /etc/group-gate/ca/yubikey-ca.crt, read_only: true, bind: {selinux: z}}
+      - {type: bind, source: ./certs/browser-ca.crt, target: /etc/group-gate/ca/browser-ca.crt, read_only: true, bind: {selinux: z}}
+
+  hub:
+    volumes:
+      - {type: tmpfs, target: /project, tmpfs: {size: 1048576, mode: 0755}}
+      - {type: bind, source: ./templates, target: /project/templates, read_only: false, bind: {selinux: z}}
+      - {type: bind, source: ./appfiles, target: /project/appfiles, read_only: false, bind: {selinux: z}}
+      - {type: bind, source: ./secrets/hub/core.env, target: /project/.env, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/hub/lldap, target: /run/portcullis/lldap, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/hub/invite, target: /run/portcullis/invite, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/domains/api-secret, target: /run/portcullis/domains/api-secret, read_only: true, bind: {selinux: z}}
+      - {type: bind, source: ./secrets/mcp-gate/hub-secret, target: /run/portcullis/mcp-gate/hub-secret, read_only: true, bind: {selinux: z}}
+      - {type: bind, source: ./secrets/mcp-gate/age.pub, target: /run/portcullis/mcp-gate/age.pub, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./group-gate/group-gate-map.conf, target: /project/group-gate/group-gate-map.conf, read_only: true, bind: {selinux: z}}
+
+  enroll:
+    volumes:
+      - {type: bind, source: ./secrets/enroll, target: /run/secrets/portcullis-enroll, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./group-gate/group-gate-map.conf, target: /etc/group-gate/map.conf, read_only: true, bind: {selinux: z}}
+
+  domains:
+    volumes:
+      - {type: bind, source: ./secrets/domains/api-secret, target: /run/portcullis/domains/api-secret, read_only: true, bind: {selinux: z}}
+      - {type: bind, source: ./secrets/domains/age.key, target: /run/portcullis/domains/age.key, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/domains/certs-endpoint/ca.crt, target: /run/portcullis/domains/certs-endpoint/ca.crt, read_only: true, bind: {selinux: z}}
+      - {type: bind, source: ./secrets/domains/certs-endpoint/server.crt, target: /run/portcullis/domains/certs-endpoint/server.crt, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/domains/certs-endpoint/server.key, target: /run/portcullis/domains/certs-endpoint/server.key, read_only: true, bind: {selinux: Z}}
+
+  mcp-gate:
+    volumes:
+      - {type: bind, source: ./secrets/mcp-gate/age.key, target: /run/portcullis/mcp-gate/age.key, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/mcp-gate/hub-secret, target: /run/portcullis/mcp-gate/hub-secret, read_only: true, bind: {selinux: z}}
+
+  prometheus:
+    volumes:
+      - {type: bind, source: ./monitoring/prometheus, target: /etc/prometheus, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/monitoring/prometheus, target: /etc/portcullis, read_only: true, bind: {selinux: Z}}
+
+  alertmanager:
+    volumes:
+      - {type: bind, source: ./secrets/monitoring/alertmanager, target: /etc/portcullis, read_only: true, bind: {selinux: Z}}
+
+  blackbox:
+    volumes:
+      - {type: bind, source: ./monitoring/blackbox/blackbox.yml, target: /etc/blackbox_exporter/config.yml, read_only: true, bind: {selinux: Z}}
+
+  textfile-exporter:
+    volumes:
+      - {type: bind, source: ./monitoring/textfile, target: /textfile, read_only: true, bind: {selinux: Z}}
+
+  grafana:
+    volumes:
+      - {type: bind, source: ./monitoring/grafana/provisioning, target: /etc/grafana/provisioning, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./monitoring/grafana/dashboards, target: /var/lib/grafana-dashboards, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/monitoring/grafana, target: /run/secrets/grafana, read_only: true, bind: {selinux: Z}}

@@ -27,7 +27,7 @@ _mcpgate_keygen() {
   local f="$1" tmp
   if ! docker image inspect "$MCPGATE_IMAGE_NAME" >/dev/null 2>&1; then
     info "Building the mcp-gate image (needed to generate its age key)..."
-    dc build mcp-gate >/dev/null || fail "could not build the mcp-gate image"
+    runtime_build_service mcp-gate >/dev/null || fail "could not build the mcp-gate image"
   fi
   tmp="$(mktemp "$f.XXXXXX")"
   chmod 600 "$tmp"
@@ -78,6 +78,6 @@ mcpgate_fix_perms() {
   for f in "$d/age.key" "$d/age.pub" "$d/hub-secret"; do
     [ ! -e "$f" ] || chmod 640 "$f"
   done
-  [ ! -e "$d/age.key" ] || ct_own "$(id -u):$CT_UID_MCP_GATE" "$d/age.key"
-  ct_own "$(id -u):$CT_UID_HUB" "$d/age.pub" "$d/hub-secret"
+  [ ! -e "$d/age.key" ] || ct_own "$(ct_operator_id):$CT_UID_MCP_GATE" "$d/age.key"
+  ct_own "$(ct_operator_id):$CT_UID_HUB" "$d/age.pub" "$d/hub-secret"
 }

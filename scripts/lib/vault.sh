@@ -60,7 +60,20 @@ vault_use_container_cli() {
     echo "ERROR: neither a host vault CLI nor docker is available" >&2
     return 1
   }
-  vault() { dc exec -T -e VAULT_TOKEN vault vault "$@"; }
+  vault() { _vault_dc_exec "$@"; }
+}
+
+# _vault_dc_exec <vault args> — `vault` inside the core container.
+# VAULT_TOKEN goes by NAME (-e VAULT_TOKEN: compose copies the value, never
+# argv), and only while it is in the environment: a bare name for an unset
+# variable is dropped by Docker but refused by Podman's compat exec (400
+# "environment variable ... badly formed, must be key=value").
+_vault_dc_exec() {
+  if printenv VAULT_TOKEN >/dev/null 2>&1; then
+    dc exec -T -e VAULT_TOKEN vault vault "$@"
+  else
+    dc exec -T vault vault "$@"
+  fi
 }
 
 # vault_no_value <output> — true when a vault CLI answer is Vault's
@@ -82,7 +95,7 @@ vault_admin() {
 
 # vexec — the vault CLI inside the container (talks to its own listener; no
 # host CLI needed). VAULT_TOKEN is forwarded by name only.
-vexec() { dc exec -T -e VAULT_TOKEN vault vault "$@"; }
+vexec() { _vault_dc_exec "$@"; }
 
 # vault_health_code — HTTP status of /v1/sys/health:
 #   200 active, 429 standby, 472/473 DR/perf standby, 501 not initialised,
@@ -123,22 +136,31 @@ _vault_start_and_status() {
   local i rc status=""
   if [ -z "$(dc ps -q --status running vault 2>/dev/null)" ]; then
     info "Starting vault container..."
-    dc up -d --no-deps vault
+    # shellcheck disable=SC2046  # nothing or --no-build
+    dc up -d $(runtime_no_build) --no-deps vault
   fi
   info "Waiting for the Vault API..."
+  local err
+  err="$(mktemp)"
   for ((i = 1; i <= 60; i++)); do
     rc=0
-    status="$(vexec status -format=json 2>/dev/null)" || rc=$?
+    status="$(vexec status -format=json 2>"$err")" || rc=$?
     # vault status: 0 = unsealed, 2 = sealed (incl. uninitialised), 1 = error
     if { [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; } && printf '%s' "$status" | jq -e 'has("initialized")' >/dev/null 2>&1; then
       break
     fi
     if [ "$i" -eq 60 ]; then
       dc logs --tail=30 vault >&2 || true
+      # The last `vault status` attempt's own error (no secret: status takes
+      # none, and compose / the engine name variables, never values).
+      echo "vault status (exit $rc) said:" >&2
+      tail -n 20 "$err" | sed 's/^/    /' >&2
+      rm -f "$err"
       fail "Vault API did not come up. See the logs above."
     fi
     sleep 2
   done
+  rm -f "$err"
   VAULT_INITIALIZED="$(printf '%s' "$status" | jq -r '.initialized')"
   VAULT_SEALED="$(printf '%s' "$status" | jq -r '.sealed')"
 }

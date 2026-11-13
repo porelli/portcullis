@@ -57,11 +57,11 @@ _prompt() {
   fi
 }
 
-# init_write_env <domain> <email> <provider> — create .env (0600) with every
-# secret freshly generated. Credentials come from the environment or a
-# silent prompt, never from the command line.
+# init_write_env <domain> <email> <provider> <runtime> — create .env (0600)
+# with every secret freshly generated. Credentials come from the environment
+# or a silent prompt, never from the command line.
 init_write_env() {
-  local domain="$1" email="$2" provider="$3" file v val creds="" old_umask
+  local domain="$1" email="$2" provider="$3" rt="$4" file v val creds="" old_umask rtkeys
   file="$(env_file)"
   for v in $(_dns_cred_vars "$provider"); do
     val="${!v:-}"
@@ -73,6 +73,8 @@ init_write_env() {
     case "$val" in *$'\n'*) fail "$v contains a newline" ;; esac
     creds="$creds$v=$val"$'\n'
   done
+  rtkeys="CONTAINER_RUNTIME=$rt"
+  [ "$rt" != podman ] || rtkeys="$rtkeys"$'\n'"PORTCULLIS_ENGINE_SOCKET=$(runtime_podman_socket)"
   old_umask="$(umask)"
   umask 077
   cat > "$file" <<EOF
@@ -88,6 +90,11 @@ ACME_STAGING=false
 
 DNS_PROVIDER=$provider
 ${creds}
+# Container runtime: chosen by ./portcullis init, never switched (to move to
+# the other one: ./portcullis backup → a fresh init → ./portcullis restore).
+# podman = rootless Podman through the operator's user socket.
+${rtkeys}
+
 KEYCLOAK_ADMIN=admin
 LLDAP_BASE_DN=dc=$(printf '%s' "$domain" | sed 's/\./,dc=/g')
 
@@ -135,12 +142,37 @@ EOF
   umask "$old_umask"
 }
 
+# _init_runtime_existing <flag> — an existing .env: its CONTAINER_RUNTIME
+# is never switched (neither by --runtime nor the environment); a missing or
+# empty one (a copied .env.example) is filled from runtime_detect, like a
+# missing secret.
+_init_runtime_existing() {
+  local flag="$1" have rt
+  have="$(env_get CONTAINER_RUNTIME)"
+  if [ -n "$have" ]; then
+    case "$have" in docker|podman) ;; *) fail "CONTAINER_RUNTIME=$have in .env is neither docker nor podman" ;; esac
+    for rt in "$flag" "${CONTAINER_RUNTIME:-}"; do
+      [ -z "$rt" ] || [ "$rt" = "$have" ] || fail "CONTAINER_RUNTIME is $have in .env and is never switched (backup → fresh init → restore)"
+    done
+    return 0
+  fi
+  rt="$(runtime_detect "$flag")" || exit 1
+  env_set CONTAINER_RUNTIME "$rt"
+  info "Set CONTAINER_RUNTIME=$rt in .env"
+  if [ "$rt" = podman ] && [ -z "$(env_get PORTCULLIS_ENGINE_SOCKET)" ]; then
+    env_set PORTCULLIS_ENGINE_SOCKET "$(runtime_podman_socket)"
+    info "Set PORTCULLIS_ENGINE_SOCKET=$(runtime_podman_socket) in .env"
+  fi
+  export CONTAINER_RUNTIME="$rt"
+}
+
 init_run() {
-  local domain="$1" email="$2" provider="$3" env_only="$4" skip_dns="$5" config_repo="$6" v
+  local domain="$1" email="$2" provider="$3" env_only="$4" skip_dns="$5" config_repo="$6" runtime="${7:-}" v rt
   require_cmd openssl
   if [ -f "$(env_file)" ]; then
     info "Using the existing $(env_file)."
     [ -z "$domain$email$provider" ] || warn "--domain/--email/--dns-provider are ignored: .env already exists (edit it instead)."
+    _init_runtime_existing "$runtime"
   else
     [ -n "$domain" ] || domain="${PORTCULLIS_DOMAIN:-}"
     if [ -z "$domain" ]; then
@@ -158,7 +190,11 @@ init_run() {
     fi
     _prompt provider "DNS provider" cloudflare
     [[ "$provider" =~ ^[a-z0-9_-]+$ ]] || fail "invalid DNS provider: '$provider'"
-    init_write_env "$domain" "$email" "$provider"
+    [ -z "$runtime" ] || [ -z "${CONTAINER_RUNTIME:-}" ] || [ "$runtime" = "$CONTAINER_RUNTIME" ] \
+      || fail "--runtime $runtime contradicts CONTAINER_RUNTIME=$CONTAINER_RUNTIME in the environment"
+    rt="$(runtime_detect "$runtime")" || exit 1
+    init_write_env "$domain" "$email" "$provider" "$rt"
+    export CONTAINER_RUNTIME="$rt"
     ok "Created $(env_file) (0600)."
   fi
   # Any secret that is empty/missing is generated — on a fresh .env that is
@@ -170,6 +206,7 @@ init_run() {
   env_load
   # shellcheck disable=SC2086
   env_require PORTCULLIS_DOMAIN $CORE_SECRETS
+  runtime_name >/dev/null
 
   if [ "$env_only" = true ]; then
     ok ".env is ready. Review it, then run ./portcullis init to set up the stack."
@@ -177,6 +214,8 @@ init_run() {
   fi
 
   require_cmd docker jq curl
+  runtime_check
+  runtime_require_host
   docker compose version >/dev/null 2>&1 || fail "the docker compose plugin is required"
   network_check
 
@@ -205,7 +244,7 @@ init_run() {
   done
   sessions_restart_if_changed
   # shellcheck disable=SC2086
-  dc up -d --build $hub_excluded
+  stack_compose_up $hub_excluded
   wait_healthy 300 vault postgres lldap keycloak
 
   info "Creating the Vault PKI..."
@@ -225,7 +264,8 @@ init_run() {
   lldap_service_account
 
   info "Starting the Hub..."
-  dc up -d hub
+  # shellcheck disable=SC2046  # nothing or --no-build
+  dc up -d $(runtime_no_build) hub
   # The Hub's image has a HEALTHCHECK: wait until it reports healthy
   # (a missing check would show "running"; both count).
   local i st=""
@@ -432,11 +472,14 @@ stack_up() {
   env_require PORTCULLIS_DOMAIN $CORE_SECRETS
   require_cmd docker jq curl
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
+  runtime_check
+  runtime_require_host
   network_check
   stack_prepare
   config_apply
   sessions_restart_if_changed
-  dc up -d --build
+  stack_compose_up
+  runtime_proxies_refresh
   domains_restart_if_renewed
   monitoring_reload
   signin_ca_reload
@@ -465,6 +508,8 @@ upgrade_run() {
   # shellcheck disable=SC2086
   env_require PORTCULLIS_DOMAIN $CORE_SECRETS
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
+  runtime_check
+  runtime_require_host
   network_check
   hub_pinned_warn
 
@@ -484,7 +529,8 @@ upgrade_run() {
 
   info "Starting services..."
   sessions_restart_if_changed
-  dc up -d --build
+  stack_compose_up
+  runtime_proxies_refresh
   domains_restart_if_renewed
   monitoring_reload
   # Traefik, Keycloak and group-gate: whenever the CA files differ from the
@@ -506,7 +552,8 @@ upgrade_run() {
     dc restart hub >/dev/null
   fi
   # Picks up a FORWARD_AUTH_CLIENT_SECRET generated above, if any.
-  dc up -d forward-auth forward-auth-ext >/dev/null
+  # shellcheck disable=SC2046  # nothing or --no-build
+  dc up -d $(runtime_no_build) forward-auth forward-auth-ext >/dev/null
   signin_ca_reload
   info "Checking the Hub's policy file against group-gate..."
   hub_policy_check
@@ -528,7 +575,8 @@ BACKUP_PASSWORD for off-host backups), then: DNS records, Vault init + unseal + 
 AppRole, CA bundle, `docker compose up`, Vault PKI (incl. a self-signed
 wildcard server cert for local use), Keycloak realm, OIDC clients, config/.
 
-With an existing .env it is kept; only empty/missing secrets are generated.
+With an existing .env it is kept; only empty/missing secrets (and a missing
+CONTAINER_RUNTIME) are generated; its CONTAINER_RUNTIME is never switched.
 Every step is idempotent, so init can be re-run after a failure.
 
 Options:
@@ -539,7 +587,14 @@ Options:
                           or another lego provider name (default: cloudflare)
   --non-interactive       never prompt; DNS credentials must be in the
                           environment (e.g. CLOUDFLARE_API_TOKEN=...)
-  --env-only              only write/complete .env, then stop
+  --runtime docker|podman container runtime, written to .env as
+                          CONTAINER_RUNTIME and never switched afterwards
+                          (default: CONTAINER_RUNTIME from the environment,
+                          else Docker if its engine answers, else rootless
+                          Podman on the user socket; podman needs the host
+                          preparation of docs operations/rootless-podman)
+  --env-only              only write/complete .env, then stop (refused
+                          without --runtime when no engine answers)
   --skip-dns              do not create DNS records
   --no-config-repo        do not create the config/ git repo
 
@@ -554,8 +609,11 @@ Usage: portcullis up
 
 Start (or update) the core stack: checks .env and the portcullis-proxy
 network settings, creates bind-mount sources, rebuilds certs/ca-bundle.crt,
-runs `docker compose up -d --build` and waits for vault, postgres, lldap
-and keycloak to be healthy. Vault unseals itself on start.
+runs `docker compose up -d --build` (rootless Podman: the local images are
+built with `podman build`, then `up -d --no-build`) and waits for vault,
+postgres, lldap and keycloak to be healthy. Vault unseals itself on start.
+Checks CONTAINER_RUNTIME against the engine and, under podman, the host
+preparation (refused while an item fails; ./portcullis status lists them).
 EOF
 }
 
@@ -593,7 +651,7 @@ EOF
 }
 
 cmd_init() {
-  local domain="" email="" provider="" env_only=false skip_dns=false config_repo=true
+  local domain="" email="" provider="" env_only=false skip_dns=false config_repo=true runtime=""
   INIT_INTERACTIVE=true
   [ -t 0 ] || INIT_INTERACTIVE=false
   while [ $# -gt 0 ]; do
@@ -601,6 +659,10 @@ cmd_init() {
       --domain) need_value init "$1" "${2:-}"; domain="$2"; shift ;;
       --email) need_value init "$1" "${2:-}"; email="$2"; shift ;;
       --dns-provider) need_value init "$1" "${2:-}"; provider="$2"; shift ;;
+      --runtime)
+        need_value init "$1" "${2:-}"
+        case "$2" in docker|podman) runtime="$2" ;; *) usage_error init "--runtime must be docker or podman" ;; esac
+        shift ;;
       --non-interactive) INIT_INTERACTIVE=false ;;
       --env-only) env_only=true ;;
       --skip-dns) skip_dns=true ;;
@@ -610,7 +672,7 @@ cmd_init() {
     esac
     shift
   done
-  init_run "$domain" "$email" "$provider" "$env_only" "$skip_dns" "$config_repo"
+  init_run "$domain" "$email" "$provider" "$env_only" "$skip_dns" "$config_repo" "$runtime"
 }
 
 cmd_up() {

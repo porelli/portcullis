@@ -1,0 +1,5 @@
+# Local `actionlint` (CI doesn't run it): GitHub-hosted labels newer than
+# the linter's built-in list.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04

@@ -138,10 +138,24 @@ env_set() {
   rm -f "$tmp"
 }
 
-# need_env — load .env (fail if missing).
+# env_unset <key> [file] — remove every KEY= line, in place (like env_set).
+env_unset() {
+  local key="$1" file="${2:-$(env_file)}" tmp
+  [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || fail "env_unset: bad key '$key'"
+  [ -f "$file" ] || return 0
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" || return 0
+  tmp="$(mktemp)"
+  KEY="$key" awk 'BEGIN { k = ENVIRON["KEY"] } $0 !~ "^[[:space:]]*(export[[:space:]]+)?" k "=" { print }' "$file" > "$tmp"
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
+# need_env — load .env (fail if missing), then check the container runtime
+# (CONTAINER_RUNTIME, the engine behind it: scripts/lib/runtime.sh).
 need_env() {
   [ -f "$(env_file)" ] || fail "$(env_file) not found. Run ./portcullis init first."
   env_load
+  runtime_check
 }
 
 # env_require <var>... — fail listing every unset/empty variable.
@@ -274,20 +288,126 @@ CT_UID_LLDAP=1000     # lldap/lldap:*-rootless (lldap_data is 1000-owned)
 # operator can run docker, i.e. is root-equivalent anyway).
 PORTCULLIS_HELPER_IMAGE="alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a"
 
-# _owner_of <path> — "uid:gid" (GNU or BSD stat).
+# _owner_of <path> — "uid:gid" on the host (GNU or BSD stat).
 _owner_of() { stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1"; }
 
-# ct_own <uid:gid> <path>... — chown the paths (no-op for those already
-# right). As root directly, otherwise via a throwaway root container with
-# only CAP_CHOWN and no network.
-ct_own() {
-  local spec="$1" p i=0 todo=() mounts=() targets=()
+# Container ids vs host ids. Docker (rootful): the same. Rootless Podman:
+# every container shares the operator's default user namespace, so
+# container id 0 is the operator and 1 ≤ c < 65536 is subuid_start + c − 1
+# (scripts/lib/runtime.sh runtime_id_maps, from the live map — never a
+# guess). Container root is the OPERATOR there: files the operator must
+# keep are chowned to "$(ct_operator_id):<gid>", never "$(id -u):…" (that
+# would hand them to a subordinate id).
+
+# ct_operator_id — the container uid that is the operator on the host.
+ct_operator_id() {
+  if _rt_is_podman; then echo 0; else id -u; fi
+}
+
+# _ct_maps — the rootless id map (cached); an unreadable or unexpected map refuses.
+_ct_maps() {
+  [ -z "${_RT_UID_START:-}" ] || return 0
+  runtime_id_maps || fail "can't read the rootless id map (podman unshare cat /proc/self/uid_map and gid_map): 0 must map to the operator and 1… to one range of at least $RT_MIN_IDS subordinate ids (/etc/subuid, /etc/subgid)"
+}
+
+# _ct_to_host <op> <start> <count> <container id> — the host id, or exit 1.
+_ct_to_host() {
+  case "$4" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$4" -eq 0 ]; then echo "$1"
+  elif [ "$4" -le "$3" ] && [ "$4" -lt 65536 ]; then echo $(($2 + $4 - 1))
+  else return 1; fi
+}
+
+# ct_host_id <c> / ct_host_gid <c> — the host uid / gid of container id c
+# (docker: c itself); an id outside the map exits 1.
+ct_host_id() {
+  if ! _rt_is_podman; then echo "$1"; return 0; fi
+  _ct_maps
+  _ct_to_host "$_RT_UID_OP" "$_RT_UID_START" "$_RT_UID_N" "$1" || { echo "container uid $1 is outside the rootless id map" >&2; return 1; }
+}
+ct_host_gid() {
+  if ! _rt_is_podman; then echo "$1"; return 0; fi
+  _ct_maps
+  _ct_to_host "$_RT_GID_OP" "$_RT_GID_START" "$_RT_GID_N" "$1" || { echo "container gid $1 is outside the rootless id map" >&2; return 1; }
+}
+
+# _ct_from_host <op> <start> <count> <host id> — the container id, or exit 1.
+_ct_from_host() {
+  if [ "$4" = "$1" ]; then echo 0
+  elif [ "$4" -ge "$2" ] && [ "$4" -lt $(($2 + $3)) ] && [ $(($4 - $2 + 1)) -lt 65536 ]; then echo $(($4 - $2 + 1))
+  else return 1; fi
+}
+
+# _owner_of_ct <path> — "uid:gid" in container ids (docker: the host ids);
+# "unmapped" when either side is outside the rootless map (host root,
+# another account: shown as 65534 inside).
+_owner_of_ct() {
+  local own u g cu cg
+  own="$(_owner_of "$1")" || return 1
+  _rt_is_podman || { echo "$own"; return 0; }
+  _ct_maps
+  u="${own%%:*}" g="${own#*:}"
+  if cu="$(_ct_from_host "$_RT_UID_OP" "$_RT_UID_START" "$_RT_UID_N" "$u")" \
+     && cg="$(_ct_from_host "$_RT_GID_OP" "$_RT_GID_START" "$_RT_GID_N" "$g")"; then
+    echo "$cu:$cg"
+  else
+    echo unmapped
+  fi
+}
+
+# _sq <string> — the string single-quoted for a POSIX shell (each embedded
+# ' as '\''), so a pasted hint never runs anything but the command.
+_sq() { printf "'%s'" "${1//\'/\'\\\'\'}"; }
+
+# ct_hint_chown <uid:gid> <path>... — the command that fixes an owner by
+# hand, every path single-quoted.
+ct_hint_chown() {
+  local spec="$1" p out=""
   shift
+  for p in "$@"; do out+=" $(_sq "$p")"; done
+  if _rt_is_podman; then echo "podman unshare chown $spec$out"; else echo "sudo chown $spec$out"; fi
+}
+
+# ct_run <docker run args...> — `docker run` for the CLI's own short-lived
+# helper containers that bind-mount host files (restores, restic). Under
+# rootless Podman they run with `--security-opt label=disable`: on an
+# SELinux-enforcing host a confined helper can't touch checkout files, and
+# relabelling backups/ or secrets/ (z / Z) is forbidden. These are our own
+# pinned images, run on the operator's command for seconds; long-running
+# compose services never get label=disable (only the two socket proxies,
+# docker-compose.podman-selinux.yml, CI-linted). Docker: unchanged.
+ct_run() {
+  if _rt_is_podman; then
+    docker run --security-opt label=disable "$@"
+  else
+    docker run "$@"
+  fi
+}
+
+# ct_own <uid:gid> <path>... — chown the paths to these CONTAINER ids (no-op
+# for those already right). Docker: as root directly, otherwise via a
+# throwaway root container with only CAP_CHOWN and no network. Rootless
+# Podman: `podman unshare chown` (the same user namespace as every
+# container, so 10001 writes the host's subuid+10000; no container, no bind
+# mount, nothing relabelled), never chown directly.
+ct_own() {
+  local spec="$1" p i=0 podman=false todo=() mounts=() targets=()
+  shift
+  if _rt_is_podman; then podman=true; _ct_maps; fi
   for p in "$@"; do
     [ -e "$p" ] || continue
-    [ "$(_owner_of "$p")" = "$spec" ] || todo+=("$p")
+    if [ "$podman" = true ]; then
+      [ "$(_owner_of_ct "$p")" = "$spec" ] || todo+=("$p")
+    else
+      [ "$(_owner_of "$p")" = "$spec" ] || todo+=("$p")
+    fi
   done
   [ "${#todo[@]}" -gt 0 ] || return 0
+  if [ "$podman" = true ]; then
+    podman unshare chown -- "$spec" "${todo[@]}" >/dev/null \
+      || fail "could not chown ${todo[*]} to $spec (try: $(ct_hint_chown "$spec" "${todo[@]}"))"
+    return
+  fi
   if [ "$(id -u)" = 0 ]; then
     chown "$spec" "${todo[@]}"
     return
@@ -301,7 +421,7 @@ ct_own() {
   docker run --rm --network none --user 0:0 --cap-drop ALL --cap-add CHOWN \
     --security-opt no-new-privileges:true "${mounts[@]}" "$PORTCULLIS_HELPER_IMAGE" \
     chown "$spec" "${targets[@]}" >/dev/null \
-    || fail "could not chown ${todo[*]} to $spec (try: sudo chown $spec ${todo[*]})"
+    || fail "could not chown ${todo[*]} to $spec (try: $(ct_hint_chown "$spec" "${todo[@]}"))"
 }
 
 # volume_own <volume> <uid:gid> — make sure the compose named volume exists
@@ -334,7 +454,7 @@ ct_group_read() {
     [ -e "$p" ] || continue
     if [ -d "$p" ]; then chmod 750 "$p"; else chmod 640 "$p"; fi
   done
-  ct_own "$(id -u):$gid" "$@"
+  ct_own "$(ct_operator_id):$gid" "$@"
 }
 
 # secrets_fix_perms — ownership/modes of everything under secrets/ that a
@@ -380,6 +500,8 @@ hub_env_write() {
     [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
     case " $CORE_SECRETS " in *" $v "*) warn "HUB_SHARED_ENV: refusing to share core secret $v with the Hub"; continue ;; esac
     case "$content" in "$v="*|*$'\n'"$v="*) continue ;; esac
+    # Written below from the host (podman only), never shared by name.
+    [ "$v" != PORTCULLIS_UNPRIVILEGED_PORT_START ] || continue
     case "$v" in
       PORTCULLIS_DOMAIN) val="${PORTCULLIS_DOMAIN:-portcullis.local}" ;;
       PORTCULLIS_TRAEFIK_IP) val="$(proxy_traefik_ip)" ;;
@@ -391,6 +513,11 @@ hub_env_write() {
     esac
     content+="$v=$val"$'\n'
   done
+  # Rootless Podman: the host's ip_unprivileged_port_start (a per-netns
+  # sysctl the Hub can't read from inside its container; RootlessCompat).
+  if _rt_is_podman; then
+    content+="PORTCULLIS_UNPRIVILEGED_PORT_START=$(runtime_port_start)"$'\n'
+  fi
   (umask 077 && mkdir -p "$(dirname "$f")")
   [ -e "$f" ] || (umask 077 && : > "$f")
   {
@@ -424,7 +551,12 @@ stack_prepare() {
   local d
   (umask 077 && mkdir -p "$PORTCULLIS_ROOT/secrets/vault-unseal" "$PORTCULLIS_ROOT/secrets/enroll" "$PORTCULLIS_ROOT/secrets/hub" "$PORTCULLIS_ROOT/secrets/domains" "$PORTCULLIS_ROOT/secrets/mcp-gate")
   for d in secrets secrets/vault-unseal secrets/enroll secrets/hub secrets/domains secrets/mcp-gate; do
-    [ -w "$PORTCULLIS_ROOT/$d" ] || fail "$PORTCULLIS_ROOT/$d is not writable (created by Docker as root?). Fix: sudo chown -R \"$(id -un)\" \"$PORTCULLIS_ROOT/secrets\""
+    if [ ! -w "$PORTCULLIS_ROOT/$d" ]; then
+      if _rt_is_podman; then
+        fail "$PORTCULLIS_ROOT/$d is not writable (owned by a subordinate id?). Fix: podman unshare chown -R 0:0 \"$PORTCULLIS_ROOT/secrets\""
+      fi
+      fail "$PORTCULLIS_ROOT/$d is not writable (created by Docker as root?). Fix: sudo chown -R \"$(id -un)\" \"$PORTCULLIS_ROOT/secrets\""
+    fi
   done
   # templates/: the Hub (uid 10001) copies app template dirs here.
   # appfiles/: the Hub writes settings data files here (contract §13.7);
@@ -439,6 +571,12 @@ stack_prepare() {
   # binding"): they must be files before the first `up` (Docker would make
   # directories), empty until ./portcullis pki setup writes them — an empty
   # or unreadable file means no certificate counts (fail closed).
+  # forward-auth(-ext) bind-mount certs/ca-bundle.crt: a file before the
+  # first `up` (rootless Podman + SELinux: the overlay's long-syntax binds
+  # never create a missing source), empty — trusting nothing — until
+  # config apply builds it.
+  [ ! -d "$PORTCULLIS_ROOT/certs/ca-bundle.crt" ] || fail "$PORTCULLIS_ROOT/certs/ca-bundle.crt is a directory (made by Docker before config apply): remove it (rmdir) and run again"
+  [ -f "$PORTCULLIS_ROOT/certs/ca-bundle.crt" ] || { : > "$PORTCULLIS_ROOT/certs/ca-bundle.crt"; chmod 644 "$PORTCULLIS_ROOT/certs/ca-bundle.crt"; }
   local ca
   for ca in yubikey-ca.crt browser-ca.crt; do
     [ ! -d "$PORTCULLIS_ROOT/certs/$ca" ] || fail "$PORTCULLIS_ROOT/certs/$ca is a directory (made by Docker before pki setup): remove it (rmdir) and run again"
@@ -486,3 +624,8 @@ stack_prepare() {
 to_epoch() {
   date -d "$1" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$1" +%s 2>/dev/null || echo 0
 }
+
+# The container runtime (CONTAINER_RUNTIME, runtime_check, ...): every
+# caller of common.sh gets it.
+# shellcheck source=runtime.sh
+source "$PORTCULLIS_LIB/runtime.sh"

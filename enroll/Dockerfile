@@ -1,5 +1,5 @@
 # golang:1.27.3-alpine3.24
-FROM golang:1.27.3-alpine3.24@sha256:fa4881266890ef051f0ce63afdfaccb69bbe8186084387f4fafd60d7ecbabc71 AS builder
+FROM docker.io/library/golang:1.27.3-alpine3.24@sha256:fa4881266890ef051f0ce63afdfaccb69bbe8186084387f4fafd60d7ecbabc71 AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
@@ -8,7 +8,7 @@ COPY web/ ./web/
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /enroll .
 
 # alpine:3.24.3
-FROM alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+FROM docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
 RUN apk add --no-cache ca-certificates \
  && addgroup -S -g 10002 enroll \
  && adduser -S -D -H -u 10002 -G enroll enroll

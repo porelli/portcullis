@@ -158,7 +158,7 @@ _py_image() {
   local img
   img="$(_svc_image group-gate)"
   [ -n "$img" ] || fail "group-gate has no image name in the compose config"
-  docker image inspect "$img" >/dev/null 2>&1 || dc build --quiet group-gate >&2 \
+  docker image inspect "$img" >/dev/null 2>&1 || runtime_build_service group-gate >&2 \
     || fail "cannot build the group-gate image ($img)"
   printf '%s' "$img"
 }
@@ -178,11 +178,15 @@ _backup_manifest() {
   files="$(cd "$dir" && find . -type f ! -name MANIFEST.json -print0 | LC_ALL=C sort -z | _sha256_files \
     | jq -Rn '[inputs | capture("^(?<h>[0-9a-f]{64}) [ *](?<p>.*)$") | {key: (.p | ltrimstr("./")), value: .h}] | from_entries')" \
     || fail "could not checksum $dir"
+  local rt
+  rt="$(runtime_name)" || exit 1
   jq -n --argjson format "$BACKUP_FORMAT" --arg created "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --arg version "$(portcullis_version)" --arg domain "${PORTCULLIS_DOMAIN:-}" \
     --arg hub "$(_svc_image hub)" --arg kc "$(_svc_image keycloak)" --argjson files "$files" \
+    --arg rt "$rt" --arg rtv "$(runtime_version)" \
     '{format: $format, created: $created, portcullis_version: $version, domain: $domain,
-      hub_image: $hub, keycloak_image: $kc, files: $files}' > "$dir/MANIFEST.json"
+      hub_image: $hub, keycloak_image: $kc,
+      runtime: {name: $rt, version: (if $rtv == "" then null else $rtv end)}, files: $files}' > "$dir/MANIFEST.json"
 }
 
 # _backup_check_manifest <dir> — every file listed has its checksum.
@@ -298,8 +302,8 @@ backup_create() {
   done
   if [ -n "$started" ]; then
     info "Starting$started for the backup..."
-    # shellcheck disable=SC2086
-    dc up -d --no-deps $started
+    # shellcheck disable=SC2086,SC2046  # $(runtime_no_build): nothing or --no-build
+    dc up -d $(runtime_no_build) --no-deps $started
   fi
   wait_healthy 120 postgres
   vault_wait_active 90 || fail "Vault is not active — ./portcullis vault unseal"
@@ -376,15 +380,21 @@ _restic_require() {
 }
 
 # _restic <restic args...> — restic in its pinned image, as the operator
-# (files stay operator-owned), read-only root FS, no capabilities. Repo
+# (files stay operator-owned; rootless Podman: container root without any
+# capability IS the operator, reading by owner and mode only), read-only
+# root FS, no capabilities. Repo
 # password and provider credentials are passed by NAME (-e VAR), in a
 # subshell, so they never reach argv or this shell's later commands.
 # Extra mounts: _RESTIC_MOUNTS=(-v src:dst ...).
 _restic() {
-  local repo="$BACKUP_REPOSITORY" path v
-  local -a args=(run --rm -i --user "$(id -u):$(id -g)" --cap-drop ALL --security-opt no-new-privileges:true
+  local repo="$BACKUP_REPOSITORY" path v user
+  if _rt_is_podman; then user=0:0; else user="$(id -u):$(id -g)"; fi
+  local -a args=(run --rm -i --user "$user" --cap-drop ALL --security-opt no-new-privileges:true
     --read-only --tmpfs /tmp -e HOME=/tmp -e RESTIC_CACHE_DIR=/cache -v "$BACKUP_ROOT/.restic-cache:/cache"
     -e RESTIC_REPOSITORY -e RESTIC_PASSWORD -e RESTIC_PROGRESS_FPS=0.2)
+  # Rootless Podman: a CLI helper bind-mounting host paths runs unlabelled
+  # (common.sh ct_run), never with z / Z on backups/.
+  if _rt_is_podman; then args+=(--security-opt label=disable); fi
   (umask 077 && mkdir -p "$BACKUP_ROOT/.restic-cache")
   case "$repo" in
     /*|local:/*)
@@ -594,7 +604,8 @@ _restore_vault() {
     "${VAULT_ADDR:-http://127.0.0.1:8200}/v1/sys/storage/raft/snapshot-force" || true)"
   [ "$code" = 204 ] || [ "$code" = 200 ] || fail "Vault snapshot restore failed (HTTP ${code:-none})"
   _restore_secrets "$dir"
-  dc up -d --no-deps --force-recreate vault >/dev/null
+  # shellcheck disable=SC2046  # nothing or --no-build
+  dc up -d $(runtime_no_build) --no-deps --force-recreate vault >/dev/null
   vault_wait_active 120 || fail "Vault did not unseal with the restored key (secrets/ and vault.snap from different installs?)"
   ok "Vault restored and unsealed with the original key."
 }
@@ -732,6 +743,40 @@ _restore_stop_secret_apps() {
   fi
 }
 
+# restore_runtime_from_host — the runtime of THIS host, before any docker
+# call of a restore (P6): with a .env its keys (need_env has checked them),
+# else runtime_detect (CONTAINER_RUNTIME from the environment, else the
+# engine that answers) exported with the rootless socket; then the engine
+# check and, under podman, the host preparation. Sets RESTORE_RUNTIME and
+# RESTORE_ENGINE_SOCKET (podman only), which the restored .env gets.
+RESTORE_RUNTIME="" RESTORE_ENGINE_SOCKET=""
+restore_runtime_from_host() {
+  if [ -f "$(env_file)" ]; then
+    env_load
+    RESTORE_RUNTIME="$(runtime_name)" || exit 1
+  else
+    RESTORE_RUNTIME="$(runtime_detect)" || exit 1
+    export CONTAINER_RUNTIME="$RESTORE_RUNTIME"
+    [ "$RESTORE_RUNTIME" != podman ] || export PORTCULLIS_ENGINE_SOCKET="${PORTCULLIS_ENGINE_SOCKET:-$(runtime_podman_socket)}"
+  fi
+  RESTORE_ENGINE_SOCKET=""
+  [ "$RESTORE_RUNTIME" != podman ] || RESTORE_ENGINE_SOCKET="${PORTCULLIS_ENGINE_SOCKET:-}"
+  runtime_check
+  runtime_require_host
+}
+
+# _restore_runtime_keys — the restored .env keeps this host's runtime, never
+# the backup's: CONTAINER_RUNTIME always, the engine socket under podman; a
+# PORTCULLIS_ENGINE_SOCKET the backup carried is dropped under docker.
+_restore_runtime_keys() {
+  env_set CONTAINER_RUNTIME "$RESTORE_RUNTIME"
+  if [ "$RESTORE_RUNTIME" = podman ]; then
+    env_set PORTCULLIS_ENGINE_SOCKET "$RESTORE_ENGINE_SOCKET"
+  else
+    env_unset PORTCULLIS_ENGINE_SOCKET
+  fi
+}
+
 backup_restore() {
   local dir="$1" yes="$2" allow_empty_lldap="${3:-false}" pre had_env=false key uid gid full spec proj helper
   require_cmd docker jq curl tar gzip
@@ -747,6 +792,8 @@ backup_restore() {
     confirm "Continue with restore?" || { echo "Cancelled."; return 0; }
   fi
 
+  # This host's runtime (never the backup's), checked before anything stops.
+  [ -n "$RESTORE_RUNTIME" ] || restore_runtime_from_host
   [ -f "$(env_file)" ] && had_env=true
   # Stop the Hub so it can't restart secret apps, then take down the
   # file-sharing apps holding hub_secrets: all before anything changes
@@ -799,6 +846,7 @@ backup_restore() {
     (umask 077 && cp "$dir/.env" "$(env_file)")
   fi
   chmod 600 "$(env_file)" 2>/dev/null || true
+  _restore_runtime_keys
   [ ! -f "$dir/realm-export.json" ] || cp "$dir/realm-export.json" "$PORTCULLIS_ROOT/keycloak/realm-export.json"
   if [ -f "$dir/headscale-config.yaml" ]; then
     mkdir -p "$PORTCULLIS_ROOT/headscale"
@@ -819,6 +867,8 @@ backup_restore() {
     rm -rf "$PORTCULLIS_ROOT/certs" && mv "$PORTCULLIS_ROOT/certs.restore-tmp" "$PORTCULLIS_ROOT/certs"
   fi
   env_reload
+  # The restored .env may set COMPOSE_FILE: the SELinux overlay again.
+  runtime_export
   _BACKUP_CFG=""
   _backup_load_cfg
   proj="$(_project_name)"
@@ -834,7 +884,8 @@ backup_restore() {
   done
   rm -rf "$PORTCULLIS_ROOT/secrets"
   stack_prepare
-  dc up -d --no-deps postgres vault
+  # shellcheck disable=SC2046  # nothing or --no-build
+  dc up -d $(runtime_no_build) --no-deps postgres vault
   _restore_pg "$dir"
   _restore_vault "$dir"
 
@@ -847,7 +898,7 @@ backup_restore() {
     docker volume rm -f "$full" >/dev/null 2>&1 || true
     docker volume create --label "com.docker.compose.project=$proj" --label "com.docker.compose.volume=$key" "$full" >/dev/null
     # tar as root keeps the archived ownership; the volume root belongs to the service user.
-    docker run --rm --network none -v "$full:/data" -v "$dir:/backup:ro" "$helper" \
+    ct_run --rm --network none -v "$full:/data" -v "$dir:/backup:ro" "$helper" \
       sh -c "tar xzf '/backup/$key.tar.gz' -C /data && chown $uid:$gid /data" \
       || fail "could not restore volume $key"
   done
@@ -880,7 +931,10 @@ backup_restore() {
   vault_init false
   # The core must come up; a non-core service (e.g. a Hub image that cannot
   # be pulled right now) must not abort a restore.
-  dc up -d || warn "some services did not start — check ./portcullis status"
+  # Rootless Podman: the local images with podman build (compose never builds).
+  if _rt_is_podman; then runtime_build_local; fi
+  # shellcheck disable=SC2046  # nothing or --no-build
+  dc up -d $(runtime_no_build) || warn "some services did not start — check ./portcullis status"
   wait_healthy 300 vault postgres lldap keycloak
   ok "Restore complete.${pre:+ Previous .env/secrets/certs: $pre.} Verify with ./portcullis status"
   if [ -n "$RESTORE_STOPPED_APPS" ]; then
@@ -890,10 +944,19 @@ backup_restore() {
 
 # ── schedule ───────────────────────────────────────────────
 
-# backup_schedule_systemd <on-calendar> <output-dir|"">
+# backup_schedule_systemd <on-calendar> <output-dir|""> — system units
+# (docker: User=, After/Requires docker.service), or under rootless Podman
+# the operator's user units (After/Requires podman.socket, no User=,
+# WantedBy=default.target; they run while linger keeps the user manager up).
 backup_schedule_systemd() {
-  local cal="$1" out="$2" user offsite="" svc timer env_line=""
+  local cal="$1" out="$2" user offsite="" svc timer env_line="" after requires user_line wanted podman=false
   user="$(id -un)"
+  if _rt_is_podman; then podman=true; fi
+  if [ "$podman" = true ]; then
+    after="network-online.target podman.socket" requires="podman.socket" user_line="" wanted="default.target"
+  else
+    after="network-online.target docker.service" requires="docker.service" user_line="User=$user" wanted="timers.target"
+  fi
   [ -z "${BACKUP_REPOSITORY:-}" ] || offsite=" --offsite"
   [ "$PORTCULLIS_ROOT" = "$PORTCULLIS_HOME" ] || env_line="Environment=PORTCULLIS_ROOT=$PORTCULLIS_ROOT"
   svc="$(cat <<EOF
@@ -901,13 +964,13 @@ backup_schedule_systemd() {
 [Unit]
 Description=Portcullis backup$( [ -n "$offsite" ] && echo " (local + off-host, restic)" || echo " (local only: BACKUP_REPOSITORY is not set)")
 Wants=network-online.target
-After=network-online.target docker.service
-Requires=docker.service
+After=$after
+Requires=$requires
 
 [Service]
 Type=oneshot
-User=$user
-WorkingDirectory=$PORTCULLIS_ROOT
+${user_line:+$user_line
+}WorkingDirectory=$PORTCULLIS_ROOT
 Environment=NO_COLOR=1
 ${env_line}
 ExecStart=$PORTCULLIS_HOME/portcullis backup$offsite
@@ -930,7 +993,7 @@ RandomizedDelaySec=30m
 Persistent=true
 
 [Install]
-WantedBy=timers.target
+WantedBy=$wanted
 EOF
 )"
   if [ -n "$out" ]; then
@@ -938,9 +1001,19 @@ EOF
     printf '%s\n' "$svc" > "$out/portcullis-backup.service"
     printf '%s\n' "$timer" > "$out/portcullis-backup.timer"
     ok "Wrote $out/portcullis-backup.service and portcullis-backup.timer"
+    if [ "$podman" = true ]; then
+      cat <<EOF
+Install (as $user, user units; linger must be on: sudo loginctl enable-linger $(_sq "$user")):
+  mkdir -p ~/.config/systemd/user
+  install -m 0644 $(_sq "$out/portcullis-backup.service") $(_sq "$out/portcullis-backup.timer") ~/.config/systemd/user/
+  systemctl --user daemon-reload && systemctl --user enable --now portcullis-backup.timer
+  systemctl --user start portcullis-backup.service   # run once now; journalctl --user -u portcullis-backup
+EOF
+      return 0
+    fi
     cat <<EOF
 Install (as root):
-  install -m 0644 $out/portcullis-backup.service $out/portcullis-backup.timer /etc/systemd/system/
+  install -m 0644 $(_sq "$out/portcullis-backup.service") $(_sq "$out/portcullis-backup.timer") /etc/systemd/system/
   systemctl daemon-reload && systemctl enable --now portcullis-backup.timer
   systemctl start portcullis-backup.service   # run once now; journalctl -u portcullis-backup
 EOF
@@ -1007,6 +1080,9 @@ Print (or write to DIR) a systemd service + timer that run
 `portcullis backup --offsite` (just `backup` while BACKUP_REPOSITORY is
 unset) as the current user, followed by `portcullis status --textfile`
 (metrics for the monitoring profile). The user must be able to run docker.
+Under rootless Podman (CONTAINER_RUNTIME=podman) they are the operator's
+user units (~/.config/systemd/user, after podman.socket, no User=).
+Needs .env (its CONTAINER_RUNTIME).
 
 Options:
   --systemd           generate systemd units (the only scheduler supported)
@@ -1088,7 +1164,10 @@ cmd_backup() {
       return ;;
     schedule)
       [ "$systemd" = true ] || usage_error "backup schedule" "--systemd is required (the only scheduler supported)"
-      [ ! -f "$(env_file)" ] || env_load
+      # The units depend on the runtime (podman: user units).
+      [ -f "$(env_file)" ] || fail "$(env_file) not found: backup schedule needs CONTAINER_RUNTIME from it (./portcullis init first)."
+      env_load
+      runtime_name >/dev/null
       backup_schedule_systemd "$cal" "$out"
       return ;;
   esac
@@ -1133,6 +1212,9 @@ cmd_restore() {
     require_cmd docker jq
     tmp="$BACKUP_ROOT/offsite-$(date +%Y%m%d-%H%M%S)"
     _restic_require
+    # The runtime before the first docker call (restic runs in a container).
+    if [ -f "$(env_file)" ]; then need_env; fi
+    restore_runtime_from_host
     info "Restoring snapshot $snap from $BACKUP_REPOSITORY into $tmp..."
     dir="$(_restic_restore_to "$snap" "$tmp")"
     backup_restore "$dir" "$yes" "$allow"
@@ -1145,5 +1227,6 @@ cmd_restore() {
     *) if [ -d "$PORTCULLIS_CALLER_PWD/$dir" ]; then dir="$PORTCULLIS_CALLER_PWD/$dir"; else dir="$PORTCULLIS_ROOT/$dir"; fi ;;
   esac
   need_env
+  restore_runtime_from_host
   backup_restore "$dir" "$yes" "$allow"
 }

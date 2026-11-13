@@ -59,7 +59,8 @@ _cfg_flip_traefik_back() {
   [ -n "${CFG_FLIP_TRAEFIK_WAS:-}" ] || return 0
   info "Starting Traefik again..."
   # No container to start (a recreate removed it): create it (M16).
-  dc start traefik >/dev/null 2>&1 || dc up -d --no-deps traefik >/dev/null 2>&1 || warn "could not start Traefik again (./portcullis up)"
+  # shellcheck disable=SC2046  # nothing or --no-build
+  dc start traefik >/dev/null 2>&1 || dc up -d $(runtime_no_build) --no-deps traefik >/dev/null 2>&1 || warn "could not start Traefik again (./portcullis up)"
 }
 
 config_apply() {
@@ -155,7 +156,8 @@ config_apply() {
   export ACME_DNS_PROVIDER="$acme_dns"
   if [ "$flipping" = true ] && [ -n "${CFG_FLIP_TRAEFIK_WAS:-}" ]; then
     info "Starting Traefik again (it registers a new ACME account with $ca_server)..."
-    dc up -d --no-deps traefik >/dev/null 2>&1 || fail "could not start Traefik on $ca_server: the ACME_STAGING flip is not finished; run the same command again"
+    # shellcheck disable=SC2046  # nothing or --no-build
+    dc up -d $(runtime_no_build) --no-deps traefik >/dev/null 2>&1 || fail "could not start Traefik on $ca_server: the ACME_STAGING flip is not finished; run the same command again"
   fi
   # Only now (Traefik runs on the new CA, or isn't running: its next start
   # reads the new value) is the flip done.

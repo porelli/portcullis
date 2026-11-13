@@ -29,7 +29,7 @@ services:
   # No client cert needed. Redirects to Keycloak if not logged in.
   # ============================================================
   grafana:
-    image: grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
+    image: docker.io/grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
     networks:
       - portcullis-proxy
     labels:
@@ -45,7 +45,7 @@ services:
   # (authaware TLS + forward auth fallback)
   # ============================================================
   wiki:
-    image: requarks/wiki:2.5.317@sha256:e4708eed80c014449c0c8426c8d466c7a52a62131555bb44372fa48378b448b8
+    image: docker.io/requarks/wiki:2.5.317@sha256:e4708eed80c014449c0c8426c8d466c7a52a62131555bb44372fa48378b448b8
     networks:
       - portcullis-proxy
     labels:
@@ -62,7 +62,7 @@ services:
   # Admin UI protected by mTLS + WebAuthn fallback.
   # ============================================================
   headscale:
-    image: headscale/headscale:v0.29.7@sha256:11f81665e842809db9fe3006a38c56a66e968baa5abd4bac498e86445572b970
+    image: docker.io/headscale/headscale:v0.29.7@sha256:11f81665e842809db9fe3006a38c56a66e968baa5abd4bac498e86445572b970
     command: serve
     volumes:
       - headscale-data:/var/lib/headscale
@@ -103,7 +103,7 @@ services:
   # Management API and dashboard protected by WebAuthn.
   # ============================================================
   coturn:
-    image: coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
+    image: docker.io/coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
     network_mode: host
     volumes:
       - coturn-data:/var/lib/coturn
@@ -121,7 +121,7 @@ services:
       --log-file=stdout
 
   netbird-management:
-    image: netbirdio/management:0.82.0@sha256:07c8f979fcc980678cc64e584cf6b7b27204ceb4c871531b29e2dce39592e9ff
+    image: docker.io/netbirdio/management:0.82.0@sha256:07c8f979fcc980678cc64e584cf6b7b27204ceb4c871531b29e2dce39592e9ff
     command: >
       --port 8011
       --log-level info
@@ -147,7 +147,7 @@ services:
       traefik.http.services.netbird-api.loadbalancer.server.port: "8011"
 
   netbird-signal:
-    image: netbirdio/signal:0.82.0@sha256:0c0c38bbef7dcdfa1822b6d59844615db55dc7303b664e7aed498151edc0dbfb
+    image: docker.io/netbirdio/signal:0.82.0@sha256:0c0c38bbef7dcdfa1822b6d59844615db55dc7303b664e7aed498151edc0dbfb
     networks:
       - portcullis-proxy
     labels:
@@ -160,7 +160,7 @@ services:
       traefik.http.services.netbird-signal.loadbalancer.server.scheme: h2c
 
   netbird-dashboard:
-    image: netbirdio/dashboard:v2.96.0@sha256:340b13c00b84349572a2acc5605e907cb09250a9e6461c757097eabdb8e02f2c
+    image: docker.io/netbirdio/dashboard:v2.96.0@sha256:340b13c00b84349572a2acc5605e907cb09250a9e6461c757097eabdb8e02f2c
     environment:
       NETBIRD_MGMT_API_ENDPOINT: https://netbird.${PORTCULLIS_DOMAIN:-portcullis.local}
       NETBIRD_MGMT_GRPC_API_ENDPOINT: https://netbird.${PORTCULLIS_DOMAIN:-portcullis.local}
@@ -184,7 +184,7 @@ services:
   # PUBLIC — no authentication at all
   # ============================================================
   docs:
-    image: nginx:1.31.8-alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
+    image: docker.io/library/nginx:1.31.8-alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
     networks:
       - portcullis-proxy
     labels:

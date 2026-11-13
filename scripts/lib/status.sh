@@ -117,6 +117,11 @@ status_run() {
   require_cmd docker jq curl
   export VAULT_ADDR="${VAULT_ADDR:-http://127.0.0.1:8200}"
 
+  # ── container runtime (podman: the host-prep checks; a fail is a problem) ──
+  local rt_json
+  rt_json="$(runtime_status_json)" || exit 1
+  [ "$(printf '%s' "$rt_json" | jq '[.checks[] | select(.status == "fail")] | length')" = 0 ] || problems=1
+
   # ── services ──
   svc_raw="$(dc ps -a --format json 2>/dev/null || true)"
   # compose prints one object per line (or one array on older versions).
@@ -223,12 +228,23 @@ status_run() {
   if [ "$json" = true ]; then
     jq -n --arg d "${PORTCULLIS_DOMAIN:-}" --argjson s "$services" --argjson v "$vault_json" \
       --argjson k "$kc" --argjson l "$lldap" --arg t "$traefik" --argjson p "$problems" --arg sh "$shadows" --arg mr "$mcp_refusing" --arg dn "$dns_json" \
-      '{domain: $d, ok: ($p == 0), services: $s, vault: $v, keycloak: $k, lldap: $l, traefik: {state: $t},
+      --argjson rt "$rt_json" \
+      '{domain: $d, ok: ($p == 0), problems: $p, runtime: $rt, services: $s, vault: $v, keycloak: $k, lldap: $l, traefik: {state: $t},
         dns_shadows: [$sh | split("\n")[] | select(. != "") | capture("^(?<container>[^ ]+) (?<name>.+)$")],
         mcp_gate: {refusing: (if $mr == "" then null else $mr end)},
         dns: (if $dn == "" then null else ($dn | fromjson) end)}'
     return "$problems"
   fi
+
+  printf '\n%sRuntime%s\n' "$C_CYAN" "$C_NC"
+  _st_line ok "runtime: $(printf '%s' "$rt_json" | jq -r '
+      if .name == "podman" then
+        "podman \(.version // "?") rootless, uid \(.uid), subuid \(.subuid_start // "?")+\(.subuid_count // "?"), ports ≥ \(.port_start)"
+      else "docker \(.version // "?")" end')"
+  local rst rtext
+  while IFS=$'\t' read -r rst rtext; do
+    case "$rst" in warn|fail) _st_line "$rst" "$rtext" ;; esac
+  done < <(printf '%s' "$rt_json" | jq -r '.checks[] | [.status, .text] | @tsv')
 
   printf '\n%sServices%s\n' "$C_CYAN" "$C_NC"
   if [ "$(printf '%s' "$services" | jq 'length')" = 0 ]; then
@@ -243,6 +259,12 @@ status_run() {
       _st_line fail "$n ${C_DIM}($stat)${C_NC}"
     fi
   done < <(printf '%s' "$services" | jq -r '.[] | [.name, .state, .health, .status] | @tsv')
+  # Rootless Podman: the proxies bind-mount the socket FILE; a restarted
+  # podman.socket leaves them on the old, dead inode (their /_ping then fails).
+  if [ "$(printf '%s' "$rt_json" | jq -r .name)" = podman ] \
+     && printf '%s' "$services" | jq -e 'any(.[]; (.name | startswith("socket-proxy-")) and .state == "running" and .health == "unhealthy")' >/dev/null; then
+    _st_line fail "a socket proxy is unhealthy: after podman.socket restarts the proxies keep the old socket's inode; ./portcullis up restarts them"
+  fi
 
   printf '\n%sVault%s\n' "$C_CYAN" "$C_NC"
   case "$vault_code" in
@@ -411,7 +433,10 @@ hub_started_unix() {
   cid="$(dc ps -q hub 2>/dev/null | head -n1)"
   [ -n "$cid" ] || { echo 0; return 0; }
   at="$(docker inspect --format '{{.State.StartedAt}}' "$cid" 2>/dev/null || true)"
-  jq -nr --arg s "$at" '($s | sub("\\.[0-9]+"; "") | fromdateiso8601? // 0)' 2>/dev/null || echo 0
+  [ -n "$at" ] || { echo 0; return 0; }
+  # GNU date reads any RFC 3339 offset (Podman reports the host's local
+  # time); jq's fromdateiso8601 only a Z suffix (BSD date, Docker's UTC).
+  date -u -d "$at" +%s 2>/dev/null || jq -nr --arg s "$at" '($s | sub("\\.[0-9]+"; "") | fromdateiso8601? // 0)' 2>/dev/null || echo 0
 }
 
 # hub_sync_status — the Hub's last template sync (<data>/source-sync.json,
@@ -477,9 +502,23 @@ hub_sources_sync() {
 }
 
 version_run() {
-  local json="$1" ver hub src running="" cid="" kc kcsrc kcrunning=""
+  local json="$1" ver hub src running="" cid="" kc kcsrc kcrunning="" rt="" rtv="" rtline=""
   ver="$(portcullis_version)"
-  [ ! -f "$(env_file)" ] || env_load
+  # An installation: its runtime (a missing CONTAINER_RUNTIME is refused);
+  # the engine's version best effort, but an engine contradicting
+  # CONTAINER_RUNTIME fails like runtime_check.
+  if [ -f "$(env_file)" ]; then
+    env_load
+    rt="$(runtime_name)" || exit 1
+    runtime_export
+    if command -v docker >/dev/null 2>&1 && _rt_engine_probe; then
+      [ "$_RT_ENGINE" = "$rt" ] || fail "CONTAINER_RUNTIME=$rt but the engine is $(_rt_engine_label "$_RT_ENGINE")"
+      rtv="$_RT_ENGINE_VERSION"
+      rtline="$rt $rtv"
+    else
+      rtline="$rt (engine not reachable)"
+    fi
+  fi
   if [ -n "${HUB_IMAGE:-}" ]; then hub="$HUB_IMAGE" src="HUB_IMAGE"; else hub="$(hub_image_default)" src="default"; fi
   if [ -n "${KEYCLOAK_IMAGE:-}" ]; then kc="$KEYCLOAK_IMAGE" kcsrc="KEYCLOAK_IMAGE"; else kc="$(keycloak_image_default)" kcsrc="default"; fi
   # The running Hub and Keycloak, if this is an installation and Docker answers.
@@ -491,8 +530,10 @@ version_run() {
   fi
   if [ "$json" = true ]; then
     jq -n --arg v "$ver" --arg h "$hub" --arg s "$src" --arg r "$running" --arg k "$kc" --arg ks "$kcsrc" --arg kr "$kcrunning" \
+      --arg rt "$rt" --arg rtv "$rtv" \
       '{version: $v, hub_image: $h, hub_image_source: $s, hub_running: (if $r == "" then null else $r end),
-        keycloak_image: $k, keycloak_image_source: $ks, keycloak_running: (if $kr == "" then null else $kr end)}'
+        keycloak_image: $k, keycloak_image_source: $ks, keycloak_running: (if $kr == "" then null else $kr end),
+        runtime: (if $rt == "" then null else $rt end), runtime_version: (if $rtv == "" then null else $rtv end)}'
     return 0
   fi
   printf 'portcullis       %s\n' "$ver"
@@ -500,6 +541,7 @@ version_run() {
   [ -z "$running" ] || printf 'hub running      %s\n' "$running"
   printf 'keycloak image   %s (%s)\n' "$kc" "$kcsrc"
   [ -z "$kcrunning" ] || printf 'keycloak running %s\n' "$kcrunning"
+  [ -z "$rtline" ] || printf 'runtime          %s\n' "$rtline"
 }
 
 help_version() {
