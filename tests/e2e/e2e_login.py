@@ -11,7 +11,7 @@ plus a whoami test app with three hosts:
   mtls.<domain>   template any[yubikey_cert] (X.509 login through Keycloak +
                   mtls binding)
 
-The workflow writes policy file v6 and signin-keycloak.json (no Hub in this
+The workflow writes policy file v7 and signin-keycloak.json (no Hub in this
 job); the latter's trust list holds the CI fixture
 tests/e2e/fixtures/virtual-authenticators.json, so the virtual key registers
 as a security key. Sign-in is passkey-only. Every user starts from a one-time

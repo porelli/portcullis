@@ -306,6 +306,15 @@ head -c 450000 /dev/zero > "$WORK/ci-450000.yml"
 head -c 450001 /dev/zero > "$WORK/ci-450001.yml"
 expect_eq "lint_ci_size.sh passes 450,000 bytes and fails 450,001" \
   "$("$HERE/lint_ci_size.sh" "$WORK/ci-450000.yml" >/dev/null; echo "rc=$?"):$("$HERE/lint_ci_size.sh" "$WORK/ci-450001.yml" >/dev/null; echo "rc=$?")" "rc=0:rc=1"
+# Same-named branch lookups (Hub, Keycloak, templates): release tags are
+# vX.Y.Z only — a `v*` glob also caught the branch vpn1 and quietly tested
+# main / the published images — and the heads are listed once (a failed
+# listing fails the step) and matched exactly (ls-remote patterns match
+# suffixes too).
+expect_eq "CI's same-named branch lookups: no v* tag glob, no ls-remote pattern lookup" \
+  "$(grep -rnE '"\$REF" *(==|!=) *v\*|ls-remote --exit-code' "$HERE/../.github" | wc -l | tr -d ' ')" 0
+expect_eq "CI's same-named branch lookups: every one lists the heads once and fails loudly" \
+  "$(grep -cF 'heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }' "$HERE/../.github/workflows/ci.yml" "$HERE/../.github/actions/hub-image/action.yml" "$HERE/../.github/actions/keycloak-image/action.yml" | awk -F: '{ s += $2 } END { print s }')" 11
 # Fully qualified base images (rootless Podman: podman build never relies
 # on registries.conf short names): tests/lint_images.sh, also in CI.
 expect_eq "every Dockerfile FROM and compose image: is fully qualified" "$("$HERE/lint_images.sh" 2>&1; echo "rc=$?")" "rc=0"

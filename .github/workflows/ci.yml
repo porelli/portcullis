@@ -2723,8 +2723,12 @@ jobs:
         run: |
           url=https://github.com/porelli/portcullis-templates
           ref=main
-          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && [[ "$REF" != v* ]] \
-              && git ls-remote --exit-code --heads "$url" "$REF" >/dev/null; then
+          # The heads, listed once: a failed listing fails the step instead
+          # of quietly testing main. Exactly refs/heads/<REF>; release tags
+          # are vX.Y.Z only (a branch like vpn1 is a branch).
+          heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && ! [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              && awk -v r="refs/heads/$REF" '$2 == r { f = 1 } END { exit !f }' <<<"$heads"; then
             ref="$REF"
           fi
           git clone --quiet --depth=1 --branch "$ref" "$url" "$RUNNER_TEMP/templates"
@@ -3095,8 +3099,12 @@ jobs:
         run: |
           url=https://github.com/porelli/portcullis-templates
           ref=main
-          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && [[ "$REF" != v* ]] \
-              && git ls-remote --exit-code --heads "$url" "$REF" >/dev/null; then
+          # The heads, listed once: a failed listing fails the step instead
+          # of quietly testing main. Exactly refs/heads/<REF>; release tags
+          # are vX.Y.Z only (a branch like vpn1 is a branch).
+          heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && ! [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              && awk -v r="refs/heads/$REF" '$2 == r { f = 1 } END { exit !f }' <<<"$heads"; then
             ref="$REF"
           fi
           git clone --quiet --depth=1 --branch "$ref" "$url" "$RUNNER_TEMP/templates"
@@ -3396,8 +3404,12 @@ jobs:
         run: |
           url=https://github.com/porelli/portcullis-templates
           ref=main
-          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && [[ "$REF" != v* ]] \
-              && git ls-remote --exit-code --heads "$url" "$REF" >/dev/null; then
+          # The heads, listed once: a failed listing fails the step instead
+          # of quietly testing main. Exactly refs/heads/<REF>; release tags
+          # are vX.Y.Z only (a branch like vpn1 is a branch).
+          heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && ! [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              && awk -v r="refs/heads/$REF" '$2 == r { f = 1 } END { exit !f }' <<<"$heads"; then
             ref="$REF"
           fi
           git clone --quiet --depth=1 --branch "$ref" "$url" "$RUNNER_TEMP/templates"
@@ -3703,8 +3715,12 @@ jobs:
         run: |
           url=https://github.com/porelli/portcullis-templates
           ref=main
-          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && [[ "$REF" != v* ]] \
-              && git ls-remote --exit-code --heads "$url" "$REF" >/dev/null; then
+          # The heads, listed once: a failed listing fails the step instead
+          # of quietly testing main. Exactly refs/heads/<REF>; release tags
+          # are vX.Y.Z only (a branch like vpn1 is a branch).
+          heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && ! [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              && awk -v r="refs/heads/$REF" '$2 == r { f = 1 } END { exit !f }' <<<"$heads"; then
             ref="$REF"
           fi
           git clone --quiet --depth=1 --branch "$ref" "$url" "$RUNNER_TEMP/templates"
@@ -4055,8 +4071,12 @@ jobs:
         run: |
           url=https://github.com/porelli/portcullis-templates
           ref=main
-          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && [[ "$REF" != v* ]] \
-              && git ls-remote --exit-code --heads "$url" "$REF" >/dev/null; then
+          # The heads, listed once: a failed listing fails the step instead
+          # of quietly testing main. Exactly refs/heads/<REF>; release tags
+          # are vX.Y.Z only (a branch like vpn1 is a branch).
+          heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && ! [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              && awk -v r="refs/heads/$REF" '$2 == r { f = 1 } END { exit !f }' <<<"$heads"; then
             ref="$REF"
           fi
           git clone --quiet --depth=1 --branch "$ref" "$url" "$RUNNER_TEMP/templates"
@@ -4809,8 +4829,12 @@ jobs:
         run: |
           url=https://github.com/porelli/portcullis-templates
           ref=main
-          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && [[ "$REF" != v* ]] \
-              && git ls-remote --exit-code --heads "$url" "$REF" >/dev/null; then
+          # The heads, listed once: a failed listing fails the step instead
+          # of quietly testing main. Exactly refs/heads/<REF>; release tags
+          # are vX.Y.Z only (a branch like vpn1 is a branch).
+          heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] && ! [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+              && awk -v r="refs/heads/$REF" '$2 == r { f = 1 } END { exit !f }' <<<"$heads"; then
             ref="$REF"
           fi
           git clone --quiet --depth=1 --branch "$ref" "$url" "$RUNNER_TEMP/templates"

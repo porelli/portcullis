@@ -68,7 +68,7 @@ for i in $(seq 1 30); do
       and .templates.strong == {op: "any", items: ["security_key", "yubikey_cert"]}
       and .core["hub.portcullis.local"] == "strong" and .core["people.portcullis.local"] == "strong"
       and .core["portcullis.local"] == "standard" and (.extra_domains | type) == "array" and .add_stronger == false' >/dev/null 2>&1 && break
-  [ "$i" -eq 30 ] && { echo "FAIL: the Hub did not publish the fresh-install v6 policy: $(policy_file)"; docker compose logs --tail=20 hub; exit 1; }
+  [ "$i" -eq 30 ] && { echo "FAIL: the Hub did not publish the fresh-install v7 policy: $(policy_file)"; docker compose logs --tail=20 hub; exit 1; }
   sleep 2
 done
 hubapi "http://$HUB_IP:8888/api/signin" | jq -e '.default == "standard" and ([.methods[] | select(.on) | .id] | sort) == ["passkey_device", "passkey_synced", "security_key", "yubikey_cert"]' >/dev/null \
@@ -86,7 +86,7 @@ gg_grew "$STEP_RE" "$n0" \
 for t in "$CI_TOKEN_SPK" "$CI_TOKEN_HWK" "$CI_TOKEN_MTLS"; do
   [ "$(gated -H "X-Forwarded-Access-Token: $t")" = 200 ] || { echo "FAIL: a session meeting Standard denied: $(gated -H "X-Forwarded-Access-Token: $t")"; exit 1; }
 done
-echo "PASS: fresh Hub publishes policy v6 (Standard the default, Strong on hub / people); group-gate steps up apps without their own pick"
+echo "PASS: fresh Hub publishes policy v7 (Standard the default, Strong on hub / people); group-gate steps up apps without their own pick"
 
 # An admin change through the sign-in API reaches group-gate: Strong
 # as the default refuses the synced passkey (the step-up asks for a

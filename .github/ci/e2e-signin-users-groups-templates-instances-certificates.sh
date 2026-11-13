@@ -98,7 +98,7 @@ for i in $(seq 1 30); do
   [ "$i" -eq 30 ] && { echo "FAIL: published: $(hub_file group-gate-policy.json | jq -c '{hosts, core, default}') $(hub_file signin-keycloak.json | jq -c '{clients, methods, mds}')"; exit 1; }
   sleep 2
 done
-echo "PASS: policy v6 picks (Basic, e2e-cert, e2e-file, e2e-anycert, Strong core pages; browser_cert on) and signin-keycloak.json clients (oidc-strong Strong, oidc-all YubiKey + certificate, oidc-cert e2e-cert)"
+echo "PASS: policy v7 picks (Basic, e2e-cert, e2e-file, e2e-anycert, Strong core pages; browser_cert on) and signin-keycloak.json clients (oidc-strong Strong, oidc-all YubiKey + certificate, oidc-cert e2e-cert)"
 
 # pat: a Hub-set password only (allowed while the method is off),
 # kept in a 0600 file, never printed.

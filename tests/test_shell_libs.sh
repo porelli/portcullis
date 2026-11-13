@@ -3619,6 +3619,14 @@ OUT="$(PORTCULLIS_AUTH_SUBNET=10.213.8.0/28 vt 'vpn_init on 51820 10.213.8.0/22'
 expect_eq "vpn init: a fixed core subnet (moved into 10.213/16) → refused" "$RC:$(printf '%s' "$OUT" | grep -c '10.213.8.0/28 (a Portcullis core network)')" "1:1"
 OUT="$(vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
 expect_eq "vpn init: the default subnet clears the reserved ranges" "$(printf '%s' "$OUT" | grep -c "address pool\|core network" || true)" 0
+# Under Podman an image HEALTHCHECK may not apply: the Hub is "running"
+# (as ./portcullis up accepts); its answer to hub vpn host-info is the check.
+OUT="$(VT_HUB_HEALTH=running vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: a Hub without a health status (running) that answers host-info → goes on" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running" || true)" "0:0"
+OUT="$(VT_HUB_HEALTH=running VT_HUB_DOWN=1 vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: a running Hub that doesn't answer host-info → refused" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub didn't answer hub vpn host-info")" "1:1"
+OUT="$(VT_HUB_HEALTH=unhealthy vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: an unhealthy Hub → refused" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running")" "1:1"
 OUT="$(VT_HUB_HEALTH=starting vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
 expect_eq "vpn init: the Hub not healthy → refused" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running")" "1:1"
 

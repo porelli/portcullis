@@ -103,7 +103,7 @@ for id in echo-a echo-b echo-c; do
   hubop POST /api/templates/enable -d "{\"id\":\"$id\"}" || { echo "FAIL: enable $id"; exit 1; }
 done
 
-# What the Hub published: policy v6 keyed by hostname, the extra domain.
+# What the Hub published: policy v7 keyed by hostname, the extra domain.
 policy_file() { docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" cat /d/group-gate-policy.json; }
 for i in $(seq 1 30); do
   policy_file | jq -e --arg x "$E2E_EXTRA" '.version == 7 and .extra_domains == [$x]
@@ -114,7 +114,7 @@ for i in $(seq 1 30); do
   [ "$i" -eq 30 ] && { echo "FAIL: policy file: $(policy_file)"; exit 1; }
   sleep 2
 done
-echo "PASS: policy v6: instances keyed by hostname, groups per instance, echo-c on e2e-cert, extra_domains = [$E2E_EXTRA]"
+echo "PASS: policy v7: instances keyed by hostname, groups per instance, echo-c on e2e-cert, extra_domains = [$E2E_EXTRA]"
 
 # The rendered sign-in: forward-auth-ext on extra-domain hosts only.
 labels() { docker inspect -f '{{json .Config.Labels}}' "$(docker ps -q --filter "label=com.docker.compose.project=portcullis-$1" --filter label=com.docker.compose.service=web)"; }

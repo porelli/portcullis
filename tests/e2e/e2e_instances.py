@@ -23,7 +23,7 @@ Scenarios (contract §5, §11):
                     once and lands on the app; a stale ext cookie signs in
                     again without a redirect loop.
   two_instances     two instances, two groups: alice reaches echo-a only,
-                    bob echo-b only (group-gate v6 keyed by hostname).
+                    bob echo-b only (group-gate v7 keyed by hostname).
   long_backup       an admin's backup of echo-b through Traefik
                     (hub.<domain>, default timeouts) that takes longer than
                     60 s: accepted with 202, a concurrent one is 409 busy,

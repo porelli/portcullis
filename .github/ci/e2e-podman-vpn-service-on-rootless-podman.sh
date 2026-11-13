@@ -7,6 +7,9 @@ set -e
 set -o pipefail
 # shellcheck source=/dev/null
 source "$RUNNER_TEMP/podlib.sh"
+# vpn init needs the Hub (hub vpn host-info): show its state first.
+docker inspect --format 'Hub: {{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$(docker compose ps -q hub)" \
+  || { echo "FAIL: no Hub container before vpn init"; docker compose ps -a; exit 1; }
 ./portcullis vpn init 2>&1 | redact
 WG_CID="$(docker compose ps -q wg)"
 docker inspect "$WG_CID" | jq -e '.[0] | .Config.User == "10006:10006" and (.HostConfig.CapAdd // [] | length) == 0

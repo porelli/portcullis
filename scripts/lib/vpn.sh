@@ -275,7 +275,9 @@ providers reach Traefik through, and the built-in WireGuard VPN for people
 (userspace WireGuard: no capability, no TUN device). Adds wg to
 COMPOSE_PROFILES, writes PORTCULLIS_VPN_BUILTIN / _PORT / _SUBNET, generates
 the built-in VPN's key (once; secrets/wg/people.key, never printed) and
-starts wg, Traefik and the Hub. The Hub must be running.
+starts wg, Traefik and the Hub. The Hub must be running (./portcullis up
+first): it answers which Local networks and provider ranges the subnet must
+not overlap.
 
 The subnet must not overlap a Docker network, Docker's default address pools
 172.16.0.0/12 and 192.168.0.0/16 (Docker allocates networks, app instances'
@@ -352,7 +354,13 @@ EOF
 vpn_init() {
   local builtin="$1" port="$2" subnet="$3" info subnets conflicts suggestion warns
   info "Checking the Hub and the VPN subnet..."
-  [ "$(container_health hub)" = healthy ] || fail "the Hub isn't running: ./portcullis up first"
+  # As ./portcullis up: healthy, or running where the runtime reports no
+  # health (an image HEALTHCHECK Podman doesn't apply). The Hub answering
+  # hub vpn host-info just below is the real check (no answer: refused).
+  case "$(container_health hub)" in
+    healthy|running) ;;
+    *) fail "the Hub isn't running: ./portcullis up first" ;;
+  esac
   info="$(_vpn_host_info)" || fail "the Hub didn't answer hub vpn host-info"
   printf '%s' "$info" | jq -e 'type == "object"' >/dev/null 2>&1 || fail "hub vpn host-info: not a JSON object"
   subnets="$(_vpn_docker_subnets)" || fail "could not list the Docker networks' subnets"
