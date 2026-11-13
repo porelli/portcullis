@@ -126,13 +126,20 @@ _dns_wait_text() {
   fi
 }
 
-# _dns_wait_at <apply output> [date] — the report's settle point as "HH:MM
-# UTC" (with date: "YYYY-MM-DD HH:MM UTC"), rounded up to the minute so
-# "after HH:MM" is never early; nothing without one.
+# _dns_clock <unix> — a settle time as printed everywhere: "YYYY-MM-DD
+# HH:MM UTC", rounded up to the minute, so "after <it>" is never early and
+# never ambiguous (a 24 h point is tomorrow's HH:MM).
+_dns_clock() {
+  jq -rn --argjson t "$1" '(($t + 59) / 60 | floor) * 60 | strftime("%Y-%m-%d %H:%M UTC")'
+}
+
+# _dns_wait_at <apply output> — the report's settle point (_dns_clock);
+# nothing without one.
 _dns_wait_at() {
-  local f='%H:%M UTC'
-  [ -z "${2:-}" ] || f='%Y-%m-%d %H:%M UTC'
-  printf '%s' "$1" | jq -r --arg f "$f" '.wait.settle_at // 0 | if . > 0 then ((. + 59) / 60 | floor) * 60 | strftime($f) else empty end' 2>/dev/null || true
+  local t
+  t="$(printf '%s' "$1" | jq -r '.wait.settle_at // 0' 2>/dev/null)" || t=0
+  [[ "$t" =~ ^[0-9]+$ ]] && [ "$t" -gt 0 ] || return 0
+  _dns_clock "$t"
 }
 
 # _dns_uri_ok <uri> — an ACME account URI fit for a CAA value and an env
@@ -237,6 +244,15 @@ dns_check() {
   return "$rc"
 }
 
+# _dns_plan_replaces_pin <plan> — the plan's caa item would change a live
+# Portcullis pin (an entry of the issuer with an accounturi): replace it,
+# or remove it with DNS_CAA=false.
+_dns_plan_replaces_pin() {
+  printf '%s' "$1" | jq -e '.caa.issuer as $iss | $iss != "" and
+    ([.items[]? | select(.set == "caa" and .status == "wrong") | (.live // [])[]
+      | select(contains("\"" + $iss) and contains("accounturi="))] | length > 0)' >/dev/null 2>&1
+}
+
 # dns_setup <yes> <dnssec> <only> — show the plan, confirm (unless yes),
 # apply the sets (all, or only <only>) and wait for them, then check.
 # --dnssec turns signing on where the provider can (cloudflare). A
@@ -272,19 +288,20 @@ dns_setup() {
   # Writing the caa set over a live Portcullis pin (removing it with
   # DNS_CAA=false, or replacing it) leaves caches holding that pin for its
   # TTL: save a settle point every later flip honours (N2), from the
-  # tool's progress line the moment the write is accepted. Whether a pin
-  # is live is read first; unreadable counts as live.
-  # When the TTL can't be read (a hand-made pin with an "auto" / zone-default
-  # TTL, or the read failed), the 24 h rule the relax uses is saved before
-  # the write (M24): the progress line's settle point is then only a guess.
+  # tool's progress line the moment the write is accepted. Only then is
+  # the caa set's TTL read first (I1: never the other sets, whose TTL says
+  # nothing about a pin); when it can't be read (a hand-made pin with an
+  # "auto" / zone-default TTL, or the read failed), the 24 h rule the relax
+  # uses is saved before the write (M24): the progress line's settle point
+  # is then only a guess.
   local settle_hook=""
-  if [[ " $DNS_SETS " == *" caa "* ]]; then
+  if [[ " $DNS_SETS " == *" caa "* ]] && _dns_plan_replaces_pin "$out"; then
     local pre prc=0
-    pre="$(_dns_tool ttl 2>/dev/null)" || prc=$?
+    pre="$(DNS_SETS=caa _dns_tool ttl)" || prc=$?
     if [ "$prc" -ne 0 ]; then
       _dns_relax_note "$(( $(date +%s) + 86400 ))" \
         || fail "couldn't save the ACME flip's settle point ($(_dns_relax_file)): nothing written"
-      warn "How long caches hold the CAA of $PORTCULLIS_DOMAIN can't be read before the write (no TTL reported, or the read failed): an ACME_STAGING flip waits 24 h after it ($(_dns_relax_file))."
+      warn "How long caches hold the CAA pin of $PORTCULLIS_DOMAIN this replaces can't be read before the write (the message is above): an ACME_STAGING flip waits 24 h after it ($(_dns_relax_file))."
       settle_hook=_dns_relax_note
     elif [ "$(printf '%s' "$pre" | jq -r '.caa_relaxed // false' 2>/dev/null)" != true ]; then
       settle_hook=_dns_relax_note
@@ -540,11 +557,11 @@ dns_flip_guard() {
     if [ -z "$nb" ]; then
       nb=$((now + 86400))
       _dns_relax_put "$now" 86400 "$nb" || { warn "could not save the settle point ($(_dns_relax_file))"; return 1; }
-      warn "The saved settle point ($(_dns_relax_file)) is unreadable: how long caches may still hold an old CAA pin of $d can't be known, so the flip waits 24 h. Run it again after $(jq -rn --argjson t "$nb" '$t | strftime("%Y-%m-%d %H:%M UTC")')."
+      warn "The saved settle point ($(_dns_relax_file)) is unreadable: how long caches may still hold an old CAA pin of $d can't be known, so the flip waits 24 h. Run it again after $(_dns_clock "$nb")."
       return 1
     fi
     if [ "$nb" -gt "$now" ]; then
-      warn "An old CAA pin of $d may still be cached until $(jq -rn --argjson t "$nb" '$t | strftime("%H:%M UTC")') (saved when it was replaced or removed: $(_dns_relax_file)): run it again after $(jq -rn --argjson t "$nb" '$t | strftime("%H:%M UTC")')."
+      warn "An old CAA pin of $d may still be cached until $(_dns_clock "$nb") (saved when it was replaced or removed: $(_dns_relax_file)): run it again after $(_dns_clock "$nb")."
       return 1
     fi
   fi
@@ -557,7 +574,9 @@ dns_flip_guard() {
   [ "$(printf '%s' "$out" | jq -r '.caa.would_issue')" = true ] && return 0
   # The check ran, but its CAA lookups failed (M22): that says nothing
   # about the CAA, so it is "couldn't check" — refused all the same.
-  if printf '%s' "$out" | jq -e '[.items[]? | select(.set == "caa" and .status == "unknown" and .severity != "info")] | length > 0' >/dev/null 2>&1; then
+  # (a pin live at another resolver is named instead, below: m4)
+  if printf '%s' "$out" | jq -e '([.items[]? | select(.set == "caa" and .status == "unknown" and .severity != "info")] | length > 0)
+      and ([.items[]? | select(.set == "caa") | (.live // [])[]] | length == 0)' >/dev/null 2>&1; then
     warn "couldn't check the public CAA of $d (DNS lookups failed): nothing changed. Run it again when the public resolvers answer."
     return 1
   fi
@@ -610,7 +629,7 @@ dns_relax_main() {
     now="$(date +%s)"
     nb=$((now + 86400))
     _dns_relax_put "$now" 86400 "$nb" || { warn "could not save the relax's settle point ($(_dns_relax_file))"; return 3; }
-    warn "The saved settle point of a relax of the CAA of $d ($(_dns_relax_file)) is unreadable: how long caches may still hold the old pin can't be known, so the flip waits 24 h, until $(jq -rn --argjson t "$nb" '$t | strftime("%Y-%m-%d %H:%M UTC")'). Run it again after that time."
+    warn "The saved settle point of a relax of the CAA of $d ($(_dns_relax_file)) is unreadable: how long caches may still hold the old pin can't be known, so the flip waits 24 h, until $(_dns_clock "$nb"). Run it again after that time."
   fi
   if [ -z "$nb" ]; then
     # No usable saved point: read the CAA's TTL (and whether it is already
@@ -639,7 +658,7 @@ dns_relax_main() {
       # longest resolvers commonly cache (I6).
       nb=$((now + 86400))
       _dns_relax_put "$now" 86400 "$nb" || { warn "could not save the relax's settle point ($(_dns_relax_file))"; return 3; }
-      warn "No Portcullis pin of $d is live (the CAA is CA-only or has none of its entries, e.g. Traefik never registered, so it was never pinned) and no settle record exists ($(_dns_relax_file)), so the old pin's lifetime is unknown: the flip waits 24 h and can go ahead after $(jq -rn --argjson t "$nb" '$t | strftime("%Y-%m-%d %H:%M UTC")') (run it again then)."
+      warn "No Portcullis pin of $d is live (the CAA is CA-only or has none of its entries, e.g. Traefik never registered, so it was never pinned) and no settle record exists ($(_dns_relax_file)), so the old pin's lifetime is unknown: the flip waits 24 h and can go ahead after $(_dns_clock "$nb") (run it again then)."
     else
       nb=$((now + ttl + 60))
       _dns_relax_put "$now" "$ttl" "$nb" || { warn "could not save the relax's settle point ($(_dns_relax_file))"; return 3; }
@@ -672,9 +691,13 @@ dns_relax_main() {
             local who left
             who="$(printf '%s' "$out" | jq -r '.wait.held_by // [] | map(sub(":53$"; "")) | if length == 0 then "a public resolver" else join(", ") end')"
             left="$(printf '%s' "$out" | jq -r '.wait.held_for // 0')"
-            warn "The CAA of $d was relaxed to CA-only, but $who still serves the old pin ($left s left), so caches (the CA's too) may hold it until $at. A rerun of $rerun goes ahead after $at." ;;
+            if [ "$left" -gt 0 ] 2>/dev/null; then
+              warn "The CAA of $d was relaxed to CA-only, but $who still serves the old pin ($left s left), so caches (the CA's too) may hold it until $at. A rerun of $rerun goes ahead after $at."
+            else
+              warn "The CAA of $d was relaxed to CA-only, but a public resolver served the old pin late, so caches (the CA's too) may hold it until $at. A rerun of $rerun goes ahead after $at."
+            fi ;;
           saved)
-            at="$(_dns_wait_at "$out" date)"
+            at="$(_dns_wait_at "$out")"
             warn "The CAA of $d was relaxed to CA-only, but the settle point saved earlier ($(_dns_relax_file)) is past what one run waits (15 min): a rerun of $rerun goes ahead after $at." ;;
           *)
             ttl="$(printf '%s' "$out" | jq -r '.wait.ttl')"

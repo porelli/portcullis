@@ -482,7 +482,7 @@ func TestToolWaitMessages(t *testing.T) {
 	pinAt(f.zone, oldAcct, time.Hour)
 	c := useVirtualClock(t)
 	_, _, errs := f.run([]string{"apply", "--wait", "auto", "--settle"}, toolJSON(caaOnly("")))
-	clear := c.now.Add(3660 * time.Second).UTC().Format("15:04 MST")
+	clear := c.now.Add(3660 * time.Second).UTC().Format("2006-01-02 15:04 MST")
 	for _, want := range []string{"written; waiting up to 15m0s for " + f.resolvers[0], "stored TTL (3600 s) is above what one run waits (15m0s)", "goes ahead after " + clear, "lowering the TTL at the provider"} {
 		if !strings.Contains(errs, want) {
 			t.Errorf("stderr %q lacks %q", errs, want)
@@ -727,5 +727,16 @@ func TestToolWaitMax(t *testing.T) {
 		if code, _, _ := f.run(args, toolJSON(caaOnly(newAcct))); code != exitUsage {
 			t.Errorf("%v = %d, want usage", args, code)
 		}
+	}
+}
+
+// I2: every settle time printed is rounded up to the minute and dated.
+func TestClockAt(t *testing.T) {
+	at := time.Date(2026, 11, 13, 23, 59, 1, 0, time.UTC).Unix()
+	if got := clockAt(at); got != "2026-11-14 00:00 UTC" {
+		t.Fatalf("clockAt = %q, want 2026-11-14 00:00 UTC (rounded up, dated)", got)
+	}
+	if got := clockAt(time.Date(2026, 11, 13, 8, 15, 0, 0, time.UTC).Unix()); got != "2026-11-13 08:15 UTC" {
+		t.Fatalf("clockAt on the minute = %q", got)
 	}
 }

@@ -326,10 +326,11 @@ func waitApplied(ctx context.Context, e toolEnv, build func(dnsplan.Input) dnspl
 	}
 }
 
-// clockAt: a Unix time as "HH:MM UTC", rounded up to the minute (so
-// "after HH:MM" is never early).
+// clockAt: a Unix time as "YYYY-MM-DD HH:MM UTC", rounded up to the
+// minute (so "after <it>" is never early, and a point past midnight is
+// never read as today's).
 func clockAt(unix int64) string {
-	return time.Unix((unix+59)/60*60, 0).UTC().Format("15:04 MST")
+	return time.Unix((unix+59)/60*60, 0).UTC().Format("2006-01-02 15:04 MST")
 }
 
 func earliest(a, b time.Time) time.Time {
@@ -364,6 +365,9 @@ func waitMessage(rep *waitReport, settle bool) string {
 			who := strings.Join(rep.HeldBy, ", ")
 			if who == "" {
 				who = "a resolver"
+			}
+			if rep.HeldFor == 0 { // m1: its answer ran out just before the stop
+				return fmt.Sprintf("domains dns apply: written; a resolver served the old records late, so caches (the CA's too) may hold them until %s. A rerun goes ahead after %s", at, at)
 			}
 			return fmt.Sprintf("domains dns apply: written; %s still serves the old records (%d s left), so caches (the CA's too) may hold them until %s. A rerun goes ahead after %s",
 				who, rep.HeldFor, at, at)
