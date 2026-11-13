@@ -2080,7 +2080,7 @@ case "$*" in
     [ ! -f "$d/rm-hup" ] || kill -HUP "$PPID"
     [ ! -f "$d/rm-fail" ] || exit 1
     exit 0 ;;
-  compose\ *\ build\ domains)
+  compose\ *\ build\ *domains)
     echo build >> "$d/order"
     exit 0 ;;
   compose\ *\ up\ -d\ --no-deps\ traefik)
@@ -2609,7 +2609,7 @@ for unmanaged in 'export DNS_CAA=false DNS_PROVIDER=cloudflare CLOUDFLARE_API_TO
   rm -f "$RELAXF"
   OUT="$(flip "$unmanaged")"
   expect_eq "config apply flip, CAA not managed ($unmanaged): no relax, no build, no settle point; cleared, new CA, done" \
-    "${OUT##*rc=}:$(grep -c -e 'dns-tool apply' -e 'dns-tool ttl' -e 'build domains' "$STUB_DIR/dt/argv" || true):$(paste -sd' ' "$STUB_DIR/dt/order"):$([ -e "$RELAXF" ] && echo saved):$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv"):$(cat "$STUB_DIR/dt/traefik-up" 2>/dev/null):$(cat "$FL_ROOT/certs/.acme-staging-last")" \
+    "${OUT##*rc=}:$(grep -c -e 'dns-tool apply' -e 'dns-tool ttl' -e 'build .*domains$' "$STUB_DIR/dt/argv" || true):$(paste -sd' ' "$STUB_DIR/dt/order"):$([ -e "$RELAXF" ] && echo saved):$(grep -c 'rm -f /acme/acme.json' "$STUB_DIR/dt/argv"):$(cat "$STUB_DIR/dt/traefik-up" 2>/dev/null):$(cat "$FL_ROOT/certs/.acme-staging-last")" \
     "0:0:check::1:CA=https://acme-staging-v02.api.letsencrypt.org/directory sentinel=false:true"
   case "$OUT" in *"24 h"*|*"Relaxing"*) t_fail "unmanaged flip ($unmanaged) waits: $OUT" ;; *) t_pass "config apply flip, CAA not managed ($unmanaged): no wait message" ;; esac
 done
