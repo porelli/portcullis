@@ -1428,7 +1428,7 @@ jobs:
           cat > /tmp/ci-mtls.yml <<'YML'
           services:
             whoami:
-              image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+              image: docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
               networks: [portcullis-proxy]
               labels:
                 traefik.enable: "true"
@@ -1498,7 +1498,7 @@ jobs:
             sleep 3
           done
           docker compose exec -T domains sh -c 'test "$(id -u)" = 10004' || { echo "FAIL: domains is not uid 10004"; exit 1; }
-          CURL_IMG=curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+          CURL_IMG=docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
           SECRET="$(cat secrets/domains/api-secret)"; echo "::add-mask::$SECRET"
           # The API on portcullis-domains (the Hub's network); the bearer comes from stdin.
           dapi() { printf 'Authorization: Bearer %s\n' "$SECRET" \
@@ -1538,7 +1538,7 @@ jobs:
           dapi http://domains:8080/domains | jq -e --arg d "$D" '.[] | select(.name == $d) | .records_ok == true and (.cert_not_after | type) == "string" and .last_error == ""' >/dev/null \
             || { echo "FAIL: domain object: $(dapi http://domains:8080/domains)"; exit 1; }
           if docker compose logs domains 2>&1 | grep -q 'ci-fake-token-0123456789'; then echo "FAIL: the DNS token is in the domains logs"; exit 1; fi
-          if docker run --rm -v portcullis_domains_data:/d:ro alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a grep -rq 'ci-fake-token-0123456789' /d; then
+          if docker run --rm -v portcullis_domains_data:/d:ro docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a grep -rq 'ci-fake-token-0123456789' /d; then
             echo "FAIL: the DNS token is in clear in domains_data"; exit 1
           fi
 
@@ -1646,7 +1646,7 @@ jobs:
                   core: ([""] + ["directory.", "hub.", "metrics.", "people.", "traefik."]
                          | map({key: (. + "portcullis.local"), value: "standard"}) | from_entries),
                   people: {}, add_stronger: false, extra_domains: []}' > /tmp/ci-policy-v6.json
-          docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
+          docker run --rm -i -v portcullis_hub_data:/d docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
               sh -c 'cat > /d/group-gate-policy.json.tmp && chmod 644 /d/group-gate-policy.json.tmp && mv /d/group-gate-policy.json.tmp /d/group-gate-policy.json' \
             < /tmp/ci-policy-v6.json
           # ci-gated has no forward-auth, so the tests send the session headers
@@ -1708,7 +1708,7 @@ jobs:
           # (contract §8.1, the starting methods) into hub_data, or the sign-in
           # extension denies everything (DENY_ALL). The Hub's start replaces it.
           printf '%s' '{"version":1,"methods":["passkey_device","passkey_synced","security_key","yubikey_cert"],"add_stronger":false,"templates":{"standard":{"op":"any","items":[{"op":"any","items":["passkey_synced","passkey_device","security_key"]},{"op":"any","items":["yubikey_cert"]}]}},"clients":{},"authenticators":{},"mds":{"serial":0,"next_update":"0001-01-01T00:00:00Z"}}' \
-            | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
+            | docker run --rm -i -v portcullis_hub_data:/d docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
                 sh -c 'cat > /d/signin-keycloak.json.tmp && chmod 644 /d/signin-keycloak.json.tmp && mv /d/signin-keycloak.json.tmp /d/signin-keycloak.json'
           # pc_method=yubikey_cert = the YubiKey certificate only (the other
           # methods step aside); with confirmation disabled a successful cert
@@ -1751,7 +1751,7 @@ jobs:
           CERT_HDR="$(grep -v -- ----- /tmp/test-client.crt | tr -d '\n')"
           FORGE=(-H "X-Forwarded-Tls-Client-Cert: $CERT_HDR" -H "X-Forwarded-For: 172.31.251.2"
                  -H "X-Forwarded-Proto: https" -H "X-Forwarded-Trusted-Proxy: true")
-          CURL_IMG=curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+          CURL_IMG=docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
           BEFORE=$(docker compose logs keycloak 2>&1 | grep -c 'X-Forwarded-Tls-Client-Cert" is not trusted' || true)
           for net in portcullis portcullis-auth; do
             docker run --rm --network "$net" "$CURL_IMG" -s -o /dev/null -D - "${FORGE[@]}" "http://keycloak:8080$AUTHQ" > "/tmp/kc-forged-$net.h" || true
@@ -1784,7 +1784,7 @@ jobs:
           gated() { curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt \
                       --resolve "gated.portcullis.local:443:127.0.0.1" -H 'X-Auth-Request-Preferred-Username: testuser' \
                       -H "X-Forwarded-Access-Token: $CI_TOKEN_HWK" "${@:2}" "https://gated.portcullis.local$1" || true; }
-          policy() { docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
+          policy() { docker run --rm -i -v portcullis_hub_data:/d docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
                        sh -c 'cat > /d/group-gate-policy.json.tmp && chmod 644 /d/group-gate-policy.json.tmp && mv /d/group-gate-policy.json.tmp /d/group-gate-policy.json'; }
           VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
           echo "::add-mask::$VAULT_TOKEN"
@@ -1821,7 +1821,7 @@ jobs:
           # Attribute headers (contract §5): group-gate's reach the app, the
           # client's never do (whoami echoes the request headers).
           printf '%s' '{"version":2,"fields":{"city":"City"},"users":{"testuser":{"city":["Milan"]}},"hosts":{"gated.portcullis.local":{"Gated-Role":{"testuser":"Admin, Ops"}},"other.portcullis.local":{"Other-Role":{"testuser":"x"}}}}' \
-            | docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
+            | docker run --rm -i -v portcullis_hub_data:/d docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
                 sh -c 'cat > /d/user-attributes.json && chmod 644 /d/user-attributes.json'
           curl -s --cacert certs/ca-chain.crt --resolve "gated.portcullis.local:443:127.0.0.1" \
             -H 'X-Auth-Request-Preferred-Username: testuser' -H "X-Forwarded-Access-Token: $CI_TOKEN_HWK" -H 'X-Forwarded-Attr-City: Forged' -H 'X-Forwarded-Attr-Forged: x' \
@@ -1846,7 +1846,7 @@ jobs:
         run: |
           pub() { curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt \
                     --resolve "public.portcullis.local:443:127.0.0.1" "${@:2}" "https://public.portcullis.local$1" || true; }
-          policy() { docker run --rm -i -v portcullis_hub_data:/d alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
+          policy() { docker run --rm -i -v portcullis_hub_data:/d docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
                        sh -c 'cat > /d/group-gate-policy.json.tmp && chmod 644 /d/group-gate-policy.json.tmp && mv /d/group-gate-policy.json.tmp /d/group-gate-policy.json'; }
           # No public_paths entry (or an older file version / subdomain keys): denied.
           policy < /tmp/ci-policy-v6.json
@@ -1913,7 +1913,7 @@ jobs:
           mkdir -p /tmp/hubproj && cat > /tmp/hubproj/compose.yml <<'YML'
           services:
             web:
-              image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+              image: docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
               volumes: [data:/data]
               networks: [portcullis-proxy, default]
           volumes:
@@ -1924,7 +1924,7 @@ jobs:
           YML
           sed -i 's/^          //' /tmp/hubproj/compose.yml
           dcli() { docker run --rm --network "$NET" -e DOCKER_HOST=tcp://socket-proxy-hub:2375 -v /tmp/hubproj:/p:ro -w /p \
-                     docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb "$@"; }
+                     docker.io/library/docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb "$@"; }
           dcli docker compose -p ci-hubproxy up -d --pull missing || { docker compose logs --tail=30 socket-proxy-hub; echo "FAIL: compose up through socket-proxy-hub"; exit 1; }
           dcli docker compose -p ci-hubproxy ps --format json | grep -q '"State":"running"' || { echo "FAIL: compose ps"; exit 1; }
           dcli docker compose -p ci-hubproxy logs web >/dev/null || { echo "FAIL: compose logs"; exit 1; }
@@ -1938,7 +1938,7 @@ jobs:
           # The libpod API and /build: 403 on the Hub's proxy too, GET and POST
           # (its POST=1 allows writes only on the allowed sections).
           hp() { docker run --rm --network "$NET" --entrypoint wget \
-                   docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb \
+                   docker.io/library/docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb \
                    -q -O /dev/null -S "$@" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -n1 | cut -d' ' -f2; }
           for denied in /libpod/info /libpod/play/kube /v5.0.0/libpod/containers/json /build; do
             [ "$(hp "http://socket-proxy-hub:2375$denied")" = 403 ] || { echo "FAIL: socket-proxy-hub allowed GET $denied"; exit 1; }
@@ -2002,7 +2002,7 @@ jobs:
           # applies the default to every app host without its own pick — here
           # the ci-gated test app.
           hubapi() { curl -s -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") "$@"; }
-          policy_file() { docker run --rm -v portcullis_hub_data:/d:ro alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a cat /d/group-gate-policy.json 2>/dev/null; }
+          policy_file() { docker run --rm -v portcullis_hub_data:/d:ro docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a cat /d/group-gate-policy.json 2>/dev/null; }
           gated() { curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt \
                       --resolve "gated.portcullis.local:443:127.0.0.1" -H 'X-Auth-Request-Preferred-Username: testuser' \
                       --cert /tmp/test-client.crt --key /tmp/test-client.key "$@" https://gated.portcullis.local/ || true; }
@@ -2063,7 +2063,7 @@ jobs:
       - name: Test the MCP gate (non-root, pinned address, secrets, access log, MCP routes without forward-auth)
         run: |
           set -o pipefail
-          ALPINE=alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+          ALPINE=docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
           # The CLI of the image: usage on a bad command (exit 2), keygen
           # prints one identity with its recipient (never kept here).
           rc=0; docker run --rm --network none --read-only --cap-drop ALL portcullis-mcp-gate --help 2>/tmp/gate-help >/dev/null || rc=$?
@@ -2175,7 +2175,7 @@ jobs:
           if [ -z "$(docker compose ps -q hub)" ]; then
             echo "::warning::the Hub isn't running (its test was skipped) — skipping signin reset-core"; exit 0
           fi
-          ALPINE=alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+          ALPINE=docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
           SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"
           hub_ip() { docker inspect -f '{{(index .NetworkSettings.Networks "portcullis").IPAddress}}' "$(docker compose ps -q hub)"; }
           hubadmin() { curl -s -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") "$@"; }
@@ -2749,6 +2749,41 @@ jobs:
           fi
           echo "PASS: portcullis up creates / reconciles portcullis-hub (lldap_admin, password from the 0640 file) and mounts it into the Hub"
 
+      - name: upgrade recreates the container of a rebuilt local image, and only that one
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          [ -n "${HUB_LOCAL:-}" ] || docker compose pull --quiet hub || { echo "::warning::Hub image cannot be pulled — skipping"; exit 0; }
+          ct_img() { docker inspect --format '{{.Image}}' "$(docker compose ps -q "$1")"; }
+          enroll_before="$(ct_img enroll)" mcp_ct="$(docker compose ps -q mcp-gate)" pg_ct="$(docker compose ps -q postgres)"
+          # A real change to enroll's image content only — its compose config
+          # (compose's config hash) stays the same: what a code change to a
+          # locally built service is (test server 2026-11-13, finding A).
+          echo 'LABEL org.portcullis.ci-rebuild="1"' >> enroll/Dockerfile
+          # upgrade's pull is skipped: every image is pinned and already
+          # verified here, and a Hub / Keycloak built from a same-named branch
+          # (HUB_LOCAL / KEYCLOAK_LOCAL) can't be pulled.
+          real="$(command -v docker)" shim="$RUNNER_TEMP/nopull"
+          mkdir -p "$shim"
+          # shellcheck disable=SC2016  # the shim's own $1 / $@
+          printf '#!/usr/bin/env bash\n[ "$1" = compose ] && for a in "$@"; do [ "$a" = pull ] && exit 0; done\nexec %q "$@"\n' "$real" > "$shim/docker"
+          chmod +x "$shim/docker"
+          PATH="$shim:$PATH" ./portcullis upgrade --skip-backup
+          git checkout -- enroll/Dockerfile
+          built="$(docker image inspect --format '{{.Id}}' portcullis-enroll)"
+          [ "$built" != "$enroll_before" ] || { echo "FAIL: the rebuild didn't change portcullis-enroll"; exit 1; }
+          [ "$(ct_img enroll)" = "$built" ] || { echo "FAIL: enroll runs $(ct_img enroll), not the freshly built $built"; exit 1; }
+          [ "$(docker image inspect --format '{{index .Config.Labels "org.portcullis.ci-rebuild"}}' "$(ct_img enroll)")" = 1 ] \
+            || { echo "FAIL: enroll's running image lacks the rebuilt label"; exit 1; }
+          # Unchanged images keep their containers (a rebuild of the same
+          # content is a new image ID under the containerd store; compose
+          # compares the content).
+          [ "$(docker compose ps -q mcp-gate)" = "$mcp_ct" ] || { echo "FAIL: mcp-gate was recreated though its image content didn't change"; exit 1; }
+          [ "$(docker compose ps -q postgres)" = "$pg_ct" ] || { echo "FAIL: postgres was recreated"; exit 1; }
+          wait_h() { for _ in $(seq 1 40); do [ "$(docker inspect --format '{{.State.Health.Status}}' "$(docker compose ps -q "$1")")" = healthy ] && return 0; sleep 3; done; return 1; }
+          wait_h enroll || { echo "FAIL: the recreated enroll isn't healthy"; docker compose logs --tail=30 enroll; exit 1; }
+          echo "PASS: upgrade rebuilt enroll and recreated its container on the new image ($built); mcp-gate and postgres kept theirs"
+
       - name: Test the session store (oauth2-proxy sessions in Valkey, a ticket cookie, the ACL)
         run: |
           # oauth2-proxy #3486: a session in cookies outgrew one cookie and the
@@ -2944,7 +2979,7 @@ jobs:
           # domains_data (age-encrypted) + secrets/domains/age.key came back: the store decrypts.
           for _ in $(seq 1 40); do [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q domains)" 2>/dev/null)" = healthy ] && break; sleep 3; done
           printf 'Authorization: Bearer %s\n' "$(cat secrets/domains/api-secret)" \
-            | docker run --rm -i --network portcullis_portcullis-domains curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93 -sf -H @- http://domains:8080/domains \
+            | docker run --rm -i --network portcullis_portcullis-domains docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93 -sf -H @- http://domains:8080/domains \
             | jq -e 'any(.[]; .name == "keep.ci-domains.test")' >/dev/null || { echo "FAIL: enrolled domain lost by backup/restore"; docker compose logs --tail=20 domains; exit 1; }
           test "$N_CERTS" = "$(vault list -format=json pki_int/certs | jq length)" || { echo "FAIL: issued-cert records lost"; exit 1; }
           vault read -format=json "pki_int/cert/$REVOKED" | jq -e '.data.revocation_time > 0' >/dev/null || { echo "FAIL: revocation lost"; exit 1; }
@@ -2978,7 +3013,7 @@ jobs:
           for _ in $(seq 1 40); do [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q mcp-gate)" 2>/dev/null)" = healthy ] && break; sleep 3; done
           [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q mcp-gate)")" = healthy ] || { echo "FAIL: mcp-gate after restore"; docker compose logs --tail=30 mcp-gate; exit 1; }
           cmp -s /tmp/gate-age.pub secrets/mcp-gate/age.pub || { echo "FAIL: the gate's recipient changed by backup/restore"; exit 1; }
-          docker run --rm -v portcullis_mcp_gate_data:/d:ro alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
+          docker run --rm -v portcullis_mcp_gate_data:/d:ro docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
             sh -c 'stat -c "%a %u %g" /d /d/access.jsonl && grep -c "deny:off" /d/access.jsonl' > /tmp/gate-restored
           [ "$(sed -n 1,2p /tmp/gate-restored | paste -sd' ')" = "750 10005 10001 640 10005 10001" ] && [ "$(sed -n 3p /tmp/gate-restored)" -ge 3 ] \
             || { echo "FAIL: restored access log: $(cat /tmp/gate-restored)"; exit 1; }
@@ -3035,7 +3070,7 @@ jobs:
       # The whole stack incl. the monitoring profile (Grafana at metrics.<domain>).
       COMPOSE_PROFILES: monitoring
       E2E_METRICS: "1"
-      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      ALPINE: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -3067,7 +3102,7 @@ jobs:
           {
             docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh \
-              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
+              | grep -E '^docker\.io/(library/(alpine|busybox)|traefik/whoami|curlimages/curl):'
           } > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         timeout-minutes: 15
@@ -3250,7 +3285,7 @@ jobs:
           cat > /tmp/e2e-app.yml <<'YML'
           services:
             whoami:
-              image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+              image: docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
               networks: [portcullis-proxy]
               labels:
                 traefik.enable: "true"
@@ -3408,7 +3443,7 @@ jobs:
           # anywhere but Traefik's IP is not accepted.
           code=$(curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt https://metrics.portcullis.local/)
           case "$code" in 302|401) ;; *) echo "FAIL: metrics.<domain> unauthenticated got $code"; exit 1 ;; esac
-          CURL_IMG=curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+          CURL_IMG=docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
           code=$(docker run --rm --network portcullis-proxy "$CURL_IMG" -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-User: admin' http://grafana:3000/api/user)
           [ "$code" != 200 ] || { echo "FAIL: Grafana accepted X-Forwarded-User from a non-Traefik peer"; exit 1; }
           echo "PASS: monitoring: targets up, probes, metrics, rules, no Vault/CRL alert, Grafana gated"
@@ -3458,8 +3493,8 @@ jobs:
       E2E_DOMAIN: portcullis.local
       E2E_EXTRA: team-b.test
       E2E_ARTIFACTS: e2e-artifacts
-      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
-      CURL_IMG: curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+      ALPINE: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      CURL_IMG: docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -3516,7 +3551,7 @@ jobs:
           {
             docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
-              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
+              | grep -E '^docker\.io/(library/(alpine|busybox)|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         timeout-minutes: 15
@@ -3844,7 +3879,10 @@ jobs:
           if docker image inspect "$HELPER" >/dev/null 2>&1; then echo "FAIL: the helper image is still present"; exit 1; fi
           hubop POST /api/instances/echo-a/backups
           ARCHIVE="$(jq -r .result.archive /tmp/op.json)"
-          docker image inspect -f '{{json .RepoDigests}}' "$HELPER" | jq -e --arg d "${HELPER%%:*}@${HELPER#*@}" 'index($d) != null' >/dev/null \
+          # RepoDigests names a docker.io image either way: docker.io/library/alpine@… or alpine@….
+          REPO="${HELPER%%:*}" SHORT="${REPO#docker.io/}"; SHORT="${SHORT#library/}"
+          docker image inspect -f '{{json .RepoDigests}}' "$HELPER" \
+            | jq -e --arg d "$REPO@${HELPER#*@}" --arg s "$SHORT@${HELPER#*@}" 'any(.[]; . == $d or . == $s)' >/dev/null \
             || { echo "FAIL: the helper image was not pulled by its digest"; exit 1; }
           [ -z "$(docker ps -aq --filter label=io.portcullis.hub.helper)" ] || { echo "FAIL: helper containers left behind"; docker ps -a; exit 1; }
           echo "PASS: backup $ARCHIVE (helper image pulled by digest, never-started helpers removed)"
@@ -4042,7 +4080,7 @@ jobs:
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
-      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      ALPINE: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
       APP_HOSTS: echo-std echo-basic echo-cert echo-file echo-anycert oidc-strong oidc-all oidc-cert
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -4106,7 +4144,7 @@ jobs:
           {
             docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
-              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
+              | grep -E '^docker\.io/(library/(alpine|busybox)|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         timeout-minutes: 15
@@ -4475,7 +4513,7 @@ jobs:
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
-      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      ALPINE: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
       APP_HOSTS: photos grafana cloud firefox-sync settings-echo settings-file
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -4571,7 +4609,7 @@ jobs:
           {
             docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
-              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
+              | grep -E '^docker\.io/(library/(alpine|busybox)|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         timeout-minutes: 15
@@ -4854,7 +4892,7 @@ jobs:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
       E2E_MEDIA: /srv/e2e-media
-      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      ALPINE: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -4938,7 +4976,7 @@ jobs:
           {
             docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
-              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
+              | grep -E '^docker\.io/(library/(alpine|busybox)|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         timeout-minutes: 15
@@ -5153,7 +5191,7 @@ jobs:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
       E2E_FAMILY: /srv/e2e-family
-      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      ALPINE: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
       # Ubuntu 24.04's Samba 4.19.5 (any security update of it).
       SMBCLIENT_VERSION: "2:4.19.5+dfsg-4ubuntu9*"
     steps:
@@ -5236,7 +5274,7 @@ jobs:
           {
             docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
-              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
+              | grep -E '^docker\.io/(library/(alpine|busybox)|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         timeout-minutes: 15
@@ -5462,7 +5500,7 @@ jobs:
     env:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
-      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      ALPINE: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -5544,7 +5582,7 @@ jobs:
           {
             docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/workflows/ci.yml scripts/lib/common.sh tests/e2e/apps/*/compose.yml \
-              | grep -E '^(alpine|busybox|traefik/whoami|curlimages/curl):'
+              | grep -E '^docker\.io/(library/(alpine|busybox)|traefik/whoami|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
       - name: Load images (cached, verified)
         timeout-minutes: 15
@@ -5814,7 +5852,7 @@ jobs:
       # CI override (rootless container addresses aren't reachable from the
       # host).
       HUB_API: http://127.0.0.1:18888
-      ALPINE: alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      ALPINE: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -6128,6 +6166,27 @@ jobs:
           # Back to the default profile for the rest of the job.
           COMPOSE_PROFILES=monitoring docker compose rm -sf prometheus alertmanager blackbox textfile-exporter grafana
 
+      - name: up recreates the container of a rebuilt local image (podman build + up --no-build), and only that one
+        timeout-minutes: 15
+        run: |
+          set -o pipefail
+          # Podman's compat inspect may or may not prefix "sha256:".
+          nid() { printf '%s' "${1#sha256:}"; }
+          ct_img() { nid "$(docker inspect --format '{{.Image}}' "$(docker compose ps -q "$1")")"; }
+          enroll_before="$(ct_img enroll)" mcp_ct="$(docker compose ps -q mcp-gate)"
+          # A change to enroll's image content only (its compose config stays the same).
+          echo 'LABEL org.portcullis.ci-rebuild="1"' >> enroll/Dockerfile
+          ./portcullis up
+          git checkout -- enroll/Dockerfile
+          built="$(nid "$(podman image inspect --format '{{.Id}}' portcullis-enroll)")"
+          [ "$built" != "$enroll_before" ] || { echo "FAIL: podman build didn't change portcullis-enroll"; exit 1; }
+          [ "$(ct_img enroll)" = "$built" ] || { echo "FAIL: enroll runs $(ct_img enroll), not the freshly built $built"; exit 1; }
+          [ "$(podman image inspect --format '{{index .Config.Labels "org.portcullis.ci-rebuild"}}' "$built")" = 1 ] \
+            || { echo "FAIL: enroll's running image lacks the rebuilt label"; exit 1; }
+          # A fully cached podman build keeps the image ID: no recreate.
+          [ "$(docker compose ps -q mcp-gate)" = "$mcp_ct" ] || { echo "FAIL: mcp-gate was recreated though its image didn't change"; exit 1; }
+          echo "PASS: up rebuilt enroll with podman build and recreated its container on it; mcp-gate kept its container"
+
       - name: Pinned networks, addresses and limits
         run: |
           set -o pipefail
@@ -6191,7 +6250,7 @@ jobs:
           mkdir -p /tmp/hubproj && cat > /tmp/hubproj/compose.yml <<'YML'
           services:
             web:
-              image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+              image: docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
               volumes: [data:/data]
               networks: [portcullis-proxy, default]
           volumes:
@@ -6201,7 +6260,7 @@ jobs:
               external: true
           YML
           dcli() { docker run --rm --network "$NET" -e DOCKER_HOST=tcp://socket-proxy-hub:2375 -v /tmp/hubproj:/p:ro -w /p \
-                     docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb "$@"; }
+                     docker.io/library/docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb "$@"; }
           dcli docker compose -p ci-hubproxy up -d --pull missing || { docker compose logs --tail=30 socket-proxy-hub; echo "FAIL: compose up through socket-proxy-hub"; exit 1; }
           dcli docker compose -p ci-hubproxy ps --format json | grep -q '"State":"running"' || { echo "FAIL: compose ps"; exit 1; }
           dcli docker compose -p ci-hubproxy logs web >/dev/null || { echo "FAIL: compose logs"; exit 1; }
@@ -6212,7 +6271,7 @@ jobs:
             if dcli $denied >/dev/null 2>&1; then echo "FAIL: socket-proxy-hub allowed: $denied"; exit 1; fi
           done
           hp() { docker run --rm --network "$NET" --entrypoint wget \
-                   docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb \
+                   docker.io/library/docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb \
                    -q -O /dev/null -S "$@" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -n1 | cut -d' ' -f2; }
           for odd in "/containers/../libpod/info" "/containers/%2e%2e/libpod/info" "/containers%2F..%2Flibpod%2Finfo" "/v1.41/build" "/v5.0.0/libpod/info"; do
             c="$(hp "http://socket-proxy-hub:2375$odd")"
@@ -6268,7 +6327,7 @@ jobs:
           cat > /tmp/ci-mtls.yml <<'YML'
           services:
             whoami:
-              image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+              image: docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
               networks: [portcullis-proxy]
               labels:
                 traefik.enable: "true"

@@ -4,7 +4,7 @@ services:
   # redirect URI (https://<host>/cb), so the app never signs anyone in; the
   # secret is only what the Hub registers in Keycloak for the client.
   web:
-    image: traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+    image: docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
     environment:
       OIDC_ECHO_SECRET: ${OIDC_ECHO_SECRET:?OIDC_ECHO_SECRET must be set}
     networks: [default, portcullis-proxy]

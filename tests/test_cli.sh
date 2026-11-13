@@ -286,6 +286,17 @@ svc/Dockerfile:4: golang:1@sha256:00
 docker-compose.yml:3: traefik/whoami:v1@sha256:00
 docker-compose.yml:13: postgres:18@sha256:00
 rc=1"
+# The CLI's image constants and the workflows' / CI templates' inline images.
+mkdir -p "$WORK/lint/scripts/lib" "$WORK/lint/.github/workflows" "$WORK/lint/tests/e2e/apps/x"
+printf 'A_IMAGE="alpine:3.24.3@sha256:0000000000000000000000000000000000000000000000000000000000000000"\nB_IMAGE="docker.io/library/alpine:3.24.3@sha256:0000000000000000000000000000000000000000000000000000000000000000"\n' > "$WORK/lint/scripts/lib/x.sh"
+printf 'env:\n  ALPINE: alpine:3@sha256:0000000000000000000000000000000000000000000000000000000000000000\n  CURL_IMG: docker.io/curlimages/curl:8@sha256:0000000000000000000000000000000000000000000000000000000000000000\nrun: docker run --rm restic/restic:0.19.1@sha256:0000000000000000000000000000000000000000000000000000000000000000 x\n' > "$WORK/lint/.github/workflows/x.yml"
+printf 'services:\n  a:\n    image: busybox:1@sha256:00\n' > "$WORK/lint/tests/e2e/apps/x/compose.yml"
+OUT="$("$WORK/lint/tests/lint_images.sh"; echo "rc=$?")"
+expect_eq "lint_images.sh flags short names in scripts/lib constants, workflow inline images and CI templates (qualified ones pass)" \
+  "$(printf '%s\n' "$OUT" | grep -E '^(scripts|\.github|tests/e2e)' | sed 's/@sha256:.*//')" "tests/e2e/apps/x/compose.yml:3: busybox:1
+scripts/lib/x.sh:1: alpine:3.24.3
+.github/workflows/x.yml:2: alpine:3
+.github/workflows/x.yml:4: restic/restic:0.19.1"
 expect_eq "the SELinux overlay adds only label=disable to security_opt (compose appends: a repeated no-new-privileges is a duplicate newer compose refuses)" \
   "$(grep -v '^[[:space:]]*#' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml" | grep -c 'no-new-privileges'):$(grep -c '^    security_opt: \["label=disable"\]$' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" "0:2"
 expect_eq "docker-compose.podman.yml sets restart: always and nothing else (podman-restart.service starts only those at boot)" \

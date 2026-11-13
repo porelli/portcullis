@@ -1510,6 +1510,26 @@ esac
 # The MANIFEST of a backup must never list hub_secrets as a file.
 expect_ok "backup: BACKUP_FILE_VOLUMES does not contain hub_secrets" bash -c '! echo "$BACKUP_FILE_VOLUMES" | grep -q hub_secrets'
 
+# Test server 2026-11-13: an empty domains_data turned 10003:10001 0750
+# (group-gate's /data) at a backup — Docker copies the image's mountpoint
+# owner and mode onto an empty named volume. The python helpers (group-gate's
+# image) mount volumes at BACKUP_PY_MOUNT, which that image doesn't have.
+rm -f "$STUB_DIR/calls"
+( _py_image() { echo portcullis-group-gate; }
+  _backup_volume_files portcullis_domains_data 10004 10004 >/dev/null 2>&1
+  _BACKUP_CFG='{"volumes":{"lldap_data":{"name":"portcullis_lldap_data"}}}'
+  _restore_lldap_count >/dev/null 2>&1 ) || true
+expect_eq "backup: the snapshot helper mounts the volume at $BACKUP_PY_MOUNT, not /data" \
+  "$(grep -c -- "--user 10004:10004 .*-v portcullis_domains_data:$BACKUP_PY_MOUNT portcullis-group-gate python3 -c" "$STUB_DIR/calls")" 1
+expect_eq "restore: the LLDAP user count mounts lldap_data read-only at $BACKUP_PY_MOUNT" \
+  "$(grep -c -- "-v portcullis_lldap_data:$BACKUP_PY_MOUNT:ro portcullis-group-gate python3 -c" "$STUB_DIR/calls")" 1
+expect_eq "backup: no CLI helper mounts a volume at /data of the group-gate (python) image" \
+  "$(grep -c -- ':/data.* portcullis-group-gate ' "$STUB_DIR/calls" || true)" 0
+expect_eq "backup: the python helpers read BACKUP_PY_MOUNT (snapshot SRC, LLDAP count URI)" \
+  "$(printf '%s\n' "$_BACKUP_PY_SNAPSHOT" | grep -cx "SRC = \"$BACKUP_PY_MOUNT\""):$(printf '%s\n' "$_BACKUP_PY_COUNT_LLDAP" | grep -cF "file:$BACKUP_PY_MOUNT/users.db")" "1:1"
+expect_eq "backup: the group-gate image has no $BACKUP_PY_MOUNT (nothing to copy onto an empty volume)" \
+  "$(grep -cE "(^|[[:space:]=])$BACKUP_PY_MOUNT([/[:space:]]|$)" "$HERE/../group-gate/Dockerfile" || true)" 0
+
 # Restore must fail closed when hub_secrets volume removal fails (security: old hashes would survive).
 # Override the existing docker stub to simulate a volume rm failure.
 mv "$WORK/bin/docker" "$WORK/bin/docker-orig"
@@ -3040,6 +3060,28 @@ expect_eq "stack_compose_up on docker: up -d --build (unchanged), no podman" "$O
 rc=0"
 expect_eq "runtime_no_build: --no-build under podman, nothing under docker" \
   "[$(CONTAINER_RUNTIME=podman runtime_no_build)][$(CONTAINER_RUNTIME=docker runtime_no_build)]" "[--no-build][]"
+# A rebuilt image reaches its container (test server 2026-11-13 finding A):
+# compose recreates on a changed image only if no up pins the decision, so
+# no `dc up` in the CLI says --no-recreate, --force-recreate is only the
+# restore's fresh Vault, and every up outside stack_compose_up builds
+# nothing itself (podman: --no-build; docker: compose builds only a missing image).
+LIBS="$HERE/../scripts/lib"
+expect_eq "no dc up in the CLI passes --no-recreate" "$(grep -n 'dc up .*--no-recreate' "$LIBS"/*.sh "$HERE/../portcullis" || true)" ""
+expect_eq "--force-recreate only on the restore's fresh Vault" \
+  "$(grep -h 'dc up .*--force-recreate' "$LIBS"/*.sh | sed 's/^ *//')" 'dc up -d $(runtime_no_build) --no-deps --force-recreate vault >/dev/null'
+expect_eq "every dc up outside stack_compose_up passes \$(runtime_no_build)" \
+  "$(grep -n 'dc up ' "$LIBS"/*.sh | grep -v '^\s*#' | grep -vF '$(runtime_no_build)' | grep -v '/runtime.sh:' || true)" ""
+expect_eq "stack_compose_up is the only dc up --build (init, up, upgrade, restore go through it)" \
+  "$(grep -n 'dc up .*--build' "$LIBS"/*.sh | grep -v -- '--no-build' | sed 's/.*\/\(runtime\.sh\):[0-9]*:.*/\1/'):$(grep -c '^ *stack_compose_up' "$LIBS/stack.sh") $(grep -c '^ *stack_compose_up ||' "$LIBS/backup.sh")" "runtime.sh:3 1"
+# restore builds on both runtimes, as up does (docker used to start the
+# images it had: a git pull before a restore left them old).
+for RTN in docker podman; do
+  OUT="$(rt "CONTAINER_RUNTIME=$RTN; compose_health_report() { :; }; stack_compose_up >/dev/null 2>&1; echo \"\$?\"; grep -cE '^compose .* up -d --(no-)?build$' \"\$STUB_DIR/rt-calls\"; grep -c '^build ' \"\$STUB_DIR/podman-calls\" 2>/dev/null || echo 0")"
+  case "$RTN:$OUT" in
+    "docker:0"$'\n'"1"$'\n'"0"$'\n'"rc=0"|"podman:0"$'\n'"1"$'\n'"3"$'\n'"rc=0") t_pass "stack_compose_up on $RTN: the local images built, one up that lets compose recreate changed ones" ;;
+    *) t_fail "stack_compose_up on $RTN: $OUT" ;;
+  esac
+done
 OUT="$(rt "CONTAINER_RUNTIME=podman PORTCULLIS_ROOT='$RX'; domains_image_ensure >/dev/null 2>&1; echo \"\$?\"; cat \"\$STUB_DIR/podman-calls\"; grep -c ' build' \"\$STUB_DIR/rt-calls\"; true")"
 expect_eq "domains_image_ensure on podman runs podman build, never dc build" "$OUT" "0
 build --format docker -t portcullis-domains -f /src/domains/Dockerfile --build-arg GO_TAGS=testprovider /src/domains
