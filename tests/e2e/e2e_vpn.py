@@ -312,16 +312,23 @@ def ts_ip(node: str, host: str = ECHO) -> str:
 def ts_get(node: str, host: str = ECHO, path: str = "/", cookie_file: str | None = None) -> tuple[int, str]:
     """A request through node's tailscaled (its SOCKS5 proxy, in its netns)
     to the tailnet address MagicDNS gives host (ts_ip); TLS and Host stay
-    host."""
-    ip = ts_ip(node, host)
-    vols = ["-v", f"{os.path.abspath(CA)}:/ca.pem:ro"]
-    hdr = []
+    host. The session cookie goes on curl's stdin (-H @-): the curl image
+    runs as a non-root user that can't read the 0600 cookie file, and a
+    cookie is a secret (never argv). (0, why) when MagicDNS has no address
+    (no tailnet: e.g. the node was deleted)."""
+    try:
+        ip = ts_ip(node, host)
+    except AssertionError as e:
+        return 0, f"no tailnet address: {e}"
+    stdin, hdr = None, []
     if cookie_file:
-        vols += ["-v", f"{cookie_file}:/h:ro"]
-        hdr = ["-H", "@/h"]
-    rc, out = sh("docker", "run", "--rm", "--network", f"container:ts-{node}", *vols, CURL_IMG,
-                 "-s", "-o", "-", "-w", "\n%{http_code}", "--max-time", "20", "--socks5", "127.0.0.1:1055",
-                 "--resolve", f"{host}:443:{ip}", "--cacert", "/ca.pem", *hdr, f"https://{host}{path}", timeout=60)
+        with open(cookie_file) as f:
+            stdin = f.read()
+        hdr = ["-H", "@-"]
+    rc, out = sh("docker", "run", "--rm", "-i", "--network", f"container:ts-{node}", "-v", f"{os.path.abspath(CA)}:/ca.pem:ro",
+                 CURL_IMG, "-s", "-o", "-", "-w", "\n%{http_code}", "--max-time", "20", "--socks5", "127.0.0.1:1055",
+                 "--resolve", f"{host}:443:{ip}", "--cacert", "/ca.pem", *hdr, f"https://{host}{path}",
+                 stdin=stdin if stdin is not None else "", timeout=60)
     body, _, code = out.rpartition("\n")
     return int(code) if code.isdigit() else 0, body
 
