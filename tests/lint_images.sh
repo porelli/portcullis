@@ -39,7 +39,7 @@ for f in docker-compose*.yml tests/e2e/apps/*/compose.yml; do
   done < <(grep -nE '^[[:space:]]+image:[[:space:]]' "$f")
 done
 # Inline pinned refs: a pinned ref is what the CLI and CI pull / run.
-for f in portcullis scripts/lib/*.sh .github/workflows/*.yml .github/actions/*/action.yml; do
+for f in portcullis scripts/lib/*.sh .github/workflows/*.yml .github/ci/*.sh .github/actions/*/action.yml; do
   [ -f "$f" ] || continue
   while IFS=: read -r n ref; do
     qualified "$ref" || { echo "$f:$n: $ref"; bad=1; }

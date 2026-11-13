@@ -183,7 +183,7 @@ expect_ok   "hub env: domain" grep -qx 'PORTCULLIS_DOMAIN=hub.test' "$HE"
 expect_ok   "hub env: Traefik IP (compose default)" grep -qx 'PORTCULLIS_TRAEFIK_IP=172.31.250.2' "$HE"
 expect_ok   "hub env: VPN client secret by prefix" grep -qx 'HEADSCALE_OIDC_CLIENT_SECRET=hs-secret' "$HE"
 expect_ok   "hub env: the VPN reserved ranges (what wg / group-gate refuse) for the Hub" \
-  grep -qx 'PORTCULLIS_VPN_RESERVED_RANGES=172.16.0.0/12 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28' "$HE"
+  grep -qx 'PORTCULLIS_VPN_RESERVED_RANGES=172.16.0.0/12 192.168.0.0/16 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28' "$HE"
 expect_ok   "hub env: HUB_SHARED_ENV" grep -qx 'MY_APP_VAR=shared' "$HE"
 expect_ok   "hub env: mcp-gate IP (compose default, G42)" grep -qx 'PORTCULLIS_MCP_GATE_IP=172.31.250.3' "$HE"
 expect_fail "hub env: never a core secret" grep -Eq 'pg-secret|hub-secret|kc-secret' "$HE"
@@ -3610,6 +3610,15 @@ OUT="$(vt 'vpn_init on 51820 10.214.0.0/23' 2>&1)"; RC=$?
 expect_eq "vpn init: the reserved link subnet → refused" "$RC:$(printf '%s' "$OUT" | grep -c 'reserved for server links')" "1:1"
 OUT="$(vt 'vpn_init on 51820 172.31.254.0/24' 2>&1)"; RC=$?
 expect_eq "vpn init: portcullis-vpn / -edge → refused" "$RC:$(printf '%s' "$OUT" | grep -c 'a Portcullis VPN network')" "1:2"
+for s in 192.168.4.0/22 172.20.0.0/22; do
+  OUT="$(vt "vpn_init on 51820 $s" 2>&1)"; RC=$?
+  expect_eq "vpn init: $s, in Docker's default address pools → refused, saying Docker allocates networks there" \
+    "$RC:$(printf '%s' "$OUT" | grep -c "(Docker's default address pool)"):$(printf '%s' "$OUT" | grep -c 'Docker allocates networks (app instances'"'"' too) from these ranges')" "1:1:1"
+done
+OUT="$(PORTCULLIS_AUTH_SUBNET=10.213.8.0/28 vt 'vpn_init on 51820 10.213.8.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: a fixed core subnet (moved into 10.213/16) → refused" "$RC:$(printf '%s' "$OUT" | grep -c '10.213.8.0/28 (a Portcullis core network)')" "1:1"
+OUT="$(vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: the default subnet clears the reserved ranges" "$(printf '%s' "$OUT" | grep -c "address pool\|core network" || true)" 0
 OUT="$(VT_HUB_HEALTH=starting vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
 expect_eq "vpn init: the Hub not healthy → refused" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running")" "1:1"
 

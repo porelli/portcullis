@@ -225,11 +225,13 @@ validate_vpn_network_config() {
 }
 
 # vpn_reserved_ranges — the ranges no VPN provider may claim, as wg and
-# group-gate refuse them (Docker's default bridge pool + compose's
-# WG_CORE_SUBNETS / GATE_CORE_SUBNETS, in that order); the Hub gets it as
+# group-gate refuse them (Docker's default address pools 172.16.0.0/12 and
+# 192.168.0.0/16 — Docker allocates networks, app instances' included, from
+# them — + compose's WG_CORE_SUBNETS / GATE_CORE_SUBNETS, in that order);
+# the Hub gets it as
 # core.env's PORTCULLIS_VPN_RESERVED_RANGES and refuses them first.
 vpn_reserved_ranges() {
-  echo "172.16.0.0/12 $(proxy_subnet) $(auth_subnet) $(domains_subnet) $(mcp_subnet) $(vpn_net) $(vpn_edge_subnet)"
+  echo "172.16.0.0/12 192.168.0.0/16 $(proxy_subnet) $(auth_subnet) $(domains_subnet) $(mcp_subnet) $(vpn_net) $(vpn_edge_subnet)"
 }
 
 # validate_vpn_edge_network_config — portcullis-vpn-edge (contract §16):

@@ -100,6 +100,15 @@ vpn_overlaps() {
     ! _overlaps "$sub" "$c" || echo "$c (a Portcullis VPN network)"
   done
   ! _overlaps "$sub" "$VPN_LINK_SUBNET" || echo "$VPN_LINK_SUBNET (reserved for server links)"
+  # What wg and group-gate refuse in vpn.json (vpn_reserved_ranges): the
+  # VPN networks are reported above.
+  for c in $(vpn_reserved_ranges); do
+    case "$c" in
+      172.16.0.0/12|192.168.0.0/16) ! _overlaps "$sub" "$c" || echo "$c (Docker's default address pool)" ;;
+      "$(vpn_net)"|"$(vpn_edge_subnet)") ;;
+      *) ! _overlaps "$sub" "$c" || echo "$c (a Portcullis core network)" ;;
+    esac
+  done
   while IFS= read -r c; do
     [ -n "$c" ] || continue
     ! _overlaps "$sub" "$c" || echo "$c (a Docker network)"
@@ -261,9 +270,11 @@ COMPOSE_PROFILES, writes PORTCULLIS_VPN_BUILTIN / _PORT / _SUBNET, generates
 the built-in VPN's key (once; secrets/wg/people.key, never printed) and
 starts wg, Traefik and the Hub. The Hub must be running.
 
-The subnet must not overlap a Docker network, Portcullis' VPN networks, the
-reserved link subnet 10.214.0.0/24, a Local network you entered in the Hub
-or a wired provider's range; a free /22 in 10.213.0.0/16 is suggested.
+The subnet must not overlap a Docker network, Docker's default address pools
+172.16.0.0/12 and 192.168.0.0/16 (Docker allocates networks, app instances'
+too, from them), Portcullis' core and VPN networks, the reserved link subnet
+10.214.0.0/24, a Local network you entered in the Hub or a wired provider's
+range; a free /22 in 10.213.0.0/16 is suggested.
 
 Options:
   --builtin on|off  the built-in VPN (default on)
@@ -343,6 +354,10 @@ vpn_init() {
     if [ -n "$conflicts" ]; then
       suggestion="$(vpn_suggest_subnet "$subnets" "$info" || true)"
       printf 'portcullis vpn init: %s overlaps:\n%s\n' "$subnet" "$(printf '%s\n' "$conflicts" | sed 's/^/  /')" >&2
+      case "$conflicts" in
+        *"(Docker's default address pool)"*)
+          printf "172.16.0.0/12 and 192.168.0.0/16 are reserved: Docker allocates networks (app instances' too) from these ranges, so an address there could be a container's, not a VPN device's.\n" >&2 ;;
+      esac
       if [ -n "$suggestion" ]; then
         printf 'Try: ./portcullis vpn init --subnet %s\n' "$suggestion" >&2
       fi

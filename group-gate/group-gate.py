@@ -1548,9 +1548,10 @@ VPN_PUBLIC_GUARD_PATH = "/public-guard/vpn"
 # Ranges no provider may claim (the vpn.json readers refuse the whole file,
 # a backstop: the Hub refuses them first, from core.env's
 # PORTCULLIS_VPN_RESERVED_RANGES = this default + the same subnets):
-# Docker's default bridge pool 172.16.0.0/12, plus the fixed core subnets
+# Docker's default address pools 172.16.0.0/12 and 192.168.0.0/16 (Docker
+# allocates networks, app instances' included, from them), plus the fixed core subnets
 # compose passes in GATE_CORE_SUBNETS (space-separated, from .env).
-VPN_RESERVED_DEFAULT = ("172.16.0.0/12",)
+VPN_RESERVED_DEFAULT = ("172.16.0.0/12", "192.168.0.0/16")
 
 
 def _reserved_nets() -> List[ipaddress.IPv4Network]:

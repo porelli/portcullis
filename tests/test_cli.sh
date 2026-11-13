@@ -299,6 +299,13 @@ a workflow's inline compose override has a CMD healthcheck argument with whitesp
 .github/workflows/x.yml:2
 rc=1"
 
+# GitHub refuses a workflow file over 500 KB (startup_failure, no jobs):
+# tests/lint_ci_size.sh keeps ci.yml under 450,000 bytes, also in CI.
+expect_eq "ci.yml is under 450,000 bytes" "$("$HERE/lint_ci_size.sh" 2>&1; echo "rc=$?")" "rc=0"
+head -c 450000 /dev/zero > "$WORK/ci-450000.yml"
+head -c 450001 /dev/zero > "$WORK/ci-450001.yml"
+expect_eq "lint_ci_size.sh passes 450,000 bytes and fails 450,001" \
+  "$("$HERE/lint_ci_size.sh" "$WORK/ci-450000.yml" >/dev/null; echo "rc=$?"):$("$HERE/lint_ci_size.sh" "$WORK/ci-450001.yml" >/dev/null; echo "rc=$?")" "rc=0:rc=1"
 # Fully qualified base images (rootless Podman: podman build never relies
 # on registries.conf short names): tests/lint_images.sh, also in CI.
 expect_eq "every Dockerfile FROM and compose image: is fully qualified" "$("$HERE/lint_images.sh" 2>&1; echo "rc=$?")" "rc=0"
