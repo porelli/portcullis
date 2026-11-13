@@ -33,6 +33,10 @@ for i in $(seq 1 40); do
   [ "$i" -eq 40 ] && { echo "FAIL: hub /healthz"; docker compose logs --tail=40 hub; exit 1; }
   sleep 2
 done
+# vpn init needs the Hub (hub vpn host-info; it waits up to 120 s for an
+# answer): show its state first.
+docker inspect --format 'Hub: {{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} restarts={{.RestartCount}}' "$(docker compose ps -q hub)" \
+  || { echo "FAIL: no Hub container before vpn init"; docker compose ps -a; exit 1; }
 ./portcullis vpn init
 docker compose exec -T wg /wg status | jq -c '{edge, people: (.people | {ok, port, subnet})}'
 echo "127.0.0.1 portcullis.local auth.portcullis.local enroll.portcullis.local hub.portcullis.local people.portcullis.local echo-vpn.portcullis.local vpn.portcullis.local vpn-admin.portcullis.local" | sudo tee -a /etc/hosts

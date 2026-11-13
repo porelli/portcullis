@@ -3539,7 +3539,12 @@ vt() {
     dc() {
       echo "dc $*" >> "$L"
       case "$*" in
-        "exec -T -u 10001:10001 hub hub vpn host-info") [ "${VT_HUB_DOWN:-}" != 1 ] || return 1; printf '%s' "${VT_HOSTINFO:-$VT_HOSTINFO_DEFAULT}" ;;
+        "exec -T -u 10001:10001 hub hub vpn host-info")
+          [ "${VT_HUB_DOWN:-}" != 1 ] || return 1
+          # VT_HUB_ANSWER_AFTER=n: the first n-1 calls fail (a Hub still starting).
+          echo x >> "$WORK/vt/hostinfo-calls"
+          [ "$(wc -l < "$WORK/vt/hostinfo-calls")" -ge "${VT_HUB_ANSWER_AFTER:-1}" ] || return 1
+          printf '%s' "${VT_HOSTINFO:-$VT_HOSTINFO_DEFAULT}" ;;
         "exec -T wg /wg keypair") printf '{"private_key":"%s","public_key":"%s"}\n' "$VPN_PRIV" "$VPN_PUB" ;;
         "exec -T -u 10001:10001 hub hub vpn add-device "*) cat >> "$WORK/vt/stdin"; echo '{"address":"10.213.0.5","server_public_key":"U2VydmVy","endpoint":"vpn.example.org:51820","allowed_ips":"10.213.0.1/32","dns":"10.213.0.1","mtu":1280}' ;;
         "exec -T wg /wg qr") cat >> "$WORK/vt/qr"; echo QR ;;
@@ -3623,12 +3628,21 @@ expect_eq "vpn init: the default subnet clears the reserved ranges" "$(printf '%
 # (as ./portcullis up accepts); its answer to hub vpn host-info is the check.
 OUT="$(VT_HUB_HEALTH=running vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
 expect_eq "vpn init: a Hub without a health status (running) that answers host-info → goes on" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running" || true)" "0:0"
-OUT="$(VT_HUB_HEALTH=running VT_HUB_DOWN=1 vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
-expect_eq "vpn init: a running Hub that doesn't answer host-info → refused" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub didn't answer hub vpn host-info")" "1:1"
+OUT="$(VT_HUB_HEALTH=running VT_HUB_DOWN=1 VPN_HUB_WAIT=1 vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: a running Hub that never answers host-info → refused after the wait" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub didn't answer hub vpn host-info within 1 s (state: running)")" "1:1"
 OUT="$(VT_HUB_HEALTH=unhealthy vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
-expect_eq "vpn init: an unhealthy Hub → refused" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running")" "1:1"
-OUT="$(VT_HUB_HEALTH=starting vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
-expect_eq "vpn init: the Hub not healthy → refused" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running")" "1:1"
+expect_eq "vpn init: an unhealthy Hub → refused at once" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running (state: unhealthy)"):$(cat "$WORK/vt/log" 2>/dev/null | grep -c 'hub vpn host-info' || true)" "1:1:0"
+for st in missing exited; do
+  OUT="$(VT_HUB_HEALTH=$st vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+  expect_eq "vpn init: no Hub ($st) → refused at once" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running (state: $st): ./portcullis up first")" "1:1"
+done
+# The Hub just restarted by ./portcullis up: health "starting" while it
+# already answers, or answers after a few tries: vpn init waits for it.
+OUT="$(VT_HUB_HEALTH=starting VT_HUB_ANSWER_AFTER=3 vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: a starting Hub that answers on the third try → goes on" "$RC:$(grep -c 'hub vpn host-info' "$WORK/vt/log")" "0:3"
+OUT="$(VT_HUB_HEALTH=starting VT_HUB_DOWN=1 VPN_HUB_WAIT=1 vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: a starting Hub that never answers → refused after the wait, nothing written" \
+  "$RC:$(printf '%s' "$OUT" | grep -c "didn't answer hub vpn host-info within 1 s (state: starting)"):$(vte | grep -c 'PORTCULLIS_VPN\|COMPOSE_PROFILES' || true)" "1:1:0"
 
 OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=vpn.example.org\nCOMPOSE_PROFILES=monitoring' vt 'vpn_init on 51820 10.213.0.0/22; vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
 expect_eq "vpn init writes the keys, adds wg to COMPOSE_PROFILES once" \

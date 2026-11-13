@@ -6,6 +6,10 @@
 set -e
 set -o pipefail
 CURL_IMG=docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+# vpn init needs the Hub (hub vpn host-info; it waits up to 120 s for an
+# answer): show its state first.
+docker inspect --format 'Hub: {{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} restarts={{.RestartCount}}' "$(docker compose ps -q hub)" \
+  || { echo "FAIL: no Hub container before vpn init"; docker compose ps -a; exit 1; }
 ./portcullis vpn init
 grep -qx 'COMPOSE_PROFILES=wg' .env || { echo "FAIL: vpn init did not add wg to COMPOSE_PROFILES"; grep '^COMPOSE_PROFILES' .env; exit 1; }
 WG_CID="$(docker compose ps -q wg)"
@@ -56,9 +60,16 @@ echo_web() { curl -s --cacert certs/ca-chain.crt --resolve "vpnecho.portcullis.l
 for i in $(seq 1 30); do echo_web | grep -q '^Hostname:' && break; [ "$i" -eq 30 ] && { echo "FAIL: vpnecho not routed"; exit 1; }; sleep 2; done
 # Spoofed client addresses on websecure: Traefik drops them (no
 # forwarded-header trust), the backend sees the real peer only.
-OUT="$(echo_web -H 'X-Forwarded-For: 10.213.0.5' -H 'X-Real-Ip: 10.213.0.5' -H 'X_Forwarded_For: 10.213.0.5')"
+# whoami ends its lines with CRLF: strip the CR before matching.
+OUT="$(echo_web -H 'X-Forwarded-For: 10.213.0.5' -H 'X-Real-Ip: 10.213.0.5' -H 'X_Forwarded_For: 10.213.0.5' | tr -d '\r')"
 if printf '%s' "$OUT" | grep -qi '10\.213\.0\.5'; then echo "FAIL: a spoofed address reached the backend on websecure:"; printf '%s\n' "$OUT"; exit 1; fi
-printf '%s' "$OUT" | grep -qiE '^X-Forwarded-For: [0-9.]+$' || { echo "FAIL: no single X-Forwarded-For: $OUT"; exit 1; }
+# Exactly one X-Forwarded-For with exactly one address (Traefik replaced
+# the forged value instead of appending to it), and X-Real-Ip the same.
+XFF="$(printf '%s\n' "$OUT" | grep -iE '^X-Forwarded-For:' || true)"
+[ "$(printf '%s\n' "$XFF" | grep -c .)" = 1 ] && [[ "$XFF" =~ ^X-Forwarded-For:\ ([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)$ ]] \
+  || { echo "FAIL: not exactly one single-address X-Forwarded-For on websecure: $OUT"; exit 1; }
+PEER="${BASH_REMATCH[1]}"
+printf '%s\n' "$OUT" | grep -qx "X-Real-Ip: $PEER" || { echo "FAIL: X-Real-Ip isn't the real peer $PEER: $OUT"; exit 1; }
 # group-gate's normal path never binds: the spoofed headers on a
 # gated route are logged with the real address, never 10.213.0.5.
 curl -s -o /dev/null --cacert certs/ca-chain.crt --resolve "gated.portcullis.local:443:127.0.0.1" \
@@ -80,6 +91,7 @@ OUT="$(docker run --rm --network portcullis-vpn-edge --ip 172.31.254.70 "$CURL_I
          --haproxy-protocol --haproxy-clientip 10.213.0.5 --resolve "vpnecho.portcullis.local:8443:$EDGE_TRAEFIK" \
          https://vpnecho.portcullis.local:8443/ || true)"
 if printf '%s' "$OUT" | grep -q '10\.213\.0\.5'; then echo "FAIL: vpnsecure honoured a PROXY header from 172.31.254.70:"; printf '%s\n' "$OUT"; exit 1; fi
+OUT="$(printf '%s' "$OUT" | tr -d '\r')"
 printf '%s' "$OUT" | grep -qE '^X-Forwarded-For: 172\.31\.254\.70$' || [ -z "$OUT" ] \
   || { echo "FAIL: unexpected answer on vpnsecure: $OUT"; exit 1; }
 echo "PASS: vpnsecure honours PROXY only from wg (portcullis-vpn can't reach it; another edge address is ignored)"
@@ -87,6 +99,34 @@ echo "PASS: vpnsecure honours PROXY only from wg (portcullis-vpn can't reach it;
 if docker run --rm --network portcullis-vpn --ip 172.31.254.21 "$CURL_IMG" -s --max-time 5 -o /dev/null telnet://172.31.254.3:9001 </dev/null; then
   echo "FAIL: an edge port answers with no provider wired"; exit 1
 fi
+# The positive proof: a built-in device through the tunnel (wg's people
+# stack → the edge → PROXY v2 → vpnsecure) sends forged forwarded
+# headers; the backend sees exactly the device's tunnel address, the one
+# wg put in the PROXY header, and nothing the client sent.
+umask 077
+for i in $(seq 1 20); do
+  ./portcullis vpn add-device testuser ci-xff > "$RUNNER_TEMP/vpn-xff.out" 2>&1 && break
+  [ "$i" -eq 20 ] && { echo "FAIL: vpn add-device: $(grep -v PrivateKey "$RUNNER_TEMP/vpn-xff.out")"; exit 1; }
+  sleep 6
+done
+sed -n '/^\[Interface\]/,/^PersistentKeepalive/p' "$RUNNER_TEMP/vpn-xff.out" > "$RUNNER_TEMP/vpn-xff.conf"
+DEV_IP="$(sed -n 's|^Address = \([0-9.]*\)/32$|\1|p' "$RUNNER_TEMP/vpn-xff.conf")"
+[[ "$DEV_IP" =~ ^10\.213\.[0-9]+\.[0-9]+$ ]] || { echo "FAIL: no tunnel address in the device config"; exit 1; }
+printf 'X-Forwarded-For: 203.0.113.66\nX-Real-Ip: 203.0.113.66\nForwarded: for=203.0.113.66\n' > "$RUNNER_TEMP/vpn-xff.hdr"
+for i in $(seq 1 10); do
+  "$RUNNER_TEMP/vpn-client" --endpoint 127.0.0.1:51820 --ca-file certs/ca-chain.crt --header-file "$RUNNER_TEMP/vpn-xff.hdr" \
+    --resolve "vpnecho.portcullis.local:443:10.213.0.1" --get "https://vpnecho.portcullis.local/" < "$RUNNER_TEMP/vpn-xff.conf" > /tmp/vpn-xff.json || true
+  jq -e '.handshake and .status == 200' /tmp/vpn-xff.json >/dev/null && break
+  [ "$i" -eq 10 ] && { echo "FAIL: whoami through the tunnel: $(jq -c 'del(.body)' /tmp/vpn-xff.json)"; docker compose logs --tail=40 wg traefik; exit 1; }
+  sleep 5
+done
+rm -f "$RUNNER_TEMP/vpn-xff.out" "$RUNNER_TEMP/vpn-xff.conf"
+BODY="$(jq -r .body /tmp/vpn-xff.json | tr -d '\r')"
+if printf '%s' "$BODY" | grep -q '203\.0\.113\.66'; then echo "FAIL: a client-sent forwarded header reached the backend over the tunnel: $BODY"; exit 1; fi
+[ "$(printf '%s\n' "$BODY" | grep -ciE '^X-Forwarded-For:')" = 1 ] && printf '%s\n' "$BODY" | grep -qx "X-Forwarded-For: $DEV_IP" \
+  && printf '%s\n' "$BODY" | grep -qx "X-Real-Ip: $DEV_IP" \
+  || { echo "FAIL: over the tunnel the backend must see exactly the tunnel address $DEV_IP: $BODY"; exit 1; }
+echo "PASS: over the tunnel the backend sees exactly the device's tunnel address ($DEV_IP, from wg's PROXY header); forged forwarded headers are dropped"
 docker compose -p ci-vpnecho -f /tmp/ci-vpnecho.yml down
 # wg stays on (profile wg) for the rest of the job: up, upgrade,
 # backup and restore run with it (secrets/wg is backed up).

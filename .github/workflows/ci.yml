@@ -1361,6 +1361,15 @@ jobs:
       - name: Test the MCP gate (non-root, pinned address, secrets, access log, MCP routes without forward-auth)
         run: bash .github/ci/build-and-test-mcp-gate.sh
 
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Build the VPN client (tests/e2e/vpn-client)
+        working-directory: tests/e2e/vpn-client
+        run: |
+          go mod verify
+          CGO_ENABLED=0 go build -o "$RUNNER_TEMP/vpn-client" .
       # The VPN service (contract §16): wg up through `./portcullis vpn init`
       # (rootful Docker here; e2e-podman runs it rootless), userspace only,
       # least privilege; vpnsecure honours PROXY v2 only from wg's address on

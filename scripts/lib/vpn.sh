@@ -93,6 +93,32 @@ _vpn_hub() {
   dc exec -T -u "$CT_UID_HUB:$CT_UID_HUB" hub hub vpn "$@"
 }
 
+# _vpn_hub_wait — the Hub's host-info JSON object, waiting up to
+# VPN_HUB_WAIT seconds (default 120) for the Hub to answer: right after
+# ./portcullis up restarts it, it answers before its health turns healthy
+# (or, where the runtime applies no image HEALTHCHECK, it stays running).
+# A Hub that is missing, stopped or unhealthy is refused at once; one that
+# never answers is refused after the wait (fail closed: no subnet check,
+# nothing written, without the Hub's Local networks and provider ranges).
+_vpn_hub_wait() {
+  local limit="${VPN_HUB_WAIT:-120}" st info start=$SECONDS
+  while :; do
+    st="$(container_health hub)"
+    case "$st" in
+      healthy|running|starting|restarting) ;;
+      *) fail "the Hub isn't running (state: $st): ./portcullis up first" ;;
+    esac
+    if info="$(_vpn_host_info)" && printf '%s' "$info" | jq -e 'type == "object"' >/dev/null 2>&1; then
+      printf '%s' "$info"
+      return 0
+    fi
+    if [ $((SECONDS - start)) -ge "$limit" ]; then
+      fail "the Hub didn't answer hub vpn host-info within $limit s (state: $st): docker compose logs hub"
+    fi
+    sleep 2
+  done
+}
+
 # _vpn_host_info — the Hub's `hub vpn host-info` JSON (Local networks,
 # provider ranges, admin_device_seen), or exit 1 when the Hub doesn't answer.
 _vpn_host_info() {
@@ -277,7 +303,8 @@ COMPOSE_PROFILES, writes PORTCULLIS_VPN_BUILTIN / _PORT / _SUBNET, generates
 the built-in VPN's key (once; secrets/wg/people.key, never printed) and
 starts wg, Traefik and the Hub. The Hub must be running (./portcullis up
 first): it answers which Local networks and provider ranges the subnet must
-not overlap.
+not overlap. vpn init waits up to 120 s for that answer (a Hub that just
+restarted), and refuses, writing nothing, when it doesn't come.
 
 The subnet must not overlap a Docker network, Docker's default address pools
 172.16.0.0/12 and 192.168.0.0/16 (Docker allocates networks, app instances'
@@ -354,15 +381,7 @@ EOF
 vpn_init() {
   local builtin="$1" port="$2" subnet="$3" info subnets conflicts suggestion warns
   info "Checking the Hub and the VPN subnet..."
-  # As ./portcullis up: healthy, or running where the runtime reports no
-  # health (an image HEALTHCHECK Podman doesn't apply). The Hub answering
-  # hub vpn host-info just below is the real check (no answer: refused).
-  case "$(container_health hub)" in
-    healthy|running) ;;
-    *) fail "the Hub isn't running: ./portcullis up first" ;;
-  esac
-  info="$(_vpn_host_info)" || fail "the Hub didn't answer hub vpn host-info"
-  printf '%s' "$info" | jq -e 'type == "object"' >/dev/null 2>&1 || fail "hub vpn host-info: not a JSON object"
+  info="$(_vpn_hub_wait)" || exit 1  # _vpn_hub_wait printed why
   subnets="$(_vpn_docker_subnets)" || fail "could not list the Docker networks' subnets"
   if [ "$builtin" = on ]; then
     conflicts="$(vpn_overlaps "$subnet" "$subnets" "$info")"
