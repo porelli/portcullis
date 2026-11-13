@@ -2012,6 +2012,10 @@ case "$*" in
     echo "$sub" >> "$d/order"
     if [ -f "$d/out-$sub" ]; then cat "$d/out-$sub"; else cat "$d/out-default"; fi
     exit "$(cat "$d/rc-$sub" 2>/dev/null || echo 0)" ;;
+  compose\ *\ exec\ -T\ domains\ domains\ report\ --main\ --refresh)
+    echo refresh >> "$d/order"
+    [ ! -f "$d/refresh-fail" ] || exit 1
+    exit 0 ;;
 esac
 exit 0
 STUB
@@ -2038,7 +2042,7 @@ OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup
 expect_eq "dns tool: credentials only on stdin (never in argv)" "$(grep -c 'tok-SECRET-123' "$STUB_DIR/dt/argv")" 0
 expect_eq "dns tool: the token is the apply input's credentials.api_token" "$(dtin apply .credentials.api_token)" tok-SECRET-123
 expect_eq "dns tool: the token never reaches the output" "$(printf '%s' "$OUT" | grep -c 'tok-SECRET-123')" 0
-expect_eq "dns setup --yes: plan then apply then check, in that order" "$(paste -sd' ' "$STUB_DIR/dt/order")" "plan apply check"
+expect_eq "dns setup --yes: plan, apply, the service's main plan refreshed, check" "$(paste -sd' ' "$STUB_DIR/dt/order")" "plan apply refresh check"
 expect_eq "dns setup: apply waits 5 minutes" "$(grep -c 'dns-tool apply --wait 5m$' "$STUB_DIR/dt/argv")" 1
 expect_eq "dns setup: the default sets are address and caa" "$(dtin apply '.sets | join(",")')" "address,caa"
 expect_eq "dns setup: the input's snake_case keys" "$(dtin apply '[keys[]] | join(",")')" "ca_server,caa,credentials,ipv4,ipv6,mail_from,name,nomail,provider,sets"
@@ -2154,7 +2158,7 @@ expect_eq "tighten: main-domain.env is 0600" "$(file_mode "$PORTCULLIS_ROOT/secr
 expect_eq "tighten: domains recreated for the new env file" "$(grep -c ' up -d domains$' "$STUB_DIR/dt/argv")" 1
 expect_eq "tighten: pins when live differs (check, then apply caa with Traefik's URI)" \
   "$(paste -sd' ' "$STUB_DIR/dt/order"):$(dtin apply '[.sets, .caa.account_uri] | @json')" \
-  'check apply:[["caa"],"https://acme-v02.api.letsencrypt.org/acme/acct/77"]'
+  'check apply refresh:[["caa"],"https://acme-v02.api.letsencrypt.org/acme/acct/77"]'
 case "$OUT" in *rc=0) t_pass "tighten: returns 0" ;; *) t_fail "tighten: $OUT" ;; esac
 # Live pin already right: no apply, no restart (the file is unchanged).
 jq '.items = [{set: "caa", name: "ci.example.org", type: "CAA", want: ["x"], live: ["x"], status: "ok", severity: "ok", fix: "none", steps: []}] | .caa.would_issue = true' \
@@ -2166,6 +2170,16 @@ jq '.caa.would_issue = false' "$STUB_DIR/dt/out-check" > "$STUB_DIR/dt/out-check
 echo 3 > "$STUB_DIR/dt/rc-apply"
 OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_tighten_main')"
 case "$OUT" in *"could not pin the CAA"*rc=0) t_pass "tighten: a failed pin warns, returns 0" ;; *) t_fail "tighten failed pin: $OUT" ;; esac
+expect_eq "tighten: a failed pin still refreshes the main plan (a partial write)" "$(paste -sd' ' "$STUB_DIR/dt/order")" "check apply refresh"
+# The refresh is best effort: the domains service down only skips it.
+touch "$STUB_DIR/dt/refresh-fail"
+rm -f "$STUB_DIR/dt/rc-apply"
+OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_tighten_main')"
+case "$OUT" in *"CAA of ci.example.org pinned"*rc=0) t_pass "tighten: a failed main-plan refresh is ignored" ;; *) t_fail "tighten refresh-fail: $OUT" ;; esac
+OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup true false ""')"
+case "$OUT" in *rc=0) t_pass "dns setup: a failed main-plan refresh is ignored" ;; *) t_fail "setup refresh-fail: $OUT" ;; esac
+rm -f "$STUB_DIR/dt/refresh-fail"
+echo 3 > "$STUB_DIR/dt/rc-apply"
 rm -f "$STUB_DIR/dt/rc-apply" "$STUB_DIR/dt/out-check"
 # No account within the poll window.
 rm -f "$STUB_DIR/dt/acme-volume"
@@ -2197,6 +2211,7 @@ expect_eq "config apply flip: relax runs before acme.json is removed" "$([ -n "$
 OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123')"
 expect_eq "config apply flip: relax applies caa CA-only" "$(dtin apply '[.sets, .caa.account_uri] | @json')" '[["caa"],""]'
 expect_eq "config apply flip: relax waits for the resolvers (2 min)" "$(grep -c 'dns-tool apply --wait 2m$' "$STUB_DIR/dt/argv")" 1
+expect_eq "config apply flip: relax refreshes the service's main plan after the apply" "$(paste -sd' ' "$STUB_DIR/dt/order")" "apply refresh"
 echo 3 > "$STUB_DIR/dt/rc-apply"
 OUT="$(flip 'export DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123')"
 case "$OUT" in *"issuance may fail on CAA until then (./portcullis dns setup)"*rc=0) t_pass "config apply flip: relax failure warns and goes on" ;; *) t_fail "relax failure: $OUT" ;; esac

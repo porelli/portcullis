@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1779,7 +1780,7 @@ func TestAccountEndpoint(t *testing.T) {
 func TestNewEndpointsNeedBearer(t *testing.T) {
 	e := newEnv(t, false)
 	for _, r := range [][2]string{{"GET", "/domains/team-x.example.org/dns"}, {"POST", "/domains/team-x.example.org/dns/apply"},
-		{"POST", "/domains/team-x.example.org/dnssec"}, {"GET", "/main/dns"}, {"GET", "/acme/account"}} {
+		{"POST", "/domains/team-x.example.org/dnssec"}, {"GET", "/main/dns"}, {"POST", "/main/dns/refresh"}, {"GET", "/acme/account"}} {
 		if code, _ := e.do(r[0], r[1], `{}`, false); code != 401 {
 			t.Errorf("%s %s = %d", r[0], r[1], code)
 		}
@@ -1908,5 +1909,113 @@ func TestMainPlanRefreshedByWorker(t *testing.T) {
 	e.waitFor("a rebuilt main plan", 10*time.Second, func() bool { at, _ := cached(); return at.After(first) })
 	if got := e.planOf("/main/dns").CheckedAt; !got.After(first) {
 		t.Fatalf("GET /main/dns still answers the old plan (%v)", got)
+	}
+}
+
+// TestPlanDroppedAfterFailedWrite (deploy 2026-11-13): a records step
+// that wrote and then failed drops the cached plan (no plan from before
+// the write until the next success; the next read rebuilds it).
+func TestPlanDroppedAfterFailedWrite(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-pd.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) })
+	cached := func() bool {
+		e.svc.mu.Lock()
+		defer e.svc.mu.Unlock()
+		_, ok := e.svc.plans[name]
+		return ok
+	}
+	if !cached() {
+		t.Fatal("no plan cached after ready")
+	}
+	// A user SPF the nomail set replaces: appended, then the delete fails.
+	e.zone.Set(name, append(e.zone.Records(name), libdns.TXT{Name: "@", TTL: time.Hour, Text: "v=spf1 include:mail.test -all"}.RR())...)
+	e.setHook(func(op string, _ []libdns.Record, _ string) error {
+		if op == "delete" {
+			return errors.New("delete refused")
+		}
+		return nil
+	})
+	if code, body := e.do("POST", "/domains/"+name+"/dns/apply", `{"sets":["nomail"]}`, true); code != 202 {
+		t.Fatalf("apply = %d %s", code, body)
+	}
+	e.waitFor("the failed step", 30*time.Second, func() bool { return e.domain(name).State == StateError })
+	if cached() {
+		t.Fatal("the plan from before the write is still cached")
+	}
+}
+
+// TestMainPlanRefreshEndpoint (deploy 2026-11-13): after the dns tool
+// writes the main domain's records, POST /main/dns/refresh drops the
+// cached main plan and answers a rebuilt one; GET serves it from then on.
+func TestMainPlanRefreshEndpoint(t *testing.T) {
+	e := newEnv(t, false)
+	e.waitFor("the worker's first main plan", 10*time.Second, func() bool {
+		e.svc.mu.Lock()
+		defer e.svc.mu.Unlock()
+		_, ok := e.svc.plans[mainPlanKey]
+		return ok
+	})
+	caa := func(pl dnsplan.Plan) dnsplan.Status {
+		for _, it := range pl.Items {
+			if it.Set == dnsplan.SetCAA && it.Type == "CAA" && it.Status != dnsplan.StatusForeign {
+				return it.Status
+			}
+		}
+		return ""
+	}
+	if st := caa(e.planOf("/main/dns")); st == dnsplan.StatusOK {
+		t.Fatalf("main CAA %s before the write", st)
+	}
+	// The dns tool pins the CAA (out of process: the service can't see it).
+	v := dnsplan.CAAValue("pebble.test", "")
+	e.zone.Set(testMain, libdns.CAA{Name: "@", TTL: dnsplan.TTLCAA, Tag: "issue", Value: v}.RR(),
+		libdns.CAA{Name: "@", TTL: dnsplan.TTLCAA, Tag: "issuewild", Value: v}.RR())
+	if st := caa(e.planOf("/main/dns")); st == dnsplan.StatusOK {
+		t.Fatal("GET rebuilt the main plan without a refresh (the test proves nothing)")
+	}
+	code, body := e.do("POST", "/main/dns/refresh", "", true)
+	if code != 200 {
+		t.Fatalf("refresh = %d %s", code, body)
+	}
+	var pl dnsplan.Plan
+	if err := json.Unmarshal([]byte(body), &pl); err != nil || caa(pl) != dnsplan.StatusOK {
+		t.Fatalf("refresh answered %v %s", err, body)
+	}
+	if st := caa(e.planOf("/main/dns")); st != dnsplan.StatusOK {
+		t.Fatalf("GET after the refresh: CAA %s", st)
+	}
+	// Not throttled: a second write right after is seen too.
+	e.zone.Set(testMain)
+	if _, body := e.do("POST", "/main/dns/refresh", "", true); !strings.Contains(body, `"status":"missing"`) {
+		t.Fatalf("second refresh %s", body)
+	}
+	if code, _ := e.do("POST", "/main/dns/refresh", "", false); code != 401 {
+		t.Fatalf("no secret = %d", code)
+	}
+}
+
+// TestMainPlanStaleBuildDiscarded: a main-plan build that started before
+// a refresh never overwrites the refreshed plan.
+func TestMainPlanStaleBuildDiscarded(t *testing.T) {
+	e := newEnv(t, false)
+	e.svc.mu.Lock()
+	gen := e.svc.mainGen
+	e.svc.mu.Unlock()
+	if code, _ := e.do("POST", "/main/dns/refresh", "", true); code != 200 {
+		t.Fatalf("refresh = %d", code)
+	}
+	e.svc.mu.Lock()
+	fresh := e.svc.plans[mainPlanKey]
+	e.svc.mu.Unlock()
+	if e.svc.storeMainPlan(gen, dnsplan.Plan{Name: "stale"}) {
+		t.Fatal("a build from before the refresh was stored")
+	}
+	e.svc.mu.Lock()
+	defer e.svc.mu.Unlock()
+	if e.svc.plans[mainPlanKey].plan.Name != fresh.plan.Name || e.svc.plans[mainPlanKey].plan.Name == "stale" {
+		t.Fatalf("cached %+v", e.svc.plans[mainPlanKey].plan.Name)
 	}
 }

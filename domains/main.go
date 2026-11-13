@@ -9,7 +9,7 @@
 //	domains healthcheck  exit 0 if the API answers /healthz (Docker HEALTHCHECK)
 //	domains enrolled   the number of enrolled domains
 //	domains dns …      the one-shot DNS tool (tool.go)
-//	domains traefik-account-uri <acme.json>, domains report --main --json
+//	domains traefik-account-uri <acme.json>, domains report --main --json|--refresh
 package main
 
 import (

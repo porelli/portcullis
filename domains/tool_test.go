@@ -250,4 +250,21 @@ func TestReportShape(t *testing.T) {
 	if code := runReport(nil, srv.URL, testSecret, &out, &errb); code != exitUsage {
 		t.Fatalf("no flags = %d", code)
 	}
+	// --refresh: POST /main/dns/refresh, nothing printed.
+	e.svc.mu.Lock()
+	gen := e.svc.mainGen
+	e.svc.mu.Unlock()
+	out.Reset()
+	if code := runReport([]string{"--main", "--refresh"}, srv.URL, testSecret, &out, &errb); code != 0 || out.Len() != 0 {
+		t.Fatalf("--refresh = %d %q %s", code, out.String(), errb.String())
+	}
+	e.svc.mu.Lock()
+	after := e.svc.mainGen
+	e.svc.mu.Unlock()
+	if after != gen+1 {
+		t.Fatalf("--refresh: main plan generation %d → %d", gen, after)
+	}
+	if code := runReport([]string{"--main", "--refresh"}, srv.URL, "wrong-secret-wrong-secret-wrong-secret", &out, &errb); code != exitFailure {
+		t.Fatalf("--refresh, wrong secret = %d", code)
+	}
 }

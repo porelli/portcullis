@@ -90,6 +90,8 @@ type Service struct {
 	plans map[string]cachedPlan
 	// mainBuilding: the worker's main-plan rebuild is running (guarded by mu).
 	mainBuilding bool
+	// mainGen counts main-plan invalidations (guarded by mu).
+	mainGen int
 
 	acmeMu      sync.Mutex // serialises ACME account registration
 	lastDropped string     // last logged list of dropped certificates (guarded by mu)
@@ -233,6 +235,7 @@ func (s *Service) APIHandler() http.Handler {
 	mux.HandleFunc("POST /domains/{name}/dns/apply", s.handleApply)
 	mux.HandleFunc("POST /domains/{name}/dnssec", s.handleDNSSEC)
 	mux.HandleFunc("GET /main/dns", s.handleMainPlan)
+	mux.HandleFunc("POST /main/dns/refresh", s.handleMainRefresh)
 	mux.HandleFunc("GET /acme/account", s.handleAccount)
 	want := sha256.Sum256([]byte("Bearer " + s.cfg.Secret))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -747,6 +750,11 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 		var zone string
 		if len(sets) > 0 {
 			written, removed, zone, err = s.applySets(rctx, p, snap, sets, uri)
+			// The cached plan predates the write: dropped (the next read
+			// rebuilds it; a successful step caches a fresh one below).
+			s.mu.Lock()
+			delete(s.plans, name)
+			s.mu.Unlock()
 		}
 		// CAA off: the CAA entries recorded in other zones (the zone found
 		// changed) are removed there too, best effort, and dropped.
@@ -992,6 +1000,7 @@ func (s *Service) refreshMainPlan(ctx context.Context) {
 		return
 	}
 	s.mainBuilding = true
+	gen := s.mainGen
 	s.mu.Unlock()
 	s.wg.Add(1)
 	go func() {
@@ -1007,11 +1016,36 @@ func (s *Service) refreshMainPlan(ctx context.Context) {
 		pctx, cancel := context.WithTimeout(ctx, planTimeout)
 		defer cancel()
 		if pl := s.buildMainPlan(pctx); ctx.Err() == nil {
-			s.mu.Lock()
-			s.plans[mainPlanKey] = cachedPlan{plan: pl, at: s.cfg.Now()}
-			s.mu.Unlock()
+			s.storeMainPlan(gen, pl)
 		}
 	}()
+}
+
+// storeMainPlan caches pl, built from generation gen, unless the main
+// plan was invalidated since (a build that started before a refresh
+// never overwrites the refreshed plan). Reports whether it stored.
+func (s *Service) storeMainPlan(gen int, pl dnsplan.Plan) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if gen != s.mainGen {
+		return false
+	}
+	s.plans[mainPlanKey] = cachedPlan{plan: pl, at: s.cfg.Now()}
+	return true
+}
+
+// handleMainRefresh drops the cached main plan and answers a rebuilt one
+// (not throttled: `./portcullis dns setup` and the CAA tighten / relax
+// call it after the dns tool wrote the main domain's records, which the
+// service can't see; otherwise the old plan stays up to RecheckEvery).
+func (s *Service) handleMainRefresh(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.mainGen++
+	delete(s.plans, mainPlanKey)
+	s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(r.Context(), planTimeout)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.mainPlan(ctx, false))
 }
 
 // mainPlan is the main domain's read-only plan (no credentials: public
@@ -1022,11 +1056,10 @@ func (s *Service) mainPlan(ctx context.Context, refresh bool) dnsplan.Plan {
 		s.mu.Unlock()
 		return pl
 	}
+	gen := s.mainGen
 	s.mu.Unlock()
 	pl := s.buildMainPlan(ctx)
-	s.mu.Lock()
-	s.plans[mainPlanKey] = cachedPlan{plan: pl, at: s.cfg.Now()}
-	s.mu.Unlock()
+	s.storeMainPlan(gen, pl)
 	return pl
 }
 
