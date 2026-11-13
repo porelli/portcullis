@@ -228,6 +228,25 @@ expect_eq "stack_prepare: a 10001-owned appfiles/ keeps its mode" "$(file_mode "
   stack_prepare ) >/dev/null 2>&1
 expect_ok "stack_prepare: mcp_gate_data owned 10005:10001" grep -qx 'volume_own mcp_gate_data 10005:10001' "$STUB_DIR/sp-vol"
 expect_ok "stack_prepare: mcp-gate secrets ensured" grep -qx 'mcpgate_ensure_secrets' "$STUB_DIR/sp-vol"
+# wg_data (VPN, V5): wg (10006) writes status.json, the Hub reads it
+# through group 10001; setgid 2750 so new files carry 10001.
+expect_ok "stack_prepare: wg_data owned 10006:10001, mode 2750" grep -qx 'volume_own wg_data 10006:10001 2750' "$STUB_DIR/sp-vol"
+# secrets/wg/people.key: an empty placeholder (people role off) so the
+# bind never makes a directory and the SELinux overlay's source exists.
+expect_ok "stack_prepare: secrets/wg/people.key is an empty file" bash -c "[ -f '$SP_ROOT/secrets/wg/people.key' ] && [ ! -s '$SP_ROOT/secrets/wg/people.key' ]"
+expect_eq "stack_prepare: people.key placeholder 0640" "$(file_mode "$SP_ROOT/secrets/wg/people.key")" 640
+printf 'KEY\n' > "$SP_ROOT/secrets/wg/people.key"
+( PORTCULLIS_ROOT="$SP_ROOT"
+  volume_own() { :; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  unset -f users_secret_files monitoring_prepare domains_prepare
+  stack_prepare ) >/dev/null 2>&1
+expect_eq "stack_prepare: an existing people.key is kept" "$(cat "$SP_ROOT/secrets/wg/people.key")" KEY
+( PORTCULLIS_ROOT="$SP_ROOT"
+  ct_group_read() { echo "ct_group_read $*" >> "$STUB_DIR/sfp-wg"; }
+  unset -f monitoring_fix_perms domains_fix_perms mcpgate_fix_perms sessions_fix_perms
+  secrets_fix_perms ) >/dev/null 2>&1
+expect_ok "secrets_fix_perms: secrets/wg and people.key group 10006" \
+  grep -qx "ct_group_read 10006 $SP_ROOT/secrets/wg $SP_ROOT/secrets/wg/people.key" "$STUB_DIR/sfp-wg"
 # group_gate_data (sign-in part 2, contract §4 "Opened log"): group-gate
 # (10003) writes the opened log, the Hub (group 10001) reads and prunes it.
 expect_ok "the stack's volume setup owns group_gate_data 10003:10001" grep -qx 'volume_own group_gate_data 10003:10001' "$STUB_DIR/sp-vol"
@@ -355,6 +374,37 @@ printf '%s' '[{"Subnet":"172.31.253.0/28"}]' > "$STUB_DIR/ipam-json-portcullis-m
 expect_fail "guard: mcp network without its range aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 rm -f "$STUB_DIR/ipam-json-portcullis-mcp"
 expect_fail "guard: invalid mcp settings abort" bash -c "PORTCULLIS_MCP_HUB_IP=172.31.253.9; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+# portcullis-vpn (contract §16): Traefik (vpnsecure) and wg pinned outside
+# the dynamic range, the Hub's gateway window .16–.62 outside both, a /26 at
+# least, no overlap with the other fixed core networks.
+unset PORTCULLIS_VPN_NET PORTCULLIS_VPN_IP_RANGE PORTCULLIS_VPN_TRAEFIK_IP PORTCULLIS_VPN_WG_IP
+expect_eq "vpn net: defaults" "$(vpn_net) $(vpn_ip_range) $(vpn_traefik_ip) $(vpn_wg_ip)" "172.31.254.0/26 172.31.254.8/29 172.31.254.2 172.31.254.3"
+expect_ok "vpn net: default valid" validate_vpn_network_config
+check_vnet() { PORTCULLIS_VPN_NET="$1" PORTCULLIS_VPN_IP_RANGE="$2" PORTCULLIS_VPN_TRAEFIK_IP="$3" PORTCULLIS_VPN_WG_IP="$4" validate_vpn_network_config; }
+expect_ok   "vpn net: custom valid"                         check_vnet 10.97.0.0/26 10.97.0.8/29 10.97.0.2 10.97.0.3
+expect_ok   "vpn net: a /24 is fine"                        check_vnet 10.97.0.0/24 10.97.0.8/29 10.97.0.2 10.97.0.3
+expect_fail "validate_vpn_network_config: wg ip outside the subnet → fail" check_vnet 10.97.0.0/26 10.97.0.8/29 10.97.0.2 10.97.1.3
+expect_fail "validate_vpn_network_config: traefik ip inside the ip_range → fail" check_vnet 10.97.0.0/26 10.97.0.8/29 10.97.0.9 10.97.0.3
+expect_fail "validate_vpn_network_config: overlap with the proxy subnet → fail" check_vnet 172.31.250.0/26 172.31.250.8/29 172.31.250.2 172.31.250.3
+expect_fail "vpn net: overlaps portcullis-auth"             check_vnet 172.31.251.0/26 172.31.251.8/29 172.31.251.4 172.31.251.5
+expect_fail "vpn net: overlaps portcullis-domains"          check_vnet 172.31.252.0/26 172.31.252.8/29 172.31.252.4 172.31.252.5
+expect_fail "vpn net: overlaps portcullis-mcp"              check_vnet 172.31.253.0/26 172.31.253.8/29 172.31.253.4 172.31.253.5
+expect_fail "vpn net: smaller than a /26"                   check_vnet 10.97.0.0/27 10.97.0.8/29 10.97.0.2 10.97.0.3
+expect_fail "vpn net: Traefik and wg share an address"      check_vnet 10.97.0.0/26 10.97.0.8/29 10.97.0.2 10.97.0.2
+expect_fail "vpn net: wg = the gateway"                     check_vnet 10.97.0.0/26 10.97.0.8/29 10.97.0.2 10.97.0.1
+expect_fail "vpn net: the range reaches the gateway window" check_vnet 10.97.0.0/26 10.97.0.16/29 10.97.0.2 10.97.0.3
+expect_fail "vpn net: wg inside the gateway window"         check_vnet 10.97.0.0/26 10.97.0.8/29 10.97.0.2 10.97.0.20
+expect_fail "vpn net: Traefik inside the gateway window"    check_vnet 10.97.0.0/26 10.97.0.8/29 10.97.0.62 10.97.0.3
+expect_fail "vpn net: invalid CIDR"                         check_vnet 10.97.0.0/33 10.97.0.8/29 10.97.0.2 10.97.0.3
+printf '%s' '[{"Subnet":"172.31.254.0/26","IPRange":"172.31.254.8/29"}]' > "$STUB_DIR/ipam-json-portcullis-vpn"
+expect_eq "vpn net: state ok" "$(vpn_network_state)" ok
+expect_ok "guard: vpn network matching" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+printf '%s' '[{"Subnet":"172.31.254.0/24","IPRange":"172.31.254.8/29"}]' > "$STUB_DIR/ipam-json-portcullis-vpn"
+expect_fail "guard: vpn network mismatch aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+rm -f "$STUB_DIR/ipam-json-portcullis-vpn"
+expect_fail "guard: invalid vpn settings abort" bash -c "PORTCULLIS_VPN_WG_IP=172.31.254.9; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+expect_ok "CORE_SERVICE_NAMES has wg" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; case \" \$CORE_SERVICE_NAMES \" in *' wg '*) exit 0;; esac; exit 1"
+
 # The gate never resolves keycloak / hub through DNS: compose maps both
 # names to the pinned addresses (extra_hosts) where they are pinned.
 CF="$HERE/../docker-compose.yml"

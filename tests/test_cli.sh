@@ -1019,8 +1019,27 @@ BAD=""
 for r in $ROUTERS; do
   grep -qE "^[[:space:]]+traefik\.http\.routers\.$r\.tls\.options: authaware@file$" "$ROOT_DIR/docker-compose.yml" || BAD="$BAD $r"
 done
-expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:14"
+expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:15"
 expect_eq "no other tls.options in docker-compose.yml" "$(grep -E 'tls\.options:' "$ROOT_DIR/docker-compose.yml" | grep -vc 'authaware@file$' || true)" 0
+# VPN (contract §16): every core router's entrypoints label is literally
+# one of the three class variables, each router in its class; vpnsecure
+# trusts PROXY only from wg's pinned address and never forwarded headers.
+EP_GOT="$(sed -n 's/^[[:space:]]*traefik\.http\.routers\.\([a-z0-9-]*\)\.entrypoints: \(.*\)$/\1 \2/p' "$ROOT_DIR/docker-compose.yml" | LC_ALL=C sort | tr '\n' ';')"
+EP_WANT=""
+for r in dashboard lldap keycloak-admin hub grafana-metrics mcp hub-mcp people-mcp; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ADMIN:-websecure,vpnsecure}"$'\n'; done
+for r in keycloak keycloak-resources oauth2-callback enroll-invite people-vpn-enrol; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ENROL:-websecure,vpnsecure}"$'\n'; done
+for r in portal people; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_CORE:-websecure,vpnsecure}"$'\n'; done
+EP_WANT="$(printf '%s' "$EP_WANT" | LC_ALL=C sort | tr '\n' ';')"
+expect_eq "every core router's entrypoints is its class variable (admin / enrol / core)" "$EP_GOT" "$EP_WANT"
+expect_eq "every core router with a rule has an entrypoints label" \
+  "$(printf '%s\n' "$ROUTERS" | LC_ALL=C sort | tr '\n' ' ')" \
+  "$(printf '%s' "$EP_GOT" | tr ';' '\n' | awk 'NF {print $1}' | LC_ALL=C sort | tr '\n' ' ')"
+expect_eq "vpnsecure trusts PROXY from wg's pinned address only" \
+  "$(grep -cF 'TRAEFIK_ENTRYPOINTS_VPNSECURE_PROXYPROTOCOL_TRUSTEDIPS: ${PORTCULLIS_VPN_WG_IP:-172.31.254.3}/32' "$ROOT_DIR/docker-compose.yml"):$(grep -cF 'ipv4_address: ${PORTCULLIS_VPN_WG_IP:-172.31.254.3}' "$ROOT_DIR/docker-compose.yml")" "1:1"
+expect_eq "no forwardedHeaders trust and no PROXY insecure on vpnsecure (or anywhere)" \
+  "$(grep -ciE 'TRAEFIK_ENTRYPOINTS_[A-Z]+_(FORWARDEDHEADERS|PROXYPROTOCOL_INSECURE)' "$ROOT_DIR/docker-compose.yml" || true)" 0
+expect_eq "vpnsecure is bound to Traefik's portcullis-vpn address and drops header aliases" \
+  "$(grep -cE '^      TRAEFIK_ENTRYPOINTS_VPNSECURE_(ADDRESS: \$\{PORTCULLIS_VPN_TRAEFIK_IP:-172\.31\.254\.2\}:8443|HTTP_ALIASHEADERSSTRATEGY: delete)$' "$ROOT_DIR/docker-compose.yml")" 2
 # The Hub can't write traefik/: /project is read-only and no writable mount
 # (short or long syntax: bind, volume, tmpfs) has traefik in its source or
 # target; the writable ones are exactly these.

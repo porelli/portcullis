@@ -205,6 +205,34 @@ jobs:
             exit 1
           fi
           echo "vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
+      # tests/vpn_json_vectors.json drives wg's and group-gate's vpn.json
+      # readers (contract §4 / §16): a byte copy of the Hub's reference
+      # vectors internal/vpn/testdata/vpn_json_vectors.json, on the
+      # same-named Hub branch when it exists, else main — like the sign-in
+      # vectors above.
+      - name: Shared vpn.json vectors match the Hub
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          own=tests/vpn_json_vectors.json
+          url="https://github.com/porelli/portcullis-hub"
+          heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
+          ref=main
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] \
+            && awk -v r="refs/heads/$REF" '$2 == r { f = 1 } END { exit !f }' <<<"$heads"; then
+            ref="$REF"
+          fi
+          sha=$(awk -v r="refs/heads/$ref" '$2 == r { print $1 }' <<<"$heads")
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::portcullis-hub has no single commit for refs/heads/$ref"; exit 1; }
+          echo "portcullis-hub (vpn.json vectors): $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
+          hub="$RUNNER_TEMP/hub_vpn_json_vectors.json"
+          code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/internal/vpn/testdata/vpn_json_vectors.json")
+          [ "$code" = 200 ] || { echo "::error::fetching the Hub's vpn.json vectors from $ref ($sha): HTTP $code"; exit 1; }
+          if ! cmp "$own" "$hub"; then
+            echo "::error::$own differs from portcullis-hub $ref ($sha) internal/vpn/testdata/vpn_json_vectors.json: copy it byte for byte"
+            exit 1
+          fi
+          echo "vpn.json vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
       # e2e_filesharing's run_op (busy-409 retry, scrubbing) on a fake Hub:
       # stdlib only, no stack.
       - name: e2e helper unit tests (e2e_fsops)
@@ -293,7 +321,7 @@ jobs:
           }
           [ -z "$(binds "$CFG_ALL" | awk '$4 != "-"')" ] || { echo "FAIL: docker-compose.yml relabels a bind (selinux): only the overlay may"; exit 1; }
           NBINDS="$(binds "$CFG_ALL" | wc -l | tr -d ' ')"
-          [ "$NBINDS" = 45 ] || { echo "FAIL: expected 45 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
+          [ "$NBINDS" = 46 ] || { echo "FAIL: expected 46 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
           diff <({ binds "$CFG_ALL" | grep -vx 'hub /project true -' | awk '{print $1, $2, $3}'; echo "hub /project/group-gate/group-gate-map.conf true"; } | sort) \
                <(binds "$OV_ALL" | awk '{print $1, $2, $3}' | sort) \
             || { echo "FAIL: docker-compose.podman-selinux.yml must re-declare every project bind (but the Hub's /project root) with the same target / read_only, plus the Hub's map file"; exit 1; }
@@ -342,11 +370,13 @@ jobs:
             || { echo "FAIL: hub proxy-secret middleware / image / LLDAP + invite credentials only as read-only files"; exit 1; }
           # Contract §1 / §8.1: Keycloak is Portcullis's image (KEYCLOAK_IMAGE,
           # edge on main) and reads the Hub's signin-keycloak.json read-only.
-          echo "$CFG" | jq -e '(.services.keycloak.image | test("^ghcr.io/porelli/portcullis-keycloak:"))
+          # hub_data's readers over every profile (wg reads vpn.json there).
+          echo "$CFG_ALL" | jq -e '(.services.keycloak.image | test("^ghcr.io/porelli/portcullis-keycloak:"))
               and ([.services.keycloak.volumes[] | select(.type == "volume") | "\(.source):\(.target):\(.read_only // false)"] == ["hub_data:/hub-data:true"])
               and ([.services | to_entries[] | select([.value.volumes[]? | select(.type == "volume" and .source == "hub_data")] | length > 0) | .key] | sort
-                   == ["group-gate", "hub", "keycloak", "mcp-gate"])' >/dev/null \
-            || { echo "FAIL: keycloak image (ghcr.io/porelli/portcullis-keycloak) / hub_data:/hub-data:ro"; exit 1; }
+                   == ["group-gate", "hub", "keycloak", "mcp-gate", "wg"])
+              and ([.services.wg.volumes[] | select(.source == "hub_data") | "\(.target):\(.read_only // false)"] == ["/hub-data:true"])' >/dev/null \
+            || { echo "FAIL: keycloak image (ghcr.io/porelli/portcullis-keycloak) / hub_data:/hub-data:ro / hub_data readers"; exit 1; }
           # Hardening baseline on every core service (all profiles).
           WEAK="$(echo "$CFG_ALL" | jq -r '.services | to_entries[]
               | select((.value.security_opt // [] | index("no-new-privileges:true") | not) or ((.value.cap_drop // []) != ["ALL"])
@@ -551,7 +581,7 @@ jobs:
               and (["mcp", "hub-mcp", "people-mcp"] | all(. as $r
                     | $l["traefik.http.routers.\($r).middlewares"] == "rate-limit@file,security-headers@file"
                     and $l["traefik.http.routers.\($r).service"] == "mcp-gate"
-                    and $l["traefik.http.routers.\($r).entrypoints"] == "websecure"))
+                    and $l["traefik.http.routers.\($r).entrypoints"] == "websecure,vpnsecure"))
               and ([$l | to_entries[] | select(.key | test("\\.middlewares$")) | .value | select(test("portcullis-auth|portcullis-groups|proxy-secret"))] == [])
               and $l["traefik.http.routers.mcp.tls.options"] == "authaware@file"
               and $l["traefik.http.routers.hub-mcp.tls.options"] == $hl["traefik.http.routers.hub.tls.options"]
@@ -648,6 +678,78 @@ jobs:
              || grep -rniE 'skip[-_]jwt[-_]bearer[-_]tokens' docker-compose*.yml oauth2-proxy/; then
             echo "FAIL: oauth2-proxy must not accept JWT bearer tokens"; exit 1
           fi
+          # VPN (contract §16): over every profile, on Docker and Podman, with
+          # and without the SELinux overlay. wg is userspace only: no
+          # capability, device, sysctl, privilege, network_mode or engine
+          # socket; Traefik trusts PROXY on vpnsecure from wg's pinned
+          # address only and never forwarded headers; portcullis-vpn holds
+          # exactly Traefik and wg at their pinned addresses (gateways join
+          # it per instance through the Hub's overrides); wg_data is wg's,
+          # read-only in the Hub; every core router is on one of the three
+          # entrypoint classes; people-vpn-enrol = people's chain on /vpn/.
+          vpn_rule() {  # <config json>
+            printf '%s' "$1" | jq -e '.services.wg as $w | .services.traefik as $t | .services.hub as $h
+                | def members($n): [.services | to_entries[] | select((.value.networks // {}) | has($n)) | .key] | sort;
+                  def mounts($src): [.services | to_entries[] | select([.value.volumes[]? | select(.type == "volume" and .source == $src)] | length > 0) | .key] | sort;
+                ($w.cap_add // []) == [] and ($w.devices // []) == [] and ($w.sysctls // {}) == {}
+                and ($w.privileged // false) == false and ($w.network_mode // null) == null
+                and ($w.cap_drop == ["ALL"]) and ($w.security_opt | index("no-new-privileges:true")) != null
+                and ([$w.volumes[] | select(.target == "/var/run/docker.sock" or (.source // "" | test("docker\\.sock$|podman\\.sock$")))] == [])
+                and $w.user == "10006:10006" and $w.group_add == ["10001"] and $w.read_only == true and $w.profiles == ["wg"]
+                and $w.image == "portcullis-wg"
+                and ([$w.ports[] | "\(.target)/\(.protocol)"] == ["51820/udp"])
+                and ([$w.volumes[] | "\(.type):\(.source | sub("^.*/secrets/"; "secrets/")):\(.target):\(.read_only // false)"] | sort
+                     == ["bind:secrets/wg/people.key:/run/portcullis/wg/people.key:true", "volume:hub_data:/hub-data:true", "volume:wg_data:/data:false"])
+                and ([$w.networks | keys[]] | sort == ["portcullis", "portcullis-vpn", "wg-egress"])
+                and $w.networks.portcullis.aliases == ["wg-metrics"]
+                and $w.environment.WG_PEOPLE == "off" and $w.environment.WG_MODE == "apps"
+                and $w.environment.WG_VPN_ADDR == $w.networks["portcullis-vpn"].ipv4_address
+                and $w.environment.WG_TRAEFIK == "\($t.networks["portcullis-vpn"].ipv4_address):8443"
+                and $w.environment.WG_METRICS == "wg-metrics:9100"
+                and ([$w.environment | keys[] | select(test("KEY$|SECRET|TOKEN|PASSWORD"))] == ["WG_PEOPLE_KEY"])
+                and $w.environment.WG_PEOPLE_KEY == "/run/portcullis/wg/people.key"
+                and $t.environment.TRAEFIK_ENTRYPOINTS_VPNSECURE_PROXYPROTOCOL_TRUSTEDIPS == "\($w.networks["portcullis-vpn"].ipv4_address)/32"
+                and $t.environment.TRAEFIK_ENTRYPOINTS_VPNSECURE_ADDRESS == "\($t.networks["portcullis-vpn"].ipv4_address):8443"
+                and $t.environment.TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_ALIASHEADERSSTRATEGY == "delete"
+                and ([$t.environment | keys[] | select(test("^TRAEFIK_ENTRYPOINTS_[A-Z]+_(FORWARDEDHEADERS_|PROXYPROTOCOL_INSECURE)"))] == [])
+                and ([$t.environment | keys[] | select(startswith("TRAEFIK_ENTRYPOINTS_VPNSECURE_"))] | sort
+                     == ["TRAEFIK_ENTRYPOINTS_VPNSECURE_ADDRESS", "TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_ALIASHEADERSSTRATEGY",
+                         "TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_CERTRESOLVER", "TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_DOMAINS_0_MAIN",
+                         "TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_DOMAINS_0_SANS", "TRAEFIK_ENTRYPOINTS_VPNSECURE_PROXYPROTOCOL_TRUSTEDIPS"])
+                and $t.environment.TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_DOMAINS_0_MAIN == $t.environment.TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_DOMAINS_0_MAIN
+                and $t.environment.TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_DOMAINS_0_SANS == $t.environment.TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_DOMAINS_0_SANS
+                and ([$t.ports[].target] | sort == [80, 443])
+                and .networks["portcullis-vpn"].name == "portcullis-vpn" and .networks["portcullis-vpn"].internal == true
+                and (members("portcullis-vpn") == ["traefik", "wg"])
+                and ([.services | to_entries[] | select(.value.networks["portcullis-vpn"].ipv4_address? != null) | .key] | sort == ["traefik", "wg"])
+                and (members("wg-egress") == ["wg"])
+                and (mounts("wg_data") == ["hub", "wg"])
+                and ([$h.volumes[] | select(.source == "wg_data") | "\(.target):\(.read_only // false)"] == ["/wg-data:true"])
+                and $h.environment.HUB_VPN_STATUS_FILE == "/wg-data/status.json"
+                and ([$h.networks | keys[]] | index("portcullis-vpn") | not)
+                and ($h.labels as $l
+                     | $l["traefik.http.routers.people-vpn-enrol.rule"] == ($l["traefik.http.routers.people.rule"] + " && PathPrefix(`/vpn/`)")
+                     and $l["traefik.http.routers.people-vpn-enrol.middlewares"] == $l["traefik.http.routers.people.middlewares"]
+                     and $l["traefik.http.routers.people-vpn-enrol.service"] == $l["traefik.http.routers.people.service"]
+                     and $l["traefik.http.routers.people-vpn-enrol.tls.options"] == $l["traefik.http.routers.people.tls.options"]
+                     and ($l["traefik.http.routers.people-vpn-enrol.priority"] | tonumber) > ($l["traefik.http.routers.people.rule"] | length))
+                and .services["group-gate"].labels["traefik.http.middlewares.vpn-required-path.replacepath.path"] == "/vpn-required"
+                and ([.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.entrypoints$")) | .value] | unique == ["websecure,vpnsecure"])' >/dev/null
+          }
+          # shellcheck disable=SC2034  # read through ${!c} below
+          CFG_PODMAN_ALL="$(CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET="$PODMAN_SOCK" docker compose -f docker-compose.yml -f docker-compose.podman.yml --profile '*' config --format json)"
+          # shellcheck disable=SC2034  # read through ${!c} below
+          OV_PODMAN_ALL="$(CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET="$PODMAN_SOCK" docker compose -f docker-compose.yml -f docker-compose.podman.yml -f docker-compose.podman-selinux.yml --profile '*' config --format json)"
+          for c in CFG_ALL CFG_PODMAN_ALL OV_ALL OV_PODMAN_ALL; do
+            vpn_rule "${!c}" || { echo "FAIL: VPN wiring (wg userspace only, vpnsecure PROXY trust, portcullis-vpn members, wg_data, people-vpn-enrol, entrypoint classes) in $c"; exit 1; }
+          done
+          echo "$CFG_PODMAN_ALL" | jq -e '.services.wg.restart == "always"' >/dev/null || { echo "FAIL: docker-compose.podman.yml must name wg"; exit 1; }
+          # Each router's entrypoints is exactly its class variable: with the
+          # three set to distinct values, every router shows its own class.
+          EP_ROUTERS="$(PORTCULLIS_EP_CORE=x-core PORTCULLIS_EP_ADMIN=x-admin PORTCULLIS_EP_ENROL=x-enrol docker compose -f docker-compose.yml --profile '*' config --format json \
+              | jq -r '[.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.entrypoints$")) | "\(.key | split(".")[3])=\(.value)"] | sort | join(" ")')"
+          WANT_EP="dashboard=x-admin enroll-invite=x-enrol grafana-metrics=x-admin hub-mcp=x-admin hub=x-admin keycloak-admin=x-admin keycloak-resources=x-enrol keycloak=x-enrol lldap=x-admin mcp=x-admin oauth2-callback=x-enrol people-mcp=x-admin people-vpn-enrol=x-enrol people=x-core portal=x-core"
+          [ "$EP_ROUTERS" = "$WANT_EP" ] || { echo "FAIL: core router entrypoint classes: got $EP_ROUTERS, want $WANT_EP"; exit 1; }
           echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring, domains service, mcp-gate, session store"
 
       - name: every image is pinned tag@sha256 (all compose files, all profiles, CLI, workflows)
@@ -667,12 +769,15 @@ jobs:
             [ "$svc:$img" != dns-tool:portcullis-domains ] || continue
             [[ "$img" =~ ^[^@[:space:]]+:[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || { echo "UNPINNED: $svc → $img"; bad=1; }
           done < /tmp/images
-          for df in enroll/Dockerfile group-gate/Dockerfile domains/Dockerfile mcp-gate/Dockerfile; do
+          for df in enroll/Dockerfile group-gate/Dockerfile domains/Dockerfile mcp-gate/Dockerfile wg/Dockerfile forwarder/Dockerfile; do
             if grep -E '^FROM ' "$df" | grep -v '@sha256:'; then echo "UNPINNED base image in $df"; bad=1; fi
           done
           # One Go builder (tag and digest) for every locally built Go service.
-          if [ "$(grep -hE '^FROM docker.io/library/golang:' enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile | awk '{print $2}' | sort -u | wc -l | tr -d ' ')" != 1 ]; then
-            echo "The Go Dockerfiles pin different golang builders:"; grep -nE '^FROM docker.io/library/golang:' enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile; bad=1
+          GO_DFS="enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile wg/Dockerfile forwarder/Dockerfile"
+          # shellcheck disable=SC2086  # a list of paths
+          if [ "$(grep -hE '^FROM docker.io/library/golang:' $GO_DFS | awk '{print $2}' | sort -u | wc -l | tr -d ' ')" != 1 ]; then
+            # shellcheck disable=SC2086
+            echo "The Go Dockerfiles pin different golang builders:"; grep -nE '^FROM docker.io/library/golang:' $GO_DFS; bad=1
           fi
           # Fully qualified registry names (docker.io/library/…, docker.io/<org>/…):
           # podman build / pull never depend on registries.conf short-name
@@ -739,9 +844,9 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum', 'mcp-gate/go.sum') }}-${{ hashFiles('enroll/**/*.go', 'domains/**/*.go', 'mcp-gate/**/*.go') }}
+          key: go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum', 'mcp-gate/go.sum', 'wg/go.sum', 'forwarder/go.sum', 'tests/e2e/vpn-client/go.sum') }}-${{ hashFiles('enroll/**/*.go', 'domains/**/*.go', 'mcp-gate/**/*.go', 'wg/**/*.go', 'forwarder/**/*.go', 'tests/e2e/vpn-client/**/*.go') }}
           restore-keys: |
-            go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum', 'mcp-gate/go.sum') }}-
+            go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum', 'mcp-gate/go.sum', 'wg/go.sum', 'forwarder/go.sum', 'tests/e2e/vpn-client/go.sum') }}-
       - name: enroll unit tests
         working-directory: enroll
         env:
@@ -771,6 +876,25 @@ jobs:
           # The shared test vector (contract §15.4, preflight G47) is
           # decoded strictly and re-encoded byte for byte by the tests.
           test -s internal/config/testdata/mcp-gate.json && test -s internal/config/testdata/mcp-credentials.json
+          CGO_ENABLED=1 go test -race ./...
+      - name: wg unit tests (vpn.json reader, userspace WireGuard tunnel, edge, people role, resolver; contract §16)
+        working-directory: wg
+        run: |
+          go mod verify
+          go vet ./...
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
+          # The image is CGO-free (netstack, no TUN): the binary must build so.
+          CGO_ENABLED=0 go build -o /dev/null .
+          # Reads ../tests/vpn_json_vectors.json (the Hub's byte copy).
+          test -s ../tests/vpn_json_vectors.json
+          CGO_ENABLED=1 go test -race ./...
+      - name: forwarder unit tests (PROXY v2 forwarder image)
+        working-directory: forwarder
+        run: |
+          go mod verify
+          go vet ./...
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
+          CGO_ENABLED=0 go build -o /dev/null .
           CGO_ENABLED=1 go test -race ./...
       # mcp-gate's shared vectors are byte copies of the Hub's: the gate
       # files (contract §15.4, internal/aigate/testdata/) and the sign-in

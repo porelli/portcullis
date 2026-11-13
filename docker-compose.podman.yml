@@ -50,3 +50,5 @@ services:
     restart: always
   vault:
     restart: always
+  wg:
+    restart: always

@@ -134,3 +134,7 @@ services:
       - {type: bind, source: ./monitoring/grafana/provisioning, target: /etc/grafana/provisioning, read_only: true, bind: {selinux: Z}}
       - {type: bind, source: ./monitoring/grafana/dashboards, target: /var/lib/grafana-dashboards, read_only: true, bind: {selinux: Z}}
       - {type: bind, source: ./secrets/monitoring/grafana, target: /run/secrets/grafana, read_only: true, bind: {selinux: Z}}
+
+  wg:
+    volumes:
+      - {type: bind, source: ./secrets/wg/people.key, target: /run/portcullis/wg/people.key, read_only: true, bind: {selinux: Z}}

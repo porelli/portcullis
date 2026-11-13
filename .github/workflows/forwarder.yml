@@ -48,7 +48,8 @@ jobs:
       packages: write   # push to GHCR
       id-token: write   # keyless cosign signing (GitHub OIDC)
     env:
-      IMAGE: ghcr.io/${{ github.repository_owner }}/portcullis-forwarder
+      # The repository (not a pinned ref: this job builds it).
+      FWD_REPO: ghcr.io/${{ github.repository_owner }}/portcullis-forwarder
       PUSH: ${{ github.ref == 'refs/heads/main' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,7 +75,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
-          images: ${{ env.IMAGE }}
+          images: ${{ env.FWD_REPO }}
           flavor: |
             latest=false
           tags: |
@@ -102,10 +103,10 @@ jobs:
         if: env.PUSH == 'true'
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+        run: cosign sign --yes "${FWD_REPO}@${DIGEST}"
 
       - name: Digest
         if: env.PUSH == 'true'
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: echo "pushed ${IMAGE}:edge@${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
+        run: echo "pushed ${FWD_REPO}:edge@${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"

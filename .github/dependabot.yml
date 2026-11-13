@@ -59,6 +59,21 @@ updates:
       - dependency-name: "golang"
         versions: [">= 1.28.a, < 1.28", ">= 1.29.a, < 1.29", ">= 1.30.a, < 1.30"]
 
+  # wg/ and forwarder/ Dockerfile base images (golang, alpine; the same
+  # builder as mcp-gate's, which CI's "one golang builder" check enforces).
+  - package-ecosystem: docker
+    directories:
+      - /wg
+      - /forwarder
+    schedule:
+      interval: weekly
+    groups:
+      vpn-images:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "golang"
+        versions: [">= 1.28.a, < 1.28", ">= 1.29.a, < 1.29", ">= 1.30.a, < 1.30"]
+
   # group-gate/Dockerfile base image (python).
   - package-ecosystem: docker
     directory: /group-gate
@@ -113,6 +128,22 @@ updates:
       interval: weekly
     groups:
       mcp-gate-go:
+        patterns: ["*"]
+
+  # wg/go.mod (wireguard-go + gVisor netstack pseudo-versions, go-proxyproto,
+  # miekg/dns, Prometheus, qrterminal), the forwarder and the e2e-vpn job's
+  # client (tests/e2e/vpn-client, the same wireguard-go): one group, so the
+  # tunnel stack moves together. gVisor pseudo-versions can break on a new
+  # Go release: the wg unit tests (and e2e-vpn) gate the merge.
+  - package-ecosystem: gomod
+    directories:
+      - /wg
+      - /forwarder
+      - /tests/e2e/vpn-client
+    schedule:
+      interval: weekly
+    groups:
+      vpn-go:
         patterns: ["*"]
 
   # Actions are pinned by commit SHA with a `# vX.Y.Z` comment; Dependabot

@@ -92,7 +92,8 @@ jobs:
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     env:
-      IMAGE: ghcr.io/${{ github.repository_owner }}/portcullis-forwarder
+      # The repository (not a pinned ref: this job builds it).
+      FWD_REPO: ghcr.io/${{ github.repository_owner }}/portcullis-forwarder
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -114,7 +115,7 @@ jobs:
           context: forwarder
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: ${{ env.IMAGE }}:${{ needs.preflight.outputs.version }}
+          tags: ${{ env.FWD_REPO }}:${{ needs.preflight.outputs.version }}
           provenance: mode=max
           sbom: true
       - name: Install cosign
@@ -122,7 +123,7 @@ jobs:
       - name: Sign image (keyless)
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+        run: cosign sign --yes "${FWD_REPO}@${DIGEST}"
 
   release:
     needs: [preflight, ci, forwarder]
