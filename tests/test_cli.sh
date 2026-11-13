@@ -193,6 +193,14 @@ HITS="$(grep -nE -e "$ARGV_RE" "$HERE/../portcullis" "$HERE"/../scripts/lib/*.sh
 expect_eq "no secrets on argv in the CLI" "$HITS" ""
 # Container root is the operator under rootless Podman: an operator-owned
 # file is chowned to ct_operator_id, never $(id -u) (a subuid there).
+# Contract §6: the engine socket reaches only the two socket proxies, from
+# PORTCULLIS_ENGINE_SOCKET (rootless Podman's user socket) or Docker's.
+ROOT_DIR_SOCK="$(cd "$HERE/.." && pwd)"
+expect_eq "the engine-socket mount appears exactly twice in docker-compose.yml" \
+  "$(grep -cF -- '- ${PORTCULLIS_ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro' "$ROOT_DIR_SOCK/docker-compose.yml")" 2
+expect_eq "no literal /var/run/docker.sock:/var/run/docker.sock mount anywhere" \
+  "$(git -C "$ROOT_DIR_SOCK" grep -nF '/var/run/docker.sock:/var/run/docker.sock' -- . ':!tests/test_cli.sh' || true)" ""
+expect_eq "the SELinux overlay never names the engine socket" "$(grep -c 'docker.sock\|ENGINE_SOCKET' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" 0
 expect_eq "no ct_own \"\$(id -u)… in the CLI (ct_operator_id)" "$(grep -rnF 'ct_own "$(id -u)' "$HERE/../scripts/lib" "$HERE/../portcullis" || true)" ""
 case "$(printf '%s\n' '  jq -n --arg p "$(cat "$f")" x' '  jq --arg pass "$LLDAP_ADMIN_PASSWORD"' | grep -cE -e "$ARGV_RE")" in
   2) t_pass "argv secret pattern catches --arg \"\$(cat ...)\" and secret variables" ;; *) t_fail "argv secret pattern" ;; esac

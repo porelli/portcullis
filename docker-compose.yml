@@ -98,7 +98,9 @@ services:
       DISABLE_IPV6: "1"
       LOG_LEVEL: warning
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # The engine socket (contract §6): rootful Docker's, or the operator's
+      # rootless Podman socket (PORTCULLIS_ENGINE_SOCKET, written by init).
+      - ${PORTCULLIS_ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
     networks:
       - socket-proxy-traefik
     healthcheck:
@@ -145,7 +147,9 @@ services:
       DISABLE_IPV6: "1"
       LOG_LEVEL: warning
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # The engine socket (contract §6): rootful Docker's, or the operator's
+      # rootless Podman socket (PORTCULLIS_ENGINE_SOCKET, written by init).
+      - ${PORTCULLIS_ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro
     networks:
       - socket-proxy-hub
     healthcheck:
@@ -867,6 +871,9 @@ services:
       HUB_DATA_DIR: /data
       # No socket mount: Engine API + `docker compose` via its proxy (contract §6).
       DOCKER_HOST: tcp://socket-proxy-hub:2375
+      # docker | podman (rootless): the Hub verifies the engine's /version
+      # against it and refuses every engine operation on a mismatch (503).
+      HUB_CONTAINER_RUNTIME: ${CONTAINER_RUNTIME:?CONTAINER_RUNTIME must be set in .env (./portcullis init writes it)}
       PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
       DEFAULT_TEMPLATES_URL: https://github.com/porelli/portcullis-templates.git
       PORTAL_DISPLAY_NAME: ${PORTAL_DISPLAY_NAME:-Portcullis}

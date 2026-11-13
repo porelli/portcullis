@@ -211,8 +211,9 @@ jobs:
         run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_e2e_fsops.py
       - name: compose files are valid with a generated .env
         run: |
-          ./portcullis init --env-only --non-interactive --domain ci.example.org --dns-provider none
+          ./portcullis init --env-only --runtime docker --non-interactive --domain ci.example.org --dns-provider none
           docker compose -f docker-compose.yml config -q
+          docker compose -f docker-compose.yml -f docker-compose.podman-selinux.yml --profile '*' config -q
           docker compose -f docker-compose.yml --profile monitoring config -q
           docker compose -f docker-compose.yml --profile '*' config -q
           docker compose -f docker-compose.yml -f docker-compose.apps.yml config -q
@@ -234,9 +235,61 @@ jobs:
           CFG="$(docker compose -f docker-compose.yml config --format json)"
           # Every profile (monitoring, ...): same pin + hardening rules.
           CFG_ALL="$(docker compose -f docker-compose.yml --profile '*' config --format json)"
-          # Contract §6: only the socket proxies mount the Docker socket.
-          echo "$CFG" | jq -e '[.services | to_entries[] | select([.value.volumes[]?.source] | index("/var/run/docker.sock")) | .key] | sort == ["socket-proxy-hub", "socket-proxy-traefik"]' >/dev/null \
-            || { echo "FAIL: a service other than the socket proxies mounts docker.sock"; exit 1; }
+          # Contract §6: only the socket proxies mount the engine socket —
+          # rootful Docker's, or the operator's rootless Podman socket
+          # (PORTCULLIS_ENGINE_SOCKET) — read-only at /var/run/docker.sock;
+          # the Hub gets the runtime as HUB_CONTAINER_RUNTIME.
+          socket_rule() {  # <config json> <runtime>
+            printf '%s' "$1" | jq -e --arg rt "$2" '(env.PORTCULLIS_ENGINE_SOCKET // "/var/run/docker.sock") as $src
+                | ([.services | to_entries[] | select([.value.volumes[]?.source] | index($src)) | .key] | sort == ["socket-proxy-hub", "socket-proxy-traefik"])
+                and ([.services["socket-proxy-traefik", "socket-proxy-hub"].volumes[] | select(.source == $src) | "\(.target):\(.read_only)"] == ["/var/run/docker.sock:true", "/var/run/docker.sock:true"])
+                and ([.services[].volumes[]? | select(.source == "/var/run/docker.sock" or .target == "/var/run/docker.sock")] | length == 2)
+                and .services.hub.environment.HUB_CONTAINER_RUNTIME == $rt' >/dev/null
+          }
+          socket_rule "$CFG" docker || { echo "FAIL: the engine socket (docker): only the two proxies, read-only; HUB_CONTAINER_RUNTIME=docker"; exit 1; }
+          export PODMAN_SOCK=/run/user/1001/podman/podman.sock
+          CFG_PODMAN="$(CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET="$PODMAN_SOCK" docker compose -f docker-compose.yml config --format json)"
+          PORTCULLIS_ENGINE_SOCKET="$PODMAN_SOCK" socket_rule "$CFG_PODMAN" podman \
+            || { echo "FAIL: the engine socket (podman): only the two proxies mount $PODMAN_SOCK read-only; HUB_CONTAINER_RUNTIME=podman"; exit 1; }
+          # No default runtime (P0): compose refuses an empty CONTAINER_RUNTIME.
+          if CONTAINER_RUNTIME='' docker compose -f docker-compose.yml config -q 2>/dev/null; then
+            echo "FAIL: compose accepted an empty CONTAINER_RUNTIME"; exit 1
+          fi
+          # Core stays userspace (VPN cross-reference): no NET_ADMIN / SYS_ADMIN.
+          CAPS="$(echo "$CFG_ALL" | jq -r '.services | to_entries[] | select((.value.cap_add // []) | any(. == "NET_ADMIN" or . == "SYS_ADMIN")) | .key')"
+          [ -z "$CAPS" ] || { echo "FAIL: core services with NET_ADMIN / SYS_ADMIN: $CAPS"; exit 1; }
+          # The rootless Podman SELinux overlay (P10): every project bind
+          # (source inside the checkout) re-declared with selinux z and the
+          # base's target / read_only, nothing else relabelled (never the
+          # engine socket), no service the base lacks, label=disable on the two
+          # proxies only (each keeping no-new-privileges); the base itself
+          # relabels nothing.
+          OV_ALL="$(docker compose -f docker-compose.yml -f docker-compose.podman-selinux.yml --profile '*' config --format json)"
+          binds() {  # <config json> — "service target read_only selinux" of every project bind
+            printf '%s' "$1" | jq -r --arg p "$PWD" '.services | to_entries[] | .key as $s | (.value.volumes // [])[]
+                | select(.type == "bind" and (.source == $p or (.source | startswith($p + "/"))))
+                | "\($s) \(.target) \(.read_only // false) \(.bind.selinux // "-")"' | sort
+          }
+          [ -z "$(binds "$CFG_ALL" | awk '$4 != "-"')" ] || { echo "FAIL: docker-compose.yml relabels a bind (selinux): only the overlay may"; exit 1; }
+          NBINDS="$(binds "$CFG_ALL" | wc -l | tr -d ' ')"
+          [ "$NBINDS" = 45 ] || { echo "FAIL: expected 45 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
+          diff <(binds "$CFG_ALL" | awk '{print $1, $2, $3, "z"}') <(binds "$OV_ALL") \
+            || { echo "FAIL: docker-compose.podman-selinux.yml must re-declare every project bind with selinux z and the same target / read_only"; exit 1; }
+          echo "$OV_ALL" | jq -e --arg p "$PWD" '[.services[].volumes[]? | select(.bind.selinux != null) | select(.source != $p and (.source | startswith($p + "/") | not))] == []
+              and ([.services[].volumes[]? | select(.target == "/var/run/docker.sock") | .bind.selinux // null] == [null, null])' >/dev/null \
+            || { echo "FAIL: the overlay relabels something outside the checkout (or the engine socket)"; exit 1; }
+          EXTRA="$(comm -23 <(yq -r '.services | keys | .[]' docker-compose.podman-selinux.yml | sort) <(docker compose -f docker-compose.yml --profile '*' config --services | sort))"
+          [ -z "$EXTRA" ] || { echo "FAIL: docker-compose.podman-selinux.yml names services docker-compose.yml lacks: $EXTRA"; exit 1; }
+          if ! echo "$OV_ALL" | jq -e '([.services | to_entries[] | select((.value.security_opt // []) | index("label=disable")) | .key] | sort == ["socket-proxy-hub", "socket-proxy-traefik"])
+                 and ([.services["socket-proxy-traefik", "socket-proxy-hub"].security_opt | index("no-new-privileges:true")] | all(. != null))' >/dev/null \
+             || ! echo "$CFG_ALL" | jq -e '[.services[].security_opt[]? | select(startswith("label"))] == []' >/dev/null; then
+            echo "FAIL: label=disable must be on exactly the two socket proxies, only in the overlay, next to no-new-privileges"; exit 1
+          fi
+          # The hardening baseline holds with the overlay merged too.
+          WEAK="$(echo "$OV_ALL" | jq -r '.services | to_entries[]
+              | select((.value.security_opt // [] | index("no-new-privileges:true") | not) or ((.value.cap_drop // []) != ["ALL"])
+                       or (.value.mem_limit == null) or (.value.pids_limit == null)) | .key')"
+          [ -z "$WEAK" ] || { echo "FAIL: with the SELinux overlay, services without no-new-privileges/cap_drop ALL/limits: $WEAK"; exit 1; }
           echo "$CFG" | jq -e '.services.traefik.environment.TRAEFIK_PROVIDERS_DOCKER_ENDPOINT == "tcp://socket-proxy-traefik:2375"
               and .services.hub.environment.DOCKER_HOST == "tcp://socket-proxy-hub:2375"
               and .services["socket-proxy-traefik"].environment.POST == "0"
@@ -743,7 +796,7 @@ jobs:
 
       - name: Generate .env (portcullis init --env-only)
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           test "$(stat -c %a .env)" = 600 || { echo "FAIL: .env is not 0600"; exit 1; }
           # Make the generated values available to the test steps below.
@@ -1804,7 +1857,12 @@ jobs:
           done
           [ "$(tp --post-data='{}' --header 'Content-Type: application/json' http://socket-proxy-traefik:2375/containers/create)" = 403 ] \
             || { echo "FAIL: traefik proxy allowed a POST"; exit 1; }
-          echo "PASS: socket-proxy-traefik is read-only and minimal"
+          # The libpod API (rootless Podman's native API: play kube, generate,
+          # ...) and /build never pass either proxy (contract §6).
+          for denied in /libpod/info /libpod/play/kube /v5.0.0/libpod/containers/json /build; do
+            [ "$(tp "http://socket-proxy-traefik:2375$denied")" = 403 ] || { echo "FAIL: traefik proxy allowed $denied"; exit 1; }
+          done
+          echo "PASS: socket-proxy-traefik is read-only and minimal (libpod and /build denied)"
 
           # Hub's proxy: run real `docker compose` through it, like the Hub does.
           docker compose up -d socket-proxy-hub
@@ -1837,7 +1895,17 @@ jobs:
             # shellcheck disable=SC2086
             if dcli $denied >/dev/null 2>&1; then echo "FAIL: socket-proxy-hub allowed: $denied"; exit 1; fi
           done
-          echo "PASS: docker compose up/ps/logs/restart/down -v work through socket-proxy-hub; swarm/system/plugins/secrets/nodes denied"
+          # The libpod API and /build: 403 on the Hub's proxy too, GET and POST
+          # (its POST=1 allows writes only on the allowed sections).
+          hp() { docker run --rm --network "$NET" --entrypoint wget \
+                   docker:29.9.2-cli@sha256:5e6baf67325a79f64ed3bed6863954d5e05d0f3d4e57cbdb14809346814bbfdb \
+                   -q -O /dev/null -S "$@" 2>&1 | grep -o 'HTTP/[0-9.]* [0-9]*' | tail -n1 | cut -d' ' -f2; }
+          for denied in /libpod/info /libpod/play/kube /v5.0.0/libpod/containers/json /build; do
+            [ "$(hp "http://socket-proxy-hub:2375$denied")" = 403 ] || { echo "FAIL: socket-proxy-hub allowed GET $denied"; exit 1; }
+            [ "$(hp --post-data='{}' --header 'Content-Type: application/json' "http://socket-proxy-hub:2375$denied")" = 403 ] \
+              || { echo "FAIL: socket-proxy-hub allowed POST $denied"; exit 1; }
+          done
+          echo "PASS: docker compose up/ps/logs/restart/down -v work through socket-proxy-hub; swarm/system/plugins/secrets/nodes, libpod and /build denied"
 
       - name: Test the Hub (non-root, socket proxy, proxy secret)
         run: |
@@ -2933,7 +3001,7 @@ jobs:
 
       - name: Generate .env and the CI override
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
             val="$(grep "^$v=" .env | cut -d= -f2-)"
@@ -3357,7 +3425,7 @@ jobs:
 
       - name: Generate .env and the CI override (Pebble, fake DNS provider)
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
             val="$(grep "^$v=" .env | cut -d= -f2-)"
@@ -3941,7 +4009,7 @@ jobs:
 
       - name: Generate .env and the CI override (Pebble, fake DNS provider, the trust list fixture from a host directory)
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           # Signing in as someone else lasts at most 2 minutes in this job
           # (every case; imp_expiry waits for it).
@@ -4396,7 +4464,7 @@ jobs:
 
       - name: Generate .env and the CI override (Pebble, fake DNS provider, app hostnames on Traefik)
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
             val="$(grep "^$v=" .env | cut -d= -f2-)"
@@ -4768,7 +4836,7 @@ jobs:
 
       - name: Generate .env and the CI override (Pebble, fake DNS provider, auth on portcullis-proxy)
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
             val="$(grep "^$v=" .env | cut -d= -f2-)"
@@ -5071,7 +5139,7 @@ jobs:
 
       - name: Generate .env and the CI override (Pebble, fake DNS provider, auth on portcullis-proxy)
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
             val="$(grep "^$v=" .env | cut -d= -f2-)"
@@ -5377,7 +5445,7 @@ jobs:
 
       - name: Generate .env and the CI override (Pebble, fake DNS provider, app hostnames on Traefik)
         run: |
-          ./portcullis init --env-only --non-interactive --domain portcullis.local \
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none
           for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
             val="$(grep "^$v=" .env | cut -d= -f2-)"
