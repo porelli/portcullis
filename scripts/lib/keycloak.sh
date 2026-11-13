@@ -850,13 +850,8 @@ oidc_register() {
   info "Registering OIDC clients..."
   _oidc_client portcullis-forward-auth FORWARD_AUTH_CLIENT_SECRET \
     "https://auth.$domain/oauth2/callback" "Portcullis Forward Auth" || failed=1
-  # Optional VPN clients — only when their secret is set in .env.
-  if [ -n "${HEADSCALE_OIDC_CLIENT_SECRET:-}" ]; then
-    _oidc_client headscale HEADSCALE_OIDC_CLIENT_SECRET "https://vpn.$domain/oidc/callback" "Headscale VPN" || failed=1
-  fi
-  if [ -n "${HEADPLANE_OIDC_CLIENT_SECRET:-}" ]; then
-    _oidc_client headplane HEADPLANE_OIDC_CLIENT_SECRET "https://vpn-admin.$domain/*" "Headplane Admin UI" || failed=1
-  fi
+  # Optional NetBird dashboard client (docker-compose.apps.yml) — only when
+  # its secret is set in .env. Other apps' clients belong to their templates.
   if [ -n "${NETBIRD_OIDC_CLIENT_SECRET:-}" ]; then
     _oidc_client netbird-dashboard NETBIRD_OIDC_CLIENT_SECRET "https://netbird.$domain/*" "NetBird Dashboard" || failed=1
   fi
@@ -933,8 +928,8 @@ help_oidc_register() {
   cat <<'EOF'
 Usage: portcullis oidc register
 
-Create the portcullis-forward-auth client (and headscale / headplane /
-netbird-dashboard when their *_OIDC_CLIENT_SECRET is set in .env) and set
+Create the portcullis-forward-auth client (and netbird-dashboard when
+NETBIRD_OIDC_CLIENT_SECRET is set in .env) and set
 each client's secret in Keycloak to the value in .env, so oauth2-proxy and
 Keycloak always agree. Idempotent. After changing FORWARD_AUTH_CLIENT_SECRET
 run this, then `portcullis up`.

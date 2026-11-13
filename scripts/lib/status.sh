@@ -225,14 +225,21 @@ status_run() {
     problems=1
   fi
 
+  # ── VPN (contract §16): a mode other than apps with wg down is a problem ──
+  local vpn_json='{"enabled":false,"mode":"apps","problem":false,"providers":[]}'
+  if declare -F vpn_status_json >/dev/null; then
+    vpn_json="$(vpn_status_json)" || vpn_json='{"enabled":false,"mode":"unknown","problem":true,"providers":[]}'
+  fi
+  [ "$(printf '%s' "$vpn_json" | jq -r '.problem')" != true ] || problems=1
+
   if [ "$json" = true ]; then
-    jq -n --arg d "${PORTCULLIS_DOMAIN:-}" --argjson s "$services" --argjson v "$vault_json" \
+    jq -n --arg d "${PORTCULLIS_DOMAIN:-}" --argjson s "$services" --argjson v "$vault_json" --argjson vpn "$vpn_json" \
       --argjson k "$kc" --argjson l "$lldap" --arg t "$traefik" --argjson p "$problems" --arg sh "$shadows" --arg mr "$mcp_refusing" --arg dn "$dns_json" \
       --argjson rt "$rt_json" \
       '{domain: $d, ok: ($p == 0), problems: $p, runtime: $rt, services: $s, vault: $v, keycloak: $k, lldap: $l, traefik: {state: $t},
         dns_shadows: [$sh | split("\n")[] | select(. != "") | capture("^(?<container>[^ ]+) (?<name>.+)$")],
         mcp_gate: {refusing: (if $mr == "" then null else $mr end)},
-        dns: (if $dn == "" then null else ($dn | fromjson) end)}'
+        dns: (if $dn == "" then null else ($dn | fromjson) end), vpn: $vpn}'
     return "$problems"
   fi
 
@@ -327,6 +334,7 @@ status_run() {
   done <<< "$shadows"
   [ -z "$mcp_refusing" ] || _st_line fail "mcp-gate: $mcp_refusing"
   _st_dns_lines "$dns_json" "$traefik_uri" "$env_uri"
+  if declare -F vpn_status_lines >/dev/null; then vpn_status_lines "$vpn_json"; fi
 
   printf '\n%sDomain: %s — run with --json for machine-readable output%s\n\n' "$C_DIM" "${PORTCULLIS_DOMAIN:-?}" "$C_NC"
   return "$problems"
@@ -357,6 +365,8 @@ status_textfile() {
     (if (.vault.browser_ca_expires_epoch // 0) > 0 then "portcullis_ca_expiry_timestamp_seconds{ca=\"browser\"} \(.vault.browser_ca_expires_epoch)" else empty end),
     g("portcullis_client_cert_expiry_timestamp_seconds"; "Expiry of the newest valid, unrevoked YubiKey and browser certificate of each user."),
     ((.vault.client_certs // [])[] | "portcullis_client_cert_expiry_timestamp_seconds{cn=\"\(.cn | esc)\",kind=\"\(.kind | esc)\"} \(.epoch)"),
+    g("portcullis_vpn_mode_restricted"; "1 when the VPN mode is admin or server (core surfaces VPN-only; PortcullisVPNDown watches wg)."),
+    "portcullis_vpn_mode_restricted \(if ((.vpn.mode // "apps") == "apps") then 0 else 1 end)",
     g("portcullis_dns_check"; "1 if the DNS check (address, caa, dnssec, foreign) of the name has no Warning or Problem (absent: DNS checks unavailable)."),
     (if .dns == null then empty else ([.dns.main] + [.dns.domains[]])[] | . as $d | ($d.checks | to_entries[] | "portcullis_dns_check{name=\"\($d.name | esc)\",check=\"\(.key)\"} \(.value)") end),
     g("portcullis_dnssec_state"; "1 for the current DNSSEC state of the name."),

@@ -86,7 +86,7 @@ done
 
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 29 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 29
+expect_eq "help lists 35 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 35
 while IFS= read -r c; do
   # shellcheck disable=SC2086
   run $c --help
@@ -115,7 +115,7 @@ expect_eq "every --help works with no engine: the engine was never asked" "$(cat
 run init --help
 case "$OUT" in *"--runtime docker|podman"*"CONTAINER_RUNTIME"*"never switched"*) t_pass "init --help documents --runtime" ;; *) t_fail "init --help lacks --runtime" ;; esac
 
-for g in vault pki keycloak oidc dns cert config signin; do
+for g in vault pki keycloak oidc dns cert config signin vpn; do
   run "$g";        expect_eq "'$g' without subcommand exits 2" "$RC" 2
   run "$g" --help; expect_eq "'$g --help' exits 0" "$RC" 0
   run "$g" bogus;  expect_eq "'$g bogus' exits 2" "$RC" 2
@@ -184,6 +184,32 @@ invite a --frob|unknown option: --frob
 lldap-ui now|unknown argument: now
 signin reset-core --force|unknown argument: --force
 signin reset-core|no terminal to confirm on: pass --yes
+vpn init extra|unexpected argument: extra
+vpn init --builtin|--builtin needs a value
+vpn init --builtin maybe|--builtin must be on or off
+vpn init --port 0|--port must be a UDP port number
+vpn init --port x|--port must be a UDP port number
+vpn init --subnet 10.213.0.1/22|--subnet must be an IPv4 network
+vpn init --subnet 10.213.0.0/31|--subnet must be an IPv4 network
+vpn init --subnet fd00::/64|--subnet must be an IPv4 network
+vpn init --frob|unknown option: --frob
+vpn mode|expected apps, admin or server
+vpn mode everything|expected apps, admin or server
+vpn mode apps admin|expected apps, admin or server
+vpn mode server --public-enrol maybe|--public-enrol must be true or false
+vpn mode server --public-enrol|--public-enrol needs a value
+vpn builtin|expected on or off
+vpn builtin maybe|expected on or off
+vpn add-device alice|expected <user> <name>
+vpn add-device 'Bad;user' phone|invalid user name
+vpn add-device alice phone extra|expected <user> <name>
+vpn devices --user|--user needs a value
+vpn devices --user Alice|invalid user name
+vpn devices bob|unexpected argument: bob
+vpn revoke|expected exactly one <device-id>
+vpn revoke a b|expected exactly one <device-id>
+vpn revoke 'x;y'|invalid device id
+vpn revoke --all|unknown option: --all
 EOF
 
 # ── no secret on a command line (CLAUDE.md: stdin, -H @<(...), key=-, jq

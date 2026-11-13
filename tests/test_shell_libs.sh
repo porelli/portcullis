@@ -3516,6 +3516,167 @@ expect_eq "runtime_proxies_refresh on podman: restarts the unhealthy proxy only"
 expect_eq "runtime_proxies_refresh on docker: nothing" \
   "$( (CONTAINER_RUNTIME=docker; container_health() { echo unhealthy; }; dc() { echo "dc $*"; }; runtime_proxies_refresh) 2>/dev/null)" ""
 
+# ══ vpn: ./portcullis vpn … (scripts/lib/vpn.sh, contract §16) ═══════
+# shellcheck source=../scripts/lib/vpn.sh
+source "$HERE/../scripts/lib/vpn.sh"
+VPN_PRIV="cHJpdmF0ZS1rZXktb2YtdGhlLXRlc3Qtc3R1Yi0wMDAwMDA="
+VPN_PUB="cHVibGljLWtleS1vZi10aGUtdGVzdC1zdHViLTAwMDAwMDA="
+# vt <script> — runs <script> in a subshell with a fresh root (.env from
+# $VT_ENV), every engine / Hub call stubbed and logged to $WORK/vt/log
+# (argv), Hub stdin to $WORK/vt/stdin, jq argv to $WORK/vt/jq.
+vt() {
+  rm -rf "$WORK/vt"; mkdir -p "$WORK/vt/root/secrets/wg" "$WORK/vt/root/secrets/monitoring/prometheus"
+  printf '%s\n' "${VT_ENV:-PORTCULLIS_DOMAIN=vpn.example.org}" > "$WORK/vt/root/.env"
+  : > "$WORK/vt/root/secrets/wg/people.key"
+  (
+    export PORTCULLIS_ROOT="$WORK/vt/root" MONITORING_SECRETS="$WORK/vt/root/secrets/monitoring"
+    unset COMPOSE_PROFILES PORTCULLIS_VPN_MODE PORTCULLIS_VPN_PUBLIC_ENROL PORTCULLIS_VPN_BUILTIN PORTCULLIS_VPN_PORT PORTCULLIS_VPN_SUBNET \
+      PORTCULLIS_EP_CORE PORTCULLIS_EP_ADMIN PORTCULLIS_EP_ENROL
+    env_load
+    L="$WORK/vt/log"
+    dc() {
+      echo "dc $*" >> "$L"
+      case "$*" in
+        "exec -T hub hub vpn host-info") [ "${VT_HUB_DOWN:-}" != 1 ] || return 1; printf '%s' "${VT_HOSTINFO:-$VT_HOSTINFO_DEFAULT}" ;;
+        "exec -T wg /wg keypair") printf '{"private_key":"%s","public_key":"%s"}\n' "$VPN_PRIV" "$VPN_PUB" ;;
+        "exec -T hub hub vpn add-device "*) cat >> "$WORK/vt/stdin"; echo '{"address":"10.213.0.5","server_public_key":"U2VydmVy","endpoint":"vpn.example.org:51820","allowed_ips":"10.213.0.1/32","dns":"10.213.0.1","mtu":1280}' ;;
+        "exec -T wg /wg qr") cat >> "$WORK/vt/qr"; echo QR ;;
+        "ps -q --status running wg") echo cid ;;
+      esac
+    }
+    docker() {
+      echo "docker $*" >> "$L"
+      case "$1 $2" in
+        "network ls") echo n1 ;;
+        "network inspect") printf '%s\n' "${VT_DOCKER_SUBNETS:-172.17.0.0/16}" ;;
+      esac
+    }
+    ct_run() { echo "ct_run $*" >> "$L"; local a; for a in "$@"; do case "$a" in type=bind,src=*) a="${a#type=bind,src=}"; printf 'S0VZ\n' > "${a%%,dst=*}" ;; esac; done; }
+    runtime_build_service() { echo "runtime_build_service $*" >> "$L"; }
+    stack_compose_up() { echo "stack_compose_up $*" >> "$L"; }
+    hub_env_write() { echo "hub_env_write" >> "$L"; }
+    ct_group_read() { echo "ct_group_read $*" >> "$L"; }
+    monitoring_fix_perms() { :; }
+    container_health() { echo "${VT_HUB_HEALTH:-healthy}"; }
+    wait_healthy() { echo "wait_healthy $*" >> "$L"; }
+    jq() { printf '%s\n' "$*" >> "$WORK/vt/jq"; command jq "$@"; }
+    eval "$1"
+  )
+}
+vte() { cat "$WORK/vt/root/.env"; }
+VT_HOSTINFO_DEFAULT='{"local_networks":["10.0.0.0/8","192.168.0.0/16"],"provider_ranges":[],"admin_device_seen":false}'
+
+expect_eq "vpn_entrypoints: apps, public enrolment on" "$(vpn_entrypoints apps true)" \
+  "PORTCULLIS_EP_CORE=websecure,vpnsecure
+PORTCULLIS_EP_ADMIN=websecure,vpnsecure
+PORTCULLIS_EP_ENROL=websecure,vpnsecure"
+expect_eq "vpn_entrypoints: apps, public enrolment off" "$(vpn_entrypoints apps false)" "$(vpn_entrypoints apps true)"
+expect_eq "vpn_entrypoints: admin, public enrolment on" "$(vpn_entrypoints admin true)" \
+  "PORTCULLIS_EP_CORE=websecure,vpnsecure
+PORTCULLIS_EP_ADMIN=vpnsecure
+PORTCULLIS_EP_ENROL=websecure,vpnsecure"
+expect_eq "vpn_entrypoints: admin, public enrolment off" "$(vpn_entrypoints admin false)" "$(vpn_entrypoints admin true)"
+expect_eq "vpn_entrypoints: server, public enrolment on" "$(vpn_entrypoints server true)" \
+  "PORTCULLIS_EP_CORE=vpnsecure
+PORTCULLIS_EP_ADMIN=vpnsecure
+PORTCULLIS_EP_ENROL=websecure,vpnsecure"
+expect_eq "vpn_entrypoints: server, public enrolment off" "$(vpn_entrypoints server false)" \
+  "PORTCULLIS_EP_CORE=vpnsecure
+PORTCULLIS_EP_ADMIN=vpnsecure
+PORTCULLIS_EP_ENROL=vpnsecure"
+expect_fail "vpn_entrypoints: an unknown mode" vpn_entrypoints everything true
+
+OUT="$(VT_DOCKER_SUBNETS=$'172.17.0.0/16\n10.213.0.0/24' vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: subnet overlapping a Docker network → refused with a suggestion" \
+  "$RC:$(printf '%s' "$OUT" | grep -c '10.213.0.0/24 (a Docker network)'):$(printf '%s' "$OUT" | grep -c 'Try: ./portcullis vpn init --subnet 10.213.4.0/22')" "1:1:1"
+expect_eq "vpn init: a refusal writes nothing" "$(vte | grep -c 'PORTCULLIS_VPN\|COMPOSE_PROFILES' || true)" 0
+OUT="$(VT_HOSTINFO='{"local_networks":["10.0.0.0/8","10.213.0.0/24"],"provider_ranges":[],"admin_device_seen":false}' vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: overlapping a Local network from hub vpn host-info → refused" \
+  "$RC:$(printf '%s' "$OUT" | grep -c '10.213.0.0/24 (a Local network')" "1:1"
+OUT="$(VT_HOSTINFO='{"local_networks":[],"provider_ranges":["10.213.0.0/16"],"admin_device_seen":false}' vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: overlapping a wired provider's range → refused, no free /22 suggested in it" \
+  "$RC:$(printf '%s' "$OUT" | grep -c "a wired VPN provider's range"):$(printf '%s' "$OUT" | grep -c 'Try:' || true)" "1:1:0"
+OUT="$(vt 'vpn_init on 51820 10.214.0.0/23' 2>&1)"; RC=$?
+expect_eq "vpn init: the reserved link subnet → refused" "$RC:$(printf '%s' "$OUT" | grep -c 'reserved for server links')" "1:1"
+OUT="$(vt 'vpn_init on 51820 172.31.254.0/24' 2>&1)"; RC=$?
+expect_eq "vpn init: portcullis-vpn / -edge → refused" "$RC:$(printf '%s' "$OUT" | grep -c 'a Portcullis VPN network')" "1:2"
+OUT="$(VT_HUB_HEALTH=starting vt 'vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init: the Hub not healthy → refused" "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running")" "1:1"
+
+OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=vpn.example.org\nCOMPOSE_PROFILES=monitoring' vt 'vpn_init on 51820 10.213.0.0/22; vpn_init on 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init writes the keys, adds wg to COMPOSE_PROFILES once" \
+  "$RC:$(vte | grep -cx 'COMPOSE_PROFILES=monitoring,wg'):$(vte | grep -cx 'PORTCULLIS_VPN_BUILTIN=on'):$(vte | grep -cx 'PORTCULLIS_VPN_PORT=51820'):$(vte | grep -cx 'PORTCULLIS_VPN_SUBNET=10.213.0.0/22')" "0:1:1:1:1"
+expect_eq "vpn init: the key generated once (a re-run keeps it), through ct_run in the wg image as the file's owner" \
+  "$(grep -c '^ct_run ' "$WORK/vt/log"):$(grep -c "^ct_run --rm --network none --user $(id -u):10006 --cap-drop ALL --security-opt no-new-privileges:true --read-only --mount type=bind,src=$WORK/vt/root/secrets/wg/people.key,dst=/k --entrypoint /wg portcullis-wg genkey /k\$" "$WORK/vt/log"):$(cat "$WORK/vt/root/secrets/wg/people.key")" "1:1:S0VZ"
+expect_eq "vpn init: the wg image is built before the key, then wg can read it, core.env refreshed, wg + Traefik + Hub started" \
+  "$(grep -E '^(runtime_build_service|ct_run|ct_group_read|hub_env_write|stack_compose_up)' "$WORK/vt/log" | head -n5 | cut -d' ' -f1-2 | tr '\n' ';')" \
+  "runtime_build_service wg;ct_run --rm;ct_group_read 10006;hub_env_write;stack_compose_up wg;"
+expect_eq "vpn init: the wg Prometheus target once the profile is on" "$(jq -c '.[0].targets' "$WORK/vt/root/secrets/monitoring/prometheus/wg-targets.json")" '["wg-metrics:9100"]'
+OUT="$(vt 'vpn_init off 51820 10.213.0.0/22' 2>&1)"; RC=$?
+expect_eq "vpn init --builtin off: no key, PORTCULLIS_VPN_BUILTIN=off, the profile on" \
+  "$RC:$(grep -c '^ct_run' "$WORK/vt/log" || true):$(vte | grep -cx 'PORTCULLIS_VPN_BUILTIN=off'):$(vte | grep -cx 'COMPOSE_PROFILES=wg')" "0:0:1:1"
+expect_eq "vpn_prom_targets: no target without the profile (no TargetDown)" \
+  "$(vt 'vpn_prom_targets; cat "$PORTCULLIS_ROOT/secrets/monitoring/prometheus/wg-targets.json"')" "[]"
+
+OUT="$(vt 'vpn_mode server true false' 2>&1)"; RC=$?
+expect_eq "vpn mode server without an admin device → refused naming --force" \
+  "$RC:$(printf '%s' "$OUT" | grep -c -- '--force'):$(vte | grep -c PORTCULLIS_VPN_MODE || true):$(grep -c stack_compose_up "$WORK/vt/log" || true)" "1:1:0:0"
+OUT="$(VT_HUB_DOWN=1 vt 'vpn_mode admin true false' 2>&1)"; RC=$?
+expect_eq "vpn mode admin with the Hub down → refused naming --force" "$RC:$(printf '%s' "$OUT" | grep -c -- '--force')" "1:1"
+OUT="$(VT_HOSTINFO='{"local_networks":[],"provider_ranges":[],"admin_device_seen":true}' vt 'vpn_mode server false false' 2>&1)"; RC=$?
+expect_eq "vpn mode server with an admin device: mode, enrolment and the classes written, core recreated" \
+  "$RC:$(vte | grep -cxE 'PORTCULLIS_VPN_MODE=server|PORTCULLIS_VPN_PUBLIC_ENROL=false|PORTCULLIS_EP_CORE=vpnsecure|PORTCULLIS_EP_ADMIN=vpnsecure|PORTCULLIS_EP_ENROL=vpnsecure'):$(grep -cx 'stack_compose_up ' "$WORK/vt/log")" "0:5:1"
+OUT="$(VT_HUB_DOWN=1 VT_ENV=$'PORTCULLIS_VPN_MODE=server\nPORTCULLIS_EP_CORE=vpnsecure' vt 'vpn_mode server true true' 2>&1)"; RC=$?
+expect_eq "vpn mode server --force with the Hub down: no check, written" "$RC:$(grep -c 'host-info' "$WORK/vt/log" || true):$(vte | grep -cx 'PORTCULLIS_VPN_MODE=server')" "0:0:1"
+OUT="$(VT_HUB_DOWN=1 VT_ENV=$'PORTCULLIS_VPN_MODE=server\nPORTCULLIS_EP_CORE=vpnsecure\nPORTCULLIS_EP_ADMIN=vpnsecure\nPORTCULLIS_EP_ENROL=vpnsecure' vt 'vpn_mode apps true false' 2>&1)"; RC=$?
+expect_eq "vpn mode apps with wg and hub down → writes and recreates" \
+  "$RC:$(grep -c '^dc exec' "$WORK/vt/log" || true):$(vte | grep -cxE 'PORTCULLIS_VPN_MODE=apps|PORTCULLIS_EP_(CORE|ADMIN|ENROL)=websecure,vpnsecure'):$(grep -cx 'stack_compose_up ' "$WORK/vt/log")" "0:0:4:1"
+
+OUT="$(vt 'vpn_add_device alice laptop' 2>&1)"; RC=$?
+ALL_ARGV="$(cat "$WORK/vt/log" "$WORK/vt/jq" 2>/dev/null)"
+expect_eq "vpn add-device: the private key never on argv" "$RC:$(printf '%s' "$ALL_ARGV" | grep -c "$VPN_PRIV" || true)" "0:0"
+expect_eq "vpn add-device: only the public key on the Hub's stdin" "$(cat "$WORK/vt/stdin")" "$VPN_PUB"
+expect_eq "vpn add-device: the config has AllowedIPs = 10.213.0.1/32" \
+  "$(printf '%s' "$OUT" | grep -cxE 'AllowedIPs = 10\.213\.0\.1/32|Address = 10\.213\.0\.5/32|DNS = 10\.213\.0\.1|PrivateKey = '"$VPN_PRIV"'|Endpoint = vpn\.example\.org:51820|MTU = 1280')" 6
+expect_eq "vpn add-device: the QR code is drawn from the same config on stdin" "$(grep -c '^PrivateKey = ' "$WORK/vt/qr"):$(printf '%s' "$OUT" | grep -cx QR)" "1:1"
+expect_eq "vpn add-device: the Hub call names the user and device" "$(grep -c '^dc exec -T hub hub vpn add-device --user alice --name laptop$' "$WORK/vt/log")" 1
+expect_ok "vpn add-device: keys stay in variables (no temp file, no -v mount)" bash -c "! grep -nE 'mktemp|> *\"?\\\$[a-z]*(key|kp)|--mount' <(sed -n '/^vpn_add_device()/,/^}/p' '$HERE/../scripts/lib/vpn.sh')"
+
+OUT="$(vt 'vpn_builtin off; vpn_builtin on' 2>&1)"; RC=$?
+expect_eq "vpn builtin off empties the key, on makes a new one; wg recreated and restarted (it reads the key at start) both times" \
+  "$RC:$(grep -c '^ct_run' "$WORK/vt/log"):$(grep -c '^dc up -d --no-deps.* wg$' "$WORK/vt/log"):$(grep -c '^dc restart wg$' "$WORK/vt/log"):$(vte | grep -cx 'PORTCULLIS_VPN_BUILTIN=on')" "0:1:2:2:1"
+OUT="$(vt 'printf KEY > "$PORTCULLIS_ROOT/secrets/wg/people.key"; vpn_builtin off; wc -c < "$PORTCULLIS_ROOT/secrets/wg/people.key"' 2>&1)"
+expect_eq "vpn builtin off: the key file emptied in place" "$(printf '%s' "$OUT" | tail -n1 | tr -d ' ')" 0
+
+# status: the vpn block, the textfile gauge.
+SJ="$(vt 'export COMPOSE_PROFILES=wg PORTCULLIS_VPN_MODE=server
+  dc() { case "$*" in
+           "exec -T wg /wg status") printf "{\"version\":1,\"written\":\"%s\",\"mode\":\"server\",\"edge\":{\"ok\":true,\"error\":\"\"},\"people\":null}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ;;
+           "exec -T wg /wg providers") echo "{\"providers\":[{\"id\":\"hs\",\"label\":\"Tailnet\",\"ranges\":[\"100.64.0.0/10\"],\"devices\":3,\"refreshed_at\":null,\"fresh\":false}]}" ;;
+         esac; }
+  vpn_status_json')"
+expect_eq "vpn_status_json: mode, up, providers, no problem while wg is up" \
+  "$(printf '%s' "$SJ" | jq -c '[.enabled, .mode, .up, .problem, (.providers | length), .status.edge.ok]')" '[true,"server",true,false,1,true]'
+SJ="$(vt 'export COMPOSE_PROFILES=wg PORTCULLIS_VPN_MODE=server; dc() { return 1; }; vpn_status_json')"
+expect_eq "vpn_status_json: mode server with wg down → a problem" "$(printf '%s' "$SJ" | jq -c '[.up, .problem]')" '[false,true]'
+SJ="$(vt 'dc() { return 1; }; vpn_status_json')"
+expect_eq "vpn_status_json: apps without wg → not set up, no problem" "$(printf '%s' "$SJ" | jq -c '[.enabled, .mode, .problem]')" '[false,"apps",false]'
+SJ="$( (require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
+        proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
+        vault_admin_env() { return 1; }; dns_status_json() { :; }
+        vpn_status_json() { echo '{"enabled":true,"mode":"admin","public_enrol":true,"up":false,"providers":[],"problem":true}'; }
+        status_run true 2>/dev/null) || true)"
+expect_eq "status --json has vpn{}" "$(printf '%s' "$SJ" | jq -c '[.vpn.mode, .vpn.problem, .ok]')" '["admin",true,false]'
+jq -n '{ok: true, services: [], vault: {active: true}, dns: null, vpn: {mode: "server"}}' > "$STUB_DIR/stf.json"
+expect_eq "status textfile has portcullis_vpn_mode_restricted" "$(stf | grep '^portcullis_vpn_mode_restricted ')" "portcullis_vpn_mode_restricted 1"
+jq -n '{ok: true, services: [], vault: {active: true}, dns: null, vpn: {mode: "apps"}}' > "$STUB_DIR/stf.json"
+expect_eq "status textfile: apps → portcullis_vpn_mode_restricted 0" "$(stf | grep '^portcullis_vpn_mode_restricted ')" "portcullis_vpn_mode_restricted 0"
+
+# Core's headscale leftovers are gone (V14: the template owns them).
+expect_eq "keycloak.sh registers no headscale client" "$(grep -ciE 'headscale|headplane' "$HERE/../scripts/lib/keycloak.sh" || true)" 0
+expect_eq "backup has no headscale-config.yaml" "$(grep -c 'headscale' "$HERE/../scripts/lib/backup.sh" || true)" 0
+expect_eq "no headscale/ directory, nothing in the apps file" "$( [ -e "$HERE/../headscale" ] && echo dir || echo none):$(grep -ciE 'headscale|headplane' "$HERE/../docker-compose.apps.yml" || true)" "none:0"
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
