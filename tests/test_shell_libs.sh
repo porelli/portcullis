@@ -2113,6 +2113,7 @@ expect_eq "dns tool: the token is the apply input's credentials.api_token" "$(dt
 expect_eq "dns tool: the token never reaches the output" "$(printf '%s' "$OUT" | grep -c 'tok-SECRET-123')" 0
 expect_eq "dns setup --yes: plan, apply, the service's main plan refreshed, check" "$(paste -sd' ' "$STUB_DIR/dt/order")" "plan ttl apply refresh check"
 expect_eq "dns setup: apply waits by the stored TTL (--wait auto)" "$(grep -c 'dns-tool apply --wait auto$' "$STUB_DIR/dt/argv")" 1
+expect_eq "dns setup: no 3 min cap (the operator runs it on purpose)" "$(grep -c -- '--wait-max' "$STUB_DIR/dt/argv" || true)" 0
 expect_eq "dns setup: the default sets are address and caa" "$(dtin apply '.sets | join(",")')" "address,caa"
 expect_eq "dns setup: the input's snake_case keys" "$(dtin apply '[keys[]] | join(",")')" "ca_server,caa,credentials,ipv4,ipv6,mail_from,name,nomail,provider,sets"
 expect_eq "dns setup: caa block" "$(dtin apply '.caa | [.enabled, .account_uri, .issuer] | @json')" '[true,"",""]'
@@ -2250,7 +2251,7 @@ OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_tight
 expect_eq "tighten: writes main-domain.env" "$(cat "$PORTCULLIS_ROOT/secrets/domains/main-domain.env")" "DOMAINS_MAIN_ACME_ACCOUNT_URI=https://acme-v02.api.letsencrypt.org/acme/acct/77"
 expect_eq "tighten: main-domain.env is 0600" "$(file_mode "$PORTCULLIS_ROOT/secrets/domains/main-domain.env")" 600
 expect_eq "tighten: domains recreated for the new env file" "$(grep -c ' up -d domains$' "$STUB_DIR/dt/argv")" 1
-expect_eq "tighten: waits by the stored TTL (--wait auto, no --settle)" "$(grep -c 'dns-tool apply --wait auto$' "$STUB_DIR/dt/argv")" 1
+expect_eq "tighten: waits by the stored TTL (--wait auto, capped at 3 min, no --settle)" "$(grep -c 'dns-tool apply --wait auto --wait-max 3m$' "$STUB_DIR/dt/argv")" 1
 expect_eq "tighten: pins when live differs (check, then apply caa with Traefik's URI)" \
   "$(paste -sd' ' "$STUB_DIR/dt/order"):$(dtin apply '[.sets, .caa.account_uri] | @json')" \
   'check apply refresh:[["caa"],"https://acme-v02.api.letsencrypt.org/acme/acct/77"]'
@@ -2277,6 +2278,10 @@ OUT="$(dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_tight
 case "$OUT" in *"could not"*) t_fail "tighten timeout reads as a failure: $OUT" ;;
   *"The CAA pin of ci.example.org written; not yet stable at 8.8.8.8, 1.1.1.1: they may serve the old records for up to 5 min 24 s more (until 08:11 UTC)"*rc=0) t_pass "tighten: a wait timeout says written, not yet stable where, and for how long" ;;
   *) t_fail "tighten timeout: $OUT" ;; esac
+# Ruling (concern 2): the tighten isn't a safety step, so `up` is never held
+# 15 min by it: its wait is capped at 3 min (--wait-max 3m), and reaching
+# the cap is success. dns setup keeps the 15 min cap.
+expect_eq "tighten: the stability wait is capped at 3 min" "$(grep -c 'dns-tool apply --wait auto --wait-max 3m$' "$STUB_DIR/dt/argv")" 1
 rm -f "$STUB_DIR/dt/rc-apply" "$STUB_DIR/dt/out-apply"
 # The refresh is best effort: the domains service down only skips it.
 touch "$STUB_DIR/dt/refresh-fail"

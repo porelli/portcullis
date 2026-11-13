@@ -689,3 +689,43 @@ func TestToolSettleBeyondCapCauses(t *testing.T) {
 		t.Fatalf("(c) %+v %s", *w, errs)
 	}
 }
+
+// Ruling on concern 2: the tighten (not a safety step) caps its stability
+// wait with --wait-max 3m; on reaching it the records were written, not yet
+// stable. --wait-max needs --wait auto and never goes with --settle.
+func TestToolWaitMax(t *testing.T) {
+	f := newToolFixture(t)
+	f.deleteMode = "porkbun"
+	pinAt(f.zone, oldAcct, 600*time.Second)
+	fl := newFlapper(t, 0)
+	fl.fresh = 600 * time.Second
+	pinAt(fl.stale, newAcct, 600*time.Second)
+	c := useVirtualClock(t)
+	c.onSleep = func(d time.Duration) { fl.step(f.zone, d) }
+	f.resolvers = append(f.resolvers, fl.addr)
+	code, out, errs := f.run([]string{"apply", "--wait", "auto", "--wait-max", "3m"}, toolJSON(caaOnly(newAcct)))
+	w := decodeApply(t, out).Wait
+	if code != exitProblem || w.Visible || w.Waited != 180 || w.Limit > 180 {
+		t.Fatalf("--wait-max 3m, a resolver re-serving the old pin = %d %+v %s: want stopped at 180 s", code, *w, errs)
+	}
+	if !strings.Contains(errs, "waiting up to 3m0s") || !strings.Contains(errs, "written; not yet stable at "+fl.addr) {
+		t.Fatalf("stderr %q", errs)
+	}
+	// Records stable at once: done at 30 s as without it.
+	f2 := newToolFixture(t)
+	code, out, _ = f2.run([]string{"apply", "--wait", "auto", "--wait-max", "3m"}, toolJSON(caaOnly(newAcct)))
+	if w := decodeApply(t, out).Wait; code != exitOK || w.Waited != 30 {
+		t.Fatalf("--wait-max 3m, stable at once = %d %+v", code, *w)
+	}
+	for _, args := range [][]string{
+		{"apply", "--wait", "auto", "--wait-max", "3m", "--settle"},
+		{"apply", "--wait", "60s", "--wait-max", "3m"},
+		{"apply", "--wait-max", "3m"},
+		{"apply", "--wait", "auto", "--wait-max", "soon"},
+		{"apply", "--wait", "auto", "--wait-max", "20m"},
+	} {
+		if code, _, _ := f.run(args, toolJSON(caaOnly(newAcct))); code != exitUsage {
+			t.Errorf("%v = %d, want usage", args, code)
+		}
+	}
+}

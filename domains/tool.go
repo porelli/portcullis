@@ -2,7 +2,7 @@ package main
 
 // One-shot subcommands of the domains image (contract §12.1):
 //
-//	domains dns plan|apply [--wait auto|<dur>] [--settle [--settle-after <unix>]]|ttl|check|dnssec-enable
+//	domains dns plan|apply [--wait auto [--wait-max <dur>]|<dur>] [--settle [--settle-after <unix>]]|ttl|check|dnssec-enable
 //	    the main domain's DNS plan, run by ./portcullis as the compose
 //	    service dns-tool (egress only, no volumes, no environment). Input:
 //	    one JSON object on stdin — the provider credentials only ever
@@ -93,7 +93,7 @@ func resolversFromEnv() []string {
 // runDNSTool is `domains dns <args>`.
 func runDNSTool(args []string, e toolEnv) int {
 	usage := func(msg string) int {
-		fmt.Fprintf(e.stderr, "domains dns: %s\nusage: domains dns plan|apply [--wait auto|<duration>] [--settle [--settle-after <unix>]]|ttl|check|dnssec-enable  (input: one JSON object on stdin)\n", msg)
+		fmt.Fprintf(e.stderr, "domains dns: %s\nusage: domains dns plan|apply [--wait auto [--wait-max <duration>]|<duration>] [--settle [--settle-after <unix>]]|ttl|check|dnssec-enable  (input: one JSON object on stdin)\n", msg)
 		return exitUsage
 	}
 	if len(args) == 0 {
@@ -128,6 +128,12 @@ func runDNSTool(args []string, e toolEnv) int {
 					wait.auto, wait.fixed = false, d
 				}
 				rest = rest[2:]
+			case rest[0] == "--wait-max" && len(rest) >= 2:
+				d, err := time.ParseDuration(rest[1])
+				if err != nil || d <= 0 || d > waitCap {
+					return usage("--wait-max needs a duration up to " + waitCap.String())
+				}
+				wait.max, rest = d, rest[2:]
 			default:
 				return usage("unexpected argument " + rest[0])
 			}
@@ -137,6 +143,10 @@ func runDNSTool(args []string, e toolEnv) int {
 		}
 		if wait.settleAfter > 0 && !wait.settle {
 			return usage("--settle-after needs --settle")
+		}
+		// A settle wait is a safety step: never shortened.
+		if wait.max > 0 && (!wait.auto || wait.settle) {
+			return usage("--wait-max needs --wait auto and no --settle")
 		}
 	default:
 		return usage("unknown subcommand " + sub)

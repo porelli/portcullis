@@ -396,8 +396,11 @@ dns_tighten_main() {
   [ "$poll" = true ] || return 0
   _dns_caa_live_ok "$uri" && return 0
   info "Pinning the CAA of $PORTCULLIS_DOMAIN to Traefik's ACME account..."
+  # Not a safety step: `up` / `upgrade` / `init` are never held long by it.
+  # The stability wait is capped at 3 min; reaching it is success (status
+  # may show the CAA not yet as planned until the plan's next rebuild).
   local out rc=0
-  out="$(_dns_caa_apply "$uri")" || rc=$?
+  out="$(_dns_caa_apply "$uri" --wait-max 3m)" || rc=$?
   case "$rc" in
     0) ok "CAA of $PORTCULLIS_DOMAIN pinned to $uri"; _dns_relax_repin ;;
     1) warn "$(_dns_wait_text "$out" "The CAA pin of $PORTCULLIS_DOMAIN"). Nothing to do: ./portcullis status shows it as planned once those caches have cleared."; _dns_relax_repin ;;

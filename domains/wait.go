@@ -90,12 +90,23 @@ type applyOutput struct {
 	Wait *waitReport `json:"wait,omitempty"`
 }
 
-// waitOpts: --wait auto | <duration>, --settle, --settle-after <unix>.
+// waitOpts: --wait auto | <duration>, --wait-max <duration> (auto
+// only, never with --settle: the tighten's 3 min, so `up` isn't held by a
+// step that isn't a safety one), --settle, --settle-after <unix>.
 type waitOpts struct {
 	auto        bool
 	fixed       time.Duration
+	max         time.Duration
 	settle      bool
 	settleAfter int64
+}
+
+// cap: the longest an auto wait runs (waitCap, or --wait-max).
+func (o waitOpts) cap() time.Duration {
+	if o.max > 0 {
+		return min(o.max, waitCap)
+	}
+	return waitCap
 }
 
 func (o waitOpts) on() bool { return o.auto || o.fixed > 0 }
@@ -103,7 +114,7 @@ func (o waitOpts) on() bool { return o.auto || o.fixed > 0 }
 // ctxBudget: the longest the wait can take.
 func (o waitOpts) ctxBudget() time.Duration {
 	if o.auto {
-		return waitCap
+		return o.cap()
 	}
 	return o.fixed
 }
@@ -198,11 +209,11 @@ func waitApplied(ctx context.Context, e toolEnv, build func(dnsplan.Input) dnspl
 	start := toolNow()
 	limit := o.fixed
 	if o.auto {
-		limit = min(ttl+waitMargin, waitCap)
+		limit = min(ttl+waitMargin, o.cap())
 	}
 	deadline, hardStop := start.Add(limit), start.Add(limit)
 	if o.auto {
-		hardStop = start.Add(waitCap)
+		hardStop = start.Add(o.cap())
 	}
 	settleAt := settlePoint(o, ttl, writtenAt, changed)
 	cause := "ttl"
@@ -335,7 +346,7 @@ func earliest(a, b time.Time) time.Time {
 func progressMessage(o waitOpts, ttl time.Duration, resolvers []string, writtenAt time.Time, changed bool) string {
 	limit := o.fixed
 	if o.auto {
-		limit = min(ttl+waitMargin, waitCap)
+		limit = min(ttl+waitMargin, o.cap())
 	}
 	return fmt.Sprintf("domains dns apply: written; waiting up to %s for %s (TTL %d s); written_at=%d settle_at=%d",
 		limit, strings.Join(resolvers, ", "), secs(ttl), writtenAt.Unix(), settlePoint(o, ttl, writtenAt, changed).Unix())
