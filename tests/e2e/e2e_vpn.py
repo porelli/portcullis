@@ -233,10 +233,10 @@ def tunnel_hold(conf: str, hold: str = "60s") -> subprocess.Popen:
 
 TS_HOLD = r"""
 import json, socket, ssl, struct, sys, time
-host, hold = sys.argv[1], float(sys.argv[2])
+host, ip, hold = sys.argv[1], sys.argv[2], float(sys.argv[3])
 s = socket.create_connection(("127.0.0.1", 1055), 10)
 s.sendall(b"\x05\x01\x00"); assert s.recv(2) == b"\x05\x00"
-s.sendall(b"\x05\x01\x00\x03" + bytes([len(host)]) + host.encode() + struct.pack("!H", 443))
+s.sendall(b"\x05\x01\x00\x01" + socket.inet_aton(ip) + struct.pack("!H", 443))
 r = s.recv(4); assert r[1] == 0, r
 s.recv({1: 6, 4: 18}[r[3]] if r[3] in (1, 4) else s.recv(1)[0] + 2)
 ctx = ssl.create_default_context(cafile="/ca.pem")
@@ -266,7 +266,7 @@ print(json.dumps({"status": status, "closed": closed, "held_s": time.time() - t0
 def ts_hold(node: str, hold: int = 60) -> subprocess.Popen:
     """The same through node's tailscaled (SOCKS5) and the gateway."""
     return subprocess.Popen(["docker", "run", "--rm", "-i", "--network", f"container:ts-{node}", "-v",
-                             f"{os.path.abspath(CA)}:/ca.pem:ro", PY_IMG, "python3", "-c", TS_HOLD, ECHO, str(hold)],
+                             f"{os.path.abspath(CA)}:/ca.pem:ro", PY_IMG, "python3", "-c", TS_HOLD, ECHO, ts_ip(node), str(hold)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
@@ -293,17 +293,35 @@ def hs_edge_port() -> int:
     return next(x["edge_port"] for x in json.loads(vpn_json)["providers"] if x["id"] == HS)
 
 
+TAILNET_IP_RE = re.compile(r"\b100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.\d{1,3}\.\d{1,3}\b")
+
+
+def ts_ip(node: str, host: str = ECHO) -> str:
+    """host's tailnet address as node's MagicDNS answers it (the vpn-dns
+    hook's extra records → the gateway). tailscaled's SOCKS5 can't be left
+    to resolve it: with --accept-dns=false its dialer knows node names only
+    and falls back to the container's resolver (the runner's /etc/hosts:
+    127.0.0.1)."""
+    rc, out = sh("docker", "exec", f"ts-{node}", "tailscale", "--socket=/tmp/ts.sock", "dns", "query", host)
+    # Never quad-100 (MagicDNS's own resolver address) if it is printed.
+    ips = [x for x in TAILNET_IP_RE.findall(out) if x != "100.100.100.100"] if rc == 0 else []
+    assert ips, f"MagicDNS for {host} on ts-{node}: {out[-300:]}"
+    return ips[0]
+
+
 def ts_get(node: str, host: str = ECHO, path: str = "/", cookie_file: str | None = None) -> tuple[int, str]:
-    """A request through node's tailscaled (its SOCKS5 proxy, in its netns),
-    the hostname resolved by tailscaled (MagicDNS extra records)."""
+    """A request through node's tailscaled (its SOCKS5 proxy, in its netns)
+    to the tailnet address MagicDNS gives host (ts_ip); TLS and Host stay
+    host."""
+    ip = ts_ip(node, host)
     vols = ["-v", f"{os.path.abspath(CA)}:/ca.pem:ro"]
     hdr = []
     if cookie_file:
         vols += ["-v", f"{cookie_file}:/h:ro"]
         hdr = ["-H", "@/h"]
     rc, out = sh("docker", "run", "--rm", "--network", f"container:ts-{node}", *vols, CURL_IMG,
-                 "-s", "-o", "-", "-w", "\n%{http_code}", "--max-time", "20", "--socks5-hostname", "127.0.0.1:1055",
-                 "--cacert", "/ca.pem", *hdr, f"https://{host}{path}", timeout=60)
+                 "-s", "-o", "-", "-w", "\n%{http_code}", "--max-time", "20", "--socks5", "127.0.0.1:1055",
+                 "--resolve", f"{host}:443:{ip}", "--cacert", "/ca.pem", *hdr, f"https://{host}{path}", timeout=60)
     body, _, code = out.rpartition("\n")
     return int(code) if code.isdigit() else 0, body
 
