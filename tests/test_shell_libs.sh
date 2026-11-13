@@ -2736,6 +2736,27 @@ case "$(cat "$WORK/vx-out")" in
   *) t_fail "Vault API wait error: $(tail -n 5 "$WORK/vx-out")" ;;
 esac
 
+# ── a failed `up` names each unhealthy container with its last health checks ──
+mkdir -p "$WORK/hcbin"
+{ printf '#!/usr/bin/env bash\n'; cat "$WORK/stub-version"; cat <<'STUB'
+case "$*" in
+  "compose --project-directory "*" up "*) exit 1 ;;
+  "compose --project-directory "*" ps -aq") printf 'c1\nc2\n' ;;
+  "inspect --format {{.Name}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} c1") echo "/portcullis-keycloak-1 unhealthy" ;;
+  "inspect --format {{.Name}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} c2") echo "/portcullis-vault-1 healthy" ;;
+  "inspect --format {{json .State.Health.Log}} c1") echo '[{"ExitCode":1,"Output":"old"},{"ExitCode":1,"Output":"a\n b"},{"ExitCode":1,"Output":"bash: connect: Connection refused\n"},{"ExitCode":-1,"Output":"timed out"}]' ;;
+esac
+exit 0
+STUB
+} > "$WORK/hcbin/docker"
+chmod +x "$WORK/hcbin/docker"
+HC_OUT="$( (PATH="$WORK/hcbin:$PATH"; CONTAINER_RUNTIME=docker; stack_compose_up keycloak; echo "rc=$?") 2>&1)"
+case "$HC_OUT" in
+  *"portcullis-keycloak-1 is unhealthy; its last health checks:"*"exit 1: a b"*"exit 1: bash: connect: Connection refused"*"exit -1: timed out"*"rc=1") t_pass "stack_compose_up: a failed up prints each unhealthy container's last three health checks" ;;
+  *) t_fail "stack_compose_up health report: $HC_OUT" ;;
+esac
+case "$HC_OUT" in *vault-1*|*"exit 1: old"*) t_fail "stack_compose_up health report: a healthy container or an old check listed: $HC_OUT" ;; *) t_pass "stack_compose_up health report: healthy containers and older checks left out" ;; esac
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

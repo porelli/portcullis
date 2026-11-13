@@ -6284,7 +6284,39 @@ jobs:
             case "$name" in portcullis-*-*) docker logs "$c" > "e2e-artifacts/apps/$name.log" 2>&1 || true ;; esac
           done
           podman info > e2e-artifacts/podman-info.txt 2>&1 || true
-          journalctl --user -n 300 --no-pager > e2e-artifacts/user-journal.txt 2>&1 || true
+          journalctl --user -n 5000 --no-pager > e2e-artifacts/user-journal.txt 2>&1 || true
+          # Every container's health (status, streak, the last checks' exit
+          # codes and output), also into the run log; podman logs of each
+          # container that isn't healthy.
+          for c in $(docker ps -aq 2>/dev/null); do
+            name="$(docker inspect -f '{{.Name}}' "$c" | tr -d /)"
+            h="$(docker inspect -f '{{json .State.Health}}' "$c" 2>/dev/null || echo null)"
+            printf '%s %s\n' "$name" "$h" >> e2e-artifacts/health.txt
+            st="$(printf '%s' "$h" | jq -r '.Status // "none"' 2>/dev/null || echo none)"
+            case "$st" in healthy|none) ;; *)
+              echo "::group::$name is $st"
+              printf '%s' "$h" | jq -r '"failing streak \(.FailingStreak)", ((.Log // [])[-5:][] | "  \(.Start) exit \(.ExitCode): \(.Output | .[0:400])")' 2>/dev/null || printf '%s\n' "$h"
+              docker inspect -f '{{json .Config.Healthcheck}}' "$c" 2>/dev/null || true
+              echo "::endgroup::"
+              podman logs --tail 200 "$c" > "e2e-artifacts/podman-logs-$name.txt" 2>&1 || true ;;
+            esac
+          done
+          # Keycloak's probe by hand (its compose healthcheck), and its
+          # readiness from the runner through the CI-only :9000 publish.
+          kc="$(docker compose ps -q keycloak 2>/dev/null | head -n1)"
+          if [ -n "$kc" ]; then
+            {
+              echo "== /etc/hosts"; docker exec "$kc" cat /etc/hosts
+              echo "== the healthcheck, by hand (rc, seconds)"
+              t0=$SECONDS
+              timeout 15 docker exec "$kc" bash -c "{ printf 'HEAD /health/ready HTTP/1.0\\r\\n\\r\\n' >&0; grep 'HTTP/1.0 200'; } 0<>/dev/tcp/localhost/9000"; echo "rc=$? $((SECONDS - t0))s"
+              echo "== the same against 127.0.0.1"
+              timeout 15 docker exec "$kc" bash -c "{ printf 'HEAD /health/ready HTTP/1.0\\r\\n\\r\\n' >&0; cat; } 0<>/dev/tcp/127.0.0.1/9000"; echo "rc=$?"
+              echo "== GET /health/ready from the runner"
+              curl -s -m 10 -i http://127.0.0.1:9000/health/ready; echo
+            } > e2e-artifacts/keycloak-probe.txt 2>&1 || true
+            cat e2e-artifacts/keycloak-probe.txt
+          fi
 
       - name: Upload logs
         timeout-minutes: 10

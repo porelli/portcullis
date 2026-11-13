@@ -386,12 +386,33 @@ runtime_no_build() {
 # stack_compose_up [service...] — `dc up -d` with the local images built:
 # docker → --build, podman → runtime_build_local, then --no-build.
 stack_compose_up() {
+  local rc=0
   if _rt_is_podman; then
     runtime_build_local
-    dc up -d --no-build "$@"
+    dc up -d --no-build "$@" || rc=$?
   else
-    dc up -d --build "$@"
+    dc up -d --build "$@" || rc=$?
   fi
+  [ "$rc" -eq 0 ] || { compose_health_report; return "$rc"; }
+}
+
+# compose_health_report — after a failed `up`: each core container whose
+# health is not healthy, with the exit code and output of its last three
+# health checks (on stderr; outputs flattened and clipped to 300
+# characters). Health checks print probe answers (HTTP status lines,
+# `vault status`, PING replies), never a secret. Best effort, never fails.
+compose_health_report() {
+  local cid name st
+  for cid in $(dc ps -aq 2>/dev/null); do
+    read -r name st < <(docker inspect --format '{{.Name}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null) || continue
+    case "$st" in
+      unhealthy|starting)
+        warn "${name#/} is $st; its last health checks:"
+        docker inspect --format '{{json .State.Health.Log}}' "$cid" 2>/dev/null \
+          | jq -r '(. // [])[-3:][] | "    exit \(.ExitCode): \((.Output // "") | gsub("\\s+"; " ") | .[0:300])"' >&2 2>/dev/null || true ;;
+    esac
+  done
+  return 0
 }
 
 # runtime_status_json — {name, version, rootless, uid, subuid_start,
