@@ -2709,6 +2709,33 @@ done < <(sed -n 's/.*type: bind, source: *\([^,}]*\).*/\1/p' "$HERE/../docker-co
 expect_eq "every SELinux-overlay bind source is in git or made by stack_prepare" "$SPX_MISSING" ""
 expect_eq "the overlay has bind sources to check" "$(grep -c 'type: bind, source:' "$HERE/../docker-compose.podman-selinux.yml" | awk '{print ($1 >= 45)}')" 1
 
+# ── vexec: VAULT_TOKEN by name only while it is in the environment (Podman's
+# compat exec refuses a bare name: 400 "badly formed, must be key=value") ──
+mkdir -p "$WORK/vxbin"
+{ printf '#!/usr/bin/env bash\n'; cat "$WORK/stub-version"; cat <<'STUB'
+echo "$*" >> "$STUB_DIR/vx-calls"
+case "$*" in
+  *" exec "*) echo "Error response from daemon: environment variable \"X\" badly formed, must be key=value" >&2; exit 1 ;;
+esac
+exit 0
+STUB
+} > "$WORK/vxbin/docker"
+chmod +x "$WORK/vxbin/docker"
+vx() { rm -f "$STUB_DIR/vx-calls"; (PATH="$WORK/vxbin:$PATH"; unset VAULT_TOKEN; eval "$1") >"$WORK/vx-out" 2>&1; sed 's/--project-directory [^ ]* //' "$STUB_DIR/vx-calls"; }
+expect_eq "vexec: VAULT_TOKEN unset → no -e VAULT_TOKEN" "$(vx 'vexec status -format=json')" "compose exec -T vault vault status -format=json"
+expect_eq "vexec: VAULT_TOKEN only a shell variable (not exported) → no -e VAULT_TOKEN" "$(vx 'VAULT_TOKEN=s3cr3t-tok; vexec status')" "compose exec -T vault vault status"
+expect_eq "vexec: VAULT_TOKEN exported → -e VAULT_TOKEN by name, the value never on argv" \
+  "$(vx 'export VAULT_TOKEN=s3cr3t-tok; vexec status')" "compose exec -T -e VAULT_TOKEN vault vault status"
+expect_eq "the container vault CLI wrapper: the same rule" \
+  "$(vx 'export VAULT_TOKEN=s3cr3t-tok; command() { [ "$2" = vault ] && return 1; builtin command "$@"; }; vault_use_container_cli; vault read x; unset VAULT_TOKEN; vault read y')" \
+  "compose exec -T -e VAULT_TOKEN vault vault read x
+compose exec -T vault vault read y"
+vx 'sleep() { :; }; _vault_start_and_status' >/dev/null
+case "$(cat "$WORK/vx-out")" in
+  *"vault status (exit 1) said:"*"badly formed, must be key=value"*"Vault API did not come up"*) t_pass "the Vault API wait prints the last vault status error when it gives up" ;;
+  *) t_fail "Vault API wait error: $(tail -n 5 "$WORK/vx-out")" ;;
+esac
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
