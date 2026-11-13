@@ -119,6 +119,12 @@ _vpn_hub_wait() {
   done
 }
 
+# _vpn_hub_ready — wait for the Hub as _vpn_hub_wait does, for a call
+# that doesn't need host-info's answer (add-device, devices, revoke).
+_vpn_hub_ready() {
+  _vpn_hub_wait >/dev/null
+}
+
 # _vpn_host_info — the Hub's `hub vpn host-info` JSON (Local networks,
 # provider ranges, admin_device_seen), or exit 1 when the Hub doesn't answer.
 _vpn_host_info() {
@@ -420,7 +426,7 @@ vpn_init() {
 vpn_mode() {
   local mode="$1" pe="$2" force="$3" info line
   if [ "$mode" != apps ] && [ "$force" != true ]; then
-    info="$(_vpn_host_info)" || fail "the Hub didn't answer (hub vpn host-info): can't check for an administrator's VPN device. Start it, or pass --force"
+    info="$(_vpn_hub_wait)" || fail "can't check for an administrator's VPN device without the Hub: start it (./portcullis up), or pass --force"
     if [ "$(printf '%s' "$info" | jq -r '.admin_device_seen == true' 2>/dev/null)" != true ]; then
       fail "no administrator's VPN device was online in the last 10 minutes: in $mode mode the admin surfaces answer only over the VPN, so you could lock yourself out. Connect a device (./portcullis vpn add-device <you> <name>) and run this again, or pass --force (break-glass: ./portcullis vpn mode apps)"
     fi
@@ -459,6 +465,7 @@ vpn_builtin() {
 vpn_add_device() {
   local user="$1" name="$2" kp pub cfg conf
   [ -n "$(dc ps -q --status running wg 2>/dev/null)" ] || fail "wg isn't running: ./portcullis vpn init first"
+  _vpn_hub_ready || exit 1  # before the key pair: _vpn_hub_wait printed why
   kp="$(dc exec -T wg /wg keypair)" || fail "wg keypair failed"
   pub="$(KP="$kp" jq -rn 'env.KP | fromjson | .public_key')" || { unset kp; fail "wg keypair: unexpected output"; }
   cfg="$(printf '%s\n' "$pub" | _vpn_hub add-device --user "$user" --name "$name")" \
@@ -477,6 +484,7 @@ vpn_devices() {
   local user="$1" json="$2" out
   local -a args=()
   [ -z "$user" ] || args=(--user "$user")
+  _vpn_hub_ready || exit 1
   out="$(_vpn_hub devices "${args[@]}")" || fail "the Hub didn't list the devices (is it running?)"
   if [ "$json" = true ]; then printf '%s\n' "$out"; return 0; fi
   printf '%s' "$out" | jq -r '
@@ -488,6 +496,7 @@ vpn_devices() {
 }
 
 vpn_revoke() {
+  _vpn_hub_ready || exit 1
   _vpn_hub revoke "$1" || fail "the Hub didn't remove device $1"
   ok "Removed VPN device $1."
 }

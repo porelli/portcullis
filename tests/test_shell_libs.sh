@@ -3662,8 +3662,15 @@ expect_eq "vpn_prom_targets: no target without the profile (no TargetDown)" \
 OUT="$(vt 'vpn_mode server true false' 2>&1)"; RC=$?
 expect_eq "vpn mode server without an admin device → refused naming --force" \
   "$RC:$(printf '%s' "$OUT" | grep -c -- '--force'):$(vte | grep -c PORTCULLIS_VPN_MODE || true):$(grep -c stack_compose_up "$WORK/vt/log" || true)" "1:1:0:0"
-OUT="$(VT_HUB_DOWN=1 vt 'vpn_mode admin true false' 2>&1)"; RC=$?
-expect_eq "vpn mode admin with the Hub down → refused naming --force" "$RC:$(printf '%s' "$OUT" | grep -c -- '--force')" "1:1"
+OUT="$(VT_HUB_DOWN=1 VPN_HUB_WAIT=1 vt 'vpn_mode admin true false' 2>&1)"; RC=$?
+expect_eq "vpn mode admin with the Hub not answering → refused after the wait, naming --force, nothing written" \
+  "$RC:$(printf '%s' "$OUT" | grep -c "didn't answer hub vpn host-info within 1 s"):$(printf '%s' "$OUT" | grep -c -- '--force'):$(vte | grep -c PORTCULLIS_VPN_MODE || true)" "1:1:1:0"
+OUT="$(VT_HUB_HEALTH=starting VT_HUB_ANSWER_AFTER=3 VT_HOSTINFO='{"local_networks":[],"provider_ranges":[],"admin_device_seen":true}' vt 'vpn_mode admin true false' 2>&1)"; RC=$?
+expect_eq "vpn mode admin: a starting Hub that answers on the third try → waited for, mode written" \
+  "$RC:$(grep -c 'hub vpn host-info' "$WORK/vt/log"):$(vte | grep -cx 'PORTCULLIS_VPN_MODE=admin')" "0:3:1"
+OUT="$(VT_HUB_HEALTH=exited vt 'vpn_mode admin true false' 2>&1)"; RC=$?
+expect_eq "vpn mode admin: no Hub (exited) → refused at once, naming --force" \
+  "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running (state: exited)"):$(printf '%s' "$OUT" | grep -c -- '--force'):$(cat "$WORK/vt/log" 2>/dev/null | grep -c 'host-info' || true)" "1:1:1:0"
 OUT="$(VT_HOSTINFO='{"local_networks":[],"provider_ranges":[],"admin_device_seen":true}' vt 'vpn_mode server false false' 2>&1)"; RC=$?
 expect_eq "vpn mode server with an admin device: mode, enrolment and the classes written, core recreated" \
   "$RC:$(vte | grep -cxE 'PORTCULLIS_VPN_MODE=server|PORTCULLIS_VPN_PUBLIC_ENROL=false|PORTCULLIS_EP_(CORE|ADMIN|ENROL)=vpnsecure|PORTCULLIS_WEB_(CORE|ADMIN|ENROL)=parked'):$(grep -cx 'stack_compose_up ' "$WORK/vt/log")" "0:8:1"
@@ -3681,8 +3688,21 @@ expect_eq "vpn add-device: the config has AllowedIPs = 10.213.0.1/32" \
   "$(printf '%s' "$OUT" | grep -cxE 'AllowedIPs = 10\.213\.0\.1/32|Address = 10\.213\.0\.5/32|DNS = 10\.213\.0\.1|PrivateKey = '"$VPN_PRIV"'|Endpoint = vpn\.example\.org:51820|MTU = 1280')" 6
 expect_eq "vpn add-device: the QR code is drawn from the same config on stdin" "$(grep -c '^PrivateKey = ' "$WORK/vt/qr"):$(printf '%s' "$OUT" | grep -cx QR)" "1:1"
 expect_eq "vpn add-device: the Hub call names the user and device" "$(grep -c '^dc exec -T -u 10001:10001 hub hub vpn add-device --user alice --name laptop$' "$WORK/vt/log")" 1
-expect_eq "vpn add-device: the Hub call is hub vpn as uid 10001 (the Hub's control socket is 0600, its own)" \
-  "$(grep -c '^dc exec .*hub hub vpn' "$WORK/vt/log"):$(grep -c '^dc exec -T -u 10001:10001 hub hub vpn ' "$WORK/vt/log")" "1:1"
+expect_eq "vpn add-device: the Hub calls (host-info readiness, add-device) are hub vpn as uid 10001 (the Hub's control socket is 0600, its own)" \
+  "$(grep -c '^dc exec .*hub hub vpn' "$WORK/vt/log"):$(grep -c '^dc exec -T -u 10001:10001 hub hub vpn ' "$WORK/vt/log")" "2:2"
+# Every vpn subcommand that calls the Hub waits for it the same way
+# (_vpn_hub_wait): a starting Hub is waited for, a stopped one refused at
+# once — before wg makes a key pair.
+for c in 'vpn_add_device alice laptop' 'vpn_devices "" false' 'vpn_revoke b1'; do
+  OUT="$(VT_HUB_HEALTH=starting VT_HUB_ANSWER_AFTER=2 vt "$c" 2>&1)"; RC=$?
+  expect_eq "$c: a starting Hub → host-info until it answers, then the call" \
+    "$RC:$(grep -c 'hub vpn host-info' "$WORK/vt/log"):$(grep -cE 'hub vpn (add-device|devices|revoke)' "$WORK/vt/log")" "0:2:1"
+  OUT="$(VT_HUB_HEALTH=missing vt "$c" 2>&1)"; RC=$?
+  expect_eq "$c: no Hub → refused at once, no Hub call, no key pair" \
+    "$RC:$(printf '%s' "$OUT" | grep -c "the Hub isn't running (state: missing)"):$(cat "$WORK/vt/log" 2>/dev/null | grep -cE 'hub vpn|wg keypair' || true)" "1:1:0"
+done
+expect_eq "vpn.sh: host-info is read only through _vpn_hub_wait" \
+  "$(grep -c '_vpn_host_info' "$HERE/../scripts/lib/vpn.sh"):$(sed -n '/^_vpn_hub_wait()/,/^}/p' "$HERE/../scripts/lib/vpn.sh" | grep -c '_vpn_host_info')" "3:1"
 expect_eq "vpn.sh: the Hub is reached only through _vpn_hub" \
   "$(grep -cE 'exec [^|]*hub hub ' "$HERE/../scripts/lib/vpn.sh")" 1
 expect_ok "vpn add-device: keys stay in variables (no temp file, no -v mount)" bash -c "! grep -nE 'mktemp|> *\"?\\\$[a-z]*(key|kp)|--mount' <(sed -n '/^vpn_add_device()/,/^}/p' '$HERE/../scripts/lib/vpn.sh')"
