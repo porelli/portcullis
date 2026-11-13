@@ -200,7 +200,7 @@ status_run() {
   dns_json="$(dns_status_json)"
   [ -z "$dns_json" ] || traefik_uri="$(dns_traefik_account_uri)" || traefik_uri=""
   local env_uri
-  env_uri="$(dns_main_env_uri)"
+  env_uri="$(dns_main_env_uri)" || env_uri=""
   dns_json="$(_st_dns_json "$dns_json" "$traefik_uri" "$env_uri")"
   if [ -n "$dns_json" ] && [ "$(printf '%s' "$dns_json" | jq '[.main.problems, (.domains[] | .problems)] | add')" != 0 ]; then
     problems=1

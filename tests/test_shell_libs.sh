@@ -2278,6 +2278,19 @@ expect_eq "textfile: no portcullis_dnssec_state for an empty state" "$(stf | gre
   'portcullis_dnssec_state{name="team-b.test",state="bogus"} 1'
 jq -n '{ok: true, services: [], vault: {active: true}, dns: null}' > "$STUB_DIR/stf.json"
 expect_eq "textfile: no dns series without the report" "$(stf | grep -c '^portcullis_dns' || true)" 0
+# CI 43341512316: without main-domain.env, dns_main_env_uri must not fail
+# under `set -euo pipefail` (status printed nothing and exited).
+rm -f "$PORTCULLIS_ROOT/secrets/domains/main-domain.env"
+expect_eq "dns_main_env_uri without the file: nothing, exit 0 under set -euo pipefail" \
+  "$(dt 'set -euo pipefail; u="$(dns_main_env_uri)"; echo "got:$u"')" "got:
+rc=0"
+SJ="$(dt "set -euo pipefail; require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
+        proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
+        vault_admin_env() { return 1; }
+        dns_status_json() { cat '$DNSR'; }; dns_traefik_account_uri() { :; }
+        status_run true 2>/dev/null")"
+expect_eq "status --json without main-domain.env (set -euo pipefail, as the CLI) still prints the report" \
+  "$(printf '%s\n' "$SJ" | sed '$d' | jq -c '[.dns.main.name, .dns.main.lost_account]' 2>/dev/null)" '["ci.example.org",false]'
 # status --json carries the block (status_run with the report stubbed).
 SJ="$( (require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
         proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }

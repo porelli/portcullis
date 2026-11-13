@@ -269,9 +269,13 @@ dns_main_env_write() {
   return 0
 }
 
-# dns_main_env_uri — the URI main-domain.env holds (nothing without it).
+# dns_main_env_uri — the URI main-domain.env holds (nothing without it;
+# always exit 0: callers assign it under set -euo pipefail).
 dns_main_env_uri() {
-  sed -n 's/^DOMAINS_MAIN_ACME_ACCOUNT_URI=//p' "$(_domains_dir)/main-domain.env" 2>/dev/null | head -n1
+  local f
+  f="$(_domains_dir)/main-domain.env"
+  [ -r "$f" ] || return 0
+  sed -n 's/^DOMAINS_MAIN_ACME_ACCOUNT_URI=//p' "$f" 2>/dev/null | head -n1 || true
 }
 
 # _dns_caa_live_ok <uri> — the live CAA at the main domain is already

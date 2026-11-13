@@ -654,15 +654,38 @@ func (s *Server) Queries() []string {
 // port).
 func Serve(z *Zone, addr string) (*Server, error) { return ServeWith(z, addr, Options{}) }
 
+// listenPair listens on UDP and TCP at the same address. With port 0 the
+// kernel picks a free UDP port, which TCP may hold already (another
+// process): then another port is tried.
+func listenPair(addr string) (net.PacketConn, net.Listener, error) {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, nil, err
+	}
+	tries := 1
+	if port == "0" {
+		tries = 50
+	}
+	for i := 0; ; i++ {
+		pc, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			return nil, nil, err
+		}
+		l, err := net.Listen("tcp", pc.LocalAddr().String())
+		if err == nil {
+			return pc, l, nil
+		}
+		pc.Close()
+		if i+1 >= tries {
+			return nil, nil, err
+		}
+	}
+}
+
 // ServeWith starts a DNS server for z with options o.
 func ServeWith(z *Zone, addr string, o Options) (*Server, error) {
-	pc, err := net.ListenPacket("udp", addr)
+	pc, l, err := listenPair(addr)
 	if err != nil {
-		return nil, err
-	}
-	l, err := net.Listen("tcp", pc.LocalAddr().String())
-	if err != nil {
-		pc.Close()
 		return nil, err
 	}
 	s := &Server{Addr: pc.LocalAddr().String()}
