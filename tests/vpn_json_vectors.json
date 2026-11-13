@@ -5,157 +5,1178 @@
       "version": 2,
       "builtin": {
         "subnet": "10.213.0.0/22",
-        "server_public_key": "HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=",
-        "domains": ["example.org"],
+        "server_public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "domains": [
+          "example.org"
+        ],
         "peers": [
-          {"ip": "10.213.0.5", "public_key": "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=", "device_id": "d1", "expires": "2027-11-13T00:00:00Z"}
+          {
+            "ip": "10.213.0.2",
+            "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "device_id": "b1",
+            "expires": null
+          },
+          {
+            "ip": "10.213.0.3",
+            "public_key": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "device_id": "b2",
+            "expires": "2026-11-13T11:00:00Z"
+          }
         ]
       },
       "providers": [
-        {"id": "builtin", "ranges": ["10.213.0.0/22"], "edge_port": 0, "gateway_ip": "", "stale": false},
-        {"id": "headscale", "label": "Headscale tailnet", "ranges": ["100.64.0.0/10"], "edge_port": 9001,
-         "gateway_ip": "172.31.254.16", "refreshed_at": "2026-11-13T10:00:00Z", "stale_after": "2026-11-13T10:03:00Z", "stale": false}
+        {
+          "id": "builtin",
+          "ranges": [
+            "10.213.0.0/22"
+          ],
+          "edge_port": 0,
+          "gateway_ip": "",
+          "stale": false
+        },
+        {
+          "id": "headscale",
+          "label": "Headscale tailnet",
+          "ranges": [
+            "100.64.0.0/10"
+          ],
+          "edge_port": 9001,
+          "gateway_ip": "172.31.254.16",
+          "refreshed_at": "2026-11-13T11:59:00Z",
+          "stale_after": "2026-11-13T12:02:00Z",
+          "stale": false
+        }
       ],
       "devices": [
-        {"ip": "10.213.0.5", "provider": "builtin", "user": "alice", "device_id": "d1", "name": "phone", "expires": "2027-11-13T00:00:00Z"},
-        {"ip": "100.64.0.7", "provider": "headscale", "user": "bob", "device_id": "headscale:12", "name": "laptop", "expires": null}
+        {
+          "ip": "10.213.0.2",
+          "provider": "builtin",
+          "user": "alice",
+          "device_id": "b1",
+          "name": "laptop",
+          "expires": null
+        },
+        {
+          "ip": "10.213.0.3",
+          "provider": "builtin",
+          "user": "bob",
+          "device_id": "b2",
+          "name": "phone",
+          "expires": "2026-11-13T11:00:00Z"
+        },
+        {
+          "ip": "100.64.0.7",
+          "provider": "headscale",
+          "user": "alice",
+          "device_id": "headscale:12",
+          "name": "tablet",
+          "expires": null
+        }
       ]
     },
-    "now": "2026-11-13T10:01:00Z",
+    "now": "2026-11-13T12:00:00Z",
     "want": "ok",
-    "allow": [
-      {"ip": "10.213.0.5", "provider": "builtin", "user": "alice"},
-      {"ip": "100.64.0.7", "provider": "headscale", "user": "bob"}
-    ],
     "deny": [
-      {"ip": "10.213.0.6", "provider": "builtin"},
-      {"ip": "100.64.0.7", "provider": "builtin"},
-      {"ip": "10.213.0.5", "provider": "headscale"}
+      {
+        "ip": "10.213.0.9",
+        "provider": "builtin"
+      },
+      {
+        "ip": "100.64.0.8",
+        "provider": "headscale"
+      },
+      {
+        "ip": "192.168.1.5",
+        "provider": ""
+      }
     ]
   },
   {
     "name": "unknown top-level key",
-    "doc": {"version": 2, "builtin": null, "providers": [], "devices": [], "extra": true},
-    "now": "2026-11-13T10:01:00Z",
-    "want": "unknown"
+    "doc": {
+      "version": 2,
+      "builtin": {
+        "subnet": "10.213.0.0/22",
+        "server_public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "domains": [
+          "example.org"
+        ],
+        "peers": [
+          {
+            "ip": "10.213.0.2",
+            "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "device_id": "b1",
+            "expires": null
+          },
+          {
+            "ip": "10.213.0.3",
+            "public_key": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "device_id": "b2",
+            "expires": "2026-11-13T11:00:00Z"
+          }
+        ]
+      },
+      "providers": [
+        {
+          "id": "builtin",
+          "ranges": [
+            "10.213.0.0/22"
+          ],
+          "edge_port": 0,
+          "gateway_ip": "",
+          "stale": false
+        },
+        {
+          "id": "headscale",
+          "label": "Headscale tailnet",
+          "ranges": [
+            "100.64.0.0/10"
+          ],
+          "edge_port": 9001,
+          "gateway_ip": "172.31.254.16",
+          "refreshed_at": "2026-11-13T11:59:00Z",
+          "stale_after": "2026-11-13T12:02:00Z",
+          "stale": false
+        }
+      ],
+      "devices": [
+        {
+          "ip": "10.213.0.2",
+          "provider": "builtin",
+          "user": "alice",
+          "device_id": "b1",
+          "name": "laptop",
+          "expires": null
+        },
+        {
+          "ip": "10.213.0.3",
+          "provider": "builtin",
+          "user": "bob",
+          "device_id": "b2",
+          "name": "phone",
+          "expires": "2026-11-13T11:00:00Z"
+        },
+        {
+          "ip": "100.64.0.7",
+          "provider": "headscale",
+          "user": "alice",
+          "device_id": "headscale:12",
+          "name": "tablet",
+          "expires": null
+        }
+      ],
+      "extra": 1
+    },
+    "now": "2026-11-13T12:00:00Z",
+    "want": "unknown field",
+    "deny": [
+      {
+        "ip": "10.213.0.2",
+        "provider": "builtin"
+      },
+      {
+        "ip": "100.64.0.7",
+        "provider": "headscale"
+      }
+    ]
   },
   {
-    "name": "unknown provider key",
-    "doc": {"version": 2, "builtin": null,
-            "providers": [{"id": "hs", "ranges": ["100.64.0.0/10"], "edge_port": 9001, "gateway_ip": "172.31.254.16", "refreshed_at": "2026-11-13T10:00:00Z", "stale_after": "2026-11-13T10:03:00Z", "stale": false, "trusted": true}],
-            "devices": []},
-    "now": "2026-11-13T10:01:00Z",
-    "want": "unknown"
+    "name": "unknown device key",
+    "doc": {
+      "version": 2,
+      "builtin": {
+        "subnet": "10.213.0.0/22",
+        "server_public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "domains": [
+          "example.org"
+        ],
+        "peers": [
+          {
+            "ip": "10.213.0.2",
+            "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "device_id": "b1",
+            "expires": null
+          },
+          {
+            "ip": "10.213.0.3",
+            "public_key": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "device_id": "b2",
+            "expires": "2026-11-13T11:00:00Z"
+          }
+        ]
+      },
+      "providers": [
+        {
+          "id": "builtin",
+          "ranges": [
+            "10.213.0.0/22"
+          ],
+          "edge_port": 0,
+          "gateway_ip": "",
+          "stale": false
+        },
+        {
+          "id": "headscale",
+          "label": "Headscale tailnet",
+          "ranges": [
+            "100.64.0.0/10"
+          ],
+          "edge_port": 9001,
+          "gateway_ip": "172.31.254.16",
+          "refreshed_at": "2026-11-13T11:59:00Z",
+          "stale_after": "2026-11-13T12:02:00Z",
+          "stale": false
+        }
+      ],
+      "devices": [
+        {
+          "ip": "10.213.0.2",
+          "provider": "builtin",
+          "user": "alice",
+          "device_id": "b1",
+          "name": "laptop",
+          "expires": null,
+          "owner": "x"
+        },
+        {
+          "ip": "10.213.0.3",
+          "provider": "builtin",
+          "user": "bob",
+          "device_id": "b2",
+          "name": "phone",
+          "expires": "2026-11-13T11:00:00Z"
+        },
+        {
+          "ip": "100.64.0.7",
+          "provider": "headscale",
+          "user": "alice",
+          "device_id": "headscale:12",
+          "name": "tablet",
+          "expires": null
+        }
+      ]
+    },
+    "now": "2026-11-13T12:00:00Z",
+    "want": "unknown field",
+    "deny": [
+      {
+        "ip": "10.213.0.2",
+        "provider": "builtin"
+      },
+      {
+        "ip": "100.64.0.7",
+        "provider": "headscale"
+      }
+    ]
   },
   {
     "name": "version 1",
-    "doc": {"version": 1, "providers": [], "devices": []},
-    "now": "2026-11-13T10:01:00Z",
-    "want": "version"
+    "doc": {
+      "version": 1,
+      "builtin": {
+        "subnet": "10.213.0.0/22",
+        "server_public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "domains": [
+          "example.org"
+        ],
+        "peers": [
+          {
+            "ip": "10.213.0.2",
+            "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "device_id": "b1",
+            "expires": null
+          },
+          {
+            "ip": "10.213.0.3",
+            "public_key": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "device_id": "b2",
+            "expires": "2026-11-13T11:00:00Z"
+          }
+        ]
+      },
+      "providers": [
+        {
+          "id": "builtin",
+          "ranges": [
+            "10.213.0.0/22"
+          ],
+          "edge_port": 0,
+          "gateway_ip": "",
+          "stale": false
+        },
+        {
+          "id": "headscale",
+          "label": "Headscale tailnet",
+          "ranges": [
+            "100.64.0.0/10"
+          ],
+          "edge_port": 9001,
+          "gateway_ip": "172.31.254.16",
+          "refreshed_at": "2026-11-13T11:59:00Z",
+          "stale_after": "2026-11-13T12:02:00Z",
+          "stale": false
+        }
+      ],
+      "devices": [
+        {
+          "ip": "10.213.0.2",
+          "provider": "builtin",
+          "user": "alice",
+          "device_id": "b1",
+          "name": "laptop",
+          "expires": null
+        },
+        {
+          "ip": "10.213.0.3",
+          "provider": "builtin",
+          "user": "bob",
+          "device_id": "b2",
+          "name": "phone",
+          "expires": "2026-11-13T11:00:00Z"
+        },
+        {
+          "ip": "100.64.0.7",
+          "provider": "headscale",
+          "user": "alice",
+          "device_id": "headscale:12",
+          "name": "tablet",
+          "expires": null
+        }
+      ]
+    },
+    "now": "2026-11-13T12:00:00Z",
+    "want": "version",
+    "deny": [
+      {
+        "ip": "10.213.0.2",
+        "provider": "builtin"
+      },
+      {
+        "ip": "100.64.0.7",
+        "provider": "headscale"
+      }
+    ]
+  },
+  {
+    "name": "version 3",
+    "doc": {
+      "version": 3,
+      "builtin": {
+        "subnet": "10.213.0.0/22",
+        "server_public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "domains": [
+          "example.org"
+        ],
+        "peers": [
+          {
+            "ip": "10.213.0.2",
+            "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "device_id": "b1",
+            "expires": null
+          },
+          {
+            "ip": "10.213.0.3",
+            "public_key": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "device_id": "b2",
+            "expires": "2026-11-13T11:00:00Z"
+          }
+        ]
+      },
+      "providers": [
+        {
+          "id": "builtin",
+          "ranges": [
+            "10.213.0.0/22"
+          ],
+          "edge_port": 0,
+          "gateway_ip": "",
+          "stale": false
+        },
+        {
+          "id": "headscale",
+          "label": "Headscale tailnet",
+          "ranges": [
+            "100.64.0.0/10"
+          ],
+          "edge_port": 9001,
+          "gateway_ip": "172.31.254.16",
+          "refreshed_at": "2026-11-13T11:59:00Z",
+          "stale_after": "2026-11-13T12:02:00Z",
+          "stale": false
+        }
+      ],
+      "devices": [
+        {
+          "ip": "10.213.0.2",
+          "provider": "builtin",
+          "user": "alice",
+          "device_id": "b1",
+          "name": "laptop",
+          "expires": null
+        },
+        {
+          "ip": "10.213.0.3",
+          "provider": "builtin",
+          "user": "bob",
+          "device_id": "b2",
+          "name": "phone",
+          "expires": "2026-11-13T11:00:00Z"
+        },
+        {
+          "ip": "100.64.0.7",
+          "provider": "headscale",
+          "user": "alice",
+          "device_id": "headscale:12",
+          "name": "tablet",
+          "expires": null
+        }
+      ]
+    },
+    "now": "2026-11-13T12:00:00Z",
+    "want": "version",
+    "deny": [
+      {
+        "ip": "10.213.0.2",
+        "provider": "builtin"
+      },
+      {
+        "ip": "100.64.0.7",
+        "provider": "headscale"
+      }
+    ]
   },
   {
     "name": "overlapping provider ranges",
-    "doc": {"version": 2, "builtin": null,
-            "providers": [
-              {"id": "a", "ranges": ["100.64.0.0/10"], "edge_port": 9001, "gateway_ip": "172.31.254.16", "refreshed_at": "2026-11-13T10:00:00Z", "stale_after": "2026-11-13T10:03:00Z", "stale": false},
-              {"id": "b", "ranges": ["100.100.0.0/16"], "edge_port": 9002, "gateway_ip": "172.31.254.17", "refreshed_at": "2026-11-13T10:00:00Z", "stale_after": "2026-11-13T10:03:00Z", "stale": false}
-            ],
-            "devices": []},
-    "now": "2026-11-13T10:01:00Z",
-    "want": "overlap"
+    "doc": {
+      "version": 2,
+      "builtin": {
+        "subnet": "10.213.0.0/22",
+        "server_public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "domains": [
+          "example.org"
+        ],
+        "peers": [
+          {
+            "ip": "10.213.0.2",
+            "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "device_id": "b1",
+            "expires": null
+          },
+          {
+            "ip": "10.213.0.3",
+            "public_key": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "device_id": "b2",
+            "expires": "2026-11-13T11:00:00Z"
+          }
+        ]
+      },
+      "providers": [
+        {
+          "id": "builtin",
+          "ranges": [
+            "10.213.0.0/22"
+          ],
+          "edge_port": 0,
+          "gateway_ip": "",
+          "stale": false
+        },
+        {
+          "id": "headscale",
+          "label": "Headscale tailnet",
+          "ranges": [
+            "100.64.0.0/10",
+            "10.213.2.0/24"
+          ],
+          "edge_port": 9001,
+          "gateway_ip": "172.31.254.16",
+          "refreshed_at": "2026-11-13T11:59:00Z",
+          "stale_after": "2026-11-13T12:02:00Z",
+          "stale": false
+        }
+      ],
+      "devices": [
+        {
+          "ip": "10.213.0.2",
+          "provider": "builtin",
+          "user": "alice",
+          "device_id": "b1",
+          "name": "laptop",
+          "expires": null
+        },
+        {
+          "ip": "10.213.0.3",
+          "provider": "builtin",
+          "user": "bob",
+          "device_id": "b2",
+          "name": "phone",
+          "expires": "2026-11-13T11:00:00Z"
+        },
+        {
+          "ip": "100.64.0.7",
+          "provider": "headscale",
+          "user": "alice",
+          "device_id": "headscale:12",
+          "name": "tablet",
+          "expires": null
+        }
+      ]
+    },
+    "now": "2026-11-13T12:00:00Z",
+    "want": "overlap",
+    "deny": [
+      {
+        "ip": "10.213.0.2",
+        "provider": "builtin"
+      },
+      {
+        "ip": "100.64.0.7",
+        "provider": "headscale"
+      }
+    ]
   },
   {
     "name": "duplicate device ip",
-    "doc": {"version": 2, "builtin": null,
-            "providers": [{"id": "hs", "ranges": ["100.64.0.0/10"], "edge_port": 9001, "gateway_ip": "172.31.254.16", "refreshed_at": "2026-11-13T10:00:00Z", "stale_after": "2026-11-13T10:03:00Z", "stale": false}],
-            "devices": [
-              {"ip": "100.64.0.7", "provider": "hs", "user": "alice", "device_id": "hs:1", "name": "a", "expires": null},
-              {"ip": "100.64.0.7", "provider": "hs", "user": "bob", "device_id": "hs:2", "name": "b", "expires": null}
-            ]},
-    "now": "2026-11-13T10:01:00Z",
-    "want": "duplicate"
-  },
-  {
-    "name": "device outside its provider ranges",
-    "doc": {"version": 2, "builtin": null,
-            "providers": [{"id": "hs", "ranges": ["100.64.0.0/10"], "edge_port": 9001, "gateway_ip": "172.31.254.16", "refreshed_at": "2026-11-13T10:00:00Z", "stale_after": "2026-11-13T10:03:00Z", "stale": false}],
-            "devices": [{"ip": "10.0.0.7", "provider": "hs", "user": "alice", "device_id": "hs:1", "name": "a", "expires": null}]},
-    "now": "2026-11-13T10:01:00Z",
-    "want": "range"
-  },
-  {
-    "name": "provider without stale_after",
-    "doc": {"version": 2, "builtin": null,
-            "providers": [{"id": "hs", "ranges": ["100.64.0.0/10"], "edge_port": 9001, "gateway_ip": "172.31.254.16",
-                           "refreshed_at": "2026-11-13T10:00:00Z", "stale": false}],
-            "devices": [{"ip": "100.64.0.7", "provider": "hs", "user": "alice", "device_id": "hs:1", "name": "a", "expires": null}]},
-    "now": "2026-11-13T10:01:00Z",
-    "want": "stale_after"
-  },
-  {
-    "name": "stale_after more than 30 min after refreshed_at",
-    "doc": {"version": 2, "builtin": null,
-            "providers": [{"id": "hs", "ranges": ["100.64.0.0/10"], "edge_port": 9001, "gateway_ip": "172.31.254.16",
-                           "refreshed_at": "2026-11-13T10:00:00Z", "stale_after": "2026-11-13T10:30:01Z", "stale": false}],
-            "devices": [{"ip": "100.64.0.7", "provider": "hs", "user": "alice", "device_id": "hs:1", "name": "a", "expires": null}]},
-    "now": "2026-11-13T10:01:00Z",
-    "want": "stale_after"
+    "doc": {
+      "version": 2,
+      "builtin": {
+        "subnet": "10.213.0.0/22",
+        "server_public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "domains": [
+          "example.org"
+        ],
+        "peers": [
+          {
+            "ip": "10.213.0.2",
+            "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "device_id": "b1",
+            "expires": null
+          },
+          {
+            "ip": "10.213.0.3",
+            "public_key": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "device_id": "b2",
+            "expires": "2026-11-13T11:00:00Z"
+          }
+        ]
+      },
+      "providers": [
+        {
+          "id": "builtin",
+          "ranges": [
+            "10.213.0.0/22"
+          ],
+          "edge_port": 0,
+          "gateway_ip": "",
+          "stale": false
+        },
+        {
+          "id": "headscale",
+          "label": "Headscale tailnet",
+          "ranges": [
+            "100.64.0.0/10"
+          ],
+          "edge_port": 9001,
+          "gateway_ip": "172.31.254.16",
+          "refreshed_at": "2026-11-13T11:59:00Z",
+          "stale_after": "2026-11-13T12:02:00Z",
+          "stale": false
+        }
+      ],
+      "devices": [
+        {
+          "ip": "10.213.0.2",
+          "provider": "builtin",
+          "user": "alice",
+          "device_id": "b1",
+          "name": "laptop",
+          "expires": null
+        },
+        {
+          "ip": "10.213.0.3",
+          "provider": "builtin",
+          "user": "bob",
+          "device_id": "b2",
+          "name": "phone",
+          "expires": "2026-11-13T11:00:00Z"
+        },
+        {
+          "ip": "100.64.0.7",
+          "provider": "headscale",
+          "user": "alice",
+          "device_id": "headscale:12",
+          "name": "tablet",
+          "expires": null
+        },
+        {
+          "ip": "100.64.0.7",
+          "provider": "headscale",
+          "user": "bob",
+          "device_id": "headscale:13",
+          "name": "x",
+          "expires": null
+        }
+      ]
+    },
+    "now": "2026-11-13T12:00:00Z",
+    "want": "duplicate",
+    "deny": [
+      {
+        "ip": "10.213.0.2",
+        "provider": "builtin"
+      },
+      {
+        "ip": "100.64.0.7",
+        "provider": "headscale"
+      }
+    ]
   },
   {
     "name": "provider past stale_after denies its own",
-    "doc": {"version": 2,
-            "builtin": {"subnet": "10.213.0.0/22", "server_public_key": "", "domains": [], "peers": []},
-            "providers": [
-              {"id": "builtin", "ranges": ["10.213.0.0/22"], "edge_port": 0, "gateway_ip": "", "stale": false},
-              {"id": "hs", "label": "tailnet", "ranges": ["100.64.0.0/10"], "edge_port": 9001, "gateway_ip": "172.31.254.16",
-               "refreshed_at": "2026-11-13T10:00:00Z", "stale_after": "2026-11-13T10:03:00Z", "stale": false},
-              {"id": "nb", "label": "netbird", "ranges": ["100.200.0.0/16"], "edge_port": 9002, "gateway_ip": "172.31.254.17",
-               "refreshed_at": "2026-11-13T10:00:00Z", "stale_after": "2026-11-13T10:30:00Z", "stale": true}
-            ],
-            "devices": [
-              {"ip": "10.213.0.9", "provider": "builtin", "user": "carol", "device_id": "d9", "name": "pc", "expires": null},
-              {"ip": "100.64.0.7", "provider": "hs", "user": "alice", "device_id": "hs:1", "name": "a", "expires": null},
-              {"ip": "100.200.0.7", "provider": "nb", "user": "bob", "device_id": "nb:1", "name": "b", "expires": null}
-            ]},
-    "now": "2026-11-13T10:05:00Z",
+    "doc": {
+      "version": 2,
+      "builtin": {
+        "subnet": "10.213.0.0/22",
+        "server_public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "domains": [
+          "example.org"
+        ],
+        "peers": [
+          {
+            "ip": "10.213.0.2",
+            "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "device_id": "b1",
+            "expires": null
+          },
+          {
+            "ip": "10.213.0.3",
+            "public_key": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "device_id": "b2",
+            "expires": "2026-11-13T11:00:00Z"
+          }
+        ]
+      },
+      "providers": [
+        {
+          "id": "builtin",
+          "ranges": [
+            "10.213.0.0/22"
+          ],
+          "edge_port": 0,
+          "gateway_ip": "",
+          "stale": false
+        },
+        {
+          "id": "headscale",
+          "label": "Headscale tailnet",
+          "ranges": [
+            "100.64.0.0/10"
+          ],
+          "edge_port": 9001,
+          "gateway_ip": "172.31.254.16",
+          "refreshed_at": "2026-11-13T11:59:00Z",
+          "stale_after": "2026-11-13T12:02:00Z",
+          "stale": false
+        }
+      ],
+      "devices": [
+        {
+          "ip": "10.213.0.2",
+          "provider": "builtin",
+          "user": "alice",
+          "device_id": "b1",
+          "name": "laptop",
+          "expires": null
+        },
+        {
+          "ip": "10.213.0.3",
+          "provider": "builtin",
+          "user": "bob",
+          "device_id": "b2",
+          "name": "phone",
+          "expires": "2026-11-13T11:00:00Z"
+        },
+        {
+          "ip": "100.64.0.7",
+          "provider": "headscale",
+          "user": "alice",
+          "device_id": "headscale:12",
+          "name": "tablet",
+          "expires": null
+        }
+      ]
+    },
+    "now": "2026-11-13T12:02:00Z",
     "want": "ok",
-    "allow": [{"ip": "10.213.0.9", "provider": "builtin", "user": "carol"}],
     "deny": [
-      {"ip": "100.64.0.7", "provider": "hs"},
-      {"ip": "100.200.0.7", "provider": "nb"}
+      {
+        "ip": "100.64.0.7",
+        "provider": "headscale"
+      }
+    ]
+  },
+  {
+    "name": "provider marked stale denies its own",
+    "doc": {
+      "version": 2,
+      "builtin": {
+        "subnet": "10.213.0.0/22",
+        "server_public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "domains": [
+          "example.org"
+        ],
+        "peers": [
+          {
+            "ip": "10.213.0.2",
+            "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "device_id": "b1",
+            "expires": null
+          },
+          {
+            "ip": "10.213.0.3",
+            "public_key": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "device_id": "b2",
+            "expires": "2026-11-13T11:00:00Z"
+          }
+        ]
+      },
+      "providers": [
+        {
+          "id": "builtin",
+          "ranges": [
+            "10.213.0.0/22"
+          ],
+          "edge_port": 0,
+          "gateway_ip": "",
+          "stale": false
+        },
+        {
+          "id": "headscale",
+          "label": "Headscale tailnet",
+          "ranges": [
+            "100.64.0.0/10"
+          ],
+          "edge_port": 9001,
+          "gateway_ip": "172.31.254.16",
+          "refreshed_at": "2026-11-13T11:59:00Z",
+          "stale_after": "2026-11-13T12:02:00Z",
+          "stale": true
+        }
+      ],
+      "devices": [
+        {
+          "ip": "10.213.0.2",
+          "provider": "builtin",
+          "user": "alice",
+          "device_id": "b1",
+          "name": "laptop",
+          "expires": null
+        },
+        {
+          "ip": "10.213.0.3",
+          "provider": "builtin",
+          "user": "bob",
+          "device_id": "b2",
+          "name": "phone",
+          "expires": "2026-11-13T11:00:00Z"
+        },
+        {
+          "ip": "100.64.0.7",
+          "provider": "headscale",
+          "user": "alice",
+          "device_id": "headscale:12",
+          "name": "tablet",
+          "expires": null
+        }
+      ]
+    },
+    "now": "2026-11-13T12:00:00Z",
+    "want": "ok",
+    "deny": [
+      {
+        "ip": "100.64.0.7",
+        "provider": "headscale"
+      }
     ]
   },
   {
     "name": "peer past expires dropped",
-    "doc": {"version": 2,
-            "builtin": {"subnet": "10.213.0.0/22", "server_public_key": "HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=", "domains": [],
-                        "peers": [
-                          {"ip": "10.213.0.5", "public_key": "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=", "device_id": "d1", "expires": "2026-11-13T09:00:00Z"},
-                          {"ip": "10.213.0.6", "public_key": "TrMvSoP4jYQlY6RIzBgbssQqY3vxI2Pi+y71lOWWXX0=", "device_id": "d2", "expires": null}
-                        ]},
-            "providers": [{"id": "builtin", "ranges": ["10.213.0.0/22"], "edge_port": 0, "gateway_ip": "", "stale": false}],
-            "devices": [
-              {"ip": "10.213.0.5", "provider": "builtin", "user": "alice", "device_id": "d1", "name": "old", "expires": "2026-11-13T09:00:00Z"},
-              {"ip": "10.213.0.6", "provider": "builtin", "user": "alice", "device_id": "d2", "name": "new", "expires": null}
-            ]},
-    "now": "2026-11-13T10:00:00Z",
+    "doc": {
+      "version": 2,
+      "builtin": {
+        "subnet": "10.213.0.0/22",
+        "server_public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "domains": [
+          "example.org"
+        ],
+        "peers": [
+          {
+            "ip": "10.213.0.2",
+            "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "device_id": "b1",
+            "expires": null
+          },
+          {
+            "ip": "10.213.0.3",
+            "public_key": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "device_id": "b2",
+            "expires": "2026-11-13T11:00:00Z"
+          }
+        ]
+      },
+      "providers": [
+        {
+          "id": "builtin",
+          "ranges": [
+            "10.213.0.0/22"
+          ],
+          "edge_port": 0,
+          "gateway_ip": "",
+          "stale": false
+        },
+        {
+          "id": "headscale",
+          "label": "Headscale tailnet",
+          "ranges": [
+            "100.64.0.0/10"
+          ],
+          "edge_port": 9001,
+          "gateway_ip": "172.31.254.16",
+          "refreshed_at": "2026-11-13T11:59:00Z",
+          "stale_after": "2026-11-13T12:02:00Z",
+          "stale": false
+        }
+      ],
+      "devices": [
+        {
+          "ip": "10.213.0.2",
+          "provider": "builtin",
+          "user": "alice",
+          "device_id": "b1",
+          "name": "laptop",
+          "expires": null
+        },
+        {
+          "ip": "10.213.0.3",
+          "provider": "builtin",
+          "user": "bob",
+          "device_id": "b2",
+          "name": "phone",
+          "expires": "2026-11-13T11:00:00Z"
+        },
+        {
+          "ip": "100.64.0.7",
+          "provider": "headscale",
+          "user": "alice",
+          "device_id": "headscale:12",
+          "name": "tablet",
+          "expires": null
+        }
+      ]
+    },
+    "now": "2026-11-13T12:00:00Z",
     "want": "ok",
-    "peers": ["10.213.0.6"],
-    "allow": [{"ip": "10.213.0.6", "provider": "builtin", "user": "alice"}],
-    "deny": [{"ip": "10.213.0.5", "provider": "builtin"}]
+    "deny": [
+      {
+        "ip": "10.213.0.3",
+        "provider": "builtin"
+      }
+    ]
   },
   {
     "name": "missing builtin with a builtin provider",
-    "doc": {"version": 2,
-            "providers": [{"id": "builtin", "ranges": ["10.213.0.0/22"], "edge_port": 0, "gateway_ip": "", "stale": false}],
-            "devices": []},
-    "now": "2026-11-13T10:00:00Z",
-    "want": "builtin"
+    "doc": {
+      "version": 2,
+      "providers": [
+        {
+          "id": "builtin",
+          "ranges": [
+            "10.213.0.0/22"
+          ],
+          "edge_port": 0,
+          "gateway_ip": "",
+          "stale": false
+        },
+        {
+          "id": "headscale",
+          "label": "Headscale tailnet",
+          "ranges": [
+            "100.64.0.0/10"
+          ],
+          "edge_port": 9001,
+          "gateway_ip": "172.31.254.16",
+          "refreshed_at": "2026-11-13T11:59:00Z",
+          "stale_after": "2026-11-13T12:02:00Z",
+          "stale": false
+        }
+      ],
+      "devices": [
+        {
+          "ip": "10.213.0.2",
+          "provider": "builtin",
+          "user": "alice",
+          "device_id": "b1",
+          "name": "laptop",
+          "expires": null
+        },
+        {
+          "ip": "10.213.0.3",
+          "provider": "builtin",
+          "user": "bob",
+          "device_id": "b2",
+          "name": "phone",
+          "expires": "2026-11-13T11:00:00Z"
+        },
+        {
+          "ip": "100.64.0.7",
+          "provider": "headscale",
+          "user": "alice",
+          "device_id": "headscale:12",
+          "name": "tablet",
+          "expires": null
+        }
+      ]
+    },
+    "now": "2026-11-13T12:00:00Z",
+    "want": "missing builtin",
+    "deny": [
+      {
+        "ip": "10.213.0.2",
+        "provider": "builtin"
+      },
+      {
+        "ip": "100.64.0.7",
+        "provider": "headscale"
+      }
+    ]
   },
   {
-    "name": "duplicate key",
-    "raw": "{\"version\": 2, \"version\": 2, \"builtin\": null, \"providers\": [], \"devices\": []}",
-    "now": "2026-11-13T10:00:00Z",
-    "want": "duplicate"
+    "name": "device outside its provider's ranges",
+    "doc": {
+      "version": 2,
+      "builtin": {
+        "subnet": "10.213.0.0/22",
+        "server_public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "domains": [
+          "example.org"
+        ],
+        "peers": [
+          {
+            "ip": "10.213.0.2",
+            "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "device_id": "b1",
+            "expires": null
+          },
+          {
+            "ip": "10.213.0.3",
+            "public_key": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "device_id": "b2",
+            "expires": "2026-11-13T11:00:00Z"
+          }
+        ]
+      },
+      "providers": [
+        {
+          "id": "builtin",
+          "ranges": [
+            "10.213.0.0/22"
+          ],
+          "edge_port": 0,
+          "gateway_ip": "",
+          "stale": false
+        },
+        {
+          "id": "headscale",
+          "label": "Headscale tailnet",
+          "ranges": [
+            "100.64.0.0/10"
+          ],
+          "edge_port": 9001,
+          "gateway_ip": "172.31.254.16",
+          "refreshed_at": "2026-11-13T11:59:00Z",
+          "stale_after": "2026-11-13T12:02:00Z",
+          "stale": false
+        }
+      ],
+      "devices": [
+        {
+          "ip": "10.213.0.2",
+          "provider": "builtin",
+          "user": "alice",
+          "device_id": "b1",
+          "name": "laptop",
+          "expires": null
+        },
+        {
+          "ip": "10.213.0.3",
+          "provider": "builtin",
+          "user": "bob",
+          "device_id": "b2",
+          "name": "phone",
+          "expires": "2026-11-13T11:00:00Z"
+        },
+        {
+          "ip": "100.128.0.1",
+          "provider": "headscale",
+          "user": "alice",
+          "device_id": "headscale:12",
+          "name": "tablet",
+          "expires": null
+        }
+      ]
+    },
+    "now": "2026-11-13T12:00:00Z",
+    "want": "outside",
+    "deny": [
+      {
+        "ip": "10.213.0.2",
+        "provider": "builtin"
+      },
+      {
+        "ip": "100.64.0.7",
+        "provider": "headscale"
+      }
+    ]
+  },
+  {
+    "name": "device of an unknown provider",
+    "doc": {
+      "version": 2,
+      "builtin": {
+        "subnet": "10.213.0.0/22",
+        "server_public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+        "domains": [
+          "example.org"
+        ],
+        "peers": [
+          {
+            "ip": "10.213.0.2",
+            "public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+            "device_id": "b1",
+            "expires": null
+          },
+          {
+            "ip": "10.213.0.3",
+            "public_key": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+            "device_id": "b2",
+            "expires": "2026-11-13T11:00:00Z"
+          }
+        ]
+      },
+      "providers": [
+        {
+          "id": "builtin",
+          "ranges": [
+            "10.213.0.0/22"
+          ],
+          "edge_port": 0,
+          "gateway_ip": "",
+          "stale": false
+        },
+        {
+          "id": "headscale",
+          "label": "Headscale tailnet",
+          "ranges": [
+            "100.64.0.0/10"
+          ],
+          "edge_port": 9001,
+          "gateway_ip": "172.31.254.16",
+          "refreshed_at": "2026-11-13T11:59:00Z",
+          "stale_after": "2026-11-13T12:02:00Z",
+          "stale": false
+        }
+      ],
+      "devices": [
+        {
+          "ip": "10.213.0.2",
+          "provider": "builtin",
+          "user": "alice",
+          "device_id": "b1",
+          "name": "laptop",
+          "expires": null
+        },
+        {
+          "ip": "10.213.0.3",
+          "provider": "builtin",
+          "user": "bob",
+          "device_id": "b2",
+          "name": "phone",
+          "expires": "2026-11-13T11:00:00Z"
+        },
+        {
+          "ip": "100.64.0.7",
+          "provider": "netbird",
+          "user": "alice",
+          "device_id": "headscale:12",
+          "name": "tablet",
+          "expires": null
+        }
+      ]
+    },
+    "now": "2026-11-13T12:00:00Z",
+    "want": "unknown provider",
+    "deny": [
+      {
+        "ip": "10.213.0.2",
+        "provider": "builtin"
+      },
+      {
+        "ip": "100.64.0.7",
+        "provider": "headscale"
+      }
+    ]
+  },
+  {
+    "name": "not JSON",
+    "doc": "{",
+    "now": "2026-11-13T12:00:00Z",
+    "want": "unexpected EOF",
+    "deny": [
+      {
+        "ip": "10.213.0.2",
+        "provider": "builtin"
+      },
+      {
+        "ip": "100.64.0.7",
+        "provider": "headscale"
+      }
+    ]
+  },
+  {
+    "name": "builtin off",
+    "doc": {
+      "version": 2,
+      "providers": [
+        {
+          "id": "headscale",
+          "label": "Headscale tailnet",
+          "ranges": [
+            "100.64.0.0/10"
+          ],
+          "edge_port": 9001,
+          "gateway_ip": "172.31.254.16",
+          "refreshed_at": "2026-11-13T11:59:00Z",
+          "stale_after": "2026-11-13T12:02:00Z",
+          "stale": false
+        }
+      ],
+      "devices": [
+        {
+          "ip": "100.64.0.7",
+          "provider": "headscale",
+          "user": "alice",
+          "device_id": "headscale:12",
+          "name": "tablet",
+          "expires": null
+        }
+      ]
+    },
+    "now": "2026-11-13T12:00:00Z",
+    "want": "ok",
+    "deny": [
+      {
+        "ip": "10.213.0.2",
+        "provider": ""
+      }
+    ]
   }
 ]

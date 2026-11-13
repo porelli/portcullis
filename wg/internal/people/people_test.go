@@ -70,7 +70,7 @@ func doc(t *testing.T, serverKey string, peers ...string) *vpndoc.Doc {
 	t.Helper()
 	var ps []string
 	for i, p := range peers {
-		ps = append(ps, `{"ip":"10.213.0.`+string(rune('5'+i))+`","public_key":"`+p+`","device_id":"d","expires":null}`)
+		ps = append(ps, `{"ip":"10.213.0.`+string(rune('5'+i))+`","public_key":"`+p+`","device_id":"d`+string(rune('a'+i))+`","expires":null}`)
 	}
 	return docRaw(t, serverKey, strings.Join(ps, ","))
 }
@@ -102,11 +102,6 @@ func TestPeopleRoleSyncsPeers(t *testing.T) {
 	if got := peerKeys(t, s); got != join(b, cc) {
 		t.Fatalf("peers after change %s", got)
 	}
-	// An empty server key (the Hub hasn't read status.json yet) is fine.
-	r.SetDoc(doc(t, "", b), nil)
-	if got := peerKeys(t, s); got != b {
-		t.Fatalf("peers %s", got)
-	}
 	// Another server's key: no peers at all, role not ok.
 	r.SetDoc(doc(t, keyPair(t), a, b), nil)
 	if got := peerKeys(t, s); got != "" {
@@ -125,7 +120,7 @@ func TestPeopleRoleSyncsPeers(t *testing.T) {
 		t.Fatalf("status %v %q", ok, e)
 	}
 	// Another subnet than this role's: refused.
-	d, err := vpndoc.Parse([]byte(`{"version":2,"builtin":{"subnet":"10.99.0.0/22","server_public_key":"","domains":[],"peers":[]},"providers":[],"devices":[]}`))
+	d, err := vpndoc.Parse([]byte(`{"version":2,"builtin":{"subnet":"10.99.0.0/22","server_public_key":"` + s.PublicKey() + `","domains":[],"peers":[]},"providers":[{"id":"builtin","ranges":["10.99.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}

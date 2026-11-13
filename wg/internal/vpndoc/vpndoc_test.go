@@ -46,6 +46,10 @@ func TestVectors(t *testing.T) {
 	for _, v := range vs {
 		t.Run(v.Name, func(t *testing.T) {
 			raw := []byte(v.Doc)
+			var asString string
+			if json.Unmarshal(v.Doc, &asString) == nil {
+				raw = []byte(asString) // a vector whose document isn't JSON
+			}
 			if v.Raw != "" {
 				raw = []byte(v.Raw)
 			}
@@ -84,7 +88,7 @@ func TestVectors(t *testing.T) {
 }
 
 const docOK = `{"version":2,
- "builtin":{"subnet":"10.213.0.0/22","server_public_key":"","domains":["example.org"],
+ "builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":["example.org"],
   "peers":[{"ip":"10.213.0.5","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d1","expires":null}]},
  "providers":[{"id":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false},
   {"id":"hs","label":"t","ranges":["100.64.0.0/10"],"edge_port":9001,"gateway_ip":"172.31.254.16",
@@ -127,12 +131,12 @@ func TestParseRefusals(t *testing.T) {
 		"no gateway":       `{"version":2,"providers":[{"id":"a","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"","stale":false}],"devices":[]}`,
 		"unknown provider": `{"version":2,"providers":[],"devices":[{"ip":"100.64.0.7","provider":"x","user":"a","device_id":"1","name":"a","expires":null}]}`,
 		"no user":          `{"version":2,"providers":[{"id":"a","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[{"ip":"100.64.0.7","provider":"a","user":"","device_id":"1","name":"a","expires":null}]}`,
-		"bad peer key":     `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"short","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
-		"peer outside":     `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"","domains":[],"peers":[{"ip":"10.9.0.5","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
-		"peer is server":   `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"","domains":[],"peers":[{"ip":"10.213.0.1","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
-		"dup peer key":     `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d","expires":null},{"ip":"10.213.0.6","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"e","expires":null}]},"providers":[],"devices":[]}`,
+		"bad peer key":     `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"short","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
+		"peer outside":     `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[{"ip":"10.9.0.5","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
+		"peer is server":   `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[{"ip":"10.213.0.1","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
+		"dup peer key":     `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d","expires":null},{"ip":"10.213.0.6","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"e","expires":null}]},"providers":[],"devices":[]}`,
 		"case key":         `{"Version":2,"providers":[],"devices":[]}`,
-		"builtin range":    `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"","domains":[],"peers":[]},"providers":[{"id":"builtin","ranges":["10.99.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`,
+		"builtin range":    `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=","domains":[],"peers":[]},"providers":[{"id":"builtin","ranges":["10.99.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`,
 	} {
 		if _, err := Parse([]byte(doc)); err == nil {
 			t.Errorf("%s: parsed, want refusal", name)
@@ -225,5 +229,63 @@ func TestStaleAfterRules(t *testing.T) {
 	}
 	if !(&Provider{ID: BuiltinID}).Fresh(at) || (&Provider{ID: BuiltinID, Stale: true}).Fresh(at) {
 		t.Fatal("builtin freshness")
+	}
+}
+
+// TestHubAlignedRules: the rules the Hub's reference reader (internal/vpn
+// Parse / Lookup) has, which this reader must not be laxer than.
+func TestHubAlignedRules(t *testing.T) {
+	const key = "HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw="
+	const peerKey = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg="
+	bp := `{"id":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}`
+	for name, doc := range map[string]string{
+		"empty server key": `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"","domains":[],"peers":[]},"providers":[` + bp + `],"devices":[]}`,
+		"peer device_id":   `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + key + `","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"` + peerKey + `","device_id":"","expires":null}]},"providers":[` + bp + `],"devices":[]}`,
+		"device device_id": `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + key + `","domains":[],"peers":[]},"providers":[` + bp + `],"devices":[{"ip":"10.213.0.5","provider":"builtin","user":"a","device_id":"","name":"n","expires":null}]}`,
+		"orphan builtin":   `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + key + `","domains":[],"peers":[]},"providers":[],"devices":[]}`,
+	} {
+		if _, err := Parse([]byte(doc)); err == nil {
+			t.Errorf("%s: parsed", name)
+		}
+	}
+	// A built-in device needs its peer (same ip and device_id), unexpired.
+	doc := `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + key + `","domains":[],
+	 "peers":[{"ip":"10.213.0.5","public_key":"` + peerKey + `","device_id":"d1","expires":"2026-11-13T12:00:00Z"}]},
+	 "providers":[` + bp + `],
+	 "devices":[{"ip":"10.213.0.5","provider":"builtin","user":"a","device_id":"d1","name":"n","expires":null},
+	            {"ip":"10.213.0.6","provider":"builtin","user":"b","device_id":"d2","name":"n","expires":null}]}`
+	d, err := Parse([]byte(doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 11, 13, 11, 0, 0, 0, time.UTC)
+	if d.Device(BuiltinID, netip.MustParseAddr("10.213.0.5"), at) == nil {
+		t.Fatal("device with its peer denied")
+	}
+	if d.Device(BuiltinID, netip.MustParseAddr("10.213.0.6"), at) != nil {
+		t.Fatal("device without a peer allowed")
+	}
+	if d.Device(BuiltinID, netip.MustParseAddr("10.213.0.5"), at.Add(time.Hour)) != nil {
+		t.Fatal("device allowed after its peer expired")
+	}
+}
+
+// TestProviderFromIngress: the lookup is per provider (the ingress the
+// connection came through): another provider's device address is denied
+// even though it is a valid device of the file.
+func TestProviderFromIngress(t *testing.T) {
+	d, err := Parse([]byte(docOK))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Date(2026, 11, 13, 10, 1, 0, 0, time.UTC)
+	tail := netip.MustParseAddr("100.64.0.7")
+	if d.Device("hs", tail, at) == nil {
+		t.Fatal("own device denied")
+	}
+	for _, p := range []string{BuiltinID, "", "other"} {
+		if d.Device(p, tail, at) != nil {
+			t.Fatalf("hs's device allowed through %q", p)
+		}
 	}
 }

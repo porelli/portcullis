@@ -134,10 +134,8 @@ func (d *Doc) validate() error {
 			return errors.New("builtin.subnet: not an IPv4 prefix between /8 and /30")
 		}
 		d.Builtin.subnet = p
-		if k := d.Builtin.ServerPublicKey; k != "" {
-			if _, err := ParseKey(k); err != nil {
-				return errors.New("builtin.server_public_key: not a WireGuard key")
-			}
+		if _, err := ParseKey(d.Builtin.ServerPublicKey); err != nil {
+			return errors.New("builtin.server_public_key: not a WireGuard key")
 		}
 		ips := map[netip.Addr]bool{}
 		keys := map[string]bool{}
@@ -157,6 +155,9 @@ func (d *Doc) validate() error {
 				return fmt.Errorf("builtin.peers[%d].public_key: duplicate key", i)
 			}
 			keys[pe.PublicKey] = true
+			if pe.DeviceID == "" {
+				return fmt.Errorf("builtin.peers[%d].device_id: empty", i)
+			}
 		}
 	}
 	ids := map[string]bool{}
@@ -214,6 +215,9 @@ func (d *Doc) validate() error {
 		}
 		p.gateway = g
 	}
+	if d.Builtin != nil && d.ProviderByID(BuiltinID) == nil {
+		return errors.New("builtin: a builtin section without a builtin provider")
+	}
 	d.byAddr = map[netip.Addr]int{}
 	for i := range d.Devices {
 		dv := &d.Devices[i]
@@ -231,8 +235,8 @@ func (d *Doc) validate() error {
 		if !p.contains(a) {
 			return fmt.Errorf("devices[%d].ip: outside its provider's ranges", i)
 		}
-		if dv.User == "" {
-			return fmt.Errorf("devices[%d].user: empty", i)
+		if dv.User == "" || dv.DeviceID == "" {
+			return fmt.Errorf("devices[%d]: empty user or device_id", i)
 		}
 		dv.addr = a
 		d.byAddr[a] = i
@@ -322,8 +326,11 @@ func (d *Doc) ProviderByID(id string) *Provider {
 }
 
 // Device is the device with address a under provider, or nil when the
-// provider is absent or stale, a lies outside its ranges, no device has a,
-// or the device's expires has passed.
+// provider is absent or stale, a lies outside its ranges, no device of
+// that provider has a, the device's expires has passed, or (built-in) its
+// peer is missing or expired. provider must come from the ingress the
+// connection arrived through (the edge port / the people stack), never
+// from anything a gateway or client sends.
 func (d *Doc) Device(provider string, a netip.Addr, now time.Time) *Device {
 	if d == nil {
 		return nil
@@ -340,11 +347,29 @@ func (d *Doc) Device(provider string, a netip.Addr, now time.Time) *Device {
 	if dv.Provider != provider {
 		return nil
 	}
-	if dv.Expires != nil && !now.Before(*dv.Expires) {
+	if expired(dv.Expires, now) {
 		return nil
+	}
+	if provider == BuiltinID {
+		// A built-in device also needs its WireGuard peer, unexpired: the
+		// peer is what wg loads, the device what group-gate binds.
+		if d.Builtin == nil {
+			return nil
+		}
+		ok := false
+		for _, pe := range d.Builtin.Peers {
+			if pe.IP == dv.IP && pe.DeviceID == dv.DeviceID && !expired(pe.Expires, now) {
+				ok = true
+			}
+		}
+		if !ok {
+			return nil
+		}
 	}
 	return dv
 }
+
+func expired(t *time.Time, now time.Time) bool { return t != nil && !now.Before(*t) }
 
 // BuiltinPeers are the built-in peers whose expires hasn't passed at now.
 func (d *Doc) BuiltinPeers(now time.Time) []BuiltinPeer {
@@ -353,7 +378,7 @@ func (d *Doc) BuiltinPeers(now time.Time) []BuiltinPeer {
 	}
 	var out []BuiltinPeer
 	for _, pe := range d.Builtin.Peers {
-		if pe.Expires != nil && !now.Before(*pe.Expires) {
+		if expired(pe.Expires, now) {
 			continue
 		}
 		k, _ := ParseKey(pe.PublicKey) // validated by Parse
