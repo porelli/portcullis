@@ -249,13 +249,13 @@ services:
     healthcheck:
       test: ["CMD", "wget", "-q", "http://127.0.0.1/"]
 YML
-printf '      test: ["CMD", "bash", "-c", "a b"]\n' > "$WORK/hl/.github/workflows/x.yml"
+printf '      test: ["CMD", "wget", "-q", "http://127.0.0.1/"]\n      test: ["CMD", "bash", "-c", "a b"]\n' > "$WORK/hl/.github/workflows/x.yml"
 expect_eq "lint_healthchecks.sh flags a spaced CMD argument, a split CMD-SHELL, a newline and an inline workflow override (a plain CMD passes)" \
   "$(PATH="${PATH#"$WORK/bin:"}" "$WORK/hl/tests/lint_healthchecks.sh" "$WORK/hl-root/.env" docker-compose.yml 2>&1 | sed 's/:[0-9]*:.*//' ; echo "rc=${PIPESTATUS[0]}")" "docker-compose.yml: a: a CMD argument has whitespace (Podman re-splits it): use one CMD-SHELL string
 docker-compose.yml: b: CMD-SHELL needs exactly one command string
 docker-compose.yml: c: a test element has a newline
 a workflow's inline compose override has a CMD healthcheck argument with whitespace:
-.github/workflows/x.yml
+.github/workflows/x.yml:2
 rc=1"
 
 # Fully qualified base images (rootless Podman: podman build never relies
