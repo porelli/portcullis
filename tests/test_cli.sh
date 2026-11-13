@@ -1122,6 +1122,8 @@ expect_eq "the people router uses client-cert-pem@file, before portcullis-groups
   "rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups@docker,hub-proxy-secret@docker,security-headers@file"
 expect_eq "group-gate mounts group_gate_data read-write, has group_add 10001 (+ 10007 for vpn.json), and both CA files read-only; GATE_CRL_URLS lists pki_int and pki_file" \
   "$(printf '%s\n' "$GG_SVC" | grep -cxE '      - group_gate_data:/data|    group_add: \["10001", "10007"\]|      - \./certs/yubikey-ca\.crt:/etc/group-gate/ca/yubikey-ca\.crt:ro|      - \./certs/browser-ca\.crt:/etc/group-gate/ca/browser-ca\.crt:ro|      GATE_YUBIKEY_CA_FILE: /etc/group-gate/ca/yubikey-ca\.crt|      GATE_BROWSER_CA_FILE: /etc/group-gate/ca/browser-ca\.crt|      GATE_OPENED_DIR: /data/opened|      GATE_CRL_URLS: http://vault:8200/v1/pki_int/crl http://vault:8200/v1/pki_file/crl|      GATE_DELTA_CRL_URLS: http://vault:8200/v1/pki_int/crl/delta http://vault:8200/v1/pki_file/crl/delta'):$(printf '%s\n' "$GG_SVC" | grep -cE 'GATE_(DELTA_)?CRL_URL:' || true)" "9:0"
+expect_eq "group-gate reads vpn.json from vpn_doc (read-only)" \
+  "$(printf '%s\n' "$GG_SVC" | grep -cxE '      GATE_VPN_FILE: /vpn-doc/vpn\.json|      - vpn_doc:/vpn-doc:ro')" 2
 # shellcheck disable=SC2016  # a literal ${IMPERSONATION_MAX_MINUTES:-30}
 expect_eq "group-gate has GATE_IMPERSONATION_FILE under /hub-data; hub has HUB_IMPERSONATION_MAX_MINUTES" \
   "$(printf '%s\n' "$GG_SVC" | sed -n 's/^      GATE_IMPERSONATION_FILE: //p'):$(printf '%s\n' "$GG_SVC" | grep -cxF '      - hub_data:/hub-data:ro'):$(svc hub | sed -n 's/^      HUB_IMPERSONATION_MAX_MINUTES: //p')" \

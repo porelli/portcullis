@@ -748,6 +748,7 @@ jobs:
                      and $l["traefik.http.routers.people-vpn-enrol.tls.options"] == $l["traefik.http.routers.people.tls.options"]
                      and ($l["traefik.http.routers.people-vpn-enrol.priority"] | tonumber) > ($l["traefik.http.routers.people.rule"] | length))
                 and $g.labels["traefik.http.middlewares.vpn-required-path.replacepath.path"] == "/vpn-required"
+                and $g.environment.GATE_VPN_FILE == "/vpn-doc/vpn.json"
                 and ([.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.entrypoints$")) | .value] | unique == ["websecure,vpnsecure"])' >/dev/null
           }
           # With the monitoring profile, Prometheus is wg's metrics network's only other member.
@@ -1776,20 +1777,21 @@ jobs:
 
       - name: Test mTLS authentication with client cert
         run: |
-          # The Hub isn't running yet: a policy file v6 (contract §4) like the
+          # The Hub isn't running yet: a policy file v7 (contract §4) like the
           # Hub's fresh install writes (the four starting methods, Standard the
           # default, every gated core page on Standard; the later steps add
           # their keys to it). Without a file group-gate denies everything.
-          jq -n '{version: 6, methods: ["passkey_device", "passkey_synced", "security_key", "yubikey_cert"],
+          jq -n '{version: 7, methods: ["passkey_device", "passkey_synced", "security_key", "yubikey_cert"],
                   templates: {standard: {op: "any", items: [{op: "any", items: ["passkey_synced", "passkey_device", "security_key"]},
                                                             {op: "any", items: ["yubikey_cert"]}]}},
                   default: "standard", hosts: {},
                   core: ([""] + ["directory.", "hub.", "metrics.", "people.", "traefik."]
                          | map({key: (. + "portcullis.local"), value: "standard"}) | from_entries),
-                  people: {}, add_stronger: false, extra_domains: []}' > /tmp/ci-policy-v6.json
+                  people: {}, add_stronger: false, extra_domains: [],
+                  vpn: {hosts: {}, server_mode: false, admin_only: false, public_enrol: true, devices_file: "vpn.json"}}' > /tmp/ci-policy-v7.json
           docker run --rm -i -v portcullis_hub_data:/d docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
               sh -c 'cat > /d/group-gate-policy.json.tmp && chmod 644 /d/group-gate-policy.json.tmp && mv /d/group-gate-policy.json.tmp /d/group-gate-policy.json' \
-            < /tmp/ci-policy-v6.json
+            < /tmp/ci-policy-v7.json
           # ci-gated has no forward-auth, so the tests send the session headers
           # portcullis-auth would set, the access token included: group-gate
           # reads only its amr / preferred_username (oauth2-proxy verified it
@@ -1946,7 +1948,7 @@ jobs:
           # path_groups through Traefik: group-gate only sees the path via
           # X-Forwarded-Uri set by Traefik's forwardAuth.
           jq '. + {groups: {"gated.portcullis.local": "users_ci"}, path_groups: {"gated.portcullis.local": [{prefix: "/admin", group: "admin_ci"}]}}' \
-            /tmp/ci-policy-v6.json | policy
+            /tmp/ci-policy-v7.json | policy
           # (the gated router has no forward-auth, so the groups header is the test's)
           for p in /admin /admin/x /%61dmin //admin /x/../admin /ADMIN '/admin;x=1' /admin%2fx; do
             code=$(gated "$p" --path-as-is -H 'X-Auth-Request-Groups: users_ci')
@@ -1956,7 +1958,7 @@ jobs:
           [ "$(gated /administrator -H 'X-Auth-Request-Groups: users_ci')" = 200 ] || { echo "FAIL: /administrator denied"; exit 1; }
           [ "$(gated /x%00 --path-as-is -H 'X-Auth-Request-Groups: users_ci')" = 403 ] || { echo "FAIL: NUL path allowed"; exit 1; }
           [ "$(gated / -H 'X-Auth-Request-Groups: other')" = 403 ] || { echo "FAIL: host group not enforced"; exit 1; }
-          policy < /tmp/ci-policy-v6.json
+          policy < /tmp/ci-policy-v7.json
           echo "PASS: path_groups enforced on Traefik's X-Forwarded-Uri (bypass variants denied)"
 
           # Attribute headers (contract §5): group-gate's reach the app, the
@@ -1990,13 +1992,13 @@ jobs:
           policy() { docker run --rm -i -v portcullis_hub_data:/d docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a \
                        sh -c 'cat > /d/group-gate-policy.json.tmp && chmod 644 /d/group-gate-policy.json.tmp && mv /d/group-gate-policy.json.tmp /d/group-gate-policy.json'; }
           # No public_paths entry (or an older file version / subdomain keys): denied.
-          policy < /tmp/ci-policy-v6.json
-          [ "$(pub /s/AbC123)" = 403 ] || { echo "FAIL: public path allowed without a v6 public_paths entry"; exit 1; }
+          policy < /tmp/ci-policy-v7.json
+          [ "$(pub /s/AbC123)" = 403 ] || { echo "FAIL: public path allowed without a v7 public_paths entry"; exit 1; }
           PP='{"paths":[{"path":"/s/{token}","match":"prefix"}],"token_pattern":"^[A-Za-z0-9-]{1,32}$"}'
           for old in "{\"version\":4,\"public_paths\":{\"public\":$PP}}" \
                      "{\"version\":5,\"public_paths\":{\"public.portcullis.local\":$PP}}" \
-                     "$(jq -c --argjson pp "$PP" '. + {version: 5, public_paths: {"public.portcullis.local": $pp}}' /tmp/ci-policy-v6.json)" \
-                     "$(jq -c --argjson pp "$PP" '. + {public_paths: {public: $pp}}' /tmp/ci-policy-v6.json)"; do
+                     "$(jq -c --argjson pp "$PP" '. + {version: 6, public_paths: {"public.portcullis.local": $pp}}' /tmp/ci-policy-v7.json)" \
+                     "$(jq -c --argjson pp "$PP" '. + {public_paths: {public: $pp}}' /tmp/ci-policy-v7.json)"; do
             echo "$old" | policy
             [ "$(pub /s/AbC123)" = 403 ] || { echo "FAIL: public path allowed by $old"; exit 1; }
           done
@@ -2004,7 +2006,7 @@ jobs:
                     paths: [{path: "/s/{token}", match: "prefix"}, {path: "/dist", match: "static"}],
                     token_pattern: "^[A-Za-z0-9-]{1,32}$", static_extensions: ["js", "css"],
                     credential_headers: ["X-Api-Key"], credential_cookies: ["nc_token"], credential_query: ["auth_token"]}}}' \
-            /tmp/ci-policy-v6.json | policy
+            /tmp/ci-policy-v7.json | policy
           for p in /s/AbC123 /s/AbC123/download /dist/core-common.js; do
             [ "$(pub "$p")" = 200 ] || { echo "FAIL: public $p denied"; docker compose logs --tail=10 group-gate; exit 1; }
           done
@@ -2023,7 +2025,7 @@ jobs:
             -H 'X-Forwarded-Attr-City: Forged' https://public.portcullis.local/s/AbC123 > /tmp/pub-attrs.out || true
           grep -q 'Hostname' /tmp/pub-attrs.out || { echo "FAIL: public path not served"; cat /tmp/pub-attrs.out; exit 1; }
           if grep -qi 'Forged' /tmp/pub-attrs.out; then echo "FAIL: forged X-Forwarded-Attr-* reached a public router's app"; exit 1; fi
-          policy < /tmp/ci-policy-v6.json
+          policy < /tmp/ci-policy-v7.json
           echo "PASS: public guard: only published paths, no credentials (PHP-normalised names)"
 
       - name: Test the socket proxies
@@ -2137,7 +2139,7 @@ jobs:
           echo "PASS: the Hub syncs its template sources at start and on SIGHUP; upgrade prints the result"
 
           # Product default (contract §4, §8.1): on a fresh install the Hub
-          # publishes policy file v6 with the four starting methods, Standard
+          # publishes policy file v7 with the four starting methods, Standard
           # (any passkey or a YubiKey certificate) the default and Strong
           # (security key or certificate) on hub / people, and group-gate
           # applies the default to every app host without its own pick — here
@@ -2149,7 +2151,7 @@ jobs:
                       --cert /tmp/test-client.crt --key /tmp/test-client.key "$@" https://gated.portcullis.local/ || true; }
           STANDARD='{"op":"any","items":[{"op":"any","items":["passkey_synced","passkey_device","security_key"]},{"op":"any","items":["yubikey_cert"]}]}'
           for i in $(seq 1 30); do
-            policy_file | jq -e --argjson std "$STANDARD" '.version == 6 and .methods == ["passkey_device", "passkey_synced", "security_key", "yubikey_cert"]
+            policy_file | jq -e --argjson std "$STANDARD" '.version == 7 and .methods == ["passkey_device", "passkey_synced", "security_key", "yubikey_cert"]
                 and .default == "standard" and .templates.standard == $std
                 and .templates.strong == {op: "any", items: ["security_key", "yubikey_cert"]}
                 and .core["hub.portcullis.local"] == "strong" and .core["people.portcullis.local"] == "strong"
@@ -3389,12 +3391,12 @@ jobs:
             [ "$HAS" = "$WANT" ] || { echo "FAIL: $c has the portcullis-invite-client scope: $HAS (want $WANT)"; exit 1; }
           done
 
-          # group-gate policy file v6 (normally written by the Hub), with the
+          # group-gate policy file v7 (normally written by the Hub), with the
           # Hub's fresh-install methods and Standard default (any passkey or
           # a YubiKey certificate). "app" has no template of its own
           # (passkey and cert-only sessions must both pass); every core
           # page on Standard.
-          printf '%s' '{"version": 6,
+          printf '%s' '{"version": 7,
             "methods": ["passkey_device", "passkey_synced", "security_key", "yubikey_cert"],
             "templates": {"standard": {"op": "any", "items": [{"op": "any", "items": ["passkey_synced", "passkey_device", "security_key"]}, {"op": "any", "items": ["yubikey_cert"]}]},
                           "e2e-hwk": {"op": "any", "items": ["security_key"]}, "e2e-mtls": {"op": "any", "items": ["yubikey_cert"]}},
@@ -3405,7 +3407,8 @@ jobs:
                      "traefik.portcullis.local": "standard"},
             "people": {}, "add_stronger": false, "extra_domains": [],
             "groups": {"app.portcullis.local": "users_e2e", "hwk.portcullis.local": "users_e2e", "mtls.portcullis.local": "users_e2e"},
-            "path_groups": {"app.portcullis.local": [{"prefix": "/admin", "group": "admin_e2e"}]}}' \
+            "path_groups": {"app.portcullis.local": [{"prefix": "/admin", "group": "admin_e2e"}]},
+            "vpn": {"hosts": {}, "server_mode": false, "admin_only": false, "public_enrol": true, "devices_file": "vpn.json"}}' \
             | docker run --rm -i -v portcullis_hub_data:/d "$ALPINE" sh -c 'cat > /d/group-gate-policy.json && chmod 644 /d/group-gate-policy.json'
           # The extension's signin-keycloak.json (normally written by the Hub;
           # without it nobody signs in, contract §8.1): the same methods and
@@ -3903,7 +3906,7 @@ jobs:
           # What the Hub published: policy v6 keyed by hostname, the extra domain.
           policy_file() { docker run --rm -v portcullis_hub_data:/d:ro "$ALPINE" cat /d/group-gate-policy.json; }
           for i in $(seq 1 30); do
-            policy_file | jq -e --arg x "$E2E_EXTRA" '.version == 6 and .extra_domains == [$x]
+            policy_file | jq -e --arg x "$E2E_EXTRA" '.version == 7 and .extra_domains == [$x]
                 and .groups["echo-a.\($x)"] == "users_echo-a" and .groups["echo-c.\($x)"] == "users_echo-c"
                 and .groups["echo-b.portcullis.local"] == "users_echo-b"
                 and .hosts["echo-c.\($x)"] == "e2e-cert" and .templates["e2e-cert"] == {op: "any", items: ["yubikey_cert"]}
@@ -4505,7 +4508,7 @@ jobs:
           # native-OIDC clients with their templates in signin-keycloak.json.
           hub_file() { docker run --rm --network none -v portcullis_hub_data:/d:ro "$ALPINE" cat "/d/$1"; }
           for i in $(seq 1 30); do
-            hub_file group-gate-policy.json | jq -e --arg d "$E2E_DOMAIN" '.version == 6
+            hub_file group-gate-policy.json | jq -e --arg d "$E2E_DOMAIN" '.version == 7
                 and .hosts["echo-basic.\($d)"] == "basic" and .hosts["echo-cert.\($d)"] == "e2e-cert"
                 and .hosts["echo-file.\($d)"] == "e2e-file" and .hosts["echo-anycert.\($d)"] == "e2e-anycert"
                 and (.methods | index("browser_cert") != null)

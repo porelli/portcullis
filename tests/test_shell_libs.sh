@@ -1037,12 +1037,12 @@ expect_eq "status --json: a failing pki_file list leaves certs_issued unknown" \
 # ── upgrade: pinned Hub image, policy file version (final review M1) ──
 # dc stub: exec prints $STUB_DIR/pv (the policy version), logs $STUB_DIR/gglog.
 pv() { (dc() { case "$1" in exec) cat "$STUB_DIR/pv" 2>/dev/null ;; logs) cat "$STUB_DIR/gglog" 2>/dev/null ;; esac; }; sleep() { :; }; "$@"; hub_policy_check 2 2>&1); }
-echo 6 > "$STUB_DIR/pv"; : > "$STUB_DIR/gglog"
+echo 7 > "$STUB_DIR/pv"; : > "$STUB_DIR/gglog"
 expect_ok "upgrade: matching policy version is fine" sh -c "printf '%s' \"\$1\" | grep -q 'matches group-gate'" _ "$(pv unset HUB_IMAGE)"
-echo 5 > "$STUB_DIR/pv"
+echo 6 > "$STUB_DIR/pv"
 OUT="$(pv export HUB_IMAGE=ghcr.io/porelli/portcullis-hub:v0.1)"
-expect_ok "upgrade: old policy version names the pinned image and the fix" sh -c "printf '%s' \"\$1\" | grep -q 'version 5, this core' && printf '%s' \"\$1\" | grep -q 'remove HUB_IMAGE=ghcr.io/porelli/portcullis-hub:v0.1'" _ "$OUT"
-echo 6 > "$STUB_DIR/pv"; echo "group-gate: deny host=x: policy file version 7 is not supported (only 6)" > "$STUB_DIR/gglog"
+expect_ok "upgrade: old policy version names the pinned image and the fix" sh -c "printf '%s' \"\$1\" | grep -q 'version 6, this core' && printf '%s' \"\$1\" | grep -q 'remove HUB_IMAGE=ghcr.io/porelli/portcullis-hub:v0.1'" _ "$OUT"
+echo 7 > "$STUB_DIR/pv"; echo "group-gate: deny host=x: policy file version 8 is not supported (only 7)" > "$STUB_DIR/gglog"
 expect_ok "upgrade: group-gate deny log is reported" sh -c "printf '%s' \"\$1\" | grep -q 'denying every app host'" _ "$(pv unset HUB_IMAGE)"
 rm -f "$STUB_DIR/pv" "$STUB_DIR/gglog"
 # ── upgrade: the Hub syncs its template sources (SIGHUP, status file) ──

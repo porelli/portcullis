@@ -181,6 +181,7 @@ import collections
 import datetime
 import hashlib
 import html
+import ipaddress
 import json
 import math
 import os
@@ -263,13 +264,13 @@ ANY_SIGNED_IN = "*"
 # can't say which methods an app accepts; a newer one may carry
 # restrictions we would drop). A file without `version` denies too, and so
 # does a missing file (no method is on, no template is known).
-POLICY_VERSION = 6
+POLICY_VERSION = 7
 # /public-guard needs a file of exactly this version (no `version` = deny).
-PUBLIC_GUARD_VERSION = 6
+PUBLIC_GUARD_VERSION = 7
 # The maps of the policy file keyed by hostname (contract §4).
 HOST_MAPS = ("hosts", "groups", "path_groups", "public_paths")
 # The v6 keys the Hub always writes; a file without one of them denies.
-POLICY_REQUIRED_KEYS = ("methods", "templates", "default", "hosts", "core", "people", "add_stronger")
+POLICY_REQUIRED_KEYS = ("methods", "templates", "default", "hosts", "core", "people", "add_stronger", "vpn")
 # Keys that may be missing (= empty, as before v6). Any other key denies.
 POLICY_OPTIONAL_KEYS = ("extra_domains", "groups", "path_groups", "public_paths", "expiring")
 # Reserved group (contract §4): the Hub publishes it for routed apps whose
@@ -586,6 +587,9 @@ def validate_policy_doc(doc) -> Optional[str]:
             return f"'people' entry {user!r} is not a lowercase user with a list of switched-on methods"
     if type(doc["add_stronger"]) is not bool:
         return "'add_stronger' is not a boolean"
+    err = validate_vpn_section(doc["vpn"])
+    if err:
+        return f"'vpn': {err}"
     for name in HOST_MAPS:
         m = doc.get(name)
         if m is None:
@@ -1517,6 +1521,418 @@ def log_uri(raw_uri: str, cfg: Optional[PublicConfig] = None) -> str:
 # ── Metrics (GET /metrics, Prometheus text format) ────────────────────
 
 
+# ── VPN (contract §4 policy v7 `vpn`, vpn.json v2, §16) ───────────────
+#
+# A VPN-only host (policy `vpn.hosts`, or a core host of a class the mode
+# makes VPN-only) needs the device ↔ person binding: the client address
+# (the last X-Forwarded-For entry, which Traefik appends from the PROXY v2
+# source on vpnsecure) names one provider by its ranges (disjoint across
+# the file); that provider must be accepted by the host's `via` and fresh
+# by this clock; a device of that provider must hold the address,
+# unexpired (a built-in one with its unexpired peer); and its owner must be
+# the signed-in person. Everything fails closed: a missing or invalid
+# vpn.json, a malformed `vpn` section (the whole policy then denies), an
+# address that isn't IPv4.
+
+VPN_FILE = os.environ.get("GATE_VPN_FILE", "/vpn-doc/vpn.json")
+VPN_DEVICES_FILE = "vpn.json"
+VPN_DOC_VERSION = 2
+VPN_BUILTIN = "builtin"
+VPN_SOURCES = ("builtin", "hook", "static")
+VPN_EDGE_PORTS = range(9001, 9001 + 47)
+# A hook provider's stale_after − refreshed_at: at most 3 × the 10 min refresh cap.
+VPN_MAX_STALE_SPAN = 1800.0
+VPN_VIA_MAX = 8
+VPN_PROVIDER_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+VPN_REQUIRED_TEXT = "This app is only reachable over a Portcullis VPN. Connect your device and reload."
+VPN_NOT_YOURS_TEXT = "this device isn't yours; sign in on your own device"
+VPN_STALE_TEXT = "your VPN's device list is out of date; try again in a minute"
+VPN_POLICY_KEYS = ("hosts", "server_mode", "admin_only", "public_enrol", "devices_file")
+
+# Core-host classes (contract §4): the subdomain of a core host → its class
+# ("" = the main domain, the portal). `enrol` is people's /vpn/ paths.
+CORE_HOST_CLASSES = {"traefik": "admin", "hub": "admin", "directory": "admin", "metrics": "admin",
+                     "auth": "admin", "people": "core", "": "core"}
+
+
+def validate_vpn_section(v) -> Optional[str]:
+    """Why a policy file's `vpn` value must deny everything, or None."""
+    if not isinstance(v, dict):
+        return "not an object"
+    if set(v) != set(VPN_POLICY_KEYS):
+        return f"keys must be exactly {list(VPN_POLICY_KEYS)}"
+    for k in ("server_mode", "admin_only", "public_enrol"):
+        if type(v[k]) is not bool:
+            return f"{k!r} is not a boolean"
+    if v["server_mode"] and v["admin_only"]:
+        return "'server_mode' and 'admin_only' are both true"
+    if v["devices_file"] != VPN_DEVICES_FILE:
+        return f"'devices_file' is not {VPN_DEVICES_FILE!r}"
+    hosts = v["hosts"]
+    if not isinstance(hosts, dict):
+        return "'hosts' is not an object"
+    core = core_hosts()
+    for h, entry in hosts.items():
+        if not valid_hostname(h):
+            return f"'hosts' key {h!r} is not a valid hostname"
+        if h in core:
+            return f"'hosts' key {h!r} is a core host"
+        if not isinstance(entry, dict) or set(entry) != {"via"}:
+            return f"'hosts' entry {h!r} is not exactly {{\"via\": [...]}}"
+        via = entry["via"]
+        if not isinstance(via, list) or not via:
+            return f"'hosts' entry {h!r}: 'via' is not a non-empty list"
+        if via == ["*"]:
+            continue
+        if (len(via) > VPN_VIA_MAX or len(set(map(str, via))) != len(via)
+                or not all(isinstance(i, str) and VPN_PROVIDER_ID_RE.fullmatch(i) for i in via)):
+            return f"'hosts' entry {h!r}: 'via' is not [\"*\"] or 1–{VPN_VIA_MAX} provider ids"
+    return None
+
+
+def _vpn_pairs(pairs):
+    """json object_pairs_hook: a duplicate key refuses the document."""
+    out = {}
+    for k, val in pairs:
+        if k in out:
+            raise ValueError(f"duplicate key {k!r}")
+        out[k] = val
+    return out
+
+
+def _vpn_keys(obj, allowed, where):
+    if not isinstance(obj, dict):
+        raise ValueError(f"{where}: not an object")
+    unknown = [k for k in obj if k not in allowed]
+    if unknown:
+        raise ValueError(f"{where}: unknown key {sorted(unknown)[0]!r}")
+
+
+def _vpn_str(obj, key, where, nonempty=False) -> str:
+    val = obj.get(key, "")
+    if not isinstance(val, str) or (nonempty and not val):
+        raise ValueError(f"{where}.{key}: not a{' non-empty' if nonempty else ''} string")
+    return val
+
+
+def _vpn_time(obj, key, where) -> Optional[float]:
+    val = obj.get(key)
+    if val is None:
+        return None
+    try:
+        return _parse_rfc3339(val)
+    except ValueError:
+        raise ValueError(f"{where}.{key}: not an RFC 3339 time") from None
+
+
+def _vpn_v4(text, where) -> ipaddress.IPv4Address:
+    try:
+        return ipaddress.IPv4Address(text)
+    except (ipaddress.AddressValueError, ValueError, TypeError):
+        raise ValueError(f"{where}: not an IPv4 address") from None
+
+
+def _vpn_net(text, where) -> ipaddress.IPv4Network:
+    try:
+        net = ipaddress.IPv4Network(text, strict=True)
+    except (ValueError, TypeError):
+        raise ValueError(f"{where}: not an IPv4 prefix without host bits") from None
+    if not 8 <= net.prefixlen <= 30:
+        raise ValueError(f"{where}: not between /8 and /30")
+    return net
+
+
+def _vpn_key_ok(text) -> bool:
+    if not isinstance(text, str):
+        return False
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except (ValueError, TypeError):
+        return False
+    return len(raw) == 32 and base64.b64encode(raw).decode() == text
+
+
+def parse_vpn_doc(doc) -> dict:
+    """The validated vpn.json v2 (contract §4), or ValueError: unknown or
+    duplicate keys (the caller's json.loads uses _vpn_pairs), a version
+    other than 2, overlapping ranges, duplicate addresses or keys, a device
+    outside its provider's ranges, a provider without a valid source, a hook
+    provider without refreshed_at / stale_after (≤ 30 min apart), a static
+    or built-in one with either. The reader the vectors drive (with the edge's
+    and the Hub's). Returns {"providers": {id: {...}}, "nets": [(net, id)],
+    "devices": {ip: {...}}, "peers": {(ip, device_id): expires}}."""
+    _vpn_keys(doc, ("version", "builtin", "providers", "devices"), "$")
+    if type(doc.get("version")) is not int or doc["version"] != VPN_DOC_VERSION:
+        raise ValueError(f"version: only {VPN_DOC_VERSION}")
+    builtin = doc.get("builtin")
+    subnet, peers = None, {}
+    if builtin is not None:
+        _vpn_keys(builtin, ("subnet", "server_public_key", "domains", "peers"), "builtin")
+        subnet = _vpn_net(builtin.get("subnet"), "builtin.subnet")
+        if not _vpn_key_ok(builtin.get("server_public_key")):
+            raise ValueError("builtin.server_public_key: not a WireGuard key")
+        domains = builtin.get("domains", [])
+        if not isinstance(domains, list) or not all(isinstance(x, str) for x in domains):
+            raise ValueError("builtin.domains: not a list of names")
+        plist = builtin.get("peers", [])
+        if not isinstance(plist, list):
+            raise ValueError("builtin.peers: not a list")
+        ips, keys = set(), set()
+        for i, pe in enumerate(plist):
+            w = f"builtin.peers[{i}]"
+            _vpn_keys(pe, ("ip", "public_key", "device_id", "expires"), w)
+            a = _vpn_v4(pe.get("ip"), w + ".ip")
+            if a not in subnet or a in (subnet.network_address, subnet.network_address + 1, subnet.broadcast_address):
+                raise ValueError(f"{w}.ip: not a client address of the subnet")
+            if a in ips:
+                raise ValueError(f"{w}.ip: duplicate address")
+            if not _vpn_key_ok(pe.get("public_key")) or pe["public_key"] in keys:
+                raise ValueError(f"{w}.public_key: not a WireGuard key or duplicate")
+            did = _vpn_str(pe, "device_id", w, nonempty=True)
+            ips.add(a)
+            keys.add(pe["public_key"])
+            peers[(str(a), did)] = _vpn_time(pe, "expires", w)
+    plist = doc.get("providers", [])
+    if not isinstance(plist, list):
+        raise ValueError("providers: not a list")
+    providers, nets, ports = {}, [], set()
+    for i, p in enumerate(plist):
+        w = f"providers[{i}]"
+        _vpn_keys(p, ("id", "source", "label", "ranges", "edge_port", "gateway_ip", "refreshed_at",
+                      "stale_after", "stale"), w)
+        pid = _vpn_str(p, "id", w, nonempty=True)
+        if pid in providers:
+            raise ValueError(f"{w}.id: duplicate")
+        source = p.get("source")
+        if source not in VPN_SOURCES:
+            raise ValueError(f"{w}.source: builtin, hook or static")
+        if (pid == VPN_BUILTIN) != (source == "builtin"):
+            raise ValueError(f"{w}: the builtin id and source go together")
+        _vpn_str(p, "label", w)
+        ranges = p.get("ranges")
+        if not isinstance(ranges, list) or not 1 <= len(ranges) <= 8:
+            raise ValueError(f"{w}.ranges: 1–8 IPv4 prefixes")
+        own = []
+        for j, r in enumerate(ranges):
+            n = _vpn_net(r, f"{w}.ranges[{j}]")
+            for other, oid in nets:
+                if other.overlaps(n):
+                    raise ValueError(f"{w}.ranges[{j}]: overlaps a range of {oid}")
+            nets.append((n, pid))
+            own.append(n)
+        stale = p.get("stale", False)
+        if type(stale) is not bool:
+            raise ValueError(f"{w}.stale: not a boolean")
+        port = p.get("edge_port", 0)
+        if type(port) is not int:
+            raise ValueError(f"{w}.edge_port: not an integer")
+        gateway = _vpn_str(p, "gateway_ip", w)
+        refreshed, stale_after = _vpn_time(p, "refreshed_at", w), _vpn_time(p, "stale_after", w)
+        if pid == VPN_BUILTIN:
+            if builtin is None:
+                raise ValueError("providers: a builtin provider without a builtin section")
+            if own != [subnet]:
+                raise ValueError("providers: builtin ranges differ from builtin.subnet")
+            if port != 0 or gateway != "" or refreshed is not None or stale_after is not None:
+                raise ValueError("providers: builtin has an edge port, a gateway, refreshed_at or stale_after")
+        else:
+            if port not in VPN_EDGE_PORTS or port in ports:
+                raise ValueError(f"{w}.edge_port: outside 9001–9047 or duplicate")
+            ports.add(port)
+            _vpn_v4(gateway, f"{w}.gateway_ip")
+            if source == "hook":
+                if refreshed is None or stale_after is None:
+                    raise ValueError(f"{w}: a hook provider needs refreshed_at and stale_after")
+                if not 0 < stale_after - refreshed <= VPN_MAX_STALE_SPAN:
+                    raise ValueError(f"{w}.stale_after: not within 30 min after refreshed_at")
+            elif refreshed is not None or stale_after is not None:
+                raise ValueError(f"{w}: a static provider carries no refreshed_at or stale_after")
+        providers[pid] = {"id": pid, "source": source, "nets": own, "stale": stale, "stale_after": stale_after}
+    if builtin is not None and VPN_BUILTIN not in providers:
+        raise ValueError("builtin: a builtin section without a builtin provider")
+    dlist = doc.get("devices", [])
+    if not isinstance(dlist, list):
+        raise ValueError("devices: not a list")
+    devices = {}
+    for i, d in enumerate(dlist):
+        w = f"devices[{i}]"
+        _vpn_keys(d, ("ip", "provider", "user", "device_id", "name", "expires"), w)
+        a = _vpn_v4(d.get("ip"), w + ".ip")
+        if str(a) in devices:
+            raise ValueError(f"{w}.ip: duplicate address")
+        pid = _vpn_str(d, "provider", w, nonempty=True)
+        if pid not in providers:
+            raise ValueError(f"{w}.provider: not a provider of the file")
+        if not any(a in n for n in providers[pid]["nets"]):
+            raise ValueError(f"{w}.ip: outside its provider's ranges")
+        devices[str(a)] = {"ip": str(a), "provider": pid, "user": _vpn_str(d, "user", w, nonempty=True),
+                           "device_id": _vpn_str(d, "device_id", w, nonempty=True),
+                           "name": _vpn_str(d, "name", w), "expires": _vpn_time(d, "expires", w)}
+    return {"providers": providers, "nets": nets, "devices": devices, "peers": peers}
+
+
+_VPN_LOCK = threading.Lock()
+_VPN_CACHE: dict = {}
+
+
+def load_vpn_file(now: Optional[float] = None) -> Optional[dict]:
+    """The validated vpn.json (parse_vpn_doc), cached by (dev, inode,
+    mtime, size), or None when it is missing, unreadable or invalid. A
+    failure is logged once per change of the file, never its content."""
+    try:
+        st = os.stat(VPN_FILE)
+        stamp = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError as e:
+        stamp = ("missing", type(e).__name__)
+    with _VPN_LOCK:
+        if _VPN_CACHE.get("stamp") != stamp:
+            doc, err = None, None
+            if stamp[0] == "missing":
+                err = f"can't be read ({stamp[1]})"
+            else:
+                try:
+                    with open(VPN_FILE, encoding="utf-8") as f:
+                        doc = parse_vpn_doc(json.load(f, object_pairs_hook=_vpn_pairs))
+                except OSError as e:
+                    err = f"can't be read ({type(e).__name__})"
+                except ValueError as e:
+                    err = f"is invalid ({str(e)[:160]})"
+                except Exception as e:  # RecursionError and any other parse failure
+                    err = f"is invalid ({type(e).__name__})"
+            _VPN_CACHE.clear()
+            _VPN_CACHE.update(stamp=stamp, doc=doc)
+            if err:
+                print(f"group-gate: {VPN_FILE} {err}: every VPN-only request is denied", flush=True)
+        return _VPN_CACHE.get("doc")
+
+
+def vpn_provider_fresh(p: dict, now: float) -> bool:
+    """Never when marked stale; a hook provider only before stale_after."""
+    if p["stale"]:
+        return False
+    if p["source"] in ("builtin", "static"):
+        return True
+    return p["source"] == "hook" and p["stale_after"] is not None and now < p["stale_after"]
+
+
+def vpn_provider_of(doc: dict, addr) -> Optional[dict]:
+    for n, pid in doc["nets"]:
+        if addr in n:
+            return doc["providers"][pid]
+    return None
+
+
+def _vpn_device_state(doc: dict, provider: str, addr, now: float) -> Tuple[Optional[dict], str]:
+    """(device, "") for a usable device of `provider` at addr, else (None,
+    "unknown" | "expired" | "stale" | "outside")."""
+    p = doc["providers"].get(provider)
+    if p is None or vpn_provider_of(doc, addr) is not p:
+        return None, "outside"
+    if not vpn_provider_fresh(p, now):
+        return None, "stale"
+    d = doc["devices"].get(str(addr))
+    if d is None or d["provider"] != provider:
+        return None, "unknown"
+    if d["expires"] is not None and now >= d["expires"]:
+        return None, "expired"
+    if provider == VPN_BUILTIN:
+        key = (d["ip"], d["device_id"])
+        if key not in doc["peers"]:
+            return None, "unknown"
+        exp = doc["peers"][key]
+        if exp is not None and now >= exp:
+            return None, "expired"
+    return d, ""
+
+
+def vpn_device(doc: dict, provider: str, ip, now: float) -> Optional[dict]:
+    """The device of `provider` at ip, usable at now, or None (the shared
+    vectors' lookup: provider-scoped, like the edge's and the Hub's)."""
+    try:
+        addr = ipaddress.IPv4Address(ip)
+    except (ValueError, TypeError):
+        return None
+    return _vpn_device_state(doc, provider, addr, now)[0]
+
+
+def client_address(headers) -> Optional[ipaddress.IPv4Address]:
+    """The last X-Forwarded-For entry as IPv4 (Traefik appends the
+    connection's remote address, on vpnsecure the PROXY v2 source); None
+    for anything else."""
+    raw = headers.get("X-Forwarded-For", "") or ""
+    last = raw.split(",")[-1].strip()
+    try:
+        return ipaddress.IPv4Address(last)
+    except (ValueError, TypeError):
+        return None
+
+
+def core_class(host: str, raw_uri: str) -> Optional[str]:
+    """The core-host class of a core host: admin, core, or (people's
+    /vpn/ paths, every reading of the path under /vpn/) enrol; None for a
+    core host group-gate doesn't class (enroll, mcp)."""
+    sub = "" if host == DOMAIN else host[: -len(DOMAIN) - 1]
+    cls = CORE_HOST_CLASSES.get(sub)
+    if cls == "core" and sub == "people":
+        try:
+            cands = normalize_path_candidates(raw_uri or "/")
+        except PathError:
+            return "core"
+        if cands and all(c.startswith("/vpn/") for c in cands):
+            return "enrol"
+    return cls
+
+
+def _vpn_required(policy_doc: dict, host: str, kind: str, raw_uri: str) -> Optional[List[str]]:
+    """The `via` of a request that needs the binding, or None (internet)."""
+    v = policy_doc["vpn"]
+    if kind == "core":
+        cls = core_class(host, raw_uri)
+        on = ((cls == "admin" and (v["admin_only"] or v["server_mode"]))
+              or (cls == "core" and v["server_mode"])
+              or (cls == "enrol" and v["server_mode"] and not v["public_enrol"]))
+        return ["*"] if on else None
+    entry = v["hosts"].get(host)
+    return list(entry["via"]) if entry is not None else None
+
+
+def vpn_binding(policy_doc: dict, vpn_doc: Optional[dict], host: str, kind: str, path: str,
+                addr, username: Optional[str], now: float):
+    """(reason, page text, device): reason None = allowed (device set when
+    the binding ran). username None skips step 3 (the public guard)."""
+    via = _vpn_required(policy_doc, host, kind, path)
+    if via is None:
+        return None, "", None
+    if vpn_doc is None:
+        return "vpn_no_doc", VPN_REQUIRED_TEXT, None
+    p = vpn_provider_of(vpn_doc, addr) if addr is not None else None
+    if p is None:
+        return "vpn_not_vpn", VPN_REQUIRED_TEXT, None
+    if via != ["*"] and p["id"] not in via:
+        return "vpn_via", VPN_REQUIRED_TEXT, None
+    d, why = _vpn_device_state(vpn_doc, p["id"], addr, now)
+    if why == "stale":
+        return "vpn_stale", VPN_STALE_TEXT, None
+    if why == "expired":
+        return "vpn_expired", VPN_REQUIRED_TEXT, None
+    if d is None:
+        return "vpn_unknown_device", VPN_REQUIRED_TEXT, None
+    if username is not None and d["user"] != username.lower():
+        return "vpn_other_owner", VPN_NOT_YOURS_TEXT, None
+    return None, "", d
+
+
+def vpn_check(policy_doc, vpn_doc, host, kind, path, addr, username, now) -> Optional[Tuple[str, str]]:
+    """None = allowed; else (reason, page_text) (contract §4 binding)."""
+    reason, text, _ = vpn_binding(policy_doc, vpn_doc, host, kind, path, addr, username, now)
+    return None if reason is None else (reason, text)
+
+
+def render_vpn_page(text: str) -> bytes:
+    return (f"<!doctype html><meta charset=\"utf-8\"><title>Portcullis VPN</title>{FAVICON_LINK}"
+            f"<h1>{MARK_HTML}VPN only</h1><p>{html.escape(text)}</p>").encode()
+
+
 class Metrics:
     """Tiny thread-safe counter registry (no client library in the image)."""
 
@@ -1926,7 +2342,8 @@ class OpenedLog:
             time.sleep(0.005)
         return True
 
-    def record(self, user, session, host, app, methods, ip, ua, act="", now: Optional[datetime.datetime] = None) -> None:
+    def record(self, user, session, host, app, methods, ip, ua, act="", now: Optional[datetime.datetime] = None,
+               vpn: Optional[dict] = None) -> None:
         """Queue the line for (session, host) unless this process already
         wrote (or queued) it. Never raises, never blocks on the disk."""
         try:
@@ -1943,6 +2360,11 @@ class OpenedLog:
                    "methods": [m for m in METHOD_IDS if m in set(methods or ())],
                    "ip": _log_field(ip, 64), "ua": _log_field(ua, self.FIELD_MAX),
                    "act": _log_field(act, self.FIELD_MAX)}
+            if vpn is not None:
+                # A request that passed the VPN binding (contract §4 "The
+                # opened log (VPN)"): the provider and the device id.
+                doc.update(via="vpn", provider=_log_field(vpn.get("provider", ""), self.FIELD_MAX),
+                           device=_log_field(vpn.get("device_id", ""), self.FIELD_MAX))
             line = (json.dumps(doc, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
             with self._lock:
                 if key in self._seen:
@@ -2975,6 +3397,52 @@ class Handler(BaseHTTPRequestHandler):
                             "needs_stronger", f"NEEDS-STRONGER {what} set_up={set_up}")
         return True
 
+    def _vpn_answer(self, reason: str, text: str, log: str):
+        """403 with a VPN page (the binding's text, never the owner)."""
+        body = render_vpn_page(text)
+        METRICS.inc("group_gate_requests_total", endpoint=self._endpoint, result="deny")
+        METRICS.inc("group_gate_denials_total", reason=reason)
+        self.send_response(403)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", SIGNIN_CSP)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        print(f"group-gate: {log}", flush=True)
+
+    def _vpn_gate(self, policy_doc: dict, host: str, kind: str, raw_uri: str,
+                  username: Optional[str]) -> bool:
+        """The VPN binding (contract §4); True when the request was denied.
+        Sets self._vpn to the bound device for the opened log."""
+        self._vpn = None
+        addr = client_address(self.headers)
+        try:
+            needed = _vpn_required(policy_doc, host, kind, raw_uri) is not None
+            vdoc = load_vpn_file() if needed else None
+            reason, text, dev = vpn_binding(policy_doc, vdoc, host, kind, raw_uri, addr, username, time.time())
+        except Exception as e:  # noqa: BLE001 — fail closed on anything unexpected
+            reason, text, dev = "vpn_no_doc", VPN_REQUIRED_TEXT, None
+            print(f"group-gate: VPN check failed ({type(e).__name__}): denied", flush=True)
+        if reason is not None:
+            self._vpn_answer(reason, text, f"DENIED user={username or '-'} host={host} addr={addr} reason={reason}")
+            return True
+        self._vpn = dev
+        return False
+
+    def _vpn_required_page(self):
+        """/vpn-required (the Hub's portcullis-vpnonly-<id> routers, through
+        vpn-required-path): a static 403, no sign-in, no cookie."""
+        body = render_vpn_page(VPN_REQUIRED_TEXT)
+        METRICS.inc("group_gate_requests_total", endpoint="vpn_required", result="deny")
+        self.send_response(403)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", SIGNIN_CSP)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _record_opened(self, username: str, host: str):
         """The opened log's line for this allowed request (first per
         (session, host)); never fails the request."""
@@ -2986,7 +3454,7 @@ class Handler(BaseHTTPRequestHandler):
             rec = getattr(self, "_imp", None)
             OPENED_LOG.record(username.lower(), session, host, app_name(host), getattr(self, "_have", set()),
                               self.headers.get("X-Real-Ip", "") or "", self.headers.get("User-Agent", "") or "",
-                              act=rec["admin"] if rec is not None else "")
+                              act=rec["admin"] if rec is not None else "", vpn=getattr(self, "_vpn", None))
         except Exception as e:  # noqa: BLE001
             METRICS.inc("group_gate_opened_log_failures_total")
             print(f"group-gate: opened log failed ({type(e).__name__}: {e})", flush=True)
@@ -3036,6 +3504,10 @@ class Handler(BaseHTTPRequestHandler):
             if not DOMAIN_OK:
                 raise PolicyError(f"PORTCULLIS_DOMAIN={DOMAIN!r} is not a valid hostname")
             doc = load_policy_file()
+            # V17: the portal is a group-gate backend, not forward-auth: the
+            # VPN binding of class core is checked here too.
+            if self._vpn_gate(doc, DOMAIN, "core", "/", user):
+                return
             if self._signin_check(doc, DOMAIN, "core", user, self._cert_ok(serials) if serials else False,
                                   rec=rec):
                 return
@@ -3069,6 +3541,17 @@ class Handler(BaseHTTPRequestHandler):
             kind = host_kind(host, extra_domains(doc))
             if kind in ("main", "extra"):
                 reason = public_guard_check(doc, host, self.headers, raw_uri)
+                if not reason:
+                    # A VPN-only app host: steps 1 and 2 only (V17: nobody
+                    # is signed in on a public path, so no owner to bind).
+                    try:
+                        vdoc = load_vpn_file() if _vpn_required(doc, host, kind, raw_uri) is not None else None
+                        vr, _, _ = vpn_binding(doc, vdoc, host, kind, raw_uri, client_address(self.headers),
+                                               None, time.time())
+                    except Exception as e:  # noqa: BLE001
+                        vr = f"vpn check failed ({type(e).__name__})"
+                    if vr:
+                        reason = f"VPN: {vr}"
                 try:
                     cfg = public_config_for(doc, host)
                 except PolicyError:
@@ -3093,6 +3576,7 @@ class Handler(BaseHTTPRequestHandler):
         # Per request (a kept-alive connection reuses the handler).
         self._have, self._claims = set(), {}
         self._imp, self._banner = None, ""
+        self._vpn = None
         gate_path = urllib.parse.urlsplit(self.path).path
         if gate_path == "/metrics":
             body = METRICS.render().encode()
@@ -3115,6 +3599,9 @@ class Handler(BaseHTTPRequestHandler):
         if gate_path == "/public-guard":
             self._endpoint = "public_guard"
             self._public_guard()
+            return
+        if gate_path == "/vpn-required":
+            self._vpn_required_page()
             return
         # Every other path: the full checks (there is no self-service path).
         self._endpoint = "gate"
@@ -3220,6 +3707,12 @@ class Handler(BaseHTTPRequestHandler):
                 f"(domain={DOMAIN!r}, extra_domains={extra_domains(policy_doc)})",
                 "host",
             )
+            return
+
+        # --- VPN binding (contract §4): after the identity checks, before
+        # the membership checks; only VPN-only hosts (and core classes the
+        # mode makes VPN-only) need it.
+        if self._vpn_gate(policy_doc, host, kind, self.headers.get("X-Forwarded-Uri", ""), username):
             return
 
         # --- Temporary memberships: an expired one is absent, whatever the

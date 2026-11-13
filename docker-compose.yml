@@ -848,6 +848,10 @@ services:
       # sign-in part 3): missing, invalid or older than 300 s = no
       # impersonation counts (impersonated requests denied).
       GATE_IMPERSONATION_FILE: /hub-data/impersonation.json
+      # The Hub's vpn.json (contract §4 / §16; the vpn_doc volume, group
+      # 10007): the device ↔ person binding of VPN-only hosts. Missing or
+      # invalid = every VPN-only request is denied.
+      GATE_VPN_FILE: /vpn-doc/vpn.json
       # Required: core hosts are <sub>.<PORTCULLIS_DOMAIN> (map.conf) and
       # app hosts <label>.<PORTCULLIS_DOMAIN> or on an enrolled domain
       # (policy v5 extra_domains); any other X-Forwarded-Host is denied.
