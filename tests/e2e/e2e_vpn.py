@@ -533,9 +533,56 @@ def main() -> int:
             state["ts_alice"] = True
         check("tailnet_register: a userspace tailscaled node registered as alice through Keycloak", tailnet_register)
 
+        def tailnet_diag(label: str) -> None:
+            """The tailnet data path hop by hop, into the artifacts: alice's
+            tailscaled and the gateway (status, serve config, ping, netcheck,
+            container state and env PORTCULLIS_VPN_EDGE), wg's edge metrics
+            for the provider and its vpn.json section. No secret is in any
+            of them (node keys are public, no auth key is printed)."""
+            gw = f"portcullis-{HS}-gateway-1"
+            gsock, asock = "--socket=/tmp/tailscaled.sock", "--socket=/tmp/ts.sock"
+            out = []
+
+            def add(title, *cmd, timeout=60):
+                rc, o = sh(*cmd, timeout=timeout)
+                out.append(f"## {title} (exit {rc})\n{redact(o)[-6000:]}\n")
+            add("gateway: container state", "docker", "inspect", "-f",
+                "{{.State.Status}} exit={{.State.ExitCode}} restarts={{.RestartCount}} started={{.State.StartedAt}} "
+                "{{range .Config.Env}}{{if eq (index (split . \"=\") 0) \"PORTCULLIS_VPN_EDGE\"}}{{.}}{{end}}{{end}}", gw)
+            add("gateway: tailscale status", "docker", "exec", gw, "tailscale", gsock, "status")
+            add("gateway: tailscale serve status", "docker", "exec", gw, "tailscale", gsock, "serve", "status", "--json")
+            add("gateway: netcheck", "docker", "exec", gw, "tailscale", gsock, "netcheck", timeout=90)
+            add("gateway: log", "docker", "logs", "--tail", "80", gw)
+            add("alice: tailscale status", "docker", "exec", "ts-alice", "tailscale", asock, "status")
+            add("alice: netcheck", "docker", "exec", "ts-alice", "tailscale", asock, "netcheck", timeout=90)
+            add("alice: ping the gateway", "docker", "exec", "ts-alice", "tailscale", asock, "ping", "--c", "3",
+                "--timeout", "5s", "portcullis-gateway", timeout=60)
+            add("alice: log", "docker", "logs", "--tail", "80", "ts-alice")
+            add("wg: edge metrics", "sh", "-c",
+                "docker run --rm --network portcullis_portcullis-metrics-wg %s -s http://wg-metrics:9100/metrics | grep -E '^wg_edge_.*provider=\"%s\"' || true"
+                % (CURL_IMG, HS))
+            rc, vj = sh("docker", "run", "--rm", "-v", "portcullis_vpn_doc:/d:ro", os.environ["ALPINE"], "cat", "/d/vpn.json")
+            try:
+                d = json.loads(vj)
+                sect = {"valid_until": d.get("valid_until"), "provider": [p for p in d["providers"] if p["id"] == HS],
+                        "devices": [x for x in d["devices"] if x["provider"] == HS]}
+                out.append("## vpn.json: the tailnet provider\n" + json.dumps(sect, indent=1) + "\n")
+            except (ValueError, KeyError) as e:
+                out.append(f"## vpn.json unreadable: {e}\n")
+            text = "\n".join(out)
+            os.makedirs(base.ART, exist_ok=True)
+            with open(os.path.join(base.ART, f"tailnet-diag-{label}.txt"), "w") as f:
+                f.write(text)
+            print(f"    tailnet diagnostics ({label}): e2e-artifacts/tailnet-diag-{label}.txt", flush=True)
+            print(text[:4000], flush=True)
+
         def tailnet_opens():
             needs("ts_alice", "vpn_only")
-            until("echo-vpn through the tailnet", lambda: opens(*ts_get("alice", cookie_file=state["alice_cookie"])), 150)
+            try:
+                until("echo-vpn through the tailnet", lambda: opens(*ts_get("alice", cookie_file=state["alice_cookie"])), 150)
+            except AssertionError:
+                tailnet_diag("opens")
+                raise
         check("tailnet_opens: through the headscale gateway with alice's session, echo-vpn opens", tailnet_opens)
 
         def tailnet_dns():
