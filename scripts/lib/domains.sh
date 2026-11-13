@@ -135,13 +135,18 @@ domains_age_keygen() {
   ok "Generated secrets/domains/age.key (encrypts the domains service's DNS credentials; backed up with secrets/)."
 }
 
-# domains_enrolled — false only when the running domains service reports
-# no enrolled domain (unknown — not running, an old image — counts as
-# enrolled: the lookups run).
-domains_enrolled() {
+# domains_enrolled_state — what the running domains service says about
+# enrolled domains: "enrolled" (≥ 1), "none" (a confirmed 0) or "unknown"
+# (not running — e.g. during `up` after a `down` —, an error, odd output).
+domains_enrolled_state() {
   local n
-  n="$(dc exec -T domains domains enrolled 2>/dev/null | tr -d '[:space:]')" || return 0
-  [ "$n" != 0 ]
+  if ! n="$(dc exec -T domains domains enrolled 2>/dev/null | tr -d '[:space:]')" || ! [[ "$n" =~ ^[0-9]+$ ]]; then
+    echo unknown
+  elif [ "$n" -gt 0 ]; then
+    echo enrolled
+  else
+    echo none
+  fi
 }
 
 # _domains_last <4|6> [<address>] — the last detected address (stored, or
@@ -161,50 +166,57 @@ _domains_last() {
 }
 
 # domains_public_ips — the server's public IPv4 / IPv6 for the domains
-# service's A/AAAA records (contract §12.1). An explicit
-# PORTCULLIS_PUBLIC_IPV4 / _IPV6 (environment or .env; an empty _IPV6 =
-# no IPv6) always wins; otherwise public_ip_detect (HTTPS, two services
-# must agree, global unicast only) — skipped while no domain is enrolled
-# (domains_enrolled): then no address unless .env sets one. A lookup that
-# ran and failed keeps the last detected address. No address = the service
-# keeps the records it set and renews certificates, but sets no new
-# records (fail closed). The result is
+# service: its enrolled domains' A/AAAA records (contract §12.1) and the
+# main-domain plan's A/AAAA check (so the lookups run with no domain
+# enrolled too). An explicit PORTCULLIS_PUBLIC_IPV4 / _IPV6 (environment
+# or .env; an empty _IPV6 = no IPv6) always wins; otherwise
+# public_ip_detect (HTTPS, two services must agree, global unicast only).
+# The last detected address (last-public-ipv4 / -ipv6) is saved, and a
+# failed lookup falls back to it ("no IPv6" would remove the AAAA
+# records), unless the running domains service confirms 0 domains
+# (domains_enrolled_state "none"); "unknown" (not running during `up`
+# after a `down`, an error) keeps the fallback, so a transient IPv6
+# failure never removes AAAA records. The files are host-specific: backups
+# leave them out and restore deletes them (backup.sh), so restored
+# secrets/ never hand the old server's address to the first enrollment.
+# No address = the service keeps the records it set and renews
+# certificates, but sets no new records (fail closed). The result is
 # written to secrets/domains/public-ips.env, the domains service's
 # env_file (a manual `docker compose up` gets it too).
 domains_public_ips() {
-  local v4="${PORTCULLIS_PUBLIC_IPV4:-}" v6="${PORTCULLIS_PUBLIC_IPV6:-}" lookup=true
-  if [ -z "$v4" ] || [ -z "${PORTCULLIS_PUBLIC_IPV6+x}" ]; then
-    domains_enrolled || lookup=false
-  fi
+  local v4="${PORTCULLIS_PUBLIC_IPV4:-}" v6="${PORTCULLIS_PUBLIC_IPV6:-}" state=""
+  # _enrolled — false only for a confirmed 0 (domains_enrolled_state, asked once).
+  _enrolled() {
+    [ -n "$state" ] || state="$(domains_enrolled_state)"
+    [ "$state" != none ]
+  }
   if [ -z "$v4" ]; then
-    [ "$lookup" = false ] || v4="$(public_ip_detect 4)"
+    v4="$(public_ip_detect 4)"
     if [ -n "$v4" ]; then
-      _domains_last 4 "$v4"
-    elif [ "$lookup" = true ]; then
-      # Only a lookup that ran and failed falls back to the last address
-      # (a skipped one publishes none: secrets/ restored on a new server
-      # must not hand the old server's address to the first enrollment).
+      if _enrolled; then _domains_last 4 "$v4"; fi
+    elif _enrolled; then
       v4="$(_domains_last 4)"
       if [ -n "$v4" ]; then
         warn "IPv4 detection failed: keeping the last detected address $v4 (set PORTCULLIS_PUBLIC_IPV4 in .env if it changed)."
       else
         warn "Could not detect the public IPv4 reliably (two HTTPS services must agree on a global address): added domains keep their records but get no new ones until it is known — set PORTCULLIS_PUBLIC_IPV4 in .env."
       fi
+    else
+      warn "Could not detect the public IPv4 reliably (two HTTPS services must agree on a global address): the A/AAAA records of ${PORTCULLIS_DOMAIN:-the domain} can't be checked — set PORTCULLIS_PUBLIC_IPV4 in .env."
     fi
   fi
   if [ -z "${PORTCULLIS_PUBLIC_IPV6+x}" ]; then
     # No IPv6 means "remove the AAAA records": a transient detection
     # failure keeps the last detected address instead.
-    v6=""
-    [ "$lookup" = false ] || v6="$(public_ip_detect 6)"
+    v6="$(public_ip_detect 6)"
     if [ -n "$v6" ]; then
-      _domains_last 6 "$v6"
-    elif [ "$lookup" = true ]; then
+      if _enrolled; then _domains_last 6 "$v6"; fi
+    elif _enrolled; then
       v6="$(_domains_last 6)"
       [ -z "$v6" ] || warn "IPv6 detection failed: keeping the last detected address $v6 (set PORTCULLIS_PUBLIC_IPV6= in .env if the server has no IPv6 any more)."
     fi
   fi
-  [ "$lookup" = true ] || info "No added domain: public address lookups skipped (run ./portcullis up again after adding the first domain)."
+  unset -f _enrolled
   export PORTCULLIS_PUBLIC_IPV4="$v4" PORTCULLIS_PUBLIC_IPV6="$v6"
   (umask 077 && printf 'DOMAINS_PUBLIC_IPV4=%s\nDOMAINS_PUBLIC_IPV6=%s\n' "$v4" "$v6" > "$(_domains_dir)/public-ips.env")
 }

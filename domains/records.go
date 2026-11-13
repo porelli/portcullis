@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/netip"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,13 +68,40 @@ func (fixedZone) FindZone(fqdn string) (string, error) {
 	return dns.Fqdn(strings.TrimPrefix(fqdn, "_acme-challenge.")), nil
 }
 
+// newPorkbunProvider wraps libdns/porkbun v1.1.0 (lib) for what it gets
+// wrong: deletes go by record ID (provider_byid.go: the library deletes
+// by name and type), and CAA values are read unquoted (porkbunCAARead).
+func newPorkbunProvider(lib dnsProvider, api recordAPI) dnsProvider {
+	return newByIDDelete(porkbunCAARead{lib}, api)
+}
+
+// porkbunCAARead: libdns/porkbun v1.1.0's toLibdnsRecord keeps a CAA
+// value's quotes (content `0 issue "x"` reads as Value "\"x\"", while
+// libdns writes it with %q). Its GetRecords answers are unquoted once
+// (strconv.Unquote, the inverse of that %q), so the plan sees what was
+// written; a value that doesn't unquote is left as is. Only porkbun's
+// reads: every other library already parses CAA through libdns.
+type porkbunCAARead struct{ dnsProvider }
+
+func (p porkbunCAARead) GetRecords(ctx context.Context, zone string) ([]libdns.Record, error) {
+	recs, err := p.dnsProvider.GetRecords(ctx, zone)
+	for i, r := range recs {
+		if c, ok := r.(libdns.CAA); ok && len(c.Value) >= 2 && strings.HasPrefix(c.Value, `"`) && strings.HasSuffix(c.Value, `"`) {
+			if u, uerr := strconv.Unquote(c.Value); uerr == nil {
+				c.Value = u
+				recs[i] = c
+			}
+		}
+	}
+	return recs, err
+}
+
 var providers = map[string]providerSpec{
 	"cloudflare": {required: []string{"api_token"}, build: func(c map[string]string) (dnsProvider, error) {
 		return &cloudflare.Provider{APIToken: c["api_token"], HTTPClient: &http.Client{Timeout: providerTimeout}}, nil
 	}, dnssec: newCloudflareDNSSEC},
 	"porkbun": {required: []string{"api_key", "secret_api_key"}, build: func(c map[string]string) (dnsProvider, error) {
-		// Deletes by record ID (provider_byid.go): the library deletes by name and type.
-		return newByIDDelete(&porkbun.Provider{APIKey: c["api_key"], APISecretKey: c["secret_api_key"]},
+		return newPorkbunProvider(&porkbun.Provider{APIKey: c["api_key"], APISecretKey: c["secret_api_key"]},
 			newPorkbunAPI(c["api_key"], c["secret_api_key"])), nil
 	}},
 	"route53": {required: []string{"access_key_id", "secret_access_key"}, optional: []string{"hosted_zone_id"}, build: func(c map[string]string) (dnsProvider, error) {

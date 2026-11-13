@@ -9,7 +9,7 @@
 //	domains healthcheck  exit 0 if the API answers /healthz (Docker HEALTHCHECK)
 //	domains enrolled   the number of enrolled domains
 //	domains dns …      the one-shot DNS tool (tool.go)
-//	domains traefik-account-uri <acme.json>, domains report --main --json
+//	domains traefik-account-uri <acme.json>, domains report --main --json|--refresh
 package main
 
 import (
@@ -76,8 +76,9 @@ func main() {
 			}
 			return
 		case "enrolled":
-			// How many domains the store holds (./portcullis up skips the
-			// public-address lookups while it is 0).
+			// How many domains the store holds (./portcullis up keeps the
+			// last detected public address after a failed lookup only
+			// while it isn't 0).
 			n, err := enrolledCount(env("DOMAINS_DATA_DIR", "/data"), env("DOMAINS_AGE_KEY_FILE", "/run/portcullis/domains/age.key"))
 			if err != nil {
 				log.Fatal(err)

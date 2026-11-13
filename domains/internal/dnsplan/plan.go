@@ -459,7 +459,7 @@ func addressItems(ctx context.Context, in Input, d string, fix Fix, cnameAt func
 				it.Want = []string{}
 				// Info, not Warning: nothing failed (never a failed lookup).
 				it.Status, it.Severity, it.Fix = StatusUnknown, SevInfo, FixNone
-				it.Steps = []string{"the server's public addresses are unknown (./portcullis up detects them once a domain is enrolled, or set PORTCULLIS_PUBLIC_IPV4 / _IPV6 in .env)"}
+				it.Steps = []string{"the server's public addresses are unknown (./portcullis up detects them, or set PORTCULLIS_PUBLIC_IPV4 / _IPV6 in .env)"}
 				out = append(out, it)
 				continue
 			}
@@ -937,7 +937,7 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 				}
 			}
 			if !s.IPv4.IsValid() {
-				return written, removed, errors.New("the server's public IPv4 is unknown (./portcullis up detects it once a domain is enrolled — run it again — or set PORTCULLIS_PUBLIC_IPV4 in .env)")
+				return written, removed, errors.New("the server's public IPv4 is unknown (./portcullis up detects it — run it again — or set PORTCULLIS_PUBLIC_IPV4 in .env)")
 			}
 			for _, r := range want[SetAddress] {
 				written = append(written, RefOf(r, zone))

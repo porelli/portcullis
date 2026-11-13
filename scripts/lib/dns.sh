@@ -230,7 +230,7 @@ dns_setup() {
   case "$rc" in
     0) ok "Applied: $DNS_SETS" ;;
     1) warn "Applied, but not everything is visible at the public resolvers yet (normal, can take longer)." ;;
-    *) fail "applying the DNS records failed (exit $rc; the message is above)" ;;
+    *) dns_main_refresh; fail "applying the DNS records failed (exit $rc; the message is above)" ;;
   esac
   if [ "$dnssec" = true ]; then
     if [ "$provider" = cloudflare ]; then
@@ -242,6 +242,7 @@ dns_setup() {
       printf '%s' "$out" | jq -r '(.dnssec.steps // [])[] | "    → " + .'
     fi
   fi
+  dns_main_refresh
   dns_check false
 }
 
@@ -323,6 +324,7 @@ dns_tighten_main() {
   else
     warn "could not pin the CAA of $PORTCULLIS_DOMAIN to Traefik's account (fix: ./portcullis dns setup)"
   fi
+  dns_main_refresh
   return 0
 }
 
@@ -336,7 +338,17 @@ dns_relax_main() {
       _dns_tool apply --wait 2m >/dev/null); then
     warn "could not relax the CAA, or the public resolvers don't show it yet (they may cache the old pin for up to 5 minutes): issuance may fail on CAA until then (./portcullis dns setup)"
   fi
+  dns_main_refresh
   return 0
+}
+
+# dns_main_refresh — after the dns tool wrote the main domain's records
+# (out of process: the service can't see it), have the domains service
+# drop its cached main plan and rebuild it; otherwise status and the Hub
+# show the plan from before the write for up to an hour. Best effort:
+# nothing when the service isn't running.
+dns_main_refresh() {
+  dc exec -T domains domains report --main --refresh >/dev/null 2>&1 || true
 }
 
 # dns_status_json — the domains service's DNS report (main + enrolled

@@ -363,13 +363,36 @@ func runTraefikAccountURI(args []string, stdout, stderr io.Writer) int {
 	return exitOK
 }
 
-// runReport is `domains report --main --json` against base (the API).
+// runReport is `domains report --main --json` against base (the API);
+// `domains report --main --refresh` drops the service's cached main plan
+// and has it rebuilt (POST /main/dns/refresh: after the dns tool wrote
+// the main domain's records), printing nothing.
 func runReport(args []string, base, secret string, stdout, stderr io.Writer) int {
-	if len(args) != 2 || args[0] != "--main" || args[1] != "--json" {
-		fmt.Fprintln(stderr, "usage: domains report --main --json")
+	if len(args) != 2 || args[0] != "--main" || (args[1] != "--json" && args[1] != "--refresh") {
+		fmt.Fprintln(stderr, "usage: domains report --main --json|--refresh")
 		return exitUsage
 	}
 	c := &http.Client{Timeout: 3 * time.Minute}
+	if args[1] == "--refresh" {
+		req, err := http.NewRequest(http.MethodPost, base+"/main/dns/refresh", nil)
+		if err != nil {
+			fmt.Fprintf(stderr, "domains report: %v\n", err)
+			return exitFailure
+		}
+		req.Header.Set("Authorization", "Bearer "+secret)
+		resp, err := c.Do(req)
+		if err != nil {
+			fmt.Fprintf(stderr, "domains report: POST /main/dns/refresh: %v\n", err)
+			return exitFailure
+		}
+		defer resp.Body.Close()
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 16<<20))
+		if resp.StatusCode != http.StatusOK {
+			fmt.Fprintf(stderr, "domains report: POST /main/dns/refresh: HTTP %d\n", resp.StatusCode)
+			return exitFailure
+		}
+		return exitOK
+	}
 	get := func(path string, out any) error {
 		req, err := http.NewRequest(http.MethodGet, base+path, nil)
 		if err != nil {

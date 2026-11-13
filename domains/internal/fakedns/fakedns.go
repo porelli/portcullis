@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -109,6 +110,25 @@ type Provider struct {
 	DeleteMode string
 }
 
+// porkbunReads: DeleteMode "porkbun" (the whole library) also reads
+// records as libdns/porkbun v1.1.0's toLibdnsRecord does: a CAA's content
+// split on the first two spaces, the value kept as is, quotes included
+// (`0 issue "letsencrypt.org"` reads back as Value "\"letsencrypt.org\"").
+func (p *Provider) porkbunReads() bool { return p.DeleteMode == "porkbun" }
+
+// porkbunCAA is a stored CAA read the porkbun library's way.
+func porkbunCAA(rr libdns.RR) (libdns.Record, bool) {
+	parts := strings.SplitN(rr.Data, " ", 3)
+	if rr.Type != "CAA" || len(parts) != 3 {
+		return nil, false
+	}
+	flags, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return nil, false
+	}
+	return libdns.CAA{Name: rr.Name, TTL: rr.TTL, Flags: uint8(flags), Tag: parts[1], Value: parts[2]}, true
+}
+
 // FindZone reports the zone the provider manages for fqdn (the service
 // skips the SOA lookup for providers that know their zone).
 func (p *Provider) FindZone(fqdn string) (string, error) {
@@ -152,6 +172,10 @@ func (p *Provider) GetRecords(_ context.Context, zone string) ([]libdns.Record, 
 		}
 		for _, rr := range rrs {
 			rr.Name = libdns.RelativeName(name+".", zone)
+			if c, ok := porkbunCAA(rr); ok && p.porkbunReads() {
+				out = append(out, c)
+				continue
+			}
 			out = append(out, parsed(rr))
 		}
 	}
