@@ -49,8 +49,21 @@ config_build_ca_bundle() {
   ok "Wrote $bundle (system CAs$extra)"
 }
 
+# _cfg_flip_traefik_back — the flip stopped Traefik and didn't finish (an
+# interrupt, a failure): start it again when it was running, once. The
+# sentinel isn't written, so the flip stays pending.
+_cfg_flip_traefik_back() {
+  [ -n "${CFG_FLIP_WINDOW:-}" ] || return 0
+  CFG_FLIP_WINDOW=""
+  trap - EXIT INT TERM HUP
+  [ -n "${CFG_FLIP_TRAEFIK_WAS:-}" ] || return 0
+  info "Starting Traefik again..."
+  # No container to start (a recreate removed it): create it (M16).
+  dc start traefik >/dev/null 2>&1 || dc up -d --no-deps traefik >/dev/null 2>&1 || warn "could not start Traefik again (./portcullis up)"
+}
+
 config_apply() {
-  local staging sentinel last ca_server
+  local staging sentinel last ca_server flipping=false
   # lego's hetzner provider prefers HETZNER_API_TOKEN (the Cloud API) over
   # HETZNER_API_KEY (the legacy DNS API): both set = the wrong API.
   if [ "${DNS_PROVIDER:-}" = hetzner ] && [ -n "${HETZNER_API_TOKEN:-}" ]; then
@@ -65,6 +78,19 @@ config_apply() {
   caa="$(_dns_flag DNS_CAA true)" || exit 1
   staging="$(_bool "$(env_get ACME_STAGING)" false)"
   echo "  ACME_STAGING=$staging"
+  if [ "$staging" = true ]; then
+    ca_server="https://acme-staging-v02.api.letsencrypt.org/directory"
+    warn "TLS: Let's Encrypt STAGING — browsers will show certificate warnings."
+  else
+    ca_server="https://acme-v02.api.letsencrypt.org/directory"
+    info "TLS: Let's Encrypt production."
+  fi
+  # Traefik's DNS-01 provider (lego): hetzner-cloud is lego's hetzner with
+  # HETZNER_API_TOKEN (lego v5's hetznerv1, Traefik v3.7.17).
+  local acme_dns="${DNS_PROVIDER:-}"
+  [ "$acme_dns" != hetzner-cloud ] || acme_dns=hetzner
+  # The CA bundle (it may download) before anything stops (I9).
+  ACME_STAGING="$staging" config_build_ca_bundle
 
   # The ACME account + certs in acme.json are bound to the CA directory URL:
   # on a staging↔production flip clear them, or Traefik keeps reusing the
@@ -77,36 +103,72 @@ config_apply() {
     last=false
   fi
   if [ -n "$last" ] && [ "$last" != "$staging" ]; then
-    warn "ACME_STAGING flipped ($last → $staging): clearing Traefik's ACME storage."
-    dc stop traefik >/dev/null 2>&1 || true
+    warn "ACME_STAGING flipped ($last → $staging): Traefik needs a new ACME account and new certificates."
+    flipping=true
     # The new account Traefik registers can't order while the CAA is
-    # pinned to the old one: back to CA-only first (dns_tighten_main pins
-    # the new account after `up`).
-    if [ "$caa" = true ] && _dns_automated "${DNS_PROVIDER:-none}"; then
-      dns_relax_main
+    # pinned to the old one: back to CA-only first, and the storage is
+    # cleared only once no cache (the CA's either) can hold the old pin
+    # (dns_tighten_main pins the new account after `up`). Traefik keeps
+    # running through the relax and its wait: CA-only lets its current
+    # account renew. Anything short of settled stops here, fail safe:
+    # acme.json, the sentinel and the saved settle point stay, so nothing
+    # orders against the old pin and the next run redoes the flip.
+    # Only where Portcullis manages the CAA (DNS_CAA=true, an automated
+    # provider with its credentials): anywhere else there is no pin of
+    # ours to relax, so no relax, no settle point and no wait.
+    local relaxed=""
+    if [ "$caa" = true ] && _dns_automated "${DNS_PROVIDER:-none}" && _dns_creds_present "${DNS_PROVIDER:-none}"; then
+      relaxed=1
+      # The dns tool must understand this CLI's arguments (an `up` after a
+      # `git pull` runs this before its own rebuild).
+      domains_image_build "for the CAA relax"
+      dns_relax_main || fail "The ACME_STAGING flip is not finished (see above): Traefik runs on with its current ACME account and storage, so nothing is ordered against the old CAA pin, and the settle point is saved: running it again early just waits or stops again."
+    fi
+    # Every flip, managed or not: a saved settle point in the future, or a
+    # public CAA a NEW account couldn't order under, stops it here (N2).
+    dns_flip_guard "$ca_server" "$relaxed" || fail "The ACME_STAGING flip is not finished (see above): nothing changed, Traefik runs on with its current ACME account."
+    CFG_FLIP_TRAEFIK_WAS="$(dc ps -q --status running traefik 2>/dev/null || true)"
+    # From the stop until Traefik runs on the new CA, any way out — an
+    # interrupt (INT / TERM / HUP: an SSH drop), a `fail`, set -e — starts
+    # it again on its old container; the sentinel is written only at the
+    # end, so the flip stays pending (I9).
+    CFG_FLIP_WINDOW=1
+    trap '_cfg_flip_traefik_back' EXIT
+    trap '_cfg_flip_traefik_back; exit 130' INT TERM HUP
+    info "Stopping Traefik..."
+    # acme.json is never cleared under a running Traefik (M15).
+    # No container at all (after `down`) is nothing to stop (M20).
+    if ! dc stop traefik >/dev/null 2>&1 && [ -n "$(dc ps -aq traefik 2>/dev/null || echo unknown)" ]; then
+      fail "could not stop Traefik: the ACME_STAGING flip is not finished; run the same command again"
     fi
     if docker volume inspect portcullis_traefik_acme >/dev/null 2>&1; then
+      info "Clearing Traefik's ACME storage (acme.json)..."
       docker run --rm --network none -v portcullis_traefik_acme:/acme "$PORTCULLIS_HELPER_IMAGE" rm -f /acme/acme.json >/dev/null 2>&1 \
-        || warn "could not clear acme.json"
+        || fail "could not clear Traefik's ACME storage (acme.json): the ACME_STAGING flip is not finished; run the same command again"
     fi
   fi
-  if [ "$staging" = true ]; then
-    ca_server="https://acme-staging-v02.api.letsencrypt.org/directory"
-    warn "TLS: Let's Encrypt STAGING — browsers will show certificate warnings."
-  else
-    ca_server="https://acme-v02.api.letsencrypt.org/directory"
-    info "TLS: Let's Encrypt production."
-  fi
-  ACME_STAGING="$staging" config_build_ca_bundle
-  mkdir -p "$(dirname "$sentinel")"
-  echo "$staging" > "$sentinel"
+  # Written to .env AND exported: compose prefers the shell's value (which
+  # env_load exported from the old .env) over the file (N1).
   env_set ACME_CA_SERVER "$ca_server"
-  # Traefik's DNS-01 provider (lego): hetzner-cloud is lego's hetzner with
-  # HETZNER_API_TOKEN (lego v5's hetznerv1, Traefik v3.7.17).
-  local acme_dns="${DNS_PROVIDER:-}"
-  [ "$acme_dns" != hetzner-cloud ] || acme_dns=hetzner
+  export ACME_CA_SERVER="$ca_server"
   env_set ACME_DNS_PROVIDER "$acme_dns"
   export ACME_DNS_PROVIDER="$acme_dns"
+  if [ "$flipping" = true ] && [ -n "${CFG_FLIP_TRAEFIK_WAS:-}" ]; then
+    info "Starting Traefik again (it registers a new ACME account with $ca_server)..."
+    dc up -d --no-deps traefik >/dev/null 2>&1 || fail "could not start Traefik on $ca_server: the ACME_STAGING flip is not finished; run the same command again"
+  fi
+  # Only now (Traefik runs on the new CA, or isn't running: its next start
+  # reads the new value) is the flip done.
+  mkdir -p "$(dirname "$sentinel")"
+  echo "$staging" > "$sentinel"
+  if [ "$flipping" = true ]; then
+    CFG_FLIP_WINDOW=""
+    trap - EXIT INT TERM HUP
+    dns_relax_done
+  fi
+  # A pending relax's settle point (ACME_STAGING reverted mid-flip) stays
+  # until a flip finishes or a pin is written again (dns_tighten_main,
+  # dns setup): the old pin may still be cached.
   # TLS options are static (traefik/dynamic/tls.yml, tracked): the Hub
   # picks one per app router, core routers use authaware.
   ok "Updated ACME_CA_SERVER. Apply with: ./portcullis up"

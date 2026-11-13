@@ -1,6 +1,7 @@
 package fakedns
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -134,5 +135,34 @@ func TestQueriesLogged(t *testing.T) {
 	ask(t, s, "x.d.test", dns.TypeA, false)
 	if got := strings.Join(s.Queries(), "|"); got != "CAA d.test|A x.d.test" {
 		t.Fatalf("queries %q", got)
+	}
+}
+
+// libdns/porkbun v1.1.0's porkbunRecordPayload raises a TTL under 600 s to
+// 600 for every write, appends and SetRecords' edits alike.
+func TestPorkbunTTLFloor(t *testing.T) {
+	z := NewZone()
+	p := &Provider{Zone: z, DeleteMode: "porkbun", SetMode: "porkbun"}
+	ctx := context.Background()
+	if _, err := p.AppendRecords(ctx, "example.test.", []libdns.Record{libdns.RR{Name: "a", Type: "TXT", TTL: 300 * time.Second, Data: "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.SetRecords(ctx, "example.test.", []libdns.Record{libdns.RR{Name: "b", Type: "TXT", TTL: 60 * time.Second, Data: "y"},
+		libdns.RR{Name: "a", Type: "TXT", TTL: 120 * time.Second, Data: "z"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"a.example.test", "b.example.test"} {
+		for _, rr := range z.Records(n) {
+			if rr.TTL != 600*time.Second {
+				t.Errorf("%s stored TTL %s, want porkbun's 600 s floor", n, rr.TTL)
+			}
+		}
+	}
+	// 900 s stays 900 s.
+	if _, err := p.AppendRecords(ctx, "example.test.", []libdns.Record{libdns.RR{Name: "c", Type: "TXT", TTL: 900 * time.Second, Data: "x"}}); err != nil {
+		t.Fatal(err)
+	}
+	if rr := z.Records("c.example.test"); len(rr) != 1 || rr[0].TTL != 900*time.Second {
+		t.Fatalf("c = %v", rr)
 	}
 }

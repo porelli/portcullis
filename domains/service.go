@@ -90,6 +90,15 @@ type Service struct {
 	plans map[string]cachedPlan
 	// mainBuilding: the worker's main-plan rebuild is running (guarded by mu).
 	mainBuilding bool
+	// mainGen counts main-plan invalidations (guarded by mu).
+	mainGen int
+	// mainFlight: a request's main-plan build in progress (guarded by
+	// mu): later requests join it, and it finishes and is stored even when
+	// the request that started it gave up (M9).
+	mainFlight *planFlight
+	// runCtx: Run's context (guarded by mu), the parent of detached
+	// builds, so a shutdown ends them.
+	runCtx context.Context
 
 	acmeMu      sync.Mutex // serialises ACME account registration
 	lastDropped string     // last logged list of dropped certificates (guarded by mu)
@@ -233,6 +242,7 @@ func (s *Service) APIHandler() http.Handler {
 	mux.HandleFunc("POST /domains/{name}/dns/apply", s.handleApply)
 	mux.HandleFunc("POST /domains/{name}/dnssec", s.handleDNSSEC)
 	mux.HandleFunc("GET /main/dns", s.handleMainPlan)
+	mux.HandleFunc("POST /main/dns/refresh", s.handleMainRefresh)
 	mux.HandleFunc("GET /acme/account", s.handleAccount)
 	want := sha256.Sum256([]byte("Bearer " + s.cfg.Secret))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -506,6 +516,9 @@ func (s *Service) Kick() {
 // Run is the worker loop; it returns once ctx is done and running work
 // has finished.
 func (s *Service) Run(ctx context.Context) {
+	s.mu.Lock()
+	s.runCtx = ctx
+	s.mu.Unlock()
 	t := time.NewTicker(s.cfg.Tick)
 	defer t.Stop()
 	for {
@@ -772,6 +785,14 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 			err = s.enableSigning(rctx, snap)
 		}
 		cancel()
+		// The cached plan predates this step's writes (records, other
+		// zones' CAA, signing): dropped (the next read rebuilds it; a
+		// successful step caches a fresh one below).
+		if len(sets) > 0 || len(otherZones) > 0 || snap.SignRequested {
+			s.mu.Lock()
+			delete(s.plans, name)
+			s.mu.Unlock()
+		}
 		// Recorded even on failure (a partial apply may have created
 		// some) and while a DELETE waits, so DELETE removes them.
 		if zone != "" {
@@ -981,17 +1002,48 @@ func (s *Service) plan(ctx context.Context, name string, refresh bool) (dnsplan.
 	return pl, nil
 }
 
+// mainRecheckUnhealthy bounds the age of a main plan that isn't healthy
+// (planHealthy): a fix — by hand, or a resolver's negative cache of a
+// fresh CAA expiring (RFC 2308, up to the SOA minimum) — shows within
+// minutes, not RecheckEvery. Public lookups only: cheap.
+const mainRecheckUnhealthy = 5 * time.Minute
+
+// planHealthy: no item above Info, the CA would issue (false or unknown
+// — no issuer — is not healthy: status reads it as a lost account) and
+// the DNSSEC chain not broken.
+func planHealthy(pl dnsplan.Plan) bool {
+	if pl.DNSSEC.State == dnssec.Bogus || pl.DNSSEC.State == dnssec.DSMismatch || !pl.CAA.WouldIssue {
+		return false
+	}
+	for _, it := range pl.Items {
+		if it.Severity == dnsplan.SevWarning || it.Severity == dnsplan.SevProblem {
+			return false
+		}
+	}
+	return true
+}
+
+// mainMaxAge is how old the cached main plan may get: RecheckEvery when
+// healthy, else min(RecheckEvery, mainRecheckUnhealthy).
+func (s *Service) mainMaxAge(pl dnsplan.Plan) time.Duration {
+	if planHealthy(pl) {
+		return s.cfg.RecheckEvery
+	}
+	return min(s.cfg.RecheckEvery, mainRecheckUnhealthy)
+}
+
 // refreshMainPlan rebuilds the main domain's plan in the background when
-// there is none or it is RecheckEvery old (as enrolled domains' plans are
-// rebuilt by their records check), so every reader sees a fresh plan.
+// there is none or it is too old (mainMaxAge; as enrolled domains' plans
+// are rebuilt by their records check), so every reader sees a fresh plan.
 func (s *Service) refreshMainPlan(ctx context.Context) {
 	s.mu.Lock()
 	c, ok := s.plans[mainPlanKey]
-	if s.mainBuilding || (ok && s.cfg.Now().Sub(c.at) < s.cfg.RecheckEvery) {
+	if s.mainBuilding || (ok && s.cfg.Now().Sub(c.at) < s.mainMaxAge(c.plan)) {
 		s.mu.Unlock()
 		return
 	}
 	s.mainBuilding = true
+	gen := s.mainGen
 	s.mu.Unlock()
 	s.wg.Add(1)
 	go func() {
@@ -1007,28 +1059,116 @@ func (s *Service) refreshMainPlan(ctx context.Context) {
 		pctx, cancel := context.WithTimeout(ctx, planTimeout)
 		defer cancel()
 		if pl := s.buildMainPlan(pctx); ctx.Err() == nil {
-			s.mu.Lock()
-			s.plans[mainPlanKey] = cachedPlan{plan: pl, at: s.cfg.Now()}
-			s.mu.Unlock()
+			s.storeMainPlan(gen, pl)
 		}
 	}()
 }
 
+// storeMainPlan caches pl, built from generation gen, unless the main
+// plan was invalidated since (a build that started before a refresh
+// never overwrites the refreshed plan). Reports whether it stored.
+func (s *Service) storeMainPlan(gen int, pl dnsplan.Plan) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if gen != s.mainGen {
+		return false
+	}
+	s.plans[mainPlanKey] = cachedPlan{plan: pl, at: s.cfg.Now()}
+	return true
+}
+
+// handleMainRefresh drops the cached main plan and answers a rebuilt one
+// (not throttled: `./portcullis dns setup` and the CAA tighten / relax
+// call it after the dns tool wrote the main domain's records, which the
+// service can't see; otherwise the old plan stays up to RecheckEvery).
+func (s *Service) handleMainRefresh(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.mainGen++
+	delete(s.plans, mainPlanKey)
+	s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(r.Context(), planTimeout)
+	defer cancel()
+	s.writeMainPlan(w, ctx, false)
+}
+
+// writeMainPlan answers the main plan, or 503 when there is none in time.
+func (s *Service) writeMainPlan(w http.ResponseWriter, ctx context.Context, refresh bool) {
+	pl, err := s.mainPlan(ctx, refresh)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, pl)
+}
+
+// planFlight is one main-plan build shared by the requests waiting on it.
+type planFlight struct {
+	gen  int
+	done chan struct{}
+	pl   dnsplan.Plan
+}
+
 // mainPlan is the main domain's read-only plan (no credentials: public
 // checks only, pinned to Traefik's account URI from main-domain.env).
-func (s *Service) mainPlan(ctx context.Context, refresh bool) dnsplan.Plan {
+// A build runs detached from ctx (single flight, planTimeout): when ctx
+// ends first (a `status` that stopped waiting) the answer is the cached
+// plan, and the build still finishes and is stored, so the refresh
+// throttle engages for the next reader.
+func (s *Service) mainPlan(ctx context.Context, refresh bool) (dnsplan.Plan, error) {
 	s.mu.Lock()
 	if pl, ok := s.cachedLocked(mainPlanKey, refresh); ok {
 		s.mu.Unlock()
-		return pl
+		return pl, nil
+	}
+	parent := s.runCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	f := s.mainFlight
+	if f == nil || f.gen != s.mainGen {
+		f = &planFlight{gen: s.mainGen, done: make(chan struct{})}
+		s.mainFlight = f
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			defer close(f.done)
+			defer func() {
+				if r := recover(); r != nil {
+					s.logf("main domain plan: panic recovered: %v", r)
+				}
+				s.mu.Lock()
+				if s.mainFlight == f {
+					s.mainFlight = nil
+				}
+				s.mu.Unlock()
+			}()
+			bctx, cancel := context.WithTimeout(parent, planTimeout)
+			defer cancel()
+			f.pl = s.buildMainPlan(bctx)
+			// A build cut short is a plan of failed lookups: never cached.
+			if bctx.Err() == nil {
+				s.storeMainPlan(f.gen, f.pl)
+			}
+		}()
 	}
 	s.mu.Unlock()
-	pl := s.buildMainPlan(ctx)
-	s.mu.Lock()
-	s.plans[mainPlanKey] = cachedPlan{plan: pl, at: s.cfg.Now()}
-	s.mu.Unlock()
-	return pl
+	select {
+	case <-f.done:
+		return f.pl, nil
+	case <-ctx.Done():
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if c, ok := s.plans[mainPlanKey]; ok {
+			return c.plan, nil
+		}
+		// Nothing to answer with: unavailable, never an empty plan that
+		// could read as clean (M17).
+		return dnsplan.Plan{}, errMainUnavailable
+	}
 }
+
+// errMainUnavailable: no main plan in time and none cached (503).
+var errMainUnavailable = errors.New("the main domain's DNS plan isn't ready yet: try again")
 
 // buildMainPlan builds the main domain's read-only plan (no cache).
 func (s *Service) buildMainPlan(ctx context.Context) dnsplan.Plan {
@@ -1078,7 +1218,7 @@ func (s *Service) handlePlan(w http.ResponseWriter, r *http.Request) {
 func (s *Service) handleMainPlan(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), planTimeout)
 	defer cancel()
-	writeJSON(w, http.StatusOK, s.mainPlan(ctx, r.URL.Query().Get("refresh") == "1"))
+	s.writeMainPlan(w, ctx, r.URL.Query().Get("refresh") == "1")
 }
 
 func (s *Service) handleAccount(w http.ResponseWriter, _ *http.Request) {

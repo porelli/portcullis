@@ -329,26 +329,46 @@ func Build(ctx context.Context, in Input) Plan {
 	cnameAt := func(n string) []libdns.RR { return pick(live, n, "CNAME") }
 
 	p.Items = append(p.Items, addressItems(ctx, in, d, fix, cnameAt)...)
-	p.Items = append(p.Items, caaItems(ctx, in, d, zone, fix, live)...)
+	// One CAA view at <d> for both the caa item and would_issue: two
+	// questions could hit different caches (anycast) and disagree.
+	caaView := lookup(ctx, in.Resolvers, d, dns.TypeCAA)
+	p.Items = append(p.Items, caaItems(ctx, in, d, zone, fix, live, caaView)...)
 	p.Items = append(p.Items, nomailItems(ctx, in, d, fix)...)
 	if in.Provider != nil && liveErr == nil {
 		p.Items = append(p.Items, foreignItems(ctx, in, d, live)...)
 	}
-	p.CAA.WouldIssue = wouldIssue(ctx, in.Resolvers, d, s.Issuer, s.AccountURI)
+	p.CAA.WouldIssue = wouldIssue(ctx, in.Resolvers, d, s.Issuer, s.AccountURI, caaView)
 	p.DNSSEC = dnssecInfo(ctx, in, d)
 	return p
 }
 
 // wouldIssue: the CA would issue for <d> and *.<d> at EVERY resolver,
-// each asked on its own (one may still cache an old pin), as waitCAA.
-func wouldIssue(ctx context.Context, resolvers []string, d, issuer, uri string) bool {
+// each on its own (one may still cache an old pin), as waitCAA. Judged on
+// view — the answers the caa item was judged on (resolver i = vals[i]);
+// only a resolver with no CAA at <d> is asked further up (RFC 8659 climb;
+// *.<d> climbs from <d> too).
+func wouldIssue(ctx context.Context, resolvers []string, d, issuer, uri string, view resolverView) bool {
 	if issuer == "" || len(resolvers) == 0 || (uri != "" && !ValidAccountURI(uri)) {
 		return false
 	}
-	for _, r := range resolvers {
-		for _, n := range []string{d, "*." + d} {
-			_, rrs, err := EffectiveCAA(ctx, []string{r}, n)
-			if err != nil || !WouldIssue(rrs, issuer, uri, strings.HasPrefix(n, "*.")) {
+	if view.err != nil || len(view.vals) != len(resolvers) {
+		return false
+	}
+	for i, r := range resolvers {
+		var rrs []*dns.CAA
+		for _, c := range toCAA(view.vals[i]) {
+			rrs = append(rrs, &dns.CAA{Flag: c.Flags, Tag: c.Tag, Value: c.Value})
+		}
+		if len(rrs) == 0 {
+			if _, parent, ok := strings.Cut(d, "."); ok {
+				var err error
+				if _, rrs, err = EffectiveCAA(ctx, []string{r}, parent); err != nil {
+					return false
+				}
+			}
+		}
+		for _, wild := range []bool{false, true} {
+			if !WouldIssue(rrs, issuer, uri, wild) {
 				return false
 			}
 		}
@@ -459,7 +479,7 @@ func addressItems(ctx context.Context, in Input, d string, fix Fix, cnameAt func
 				it.Want = []string{}
 				// Info, not Warning: nothing failed (never a failed lookup).
 				it.Status, it.Severity, it.Fix = StatusUnknown, SevInfo, FixNone
-				it.Steps = []string{"the server's public addresses are unknown (./portcullis up detects them once a domain is enrolled, or set PORTCULLIS_PUBLIC_IPV4 / _IPV6 in .env)"}
+				it.Steps = []string{"the server's public addresses are unknown (./portcullis up detects them, or set PORTCULLIS_PUBLIC_IPV4 / _IPV6 in .env)"}
 				out = append(out, it)
 				continue
 			}
@@ -519,13 +539,12 @@ func caaData(cs []libdns.CAA) []string {
 	return out
 }
 
-func caaItems(ctx context.Context, in Input, d, zone string, fix Fix, live []liveRec) []Item {
+func caaItems(ctx context.Context, in Input, d, zone string, fix Fix, live []liveRec, v resolverView) []Item {
 	s := in.Spec
 	if s.CAA && s.Issuer == "" {
 		return []Item{{Set: SetCAA, Name: d, Type: "CAA", Want: []string{}, Live: []string{}, Status: StatusUnknown, Severity: SevInfo, Fix: FixNone,
 			Steps: []string{"CAA skipped: unknown CA (set DNS_CAA_ISSUER to its CAA issuer domain)"}}}
 	}
-	v := lookup(ctx, in.Resolvers, d, dns.TypeCAA)
 	if v.err != nil {
 		return []Item{{Set: SetCAA, Name: d, Type: "CAA", Want: []string{}, Live: []string{}, Status: StatusUnknown, Severity: SevWarning, Fix: FixNone,
 			Steps: []string{"lookup failed (retry): " + v.err.Error()}}}
@@ -937,7 +956,7 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 				}
 			}
 			if !s.IPv4.IsValid() {
-				return written, removed, errors.New("the server's public IPv4 is unknown (./portcullis up detects it once a domain is enrolled — run it again — or set PORTCULLIS_PUBLIC_IPV4 in .env)")
+				return written, removed, errors.New("the server's public IPv4 is unknown (./portcullis up detects it — run it again — or set PORTCULLIS_PUBLIC_IPV4 in .env)")
 			}
 			for _, r := range want[SetAddress] {
 				written = append(written, RefOf(r, zone))

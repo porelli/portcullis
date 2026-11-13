@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -105,8 +106,37 @@ type Provider struct {
 	// (libdns/hetzner v1.0.0, findRecordID) deletes the FIRST record with
 	// the input's name and type, from one listing taken at the start (the
 	// same record twice fails, as the API's 404 would). Mode "porkbun"
-	// also raises a TTL under 600 s to 600 on append, as the library does.
+	// also raises a TTL under 600 s to 600 on every write (append, and
+	// SetRecords' edits), as the library does (porkbunTTL).
 	DeleteMode string
+}
+
+// porkbunLib: DeleteMode "porkbun" plays the whole library: it also reads
+// records as libdns/porkbun v1.1.0's toLibdnsRecord does: a CAA's content
+// split on the first two spaces, the value kept as is, quotes included
+// (`0 issue "letsencrypt.org"` reads back as Value "\"letsencrypt.org\"").
+func (p *Provider) porkbunLib() bool { return p.DeleteMode == "porkbun" }
+
+// porkbunCAA is a stored CAA read the porkbun library's way.
+func porkbunCAA(rr libdns.RR) (libdns.Record, bool) {
+	parts := strings.SplitN(rr.Data, " ", 3)
+	if rr.Type != "CAA" || len(parts) != 3 {
+		return nil, false
+	}
+	flags, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return nil, false
+	}
+	return libdns.CAA{Name: rr.Name, TTL: rr.TTL, Flags: uint8(flags), Tag: parts[1], Value: parts[2]}, true
+}
+
+// porkbunTTL: libdns/porkbun v1.1.0's porkbunRecordPayload (every append
+// and edit) raises a TTL under 600 s to 600, Porkbun's minimum.
+func porkbunTTL(ttl time.Duration) time.Duration {
+	if ttl < 600*time.Second {
+		return 600 * time.Second
+	}
+	return ttl
 }
 
 // FindZone reports the zone the provider manages for fqdn (the service
@@ -152,6 +182,10 @@ func (p *Provider) GetRecords(_ context.Context, zone string) ([]libdns.Record, 
 		}
 		for _, rr := range rrs {
 			rr.Name = libdns.RelativeName(name+".", zone)
+			if c, ok := porkbunCAA(rr); ok && p.porkbunLib() {
+				out = append(out, c)
+				continue
+			}
 			out = append(out, parsed(rr))
 		}
 	}
@@ -175,8 +209,8 @@ func (p *Provider) AppendRecords(_ context.Context, zone string, recs []libdns.R
 	defer p.Zone.mu.Unlock()
 	for _, r := range recs {
 		rr := r.RR()
-		if p.DeleteMode == "porkbun" && rr.TTL < 600*time.Second {
-			rr.TTL = 600 * time.Second // libdns/porkbun v1.1.0's AppendRecords
+		if p.porkbunLib() {
+			rr.TTL = porkbunTTL(rr.TTL)
 		}
 		n := abs(rr.Name, zone)
 		p.Zone.recs[n] = append(p.Zone.recs[n], rr)
@@ -194,6 +228,9 @@ func (p *Provider) SetRecords(_ context.Context, zone string, recs []libdns.Reco
 	if p.SetMode != "" {
 		for _, r := range recs {
 			rr := r.RR()
+			if p.porkbunLib() {
+				rr.TTL = porkbunTTL(rr.TTL)
+			}
 			n := abs(rr.Name, zone)
 			var idx []int
 			for i, old := range p.Zone.recs[n] {

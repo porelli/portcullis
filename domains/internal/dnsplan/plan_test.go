@@ -2,9 +2,11 @@ package dnsplan
 
 import (
 	"context"
+	"net"
 	"net/netip"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -517,5 +519,69 @@ func TestDNSSECInsecureInfo(t *testing.T) {
 	info := Build(context.Background(), e.in).DNSSEC
 	if info.State != dnssec.Insecure || len(info.Steps) != 1 || !strings.Contains(info.Steps[0], "parent zone") {
 		t.Fatalf("%+v", info)
+	}
+}
+
+// flapping is a resolver whose CAA answers at pd alternate between two
+// caches (anycast shards: the deploy's finding C), first good then stale;
+// every other question goes to good.
+func flapping(t *testing.T, good, stale string) string {
+	t.Helper()
+	var n int
+	var mu sync.Mutex
+	h := dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+		up := good
+		if q := req.Question[0]; q.Qtype == dns.TypeCAA && strings.EqualFold(strings.TrimSuffix(q.Name, "."), pd) {
+			mu.Lock()
+			if n%2 == 1 {
+				up = stale
+			}
+			n++
+			mu.Unlock()
+		}
+		in, err := dns.Exchange(req, up)
+		if err != nil {
+			dns.HandleFailed(w, req)
+			return
+		}
+		_ = w.WriteMsg(in)
+	})
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &dns.Server{PacketConn: pc, Handler: h}
+	go func() { _ = srv.ActivateAndServe() }()
+	t.Cleanup(func() { _ = srv.Shutdown() })
+	return pc.LocalAddr().String()
+}
+
+// TestWouldIssueSameViewAsItems (deploy finding C): would_issue is judged
+// on the same resolver answers as the caa item, so a resolver whose
+// caches disagree between two questions can't give an ok item next to
+// would_issue false.
+func TestWouldIssueSameViewAsItems(t *testing.T) {
+	e := newPlanEnv(t)
+	e.ourCAA()
+	stale := fakedns.NewZone()
+	old := CAAValue("letsencrypt.org", "https://acme-v02.api.letsencrypt.org/acme/acct/1")
+	stale.Set(pd, libdns.CAA{Name: "portcullis", Tag: "issue", Value: old}.RR(), libdns.CAA{Name: "portcullis", Tag: "issuewild", Value: old}.RR())
+	e.in.Resolvers = []string{flapping(t, e.in.Resolvers[0], serveZone(t, stale)[0])}
+	e.in.Provider = nil
+	p := Build(context.Background(), e.in)
+	it := find(t, p, SetCAA, pd, "CAA", StatusOK)
+	if !p.CAA.WouldIssue {
+		t.Fatalf("caa item %s but would_issue false: two different answers judged", it.Status)
+	}
+}
+
+// A CAA only at the parent: the climb still happens where <d> has none.
+func TestWouldIssueClimbsFromItemView(t *testing.T) {
+	e := newPlanEnv(t)
+	other := CAAValue("digicert.com", "")
+	e.zone.Set("example.test", append(e.zone.Records("example.test"), libdns.CAA{Name: "@", Tag: "issue", Value: other}.RR())...)
+	e.in.Provider = nil
+	if p := Build(context.Background(), e.in); p.CAA.WouldIssue {
+		t.Fatal("would_issue under a parent CAA allowing only another CA")
 	}
 }

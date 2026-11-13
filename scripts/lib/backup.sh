@@ -321,6 +321,8 @@ backup_create() {
   [ ! -d "$PORTCULLIS_ROOT/config" ] || cp -a "$PORTCULLIS_ROOT/config" "$work/config"
   [ ! -d "$PORTCULLIS_ROOT/certs" ] || cp -a "$PORTCULLIS_ROOT/certs" "$work/certs"
   [ ! -d "$PORTCULLIS_ROOT/secrets" ] || cp -a "$PORTCULLIS_ROOT/secrets" "$work/secrets"
+  # Host-specific (the last detected public addresses): never archived.
+  _strip_host_files "$work/secrets"
 
   printf '  %-26s' "vault (raft snapshot)"; _backup_vault_snapshot "$work/vault.snap"; printf ' %sdone%s\n' "$C_GREEN" "$C_NC"
   printf '  %-26s' "postgres (pg_dump)"; _backup_pg_dump "$work/postgres.dump"; printf ' %sdone%s\n' "$C_GREEN" "$C_NC"
@@ -608,10 +610,29 @@ _restore_vault() {
   ok "Vault restored and unsealed with the original key."
 }
 
+# _strip_host_files <secrets dir> — removes what belongs to one host, not
+# the install: the last detected public addresses (domains.sh
+# domains_public_ips falls back to them) and a pending ACME flip's settle
+# point (acme-relax.env, dns.sh; _restore_secrets keeps the live one). A
+# backup never carries them, a
+# restore deletes them (older backups, or the same host: can't tell).
+_strip_host_files() {
+  rm -f "$1/domains/last-public-ipv4" "$1/domains/last-public-ipv6" "$1/domains/acme-relax.env"
+}
+
 _restore_secrets() {
-  local dir="$1"
+  local dir="$1" relax="$PORTCULLIS_ROOT/secrets/domains/acme-relax.env" keep=""
+  # A pending ACME flip's settle point describes live DNS caches, which a
+  # restore doesn't change: the live one is kept (I6); none is ever in a
+  # backup.
+  if [ -f "$relax" ]; then keep="$(mktemp)" && cp -p "$relax" "$keep"; fi
   (umask 077 && rm -rf "$PORTCULLIS_ROOT/secrets.restore-tmp" && cp -a "$dir/secrets" "$PORTCULLIS_ROOT/secrets.restore-tmp")
   rm -rf "$PORTCULLIS_ROOT/secrets" && mv "$PORTCULLIS_ROOT/secrets.restore-tmp" "$PORTCULLIS_ROOT/secrets"
+  _strip_host_files "$PORTCULLIS_ROOT/secrets"
+  if [ -n "$keep" ]; then
+    mkdir -p "$(dirname "$relax")" && cp -p "$keep" "$relax" && chmod 600 "$relax"
+    rm -f "$keep"
+  fi
   chmod 700 "$PORTCULLIS_ROOT/secrets"
   secrets_fix_perms
 }
