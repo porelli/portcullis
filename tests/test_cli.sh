@@ -315,6 +315,16 @@ expect_eq "CI's same-named branch lookups: no v* tag glob, no ls-remote pattern 
   "$(grep -rnE '"\$REF" *(==|!=) *v\*|ls-remote --exit-code' "$HERE/../.github" | wc -l | tr -d ' ')" 0
 expect_eq "CI's same-named branch lookups: every one lists the heads once and fails loudly" \
   "$(grep -cF 'heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }' "$HERE/../.github/workflows/ci.yml" "$HERE/../.github/actions/hub-image/action.yml" "$HERE/../.github/actions/keycloak-image/action.yml" | awk -F: '{ s += $2 } END { print s }')" 11
+# Client forwarded / address headers Traefik doesn't manage are deleted on
+# every websecure and vpnsecure router (entrypoint http.middlewares).
+expect_eq "strip-client-forwarded@file deletes Forwarded, X-Real-Ip's look-alikes and every unmanaged X-Forwarded-*" \
+  "$(yq -o=json '.http.middlewares["strip-client-forwarded"].headers.customRequestHeaders' "$HERE/../traefik/dynamic/middlewares.yml" \
+     | jq -c '[to_entries[] | select(.value != "") | .key] as $bad
+              | ["Forwarded", "Forwarded-For", "X-Forwarded", "X-Forwarded-Prefix", "X-Forwarded-Uri", "X-Forwarded-Method", "X-Forwarded-Scheme",
+                 "X-Forwarded-Ssl", "X-Forwarded-Protocol", "X-Url-Scheme", "X-Original-Forwarded-For", "X-Client-Ip", "True-Client-Ip",
+                 "Cf-Connecting-Ip", "Fastly-Client-Ip", "X-Cluster-Client-Ip"] - keys | {missing: ., bad: $bad}')" '{"missing":[],"bad":[]}'
+expect_eq "websecure and vpnsecure run strip-client-forwarded@file first" \
+  "$(grep -cE '^      TRAEFIK_ENTRYPOINTS_(WEBSECURE|VPNSECURE)_HTTP_MIDDLEWARES: strip-client-forwarded@file$' "$HERE/../docker-compose.yml")" 2
 # Fully qualified base images (rootless Podman: podman build never relies
 # on registries.conf short names): tests/lint_images.sh, also in CI.
 expect_eq "every Dockerfile FROM and compose image: is fully qualified" "$("$HERE/lint_images.sh" 2>&1; echo "rc=$?")" "rc=0"

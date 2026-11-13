@@ -1,4 +1,5 @@
-// Package vpndoc reads hub_data/vpn.json v2 (contract §4/§16), the Hub's
+// Package vpndoc reads vpn.json v2 (the vpn_doc volume, /vpn-doc/vpn.json;
+// contract §4/§16), the Hub's
 // list of VPN providers, their device maps and the built-in peers. It
 // fails closed: an unknown version or key, a duplicate key, a parse error,
 // overlapping provider ranges or a duplicate address refuses the whole

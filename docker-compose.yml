@@ -223,6 +223,9 @@ services:
       # headers are always deleted from untrusted clients (no trustedIPs).
       TRAEFIK_ENTRYPOINTS_WEB_HTTP_ALIASHEADERSSTRATEGY: delete
       TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_ALIASHEADERSSTRATEGY: delete
+      # Client address / scheme headers Traefik doesn't manage (Forwarded,
+      # X-Client-Ip, ...): deleted before every router's own middlewares.
+      TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_MIDDLEWARES: strip-client-forwarded@file
       # Routers without an explicit entrypoint attach to websecure only.
       TRAEFIK_ENTRYPOINTS_WEBSECURE_ASDEFAULT: "true"
       TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_TO: websecure
@@ -241,6 +244,7 @@ services:
       TRAEFIK_ENTRYPOINTS_VPNSECURE_ADDRESS: ${PORTCULLIS_VPN_EDGE_TRAEFIK_IP:-172.31.254.66}:8443
       TRAEFIK_ENTRYPOINTS_VPNSECURE_PROXYPROTOCOL_TRUSTEDIPS: ${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}/32
       TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_ALIASHEADERSSTRATEGY: delete
+      TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_MIDDLEWARES: strip-client-forwarded@file
       TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_CERTRESOLVER: letsencrypt
       TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_DOMAINS_0_MAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
       TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_DOMAINS_0_SANS: "*.${PORTCULLIS_DOMAIN:-portcullis.local}"

@@ -1,8 +1,8 @@
 // Command wg is Portcullis' VPN service (contract §16): the edge (the only
 // PROXY v2 client of Traefik's vpnsecure entrypoint) and the built-in
 // people VPN role, on userspace WireGuard (wireguard-go + gVisor
-// netstack): no capability, no TUN device. It reads hub_data/vpn.json
-// (Hub-written, public data only) and writes wg_data/status.json.
+// netstack): no capability, no TUN device. It reads /vpn-doc/vpn.json (the
+// vpn_doc volume; Hub-written, public data only) and writes wg_data/status.json.
 //
 //	wg run            the service
 //	wg genkey <path>  write a new private key into <path> in place (0640); prints nothing

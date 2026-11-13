@@ -50,6 +50,14 @@ services:
       traefik.http.routers.ci-vpnecho.entrypoints: websecure,vpnsecure
       traefik.http.routers.ci-vpnecho.tls.options: authaware@file
       traefik.http.routers.ci-vpnecho.service: ci-vpnecho
+      # Through group-gate (its normal public guard, websecure): proves a
+      # request carrying every forged header reaches group-gate and isn't
+      # let in by them.
+      traefik.http.routers.ci-vpnguard.rule: Host(`vpnguard.portcullis.local`)
+      traefik.http.routers.ci-vpnguard.entrypoints: websecure
+      traefik.http.routers.ci-vpnguard.tls.options: authaware@file
+      traefik.http.routers.ci-vpnguard.middlewares: portcullis-public-guard@docker
+      traefik.http.routers.ci-vpnguard.service: ci-vpnecho
 networks:
   portcullis-proxy:
     external: true
@@ -60,9 +68,23 @@ echo_web() { curl -s --cacert certs/ca-chain.crt --resolve "vpnecho.portcullis.l
 for i in $(seq 1 30); do echo_web | grep -q '^Hostname:' && break; [ "$i" -eq 30 ] && { echo "FAIL: vpnecho not routed"; exit 1; }; sleep 2; done
 # Spoofed client addresses on websecure: Traefik drops them (no
 # forwarded-header trust), the backend sees the real peer only.
+# Every client forwarded / address / scheme header, forged with one
+# marker value (and `_` aliases): none may reach a backend, on websecure
+# here and over the tunnel on vpnsecure below. Traefik sets XFF / X-Real-Ip
+# itself; strip-client-forwarded@file deletes the ones it doesn't manage.
+FORGED_HDRS="$RUNNER_TEMP/forged-headers.txt"
+for h in Forwarded Forwarded-For X-Forwarded X-Forwarded-For X-Forwarded-Host X-Forwarded-Proto X-Forwarded-Port \
+         X-Forwarded-Server X-Forwarded-Prefix X-Forwarded-Scheme X-Forwarded-Ssl X-Forwarded-Protocol X-Forwarded-Uri \
+         X-Url-Scheme X-Real-Ip X-Client-Ip True-Client-Ip Cf-Connecting-Ip Fastly-Client-Ip X-Cluster-Client-Ip \
+         X-Original-Forwarded-For X_Forwarded_For X_Real_Ip; do
+  case "$h" in Forwarded) printf '%s: for=203.0.113.66\n' "$h" ;; *) printf '%s: 203.0.113.66\n' "$h" ;; esac
+done > "$FORGED_HDRS"
 # whoami ends its lines with CRLF: strip the CR before matching.
-OUT="$(echo_web -H 'X-Forwarded-For: 10.213.0.5' -H 'X-Real-Ip: 10.213.0.5' -H 'X_Forwarded_For: 10.213.0.5' | tr -d '\r')"
-if printf '%s' "$OUT" | grep -qi '10\.213\.0\.5'; then echo "FAIL: a spoofed address reached the backend on websecure:"; printf '%s\n' "$OUT"; exit 1; fi
+OUT="$(echo_web -H "@$FORGED_HDRS" | tr -d '\r')"
+printf '%s' "$OUT" | grep -q '^Hostname:' || { echo "FAIL: whoami on websecure didn't answer: $OUT"; exit 1; }
+if printf '%s' "$OUT" | grep -q '203\.0\.113\.66'; then echo "FAIL: a client-sent forwarded header reached the backend on websecure:"; printf '%s\n' "$OUT" | grep '203\.0\.113\.66'; exit 1; fi
+printf '%s\n' "$OUT" | grep -qx 'X-Forwarded-Host: vpnecho.portcullis.local' && printf '%s\n' "$OUT" | grep -qx 'X-Forwarded-Proto: https' \
+  || { echo "FAIL: X-Forwarded-Host / -Proto on websecure aren't Traefik's: $OUT"; exit 1; }
 # Exactly one X-Forwarded-For with exactly one address (Traefik replaced
 # the forged value instead of appending to it), and X-Real-Ip the same.
 XFF="$(printf '%s\n' "$OUT" | grep -iE '^X-Forwarded-For:' || true)"
@@ -70,12 +92,18 @@ XFF="$(printf '%s\n' "$OUT" | grep -iE '^X-Forwarded-For:' || true)"
   || { echo "FAIL: not exactly one single-address X-Forwarded-For on websecure: $OUT"; exit 1; }
 PEER="${BASH_REMATCH[1]}"
 printf '%s\n' "$OUT" | grep -qx "X-Real-Ip: $PEER" || { echo "FAIL: X-Real-Ip isn't the real peer $PEER: $OUT"; exit 1; }
-# group-gate's normal path never binds: the spoofed headers on a
-# gated route are logged with the real address, never 10.213.0.5.
-curl -s -o /dev/null --cacert certs/ca-chain.crt --resolve "gated.portcullis.local:443:127.0.0.1" \
-  -H 'X-Forwarded-For: 10.213.0.5' -H 'X-Real-Ip: 10.213.0.5' https://gated.portcullis.local/ || true
-if docker compose logs --since 2m group-gate | grep -q 'addr=10\.213\.0\.5'; then echo "FAIL: group-gate saw a spoofed address"; exit 1; fi
-echo "PASS: spoofed X-Forwarded-For / X-Real-Ip on websecure never reach a backend or group-gate"
+# group-gate behind the forged headers: the request must reach it (its
+# DENIED line for that host) and be refused (no public exception: no
+# forged address or scheme lets it in), and the forged value never shows
+# up in what group-gate logged.
+code="$(curl -s -o /dev/null -w '%{http_code}' --cacert certs/ca-chain.crt --resolve "vpnguard.portcullis.local:443:127.0.0.1" \
+  -H "@$FORGED_HDRS" https://vpnguard.portcullis.local/ || true)"
+[ "$code" = 403 ] || { echo "FAIL: vpnguard (group-gate's public guard) with forged headers answered $code, want 403"; exit 1; }
+GG="$(docker compose logs --since 2m group-gate)"
+printf '%s\n' "$GG" | grep -q "DENIED public host='vpnguard.portcullis.local'" \
+  || { echo "FAIL: group-gate never saw the forged request (no DENIED line for vpnguard)"; printf '%s\n' "$GG" | tail -20; exit 1; }
+if printf '%s\n' "$GG" | grep "vpnguard" | grep -q '203\.0\.113\.66'; then echo "FAIL: group-gate logged a forged value"; exit 1; fi
+echo "PASS: no client-sent forwarded / address / scheme header ($(wc -l < "$FORGED_HDRS") forged) reaches a backend on websecure; group-gate never sees a spoofed address"
 
 # A PROXY header to vpnsecure from anything but wg: from a gateway's
 # network (portcullis-vpn) Traefik isn't reachable at all; from the
@@ -112,9 +140,8 @@ done
 sed -n '/^\[Interface\]/,/^PersistentKeepalive/p' "$RUNNER_TEMP/vpn-xff.out" > "$RUNNER_TEMP/vpn-xff.conf"
 DEV_IP="$(sed -n 's|^Address = \([0-9.]*\)/32$|\1|p' "$RUNNER_TEMP/vpn-xff.conf")"
 [[ "$DEV_IP" =~ ^10\.213\.[0-9]+\.[0-9]+$ ]] || { echo "FAIL: no tunnel address in the device config"; exit 1; }
-printf 'X-Forwarded-For: 203.0.113.66\nX-Real-Ip: 203.0.113.66\nForwarded: for=203.0.113.66\n' > "$RUNNER_TEMP/vpn-xff.hdr"
 for i in $(seq 1 10); do
-  "$RUNNER_TEMP/vpn-client" --endpoint 127.0.0.1:51820 --ca-file certs/ca-chain.crt --header-file "$RUNNER_TEMP/vpn-xff.hdr" \
+  "$RUNNER_TEMP/vpn-client" --endpoint 127.0.0.1:51820 --ca-file certs/ca-chain.crt --header-file "$FORGED_HDRS" \
     --resolve "vpnecho.portcullis.local:443:10.213.0.1" --get "https://vpnecho.portcullis.local/" < "$RUNNER_TEMP/vpn-xff.conf" > /tmp/vpn-xff.json || true
   jq -e '.handshake and .status == 200' /tmp/vpn-xff.json >/dev/null && break
   [ "$i" -eq 10 ] && { echo "FAIL: whoami through the tunnel: $(jq -c 'del(.body)' /tmp/vpn-xff.json)"; docker compose logs --tail=40 wg traefik; exit 1; }
@@ -122,11 +149,13 @@ for i in $(seq 1 10); do
 done
 rm -f "$RUNNER_TEMP/vpn-xff.out" "$RUNNER_TEMP/vpn-xff.conf"
 BODY="$(jq -r .body /tmp/vpn-xff.json | tr -d '\r')"
-if printf '%s' "$BODY" | grep -q '203\.0\.113\.66'; then echo "FAIL: a client-sent forwarded header reached the backend over the tunnel: $BODY"; exit 1; fi
+if printf '%s' "$BODY" | grep -q '203\.0\.113\.66'; then echo "FAIL: a client-sent forwarded header reached the backend over the tunnel:"; printf '%s\n' "$BODY" | grep '203\.0\.113\.66'; exit 1; fi
+printf '%s\n' "$BODY" | grep -qx 'X-Forwarded-Host: vpnecho.portcullis.local' && printf '%s\n' "$BODY" | grep -qx 'X-Forwarded-Proto: https' \
+  || { echo "FAIL: X-Forwarded-Host / -Proto over the tunnel aren't Traefik's: $BODY"; exit 1; }
 [ "$(printf '%s\n' "$BODY" | grep -ciE '^X-Forwarded-For:')" = 1 ] && printf '%s\n' "$BODY" | grep -qx "X-Forwarded-For: $DEV_IP" \
   && printf '%s\n' "$BODY" | grep -qx "X-Real-Ip: $DEV_IP" \
   || { echo "FAIL: over the tunnel the backend must see exactly the tunnel address $DEV_IP: $BODY"; exit 1; }
-echo "PASS: over the tunnel the backend sees exactly the device's tunnel address ($DEV_IP, from wg's PROXY header); forged forwarded headers are dropped"
+echo "PASS: over the tunnel the backend sees exactly the device's tunnel address ($DEV_IP, from wg's PROXY header); none of the $(wc -l < "$FORGED_HDRS") forged forwarded headers reaches it"
 docker compose -p ci-vpnecho -f /tmp/ci-vpnecho.yml down
 # wg stays on (profile wg) for the rest of the job: up, upgrade,
 # backup and restore run with it (secrets/wg is backed up).

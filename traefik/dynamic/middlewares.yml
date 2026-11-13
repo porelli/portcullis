@@ -23,6 +23,35 @@
 
 http:
   middlewares:
+    # Client-supplied address / scheme headers Traefik itself doesn't
+    # manage, deleted on every router of websecure and vpnsecure (the
+    # entrypoints' http.middlewares: they run first, also for the Hub's and
+    # the templates' routers). Traefik replaces X-Forwarded-For / -Host /
+    # -Proto / -Port / -Server and X-Real-Ip from the connection (on
+    # vpnsecure: wg's PROXY v2 source, the tunnel address) because no
+    # entrypoint trusts forwarded headers; these others it passed through
+    # untouched (a client's `Forwarded: for=…` reached backends). An empty
+    # value deletes the header. CI asserts every one, on both entrypoints.
+    strip-client-forwarded:
+      headers:
+        customRequestHeaders:
+          Forwarded: ""
+          Forwarded-For: ""
+          X-Forwarded: ""
+          X-Forwarded-Prefix: ""
+          X-Forwarded-Uri: ""
+          X-Forwarded-Method: ""
+          X-Forwarded-Scheme: ""
+          X-Forwarded-Ssl: ""
+          X-Forwarded-Protocol: ""
+          X-Url-Scheme: ""
+          X-Original-Forwarded-For: ""
+          X-Client-Ip: ""
+          True-Client-Ip: ""
+          Cf-Connecting-Ip: ""
+          Fastly-Client-Ip: ""
+          X-Cluster-Client-Ip: ""
+
     # Passes the presented certificate's details as headers to backends.
     # Backends receive:
     #   X-Forwarded-Tls-Client-Cert:      the certificates themselves (base64
