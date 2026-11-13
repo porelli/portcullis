@@ -1611,13 +1611,14 @@ def validate_vpn_section(v) -> Optional[str]:
         if not isinstance(entry, dict) or set(entry) != {"via"}:
             return f"'hosts' entry {h!r} is not exactly {{\"via\": [...]}}"
         via = entry["via"]
-        if not isinstance(via, list) or not via:
-            return f"'hosts' entry {h!r}: 'via' is not a non-empty list"
+        if not isinstance(via, list):
+            return f"'hosts' entry {h!r}: 'via' is not a list"
+        # [] is valid: no provider (every address denied); only ["*"] is any.
         if via == ["*"]:
             continue
         if (len(via) > VPN_VIA_MAX or len(set(map(str, via))) != len(via)
                 or not all(isinstance(i, str) and VPN_PROVIDER_ID_RE.fullmatch(i) for i in via)):
-            return f"'hosts' entry {h!r}: 'via' is not [\"*\"] or 1–{VPN_VIA_MAX} provider ids"
+            return f"'hosts' entry {h!r}: 'via' is not [\"*\"] or 0–{VPN_VIA_MAX} provider ids"
     return None
 
 
@@ -1689,12 +1690,16 @@ def parse_vpn_doc(doc) -> dict:
     other than 2, overlapping ranges, duplicate addresses or keys, a device
     outside its provider's ranges, a provider without a valid source, a hook
     provider without refreshed_at / stale_after (≤ 30 min apart), a static
-    or built-in one with either. The reader the vectors drive (with the edge's
-    and the Hub's). Returns {"providers": {id: {...}}, "nets": [(net, id)],
-    "devices": {ip: {...}}, "peers": {(ip, device_id): expires}}."""
-    _vpn_keys(doc, ("version", "builtin", "providers", "devices"), "$")
+    or built-in one with either, no valid_until (RFC 3339; past it every
+    lookup denies). The reader the vectors drive (with the edge's and the
+    Hub's). Returns {"valid_until": t, "providers": {id: {...}}, "nets":
+    [(net, id)], "devices": {ip: {...}}, "peers": {(ip, device_id): expires}}."""
+    _vpn_keys(doc, ("version", "valid_until", "builtin", "providers", "devices"), "$")
     if type(doc.get("version")) is not int or doc["version"] != VPN_DOC_VERSION:
         raise ValueError(f"version: only {VPN_DOC_VERSION}")
+    if not isinstance(doc.get("valid_until"), str):
+        raise ValueError("valid_until: missing")
+    valid_until = _vpn_time(doc, "valid_until", "$")
     builtin = doc.get("builtin")
     subnet, peers = None, {}
     if builtin is not None:
@@ -1801,7 +1806,13 @@ def parse_vpn_doc(doc) -> dict:
         devices[str(a)] = {"ip": str(a), "provider": pid, "user": _vpn_str(d, "user", w, nonempty=True),
                            "device_id": _vpn_str(d, "device_id", w, nonempty=True),
                            "name": _vpn_str(d, "name", w), "expires": _vpn_time(d, "expires", w)}
-    return {"providers": providers, "nets": nets, "devices": devices, "peers": peers}
+    return {"valid_until": valid_until, "providers": providers, "nets": nets, "devices": devices, "peers": peers}
+
+
+def vpn_doc_valid(doc: Optional[dict], now: float) -> bool:
+    """A parsed vpn.json whose valid_until is still ahead (the Hub
+    republishes it every 10 min, now + 1 h: a Hub that stops fails closed)."""
+    return doc is not None and doc.get("valid_until") is not None and now < doc["valid_until"]
 
 
 _VPN_LOCK = threading.Lock()
@@ -1857,7 +1868,9 @@ def vpn_provider_of(doc: dict, addr) -> Optional[dict]:
 
 def _vpn_device_state(doc: dict, provider: str, addr, now: float) -> Tuple[Optional[dict], str]:
     """(device, "") for a usable device of `provider` at addr, else (None,
-    "unknown" | "expired" | "stale" | "outside")."""
+    "unknown" | "expired" | "stale" | "outside" | "doc_expired")."""
+    if not vpn_doc_valid(doc, now):
+        return None, "doc_expired"
     p = doc["providers"].get(provider)
     if p is None or vpn_provider_of(doc, addr) is not p:
         return None, "outside"
@@ -1943,6 +1956,8 @@ def vpn_binding(policy_doc: dict, vpn_doc: Optional[dict], host: str, kind: str,
         return "vpn_not_vpn", VPN_REQUIRED_TEXT, None
     if vpn_doc is None:
         return "vpn_no_doc", VPN_REQUIRED_TEXT, None
+    if not vpn_doc_valid(vpn_doc, now):
+        return "vpn_doc_expired", VPN_REQUIRED_TEXT, None
     p = vpn_provider_of(vpn_doc, addr) if addr is not None else None
     if p is None:
         return "vpn_not_vpn", VPN_REQUIRED_TEXT, None
@@ -3582,9 +3597,13 @@ class Handler(BaseHTTPRequestHandler):
             kind = host_kind(host, extra_domains(doc))
             if kind in ("main", "extra"):
                 reason = public_guard_check(doc, host, self.headers, raw_uri)
-                if not reason:
-                    # A VPN-only app host: steps 1 and 2 only (V17: nobody
-                    # is signed in on a public path, so no owner to bind).
+                if not reason and vpn_path:
+                    # A VPN-only app host on vpnsecure: steps 1 and 2 only
+                    # (V17: nobody is signed in on a public path, so no
+                    # owner to bind). On websecure (portcullis-public-guard)
+                    # a published public path needs no VPN: public links are
+                    # public by design (server mode with public links); the
+                    # rest of the host still goes through /auth/vpn.
                     try:
                         need = _vpn_required(doc, host, kind, raw_uri) is not None
                         vdoc = load_vpn_file() if need and vpn_path else None

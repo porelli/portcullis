@@ -63,7 +63,7 @@ func TestServeEndToEnd(t *testing.T) {
 	keyFile := filepath.Join(dir, "people.key")
 	os.WriteFile(keyFile, []byte(tunnel.KeyString(srvKey)+"\n"), 0o640)
 	vpnFile := filepath.Join(dir, "vpn.json")
-	os.WriteFile(vpnFile, []byte(fmt.Sprintf(`{"version":2,
+	os.WriteFile(vpnFile, []byte(fmt.Sprintf(`{"version":2,"valid_until":"2099-01-01T00:00:00Z",
  "builtin":{"subnet":"10.213.0.0/22","server_public_key":%q,"domains":[],
   "peers":[{"ip":"10.213.0.5","public_key":%q,"device_id":"d1","expires":null}]},
  "providers":[{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],

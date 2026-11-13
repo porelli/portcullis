@@ -77,7 +77,7 @@ func doc(t *testing.T, serverKey string, peers ...string) *vpndoc.Doc {
 
 func docRaw(t *testing.T, serverKey, peers string) *vpndoc.Doc {
 	t.Helper()
-	d, err := vpndoc.Parse([]byte(`{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + serverKey +
+	d, err := vpndoc.Parse([]byte(`{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + serverKey +
 		`","domains":[],"peers":[` + peers + `]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`))
 	if err != nil {
 		t.Fatalf("fixture: %v", err)
@@ -120,7 +120,7 @@ func TestPeopleRoleSyncsPeers(t *testing.T) {
 		t.Fatalf("status %v %q", ok, e)
 	}
 	// Another subnet than this role's: refused.
-	d, err := vpndoc.Parse([]byte(`{"version":2,"builtin":{"subnet":"10.99.0.0/22","server_public_key":"` + s.PublicKey() + `","domains":[],"peers":[]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.99.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`))
+	d, err := vpndoc.Parse([]byte(`{"version":2,"valid_until":"2099-01-01T00:00:00Z","builtin":{"subnet":"10.99.0.0/22","server_public_key":"` + s.PublicKey() + `","domains":[],"peers":[]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.99.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -198,5 +198,30 @@ func TestLoadKey(t *testing.T) {
 	}
 	if _, _, err := LoadKey(filepath.Join(dir, "none")); err == nil {
 		t.Fatal("missing file accepted")
+	}
+}
+
+// TestPeersDroppedAtValidUntil: past vpn.json's valid_until every peer is
+// removed and the role reports why, although no peer expired.
+func TestPeersDroppedAtValidUntil(t *testing.T) {
+	c := &clock{t: time.Date(2026, 11, 13, 10, 0, 0, 0, time.UTC)}
+	r, s := newRole(t, c)
+	a := keyPair(t)
+	d, err := vpndoc.Parse([]byte(`{"version":2,"valid_until":"2026-11-13T10:00:05Z","builtin":{"subnet":"10.213.0.0/22","server_public_key":"` + s.PublicKey() +
+		`","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"` + a + `","device_id":"d1","expires":null}]},"providers":[{"id":"builtin","source":"builtin","ranges":["10.213.0.0/22"],"edge_port":0,"gateway_ip":"","stale":false}],"devices":[]}`))
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	r.SetDoc(d, nil)
+	if got := peerKeys(t, s); got != a {
+		t.Fatalf("peers before valid_until: %q", got)
+	}
+	c.set(c.now().Add(5 * time.Second))
+	r.Tick()
+	if got := peerKeys(t, s); got != "" {
+		t.Fatalf("peers kept past valid_until: %q", got)
+	}
+	if ok, msg := r.Status(); ok || !strings.Contains(msg, "valid_until") {
+		t.Fatalf("status %v %q", ok, msg)
 	}
 }

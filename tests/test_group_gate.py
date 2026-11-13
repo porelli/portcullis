@@ -3686,13 +3686,15 @@ def iso(t):
     return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def vpn_doc(now=None, hs_stale=False, hs_age=60, bob_expires=None, extra_devices=()):
+def vpn_doc(now=None, hs_stale=False, hs_age=60, bob_expires=None, extra_devices=(), valid_for=3600):
     """A valid vpn.json v2: the built-in (bob .5, alice .6) and a hook
-    provider `hs` (bob 100.64.0.7), refreshed hs_age s before now."""
+    provider `hs` (bob 100.64.0.7), refreshed hs_age s before now, valid
+    until valid_for s after now (the Hub writes now + 1 h)."""
     now = time.time() if now is None else now
     bob_exp = None if bob_expires is None else iso(bob_expires)
     return {
         "version": 2,
+        "valid_until": iso(now + valid_for),
         "builtin": {"subnet": "10.213.0.0/22", "server_public_key": SERVER_KEY, "domains": ["example.com"],
                     "peers": [{"ip": "10.213.0.5", "public_key": PEER_BOB, "device_id": "b1", "expires": bob_exp},
                               {"ip": "10.213.0.6", "public_key": PEER_ALICE, "device_id": "a1", "expires": None}]},
@@ -3816,8 +3818,9 @@ class VpnTest(GateTest):
 
     def test_vpn_unknown_key_denies(self):
         for vpn in ({**BASE["vpn"], "extra": 1}, {k: v for k, v in BASE["vpn"].items() if k != "public_enrol"},
-                    dict(BASE["vpn"], hosts={"app.example.com": {"via": []}}),
                     dict(BASE["vpn"], hosts={"app.example.com": {"via": ["*"], "x": 1}}),
+                    dict(BASE["vpn"], hosts={"app.example.com": {"via": "*"}}),
+                    dict(BASE["vpn"], hosts={"app.example.com": {"via": None}}),
                     dict(BASE["vpn"], hosts={"App..example.com": {"via": ["*"]}}),
                     dict(BASE["vpn"], hosts={"app.example.com": {"via": ["a"] * 9}}),
                     dict(BASE["vpn"], hosts={"app.example.com": {"via": ["*", "builtin"]}}),
@@ -3873,6 +3876,42 @@ class VpnTest(GateTest):
         self.assertEqual(self.get("app.example.com", "10.213.0.5")[0], 200)
         self.vpn_only(via=["gone"])  # a provider no longer wired: denied
         self.assert_denied("10.213.0.5", REQUIRED_TEXT)
+
+    def test_via_empty_means_no_provider(self):
+        # Contract: via [] is valid and names no provider: every address is
+        # denied, the built-in's and a hook provider's alike. Only an
+        # explicit ["*"] means any provider.
+        self.assertIsNone(gg.validate_vpn_section(dict(BASE["vpn"], hosts={"app.example.com": {"via": []}})))
+        self.vpn_only(via=[])
+        self.assert_denied("10.213.0.5", REQUIRED_TEXT)
+        self.assert_denied("100.64.0.7", REQUIRED_TEXT)
+        self.assertEqual(self.get("app.example.com", "203.0.113.9", gate_path="/auth")[0], 403)
+        doc = gg.parse_vpn_doc(json.loads(json.dumps(vpn_doc()), object_pairs_hook=gg._vpn_pairs))
+        pol = dict(BASE, **vpn_policy({"app.example.com": {"via": []}}))
+        self.assertEqual(gg.vpn_check(pol, doc, "app.example.com", "main", "/", gg.ipaddress.IPv4Address("10.213.0.5"),
+                                      "bob", time.time())[0], "vpn_via")
+
+    def test_valid_until(self):
+        # Past valid_until the whole file is invalid: every VPN request is
+        # denied, although each device is otherwise fine.
+        self.vpn_only()
+        self.assertEqual(self.get("app.example.com", "10.213.0.5")[0], 200)
+        write_vpn(vpn_doc(valid_for=-1))
+        self.assert_denied("10.213.0.5", REQUIRED_TEXT)
+        self.assert_denied("100.64.0.7", REQUIRED_TEXT)
+        now = time.time()
+        doc = gg.parse_vpn_doc(json.loads(json.dumps(vpn_doc(now=now, valid_for=30)), object_pairs_hook=gg._vpn_pairs))
+        self.assertIsNotNone(gg.vpn_device(doc, "builtin", "10.213.0.5", now + 29))
+        self.assertIsNone(gg.vpn_device(doc, "builtin", "10.213.0.5", now + 30))
+        pol = dict(BASE, **vpn_policy({"app.example.com": {"via": ["*"]}}))
+        self.assertEqual(gg.vpn_check(pol, doc, "app.example.com", "main", "/", gg.ipaddress.IPv4Address("10.213.0.5"),
+                                      "bob", now + 30)[0], "vpn_doc_expired")
+        for bad in ({k: v for k, v in vpn_doc().items() if k != "valid_until"},
+                    dict(vpn_doc(), valid_until=None), dict(vpn_doc(), valid_until="in an hour"),
+                    dict(vpn_doc(), valid_until=1700000000)):
+            with self.subTest(valid_until=bad.get("valid_until", "<missing>")):
+                with self.assertRaises(ValueError):
+                    gg.parse_vpn_doc(json.loads(json.dumps(bad), object_pairs_hook=gg._vpn_pairs))
 
     def test_unknown_device(self):
         self.vpn_only()
@@ -4064,11 +4103,48 @@ class VpnTest(GateTest):
         self.assertEqual(guard("10.213.0.9"), 403)    # step 2: no device
         self.assertEqual(guard("10.213.0.5"), 200)    # a device: no person to bind
         self.assertEqual(guard("10.213.0.6"), 200)    # step 3 isn't enforced
-        self.assertEqual(guard("10.213.0.5", path="/public-guard"), 403)  # the websecure guard: never
         write_vpn(vpn_doc(hs_stale=True))
         self.assertEqual(guard("100.64.0.7"), 403)
         write_vpn(None)
         self.assertEqual(guard("10.213.0.5"), 403)
+
+    def test_public_guard_websecure_public_paths_on_a_vpn_host(self):
+        # Ruling (server mode with public links): the websecure guard
+        # (portcullis-public-guard@docker) admits the host's published
+        # public paths with no VPN check: public links are public by design.
+        # Anything else on the host still needs the VPN (/auth/vpn).
+        write_policy(dict(PUBLIC_DOC, **vpn_policy({"cloud.example.com": {"via": ["*"]}}, server_mode=True)))
+        import http.client
+
+        def guard(uri, xff="203.0.113.9", path="/public-guard"):
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            c.putrequest("GET", path, skip_accept_encoding=True)
+            c.putheader("X-Forwarded-Host", "cloud.example.com")
+            c.putheader("X-Forwarded-Uri", uri)
+            if xff is not None:
+                c.putheader("X-Forwarded-For", xff)
+            c.endheaders()
+            r = c.getresponse()
+            r.read()
+            c.close()
+            return r.status
+        for xff in ("203.0.113.9", None, "10.213.0.9"):
+            with self.subTest(xff=xff):
+                self.assertEqual(guard("/s/AbC123", xff=xff), 200)
+                self.assertEqual(guard("/dist/app.js", xff=xff), 200)
+        write_vpn(None)  # no vpn.json at all: public links don't depend on it
+        self.assertEqual(guard("/s/AbC123"), 200)
+        write_vpn(vpn_doc())
+        for uri in ("/", "/index.php/apps/files", "/s/AbC123/../../index.php", "/s/bad%2Ftoken", "/dist/app.php"):
+            with self.subTest(uri=uri):
+                self.assertEqual(guard(uri), 403)
+        # The rest of the host: the normal gate path denies, the VPN path binds.
+        self.assertEqual(self.get("cloud.example.com", "203.0.113.9", uri="/index.php/apps/files", gate_path="/auth")[0], 403)
+        self.assertEqual(self.get("cloud.example.com", "203.0.113.9", uri="/index.php/apps/files")[0], 403)
+        # A VPN host without public_paths: the websecure guard still denies.
+        write_policy(dict(BASE, **vpn_policy({"app.example.com": {"via": ["*"]}}, server_mode=True)))
+        c_status = guard("/s/AbC123")
+        self.assertEqual(c_status, 403)
 
     # ── pages ──
 

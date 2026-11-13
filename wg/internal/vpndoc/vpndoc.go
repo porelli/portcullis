@@ -67,10 +67,16 @@ func Reserve(ps ...netip.Prefix) { reserved = append(reserved, ps...) }
 const MaxSize = 64 << 20
 
 type Doc struct {
-	Version   int        `json:"version"`
-	Builtin   *Builtin   `json:"builtin"`
-	Providers []Provider `json:"providers"`
-	Devices   []Device   `json:"devices"`
+	Version int `json:"version"`
+	// ValidUntil (required): the Hub writes now + 1 h and republishes every
+	// 10 min. At or past it the whole file is invalid (Valid): every
+	// device lookup denies, no built-in peer loads, the edge rejects and
+	// closes its connections. A Hub that stops publishing fails closed
+	// within the hour.
+	ValidUntil *time.Time `json:"valid_until"`
+	Builtin    *Builtin   `json:"builtin"`
+	Providers  []Provider `json:"providers"`
+	Devices    []Device   `json:"devices"`
 
 	byAddr map[netip.Addr]int // device index by address
 }
@@ -150,6 +156,9 @@ func Parse(b []byte) (*Doc, error) {
 func (d *Doc) validate() error {
 	if d.Version != Version {
 		return fmt.Errorf("version %d, want %d", d.Version, Version)
+	}
+	if d.ValidUntil == nil {
+		return errors.New("valid_until: missing")
 	}
 	if d.Builtin != nil {
 		p, err := netip.ParsePrefix(d.Builtin.Subnet)
@@ -375,7 +384,7 @@ func (d *Doc) ProviderByID(id string) *Provider {
 // connection arrived through (the edge port / the people stack), never
 // from anything a gateway or client sends.
 func (d *Doc) Device(provider string, a netip.Addr, now time.Time) *Device {
-	if d == nil {
+	if !d.Valid(now) {
 		return nil
 	}
 	p := d.ProviderByID(provider)
@@ -414,9 +423,16 @@ func (d *Doc) Device(provider string, a netip.Addr, now time.Time) *Device {
 
 func expired(t *time.Time, now time.Time) bool { return t != nil && !now.Before(*t) }
 
-// BuiltinPeers are the built-in peers whose expires hasn't passed at now.
+// Valid reports whether the document may be used at now: parsed, with a
+// valid_until still ahead. False for a nil document.
+func (d *Doc) Valid(now time.Time) bool {
+	return d != nil && d.ValidUntil != nil && now.Before(*d.ValidUntil)
+}
+
+// BuiltinPeers are the built-in peers whose expires hasn't passed at now
+// (none once the document is past valid_until).
 func (d *Doc) BuiltinPeers(now time.Time) []BuiltinPeer {
-	if d == nil || d.Builtin == nil {
+	if !d.Valid(now) || d.Builtin == nil {
 		return nil
 	}
 	var out []BuiltinPeer

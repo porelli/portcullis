@@ -36,10 +36,11 @@ const (
 	NotInMap      = "not_in_map"
 	Stale         = "stale"
 	NoDoc         = "no_doc"
+	Expired       = "expired" // vpn.json past its valid_until
 )
 
 // Reasons lists every rejection reason.
-var Reasons = []string{WrongPort, WrongGateway, NoHeader, SlowHeader, OutsideRanges, NotInMap, Stale, NoDoc}
+var Reasons = []string{WrongPort, WrongGateway, NoHeader, SlowHeader, OutsideRanges, NotInMap, Stale, NoDoc, Expired}
 
 // Edge checks and forwards connections.
 type Edge struct {
@@ -71,6 +72,7 @@ type Edge struct {
 // Close reasons of admitted connections (wg_edge_closed_total).
 const (
 	ClosedNoDoc         = "no_doc"
+	ClosedExpired       = "expired"
 	ClosedOutsideRanges = "outside_ranges"
 	ClosedStale         = "stale"
 	ClosedRevoked       = "revoked"
@@ -79,7 +81,7 @@ const (
 )
 
 // CloseReasons lists every close reason.
-var CloseReasons = []string{ClosedNoDoc, ClosedOutsideRanges, ClosedStale, ClosedRevoked, ClosedLifetime, ClosedIdle}
+var CloseReasons = []string{ClosedNoDoc, ClosedExpired, ClosedOutsideRanges, ClosedStale, ClosedRevoked, ClosedLifetime, ClosedIdle}
 
 // Defaults for the session limits.
 const (
@@ -249,12 +251,16 @@ func (e *Edge) forward(c net.Conn, d *vpndoc.Doc, providerID string, client neti
 		e.reject(c, providerID, NoDoc)
 		return
 	}
+	now := e.now()
+	if !d.Valid(now) {
+		e.reject(c, providerID, Expired)
+		return
+	}
 	p := d.ProviderByID(providerID)
 	if p == nil || !client.Addr().Is4() || d.ProviderOf(client.Addr()) != p {
 		e.reject(c, providerID, OutsideRanges)
 		return
 	}
-	now := e.now()
 	if !p.Fresh(now) {
 		e.reject(c, providerID, Stale)
 		return
@@ -298,6 +304,9 @@ func (e *Edge) forward(c net.Conn, d *vpndoc.Doc, providerID string, client neti
 func (e *Edge) recheck(s *session, d *vpndoc.Doc, now time.Time) string {
 	if d == nil {
 		return ClosedNoDoc
+	}
+	if !d.Valid(now) {
+		return ClosedExpired
 	}
 	p := d.ProviderByID(s.provider)
 	if p == nil || d.ProviderOf(s.client) != p {

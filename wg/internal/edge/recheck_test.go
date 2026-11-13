@@ -280,3 +280,32 @@ func TestEdgeConcurrentClose(t *testing.T) {
 		t.Fatalf("closed{no_doc} = %v > 20 sessions", total)
 	}
 }
+
+// TestEdgeValidUntilClosesAndRejects: once vpn.json is past its
+// valid_until (the Hub stopped republishing), every admitted connection
+// closes and a new one is rejected, although nothing else changed.
+func TestEdgeValidUntilClosesAndRejects(t *testing.T) {
+	doc := strings.Replace(docJSON("127.0.0.1", false), `"valid_until":"2099-01-01T00:00:00Z"`, `"valid_until":"2026-11-13T10:02:00Z"`, 1)
+	f := newFixture(t, doc)
+	c, br := f.open("100.64.0.7:40000")
+	f.ping(c, br)
+	f.e.Revalidate()
+	f.ping(c, br) // 10:01: still valid
+	f.advance(time.Minute)
+	f.e.Revalidate()
+	closedSoon(t, c, br)
+	if v := f.closed("expired"); v != 1 {
+		t.Fatalf("closed{expired} = %v", v)
+	}
+	c2, err := net.Dial("tcp4", f.addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	c2.Write(v2Header("100.64.0.7:40001"))
+	c2.Write([]byte("ping\n"))
+	closedSoon(t, c2, bufio.NewReader(c2))
+	if v := testutil.ToFloat64(f.e.rejected.WithLabelValues("hs", "expired")); v != 1 {
+		t.Fatalf("rejected{expired} = %v", v)
+	}
+}

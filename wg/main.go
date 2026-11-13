@@ -489,6 +489,8 @@ func serve(ctx context.Context, cfg *config) error {
 		st := status.Doc{Mode: cfg.Mode}
 		if d == nil {
 			st.Edge = status.Role{OK: false, Error: docErr.Load().(string)}
+		} else if !d.Valid(now) {
+			st.Edge = status.Role{OK: false, Error: "vpn.json: past valid_until (the Hub hasn't republished it)"}
 		} else if lerr := listeners.err(); lerr != "" {
 			st.Edge = status.Role{OK: false, Error: lerr}
 		} else {

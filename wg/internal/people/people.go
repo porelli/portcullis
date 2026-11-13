@@ -95,6 +95,11 @@ func (r *Role) applyLocked() {
 		r.fail(msg)
 		return
 	}
+	if !d.Valid(r.now()) {
+		// The Hub stopped publishing (valid_until passed): no peer at all.
+		r.fail("vpn.json: past valid_until (the Hub hasn't republished it)")
+		return
+	}
 	if d.Builtin == nil {
 		// The Hub hasn't enabled the built-in provider: no peers.
 		if err := r.stack.SyncPeers(nil); err != nil {
