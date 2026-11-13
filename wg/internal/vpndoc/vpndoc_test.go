@@ -119,14 +119,14 @@ func TestParseRefusals(t *testing.T) {
 		"empty":            ``,
 		"null":             `null`,
 		"trailing":         `{"version":2,"providers":[],"devices":[]} {}`,
-		"ipv6 range":       `{"version":2,"providers":[{"id":"a","ranges":["fd00::/64"],"edge_port":9001,"gateway_ip":"172.31.254.16","stale":false}],"devices":[]}`,
-		"unmasked range":   `{"version":2,"providers":[{"id":"a","ranges":["100.64.0.1/10"],"edge_port":9001,"gateway_ip":"172.31.254.16","stale":false}],"devices":[]}`,
-		"dup provider":     `{"version":2,"providers":[{"id":"a","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.16","stale":false},{"id":"a","ranges":["100.65.0.0/16"],"edge_port":9002,"gateway_ip":"172.31.254.17","stale":false}],"devices":[]}`,
-		"dup edge port":    `{"version":2,"providers":[{"id":"a","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.16","stale":false},{"id":"b","ranges":["100.65.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.17","stale":false}],"devices":[]}`,
-		"bad edge port":    `{"version":2,"providers":[{"id":"a","ranges":["100.64.0.0/16"],"edge_port":80,"gateway_ip":"172.31.254.16","stale":false}],"devices":[]}`,
+		"ipv6 range":       `{"version":2,"providers":[{"id":"a","ranges":["fd00::/64"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
+		"unmasked range":   `{"version":2,"providers":[{"id":"a","ranges":["100.64.0.1/10"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
+		"dup provider":     `{"version":2,"providers":[{"id":"a","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false},{"id":"a","ranges":["100.65.0.0/16"],"edge_port":9002,"gateway_ip":"172.31.254.17","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
+		"dup edge port":    `{"version":2,"providers":[{"id":"a","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false},{"id":"b","ranges":["100.65.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.17","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
+		"bad edge port":    `{"version":2,"providers":[{"id":"a","ranges":["100.64.0.0/16"],"edge_port":80,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[]}`,
 		"no gateway":       `{"version":2,"providers":[{"id":"a","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"","stale":false}],"devices":[]}`,
 		"unknown provider": `{"version":2,"providers":[],"devices":[{"ip":"100.64.0.7","provider":"x","user":"a","device_id":"1","name":"a","expires":null}]}`,
-		"no user":          `{"version":2,"providers":[{"id":"a","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.16","stale":false}],"devices":[{"ip":"100.64.0.7","provider":"a","user":"","device_id":"1","name":"a","expires":null}]}`,
+		"no user":          `{"version":2,"providers":[{"id":"a","ranges":["100.64.0.0/16"],"edge_port":9001,"gateway_ip":"172.31.254.16","refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:03:00Z","stale":false}],"devices":[{"ip":"100.64.0.7","provider":"a","user":"","device_id":"1","name":"a","expires":null}]}`,
 		"bad peer key":     `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"","domains":[],"peers":[{"ip":"10.213.0.5","public_key":"short","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
 		"peer outside":     `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"","domains":[],"peers":[{"ip":"10.9.0.5","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
 		"peer is server":   `{"version":2,"builtin":{"subnet":"10.213.0.0/22","server_public_key":"","domains":[],"peers":[{"ip":"10.213.0.1","public_key":"xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=","device_id":"d","expires":null}]},"providers":[],"devices":[]}`,
@@ -185,4 +185,45 @@ func TestWatcher(t *testing.T) {
 		t.Fatal(err)
 	}
 	wait("err")
+}
+
+// TestStaleAfterRules: a marketplace provider's map is only fresh before a
+// stale_after the Hub must write, at most MaxStaleSpan after refreshed_at.
+func TestStaleAfterRules(t *testing.T) {
+	prov := func(extra string) string {
+		return `{"version":2,"providers":[{"id":"hs","ranges":["100.64.0.0/10"],"edge_port":9001,"gateway_ip":"172.31.254.16",` +
+			extra + `"stale":false}],"devices":[{"ip":"100.64.0.7","provider":"hs","user":"alice","device_id":"1","name":"a","expires":null}]}`
+	}
+	for name, extra := range map[string]string{
+		"nil stale_after":            `"refreshed_at":"2026-11-13T10:00:00Z",`,
+		"null stale_after":           `"refreshed_at":"2026-11-13T10:00:00Z","stale_after":null,`,
+		"nil refreshed_at":           `"stale_after":"2026-11-13T10:03:00Z",`,
+		"stale_after too far ahead":  `"refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:30:01Z",`,
+		"stale_after a year ahead":   `"refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2027-11-13T10:00:00Z",`,
+		"stale_after before refresh": `"refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T09:59:00Z",`,
+	} {
+		if _, err := Parse([]byte(prov(extra))); err == nil || !strings.Contains(err.Error(), "stale_after") && !strings.Contains(err.Error(), "refreshed_at") {
+			t.Errorf("%s: err %v, want a stale_after refusal", name, err)
+		}
+	}
+	d, err := Parse([]byte(prov(`"refreshed_at":"2026-11-13T10:00:00Z","stale_after":"2026-11-13T10:30:00Z",`)))
+	if err != nil {
+		t.Fatalf("30 min span refused: %v", err)
+	}
+	at := time.Date(2026, 11, 13, 10, 29, 59, 0, time.UTC)
+	a := netip.MustParseAddr("100.64.0.7")
+	if d.Device("hs", a, at) == nil {
+		t.Fatal("fresh device denied")
+	}
+	if d.Device("hs", a, at.Add(time.Second)) != nil {
+		t.Fatal("device allowed at stale_after")
+	}
+	// Belt and braces: a provider value with no stale_after is never fresh.
+	p := &Provider{ID: "hs"}
+	if p.Fresh(at) {
+		t.Fatal("Fresh without stale_after")
+	}
+	if !(&Provider{ID: BuiltinID}).Fresh(at) || (&Provider{ID: BuiltinID, Stale: true}).Fresh(at) {
+		t.Fatal("builtin freshness")
+	}
 }

@@ -35,6 +35,12 @@ const (
 	EdgePortLast  = 9001 + 46
 )
 
+// MaxStaleSpan is the largest stale_after − refreshed_at a provider may
+// carry: the Hub writes refreshed_at + max(3 × refresh, 3 min) and refresh
+// is at most 10 min (contract §3.3 / §4), so anything later would keep a
+// map alive longer than any legal refresh allows.
+const MaxStaleSpan = 3 * 10 * time.Minute
+
 // MaxSize bounds the file (the Hub caps 10 000 devices per provider).
 const MaxSize = 64 << 20
 
@@ -196,6 +202,12 @@ func (d *Doc) validate() error {
 			return fmt.Errorf("providers[%d].edge_port: outside %d–%d or duplicate", i, EdgePortFirst, EdgePortLast)
 		}
 		ports[p.EdgePort] = true
+		if p.RefreshedAt == nil || p.StaleAfter == nil {
+			return fmt.Errorf("providers[%d]: refreshed_at and stale_after are required", i)
+		}
+		if span := p.StaleAfter.Sub(*p.RefreshedAt); span <= 0 || span > MaxStaleSpan {
+			return fmt.Errorf("providers[%d].stale_after: not within %s after refreshed_at", i, MaxStaleSpan)
+		}
 		g, err := netip.ParseAddr(p.GatewayIP)
 		if err != nil || !g.Is4() {
 			return fmt.Errorf("providers[%d].gateway_ip: not an IPv4 address", i)
@@ -270,15 +282,17 @@ func (p *Provider) Prefixes() []netip.Prefix { return p.prefixes }
 func (p *Provider) Gateway() netip.Addr { return p.gateway }
 
 // Fresh reports whether the provider's map may be used at now: not marked
-// stale by the Hub and, when it has one, not past stale_after.
+// stale by the Hub and, for a marketplace provider, before stale_after (a
+// missing stale_after is never fresh; Parse refuses it anyway). The
+// built-in map is the Hub's own device list, with no refresh.
 func (p *Provider) Fresh(now time.Time) bool {
 	if p.Stale {
 		return false
 	}
-	if p.StaleAfter != nil && !now.Before(*p.StaleAfter) {
-		return false
+	if p.ID == BuiltinID {
+		return true
 	}
-	return true
+	return p.StaleAfter != nil && now.Before(*p.StaleAfter)
 }
 
 // ProviderOf is the provider whose ranges hold a (ranges are disjoint).
