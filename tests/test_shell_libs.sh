@@ -4005,6 +4005,10 @@ case "$*" in
   "get pods -o json") cat "$K/pods.json" 2>/dev/null || echo '{"items":[]}' ;;
   "get events --field-selector "*) echo '{"items":[{"reason":"BackOff","message":"Back-off restarting failed container"}]}' ;;
   "get deployments -l portcullis.io/person-secrets -o json") echo '{"items":[{"metadata":{"labels":{"portcullis.io/instance":"samba"}}}]}' ;;
+  "create -f -") cat >> "$STUB_DIR/kubectl-stdin"; echo --- >> "$STUB_DIR/kubectl-stdin"; printf 'create pod\n' >> "$STUB_DIR/order" ;;
+  "wait --for=jsonpath={.status.phase}=Succeeded pod/"*) printf 'wait %s\n' "$3" >> "$STUB_DIR/order"; exit "${STUB_WAIT_RC:-0}" ;;
+  "logs pod/keygen-"*) printf 'logs\n' >> "$STUB_DIR/order"; printf '# public key: age1kube\nAGE-SECRET-KEY-1KUBEQQQQ\n' ;;
+  "get pod keygen-"*" -o json") echo '{"status":{"phase":"Pending","containerStatuses":[{"name":"keygen","state":{"waiting":{"reason":"ErrImagePull","message":"failed to pull localhost/portcullis-domains@sha256:abc"}}}],"conditions":[{"type":"Ready","status":"False","reason":"ContainersNotReady"}]}}' ;;
   "scale "*|"patch "*|"annotate "*|"rollout "*|"wait "*) printf 'kubectl %s %s\n' "$ns" "$*" >> "$STUB_DIR/order" ;;
   "run "*) printf 'kubectl run\n' >> "$STUB_DIR/order"; cat >/dev/null; exit "${STUB_RUN_RC:-0}" ;;
   "create --dry-run=client -o json -f -") cat >/dev/null; printf '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"oneshot"},"spec":{"containers":[{"name":"x","image":"ghcr.io/porelli/portcullis-hub@sha256:%064d","command":["/usr/local/bin/hub"]}]}}\n' 1 ;;
@@ -4369,11 +4373,13 @@ case "$OUT" in *"PORTCULLIS_WG_EDGE_SERVICE_IP is not set in .env (required by t
 k_fixtures; k15_root; rm -f "$KS/order"
 mkdir -p "$KS/bin2"
 printf '#!/usr/bin/env bash\nprintf "docker %%s\\n" "$*" >> "$STUB_DIR/order"\n[ "$1" != save ] || echo IMAGE-TAR\nexit 0\n' > "$KS/bin2/docker"
-printf '#!/usr/bin/env bash\nprintf "sudo %%s\\n" "$*" >> "$STUB_DIR/order"\ncase "$*" in *"images ls"*) printf "REF TYPE DIGEST\\nx y sha256:%%064d\\n" 9 ;; *) cat >/dev/null ;; esac\n' > "$KS/bin2/sudo"
+printf '#!/usr/bin/env bash\nprintf "sudo %%s\\n" "$*" >> "$STUB_DIR/order"\ncase "$*" in *"images ls"*) printf "REF TYPE DIGEST\\nx y sha256:%%064d\\n" 9 ;; *"images import"*) cat >/dev/null ;; esac\n' > "$KS/bin2/sudo"
 chmod +x "$KS/bin2/docker" "$KS/bin2/sudo"
 echo '{"items":[{"metadata":{"name":"keycloak-abc"},"status":{"phase":"Running","containerStatuses":[{"ready":false,"restartCount":4}]}}]}' > "$KS/kube/pods.json"
 OUT="$(kt "$K15_ENV; PATH='$KS/bin2':\$PATH PORTCULLIS_KUBE_IMAGES=local KUBE_HUB_IMAGE=; export STUB_HELM_FAIL=1; _kube_registry_digest() { echo \"\${1%:*}@sha256:$(printf '%064d' 3)\"; }; kube_netpol_probe() { :; }; _rtk_up")"
 case "$OUT" in *"keycloak-abc Running restarts=4 is not ready; its last events:"*"BackOff: Back-off restarting failed container"*"rc=1") t_pass "rt_up kubernetes: helm timeout → kube_health_report (pods, restarts, last events)" ;; *) t_fail "rt_up helm failure: $OUT" ;; esac
+expect_eq "K1 local: each import also tags its digest reference in containerd (the kubelet resolves localhost/…@sha256 only by that name)" \
+  "$(grep -c '^sudo k3s ctr -n k8s.io images tag --force localhost/portcullis-[a-z-]*:local localhost/portcullis-[a-z-]*@sha256:' "$KS/order")" 5
 expect_eq "rt_up kubernetes: every K1 local image built and imported before helm runs" \
   "$(awk '/^docker build/ {b++} /^sudo k3s ctr -n k8s.io images import/ {i++} /^helm .*upgrade --install/ {print b ":" i; exit}' "$KS/order")" "5:5"
 expect_eq "rt_up kubernetes: helm failure → no digest cache" \
@@ -4385,6 +4391,20 @@ OUT="$(kt "set -euo pipefail; $K15_ENV; _kube_registry_digest() { echo \"\${1%:*
 expect_eq "rt_up kubernetes (under the CLI's set -euo pipefail): success → the objects live and the digest cache" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(test -e "$KS/live/Secret.portcullis-env.json" && echo true || echo false):$(jq -r '.hub' "$K15/secrets/kube/digests.json")" \
   "rc=0:true:ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 3)"
+# _kube_keygen: created, waited for, read, deleted; a pod that never runs
+# says why (phase, the container's waiting reason, events), never its logs.
+k_fixtures; rm -f "$KS/order"
+OUT="$(kt "_K_IMAGES='{\"domains\":\"localhost/portcullis-domains@sha256:$(printf '%064d' 5)\"}'; _kube_keygen domains 10004" 2>/dev/null)"
+expect_eq "_kube_keygen kubernetes: the key from the pod's output; create → wait → logs" \
+  "$(printf '%s\n' "$OUT" | grep -c '^AGE-SECRET-KEY-1KUBE'):$(grep -E '^(create pod|wait|logs)' "$KS/order" | cut -d' ' -f1 | tr '\n' ',')" "1:create,wait,logs,"
+expect_eq "_kube_keygen kubernetes: a restricted pod (non-root 10004, no token, drop ALL, read-only root, RuntimeDefault)" \
+  "$(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(.kind == "Pod") | [.spec.securityContext.runAsUser, .spec.automountServiceAccountToken, .spec.containers[0].securityContext.capabilities.drop, .spec.containers[0].securityContext.readOnlyRootFilesystem, .spec.securityContext.seccompProfile.type, .spec.containers[0].command]' 2>/dev/null)" \
+  '[10004,false,["ALL"],true,"RuntimeDefault",["domains","keygen"]]'
+rm -f "$KS/order"
+OUT="$(kt "export STUB_WAIT_RC=1; KUBE_POD_WAIT=1 _K_IMAGES='{\"domains\":\"localhost/portcullis-domains@sha256:$(printf '%064d' 5)\"}'; _kube_keygen domains 10004")"
+case "$OUT" in *"did not complete: phase Pending; keygen: ErrImagePull failed to pull localhost/portcullis-domains@sha256:abc"*"BackOff"*"rc=1") t_pass "_kube_keygen kubernetes: a pod that never runs → its phase, waiting reason and events, rc 1" ;; *) t_fail "keygen diag: $OUT" ;; esac
+expect_eq "_kube_keygen kubernetes: a failed pod's logs are never read" "$(grep -c '^logs' "$KS/order" || true)" 0
+
 # down never uninstalls
 k_fixtures; rm -f "$KS/order" "$KS/helm-calls"
 OUT="$(kt 'rt_down')"

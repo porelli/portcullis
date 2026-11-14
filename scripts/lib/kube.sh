@@ -593,19 +593,46 @@ _rtk_up_service() {
 # _kube_keygen <svc> <uid> — `<svc> keygen` (an age identity, offline) in a
 # one-shot pod of the service's image: no network label, no volume, its uid.
 _kube_keygen() {
-  local svc="$1" u="$2" img name spec
+  local svc="$1" u="$2" img name ns out rc=0
   kube_images_ready
   img="$(printf '%s' "$_K_IMAGES" | jq -r --arg s "$svc" '.[$s] // empty')"
   [ -n "$img" ] || fail "no image for $svc"
+  ns="$(kube_ns)"
   name="keygen-$svc-$(openssl rand -hex 3)"
-  spec="$(N="$name" IMG="$img" U="$u" S="$svc" jq -nc '
-    {apiVersion: "v1", kind: "Pod", metadata: {name: env.N, labels: {"portcullis.io/component": "keygen"}},
+  # Created, waited for, read, deleted (not `kubectl run -i`: a pod that
+  # never starts must say why — _kube_pod_diag).
+  N="$name" NS="$ns" IMG="$img" U="$u" S="$svc" jq -n '
+    {apiVersion: "v1", kind: "Pod", metadata: {name: env.N, namespace: env.NS, labels: {"portcullis.io/component": "keygen"}},
      spec: {restartPolicy: "Never", automountServiceAccountToken: false, enableServiceLinks: false,
        securityContext: {runAsNonRoot: true, runAsUser: (env.U | tonumber), runAsGroup: (env.U | tonumber), seccompProfile: {type: "RuntimeDefault"}},
-       containers: [{name: env.N, image: env.IMG, command: [env.S, "keygen"],
+       containers: [{name: "keygen", image: env.IMG, command: [env.S, "keygen"],
          resources: {limits: {memory: "64Mi"}, requests: {memory: "64Mi"}},
-         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}}]}}')"
-  kube_ctl -n "$(kube_ns)" run "$name" --image="$img" --restart=Never --rm -i --quiet --overrides="$spec" </dev/null
+         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}}]}}' \
+    | kube_ctl create -f - >/dev/null || { warn "the $svc keygen pod was refused (see above)"; return 1; }
+  if ! kube_ctl -n "$ns" wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$name" --timeout="${KUBE_POD_WAIT:-180}s" >/dev/null 2>&1; then
+    _kube_pod_diag "$name"
+    kube_ctl -n "$ns" delete pod "$name" --wait=false >/dev/null 2>&1 || true
+    return 1
+  fi
+  out="$(kube_ctl -n "$ns" logs "pod/$name" 2>/dev/null)" || rc=$?
+  kube_ctl -n "$ns" delete pod "$name" --wait=false >/dev/null 2>&1 || true
+  [ "$rc" = 0 ] && [ -n "$out" ] || { warn "could not read the $svc keygen pod's output"; return 1; }
+  printf '%s\n' "$out"
+}
+
+# _kube_pod_diag <pod> — why a helper pod didn't run, on stderr: its phase,
+# each container's waiting / terminated reason and message (an image that
+# won't pull, a PSA or admission refusal of the container, a crash), and its
+# last 5 events. Never its logs or env (a keygen's output is a key).
+_kube_pod_diag() {
+  local ns pod="$1" j
+  ns="$(kube_ns)"
+  j="$(kube_ctl -n "$ns" get pod "$pod" -o json 2>/dev/null)" || { warn "pod $pod: gone or unreadable"; return 0; }
+  warn "pod $pod did not complete: $(printf '%s' "$j" | jq -r '"phase " + (.status.phase // "?") + ([(.status.initContainerStatuses // []) + (.status.containerStatuses // []) | .[]
+      | "; " + .name + ": " + ((.state.waiting // .state.terminated // {}) | ((.reason // "") + " " + ((.message // "") | .[0:300])))] | join(""))
+      + ([(.status.conditions // [])[] | select(.status != "True") | "; " + .type + " " + (.reason // "") + " " + ((.message // "") | .[0:200])] | join(""))' 2>/dev/null)"
+  kube_ctl -n "$ns" get events --field-selector "involvedObject.name=$pod" -o json 2>/dev/null \
+    | jq -r '(.items // []) | sort_by(.lastTimestamp // .eventTime // "") | .[-5:][] | "    \(.type) \(.reason): \((.message // "") | gsub("\\s+"; " ") | .[0:300])"' >&2 2>/dev/null || true
 }
 
 # _kube_acme_account_uri — Traefik's ACME account URI from acme.json on the
@@ -1135,6 +1162,10 @@ _kube_local_import() {
   "$builder" save "$name" | sudo k3s ctr -n k8s.io images import - >/dev/null || return 1
   dig="$(sudo k3s ctr -n k8s.io images ls "name==$name" 2>/dev/null | awk 'NR > 1 { print $3; exit }')"
   [[ "$dig" =~ ^sha256:[0-9a-f]{64}$ ]] || return 1
+  # The kubelet resolves a digest reference only by that exact name in
+  # containerd's store (an import creates just the tag): without it the pod
+  # tries to pull localhost/…@sha256 and stays in ErrImagePull.
+  sudo k3s ctr -n k8s.io images tag --force "$name" "localhost/portcullis-$svc@$dig" >/dev/null || return 1
   echo "localhost/portcullis-$svc@$dig"
 }
 
@@ -1540,7 +1571,13 @@ _rtk_run() {
       .metadata.name = env.N | .spec.containers[0].stdin = true | .spec.containers[0].stdinOnce = true
       | .spec.containers[0].name = env.N
       | .spec.containers[0].command = ((if env.E != "" then [env.E] else .spec.containers[0].command end) + $ARGS.positional)' -- "$@")"
-  kube_ctl -n "$(kube_ns)" run "$name" --image="$img" --restart=Never --rm -i --quiet --overrides="$spec"
+  local rc=0
+  kube_ctl -n "$(kube_ns)" run "$name" --image="$img" --restart=Never --rm -i --quiet \
+    --pod-running-timeout="${KUBE_POD_WAIT:-180}s" --overrides="$spec" || rc=$?
+  # A pod that never ran (a pull, PSA or admission failure) says why;
+  # best effort (--rm may have removed it).
+  [ "$rc" = 0 ] || { kube_ctl -n "$(kube_ns)" get pod "$name" >/dev/null 2>&1 && _kube_pod_diag "$name"; kube_ctl -n "$(kube_ns)" delete pod "$name" --wait=false >/dev/null 2>&1; true; }
+  return "$rc"
 }
 
 # ── volumes (K16: owner-uid helper pods in the core namespace) ──
@@ -1662,7 +1699,8 @@ _kube_helper_pod() {
          volumeMounts: ([{name: "tmp", mountPath: "/tmp"}] + (if env.P == "" then [] else [{name: "vol", mountPath: "/vol", readOnly: (env.RO == "ro")}] end))}],
        volumes: ([{name: "tmp", emptyDir: {medium: "Memory"}}] + (if env.P == "" then [] else [{name: "vol", persistentVolumeClaim: {claimName: env.P, readOnly: (env.RO == "ro")}}] end))}}' \
     | kube_ctl create -f - >/dev/null || return 1
-  if ! kube_ctl -n "$(kube_ns)" wait --for=condition=Ready "pod/$name" --timeout=180s >/dev/null; then
+  if ! kube_ctl -n "$(kube_ns)" wait --for=condition=Ready "pod/$name" --timeout="${KUBE_POD_WAIT:-180}s" >/dev/null; then
+    _kube_pod_diag "$name"
     kube_ctl -n "$(kube_ns)" delete pod "$name" --wait=false >/dev/null 2>&1 || true
     return 1
   fi
