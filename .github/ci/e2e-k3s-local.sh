@@ -96,7 +96,7 @@ DOCKERFILE
   docker exec "$name" sudo -u runner mkdir -p "$w"
   (cd "$here" && git ls-files -co --exclude-standard | tar -cf - -T -) | docker exec -i "$name" sudo -u runner tar -C "$w" -xf -
   docker exec "$name" sudo -u runner bash -c "cd $w && git init -q && git add -A && git -c user.email=l@l -c user.name=local commit -qm local && git branch -m kube1"
-  local envs=(-e E2E_K3S_SKIP_DOCKER="${E2E_K3S_SKIP_DOCKER:-}" -e GITHUB_REF_NAME=kube1)
+  local envs=(-e E2E_K3S_SKIP_DOCKER="${E2E_K3S_SKIP_DOCKER:-}" -e K3S_LINE="${K3S_LINE:-}" -e GITHUB_REF_NAME=kube1)
   if [ -n "$hub" ]; then
     git -C "$hub" archive "${HUB_REF:-HEAD}" | docker exec -i "$name" sudo -u runner bash -c 'mkdir -p ~/hub && tar -C ~/hub -xf -'
     docker exec "$name" sudo -u runner bash -c 'cd ~/hub && docker build -q -t portcullis-hub:ci . >/dev/null' || { echo "FAIL: the Hub image didn't build"; exit 1; }
