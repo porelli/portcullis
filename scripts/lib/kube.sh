@@ -778,6 +778,10 @@ kube_admission_params() {
   local me
   me="$(kube_ctl auth whoami -o json 2>/dev/null | jq -r '.status.userInfo.username // empty' 2>/dev/null || true)"
   [ -n "$me" ] || fail "can't tell this CLI's own identity (kubectl auth whoami): refusing to write admission params"
+  local reserved maxprio
+  reserved="$(kube_reserved_hosts)" || exit 1
+  maxprio="$(jq -r '.maxAppPriority | select(type == "number" and . >= 0)' "$PORTCULLIS_HOME/charts/portcullis/core-routes.json" 2>/dev/null || true)"
+  [ -n "$maxprio" ] || fail "charts/portcullis/core-routes.json has no maxAppPriority: refusing to write admission params"
   printf '%s\t%s\n' \
     hubImage "$hub" \
     hubServiceAccount "system:serviceaccount:$ns:portcullis-hub" \
@@ -795,7 +799,18 @@ kube_admission_params() {
     cliUsername "$me" \
     appsNamespace "$(kube_apps_ns)" \
     edgeNamespace "$KUBE_EDGE_NS" \
-    edgeCoreMiddlewares "$KUBE_EDGE_CORE_MIDDLEWARES"
+    edgeCoreMiddlewares "$KUBE_EDGE_CORE_MIDDLEWARES" \
+    reservedHosts "$reserved" \
+    maxAppPriority "$maxprio"
+}
+
+# kube_reserved_hosts — every host a core route serves (the chart's
+# core-routes.json, the same list ingressroutes-core.yaml renders): the apex
+# and <subdomain>.<domain>, lowercase, space-separated.
+kube_reserved_hosts() {
+  local d="${PORTCULLIS_DOMAIN:-}"
+  [ -n "$d" ] || fail "PORTCULLIS_DOMAIN is not set: refusing to write admission params without the reserved hosts"
+  D="${d,,}" jq -r '[env.D] + [.subdomains[] | . + "." + env.D] | join(" ")' "$PORTCULLIS_HOME/charts/portcullis/core-routes.json"
 }
 
 # The owner=core Middlewares of portcullis-edge (the chart's four and the
@@ -875,8 +890,12 @@ kube_cluster_setup() {
   _kube_applied_set cluster.admission "$(_kube_sha "$adm/policies.yaml" "$adm/bindings.yaml")"
 
   info "Cluster setup: admission params..."
+  # Captured first: a refusal inside it (no node address, no identity, no
+  # domain) must stop the setup, which a process substitution would hide.
+  local params
+  params="$(kube_admission_params "$hub")" || fail "the admission params can't be built (see above): nothing written"
   tmp="$(mktemp -d)"
-  while IFS=$'\t' read -r f ep; do printf '%s' "$ep" > "$tmp/$f"; done < <(kube_admission_params "$hub")
+  while IFS=$'\t' read -r f ep; do printf '%s' "$ep" > "$tmp/$f"; done <<< "$params"
   _kube_configmap_from portcullis-admission-params "$(kube_apps_ns)" "$tmp" || { rm -rf "$tmp"; fail "could not write portcullis-admission-params"; }
   _kube_applied_set cluster.params "$(_kube_sha "$tmp"/*)"
   rm -rf "$tmp"

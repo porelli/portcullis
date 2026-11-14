@@ -16,6 +16,7 @@ namespace, and every core IngressRoute / Middleware lives there.
   python3 tests/k8s_hardening.py
 """
 import re
+import json
 import sys
 
 import yaml
@@ -215,6 +216,24 @@ def check_edge(docs):
                 F.add(f"{d['kind']} {d['metadata']['name']} in {ns}: core Traefik objects live in {K.EDGE_NS} (Traefik's only watched namespace)")
             if (d["metadata"].get("labels") or {}).get("portcullis.io/owner") != "core":
                 F.add(f"{d['kind']} {d['metadata']['name']}: no portcullis.io/owner=core (the Hub could change it)")
+    # The apps' bounds (core-routes.json → params reservedHosts /
+    # maxAppPriority): every core IngressRoute's host is reserved and every
+    # core route's effective priority (its own, else Traefik's len(rule)) is
+    # above maxAppPriority.
+    cr = json.loads((K.CHART / "core-routes.json").read_text())
+    dom = K.domain(docs)
+    reserved = {dom} | {f"{s}.{dom}" for s in cr["subdomains"]}
+    for ir in K.by_kind(docs, "IngressRoute"):
+        for r in ir["spec"]["routes"]:
+            prio = r.get("priority") or len(r["match"])
+            if prio <= cr["maxAppPriority"]:
+                F.add(f"IngressRoute {ir['metadata']['name']}: priority {prio} not above maxAppPriority {cr['maxAppPriority']}")
+            hosts = re.findall(r"Host\(`([^`]*)`\)", r["match"])
+            if ir["metadata"]["name"] != "kcinternal" and not hosts:
+                F.add(f"IngressRoute {ir['metadata']['name']}: a rule without Host(...)")
+            for h in hosts:
+                if h.lower() not in reserved:
+                    F.add(f"IngressRoute {ir['metadata']['name']}: host {h} isn't in reservedHosts (core-routes.json)")
     # The params' edgeCoreMiddlewares (no Hub route may name them) = the
     # chart's edge Middlewares + the CLI's hub-proxy-secret.
     want = sorted(["hub-proxy-secret"] + [d["metadata"]["name"] for d in K.by_kind(docs, "Middleware")])

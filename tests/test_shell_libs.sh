@@ -3995,7 +3995,7 @@ kt() {
   ( export STUB_DIR="$KS" PATH="$KS/bin:$PATH" CONTAINER_RUNTIME=kubernetes PORTCULLIS_KUBE_CONTEXT=ci \
       PORTCULLIS_POD_CIDR=10.42.0.0/24 PORTCULLIS_SERVICE_CIDR=10.43.0.0/16 PORTCULLIS_KUBE_API_ENDPOINTS=10.1.0.4:6443 \
       PORTCULLIS_KUBE_INSTALL_ID=0b0e2b3c-1111-4222-8333-444455556666 KUBE_LOCAL_ADDRS="10.1.0.4 198.51.100.1" \
-      PORTCULLIS_PUBLIC_IPV4=198.51.100.1 KUBE_TCP_PROBE=false
+      PORTCULLIS_PUBLIC_IPV4=198.51.100.1 KUBE_TCP_PROBE=false PORTCULLIS_DOMAIN=k.example.org
     unset _RT_CHECKED _RT_HOST_OK
     ( eval "$1" ); echo "rc=$?" ) 2>&1
 }
@@ -4120,6 +4120,9 @@ expect_eq "cluster setup: CRDs, VAPs and bindings applied server-side (never Hel
 expect_eq "cluster setup: applied.json records every step (0600)" \
   "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json"):$(file_mode "$CS_ROOT/secrets/kube/applied.json")" "cluster.admission cluster.crds cluster.namespaces cluster.params cluster.storage:600"
 k_fixtures
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; export STUB_WHOAMI_FAIL=1; kube_cluster_setup")"
+case "$OUT" in *"the admission params can't be built"*"rc=1") case "$(cat "$KS/kubectl-stdin" 2>/dev/null)" in *portcullis-admission-params*) t_fail "cluster setup wrote params after a refusal" ;; *) t_pass "cluster setup: a params refusal (no CLI identity) stops the setup, no params written" ;; esac ;; *) t_fail "cluster setup params refusal: $OUT" ;; esac
+k_fixtures
 echo '{"items":[{"metadata":{"name":"stray-tls"}}]}' > "$KS/kube/edge-secrets.json"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
 case "$OUT" in *"the namespace portcullis-edge holds 1 Secrets: Traefik reads every Secret there"*"rc=1") t_pass "cluster setup: a Secret in the edge namespace (Traefik reads it) → refused" ;; *) t_fail "cluster setup edge secret: $OUT" ;; esac
@@ -4135,7 +4138,16 @@ OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NOD
 case "$OUT" in *"no node address"*"rc=1") t_pass "admission params: no node address → refused (never params that can't exclude the nodes)" ;; *) t_fail "admission params no nodes: $OUT" ;; esac
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; export STUB_WHOAMI_FAIL=1; kube_admission_params x")"
 case "$OUT" in *"can't tell this CLI's own identity"*"rc=1") t_pass "admission params: the CLI's identity unknown → refused (portcullis-edge-routes exempts it by name)" ;; *) t_fail "admission params whoami: $OUT" ;; esac
-OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; kube_admission_params x | grep -E '^(cliUsername|appsNamespace|edgeNamespace|edgeCoreMiddlewares)'" | tr '\t' '=' | head -n4 | tr '\n' ';')"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' PORTCULLIS_DOMAIN=K.Example.org; kube_admission_params x | grep -E '^(reservedHosts|maxAppPriority)'" | tr '\t' '=' | head -n2 | tr '\n' ';')"
+expect_eq "admission params: reservedHosts = the apex + core-routes.json's subdomains (lowercase), maxAppPriority from core-routes.json" "$OUT" \
+  "reservedHosts=k.example.org traefik.k.example.org hub.k.example.org directory.k.example.org metrics.k.example.org people.k.example.org mcp.k.example.org auth.k.example.org enroll.k.example.org;maxAppPriority=0;"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; unset PORTCULLIS_DOMAIN; kube_reserved_hosts")"
+case "$OUT" in *"PORTCULLIS_DOMAIN is not set"*"rc=1") t_pass "reservedHosts: no domain → refused" ;; *) t_fail "reservedHosts no domain: $OUT" ;; esac
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; unset PORTCULLIS_DOMAIN; kube_admission_params x")"
+case "$OUT" in *"PORTCULLIS_DOMAIN is not set"*"rc=1") case "$OUT" in *reservedHosts*) t_fail "admission params written without a domain: $OUT" ;; *) t_pass "admission params: no domain → refused before any key is printed" ;; esac ;; *) t_fail "admission params no domain: $OUT" ;; esac
+expect_eq "admission reservedHosts example = core-routes.json for portcullis.local" "$(sed -n 's/^  reservedHosts: //p' "$HERE/../kube/admission/params.yaml")" \
+  "$(PORTCULLIS_DOMAIN=portcullis.local kube_reserved_hosts)"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' PORTCULLIS_DOMAIN=k.example.org; kube_admission_params x | grep -E '^(cliUsername|appsNamespace|edgeNamespace|edgeCoreMiddlewares)'" | tr '\t' '=' | head -n4 | tr '\n' ';')"
 expect_eq "admission params: the CLI's identity (auth whoami), the apps / edge namespaces, the core edge Middlewares" "$OUT" \
   "cliUsername=system:admin;appsNamespace=portcullis-apps;edgeNamespace=portcullis-edge;edgeCoreMiddlewares=$KUBE_EDGE_CORE_MIDDLEWARES;"
 # setup.sh (K3): uid / gid 1–65535, 3–4 octal digits; mkdir -m then chown;

@@ -1,0 +1,5 @@
+{
+  "_comment": "The one source of the core routers' hosts (ingressroutes-core.yaml) and the apps' bounds the CLI writes into portcullis-admission-params: reservedHosts = the apex + <subdomain>.<domain> for each subdomain, maxAppPriority (below every core route's effective priority: its own, else Traefik's default len(rule)). tests/k8s_hardening.py holds the rendered core IngressRoutes to both.",
+  "subdomains": ["traefik", "hub", "directory", "metrics", "people", "mcp", "auth", "enroll"],
+  "maxAppPriority": 0
+}

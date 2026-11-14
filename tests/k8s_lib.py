@@ -120,3 +120,8 @@ class Failures:
             print(f"FAIL: {m}")
         print(f"{self.name}: {len(self.items)} failure(s)" if self.items else f"{self.name}: ok")
         return 1 if self.items else 0
+
+
+def domain(docs=None):
+    """The CI values' domain (tests/k8s-ci-values.yaml)."""
+    return yaml.safe_load((ROOT / "tests" / "k8s-ci-values.yaml").read_text())["domain"]

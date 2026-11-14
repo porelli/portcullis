@@ -11,7 +11,8 @@ core Service's cluster DNS name. k8s_parity.py compares these with compose. */ -
 {{- $ep := .Values.entrypoints -}}
 {{- $h := printf "Host(`%s`)" $d -}}
 {{- $sub := dict -}}
-{{- range list "traefik" "hub" "directory" "metrics" "people" "mcp" "auth" "enroll" -}}{{- $_ := set $sub . (printf "Host(`%s.%s`)" . $d) -}}{{- end -}}
+{{- /* core-routes.json: the core hosts, also the CLI's reservedHosts. */ -}}
+{{- range (.Files.Get "core-routes.json" | fromJson).subdomains -}}{{- $_ := set $sub . (printf "Host(`%s.%s`)" . $d) -}}{{- end -}}
 {{- $kcAdmin := printf "%s && (PathPrefix(`/admin`) || PathPrefix(`/realms/master`))" $sub.auth -}}
 {{- $mcpPaths := "(Path(`/mcp`) || Path(`/.well-known/oauth-protected-resource/mcp`))" -}}
 {{- $peopleChain := list "rate-limit@file" "client-cert-pem@file" "portcullis-auth@file" "portcullis-groups@file" "hub-proxy-secret" "security-headers@file" -}}
