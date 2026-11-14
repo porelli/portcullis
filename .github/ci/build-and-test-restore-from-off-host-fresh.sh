@@ -32,7 +32,13 @@ docker compose -p ci-hubproxy down -v 2>/dev/null || true
 docker compose down -v
 rm -rf .env secrets/* certs backups/2* backups/.verify-* monitoring/textfile/*.prom
 unset VAULT_TOKEN
-./portcullis restore --yes --from-offsite
+./portcullis restore --yes --from-offsite 2>&1 | tee /tmp/restore.out
+[ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL: restore --from-offsite"; exit 1; }
+# Its last line (T24, both restore paths): authenticator apps and passkeys
+# removed since the backup work again.
+tail -n1 /tmp/restore.out | sed 's/\x1b\[[0-9;]*m//g' \
+  | grep -qxF "==> Authenticator apps and passkeys removed after this backup's date work again: remove the ones reported lost since then (People → person → Sign-in)." \
+  || { echo "FAIL: restore's last line isn't the lost-devices note: $(tail -n1 /tmp/restore.out)"; exit 1; }
 VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
 echo "::add-mask::$VAULT_TOKEN"
 test "$ROOT_CA" = "$(vault read -field=certificate pki/cert/ca | sha256sum)" || { echo "FAIL: CA differs after restore"; exit 1; }

@@ -177,7 +177,7 @@ func TestTokenMethodsDropCertificates(t *testing.T) {
 		"browser certificate amr": {[]string{"file"}, all, ""},
 		"both certificates":       {[]string{"mtls", "file", "hwk"}, all, SecurityKey},
 		"setup link":              {[]string{"inv"}, all, ""},
-		"unknown and case":        {[]string{"HWK", "webauthn", "otp", ""}, all, ""},
+		"unknown and case":        {[]string{"HWK", "webauthn", "OTP", "sms", ""}, all, ""},
 		"every passkey":           {[]string{"spk", "dpk", "hwk", "pwd"}, all, "password,passkey_synced,passkey_device,security_key"},
 		"switched off":            {[]string{"pwd", "spk", "hwk"}, []string{PasskeyDevice, SecurityKey, YubiKeyCert}, SecurityKey},
 		"nothing enabled":         {[]string{"hwk"}, nil, ""},
@@ -207,4 +207,74 @@ func fromKeyRoundTrip(t *testing.T, k string) bool {
 	t.Helper()
 	h := FromKey(k + ",inv,,family:passkey")
 	return len(h) == 2 && h[SecurityKey] && h[Password] && Key(h) == "password,security_key"
+}
+
+// T22: an MCP token counts totp (amr otp) while it is switched on: the
+// browser sign-in behind the token typed the code, and there is no
+// certificate-style binding to check.
+func TestTokenMethodsCountsTOTP(t *testing.T) {
+	on := []string{Password, TOTP, SecurityKey}
+	if got := Key(TokenMethods([]string{"pwd", "otp"}, on)); got != "password,totp" {
+		t.Errorf("pwd+otp: %q", got)
+	}
+	if got := Key(TokenMethods([]string{"pwd", "otp"}, []string{Password, SecurityKey})); got != "password" {
+		t.Errorf("totp off: %q", got)
+	}
+	var r Rule
+	if err := json.Unmarshal([]byte(`{"op":"all","items":["password","totp"]}`), &r); err != nil {
+		t.Fatal(err)
+	}
+	if err := Validate(r); err != nil {
+		t.Fatalf("all[password,totp]: %v", err)
+	}
+	if !r.Satisfied(TokenMethods([]string{"pwd", "otp"}, on)) {
+		t.Error("password and code not met")
+	}
+	if r.Satisfied(TokenMethods([]string{"otp"}, on)) || r.Satisfied(TokenMethods([]string{"pwd"}, on)) {
+		t.Error("met with one of the two")
+	}
+	if Methods[1] != TOTP || amrOf[TOTP] != "otp" || !Known("totp") {
+		t.Errorf("the table: %v", Methods)
+	}
+}
+
+// §8.1 "Rules": a compiled rule with an alternative that is totp alone is
+// refused (fail closed), however it is nested or made redundant.
+func TestValidateRejectsCodeOnly(t *testing.T) {
+	for _, bad := range []string{
+		`{"op":"any","items":["totp","security_key"]}`,
+		`{"op":"any","items":["totp"]}`,
+		`{"op":"all","items":["totp"]}`,
+		`{"op":"any","items":["totp",{"op":"all","items":["totp","password"]}]}`,
+		`{"op":"all","items":["totp",{"op":"any","items":["totp"]}]}`,
+		`{"op":"all","items":[{"op":"any","items":["totp","password"]},{"op":"any","items":["totp","security_key"]}]}`,
+		`{"op":"any","items":[{"op":"all","items":["totp"]},{"op":"all","items":["password",{"op":"any","items":["totp","security_key"]}]}]}`,
+	} {
+		var r Rule
+		if err := json.Unmarshal([]byte(bad), &r); err != nil {
+			t.Fatal(err)
+		}
+		if err := Validate(r); err == nil || err.Error() != "an authenticator code alone is a way in" {
+			t.Errorf("%s: %v", bad, err)
+		}
+	}
+	for _, good := range []string{
+		`{"op":"all","items":["password","totp"]}`,
+		`{"op":"any","items":["security_key",{"op":"all","items":["password","totp"]}]}`,
+	} {
+		var r Rule
+		if err := json.Unmarshal([]byte(good), &r); err != nil {
+			t.Fatal(err)
+		}
+		if err := Validate(r); err != nil {
+			t.Errorf("%s: %v", good, err)
+		}
+	}
+}
+
+// P30: set is a uint8, one bit per method.
+func TestMethodsFitTheSet(t *testing.T) {
+	if len(Methods) > 8 {
+		t.Fatalf("%d methods: widen `type set uint8` in rule.go", len(Methods))
+	}
 }

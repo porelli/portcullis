@@ -611,6 +611,36 @@ func TestConfigV2Strict(t *testing.T) {
 	}
 }
 
+// §8.1 "Rules": with totp switched on, a gate file whose rule has an
+// alternative that is totp alone fails to load (fail closed); a code next
+// to another method loads.
+func TestConfigRefusesCodeOnlyRule(t *testing.T) {
+	gate := string(vector(t, "mcp-gate.json"))
+	methods := "\"security_key\",\n    \"yubikey_cert\"\n  ],"
+	withTOTP := "\"security_key\",\n    \"totp\",\n    \"yubikey_cert\"\n  ],"
+	std := "\"rule\": {\n        \"op\": \"any\",\n        \"items\": [\n          {\n            \"op\": \"any\",\n            \"items\": [\n              \"passkey_synced\",\n              \"passkey_device\",\n              \"security_key\"\n            ]\n          },\n          {\n            \"op\": \"any\",\n            \"items\": [\n              \"yubikey_cert\"\n            ]\n          }\n        ]\n      },"
+	if strings.Count(gate, methods) != 1 || !strings.Contains(gate, std) {
+		t.Fatal("anchors not in the vector")
+	}
+	on := strings.Replace(gate, methods, withTOTP, 1)
+	load := func(rule string) error {
+		_, err := DecodeFile([]byte(strings.Replace(on, std, `"rule": `+rule+`,`, 1)))
+		return err
+	}
+	for _, bad := range []string{
+		`{"op":"any","items":["totp","security_key"]}`,
+		`{"op":"all","items":[{"op":"any","items":["totp"]}]}`,
+		`{"op":"any","items":["security_key",{"op":"all","items":[{"op":"any","items":["totp","passkey_device"]},{"op":"any","items":["totp"]}]}]}`,
+	} {
+		if err := load(bad); err == nil {
+			t.Errorf("%s: loaded", bad)
+		}
+	}
+	if err := load(`{"op":"all","items":["security_key","totp"]}`); err != nil {
+		t.Errorf("security key and code: %v", err)
+	}
+}
+
 // Fix round 1: a rule that doesn't decode names its path (resource and
 // "rule"), never the value.
 func TestRuleDecodeErrorNamesPath(t *testing.T) {
