@@ -74,7 +74,7 @@ container() {
     case "$1" in --hub) hub="$2"; shift 2 ;; --k3s-keep) keep=true; shift ;; *) break ;; esac
   done
   docker info >/dev/null 2>&1 || { echo "FAIL: docker isn't answering"; exit 1; }
-  ! docker inspect "$name" >/dev/null 2>&1 || { echo "FAIL: $name exists (one cluster at a time): docker rm -f $name; docker volume rm $name-docker $name-containerd $name-rancher"; exit 1; }
+  ! docker inspect "$name" >/dev/null 2>&1 || { echo "FAIL: $name exists (one cluster at a time): docker rm -f $name; docker volume rm $name-docker $name-containerd $name-rancher $name-srv"; exit 1; }
   docker build -q -t "$img" - >/dev/null <<'DOCKERFILE'
 FROM docker.io/library/ubuntu:26.04
 ENV DEBIAN_FRONTEND=noninteractive
@@ -87,14 +87,15 @@ STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
 DOCKERFILE
   # The inner dockerd's image store (containerd snapshots) needs a real
-  # filesystem too: overlay on the container's overlay root fails.
-  docker volume create "$name-docker" >/dev/null; docker volume create "$name-containerd" >/dev/null; docker volume create "$name-rancher" >/dev/null
+  # filesystem too: overlay on the container's overlay root fails; and /srv
+  # (the fixer's folders) must be a real filesystem with ACLs, as on a runner.
+  docker volume create "$name-docker" >/dev/null; docker volume create "$name-containerd" >/dev/null; docker volume create "$name-rancher" >/dev/null; docker volume create "$name-srv" >/dev/null
   # The trap runs after container() returns: its locals are gone, so the
   # values are bound now.
   # shellcheck disable=SC2064
-  [ "$keep" = true ] || trap "docker rm -f '$name' >/dev/null 2>&1 || true; docker volume rm '$name-docker' '$name-containerd' '$name-rancher' >/dev/null 2>&1 || true" EXIT
+  [ "$keep" = true ] || trap "docker rm -f '$name' >/dev/null 2>&1 || true; docker volume rm '$name-docker' '$name-containerd' '$name-rancher' '$name-srv' >/dev/null 2>&1 || true" EXIT
   docker run -d --name "$name" --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-    -v "$name-docker:/var/lib/docker" -v "$name-containerd:/var/lib/containerd" -v "$name-rancher:/var/lib/rancher" --tmpfs /run --tmpfs /run/lock "$img" >/dev/null
+    -v "$name-docker:/var/lib/docker" -v "$name-containerd:/var/lib/containerd" -v "$name-rancher:/var/lib/rancher" -v "$name-srv:/srv" --tmpfs /run --tmpfs /run/lock "$img" >/dev/null
   for i in $(seq 1 60); do docker exec "$name" docker info >/dev/null 2>&1 && break; [ "$i" = 60 ] && { echo "FAIL: docker in the runner didn't start"; exit 1; }; sleep 2; done
   local w=/home/runner/work/portcullis/portcullis
   docker exec "$name" sudo -u runner mkdir -p "$w"
