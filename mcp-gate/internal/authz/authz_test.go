@@ -215,8 +215,10 @@ func TestTokenMatrix(t *testing.T) {
 		{name: "acr hwk without amr", auth: tok(with(base, "amr", nil, "acr", "hwk")), status: 403, reason: "sign_in"},
 		{name: "amr mtls (never counts)", auth: tok(with(base, "amr", []string{"mtls"})), status: 403, reason: "sign_in"},
 		{name: "amr file (never counts)", auth: tok(with(base, "amr", []string{"file"})), status: 403, reason: "sign_in"},
-		{name: "amr otp alone (not on the rule)", auth: tok(with(base, "amr", []string{"otp"})), mod: func(sn *config.Snapshot, _ *Request) {
-			sn.File.Methods = []string{"passkey_device", "passkey_synced", "security_key", "totp", "yubikey_cert"}
+		{name: "amr otp alone on password and code", auth: tok(with(base, "amr", []string{"otp"})), mod: func(sn *config.Snapshot, r *Request) {
+			sn.File.Methods = []string{"password", "totp"}
+			res, _ := sn.Resource(r.Host, r.Path)
+			res.Rule = signin.Rule{Op: signin.OpAll, Items: []signin.Rule{{Leaf: signin.Password}, {Leaf: signin.TOTP}}}
 		}, status: 403, reason: "sign_in"},
 		{name: "amr pwd + otp on password and code", auth: tok(with(base, "amr", []string{"pwd", "otp"})), mod: func(sn *config.Snapshot, r *Request) {
 			sn.File.Methods = []string{"password", "totp"}

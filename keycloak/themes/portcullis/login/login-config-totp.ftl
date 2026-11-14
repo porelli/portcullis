@@ -25,7 +25,7 @@
                 <p>${msg("portcullisTotpStep1")}</p>
 
                 <ul id="kc-totp-supported-apps">
-                    <#list ["Google Authenticator", "Microsoft Authenticator", "Authy", "1Password", "Bitwarden", "FreeOTP", "Aegis", "Raivo"] as app>
+                    <#list ["Google Authenticator", "Microsoft Authenticator", "Authy", "1Password", "Bitwarden", "FreeOTP", "Aegis"] as app>
                         <li>${app}</li>
                     </#list>
                 </ul>

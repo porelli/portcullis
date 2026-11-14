@@ -2174,9 +2174,15 @@ CHRONY_OK='Reference ID    : C0A80101 (ntp.example.com)
 System time     : 0.000123456 seconds fast of NTP time
 Leap status     : Normal'
 CHRONY_OFF='System time     : 12.500000000 seconds slow of NTP time'
+# An unsynchronised chronyd: a tiny offset (nothing to correct against), leap not Normal.
+CHRONY_UNSYNC='Reference ID    : 00000000 ()
+System time     : 0.000000001 seconds fast of NTP time
+Leap status     : Not synchronised'
 expect_eq "clock: timedatectl yes / no" "$(clock_with yes -):$(clock_with no "$CHRONY_OK")" "true:false"
 expect_eq "clock: timedatectl without an answer → chrony's offset (under 5 s true, else false)" \
   "$(clock_with '' "$CHRONY_OK"):$(clock_with - "$CHRONY_OFF"):$(clock_with - 'System time     : 4.999 seconds fast of NTP time')" "true:false:true"
+expect_eq "clock: chrony's Leap status Not synchronised → false, whatever the offset (T12-L3)" \
+  "$(clock_with - "$CHRONY_UNSYNC"):$(clock_with '' "$CHRONY_UNSYNC")" "false:false"
 expect_eq "clock: neither tool, or an answer that doesn't parse → unknown" \
   "$(clock_with - -):$(clock_with maybe -):$(clock_with - 'chronyc: cannot talk to daemon')" "unknown:unknown:unknown"
 

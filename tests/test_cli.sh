@@ -714,7 +714,7 @@ PK_REALM_OK='{"realm":"portcullis","webAuthnPolicyPasswordlessAttestationConveya
 pk_status() {
   (
     export PK_REALM="$1" PK_2FA="$2" KEYCLOAK_ADMIN_PASSWORD=stub CONTAINER_RUNTIME=docker
-    export PK_OTP_RA="${PK_OTP_RA-true}" PK_OTP_AGE="${PK_OTP_AGE-300}" PK_CLOCK="${PK_CLOCK:-true}"
+    export PK_OTP_RA="${PK_OTP_RA-true}" PK_OTP_AGE="${PK_OTP_AGE-300}" PK_CLOCK="${PK_CLOCK:-true}" PK_OTP_DEFAULT="${PK_OTP_DEFAULT:-false}" PK_OTP_PRIO="${PK_OTP_PRIO:-}"
     for l in common keycloak status; do
       # shellcheck disable=SC1090
       . "$HERE/../scripts/lib/$l.sh"
@@ -737,7 +737,8 @@ pk_status() {
         /portcullis/authentication/required-actions/webauthn-register-passwordless) echo '{"alias":"webauthn-register-passwordless","enabled":true}' ;;
         /portcullis/authentication/required-actions/webauthn-register) printf '{"alias":"webauthn-register","enabled":%s}' "$PK_2FA" ;;
         /portcullis/authentication/required-actions/CONFIGURE_TOTP|/portcullis/authentication/required-actions/delete_credential)
-          [ -z "$PK_OTP_RA" ] || printf '{"alias":"%s","enabled":%s}' "${1##*/}" "$PK_OTP_RA" ;;
+          a="${1##*/}"; p=85; [ "$a" = CONFIGURE_TOTP ] || p=100
+          [ -z "$PK_OTP_RA" ] || printf '{"alias":"%s","enabled":%s,"defaultAction":%s,"priority":%s}' "$a" "$PK_OTP_RA" "$PK_OTP_DEFAULT" "${PK_OTP_PRIO:-$p}" ;;
         /portcullis/authentication/required-actions/*/config) printf '{"config":{"max_auth_age":"%s"}}' "$PK_OTP_AGE" ;;
         *) echo '{}' ;;
       esac
@@ -787,6 +788,9 @@ expect_eq "status: a drifted OTP policy → a ✗ line, exit 1" \
 expect_eq "status --json: the actions disabled, max_auth_age 600 → named problems" \
   "$(PK_OTP_RA=false PK_OTP_AGE=600 pk_status "$PK_REALM_OK" false json | jq -c 'select(type == "object") | .keycloak.otp_policy.problems')" \
   '["required action CONFIGURE_TOTP disabled (wanted enabled)","CONFIGURE_TOTP max_auth_age 600 (wanted 300)","required action delete_credential disabled (wanted enabled)","delete_credential max_auth_age 600 (wanted 300)"]'
+expect_eq "status --json: a default action, another priority → named problems (T12-L1)" \
+  "$(PK_OTP_DEFAULT=true PK_OTP_PRIO=10 pk_status "$PK_REALM_OK" false json | jq -c 'select(type == "object") | .keycloak.otp_policy.problems')" \
+  '["required action CONFIGURE_TOTP is a default action (wanted not)","required action CONFIGURE_TOTP priority 10 (wanted 85)","required action delete_credential is a default action (wanted not)","required action delete_credential priority 10 (wanted 100)"]'
 expect_eq "status --json: the actions missing → problems (fail closed)" \
   "$(PK_OTP_RA='' pk_status "$PK_REALM_OK" false json | jq -c 'select(type == "object") | .keycloak.otp_policy.problems')" \
   '["required action CONFIGURE_TOTP missing (wanted enabled)","required action delete_credential missing (wanted enabled)"]'
@@ -917,7 +921,7 @@ expect_eq "theme: webauthn-register.ftl hands portcullisHints to webauthnRegiste
 TOTP_FTL="$HERE/../keycloak/themes/portcullis/login/login-config-totp.ftl"
 # shellcheck disable=SC2016  # literal FreeMarker
 expect_eq "theme: login-config-totp.ftl prefills a unique label and names the apps" \
-  "$(grep -cF 'value="${msg("portcullisTotpDeviceDefault")} ${.now?string("yyyy-MM-dd HH:mm:ss")}"' "$TOTP_FTL"):$(grep -c '"Google Authenticator", "Microsoft Authenticator", "Authy", "1Password", "Bitwarden", "FreeOTP", "Aegis", "Raivo"' "$TOTP_FTL"):$(grep -cx 'portcullisTotpDeviceDefault=Authenticator' "$HERE/../keycloak/themes/portcullis/login/messages/messages_en.properties")" "1:1:1"
+  "$(grep -cF 'value="${msg("portcullisTotpDeviceDefault")} ${.now?string("yyyy-MM-dd HH:mm:ss")}"' "$TOTP_FTL"):$(grep -c '"Google Authenticator", "Microsoft Authenticator", "Authy", "1Password", "Bitwarden", "FreeOTP", "Aegis"]' "$TOTP_FTL"):$(grep -cx 'portcullisTotpDeviceDefault=Authenticator' "$HERE/../keycloak/themes/portcullis/login/messages/messages_en.properties")" "1:1:1"
 # shellcheck disable=SC2016  # literal FreeMarker
 expect_eq "theme: login-config-totp.ftl keeps the stock QR / key ids, the hidden totpSecret and mode, totp / userLabel inputs" \
   "$(for n in 'id="kc-totp-secret-qr-code"' 'id="kc-totp-secret-key"' 'id="mode-manual"' 'name="totpSecret" value="${totp.totpSecret}"' 'name="mode" value="${mode}"' 'name="totp"' 'name="userLabel"' 'logoutOtherSessions'; do grep -cF -- "$n" "$TOTP_FTL"; done | tr '\n' ' ')" "1 1 1 1 1 1 1 1 "

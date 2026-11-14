@@ -138,7 +138,8 @@ kc_passkey_actions_drift() {
 # KC_OTP_ACTIONS (contract §8.1 "Authenticator-app codes"): one
 # "<setting> <value> (wanted <value>)" line per differing setting, by name
 # (the seven otpPolicy* values, then each action's max_auth_age), a line
-# per action that is missing or disabled, "… can't be read" when the realm
+# per action that is missing, disabled, a default action or at another
+# priority than KC_OTP_ACTIONS', "… can't be read" when the realm
 # or an action can't be (never empty then); nothing when everything agrees.
 kc_otp_policy_drift() {
   kc_get "/$KC_REALM" 2>/dev/null | jq -rs --argjson w "$KC_REALM_OTP_SETTINGS" '
@@ -147,13 +148,17 @@ kc_otp_policy_drift() {
         | select($r[$k] != $w[$k])
         | "\($k) \($r[$k] // "unset" | tostring) (wanted \($w[$k] | tostring))"
       end' 2>/dev/null || echo "the realm can't be read"
-  local ra
+  local ra prio
   for ra in $KC_OTP_ACTIONS; do
-    ra="${ra%%:*}"
-    kc_get "/$KC_REALM/authentication/required-actions/$ra" 2>/dev/null | jq -rs --arg a "$ra" '
+    prio="${ra#*:}" ra="${ra%%:*}"
+    # A default action would put authenticator setup on every new user.
+    kc_get "/$KC_REALM/authentication/required-actions/$ra" 2>/dev/null | jq -rs --arg a "$ra" --argjson p "$prio" '
         .[0] | if type != "object" or (.alias // "") == "" then "required action \($a) missing (wanted enabled)"
-        elif .enabled != true then "required action \($a) disabled (wanted enabled)"
-        else empty end' 2>/dev/null || echo "required action $ra can't be read"
+        else
+          (if .enabled != true then "required action \($a) disabled (wanted enabled)" else empty end),
+          (if .defaultAction == true then "required action \($a) is a default action (wanted not)" else empty end),
+          (if .priority != $p then "required action \($a) priority \(.priority // "unset" | tostring) (wanted \($p))" else empty end)
+        end' 2>/dev/null || echo "required action $ra can't be read"
     kc_get "/$KC_REALM/authentication/required-actions/$ra/config" 2>/dev/null | jq -rs --arg a "$ra" --arg w "$KC_OTP_MAX_AUTH_AGE" '
         .[0] | if type != "object" then "required action \($a) config can'"'"'t be read"
         elif ((.config // {}) | type) != "object" then "required action \($a) config can'"'"'t be read"

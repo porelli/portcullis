@@ -29,8 +29,10 @@ _st_line() {  # _st_line ok|warn|note|fail <text>
 # status_clock_synced — whether this server's clock is synchronised
 # (contract §8.1 "Authenticator-app codes": codes fail when it is more than
 # about 30 s off): "true" / "false" from systemd's NTPSynchronized
-# (`timedatectl show`), else from chrony's offset (`chronyc tracking`,
-# "System time : <s> seconds fast|slow of NTP time": under 5 s is true),
+# (`timedatectl show`), else from chrony (`chronyc tracking`: "Leap status"
+# other than Normal is false — an unsynchronised chronyd reports a tiny
+# offset, it has nothing to correct against —, else "System time : <s>
+# seconds fast|slow of NTP time" under 5 s is true),
 # else "unknown" (neither tool, or an answer that doesn't parse).
 status_clock_synced() {
   local v
@@ -42,7 +44,11 @@ status_clock_synced() {
     esac
   fi
   if command -v chronyc >/dev/null 2>&1; then
-    v="$(chronyc tracking 2>/dev/null | awk -F: '$1 ~ /^System time *$/ { split($2, w, " "); print w[1]; exit }' || true)"
+    local tracking leap
+    tracking="$(chronyc tracking 2>/dev/null || true)"
+    leap="$(printf '%s\n' "$tracking" | awk -F: '$1 ~ /^Leap status *$/ { sub(/^ +/, "", $2); sub(/ +$/, "", $2); print $2; exit }')"
+    if [ -n "$leap" ] && [ "$leap" != Normal ]; then echo false; return; fi
+    v="$(printf '%s\n' "$tracking" | awk -F: '$1 ~ /^System time *$/ { split($2, w, " "); print w[1]; exit }')"
     if [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
       if awk -v o="$v" 'BEGIN { exit !(o < 5) }'; then echo true; else echo false; fi
       return

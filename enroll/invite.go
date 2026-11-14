@@ -271,14 +271,21 @@ type inviteOptions struct {
 // step (the Hub's invite does, contract §9.4).
 var errAuthenticatorCLI = errors.New("the authenticator-app step is only for setup links made in the Hub")
 
+// errAuthenticatorUnavailable: this enroll has no way to add CONFIGURE_TOTP
+// (requireTotp not wired): the option is refused (503), never dropped.
+var errAuthenticatorUnavailable = errors.New("the authenticator-app step isn't available on this server")
+
 // Create registers a new invite and returns its token. allowAdmin is true
 // only for the loopback (docker exec) path.
 func (s *inviteService) Create(user, landing string, ttl time.Duration, allowAdmin bool, opt inviteOptions) (string, time.Time, error) {
 	if user == hubServiceAccount || (user == bootstrapAdmin && !allowAdmin) {
 		return "", time.Time{}, errProtected
 	}
-	if opt.Authenticator && (allowAdmin || s.requireTotp == nil) {
+	if opt.Authenticator && allowAdmin {
 		return "", time.Time{}, errAuthenticatorCLI
+	}
+	if opt.Authenticator && s.requireTotp == nil {
+		return "", time.Time{}, errAuthenticatorUnavailable
 	}
 	if !allowAdmin {
 		if err := s.checkNotProtected(user, "create"); err != nil {
@@ -492,7 +499,7 @@ func (s *inviteService) handleRedeem(w http.ResponseWriter, r *http.Request) {
 	err := s.requirePasskey(inv.User)
 	if err == nil && inv.Authenticator {
 		if s.requireTotp == nil {
-			err = errAuthenticatorCLI
+			err = errAuthenticatorUnavailable
 		} else {
 			err = s.requireTotp(inv.User)
 		}
@@ -782,7 +789,7 @@ func (s *inviteService) handleAPICreate(local bool) http.HandlerFunc {
 		case errors.Is(err, errNoUser):
 			jsonError(w, http.StatusNotFound, err.Error())
 			return
-		case errors.Is(err, errGroupCheck):
+		case errors.Is(err, errGroupCheck), errors.Is(err, errAuthenticatorUnavailable):
 			jsonError(w, http.StatusServiceUnavailable, err.Error())
 			return
 		case err != nil:

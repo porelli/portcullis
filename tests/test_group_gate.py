@@ -1261,7 +1261,7 @@ class SigninV6Test(GateTest):
                                  {"passkey_synced"}, False, "example.com").decode()
         self.assertIn(link, b)
         self.assertNotIn("or ask your admin", b)
-        # Set up already: no link, no ask (the password is what's missing here).
+        # totp is missing but set up: a step-up case, so no link and no ask.
         b = gg.render_needs_page("App", {"passkey_synced"}, {"op": "all", "items": ["passkey_synced", "totp"]},
                                  {"passkey_synced", "totp"}, False, "example.com").decode()
         self.assertNotIn("portcullis-set-up-authenticator", b)

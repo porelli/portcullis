@@ -544,10 +544,12 @@ func TestCLINeverAuthenticator(t *testing.T) {
 	if _, _, err := s.Create("alice", "", 0, true, inviteOptions{Authenticator: true}); !errors.Is(err, errAuthenticatorCLI) {
 		t.Fatalf("Create(local, authenticator): %v", err)
 	}
-	// Without a requireTotp (not wired), the Hub's option is refused too: fail closed.
+	// Without a requireTotp (not wired), the Hub's option is refused too
+	// (503, its own text): fail closed, never a link without the step.
 	s.requireTotp = nil
-	if w := apiPost(s, false, `{"username":"alice","authenticator":true}`); w.Code != http.StatusBadRequest {
-		t.Fatalf("no requireTotp: %d", w.Code)
+	if w := apiPost(s, false, `{"username":"alice","authenticator":true}`); w.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(w.Body.String(), "isn't available on this server") {
+		t.Fatalf("no requireTotp: %d %s", w.Code, w.Body)
 	}
 	if w := apiPost(s, true, `{"username":"admin"}`); w.Code != http.StatusCreated || len(*required) != 0 {
 		t.Fatalf("loopback plain: %d", w.Code)
