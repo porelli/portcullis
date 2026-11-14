@@ -1083,7 +1083,8 @@ class SigninV6Test(GateTest):
         self.assertEqual(gg.choose_stepup(STANDARD, set(), None), "passkey")
         self.assertEqual(gg.choose_stepup(STANDARD, set(), {"passkey_device", "security_key"}), "passkey_device")
         self.assertIsNone(gg.choose_stepup({"op": "all", "items": ["security_key", "yubikey_cert"]}, set(), None))
-        for m in ("password", "passkey_synced", "browser_cert", "passkey_device", "security_key", "yubikey_cert", "passkey"):
+        for m in ("password", "totp", "passkey_synced", "browser_cert", "passkey_device", "security_key", "yubikey_cert",
+                  "passkey"):
             self.assertIn(f"pc_method={m}&", gg.stepup_url("x.example.com", m, extra=False))
         with self.assertRaises(ValueError):
             gg.stepup_url("x.example.com", "hwk", extra=False)
@@ -1160,7 +1161,7 @@ class SigninV6Test(GateTest):
         self.assertEqual(gg.METHOD_WORDS, {"password": "password", "passkey_synced": "passkey",
                                            "browser_cert": "browser certificate", "passkey_device": "device-bound passkey",
                                            "security_key": "security key", "yubikey_cert": "YubiKey certificate",
-                                           "passkey": "passkey"})
+                                           "totp": "code from an authenticator app", "passkey": "passkey"})
 
     def test_alpha_pc_method_allowlist(self):
         with open(ALPHA) as f:
@@ -1178,11 +1179,98 @@ class SigninV6Test(GateTest):
             elif stripped.startswith("default:"):
                 params.setdefault("__default__", []).append(name)
         self.assertEqual(sorted(params), ["kc_idp_hint", "pc_method", "prompt"])
-        self.assertEqual(params["pc_method"], ["password", "passkey_synced", "browser_cert", "passkey_device",
+        self.assertEqual(params["pc_method"], ["password", "totp", "passkey_synced", "browser_cert", "passkey_device",
                                                "security_key", "yubikey_cert", "passkey"])
         self.assertEqual(set(params["pc_method"]), gg.STEPUP_METHODS)
         self.assertEqual(params["kc_idp_hint"], ["portcullis-invite"])
         self.assertEqual(params["prompt"], ["login"])
+
+    # ── Authenticator-app codes (contract §8.1 "Authenticator-app codes") ──
+
+    def test_totp_amr_and_tenths(self):
+        self.assertEqual(gg.METHOD_IDS, ("password", "totp", "passkey_synced", "browser_cert", "passkey_device",
+                                         "security_key", "yubikey_cert"))
+        self.assertEqual(gg.AMR_TO_METHOD["otp"], "totp")
+        self.assertEqual(gg.METHOD_TENTHS["totp"], 15)
+        self.assertEqual(gg.METHOD_WORDS["totp"], "code from an authenticator app")
+        self.assertEqual(gg.STEPUP_METHODS, frozenset(gg.METHOD_IDS) | {"passkey"})
+        self.assertEqual(gg.session_methods(["pwd", "otp"], ALL_METHODS, set()), {"password", "totp"})
+        # Switched off: amr otp counts as nothing.
+        self.assertEqual(gg.session_methods(["pwd", "otp"], ALL_METHODS - {"totp"}, set()), {"password"})
+
+    def test_validate_rule_code_only(self):
+        code_only = "an authenticator code alone is a way in"
+        for bad in ({"op": "any", "items": ["totp", "security_key"]},
+                    {"op": "any", "items": ["totp"]},
+                    {"op": "all", "items": ["totp"]},
+                    {"op": "any", "items": ["totp", {"op": "all", "items": ["totp", "password"]}]},
+                    {"op": "all", "items": ["totp", {"op": "any", "items": ["totp"]}]},
+                    {"op": "any", "items": ["security_key", {"op": "all", "items": [{"op": "any", "items": ["totp"]}]}]},
+                    {"op": "all", "items": [{"op": "any", "items": ["totp", "password"]},
+                                            {"op": "any", "items": ["totp", "security_key"]}]}):
+            with self.subTest(bad=bad):
+                self.assertEqual(gg.validate_rule(bad, ALL_METHODS), code_only)
+                write_policy({"methods": sorted(ALL_METHODS), "templates": {**BASE["templates"], "x": bad},
+                              "hosts": {"grafana.example.com": "x"}}, malformed=True)
+                self.assertEqual(self.page("grafana.example.com", ["pwd", "otp", "hwk"])[0], 403)
+        for good in ({"op": "all", "items": ["password", "totp"]},
+                     {"op": "all", "items": ["totp", {"op": "any", "items": ["password", "security_key"]}]},
+                     {"op": "any", "items": ["security_key", {"op": "all", "items": ["password", "totp"]}]}):
+            with self.subTest(good=good):
+                self.assertIsNone(gg.validate_rule(good, ALL_METHODS))
+        # Off: the leaf is refused as not switched on, before any code-only check.
+        self.assertEqual(gg.validate_rule({"op": "all", "items": ["password", "totp"]}, ALL_METHODS - {"totp"}),
+                         "'totp' is not switched on")
+        write_policy({"methods": sorted(ALL_METHODS),
+                      "templates": {**BASE["templates"], "pc": {"op": "all", "items": ["password", "totp"]}},
+                      "hosts": {"grafana.example.com": "pc"}})
+        self.assertEqual(self.page("grafana.example.com", ["pwd", "otp"])[0], 200)
+        self.assertEqual(self.page("grafana.example.com", ["otp"])[0], 403)
+
+    def test_stepup_totp(self):
+        rule = {"op": "all", "items": ["password", "totp"]}
+        self.assertEqual(gg.choose_stepup(rule, {"password"}, {"password", "totp"}), "totp")
+        self.assertIsNone(gg.choose_stepup(rule, {"password"}, {"password"}))
+        self.assertEqual(gg.choose_stepup(rule, {"password"}, None), "totp")
+        url = gg.stepup_url("grafana.example.com", "totp", extra=False)
+        self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(url).query),
+                         {"pc_method": ["totp"], "rd": ["https://grafana.example.com/"]})
+        write_policy({"methods": sorted(ALL_METHODS), "templates": {**BASE["templates"], "pc": rule},
+                      "hosts": {"grafana.example.com": "pc"}, "people": {"bob": ["password", "totp"]}})
+        code, hdrs, body = self.page("grafana.example.com", ["pwd"])
+        self.assertEqual(code, 403)
+        self.assertIn("pc_method=totp&", hdrs["X-Stepup-URL"])
+        self.assertIn("grafana.example.com needs a code from an authenticator app", body)
+
+    def test_needs_page_authenticator_link(self):
+        acct = "https://people.example.com/signin"
+        rule = {"op": "all", "items": ["password", "totp"]}
+        link = f'<a id="portcullis-set-up-authenticator" class="btn" href="{acct}">Set up an authenticator app</a>'
+        # A password session (1.0), no authenticator, add_stronger off: ask your admin, no link.
+        b = gg.render_needs_page("App", {"password"}, rule, {"password"}, False, "example.com").decode()
+        self.assertIn("<li>a password and a code from an authenticator app <span class=\"portcullis-sub\">"
+                      "— you don&#x27;t have an authenticator app yet</span></li>", b)
+        self.assertNotIn("portcullis-set-up-authenticator", b)
+        self.assertIn('<span class="portcullis-sub">or ask your admin</span>', b)
+        # add_stronger on: the link.
+        b = gg.render_needs_page("App", {"password"}, rule, {"password"}, True, "example.com").decode()
+        self.assertIn(link, b)
+        self.assertNotIn("or ask your admin", b)
+        # A synced-passkey session (2.5 ≥ 1.5): the link, add_stronger off.
+        b = gg.render_needs_page("App", {"passkey_synced"}, {"op": "all", "items": ["passkey_synced", "totp"]},
+                                 {"passkey_synced"}, False, "example.com").decode()
+        self.assertIn(link, b)
+        self.assertNotIn("or ask your admin", b)
+        # Set up already: no link, no ask (the password is what's missing here).
+        b = gg.render_needs_page("App", {"passkey_synced"}, {"op": "all", "items": ["passkey_synced", "totp"]},
+                                 {"passkey_synced", "totp"}, False, "example.com").decode()
+        self.assertNotIn("portcullis-set-up-authenticator", b)
+        self.assertNotIn("have an authenticator app yet", b)
+        # A person `people` doesn't know: no "yet", still the link rules.
+        b = gg.render_needs_page("App", {"passkey_synced"}, {"op": "all", "items": ["passkey_synced", "totp"]},
+                                 None, False, "example.com").decode()
+        self.assertNotIn("yet</span>", b)
+        self.assertIn(link, b)
 
 
 def token(**claims):

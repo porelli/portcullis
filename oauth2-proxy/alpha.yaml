@@ -42,6 +42,7 @@ providers:
       - name: pc_method
         allow:
           - value: password
+          - value: totp
           - value: passkey_synced
           - value: browser_cert
           - value: passkey_device

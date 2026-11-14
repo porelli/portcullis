@@ -23,9 +23,12 @@ import (
 	"strings"
 )
 
-// The six method ids (§8.1), in canonical order (weakest first).
+// The seven method ids (§8.1), in canonical order. TOTP (an
+// authenticator-app code, amr "otp") is a second factor only: Validate
+// refuses a compiled rule with an alternative that is TOTP alone.
 const (
 	Password      = "password"
+	TOTP          = "totp"
 	PasskeySynced = "passkey_synced"
 	BrowserCert   = "browser_cert"
 	PasskeyDevice = "passkey_device"
@@ -34,12 +37,13 @@ const (
 )
 
 // Methods lists every method id in canonical order.
-var Methods = []string{Password, PasskeySynced, BrowserCert, PasskeyDevice, SecurityKey, YubiKeyCert}
+var Methods = []string{Password, TOTP, PasskeySynced, BrowserCert, PasskeyDevice, SecurityKey, YubiKeyCert}
 
 // amrOf is the §8.1 table: the amr value Keycloak records per method.
 // "inv" (a setup-link session) is not a method and maps to nothing.
 var amrOf = map[string]string{
 	Password:      "pwd",
+	TOTP:          "otp",
 	PasskeySynced: "spk",
 	BrowserCert:   "file",
 	PasskeyDevice: "dpk",
@@ -74,7 +78,7 @@ func rank(m string) int {
 	return -1
 }
 
-// Known reports whether s is one of the six method ids (no family, no amr
+// Known reports whether s is one of the seven method ids (no family, no amr
 // value).
 func Known(s string) bool { return rank(s) >= 0 }
 
@@ -209,7 +213,9 @@ func decodeRule(dec *json.Decoder, depth int) (Rule, error) {
 // Validate is the readers' check of a compiled rule (the Hub's
 // ValidateCompiled): the top is a group; every group is "all" / "any"
 // with 1–8 items; groups nest at most 4 levels; at most 48 leaves, each a
-// method id (no families). It doesn't look at the switches.
+// method id (no families); no alternative is TOTP alone (an authenticator
+// code is never a way in by itself, §8.1 "Rules"). It doesn't look at the
+// switches.
 func Validate(r Rule) error {
 	if r.isLeaf() {
 		return errors.New("a compiled rule must be a group")
@@ -248,6 +254,15 @@ func Validate(r Rule) error {
 	}
 	if leaves > MaxLeaves {
 		return fmt.Errorf("more than %d methods", MaxLeaves)
+	}
+	sets, err := alternatives(r)
+	if err != nil {
+		return err
+	}
+	for _, s := range sets {
+		if s == codeOnly {
+			return errors.New("an authenticator code alone is a way in")
+		}
 	}
 	return nil
 }
@@ -293,8 +308,12 @@ func (r Rule) Satisfied(have map[string]bool) bool {
 	return false
 }
 
-// set is a set of methods, bit i = Methods[i].
+// set is a set of methods, bit i = Methods[i] (TestMethodsFitTheSet:
+// widen it before a ninth method).
 type set uint8
+
+// codeOnly is the one alternative no compiled rule may have.
+var codeOnly = set(1 << rank(TOTP))
 
 // minimal drops duplicates and supersets of another set, keeping the
 // order of first appearance (the Hub's minimal).
@@ -401,7 +420,8 @@ func (r Rule) NeedsCertificate() bool {
 
 // TokenMethods is what an MCP access token counts for (§15.2): each amr
 // value mapped through the §8.1 table, kept only while the method is in
-// enabled (the gate file's switched-on methods), and never yubikey_cert or
+// enabled (the gate file's switched-on methods; totp counts, T22: the
+// browser sign-in behind the token typed the code), and never yubikey_cert or
 // browser_cert — an MCP client presents no certificate, so a certificate
 // amr in its token proves nothing on this request. "inv" and every value
 // outside the table count as nothing.
