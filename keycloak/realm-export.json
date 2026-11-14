@@ -42,8 +42,15 @@
   "webAuthnPolicyPasswordlessUserVerificationRequirement": "required",
   "webAuthnPolicyPasswordlessCreateTimeout": 60,
   "webAuthnPolicyPasswordlessAvoidSameAuthenticatorRegister": true,
+  "otpPolicyType": "totp",
+  "otpPolicyAlgorithm": "HmacSHA1",
+  "otpPolicyDigits": 6,
+  "otpPolicyPeriod": 30,
+  "otpPolicyLookAheadWindow": 1,
+  "otpPolicyCodeReusable": false,
+  "otpPolicyInitialCounter": 0,
   "eventsEnabled": true,
-  "enabledEventTypes": ["LOGIN", "LOGIN_ERROR", "IMPERSONATE"],
+  "enabledEventTypes": ["LOGIN", "LOGIN_ERROR", "IMPERSONATE", "UPDATE_CREDENTIAL", "REMOVE_CREDENTIAL"],
   "eventsExpiration": 31536000,
   "attributes": {
     "acr.loa.map": "{}"
@@ -99,7 +106,7 @@
     },
     {
       "alias": "portcullis-signin",
-      "description": "YubiKey certificate, then browser certificate (automatic when the browser presents one of that kind's CA), a passkey, or a password; each only while its method is on",
+      "description": "YubiKey certificate, then browser certificate (automatic when the browser presents one of that kind's CA), a passkey, a password, or an authenticator code (only once the user is known); each only while its method is on",
       "providerId": "basic-flow",
       "topLevel": false,
       "builtIn": false,
@@ -130,6 +137,13 @@
           "requirement": "ALTERNATIVE",
           "priority": 40,
           "authenticatorConfig": "password-config"
+        },
+        {
+          "authenticator": "portcullis-otp",
+          "authenticatorFlow": false,
+          "requirement": "ALTERNATIVE",
+          "priority": 50,
+          "authenticatorConfig": "otp-config"
         }
       ]
     },
@@ -409,6 +423,10 @@
       "config": { "default.reference.value": "pwd", "default.reference.maxAge": "36000" }
     },
     {
+      "alias": "otp-config",
+      "config": { "default.reference.value": "otp", "default.reference.maxAge": "36000" }
+    },
+    {
       "alias": "passkey-kind-security-key",
       "config": { "kind": "security_key" }
     },
@@ -476,6 +494,15 @@
       "priority": 80
     },
     {
+      "alias": "CONFIGURE_TOTP",
+      "name": "Configure OTP",
+      "providerId": "CONFIGURE_TOTP",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 85,
+      "config": { "max_auth_age": "300" }
+    },
+    {
       "alias": "portcullis-impersonation-notice",
       "name": "Impersonation notice",
       "providerId": "portcullis-impersonation-notice",
@@ -483,6 +510,15 @@
       "defaultAction": false,
       "priority": 90,
       "config": {}
+    },
+    {
+      "alias": "delete_credential",
+      "name": "Delete Credential",
+      "providerId": "delete_credential",
+      "enabled": true,
+      "defaultAction": false,
+      "priority": 100,
+      "config": { "max_auth_age": "300" }
     }
   ],
   "components": {

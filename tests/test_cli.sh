@@ -742,24 +742,31 @@ expect_eq "realm export: portcullis-universal is REQUIRED portcullis-authenticat
 expect_eq "realm export: portcullis-universal is the browser flow" "$(jq -r .browserFlow "$RX")" portcullis-universal
 expect_eq "realm export: portcullis-authenticate = cookie | invite redirector | portcullis-signin" \
   "$(flow portcullis-authenticate)" '["ALTERNATIVE auth-cookie","ALTERNATIVE identity-provider-redirector","ALTERNATIVE portcullis-signin"]'
-expect_eq "realm export: portcullis-signin = x509 | x509 | passkey sub-flow | password form" \
-  "$(flow portcullis-signin)" '["ALTERNATIVE portcullis-x509","ALTERNATIVE portcullis-x509","ALTERNATIVE portcullis-signin-passkey","ALTERNATIVE portcullis-password-form"]'
-expect_eq "realm-export: portcullis-signin = x509 (x509-config, mtls, yubikey CA), x509 (x509-browser-config, file, browser CA), passkey sub-flow, password form, in that order" \
+expect_eq "realm export: portcullis-signin = x509 | x509 | passkey sub-flow | password form | authenticator code" \
+  "$(flow portcullis-signin)" '["ALTERNATIVE portcullis-x509","ALTERNATIVE portcullis-x509","ALTERNATIVE portcullis-signin-passkey","ALTERNATIVE portcullis-password-form","ALTERNATIVE portcullis-otp"]'
+expect_eq "realm-export: portcullis-signin = x509 (x509-config, mtls, yubikey CA), x509 (x509-browser-config, file, browser CA), passkey sub-flow, password form, authenticator code (otp-config, otp), in that order" \
   "$(jq -c '.authenticatorConfig as $c | [.authenticationFlows[] | select(.alias == "portcullis-signin") | .authenticationExecutions | sort_by(.priority)[]
       | (.authenticatorConfig // "") as $n | [.priority, (.authenticator // .flowAlias), $n,
          ([$c[] | select(.alias == $n) | .config | .["default.reference.value"], .["portcullis.method"], .["portcullis.ca"]] | map(. // "") | join(" "))]]' "$RX")" \
-  '[[10,"portcullis-x509","x509-config","mtls yubikey_cert /opt/keycloak/conf/truststores/portcullis/portcullis-yubikey-ca.pem"],[20,"portcullis-x509","x509-browser-config","file browser_cert /opt/keycloak/conf/truststores/portcullis/portcullis-browser-ca.pem"],[30,"portcullis-signin-passkey","",""],[40,"portcullis-password-form","password-config","pwd  "]]'
+  '[[10,"portcullis-x509","x509-config","mtls yubikey_cert /opt/keycloak/conf/truststores/portcullis/portcullis-yubikey-ca.pem"],[20,"portcullis-x509","x509-browser-config","file browser_cert /opt/keycloak/conf/truststores/portcullis/portcullis-browser-ca.pem"],[30,"portcullis-signin-passkey","",""],[40,"portcullis-password-form","password-config","pwd  "],[50,"portcullis-otp","otp-config","otp  "]]'
 expect_eq "realm-export: each x509 config's CRL paths name only its own mount" \
   "$(jq -c '[.authenticatorConfig[] | select(.config | has("portcullis.method")) | {(.alias): .config["x509-cert-auth.crl-relative-path"]}] | add' "$RX")" \
   '{"x509-config":"http://vault:8200/v1/pki_int/crl##http://vault:8200/v1/pki_int/crl/delta","x509-browser-config":"http://vault:8200/v1/pki_file/crl##http://vault:8200/v1/pki_file/crl/delta"}'
 expect_eq "realm-export: both x509 configs check CRLs, abort on a stale CRL and keep the same X.509 settings" \
   "$(jq -c '[.authenticatorConfig[] | select(.config | has("portcullis.method")) | .config
       | del(.["portcullis.method"], .["portcullis.ca"], .["default.reference.value"], .["x509-cert-auth.crl-relative-path"])] | (unique | length), .[0]["x509-cert-auth.crl-checking-enabled"], .[0]["x509-cert-auth-crl-abort-if-non-updated"]' "$RX" | tr '\n' ' ')" '1 "true" "true" '
-expect_eq "realm-export: events LOGIN, LOGIN_ERROR, IMPERSONATE, expiration 31536000" \
-  "$(jq -c '[.eventsEnabled, (.enabledEventTypes | sort), .eventsExpiration]' "$RX")" '[true,["IMPERSONATE","LOGIN","LOGIN_ERROR"],31536000]'
+expect_eq "realm-export: events LOGIN, LOGIN_ERROR, IMPERSONATE, UPDATE_CREDENTIAL, REMOVE_CREDENTIAL, expiration 31536000" \
+  "$(jq -c '[.eventsEnabled, (.enabledEventTypes | sort), .eventsExpiration]' "$RX")" '[true,["IMPERSONATE","LOGIN","LOGIN_ERROR","REMOVE_CREDENTIAL","UPDATE_CREDENTIAL"],31536000]'
 expect_eq "realm-export: requiredActions has exactly the pinned portcullis-impersonation-notice entry; enabledEventTypes ⊇ LOGIN, LOGIN_ERROR, IMPERSONATE; no clientScopes" \
   "$(jq -cS '[.requiredActions[] | select(.alias == "portcullis-impersonation-notice" or .providerId == "portcullis-impersonation-notice")]' "$RX"):$(jq '.enabledEventTypes | contains(["LOGIN","LOGIN_ERROR","IMPERSONATE"])' "$RX"):$(jq 'has("clientScopes")' "$RX")" \
   "$(jq -cS '[.]' <<<'{"alias":"portcullis-impersonation-notice","name":"Impersonation notice","providerId":"portcullis-impersonation-notice","enabled":true,"defaultAction":false,"priority":90,"config":{}}'):true:false"
+expect_eq "realm-export: the OTP policy (contract §8.1 \"Authenticator-app codes\")" \
+  "$(jq -c '[.otpPolicyType, .otpPolicyAlgorithm, .otpPolicyDigits, .otpPolicyPeriod, .otpPolicyLookAheadWindow, .otpPolicyCodeReusable, .otpPolicyInitialCounter]' "$RX")" \
+  '["totp","HmacSHA1",6,30,1,false,0]'
+expect_eq "realm-export: CONFIGURE_TOTP (85) and delete_credential (100) enabled, never default, max_auth_age 300; the passkey action at 80, the notice at 90" \
+  "$(jq -c '[.requiredActions[] | select(.alias | IN("webauthn-register-passwordless", "CONFIGURE_TOTP", "portcullis-impersonation-notice", "delete_credential"))
+      | [.alias, .providerId, .enabled, .defaultAction, .priority, (.config.max_auth_age // null)]] | sort_by(.[4])' "$RX")" \
+  '[["webauthn-register-passwordless","webauthn-register-passwordless",true,false,80,null],["CONFIGURE_TOTP","CONFIGURE_TOTP",true,false,85,"300"],["portcullis-impersonation-notice","portcullis-impersonation-notice",true,false,90,null],["delete_credential","delete_credential",true,false,100,"300"]]'
 expect_eq "realm-export: no impersonation mapper anywhere (keycloak configure adds it, F5)" \
   "$(jq '[.. | objects | select(.protocolMapper? == "portcullis-impersonation")] | length' "$RX")" 0
 expect_eq "realm export: portcullis-signin-passkey = REQUIRED portcullis-passkey + one CONDITIONAL sub-flow per kind" \
@@ -783,7 +790,7 @@ expect_eq "realm export: acr.loa.map is {}" "$(jq -r '.attributes["acr.loa.map"]
 expect_eq "every reference config has maxAge 36000" \
   "$(jq -c '[.authenticatorConfig[].config | select(has("default.reference.value")) | .["default.reference.maxAge"]] | unique' "$RX")" '["36000"]'
 expect_eq "realm export: every amr of the browser and invite flows has a reference config" \
-  "$(jq -c '[.authenticatorConfig[].config | .["default.reference.value"] // empty] | sort' "$RX")" '["dpk","file","hwk","inv","mtls","pwd","spk"]'
+  "$(jq -c '[.authenticatorConfig[].config | .["default.reference.value"] // empty] | sort' "$RX")" '["dpk","file","hwk","inv","mtls","otp","pwd","spk"]'
 expect_eq "realm export: the invite post-broker flow keeps admit / deny, records inv, ends with portcullis-template" \
   "$(flow portcullis-invite-session)" '["CONDITIONAL portcullis-invite-client","CONDITIONAL portcullis-invite-deny","REQUIRED allow-access-authenticator","REQUIRED portcullis-template"]'
 expect_eq "invite amr configs say inv" \

@@ -45,11 +45,11 @@ echo "$EX" | jq -e '[.[] | [.level, (if .authenticationFlow then .displayName el
         [3, "portcullis-passkey-security-key", "CONDITIONAL"], [4, "portcullis-condition-passkey-kind", "REQUIRED"], [4, "portcullis-method", "REQUIRED"],
         [3, "portcullis-passkey-device", "CONDITIONAL"], [4, "portcullis-condition-passkey-kind", "REQUIRED"], [4, "portcullis-method", "REQUIRED"],
         [3, "portcullis-passkey-synced", "CONDITIONAL"], [4, "portcullis-condition-passkey-kind", "REQUIRED"], [4, "portcullis-method", "REQUIRED"],
-        [2, "portcullis-password-form", "ALTERNATIVE"], [0, "portcullis-template", "REQUIRED"]]' >/dev/null \
+        [2, "portcullis-password-form", "ALTERNATIVE"], [2, "portcullis-otp", "ALTERNATIVE"], [0, "portcullis-template", "REQUIRED"]]' >/dev/null \
   || { echo "FAIL: browser flow: $(echo "$EX" | jq -c '[.[] | [.level, (if .authenticationFlow then .displayName else .providerId end), .requirement]]')"; exit 1; }
 # Every reference execution keeps its method 10 h in the amr.
-for c in $(echo "$EX" | jq -r '.[] | select(.providerId // "" | IN("portcullis-x509", "portcullis-password-form", "portcullis-method")) | .authenticationConfig // "none"'); do
-  kc "/authentication/config/$c" | jq -e '(.config["default.reference.value"] | IN("mtls", "file", "pwd", "hwk", "dpk", "spk")) and .config["default.reference.maxAge"] == "36000"' >/dev/null \
+for c in $(echo "$EX" | jq -r '.[] | select(.providerId // "" | IN("portcullis-x509", "portcullis-password-form", "portcullis-method", "portcullis-otp")) | .authenticationConfig // "none"'); do
+  kc "/authentication/config/$c" | jq -e '(.config["default.reference.value"] | IN("mtls", "file", "pwd", "hwk", "dpk", "spk", "otp")) and .config["default.reference.maxAge"] == "36000"' >/dev/null \
     || { echo "FAIL: reference config $c: $(kc "/authentication/config/$c" | jq -c .config)"; exit 1; }
 done
 # The two x509 executions (contract §8.1, sign-in part 2), in order:
@@ -65,7 +65,7 @@ T=/opt/keycloak/conf/truststores/portcullis
     {alias: "x509-browser-config", m: "browser_cert", ref: "file", ca: "\($t)/portcullis-browser-ca.pem",
       crl: "http://vault:8200/v1/pki_file/crl##http://vault:8200/v1/pki_file/crl/delta", abort: "true"}]')" ] \
   || { echo "FAIL: the x509 configs: $X509"; exit 1; }
-kc /events/config | jq -e '.eventsEnabled and ((.enabledEventTypes | sort) == ["IMPERSONATE", "LOGIN", "LOGIN_ERROR"]) and .eventsExpiration > 0' >/dev/null \
+kc /events/config | jq -e '.eventsEnabled and ((.enabledEventTypes | sort) == ["IMPERSONATE", "LOGIN", "LOGIN_ERROR", "REMOVE_CREDENTIAL", "UPDATE_CREDENTIAL"]) and .eventsExpiration > 0' >/dev/null \
   || { echo "FAIL: realm events config: $(kc /events/config | jq -c '{eventsEnabled, enabledEventTypes, eventsExpiration}')"; exit 1; }
 kc /authentication/required-actions | jq -e '[.[] | select(.alias | startswith("webauthn-register")) | [.alias, .enabled]] | sort
     == [["webauthn-register", false], ["webauthn-register-passwordless", true]]' >/dev/null \
