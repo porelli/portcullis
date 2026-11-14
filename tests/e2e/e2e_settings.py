@@ -629,14 +629,19 @@ def main() -> int:
             body = r.text()
             assert r.status == 200, f"/api/me/apps: HTTP {r.status}: {body[:300]}"
             apps = r.json()["apps"]
-            assert [a["id"] for a in apps] == ["settings-file"], [a["id"] for a in apps]
+            # My apps lists every app carol can open (the gate's own decision),
+            # not only apps with settings: settings-file, plus firefox-sync,
+            # whose access group she is in. Never immich or anything else.
+            ids = [a["id"] for a in apps]
+            assert "settings-file" in ids and set(ids) <= {"settings-file", "firefox-sync"}, ids
             for other in ("alice", "bob", "dave"):
                 assert other not in body.lower(), f"{other} in carol's /api/me/apps: {body[:600]}"
-            vals = {v["key"]: v["value"] for v in apps[0]["values"]}
-            assert set(vals) == {"seats", "level"}, apps[0]
+            sf = next(a for a in apps if a["id"] == "settings-file")
+            vals = {v["key"]: v["value"] for v in sf["values"]}
+            assert set(vals) == {"seats", "level"}, sf
             r = carol.request.get(PEOPLE + "/api/instances/immich/settings")
             assert r.status == 404, f"people /api/instances/immich/settings: HTTP {r.status}: {r.text()[:200]}"
-        check("people: carol's /api/me/apps lists only settings-file, no other username; "
+        check("people: carol's /api/me/apps lists the apps she can open (settings-file, firefox-sync), no other username; "
               "/api/instances/immich/settings on people.<domain> is 404", my_apps_carol)
 
         # ── person-entered: leaving and rejoining the access group ──
