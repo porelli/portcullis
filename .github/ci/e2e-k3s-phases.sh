@@ -120,6 +120,10 @@ seed)
   echo "PASS: the Hub's template source (echo, folder-writer) seeded; $E2E_FOLDER ready; certificate $serial issued"
   ;;
 hub)
+  # The forward binds one pod when it starts: wait until the Hub's rollout
+  # (the assertions' `./portcullis up`) is done, or it may be a terminating one.
+  K -n portcullis rollout status deploy/hub --timeout=300s >/dev/null || fail "the Hub's rollout didn't finish"
+  K -n portcullis wait --for=condition=Available deploy/hub --timeout=300s >/dev/null || fail "the Hub isn't available"
   pf_log="$(mktemp)"
   K -n portcullis port-forward --address 127.0.0.1 svc/hub :8888 > "$pf_log" 2>&1 &
   for i in $(seq 1 50); do grep -q 'Forwarding from' "$pf_log" && break; sleep 0.2; done

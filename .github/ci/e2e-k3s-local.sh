@@ -74,7 +74,7 @@ container() {
     case "$1" in --hub) hub="$2"; shift 2 ;; --k3s-keep) keep=true; shift ;; *) break ;; esac
   done
   docker info >/dev/null 2>&1 || { echo "FAIL: docker isn't answering"; exit 1; }
-  ! docker inspect "$name" >/dev/null 2>&1 || { echo "FAIL: $name exists (one cluster at a time): docker rm -f $name; docker volume rm $name-docker $name-rancher"; exit 1; }
+  ! docker inspect "$name" >/dev/null 2>&1 || { echo "FAIL: $name exists (one cluster at a time): docker rm -f $name; docker volume rm $name-docker $name-containerd $name-rancher"; exit 1; }
   docker build -q -t "$img" - >/dev/null <<'DOCKERFILE'
 FROM docker.io/library/ubuntu:26.04
 ENV DEBIAN_FRONTEND=noninteractive
@@ -86,11 +86,13 @@ RUN apt-get update -qq && apt-get install -y -qq systemd systemd-sysv dbus sudo 
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
 DOCKERFILE
-  docker volume create "$name-docker" >/dev/null; docker volume create "$name-rancher" >/dev/null
-  cleanup() { [ "$keep" = true ] && return 0; docker rm -f "$name" >/dev/null 2>&1 || true; docker volume rm "$name-docker" "$name-rancher" >/dev/null 2>&1 || true; }
+  # The inner dockerd's image store (containerd snapshots) needs a real
+  # filesystem too: overlay on the container's overlay root fails.
+  docker volume create "$name-docker" >/dev/null; docker volume create "$name-containerd" >/dev/null; docker volume create "$name-rancher" >/dev/null
+  cleanup() { [ "$keep" = true ] && return 0; docker rm -f "$name" >/dev/null 2>&1 || true; docker volume rm "$name-docker" "$name-containerd" "$name-rancher" >/dev/null 2>&1 || true; }
   trap cleanup EXIT
   docker run -d --name "$name" --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-    -v "$name-docker:/var/lib/docker" -v "$name-rancher:/var/lib/rancher" --tmpfs /run --tmpfs /run/lock "$img" >/dev/null
+    -v "$name-docker:/var/lib/docker" -v "$name-containerd:/var/lib/containerd" -v "$name-rancher:/var/lib/rancher" --tmpfs /run --tmpfs /run/lock "$img" >/dev/null
   for i in $(seq 1 60); do docker exec "$name" docker info >/dev/null 2>&1 && break; [ "$i" = 60 ] && { echo "FAIL: docker in the runner didn't start"; exit 1; }; sleep 2; done
   local w=/home/runner/work/portcullis/portcullis
   docker exec "$name" sudo -u runner mkdir -p "$w"
@@ -99,7 +101,8 @@ DOCKERFILE
   local envs=(-e E2E_K3S_SKIP_DOCKER="${E2E_K3S_SKIP_DOCKER:-}" -e K3S_LINE="${K3S_LINE:-}" -e GITHUB_REF_NAME=kube1)
   if [ -n "$hub" ]; then
     git -C "$hub" archive "${HUB_REF:-HEAD}" | docker exec -i "$name" sudo -u runner bash -c 'mkdir -p ~/hub && tar -C ~/hub -xf -'
-    docker exec "$name" sudo -u runner bash -c 'cd ~/hub && docker build -q -t portcullis-hub:ci . >/dev/null' || { echo "FAIL: the Hub image didn't build"; exit 1; }
+    docker exec "$name" sudo -u runner bash -c 'cd ~/hub && docker build -q -t portcullis-hub:ci . >/tmp/hub-build.log 2>&1' \
+      || { docker exec "$name" tail -n 30 /tmp/hub-build.log; echo "FAIL: the Hub image didn't build"; exit 1; }
     envs+=(-e HUB_IMAGE=portcullis-hub:ci -e HUB_LOCAL=1)
   fi
   [ -z "${KEYCLOAK_IMAGE:-}" ] || envs+=(-e KEYCLOAK_IMAGE="$KEYCLOAK_IMAGE")
