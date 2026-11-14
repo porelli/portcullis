@@ -24,6 +24,8 @@ KUBE_STORAGE_NS="portcullis-storage"
 # Traefik's only watched namespace (the chart's edgeNamespace): the core
 # IngressRoutes and Middlewares, hub-proxy-secret, never a Secret.
 KUBE_EDGE_NS="portcullis-edge"
+# The six admission bindings (kube/admission/bindings.yaml).
+KUBE_BINDINGS="portcullis-apps-guard-pods portcullis-apps-guard-workloads portcullis-apps-guard-services portcullis-apps-guard-traefik portcullis-apps-guard-netpol portcullis-edge-guard-routes"
 KUBE_PROBE_NS="portcullis-netpol-probe"
 KUBE_MANAGED_LABEL="app.kubernetes.io/managed-by"
 KUBE_INSTALL_ANNOTATION="portcullis.io/install"
@@ -654,14 +656,14 @@ kube_vpn_reserved() {
 }
 
 # kube_status_extra — status --json's kubernetes fields: netpol (the CLI's
-# probe ConfigMap), admission (the five bindings), dns_shadows (an app
+# probe ConfigMap), admission (the six bindings), dns_shadows (an app
 # Service named like a core one), kube_api_public (K8).
 kube_status_extra() {
   local np adm b shadows pub api=false a
   np="$(kube_ctl -n "$(kube_apps_ns)" get configmap portcullis-netpol-probe -o json 2>/dev/null | jq -r '.data.proven_at // empty' 2>/dev/null || true)"
   adm=ok
-  for b in pods workloads services traefik netpol; do
-    kube_ctl get validatingadmissionpolicybinding "portcullis-apps-guard-$b" >/dev/null 2>&1 || adm=missing
+  for b in $KUBE_BINDINGS; do
+    kube_ctl get validatingadmissionpolicybinding "$b" >/dev/null 2>&1 || adm=missing
   done
   shadows="$(jq -cn --argjson core "$(kube_ctl -n "$(kube_ns)" get services -o json 2>/dev/null | jq -c '[.items[].metadata.name]' 2>/dev/null || echo '[]')" \
     --argjson apps "$(kube_ctl -n "$(kube_apps_ns)" get services -o json 2>/dev/null | jq -c '[.items[].metadata.name]' 2>/dev/null || echo '[]')" \
@@ -773,6 +775,9 @@ kube_admission_params() {
   for ep in ${PORTCULLIS_KUBE_API_ENDPOINTS:-}; do api+="${api:+ }${ep%:*}/32"; done
   [ -n "$nodes" ] || fail "no node address (PORTCULLIS_KUBE_NODE_ADDRESSES): refusing to write admission params that couldn't exclude the nodes"
   [ -n "$api" ] || fail "no kube API endpoint (PORTCULLIS_KUBE_API_ENDPOINTS): refusing to write admission params"
+  local me
+  me="$(kube_ctl auth whoami -o json 2>/dev/null | jq -r '.status.userInfo.username // empty' 2>/dev/null || true)"
+  [ -n "$me" ] || fail "can't tell this CLI's own identity (kubectl auth whoami): refusing to write admission params"
   printf '%s\t%s\n' \
     hubImage "$hub" \
     hubServiceAccount "system:serviceaccount:$ns:portcullis-hub" \
@@ -786,8 +791,16 @@ kube_admission_params() {
     traefik "$ns:portcullis.io/component=traefik" \
     mcpGate "$ns:portcullis.io/component=mcp-gate" \
     wg "$ns:portcullis.io/component=wg" \
-    fileMiddlewares "$KUBE_FILE_NAMES"
+    fileMiddlewares "$KUBE_FILE_NAMES" \
+    cliUsername "$me" \
+    appsNamespace "$(kube_apps_ns)" \
+    edgeNamespace "$KUBE_EDGE_NS" \
+    edgeCoreMiddlewares "$KUBE_EDGE_CORE_MIDDLEWARES"
 }
+
+# The owner=core Middlewares of portcullis-edge (the chart's four and the
+# CLI's hub-proxy-secret): no Hub route or chain may name them.
+KUBE_EDGE_CORE_MIDDLEWARES="hub-proxy-secret portcullis-auth-console portal-path portal-vpn-path directory-redirect"
 
 # The @file names apps may use (K15, contract §5): middlewares.yml's six,
 # the core middlewares and the three core services of traefik-dynamic.
@@ -812,7 +825,7 @@ _kube_configmap_from() {
 #   storage     the provisioner portcullis.io/local-path (kube/storage),
 #               its ConfigMap, the StorageClasses, its deny policy + API egress;
 #   crds        the Traefik CRDs (K14: kubectl --server-side, never Helm);
-#   admission   the five VAPs and their five bindings (kube/admission);
+#   admission   the six VAPs and their six bindings (kube/admission);
 #   params      portcullis-admission-params: the Hub's resolved digest
 #               (KUBE_HUB_IMAGE, name@sha256:…), roots, ports, networks, peers.
 kube_cluster_setup() {
@@ -1147,7 +1160,7 @@ kube_sync_secrets() {
   done
   [ -n "${HUB_PROXY_SECRET:-}" ] || { rm -rf "$_K_STAGE"; fail "HUB_PROXY_SECRET is not set in .env"; }
   NS="$KUBE_EDGE_NS" jq -n '{apiVersion: "traefik.io/v1alpha1", kind: "Middleware",
-      metadata: {name: "hub-proxy-secret", namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}},
+      metadata: {name: "hub-proxy-secret", namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/owner": "core"}},
       spec: {headers: {customRequestHeaders: {"X-Portcullis-Proxy-Secret": env.HUB_PROXY_SECRET}}}}' > "$want" \
     && _kube_put "$want" || { rm -rf "$_K_STAGE"; fail "could not apply the hub-proxy-secret Middleware"; }
   rm -rf "$_K_STAGE"
@@ -1237,15 +1250,15 @@ kube_health_report() {
 }
 
 # kube_cluster_check — the Hub's cluster check input (contract §6): the apps
-# namespace's PSA labels and the five bindings, written as the ConfigMap
+# namespace's PSA labels and the six bindings, written as the ConfigMap
 # portcullis-cluster-check (checked_at RFC 3339 UTC, ok true|false, why).
 kube_cluster_check() {
   local ns why="" b psa
   ns="$(kube_apps_ns)"
   psa="$(kube_ctl get namespace "$ns" -o json 2>/dev/null | jq -r '[.metadata.labels["pod-security.kubernetes.io/enforce"], .metadata.labels["pod-security.kubernetes.io/warn"], .metadata.labels["pod-security.kubernetes.io/audit"]] | join(",")' 2>/dev/null || true)"
   [ "$psa" = privileged,baseline,baseline ] || why="the apps namespace's PSA labels are '${psa:-unreadable}' (want enforce privileged, warn / audit baseline)"
-  for b in pods workloads services traefik netpol; do
-    [ -n "$why" ] || kube_ctl get validatingadmissionpolicybinding "portcullis-apps-guard-$b" >/dev/null 2>&1 || why="the binding portcullis-apps-guard-$b is missing"
+  for b in $KUBE_BINDINGS; do
+    [ -n "$why" ] || kube_ctl get validatingadmissionpolicybinding "$b" >/dev/null 2>&1 || why="the binding $b is missing"
   done
   NS="$(kube_ns)" OK="$([ -z "$why" ] && echo true || echo false)" WHY="$why" AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" jq -n '
     {apiVersion: "v1", kind: "ConfigMap",

@@ -130,8 +130,15 @@ def main():
     for r in K.by_kind(docs, "ClusterRole") + K.by_kind(docs, "ClusterRoleBinding"):
         F.add(f"{r['kind']} {r['metadata']['name']}: nothing cluster-scoped")
     hub_roles = [r for r in K.by_kind(docs, "Role") if r["metadata"]["name"] == "portcullis-hub"]
-    if [r["metadata"]["namespace"] for r in hub_roles] != [K.APPS_NS]:
-        F.add(f"the Hub's Role must be exactly one, in {K.APPS_NS}")
+    if sorted(r["metadata"]["namespace"] for r in hub_roles) != sorted([K.APPS_NS, K.EDGE_NS]):
+        F.add(f"the Hub's Roles must be exactly two, in {K.APPS_NS} and {K.EDGE_NS}")
+    for r in hub_roles:
+        traefik_rules = [x for x in r["rules"] if "traefik.io" in x.get("apiGroups", [])]
+        if r["metadata"]["namespace"] == K.EDGE_NS:
+            if [(x["apiGroups"], sorted(x["resources"])) for x in r["rules"]] != [(["traefik.io"], ["ingressroutes", "middlewares"])]:
+                F.add(f"the Hub's Role in {K.EDGE_NS}: only traefik.io ingressroutes + middlewares, got {r['rules']}")
+        elif traefik_rules:
+            F.add(f"the Hub's Role in {r['metadata']['namespace']}: traefik.io (Traefik objects live in {K.EDGE_NS})")
     for r in hub_roles:
         for rule in r["rules"]:
             if "pods/exec" in rule["resources"] and rule["verbs"] != ["create"]:
@@ -203,11 +210,24 @@ def check_edge(docs):
         if d.get("kind") == "Secret" and ns == K.EDGE_NS:
             F.add(f"Secret {d['metadata']['name']} in {K.EDGE_NS} (Traefik reads every Secret there)")
         if d.get("kind") in ("IngressRoute", "Middleware", "IngressRouteTCP", "IngressRouteUDP", "TLSOption", "TLSStore",
-                             "ServersTransport", "TraefikService", "MiddlewareTCP") and ns != K.EDGE_NS:
-            F.add(f"{d['kind']} {d['metadata']['name']} in {ns}: core Traefik objects live in {K.EDGE_NS} (Traefik's only watched namespace)")
+                             "ServersTransport", "TraefikService", "MiddlewareTCP"):
+            if ns != K.EDGE_NS:
+                F.add(f"{d['kind']} {d['metadata']['name']} in {ns}: core Traefik objects live in {K.EDGE_NS} (Traefik's only watched namespace)")
+            if (d["metadata"].get("labels") or {}).get("portcullis.io/owner") != "core":
+                F.add(f"{d['kind']} {d['metadata']['name']}: no portcullis.io/owner=core (the Hub could change it)")
+    # The params' edgeCoreMiddlewares (no Hub route may name them) = the
+    # chart's edge Middlewares + the CLI's hub-proxy-secret.
+    want = sorted(["hub-proxy-secret"] + [d["metadata"]["name"] for d in K.by_kind(docs, "Middleware")])
+    params = yaml.safe_load((K.ROOT / "kube" / "admission" / "params.yaml").read_text())["data"]
+    if sorted(params["edgeCoreMiddlewares"].split()) != want:
+        F.add(f"kube/admission/params.yaml edgeCoreMiddlewares {params['edgeCoreMiddlewares']!r} != the core edge Middlewares {want}")
     env = {e["name"]: e.get("value") for e in K.deployments(docs)["traefik"]["spec"]["template"]["spec"]["containers"][0]["env"]}
     if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES") != K.EDGE_NS:
         F.add(f"traefik: kubernetesCRD namespaces {env.get('TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES')!r} (want {K.EDGE_NS} only)")
+    if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWEXTERNALNAMESERVICES") != "false":
+        F.add("traefik: ExternalName services must stay off")
+    if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE") != "true":
+        F.add("traefik: allowCrossNamespace must be true (the apps' edge routes name apps Services; portcullis-edge-routes bounds them)")
 
 
 if __name__ == "__main__":

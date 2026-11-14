@@ -53,6 +53,7 @@ metadata:
   namespace: {{ $.Values.edgeNamespace }}
   labels:
     app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
 spec:
   entryPoints: {{ toJson (splitList "," $r.ep) }}
   routes:
@@ -96,6 +97,7 @@ metadata:
   namespace: {{ .Values.edgeNamespace }}
   labels:
     app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
 spec:
   entryPoints: ["kcinternal"]
   routes:

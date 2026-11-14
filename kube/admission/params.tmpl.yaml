@@ -21,3 +21,7 @@ data:
   mcpGate: "<PORTCULLIS_NAMESPACE>:portcullis.io/component=mcp-gate"
   wg: "<PORTCULLIS_NAMESPACE>:portcullis.io/component=wg"
   fileMiddlewares: "<traefik/dynamic/middlewares.yml's six + the K15 seven, each @file, + group-gate@file forward-auth-ext@file mcp-gate@file>"
+  cliUsername: "<the CLI's own identity: kubectl auth whoami at setup; exempt from portcullis-edge-routes>"
+  appsNamespace: "<PORTCULLIS_APPS_NAMESPACE>"
+  edgeNamespace: "portcullis-edge"
+  edgeCoreMiddlewares: "<the owner=core Middlewares of portcullis-edge: KUBE_EDGE_CORE_MIDDLEWARES>"

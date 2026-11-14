@@ -136,13 +136,14 @@ denied() { # denied <policy> <manifest json> — a server dry-run refused by tha
 POD='{"apiVersion":"v1","kind":"Pod","metadata":{"name":"g","labels":{"portcullis.io/instance":"e2e"}},"spec":{"automountServiceAccountToken":false,"containers":[{"name":"c","image":"'"$ALPINE"'"}]'
 denied pods "$POD"',"volumes":[{"name":"h","hostPath":{"path":"/etc"}}]}}'
 denied services '{"apiVersion":"v1","kind":"Service","metadata":{"name":"g","labels":{"portcullis.io/instance":"e2e"}},"spec":{"type":"NodePort","ports":[{"port":80}]}}'
-denied traefik '{"apiVersion":"traefik.io/v1alpha1","kind":"IngressRoute","metadata":{"name":"g"},"spec":{"routes":[{"match":"Host(`x`)","kind":"Rule","middlewares":[{"name":"hub-proxy-secret","namespace":"portcullis"}],"services":[{"name":"x","port":80}]}]}}'
 denied pods "$(printf '%s' "$POD" | sed 's/"portcullis.io\/instance":"e2e"/"portcullis.io\/instance":"e2e","portcullis.io\/helper":"fixer"/' | sed "s|$ALPINE|docker.io/library/busybox:1.38.0|")"'}}'
 denied pods "$(printf '%s' "$POD" | sed 's/"portcullis.io\/instance":"e2e"/"portcullis.io\/instance":"e2e","portcullis.io\/vpn-slot":"47"/')"'}}'
 [ "$(KH -n "$APPS" auth can-i get pods/exec)" = no ] || fail "the Hub's ServiceAccount may get pods/exec (K2: create only)"
 [ "$(KH -n "$APPS" auth can-i create pods/exec)" = yes ] || fail "the Hub's ServiceAccount can't create pods/exec"
 [ "$(KH -n "$NS" auth can-i get secrets)" = no ] || fail "the Hub's ServiceAccount reads core Secrets"
-pass "the guard refuses a hostPath outside the roots, a NodePort, a cross-namespace middleware, a foreign helper image and vpn-slot 47, each by its binding; pods/exec is create only"
+pass "the guard refuses a hostPath outside the roots, a NodePort, a foreign helper image and vpn-slot 47, each by its binding; pods/exec is create only"
+# The apps' Traefik objects live in portcullis-edge: every refusal there.
+bash .github/ci/e2e-k3s-edge-admission.sh ci
 
 # ── Secret access of every ServiceAccount (least privilege) ──
 # Traefik reads Secrets only in the edge namespace (it holds none), the Hub

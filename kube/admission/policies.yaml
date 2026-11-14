@@ -1,7 +1,10 @@
 # The admission guard behind the Hub's Role (contract §6 "The admission
 # policies", K6): five ValidatingAdmissionPolicies on the apps namespace,
-# each bound by its own portcullis-apps-guard-<policy> (bindings.yaml) with
-# the params ConfigMap portcullis-admission-params (params.yaml). Authored
+# each bound by its own portcullis-apps-guard-<policy> (bindings.yaml), and
+# portcullis-edge-routes on portcullis-edge (Traefik's only watched
+# namespace: the core and the apps' IngressRoutes / Middlewares) bound by
+# portcullis-edge-guard-routes, all with the params ConfigMap
+# portcullis-admission-params (params.yaml). Authored
 # in the Hub (internal/runtime/kube/testdata/admission/, envtest vectors);
 # this is a byte copy, compared in CI (K13).
 apiVersion: admissionregistration.k8s.io/v1
@@ -137,7 +140,7 @@ spec:
       pods run as the namespace's default ServiceAccount with automountServiceAccountToken: false
   - expression: variables.refNames.all(n, n.startsWith(variables.prefix) || n.startsWith('tpl-'))
     messageExpression: >-
-      'a Secret, ConfigMap or PVC that isn''t this instance''s (' + variables.prefix + '* or tpl-*)'
+      "a Secret, ConfigMap or PVC that isn't this instance's (" + variables.prefix + "* or tpl-*)"
   - expression: >-
       variables.annotations.all(k, !k.startsWith('cni.projectcalico.org/') && !k.startsWith('k8s.v1.cni.cncf.io/')
       && !k.startsWith('v1.multus-cni.io/') && !k.startsWith('kube-router.io/') && !k.startsWith('io.cilium/'))
@@ -337,7 +340,7 @@ spec:
   - expression: >-
       object.kind == 'Secret' || (variables.refNames.all(n, n.startsWith(variables.prefix) || n.startsWith('tpl-')))
     messageExpression: >-
-      'a Secret, ConfigMap or PVC that isn''t this instance''s (' + variables.prefix + '* or tpl-*)'
+      "a Secret, ConfigMap or PVC that isn't this instance's (" + variables.prefix + "* or tpl-*)"
   - expression: >-
       object.kind == 'Secret' || (variables.annotations.all(k, !k.startsWith('cni.projectcalico.org/') && !k.startsWith('k8s.v1.cni.cncf.io/')
       && !k.startsWith('v1.multus-cni.io/') && !k.startsWith('kube-router.io/') && !k.startsWith('io.cilium/')))
@@ -429,41 +432,12 @@ spec:
       - apiGroups: ["traefik.io"]
         apiVersions: ["*"]
         operations: ["CREATE", "UPDATE"]
-        resources: ["ingressroutes", "middlewares", "ingressroutetcps", "ingressrouteudps", "serverstransports", "serverstransporttcps", "traefikservices", "tlsoptions", "tlsstores", "middlewaretcps"]
-  variables:
-    - name: tiers
-      expression: "['authaware@file', 'public@file', 'protected@file', 'protected-any@file']"
-    - name: fileNames
-      expression: "params.data.fileMiddlewares.split(' ')"
-    - name: coreServices
-      expression: "['group-gate@file', 'forward-auth-ext@file', 'mcp-gate@file']"
+        resources: ["*"]
+  # Traefik doesn't watch the apps namespace (it would list every Secret of
+  # it): app IngressRoutes / Middlewares live in portcullis-edge.
   validations:
-    - expression: "object.kind in ['IngressRoute', 'Middleware']"
-      messageExpression: "object.kind + ' is refused in the apps namespace'"
-    - expression: >-
-        object.kind != 'IngressRoute' || object.spec.routes.all(r,
-          (!has(r.middlewares) || r.middlewares.all(m,
-            (!m.name.contains('@') && (!has(m.namespace) || m.namespace == object.metadata.namespace))
-            || m.name in variables.fileNames))
-          && r.services.all(s,
-            (has(s.kind) && s.kind == 'TraefikService')
-              ? s.name in variables.coreServices
-              : (!s.name.contains('@') && (!has(s.namespace) || s.namespace == object.metadata.namespace))))
-      message: "a middleware outside this namespace and the @file allowlist, an @internal or foreign service"
-    - expression: >-
-        object.kind != 'IngressRoute' || !has(object.spec.tls)
-        || ((!has(object.spec.tls.options) || (object.spec.tls.options.name in variables.tiers && !has(object.spec.tls.options.namespace)))
-            && !has(object.spec.tls.secretName) && !has(object.spec.tls.store))
-      message: "tls.options outside the four tiers, or a TLS secret / store reference"
-    - expression: "object.kind != 'Middleware' || !has(object.spec.forwardAuth)"
-      message: "a forwardAuth Middleware is refused in the apps namespace"
-    - expression: >-
-        object.kind != 'Middleware' || !has(object.spec.headers)
-        || ((!has(object.spec.headers.customRequestHeaders) || object.spec.headers.customRequestHeaders.all(h, !h.lowerAscii().startsWith('x-portcullis-')))
-            && (!has(object.spec.headers.customResponseHeaders) || object.spec.headers.customResponseHeaders.all(h, !h.lowerAscii().startsWith('x-portcullis-'))))
-      message: "a Middleware may not set an X-Portcullis-* header"
-    - expression: "object.kind != 'Middleware' || (!has(object.spec.basicAuth) && !has(object.spec.digestAuth) && !has(object.spec.errors) && !has(object.spec.chain))"
-      message: "a Middleware that references secrets or other services (basicAuth, digestAuth, errors, chain) is refused"
+    - expression: "false"
+      messageExpression: "object.kind + ' is refused in the apps namespace: Traefik objects live in portcullis-edge'"
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -560,3 +534,114 @@ spec:
             && p.ipBlock.cidr in variables.nodes && (!has(p.ipBlock.except) || size(p.ipBlock.except) == 0)
             && has(r.ports) && size(r.ports) > 0 && r.ports.all(x, has(x.port) && (x.port == 80 || x.port == 443)))))
       message: "an egress peer outside the Hub's shapes (same instance, kube-dns :53, the instance's wg edge port, the internet minus the cluster, a node on 80 / 443)"
+---
+# portcullis-edge-routes: everyone but the CLI's own identity (params
+# cliUsername: helm and kubectl run there and write the core objects) may
+# write only owner=hub IngressRoutes / Middlewares here, never touch an
+# owner=core one, and only in the shapes the Hub renders today:
+#   IngressRoute  entryPoints ⊆ web / websecure / vpnsecure (never empty =
+#                 every entrypoint), services = Services of the apps namespace
+#                 or kind TraefikService with a K15 core service name
+#                 (group-gate@file, forward-auth-ext@file, mcp-gate@file);
+#                 middlewares = this namespace's (never a core one:
+#                 edgeCoreMiddlewares) or the @file allowlist; tls only the
+#                 four tiers, the letsencrypt resolver, no secret / store
+#   Middleware    exactly one type of the Hub's template allowlist
+#                 (internal/templates middlewareAttrRe) — never forwardAuth,
+#                 errors, plugin, basicAuth, digestAuth, passTLSClientCert;
+#                 no redis address; no X-Portcullis-* header; a chain only of
+#                 this namespace's (never core) or allowlisted @file names
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: portcullis-edge-routes
+spec:
+  failurePolicy: Fail
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["traefik.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["*"]
+  variables:
+    - name: exempt
+      expression: "params.data.cliUsername != '' && request.userInfo.username == params.data.cliUsername"
+    - name: del
+      expression: "request.operation == 'DELETE'"
+    - name: edge
+      expression: "params.data.edgeNamespace"
+    - name: apps
+      expression: "params.data.appsNamespace"
+    - name: fileNames
+      expression: "params.data.fileMiddlewares.split(' ')"
+    - name: coreMiddlewares
+      expression: "params.data.edgeCoreMiddlewares.split(' ')"
+    - name: coreServices
+      expression: "['group-gate@file', 'forward-auth-ext@file', 'mcp-gate@file']"
+    - name: tiers
+      expression: "['authaware@file', 'public@file', 'protected@file', 'protected-any@file']"
+    - name: entryPoints
+      expression: "['web', 'websecure', 'vpnsecure']"
+    - name: types
+      expression: "['addPrefix', 'stripPrefix', 'stripPrefixRegex', 'replacePath', 'replacePathRegex', 'redirectRegex', 'redirectScheme', 'headers', 'compress', 'contentType', 'chain', 'rateLimit', 'inFlightReq', 'ipAllowList', 'buffering', 'retry', 'circuitBreaker', 'grpcWeb']"
+    - name: owner
+      expression: "!variables.del && has(object.metadata.labels) && 'portcullis.io/owner' in object.metadata.labels ? object.metadata.labels['portcullis.io/owner'] : ''"
+    - name: oldOwner
+      expression: "request.operation != 'CREATE' && has(oldObject.metadata.labels) && 'portcullis.io/owner' in oldObject.metadata.labels ? oldObject.metadata.labels['portcullis.io/owner'] : ''"
+  validations:
+    - expression: "variables.exempt || variables.del || object.kind in ['IngressRoute', 'Middleware']"
+      messageExpression: "object.kind + ' is refused in portcullis-edge (only IngressRoute and Middleware)'"
+    - expression: "variables.exempt || variables.del || variables.owner == 'hub'"
+      message: "an object here needs the label portcullis.io/owner=hub"
+    - expression: "variables.exempt || request.operation == 'CREATE' || variables.oldOwner == 'hub'"
+      message: "only owner=hub objects may be changed or deleted (owner=core objects are the CLI's)"
+    - expression: >-
+        variables.exempt || variables.del || object.kind != 'IngressRoute'
+        || (has(object.spec.entryPoints) && size(object.spec.entryPoints) > 0
+            && object.spec.entryPoints.all(e, e in variables.entryPoints))
+      message: "entryPoints must be set and only web, websecure or vpnsecure"
+    - expression: >-
+        variables.exempt || variables.del || object.kind != 'IngressRoute'
+        || object.spec.routes.all(r, r.services.all(s,
+             (has(s.kind) && s.kind == 'TraefikService')
+               ? (s.name in variables.coreServices && !has(s.namespace))
+               : ((!has(s.kind) || s.kind == 'Service') && !s.name.contains('@')
+                  && has(s.namespace) && s.namespace == variables.apps)))
+      message: "a service must be a Service of the apps namespace (namespace set) or a K15 core service (group-gate@file, forward-auth-ext@file, mcp-gate@file)"
+    - expression: >-
+        variables.exempt || variables.del || object.kind != 'IngressRoute'
+        || object.spec.routes.all(r, !has(r.middlewares) || r.middlewares.all(m,
+             m.name.contains('@')
+               ? (m.name in variables.fileNames && !has(m.namespace))
+               : ((!has(m.namespace) || m.namespace == variables.edge) && !(m.name in variables.coreMiddlewares))))
+      message: "a middleware must be this namespace's (not a core one) or on the @file allowlist"
+    - expression: >-
+        variables.exempt || variables.del || object.kind != 'IngressRoute' || !has(object.spec.tls)
+        || ((!has(object.spec.tls.options) || (object.spec.tls.options.name in variables.tiers && !has(object.spec.tls.options.namespace)))
+            && !has(object.spec.tls.secretName) && !has(object.spec.tls.store)
+            && (!has(object.spec.tls.certResolver) || object.spec.tls.certResolver == 'letsencrypt'))
+      message: "tls.options outside the four tiers, another resolver, or a TLS secret / store reference"
+    - expression: >-
+        variables.exempt || variables.del || object.kind != 'Middleware'
+        || (size(object.spec) == 1 && object.spec.all(k, k in variables.types))
+      message: "a Middleware must have exactly one type of the Hub's allowlist (never forwardAuth, errors, plugin, basicAuth, digestAuth, passTLSClientCert)"
+    - expression: >-
+        variables.exempt || variables.del || object.kind != 'Middleware'
+        || ((!has(object.spec.rateLimit) || !has(object.spec.rateLimit.redis))
+            && (!has(object.spec.inFlightReq) || !has(object.spec.inFlightReq.redis)))
+      message: "a rateLimit / inFlightReq with a redis address is refused"
+    - expression: >-
+        variables.exempt || variables.del || object.kind != 'Middleware' || !has(object.spec.headers)
+        || ((!has(object.spec.headers.customRequestHeaders) || object.spec.headers.customRequestHeaders.all(h, !h.lowerAscii().startsWith('x-portcullis-')))
+            && (!has(object.spec.headers.customResponseHeaders) || object.spec.headers.customResponseHeaders.all(h, !h.lowerAscii().startsWith('x-portcullis-'))))
+      message: "a Middleware may not set an X-Portcullis-* header"
+    - expression: >-
+        variables.exempt || variables.del || object.kind != 'Middleware' || !has(object.spec.chain)
+        || object.spec.chain.middlewares.all(m,
+             m.name.contains('@')
+               ? (m.name in variables.fileNames && !has(m.namespace))
+               : ((!has(m.namespace) || m.namespace == variables.edge) && !(m.name in variables.coreMiddlewares)))
+      message: "a chain may name only this namespace's middlewares (not a core one) or the @file allowlist"

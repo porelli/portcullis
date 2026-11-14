@@ -10,7 +10,8 @@ listener is reached through a kubectl port-forward (HUB_API).
 Scenarios:
   runtime   GET /api/runtime: kubernetes, verified, context ci, admission ok,
             netpol proven, engine_version the API server's.
-  echo      an echo instance: create → enable (its pods in portcullis-apps,
+  echo      an echo instance: create → enable (its routes owner=hub in
+            portcullis-edge, none in portcullis-apps; its pods in portcullis-apps,
             labelled portcullis.io/instance, automountServiceAccountToken
             false, its PVC owned by the service uid) → its host redirects to
             Keycloak through Traefik → backup → delete (typed id) → restore
@@ -41,6 +42,7 @@ DOMAIN = os.environ.get("E2E_DOMAIN", "portcullis.local")
 FOLDER = os.environ.get("E2E_FOLDER", "/srv/e2e-k3s")
 ART = os.environ.get("E2E_ARTIFACTS", "e2e-artifacts")
 APPS = "portcullis-apps"
+EDGE = "portcullis-edge"
 ECHO, ECHO_R, WRITER = "echo-k", "echo-k-r", "folder-writer"
 OP_S = 1200
 
@@ -132,7 +134,13 @@ def main() -> int:
             spec = p["spec"]
             assert spec.get("automountServiceAccountToken") is False, f"{p['metadata']['name']}: a ServiceAccount token"
             assert spec.get("serviceAccountName", "default") == "default", p["metadata"]["name"]
-        # Through Traefik: the host without a session redirects to Keycloak.
+        # The instance's routes live in portcullis-edge (owner=hub), none in
+        # the apps namespace (Traefik doesn't watch it).
+        edge = json.loads(kubectl("-n", EDGE, "get", "ingressroutes", "-l", "portcullis.io/owner=hub", "-o", "json"))["items"]
+        assert any(host in r["spec"]["routes"][0]["match"] for r in edge), f"no owner=hub IngressRoute for {host} in {EDGE}"
+        assert not json.loads(kubectl("-n", APPS, "get", "ingressroutes", "-o", "json"))["items"], f"IngressRoutes in {APPS}"
+        # Through Traefik (edge route → the apps Service, the NetPols across
+        # namespaces): the host without a session redirects to Keycloak.
         out = sh("curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{redirect_url}", "--max-time", "20", "-k",
                  "--resolve", f"{host}:443:198.51.100.1", f"https://{host}/")
         code, _, loc = out.partition(" ")

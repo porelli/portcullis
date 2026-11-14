@@ -1,6 +1,7 @@
 # One binding per policy (a binding binds exactly one policy, Task 0 Q4;
-# K6 / K-P1): portcullis-apps-guard-<policy>, the apps namespace only, the
-# params ConfigMap portcullis-admission-params (missing = deny), Deny.
+# K6 / K-P1): portcullis-apps-guard-<policy>, the apps namespace only, and
+# portcullis-edge-guard-routes on portcullis-edge; the params ConfigMap
+# portcullis-admission-params (missing = deny), Deny.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
@@ -80,3 +81,19 @@ spec:
     namespaceSelector:
       matchLabels:
         kubernetes.io/metadata.name: portcullis-apps
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: portcullis-edge-guard-routes
+spec:
+  policyName: portcullis-edge-routes
+  validationActions: ["Deny"]
+  paramRef:
+    name: portcullis-admission-params
+    namespace: portcullis-apps
+    parameterNotFoundAction: Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: portcullis-edge

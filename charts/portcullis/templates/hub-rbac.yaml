@@ -1,7 +1,10 @@
 {{- /* The Hub's access (K2, contract §6 "On Kubernetes"): one ServiceAccount
-here and exactly one Role in the apps namespace (files/hub-role.yaml, a byte
-copy of the Hub's internal/runtime/kube/testdata/role.yaml, compared in CI);
-nothing in this namespace, nothing cluster-scoped. */ -}}
+here, one Role in the apps namespace and one in portcullis-edge (only
+IngressRoutes and Middlewares: the apps' routes, held to owner=hub and the
+Hub's shapes by the portcullis-edge-routes admission policy) —
+files/hub-role.yaml, a byte copy of the Hub's
+internal/runtime/kube/testdata/role.yaml, compared in CI; nothing in this
+namespace, nothing cluster-scoped. */ -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -9,13 +12,27 @@ metadata:
   namespace: {{ .Release.Namespace }}
 automountServiceAccountToken: false
 ---
-{{ .Files.Get "files/hub-role.yaml" | replace "namespace: portcullis-apps" (printf "namespace: %s" .Values.appsNamespace) }}
+{{ .Files.Get "files/hub-role.yaml" | replace "namespace: portcullis-apps" (printf "namespace: %s" .Values.appsNamespace) | replace "namespace: portcullis-edge" (printf "namespace: %s" .Values.edgeNamespace) }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: portcullis-hub
   namespace: {{ .Values.appsNamespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portcullis-hub
+subjects:
+  - kind: ServiceAccount
+    name: portcullis-hub
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-hub
+  namespace: {{ .Values.edgeNamespace }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role

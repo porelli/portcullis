@@ -3891,6 +3891,7 @@ ns=""
 if [ "${1:-}" = -n ]; then ns="$2"; shift 2; fi
 case "$*" in
   "version -o json") cat "$K/version.json" ;;
+  "auth whoami -o json") [ -z "${STUB_WHOAMI_FAIL:-}" ] || exit 1; echo '{"status":{"userInfo":{"username":"system:admin"}}}' ;;
   "get nodes -o json") cat "$K/nodes.json" ;;
   "create --dry-run=server -f -") cat >/dev/null; cat "$K/svc-dryrun.err" >&2; exit 1 ;;
   "get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o json") cat "$K/eps.json" ;;
@@ -4132,6 +4133,11 @@ OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE=ghcr.io/porelli/portcullis-
 case "$OUT" in *"isn't resolved to a digest"*"rc=1") t_pass "cluster setup: an unresolved Hub tag → refused (the params pin a digest)" ;; *) t_fail "cluster setup tag: $OUT" ;; esac
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES=' '; kube_ctl() { [ \"\$1 \$2\" = 'get nodes' ] && { echo '{\"items\":[]}'; return 0; }; command kubectl --context ci \"\$@\"; }; kube_admission_params x")"
 case "$OUT" in *"no node address"*"rc=1") t_pass "admission params: no node address → refused (never params that can't exclude the nodes)" ;; *) t_fail "admission params no nodes: $OUT" ;; esac
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; export STUB_WHOAMI_FAIL=1; kube_admission_params x")"
+case "$OUT" in *"can't tell this CLI's own identity"*"rc=1") t_pass "admission params: the CLI's identity unknown → refused (portcullis-edge-routes exempts it by name)" ;; *) t_fail "admission params whoami: $OUT" ;; esac
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; kube_admission_params x | grep -E '^(cliUsername|appsNamespace|edgeNamespace|edgeCoreMiddlewares)'" | tr '\t' '=' | head -n4 | tr '\n' ';')"
+expect_eq "admission params: the CLI's identity (auth whoami), the apps / edge namespaces, the core edge Middlewares" "$OUT" \
+  "cliUsername=system:admin;appsNamespace=portcullis-apps;edgeNamespace=portcullis-edge;edgeCoreMiddlewares=$KUBE_EDGE_CORE_MIDDLEWARES;"
 # setup.sh (K3): uid / gid 1–65535, 3–4 octal digits; mkdir -m then chown;
 # anything else refused, nothing created.
 SB="$WORK/setupbin"; mkdir -p "$SB"
@@ -4159,9 +4165,12 @@ expect_eq "kube/storage/admission.yaml pins the same helper and provisioner imag
 expect_eq "StorageClasses: portcullis-core Retain, portcullis-apps Delete, both portcullis.io/local-path with the three owner patterns, never volumeType local" \
   "$(python3 -c 'import sys, yaml; print([(d["metadata"]["name"], d["reclaimPolicy"], d["provisioner"], sorted(d["parameters"]), "volumeType" in d["parameters"]) for d in yaml.safe_load_all(open(sys.argv[1]))])' "$HERE/../kube/storage/storageclasses.yaml")" \
   "[('portcullis-core', 'Retain', 'portcullis.io/local-path', ['groupPattern', 'permPattern', 'userPattern'], False), ('portcullis-apps', 'Delete', 'portcullis.io/local-path', ['groupPattern', 'permPattern', 'userPattern'], False)]"
-expect_eq "kube/admission: five policies, five bindings portcullis-apps-guard-<policy> (Deny, params missing = Deny, Fail)" \
+expect_eq "kube/admission: six policies, six bindings (portcullis-apps-guard-<policy>, portcullis-edge-guard-routes; Deny, params missing = Deny, Fail)" \
   "$(python3 -c 'import sys, yaml; P = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]; B = [d for d in yaml.safe_load_all(open(sys.argv[2])) if d]; print(sorted(p["metadata"]["name"] for p in P), all(p["spec"]["failurePolicy"] == "Fail" for p in P), sorted((b["metadata"]["name"], b["spec"]["policyName"], b["spec"]["validationActions"] == ["Deny"], b["spec"]["paramRef"]["parameterNotFoundAction"]) for b in B))' "$HERE/../kube/admission/policies.yaml" "$HERE/../kube/admission/bindings.yaml")" \
-  "['portcullis-apps-netpol', 'portcullis-apps-pods', 'portcullis-apps-services', 'portcullis-apps-traefik', 'portcullis-apps-workloads'] True [('portcullis-apps-guard-netpol', 'portcullis-apps-netpol', True, 'Deny'), ('portcullis-apps-guard-pods', 'portcullis-apps-pods', True, 'Deny'), ('portcullis-apps-guard-services', 'portcullis-apps-services', True, 'Deny'), ('portcullis-apps-guard-traefik', 'portcullis-apps-traefik', True, 'Deny'), ('portcullis-apps-guard-workloads', 'portcullis-apps-workloads', True, 'Deny')]"
+  "['portcullis-apps-netpol', 'portcullis-apps-pods', 'portcullis-apps-services', 'portcullis-apps-traefik', 'portcullis-apps-workloads', 'portcullis-edge-routes'] True [('portcullis-apps-guard-netpol', 'portcullis-apps-netpol', True, 'Deny'), ('portcullis-apps-guard-pods', 'portcullis-apps-pods', True, 'Deny'), ('portcullis-apps-guard-services', 'portcullis-apps-services', True, 'Deny'), ('portcullis-apps-guard-traefik', 'portcullis-apps-traefik', True, 'Deny'), ('portcullis-apps-guard-workloads', 'portcullis-apps-workloads', True, 'Deny'), ('portcullis-edge-guard-routes', 'portcullis-edge-routes', True, 'Deny')]"
+expect_eq "the CLI's KUBE_BINDINGS = bindings.yaml's names" \
+  "$(python3 -c 'import sys, yaml; print(" ".join(d["metadata"]["name"] for d in yaml.safe_load_all(open(sys.argv[1])) if d))' "$HERE/../kube/admission/bindings.yaml")" "$KUBE_BINDINGS"
+expect_eq "admission edgeCoreMiddlewares = the CLI's KUBE_EDGE_CORE_MIDDLEWARES = the params example's" "$(sed -n 's/^  edgeCoreMiddlewares: //p' "$HERE/../kube/admission/params.yaml")" "$KUBE_EDGE_CORE_MIDDLEWARES"
 expect_eq "admission fileMiddlewares = the CLI's KUBE_FILE_NAMES = the params example's" "$(sed -n 's/^  fileMiddlewares: //p' "$HERE/../kube/admission/params.yaml")" "$KUBE_FILE_NAMES"
 # ── Task 15: sync, values, the release, one-shots, restore, VPN, revocation ──
 # shellcheck source=../scripts/lib/signin.sh

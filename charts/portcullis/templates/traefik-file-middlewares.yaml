@@ -107,6 +107,9 @@ kind: Middleware
 metadata:
   name: portcullis-auth-console
   namespace: {{ $edge }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
 spec:
   forwardAuth:
     address: http://forward-auth.{{ $ns }}.svc.cluster.local:4180
@@ -119,6 +122,9 @@ kind: Middleware
 metadata:
   name: portal-path
   namespace: {{ $edge }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
 spec:
   replacePath:
     path: /portal
@@ -128,6 +134,9 @@ kind: Middleware
 metadata:
   name: portal-vpn-path
   namespace: {{ $edge }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
 spec:
   replacePath:
     path: /portal/vpn
@@ -137,6 +146,9 @@ kind: Middleware
 metadata:
   name: directory-redirect
   namespace: {{ $edge }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
 spec:
   redirectRegex:
     regex: ^https?://[^/]+(/.*)?$

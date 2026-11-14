@@ -20,3 +20,7 @@ data:
   mcpGate: portcullis:portcullis.io/component=mcp-gate
   wg: portcullis:portcullis.io/component=wg
   fileMiddlewares: client-headers@file client-cert-pem@file rate-limit@file rate-limit-auth@file security-headers@file strip-client-forwarded@file portcullis-auth@file portcullis-auth-ext@file portcullis-groups@file portcullis-groups-vpn@file portcullis-public-guard@file portcullis-public-guard-vpn@file vpn-required-path@file group-gate@file forward-auth-ext@file mcp-gate@file
+  cliUsername: system:admin
+  appsNamespace: portcullis-apps
+  edgeNamespace: portcullis-edge
+  edgeCoreMiddlewares: hub-proxy-secret portcullis-auth-console portal-path portal-vpn-path directory-redirect
