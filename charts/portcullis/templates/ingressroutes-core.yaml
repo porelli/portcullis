@@ -2,8 +2,11 @@
 one IngressRoute each, entrypoints from the six classes (entrypoints.ep /
 entrypoints.web, written by ./portcullis vpn mode; `parked` = Traefik's
 loopback), the -vpn twins on vpnsecure with group-gate's VPN paths.
-Middleware names: CRDs of this namespace without a suffix, the file
-provider's with @file (K15). k8s_parity.py compares these with compose. */ -}}
+Middleware names: CRDs of the edge namespace without a suffix, the file
+provider's with @file (K15). They live in the edge namespace (Traefik's only
+watched one: it holds no Secret), so every backend is a file-provider
+service core-<service>-<port>@file (traefik-file-middlewares.yaml) on the
+core Service's cluster DNS name. k8s_parity.py compares these with compose. */ -}}
 {{- $d := include "portcullis.domain" . -}}
 {{- $ep := .Values.entrypoints -}}
 {{- $h := printf "Host(`%s`)" $d -}}
@@ -47,7 +50,7 @@ apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
   name: {{ $r.name }}
-  namespace: {{ $.Release.Namespace }}
+  namespace: {{ $.Values.edgeNamespace }}
   labels:
     app.kubernetes.io/managed-by: portcullis
 spec:
@@ -69,8 +72,8 @@ spec:
         - name: {{ $r.svc }}
           kind: TraefikService
         {{- else }}
-        - name: {{ $r.svc }}
-          port: {{ $r.port }}
+        - name: {{ printf "core-%s-%v@file" $r.svc $r.port }}
+          kind: TraefikService
         {{- end }}
   tls:
     {{- if $r.resolver }}
@@ -90,7 +93,7 @@ apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
   name: kcinternal
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ .Values.edgeNamespace }}
   labels:
     app.kubernetes.io/managed-by: portcullis
 spec:
@@ -101,5 +104,5 @@ spec:
       middlewares:
         - name: strip-forwarded@file
       services:
-        - name: keycloak
-          port: 8080
+        - name: core-keycloak-8080@file
+          kind: TraefikService

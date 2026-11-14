@@ -6,17 +6,31 @@ portcullis.io/component, its net labels, automountServiceAccountToken false
 memory limit = request, portcullis.io/config-hash; and no workload in the
 core namespace that PSA `restricted` would refuse. Also: no randAlphaNum /
 randAscii / genPrivateKey anywhere in the chart, every image by digest.
+Secret access (least privilege): every ServiceAccount's get / list / watch
+on Secrets, per namespace, from the chart's and kube/storage's RBAC, is
+exactly SECRET_READERS (Traefik only the edge namespace, which renders no
+Secret; the Hub only the apps namespace; nobody the core one, which holds
+portcullis-env, the age / wg / vault Secrets); Traefik watches only the edge
+namespace, and every core IngressRoute / Middleware lives there.
 
   python3 tests/k8s_hardening.py
 """
 import re
 import sys
 
+import yaml
+
 import k8s_lib as K
 
 F = K.Failures("k8s_hardening")
 TOKEN_OK = {"traefik", "hub"}
 WRITABLE_ROOT_OK = {"keycloak"}  # compose: not read_only (`start` re-augments)
+# ServiceAccount (namespace/name) → the namespaces whose Secrets it may read.
+SECRET_READERS = {
+    f"{K.NS}/traefik": {K.EDGE_NS},
+    f"{K.NS}/portcullis-hub": {K.APPS_NS},
+}
+SECRET_READ_VERBS = {"get", "list", "watch", "*"}
 RESTRICTED_VOLUMES = {"configMap", "csi", "downwardAPI", "emptyDir", "ephemeral", "persistentVolumeClaim", "projected", "secret"}
 
 
@@ -133,9 +147,67 @@ def main():
             for rule in r["rules"]:
                 if set(rule["verbs"]) - {"get", "list", "watch"}:
                     F.add(f"Traefik's Role in {r['metadata']['namespace']}: {rule['verbs']} (read-only)")
-                if "secrets" in rule["resources"] and r["metadata"]["namespace"] != K.NS:
-                    F.add("Traefik's Role: secrets outside the core namespace")
+    check_secret_access(docs + storage_docs())
+    check_edge(docs)
     return F.done()
+
+
+def storage_docs():
+    out = []
+    for p in sorted((K.ROOT / "kube" / "storage").glob("*.yaml")):
+        out += [d for d in yaml.safe_load_all(p.read_text()) if d]
+    return out
+
+
+def reads_secrets(rule):
+    return (set(rule.get("apiGroups", [])) & {"", "*"}) and (set(rule.get("resources", [])) & {"secrets", "*"}) \
+        and (set(rule.get("verbs", [])) & SECRET_READ_VERBS)
+
+
+def secret_access(docs):
+    """{"ns/sa": {namespace or "*"}} — where each ServiceAccount may read Secrets."""
+    roles = {(d["kind"], d["metadata"].get("namespace", ""), d["metadata"]["name"]): d
+             for d in docs if d.get("kind") in ("Role", "ClusterRole")}
+    out = {}
+    for b in docs:
+        if b.get("kind") not in ("RoleBinding", "ClusterRoleBinding"):
+            continue
+        ref = b["roleRef"]
+        bns = b["metadata"].get("namespace", "")
+        role = roles.get((ref["kind"], bns if ref["kind"] == "Role" else "", ref["name"]))
+        if role is None:
+            F.add(f"{b['kind']} {bns}/{b['metadata']['name']}: its {ref['kind']} {ref['name']} isn't rendered")
+            continue
+        if not any(reads_secrets(r) for r in role.get("rules", [])):
+            continue
+        where = bns if b["kind"] == "RoleBinding" else "*"
+        for s in b.get("subjects", []):
+            key = f"{s.get('namespace', bns)}/{s['name']}" if s["kind"] == "ServiceAccount" else f"{s['kind']}:{s['name']}"
+            out.setdefault(key, set()).add(where)
+    return out
+
+
+def check_secret_access(docs):
+    got = secret_access(docs)
+    for sa in sorted(set(got) | set(SECRET_READERS)):
+        if got.get(sa, set()) != SECRET_READERS.get(sa, set()):
+            F.add(f"Secret access of {sa}: {sorted(got.get(sa, set()))} (want {sorted(SECRET_READERS.get(sa, set()))})")
+    # portcullis-env lives in the core namespace: Traefik may never read it.
+    if K.NS in got.get(f"{K.NS}/traefik", set()) or "*" in got.get(f"{K.NS}/traefik", set()):
+        F.add("Traefik's ServiceAccount can read portcullis-env (Secrets of the core namespace)")
+
+
+def check_edge(docs):
+    for d in docs:
+        ns = d.get("metadata", {}).get("namespace")
+        if d.get("kind") == "Secret" and ns == K.EDGE_NS:
+            F.add(f"Secret {d['metadata']['name']} in {K.EDGE_NS} (Traefik reads every Secret there)")
+        if d.get("kind") in ("IngressRoute", "Middleware", "IngressRouteTCP", "IngressRouteUDP", "TLSOption", "TLSStore",
+                             "ServersTransport", "TraefikService", "MiddlewareTCP") and ns != K.EDGE_NS:
+            F.add(f"{d['kind']} {d['metadata']['name']} in {ns}: core Traefik objects live in {K.EDGE_NS} (Traefik's only watched namespace)")
+    env = {e["name"]: e.get("value") for e in K.deployments(docs)["traefik"]["spec"]["template"]["spec"]["containers"][0]["env"]}
+    if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES") != K.EDGE_NS:
+        F.add(f"traefik: kubernetesCRD namespaces {env.get('TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES')!r} (want {K.EDGE_NS} only)")
 
 
 if __name__ == "__main__":

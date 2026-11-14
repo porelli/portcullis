@@ -1,24 +1,27 @@
-{{- /* Traefik's ServiceAccount (the k8s form of socket-proxy-traefik):
-read-only Roles in the two namespaces — services, endpointslices, the
-traefik.io objects; secrets in this (core) namespace only, never the apps
-one. Nothing cluster-scoped, no nodes (the Ingress / Gateway providers are
-off). */ -}}
+{{- /* Traefik's ServiceAccount (the k8s form of socket-proxy-traefik): one
+read-only Role, in the edge namespace only. Traefik's CRD provider runs a
+Secret informer (list / watch, no name or label scope RBAC can narrow) in
+every namespace it watches, so it watches only the edge namespace, which
+holds the core IngressRoutes and Middlewares and never a Secret: TLS comes
+from the file provider. Nothing in the core namespace (portcullis-env, the
+age / wg / vault Secrets) or the apps namespace (the instances' Secrets),
+nothing cluster-scoped, no nodes (the Ingress / Gateway providers are off).
+k8s_hardening.py checks every ServiceAccount's Secret access. */ -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: traefik
   namespace: {{ .Release.Namespace }}
 automountServiceAccountToken: false
-{{- range $ns := list .Release.Namespace .Values.appsNamespace }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: traefik
-  namespace: {{ $ns }}
+  namespace: {{ .Values.edgeNamespace }}
 rules:
   - apiGroups: [""]
-    resources: {{ if eq $ns $.Release.Namespace }}["services", "secrets"]{{ else }}["services"]{{ end }}
+    resources: ["services", "secrets"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
@@ -31,7 +34,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: traefik
-  namespace: {{ $ns }}
+  namespace: {{ .Values.edgeNamespace }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -39,5 +42,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: traefik
-    namespace: {{ $.Release.Namespace }}
-{{- end }}
+    namespace: {{ .Release.Namespace }}

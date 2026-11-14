@@ -2,11 +2,16 @@
 "Names apps may use"): the core middlewares and services app routers name
 as @file (an IngressRoute in the apps namespace can't reach this
 namespace's objects), and the chart-only strip-forwarded of the kcinternal
-router. Projected next to the synced traefik/dynamic/*.yml. The core-only
+router, and the core routers' backends core-<service>-<port> (the core
+IngressRoutes live in the edge namespace, which holds no Service of
+theirs). Projected next to the synced traefik/dynamic/*.yml. The core-only
 Middlewares (portcullis-auth-console, portal paths, directory-redirect) are
-CRDs here; hub-proxy-secret (it carries the secret) is applied by the CLI
+CRDs of the edge namespace; hub-proxy-secret (it carries the secret) is applied by the CLI
 from stdin, never rendered. */ -}}
 {{- $ns := .Release.Namespace -}}
+{{- $edge := .Values.edgeNamespace -}}
+{{- $core := list (list "lldap" 17170) (list "keycloak" 8080) (list "forward-auth" 4180) (list "group-gate" 8080) (list "hub" 8888) (list "hub" 8889) (list "enroll" 8443) (list "mcp-gate" 8080) -}}
+{{- if .Values.monitoring.enabled }}{{- $core = append $core (list "grafana" 3000) -}}{{- end -}}
 {{- $d := include "portcullis.domain" . -}}
 {{- $idh := "X-Auth-Request-User,X-Auth-Request-Email,X-Auth-Request-Groups,X-Auth-Request-Preferred-Username,X-Forwarded-User,X-Forwarded-Email,Authorization,X-Forwarded-Access-Token,X-Forwarded-Impersonator,X-Forwarded-Impersonation" | splitList "," -}}
 apiVersion: v1
@@ -90,12 +95,18 @@ data:
           loadBalancer:
             servers:
               - url: http://mcp-gate.{{ $ns }}.svc.cluster.local:8080
+        {{- range $c := $core }}
+        core-{{ index $c 0 }}-{{ index $c 1 }}:
+          loadBalancer:
+            servers:
+              - url: http://{{ index $c 0 }}.{{ $ns }}.svc.cluster.local:{{ index $c 1 }}
+        {{- end }}
 ---
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
   name: portcullis-auth-console
-  namespace: {{ $ns }}
+  namespace: {{ $edge }}
 spec:
   forwardAuth:
     address: http://forward-auth.{{ $ns }}.svc.cluster.local:4180
@@ -107,7 +118,7 @@ apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
   name: portal-path
-  namespace: {{ $ns }}
+  namespace: {{ $edge }}
 spec:
   replacePath:
     path: /portal
@@ -116,7 +127,7 @@ apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
   name: portal-vpn-path
-  namespace: {{ $ns }}
+  namespace: {{ $edge }}
 spec:
   replacePath:
     path: /portal/vpn
@@ -125,7 +136,7 @@ apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
   name: directory-redirect
-  namespace: {{ $ns }}
+  namespace: {{ $edge }}
 spec:
   redirectRegex:
     regex: ^https?://[^/]+(/.*)?$

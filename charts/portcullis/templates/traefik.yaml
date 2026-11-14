@@ -1,7 +1,8 @@
 {{- /* traefik (compose: traefik). Non-root 65532 on :8000 / :8443 behind
 the traefik LoadBalancer (services.yaml); kcinternal :8081 and vpnsecure
-:8444 are container ports of their own. kubernetesCRD provider on the two
-namespaces, no cross-namespace references, no ExternalName; Ingress and
+:8444 are container ports of their own. kubernetesCRD provider on the edge
+namespace only (it lists every Secret of a watched namespace: never the core
+or apps one), no cross-namespace references, no ExternalName; Ingress and
 Gateway providers off. File provider: the synced traefik/dynamic plus the
 chart's traefik-dynamic (K15 core names, strip-forwarded), projected into
 one directory. Every untrusted entrypoint runs strip-client-forwarded@file
@@ -53,7 +54,7 @@ first and deletes header aliases. */ -}}
     (dict "name" "TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_DOMAINS_0_SANS" "value" (printf "*.%s" $d))
     (dict "name" "TRAEFIK_ENTRYPOINTS_PARKED_ADDRESS" "value" "127.0.0.1:8441")
     (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD" "value" "true")
-    (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES" "value" (printf "%s,%s" .Release.Namespace .Values.appsNamespace))
+    (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES" "value" .Values.edgeNamespace)
     (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE" "value" "false")
     (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWEXTERNALNAMESERVICES" "value" "false")
     (dict "name" "TRAEFIK_PROVIDERS_FILE_DIRECTORY" "value" "/etc/traefik/dynamic")

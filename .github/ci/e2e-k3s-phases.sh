@@ -119,7 +119,7 @@ vpn)
   K -n portcullis get svc wg-people -o json | jq -e '.spec.type == "LoadBalancer" and .spec.externalTrafficPolicy == "Local" and ([.spec.ports[].protocol] == ["UDP"])' >/dev/null \
     || fail "wg-people isn't a UDP-only LoadBalancer with externalTrafficPolicy Local"
   K -n portcullis get svc traefik -o json | jq -e '[.spec.ports[].port] == [80, 443]' >/dev/null || fail "the traefik LoadBalancer has ports beyond 80 / 443"
-  ep() { K -n portcullis get ingressroute "$1" -o jsonpath='{.spec.entryPoints}'; }
+  ep() { K -n portcullis-edge get ingressroute "$1" -o jsonpath='{.spec.entryPoints}'; }
   [ "$(ep hub)" = '["websecure"]' ] || fail "apps mode: the hub router's entrypoints are $(ep hub)"
   ./portcullis vpn mode admin --force 2>&1 | redact
   [ "$(ep hub)" = '["parked"]' ] && [ "$(ep hub-vpn)" = '["vpnsecure"]' ] || fail "admin mode: hub $(ep hub), hub-vpn $(ep hub-vpn)"

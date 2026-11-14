@@ -140,6 +140,10 @@ renderNamespaces: false
 installID: ""
 appsNamespace: portcullis-apps
 storageNamespace: portcullis-storage
+# Traefik's only watched namespace: the core IngressRoutes and Middlewares,
+# never a Secret (Traefik's CRD provider lists every Secret of each watched
+# namespace, so the core and apps namespaces are never watched).
+edgeNamespace: portcullis-edge
 
 # rt_run (K16): the one-shot to render (templates/oneshot.yaml), set by
 # ./portcullis only with helm template --show-only.

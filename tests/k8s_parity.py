@@ -259,6 +259,20 @@ def compose_routers(comp, cls):
     return routers
 
 
+def compose_ports(comp):
+    """{traefik service name: its loadbalancer.server.port} from compose labels."""
+    out = {}
+    for svc in comp["services"].values():
+        labels = svc.get("labels") or {}
+        if isinstance(labels, list):
+            labels = dict(x.split("=", 1) for x in labels)
+        for k, v in labels.items():
+            m = re.match(r"traefik\.http\.services\.([^.]+)\.loadbalancer\.server\.port$", k)
+            if m:
+                out[m.group(1)] = str(v)
+    return out
+
+
 def check_routers(comp):
     for mode in ("apps", "admin", "server"):
         cls = classes(mode)
@@ -291,6 +305,17 @@ def check_routers(comp):
                 F.add(f"router {rname}: middlewares {got_mw} != compose {want_mw}")
             svc = r.get("service", rname)
             gs = route["services"][0]["name"]
+            # Core backends are file-provider services core-<service>-<port>@file
+            # (the IngressRoutes live in the edge namespace): compare the
+            # service and the compose port.
+            m = re.match(r"^core-(.+)-([0-9]+)@file$", gs)
+            if m:
+                gs = m.group(1)
+                want_port = compose_ports(comp).get(svc)
+                if want_port and m.group(2) != want_port:
+                    F.add(f"router {rname}: port {m.group(2)} != compose {want_port}")
+            elif not gs.endswith("@internal"):
+                F.add(f"router {rname}: service {gs} isn't a core-<service>-<port>@file or @internal service")
             if gs != svc and not (svc == "hub-people" and gs == "hub") and not (svc == rname and gs == r["owner"]) \
                and not (svc == "grafana-metrics" and gs == "grafana"):
                 F.add(f"router {rname}: service {gs} != compose {svc}")

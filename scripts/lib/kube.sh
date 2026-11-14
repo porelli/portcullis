@@ -11,7 +11,7 @@
 #   PORTCULLIS_APPS_NAMESPACE        the app instances' namespace (portcullis-apps)
 #   PORTCULLIS_POD_CIDR / _SERVICE_CIDR / PORTCULLIS_KUBE_API_ENDPOINTS
 #                                    detected at init, re-checked by runtime_check
-#   PORTCULLIS_KUBE_INSTALL_ID       owns the three namespaces (K11)
+#   PORTCULLIS_KUBE_INSTALL_ID       owns the four namespaces (K11)
 #   PORTCULLIS_KUBE_IMAGES           registry | local (K1)
 #   PORTCULLIS_TRAEFIK_SERVICE_IP, PORTCULLIS_TRAEFIK_VPN_SERVICE_IP,
 #   PORTCULLIS_WG_EDGE_SERVICE_IP    fixed ClusterIPs (service network + 20/21/22)
@@ -21,6 +21,9 @@
 
 KUBE_MIN_VERSION="1.32"
 KUBE_STORAGE_NS="portcullis-storage"
+# Traefik's only watched namespace (the chart's edgeNamespace): the core
+# IngressRoutes and Middlewares, hub-proxy-secret, never a Secret.
+KUBE_EDGE_NS="portcullis-edge"
 KUBE_PROBE_NS="portcullis-netpol-probe"
 KUBE_MANAGED_LABEL="app.kubernetes.io/managed-by"
 KUBE_INSTALL_ANNOTATION="portcullis.io/install"
@@ -266,7 +269,7 @@ kube_host_checks() {
   else
     _rt_chk fail "can't read the cluster's networks: $_K_ERR"
   fi
-  for ns in "$(kube_ns)" "$(kube_apps_ns)" "$KUBE_STORAGE_NS"; do
+  for ns in "$(kube_ns)" "$(kube_apps_ns)" "$KUBE_STORAGE_NS" "$KUBE_EDGE_NS"; do
     _kube_ns_check "$ns"
   done
   # Task 0 Q1: ServiceLB keeps the client address only for an address it
@@ -724,7 +727,8 @@ KUBE_FIELD_MANAGER="portcullis-cli"
 kube_applied_file() { echo "$PORTCULLIS_ROOT/secrets/kube/applied.json"; }
 
 # _kube_applied_set <key> <value> — record a step in secrets/kube/applied.json
-# (0600, written atomically) only after it succeeded.
+# (0600, written atomically) only after it succeeded. A record for the
+# operator only: nothing reads it to skip work (every run re-applies).
 _kube_applied_set() {
   local f tmp
   f="$(kube_applied_file)"
@@ -801,8 +805,10 @@ _kube_configmap_from() {
 #   namespaces  portcullis (restricted), portcullis-apps (enforce privileged,
 #               warn / audit baseline), portcullis-storage (enforce
 #               privileged: its helpers need hostPath; warn / audit
-#               baseline; pinned by kube/storage/admission.yaml), all with
-#               K11's label + annotation;
+#               baseline; pinned by kube/storage/admission.yaml),
+#               portcullis-edge (restricted: Traefik's only watched
+#               namespace, no pod, no Secret), all with K11's label +
+#               annotation;
 #   storage     the provisioner portcullis.io/local-path (kube/storage),
 #               its ConfigMap, the StorageClasses, its deny policy + API egress;
 #   crds        the Traefik CRDs (K14: kubectl --server-side, never Helm);
@@ -821,6 +827,7 @@ kube_cluster_setup() {
   kube_namespace_apply "$(kube_ns)" restricted restricted restricted || fail "could not create the namespace $(kube_ns)"
   kube_namespace_apply "$(kube_apps_ns)" privileged baseline baseline || fail "could not create the namespace $(kube_apps_ns)"
   kube_namespace_apply "$KUBE_STORAGE_NS" privileged baseline baseline || fail "could not create the namespace $KUBE_STORAGE_NS"
+  kube_namespace_apply "$KUBE_EDGE_NS" restricted restricted restricted || fail "could not create the namespace $KUBE_EDGE_NS"
   _kube_applied_set cluster.namespaces "${PORTCULLIS_KUBE_INSTALL_ID}"
 
   info "Cluster setup: storage (portcullis.io/local-path)..."
@@ -860,6 +867,11 @@ kube_cluster_setup() {
   _kube_configmap_from portcullis-admission-params "$(kube_apps_ns)" "$tmp" || { rm -rf "$tmp"; fail "could not write portcullis-admission-params"; }
   _kube_applied_set cluster.params "$(_kube_sha "$tmp"/*)"
   rm -rf "$tmp"
+
+  # Traefik's Role reads every Secret of the edge namespace: none may be there.
+  local n
+  n="$(kube_ctl -n "$KUBE_EDGE_NS" get secrets -o json 2>/dev/null | jq -r '.items | length' 2>/dev/null || true)"
+  [ "$n" = 0 ] || fail "the namespace $KUBE_EDGE_NS holds ${n:-an unreadable list of} Secrets: Traefik reads every Secret there, so it must hold none (delete them): nothing deployed"
 }
 
 # ══ Task 15: images, sync, values, the release ════════════
@@ -969,7 +981,7 @@ kube_resolve_images() {
 KUBE_ENV_SECRETS="POSTGRES_PASSWORD KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD LLDAP_JWT_SECRET FORWARD_AUTH_CLIENT_SECRET FORWARD_AUTH_COOKIE_SECRET FORWARD_AUTH_REDIS_PASSWORD FORWARD_AUTH_EXT_REDIS_PASSWORD HUB_PROXY_SECRET CLOUDFLARE_API_TOKEN PORKBUN_API_KEY PORKBUN_SECRET_API_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_HOSTED_ZONE_ID DO_AUTH_TOKEN HETZNER_API_KEY HETZNER_API_TOKEN"
 
 # secrets/ files never synced: the CLI's own (kube/), the Vault root token
-# (nothing in the cluster mounts it; Traefik's Role reads core Secrets),
+# (nothing in the cluster mounts it),
 # the endpoint CA's key, the host-specific addresses.
 _kube_sync_skip() {
   case "$1" in
@@ -1081,38 +1093,64 @@ kube_sync_stage() {
   done
 }
 
-# kube_sync_secrets — stage everything, apply each object whose content
-# hash differs from secrets/kube/applied.json (server-side, from stdin:
-# `kubectl create … --from-file=<dir> --dry-run=client -o yaml | kubectl
-# apply -f -`), and the hub-proxy-secret Middleware (its header holds the
-# secret: built by jq from the environment, applied from stdin). Sets
-# _K_HASHES (JSON {name: hash}); applied.json is written by the caller only
-# after the release succeeded.
+# _kube_put <file> — the object exactly as in the file: replaced when it
+# exists (a key added or changed by hand is gone, unlike an apply, which
+# keeps other managers' fields), else created. Our field manager.
+_kube_put() {
+  if kube_ctl get -f "$1" -o name >/dev/null 2>&1; then
+    kube_ctl replace --field-manager="$KUBE_FIELD_MANAGER" -f "$1" >/dev/null
+  else
+    kube_ctl create --field-manager="$KUBE_FIELD_MANAGER" -f "$1" >/dev/null
+  fi
+}
+
+# kube_sync_secrets [--full] — stage everything and put each object whose
+# LIVE content (data + binaryData, read with kubectl get) differs from the
+# staged one, or that is missing: no local cache decides (a restore, a reset
+# cluster or a hand edit is always corrected). --full (or KUBE_SYNC_FULL=1:
+# restore) puts every object without comparing; an unreadable live list does
+# too. Objects are built by `kubectl create … --from-file=<dir> --dry-run=client
+# -o json` into the 0700 staging dir (never argv), and the hub-proxy-secret
+# Middleware (its header holds the secret: built by jq from the environment)
+# goes to the edge namespace, Traefik's only one. Sets _K_HASHES (JSON
+# {name: content hash}) for the chart's rollout annotations.
 kube_sync_secrets() {
-  local item kind name dir h old ns
+  local full=false item kind name dir h ns want live
+  [ "${1:-}" = --full ] || [ "${KUBE_SYNC_FULL:-}" = 1 ] && full=true
   ns="$(kube_ns)"
   kube_sync_stage
   _K_HASHES='{}'
+  live="$_K_STAGE/.live" want="$_K_STAGE/.live/want.json"
+  (umask 077 && mkdir -p "$live")
+  if [ "$full" = false ]; then
+    kube_ctl -n "$ns" get secrets -o json > "$live/secret.json" 2>/dev/null \
+      && kube_ctl -n "$ns" get configmaps -o json > "$live/configmap.json" 2>/dev/null \
+      || { warn "can't list the live Secrets / ConfigMaps of $ns: syncing every object"; full=true; }
+  fi
   for item in "${_K_STAGED[@]}"; do
     IFS='|' read -r kind name dir <<< "$item"
     h="$(_kube_dir_hash "$dir")"
     _K_HASHES="$(printf '%s' "$_K_HASHES" | N="$name" H="$h" jq -c '.[env.N] = env.H')"
-    old="$(jq -r --arg n "$name" '.objects[$n] // empty' "$(kube_applied_file)" 2>/dev/null || true)"
-    [ "$old" != "$h" ] || continue
     if [ "$kind" = secret ]; then
-      kube_ctl create secret generic "$name" -n "$ns" --from-file="$dir" --dry-run=client -o yaml
+      kube_ctl create secret generic "$name" -n "$ns" --from-file="$dir" --dry-run=client -o json
     else
-      kube_ctl create configmap "$name" -n "$ns" --from-file="$dir" --dry-run=client -o yaml
-    fi | kube_ctl apply --server-side --force-conflicts --field-manager="$KUBE_FIELD_MANAGER" -f - >/dev/null \
-      || { rm -rf "$_K_STAGE"; fail "could not sync $kind $name"; }
+      kube_ctl create configmap "$name" -n "$ns" --from-file="$dir" --dry-run=client -o json
+    fi > "$want" || { rm -rf "$_K_STAGE"; fail "could not build $kind $name"; }
+    if [ "$full" = false ] && jq -n -e --slurpfile w "$want" --slurpfile l "$live/$kind.json" '
+        def body: {data: (.data // {}), binaryData: (.binaryData // {})};
+        ($w[0] | body) as $b
+        | [$l[0].items[] | select(.metadata.name == $w[0].metadata.name)]
+        | (length == 1) and ((.[0] | body) == $b)' >/dev/null 2>&1; then
+      continue
+    fi
+    _kube_put "$want" || { rm -rf "$_K_STAGE"; fail "could not sync $kind $name"; }
   done
-  rm -rf "$_K_STAGE"
-  [ -n "${HUB_PROXY_SECRET:-}" ] || fail "HUB_PROXY_SECRET is not set in .env"
-  NS="$ns" jq -n '{apiVersion: "traefik.io/v1alpha1", kind: "Middleware",
+  [ -n "${HUB_PROXY_SECRET:-}" ] || { rm -rf "$_K_STAGE"; fail "HUB_PROXY_SECRET is not set in .env"; }
+  NS="$KUBE_EDGE_NS" jq -n '{apiVersion: "traefik.io/v1alpha1", kind: "Middleware",
       metadata: {name: "hub-proxy-secret", namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}},
-      spec: {headers: {customRequestHeaders: {"X-Portcullis-Proxy-Secret": env.HUB_PROXY_SECRET}}}}' \
-    | kube_ctl apply --server-side --force-conflicts --field-manager="$KUBE_FIELD_MANAGER" -f - >/dev/null \
-    || fail "could not apply the hub-proxy-secret Middleware"
+      spec: {headers: {customRequestHeaders: {"X-Portcullis-Proxy-Secret": env.HUB_PROXY_SECRET}}}}' > "$want" \
+    && _kube_put "$want" || { rm -rf "$_K_STAGE"; fail "could not apply the hub-proxy-secret Middleware"; }
+  rm -rf "$_K_STAGE"
 }
 
 # ── values (no secret ever) ──
@@ -1223,8 +1261,8 @@ kube_cluster_check() {
 # Secrets / ConfigMaps synced, the cluster setup, the NetworkPolicy probe
 # (proven for this run only), values, then `helm upgrade --install --wait
 # --timeout 10m --skip-crds` (the CRDs are init's, K14). Only after Helm
-# succeeded: applied.json's object hashes and the digest cache. A failed
-# or timed-out run prints kube_health_report and writes neither.
+# succeeded: the digest cache. A failed or timed-out run prints
+# kube_health_report and writes nothing.
 _rtk_up() {
   local rc=0 vf
   local -a wait=(--wait --timeout 10m)
@@ -1248,19 +1286,9 @@ _rtk_up() {
     kube_health_report
     return "$rc"
   fi
-  _kube_applied_set_objects "$_K_HASHES"
   (umask 077 && printf '%s\n' "$_K_IMAGES" > "$(kube_digests_file)")
   kube_cluster_check
   kube_forward_core
-}
-
-# _kube_applied_set_objects <json> — applied.json's object hashes (after success).
-_kube_applied_set_objects() {
-  local f tmp
-  f="$(kube_applied_file)"
-  [ -s "$f" ] || (umask 077 && mkdir -p "$(dirname "$f")" && echo '{}' > "$f")
-  tmp="$(mktemp "$f.XXXXXX")"
-  O="$1" jq '.objects = (env.O | fromjson)' "$f" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$f" || { rm -f "$tmp"; fail "could not write $f"; }
 }
 
 # _rtk_pull — the images are resolved (by digest) at every up; nothing to pull.
@@ -1552,7 +1580,7 @@ _kube_restore_vault() {
     "$VAULT_ADDR/v1/sys/storage/raft/snapshot-force" || true)"
   [ "$code" = 204 ] || [ "$code" = 200 ] || fail "Vault snapshot restore failed (HTTP ${code:-none})"
   _restore_secrets "$dir"
-  kube_sync_secrets
+  kube_sync_secrets --full
   kube_ctl -n "$(kube_ns)" rollout restart deploy/vault >/dev/null && _kube_wait_running vault || fail "could not restart Vault"
   pf="$(_kube_forward vault 8200)" || fail "no port-forward to Vault"
   export VAULT_ADDR="http://127.0.0.1:$pf"
@@ -1592,6 +1620,8 @@ _backup_restore_kube() {
     confirm "Continue with restore?" || { echo "Cancelled."; return 0; }
   fi
   [ -n "$RESTORE_RUNTIME" ] || restore_runtime_from_host
+  # Every later sync of this run puts every object (never compared).
+  export KUBE_SYNC_FULL=1
   info "Stopping the Hub..."
   _kube_scale hub 0 || fail "could not stop the Hub: nothing was restored"
   if ! _kube_restore_stop_secret_apps; then

@@ -1,8 +1,8 @@
-{{- /* The three namespaces, rendered only for kubeconform in CI
+{{- /* The four namespaces, rendered only for kubeconform in CI
 (renderNamespaces): ./portcullis init creates them itself — PSA labels and
 K11's ownership label + install annotation —, never Helm. */ -}}
 {{- if .Values.renderNamespaces }}
-{{- range $n := list (list .Release.Namespace "restricted" "restricted" "restricted") (list .Values.appsNamespace "privileged" "baseline" "baseline") (list .Values.storageNamespace "baseline" "baseline" "baseline") }}
+{{- range $n := list (list .Release.Namespace "restricted" "restricted" "restricted") (list .Values.appsNamespace "privileged" "baseline" "baseline") (list .Values.storageNamespace "baseline" "baseline" "baseline") (list .Values.edgeNamespace "restricted" "restricted" "restricted") }}
 ---
 apiVersion: v1
 kind: Namespace

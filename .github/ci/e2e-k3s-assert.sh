@@ -7,7 +7,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 K() { kubectl --context ci "$@"; }
-NS=portcullis APPS=portcullis-apps
+NS=portcullis APPS=portcullis-apps EDGE=portcullis-edge STORAGE=portcullis-storage
 ALPINE="docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a"
 T="$(mktemp -d)"; chmod 700 "$T"
 trap 'rm -rf "$T"; K -n "$APPS" delete pod -l e2e-k3s=probe --wait=false >/dev/null 2>&1 || true; K -n "$NS" delete pod -l e2e-k3s=probe --wait=false >/dev/null 2>&1 || true' EXIT
@@ -143,6 +143,28 @@ denied pods "$(printf '%s' "$POD" | sed 's/"portcullis.io\/instance":"e2e"/"port
 [ "$(KH -n "$APPS" auth can-i create pods/exec)" = yes ] || fail "the Hub's ServiceAccount can't create pods/exec"
 [ "$(KH -n "$NS" auth can-i get secrets)" = no ] || fail "the Hub's ServiceAccount reads core Secrets"
 pass "the guard refuses a hostPath outside the roots, a NodePort, a cross-namespace middleware, a foreign helper image and vpn-slot 47, each by its binding; pods/exec is create only"
+
+# ── Secret access of every ServiceAccount (least privilege) ──
+# Traefik reads Secrets only in the edge namespace (it holds none), the Hub
+# only in the apps namespace; nobody else anywhere of ours or kube-system.
+[ "$(K auth can-i get secret/portcullis-env -n "$NS" --as="system:serviceaccount:$NS:traefik" 2>/dev/null || true)" = no ] \
+  || fail "Traefik's ServiceAccount can get portcullis-env"
+[ "$(K -n "$EDGE" get secrets -o json | jq '.items | length')" = 0 ] || fail "the edge namespace holds a Secret (Traefik reads every Secret there)"
+n=0
+while IFS= read -r sa; do
+  for ns in "$NS" "$APPS" "$EDGE" "$STORAGE" kube-system; do
+    want=no
+    case "$sa:$ns" in "$NS/traefik:$EDGE" | "$NS/portcullis-hub:$APPS") want=yes ;; esac
+    for verb in get list watch; do
+      got="$(K auth can-i "$verb" secrets -n "$ns" --as="system:serviceaccount:${sa/\//:}" 2>/dev/null || true)"
+      [ "$got" = "$want" ] || fail "ServiceAccount $sa: can-i $verb secrets -n $ns = ${got:-error} (want $want)"
+    done
+  done
+  n=$((n + 1))
+done < <(K get serviceaccounts -A -o json | jq -r --arg a "$NS" --arg b "$APPS" --arg c "$EDGE" --arg d "$STORAGE" \
+  '.items[] | select(.metadata.namespace as $n | [$a, $b, $c, $d] | index($n)) | "\(.metadata.namespace)/\(.metadata.name)"')
+[ "$n" -ge 4 ] || fail "only $n ServiceAccounts found in our namespaces"
+pass "Secret access: Traefik only $EDGE (no Secret there, never portcullis-env), the Hub only $APPS, the other $((n - 2)) ServiceAccounts none"
 
 # ── revocation within 10 s ──
 SER="$(cat "$T/../e2e-k3s-serial" 2>/dev/null || true)"

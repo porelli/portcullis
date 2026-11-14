@@ -3908,6 +3908,39 @@ case "$*" in
     all="$*"; f="${all##* -f }"
     [ -z "${STUB_APPLY_FAIL_MATCH:-}" ] || case "$f" in *"$STUB_APPLY_FAIL_MATCH"*) echo "stub: apply of $f refused" >&2; exit 1 ;; esac
     [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
+  "create secret generic "*" --dry-run=client -o json"|"create configmap "*" --dry-run=client -o json")
+    # The object as kubectl builds it: Secret data base64, ConfigMap data text.
+    if [ "$2" = secret ]; then kind=Secret n="$4"; else kind=ConfigMap n="$3"; fi
+    printf 'create %s %s\n' "$kind" "$n" >> "$STUB_DIR/order"
+    all="$*"; d="${all##*--from-file=}"; d="${d%% *}"
+    data='{}'
+    for f in "$d"/*; do
+      [ -f "$f" ] || continue
+      if [ "$kind" = Secret ]; then v="$(base64 < "$f" | tr -d '\n')"; else v="$(cat "$f")"; fi
+      data="$(printf '%s' "$data" | FK="${f##*/}" FV="$v" jq -c '.[env.FK] = env.FV')"
+    done
+    printf '%s' "$data" | KIND="$kind" N="$n" jq '{apiVersion: "v1", kind: env.KIND, metadata: {name: env.N, namespace: "portcullis"}, data: .}' ;;
+  "get -f "*" -o name")
+    lk="$(jq -r .kind "$3").$(jq -r .metadata.name "$3")"
+    [ -e "$STUB_DIR/live/$lk.json" ] || { echo "Error from server (NotFound)" >&2; exit 1; }
+    echo "$lk" ;;
+  "replace --field-manager="*" -f "*|"create --field-manager="*" -f "*)
+    all="$*"; f="${all##* -f }"
+    lk="$(jq -r .kind "$f").$(jq -r .metadata.name "$f")"
+    printf 'put %s %s\n' "$1" "$lk" >> "$STUB_DIR/order"
+    cat "$f" >> "$STUB_DIR/kubectl-stdin"; echo --- >> "$STUB_DIR/kubectl-stdin"
+    [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1
+    mkdir -p "$STUB_DIR/live"; cp "$f" "$STUB_DIR/live/$lk.json" ;;
+  "get secrets -o json"|"get configmaps -o json")
+    case "$ns" in
+      portcullis)
+        [ -z "${STUB_LIVE_LIST_FAIL:-}" ] || { echo "Error from server (Forbidden)" >&2; exit 1; }
+        lk=Secret; [ "$2" = configmaps ] && lk=ConfigMap
+        set -- "$STUB_DIR"/live/"$lk".*.json
+        if [ -e "$1" ]; then jq -s '{items: .}' "$@"; else echo '{"items":[]}'; fi ;;
+      portcullis-edge) cat "$K/edge-secrets.json" 2>/dev/null || echo '{"items":[]}' ;;
+      *) cat "$K/apps-secrets.json" 2>/dev/null || echo '{"items":[]}' ;;
+    esac ;;
   "create secret generic "*" --dry-run=client -o yaml"|"create configmap "*" --dry-run=client -o yaml")
     if [ "$2" = secret ]; then kn="secret $4"; else kn="configmap $3"; fi
     printf 'create %s\n' "$kn" >> "$STUB_DIR/order"
@@ -3921,7 +3954,6 @@ case "$*" in
   "get pods -l portcullis.io/component=hub -o json"|"get pods -l portcullis.io/component=wg -o json") echo '{"items":[{"status":{"phase":"Running","containerStatuses":[{"ready":true,"started":true}]},"spec":{"containers":[{"readinessProbe":{}}]}}]}' ;;
   "get pods -o json") cat "$K/pods.json" 2>/dev/null || echo '{"items":[]}' ;;
   "get events --field-selector "*) echo '{"items":[{"reason":"BackOff","message":"Back-off restarting failed container"}]}' ;;
-  "get secrets -o json") cat "$K/apps-secrets.json" 2>/dev/null || echo '{"items":[]}' ;;
   "get deployments -l portcullis.io/person-secrets -o json") echo '{"items":[{"metadata":{"labels":{"portcullis.io/instance":"samba"}}}]}' ;;
   "scale "*|"patch "*|"annotate "*|"rollout "*|"wait "*) printf 'kubectl %s %s\n' "$ns" "$*" >> "$STUB_DIR/order" ;;
   "run "*) printf 'kubectl run\n' >> "$STUB_DIR/order"; cat >/dev/null; exit "${STUB_RUN_RC:-0}" ;;
@@ -3945,7 +3977,7 @@ exit 0
 HSTUB
 chmod +x "$KS/bin/kubectl" "$KS/bin/helm"
 k_fixtures() {
-  rm -rf "$KS/kube" "$KS/kubectl-calls" "$KS/kubectl-stdin"; mkdir -p "$KS/kube"
+  rm -rf "$KS/kube" "$KS/kubectl-calls" "$KS/kubectl-stdin" "$KS/live"; mkdir -p "$KS/kube"
   printf 'ci\nother\n' > "$KS/kube/contexts"
   echo '{"serverVersion":{"gitVersion":"v1.37.2+k3s1"}}' > "$KS/kube/version.json"
   cat > "$KS/kube/nodes.json" <<'J'
@@ -4079,13 +4111,17 @@ expect_eq "cluster setup: params ConfigMap carries the resolved Hub digest, the 
 expect_eq "cluster setup: the params ConfigMap has exactly params.tmpl.yaml's keys" \
   "$(sed -n '/name: portcullis-admission-params/,/^---/p' "$KS/kubectl-stdin" | sed -n '/^data:/,$p' | sed -n 's/^  \([A-Za-z]*\): .*/\1/p' | sort | tr '\n' ' ')" \
   "$(sed -n '/^data:/,$p' "$HERE/../kube/admission/params.tmpl.yaml" | sed -n 's/^  \([A-Za-z]*\): .*/\1/p' | sort | tr '\n' ' ')"
-expect_eq "cluster setup: the three namespaces with PSA labels and K11's label + install annotation (server-side)" \
+expect_eq "cluster setup: the four namespaces with PSA labels and K11's label + install annotation (server-side)" \
   "$(jq -cs '[.[] | select(.kind == "Namespace") | [.metadata.name, .metadata.labels["pod-security.kubernetes.io/enforce"], .metadata.labels["pod-security.kubernetes.io/warn"], .metadata.labels["app.kubernetes.io/managed-by"], .metadata.annotations["portcullis.io/install"]]]' < <(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(type == "object")' 2>/dev/null))" \
-  '[["portcullis","restricted","restricted","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-apps","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-storage","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"]]'
+  '[["portcullis","restricted","restricted","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-apps","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-storage","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-edge","restricted","restricted","portcullis","0b0e2b3c-1111-4222-8333-444455556666"]]'
 expect_eq "cluster setup: CRDs, VAPs and bindings applied server-side (never Helm), the storage API egress to each endpoint" \
   "$(grep -c 'apply --server-side --force-conflicts --field-manager=portcullis-cli -f .*charts/portcullis/crds/traefik-v3.7.17.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/policies.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/bindings.yaml' "$KS/kubectl-calls"):$(grep -c '"cidr": "10.1.0.4/32"' "$KS/kubectl-stdin")" "1:1:1:1"
 expect_eq "cluster setup: applied.json records every step (0600)" \
   "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json"):$(file_mode "$CS_ROOT/secrets/kube/applied.json")" "cluster.admission cluster.crds cluster.namespaces cluster.params cluster.storage:600"
+k_fixtures
+echo '{"items":[{"metadata":{"name":"stray-tls"}}]}' > "$KS/kube/edge-secrets.json"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
+case "$OUT" in *"the namespace portcullis-edge holds 1 Secrets: Traefik reads every Secret there"*"rc=1") t_pass "cluster setup: a Secret in the edge namespace (Traefik reads it) → refused" ;; *) t_fail "cluster setup edge secret: $OUT" ;; esac
 k_fixtures
 rm -rf "$CS_ROOT/secrets/kube"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; export STUB_APPLY_FAIL_MATCH=kube/admission/policies.yaml; kube_cluster_setup")"
@@ -4152,16 +4188,46 @@ expect_eq "sync: Secrets from secrets/ dirs (--from-file), portcullis-env, Confi
   "$(grep -cE 'create secret generic secrets-hub-lldap .*--from-file=|create secret generic portcullis-env .*--from-file=|create configmap certs-revocation .*--from-file=|create secret generic secrets-certs .*--from-file=' "$KS/kubectl-calls"):$(grep -rlE 'ROOT-TOKEN-XYZ|CA-KEY-SECRET' "$KS/kubectl-stdin" 2>/dev/null | wc -l | tr -d ' ')" "4:0"
 expect_eq "sync: the hub-proxy-secret Middleware from stdin (jq), its secret not on argv" \
   "$(grep -c '"X-Portcullis-Proxy-Secret": "HUB-PROXY-SECRET-555"' "$KS/kubectl-stdin"):$(grep -c 'HUB-PROXY-SECRET-555' "$KS/kubectl-calls" || true)" "1:0"
-# unchanged hash → no apply
-kt "$K15_ENV; kube_sync_secrets >/dev/null; _kube_applied_set_objects \"\$_K_HASHES\"" >/dev/null
-rm -f "$KS/kubectl-calls"
+# The live objects decide (no local cache): unchanged → nothing put; a hand
+# edit, a hand-added key or a deleted object → corrected; --full,
+# KUBE_SYNC_FULL=1 or an unreadable live list → every object put.
+k15_puts() { grep -c '^put .* \(Secret\|ConfigMap\)\.' "$KS/order" 2>/dev/null || true; }
+expect_eq "sync: the first run creates every object (no live one yet)" \
+  "$(grep -c '^put create Secret.portcullis-env$' "$KS/order"):$(grep -c '^put replace ' "$KS/order" || true)" "1:0"
+rm -f "$KS/order"
 kt "$K15_ENV; kube_sync_secrets" >/dev/null
-expect_eq "sync: unchanged hashes → no object applied again (only the hub-proxy-secret Middleware)" \
-  "$(grep -c 'create secret generic\|create configmap' "$KS/kubectl-calls" || true)" 0
+expect_eq "sync: live objects equal → none put again (only the hub-proxy-secret Middleware)" \
+  "$(k15_puts):$(grep -c '^put .* Middleware.hub-proxy-secret$' "$KS/order")" "0:1"
+jq '.data.password = "SEFDS0VE" | .data.extra = "eA=="' "$KS/live/Secret.secrets-hub-lldap.json" > "$KS/live.tmp" && mv "$KS/live.tmp" "$KS/live/Secret.secrets-hub-lldap.json"
+rm -f "$KS/live/ConfigMap.certs-revocation.json" "$KS/order"
+kt "$K15_ENV; kube_sync_secrets" >/dev/null
+expect_eq "sync: a live Secret changed by hand (value and an added key) is replaced as staged; a deleted ConfigMap is created; nothing else put" \
+  "$(grep -c '^put replace Secret.secrets-hub-lldap$' "$KS/order"):$(grep -c '^put create ConfigMap.certs-revocation$' "$KS/order"):$(k15_puts):$(jq -r '[.data.password, (.data | has("extra"))] | join(",")' "$KS/live/Secret.secrets-hub-lldap.json")" \
+  "1:1:2:$(printf 'SECRET-LLDAP-PW-123' | base64),false"
 printf 'CHANGED' > "$K15/secrets/hub/lldap/password"
-rm -f "$KS/kubectl-calls"
+rm -f "$KS/order"
 kt "$K15_ENV; kube_sync_secrets" >/dev/null
-expect_eq "sync: a changed file → only its object applied" "$(grep -c 'create secret generic\|create configmap' "$KS/kubectl-calls"):$(grep -c 'create secret generic secrets-hub-lldap' "$KS/kubectl-calls")" "1:1"
+expect_eq "sync: a changed file → only its object put" "$(k15_puts):$(grep -c '^put replace Secret.secrets-hub-lldap$' "$KS/order")" "1:1"
+N_OBJ="$(find "$KS/live" -name 'Secret.*' -o -name 'ConfigMap.*' | wc -l | tr -d ' ')"
+rm -f "$KS/order"
+kt "$K15_ENV; kube_sync_secrets --full" >/dev/null
+expect_eq "sync --full: every object put without comparing" "$(k15_puts)" "$N_OBJ"
+rm -f "$KS/order"
+kt "$K15_ENV; KUBE_SYNC_FULL=1 kube_sync_secrets" >/dev/null
+expect_eq "sync with KUBE_SYNC_FULL=1 (restore): every object put" "$(k15_puts)" "$N_OBJ"
+rm -f "$KS/order"
+OUT="$(kt "$K15_ENV; STUB_LIVE_LIST_FAIL=1 kube_sync_secrets" 2>&1)"
+case "$OUT" in *"can't list the live Secrets / ConfigMaps of portcullis: syncing every object"*"rc=0") t_pass "sync: an unreadable live list → every object put (warned)" ;; *) t_fail "sync live list failure: $OUT" ;; esac
+expect_eq "sync: an unreadable live list puts every object" "$(k15_puts)" "$N_OBJ"
+expect_eq "sync: the hub-proxy-secret Middleware lives in the edge namespace (Traefik's only one)" \
+  "$(jq -r '.metadata.namespace' "$KS/live/Middleware.hub-proxy-secret.json")" "portcullis-edge"
+expect_eq "sync: no secrets/kube/applied.json object cache is read or written" \
+  "$(grep -c 'objects' <(declare -f kube_sync_secrets _rtk_up) || true):$(jq -r 'has("objects")' "$K15/secrets/kube/applied.json" 2>/dev/null || echo none)" "0:none"
+expect_eq "restore: the Vault step and the whole restore force a full sync" \
+  "$(declare -f _kube_restore_vault | grep -c 'kube_sync_secrets --full'):$(declare -f _backup_restore_kube | grep -c 'export KUBE_SYNC_FULL=1')" "1:1"
+SH="$WORK/strip"; rm -rf "$SH"; mkdir -p "$SH/kube" "$SH/domains" "$SH/hub"; : > "$SH/kube/values.yaml"; : > "$SH/kube/applied.json"; : > "$SH/hub/core.env"
+_strip_host_files "$SH"
+expect_eq "backups / restores never carry secrets/kube (_strip_host_files)" "$(test -e "$SH/kube" && echo kept || echo gone):$(test -e "$SH/hub/core.env" && echo kept || echo gone)" "gone:kept"
 # values: no secret, every key; a missing required one refused
 k15_root
 OUT="$(kt "$K15_ENV; _K_IMAGES='{\"hub\":\"ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 1)\"}'; kube_render_values; jq -c '[.domain, .podCIDR, .apiEndpoints, .nodeAddresses, .traefikServiceIP, .entrypoints.web.admin, .vpn.reservedPools, .hub.selfImage | tostring]' \"$K15/secrets/kube/values.yaml\"")"
@@ -4181,14 +4247,14 @@ OUT="$(kt "$K15_ENV; PATH='$KS/bin2':\$PATH PORTCULLIS_KUBE_IMAGES=local KUBE_HU
 case "$OUT" in *"keycloak-abc Running restarts=4 is not ready; its last events:"*"BackOff: Back-off restarting failed container"*"rc=1") t_pass "rt_up kubernetes: helm timeout → kube_health_report (pods, restarts, last events)" ;; *) t_fail "rt_up helm failure: $OUT" ;; esac
 expect_eq "rt_up kubernetes: every K1 local image built and imported before helm runs" \
   "$(awk '/^docker build/ {b++} /^sudo k3s ctr -n k8s.io images import/ {i++} /^helm .*upgrade --install/ {print b ":" i; exit}' "$KS/order")" "5:5"
-expect_eq "rt_up kubernetes: helm failure → applied.json without objects, no digest cache" \
-  "$(jq -r 'has("objects")' "$K15/secrets/kube/applied.json" 2>/dev/null || echo none):$(test -e "$K15/secrets/kube/digests.json" && echo cached || echo none)" "false:none"
+expect_eq "rt_up kubernetes: helm failure → no digest cache" \
+  "$(test -e "$K15/secrets/kube/digests.json" && echo cached || echo none)" "none"
 expect_eq "rt_up kubernetes: helm upgrade --install --wait --timeout 10m --skip-crds on the context" \
   "$(grep -c '^--kube-context ci upgrade --install portcullis .* -n portcullis --skip-crds --wait --timeout 10m -f .*/secrets/kube/values.yaml' "$KS/helm-calls")" 1
 k_fixtures; k15_root
 OUT="$(kt "set -euo pipefail; $K15_ENV; _kube_registry_digest() { echo \"\${1%:*}@sha256:$(printf '%064d' 3)\"; }; kube_netpol_probe() { :; }; _rtk_up" </dev/null)"
-expect_eq "rt_up kubernetes (under the CLI's set -euo pipefail): success → applied.json objects and the digest cache" \
-  "$(printf '%s\n' "$OUT" | tail -n1):$(jq -r '.objects | has("portcullis-env")' "$K15/secrets/kube/applied.json"):$(jq -r '.hub' "$K15/secrets/kube/digests.json")" \
+expect_eq "rt_up kubernetes (under the CLI's set -euo pipefail): success → the objects live and the digest cache" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(test -e "$KS/live/Secret.portcullis-env.json" && echo true || echo false):$(jq -r '.hub' "$K15/secrets/kube/digests.json")" \
   "rc=0:true:ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 3)"
 # down never uninstalls
 k_fixtures; rm -f "$KS/order" "$KS/helm-calls"

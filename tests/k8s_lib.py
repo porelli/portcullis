@@ -14,6 +14,8 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 CHART = ROOT / "charts" / "portcullis"
 NS = "portcullis"
 APPS_NS = "portcullis-apps"
+EDGE_NS = "portcullis-edge"
+STORAGE_NS = "portcullis-storage"
 # Compose services with no Kubernetes form (the Roles replace them).
 ABSENT = {"socket-proxy-traefik", "socket-proxy-hub"}
 # Compose networks with no Kubernetes form.
