@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       jobs:
-        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn"
+        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s"
         type: string
         default: all
 
@@ -5129,3 +5129,84 @@ jobs:
             docker compose -p "$p" down -v 2>/dev/null || true
           done
           docker compose down -v
+
+  # Kubernetes end to end (spec § 10, Task 16): real k3s on the runner (the
+  # pin, sha256-checked, the § 6 flags, --node-external-ip for the netns
+  # client), never kind / k3d. A Docker phase first (the cross-runtime
+  # restore's backup, never an artifact), then init --runtime kubernetes
+  # with the K1 local images (the same-named Hub / Keycloak branches'
+  # included). Asserts (e2e-k3s-assert.sh, e2e_k3s.py): the probe, PSA
+  # restricted, kcinternal / Keycloak-only-from-Traefik, an app pod reaches
+  # no core service, :6443 or :10250, the client address through ServiceLB
+  # and status's --node-external-ip warning, PVC owners on the node and a
+  # Pending PVC without them, the admission guard by binding with the Hub's
+  # token and create-only pods/exec, revocation ≤ 10 s, the VPN port-bound
+  # rules, the Hub's instances (deploy / backup / restore / delete) and the
+  # fixer, vpn mode admin and the break-glass apps, the Docker → Kubernetes
+  # restore. Failure artifacts: logs and events only.
+  e2e-k3s:
+    needs: jobs-input
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-k3s,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-k3s ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-k3s,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-k3s ')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    env:
+      E2E_DOMAIN: portcullis.local
+      E2E_ARTIFACTS: e2e-artifacts
+      E2E_FOLDER: /srv/e2e-k3s
+      ACME_STAGING: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/keycloak-image
+      - name: Docker phase — init, one LLDAP person, backup, wipe
+        timeout-minutes: 30
+        run: bash .github/ci/e2e-k3s-phases.sh docker
+      - name: Install k3s (the pin, the § 6 flags, the netns client)
+        timeout-minutes: 10
+        run: bash .github/ci/e2e-k3s-install.sh --netns-client
+      - name: init --runtime kubernetes (K1 local images)
+        timeout-minutes: 30
+        run: bash .github/ci/e2e-k3s-phases.sh init
+      - name: Template source, the fixer's folder, a certificate to revoke
+        timeout-minutes: 10
+        run: bash .github/ci/e2e-k3s-phases.sh seed
+      - name: Kubernetes assertions (isolation, trust, PVC owners, admission, revocation, VPN rules)
+        timeout-minutes: 20
+        run: bash .github/ci/e2e-k3s-assert.sh
+      - name: The Hub on Kubernetes (e2e_k3s.py)
+        timeout-minutes: 30
+        run: bash .github/ci/e2e-k3s-phases.sh hub
+      - name: VPN on Kubernetes (vpn init, modes, break-glass)
+        timeout-minutes: 20
+        run: bash .github/ci/e2e-k3s-phases.sh vpn
+      - name: Docker → Kubernetes restore round trip
+        timeout-minutes: 30
+        run: bash .github/ci/e2e-k3s-phases.sh restore
+      - name: Collect logs and events
+        if: failure()
+        run: |
+          mkdir -p e2e-artifacts
+          for ns in portcullis portcullis-apps portcullis-storage; do
+            kubectl --context ci -n "$ns" get pods -o wide > "e2e-artifacts/$ns-pods.txt" 2>&1 || true
+            kubectl --context ci -n "$ns" get events --sort-by=.lastTimestamp > "e2e-artifacts/$ns-events.txt" 2>&1 || true
+            for d in $(kubectl --context ci -n "$ns" get deploy -o name 2>/dev/null); do
+              kubectl --context ci -n "$ns" logs "$d" --all-containers --tail=500 > "e2e-artifacts/$ns-${d#*/}.log" 2>&1 || true
+            done
+          done
+          sudo journalctl -u k3s --no-pager | tail -n 500 > e2e-artifacts/k3s.log 2>&1 || true
+      - name: Upload logs
+        timeout-minutes: 10
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-k3s-artifacts
+          path: e2e-artifacts/
+          retention-days: 7
