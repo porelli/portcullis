@@ -232,6 +232,7 @@ type config struct {
 	People                         bool
 	Port                           int
 	Subnet                         netip.Prefix
+	AddrMode                       string     // docker (separate networks) | pod (Kubernetes: one pod address)
 	VPNAddr                        netip.Addr // portcullis-vpn: the edge ports gateways connect to
 	EdgeAddr                       netip.Addr // portcullis-vpn-edge: the only source Traefik trusts PROXY from
 	Traefik                        netip.AddrPort
@@ -305,13 +306,31 @@ func loadConfig(getenv func(string) string) (*config, error) {
 		return nil, errors.New("WG_SUBNET must be an IPv4 network between /8 and /30")
 	}
 	c.Subnet = sn
+	// WG_ADDR_MODE (K7): docker (the default) — the edge ports, the PROXY
+	// source and the metrics each on their own network, so their addresses
+	// must differ; pod (Kubernetes) — one pod address for every role, kept
+	// apart by NetworkPolicies, so WG_VPN_ADDR and WG_EDGE_ADDR are both the
+	// pod's IP and must be equal. Anything else refuses the start.
+	switch m := envOr(getenv, "WG_ADDR_MODE", "docker"); m {
+	case "docker", "pod":
+		c.AddrMode = m
+	default:
+		return nil, errors.New("WG_ADDR_MODE must be docker or pod")
+	}
 	a, err := netip.ParseAddr(getenv("WG_VPN_ADDR"))
 	if err != nil || !a.Is4() {
+		if c.AddrMode == "pod" {
+			return nil, errors.New("WG_VPN_ADDR must be the pod's IPv4 address (WG_ADDR_MODE=pod)")
+		}
 		return nil, errors.New("WG_VPN_ADDR must be wg's IPv4 address on portcullis-vpn")
 	}
 	c.VPNAddr = a
 	ea, err := netip.ParseAddr(getenv("WG_EDGE_ADDR"))
-	if err != nil || !ea.Is4() || ea == a {
+	if c.AddrMode == "pod" {
+		if err != nil || ea != a {
+			return nil, errors.New("WG_EDGE_ADDR must be the pod's IPv4 address, = WG_VPN_ADDR (WG_ADDR_MODE=pod)")
+		}
+	} else if err != nil || !ea.Is4() || ea == a {
 		return nil, errors.New("WG_EDGE_ADDR must be wg's IPv4 address on portcullis-vpn-edge (not its portcullis-vpn one)")
 	}
 	c.EdgeAddr = ea
@@ -401,6 +420,17 @@ func metricsAddr(hostport string, lookup func(string) ([]netip.Addr, error), loc
 		}
 	}
 	return netip.AddrPort{}, fmt.Errorf("%s isn't an address of this container", h)
+}
+
+// metricsNever — the addresses metrics may not bind to: the portcullis-vpn
+// and edge ones under docker (gateways sit there); none under pod mode,
+// where the pod has one address and only Prometheus may reach :9100 (its
+// NetworkPolicy).
+func metricsNever(cfg *config) []netip.Addr {
+	if cfg.AddrMode == "pod" {
+		return nil
+	}
+	return []netip.Addr{cfg.VPNAddr, cfg.EdgeAddr}
 }
 
 func localAddrs() []netip.Addr {
@@ -590,7 +620,7 @@ func serveMetrics(ctx context.Context, cfg *config, reg *prometheus.Registry) {
 	var addr netip.AddrPort
 	var err error
 	for i := 0; i < 30; i++ {
-		addr, err = metricsAddr(cfg.Metrics, lookupIPs, localAddrs(), cfg.VPNAddr, cfg.EdgeAddr)
+		addr, err = metricsAddr(cfg.Metrics, lookupIPs, localAddrs(), metricsNever(cfg)...)
 		if err == nil {
 			break
 		}

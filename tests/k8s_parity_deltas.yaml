@@ -1,0 +1,53 @@
+# Reviewed differences between charts/portcullis and docker-compose.yml
+# (tests/k8s_parity.py). Every entry needs a reason; one that no longer
+# applies fails the check. Kinds: user, caps, env-missing, env-extra, mount,
+# bind, tmpfs-mode.
+
+user:
+  # compose has no `user:` (the image's USER); restricted PSA needs the
+  # numeric ids in the pod spec. Values are the images' own users.
+  - {service: enroll, item: "10002:10002", reason: "the image's USER 10002:10002 (enroll/Dockerfile), stated for runAsNonRoot"}
+  - {service: hub, item: "10001:10001", reason: "the image's USER 10001:10001, stated for runAsNonRoot"}
+  - {service: forward-auth, item: "65532:65532", reason: "distroless nonroot (65532), stated for runAsNonRoot"}
+  - {service: forward-auth-ext, item: "65532:65532", reason: "distroless nonroot (65532), stated for runAsNonRoot"}
+  - {service: lldap, item: "1000:1000", reason: "the -rootless image's lldap user (CT_UID_LLDAP), stated for runAsNonRoot"}
+  - {service: keycloak, item: "1000:0", reason: "the Keycloak image's user 1000, group 0 (its files are group 0)"}
+  - {service: traefik, item: "65532:65532", reason: "spec §5: Traefik runs non-root (65532) on :8000/:8443 behind the LoadBalancer; on Docker it is root binding :80/:443"}
+
+caps:
+  - {service: traefik, item: "NET_BIND_SERVICE->", reason: "non-root on :8000/:8443 needs no capability (the LoadBalancer maps 80/443)"}
+
+env-missing:
+  - {service: traefik, item: TRAEFIK_PROVIDERS_DOCKER, reason: "the docker provider is replaced by kubernetesCRD (spec §5)"}
+  - {service: traefik, item: TRAEFIK_PROVIDERS_DOCKER_ENDPOINT, reason: "no socket proxy on Kubernetes: Traefik's Roles replace it"}
+  - {service: traefik, item: TRAEFIK_PROVIDERS_DOCKER_EXPOSEDBYDEFAULT, reason: "docker provider only"}
+  - {service: traefik, item: TRAEFIK_PROVIDERS_DOCKER_NETWORK, reason: "docker provider only"}
+  - {service: hub, item: DOCKER_HOST, reason: "no engine on Kubernetes: the Hub uses its in-cluster ServiceAccount (HUB_CONTAINER_RUNTIME=kubernetes)"}
+
+env-extra:
+  - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD, reason: "spec §5: the kubernetesCRD provider"}
+  - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES, reason: "spec §5: exactly the core and the apps namespace"}
+  - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE, reason: "spec §5: false"}
+  - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWEXTERNALNAMESERVICES, reason: "spec §5: false"}
+  - {service: traefik, item: TRAEFIK_ENTRYPOINTS_KCINTERNAL_ADDRESS, reason: "kcinternal :8081 (K15): internal Keycloak clients through Traefik"}
+  - {service: traefik, item: TRAEFIK_ENTRYPOINTS_KCINTERNAL_HTTP_ALIASHEADERSSTRATEGY, reason: "kcinternal deletes header aliases like websecure / vpnsecure (K-P10)"}
+  - {service: traefik, item: TRAEFIK_ENTRYPOINTS_KCINTERNAL_HTTP_MIDDLEWARES, reason: "strip-client-forwarded@file first on kcinternal too (K-P10)"}
+  - {service: traefik, item: TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_PORT, reason: "web listens on :8000 behind port 80: the redirect names the public 443, not :8443"}
+  - {service: traefik, item: TRAEFIK_ACCESSLOG_FORMAT, reason: "JSON access log: e2e-k3s asserts the client address (ClientHost) through ServiceLB"}
+  - {service: hub, item: HUB_SELF_IMAGE, reason: "contract §6: the Hub's own digest, its helper pods' image"}
+  - {service: hub, item: HUB_APPS_NAMESPACE, reason: "contract §6: the namespace the Hub's Role covers"}
+  - {service: wg, item: WG_ADDR_MODE, reason: "K7: pod — one pod address for every role"}
+  - {service: wg, item: WG_POD_IP, reason: "K7: the Downward API status.podIP behind WG_VPN_ADDR / WG_EDGE_ADDR / WG_METRICS"}
+
+bind:
+  - {service: hub, item: /project, reason: "no checkout on Kubernetes: an emptyDir that holds core.env (Secret, subPath) and the group-gate map (ConfigMap); everything else under /project was masked on Docker anyway"}
+  - {service: hub, item: /project/templates, reason: "the kube backend delivers template files as ConfigMaps (tpl-<id>-<hash>): the Hub's own scratch emptyDir"}
+  - {service: hub, item: /project/appfiles, reason: "data files are ConfigMaps / Secrets per instance (contract §13.7): the Hub's own scratch emptyDir"}
+
+mount:
+  - {service: hub, item: /project/secrets, reason: "a tmpfs mask over the checkout's secrets/ on Docker; /project holds no secrets/ on Kubernetes"}
+  - {service: hub, item: /project/backups, reason: "a tmpfs mask over the checkout's backups/ on Docker; nothing to mask on Kubernetes"}
+
+tmpfs-mode:
+  - {service: hub, item: /home/hub, reason: "K-P25: emptyDir has no mode (it is 0777); only uid 10001 runs in the pod"}
+  - {service: postgres, item: /var/run/postgresql, reason: "K-P25: emptyDir has no mode (it is 0777, compose's 1777 without the sticky bit); only uid 70 runs in the pod"}

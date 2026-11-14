@@ -157,6 +157,14 @@ jobs:
         run: /tmp/k8s-venv/bin/python scripts/gen-images-yaml.py --check
       - name: CLI argument parsing tests
         run: PATH="/tmp/k8s-venv/bin:$PATH" bash tests/test_cli.sh
+      # charts/portcullis (Task 13): helm lint, kubeconform -strict (pinned
+      # schemas + Traefik CRDs), parity with compose, the NetworkPolicy
+      # matrix, the hardening baseline, the Hub's byte copies (K13).
+      - name: Kubernetes chart static checks
+        timeout-minutes: 10
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: bash .github/ci/unit-tests-kube-static.sh
       - name: shell library tests (.env, proxy network, revocation sync, pki setup)
         run: bash tests/test_shell_libs.sh
       # group-gate's own pins (group-gate/requirements.txt, hashes), the same

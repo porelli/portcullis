@@ -1,0 +1,12 @@
+apiVersion: v2
+name: portcullis
+description: >-
+  Portcullis core on a single-node k3s (CONTAINER_RUNTIME=kubernetes): the
+  services of docker-compose.yml as Deployments, PSA restricted, every path a
+  NetworkPolicy derived from the compose networks. Driven only by
+  ./portcullis (values from secrets/kube/values.yaml, Secrets and ConfigMaps
+  synced from secrets/ and the checkout; the chart generates no secret).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.32.0-0"

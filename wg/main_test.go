@@ -183,6 +183,55 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil || !c.People || c.Mode != "server" || c.Metrics != "" {
 		t.Fatalf("%+v %v", c, err)
 	}
+	if c, err := loadConfig(get(map[string]string{"WG_ADDR_MODE": "docker"})); err != nil || c.AddrMode != "docker" {
+		t.Fatalf("WG_ADDR_MODE=docker: %+v %v", c, err)
+	}
+}
+
+// TestLoadConfigPodMode (K7): on Kubernetes every role shares the pod's one
+// address (isolation is the NetworkPolicies'): WG_ADDR_MODE=pod accepts
+// WG_VPN_ADDR = WG_EDGE_ADDR, requires them equal, and any other mode but
+// docker refuses the start; docker keeps every separate-address check.
+func TestLoadConfigPodMode(t *testing.T) {
+	pod := map[string]string{
+		"WG_ADDR_MODE": "pod", "WG_VPN_ADDR": "10.42.0.17", "WG_EDGE_ADDR": "10.42.0.17",
+		"WG_TRAEFIK": "10.43.0.21:8444", "WG_DOMAIN": "example.org", "WG_METRICS": "10.42.0.17:9100",
+	}
+	get := func(over map[string]string) func(string) string {
+		return func(k string) string {
+			if v, ok := over[k]; ok {
+				return v
+			}
+			return pod[k]
+		}
+	}
+	c, err := loadConfig(get(nil))
+	if err != nil || c.AddrMode != "pod" || c.VPNAddr != c.EdgeAddr || c.VPNAddr != netip.MustParseAddr("10.42.0.17") || c.Metrics != "10.42.0.17:9100" {
+		t.Fatalf("pod mode: %+v %v", c, err)
+	}
+	for name, over := range map[string]map[string]string{
+		"pod: addresses differ": {"WG_EDGE_ADDR": "10.42.0.18"},
+		"pod: no address":       {"WG_VPN_ADDR": "", "WG_EDGE_ADDR": ""},
+		"pod: v6 address":       {"WG_VPN_ADDR": "fd00::1", "WG_EDGE_ADDR": "fd00::1"},
+		"unknown mode":          {"WG_ADDR_MODE": "host"},
+		"empty-ish mode":        {"WG_ADDR_MODE": "Pod"},
+		"docker: one address":   {"WG_ADDR_MODE": "docker"},
+	} {
+		if _, err := loadConfig(get(over)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	// Metrics on the pod address: allowed in pod mode only.
+	ip := netip.MustParseAddr("10.42.0.17")
+	local := []netip.Addr{netip.MustParseAddr("127.0.0.1"), ip}
+	look := func(string) ([]netip.Addr, error) { return []netip.Addr{ip}, nil }
+	if a, err := metricsAddr("10.42.0.17:9100", look, local, metricsNever(c)...); err != nil || a.String() != "10.42.0.17:9100" {
+		t.Fatalf("pod metrics: %v %v", a, err)
+	}
+	d := &config{AddrMode: "docker", VPNAddr: ip, EdgeAddr: netip.MustParseAddr("10.42.0.18")}
+	if _, err := metricsAddr("10.42.0.17:9100", look, local, metricsNever(d)...); err == nil {
+		t.Fatal("docker mode: metrics on the VPN address accepted")
+	}
 }
 
 // TestMetricsAddr (V23): metrics bind to the address the portcullis-only

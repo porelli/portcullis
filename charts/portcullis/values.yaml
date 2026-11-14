@@ -1,0 +1,146 @@
+# Values of the core chart. ./portcullis writes every one of them from .env
+# into secrets/kube/values.yaml (kube_render_values; no secret ever: those
+# are Secrets synced from secrets/ and .env). The keys marked required have
+# no usable default: the chart refuses to render without them (`required`
+# replaces compose's ${VAR:?}).
+
+# Required: PORTCULLIS_DOMAIN.
+domain: ""
+# The cluster's networks (.env, detected at init and re-checked every run).
+podCIDR: ""
+serviceCIDR: ""
+# The kube API (default/kubernetes EndpointSlice): ip:port, the only
+# addresses the Hub and Traefik may reach on it.
+apiEndpoints: []
+# Fixed ClusterIPs in the service CIDR's static band (network + 20/21/22).
+traefikServiceIP: ""
+traefikVPNServiceIP: ""
+wgEdgeServiceIP: ""
+# The node addresses (InternalIP / ExternalIP): app egress excludes them,
+# except 80/443 (the hairpin to auth.<domain>).
+nodeAddresses: []
+
+# Every image by digest only (name@sha256:...): images.yaml's third-party
+# refs and the tag refs the CLI resolved (K1). Required per rendered service.
+images: {}
+
+# The containers' uids / gids (common.sh CT_*).
+uids:
+  traefik: 65532
+  postgres: 70
+  vault: 100
+  vaultGroup: 1000
+  lldap: 1000
+  keycloak: 1000
+  sessions: 999
+  sessionsGroup: 1000
+  oauth2proxy: 65532
+  groupGate: 10003
+  hub: 10001
+  enroll: 10002
+  domains: 10004
+  mcpGate: 10005
+  wg: 10006
+  vpnDoc: 10007
+  nobody: 65534
+  grafana: 472
+
+# Compose profiles (COMPOSE_PROFILES): the same switches as on Docker.
+monitoring:
+  enabled: false
+  prometheusRetention: 30d
+
+wg:
+  enabled: false
+  builtin: "off"
+  subnet: 10.213.0.0/22
+  dnsUpstream: 1.1.1.1,9.9.9.9
+  people:
+    port: 51820
+  # Contract §16 defaults.
+  edge:
+    maxPerProvider: 1024
+    maxPerUser: 128
+    maxPerClient: 32
+    pressurePercent: 90
+    pressureIdle: 2m
+
+vpn:
+  mode: apps
+  publicEnrol: "true"
+  # Ranges no VPN provider may claim on top of compose's fixed core subnets:
+  # the pod and the service CIDR (K-P11).
+  reservedPools: ""
+  # compose's fixed core subnets, as WG_CORE_SUBNETS / GATE_CORE_SUBNETS
+  # list them (network.sh vpn_reserved_ranges' fixed part).
+  coreSubnets: "172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28"
+
+# The six entrypoint classes (.env PORTCULLIS_EP_* / PORTCULLIS_WEB_*,
+# written by ./portcullis vpn mode): comma-separated entrypoint lists.
+entrypoints:
+  ep:
+    core: websecure,vpnsecure
+    admin: websecure,vpnsecure
+    enrol: websecure,vpnsecure
+  web:
+    core: websecure
+    admin: websecure
+    enrol: websecure
+
+acme:
+  email: ""
+  caServer: https://acme-v02.api.letsencrypt.org/directory
+  dnsProvider: cloudflare
+  cfApiEmail: ""
+  gceProject: ""
+
+dns:
+  caa: "true"
+  caaIssuer: ""
+  caaIodef: ""
+
+keycloak:
+  admin: admin
+
+lldap:
+  baseDN: dc=portcullis,dc=local
+
+hub:
+  bindRoots: ""
+  invitesProtectedGroups: ""
+  portalDisplayName: Portcullis
+  clientCertTTL: 720h
+  certExpiryWarnDays: "7"
+  impersonationMaxMinutes: "30"
+  # The Hub's own image by digest (= images.hub), the helper pods' image.
+  selfImage: ""
+  appsNamespace: portcullis-apps
+
+alerting:
+  smtpFrom: ""
+
+# Content hashes of every synced ConfigMap / Secret (secrets/kube/applied.json):
+# pods carry portcullis.io/config-hash over the ones they mount, so a
+# change rolls them.
+hashes: {}
+
+# Nested host directories synced as one ConfigMap each, keys = the
+# relative path with "/" → "__": the items that rebuild the tree.
+configItems:
+  keycloakTheme: []
+  vault: []
+  prometheus: []
+  grafanaProvisioning: []
+  grafanaDashboards: []
+  textfile: []
+
+# Only for kubeconform in CI: ./portcullis init applies the namespaces
+# itself (labels, PSA, ownership, K11), never Helm.
+renderNamespaces: false
+installID: ""
+appsNamespace: portcullis-apps
+storageNamespace: portcullis-storage
+
+# rt_run (K16): the one-shot to render (templates/oneshot.yaml), set by
+# ./portcullis only with helm template --show-only.
+oneshot: ""
