@@ -128,11 +128,13 @@ invite_create() {
   printf '%s' "$out"
 }
 
-# The credentials `invite --replace-keys` deletes: every passkey kind.
-INVITE_PASSKEY_TYPES_JQ='.[]? | select(.type | IN("webauthn", "webauthn-passwordless", "portcullis-device-passkey", "portcullis-security-key")) | .id'
+# The credentials `invite --replace-keys` deletes: every passkey kind and
+# every authenticator app (`otp`: a lost phone is a lost second factor too).
+INVITE_PASSKEY_TYPES_JQ='.[]? | select(.type | IN("webauthn", "webauthn-passwordless", "portcullis-device-passkey", "portcullis-security-key", "otp")) | .id'
 
-# invite_replace_keys <user> — delete the user's passkeys / security keys
-# in Keycloak and end their sessions (lost or stolen key), before a new link.
+# invite_replace_keys <user> — delete the user's passkeys, security keys and
+# authenticator apps in Keycloak and end their sessions (lost or stolen key
+# or phone), before a new link. The password stays.
 invite_replace_keys() {
   local user="$1" uid cid code n=0
   require_cmd curl
@@ -140,14 +142,14 @@ invite_replace_keys() {
   uid="$(kc_get "/$KC_REALM/users?username=$(jq -rn --arg u "$user" '$u|@uri')&exact=true" | jq -r '.[0].id // empty')"
   [ -n "$uid" ] || fail "$user is not known to Keycloak (no such LLDAP user?)"
   # Every passkey kind (contract §8.1 "Methods"): the stock types and the
-  # extension's device-bound / security-key types.
+  # extension's device-bound / security-key types; and `otp` (totp).
   for cid in $(kc_get "/$KC_REALM/users/$uid/credentials" | jq -r "$INVITE_PASSKEY_TYPES_JQ"); do
     code="$(kc_send DELETE "/$KC_REALM/users/$uid/credentials/$cid" < /dev/null)"
     [ "$code" = 204 ] || fail "could not delete a key of $user (HTTP $code)"
     n=$((n + 1))
   done
   code="$(kc_send POST "/$KC_REALM/users/$uid/logout" < /dev/null)"
-  _kc_report "$user: removed $n key(s), signed out everywhere" "$code" 204 || fail "could not sign $user out"
+  _kc_report "$user: removed $n key(s) and authenticator app(s), signed out everywhere" "$code" 204 || fail "could not sign $user out"
 }
 
 help_invite() {
@@ -167,8 +169,9 @@ refuses invites for `admin`; only the server can issue them.
   --to             where to land afterwards: hub (https://hub.<domain>/),
                    portal (https://<domain>/, default) or an https URL on
                    the domain
-  --replace-keys   lost / stolen key: first delete ALL of the user's passkeys
-                   and security keys in Keycloak and sign them out everywhere.
+  --replace-keys   lost / stolen key: first delete ALL of the user's passkeys,
+                   security keys and authenticator apps in Keycloak and sign
+                   them out everywhere.
                    Without it the new key is added next to the old ones (a
                    spare key); the old ones keep working.
   --json           print enroll's JSON ({"url","expires_at"})

@@ -100,18 +100,24 @@ var inviteTokenRe = regexp.MustCompile(inviteTokenPattern)
 // invite must never hand over an administrator, so the user's groups are
 // checked again at every later step (the user may have been added to
 // lldap_admin after the invite was created).
+//
+// Authenticator: the Hub asked for the authenticator-app step too (only an
+// API invite; the server's CLI never sets it): the redeem adds
+// CONFIGURE_TOTP after the passkey action.
 type invite struct {
-	User       string
-	Landing    string
-	Expires    time.Time
-	APICreated bool
+	User          string
+	Landing       string
+	Expires       time.Time
+	APICreated    bool
+	Authenticator bool
 }
 
 type redemption struct {
-	User       string
-	Landing    string
-	Expires    time.Time
-	APICreated bool
+	User          string
+	Landing       string
+	Expires       time.Time
+	APICreated    bool
+	Authenticator bool
 }
 
 type authCode struct {
@@ -140,6 +146,9 @@ type inviteService struct {
 	protectedGroups map[string]bool
 	// requirePasskey adds webauthn-register-passwordless to the Keycloak user.
 	requirePasskey func(string) error
+	// requireTotp adds CONFIGURE_TOTP to the Keycloak user (an invite with
+	// Authenticator, after requirePasskey); nil = such invites are refused.
+	requireTotp func(string) error
 	// listCertificates lists the issued client certificates of both
 	// mounts with their revocation state (GET /internal/certificates,
 	// contract §9.4).
@@ -162,14 +171,14 @@ type inviteService struct {
 	kid string
 }
 
-func newInviteService(domain, clientSecret, apiSecret string, lookupUser func(string) (*User, error), requirePasskey func(string) error) (*inviteService, error) {
+func newInviteService(domain, clientSecret, apiSecret string, lookupUser func(string) (*User, error), requirePasskey, requireTotp func(string) error) (*inviteService, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
 	}
 	return &inviteService{
 		domain: domain, clientSecret: clientSecret, apiSecret: apiSecret, lookupUser: lookupUser,
-		requirePasskey: requirePasskey, now: time.Now,
+		requirePasskey: requirePasskey, requireTotp: requireTotp, now: time.Now,
 		invites: map[string]*invite{}, redemptions: map[string]*redemption{},
 		codes: map[string]*authCode{}, fails: map[string][]time.Time{},
 		key: key, kid: randomToken(9),
@@ -251,11 +260,25 @@ func (s *inviteService) fail(ip string) {
 	s.fails[ip] = append(s.fails[ip], s.now())
 }
 
+// inviteOptions are a Hub invite's options (POST /internal/invites).
+type inviteOptions struct {
+	// Authenticator: also set up an authenticator app (CONFIGURE_TOTP on
+	// redeem, after the passkey). Never from the loopback (CLI) path.
+	Authenticator bool
+}
+
+// errAuthenticatorCLI: the loopback path never asks for the authenticator
+// step (the Hub's invite does, contract §9.4).
+var errAuthenticatorCLI = errors.New("the authenticator-app step is only for setup links made in the Hub")
+
 // Create registers a new invite and returns its token. allowAdmin is true
 // only for the loopback (docker exec) path.
-func (s *inviteService) Create(user, landing string, ttl time.Duration, allowAdmin bool) (string, time.Time, error) {
+func (s *inviteService) Create(user, landing string, ttl time.Duration, allowAdmin bool, opt inviteOptions) (string, time.Time, error) {
 	if user == hubServiceAccount || (user == bootstrapAdmin && !allowAdmin) {
 		return "", time.Time{}, errProtected
+	}
+	if opt.Authenticator && (allowAdmin || s.requireTotp == nil) {
+		return "", time.Time{}, errAuthenticatorCLI
 	}
 	if !allowAdmin {
 		if err := s.checkNotProtected(user, "create"); err != nil {
@@ -289,9 +312,11 @@ func (s *inviteService) Create(user, landing string, ttl time.Duration, allowAdm
 			revoked++
 		}
 	}
-	s.invites[hashKey(token)] = &invite{User: u.Username, Landing: landing, Expires: exp, APICreated: !allowAdmin}
+	s.invites[hashKey(token)] = &invite{User: u.Username, Landing: landing, Expires: exp, APICreated: !allowAdmin,
+		Authenticator: opt.Authenticator}
 	s.mu.Unlock()
-	log.Printf("INVITE created user=%s expires=%s landing=%s revoked=%d", u.Username, exp.UTC().Format(time.RFC3339), landing, revoked)
+	log.Printf("INVITE created user=%s expires=%s landing=%s authenticator=%t revoked=%d", u.Username,
+		exp.UTC().Format(time.RFC3339), landing, opt.Authenticator, revoked)
 	return token, exp, nil
 }
 
@@ -461,8 +486,18 @@ func (s *inviteService) handleRedeem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// Keycloak first: if it is down the link stays usable.
-	if err := s.requirePasskey(inv.User); err != nil {
+	// Keycloak first: if it is down the link stays usable. The
+	// authenticator step only after the passkey's, and a failure of either
+	// leaves the link unused (P35); both actions are added once.
+	err := s.requirePasskey(inv.User)
+	if err == nil && inv.Authenticator {
+		if s.requireTotp == nil {
+			err = errAuthenticatorCLI
+		} else {
+			err = s.requireTotp(inv.User)
+		}
+	}
+	if err != nil {
 		log.Printf("INVITE redeem failed user=%s: keycloak: %v", inv.User, err)
 		s.page(w, http.StatusServiceUnavailable, map[string]any{
 			"Error": "The sign-in service is not reachable right now. Try the same link again in a minute.",
@@ -475,13 +510,14 @@ func (s *inviteService) handleRedeem(w http.ResponseWriter, r *http.Request) {
 	}
 	cookie := randomToken(32)
 	s.mu.Lock()
-	s.redemptions[hashKey(cookie)] = &redemption{User: inv.User, Landing: inv.Landing, Expires: s.now().Add(redemptionTTL), APICreated: inv.APICreated}
+	s.redemptions[hashKey(cookie)] = &redemption{User: inv.User, Landing: inv.Landing, Expires: s.now().Add(redemptionTTL),
+		APICreated: inv.APICreated, Authenticator: inv.Authenticator}
 	s.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{
 		Name: inviteCookie, Value: cookie, Path: "/invite/", MaxAge: int(redemptionTTL.Seconds()),
 		Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,
 	})
-	log.Printf("INVITE redeemed user=%s ip=%s", inv.User, ip)
+	log.Printf("INVITE redeemed user=%s ip=%s authenticator=%t", inv.User, ip, inv.Authenticator)
 	q := url.Values{
 		"rd":          {inv.Landing},
 		"kc_idp_hint": {inviteIdPAlias},
@@ -632,10 +668,13 @@ func (s *inviteService) handleJWKS(w http.ResponseWriter, _ *http.Request) {
 	}}})
 }
 
+// inviteRequest is POST /internal/invites' body, strict (P13): exactly
+// these keys, anything else is a 400. The CLI never sends authenticator.
 type inviteRequest struct {
-	Username string `json:"username"`
-	TTL      string `json:"ttl,omitempty"`
-	Landing  string `json:"landing,omitempty"`
+	Username      string `json:"username"`
+	TTL           string `json:"ttl,omitempty"`
+	Landing       string `json:"landing,omitempty"`
+	Authenticator bool   `json:"authenticator,omitempty"`
 }
 
 func jsonError(w http.ResponseWriter, status int, msg string) {
@@ -719,8 +758,10 @@ func (s *inviteService) handleAPICreate(local bool) http.HandlerFunc {
 			return
 		}
 		var req inviteRequest
-		if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil {
-			jsonError(w, http.StatusBadRequest, "body must be JSON {\"username\": \"...\"}")
+		dec := json.NewDecoder(io.LimitReader(r.Body, 4096))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil || dec.More() {
+			jsonError(w, http.StatusBadRequest, "body must be JSON {\"username\", \"ttl\", \"landing\", \"authenticator\"}")
 			return
 		}
 		var ttl time.Duration
@@ -732,7 +773,8 @@ func (s *inviteService) handleAPICreate(local bool) http.HandlerFunc {
 			}
 			ttl = d
 		}
-		token, exp, err := s.Create(strings.TrimSpace(req.Username), req.Landing, ttl, local)
+		token, exp, err := s.Create(strings.TrimSpace(req.Username), req.Landing, ttl, local,
+			inviteOptions{Authenticator: req.Authenticator})
 		switch {
 		case errors.Is(err, errProtected):
 			jsonError(w, http.StatusConflict, err.Error())
@@ -804,8 +846,7 @@ func runInviteCommand(args []string) int {
 		fmt.Fprintln(os.Stderr, "usage: enroll invite <user> [-ttl 24h] [-landing https://...]")
 		return 2
 	}
-	body, _ := json.Marshal(inviteRequest{Username: user, TTL: *ttl, Landing: *landing})
-	resp, err := http.Post("http://"+inviteLocalAddr+"/internal/invites", "application/json", bytes.NewReader(body))
+	resp, err := http.Post("http://"+inviteLocalAddr+"/internal/invites", "application/json", bytes.NewReader(inviteCommandBody(user, *ttl, *landing)))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "enroll is not running in this container:", err)
 		return 1
@@ -818,6 +859,13 @@ func runInviteCommand(args []string) int {
 	}
 	os.Stdout.Write(out)
 	return 0
+}
+
+// inviteCommandBody is the CLI's POST /internal/invites body: never the
+// authenticator option (TestCLINeverAuthenticator).
+func inviteCommandBody(user, ttl, landing string) []byte {
+	body, _ := json.Marshal(inviteRequest{Username: user, TTL: ttl, Landing: landing})
+	return body
 }
 
 var errNoSecret = errors.New("invite client secret not configured")

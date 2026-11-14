@@ -16,13 +16,21 @@ PRE_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8
   --data-urlencode grant_type=password --data-urlencode password@- | jq -r .access_token)
 [ -n "$PRE_TOKEN" ] && [ "$PRE_TOKEN" != null ] || { echo "FAIL: admin token for the passkey-policy drift check"; exit 1; }
 echo "::add-mask::$PRE_TOKEN"
-echo '{"webAuthnPolicyPasswordlessRpEntityName": "Portcullis", "webAuthnPolicyPasswordlessAttestationConveyancePreference": "none", "webAuthnPolicyPasswordlessAuthenticatorAttachment": "cross-platform"}' \
+# Likewise the OTP policy (8 digits, codes reusable) and a CONFIGURE_TOTP
+# without its max_auth_age: configure puts both back (contract §8.1).
+echo '{"webAuthnPolicyPasswordlessRpEntityName": "Portcullis", "webAuthnPolicyPasswordlessAttestationConveyancePreference": "none", "webAuthnPolicyPasswordlessAuthenticatorAttachment": "cross-platform", "otpPolicyDigits": 8, "otpPolicyCodeReusable": true}' \
   | curl -sf -X PUT -H @<(printf 'Authorization: Bearer %s\n' "$PRE_TOKEN") -H 'Content-Type: application/json' --data-binary @- \
     http://127.0.0.1:8080/admin/realms/portcullis \
   || { echo "FAIL: drifting the passkey policy"; exit 1; }
 curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$PRE_TOKEN") http://127.0.0.1:8080/admin/realms/portcullis \
   | jq -e '.webAuthnPolicyPasswordlessAttestationConveyancePreference == "none"' >/dev/null \
   || { echo "FAIL: the drift didn't take (the check would prove nothing)"; exit 1; }
+echo '{"config": {}}' | curl -sf -X PUT -H @<(printf 'Authorization: Bearer %s\n' "$PRE_TOKEN") -H 'Content-Type: application/json' --data-binary @- \
+    http://127.0.0.1:8080/admin/realms/portcullis/authentication/required-actions/CONFIGURE_TOTP/config \
+  || { echo "FAIL: clearing CONFIGURE_TOTP's config"; exit 1; }
+curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$PRE_TOKEN") http://127.0.0.1:8080/admin/realms/portcullis \
+  | jq -e '.otpPolicyDigits == 8 and .otpPolicyCodeReusable' >/dev/null \
+  || { echo "FAIL: the OTP drift didn't take (the check would prove nothing)"; exit 1; }
 unset PRE_TOKEN
 OUT=$(./portcullis keycloak configure)
 echo "$OUT" | grep -c "up to date" | grep -qx 3 || { echo "FAIL: flows rebuilt on a second configure"; echo "$OUT"; exit 1; }
@@ -70,6 +78,23 @@ kc /events/config | jq -e '.eventsEnabled and ((.enabledEventTypes | sort) == ["
 kc /authentication/required-actions | jq -e '[.[] | select(.alias | startswith("webauthn-register")) | [.alias, .enabled]] | sort
     == [["webauthn-register", false], ["webauthn-register-passwordless", true]]' >/dev/null \
   || { echo "FAIL: required actions: webauthn-register-passwordless on, the two-factor webauthn-register off"; exit 1; }
+# Authenticator-app codes (contract §8.1): the policy every common app
+# computes, both required actions on with a 5-minute sign-in, as configure
+# put them back after the drift above.
+kc "" | jq -e '[.otpPolicyType, .otpPolicyAlgorithm, .otpPolicyDigits, .otpPolicyPeriod, .otpPolicyLookAheadWindow, .otpPolicyCodeReusable, .otpPolicyInitialCounter]
+    == ["totp", "HmacSHA1", 6, 30, 1, false, 0]' >/dev/null \
+  || { echo "FAIL: realm OTP policy: $(kc "" | jq -c 'with_entries(select(.key | startswith("otpPolicy")))')"; exit 1; }
+for ra in CONFIGURE_TOTP:85 delete_credential:100; do
+  kc "/authentication/required-actions/${ra%%:*}" | jq -e --argjson p "${ra#*:}" '.enabled and (.defaultAction | not) and .priority == $p' >/dev/null \
+    || { echo "FAIL: required action ${ra%%:*}: $(kc "/authentication/required-actions/${ra%%:*}" | jq -c .)"; exit 1; }
+  kc "/authentication/required-actions/${ra%%:*}/config" | jq -e '.config.max_auth_age == "300"' >/dev/null \
+    || { echo "FAIL: required action ${ra%%:*} config: $(kc "/authentication/required-actions/${ra%%:*}/config" | jq -c .)"; exit 1; }
+done
+# The override is the extension's (server info: portcullis: totp), never the stock action.
+curl -sf -H @<(printf 'Authorization: Bearer %s\n' "$KC_TOKEN") http://127.0.0.1:8080/admin/serverinfo \
+  | jq -e '.providers["required-action"].providers.CONFIGURE_TOTP.operationalInfo.portcullis == "totp"' >/dev/null \
+  || { echo "FAIL: CONFIGURE_TOTP is not the sign-in extension's override (server info)"; exit 1; }
+echo "PASS: OTP policy and the authenticator-app required actions (drift put back by configure)"
 kc "" | jq -e '.attributes["acr.loa.map"] == "{}" and .bruteForceProtected and .failureFactor == 10 and .waitIncrementSeconds == 60
     and .maxFailureWaitSeconds == 900 and (.permanentLockout | not) and .webAuthnPolicyPasswordlessAttestationConveyancePreference == "direct"
     and .webAuthnPolicyPasswordlessAuthenticatorAttachment == "not specified" and .webAuthnPolicyPasswordlessRequireResidentKey == "Yes"

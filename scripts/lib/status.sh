@@ -17,12 +17,38 @@ _st_mcp_refusing() {
     | head -n1 || true
 }
 
-_st_line() {  # _st_line ok|warn|fail <text>
+_st_line() {  # _st_line ok|warn|note|fail <text>
   case "$1" in
     ok)   printf '  %s✓%s %s\n' "$C_GREEN" "$C_NC" "$2" ;;
     warn) printf '  %s!%s %s\n' "$C_YELLOW" "$C_NC" "$2" ;;
+    note) printf '  %s·%s %s\n' "$C_DIM" "$C_NC" "$2" ;;
     *)    printf '  %s✗%s %s\n' "$C_RED" "$C_NC" "$2" ;;
   esac
+}
+
+# status_clock_synced — whether this server's clock is synchronised
+# (contract §8.1 "Authenticator-app codes": codes fail when it is more than
+# about 30 s off): "true" / "false" from systemd's NTPSynchronized
+# (`timedatectl show`), else from chrony's offset (`chronyc tracking`,
+# "System time : <s> seconds fast|slow of NTP time": under 5 s is true),
+# else "unknown" (neither tool, or an answer that doesn't parse).
+status_clock_synced() {
+  local v
+  if command -v timedatectl >/dev/null 2>&1; then
+    v="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+    case "$v" in
+      yes) echo true; return ;;
+      no) echo false; return ;;
+    esac
+  fi
+  if command -v chronyc >/dev/null 2>&1; then
+    v="$(chronyc tracking 2>/dev/null | awk -F: '$1 ~ /^System time *$/ { split($2, w, " "); print w[1]; exit }' || true)"
+    if [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+      if awk -v o="$v" 'BEGIN { exit !(o < 5) }'; then echo true; else echo false; fi
+      return
+    fi
+  fi
+  echo unknown
 }
 
 # _st_dns_json <report> <traefik-uri> <env-uri> — the `dns` block of
@@ -183,7 +209,7 @@ status_run() {
   fi
 
   # ── keycloak (health on the unpublished management port → docker health) ──
-  local kc_health users=null realm=false fwd=false passkey=null
+  local kc_health users=null realm=false fwd=false passkey=null otp=null
   kc_health="$(container_health keycloak)"
   [ "$kc_health" = healthy ] || problems=1
   if [ "$kc_health" = healthy ] && [ -n "${KEYCLOAK_ADMIN_PASSWORD:-}" ] && (kc_login >/dev/null 2>&1); then
@@ -196,9 +222,17 @@ status_run() {
     # kinds"): a drifted one silently classifies every new passkey as synced.
     passkey="$( { kc_passkey_policy_drift; kc_passkey_actions_drift; } | jq -Rsc 'split("\n") | map(select(. != "")) | {ok: (length == 0), problems: .}')"
     [ "$(printf '%s' "$passkey" | jq -r .ok)" = true ] || problems=1
+    # The OTP policy and the two authenticator-app actions (contract §8.1
+    # "Authenticator-app codes"): checked whether totp is on or not.
+    otp="$(kc_otp_policy_drift | jq -Rsc 'split("\n") | map(select(. != "")) | {ok: (length == 0), problems: .}')"
+    [ "$(printf '%s' "$otp" | jq -r .ok)" = true ] || problems=1
   fi
-  kc="$(jq -n --arg h "$kc_health" --argjson r "$realm" --argjson u "$users" --argjson f "$fwd" --argjson pk "$passkey" \
-    '{health: $h, realm: $r, users: $u, forward_auth_client: $f, passkey_policy: $pk}')"
+  kc="$(jq -n --arg h "$kc_health" --argjson r "$realm" --argjson u "$users" --argjson f "$fwd" --argjson pk "$passkey" --argjson otp "$otp" \
+    '{health: $h, realm: $r, users: $u, forward_auth_client: $f, passkey_policy: $pk, otp_policy: $otp}')"
+
+  # ── the clock (authenticator codes; a warning, never a problem) ──
+  local clock
+  clock="$(status_clock_synced)"
 
   # ── lldap / traefik ──
   lldap="$(jq -n --arg h "$(container_health lldap)" '{health: $h}')"
@@ -235,8 +269,9 @@ status_run() {
   if [ "$json" = true ]; then
     jq -n --arg d "${PORTCULLIS_DOMAIN:-}" --argjson s "$services" --argjson v "$vault_json" --argjson vpn "$vpn_json" \
       --argjson k "$kc" --argjson l "$lldap" --arg t "$traefik" --argjson p "$problems" --arg sh "$shadows" --arg mr "$mcp_refusing" --arg dn "$dns_json" \
-      --argjson rt "$rt_json" \
-      '{domain: $d, ok: ($p == 0), problems: $p, runtime: $rt, services: $s, vault: $v, keycloak: $k, lldap: $l, traefik: {state: $t},
+      --argjson rt "$rt_json" --arg ck "$clock" \
+      '{domain: $d, ok: ($p == 0), problems: $p, runtime: $rt,
+        system: {clock_synced: (if $ck == "true" then true elif $ck == "false" then false else "unknown" end)}, services: $s, vault: $v, keycloak: $k, lldap: $l, traefik: {state: $t},
         dns_shadows: [$sh | split("\n")[] | select(. != "") | capture("^(?<container>[^ ]+) (?<name>.+)$")],
         mcp_gate: {refusing: (if $mr == "" then null else $mr end)},
         dns: (if $dn == "" then null else ($dn | fromjson) end), vpn: $vpn}'
@@ -252,6 +287,11 @@ status_run() {
   while IFS=$'\t' read -r rst rtext; do
     case "$rst" in warn|fail) _st_line "$rst" "$rtext" ;; esac
   done < <(printf '%s' "$rt_json" | jq -r '.checks[] | [.status, .text] | @tsv')
+  case "$clock" in
+    true) _st_line ok "clock synchronised" ;;
+    false) _st_line warn "the clock isn't synchronised: authenticator-app codes fail when it is more than about 30 s off; turn on time sync (timedatectl set-ntp true)" ;;
+    *) _st_line note "clock synchronisation unknown (no timedatectl or chronyc answer)" ;;
+  esac
 
   printf '\n%sServices%s\n' "$C_CYAN" "$C_NC"
   if [ "$(printf '%s' "$services" | jq 'length')" = 0 ]; then
@@ -313,6 +353,13 @@ status_run() {
           _st_line fail "passkey policy: $(printf '%s' "$passkey" | jq -r '.problems | join(", ")') — new passkeys can't be told apart; run ./portcullis keycloak configure"
         fi
       fi
+      if [ "$otp" != null ]; then
+        if [ "$(printf '%s' "$otp" | jq -r .ok)" = true ]; then
+          _st_line ok "authenticator codes: HmacSHA1, 6 digits, 30 s, one step of drift, no reuse; 5-minute sign-in to add or remove"
+        else
+          _st_line fail "authenticator codes: $(printf '%s' "$otp" | jq -r '.problems | join(", ")') — run ./portcullis keycloak configure"
+        fi
+      fi
     fi
   else
     _st_line fail "$kc_health"
@@ -359,6 +406,10 @@ status_textfile() {
     "portcullis_vault_active \(if .vault.active then 1 else 0 end)",
     g("portcullis_keycloak_passkey_policy_ok"; "1 if the realm passkey policy and registration actions are the ones Portcullis needs (absent: not checked)."),
     (if .keycloak.passkey_policy == null then empty else "portcullis_keycloak_passkey_policy_ok \(if .keycloak.passkey_policy.ok then 1 else 0 end)" end),
+    g("portcullis_keycloak_otp_policy_ok"; "1 if the realm OTP policy and the authenticator-app actions are the ones Portcullis needs (absent: not checked)."),
+    (if .keycloak.otp_policy == null then empty else "portcullis_keycloak_otp_policy_ok \(if .keycloak.otp_policy.ok then 1 else 0 end)" end),
+    g("portcullis_system_clock_synced"; "1 if the server clock is synchronised, 0 if not (absent: unknown); authenticator codes need it."),
+    (if (.system.clock_synced | type) == "boolean" then "portcullis_system_clock_synced \(if .system.clock_synced then 1 else 0 end)" else empty end),
     g("portcullis_ca_expiry_timestamp_seconds"; "Expiry of the CAs of the internal certificate authority (Vault)."),
     (if (.vault.root_ca_expires_epoch // 0) > 0 then "portcullis_ca_expiry_timestamp_seconds{ca=\"root\"} \(.vault.root_ca_expires_epoch)" else empty end),
     (if (.vault.intermediate_ca_expires_epoch // 0) > 0 then "portcullis_ca_expiry_timestamp_seconds{ca=\"intermediate\"} \(.vault.intermediate_ca_expires_epoch)" else empty end),
@@ -592,7 +643,10 @@ CERT_EXPIRY_WARN_DAYS = 7 days),
 Keycloak (realm, users, forward-auth client, the passkey policy: attestation
 direct, any attachment, resident key and user verification required, only
 the passwordless registration action on — anything else fails: new passkeys
-couldn't be told apart),
+couldn't be told apart; the authenticator-app policy: HmacSHA1, 6 digits,
+30 s, one step of drift, no reuse, CONFIGURE_TOTP and delete_credential on
+with a 5-minute sign-in — anything else fails), the clock (a warning when
+it isn't synchronised: authenticator codes fail when it is ~30 s off),
 LLDAP, Traefik and DNS (per name, from the domains service: A/AAAA point
 at this server, CAA as planned and allowing Traefik's ACME account, DNSSEC
 state, records that aren't Portcullis'; a warning if the domains service
@@ -604,7 +658,8 @@ Options:
   --json       machine-readable output (same exit status)
   --textfile   write the same as Prometheus metrics to
                monitoring/textfile/status.prom for the monitoring profile
-               (service health, Vault active, the passkey policy, CA and
+               (service health, Vault active, the passkey and OTP
+               policies, the clock, CA and
                per-user YubiKey / browser certificate expiry, per-name DNS
                checks and DNSSEC state); run after every scheduled backup
 EOF

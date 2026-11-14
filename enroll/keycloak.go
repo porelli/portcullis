@@ -4,7 +4,9 @@ package main
 // `portcullis-enroll` (service account, realm-management manage-users +
 // view-users; created by `portcullis keycloak configure`) adds the required
 // action webauthn-register-passwordless to the invited user, so the invite
-// login cannot finish without registering a passkey.
+// login cannot finish without registering a passkey; and, for a Hub link
+// with the authenticator option, CONFIGURE_TOTP (the extension's override
+// decides, contract §9.4 / §8.1 "Authenticator-app codes").
 
 import (
 	"context"
@@ -16,7 +18,10 @@ import (
 	"github.com/Nerzal/gocloak/v14"
 )
 
-const passkeyAction = "webauthn-register-passwordless"
+const (
+	passkeyAction = "webauthn-register-passwordless"
+	totpAction    = "CONFIGURE_TOTP"
+)
 
 type keycloakClient struct {
 	realm, clientID string
@@ -69,6 +74,18 @@ func (k *keycloakClient) accessToken(ctx context.Context) (string, error) {
 // RequirePasskey imports the user from LDAP if needed (the exact-username
 // search does that) and adds the passkey registration required action.
 func (k *keycloakClient) RequirePasskey(username string) error {
+	return k.requireAction(username, passkeyAction)
+}
+
+// RequireTotp adds the authenticator-app setup required action
+// (CONFIGURE_TOTP) to the user, after RequirePasskey on a setup link with
+// the authenticator option.
+func (k *keycloakClient) RequireTotp(username string) error {
+	return k.requireAction(username, totpAction)
+}
+
+// requireAction adds action to the user's required actions (once).
+func (k *keycloakClient) requireAction(username, action string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	tok, err := k.accessToken(ctx)
@@ -89,13 +106,13 @@ func (k *keycloakClient) RequirePasskey(username string) error {
 		return fmt.Errorf("get user: %w", err)
 	}
 	for _, a := range u.RequiredActions {
-		if a == passkeyAction {
+		if a == action {
 			return nil
 		}
 	}
 	// Only id + requiredActions: Keycloak leaves absent fields unchanged.
 	if err := k.gc.UpdateUser(ctx, tok, k.realm, gocloak.User{
-		ID: gocloak.StringP(id), RequiredActions: append(u.RequiredActions, passkeyAction)}); err != nil {
+		ID: gocloak.StringP(id), RequiredActions: append(u.RequiredActions, action)}); err != nil {
 		return fmt.Errorf("update user: %w", err)
 	}
 	return nil

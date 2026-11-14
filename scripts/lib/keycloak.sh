@@ -43,6 +43,21 @@ KC_REALM_TOKEN_SETTINGS='{"offlineSessionIdleTimeout": 2592000, "offlineSessionM
 # is silently kept (a 204 all the same).
 KC_REALM_SIGNIN_SETTINGS='{"attributes": {"acr.loa.map": "{}"}, "bruteForceProtected": true, "permanentLockout": false, "failureFactor": 10, "waitIncrementSeconds": 60, "maxFailureWaitSeconds": 900, "webAuthnPolicyPasswordlessRpEntityName": "Portcullis", "webAuthnPolicyPasswordlessAttestationConveyancePreference": "direct", "webAuthnPolicyPasswordlessAuthenticatorAttachment": "not specified", "webAuthnPolicyPasswordlessRequireResidentKey": "Yes", "webAuthnPolicyPasswordlessUserVerificationRequirement": "required"}'
 
+# Authenticator-app codes (contract §8.1 "Authenticator-app codes"): the
+# realm OTP policy every common app computes (HMAC-SHA1, 6 digits, 30 s),
+# one step of clock drift each way, each code accepted once. Same values as
+# realm-export.json; pushed with the realm PUT on every run, read back
+# (kc_otp_policy_drift) and a difference fails configure.
+# shellcheck disable=SC2034  # read by the tests
+KC_REALM_OTP_SETTINGS='{"otpPolicyType": "totp", "otpPolicyAlgorithm": "HmacSHA1", "otpPolicyDigits": 6, "otpPolicyPeriod": 30, "otpPolicyLookAheadWindow": 1, "otpPolicyCodeReusable": false, "otpPolicyInitialCounter": 0}'
+# The two required actions behind adding / replacing (CONFIGURE_TOTP, the
+# extension's override) and removing (delete_credential) an authenticator
+# app: <alias>:<priority> (CONFIGURE_TOTP after the passkey action's 80,
+# before the impersonation notice's 90). Both ask for a sign-in within the
+# last KC_OTP_MAX_AUTH_AGE seconds (Keycloak re-authenticates first).
+KC_OTP_ACTIONS="CONFIGURE_TOTP:85 delete_credential:100"
+KC_OTP_MAX_AUTH_AGE=300
+
 kc_url() { echo "${KEYCLOAK_URL:-http://127.0.0.1:8080}"; }
 
 # kc_login — sets KC_TOKEN (admin-cli password grant on the master realm).
@@ -113,6 +128,66 @@ kc_passkey_actions_drift() {
         .[0] | if type != "object" or (.enabled | type) != "boolean" then "required action \($a) can'"'"'t be read"
         elif .enabled != $w then "required action \($a) \(.enabled | state) (wanted \($w | state))"
         else empty end' 2>/dev/null || echo "required action $ra can't be read"
+  done
+}
+
+# kc_otp_policy_drift — how the realm's OTP policy and the two
+# authenticator-app required actions differ from KC_REALM_OTP_SETTINGS /
+# KC_OTP_ACTIONS (contract §8.1 "Authenticator-app codes"): one
+# "<setting> <value> (wanted <value>)" line per differing setting, by name
+# (the seven otpPolicy* values, then each action's max_auth_age), a line
+# per action that is missing or disabled, "… can't be read" when the realm
+# or an action can't be (never empty then); nothing when everything agrees.
+kc_otp_policy_drift() {
+  kc_get "/$KC_REALM" 2>/dev/null | jq -rs --argjson w "$KC_REALM_OTP_SETTINGS" '
+      .[0] | if type != "object" or (.realm // "") == "" then "the realm can'"'"'t be read"
+      else . as $r | $w | keys_unsorted[] as $k
+        | select($r[$k] != $w[$k])
+        | "\($k) \($r[$k] // "unset" | tostring) (wanted \($w[$k] | tostring))"
+      end' 2>/dev/null || echo "the realm can't be read"
+  local ra
+  for ra in $KC_OTP_ACTIONS; do
+    ra="${ra%%:*}"
+    kc_get "/$KC_REALM/authentication/required-actions/$ra" 2>/dev/null | jq -rs --arg a "$ra" '
+        .[0] | if type != "object" or (.alias // "") == "" then "required action \($a) missing (wanted enabled)"
+        elif .enabled != true then "required action \($a) disabled (wanted enabled)"
+        else empty end' 2>/dev/null || echo "required action $ra can't be read"
+    kc_get "/$KC_REALM/authentication/required-actions/$ra/config" 2>/dev/null | jq -rs --arg a "$ra" --arg w "$KC_OTP_MAX_AUTH_AGE" '
+        .[0] | if type != "object" then "required action \($a) config can'"'"'t be read"
+        elif ((.config // {}) | type) != "object" then "required action \($a) config can'"'"'t be read"
+        elif (.config.max_auth_age // "") != $w then "\($a) max_auth_age \(.config.max_auth_age // "unset" | tostring) (wanted \($w))"
+        else empty end' 2>/dev/null || echo "required action $ra config can't be read"
+  done
+}
+
+# _kc_otp_actions — registers CONFIGURE_TOTP and delete_credential when the
+# realm lacks them (POST /authentication/register-required-action: a realm
+# imported before they were in realm-export.json), keeps them enabled, not
+# default actions, at their priority, and PUTs their config
+# {"config":{"max_auth_age":"300"}}. configure reads all of it back with
+# kc_otp_policy_drift and fails on any difference.
+_kc_otp_actions() {
+  local ra prio name cur code
+  for ra in $KC_OTP_ACTIONS; do
+    prio="${ra#*:}" ra="${ra%%:*}"
+    case "$ra" in CONFIGURE_TOTP) name="Configure OTP" ;; *) name="Delete Credential" ;; esac
+    cur="$(kc_get "/$KC_REALM/authentication/required-actions/$ra")"
+    if ! printf '%s' "$cur" | jq -e --arg a "$ra" 'type == "object" and .alias == $a' >/dev/null 2>&1; then
+      code="$(jq -nc --arg a "$ra" --arg n "$name" '{providerId: $a, name: $n}' \
+        | kc_send POST "/$KC_REALM/authentication/register-required-action")"
+      _kc_report "$ra required action registered" "$code" 204 201 || true
+      cur="$(kc_get "/$KC_REALM/authentication/required-actions/$ra")"
+    fi
+    if ! printf '%s' "$cur" | jq -e --argjson p "$prio" '.enabled == true and .defaultAction == false and .priority == $p' >/dev/null 2>&1; then
+      code="$(jq -nc --arg c "$cur" --arg a "$ra" --arg n "$name" --argjson p "$prio" \
+          '((try ($c | fromjson) catch {}) | if type == "object" then . else {} end)
+           + {alias: $a, providerId: $a, enabled: true, defaultAction: false, priority: $p} | .name //= $n' \
+        | kc_send PUT "/$KC_REALM/authentication/required-actions/$ra")"
+      _kc_report "$ra required action enabled (priority $prio)" "$code" 204 || true
+    fi
+    code="$(jq -nc --arg m "$KC_OTP_MAX_AUTH_AGE" '{config: {max_auth_age: $m}}' \
+      | kc_send PUT "/$KC_REALM/authentication/required-actions/$ra/config")"
+    _kc_report "$ra: a sign-in within the last $KC_OTP_MAX_AUTH_AGE s first" "$code" 204 || true
   done
 }
 
@@ -317,15 +392,16 @@ keycloak_configure() {
     warn "    no LDAP federation component found in realm $KC_REALM"
   fi
 
-  info "Setting the sign-in settings (no LoA map, brute force, passkey policy), offline-session bounds, refresh-token reuse and the browser flow..."
+  info "Setting the sign-in settings (no LoA map, brute force, passkey and OTP policies), offline-session bounds, refresh-token reuse and the browser flow..."
   # Only switch browserFlow if it is unset or the realm's built-in value;
   # an operator's custom flow is preserved.
   # sslRequired=external: browsers only reach Keycloak through Traefik
   # (HTTPS; proxy headers trusted from Traefik only), and "all" would also
   # refuse the invite identity provider's back-channel URLs on the private
   # network (http://enroll:8445, Keycloak's URL check resolves the host).
-  code="$(kc_get "/$KC_REALM" | jq --argjson tok "$KC_REALM_TOKEN_SETTINGS" --argjson signin "$KC_REALM_SIGNIN_SETTINGS" '
-      {sslRequired: "external"} + $signin + $tok +
+  code="$(kc_get "/$KC_REALM" | jq --argjson tok "$KC_REALM_TOKEN_SETTINGS" --argjson signin "$KC_REALM_SIGNIN_SETTINGS" \
+      --argjson otp "$KC_REALM_OTP_SETTINGS" '
+      {sslRequired: "external"} + $signin + $otp + $tok +
       (if ((.browserFlow // "") == "" or .browserFlow == "portcullis-browser-flow")
        then {browserFlow: "portcullis-universal"} else {} end) +
       # Login theme: unique passkey labels, so a second key (recovery) can be
@@ -360,10 +436,20 @@ keycloak_configure() {
       else _kc_report "$ra (two-factor) required action disabled" "$code" 204 || true; fi
     fi
   done
+  # Authenticator-app codes (contract §8.1): the realm OTP policy (PUT
+  # above) and the two required actions, read back. Fail closed: a drifted
+  # policy makes codes from the common apps fail, or accepts a code twice;
+  # a missing max_auth_age lets an old session add or remove one.
+  _kc_otp_actions
+  drift="$(kc_otp_policy_drift)"
+  if [ -n "$drift" ]; then
+    fail "the realm's authenticator-app settings are still not the ones Portcullis needs after the update: $(printf '%s' "$drift" | paste -sd, - | sed 's/,/, /g'). Check Keycloak (is the portcullis-keycloak image running?), then run ./portcullis keycloak configure again."
+  fi
+  echo "    authenticator codes: HmacSHA1, 6 digits, 30 s, one step of drift, no reuse; a sign-in within $KC_OTP_MAX_AUTH_AGE s to add or remove one"
 
   info "Checking the sign-in executions carry AMR reference values..."
-  # Every portcullis-x509, portcullis-password-form and portcullis-method
-  # execution of the browser flow, and the invite flow's own allow-access
+  # Every portcullis-x509, portcullis-password-form, portcullis-method and
+  # portcullis-otp execution of the browser flow, and the invite flow's own allow-access
   # step (amr inv), needs an authenticatorConfig with default.reference.value
   # and default.reference.maxAge (36000): without it the amr claim lacks the
   # method and no reader can count it (contract §8.1).
@@ -377,7 +463,7 @@ keycloak_configure() {
           | jq -e '(.config["default.reference.value"] // "") != "" and .config["default.reference.maxAge"] == "36000"' >/dev/null 2>&1; then
         warn "    $flow/$provider config has no default.reference.value / maxAge 36000 → empty or short-lived amr for this method"
       fi
-    done < <(printf '%s' "$execs" | jq -r '.[] | select((.providerId // "" | IN("portcullis-x509", "portcullis-password-form", "portcullis-method"))
+    done < <(printf '%s' "$execs" | jq -r '.[] | select((.providerId // "" | IN("portcullis-x509", "portcullis-password-form", "portcullis-method", "portcullis-otp"))
         or (.providerId == "allow-access-authenticator" and .level == 0)) | .providerId + " " + (.authenticationConfig // "none")')
   done
 
@@ -889,6 +975,10 @@ API on 127.0.0.1:8080 (override with KEYCLOAK_URL):
     identity provider's first-login / post-login flows)
   - keeps webauthn-register-passwordless enabled and the two-factor
     webauthn-register disabled
+  - the authenticator-app (OTP) policy: HmacSHA1, 6 digits, 30 s, one step
+    of clock drift, each code accepted once; registers and enables the
+    CONFIGURE_TOTP and delete_credential required actions, each asking for
+    a sign-in within the last 5 minutes; read back, a difference fails
   - the invite identity provider portcullis-invite (enroll; URLs + client
     secret from secrets/enroll/invite-client-secret) and the service-account
     client portcullis-enroll (view-users, manage-users)

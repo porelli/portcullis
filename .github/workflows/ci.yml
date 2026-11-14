@@ -207,6 +207,18 @@ jobs:
             exit 1
           fi
           echo "vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
+          # The Hub owns the events config and overwrites the realm's
+          # (EnsureEventsConfig): its ConfigEventTypes and realm-export.json's
+          # enabledEventTypes must be the same set (contract §8, P33).
+          ev="$RUNNER_TEMP/hub_events.go"
+          code=$(curl -sS -o "$ev" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/internal/keycloak/events.go")
+          [ "$code" = 200 ] || { echo "::error::fetching the Hub's internal/keycloak/events.go from $ref ($sha): HTTP $code"; exit 1; }
+          hub_types=$(sed -n 's/^var ConfigEventTypes = \[\]string{\(.*\)}$/[\1]/p' "$ev" | jq -cS 'sort') || hub_types=""
+          own_types=$(jq -cS '.enabledEventTypes | sort' keycloak/realm-export.json)
+          if [ -z "$hub_types" ] || [ "$hub_types" != "$own_types" ]; then
+            echo "::error::keycloak/realm-export.json enabledEventTypes $own_types differ from portcullis-hub $ref ($sha) ConfigEventTypes ${hub_types:-(not found)}"
+            exit 1
+          fi
       # tests/vpn_json_vectors.json drives wg's and group-gate's vpn.json
       # readers (contract §4 / §16): a byte copy of the Hub's reference
       # vectors internal/vpn/testdata/vpn_json_vectors.json, on the

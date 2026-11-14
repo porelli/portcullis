@@ -34,7 +34,8 @@ func testInvites(t *testing.T) (*inviteService, *[]string) {
 			}
 			return nil, errors.New("not found")
 		},
-		func(u string) error { *required = append(*required, u); return nil })
+		func(u string) error { *required = append(*required, u); return nil },
+		func(u string) error { *required = append(*required, "totp:"+u); return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +261,7 @@ func TestInviteExpiryAndLanding(t *testing.T) {
 	s, _ := testInvites(t)
 	now := time.Now()
 	s.now = func() time.Time { return now }
-	tok, _, err := s.Create("bob", "https://hub.example.org/", time.Hour, false)
+	tok, _, err := s.Create("bob", "https://hub.example.org/", time.Hour, false, inviteOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,11 +270,11 @@ func TestInviteExpiryAndLanding(t *testing.T) {
 		t.Fatal("expired invite still valid")
 	}
 	for _, l := range []string{"http://example.org/", "https://evil.com/", "https://example.org.evil.com/", "https://u@example.org/", "https://example.org:8443/"} {
-		if _, _, err := s.Create("bob", l, 0, false); err == nil {
+		if _, _, err := s.Create("bob", l, 0, false, inviteOptions{}); err == nil {
 			t.Fatalf("landing %s accepted", l)
 		}
 	}
-	if _, _, err := s.Create("bob", "", 8*24*time.Hour, false); err == nil {
+	if _, _, err := s.Create("bob", "", 8*24*time.Hour, false, inviteOptions{}); err == nil {
 		t.Fatal("ttl above the maximum accepted")
 	}
 	if s.peek("short") != nil || s.consume("../../etc") != nil {
@@ -284,7 +285,7 @@ func TestInviteExpiryAndLanding(t *testing.T) {
 func TestInviteKeycloakDownKeepsTheLink(t *testing.T) {
 	s, _ := testInvites(t)
 	s.requirePasskey = func(string) error { return errors.New("down") }
-	tok, _, _ := s.Create("alice", "", 0, false)
+	tok, _, _ := s.Create("alice", "", 0, false, inviteOptions{})
 	if w := do(inviteMux(s), "POST", "/invite/"+tok, "", map[string]string{"Sec-Fetch-Site": "same-origin"}); w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("redeem with Keycloak down: %d", w.Code)
 	}
@@ -409,11 +410,146 @@ func TestInviteAPIRecheckAfterPromotion(t *testing.T) {
 
 	// 5. A promoted user's server-made (CLI) invite is not affected.
 	groups["alice"] = []string{"lldap_admin"}
-	ltok, _, err := s.Create("alice", "", 0, true)
+	ltok, _, err := s.Create("alice", "", 0, true, inviteOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if w := redeem(ltok); w.Code != http.StatusSeeOther {
 		t.Fatalf("CLI invite for an administrator: %d", w.Code)
+	}
+}
+
+// apiPost posts body to POST /internal/invites on the Hub's listener.
+func apiPost(s *inviteService, local bool, body string) *httptest.ResponseRecorder {
+	hdr := map[string]string{"Content-Type": "application/json"}
+	if !local {
+		hdr["Authorization"] = "Bearer " + testAPISecret
+	}
+	return do(s.apiHandler(local), "POST", "/internal/invites", body, hdr)
+}
+
+// T8 / P13: the body is strict over {username, ttl, landing, authenticator};
+// authenticator true is kept on the invite, absent or false is no step.
+func TestCreateAuthenticatorStrictBody(t *testing.T) {
+	s, _ := testInvites(t)
+	for _, bad := range []string{
+		`{"username":"alice","authenticator":true,"x":1}`,
+		`{"username":"alice","Authenticator":"yes"}`,
+		`{"username":"alice","authenticator":"true"}`,
+		`{"username":"alice","otp":true}`,
+		`{"username":"alice"} {"username":"bob"}`,
+	} {
+		if w := apiPost(s, false, bad); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: %d %s", bad, w.Code, w.Body)
+		}
+	}
+	for body, want := range map[string]bool{
+		`{"username":"alice"}`:                       false,
+		`{"username":"bob","authenticator":false}`:   false,
+		`{"username":"carol2","authenticator":true}`: true, // unknown user: 404, checked below
+		`{"username":"alice","ttl":"1h","landing":"https://hub.example.org/","authenticator":true}`: true,
+	} {
+		w := apiPost(s, false, body)
+		if strings.Contains(body, "carol2") {
+			if w.Code != http.StatusNotFound {
+				t.Errorf("%s: %d", body, w.Code)
+			}
+			continue
+		}
+		if w.Code != http.StatusCreated {
+			t.Fatalf("%s: %d %s", body, w.Code, w.Body)
+		}
+		var out map[string]string
+		json.Unmarshal(w.Body.Bytes(), &out)
+		inv := s.peek(token(out["url"]))
+		if inv == nil || inv.Authenticator != want {
+			t.Errorf("%s: invite %+v, want authenticator %v", body, inv, want)
+		}
+	}
+	// Protected accounts are refused with the option as without it.
+	if w := apiPost(s, false, `{"username":"carol","authenticator":true}`); w.Code != http.StatusConflict {
+		t.Errorf("lldap_admin member: %d", w.Code)
+	}
+}
+
+// T8 / P35: the redeem adds CONFIGURE_TOTP only for an authenticator
+// invite and only after the passkey action; a failure leaves the link
+// unused, exactly as a passkey failure does.
+func TestRedeemAddsTotpAfterPasskey(t *testing.T) {
+	s, required := testInvites(t)
+	h := inviteMux(s)
+	redeem := func(tok string) int {
+		return do(h, "POST", "/invite/"+tok, "", map[string]string{"Sec-Fetch-Site": "same-origin"}).Code
+	}
+	link := func(body string) string {
+		w := apiPost(s, false, body)
+		var out map[string]string
+		json.Unmarshal(w.Body.Bytes(), &out)
+		return token(out["url"])
+	}
+	if c := redeem(link(`{"username":"bob"}`)); c != http.StatusSeeOther {
+		t.Fatalf("plain redeem: %d", c)
+	}
+	if strings.Join(*required, ",") != "bob" {
+		t.Fatalf("plain link: %v", *required)
+	}
+	*required = nil
+	// Keycloak refuses CONFIGURE_TOTP: 503, the link still works afterwards.
+	tok := link(`{"username":"alice","authenticator":true}`)
+	ok := s.requireTotp
+	s.requireTotp = func(u string) error { *required = append(*required, "fail:"+u); return errors.New("down") }
+	if c := redeem(tok); c != http.StatusServiceUnavailable {
+		t.Fatalf("totp failure: %d", c)
+	}
+	if strings.Join(*required, ",") != "alice,fail:alice" {
+		t.Fatalf("order on failure: %v", *required)
+	}
+	if s.peek(tok) == nil {
+		t.Fatal("the link was used up by a failed redeem")
+	}
+	// The passkey step failing never reaches the authenticator step.
+	*required = nil
+	pk := s.requirePasskey
+	s.requirePasskey = func(u string) error { return errors.New("down") }
+	if c := redeem(tok); c != http.StatusServiceUnavailable || len(*required) != 0 {
+		t.Fatalf("passkey failure: %d %v", c, *required)
+	}
+	s.requirePasskey, s.requireTotp = pk, ok
+	if c := redeem(tok); c != http.StatusSeeOther {
+		t.Fatalf("retry: %d", c)
+	}
+	if strings.Join(*required, ",") != "alice,totp:alice" {
+		t.Fatalf("order: %v", *required)
+	}
+	if c := redeem(tok); c != http.StatusNotFound {
+		t.Fatalf("second redeem: %d", c)
+	}
+}
+
+// T8: the server's CLI (the loopback listener, `enroll invite`) never makes
+// an authenticator link: its body has no such key, and the listener
+// refuses one.
+func TestCLINeverAuthenticator(t *testing.T) {
+	var m map[string]any
+	if err := json.Unmarshal(inviteCommandBody("admin", "1h", "https://hub.example.org/"), &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["authenticator"]; ok {
+		t.Fatalf("CLI body %v", m)
+	}
+	s, required := testInvites(t)
+	if w := apiPost(s, true, `{"username":"admin","authenticator":true}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("loopback authenticator: %d %s", w.Code, w.Body)
+	}
+	if _, _, err := s.Create("alice", "", 0, true, inviteOptions{Authenticator: true}); !errors.Is(err, errAuthenticatorCLI) {
+		t.Fatalf("Create(local, authenticator): %v", err)
+	}
+	// Without a requireTotp (not wired), the Hub's option is refused too: fail closed.
+	s.requireTotp = nil
+	if w := apiPost(s, false, `{"username":"alice","authenticator":true}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("no requireTotp: %d", w.Code)
+	}
+	if w := apiPost(s, true, `{"username":"admin"}`); w.Code != http.StatusCreated || len(*required) != 0 {
+		t.Fatalf("loopback plain: %d", w.Code)
 	}
 }

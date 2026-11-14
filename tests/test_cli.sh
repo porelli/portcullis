@@ -534,6 +534,16 @@ case "$p" in
   "$R/authentication/required-actions/portcullis-impersonation-notice")
     jq -sc '[.[] | select(.m == "PUT" and (.p | endswith("/required-actions/portcullis-impersonation-notice"))) | .b | fromjson] | last
       // {"alias":"portcullis-impersonation-notice","name":"Impersonation notice","providerId":"portcullis-impersonation-notice","enabled":false,"defaultAction":false,"priority":90,"config":{}}' "$KC_LOG" ;;
+  # The authenticator-app actions: absent until configure registers them
+  # (POST register-required-action), then the last PUT; their config is the
+  # last PUT unless KC_OTP_KEEP is set (Keycloak keeping the old one).
+  "$R/authentication/required-actions/CONFIGURE_TOTP"|"$R/authentication/required-actions/delete_credential")
+    jq -sc --arg p "$p" --arg a "${p##*/}" '([.[] | select(.m == "PUT" and .p == $p) | .b | fromjson] | last)
+        // (if any(.[]; .m == "POST" and (.p | endswith("/register-required-action")) and (.b | fromjson | .providerId) == $a)
+            then {alias: $a, providerId: $a, name: $a, enabled: false, defaultAction: false, priority: 1000, config: {}} else {} end)' "$KC_LOG" ;;
+  "$R/authentication/required-actions/CONFIGURE_TOTP/config"|"$R/authentication/required-actions/delete_credential/config")
+    if [ -n "${KC_OTP_KEEP:-}" ]; then echo '{"config":{}}'
+    else jq -sc --arg p "$p" '([.[] | select(.m == "PUT" and .p == $p) | .b | fromjson] | last) // {"config":{}}' "$KC_LOG"; fi ;;
   # A drifted passkey policy (the test server's); the realm PUTs configure
   # sent are applied on top unless KC_REALM_KEEP is set (Keycloak 26.8
   # keeping the policy).
@@ -559,6 +569,34 @@ expect_eq "keycloak configure (stub admin API) exits 0" "$RC" 0
 [ "$RC" = 0 ] || sed 's/^/    /' "$WORK/err" | tail -5
 expect_eq "keycloak configure re-read the realm's passkey policy after its PUT (the drifted one fixed)" \
   "$(grep -c 'passkey policy: direct attestation' "$WORK/out")" 1
+# Authenticator-app codes (contract §8.1): the OTP policy in the realm PUT,
+# both actions registered (absent from this realm), enabled at 85 / 100,
+# their max_auth_age 300, all read back.
+expect_eq "keycloak configure: the realm PUT carries the seven OTP policy values" \
+  "$(jq -sc '[.[] | select(.m == "PUT" and .p == "/admin/realms/portcullis") | .b | fromjson | select(has("otpPolicyType"))
+      | {otpPolicyType, otpPolicyAlgorithm, otpPolicyDigits, otpPolicyPeriod, otpPolicyLookAheadWindow, otpPolicyCodeReusable, otpPolicyInitialCounter}] | unique' "$WORK/kc/log")" \
+  '[{"otpPolicyType":"totp","otpPolicyAlgorithm":"HmacSHA1","otpPolicyDigits":6,"otpPolicyPeriod":30,"otpPolicyLookAheadWindow":1,"otpPolicyCodeReusable":false,"otpPolicyInitialCounter":0}]'
+expect_eq "keycloak configure: OTP settings equal realm-export.json's" \
+  "$(jq -cS 'with_entries(select(.key | startswith("otpPolicy")))' "$HERE/../keycloak/realm-export.json")" \
+  "$(bash -c ". '$HERE/../scripts/lib/keycloak.sh'; printf '%s' \"\$KC_REALM_OTP_SETTINGS\"" | jq -cS .)"
+expect_eq "keycloak configure registers CONFIGURE_TOTP and delete_credential when the realm lacks them" \
+  "$(jq -sc '[.[] | select(.m == "POST" and (.p | endswith("/authentication/register-required-action"))) | .b | fromjson]' "$WORK/kc/log")" \
+  '[{"providerId":"CONFIGURE_TOTP","name":"Configure OTP"},{"providerId":"delete_credential","name":"Delete Credential"}]'
+expect_eq "keycloak configure enables both (CONFIGURE_TOTP at 85, delete_credential at 100, never a default action)" \
+  "$(jq -sc '[.[] | select(.m == "PUT" and (.p | test("/required-actions/(CONFIGURE_TOTP|delete_credential)$"))) | .b | fromjson | [.alias, .enabled, .defaultAction, .priority]]' "$WORK/kc/log")" \
+  '[["CONFIGURE_TOTP",true,false,85],["delete_credential",true,false,100]]'
+expect_eq "keycloak configure PUTs each action's config {\"config\":{\"max_auth_age\":\"300\"}}" \
+  "$(jq -sc '[.[] | select(.m == "PUT" and (.p | test("/required-actions/[^/]+/config$"))) | (.p | split("/")[-2]) + " " + .b]' "$WORK/kc/log")" \
+  '["CONFIGURE_TOTP {\"config\":{\"max_auth_age\":\"300\"}}","delete_credential {\"config\":{\"max_auth_age\":\"300\"}}"]'
+expect_eq "keycloak configure re-read the OTP policy and both actions after its PUTs" \
+  "$(grep -c 'authenticator codes: HmacSHA1, 6 digits, 30 s, one step of drift, no reuse' "$WORK/out")" 1
+# Fail closed: Keycloak answered 204 but kept the actions' old config.
+: > "$WORK/kc/log"
+RC=0
+PATH="$WORK/kcbin:$PATH" KC_LOG="$WORK/kc/log" KC_FIX="$WORK/kc" KC_OTP_KEEP=1 \
+  "$CLI" keycloak configure >"$WORK/out2" 2>"$WORK/err2" </dev/null || RC=$?
+expect_eq "keycloak configure fails when the OTP read-back differs (max_auth_age not taken), naming both" \
+  "$RC:$(grep -c "authenticator-app settings are still not the ones Portcullis needs after the update: CONFIGURE_TOTP max_auth_age unset (wanted 300), delete_credential max_auth_age unset (wanted 300)" "$WORK/err2")" "1:1"
 # Fail closed: Keycloak answered 204 but kept the drifted policy.
 : > "$WORK/kc/log"
 RC=0
@@ -671,11 +709,12 @@ expect_eq "keycloak configure's impersonation steps never touch the events confi
 # ── status: the realm's passkey policy (contract §8.1 "Passkey kinds"),
 # with kc_get stubbed: a drifted one fails status (a ✗ line, --json
 # keycloak.passkey_policy, the textfile gauge) ──
-PK_REALM_OK='{"realm":"portcullis","webAuthnPolicyPasswordlessAttestationConveyancePreference":"direct","webAuthnPolicyPasswordlessAuthenticatorAttachment":"not specified","webAuthnPolicyPasswordlessRequireResidentKey":"Yes","webAuthnPolicyPasswordlessUserVerificationRequirement":"required"}'
+PK_REALM_OK='{"realm":"portcullis","webAuthnPolicyPasswordlessAttestationConveyancePreference":"direct","webAuthnPolicyPasswordlessAuthenticatorAttachment":"not specified","webAuthnPolicyPasswordlessRequireResidentKey":"Yes","webAuthnPolicyPasswordlessUserVerificationRequirement":"required","otpPolicyType":"totp","otpPolicyAlgorithm":"HmacSHA1","otpPolicyDigits":6,"otpPolicyPeriod":30,"otpPolicyLookAheadWindow":1,"otpPolicyCodeReusable":false,"otpPolicyInitialCounter":0}'
 # pk_status <realm JSON> <two-factor action enabled> <json|text|textfile> — status_run's output, then "rc <n>".
 pk_status() {
   (
     export PK_REALM="$1" PK_2FA="$2" KEYCLOAK_ADMIN_PASSWORD=stub CONTAINER_RUNTIME=docker
+    export PK_OTP_RA="${PK_OTP_RA-true}" PK_OTP_AGE="${PK_OTP_AGE-300}" PK_CLOCK="${PK_CLOCK:-true}"
     for l in common keycloak status; do
       # shellcheck disable=SC1090
       . "$HERE/../scripts/lib/$l.sh"
@@ -689,6 +728,7 @@ pk_status() {
     _st_mcp_refusing() { :; }
     kc_login() { :; }
     metrics_textfile_write() { cat; }
+    status_clock_synced() { echo "$PK_CLOCK"; }
     kc_get() {
       case "$1" in
         /portcullis) printf '%s' "$PK_REALM" ;;
@@ -696,6 +736,9 @@ pk_status() {
         "/portcullis/clients?clientId=portcullis-forward-auth") echo '[{"id":"fwd"}]' ;;
         /portcullis/authentication/required-actions/webauthn-register-passwordless) echo '{"alias":"webauthn-register-passwordless","enabled":true}' ;;
         /portcullis/authentication/required-actions/webauthn-register) printf '{"alias":"webauthn-register","enabled":%s}' "$PK_2FA" ;;
+        /portcullis/authentication/required-actions/CONFIGURE_TOTP|/portcullis/authentication/required-actions/delete_credential)
+          [ -z "$PK_OTP_RA" ] || printf '{"alias":"%s","enabled":%s}' "${1##*/}" "$PK_OTP_RA" ;;
+        /portcullis/authentication/required-actions/*/config) printf '{"config":{"max_auth_age":"%s"}}' "$PK_OTP_AGE" ;;
         *) echo '{}' ;;
       esac
     }
@@ -728,6 +771,36 @@ expect_eq "status --json: an unreadable realm or action → not ok (fail closed)
 expect_eq "status --textfile: portcullis_keycloak_passkey_policy_ok 1 / 0" \
   "$(pk_status "$PK_REALM_OK" false textfile | grep '^portcullis_keycloak_passkey_policy_ok '):$(pk_status "$PK_REALM_BAD" false textfile | grep '^portcullis_keycloak_passkey_policy_ok ')" \
   "portcullis_keycloak_passkey_policy_ok 1:portcullis_keycloak_passkey_policy_ok 0"
+# ── status: the OTP policy and the authenticator-app actions (contract §8.1
+# "Authenticator-app codes", T23) and the clock ──
+expect_eq "status --json: the wanted OTP policy and actions → otp_policy ok; clock synced true" \
+  "$(pk_status "$PK_REALM_OK" false json | jq -c 'select(type == "object") | [.ok, .keycloak.otp_policy, .system.clock_synced]')" '[true,{"ok":true,"problems":[]},true]'
+expect_eq "status: the OTP line" \
+  "$(pk_status "$PK_REALM_OK" false text | grep -c '✓ authenticator codes: HmacSHA1, 6 digits, 30 s, one step of drift, no reuse; 5-minute sign-in to add or remove')" 1
+OTP_BAD="$(jq -c '.otpPolicyDigits = 8 | .otpPolicyCodeReusable = true | del(.otpPolicyAlgorithm)' <<<"$PK_REALM_OK")"
+expect_eq "status --json: a drifted OTP policy → one named problem per setting, status fails" \
+  "$(pk_status "$OTP_BAD" false json | jq -c 'select(type == "object") | [.ok, .keycloak.otp_policy]')" \
+  '[false,{"ok":false,"problems":["otpPolicyAlgorithm unset (wanted HmacSHA1)","otpPolicyDigits 8 (wanted 6)","otpPolicyCodeReusable true (wanted false)"]}]'
+expect_eq "status: a drifted OTP policy → a ✗ line, exit 1" \
+  "$(pk_status "$OTP_BAD" false text | grep -F '✗ authenticator codes' | sed 's/\x1b\[[0-9;]*m//g'):$(pk_status "$OTP_BAD" false text | tail -n1)" \
+  "  ✗ authenticator codes: otpPolicyAlgorithm unset (wanted HmacSHA1), otpPolicyDigits 8 (wanted 6), otpPolicyCodeReusable true (wanted false) — run ./portcullis keycloak configure:rc 1"
+expect_eq "status --json: the actions disabled, max_auth_age 600 → named problems" \
+  "$(PK_OTP_RA=false PK_OTP_AGE=600 pk_status "$PK_REALM_OK" false json | jq -c 'select(type == "object") | .keycloak.otp_policy.problems')" \
+  '["required action CONFIGURE_TOTP disabled (wanted enabled)","CONFIGURE_TOTP max_auth_age 600 (wanted 300)","required action delete_credential disabled (wanted enabled)","delete_credential max_auth_age 600 (wanted 300)"]'
+expect_eq "status --json: the actions missing → problems (fail closed)" \
+  "$(PK_OTP_RA='' pk_status "$PK_REALM_OK" false json | jq -c 'select(type == "object") | .keycloak.otp_policy.problems')" \
+  '["required action CONFIGURE_TOTP missing (wanted enabled)","required action delete_credential missing (wanted enabled)"]'
+expect_eq "status --json: an unreadable realm → the OTP policy not ok" \
+  "$(pk_status '' false json | jq -c 'select(type == "object") | .keycloak.otp_policy.problems[0]')" "\"the realm can't be read\""
+expect_eq "status --textfile: portcullis_keycloak_otp_policy_ok 1 / 0" \
+  "$(pk_status "$PK_REALM_OK" false textfile | grep '^portcullis_keycloak_otp_policy_ok '):$(pk_status "$OTP_BAD" false textfile | grep '^portcullis_keycloak_otp_policy_ok ')" \
+  "portcullis_keycloak_otp_policy_ok 1:portcullis_keycloak_otp_policy_ok 0"
+expect_eq "status: a clock that isn't synchronised is a warning, never a problem (exit 0); --json false" \
+  "$(PK_CLOCK=false pk_status "$PK_REALM_OK" false text | grep -c "! the clock isn't synchronised: authenticator-app codes fail"):$(PK_CLOCK=false pk_status "$PK_REALM_OK" false text | tail -n1):$(PK_CLOCK=false pk_status "$PK_REALM_OK" false json | jq -c 'select(type == "object") | [.ok, .system.clock_synced]')" \
+  "1:rc 0:[true,false]"
+expect_eq "status --json: clock unknown → \"unknown\"; textfile: the clock gauge 1 / 0, absent when unknown" \
+  "$(PK_CLOCK=unknown pk_status "$PK_REALM_OK" false json | jq -c 'select(type == "object") | .system.clock_synced'):$(pk_status "$PK_REALM_OK" false textfile | grep '^portcullis_system_clock_synced '):$(PK_CLOCK=false pk_status "$PK_REALM_OK" false textfile | grep '^portcullis_system_clock_synced '):$(PK_CLOCK=unknown pk_status "$PK_REALM_OK" false textfile | grep -c '^portcullis_system_clock_synced ' || true)" \
+  '"unknown":portcullis_system_clock_synced 1:portcullis_system_clock_synced 0:0'
 
 # ── realm-export.json: the sign-in flows of contract §8.1 (D6) ──
 RX="$HERE/../keycloak/realm-export.json"
@@ -838,6 +911,16 @@ expect_eq "every forward-auth middleware's authResponseHeaders lists X-Forwarded
 # The login theme passes the extension's hints to the registration script.
 expect_eq "theme: webauthn-register.ftl hands portcullisHints to webauthnRegister.js" \
   "$(grep -cF 'portcullisHints : ${(portcullisHints!"[]")?c}' "$HERE/../keycloak/themes/portcullis/login/webauthn-register.ftl" 2>/dev/null || echo 0)" 1
+# The authenticator-app setup page (contract §8.1 "Authenticator-app codes"):
+# a unique prefilled label, the apps named, the stock ids, hidden secret
+# input and mode handling kept (the e2e hides the QR / key by id).
+TOTP_FTL="$HERE/../keycloak/themes/portcullis/login/login-config-totp.ftl"
+# shellcheck disable=SC2016  # literal FreeMarker
+expect_eq "theme: login-config-totp.ftl prefills a unique label and names the apps" \
+  "$(grep -cF 'value="${msg("portcullisTotpDeviceDefault")} ${.now?string("yyyy-MM-dd HH:mm:ss")}"' "$TOTP_FTL"):$(grep -c '"Google Authenticator", "Microsoft Authenticator", "Authy", "1Password", "Bitwarden", "FreeOTP", "Aegis", "Raivo"' "$TOTP_FTL"):$(grep -cx 'portcullisTotpDeviceDefault=Authenticator' "$HERE/../keycloak/themes/portcullis/login/messages/messages_en.properties")" "1:1:1"
+# shellcheck disable=SC2016  # literal FreeMarker
+expect_eq "theme: login-config-totp.ftl keeps the stock QR / key ids, the hidden totpSecret and mode, totp / userLabel inputs" \
+  "$(for n in 'id="kc-totp-secret-qr-code"' 'id="kc-totp-secret-key"' 'id="mode-manual"' 'name="totpSecret" value="${totp.totpSecret}"' 'name="mode" value="${mode}"' 'name="totp"' 'name="userLabel"' 'logoutOtherSessions'; do grep -cF -- "$n" "$TOTP_FTL"; done | tr '\n' ' ')" "1 1 1 1 1 1 1 1 "
 expect_eq "theme: webauthnRegister.js asks for direct attestation and sets hints" \
   "$(grep -cE 'attestation = "direct"|publicKey\.hints = ' "$HERE/../keycloak/themes/portcullis/login/resources/js/webauthnRegister.js")" 2
 

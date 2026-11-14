@@ -526,7 +526,7 @@ func main() {
 		log.Printf("WARNING: Hub invite API disabled: %v", err)
 	}
 	kc := newKeycloakClient(envOr("KEYCLOAK_URL", "http://keycloak:8080"), "portcullis", "portcullis-enroll", secretDir+"/keycloak-client-secret")
-	inv, err := newInviteService(cfg.Domain, clientSecret, apiSecret, cfg.getUser, kc.RequirePasskey)
+	inv, err := newInviteService(cfg.Domain, clientSecret, apiSecret, cfg.getUser, kc.RequirePasskey, kc.RequireTotp)
 	if err != nil {
 		log.Fatalf("invite service: %v", err)
 	}

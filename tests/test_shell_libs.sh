@@ -1878,6 +1878,11 @@ if [ "$rc" = 3 ] && [ -n "$stop_hub" ] && [ -n "$down_samba" ] && [ -n "$down_tm
 else
   t_fail "restore: order wrong (rc=$rc stop_hub=$stop_hub samba=$down_samba tm=$down_tm core=$down_core rm_pg=$rm_pg): $(tr '\n' '|' < "$STUB_DIR/calls")"
 fi
+expect_eq "restore's last line (T24): authenticator apps and passkeys removed since the backup work again" \
+  "$(bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/backup.sh'; _restore_lost_devices_note" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')" \
+  "$(printf '%s' "==> Authenticator apps and passkeys removed after this backup's date work again: remove the ones reported lost since then (People → person → Sign-in).")"
+expect_eq "restore: the note is backup_restore's last command (both cmd_restore paths call it)" \
+  "$(bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/backup.sh'; declare -f backup_restore" | grep -v '^ *}$' | tail -n1 | sed 's/^ *//; s/;$//')" "_restore_lost_devices_note"
 expect_eq "restore: each app project downed once, never the core project by -p" \
   "$(grep -c '^compose -p ' "$STUB_DIR/calls")" "2"
 expect_ok "restore: no app down removes volumes" sh -c "! grep -q '^compose -p .* -v' '$STUB_DIR/calls'"
@@ -2145,9 +2150,35 @@ RK_OUT="$(
   kc_send() { echo "$1 $2" >&3; echo 204; }
   invite_replace_keys alice 3>&1 >/dev/null 2>&1
 )"
-expect_eq "invite --replace-keys deletes every passkey kind, never a password / OTP, then signs out" \
+expect_eq "invite --replace-keys deletes every passkey kind and every authenticator app (otp, T28), never a password, then signs out" \
   "$(printf '%s\n' "$RK_OUT" | sort | tr '\n' ' ')" \
-  "DELETE /portcullis/users/u1/credentials/c1 DELETE /portcullis/users/u1/credentials/c2 DELETE /portcullis/users/u1/credentials/c3 DELETE /portcullis/users/u1/credentials/c4 POST /portcullis/users/u1/logout "
+  "DELETE /portcullis/users/u1/credentials/c1 DELETE /portcullis/users/u1/credentials/c2 DELETE /portcullis/users/u1/credentials/c3 DELETE /portcullis/users/u1/credentials/c4 DELETE /portcullis/users/u1/credentials/c6 POST /portcullis/users/u1/logout "
+expect_eq "INVITE_PASSKEY_TYPES_JQ selects otp, never password" \
+  "$(bash -c "source '$HERE/../scripts/lib/users.sh'; jq -c \"[\$INVITE_PASSKEY_TYPES_JQ]\" <<<'[{\"id\":\"o\",\"type\":\"otp\"},{\"id\":\"p\",\"type\":\"password\"}]'")" '["o"]'
+
+# ── status_clock_synced (contract §8.1 "Authenticator-app codes"): systemd's
+# NTPSynchronized, else chrony's offset under 5 s, else unknown ──
+mkdir -p "$WORK/clk"
+# clock_with <timedatectl answer|-> <chronyc tracking text|-> — the helper's
+# answer with only the stubs given on PATH ("-" = that tool is absent).
+clock_with() {
+  rm -f "$WORK/clk/timedatectl" "$WORK/clk/chronyc"
+  if [ "$1" != - ]; then printf '#!/bin/sh\n[ "$*" = "show -p NTPSynchronized --value" ] || exit 2\nprintf "%%s\\n" "%s"\n' "$1" > "$WORK/clk/timedatectl"; chmod +x "$WORK/clk/timedatectl"; fi
+  if [ "$2" != - ]; then printf '#!/bin/sh\n[ "$1" = tracking ] || exit 2\ncat <<EOF\n%s\nEOF\n' "$2" > "$WORK/clk/chronyc"; chmod +x "$WORK/clk/chronyc"; fi
+  # Only the stubs and the basic tools: no host timedatectl / chronyc.
+  mkdir -p "$WORK/clk/bin"
+  for t in awk sh cat; do ln -sf "$(command -v "$t")" "$WORK/clk/bin/$t"; done
+  PATH="$WORK/clk:$WORK/clk/bin" "$BASH" -c "source '$HERE/../scripts/lib/status.sh'; status_clock_synced"
+}
+CHRONY_OK='Reference ID    : C0A80101 (ntp.example.com)
+System time     : 0.000123456 seconds fast of NTP time
+Leap status     : Normal'
+CHRONY_OFF='System time     : 12.500000000 seconds slow of NTP time'
+expect_eq "clock: timedatectl yes / no" "$(clock_with yes -):$(clock_with no "$CHRONY_OK")" "true:false"
+expect_eq "clock: timedatectl without an answer → chrony's offset (under 5 s true, else false)" \
+  "$(clock_with '' "$CHRONY_OK"):$(clock_with - "$CHRONY_OFF"):$(clock_with - 'System time     : 4.999 seconds fast of NTP time')" "true:false:true"
+expect_eq "clock: neither tool, or an answer that doesn't parse → unknown" \
+  "$(clock_with - -):$(clock_with maybe -):$(clock_with - 'chronyc: cannot talk to daemon')" "unknown:unknown:unknown"
 
 # ══ dns: plan / setup / check on the domains image's dns tool ═══
 # docker stub: argv of every call → $STUB_DIR/dt/argv (one line each);

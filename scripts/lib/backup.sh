@@ -945,6 +945,16 @@ backup_restore() {
   if [ -n "$RESTORE_STOPPED_APPS" ]; then
     warn "Taken down for the restore and NOT started again: $RESTORE_STOPPED_APPS. Their file-share passwords were voided by the restore (people create new ones on My apps). Start each one again from the Hub: its drift shows it as not running (resolve the drift there, or restart the app)."
   fi
+  # Always the last line, on both restore paths (local and --from-offsite).
+  _restore_lost_devices_note
+}
+
+# _restore_lost_devices_note — restore's last line (contract §8.1
+# "Authenticator-app codes", T24): the restored Keycloak database brings
+# back every authenticator app and passkey removed after the backup's date,
+# a lost phone or key included, and the restored audit can't say which.
+_restore_lost_devices_note() {
+  warn "Authenticator apps and passkeys removed after this backup's date work again: remove the ones reported lost since then (People → person → Sign-in)."
 }
 
 # ── schedule ───────────────────────────────────────────────
