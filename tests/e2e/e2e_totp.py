@@ -80,7 +80,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_login as base  # noqa: E402
 import e2e_ops  # noqa: E402
 import e2e_signin as s  # noqa: E402  (the stack's helpers: check, hub, kc, people_json, …)
-from e2e_signin import (AUTH, DOMAIN, ECHO_BASIC, PEOPLE, PORTAL, REALM, TIMEOUT_MS, body, check, goto,  # noqa: E402
+from e2e_signin import (AUTH, DOMAIN, ECHO_BASIC, PEOPLE, PORTAL, REALM, TIMEOUT_MS, body, check,  # noqa: E402
                         hub, hub_ok, kc, kc_user_id, mask, needs, people_as, people_json, state, until)
 
 ECHO_OTP = f"https://echo-otp.{DOMAIN}"
@@ -107,6 +107,53 @@ USED: set = set()
 
 
 # ── small helpers ──
+
+def network_changed(e: Exception) -> bool:
+    return "ERR_NETWORK_CHANGED" in str(e)
+
+
+def note_retry(what: str) -> None:
+    """A navigation retried after Chromium's net::ERR_NETWORK_CHANGED (a
+    container start or network attach on the runner aborts in-flight
+    requests): visible in the log and the job summary."""
+    print(f"::warning::e2e_totp: {what} aborted by net::ERR_NETWORK_CHANGED; retried once", flush=True)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a") as f:
+            f.write(f"- ⚠️ e2e_totp: {what} retried once after net::ERR_NETWORK_CHANGED\n")
+
+
+def goto(page: Page, url: str):
+    """page.goto, retried once on net::ERR_NETWORK_CHANGED only (logged)."""
+    try:
+        return page.goto(url, wait_until="domcontentloaded")
+    except PWError as e:
+        if not network_changed(e):
+            raise
+        note_retry(f"opening {url.split('?')[0]}")
+        page.wait_for_timeout(2000)
+        return page.goto(url, wait_until="domcontentloaded")
+
+
+def interfaces() -> str:
+    out = subprocess.run(["ip", "-o", "link", "show"], capture_output=True, text=True)
+    return "\n".join(sorted(ln.split(":")[1].strip() for ln in out.stdout.splitlines() if ":" in ln))
+
+
+def network_settled(quiet: float = 10, limit: float = 120) -> None:
+    """Wait until the runner's network interfaces stopped changing for
+    `quiet` seconds (an instance's containers attach veths and bridges
+    while they start: Chromium aborts requests in flight with
+    net::ERR_NETWORK_CHANGED)."""
+    deadline, last, since = time.time() + limit, interfaces(), time.time()
+    while time.time() < deadline:
+        time.sleep(1)
+        now = interfaces()
+        if now != last:
+            last, since = now, time.time()
+        elif time.time() - since >= quiet:
+            return
+    print(f"::warning::e2e_totp: the network still changed after {limit:.0f} s", flush=True)
 
 def shot(page: Page, name: str) -> None:
     """A screenshot only (never the HTML), never of the setup page."""
@@ -233,8 +280,23 @@ def type_password(page: Page, user: str, password: str) -> None:
     if visible(page, "#username") and page.locator("#username").is_editable():
         page.fill("#username", user)
     page.fill("#password", password)
-    with page.expect_navigation(wait_until="domcontentloaded"):
-        page.click("#kc-login")
+    try:
+        with page.expect_navigation(wait_until="domcontentloaded"):
+            page.click("#kc-login")
+    except PWError as e:
+        if not network_changed(e):
+            raise
+        # The post never got its answer: back on the form (Keycloak's own
+        # page, or the one before Chromium's error page), typed once more.
+        note_retry("the password form")
+        page.wait_for_timeout(2000)
+        if not visible(page, "#password"):
+            page.go_back(wait_until="domcontentloaded")
+        if visible(page, "#username") and page.locator("#username").is_editable():
+            page.fill("#username", user)
+        page.fill("#password", password)
+        with page.expect_navigation(wait_until="domcontentloaded"):
+            page.click("#kc-login")
 
 
 def dismiss_notice(page: Page) -> bool:
@@ -421,6 +483,8 @@ def main() -> int:
             until(f"{INSTANCE} on {TEMPLATE} in the policy",
                   lambda: s.hub_json("group-gate-policy.json")["hosts"].get(f"{INSTANCE}.{DOMAIN}") == TEMPLATE, 60)
             until(f"{INSTANCE} routed", lambda: s.curl_tls(f"{INSTANCE}.{DOMAIN}")[1] in ("302", "401", "403"), 120)
+            # Its containers' networks attached: no browser request in flight meanwhile.
+            network_settled()
             # pat: his password only (e2e_signin gave him a device-bound passkey).
             uid = kc_user_id("pat")
             for c in kc(f"/users/{uid}/credentials"):
