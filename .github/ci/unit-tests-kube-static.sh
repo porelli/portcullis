@@ -106,6 +106,21 @@ fi
 if "$HELM" template portcullis charts/portcullis -n portcullis -f tests/k8s-ci-values.yaml -f "$IMGV" --set images.vault=docker.io/hashicorp/vault:2.2.1 >/dev/null 2>&1; then
   echo "FAIL: the chart renders an image without a digest"; exit 1
 fi
+# The egress policy fails closed without the node / API addresses, and
+# excludes every API endpoint even off the nodes.
+for empty in nodeAddresses apiEndpoints; do
+  if "$HELM" template portcullis charts/portcullis -n portcullis -f tests/k8s-ci-values.yaml -f "$IMGV" --set "$empty=null" >/dev/null 2>&1 \
+     || "$HELM" template portcullis charts/portcullis -n portcullis -f tests/k8s-ci-values.yaml -f "$IMGV" --set-json "$empty=[]" >/dev/null 2>&1; then
+    echo "FAIL: the chart renders the egress policy with an empty $empty"; exit 1
+  fi
+done
+"$HELM" template portcullis charts/portcullis -n portcullis -f tests/k8s-ci-values.yaml -f "$IMGV" --set-json 'apiEndpoints=["10.1.0.4:6443","10.9.8.7:6443"]' --show-only templates/netpol-networks.yaml \
+  | "$PY" -c 'import sys, yaml
+p = [d for d in yaml.safe_load_all(sys.stdin) if d and d["metadata"]["name"] == "egress-internet"][0]
+ex = p["spec"]["egress"][0]["to"][0]["ipBlock"]["except"]
+want = {"10.42.0.0/24", "10.43.0.0/16", "169.254.0.0/16", "10.1.0.4/32", "198.51.100.1/32", "10.9.8.7/32"}
+sys.exit(0 if set(ex) == want else "FAIL: egress-internet except %s != %s" % (sorted(ex), sorted(want)))'
+echo "PASS: the egress policy refuses an empty nodeAddresses / apiEndpoints and excludes every API endpoint"
 
 "$PY" tests/k8s_parity.py
 "$PY" tests/k8s_netpol_matrix.py

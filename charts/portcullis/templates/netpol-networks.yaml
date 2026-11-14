@@ -8,6 +8,10 @@ portcullis.io/egress (a member of a non-internal network): the internet, not
 the pod / service networks, link-local or the nodes — the nodes only on
 80 / 443 (the hairpin to auth.<domain>). */ -}}
 {{- $ns := .Release.Namespace -}}
+{{- /* Fail closed: without the node and API addresses the internet rule
+would let every egress pod reach the nodes and the kube API. */ -}}
+{{- if not (required "nodeAddresses is required (PORTCULLIS_KUBE_NODE_ADDRESSES)" .Values.nodeAddresses) }}{{ fail "nodeAddresses is empty: refusing to render the egress policy without the node addresses" }}{{ end -}}
+{{- if not (required "apiEndpoints is required (PORTCULLIS_KUBE_API_ENDPOINTS)" .Values.apiEndpoints) }}{{ fail "apiEndpoints is empty: refusing to render the egress policy without the kube API addresses" }}{{ end -}}
 {{- $nets := list "portcullis" "portcullis-proxy" "portcullis-auth" "monitoring" "alerting" "portcullis-domains" "portcullis-certs" "domains-egress" "portcullis-mcp" "portcullis-sessions" "wg-egress" -}}
 {{- range $n := $nets }}
 ---
@@ -73,6 +77,12 @@ spec:
               - 169.254.0.0/16
               {{- range .Values.nodeAddresses }}
               - {{ . }}/32
+              {{- end }}
+              {{- range .Values.apiEndpoints }}
+              {{- $a := index (splitList ":" .) 0 }}
+              {{- if not (has $a $.Values.nodeAddresses) }}
+              - {{ $a }}/32
+              {{- end }}
               {{- end }}
     {{- with .Values.nodeAddresses }}
     - to:
