@@ -29,7 +29,7 @@ services:
   # No client cert needed. Redirects to Keycloak if not logged in.
   # ============================================================
   grafana:
-    image: docker.io/grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
+    image: docker.io/grafana/grafana:13.3.1@sha256:0615ec4fbd4072004b7d86b46ded63013a74b7d6eb1119273dd89e8fa25c13cf
     networks:
       - portcullis-proxy
     labels:
@@ -80,7 +80,7 @@ services:
       --log-file=stdout
 
   netbird-management:
-    image: docker.io/netbirdio/management:0.82.0@sha256:07c8f979fcc980678cc64e584cf6b7b27204ceb4c871531b29e2dce39592e9ff
+    image: docker.io/netbirdio/management:0.82.1@sha256:cbdd58b5ea70072afa4684c4ad191522e4cc32e753ba3fdd8dab7ffc16f61120
     command: >
       --port 8011
       --log-level info
@@ -106,7 +106,7 @@ services:
       traefik.http.services.netbird-api.loadbalancer.server.port: "8011"
 
   netbird-signal:
-    image: docker.io/netbirdio/signal:0.82.0@sha256:0c0c38bbef7dcdfa1822b6d59844615db55dc7303b664e7aed498151edc0dbfb
+    image: docker.io/netbirdio/signal:0.82.1@sha256:1735ff3b09c4fdace66ef38ffe6cded1821800ef78755560d918079aff2c7608
     networks:
       - portcullis-proxy
     labels:
@@ -119,7 +119,7 @@ services:
       traefik.http.services.netbird-signal.loadbalancer.server.scheme: h2c
 
   netbird-dashboard:
-    image: docker.io/netbirdio/dashboard:v2.96.0@sha256:340b13c00b84349572a2acc5605e907cb09250a9e6461c757097eabdb8e02f2c
+    image: docker.io/netbirdio/dashboard:v2.96.1@sha256:dbbec81fff42f6eb42ce0594033eafc1ae1c69b25a2595cc90e8097f0bcd468d
     environment:
       NETBIRD_MGMT_API_ENDPOINT: https://netbird.${PORTCULLIS_DOMAIN:-portcullis.local}
       NETBIRD_MGMT_GRPC_API_ENDPOINT: https://netbird.${PORTCULLIS_DOMAIN:-portcullis.local}
