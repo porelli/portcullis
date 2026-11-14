@@ -40,10 +40,18 @@ status_wait() { # status_wait <seconds> — status --json clean (DNS problems al
   fail "status not clean after $1 s"
 }
 
-lldap_token() {
-  local pw
-  pw="$(grep '^LLDAP_ADMIN_PASSWORD=' .env | cut -d= -f2-)"; echo "::add-mask::$pw"
-  PW="$pw" jq -n '{username: "admin", password: env.PW}' | curl -sf "$1/auth/simple/login" -H 'Content-Type: application/json' -d @- | jq -r .token
+lldap_token() { # lldap_token <base> — admin's token (retried; the HTTP status on failure, never the token)
+  local pw code tok out
+  pw="$(grep '^LLDAP_ADMIN_PASSWORD=' .env | cut -d= -f2-)"; echo "::add-mask::$pw" >&2
+  out="$(mktemp)"
+  for _ in $(seq 1 30); do
+    code="$(PW="$pw" jq -n '{username: "admin", password: env.PW}' \
+      | curl -s -o "$out" -w '%{http_code}' --max-time 10 "$1/auth/simple/login" -H 'Content-Type: application/json' -d @- || true)"
+    tok="$(jq -r '.token // empty' "$out" 2>/dev/null || true)"
+    [ "$code" = 200 ] && [ -n "$tok" ] && { rm -f "$out"; printf '%s' "$tok"; return 0; }
+    sleep 2
+  done
+  rm -f "$out"; echo "FAIL: LLDAP login as admin: HTTP ${code:-none}" >&2; return 1
 }
 
 case "${1:-}" in
@@ -53,10 +61,7 @@ docker)
   printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
   COMPOSE_FILE=docker-compose.yml:docker-compose.ci.yml ./portcullis init --runtime docker --non-interactive --domain "$E2E_DOMAIN" \
     --email "ci@$E2E_DOMAIN" --dns-provider none --no-config-repo 2>&1 | redact
-  tok="$(lldap_token http://127.0.0.1:17170)"; echo "::add-mask::$tok"
-  jq -n '{query: "mutation { createUser(user: {id: \"rt-person\", email: \"rt-person@portcullis.local\"}) { id } }"}' \
-    | curl -sf http://127.0.0.1:17170/api/graphql -H @<(printf 'Authorization: Bearer %s\n' "$tok") -H 'Content-Type: application/json' -d @- \
-    | jq -e '.errors == null' >/dev/null || fail "create the LLDAP person rt-person"
+  bash .github/ci/lldap-create-person.sh rt-person
   COMPOSE_FILE=docker-compose.yml:docker-compose.ci.yml ./portcullis backup
   B="$(find backups -mindepth 1 -maxdepth 1 -type d -name '2*' | sort | tail -n1)"
   jq -e '.runtime.name == "docker"' "$B/MANIFEST.json" >/dev/null || fail "the Docker backup's MANIFEST.json"
@@ -144,7 +149,7 @@ restore)
   K -n portcullis port-forward --address 127.0.0.1 svc/lldap :17170 > "$pf_log" 2>&1 &
   for i in $(seq 1 50); do grep -q 'Forwarding from' "$pf_log" && break; sleep 0.2; done
   port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) .*/\1/p' "$pf_log" | head -n1)"
-  tok="$(lldap_token "http://127.0.0.1:$port")"; echo "::add-mask::$tok"
+  tok="$(lldap_token "http://127.0.0.1:$port")" || exit 1; echo "::add-mask::$tok"
   jq -n '{query: "{ user(userId: \"rt-person\") { id } }"}' | curl -sf "http://127.0.0.1:$port/api/graphql" -H @<(printf 'Authorization: Bearer %s\n' "$tok") \
     -H 'Content-Type: application/json' -d @- | jq -e '.data.user.id == "rt-person"' >/dev/null || fail "rt-person isn't in the restored LLDAP"
   echo "PASS: Docker → Kubernetes restore: host keys kept, status clean, the CA chain and rt-person are the Docker phase's"
