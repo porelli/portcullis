@@ -1,7 +1,9 @@
 # One binding per policy (a binding binds exactly one policy, Task 0 Q4;
 # K6 / K-P1): portcullis-apps-guard-<policy>, the apps namespace only, and
 # portcullis-edge-guard-routes on portcullis-edge; the params ConfigMap
-# portcullis-admission-params (missing = deny), Deny.
+# portcullis-admission-params (missing = deny), Deny. The CLI applies each as
+# <name>-<params generation> on portcullis-admission-params-<generation>,
+# create-before-delete (scripts/lib/kube.sh kube_admission_params_apply).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:

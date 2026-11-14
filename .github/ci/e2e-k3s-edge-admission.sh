@@ -4,8 +4,9 @@
 # by RBAC (its edge Role: IngressRoute + Middleware only) and the
 # portcullis-edge-routes policy (kube/admission/policies.yaml). Every case
 # runs as the Hub's ServiceAccount (`kubectl --as`, server dry-run unless it
-# needs a live object); each refusal must come from the binding
-# portcullis-edge-guard-routes, each control must be admitted.
+# needs a live object); each refusal must come from a binding
+# portcullis-edge-guard-routes-<params generation>, each control must be
+# admitted.
 #   bash .github/ci/e2e-k3s-edge-admission.sh [<context>]   (default ci)
 # Needs: the namespaces, the policies + bindings + params, the Hub's Roles
 # (./portcullis init does all of it).
@@ -30,7 +31,7 @@ admitted() {
 refused() {
   local what="$1" out; shift
   if out="$(KH -n "$EDGE" "$@" 2>&1)"; then fail "admitted, want refused: $what"; fi
-  printf '%s' "$out" | grep -q "with binding 'portcullis-edge-guard-routes'" \
+  printf '%s' "$out" | grep -q "with binding 'portcullis-edge-guard-routes-" \
     || fail "refused, but not by portcullis-edge-guard-routes: $what: $(printf '%s' "$out" | head -c 400)"
   count ref
 }
@@ -103,7 +104,9 @@ ir '.spec.routes[0].priority = 1001' | refused "a priority above maxAppPriority"
 for m in 'HostRegexp(`.+`)' 'PathPrefix(`/`)' 'Host(`e2e.example.org`) || PathPrefix(`/`)' 'Host(`e2e.example.org`) && Header(`X`, `y`)' 'ClientIP(`10.0.0.0/8`)'; do
   ir ".spec.routes[0].match = \"$m\"" | refused "the match $m" "${C[@]}"
 done
-RES="$(K -n "$APPS" get configmap portcullis-admission-params -o jsonpath='{.data.reservedHosts}')"
+# The params the live edge binding names (older generations may linger).
+PCM="$(K get validatingadmissionpolicybinding -l portcullis.io/binding=portcullis-edge-guard-routes -o jsonpath='{.items[0].spec.paramRef.name}')"
+RES="$(K -n "$APPS" get configmap "$PCM" -o jsonpath='{.data.reservedHosts}')"
 APEX="${RES%% *}" HUBH="hub.${RES%% *}"
 ir ".spec.routes[0].match = \"Host(\`app1.$APEX\`)\"" | admitted "an app host under the apex (app1.$APEX)" "${C[@]}"
 for h in "$HUBH." "HUB.$APEX" "Hub.$APEX" "hub..$APEX" "-x.example.org" "x-.example.org" "x.$HUBH" "a.b.$HUBH" "$HUBH.." ".$HUBH"; do

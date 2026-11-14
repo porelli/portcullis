@@ -131,7 +131,7 @@ KH() { kubectl --kubeconfig "$T/hub.kubeconfig" "$@"; }
 denied() { # denied <policy> <manifest json> — a server dry-run refused by that binding
   local out
   if out="$(printf '%s' "$2" | KH -n "$APPS" create --dry-run=server -f - 2>&1)"; then fail "the guard admitted: $(printf '%s' "$2" | head -c 200)"; fi
-  printf '%s' "$out" | grep -q "with binding 'portcullis-apps-guard-$1'" || fail "refused, but not by portcullis-apps-guard-$1: $(printf '%s' "$out" | head -c 400)"
+  printf '%s' "$out" | grep -q "with binding 'portcullis-apps-guard-$1-" || fail "refused, but not by portcullis-apps-guard-$1: $(printf '%s' "$out" | head -c 400)"
 }
 POD='{"apiVersion":"v1","kind":"Pod","metadata":{"name":"g","labels":{"portcullis.io/instance":"e2e"}},"spec":{"automountServiceAccountToken":false,"containers":[{"name":"c","image":"'"$ALPINE"'"}]'
 denied pods "$POD"',"volumes":[{"name":"h","hostPath":{"path":"/etc"}}]}}'
@@ -144,6 +144,8 @@ denied pods "$(printf '%s' "$POD" | sed 's/"portcullis.io\/instance":"e2e"/"port
 pass "the guard refuses a hostPath outside the roots, a NodePort, a foreign helper image and vpn-slot 47, each by its binding; pods/exec is create only"
 # The apps' Traefik objects live in portcullis-edge: every refusal there.
 bash .github/ci/e2e-k3s-edge-admission.sh ci
+# A params change never leaves an object unbound.
+bash .github/ci/e2e-k3s-rebind.sh
 
 # ── Secret access of every ServiceAccount (least privilege) ──
 # Traefik reads Secrets only in the edge namespace (it holds none), the Hub

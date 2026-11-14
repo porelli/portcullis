@@ -596,12 +596,13 @@ spec:
     - name: oldOwner
       expression: "request.operation != 'CREATE' && has(oldObject.metadata.labels) && 'portcullis.io/owner' in oldObject.metadata.labels ? oldObject.metadata.labels['portcullis.io/owner'] : ''"
   validations:
-    # The CLI's probe (kube_admission_probe): an annotation naming another
-    # params generation is refused, so only the params just written admit it.
+    # The CLI's probe (kube_admission_probe): an object annotated with
+    # exactly this binding's params generation is refused, naming it — the
+    # proof that bindings of that generation are live with their params.
     - expression: >-
         variables.del || !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
-        || object.metadata.annotations['portcullis.io/params-generation'] == params.data.generation
-      message: "portcullis.io/params-generation isn't these params' generation"
+        || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
+      messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
     - expression: "variables.exempt || variables.del || object.kind in ['IngressRoute', 'Middleware']"
       messageExpression: "object.kind + ' is refused in portcullis-edge (only IngressRoute and Middleware)'"
     - expression: >-
