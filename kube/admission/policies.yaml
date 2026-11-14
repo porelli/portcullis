@@ -904,8 +904,8 @@ spec:
     - name: ownName
       expression: "variables.inst + '--'"
     # <instance>--<service>: the part after the instance's own prefix is one
-    # DNS label without "--" (instance ids may hold "--": instance a may
-    # never name a--b--web, instance a--b's).
+    # DNS label without "--", so "--" stays the one separator (the Hub
+    # refuses instance ids with "--"; this holds without relying on that).
     - name: ownSvc
       expression: >-
         !variables.del && object.kind == 'Service' && variables.inst != ''

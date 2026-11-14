@@ -272,7 +272,7 @@ func snapshot(f *config.File) *config.Snapshot {
 
 func peopleTools() []string {
 	return []string{"my_apps", "invite_person", "update_person", "delete_person",
-		"person_sign_in", "revoke_person_certificate", "remove_passkeys"}
+		"person_sign_in", "revoke_person_certificate", "remove_passkeys", "remove_authenticators"}
 }
 
 func newHarness(t *testing.T, f *config.File, ups map[string]*fakeUp, tweak func(c *Config)) *harness {
@@ -810,11 +810,15 @@ func TestAggregateNeverHasAdminTools(t *testing.T) {
 			t.Errorf("listed %s", n)
 		}
 	}
+	if !slices.Contains(delegateTools, "remove_authenticators") {
+		t.Error("remove_authenticators acts on another person: a delegate tool (G38)")
+	}
 	if !slices.Contains(got, "portcullis__my_apps") {
 		t.Errorf("no people tool: %v", got)
 	}
 	for _, name := range []string{"portcullis__invite_person", "portcullis__update_person", "portcullis__delete_person",
-		"portcullis__person_sign_in", "portcullis__revoke_person_certificate", "portcullis__remove_passkeys", "portcullis__delete_instance"} {
+		"portcullis__person_sign_in", "portcullis__revoke_person_certificate", "portcullis__remove_passkeys", "portcullis__remove_authenticators",
+		"portcullis__delete_instance"} {
 		r, err := cs.CallTool(ctx20(t), &sdk.CallToolParams{Name: name})
 		if err == nil && !r.IsError {
 			t.Errorf("%s answered", name)

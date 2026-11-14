@@ -33,8 +33,11 @@ Checks, run in order:
      sign-in methods (core[host] for a gated core host, else hosts[host],
      else default) must be met by the session's methods: the token's amr
      values mapped through the method table (AMR_TO_METHOD), kept only
-     while the method is switched on (`methods`). If not, 403 with one of
-     three pages (contract §5), never an automatic redirect:
+     while the method is switched on (`methods`; amr `otp` is `totp`, an
+     authenticator-app code). A compiled rule with an alternative that is
+     `totp` alone is invalid (fail closed: a code is never a way in by
+     itself). If not met, 403 with one of three pages (contract §5),
+     never an automatic redirect:
        - present-certificate (#present-certificate): amr holds mtls (file)
          and the rule would be met if the YubiKey (browser) certificate
          counted, but this request carries no bound certificate of that kind;
@@ -283,15 +286,17 @@ DENY_USERS = frozenset(u.strip().lower() for u in os.environ.get("GATE_DENY_USER
 # ── Sign-in methods (contract §8.1 "Methods"; the same table in the Hub's
 # internal/signin, the Keycloak extension and mcp-gate) ──
 
-# The six method ids in canonical order (weakest first).
-METHOD_IDS = ("password", "passkey_synced", "browser_cert", "passkey_device", "security_key", "yubikey_cert")
+# The seven method ids in canonical order (contract §8.1). `totp` (an
+# authenticator-app code, amr `otp`) is a second factor only: no compiled
+# rule may have an alternative that is `totp` alone (validate_rule).
+METHOD_IDS = ("password", "totp", "passkey_synced", "browser_cert", "passkey_device", "security_key", "yubikey_cert")
 # amr value → method id. Anything else (`inv`, a setup-link session,
 # included) stands for nothing.
-AMR_TO_METHOD = {"pwd": "password", "spk": "passkey_synced", "file": "browser_cert",
+AMR_TO_METHOD = {"pwd": "password", "otp": "totp", "spk": "passkey_synced", "file": "browser_cert",
                  "dpk": "passkey_device", "hwk": "security_key", "mtls": "yubikey_cert"}
 # Strengths in tenths (contract §8.1): only the pages' "Set up …" vs "ask
 # your admin" use them, never an access decision.
-METHOD_TENTHS = {"password": 10, "passkey_synced": 25, "browser_cert": 25,
+METHOD_TENTHS = {"password": 10, "totp": 15, "passkey_synced": 25, "browser_cert": 25,
                  "passkey_device": 30, "security_key": 35, "yubikey_cert": 40}
 PASSKEY_KINDS = ("passkey_synced", "passkey_device", "security_key")
 # What a step-up may ask for (`pc_method`, oauth2-proxy's allowlist in
@@ -396,7 +401,9 @@ def validate_rule(node, methods: set, depth: int = 1) -> Optional[str]:
     `methods` (switched on) or a nested group of the same shape; groups nest
     at most 4 levels (the top group is level 1), with at most 48 leaves.
     A family, an amr value, `inv` or any other leaf is refused, as is a
-    leaf at the top."""
+    leaf at the top, and so is a rule with an alternative that is `totp`
+    alone: an authenticator code is never a way in by itself (contract
+    §8.1 "Rules"; checked last, on the whole rule)."""
     if not isinstance(node, dict):
         return "a compiled rule must be a group"
     if depth > RULE_MAX_DEPTH:
@@ -422,7 +429,13 @@ def validate_rule(node, methods: set, depth: int = 1) -> Optional[str]:
             return f"an item must be a method id or a group, not {it!r}"
     if depth == 1 and _rule_leaves(node) > RULE_MAX_LEAVES:
         return f"more than {RULE_MAX_LEAVES} methods in one rule"
+    if depth == 1 and CODE_ONLY in alternatives(node):
+        return "an authenticator code alone is a way in"
     return None
+
+
+# The one alternative no compiled rule may have (validate_rule).
+CODE_ONLY = frozenset({"totp"})
 
 
 def rule_satisfied(node, have: set) -> bool:
@@ -3023,7 +3036,7 @@ def return_path(raw_uri: str, method: str) -> str:
 
 def stepup_url(host: str, method: str, extra: bool, path: str = "/") -> str:
     """The step-up URL (contract §5 "Step-up URL"): oauth2-proxy's
-    /oauth2/start with `pc_method=<method>` (one of the six method ids or
+    /oauth2/start with `pc_method=<method>` (one of the seven method ids or
     `passkey`; oauth2-proxy's loginURLParameters allow exactly those and
     Keycloak hands it to the extension as a client note), which asks for
     that one method on top of the Keycloak session's. `rd` returns to
@@ -3064,7 +3077,8 @@ def stepup_url(host: str, method: str, extra: bool, path: str = "/") -> str:
 # is the step-up's any-passkey-kind ask.
 METHOD_WORDS = {"password": "password", "passkey_synced": "passkey", "browser_cert": "browser certificate",
                 "passkey_device": "device-bound passkey", "security_key": "security key",
-                "yubikey_cert": "YubiKey certificate", "passkey": "passkey"}
+                "yubikey_cert": "YubiKey certificate", "totp": "code from an authenticator app",
+                "passkey": "passkey"}
 
 SIGNIN_CSS = PORTAL_CSS + (
     "h1{margin-bottom:1rem}p{margin:.75rem 0}ul{margin:.5rem 0 .75rem 1.5rem}"
@@ -3170,7 +3184,12 @@ def render_needs_page(app: str, have: set, node, set_up: Optional[set], add_stro
     passkey" / "Set up a security key" for a missing passkey kind not set
     up while `add_stronger` is on or it is no stronger than the session's
     strongest method, otherwise — and always for passwords and
-    certificates — "or ask your admin"; "Sign-in methods" always.
+    certificates — "or ask your admin"; "Sign-in methods" always. An
+    authenticator code (`totp`) not set up reads "— you don't have an
+    authenticator app yet" and gets "Set up an authenticator app"
+    (#portcullis-set-up-authenticator) under the same rule (1.5: any
+    passkey or certificate session, never a password-only one unless
+    `add_stronger` is on).
 
     `impersonated` (a live impersonation's record, D39): the impersonation
     form instead — "<App> needs <methods>. <admin>'s sign-in didn't use
@@ -3196,25 +3215,34 @@ def render_needs_page(app: str, have: set, node, set_up: Optional[set], add_stro
     known = set_up if set_up is not None else set()
     lines, missing_all = [], []
     for alt in alternatives(node):
-        not_set_up = False
+        not_set_up = no_code = False
         for m in _canonical(alt):
             if m in have:
                 continue
             if m not in missing_all:
                 missing_all.append(m)
-            if m in PASSKEY_KINDS and set_up is not None and m not in known:
-                not_set_up = True
-        sub = " <span class=\"portcullis-sub\">— you don&#x27;t have one yet</span>" if not_set_up else ""
+            if set_up is not None and m not in known:
+                if m in PASSKEY_KINDS:
+                    not_set_up = True
+                elif m == "totp":
+                    no_code = True
+        sub = ""
+        if not_set_up:
+            sub = " <span class=\"portcullis-sub\">— you don&#x27;t have one yet</span>"
+        elif no_code:
+            sub = " <span class=\"portcullis-sub\">— you don&#x27;t have an authenticator app yet</span>"
         lines.append(f"<li>{_methods_html(_canonical(alt))}{sub}</li>")
-    passkey = security_key = ask_admin = False
+    passkey = security_key = authenticator = ask_admin = False
     for m in missing_all:
-        if m not in PASSKEY_KINDS:
+        if m not in PASSKEY_KINDS and m != "totp":
             ask_admin = True  # passwords and certificates: only an admin sets them up
         elif m in known:
             continue
         elif add_stronger or METHOD_TENTHS[m] <= strongest:
             if m == "security_key":
                 security_key = True
+            elif m == "totp":
+                authenticator = True
             else:
                 passkey = True
         else:
@@ -3230,6 +3258,9 @@ def render_needs_page(app: str, have: set, node, set_up: Optional[set], add_stro
         links.append(f"<a id=\"portcullis-set-up-passkey\" class=\"btn\" href=\"{acct}\">Set up a passkey</a>")
     if security_key:
         links.append(f"<a id=\"portcullis-set-up-security-key\" class=\"btn\" href=\"{acct}\">Set up a security key</a>")
+    if authenticator:
+        links.append(f"<a id=\"portcullis-set-up-authenticator\" class=\"btn\" href=\"{acct}\">"
+                     "Set up an authenticator app</a>")
     links.append(f"<a id=\"portcullis-sign-in-methods\" href=\"{acct}\">Sign-in methods</a>")
     if ask_admin:
         links.append("<span class=\"portcullis-sub\">or ask your admin</span>")

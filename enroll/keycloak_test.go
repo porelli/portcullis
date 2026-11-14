@@ -119,3 +119,20 @@ func TestKeycloakBadSecret(t *testing.T) {
 		t.Fatal("missing secret file accepted")
 	}
 }
+
+func TestKeycloakRequireTotp(t *testing.T) {
+	f := &fakeKeycloak{actions: []string{passkeyAction}}
+	srv := httptest.NewServer(f.handler(t))
+	defer srv.Close()
+	secret := filepath.Join(t.TempDir(), "secret")
+	os.WriteFile(secret, []byte(testKCSecret+"\n"), 0o600)
+	k := newKeycloakClient(srv.URL, "portcullis", "portcullis-enroll", secret)
+	for i := 0; i < 2; i++ {
+		if err := k.RequireTotp("bob"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if strings.Join(f.actions, ",") != passkeyAction+",CONFIGURE_TOTP" || len(f.puts) != 1 {
+		t.Errorf("actions %v, %d PUTs", f.actions, len(f.puts))
+	}
+}

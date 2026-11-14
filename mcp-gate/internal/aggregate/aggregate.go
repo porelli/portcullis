@@ -71,9 +71,10 @@ var (
 )
 
 // The delegate tools are only on people.<d>/mcp, never here (G38): the
-// Hub's peopleDelegateTools, help to reset (sign_in_help) included.
+// Hub's peopleDelegateTools, help to reset (sign_in_help) included, and
+// remove_authenticators (another person's authenticator apps).
 var delegateTools = []string{"invite_person", "update_person", "delete_person",
-	"person_sign_in", "revoke_person_certificate", "remove_passkeys"}
+	"person_sign_in", "revoke_person_certificate", "remove_passkeys", "remove_authenticators"}
 
 func isDelegate(name string) bool { return slices.Contains(delegateTools, strings.ToLower(name)) }
 

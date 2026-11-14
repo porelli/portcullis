@@ -2024,6 +2024,8 @@ _backup_restore_kube() {
   wait_healthy 300 vault postgres lldap keycloak
   ok "Restore complete. Previous .env/secrets/certs: $pre. Verify with ./portcullis status"
   [ -z "${RESTORE_STOPPED_APPS:-}" ] || warn "Scaled to 0 for the restore and NOT started again: $RESTORE_STOPPED_APPS (their file-share passwords were voided). Start each one from the Hub."
+  # Always the last line, as on docker / podman.
+  _restore_lost_devices_note
 }
 
 # ── offsite on kubernetes: the host's restic (K16) ──
