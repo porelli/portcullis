@@ -18,6 +18,9 @@ Scenarios:
             into a new id → delete.
   fixer     the folder fixer on /srv/e2e-k3s (folder-writer's `shared`):
             the apply op is ok and the files get the folder's gid.
+  alias     the CI template alias-echo: its client reaches the web service
+            by the compose alias web-internal (the Hub's Service
+            alias-k--web-internal + the pods' hostAliases); the host is gated.
   mcp_companion  the templates repo's gitea with its AI companion on: the
             companion's URL https://gitea-k.<d>/mcp (the Hub's route on the
             app's own host to mcp-gate@file) serves the gate's RFC 9728
@@ -48,7 +51,7 @@ FOLDER = os.environ.get("E2E_FOLDER", "/srv/e2e-k3s")
 ART = os.environ.get("E2E_ARTIFACTS", "e2e-artifacts")
 APPS = "portcullis-apps"
 EDGE = "portcullis-edge"
-ECHO, ECHO_R, WRITER, GITEA = "echo-k", "echo-k-r", "folder-writer", "gitea-k"
+ECHO, ECHO_R, WRITER, GITEA, ALIAS = "echo-k", "echo-k-r", "folder-writer", "gitea-k", "alias-k"
 OP_S = 1200
 
 results: list[tuple[str, bool, str]] = []
@@ -177,6 +180,27 @@ def main() -> int:
         assert got == str(gid), f"{FOLDER}/file-1.txt gid {got}, want {gid} (the identity map on k8s)"
         print(f"    applied: gid {gid}", flush=True)
     check("fixer: the folder's apply on /srv is ok through a helper pod; the files carry the folder gid", fixer)
+
+    def alias():
+        needs("runtime")
+        host = f"{ALIAS}.{DOMAIN}"
+        run_op("POST", "/api/instances", {"template": "alias-echo", "id": ALIAS, "label": "Alias on k3s", "hosts": {"alias-echo": host}})
+        run_op("POST", "/api/templates/enable", {"id": ALIAS}, timeout=1500)
+        svc = f"{ALIAS}--web-internal"
+        ip = kubectl("-n", APPS, "get", "service", svc, "-o", "jsonpath={.spec.clusterIP}").strip()
+        pods = json.loads(kubectl("-n", APPS, "get", "pods", "-l", f"portcullis.io/instance={ALIAS}", "-o", "json"))["items"]
+        client = next(p for p in pods if p["metadata"]["labels"].get("portcullis.io/service") == "client")
+        ha = client["spec"].get("hostAliases") or []
+        assert any(h.get("ip") == ip and "web-internal" in h.get("hostnames", []) for h in ha), f"client hostAliases {ha}, want web-internal → {ip}"
+        out = kubectl("-n", APPS, "exec", client["metadata"]["name"], "--", "wget", "-qO-", "-T", "10", "http://web-internal/")
+        assert "Hostname:" in out, f"web-internal from the client: {out[:300]}"
+        # Gated from outside: through Traefik without a session → Keycloak.
+        out = sh("curl", "-s", "-o", "/dev/null", "-w", "%{http_code} %{redirect_url}", "--max-time", "20", "-k",
+                 "--resolve", f"{host}:443:198.51.100.1", f"https://{host}/")
+        code, _, loc = out.partition(" ")
+        assert code in ("302", "303", "307") and ("auth." + DOMAIN) in loc, f"{host}: {out}"
+        print(f"    web-internal → {svc} {ip} from the client; {host} gated", flush=True)
+    check("alias: a compose network alias (web-internal) reaches the gated app inside its instance (Service + hostAliases)", alias)
 
     def mcp_companion():
         needs("runtime")

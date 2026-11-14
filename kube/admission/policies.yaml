@@ -67,6 +67,10 @@ spec:
       'portcullis.io/one-shot' in variables.labels && variables.labels['portcullis.io/one-shot'] == 'true' && has(variables.meta.ownerReferences) && variables.meta.ownerReferences.exists(o, o.kind == 'Job' && has(o.controller) && o.controller) && request.userInfo.username in ['system:serviceaccount:kube-system:job-controller', 'system:kube-controller-manager'] && has(variables.spec.automountServiceAccountToken) && variables.spec.automountServiceAccountToken == false && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.fsGroup) && variables.spec.securityContext.fsGroup == 0) && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.supplementalGroups) && 0 in variables.spec.securityContext.supplementalGroups) && variables.volumes.all(v, has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName.startsWith(variables.prefix)) || (has(v.configMap) && v.configMap.name.startsWith(variables.prefix)) || (has(v.secret) && v.secret.secretName.startsWith(variables.prefix))) && variables.containers.all(c, has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && 'ALL' in c.securityContext.capabilities.drop && (!has(c.securityContext.capabilities.add) || c.securityContext.capabilities.add.all(x, x in ['CHOWN', 'DAC_OVERRIDE', 'FOWNER'])) && (!has(c.ports) || size(c.ports) == 0) && ((has(c.securityContext) && has(c.securityContext.runAsGroup)) ? c.securityContext.runAsGroup != 0 : (has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsGroup) && variables.spec.securityContext.runAsGroup != 0)) && (!has(c.volumeMounts) || c.volumeMounts.all(m, !variables.volumes.exists(v, v.name == m.name && has(v.hostPath)))))
   - name: initNames
     expression: 'has(variables.spec.initContainers) ? variables.spec.initContainers.map(c, c.name) : []'
+  - name: svcStaticBand
+    expression: >-
+      string(cidr(params.data.serviceCIDR).ip()) + '/' + string(32 - ((32 - cidr(params.data.serviceCIDR).prefixLength()) - 4 < 4 ? 4
+      : ((32 - cidr(params.data.serviceCIDR).prefixLength()) - 4 > 8 ? 8 : (32 - cidr(params.data.serviceCIDR).prefixLength()) - 4)))
   validations:
   - expression: >-
       !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
@@ -185,6 +189,17 @@ spec:
     message: >-
       hostname / subdomain / dnsConfig: only the pod's own portcullis.io/service and instance, the search domain
       <instance>.<apps namespace>.svc.cluster.local, no nameservers, no dnsPolicy None
+  # Compose network aliases (ruling): /etc/hosts entries for the Hub's
+  # <instance>--<alias> ClusterIP Services only.
+  - expression: >-
+      (!has(variables.spec.hostAliases) || (size(variables.spec.hostAliases) <= 16 && variables.spec.hostAliases.all(h,
+        has(h.ip) && isIP(h.ip) && ip(h.ip).family() == 4 && cidr(params.data.serviceCIDR).containsIP(h.ip)
+        && h.ip != string(cidr(params.data.serviceCIDR).ip()) && !cidr(variables.svcStaticBand).containsIP(h.ip)
+        && has(h.hostnames) && size(h.hostnames) > 0 && size(h.hostnames) <= 16
+        && h.hostnames.all(n, n.matches('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')))))
+    message: >-
+      hostAliases: at most 16 entries, each an address of the service network outside its static band
+      (the core Services' fixed addresses) and 1-16 hostnames that are single DNS labels
   - expression: >-
       !variables.probe || (variables.inst == 'portcullis-probe'
           && variables.volumes.size() == 0
@@ -278,6 +293,10 @@ spec:
       'portcullis.io/one-shot' in variables.labels && variables.labels['portcullis.io/one-shot'] == 'true' && object.kind == 'Job' && has(variables.spec.automountServiceAccountToken) && variables.spec.automountServiceAccountToken == false && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.fsGroup) && variables.spec.securityContext.fsGroup == 0) && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.supplementalGroups) && 0 in variables.spec.securityContext.supplementalGroups) && variables.volumes.all(v, has(v.emptyDir) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName.startsWith(variables.prefix)) || (has(v.configMap) && v.configMap.name.startsWith(variables.prefix)) || (has(v.secret) && v.secret.secretName.startsWith(variables.prefix))) && variables.containers.all(c, has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && 'ALL' in c.securityContext.capabilities.drop && (!has(c.securityContext.capabilities.add) || c.securityContext.capabilities.add.all(x, x in ['CHOWN', 'DAC_OVERRIDE', 'FOWNER'])) && (!has(c.ports) || size(c.ports) == 0) && ((has(c.securityContext) && has(c.securityContext.runAsGroup)) ? c.securityContext.runAsGroup != 0 : (has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsGroup) && variables.spec.securityContext.runAsGroup != 0)) && (!has(c.volumeMounts) || c.volumeMounts.all(m, !variables.volumes.exists(v, v.name == m.name && has(v.hostPath)))))
   - name: initNames
     expression: 'has(variables.spec.initContainers) ? variables.spec.initContainers.map(c, c.name) : []'
+  - name: svcStaticBand
+    expression: >-
+      string(cidr(params.data.serviceCIDR).ip()) + '/' + string(32 - ((32 - cidr(params.data.serviceCIDR).prefixLength()) - 4 < 4 ? 4
+      : ((32 - cidr(params.data.serviceCIDR).prefixLength()) - 4 > 8 ? 8 : (32 - cidr(params.data.serviceCIDR).prefixLength()) - 4)))
   validations:
   - expression: >-
       !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
@@ -407,6 +426,17 @@ spec:
     message: >-
       hostname / subdomain / dnsConfig: only the pod's own portcullis.io/service and instance, the search domain
       <instance>.<apps namespace>.svc.cluster.local, no nameservers, no dnsPolicy None
+  # Compose network aliases (ruling): /etc/hosts entries for the Hub's
+  # <instance>--<alias> ClusterIP Services only.
+  - expression: >-
+      object.kind == 'Secret' || (!has(variables.spec.hostAliases) || (size(variables.spec.hostAliases) <= 16 && variables.spec.hostAliases.all(h,
+        has(h.ip) && isIP(h.ip) && ip(h.ip).family() == 4 && cidr(params.data.serviceCIDR).containsIP(h.ip)
+        && h.ip != string(cidr(params.data.serviceCIDR).ip()) && !cidr(variables.svcStaticBand).containsIP(h.ip)
+        && has(h.hostnames) && size(h.hostnames) > 0 && size(h.hostnames) <= 16
+        && h.hostnames.all(n, n.matches('^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$')))))
+    message: >-
+      hostAliases: at most 16 entries, each an address of the service network outside its static band
+      (the core Services' fixed addresses) and 1-16 hostnames that are single DNS labels
   - expression: >-
       object.kind == 'Secret' || (!variables.probe || (variables.inst == 'portcullis-probe'
           && variables.volumes.size() == 0

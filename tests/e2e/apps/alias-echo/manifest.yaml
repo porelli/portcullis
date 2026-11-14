@@ -1,0 +1,18 @@
+# CI-only template for e2e-k3s: a gated whoami reached inside its instance
+# by a compose network alias (web-internal). Not a marketplace template.
+name: Alias echo
+description: Header echo reached by a network alias (CI)
+category: misc
+instances: multi
+auth:
+  method: forward-auth
+  group_access: true
+  access_group: users_alias-echo
+  admin_group: admin_alias-echo
+urls:
+  - label: Alias echo
+    url: "https://{{HOST_ALIAS_ECHO}}"
+
+# AI support (contract §3.2, required in every manifest): a CI fixture.
+ai:
+  unsupported: "A CI test fixture with no app API for an AI to act through"
