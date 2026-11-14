@@ -20,7 +20,9 @@ Scenarios:
             the apply op is ok and the files get the folder's gid.
   alias     the CI template alias-echo: its client reaches the web service
             by the compose alias web-internal (the Hub's Service
-            alias-k--web-internal + the pods' hostAliases); the host is gated.
+            alias-k--web-internal + the pods' hostAliases); the host is gated;
+            an instance named web doesn't capture the client's bare "web"
+            (subdomain alias-k--pods, no Service named web).
   mcp_companion  the templates repo's gitea with its AI companion on: the
             companion's URL https://gitea-k.<d>/mcp (the Hub's route on the
             app's own host to mcp-gate@file) serves the gate's RFC 9728
@@ -199,7 +201,20 @@ def main() -> int:
                  "--resolve", f"{host}:443:198.51.100.1", f"https://{host}/")
         code, _, loc = out.partition(" ")
         assert code in ("302", "303", "307") and ("auth." + DOMAIN) in loc, f"{host}: {out}"
-        print(f"    web-internal → {svc} {ip} from the client; {host} gated", flush=True)
+        # An instance named after alias-k's compose service ("web") must not
+        # capture its lookups: the client's bare "web" still reaches its own
+        # web pod (hostname web under the headless alias-k--pods), and no
+        # Service named "web" exists.
+        run_op("POST", "/api/instances", {"template": "echo", "id": "web", "label": "Named web", "hosts": {"echo": f"web.{DOMAIN}"}})
+        run_op("POST", "/api/templates/enable", {"id": "web"}, timeout=1500)
+        own = next(p for p in pods if p["metadata"]["labels"].get("portcullis.io/service") == "web")["status"]["podIP"]
+        out = kubectl("-n", APPS, "exec", client["metadata"]["name"], "--", "wget", "-qO-", "-T", "10", "http://web/")
+        assert f"IP: {own}" in out, f"bare web from {ALIAS}'s client didn't answer from its own web pod {own}: {out[:400]}"
+        assert subprocess.run(["kubectl", "--context", "ci", "-n", APPS, "get", "service", "web"], capture_output=True).returncode != 0, \
+            "a Service named web exists in the apps namespace"
+        assert client["spec"].get("subdomain") == f"{ALIAS}--pods", client["spec"].get("subdomain")
+        run_op("POST", "/api/instances/web/delete", {"confirm": "web"})
+        print(f"    web-internal → {svc} {ip} from the client; bare web stays {ALIAS}'s ({own}) with an instance named web; {host} gated", flush=True)
     check("alias: a compose network alias (web-internal) reaches the gated app inside its instance (Service + hostAliases)", alias)
 
     def mcp_companion():

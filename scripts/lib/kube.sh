@@ -985,7 +985,7 @@ _kube_probe_object() {
   esac
   ns="$(kube_apps_ns)"
   K="$kind" G="$2" IMG="${KUBE_HUB_IMAGE:-$PORTCULLIS_HELPER_IMAGE}" jq -n '
-    {name: "portcullis-admission-probe", labels: {"portcullis.io/instance": "portcullis-admission-probe"},
+    {name: "portcullis-admission-probe--probe", labels: {"portcullis.io/instance": "portcullis-admission-probe"},
      annotations: {"portcullis.io/params-generation": env.G}} as $m
     | {name: "c", image: env.IMG, command: ["true"]} as $c
     | if env.K == "Pod" then {apiVersion: "v1", kind: "Pod", metadata: $m, spec: {automountServiceAccountToken: false, containers: [$c]}}

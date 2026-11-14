@@ -182,13 +182,13 @@ spec:
   # Compose names (ruling): the Hub's hostname / subdomain / search domain only.
   - expression: >-
       ((!has(variables.spec.hostname) || ('portcullis.io/service' in variables.labels && variables.spec.hostname == variables.labels['portcullis.io/service']))
-        && (!has(variables.spec.subdomain) || variables.spec.subdomain == variables.inst)
+        && (!has(variables.spec.subdomain) || variables.spec.subdomain == variables.inst + '--pods')
         && (!has(variables.spec.dnsPolicy) || variables.spec.dnsPolicy != 'None')
         && (!has(variables.spec.dnsConfig) || ((!has(variables.spec.dnsConfig.nameservers) || size(variables.spec.dnsConfig.nameservers) == 0)
-          && (!has(variables.spec.dnsConfig.searches) || variables.spec.dnsConfig.searches.all(s, s == variables.inst + '.' + params.data.appsNamespace + '.svc.cluster.local')))))
+          && (!has(variables.spec.dnsConfig.searches) || variables.spec.dnsConfig.searches.all(s, s == variables.inst + '--pods.' + params.data.appsNamespace + '.svc.cluster.local')))))
     message: >-
-      hostname / subdomain / dnsConfig: only the pod's own portcullis.io/service and instance, the search domain
-      <instance>.<apps namespace>.svc.cluster.local, no nameservers, no dnsPolicy None
+      hostname / subdomain / dnsConfig: only the pod's own portcullis.io/service, the subdomain <instance>--pods, the
+      search domain <instance>--pods.<apps namespace>.svc.cluster.local, no nameservers, no dnsPolicy None
   # Compose network aliases (ruling): /etc/hosts entries for the Hub's
   # <instance>--<alias> ClusterIP Services only.
   - expression: >-
@@ -419,13 +419,13 @@ spec:
   # Compose names (ruling): the Hub's hostname / subdomain / search domain only.
   - expression: >-
       object.kind == 'Secret' || ((!has(variables.spec.hostname) || ('portcullis.io/service' in variables.labels && variables.spec.hostname == variables.labels['portcullis.io/service']))
-        && (!has(variables.spec.subdomain) || variables.spec.subdomain == variables.inst)
+        && (!has(variables.spec.subdomain) || variables.spec.subdomain == variables.inst + '--pods')
         && (!has(variables.spec.dnsPolicy) || variables.spec.dnsPolicy != 'None')
         && (!has(variables.spec.dnsConfig) || ((!has(variables.spec.dnsConfig.nameservers) || size(variables.spec.dnsConfig.nameservers) == 0)
-          && (!has(variables.spec.dnsConfig.searches) || variables.spec.dnsConfig.searches.all(s, s == variables.inst + '.' + params.data.appsNamespace + '.svc.cluster.local')))))
+          && (!has(variables.spec.dnsConfig.searches) || variables.spec.dnsConfig.searches.all(s, s == variables.inst + '--pods.' + params.data.appsNamespace + '.svc.cluster.local')))))
     message: >-
-      hostname / subdomain / dnsConfig: only the pod's own portcullis.io/service and instance, the search domain
-      <instance>.<apps namespace>.svc.cluster.local, no nameservers, no dnsPolicy None
+      hostname / subdomain / dnsConfig: only the pod's own portcullis.io/service, the subdomain <instance>--pods, the
+      search domain <instance>--pods.<apps namespace>.svc.cluster.local, no nameservers, no dnsPolicy None
   # Compose network aliases (ruling): /etc/hosts entries for the Hub's
   # <instance>--<alias> ClusterIP Services only.
   - expression: >-
@@ -488,6 +488,16 @@ spec:
         !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
         || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
       messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
+    # Names (ruling): an instance's Services are <instance>--… (its pods'
+    # Services, aliases and the headless <instance>--pods) or its AI
+    # companions' gate aliases portcullis-mcp-<instance>--…: a Service named
+    # like another instance's compose service (db) would capture its lookups.
+    - expression: >-
+        has(object.metadata.labels) && 'portcullis.io/instance' in object.metadata.labels
+        && object.metadata.labels['portcullis.io/instance'] != ''
+        && (object.metadata.name.startsWith(object.metadata.labels['portcullis.io/instance'] + '--')
+            || object.metadata.name.startsWith('portcullis-mcp-' + object.metadata.labels['portcullis.io/instance'] + '--'))
+      message: "a Service is named <instance>--… or portcullis-mcp-<instance>--… (with its portcullis.io/instance label)"
     - expression: "!has(object.spec.type) || object.spec.type in ['ClusterIP', 'LoadBalancer']"
       messageExpression: "'Service type ' + object.spec.type + ' is refused (NodePort, ExternalName)'"
     - expression: "!has(object.spec.externalIPs) || size(object.spec.externalIPs) == 0"
