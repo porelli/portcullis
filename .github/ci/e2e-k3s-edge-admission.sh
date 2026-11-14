@@ -103,7 +103,13 @@ ir '.spec.routes[0].priority = 1001' | refused "a priority above maxAppPriority"
 for m in 'HostRegexp(`.+`)' 'PathPrefix(`/`)' 'Host(`e2e.example.org`) || PathPrefix(`/`)' 'Host(`e2e.example.org`) && Header(`X`, `y`)' 'ClientIP(`10.0.0.0/8`)'; do
   ir ".spec.routes[0].match = \"$m\"" | refused "the match $m" "${C[@]}"
 done
-for h in $(K -n "$APPS" get configmap portcullis-admission-params -o jsonpath='{.data.reservedHosts}'); do
+RES="$(K -n "$APPS" get configmap portcullis-admission-params -o jsonpath='{.data.reservedHosts}')"
+APEX="${RES%% *}" HUBH="hub.${RES%% *}"
+ir ".spec.routes[0].match = \"Host(\`app1.$APEX\`)\"" | admitted "an app host under the apex (app1.$APEX)" "${C[@]}"
+for h in "$HUBH." "HUB.$APEX" "Hub.$APEX" "hub..$APEX" "-x.example.org" "x-.example.org" "x.$HUBH" "a.b.$HUBH" "$HUBH.." ".$HUBH"; do
+  ir ".spec.routes[0].match = \"Host(\`$h\`)\"" | refused "the host $h (trailing dot, case, empty label, hyphen, a core subdomain)" "${C[@]}"
+done
+for h in $RES; do
   ir ".spec.routes[0].match = \"Host(\`$h\`) && PathPrefix(\`/x\`)\"" | refused "a route on the reserved host $h" "${C[@]}"
 done
 ir '.spec.entryPoints = ["websecure", "parked"]' | refused "entrypoint parked" "${C[@]}"

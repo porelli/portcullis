@@ -596,6 +596,12 @@ spec:
     - name: oldOwner
       expression: "request.operation != 'CREATE' && has(oldObject.metadata.labels) && 'portcullis.io/owner' in oldObject.metadata.labels ? oldObject.metadata.labels['portcullis.io/owner'] : ''"
   validations:
+    # The CLI's probe (kube_admission_probe): an annotation naming another
+    # params generation is refused, so only the params just written admit it.
+    - expression: >-
+        variables.del || !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
+        || object.metadata.annotations['portcullis.io/params-generation'] == params.data.generation
+      message: "portcullis.io/params-generation isn't these params' generation"
     - expression: "variables.exempt || variables.del || object.kind in ['IngressRoute', 'Middleware']"
       messageExpression: "object.kind + ' is refused in portcullis-edge (only IngressRoute and Middleware)'"
     - expression: >-
@@ -614,12 +620,22 @@ spec:
     # HostSNI, ClientIP, headers, methods, no catch-all).
     - expression: >-
         variables.exempt || variables.routes.all(r, has(r.match)
-          && r.match.matches('^\\(?Host\\(`[a-z0-9.-]+`\\)( \\|\\| Host\\(`[a-z0-9.-]+`\\))*\\)?( && \\(?(PathPrefix|Path)\\(`[^`()]*`\\)( \\|\\| (PathPrefix|Path)\\(`[^`()]*`\\))*\\)?)?$'))
+          && r.match.matches('^\\(?Host\\(`[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+`\\)( \\|\\| Host\\(`[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+`\\))*\\)?( && \\(?(PathPrefix|Path)\\(`[^`()]*`\\)( \\|\\| (PathPrefix|Path)\\(`[^`()]*`\\))*\\)?)?$'))
       message: "a route match other than Host(...) with an optional && Path / PathPrefix"
+    # Hosts: lowercase labels of [a-z0-9-] (no leading / trailing hyphen),
+    # no empty label, no trailing dot (the shape above). Defence in depth:
+    # every Host(`…`) at all, normalised (lowerAscii, empty labels dropped:
+    # a trailing / double dot), is refused when it is a reserved host or a
+    # subdomain of one (the apex, which the other reserved hosts sit under,
+    # only exactly).
     - expression: >-
         variables.exempt || variables.routes.all(r, !has(r.match)
-          || r.match.findAll('Host\\(`[a-z0-9.-]+`\\)').all(h, !(h.substring(6, size(h) - 2) in variables.reserved)))
-      message: "a route on a reserved core hostname"
+          || r.match.findAll('Host\\(`[^`]*`\\)').all(h,
+               !variables.reserved.exists(x, x != '' && (
+                    h.substring(6, size(h) - 2).lowerAscii().split('.').filter(l, l != '').join('.') == x
+                    || (h.substring(6, size(h) - 2).lowerAscii().split('.').filter(l, l != '').join('.').endsWith('.' + x)
+                        && !variables.reserved.exists(o, o.endsWith('.' + x)))))))
+      message: "a route on a reserved core hostname (or a subdomain of one)"
     - expression: "variables.exempt || variables.routes.all(r, !has(r.priority) || r.priority <= int(params.data.maxAppPriority))"
       message: "a route priority above maxAppPriority"
     - expression: "variables.exempt || variables.del || object.kind != 'IngressRoute' || has(object.spec.tls)"

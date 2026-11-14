@@ -813,6 +813,97 @@ kube_reserved_hosts() {
   D="${d,,}" jq -r '[env.D] + [.subdomains[] | . + "." + env.D] | join(" ")' "$PORTCULLIS_HOME/charts/portcullis/core-routes.json"
 }
 
+# kube_admission_params_apply <hub image> — portcullis-admission-params as
+# kube_admission_params builds it (plus generation: the sha256 of every
+# other key=value, so a probe can tell these params from older ones),
+# replaced whole. The API server can keep evaluating a binding's old params
+# after the ConfigMap changed (seen on k3s 1.37 after a key-set change): on
+# any change the Hub is held at 0, the bindings are deleted and re-created,
+# and kube_admission_probe must see this generation in effect within 60 s,
+# else the setup is refused with the Hub left at 0.
+kube_admission_params_apply() {
+  local hub="$1" adm="$PORTCULLIS_HOME/kube/admission" tmp gen
+  # Captured first: a refusal inside it (no node address, no identity, no
+  # domain) must stop the setup, which a process substitution would hide.
+  local params
+  params="$(kube_admission_params "$hub")" || fail "the admission params can't be built (see above): nothing written"
+  tmp="$(mktemp -d)"
+  mkdir "$tmp/data"
+  while IFS=$'\t' read -r f ep; do printf '%s' "$ep" > "$tmp/data/$f"; done <<< "$params"
+  gen="$(printf '%s\n' "$params" | LC_ALL=C sort | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)"
+  printf '%s' "$gen" > "$tmp/data/generation"
+  kube_ctl create configmap portcullis-admission-params -n "$(kube_apps_ns)" --from-file="$tmp/data" --dry-run=client -o json > "$tmp/params.json" \
+    || { rm -rf "$tmp"; fail "could not build portcullis-admission-params"; }
+  # The API server can keep evaluating a binding's old params after the
+  # ConfigMap changed (seen on k3s 1.37 after a key-set change): on any
+  # change the bindings are deleted and re-created, with the Hub held at 0
+  # meanwhile (nothing judged by them may write while they are gone).
+  local live_data new_data changed=false hub_n=""
+  live_data="$(kube_ctl -n "$(kube_apps_ns)" get configmap portcullis-admission-params -o json 2>/dev/null | jq -cS '.data // {}' 2>/dev/null || true)"
+  new_data="$(jq -cS '.data // {}' "$tmp/params.json")"
+  [ "$live_data" = "$new_data" ] || changed=true
+  if [ "$changed" = true ]; then
+    hub_n="$(kube_ctl -n "$(kube_ns)" get deployment hub -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+    if [ -n "$hub_n" ] && [ "$hub_n" != 0 ]; then
+      _kube_scale hub 0 || { rm -rf "$tmp"; fail "could not stop the Hub before re-binding the admission policies: nothing changed"; }
+    fi
+  fi
+  _kube_put "$tmp/params.json" || { rm -rf "$tmp"; fail "could not write portcullis-admission-params"; }
+  _kube_applied_set cluster.params "$(_kube_sha "$tmp"/data/*)"
+  rm -rf "$tmp"
+  if [ "$changed" = true ]; then
+    info "Cluster setup: the admission params changed: re-creating the bindings..."
+    kube_ctl delete -f "$adm/bindings.yaml" --ignore-not-found --wait >/dev/null \
+      && _kube_apply_files "$adm/bindings.yaml" \
+      || fail "could not re-create the admission bindings (the Hub stays at 0)"
+  fi
+  kube_admission_probe "$gen" || fail "the admission policies don't show the new params in effect (see above)${hub_n:+; the Hub stays at 0}: nothing deployed"
+  if [ -n "$hub_n" ] && [ "$hub_n" != 0 ]; then
+    _kube_scale hub "$hub_n" || fail "could not start the Hub again (replicas $hub_n)"
+  fi
+
+}
+
+# kube_admission_probe — the live policies judge with the params just
+# written: as a probe identity (judged: not the CLI's; system:masters only
+# so RBAC lets the request reach admission; server dry-run, nothing kept)
+# a Hub-shaped route on a reserved host must be refused by
+# portcullis-edge-guard-routes and the same route on a free host admitted,
+# both annotated portcullis.io/params-generation=<generation>: the policy
+# refuses an annotation that isn't its params' generation, so only the new
+# params in effect admit it. Retried for KUBE_ADMISSION_PROBE_WAIT seconds
+# (60).
+kube_admission_probe() {
+  local gen="${1:?}" d reserved i refused admitted out
+  d="${PORTCULLIS_DOMAIN:?}"
+  reserved="$(kube_reserved_hosts)" || return 1
+  reserved="${reserved%% *}"
+  for ((i = 0; ; i += 3)); do
+    refused=false admitted=false
+    if ! out="$(_kube_probe_route "$reserved" "$gen" 2>&1)"; then
+      case "$out" in *"portcullis-edge-guard-routes"*"reserved core hostname"*) refused=true ;; esac
+    fi
+    if _kube_probe_route "portcullis-admission-probe.${d,,}" "$gen" >/dev/null 2>&1; then admitted=true; fi
+    [ "$refused $admitted" != "true true" ] || return 0
+    [ "$i" -lt "${KUBE_ADMISSION_PROBE_WAIT:-60}" ] || break
+    sleep 3
+  done
+  warn "admission probe: a route on $reserved was $([ "$refused" = true ] && echo refused || echo "not refused by portcullis-edge-guard-routes"), one on a free host $([ "$admitted" = true ] && echo admitted || echo refused) (after ${KUBE_ADMISSION_PROBE_WAIT:-60} s)"
+  return 1
+}
+
+# _kube_probe_route <host> <generation> — a server dry-run of a Hub-shaped
+# IngressRoute.
+_kube_probe_route() {
+  H="$1" G="$2" APPS="$(kube_apps_ns)" jq -n '{apiVersion: "traefik.io/v1alpha1", kind: "IngressRoute",
+      metadata: {name: "portcullis-admission-probe", labels: {"portcullis.io/owner": "hub", "portcullis.io/instance": "portcullis-admission-probe"},
+        annotations: {"portcullis.io/params-generation": env.G}},
+      spec: {entryPoints: ["websecure"], routes: [{match: ("Host(`" + env.H + "`)"), kind: "Rule",
+        services: [{name: "portcullis-admission-probe", namespace: env.APPS, port: 80}]}],
+        tls: {options: {name: "authaware@file"}}}}' \
+    | kube_ctl -n "$KUBE_EDGE_NS" --as=portcullis-admission-probe --as-group=system:masters create --dry-run=server -f -
+}
+
 # The owner=core Middlewares of portcullis-edge (the chart's four and the
 # CLI's hub-proxy-secret): no Hub route or chain may name them.
 KUBE_EDGE_CORE_MIDDLEWARES="hub-proxy-secret portcullis-auth-console portal-path portal-vpn-path directory-redirect"
@@ -890,15 +981,7 @@ kube_cluster_setup() {
   _kube_applied_set cluster.admission "$(_kube_sha "$adm/policies.yaml" "$adm/bindings.yaml")"
 
   info "Cluster setup: admission params..."
-  # Captured first: a refusal inside it (no node address, no identity, no
-  # domain) must stop the setup, which a process substitution would hide.
-  local params
-  params="$(kube_admission_params "$hub")" || fail "the admission params can't be built (see above): nothing written"
-  tmp="$(mktemp -d)"
-  while IFS=$'\t' read -r f ep; do printf '%s' "$ep" > "$tmp/$f"; done <<< "$params"
-  _kube_configmap_from portcullis-admission-params "$(kube_apps_ns)" "$tmp" || { rm -rf "$tmp"; fail "could not write portcullis-admission-params"; }
-  _kube_applied_set cluster.params "$(_kube_sha "$tmp"/*)"
-  rm -rf "$tmp"
+  kube_admission_params_apply "$hub"
 
   # Traefik's Role reads every Secret of the edge namespace: none may be there.
   local n

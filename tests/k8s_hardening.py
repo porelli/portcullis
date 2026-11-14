@@ -169,13 +169,17 @@ def core_route_problems(docs, cr):
     route only where a core rule without Host(...) can match an app host:
     every such rule must be on an entrypoint apps can't use, or rank above
     maxAppPriority (its priority, else Traefik's default len(rule)); every
-    Host-limited core rule names reserved hosts only."""
+    Host-limited core rule names reserved hosts only. Defence in depth (a
+    host-check bypass): every core route on an app entrypoint has an
+    explicit priority above maxAppPriority."""
     dom = K.domain(docs)
     reserved = {dom} | {f"{s}.{dom}" for s in cr["subdomains"]}
     out = []
     for ir in K.by_kind(docs, "IngressRoute"):
         name, eps = ir["metadata"]["name"], set(ir["spec"].get("entryPoints") or [])
         for r in ir["spec"]["routes"]:
+            if eps & APP_ENTRYPOINTS and not (isinstance(r.get("priority"), int) and r["priority"] > cr["maxAppPriority"]):
+                out.append(f"IngressRoute {name}: on {sorted(eps & APP_ENTRYPOINTS)} at priority {r.get('priority')} (needs an explicit one above maxAppPriority {cr['maxAppPriority']})")
             hosts = re.findall(r"Host\(`([^`]*)`\)", r["match"])
             if not hosts:
                 prio = r.get("priority") or len(r["match"])
@@ -206,7 +210,21 @@ def _unreserved_host(docs):
     return docs
 
 
+def _core_low_priority(docs):
+    ir = next(d for d in docs if d.get("kind") == "IngressRoute" and d["metadata"]["name"] == "core-vpn-required")
+    ir["spec"]["routes"][0]["priority"] = 1
+    return docs
+
+
+def _core_no_priority(docs):
+    ir = next(d for d in docs if d.get("kind") == "IngressRoute" and d["metadata"]["name"] == "hub")
+    del ir["spec"]["routes"][0]["priority"]
+    return docs
+
+
 MUTATIONS = [
+    ("a core route on websecure at priority 1", _core_low_priority),
+    ("a core route on websecure without an explicit priority", _core_no_priority),
     ("a Host-less rule on websecure below the cap", _hostless_on_websecure),
     ("a Host-less rule on every entrypoint", _hostless_no_entrypoints),
     ("a core host outside reservedHosts", _unreserved_host),

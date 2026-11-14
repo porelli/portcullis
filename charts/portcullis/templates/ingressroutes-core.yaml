@@ -60,9 +60,10 @@ spec:
   routes:
     - match: {{ $r.rule | quote }}
       kind: Rule
-      {{- with $r.prio }}
-      priority: {{ . }}
-      {{- end }}
+      {{- /* Above every app route (core-routes.json maxAppPriority), the
+      relative order kept: 10000 + compose's priority, else + Traefik's
+      default len(rule). */}}
+      priority: {{ add 10000 (default (len $r.rule) $r.prio) }}
       {{- with $r.mw }}
       middlewares:
         {{- range . }}

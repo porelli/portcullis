@@ -294,8 +294,11 @@ def check_routers(comp):
             want_rule = r["rule"].replace("ci.example.org", "ci.example.org")
             if route["match"] != interp(want_rule).replace("portcullis.local", "ci.example.org"):
                 F.add(f"router {rname}: rule {route['match']!r} != compose {r['rule']!r}")
-            if str(route.get("priority", "")) != str(r.get("priority", "")):
-                F.add(f"router {rname}: priority {route.get('priority')} != compose {r.get('priority')}")
+            # Core routes rank above every app route on Kubernetes: 10000 +
+            # compose's priority (else Traefik's default len(rule)).
+            want_prio = 10000 + (int(r["priority"]) if r.get("priority") else len(route["match"]))
+            if route.get("priority") != want_prio:
+                F.add(f"router {rname}: priority {route.get('priority')} != 10000 + compose's {r.get('priority') or 'len(rule)'} ({want_prio})")
             want_mw = []
             for mw in [x for x in r.get("middlewares", "").split(",") if x]:
                 base, _, prov = mw.partition("@")

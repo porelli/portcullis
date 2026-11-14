@@ -26,3 +26,4 @@ data:
   edgeCoreMiddlewares: hub-proxy-secret portcullis-auth-console portal-path portal-vpn-path directory-redirect
   reservedHosts: portcullis.local traefik.portcullis.local hub.portcullis.local directory.portcullis.local metrics.portcullis.local people.portcullis.local mcp.portcullis.local auth.portcullis.local enroll.portcullis.local
   maxAppPriority: "1000"
+  generation: "0123456789abcdef"

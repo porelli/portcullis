@@ -3907,6 +3907,7 @@ case "$*" in
   "apply --server-side"*" -f -") cat >> "$STUB_DIR/kubectl-stdin"; echo --- >> "$STUB_DIR/kubectl-stdin"; [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
   "apply --server-side"*" -f "*)
     all="$*"; f="${all##* -f }"
+    case "$f" in *bindings.yaml) printf 'apply bindings\n' >> "$STUB_DIR/order" ;; esac
     [ -z "${STUB_APPLY_FAIL_MATCH:-}" ] || case "$f" in *"$STUB_APPLY_FAIL_MATCH"*) echo "stub: apply of $f refused" >&2; exit 1 ;; esac
     [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
   "create secret generic "*" --dry-run=client -o json"|"create configmap "*" --dry-run=client -o json")
@@ -3932,6 +3933,17 @@ case "$*" in
     cat "$f" >> "$STUB_DIR/kubectl-stdin"; echo --- >> "$STUB_DIR/kubectl-stdin"
     [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1
     mkdir -p "$STUB_DIR/live"; cp "$f" "$STUB_DIR/live/$lk.json" ;;
+  "get configmap portcullis-admission-params -o json")
+    cat "$STUB_DIR/live/ConfigMap.portcullis-admission-params.json" 2>/dev/null || { echo "Error from server (NotFound)" >&2; exit 1; } ;;
+  "get deployment hub -o jsonpath={.spec.replicas}") [ -n "${STUB_HUB_REPLICAS:-}" ] || exit 1; echo "$STUB_HUB_REPLICAS" ;;
+  "delete -f "*"bindings.yaml --ignore-not-found --wait") printf 'delete bindings\n' >> "$STUB_DIR/order" ;;
+  "--as=portcullis-admission-probe --as-group=system:masters create --dry-run=server -f -")
+    in="$(cat)"; printf 'probe\n' >> "$STUB_DIR/order"
+    [ -z "${STUB_PROBE_STALE:-}" ] || { echo "denied request: portcullis.io/params-generation isn't these params' generation" >&2; exit 1; }
+    want="$(jq -r '.data.generation' "$STUB_DIR/live/ConfigMap.portcullis-admission-params.json")"
+    case "$in" in *"\"portcullis.io/params-generation\": \"$want\""*) ;; *) echo "denied request: portcullis.io/params-generation isn't these params' generation" >&2; exit 1 ;; esac
+    case "$in" in *'Host(`portcullis-admission-probe.'*) exit 0 ;; esac
+    echo "ValidatingAdmissionPolicy 'portcullis-edge-routes' with binding 'portcullis-edge-guard-routes' denied request: a route on a reserved core hostname" >&2; exit 1 ;;
   "get secrets -o json"|"get configmaps -o json")
     case "$ns" in
       portcullis)
@@ -4107,18 +4119,37 @@ k_fixtures
 CS_ROOT="$WORK/cs-root"; rm -rf "$CS_ROOT"; mkdir -p "$CS_ROOT/secrets"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
 case "$OUT" in *"rc=0") t_pass "kube_cluster_setup: every step applies" ;; *) t_fail "kube_cluster_setup: $OUT" ;; esac
+PJ="$KS/live/ConfigMap.portcullis-admission-params.json"
 expect_eq "cluster setup: params ConfigMap carries the resolved Hub digest, the Hub's ServiceAccount, the node and API /32s" \
-  "$(grep -cxE "  hubImage: $HUBD|  hubServiceAccount: system:serviceaccount:portcullis:portcullis-hub|  nodeAddresses: 10.1.0.4/32 198.51.100.1/32|  apiAddresses: 10.1.0.4/32|  corePorts: 80 443 51820 8000 8081 8443 8444" "$KS/kubectl-stdin")" 5
+  "$(jq -r --arg h "$HUBD" '.data | [.hubImage == $h, .hubServiceAccount == "system:serviceaccount:portcullis:portcullis-hub", .nodeAddresses == "10.1.0.4/32 198.51.100.1/32", .apiAddresses == "10.1.0.4/32", .corePorts == "80 443 51820 8000 8081 8443 8444"] | map(select(.)) | length' "$PJ")" 5
 expect_eq "cluster setup: the params ConfigMap has exactly params.tmpl.yaml's keys" \
-  "$(sed -n '/name: portcullis-admission-params/,/^---/p' "$KS/kubectl-stdin" | sed -n '/^data:/,$p' | sed -n 's/^  \([A-Za-z]*\): .*/\1/p' | sort | tr '\n' ' ')" \
+  "$(jq -r '.data | keys | join(" ")' "$PJ") " \
   "$(sed -n '/^data:/,$p' "$HERE/../kube/admission/params.tmpl.yaml" | sed -n 's/^  \([A-Za-z]*\): .*/\1/p' | sort | tr '\n' ' ')"
+expect_eq "cluster setup: first params → bindings re-created, the live policies probed (refusal + admit); no Hub to stop" \
+  "$(grep -E '^(delete bindings|apply bindings|probe|kubectl .*scale deploy/hub)' "$KS/order" | sort | uniq -c | tr -s ' ' | tr '\n' ';')" " 2 apply bindings; 1 delete bindings; 2 probe;"
 expect_eq "cluster setup: the four namespaces with PSA labels and K11's label + install annotation (server-side)" \
   "$(jq -cs '[.[] | select(.kind == "Namespace") | [.metadata.name, .metadata.labels["pod-security.kubernetes.io/enforce"], .metadata.labels["pod-security.kubernetes.io/warn"], .metadata.labels["app.kubernetes.io/managed-by"], .metadata.annotations["portcullis.io/install"]]]' < <(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(type == "object")' 2>/dev/null))" \
   '[["portcullis","restricted","restricted","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-apps","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-storage","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-edge","restricted","restricted","portcullis","0b0e2b3c-1111-4222-8333-444455556666"]]'
-expect_eq "cluster setup: CRDs, VAPs and bindings applied server-side (never Helm), the storage API egress to each endpoint" \
-  "$(grep -c 'apply --server-side --force-conflicts --field-manager=portcullis-cli -f .*charts/portcullis/crds/traefik-v3.7.17.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/policies.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/bindings.yaml' "$KS/kubectl-calls"):$(grep -c '"cidr": "10.1.0.4/32"' "$KS/kubectl-stdin")" "1:1:1:1"
+expect_eq "cluster setup: CRDs, VAPs and bindings applied server-side (never Helm; the bindings again after the first params), the storage API egress to each endpoint" \
+  "$(grep -c 'apply --server-side --force-conflicts --field-manager=portcullis-cli -f .*charts/portcullis/crds/traefik-v3.7.17.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/policies.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/bindings.yaml' "$KS/kubectl-calls"):$(grep -c '"cidr": "10.1.0.4/32"' "$KS/kubectl-stdin")" "1:1:2:1"
 expect_eq "cluster setup: applied.json records every step (0600)" \
   "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json"):$(file_mode "$CS_ROOT/secrets/kube/applied.json")" "cluster.admission cluster.crds cluster.namespaces cluster.params cluster.storage:600"
+G1="$(jq -r '.data.generation' "$KS/live/ConfigMap.portcullis-admission-params.json")"
+case "$G1" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) t_pass "params generation: 16 hex, in the ConfigMap" ;; *) t_fail "params generation: $G1" ;; esac
+rm -f "$KS/order"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; export STUB_HUB_REPLICAS=1; kube_cluster_setup")"
+expect_eq "cluster setup: unchanged params → no re-binding, no Hub stop; the probe still runs" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c 'delete bindings\|scale deploy/hub' "$KS/order" || true):$(grep -c '^probe$' "$KS/order")" "rc=0:0:2"
+rm -f "$KS/order"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.7'; export STUB_HUB_REPLICAS=1; kube_cluster_setup")"
+expect_eq "cluster setup: changed params → the Hub to 0, params put, bindings deleted + re-created, probed, the Hub back to 1" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -E '^(kubectl .*scale deploy/hub|delete bindings|apply bindings|probe)' "$KS/order" | sed 's/^kubectl portcullis //' | tr '\n' ';')" \
+  "rc=0:apply bindings;scale deploy/hub --replicas=0;delete bindings;apply bindings;probe;probe;scale deploy/hub --replicas=1;"
+expect_eq "params generation: changed params → a new generation" "$([ "$(jq -r '.data.generation' "$KS/live/ConfigMap.portcullis-admission-params.json")" != "$G1" ] && echo new || echo same)" new
+rm -f "$KS/order"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.8' KUBE_ADMISSION_PROBE_WAIT=0; export STUB_HUB_REPLICAS=1 STUB_PROBE_STALE=1; kube_cluster_setup")"
+case "$OUT" in *"don't show the new params in effect"*"the Hub stays at 0"*"rc=1") t_pass "cluster setup: the probe sees stale params (no such key) → refused, the Hub left at 0" ;; *) t_fail "cluster setup stale probe: $OUT" ;; esac
+expect_eq "cluster setup: stale params → the Hub never scaled back" "$(grep -c 'scale deploy/hub --replicas=1' "$KS/order" || true)" 0
 k_fixtures
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; export STUB_WHOAMI_FAIL=1; kube_cluster_setup")"
 case "$OUT" in *"the admission params can't be built"*"rc=1") case "$(cat "$KS/kubectl-stdin" 2>/dev/null)" in *portcullis-admission-params*) t_fail "cluster setup wrote params after a refusal" ;; *) t_pass "cluster setup: a params refusal (no CLI identity) stops the setup, no params written" ;; esac ;; *) t_fail "cluster setup params refusal: $OUT" ;; esac
