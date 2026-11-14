@@ -109,7 +109,7 @@ services:
   # Read-only Docker API for Traefik's docker provider: containers,
   # networks, events, version (+ /_ping). No writes (POST=0).
   socket-proxy-traefik:
-    image: ghcr.io/linuxserver/socket-proxy:3.4.7@sha256:4e5e59efd3338205561c54262581992036e5a36ccca97d487b1d4ec41f9adc58
+    image: ghcr.io/linuxserver/socket-proxy:3.4.7@sha256:823dda971e9a3951257eb251586a804199819fe1587c35faa43adc7b52a2ff16
     <<: *hardening
     # HAProxy runs as root (the socket is root:docker) and chroots to "/".
     cap_add: [SYS_CHROOT]
@@ -150,7 +150,7 @@ services:
   # /containers/{id}/archive) is allowed (ALLOW_ARCHIVE): the Hub's instance
   # backups / restores copy volume data through never-started helpers.
   socket-proxy-hub:
-    image: ghcr.io/linuxserver/socket-proxy:3.4.7@sha256:4e5e59efd3338205561c54262581992036e5a36ccca97d487b1d4ec41f9adc58
+    image: ghcr.io/linuxserver/socket-proxy:3.4.7@sha256:823dda971e9a3951257eb251586a804199819fe1587c35faa43adc7b52a2ff16
     <<: *hardening
     cap_add: [SYS_CHROOT]
     read_only: true
@@ -190,7 +190,7 @@ services:
     restart: unless-stopped
 
   traefik:
-    image: docker.io/library/traefik:v3.7.17@sha256:f4bb143d1135a579b630ed491e17ec50f6f7c9c6a30585ff3d385471d2a86f5a
+    image: docker.io/library/traefik:v3.7.18@sha256:9c437ac4f09ce6f4980a8544902d3475fdf70a1a7c578729581d2535dfa7d635
     <<: *hardening
     # Runs as root (binds :80/:443, owns the ACME volume) but with no
     # capability except binding low ports; root without CAP_DAC_OVERRIDE
@@ -353,7 +353,7 @@ services:
     restart: unless-stopped
 
   postgres:
-    image: docker.io/library/postgres:18.6-alpine3.24@sha256:10a5c69a83035ab5239f5620d708520e8b28f5aa1f2b20143e6024532edadfb5
+    image: docker.io/library/postgres:18.6-alpine3.24@sha256:9ba53c7d41ea093baf5c1ba635ba5434c4f979880527d49bb7d9237d3193085b
     <<: *hardening
     # The image's postgres user. /var/lib/postgresql is postgres-owned in
     # the image, so a fresh volume inherits it and the entrypoint needs no
@@ -1619,7 +1619,7 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: docker.io/grafana/grafana:13.3.0@sha256:488984b716c0862639f91a698adbe2862677a5a07bad42da5f03f3030883b205
+    image: docker.io/grafana/grafana:13.3.1@sha256:0615ec4fbd4072004b7d86b46ded63013a74b7d6eb1119273dd89e8fa25c13cf
     profiles: [monitoring]
     <<: *hardening
     user: "472:472"
