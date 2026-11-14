@@ -69,7 +69,9 @@ probe_pod "$NS" e2e-hubside '{"portcullis.io/component": "hub-probe"}'
 # A pod labelled like an internal client (hub) for kcinternal: the
 # certificate header never reaches Keycloak (no X.509 login: the realm's
 # certificate flow sees no cert and the request is an ordinary one).
-K -n "$NS" label pod e2e-hubside portcullis.io/component=hub --overwrite >/dev/null
+# Its network label too: egress from the core namespace is default-deny,
+# the Hub reaches Traefik through net-portcullis-egress.
+K -n "$NS" label pod e2e-hubside portcullis.io/component=hub portcullis.io/net-portcullis=true --overwrite >/dev/null
 KI="$(svc_ip keycloak-internal)"
 out="$(K -n "$NS" exec e2e-hubside -- wget -q -O - --header 'X-Forwarded-Tls-Client-Cert: MIIBfake' --header 'X-Forwarded-For: 203.0.113.66' \
   "http://$KI:8081/realms/portcullis/.well-known/openid-configuration" 2>&1 || true)"
@@ -111,9 +113,15 @@ N="e2e-noowner-pod" IMG="$ALPINE" jq -n '{apiVersion: "v1", kind: "Pod", metadat
   spec: {automountServiceAccountToken: false, securityContext: {runAsNonRoot: true, runAsUser: 65534, seccompProfile: {type: "RuntimeDefault"}},
     containers: [{name: "c", image: env.IMG, command: ["true"], securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: ["ALL"]}},
       volumeMounts: [{name: "v", mountPath: "/v"}]}], volumes: [{name: "v", persistentVolumeClaim: {claimName: "e2e-noowner"}}]}}' | K create -f - >/dev/null
-sleep 20
-[ "$(K -n "$NS" get pvc e2e-noowner -o jsonpath='{.status.phase}')" = Pending ] || fail "a PVC without owner annotations was provisioned"
-K -n portcullis-storage logs deploy/portcullis-local-path --since=2m 2>/dev/null | grep -q 'portcullis-setup REFUSED' || fail "the provisioner logged no portcullis-setup REFUSED"
+# The provisioner prints a helper pod's log only when it gives up on it (its
+# 120 s helper timeout: it waits for Succeeded), so the refusal is polled.
+refused=false
+for _ in $(seq 1 40); do
+  [ "$(K -n "$NS" get pvc e2e-noowner -o jsonpath='{.status.phase}')" = Pending ] || fail "a PVC without owner annotations was provisioned"
+  if K -n portcullis-storage logs deploy/portcullis-local-path --since=5m 2>/dev/null | grep -q 'portcullis-setup REFUSED: bad uid'; then refused=true; break; fi
+  sleep 5
+done
+[ "$refused" = true ] || fail "the provisioner logged no portcullis-setup REFUSED within 200 s"
 K -n "$NS" delete pod e2e-noowner-pod --wait=false >/dev/null; K -n "$NS" delete pvc e2e-noowner --wait=false >/dev/null
 pass "a PVC without the owner annotations stays Pending (portcullis-setup REFUSED)"
 
@@ -138,8 +146,8 @@ denied pods "$POD"',"volumes":[{"name":"h","hostPath":{"path":"/etc"}}]}}'
 denied services '{"apiVersion":"v1","kind":"Service","metadata":{"name":"g","labels":{"portcullis.io/instance":"e2e"}},"spec":{"type":"NodePort","ports":[{"port":80}]}}'
 denied pods "$(printf '%s' "$POD" | sed 's/"portcullis.io\/instance":"e2e"/"portcullis.io\/instance":"e2e","portcullis.io\/helper":"fixer"/' | sed "s|$ALPINE|docker.io/library/busybox:1.38.0|")"'}}'
 denied pods "$(printf '%s' "$POD" | sed 's/"portcullis.io\/instance":"e2e"/"portcullis.io\/instance":"e2e","portcullis.io\/vpn-slot":"47"/')"'}}'
-[ "$(KH -n "$APPS" auth can-i get pods/exec)" = no ] || fail "the Hub's ServiceAccount may get pods/exec (K2: create only)"
-[ "$(KH -n "$APPS" auth can-i create pods/exec)" = yes ] || fail "the Hub's ServiceAccount can't create pods/exec"
+[ "$(KH -n "$APPS" auth can-i get pods --subresource=exec)" = no ] || fail "the Hub's ServiceAccount may get pods/exec (K2: create only)"
+[ "$(KH -n "$APPS" auth can-i create pods --subresource=exec)" = yes ] || fail "the Hub's ServiceAccount can't create pods/exec"
 [ "$(KH -n "$NS" auth can-i get secrets)" = no ] || fail "the Hub's ServiceAccount reads core Secrets"
 pass "the guard refuses a hostPath outside the roots, a NodePort, a foreign helper image and vpn-slot 47, each by its binding; pods/exec is create only"
 # The apps' Traefik objects live in portcullis-edge: every refusal there.

@@ -3344,6 +3344,14 @@ OUT="$(rt "CONTAINER_RUNTIME=podman; backup_schedule_systemd 'Sun 04:00' '$WORK/
 case "$OUT" in *"~/.config/systemd/user"*"systemctl --user daemon-reload"*"systemctl --user enable --now portcullis-backup.timer"*) t_pass "backup schedule --output on podman: user-unit install commands" ;; *) t_fail "schedule podman output: $OUT" ;; esac
 OUT="$(rt "CONTAINER_RUNTIME=docker; backup_schedule_systemd '*-*-* 03:15:00' ''")"
 case "$OUT" in *"Requires=docker.service"*"User=$(id -un)"*"WantedBy=timers.target"*) t_pass "backup schedule on docker: system units (unchanged)" ;; *) t_fail "schedule docker: $OUT" ;; esac
+# Kubernetes: no engine unit (a k3s host without Docker would never start
+# the timer); k3s.service when this host runs it, else nothing.
+OUT="$(rt "CONTAINER_RUNTIME=kubernetes; systemctl() { [ \"\$1 \$2\" = 'cat k3s.service' ]; }; backup_schedule_systemd '*-*-* 03:15:00' ''")"
+case "$OUT" in *"After=network-online.target k3s.service"*"Requires=k3s.service"*"User=$(id -un)"*"WantedBy=timers.target"*) t_pass "backup schedule on kubernetes (k3s host): After/Requires k3s.service, system units" ;; *) t_fail "schedule kube k3s: $OUT" ;; esac
+case "$OUT" in *docker*|*podman*) t_fail "backup schedule on kubernetes: an engine dependency: $OUT" ;; *) t_pass "backup schedule on kubernetes: no docker / podman dependency" ;; esac
+OUT="$(rt "CONTAINER_RUNTIME=kubernetes; systemctl() { return 1; }; backup_schedule_systemd '*-*-* 03:15:00' ''")"
+case "$OUT" in *"Requires="*|*k3s*|*docker*) t_fail "backup schedule on kubernetes (remote cluster): a unit dependency: $OUT" ;;
+  *"After=network-online.target"*"User=$(id -un)"*"WantedBy=timers.target"*) t_pass "backup schedule on kubernetes (no k3s here): no Requires=, After=network-online.target only" ;; *) t_fail "schedule kube remote: $OUT" ;; esac
 
 # Every bind source of the SELinux overlay exists before `up`: in git, or
 # made by stack_prepare (the overlay's long-syntax binds never create a
@@ -3624,6 +3632,18 @@ case "$LUI" in *"ssh -N -L 17170:10.88.0.7:17170 "*) t_pass "lldap-ui on docker:
 expect_eq "lldap-ui on docker: no forwarder" "$(grep -c '^run ' "$STUB_DIR/lui-calls")" 0
 rm -f "$WORK/lui-root/.env"
 case "$(lui)" in *"not found. Run ./portcullis init first"*) t_pass "lldap-ui needs .env (need_env, the runtime check)" ;; *) t_fail "lldap-ui without .env" ;; esac
+# Kubernetes: a port-forward; no docker needed (a k3s host has none).
+mkdir -p "$WORK/luik/bin" "$WORK/luik/root"
+printf '#!/bin/sh\necho "kubectl $*" >> "%s"\n' "$WORK/luik/calls" > "$WORK/luik/bin/kubectl"; chmod +x "$WORK/luik/bin/kubectl"
+printf 'CONTAINER_RUNTIME=kubernetes\nPORTCULLIS_KUBE_CONTEXT=ci\n' > "$WORK/luik/root/.env"
+LUI="$( (unset CONTAINER_RUNTIME DOCKER_HOST COMPOSE_FILE _RT_CHECKED
+  export PATH="$WORK/luik/bin:$PATH" PORTCULLIS_ROOT="$WORK/luik/root"
+  bash -c 'for l in common network users; do . "$1/scripts/lib/$l.sh"; done
+    require_cmd() { [ "$1" != docker ] || { echo "REQUIRED docker"; exit 9; }; }
+    kube_runtime_check() { :; }; rt_running() { [ "$1" = lldap ]; }; cmd_lldap_ui' _ "$HERE/..") 2>&1; echo "rc=$?"; cat "$WORK/luik/calls" 2>/dev/null)"
+case "$LUI" in *"REQUIRED docker"*) t_fail "lldap-ui on kubernetes requires docker: $LUI" ;;
+  *"127.0.0.1:17170 (this server only)"*"rc=0"*"kubectl --context ci -n "*" port-forward --address 127.0.0.1 svc/lldap 17170:17170"*) t_pass "lldap-ui on kubernetes: a loopback port-forward, no docker needed" ;;
+  *) t_fail "lldap-ui on kubernetes: $LUI" ;; esac
 
 OUT="$(rt "$RT_HOST; id() { case \"\$1\" in -un) echo \"o'brien\" ;; *) command id \"\$@\" ;; esac; }; export STUB_UID_MAP=''; runtime_host_checks")"
 case "$OUT" in *"--add-subgids 100000-165535 'o'\\''brien', then podman system migrate"*) t_pass "runtime_host_checks: the usermod hint single-quotes the user" ;; *) t_fail "usermod hint: $(printf '%s' "$OUT" | grep subuid)" ;; esac
@@ -4052,6 +4072,43 @@ kt() {
     unset _RT_CHECKED _RT_HOST_OK
     ( eval "$1" ); echo "rc=$?" ) 2>&1
 }
+
+# _rtk_health: a rolling Deployment is "starting" (the old pod's readiness
+# isn't the new config's); otherwise the newest non-terminating pod decides.
+RH_POD='{"status":{"phase":"Running","containerStatuses":[{"ready":%s,"started":true}]},"spec":{"containers":[{"readinessProbe":{}}]},"metadata":{"creationTimestamp":"%s"%s}}'
+rh() { # rh <deploy json> <pods json>
+  kt "kube_ctl() { case \"\$*\" in *'get deploy keycloak'*) printf '%s' '$1' ;; *'get pods'*) printf '%s' '{\"items\":$2}' ;; esac; }; _rtk_health keycloak"
+}
+RH_OLD="$(printf "$RH_POD" true 2026-01-01T00:00:00Z '')" RH_NEW="$(printf "$RH_POD" false 2026-01-01T00:01:00Z '')"
+RH_GONE="$(printf "$RH_POD" true 2026-01-01T00:02:00Z ',"deletionTimestamp":"2026-01-01T00:03:00Z"')"
+expect_eq "_rtk_health: a Deployment not yet observed at its generation → starting (not the old pod's ready)" \
+  "$(rh '{"metadata":{"generation":3},"spec":{"replicas":1},"status":{"observedGeneration":2,"replicas":1,"updatedReplicas":1}}' "[$RH_OLD]")" "starting
+rc=0"
+expect_eq "_rtk_health: old and new ReplicaSet pods both counted → starting" \
+  "$(rh '{"metadata":{"generation":3},"spec":{"replicas":1},"status":{"observedGeneration":3,"replicas":2,"updatedReplicas":1}}' "[$RH_OLD,$RH_NEW]")" "starting
+rc=0"
+expect_eq "_rtk_health: rolled out → the newest pod decides, a terminating one ignored" \
+  "$(rh '{"metadata":{"generation":3},"spec":{"replicas":1},"status":{"observedGeneration":3,"replicas":1,"updatedReplicas":1}}' "[$RH_GONE,$RH_OLD,$RH_NEW]")" "unhealthy
+rc=0"
+expect_eq "_rtk_health: rolled out and ready → healthy" \
+  "$(rh '{"metadata":{"generation":3},"spec":{"replicas":1},"status":{"observedGeneration":3,"replicas":1,"updatedReplicas":1}}' "[$RH_OLD]")" "healthy
+rc=0"
+expect_eq "_rtk_health: no Deployment → missing" "$(kt "kube_ctl() { return 1; }; _rtk_health keycloak")" "missing
+rc=0"
+# _rtk_exec: kubectl's own "command terminated with exit code N" never
+# reaches the caller; the command's stderr and exit code do.
+expect_eq "_rtk_exec: an empty Vault list on kubernetes is the bare {} with exit 2 (vault_no_value accepts it)" \
+  "$(kt "kube_ctl() { echo '{}' >&2; echo 'command terminated with exit code 2' >&2; return 2; }; out=\$(_rtk_exec vault -- vault list x 2>&1) || echo \"rc \$?\"; printf '%s|' \"\$out\"; vault_no_value \"\$out\" && echo no-value")" "rc 2
+{}|no-value
+rc=0"
+# _rtk_wait_ready waits on _rtk_health (rollout-aware), never on a pod list.
+expect_eq "_rtk_wait_ready: starting, starting, then running → done" \
+  "$(rm -f "$WORK/rwr"; kt "sleep() { :; }; _rtk_health() { echo . >> '$WORK/rwr'; [ \$(wc -l < '$WORK/rwr') -ge 3 ] && echo running || echo starting; }; _rtk_wait_ready keycloak; echo \"after \$(wc -l < '$WORK/rwr' | tr -d ' ')\"")" "after 3
+rc=0"
+expect_eq "_rtk_wait_ready: never Running within KUBE_READY_WAIT → fails" \
+  "$(kt "KUBE_READY_WAIT=4; sleep() { :; }; _rtk_health() { echo exited; }; _rtk_wait_ready keycloak")" "rc=1"
+case "$(declare -f _rtk_wait_ready _kube_wait_running 2>/dev/null; sed -n '/^_rtk_wait_ready()/,/^}/p;/^_kube_wait_running()/p' "$HERE/../scripts/lib/kube.sh")" in
+  *"wait --for"*) t_fail "_rtk_wait_ready / _kube_wait_running use kubectl wait on a pod list" ;; *) t_pass "_rtk_wait_ready / _kube_wait_running: no kubectl wait on a pod list" ;; esac
 k_fixtures
 OUT="$(kt 'unset PORTCULLIS_KUBE_CONTEXT; runtime_check')"
 case "$OUT" in *"PORTCULLIS_KUBE_CONTEXT is not set"*"rc=1") t_pass "need_env: kubernetes without PORTCULLIS_KUBE_CONTEXT → refused naming it" ;; *) t_fail "kube no context: $OUT" ;; esac
@@ -4251,7 +4308,7 @@ expect_eq "admission reservedHosts example = core-routes.json for portcullis.loc
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' PORTCULLIS_DOMAIN=k.example.org; kube_admission_params x | grep -E '^(cliUsername|appsNamespace|edgeNamespace|edgeCoreMiddlewares)'" | tr '\t' '=' | sed -n '1,4p' | tr '\n' ';')"
 expect_eq "admission params: the CLI's identity (auth whoami), the apps / edge namespaces, the core edge Middlewares" "$OUT" \
   "cliUsername=system:admin;appsNamespace=portcullis-apps;edgeNamespace=portcullis-edge;edgeCoreMiddlewares=$KUBE_EDGE_CORE_MIDDLEWARES;"
-# setup.sh (K3): uid / gid 1–65535, 3–4 octal digits; mkdir -m then chown;
+# setup.sh (K3): uid / gid 1–65535, 3–4 octal digits; mkdir -m 0700, chmod, then chown;
 # anything else refused, nothing created.
 SB="$WORK/setupbin"; mkdir -p "$SB"
 printf '#!/bin/sh\necho "chown $*" >> "$SETUP_LOG"\n' > "$SB/chown"; chmod +x "$SB/chown"
@@ -4264,15 +4321,21 @@ if stat -c %a / >/dev/null 2>&1; then :; else printf '#!/bin/sh\n[ "$1" = -c ] &
 mkdir -p "$WORK/volp"; chgrp "$(id -g)" "$WORK/volp"
 setup_run() { rm -rf "$WORK/volp/vol" "$WORK/setup.log"; ( export PATH="$SB:$PATH" SETUP_LOG="$WORK/setup.log" VOL_DIR="$WORK/volp/vol" VOL_USER="$1" VOL_GROUP="$2" VOL_PERM="$3"; sh "$HERE/../kube/storage/setup.sh" ) 2>&1; echo "rc=$?"; }
 OUT="$(setup_run 10001 10001 0750)"
-expect_eq "setup.sh 10001/10001/0750 → mkdir 0700, chown 10001:10001, then chmod 0750" "$OUT|$(file_mode "$WORK/volp/vol")|$(cat "$WORK/setup.log" | tr '\n' ';')" "rc=0|750|mkdir -m 0700 $WORK/volp/vol;chown 10001:10001 $WORK/volp/vol;chmod 0750 $WORK/volp/vol;"
+expect_eq "setup.sh 10001/10001/0750 → mkdir 0700, chmod 0750, then chown 10001:10001" "$OUT|$(file_mode "$WORK/volp/vol")|$(cat "$WORK/setup.log" | tr '\n' ';')" "rc=0|750|mkdir -m 0700 $WORK/volp/vol;chmod 0750 $WORK/volp/vol;chown 10001:10001 $WORK/volp/vol;"
 OUT="$(setup_run 10006 10001 2750)"
-expect_eq "setup.sh 10006/10001/2750 → chown first, then chmod 2750 (a chown without CAP_FSETID clears setgid on Linux); the directory is 2750" \
-  "$OUT|$(cat "$WORK/setup.log" | tr '\n' ';')|$(file_mode "$WORK/volp/vol")" "rc=0|mkdir -m 0700 $WORK/volp/vol;chown 10006:10001 $WORK/volp/vol;chmod 2750 $WORK/volp/vol;|2750"
-# A chown that clears setgid after the mode (the old order) is caught: a
-# chmod that doesn't stick refuses.
+expect_eq "setup.sh 10006/10001/2750 → chmod 2750 while root's, then chown (a chmod without CAP_FSETID outside the group drops setgid; a chown keeps it on a directory); the directory is 2750" \
+  "$OUT|$(cat "$WORK/setup.log" | tr '\n' ';')|$(file_mode "$WORK/volp/vol")" "rc=0|mkdir -m 0700 $WORK/volp/vol;chmod 2750 $WORK/volp/vol;chown 10006:10001 $WORK/volp/vol;|2750"
+# A mode that doesn't stick is caught, read back after the chown: a chmod
+# that drops setgid, or a chown that clears it, refuses.
 printf '#!/bin/sh\necho "chmod $*" >> "$SETUP_LOG"\nexec /bin/chmod 0750 "$2"\n' > "$SB/chmod.lossy"
 OUT="$(mv "$SB/chmod" "$SB/chmod.real"; cp "$SB/chmod.lossy" "$SB/chmod"; chmod +x "$SB/chmod"; setup_run 10006 10001 2750; mv "$SB/chmod.real" "$SB/chmod")"
-case "$OUT" in *"portcullis-setup REFUSED:"*"is mode 750 after chmod 2750 (want 2750)"*"rc=1") t_pass "setup.sh: a mode that doesn't stick (750 for 2750) refuses" ;; *) t_fail "setup.sh lossy chmod: $OUT" ;; esac
+case "$OUT" in *"portcullis-setup REFUSED:"*"is mode 750 after chmod 2750 and chown (want 2750)"*"rc=1") t_pass "setup.sh: a mode that doesn't stick (750 for 2750) refuses" ;; *) t_fail "setup.sh lossy chmod: $OUT" ;; esac
+printf '#!/bin/sh\necho "chown $*" >> "$SETUP_LOG"\nexec /bin/chmod 0750 "$2"\n' > "$SB/chown.lossy"
+OUT="$(mv "$SB/chown" "$SB/chown.real"; cp "$SB/chown.lossy" "$SB/chown"; chmod +x "$SB/chown"; setup_run 10006 10001 2750; mv "$SB/chown.real" "$SB/chown")"
+case "$OUT" in *"portcullis-setup REFUSED:"*"is mode 750 after chmod 2750 and chown (want 2750)"*"rc=1") t_pass "setup.sh: a chown that clears setgid refuses (the mode is read back after it)" ;; *) t_fail "setup.sh lossy chown: $OUT" ;; esac
+expect_eq "setup.sh: a refusal after the mkdir removes the directory (a retry can succeed)" "$(test -e "$WORK/volp/vol" && echo left || echo removed)" removed
+OUT="$(setup_run 10006 10001 2750)"
+expect_eq "setup.sh: the retry after a refusal succeeds" "$OUT|$(file_mode "$WORK/volp/vol")" "rc=0|2750"
 for bad in ":10001:0750:uid ''" "x:10001:0750:uid 'x'" "65536:10001:0750:uid '65536'" "10001::0750:gid ''" "10001:0:0750:gid '0'" "10001:10001::mode ''" "10001:10001:0789:mode '0789'" "10001:10001:75:mode '75'" "010001:10001:0750:uid '010001'"; do
   IFS=: read -r u g m why <<< "$bad"
   OUT="$(setup_run "$u" "$g" "$m")"

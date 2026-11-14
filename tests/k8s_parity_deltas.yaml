@@ -29,10 +29,10 @@ env-extra:
   - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES, reason: "spec §5: exactly the core and the apps namespace"}
   - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE, reason: "spec §5: false"}
   - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWEXTERNALNAMESERVICES, reason: "spec §5: false"}
+  - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_DISABLECLUSTERSCOPERESOURCES, reason: "no Node informer: Traefik's Role is namespaced (edge only), nothing cluster-scoped; a list it can't make keeps the provider from loading any route"}
   - {service: traefik, item: TRAEFIK_ENTRYPOINTS_KCINTERNAL_ADDRESS, reason: "kcinternal :8081 (K15): internal Keycloak clients through Traefik"}
   - {service: traefik, item: TRAEFIK_ENTRYPOINTS_KCINTERNAL_HTTP_ALIASHEADERSSTRATEGY, reason: "kcinternal deletes header aliases like websecure / vpnsecure (K-P10)"}
   - {service: traefik, item: TRAEFIK_ENTRYPOINTS_KCINTERNAL_HTTP_MIDDLEWARES, reason: "strip-client-forwarded@file first on kcinternal too (K-P10)"}
-  - {service: traefik, item: TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_PORT, reason: "web listens on :8000 behind port 80: the redirect names the public 443, not :8443"}
   - {service: traefik, item: TRAEFIK_ACCESSLOG_FORMAT, reason: "JSON access log: e2e-k3s asserts the client address (ClientHost) through ServiceLB"}
   - {service: hub, item: HUB_SELF_IMAGE, reason: "contract §6: the Hub's own digest, its helper pods' image"}
   - {service: hub, item: HUB_APPS_NAMESPACE, reason: "contract §6: the namespace the Hub's Role covers"}

@@ -2,14 +2,19 @@
 # The local-path provisioner's setup script for portcullis.io/local-path
 # (K3, mechanism (a) native): the StorageClass's userPattern / groupPattern
 # / permPattern turn a PVC's annotations portcullis.io/uid, /gid and /mode
-# into VOL_USER, VOL_GROUP and VOL_PERM. The directory is created 0700,
-# owned by that uid:gid, and only then given its mode (on Linux a chown
-# without CAP_FSETID clears the setgid bit), which is read back. Any missing
+# into VOL_USER, VOL_GROUP and VOL_PERM. The directory is created 0700
+# (root's), given its mode, then owned by that uid:gid, and the mode is read
+# back. That order: without CAP_FSETID a chmod by a process outside the
+# directory's group drops setgid (chown → chmod gave 750 for 2750, Linux
+# 7.0), while a chown never clears it on a directory. Any missing
 # or bad value, or a mode that didn't stick, refuses (exit 1): the PVC stays Pending,
 # the provisioner logs "portcullis-setup REFUSED: <why>". Runs in the
 # helper pod (uid 0, CAP_CHOWN / DAC_OVERRIDE / FOWNER only).
 set -eu
-refuse() { echo "portcullis-setup REFUSED: $*" >&2; exit 1; }
+made=""
+# A refusal after the mkdir removes that (empty) directory: else every retry
+# of the PVC refuses "already exists" for good.
+refuse() { echo "portcullis-setup REFUSED: $*" >&2; [ -z "$made" ] || rmdir "$VOL_DIR" 2>/dev/null || true; exit 1; }
 id_ok() {
   case "$1" in ''|*[!0-9]*|0*) return 1 ;; esac
   [ "${#1}" -le 5 ] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
@@ -25,8 +30,9 @@ case "${VOL_PERM:-}" in
 esac
 [ ! -e "$VOL_DIR" ] || refuse "$VOL_DIR already exists"
 mkdir -m 0700 "$VOL_DIR"
-chown "$VOL_USER:$VOL_GROUP" "$VOL_DIR"
-chmod "$VOL_PERM" "$VOL_DIR"
+made=1
+chmod "$VOL_PERM" "$VOL_DIR" || refuse "chmod $VOL_PERM $VOL_DIR failed"
+chown "$VOL_USER:$VOL_GROUP" "$VOL_DIR" || refuse "chown $VOL_USER:$VOL_GROUP $VOL_DIR failed"
 want="$(printf '%o' "0$VOL_PERM")"
 got="$(stat -c %a "$VOL_DIR")"
-[ "$got" = "$want" ] || refuse "$VOL_DIR is mode $got after chmod $VOL_PERM (want $want)"
+[ "$got" = "$want" ] || refuse "$VOL_DIR is mode $got after chmod $VOL_PERM and chown (want $want)"

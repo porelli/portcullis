@@ -210,7 +210,7 @@ status_run() {
   local shadows kx='{}' mcp_refusing=""
   if _rt_is_kube; then
     # Kubernetes: no app Service may be named like a core one (structural,
-    # asserted), the CLI's NetworkPolicy probe, the five admission
+    # asserted), the CLI's NetworkPolicy probe, the six admission
     # bindings, the kube API on the public address (K8, a warning).
     kx="$(kube_status_extra)"
     shadows="$(printf '%s' "$kx" | jq -r '.dns_shadows[] | "service/\(.) \(.)"')"

@@ -151,14 +151,58 @@ def main():
                 F.add(f"the Hub's Role: {rule['resources']}")
             if set(rule["verbs"]) & {"escalate", "bind", "impersonate", "*"}:
                 F.add(f"the Hub's Role: verbs {rule['verbs']}")
+    # What Traefik 3.7's CRD provider lists in a watched namespace: a
+    # resource it can't list keeps it from loading any route (e2e-k3s saw
+    # configmaps forbidden → every core route 404).
+    TRAEFIK_NEEDS = {("", "services"), ("", "secrets"), ("", "configmaps"), ("discovery.k8s.io", "endpointslices"),
+                     ("traefik.io", "ingressroutes"), ("traefik.io", "middlewares"), ("traefik.io", "serverstransports"),
+                     ("traefik.io", "tlsoptions"), ("traefik.io", "tlsstores"), ("traefik.io", "traefikservices")}
     for r in K.by_kind(docs, "Role"):
         if r["metadata"]["name"] == "traefik":
+            have = {(g, res) for rule in r["rules"] if {"list", "watch"} <= set(rule["verbs"]) for g in rule["apiGroups"] for res in rule["resources"]}
+            for g, res in sorted(TRAEFIK_NEEDS - have):
+                F.add(f"Traefik's Role in {r['metadata']['namespace']}: no list / watch on {g or 'core'}/{res} (its CRD provider loads no route without it)")
             for rule in r["rules"]:
                 if set(rule["verbs"]) - {"get", "list", "watch"}:
                     F.add(f"Traefik's Role in {r['metadata']['namespace']}: {rule['verbs']} (read-only)")
     check_secret_access(docs + storage_docs())
     check_edge(docs)
+    check_psa()
+    # Every PVC a pod claims is rendered, with and without the optional
+    # profiles (compose's named volumes exist in every profile).
+    for extra in (None, {"wg": {"enabled": False}}):
+        d = K.render(extra)
+        have = {c["metadata"]["name"] for c in K.by_kind(d, "PersistentVolumeClaim")}
+        for name, _, _, spec, _ in K.pod_specs(d):
+            for v in spec.get("volumes", []):
+                c = (v.get("persistentVolumeClaim") or {}).get("claimName")
+                if c and c not in have:
+                    F.add(f"{name}: claims PVC {c}, not rendered ({'CI values' if extra is None else extra})")
     return F.done()
+
+
+# The PSA levels: charts/portcullis/namespaces.json is the one source (the
+# CLI's kube_psa and templates/namespaces.yaml read it). Core and edge
+# restricted; apps (root one-shots) and storage (the helpers' hostPath)
+# can't be stricter than enforce privileged, warn / audit baseline.
+PSA_WANT = {"core": ["restricted"] * 3, "apps": ["privileged", "baseline", "baseline"],
+            "storage": ["privileged", "baseline", "baseline"], "edge": ["restricted"] * 3}
+
+
+def check_psa():
+    src = json.loads((K.CHART / "namespaces.json").read_text())
+    for role, want in PSA_WANT.items():
+        if src.get(role) != want:
+            F.add(f"namespaces.json {role}: {src.get(role)} (want {want})")
+    names = {"core": K.NS, "apps": K.APPS_NS, "storage": "portcullis-storage", "edge": K.EDGE_NS}
+    ns = {d["metadata"]["name"]: d["metadata"].get("labels", {}) for d in K.by_kind(K.render({"renderNamespaces": True}), "Namespace")}
+    for role, n in names.items():
+        got = [ns.get(n, {}).get(f"pod-security.kubernetes.io/{m}") for m in ("enforce", "warn", "audit")]
+        if got != src.get(role):
+            F.add(f"the chart's namespace {n}: PSA {got} != namespaces.json {role} {src.get(role)}")
+    kube = (K.ROOT / "scripts" / "lib" / "kube.sh").read_text()
+    if re.search(r"kube_namespace_apply\s+\S+\s+(privileged|baseline|restricted)\b", kube) or re.search(r"(privileged|baseline|restricted),(privileged|baseline|restricted)", kube):
+        F.add("scripts/lib/kube.sh spells PSA levels itself: kube_psa reads charts/portcullis/namespaces.json")
 
 
 APP_ENTRYPOINTS = {"web", "websecure", "vpnsecure"}
@@ -315,6 +359,8 @@ def check_edge(docs):
     env = {e["name"]: e.get("value") for e in K.deployments(docs)["traefik"]["spec"]["template"]["spec"]["containers"][0]["env"]}
     if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES") != K.EDGE_NS:
         F.add(f"traefik: kubernetesCRD namespaces {env.get('TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES')!r} (want {K.EDGE_NS} only)")
+    if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_DISABLECLUSTERSCOPERESOURCES") != "true":
+        F.add("traefik: kubernetesCRD disableClusterScopeResources must be true (its Role is namespaced: a Node list it can't make loads no route)")
     if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWEXTERNALNAMESERVICES") != "false":
         F.add("traefik: ExternalName services must stay off")
     if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE") != "true":

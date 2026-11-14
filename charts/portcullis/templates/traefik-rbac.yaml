@@ -6,6 +6,8 @@ holds the core IngressRoutes and Middlewares and never a Secret: TLS comes
 from the file provider. Nothing in the core namespace (portcullis-env, the
 age / wg / vault Secrets) or the apps namespace (the instances' Secrets),
 nothing cluster-scoped, no nodes (the Ingress / Gateway providers are off).
+The provider's informers need every resource listed (Traefik 3.7 lists
+ConfigMaps too): one it can't list keeps it from loading any route.
 k8s_hardening.py checks every ServiceAccount's Secret access. */ -}}
 apiVersion: v1
 kind: ServiceAccount
@@ -21,7 +23,7 @@ metadata:
   namespace: {{ .Values.edgeNamespace }}
 rules:
   - apiGroups: [""]
-    resources: ["services", "secrets"]
+    resources: ["services", "secrets", "configmaps"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]

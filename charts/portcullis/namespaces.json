@@ -1,0 +1,7 @@
+{
+  "_comment": "Pod Security Admission levels of the four namespaces: [enforce, warn, audit]. The one source: ./portcullis (kube_cluster_setup, status) applies and checks them, templates/namespaces.yaml renders them for kubeconform. apps and storage enforce privileged (root one-shots / the storage helpers' hostPath; their admission policies pin what runs there), warn / audit baseline.",
+  "core": ["restricted", "restricted", "restricted"],
+  "apps": ["privileged", "baseline", "baseline"],
+  "storage": ["privileged", "baseline", "baseline"],
+  "edge": ["restricted", "restricted", "restricted"]
+}

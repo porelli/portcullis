@@ -494,10 +494,19 @@ _KUBE_POD_HEALTH_JQ='
       elif ($cs.started != true) then "starting"
       else "unhealthy" end;'
 
+# _rtk_health <svc> — the service's health: "starting" while its Deployment
+# rolls (helm without --wait, a restart: the old pod's readiness isn't the
+# new config's), else its newest non-terminating pod's.
 _rtk_health() {
-  local pods
+  local pods dep
+  dep="$(kube_ctl -n "$(kube_ns)" get deploy "$1" -o json 2>/dev/null)" || { echo missing; return 0; }
+  if ! printf '%s' "$dep" | jq -e '(.status.observedGeneration // 0) >= .metadata.generation
+      and (.status.updatedReplicas // 0) == (.spec.replicas // 1) and (.status.replicas // 0) == (.status.updatedReplicas // 0)' >/dev/null 2>&1; then
+    echo starting; return 0
+  fi
   pods="$(_rtk_pods_json "$1")" || { echo missing; return 0; }
-  printf '%s' "$pods" | jq -r "$_KUBE_POD_HEALTH_JQ"' if length == 0 then "missing" else (.[0] | health) end' 2>/dev/null || echo missing
+  printf '%s' "$pods" | jq -r "$_KUBE_POD_HEALTH_JQ"' [.[] | select(.metadata.deletionTimestamp == null)] | sort_by(.metadata.creationTimestamp)
+    | if length == 0 then "missing" else (last | health) end' 2>/dev/null || echo missing
 }
 
 _rtk_running() {
@@ -521,11 +530,16 @@ _rtk_ps() {
   fi
 }
 
+# _rtk_exec <svc> [--] <argv…> — like docker exec: the command's output and
+# exit code only. kubectl adds "command terminated with exit code N" to
+# stderr for a non-zero exit; that line is dropped (callers judge the
+# command's own answer, e.g. Vault's bare "{}" for an empty list).
 _rtk_exec() {
   local svc="$1"
   shift
   [ "${1:-}" != -- ] || shift
-  kube_ctl -n "$(kube_ns)" exec -i "deploy/$svc" -c "$svc" -- "$@"
+  kube_ctl -n "$(kube_ns)" exec -i "deploy/$svc" -c "$svc" -- "$@" \
+    2> >(awk '!/^command terminated with exit code [0-9]+$/ { print; fflush() }' >&2)
 }
 
 # _rtk_logs <service> [compose logs options] — --tail / --since kept,
@@ -547,12 +561,20 @@ _rtk_logs() {
   kube_ctl -n "$(kube_ns)" logs "deploy/$svc" -c "$svc" ${opts[@]+"${opts[@]}"}
 }
 
-# _rtk_wait_ready <service>... — a pod of each service is Running (as
-# docker's start / restart: health is the caller's wait_healthy).
+# _rtk_wait_ready <service>... — each service's Deployment rolled out and
+# its newest pod Running (as docker's start / restart: health is the
+# caller's wait_healthy), ≤ KUBE_READY_WAIT (300 s) each. Judged by
+# _rtk_health, never `kubectl wait pod -l`: that fails NotFound when an old
+# ReplicaSet's pod it matched goes away, and passes on that old pod.
 _rtk_wait_ready() {
-  local svc
+  local svc i st
   for svc in "$@"; do
-    kube_ctl -n "$(kube_ns)" wait --for=jsonpath='{.status.phase}'=Running pod -l "$_KUBE_COMPONENT=$svc" --timeout=300s >/dev/null || return 1
+    for ((i = 0; ; i += 2)); do
+      st="$(_rtk_health "$svc")"
+      case "$st" in healthy|running|unhealthy) break ;; esac
+      [ "$i" -lt "${KUBE_READY_WAIT:-300}" ] || return 1
+      sleep 2
+    done
   done
 }
 
@@ -775,6 +797,17 @@ _kube_apply_files() {
   for f in "$@"; do
     kube_ctl apply --server-side --force-conflicts --field-manager="$KUBE_FIELD_MANAGER" -f "$f" >/dev/null || return 1
   done
+}
+
+# kube_psa <core|apps|storage|edge> — the namespace's PSA levels
+# "<enforce> <warn> <audit>" from charts/portcullis/namespaces.json (the
+# chart renders the same file); fails on anything but three known levels.
+kube_psa() {
+  local l
+  l="$(R="$1" jq -r '.[env.R] | select(type == "array" and length == 3 and all(.[]; . == "privileged" or . == "baseline" or . == "restricted")) | join(" ")' \
+    "$PORTCULLIS_HOME/charts/portcullis/namespaces.json" 2>/dev/null || true)"
+  [ -n "$l" ] || fail "charts/portcullis/namespaces.json has no valid PSA levels for $1"
+  printf '%s\n' "$l"
 }
 
 # kube_namespace_apply <name> <enforce> <warn> <audit> — the namespace with
@@ -1077,10 +1110,13 @@ kube_cluster_setup() {
   [ -n "$crds" ] || fail "no Traefik CRD bundle in charts/portcullis/crds"
 
   info "Cluster setup: namespaces..."
-  kube_namespace_apply "$(kube_ns)" restricted restricted restricted || fail "could not create the namespace $(kube_ns)"
-  kube_namespace_apply "$(kube_apps_ns)" privileged baseline baseline || fail "could not create the namespace $(kube_apps_ns)"
-  kube_namespace_apply "$KUBE_STORAGE_NS" privileged baseline baseline || fail "could not create the namespace $KUBE_STORAGE_NS"
-  kube_namespace_apply "$KUBE_EDGE_NS" restricted restricted restricted || fail "could not create the namespace $KUBE_EDGE_NS"
+  local role nsn psa
+  for role in core apps storage edge; do
+    case "$role" in core) nsn="$(kube_ns)" ;; apps) nsn="$(kube_apps_ns)" ;; storage) nsn="$KUBE_STORAGE_NS" ;; edge) nsn="$KUBE_EDGE_NS" ;; esac
+    psa="$(kube_psa "$role")" || exit 1
+    # shellcheck disable=SC2086  # three single-word levels
+    kube_namespace_apply "$nsn" $psa || fail "could not create the namespace $nsn"
+  done
   _kube_applied_set cluster.namespaces "${PORTCULLIS_KUBE_INSTALL_ID}"
 
   info "Cluster setup: storage (portcullis.io/local-path)..."
@@ -1494,10 +1530,11 @@ kube_health_report() {
 # namespace's PSA labels and the six bindings, written as the ConfigMap
 # portcullis-cluster-check (checked_at RFC 3339 UTC, ok true|false, why).
 kube_cluster_check() {
-  local ns why="" b psa
+  local ns why="" b psa want
   ns="$(kube_apps_ns)"
-  psa="$(kube_ctl get namespace "$ns" -o json 2>/dev/null | jq -r '[.metadata.labels["pod-security.kubernetes.io/enforce"], .metadata.labels["pod-security.kubernetes.io/warn"], .metadata.labels["pod-security.kubernetes.io/audit"]] | join(",")' 2>/dev/null || true)"
-  [ "$psa" = privileged,baseline,baseline ] || why="the apps namespace's PSA labels are '${psa:-unreadable}' (want enforce privileged, warn / audit baseline)"
+  want="$(kube_psa apps)" || exit 1
+  psa="$(kube_ctl get namespace "$ns" -o json 2>/dev/null | jq -r '[.metadata.labels["pod-security.kubernetes.io/enforce"], .metadata.labels["pod-security.kubernetes.io/warn"], .metadata.labels["pod-security.kubernetes.io/audit"]] | join(" ")' 2>/dev/null || true)"
+  [ "$psa" = "$want" ] || why="the apps namespace's PSA labels are '${psa:-unreadable}' (want enforce / warn / audit $want, charts/portcullis/namespaces.json)"
   [ -n "$why" ] || why="$(kube_bindings_missing)"
   NS="$(kube_ns)" OK="$([ -z "$why" ] && echo true || echo false)" WHY="$why" AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" jq -n '
     {apiVersion: "v1", kind: "ConfigMap",
@@ -1816,9 +1853,7 @@ _kube_restore_stop_secret_apps() {
 _kube_scale() { kube_ctl -n "$(kube_ns)" scale "deploy/$1" --replicas="$2" >/dev/null; }
 
 # _kube_wait_running <svc> — a pod of the service is Running (not Ready).
-_kube_wait_running() {
-  kube_ctl -n "$(kube_ns)" wait --for=jsonpath='{.status.phase}'=Running pod -l "$_KUBE_COMPONENT=$1" --timeout=300s >/dev/null
-}
+_kube_wait_running() { _rtk_wait_ready "$1"; }
 
 # _kube_restore_vault <dir> — the fresh Vault (its PVC emptied) initialised
 # with throwaway keys, the snapshot force-restored through the forward,

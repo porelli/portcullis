@@ -44,8 +44,6 @@ the people key as a Secret file, vpn-doc read-only, no hub-data. */ -}}
 -}}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---
-{{ include "portcullis.pvc" (list . "wg-data" .Values.uids.wg .Values.uids.hub "2750") }}
----
 # The gateways' edge (K5/K8): ports 9001–9047 → the wg pod, at a fixed
 # ClusterIP (PORTCULLIS_VPN_EDGE = <this>:<9001+n>). Never a LoadBalancer.
 apiVersion: v1
@@ -96,3 +94,7 @@ spec:
       port: 9100
       targetPort: 9100
 {{- end }}
+{{- /* wg-data with or without wg (compose: the wg_data volume exists in every
+profile): the Hub mounts it read-only, its status file absent = VPN off. */}}
+---
+{{ include "portcullis.pvc" (list . "wg-data" .Values.uids.wg .Values.uids.hub "2750") }}

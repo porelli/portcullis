@@ -1,6 +1,10 @@
 services:
   web:
     image: docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+    # A numeric non-root user (Kubernetes refuses a volume-mounting service
+    # without one), so :8080: a non-root pod can't bind :80.
+    user: "65534:65534"
+    command: ["--port", "8080"]
     networks: [default, portcullis-proxy]
     volumes:
       - data:/data
@@ -9,7 +13,7 @@ services:
       traefik.http.routers.echo.rule: Host(`${PORTCULLIS_HOST_ECHO:-echo.portcullis.local}`)
       traefik.http.routers.echo.entrypoints: websecure
       traefik.http.routers.echo.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
-      traefik.http.services.echo.loadbalancer.server.port: "80"
+      traefik.http.services.echo.loadbalancer.server.port: "8080"
   # PID 1 shell that ignores SIGTERM: compose down waits ECHO_STOP_GRACE.
   # Its own image (never the Hub's helper alpine): e2e-instances removes the
   # helper image while echo instances run and checks the Hub pulls it by

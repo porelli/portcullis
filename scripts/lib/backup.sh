@@ -1005,12 +1005,17 @@ _backup_restore_docker() {
 # backup_schedule_systemd <on-calendar> <output-dir|""> — system units
 # (docker: User=, After/Requires docker.service), or under rootless Podman
 # the operator's user units (After/Requires podman.socket, no User=,
-# WantedBy=default.target; they run while linger keeps the user manager up).
+# WantedBy=default.target; they run while linger keeps the user manager up),
+# or on Kubernetes system units with User= and no engine dependency but
+# k3s.service when this host runs it (a remote cluster: none).
 backup_schedule_systemd() {
   local cal="$1" out="$2" user offsite="" svc timer env_line="" after requires user_line wanted podman=false
   user="$(id -un)"
   if _rt_is_podman; then podman=true; fi
-  if [ "$podman" = true ]; then
+  if _rt_is_kube; then
+    after="network-online.target" requires="" user_line="User=$user" wanted="timers.target"
+    if systemctl cat k3s.service >/dev/null 2>&1; then after="$after k3s.service" requires="k3s.service"; fi
+  elif [ "$podman" = true ]; then
     after="network-online.target podman.socket" requires="podman.socket" user_line="" wanted="default.target"
   else
     after="network-online.target docker.service" requires="docker.service" user_line="User=$user" wanted="timers.target"
@@ -1023,8 +1028,8 @@ backup_schedule_systemd() {
 Description=Portcullis backup$( [ -n "$offsite" ] && echo " (local + off-host, restic)" || echo " (local only: BACKUP_REPOSITORY is not set)")
 Wants=network-online.target
 After=$after
-Requires=$requires
-
+${requires:+Requires=$requires
+}
 [Service]
 Type=oneshot
 ${user_line:+$user_line

@@ -6,7 +6,9 @@ or apps one); cross-namespace references on (the apps' edge routes name apps Ser
 Gateway providers off. File provider: the synced traefik/dynamic plus the
 chart's traefik-dynamic (K15 core names, strip-forwarded), projected into
 one directory. Every untrusted entrypoint runs strip-client-forwarded@file
-first and deletes header aliases. */ -}}
+first and deletes header aliases. web → https://<host>:443 (the redirect's
+`to` is the public port: websecure's own :8443 sits behind 443; Traefik's
+redirection has no port field, and a set one fails its env decoding). */ -}}
 {{- $d := include "portcullis.domain" . -}}
 {{- $s := dict
   "name" "traefik" "uid" .Values.uids.traefik "gid" .Values.uids.traefik
@@ -35,9 +37,8 @@ first and deletes header aliases. */ -}}
     (dict "name" "TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_ALIASHEADERSSTRATEGY" "value" "delete")
     (dict "name" "TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_MIDDLEWARES" "value" "strip-client-forwarded@file")
     (dict "name" "TRAEFIK_ENTRYPOINTS_WEBSECURE_ASDEFAULT" "value" "true")
-    (dict "name" "TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_TO" "value" "websecure")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_TO" "value" ":443")
     (dict "name" "TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_SCHEME" "value" "https")
-    (dict "name" "TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_PORT" "value" "443")
     (dict "name" "TRAEFIK_ENTRYPOINTS_WEBSECURE_ADDRESS" "value" ":8443")
     (dict "name" "TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_CERTRESOLVER" "value" "letsencrypt")
     (dict "name" "TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_DOMAINS_0_MAIN" "value" $d)
@@ -57,6 +58,7 @@ first and deletes header aliases. */ -}}
     (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES" "value" .Values.edgeNamespace)
     (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE" "value" "true")
     (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWEXTERNALNAMESERVICES" "value" "false")
+    (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_DISABLECLUSTERSCOPERESOURCES" "value" "true")
     (dict "name" "TRAEFIK_PROVIDERS_FILE_DIRECTORY" "value" "/etc/traefik/dynamic")
     (dict "name" "TRAEFIK_PROVIDERS_FILE_WATCH" "value" "true")
     (dict "name" "TRAEFIK_PROVIDERS_HTTP_ENDPOINT" "value" "https://domains:8443/traefik/dynamic")

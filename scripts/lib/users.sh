@@ -269,7 +269,6 @@ cmd_lldap_ui() {
     esac
   done
   need_env
-  require_cmd docker
   if _rt_is_kube; then
     # K16: a port-forward to LLDAP's own UI on this server's loopback.
     local port="${LLDAP_UI_PORT:-17170}"
@@ -280,6 +279,7 @@ cmd_lldap_ui() {
     kube_ctl -n "$(kube_ns)" port-forward --address 127.0.0.1 svc/lldap "$port:17170" >/dev/null
     return
   fi
+  require_cmd docker
   _lldap_ui_run
 }
 
