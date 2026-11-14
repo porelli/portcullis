@@ -856,11 +856,11 @@ if [ "\$cmd" = "config" ] && [ "\$1" = "--services" ]; then
   printf 'vault\nlldap\nkeycloak\nhub\ntraefik\n'
   exit 0
 fi
-# For other commands, filter out -d and --build, log the rest
+# For other commands, filter out -d, --build and --no-build, log the rest
 args=""
 while [ \$# -gt 0 ]; do
   case "\$1" in
-    -d|--build) shift; continue ;;
+    -d|--build|--no-build) shift; continue ;;
     *) args="\$args \$1"; shift ;;
   esac
 done
@@ -986,6 +986,10 @@ expect_eq "up: account unchanged, no hub restart" \
 # A changed session-store config is applied (restart) before compose recreates the oauth2-proxies.
 expect_eq "up: the session store's restart check runs before docker compose up" \
   "$(grep -E '^(sessions_restart_if_changed|up)' "$DC_CALLS" | head -n2 | paste -sd' ' -)" "sessions_restart_if_changed up"
+# The local images are built before the first up recreates anything
+# (test server 2026-11-13: a build next to Keycloak's restart).
+expect_eq "up: the local images are built before the first docker compose up" \
+  "$(grep -E '^(build|up)( |$)' "$DC_CALLS" | head -n2 | paste -sd'|' -)" "build --quiet|up"
 
 # stack_up when account changed: restart hub.
 touch "$LLDAP_ACCOUNT_CHANGED"
@@ -1047,6 +1051,10 @@ expect_eq "upgrade: account unchanged, no hub restart" \
   "$(grep -c '^restart.*hub' "$DC_CALLS" 2>/dev/null || true)" 0
 expect_eq "upgrade: the session store's restart check runs before docker compose up" \
   "$(grep -E '^(sessions_restart_if_changed|up)' "$DC_CALLS" | head -n2 | paste -sd' ' -)" "sessions_restart_if_changed up"
+# The local images are built before the first up recreates anything
+# (test server 2026-11-13: a build next to Keycloak's restart).
+expect_eq "upgrade: the local images are built before the first docker compose up" \
+  "$(grep -E '^(build|up)( |$)' "$DC_CALLS" | head -n2 | paste -sd'|' -)" "build --quiet|up"
 
 # ── static TLS options (contract §5 "TLS tier per host", plan D18) ──
 ROOT_DIR="$(cd "$HERE/.." && pwd)"

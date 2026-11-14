@@ -464,14 +464,24 @@ runtime_build_service() {
 }
 
 # runtime_no_build — "--no-build" for a `dc up` outside stack_compose_up
-# unless CONTAINER_RUNTIME is docker: under podman compose must never reach
+# (which builds first, then passes --no-build) unless CONTAINER_RUNTIME
+# is docker: under podman compose must never reach
 # the compat /build (a missing image then fails instead).
 runtime_no_build() {
   [ "${CONTAINER_RUNTIME:-}" = docker ] || echo --no-build
 }
 
-# stack_compose_up [service...] — `dc up -d` with the local images built:
-# docker → --build, podman → runtime_build_local, then --no-build. Never
+# runtime_build_all — build every local image (the services with a `build`
+# section, in the active profiles): docker → `docker compose build --quiet`,
+# podman → runtime_build_local.
+runtime_build_all() {
+  if _rt_is_podman; then runtime_build_local; else dc build --quiet || { warn "docker compose build failed"; return 1; }; fi
+}
+
+# stack_compose_up [service...] — the local images built FIRST (all of them:
+# runtime_build_all), then one `dc up -d --no-build`, so no build competes
+# with Keycloak's start (test server 2026-11-13: a rebuild next to
+# Keycloak's restart made it miss its health deadline). Never
 # --no-recreate / --force-recreate: compose recreates exactly the containers
 # whose config or image changed. It compares the image's runnable content
 # (its com.docker.compose.image label: under Docker's containerd store the
@@ -481,15 +491,72 @@ runtime_no_build() {
 # Podman the image ID, which a fully cached `podman build` keeps). CI
 # (build-and-test after an upgrade, e2e-podman after an up) checks that a
 # changed image reaches its container and an unchanged one isn't recreated.
+#
+# A failed up only because a dependency is still starting (every container
+# running or created, one or more health "starting" / "unhealthy", none
+# restarted since): wait up to STACK_UP_WAIT seconds (default 300) for them
+# to be healthy, then run the same up once more, so the dependents
+# (forward-auth, ...) and the caller's later steps still happen. A container
+# down (exited, dead, restarting) or restarted during the wait, or still not
+# healthy at the end, fails at once: named, then compose_health_report.
 stack_compose_up() {
-  local rc=0
-  if _rt_is_podman; then
-    runtime_build_local
-    dc up -d --no-build "$@" || rc=$?
-  else
-    dc up -d --build "$@" || rc=$?
+  local rc=0 base chk i svc why wait="${STACK_UP_WAIT:-300}"
+  runtime_build_all || return 1
+  dc up -d --no-build "$@" || rc=$?
+  [ "$rc" -ne 0 ] || return 0
+  base="$(_stack_up_states)"
+  chk="$(_stack_up_check "$base")"
+  if [ "${chk%% *}" = pending ]; then
+    warn "compose up stopped while${chk#pending} still starting: waiting up to ${wait}s for it to be healthy, then running up again"
+    for ((i = 0; i < wait; i += 5)); do
+      sleep 5
+      chk="$(_stack_up_check "$base")"
+      [ "${chk%% *}" = pending ] || break
+    done
+    if [ "$chk" = ready ]; then
+      info "Healthy now: running compose up again..."
+      rc=0
+      dc up -d --no-build "$@" || rc=$?
+      [ "$rc" -ne 0 ] || return 0
+      warn "compose up failed again"
+    fi
   fi
-  [ "$rc" -eq 0 ] || { compose_health_report; return "$rc"; }
+  case "$chk" in
+    pending*) warn "${chk#pending } still not healthy after ${wait}s. Check: docker compose logs${chk#pending}" ;;
+    down*) read -r _ svc why <<< "$chk"; warn "$svc is $why (not a slow start). Check: docker compose logs $svc" ;;
+  esac
+  compose_health_report
+  return "$rc"
+}
+
+# _stack_up_states — "<service> <status> <restart count> <health>" for each
+# core container (health "none" without a healthcheck).
+_stack_up_states() {
+  local cid
+  for cid in $(dc ps -aq 2>/dev/null); do
+    docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}} {{.State.Status}} {{.RestartCount}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || true
+  done
+}
+
+# _stack_up_check <baseline states> — after a failed up: "down <service>
+# <status|restarted>" when a container is down or restarted since the
+# baseline, else "pending <service>..." for the running ones still starting
+# or unhealthy, else "ready". Created containers (waiting on a dependency)
+# don't count.
+_stack_up_check() {
+  local base="$1" svc st n hl b pending=""
+  while read -r svc st n hl; do
+    [ -n "$svc" ] || continue
+    case "$st" in
+      created) continue ;;
+      running) ;;
+      *) echo "down $svc $st"; return 0 ;;
+    esac
+    b="$(printf '%s\n' "$base" | awk -v s="$svc" '$1 == s { print $3; exit }')"
+    if [ -n "$b" ] && [ "${n:-0}" -gt "$b" ] 2>/dev/null; then echo "down $svc restarted"; return 0; fi
+    case "$hl" in starting|unhealthy) pending="$pending $svc" ;; esac
+  done < <(_stack_up_states)
+  if [ -n "$pending" ]; then echo "pending$pending"; else echo ready; fi
 }
 
 # runtime_proxies_refresh — rootless Podman: the socket proxies bind-mount

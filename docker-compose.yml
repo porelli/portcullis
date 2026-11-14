@@ -550,7 +550,12 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
-      start_period: 30s
+      # 300 s: Keycloak's `start` re-augments on every start, and a busy
+      # 2-vCPU host needed ~160 s after an image change (test server
+      # 2026-11-13) against the old 30 s + 12 × 10 s. A check that passes
+      # during start_period marks it healthy at once, so a fast start isn't
+      # delayed; only failures inside it don't count.
+      start_period: 300s
     mem_limit: 2g
     pids_limit: 1024
     labels:
