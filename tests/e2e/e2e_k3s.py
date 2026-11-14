@@ -18,6 +18,11 @@ Scenarios:
             into a new id → delete.
   fixer     the folder fixer on /srv/e2e-k3s (folder-writer's `shared`):
             the apply op is ok and the files get the folder's gid.
+  mcp_companion  the templates repo's gitea with its AI companion on: the
+            companion's URL https://gitea-k.<d>/mcp (the Hub's route on the
+            app's own host to mcp-gate@file) serves the gate's RFC 9728
+            document and its 401 through Traefik; the gate alias Service
+            portcullis-mcp-gitea-k--gitea exists.
 
 Environment: HUB_API, E2E_HUB_SECRET (never printed, never on argv),
 E2E_DOMAIN, E2E_FOLDER (/srv/e2e-k3s), E2E_ARTIFACTS. Stdlib + kubectl.
@@ -43,7 +48,7 @@ FOLDER = os.environ.get("E2E_FOLDER", "/srv/e2e-k3s")
 ART = os.environ.get("E2E_ARTIFACTS", "e2e-artifacts")
 APPS = "portcullis-apps"
 EDGE = "portcullis-edge"
-ECHO, ECHO_R, WRITER = "echo-k", "echo-k-r", "folder-writer"
+ECHO, ECHO_R, WRITER, GITEA = "echo-k", "echo-k-r", "folder-writer", "gitea-k"
 OP_S = 1200
 
 results: list[tuple[str, bool, str]] = []
@@ -172,6 +177,43 @@ def main() -> int:
         assert got == str(gid), f"{FOLDER}/file-1.txt gid {got}, want {gid} (the identity map on k8s)"
         print(f"    applied: gid {gid}", flush=True)
     check("fixer: the folder's apply on /srv is ok through a helper pod; the files carry the folder gid", fixer)
+
+    def mcp_companion():
+        needs("runtime")
+        host = f"{GITEA}.{DOMAIN}"
+        hub_ok("GET", "/api/templates")
+        deadline = time.time() + 120
+        while "gitea" not in {x.get("id") for x in hub_get("/api/templates")}:
+            assert time.time() < deadline, "the Hub never loaded the templates repo's gitea"
+            time.sleep(5)
+        run_op("POST", "/api/instances", {"template": "gitea", "id": GITEA, "label": "Gitea on k3s", "hosts": {"gitea": host}})
+        run_op("POST", "/api/templates/enable", {"id": GITEA}, timeout=1500)
+        v = hub_ok("PUT", "/api/ai/settings", {"enabled": True, "clients": {"claude_code": {"offered": True, "admin": False}}})
+        assert v.get("enabled") is True and v.get("gate_present") is True, v
+        run_op("PUT", f"/api/instances/{GITEA}/ai", {"companions": {"gitea": {"enabled": True, "mode": "read_only"}}}, timeout=900)
+        svc = f"portcullis-mcp-{GITEA}--gitea"
+        kubectl("-n", APPS, "get", "service", svc)
+        # The companion URL on the app's own host, through Traefik → mcp-gate
+        # (the Hub's companion route): its RFC 9728 document and an
+        # unauthenticated call answered by the gate.
+        meta, call = f"https://{host}/.well-known/oauth-protected-resource/mcp", f"https://{host}/mcp"
+        deadline = time.time() + 180
+        while True:
+            out = sh("curl", "-sk", "--max-time", "20", "--resolve", f"{host}:443:198.51.100.1", "-w", "\n%{http_code}", meta)
+            body, _, code = out.rpartition("\n")
+            if code == "200":
+                doc = json.loads(body)
+                assert doc.get("resource") == call, doc
+                break
+            assert time.time() < deadline, f"{meta}: HTTP {code}: {body[:300]}"
+            time.sleep(5)
+        out = sh("curl", "-sk", "--max-time", "20", "--resolve", f"{host}:443:198.51.100.1", "-o", "/dev/null", "-D", "-",
+                 "-X", "POST", "-H", "Content-Type: application/json", "-d",
+                 '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"e2e-k3s","version":"0"}}}',
+                 call)
+        assert out.split()[1] == "401" and "resource_metadata=" in out.lower(), f"{call}: {out[:400]}"
+        print(f"    {call}: the gate's 401 with resource_metadata; Service {svc}", flush=True)
+    check("mcp_companion: gitea's companion on, its MCP URL on the app's host reaches mcp-gate through Traefik", mcp_companion)
 
     failed = [r for r in results if not r[1]]
     print(f"\n{len(results) - len(failed)} passed, {len(failed)} failed", flush=True)

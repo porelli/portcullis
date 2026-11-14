@@ -6,7 +6,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: portcullis-admission-params
-  namespace: "<PORTCULLIS_APPS_NAMESPACE>"
+  namespace: "<PORTCULLIS_NAMESPACE>"
 data:
   hubImage: "<the Hub's resolved digest, name@sha256:…>"
   hubServiceAccount: "system:serviceaccount:<PORTCULLIS_NAMESPACE>:portcullis-hub"

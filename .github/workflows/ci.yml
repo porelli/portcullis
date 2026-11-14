@@ -5175,6 +5175,10 @@ jobs:
       - name: init --runtime kubernetes (K1 local images)
         timeout-minutes: 30
         run: bash .github/ci/e2e-k3s-phases.sh init
+      - name: Templates (same-named templates branch, else main)
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: bash .github/ci/templates-checkout.sh gitea
       - name: Template source, the fixer's folder, a certificate to revoke
         timeout-minutes: 10
         run: bash .github/ci/e2e-k3s-phases.sh seed

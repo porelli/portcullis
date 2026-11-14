@@ -3952,7 +3952,7 @@ case "$*" in
     if [ -e "$1" ]; then jq -s '{items: .}' "$@"; else echo '{"items":[]}'; fi ;;
   "delete validatingadmissionpolicybinding"*)
     for a in "$@"; do case "$a" in validatingadmissionpolicybinding.*/*) rm -f "$STUB_DIR/live/Binding.${a##*/}.json"; printf 'delete binding %s\n' "${a##*/}" >> "$STUB_DIR/order" ;; esac; done ;;
-  "get configmap -l portcullis.io/params-generation,portcullis.io/params-generation!="*" -o json")
+  "get configmap -l app.kubernetes.io/managed-by=portcullis,portcullis.io/params-generation,portcullis.io/params-generation!="*" -o json")
     g="${4##*!=}"; out='[]'
     for c in "$STUB_DIR"/live/ConfigMap.portcullis-admission-params-*.json; do [ -e "$c" ] || continue
       [ "$(jq -r '.metadata.labels["portcullis.io/params-generation"]' "$c")" = "$g" ] || out="$(jq -c --slurpfile c "$c" '. + $c' <<< "$out")"
@@ -3961,15 +3961,21 @@ case "$*" in
   "delete configmap portcullis-admission-params-"*) rm -f "$STUB_DIR/live/ConfigMap.$3.json"; printf 'delete params %s\n' "$3" >> "$STUB_DIR/order" ;;
   "get ingressroutes.traefik.io -l portcullis.io/owner=hub -o json") cat "$K/edge-hub-ir.json" 2>/dev/null || echo '{"items":[]}' ;;
   "get middlewares.traefik.io -l portcullis.io/owner=hub -o json") echo '{"items":[]}' ;;
-  "--as=portcullis-admission-probe --as-group=system:masters replace --dry-run=server -f -")
+  "--as=system:serviceaccount:portcullis:portcullis-hub --as-group=system:masters replace --dry-run=server -f -")
     in="$(cat)"; case "$in" in *REFUSE-ME*) echo "ValidatingAdmissionPolicy 'portcullis-edge-routes' with binding 'portcullis-edge-guard-routes-x' denied request: a route on a reserved core hostname" >&2; exit 1 ;; esac ;;
   "delete ingressroutes.traefik.io "*) printf 'delete ir %s\n' "$3" >> "$STUB_DIR/order" ;;
-  "--as=portcullis-admission-probe --as-group=system:masters create --dry-run=server -f -")
-    in="$(cat)"; printf 'probe\n' >> "$STUB_DIR/order"
+  "--as=system:serviceaccount:portcullis:portcullis-hub --as-group=system:masters create --dry-run=server -f -")
+    in="$(cat)"
     g="$(printf '%s' "$in" | jq -r '.metadata.annotations["portcullis.io/params-generation"] // ""')"
+    k="$(printf '%s' "$in" | jq -r .kind)"
+    case "$k:$ns" in
+      Pod:*) b=portcullis-apps-guard-pods ;; Deployment:*) b=portcullis-apps-guard-workloads ;; Service:*) b=portcullis-apps-guard-services ;;
+      NetworkPolicy:*) b=portcullis-apps-guard-netpol ;; IngressRoute:portcullis-apps) b=portcullis-apps-guard-traefik ;; *) b=portcullis-edge-guard-routes ;;
+    esac
+    printf 'probe %s\n' "${g:+$b}" >> "$STUB_DIR/order"
     if [ -n "$g" ]; then
-      if [ -z "${STUB_PROBE_STALE:-}" ] && [ -e "$STUB_DIR/live/Binding.portcullis-edge-guard-routes-$g.json" ] && [ -e "$STUB_DIR/live/ConfigMap.portcullis-admission-params-$g.json" ]; then
-        echo "ValidatingAdmissionPolicy 'portcullis-edge-routes' with binding 'portcullis-edge-guard-routes-$g' denied request: admission probe: params generation $g in effect" >&2
+      if [ -z "${STUB_PROBE_STALE:-}" ] && [ "${STUB_PROBE_STALE_BINDING:-}" != "$b" ] && [ -e "$STUB_DIR/live/Binding.$b-$g.json" ] && [ -e "$STUB_DIR/live/ConfigMap.portcullis-admission-params-$g.json" ]; then
+        echo "ValidatingAdmissionPolicy 'x' with binding '$b-$g' denied request: admission probe: params generation $g in effect" >&2
       else echo "denied request: failed to configure binding: no params found" >&2; fi
       exit 1
     fi
@@ -4161,7 +4167,9 @@ expect_eq "cluster setup: the params ConfigMap has exactly params.tmpl.yaml's ke
 expect_eq "cluster setup: the six bindings as <name>-<generation> on portcullis-admission-params-<generation>, labelled with their base name" \
   "$(jq -s -r --arg g "$G1" 'map(select(.metadata.labels["portcullis.io/params-generation"] == $g) | [.metadata.name == .metadata.labels["portcullis.io/binding"] + "-" + $g, .spec.paramRef.name == "portcullis-admission-params-" + $g] | all) | [length, all] | map(tostring) | join(":")' "$KS"/live/Binding.*.json)" "6:true"
 expect_eq "cluster setup: first run → params, bindings, probe (3 requests), nothing older to delete" \
-  "$(grep -E '^(apply bindings|probe|delete binding|delete params|stamp)' "$KS/order" | sed "s/$G1/G1/" | uniq -c | tr -s ' ' | tr '\n' ';')" " 1 apply bindings G1; 3 probe;"
+  "$(grep -E '^(apply bindings|probe|delete binding|delete params|stamp)' "$KS/order" | sed "s/$G1/G1/; s/^probe .*/probe/" | uniq -c | tr -s ' ' | tr '\n' ';')" " 1 apply bindings G1; 8 probe;"
+expect_eq "cluster setup: every one of the six bindings probed with its own object" \
+  "$(grep '^probe portcullis-' "$KS/order" | sort | tr '\n' ' ')" "$(printf 'probe %s\n' $KUBE_BINDINGS | sort | tr '\n' ' ')"
 expect_eq "cluster setup: the four namespaces with PSA labels and K11's label + install annotation (server-side)" \
   "$(jq -cs '[.[] | select(.kind == "Namespace") | [.metadata.name, .metadata.labels["pod-security.kubernetes.io/enforce"], .metadata.labels["pod-security.kubernetes.io/warn"], .metadata.labels["app.kubernetes.io/managed-by"], .metadata.annotations["portcullis.io/install"]]]' < <(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(type == "object")' 2>/dev/null))" \
   '[["portcullis","restricted","restricted","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-apps","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-storage","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-edge","restricted","restricted","portcullis","0b0e2b3c-1111-4222-8333-444455556666"]]'
@@ -4172,20 +4180,30 @@ expect_eq "cluster setup: applied.json records every step (0600)" \
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
 expect_eq "cluster setup: unchanged params → the same generation re-applied and probed, nothing deleted, no Hub scaling" \
-  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c 'delete binding\|scale deploy/hub' "$KS/order" || true):$(grep -c '^probe$' "$KS/order")" "rc=0:0:3"
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c 'delete binding\|scale deploy/hub' "$KS/order" || true):$(grep -c '^probe' "$KS/order")" "rc=0:0:8"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.7'; kube_cluster_setup")"
 G2="$(grep '^apply bindings ' "$KS/order" | tail -n1 | cut -d' ' -f3)"
 expect_eq "cluster setup: changed params → create-before-delete: the new generation's bindings, the probe, only then the older bindings deleted; the older params stamped, not deleted; the Hub never scaled" \
-  "$(printf '%s\n' "$OUT" | tail -n1):$([ "$G2" != "$G1" ] && echo new-gen):$(grep -E '^(apply bindings|probe|delete binding|delete params|stamp|kubectl .*scale)' "$KS/order" | sed "s/$G2/G2/; s/$G1/G1/" | uniq -c | tr -s ' ' | tr '\n' ';')" \
-  "rc=0:new-gen: 1 apply bindings G2; 3 probe; 1 delete binding portcullis-apps-guard-netpol-G1; 1 delete binding portcullis-apps-guard-pods-G1; 1 delete binding portcullis-apps-guard-services-G1; 1 delete binding portcullis-apps-guard-traefik-G1; 1 delete binding portcullis-apps-guard-workloads-G1; 1 delete binding portcullis-edge-guard-routes-G1; 1 stamp portcullis-admission-params-G1;"
+  "$(printf '%s\n' "$OUT" | tail -n1):$([ "$G2" != "$G1" ] && echo new-gen):$(grep -E '^(apply bindings|probe|delete binding|delete params|stamp|kubectl .*scale)' "$KS/order" | sed "s/$G2/G2/; s/$G1/G1/; s/^probe .*/probe/" | uniq -c | tr -s ' ' | tr '\n' ';')" \
+  "rc=0:new-gen: 1 apply bindings G2; 8 probe; 1 delete binding portcullis-apps-guard-netpol-G1; 1 delete binding portcullis-apps-guard-pods-G1; 1 delete binding portcullis-apps-guard-services-G1; 1 delete binding portcullis-apps-guard-traefik-G1; 1 delete binding portcullis-apps-guard-workloads-G1; 1 delete binding portcullis-edge-guard-routes-G1; 1 stamp portcullis-admission-params-G1;"
+echo '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"portcullis-admission-params-ffffffffffffffff","labels":{"app.kubernetes.io/managed-by":"portcullis","portcullis.io/params-generation":"ffffffffffffffff"},"annotations":{"portcullis.io/orphaned-at":"a[$(touch '"$WORK"'/pwned)]"}},"data":{}}' > "$KS/live/ConfigMap.portcullis-admission-params-ffffffffffffffff.json"
+echo '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"portcullis-admission-params-evil","labels":{"app.kubernetes.io/managed-by":"portcullis","portcullis.io/params-generation":"x"},"annotations":{"portcullis.io/orphaned-at":"1"}},"data":{}}' > "$KS/live/ConfigMap.portcullis-admission-params-evil.json"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.7' KUBE_PARAMS_GRACE=0; kube_cluster_setup")"
 expect_eq "cluster setup: an orphaned older params ConfigMap is deleted once past the grace" \
   "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c "^delete params portcullis-admission-params-$G1$" "$KS/order")" "rc=0:1"
+expect_eq "params GC: an orphaned-at that isn't a timestamp is never evaluated (no command ran), the ConfigMap kept; a foreign name never touched" \
+  "$(test -e "$WORK/pwned" && echo PWNED || echo safe):$(test -e "$KS/live/ConfigMap.portcullis-admission-params-ffffffffffffffff.json" && echo kept):$(printf '%s' "$OUT" | grep -c "isn't a timestamp"):$(test -e "$KS/live/ConfigMap.portcullis-admission-params-evil.json" && echo kept):$(printf '%s' "$OUT" | grep -c 'not an admission params name')" \
+  "safe:kept:1:kept:1"
+rm -f "$KS/live/ConfigMap.portcullis-admission-params-ffffffffffffffff.json" "$KS/live/ConfigMap.portcullis-admission-params-evil.json"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.8' KUBE_ADMISSION_PROBE_WAIT=0; export STUB_PROBE_STALE=1; kube_cluster_setup")"
 case "$OUT" in *"aren't live with their params"*"the older bindings still judge"*"rc=1") t_pass "cluster setup: the new generation doesn't probe live → refused, the older bindings kept" ;; *) t_fail "cluster setup stale probe: $OUT" ;; esac
+rm -f "$KS/order"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.8' KUBE_ADMISSION_PROBE_WAIT=0; export STUB_PROBE_STALE_BINDING=portcullis-apps-guard-netpol; kube_cluster_setup")"
+case "$OUT" in *"not live with generation"*"portcullis-apps-guard-netpol"*"aren't live with their params"*"rc=1") t_pass "cluster setup: one binding of the six (netpol) not live → refused, the older bindings kept" ;; *) t_fail "cluster setup one stale binding: $OUT" ;; esac
+expect_eq "cluster setup: one stale binding deletes nothing" "$(grep -c '^delete binding' "$KS/order" || true)" 0
 expect_eq "cluster setup: a failed probe deletes no binding" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:6"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.9'; export STUB_BINDINGS_FAIL=1; kube_cluster_setup")"

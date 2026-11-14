@@ -49,7 +49,7 @@ ir() {
     metadata: {name: "e2e-app", labels: {"portcullis.io/owner": "hub", "portcullis.io/instance": "e2e"}},
     spec: {entryPoints: ["websecure"],
       routes: [{match: "Host(`e2e.example.org`)", kind: "Rule",
-        middlewares: [{name: "client-headers@file"}, {name: "portcullis-auth@file"}, {name: "portcullis-groups@file"}, {name: "e2e-app-strip"}],
+        middlewares: [{name: "client-headers@file"}, {name: "portcullis-auth@file"}, {name: "portcullis-groups@file"}, {name: "e2e--strip"}],
         services: [{name: "e2e-app", namespace: $apps, port: 80}]}],
       tls: {certResolver: "letsencrypt", options: {name: "authaware@file"}}}}' | jq "$1"
 }
@@ -57,7 +57,7 @@ ir() {
 HUB_LABELS='{"portcullis.io/owner": "hub", "portcullis.io/instance": "e2e"}'
 mw() {
   jq -n --argjson s "$1" --argjson l "${2:-$HUB_LABELS}" \
-    '{apiVersion: "traefik.io/v1alpha1", kind: "Middleware", metadata: {name: "e2e-app-strip", labels: $l}, spec: $s}'
+    '{apiVersion: "traefik.io/v1alpha1", kind: "Middleware", metadata: {name: "e2e--strip", labels: $l}, spec: $s}'
 }
 C=(create --dry-run=server -f -)
 
@@ -67,12 +67,12 @@ ir '.spec.entryPoints = ["websecure", "vpnsecure"]' | admitted "entryPoints webs
 ir '.spec.routes[0].match = "Host(`a.example.org`) || Host(`b.example.org`) && (PathPrefix(`/x`) || Path(`/y`))" | .spec.routes[0].priority = 1000' \
   | admitted "two hosts, paths, priority at maxAppPriority" "${C[@]}"
 ir '.spec.routes[0].services = [{name: "group-gate@file", kind: "TraefikService"}]' | admitted "a K15 core service (group-gate@file)" "${C[@]}"
-ir '.spec.routes[0].middlewares += [{name: "e2e-chain", namespace: "portcullis-edge"}]' | admitted "a middleware named with the edge namespace" "${C[@]}"
+ir '.spec.routes[0].middlewares += [{name: "e2e--chain", namespace: "portcullis-edge"}]' | admitted "a middleware named with the edge namespace" "${C[@]}"
 mw '{"stripPrefix": {"prefixes": ["/x"]}}' | admitted "a stripPrefix Middleware" "${C[@]}"
 mw '{"headers": {"customRequestHeaders": {"X-Forwarded-Attr-Tier": ""}}}' | admitted "a headers Middleware" "${C[@]}"
 mw '{"redirectRegex": {"regex": "^https://a/(.*)", "replacement": "https://b/${1}"}}' | admitted "a redirectRegex Middleware" "${C[@]}"
 mw '{"ipAllowList": {"sourceRange": ["10.213.0.0/22"]}}' | admitted "an ipAllowList Middleware" "${C[@]}"
-mw '{"chain": {"middlewares": [{"name": "e2e-app-strip"}, {"name": "portcullis-groups-vpn@file"}]}}' | admitted "a chain of own + @file middlewares" "${C[@]}"
+mw '{"chain": {"middlewares": [{"name": "e2e--strip"}, {"name": "portcullis-groups-vpn@file"}]}}' | admitted "a chain of own + @file middlewares" "${C[@]}"
 
 # ── ownership ──
 ir 'del(.metadata.labels)' | refused "an IngressRoute without portcullis.io/owner" "${C[@]}"
@@ -90,6 +90,7 @@ refused "patching the core Middleware portcullis-auth-console" patch --dry-run=s
 # A live Hub object: update and delete admitted.
 ir . | KH -n "$EDGE" create -f - >/dev/null || fail "the Hub can't create its IngressRoute"
 admitted "the Hub patching its own IngressRoute" patch ingressroute e2e-app --type=merge -p '{"spec":{"entryPoints":["websecure","vpnsecure"]}}'
+refused "the Hub moving its route to another instance" label ingressroute e2e-app portcullis.io/instance=other --overwrite
 refused "the Hub dropping its owner label" label ingressroute e2e-app portcullis.io/owner-
 admitted "the Hub deleting its own IngressRoute" delete ingressroute e2e-app
 
@@ -105,8 +106,8 @@ for m in 'HostRegexp(`.+`)' 'PathPrefix(`/`)' 'Host(`e2e.example.org`) || PathPr
   ir ".spec.routes[0].match = \"$m\"" | refused "the match $m" "${C[@]}"
 done
 # The params the live edge binding names (older generations may linger).
-PCM="$(K get validatingadmissionpolicybinding -l portcullis.io/binding=portcullis-edge-guard-routes -o jsonpath='{.items[0].spec.paramRef.name}')"
-RES="$(K -n "$APPS" get configmap "$PCM" -o jsonpath='{.data.reservedHosts}')"
+PREF="$(K get validatingadmissionpolicybinding -l portcullis.io/binding=portcullis-edge-guard-routes -o jsonpath='{.items[0].spec.paramRef.namespace}/{.items[0].spec.paramRef.name}')"
+RES="$(K -n "${PREF%%/*}" get configmap "${PREF#*/}" -o jsonpath='{.data.reservedHosts}')"
 APEX="${RES%% *}" HUBH="hub.${RES%% *}"
 ir ".spec.routes[0].match = \"Host(\`app1.$APEX\`)\"" | admitted "an app host under the apex (app1.$APEX)" "${C[@]}"
 for h in "$HUBH." "HUB.$APEX" "Hub.$APEX" "hub..$APEX" "-x.example.org" "x-.example.org" "x.$HUBH" "a.b.$HUBH" "$HUBH.." ".$HUBH"; do
@@ -122,6 +123,19 @@ done
 ir 'del(.spec.routes[0].services[0].namespace)' | refused "a Service without a namespace" "${C[@]}"
 ir '.spec.routes[0].services = [{name: "core-hub-8888@file", kind: "TraefikService"}]' | refused "a core router backend (core-hub-8888@file)" "${C[@]}"
 ir '.spec.routes[0].services = [{name: "api@internal", kind: "TraefikService"}]' | refused "api@internal" "${C[@]}"
+ir '.spec.routes[0].match = "Host(`e2e.example.org`) && Path(`/mcp`)" | .spec.routes[0].services = [{name: "mcp-gate@file", kind: "TraefikService"}]' \
+  | admitted "a companion MCP route to mcp-gate@file on the app's host" "${C[@]}"
+ir '.spec.routes[0].middlewares += [{name: "other--strip"}]' | refused "another instance's middleware" "${C[@]}"
+ir '.metadata.labels["portcullis.io/reach"] = "vpn"' | refused "a VPN-only instance's route on websecure" "${C[@]}"
+ir '.metadata.labels["portcullis.io/reach"] = "vpn" | .spec.entryPoints = ["vpnsecure"]' | admitted "a VPN-only instance's route on vpnsecure" "${C[@]}"
+ir '.metadata.labels["portcullis.io/reach"] = "vpn" | .spec.routes[0].middlewares = [{name: "vpn-required-path@file"}] | .spec.routes[0].services = [{name: "group-gate@file", kind: "TraefikService"}]' \
+  | admitted "a VPN-only instance's websecure VPN-required page" "${C[@]}"
+mw '{"headers": {"customRequestHeaders": {"X_Portcullis_Proxy_Secret": "x"}}}' | refused "an X_Portcullis_* header" "${C[@]}"
+# Only the Hub's ServiceAccount (and the CLI) may write here.
+out="$(ir . | K -n "$EDGE" --as=system:serviceaccount:portcullis-apps:default --as-group=system:masters create --dry-run=server -f - 2>&1)" \
+  && fail "another ServiceAccount (with RBAC) may write the apps' routes"
+printf '%s' "$out" | grep -q "with binding 'portcullis-edge-guard-routes-" || fail "another ServiceAccount's route refused, but not by the edge binding: ${out:0:300}"
+count ref
 ir '.spec.routes[0].services = [{name: "e2e-wrr", kind: "TraefikService"}]' | refused "an own TraefikService" "${C[@]}"
 ir '.spec.routes[0].services = [{name: "group-gate@file", kind: "TraefikService", namespace: "portcullis"}]' | refused "a K15 service with a namespace" "${C[@]}"
 ir '.spec.routes[0].middlewares += [{name: "hub-proxy-secret"}]' | refused "the core middleware hub-proxy-secret" "${C[@]}"

@@ -123,8 +123,8 @@ spec:
           port: {{ index $p 1 }}
     {{- end }}
 ---
-# Traefik → the apps' routed ports, mcp-gate → their companion ports (the
-# apps' own policies admit exactly those, contract §5).
+# Traefik → the apps' routed ports (the apps' own policies admit exactly
+# those, contract §5).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -134,16 +134,38 @@ metadata:
     app.kubernetes.io/managed-by: portcullis
 spec:
   podSelector:
-    matchExpressions:
-      - key: portcullis.io/component
-        operator: In
-        values: ["traefik", "mcp-gate"]
+    matchLabels:
+      portcullis.io/component: traefik
   policyTypes: ["Egress"]
   egress:
     - to:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: {{ .Values.appsNamespace }}
+---
+# mcp-gate → the apps' MCP companions only (pods the Hub labels
+# portcullis.io/mcp-companion: "true"); their own policies admit mcp-gate
+# on exactly the companion ports.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: to-mcp-companions
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: mcp-gate
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.appsNamespace }}
+          podSelector:
+            matchLabels:
+              portcullis.io/mcp-companion: "true"
 ---
 # Traefik: web / websecure from anywhere (and every pod of both namespaces);
 # kcinternal from the five internal Keycloak clients only; vpnsecure from

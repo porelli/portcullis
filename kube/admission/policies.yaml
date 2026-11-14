@@ -60,19 +60,18 @@ spec:
       'net.ipv4.tcp_keepalive_intvl', 'net.ipv4.tcp_keepalive_probes']
   - name: prefix
     expression: variables.inst + '--'
-  - name: refNames
+  # Root one-shot helpers (ruling): a Job's pod labelled portcullis.io/one-shot:
+  # true, every container of the root shape, no ServiceAccount token.
+  - name: oneShot
     expression: >-
-      variables.volumes.filter(v, has(v.secret)).map(v, v.secret.secretName) + variables.volumes.filter(v, has(v.configMap)).map(v,
-      v.configMap.name) + variables.volumes.filter(v, has(v.persistentVolumeClaim)).map(v, v.persistentVolumeClaim.claimName)
-      + variables.volumes.filter(v, has(v.projected) && has(v.projected.sources)).map(v, v.projected.sources.filter(s,
-      has(s.secret)).map(s, s.secret.name)
-          + v.projected.sources.filter(s, has(s.configMap)).map(s, s.configMap.name)).flatten()
-      + variables.containers.filter(c, has(c.envFrom)).map(c, c.envFrom.filter(e, has(e.secretRef)).map(e, e.secretRef.name)
-          + c.envFrom.filter(e, has(e.configMapRef)).map(e, e.configMapRef.name)).flatten()
-      + variables.containers.filter(c, has(c.env)).map(c, c.env.filter(e, has(e.valueFrom) && has(e.valueFrom.secretKeyRef)).map(e,
-      e.valueFrom.secretKeyRef.name)
-          + c.env.filter(e, has(e.valueFrom) && has(e.valueFrom.configMapKeyRef)).map(e, e.valueFrom.configMapKeyRef.name)).flatten()
+      'portcullis.io/one-shot' in variables.labels && variables.labels['portcullis.io/one-shot'] == 'true' && has(variables.meta.ownerReferences) && variables.meta.ownerReferences.exists(o, o.kind == 'Job' && has(o.controller) && o.controller) && request.userInfo.username in ['system:serviceaccount:kube-system:job-controller', 'system:kube-controller-manager'] && has(variables.spec.automountServiceAccountToken) && variables.spec.automountServiceAccountToken == false && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.fsGroup) && variables.spec.securityContext.fsGroup == 0) && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.supplementalGroups) && 0 in variables.spec.securityContext.supplementalGroups) && variables.volumes.all(v, has(v.emptyDir) || has(v.hostPath) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName.startsWith(variables.prefix)) || (has(v.configMap) && v.configMap.name.startsWith(variables.prefix)) || (has(v.secret) && v.secret.secretName.startsWith(variables.prefix))) && variables.containers.all(c, has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && 'ALL' in c.securityContext.capabilities.drop && (!has(c.securityContext.capabilities.add) || c.securityContext.capabilities.add.all(x, x in ['CHOWN', 'DAC_OVERRIDE', 'FOWNER'])) && (!has(c.ports) || size(c.ports) == 0) && ((has(c.securityContext) && has(c.securityContext.runAsGroup)) ? c.securityContext.runAsGroup != 0 : (has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsGroup) && variables.spec.securityContext.runAsGroup != 0)) && (!has(c.volumeMounts) || c.volumeMounts.all(m, (has(m.readOnly) && m.readOnly) || !variables.volumes.exists(v, v.name == m.name && has(v.hostPath)))))
+  - name: initNames
+    expression: 'has(variables.spec.initContainers) ? variables.spec.initContainers.map(c, c.name) : []'
   validations:
+  - expression: >-
+      !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
+      || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
+    messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
   - expression: variables.inst != ''
     message: a pod needs the portcullis.io/instance label
   - expression: variables.inst != 'portcullis-probe' || variables.probe
@@ -128,17 +127,26 @@ spec:
       s.name in variables.safeSysctls)
     message: a sysctl outside the baseline's safe set
   - expression: >-
-      variables.volumes.all(v, !has(v.hostPath)
-        || (!v.hostPath.path.contains('/..') && !v.hostPath.path.contains('/./')
-            && params.data.bindRoots.split(' ').exists(r, r != '' && (v.hostPath.path == r || v.hostPath.path.startsWith(r
-      + '/')))))
-    message: a hostPath outside the shared-folder roots
+      variables.volumes.all(v, has(v.emptyDir)
+        || (has(v.configMap) && (v.configMap.name.startsWith(variables.prefix) || v.configMap.name.startsWith('tpl-')))
+        || (has(v.secret) && (v.secret.secretName.startsWith(variables.prefix) || v.secret.secretName.startsWith('tpl-')))
+        || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName.startsWith(variables.prefix))
+        || (has(v.hostPath) && !v.hostPath.path.contains('/..') && !v.hostPath.path.contains('/./')
+            && params.data.bindRoots.split(' ').exists(r, r != '' && (v.hostPath.path == r || v.hostPath.path.startsWith(r + '/'))))
+        || (has(v.projected) && has(v.projected.sources) && v.projected.sources.all(src, has(src.downwardAPI)
+            || (has(src.secret) && (src.secret.name.startsWith(variables.prefix) || src.secret.name.startsWith('tpl-'))) || (has(src.configMap) && (src.configMap.name.startsWith(variables.prefix) || src.configMap.name.startsWith('tpl-'))))))
+    message: >-
+      a volume outside the allowlist (emptyDir; the instance's own ConfigMap, Secret or PVC; hostPath under the shared-folder roots; projected secret, configMap or downwardAPI)
   - expression: >-
       (!has(variables.spec.serviceAccountName) || variables.spec.serviceAccountName == 'default') && has(variables.spec.automountServiceAccountToken)
       && variables.spec.automountServiceAccountToken == false
     message: >-
       pods run as the namespace's default ServiceAccount with automountServiceAccountToken: false
-  - expression: variables.refNames.all(n, n.startsWith(variables.prefix) || n.startsWith('tpl-'))
+  - expression: >-
+      variables.containers.all(c, (!has(c.envFrom) || c.envFrom.all(e, (!has(e.secretRef) || (e.secretRef.name.startsWith(variables.prefix) || e.secretRef.name.startsWith('tpl-')))
+          && (!has(e.configMapRef) || (e.configMapRef.name.startsWith(variables.prefix) || e.configMapRef.name.startsWith('tpl-')))))
+        && (!has(c.env) || c.env.all(e, !has(e.valueFrom) || ((!has(e.valueFrom.secretKeyRef) || (e.valueFrom.secretKeyRef.name.startsWith(variables.prefix) || e.valueFrom.secretKeyRef.name.startsWith('tpl-')))
+          && (!has(e.valueFrom.configMapKeyRef) || (e.valueFrom.configMapKeyRef.name.startsWith(variables.prefix) || e.valueFrom.configMapKeyRef.name.startsWith('tpl-')))))))
     messageExpression: >-
       "a Secret, ConfigMap or PVC that isn't this instance's (" + variables.prefix + "* or tpl-*)"
   - expression: >-
@@ -158,11 +166,25 @@ spec:
       a helper pod: portcullis.io/helper fixer or volume, the Hub's own image, no network label, created by the
       Hub
   - expression: >-
-      variables.helper != '' || (!(has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsUser)
-      && variables.spec.securityContext.runAsUser == 0)
-          && variables.containers.all(c, !(has(c.securityContext) && has(c.securityContext.runAsUser) && c.securityContext.runAsUser
-      == 0)))
-    message: only the Hub's helper pods may run as root
+      (variables.helper != '' || ((!(has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsUser)
+        && variables.spec.securityContext.runAsUser == 0) || variables.oneShot)
+        && variables.containers.all(c, !(has(c.securityContext) && has(c.securityContext.runAsUser) && c.securityContext.runAsUser == 0)
+          || variables.oneShot || (c.name in variables.initNames && has(variables.spec.automountServiceAccountToken) && variables.spec.automountServiceAccountToken == false && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.fsGroup) && variables.spec.securityContext.fsGroup == 0) && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.supplementalGroups) && 0 in variables.spec.securityContext.supplementalGroups) && has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && 'ALL' in c.securityContext.capabilities.drop && (!has(c.securityContext.capabilities.add) || c.securityContext.capabilities.add.all(x, x in ['CHOWN', 'DAC_OVERRIDE', 'FOWNER'])) && (!has(c.ports) || size(c.ports) == 0) && ((has(c.securityContext) && has(c.securityContext.runAsGroup)) ? c.securityContext.runAsGroup != 0 : (has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsGroup) && variables.spec.securityContext.runAsGroup != 0)) && (!has(c.volumeMounts) || c.volumeMounts.all(m, (has(m.readOnly) && m.readOnly) || !variables.volumes.exists(v, v.name == m.name && has(v.hostPath))))))))
+    message: >-
+      only the Hub's helper pods, a Job's one-shot pods (portcullis.io/one-shot) and init containers of the root shape
+      (drop ALL, add only CHOWN / DAC_OVERRIDE / FOWNER, no privilege escalation, no ports, no ServiceAccount token, a group
+      other than 0, no fsGroup / supplemental group 0, hostPath only read-only; a one-shot pod's volumes only emptyDir,
+      read-only hostPath or the instance's own PVC / ConfigMap / Secret) may run as root
+  # Compose names (ruling): the Hub's hostname / subdomain / search domain only.
+  - expression: >-
+      ((!has(variables.spec.hostname) || ('portcullis.io/service' in variables.labels && variables.spec.hostname == variables.labels['portcullis.io/service']))
+        && (!has(variables.spec.subdomain) || variables.spec.subdomain == variables.inst)
+        && (!has(variables.spec.dnsPolicy) || variables.spec.dnsPolicy != 'None')
+        && (!has(variables.spec.dnsConfig) || ((!has(variables.spec.dnsConfig.nameservers) || size(variables.spec.dnsConfig.nameservers) == 0)
+          && (!has(variables.spec.dnsConfig.searches) || variables.spec.dnsConfig.searches.all(s, s == variables.inst + '.' + params.data.appsNamespace + '.svc.cluster.local')))))
+    message: >-
+      hostname / subdomain / dnsConfig: only the pod's own portcullis.io/service and instance, the search domain
+      <instance>.<apps namespace>.svc.cluster.local, no nameservers, no dnsPolicy None
   - expression: >-
       !variables.probe || (variables.inst == 'portcullis-probe'
           && variables.volumes.size() == 0
@@ -249,19 +271,18 @@ spec:
       'net.ipv4.tcp_keepalive_intvl', 'net.ipv4.tcp_keepalive_probes']
   - name: prefix
     expression: variables.inst + '--'
-  - name: refNames
+  # Root one-shot helpers (ruling): a Job's pod labelled portcullis.io/one-shot:
+  # true, every container of the root shape, no ServiceAccount token.
+  - name: oneShot
     expression: >-
-      variables.volumes.filter(v, has(v.secret)).map(v, v.secret.secretName) + variables.volumes.filter(v, has(v.configMap)).map(v,
-      v.configMap.name) + variables.volumes.filter(v, has(v.persistentVolumeClaim)).map(v, v.persistentVolumeClaim.claimName)
-      + variables.volumes.filter(v, has(v.projected) && has(v.projected.sources)).map(v, v.projected.sources.filter(s,
-      has(s.secret)).map(s, s.secret.name)
-          + v.projected.sources.filter(s, has(s.configMap)).map(s, s.configMap.name)).flatten()
-      + variables.containers.filter(c, has(c.envFrom)).map(c, c.envFrom.filter(e, has(e.secretRef)).map(e, e.secretRef.name)
-          + c.envFrom.filter(e, has(e.configMapRef)).map(e, e.configMapRef.name)).flatten()
-      + variables.containers.filter(c, has(c.env)).map(c, c.env.filter(e, has(e.valueFrom) && has(e.valueFrom.secretKeyRef)).map(e,
-      e.valueFrom.secretKeyRef.name)
-          + c.env.filter(e, has(e.valueFrom) && has(e.valueFrom.configMapKeyRef)).map(e, e.valueFrom.configMapKeyRef.name)).flatten()
+      'portcullis.io/one-shot' in variables.labels && variables.labels['portcullis.io/one-shot'] == 'true' && object.kind == 'Job' && has(variables.spec.automountServiceAccountToken) && variables.spec.automountServiceAccountToken == false && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.fsGroup) && variables.spec.securityContext.fsGroup == 0) && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.supplementalGroups) && 0 in variables.spec.securityContext.supplementalGroups) && variables.volumes.all(v, has(v.emptyDir) || has(v.hostPath) || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName.startsWith(variables.prefix)) || (has(v.configMap) && v.configMap.name.startsWith(variables.prefix)) || (has(v.secret) && v.secret.secretName.startsWith(variables.prefix))) && variables.containers.all(c, has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && 'ALL' in c.securityContext.capabilities.drop && (!has(c.securityContext.capabilities.add) || c.securityContext.capabilities.add.all(x, x in ['CHOWN', 'DAC_OVERRIDE', 'FOWNER'])) && (!has(c.ports) || size(c.ports) == 0) && ((has(c.securityContext) && has(c.securityContext.runAsGroup)) ? c.securityContext.runAsGroup != 0 : (has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsGroup) && variables.spec.securityContext.runAsGroup != 0)) && (!has(c.volumeMounts) || c.volumeMounts.all(m, (has(m.readOnly) && m.readOnly) || !variables.volumes.exists(v, v.name == m.name && has(v.hostPath)))))
+  - name: initNames
+    expression: 'has(variables.spec.initContainers) ? variables.spec.initContainers.map(c, c.name) : []'
   validations:
+  - expression: >-
+      !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
+      || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
+    messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
   - expression: >-
       object.kind != 'Secret' || !has(object.type) || object.type != 'kubernetes.io/service-account-token'
     message: a ServiceAccount token Secret is refused
@@ -326,11 +347,16 @@ spec:
       || variables.spec.securityContext.sysctls.all(s, s.name in variables.safeSysctls))
     message: a sysctl outside the baseline's safe set
   - expression: >-
-      object.kind == 'Secret' || (variables.volumes.all(v, !has(v.hostPath)
-        || (!v.hostPath.path.contains('/..') && !v.hostPath.path.contains('/./')
-            && params.data.bindRoots.split(' ').exists(r, r != '' && (v.hostPath.path == r || v.hostPath.path.startsWith(r
-      + '/'))))))
-    message: a hostPath outside the shared-folder roots
+      object.kind == 'Secret' || (variables.volumes.all(v, has(v.emptyDir)
+        || (has(v.configMap) && (v.configMap.name.startsWith(variables.prefix) || v.configMap.name.startsWith('tpl-')))
+        || (has(v.secret) && (v.secret.secretName.startsWith(variables.prefix) || v.secret.secretName.startsWith('tpl-')))
+        || (has(v.persistentVolumeClaim) && v.persistentVolumeClaim.claimName.startsWith(variables.prefix))
+        || (has(v.hostPath) && !v.hostPath.path.contains('/..') && !v.hostPath.path.contains('/./')
+            && params.data.bindRoots.split(' ').exists(r, r != '' && (v.hostPath.path == r || v.hostPath.path.startsWith(r + '/'))))
+        || (has(v.projected) && has(v.projected.sources) && v.projected.sources.all(src, has(src.downwardAPI)
+            || (has(src.secret) && (src.secret.name.startsWith(variables.prefix) || src.secret.name.startsWith('tpl-'))) || (has(src.configMap) && (src.configMap.name.startsWith(variables.prefix) || src.configMap.name.startsWith('tpl-')))))))
+    message: >-
+      a volume outside the allowlist (emptyDir; the instance's own ConfigMap, Secret or PVC; hostPath under the shared-folder roots; projected secret, configMap or downwardAPI)
   - expression: >-
       object.kind == 'Secret' || ((!has(variables.spec.serviceAccountName) || variables.spec.serviceAccountName
       == 'default') && has(variables.spec.automountServiceAccountToken) && variables.spec.automountServiceAccountToken
@@ -338,7 +364,10 @@ spec:
     message: >-
       pods run as the namespace's default ServiceAccount with automountServiceAccountToken: false
   - expression: >-
-      object.kind == 'Secret' || (variables.refNames.all(n, n.startsWith(variables.prefix) || n.startsWith('tpl-')))
+      object.kind == 'Secret' || (variables.containers.all(c, (!has(c.envFrom) || c.envFrom.all(e, (!has(e.secretRef) || (e.secretRef.name.startsWith(variables.prefix) || e.secretRef.name.startsWith('tpl-')))
+          && (!has(e.configMapRef) || (e.configMapRef.name.startsWith(variables.prefix) || e.configMapRef.name.startsWith('tpl-')))))
+        && (!has(c.env) || c.env.all(e, !has(e.valueFrom) || ((!has(e.valueFrom.secretKeyRef) || (e.valueFrom.secretKeyRef.name.startsWith(variables.prefix) || e.valueFrom.secretKeyRef.name.startsWith('tpl-')))
+          && (!has(e.valueFrom.configMapKeyRef) || (e.valueFrom.configMapKeyRef.name.startsWith(variables.prefix) || e.valueFrom.configMapKeyRef.name.startsWith('tpl-'))))))))
     messageExpression: >-
       "a Secret, ConfigMap or PVC that isn't this instance's (" + variables.prefix + "* or tpl-*)"
   - expression: >-
@@ -359,11 +388,25 @@ spec:
       a helper pod: portcullis.io/helper fixer or volume, the Hub's own image, no network label, created by the
       Hub
   - expression: >-
-      object.kind == 'Secret' || (variables.helper != '' || (!(has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsUser)
-      && variables.spec.securityContext.runAsUser == 0)
-          && variables.containers.all(c, !(has(c.securityContext) && has(c.securityContext.runAsUser) && c.securityContext.runAsUser
-      == 0))))
-    message: only the Hub's helper pods may run as root
+      object.kind == 'Secret' || (variables.helper != '' || ((!(has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsUser)
+        && variables.spec.securityContext.runAsUser == 0) || variables.oneShot)
+        && variables.containers.all(c, !(has(c.securityContext) && has(c.securityContext.runAsUser) && c.securityContext.runAsUser == 0)
+          || variables.oneShot || (c.name in variables.initNames && has(variables.spec.automountServiceAccountToken) && variables.spec.automountServiceAccountToken == false && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.fsGroup) && variables.spec.securityContext.fsGroup == 0) && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.supplementalGroups) && 0 in variables.spec.securityContext.supplementalGroups) && has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && 'ALL' in c.securityContext.capabilities.drop && (!has(c.securityContext.capabilities.add) || c.securityContext.capabilities.add.all(x, x in ['CHOWN', 'DAC_OVERRIDE', 'FOWNER'])) && (!has(c.ports) || size(c.ports) == 0) && ((has(c.securityContext) && has(c.securityContext.runAsGroup)) ? c.securityContext.runAsGroup != 0 : (has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsGroup) && variables.spec.securityContext.runAsGroup != 0)) && (!has(c.volumeMounts) || c.volumeMounts.all(m, (has(m.readOnly) && m.readOnly) || !variables.volumes.exists(v, v.name == m.name && has(v.hostPath))))))))
+    message: >-
+      only the Hub's helper pods, a Job's one-shot pods (portcullis.io/one-shot) and init containers of the root shape
+      (drop ALL, add only CHOWN / DAC_OVERRIDE / FOWNER, no privilege escalation, no ports, no ServiceAccount token, a group
+      other than 0, no fsGroup / supplemental group 0, hostPath only read-only; a one-shot pod's volumes only emptyDir,
+      read-only hostPath or the instance's own PVC / ConfigMap / Secret) may run as root
+  # Compose names (ruling): the Hub's hostname / subdomain / search domain only.
+  - expression: >-
+      object.kind == 'Secret' || ((!has(variables.spec.hostname) || ('portcullis.io/service' in variables.labels && variables.spec.hostname == variables.labels['portcullis.io/service']))
+        && (!has(variables.spec.subdomain) || variables.spec.subdomain == variables.inst)
+        && (!has(variables.spec.dnsPolicy) || variables.spec.dnsPolicy != 'None')
+        && (!has(variables.spec.dnsConfig) || ((!has(variables.spec.dnsConfig.nameservers) || size(variables.spec.dnsConfig.nameservers) == 0)
+          && (!has(variables.spec.dnsConfig.searches) || variables.spec.dnsConfig.searches.all(s, s == variables.inst + '.' + params.data.appsNamespace + '.svc.cluster.local')))))
+    message: >-
+      hostname / subdomain / dnsConfig: only the pod's own portcullis.io/service and instance, the search domain
+      <instance>.<apps namespace>.svc.cluster.local, no nameservers, no dnsPolicy None
   - expression: >-
       object.kind == 'Secret' || (!variables.probe || (variables.inst == 'portcullis-probe'
           && variables.volumes.size() == 0
@@ -396,7 +439,25 @@ spec:
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]
         resources: ["services"]
+  variables:
+    - name: svcBits
+      expression: "32 - cidr(params.data.serviceCIDR).prefixLength()"
+    - name: bandBits
+      expression: "variables.svcBits - 4 < 4 ? 4 : (variables.svcBits - 4 > 8 ? 8 : variables.svcBits - 4)"
+    - name: staticBand
+      expression: "string(cidr(params.data.serviceCIDR).ip()) + '/' + string(32 - variables.bandBits)"
+    # A server dry-run reports the service network's own address as the
+    # clusterIP (never allocated): not a static-band address.
+    - name: netAddr
+      expression: "string(cidr(params.data.serviceCIDR).ip())"
   validations:
+    # The CLI's probe (kube_admission_probe): an object annotated with
+    # exactly this binding's params generation is refused, naming it — the
+    # proof that this policy's binding of that generation is live.
+    - expression: >-
+        !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
+        || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
+      messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
     - expression: "!has(object.spec.type) || object.spec.type in ['ClusterIP', 'LoadBalancer']"
       messageExpression: "'Service type ' + object.spec.type + ' is refused (NodePort, ExternalName)'"
     - expression: "!has(object.spec.externalIPs) || size(object.spec.externalIPs) == 0"
@@ -407,12 +468,17 @@ spec:
         !has(object.spec.type) || object.spec.type != 'LoadBalancer'
         || (has(object.spec.allocateLoadBalancerNodePorts) && object.spec.allocateLoadBalancerNodePorts == false)
       message: "a LoadBalancer needs allocateLoadBalancerNodePorts: false"
+    # The API server allocates a Service's clusterIP before admission, so
+    # an allocated one can't be told from a requested one (Kubernetes 1.32:
+    # every Service would be refused). Refused instead: any clusterIP in the
+    # service network's static band, the first min(max(16, size/16), 256)
+    # addresses, where the core Services' fixed IPs live (the dynamic
+    # allocator never picks them while the dynamic band has room).
     - expression: >-
-        (!has(object.spec.clusterIP) || object.spec.clusterIP in ['', 'None']
-          || (request.operation == 'UPDATE' && has(oldObject.spec.clusterIP) && oldObject.spec.clusterIP == object.spec.clusterIP))
-        && (!has(object.spec.clusterIPs) || object.spec.clusterIPs.all(ip, ip == 'None')
-          || (request.operation == 'UPDATE' && has(oldObject.spec.clusterIPs) && oldObject.spec.clusterIPs == object.spec.clusterIPs))
-      message: "an explicit clusterIP is refused (only None)"
+        (!has(object.spec.clusterIP) || object.spec.clusterIP in ['', 'None'] || !isIP(object.spec.clusterIP)
+          || !cidr(variables.staticBand).containsIP(object.spec.clusterIP) || object.spec.clusterIP == variables.netAddr)
+        && (!has(object.spec.clusterIPs) || object.spec.clusterIPs.all(a, a == 'None' || !isIP(a) || !cidr(variables.staticBand).containsIP(a) || a == variables.netAddr))
+      message: "a clusterIP in the service network's static band (the core Services' fixed addresses) is refused"
     - expression: >-
         !has(object.spec.type) || object.spec.type != 'LoadBalancer'
         || object.spec.ports.all(p, !(string(p.port) in params.data.corePorts.split(' ')))
@@ -436,7 +502,16 @@ spec:
   # Traefik doesn't watch the apps namespace (it would list every Secret of
   # it): app IngressRoutes / Middlewares live in portcullis-edge.
   validations:
-    - expression: "false"
+    # The CLI's probe (kube_admission_probe): an object annotated with
+    # exactly this binding's params generation is refused, naming it — the
+    # proof that this policy's binding of that generation is live.
+    - expression: >-
+        !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
+        || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
+      messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
+    # The CLI's probes of other params generations pass (Traefik doesn't
+    # watch this namespace and the Hub has no Role for traefik.io here).
+    - expression: "has(object.metadata.annotations) && 'portcullis.io/params-generation' in object.metadata.annotations"
       messageExpression: "object.kind + ' is refused in the apps namespace: Traefik objects live in portcullis-edge'"
 ---
 apiVersion: admissionregistration.k8s.io/v1
@@ -484,6 +559,13 @@ spec:
     - name: dnsSel
       expression: "{params.data.kubeDNS.split(':')[1].split('=')[0]: params.data.kubeDNS.split(':')[1].split('=')[1]}"
   validations:
+    # The CLI's probe (kube_admission_probe): an object annotated with
+    # exactly this binding's params generation is refused, naming it — the
+    # proof that this policy's binding of that generation is live.
+    - expression: >-
+        !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
+        || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
+      messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
     - expression: >-
         variables.probe
         || (variables.inst != ''
@@ -492,17 +574,22 @@ spec:
       message: "a NetworkPolicy selects one instance's pods (portcullis.io/instance plus a net-, egress, service or vpn-slot key)"
     - expression: "size(variables.nodes) > 0 && size(variables.apiAddrs) > 0"
       message: "the params carry no node or API addresses: every NetworkPolicy is refused (fail closed)"
+    # A port range would widen every port check below (53, 80 / 443, the
+    # wg edge port): the Hub never writes endPort.
+    - expression: >-
+        variables.ingress.all(r, !has(r.ports) || r.ports.all(x, !has(x.endPort)))
+        && variables.egress.all(r, !has(r.ports) || r.ports.all(x, !has(x.endPort)))
+      message: "a NetworkPolicy port range (endPort) is refused"
     - expression: "variables.ingress.all(r, has(r.from) && size(r.from) > 0) && variables.egress.all(r, has(r.to) && size(r.to) > 0)"
       message: "a rule without from / to (all peers) is refused"
     - expression: >-
-        (variables.ingress.map(r, r.from).flatten() + variables.egress.map(r, r.to).flatten()).all(p,
-          (!has(p.namespaceSelector) || (has(p.namespaceSelector.matchLabels) && size(p.namespaceSelector.matchLabels) > 0) || (has(p.namespaceSelector.matchExpressions) && size(p.namespaceSelector.matchExpressions) > 0))
-          && (!has(p.podSelector) || (has(p.podSelector.matchLabels) && size(p.podSelector.matchLabels) > 0) || (has(p.podSelector.matchExpressions) && size(p.podSelector.matchExpressions) > 0)))
+        variables.ingress.all(r, r.from.all(p, (!has(p.namespaceSelector) || (has(p.namespaceSelector.matchLabels) && size(p.namespaceSelector.matchLabels) > 0) || (has(p.namespaceSelector.matchExpressions) && size(p.namespaceSelector.matchExpressions) > 0))
+          && (!has(p.podSelector) || (has(p.podSelector.matchLabels) && size(p.podSelector.matchLabels) > 0) || (has(p.podSelector.matchExpressions) && size(p.podSelector.matchExpressions) > 0)))) && variables.egress.all(r, r.to.all(p, (!has(p.namespaceSelector) || (has(p.namespaceSelector.matchLabels) && size(p.namespaceSelector.matchLabels) > 0) || (has(p.namespaceSelector.matchExpressions) && size(p.namespaceSelector.matchExpressions) > 0))
+          && (!has(p.podSelector) || (has(p.podSelector.matchLabels) && size(p.podSelector.matchLabels) > 0) || (has(p.podSelector.matchExpressions) && size(p.podSelector.matchExpressions) > 0))))
       message: "an empty namespaceSelector or podSelector is refused"
     - expression: >-
         !variables.probe
-        || (variables.ingress.map(r, r.from).flatten() + variables.egress.map(r, r.to).flatten()).all(p,
-             !has(p.namespaceSelector) && !has(p.ipBlock) && has(p.podSelector) && has(p.podSelector.matchLabels) && 'portcullis.io/probe' in p.podSelector.matchLabels)
+        || (variables.ingress.all(r, r.from.all(p, !has(p.namespaceSelector) && !has(p.ipBlock) && has(p.podSelector) && has(p.podSelector.matchLabels) && 'portcullis.io/probe' in p.podSelector.matchLabels)) && variables.egress.all(r, r.to.all(p, !has(p.namespaceSelector) && !has(p.ipBlock) && has(p.podSelector) && has(p.podSelector.matchLabels) && 'portcullis.io/probe' in p.podSelector.matchLabels)))
       message: "a probe policy's peers are probe pods only"
     - expression: >-
         variables.probe || variables.ingress.all(r, r.from.all(p,
@@ -520,11 +607,11 @@ spec:
           || (!has(p.ipBlock) && has(p.namespaceSelector) && has(p.namespaceSelector.matchLabels)
             && p.namespaceSelector.matchLabels == {'kubernetes.io/metadata.name': variables.dnsNs}
             && has(p.podSelector) && has(p.podSelector.matchLabels) && p.podSelector.matchLabels == variables.dnsSel
-            && has(r.ports) && r.ports.all(x, has(x.port) && x.port == 53))
+            && has(r.ports) && size(r.ports) > 0 && r.ports.all(x, has(x.port) && x.port == 53 && !has(x.endPort)))
           || (!has(p.ipBlock) && has(p.namespaceSelector) && has(p.namespaceSelector.matchLabels)
             && p.namespaceSelector.matchLabels == {'kubernetes.io/metadata.name': variables.coreNs}
             && has(p.podSelector) && has(p.podSelector.matchLabels) && p.podSelector.matchLabels == variables.wgSel
-            && variables.slot != '' && has(r.ports) && size(r.ports) == 1 && has(r.ports[0].port) && string(r.ports[0].port) == string(9001 + int(variables.slot)))
+            && variables.slot != '' && has(r.ports) && size(r.ports) == 1 && has(r.ports[0].port) && !has(r.ports[0].endPort) && string(r.ports[0].port) == string(9001 + int(variables.slot)))
           || (has(p.ipBlock) && !has(p.namespaceSelector) && !has(p.podSelector)
             && p.ipBlock.cidr == '0.0.0.0/0' && has(p.ipBlock.except)
             && params.data.podCIDR in p.ipBlock.except && params.data.serviceCIDR in p.ipBlock.except
@@ -532,7 +619,7 @@ spec:
             && variables.apiAddrs.all(n, n in p.ipBlock.except))
           || (has(p.ipBlock) && !has(p.namespaceSelector) && !has(p.podSelector)
             && p.ipBlock.cidr in variables.nodes && (!has(p.ipBlock.except) || size(p.ipBlock.except) == 0)
-            && has(r.ports) && size(r.ports) > 0 && r.ports.all(x, has(x.port) && (x.port == 80 || x.port == 443)))))
+            && has(r.ports) && size(r.ports) > 0 && r.ports.all(x, has(x.port) && !has(x.endPort) && (x.port == 80 || x.port == 443)))))
       message: "an egress peer outside the Hub's shapes (same instance, kube-dns :53, the instance's wg edge port, the internet minus the cluster, a node on 80 / 443)"
 ---
 # portcullis-edge-routes: everyone but the CLI's own identity (params
@@ -542,7 +629,8 @@ spec:
 #   IngressRoute  entryPoints ⊆ web / websecure / vpnsecure (never empty =
 #                 every entrypoint), services = Services of the apps namespace
 #                 or kind TraefikService with a K15 core service name
-#                 (group-gate@file, forward-auth-ext@file, mcp-gate@file);
+#                 (group-gate@file, forward-auth-ext@file, mcp-gate@file:
+#                 the companions' MCP routes on their app's host);
 #                 middlewares = this namespace's (never a core one:
 #                 edgeCoreMiddlewares) or the @file allowlist; tls only the
 #                 four tiers, the letsencrypt resolver, no secret / store
@@ -595,6 +683,12 @@ spec:
       expression: "!variables.del && has(object.metadata.labels) && 'portcullis.io/owner' in object.metadata.labels ? object.metadata.labels['portcullis.io/owner'] : ''"
     - name: oldOwner
       expression: "request.operation != 'CREATE' && has(oldObject.metadata.labels) && 'portcullis.io/owner' in oldObject.metadata.labels ? oldObject.metadata.labels['portcullis.io/owner'] : ''"
+    - name: inst
+      expression: "!variables.del && has(object.metadata.labels) && 'portcullis.io/instance' in object.metadata.labels ? object.metadata.labels['portcullis.io/instance'] : ''"
+    - name: oldInst
+      expression: "request.operation != 'CREATE' && has(oldObject.metadata.labels) && 'portcullis.io/instance' in oldObject.metadata.labels ? oldObject.metadata.labels['portcullis.io/instance'] : ''"
+    - name: ownName
+      expression: "variables.inst + '--'"
   validations:
     # The CLI's probe (kube_admission_probe): an object annotated with
     # exactly this binding's params generation is refused, naming it — the
@@ -611,6 +705,21 @@ spec:
       message: "an object here needs the labels portcullis.io/owner=hub and portcullis.io/instance"
     - expression: "variables.exempt || request.operation == 'CREATE' || variables.oldOwner == 'hub'"
       message: "only owner=hub objects may be changed or deleted (owner=core objects are the CLI's)"
+    - expression: "variables.exempt || request.operation != 'UPDATE' || (variables.inst == variables.oldInst && variables.owner == variables.oldOwner)"
+      message: "portcullis.io/owner and portcullis.io/instance can't change on an update"
+    - expression: "variables.exempt || request.userInfo.username == params.data.hubServiceAccount"
+      message: "only the Hub's ServiceAccount (and the CLI) may write the apps' routes"
+    # A VPN-only instance's routes (the Hub labels them portcullis.io/reach:
+    # vpn) are on vpnsecure, but its websecure "VPN required" page
+    # (vpn-required-path first) and an opted-in public link (public-guard
+    # first).
+    - expression: >-
+        variables.exempt || variables.del || object.kind != 'IngressRoute' || !has(object.metadata.labels)
+        || !('portcullis.io/reach' in object.metadata.labels) || object.metadata.labels['portcullis.io/reach'] != 'vpn'
+        || object.spec.entryPoints.all(x, x == 'vpnsecure')
+        || variables.routes.all(r, has(r.middlewares) && size(r.middlewares) > 0
+             && r.middlewares[0].name in ['vpn-required-path@file', 'portcullis-public-guard@file'])
+      message: "a route of a VPN-only instance (portcullis.io/reach: vpn) is on vpnsecure only (but its VPN-required page and an opted-in public link)"
     - expression: >-
         variables.exempt || variables.del || object.kind != 'IngressRoute'
         || (has(object.spec.entryPoints) && size(object.spec.entryPoints) > 0
@@ -654,8 +763,8 @@ spec:
         || object.spec.routes.all(r, !has(r.middlewares) || r.middlewares.all(m,
              m.name.contains('@')
                ? (m.name in variables.fileNames && !has(m.namespace))
-               : ((!has(m.namespace) || m.namespace == variables.edge) && !(m.name in variables.coreMiddlewares))))
-      message: "a middleware must be this namespace's (not a core one) or on the @file allowlist"
+               : ((!has(m.namespace) || m.namespace == variables.edge) && !(m.name in variables.coreMiddlewares) && m.name.startsWith(variables.ownName))))
+      message: "a middleware must be this instance's own (<instance>--…, never a core one) or on the @file allowlist"
     - expression: >-
         variables.exempt || variables.del || object.kind != 'IngressRoute' || !has(object.spec.tls)
         || ((!has(object.spec.tls.options) || (object.spec.tls.options.name in variables.tiers && !has(object.spec.tls.options.namespace)))
@@ -673,13 +782,13 @@ spec:
       message: "a rateLimit / inFlightReq with a redis address is refused"
     - expression: >-
         variables.exempt || variables.del || object.kind != 'Middleware' || !has(object.spec.headers)
-        || ((!has(object.spec.headers.customRequestHeaders) || object.spec.headers.customRequestHeaders.all(h, !h.lowerAscii().startsWith('x-portcullis-')))
-            && (!has(object.spec.headers.customResponseHeaders) || object.spec.headers.customResponseHeaders.all(h, !h.lowerAscii().startsWith('x-portcullis-'))))
+        || ((!has(object.spec.headers.customRequestHeaders) || object.spec.headers.customRequestHeaders.all(h, !h.lowerAscii().replace('_', '-').startsWith('x-portcullis-')))
+            && (!has(object.spec.headers.customResponseHeaders) || object.spec.headers.customResponseHeaders.all(h, !h.lowerAscii().replace('_', '-').startsWith('x-portcullis-'))))
       message: "a Middleware may not set an X-Portcullis-* header"
     - expression: >-
         variables.exempt || variables.del || object.kind != 'Middleware' || !has(object.spec.chain)
         || object.spec.chain.middlewares.all(m,
              m.name.contains('@')
                ? (m.name in variables.fileNames && !has(m.namespace))
-               : ((!has(m.namespace) || m.namespace == variables.edge) && !(m.name in variables.coreMiddlewares)))
-      message: "a chain may name only this namespace's middlewares (not a core one) or the @file allowlist"
+               : ((!has(m.namespace) || m.namespace == variables.edge) && !(m.name in variables.coreMiddlewares) && m.name.startsWith(variables.ownName)))
+      message: "a chain may name only this instance's own middlewares (never a core one) or the @file allowlist"

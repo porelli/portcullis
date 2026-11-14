@@ -144,6 +144,12 @@ denied pods "$(printf '%s' "$POD" | sed 's/"portcullis.io\/instance":"e2e"/"port
 pass "the guard refuses a hostPath outside the roots, a NodePort, a foreign helper image and vpn-slot 47, each by its binding; pods/exec is create only"
 # The apps' Traefik objects live in portcullis-edge: every refusal there.
 bash .github/ci/e2e-k3s-edge-admission.sh ci
+# MCP on Kubernetes: only core's Host(mcp.<domain>) route to mcp-gate (no
+# Hub MCP routes): through Traefik it answers the gate's own refusal.
+D="$(grep '^PORTCULLIS_DOMAIN=' .env | cut -d= -f2-)"
+code="$(curl -sk -o "$T/mcp.out" -w '%{http_code}' --max-time 20 --resolve "mcp.$D:443:198.51.100.1" -X POST -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"e2e-k3s","version":"0"}}}' "https://mcp.$D/mcp")"
+case "$code:$(cat "$T/mcp.out")" in 503:*"AI support is off"*|401:*) pass "MCP: mcp.$D/mcp reaches mcp-gate through Traefik (HTTP $code)" ;; *) fail "MCP: mcp.$D/mcp answered $code: $(head -c 200 "$T/mcp.out")" ;; esac
 # A params change never leaves an object unbound.
 bash .github/ci/e2e-k3s-rebind.sh
 

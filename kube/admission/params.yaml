@@ -5,7 +5,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: portcullis-admission-params
-  namespace: portcullis-apps
+  namespace: portcullis
 data:
   hubImage: ghcr.io/porelli/portcullis-hub@sha256:1111111111111111111111111111111111111111111111111111111111111111
   hubServiceAccount: system:serviceaccount:portcullis:portcullis-hub

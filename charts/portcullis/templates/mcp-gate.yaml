@@ -1,9 +1,13 @@
 {{- /* mcp-gate (compose: mcp-gate). compose's extra_hosts pins become the
 core Services' cluster DNS names (apps can't create Services in this
-namespace, so nothing can shadow them); Keycloak through kcinternal. */ -}}
+namespace, so nothing can shadow them); Keycloak through kcinternal. The
+companions' gate aliases portcullis-mcp-<instance>--<companion> are the
+Hub's ClusterIP Services in the apps namespace: its search domain resolves
+them by the bare alias, as Docker's DNS does. */ -}}
 {{- $s := dict
   "name" "mcp-gate" "uid" .Values.uids.mcpGate "gid" .Values.uids.mcpGate "groups" (list .Values.uids.hub)
   "memory" "1Gi" "nets" (list "portcullis-mcp" "portcullis-proxy") "egress" true
+  "dnsSearches" (list (printf "%s.svc.cluster.local" .Values.appsNamespace))
   "hashes" (list "secrets-mcp-gate")
   "health" (dict "test" (list "mcp-gate" "healthcheck") "interval" 10 "timeout" 5 "retries" 3)
   "ports" (list (dict "name" "http" "port" 8080))

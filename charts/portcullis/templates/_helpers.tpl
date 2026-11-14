@@ -72,7 +72,7 @@ caps ([cap] added after drop ALL), memory, health (probes dict), env (list of
 EnvVar), envFrom, args, command, ports ([{name, port, protocol}]), mounts
 ([VolumeMount]), volumes ([Volume]), nets ([compose network]), egress
 (bool), token (bool: the ServiceAccount token, Traefik and the Hub only),
-serviceAccount, hostAliases, hashes ([object names]), grace (seconds),
+serviceAccount, hostAliases, dnsSearches (dnsConfig.searches), hashes ([object names]), grace (seconds),
 extraLabels (map), fsGroup.
 */}}
 {{- define "portcullis.deployment" -}}
@@ -120,6 +120,10 @@ spec:
       {{- with $s.hostAliases }}
       hostAliases:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.dnsSearches }}
+      dnsConfig:
+        searches: {{ toJson . }}
       {{- end }}
       securityContext:
         runAsNonRoot: true
