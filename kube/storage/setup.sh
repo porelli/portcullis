@@ -2,9 +2,10 @@
 # The local-path provisioner's setup script for portcullis.io/local-path
 # (K3, mechanism (a) native): the StorageClass's userPattern / groupPattern
 # / permPattern turn a PVC's annotations portcullis.io/uid, /gid and /mode
-# into VOL_USER, VOL_GROUP and VOL_PERM. The directory is created with that
-# mode, then owned by that uid:gid (a directory keeps its setgid bit on
-# chown). Any missing or bad value refuses (exit 1): the PVC stays Pending,
+# into VOL_USER, VOL_GROUP and VOL_PERM. The directory is created 0700,
+# owned by that uid:gid, and only then given its mode (on Linux a chown
+# without CAP_FSETID clears the setgid bit), which is read back. Any missing
+# or bad value, or a mode that didn't stick, refuses (exit 1): the PVC stays Pending,
 # the provisioner logs "portcullis-setup REFUSED: <why>". Runs in the
 # helper pod (uid 0, CAP_CHOWN / DAC_OVERRIDE / FOWNER only).
 set -eu
@@ -23,5 +24,9 @@ case "${VOL_PERM:-}" in
   *) refuse "bad mode '${VOL_PERM:-}' (portcullis.io/mode: 3-4 octal digits)" ;;
 esac
 [ ! -e "$VOL_DIR" ] || refuse "$VOL_DIR already exists"
-mkdir -m "$VOL_PERM" "$VOL_DIR"
+mkdir -m 0700 "$VOL_DIR"
 chown "$VOL_USER:$VOL_GROUP" "$VOL_DIR"
+chmod "$VOL_PERM" "$VOL_DIR"
+want="$(printf '%o' "0$VOL_PERM")"
+got="$(stat -c %a "$VOL_DIR")"
+[ "$got" = "$want" ] || refuse "$VOL_DIR is mode $got after chmod $VOL_PERM (want $want)"

@@ -5158,6 +5158,9 @@ jobs:
       E2E_ARTIFACTS: e2e-artifacts
       E2E_FOLDER: /srv/e2e-k3s
       ACME_STAGING: "true"
+      # No CI compose override in this job (the Docker phase names its own):
+      # the image actions read compose's defaults before any .env exists.
+      COMPOSE_FILE: docker-compose.yml
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Hub image (same-named Hub branch → built here, else the published one)

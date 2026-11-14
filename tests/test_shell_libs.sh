@@ -29,7 +29,7 @@ t_fail() { FAIL=$((FAIL + 1)); echo "FAIL - $*"; }
 expect_ok()   { local d="$1"; shift; if "$@" >/dev/null 2>&1; then t_pass "$d"; else t_fail "$d"; fi; }
 expect_fail() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then t_fail "$d"; else t_pass "$d"; fi; }
 expect_eq()   { if [ "$2" = "$3" ]; then t_pass "$1"; else t_fail "$1 (got '$2', want '$3')"; fi; }
-file_mode()   { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+file_mode()   { stat -c %a "$1" 2>/dev/null || { m="$(stat -f %Mp%Lp "$1")" && echo "${m#0}"; }; }
 file_inode()  { stat -c %i "$1" 2>/dev/null || stat -f %i "$1"; }
 
 # ── stubs ──────────────────────────────────────────────────
@@ -4235,7 +4235,7 @@ OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NOD
 case "$OUT" in *"no node address"*"rc=1") t_pass "admission params: no node address → refused (never params that can't exclude the nodes)" ;; *) t_fail "admission params no nodes: $OUT" ;; esac
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; export STUB_WHOAMI_FAIL=1; kube_admission_params x")"
 case "$OUT" in *"can't tell this CLI's own identity"*"rc=1") t_pass "admission params: the CLI's identity unknown → refused (portcullis-edge-routes exempts it by name)" ;; *) t_fail "admission params whoami: $OUT" ;; esac
-OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' PORTCULLIS_DOMAIN=K.Example.org; kube_admission_params x | grep -E '^(reservedHosts|maxAppPriority)'" | tr '\t' '=' | head -n2 | tr '\n' ';')"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' PORTCULLIS_DOMAIN=K.Example.org; kube_admission_params x | grep -E '^(reservedHosts|maxAppPriority)'" | tr '\t' '=' | sed -n '1,2p' | tr '\n' ';')"
 expect_eq "admission params: reservedHosts = the apex + core-routes.json's subdomains (lowercase), maxAppPriority from core-routes.json" "$OUT" \
   "reservedHosts=k.example.org traefik.k.example.org hub.k.example.org directory.k.example.org metrics.k.example.org people.k.example.org mcp.k.example.org auth.k.example.org enroll.k.example.org;maxAppPriority=1000;"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; unset PORTCULLIS_DOMAIN; kube_reserved_hosts")"
@@ -4244,7 +4244,7 @@ OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; unset PORTCULLIS_DOMAIN; kube_admission_p
 case "$OUT" in *"PORTCULLIS_DOMAIN is not set"*"rc=1") case "$OUT" in *reservedHosts*) t_fail "admission params written without a domain: $OUT" ;; *) t_pass "admission params: no domain → refused before any key is printed" ;; esac ;; *) t_fail "admission params no domain: $OUT" ;; esac
 expect_eq "admission reservedHosts example = core-routes.json for portcullis.local" "$(sed -n 's/^  reservedHosts: //p' "$HERE/../kube/admission/params.yaml")" \
   "$(PORTCULLIS_DOMAIN=portcullis.local kube_reserved_hosts)"
-OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' PORTCULLIS_DOMAIN=k.example.org; kube_admission_params x | grep -E '^(cliUsername|appsNamespace|edgeNamespace|edgeCoreMiddlewares)'" | tr '\t' '=' | head -n4 | tr '\n' ';')"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' PORTCULLIS_DOMAIN=k.example.org; kube_admission_params x | grep -E '^(cliUsername|appsNamespace|edgeNamespace|edgeCoreMiddlewares)'" | tr '\t' '=' | sed -n '1,4p' | tr '\n' ';')"
 expect_eq "admission params: the CLI's identity (auth whoami), the apps / edge namespaces, the core edge Middlewares" "$OUT" \
   "cliUsername=system:admin;appsNamespace=portcullis-apps;edgeNamespace=portcullis-edge;edgeCoreMiddlewares=$KUBE_EDGE_CORE_MIDDLEWARES;"
 # setup.sh (K3): uid / gid 1–65535, 3–4 octal digits; mkdir -m then chown;
@@ -4252,12 +4252,23 @@ expect_eq "admission params: the CLI's identity (auth whoami), the apps / edge n
 SB="$WORK/setupbin"; mkdir -p "$SB"
 printf '#!/bin/sh\necho "chown $*" >> "$SETUP_LOG"\n' > "$SB/chown"; chmod +x "$SB/chown"
 printf '#!/bin/sh\necho "mkdir $*" >> "$SETUP_LOG"\nexec /bin/mkdir "$@"\n' > "$SB/mkdir"; chmod +x "$SB/mkdir"
-setup_run() { rm -rf "$WORK/vol" "$WORK/setup.log"; ( export PATH="$SB:$PATH" SETUP_LOG="$WORK/setup.log" VOL_DIR="$WORK/vol" VOL_USER="$1" VOL_GROUP="$2" VOL_PERM="$3"; sh "$HERE/../kube/storage/setup.sh" ) 2>&1; echo "rc=$?"; }
+printf '#!/bin/sh\necho "chmod $*" >> "$SETUP_LOG"\nexec /bin/chmod "$@"\n' > "$SB/chmod"; chmod +x "$SB/chmod"
+# stat -c %a: GNU (Linux CI) as is; BSD (macOS) through stat -f %Lp.
+if stat -c %a / >/dev/null 2>&1; then :; else printf '#!/bin/sh\n[ "$1" = -c ] && shift 2\nm="$(/usr/bin/stat -f %%Mp%%Lp "$1")"; echo "${m#0}"\n' > "$SB/stat"; chmod +x "$SB/stat"; fi
+# The parent carries the runner's own group: BSD (macOS) drops a setgid bit
+# chmod sets on a directory whose group the caller isn't in.
+mkdir -p "$WORK/volp"; chgrp "$(id -g)" "$WORK/volp"
+setup_run() { rm -rf "$WORK/volp/vol" "$WORK/setup.log"; ( export PATH="$SB:$PATH" SETUP_LOG="$WORK/setup.log" VOL_DIR="$WORK/volp/vol" VOL_USER="$1" VOL_GROUP="$2" VOL_PERM="$3"; sh "$HERE/../kube/storage/setup.sh" ) 2>&1; echo "rc=$?"; }
 OUT="$(setup_run 10001 10001 0750)"
-expect_eq "setup.sh 10001/10001/0750 → mkdir -m 0750, chown 10001:10001" "$OUT|$(file_mode "$WORK/vol")|$(cat "$WORK/setup.log" | tr '\n' ';')" "rc=0|750|mkdir -m 0750 $WORK/vol;chown 10001:10001 $WORK/vol;"
+expect_eq "setup.sh 10001/10001/0750 → mkdir 0700, chown 10001:10001, then chmod 0750" "$OUT|$(file_mode "$WORK/volp/vol")|$(cat "$WORK/setup.log" | tr '\n' ';')" "rc=0|750|mkdir -m 0700 $WORK/volp/vol;chown 10001:10001 $WORK/volp/vol;chmod 0750 $WORK/volp/vol;"
 OUT="$(setup_run 10006 10001 2750)"
-expect_eq "setup.sh 10006/10001/2750 → mkdir -m 2750 (setgid) first, then chown 10006:10001 (a directory keeps setgid on chown)" "$OUT|$(cat "$WORK/setup.log" | tr '\n' ';')" "rc=0|mkdir -m 2750 $WORK/vol;chown 10006:10001 $WORK/vol;"
-[ "$(uname)" != Linux ] || expect_eq "setup.sh 2750: the directory is 2750 (Linux)" "$(file_mode "$WORK/vol")" 2750
+expect_eq "setup.sh 10006/10001/2750 → chown first, then chmod 2750 (a chown without CAP_FSETID clears setgid on Linux); the directory is 2750" \
+  "$OUT|$(cat "$WORK/setup.log" | tr '\n' ';')|$(file_mode "$WORK/volp/vol")" "rc=0|mkdir -m 0700 $WORK/volp/vol;chown 10006:10001 $WORK/volp/vol;chmod 2750 $WORK/volp/vol;|2750"
+# A chown that clears setgid after the mode (the old order) is caught: a
+# chmod that doesn't stick refuses.
+printf '#!/bin/sh\necho "chmod $*" >> "$SETUP_LOG"\nexec /bin/chmod 0750 "$2"\n' > "$SB/chmod.lossy"
+OUT="$(mv "$SB/chmod" "$SB/chmod.real"; cp "$SB/chmod.lossy" "$SB/chmod"; chmod +x "$SB/chmod"; setup_run 10006 10001 2750; mv "$SB/chmod.real" "$SB/chmod")"
+case "$OUT" in *"portcullis-setup REFUSED:"*"is mode 750 after chmod 2750 (want 2750)"*"rc=1") t_pass "setup.sh: a mode that doesn't stick (750 for 2750) refuses" ;; *) t_fail "setup.sh lossy chmod: $OUT" ;; esac
 for bad in ":10001:0750:uid ''" "x:10001:0750:uid 'x'" "65536:10001:0750:uid '65536'" "10001::0750:gid ''" "10001:0:0750:gid '0'" "10001:10001::mode ''" "10001:10001:0789:mode '0789'" "10001:10001:75:mode '75'" "010001:10001:0750:uid '010001'"; do
   IFS=: read -r u g m why <<< "$bad"
   OUT="$(setup_run "$u" "$g" "$m")"
