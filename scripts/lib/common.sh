@@ -707,10 +707,15 @@ hub_env_write() {
       # companions — Traefik's and mcp-gate's address on docker / podman,
       # the pod CIDR on kubernetes (with a NetworkPolicy admitting only
       # that peer: this is the second layer). Never from .env.
-      PORTCULLIS_TRAEFIK_SOURCE)
-        if _rt_is_kube; then val="${PORTCULLIS_POD_CIDR:-}"; else val="$(proxy_traefik_ip)/32"; fi ;;
-      PORTCULLIS_MCP_GATE_SOURCE)
-        if _rt_is_kube; then val="${PORTCULLIS_POD_CIDR:-}"; else val="$(mcp_gate_ip)/32"; fi ;;
+      PORTCULLIS_TRAEFIK_SOURCE|PORTCULLIS_MCP_GATE_SOURCE)
+        if _rt_is_kube; then
+          # The whole pod CIDR (pod addresses can't be pinned): only the
+          # second layer behind the instance's NetworkPolicy, whose
+          # enforcement the probe proves. Never an empty value.
+          [ -n "${PORTCULLIS_POD_CIDR:-}" ] || fail "PORTCULLIS_POD_CIDR is not set (.env): refusing to write an empty $v for the Hub"
+          val="$PORTCULLIS_POD_CIDR"
+        elif [ "$v" = PORTCULLIS_TRAEFIK_SOURCE ]; then val="$(proxy_traefik_ip)/32"
+        else val="$(mcp_gate_ip)/32"; fi ;;
       PORTCULLIS_PROXY_SUBNET) val="$(proxy_subnet)" ;;
       PORTCULLIS_PROXY_IP_RANGE) val="$(proxy_ip_range)" ;;
       PORTAL_DISPLAY_NAME) val="${PORTAL_DISPLAY_NAME:-Portcullis}" ;;

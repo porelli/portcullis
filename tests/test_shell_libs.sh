@@ -3906,7 +3906,8 @@ case "$*" in
   "apply -f -") cat >> "$STUB_DIR/kubectl-stdin"; [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
   "apply -f "*) [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
   "exec client-allowed -- nc"*) exit "${STUB_DIAL_ALLOWED:-0}" ;;
-  "exec client-denied -- nc"*) exit "${STUB_DIAL_DENIED:-1}" ;;
+  "exec client-ingress -- nc"*) exit "${STUB_DIAL_INGRESS:-1}" ;;
+  "exec client-egress -- nc"*) exit "${STUB_DIAL_EGRESS:-1}" ;;
   "get pod server -o jsonpath={.status.podIP}") echo 10.42.0.9 ;;
   *) [ -n "${STUB_KUBE_SCRIPT:-}" ] && . "$STUB_KUBE_SCRIPT" ;;
 esac
@@ -4001,19 +4002,41 @@ echo '{"metadata":{"name":"portcullis","labels":{"app.kubernetes.io/managed-by":
 OUT="$(kt 'kube_host_checks | grep "namespace portcullis "; kube_require_host')"
 case "$OUT" in *"ok	namespace portcullis belongs to this install"*"rc=0") t_pass "init kubernetes: matching install id → adopted" ;; *) t_fail "kube adopt: $OUT" ;; esac
 k_fixtures
-# The NetworkPolicy probe: proven only when the denied dial fails AND the allowed one succeeds.
+# The NetworkPolicy probe: proven only when both refusals hold AND the allowed dial succeeds.
 OUT="$(kt 'sleep() { :; }; kube_netpol_probe')"
-case "$OUT" in *"NetworkPolicies are enforced"*"rc=0") t_pass "kube_netpol_probe: denied fails, allowed succeeds → proven" ;; *) t_fail "kube probe ok: $OUT" ;; esac
+case "$OUT" in *"NetworkPolicies are enforced"*"rc=0") t_pass "kube_netpol_probe: ingress and egress refusals hold, allowed succeeds → proven" ;; *) t_fail "kube probe ok: $OUT" ;; esac
 expect_eq "kube_netpol_probe: proven → ConfigMap portcullis-netpol-probe (proven_at) in portcullis-apps, the probe namespace deleted" \
   "$(grep -c 'name: portcullis-netpol-probe' "$KS/kubectl-stdin"):$(grep -c 'namespace: portcullis-apps' "$KS/kubectl-stdin"):$(grep -c 'proven_at: "20' "$KS/kubectl-stdin"):$(grep -c 'delete namespace portcullis-netpol-probe' "$KS/kubectl-calls")" "1:1:1:2"
 k_fixtures
 OUT="$(kt 'sleep() { :; }; export STUB_DIAL_ALLOWED=1; kube_netpol_probe')"
 case "$OUT" in *"the allowed connection failed"*"rc=1") t_pass "kube_netpol_probe: allowed dial fails → not proven" ;; *) t_fail "kube probe allowed fails: $OUT" ;; esac
 expect_eq "kube_netpol_probe: not proven → ConfigMap not written, probe namespace deleted" "$(test -e "$KS/kubectl-stdin" && echo written || echo none):$(grep -c 'delete namespace portcullis-netpol-probe' "$KS/kubectl-calls")" "none:2"
+# Each direction on its own: a cluster that ignores ingress OR egress
+# policies fails the probe (the review's fail-open case: one client denied
+# both ways would pass with only one direction enforced).
 k_fixtures
-OUT="$(kt 'sleep() { :; }; export STUB_DIAL_DENIED=0; kube_netpol_probe')"
-case "$OUT" in *"NOT enforced"*"rc=1") t_pass "kube_netpol_probe: the denied dial gets through → not proven" ;; *) t_fail "kube probe denied ok: $OUT" ;; esac
-expect_eq "kube_netpol_probe: denied got through → ConfigMap not written" "$(test -e "$KS/kubectl-stdin" && echo written || echo none)" none
+OUT="$(kt 'sleep() { :; }; export STUB_DIAL_INGRESS=0; kube_netpol_probe')"
+case "$OUT" in *"ingress NetworkPolicies are NOT enforced"*"rc=1") t_pass "kube_netpol_probe: ingress policies ignored (client-ingress gets through) → not proven" ;; *) t_fail "kube probe ingress ignored: $OUT" ;; esac
+expect_eq "kube_netpol_probe: ingress ignored → ConfigMap not written" "$(test -e "$KS/kubectl-stdin" && echo written || echo none)" none
+k_fixtures
+OUT="$(kt 'sleep() { :; }; export STUB_DIAL_EGRESS=0; kube_netpol_probe')"
+case "$OUT" in *"egress NetworkPolicies are NOT enforced"*"rc=1") t_pass "kube_netpol_probe: egress policies ignored (client-egress gets through) → not proven" ;; *) t_fail "kube probe egress ignored: $OUT" ;; esac
+expect_eq "kube_netpol_probe: egress ignored → ConfigMap not written" "$(test -e "$KS/kubectl-stdin" && echo written || echo none)" none
+# The manifests themselves: the server admits exactly client-allowed and
+# client-egress; client-ingress has the only egress allowance besides the
+# control's; default deny both ways.
+expect_eq "kube/probe: the server's ingress admits [allowed, egress-test]; egress allowed for ingress-test and allowed only; default deny both ways" \
+  "$(python3 - "$HERE/../kube/probe" <<'PY2'
+import sys, yaml, glob
+docs = [d for f in sorted(glob.glob(sys.argv[1] + "/*.yaml")) for d in yaml.safe_load_all(open(f)) if d]
+pols = {d["metadata"]["name"]: d["spec"] for d in docs if d["kind"] == "NetworkPolicy"}
+ing = [p for p in pols.values() if "Ingress" in p["policyTypes"] and p["podSelector"].get("matchLabels") == {"portcullis.io/probe": "server"}]
+adm = sorted(ing[0]["ingress"][0]["from"][0]["podSelector"]["matchExpressions"][0]["values"])
+egr = sorted(p["podSelector"]["matchLabels"]["portcullis.io/probe"] for p in pols.values() if p["policyTypes"] == ["Egress"])
+dd = [n for n, p in pols.items() if p["podSelector"] == {} and sorted(p["policyTypes"]) == ["Egress", "Ingress"] and not p.get("ingress") and not p.get("egress")]
+print(adm, egr, len(dd))
+PY2
+)" "['allowed', 'egress-test'] ['allowed', 'ingress-test'] 1"
 expect_eq "kube/probe/*.yaml run PORTCULLIS_HELPER_IMAGE (the CLI's pinned helper)" \
   "$(grep -h 'image:' "$HERE"/../kube/probe/*.yaml | sed 's/.*image: //' | sort -u)" "$PORTCULLIS_HELPER_IMAGE"
 # runtime_export under kubernetes: the pod + service CIDR are reserved (K-P11).
@@ -4038,6 +4061,8 @@ PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20
 PORTCULLIS_RUNTIME_ROOTS=/var/lib/rancher/k3s /var/lib/portcullis-storage
 PORTCULLIS_KUBE_CONTEXT=ci
 PORTCULLIS_KUBE_NODE_ADDRESSES=10.1.0.4 198.51.100.1"
+OUT="$(kt "PORTCULLIS_ROOT='$HW'; unset PORTCULLIS_POD_CIDR; hub_env_write")"
+case "$OUT" in *"PORTCULLIS_POD_CIDR is not set (.env): refusing to write an empty PORTCULLIS_TRAEFIK_SOURCE"*"rc=1") t_pass "hub_env_write kubernetes: no PORTCULLIS_POD_CIDR → refused (never an empty _SOURCE)" ;; *) t_fail "hub_env_write empty pod cidr: $OUT" ;; esac
 # jq 1.8: `A and B as $x | C` binds (A and B) to $x (jq 1.7 bound B
 # alone): the two readings differ, so the kubernetes filters write the
 # parentheses out.

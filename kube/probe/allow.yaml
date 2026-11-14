@@ -1,24 +1,5 @@
-# The one allowed path (client-allowed → server :8080, both directions'
-# rules) and its client: its dial has to succeed.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: allow-client
-  namespace: portcullis-netpol-probe
-spec:
-  podSelector:
-    matchLabels:
-      portcullis.io/probe: server
-  policyTypes: ["Ingress"]
-  ingress:
-    - from:
-        - podSelector:
-            matchLabels:
-              portcullis.io/probe: allowed
-      ports:
-        - protocol: TCP
-          port: 8080
----
+# The control: client-allowed has both directions (its egress here, the
+# server's ingress in deny.yaml): its dial has to succeed.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

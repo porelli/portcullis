@@ -357,36 +357,42 @@ _kube_probe_cleanup() {
   kube_ctl delete namespace "$KUBE_PROBE_NS" --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 
-# kube_netpol_probe — prove NetworkPolicies are enforced: in a scratch
-# namespace (kube/probe/*) a client the policies deny must NOT reach the
-# server and the one they allow MUST. Only then the ConfigMap
-# portcullis-netpol-probe (proven_at, UTC) is written in the apps
-# namespace (the Hub reads it); the scratch namespace is deleted either
-# way. Returns 1 (nothing written) when not proven.
+# kube_netpol_probe — prove NetworkPolicies are enforced, each direction on
+# its own (kube/probe/*): client-ingress (egress allowed, the server's
+# ingress refuses it) and client-egress (the server admits it, no egress
+# allowed) must NOT reach the server, and client-allowed (both allowed)
+# MUST. Only then the ConfigMap portcullis-netpol-probe (proven_at, UTC)
+# is written in the apps namespace (the Hub reads it, never as enough by
+# itself); the scratch namespace is deleted either way. Returns 1 (nothing
+# written) when not proven.
 kube_netpol_probe() {
-  local dir="${KUBE_PROBE_DIR:-$PORTCULLIS_HOME/kube/probe}" f ip i allowed=false denied_failed=false
+  local dir="${KUBE_PROBE_DIR:-$PORTCULLIS_HOME/kube/probe}" f ip i allowed=false ingress_held=false egress_held=false
   _kube_probe_cleanup
   kube_ctl wait --for=delete "namespace/$KUBE_PROBE_NS" --timeout=120s >/dev/null 2>&1 || true
   for f in namespace deny allow; do
     kube_ctl apply -f "$dir/$f.yaml" >/dev/null || { _kube_probe_cleanup; warn "could not apply the NetworkPolicy probe ($f.yaml)"; return 1; }
   done
-  if ! kube_ctl -n "$KUBE_PROBE_NS" wait --for=jsonpath='{.status.phase}'=Running pod/server pod/client-denied pod/client-allowed --timeout=180s >/dev/null 2>&1; then
+  if ! kube_ctl -n "$KUBE_PROBE_NS" wait --for=jsonpath='{.status.phase}'=Running pod/server pod/client-ingress pod/client-egress pod/client-allowed --timeout=180s >/dev/null 2>&1; then
     _kube_probe_cleanup; warn "the NetworkPolicy probe pods didn't start"; return 1
   fi
   ip="$(kube_ctl -n "$KUBE_PROBE_NS" get pod server -o jsonpath='{.status.podIP}' 2>/dev/null)"
   [ -n "$ip" ] || { _kube_probe_cleanup; warn "the probe server has no address"; return 1; }
-  # The allowed dial may need the policy controller a moment: retried.
+  # The control may need the policy controller a moment: retried.
   for ((i = 0; i < 10; i++)); do
     if _kube_dial client-allowed "$ip"; then allowed=true; break; fi
     sleep 2
   done
-  if ! _kube_dial client-denied "$ip"; then denied_failed=true; fi
+  if ! _kube_dial client-ingress "$ip"; then ingress_held=true; fi
+  if ! _kube_dial client-egress "$ip"; then egress_held=true; fi
   _kube_probe_cleanup
   if [ "$allowed" != true ]; then
     warn "NetworkPolicy probe: the allowed connection failed (pod networking broken?): not proven"; return 1
   fi
-  if [ "$denied_failed" != true ]; then
-    warn "NetworkPolicy probe: a connection every policy denies got through: NetworkPolicies are NOT enforced (k3s without its network policy controller?)"; return 1
+  if [ "$ingress_held" != true ]; then
+    warn "NetworkPolicy probe: a connection the server's ingress policy refuses got through: ingress NetworkPolicies are NOT enforced"; return 1
+  fi
+  if [ "$egress_held" != true ]; then
+    warn "NetworkPolicy probe: a connection no egress policy allows got through: egress NetworkPolicies are NOT enforced"; return 1
   fi
   kube_ctl apply -f - >/dev/null <<EOF || { warn "could not write the ConfigMap portcullis-netpol-probe"; return 1; }
 apiVersion: v1
@@ -399,7 +405,7 @@ metadata:
 data:
   proven_at: "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 EOF
-  ok "NetworkPolicies are enforced (probe: the denied dial failed, the allowed one succeeded)."
+  ok "NetworkPolicies are enforced in both directions (probe: ingress and egress refusals held, the allowed dial succeeded)."
 }
 
 # ── port-forward ──────────────────────────────────────────
