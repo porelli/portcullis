@@ -613,8 +613,155 @@ _rtk_volume_out() { fail "rt_volume_out: not available on kubernetes yet"; }
 _rtk_volume_in() { fail "rt_volume_in: not available on kubernetes yet"; }
 
 # kube_init_cluster — init / up / upgrade under kubernetes, before anything
-# is deployed: NetworkPolicy enforcement must be proven (spec §6), else
-# nothing is deployed.
+# is deployed: the cluster setup (namespaces, storage, CRDs, admission),
+# then NetworkPolicy enforcement must be proven (spec §6), else nothing is
+# deployed.
 kube_init_cluster() {
+  kube_cluster_setup
   kube_netpol_probe || fail "NetworkPolicy enforcement isn't proven (see above): nothing is deployed"
+}
+
+# ── cluster setup (Task 14) ───────────────────────────────
+
+KUBE_FIELD_MANAGER="portcullis-cli"
+
+kube_applied_file() { echo "$PORTCULLIS_ROOT/secrets/kube/applied.json"; }
+
+# _kube_applied_set <key> <value> — record a step in secrets/kube/applied.json
+# (0600, written atomically) only after it succeeded.
+_kube_applied_set() {
+  local f tmp
+  f="$(kube_applied_file)"
+  (umask 077 && mkdir -p "$(dirname "$f")")
+  [ -s "$f" ] || (umask 077 && echo '{}' > "$f")
+  tmp="$(mktemp "$f.XXXXXX")"
+  K="$1" V="$2" jq '.[env.K] = env.V' "$f" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$f" || { rm -f "$tmp"; fail "could not write $f"; }
+}
+
+# _kube_sha <file>... — sha256 over the files' contents (in order).
+_kube_sha() { cat "$@" | { sha256sum 2>/dev/null || shasum -a 256; } | awk '{print $1}'; }
+
+# _kube_apply_files <file>... — server-side apply, our field manager.
+_kube_apply_files() {
+  local f
+  for f in "$@"; do
+    kube_ctl apply --server-side --force-conflicts --field-manager="$KUBE_FIELD_MANAGER" -f "$f" >/dev/null || return 1
+  done
+}
+
+# kube_namespace_apply <name> <enforce> <warn> <audit> — the namespace with
+# its PSA labels and K11's ownership label + install annotation.
+kube_namespace_apply() {
+  [ -n "${PORTCULLIS_KUBE_INSTALL_ID:-}" ] || fail "PORTCULLIS_KUBE_INSTALL_ID is not set (.env): refusing to create or adopt namespaces"
+  N="$1" E="$2" W="$3" A="$4" L="$KUBE_MANAGED_LABEL" AN="$KUBE_INSTALL_ANNOTATION" ID="$PORTCULLIS_KUBE_INSTALL_ID" jq -n '
+    {apiVersion: "v1", kind: "Namespace",
+     metadata: {name: env.N,
+       labels: {(env.L): "portcullis", "pod-security.kubernetes.io/enforce": env.E,
+                "pod-security.kubernetes.io/warn": env.W, "pod-security.kubernetes.io/audit": env.A},
+       annotations: {(env.AN): env.ID}}}' \
+    | kube_ctl apply --server-side --force-conflicts --field-manager="$KUBE_FIELD_MANAGER" -f - >/dev/null
+}
+
+# kube_admission_params <hub image> — the params ConfigMap's keys as
+# "key<TAB>value" lines (kube/admission/params.tmpl.yaml lists them).
+kube_admission_params() {
+  local hub="$1" ns roots nodes api a ep
+  ns="$(kube_ns)"
+  roots="${HUB_OVERRIDE_BIND_ROOTS:-/srv:/mnt:/media}"
+  nodes="" api=""
+  for a in ${PORTCULLIS_KUBE_NODE_ADDRESSES:-$(kube_node_addresses)}; do nodes+="${nodes:+ }$a/32"; done
+  for ep in ${PORTCULLIS_KUBE_API_ENDPOINTS:-}; do api+="${api:+ }${ep%:*}/32"; done
+  [ -n "$nodes" ] || fail "no node address (PORTCULLIS_KUBE_NODE_ADDRESSES): refusing to write admission params that couldn't exclude the nodes"
+  [ -n "$api" ] || fail "no kube API endpoint (PORTCULLIS_KUBE_API_ENDPOINTS): refusing to write admission params"
+  printf '%s\t%s\n' \
+    hubImage "$hub" \
+    hubServiceAccount "system:serviceaccount:$ns:portcullis-hub" \
+    bindRoots "${roots//:/ }" \
+    corePorts "80 443 ${PORTCULLIS_VPN_PORT:-51820} 8000 8081 8443 8444" \
+    podCIDR "${PORTCULLIS_POD_CIDR:?}" \
+    serviceCIDR "${PORTCULLIS_SERVICE_CIDR:?}" \
+    nodeAddresses "$nodes" \
+    apiAddresses "$api" \
+    kubeDNS "kube-system:k8s-app=kube-dns" \
+    traefik "$ns:portcullis.io/component=traefik" \
+    mcpGate "$ns:portcullis.io/component=mcp-gate" \
+    wg "$ns:portcullis.io/component=wg" \
+    fileMiddlewares "$KUBE_FILE_NAMES"
+}
+
+# The @file names apps may use (K15, contract §5): middlewares.yml's six,
+# the core middlewares and the three core services of traefik-dynamic.
+KUBE_FILE_NAMES="client-headers@file client-cert-pem@file rate-limit@file rate-limit-auth@file security-headers@file strip-client-forwarded@file portcullis-auth@file portcullis-auth-ext@file portcullis-groups@file portcullis-groups-vpn@file portcullis-public-guard@file portcullis-public-guard-vpn@file vpn-required-path@file group-gate@file forward-auth-ext@file mcp-gate@file"
+
+# _kube_configmap_from <name> <namespace> <dir> — a ConfigMap whose keys are
+# the dir's files (kubectl builds it; applied server-side from stdin).
+_kube_configmap_from() {
+  kube_ctl create configmap "$1" -n "$2" --from-file="$3" --dry-run=client -o yaml \
+    | kube_ctl apply --server-side --force-conflicts --field-manager="$KUBE_FIELD_MANAGER" -f - >/dev/null
+}
+
+# kube_cluster_setup — idempotent, server-side; each step is recorded in
+# secrets/kube/applied.json only after it succeeded:
+#   namespaces  portcullis (restricted), portcullis-apps (enforce privileged,
+#               warn / audit baseline), portcullis-storage (enforce
+#               privileged: its helpers need hostPath; warn / audit
+#               baseline; pinned by kube/storage/admission.yaml), all with
+#               K11's label + annotation;
+#   storage     the provisioner portcullis.io/local-path (kube/storage),
+#               its ConfigMap, the StorageClasses, its deny policy + API egress;
+#   crds        the Traefik CRDs (K14: kubectl --server-side, never Helm);
+#   admission   the five VAPs and their five bindings (kube/admission);
+#   params      portcullis-admission-params: the Hub's resolved digest
+#               (KUBE_HUB_IMAGE, name@sha256:…), roots, ports, networks, peers.
+kube_cluster_setup() {
+  local hub="${KUBE_HUB_IMAGE:-}" tmp f ep
+  [[ "$hub" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]] \
+    || fail "the Hub's image isn't resolved to a digest (KUBE_HUB_IMAGE=${hub:-unset}): refusing to write admission params that pin another helper image"
+  local st="$PORTCULLIS_HOME/kube/storage" adm="$PORTCULLIS_HOME/kube/admission" crds
+  crds="$(find "$PORTCULLIS_HOME/charts/portcullis/crds" -name 'traefik-*.yaml' | sort | head -n1)"
+  [ -n "$crds" ] || fail "no Traefik CRD bundle in charts/portcullis/crds"
+
+  info "Cluster setup: namespaces..."
+  kube_namespace_apply "$(kube_ns)" restricted restricted restricted || fail "could not create the namespace $(kube_ns)"
+  kube_namespace_apply "$(kube_apps_ns)" privileged baseline baseline || fail "could not create the namespace $(kube_apps_ns)"
+  kube_namespace_apply "$KUBE_STORAGE_NS" privileged baseline baseline || fail "could not create the namespace $KUBE_STORAGE_NS"
+  _kube_applied_set cluster.namespaces "${PORTCULLIS_KUBE_INSTALL_ID}"
+
+  info "Cluster setup: storage (portcullis.io/local-path)..."
+  tmp="$(mktemp -d)"
+  cp "$st/config.json" "$tmp/config.json"
+  cp "$st/setup.sh" "$tmp/setup"
+  cp "$st/teardown.sh" "$tmp/teardown"
+  cp "$st/helper-pod.yaml" "$tmp/helperPod.yaml"
+  if ! _kube_apply_files "$st/namespace.yaml" "$st/admission.yaml" \
+       || ! _kube_configmap_from portcullis-local-path-config "$KUBE_STORAGE_NS" "$tmp" \
+       || ! _kube_apply_files "$st/provisioner.yaml" "$st/storageclasses.yaml"; then
+    rm -rf "$tmp"; fail "the storage setup failed (see above): nothing recorded"
+  fi
+  rm -rf "$tmp"
+  # The provisioner's only egress: the kube API endpoints.
+  # shellcheck disable=SC2086  # ip:port words
+  printf '%s\n' ${PORTCULLIS_KUBE_API_ENDPOINTS:?} | jq -R . | jq -s --arg ns "$KUBE_STORAGE_NS" '
+      {apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy",
+       metadata: {name: "kube-api", namespace: $ns},
+       spec: {podSelector: {matchLabels: {app: "portcullis-local-path"}}, policyTypes: ["Egress"],
+              egress: [.[] | split(":") as $p | {to: [{ipBlock: {cidr: ($p[0] + "/32")}}], ports: [{protocol: "TCP", port: ($p[1] | tonumber)}]}]}}' \
+    | kube_ctl apply --server-side --force-conflicts --field-manager="$KUBE_FIELD_MANAGER" -f - >/dev/null \
+    || fail "could not apply the storage namespace's API egress policy"
+  _kube_applied_set cluster.storage "$(_kube_sha "$st"/*)"
+
+  info "Cluster setup: Traefik CRDs ($(basename "$crds" .yaml))..."
+  _kube_apply_files "$crds" || fail "could not apply the Traefik CRDs"
+  _kube_applied_set cluster.crds "$(_kube_sha "$crds")"
+
+  info "Cluster setup: admission policies..."
+  _kube_apply_files "$adm/policies.yaml" "$adm/bindings.yaml" || fail "could not apply the admission policies (see above): nothing recorded"
+  _kube_applied_set cluster.admission "$(_kube_sha "$adm/policies.yaml" "$adm/bindings.yaml")"
+
+  info "Cluster setup: admission params..."
+  tmp="$(mktemp -d)"
+  while IFS=$'\t' read -r f ep; do printf '%s' "$ep" > "$tmp/$f"; done < <(kube_admission_params "$hub")
+  _kube_configmap_from portcullis-admission-params "$(kube_apps_ns)" "$tmp" || { rm -rf "$tmp"; fail "could not write portcullis-admission-params"; }
+  _kube_applied_set cluster.params "$(_kube_sha "$tmp"/*)"
+  rm -rf "$tmp"
 }

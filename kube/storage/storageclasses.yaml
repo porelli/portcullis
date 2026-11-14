@@ -1,0 +1,32 @@
+# Both StorageClasses use the Portcullis provisioner with K3's native owner
+# patterns: the directory is made with the PVC's portcullis.io/uid, /gid and
+# /mode annotations (setup.sh refuses missing or bad ones). hostPath PVs
+# (the provisioner's default volume type): kubelet never applies a pod's
+# fsGroup to them, so a shared volume keeps its group (vpn-doc 10007).
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: portcullis-core
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+provisioner: portcullis.io/local-path
+reclaimPolicy: Retain
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  userPattern: '{{ index .PVC.Annotations "portcullis.io/uid" }}'
+  groupPattern: '{{ index .PVC.Annotations "portcullis.io/gid" }}'
+  permPattern: '{{ index .PVC.Annotations "portcullis.io/mode" }}'
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: portcullis-apps
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+provisioner: portcullis.io/local-path
+reclaimPolicy: Delete
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  userPattern: '{{ index .PVC.Annotations "portcullis.io/uid" }}'
+  groupPattern: '{{ index .PVC.Annotations "portcullis.io/gid" }}'
+  permPattern: '{{ index .PVC.Annotations "portcullis.io/mode" }}'

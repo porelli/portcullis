@@ -3903,6 +3903,15 @@ case "$*" in
   "get namespace "*)
     n="${3}"; [ -f "$K/ns-$n.json" ] && exit 0
     echo "Error from server (NotFound): namespaces \"$n\" not found" >&2; exit 1 ;;
+  "apply --server-side"*" -f -") cat >> "$STUB_DIR/kubectl-stdin"; echo --- >> "$STUB_DIR/kubectl-stdin"; [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
+  "apply --server-side"*" -f "*)
+    all="$*"; f="${all##* -f }"
+    [ -z "${STUB_APPLY_FAIL_MATCH:-}" ] || case "$f" in *"$STUB_APPLY_FAIL_MATCH"*) echo "stub: apply of $f refused" >&2; exit 1 ;; esac
+    [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
+  "create configmap "*" --dry-run=client -o yaml")
+    all="$*"; d="${all##*--from-file=}"; d="${d%% *}"
+    printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n' "$3"
+    for f in "$d"/*; do printf '  %s: %s\n' "${f##*/}" "$(head -c 200 "$f" | head -n1)"; done ;;
   "apply -f -") cat >> "$STUB_DIR/kubectl-stdin"; [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
   "apply -f "*) [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
   "exec client-allowed -- nc"*) exit "${STUB_DIAL_ALLOWED:-0}" ;;
@@ -4039,6 +4048,65 @@ PY2
 )" "['allowed', 'egress-test'] ['allowed', 'ingress-test'] 1"
 expect_eq "kube/probe/*.yaml run PORTCULLIS_HELPER_IMAGE (the CLI's pinned helper)" \
   "$(grep -h 'image:' "$HERE"/../kube/probe/*.yaml | sed 's/.*image: //' | sort -u)" "$PORTCULLIS_HELPER_IMAGE"
+# ── cluster setup (Task 14) ──
+HUBD="ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 7)"
+k_fixtures
+CS_ROOT="$WORK/cs-root"; rm -rf "$CS_ROOT"; mkdir -p "$CS_ROOT/secrets"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
+case "$OUT" in *"rc=0") t_pass "kube_cluster_setup: every step applies" ;; *) t_fail "kube_cluster_setup: $OUT" ;; esac
+expect_eq "cluster setup: params ConfigMap carries the resolved Hub digest, the Hub's ServiceAccount, the node and API /32s" \
+  "$(grep -cxE "  hubImage: $HUBD|  hubServiceAccount: system:serviceaccount:portcullis:portcullis-hub|  nodeAddresses: 10.1.0.4/32 198.51.100.1/32|  apiAddresses: 10.1.0.4/32|  corePorts: 80 443 51820 8000 8081 8443 8444" "$KS/kubectl-stdin")" 5
+expect_eq "cluster setup: the params ConfigMap has exactly params.tmpl.yaml's keys" \
+  "$(sed -n '/name: portcullis-admission-params/,/^---/p' "$KS/kubectl-stdin" | sed -n '/^data:/,$p' | sed -n 's/^  \([A-Za-z]*\): .*/\1/p' | sort | tr '\n' ' ')" \
+  "$(sed -n '/^data:/,$p' "$HERE/../kube/admission/params.tmpl.yaml" | sed -n 's/^  \([A-Za-z]*\): .*/\1/p' | sort | tr '\n' ' ')"
+expect_eq "cluster setup: the three namespaces with PSA labels and K11's label + install annotation (server-side)" \
+  "$(jq -cs '[.[] | select(.kind == "Namespace") | [.metadata.name, .metadata.labels["pod-security.kubernetes.io/enforce"], .metadata.labels["pod-security.kubernetes.io/warn"], .metadata.labels["app.kubernetes.io/managed-by"], .metadata.annotations["portcullis.io/install"]]]' < <(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(type == "object")' 2>/dev/null))" \
+  '[["portcullis","restricted","restricted","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-apps","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-storage","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"]]'
+expect_eq "cluster setup: CRDs, VAPs and bindings applied server-side (never Helm), the storage API egress to each endpoint" \
+  "$(grep -c 'apply --server-side --force-conflicts --field-manager=portcullis-cli -f .*charts/portcullis/crds/traefik-v3.7.17.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/policies.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/bindings.yaml' "$KS/kubectl-calls"):$(grep -c '"cidr": "10.1.0.4/32"' "$KS/kubectl-stdin")" "1:1:1:1"
+expect_eq "cluster setup: applied.json records every step (0600)" \
+  "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json"):$(file_mode "$CS_ROOT/secrets/kube/applied.json")" "cluster.admission cluster.crds cluster.namespaces cluster.params cluster.storage:600"
+k_fixtures
+rm -rf "$CS_ROOT/secrets/kube"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; export STUB_APPLY_FAIL_MATCH=kube/admission/policies.yaml; kube_cluster_setup")"
+case "$OUT" in *"could not apply the admission policies"*"rc=1") t_pass "cluster setup: a failed VAP apply fails the setup" ;; *) t_fail "cluster setup VAP failure: $OUT" ;; esac
+expect_eq "cluster setup: a failed VAP apply leaves applied.json without the admission and params steps" \
+  "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json")" "cluster.crds cluster.namespaces cluster.storage"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE=ghcr.io/porelli/portcullis-hub:edge; kube_cluster_setup")"
+case "$OUT" in *"isn't resolved to a digest"*"rc=1") t_pass "cluster setup: an unresolved Hub tag → refused (the params pin a digest)" ;; *) t_fail "cluster setup tag: $OUT" ;; esac
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES=' '; kube_ctl() { [ \"\$1 \$2\" = 'get nodes' ] && { echo '{\"items\":[]}'; return 0; }; command kubectl --context ci \"\$@\"; }; kube_admission_params x")"
+case "$OUT" in *"no node address"*"rc=1") t_pass "admission params: no node address → refused (never params that can't exclude the nodes)" ;; *) t_fail "admission params no nodes: $OUT" ;; esac
+# setup.sh (K3): uid / gid 1–65535, 3–4 octal digits; mkdir -m then chown;
+# anything else refused, nothing created.
+SB="$WORK/setupbin"; mkdir -p "$SB"
+printf '#!/bin/sh\necho "chown $*" >> "$SETUP_LOG"\n' > "$SB/chown"; chmod +x "$SB/chown"
+printf '#!/bin/sh\necho "mkdir $*" >> "$SETUP_LOG"\nexec /bin/mkdir "$@"\n' > "$SB/mkdir"; chmod +x "$SB/mkdir"
+setup_run() { rm -rf "$WORK/vol" "$WORK/setup.log"; ( export PATH="$SB:$PATH" SETUP_LOG="$WORK/setup.log" VOL_DIR="$WORK/vol" VOL_USER="$1" VOL_GROUP="$2" VOL_PERM="$3"; sh "$HERE/../kube/storage/setup.sh" ) 2>&1; echo "rc=$?"; }
+OUT="$(setup_run 10001 10001 0750)"
+expect_eq "setup.sh 10001/10001/0750 → mkdir -m 0750, chown 10001:10001" "$OUT|$(file_mode "$WORK/vol")|$(cat "$WORK/setup.log" | tr '\n' ';')" "rc=0|750|mkdir -m 0750 $WORK/vol;chown 10001:10001 $WORK/vol;"
+OUT="$(setup_run 10006 10001 2750)"
+expect_eq "setup.sh 10006/10001/2750 → mkdir -m 2750 (setgid) first, then chown 10006:10001 (a directory keeps setgid on chown)" "$OUT|$(cat "$WORK/setup.log" | tr '\n' ';')" "rc=0|mkdir -m 2750 $WORK/vol;chown 10006:10001 $WORK/vol;"
+[ "$(uname)" != Linux ] || expect_eq "setup.sh 2750: the directory is 2750 (Linux)" "$(file_mode "$WORK/vol")" 2750
+for bad in ":10001:0750:uid ''" "x:10001:0750:uid 'x'" "65536:10001:0750:uid '65536'" "10001::0750:gid ''" "10001:0:0750:gid '0'" "10001:10001::mode ''" "10001:10001:0789:mode '0789'" "10001:10001:75:mode '75'" "010001:10001:0750:uid '010001'"; do
+  IFS=: read -r u g m why <<< "$bad"
+  OUT="$(setup_run "$u" "$g" "$m")"
+  case "$OUT" in *"portcullis-setup REFUSED: bad $why"*"rc=1") ok_case=1 ;; *) ok_case=0 ;; esac
+  expect_eq "setup.sh $u/$g/$m → REFUSED (bad $why), nothing created" "$ok_case:$(test -e "$WORK/vol" && echo made || echo none):$(test -e "$WORK/setup.log" && echo chown || echo none)" "1:none:none"
+done
+expect_eq "the provisioner: --service-account-name its own SA, --provisioner-name portcullis.io/local-path, the pinned image, never --allow-unsafe-helper-pod-template" \
+  "$(grep -A1 -- '- --service-account-name' "$HERE/../kube/storage/provisioner.yaml" | tail -n1 | tr -d ' -'):$(grep -c 'portcullis.io/local-path' "$HERE/../kube/storage/provisioner.yaml" | awk '{print ($1>0)}'):$(grep -c 'image: docker.io/rancher/local-path-provisioner:v0.0.37@sha256:e757967a5ec338f6a9b371c5a9688bedaa8c3578ea3dd4db329ea0084be0a86f' "$HERE/../kube/storage/provisioner.yaml"):$(grep -rc 'allow-unsafe-helper-pod-template' "$HERE/../kube/storage" | awk -F: '{s+=$2} END {print s}')" "portcullislocalpath:1:1:1"
+expect_eq "the helper pod: PORTCULLIS_HELPER_IMAGE, uid 0, the 11 other default caps dropped by name (CHOWN, DAC_OVERRIDE, FOWNER kept), nothing added" \
+  "$(sed -n 's/.*image: //p' "$HERE/../kube/storage/helper-pod.yaml"):$(python3 -c 'import sys, yaml; c = yaml.safe_load(open(sys.argv[1]))["spec"]["containers"][0]["securityContext"]; print(c["runAsUser"], sorted(c["capabilities"]["drop"]) == sorted(["AUDIT_WRITE","FSETID","KILL","MKNOD","NET_BIND_SERVICE","NET_RAW","SETFCAP","SETGID","SETPCAP","SETUID","SYS_CHROOT"]), "add" in c["capabilities"], c["allowPrivilegeEscalation"], c["readOnlyRootFilesystem"])' "$HERE/../kube/storage/helper-pod.yaml")" \
+  "$PORTCULLIS_HELPER_IMAGE:0 True False False True"
+expect_eq "kube/storage/admission.yaml pins the same helper and provisioner images" \
+  "$(grep -c "c.image == '$PORTCULLIS_HELPER_IMAGE'" "$HERE/../kube/storage/admission.yaml"):$(grep -c "c.image == 'docker.io/rancher/local-path-provisioner:v0.0.37@sha256:e757967a5ec338f6a9b371c5a9688bedaa8c3578ea3dd4db329ea0084be0a86f'" "$HERE/../kube/storage/admission.yaml")" "1:1"
+expect_eq "StorageClasses: portcullis-core Retain, portcullis-apps Delete, both portcullis.io/local-path with the three owner patterns, never volumeType local" \
+  "$(python3 -c 'import sys, yaml; print([(d["metadata"]["name"], d["reclaimPolicy"], d["provisioner"], sorted(d["parameters"]), "volumeType" in d["parameters"]) for d in yaml.safe_load_all(open(sys.argv[1]))])' "$HERE/../kube/storage/storageclasses.yaml")" \
+  "[('portcullis-core', 'Retain', 'portcullis.io/local-path', ['groupPattern', 'permPattern', 'userPattern'], False), ('portcullis-apps', 'Delete', 'portcullis.io/local-path', ['groupPattern', 'permPattern', 'userPattern'], False)]"
+expect_eq "kube/admission: five policies, five bindings portcullis-apps-guard-<policy> (Deny, params missing = Deny, Fail)" \
+  "$(python3 -c 'import sys, yaml; P = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]; B = [d for d in yaml.safe_load_all(open(sys.argv[2])) if d]; print(sorted(p["metadata"]["name"] for p in P), all(p["spec"]["failurePolicy"] == "Fail" for p in P), sorted((b["metadata"]["name"], b["spec"]["policyName"], b["spec"]["validationActions"] == ["Deny"], b["spec"]["paramRef"]["parameterNotFoundAction"]) for b in B))' "$HERE/../kube/admission/policies.yaml" "$HERE/../kube/admission/bindings.yaml")" \
+  "['portcullis-apps-netpol', 'portcullis-apps-pods', 'portcullis-apps-services', 'portcullis-apps-traefik', 'portcullis-apps-workloads'] True [('portcullis-apps-guard-netpol', 'portcullis-apps-netpol', True, 'Deny'), ('portcullis-apps-guard-pods', 'portcullis-apps-pods', True, 'Deny'), ('portcullis-apps-guard-services', 'portcullis-apps-services', True, 'Deny'), ('portcullis-apps-guard-traefik', 'portcullis-apps-traefik', True, 'Deny'), ('portcullis-apps-guard-workloads', 'portcullis-apps-workloads', True, 'Deny')]"
+expect_eq "admission fileMiddlewares = the CLI's KUBE_FILE_NAMES = the params example's" "$(sed -n 's/^  fileMiddlewares: //p' "$HERE/../kube/admission/params.yaml")" "$KUBE_FILE_NAMES"
 # runtime_export under kubernetes: the pod + service CIDR are reserved (K-P11).
 expect_eq "runtime_export kubernetes: PORTCULLIS_VPN_RUNTIME_POOLS = pod + service CIDR" \
   "$(kt 'runtime_export; echo "$PORTCULLIS_VPN_RUNTIME_POOLS"' | head -n1)" "10.42.0.0/24 10.43.0.0/16"

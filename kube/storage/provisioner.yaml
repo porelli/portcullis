@@ -1,0 +1,151 @@
+# The Portcullis local-path provisioner (K3): upstream
+# rancher/local-path-provisioner v0.0.37 as a second provisioner,
+# portcullis.io/local-path, in its own namespace portcullis-storage, with
+# its own ServiceAccount (--service-account-name: required when it isn't
+# upstream's name, Task 0 run 2) and upstream's RBAC (the cluster part is
+# what a provisioner needs: PVs, PVCs, nodes, storage classes, events).
+# Its ConfigMap (config.json, setup.sh, teardown.sh, helper-pod.yaml) is
+# made from those files by ./portcullis (kube_cluster_setup).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: portcullis-local-path
+  namespace: portcullis-storage
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-local-path
+  namespace: portcullis-storage
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-local-path
+  namespace: portcullis-storage
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portcullis-local-path
+subjects:
+  - kind: ServiceAccount
+    name: portcullis-local-path
+    namespace: portcullis-storage
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: portcullis-local-path
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "persistentvolumeclaims", "configmaps", "pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portcullis-local-path
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: portcullis-local-path
+subjects:
+  - kind: ServiceAccount
+    name: portcullis-local-path
+    namespace: portcullis-storage
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portcullis-local-path
+  namespace: portcullis-storage
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: portcullis-local-path
+  template:
+    metadata:
+      labels:
+        app: portcullis-local-path
+    spec:
+      serviceAccountName: portcullis-local-path
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: local-path-provisioner
+          image: docker.io/rancher/local-path-provisioner:v0.0.37@sha256:e757967a5ec338f6a9b371c5a9688bedaa8c3578ea3dd4db329ea0084be0a86f
+          imagePullPolicy: IfNotPresent
+          command:
+            - local-path-provisioner
+            - start
+            - --config
+            - /etc/config/config.json
+            - --provisioner-name
+            - portcullis.io/local-path
+            - --service-account-name
+            - portcullis-local-path
+            - --configmap-name
+            - portcullis-local-path-config
+          ports:
+            - name: health
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: health
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: health
+            periodSeconds: 10
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: CONFIG_MOUNT_PATH
+              value: /etc/config/
+            - name: HEALTH_PORT
+              value: "8080"
+          resources:
+            limits:
+              memory: 64Mi
+            requests:
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/config/
+              readOnly: true
+      volumes:
+        - name: config-volume
+          configMap:
+            name: portcullis-local-path-config

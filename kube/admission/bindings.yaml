@@ -1,0 +1,82 @@
+# One binding per policy (a binding binds exactly one policy, Task 0 Q4;
+# K6 / K-P1): portcullis-apps-guard-<policy>, the apps namespace only, the
+# params ConfigMap portcullis-admission-params (missing = deny), Deny.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: portcullis-apps-guard-pods
+spec:
+  policyName: portcullis-apps-pods
+  validationActions: ["Deny"]
+  paramRef:
+    name: portcullis-admission-params
+    namespace: portcullis-apps
+    parameterNotFoundAction: Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: portcullis-apps
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: portcullis-apps-guard-workloads
+spec:
+  policyName: portcullis-apps-workloads
+  validationActions: ["Deny"]
+  paramRef:
+    name: portcullis-admission-params
+    namespace: portcullis-apps
+    parameterNotFoundAction: Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: portcullis-apps
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: portcullis-apps-guard-services
+spec:
+  policyName: portcullis-apps-services
+  validationActions: ["Deny"]
+  paramRef:
+    name: portcullis-admission-params
+    namespace: portcullis-apps
+    parameterNotFoundAction: Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: portcullis-apps
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: portcullis-apps-guard-traefik
+spec:
+  policyName: portcullis-apps-traefik
+  validationActions: ["Deny"]
+  paramRef:
+    name: portcullis-admission-params
+    namespace: portcullis-apps
+    parameterNotFoundAction: Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: portcullis-apps
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: portcullis-apps-guard-netpol
+spec:
+  policyName: portcullis-apps-netpol
+  validationActions: ["Deny"]
+  paramRef:
+    name: portcullis-admission-params
+    namespace: portcullis-apps
+    parameterNotFoundAction: Deny
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: portcullis-apps

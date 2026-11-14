@@ -1,0 +1,16 @@
+# portcullis-storage (K3): the provisioner and its helper pods only.
+# Default deny both ways; the provisioner's egress to the kube API is a
+# policy ./portcullis renders from the default/kubernetes endpoints
+# (kube_cluster_setup), the helpers get none. PSA: enforce privileged
+# (the helper pods mount the storage root as hostPath, which baseline
+# refuses), warn / audit baseline; kube/storage/admission.yaml pins what
+# may run there instead. The namespace itself (PSA labels, K11 label and
+# annotation) is made by ./portcullis.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: portcullis-storage
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]

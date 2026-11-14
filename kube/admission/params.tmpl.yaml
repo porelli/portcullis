@@ -1,0 +1,23 @@
+# The keys of portcullis-admission-params and where kube_cluster_setup takes
+# each from (scripts/lib/kube.sh kube_admission_params; tests compare the
+# key set). Values are plain strings, lists space-separated, peer selectors
+# "<namespace>:<label>=<value>".
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: portcullis-admission-params
+  namespace: "<PORTCULLIS_APPS_NAMESPACE>"
+data:
+  hubImage: "<the Hub's resolved digest, name@sha256:…>"
+  hubServiceAccount: "system:serviceaccount:<PORTCULLIS_NAMESPACE>:portcullis-hub"
+  bindRoots: "<HUB_OVERRIDE_BIND_ROOTS, colons → spaces; default /srv /mnt /media>"
+  corePorts: "80 443 <PORTCULLIS_VPN_PORT, default 51820> 8000 8081 8443 8444"
+  podCIDR: "<PORTCULLIS_POD_CIDR>"
+  serviceCIDR: "<PORTCULLIS_SERVICE_CIDR>"
+  nodeAddresses: "<PORTCULLIS_KUBE_NODE_ADDRESSES, each /32>"
+  apiAddresses: "<PORTCULLIS_KUBE_API_ENDPOINTS' addresses, each /32>"
+  kubeDNS: "kube-system:k8s-app=kube-dns"
+  traefik: "<PORTCULLIS_NAMESPACE>:portcullis.io/component=traefik"
+  mcpGate: "<PORTCULLIS_NAMESPACE>:portcullis.io/component=mcp-gate"
+  wg: "<PORTCULLIS_NAMESPACE>:portcullis.io/component=wg"
+  fileMiddlewares: "<traefik/dynamic/middlewares.yml's six + the K15 seven, each @file, + group-gate@file forward-auth-ext@file mcp-gate@file>"

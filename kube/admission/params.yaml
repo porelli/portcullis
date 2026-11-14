@@ -1,0 +1,22 @@
+# The admission params as the Hub's vectors use them (a k3s-default
+# cluster, the defaults' namespaces). ./portcullis writes the real one from
+# params.tmpl.yaml's keys (kube_cluster_setup).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: portcullis-admission-params
+  namespace: portcullis-apps
+data:
+  hubImage: ghcr.io/porelli/portcullis-hub@sha256:1111111111111111111111111111111111111111111111111111111111111111
+  hubServiceAccount: system:serviceaccount:portcullis:portcullis-hub
+  bindRoots: /srv /mnt /media
+  corePorts: 80 443 51820 8000 8081 8443 8444
+  podCIDR: 10.42.0.0/24
+  serviceCIDR: 10.43.0.0/16
+  nodeAddresses: 10.1.0.4/32
+  apiAddresses: 10.1.0.4/32
+  kubeDNS: kube-system:k8s-app=kube-dns
+  traefik: portcullis:portcullis.io/component=traefik
+  mcpGate: portcullis:portcullis.io/component=mcp-gate
+  wg: portcullis:portcullis.io/component=wg
+  fileMiddlewares: client-headers@file client-cert-pem@file rate-limit@file rate-limit-auth@file security-headers@file strip-client-forwarded@file portcullis-auth@file portcullis-auth-ext@file portcullis-groups@file portcullis-groups-vpn@file portcullis-public-guard@file portcullis-public-guard-vpn@file vpn-required-path@file group-gate@file forward-auth-ext@file mcp-gate@file
