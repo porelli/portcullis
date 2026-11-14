@@ -108,7 +108,9 @@ DOCKERFILE
     envs+=(-e HUB_IMAGE=portcullis-hub:ci -e HUB_LOCAL=1)
   fi
   [ -z "${KEYCLOAK_IMAGE:-}" ] || envs+=(-e KEYCLOAK_IMAGE="$KEYCLOAK_IMAGE")
-  docker exec "${envs[@]}" "$name" sudo -E -u runner -H bash -c "cd $w && bash .github/ci/e2e-k3s-local.sh steps $*"
+  # docker exec -u, never sudo -E: Ubuntu 26.04's sudo ignores -E, and the
+  # steps then ran without HUB_IMAGE (the published edge Hub was deployed).
+  docker exec "${envs[@]}" -e HOME=/home/runner -e USER=runner -u runner -w "$w" "$name" bash -c "bash .github/ci/e2e-k3s-local.sh steps $*"
 }
 
 case "${1:-}" in
