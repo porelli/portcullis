@@ -921,7 +921,7 @@ spec:
         || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
       messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
     - expression: "variables.exempt || variables.del || object.kind in ['IngressRoute', 'Middleware', 'Service']"
-      messageExpression: "object.kind + ' is refused in portcullis-edge (only IngressRoute, Middleware and the apps'' ExternalName Services)'"
+      messageExpression: "object.kind + ' is refused in portcullis-edge (only IngressRoute, Middleware and the pinned ExternalName Services)'"
     - expression: >-
         variables.exempt || variables.del || (variables.owner == 'hub'
           && 'portcullis.io/instance' in object.metadata.labels && object.metadata.labels['portcullis.io/instance'] != '')

@@ -151,6 +151,17 @@ def main():
                                    for rr in pol["spec"]["matchConstraints"]["resourceRules"])
     pins = bool(pol) and any("object.spec.externalName == object.metadata.name + '.' + variables.apps + '.svc.cluster.local'" in v["expression"]
                              for v in pol["spec"]["validations"])
+    # CEL strings are single-quoted: an odd count of quotes in an expression
+    # is a string that never ends (the API server refuses the whole policy).
+    for d in yaml.safe_load_all((K.ROOT / "kube" / "admission" / "policies.yaml").read_text()):
+        if not d or d.get("kind") != "ValidatingAdmissionPolicy":
+            continue
+        exprs = [v.get("expression", "") for v in d["spec"].get("variables", [])]
+        exprs += [v.get(k, "") for v in d["spec"].get("validations", []) for k in ("expression", "messageExpression")]
+        for e in exprs:
+            # A YAML '' escape leaked into CEL (apps'' …) or an odd count.
+            if e.replace("\\'", "").count("'") % 2 or re.search(r"[A-Za-z]''[A-Za-z ]", e):
+                F.add(f"policy {d['metadata']['name']}: broken quotes in CEL: {e[:120]}")
     for r in hub_roles:
         if r["metadata"]["namespace"] == K.EDGE_NS and any("services" in x["resources"] for x in r["rules"]) and not (judges_svc and pins):
             F.add(f"the Hub's Role in {K.EDGE_NS} grants services but portcullis-edge-routes doesn't judge and pin Services (CREATE / UPDATE / DELETE, externalName = <name>.<apps ns>.svc.cluster.local)")
