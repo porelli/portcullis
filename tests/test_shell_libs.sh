@@ -4531,6 +4531,14 @@ OUT="$(kt '_kube_restore_stop_secret_apps; echo "rc=$? msg=$_RESTORE_ERROR_MSG"'
 mv "$KS/kube/apps-secrets.json.bak" "$KS/kube/apps-secrets.json"
 expect_eq "restore: an unreadable Secret list refuses (a credential would survive the restore)" \
   "$(grep -c 'patch' "$KS/order" 2>/dev/null || true):$(printf '%s\n' "$OUT" | grep -c "rc=1 msg=could not list the apps' Secrets")" "0:1"
+# The kubernetes restore puts the backup's secret variables (portcullis-env:
+# POSTGRES_PASSWORD) live BEFORE the emptied Postgres starts: it initialises
+# with that password, which Keycloak then reads (the old one = Keycloak never
+# connects again).
+RB="$(sed -n '/^_backup_restore_kube() {/,/^}/p' "$HERE/../scripts/lib/kube.sh")"
+expect_eq "kube restore: kube_sync_secrets after the .env is restored and before the fresh Postgres" \
+  "$(printf '%s\n' "$RB" | awk '/cat "\$dir\/.env"/ {printf "cat "} /kube_sync_secrets/ {printf "kube_sync_secrets "} /_kube_empty_volume postgres_data/ {printf "_kube_empty_volume "}')" \
+  "cat kube_sync_secrets _kube_empty_volume "
 # The LLDAP guard on kubernetes counts LLDAP's users from its PVC (never the
 # docker-only volume helper), and still refuses an empty LLDAP.
 OUT="$(kt '_restore_lldap_count() { echo DOCKER-HELPER; }; _restore_kc_federated_count() { echo 5; }; _kube_restore_lldap_count() { echo 3; }; _restore_lldap_guard false; echo "rc=$?"')"

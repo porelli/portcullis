@@ -1997,6 +1997,10 @@ _backup_restore_kube() {
   fi
   env_reload
   runtime_export
+  # The backup's secret variables live first (portcullis-env): the emptied
+  # Postgres initialises with POSTGRES_PASSWORD from it, and Keycloak reads the
+  # same key (with the old one live here Keycloak never connected again).
+  kube_sync_secrets --full || fail "could not sync the restored secret variables"
   # Fresh Postgres and Vault (emptied in place, as their owners).
   _kube_empty_volume postgres_data 70 70 || fail "could not empty postgres-data"
   _kube_empty_volume vault_data 100 1000 || fail "could not empty vault-data"
