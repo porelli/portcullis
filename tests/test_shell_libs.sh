@@ -4140,7 +4140,7 @@ OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; export STUB_WHOAMI_FAIL=1; kube_admission
 case "$OUT" in *"can't tell this CLI's own identity"*"rc=1") t_pass "admission params: the CLI's identity unknown → refused (portcullis-edge-routes exempts it by name)" ;; *) t_fail "admission params whoami: $OUT" ;; esac
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' PORTCULLIS_DOMAIN=K.Example.org; kube_admission_params x | grep -E '^(reservedHosts|maxAppPriority)'" | tr '\t' '=' | head -n2 | tr '\n' ';')"
 expect_eq "admission params: reservedHosts = the apex + core-routes.json's subdomains (lowercase), maxAppPriority from core-routes.json" "$OUT" \
-  "reservedHosts=k.example.org traefik.k.example.org hub.k.example.org directory.k.example.org metrics.k.example.org people.k.example.org mcp.k.example.org auth.k.example.org enroll.k.example.org;maxAppPriority=0;"
+  "reservedHosts=k.example.org traefik.k.example.org hub.k.example.org directory.k.example.org metrics.k.example.org people.k.example.org mcp.k.example.org auth.k.example.org enroll.k.example.org;maxAppPriority=1000;"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; unset PORTCULLIS_DOMAIN; kube_reserved_hosts")"
 case "$OUT" in *"PORTCULLIS_DOMAIN is not set"*"rc=1") t_pass "reservedHosts: no domain → refused" ;; *) t_fail "reservedHosts no domain: $OUT" ;; esac
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; unset PORTCULLIS_DOMAIN; kube_admission_params x")"

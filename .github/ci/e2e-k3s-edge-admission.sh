@@ -45,7 +45,7 @@ forbidden() {
 # ir <jq patch> — an IngressRoute the Hub renders, patched.
 ir() {
   jq -n --arg apps "$APPS" '{apiVersion: "traefik.io/v1alpha1", kind: "IngressRoute",
-    metadata: {name: "e2e-app", labels: {"portcullis.io/owner": "hub"}},
+    metadata: {name: "e2e-app", labels: {"portcullis.io/owner": "hub", "portcullis.io/instance": "e2e"}},
     spec: {entryPoints: ["websecure"],
       routes: [{match: "Host(`e2e.example.org`)", kind: "Rule",
         middlewares: [{name: "client-headers@file"}, {name: "portcullis-auth@file"}, {name: "portcullis-groups@file"}, {name: "e2e-app-strip"}],
@@ -53,7 +53,7 @@ ir() {
       tls: {certResolver: "letsencrypt", options: {name: "authaware@file"}}}}' | jq "$1"
 }
 # mw <spec json> [labels json] — a Middleware.
-HUB_LABELS='{"portcullis.io/owner": "hub"}'
+HUB_LABELS='{"portcullis.io/owner": "hub", "portcullis.io/instance": "e2e"}'
 mw() {
   jq -n --argjson s "$1" --argjson l "${2:-$HUB_LABELS}" \
     '{apiVersion: "traefik.io/v1alpha1", kind: "Middleware", metadata: {name: "e2e-app-strip", labels: $l}, spec: $s}'
@@ -62,7 +62,9 @@ C=(create --dry-run=server -f -)
 
 # ── controls: the Hub's shapes are admitted ──
 ir . | admitted "an app IngressRoute (apps Service, @file + own middlewares, authaware)" "${C[@]}"
-ir '.spec.entryPoints = ["web", "websecure", "vpnsecure"]' | admitted "entryPoints web, websecure, vpnsecure" "${C[@]}"
+ir '.spec.entryPoints = ["websecure", "vpnsecure"]' | admitted "entryPoints websecure, vpnsecure" "${C[@]}"
+ir '.spec.routes[0].match = "Host(`a.example.org`) || Host(`b.example.org`) && (PathPrefix(`/x`) || Path(`/y`))" | .spec.routes[0].priority = 1000' \
+  | admitted "two hosts, paths, priority at maxAppPriority" "${C[@]}"
 ir '.spec.routes[0].services = [{name: "group-gate@file", kind: "TraefikService"}]' | admitted "a K15 core service (group-gate@file)" "${C[@]}"
 ir '.spec.routes[0].middlewares += [{name: "e2e-chain", namespace: "portcullis-edge"}]' | admitted "a middleware named with the edge namespace" "${C[@]}"
 mw '{"stripPrefix": {"prefixes": ["/x"]}}' | admitted "a stripPrefix Middleware" "${C[@]}"
@@ -80,6 +82,8 @@ core="$(K -n "$EDGE" get ingressroutes -l portcullis.io/owner=core -o jsonpath='
 refused "relabelling the core IngressRoute $core" label --dry-run=server ingressroute "$core" portcullis.io/owner=hub --overwrite
 refused "patching the core IngressRoute $core" patch --dry-run=server ingressroute "$core" --type=merge -p '{"spec":{"entryPoints":["websecure"]}}'
 refused "deleting the core IngressRoute $core" delete --dry-run=server ingressroute "$core"
+refused "taking over the core IngressRoute $core (relabel owner=hub + instance, new spec)" patch --dry-run=server ingressroute "$core" --type=merge \
+  -p "$(ir '.' | jq -c '{metadata: {labels: .metadata.labels}, spec: .spec}')"
 refused "deleting the core Middleware hub-proxy-secret" delete --dry-run=server middleware hub-proxy-secret
 refused "patching the core Middleware portcullis-auth-console" patch --dry-run=server middleware portcullis-auth-console --type=merge -p '{"metadata":{"labels":{"x":"y"}}}'
 # A live Hub object: update and delete admitted.
@@ -92,6 +96,16 @@ admitted "the Hub deleting its own IngressRoute" delete ingressroute e2e-app
 ir 'del(.spec.entryPoints)' | refused "no entryPoints (= every entrypoint)" "${C[@]}"
 ir '.spec.entryPoints = []' | refused "empty entryPoints" "${C[@]}"
 ir '.spec.entryPoints = ["kcinternal"]' | refused "entrypoint kcinternal" "${C[@]}"
+ir '.spec.entryPoints = ["web"]' | refused "entrypoint web" "${C[@]}"
+ir 'del(.metadata.labels["portcullis.io/instance"])' | refused "an IngressRoute without portcullis.io/instance" "${C[@]}"
+ir 'del(.spec.tls)' | refused "a route without TLS" "${C[@]}"
+ir '.spec.routes[0].priority = 1001' | refused "a priority above maxAppPriority" "${C[@]}"
+for m in 'HostRegexp(`.+`)' 'PathPrefix(`/`)' 'Host(`e2e.example.org`) || PathPrefix(`/`)' 'Host(`e2e.example.org`) && Header(`X`, `y`)' 'ClientIP(`10.0.0.0/8`)'; do
+  ir ".spec.routes[0].match = \"$m\"" | refused "the match $m" "${C[@]}"
+done
+for h in $(K -n "$APPS" get configmap portcullis-admission-params -o jsonpath='{.data.reservedHosts}'); do
+  ir ".spec.routes[0].match = \"Host(\`$h\`) && PathPrefix(\`/x\`)\"" | refused "a route on the reserved host $h" "${C[@]}"
+done
 ir '.spec.entryPoints = ["websecure", "parked"]' | refused "entrypoint parked" "${C[@]}"
 for sns in "$NS" portcullis-storage kube-system "$EDGE"; do
   ir ".spec.routes[0].services[0].namespace = \"$sns\"" | refused "a Service in $sns" "${C[@]}"

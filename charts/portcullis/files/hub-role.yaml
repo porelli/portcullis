@@ -1,8 +1,16 @@
+# The Hub's Role in the apps namespace (contract §6 "On Kubernetes"): the
+# Kubernetes form of socket-proxy-hub. The Hub is the source (K13): core's
+# chart keeps a byte copy (core CI compares the two). pods/exec is create
+# only: get alone opens a WebSocket exec on 1.32. Routes live in the edge
+# namespace (role-edge.yaml). Nothing in the core namespace, nothing
+# cluster-scoped.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: portcullis-hub
   namespace: portcullis-apps
+  labels:
+    app.kubernetes.io/managed-by: portcullis
 rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
@@ -28,13 +36,3 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list", "watch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: portcullis-hub
-  namespace: portcullis-edge
-rules:
-  - apiGroups: ["traefik.io"]
-    resources: ["ingressroutes", "middlewares"]
-    verbs: ["create", "update", "patch", "delete", "get", "list", "watch"]

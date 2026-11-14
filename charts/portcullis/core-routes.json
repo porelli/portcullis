@@ -1,5 +1,14 @@
 {
-  "_comment": "The one source of the core routers' hosts (ingressroutes-core.yaml) and the apps' bounds the CLI writes into portcullis-admission-params: reservedHosts = the apex + <subdomain>.<domain> for each subdomain, maxAppPriority (below every core route's effective priority: its own, else Traefik's default len(rule)). tests/k8s_hardening.py holds the rendered core IngressRoutes to both.",
-  "subdomains": ["traefik", "hub", "directory", "metrics", "people", "mcp", "auth", "enroll"],
-  "maxAppPriority": 0
+  "_comment": "The one source of the core routers' hosts (ingressroutes-core.yaml) and the apps' bounds the CLI writes into portcullis-admission-params: reservedHosts = the apex + <subdomain>.<domain> for each subdomain; maxAppPriority = the highest priority an app route may have (the Hub's MaxPriorityBound()+1..+3 are template-dependent; 1000 = the Hub's admission example, maxRoutePriority). Hosts are disjoint, so tests/k8s_hardening.py requires only that core rules without Host(...) are off the app entrypoints or rank above it, and that every Host-limited core rule names reserved hosts.",
+  "subdomains": [
+    "traefik",
+    "hub",
+    "directory",
+    "metrics",
+    "people",
+    "mcp",
+    "auth",
+    "enroll"
+  ],
+  "maxAppPriority": 1000
 }

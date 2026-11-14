@@ -1,0 +1,14 @@
+# The Hub's Role in the edge namespace (portcullis-edge, the only one
+# Traefik watches): IngressRoutes and Middlewares only. The Hub is the
+# source (K13): core's chart keeps a byte copy.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-hub
+  namespace: portcullis-edge
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+rules:
+  - apiGroups: ["traefik.io"]
+    resources: ["ingressroutes", "middlewares"]
+    verbs: ["create", "update", "patch", "delete", "get", "list", "watch"]

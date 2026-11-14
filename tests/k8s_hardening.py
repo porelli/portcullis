@@ -16,6 +16,7 @@ namespace, and every core IngressRoute / Middleware lives there.
   python3 tests/k8s_hardening.py
 """
 import re
+import copy
 import json
 import sys
 
@@ -160,6 +161,58 @@ def main():
     return F.done()
 
 
+APP_ENTRYPOINTS = {"web", "websecure", "vpnsecure"}
+
+
+def core_route_problems(docs, cr):
+    """Hosts are disjoint (reservedHosts), so a core route can lose to an app
+    route only where a core rule without Host(...) can match an app host:
+    every such rule must be on an entrypoint apps can't use, or rank above
+    maxAppPriority (its priority, else Traefik's default len(rule)); every
+    Host-limited core rule names reserved hosts only."""
+    dom = K.domain(docs)
+    reserved = {dom} | {f"{s}.{dom}" for s in cr["subdomains"]}
+    out = []
+    for ir in K.by_kind(docs, "IngressRoute"):
+        name, eps = ir["metadata"]["name"], set(ir["spec"].get("entryPoints") or [])
+        for r in ir["spec"]["routes"]:
+            hosts = re.findall(r"Host\(`([^`]*)`\)", r["match"])
+            if not hosts:
+                prio = r.get("priority") or len(r["match"])
+                if (not eps or eps & APP_ENTRYPOINTS) and prio <= cr["maxAppPriority"]:
+                    out.append(f"IngressRoute {name}: a rule without Host(...) on {sorted(eps) or 'every entrypoint'} at priority {prio} <= maxAppPriority {cr['maxAppPriority']}")
+            for h in hosts:
+                if h.lower() not in reserved:
+                    out.append(f"IngressRoute {name}: host {h} isn't in reservedHosts (core-routes.json)")
+    return out
+
+
+def _hostless_on_websecure(docs):
+    ir = next(d for d in docs if d.get("kind") == "IngressRoute" and d["metadata"]["name"] == "kcinternal")
+    ir["spec"]["entryPoints"] = ["websecure"]
+    ir["spec"]["routes"][0]["priority"] = 5
+    return docs
+
+
+def _hostless_no_entrypoints(docs):
+    ir = next(d for d in docs if d.get("kind") == "IngressRoute" and d["metadata"]["name"] == "kcinternal")
+    del ir["spec"]["entryPoints"]
+    return docs
+
+
+def _unreserved_host(docs):
+    ir = next(d for d in docs if d.get("kind") == "IngressRoute" and d["metadata"]["name"] == "hub")
+    ir["spec"]["routes"][0]["match"] = ir["spec"]["routes"][0]["match"].replace("hub.", "hubx.")
+    return docs
+
+
+MUTATIONS = [
+    ("a Host-less rule on websecure below the cap", _hostless_on_websecure),
+    ("a Host-less rule on every entrypoint", _hostless_no_entrypoints),
+    ("a core host outside reservedHosts", _unreserved_host),
+]
+
+
 def storage_docs():
     out = []
     for p in sorted((K.ROOT / "kube" / "storage").glob("*.yaml")):
@@ -217,23 +270,13 @@ def check_edge(docs):
             if (d["metadata"].get("labels") or {}).get("portcullis.io/owner") != "core":
                 F.add(f"{d['kind']} {d['metadata']['name']}: no portcullis.io/owner=core (the Hub could change it)")
     # The apps' bounds (core-routes.json → params reservedHosts /
-    # maxAppPriority): every core IngressRoute's host is reserved and every
-    # core route's effective priority (its own, else Traefik's len(rule)) is
-    # above maxAppPriority.
+    # maxAppPriority), with their mutation tests.
     cr = json.loads((K.CHART / "core-routes.json").read_text())
-    dom = K.domain(docs)
-    reserved = {dom} | {f"{s}.{dom}" for s in cr["subdomains"]}
-    for ir in K.by_kind(docs, "IngressRoute"):
-        for r in ir["spec"]["routes"]:
-            prio = r.get("priority") or len(r["match"])
-            if prio <= cr["maxAppPriority"]:
-                F.add(f"IngressRoute {ir['metadata']['name']}: priority {prio} not above maxAppPriority {cr['maxAppPriority']}")
-            hosts = re.findall(r"Host\(`([^`]*)`\)", r["match"])
-            if ir["metadata"]["name"] != "kcinternal" and not hosts:
-                F.add(f"IngressRoute {ir['metadata']['name']}: a rule without Host(...)")
-            for h in hosts:
-                if h.lower() not in reserved:
-                    F.add(f"IngressRoute {ir['metadata']['name']}: host {h} isn't in reservedHosts (core-routes.json)")
+    for p in core_route_problems(docs, cr):
+        F.add(p)
+    for what, mutate in MUTATIONS:
+        if not core_route_problems(mutate(copy.deepcopy(docs)), cr):
+            F.add(f"core_route_problems misses {what} (mutation test)")
     # The params' edgeCoreMiddlewares (no Hub route may name them) = the
     # chart's edge Middlewares + the CLI's hub-proxy-secret.
     want = sorted(["hub-proxy-secret"] + [d["metadata"]["name"] for d in K.by_kind(docs, "Middleware")])

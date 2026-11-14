@@ -145,7 +145,7 @@ if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] \
 fi
 sha=$(awk -v r="refs/heads/$ref" '$2 == r { print $1 }' <<<"$heads")
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::portcullis-hub has no single commit for refs/heads/$ref"; exit 1; }
-copies="charts/portcullis/files/hub-role.yaml=internal/runtime/kube/testdata/role.yaml"
+copies="charts/portcullis/files/hub-role.yaml=internal/runtime/kube/testdata/role.yaml charts/portcullis/files/hub-role-edge.yaml=internal/runtime/kube/testdata/role-edge.yaml"
 if [ -d kube/admission ]; then
   for f in kube/admission/policies.yaml kube/admission/bindings.yaml kube/admission/params.yaml; do
     copies="$copies $f=internal/runtime/kube/testdata/admission/${f##*/}"

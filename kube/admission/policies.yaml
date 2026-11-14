@@ -584,7 +584,11 @@ spec:
     - name: tiers
       expression: "['authaware@file', 'public@file', 'protected@file', 'protected-any@file']"
     - name: entryPoints
-      expression: "['web', 'websecure', 'vpnsecure']"
+      expression: "['websecure', 'vpnsecure']"
+    - name: reserved
+      expression: "params.data.reservedHosts.split(' ')"
+    - name: routes
+      expression: "!variables.del && object.kind == 'IngressRoute' && has(object.spec.routes) ? object.spec.routes : []"
     - name: types
       expression: "['addPrefix', 'stripPrefix', 'stripPrefixRegex', 'replacePath', 'replacePathRegex', 'redirectRegex', 'redirectScheme', 'headers', 'compress', 'contentType', 'chain', 'rateLimit', 'inFlightReq', 'ipAllowList', 'buffering', 'retry', 'circuitBreaker', 'grpcWeb']"
     - name: owner
@@ -594,15 +598,32 @@ spec:
   validations:
     - expression: "variables.exempt || variables.del || object.kind in ['IngressRoute', 'Middleware']"
       messageExpression: "object.kind + ' is refused in portcullis-edge (only IngressRoute and Middleware)'"
-    - expression: "variables.exempt || variables.del || variables.owner == 'hub'"
-      message: "an object here needs the label portcullis.io/owner=hub"
+    - expression: >-
+        variables.exempt || variables.del || (variables.owner == 'hub'
+          && 'portcullis.io/instance' in object.metadata.labels && object.metadata.labels['portcullis.io/instance'] != '')
+      message: "an object here needs the labels portcullis.io/owner=hub and portcullis.io/instance"
     - expression: "variables.exempt || request.operation == 'CREATE' || variables.oldOwner == 'hub'"
       message: "only owner=hub objects may be changed or deleted (owner=core objects are the CLI's)"
     - expression: >-
         variables.exempt || variables.del || object.kind != 'IngressRoute'
         || (has(object.spec.entryPoints) && size(object.spec.entryPoints) > 0
             && object.spec.entryPoints.all(e, e in variables.entryPoints))
-      message: "entryPoints must be set and only web, websecure or vpnsecure"
+      message: "entryPoints must be set and only websecure or vpnsecure"
+    # The shape the Hub renders on Docker: Host(`h`) [|| Host(`h`)…], with
+    # an optional && Path / PathPrefix [|| …]; nothing else (no HostRegexp,
+    # HostSNI, ClientIP, headers, methods, no catch-all).
+    - expression: >-
+        variables.exempt || variables.routes.all(r, has(r.match)
+          && r.match.matches('^\\(?Host\\(`[a-z0-9.-]+`\\)( \\|\\| Host\\(`[a-z0-9.-]+`\\))*\\)?( && \\(?(PathPrefix|Path)\\(`[^`()]*`\\)( \\|\\| (PathPrefix|Path)\\(`[^`()]*`\\))*\\)?)?$'))
+      message: "a route match other than Host(...) with an optional && Path / PathPrefix"
+    - expression: >-
+        variables.exempt || variables.routes.all(r, !has(r.match)
+          || r.match.findAll('Host\\(`[a-z0-9.-]+`\\)').all(h, !(h.substring(6, size(h) - 2) in variables.reserved)))
+      message: "a route on a reserved core hostname"
+    - expression: "variables.exempt || variables.routes.all(r, !has(r.priority) || r.priority <= int(params.data.maxAppPriority))"
+      message: "a route priority above maxAppPriority"
+    - expression: "variables.exempt || variables.del || object.kind != 'IngressRoute' || has(object.spec.tls)"
+      message: "a route without TLS"
     - expression: >-
         variables.exempt || variables.del || object.kind != 'IngressRoute'
         || object.spec.routes.all(r, r.services.all(s,

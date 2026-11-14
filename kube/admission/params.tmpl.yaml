@@ -26,4 +26,4 @@ data:
   edgeNamespace: "portcullis-edge"
   edgeCoreMiddlewares: "<the owner=core Middlewares of portcullis-edge: KUBE_EDGE_CORE_MIDDLEWARES>"
   reservedHosts: "<every core host: the apex + charts/portcullis/core-routes.json subdomains . PORTCULLIS_DOMAIN>"
-  maxAppPriority: "<core-routes.json maxAppPriority: below every core route's priority>"
+  maxAppPriority: "<core-routes.json maxAppPriority: the highest priority an app route may have>"
