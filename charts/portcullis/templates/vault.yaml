@@ -1,0 +1,39 @@
+{{- /* vault (compose: vault): raft in the PVC, auto-unseal from secrets/vault-unseal. */ -}}
+{{- $s := dict
+  "name" "vault" "uid" .Values.uids.vault "gid" .Values.uids.vaultGroup
+  "memory" "512Mi" "nets" (list "portcullis") "egress" true
+  "hashes" (list "config-vault" "secrets-vault-unseal")
+  "command" (list "/bin/sh" "/vault/portcullis/entrypoint.sh")
+  "health" (dict "test" (list "vault" "status") "interval" 5 "timeout" 3 "retries" 5 "startPeriod" 30)
+  "ports" (list (dict "name" "vault" "port" 8200))
+  "env" (list
+    (dict "name" "VAULT_ADDR" "value" "http://127.0.0.1:8200")
+    (dict "name" "SKIP_SETCAP" "value" "true"))
+  "mounts" (list
+    (dict "name" "data" "mountPath" "/vault/file")
+    (dict "name" "config" "mountPath" "/vault/portcullis" "readOnly" true)
+    (dict "name" "unseal" "mountPath" "/vault/unseal" "readOnly" true)
+    (dict "name" "tmp" "mountPath" "/tmp"))
+  "volumes" (list
+    (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "vault-data"))
+    (dict "name" "config" "configMap" (dict "name" "config-vault" "items" (.Values.configItems.vault | default list)))
+    (dict "name" "unseal" "secret" (dict "secretName" "secrets-vault-unseal" "defaultMode" 288))
+    (dict "name" "tmp" "emptyDir" (dict "medium" "Memory")))
+  "fsGroup" .Values.uids.vaultGroup
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+---
+{{ include "portcullis.pvc" (list . "vault-data" .Values.uids.vault .Values.uids.vaultGroup "0750") }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vault
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    portcullis.io/component: vault
+  ports:
+    - name: vault
+      port: 8200
+      targetPort: 8200

@@ -1,0 +1,51 @@
+{{- /* forward-auth (compose: forward-auth): oauth2-proxy, no healthcheck (distroless).
+auth.<domain> resolves to the traefik Service (hostAliases, as host-gateway). */ -}}
+{{- $d := include "portcullis.domain" . -}}
+{{- $s := dict
+  "name" "forward-auth" "image" "forward-auth" "uid" .Values.uids.oauth2proxy "gid" .Values.uids.oauth2proxy
+  "memory" "256Mi" "nets" (list "portcullis" "portcullis-sessions") "egress" true
+  "hashes" (list "portcullis-env" "certs" "config-oauth2-proxy")
+  "args" (list "--alpha-config=/etc/oauth2-proxy/alpha.yaml")
+  "hostAliases" (list (dict "ip" (required "traefikServiceIP is required" .Values.traefikServiceIP) "hostnames" (list (printf "auth.%s" $d))))
+  "ports" (list (dict "name" "http" "port" 4180))
+  "env" (list
+    (dict "name" "PORTCULLIS_DOMAIN" "value" $d)
+    (dict "name" "FORWARD_AUTH_CLIENT_SECRET" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "FORWARD_AUTH_CLIENT_SECRET")))
+    (dict "name" "OAUTH2_PROXY_COOKIE_SECRET" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "FORWARD_AUTH_COOKIE_SECRET")))
+    (dict "name" "OAUTH2_PROXY_COOKIE_DOMAINS" "value" (printf ".%s" $d))
+    (dict "name" "OAUTH2_PROXY_COOKIE_SAMESITE" "value" "lax")
+    (dict "name" "OAUTH2_PROXY_COOKIE_REFRESH" "value" "1m")
+    (dict "name" "OAUTH2_PROXY_EMAIL_DOMAINS" "value" "*")
+    (dict "name" "OAUTH2_PROXY_REVERSE_PROXY" "value" "true")
+    (dict "name" "OAUTH2_PROXY_TRUSTED_PROXY_IPS" "value" (printf "%s,127.0.0.1/32" .Values.podCIDR))
+    (dict "name" "OAUTH2_PROXY_WHITELIST_DOMAINS" "value" (printf ".%s" $d))
+    (dict "name" "OAUTH2_PROXY_REDIRECT_URL" "value" (printf "https://auth.%s/oauth2/callback" $d))
+    (dict "name" "OAUTH2_PROXY_BACKEND_LOGOUT_URL" "value" (printf "https://auth.%s/realms/portcullis/protocol/openid-connect/logout?id_token_hint={id_token}" $d))
+    (dict "name" "OAUTH2_PROXY_SKIP_PROVIDER_BUTTON" "value" "true")
+    (dict "name" "OAUTH2_PROXY_SSL_UPSTREAM_INSECURE_SKIP_VERIFY" "value" "true")
+    (dict "name" "SSL_CERT_FILE" "value" "/etc/ssl/certs/ca-certificates.crt")
+    (dict "name" "OAUTH2_PROXY_SESSION_STORE_TYPE" "value" "redis")
+    (dict "name" "OAUTH2_PROXY_REDIS_CONNECTION_URL" "value" "redis://sessions:6379")
+    (dict "name" "OAUTH2_PROXY_REDIS_USERNAME" "value" "forward-auth")
+    (dict "name" "OAUTH2_PROXY_REDIS_PASSWORD" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "FORWARD_AUTH_REDIS_PASSWORD"))))
+  "mounts" (list
+    (dict "name" "ca" "mountPath" "/etc/ssl/certs" "readOnly" true)
+    (dict "name" "alpha" "mountPath" "/etc/oauth2-proxy" "readOnly" true))
+  "volumes" (list
+    (dict "name" "ca" "configMap" (dict "name" "certs" "items" (list (dict "key" "ca-bundle.crt" "path" "ca-certificates.crt"))))
+    (dict "name" "alpha" "configMap" (dict "name" "config-oauth2-proxy" "items" (list (dict "key" "alpha.yaml" "path" "alpha.yaml")))))
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: forward-auth
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    portcullis.io/component: forward-auth
+  ports:
+    - name: http
+      port: 4180
+      targetPort: 4180

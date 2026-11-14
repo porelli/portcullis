@@ -24,7 +24,7 @@ backups/*
 monitoring/textfile/*
 !monitoring/textfile/.gitkeep
 # Hub-generated copies of app template dirs (see hub volumes in docker-compose.yml)
-templates/
+/templates/
 # Hub-written settings data files (see hub volumes in docker-compose.yml)
 appfiles/
 .hub/

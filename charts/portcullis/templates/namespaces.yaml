@@ -1,0 +1,19 @@
+{{- /* The three namespaces, rendered only for kubeconform in CI
+(renderNamespaces): ./portcullis init creates them itself — PSA labels and
+K11's ownership label + install annotation —, never Helm. */ -}}
+{{- if .Values.renderNamespaces }}
+{{- range $n := list (list .Release.Namespace "restricted" "restricted" "restricted") (list .Values.appsNamespace "privileged" "baseline" "baseline") (list .Values.storageNamespace "baseline" "baseline" "baseline") }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ index $n 0 }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    pod-security.kubernetes.io/enforce: {{ index $n 1 }}
+    pod-security.kubernetes.io/warn: {{ index $n 2 }}
+    pod-security.kubernetes.io/audit: {{ index $n 3 }}
+  annotations:
+    portcullis.io/install: {{ required "installID is required" $.Values.installID | quote }}
+{{- end }}
+{{- end }}

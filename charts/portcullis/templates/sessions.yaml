@@ -1,0 +1,30 @@
+{{- /* sessions (compose: sessions): Valkey, memory only. */ -}}
+{{- $s := dict
+  "name" "sessions" "uid" .Values.uids.sessions "gid" .Values.uids.sessionsGroup
+  "memory" "128Mi" "nets" (list "portcullis-sessions")
+  "hashes" (list "secrets-sessions")
+  "args" (list "valkey-server" "/etc/valkey/valkey.conf")
+  "health" (dict "test" (list "sh" "-c" "valkey-cli -h 127.0.0.1 ping 2>&1 | grep -q NOAUTH") "interval" 5 "timeout" 3 "retries" 10 "startPeriod" 5)
+  "ports" (list (dict "name" "valkey" "port" 6379))
+  "mounts" (list
+    (dict "name" "data" "mountPath" "/data")
+    (dict "name" "conf" "mountPath" "/etc/valkey" "readOnly" true))
+  "volumes" (list
+    (dict "name" "data" "emptyDir" (dict "medium" "Memory"))
+    (dict "name" "conf" "secret" (dict "secretName" "secrets-sessions" "defaultMode" 288 "items" (list (dict "key" "valkey.conf" "path" "valkey.conf")))))
+  "fsGroup" .Values.uids.sessionsGroup
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sessions
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    portcullis.io/component: sessions
+  ports:
+    - name: valkey
+      port: 6379
+      targetPort: 6379

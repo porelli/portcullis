@@ -1,0 +1,41 @@
+{{- /* Default deny, both directions, in the core and the apps namespace
+(spec anti-goal: every allowed path is a policy of its own); every pod may
+ask kube-dns (port 53). The apps' own paths are the Hub's per-instance
+policies. */ -}}
+{{- range $ns := list .Release.Namespace .Values.appsNamespace }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kube-dns
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

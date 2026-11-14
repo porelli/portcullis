@@ -1,0 +1,43 @@
+{{- /* Traefik's ServiceAccount (the k8s form of socket-proxy-traefik):
+read-only Roles in the two namespaces — services, endpointslices, the
+traefik.io objects; secrets in this (core) namespace only, never the apps
+one. Nothing cluster-scoped, no nodes (the Ingress / Gateway providers are
+off). */ -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: traefik
+  namespace: {{ .Release.Namespace }}
+automountServiceAccountToken: false
+{{- range $ns := list .Release.Namespace .Values.appsNamespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: traefik
+  namespace: {{ $ns }}
+rules:
+  - apiGroups: [""]
+    resources: {{ if eq $ns $.Release.Namespace }}["services", "secrets"]{{ else }}["services"]{{ end }}
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["traefik.io"]
+    resources: ["ingressroutes", "ingressroutetcps", "ingressrouteudps", "middlewares", "middlewaretcps", "serverstransports", "serverstransporttcps", "tlsoptions", "tlsstores", "traefikservices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: traefik
+  namespace: {{ $ns }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: traefik
+subjects:
+  - kind: ServiceAccount
+    name: traefik
+    namespace: {{ $.Release.Namespace }}
+{{- end }}

@@ -1,0 +1,98 @@
+{{- /* wg (compose: wg, profile wg → wg.enabled), K7: one Deployment,
+WG_ADDR_MODE=pod (every role on the pod's one address, isolated by
+netpol-wg-edge.yaml instead of networks), uid 10006 + 10007, no capability,
+the people key as a Secret file, vpn-doc read-only, no hub-data. */ -}}
+{{- if .Values.wg.enabled }}
+{{- $s := dict
+  "name" "wg" "uid" .Values.uids.wg "gid" .Values.uids.wg "groups" (list .Values.uids.vpnDoc)
+  "memory" "128Mi" "nets" (list "portcullis-vpn" "portcullis-vpn-edge" "wg-egress" "portcullis-metrics-wg") "egress" true
+  "extraLabels" (dict "portcullis.io/ingress" "bound")
+  "hashes" (list "secrets-wg")
+  "health" (dict "test" (list "/wg" "healthcheck") "interval" 10 "timeout" 5 "retries" 3 "startPeriod" 15)
+  "ports" (concat (list (dict "name" "people" "port" (int .Values.wg.people.port) "protocol" "UDP") (dict "name" "metrics" "port" 9100)) (include "portcullis.wgEdgePorts" . | fromYamlArray))
+  "env" (list
+    (dict "name" "WG_POD_IP" "valueFrom" (dict "fieldRef" (dict "fieldPath" "status.podIP")))
+    (dict "name" "WG_ADDR_MODE" "value" "pod")
+    (dict "name" "WG_VPN_FILE" "value" "/vpn-doc/vpn.json")
+    (dict "name" "WG_STATUS_FILE" "value" "/data/status.json")
+    (dict "name" "WG_PEOPLE_KEY" "value" "/run/portcullis/wg/people.key")
+    (dict "name" "WG_PEOPLE" "value" (.Values.wg.builtin | toString))
+    (dict "name" "WG_PORT" "value" (.Values.wg.people.port | toString))
+    (dict "name" "WG_SUBNET" "value" .Values.wg.subnet)
+    (dict "name" "WG_VPN_ADDR" "value" "$(WG_POD_IP)")
+    (dict "name" "WG_EDGE_ADDR" "value" "$(WG_POD_IP)")
+    (dict "name" "WG_CORE_SUBNETS" "value" (printf "%s %s" .Values.vpn.coreSubnets .Values.vpn.reservedPools | trim))
+    (dict "name" "WG_TRAEFIK" "value" (printf "%s:8444" (required "traefikVPNServiceIP is required" .Values.traefikVPNServiceIP)))
+    (dict "name" "WG_DNS_UPSTREAM" "value" .Values.wg.dnsUpstream)
+    (dict "name" "WG_DOMAIN" "value" (include "portcullis.domain" .))
+    (dict "name" "WG_MODE" "value" .Values.vpn.mode)
+    (dict "name" "WG_METRICS" "value" "$(WG_POD_IP):9100")
+    (dict "name" "WG_EDGE_MAX_PER_PROVIDER" "value" (.Values.wg.edge.maxPerProvider | toString))
+    (dict "name" "WG_EDGE_MAX_PER_USER" "value" (.Values.wg.edge.maxPerUser | toString))
+    (dict "name" "WG_EDGE_MAX_PER_CLIENT" "value" (.Values.wg.edge.maxPerClient | toString))
+    (dict "name" "WG_EDGE_PRESSURE_PERCENT" "value" (.Values.wg.edge.pressurePercent | toString))
+    (dict "name" "WG_EDGE_PRESSURE_IDLE" "value" (.Values.wg.edge.pressureIdle | toString)))
+  "mounts" (list
+    (dict "name" "vpn-doc" "mountPath" "/vpn-doc" "readOnly" true)
+    (dict "name" "data" "mountPath" "/data")
+    (dict "name" "key" "mountPath" "/run/portcullis/wg" "readOnly" true))
+  "volumes" (list
+    (dict "name" "vpn-doc" "persistentVolumeClaim" (dict "claimName" "vpn-doc" "readOnly" true))
+    (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "wg-data"))
+    (dict "name" "key" "secret" (dict "secretName" "secrets-wg" "defaultMode" 288 "items" (list (dict "key" "people.key" "path" "people.key")))))
+  "fsGroup" .Values.uids.wg
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+---
+{{ include "portcullis.pvc" (list . "wg-data" .Values.uids.wg .Values.uids.hub "2750") }}
+---
+# The gateways' edge (K5/K8): ports 9001–9047 → the wg pod, at a fixed
+# ClusterIP (PORTCULLIS_VPN_EDGE = <this>:<9001+n>). Never a LoadBalancer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wg-edge
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  clusterIP: {{ required "wgEdgeServiceIP is required" .Values.wgEdgeServiceIP }}
+  selector:
+    portcullis.io/component: wg
+  ports:
+    {{- range $n := until 47 }}
+    - name: edge-{{ $n }}
+      port: {{ add 9001 $n }}
+      targetPort: {{ add 9001 $n }}
+    {{- end }}
+---
+# The people role's WireGuard port: the only LoadBalancer port of wg.
+apiVersion: v1
+kind: Service
+metadata:
+  name: wg-people
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    portcullis.io/component: wg
+  ports:
+    - name: people
+      port: {{ .Values.wg.people.port }}
+      targetPort: {{ .Values.wg.people.port }}
+      protocol: UDP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: wg-metrics
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector:
+    portcullis.io/component: wg
+  ports:
+    - name: metrics
+      port: 9100
+      targetPort: 9100
+{{- end }}

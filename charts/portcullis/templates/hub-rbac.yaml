@@ -1,0 +1,26 @@
+{{- /* The Hub's access (K2, contract §6 "On Kubernetes"): one ServiceAccount
+here and exactly one Role in the apps namespace (files/hub-role.yaml, a byte
+copy of the Hub's internal/runtime/kube/testdata/role.yaml, compared in CI);
+nothing in this namespace, nothing cluster-scoped. */ -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: portcullis-hub
+  namespace: {{ .Release.Namespace }}
+automountServiceAccountToken: false
+---
+{{ .Files.Get "files/hub-role.yaml" | replace "namespace: portcullis-apps" (printf "namespace: %s" .Values.appsNamespace) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-hub
+  namespace: {{ .Values.appsNamespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portcullis-hub
+subjects:
+  - kind: ServiceAccount
+    name: portcullis-hub
+    namespace: {{ .Release.Namespace }}

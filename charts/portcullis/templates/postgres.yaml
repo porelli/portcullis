@@ -1,0 +1,38 @@
+{{- /* postgres (compose: postgres). */ -}}
+{{- $s := dict
+  "name" "postgres" "uid" .Values.uids.postgres "gid" .Values.uids.postgres
+  "memory" "1Gi" "nets" (list "portcullis") "egress" true
+  "hashes" (list "portcullis-env")
+  "health" (dict "test" (list "sh" "-c" "pg_isready -U keycloak") "interval" 5 "timeout" 5 "retries" 10 "startPeriod" 60)
+  "ports" (list (dict "name" "postgres" "port" 5432))
+  "env" (list
+    (dict "name" "POSTGRES_DB" "value" "keycloak")
+    (dict "name" "POSTGRES_USER" "value" "keycloak")
+    (dict "name" "POSTGRES_PASSWORD" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "POSTGRES_PASSWORD"))))
+  "mounts" (list
+    (dict "name" "data" "mountPath" "/var/lib/postgresql")
+    (dict "name" "run" "mountPath" "/var/run/postgresql")
+    (dict "name" "tmp" "mountPath" "/tmp")
+    (dict "name" "shm" "mountPath" "/dev/shm"))
+  "volumes" (list
+    (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "postgres-data"))
+    (dict "name" "run" "emptyDir" (dict "medium" "Memory"))
+    (dict "name" "tmp" "emptyDir" (dict "medium" "Memory"))
+    (dict "name" "shm" "emptyDir" (dict "medium" "Memory" "sizeLimit" "128Mi")))
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+---
+{{ include "portcullis.pvc" (list . "postgres-data" .Values.uids.postgres .Values.uids.postgres "0750" "5Gi") }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    portcullis.io/component: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432

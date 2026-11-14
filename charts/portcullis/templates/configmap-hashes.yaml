@@ -1,0 +1,17 @@
+{{- /* What the release was rendered against: each synced ConfigMap / Secret's
+content hash (secrets/kube/applied.json; pods carry the hash of the ones
+they mount as portcullis.io/config-hash). Hashes only, never content. */ -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: portcullis-config-hashes
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+data:
+  {{- range $k, $v := .Values.hashes }}
+  {{ $k }}: {{ $v | quote }}
+  {{- end }}
+  {{- if not .Values.hashes }}
+  none: ""
+  {{- end }}

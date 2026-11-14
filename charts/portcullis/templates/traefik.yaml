@@ -1,0 +1,107 @@
+{{- /* traefik (compose: traefik). Non-root 65532 on :8000 / :8443 behind
+the traefik LoadBalancer (services.yaml); kcinternal :8081 and vpnsecure
+:8444 are container ports of their own. kubernetesCRD provider on the two
+namespaces, no cross-namespace references, no ExternalName; Ingress and
+Gateway providers off. File provider: the synced traefik/dynamic plus the
+chart's traefik-dynamic (K15 core names, strip-forwarded), projected into
+one directory. Every untrusted entrypoint runs strip-client-forwarded@file
+first and deletes header aliases. */ -}}
+{{- $d := include "portcullis.domain" . -}}
+{{- $s := dict
+  "name" "traefik" "uid" .Values.uids.traefik "gid" .Values.uids.traefik
+  "memory" "512Mi" "nets" (list "portcullis" "portcullis-proxy" "portcullis-auth" "portcullis-certs" "portcullis-vpn-edge") "egress" true
+  "extraLabels" (dict "portcullis.io/ingress" "bound")
+  "token" true "serviceAccount" "traefik"
+  "hashes" (list "portcullis-env" "config-traefik-dynamic" "certs" "secrets-certs" "secrets-domains-certs-endpoint")
+  "health" (dict "test" (list "traefik" "healthcheck" "--ping") "interval" 10 "timeout" 5 "retries" 5 "startPeriod" 20)
+  "ports" (list (dict "name" "web" "port" 8000) (dict "name" "websecure" "port" 8443) (dict "name" "kcinternal" "port" 8081)
+    (dict "name" "vpnsecure" "port" 8444) (dict "name" "ping" "port" 8080) (dict "name" "metrics" "port" 8082))
+  "env" (concat (list
+    (dict "name" "TRAEFIK_API_DASHBOARD" "value" "true")
+    (dict "name" "TRAEFIK_API_INSECURE" "value" "false")
+    (dict "name" "TRAEFIK_LOG_LEVEL" "value" "INFO")
+    (dict "name" "TRAEFIK_ACCESSLOG" "value" "true")
+    (dict "name" "TRAEFIK_ACCESSLOG_FORMAT" "value" "json")
+    (dict "name" "TRAEFIK_PING" "value" "true")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_TRAEFIK_ADDRESS" "value" ":8080")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_TRAEFIK_HTTP_ALIASHEADERSSTRATEGY" "value" "delete")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_METRICS_ADDRESS" "value" ":8082")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_METRICS_HTTP_ALIASHEADERSSTRATEGY" "value" "delete")
+    (dict "name" "TRAEFIK_METRICS_PROMETHEUS" "value" "true")
+    (dict "name" "TRAEFIK_METRICS_PROMETHEUS_ENTRYPOINT" "value" "metrics")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_WEB_ADDRESS" "value" ":8000")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_WEB_HTTP_ALIASHEADERSSTRATEGY" "value" "delete")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_ALIASHEADERSSTRATEGY" "value" "delete")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_MIDDLEWARES" "value" "strip-client-forwarded@file")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_WEBSECURE_ASDEFAULT" "value" "true")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_TO" "value" "websecure")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_SCHEME" "value" "https")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_PORT" "value" "443")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_WEBSECURE_ADDRESS" "value" ":8443")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_CERTRESOLVER" "value" "letsencrypt")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_DOMAINS_0_MAIN" "value" $d)
+    (dict "name" "TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_DOMAINS_0_SANS" "value" (printf "*.%s" $d))
+    (dict "name" "TRAEFIK_ENTRYPOINTS_KCINTERNAL_ADDRESS" "value" ":8081")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_KCINTERNAL_HTTP_ALIASHEADERSSTRATEGY" "value" "delete")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_KCINTERNAL_HTTP_MIDDLEWARES" "value" "strip-client-forwarded@file")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_VPNSECURE_ADDRESS" "value" ":8444")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_VPNSECURE_PROXYPROTOCOL_TRUSTEDIPS" "value" (required "podCIDR is required" .Values.podCIDR))
+    (dict "name" "TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_ALIASHEADERSSTRATEGY" "value" "delete")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_MIDDLEWARES" "value" "strip-client-forwarded@file")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_CERTRESOLVER" "value" "letsencrypt")
+    (dict "name" "TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_DOMAINS_0_MAIN" "value" $d)
+    (dict "name" "TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_DOMAINS_0_SANS" "value" (printf "*.%s" $d))
+    (dict "name" "TRAEFIK_ENTRYPOINTS_PARKED_ADDRESS" "value" "127.0.0.1:8441")
+    (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD" "value" "true")
+    (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES" "value" (printf "%s,%s" .Release.Namespace .Values.appsNamespace))
+    (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE" "value" "false")
+    (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWEXTERNALNAMESERVICES" "value" "false")
+    (dict "name" "TRAEFIK_PROVIDERS_FILE_DIRECTORY" "value" "/etc/traefik/dynamic")
+    (dict "name" "TRAEFIK_PROVIDERS_FILE_WATCH" "value" "true")
+    (dict "name" "TRAEFIK_PROVIDERS_HTTP_ENDPOINT" "value" "https://domains:8443/traefik/dynamic")
+    (dict "name" "TRAEFIK_PROVIDERS_HTTP_POLLINTERVAL" "value" "10s")
+    (dict "name" "TRAEFIK_PROVIDERS_HTTP_POLLTIMEOUT" "value" "5s")
+    (dict "name" "TRAEFIK_PROVIDERS_HTTP_MAXRESPONSEBODYSIZE" "value" "4194304")
+    (dict "name" "TRAEFIK_PROVIDERS_HTTP_TLS_CA" "value" "/run/portcullis/domains-endpoint/ca.crt")
+    (dict "name" "TRAEFIK_PROVIDERS_HTTP_TLS_CERT" "value" "/run/portcullis/domains-endpoint/client.crt")
+    (dict "name" "TRAEFIK_PROVIDERS_HTTP_TLS_KEY" "value" "/run/portcullis/domains-endpoint/client.key")
+    (dict "name" "TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL" "value" (.Values.acme.email | default (printf "admin@%s" $d)))
+    (dict "name" "TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_STORAGE" "value" "/acme/acme.json")
+    (dict "name" "TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_CASERVER" "value" .Values.acme.caServer)
+    (dict "name" "TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_DNSCHALLENGE" "value" "true")
+    (dict "name" "TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_DNSCHALLENGE_PROVIDER" "value" .Values.acme.dnsProvider)
+    (dict "name" "TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_DNSCHALLENGE_RESOLVERS" "value" "1.1.1.1:53,8.8.8.8:53")
+    (dict "name" "CF_API_EMAIL" "value" .Values.acme.cfApiEmail)
+    (dict "name" "GCE_PROJECT" "value" .Values.acme.gceProject))
+    (list
+    (dict "name" "CF_DNS_API_TOKEN" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "CLOUDFLARE_API_TOKEN" "optional" true)))
+    (dict "name" "PORKBUN_API_KEY" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "PORKBUN_API_KEY" "optional" true)))
+    (dict "name" "PORKBUN_SECRET_API_KEY" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "PORKBUN_SECRET_API_KEY" "optional" true)))
+    (dict "name" "AWS_ACCESS_KEY_ID" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "AWS_ACCESS_KEY_ID" "optional" true)))
+    (dict "name" "AWS_SECRET_ACCESS_KEY" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "AWS_SECRET_ACCESS_KEY" "optional" true)))
+    (dict "name" "AWS_HOSTED_ZONE_ID" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "AWS_HOSTED_ZONE_ID" "optional" true)))
+    (dict "name" "DO_AUTH_TOKEN" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "DO_AUTH_TOKEN" "optional" true)))
+    (dict "name" "HETZNER_API_KEY" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "HETZNER_API_KEY" "optional" true)))
+    (dict "name" "HETZNER_API_TOKEN" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "HETZNER_API_TOKEN" "optional" true)))))
+  "mounts" (list
+    (dict "name" "dynamic" "mountPath" "/etc/traefik/dynamic" "readOnly" true)
+    (dict "name" "certs" "mountPath" "/certs" "readOnly" true)
+    (dict "name" "acme" "mountPath" "/acme")
+    (dict "name" "domains-endpoint" "mountPath" "/run/portcullis/domains-endpoint" "readOnly" true)
+    (dict "name" "tmp" "mountPath" "/tmp"))
+  "volumes" (list
+    (dict "name" "dynamic" "projected" (dict "sources" (list
+      (dict "configMap" (dict "name" "config-traefik-dynamic"))
+      (dict "configMap" (dict "name" "traefik-dynamic")))))
+    (dict "name" "certs" "projected" (dict "defaultMode" 288 "sources" (list
+      (dict "configMap" (dict "name" "certs"))
+      (dict "secret" (dict "name" "secrets-certs" "optional" true)))))
+    (dict "name" "acme" "persistentVolumeClaim" (dict "claimName" "traefik-acme"))
+    (dict "name" "domains-endpoint" "secret" (dict "secretName" "secrets-domains-certs-endpoint" "defaultMode" 288 "items" (list
+      (dict "key" "ca.crt" "path" "ca.crt") (dict "key" "client.crt" "path" "client.crt") (dict "key" "client.key" "path" "client.key"))))
+    (dict "name" "tmp" "emptyDir" (dict "medium" "Memory")))
+  "fsGroup" .Values.uids.traefik
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+---
+{{ include "portcullis.pvc" (list . "traefik-acme" .Values.uids.traefik .Values.uids.traefik "0700") }}

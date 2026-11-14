@@ -1,0 +1,49 @@
+{{- /* domains (compose: domains). Its API answers connections addressed to
+DOMAINS_API_SUBNET: the pod CIDR here (one pod address), the second layer
+behind the portcullis-domains policy (the Hub and domains only). */ -}}
+{{- $s := dict
+  "name" "domains" "uid" .Values.uids.domains "gid" .Values.uids.domains "groups" (list .Values.uids.hub)
+  "memory" "256Mi" "nets" (list "portcullis-domains" "portcullis-certs" "domains-egress") "egress" true
+  "hashes" (list "secrets-domains" "secrets-domains-certs-endpoint" "domains-env")
+  "health" (dict "test" (list "domains" "healthcheck") "interval" 10 "timeout" 5 "retries" 3)
+  "ports" (list (dict "name" "api" "port" 8080) (dict "name" "certs" "port" 8443))
+  "env" (list
+    (dict "name" "PORTCULLIS_DOMAIN" "value" (include "portcullis.domain" .))
+    (dict "name" "ACME_EMAIL" "value" .Values.acme.email)
+    (dict "name" "ACME_CA_SERVER" "value" .Values.acme.caServer)
+    (dict "name" "DOMAINS_API_SUBNET" "value" (required "podCIDR is required" .Values.podCIDR))
+    (dict "name" "DNS_CAA" "value" (.Values.dns.caa | toString))
+    (dict "name" "DNS_CAA_ISSUER" "value" .Values.dns.caaIssuer)
+    (dict "name" "DNS_CAA_IODEF" "value" .Values.dns.caaIodef)
+    (dict "name" "ALERT_SMTP_FROM" "value" .Values.alerting.smtpFrom))
+  "envFrom" (list (dict "secretRef" (dict "name" "domains-env" "optional" true)))
+  "mounts" (list
+    (dict "name" "data" "mountPath" "/data")
+    (dict "name" "secrets" "mountPath" "/run/portcullis/domains" "readOnly" true))
+  "volumes" (list
+    (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "domains-data"))
+    (dict "name" "secrets" "projected" (dict "defaultMode" 288 "sources" (list
+      (dict "secret" (dict "name" "secrets-domains" "items" (list (dict "key" "api-secret" "path" "api-secret") (dict "key" "age.key" "path" "age.key"))))
+      (dict "secret" (dict "name" "secrets-domains-certs-endpoint" "items" (list
+        (dict "key" "ca.crt" "path" "certs-endpoint/ca.crt") (dict "key" "server.crt" "path" "certs-endpoint/server.crt") (dict "key" "server.key" "path" "certs-endpoint/server.key"))))))))
+  "fsGroup" .Values.uids.domains
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+---
+{{ include "portcullis.pvc" (list . "domains-data" .Values.uids.domains .Values.uids.domains "0750") }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: domains
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    portcullis.io/component: domains
+  ports:
+    - name: api
+      port: 8080
+      targetPort: 8080
+    - name: certs
+      port: 8443
+      targetPort: 8443

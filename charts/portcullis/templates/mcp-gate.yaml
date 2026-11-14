@@ -1,0 +1,46 @@
+{{- /* mcp-gate (compose: mcp-gate). compose's extra_hosts pins become the
+core Services' cluster DNS names (apps can't create Services in this
+namespace, so nothing can shadow them); Keycloak through kcinternal. */ -}}
+{{- $s := dict
+  "name" "mcp-gate" "uid" .Values.uids.mcpGate "gid" .Values.uids.mcpGate "groups" (list .Values.uids.hub)
+  "memory" "1Gi" "nets" (list "portcullis-mcp" "portcullis-proxy") "egress" true
+  "hashes" (list "secrets-mcp-gate")
+  "health" (dict "test" (list "mcp-gate" "healthcheck") "interval" 10 "timeout" 5 "retries" 3)
+  "ports" (list (dict "name" "http" "port" 8080))
+  "env" (list
+    (dict "name" "MCP_GATE_LISTEN" "value" ":8080")
+    (dict "name" "MCP_GATE_HUB_DATA" "value" "/hub-data")
+    (dict "name" "MCP_GATE_DATA" "value" "/data")
+    (dict "name" "MCP_GATE_AGE_KEY_FILE" "value" "/run/portcullis/mcp-gate/age.key")
+    (dict "name" "MCP_GATE_HUB_SECRET_FILE" "value" "/run/portcullis/mcp-gate/hub-secret")
+    (dict "name" "MCP_GATE_JWKS_URL" "value" (printf "%s/realms/portcullis/protocol/openid-connect/certs" (include "portcullis.keycloakInternal" .)))
+    (dict "name" "MCP_GATE_HUB_URL" "value" (printf "http://%s:8890" (include "portcullis.svcHost" (list . "hub"))))
+    (dict "name" "GOMEMLIMIT" "value" "900MiB"))
+  "mounts" (list
+    (dict "name" "hub-data" "mountPath" "/hub-data" "readOnly" true)
+    (dict "name" "data" "mountPath" "/data")
+    (dict "name" "secrets" "mountPath" "/run/portcullis/mcp-gate" "readOnly" true)
+    (dict "name" "tmp" "mountPath" "/tmp"))
+  "volumes" (list
+    (dict "name" "hub-data" "persistentVolumeClaim" (dict "claimName" "hub-data" "readOnly" true))
+    (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "mcp-gate-data"))
+    (dict "name" "secrets" "secret" (dict "secretName" "secrets-mcp-gate" "defaultMode" 288 "items" (list (dict "key" "age.key" "path" "age.key") (dict "key" "hub-secret" "path" "hub-secret"))))
+    (dict "name" "tmp" "emptyDir" (dict "medium" "Memory")))
+  "fsGroup" .Values.uids.mcpGate
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+---
+{{ include "portcullis.pvc" (list . "mcp-gate-data" .Values.uids.mcpGate .Values.uids.hub "0750") }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-gate
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    portcullis.io/component: mcp-gate
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

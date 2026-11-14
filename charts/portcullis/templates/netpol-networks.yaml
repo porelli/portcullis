@@ -1,0 +1,245 @@
+{{- /* The compose network map as NetworkPolicies (k8s_netpol_matrix.py derives
+the expected pairs from docker-compose.yml): per network N, members (pod
+label portcullis.io/net-N) reach each other in both directions — except the
+ingress of the port-bound pods (portcullis.io/ingress: bound: traefik,
+keycloak, grafana, wg), which admit exactly one peer set per port (below).
+The VPN networks are port-bound rules only (netpol-wg-edge.yaml).
+portcullis.io/egress (a member of a non-internal network): the internet, not
+the pod / service networks, link-local or the nodes — the nodes only on
+80 / 443 (the hairpin to auth.<domain>). */ -}}
+{{- $ns := .Release.Namespace -}}
+{{- $nets := list "portcullis" "portcullis-proxy" "portcullis-auth" "monitoring" "alerting" "portcullis-domains" "portcullis-certs" "domains-egress" "portcullis-mcp" "portcullis-sessions" "wg-egress" -}}
+{{- range $n := $nets }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: net-{{ $n }}-ingress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/net-{{ $n }}: "true"
+    matchExpressions:
+      - key: portcullis.io/ingress
+        operator: DoesNotExist
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/net-{{ $n }}: "true"
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: net-{{ $n }}-egress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/net-{{ $n }}: "true"
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              portcullis.io/net-{{ $n }}: "true"
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: egress-internet
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/egress: "true"
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - {{ required "podCIDR is required" .Values.podCIDR }}
+              - {{ required "serviceCIDR is required" .Values.serviceCIDR }}
+              - 169.254.0.0/16
+              {{- range .Values.nodeAddresses }}
+              - {{ . }}/32
+              {{- end }}
+    {{- with .Values.nodeAddresses }}
+    - to:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}/32
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 80
+        - protocol: TCP
+          port: 443
+    {{- end }}
+---
+# The Hub and Traefik only: the kube API (default/kubernetes endpoints).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kube-api
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchExpressions:
+      - key: portcullis.io/component
+        operator: In
+        values: ["hub", "traefik"]
+  policyTypes: ["Egress"]
+  egress:
+    {{- range (required "apiEndpoints is required" .Values.apiEndpoints) }}
+    {{- $p := splitList ":" . }}
+    - to:
+        - ipBlock:
+            cidr: {{ index $p 0 }}/32
+      ports:
+        - protocol: TCP
+          port: {{ index $p 1 }}
+    {{- end }}
+---
+# Traefik → the apps' routed ports, mcp-gate → their companion ports (the
+# apps' own policies admit exactly those, contract §5).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: to-apps
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchExpressions:
+      - key: portcullis.io/component
+        operator: In
+        values: ["traefik", "mcp-gate"]
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.appsNamespace }}
+---
+# Traefik: web / websecure from anywhere (and every pod of both namespaces);
+# kcinternal from the five internal Keycloak clients only; vpnsecure from
+# wg only; metrics from Prometheus only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: traefik-ingress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: traefik
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $ns }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.appsNamespace }}
+      ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 8443
+    - from:
+        - podSelector:
+            matchExpressions:
+              - key: portcullis.io/component
+                operator: In
+                values: ["hub", "enroll", "forward-auth", "forward-auth-ext", "mcp-gate"]
+      ports:
+        - protocol: TCP
+          port: 8081
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: wg
+      ports:
+        - protocol: TCP
+          port: 8444
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: prometheus
+      ports:
+        - protocol: TCP
+          port: 8082
+---
+# Keycloak: 8080 from Traefik only (its proxy headers are trusted from the
+# pod CIDR: this is what makes that safe); 9000 (metrics) from Prometheus.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: keycloak-ingress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: keycloak
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: traefik
+      ports:
+        - protocol: TCP
+          port: 8080
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: prometheus
+      ports:
+        - protocol: TCP
+          port: 9000
+{{- if .Values.monitoring.enabled }}
+---
+# Grafana trusts X-Forwarded-User from the pod CIDR (GF_AUTH_PROXY_WHITELIST):
+# so :3000 admits Traefik only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: grafana-ingress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: grafana
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: traefik
+      ports:
+        - protocol: TCP
+          port: 3000
+{{- end }}

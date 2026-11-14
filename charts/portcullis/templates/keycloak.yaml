@@ -1,0 +1,57 @@
+{{- /* keycloak (compose: keycloak). Port 8080 admits Traefik only (its
+proxy headers trusted from the pod CIDR, the second layer); internal
+clients use keycloak-internal:8081 (Traefik's kcinternal). Not read-only:
+`start` re-augments (as on Docker). */ -}}
+{{- $d := include "portcullis.domain" . -}}
+{{- $s := dict
+  "name" "keycloak" "uid" .Values.uids.keycloak "gid" 0 "readOnly" false
+  "memory" "2Gi" "nets" (list "portcullis" "portcullis-auth" "portcullis-mcp") "egress" true
+  "extraLabels" (dict "portcullis.io/ingress" "bound")
+  "hashes" (list "portcullis-env" "config-keycloak-realm" "config-keycloak-theme" "certs-truststore")
+  "args" (list "start" "--import-realm" "--http-enabled=true" "--http-port=8080"
+    (printf "--hostname=https://auth.%s" $d) "--proxy-headers=xforwarded"
+    (printf "--proxy-trusted-addresses=%s" (required "podCIDR is required" .Values.podCIDR))
+    "--health-enabled=true" "--metrics-enabled=true" "--spi-x509cert-lookup--provider=traefik"
+    "--truststore-paths=/opt/keycloak/conf/truststores/portcullis" "--spi-crl-storage--infinispan--cache-time=60"
+    "--features-disabled=impersonation")
+  "health" (dict "test" (list "sh" "-c" "bash -c '{ printf \"HEAD /health/ready HTTP/1.0\\r\\n\\r\\n\" >&0; grep \"HTTP/1.0 200\"; } 0<>/dev/tcp/localhost/9000'") "interval" 10 "timeout" 5 "retries" 12 "startPeriod" 300)
+  "ports" (list (dict "name" "http" "port" 8080) (dict "name" "management" "port" 9000))
+  "env" (list
+    (dict "name" "KC_DB" "value" "postgres")
+    (dict "name" "KC_DB_URL" "value" "jdbc:postgresql://postgres:5432/keycloak")
+    (dict "name" "KC_DB_USERNAME" "value" "keycloak")
+    (dict "name" "KC_DB_PASSWORD" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "POSTGRES_PASSWORD")))
+    (dict "name" "KC_BOOTSTRAP_ADMIN_USERNAME" "value" .Values.keycloak.admin)
+    (dict "name" "KC_BOOTSTRAP_ADMIN_PASSWORD" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "KEYCLOAK_ADMIN_PASSWORD")))
+    (dict "name" "PORTCULLIS_SIGNIN_URL" "value" (printf "https://people.%s/signin" $d))
+    (dict "name" "PORTCULLIS_PORTAL_URL" "value" (printf "https://%s/" $d)))
+  "mounts" (list
+    (dict "name" "realm" "mountPath" "/opt/keycloak/data/import" "readOnly" true)
+    (dict "name" "theme" "mountPath" "/opt/keycloak/themes/portcullis" "readOnly" true)
+    (dict "name" "truststore" "mountPath" "/opt/keycloak/conf/truststores/portcullis" "readOnly" true)
+    (dict "name" "hub-data" "mountPath" "/hub-data" "readOnly" true)
+    (dict "name" "tmp" "mountPath" "/tmp"))
+  "volumes" (list
+    (dict "name" "realm" "configMap" (dict "name" "config-keycloak-realm" "items" (list (dict "key" "realm-export.json" "path" "realm-export.json"))))
+    (dict "name" "theme" "configMap" (dict "name" "config-keycloak-theme" "items" (.Values.configItems.keycloakTheme | default list)))
+    (dict "name" "truststore" "configMap" (dict "name" "certs-truststore"))
+    (dict "name" "hub-data" "persistentVolumeClaim" (dict "claimName" "hub-data" "readOnly" true))
+    (dict "name" "tmp" "emptyDir" (dict "medium" "Memory")))
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    portcullis.io/component: keycloak
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: management
+      port: 9000
+      targetPort: 9000

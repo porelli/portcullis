@@ -1,0 +1,68 @@
+{{- /* Traefik's Services (K-P26): only 80 → 8000 and 443 → 8443 are on the
+LoadBalancer (ServiceLB publishes every port of one on the node); kcinternal,
+vpnsecure and metrics are ClusterIPs. Fixed ClusterIPs in the static band. */ -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: traefik
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  clusterIP: {{ required "traefikServiceIP is required" .Values.traefikServiceIP }}
+  selector:
+    portcullis.io/component: traefik
+  ports:
+    - name: web
+      port: 80
+      targetPort: 8000
+    - name: websecure
+      port: 443
+      targetPort: 8443
+---
+# Internal Keycloak clients (hub, enroll, forward-auth, forward-auth-ext,
+# mcp-gate): Traefik's kcinternal entrypoint, never Keycloak directly.
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-internal
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector:
+    portcullis.io/component: traefik
+  ports:
+    - name: kcinternal
+      port: 8081
+      targetPort: 8081
+---
+# vpnsecure for wg (WG_TRAEFIK = <this>:8444).
+apiVersion: v1
+kind: Service
+metadata:
+  name: traefik-vpn
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  clusterIP: {{ required "traefikVPNServiceIP is required" .Values.traefikVPNServiceIP }}
+  selector:
+    portcullis.io/component: traefik
+  ports:
+    - name: vpnsecure
+      port: 8444
+      targetPort: 8444
+---
+# Prometheus scrapes traefik:8082 (as on Docker).
+apiVersion: v1
+kind: Service
+metadata:
+  name: traefik-metrics
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector:
+    portcullis.io/component: traefik
+  ports:
+    - name: metrics
+      port: 8082
+      targetPort: 8082

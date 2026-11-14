@@ -1,0 +1,93 @@
+{{- /* wg (K5, K7, contract §16.1): the VPN networks as port-bound rules.
+Each edge port 9001+n admits only apps pods labelled
+portcullis.io/vpn-slot: "<n>"; the people UDP port admits anyone; metrics
+9100 admits Prometheus only; nothing else reaches wg. wg reaches Traefik's
+vpnsecure 8444 only (plus the resolver upstreams: portcullis.io/egress),
+never the kube API. */ -}}
+{{- if .Values.wg.enabled }}
+{{- $ns := .Release.Namespace }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: wg-ingress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: wg
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: UDP
+          port: {{ .Values.wg.people.port }}
+    {{- if .Values.monitoring.enabled }}
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: prometheus
+      ports:
+        - protocol: TCP
+          port: 9100
+    {{- end }}
+    {{- range $n := until 47 }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ $.Values.appsNamespace }}
+          podSelector:
+            matchLabels:
+              portcullis.io/vpn-slot: {{ $n | toString | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ add 9001 $n }}
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: wg-egress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: wg
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: traefik
+      ports:
+        - protocol: TCP
+          port: 8444
+{{- if .Values.monitoring.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus-to-wg
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: prometheus
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: wg
+      ports:
+        - protocol: TCP
+          port: 9100
+{{- end }}
+{{- end }}
