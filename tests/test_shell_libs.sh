@@ -4104,12 +4104,24 @@ expect_eq "_rtk_exec: an empty Vault list on kubernetes is the bare {} with exit
   "$(kt "kube_ctl() { echo '{}' >&2; echo 'command terminated with exit code 2' >&2; return 2; }; out=\$(_rtk_exec vault -- vault list x 2>&1) || echo \"rc \$?\"; printf '%s|' \"\$out\"; vault_no_value \"\$out\" && echo no-value")" "rc 2
 {}|no-value
 rc=0"
-# _rtk_wait_ready waits on _rtk_health (rollout-aware), never on a pod list.
-expect_eq "_rtk_wait_ready: starting, starting, then running → done" \
-  "$(rm -f "$WORK/rwr"; kt "sleep() { :; }; _rtk_health() { echo . >> '$WORK/rwr'; [ \$(wc -l < '$WORK/rwr') -ge 3 ] && echo running || echo starting; }; _rtk_wait_ready keycloak; echo \"after \$(wc -l < '$WORK/rwr' | tr -d ' ')\"")" "after 3
+# _rtk_wait_ready waits on _rtk_rolled_running (rollout-aware, phase
+# Running whatever the probes say), never on a pod list.
+expect_eq "_rtk_wait_ready: not yet, not yet, then rolled out and Running → done" \
+  "$(rm -f "$WORK/rwr"; kt "sleep() { :; }; _rtk_rolled_running() { echo . >> '$WORK/rwr'; [ \$(wc -l < '$WORK/rwr') -ge 3 ]; }; _rtk_wait_ready keycloak; echo \"after \$(wc -l < '$WORK/rwr' | tr -d ' ')\"")" "after 3
 rc=0"
-expect_eq "_rtk_wait_ready: never Running within KUBE_READY_WAIT → fails" \
-  "$(kt "KUBE_READY_WAIT=4; sleep() { :; }; _rtk_health() { echo exited; }; _rtk_wait_ready keycloak")" "rc=1"
+expect_eq "_rtk_wait_ready: never rolled out within KUBE_READY_WAIT → fails" \
+  "$(kt "KUBE_READY_WAIT=4; sleep() { :; }; _rtk_rolled_running() { return 1; }; _rtk_wait_ready keycloak")" "rc=1"
+RR_DEP='{"metadata":{"generation":2},"spec":{"replicas":1},"status":{"observedGeneration":2,"replicas":1,"updatedReplicas":1}}'
+rr() { kt "kube_ctl() { case \"\$*\" in *'get deploy vault'*) printf '%s' '$1' ;; *'get pods'*) printf '%s' '{\"items\":$2}' ;; esac; }; _rtk_rolled_running vault && echo yes || echo no"; }
+expect_eq "_rtk_rolled_running: an unstarted (sealed) Vault pod in phase Running counts (the old wait's semantics)" \
+  "$(rr "$RR_DEP" '[{"status":{"phase":"Running","containerStatuses":[{"ready":false,"started":false}]},"metadata":{"creationTimestamp":"2026-01-01T00:00:00Z"}}]')" "yes
+rc=0"
+expect_eq "_rtk_rolled_running: Pending → not yet" \
+  "$(rr "$RR_DEP" '[{"status":{"phase":"Pending"},"metadata":{"creationTimestamp":"2026-01-01T00:00:00Z"}}]')" "no
+rc=0"
+expect_eq "_rtk_rolled_running: a rollout in progress → not yet, though the old pod runs" \
+  "$(rr '{"metadata":{"generation":3},"spec":{"replicas":1},"status":{"observedGeneration":3,"replicas":2,"updatedReplicas":1}}' '[{"status":{"phase":"Running"},"metadata":{"creationTimestamp":"2026-01-01T00:00:00Z"}}]')" "no
+rc=0"
 case "$(declare -f _rtk_wait_ready _kube_wait_running 2>/dev/null; sed -n '/^_rtk_wait_ready()/,/^}/p;/^_kube_wait_running()/p' "$HERE/../scripts/lib/kube.sh")" in
   *"wait --for"*) t_fail "_rtk_wait_ready / _kube_wait_running use kubectl wait on a pod list" ;; *) t_pass "_rtk_wait_ready / _kube_wait_running: no kubectl wait on a pod list" ;; esac
 k_fixtures

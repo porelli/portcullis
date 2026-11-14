@@ -561,17 +561,29 @@ _rtk_logs() {
   kube_ctl -n "$(kube_ns)" logs "deploy/$svc" -c "$svc" ${opts[@]+"${opts[@]}"}
 }
 
+# _rtk_rolled_running <service> — its Deployment rolled out (as
+# _rtk_health judges it) and its newest non-terminating pod's phase Running,
+# whatever its probes say (an uninitialised Vault never starts).
+_rtk_rolled_running() {
+  local dep pods
+  dep="$(kube_ctl -n "$(kube_ns)" get deploy "$1" -o json 2>/dev/null)" || return 1
+  printf '%s' "$dep" | jq -e '(.status.observedGeneration // 0) >= .metadata.generation
+      and (.status.updatedReplicas // 0) == (.spec.replicas // 1) and (.status.replicas // 0) == (.status.updatedReplicas // 0)' >/dev/null 2>&1 || return 1
+  pods="$(_rtk_pods_json "$1")" || return 1
+  printf '%s' "$pods" | jq -e '[.[] | select(.metadata.deletionTimestamp == null)] | sort_by(.metadata.creationTimestamp)
+      | length > 0 and (last | .status.phase == "Running")' >/dev/null 2>&1
+}
+
 # _rtk_wait_ready <service>... — each service's Deployment rolled out and
 # its newest pod Running (as docker's start / restart: health is the
-# caller's wait_healthy), ≤ KUBE_READY_WAIT (300 s) each. Judged by
-# _rtk_health, never `kubectl wait pod -l`: that fails NotFound when an old
-# ReplicaSet's pod it matched goes away, and passes on that old pod.
+# caller's wait_healthy), ≤ KUBE_READY_WAIT (300 s) each. Never `kubectl
+# wait pod -l`: that fails NotFound when an old ReplicaSet's pod it matched
+# goes away, and passes on that old pod.
 _rtk_wait_ready() {
-  local svc i st
+  local svc i
   for svc in "$@"; do
     for ((i = 0; ; i += 2)); do
-      st="$(_rtk_health "$svc")"
-      case "$st" in healthy|running|unhealthy) break ;; esac
+      _rtk_rolled_running "$svc" && break
       [ "$i" -lt "${KUBE_READY_WAIT:-300}" ] || return 1
       sleep 2
     done
