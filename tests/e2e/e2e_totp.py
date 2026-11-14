@@ -136,7 +136,10 @@ def goto(page: Page, url: str):
 
 
 def interfaces() -> str:
-    out = subprocess.run(["ip", "-o", "link", "show"], capture_output=True, text=True)
+    try:
+        out = subprocess.run(["ip", "-o", "link", "show"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""  # no iproute2: nothing to compare, the wait ends after `quiet`
     return "\n".join(sorted(ln.split(":")[1].strip() for ln in out.stdout.splitlines() if ":" in ln))
 
 
