@@ -73,7 +73,10 @@ EnvVar), envFrom, args, command, ports ([{name, port, protocol}]), mounts
 ([VolumeMount]), volumes ([Volume]), nets ([compose network]), egress
 (bool), token (bool: the ServiceAccount token, Traefik and the Hub only),
 serviceAccount, hostAliases, dnsSearches (dnsConfig.searches), hashes ([object names]), grace (seconds),
-extraLabels (map), fsGroup.
+extraLabels (map), fsGroup, httpReady ({path, port}: a kube-only readiness
+httpGet for an image without a compose healthcheck — distroless —, so helm
+--wait and status see a crash loop; readiness only, never liveness;
+k8s_parity's delta kind kube-probe).
 */}}
 {{- define "portcullis.deployment" -}}
 {{- $root := .root -}}{{- $s := .s -}}
@@ -179,6 +182,15 @@ spec:
               {{- end }}
           {{- with $s.health }}
           {{- include "portcullis.probes" . | nindent 10 }}
+          {{- end }}
+          {{- with $s.httpReady }}
+          readinessProbe:
+            httpGet:
+              path: {{ .path }}
+              port: {{ .port }}
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
           {{- end }}
           {{- with $s.mounts }}
           volumeMounts:

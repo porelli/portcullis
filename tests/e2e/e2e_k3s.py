@@ -23,11 +23,11 @@ Scenarios:
             alias-k--web-internal + the pods' hostAliases); the host is gated;
             an instance named web doesn't capture the client's bare "web"
             (subdomain alias-k--pods, no Service named web).
-  mcp_companion  the templates repo's gitea with its AI companion on: the
-            companion's URL https://gitea-k.<d>/mcp (the Hub's route on the
-            app's own host to mcp-gate@file) serves the gate's RFC 9728
+  mcp_companion  the CI template mcp-echo with its AI companion on: the
+            companion's URL https://mcp-echo-k.<d>/mcp (the Hub's route on
+            the app's own host to mcp-gate@file) serves the gate's RFC 9728
             document and its 401 through Traefik; the gate alias Service
-            portcullis-mcp-gitea-k--gitea exists.
+            portcullis-mcp-mcp-echo-k--echo exists.
 
 Environment: HUB_API, E2E_HUB_SECRET (never printed, never on argv),
 E2E_DOMAIN, E2E_FOLDER (/srv/e2e-k3s), E2E_ARTIFACTS. Stdlib + kubectl.
@@ -53,7 +53,7 @@ FOLDER = os.environ.get("E2E_FOLDER", "/srv/e2e-k3s")
 ART = os.environ.get("E2E_ARTIFACTS", "e2e-artifacts")
 APPS = "portcullis-apps"
 EDGE = "portcullis-edge"
-ECHO, ECHO_R, WRITER, GITEA, ALIAS = "echo-k", "echo-k-r", "folder-writer", "gitea-k", "alias-k"
+ECHO, ECHO_R, WRITER, MCPE, ALIAS = "echo-k", "echo-k-r", "folder-writer", "mcp-echo-k", "alias-k"
 OP_S = 1200
 
 results: list[tuple[str, bool, str]] = []
@@ -219,18 +219,18 @@ def main() -> int:
 
     def mcp_companion():
         needs("runtime")
-        host = f"{GITEA}.{DOMAIN}"
+        host = f"{MCPE}.{DOMAIN}"
         hub_ok("GET", "/api/templates")
         deadline = time.time() + 120
-        while "gitea" not in {x.get("id") for x in hub_get("/api/templates")}:
-            assert time.time() < deadline, "the Hub never loaded the templates repo's gitea"
+        while "mcp-echo" not in {x.get("id") for x in hub_get("/api/templates")}:
+            assert time.time() < deadline, "the Hub never loaded the CI template mcp-echo"
             time.sleep(5)
-        run_op("POST", "/api/instances", {"template": "gitea", "id": GITEA, "label": "Gitea on k3s", "hosts": {"gitea": host}})
-        run_op("POST", "/api/templates/enable", {"id": GITEA}, timeout=1500)
+        run_op("POST", "/api/instances", {"template": "mcp-echo", "id": MCPE, "label": "MCP echo on k3s", "hosts": {"mcp-echo": host}})
+        run_op("POST", "/api/templates/enable", {"id": MCPE}, timeout=600)
         v = hub_ok("PUT", "/api/ai/settings", {"enabled": True, "clients": {"claude_code": {"offered": True, "admin": False}}})
         assert v.get("enabled") is True and v.get("gate_present") is True, v
-        run_op("PUT", f"/api/instances/{GITEA}/ai", {"companions": {"gitea": {"enabled": True, "mode": "read_only"}}}, timeout=900)
-        svc = f"portcullis-mcp-{GITEA}--gitea"
+        run_op("PUT", f"/api/instances/{MCPE}/ai", {"companions": {"echo": {"enabled": True, "mode": "read_only"}}}, timeout=900)
+        svc = f"portcullis-mcp-{MCPE}--echo"
         kubectl("-n", APPS, "get", "service", svc)
         # The companion URL on the app's own host, through Traefik → mcp-gate
         # (the Hub's companion route): its RFC 9728 document and an
@@ -252,7 +252,7 @@ def main() -> int:
                  call)
         assert out.split()[1] == "401" and "resource_metadata=" in out.lower(), f"{call}: {out[:400]}"
         print(f"    {call}: the gate's 401 with resource_metadata; Service {svc}", flush=True)
-    check("mcp_companion: gitea's companion on, its MCP URL on the app's host reaches mcp-gate through Traefik", mcp_companion)
+    check("mcp_companion: mcp-echo's companion on, its MCP URL on the app's host reaches mcp-gate through Traefik", mcp_companion)
 
     failed = [r for r in results if not r[1]]
     print(f"\n{len(results) - len(failed)} passed, {len(failed)} failed", flush=True)

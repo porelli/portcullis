@@ -1,0 +1,44 @@
+# CI-only template for e2e-k3s (mcp_companion): a gated whoami with an
+# identity_headers MCP companion. Not a marketplace template.
+name: MCP echo
+description: Header echo with an MCP companion (CI)
+category: misc
+instances: multi
+auth:
+  method: forward-auth
+  group_access: true
+  access_group: users_mcp-echo
+  admin_group: admin_mcp-echo
+urls:
+  - label: MCP echo
+    url: "https://{{HOST_MCP_ECHO}}"
+
+env:
+  - key: MCP_ECHO_TOKEN
+    description: Caller secret of the echo-mcp companion (the gate sends it)
+    generate: random
+
+# AI support (contract §3.2): one companion, identity headers plus a caller
+# secret; whoami answers every path, which is all the CI scenario needs.
+ai:
+  mcp:
+    - name: echo
+      label: Echo
+      kind: companion
+      service: echo-mcp
+      port: 8080
+      path: /mcp
+      router: mcp-echo
+      public_path: /mcp
+      upstream: official
+      source: https://github.com/traefik/whoami
+      protocol: ["2025-11-25"]
+      modes: [read_only]
+      default_mode: read_only
+      identity:
+        mode: identity_headers
+        caller_secret: {env: MCP_ECHO_TOKEN, header: Authorization, format: "Bearer {secret}"}
+      tools:
+        writes: []
+        confirm: []
+        never: []

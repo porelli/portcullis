@@ -8,6 +8,7 @@ auth.<domain> resolves to the traefik Service (hostAliases, as host-gateway). */
   "args" (list "--alpha-config=/etc/oauth2-proxy/alpha.yaml")
   "hostAliases" (list (dict "ip" (required "traefikServiceIP is required" .Values.traefikServiceIP) "hostnames" (list (printf "auth.%s" $d))))
   "ports" (list (dict "name" "http" "port" 4180))
+  "httpReady" (dict "path" "/ping" "port" 4180)
   "env" (list
     (dict "name" "PORTCULLIS_DOMAIN" "value" $d)
     (dict "name" "FORWARD_AUTH_CLIENT_SECRET" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "FORWARD_AUTH_CLIENT_SECRET")))

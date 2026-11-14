@@ -2,7 +2,11 @@
 the traefik LoadBalancer (services.yaml); kcinternal :8081 and vpnsecure
 :8444 are container ports of their own. kubernetesCRD provider on the edge
 namespace only (it lists every Secret of a watched namespace: never the core
-or apps one); cross-namespace references on (the apps' edge routes name apps Services; portcullis-edge-routes admits only those), no ExternalName; Ingress and
+or apps one); no cross-namespace reference (every route names edge-local
+objects or @file ones); ExternalName on: the apps' backends are the Hub's
+ExternalName Services in the edge namespace, each pinned by
+portcullis-edge-routes to <name>.<apps ns>.svc.cluster.local (its own apps
+Service, never ExternalName itself); Ingress and
 Gateway providers off. File provider: the synced traefik/dynamic plus the
 chart's traefik-dynamic (K15 core names, strip-forwarded), projected into
 one directory. Every untrusted entrypoint runs strip-client-forwarded@file
@@ -56,9 +60,10 @@ redirection has no port field, and a set one fails its env decoding). */ -}}
     (dict "name" "TRAEFIK_ENTRYPOINTS_PARKED_ADDRESS" "value" "127.0.0.1:8441")
     (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD" "value" "true")
     (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES" "value" .Values.edgeNamespace)
-    (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE" "value" "true")
-    (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWEXTERNALNAMESERVICES" "value" "false")
+    (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE" "value" "false")
+    (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWEXTERNALNAMESERVICES" "value" "true")
     (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_DISABLECLUSTERSCOPERESOURCES" "value" "true")
+    (dict "name" "TRAEFIK_PROVIDERS_KUBERNETESCRD_SAFENAMING" "value" "true")
     (dict "name" "TRAEFIK_PROVIDERS_FILE_DIRECTORY" "value" "/etc/traefik/dynamic")
     (dict "name" "TRAEFIK_PROVIDERS_FILE_WATCH" "value" "true")
     (dict "name" "TRAEFIK_PROVIDERS_HTTP_ENDPOINT" "value" "https://domains:8443/traefik/dynamic")

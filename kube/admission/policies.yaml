@@ -861,6 +861,13 @@ spec:
         apiVersions: ["*"]
         operations: ["CREATE", "UPDATE", "DELETE"]
         resources: ["*"]
+      # The apps' backends as seen from the edge: ExternalName Services
+      # pinned to the instance's own apps Service (Traefik watches only this
+      # namespace and can't read the apps one).
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE"]
+        resources: ["services"]
   variables:
     - name: exempt
       expression: "params.data.cliUsername != '' && request.userInfo.username == params.data.cliUsername"
@@ -896,6 +903,15 @@ spec:
       expression: "request.operation != 'CREATE' && has(oldObject.metadata.labels) && 'portcullis.io/instance' in oldObject.metadata.labels ? oldObject.metadata.labels['portcullis.io/instance'] : ''"
     - name: ownName
       expression: "variables.inst + '--'"
+    # <instance>--<service>: the part after the instance's own prefix is one
+    # DNS label without "--" (instance ids may hold "--": instance a may
+    # never name a--b--web, instance a--b's).
+    - name: ownSvc
+      expression: >-
+        !variables.del && object.kind == 'Service' && variables.inst != ''
+        && object.metadata.name.startsWith(variables.ownName)
+        && object.metadata.name.substring(size(variables.ownName)).matches('^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
+        && !object.metadata.name.substring(size(variables.ownName)).contains('--')
   validations:
     # The CLI's probe (kube_admission_probe): an object annotated with
     # exactly this binding's params generation is refused, naming it — the
@@ -904,8 +920,8 @@ spec:
         variables.del || !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
         || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
       messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
-    - expression: "variables.exempt || variables.del || object.kind in ['IngressRoute', 'Middleware']"
-      messageExpression: "object.kind + ' is refused in portcullis-edge (only IngressRoute and Middleware)'"
+    - expression: "variables.exempt || variables.del || object.kind in ['IngressRoute', 'Middleware', 'Service']"
+      messageExpression: "object.kind + ' is refused in portcullis-edge (only IngressRoute, Middleware and the apps'' ExternalName Services)'"
     - expression: >-
         variables.exempt || variables.del || (variables.owner == 'hub'
           && 'portcullis.io/instance' in object.metadata.labels && object.metadata.labels['portcullis.io/instance'] != '')
@@ -962,9 +978,38 @@ spec:
         || object.spec.routes.all(r, r.services.all(s,
              (has(s.kind) && s.kind == 'TraefikService')
                ? (s.name in variables.coreServices && !has(s.namespace))
-               : ((!has(s.kind) || s.kind == 'Service') && !s.name.contains('@')
-                  && has(s.namespace) && s.namespace == variables.apps)))
-      message: "a service must be a Service of the apps namespace (namespace set) or a K15 core service (group-gate@file, forward-auth-ext@file, mcp-gate@file)"
+               : ((!has(s.kind) || s.kind == 'Service') && !has(s.namespace)
+                  && s.name.startsWith(variables.ownName)
+                  && s.name.substring(size(variables.ownName)).matches('^[a-z0-9]([a-z0-9-]*[a-z0-9])?$')
+                  && !s.name.substring(size(variables.ownName)).contains('--'))))
+      message: "a service must be this instance's own edge Service (<instance>--<service>, no namespace) or a K15 core service (group-gate@file, forward-auth-ext@file, mcp-gate@file)"
+    # The apps' backends: exactly an ExternalName Service named
+    # <instance>--<service> after its own instance label, pointing at that
+    # name in the apps namespace (its ClusterIP Service there; apps Services
+    # are never ExternalName, so the name can't chain on), no selector, no
+    # address of its own, the routes' TCP ports named tcp-<port>.
+    - expression: >-
+        variables.exempt || variables.del || object.kind != 'Service'
+        || (has(object.spec.type) && object.spec.type == 'ExternalName'
+            && (!has(object.spec.selector) || size(object.spec.selector) == 0)
+            && (!has(object.spec.clusterIP) || object.spec.clusterIP == '')
+            && (!has(object.spec.clusterIPs) || size(object.spec.clusterIPs) == 0)
+            && (!has(object.spec.externalIPs) || size(object.spec.externalIPs) == 0)
+            && !has(object.spec.loadBalancerIP) && !has(object.spec.loadBalancerClass)
+            && (!has(object.spec.loadBalancerSourceRanges) || size(object.spec.loadBalancerSourceRanges) == 0))
+      message: "a Service in portcullis-edge must be type ExternalName with no selector, cluster IP, external IPs or load balancer"
+    - expression: >-
+        variables.exempt || variables.del || object.kind != 'Service'
+        || (variables.ownSvc && has(object.spec.externalName)
+            && object.spec.externalName == object.metadata.name + '.' + variables.apps + '.svc.cluster.local')
+      messageExpression: "'a Service in portcullis-edge must be named <instance>--<service> after its own portcullis.io/instance label and point at exactly <its name>.' + variables.apps + '.svc.cluster.local'"
+    - expression: >-
+        variables.exempt || variables.del || object.kind != 'Service'
+        || (has(object.spec.ports) && size(object.spec.ports) >= 1 && size(object.spec.ports) <= 16 && object.spec.ports.all(p,
+              has(p.name) && p.name == 'tcp-' + string(p.port)
+              && (!has(p.protocol) || p.protocol == 'TCP') && !has(p.nodePort) && !has(p.appProtocol)
+              && (!has(p.targetPort) || (type(p.targetPort) == int && p.targetPort == p.port))))
+      message: "an edge Service's ports: 1 to 16, each {name: tcp-<port>, port, protocol: TCP}, no nodePort / appProtocol, targetPort = port"
     - expression: >-
         variables.exempt || variables.del || object.kind != 'IngressRoute'
         || object.spec.routes.all(r, !has(r.middlewares) || r.middlewares.all(m,

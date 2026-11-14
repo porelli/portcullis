@@ -187,8 +187,13 @@ def check_services(comp, docs):
                     F.add(f"{name}: startupProbe {sp} != start_period {hc['start_period']} (want failureThreshold {fth})")
             elif sp:
                 F.add(f"{name}: a startupProbe without a compose start_period")
-        elif any(c.get(p) for p in ("readinessProbe", "livenessProbe", "startupProbe")):
-            F.add(f"{name}: probes without a compose healthcheck")
+        elif c.get("livenessProbe") or c.get("startupProbe"):
+            F.add(f"{name}: liveness / startup probes without a compose healthcheck")
+        elif c.get("readinessProbe"):
+            rp = c["readinessProbe"]
+            hg = rp.get("httpGet") or {}
+            if "exec" in rp or not hg or not delta("kube-probe", name, f"{hg.get('path')}:{hg.get('port')}"):
+                F.add(f"{name}: a readinessProbe without a compose healthcheck (only a reviewed kube-probe httpGet)")
         # networks → labels
         nets = svc.get("networks") or ["default"]
         nets = set(nets if isinstance(nets, list) else nets.keys()) - K.ABSENT_NETS

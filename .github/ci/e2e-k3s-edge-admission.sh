@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # e2e-k3s "portcullis-edge admission" (controller ruling, option (a)): the
-# Hub writes the apps' IngressRoutes / Middlewares into portcullis-edge, held
-# by RBAC (its edge Role: IngressRoute + Middleware only) and the
+# Hub writes the apps' IngressRoutes / Middlewares and their backends
+# (ExternalName Services pinned to <name>.<apps ns>.svc.cluster.local) into
+# portcullis-edge, held by RBAC (its edge Role: IngressRoute, Middleware,
+# Service) and the
 # portcullis-edge-routes policy (kube/admission/policies.yaml). Every case
 # runs as the Hub's ServiceAccount (`kubectl --as`, server dry-run unless it
 # needs a live object); each refusal must come from a binding
@@ -45,12 +47,12 @@ forbidden() {
 
 # ir <jq patch> — an IngressRoute the Hub renders, patched.
 ir() {
-  jq -n --arg apps "$APPS" '{apiVersion: "traefik.io/v1alpha1", kind: "IngressRoute",
+  jq -n '{apiVersion: "traefik.io/v1alpha1", kind: "IngressRoute",
     metadata: {name: "e2e-app", labels: {"portcullis.io/owner": "hub", "portcullis.io/instance": "e2e"}},
     spec: {entryPoints: ["websecure"],
       routes: [{match: "Host(`e2e.example.org`)", kind: "Rule",
         middlewares: [{name: "client-headers@file"}, {name: "portcullis-auth@file"}, {name: "portcullis-groups@file"}, {name: "e2e--strip"}],
-        services: [{name: "e2e-app", namespace: $apps, port: 80}]}],
+        services: [{name: "e2e--web", port: 80}]}],
       tls: {certResolver: "letsencrypt", options: {name: "authaware@file"}}}}' | jq "$1"
 }
 # mw <spec json> [labels json] — a Middleware.
@@ -62,7 +64,8 @@ mw() {
 C=(create --dry-run=server -f -)
 
 # ── controls: the Hub's shapes are admitted ──
-ir . | admitted "an app IngressRoute (apps Service, @file + own middlewares, authaware)" "${C[@]}"
+ir . | admitted "an app IngressRoute (its own edge Service, @file + own middlewares, authaware)" "${C[@]}"
+ir '.spec.routes[0].services[0].kind = "Service"' | admitted "its own edge Service, kind Service (the Hub's ref)" "${C[@]}"
 ir '.spec.entryPoints = ["websecure", "vpnsecure"]' | admitted "entryPoints websecure, vpnsecure" "${C[@]}"
 ir '.spec.routes[0].match = "Host(`a.example.org`) || Host(`b.example.org`) && (PathPrefix(`/x`) || Path(`/y`))" | .spec.routes[0].priority = 1000' \
   | admitted "two hosts, paths, priority at maxAppPriority" "${C[@]}"
@@ -117,10 +120,12 @@ for h in $RES; do
   ir ".spec.routes[0].match = \"Host(\`$h\`) && PathPrefix(\`/x\`)\"" | refused "a route on the reserved host $h" "${C[@]}"
 done
 ir '.spec.entryPoints = ["websecure", "parked"]' | refused "entrypoint parked" "${C[@]}"
-for sns in "$NS" portcullis-storage kube-system "$EDGE"; do
+for sns in "$EDGE" "$APPS" "$NS" portcullis-storage kube-system; do
   ir ".spec.routes[0].services[0].namespace = \"$sns\"" | refused "a Service in $sns" "${C[@]}"
 done
-ir 'del(.spec.routes[0].services[0].namespace)' | refused "a Service without a namespace" "${C[@]}"
+for sname in other--web e2e-app e2e--b--web e2e-- keycloak; do
+  ir ".spec.routes[0].services[0].name = \"$sname\"" | refused "a route to the edge Service $sname (not instance e2e's own)" "${C[@]}"
+done
 ir '.spec.routes[0].services = [{name: "core-hub-8888@file", kind: "TraefikService"}]' | refused "a core router backend (core-hub-8888@file)" "${C[@]}"
 ir '.spec.routes[0].services = [{name: "api@internal", kind: "TraefikService"}]' | refused "api@internal" "${C[@]}"
 ir '.spec.routes[0].match = "Host(`e2e.example.org`) && Path(`/mcp`)" | .spec.routes[0].services = [{name: "mcp-gate@file", kind: "TraefikService"}]' \
@@ -160,15 +165,68 @@ mw '{"chain": {"middlewares": [{"name": "hub-proxy-secret"}]}}' | refused "a cha
 mw '{"chain": {"middlewares": [{"name": "x", "namespace": "portcullis-apps"}]}}' | refused "a chain into the apps namespace" "${C[@]}"
 mw '{"chain": {"middlewares": [{"name": "nope@file"}]}}' | refused "a chain with an unlisted @file" "${C[@]}"
 
-# ── RBAC: only IngressRoute + Middleware ──
+# ── the apps' backends: the Hub's ExternalName Services, pinned ──
+# As the Hub with system:masters (RBAC out of the way): the policy alone.
+# esvc <jq patch> — the shape the Hub emits for instance e2e's service web.
+esvc() {
+  jq -n --arg apps "$APPS" '{apiVersion: "v1", kind: "Service",
+    metadata: {name: "e2e--web", labels: {"portcullis.io/owner": "hub", "portcullis.io/instance": "e2e"}},
+    spec: {type: "ExternalName", externalName: ("e2e--web." + $apps + ".svc.cluster.local"),
+      ports: [{name: "tcp-80", port: 80, protocol: "TCP"}]}}' | jq "$1"
+}
+KM=(--as-group=system:masters create --dry-run=server -f -)
+esvc . | admitted "the pinned ExternalName Service (e2e--web → e2e--web.$APPS.svc.cluster.local)" "${KM[@]}"
+esvc '.spec.ports += [{name: "tcp-8443", port: 8443, protocol: "TCP"}]' | admitted "two route ports" "${KM[@]}"
+esvc 'del(.spec.ports)' | refused "no ports" "${KM[@]}"
+esvc '.spec.ports[0].name = "http"' | refused "a port not named tcp-<port>" "${KM[@]}"
+esvc '.spec.ports[0].name = "tcp-81"' | refused "a port named for another port" "${KM[@]}"
+esvc ".metadata.name = \"other--web\" | .spec.externalName = \"other--web.$APPS.svc.cluster.local\"" | refused "another instance's name" "${KM[@]}"
+esvc '.spec.externalName = "keycloak.portcullis.svc.cluster.local"' | refused "a core service's name" "${KM[@]}"
+esvc ".spec.externalName = \"e2e--other.$APPS.svc.cluster.local\"" | refused "another of its own names than the Service's" "${KM[@]}"
+esvc '.spec.externalName = "example.org"' | refused "an external FQDN" "${KM[@]}"
+esvc '.spec.externalName = "10.43.0.20"' | refused "an IP address" "${KM[@]}"
+esvc ".spec.externalName = \"e2e--web.$APPS.svc.cluster.local.\"" | refused "the name with a trailing dot" "${KM[@]}"
+esvc ".spec.externalName = \"e2e--web.$APPS\"" | refused "a short name (search-domain dependent)" "${KM[@]}"
+esvc '.metadata.labels["portcullis.io/instance"] = "e2f"' | refused "a label / name mismatch (instance e2f, name e2e--web)" "${KM[@]}"
+esvc ".metadata.labels[\"portcullis.io/instance\"] = \"e2e--b\" | .metadata.name = \"e2e--b--web\" | .spec.externalName = \"e2e--b--web.$APPS.svc.cluster.local\"" \
+  | admitted "instance e2e--b's own e2e--b--web" "${KM[@]}"
+esvc ".metadata.name = \"e2e--b--web\" | .spec.externalName = \"e2e--b--web.$APPS.svc.cluster.local\"" | refused "instance e2e naming e2e--b--web (instance e2e--b's)" "${KM[@]}"
+esvc 'del(.metadata.labels["portcullis.io/instance"])' | refused "no instance label" "${KM[@]}"
+esvc '.metadata.labels["portcullis.io/owner"] = "core"' | refused "owner=core" "${KM[@]}"
+esvc 'del(.spec.externalName) | .spec.type = "ClusterIP" | .spec.selector = {"portcullis.io/instance": "e2e"}' | refused "a ClusterIP Service with a selector" "${KM[@]}"
+esvc 'del(.spec.externalName) | .spec.type = "ClusterIP" | .spec.clusterIP = "None"' | refused "a headless Service" "${KM[@]}"
+esvc '.spec.selector = {"portcullis.io/instance": "e2e"}' | refused "an ExternalName with a selector" "${KM[@]}"
+esvc '.spec.externalIPs = ["198.51.100.1"]' | refused "externalIPs" "${KM[@]}"
+esvc '.spec.ports[0].targetPort = 8080' | refused "a targetPort other than its port" "${KM[@]}"
+esvc '.spec.ports[0].appProtocol = "https"' | refused "an appProtocol" "${KM[@]}"
+esvc '.spec.ports[0].protocol = "UDP"' | refused "a UDP port" "${KM[@]}"
+esvc '.spec.ports[0].nodePort = 30080' | refused "a nodePort" "${KM[@]}"
+esvc '.spec.loadBalancerSourceRanges = ["0.0.0.0/0"]' | refused "a loadBalancer field" "${KM[@]}"
+# Live objects: an owner=core Service here (the CLI's, exempt; never
+# ExternalName) the Hub may neither change nor delete, and the Hub's own one
+# it may delete but never relabel.
+jq -n '{apiVersion: "v1", kind: "Service", metadata: {name: "e2e-core", labels: {"portcullis.io/owner": "core"}},
+  spec: {type: "ClusterIP", ports: [{name: "tcp-80", port: 80}]}}' | K -n "$EDGE" create -f - >/dev/null
+esvc . | KH -n "$EDGE" --as-group=system:masters create -f - >/dev/null || fail "the Hub's ExternalName Service couldn't be created"
+trap 'rm -rf "$CNT"; K -n "$EDGE" delete service e2e-core e2e--web --ignore-not-found --wait=false >/dev/null 2>&1 || true' EXIT
+refused "deleting an owner=core Service" --as-group=system:masters delete service e2e-core --dry-run=server
+refused "relabelling an owner=core Service to owner=hub" --as-group=system:masters label service e2e-core portcullis.io/owner=hub portcullis.io/instance=e2e --overwrite --dry-run=server
+refused "relabelling its Service to another instance" --as-group=system:masters label service e2e--web portcullis.io/instance=e2f --overwrite --dry-run=server
+refused "relabelling its Service owner=core" --as-group=system:masters label service e2e--web portcullis.io/owner=core --overwrite --dry-run=server
+refused "repointing its Service at a core name" --as-group=system:masters patch service e2e--web --type=merge -p '{"spec":{"externalName":"keycloak.portcullis.svc.cluster.local"}}' --dry-run=server
+refused "adding a selector to its Service" --as-group=system:masters patch service e2e--web --type=merge -p '{"spec":{"selector":{"portcullis.io/instance":"e2e"}}}' --dry-run=server
+admitted "deleting its own Service" --as-group=system:masters delete service e2e--web --dry-run=server
+
+# ── RBAC: only IngressRoute + Middleware + Service ──
 jq -n '{apiVersion: "traefik.io/v1alpha1", kind: "TLSOption", metadata: {name: "e2e", labels: {"portcullis.io/owner": "hub"}}, spec: {minVersion: "VersionTLS10"}}' \
   | forbidden "a TLSOption" "${C[@]}"
 jq -n '{apiVersion: "traefik.io/v1alpha1", kind: "TraefikService", metadata: {name: "e2e", labels: {"portcullis.io/owner": "hub"}}, spec: {weighted: {services: [{name: "api@internal"}]}}}' \
   | forbidden "a TraefikService" "${C[@]}"
-for what in "get secrets" "list secrets" "create secrets" "get configmaps" "create configmaps" "create services"; do
+for what in "get secrets" "list secrets" "create secrets" "get configmaps" "create configmaps" "create endpointslices.discovery.k8s.io"; do
   # shellcheck disable=SC2086  # verb + resource
   [ "$(KH -n "$EDGE" auth can-i $what 2>/dev/null || true)" = no ] || fail "the Hub can $what in $EDGE"
   count ref
 done
 [ "$(KH -n "$APPS" auth can-i create ingressroutes.traefik.io 2>/dev/null || true)" = no ] || fail "the Hub can still create IngressRoutes in $APPS"
+[ "$(KH -n "$EDGE" auth can-i create services 2>/dev/null || true)" = yes ] || fail "the Hub can't create its ExternalName Services in $EDGE (its edge Role: services)"
 echo "PASS: portcullis-edge admission: $(wc -l < "$CNT/ok" | tr -d " ") Hub shapes admitted, $(wc -l < "$CNT/ref" | tr -d " ") refusals (each by portcullis-edge-guard-routes or RBAC)"

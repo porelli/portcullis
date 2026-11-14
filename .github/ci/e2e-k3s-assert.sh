@@ -152,6 +152,8 @@ denied pods "$(printf '%s' "$POD" | sed 's/"portcullis.io\/instance":"e2e"/"port
 pass "the guard refuses a hostPath outside the roots, a NodePort, a foreign helper image and vpn-slot 47, each by its binding; pods/exec is create only"
 # The apps' Traefik objects live in portcullis-edge: every refusal there.
 bash .github/ci/e2e-k3s-edge-admission.sh ci
+# The Hub's route shape routes: edge ExternalName → the app pod.
+bash .github/ci/e2e-k3s-edge-route.sh ci
 # MCP on Kubernetes: only core's Host(mcp.<domain>) route to mcp-gate (no
 # Hub MCP routes): through Traefik it answers the gate's own refusal.
 D="$(grep '^PORTCULLIS_DOMAIN=' .env | cut -d= -f2-)"

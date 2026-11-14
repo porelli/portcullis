@@ -137,10 +137,23 @@ def main():
     for r in hub_roles:
         traefik_rules = [x for x in r["rules"] if "traefik.io" in x.get("apiGroups", [])]
         if r["metadata"]["namespace"] == K.EDGE_NS:
-            if [(x["apiGroups"], sorted(x["resources"])) for x in r["rules"]] != [(["traefik.io"], ["ingressroutes", "middlewares"])]:
-                F.add(f"the Hub's Role in {K.EDGE_NS}: only traefik.io ingressroutes + middlewares, got {r['rules']}")
+            if sorted((tuple(x["apiGroups"]), tuple(sorted(x["resources"]))) for x in r["rules"]) != [(("",), ("services",)), (("traefik.io",), ("ingressroutes", "middlewares"))]:
+                F.add(f"the Hub's Role in {K.EDGE_NS}: only traefik.io ingressroutes + middlewares and services (its pinned ExternalName backends), got {r['rules']}")
         elif traefik_rules:
             F.add(f"the Hub's Role in {r['metadata']['namespace']}: traefik.io (Traefik objects live in {K.EDGE_NS})")
+    # The Hub's edge Services are safe only under portcullis-edge-routes'
+    # Service rule (ExternalName pinned to its own apps name): a Role that
+    # grants services there without that rule fails.
+    pol = next((d for d in yaml.safe_load_all((K.ROOT / "kube" / "admission" / "policies.yaml").read_text())
+                if d and d.get("metadata", {}).get("name") == "portcullis-edge-routes"), None)
+    judges_svc = bool(pol) and any("" in rr.get("apiGroups", []) and "services" in rr.get("resources", [])
+                                   and {"CREATE", "UPDATE", "DELETE"} <= set(rr.get("operations", []))
+                                   for rr in pol["spec"]["matchConstraints"]["resourceRules"])
+    pins = bool(pol) and any("object.spec.externalName == object.metadata.name + '.' + variables.apps + '.svc.cluster.local'" in v["expression"]
+                             for v in pol["spec"]["validations"])
+    for r in hub_roles:
+        if r["metadata"]["namespace"] == K.EDGE_NS and any("services" in x["resources"] for x in r["rules"]) and not (judges_svc and pins):
+            F.add(f"the Hub's Role in {K.EDGE_NS} grants services but portcullis-edge-routes doesn't judge and pin Services (CREATE / UPDATE / DELETE, externalName = <name>.<apps ns>.svc.cluster.local)")
     for r in hub_roles:
         for rule in r["rules"]:
             if "pods/exec" in rule["resources"] and rule["verbs"] != ["create"]:
@@ -361,10 +374,18 @@ def check_edge(docs):
         F.add(f"traefik: kubernetesCRD namespaces {env.get('TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES')!r} (want {K.EDGE_NS} only)")
     if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_DISABLECLUSTERSCOPERESOURCES") != "true":
         F.add("traefik: kubernetesCRD disableClusterScopeResources must be true (its Role is namespaced: a Node list it can't make loads no route)")
-    if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWEXTERNALNAMESERVICES") != "false":
-        F.add("traefik: ExternalName services must stay off")
-    if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE") != "true":
-        F.add("traefik: allowCrossNamespace must be true (the apps' edge routes name apps Services; portcullis-edge-routes bounds them)")
+    if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWEXTERNALNAMESERVICES") != "true":
+        F.add("traefik: allowExternalNameServices must be true (the apps' backends are the Hub's pinned ExternalName Services in the edge namespace)")
+    if env.get("TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE") != "false":
+        F.add("traefik: allowCrossNamespace must be false (every route names edge-local or @file objects)")
+    # Core's own objects are never ExternalName (only the Hub's pinned ones
+    # in the edge namespace, admitted by portcullis-edge-routes), and the
+    # chart puts no Service in the edge namespace at all.
+    for s in K.by_kind(docs, "Service"):
+        if s["spec"].get("type") == "ExternalName":
+            F.add(f"service {s['metadata']['name']}: ExternalName (core's Services never are)")
+        if s["metadata"].get("namespace") == K.EDGE_NS:
+            F.add(f"service {s['metadata']['name']}: in {K.EDGE_NS} (only the Hub's ExternalName Services live there)")
 
 
 if __name__ == "__main__":

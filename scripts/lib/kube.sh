@@ -956,14 +956,14 @@ _kube_params_gc() {
   done < <(printf '%s' "$cms" | jq -r '.items[] | [.metadata.name, (.metadata.annotations["portcullis.io/orphaned-at"] // "")] | @tsv' 2>/dev/null || true)
 }
 
-# kube_edge_rejudge — every owner=hub IngressRoute / Middleware of the edge
+# kube_edge_rejudge — every owner=hub IngressRoute / Middleware / Service of the edge
 # namespace through the live policies (server dry-run replace as the Hub's
 # ServiceAccount, with system:masters only so RBAC lets it reach
 # admission); one they refuse is deleted and named.
 # Any other failure stops the setup.
 kube_edge_rejudge() {
   local kind list n i obj out
-  for kind in ingressroutes.traefik.io middlewares.traefik.io; do
+  for kind in ingressroutes.traefik.io middlewares.traefik.io services; do
     list="$(kube_ctl -n "$KUBE_EDGE_NS" get "$kind" -l portcullis.io/owner=hub -o json)" || fail "can't list the Hub's $kind in $KUBE_EDGE_NS"
     n="$(printf '%s' "$list" | jq '.items | length')"
     for ((i = 0; i < n; i++)); do
@@ -1062,11 +1062,11 @@ _kube_probe_object() {
 # _kube_probe_route <host> <generation|""> — a server dry-run of a
 # Hub-shaped IngressRoute (annotated with the generation when given).
 _kube_probe_route() {
-  H="$1" G="$2" APPS="$(kube_apps_ns)" jq -n '{apiVersion: "traefik.io/v1alpha1", kind: "IngressRoute",
+  H="$1" G="$2" jq -n '{apiVersion: "traefik.io/v1alpha1", kind: "IngressRoute",
       metadata: ({name: "portcullis-admission-probe", labels: {"portcullis.io/owner": "hub", "portcullis.io/instance": "portcullis-admission-probe"}}
         + (if env.G == "" then {} else {annotations: {"portcullis.io/params-generation": env.G}} end)),
       spec: {entryPoints: ["websecure"], routes: [{match: ("Host(`" + env.H + "`)"), kind: "Rule",
-        services: [{name: "portcullis-admission-probe", namespace: env.APPS, port: 80}]}],
+        services: [{name: "portcullis-admission-probe--probe", port: 80}]}],
         tls: {options: {name: "authaware@file"}}}}' \
     | kube_ctl -n "$KUBE_EDGE_NS" --as="$(_kube_hub_sa)" --as-group=system:masters create --dry-run=server -f -
 }

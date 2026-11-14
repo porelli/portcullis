@@ -1,7 +1,7 @@
 # Reviewed differences between charts/portcullis and docker-compose.yml
 # (tests/k8s_parity.py). Every entry needs a reason; one that no longer
 # applies fails the check. Kinds: user, caps, env-missing, env-extra, mount,
-# bind, tmpfs-mode.
+# bind, tmpfs-mode, kube-probe.
 
 user:
   # compose has no `user:` (the image's USER); restricted PSA needs the
@@ -27,9 +27,10 @@ env-missing:
 env-extra:
   - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD, reason: "spec §5: the kubernetesCRD provider"}
   - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES, reason: "spec §5: exactly the core and the apps namespace"}
-  - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE, reason: "spec §5: false"}
-  - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWEXTERNALNAMESERVICES, reason: "spec §5: false"}
+  - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE, reason: "spec §5: false (routes name edge-local or @file objects)"}
+  - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWEXTERNALNAMESERVICES, reason: "true: the apps' backends are the Hub's ExternalName Services in the edge namespace, pinned by portcullis-edge-routes (controller ruling, spec §5 updated)"}
   - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_DISABLECLUSTERSCOPERESOURCES, reason: "no Node informer: Traefik's Role is namespaced (edge only), nothing cluster-scoped; a list it can't make keeps the provider from loading any route"}
+  - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD_SAFENAMING, reason: "generated CRD router / service names that can't collide across namespaces (nothing refers to them: core and Hub routes name CRD objects, never generated names)"}
   - {service: traefik, item: TRAEFIK_ENTRYPOINTS_KCINTERNAL_ADDRESS, reason: "kcinternal :8081 (K15): internal Keycloak clients through Traefik"}
   - {service: traefik, item: TRAEFIK_ENTRYPOINTS_KCINTERNAL_HTTP_ALIASHEADERSSTRATEGY, reason: "kcinternal deletes header aliases like websecure / vpnsecure (K-P10)"}
   - {service: traefik, item: TRAEFIK_ENTRYPOINTS_KCINTERNAL_HTTP_MIDDLEWARES, reason: "strip-client-forwarded@file first on kcinternal too (K-P10)"}
@@ -51,3 +52,10 @@ mount:
 tmpfs-mode:
   - {service: hub, item: /home/hub, reason: "K-P25: emptyDir has no mode (it is 0777); only uid 10001 runs in the pod"}
   - {service: postgres, item: /var/run/postgresql, reason: "K-P25: emptyDir has no mode (it is 0777, compose's 1777 without the sticky bit); only uid 70 runs in the pod"}
+
+kube-probe:
+  # Distroless images without a compose healthcheck: a readiness httpGet
+  # only, so helm --wait and status see a crash loop (Docker's compose has
+  # no probe; Traefik and status see it fail there).
+  - {service: forward-auth, item: "/ping:4180", reason: "oauth2-proxy's own /ping: a crash loop was invisible to helm --wait and status"}
+  - {service: forward-auth-ext, item: "/ping:4180", reason: "oauth2-proxy's own /ping: a crash loop was invisible to helm --wait and status"}

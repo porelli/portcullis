@@ -4022,6 +4022,9 @@ case "$*" in
   "exec client-allowed -- nc"*) exit "${STUB_DIAL_ALLOWED:-0}" ;;
   "exec -i deploy/wg -c wg -- /wg keypair") printf '{"private_key":"%s","public_key":"%s"}\n' "${STUB_WG_PRIV:-cHJpdg==}" "${STUB_WG_PUB:-cHVi}" ;;
   "get pods -l portcullis.io/component=hub -o json"|"get pods -l portcullis.io/component=wg -o json") echo '{"items":[{"status":{"phase":"Running","containerStatuses":[{"ready":true,"started":true}]},"spec":{"containers":[{"readinessProbe":{}}]}}]}' ;;
+  # _rtk_health / _rtk_wait_ready: every Deployment rolled out, its pod Running.
+  "get deploy "*" -o json") echo '{"metadata":{"generation":1},"spec":{"replicas":1},"status":{"observedGeneration":1,"replicas":1,"updatedReplicas":1}}' ;;
+  "get pods -l portcullis.io/component="*" -o json") echo '{"items":[{"status":{"phase":"Running","containerStatuses":[{"ready":true,"started":true}]},"spec":{"containers":[{"readinessProbe":{}}]}}]}' ;;
   "get pods -o json") cat "$K/pods.json" 2>/dev/null || echo '{"items":[]}' ;;
   "get events --field-selector "*) echo '{"items":[{"reason":"BackOff","message":"Back-off restarting failed container"}]}' ;;
   "get deployments -l portcullis.io/person-secrets -o json") echo '{"items":[{"metadata":{"labels":{"portcullis.io/instance":"samba"}}}]}' ;;

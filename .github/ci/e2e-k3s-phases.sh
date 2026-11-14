@@ -6,9 +6,8 @@
 #            chain's sha256; then down and wiped
 #   init     .env for kubernetes (context ci, K1 local images), the CI TLS
 #            certificate, ./portcullis init --runtime kubernetes
-#   seed     the Hub's template source (tests/e2e/apps echo + folder-writer +
-#            alias-echo,
-#            the templates repo's gitea) into hub-data, the
+#   seed     the Hub's template source (tests/e2e/apps echo, folder-writer,
+#            alias-echo, mcp-echo) into hub-data, the
 #            fixer's /srv/e2e-k3s, an issued YubiKey certificate's serial
 #   hub      tests/e2e/e2e_k3s.py through a port-forward to the Hub
 #   vpn      vpn init (built-in on), a device handshake through wg-people
@@ -103,9 +102,8 @@ seed)
         securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}},
         volumeMounts: [{name: "d", mountPath: "/data"}]}], volumes: [{name: "d", persistentVolumeClaim: {claimName: "hub-data"}}]}}' | K create -f - >/dev/null
   K -n portcullis wait --for=condition=Ready "pod/$pod" --timeout=180s >/dev/null
-  # The CI templates and the templates repo's gitea (its AI companion).
-  [ -d "$RUNNER_TEMP/templates/gitea" ] || fail "no templates checkout at \$RUNNER_TEMP/templates"
-  tar -cf - -C tests/e2e/apps echo folder-writer alias-echo -C "$RUNNER_TEMP/templates" gitea | K -n portcullis exec -i "$pod" -- sh -c 'mkdir -p /data/repos/ci && tar -C /data/repos/ci -xf - &&
+  # The CI templates (mcp-echo: an AI companion with numeric users).
+  tar -cf - -C tests/e2e/apps echo folder-writer alias-echo mcp-echo | K -n portcullis exec -i "$pod" -- sh -c 'mkdir -p /data/repos/ci && tar -C /data/repos/ci -xf - &&
     printf "sources:\n  - name: ci\n    url: \"\"\n    path: /data/repos/ci\n" > /data/state.yaml && chmod 600 /data/state.yaml'
   K -n portcullis delete pod "$pod" --wait=false >/dev/null
   K -n portcullis rollout restart deploy/hub >/dev/null

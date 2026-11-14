@@ -1,0 +1,40 @@
+# CI-only (e2e-k3s mcp_companion): a gated whoami and an MCP companion
+# (identity_headers) the Hub routes on the app's own host through mcp-gate.
+# Both run as numeric non-root users (Kubernetes), whoami on :8080. The
+# companion is never called with a valid token in CI: the scenario checks
+# the gate's RFC 9728 document and its 401 on the app's host.
+services:
+  web:
+    image: docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+    user: "65534:65534"
+    command: ["--port", "8080"]
+    networks: [portcullis-proxy, mcp-trust]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.mcp-echo.rule: Host(`${PORTCULLIS_HOST_MCP_ECHO:-mcp-echo.portcullis.local}`)
+      traefik.http.routers.mcp-echo.entrypoints: websecure
+      traefik.http.routers.mcp-echo.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.mcp-echo.loadbalancer.server.port: "8080"
+  # The companion: whoami again (it answers any path, /mcp included). The
+  # caller secret reaches it as an environment variable, never argv.
+  echo-mcp:
+    image: docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+    user: "65534:65534"
+    command: ["--port", "8080"]
+    environment:
+      MCP_ECHO_TOKEN: ${MCP_ECHO_TOKEN:?MCP_ECHO_TOKEN must be set}
+    # Its trust network only (contract §3.2): while AI support is on the
+    # Hub's override also attaches it to the proxy network (the gate's alias).
+    networks: [mcp-trust]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+networks:
+  portcullis-proxy:
+    external: true
+  mcp-trust:
+    internal: true
