@@ -56,6 +56,7 @@ echo "E2E_HS_API_KEY_FILE=$RUNNER_TEMP/hs-api-key" >> "$GITHUB_ENV"
 T_PUT="$(date -u +%s)"
 KEY="$KEY" jq -n '{secrets: {api_key: {value: env.KEY}}}' | hubc PUT /api/instances/headscale/settings -d @- > /tmp/code
 case "$(cat /tmp/code)" in 200|202) ;; *) echo "FAIL: headscale api_key: $(cat /tmp/code) $(cat /tmp/hub.out)"; exit 1 ;; esac
+T_WIRE="$(date +%s)"
 code=$(hubc PUT /api/instances/headscale/vpn-provider -d '{"wired": true, "refresh": "15s"}')
 case "$code" in 200|202) ;; *) echo "FAIL: wire headscale: $code $(cat /tmp/hub.out)"; exit 1 ;; esac
 # Settle before the setup links are spent (the browser runs next): the
@@ -74,9 +75,26 @@ for i in $(seq 1 80); do
   [ "$i" -eq 80 ] && { echo "FAIL: headscale's map isn't fresh: $(hub GET /api/vpn | jq -c .providers)"; exit 1; }
   sleep 3
 done
-# 60 s, not 20: on main run 43527815385 headscale's gateway exited and
-# restarted on its own ~40 s after a 20 s quiet window (during bob's
-# sign-in). setup_link_signin retries once with a new link if one is hit.
+# The gateway logged in before the quiet window. Its exit about a minute
+# after wiring is expected (templates): the Hub recreates the headscale
+# project, the gateway's first TLS connection to Traefik predates the
+# headscale router (421), containerboot's 60 s boot deadline exits it and
+# Docker restarts it; the next boot logs in. So a die here isn't a failure;
+# only not getting to Running within ~5 min is. The restarts (die events
+# since the wiring, a recreated container included) go to the summary.
+GW=portcullis-headscale-gateway-1
+for i in $(seq 1 100); do
+  st="$(docker exec "$GW" tailscale --socket=/tmp/tailscaled.sock status --json 2>/dev/null | jq -r '.BackendState // empty' 2>/dev/null || true)"
+  [ "$st" = Running ] && [ "$(docker inspect -f '{{.State.Running}}' "$GW" 2>/dev/null)" = true ] && break
+  [ "$i" -eq 100 ] && { echo "FAIL: headscale's gateway isn't logged in after ~5 min (state: ${st:-none})"; docker logs --tail=40 "$GW"; exit 1; }
+  sleep 3
+done
+GW_DIES="$(docker events --since "$T_WIRE" --until "$(date +%s)" --filter container="$GW" --filter event=die --format '{{.Time}}' | wc -l | tr -d ' ')"
+echo "headscale gateway: logged in $(( $(date +%s) - T_WIRE )) s after wiring, ${GW_DIES} restart(s) (one expected: its first boot predates the headscale router)" \
+  | tee -a "$GITHUB_STEP_SUMMARY"
+# Then 60 s of quiet: on main run 43527815385 that gateway restart came
+# ~40 s after a 20 s window (during bob's sign-in). setup_link_signin
+# retries once with a new link if a later change still hits one.
 for i in $(seq 1 100); do
   n="$(docker events --since 60s --until "$(date +%s)" --filter event=start --filter event=connect --format '{{.Type}} {{.Action}} {{.Actor.Attributes.name}}' | wc -l)"
   [ "$n" -eq 0 ] && break
