@@ -37,6 +37,16 @@ refused() {
     || fail "refused, but not by portcullis-edge-guard-routes: $what: $(printf '%s' "$out" | head -c 400)"
   count ref
 }
+# rejected <what> <verb args…> — refused by the edge binding or, for a shape
+# the API server's own validation already forbids (nodePort / loadBalancer
+# fields on an ExternalName), by that validation: both keep it out.
+rejected() {
+  local what="$1" out; shift
+  if out="$(KH -n "$EDGE" "$@" 2>&1)"; then fail "admitted, want refused: $what"; fi
+  printf '%s' "$out" | grep -q "with binding 'portcullis-edge-guard-routes-\|is invalid:" \
+    || fail "refused, but neither by portcullis-edge-guard-routes nor by API validation: $what: $(printf '%s' "$out" | head -c 400)"
+  count ref
+}
 # forbidden <what> <verb args…> — refused by RBAC (the Hub's edge Role).
 forbidden() {
   local what="$1" out; shift
@@ -200,8 +210,8 @@ esvc '.spec.externalIPs = ["198.51.100.1"]' | refused "externalIPs" "${KM[@]}"
 esvc '.spec.ports[0].targetPort = 8080' | refused "a targetPort other than its port" "${KM[@]}"
 esvc '.spec.ports[0].appProtocol = "https"' | refused "an appProtocol" "${KM[@]}"
 esvc '.spec.ports[0].protocol = "UDP"' | refused "a UDP port" "${KM[@]}"
-esvc '.spec.ports[0].nodePort = 30080' | refused "a nodePort" "${KM[@]}"
-esvc '.spec.loadBalancerSourceRanges = ["0.0.0.0/0"]' | refused "a loadBalancer field" "${KM[@]}"
+esvc '.spec.ports[0].nodePort = 30080' | rejected "a nodePort" "${KM[@]}"
+esvc '.spec.loadBalancerSourceRanges = ["0.0.0.0/0"]' | rejected "a loadBalancer field" "${KM[@]}"
 # Live objects: an owner=core Service here (the CLI's, exempt; never
 # ExternalName) the Hub may neither change nor delete, and the Hub's own one
 # it may delete but never relabel.
