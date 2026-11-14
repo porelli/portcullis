@@ -106,7 +106,7 @@
     },
     {
       "alias": "portcullis-signin",
-      "description": "YubiKey certificate, then browser certificate (automatic when the browser presents one of that kind's CA), a passkey, a password, or an authenticator code (only once the user is known); each only while its method is on",
+      "description": "YubiKey certificate, then browser certificate (automatic when presented), a passkey, a password, or an authenticator code after another method; each only while its method is on",
       "providerId": "basic-flow",
       "topLevel": false,
       "builtIn": false,

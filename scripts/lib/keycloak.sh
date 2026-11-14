@@ -47,7 +47,9 @@ KC_REALM_SIGNIN_SETTINGS='{"attributes": {"acr.loa.map": "{}"}, "bruteForceProte
 # realm OTP policy every common app computes (HMAC-SHA1, 6 digits, 30 s),
 # one step of clock drift each way, each code accepted once. Same values as
 # realm-export.json; pushed with the realm PUT on every run, read back
-# (kc_otp_policy_drift) and a difference fails configure.
+# (kc_otp_policy_drift) and a difference fails configure. Keycloak 26.8's
+# realm update applies the OTP policy only when otpPolicyType is in the body
+# and builds the whole policy from the body, so all seven always go together.
 # shellcheck disable=SC2034  # read by the tests
 KC_REALM_OTP_SETTINGS='{"otpPolicyType": "totp", "otpPolicyAlgorithm": "HmacSHA1", "otpPolicyDigits": 6, "otpPolicyPeriod": 30, "otpPolicyLookAheadWindow": 1, "otpPolicyCodeReusable": false, "otpPolicyInitialCounter": 0}'
 # The two required actions behind adding / replacing (CONFIGURE_TOTP, the

@@ -18,7 +18,9 @@ PRE_TOKEN=$(printf '%s' "$KEYCLOAK_ADMIN_PASSWORD" | curl -sf http://127.0.0.1:8
 echo "::add-mask::$PRE_TOKEN"
 # Likewise the OTP policy (8 digits, codes reusable) and a CONFIGURE_TOTP
 # without its max_auth_age: configure puts both back (contract §8.1).
-echo '{"webAuthnPolicyPasswordlessRpEntityName": "Portcullis", "webAuthnPolicyPasswordlessAttestationConveyancePreference": "none", "webAuthnPolicyPasswordlessAuthenticatorAttachment": "cross-platform", "otpPolicyDigits": 8, "otpPolicyCodeReusable": true}' \
+# Keycloak 26.8 applies the OTP policy only when otpPolicyType is in the
+# body (and builds it from the body's otpPolicy* values), so all seven go.
+echo '{"webAuthnPolicyPasswordlessRpEntityName": "Portcullis", "webAuthnPolicyPasswordlessAttestationConveyancePreference": "none", "webAuthnPolicyPasswordlessAuthenticatorAttachment": "cross-platform", "otpPolicyType": "totp", "otpPolicyAlgorithm": "HmacSHA1", "otpPolicyDigits": 8, "otpPolicyPeriod": 30, "otpPolicyLookAheadWindow": 1, "otpPolicyCodeReusable": true, "otpPolicyInitialCounter": 0}' \
   | curl -sf -X PUT -H @<(printf 'Authorization: Bearer %s\n' "$PRE_TOKEN") -H 'Content-Type: application/json' --data-binary @- \
     http://127.0.0.1:8080/admin/realms/portcullis \
   || { echo "FAIL: drifting the passkey policy"; exit 1; }

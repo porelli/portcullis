@@ -133,8 +133,10 @@ jobs:
           # Most Keycloak columns are varchar(255) (an import with a longer
           # value aborts the first start); a flow description also gets
           # keycloak configure's " [sync <sha256>]" marker (72 chars).
-          jq -e '([.. | strings | length] | max) <= 255 and ([.authenticationFlows[].description // "" | length] | max) <= 183' keycloak/realm-export.json >/dev/null \
-            || { echo "FAIL: a realm-export.json value is too long for Keycloak"; exit 1; }
+          long=$(jq -r '[paths(strings) as $p | {k: ($p | map(tostring) | join(".")), n: (getpath($p) | length)}
+              | select(.n > 255 or ((.k | test("^authenticationFlows\\.[0-9]+\\.description$")) and .n > 183))
+              | "\(.k) (\(.n) chars)"] | join(", ")' keycloak/realm-export.json) || long="realm-export.json can't be read"
+          [ -z "$long" ] || { echo "FAIL: a realm-export.json value is too long for Keycloak (255, a flow description 183): $long"; exit 1; }
       - name: CLI help for every command
         run: |
           ./portcullis help
