@@ -215,6 +215,8 @@ status_run() {
     kx="$(kube_status_extra)"
     shadows="$(printf '%s' "$kx" | jq -r '.dns_shadows[] | "service/\(.) \(.)"')"
     [ "$(printf '%s' "$kx" | jq -r '(.netpol == "proven") and (.admission == "ok")')" = true ] || problems=1
+    # A crash-looping or just-restarted Deployment (or an unreadable pod list).
+    [ "$(printf '%s' "$kx" | jq -r '.crashing != null and (.crashing | length) == 0')" = true ] || problems=1
   else
     # A docker error is a problem too (fail closed), shown as one line.
     shadows="$(proxy_dns_shadows)" || shadows="(docker) the containers on portcullis-proxy can't be inspected"
@@ -334,7 +336,7 @@ status_run() {
   [ "$out" = healthy ] && _st_line ok "lldap healthy" || _st_line fail "lldap $out"
   case "$traefik" in healthy|running) _st_line ok "traefik $traefik" ;; *) _st_line fail "traefik $traefik" ;; esac
   domains_status_lines
-  local shadow
+  local shadow cns cdep creason crest
   while read -r shadow; do
     [ -n "$shadow" ] || continue
     case "$shadow" in
@@ -344,6 +346,16 @@ status_run() {
     esac
   done <<< "$shadows"
   [ -z "$mcp_refusing" ] || _st_line fail "mcp-gate: $mcp_refusing"
+  if _rt_is_kube; then
+    if [ "$(printf '%s' "$kx" | jq -r '.crashing == null')" = true ]; then
+      _st_line fail "kubernetes: the pods can't be read (crash-loop check failed closed)"
+    else
+      while IFS=$'\t' read -r cns cdep creason crest; do
+        [ -n "$cdep" ] || continue
+        _st_line fail "kubernetes: $cns/$cdep is crashing ($creason, $crest restarts): kubectl -n $cns logs deploy/$cdep --previous"
+      done < <(printf '%s' "$kx" | jq -r '.crashing[] | [.namespace, .deployment, .reason, (.restarts | tostring)] | @tsv')
+    fi
+  fi
   _st_dns_lines "$dns_json" "$traefik_uri" "$env_uri"
   if declare -F vpn_status_lines >/dev/null; then vpn_status_lines "$vpn_json"; fi
 

@@ -4538,6 +4538,31 @@ expect_eq "restore's LLDAP guard on kubernetes: LLDAP's own count (3 users, 5 fe
   "$(printf '%s\n' "$OUT" | grep -c DOCKER-HELPER):$(printf '%s\n' "$OUT" | tail -n1)" "0:rc=0"
 OUT="$(kt '_restore_kc_federated_count() { echo 5; }; _kube_restore_lldap_count() { echo 0; }; _restore_lldap_guard false; echo "rc=$?"' 2>&1)"
 case "$OUT" in *"LLDAP has no users (0) but the restored Keycloak database has 5 federated users"*"rc=1"*) t_pass "restore's LLDAP guard on kubernetes: an empty LLDAP with federated Keycloak users refuses" ;; *) t_fail "kube lldap guard empty: $OUT" ;; esac
+# status on kubernetes: a Deployment whose pods crash-loop or restarted in
+# the last 10 minutes is a problem; a Job's pod, an old restart and a
+# terminating pod are not; an unreadable pod list is "unknown" (fail closed).
+NOWISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; OLDISO="2020-01-01T00:00:00Z"
+REC="$(date -u -d '-2 min' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-2M +%Y-%m-%dT%H:%M:%SZ)"
+CRASH_CORE='{"items":[
+ {"metadata":{"name":"hub-6ccdd8956b-w4tm4","labels":{"pod-template-hash":"6ccdd8956b"},"ownerReferences":[{"kind":"ReplicaSet","name":"hub-6ccdd8956b"}]},
+  "status":{"containerStatuses":[{"restartCount":4,"state":{"waiting":{"reason":"CrashLoopBackOff"}},"lastState":{"terminated":{"finishedAt":"'"$NOWISO"'"}}}]}},
+ {"metadata":{"name":"lldap-685d98967d-hz4l9","labels":{"pod-template-hash":"685d98967d"},"ownerReferences":[{"kind":"ReplicaSet","name":"lldap-685d98967d"}]},
+  "status":{"containerStatuses":[{"restartCount":1,"state":{"running":{}},"lastState":{"terminated":{"finishedAt":"'"$OLDISO"'"}}}]}},
+ {"metadata":{"name":"oneshot-x","ownerReferences":[{"kind":"Job","name":"oneshot"}]},
+  "status":{"containerStatuses":[{"restartCount":0,"state":{"waiting":{"reason":"Error"}}}]}},
+ {"metadata":{"name":"vault-58c5dcfdf7-old","deletionTimestamp":"'"$NOWISO"'","labels":{"pod-template-hash":"58c5dcfdf7"},"ownerReferences":[{"kind":"ReplicaSet","name":"vault-58c5dcfdf7"}]},
+  "status":{"containerStatuses":[{"restartCount":0,"state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}}]}'
+CRASH_APPS='{"items":[
+ {"metadata":{"name":"echo-k--web-5d9f7c8b6-abcde","labels":{"pod-template-hash":"5d9f7c8b6"},"ownerReferences":[{"kind":"ReplicaSet","name":"echo-k--web-5d9f7c8b6"}]},
+  "status":{"containerStatuses":[{"restartCount":2,"ready":false,"state":{"running":{}},"lastState":{"terminated":{"finishedAt":"'"$REC"'"}}}]}},
+ {"metadata":{"name":"fa--x-6b7c8d9e0-zzzzz","labels":{"pod-template-hash":"6b7c8d9e0"},"ownerReferences":[{"kind":"ReplicaSet","name":"fa--x-6b7c8d9e0"}]},
+  "status":{"containerStatuses":[{"restartCount":3,"ready":true,"state":{"running":{}},"lastState":{"terminated":{"finishedAt":"'"$REC"'"}}}]}}]}'
+printf '%s' "$CRASH_CORE" > "$WORK/crash-core.json"; printf '%s' "$CRASH_APPS" > "$WORK/crash-apps.json"
+cj() { kt "kube_ctl() { case \"\$*\" in *'-n portcullis get pods -o json'*) ${1:-cat '$WORK/crash-core.json'} ;; *'-n portcullis-apps get pods -o json'*) cat '$WORK/crash-apps.json' ;; esac; }; kube_crashing_json"; }
+expect_eq "kube_crashing_json: the crash-looping Hub and an app restarted 2 min ago and not ready; not one ready again, an old restart, a Job's pod or a terminating pod" \
+  "$(cj | head -n1 | jq -c '[.[] | [.namespace, .deployment, .reason]]')" \
+  '[["portcullis","hub","CrashLoopBackOff"],["portcullis-apps","echo-k--web","restarted"]]'
+expect_eq "kube_crashing_json: an unreadable pod list → null (status counts it a problem)" "$(cj 'return 1' | head -n1)" "null"
 # status --json runtime
 OUT="$(kt 'kube_status_json v1.37.2+k3s1')"
 expect_eq "status --json runtime.name = kubernetes, runtime.context set, version, the § 6 rows as checks" \

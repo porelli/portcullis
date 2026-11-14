@@ -720,8 +720,40 @@ kube_vpn_reserved() {
 # kube_status_extra — status --json's kubernetes fields: netpol (the CLI's
 # probe ConfigMap), admission (the six bindings), dns_shadows (an app
 # Service named like a core one), kube_api_public (K8).
+# kube_crashing_json — the Deployments of both namespaces whose live pods
+# crash: a container waiting in CrashLoopBackOff / Error / an image pull
+# backoff, or one that restarted in the last 10 minutes and isn't ready
+# again (a pod that settled after start-up restarts is fine). JSON
+# [{namespace, deployment, pod, reason, restarts}] (a Deployment = its pod's
+# ReplicaSet minus the pod-template hash; Jobs and terminating pods aren't
+# judged), or null when a pod list can't be read (status: a problem).
+kube_crashing_json() {
+  local ns pods all='[]' now
+  now="$(date +%s)"
+  for ns in "$(kube_ns)" "$(kube_apps_ns)"; do
+    pods="$(kube_ctl -n "$ns" get pods -o json 2>/dev/null)" \
+      && printf '%s' "$pods" | jq -e '.items | type == "array"' >/dev/null 2>&1 || { echo null; return 0; }
+    all="$(NS="$ns" NOW="$now" jq -c --argjson acc "$all" '
+      $acc + [.items[] | select(.metadata.deletionTimestamp == null)
+        | (.metadata.ownerReferences // [] | map(select(.kind == "ReplicaSet")) | .[0].name) as $rs
+        | select($rs != null)
+        | (.metadata.labels["pod-template-hash"] // "") as $h
+        | ($rs | if $h != "" and endswith("-" + $h) then .[0:(length - ($h | length) - 1)] else . end) as $dep
+        | .metadata.name as $pod
+        | [(.status.initContainerStatuses // [])[], (.status.containerStatuses // [])[]] as $cs
+        | ([$cs[] | .state.waiting.reason // empty | select(. == "CrashLoopBackOff" or . == "Error" or . == "ImagePullBackOff" or . == "ErrImagePull")] | first) as $wait
+        | ([$cs[] | select((.restartCount // 0) > 0 and .ready != true)
+             | .lastState.terminated.finishedAt // empty | (try fromdateiso8601 catch 0)
+             | select(. > ((env.NOW | tonumber) - 600))] | length > 0) as $recent
+        | select($wait != null or $recent)
+        | {namespace: env.NS, deployment: $dep, pod: $pod, reason: ($wait // "restarted"),
+           restarts: ([$cs[] | .restartCount // 0] | add // 0)}]' <<< "$pods" 2>/dev/null)" || { echo null; return 0; }
+  done
+  printf '%s\n' "$all" | jq -c 'unique_by([.namespace, .deployment])'
+}
+
 kube_status_extra() {
-  local np adm b shadows pub api=false a
+  local np adm b shadows pub api=false a crash
   np="$(kube_ctl -n "$(kube_apps_ns)" get configmap portcullis-netpol-probe -o json 2>/dev/null | jq -r '.data.proven_at // empty' 2>/dev/null || true)"
   adm=ok
   [ -z "$(kube_bindings_missing)" ] || adm=missing
@@ -732,9 +764,10 @@ kube_status_extra() {
   if [ -n "$pub" ]; then
     for a in 6443 10250; do _kube_tcp_open "$pub" "$a" && api=true; done
   fi
-  jq -nc --arg np "$np" --arg adm "$adm" --argjson sh "$shadows" --argjson api "$api" \
+  crash="$(kube_crashing_json)"
+  jq -nc --arg np "$np" --arg adm "$adm" --argjson sh "$shadows" --argjson api "$api" --argjson cr "$crash" \
     '{netpol: (if $np == "" then "unproven" else "proven" end), netpol_proven_at: (if $np == "" then null else $np end),
-      admission: $adm, dns_shadows: $sh, kube_api_public: $api}'
+      admission: $adm, dns_shadows: $sh, kube_api_public: $api, crashing: $cr}'
 }
 
 _rtk_kill() { _rtk_exec "$1" -- kill -s "$2" 1; }
