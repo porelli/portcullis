@@ -158,12 +158,12 @@ def main() -> int:
         rec = run_op("POST", f"/api/instances/{ECHO}/backups", {})
         archive = (rec.get("result") or {}).get("archive")
         assert archive, f"backup without an archive: {e2e_ops.describe(rec)}"
-        run_op("POST", f"/api/instances/{ECHO}/delete", {"confirm": ECHO})
+        run_op("DELETE", f"/api/instances/{ECHO}", {"confirm": ECHO})
         assert not json.loads(kubectl("-n", APPS, "get", "deployments", "-l", f"portcullis.io/instance={ECHO}", "-o", "json"))["items"], \
             "the deleted instance's Deployments are still there"
         rec = run_op("POST", "/api/instances/restore", {"archive": archive, "id": ECHO_R})
         assert (rec.get("result") or {}).get("instance") == ECHO_R, e2e_ops.describe(rec)
-        run_op("POST", f"/api/instances/{ECHO_R}/delete", {"confirm": ECHO_R})
+        run_op("DELETE", f"/api/instances/{ECHO_R}", {"confirm": ECHO_R})
         print(f"    backup {archive} restored as {ECHO_R}, both deleted", flush=True)
     check("echo: create, enable (pods without a token, default SA), Traefik → Keycloak, backup, delete, restore, delete", echo)
 
@@ -213,7 +213,7 @@ def main() -> int:
         assert subprocess.run(["kubectl", "--context", "ci", "-n", APPS, "get", "service", "web"], capture_output=True).returncode != 0, \
             "a Service named web exists in the apps namespace"
         assert client["spec"].get("subdomain") == f"{ALIAS}--pods", client["spec"].get("subdomain")
-        run_op("POST", "/api/instances/web/delete", {"confirm": "web"})
+        run_op("DELETE", "/api/instances/web", {"confirm": "web"})
         print(f"    web-internal → {svc} {ip} from the client; bare web stays {ALIAS}'s ({own}) with an instance named web; {host} gated", flush=True)
     check("alias: a compose network alias (web-internal) reaches the gated app inside its instance (Service + hostAliases)", alias)
 
