@@ -424,8 +424,9 @@ def main() -> int:
                 ctx = new_context()
                 page = ctx.new_page()
                 key = base.Authenticator(page)
-                page.goto(os.environ[f"E2E_{who.upper()}_INVITE"], wait_until="domcontentloaded")
-                base.passkey_flow(page, until=PORTAL, label=f"vpn-{who}", expect_stepups=1)
+                base.setup_link_signin(page, os.environ[f"E2E_{who.upper()}_INVITE"], who=who,
+                                       mint=lambda: base.mint_setup_link(who, "portal"),
+                                       until=PORTAL, label=f"vpn-{who}", expect_stepups=1)
                 sessions[who] = (ctx, page, key)
                 state[f"{who}_cookie"] = secret_file(f"{who}.cookie", cookie_header(ctx))
             check(f"{who} signs in from a setup link", signs_in)

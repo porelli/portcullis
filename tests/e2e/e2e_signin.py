@@ -1039,9 +1039,9 @@ def main() -> int:
             page = ctx.new_page()
             key = Key(page)
             try:
-                goto(page, invite("root", HUB + "/"))
                 stepups: list = []
-                base.passkey_flow(page, until=HUB, label="root", expect_stepups=1, stepups=stepups)
+                base.setup_link_signin(page, invite("root", HUB + "/"), who="root", mint=lambda: invite("root", HUB + "/"),
+                                       until=HUB, label="root", expect_stepups=1, stepups=stepups)
                 # A setup-link session asks the Hub's Strong for the one passkey kind it has.
                 assert "pc_method=security_key&" in stepups[0], stepups
                 resp = page.reload(wait_until="domcontentloaded")
@@ -1062,8 +1062,8 @@ def main() -> int:
             page = ctx.new_page()
             key = Key(page)
             try:
-                goto(page, invite("admin", "portal"))
-                base.passkey_flow(page, until=PORTAL, label="admin", expect_stepups=1)
+                base.setup_link_signin(page, invite("admin", "portal"), who="admin", mint=lambda: invite("admin", "portal"),
+                                       until=PORTAL, label="admin", expect_stepups=1)
                 assert "Signed in as <strong>admin</strong>" in page.content()
                 state["admin_creds"] = key.credentials()
             finally:
@@ -1075,9 +1075,9 @@ def main() -> int:
             ctx = new_context()
             page = ctx.new_page()
             key = Key(page, synced=True)
-            goto(page, invite("sam", "portal"))
             stepups: list = []
-            base.passkey_flow(page, until=PORTAL, label="sam", expect_stepups=1, stepups=stepups)
+            base.setup_link_signin(page, invite("sam", "portal"), who="sam", mint=lambda: invite("sam", "portal"),
+                                   until=PORTAL, label="sam", expect_stepups=1, stepups=stepups)
             assert "pc_method=passkey&" in stepups[0], stepups
             assert kc_types("sam") == ["webauthn-passwordless"], kc_types("sam")
             assert f"passkey registered for sam: AAGUID {AAGUID}, kind passkey_synced" in kc_log()
@@ -1268,8 +1268,8 @@ def main() -> int:
             page = ctx.new_page()
             key = Key(page)
             try:
-                goto(page, invite("alice", "portal"))
-                base.passkey_flow(page, until=PORTAL, label="alice", expect_stepups=1)
+                base.setup_link_signin(page, invite("alice", "portal"), who="alice", mint=lambda: invite("alice", "portal"),
+                                       until=PORTAL, label="alice", expect_stepups=1)
                 state["alice_storage"] = ctx.storage_state()
                 state["alice_creds"] = key.credentials()
             finally:

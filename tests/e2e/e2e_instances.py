@@ -140,8 +140,8 @@ def main() -> int:
         state: dict = {}
 
         def alice_signs_in():
-            page.goto(os.environ["E2E_ALICE_INVITE"], wait_until="domcontentloaded")
-            base.passkey_flow(page, until=PORTAL, label="inst-alice", expect_stepups=1)
+            base.setup_link_signin(page, os.environ["E2E_ALICE_INVITE"], who="alice", mint=lambda: base.mint_setup_link("alice", "portal"),
+                                   until=PORTAL, label="inst-alice", expect_stepups=1)
             base.shot(page, "inst-alice-portal")
             assert "Signed in as <strong>alice</strong>" in page.content(), page.content()[:400]
             assert key.registered == 1, f"{key.registered} passkeys registered"
@@ -253,8 +253,8 @@ def main() -> int:
         bkey = base.Authenticator(page)
 
         def bob_only_echo_b():
-            page.goto(os.environ["E2E_BOB_INVITE"], wait_until="domcontentloaded")
-            base.passkey_flow(page, until=PORTAL, label="inst-bob", expect_stepups=1)
+            base.setup_link_signin(page, os.environ["E2E_BOB_INVITE"], who="bob", mint=lambda: base.mint_setup_link("bob", "portal"),
+                                   until=PORTAL, label="inst-bob", expect_stepups=1)
             code = settle(page, ECHO_B + "/")
             base.shot(page, "inst-bob-echo-b")
             assert code == 200 and headers_of(page.inner_text("body")).get("x-forwarded-user") == ["bob"], f"HTTP {code}"
@@ -272,8 +272,8 @@ def main() -> int:
         base.Authenticator(page)
 
         def long_backup_through_traefik():
-            page.goto(os.environ["E2E_ADMIN_INVITE"], wait_until="domcontentloaded")
-            base.passkey_flow(page, until=PORTAL, label="inst-admin", expect_stepups=1)
+            base.setup_link_signin(page, os.environ["E2E_ADMIN_INVITE"], who="admin", mint=lambda: base.mint_setup_link("admin", "portal"),
+                                   until=PORTAL, label="inst-admin", expect_stepups=1)
             assert goto_ok(page, HUB + "/"), "admin cannot open the Hub"
             # The Hub accepts at once (202) and runs the backup in the
             # background; no request stays open (Traefik's default timeouts).

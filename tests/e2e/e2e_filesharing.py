@@ -500,8 +500,8 @@ def sign_in(browser, who: str):
     ctx.set_default_timeout(TIMEOUT_MS)
     page = ctx.new_page()
     auth = base.Authenticator(page)
-    page.goto(link, wait_until="domcontentloaded")
-    base.passkey_flow(page, until=PORTAL, label=f"set-{who}", expect_stepups=1)
+    base.setup_link_signin(page, link, who=who, mint=lambda: base.mint_setup_link(who, "portal"),
+                           until=PORTAL, label=f"set-{who}", expect_stepups=1)
     assert f"Signed in as <strong>{who}</strong>" in page.content(), page.content()[:300]
     return ctx, page, auth
 

@@ -130,6 +130,53 @@ def on_login_pages(page: Page) -> bool:
     return page.url.startswith(AUTH + "/realms/") or page.url.startswith(f"https://enroll.{DOMAIN}/invite/")
 
 
+def mint_setup_link(user: str, to: str = "portal") -> str:
+    """A new setup link for user (CI only), exactly as the jobs' setup steps
+    mint them: ./portcullis invite <user> --to <to> --json. Masked."""
+    out = subprocess.run(["./portcullis", "invite", user, "--to", to, "--json"], capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, f"portcullis invite {user}: exit {out.returncode} {out.stderr[-300:]}"
+    url = json.loads(out.stdout)["url"]
+    assert re.fullmatch(r"https://enroll\.[A-Za-z0-9.-]+/invite/[A-Za-z0-9_-]{43}", url), "malformed setup link"
+    print(f"::add-mask::{url}", flush=True)
+    return url
+
+
+def _note_retry(text: str) -> None:
+    """A retried setup link, visible in the log and the job summary (so a
+    repeated flake isn't hidden by the retry)."""
+    print(f"::warning::{text}", flush=True)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary:
+        with open(summary, "a") as f:
+            f.write(f"- ⚠️ {text}\n")
+
+
+def setup_link_signin(page: Page, link: str, *, who: str, mint, until: str, label: str, expect_stepups: int,
+                      stepups: list | None = None) -> None:
+    """Open a setup link and run passkey_flow. A setup link is single-use,
+    so when the attempt ends on a Chromium error page (net::
+    ERR_NETWORK_CHANGED: a container start or network attach on the runner
+    aborted the navigation) mint() gives a NEW link for the same person and
+    the sign-in runs once more, noted in the job summary. Any other failure
+    (a password field, a Keycloak error, a wrong page) fails at once."""
+    for attempt in (1, 2):
+        try:
+            page.goto(link, wait_until="domcontentloaded")
+            passkey_flow(page, until=until, label=label if attempt == 1 else f"{label}-retry",
+                         expect_stepups=expect_stepups, stepups=stepups)
+            return
+        except Exception as e:  # noqa: BLE001
+            aborted = (page.url.startswith("chrome-error://") or "chrome-error://" in str(e)
+                       or "ERR_NETWORK_CHANGED" in str(e))
+            if attempt == 2 or not aborted:
+                raise
+            _note_retry(f"e2e {label}: {who}'s setup-link sign-in ended on a Chromium error page "
+                        "(net::ERR_NETWORK_CHANGED?); retried once with a new setup link")
+            if stepups is not None:
+                stepups.clear()
+            link = mint()
+
+
 def passkey_flow(page: Page, *, until: str, label: str, expect_stepups: int, stepups: list | None = None) -> None:
     """Drive the setup-link page, Keycloak and group-gate's step-up page
     until the browser lands on `until`. Handles: "Register my key" (setup
