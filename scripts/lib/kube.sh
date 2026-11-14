@@ -1849,13 +1849,24 @@ _kube_restore_volume() {
 # _kube_restore_stop_secret_apps — the instances that mount *-pw Secrets
 # (label portcullis.io/person-secrets) scaled to 0, then every *-pw Secret
 # emptied (contract §6: a restore voids every credential).
+# Both lists fail closed: an unreadable one refuses before anything changes
+# (a *-pw Secret left unemptied would survive the restore). No matching
+# Deployment = nothing to scale (`kubectl scale -l` refuses an empty match).
 _kube_restore_stop_secret_apps() {
-  local ns s
+  local ns s deps secs pw
   ns="$(kube_apps_ns)"
-  kube_ctl -n "$ns" scale deployment -l portcullis.io/person-secrets --replicas=0 >/dev/null \
-    || { _RESTORE_ERROR_MSG="could not scale the person-secret instances to 0: nothing was restored"; return 1; }
-  RESTORE_STOPPED_APPS="$(kube_ctl -n "$ns" get deployments -l portcullis.io/person-secrets -o json 2>/dev/null | jq -r '[.items[].metadata.labels["portcullis.io/instance"] // empty] | unique | join(" ")' || true)"
-  for s in $(kube_ctl -n "$ns" get secrets -o json 2>/dev/null | jq -r '.items[].metadata.name | select(endswith("-pw"))'); do
+  deps="$(kube_ctl -n "$ns" get deployments -l portcullis.io/person-secrets -o json 2>/dev/null)" \
+    && printf '%s' "$deps" | jq -e '.items | type == "array"' >/dev/null 2>&1 \
+    || { _RESTORE_ERROR_MSG="could not list the person-secret instances: nothing was restored"; return 1; }
+  secs="$(kube_ctl -n "$ns" get secrets -o json 2>/dev/null)" \
+    && pw="$(printf '%s' "$secs" | jq -er '.items | if type == "array" then [.[].metadata.name | select(endswith("-pw"))] | join(" ") else error("no items") end' 2>/dev/null)" \
+    || { _RESTORE_ERROR_MSG="could not list the apps' Secrets: nothing was restored"; return 1; }
+  if printf '%s' "$deps" | jq -e '.items | length > 0' >/dev/null; then
+    kube_ctl -n "$ns" scale deployment -l portcullis.io/person-secrets --replicas=0 >/dev/null \
+      || { _RESTORE_ERROR_MSG="could not scale the person-secret instances to 0: nothing was restored"; return 1; }
+  fi
+  RESTORE_STOPPED_APPS="$(printf '%s' "$deps" | jq -r '[.items[].metadata.labels["portcullis.io/instance"] // empty] | unique | join(" ")')"
+  for s in $pw; do
     kube_ctl -n "$ns" patch secret "$s" --type=json -p '[{"op": "replace", "path": "/data", "value": {}}]' >/dev/null \
       || { _RESTORE_ERROR_MSG="could not empty the Secret $s: nothing was restored"; return 1; }
   done

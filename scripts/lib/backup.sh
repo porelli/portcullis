@@ -656,17 +656,23 @@ _strip_host_files() {
 }
 
 _restore_secrets() {
-  local dir="$1" relax="$PORTCULLIS_ROOT/secrets/domains/acme-relax.env" keep=""
+  local dir="$1" relax="$PORTCULLIS_ROOT/secrets/domains/acme-relax.env" keep="" kube="$PORTCULLIS_ROOT/secrets/kube" keepk=""
   # A pending ACME flip's settle point describes live DNS caches, which a
   # restore doesn't change: the live one is kept (I6); none is ever in a
-  # backup.
+  # backup. Likewise this host's Kubernetes state (secrets/kube: the
+  # release's digests and values, the setup record) is kept as it is.
   if [ -f "$relax" ]; then keep="$(mktemp)" && cp -p "$relax" "$keep"; fi
+  if [ -d "$kube" ]; then keepk="$(mktemp -d)" && chmod 700 "$keepk" && cp -a "$kube" "$keepk/kube"; fi
   (umask 077 && rm -rf "$PORTCULLIS_ROOT/secrets.restore-tmp" && cp -a "$dir/secrets" "$PORTCULLIS_ROOT/secrets.restore-tmp")
   rm -rf "$PORTCULLIS_ROOT/secrets" && mv "$PORTCULLIS_ROOT/secrets.restore-tmp" "$PORTCULLIS_ROOT/secrets"
   _strip_host_files "$PORTCULLIS_ROOT/secrets"
   if [ -n "$keep" ]; then
     mkdir -p "$(dirname "$relax")" && cp -p "$keep" "$relax" && chmod 600 "$relax"
     rm -f "$keep"
+  fi
+  if [ -n "$keepk" ]; then
+    cp -a "$keepk/kube" "$kube" && chmod 700 "$kube"
+    rm -rf "$keepk"
   fi
   chmod 700 "$PORTCULLIS_ROOT/secrets"
   secrets_fix_perms
@@ -699,7 +705,7 @@ _restore_kc_federated_count() {
 # ones; <allow> = true (--allow-empty-lldap) only warns.
 _restore_lldap_guard() {
   local allow="$1" ll kcn
-  ll="$(_restore_lldap_count)"
+  if _rt_is_kube; then ll="$(_kube_restore_lldap_count)"; else ll="$(_restore_lldap_count)"; fi
   kcn="$(_restore_kc_federated_count)"
   case "$kcn" in ''|*[!0-9]*) kcn=0 ;; esac
   if { [ "$ll" = missing ] || [ "$ll" = 0 ]; } && [ "$kcn" -gt 0 ]; then

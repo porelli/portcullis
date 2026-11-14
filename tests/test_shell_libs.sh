@@ -1560,6 +1560,16 @@ echo RELAX_NOT_BEFORE=1900000000 > "$WORK/rsec-root/secrets/domains/acme-relax.e
 (PORTCULLIS_ROOT="$WORK/rsec-root"; secrets_fix_perms() { :; }; _restore_secrets "$WORK/rsec-backup")
 expect_eq "restore: last-public-ipv* deleted, the live acme-relax.env kept (live DNS: a restore doesn't change it), the rest installed" \
   "$(find "$WORK/rsec-root/secrets" -name 'last-public-*' | wc -l | tr -d ' '):$(cat "$WORK/rsec-root/secrets/domains/acme-relax.env"):$(cat "$WORK/rsec-root/secrets/domains/api-secret")" "0:RELAX_NOT_BEFORE=1900000000:keep"
+# secrets/kube/ (this host's cluster state: digests, values, the setup
+# record) is never in a backup and never replaced: the live one stays, a
+# stray one in the backup never lands.
+mkdir -p "$WORK/rsec-root/secrets/kube" "$WORK/rsec-backup/secrets/kube"
+echo '{"group-gate":"localhost/portcullis-group-gate@sha256:live"}' > "$WORK/rsec-root/secrets/kube/digests.json"
+echo '{"group-gate":"from-the-backup"}' > "$WORK/rsec-backup/secrets/kube/digests.json"; echo stray > "$WORK/rsec-backup/secrets/kube/values.yaml"
+(PORTCULLIS_ROOT="$WORK/rsec-root"; secrets_fix_perms() { :; }; _restore_secrets "$WORK/rsec-backup")
+expect_eq "restore keeps this host's secrets/kube (digests.json) and installs none from the backup" \
+  "$(cat "$WORK/rsec-root/secrets/kube/digests.json"):$(test -e "$WORK/rsec-root/secrets/kube/values.yaml" && echo stray || echo none):$(file_mode "$WORK/rsec-root/secrets/kube")" \
+  '{"group-gate":"localhost/portcullis-group-gate@sha256:live"}:none:700'
 # The same on this root (what restore leaves), then the first `up`.
 _strip_host_files "$PORTCULLIS_ROOT/secrets"
 ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.8
@@ -4027,7 +4037,9 @@ case "$*" in
   "get pods -l portcullis.io/component="*" -o json") echo '{"items":[{"status":{"phase":"Running","containerStatuses":[{"ready":true,"started":true}]},"spec":{"containers":[{"readinessProbe":{}}]}}]}' ;;
   "get pods -o json") cat "$K/pods.json" 2>/dev/null || echo '{"items":[]}' ;;
   "get events --field-selector "*) echo '{"items":[{"reason":"BackOff","message":"Back-off restarting failed container"}]}' ;;
-  "get deployments -l portcullis.io/person-secrets -o json") echo '{"items":[{"metadata":{"labels":{"portcullis.io/instance":"samba"}}}]}' ;;
+  "get deployments -l portcullis.io/person-secrets -o json")
+    [ -z "${STUB_PS_LIST_FAIL:-}" ] || exit 1
+    if [ -n "${STUB_PS_NONE:-}" ]; then echo '{"items":[]}'; else echo '{"items":[{"metadata":{"labels":{"portcullis.io/instance":"samba"}}}]}'; fi ;;
   "create -f -") cat >> "$STUB_DIR/kubectl-stdin"; echo --- >> "$STUB_DIR/kubectl-stdin"; printf 'create pod\n' >> "$STUB_DIR/order" ;;
   "wait --for=jsonpath={.status.phase}=Succeeded pod/"*) printf 'wait %s\n' "$3" >> "$STUB_DIR/order"; exit "${STUB_WAIT_RC:-0}" ;;
   "logs pod/keygen-"*) printf 'logs\n' >> "$STUB_DIR/order"; printf '# public key: age1kube\nAGE-SECRET-KEY-1KUBEQQQQ\n' ;;
@@ -4503,6 +4515,29 @@ OUT="$(kt '_kube_restore_stop_secret_apps; echo "stopped=$RESTORE_STOPPED_APPS"'
 expect_eq "restore empties every *-pw Secret, after scaling the person-secret instances to 0 (and only those Secrets)" \
   "$(grep -E 'scale|patch' "$KS/order" | sed 's/--type=json.*//' | tr '\n' ';'):$(printf '%s\n' "$OUT" | grep -c 'stopped=samba')" \
   "kubectl portcullis-apps scale deployment -l portcullis.io/person-secrets --replicas=0;kubectl portcullis-apps patch secret samba--share-pw ;kubectl portcullis-apps patch secret tm--share-pw ;:1"
+# No file-sharing instance: nothing to scale (kubectl scale -l on no match
+# fails "no objects passed to scale"), the Secrets still emptied.
+rm -f "$KS/order"
+OUT="$(kt 'STUB_PS_NONE=1 _kube_restore_stop_secret_apps; echo "rc=$? stopped=[$RESTORE_STOPPED_APPS]"')"
+expect_eq "restore with no person-secret instance: no scale, every *-pw Secret emptied, nothing stopped" \
+  "$(grep -E 'scale|patch' "$KS/order" | sed 's/--type=json.*//' | tr '\n' ';'):$(printf '%s\n' "$OUT" | grep -c 'rc=0 stopped=\[\]')" \
+  "kubectl portcullis-apps patch secret samba--share-pw ;kubectl portcullis-apps patch secret tm--share-pw ;:1"
+rm -f "$KS/order"; : > "$KS/order"
+OUT="$(kt 'STUB_PS_LIST_FAIL=1 _kube_restore_stop_secret_apps; echo "rc=$? msg=$_RESTORE_ERROR_MSG"')"
+expect_eq "restore: an unreadable person-secret list refuses before anything changes" \
+  "$(grep -cE 'scale|patch' "$KS/order" 2>/dev/null || true):$(printf '%s\n' "$OUT" | grep -c 'rc=1 msg=could not list the person-secret instances')" "0:1"
+rm -f "$KS/order"; : > "$KS/order"; mv "$KS/kube/apps-secrets.json" "$KS/kube/apps-secrets.json.bak"; printf 'not json' > "$KS/kube/apps-secrets.json"
+OUT="$(kt '_kube_restore_stop_secret_apps; echo "rc=$? msg=$_RESTORE_ERROR_MSG"')"
+mv "$KS/kube/apps-secrets.json.bak" "$KS/kube/apps-secrets.json"
+expect_eq "restore: an unreadable Secret list refuses (a credential would survive the restore)" \
+  "$(grep -c 'patch' "$KS/order" 2>/dev/null || true):$(printf '%s\n' "$OUT" | grep -c "rc=1 msg=could not list the apps' Secrets")" "0:1"
+# The LLDAP guard on kubernetes counts LLDAP's users from its PVC (never the
+# docker-only volume helper), and still refuses an empty LLDAP.
+OUT="$(kt '_restore_lldap_count() { echo DOCKER-HELPER; }; _restore_kc_federated_count() { echo 5; }; _kube_restore_lldap_count() { echo 3; }; _restore_lldap_guard false; echo "rc=$?"')"
+expect_eq "restore's LLDAP guard on kubernetes: LLDAP's own count (3 users, 5 federated) → goes on, the docker helper never runs" \
+  "$(printf '%s\n' "$OUT" | grep -c DOCKER-HELPER):$(printf '%s\n' "$OUT" | tail -n1)" "0:rc=0"
+OUT="$(kt '_restore_kc_federated_count() { echo 5; }; _kube_restore_lldap_count() { echo 0; }; _restore_lldap_guard false; echo "rc=$?"' 2>&1)"
+case "$OUT" in *"LLDAP has no users (0) but the restored Keycloak database has 5 federated users"*"rc=1"*) t_pass "restore's LLDAP guard on kubernetes: an empty LLDAP with federated Keycloak users refuses" ;; *) t_fail "kube lldap guard empty: $OUT" ;; esac
 # status --json runtime
 OUT="$(kt 'kube_status_json v1.37.2+k3s1')"
 expect_eq "status --json runtime.name = kubernetes, runtime.context set, version, the § 6 rows as checks" \
