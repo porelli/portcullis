@@ -74,10 +74,13 @@ for i in $(seq 1 80); do
   [ "$i" -eq 80 ] && { echo "FAIL: headscale's map isn't fresh: $(hub GET /api/vpn | jq -c .providers)"; exit 1; }
   sleep 3
 done
-for i in $(seq 1 60); do
-  n="$(docker events --since 20s --until "$(date +%s)" --filter event=start --filter event=connect --format '{{.Type}} {{.Action}} {{.Actor.Attributes.name}}' | wc -l)"
+# 60 s, not 20: on main run 43527815385 headscale's gateway exited and
+# restarted on its own ~40 s after a 20 s quiet window (during bob's
+# sign-in). setup_link_signin retries once with a new link if one is hit.
+for i in $(seq 1 100); do
+  n="$(docker events --since 60s --until "$(date +%s)" --filter event=start --filter event=connect --format '{{.Type}} {{.Action}} {{.Actor.Attributes.name}}' | wc -l)"
   [ "$n" -eq 0 ] && break
-  [ "$i" -eq 60 ] && { echo "FAIL: the engine never went 20 s without a container start or network attach"; exit 1; }
+  [ "$i" -eq 100 ] && { echo "FAIL: the engine never went 60 s without a container start or network attach"; exit 1; }
   sleep 3
 done
 hub GET /api/vpn | jq -c '{mode, wg, providers: [.providers[] | {id, wired, stale, devices}]}'
