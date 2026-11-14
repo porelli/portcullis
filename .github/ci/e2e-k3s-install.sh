@@ -98,7 +98,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now k3s.service
 
 for i in $(seq 1 90); do
-  sudo test -s /etc/rancher/k3s/k3s.yaml && sudo k3s kubectl get nodes >/dev/null 2>&1 && break
+  # A node, not just an answering API (an empty list answers too, and
+  # `kubectl wait node --all` then fails "no matching resources found").
+  sudo test -s /etc/rancher/k3s/k3s.yaml && sudo k3s kubectl get nodes -o name 2>/dev/null | grep -q . && break
   [ "$i" -eq 90 ] && { echo "FAIL: k3s didn't start"; sudo journalctl -u k3s --no-pager | tail -50; exit 1; }
   sleep 2
 done
