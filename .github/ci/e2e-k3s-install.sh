@@ -14,11 +14,22 @@
 set -euo pipefail
 
 K3S_VERSION="v1.37.2+k3s1"
-K3S_SHA256=265b3ee6a3198ef14033c63ef46cbb32370d83795199fb6d1b01f21575eddbda
 KUBECTL_VERSION="v1.37.2"
-KUBECTL_SHA256=c04487523e7aa7d1493f7808174c899db93d7a9cf57531420cd76b9bd415f8f4
 HELM_VERSION=v4.3.1
-HELM_SHA256=0403a88ae20913d11b10a2467b50087721fea7581736da6b9d3992f5357fe54b
+# Per architecture (CI: amd64; a local arm64 runner, .github/ci/e2e-k3s-local.sh).
+case "$(uname -m)" in
+  x86_64)
+    ARCH=amd64 K3S_ASSET=k3s
+    K3S_SHA256=265b3ee6a3198ef14033c63ef46cbb32370d83795199fb6d1b01f21575eddbda
+    KUBECTL_SHA256=c04487523e7aa7d1493f7808174c899db93d7a9cf57531420cd76b9bd415f8f4
+    HELM_SHA256=0403a88ae20913d11b10a2467b50087721fea7581736da6b9d3992f5357fe54b ;;
+  aarch64|arm64)
+    ARCH=arm64 K3S_ASSET=k3s-arm64
+    K3S_SHA256=a779ccf1e5e2e33a62f5a29c2f1c0bbf99431e100579d4c10f0aa0742a6aa84b
+    KUBECTL_SHA256=fcc16f63186659d9722014b7e02d5fdd2d4e669cb8c0ab66365d7d3b8ba03509
+    HELM_SHA256=8cf8f66ecbc252ac8f7f06cca68aba88508ddfde3a6a34feb1678ad1694b4f88 ;;
+  *) echo "FAIL: no pinned k3s / kubectl / helm for $(uname -m)"; exit 1 ;;
+esac
 
 netns=false
 case "${1:-}" in
@@ -32,10 +43,10 @@ fetch() { # fetch <url> <sha256> <out>
   curl -fsSL --retry 3 -o "$3" "$1"
   echo "$2  $3" | sha256sum -c --quiet - || { echo "FAIL: $1 doesn't match its pinned sha256"; exit 1; }
 }
-fetch "https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION//+/%2B}/k3s" "$K3S_SHA256" "$tmp/k3s"
-fetch "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/amd64/kubectl" "$KUBECTL_SHA256" "$tmp/kubectl"
-fetch "https://get.helm.sh/helm-$HELM_VERSION-linux-amd64.tar.gz" "$HELM_SHA256" "$tmp/helm.tgz"
-tar -xzf "$tmp/helm.tgz" -C "$tmp" --strip-components=1 linux-amd64/helm
+fetch "https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION//+/%2B}/$K3S_ASSET" "$K3S_SHA256" "$tmp/k3s"
+fetch "https://dl.k8s.io/release/$KUBECTL_VERSION/bin/linux/$ARCH/kubectl" "$KUBECTL_SHA256" "$tmp/kubectl"
+fetch "https://get.helm.sh/helm-$HELM_VERSION-linux-$ARCH.tar.gz" "$HELM_SHA256" "$tmp/helm.tgz"
+tar -xzf "$tmp/helm.tgz" -C "$tmp" --strip-components=1 "linux-$ARCH/helm"
 sudo install -m 0755 "$tmp/k3s" /usr/local/bin/k3s
 sudo install -m 0755 "$tmp/kubectl" /usr/local/bin/kubectl
 sudo install -m 0755 "$tmp/helm" /usr/local/bin/helm

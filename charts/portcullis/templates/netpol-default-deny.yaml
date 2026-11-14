@@ -11,6 +11,7 @@ metadata:
   namespace: {{ $ns }}
   labels:
     app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
 spec:
   podSelector: {}
   policyTypes: ["Ingress", "Egress"]
@@ -23,6 +24,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/managed-by: portcullis
+    portcullis.io/owner: core
 spec:
   podSelector: {}
   policyTypes: ["Egress"]

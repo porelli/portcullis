@@ -295,6 +295,17 @@ def check_edge(docs):
     for what, mutate in MUTATIONS:
         if not core_route_problems(mutate(copy.deepcopy(docs)), cr):
             F.add(f"core_route_problems misses {what} (mutation test)")
+    # Chart objects the admission policies judge (apps and edge namespaces)
+    # carry portcullis.io/owner=core: the CLI's identity is what exempts
+    # them, the label says whose they are.
+    judged = {"NetworkPolicy", "Service", "Pod", "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "Secret",
+              "IngressRoute", "Middleware", "IngressRouteTCP", "IngressRouteUDP", "TLSOption", "TLSStore", "ServersTransport",
+              "TraefikService", "MiddlewareTCP"}
+    for d in docs:
+        m = d.get("metadata", {})
+        if m.get("namespace") in (K.APPS_NS, K.EDGE_NS) and d.get("kind") in judged \
+                and (m.get("labels") or {}).get("portcullis.io/owner") != "core":
+            F.add(f"{d['kind']} {m.get('namespace')}/{m['name']}: a chart object the policies judge without portcullis.io/owner=core")
     # The params' edgeCoreMiddlewares (no Hub route may name them) = the
     # chart's edge Middlewares + the CLI's hub-proxy-secret.
     want = sorted(["hub-proxy-secret"] + [d["metadata"]["name"] for d in K.by_kind(docs, "Middleware")])

@@ -54,6 +54,13 @@ lldap_token() { # lldap_token <base> — admin's token (retried; the HTTP status
   rm -f "$out"; echo "FAIL: LLDAP login as admin: HTTP ${code:-none}" >&2; return 1
 }
 
+# E2E_K3S_SKIP_DOCKER=1 (local iteration, .github/ci/e2e-k3s-local.sh):
+# the Docker phase and the Docker → Kubernetes restore are skipped; CI runs
+# both.
+if [ "${E2E_K3S_SKIP_DOCKER:-}" = 1 ]; then
+  case "${1:-}" in docker|restore) echo "SKIPPED: $1 (E2E_K3S_SKIP_DOCKER=1)"; exit 0 ;; esac
+fi
+
 case "${1:-}" in
 docker)
   ./portcullis init --env-only --runtime docker --non-interactive --domain "$E2E_DOMAIN" --email "ci@$E2E_DOMAIN" --dns-provider none

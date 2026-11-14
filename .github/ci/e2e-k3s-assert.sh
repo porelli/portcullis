@@ -150,6 +150,10 @@ D="$(grep '^PORTCULLIS_DOMAIN=' .env | cut -d= -f2-)"
 code="$(curl -sk -o "$T/mcp.out" -w '%{http_code}' --max-time 20 --resolve "mcp.$D:443:198.51.100.1" -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"e2e-k3s","version":"0"}}}' "https://mcp.$D/mcp")"
 case "$code:$(cat "$T/mcp.out")" in 503:*"AI support is off"*|401:*) pass "MCP: mcp.$D/mcp reaches mcp-gate through Traefik (HTTP $code)" ;; *) fail "MCP: mcp.$D/mcp answered $code: $(head -c 200 "$T/mcp.out")" ;; esac
+# Every ruled apps shape (root, names, hostAliases, Services, endPort, tpl).
+bash .github/ci/e2e-k3s-apps-admission.sh ci
+# The chart's own objects pass the policies only as the CLI.
+bash .github/ci/e2e-k3s-chart-admission.sh ci
 # A params change never leaves an object unbound.
 bash .github/ci/e2e-k3s-rebind.sh
 
