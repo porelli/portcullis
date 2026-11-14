@@ -75,6 +75,7 @@ init_write_env() {
   done
   rtkeys="CONTAINER_RUNTIME=$rt"
   [ "$rt" != podman ] || rtkeys="$rtkeys"$'\n'"PORTCULLIS_ENGINE_SOCKET=$(runtime_podman_socket)"
+  [ "$rt" != kubernetes ] || rtkeys="$rtkeys"$'\n'"${INIT_KUBE_KEYS:?}"
   old_umask="$(umask)"
   umask 077
   cat > "$file" <<EOF
@@ -150,12 +151,17 @@ _init_runtime_existing() {
   local flag="$1" have rt
   have="$(env_get CONTAINER_RUNTIME)"
   if [ -n "$have" ]; then
-    case "$have" in docker|podman) ;; *) fail "CONTAINER_RUNTIME=$have in .env is neither docker nor podman" ;; esac
+    case "$have" in docker|podman|kubernetes) ;; *) fail "CONTAINER_RUNTIME=$have in .env is not docker, podman or kubernetes" ;; esac
     for rt in "$flag" "${CONTAINER_RUNTIME:-}"; do
       [ -z "$rt" ] || [ "$rt" = "$have" ] || fail "CONTAINER_RUNTIME is $have in .env and is never switched (backup → fresh init → restore)"
     done
+    if [ "$have" = kubernetes ] && [ -n "$2" ] && [ "$2" != "$(env_get PORTCULLIS_KUBE_CONTEXT)" ]; then
+      fail "PORTCULLIS_KUBE_CONTEXT is $(env_get PORTCULLIS_KUBE_CONTEXT) in .env: edit it there, not with --kube-context"
+    fi
     return 0
   fi
+  [ "$flag" != kubernetes ] && [ "${CONTAINER_RUNTIME:-}" != kubernetes ] \
+    || fail "CONTAINER_RUNTIME=kubernetes needs a fresh .env (init --runtime kubernetes --kube-context <ctx> writes its keys)"
   rt="$(runtime_detect "$flag")" || exit 1
   env_set CONTAINER_RUNTIME "$rt"
   info "Set CONTAINER_RUNTIME=$rt in .env"
@@ -167,12 +173,12 @@ _init_runtime_existing() {
 }
 
 init_run() {
-  local domain="$1" email="$2" provider="$3" env_only="$4" skip_dns="$5" config_repo="$6" runtime="${7:-}" v rt
+  local domain="$1" email="$2" provider="$3" env_only="$4" skip_dns="$5" config_repo="$6" runtime="${7:-}" kctx="${8:-}" v rt kubekeys=""
   require_cmd openssl
   if [ -f "$(env_file)" ]; then
     info "Using the existing $(env_file)."
     [ -z "$domain$email$provider" ] || warn "--domain/--email/--dns-provider are ignored: .env already exists (edit it instead)."
-    _init_runtime_existing "$runtime"
+    _init_runtime_existing "$runtime" "$kctx"
   else
     [ -n "$domain" ] || domain="${PORTCULLIS_DOMAIN:-}"
     if [ -z "$domain" ]; then
@@ -193,7 +199,18 @@ init_run() {
     [ -z "$runtime" ] || [ -z "${CONTAINER_RUNTIME:-}" ] || [ "$runtime" = "$CONTAINER_RUNTIME" ] \
       || fail "--runtime $runtime contradicts CONTAINER_RUNTIME=$CONTAINER_RUNTIME in the environment"
     rt="$(runtime_detect "$runtime")" || exit 1
-    init_write_env "$domain" "$email" "$provider" "$rt"
+    if [ "$rt" = kubernetes ]; then
+      # The cluster's networks are detected now (runtime_check re-checks
+      # them every run), before anything is written.
+      kctx="${kctx:-${PORTCULLIS_KUBE_CONTEXT:-}}"
+      [ -n "$kctx" ] || usage_error init "--runtime kubernetes needs --kube-context <ctx> (the current context is never used)"
+      require_cmd kubectl
+      kube_context_exists "$kctx" || fail "the kube context $kctx doesn't exist (kubectl config get-contexts)"
+      PORTCULLIS_KUBE_CONTEXT="$kctx" kube_detect_cidrs || fail "can't read the cluster behind $kctx: $_K_ERR"
+      ! _kube_ipv6_in "$_K_POD_CIDR $_K_SVC_CIDR" || fail "dual-stack or IPv6 cluster (pods $_K_POD_CIDR, services $_K_SVC_CIDR): Portcullis supports IPv4 single-stack only"
+      kubekeys="$(kube_env_keys "$kctx")" || exit 1
+    fi
+    INIT_KUBE_KEYS="$kubekeys" init_write_env "$domain" "$email" "$provider" "$rt"
     export CONTAINER_RUNTIME="$rt"
     ok "Created $(env_file) (0600)."
   fi
@@ -213,11 +230,15 @@ init_run() {
     return 0
   fi
 
-  require_cmd docker jq curl
+  if _rt_is_kube; then require_cmd kubectl helm jq curl; else require_cmd docker jq curl; fi
   runtime_check
   runtime_require_host
   rt_require_tools
-  network_check
+  if _rt_is_kube; then
+    kube_init_cluster
+  else
+    network_check
+  fi
 
   if [ "$skip_dns" = true ] || [ "${DNS_PROVIDER:-none}" = none ]; then
     info "Skipping DNS record setup."
@@ -585,12 +606,19 @@ Options:
                           or another lego provider name (default: cloudflare)
   --non-interactive       never prompt; DNS credentials must be in the
                           environment (e.g. CLOUDFLARE_API_TOKEN=...)
-  --runtime docker|podman container runtime, written to .env as
+  --runtime docker|podman|kubernetes
+                          container runtime, written to .env as
                           CONTAINER_RUNTIME and never switched afterwards
                           (default: CONTAINER_RUNTIME from the environment,
                           else Docker if its engine answers, else rootless
                           Podman on the user socket; podman needs the host
-                          preparation of docs operations/rootless-podman)
+                          preparation of docs operations/rootless-podman;
+                          kubernetes is never detected: name it, with
+                          --kube-context, docs operations/kubernetes)
+  --kube-context CTX      the kubeconfig context of the cluster (required
+                          with --runtime kubernetes; written to .env as
+                          PORTCULLIS_KUBE_CONTEXT: the current context is
+                          never used)
   --env-only              only write/complete .env, then stop (refused
                           without --runtime when no engine answers)
   --skip-dns              do not create DNS records
@@ -649,7 +677,7 @@ EOF
 }
 
 cmd_init() {
-  local domain="" email="" provider="" env_only=false skip_dns=false config_repo=true runtime=""
+  local domain="" email="" provider="" env_only=false skip_dns=false config_repo=true runtime="" kube_context=""
   INIT_INTERACTIVE=true
   [ -t 0 ] || INIT_INTERACTIVE=false
   while [ $# -gt 0 ]; do
@@ -659,8 +687,9 @@ cmd_init() {
       --dns-provider) need_value init "$1" "${2:-}"; provider="$2"; shift ;;
       --runtime)
         need_value init "$1" "${2:-}"
-        case "$2" in docker|podman) runtime="$2" ;; *) usage_error init "--runtime must be docker or podman" ;; esac
+        case "$2" in docker|podman|kubernetes) runtime="$2" ;; *) usage_error init "--runtime must be docker, podman or kubernetes" ;; esac
         shift ;;
+      --kube-context) need_value init "$1" "${2:-}"; kube_context="$2"; shift ;;
       --non-interactive) INIT_INTERACTIVE=false ;;
       --env-only) env_only=true ;;
       --skip-dns) skip_dns=true ;;
@@ -670,7 +699,11 @@ cmd_init() {
     esac
     shift
   done
-  init_run "$domain" "$email" "$provider" "$env_only" "$skip_dns" "$config_repo" "$runtime"
+  [ -z "$kube_context" ] || [ "$runtime" = kubernetes ] || [ "${CONTAINER_RUNTIME:-}" = kubernetes ] \
+    || usage_error init "--kube-context goes with --runtime kubernetes"
+  [ "$runtime" != kubernetes ] || [ -n "$kube_context" ] || [ -n "${PORTCULLIS_KUBE_CONTEXT:-}" ] || [ -f "$(env_file)" ] \
+    || usage_error init "--runtime kubernetes needs --kube-context <ctx> (the current context is never used)"
+  init_run "$domain" "$email" "$provider" "$env_only" "$skip_dns" "$config_repo" "$runtime" "$kube_context"
 }
 
 cmd_up() {

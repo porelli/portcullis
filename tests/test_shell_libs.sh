@@ -3021,9 +3021,9 @@ case "$OUT" in *"no container engine answers: pass --runtime docker|podman"*"/et
 expect_eq "runtime_detect: an unknown runtime → refused" "$(rt 'runtime_detect lxc >/dev/null 2>&1')" "rc=1"
 
 OUT="$(rt 'runtime_name')"
-case "$OUT" in *"CONTAINER_RUNTIME is not set in .env (docker or podman): ./portcullis init writes it"*"rc=1") t_pass "runtime_name: unset → refused naming the variable" ;; *) t_fail "runtime_name unset: $OUT" ;; esac
+case "$OUT" in *"CONTAINER_RUNTIME is not set in .env (docker, podman or kubernetes): ./portcullis init writes it"*"rc=1") t_pass "runtime_name: unset → refused naming the variable" ;; *) t_fail "runtime_name unset: $OUT" ;; esac
 OUT="$(rt 'CONTAINER_RUNTIME=Docker runtime_name')"
-case "$OUT" in *"CONTAINER_RUNTIME=Docker is neither docker nor podman"*"rc=1") t_pass "runtime_name: another value → refused naming it" ;; *) t_fail "runtime_name bad: $OUT" ;; esac
+case "$OUT" in *"CONTAINER_RUNTIME=Docker is not docker, podman or kubernetes"*"rc=1") t_pass "runtime_name: another value → refused naming it" ;; *) t_fail "runtime_name bad: $OUT" ;; esac
 OUT="$(rt 'CONTAINER_RUNTIME=docker STUB_DOCKER_SOCK_ENGINE="Podman Engine" runtime_check')"
 case "$OUT" in *"CONTAINER_RUNTIME=docker but the engine is Podman Engine"*"rc=1") t_pass "runtime_check: CONTAINER_RUNTIME=docker but the engine is Podman → fails" ;; *) t_fail "runtime_check docker/podman: $OUT" ;; esac
 OUT="$(rt "CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET='$RT_PSOCK' STUB_PODMAN_SOCK_ENGINE=Engine runtime_check")"
@@ -3871,6 +3871,181 @@ expect_eq "status textfile: apps → portcullis_vpn_mode_restricted 0" "$(stf | 
 expect_eq "keycloak.sh registers no headscale client" "$(grep -ciE 'headscale|headplane' "$HERE/../scripts/lib/keycloak.sh" || true)" 0
 expect_eq "backup has no headscale-config.yaml" "$(grep -c 'headscale' "$HERE/../scripts/lib/backup.sh" || true)" 0
 expect_eq "no headscale/ directory, nothing in the apps file" "$( [ -e "$HERE/../headscale" ] && echo dir || echo none):$(grep -ciE 'headscale|headplane' "$HERE/../docker-compose.apps.yml" || true)" "none:0"
+
+# ══ kubernetes runtime (scripts/lib/kube.sh) ══════════════
+# A kubectl stub with canned answers ($STUB_DIR/kube/*); every argv logged.
+KS="$WORK/kstub"; mkdir -p "$KS/bin" "$KS/kube"
+cat > "$KS/bin/kubectl" <<'KSTUB'
+#!/usr/bin/env bash
+# kubectl stub: canned answers from $STUB_DIR/kube/, every argv logged.
+K="$STUB_DIR/kube"
+printf '%s\n' "$*" >> "$STUB_DIR/kubectl-calls"
+args=("$@")
+if [ "${1:-}" = config ]; then
+  [ "$2 $3 $4" = "get-contexts -o name" ] && { cat "$K/contexts" 2>/dev/null; exit 0; }
+  exit 1
+fi
+[ "${1:-}" = --context ] || { echo "stub: no --context" >&2; exit 97; }
+shift 2
+ns=""
+if [ "${1:-}" = -n ]; then ns="$2"; shift 2; fi
+case "$*" in
+  "version -o json") cat "$K/version.json" ;;
+  "get nodes -o json") cat "$K/nodes.json" ;;
+  "create --dry-run=server -f -") cat >/dev/null; cat "$K/svc-dryrun.err" >&2; exit 1 ;;
+  "get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o json") cat "$K/eps.json" ;;
+  "get --raw /api/v1/nodes/"*"/proxy/configz") cat "$K/configz.json" 2>/dev/null || exit 1 ;;
+  "get services -A -o json") cat "$K/svcs.json" 2>/dev/null || echo '{"items":[]}' ;;
+  "get service traefik -o json") cat "$K/traefik-svc.json" 2>/dev/null || { echo 'Error from server (NotFound)' >&2; exit 1; } ;;
+  "get namespace "*" -o json")
+    n="${3}"; [ -f "$K/ns-$n.json" ] && { cat "$K/ns-$n.json"; exit 0; }
+    echo "Error from server (NotFound): namespaces \"$n\" not found" >&2; exit 1 ;;
+  "get namespace "*)
+    n="${3}"; [ -f "$K/ns-$n.json" ] && exit 0
+    echo "Error from server (NotFound): namespaces \"$n\" not found" >&2; exit 1 ;;
+  "apply -f -") cat >> "$STUB_DIR/kubectl-stdin"; [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
+  "apply -f "*) [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
+  "exec client-allowed -- nc"*) exit "${STUB_DIAL_ALLOWED:-0}" ;;
+  "exec client-denied -- nc"*) exit "${STUB_DIAL_DENIED:-1}" ;;
+  "get pod server -o jsonpath={.status.podIP}") echo 10.42.0.9 ;;
+  *) [ -n "${STUB_KUBE_SCRIPT:-}" ] && . "$STUB_KUBE_SCRIPT" ;;
+esac
+exit 0
+KSTUB
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$STUB_DIR/helm-calls"\nexit 0\n' > "$KS/bin/helm"
+chmod +x "$KS/bin/kubectl" "$KS/bin/helm"
+k_fixtures() {
+  rm -rf "$KS/kube" "$KS/kubectl-calls" "$KS/kubectl-stdin"; mkdir -p "$KS/kube"
+  printf 'ci\nother\n' > "$KS/kube/contexts"
+  echo '{"serverVersion":{"gitVersion":"v1.37.2+k3s1"}}' > "$KS/kube/version.json"
+  cat > "$KS/kube/nodes.json" <<'J'
+{"items":[{"metadata":{"name":"node1","annotations":{"k3s.io/node-args":"[\"server\",\"--disable\",\"traefik\",\"--secrets-encryption\",\"--kubelet-arg\",\"pod-max-pids=1024\",\"--node-external-ip\",\"198.51.100.1\"]"}},
+  "spec":{"podCIDR":"10.42.0.0/24","podCIDRs":["10.42.0.0/24"]},
+  "status":{"addresses":[{"type":"InternalIP","address":"10.1.0.4"},{"type":"ExternalIP","address":"198.51.100.1"}]}}]}
+J
+  echo 'The Service "portcullis-cidr-probe" is invalid: spec.clusterIPs: Invalid value: []string{"0.0.0.1"}: failed to allocate IP 0.0.0.1: the provided IP (0.0.0.1) is not in the valid range. The range of valid IPs is 10.43.0.0/16' > "$KS/kube/svc-dryrun.err"
+  echo '{"items":[{"ports":[{"port":6443}],"endpoints":[{"addresses":["10.1.0.4"]}]}]}' > "$KS/kube/eps.json"
+  echo '{"kubeletconfig":{"podPidsLimit":1024}}' > "$KS/kube/configz.json"
+}
+# kt <code> — run code with the libs, CONTAINER_RUNTIME=kubernetes and the stub.
+kt() {
+  ( export STUB_DIR="$KS" PATH="$KS/bin:$PATH" CONTAINER_RUNTIME=kubernetes PORTCULLIS_KUBE_CONTEXT=ci \
+      PORTCULLIS_POD_CIDR=10.42.0.0/24 PORTCULLIS_SERVICE_CIDR=10.43.0.0/16 PORTCULLIS_KUBE_API_ENDPOINTS=10.1.0.4:6443 \
+      PORTCULLIS_KUBE_INSTALL_ID=0b0e2b3c-1111-4222-8333-444455556666 KUBE_LOCAL_ADDRS="10.1.0.4 198.51.100.1" \
+      PORTCULLIS_PUBLIC_IPV4=198.51.100.1 KUBE_TCP_PROBE=false
+    unset _RT_CHECKED _RT_HOST_OK
+    ( eval "$1" ); echo "rc=$?" ) 2>&1
+}
+k_fixtures
+OUT="$(kt 'unset PORTCULLIS_KUBE_CONTEXT; runtime_check')"
+case "$OUT" in *"PORTCULLIS_KUBE_CONTEXT is not set"*"rc=1") t_pass "need_env: kubernetes without PORTCULLIS_KUBE_CONTEXT → refused naming it" ;; *) t_fail "kube no context: $OUT" ;; esac
+OUT="$(kt 'PORTCULLIS_KUBE_CONTEXT=nope; runtime_check')"
+case "$OUT" in *"kube context nope"*"doesn't exist"*"rc=1") t_pass "runtime_check: a context that doesn't exist → refused" ;; *) t_fail "kube missing context: $OUT" ;; esac
+k_fixtures
+OUT="$(kt 'runtime_check && kube_ctl get nodes -o json >/dev/null && kube_helm list >/dev/null')"
+expect_eq "runtime_check: the cluster's networks = .env → ok" "$(printf '%s\n' "$OUT" | tail -n1)" "rc=0"
+expect_eq "kube_ctl / kube_helm always pass the context (never the current one)" \
+  "$(grep -vc '^--context ci \|^config get-contexts' "$KS/kubectl-calls"):$(grep -c '^--kube-context ci ' "$KS/helm-calls")" "0:1"
+OUT="$(kt 'PORTCULLIS_POD_CIDR=10.99.0.0/24; runtime_check')"
+case "$OUT" in *"PORTCULLIS_POD_CIDR=10.99.0.0/24 in .env, but the cluster has 10.42.0.0/24"*"rc=1") t_pass "runtime_check: detected pod CIDR differs from .env → refused naming both" ;; *) t_fail "kube pod cidr mismatch: $OUT" ;; esac
+OUT="$(kt 'PORTCULLIS_KUBE_API_ENDPOINTS=10.1.0.9:6443; runtime_check')"
+case "$OUT" in *"PORTCULLIS_KUBE_API_ENDPOINTS=10.1.0.9:6443 in .env, but the cluster has 10.1.0.4:6443"*"rc=1") t_pass "runtime_check: a different API endpoint → refused naming both" ;; *) t_fail "kube api ep mismatch: $OUT" ;; esac
+expect_eq "kube_detect_cidrs: pod, service CIDR and API endpoints" "$(kt 'kube_detect_cidrs; echo "$_K_POD_CIDR|$_K_SVC_CIDR|$_K_API_EP"')" "10.42.0.0/24|10.43.0.0/16|10.1.0.4:6443
+rc=0"
+echo 'error: something else entirely' > "$KS/kube/svc-dryrun.err"
+OUT="$(kt 'kube_detect_cidrs')"
+case "$OUT" in *"rc=1") t_pass "kube_detect_cidrs: an unparsable dry-run answer → refused" ;; *) t_fail "kube unparsable svc cidr: $OUT" ;; esac
+k_fixtures
+OUT="$(kt 'kube_host_checks')"
+expect_eq "kube_host_checks: a prepared k3s → no fail line" "$(printf '%s\n' "$OUT" | grep -c '^fail' || true)" 0
+case "$OUT" in *"ok	Kubernetes v1.37.2+k3s1"*"ok	PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 is free"*"ok	namespace portcullis: not there yet"*"ok	namespace portcullis-storage: not there yet"*) t_pass "kube_host_checks: version, fixed ClusterIPs, the three namespaces" ;; *) t_fail "kube_host_checks ok: $OUT" ;; esac
+sed -i.bak 's/"10.42.0.0\/24","fd00:10:42::\/56"/X/; s/"podCIDRs":\["10.42.0.0\/24"\]/"podCIDRs":["10.42.0.0\/24","fd00:42::\/56"]/' "$KS/kube/nodes.json"
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"fail	dual-stack or IPv6 cluster"*) t_pass "kube_host_checks: an IPv6 pod CIDR → refused" ;; *) t_fail "kube ipv6: $OUT" ;; esac
+OUT="$(kt 'runtime_check')"
+case "$OUT" in *"dual-stack or IPv6 cluster"*"rc=1") t_pass "runtime_check: an IPv6 pod CIDR → refused" ;; *) t_fail "kube ipv6 runtime_check: $OUT" ;; esac
+k_fixtures
+echo '{"serverVersion":{"gitVersion":"v1.31.9+k3s1"}}' > "$KS/kube/version.json"
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"fail	Kubernetes v1.31.9+k3s1: Portcullis needs >= 1.32"*) t_pass "kube_host_checks: server v1.31 → refused" ;; *) t_fail "kube v1.31: $OUT" ;; esac
+k_fixtures
+echo '{"kubeletconfig":{"podPidsLimit":-1}}' > "$KS/kube/configz.json"
+sed -i.bak 's/\\"--secrets-encryption\\",//' "$KS/kube/nodes.json"
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"fail	k3s runs without --secrets-encryption"*"fail	kubelet podPidsLimit is -1"*) t_pass "kube_host_checks: no secrets encryption, no pod pids limit → refused" ;; *) t_fail "kube flags: $OUT" ;; esac
+k_fixtures
+# Task 0 Q1: the public address is local but ServiceLB publishes another.
+OUT="$(kt 'KUBE_LOCAL_ADDRS="10.1.0.4 203.0.113.7"; PORTCULLIS_PUBLIC_IPV4=203.0.113.7; kube_host_checks')"
+case "$OUT" in *"warn	client IPs will be rewritten"*"--node-external-ip=203.0.113.7"*) t_pass "kube_host_checks: public IP local but not an LB ingress address → warning naming --node-external-ip" ;; *) t_fail "kube source ip: $OUT" ;; esac
+case "$OUT" in *"fail	client IPs"*) t_fail "kube source ip: a refusal" ;; *) t_pass "kube_host_checks: the source-IP row is never a refusal" ;; esac
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"ok	client addresses kept: 198.51.100.1"*) t_pass "kube_host_checks: the public IP is the node's ExternalIP → ok" ;; *) t_fail "kube source ip ok: $OUT" ;; esac
+# K8: :6443 / :10250 answering on the public address → a warning.
+OUT="$(kt 'KUBE_TCP_PROBE=true; kube_host_checks')"
+case "$OUT" in *"warn	port 6443 answers on the public address 198.51.100.1"*"warn	port 10250 answers"*) t_pass "kube_host_checks: the API / kubelet on the public address → warning (K8)" ;; *) t_fail "kube K8: $OUT" ;; esac
+# The fixed ClusterIPs: in the static band and free.
+echo '{"items":[{"metadata":{"namespace":"kube-system","name":"x"},"spec":{"clusterIP":"10.43.0.21"}},{"metadata":{"namespace":"portcullis","name":"traefik"},"spec":{"clusterIP":"10.43.0.20"}}]}' > "$KS/kube/svcs.json"
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"ok	PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 is free"*"fail	PORTCULLIS_TRAEFIK_VPN_SERVICE_IP=10.43.0.21 is already taken by Service kube-system/x"*) t_pass "kube_host_checks: a fixed ClusterIP held by another Service → refused (ours is fine)" ;; *) t_fail "kube svc ip taken: $OUT" ;; esac
+OUT="$(kt 'PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.9.1; kube_host_checks')"
+case "$OUT" in *"fail	PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.9.1 is outside the service CIDR's static band (the first 256 addresses"*) t_pass "kube_host_checks: a fixed ClusterIP outside the static band → refused" ;; *) t_fail "kube band: $OUT" ;; esac
+k_fixtures
+# K11: a namespace Portcullis didn't create is never adopted.
+echo '{"metadata":{"name":"portcullis","labels":{"kubernetes.io/metadata.name":"portcullis"}}}' > "$KS/kube/ns-portcullis.json"
+OUT="$(kt 'kube_require_host')"
+case "$OUT" in *"isn't ready for Portcullis"*"namespace portcullis exists but isn't this install's"*"rc=1") t_pass "init kubernetes: foreign portcullis namespace → refused" ;; *) t_fail "kube foreign ns: $OUT" ;; esac
+echo '{"metadata":{"name":"portcullis","labels":{"app.kubernetes.io/managed-by":"portcullis"},"annotations":{"portcullis.io/install":"ffffffff-1111-4222-8333-444455556666"}}}' > "$KS/kube/ns-portcullis.json"
+OUT="$(kt 'kube_require_host')"
+case "$OUT" in *"namespace portcullis exists but isn't this install's"*"rc=1") t_pass "init kubernetes: our label but another install id → refused" ;; *) t_fail "kube other install: $OUT" ;; esac
+echo '{"metadata":{"name":"portcullis","labels":{"app.kubernetes.io/managed-by":"portcullis"},"annotations":{"portcullis.io/install":"0b0e2b3c-1111-4222-8333-444455556666"}}}' > "$KS/kube/ns-portcullis.json"
+OUT="$(kt 'kube_host_checks | grep "namespace portcullis "; kube_require_host')"
+case "$OUT" in *"ok	namespace portcullis belongs to this install"*"rc=0") t_pass "init kubernetes: matching install id → adopted" ;; *) t_fail "kube adopt: $OUT" ;; esac
+k_fixtures
+# The NetworkPolicy probe: proven only when the denied dial fails AND the allowed one succeeds.
+OUT="$(kt 'sleep() { :; }; kube_netpol_probe')"
+case "$OUT" in *"NetworkPolicies are enforced"*"rc=0") t_pass "kube_netpol_probe: denied fails, allowed succeeds → proven" ;; *) t_fail "kube probe ok: $OUT" ;; esac
+expect_eq "kube_netpol_probe: proven → ConfigMap portcullis-netpol-probe (proven_at) in portcullis-apps, the probe namespace deleted" \
+  "$(grep -c 'name: portcullis-netpol-probe' "$KS/kubectl-stdin"):$(grep -c 'namespace: portcullis-apps' "$KS/kubectl-stdin"):$(grep -c 'proven_at: "20' "$KS/kubectl-stdin"):$(grep -c 'delete namespace portcullis-netpol-probe' "$KS/kubectl-calls")" "1:1:1:2"
+k_fixtures
+OUT="$(kt 'sleep() { :; }; export STUB_DIAL_ALLOWED=1; kube_netpol_probe')"
+case "$OUT" in *"the allowed connection failed"*"rc=1") t_pass "kube_netpol_probe: allowed dial fails → not proven" ;; *) t_fail "kube probe allowed fails: $OUT" ;; esac
+expect_eq "kube_netpol_probe: not proven → ConfigMap not written, probe namespace deleted" "$(test -e "$KS/kubectl-stdin" && echo written || echo none):$(grep -c 'delete namespace portcullis-netpol-probe' "$KS/kubectl-calls")" "none:2"
+k_fixtures
+OUT="$(kt 'sleep() { :; }; export STUB_DIAL_DENIED=0; kube_netpol_probe')"
+case "$OUT" in *"NOT enforced"*"rc=1") t_pass "kube_netpol_probe: the denied dial gets through → not proven" ;; *) t_fail "kube probe denied ok: $OUT" ;; esac
+expect_eq "kube_netpol_probe: denied got through → ConfigMap not written" "$(test -e "$KS/kubectl-stdin" && echo written || echo none)" none
+expect_eq "kube/probe/*.yaml run PORTCULLIS_HELPER_IMAGE (the CLI's pinned helper)" \
+  "$(grep -h 'image:' "$HERE"/../kube/probe/*.yaml | sed 's/.*image: //' | sort -u)" "$PORTCULLIS_HELPER_IMAGE"
+# runtime_export under kubernetes: the pod + service CIDR are reserved (K-P11).
+expect_eq "runtime_export kubernetes: PORTCULLIS_VPN_RUNTIME_POOLS = pod + service CIDR" \
+  "$(kt 'runtime_export; echo "$PORTCULLIS_VPN_RUNTIME_POOLS"' | head -n1)" "10.42.0.0/24 10.43.0.0/16"
+# hub_env_write: the _SOURCE pair (contract §2), the kube keys for the Hub.
+HW="$WORK/hw"; rm -rf "$HW"; mkdir -p "$HW/secrets/hub"
+( export PORTCULLIS_ROOT="$HW" CONTAINER_RUNTIME=docker PORTCULLIS_TRAEFIK_IP=172.31.250.2 PORTCULLIS_MCP_GATE_IP=172.31.250.3; hub_env_write )
+expect_eq "hub_env_write: PORTCULLIS_TRAEFIK_SOURCE / _MCP_GATE_SOURCE = <ip>/32 on docker, no kube keys" \
+  "$(grep -E '^PORTCULLIS_(TRAEFIK|MCP_GATE)_SOURCE=|^PORTCULLIS_(POD_CIDR|SERVICE_CIDR|WG_EDGE_SERVICE_IP|RUNTIME_ROOTS|KUBE_CONTEXT|KUBE_NODE_ADDRESSES)=' "$HW/secrets/hub/core.env")" \
+  "PORTCULLIS_TRAEFIK_SOURCE=172.31.250.2/32
+PORTCULLIS_MCP_GATE_SOURCE=172.31.250.3/32"
+kt "PORTCULLIS_ROOT='$HW'; PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.0.22 PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.1'; hub_env_write" >/dev/null
+expect_eq "hub_env_write: PORTCULLIS_TRAEFIK_SOURCE = the pod CIDR on kubernetes, plus the CIDRs, wg-edge, the runtime roots, the context and the node addresses" \
+  "$(grep -E '^PORTCULLIS_(TRAEFIK|MCP_GATE)_SOURCE=|^PORTCULLIS_(POD_CIDR|SERVICE_CIDR|WG_EDGE_SERVICE_IP|TRAEFIK_SERVICE_IP|RUNTIME_ROOTS|KUBE_CONTEXT|KUBE_NODE_ADDRESSES)=' "$HW/secrets/hub/core.env")" \
+  "PORTCULLIS_TRAEFIK_SOURCE=10.42.0.0/24
+PORTCULLIS_MCP_GATE_SOURCE=10.42.0.0/24
+PORTCULLIS_POD_CIDR=10.42.0.0/24
+PORTCULLIS_SERVICE_CIDR=10.43.0.0/16
+PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.0.22
+PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20
+PORTCULLIS_RUNTIME_ROOTS=/var/lib/rancher/k3s /var/lib/portcullis-storage
+PORTCULLIS_KUBE_CONTEXT=ci
+PORTCULLIS_KUBE_NODE_ADDRESSES=10.1.0.4 198.51.100.1"
+# jq 1.8: `A and B as $x | C` binds (A and B) to $x (jq 1.7 bound B
+# alone): the two readings differ, so the kubernetes filters write the
+# parentheses out.
+JQF='{"items":[{"ok":true,"n":1}]}'
+expect_eq "jq 1.8 precedence fixture: (A and B) as \$x and A and (B as \$x | …) differ" \
+  "$(printf '%s' "$JQF" | jq -c '.items[0] | (.ok and .n) as $x | [$x]')|$(printf '%s' "$JQF" | jq -c '.items[0] | .ok and (.n as $x | [$x])')" "[true]|true"
+expect_eq "every jq '... and/or ... as \$x' in the kubernetes code is parenthesised" \
+  "$(grep -nE '(and|or) [^|()]+ as [$]' "$HERE/../scripts/lib/kube.sh" || true)" ""
 
 echo ""
 echo "$PASS passed, $FAIL failed"

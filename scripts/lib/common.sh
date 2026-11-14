@@ -247,13 +247,15 @@ dc() { _rt_docker_only; docker compose --project-directory "$PORTCULLIS_ROOT" "$
 
 # rt_up [service...] — start / update the core stack (docker / podman:
 # stack_compose_up, scripts/lib/runtime.sh: local images built first, one
-# up, the slow-start retry).
-rt_up() { stack_compose_up "$@"; }
+# up, the slow-start retry; kubernetes: the Helm release, which is whole,
+# so a service list is accepted and ignored).
+# Every verb's kubernetes branch is _rtk_<verb> (scripts/lib/kube.sh).
+rt_up() { if _rt_is_kube; then _rtk_up "$@"; else stack_compose_up "$@"; fi; }
 
 # rt_up_service [--deps] <service>... — (re)create just these services
 # now, without building (docker: `up -d --no-deps`; --deps: with their
 # dependencies).
-rt_up_service() { _rtd_up_service "$@"; }
+rt_up_service() { if _rt_is_kube; then _rtk_up_service "$@"; else _rtd_up_service "$@"; fi; }
 _rtd_up_service() {
   local deps=--no-deps
   [ "$1" != --deps ] || { deps=""; shift; }
@@ -262,20 +264,20 @@ _rtd_up_service() {
 }
 
 # rt_pull — fetch the images of the core stack (local builds excluded).
-rt_pull() { _rtd_pull; }
+rt_pull() { if _rt_is_kube; then _rtk_pull; else _rtd_pull; fi; }
 _rtd_pull() { dc pull --quiet --ignore-buildable 2>/dev/null || dc pull --ignore-buildable; }
 
 # rt_services — the core services, one per line (active profiles).
-rt_services() { _rtd_services; }
+rt_services() { if _rt_is_kube; then _rtk_services; else _rtd_services; fi; }
 _rtd_services() { dc config --services; }
 
 # rt_require_tools — the runtime's client tools are there (docker: the
 # compose plugin).
-rt_require_tools() { _rtd_require_tools; }
+rt_require_tools() { if _rt_is_kube; then _rtk_require_tools; else _rtd_require_tools; fi; }
 _rtd_require_tools() { docker compose version >/dev/null 2>&1 || fail "the docker compose plugin is required"; }
 
 # rt_down [args...] — stop and remove the core containers (volumes kept).
-rt_down() { _rtd_down "$@"; }
+rt_down() { if _rt_is_kube; then _rtk_down "$@"; else _rtd_down "$@"; fi; }
 _rtd_down() { dc down "$@"; }
 
 # rt_exec [-i] [-e NAME]... <service> -- <argv...> — run argv in the
@@ -295,7 +297,12 @@ rt_exec() {
     esac
   done
   [ -n "$svc" ] || fail "rt_exec: no service"
-  _rtd_exec "$svc" ${envs[@]+"${envs[@]}"} -- "$@"
+  if _rt_is_kube; then
+    [ "${#envs[@]}" -eq 0 ] || fail "rt_exec -e is docker / podman only (on kubernetes pass values on stdin)"
+    _rtk_exec "$svc" "$@"
+  else
+    _rtd_exec "$svc" ${envs[@]+"${envs[@]}"} -- "$@"
+  fi
 }
 _rtd_exec() {
   local svc="$1"
@@ -307,30 +314,30 @@ _rtd_exec() {
 }
 
 # rt_logs <service> [compose logs options...] — the service's log.
-rt_logs() { local svc="$1"; shift; _rtd_logs "$svc" "$@"; }
+rt_logs() { local svc="$1"; shift; if _rt_is_kube; then _rtk_logs "$svc" "$@"; else _rtd_logs "$svc" "$@"; fi; }
 _rtd_logs() { local svc="$1"; shift; dc logs "$@" "$svc"; }
 
 # rt_ps [--json] — the core containers (--json: compose's JSON lines,
 # stopped ones included).
-rt_ps() { _rtd_ps "$@"; }
+rt_ps() { if _rt_is_kube; then _rtk_ps "$@"; else _rtd_ps "$@"; fi; }
 _rtd_ps() {
   if [ "${1:-}" = --json ]; then dc ps -a --format json; else dc ps; fi
 }
 
 # rt_running <service> — true when the service has a running container.
-rt_running() { _rtd_running "$1"; }
+rt_running() { if _rt_is_kube; then _rtk_running "$1"; else _rtd_running "$1"; fi; }
 _rtd_running() { [ -n "$(dc ps -q --status running "$1" 2>/dev/null)" ]; }
 
 # rt_restart <service>... / rt_stop <service>... / rt_start <service>...
-rt_restart() { _rtd_restart "$@"; }
+rt_restart() { if _rt_is_kube; then _rtk_restart "$@"; else _rtd_restart "$@"; fi; }
 _rtd_restart() { dc restart "$@"; }
-rt_stop() { _rtd_stop "$@"; }
+rt_stop() { if _rt_is_kube; then _rtk_stop "$@"; else _rtd_stop "$@"; fi; }
 _rtd_stop() { dc stop "$@"; }
-rt_start() { _rtd_start "$@"; }
+rt_start() { if _rt_is_kube; then _rtk_start "$@"; else _rtd_start "$@"; fi; }
 _rtd_start() { dc start "$@"; }
 
 # rt_kill <service> <signal> — send a signal to the service's main process.
-rt_kill() { _rtd_kill "$1" "$2"; }
+rt_kill() { if _rt_is_kube; then _rtk_kill "$1" "$2"; else _rtd_kill "$1" "$2"; fi; }
 _rtd_kill() { dc kill -s "$2" "$1"; }
 
 # rt_run <service> [-i] [--user U:G] [--entrypoint E] [--label K=V] -- <args...>
@@ -348,7 +355,7 @@ rt_run() {
       *) fail "rt_run: unknown option $1" ;;
     esac
   done
-  _rtd_run "$svc" ${opts[@]+"${opts[@]}"} -- "$@"
+  if _rt_is_kube; then _rtk_run "$svc" ${opts[@]+"${opts[@]}"} -- "$@"; else _rtd_run "$svc" ${opts[@]+"${opts[@]}"} -- "$@"; fi
 }
 _rtd_run() {
   local svc="$1"
@@ -361,7 +368,7 @@ _rtd_run() {
 
 # rt_image <service> — the running container's image as "<ref> (<id>)",
 # nothing when it isn't running.
-rt_image() { _rtd_image "$1"; }
+rt_image() { if _rt_is_kube; then _rtk_image "$1"; else _rtd_image "$1"; fi; }
 _rtd_image() {
   local cid
   cid="$(dc ps -q "$1" 2>/dev/null | head -n1 || true)"
@@ -370,7 +377,7 @@ _rtd_image() {
 
 # rt_started_at <service> — the running container's start time as the
 # runtime reports it (RFC 3339), nothing when it isn't running.
-rt_started_at() { _rtd_started_at "$1"; }
+rt_started_at() { if _rt_is_kube; then _rtk_started_at "$1"; else _rtd_started_at "$1"; fi; }
 _rtd_started_at() {
   local cid
   cid="$(dc ps -q "$1" 2>/dev/null | head -n1)"
@@ -379,7 +386,7 @@ _rtd_started_at() {
 }
 
 # rt_health <service> — healthy|unhealthy|starting|running|exited|missing
-rt_health() { _rtd_health "$1"; }
+rt_health() { if _rt_is_kube; then _rtk_health "$1"; else _rtd_health "$1"; fi; }
 _rtd_health() {
   local cid st
   cid="$(dc ps -q "$1" 2>/dev/null | head -n1)"
@@ -392,7 +399,7 @@ _rtd_health() {
 # core named volume on stdout, read by a throwaway helper as uid:gid
 # (default 0:0 with no capability: owner and mode only), the volume
 # mounted read-only at /vol (never at an image path).
-rt_volume_out() { _rtd_volume_out "$@"; }
+rt_volume_out() { if _rt_is_kube; then _rtk_volume_out "$@"; else _rtd_volume_out "$@"; fi; }
 _rtd_volume_out() {
   local vol="${COMPOSE_PROJECT_NAME:-portcullis}_$1" path="${2:-.}" user="${3:-0:0}"
   docker run --rm -i --network none --read-only --user "$user" --cap-drop ALL \
@@ -402,7 +409,7 @@ _rtd_volume_out() {
 
 # rt_volume_in <volume> <path> [uid:gid] — a tar on stdin extracted under
 # <path> inside the core named volume, as uid:gid (the volume's owner).
-rt_volume_in() { _rtd_volume_in "$@"; }
+rt_volume_in() { if _rt_is_kube; then _rtk_volume_in "$@"; else _rtd_volume_in "$@"; fi; }
 _rtd_volume_in() {
   local vol="${COMPOSE_PROJECT_NAME:-portcullis}_$1" path="${2:-.}" user="${3:-0:0}"
   docker run --rm -i --network none --read-only --user "$user" --cap-drop ALL \
@@ -671,7 +678,7 @@ secrets_fix_perms() {
 # Core variables the Hub may copy into app .env files (templates reference
 # them as ${VAR}); everything else in .env is a core secret the Hub never
 # sees. Operators can add names via HUB_SHARED_ENV="VAR1 VAR2".
-HUB_ENV_VARS="PORTCULLIS_DOMAIN PORTCULLIS_TRAEFIK_IP PORTCULLIS_MCP_GATE_IP PORTCULLIS_PROXY_SUBNET PORTCULLIS_PROXY_IP_RANGE PORTAL_DISPLAY_NAME PORTCULLIS_VPN_MODE PORTCULLIS_VPN_PUBLIC_ENROL PORTCULLIS_VPN_NET PORTCULLIS_VPN_WG_IP PORTCULLIS_VPN_BUILTIN PORTCULLIS_VPN_RESERVED_RANGES"
+HUB_ENV_VARS="PORTCULLIS_DOMAIN PORTCULLIS_TRAEFIK_IP PORTCULLIS_MCP_GATE_IP PORTCULLIS_TRAEFIK_SOURCE PORTCULLIS_MCP_GATE_SOURCE PORTCULLIS_PROXY_SUBNET PORTCULLIS_PROXY_IP_RANGE PORTAL_DISPLAY_NAME PORTCULLIS_VPN_MODE PORTCULLIS_VPN_PUBLIC_ENROL PORTCULLIS_VPN_NET PORTCULLIS_VPN_WG_IP PORTCULLIS_VPN_BUILTIN PORTCULLIS_VPN_RESERVED_RANGES"
 HUB_ENV_PREFIXES="NETBIRD_ COTURN_"
 
 # hub_env_write — secrets/hub/core.env, mounted read-only as the Hub's
@@ -690,12 +697,20 @@ hub_env_write() {
     [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
     case " $CORE_SECRETS " in *" $v "*) warn "HUB_SHARED_ENV: refusing to share core secret $v with the Hub"; continue ;; esac
     case "$content" in "$v="*|*$'\n'"$v="*) continue ;; esac
-    # Written below from the host (podman only), never shared by name.
-    [ "$v" != PORTCULLIS_UNPRIVILEGED_PORT_START ] || continue
+    # Written below from the host (podman / kubernetes only), never shared by name.
+    case "$v" in PORTCULLIS_UNPRIVILEGED_PORT_START|PORTCULLIS_POD_CIDR|PORTCULLIS_SERVICE_CIDR|PORTCULLIS_WG_EDGE_SERVICE_IP|PORTCULLIS_TRAEFIK_SERVICE_IP|PORTCULLIS_RUNTIME_ROOTS|PORTCULLIS_KUBE_*) continue ;; esac
     case "$v" in
       PORTCULLIS_DOMAIN) val="${PORTCULLIS_DOMAIN:-portcullis.local}" ;;
       PORTCULLIS_TRAEFIK_IP) val="$(proxy_traefik_ip)" ;;
       PORTCULLIS_MCP_GATE_IP) val="$(mcp_gate_ip)" ;;
+      # Contract §2: the only peers that may send identity headers / call
+      # companions — Traefik's and mcp-gate's address on docker / podman,
+      # the pod CIDR on kubernetes (with a NetworkPolicy admitting only
+      # that peer: this is the second layer). Never from .env.
+      PORTCULLIS_TRAEFIK_SOURCE)
+        if _rt_is_kube; then val="${PORTCULLIS_POD_CIDR:-}"; else val="$(proxy_traefik_ip)/32"; fi ;;
+      PORTCULLIS_MCP_GATE_SOURCE)
+        if _rt_is_kube; then val="${PORTCULLIS_POD_CIDR:-}"; else val="$(mcp_gate_ip)/32"; fi ;;
       PORTCULLIS_PROXY_SUBNET) val="$(proxy_subnet)" ;;
       PORTCULLIS_PROXY_IP_RANGE) val="$(proxy_ip_range)" ;;
       PORTAL_DISPLAY_NAME) val="${PORTAL_DISPLAY_NAME:-Portcullis}" ;;
@@ -718,6 +733,19 @@ hub_env_write() {
   # sysctl the Hub can't read from inside its container; RootlessCompat).
   if _rt_is_podman; then
     content+="PORTCULLIS_UNPRIVILEGED_PORT_START=$(runtime_port_start)"$'\n'
+  fi
+  # Kubernetes (contract §2): the cluster's networks, wg-edge's address,
+  # the doctor's forbidden roots, the context (GET /api/runtime) and the
+  # node addresses (read now: the instances' egress rule and the admission
+  # params exclude them).
+  if _rt_is_kube; then
+    content+="PORTCULLIS_POD_CIDR=${PORTCULLIS_POD_CIDR:-}"$'\n'
+    content+="PORTCULLIS_SERVICE_CIDR=${PORTCULLIS_SERVICE_CIDR:-}"$'\n'
+    content+="PORTCULLIS_WG_EDGE_SERVICE_IP=${PORTCULLIS_WG_EDGE_SERVICE_IP:-}"$'\n'
+    content+="PORTCULLIS_TRAEFIK_SERVICE_IP=${PORTCULLIS_TRAEFIK_SERVICE_IP:-}"$'\n'
+    content+="PORTCULLIS_RUNTIME_ROOTS=$KUBE_RUNTIME_ROOTS"$'\n'
+    content+="PORTCULLIS_KUBE_CONTEXT=${PORTCULLIS_KUBE_CONTEXT:-}"$'\n'
+    content+="PORTCULLIS_KUBE_NODE_ADDRESSES=$(kube_node_addresses)"$'\n'
   fi
   (umask 077 && mkdir -p "$(dirname "$f")")
   [ -e "$f" ] || (umask 077 && : > "$f")

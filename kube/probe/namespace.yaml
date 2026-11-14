@@ -1,0 +1,45 @@
+# The NetworkPolicy enforcement probe (spec §6, kube_netpol_probe): a
+# scratch namespace, PSA restricted, with the server every client dials.
+# Deleted by the CLI after every probe. The image is the CLI's
+# PORTCULLIS_HELPER_IMAGE (tests/test_shell_libs.sh checks they match).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: portcullis-netpol-probe
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: server
+  namespace: portcullis-netpol-probe
+  labels:
+    portcullis.io/probe: server
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: server
+      image: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      command: ["sh", "-c", "while true; do echo ok | nc -l -p 8080; done"]
+      ports:
+        - containerPort: 8080
+      resources:
+        limits:
+          memory: 16Mi
+        requests:
+          memory: 16Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]

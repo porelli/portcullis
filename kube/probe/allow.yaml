@@ -1,0 +1,71 @@
+# The one allowed path (client-allowed → server :8080, both directions'
+# rules) and its client: its dial has to succeed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-client
+  namespace: portcullis-netpol-probe
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/probe: server
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/probe: allowed
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-client-egress
+  namespace: portcullis-netpol-probe
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/probe: allowed
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              portcullis.io/probe: server
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: client-allowed
+  namespace: portcullis-netpol-probe
+  labels:
+    portcullis.io/probe: allowed
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65534
+    runAsGroup: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: client
+      image: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      command: ["sleep", "600"]
+      resources:
+        limits:
+          memory: 16Mi
+        requests:
+          memory: 16Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]

@@ -17,12 +17,13 @@ RT_PODMAN_MIN="5.4"
 RT_PORT_START_MAX=80
 RT_MIN_IDS=65536
 
-# runtime_name — docker|podman from CONTAINER_RUNTIME; anything else fails.
+# runtime_name — docker|podman|kubernetes from CONTAINER_RUNTIME; anything
+# else fails.
 runtime_name() {
   case "${CONTAINER_RUNTIME:-}" in
-    docker|podman) printf '%s\n' "$CONTAINER_RUNTIME" ;;
-    "") fail "CONTAINER_RUNTIME is not set in .env (docker or podman): ./portcullis init writes it; an install from before rootless support adds CONTAINER_RUNTIME=docker by hand" ;;
-    *) fail "CONTAINER_RUNTIME=$CONTAINER_RUNTIME is neither docker nor podman (.env)" ;;
+    docker|podman|kubernetes) printf '%s\n' "$CONTAINER_RUNTIME" ;;
+    "") fail "CONTAINER_RUNTIME is not set in .env (docker, podman or kubernetes): ./portcullis init writes it; an install from before rootless support adds CONTAINER_RUNTIME=docker by hand" ;;
+    *) fail "CONTAINER_RUNTIME=$CONTAINER_RUNTIME is not docker, podman or kubernetes (.env)" ;;
   esac
 }
 
@@ -92,6 +93,8 @@ runtime_detect() {
   local want="${1:-${CONTAINER_RUNTIME:-}}" sock
   case "$want" in
     docker) echo docker; return 0 ;;
+    # Never detected: only by name (--runtime kubernetes, with its context).
+    kubernetes) echo kubernetes; return 0 ;;
     podman)
       if [ "$(id -u)" = 0 ]; then
         echo "podman as root is not supported: Portcullis runs rootless Podman only (as a dedicated unprivileged user)" >&2
@@ -99,7 +102,7 @@ runtime_detect() {
       fi
       echo podman; return 0 ;;
     "") ;;
-    *) echo "the container runtime must be docker or podman (got '$want')" >&2; return 1 ;;
+    *) echo "the container runtime must be docker, podman or kubernetes (got '$want')" >&2; return 1 ;;
   esac
   if [ -n "${DOCKER_HOST:-}" ]; then
     if _rt_engine_probe && [ "$_RT_ENGINE" = docker ]; then echo docker; return 0; fi
@@ -143,6 +146,12 @@ runtime_export() {
   # group-gate (compose appends them to WG_CORE_SUBNETS / GATE_CORE_SUBNETS)
   # and by the Hub (vpn_reserved_ranges). Never taken from outside.
   export PORTCULLIS_VPN_RUNTIME_POOLS=""
+  # Kubernetes: the pod and service networks (K-P11).
+  if _rt_is_kube; then
+    export PORTCULLIS_VPN_RUNTIME_POOLS="${PORTCULLIS_POD_CIDR:-} ${PORTCULLIS_SERVICE_CIDR:-}"
+    PORTCULLIS_VPN_RUNTIME_POOLS="$(printf '%s' "$PORTCULLIS_VPN_RUNTIME_POOLS" | xargs)"
+    return 0
+  fi
   _rt_is_podman || return 0
   export PORTCULLIS_VPN_RUNTIME_POOLS="$RT_PODMAN_POOLS"
   sock="$(runtime_podman_socket)"
@@ -172,6 +181,11 @@ runtime_check() {
   local rt sock
   rt="$(runtime_name)" || exit 1
   runtime_export
+  if [ "$rt" = kubernetes ]; then
+    kube_runtime_check
+    _RT_CHECKED=1
+    return 0
+  fi
   _rt_engine_probe || fail "the container engine doesn't answer (CONTAINER_RUNTIME=$rt, DOCKER_HOST=${DOCKER_HOST:-unset}): start it, or check the socket"
   [ "$_RT_ENGINE" = "$rt" ] || fail "CONTAINER_RUNTIME=$rt but the engine is $(_rt_engine_label "$_RT_ENGINE")${DOCKER_HOST:+ (DOCKER_HOST=$DOCKER_HOST)}"
   if [ "$rt" = podman ]; then
@@ -191,6 +205,7 @@ runtime_check() {
 
 # runtime_version — the engine's version (best effort, "" when it doesn't answer).
 runtime_version() {
+  if _rt_is_kube; then kube_server_version; return 0; fi
   _rt_engine_probe || return 0
   printf '%s\n' "$_RT_ENGINE_VERSION"
 }
@@ -418,6 +433,7 @@ _rt_apparmor_pasta_check() {
 # while a † host-prep item fails. Docker: no-op.
 runtime_require_host() {
   local lines fails
+  if _rt_is_kube; then kube_require_host; return; fi
   _rt_is_podman || return 0
   [ -z "${_RT_HOST_OK:-}" ] || return 0
   lines="$(runtime_host_checks)" || exit 1
@@ -609,6 +625,7 @@ runtime_status_json() {
   local rt ver checks
   rt="$(runtime_name)" || exit 1
   ver="$(runtime_version)"
+  if [ "$rt" = kubernetes ]; then kube_status_json "$ver"; return 0; fi
   if [ "$rt" = docker ]; then
     jq -nc --arg v "$ver" --argjson u "$(id -u)" \
       '{name: "docker", version: (if $v == "" then null else $v end), rootless: false, uid: $u,
@@ -625,3 +642,8 @@ runtime_status_json() {
       subuid_start: ($us | num), subuid_count: ($un | num), subgid_start: ($gs | num), subgid_count: ($gn | num),
       port_start: $p, checks: $c}'
 }
+
+# The kubernetes runtime (kube_ctl, the cluster checks, the probe, the
+# rt_* kubernetes branch).
+# shellcheck source=kube.sh
+source "$PORTCULLIS_LIB/kube.sh"

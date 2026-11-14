@@ -151,7 +151,10 @@ init --domain|--domain needs a value
 init --domain --email|--domain needs a value
 init --frob|unknown argument: --frob
 init --runtime|--runtime needs a value
-init --runtime lxc|--runtime must be docker or podman
+init --runtime lxc|--runtime must be docker, podman or kubernetes
+init --runtime docker --kube-context ci|--kube-context goes with --runtime kubernetes
+init --runtime kubernetes|--runtime kubernetes needs --kube-context
+init --kube-context|--kube-context needs a value
 vault init --rotate-enroll-secret|unknown argument
 pki setup --with-server-certs|unknown argument
 cert enroll|expected <username> [email]
@@ -214,7 +217,7 @@ EOF
 
 # ── no secret on a command line (CLAUDE.md: stdin, -H @<(...), key=-, jq
 # --rawfile / env.X) ── lines marked "secret-argv-ok" are reviewed exceptions.
-ARGV_RE='--arg(json)? [A-Za-z_]+ "?\$\(cat|--arg(json)? [A-Za-z_]+ "?\$\{?[A-Za-z_]*(PASSWORD|SECRET|TOKEN|PASS)\b|--(admin-)?password[ =]"?\$|--token[ =]"?\$|(PASSWORD|SECRET|TOKEN)=[^ ]*\$\(cat '
+ARGV_RE='--from-literal|--set(-string|-json)?[ =][^ ]*(secrets/|\$\(cat|PASSWORD|SECRET|TOKEN)|--arg(json)? [A-Za-z_]+ "?\$\(cat|--arg(json)? [A-Za-z_]+ "?\$\{?[A-Za-z_]*(PASSWORD|SECRET|TOKEN|PASS)\b|--(admin-)?password[ =]"?\$|--token[ =]"?\$|(PASSWORD|SECRET|TOKEN)=[^ ]*\$\(cat '
 HITS="$(grep -nE -e "$ARGV_RE" "$HERE/../portcullis" "$HERE"/../scripts/lib/*.sh | grep -v 'secret-argv-ok' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
 expect_eq "no secrets on argv in the CLI" "$HITS" ""
 # Container root is the operator under rootless Podman: an operator-owned
@@ -387,8 +390,8 @@ expect_eq "the rt_* lint catches a docker call in a function without the guard" 
          [ -n "$hit" ] || continue
          first="$(printf '%s\n' "$body" | sed -n '3,$p' | grep -vE '^[[:space:]]*(local|declare) ' | head -n1 | tr -d ' ;')"
          [ "$first" = _rt_docker_only ] || echo "$f"; done) 2>/dev/null)" "unguarded"
-case "$(printf '%s\n' '  jq -n --arg p "$(cat "$f")" x' '  jq --arg pass "$LLDAP_ADMIN_PASSWORD"' | grep -cE -e "$ARGV_RE")" in
-  2) t_pass "argv secret pattern catches --arg \"\$(cat ...)\" and secret variables" ;; *) t_fail "argv secret pattern" ;; esac
+case "$(printf '%s\n' '  jq -n --arg p "$(cat "$f")" x' '  jq --arg pass "$LLDAP_ADMIN_PASSWORD"' '  kube_ctl create secret generic x --from-literal=a=b' '  kube_helm upgrade --set hub.secret=$(cat secrets/hub/x)' '  helm upgrade --set-string pw=$POSTGRES_PASSWORD' | grep -cE -e "$ARGV_RE")" in
+  5) t_pass "argv secret pattern catches --arg \"\$(cat ...)\", secret variables, --from-literal and --set with a secret" ;; *) t_fail "argv secret pattern" ;; esac
 
 # version and backup schedule work without .env (and without docker).
 run version
@@ -432,7 +435,7 @@ expect_eq "version with .env but no CONTAINER_RUNTIME → refused" "$RC" 1
 case "$ERR" in *"CONTAINER_RUNTIME is not set in .env"*) t_pass "version names CONTAINER_RUNTIME" ;; *) t_fail "version without CONTAINER_RUNTIME: $ERR" ;; esac
 # need_env: every command needing the runtime refuses without it.
 run status
-expect_eq "need_env: no CONTAINER_RUNTIME → refused naming the variable" "$RC:$(printf '%s' "$ERR" | grep -c 'CONTAINER_RUNTIME is not set in .env (docker or podman)')" "1:1"
+expect_eq "need_env: no CONTAINER_RUNTIME → refused naming the variable" "$RC:$(printf '%s' "$ERR" | grep -c 'CONTAINER_RUNTIME is not set in .env (docker, podman or kubernetes)')" "1:1"
 rm -f "$PORTCULLIS_ROOT/.env"
 run restore --from-offsite
 expect_eq "restore --from-offsite without a repository exits 1" "$RC" 1
@@ -458,6 +461,32 @@ RC=0; XDG_RUNTIME_DIR=/run/user/4242 "$CLI" init --env-only --non-interactive --
 expect_eq "init --env-only writes CONTAINER_RUNTIME=podman and the rootless PORTCULLIS_ENGINE_SOCKET with --runtime podman" \
   "$RC:$(grep -c '^CONTAINER_RUNTIME=podman$' "$PORTCULLIS_ROOT/.env"):$(grep -c '^PORTCULLIS_ENGINE_SOCKET=/run/user/4242/podman/podman.sock$' "$PORTCULLIS_ROOT/.env")" "0:1:1"
 rm -f "$PORTCULLIS_ROOT/.env"
+# --runtime kubernetes: the context's networks detected, the kube keys
+# written (a kubectl stub on the context ci; any other context fails).
+mkdir -p "$WORK/kbin"
+cat > "$WORK/kbin/kubectl" <<'KSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$KUBE_CALLS"
+[ "$*" = "config get-contexts -o name" ] && { echo ci; exit 0; }
+[ "$1 $2" = "--context ci" ] || exit 97
+shift 2
+case "$*" in
+  "get nodes -o json") echo '{"items":[{"metadata":{"name":"n1"},"spec":{"podCIDRs":["10.42.0.0/24"]},"status":{"addresses":[{"type":"InternalIP","address":"10.1.0.4"}]}}]}' ;;
+  "create --dry-run=server -f -") cat >/dev/null; echo 'The Service "portcullis-cidr-probe" is invalid: spec.clusterIPs: Invalid value: []string{"0.0.0.1"}: failed to allocate IP 0.0.0.1: the provided IP (0.0.0.1) is not in the valid range. The range of valid IPs is 10.43.0.0/16' >&2; exit 1 ;;
+  "get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o json") echo '{"items":[{"ports":[{"port":6443}],"endpoints":[{"addresses":["10.1.0.4"]}]}]}' ;;
+  *) exit 98 ;;
+esac
+KSTUB
+chmod +x "$WORK/kbin/kubectl"
+RC=0; PATH="$WORK/kbin:$PATH" KUBE_CALLS="$WORK/kube-calls" STUB_CALLS="$WORK/kdocker-calls" "$CLI" init --env-only --non-interactive --domain ci.example.org --dns-provider none --runtime kubernetes --kube-context ci >/dev/null 2>"$WORK/err" </dev/null || RC=$?
+expect_eq "init --env-only --runtime kubernetes writes CONTAINER_RUNTIME=kubernetes, the context, namespaces, detected networks, the install id, registry images and the fixed ClusterIPs" \
+  "$RC:$(grep -cxE 'CONTAINER_RUNTIME=kubernetes|PORTCULLIS_KUBE_CONTEXT=ci|PORTCULLIS_NAMESPACE=portcullis|PORTCULLIS_APPS_NAMESPACE=portcullis-apps|PORTCULLIS_POD_CIDR=10\.42\.0\.0/24|PORTCULLIS_SERVICE_CIDR=10\.43\.0\.0/16|PORTCULLIS_KUBE_API_ENDPOINTS=10\.1\.0\.4:6443|PORTCULLIS_KUBE_INSTALL_ID=[0-9a-f-]{36}|PORTCULLIS_KUBE_IMAGES=registry|PORTCULLIS_TRAEFIK_SERVICE_IP=10\.43\.0\.20|PORTCULLIS_TRAEFIK_VPN_SERVICE_IP=10\.43\.0\.21|PORTCULLIS_WG_EDGE_SERVICE_IP=10\.43\.0\.22' "$PORTCULLIS_ROOT/.env"):$(grep -vc '^--context ci \|^config get-contexts' "$WORK/kube-calls")" "0:12:0"
+expect_eq "init --runtime kubernetes: no docker call" "$(cat "$WORK/kdocker-calls" 2>/dev/null)" ""
+run init --env-only --non-interactive --runtime docker
+expect_eq "init: CONTAINER_RUNTIME=kubernetes in .env, --runtime docker → refused" "$RC:$(grep -c 'never switched' <<< "$ERR")" "1:1"
+rm -f "$PORTCULLIS_ROOT/.env"
+RC=0; PATH="$WORK/kbin:$PATH" KUBE_CALLS="$WORK/kube-calls" "$CLI" init --env-only --non-interactive --domain ci.example.org --dns-provider none --runtime kubernetes --kube-context prod >/dev/null 2>"$WORK/err" </dev/null || RC=$?
+expect_eq "init --runtime kubernetes: a context that doesn't exist → refused, no .env" "$RC:$(grep -c "kube context prod doesn't exist" "$WORK/err"):$(test -e "$PORTCULLIS_ROOT/.env" && echo yes || echo no)" "1:1:no"
 run init --env-only --non-interactive --domain ci.example.org --dns-provider none --runtime docker
 expect_eq "init --env-only succeeds" "$RC" 0
 ENVF="$PORTCULLIS_ROOT/.env"
