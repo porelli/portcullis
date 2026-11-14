@@ -224,19 +224,190 @@ env_generate_missing() {
   env_load
 }
 
-# ── docker compose ─────────────────────────────────────────
+# ── Runtime verbs (rt_*) ───────────────────────────────────
+#
+# Every container operation outside the runtime layer goes through these
+# verbs. On docker / podman each is today's `docker compose` code (the
+# `_rtd_*` docker branch); code that only exists there (throwaway helper
+# containers, named volumes, Docker networks, the compose project) lives in
+# functions that start with `_rt_docker_only`, which refuses to run under
+# any other runtime. tests/test_cli.sh checks that every function calling
+# dc / docker is one of those (or the docker branch itself).
+
+# _rt_docker_only — the first command of every function that calls docker
+# or dc directly: refused (fail closed) under CONTAINER_RUNTIME=kubernetes.
+_rt_docker_only() {
+  [ "${CONTAINER_RUNTIME:-}" != kubernetes ] \
+    || fail "internal: ${FUNCNAME[1]:-?} runs on docker / podman only (CONTAINER_RUNTIME=kubernetes)"
+}
 
 # dc <args> — docker compose for the core project. COMPOSE_FILE (e.g. CI
 # overrides) is honoured because we run from the project root.
-dc() { docker compose --project-directory "$PORTCULLIS_ROOT" "$@"; }
+dc() { _rt_docker_only; docker compose --project-directory "$PORTCULLIS_ROOT" "$@"; }
 
-# container_health <service> — healthy|unhealthy|starting|running|exited|missing
-container_health() {
+# rt_up [service...] — start / update the core stack (docker / podman:
+# stack_compose_up, scripts/lib/runtime.sh: local images built first, one
+# up, the slow-start retry).
+rt_up() { stack_compose_up "$@"; }
+
+# rt_up_service [--deps] <service>... — (re)create just these services
+# now, without building (docker: `up -d --no-deps`; --deps: with their
+# dependencies).
+rt_up_service() { _rtd_up_service "$@"; }
+_rtd_up_service() {
+  local deps=--no-deps
+  [ "$1" != --deps ] || { deps=""; shift; }
+  # shellcheck disable=SC2046,SC2086  # nothing or --no-build; nothing or --no-deps
+  dc up -d $(runtime_no_build) $deps "$@"
+}
+
+# rt_pull — fetch the images of the core stack (local builds excluded).
+rt_pull() { _rtd_pull; }
+_rtd_pull() { dc pull --quiet --ignore-buildable 2>/dev/null || dc pull --ignore-buildable; }
+
+# rt_services — the core services, one per line (active profiles).
+rt_services() { _rtd_services; }
+_rtd_services() { dc config --services; }
+
+# rt_require_tools — the runtime's client tools are there (docker: the
+# compose plugin).
+rt_require_tools() { _rtd_require_tools; }
+_rtd_require_tools() { docker compose version >/dev/null 2>&1 || fail "the docker compose plugin is required"; }
+
+# rt_down [args...] — stop and remove the core containers (volumes kept).
+rt_down() { _rtd_down "$@"; }
+_rtd_down() { dc down "$@"; }
+
+# rt_exec [-i] [-e NAME]... <service> -- <argv...> — run argv in the
+# service's running container. -i: stdin is passed (docker always passes
+# it: `exec -T`). -e NAME: the variable passed by NAME, never its value on
+# argv (docker / podman only). No -u: the container's own user.
+rt_exec() {
+  local -a envs=()
+  local svc=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -i) shift ;;
+      -e) envs+=(-e "$2"); shift 2 ;;
+      --) shift; break ;;
+      -*) fail "rt_exec: unknown option $1" ;;
+      *) [ -z "$svc" ] || fail "rt_exec: expected <service> -- <argv...>"; svc="$1"; shift ;;
+    esac
+  done
+  [ -n "$svc" ] || fail "rt_exec: no service"
+  _rtd_exec "$svc" ${envs[@]+"${envs[@]}"} -- "$@"
+}
+_rtd_exec() {
+  local svc="$1"
+  shift
+  local -a opts=()
+  while [ "$1" != -- ]; do opts+=("$1"); shift; done
+  shift
+  dc exec -T ${opts[@]+"${opts[@]}"} "$svc" "$@"
+}
+
+# rt_logs <service> [compose logs options...] — the service's log.
+rt_logs() { local svc="$1"; shift; _rtd_logs "$svc" "$@"; }
+_rtd_logs() { local svc="$1"; shift; dc logs "$@" "$svc"; }
+
+# rt_ps [--json] — the core containers (--json: compose's JSON lines,
+# stopped ones included).
+rt_ps() { _rtd_ps "$@"; }
+_rtd_ps() {
+  if [ "${1:-}" = --json ]; then dc ps -a --format json; else dc ps; fi
+}
+
+# rt_running <service> — true when the service has a running container.
+rt_running() { _rtd_running "$1"; }
+_rtd_running() { [ -n "$(dc ps -q --status running "$1" 2>/dev/null)" ]; }
+
+# rt_restart <service>... / rt_stop <service>... / rt_start <service>...
+rt_restart() { _rtd_restart "$@"; }
+_rtd_restart() { dc restart "$@"; }
+rt_stop() { _rtd_stop "$@"; }
+_rtd_stop() { dc stop "$@"; }
+rt_start() { _rtd_start "$@"; }
+_rtd_start() { dc start "$@"; }
+
+# rt_kill <service> <signal> — send a signal to the service's main process.
+rt_kill() { _rtd_kill "$1" "$2"; }
+_rtd_kill() { dc kill -s "$2" "$1"; }
+
+# rt_run <service> [-i] [--user U:G] [--entrypoint E] [--label K=V] -- <args...>
+# — a one-shot container of the service (docker: `compose run --rm
+# --no-deps -T`), secrets only on stdin.
+rt_run() {
+  local svc="$1"
+  shift
+  local -a opts=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -i) shift ;;
+      --user|--entrypoint|--label) opts+=("$1" "$2"); shift 2 ;;
+      --) shift; break ;;
+      *) fail "rt_run: unknown option $1" ;;
+    esac
+  done
+  _rtd_run "$svc" ${opts[@]+"${opts[@]}"} -- "$@"
+}
+_rtd_run() {
+  local svc="$1"
+  shift
+  local -a opts=()
+  while [ "$1" != -- ]; do opts+=("$1"); shift; done
+  shift
+  dc run --rm --no-deps -T ${opts[@]+"${opts[@]}"} "$svc" "$@"
+}
+
+# rt_image <service> — the running container's image as "<ref> (<id>)",
+# nothing when it isn't running.
+rt_image() { _rtd_image "$1"; }
+_rtd_image() {
+  local cid
+  cid="$(dc ps -q "$1" 2>/dev/null | head -n1 || true)"
+  [ -z "$cid" ] || docker inspect --format '{{.Config.Image}} ({{.Image}})' "$cid" 2>/dev/null || true
+}
+
+# rt_started_at <service> — the running container's start time as the
+# runtime reports it (RFC 3339), nothing when it isn't running.
+rt_started_at() { _rtd_started_at "$1"; }
+_rtd_started_at() {
+  local cid
+  cid="$(dc ps -q "$1" 2>/dev/null | head -n1)"
+  [ -n "$cid" ] || return 0
+  docker inspect --format '{{.State.StartedAt}}' "$cid" 2>/dev/null || true
+}
+
+# rt_health <service> — healthy|unhealthy|starting|running|exited|missing
+rt_health() { _rtd_health "$1"; }
+_rtd_health() {
   local cid st
   cid="$(dc ps -q "$1" 2>/dev/null | head -n1)"
   [ -n "$cid" ] || { echo missing; return 0; }
   st="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null)"
   echo "${st:-missing}"
+}
+
+# rt_volume_out <volume> <path> [uid:gid] — a tar of <path> inside the
+# core named volume on stdout, read by a throwaway helper as uid:gid
+# (default 0:0 with no capability: owner and mode only), the volume
+# mounted read-only at /vol (never at an image path).
+rt_volume_out() { _rtd_volume_out "$@"; }
+_rtd_volume_out() {
+  local vol="${COMPOSE_PROJECT_NAME:-portcullis}_$1" path="${2:-.}" user="${3:-0:0}"
+  docker run --rm -i --network none --read-only --user "$user" --cap-drop ALL \
+    --security-opt no-new-privileges:true --mount "type=volume,src=$vol,dst=/vol,readonly" \
+    "$PORTCULLIS_HELPER_IMAGE" tar -C /vol -cf - "$path"
+}
+
+# rt_volume_in <volume> <path> [uid:gid] — a tar on stdin extracted under
+# <path> inside the core named volume, as uid:gid (the volume's owner).
+rt_volume_in() { _rtd_volume_in "$@"; }
+_rtd_volume_in() {
+  local vol="${COMPOSE_PROJECT_NAME:-portcullis}_$1" path="${2:-.}" user="${3:-0:0}"
+  docker run --rm -i --network none --read-only --user "$user" --cap-drop ALL \
+    --security-opt no-new-privileges:true --mount "type=volume,src=$vol,dst=/vol" \
+    "$PORTCULLIS_HELPER_IMAGE" tar -C "/vol/$path" -xf -
 }
 
 # wait_healthy <timeout-seconds> <service>... — fail on timeout.
@@ -247,7 +418,7 @@ wait_healthy() {
     printf '  waiting for %s...' "$svc"
     st=""
     for ((i = 0; i < timeout; i += 3)); do
-      st="$(container_health "$svc")"
+      st="$(rt_health "$svc")"
       [ "$st" = healthy ] && break
       sleep 3
     done
@@ -381,6 +552,7 @@ ct_hint_chown() {
 # compose services never get label=disable (only the two socket proxies,
 # docker-compose.podman-selinux.yml, CI-linted). Docker: unchanged.
 ct_run() {
+  _rt_docker_only
   if _rt_is_podman; then
     docker run --security-opt label=disable "$@"
   else
@@ -396,6 +568,7 @@ ct_run() {
 # mount, nothing relabelled), never chown directly.
 ct_own() {
   local spec="$1" p i=0 podman=false todo=() mounts=() targets=()
+  _rt_docker_only
   shift
   if _rt_is_podman; then podman=true; _ct_maps; fi
   for p in "$@"; do
@@ -436,6 +609,7 @@ ct_own() {
 # image's ownership in. Created with compose's labels so compose adopts it.
 volume_own() {
   local vol="$1" spec="$2" mode="${3:-}" project="${COMPOSE_PROJECT_NAME:-portcullis}" name
+  _rt_docker_only
   name="${project}_$vol"
   if ! docker volume inspect "$name" >/dev/null 2>&1; then
     docker volume create --label "com.docker.compose.project=$project" \
@@ -558,6 +732,7 @@ hub_env_write() {
 _ensure_secrets_volume() {
   local name="${HUB_SECRETS_VOLUME:-portcullis_hub_secrets}"
   local project="${COMPOSE_PROJECT_NAME:-portcullis}"
+  _rt_docker_only
   if ! docker volume inspect "$name" >/dev/null 2>&1; then
     docker volume create --label "com.docker.compose.project=$project" \
       --label "com.docker.compose.volume=hub_secrets" "$name" >/dev/null \

@@ -25,6 +25,7 @@ _mcpgate_dir() { echo "$PORTCULLIS_ROOT/secrets/mcp-gate"; }
 # mcp-gate image itself (filippo.io/age), straight into the file.
 _mcpgate_keygen() {
   local f="$1" tmp
+  _rt_docker_only
   if ! docker image inspect "$MCPGATE_IMAGE_NAME" >/dev/null 2>&1; then
     info "Building the mcp-gate image (needed to generate its age key)..."
     runtime_build_service mcp-gate >/dev/null || fail "could not build the mcp-gate image"

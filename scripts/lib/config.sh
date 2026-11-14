@@ -52,6 +52,24 @@ config_build_ca_bundle() {
 # _cfg_flip_traefik_back — the flip stopped Traefik and didn't finish (an
 # interrupt, a failure): start it again when it was running, once. The
 # sentinel isn't written, so the flip stays pending.
+# _cfg_acme_exists — Traefik's ACME storage exists.
+_cfg_acme_exists() {
+  _rt_docker_only
+  docker volume inspect portcullis_traefik_acme >/dev/null 2>&1
+}
+
+# _cfg_acme_clear — remove acme.json from Traefik's ACME storage.
+_cfg_acme_clear() {
+  _rt_docker_only
+  docker run --rm --network none -v portcullis_traefik_acme:/acme "$PORTCULLIS_HELPER_IMAGE" rm -f /acme/acme.json >/dev/null 2>&1
+}
+
+# _cfg_traefik_exists — a Traefik container exists (or docker can't tell).
+_cfg_traefik_exists() {
+  _rt_docker_only
+  [ -n "$(dc ps -aq traefik 2>/dev/null || echo unknown)" ]
+}
+
 _cfg_flip_traefik_back() {
   [ -n "${CFG_FLIP_WINDOW:-}" ] || return 0
   CFG_FLIP_WINDOW=""
@@ -59,8 +77,7 @@ _cfg_flip_traefik_back() {
   [ -n "${CFG_FLIP_TRAEFIK_WAS:-}" ] || return 0
   info "Starting Traefik again..."
   # No container to start (a recreate removed it): create it (M16).
-  # shellcheck disable=SC2046  # nothing or --no-build
-  dc start traefik >/dev/null 2>&1 || dc up -d $(runtime_no_build) --no-deps traefik >/dev/null 2>&1 || warn "could not start Traefik again (./portcullis up)"
+  rt_start traefik >/dev/null 2>&1 || rt_up_service traefik >/dev/null 2>&1 || warn "could not start Traefik again (./portcullis up)"
 }
 
 config_apply() {
@@ -100,7 +117,7 @@ config_apply() {
   last="$(cat "$sentinel" 2>/dev/null || true)"
   # No sentinel but ACME storage exists: it was filled by compose's default
   # CA (production) — treat it as such so a first flip to staging clears it.
-  if [ -z "$last" ] && docker volume inspect portcullis_traefik_acme >/dev/null 2>&1; then
+  if [ -z "$last" ] && _cfg_acme_exists; then
     last=false
   fi
   if [ -n "$last" ] && [ "$last" != "$staging" ]; then
@@ -128,7 +145,8 @@ config_apply() {
     # Every flip, managed or not: a saved settle point in the future, or a
     # public CAA a NEW account couldn't order under, stops it here (N2).
     dns_flip_guard "$ca_server" "$relaxed" || fail "The ACME_STAGING flip is not finished (see above): nothing changed, Traefik runs on with its current ACME account."
-    CFG_FLIP_TRAEFIK_WAS="$(dc ps -q --status running traefik 2>/dev/null || true)"
+    CFG_FLIP_TRAEFIK_WAS=""
+    if rt_running traefik; then CFG_FLIP_TRAEFIK_WAS=1; fi
     # From the stop until Traefik runs on the new CA, any way out — an
     # interrupt (INT / TERM / HUP: an SSH drop), a `fail`, set -e — starts
     # it again on its old container; the sentinel is written only at the
@@ -139,13 +157,12 @@ config_apply() {
     info "Stopping Traefik..."
     # acme.json is never cleared under a running Traefik (M15).
     # No container at all (after `down`) is nothing to stop (M20).
-    if ! dc stop traefik >/dev/null 2>&1 && [ -n "$(dc ps -aq traefik 2>/dev/null || echo unknown)" ]; then
+    if ! rt_stop traefik >/dev/null 2>&1 && _cfg_traefik_exists; then
       fail "could not stop Traefik: the ACME_STAGING flip is not finished; run the same command again"
     fi
-    if docker volume inspect portcullis_traefik_acme >/dev/null 2>&1; then
+    if _cfg_acme_exists; then
       info "Clearing Traefik's ACME storage (acme.json)..."
-      docker run --rm --network none -v portcullis_traefik_acme:/acme "$PORTCULLIS_HELPER_IMAGE" rm -f /acme/acme.json >/dev/null 2>&1 \
-        || fail "could not clear Traefik's ACME storage (acme.json): the ACME_STAGING flip is not finished; run the same command again"
+      _cfg_acme_clear || fail "could not clear Traefik's ACME storage (acme.json): the ACME_STAGING flip is not finished; run the same command again"
     fi
   fi
   # Written to .env AND exported: compose prefers the shell's value (which
@@ -156,8 +173,7 @@ config_apply() {
   export ACME_DNS_PROVIDER="$acme_dns"
   if [ "$flipping" = true ] && [ -n "${CFG_FLIP_TRAEFIK_WAS:-}" ]; then
     info "Starting Traefik again (it registers a new ACME account with $ca_server)..."
-    # shellcheck disable=SC2046  # nothing or --no-build
-    dc up -d $(runtime_no_build) --no-deps traefik >/dev/null 2>&1 || fail "could not start Traefik on $ca_server: the ACME_STAGING flip is not finished; run the same command again"
+    rt_up_service traefik >/dev/null 2>&1 || fail "could not start Traefik on $ca_server: the ACME_STAGING flip is not finished; run the same command again"
   fi
   # Only now (Traefik runs on the new CA, or isn't running: its next start
   # reads the new value) is the flip done.

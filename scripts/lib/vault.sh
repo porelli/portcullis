@@ -70,9 +70,9 @@ vault_use_container_cli() {
 # "environment variable ... badly formed, must be key=value").
 _vault_dc_exec() {
   if printenv VAULT_TOKEN >/dev/null 2>&1; then
-    dc exec -T -e VAULT_TOKEN vault vault "$@"
+    rt_exec -i -e VAULT_TOKEN vault -- vault "$@"
   else
-    dc exec -T vault vault "$@"
+    rt_exec -i vault -- vault "$@"
   fi
 }
 
@@ -134,10 +134,9 @@ _write_secret() {
 # API; sets VAULT_INITIALIZED / VAULT_SEALED.
 _vault_start_and_status() {
   local i rc status=""
-  if [ -z "$(dc ps -q --status running vault 2>/dev/null)" ]; then
+  if ! rt_running vault; then
     info "Starting vault container..."
-    # shellcheck disable=SC2046  # nothing or --no-build
-    dc up -d $(runtime_no_build) --no-deps vault
+    rt_up_service vault
   fi
   info "Waiting for the Vault API..."
   local err
@@ -150,7 +149,7 @@ _vault_start_and_status() {
       break
     fi
     if [ "$i" -eq 60 ]; then
-      dc logs --tail=30 vault >&2 || true
+      rt_logs vault --tail=30 >&2 || true
       # The last `vault status` attempt's own error (no secret: status takes
       # none, and compose / the engine name variables, never values).
       echo "vault status (exit $rc) said:" >&2

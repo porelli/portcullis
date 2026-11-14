@@ -96,8 +96,8 @@ monitoring_prepare() {
 # config on SIGHUP.
 monitoring_reload() {
   [ "${MONITORING_ALERTMANAGER_CHANGED:-false}" = true ] || return 0
-  [ -n "$(dc ps -q --status running alertmanager 2>/dev/null)" ] || return 0
-  dc kill -s HUP alertmanager >/dev/null 2>&1 && info "Alertmanager reloaded its receivers." || true
+  rt_running alertmanager || return 0
+  rt_kill alertmanager HUP >/dev/null 2>&1 && info "Alertmanager reloaded its receivers." || true
 }
 
 # monitoring_fix_perms — part of secrets_fix_perms.

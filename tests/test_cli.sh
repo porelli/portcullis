@@ -355,6 +355,38 @@ expect_eq "docker-compose.podman.yml sets restart: always and nothing else (podm
   "$(grep -vE '^[[:space:]]*(#|$)|^services:$|^  [a-z][a-z0-9-]*:$|^    restart: always$' "$ROOT_DIR_SOCK/docker-compose.podman.yml"):$(grep -c '^    restart: always$' "$ROOT_DIR_SOCK/docker-compose.podman.yml" | awk '{print ($1 >= 20)}')" ":1"
 expect_eq "the SELinux overlay never names the engine socket" "$(grep -c 'docker.sock\|ENGINE_SOCKET' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" 0
 expect_eq "no ct_own \"\$(id -u)… in the CLI (ct_operator_id)" "$(grep -rnF 'ct_own "$(id -u)' "$HERE/../scripts/lib" "$HERE/../portcullis" || true)" ""
+# ── the runtime layer (rt_*): no dc / docker call outside the docker
+# branch. Every function (the libs sourced, bodies from `declare -f`, so
+# comments are gone) that calls dc or docker in a command position must be
+# `dc`, a `_rtd_*` docker-branch verb, or start with `_rt_docker_only`
+# (refused under kubernetes). Quoted text without a command substitution
+# (messages, hints) and the help_* texts are ignored.
+rt_docker_hits() {
+  ( set +eu
+    PORTCULLIS_ROOT="$WORK/rtlint-root"
+    for _l in common network vault pki certs keycloak users domains mcpgate sessions dns config status monitoring backup signin vpn stack; do
+      # shellcheck source=/dev/null
+      source "$HERE/../scripts/lib/$_l.sh"
+    done
+    for fn in $(declare -F | awk '{print $3}'); do
+      case "$fn" in dc|_rtd_*|help_*|rt_docker_hits) continue ;; esac
+      body="$(declare -f "$fn")"
+      hit="$(printf '%s\n' "$body" | perl -0777 -pe 's/('"'"'[^'"'"']*'"'"')|"((?:[^"\\]|\\.)*)"/ defined($1) ? q{} : index($2, q{$(}) >= 0 ? qq{"$2"} : q{""} /gse' \
+        | grep -vE '^[[:space:]]*[^ ()]+( \| [^ ()]+)*\)' | grep -E '(^|[;&|(!{`]|\$\(|then |do |else |&& |\|\| )[[:space:]]*(dc|docker)( |$)' || true)"
+      [ -n "$hit" ] || continue
+      first="$(printf '%s\n' "$body" | sed -n '3,$p' | grep -vE '^[[:space:]]*(local|declare) ' | head -n1 | tr -d ' ;')"
+      [ "$first" = _rt_docker_only ] || printf '%s\n' "$fn"
+    done ) 2>/dev/null
+}
+expect_eq "no dc / docker call outside the rt_* docker branch (functions starting with _rt_docker_only)" "$(rt_docker_hits | tr '\n' ' ')" ""
+expect_eq "the rt_* lint catches a docker call in a function without the guard" \
+  "$( (unguarded() { local x; x="$(dc ps -q)"; docker inspect "$x"; }; guarded() { local y=1; _rt_docker_only; docker ps "$y"; }
+       msg() { warn "run: docker compose logs (docker compose -p x down)"; }
+       for f in unguarded guarded msg; do body="$(declare -f "$f")"
+         hit="$(printf '%s\n' "$body" | perl -0777 -pe 's/('"'"'[^'"'"']*'"'"')|"((?:[^"\\]|\\.)*)"/ defined($1) ? q{} : index($2, q{$(}) >= 0 ? qq{"$2"} : q{""} /gse' | grep -vE '^[[:space:]]*[^ ()]+( \| [^ ()]+)*\)' | grep -E '(^|[;&|(!{`]|\$\(|then |do |else |&& |\|\| )[[:space:]]*(dc|docker)( |$)' || true)"
+         [ -n "$hit" ] || continue
+         first="$(printf '%s\n' "$body" | sed -n '3,$p' | grep -vE '^[[:space:]]*(local|declare) ' | head -n1 | tr -d ' ;')"
+         [ "$first" = _rt_docker_only ] || echo "$f"; done) 2>/dev/null)" "unguarded"
 case "$(printf '%s\n' '  jq -n --arg p "$(cat "$f")" x' '  jq --arg pass "$LLDAP_ADMIN_PASSWORD"' | grep -cE -e "$ARGV_RE")" in
   2) t_pass "argv secret pattern catches --arg \"\$(cat ...)\" and secret variables" ;; *) t_fail "argv secret pattern" ;; esac
 
@@ -683,7 +715,7 @@ pk_status() {
     dc() { echo '{"Service":"keycloak","State":"running","Health":"healthy","Status":"Up"}'; }
     vault_health_code() { echo 200; }
     vault_admin_env() { return 1; }
-    container_health() { echo healthy; }
+    rt_health() { echo healthy; }
     proxy_dns_shadows() { :; }
     domains_status_lines() { :; }
     _st_mcp_refusing() { :; }
@@ -868,9 +900,9 @@ printf '%s%s\n' "\$cmd" "\$args" >> "$DC_CALLS"
 exit 0
 DCSTUB
 chmod +x "$WORK/dcbin/docker"
-# Stub container_health: returns "healthy" for vault/lldap/keycloak, "healthy" for hub (its image HEALTHCHECK).
+# Stub rt_health: returns "healthy" for vault/lldap/keycloak, "healthy" for hub (its image HEALTHCHECK).
 cat > "$WORK/test-init-stub.sh" <<INITSTUB
-container_health() {
+rt_health() {
   case "\$1" in
     vault|lldap|keycloak|postgres) echo healthy ;;
     hub) echo healthy ;;
@@ -880,7 +912,7 @@ container_health() {
 wait_healthy() {
   local timeout="\$1"; shift
   for svc in "\$@"; do
-    [ "\$(container_health "\$svc")" = healthy ] || return 1
+    [ "\$(rt_health "\$svc")" = healthy ] || return 1
   done
 }
 # Stub the functions init_run calls that touch Vault/Keycloak/DNS.
@@ -937,12 +969,12 @@ VAULT_INIT_FILE="$PORTCULLIS_ROOT/secrets/vault-init.json"
 mkdir -p "$PORTCULLIS_ROOT/secrets"
 echo '{}' > "$VAULT_INIT_FILE"
 cat > "$WORK/test-up-stub.sh" <<UPSTUB
-container_health() {
+rt_health() {
   case "\$1" in vault|lldap|keycloak|postgres) echo healthy ;; *) echo running ;; esac
 }
 wait_healthy() {
   local timeout="\$1"; shift
-  for svc in "\$@"; do [ "\$(container_health "\$svc")" = healthy ] || return 1; done
+  for svc in "\$@"; do [ "\$(rt_health "\$svc")" = healthy ] || return 1; done
 }
 vault_init() { :; }
 pki_setup() { PKI_CREATED=false; PKI_TRUSTSTORE_CHANGED=false; }

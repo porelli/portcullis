@@ -1024,7 +1024,7 @@ jq '.vault.browser_ca_expires_epoch = 0' "$STUB_DIR/stf.json" > "$STUB_DIR/stf2.
 expect_eq "status --textfile: no browser CA series while its expiry is unknown" "$(stf | grep -c 'ca="browser"' || true)" 0
 # status --json over both mounts: nothing issued on pki_file yet ("No value
 # found", exit 2) is an empty list, not an unknown count (CI run 43051184972).
-sjson() { (require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
+sjson() { (require_cmd() { :; }; dc() { :; }; rt_health() { echo healthy; }; kc_login() { return 1; }
            proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
            vault_admin_env() { export VAULT_TOKEN=x; }; vault_use_container_cli() { :; }
            _cert_info() { echo "testuser|Dec 11 15:51:10 2099 GMT|false"; }
@@ -2913,7 +2913,7 @@ rm -f "$PORTCULLIS_ROOT/secrets/domains/main-domain.env"
 expect_eq "dns_main_env_uri without the file: nothing, exit 0 under set -euo pipefail" \
   "$(dt 'set -euo pipefail; u="$(dns_main_env_uri)"; echo "got:$u"')" "got:
 rc=0"
-SJ="$(dt "set -euo pipefail; require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
+SJ="$(dt "set -euo pipefail; require_cmd() { :; }; dc() { :; }; rt_health() { echo healthy; }; kc_login() { return 1; }
         proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
         vault_admin_env() { return 1; }
         dns_status_json() { cat '$DNSR'; }; dns_traefik_account_uri() { :; }
@@ -2921,7 +2921,7 @@ SJ="$(dt "set -euo pipefail; require_cmd() { :; }; dc() { :; }; container_health
 expect_eq "status --json without main-domain.env (set -euo pipefail, as the CLI) still prints the report" \
   "$(printf '%s\n' "$SJ" | sed '$d' | jq -c '[.dns.main.name, .dns.main.lost_account]' 2>/dev/null)" '["ci.example.org",false]'
 # status --json carries the block (status_run with the report stubbed).
-SJ="$( (require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
+SJ="$( (require_cmd() { :; }; dc() { :; }; rt_health() { echo healthy; }; kc_login() { return 1; }
         proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
         vault_admin_env() { return 1; }
         dns_status_json() { cat "$DNSR"; }; dns_traefik_account_uri() { echo https://acme/acct/1; }; dns_main_env_uri() { echo https://acme/acct/1; }
@@ -3159,14 +3159,14 @@ cat > "$STUB_DIR/rt-config.json" <<'JSON'
  "dns-tool":{"image":"portcullis-domains"},
  "vault":{"image":"hashicorp/vault:2"}}}
 JSON
-OUT="$(rt "CONTAINER_RUNTIME=podman; stack_compose_up >/dev/null 2>&1; echo \"\$?\"; sort \"\$STUB_DIR/podman-calls\"; grep -E '^compose .* (up|build)( |$)' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'")"
+OUT="$(rt "CONTAINER_RUNTIME=podman; rt_up >/dev/null 2>&1; echo \"\$?\"; sort \"\$STUB_DIR/podman-calls\"; grep -E '^compose .* (up|build)( |$)' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'")"
 expect_eq "stack_compose_up on podman builds with podman build and runs up --no-build" "$OUT" "0
 build --format docker -t portcullis-domains -f /src/domains/Dockerfile --build-arg GO_TAGS=testprovider /src/domains
 build --format docker -t portcullis-enroll -f /src/enroll/Dockerfile /src/enroll
 build --format docker -t portcullis-mcp-gate -f /src/mcp-gate/Dockerfile.x /src/mcp-gate
 compose up -d --no-build
 rc=0"
-OUT="$(rt "CONTAINER_RUNTIME=docker; stack_compose_up hub >/dev/null 2>&1; grep -E '^compose ' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'; test ! -e \"\$STUB_DIR/podman-calls\"")"
+OUT="$(rt "CONTAINER_RUNTIME=docker; rt_up hub >/dev/null 2>&1; grep -E '^compose ' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'; test ! -e \"\$STUB_DIR/podman-calls\"")"
 expect_eq "stack_compose_up on docker: build --quiet first, then up -d --no-build, no podman" "$OUT" "compose build --quiet
 compose up -d --no-build hub
 rc=0"
@@ -3183,12 +3183,15 @@ expect_eq "--force-recreate only on the restore's fresh Vault" \
   "$(grep -h 'dc up .*--force-recreate' "$LIBS"/*.sh | sed 's/^ *//')" 'dc up -d $(runtime_no_build) --no-deps --force-recreate vault >/dev/null'
 expect_eq "every dc up outside stack_compose_up passes \$(runtime_no_build)" \
   "$(grep -n 'dc up ' "$LIBS"/*.sh | grep -v '^\s*#' | grep -vF '$(runtime_no_build)' | grep -v '/runtime.sh:' || true)" ""
-expect_eq "no dc up --build anywhere: stack_compose_up builds first (init, up, upgrade, restore go through it)" \
-  "$(grep -n 'dc up .*--build' "$LIBS"/*.sh | grep -v -- '--no-build' || true):$(grep -c '^ *stack_compose_up' "$LIBS/stack.sh") $(grep -c '^ *stack_compose_up ||' "$LIBS/backup.sh")" ":3 1"
+expect_eq "no dc up --build anywhere: rt_up (= stack_compose_up on docker / podman) builds first (init, up, upgrade, restore go through it)" \
+  "$(grep -n 'dc up .*--build' "$LIBS"/*.sh | grep -v -- '--no-build' || true):$(grep -c '^ *rt_up\b' "$LIBS/stack.sh") $(grep -c '^ *rt_up ||' "$LIBS/backup.sh")" ":3 1"
+expect_eq "rt_up on docker / podman is stack_compose_up (the kcwait tests below run through it)" \
+  "$( (stack_compose_up() { echo "scu $*"; }; CONTAINER_RUNTIME=docker; rt_up wg traefik hub; CONTAINER_RUNTIME=podman; rt_up) )" "scu wg traefik hub
+scu "
 # restore builds on both runtimes, as up does (docker used to start the
 # images it had: a git pull before a restore left them old).
 for RTN in docker podman; do
-  OUT="$(rt "CONTAINER_RUNTIME=$RTN; compose_health_report() { :; }; stack_compose_up >/dev/null 2>&1; echo \"\$?\"; grep -cE '^compose .* up -d --(no-)?build$' \"\$STUB_DIR/rt-calls\"; grep -c '^build ' \"\$STUB_DIR/podman-calls\" 2>/dev/null || echo 0")"
+  OUT="$(rt "CONTAINER_RUNTIME=$RTN; compose_health_report() { :; }; rt_up >/dev/null 2>&1; echo \"\$?\"; grep -cE '^compose .* up -d --(no-)?build$' \"\$STUB_DIR/rt-calls\"; grep -c '^build ' \"\$STUB_DIR/podman-calls\" 2>/dev/null || echo 0")"
   case "$RTN:$OUT" in
     "docker:0"$'\n'"1"$'\n'"0"$'\n'"rc=0"|"podman:0"$'\n'"1"$'\n'"3"$'\n'"rc=0") t_pass "stack_compose_up on $RTN: the local images built, one up that lets compose recreate changed ones" ;;
     *) t_fail "stack_compose_up on $RTN: $OUT" ;;
@@ -3415,7 +3418,7 @@ exit 0
 STUB
 } > "$WORK/hcbin/docker"
 chmod +x "$WORK/hcbin/docker"
-HC_OUT="$( (PATH="$WORK/hcbin:$PATH"; CONTAINER_RUNTIME=docker; stack_compose_up keycloak; echo "rc=$?") 2>&1)"
+HC_OUT="$( (PATH="$WORK/hcbin:$PATH"; CONTAINER_RUNTIME=docker; rt_up keycloak; echo "rc=$?") 2>&1)"
 case "$HC_OUT" in
   *"portcullis-keycloak-1 is unhealthy; its last health checks:"*"exit 1: a b"*"exit 1: bash: connect: Connection refused"*"exit -1: timed out"*"rc=1") t_pass "stack_compose_up: a failed up prints each unhealthy container's last three health checks" ;;
   *) t_fail "stack_compose_up health report: $HC_OUT" ;;
@@ -3454,7 +3457,7 @@ su_run() {
   printf '%s\n' "$4" > "$SU/tick"
   ( PATH="$WORK/subin:$PATH"; export SU STACK_UP_WAIT=30; CONTAINER_RUNTIME=docker
     sleep() { echo x >> "$SU/ticks"; bash "$SU/tick"; }
-    stack_compose_up keycloak; echo "rc=$?" ) 2>&1
+    rt_up keycloak; echo "rc=$?" ) 2>&1
   echo "ticks=$(wc -l < "$SU/ticks" | tr -d " ")"
   grep -E '^compose .* (up|build)( |$)' "$SU/calls" | sed 's/--project-directory [^ ]* //'
 }
@@ -3628,9 +3631,9 @@ case "$OUT" in *"--add-subgids 100000-165535 'o'\\''brien', then podman system m
 # A restarted podman.socket leaves the proxies on a dead inode: up restarts
 # the unhealthy ones (podman only).
 expect_eq "runtime_proxies_refresh on podman: restarts the unhealthy proxy only" \
-  "$( (CONTAINER_RUNTIME=podman; container_health() { [ "$1" = socket-proxy-hub ] && echo unhealthy || echo healthy; }; dc() { echo "dc $*" >> "$WORK/prx-calls"; }; rm -f "$WORK/prx-calls"; runtime_proxies_refresh) 2>/dev/null; cat "$WORK/prx-calls")" "dc restart socket-proxy-hub"
+  "$( (CONTAINER_RUNTIME=podman; rt_health() { [ "$1" = socket-proxy-hub ] && echo unhealthy || echo healthy; }; dc() { echo "dc $*" >> "$WORK/prx-calls"; }; rm -f "$WORK/prx-calls"; runtime_proxies_refresh) 2>/dev/null; cat "$WORK/prx-calls")" "dc restart socket-proxy-hub"
 expect_eq "runtime_proxies_refresh on docker: nothing" \
-  "$( (CONTAINER_RUNTIME=docker; container_health() { echo unhealthy; }; dc() { echo "dc $*"; }; runtime_proxies_refresh) 2>/dev/null)" ""
+  "$( (CONTAINER_RUNTIME=docker; rt_health() { echo unhealthy; }; dc() { echo "dc $*"; }; runtime_proxies_refresh) 2>/dev/null)" ""
 
 # ══ vpn: ./portcullis vpn … (scripts/lib/vpn.sh, contract §16) ═══════
 # shellcheck source=../scripts/lib/vpn.sh
@@ -3653,14 +3656,14 @@ vt() {
     dc() {
       echo "dc $*" >> "$L"
       case "$*" in
-        "exec -T -u 10001:10001 hub hub vpn host-info")
+        "exec -T hub hub vpn host-info")
           [ "${VT_HUB_DOWN:-}" != 1 ] || return 1
           # VT_HUB_ANSWER_AFTER=n: the first n-1 calls fail (a Hub still starting).
           echo x >> "$WORK/vt/hostinfo-calls"
           [ "$(wc -l < "$WORK/vt/hostinfo-calls")" -ge "${VT_HUB_ANSWER_AFTER:-1}" ] || return 1
           printf '%s' "${VT_HOSTINFO:-$VT_HOSTINFO_DEFAULT}" ;;
         "exec -T wg /wg keypair") printf '{"private_key":"%s","public_key":"%s"}\n' "$VPN_PRIV" "$VPN_PUB" ;;
-        "exec -T -u 10001:10001 hub hub vpn add-device "*) cat >> "$WORK/vt/stdin"; echo '{"address":"10.213.0.5","server_public_key":"U2VydmVy","endpoint":"vpn.example.org:51820","allowed_ips":"10.213.0.1/32","dns":"10.213.0.1","mtu":1280}' ;;
+        "exec -T hub hub vpn add-device "*) cat >> "$WORK/vt/stdin"; echo '{"address":"10.213.0.5","server_public_key":"U2VydmVy","endpoint":"vpn.example.org:51820","allowed_ips":"10.213.0.1/32","dns":"10.213.0.1","mtu":1280}' ;;
         "exec -T wg /wg qr") cat >> "$WORK/vt/qr"; echo QR ;;
         "ps -q --status running wg") echo cid ;;
       esac
@@ -3678,7 +3681,7 @@ vt() {
     hub_env_write() { echo "hub_env_write" >> "$L"; }
     ct_group_read() { echo "ct_group_read $*" >> "$L"; }
     monitoring_fix_perms() { :; }
-    container_health() { echo "${VT_HUB_HEALTH:-healthy}"; }
+    rt_health() { echo "${VT_HUB_HEALTH:-healthy}"; }
     wait_healthy() { echo "wait_healthy $*" >> "$L"; }
     jq() { printf '%s\n' "$*" >> "$WORK/vt/jq"; command jq "$@"; }
     eval "$1"
@@ -3811,9 +3814,9 @@ expect_eq "vpn add-device: only the public key on the Hub's stdin" "$(cat "$WORK
 expect_eq "vpn add-device: the config has AllowedIPs = 10.213.0.1/32" \
   "$(printf '%s' "$OUT" | grep -cxE 'AllowedIPs = 10\.213\.0\.1/32|Address = 10\.213\.0\.5/32|DNS = 10\.213\.0\.1|PrivateKey = '"$VPN_PRIV"'|Endpoint = vpn\.example\.org:51820|MTU = 1280')" 6
 expect_eq "vpn add-device: the QR code is drawn from the same config on stdin" "$(grep -c '^PrivateKey = ' "$WORK/vt/qr"):$(printf '%s' "$OUT" | grep -cx QR)" "1:1"
-expect_eq "vpn add-device: the Hub call names the user and device" "$(grep -c '^dc exec -T -u 10001:10001 hub hub vpn add-device --user alice --name laptop$' "$WORK/vt/log")" 1
-expect_eq "vpn add-device: the Hub calls (host-info readiness, add-device) are hub vpn as uid 10001 (the Hub's control socket is 0600, its own)" \
-  "$(grep -c '^dc exec .*hub hub vpn' "$WORK/vt/log"):$(grep -c '^dc exec -T -u 10001:10001 hub hub vpn ' "$WORK/vt/log")" "2:2"
+expect_eq "vpn add-device: the Hub call names the user and device" "$(grep -c '^dc exec -T hub hub vpn add-device --user alice --name laptop$' "$WORK/vt/log")" 1
+expect_eq "vpn add-device: the Hub calls (host-info readiness, add-device) are hub vpn as the Hub container's own user, 10001 (no -u: the control socket is 0600, its own)" \
+  "$(grep -c '^dc exec .*hub hub vpn' "$WORK/vt/log"):$(grep -c '^dc exec -T hub hub vpn ' "$WORK/vt/log")" "2:2"
 # Every vpn subcommand that calls the Hub waits for it the same way
 # (_vpn_hub_wait): a starting Hub is waited for, a stopped one refused at
 # once — before wg makes a key pair.
@@ -3828,7 +3831,7 @@ done
 expect_eq "vpn.sh: host-info is read only through _vpn_hub_wait" \
   "$(grep -c '_vpn_host_info' "$HERE/../scripts/lib/vpn.sh"):$(sed -n '/^_vpn_hub_wait()/,/^}/p' "$HERE/../scripts/lib/vpn.sh" | grep -c '_vpn_host_info')" "3:1"
 expect_eq "vpn.sh: the Hub is reached only through _vpn_hub" \
-  "$(grep -cE 'exec [^|]*hub hub ' "$HERE/../scripts/lib/vpn.sh")" 1
+  "$(grep -cE 'exec [^|]*hub -- hub ' "$HERE/../scripts/lib/vpn.sh")" 1
 expect_ok "vpn add-device: keys stay in variables (no temp file, no -v mount)" bash -c "! grep -nE 'mktemp|> *\"?\\\$[a-z]*(key|kp)|--mount' <(sed -n '/^vpn_add_device()/,/^}/p' '$HERE/../scripts/lib/vpn.sh')"
 
 OUT="$(vt 'vpn_builtin on' 2>&1)"; RC=$?
@@ -3853,7 +3856,7 @@ SJ="$(vt 'export COMPOSE_PROFILES=wg PORTCULLIS_VPN_MODE=server; dc() { return 1
 expect_eq "vpn_status_json: mode server with wg down → a problem" "$(printf '%s' "$SJ" | jq -c '[.up, .problem]')" '[false,true]'
 SJ="$(vt 'dc() { return 1; }; vpn_status_json')"
 expect_eq "vpn_status_json: apps without wg → not set up, no problem" "$(printf '%s' "$SJ" | jq -c '[.enabled, .mode, .problem]')" '[false,"apps",false]'
-SJ="$( (require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
+SJ="$( (require_cmd() { :; }; dc() { :; }; rt_health() { echo healthy; }; kc_login() { return 1; }
         proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
         vault_admin_env() { return 1; }; dns_status_json() { :; }
         vpn_status_json() { echo '{"enabled":true,"mode":"admin","public_enrol":true,"up":false,"providers":[],"problem":true}'; }

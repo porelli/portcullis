@@ -216,7 +216,7 @@ init_run() {
   require_cmd docker jq curl
   runtime_check
   runtime_require_host
-  docker compose version >/dev/null 2>&1 || fail "the docker compose plugin is required"
+  rt_require_tools
   network_check
 
   if [ "$skip_dns" = true ] || [ "${DNS_PROVIDER:-none}" = none ]; then
@@ -238,13 +238,13 @@ init_run() {
   info "Starting services..."
   # Start everything except hub (needs LLDAP service account + Keycloak clients first).
   local all_svcs hub_excluded=""
-  all_svcs="$(dc config --services | tr '\n' ' ')"
+  all_svcs="$(rt_services | tr '\n' ' ')"
   for s in $all_svcs; do
     [ "$s" = hub ] || hub_excluded="$hub_excluded $s"
   done
   sessions_restart_if_changed
   # shellcheck disable=SC2086
-  stack_compose_up $hub_excluded
+  rt_up $hub_excluded
   wait_healthy 300 vault postgres lldap keycloak
 
   info "Creating the Vault PKI..."
@@ -253,7 +253,7 @@ init_run() {
   # server.key was just written: give Traefik (group 0) read access.
   stack_prepare
   info "Restarting Traefik, the forward-auth services, Keycloak and group-gate to pick up the CA chain..."
-  dc restart traefik forward-auth forward-auth-ext keycloak group-gate
+  rt_restart traefik forward-auth forward-auth-ext keycloak group-gate
   signin_ca_mark
   pki_files_mark
   config_mark
@@ -264,13 +264,12 @@ init_run() {
   lldap_service_account
 
   info "Starting the Hub..."
-  # shellcheck disable=SC2046  # nothing or --no-build
-  dc up -d $(runtime_no_build) hub
+  rt_up_service --deps hub
   # The Hub's image has a HEALTHCHECK: wait until it reports healthy
   # (a missing check would show "running"; both count).
   local i st=""
   for ((i = 0; i < 120; i += 3)); do
-    st="$(container_health hub)"
+    st="$(rt_health hub)"
     case "$st" in healthy|running) break ;; esac
     sleep 3
   done
@@ -338,7 +337,7 @@ signin_ca_reload() {
   sum="$(_ca_bundle_sum "$bundle")"
   if [ "$(cat "$stamp" 2>/dev/null)" != "$sum" ]; then
     info "Restarting the forward-auth services to pick up the new CA bundle..."
-    dc restart forward-auth forward-auth-ext >/dev/null || return 1
+    rt_restart forward-auth forward-auth-ext >/dev/null || return 1
     printf '%s\n' "$sum" > "$stamp"
   fi
 }
@@ -376,7 +375,7 @@ pki_files_reload() {
   [ "$(cat "$stamp" 2>/dev/null)" != "$sum" ] || return 0
   info "Restarting Traefik, Keycloak and group-gate to pick up the internal CA's files..."
   # shellcheck disable=SC2086
-  dc restart $PKI_FILES_SERVICES >/dev/null || return 1
+  rt_restart $PKI_FILES_SERVICES >/dev/null || return 1
   printf '%s\n' "$sum" > "$stamp"
 }
 
@@ -458,7 +457,7 @@ config_reload() {
     # shellcheck disable=SC2086
     info "Restarting services to pick up config changes:$to_restart"
     # shellcheck disable=SC2086
-    dc restart $to_restart >/dev/null || return 1
+    rt_restart $to_restart >/dev/null || return 1
     # Write stamps only after successful restart
     printf '%s' "$pending_stamps" | while IFS=' ' read -r stamp_path sum_val; do
       [ -n "$stamp_path" ] || continue
@@ -478,7 +477,7 @@ stack_up() {
   stack_prepare
   config_apply
   sessions_restart_if_changed
-  stack_compose_up
+  rt_up
   runtime_proxies_refresh
   domains_restart_if_renewed
   monitoring_reload
@@ -493,7 +492,7 @@ stack_up() {
   lldap_service_account
   if [ "${LLDAP_SA_CHANGED:-false}" = true ]; then
     info "Restarting the Hub to pick up the updated LLDAP credentials..."
-    dc restart hub >/dev/null
+    rt_restart hub >/dev/null
   fi
   ok "Portcullis is up. Check: ./portcullis status"
 }
@@ -520,7 +519,7 @@ upgrade_run() {
   fi
 
   info "Pulling images..."
-  dc pull --quiet --ignore-buildable 2>/dev/null || dc pull --ignore-buildable
+  rt_pull
 
   stack_prepare
   vault_init false
@@ -529,7 +528,7 @@ upgrade_run() {
 
   info "Starting services..."
   sessions_restart_if_changed
-  stack_compose_up
+  rt_up
   runtime_proxies_refresh
   domains_restart_if_renewed
   monitoring_reload
@@ -549,11 +548,10 @@ upgrade_run() {
   lldap_service_account
   if [ "${LLDAP_SA_CHANGED:-false}" = true ]; then
     info "Restarting the Hub to pick up the updated LLDAP credentials..."
-    dc restart hub >/dev/null
+    rt_restart hub >/dev/null
   fi
   # Picks up a FORWARD_AUTH_CLIENT_SECRET generated above, if any.
-  # shellcheck disable=SC2046  # nothing or --no-build
-  dc up -d $(runtime_no_build) forward-auth forward-auth-ext >/dev/null
+  rt_up_service --deps forward-auth forward-auth-ext >/dev/null
   signin_ca_reload
   info "Checking the Hub's policy file against group-gate..."
   hub_policy_check
@@ -695,7 +693,7 @@ cmd_down() {
   done
   need_env
   require_cmd docker
-  dc down
+  rt_down
 }
 
 cmd_upgrade() {

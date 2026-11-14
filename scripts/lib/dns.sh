@@ -87,7 +87,7 @@ _dns_tool() {
   esac
   input="$(_dns_tool_input "$mode")" || exit 1
   domains_image_ensure "for the dns tool"
-  printf '%s' "$input" | dc run --rm --no-deps -T dns-tool "$@"
+  printf '%s' "$input" | rt_run dns-tool -i -- "$@"
 }
 
 # _dns_dur <seconds> — "45 s", "10 min", "5 min 24 s".
@@ -157,6 +157,7 @@ _dns_uri_ok() {
 # Exit 1 (nothing printed) when the volume exists but couldn't be read.
 dns_traefik_account_uri() {
   local uri rc=0
+  _rt_docker_only
   docker volume inspect portcullis_traefik_acme >/dev/null 2>&1 || return 0
   if ! docker image inspect "$DOMAINS_IMAGE_NAME" >/dev/null 2>&1; then
     (domains_image_ensure "to read Traefik's ACME account") >&2 || return 1
@@ -358,11 +359,10 @@ dns_main_env_write() {
   (umask 077; printf '%s\n' "$new" > "$f.tmp") && mv -f "$f.tmp" "$f" && chmod 600 "$f" \
     || { rm -f "$f.tmp"; warn "could not write $f"; return 1; }
   info "Traefik's ACME account: $uri (secrets/domains/main-domain.env)"
-  if [ "$when" = if-running ] && [ -z "$(dc ps -q --status running domains 2>/dev/null)" ]; then
+  if [ "$when" = if-running ] && ! rt_running domains; then
     return 0
   fi
-  # shellcheck disable=SC2046  # nothing or --no-build
-  dc up -d $(runtime_no_build) domains >/dev/null 2>&1 || warn "could not restart the domains service to read main-domain.env"
+  rt_up_service --deps domains >/dev/null 2>&1 || warn "could not restart the domains service to read main-domain.env"
   return 0
 }
 
@@ -720,7 +720,7 @@ dns_relax_main() {
 # show the plan from before the write for up to an hour. Best effort:
 # nothing when the service isn't running.
 dns_main_refresh() {
-  dc exec -T domains domains report --main --refresh >/dev/null 2>&1 || true
+  rt_exec domains -- domains report --main --refresh >/dev/null 2>&1 || true
 }
 
 # dns_status_json — the domains service's DNS report (main + enrolled
@@ -733,9 +733,9 @@ dns_main_refresh() {
 # report then, marked image_old (status names it; M10).
 dns_status_json() {
   local out rc=0
-  out="$(dc exec -T domains domains report --main --json --fresh 2>/dev/null)" || rc=$?
+  out="$(rt_exec domains -- domains report --main --json --fresh 2>/dev/null)" || rc=$?
   if [ "$rc" -eq 2 ]; then
-    out="$(dc exec -T domains domains report --main --json 2>/dev/null)" || return 0
+    out="$(rt_exec domains -- domains report --main --json 2>/dev/null)" || return 0
     printf '%s' "$out" | jq -c '. + {main_fresh: false, image_old: true}' 2>/dev/null || true
     return 0
   fi

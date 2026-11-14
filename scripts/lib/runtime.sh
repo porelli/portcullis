@@ -44,6 +44,7 @@ _rt_is_podman() {
 # nothing answers.
 _rt_engine_probe() {
   local comps out
+  _rt_docker_only
   _RT_ENGINE="" _RT_ENGINE_VERSION=""
   if [ -n "${1:-}" ]; then
     comps="$(DOCKER_HOST="$1" docker version --format '{{json .Server.Components}}' 2>/dev/null)" || return 1
@@ -265,6 +266,7 @@ RT_PODMAN_POOLS="10.88.0.0/16 10.89.0.0/16"
 # reserved pools), warn with it off; the line to add is named either way.
 _rt_pool_check() {
   local net="portcullis-pool-probe-$$" subnet="" why sev=warn
+  _rt_docker_only
   case ",${COMPOSE_PROFILES:-}," in *,wg,*) sev=fail ;; esac
   if docker network create --label com.portcullis.pool-probe=1 "$net" >/dev/null 2>&1; then
     subnet="$(docker network inspect --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$net" 2>/dev/null | awk '{print $1}')"
@@ -284,6 +286,7 @@ _rt_pool_check() {
 # upgrade and restore refuse). Prints nothing under docker.
 runtime_host_checks() {
   local uid user f ctl id lim lin u st pstart v um cm
+  _rt_docker_only
   _rt_is_podman || return 0
   uid="$(id -u)" user="$(id -un)"
   if [ "$uid" = 0 ]; then
@@ -431,6 +434,7 @@ runtime_require_host() {
 runtime_build_local() {
   local cfg svc img ctx df args target a n=0
   local -a cmd
+  _rt_docker_only
   cfg="$(dc config --format json)" || fail "docker compose config failed (is .env complete?)"
   while IFS=$'\t' read -r svc img ctx df args target; do
     [ -n "$svc" ] || continue
@@ -460,6 +464,7 @@ runtime_build_local() {
 # runtime_build_service <service> — build one local image: docker →
 # `docker compose build --quiet`, podman → runtime_build_local.
 runtime_build_service() {
+  _rt_docker_only
   if _rt_is_podman; then runtime_build_local "$1"; else dc build --quiet "$1"; fi
 }
 
@@ -475,6 +480,7 @@ runtime_no_build() {
 # section, in the active profiles): docker → `docker compose build --quiet`,
 # podman → runtime_build_local.
 runtime_build_all() {
+  _rt_docker_only
   if _rt_is_podman; then runtime_build_local; else dc build --quiet || { warn "docker compose build failed"; return 1; }; fi
 }
 
@@ -501,6 +507,7 @@ runtime_build_all() {
 # healthy at the end, fails at once: named, then compose_health_report.
 stack_compose_up() {
   local rc=0 base chk i svc why wait="${STACK_UP_WAIT:-300}"
+  _rt_docker_only
   runtime_build_all || return 1
   dc up -d --no-build "$@" || rc=$?
   [ "$rc" -ne 0 ] || return 0
@@ -533,6 +540,7 @@ stack_compose_up() {
 # core container (health "none" without a healthcheck).
 _stack_up_states() {
   local cid
+  _rt_docker_only
   for cid in $(dc ps -aq 2>/dev/null); do
     docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}} {{.State.Status}} {{.RestartCount}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || true
   done
@@ -568,9 +576,9 @@ runtime_proxies_refresh() {
   local svc
   _rt_is_podman || return 0
   for svc in socket-proxy-traefik socket-proxy-hub; do
-    if [ "$(container_health "$svc")" = unhealthy ]; then
+    if [ "$(rt_health "$svc")" = unhealthy ]; then
       warn "$svc is unhealthy (podman.socket restarted?): restarting it on the current socket"
-      dc restart "$svc" >/dev/null || fail "could not restart $svc"
+      rt_restart "$svc" >/dev/null || fail "could not restart $svc"
     fi
   done
 }
@@ -582,6 +590,7 @@ runtime_proxies_refresh() {
 # `vault status`, PING replies), never a secret. Best effort, never fails.
 compose_health_report() {
   local cid name st
+  _rt_docker_only
   for cid in $(dc ps -aq 2>/dev/null); do
     read -r name st < <(docker inspect --format '{{.Name}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null) || continue
     case "$st" in

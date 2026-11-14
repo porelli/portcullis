@@ -115,6 +115,7 @@ domains_endpoint_certs() {
 # (its age key, the one-shot dns tool and the Traefik account reader all
 # run from it, possibly before the first `up`).
 domains_image_ensure() {
+  _rt_docker_only
   docker image inspect "$DOMAINS_IMAGE_NAME" >/dev/null 2>&1 && return 0
   info "Building the domains service image${1:+ (needed $1)}..."
   runtime_build_service domains >/dev/null || fail "could not build the domains image"
@@ -132,6 +133,7 @@ domains_image_build() {
 # domains image itself (filippo.io/age), offline.
 domains_age_keygen() {
   local f="$1" tmp
+  _rt_docker_only
   domains_image_ensure "to generate its age key"
   tmp="$(mktemp "$f.XXXXXX")"
   chmod 600 "$tmp"
@@ -148,7 +150,7 @@ domains_age_keygen() {
 # (not running — e.g. during `up` after a `down` —, an error, odd output).
 domains_enrolled_state() {
   local n
-  if ! n="$(dc exec -T domains domains enrolled 2>/dev/null | tr -d '[:space:]')" || ! [[ "$n" =~ ^[0-9]+$ ]]; then
+  if ! n="$(rt_exec domains -- domains enrolled 2>/dev/null | tr -d '[:space:]')" || ! [[ "$n" =~ ^[0-9]+$ ]]; then
     echo unknown
   elif [ "$n" -gt 0 ]; then
     echo enrolled
@@ -269,8 +271,8 @@ domains_restart_if_renewed() {
   [ "$DOMAINS_CERTS_RENEWED" = true ] || return 0
   # domains first (it serves the new server certificate), healthy, then
   # traefik (its client certificate): never traefik against the old one.
-  if dc restart domains >/dev/null && wait_healthy 120 domains; then
-    dc restart traefik >/dev/null || warn "could not restart traefik after renewing the endpoint certificates (run: docker compose restart traefik)"
+  if rt_restart domains >/dev/null && wait_healthy 120 domains; then
+    rt_restart traefik >/dev/null || warn "could not restart traefik after renewing the endpoint certificates (run: docker compose restart traefik)"
   else
     warn "could not restart domains after renewing the endpoint certificates (run: docker compose restart domains, then docker compose restart traefik)"
   fi

@@ -80,6 +80,7 @@ _vpn_set() {
 # line. Fails on a docker error (fail closed: init refuses to go on).
 _vpn_docker_subnets() {
   local ids
+  _rt_docker_only
   ids="$(docker network ls -q)" || return 1
   [ -n "$ids" ] || return 0
   # shellcheck disable=SC2086  # network ids
@@ -90,7 +91,7 @@ _vpn_docker_subnets() {
 # the Hub's control socket /tmp/hub-host.sock (0600) answers that uid only.
 # Arguments are names and ids; the public key goes on stdin.
 _vpn_hub() {
-  dc exec -T -u "$CT_UID_HUB:$CT_UID_HUB" hub hub vpn "$@"
+  rt_exec -i hub -- hub vpn "$@"
 }
 
 # _vpn_hub_wait — the Hub's host-info JSON object, waiting up to
@@ -103,7 +104,7 @@ _vpn_hub() {
 _vpn_hub_wait() {
   local limit="${VPN_HUB_WAIT:-120}" st info start=$SECONDS
   while :; do
-    st="$(container_health hub)"
+    st="$(rt_health hub)"
     case "$st" in
       healthy|running|starting|restarting) ;;
       *) fail "the Hub isn't running (state: $st): ./portcullis up first" ;;
@@ -237,8 +238,8 @@ vpn_status_json() {
   local st="" prov="" enabled=false
   if _vpn_profiles_has_wg; then
     enabled=true
-    st="$(dc exec -T wg /wg status 2>/dev/null)" || st=""
-    prov="$(dc exec -T wg /wg providers 2>/dev/null)" || prov=""
+    st="$(rt_exec wg -- /wg status 2>/dev/null)" || st=""
+    prov="$(rt_exec wg -- /wg providers 2>/dev/null)" || prov=""
   fi
   jq -n --argjson en "$enabled" --arg mode "${PORTCULLIS_VPN_MODE:-apps}" --arg pe "${PORTCULLIS_VPN_PUBLIC_ENROL:-true}" \
     --arg bi "${PORTCULLIS_VPN_BUILTIN:-off}" --arg port "${PORTCULLIS_VPN_PORT:-$VPN_DEFAULT_PORT}" \
@@ -431,7 +432,7 @@ vpn_init() {
   vpn_prom_targets
   if declare -F monitoring_fix_perms >/dev/null; then monitoring_fix_perms; fi
   info "Starting wg, Traefik and the Hub..."
-  stack_compose_up wg traefik hub || fail "could not start wg, Traefik and the Hub"
+  rt_up wg traefik hub || fail "could not start wg, Traefik and the Hub"
   wait_healthy 120 wg
   ok "The VPN service is up (built-in VPN $builtin$([ "$builtin" = on ] && echo ", UDP port $port, subnet $subnet")). Wire marketplace VPNs in the Hub; add devices on the Sign-in page or with ./portcullis vpn add-device."
 }
@@ -451,7 +452,7 @@ vpn_mode() {
   done < <(vpn_entrypoints "$mode" "$pe")
   hub_env_write
   info "Recreating core with VPN mode $mode..."
-  stack_compose_up || fail "could not recreate core (the .env is written: run ./portcullis up)"
+  rt_up || fail "could not recreate core (the .env is written: run ./portcullis up)"
   ok "VPN mode $mode."
 }
 
@@ -472,17 +473,16 @@ vpn_builtin() {
   runtime_build_service wg || fail "could not build the wg image"
   # up applies a changed WG_PEOPLE; the restart makes wg read the key file
   # again (it reads it at start) when only the key changed.
-  # shellcheck disable=SC2046  # runtime_no_build prints one flag or nothing
-  dc up -d --no-deps $(runtime_no_build) wg || fail "could not recreate wg"
-  dc restart wg >/dev/null || fail "could not restart wg"
+  rt_up_service wg || fail "could not recreate wg"
+  rt_restart wg >/dev/null || fail "could not restart wg"
   ok "The built-in VPN is $1."
 }
 
 vpn_add_device() {
   local user="$1" name="$2" kp pub cfg conf
-  [ -n "$(dc ps -q --status running wg 2>/dev/null)" ] || fail "wg isn't running: ./portcullis vpn init first"
+  rt_running wg || fail "wg isn't running: ./portcullis vpn init first"
   _vpn_hub_ready || exit 1  # before the key pair: _vpn_hub_wait printed why
-  kp="$(dc exec -T wg /wg keypair)" || fail "wg keypair failed"
+  kp="$(rt_exec wg -- /wg keypair)" || fail "wg keypair failed"
   pub="$(KP="$kp" jq -rn 'env.KP | fromjson | .public_key')" || { unset kp; fail "wg keypair: unexpected output"; }
   cfg="$(printf '%s\n' "$pub" | _vpn_hub add-device --user "$user" --name "$name")" \
     || { unset kp; fail "the Hub refused the device (see above)"; }
@@ -492,7 +492,7 @@ vpn_add_device() {
     || { unset kp; fail "the Hub's answer isn't a device config"; }
   unset kp
   printf '# WireGuard config for %s (%s): import it, or scan the QR code below. Shown once.\n%s\n\n' "$user" "$name" "$conf"
-  printf '%s\n' "$conf" | dc exec -T wg /wg qr || warn "could not draw the QR code"
+  printf '%s\n' "$conf" | rt_exec -i wg -- /wg qr || warn "could not draw the QR code"
   unset conf
 }
 

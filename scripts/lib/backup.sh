@@ -155,6 +155,7 @@ PY
 # ── helpers ────────────────────────────────────────────────
 
 _backup_load_cfg() {
+  _rt_docker_only
   [ -n "$_BACKUP_CFG" ] || _BACKUP_CFG="$(dc config --format json 2>/dev/null)" \
     || fail "docker compose config failed (is .env complete?)"
   [ -n "$_BACKUP_CFG" ] || fail "docker compose config returned nothing"
@@ -165,6 +166,7 @@ _svc_image() { printf '%s' "$_BACKUP_CFG" | jq -r --arg s "$1" '.services[$s].im
 # first if this host does not have it yet (e.g. verify before the first `up`).
 _py_image() {
   local img
+  _rt_docker_only
   img="$(_svc_image group-gate)"
   [ -n "$img" ] || fail "group-gate has no image name in the compose config"
   docker image inspect "$img" >/dev/null 2>&1 || runtime_build_service group-gate >&2 \
@@ -240,13 +242,14 @@ _backup_vault_snapshot() {
 
 _backup_pg_dump() {
   local out="$1"
-  dc exec -T postgres pg_dump -U keycloak -d keycloak -Fc > "$out" || fail "pg_dump failed"
+  rt_exec postgres -- pg_dump -U keycloak -d keycloak -Fc > "$out" || fail "pg_dump failed"
   [ "$(head -c 5 "$out")" = PGDMP ] || fail "pg_dump output is not a custom-format dump"
 }
 
 # _backup_volume_files <volume> <uid> <gid> — tar.gz of the volume on stdout.
 _backup_volume_files() {
   local img
+  _rt_docker_only
   img="$(_py_image)" || return 1
   docker run --rm --network none --user "$2:$3" --cap-drop ALL --security-opt no-new-privileges:true \
     --read-only --tmpfs /tmp -e PYTHONDONTWRITEBYTECODE=1 -v "$1:$BACKUP_PY_MOUNT" \
@@ -297,6 +300,7 @@ _backup_prune_local() {
 
 backup_create() {
   local dir work started="" svc t0 old_umask spec key uid gid full f
+  _rt_docker_only
   require_cmd docker jq curl gzip tar
   t0="$(date +%s)"
   _backup_load_cfg
@@ -307,7 +311,7 @@ backup_create() {
   # The dumps talk to the running Vault and Postgres; start them if needed
   # (and stop them again afterwards).
   for svc in postgres vault; do
-    [ -n "$(dc ps -q --status running "$svc" 2>/dev/null)" ] || started="$started $svc"
+    rt_running "$svc" || started="$started $svc"
   done
   if [ -n "$started" ]; then
     info "Starting$started for the backup..."
@@ -353,7 +357,7 @@ backup_create() {
 
   if [ -n "$started" ]; then
     # shellcheck disable=SC2086
-    dc stop $started >/dev/null 2>&1 || true
+    rt_stop $started >/dev/null 2>&1 || true
   fi
   # shellcheck disable=SC2034
   BACKUP_LAST_DIR="$dir"
@@ -396,6 +400,7 @@ _restic_require() {
 # Extra mounts: _RESTIC_MOUNTS=(-v src:dst ...).
 _restic() {
   local repo="$BACKUP_REPOSITORY" path v user
+  _rt_docker_only
   if _rt_is_podman; then user=0:0; else user="$(id -u):$(id -g)"; fi
   local -a args=(run --rm -i --user "$user" --cap-drop ALL --security-opt no-new-privileges:true
     --read-only --tmpfs /tmp -e HOME=/tmp -e RESTIC_CACHE_DIR=/cache -v "$BACKUP_ROOT/.restic-cache:/cache"
@@ -484,6 +489,7 @@ _restic_restore_to() {
 # backup_verify_dir <dir> — checksums + every piece is usable.
 backup_verify_dir() {
   local dir="$1" t n rc=0 realms users kc pg_img py_img f
+  _rt_docker_only
   _backup_check_layout "$dir"
   _backup_check_manifest "$dir" || fail "checksum mismatch in $dir"
   ok "checksums match MANIFEST.json ($(jq '.files | length' "$dir/MANIFEST.json") files)"
@@ -541,6 +547,7 @@ backup_verify_dir() {
 
 _verify_pg() {
   local n="$1" dump="$2" i
+  _rt_docker_only
   for ((i = 0; i < 60; i++)); do
     docker exec "$n" pg_isready -U postgres -h 127.0.0.1 -q 2>/dev/null && break
     sleep 2
@@ -585,10 +592,10 @@ _restore_pg() {
   # TCP readiness = the final server (the image's init server only listens
   # on the socket).
   for ((i = 0; i < 90; i++)); do
-    dc exec -T postgres pg_isready -U keycloak -h 127.0.0.1 -q >/dev/null 2>&1 && break
+    rt_exec postgres -- pg_isready -U keycloak -h 127.0.0.1 -q >/dev/null 2>&1 && break
     sleep 2
   done
-  dc exec -T postgres pg_restore -U keycloak -d keycloak --no-owner --exit-on-error --single-transaction \
+  rt_exec -i postgres -- pg_restore -U keycloak -d keycloak --no-owner --exit-on-error --single-transaction \
     < "$dir/postgres.dump" || fail "pg_restore failed"
 }
 
@@ -598,6 +605,7 @@ _restore_pg() {
 # the original key.
 _restore_vault() {
   local dir="$1" init tmp_key tmp_root code
+  _rt_docker_only
   info "Restoring Vault (raft snapshot)..."
   unset VAULT_TOKEN
   _vault_start_and_status
@@ -650,6 +658,7 @@ _restore_secrets() {
 # (stopped) lldap_data volume, or "missing".
 _restore_lldap_count() {
   local vol
+  _rt_docker_only
   vol="$(_volume_name lldap_data)"
   docker volume inspect "$vol" >/dev/null 2>&1 || { echo missing; return 0; }
   docker run --rm --network none --read-only --tmpfs /tmp --user "$CT_UID_LLDAP:$CT_UID_LLDAP" --cap-drop ALL \
@@ -661,7 +670,7 @@ _restore_lldap_count() {
 # linked to the LDAP federation (the restored database; Postgres is up),
 # besides admin; "" if unknown.
 _restore_kc_federated_count() {
-  dc exec -T postgres psql -U keycloak -d keycloak -tAc \
+  rt_exec postgres -- psql -U keycloak -d keycloak -tAc \
     "select count(*) from user_entity u join realm r on r.id = u.realm_id where r.name = 'portcullis' and u.federation_link is not null and u.username <> 'admin'" \
     2>/dev/null | tr -d '[:space:]'
 }
@@ -703,6 +712,7 @@ RESTORE_STOPPED_APPS=""
 _RESTORE_ERROR_MSG=""
 _restore_stop_secret_apps() {
   local vol="$1" core="$2" hub_stopped="${3:-false}" ids id p left empty
+  _rt_docker_only
   _RESTORE_ERROR_MSG=""
   if ! ids="$(docker ps -aq --filter "volume=$vol")"; then
     _RESTORE_ERROR_MSG="can't list the containers using $vol (docker ps failed): nothing was restored"
@@ -787,6 +797,7 @@ _restore_runtime_keys() {
 
 backup_restore() {
   local dir="$1" yes="$2" allow_empty_lldap="${3:-false}" pre had_env=false key uid gid full spec proj helper
+  _rt_docker_only
   require_cmd docker jq curl tar gzip
   [ -d "$dir" ] || fail "Backup directory not found: $dir"
   dir="$(cd "$dir" && pwd)"
@@ -810,12 +821,12 @@ backup_restore() {
   if [ "$had_env" = true ]; then
     _backup_load_cfg
     info "Stopping Hub..."
-    dc stop hub || fail "could not stop the Hub: nothing was restored"
+    rt_stop hub || fail "could not stop the Hub: nothing was restored"
     hub_stopped=true
     full="$(_volume_name hub_secrets)"
     if ! _restore_stop_secret_apps "${full:-portcullis_hub_secrets}" "$(_project_name)" true; then
       info "Restarting Hub..."
-      if dc start hub 2>/dev/null; then
+      if rt_start hub 2>/dev/null; then
         fail "$_RESTORE_ERROR_MSG, Hub running again"
       else
         fail "$_RESTORE_ERROR_MSG, Hub was stopped but could not be restarted"
@@ -832,7 +843,7 @@ backup_restore() {
       && { [ ! -d "$PORTCULLIS_ROOT/certs" ] || cp -a "$PORTCULLIS_ROOT/certs" "$pre/certs"; }); then
       if [ "$hub_stopped" = true ]; then
         info "Restarting Hub..."
-        if dc start hub 2>/dev/null; then
+        if rt_start hub 2>/dev/null; then
           fail "could not save pre-restore copy: nothing was restored, Hub running again"
         else
           fail "could not save pre-restore copy: nothing was restored, Hub was stopped but could not be restarted"
@@ -843,8 +854,8 @@ backup_restore() {
     fi
     _backup_load_cfg
     info "Stopping services..."
-    dc down
-    hub_stopped=false  # dc down includes the Hub, so it's not independently stopped anymore
+    rt_down
+    hub_stopped=false  # rt_down includes the Hub, so it's not independently stopped anymore
   fi
 
   # .env in place (keeps a symlink into config/ and the Hub's bind mount).
@@ -936,10 +947,10 @@ backup_restore() {
   # The core must come up; a non-core service (e.g. a Hub image that cannot
   # be pulled right now) must not abort a restore.
   # The local images are built on both runtimes, as up / upgrade do
-  # (stack_compose_up: docker --build, podman podman build + --no-build), so
+  # (rt_up: docker --build, podman podman build + --no-build), so
   # a restore never starts a container from an image older than this
   # checkout; compose recreates a container whose image content changed.
-  stack_compose_up || warn "some services did not start — check ./portcullis status"
+  rt_up || warn "some services did not start — check ./portcullis status"
   wait_healthy 300 vault postgres lldap keycloak
   ok "Restore complete.${pre:+ Previous .env/secrets/certs: $pre.} Verify with ./portcullis status"
   if [ -n "$RESTORE_STOPPED_APPS" ]; then

@@ -37,7 +37,7 @@ _lldap_login() {
   env_require LLDAP_ADMIN_PASSWORD
   # The password reaches jq through its environment, never argv.
   LLDAP_ADMIN_PASSWORD="$LLDAP_ADMIN_PASSWORD" jq -nc '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
-    | dc exec -T lldap curl -sf --max-time 20 http://localhost:17170/auth/simple/login \
+    | rt_exec -i lldap -- curl -sf --max-time 20 http://localhost:17170/auth/simple/login \
         -H 'Content-Type: application/json' -d @- | jq -r '.token // empty'
 }
 
@@ -47,7 +47,7 @@ _lldap_gql() {
   [ -n "$vars" ] || vars='{}'
   # shellcheck disable=SC2016  # expanded by the container's sh / curl
   { printf '%s\n' "$1"; jq -nc --arg q "$2" --argjson v "$vars" '{query: $q, variables: $v}'; } \
-    | dc exec -T lldap sh -c 'read -r T; export T; exec curl -sf --max-time 20 --variable %T \
+    | rt_exec -i lldap -- sh -c 'read -r T; export T; exec curl -sf --max-time 20 --variable %T \
         --expand-header "Authorization: Bearer {{T}}" -H "Content-Type: application/json" \
         -d @- http://localhost:17170/api/graphql'
 }
@@ -94,7 +94,7 @@ lldap_service_account() {
   fi
   # Password: try it; reset it when LLDAP and the file disagree.
   if jq -nc --arg u "$HUB_LLDAP_USER" --rawfile p "$pw" '{username: $u, password: ($p | rtrimstr("\n"))}' \
-      | dc exec -T lldap curl -sf -o /dev/null --max-time 20 http://localhost:17170/auth/simple/login \
+      | rt_exec -i lldap -- curl -sf -o /dev/null --max-time 20 http://localhost:17170/auth/simple/login \
           -H 'Content-Type: application/json' -d @-; then
     echo "    $HUB_LLDAP_USER: password matches secrets/hub/lldap/password"
     return 0
@@ -105,7 +105,7 @@ lldap_service_account() {
   # exception): it reaches the lldap container on stdin, but the tool's argv
   # there is visible from the host (ps) while it runs.
   # shellcheck disable=SC2016
-  if { printf '%s\n' "$tok"; cat "$pw"; echo; } | dc exec -T lldap sh -c 'read -r T; read -r P; export LLDAP_USER_PASSWORD="$P";
+  if { printf '%s\n' "$tok"; cat "$pw"; echo; } | rt_exec -i lldap -- sh -c 'read -r T; read -r P; export LLDAP_USER_PASSWORD="$P";
       exec /app/lldap_set_password --base-url http://localhost:17170 --token "$T" --username "$1"' _ "$HUB_LLDAP_USER" >/dev/null; then # secret-argv-ok: inside the lldap container
     echo "    $HUB_LLDAP_USER: password set from secrets/hub/lldap/password"
     LLDAP_SA_CHANGED=true
@@ -123,7 +123,7 @@ invite_create() {
   local -a args=("$user")
   [ -z "$ttl" ] || args+=(-ttl "$ttl")
   [ -z "$landing" ] || args+=(-landing "$landing")
-  out="$(dc exec -T enroll enroll invite "${args[@]}")" || fail "enroll refused the invite for $user (see above; is the stack up?)"
+  out="$(rt_exec enroll -- enroll invite "${args[@]}")" || fail "enroll refused the invite for $user (see above; is the stack up?)"
   printf '%s' "$out" | jq -e '.url' >/dev/null 2>&1 || fail "unexpected answer from enroll: $out"
   printf '%s' "$out"
 }
@@ -243,6 +243,7 @@ EOF
 # the server's loopback only, removed when the command ends.
 _lldap_ui_podman() {
   local port="${LLDAP_UI_PORT:-17170}" name="portcullis-lldap-ui-$$"
+  _rt_docker_only
   [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] \
     || fail "LLDAP_UI_PORT=$port is not a port between 1024 and 65535"
   # shellcheck disable=SC2064  # $name is fixed now
@@ -269,7 +270,14 @@ cmd_lldap_ui() {
   done
   need_env
   require_cmd docker
+  _lldap_ui_run
+}
+
+# _lldap_ui_run — the docker / podman way to LLDAP's own UI (an SSH tunnel
+# to its container address; podman: a loopback forwarder).
+_lldap_ui_run() {
   local id ip
+  _rt_docker_only
   id="$(dc ps -q lldap 2>/dev/null || true)"
   [ -n "$id" ] || fail "LLDAP is not running (portcullis up)"
   if _rt_is_podman; then

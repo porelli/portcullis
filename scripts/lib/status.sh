@@ -10,6 +10,7 @@
 # nothing when it serves, is off, or isn't running.
 _st_mcp_refusing() {
   local cid
+  _rt_docker_only
   cid="$(dc ps -q mcp-gate 2>/dev/null | head -n1)"
   [ -n "$cid" ] || return 0
   docker inspect --format '{{json .State.Health}}' "$cid" 2>/dev/null \
@@ -123,7 +124,7 @@ status_run() {
   [ "$(printf '%s' "$rt_json" | jq '[.checks[] | select(.status == "fail")] | length')" = 0 ] || problems=1
 
   # ── services ──
-  svc_raw="$(dc ps -a --format json 2>/dev/null || true)"
+  svc_raw="$(rt_ps --json 2>/dev/null || true)"
   # compose prints one object per line (or one array on older versions).
   services="$(printf '%s\n' "$svc_raw" | jq -cs '
       (if length == 1 and (.[0] | type) == "array" then .[0] else . end)
@@ -184,7 +185,7 @@ status_run() {
 
   # ── keycloak (health on the unpublished management port → docker health) ──
   local kc_health users=null realm=false fwd=false passkey=null
-  kc_health="$(container_health keycloak)"
+  kc_health="$(rt_health keycloak)"
   [ "$kc_health" = healthy ] || problems=1
   if [ "$kc_health" = healthy ] && [ -n "${KEYCLOAK_ADMIN_PASSWORD:-}" ] && (kc_login >/dev/null 2>&1); then
     kc_login >/dev/null 2>&1
@@ -201,8 +202,8 @@ status_run() {
     '{health: $h, realm: $r, users: $u, forward_auth_client: $f, passkey_policy: $pk}')"
 
   # ── lldap / traefik ──
-  lldap="$(jq -n --arg h "$(container_health lldap)" '{health: $h}')"
-  traefik="$(container_health traefik)"
+  lldap="$(jq -n --arg h "$(rt_health lldap)" '{health: $h}')"
+  traefik="$(rt_health traefik)"
   case "$traefik" in healthy|running) ;; *) problems=1 ;; esac
   # A non-core container answering to a core service name on portcullis-proxy
   # (network.sh proxy_dns_shadows; up / upgrade refuse to run while it lasts).
@@ -415,7 +416,7 @@ hub_policy_check() {
   want="$(sed -n 's/^POLICY_VERSION = \([0-9][0-9]*\).*/\1/p' "$PORTCULLIS_HOME/group-gate/group-gate.py" | head -n1)"
   [ -n "$want" ] || return 0
   for i in $(seq 1 "$tries"); do
-    got="$(dc exec -T group-gate python3 -c 'import json
+    got="$(rt_exec group-gate -- python3 -c 'import json
 try:
     print(json.load(open("/hub-data/group-gate-policy.json")).get("version"))
 except FileNotFoundError:
@@ -425,7 +426,7 @@ except Exception:
     [ -z "$got" ] || [ "$got" = missing ] || break
     [ "$i" -eq "$tries" ] || sleep 3
   done
-  denied="$(dc logs --no-color --since 10m group-gate 2>/dev/null | grep -c 'is not supported (only' || true)"
+  denied="$(rt_logs group-gate --no-color --since 10m 2>/dev/null | grep -c 'is not supported (only' || true)"
   if { [ -n "$got" ] && [ "$got" != missing ] && [ "$got" != "$want" ]; } || [ "${denied:-0}" -gt 0 ]; then
     fix="run ./portcullis up (it pulls the Hub image this core expects)"
     [ -z "${HUB_IMAGE:-}" ] || fix="remove HUB_IMAGE=$HUB_IMAGE from .env (or set a Hub release that matches this core), then $fix"
@@ -439,10 +440,8 @@ except Exception:
 # hub_started_unix — the running Hub container's start time (epoch
 # seconds; 0: unknown).
 hub_started_unix() {
-  local cid at
-  cid="$(dc ps -q hub 2>/dev/null | head -n1)"
-  [ -n "$cid" ] || { echo 0; return 0; }
-  at="$(docker inspect --format '{{.State.StartedAt}}' "$cid" 2>/dev/null || true)"
+  local at
+  at="$(rt_started_at hub)"
   [ -n "$at" ] || { echo 0; return 0; }
   # GNU date reads any RFC 3339 offset (Podman reports the host's local
   # time); jq's fromdateiso8601 only a Z suffix (BSD date, Docker's UTC).
@@ -451,7 +450,7 @@ hub_started_unix() {
 
 # hub_sync_status — the Hub's last template sync (<data>/source-sync.json,
 # JSON; empty: none).
-hub_sync_status() { dc exec -T hub cat /data/source-sync.json 2>/dev/null || true; }
+hub_sync_status() { rt_exec hub -- cat /data/source-sync.json 2>/dev/null || true; }
 
 # hub_sources_sync [tries] — after a start: the Hub fast-forwards its
 # template sources (git) and reports the outcome. A Hub newer than its
@@ -479,7 +478,7 @@ hub_sources_sync() {
     return 0
   fi
   t0="$(date +%s)"
-  if ! dc kill -s HUP hub >/dev/null 2>&1; then
+  if ! rt_kill hub HUP >/dev/null 2>&1; then
     warn "Could not signal the Hub to sync its template sources: $fix."
     return 0
   fi
@@ -512,7 +511,7 @@ hub_sources_sync() {
 }
 
 version_run() {
-  local json="$1" ver hub src running="" cid="" kc kcsrc kcrunning="" rt="" rtv="" rtline=""
+  local json="$1" ver hub src running="" kc kcsrc kcrunning="" rt="" rtv="" rtline=""
   ver="$(portcullis_version)"
   # An installation: its runtime (a missing CONTAINER_RUNTIME is refused);
   # the engine's version best effort, but an engine contradicting
@@ -533,10 +532,8 @@ version_run() {
   if [ -n "${KEYCLOAK_IMAGE:-}" ]; then kc="$KEYCLOAK_IMAGE" kcsrc="KEYCLOAK_IMAGE"; else kc="$(keycloak_image_default)" kcsrc="default"; fi
   # The running Hub and Keycloak, if this is an installation and Docker answers.
   if [ -f "$(env_file)" ] && command -v docker >/dev/null 2>&1; then
-    cid="$(dc ps -q hub 2>/dev/null | head -n1 || true)"
-    [ -z "$cid" ] || running="$(docker inspect --format '{{.Config.Image}} ({{.Image}})' "$cid" 2>/dev/null || true)"
-    cid="$(dc ps -q keycloak 2>/dev/null | head -n1 || true)"
-    [ -z "$cid" ] || kcrunning="$(docker inspect --format '{{.Config.Image}} ({{.Image}})' "$cid" 2>/dev/null || true)"
+    running="$(rt_image hub)"
+    kcrunning="$(rt_image keycloak)"
   fi
   if [ "$json" = true ]; then
     jq -n --arg v "$ver" --arg h "$hub" --arg s "$src" --arg r "$running" --arg k "$kc" --arg ks "$kcsrc" --arg kr "$kcrunning" \
