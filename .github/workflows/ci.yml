@@ -2424,7 +2424,7 @@ jobs:
       E2E_DOMAIN: portcullis.local
       E2E_ARTIFACTS: e2e-artifacts
       ALPINE: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
-      APP_HOSTS: echo-std echo-basic echo-cert echo-file echo-anycert oidc-strong oidc-all oidc-cert
+      APP_HOSTS: echo-std echo-basic echo-cert echo-file echo-anycert oidc-strong oidc-all oidc-cert echo-otp
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -2634,7 +2634,7 @@ jobs:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt', 'tests/e2e/requirements-totp.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
         timeout-minutes: 10
@@ -2644,6 +2644,8 @@ jobs:
           # cryptography (group-gate's pinned, hashed wheels): the .p12, CSRs
           # and the CA checks of the browser-certificate cases.
           /tmp/e2e-venv/bin/pip install --quiet --require-hashes --only-binary=:all: -r group-gate/requirements.txt
+          # pyotp (the authenticator-code cases), hashed in its own file (P8).
+          /tmp/e2e-venv/bin/pip install --quiet --require-hashes --only-binary=:all: -r tests/e2e/requirements-totp.txt
           sudo /tmp/e2e-venv/bin/playwright install-deps chromium
           /tmp/e2e-venv/bin/playwright install chromium
           sudo apt-get install -y -qq libnss3-tools >/dev/null
@@ -2664,6 +2666,24 @@ jobs:
           E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
           export E2E_HUB_SECRET
           NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_signin.py
+
+      # Authenticator-app codes (contract §8.1; tests/e2e/e2e_totp.py's
+      # docstring lists the cases): on the same stack, after the sign-in
+      # scenarios, whatever they left. The secrets it reads are masked and
+      # never written; no screenshot of a setup page, no trace.
+      - name: Authenticator codes
+        if: success() || failure()
+        env:
+          E2E_ROOT_CERT: /tmp/e2e-secrets/root.crt
+          E2E_ROOT_KEY: /tmp/e2e-secrets/root.key
+          E2E_BOB_CERT: /tmp/e2e-secrets/bob.crt
+          E2E_BOB_KEY: /tmp/e2e-secrets/bob.key
+          E2E_PAT_PASSWORD_FILE: /tmp/e2e-secrets/pat.password
+          E2E_FIXTURE: /tmp/signin-fixture/extra-authenticators.json
+        run: |
+          E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
+          export E2E_HUB_SECRET
+          NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_totp.py
 
       # Keycloak's portcullis-needs-stronger.ftl in core's portcullis theme
       # (a Keycloak page: no secret on it), kept on success too.
