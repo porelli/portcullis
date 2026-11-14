@@ -1,0 +1,127 @@
+name: Core images
+
+# The five images core builds locally on Docker (K1: group-gate, enroll,
+# domains — also the dns-tool —, mcp-gate, wg), published for Kubernetes,
+# where k3s has no builder: ghcr.io/porelli/portcullis-<svc>. `edge` from
+# main (a push touching the service's directory, or a dispatch), cosign
+# keyless; on another branch a dispatch only builds. Release tags X.Y.Z are
+# pushed by release.yml; there is never a `latest`. The CLI resolves every
+# tag to a digest at up / upgrade (charts/portcullis/images.yaml).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'group-gate/**'
+      - 'enroll/**'
+      - 'domains/**'
+      - 'mcp-gate/**'
+      - 'wg/**'
+      - '.github/workflows/images.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        svc: [group-gate, enroll, domains, mcp-gate, wg]
+    permissions:
+      contents: read
+      packages: write   # push to GHCR
+      id-token: write   # keyless cosign signing (GitHub OIDC)
+    env:
+      # The repository (not a pinned ref: this job builds it).
+      IMG_REPO: ghcr.io/${{ github.repository_owner }}/portcullis-${{ matrix.svc }}
+      SVC: ${{ matrix.svc }}
+      ON_MAIN: ${{ github.ref == 'refs/heads/main' }}
+      EVENT: ${{ github.event_name }}
+      BEFORE: ${{ github.event.before }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # A push builds only the services whose directory (or this workflow)
+      # changed; a dispatch builds every one. Pushed only from main.
+      - name: Changed?
+        id: changed
+        run: |
+          go=true
+          if [ "$EVENT" = push ] && [[ "$BEFORE" =~ ^[0-9a-f]{40}$ ]] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ] \
+             && git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
+             && git diff --quiet "$BEFORE" "$GITHUB_SHA" -- "$SVC" .github/workflows/images.yml; then
+            go=false
+          fi
+          push=false
+          if [ "$go" = true ] && [ "$ON_MAIN" = true ]; then push=true; fi
+          echo "build=$go" >> "$GITHUB_OUTPUT"
+          echo "push=$push" >> "$GITHUB_OUTPUT"
+          echo "$SVC: build=$go push=$push"
+
+      - name: Set up QEMU
+        if: steps.changed.outputs.build == 'true'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Docker Buildx
+        if: steps.changed.outputs.build == 'true'
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        if: steps.changed.outputs.push == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # edge for main, never latest (release.yml adds X.Y.Z).
+      - name: Docker metadata
+        if: steps.changed.outputs.build == 'true'
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMG_REPO }}
+          flavor: |
+            latest=false
+          tags: |
+            type=edge,branch=main
+
+      - name: Build and push
+        if: steps.changed.outputs.build == 'true'
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.svc }}
+          push: ${{ steps.changed.outputs.push == 'true' }}
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=max
+          sbom: true
+
+      - name: Install cosign
+        if: steps.changed.outputs.push == 'true'
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      # Sign the pushed manifest-list digest (covers every tag and platform).
+      - name: Sign image (keyless)
+        if: steps.changed.outputs.push == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMG_REPO}@${DIGEST}"
+
+      - name: Digest
+        if: steps.changed.outputs.push == 'true'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: echo "pushed ${IMG_REPO}:edge@${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"

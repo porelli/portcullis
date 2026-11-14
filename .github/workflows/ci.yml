@@ -146,8 +146,17 @@ jobs:
             head -n1 /tmp/help.out | grep -q "^Usage: portcullis $cmd" || { echo "FAIL: '$cmd --help' has no usage line"; exit 1; }
             echo "::endgroup::"
           done
+      # PyYAML for the Kubernetes static checks (scripts/gen-images-yaml.py,
+      # tests/k8s_*.py), pinned with hashes; test_cli runs the generator too.
+      - name: Kubernetes check dependencies (pinned, hashes)
+        run: |
+          python3 -m venv /tmp/k8s-venv
+          /tmp/k8s-venv/bin/pip install --quiet --disable-pip-version-check \
+            --require-hashes --only-binary=:all: -r tests/k8s-requirements.txt
+      - name: charts/portcullis/images.yaml is generated from docker-compose.yml
+        run: /tmp/k8s-venv/bin/python scripts/gen-images-yaml.py --check
       - name: CLI argument parsing tests
-        run: bash tests/test_cli.sh
+        run: PATH="/tmp/k8s-venv/bin:$PATH" bash tests/test_cli.sh
       - name: shell library tests (.env, proxy network, revocation sync, pki setup)
         run: bash tests/test_shell_libs.sh
       # group-gate's own pins (group-gate/requirements.txt, hashes), the same

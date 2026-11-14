@@ -352,6 +352,35 @@ expect_eq "lint_images.sh flags short names in scripts/lib constants, workflow i
 scripts/lib/x.sh:1: alpine:3.24.3
 .github/workflows/x.yml:2: alpine:3
 .github/workflows/x.yml:4: restic/restic:0.19.1"
+# Kubernetes (K1, K3): images.yaml, the chart templates, kube/**/*.yaml.
+Z64=0000000000000000000000000000000000000000000000000000000000000000
+mkdir -p "$WORK/lint/charts/portcullis/templates" "$WORK/lint/kube/storage"
+printf 'images:\n  a: docker.io/library/postgres:18@sha256:%s\n  b: postgres:18@sha256:%s\n  c: docker.io/library/vault:2\n  d:\n    tag_ref: ghcr.io/porelli/portcullis-hub:edge\n  e:\n    tag_ref: docker.io/evil/hub:edge\n' "$Z64" "$Z64" > "$WORK/lint/charts/portcullis/images.yaml"
+printf 'spec:\n  containers:\n    - image: {{ .Values.images.vault }}\n    - image: busybox:1@sha256:%s\n' "$Z64" > "$WORK/lint/charts/portcullis/templates/x.yaml"
+printf 'spec:\n  image: docker.io/rancher/local-path-provisioner:v0.0.37\n' > "$WORK/lint/kube/storage/p.yaml"
+OUT="$("$WORK/lint/tests/lint_images.sh"; echo "rc=$?")"
+expect_eq "lint_images.sh flags an unqualified / unpinned images.yaml entry, a foreign tag_ref, and short or unpinned images in the chart templates and kube/" \
+  "$(printf '%s\n' "$OUT" | grep -E '^(charts|kube)' | sed 's/@sha256:.*//' | sort -u)" "charts/portcullis/images.yaml:3: postgres:18
+charts/portcullis/images.yaml:4: docker.io/library/vault:2 (not pinned tag@sha256)
+charts/portcullis/images.yaml:8: docker.io/evil/hub:edge (a tag_ref outside ghcr.io/porelli/portcullis-*)
+charts/portcullis/templates/x.yaml:4: busybox:1
+kube/storage/p.yaml:2: docker.io/rancher/local-path-provisioner:v0.0.37"
+# images.yaml is generated from compose (K1): a stale file fails --check.
+mkdir -p "$WORK/gen/scripts" "$WORK/gen/charts/portcullis"
+cp "$HERE/../scripts/gen-images-yaml.py" "$WORK/gen/scripts/"
+cp "$HERE/../docker-compose.yml" "$WORK/gen/"
+if python3 -c 'import yaml' 2>/dev/null; then
+  python3 "$WORK/gen/scripts/gen-images-yaml.py"
+  expect_eq "gen-images-yaml.py --check: a fresh file passes" "$(python3 "$WORK/gen/scripts/gen-images-yaml.py" --check 2>&1; echo "rc=$?")" "rc=0"
+  sed -i.bak 's/postgres:18[^ ]*/postgres:17/' "$WORK/gen/charts/portcullis/images.yaml"
+  expect_eq "gen-images-yaml.py --check: a stale file → exit 1" "$(python3 "$WORK/gen/scripts/gen-images-yaml.py" --check 2>&1; echo "rc=$?")" "charts/portcullis/images.yaml is stale: run scripts/gen-images-yaml.py
+rc=1"
+  expect_eq "charts/portcullis/images.yaml is current" "$(python3 "$HERE/../scripts/gen-images-yaml.py" --check 2>&1; echo "rc=$?")" "rc=0"
+  expect_eq "images.yaml: the five core-built images, the Hub and Keycloak are tag_refs; no socket proxy" \
+    "$(grep -c 'tag_ref: ghcr.io/porelli/portcullis-' "$HERE/../charts/portcullis/images.yaml"):$(grep -c 'socket-proxy' "$HERE/../charts/portcullis/images.yaml")" "8:0"
+else
+  t_fail "gen-images-yaml.py: python3 has no yaml module (pip install -r tests/k8s-requirements.txt)"
+fi
 expect_eq "the SELinux overlay adds only label=disable to security_opt (compose appends: a repeated no-new-privileges is a duplicate newer compose refuses)" \
   "$(grep -v '^[[:space:]]*#' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml" | grep -c 'no-new-privileges'):$(grep -c '^    security_opt: \["label=disable"\]$' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" "0:2"
 expect_eq "docker-compose.podman.yml sets restart: always and nothing else (podman-restart.service starts only those at boot)" \
