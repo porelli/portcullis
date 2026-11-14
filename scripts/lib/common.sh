@@ -44,6 +44,9 @@ need_value() {
 require_cmd() {
   local c
   for c in "$@"; do
+    # Under kubernetes the CLI talks to the cluster, not an engine
+    # (runtime_check requires kubectl / helm there).
+    [ "$c" != docker ] || [ "${CONTAINER_RUNTIME:-}" != kubernetes ] || continue
     command -v "$c" >/dev/null 2>&1 || fail "$c is required but not installed"
   done
 }
@@ -275,6 +278,11 @@ _rtd_services() { dc config --services; }
 # compose plugin).
 rt_require_tools() { if _rt_is_kube; then _rtk_require_tools; else _rtd_require_tools; fi; }
 _rtd_require_tools() { docker compose version >/dev/null 2>&1 || fail "the docker compose plugin is required"; }
+
+# rt_network_check — the runtime's network preconditions before anything
+# starts: docker / podman network_check (IPAM, the DNS-shadow guard);
+# kubernetes: nothing here (rt_up's cluster setup and NetworkPolicy probe).
+rt_network_check() { if _rt_is_kube; then return 0; fi; network_check; }
 
 # rt_down [args...] — stop and remove the core containers (volumes kept).
 rt_down() { if _rt_is_kube; then _rtk_down "$@"; else _rtd_down "$@"; fi; }
@@ -574,6 +582,12 @@ ct_run() {
 # container, so 10001 writes the host's subuid+10000; no container, no bind
 # mount, nothing relabelled), never chown directly.
 ct_own() {
+  # Kubernetes: secrets/ is the CLI's (synced into Secrets with their own
+  # modes), no container reads host files.
+  if _rt_is_kube; then return 0; fi
+  _ct_own_docker "$@"
+}
+_ct_own_docker() {
   local spec="$1" p i=0 podman=false todo=() mounts=() targets=()
   _rt_docker_only
   shift
@@ -615,6 +629,11 @@ ct_own() {
 # read-only) the volume starts root-owned and Docker never copies the owning
 # image's ownership in. Created with compose's labels so compose adopts it.
 volume_own() {
+  # Kubernetes: the PVCs are created with their owner (K3 annotations).
+  if _rt_is_kube; then return 0; fi
+  _volume_own_docker "$@"
+}
+_volume_own_docker() {
   local vol="$1" spec="$2" mode="${3:-}" project="${COMPOSE_PROJECT_NAME:-portcullis}" name
   _rt_docker_only
   name="${project}_$vol"
@@ -763,6 +782,11 @@ hub_env_write() {
 # _ensure_secrets_volume — ensure hub_secrets volume exists with CT_UID_HUB:CT_UID_HUB 0700.
 # Called by init/upgrade/restore (through stack_prepare) per contract §6.
 _ensure_secrets_volume() {
+  # Kubernetes: hub-secrets is a PVC owned 10001:10001 0700 by its annotations.
+  if _rt_is_kube; then return 0; fi
+  _ensure_secrets_volume_docker
+}
+_ensure_secrets_volume_docker() {
   local name="${HUB_SECRETS_VOLUME:-portcullis_hub_secrets}"
   local project="${COMPOSE_PROJECT_NAME:-portcullis}"
   _rt_docker_only

@@ -25,6 +25,19 @@ _mcpgate_dir() { echo "$PORTCULLIS_ROOT/secrets/mcp-gate"; }
 # mcp-gate image itself (filippo.io/age), straight into the file.
 _mcpgate_keygen() {
   local f="$1" tmp
+  if _rt_is_kube; then
+    tmp="$(mktemp "$f.XXXXXX")"
+    chmod 600 "$tmp"
+    _kube_keygen mcp-gate "$CT_UID_MCP_GATE" > "$tmp" && grep -q '^AGE-SECRET-KEY-1' "$tmp" && grep -Eq '^# public key: age1[0-9a-z]+$' "$tmp" \
+      || { rm -f "$tmp"; fail "could not generate secrets/mcp-gate/age.key"; }
+    mv -f "$tmp" "$f"
+    ok "Generated secrets/mcp-gate/age.key (decrypts the Hub's AI credentials; backed up with secrets/)."
+    return 0
+  fi
+  _mcpgate_keygen_docker "$f"
+}
+_mcpgate_keygen_docker() {
+  local f="$1" tmp
   _rt_docker_only
   if ! docker image inspect "$MCPGATE_IMAGE_NAME" >/dev/null 2>&1; then
     info "Building the mcp-gate image (needed to generate its age key)..."

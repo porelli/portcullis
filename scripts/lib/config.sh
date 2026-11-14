@@ -54,18 +54,30 @@ config_build_ca_bundle() {
 # sentinel isn't written, so the flip stays pending.
 # _cfg_acme_exists — Traefik's ACME storage exists.
 _cfg_acme_exists() {
+  if _rt_is_kube; then _kube_acme_exists; return; fi
+  _cfg_acme_exists_docker
+}
+_cfg_acme_exists_docker() {
   _rt_docker_only
   docker volume inspect portcullis_traefik_acme >/dev/null 2>&1
 }
 
 # _cfg_acme_clear — remove acme.json from Traefik's ACME storage.
 _cfg_acme_clear() {
+  if _rt_is_kube; then _kube_acme_clear; return; fi
+  _cfg_acme_clear_docker
+}
+_cfg_acme_clear_docker() {
   _rt_docker_only
   docker run --rm --network none -v portcullis_traefik_acme:/acme "$PORTCULLIS_HELPER_IMAGE" rm -f /acme/acme.json >/dev/null 2>&1
 }
 
 # _cfg_traefik_exists — a Traefik container exists (or docker can't tell).
 _cfg_traefik_exists() {
+  if _rt_is_kube; then _kube_traefik_exists; return; fi
+  _cfg_traefik_exists_docker
+}
+_cfg_traefik_exists_docker() {
   _rt_docker_only
   [ -n "$(dc ps -aq traefik 2>/dev/null || echo unknown)" ]
 }

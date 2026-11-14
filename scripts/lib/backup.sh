@@ -298,7 +298,11 @@ _backup_prune_local() {
 
 # ── backup ─────────────────────────────────────────────────
 
-backup_create() {
+# backup_create — a consistent, online backup (docker / podman: compose
+# volumes and helper containers; kubernetes: scripts/lib/kube.sh).
+backup_create() { if _rt_is_kube; then _backup_create_kube; else _backup_create_docker; fi; }
+
+_backup_create_docker() {
   local dir work started="" svc t0 old_umask spec key uid gid full f
   _rt_docker_only
   require_cmd docker jq curl gzip tar
@@ -398,7 +402,9 @@ _restic_require() {
 # password and provider credentials are passed by NAME (-e VAR), in a
 # subshell, so they never reach argv or this shell's later commands.
 # Extra mounts: _RESTIC_MOUNTS=(-v src:dst ...).
-_restic() {
+_restic() { if _rt_is_kube; then _restic_host "$@"; else _restic_docker "$@"; fi; }
+
+_restic_docker() {
   local repo="$BACKUP_REPOSITORY" path v user
   _rt_docker_only
   if _rt_is_podman; then user=0:0; else user="$(id -u):$(id -g)"; fi
@@ -480,14 +486,23 @@ _restic_restore_to() {
   _RESTIC_MOUNTS=(-v "$target:/restore")
   _restic restore "$snap" ${filter[@]+"${filter[@]}"} --target /restore >&2 || { _RESTIC_MOUNTS=(); fail "restic restore of $snap failed"; }
   _RESTIC_MOUNTS=()
-  [ -f "$target$BACKUP_SNAPSHOT_PATH/MANIFEST.json" ] || fail "snapshot $snap has no $BACKUP_SNAPSHOT_PATH/MANIFEST.json"
+  if [ ! -f "$target$BACKUP_SNAPSHOT_PATH/MANIFEST.json" ]; then
+    # A snapshot made by the host restic (kubernetes) keeps the host path.
+    local m
+    m="$(find "$target" -name MANIFEST.json -path '*/MANIFEST.json' 2>/dev/null | head -n1)"
+    [ -n "$m" ] || fail "snapshot $snap has no $BACKUP_SNAPSHOT_PATH/MANIFEST.json"
+    printf '%s' "$(dirname "$m")"
+    return 0
+  fi
   printf '%s' "$target$BACKUP_SNAPSHOT_PATH"
 }
 
 # ── verify ─────────────────────────────────────────────────
 
 # backup_verify_dir <dir> — checksums + every piece is usable.
-backup_verify_dir() {
+backup_verify_dir() { if _rt_is_kube; then _backup_verify_dir_kube "$@"; else _backup_verify_dir_docker "$@"; fi; }
+
+_backup_verify_dir_docker() {
   local dir="$1" t n rc=0 realms users kc pg_img py_img f
   _rt_docker_only
   _backup_check_layout "$dir"
@@ -779,6 +794,15 @@ restore_runtime_from_host() {
   fi
   RESTORE_ENGINE_SOCKET=""
   [ "$RESTORE_RUNTIME" != podman ] || RESTORE_ENGINE_SOCKET="${PORTCULLIS_ENGINE_SOCKET:-}"
+  # Kubernetes: the cluster's keys stay this host's (context, namespaces,
+  # networks, install id, images, fixed ClusterIPs), never the backup's.
+  RESTORE_KUBE_KEYS=""
+  if [ "$RESTORE_RUNTIME" = kubernetes ]; then
+    local k
+    for k in $RESTORE_KUBE_KEY_NAMES; do
+      [ -z "${!k:-}" ] || RESTORE_KUBE_KEYS+="$k=${!k}"$'\n'
+    done
+  fi
   runtime_check
   runtime_require_host
 }
@@ -786,16 +810,30 @@ restore_runtime_from_host() {
 # _restore_runtime_keys — the restored .env keeps this host's runtime, never
 # the backup's: CONTAINER_RUNTIME always, the engine socket under podman; a
 # PORTCULLIS_ENGINE_SOCKET the backup carried is dropped under docker.
+# The .env keys that belong to a kubernetes host (restore keeps the host's).
+RESTORE_KUBE_KEY_NAMES="PORTCULLIS_KUBE_CONTEXT PORTCULLIS_NAMESPACE PORTCULLIS_APPS_NAMESPACE PORTCULLIS_POD_CIDR PORTCULLIS_SERVICE_CIDR PORTCULLIS_KUBE_API_ENDPOINTS PORTCULLIS_KUBE_INSTALL_ID PORTCULLIS_KUBE_IMAGES PORTCULLIS_TRAEFIK_SERVICE_IP PORTCULLIS_TRAEFIK_VPN_SERVICE_IP PORTCULLIS_WG_EDGE_SERVICE_IP"
+
 _restore_runtime_keys() {
+  local k line
   env_set CONTAINER_RUNTIME "$RESTORE_RUNTIME"
   if [ "$RESTORE_RUNTIME" = podman ]; then
     env_set PORTCULLIS_ENGINE_SOCKET "$RESTORE_ENGINE_SOCKET"
   else
     env_unset PORTCULLIS_ENGINE_SOCKET
   fi
+  # The backup's kubernetes keys (if any) never survive; this host's do.
+  for k in $RESTORE_KUBE_KEY_NAMES; do env_unset "$k"; done
+  if [ "$RESTORE_RUNTIME" = kubernetes ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      env_set "${line%%=*}" "${line#*=}"
+    done <<< "${RESTORE_KUBE_KEYS:-}"
+  fi
 }
 
-backup_restore() {
+backup_restore() { if _rt_is_kube; then _backup_restore_kube "$@"; else _backup_restore_docker "$@"; fi; }
+
+_backup_restore_docker() {
   local dir="$1" yes="$2" allow_empty_lldap="${3:-false}" pre had_env=false key uid gid full spec proj helper
   _rt_docker_only
   require_cmd docker jq curl tar gzip

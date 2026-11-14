@@ -69,6 +69,21 @@ vault_use_container_cli() {
 # variable is dropped by Docker but refused by Podman's compat exec (400
 # "environment variable ... badly formed, must be key=value").
 _vault_dc_exec() {
+  # Kubernetes: no -e on an exec; the token is the first line of stdin
+  # (sh's read takes only that line from a pipe), never argv.
+  if _rt_is_kube; then
+    if printenv VAULT_TOKEN >/dev/null 2>&1; then
+      # shellcheck disable=SC2016  # expanded by the container's sh
+      if [ -t 0 ]; then
+        printf '%s\n' "$VAULT_TOKEN" | rt_exec -i vault -- sh -c 'IFS= read -r t; VAULT_TOKEN="$t" exec vault "$@"' vault "$@"
+      else
+        { printf '%s\n' "$VAULT_TOKEN"; cat; } | rt_exec -i vault -- sh -c 'IFS= read -r t; VAULT_TOKEN="$t" exec vault "$@"' vault "$@"
+      fi
+    else
+      rt_exec -i vault -- vault "$@"
+    fi
+    return
+  fi
   if printenv VAULT_TOKEN >/dev/null 2>&1; then
     rt_exec -i -e VAULT_TOKEN vault -- vault "$@"
   else
@@ -137,6 +152,12 @@ _vault_start_and_status() {
   if ! rt_running vault; then
     info "Starting vault container..."
     rt_up_service vault
+  fi
+  # Kubernetes: the CLI's curl reaches Vault through a port-forward.
+  if _rt_is_kube && [ -z "${_K_VAULT_FWD:-}" ]; then
+    local pf
+    pf="$(_kube_forward vault 8200)" || fail "no port-forward to Vault"
+    export VAULT_ADDR="http://127.0.0.1:$pf" _K_VAULT_FWD=1
   fi
   info "Waiting for the Vault API..."
   local err

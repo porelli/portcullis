@@ -3183,8 +3183,8 @@ expect_eq "--force-recreate only on the restore's fresh Vault" \
   "$(grep -h 'dc up .*--force-recreate' "$LIBS"/*.sh | sed 's/^ *//')" 'dc up -d $(runtime_no_build) --no-deps --force-recreate vault >/dev/null'
 expect_eq "every dc up outside stack_compose_up passes \$(runtime_no_build)" \
   "$(grep -n 'dc up ' "$LIBS"/*.sh | grep -v '^\s*#' | grep -vF '$(runtime_no_build)' | grep -v '/runtime.sh:' || true)" ""
-expect_eq "no dc up --build anywhere: rt_up (= stack_compose_up on docker / podman) builds first (init, up, upgrade, restore go through it)" \
-  "$(grep -n 'dc up .*--build' "$LIBS"/*.sh | grep -v -- '--no-build' || true):$(grep -c '^ *rt_up\b' "$LIBS/stack.sh") $(grep -c '^ *rt_up ||' "$LIBS/backup.sh")" ":3 1"
+expect_eq "no dc up --build anywhere: rt_up (= stack_compose_up on docker / podman) builds first (init, up, upgrade, restore go through it; init's last kubernetes rt_up too)" \
+  "$(grep -n 'dc up .*--build' "$LIBS"/*.sh | grep -v -- '--no-build' || true):$(grep -c '^ *rt_up\b' "$LIBS/stack.sh") $(grep -c '^ *rt_up ||' "$LIBS/backup.sh")" ":4 1"
 expect_eq "rt_up on docker / podman is stack_compose_up (the kcwait tests below run through it)" \
   "$( (stack_compose_up() { echo "scu $*"; }; CONTAINER_RUNTIME=docker; rt_up wg traefik hub; CONTAINER_RUNTIME=podman; rt_up) )" "scu wg traefik hub
 scu "
@@ -3908,13 +3908,24 @@ case "$*" in
     all="$*"; f="${all##* -f }"
     [ -z "${STUB_APPLY_FAIL_MATCH:-}" ] || case "$f" in *"$STUB_APPLY_FAIL_MATCH"*) echo "stub: apply of $f refused" >&2; exit 1 ;; esac
     [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
-  "create configmap "*" --dry-run=client -o yaml")
+  "create secret generic "*" --dry-run=client -o yaml"|"create configmap "*" --dry-run=client -o yaml")
+    if [ "$2" = secret ]; then kn="secret $4"; else kn="configmap $3"; fi
+    printf 'create %s\n' "$kn" >> "$STUB_DIR/order"
     all="$*"; d="${all##*--from-file=}"; d="${d%% *}"
-    printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n' "$3"
+    printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n' "${kn#* }"
     for f in "$d"/*; do printf '  %s: %s\n' "${f##*/}" "$(head -c 200 "$f" | head -n1)"; done ;;
   "apply -f -") cat >> "$STUB_DIR/kubectl-stdin"; [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
   "apply -f "*) [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
   "exec client-allowed -- nc"*) exit "${STUB_DIAL_ALLOWED:-0}" ;;
+  "exec -i deploy/wg -c wg -- /wg keypair") printf '{"private_key":"%s","public_key":"%s"}\n' "${STUB_WG_PRIV:-cHJpdg==}" "${STUB_WG_PUB:-cHVi}" ;;
+  "get pods -l portcullis.io/component=hub -o json"|"get pods -l portcullis.io/component=wg -o json") echo '{"items":[{"status":{"phase":"Running","containerStatuses":[{"ready":true,"started":true}]},"spec":{"containers":[{"readinessProbe":{}}]}}]}' ;;
+  "get pods -o json") cat "$K/pods.json" 2>/dev/null || echo '{"items":[]}' ;;
+  "get events --field-selector "*) echo '{"items":[{"reason":"BackOff","message":"Back-off restarting failed container"}]}' ;;
+  "get secrets -o json") cat "$K/apps-secrets.json" 2>/dev/null || echo '{"items":[]}' ;;
+  "get deployments -l portcullis.io/person-secrets -o json") echo '{"items":[{"metadata":{"labels":{"portcullis.io/instance":"samba"}}}]}' ;;
+  "scale "*|"patch "*|"annotate "*|"rollout "*|"wait "*) printf 'kubectl %s %s\n' "$ns" "$*" >> "$STUB_DIR/order" ;;
+  "run "*) printf 'kubectl run\n' >> "$STUB_DIR/order"; cat >/dev/null; exit "${STUB_RUN_RC:-0}" ;;
+  "create --dry-run=client -o json -f -") cat >/dev/null; printf '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"oneshot"},"spec":{"containers":[{"name":"x","image":"ghcr.io/porelli/portcullis-hub@sha256:%064d","command":["/usr/local/bin/hub"]}]}}\n' 1 ;;
   "exec client-ingress -- nc"*) exit "${STUB_DIAL_INGRESS:-1}" ;;
   "exec client-egress -- nc"*) exit "${STUB_DIAL_EGRESS:-1}" ;;
   "get pod server -o jsonpath={.status.podIP}") echo 10.42.0.9 ;;
@@ -3922,7 +3933,16 @@ case "$*" in
 esac
 exit 0
 KSTUB
-printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "$STUB_DIR/helm-calls"\nexit 0\n' > "$KS/bin/helm"
+cat > "$KS/bin/helm" <<'HSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_DIR/helm-calls"
+printf 'helm %s\n' "$*" >> "$STUB_DIR/order"
+case "$*" in
+  *" template "*"--show-only templates/oneshot.yaml"*) printf 'apiVersion: v1\nkind: Pod\nmetadata:\n  name: oneshot\nspec:\n  containers:\n    - name: x\n      image: ghcr.io/porelli/portcullis-hub@sha256:%064d\n      command: ["/usr/local/bin/hub"]\n' 1 ;;
+  *" upgrade --install "*) [ -z "${STUB_HELM_FAIL:-}" ] || { echo "Error: context deadline exceeded" >&2; exit 1; } ;;
+esac
+exit 0
+HSTUB
 chmod +x "$KS/bin/kubectl" "$KS/bin/helm"
 k_fixtures() {
   rm -rf "$KS/kube" "$KS/kubectl-calls" "$KS/kubectl-stdin"; mkdir -p "$KS/kube"
@@ -4107,6 +4127,120 @@ expect_eq "kube/admission: five policies, five bindings portcullis-apps-guard-<p
   "$(python3 -c 'import sys, yaml; P = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]; B = [d for d in yaml.safe_load_all(open(sys.argv[2])) if d]; print(sorted(p["metadata"]["name"] for p in P), all(p["spec"]["failurePolicy"] == "Fail" for p in P), sorted((b["metadata"]["name"], b["spec"]["policyName"], b["spec"]["validationActions"] == ["Deny"], b["spec"]["paramRef"]["parameterNotFoundAction"]) for b in B))' "$HERE/../kube/admission/policies.yaml" "$HERE/../kube/admission/bindings.yaml")" \
   "['portcullis-apps-netpol', 'portcullis-apps-pods', 'portcullis-apps-services', 'portcullis-apps-traefik', 'portcullis-apps-workloads'] True [('portcullis-apps-guard-netpol', 'portcullis-apps-netpol', True, 'Deny'), ('portcullis-apps-guard-pods', 'portcullis-apps-pods', True, 'Deny'), ('portcullis-apps-guard-services', 'portcullis-apps-services', True, 'Deny'), ('portcullis-apps-guard-traefik', 'portcullis-apps-traefik', True, 'Deny'), ('portcullis-apps-guard-workloads', 'portcullis-apps-workloads', True, 'Deny')]"
 expect_eq "admission fileMiddlewares = the CLI's KUBE_FILE_NAMES = the params example's" "$(sed -n 's/^  fileMiddlewares: //p' "$HERE/../kube/admission/params.yaml")" "$KUBE_FILE_NAMES"
+# ── Task 15: sync, values, the release, one-shots, restore, VPN, revocation ──
+# shellcheck source=../scripts/lib/signin.sh
+source "$HERE/../scripts/lib/signin.sh"
+K15="$WORK/k15"
+k15_root() {
+  rm -rf "$K15"; mkdir -p "$K15/secrets/hub/lldap" "$K15/secrets/wg" "$K15/secrets/domains/certs-endpoint" "$K15/secrets/kube" "$K15/certs/revocation" "$K15/certs/truststore"
+  printf 'SECRET-LLDAP-PW-123' > "$K15/secrets/hub/lldap/password"
+  printf 'portcullis-hub' > "$K15/secrets/hub/lldap/username"
+  printf '{"root_token":"ROOT-TOKEN-XYZ"}' > "$K15/secrets/vault-init.json"
+  printf 'CA-KEY-SECRET' > "$K15/secrets/domains/certs-endpoint/ca.key"
+  printf 'client' > "$K15/secrets/domains/certs-endpoint/client.crt"
+  : > "$K15/secrets/wg/people.key"
+  printf 'cert' > "$K15/certs/ca-chain.crt"; printf 'KEY' > "$K15/certs/server.key"; printf '1a\n' > "$K15/certs/revocation/revoked-serials.txt"
+  echo "PORTCULLIS_DOMAIN=k.example.org" > "$K15/.env"
+}
+K15_ENV="export PORTCULLIS_ROOT='$K15' POSTGRES_PASSWORD=PG-SECRET-777 HUB_PROXY_SECRET=HUB-PROXY-SECRET-555 KEYCLOAK_ADMIN_PASSWORD=KC-SECRET PORTCULLIS_DOMAIN=k.example.org PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 PORTCULLIS_TRAEFIK_VPN_SERVICE_IP=10.43.0.21 PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.0.22"
+k_fixtures; k15_root; rm -f "$KS/order"
+OUT="$(kt "set -euo pipefail; $K15_ENV; kube_sync_secrets" </dev/null)"
+expect_eq "sync: every object applied (under set -euo pipefail)" "$(printf '%s\n' "$OUT" | tail -n1)" "rc=0"
+expect_eq "sync: no secret on argv (kubectl / helm argv recorded)" \
+  "$(cat "$KS/kubectl-calls" "$KS/helm-calls" 2>/dev/null | grep -cE 'SECRET-LLDAP-PW-123|PG-SECRET-777|HUB-PROXY-SECRET-555|KC-SECRET|ROOT-TOKEN-XYZ|CA-KEY-SECRET' || true)" 0
+expect_eq "sync: Secrets from secrets/ dirs (--from-file), portcullis-env, ConfigMaps; never vault-init.json or the endpoint CA key" \
+  "$(grep -cE 'create secret generic secrets-hub-lldap .*--from-file=|create secret generic portcullis-env .*--from-file=|create configmap certs-revocation .*--from-file=|create secret generic secrets-certs .*--from-file=' "$KS/kubectl-calls"):$(grep -rlE 'ROOT-TOKEN-XYZ|CA-KEY-SECRET' "$KS/kubectl-stdin" 2>/dev/null | wc -l | tr -d ' ')" "4:0"
+expect_eq "sync: the hub-proxy-secret Middleware from stdin (jq), its secret not on argv" \
+  "$(grep -c '"X-Portcullis-Proxy-Secret": "HUB-PROXY-SECRET-555"' "$KS/kubectl-stdin"):$(grep -c 'HUB-PROXY-SECRET-555' "$KS/kubectl-calls" || true)" "1:0"
+# unchanged hash → no apply
+kt "$K15_ENV; kube_sync_secrets >/dev/null; _kube_applied_set_objects \"\$_K_HASHES\"" >/dev/null
+rm -f "$KS/kubectl-calls"
+kt "$K15_ENV; kube_sync_secrets" >/dev/null
+expect_eq "sync: unchanged hashes → no object applied again (only the hub-proxy-secret Middleware)" \
+  "$(grep -c 'create secret generic\|create configmap' "$KS/kubectl-calls" || true)" 0
+printf 'CHANGED' > "$K15/secrets/hub/lldap/password"
+rm -f "$KS/kubectl-calls"
+kt "$K15_ENV; kube_sync_secrets" >/dev/null
+expect_eq "sync: a changed file → only its object applied" "$(grep -c 'create secret generic\|create configmap' "$KS/kubectl-calls"):$(grep -c 'create secret generic secrets-hub-lldap' "$KS/kubectl-calls")" "1:1"
+# values: no secret, every key; a missing required one refused
+k15_root
+OUT="$(kt "$K15_ENV; _K_IMAGES='{\"hub\":\"ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 1)\"}'; kube_render_values; jq -c '[.domain, .podCIDR, .apiEndpoints, .nodeAddresses, .traefikServiceIP, .entrypoints.web.admin, .vpn.reservedPools, .hub.selfImage | tostring]' \"$K15/secrets/kube/values.yaml\"")"
+expect_eq "kube_render_values: .env → values (the networks, the ClusterIPs, the six classes, the pools, the Hub's digest)" "$(printf '%s\n' "$OUT" | head -n1)" \
+  "[\"k.example.org\",\"10.42.0.0/24\",\"[\\\"10.1.0.4:6443\\\"]\",\"[\\\"10.1.0.4\\\",\\\"198.51.100.1\\\"]\",\"10.43.0.20\",\"websecure\",\"10.42.0.0/24 10.43.0.0/16\",\"ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 1)\"]"
+expect_eq "kube_render_values: no secret in values.yaml (0600)" "$(grep -cE 'PG-SECRET|HUB-PROXY|KC-SECRET' "$K15/secrets/kube/values.yaml" || true):$(file_mode "$K15/secrets/kube/values.yaml")" "0:600"
+OUT="$(kt "$K15_ENV; unset PORTCULLIS_WG_EDGE_SERVICE_IP; _K_IMAGES='{}'; kube_render_values")"
+case "$OUT" in *"PORTCULLIS_WG_EDGE_SERVICE_IP is not set in .env (required by the chart)"*"rc=1") t_pass "kube_render_values: a required key missing → refused naming it" ;; *) t_fail "values missing key: $OUT" ;; esac
+# rt_up: K1 local builds first; helm failure → health report, applied.json unchanged
+k_fixtures; k15_root; rm -f "$KS/order"
+mkdir -p "$KS/bin2"
+printf '#!/usr/bin/env bash\nprintf "docker %%s\\n" "$*" >> "$STUB_DIR/order"\n[ "$1" != save ] || echo IMAGE-TAR\nexit 0\n' > "$KS/bin2/docker"
+printf '#!/usr/bin/env bash\nprintf "sudo %%s\\n" "$*" >> "$STUB_DIR/order"\ncase "$*" in *"images ls"*) printf "REF TYPE DIGEST\\nx y sha256:%%064d\\n" 9 ;; *) cat >/dev/null ;; esac\n' > "$KS/bin2/sudo"
+chmod +x "$KS/bin2/docker" "$KS/bin2/sudo"
+echo '{"items":[{"metadata":{"name":"keycloak-abc"},"status":{"phase":"Running","containerStatuses":[{"ready":false,"restartCount":4}]}}]}' > "$KS/kube/pods.json"
+OUT="$(kt "$K15_ENV; PATH='$KS/bin2':\$PATH PORTCULLIS_KUBE_IMAGES=local KUBE_HUB_IMAGE=; export STUB_HELM_FAIL=1; _kube_registry_digest() { echo \"\${1%:*}@sha256:$(printf '%064d' 3)\"; }; kube_netpol_probe() { :; }; _rtk_up")"
+case "$OUT" in *"keycloak-abc Running restarts=4 is not ready; its last events:"*"BackOff: Back-off restarting failed container"*"rc=1") t_pass "rt_up kubernetes: helm timeout → kube_health_report (pods, restarts, last events)" ;; *) t_fail "rt_up helm failure: $OUT" ;; esac
+expect_eq "rt_up kubernetes: every K1 local image built and imported before helm runs" \
+  "$(awk '/^docker build/ {b++} /^sudo k3s ctr -n k8s.io images import/ {i++} /^helm .*upgrade --install/ {print b ":" i; exit}' "$KS/order")" "5:5"
+expect_eq "rt_up kubernetes: helm failure → applied.json without objects, no digest cache" \
+  "$(jq -r 'has("objects")' "$K15/secrets/kube/applied.json" 2>/dev/null || echo none):$(test -e "$K15/secrets/kube/digests.json" && echo cached || echo none)" "false:none"
+expect_eq "rt_up kubernetes: helm upgrade --install --wait --timeout 10m --skip-crds on the context" \
+  "$(grep -c '^--kube-context ci upgrade --install portcullis .* -n portcullis --skip-crds --wait --timeout 10m -f .*/secrets/kube/values.yaml' "$KS/helm-calls")" 1
+k_fixtures; k15_root
+OUT="$(kt "set -euo pipefail; $K15_ENV; _kube_registry_digest() { echo \"\${1%:*}@sha256:$(printf '%064d' 3)\"; }; kube_netpol_probe() { :; }; _rtk_up" </dev/null)"
+expect_eq "rt_up kubernetes (under the CLI's set -euo pipefail): success → applied.json objects and the digest cache" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(jq -r '.objects | has("portcullis-env")' "$K15/secrets/kube/applied.json"):$(jq -r '.hub' "$K15/secrets/kube/digests.json")" \
+  "rc=0:true:ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 3)"
+# down never uninstalls
+k_fixtures; rm -f "$KS/order" "$KS/helm-calls"
+OUT="$(kt 'rt_down')"
+expect_eq "down never runs helm uninstall: every Deployment of both namespaces scaled to 0" \
+  "$(test -e "$KS/helm-calls" && echo helm || echo none):$(grep -c 'scale deployment --all --replicas=0' "$KS/order")" "none:2"
+expect_eq "no helm uninstall anywhere in the CLI" "$(grep -rn 'helm.*uninstall\|kube_helm uninstall' "$HERE/../scripts/lib" "$HERE/../portcullis" | grep -v '^[^:]*:[0-9]*: *#' | grep -vc 'never' || true)" 0
+# restore keeps the host's kubernetes keys
+RK="$WORK/rk"; rm -rf "$RK"; mkdir -p "$RK"
+printf 'CONTAINER_RUNTIME=kubernetes\nPORTCULLIS_KUBE_CONTEXT=ci\nPORTCULLIS_POD_CIDR=10.42.0.0/24\nPORTCULLIS_SERVICE_CIDR=10.43.0.0/16\nPORTCULLIS_KUBE_API_ENDPOINTS=10.1.0.4:6443\nPORTCULLIS_KUBE_INSTALL_ID=0b0e2b3c-1111-4222-8333-444455556666\nPORTCULLIS_DOMAIN=host.example\n' > "$RK/.env"
+OUT="$(kt "PORTCULLIS_ROOT='$RK'; unset PORTCULLIS_KUBE_CONTEXT PORTCULLIS_POD_CIDR PORTCULLIS_KUBE_INSTALL_ID; kube_forward_core() { :; }; restore_runtime_from_host >/dev/null; printf 'CONTAINER_RUNTIME=docker\nPORTCULLIS_DOMAIN=backup.example\nPORTCULLIS_KUBE_CONTEXT=backup-ctx\nPORTCULLIS_ENGINE_SOCKET=/x\n' > '$RK/.env'; _restore_runtime_keys; cat '$RK/.env'")"
+expect_eq "restore keeps CONTAINER_RUNTIME and every PORTCULLIS_KUBE_* / network key from the host, never the backup's" \
+  "$(printf '%s\n' "$OUT" | grep -E '^(CONTAINER_RUNTIME|PORTCULLIS_KUBE_CONTEXT|PORTCULLIS_POD_CIDR|PORTCULLIS_KUBE_INSTALL_ID|PORTCULLIS_ENGINE_SOCKET|PORTCULLIS_DOMAIN)=' | sort | tr '\n' ' ')" \
+  "CONTAINER_RUNTIME=kubernetes PORTCULLIS_DOMAIN=backup.example PORTCULLIS_KUBE_CONTEXT=ci PORTCULLIS_KUBE_INSTALL_ID=0b0e2b3c-1111-4222-8333-444455556666 PORTCULLIS_POD_CIDR=10.42.0.0/24 "
+# restore empties *-pw Secrets (after scaling those instances to 0)
+k_fixtures; rm -f "$KS/order"
+echo '{"items":[{"metadata":{"name":"samba--share-pw"}},{"metadata":{"name":"samba--env"}},{"metadata":{"name":"tm--share-pw"}}]}' > "$KS/kube/apps-secrets.json"
+OUT="$(kt '_kube_restore_stop_secret_apps; echo "stopped=$RESTORE_STOPPED_APPS"')"
+expect_eq "restore empties every *-pw Secret, after scaling the person-secret instances to 0 (and only those Secrets)" \
+  "$(grep -E 'scale|patch' "$KS/order" | sed 's/--type=json.*//' | tr '\n' ';'):$(printf '%s\n' "$OUT" | grep -c 'stopped=samba')" \
+  "kubectl portcullis-apps scale deployment -l portcullis.io/person-secrets --replicas=0;kubectl portcullis-apps patch secret samba--share-pw ;kubectl portcullis-apps patch secret tm--share-pw ;:1"
+# status --json runtime
+OUT="$(kt 'kube_status_json v1.37.2+k3s1')"
+expect_eq "status --json runtime.name = kubernetes, runtime.context set, version, the § 6 rows as checks" \
+  "$(printf '%s\n' "$OUT" | head -n1 | jq -c '[.name, .context, .version, (.checks | length > 5)]')" '["kubernetes","ci","v1.37.2+k3s1",true]'
+# vpn init on kubernetes: the people key from wg keypair (variables), never argv
+k_fixtures; k15_root
+OUT="$(kt "PORTCULLIS_ROOT='$K15'; export STUB_WG_PRIV=UFJJVkFURS1LRVktOTk5 STUB_WG_PUB=UFVC; vpn_genkey_kube; cat '$K15/secrets/wg/people.key'; file_mode '$K15/secrets/wg/people.key'")"
+expect_eq "vpn init kubernetes: people key from wg keypair (only the private key, 0640, in place)" "$(printf '%s\n' "$OUT" | head -n2 | tr '\n' ' ')" "UFJJVkFURS1LRVktOTk5 640 "
+expect_eq "vpn init kubernetes: the private key never on argv" "$(grep -c 'UFJJVkFURS1LRVktOTk5' "$KS/kubectl-calls" || true)" 0
+OUT="$(kt 'vpn_overlaps 10.42.0.0/22 "$(kube_vpn_reserved)" "{\"local_networks\":[],\"provider_ranges\":[]}"')"
+case "$OUT" in *10.42.0.0/24*) t_pass "vpn init kubernetes: a subnet over the pod CIDR → refused" ;; *) t_fail "vpn pod cidr overlap: $OUT" ;; esac
+OUT="$(kt 'vpn_overlaps 10.213.0.0/22 "$(kube_vpn_reserved)" "{\"local_networks\":[],\"provider_ranges\":[]}"')"
+expect_eq "vpn init kubernetes: 10.213.0.0/22 is free of the pod / service CIDRs and the nodes" "$OUT" "rc=0"
+# signin reset-core on kubernetes: Hub to 0, the one-shot, Hub to 1 (also on failure)
+k_fixtures; k15_root; rm -f "$KS/order"
+for RC_RUN in 0 1; do
+  rm -f "$KS/order"
+  # Under the CLI's own set -euo pipefail (a SIGPIPE'd pipeline must not abort it).
+  OUT="$(kt "set -euo pipefail; $K15_ENV; export STUB_RUN_RC=$RC_RUN; kube_images_ready() { _K_IMAGES='{}'; }; kube_render_values() { : > '$K15/secrets/kube/values.yaml'; }; signin_reset_core" </dev/null)"
+  expect_eq "signin reset-core kubernetes (run rc $RC_RUN): Hub scaled to 0, the one-shot, Hub scaled to 1" \
+    "$(grep -E 'scale deploy/hub|kubectl run' "$KS/order" | sed 's/^kubectl portcullis //' | tr '\n' ';')" "scale deploy/hub --replicas=0;kubectl run;scale deploy/hub --replicas=1;"
+done
+expect_eq "rt_run kubernetes: the chart's one-shot pod (its image), the argv appended to its entrypoint, stdin attached, removed after" \
+  "$(grep '^--context ci -n portcullis run oneshot-hub-' "$KS/kubectl-calls" | tail -n1 | sed -n 's/.*--overrides=//p' | jq -c '[.spec.containers[0].command, .spec.containers[0].stdin, .spec.containers[0].image]'):$(grep -c -- '--restart=Never --rm -i --quiet' "$KS/kubectl-calls")" \
+  "[[\"/usr/local/bin/hub\",\"signin\",\"reset-core\"],true,\"ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 1)\"]:2"
+# cert revoke / sync bump the annotation
+k_fixtures; k15_root; rm -f "$KS/order" "$KS/kubectl-stdin"
+OUT="$(kt "PORTCULLIS_ROOT='$K15'; kube_revocation_bump")"
+expect_eq "cert revoke bumps portcullis.io/rev on group-gate's pod after syncing certs-revocation" \
+  "$(grep -c 'create configmap certs-revocation' "$KS/order"):$(grep -c 'annotate pod -l portcullis.io/component=group-gate --overwrite portcullis.io/rev=' "$KS/order")" "1:1"
+expect_eq "cert sync calls the kubernetes bump" "$(sed -n '/^cert_sync() {/,/^}/p' "$HERE/../scripts/lib/certs.sh" | grep -c 'kube_revocation_bump')" 1
 # runtime_export under kubernetes: the pod + service CIDR are reserved (K-P11).
 expect_eq "runtime_export kubernetes: PORTCULLIS_VPN_RUNTIME_POOLS = pod + service CIDR" \
   "$(kt 'runtime_export; echo "$PORTCULLIS_VPN_RUNTIME_POOLS"' | head -n1)" "10.42.0.0/24 10.43.0.0/16"

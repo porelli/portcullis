@@ -249,6 +249,12 @@ init_run() {
   fi
 
   stack_prepare
+  if _rt_is_kube; then
+    # Kubernetes: the release first (not waited for: Vault is not
+    # initialised yet), then Vault initialised in its pod.
+    info "Installing the release..."
+    KUBE_HELM_WAIT=false rt_up || fail "helm could not install the release"
+  fi
   info "Initialising Vault..."
   vault_init false
   # ACME_STAGING → ACME_CA_SERVER, and the CA bundle (forward-auth
@@ -264,8 +270,14 @@ init_run() {
     [ "$s" = hub ] || hub_excluded="$hub_excluded $s"
   done
   sessions_restart_if_changed
-  # shellcheck disable=SC2086
-  rt_up $hub_excluded
+  if _rt_is_kube; then
+    # The release is whole: the Hub starts too (it waits for its LLDAP
+    # account, delivered below); the unseal key reaches Vault's Secret.
+    KUBE_HELM_WAIT=false rt_up || fail "helm could not upgrade the release"
+  else
+    # shellcheck disable=SC2086
+    rt_up $hub_excluded
+  fi
   wait_healthy 300 vault postgres lldap keycloak
 
   info "Creating the Vault PKI..."
@@ -274,18 +286,30 @@ init_run() {
   # server.key was just written: give Traefik (group 0) read access.
   stack_prepare
   info "Restarting Traefik, the forward-auth services, Keycloak and group-gate to pick up the CA chain..."
-  rt_restart traefik forward-auth forward-auth-ext keycloak group-gate
+  if _rt_is_kube; then
+    # The synced ConfigMaps change their pods' config hash: they roll.
+    KUBE_HELM_WAIT=false rt_up || fail "helm could not upgrade the release"
+  else
+    rt_restart traefik forward-auth forward-auth-ext keycloak group-gate
+  fi
   signin_ca_mark
   pki_files_mark
   config_mark
   wait_healthy 300 keycloak
+  ! _rt_is_kube || kube_forward_core
 
   keycloak_configure false
   oidc_register
   lldap_service_account
 
   info "Starting the Hub..."
-  rt_up_service --deps hub
+  if _rt_is_kube; then
+    # The LLDAP account's files reach the Hub's Secret; the whole release
+    # is waited for (helm --wait) this time.
+    rt_up || fail "the release did not become ready (see above)"
+  else
+    rt_up_service --deps hub
+  fi
   # The Hub's image has a HEALTHCHECK: wait until it reports healthy
   # (a missing check would show "running"; both count).
   local i st=""
@@ -494,7 +518,7 @@ stack_up() {
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
   runtime_check
   runtime_require_host
-  network_check
+  rt_network_check
   stack_prepare
   config_apply
   sessions_restart_if_changed
@@ -530,7 +554,7 @@ upgrade_run() {
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
   runtime_check
   runtime_require_host
-  network_check
+  rt_network_check
   hub_pinned_warn
 
   if [ "$skip_backup" = true ]; then

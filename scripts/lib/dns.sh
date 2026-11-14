@@ -156,6 +156,16 @@ _dns_uri_ok() {
 # keys). Nothing when there is no account yet (fail closed: CA-only CAA).
 # Exit 1 (nothing printed) when the volume exists but couldn't be read.
 dns_traefik_account_uri() {
+  local uri
+  if _rt_is_kube; then
+    uri="$(_kube_acme_account_uri)" || return 1
+    [ -n "$uri" ] || return 0
+    if _dns_uri_ok "$uri"; then printf '%s\n' "$uri"; return 0; fi
+    return 1
+  fi
+  _dns_traefik_account_uri_docker
+}
+_dns_traefik_account_uri_docker() {
   local uri rc=0
   _rt_docker_only
   docker volume inspect portcullis_traefik_acme >/dev/null 2>&1 || return 0

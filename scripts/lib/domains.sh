@@ -133,6 +133,19 @@ domains_image_build() {
 # domains image itself (filippo.io/age), offline.
 domains_age_keygen() {
   local f="$1" tmp
+  if _rt_is_kube; then
+    tmp="$(mktemp "$f.XXXXXX")"
+    chmod 600 "$tmp"
+    _kube_keygen domains "$CT_UID_DOMAINS" > "$tmp" && grep -q '^AGE-SECRET-KEY-1' "$tmp" \
+      || { rm -f "$tmp"; fail "could not generate secrets/domains/age.key"; }
+    mv -f "$tmp" "$f"
+    ok "Generated secrets/domains/age.key (encrypts the domains service's DNS credentials; backed up with secrets/)."
+    return 0
+  fi
+  _domains_age_keygen_docker "$f"
+}
+_domains_age_keygen_docker() {
+  local f="$1" tmp
   _rt_docker_only
   domains_image_ensure "to generate its age key"
   tmp="$(mktemp "$f.XXXXXX")"

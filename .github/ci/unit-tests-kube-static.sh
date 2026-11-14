@@ -99,7 +99,8 @@ for os in dns-tool hub; do
 done
 # The CLI-applied manifests (probe, storage, admission; not the template of
 # the params' keys).
-mapfile -t KUBE_FILES < <(ls kube/probe/*.yaml kube/storage/*.yaml; find kube/admission -name '*.yaml' ! -name '*.tmpl.yaml' | sort)
+KUBE_FILES=()
+while IFS= read -r f; do KUBE_FILES+=("$f"); done < <(ls kube/probe/*.yaml kube/storage/*.yaml; find kube/admission -name '*.yaml' ! -name '*.tmpl.yaml' | sort)
 "$KUBECONFORM" -strict -summary -kubernetes-version "$K8S_VERSION" \
   -schema-location "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/$K8S_SCHEMA_COMMIT/{{ .NormalizedKubernetesVersion }}-standalone{{ .StrictSuffix }}/{{ .ResourceKind }}{{ .KindSuffix }}.json" \
   "${KUBE_FILES[@]}"

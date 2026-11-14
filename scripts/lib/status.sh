@@ -207,12 +207,20 @@ status_run() {
   case "$traefik" in healthy|running) ;; *) problems=1 ;; esac
   # A non-core container answering to a core service name on portcullis-proxy
   # (network.sh proxy_dns_shadows; up / upgrade refuse to run while it lasts).
-  local shadows
-  # A docker error is a problem too (fail closed), shown as one line.
-  shadows="$(proxy_dns_shadows)" || shadows="(docker) the containers on portcullis-proxy can't be inspected"
+  local shadows kx='{}' mcp_refusing=""
+  if _rt_is_kube; then
+    # Kubernetes: no app Service may be named like a core one (structural,
+    # asserted), the CLI's NetworkPolicy probe, the five admission
+    # bindings, the kube API on the public address (K8, a warning).
+    kx="$(kube_status_extra)"
+    shadows="$(printf '%s' "$kx" | jq -r '.dns_shadows[] | "service/\(.) \(.)"')"
+    [ "$(printf '%s' "$kx" | jq -r '(.netpol == "proven") and (.admission == "ok")')" = true ] || problems=1
+  else
+    # A docker error is a problem too (fail closed), shown as one line.
+    shadows="$(proxy_dns_shadows)" || shadows="(docker) the containers on portcullis-proxy can't be inspected"
+    mcp_refusing="$(_st_mcp_refusing)"
+  fi
   [ -z "$shadows" ] || problems=1
-  local mcp_refusing
-  mcp_refusing="$(_st_mcp_refusing)"
   [ -z "$mcp_refusing" ] || problems=1
 
   # ── DNS (the domains service's plans; Traefik's account for the pin) ──
@@ -236,17 +244,19 @@ status_run() {
   if [ "$json" = true ]; then
     jq -n --arg d "${PORTCULLIS_DOMAIN:-}" --argjson s "$services" --argjson v "$vault_json" --argjson vpn "$vpn_json" \
       --argjson k "$kc" --argjson l "$lldap" --arg t "$traefik" --argjson p "$problems" --arg sh "$shadows" --arg mr "$mcp_refusing" --arg dn "$dns_json" \
-      --argjson rt "$rt_json" \
+      --argjson rt "$rt_json" --argjson kx "$kx" \
       '{domain: $d, ok: ($p == 0), problems: $p, runtime: $rt, services: $s, vault: $v, keycloak: $k, lldap: $l, traefik: {state: $t},
         dns_shadows: [$sh | split("\n")[] | select(. != "") | capture("^(?<container>[^ ]+) (?<name>.+)$")],
         mcp_gate: {refusing: (if $mr == "" then null else $mr end)},
-        dns: (if $dn == "" then null else ($dn | fromjson) end), vpn: $vpn}'
+        dns: (if $dn == "" then null else ($dn | fromjson) end), vpn: $vpn} + ($kx | del(.dns_shadows))'
     return "$problems"
   fi
 
   printf '\n%sRuntime%s\n' "$C_CYAN" "$C_NC"
   _st_line ok "runtime: $(printf '%s' "$rt_json" | jq -r '
-      if .name == "podman" then
+      if .name == "kubernetes" then
+        "kubernetes \(.version // "?") (context \(.context // "?"))"
+      elif .name == "podman" then
         "podman \(.version // "?") rootless, uid \(.uid), subuid \(.subuid_start // "?")+\(.subuid_count // "?"), ports ≥ \(.port_start)"
       else "docker \(.version // "?")" end')"
   local rst rtext
@@ -520,7 +530,10 @@ version_run() {
     env_load
     rt="$(runtime_name)" || exit 1
     runtime_export
-    if command -v docker >/dev/null 2>&1 && _rt_engine_probe; then
+    if [ "$rt" = kubernetes ]; then
+      rtv="$(kube_server_version 2>/dev/null || true)"
+      rtline="kubernetes ${rtv:-(cluster not reachable)}"
+    elif command -v docker >/dev/null 2>&1 && _rt_engine_probe; then
       [ "$_RT_ENGINE" = "$rt" ] || fail "CONTAINER_RUNTIME=$rt but the engine is $(_rt_engine_label "$_RT_ENGINE")"
       rtv="$_RT_ENGINE_VERSION"
       rtline="$rt $rtv"
@@ -531,7 +544,7 @@ version_run() {
   if [ -n "${HUB_IMAGE:-}" ]; then hub="$HUB_IMAGE" src="HUB_IMAGE"; else hub="$(hub_image_default)" src="default"; fi
   if [ -n "${KEYCLOAK_IMAGE:-}" ]; then kc="$KEYCLOAK_IMAGE" kcsrc="KEYCLOAK_IMAGE"; else kc="$(keycloak_image_default)" kcsrc="default"; fi
   # The running Hub and Keycloak, if this is an installation and Docker answers.
-  if [ -f "$(env_file)" ] && command -v docker >/dev/null 2>&1; then
+  if [ -f "$(env_file)" ] && { _rt_is_kube || command -v docker >/dev/null 2>&1; }; then
     running="$(rt_image hub)"
     kcrunning="$(rt_image keycloak)"
   fi

@@ -205,6 +205,19 @@ _vpn_valid_subnet() {
 # root has no CAP_DAC_OVERRIDE here and couldn't write an operator-owned
 # 0640 file), no network, no capability, read-only; the key is never
 # printed. Then wg's group may read it (0640 group 10006).
+# vpn_genkey_kube — kubernetes (K16): a key pair from `/wg keypair` in the
+# running wg pod, kept in a shell variable; only the private key written,
+# in place, into secrets/wg/people.key (0640). Never argv, never a temp file.
+vpn_genkey_kube() {
+  local key="$PORTCULLIS_ROOT/secrets/wg/people.key" kp
+  [ -f "$key" ] || fail "$key is missing (./portcullis up creates the placeholder)"
+  kp="$(rt_exec wg -- /wg keypair)" || fail "wg keypair failed"
+  KP="$kp" jq -rn 'env.KP | fromjson | .private_key' > "$key" || { unset kp; fail "wg keypair: unexpected output"; }
+  unset kp
+  chmod 640 "$key"
+  [ -s "$key" ] || fail "wg keypair wrote no key"
+}
+
 vpn_genkey() {
   local key="$PORTCULLIS_ROOT/secrets/wg/people.key"
   [ -f "$key" ] || fail "$key is missing (./portcullis up creates the placeholder)"
@@ -398,7 +411,13 @@ vpn_init() {
     case "$pool" in fail*) fail "${pool#fail$'\t'}" ;; esac
   fi
   info="$(_vpn_hub_wait)" || exit 1  # _vpn_hub_wait printed why
-  subnets="$(_vpn_docker_subnets)" || fail "could not list the Docker networks' subnets"
+  # Kubernetes: the pod and service CIDRs and the node addresses (K-P11),
+  # instead of Docker's networks.
+  if _rt_is_kube; then
+    subnets="$(kube_vpn_reserved)" || fail "could not read the cluster's networks"
+  else
+    subnets="$(_vpn_docker_subnets)" || fail "could not list the Docker networks' subnets"
+  fi
   if [ "$builtin" = on ]; then
     conflicts="$(vpn_overlaps "$subnet" "$subnets" "$info")"
     if [ -n "$conflicts" ]; then
@@ -423,7 +442,7 @@ vpn_init() {
   _vpn_set COMPOSE_PROFILES "$(_vpn_profiles_with_wg)"
   _vpn_set PORTCULLIS_VPN_PORT "$port"
   _vpn_set PORTCULLIS_VPN_SUBNET "$subnet"
-  if [ "$builtin" = on ] && [ ! -s "$PORTCULLIS_ROOT/secrets/wg/people.key" ]; then
+  if [ "$builtin" = on ] && [ ! -s "$PORTCULLIS_ROOT/secrets/wg/people.key" ] && ! _rt_is_kube; then
     info "Generating the built-in VPN's key..."
     vpn_genkey
   fi
@@ -434,6 +453,15 @@ vpn_init() {
   info "Starting wg, Traefik and the Hub..."
   rt_up wg traefik hub || fail "could not start wg, Traefik and the Hub"
   wait_healthy 120 wg
+  # Kubernetes (K16): wg runs the edge role alone with the empty key; the
+  # key is made by `wg keypair` in it, then synced and wg restarted.
+  if _rt_is_kube && [ "$builtin" = on ] && [ ! -s "$PORTCULLIS_ROOT/secrets/wg/people.key" ]; then
+    info "Generating the built-in VPN's key..."
+    vpn_genkey_kube
+    rt_up || fail "could not deliver the people key to wg"
+    rt_restart wg >/dev/null || fail "could not restart wg"
+    wait_healthy 120 wg
+  fi
   ok "The VPN service is up (built-in VPN $builtin$([ "$builtin" = on ] && echo ", UDP port $port, subnet $subnet")). Wire marketplace VPNs in the Hub; add devices on the Sign-in page or with ./portcullis vpn add-device."
 }
 
@@ -463,13 +491,23 @@ vpn_builtin() {
   _vpn_profiles_has_wg || fail "the VPN service isn't set up: run ./portcullis vpn init first"
   case "$1" in
     on)
-      [ -s "$key" ] || { info "Generating the built-in VPN's key..."; vpn_genkey; } ;;
+      if [ ! -s "$key" ]; then
+        info "Generating the built-in VPN's key..."
+        if _rt_is_kube; then vpn_genkey_kube; else vpn_genkey; fi
+      fi ;;
     off)
       [ -f "$key" ] || fail "$key is missing (./portcullis up creates the placeholder)"
       : > "$key" ;;
   esac
   _vpn_set PORTCULLIS_VPN_BUILTIN "$1"
   hub_env_write
+  if _rt_is_kube; then
+    # The release carries WG_PEOPLE and the key Secret: applied, wg rolled.
+    rt_up || fail "could not apply the release with the built-in VPN $1"
+    rt_restart wg >/dev/null || fail "could not restart wg"
+    ok "The built-in VPN is $1."
+    return 0
+  fi
   runtime_build_service wg || fail "could not build the wg image"
   # up applies a changed WG_PEOPLE; the restart makes wg read the key file
   # again (it reads it at start) when only the key changed.

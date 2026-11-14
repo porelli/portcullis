@@ -9,9 +9,10 @@ Every compose service that exists on Kubernetes gets one entry:
     ever sees name@sha256:... .
 The socket proxies have no Kubernetes form (the Roles replace them).
 
-  scripts/gen-images-yaml.py           rewrite the file
+  scripts/gen-images-yaml.py           rewrite the files (images.yaml and images.json)
   scripts/gen-images-yaml.py --check   exit 1 when the file is stale
 """
+import json
 import pathlib
 import re
 import sys
@@ -21,6 +22,8 @@ import yaml
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 COMPOSE = ROOT / "docker-compose.yml"
 OUT = ROOT / "charts" / "portcullis" / "images.yaml"
+# The same map as JSON, for ./portcullis (jq; no YAML parser on the host).
+OUT_JSON = ROOT / "charts" / "portcullis" / "images.json"
 
 REGISTRY = "ghcr.io/porelli/portcullis-"
 CORE_BUILT = ("group-gate", "enroll", "domains", "mcp-gate", "wg")
@@ -61,23 +64,27 @@ def entries(compose):
 
 def render():
     compose = yaml.safe_load(COMPOSE.read_text())
-    body = yaml.safe_dump({"images": entries(compose)}, sort_keys=True, default_flow_style=False, width=200)
-    return HEADER + body
+    imgs = {"images": entries(compose)}
+    body = yaml.safe_dump(imgs, sort_keys=True, default_flow_style=False, width=200)
+    return HEADER + body, json.dumps(imgs, sort_keys=True, indent=2) + "\n"
 
 
 def main(argv):
-    text = render()
+    text, js = render()
     if argv[1:] == ["--check"]:
-        have = OUT.read_text() if OUT.exists() else ""
-        if have != text:
-            print(f"{OUT.relative_to(ROOT)} is stale: run scripts/gen-images-yaml.py", file=sys.stderr)
-            return 1
-        return 0
+        rc = 0
+        for out, want in ((OUT, text), (OUT_JSON, js)):
+            have = out.read_text() if out.exists() else ""
+            if have != want:
+                print(f"{out.relative_to(ROOT)} is stale: run scripts/gen-images-yaml.py", file=sys.stderr)
+                rc = 1
+        return rc
     if argv[1:]:
         print("usage: gen-images-yaml.py [--check]", file=sys.stderr)
         return 2
     OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(text)
+    OUT_JSON.write_text(js)
     return 0
 
 

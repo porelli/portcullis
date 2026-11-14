@@ -270,6 +270,16 @@ cmd_lldap_ui() {
   done
   need_env
   require_cmd docker
+  if _rt_is_kube; then
+    # K16: a port-forward to LLDAP's own UI on this server's loopback.
+    local port="${LLDAP_UI_PORT:-17170}"
+    rt_running lldap || fail "LLDAP is not running (portcullis up)"
+    ok "LLDAP's web UI on 127.0.0.1:$port (this server only) until you press Ctrl-C. On your machine run:"
+    printf '\n  ssh -N -L 17170:127.0.0.1:%s %s@%s\n\n' "$port" "$(id -un)" "$(hostname -f 2>/dev/null || hostname)"
+    echo "    then open http://localhost:17170 and sign in as the LLDAP admin (LLDAP_ADMIN_PASSWORD in .env)."
+    kube_ctl -n "$(kube_ns)" port-forward --address 127.0.0.1 svc/lldap "$port:17170" >/dev/null
+    return
+  fi
   _lldap_ui_run
 }
 
