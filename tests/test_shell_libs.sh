@@ -3167,7 +3167,8 @@ build --format docker -t portcullis-mcp-gate -f /src/mcp-gate/Dockerfile.x /src/
 compose up -d --no-build
 rc=0"
 OUT="$(rt "CONTAINER_RUNTIME=docker; stack_compose_up hub >/dev/null 2>&1; grep -E '^compose ' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'; test ! -e \"\$STUB_DIR/podman-calls\"")"
-expect_eq "stack_compose_up on docker: up -d --build (unchanged), no podman" "$OUT" "compose up -d --build hub
+expect_eq "stack_compose_up on docker: build --quiet first, then up -d --no-build, no podman" "$OUT" "compose build --quiet
+compose up -d --no-build hub
 rc=0"
 expect_eq "runtime_no_build: --no-build under podman, nothing under docker" \
   "[$(CONTAINER_RUNTIME=podman runtime_no_build)][$(CONTAINER_RUNTIME=docker runtime_no_build)]" "[--no-build][]"
@@ -3182,8 +3183,8 @@ expect_eq "--force-recreate only on the restore's fresh Vault" \
   "$(grep -h 'dc up .*--force-recreate' "$LIBS"/*.sh | sed 's/^ *//')" 'dc up -d $(runtime_no_build) --no-deps --force-recreate vault >/dev/null'
 expect_eq "every dc up outside stack_compose_up passes \$(runtime_no_build)" \
   "$(grep -n 'dc up ' "$LIBS"/*.sh | grep -v '^\s*#' | grep -vF '$(runtime_no_build)' | grep -v '/runtime.sh:' || true)" ""
-expect_eq "stack_compose_up is the only dc up --build (init, up, upgrade, restore go through it)" \
-  "$(grep -n 'dc up .*--build' "$LIBS"/*.sh | grep -v -- '--no-build' | sed 's/.*\/\(runtime\.sh\):[0-9]*:.*/\1/'):$(grep -c '^ *stack_compose_up' "$LIBS/stack.sh") $(grep -c '^ *stack_compose_up ||' "$LIBS/backup.sh")" "runtime.sh:3 1"
+expect_eq "no dc up --build anywhere: stack_compose_up builds first (init, up, upgrade, restore go through it)" \
+  "$(grep -n 'dc up .*--build' "$LIBS"/*.sh | grep -v -- '--no-build' || true):$(grep -c '^ *stack_compose_up' "$LIBS/stack.sh") $(grep -c '^ *stack_compose_up ||' "$LIBS/backup.sh")" ":3 1"
 # restore builds on both runtimes, as up does (docker used to start the
 # images it had: a git pull before a restore left them old).
 for RTN in docker podman; do
@@ -3420,6 +3421,83 @@ case "$HC_OUT" in
   *) t_fail "stack_compose_up health report: $HC_OUT" ;;
 esac
 case "$HC_OUT" in *vault-1*|*"exit 1: old"*) t_fail "stack_compose_up health report: a healthy container or an old check listed: $HC_OUT" ;; *) t_pass "stack_compose_up health report: healthy containers and older checks left out" ;; esac
+
+# ── a failed up while a dependency is still starting: wait, one more up ──
+# (test server 2026-11-13 finding A). The stub's up fails while
+# $SU/kc-health isn't "healthy"; keycloak's state / restart count / health
+# come from $SU/kc-state, $SU/kc-restarts, $SU/kc-health; every `sleep`
+# runs $SU/tick (the test's script for what changes meanwhile).
+SU="$WORK/su"; mkdir -p "$WORK/subin" "$SU"
+{ printf '#!/usr/bin/env bash\n'; cat "$WORK/stub-version"; cat <<'STUB'
+echo "$*" >> "$SU/calls"
+case "$*" in
+  "compose --project-directory "*" build"*) exit 0 ;;
+  "compose --project-directory "*" up "*)
+    [ "$(cat "$SU/kc-health")" = healthy ] || { echo "dependency failed to start: container portcullis-keycloak-1 is unhealthy" >&2; exit 1; } ;;
+  "compose --project-directory "*" ps -aq") printf 'c1\nc2\nc3\n' ;;
+  "inspect --format {{index .Config.Labels \"com.docker.compose.service\"}} "*" c1")
+    echo "keycloak $(cat "$SU/kc-state") $(cat "$SU/kc-restarts") $(cat "$SU/kc-health")" ;;
+  "inspect --format {{index .Config.Labels \"com.docker.compose.service\"}} "*" c2") echo "vault running 0 healthy" ;;
+  "inspect --format {{index .Config.Labels \"com.docker.compose.service\"}} "*" c3") echo "forward-auth created 0 none" ;;
+  "inspect --format {{.Name}} "*" c1") echo "/portcullis-keycloak-1 $(cat "$SU/kc-health")" ;;
+  "inspect --format {{.Name}} "*) echo "/portcullis-other-1 healthy" ;;
+  "inspect --format {{json .State.Health.Log}} c1") echo '[{"ExitCode":1,"Output":"kc not ready"}]' ;;
+esac
+exit 0
+STUB
+} > "$WORK/subin/docker"
+chmod +x "$WORK/subin/docker"
+# su_run <state> <restarts> <health> <tick script> — stack_compose_up keycloak
+# with the wait at 30 s (6 polls); prints its output, the up / build calls and rc.
+su_run() {
+  rm -f "$SU/calls"; : > "$SU/ticks"; echo "$1" > "$SU/kc-state"; echo "$2" > "$SU/kc-restarts"; echo "$3" > "$SU/kc-health"
+  printf '%s\n' "$4" > "$SU/tick"
+  ( PATH="$WORK/subin:$PATH"; export SU STACK_UP_WAIT=30; CONTAINER_RUNTIME=docker
+    sleep() { echo x >> "$SU/ticks"; bash "$SU/tick"; }
+    stack_compose_up keycloak; echo "rc=$?" ) 2>&1
+  echo "ticks=$(wc -l < "$SU/ticks" | tr -d " ")"
+  grep -E '^compose .* (up|build)( |$)' "$SU/calls" | sed 's/--project-directory [^ ]* //'
+}
+# Slow but healthy: unhealthy at compose's deadline, healthy two polls later.
+OUT="$(su_run running 0 unhealthy 'n=$(wc -l < "$SU/ticks"); [ "$n" -lt 2 ] || echo healthy > "$SU/kc-health"')"
+case "$OUT" in
+  *"compose up stopped while keycloak still starting"*"Healthy now: running compose up again"*"rc=0"*"ticks=2"*) t_pass "stack_compose_up: a slow-healthy Keycloak → waited, one more up, success" ;;
+  *) t_fail "stack_compose_up slow keycloak: $OUT" ;;
+esac
+expect_eq "stack_compose_up slow keycloak: the build once, before the first up; the up twice, never rebuilding" \
+  "$(printf '%s\n' "$OUT" | grep '^compose ')" "compose build --quiet
+compose up -d --no-build keycloak
+compose up -d --no-build keycloak"
+# Starting (still inside start_period at compose's deadline) counts too.
+OUT="$(su_run running 0 starting 'echo healthy > "$SU/kc-health"')"
+case "$OUT" in *"rc=0"*"ticks=1"*) t_pass "stack_compose_up: a starting Keycloak → waited, success" ;; *) t_fail "stack_compose_up starting keycloak: $OUT" ;; esac
+# Crash loop: restarting → no wait, fails naming it, with the health report.
+OUT="$(su_run restarting 3 unhealthy ':')"
+case "$OUT" in
+  *"keycloak is restarting (not a slow start)"*"portcullis-keycloak-1 is unhealthy; its last health checks:"*"kc not ready"*"rc=1"*"ticks=0"*) t_pass "stack_compose_up: a crash-looping Keycloak fails at once, named, with its health checks" ;;
+  *) t_fail "stack_compose_up crash loop: $OUT" ;;
+esac
+expect_eq "stack_compose_up crash loop: one up only" "$(printf '%s\n' "$OUT" | grep -c '^compose up ')" "1"
+# Running at first but restarted during the wait → a crash, not a slow start.
+OUT="$(su_run running 0 unhealthy 'echo 1 > "$SU/kc-restarts"')"
+case "$OUT" in *"keycloak is restarted (not a slow start)"*"rc=1"*"ticks=1"*) t_pass "stack_compose_up: Keycloak restarted during the wait → fails at once" ;; *) t_fail "stack_compose_up restarted: $OUT" ;; esac
+# Exited: no wait.
+OUT="$(su_run exited 0 unhealthy ':')"
+case "$OUT" in *"keycloak is exited (not a slow start)"*"rc=1"*"ticks=0"*) t_pass "stack_compose_up: an exited Keycloak fails at once" ;; *) t_fail "stack_compose_up exited: $OUT" ;; esac
+# Never healthy: the whole bounded wait, then fails loudly, no second up.
+OUT="$(su_run running 0 unhealthy ':')"
+case "$OUT" in
+  *"keycloak still not healthy after 30s"*"portcullis-keycloak-1 is unhealthy; its last health checks:"*"rc=1"*"ticks=6"*) t_pass "stack_compose_up: Keycloak unhealthy after the wait → fails, named, with its health checks" ;;
+  *) t_fail "stack_compose_up never healthy: $OUT" ;;
+esac
+expect_eq "stack_compose_up never healthy: one up only" "$(printf '%s\n' "$OUT" | grep -c '^compose up ')" "1"
+# Keycloak's healthcheck budget: start_period 300 s, interval / retries kept.
+expect_eq "keycloak healthcheck: start_period 300s, interval 10s, retries 12, CMD-SHELL" \
+  "$(awk '/^  keycloak:/{k=1} k && /^  [a-z]/ && !/^  keycloak:/{k=0} k' "$HERE/../docker-compose.yml" | grep -E '^      (test|interval|retries|start_period):' | sed -E 's/^ +//; s/^(test: \["CMD-SHELL").*/\1/')" \
+  'test: ["CMD-SHELL"
+interval: 10s
+retries: 12
+start_period: 300s'
 
 # ── network_state under rootless Podman: its compat inspect has no IPRange
 # (Podman keeps the range as a lease range: first+1 .. last); the range is
