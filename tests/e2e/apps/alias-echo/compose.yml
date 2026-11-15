@@ -1,0 +1,28 @@
+# CI-only (e2e-k3s): a gated whoami with a compose network alias on its
+# default network, and a client in the same instance that reaches it by
+# that alias only (on Kubernetes: the Hub's <instance>--<alias> ClusterIP
+# Service plus the pods' hostAliases).
+services:
+  web:
+    image: docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
+    networks:
+      default:
+        aliases: [web-internal]
+      portcullis-proxy: {}
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.alias-echo.rule: Host(`${PORTCULLIS_HOST_ALIAS_ECHO:-alias-echo.portcullis.local}`)
+      traefik.http.routers.alias-echo.entrypoints: websecure
+      traefik.http.routers.alias-echo.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.alias-echo.loadbalancer.server.port: "80"
+  client:
+    image: docker.io/library/busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
+    command: ["sh", "-c", "while :; do sleep 3600; done"]
+    networks: [default]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+networks:
+  portcullis-proxy:
+    external: true

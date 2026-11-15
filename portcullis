@@ -72,6 +72,9 @@ VPN:
   vpn devices                 List VPN devices of every provider
   vpn revoke                  Remove a built-in VPN device
 
+Kubernetes:
+  kube check                  Refresh the cluster check the Hub reads (init's timer: every 6 h)
+
 YubiKey and browser certificates:
   cert enroll                 New key + YubiKey certificate on a YubiKey
   cert renew                  New YubiKey certificate for the key already on the YubiKey
@@ -95,7 +98,7 @@ main() {
   esac
   cd "$PORTCULLIS_ROOT"
   case "$cmd" in
-    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert|signin|vpn)
+    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert|signin|vpn|kube)
       "cmd_$cmd" "$@" ;;
     lldap-ui) cmd_lldap_ui "$@" ;;
     *)

@@ -69,10 +69,25 @@ vault_use_container_cli() {
 # variable is dropped by Docker but refused by Podman's compat exec (400
 # "environment variable ... badly formed, must be key=value").
 _vault_dc_exec() {
+  # Kubernetes: no -e on an exec; the token is the first line of stdin
+  # (sh's read takes only that line from a pipe), never argv.
+  if _rt_is_kube; then
+    if printenv VAULT_TOKEN >/dev/null 2>&1; then
+      # shellcheck disable=SC2016  # expanded by the container's sh
+      if [ -t 0 ]; then
+        printf '%s\n' "$VAULT_TOKEN" | rt_exec -i vault -- sh -c 'IFS= read -r t; VAULT_TOKEN="$t" exec vault "$@"' vault "$@"
+      else
+        { printf '%s\n' "$VAULT_TOKEN"; cat; } | rt_exec -i vault -- sh -c 'IFS= read -r t; VAULT_TOKEN="$t" exec vault "$@"' vault "$@"
+      fi
+    else
+      rt_exec -i vault -- vault "$@"
+    fi
+    return
+  fi
   if printenv VAULT_TOKEN >/dev/null 2>&1; then
-    dc exec -T -e VAULT_TOKEN vault vault "$@"
+    rt_exec -i -e VAULT_TOKEN vault -- vault "$@"
   else
-    dc exec -T vault vault "$@"
+    rt_exec -i vault -- vault "$@"
   fi
 }
 
@@ -134,10 +149,15 @@ _write_secret() {
 # API; sets VAULT_INITIALIZED / VAULT_SEALED.
 _vault_start_and_status() {
   local i rc status=""
-  if [ -z "$(dc ps -q --status running vault 2>/dev/null)" ]; then
+  if ! rt_running vault; then
     info "Starting vault container..."
-    # shellcheck disable=SC2046  # nothing or --no-build
-    dc up -d $(runtime_no_build) --no-deps vault
+    rt_up_service vault
+  fi
+  # Kubernetes: the CLI's curl reaches Vault through a port-forward.
+  if _rt_is_kube && [ -z "${_K_VAULT_FWD:-}" ]; then
+    local pf
+    pf="$(_kube_forward vault 8200)" || fail "no port-forward to Vault"
+    export VAULT_ADDR="http://127.0.0.1:$pf" _K_VAULT_FWD=1
   fi
   info "Waiting for the Vault API..."
   local err
@@ -150,7 +170,7 @@ _vault_start_and_status() {
       break
     fi
     if [ "$i" -eq 60 ]; then
-      dc logs --tail=30 vault >&2 || true
+      rt_logs vault --tail=30 >&2 || true
       # The last `vault status` attempt's own error (no secret: status takes
       # none, and compose / the engine name variables, never values).
       echo "vault status (exit $rc) said:" >&2

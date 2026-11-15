@@ -107,9 +107,9 @@ sessions_prepare() {
 # out once.
 sessions_restart_if_changed() {
   [ "$SESSIONS_CONF_CHANGED" = true ] || return 0
-  [ -n "$(dc ps -q --status running sessions 2>/dev/null)" ] || return 0
+  rt_running sessions || return 0
   info "Restarting the session store (its users changed; everyone signs in again)..."
-  dc restart sessions >/dev/null || fail "could not restart the session store: docker compose logs sessions"
+  rt_restart sessions >/dev/null || fail "could not restart the session store: docker compose logs sessions"
   SESSIONS_CONF_CHANGED=false
 }
 

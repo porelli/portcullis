@@ -1,0 +1,119 @@
+{{- /* hub (compose: hub). On Kubernetes it drives the apps namespace with
+its ServiceAccount portcullis-hub (hub-rbac.yaml: one Role there, nothing
+here). /project is an emptyDir: core.env (secrets/hub/core.env) and the
+group-gate map are mounted into it, templates/ and appfiles/ are its own
+scratch (the kube backend delivers them as ConfigMaps / Secrets). The
+cluster check's result (portcullis-cluster-check, written by the CLI at
+every up / upgrade) is read-only at /run/portcullis/cluster-check. */ -}}
+{{- $d := include "portcullis.domain" . -}}
+{{- $s := dict
+  "name" "hub" "uid" .Values.uids.hub "gid" .Values.uids.hub "groups" (list .Values.uids.vpnDoc)
+  "memory" "1Gi" "nets" (list "portcullis" "portcullis-domains" "portcullis-mcp") "egress" true
+  "token" true "serviceAccount" "portcullis-hub" "grace" 60
+  "hashes" (list "portcullis-env" "secrets-hub" "secrets-hub-lldap" "secrets-hub-invite" "secrets-domains" "secrets-mcp-gate" "config-group-gate")
+  "ports" (list (dict "name" "admin" "port" 8888) (dict "name" "people" "port" 8889) (dict "name" "mcp" "port" 8890))
+  "env" (list
+    (dict "name" "PROJECT_DIR" "value" "/project")
+    (dict "name" "PROJECT_HOST_DIR" "value" "/project")
+    (dict "name" "HUB_DATA_DIR" "value" "/data")
+    (dict "name" "HUB_CONTAINER_RUNTIME" "value" "kubernetes")
+    (dict "name" "HUB_SELF_IMAGE" "value" (include "portcullis.image" (list . "hub")))
+    (dict "name" "HUB_APPS_NAMESPACE" "value" .Values.appsNamespace)
+    (dict "name" "PORTCULLIS_DOMAIN" "value" $d)
+    (dict "name" "DEFAULT_TEMPLATES_URL" "value" "https://github.com/porelli/portcullis-templates.git")
+    (dict "name" "PORTAL_DISPLAY_NAME" "value" .Values.hub.portalDisplayName)
+    (dict "name" "KEYCLOAK_URL" "value" (include "portcullis.keycloakInternal" .))
+    (dict "name" "KEYCLOAK_ADMIN" "value" .Values.keycloak.admin)
+    (dict "name" "KEYCLOAK_ADMIN_PASSWORD" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "KEYCLOAK_ADMIN_PASSWORD")))
+    (dict "name" "HUB_LLDAP_CREDENTIALS_DIR" "value" "/run/portcullis/lldap")
+    (dict "name" "LLDAP_HTTP_URL" "value" "http://lldap:17170")
+    (dict "name" "LLDAP_LDAP_URL" "value" "ldap://lldap:3890")
+    (dict "name" "LLDAP_BASE_DN" "value" .Values.lldap.baseDN)
+    (dict "name" "INVITE_PROTECTED_GROUPS" "value" .Values.hub.invitesProtectedGroups)
+    (dict "name" "HUB_INVITE_API_URL" "value" "http://enroll:8444/internal/invites")
+    (dict "name" "HUB_INVITE_SECRET_FILE" "value" "/run/portcullis/invite/secret")
+    (dict "name" "HUB_DOMAINS_API_URL" "value" "http://domains:8080")
+    (dict "name" "HUB_DOMAINS_SECRET_FILE" "value" "/run/portcullis/domains/api-secret")
+    (dict "name" "HUB_OVERRIDE_BIND_ROOTS" "value" .Values.hub.bindRoots)
+    (dict "name" "HUB_PROXY_SECRET" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "HUB_PROXY_SECRET")))
+    (dict "name" "HUB_PEOPLE_ADDR" "value" ":8889")
+    (dict "name" "HUB_SECRETS_DIR" "value" "/secrets")
+    (dict "name" "HUB_SECRETS_VOLUME" "value" "hub-secrets")
+    (dict "name" "HUB_KEYCLOAK_PUBLIC_URL" "value" (printf "https://auth.%s" $d))
+    (dict "name" "HUB_MCP_ADDR" "value" ":8890")
+    (dict "name" "HUB_MCP_GATE_SECRET_FILE" "value" "/run/portcullis/mcp-gate/hub-secret")
+    (dict "name" "HUB_MCP_GATE_RECIPIENT_FILE" "value" "/run/portcullis/mcp-gate/age.pub")
+    (dict "name" "HUB_MCP_GATE_DATA_DIR" "value" "/mcp-gate-data")
+    (dict "name" "HUB_CLIENT_CERT_TTL" "value" .Values.hub.clientCertTTL)
+    (dict "name" "HUB_CERT_EXPIRY_WARN_DAYS" "value" (.Values.hub.certExpiryWarnDays | toString))
+    (dict "name" "HUB_GROUP_GATE_DATA_DIR" "value" "/group-gate-data")
+    (dict "name" "HUB_IMPERSONATION_MAX_MINUTES" "value" (.Values.hub.impersonationMaxMinutes | toString))
+    (dict "name" "HUB_VPN_STATUS_FILE" "value" "/wg-data/status.json")
+    (dict "name" "HUB_VPN_DOC_DIR" "value" "/vpn-doc")
+    (dict "name" "HUB_VPN_DOC_GID" "value" (.Values.uids.vpnDoc | toString)))
+  "mounts" (list
+    (dict "name" "project" "mountPath" "/project")
+    (dict "name" "core-env" "mountPath" "/project/.env" "subPath" "core.env" "readOnly" true)
+    (dict "name" "project-map" "mountPath" "/project/group-gate" "readOnly" true)
+    (dict "name" "templates" "mountPath" "/project/templates")
+    (dict "name" "appfiles" "mountPath" "/project/appfiles")
+    (dict "name" "data" "mountPath" "/data")
+    (dict "name" "lldap" "mountPath" "/run/portcullis/lldap" "readOnly" true)
+    (dict "name" "invite" "mountPath" "/run/portcullis/invite" "readOnly" true)
+    (dict "name" "domains" "mountPath" "/run/portcullis/domains" "readOnly" true)
+    (dict "name" "mcp-gate" "mountPath" "/run/portcullis/mcp-gate" "readOnly" true)
+    (dict "name" "cluster-check" "mountPath" "/run/portcullis/cluster-check" "readOnly" true)
+    (dict "name" "mcp-gate-data" "mountPath" "/mcp-gate-data" "readOnly" true)
+    (dict "name" "group-gate-data" "mountPath" "/group-gate-data")
+    (dict "name" "wg-data" "mountPath" "/wg-data" "readOnly" true)
+    (dict "name" "vpn-doc" "mountPath" "/vpn-doc")
+    (dict "name" "secrets" "mountPath" "/secrets")
+    (dict "name" "tmp" "mountPath" "/tmp")
+    (dict "name" "home" "mountPath" "/home/hub"))
+  "volumes" (list
+    (dict "name" "project" "emptyDir" (dict "medium" "Memory" "sizeLimit" "1Mi"))
+    (dict "name" "core-env" "secret" (dict "secretName" "secrets-hub" "defaultMode" 288))
+    (dict "name" "project-map" "configMap" (dict "name" "config-group-gate"))
+    (dict "name" "templates" "emptyDir" (dict "sizeLimit" "256Mi"))
+    (dict "name" "appfiles" "emptyDir" (dict "sizeLimit" "64Mi"))
+    (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "hub-data"))
+    (dict "name" "lldap" "secret" (dict "secretName" "secrets-hub-lldap" "defaultMode" 288))
+    (dict "name" "invite" "secret" (dict "secretName" "secrets-hub-invite" "defaultMode" 288))
+    (dict "name" "domains" "secret" (dict "secretName" "secrets-domains" "defaultMode" 288 "items" (list (dict "key" "api-secret" "path" "api-secret"))))
+    (dict "name" "mcp-gate" "secret" (dict "secretName" "secrets-mcp-gate" "defaultMode" 288 "items" (list (dict "key" "hub-secret" "path" "hub-secret") (dict "key" "age.pub" "path" "age.pub"))))
+    (dict "name" "cluster-check" "configMap" (dict "name" "portcullis-cluster-check" "optional" true))
+    (dict "name" "mcp-gate-data" "persistentVolumeClaim" (dict "claimName" "mcp-gate-data" "readOnly" true))
+    (dict "name" "group-gate-data" "persistentVolumeClaim" (dict "claimName" "group-gate-data"))
+    (dict "name" "wg-data" "persistentVolumeClaim" (dict "claimName" "wg-data" "readOnly" true))
+    (dict "name" "vpn-doc" "persistentVolumeClaim" (dict "claimName" "vpn-doc"))
+    (dict "name" "secrets" "persistentVolumeClaim" (dict "claimName" "hub-secrets"))
+    (dict "name" "tmp" "emptyDir" (dict "medium" "Memory"))
+    (dict "name" "home" "emptyDir" (dict "medium" "Memory")))
+  "fsGroup" .Values.uids.hub
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+---
+{{ include "portcullis.pvc" (list . "hub-data" .Values.uids.hub .Values.uids.hub "0750") }}
+---
+{{ include "portcullis.pvc" (list . "hub-secrets" .Values.uids.hub .Values.uids.hub "0700") }}
+---
+{{ include "portcullis.pvc" (list . "vpn-doc" .Values.uids.hub .Values.uids.vpnDoc "2750") }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hub
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    portcullis.io/component: hub
+  ports:
+    - name: admin
+      port: 8888
+      targetPort: 8888
+    - name: people
+      port: 8889
+      targetPort: 8889
+    - name: mcp
+      port: 8890
+      targetPort: 8890

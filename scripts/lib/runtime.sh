@@ -17,12 +17,13 @@ RT_PODMAN_MIN="5.4"
 RT_PORT_START_MAX=80
 RT_MIN_IDS=65536
 
-# runtime_name — docker|podman from CONTAINER_RUNTIME; anything else fails.
+# runtime_name — docker|podman|kubernetes from CONTAINER_RUNTIME; anything
+# else fails.
 runtime_name() {
   case "${CONTAINER_RUNTIME:-}" in
-    docker|podman) printf '%s\n' "$CONTAINER_RUNTIME" ;;
-    "") fail "CONTAINER_RUNTIME is not set in .env (docker or podman): ./portcullis init writes it; an install from before rootless support adds CONTAINER_RUNTIME=docker by hand" ;;
-    *) fail "CONTAINER_RUNTIME=$CONTAINER_RUNTIME is neither docker nor podman (.env)" ;;
+    docker|podman|kubernetes) printf '%s\n' "$CONTAINER_RUNTIME" ;;
+    "") fail "CONTAINER_RUNTIME is not set in .env (docker, podman or kubernetes): ./portcullis init writes it; an install from before rootless support adds CONTAINER_RUNTIME=docker by hand" ;;
+    *) fail "CONTAINER_RUNTIME=$CONTAINER_RUNTIME is not docker, podman or kubernetes (.env)" ;;
   esac
 }
 
@@ -44,6 +45,7 @@ _rt_is_podman() {
 # nothing answers.
 _rt_engine_probe() {
   local comps out
+  _rt_docker_only
   _RT_ENGINE="" _RT_ENGINE_VERSION=""
   if [ -n "${1:-}" ]; then
     comps="$(DOCKER_HOST="$1" docker version --format '{{json .Server.Components}}' 2>/dev/null)" || return 1
@@ -91,6 +93,8 @@ runtime_detect() {
   local want="${1:-${CONTAINER_RUNTIME:-}}" sock
   case "$want" in
     docker) echo docker; return 0 ;;
+    # Never detected: only by name (--runtime kubernetes, with its context).
+    kubernetes) echo kubernetes; return 0 ;;
     podman)
       if [ "$(id -u)" = 0 ]; then
         echo "podman as root is not supported: Portcullis runs rootless Podman only (as a dedicated unprivileged user)" >&2
@@ -98,7 +102,7 @@ runtime_detect() {
       fi
       echo podman; return 0 ;;
     "") ;;
-    *) echo "the container runtime must be docker or podman (got '$want')" >&2; return 1 ;;
+    *) echo "the container runtime must be docker, podman or kubernetes (got '$want')" >&2; return 1 ;;
   esac
   if [ -n "${DOCKER_HOST:-}" ]; then
     if _rt_engine_probe && [ "$_RT_ENGINE" = docker ]; then echo docker; return 0; fi
@@ -142,6 +146,12 @@ runtime_export() {
   # group-gate (compose appends them to WG_CORE_SUBNETS / GATE_CORE_SUBNETS)
   # and by the Hub (vpn_reserved_ranges). Never taken from outside.
   export PORTCULLIS_VPN_RUNTIME_POOLS=""
+  # Kubernetes: the pod and service networks (K-P11).
+  if _rt_is_kube; then
+    export PORTCULLIS_VPN_RUNTIME_POOLS="${PORTCULLIS_POD_CIDR:-} ${PORTCULLIS_SERVICE_CIDR:-}"
+    PORTCULLIS_VPN_RUNTIME_POOLS="$(printf '%s' "$PORTCULLIS_VPN_RUNTIME_POOLS" | xargs)"
+    return 0
+  fi
   _rt_is_podman || return 0
   export PORTCULLIS_VPN_RUNTIME_POOLS="$RT_PODMAN_POOLS"
   sock="$(runtime_podman_socket)"
@@ -171,6 +181,11 @@ runtime_check() {
   local rt sock
   rt="$(runtime_name)" || exit 1
   runtime_export
+  if [ "$rt" = kubernetes ]; then
+    kube_runtime_check
+    _RT_CHECKED=1
+    return 0
+  fi
   _rt_engine_probe || fail "the container engine doesn't answer (CONTAINER_RUNTIME=$rt, DOCKER_HOST=${DOCKER_HOST:-unset}): start it, or check the socket"
   [ "$_RT_ENGINE" = "$rt" ] || fail "CONTAINER_RUNTIME=$rt but the engine is $(_rt_engine_label "$_RT_ENGINE")${DOCKER_HOST:+ (DOCKER_HOST=$DOCKER_HOST)}"
   if [ "$rt" = podman ]; then
@@ -190,6 +205,7 @@ runtime_check() {
 
 # runtime_version — the engine's version (best effort, "" when it doesn't answer).
 runtime_version() {
+  if _rt_is_kube; then kube_server_version; return 0; fi
   _rt_engine_probe || return 0
   printf '%s\n' "$_RT_ENGINE_VERSION"
 }
@@ -265,6 +281,7 @@ RT_PODMAN_POOLS="10.88.0.0/16 10.89.0.0/16"
 # reserved pools), warn with it off; the line to add is named either way.
 _rt_pool_check() {
   local net="portcullis-pool-probe-$$" subnet="" why sev=warn
+  _rt_docker_only
   case ",${COMPOSE_PROFILES:-}," in *,wg,*) sev=fail ;; esac
   if docker network create --label com.portcullis.pool-probe=1 "$net" >/dev/null 2>&1; then
     subnet="$(docker network inspect --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' "$net" 2>/dev/null | awk '{print $1}')"
@@ -284,6 +301,7 @@ _rt_pool_check() {
 # upgrade and restore refuse). Prints nothing under docker.
 runtime_host_checks() {
   local uid user f ctl id lim lin u st pstart v um cm
+  _rt_docker_only
   _rt_is_podman || return 0
   uid="$(id -u)" user="$(id -un)"
   if [ "$uid" = 0 ]; then
@@ -415,6 +433,7 @@ _rt_apparmor_pasta_check() {
 # while a † host-prep item fails. Docker: no-op.
 runtime_require_host() {
   local lines fails
+  if _rt_is_kube; then kube_require_host; return; fi
   _rt_is_podman || return 0
   [ -z "${_RT_HOST_OK:-}" ] || return 0
   lines="$(runtime_host_checks)" || exit 1
@@ -431,6 +450,7 @@ runtime_require_host() {
 runtime_build_local() {
   local cfg svc img ctx df args target a n=0
   local -a cmd
+  _rt_docker_only
   cfg="$(dc config --format json)" || fail "docker compose config failed (is .env complete?)"
   while IFS=$'\t' read -r svc img ctx df args target; do
     [ -n "$svc" ] || continue
@@ -460,6 +480,7 @@ runtime_build_local() {
 # runtime_build_service <service> — build one local image: docker →
 # `docker compose build --quiet`, podman → runtime_build_local.
 runtime_build_service() {
+  _rt_docker_only
   if _rt_is_podman; then runtime_build_local "$1"; else dc build --quiet "$1"; fi
 }
 
@@ -475,6 +496,7 @@ runtime_no_build() {
 # section, in the active profiles): docker → `docker compose build --quiet`,
 # podman → runtime_build_local.
 runtime_build_all() {
+  _rt_docker_only
   if _rt_is_podman; then runtime_build_local; else dc build --quiet || { warn "docker compose build failed"; return 1; }; fi
 }
 
@@ -501,6 +523,7 @@ runtime_build_all() {
 # healthy at the end, fails at once: named, then compose_health_report.
 stack_compose_up() {
   local rc=0 base chk i svc why wait="${STACK_UP_WAIT:-300}"
+  _rt_docker_only
   runtime_build_all || return 1
   dc up -d --no-build "$@" || rc=$?
   [ "$rc" -ne 0 ] || return 0
@@ -533,6 +556,7 @@ stack_compose_up() {
 # core container (health "none" without a healthcheck).
 _stack_up_states() {
   local cid
+  _rt_docker_only
   for cid in $(dc ps -aq 2>/dev/null); do
     docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}} {{.State.Status}} {{.RestartCount}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || true
   done
@@ -568,9 +592,9 @@ runtime_proxies_refresh() {
   local svc
   _rt_is_podman || return 0
   for svc in socket-proxy-traefik socket-proxy-hub; do
-    if [ "$(container_health "$svc")" = unhealthy ]; then
+    if [ "$(rt_health "$svc")" = unhealthy ]; then
       warn "$svc is unhealthy (podman.socket restarted?): restarting it on the current socket"
-      dc restart "$svc" >/dev/null || fail "could not restart $svc"
+      rt_restart "$svc" >/dev/null || fail "could not restart $svc"
     fi
   done
 }
@@ -582,6 +606,7 @@ runtime_proxies_refresh() {
 # `vault status`, PING replies), never a secret. Best effort, never fails.
 compose_health_report() {
   local cid name st
+  _rt_docker_only
   for cid in $(dc ps -aq 2>/dev/null); do
     read -r name st < <(docker inspect --format '{{.Name}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null) || continue
     case "$st" in
@@ -600,6 +625,7 @@ runtime_status_json() {
   local rt ver checks
   rt="$(runtime_name)" || exit 1
   ver="$(runtime_version)"
+  if [ "$rt" = kubernetes ]; then kube_status_json "$ver"; return 0; fi
   if [ "$rt" = docker ]; then
     jq -nc --arg v "$ver" --argjson u "$(id -u)" \
       '{name: "docker", version: (if $v == "" then null else $v end), rootless: false, uid: $u,
@@ -616,3 +642,8 @@ runtime_status_json() {
       subuid_start: ($us | num), subuid_count: ($un | num), subgid_start: ($gs | num), subgid_count: ($gn | num),
       port_start: $p, checks: $c}'
 }
+
+# The kubernetes runtime (kube_ctl, the cluster checks, the probe, the
+# rt_* kubernetes branch).
+# shellcheck source=kube.sh
+source "$PORTCULLIS_LIB/kube.sh"

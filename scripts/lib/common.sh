@@ -44,6 +44,9 @@ need_value() {
 require_cmd() {
   local c
   for c in "$@"; do
+    # Under kubernetes the CLI talks to the cluster, not an engine
+    # (runtime_check requires kubectl / helm there).
+    [ "$c" != docker ] || [ "${CONTAINER_RUNTIME:-}" != kubernetes ] || continue
     command -v "$c" >/dev/null 2>&1 || fail "$c is required but not installed"
   done
 }
@@ -224,19 +227,202 @@ env_generate_missing() {
   env_load
 }
 
-# ── docker compose ─────────────────────────────────────────
+# ── Runtime verbs (rt_*) ───────────────────────────────────
+#
+# Every container operation outside the runtime layer goes through these
+# verbs. On docker / podman each is today's `docker compose` code (the
+# `_rtd_*` docker branch); code that only exists there (throwaway helper
+# containers, named volumes, Docker networks, the compose project) lives in
+# functions that start with `_rt_docker_only`, which refuses to run under
+# any other runtime. tests/test_cli.sh checks that every function calling
+# dc / docker is one of those (or the docker branch itself).
+
+# _rt_docker_only — the first command of every function that calls docker
+# or dc directly: refused (fail closed) under CONTAINER_RUNTIME=kubernetes.
+_rt_docker_only() {
+  [ "${CONTAINER_RUNTIME:-}" != kubernetes ] \
+    || fail "internal: ${FUNCNAME[1]:-?} runs on docker / podman only (CONTAINER_RUNTIME=kubernetes)"
+}
 
 # dc <args> — docker compose for the core project. COMPOSE_FILE (e.g. CI
 # overrides) is honoured because we run from the project root.
-dc() { docker compose --project-directory "$PORTCULLIS_ROOT" "$@"; }
+dc() { _rt_docker_only; docker compose --project-directory "$PORTCULLIS_ROOT" "$@"; }
 
-# container_health <service> — healthy|unhealthy|starting|running|exited|missing
-container_health() {
+# rt_up [service...] — start / update the core stack (docker / podman:
+# stack_compose_up, scripts/lib/runtime.sh: local images built first, one
+# up, the slow-start retry; kubernetes: the Helm release, which is whole,
+# so a service list is accepted and ignored).
+# Every verb's kubernetes branch is _rtk_<verb> (scripts/lib/kube.sh).
+rt_up() { if _rt_is_kube; then _rtk_up "$@"; else stack_compose_up "$@"; fi; }
+
+# rt_up_service [--deps] <service>... — (re)create just these services
+# now, without building (docker: `up -d --no-deps`; --deps: with their
+# dependencies).
+rt_up_service() { if _rt_is_kube; then _rtk_up_service "$@"; else _rtd_up_service "$@"; fi; }
+_rtd_up_service() {
+  local deps=--no-deps
+  [ "$1" != --deps ] || { deps=""; shift; }
+  # shellcheck disable=SC2046,SC2086  # nothing or --no-build; nothing or --no-deps
+  dc up -d $(runtime_no_build) $deps "$@"
+}
+
+# rt_pull — fetch the images of the core stack (local builds excluded).
+rt_pull() { if _rt_is_kube; then _rtk_pull; else _rtd_pull; fi; }
+_rtd_pull() { dc pull --quiet --ignore-buildable 2>/dev/null || dc pull --ignore-buildable; }
+
+# rt_services — the core services, one per line (active profiles).
+rt_services() { if _rt_is_kube; then _rtk_services; else _rtd_services; fi; }
+_rtd_services() { dc config --services; }
+
+# rt_require_tools — the runtime's client tools are there (docker: the
+# compose plugin).
+rt_require_tools() { if _rt_is_kube; then _rtk_require_tools; else _rtd_require_tools; fi; }
+_rtd_require_tools() { docker compose version >/dev/null 2>&1 || fail "the docker compose plugin is required"; }
+
+# rt_network_check — the runtime's network preconditions before anything
+# starts: docker / podman network_check (IPAM, the DNS-shadow guard);
+# kubernetes: nothing here (rt_up's cluster setup and NetworkPolicy probe).
+rt_network_check() { if _rt_is_kube; then return 0; fi; network_check; }
+
+# rt_down [args...] — stop and remove the core containers (volumes kept).
+rt_down() { if _rt_is_kube; then _rtk_down "$@"; else _rtd_down "$@"; fi; }
+_rtd_down() { dc down "$@"; }
+
+# rt_exec [-i] [-e NAME]... <service> -- <argv...> — run argv in the
+# service's running container. -i: stdin is passed (docker always passes
+# it: `exec -T`). -e NAME: the variable passed by NAME, never its value on
+# argv (docker / podman only). No -u: the container's own user.
+rt_exec() {
+  local -a envs=()
+  local svc=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -i) shift ;;
+      -e) envs+=(-e "$2"); shift 2 ;;
+      --) shift; break ;;
+      -*) fail "rt_exec: unknown option $1" ;;
+      *) [ -z "$svc" ] || fail "rt_exec: expected <service> -- <argv...>"; svc="$1"; shift ;;
+    esac
+  done
+  [ -n "$svc" ] || fail "rt_exec: no service"
+  if _rt_is_kube; then
+    [ "${#envs[@]}" -eq 0 ] || fail "rt_exec -e is docker / podman only (on kubernetes pass values on stdin)"
+    _rtk_exec "$svc" "$@"
+  else
+    _rtd_exec "$svc" ${envs[@]+"${envs[@]}"} -- "$@"
+  fi
+}
+_rtd_exec() {
+  local svc="$1"
+  shift
+  local -a opts=()
+  while [ "$1" != -- ]; do opts+=("$1"); shift; done
+  shift
+  dc exec -T ${opts[@]+"${opts[@]}"} "$svc" "$@"
+}
+
+# rt_logs <service> [compose logs options...] — the service's log.
+rt_logs() { local svc="$1"; shift; if _rt_is_kube; then _rtk_logs "$svc" "$@"; else _rtd_logs "$svc" "$@"; fi; }
+_rtd_logs() { local svc="$1"; shift; dc logs "$@" "$svc"; }
+
+# rt_ps [--json] — the core containers (--json: compose's JSON lines,
+# stopped ones included).
+rt_ps() { if _rt_is_kube; then _rtk_ps "$@"; else _rtd_ps "$@"; fi; }
+_rtd_ps() {
+  if [ "${1:-}" = --json ]; then dc ps -a --format json; else dc ps; fi
+}
+
+# rt_running <service> — true when the service has a running container.
+rt_running() { if _rt_is_kube; then _rtk_running "$1"; else _rtd_running "$1"; fi; }
+_rtd_running() { [ -n "$(dc ps -q --status running "$1" 2>/dev/null)" ]; }
+
+# rt_restart <service>... / rt_stop <service>... / rt_start <service>...
+rt_restart() { if _rt_is_kube; then _rtk_restart "$@"; else _rtd_restart "$@"; fi; }
+_rtd_restart() { dc restart "$@"; }
+rt_stop() { if _rt_is_kube; then _rtk_stop "$@"; else _rtd_stop "$@"; fi; }
+_rtd_stop() { dc stop "$@"; }
+rt_start() { if _rt_is_kube; then _rtk_start "$@"; else _rtd_start "$@"; fi; }
+_rtd_start() { dc start "$@"; }
+
+# rt_kill <service> <signal> — send a signal to the service's main process.
+rt_kill() { if _rt_is_kube; then _rtk_kill "$1" "$2"; else _rtd_kill "$1" "$2"; fi; }
+_rtd_kill() { dc kill -s "$2" "$1"; }
+
+# rt_run <service> [-i] [--user U:G] [--entrypoint E] [--label K=V] -- <args...>
+# — a one-shot container of the service (docker: `compose run --rm
+# --no-deps -T`), secrets only on stdin.
+rt_run() {
+  local svc="$1"
+  shift
+  local -a opts=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -i) shift ;;
+      --user|--entrypoint|--label) opts+=("$1" "$2"); shift 2 ;;
+      --) shift; break ;;
+      *) fail "rt_run: unknown option $1" ;;
+    esac
+  done
+  if _rt_is_kube; then _rtk_run "$svc" ${opts[@]+"${opts[@]}"} -- "$@"; else _rtd_run "$svc" ${opts[@]+"${opts[@]}"} -- "$@"; fi
+}
+_rtd_run() {
+  local svc="$1"
+  shift
+  local -a opts=()
+  while [ "$1" != -- ]; do opts+=("$1"); shift; done
+  shift
+  dc run --rm --no-deps -T ${opts[@]+"${opts[@]}"} "$svc" "$@"
+}
+
+# rt_image <service> — the running container's image as "<ref> (<id>)",
+# nothing when it isn't running.
+rt_image() { if _rt_is_kube; then _rtk_image "$1"; else _rtd_image "$1"; fi; }
+_rtd_image() {
+  local cid
+  cid="$(dc ps -q "$1" 2>/dev/null | head -n1 || true)"
+  [ -z "$cid" ] || docker inspect --format '{{.Config.Image}} ({{.Image}})' "$cid" 2>/dev/null || true
+}
+
+# rt_started_at <service> — the running container's start time as the
+# runtime reports it (RFC 3339), nothing when it isn't running.
+rt_started_at() { if _rt_is_kube; then _rtk_started_at "$1"; else _rtd_started_at "$1"; fi; }
+_rtd_started_at() {
+  local cid
+  cid="$(dc ps -q "$1" 2>/dev/null | head -n1)"
+  [ -n "$cid" ] || return 0
+  docker inspect --format '{{.State.StartedAt}}' "$cid" 2>/dev/null || true
+}
+
+# rt_health <service> — healthy|unhealthy|starting|running|exited|missing
+rt_health() { if _rt_is_kube; then _rtk_health "$1"; else _rtd_health "$1"; fi; }
+_rtd_health() {
   local cid st
   cid="$(dc ps -q "$1" 2>/dev/null | head -n1)"
   [ -n "$cid" ] || { echo missing; return 0; }
   st="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid" 2>/dev/null)"
   echo "${st:-missing}"
+}
+
+# rt_volume_out <volume> <path> [uid:gid] — a tar of <path> inside the
+# core named volume on stdout, read by a throwaway helper as uid:gid
+# (default 0:0 with no capability: owner and mode only), the volume
+# mounted read-only at /vol (never at an image path).
+rt_volume_out() { if _rt_is_kube; then _rtk_volume_out "$@"; else _rtd_volume_out "$@"; fi; }
+_rtd_volume_out() {
+  local vol="${COMPOSE_PROJECT_NAME:-portcullis}_$1" path="${2:-.}" user="${3:-0:0}"
+  docker run --rm -i --network none --read-only --user "$user" --cap-drop ALL \
+    --security-opt no-new-privileges:true --mount "type=volume,src=$vol,dst=/vol,readonly" \
+    "$PORTCULLIS_HELPER_IMAGE" tar -C /vol -cf - "$path"
+}
+
+# rt_volume_in <volume> <path> [uid:gid] — a tar on stdin extracted under
+# <path> inside the core named volume, as uid:gid (the volume's owner).
+rt_volume_in() { if _rt_is_kube; then _rtk_volume_in "$@"; else _rtd_volume_in "$@"; fi; }
+_rtd_volume_in() {
+  local vol="${COMPOSE_PROJECT_NAME:-portcullis}_$1" path="${2:-.}" user="${3:-0:0}"
+  docker run --rm -i --network none --read-only --user "$user" --cap-drop ALL \
+    --security-opt no-new-privileges:true --mount "type=volume,src=$vol,dst=/vol" \
+    "$PORTCULLIS_HELPER_IMAGE" tar -C "/vol/$path" -xf -
 }
 
 # wait_healthy <timeout-seconds> <service>... — fail on timeout.
@@ -247,7 +433,7 @@ wait_healthy() {
     printf '  waiting for %s...' "$svc"
     st=""
     for ((i = 0; i < timeout; i += 3)); do
-      st="$(container_health "$svc")"
+      st="$(rt_health "$svc")"
       [ "$st" = healthy ] && break
       sleep 3
     done
@@ -381,6 +567,7 @@ ct_hint_chown() {
 # compose services never get label=disable (only the two socket proxies,
 # docker-compose.podman-selinux.yml, CI-linted). Docker: unchanged.
 ct_run() {
+  _rt_docker_only
   if _rt_is_podman; then
     docker run --security-opt label=disable "$@"
   else
@@ -395,7 +582,14 @@ ct_run() {
 # container, so 10001 writes the host's subuid+10000; no container, no bind
 # mount, nothing relabelled), never chown directly.
 ct_own() {
+  # Kubernetes: secrets/ is the CLI's (synced into Secrets with their own
+  # modes), no container reads host files.
+  if _rt_is_kube; then return 0; fi
+  _ct_own_docker "$@"
+}
+_ct_own_docker() {
   local spec="$1" p i=0 podman=false todo=() mounts=() targets=()
+  _rt_docker_only
   shift
   if _rt_is_podman; then podman=true; _ct_maps; fi
   for p in "$@"; do
@@ -435,7 +629,13 @@ ct_own() {
 # read-only) the volume starts root-owned and Docker never copies the owning
 # image's ownership in. Created with compose's labels so compose adopts it.
 volume_own() {
+  # Kubernetes: the PVCs are created with their owner (K3 annotations).
+  if _rt_is_kube; then return 0; fi
+  _volume_own_docker "$@"
+}
+_volume_own_docker() {
   local vol="$1" spec="$2" mode="${3:-}" project="${COMPOSE_PROJECT_NAME:-portcullis}" name
+  _rt_docker_only
   name="${project}_$vol"
   if ! docker volume inspect "$name" >/dev/null 2>&1; then
     docker volume create --label "com.docker.compose.project=$project" \
@@ -497,7 +697,7 @@ secrets_fix_perms() {
 # Core variables the Hub may copy into app .env files (templates reference
 # them as ${VAR}); everything else in .env is a core secret the Hub never
 # sees. Operators can add names via HUB_SHARED_ENV="VAR1 VAR2".
-HUB_ENV_VARS="PORTCULLIS_DOMAIN PORTCULLIS_TRAEFIK_IP PORTCULLIS_MCP_GATE_IP PORTCULLIS_PROXY_SUBNET PORTCULLIS_PROXY_IP_RANGE PORTAL_DISPLAY_NAME PORTCULLIS_VPN_MODE PORTCULLIS_VPN_PUBLIC_ENROL PORTCULLIS_VPN_NET PORTCULLIS_VPN_WG_IP PORTCULLIS_VPN_BUILTIN PORTCULLIS_VPN_RESERVED_RANGES"
+HUB_ENV_VARS="PORTCULLIS_DOMAIN PORTCULLIS_TRAEFIK_IP PORTCULLIS_MCP_GATE_IP PORTCULLIS_TRAEFIK_SOURCE PORTCULLIS_MCP_GATE_SOURCE PORTCULLIS_PROXY_SUBNET PORTCULLIS_PROXY_IP_RANGE PORTAL_DISPLAY_NAME PORTCULLIS_VPN_MODE PORTCULLIS_VPN_PUBLIC_ENROL PORTCULLIS_VPN_NET PORTCULLIS_VPN_WG_IP PORTCULLIS_VPN_BUILTIN PORTCULLIS_VPN_RESERVED_RANGES"
 HUB_ENV_PREFIXES="NETBIRD_ COTURN_"
 
 # hub_env_write — secrets/hub/core.env, mounted read-only as the Hub's
@@ -516,12 +716,25 @@ hub_env_write() {
     [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
     case " $CORE_SECRETS " in *" $v "*) warn "HUB_SHARED_ENV: refusing to share core secret $v with the Hub"; continue ;; esac
     case "$content" in "$v="*|*$'\n'"$v="*) continue ;; esac
-    # Written below from the host (podman only), never shared by name.
-    [ "$v" != PORTCULLIS_UNPRIVILEGED_PORT_START ] || continue
+    # Written below from the host (podman / kubernetes only), never shared by name.
+    case "$v" in PORTCULLIS_UNPRIVILEGED_PORT_START|PORTCULLIS_POD_CIDR|PORTCULLIS_SERVICE_CIDR|PORTCULLIS_WG_EDGE_SERVICE_IP|PORTCULLIS_TRAEFIK_SERVICE_IP|PORTCULLIS_RUNTIME_ROOTS|PORTCULLIS_KUBE_*) continue ;; esac
     case "$v" in
       PORTCULLIS_DOMAIN) val="${PORTCULLIS_DOMAIN:-portcullis.local}" ;;
       PORTCULLIS_TRAEFIK_IP) val="$(proxy_traefik_ip)" ;;
       PORTCULLIS_MCP_GATE_IP) val="$(mcp_gate_ip)" ;;
+      # Contract §2: the only peers that may send identity headers / call
+      # companions — Traefik's and mcp-gate's address on docker / podman,
+      # the pod CIDR on kubernetes (with a NetworkPolicy admitting only
+      # that peer: this is the second layer). Never from .env.
+      PORTCULLIS_TRAEFIK_SOURCE|PORTCULLIS_MCP_GATE_SOURCE)
+        if _rt_is_kube; then
+          # The whole pod CIDR (pod addresses can't be pinned): only the
+          # second layer behind the instance's NetworkPolicy, whose
+          # enforcement the probe proves. Never an empty value.
+          [ -n "${PORTCULLIS_POD_CIDR:-}" ] || fail "PORTCULLIS_POD_CIDR is not set (.env): refusing to write an empty $v for the Hub"
+          val="$PORTCULLIS_POD_CIDR"
+        elif [ "$v" = PORTCULLIS_TRAEFIK_SOURCE ]; then val="$(proxy_traefik_ip)/32"
+        else val="$(mcp_gate_ip)/32"; fi ;;
       PORTCULLIS_PROXY_SUBNET) val="$(proxy_subnet)" ;;
       PORTCULLIS_PROXY_IP_RANGE) val="$(proxy_ip_range)" ;;
       PORTAL_DISPLAY_NAME) val="${PORTAL_DISPLAY_NAME:-Portcullis}" ;;
@@ -545,6 +758,19 @@ hub_env_write() {
   if _rt_is_podman; then
     content+="PORTCULLIS_UNPRIVILEGED_PORT_START=$(runtime_port_start)"$'\n'
   fi
+  # Kubernetes (contract §2): the cluster's networks, wg-edge's address,
+  # the doctor's forbidden roots, the context (GET /api/runtime) and the
+  # node addresses (read now: the instances' egress rule and the admission
+  # params exclude them).
+  if _rt_is_kube; then
+    content+="PORTCULLIS_POD_CIDR=${PORTCULLIS_POD_CIDR:-}"$'\n'
+    content+="PORTCULLIS_SERVICE_CIDR=${PORTCULLIS_SERVICE_CIDR:-}"$'\n'
+    content+="PORTCULLIS_WG_EDGE_SERVICE_IP=${PORTCULLIS_WG_EDGE_SERVICE_IP:-}"$'\n'
+    content+="PORTCULLIS_TRAEFIK_SERVICE_IP=${PORTCULLIS_TRAEFIK_SERVICE_IP:-}"$'\n'
+    content+="PORTCULLIS_RUNTIME_ROOTS=$KUBE_RUNTIME_ROOTS"$'\n'
+    content+="PORTCULLIS_KUBE_CONTEXT=${PORTCULLIS_KUBE_CONTEXT:-}"$'\n'
+    content+="PORTCULLIS_KUBE_NODE_ADDRESSES=$(kube_node_addresses)"$'\n'
+  fi
   (umask 077 && mkdir -p "$(dirname "$f")")
   [ -e "$f" ] || (umask 077 && : > "$f")
   {
@@ -556,8 +782,14 @@ hub_env_write() {
 # _ensure_secrets_volume — ensure hub_secrets volume exists with CT_UID_HUB:CT_UID_HUB 0700.
 # Called by init/upgrade/restore (through stack_prepare) per contract §6.
 _ensure_secrets_volume() {
+  # Kubernetes: hub-secrets is a PVC owned 10001:10001 0700 by its annotations.
+  if _rt_is_kube; then return 0; fi
+  _ensure_secrets_volume_docker
+}
+_ensure_secrets_volume_docker() {
   local name="${HUB_SECRETS_VOLUME:-portcullis_hub_secrets}"
   local project="${COMPOSE_PROJECT_NAME:-portcullis}"
+  _rt_docker_only
   if ! docker volume inspect "$name" >/dev/null 2>&1; then
     docker volume create --label "com.docker.compose.project=$project" \
       --label "com.docker.compose.volume=hub_secrets" "$name" >/dev/null \

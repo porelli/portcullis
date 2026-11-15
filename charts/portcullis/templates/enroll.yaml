@@ -1,0 +1,47 @@
+{{- /* enroll (compose: enroll): setup links, certificate API. */ -}}
+{{- $s := dict
+  "name" "enroll" "uid" .Values.uids.enroll "gid" .Values.uids.enroll
+  "memory" "128Mi" "nets" (list "portcullis") "egress" true
+  "hashes" (list "portcullis-env" "secrets-enroll" "config-group-gate")
+  "health" (dict "test" (list "wget" "-q" "-O" "/dev/null" "http://127.0.0.1:8443/healthz") "interval" 10 "timeout" 3 "retries" 3)
+  "ports" (list (dict "name" "invite" "port" 8443) (dict "name" "api" "port" 8444) (dict "name" "idp" "port" 8445))
+  "env" (list
+    (dict "name" "INVITE_PROTECTED_GROUPS" "value" .Values.hub.invitesProtectedGroups)
+    (dict "name" "VAULT_ADDR" "value" "http://vault:8200")
+    (dict "name" "VAULT_ROLE_ID_FILE" "value" "/run/secrets/portcullis-enroll/role-id")
+    (dict "name" "VAULT_SECRET_ID_FILE" "value" "/run/secrets/portcullis-enroll/secret-id")
+    (dict "name" "LLDAP_URL" "value" "ldap://lldap:3890")
+    (dict "name" "LLDAP_BASE_DN" "value" .Values.lldap.baseDN)
+    (dict "name" "LLDAP_BIND_DN" "value" (printf "uid=admin,ou=people,%s" .Values.lldap.baseDN))
+    (dict "name" "LLDAP_BIND_PASSWORD" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "LLDAP_ADMIN_PASSWORD")))
+    (dict "name" "PORTCULLIS_DOMAIN" "value" (include "portcullis.domain" .))
+    (dict "name" "CERT_TTL" "value" .Values.hub.clientCertTTL)
+    (dict "name" "KEYCLOAK_URL" "value" (include "portcullis.keycloakInternal" .)))
+  "mounts" (list
+    (dict "name" "secrets" "mountPath" "/run/secrets/portcullis-enroll" "readOnly" true)
+    (dict "name" "map" "mountPath" "/etc/group-gate" "readOnly" true))
+  "volumes" (list
+    (dict "name" "secrets" "secret" (dict "secretName" "secrets-enroll" "defaultMode" 288))
+    (dict "name" "map" "configMap" (dict "name" "config-group-gate" "items" (list (dict "key" "group-gate-map.conf" "path" "map.conf")))))
+  "fsGroup" .Values.uids.enroll
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: enroll
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    portcullis.io/component: enroll
+  ports:
+    - name: invite
+      port: 8443
+      targetPort: 8443
+    - name: api
+      port: 8444
+      targetPort: 8444
+    - name: idp
+      port: 8445
+      targetPort: 8445

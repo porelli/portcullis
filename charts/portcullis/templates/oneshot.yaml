@@ -1,0 +1,90 @@
+{{- /* rt_run's one-shot pods (K16): rendered only when ./portcullis asks for
+one (`helm template --show-only templates/oneshot.yaml --set-string
+oneshot=<service>`), from the service's own spec: the same image digest,
+user, capabilities and labels, restartPolicy Never, secrets only on stdin.
+  dns-tool: the domains image's `domains dns` (compose profile tools);
+  hub:      `hub signin reset-core` against the Hub's data (the Hub scaled
+            to 0 first). */ -}}
+{{- if eq .Values.oneshot "dns-tool" }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oneshot-dns-tool
+  namespace: {{ .Release.Namespace }}
+  labels:
+    portcullis.io/component: dns-tool
+    portcullis.io/oneshot: "true"
+    portcullis.io/net-domains-egress: "true"
+    portcullis.io/egress: "true"
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: {{ .Values.uids.domains }}
+    runAsGroup: {{ .Values.uids.domains }}
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: dns-tool
+      image: {{ include "portcullis.image" (list . "dns-tool") }}
+      command: ["domains", "dns"]
+      stdin: true
+      stdinOnce: true
+      resources:
+        limits:
+          memory: 128Mi
+        requests:
+          memory: 128Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+{{- else if eq .Values.oneshot "hub" }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oneshot-hub
+  namespace: {{ .Release.Namespace }}
+  labels:
+    portcullis.io/component: hub-oneshot
+    portcullis.io/oneshot: "true"
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: {{ .Values.uids.hub }}
+    runAsGroup: {{ .Values.uids.hub }}
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: hub
+      image: {{ include "portcullis.image" (list . "hub") }}
+      command: ["/usr/local/bin/hub"]
+      stdin: true
+      stdinOnce: true
+      env:
+        - name: HUB_DATA_DIR
+          value: /data
+      resources:
+        limits:
+          memory: 256Mi
+        requests:
+          memory: 256Mi
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: hub-data
+{{- end }}

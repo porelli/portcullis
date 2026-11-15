@@ -29,7 +29,7 @@ t_fail() { FAIL=$((FAIL + 1)); echo "FAIL - $*"; }
 expect_ok()   { local d="$1"; shift; if "$@" >/dev/null 2>&1; then t_pass "$d"; else t_fail "$d"; fi; }
 expect_fail() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then t_fail "$d"; else t_pass "$d"; fi; }
 expect_eq()   { if [ "$2" = "$3" ]; then t_pass "$1"; else t_fail "$1 (got '$2', want '$3')"; fi; }
-file_mode()   { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+file_mode()   { stat -c %a "$1" 2>/dev/null || { m="$(stat -f %Mp%Lp "$1")" && echo "${m#0}"; }; }
 file_inode()  { stat -c %i "$1" 2>/dev/null || stat -f %i "$1"; }
 
 # ── stubs ──────────────────────────────────────────────────
@@ -1024,7 +1024,7 @@ jq '.vault.browser_ca_expires_epoch = 0' "$STUB_DIR/stf.json" > "$STUB_DIR/stf2.
 expect_eq "status --textfile: no browser CA series while its expiry is unknown" "$(stf | grep -c 'ca="browser"' || true)" 0
 # status --json over both mounts: nothing issued on pki_file yet ("No value
 # found", exit 2) is an empty list, not an unknown count (CI run 43051184972).
-sjson() { (require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
+sjson() { (require_cmd() { :; }; dc() { :; }; rt_health() { echo healthy; }; kc_login() { return 1; }
            proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
            vault_admin_env() { export VAULT_TOKEN=x; }; vault_use_container_cli() { :; }
            _cert_info() { echo "testuser|Dec 11 15:51:10 2099 GMT|false"; }
@@ -1560,6 +1560,16 @@ echo RELAX_NOT_BEFORE=1900000000 > "$WORK/rsec-root/secrets/domains/acme-relax.e
 (PORTCULLIS_ROOT="$WORK/rsec-root"; secrets_fix_perms() { :; }; _restore_secrets "$WORK/rsec-backup")
 expect_eq "restore: last-public-ipv* deleted, the live acme-relax.env kept (live DNS: a restore doesn't change it), the rest installed" \
   "$(find "$WORK/rsec-root/secrets" -name 'last-public-*' | wc -l | tr -d ' '):$(cat "$WORK/rsec-root/secrets/domains/acme-relax.env"):$(cat "$WORK/rsec-root/secrets/domains/api-secret")" "0:RELAX_NOT_BEFORE=1900000000:keep"
+# secrets/kube/ (this host's cluster state: digests, values, the setup
+# record) is never in a backup and never replaced: the live one stays, a
+# stray one in the backup never lands.
+mkdir -p "$WORK/rsec-root/secrets/kube" "$WORK/rsec-backup/secrets/kube"
+echo '{"group-gate":"localhost/portcullis-group-gate@sha256:live"}' > "$WORK/rsec-root/secrets/kube/digests.json"
+echo '{"group-gate":"from-the-backup"}' > "$WORK/rsec-backup/secrets/kube/digests.json"; echo stray > "$WORK/rsec-backup/secrets/kube/values.yaml"
+(PORTCULLIS_ROOT="$WORK/rsec-root"; secrets_fix_perms() { :; }; _restore_secrets "$WORK/rsec-backup")
+expect_eq "restore keeps this host's secrets/kube (digests.json) and installs none from the backup" \
+  "$(cat "$WORK/rsec-root/secrets/kube/digests.json"):$(test -e "$WORK/rsec-root/secrets/kube/values.yaml" && echo stray || echo none):$(file_mode "$WORK/rsec-root/secrets/kube")" \
+  '{"group-gate":"localhost/portcullis-group-gate@sha256:live"}:none:700'
 # The same on this root (what restore leaves), then the first `up`.
 _strip_host_files "$PORTCULLIS_ROOT/secrets"
 ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.8
@@ -1881,8 +1891,10 @@ fi
 expect_eq "restore's last line (T24): authenticator apps and passkeys removed since the backup work again" \
   "$(bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/backup.sh'; _restore_lost_devices_note" 2>&1 | sed 's/\x1b\[[0-9;]*m//g')" \
   "$(printf '%s' "==> Authenticator apps and passkeys removed after this backup's date work again: remove the ones reported lost since then (People → person → Sign-in).")"
-expect_eq "restore: the note is backup_restore's last command (both cmd_restore paths call it)" \
-  "$(bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/backup.sh'; declare -f backup_restore" | grep -v '^ *}$' | tail -n1 | sed 's/^ *//; s/;$//')" "_restore_lost_devices_note"
+# Both runtimes' restores end with it (docker / podman and kubernetes).
+expect_eq "the lost-devices note is the last call of the docker and the kubernetes restore" \
+  "$(for f in _backup_restore_docker _backup_restore_kube; do sed -n "/^$f() {/,/^}/p" "$HERE"/../scripts/lib/backup.sh "$HERE"/../scripts/lib/kube.sh | grep -v '^ *#' | grep -v '^}' | tail -n1 | tr -d ' '; done | tr '\n' ' ')" \
+  "_restore_lost_devices_note _restore_lost_devices_note "
 expect_eq "restore: each app project downed once, never the core project by -p" \
   "$(grep -c '^compose -p ' "$STUB_DIR/calls")" "2"
 expect_ok "restore: no app down removes volumes" sh -c "! grep -q '^compose -p .* -v' '$STUB_DIR/calls'"
@@ -2950,7 +2962,7 @@ rm -f "$PORTCULLIS_ROOT/secrets/domains/main-domain.env"
 expect_eq "dns_main_env_uri without the file: nothing, exit 0 under set -euo pipefail" \
   "$(dt 'set -euo pipefail; u="$(dns_main_env_uri)"; echo "got:$u"')" "got:
 rc=0"
-SJ="$(dt "set -euo pipefail; require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
+SJ="$(dt "set -euo pipefail; require_cmd() { :; }; dc() { :; }; rt_health() { echo healthy; }; kc_login() { return 1; }
         proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
         vault_admin_env() { return 1; }
         dns_status_json() { cat '$DNSR'; }; dns_traefik_account_uri() { :; }
@@ -2958,7 +2970,7 @@ SJ="$(dt "set -euo pipefail; require_cmd() { :; }; dc() { :; }; container_health
 expect_eq "status --json without main-domain.env (set -euo pipefail, as the CLI) still prints the report" \
   "$(printf '%s\n' "$SJ" | sed '$d' | jq -c '[.dns.main.name, .dns.main.lost_account]' 2>/dev/null)" '["ci.example.org",false]'
 # status --json carries the block (status_run with the report stubbed).
-SJ="$( (require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
+SJ="$( (require_cmd() { :; }; dc() { :; }; rt_health() { echo healthy; }; kc_login() { return 1; }
         proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
         vault_admin_env() { return 1; }
         dns_status_json() { cat "$DNSR"; }; dns_traefik_account_uri() { echo https://acme/acct/1; }; dns_main_env_uri() { echo https://acme/acct/1; }
@@ -3058,9 +3070,9 @@ case "$OUT" in *"no container engine answers: pass --runtime docker|podman"*"/et
 expect_eq "runtime_detect: an unknown runtime → refused" "$(rt 'runtime_detect lxc >/dev/null 2>&1')" "rc=1"
 
 OUT="$(rt 'runtime_name')"
-case "$OUT" in *"CONTAINER_RUNTIME is not set in .env (docker or podman): ./portcullis init writes it"*"rc=1") t_pass "runtime_name: unset → refused naming the variable" ;; *) t_fail "runtime_name unset: $OUT" ;; esac
+case "$OUT" in *"CONTAINER_RUNTIME is not set in .env (docker, podman or kubernetes): ./portcullis init writes it"*"rc=1") t_pass "runtime_name: unset → refused naming the variable" ;; *) t_fail "runtime_name unset: $OUT" ;; esac
 OUT="$(rt 'CONTAINER_RUNTIME=Docker runtime_name')"
-case "$OUT" in *"CONTAINER_RUNTIME=Docker is neither docker nor podman"*"rc=1") t_pass "runtime_name: another value → refused naming it" ;; *) t_fail "runtime_name bad: $OUT" ;; esac
+case "$OUT" in *"CONTAINER_RUNTIME=Docker is not docker, podman or kubernetes"*"rc=1") t_pass "runtime_name: another value → refused naming it" ;; *) t_fail "runtime_name bad: $OUT" ;; esac
 OUT="$(rt 'CONTAINER_RUNTIME=docker STUB_DOCKER_SOCK_ENGINE="Podman Engine" runtime_check')"
 case "$OUT" in *"CONTAINER_RUNTIME=docker but the engine is Podman Engine"*"rc=1") t_pass "runtime_check: CONTAINER_RUNTIME=docker but the engine is Podman → fails" ;; *) t_fail "runtime_check docker/podman: $OUT" ;; esac
 OUT="$(rt "CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET='$RT_PSOCK' STUB_PODMAN_SOCK_ENGINE=Engine runtime_check")"
@@ -3196,14 +3208,14 @@ cat > "$STUB_DIR/rt-config.json" <<'JSON'
  "dns-tool":{"image":"portcullis-domains"},
  "vault":{"image":"hashicorp/vault:2"}}}
 JSON
-OUT="$(rt "CONTAINER_RUNTIME=podman; stack_compose_up >/dev/null 2>&1; echo \"\$?\"; sort \"\$STUB_DIR/podman-calls\"; grep -E '^compose .* (up|build)( |$)' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'")"
+OUT="$(rt "CONTAINER_RUNTIME=podman; rt_up >/dev/null 2>&1; echo \"\$?\"; sort \"\$STUB_DIR/podman-calls\"; grep -E '^compose .* (up|build)( |$)' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'")"
 expect_eq "stack_compose_up on podman builds with podman build and runs up --no-build" "$OUT" "0
 build --format docker -t portcullis-domains -f /src/domains/Dockerfile --build-arg GO_TAGS=testprovider /src/domains
 build --format docker -t portcullis-enroll -f /src/enroll/Dockerfile /src/enroll
 build --format docker -t portcullis-mcp-gate -f /src/mcp-gate/Dockerfile.x /src/mcp-gate
 compose up -d --no-build
 rc=0"
-OUT="$(rt "CONTAINER_RUNTIME=docker; stack_compose_up hub >/dev/null 2>&1; grep -E '^compose ' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'; test ! -e \"\$STUB_DIR/podman-calls\"")"
+OUT="$(rt "CONTAINER_RUNTIME=docker; rt_up hub >/dev/null 2>&1; grep -E '^compose ' \"\$STUB_DIR/rt-calls\" | sed 's/--project-directory [^ ]* //'; test ! -e \"\$STUB_DIR/podman-calls\"")"
 expect_eq "stack_compose_up on docker: build --quiet first, then up -d --no-build, no podman" "$OUT" "compose build --quiet
 compose up -d --no-build hub
 rc=0"
@@ -3220,12 +3232,15 @@ expect_eq "--force-recreate only on the restore's fresh Vault" \
   "$(grep -h 'dc up .*--force-recreate' "$LIBS"/*.sh | sed 's/^ *//')" 'dc up -d $(runtime_no_build) --no-deps --force-recreate vault >/dev/null'
 expect_eq "every dc up outside stack_compose_up passes \$(runtime_no_build)" \
   "$(grep -n 'dc up ' "$LIBS"/*.sh | grep -v '^\s*#' | grep -vF '$(runtime_no_build)' | grep -v '/runtime.sh:' || true)" ""
-expect_eq "no dc up --build anywhere: stack_compose_up builds first (init, up, upgrade, restore go through it)" \
-  "$(grep -n 'dc up .*--build' "$LIBS"/*.sh | grep -v -- '--no-build' || true):$(grep -c '^ *stack_compose_up' "$LIBS/stack.sh") $(grep -c '^ *stack_compose_up ||' "$LIBS/backup.sh")" ":3 1"
+expect_eq "no dc up --build anywhere: rt_up (= stack_compose_up on docker / podman) builds first (init, up, upgrade, restore go through it; init's last kubernetes rt_up too)" \
+  "$(grep -n 'dc up .*--build' "$LIBS"/*.sh | grep -v -- '--no-build' || true):$(grep -c '^ *rt_up\b' "$LIBS/stack.sh") $(grep -c '^ *rt_up ||' "$LIBS/backup.sh")" ":4 1"
+expect_eq "rt_up on docker / podman is stack_compose_up (the kcwait tests below run through it)" \
+  "$( (stack_compose_up() { echo "scu $*"; }; CONTAINER_RUNTIME=docker; rt_up wg traefik hub; CONTAINER_RUNTIME=podman; rt_up) )" "scu wg traefik hub
+scu "
 # restore builds on both runtimes, as up does (docker used to start the
 # images it had: a git pull before a restore left them old).
 for RTN in docker podman; do
-  OUT="$(rt "CONTAINER_RUNTIME=$RTN; compose_health_report() { :; }; stack_compose_up >/dev/null 2>&1; echo \"\$?\"; grep -cE '^compose .* up -d --(no-)?build$' \"\$STUB_DIR/rt-calls\"; grep -c '^build ' \"\$STUB_DIR/podman-calls\" 2>/dev/null || echo 0")"
+  OUT="$(rt "CONTAINER_RUNTIME=$RTN; compose_health_report() { :; }; rt_up >/dev/null 2>&1; echo \"\$?\"; grep -cE '^compose .* up -d --(no-)?build$' \"\$STUB_DIR/rt-calls\"; grep -c '^build ' \"\$STUB_DIR/podman-calls\" 2>/dev/null || echo 0")"
   case "$RTN:$OUT" in
     "docker:0"$'\n'"1"$'\n'"0"$'\n'"rc=0"|"podman:0"$'\n'"1"$'\n'"3"$'\n'"rc=0") t_pass "stack_compose_up on $RTN: the local images built, one up that lets compose recreate changed ones" ;;
     *) t_fail "stack_compose_up on $RTN: $OUT" ;;
@@ -3378,6 +3393,14 @@ OUT="$(rt "CONTAINER_RUNTIME=podman; backup_schedule_systemd 'Sun 04:00' '$WORK/
 case "$OUT" in *"~/.config/systemd/user"*"systemctl --user daemon-reload"*"systemctl --user enable --now portcullis-backup.timer"*) t_pass "backup schedule --output on podman: user-unit install commands" ;; *) t_fail "schedule podman output: $OUT" ;; esac
 OUT="$(rt "CONTAINER_RUNTIME=docker; backup_schedule_systemd '*-*-* 03:15:00' ''")"
 case "$OUT" in *"Requires=docker.service"*"User=$(id -un)"*"WantedBy=timers.target"*) t_pass "backup schedule on docker: system units (unchanged)" ;; *) t_fail "schedule docker: $OUT" ;; esac
+# Kubernetes: no engine unit (a k3s host without Docker would never start
+# the timer); k3s.service when this host runs it, else nothing.
+OUT="$(rt "CONTAINER_RUNTIME=kubernetes; systemctl() { [ \"\$1 \$2\" = 'cat k3s.service' ]; }; backup_schedule_systemd '*-*-* 03:15:00' ''")"
+case "$OUT" in *"After=network-online.target k3s.service"*"Requires=k3s.service"*"User=$(id -un)"*"WantedBy=timers.target"*) t_pass "backup schedule on kubernetes (k3s host): After/Requires k3s.service, system units" ;; *) t_fail "schedule kube k3s: $OUT" ;; esac
+case "$OUT" in *docker*|*podman*) t_fail "backup schedule on kubernetes: an engine dependency: $OUT" ;; *) t_pass "backup schedule on kubernetes: no docker / podman dependency" ;; esac
+OUT="$(rt "CONTAINER_RUNTIME=kubernetes; systemctl() { return 1; }; backup_schedule_systemd '*-*-* 03:15:00' ''")"
+case "$OUT" in *"Requires="*|*k3s*|*docker*) t_fail "backup schedule on kubernetes (remote cluster): a unit dependency: $OUT" ;;
+  *"After=network-online.target"*"User=$(id -un)"*"WantedBy=timers.target"*) t_pass "backup schedule on kubernetes (no k3s here): no Requires=, After=network-online.target only" ;; *) t_fail "schedule kube remote: $OUT" ;; esac
 
 # Every bind source of the SELinux overlay exists before `up`: in git, or
 # made by stack_prepare (the overlay's long-syntax binds never create a
@@ -3452,7 +3475,7 @@ exit 0
 STUB
 } > "$WORK/hcbin/docker"
 chmod +x "$WORK/hcbin/docker"
-HC_OUT="$( (PATH="$WORK/hcbin:$PATH"; CONTAINER_RUNTIME=docker; stack_compose_up keycloak; echo "rc=$?") 2>&1)"
+HC_OUT="$( (PATH="$WORK/hcbin:$PATH"; CONTAINER_RUNTIME=docker; rt_up keycloak; echo "rc=$?") 2>&1)"
 case "$HC_OUT" in
   *"portcullis-keycloak-1 is unhealthy; its last health checks:"*"exit 1: a b"*"exit 1: bash: connect: Connection refused"*"exit -1: timed out"*"rc=1") t_pass "stack_compose_up: a failed up prints each unhealthy container's last three health checks" ;;
   *) t_fail "stack_compose_up health report: $HC_OUT" ;;
@@ -3491,7 +3514,7 @@ su_run() {
   printf '%s\n' "$4" > "$SU/tick"
   ( PATH="$WORK/subin:$PATH"; export SU STACK_UP_WAIT=30; CONTAINER_RUNTIME=docker
     sleep() { echo x >> "$SU/ticks"; bash "$SU/tick"; }
-    stack_compose_up keycloak; echo "rc=$?" ) 2>&1
+    rt_up keycloak; echo "rc=$?" ) 2>&1
   echo "ticks=$(wc -l < "$SU/ticks" | tr -d " ")"
   grep -E '^compose .* (up|build)( |$)' "$SU/calls" | sed 's/--project-directory [^ ]* //'
 }
@@ -3658,6 +3681,18 @@ case "$LUI" in *"ssh -N -L 17170:10.88.0.7:17170 "*) t_pass "lldap-ui on docker:
 expect_eq "lldap-ui on docker: no forwarder" "$(grep -c '^run ' "$STUB_DIR/lui-calls")" 0
 rm -f "$WORK/lui-root/.env"
 case "$(lui)" in *"not found. Run ./portcullis init first"*) t_pass "lldap-ui needs .env (need_env, the runtime check)" ;; *) t_fail "lldap-ui without .env" ;; esac
+# Kubernetes: a port-forward; no docker needed (a k3s host has none).
+mkdir -p "$WORK/luik/bin" "$WORK/luik/root"
+printf '#!/bin/sh\necho "kubectl $*" >> "%s"\n' "$WORK/luik/calls" > "$WORK/luik/bin/kubectl"; chmod +x "$WORK/luik/bin/kubectl"
+printf 'CONTAINER_RUNTIME=kubernetes\nPORTCULLIS_KUBE_CONTEXT=ci\n' > "$WORK/luik/root/.env"
+LUI="$( (unset CONTAINER_RUNTIME DOCKER_HOST COMPOSE_FILE _RT_CHECKED
+  export PATH="$WORK/luik/bin:$PATH" PORTCULLIS_ROOT="$WORK/luik/root"
+  bash -c 'for l in common network users; do . "$1/scripts/lib/$l.sh"; done
+    require_cmd() { [ "$1" != docker ] || { echo "REQUIRED docker"; exit 9; }; }
+    kube_runtime_check() { :; }; rt_running() { [ "$1" = lldap ]; }; cmd_lldap_ui' _ "$HERE/..") 2>&1; echo "rc=$?"; cat "$WORK/luik/calls" 2>/dev/null)"
+case "$LUI" in *"REQUIRED docker"*) t_fail "lldap-ui on kubernetes requires docker: $LUI" ;;
+  *"127.0.0.1:17170 (this server only)"*"rc=0"*"kubectl --context ci -n "*" port-forward --address 127.0.0.1 svc/lldap 17170:17170"*) t_pass "lldap-ui on kubernetes: a loopback port-forward, no docker needed" ;;
+  *) t_fail "lldap-ui on kubernetes: $LUI" ;; esac
 
 OUT="$(rt "$RT_HOST; id() { case \"\$1\" in -un) echo \"o'brien\" ;; *) command id \"\$@\" ;; esac; }; export STUB_UID_MAP=''; runtime_host_checks")"
 case "$OUT" in *"--add-subgids 100000-165535 'o'\\''brien', then podman system migrate"*) t_pass "runtime_host_checks: the usermod hint single-quotes the user" ;; *) t_fail "usermod hint: $(printf '%s' "$OUT" | grep subuid)" ;; esac
@@ -3665,9 +3700,9 @@ case "$OUT" in *"--add-subgids 100000-165535 'o'\\''brien', then podman system m
 # A restarted podman.socket leaves the proxies on a dead inode: up restarts
 # the unhealthy ones (podman only).
 expect_eq "runtime_proxies_refresh on podman: restarts the unhealthy proxy only" \
-  "$( (CONTAINER_RUNTIME=podman; container_health() { [ "$1" = socket-proxy-hub ] && echo unhealthy || echo healthy; }; dc() { echo "dc $*" >> "$WORK/prx-calls"; }; rm -f "$WORK/prx-calls"; runtime_proxies_refresh) 2>/dev/null; cat "$WORK/prx-calls")" "dc restart socket-proxy-hub"
+  "$( (CONTAINER_RUNTIME=podman; rt_health() { [ "$1" = socket-proxy-hub ] && echo unhealthy || echo healthy; }; dc() { echo "dc $*" >> "$WORK/prx-calls"; }; rm -f "$WORK/prx-calls"; runtime_proxies_refresh) 2>/dev/null; cat "$WORK/prx-calls")" "dc restart socket-proxy-hub"
 expect_eq "runtime_proxies_refresh on docker: nothing" \
-  "$( (CONTAINER_RUNTIME=docker; container_health() { echo unhealthy; }; dc() { echo "dc $*"; }; runtime_proxies_refresh) 2>/dev/null)" ""
+  "$( (CONTAINER_RUNTIME=docker; rt_health() { echo unhealthy; }; dc() { echo "dc $*"; }; runtime_proxies_refresh) 2>/dev/null)" ""
 
 # ══ vpn: ./portcullis vpn … (scripts/lib/vpn.sh, contract §16) ═══════
 # shellcheck source=../scripts/lib/vpn.sh
@@ -3690,14 +3725,14 @@ vt() {
     dc() {
       echo "dc $*" >> "$L"
       case "$*" in
-        "exec -T -u 10001:10001 hub hub vpn host-info")
+        "exec -T hub hub vpn host-info")
           [ "${VT_HUB_DOWN:-}" != 1 ] || return 1
           # VT_HUB_ANSWER_AFTER=n: the first n-1 calls fail (a Hub still starting).
           echo x >> "$WORK/vt/hostinfo-calls"
           [ "$(wc -l < "$WORK/vt/hostinfo-calls")" -ge "${VT_HUB_ANSWER_AFTER:-1}" ] || return 1
           printf '%s' "${VT_HOSTINFO:-$VT_HOSTINFO_DEFAULT}" ;;
         "exec -T wg /wg keypair") printf '{"private_key":"%s","public_key":"%s"}\n' "$VPN_PRIV" "$VPN_PUB" ;;
-        "exec -T -u 10001:10001 hub hub vpn add-device "*) cat >> "$WORK/vt/stdin"; echo '{"address":"10.213.0.5","server_public_key":"U2VydmVy","endpoint":"vpn.example.org:51820","allowed_ips":"10.213.0.1/32","dns":"10.213.0.1","mtu":1280}' ;;
+        "exec -T hub hub vpn add-device "*) cat >> "$WORK/vt/stdin"; echo '{"address":"10.213.0.5","server_public_key":"U2VydmVy","endpoint":"vpn.example.org:51820","allowed_ips":"10.213.0.1/32","dns":"10.213.0.1","mtu":1280}' ;;
         "exec -T wg /wg qr") cat >> "$WORK/vt/qr"; echo QR ;;
         "ps -q --status running wg") echo cid ;;
       esac
@@ -3715,7 +3750,7 @@ vt() {
     hub_env_write() { echo "hub_env_write" >> "$L"; }
     ct_group_read() { echo "ct_group_read $*" >> "$L"; }
     monitoring_fix_perms() { :; }
-    container_health() { echo "${VT_HUB_HEALTH:-healthy}"; }
+    rt_health() { echo "${VT_HUB_HEALTH:-healthy}"; }
     wait_healthy() { echo "wait_healthy $*" >> "$L"; }
     jq() { printf '%s\n' "$*" >> "$WORK/vt/jq"; command jq "$@"; }
     eval "$1"
@@ -3848,9 +3883,9 @@ expect_eq "vpn add-device: only the public key on the Hub's stdin" "$(cat "$WORK
 expect_eq "vpn add-device: the config has AllowedIPs = 10.213.0.1/32" \
   "$(printf '%s' "$OUT" | grep -cxE 'AllowedIPs = 10\.213\.0\.1/32|Address = 10\.213\.0\.5/32|DNS = 10\.213\.0\.1|PrivateKey = '"$VPN_PRIV"'|Endpoint = vpn\.example\.org:51820|MTU = 1280')" 6
 expect_eq "vpn add-device: the QR code is drawn from the same config on stdin" "$(grep -c '^PrivateKey = ' "$WORK/vt/qr"):$(printf '%s' "$OUT" | grep -cx QR)" "1:1"
-expect_eq "vpn add-device: the Hub call names the user and device" "$(grep -c '^dc exec -T -u 10001:10001 hub hub vpn add-device --user alice --name laptop$' "$WORK/vt/log")" 1
-expect_eq "vpn add-device: the Hub calls (host-info readiness, add-device) are hub vpn as uid 10001 (the Hub's control socket is 0600, its own)" \
-  "$(grep -c '^dc exec .*hub hub vpn' "$WORK/vt/log"):$(grep -c '^dc exec -T -u 10001:10001 hub hub vpn ' "$WORK/vt/log")" "2:2"
+expect_eq "vpn add-device: the Hub call names the user and device" "$(grep -c '^dc exec -T hub hub vpn add-device --user alice --name laptop$' "$WORK/vt/log")" 1
+expect_eq "vpn add-device: the Hub calls (host-info readiness, add-device) are hub vpn as the Hub container's own user, 10001 (no -u: the control socket is 0600, its own)" \
+  "$(grep -c '^dc exec .*hub hub vpn' "$WORK/vt/log"):$(grep -c '^dc exec -T hub hub vpn ' "$WORK/vt/log")" "2:2"
 # Every vpn subcommand that calls the Hub waits for it the same way
 # (_vpn_hub_wait): a starting Hub is waited for, a stopped one refused at
 # once — before wg makes a key pair.
@@ -3865,7 +3900,7 @@ done
 expect_eq "vpn.sh: host-info is read only through _vpn_hub_wait" \
   "$(grep -c '_vpn_host_info' "$HERE/../scripts/lib/vpn.sh"):$(sed -n '/^_vpn_hub_wait()/,/^}/p' "$HERE/../scripts/lib/vpn.sh" | grep -c '_vpn_host_info')" "3:1"
 expect_eq "vpn.sh: the Hub is reached only through _vpn_hub" \
-  "$(grep -cE 'exec [^|]*hub hub ' "$HERE/../scripts/lib/vpn.sh")" 1
+  "$(grep -cE 'exec [^|]*hub -- hub ' "$HERE/../scripts/lib/vpn.sh")" 1
 expect_ok "vpn add-device: keys stay in variables (no temp file, no -v mount)" bash -c "! grep -nE 'mktemp|> *\"?\\\$[a-z]*(key|kp)|--mount' <(sed -n '/^vpn_add_device()/,/^}/p' '$HERE/../scripts/lib/vpn.sh')"
 
 OUT="$(vt 'vpn_builtin on' 2>&1)"; RC=$?
@@ -3890,7 +3925,7 @@ SJ="$(vt 'export COMPOSE_PROFILES=wg PORTCULLIS_VPN_MODE=server; dc() { return 1
 expect_eq "vpn_status_json: mode server with wg down → a problem" "$(printf '%s' "$SJ" | jq -c '[.up, .problem]')" '[false,true]'
 SJ="$(vt 'dc() { return 1; }; vpn_status_json')"
 expect_eq "vpn_status_json: apps without wg → not set up, no problem" "$(printf '%s' "$SJ" | jq -c '[.enabled, .mode, .problem]')" '[false,"apps",false]'
-SJ="$( (require_cmd() { :; }; dc() { :; }; container_health() { echo healthy; }; kc_login() { return 1; }
+SJ="$( (require_cmd() { :; }; dc() { :; }; rt_health() { echo healthy; }; kc_login() { return 1; }
         proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
         vault_admin_env() { return 1; }; dns_status_json() { :; }
         vpn_status_json() { echo '{"enabled":true,"mode":"admin","public_enrol":true,"up":false,"providers":[],"problem":true}'; }
@@ -3905,6 +3940,826 @@ expect_eq "status textfile: apps → portcullis_vpn_mode_restricted 0" "$(stf | 
 expect_eq "keycloak.sh registers no headscale client" "$(grep -ciE 'headscale|headplane' "$HERE/../scripts/lib/keycloak.sh" || true)" 0
 expect_eq "backup has no headscale-config.yaml" "$(grep -c 'headscale' "$HERE/../scripts/lib/backup.sh" || true)" 0
 expect_eq "no headscale/ directory, nothing in the apps file" "$( [ -e "$HERE/../headscale" ] && echo dir || echo none):$(grep -ciE 'headscale|headplane' "$HERE/../docker-compose.apps.yml" || true)" "none:0"
+
+# ══ kubernetes runtime (scripts/lib/kube.sh) ══════════════
+# A kubectl stub with canned answers ($STUB_DIR/kube/*); every argv logged.
+KS="$WORK/kstub"; mkdir -p "$KS/bin" "$KS/kube"
+cat > "$KS/bin/kubectl" <<'KSTUB'
+#!/usr/bin/env bash
+# kubectl stub: canned answers from $STUB_DIR/kube/, every argv logged.
+K="$STUB_DIR/kube"
+printf '%s\n' "$*" >> "$STUB_DIR/kubectl-calls"
+args=("$@")
+if [ "${1:-}" = config ]; then
+  [ "$2 $3 $4" = "get-contexts -o name" ] && { cat "$K/contexts" 2>/dev/null; exit 0; }
+  exit 1
+fi
+[ "${1:-}" = --context ] || { echo "stub: no --context" >&2; exit 97; }
+shift 2
+ns=""
+if [ "${1:-}" = -n ]; then ns="$2"; shift 2; fi
+case "$*" in
+  "version -o json") cat "$K/version.json" ;;
+  "auth whoami -o json") [ -z "${STUB_WHOAMI_FAIL:-}" ] || exit 1; echo '{"status":{"userInfo":{"username":"system:admin"}}}' ;;
+  "get nodes -o json") cat "$K/nodes.json" ;;
+  "create --dry-run=server -f -") cat >/dev/null; cat "$K/svc-dryrun.err" >&2; exit 1 ;;
+  "get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o json") cat "$K/eps.json" ;;
+  "get --raw /api/v1/nodes/"*"/proxy/configz") cat "$K/configz.json" 2>/dev/null || exit 1 ;;
+  "get services -A -o json") [ ! -e "$K/svcs.fail" ] || { echo 'Error from server (Forbidden)' >&2; exit 1; }; cat "$K/svcs.json" 2>/dev/null || echo '{"items":[]}' ;;
+  "get service traefik -o json") cat "$K/traefik-svc.json" 2>/dev/null || { echo 'Error from server (NotFound)' >&2; exit 1; } ;;
+  "get namespace "*" -o json")
+    n="${3}"; [ -f "$K/ns-$n.json" ] && { cat "$K/ns-$n.json"; exit 0; }
+    echo "Error from server (NotFound): namespaces \"$n\" not found" >&2; exit 1 ;;
+  "get namespace "*)
+    n="${3}"; [ -f "$K/ns-$n.json" ] && exit 0
+    echo "Error from server (NotFound): namespaces \"$n\" not found" >&2; exit 1 ;;
+  "apply --server-side"*" -f -") cat >> "$STUB_DIR/kubectl-stdin"; echo --- >> "$STUB_DIR/kubectl-stdin"; [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
+  "apply --server-side"*" -f "*)
+    all="$*"; f="${all##* -f }"
+    [ -z "${STUB_APPLY_FAIL_MATCH:-}" ] || case "$f" in *"$STUB_APPLY_FAIL_MATCH"*) echo "stub: apply of $f refused" >&2; exit 1 ;; esac
+    [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1
+    case "$f" in *bindings.json)
+      [ -z "${STUB_BINDINGS_FAIL:-}" ] || { echo "stub: bindings refused" >&2; exit 1; }
+      mkdir -p "$STUB_DIR/live"
+      for b in $(jq -r '.items[].metadata.name' "$f"); do
+        jq --arg b "$b" '.items[] | select(.metadata.name == $b)' "$f" > "$STUB_DIR/live/Binding.$b.json"
+      done
+      printf 'apply bindings %s\n' "$(jq -r '.items[0].metadata.labels["portcullis.io/params-generation"]' "$f")" >> "$STUB_DIR/order" ;;
+    esac ;;
+  "create secret generic "*" --dry-run=client -o json"|"create configmap "*" --dry-run=client -o json")
+    # The object as kubectl builds it: Secret data base64, ConfigMap data text.
+    if [ "$2" = secret ]; then kind=Secret n="$4"; else kind=ConfigMap n="$3"; fi
+    printf 'create %s %s\n' "$kind" "$n" >> "$STUB_DIR/order"
+    all="$*"; d="${all##*--from-file=}"; d="${d%% *}"
+    data='{}'
+    for f in "$d"/*; do
+      [ -f "$f" ] || continue
+      if [ "$kind" = Secret ]; then v="$(base64 < "$f" | tr -d '\n')"; else v="$(cat "$f")"; fi
+      data="$(printf '%s' "$data" | FK="${f##*/}" FV="$v" jq -c '.[env.FK] = env.FV')"
+    done
+    printf '%s' "$data" | KIND="$kind" N="$n" jq '{apiVersion: "v1", kind: env.KIND, metadata: {name: env.N, namespace: "portcullis"}, data: .}' ;;
+  "get -f "*" -o name")
+    lk="$(jq -r .kind "$3").$(jq -r .metadata.name "$3")"
+    [ -e "$STUB_DIR/live/$lk.json" ] || { echo "Error from server (NotFound)" >&2; exit 1; }
+    echo "$lk" ;;
+  "replace --field-manager="*" -f "*|"create --field-manager="*" -f "*)
+    all="$*"; f="${all##* -f }"
+    lk="$(jq -r .kind "$f").$(jq -r .metadata.name "$f")"
+    printf 'put %s %s\n' "$1" "$lk" >> "$STUB_DIR/order"
+    cat "$f" >> "$STUB_DIR/kubectl-stdin"; echo --- >> "$STUB_DIR/kubectl-stdin"
+    [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1
+    mkdir -p "$STUB_DIR/live"; cp "$f" "$STUB_DIR/live/$lk.json" ;;
+  "create -f "*"bindings.yaml --dry-run=client -o json")
+    python3 -c 'import json, sys, yaml; [print(json.dumps(d)) for d in yaml.safe_load_all(open(sys.argv[1])) if d]' "$3" ;;
+  "get validatingadmissionpolicybinding -l portcullis.io/binding,portcullis.io/params-generation!="*" -o name")
+    g="${4##*!=}"
+    for b in "$STUB_DIR"/live/Binding.*.json; do [ -e "$b" ] || continue
+      [ "$(jq -r '.metadata.labels["portcullis.io/params-generation"]' "$b")" = "$g" ] || echo "validatingadmissionpolicybinding.admissionregistration.k8s.io/$(jq -r .metadata.name "$b")"
+    done ;;
+  "get validatingadmissionpolicybinding -l portcullis.io/binding -o json")
+    set -- "$STUB_DIR"/live/Binding.*.json
+    if [ -e "$1" ]; then jq -s '{items: .}' "$@"; else echo '{"items":[]}'; fi ;;
+  "delete validatingadmissionpolicybinding"*)
+    for a in "$@"; do case "$a" in validatingadmissionpolicybinding.*/*) rm -f "$STUB_DIR/live/Binding.${a##*/}.json"; printf 'delete binding %s\n' "${a##*/}" >> "$STUB_DIR/order" ;; esac; done ;;
+  "get configmap -l app.kubernetes.io/managed-by=portcullis,portcullis.io/params-generation,portcullis.io/params-generation!="*" -o json")
+    g="${4##*!=}"; out='[]'
+    for c in "$STUB_DIR"/live/ConfigMap.portcullis-admission-params-*.json; do [ -e "$c" ] || continue
+      [ "$(jq -r '.metadata.labels["portcullis.io/params-generation"]' "$c")" = "$g" ] || out="$(jq -c --slurpfile c "$c" '. + $c' <<< "$out")"
+    done; jq '{items: .}' <<< "$out" ;;
+  "annotate configmap "*) c="$STUB_DIR/live/ConfigMap.$3.json"; v="${4#*=}"; jq --arg v "$v" '.metadata.annotations["portcullis.io/orphaned-at"] = $v' "$c" > "$c.t" && mv "$c.t" "$c"; printf 'stamp %s\n' "$3" >> "$STUB_DIR/order" ;;
+  "delete configmap portcullis-admission-params-"*) rm -f "$STUB_DIR/live/ConfigMap.$3.json"; printf 'delete params %s\n' "$3" >> "$STUB_DIR/order" ;;
+  "get ingressroutes.traefik.io -l portcullis.io/owner=hub -o json") cat "$K/edge-hub-ir.json" 2>/dev/null || echo '{"items":[]}' ;;
+  "get middlewares.traefik.io -l portcullis.io/owner=hub -o json") echo '{"items":[]}' ;;
+  "--as=system:serviceaccount:portcullis:portcullis-hub --as-group=system:masters replace --dry-run=server -f -")
+    in="$(cat)"; case "$in" in *REFUSE-ME*) echo "ValidatingAdmissionPolicy 'portcullis-edge-routes' with binding 'portcullis-edge-guard-routes-x' denied request: a route on a reserved core hostname" >&2; exit 1 ;; esac ;;
+  "delete ingressroutes.traefik.io "*) printf 'delete ir %s\n' "$3" >> "$STUB_DIR/order" ;;
+  "--as=system:serviceaccount:portcullis:portcullis-hub --as-group=system:masters create --dry-run=server -f -")
+    in="$(cat)"
+    g="$(printf '%s' "$in" | jq -r '.metadata.annotations["portcullis.io/params-generation"] // ""')"
+    k="$(printf '%s' "$in" | jq -r .kind)"
+    case "$k:$ns" in
+      Pod:*) b=portcullis-apps-guard-pods ;; Deployment:*) b=portcullis-apps-guard-workloads ;; Service:*) b=portcullis-apps-guard-services ;;
+      NetworkPolicy:*) b=portcullis-apps-guard-netpol ;; IngressRoute:"${STUB_APPS_NS:-portcullis-apps}") b=portcullis-apps-guard-traefik ;; *) b=portcullis-edge-guard-routes ;;
+    esac
+    printf 'probe %s\n' "${g:+$b}" >> "$STUB_DIR/order"
+    if [ -n "$g" ]; then
+      if [ -z "${STUB_PROBE_STALE:-}" ] && [ "${STUB_PROBE_STALE_BINDING:-}" != "$b" ] && [ -e "$STUB_DIR/live/Binding.$b-$g.json" ] && [ -e "$STUB_DIR/live/ConfigMap.portcullis-admission-params-$g.json" ]; then
+        echo "ValidatingAdmissionPolicy 'x' with binding '$b-$g' denied request: admission probe: params generation $g in effect" >&2
+      else echo "denied request: failed to configure binding: no params found" >&2; fi
+      exit 1
+    fi
+    case "$in" in *'Host(`portcullis-admission-probe.'*) exit 0 ;; esac
+    echo "ValidatingAdmissionPolicy 'portcullis-edge-routes' with binding 'portcullis-edge-guard-routes-x' denied request: a route on a reserved core hostname" >&2; exit 1 ;;
+  "get secrets -o json"|"get configmaps -o json")
+    case "$ns" in
+      portcullis)
+        [ -z "${STUB_LIVE_LIST_FAIL:-}" ] || { echo "Error from server (Forbidden)" >&2; exit 1; }
+        lk=Secret; [ "$2" = configmaps ] && lk=ConfigMap
+        set -- "$STUB_DIR"/live/"$lk".*.json
+        if [ -e "$1" ]; then jq -s '{items: .}' "$@"; else echo '{"items":[]}'; fi ;;
+      portcullis-edge) cat "$K/edge-secrets.json" 2>/dev/null || echo '{"items":[]}' ;;
+      *) cat "$K/apps-secrets.json" 2>/dev/null || echo '{"items":[]}' ;;
+    esac ;;
+  "create secret generic "*" --dry-run=client -o yaml"|"create configmap "*" --dry-run=client -o yaml")
+    if [ "$2" = secret ]; then kn="secret $4"; else kn="configmap $3"; fi
+    printf 'create %s\n' "$kn" >> "$STUB_DIR/order"
+    all="$*"; d="${all##*--from-file=}"; d="${d%% *}"
+    printf 'apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\ndata:\n' "${kn#* }"
+    for f in "$d"/*; do printf '  %s: %s\n' "${f##*/}" "$(head -c 200 "$f" | head -n1)"; done ;;
+  "apply -f -") cat >> "$STUB_DIR/kubectl-stdin"; [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
+  "apply -f "*) [ -z "${STUB_APPLY_FAIL:-}" ] || exit 1 ;;
+  "exec client-allowed -- nc"*) exit "${STUB_DIAL_ALLOWED:-0}" ;;
+  "exec -i deploy/wg -c wg -- /wg keypair") printf '{"private_key":"%s","public_key":"%s"}\n' "${STUB_WG_PRIV:-cHJpdg==}" "${STUB_WG_PUB:-cHVi}" ;;
+  "get pods -l portcullis.io/component=hub -o json"|"get pods -l portcullis.io/component=wg -o json") echo '{"items":[{"status":{"phase":"Running","containerStatuses":[{"ready":true,"started":true}]},"spec":{"containers":[{"readinessProbe":{}}]}}]}' ;;
+  # _rtk_health / _rtk_wait_ready: every Deployment rolled out, its pod Running.
+  "get deploy "*" -o json") echo '{"metadata":{"generation":1},"spec":{"replicas":1},"status":{"observedGeneration":1,"replicas":1,"updatedReplicas":1}}' ;;
+  "get pods -l portcullis.io/component="*" -o json") echo '{"items":[{"status":{"phase":"Running","containerStatuses":[{"ready":true,"started":true}]},"spec":{"containers":[{"readinessProbe":{}}]}}]}' ;;
+  "get pods -o json") cat "$K/pods.json" 2>/dev/null || echo '{"items":[]}' ;;
+  "get events --field-selector "*) echo '{"items":[{"reason":"BackOff","message":"Back-off restarting failed container"}]}' ;;
+  "get deployments -l portcullis.io/person-secrets -o json")
+    [ -z "${STUB_PS_LIST_FAIL:-}" ] || exit 1
+    if [ -n "${STUB_PS_NONE:-}" ]; then echo '{"items":[]}'; else echo '{"items":[{"metadata":{"labels":{"portcullis.io/instance":"samba"}}}]}'; fi ;;
+  "create -f -") cat >> "$STUB_DIR/kubectl-stdin"; echo --- >> "$STUB_DIR/kubectl-stdin"; printf 'create pod\n' >> "$STUB_DIR/order" ;;
+  "wait --for=jsonpath={.status.phase}=Succeeded pod/"*) printf 'wait %s\n' "$3" >> "$STUB_DIR/order"; exit "${STUB_WAIT_RC:-0}" ;;
+  "wait --for=condition=Ready pod/keygen-"*) printf 'wait %s\n' "$3" >> "$STUB_DIR/order"; exit "${STUB_WAIT_RC:-0}" ;;
+  "logs pod/keygen-"*) printf 'logs\n' >> "$STUB_DIR/order"; printf '# public key: age1kube\nAGE-SECRET-KEY-1KUBEQQQQ\n' ;;
+  "exec keygen-"*" -c keygen -- sh -c "*"cat /k/key") printf 'exec cat\n' >> "$STUB_DIR/order"; printf '# public key: age1kube\nAGE-SECRET-KEY-1KUBEQQQQ\n' ;;
+  "get pod keygen-"*" -o json") echo '{"status":{"phase":"Pending","containerStatuses":[{"name":"keygen","state":{"waiting":{"reason":"ErrImagePull","message":"failed to pull localhost/portcullis-domains@sha256:abc"}}}],"conditions":[{"type":"Ready","status":"False","reason":"ContainersNotReady"}]}}' ;;
+  "scale "*|"patch "*|"annotate "*|"rollout "*|"wait "*) printf 'kubectl %s %s\n' "$ns" "$*" >> "$STUB_DIR/order" ;;
+  "run "*) printf 'kubectl run\n' >> "$STUB_DIR/order"; cat >/dev/null; exit "${STUB_RUN_RC:-0}" ;;
+  "create --dry-run=client -o json -f -") cat >/dev/null; printf '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"oneshot"},"spec":{"containers":[{"name":"x","image":"ghcr.io/porelli/portcullis-hub@sha256:%064d","command":["/usr/local/bin/hub"]}]}}\n' 1 ;;
+  "exec client-ingress -- nc"*) exit "${STUB_DIAL_INGRESS:-1}" ;;
+  "exec client-egress -- nc"*) exit "${STUB_DIAL_EGRESS:-1}" ;;
+  "get pod server -o jsonpath={.status.podIP}") echo 10.42.0.9 ;;
+  *) [ -n "${STUB_KUBE_SCRIPT:-}" ] && . "$STUB_KUBE_SCRIPT" ;;
+esac
+exit 0
+KSTUB
+cat > "$KS/bin/helm" <<'HSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_DIR/helm-calls"
+printf 'helm %s\n' "$*" >> "$STUB_DIR/order"
+case "$*" in
+  *" template "*"--show-only templates/oneshot.yaml"*) printf 'apiVersion: v1\nkind: Pod\nmetadata:\n  name: oneshot\nspec:\n  containers:\n    - name: x\n      image: ghcr.io/porelli/portcullis-hub@sha256:%064d\n      command: ["/usr/local/bin/hub"]\n' 1 ;;
+  *" upgrade --install "*) [ -z "${STUB_HELM_FAIL:-}" ] || { echo "Error: context deadline exceeded" >&2; exit 1; } ;;
+esac
+exit 0
+HSTUB
+chmod +x "$KS/bin/kubectl" "$KS/bin/helm"
+k_fixtures() {
+  rm -rf "$KS/kube" "$KS/kubectl-calls" "$KS/kubectl-stdin" "$KS/live"; mkdir -p "$KS/kube"
+  printf 'ci\nother\n' > "$KS/kube/contexts"
+  echo '{"serverVersion":{"gitVersion":"v1.37.2+k3s1"}}' > "$KS/kube/version.json"
+  cat > "$KS/kube/nodes.json" <<'J'
+{"items":[{"metadata":{"name":"node1","annotations":{"k3s.io/node-args":"[\"server\",\"--disable\",\"traefik\",\"--secrets-encryption\",\"--kubelet-arg\",\"pod-max-pids=1024\",\"--node-external-ip\",\"198.51.100.1\"]"}},
+  "spec":{"podCIDR":"10.42.0.0/24","podCIDRs":["10.42.0.0/24"]},
+  "status":{"addresses":[{"type":"InternalIP","address":"10.1.0.4"},{"type":"ExternalIP","address":"198.51.100.1"}]}}]}
+J
+  echo 'The Service "portcullis-cidr-probe" is invalid: spec.clusterIPs: Invalid value: []string{"0.0.0.1"}: failed to allocate IP 0.0.0.1: the provided IP (0.0.0.1) is not in the valid range. The range of valid IPs is 10.43.0.0/16' > "$KS/kube/svc-dryrun.err"
+  echo '{"items":[{"ports":[{"port":6443}],"endpoints":[{"addresses":["10.1.0.4"]}]}]}' > "$KS/kube/eps.json"
+  echo '{"kubeletconfig":{"podPidsLimit":1024}}' > "$KS/kube/configz.json"
+}
+# kt <code> — run code with the libs, CONTAINER_RUNTIME=kubernetes and the stub.
+kt() {
+  ( export STUB_DIR="$KS" PATH="$KS/bin:$PATH" CONTAINER_RUNTIME=kubernetes PORTCULLIS_KUBE_CONTEXT=ci \
+      PORTCULLIS_POD_CIDR=10.42.0.0/24 PORTCULLIS_SERVICE_CIDR=10.43.0.0/16 PORTCULLIS_KUBE_API_ENDPOINTS=10.1.0.4:6443 \
+      PORTCULLIS_KUBE_INSTALL_ID=0b0e2b3c-1111-4222-8333-444455556666 KUBE_LOCAL_ADDRS="10.1.0.4 198.51.100.1" \
+      PORTCULLIS_PUBLIC_IPV4=198.51.100.1 KUBE_TCP_PROBE=false PORTCULLIS_DOMAIN=k.example.org
+    unset _RT_CHECKED _RT_HOST_OK
+    ( eval "$1" ); echo "rc=$?" ) 2>&1
+}
+
+# The cluster check's refresh (final review I4): `kube check`, the
+# portcullis-kube-check.timer init installs (every 6 h), status at 20 / 24 h.
+KCT="$WORK/kct"; rm -rf "$KCT"; mkdir -p "$KCT/bin"
+printf '#!/bin/sh\n[ "$1 $2" = "cat k3s.service" ] && exit "${STUB_K3S_UNIT_RC:-0}"\nexit 0\n' > "$KCT/bin/systemctl"; chmod +x "$KCT/bin/systemctl"
+OUT="$(kt "PATH='$KCT/bin':\$PATH; KUBECONFIG=/home/op/.kube/config; kube_check_timer_units '$KCT/u'; cat '$KCT/u/portcullis-kube-check.service' '$KCT/u/portcullis-kube-check.timer'")"
+expect_eq "kube check timer: a oneshot as the operator after (and requiring) k3s.service, running kube check, with KUBECONFIG" \
+  "$(printf '%s\n' "$OUT" | grep -cE '^(Type=oneshot|User=.+|After=network-online.target k3s.service|Requires=k3s.service|Environment=KUBECONFIG=/home/op/.kube/config|ExecStart=.*/portcullis kube check)$')" 6
+expect_eq "kube check timer: every 6 h, persistent, timers.target" \
+  "$(printf '%s\n' "$OUT" | grep -cE '^(OnCalendar=\*-\*-\* 00/6:00:00|Persistent=true|WantedBy=timers.target)$')" 3
+OUT="$(kt "PATH='$KCT/bin':\$PATH; export STUB_K3S_UNIT_RC=1; unset KUBECONFIG; kube_check_timer_units '$KCT/v'; cat '$KCT/v/portcullis-kube-check.service'")"
+expect_eq "kube check timer: no k3s.service on this host (a remote cluster) → no k3s dependency, no KUBECONFIG line" \
+  "$(printf '%s\n' "$OUT" | grep -cE 'k3s.service|KUBECONFIG' || true):$(printf '%s\n' "$OUT" | grep -c '^After=network-online.target$')" "0:1"
+OUT="$(kt "PATH='$KCT/bin':\$PATH; KUBE_SYSTEMD_RUN='$KCT/none'; kube_check_timer_install")"
+case "$OUT" in *"No systemd: run ./portcullis kube check at least every 20 h"*"rc=0") t_pass "kube check timer: no systemd → a warning naming the 20 h, init goes on" ;; *) t_fail "kube timer no systemd: $OUT" ;; esac
+expect_eq "init on kubernetes installs the kube check timer" "$(sed -n '/^init_run() {/,/^}/p' "$HERE"/../scripts/lib/stack.sh | grep -c '_rt_is_kube || kube_check_timer_install')" 1
+# status: fresh ok, 21 h a warning, 25 h / failed / missing a problem.
+ckl() { kt "KUBE_NOW=$2; kube_ctl() { case \"\$*\" in *'get configmap portcullis-cluster-check -o json'*) $1 ;; esac; }; kube_cluster_check_lines \"\$(kube_cluster_check_json)\""; }
+CKD='{"data":{"checked_at":"2026-11-14T00:00:00Z","ok":"true","why":""}}'
+T0=1794614400   # 2026-11-14T00:00:00Z
+expect_eq "status: a cluster check 1 h old → ok" "$(ckl "echo '$CKD'" $((T0 + 3600)) | tr -d '\033' | sed 's/\[[0-9;]*m//g' | tr '\n' ' ')" "  ✓ kubernetes: cluster check ok (1 h old) rc=0 "
+OUT="$(ckl "echo '$CKD'" $((T0 + 21 * 3600)))"
+case "$OUT" in *"kubernetes: the cluster check is 21 h old: the Hub refuses every runtime operation once it is 24 h old"*"rc=0") t_pass "status: a cluster check 21 h old → a warning, not a problem" ;; *) t_fail "status check 21 h: $OUT" ;; esac
+OUT="$(ckl "echo '$CKD'" $((T0 + 25 * 3600)))"
+case "$OUT" in *"✗"*"the cluster check is 25 h old: the Hub refuses every runtime operation past 24 h"*"rc=1") t_pass "status: a cluster check 25 h old → a problem" ;; *) t_fail "status check 25 h: $OUT" ;; esac
+OUT="$(ckl "echo '{\"data\":{\"checked_at\":\"2026-11-14T00:00:00Z\",\"ok\":\"false\",\"why\":\"bindings missing: x\"}}'" $((T0 + 60)))"
+case "$OUT" in *"the cluster check failed (bindings missing: x)"*"rc=1") t_pass "status: a failed cluster check → a problem naming why" ;; *) t_fail "status check failed: $OUT" ;; esac
+OUT="$(ckl "return 1" $T0)"
+case "$OUT" in *"no cluster check (ConfigMap portcullis-cluster-check)"*"rc=1") t_pass "status: no readable cluster check → a problem" ;; *) t_fail "status check missing: $OUT" ;; esac
+OUT="$(ckl "echo '{\"data\":{\"checked_at\":\"yesterday\",\"ok\":\"true\"}}'" $T0)"
+case "$OUT" in *"rc=1") t_pass "status: an unparseable checked_at counts as too old" ;; *) t_fail "status check bad time: $OUT" ;; esac
+expect_eq "status counts the cluster check (kube_cluster_check_lines) towards problems" "$(sed -n '/^status_run() {/,/^}/p' "$HERE"/../scripts/lib/status.sh | grep -c 'kube_cluster_check_lines .* || problems=1')" 1
+# kube check: kube_cluster_check's verdict decides the exit status.
+OUT="$(kt "kube_psa() { echo 'privileged baseline baseline'; }; kube_bindings_missing() { echo 'binding x missing'; }; kube_ctl() { case \"\$*\" in *'get namespace'*) echo '{\"metadata\":{\"labels\":{\"pod-security.kubernetes.io/enforce\":\"privileged\",\"pod-security.kubernetes.io/warn\":\"baseline\",\"pod-security.kubernetes.io/audit\":\"baseline\"}}}' ;; *apply*) cat > '$KCT/applied' ;; esac; }; kube_cluster_check 2>/dev/null; echo \"why=\$_K_CHECK_WHY\"; jq -r '.data.ok' '$KCT/applied'")"
+expect_eq "kube_cluster_check: a missing binding → recorded for the Hub (ok false) and for kube check's exit status" "$(printf '%s\n' "$OUT" | head -n2 | tr '\n' ' ')" "why=binding x missing false "
+expect_eq "cmd_kube check exits 1 on a failed check" "$(sed -n '/^cmd_kube() {/,/^}/p' "$HERE"/../scripts/lib/kube.sh | grep -c '\[ -z "\$_K_CHECK_WHY" \] || exit 1')" 1
+# No CLI path deletes the apps or edge namespace (only the probe's own): the
+# apps policies judge DELETE by the old object, and the namespace controller
+# isn't exempt, so such a path would first have to delete the owner=core
+# objects there as the CLI identity (ruling) — add that ordering with it.
+expect_eq "the CLI deletes no namespace but the NetworkPolicy probe's" \
+  "$(grep -rn 'delete namespace\|delete ns ' "$HERE"/../scripts/lib "$HERE"/../portcullis | grep -v '^[^:]*:[0-9]*: *#' | grep -vc 'KUBE_PROBE_NS' || true)" 0
+# The AppArmor stacking host check (containerd#14485 / k3s#13625): with
+# kernel.apparmor_restrict_unprivileged_unconfined=1 and containerd's
+# profile in use, signals inside containers are denied (Postgres never
+# finishes starting): refused, naming both ways out; never changed by us.
+AA="$WORK/aa"; mkdir -p "$AA/sys" "$AA/sec"
+LOCALNODE='{"items":[{"status":{"addresses":[{"type":"InternalIP","address":"10.1.0.4"}]}}]}'
+REMOTENODE='{"items":[{"status":{"addresses":[{"type":"InternalIP","address":"192.0.2.9"}]}}]}'
+aa() { # aa <sysctl value|-> <apparmor enabled Y|N> <profiles text|-> [node json]
+  rm -f "$AA/sys/x" "$AA/sec/profiles"; [ "$1" = - ] || echo "$1" > "$AA/sys/x"
+  echo "$2" > "$AA/enabled"; [ "$3" = - ] || printf '%s\n' "$3" > "$AA/sec/profiles"
+  kt "KUBE_AA_SYSCTL='$AA/sys/x' KUBE_AA_ENABLED='$AA/enabled' KUBE_AA_PROFILES='$AA/sec/profiles'; _kube_apparmor_check '${4:-$LOCALNODE}'"
+}
+OUT="$(aa 1 Y 'cri-containerd.apparmor.d (enforce)')"
+case "$OUT" in "fail	"*"apparmor_restrict_unprivileged_unconfined=1"*"containerd#14485"*"k3s#13625"*"sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0"*"relaxes"*"a k3s with the fix"*) t_pass "AppArmor check: sysctl 1 + containerd's profile → fail naming the cause and both options" ;; *) t_fail "aa 1: $OUT" ;; esac
+case "$(aa 1 Y -)" in "fail	"*) t_pass "AppArmor check: sysctl 1, profiles unreadable → fail (fail closed)" ;; *) t_fail "aa unreadable: $(aa 1 Y -)" ;; esac
+case "$(aa 0 Y 'cri-containerd.apparmor.d (enforce)')" in "ok	"*"= 0"*) t_pass "AppArmor check: sysctl 0 → ok, the value shown" ;; *) t_fail "aa 0: $(aa 0 Y x)" ;; esac
+case "$(aa - Y 'cri-containerd.apparmor.d (enforce)')" in "ok	"*"not on this kernel"*) t_pass "AppArmor check: no such sysctl → ok" ;; *) t_fail "aa none" ;; esac
+case "$(aa 1 N -)" in "ok	"*"AppArmor off"*) t_pass "AppArmor check: AppArmor off → ok" ;; *) t_fail "aa off: $(aa 1 N -)" ;; esac
+case "$(aa 1 Y 'docker-default (enforce)')" in "warn	"*"loaded yet"*) t_pass "AppArmor check: containerd's profile not loaded yet → warn" ;; *) t_fail "aa notloaded: $(aa 1 Y 'docker-default (enforce)')" ;; esac
+case "$(aa 1 Y 'cri-containerd.apparmor.d (enforce)' "$REMOTENODE")" in "warn	"*"isn't this host"*) t_pass "AppArmor check: a remote node → warn (checked there)" ;; *) t_fail "aa remote" ;; esac
+expect_eq "AppArmor check: the CLI never writes the sysctl (only the CI install script may)" \
+  "$(grep -n 'apparmor_restrict_unprivileged_unconfined=0' "$HERE"/../scripts/lib/*.sh "$HERE"/../portcullis | grep -v '_rt_chk\|#' | grep -c 'sysctl -w\|tee\|> */proc' || true)" 0
+expect_eq "AppArmor check runs in kube_host_checks (init / up refuse on fail; status shows it)" "$(sed -n '/^kube_host_checks() {/,/^}/p' "$HERE"/../scripts/lib/kube.sh | grep -c '_kube_apparmor_check')" 1
+# _rtk_health: a rolling Deployment is "starting" (the old pod's readiness
+# isn't the new config's); otherwise the newest non-terminating pod decides.
+RH_POD='{"status":{"phase":"Running","containerStatuses":[{"ready":%s,"started":true}]},"spec":{"containers":[{"readinessProbe":{}}]},"metadata":{"creationTimestamp":"%s"%s}}'
+rh() { # rh <deploy json> <pods json>
+  kt "kube_ctl() { case \"\$*\" in *'get deploy keycloak'*) printf '%s' '$1' ;; *'get pods'*) printf '%s' '{\"items\":$2}' ;; esac; }; _rtk_health keycloak"
+}
+RH_OLD="$(printf "$RH_POD" true 2026-01-01T00:00:00Z '')" RH_NEW="$(printf "$RH_POD" false 2026-01-01T00:01:00Z '')"
+RH_GONE="$(printf "$RH_POD" true 2026-01-01T00:02:00Z ',"deletionTimestamp":"2026-01-01T00:03:00Z"')"
+expect_eq "_rtk_health: a Deployment not yet observed at its generation → starting (not the old pod's ready)" \
+  "$(rh '{"metadata":{"generation":3},"spec":{"replicas":1},"status":{"observedGeneration":2,"replicas":1,"updatedReplicas":1}}' "[$RH_OLD]")" "starting
+rc=0"
+expect_eq "_rtk_health: old and new ReplicaSet pods both counted → starting" \
+  "$(rh '{"metadata":{"generation":3},"spec":{"replicas":1},"status":{"observedGeneration":3,"replicas":2,"updatedReplicas":1}}' "[$RH_OLD,$RH_NEW]")" "starting
+rc=0"
+expect_eq "_rtk_health: rolled out → the newest pod decides, a terminating one ignored" \
+  "$(rh '{"metadata":{"generation":3},"spec":{"replicas":1},"status":{"observedGeneration":3,"replicas":1,"updatedReplicas":1}}' "[$RH_GONE,$RH_OLD,$RH_NEW]")" "unhealthy
+rc=0"
+expect_eq "_rtk_health: rolled out and ready → healthy" \
+  "$(rh '{"metadata":{"generation":3},"spec":{"replicas":1},"status":{"observedGeneration":3,"replicas":1,"updatedReplicas":1}}' "[$RH_OLD]")" "healthy
+rc=0"
+expect_eq "_rtk_health: no Deployment → missing" "$(kt "kube_ctl() { return 1; }; _rtk_health keycloak")" "missing
+rc=0"
+# _rtk_exec: kubectl's own "command terminated with exit code N" never
+# reaches the caller; the command's stderr and exit code do.
+expect_eq "_rtk_exec: an empty Vault list on kubernetes is the bare {} with exit 2 (vault_no_value accepts it)" \
+  "$(kt "kube_ctl() { echo '{}' >&2; echo 'command terminated with exit code 2' >&2; return 2; }; out=\$(_rtk_exec vault -- vault list x 2>&1) || echo \"rc \$?\"; printf '%s|' \"\$out\"; vault_no_value \"\$out\" && echo no-value")" "rc 2
+{}|no-value
+rc=0"
+# _rtk_wait_ready waits on _rtk_rolled_running (rollout-aware, phase
+# Running whatever the probes say), never on a pod list.
+expect_eq "_rtk_wait_ready: not yet, not yet, then rolled out and Running → done" \
+  "$(rm -f "$WORK/rwr"; kt "sleep() { :; }; _rtk_rolled_running() { echo . >> '$WORK/rwr'; [ \$(wc -l < '$WORK/rwr') -ge 3 ]; }; _rtk_wait_ready keycloak; echo \"after \$(wc -l < '$WORK/rwr' | tr -d ' ')\"")" "after 3
+rc=0"
+expect_eq "_rtk_wait_ready: never rolled out within KUBE_READY_WAIT → fails" \
+  "$(kt "KUBE_READY_WAIT=4; sleep() { :; }; _rtk_rolled_running() { return 1; }; _rtk_wait_ready keycloak")" "rc=1"
+RR_DEP='{"metadata":{"generation":2},"spec":{"replicas":1},"status":{"observedGeneration":2,"replicas":1,"updatedReplicas":1}}'
+rr() { kt "kube_ctl() { case \"\$*\" in *'get deploy vault'*) printf '%s' '$1' ;; *'get pods'*) printf '%s' '{\"items\":$2}' ;; esac; }; _rtk_rolled_running vault && echo yes || echo no"; }
+expect_eq "_rtk_rolled_running: an unstarted (sealed) Vault pod in phase Running counts (the old wait's semantics)" \
+  "$(rr "$RR_DEP" '[{"status":{"phase":"Running","containerStatuses":[{"ready":false,"started":false}]},"metadata":{"creationTimestamp":"2026-01-01T00:00:00Z"}}]')" "yes
+rc=0"
+expect_eq "_rtk_rolled_running: Pending → not yet" \
+  "$(rr "$RR_DEP" '[{"status":{"phase":"Pending"},"metadata":{"creationTimestamp":"2026-01-01T00:00:00Z"}}]')" "no
+rc=0"
+expect_eq "_rtk_rolled_running: a rollout in progress → not yet, though the old pod runs" \
+  "$(rr '{"metadata":{"generation":3},"spec":{"replicas":1},"status":{"observedGeneration":3,"replicas":2,"updatedReplicas":1}}' '[{"status":{"phase":"Running"},"metadata":{"creationTimestamp":"2026-01-01T00:00:00Z"}}]')" "no
+rc=0"
+case "$(declare -f _rtk_wait_ready _kube_wait_running 2>/dev/null; sed -n '/^_rtk_wait_ready()/,/^}/p;/^_kube_wait_running()/p' "$HERE/../scripts/lib/kube.sh")" in
+  *"wait --for"*) t_fail "_rtk_wait_ready / _kube_wait_running use kubectl wait on a pod list" ;; *) t_pass "_rtk_wait_ready / _kube_wait_running: no kubectl wait on a pod list" ;; esac
+k_fixtures
+OUT="$(kt 'unset PORTCULLIS_KUBE_CONTEXT; runtime_check')"
+case "$OUT" in *"PORTCULLIS_KUBE_CONTEXT is not set"*"rc=1") t_pass "need_env: kubernetes without PORTCULLIS_KUBE_CONTEXT → refused naming it" ;; *) t_fail "kube no context: $OUT" ;; esac
+OUT="$(kt 'PORTCULLIS_KUBE_CONTEXT=nope; runtime_check')"
+case "$OUT" in *"kube context nope"*"doesn't exist"*"rc=1") t_pass "runtime_check: a context that doesn't exist → refused" ;; *) t_fail "kube missing context: $OUT" ;; esac
+k_fixtures
+OUT="$(kt 'runtime_check && kube_ctl get nodes -o json >/dev/null && kube_helm list >/dev/null')"
+expect_eq "runtime_check: the cluster's networks = .env → ok" "$(printf '%s\n' "$OUT" | tail -n1)" "rc=0"
+expect_eq "kube_ctl / kube_helm always pass the context (never the current one)" \
+  "$(grep -vc '^--context ci \|^config get-contexts' "$KS/kubectl-calls"):$(grep -c '^--kube-context ci ' "$KS/helm-calls")" "0:1"
+OUT="$(kt 'PORTCULLIS_POD_CIDR=10.99.0.0/24; runtime_check')"
+case "$OUT" in *"PORTCULLIS_POD_CIDR=10.99.0.0/24 in .env, but the cluster has 10.42.0.0/24"*"rc=1") t_pass "runtime_check: detected pod CIDR differs from .env → refused naming both" ;; *) t_fail "kube pod cidr mismatch: $OUT" ;; esac
+OUT="$(kt 'PORTCULLIS_KUBE_API_ENDPOINTS=10.1.0.9:6443; runtime_check')"
+case "$OUT" in *"PORTCULLIS_KUBE_API_ENDPOINTS=10.1.0.9:6443 in .env, but the cluster has 10.1.0.4:6443"*"rc=1") t_pass "runtime_check: a different API endpoint → refused naming both" ;; *) t_fail "kube api ep mismatch: $OUT" ;; esac
+expect_eq "kube_detect_cidrs: pod, service CIDR and API endpoints" "$(kt 'kube_detect_cidrs; echo "$_K_POD_CIDR|$_K_SVC_CIDR|$_K_API_EP"')" "10.42.0.0/24|10.43.0.0/16|10.1.0.4:6443
+rc=0"
+echo 'error: something else entirely' > "$KS/kube/svc-dryrun.err"
+OUT="$(kt 'kube_detect_cidrs')"
+case "$OUT" in *"rc=1") t_pass "kube_detect_cidrs: an unparsable dry-run answer → refused" ;; *) t_fail "kube unparsable svc cidr: $OUT" ;; esac
+k_fixtures
+OUT="$(kt 'kube_host_checks')"
+expect_eq "kube_host_checks: a prepared k3s → no fail line" "$(printf '%s\n' "$OUT" | grep -c '^fail' || true)" 0
+case "$OUT" in *"ok	Kubernetes v1.37.2+k3s1"*"ok	PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 is free"*"ok	namespace portcullis: not there yet"*"ok	namespace portcullis-storage: not there yet"*) t_pass "kube_host_checks: version, fixed ClusterIPs, the three namespaces" ;; *) t_fail "kube_host_checks ok: $OUT" ;; esac
+sed -i.bak 's/"10.42.0.0\/24","fd00:10:42::\/56"/X/; s/"podCIDRs":\["10.42.0.0\/24"\]/"podCIDRs":["10.42.0.0\/24","fd00:42::\/56"]/' "$KS/kube/nodes.json"
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"fail	dual-stack or IPv6 cluster"*) t_pass "kube_host_checks: an IPv6 pod CIDR → refused" ;; *) t_fail "kube ipv6: $OUT" ;; esac
+OUT="$(kt 'runtime_check')"
+case "$OUT" in *"dual-stack or IPv6 cluster"*"rc=1") t_pass "runtime_check: an IPv6 pod CIDR → refused" ;; *) t_fail "kube ipv6 runtime_check: $OUT" ;; esac
+k_fixtures
+echo '{"serverVersion":{"gitVersion":"v1.32.13+k3s1"}}' > "$KS/kube/version.json"
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"fail	Kubernetes v1.32.13+k3s1: Portcullis needs >= 1.33"*) t_pass "kube_host_checks: server v1.32 → refused (the floor is 1.33)" ;; *) t_fail "kube v1.31: $OUT" ;; esac
+k_fixtures
+echo '{"kubeletconfig":{"podPidsLimit":-1}}' > "$KS/kube/configz.json"
+sed -i.bak 's/\\"--secrets-encryption\\",//' "$KS/kube/nodes.json"
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"fail	k3s runs without --secrets-encryption"*"fail	kubelet podPidsLimit is -1"*) t_pass "kube_host_checks: no secrets encryption, no pod pids limit → refused" ;; *) t_fail "kube flags: $OUT" ;; esac
+k_fixtures
+jq '.items[0].metadata.annotations = {}' "$KS/kube/nodes.json" > "$KS/kube/n.json" && mv "$KS/kube/n.json" "$KS/kube/nodes.json"
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"fail	k3s, but its node-args (k3s.io/node-args) are unreadable"*) t_pass "kube_host_checks: k3s with unreadable node-args → refused (M2)" ;; *) t_fail "kube unreadable node-args: $OUT" ;; esac
+echo '{"serverVersion":{"gitVersion":"v1.37.2"}}' > "$KS/kube/version.json"
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"warn	not k3s: secrets encryption"*) case "$OUT" in *"node-args (k3s.io/node-args) are unreadable"*) t_fail "kube not k3s: refused" ;; *) t_pass "kube_host_checks: not k3s, no node-args → a warning only" ;; esac ;; *) t_fail "kube not k3s: $OUT" ;; esac
+k_fixtures
+touch "$KS/kube/svcs.fail"
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"fail	can't list Services: the fixed ClusterIPs can't be checked free"*) case "$OUT" in *"is free"*) t_fail "kube svcs list failed: still called free" ;; *) t_pass "kube_host_checks: an unreadable Services list → refused, nothing called free (M1)" ;; esac ;; *) t_fail "kube svcs list failed: $OUT" ;; esac
+k_fixtures
+# Task 0 Q1: the public address is local but ServiceLB publishes another.
+OUT="$(kt 'KUBE_LOCAL_ADDRS="10.1.0.4 203.0.113.7"; PORTCULLIS_PUBLIC_IPV4=203.0.113.7; kube_host_checks')"
+case "$OUT" in *"warn	client IPs will be rewritten"*"--node-external-ip=203.0.113.7"*) t_pass "kube_host_checks: public IP local but not an LB ingress address → warning naming --node-external-ip" ;; *) t_fail "kube source ip: $OUT" ;; esac
+case "$OUT" in *"fail	client IPs"*) t_fail "kube source ip: a refusal" ;; *) t_pass "kube_host_checks: the source-IP row is never a refusal" ;; esac
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"ok	client addresses kept: 198.51.100.1"*) t_pass "kube_host_checks: the public IP is the node's ExternalIP → ok" ;; *) t_fail "kube source ip ok: $OUT" ;; esac
+# K8: :6443 / :10250 answering on the public address → a warning.
+OUT="$(kt 'KUBE_TCP_PROBE=true; kube_host_checks')"
+case "$OUT" in *"warn	port 6443 answers on the public address 198.51.100.1"*"warn	port 10250 answers"*) t_pass "kube_host_checks: the API / kubelet on the public address → warning (K8)" ;; *) t_fail "kube K8: $OUT" ;; esac
+# The fixed ClusterIPs: in the static band and free.
+echo '{"items":[{"metadata":{"namespace":"kube-system","name":"x"},"spec":{"clusterIP":"10.43.0.21"}},{"metadata":{"namespace":"portcullis","name":"traefik"},"spec":{"clusterIP":"10.43.0.20"}}]}' > "$KS/kube/svcs.json"
+OUT="$(kt 'kube_host_checks')"
+case "$OUT" in *"ok	PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 is free"*"fail	PORTCULLIS_TRAEFIK_VPN_SERVICE_IP=10.43.0.21 is already taken by Service kube-system/x"*) t_pass "kube_host_checks: a fixed ClusterIP held by another Service → refused (ours is fine)" ;; *) t_fail "kube svc ip taken: $OUT" ;; esac
+OUT="$(kt 'PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.9.1; kube_host_checks')"
+case "$OUT" in *"fail	PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.9.1 is outside the service CIDR's static band (the first 256 addresses"*) t_pass "kube_host_checks: a fixed ClusterIP outside the static band → refused" ;; *) t_fail "kube band: $OUT" ;; esac
+k_fixtures
+# K11: a namespace Portcullis didn't create is never adopted.
+echo '{"metadata":{"name":"portcullis","labels":{"kubernetes.io/metadata.name":"portcullis"}}}' > "$KS/kube/ns-portcullis.json"
+OUT="$(kt 'kube_require_host')"
+case "$OUT" in *"isn't ready for Portcullis"*"namespace portcullis exists but isn't this install's"*"rc=1") t_pass "init kubernetes: foreign portcullis namespace → refused" ;; *) t_fail "kube foreign ns: $OUT" ;; esac
+echo '{"metadata":{"name":"portcullis","labels":{"app.kubernetes.io/managed-by":"portcullis"},"annotations":{"portcullis.io/install":"ffffffff-1111-4222-8333-444455556666"}}}' > "$KS/kube/ns-portcullis.json"
+OUT="$(kt 'kube_require_host')"
+case "$OUT" in *"namespace portcullis exists but isn't this install's"*"rc=1") t_pass "init kubernetes: our label but another install id → refused" ;; *) t_fail "kube other install: $OUT" ;; esac
+echo '{"metadata":{"name":"portcullis","labels":{"app.kubernetes.io/managed-by":"portcullis"},"annotations":{"portcullis.io/install":"0b0e2b3c-1111-4222-8333-444455556666"}}}' > "$KS/kube/ns-portcullis.json"
+OUT="$(kt 'kube_host_checks | grep "namespace portcullis "; kube_require_host')"
+case "$OUT" in *"ok	namespace portcullis belongs to this install"*"rc=0") t_pass "init kubernetes: matching install id → adopted" ;; *) t_fail "kube adopt: $OUT" ;; esac
+k_fixtures
+# The NetworkPolicy probe: proven only when both refusals hold AND the allowed dial succeeds.
+OUT="$(kt 'sleep() { :; }; kube_netpol_probe')"
+case "$OUT" in *"NetworkPolicies are enforced"*"rc=0") t_pass "kube_netpol_probe: ingress and egress refusals hold, allowed succeeds → proven" ;; *) t_fail "kube probe ok: $OUT" ;; esac
+expect_eq "kube_netpol_probe: proven → ConfigMap portcullis-netpol-probe (proven_at) in portcullis-apps, the probe namespace deleted" \
+  "$(grep -c 'name: portcullis-netpol-probe' "$KS/kubectl-stdin"):$(grep -c 'namespace: portcullis-apps' "$KS/kubectl-stdin"):$(grep -c 'proven_at: "20' "$KS/kubectl-stdin"):$(grep -c 'delete namespace portcullis-netpol-probe' "$KS/kubectl-calls")" "1:1:1:2"
+k_fixtures
+OUT="$(kt 'sleep() { :; }; export STUB_DIAL_ALLOWED=1; kube_netpol_probe')"
+case "$OUT" in *"the allowed connection failed"*"rc=1") t_pass "kube_netpol_probe: allowed dial fails → not proven" ;; *) t_fail "kube probe allowed fails: $OUT" ;; esac
+expect_eq "kube_netpol_probe: not proven → ConfigMap not written, probe namespace deleted" "$(test -e "$KS/kubectl-stdin" && echo written || echo none):$(grep -c 'delete namespace portcullis-netpol-probe' "$KS/kubectl-calls")" "none:2"
+# Each direction on its own: a cluster that ignores ingress OR egress
+# policies fails the probe (the review's fail-open case: one client denied
+# both ways would pass with only one direction enforced).
+k_fixtures
+OUT="$(kt 'sleep() { :; }; export STUB_DIAL_INGRESS=0; kube_netpol_probe')"
+case "$OUT" in *"ingress NetworkPolicies are NOT enforced"*"rc=1") t_pass "kube_netpol_probe: ingress policies ignored (client-ingress gets through) → not proven" ;; *) t_fail "kube probe ingress ignored: $OUT" ;; esac
+expect_eq "kube_netpol_probe: ingress ignored → ConfigMap not written" "$(test -e "$KS/kubectl-stdin" && echo written || echo none)" none
+k_fixtures
+OUT="$(kt 'sleep() { :; }; export STUB_DIAL_EGRESS=0; kube_netpol_probe')"
+case "$OUT" in *"egress NetworkPolicies are NOT enforced"*"rc=1") t_pass "kube_netpol_probe: egress policies ignored (client-egress gets through) → not proven" ;; *) t_fail "kube probe egress ignored: $OUT" ;; esac
+expect_eq "kube_netpol_probe: egress ignored → ConfigMap not written" "$(test -e "$KS/kubectl-stdin" && echo written || echo none)" none
+# The manifests themselves: the server admits exactly client-allowed and
+# client-egress; client-ingress has the only egress allowance besides the
+# control's; default deny both ways.
+expect_eq "kube/probe: the server's ingress admits [allowed, egress-test]; egress allowed for ingress-test and allowed only; default deny both ways" \
+  "$(python3 - "$HERE/../kube/probe" <<'PY2'
+import sys, yaml, glob
+docs = [d for f in sorted(glob.glob(sys.argv[1] + "/*.yaml")) for d in yaml.safe_load_all(open(f)) if d]
+pols = {d["metadata"]["name"]: d["spec"] for d in docs if d["kind"] == "NetworkPolicy"}
+ing = [p for p in pols.values() if "Ingress" in p["policyTypes"] and p["podSelector"].get("matchLabels") == {"portcullis.io/probe": "server"}]
+adm = sorted(ing[0]["ingress"][0]["from"][0]["podSelector"]["matchExpressions"][0]["values"])
+egr = sorted(p["podSelector"]["matchLabels"]["portcullis.io/probe"] for p in pols.values() if p["policyTypes"] == ["Egress"])
+dd = [n for n, p in pols.items() if p["podSelector"] == {} and sorted(p["policyTypes"]) == ["Egress", "Ingress"] and not p.get("ingress") and not p.get("egress")]
+print(adm, egr, len(dd))
+PY2
+)" "['allowed', 'egress-test'] ['allowed', 'ingress-test'] 1"
+expect_eq "kube/probe/*.yaml run PORTCULLIS_HELPER_IMAGE (the CLI's pinned helper)" \
+  "$(grep -h 'image:' "$HERE"/../kube/probe/*.yaml | sed 's/.*image: //' | sort -u)" "$PORTCULLIS_HELPER_IMAGE"
+# ── cluster setup (Task 14) ──
+HUBD="ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 7)"
+k_fixtures
+CS_ROOT="$WORK/cs-root"; rm -rf "$CS_ROOT"; mkdir -p "$CS_ROOT/secrets"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
+case "$OUT" in *"rc=0") t_pass "kube_cluster_setup: every step applies" ;; *) t_fail "kube_cluster_setup: $OUT" ;; esac
+PJ="$(ls "$KS"/live/ConfigMap.portcullis-admission-params-*.json | head -n1)"
+G1="$(jq -r '.data.generation' "$PJ")"
+case "$G1" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) t_pass "params generation: 16 hex, the ConfigMap portcullis-admission-params-<generation>" ;; *) t_fail "params generation: $G1" ;; esac
+expect_eq "cluster setup: params ConfigMap carries the resolved Hub digest, the Hub's ServiceAccount, the node and API /32s" \
+  "$(jq -r --arg h "$HUBD" '.data | [.hubImage == $h, .hubServiceAccount == "system:serviceaccount:portcullis:portcullis-hub", .nodeAddresses == "10.1.0.4/32 198.51.100.1/32", .apiAddresses == "10.1.0.4/32", .corePorts == "80 443 51820 8000 8081 8443 8444"] | map(select(.)) | length' "$PJ")" 5
+expect_eq "cluster setup: the params ConfigMap has exactly params.tmpl.yaml's keys" \
+  "$(jq -r '.data | keys | join(" ")' "$PJ") " \
+  "$(sed -n '/^data:/,$p' "$HERE/../kube/admission/params.tmpl.yaml" | sed -n 's/^  \([A-Za-z]*\): .*/\1/p' | sort | tr '\n' ' ')"
+expect_eq "cluster setup: the six bindings as <name>-<generation> on portcullis-admission-params-<generation>, labelled with their base name" \
+  "$(jq -s -r --arg g "$G1" 'map(select(.metadata.labels["portcullis.io/params-generation"] == $g) | [.metadata.name == .metadata.labels["portcullis.io/binding"] + "-" + $g, .spec.paramRef.name == "portcullis-admission-params-" + $g] | all) | [length, all] | map(tostring) | join(":")' "$KS"/live/Binding.*.json)" "6:true"
+expect_eq "cluster setup: the five apps bindings select portcullis-apps, the edge one portcullis-edge" \
+  "$(jq -s -r --arg g "$G1" 'map(select(.metadata.labels["portcullis.io/params-generation"] == $g) | .spec.matchResources.namespaceSelector.matchLabels["kubernetes.io/metadata.name"]) | group_by(.) | map("\(.[0])=\(length)") | join(" ")' "$KS"/live/Binding.*.json)" \
+  "portcullis-apps=5 portcullis-edge=1"
+expect_eq "cluster setup: first run → params, bindings, probe (3 requests), nothing older to delete" \
+  "$(grep -E '^(apply bindings|probe|delete binding|delete params|stamp)' "$KS/order" | sed "s/$G1/G1/; s/^probe .*/probe/" | uniq -c | tr -s ' ' | tr '\n' ';')" " 1 apply bindings G1; 8 probe;"
+expect_eq "cluster setup: every one of the six bindings probed with its own object" \
+  "$(grep '^probe portcullis-' "$KS/order" | sort | tr '\n' ' ')" "$(printf 'probe %s\n' $KUBE_BINDINGS | sort | tr '\n' ' ')"
+expect_eq "cluster setup: the four namespaces with PSA labels and K11's label + install annotation (server-side)" \
+  "$(jq -cs '[.[] | select(.kind == "Namespace") | [.metadata.name, .metadata.labels["pod-security.kubernetes.io/enforce"], .metadata.labels["pod-security.kubernetes.io/warn"], .metadata.labels["app.kubernetes.io/managed-by"], .metadata.annotations["portcullis.io/install"]]]' < <(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(type == "object")' 2>/dev/null))" \
+  '[["portcullis","restricted","restricted","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-apps","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-storage","privileged","baseline","portcullis","0b0e2b3c-1111-4222-8333-444455556666"],["portcullis-edge","restricted","restricted","portcullis","0b0e2b3c-1111-4222-8333-444455556666"]]'
+expect_eq "cluster setup: CRDs and VAPs applied server-side (never Helm), bindings.yaml never applied under its own names, the storage API egress to each endpoint" \
+  "$(grep -c 'apply --server-side --force-conflicts --field-manager=portcullis-cli -f .*charts/portcullis/crds/traefik-v3.7.17.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/policies.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/bindings.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*/bindings.json' "$KS/kubectl-calls"):$(grep -c '"cidr": "10.1.0.4/32"' "$KS/kubectl-stdin")" "1:1:0:1:1"
+expect_eq "cluster setup: applied.json records every step (0600)" \
+  "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json"):$(file_mode "$CS_ROOT/secrets/kube/applied.json")" "cluster.admission cluster.crds cluster.namespaces cluster.params cluster.storage:600"
+rm -f "$KS/order"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
+expect_eq "cluster setup: unchanged params → the same generation re-applied and probed, nothing deleted, no Hub scaling" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c 'delete binding\|scale deploy/hub' "$KS/order" || true):$(grep -c '^probe' "$KS/order")" "rc=0:0:8"
+rm -f "$KS/order"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.7'; kube_cluster_setup")"
+G2="$(grep '^apply bindings ' "$KS/order" | tail -n1 | cut -d' ' -f3)"
+expect_eq "cluster setup: changed params → create-before-delete: the new generation's bindings, the probe, only then the older bindings deleted; the older params stamped, not deleted; the Hub never scaled" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$([ "$G2" != "$G1" ] && echo new-gen):$(grep -E '^(apply bindings|probe|delete binding|delete params|stamp|kubectl .*scale)' "$KS/order" | sed "s/$G2/G2/; s/$G1/G1/; s/^probe .*/probe/" | uniq -c | tr -s ' ' | tr '\n' ';')" \
+  "rc=0:new-gen: 1 apply bindings G2; 8 probe; 1 delete binding portcullis-apps-guard-netpol-G1; 1 delete binding portcullis-apps-guard-pods-G1; 1 delete binding portcullis-apps-guard-services-G1; 1 delete binding portcullis-apps-guard-traefik-G1; 1 delete binding portcullis-apps-guard-workloads-G1; 1 delete binding portcullis-edge-guard-routes-G1; 1 stamp portcullis-admission-params-G1;"
+echo '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"portcullis-admission-params-ffffffffffffffff","labels":{"app.kubernetes.io/managed-by":"portcullis","portcullis.io/params-generation":"ffffffffffffffff"},"annotations":{"portcullis.io/orphaned-at":"a[$(touch '"$WORK"'/pwned)]"}},"data":{}}' > "$KS/live/ConfigMap.portcullis-admission-params-ffffffffffffffff.json"
+echo '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"portcullis-admission-params-evil","labels":{"app.kubernetes.io/managed-by":"portcullis","portcullis.io/params-generation":"x"},"annotations":{"portcullis.io/orphaned-at":"1"}},"data":{}}' > "$KS/live/ConfigMap.portcullis-admission-params-evil.json"
+rm -f "$KS/order"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.7' KUBE_PARAMS_GRACE=0; kube_cluster_setup")"
+expect_eq "cluster setup: an orphaned older params ConfigMap is deleted once past the grace" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c "^delete params portcullis-admission-params-$G1$" "$KS/order")" "rc=0:1"
+expect_eq "params GC: an orphaned-at that isn't a timestamp is never evaluated (no command ran), the ConfigMap kept; a foreign name never touched" \
+  "$(test -e "$WORK/pwned" && echo PWNED || echo safe):$(test -e "$KS/live/ConfigMap.portcullis-admission-params-ffffffffffffffff.json" && echo kept):$(printf '%s' "$OUT" | grep -c "isn't a timestamp"):$(test -e "$KS/live/ConfigMap.portcullis-admission-params-evil.json" && echo kept):$(printf '%s' "$OUT" | grep -c 'not an admission params name')" \
+  "safe:kept:1:kept:1"
+rm -f "$KS/live/ConfigMap.portcullis-admission-params-ffffffffffffffff.json" "$KS/live/ConfigMap.portcullis-admission-params-evil.json"
+rm -f "$KS/order"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.8' KUBE_ADMISSION_PROBE_WAIT=0; export STUB_PROBE_STALE=1; kube_cluster_setup")"
+case "$OUT" in *"aren't live with their params"*"the older bindings still judge"*"rc=1") t_pass "cluster setup: the new generation doesn't probe live → refused, the older bindings kept" ;; *) t_fail "cluster setup stale probe: $OUT" ;; esac
+rm -f "$KS/order"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.8' KUBE_ADMISSION_PROBE_WAIT=0; export STUB_PROBE_STALE_BINDING=portcullis-apps-guard-netpol; kube_cluster_setup")"
+case "$OUT" in *"not live with generation"*"portcullis-apps-guard-netpol"*"aren't live with their params"*"rc=1") t_pass "cluster setup: one binding of the six (netpol) not live → refused, the older bindings kept" ;; *) t_fail "cluster setup one stale binding: $OUT" ;; esac
+expect_eq "cluster setup: one stale binding deletes nothing" "$(grep -c '^delete binding' "$KS/order" || true)" 0
+expect_eq "cluster setup: a failed probe deletes no binding" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:6"
+rm -f "$KS/order"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.9'; export STUB_BINDINGS_FAIL=1; kube_cluster_setup")"
+case "$OUT" in *"could not create the admission bindings of params generation"*"the older ones still judge"*"rc=1") t_pass "cluster setup: the new bindings can't be created → refused, nothing deleted" ;; *) t_fail "cluster setup bindings failure: $OUT" ;; esac
+expect_eq "cluster setup: failed bindings → the older bindings kept" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:6"
+echo '{"items":[{"kind":"IngressRoute","metadata":{"name":"app-ok","labels":{"portcullis.io/instance":"a"}}},{"kind":"IngressRoute","metadata":{"name":"app-bad","labels":{"portcullis.io/instance":"b"}},"spec":{"x":"REFUSE-ME"}}]}' > "$KS/kube/edge-hub-ir.json"
+rm -f "$KS/order"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
+expect_eq "cluster setup: every owner=hub edge object re-judged; the one the new policies refuse deleted and named" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c '^delete ir' "$KS/order"):$(grep -c '^delete ir app-bad$' "$KS/order"):$(printf '%s' "$OUT" | grep -c 'refuse ingressroutes app-bad (instance b): deleted')" "rc=0:1:1:1"
+rm -f "$KS/kube/edge-hub-ir.json"
+k_fixtures
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_APPS_NAMESPACE=team-apps; export STUB_APPS_NS=team-apps; kube_cluster_setup")"
+expect_eq "cluster setup, PORTCULLIS_APPS_NAMESPACE=team-apps: the five apps bindings select team-apps, the edge one portcullis-edge" \
+  "$(printf '%s\n' "$OUT" | tail -n1) $(jq -s -r 'map(.spec.matchResources.namespaceSelector.matchLabels["kubernetes.io/metadata.name"]) | group_by(.) | map("\(.[0])=\(length)") | join(" ")' "$KS"/live/Binding.*.json)" \
+  "rc=0 portcullis-edge=1 team-apps=5"
+expect_eq "no Hub scaling around the admission bindings (create-before-delete needs none)" "$(declare -f kube_admission_params_apply kube_cluster_setup | grep -c '_kube_scale\|deployment hub' || true)" 0
+k_fixtures
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; export STUB_WHOAMI_FAIL=1; kube_cluster_setup")"
+case "$OUT" in *"the admission params can't be built"*"rc=1") case "$(cat "$KS/kubectl-stdin" 2>/dev/null)" in *portcullis-admission-params*) t_fail "cluster setup wrote params after a refusal" ;; *) t_pass "cluster setup: a params refusal (no CLI identity) stops the setup, no params written" ;; esac ;; *) t_fail "cluster setup params refusal: $OUT" ;; esac
+k_fixtures
+echo '{"items":[{"metadata":{"name":"stray-tls"}}]}' > "$KS/kube/edge-secrets.json"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
+case "$OUT" in *"the namespace portcullis-edge holds 1 Secrets: Traefik reads every Secret there"*"rc=1") t_pass "cluster setup: a Secret in the edge namespace (Traefik reads it) → refused" ;; *) t_fail "cluster setup edge secret: $OUT" ;; esac
+k_fixtures
+rm -rf "$CS_ROOT/secrets/kube"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; export STUB_APPLY_FAIL_MATCH=kube/admission/policies.yaml; kube_cluster_setup")"
+case "$OUT" in *"could not apply the admission policies"*"rc=1") t_pass "cluster setup: a failed VAP apply fails the setup" ;; *) t_fail "cluster setup VAP failure: $OUT" ;; esac
+expect_eq "cluster setup: a failed VAP apply leaves applied.json without the admission and params steps" \
+  "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json")" "cluster.crds cluster.namespaces cluster.storage"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE=ghcr.io/porelli/portcullis-hub:edge; kube_cluster_setup")"
+case "$OUT" in *"isn't resolved to a digest"*"rc=1") t_pass "cluster setup: an unresolved Hub tag → refused (the params pin a digest)" ;; *) t_fail "cluster setup tag: $OUT" ;; esac
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES=' '; kube_ctl() { [ \"\$1 \$2\" = 'get nodes' ] && { echo '{\"items\":[]}'; return 0; }; command kubectl --context ci \"\$@\"; }; kube_admission_params x")"
+case "$OUT" in *"no node address"*"rc=1") t_pass "admission params: no node address → refused (never params that can't exclude the nodes)" ;; *) t_fail "admission params no nodes: $OUT" ;; esac
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; export STUB_WHOAMI_FAIL=1; kube_admission_params x")"
+case "$OUT" in *"can't tell this CLI's own identity"*"rc=1") t_pass "admission params: the CLI's identity unknown → refused (portcullis-edge-routes exempts it by name)" ;; *) t_fail "admission params whoami: $OUT" ;; esac
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' PORTCULLIS_DOMAIN=K.Example.org; kube_admission_params x | grep -E '^(reservedHosts|maxAppPriority)'" | tr '\t' '=' | sed -n '1,2p' | tr '\n' ';')"
+expect_eq "admission params: reservedHosts = the apex + core-routes.json's subdomains (lowercase), maxAppPriority from core-routes.json" "$OUT" \
+  "reservedHosts=k.example.org traefik.k.example.org hub.k.example.org directory.k.example.org metrics.k.example.org people.k.example.org mcp.k.example.org auth.k.example.org enroll.k.example.org;maxAppPriority=1000;"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; unset PORTCULLIS_DOMAIN; kube_reserved_hosts")"
+case "$OUT" in *"PORTCULLIS_DOMAIN is not set"*"rc=1") t_pass "reservedHosts: no domain → refused" ;; *) t_fail "reservedHosts no domain: $OUT" ;; esac
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT'; unset PORTCULLIS_DOMAIN; kube_admission_params x")"
+case "$OUT" in *"PORTCULLIS_DOMAIN is not set"*"rc=1") case "$OUT" in *reservedHosts*) t_fail "admission params written without a domain: $OUT" ;; *) t_pass "admission params: no domain → refused before any key is printed" ;; esac ;; *) t_fail "admission params no domain: $OUT" ;; esac
+expect_eq "admission reservedHosts example = core-routes.json for portcullis.local" "$(sed -n 's/^  reservedHosts: //p' "$HERE/../kube/admission/params.yaml")" \
+  "$(PORTCULLIS_DOMAIN=portcullis.local kube_reserved_hosts)"
+OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' PORTCULLIS_DOMAIN=k.example.org; kube_admission_params x | grep -E '^(cliUsername|appsNamespace|edgeNamespace|edgeCoreMiddlewares)'" | tr '\t' '=' | sed -n '1,4p' | tr '\n' ';')"
+expect_eq "admission params: the CLI's identity (auth whoami), the apps / edge namespaces, the core edge Middlewares" "$OUT" \
+  "cliUsername=system:admin;appsNamespace=portcullis-apps;edgeNamespace=portcullis-edge;edgeCoreMiddlewares=$KUBE_EDGE_CORE_MIDDLEWARES;"
+# setup.sh (K3): uid / gid 1–65535, 3–4 octal digits; mkdir -m 0700, chmod, then chown;
+# anything else refused, nothing created.
+SB="$WORK/setupbin"; mkdir -p "$SB"
+printf '#!/bin/sh\necho "chown $*" >> "$SETUP_LOG"\n' > "$SB/chown"; chmod +x "$SB/chown"
+printf '#!/bin/sh\necho "mkdir $*" >> "$SETUP_LOG"\nexec /bin/mkdir "$@"\n' > "$SB/mkdir"; chmod +x "$SB/mkdir"
+printf '#!/bin/sh\necho "chmod $*" >> "$SETUP_LOG"\nexec /bin/chmod "$@"\n' > "$SB/chmod"; chmod +x "$SB/chmod"
+# stat -c %a: GNU (Linux CI) as is; BSD (macOS) through stat -f %Lp.
+if stat -c %a / >/dev/null 2>&1; then :; else printf '#!/bin/sh\n[ "$1" = -c ] && shift 2\nm="$(/usr/bin/stat -f %%Mp%%Lp "$1")"; echo "${m#0}"\n' > "$SB/stat"; chmod +x "$SB/stat"; fi
+# The parent carries the runner's own group: BSD (macOS) drops a setgid bit
+# chmod sets on a directory whose group the caller isn't in.
+mkdir -p "$WORK/volp"; chgrp "$(id -g)" "$WORK/volp"
+setup_run() { rm -rf "$WORK/volp/vol" "$WORK/setup.log"; ( export PATH="$SB:$PATH" SETUP_LOG="$WORK/setup.log" VOL_DIR="$WORK/volp/vol" VOL_USER="$1" VOL_GROUP="$2" VOL_PERM="$3"; sh "$HERE/../kube/storage/setup.sh" ) 2>&1; echo "rc=$?"; }
+OUT="$(setup_run 10001 10001 0750)"
+expect_eq "setup.sh 10001/10001/0750 → mkdir 0700, chmod 0750, then chown 10001:10001" "$OUT|$(file_mode "$WORK/volp/vol")|$(cat "$WORK/setup.log" | tr '\n' ';')" "rc=0|750|mkdir -m 0700 $WORK/volp/vol;chmod 0750 $WORK/volp/vol;chown 10001:10001 $WORK/volp/vol;"
+OUT="$(setup_run 10006 10001 2750)"
+expect_eq "setup.sh 10006/10001/2750 → chmod 2750 while root's, then chown (a chmod without CAP_FSETID outside the group drops setgid; a chown keeps it on a directory); the directory is 2750" \
+  "$OUT|$(cat "$WORK/setup.log" | tr '\n' ';')|$(file_mode "$WORK/volp/vol")" "rc=0|mkdir -m 0700 $WORK/volp/vol;chmod 2750 $WORK/volp/vol;chown 10006:10001 $WORK/volp/vol;|2750"
+# A mode that doesn't stick is caught, read back after the chown: a chmod
+# that drops setgid, or a chown that clears it, refuses.
+printf '#!/bin/sh\necho "chmod $*" >> "$SETUP_LOG"\nexec /bin/chmod 0750 "$2"\n' > "$SB/chmod.lossy"
+OUT="$(mv "$SB/chmod" "$SB/chmod.real"; cp "$SB/chmod.lossy" "$SB/chmod"; chmod +x "$SB/chmod"; setup_run 10006 10001 2750; mv "$SB/chmod.real" "$SB/chmod")"
+case "$OUT" in *"portcullis-setup REFUSED:"*"is mode 750 after chmod 2750 and chown (want 2750)"*"rc=1") t_pass "setup.sh: a mode that doesn't stick (750 for 2750) refuses" ;; *) t_fail "setup.sh lossy chmod: $OUT" ;; esac
+# g-s, not a numeric mode: GNU chmod keeps a directory's setgid for 0750.
+printf '#!/bin/sh\necho "chown $*" >> "$SETUP_LOG"\nexec /bin/chmod g-s "$2"\n' > "$SB/chown.lossy"
+OUT="$(mv "$SB/chown" "$SB/chown.real"; cp "$SB/chown.lossy" "$SB/chown"; chmod +x "$SB/chown"; setup_run 10006 10001 2750; mv "$SB/chown.real" "$SB/chown")"
+case "$OUT" in *"portcullis-setup REFUSED:"*"is mode 750 after chmod 2750 and chown (want 2750)"*"rc=1") t_pass "setup.sh: a chown that clears setgid refuses (the mode is read back after it)" ;; *) t_fail "setup.sh lossy chown: $OUT" ;; esac
+expect_eq "setup.sh: a refusal after the mkdir removes the directory (a retry can succeed)" "$(test -e "$WORK/volp/vol" && echo left || echo removed)" removed
+OUT="$(setup_run 10006 10001 2750)"
+expect_eq "setup.sh: the retry after a refusal succeeds" "$OUT|$(file_mode "$WORK/volp/vol")" "rc=0|2750"
+for bad in ":10001:0750:uid ''" "x:10001:0750:uid 'x'" "65536:10001:0750:uid '65536'" "10001::0750:gid ''" "10001:0:0750:gid '0'" "10001:10001::mode ''" "10001:10001:0789:mode '0789'" "10001:10001:75:mode '75'" "010001:10001:0750:uid '010001'"; do
+  IFS=: read -r u g m why <<< "$bad"
+  OUT="$(setup_run "$u" "$g" "$m")"
+  case "$OUT" in *"portcullis-setup REFUSED: bad $why"*"rc=1") ok_case=1 ;; *) ok_case=0 ;; esac
+  expect_eq "setup.sh $u/$g/$m → REFUSED (bad $why), nothing created" "$ok_case:$(test -e "$WORK/vol" && echo made || echo none):$(test -e "$WORK/setup.log" && echo chown || echo none)" "1:none:none"
+done
+expect_eq "the provisioner: --service-account-name its own SA, --provisioner-name portcullis.io/local-path, the pinned image, never --allow-unsafe-helper-pod-template" \
+  "$(grep -A1 -- '- --service-account-name' "$HERE/../kube/storage/provisioner.yaml" | tail -n1 | tr -d ' -'):$(grep -c 'portcullis.io/local-path' "$HERE/../kube/storage/provisioner.yaml" | awk '{print ($1>0)}'):$(grep -c 'image: docker.io/rancher/local-path-provisioner:v0.0.37@sha256:e757967a5ec338f6a9b371c5a9688bedaa8c3578ea3dd4db329ea0084be0a86f' "$HERE/../kube/storage/provisioner.yaml"):$(grep -rc 'allow-unsafe-helper-pod-template' "$HERE/../kube/storage" | awk -F: '{s+=$2} END {print s}')" "portcullislocalpath:1:1:1"
+expect_eq "the helper pod: PORTCULLIS_HELPER_IMAGE, uid 0, the 11 other default caps dropped by name (CHOWN, DAC_OVERRIDE, FOWNER kept), nothing added" \
+  "$(sed -n 's/.*image: //p' "$HERE/../kube/storage/helper-pod.yaml"):$(python3 -c 'import sys, yaml; c = yaml.safe_load(open(sys.argv[1]))["spec"]["containers"][0]["securityContext"]; print(c["runAsUser"], sorted(c["capabilities"]["drop"]) == sorted(["AUDIT_WRITE","FSETID","KILL","MKNOD","NET_BIND_SERVICE","NET_RAW","SETFCAP","SETGID","SETPCAP","SETUID","SYS_CHROOT"]), "add" in c["capabilities"], c["allowPrivilegeEscalation"], c["readOnlyRootFilesystem"])' "$HERE/../kube/storage/helper-pod.yaml")" \
+  "$PORTCULLIS_HELPER_IMAGE:0 True False False True"
+expect_eq "kube/storage/admission.yaml pins the same helper and provisioner images" \
+  "$(grep -c "c.image == '$PORTCULLIS_HELPER_IMAGE'" "$HERE/../kube/storage/admission.yaml"):$(grep -c "c.image == 'docker.io/rancher/local-path-provisioner:v0.0.37@sha256:e757967a5ec338f6a9b371c5a9688bedaa8c3578ea3dd4db329ea0084be0a86f'" "$HERE/../kube/storage/admission.yaml")" "1:1"
+expect_eq "StorageClasses: portcullis-core Retain, portcullis-apps Delete, both portcullis.io/local-path with the three owner patterns, never volumeType local" \
+  "$(python3 -c 'import sys, yaml; print([(d["metadata"]["name"], d["reclaimPolicy"], d["provisioner"], sorted(d["parameters"]), "volumeType" in d["parameters"]) for d in yaml.safe_load_all(open(sys.argv[1]))])' "$HERE/../kube/storage/storageclasses.yaml")" \
+  "[('portcullis-core', 'Retain', 'portcullis.io/local-path', ['groupPattern', 'permPattern', 'userPattern'], False), ('portcullis-apps', 'Delete', 'portcullis.io/local-path', ['groupPattern', 'permPattern', 'userPattern'], False)]"
+expect_eq "kube/admission: six policies, six bindings (portcullis-apps-guard-<policy>, portcullis-edge-guard-routes; Deny, params missing = Deny, Fail)" \
+  "$(python3 -c 'import sys, yaml; P = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]; B = [d for d in yaml.safe_load_all(open(sys.argv[2])) if d]; print(sorted(p["metadata"]["name"] for p in P), all(p["spec"]["failurePolicy"] == "Fail" for p in P), sorted((b["metadata"]["name"], b["spec"]["policyName"], b["spec"]["validationActions"] == ["Deny"], b["spec"]["paramRef"]["parameterNotFoundAction"]) for b in B))' "$HERE/../kube/admission/policies.yaml" "$HERE/../kube/admission/bindings.yaml")" \
+  "['portcullis-apps-netpol', 'portcullis-apps-pods', 'portcullis-apps-services', 'portcullis-apps-traefik', 'portcullis-apps-workloads', 'portcullis-edge-routes'] True [('portcullis-apps-guard-netpol', 'portcullis-apps-netpol', True, 'Deny'), ('portcullis-apps-guard-pods', 'portcullis-apps-pods', True, 'Deny'), ('portcullis-apps-guard-services', 'portcullis-apps-services', True, 'Deny'), ('portcullis-apps-guard-traefik', 'portcullis-apps-traefik', True, 'Deny'), ('portcullis-apps-guard-workloads', 'portcullis-apps-workloads', True, 'Deny'), ('portcullis-edge-guard-routes', 'portcullis-edge-routes', True, 'Deny')]"
+expect_eq "the CLI's KUBE_BINDINGS = bindings.yaml's names" \
+  "$(python3 -c 'import sys, yaml; print(" ".join(d["metadata"]["name"] for d in yaml.safe_load_all(open(sys.argv[1])) if d))' "$HERE/../kube/admission/bindings.yaml")" "$KUBE_BINDINGS"
+expect_eq "admission edgeCoreMiddlewares = the CLI's KUBE_EDGE_CORE_MIDDLEWARES = the params example's" "$(sed -n 's/^  edgeCoreMiddlewares: //p' "$HERE/../kube/admission/params.yaml")" "$KUBE_EDGE_CORE_MIDDLEWARES"
+expect_eq "admission fileMiddlewares = the CLI's KUBE_FILE_NAMES = the params example's" "$(sed -n 's/^  fileMiddlewares: //p' "$HERE/../kube/admission/params.yaml")" "$KUBE_FILE_NAMES"
+# ── Task 15: sync, values, the release, one-shots, restore, VPN, revocation ──
+# shellcheck source=../scripts/lib/signin.sh
+source "$HERE/../scripts/lib/signin.sh"
+K15="$WORK/k15"
+k15_root() {
+  rm -rf "$K15"; mkdir -p "$K15/secrets/hub/lldap" "$K15/secrets/wg" "$K15/secrets/domains/certs-endpoint" "$K15/secrets/kube" "$K15/certs/revocation" "$K15/certs/truststore"
+  printf 'SECRET-LLDAP-PW-123' > "$K15/secrets/hub/lldap/password"
+  printf 'portcullis-hub' > "$K15/secrets/hub/lldap/username"
+  printf '{"root_token":"ROOT-TOKEN-XYZ"}' > "$K15/secrets/vault-init.json"
+  printf 'CA-KEY-SECRET' > "$K15/secrets/domains/certs-endpoint/ca.key"
+  printf 'client' > "$K15/secrets/domains/certs-endpoint/client.crt"
+  : > "$K15/secrets/wg/people.key"
+  printf 'cert' > "$K15/certs/ca-chain.crt"; printf 'KEY' > "$K15/certs/server.key"; printf '1a\n' > "$K15/certs/revocation/revoked-serials.txt"
+  echo "PORTCULLIS_DOMAIN=k.example.org" > "$K15/.env"
+}
+K15_ENV="export PORTCULLIS_ROOT='$K15' POSTGRES_PASSWORD=PG-SECRET-777 HUB_PROXY_SECRET=HUB-PROXY-SECRET-555 KEYCLOAK_ADMIN_PASSWORD=KC-SECRET PORTCULLIS_DOMAIN=k.example.org PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 PORTCULLIS_TRAEFIK_VPN_SERVICE_IP=10.43.0.21 PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.0.22"
+k_fixtures; k15_root; rm -f "$KS/order"
+OUT="$(kt "set -euo pipefail; $K15_ENV; kube_sync_secrets" </dev/null)"
+expect_eq "sync: every object applied (under set -euo pipefail)" "$(printf '%s\n' "$OUT" | tail -n1)" "rc=0"
+expect_eq "sync: no secret on argv (kubectl / helm argv recorded)" \
+  "$(cat "$KS/kubectl-calls" "$KS/helm-calls" 2>/dev/null | grep -cE 'SECRET-LLDAP-PW-123|PG-SECRET-777|HUB-PROXY-SECRET-555|KC-SECRET|ROOT-TOKEN-XYZ|CA-KEY-SECRET' || true)" 0
+expect_eq "sync: Secrets from secrets/ dirs (--from-file), portcullis-env, ConfigMaps; never vault-init.json or the endpoint CA key" \
+  "$(grep -cE 'create secret generic secrets-hub-lldap .*--from-file=|create secret generic portcullis-env .*--from-file=|create configmap certs-revocation .*--from-file=|create secret generic secrets-certs .*--from-file=' "$KS/kubectl-calls"):$(grep -rlE 'ROOT-TOKEN-XYZ|CA-KEY-SECRET' "$KS/kubectl-stdin" 2>/dev/null | wc -l | tr -d ' ')" "4:0"
+expect_eq "sync: the hub-proxy-secret Middleware from stdin (jq), its secret not on argv" \
+  "$(grep -c '"X-Portcullis-Proxy-Secret": "HUB-PROXY-SECRET-555"' "$KS/kubectl-stdin"):$(grep -c 'HUB-PROXY-SECRET-555' "$KS/kubectl-calls" || true)" "1:0"
+# The live objects decide (no local cache): unchanged → nothing put; a hand
+# edit, a hand-added key or a deleted object → corrected; --full,
+# KUBE_SYNC_FULL=1 or an unreadable live list → every object put.
+k15_puts() { grep -c '^put .* \(Secret\|ConfigMap\)\.' "$KS/order" 2>/dev/null || true; }
+expect_eq "sync: the first run creates every object (no live one yet)" \
+  "$(grep -c '^put create Secret.portcullis-env$' "$KS/order"):$(grep -c '^put replace ' "$KS/order" || true)" "1:0"
+rm -f "$KS/order"
+kt "$K15_ENV; kube_sync_secrets" >/dev/null
+expect_eq "sync: live objects equal → none put again (only the hub-proxy-secret Middleware)" \
+  "$(k15_puts):$(grep -c '^put .* Middleware.hub-proxy-secret$' "$KS/order")" "0:1"
+jq '.data.password = "SEFDS0VE" | .data.extra = "eA=="' "$KS/live/Secret.secrets-hub-lldap.json" > "$KS/live.tmp" && mv "$KS/live.tmp" "$KS/live/Secret.secrets-hub-lldap.json"
+rm -f "$KS/live/ConfigMap.certs-revocation.json" "$KS/order"
+kt "$K15_ENV; kube_sync_secrets" >/dev/null
+expect_eq "sync: a live Secret changed by hand (value and an added key) is replaced as staged; a deleted ConfigMap is created; nothing else put" \
+  "$(grep -c '^put replace Secret.secrets-hub-lldap$' "$KS/order"):$(grep -c '^put create ConfigMap.certs-revocation$' "$KS/order"):$(k15_puts):$(jq -r '[.data.password, (.data | has("extra"))] | join(",")' "$KS/live/Secret.secrets-hub-lldap.json")" \
+  "1:1:2:$(printf 'SECRET-LLDAP-PW-123' | base64),false"
+printf 'CHANGED' > "$K15/secrets/hub/lldap/password"
+rm -f "$KS/order"
+kt "$K15_ENV; kube_sync_secrets" >/dev/null
+expect_eq "sync: a changed file → only its object put" "$(k15_puts):$(grep -c '^put replace Secret.secrets-hub-lldap$' "$KS/order")" "1:1"
+N_OBJ="$(find "$KS/live" -name 'Secret.*' -o -name 'ConfigMap.*' | wc -l | tr -d ' ')"
+rm -f "$KS/order"
+kt "$K15_ENV; kube_sync_secrets --full" >/dev/null
+expect_eq "sync --full: every object put without comparing" "$(k15_puts)" "$N_OBJ"
+rm -f "$KS/order"
+kt "$K15_ENV; KUBE_SYNC_FULL=1 kube_sync_secrets" >/dev/null
+expect_eq "sync with KUBE_SYNC_FULL=1 (restore): every object put" "$(k15_puts)" "$N_OBJ"
+rm -f "$KS/order"
+OUT="$(kt "$K15_ENV; STUB_LIVE_LIST_FAIL=1 kube_sync_secrets" 2>&1)"
+case "$OUT" in *"can't list the live Secrets / ConfigMaps of portcullis: syncing every object"*"rc=0") t_pass "sync: an unreadable live list → every object put (warned)" ;; *) t_fail "sync live list failure: $OUT" ;; esac
+expect_eq "sync: an unreadable live list puts every object" "$(k15_puts)" "$N_OBJ"
+expect_eq "sync: the hub-proxy-secret Middleware lives in the edge namespace (Traefik's only one)" \
+  "$(jq -r '.metadata.namespace' "$KS/live/Middleware.hub-proxy-secret.json")" "portcullis-edge"
+expect_eq "sync: no secrets/kube/applied.json object cache is read or written" \
+  "$(grep -c 'objects' <(declare -f kube_sync_secrets _rtk_up) || true):$(jq -r 'has("objects")' "$K15/secrets/kube/applied.json" 2>/dev/null || echo none)" "0:none"
+expect_eq "restore: the Vault step and the whole restore force a full sync" \
+  "$(declare -f _kube_restore_vault | grep -c 'kube_sync_secrets --full'):$(declare -f _backup_restore_kube | grep -c 'export KUBE_SYNC_FULL=1')" "1:1"
+SH="$WORK/strip"; rm -rf "$SH"; mkdir -p "$SH/kube" "$SH/domains" "$SH/hub"; : > "$SH/kube/values.yaml"; : > "$SH/kube/applied.json"; : > "$SH/hub/core.env"
+_strip_host_files "$SH"
+expect_eq "backups / restores never carry secrets/kube (_strip_host_files)" "$(test -e "$SH/kube" && echo kept || echo gone):$(test -e "$SH/hub/core.env" && echo kept || echo gone)" "gone:kept"
+# values: no secret, every key; a missing required one refused
+k15_root
+OUT="$(kt "$K15_ENV; _K_IMAGES='{\"hub\":\"ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 1)\"}'; kube_render_values; jq -c '[.domain, .podCIDR, .apiEndpoints, .nodeAddresses, .traefikServiceIP, .entrypoints.web.admin, .vpn.reservedPools, .hub.selfImage | tostring]' \"$K15/secrets/kube/values.yaml\"")"
+expect_eq "kube_render_values: .env → values (the networks, the ClusterIPs, the six classes, the pools, the Hub's digest)" "$(printf '%s\n' "$OUT" | head -n1)" \
+  "[\"k.example.org\",\"10.42.0.0/24\",\"[\\\"10.1.0.4:6443\\\"]\",\"[\\\"10.1.0.4\\\",\\\"198.51.100.1\\\"]\",\"10.43.0.20\",\"websecure\",\"10.42.0.0/24 10.43.0.0/16\",\"ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 1)\"]"
+expect_eq "kube_render_values: no secret in values.yaml (0600)" "$(grep -cE 'PG-SECRET|HUB-PROXY|KC-SECRET' "$K15/secrets/kube/values.yaml" || true):$(file_mode "$K15/secrets/kube/values.yaml")" "0:600"
+OUT="$(kt "$K15_ENV; unset PORTCULLIS_WG_EDGE_SERVICE_IP; _K_IMAGES='{}'; kube_render_values")"
+case "$OUT" in *"PORTCULLIS_WG_EDGE_SERVICE_IP is not set in .env (required by the chart)"*"rc=1") t_pass "kube_render_values: a required key missing → refused naming it" ;; *) t_fail "values missing key: $OUT" ;; esac
+# rt_up: K1 local builds first; helm failure → health report, applied.json unchanged
+k_fixtures; k15_root; rm -f "$KS/order"
+mkdir -p "$KS/bin2"
+printf '#!/usr/bin/env bash\nprintf "docker %%s\\n" "$*" >> "$STUB_DIR/order"\n[ "$1" != save ] || echo IMAGE-TAR\nexit 0\n' > "$KS/bin2/docker"
+printf '#!/usr/bin/env bash\nprintf "sudo %%s\\n" "$*" >> "$STUB_DIR/order"\ncase "$*" in *"images ls"*) printf "REF TYPE DIGEST\\nx y sha256:%%064d\\n" 9 ;; *"images import"*) cat >/dev/null ;; esac\n' > "$KS/bin2/sudo"
+chmod +x "$KS/bin2/docker" "$KS/bin2/sudo"
+echo '{"items":[{"metadata":{"name":"keycloak-abc"},"status":{"phase":"Running","containerStatuses":[{"ready":false,"restartCount":4}]}}]}' > "$KS/kube/pods.json"
+OUT="$(kt "$K15_ENV; PATH='$KS/bin2':\$PATH PORTCULLIS_KUBE_IMAGES=local KUBE_HUB_IMAGE=; export STUB_HELM_FAIL=1; _kube_registry_digest() { echo \"\${1%:*}@sha256:$(printf '%064d' 3)\"; }; kube_netpol_probe() { :; }; _rtk_up")"
+case "$OUT" in *"keycloak-abc Running restarts=4 is not ready; its last events:"*"BackOff: Back-off restarting failed container"*"rc=1") t_pass "rt_up kubernetes: helm timeout → kube_health_report (pods, restarts, last events)" ;; *) t_fail "rt_up helm failure: $OUT" ;; esac
+expect_eq "K1 local: each import also tags its digest reference in containerd (the kubelet resolves localhost/…@sha256 only by that name)" \
+  "$(grep -c '^sudo k3s ctr -n k8s.io images tag --force localhost/portcullis-[a-z-]*:local localhost/portcullis-[a-z-]*@sha256:' "$KS/order")" 5
+expect_eq "rt_up kubernetes: every K1 local image built and imported before helm runs" \
+  "$(awk '/^docker build/ {b++} /^sudo k3s ctr -n k8s.io images import/ {i++} /^helm .*upgrade --install/ {print b ":" i; exit}' "$KS/order")" "5:5"
+expect_eq "rt_up kubernetes: helm failure → no digest cache" \
+  "$(test -e "$K15/secrets/kube/digests.json" && echo cached || echo none)" "none"
+expect_eq "rt_up kubernetes: helm upgrade --install --wait --timeout 10m --skip-crds on the context" \
+  "$(grep -c '^--kube-context ci upgrade --install portcullis .* -n portcullis --skip-crds --wait --timeout 10m -f .*/secrets/kube/values.yaml' "$KS/helm-calls")" 1
+k_fixtures; k15_root
+OUT="$(kt "set -euo pipefail; $K15_ENV; _kube_registry_digest() { echo \"\${1%:*}@sha256:$(printf '%064d' 3)\"; }; kube_netpol_probe() { :; }; _rtk_up" </dev/null)"
+expect_eq "rt_up kubernetes (under the CLI's set -euo pipefail): success → the objects live and the digest cache" \
+  "$(printf '%s\n' "$OUT" | tail -n1):$(test -e "$KS/live/Secret.portcullis-env.json" && echo true || echo false):$(jq -r '.hub' "$K15/secrets/kube/digests.json")" \
+  "rc=0:true:ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 3)"
+# _kube_keygen: created, waited for, read, deleted; a pod that never runs
+# says why (phase, the container's waiting reason, events), never its logs.
+k_fixtures; rm -f "$KS/order"
+OUT="$(kt "_K_IMAGES='{\"domains\":\"localhost/portcullis-domains@sha256:$(printf '%064d' 5)\"}'; _kube_keygen domains 10004" 2>/dev/null)"
+expect_eq "_kube_keygen kubernetes: the key read by exec cat from the pod's memory emptyDir, never its logs; create → wait → exec" \
+  "$(printf '%s\n' "$OUT" | grep -c '^AGE-SECRET-KEY-1KUBE'):$(grep -E '^(create pod|wait|logs|exec)' "$KS/order" | cut -d' ' -f1 | tr '\n' ',')" "1:create,wait,exec,"
+expect_eq "_kube_keygen kubernetes: a restricted pod (non-root 10004, no token, drop ALL, read-only root, RuntimeDefault)" \
+  "$(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(.kind == "Pod") | [.spec.securityContext.runAsUser, .spec.automountServiceAccountToken, .spec.containers[0].securityContext.capabilities.drop, .spec.containers[0].securityContext.readOnlyRootFilesystem, .spec.securityContext.seccompProfile.type, .spec.containers[0].command[3], (.spec.containers[0].command[2] | test("keygen > /k/key.tmp")), .spec.volumes[0].emptyDir.medium]' 2>/dev/null)" \
+  '[10004,false,["ALL"],true,"RuntimeDefault","domains",true,"Memory"]'
+rm -f "$KS/order"
+OUT="$(kt "export STUB_WAIT_RC=1; KUBE_POD_WAIT=1 _K_IMAGES='{\"domains\":\"localhost/portcullis-domains@sha256:$(printf '%064d' 5)\"}'; _kube_keygen domains 10004")"
+case "$OUT" in *"did not complete: phase Pending; keygen: ErrImagePull failed to pull localhost/portcullis-domains@sha256:abc"*"BackOff"*"rc=1") t_pass "_kube_keygen kubernetes: a pod that never runs → its phase, waiting reason and events, rc 1" ;; *) t_fail "keygen diag: $OUT" ;; esac
+expect_eq "_kube_keygen kubernetes: a failed pod is never read" "$(grep -c '^logs\|^exec' "$KS/order" || true)" 0
+expect_eq "_kube_keygen never reads a keygen pod's logs" "$(sed -n '/^_kube_keygen() {/,/^}/p' "$HERE/../scripts/lib/kube.sh" | grep -c 'kube_ctl.* logs' || true)" 0
+
+# down never uninstalls
+k_fixtures; rm -f "$KS/order" "$KS/helm-calls"
+OUT="$(kt 'rt_down')"
+expect_eq "down never runs helm uninstall: every Deployment of both namespaces scaled to 0" \
+  "$(test -e "$KS/helm-calls" && echo helm || echo none):$(grep -c 'scale deployment --all --replicas=0' "$KS/order")" "none:2"
+expect_eq "no helm uninstall anywhere in the CLI" "$(grep -rn 'helm.*uninstall\|kube_helm uninstall' "$HERE/../scripts/lib" "$HERE/../portcullis" | grep -v '^[^:]*:[0-9]*: *#' | grep -vc 'never' || true)" 0
+# restore keeps the host's kubernetes keys
+RK="$WORK/rk"; rm -rf "$RK"; mkdir -p "$RK"
+printf 'CONTAINER_RUNTIME=kubernetes\nPORTCULLIS_KUBE_CONTEXT=ci\nPORTCULLIS_POD_CIDR=10.42.0.0/24\nPORTCULLIS_SERVICE_CIDR=10.43.0.0/16\nPORTCULLIS_KUBE_API_ENDPOINTS=10.1.0.4:6443\nPORTCULLIS_KUBE_INSTALL_ID=0b0e2b3c-1111-4222-8333-444455556666\nPORTCULLIS_DOMAIN=host.example\n' > "$RK/.env"
+OUT="$(kt "PORTCULLIS_ROOT='$RK'; unset PORTCULLIS_KUBE_CONTEXT PORTCULLIS_POD_CIDR PORTCULLIS_KUBE_INSTALL_ID; kube_forward_core() { :; }; restore_runtime_from_host >/dev/null; printf 'CONTAINER_RUNTIME=docker\nPORTCULLIS_DOMAIN=backup.example\nPORTCULLIS_KUBE_CONTEXT=backup-ctx\nPORTCULLIS_ENGINE_SOCKET=/x\n' > '$RK/.env'; _restore_runtime_keys; cat '$RK/.env'")"
+expect_eq "restore keeps CONTAINER_RUNTIME and every PORTCULLIS_KUBE_* / network key from the host, never the backup's" \
+  "$(printf '%s\n' "$OUT" | grep -E '^(CONTAINER_RUNTIME|PORTCULLIS_KUBE_CONTEXT|PORTCULLIS_POD_CIDR|PORTCULLIS_KUBE_INSTALL_ID|PORTCULLIS_ENGINE_SOCKET|PORTCULLIS_DOMAIN)=' | sort | tr '\n' ' ')" \
+  "CONTAINER_RUNTIME=kubernetes PORTCULLIS_DOMAIN=backup.example PORTCULLIS_KUBE_CONTEXT=ci PORTCULLIS_KUBE_INSTALL_ID=0b0e2b3c-1111-4222-8333-444455556666 PORTCULLIS_POD_CIDR=10.42.0.0/24 "
+# restore empties *-pw Secrets (after scaling those instances to 0)
+k_fixtures; rm -f "$KS/order"
+echo '{"items":[{"metadata":{"name":"samba--share-pw"}},{"metadata":{"name":"samba--env"}},{"metadata":{"name":"tm--share-pw"}}]}' > "$KS/kube/apps-secrets.json"
+OUT="$(kt '_kube_restore_stop_secret_apps; echo "stopped=$RESTORE_STOPPED_APPS"')"
+expect_eq "restore empties every *-pw Secret, after scaling the person-secret instances to 0 (and only those Secrets)" \
+  "$(grep -E 'scale|patch' "$KS/order" | sed 's/--type=json.*//' | tr '\n' ';'):$(printf '%s\n' "$OUT" | grep -c 'stopped=samba')" \
+  "kubectl portcullis-apps scale deployment -l portcullis.io/person-secrets --replicas=0;kubectl portcullis-apps patch secret samba--share-pw ;kubectl portcullis-apps patch secret tm--share-pw ;:1"
+# No file-sharing instance: nothing to scale (kubectl scale -l on no match
+# fails "no objects passed to scale"), the Secrets still emptied.
+rm -f "$KS/order"
+OUT="$(kt 'STUB_PS_NONE=1 _kube_restore_stop_secret_apps; echo "rc=$? stopped=[$RESTORE_STOPPED_APPS]"')"
+expect_eq "restore with no person-secret instance: no scale, every *-pw Secret emptied, nothing stopped" \
+  "$(grep -E 'scale|patch' "$KS/order" | sed 's/--type=json.*//' | tr '\n' ';'):$(printf '%s\n' "$OUT" | grep -c 'rc=0 stopped=\[\]')" \
+  "kubectl portcullis-apps patch secret samba--share-pw ;kubectl portcullis-apps patch secret tm--share-pw ;:1"
+rm -f "$KS/order"; : > "$KS/order"
+OUT="$(kt 'STUB_PS_LIST_FAIL=1 _kube_restore_stop_secret_apps; echo "rc=$? msg=$_RESTORE_ERROR_MSG"')"
+expect_eq "restore: an unreadable person-secret list refuses before anything changes" \
+  "$(grep -cE 'scale|patch' "$KS/order" 2>/dev/null || true):$(printf '%s\n' "$OUT" | grep -c 'rc=1 msg=could not list the person-secret instances')" "0:1"
+rm -f "$KS/order"; : > "$KS/order"; mv "$KS/kube/apps-secrets.json" "$KS/kube/apps-secrets.json.bak"; printf 'not json' > "$KS/kube/apps-secrets.json"
+OUT="$(kt '_kube_restore_stop_secret_apps; echo "rc=$? msg=$_RESTORE_ERROR_MSG"')"
+mv "$KS/kube/apps-secrets.json.bak" "$KS/kube/apps-secrets.json"
+expect_eq "restore: an unreadable Secret list refuses (a credential would survive the restore)" \
+  "$(grep -c 'patch' "$KS/order" 2>/dev/null || true):$(printf '%s\n' "$OUT" | grep -c "rc=1 msg=could not list the apps' Secrets")" "0:1"
+# The kubernetes restore puts the backup's secret variables (portcullis-env:
+# POSTGRES_PASSWORD) live BEFORE the emptied Postgres starts: it initialises
+# with that password, which Keycloak then reads (the old one = Keycloak never
+# connects again).
+RB="$(sed -n '/^_backup_restore_kube() {/,/^}/p' "$HERE/../scripts/lib/kube.sh")"
+expect_eq "kube restore: kube_sync_secrets after the .env is restored and before the fresh Postgres" \
+  "$(printf '%s\n' "$RB" | awk '/cat "\$dir\/.env"/ {printf "cat "} /kube_sync_secrets/ {printf "kube_sync_secrets "} /_kube_empty_volume postgres_data/ {printf "_kube_empty_volume "}')" \
+  "cat kube_sync_secrets _kube_empty_volume "
+# The LLDAP guard on kubernetes counts LLDAP's users from its PVC (never the
+# docker-only volume helper), and still refuses an empty LLDAP.
+OUT="$(kt '_restore_lldap_count() { echo DOCKER-HELPER; }; _restore_kc_federated_count() { echo 5; }; _kube_restore_lldap_count() { echo 3; }; _restore_lldap_guard false; echo "rc=$?"')"
+expect_eq "restore's LLDAP guard on kubernetes: LLDAP's own count (3 users, 5 federated) → goes on, the docker helper never runs" \
+  "$(printf '%s\n' "$OUT" | grep -c DOCKER-HELPER):$(printf '%s\n' "$OUT" | tail -n1)" "0:rc=0"
+OUT="$(kt '_restore_kc_federated_count() { echo 5; }; _kube_restore_lldap_count() { echo 0; }; _restore_lldap_guard false; echo "rc=$?"' 2>&1)"
+case "$OUT" in *"LLDAP has no users (0) but the restored Keycloak database has 5 federated users"*"rc=1"*) t_pass "restore's LLDAP guard on kubernetes: an empty LLDAP with federated Keycloak users refuses" ;; *) t_fail "kube lldap guard empty: $OUT" ;; esac
+# status on kubernetes: a Deployment whose pods crash-loop or restarted in
+# the last 10 minutes is a problem; a Job's pod, an old restart and a
+# terminating pod are not; an unreadable pod list is "unknown" (fail closed).
+NOWISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; OLDISO="2020-01-01T00:00:00Z"
+REC="$(date -u -d '-2 min' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-2M +%Y-%m-%dT%H:%M:%SZ)"
+CRASH_CORE='{"items":[
+ {"metadata":{"name":"hub-6ccdd8956b-w4tm4","labels":{"pod-template-hash":"6ccdd8956b"},"ownerReferences":[{"kind":"ReplicaSet","name":"hub-6ccdd8956b"}]},
+  "status":{"containerStatuses":[{"restartCount":4,"state":{"waiting":{"reason":"CrashLoopBackOff"}},"lastState":{"terminated":{"finishedAt":"'"$NOWISO"'"}}}]}},
+ {"metadata":{"name":"lldap-685d98967d-hz4l9","labels":{"pod-template-hash":"685d98967d"},"ownerReferences":[{"kind":"ReplicaSet","name":"lldap-685d98967d"}]},
+  "status":{"containerStatuses":[{"restartCount":1,"state":{"running":{}},"lastState":{"terminated":{"finishedAt":"'"$OLDISO"'"}}}]}},
+ {"metadata":{"name":"oneshot-x","ownerReferences":[{"kind":"Job","name":"oneshot"}]},
+  "status":{"containerStatuses":[{"restartCount":0,"state":{"waiting":{"reason":"Error"}}}]}},
+ {"metadata":{"name":"vault-58c5dcfdf7-old","deletionTimestamp":"'"$NOWISO"'","labels":{"pod-template-hash":"58c5dcfdf7"},"ownerReferences":[{"kind":"ReplicaSet","name":"vault-58c5dcfdf7"}]},
+  "status":{"containerStatuses":[{"restartCount":0,"state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}}]}'
+CRASH_APPS='{"items":[
+ {"metadata":{"name":"echo-k--web-5d9f7c8b6-abcde","labels":{"pod-template-hash":"5d9f7c8b6"},"ownerReferences":[{"kind":"ReplicaSet","name":"echo-k--web-5d9f7c8b6"}]},
+  "status":{"containerStatuses":[{"restartCount":2,"ready":false,"state":{"running":{}},"lastState":{"terminated":{"finishedAt":"'"$REC"'"}}}]}},
+ {"metadata":{"name":"fa--x-6b7c8d9e0-zzzzz","labels":{"pod-template-hash":"6b7c8d9e0"},"ownerReferences":[{"kind":"ReplicaSet","name":"fa--x-6b7c8d9e0"}]},
+  "status":{"containerStatuses":[{"restartCount":3,"ready":true,"state":{"running":{}},"lastState":{"terminated":{"finishedAt":"'"$REC"'"}}}]}}]}'
+printf '%s' "$CRASH_CORE" > "$WORK/crash-core.json"; printf '%s' "$CRASH_APPS" > "$WORK/crash-apps.json"
+cj() { kt "kube_ctl() { case \"\$*\" in *'-n portcullis get pods -o json'*) ${1:-cat '$WORK/crash-core.json'} ;; *'-n portcullis-apps get pods -o json'*) cat '$WORK/crash-apps.json' ;; esac; }; kube_crashing_json"; }
+expect_eq "kube_crashing_json: the crash-looping Hub and an app restarted 2 min ago and not ready; not one ready again, an old restart, a Job's pod or a terminating pod" \
+  "$(cj | head -n1 | jq -c '[.[] | [.namespace, .deployment, .reason]]')" \
+  '[["portcullis","hub","CrashLoopBackOff"],["portcullis-apps","echo-k--web","restarted"]]'
+expect_eq "kube_crashing_json: an unreadable pod list → null (status counts it a problem)" "$(cj 'return 1' | head -n1)" "null"
+# status --json runtime
+OUT="$(kt 'kube_status_json v1.37.2+k3s1')"
+expect_eq "status --json runtime.name = kubernetes, runtime.context set, version, the § 6 rows as checks" \
+  "$(printf '%s\n' "$OUT" | head -n1 | jq -c '[.name, .context, .version, (.checks | length > 5)]')" '["kubernetes","ci","v1.37.2+k3s1",true]'
+# vpn init on kubernetes: the people key from wg keypair (variables), never argv
+k_fixtures; k15_root
+OUT="$(kt "PORTCULLIS_ROOT='$K15'; export STUB_WG_PRIV=UFJJVkFURS1LRVktOTk5 STUB_WG_PUB=UFVC; vpn_genkey_kube; cat '$K15/secrets/wg/people.key'; file_mode '$K15/secrets/wg/people.key'")"
+expect_eq "vpn init kubernetes: people key from wg keypair (only the private key, 0640, in place)" "$(printf '%s\n' "$OUT" | head -n2 | tr '\n' ' ')" "UFJJVkFURS1LRVktOTk5 640 "
+expect_eq "vpn init kubernetes: the private key never on argv" "$(grep -c 'UFJJVkFURS1LRVktOTk5' "$KS/kubectl-calls" || true)" 0
+OUT="$(kt 'vpn_overlaps 10.42.0.0/22 "$(kube_vpn_reserved)" "{\"local_networks\":[],\"provider_ranges\":[]}"')"
+case "$OUT" in *10.42.0.0/24*) t_pass "vpn init kubernetes: a subnet over the pod CIDR → refused" ;; *) t_fail "vpn pod cidr overlap: $OUT" ;; esac
+OUT="$(kt 'vpn_overlaps 10.213.0.0/22 "$(kube_vpn_reserved)" "{\"local_networks\":[],\"provider_ranges\":[]}"')"
+expect_eq "vpn init kubernetes: 10.213.0.0/22 is free of the pod / service CIDRs and the nodes" "$OUT" "rc=0"
+# signin reset-core on kubernetes: Hub to 0, the one-shot, Hub to 1 (also on failure)
+k_fixtures; k15_root; rm -f "$KS/order"
+for RC_RUN in 0 1; do
+  rm -f "$KS/order"
+  # Under the CLI's own set -euo pipefail (a SIGPIPE'd pipeline must not abort it).
+  OUT="$(kt "set -euo pipefail; $K15_ENV; export STUB_RUN_RC=$RC_RUN; kube_images_ready() { _K_IMAGES='{}'; }; kube_render_values() { : > '$K15/secrets/kube/values.yaml'; }; signin_reset_core" </dev/null)"
+  expect_eq "signin reset-core kubernetes (run rc $RC_RUN): Hub scaled to 0, the one-shot, Hub scaled to 1" \
+    "$(grep -E 'scale deploy/hub|kubectl run' "$KS/order" | sed 's/^kubectl portcullis //' | tr '\n' ';')" "scale deploy/hub --replicas=0;kubectl run;scale deploy/hub --replicas=1;"
+done
+expect_eq "rt_run kubernetes: the chart's one-shot pod (its image), the argv appended to its entrypoint, stdin attached, removed after" \
+  "$(grep '^--context ci -n portcullis run oneshot-hub-' "$KS/kubectl-calls" | tail -n1 | sed -n 's/.*--overrides=//p' | jq -c '[.spec.containers[0].command, .spec.containers[0].stdin, .spec.containers[0].image]'):$(grep -c -- '--restart=Never --rm -i --quiet' "$KS/kubectl-calls")" \
+  "[[\"/usr/local/bin/hub\",\"signin\",\"reset-core\"],true,\"ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 1)\"]:2"
+# cert revoke / sync bump the annotation
+k_fixtures; k15_root; rm -f "$KS/order" "$KS/kubectl-stdin"
+OUT="$(kt "PORTCULLIS_ROOT='$K15'; kube_revocation_bump")"
+expect_eq "cert revoke bumps portcullis.io/rev on group-gate's pod after syncing certs-revocation" \
+  "$(grep -c 'create configmap certs-revocation' "$KS/order"):$(grep -c 'annotate pod -l portcullis.io/component=group-gate --overwrite portcullis.io/rev=' "$KS/order")" "1:1"
+expect_eq "cert sync calls the kubernetes bump" "$(sed -n '/^cert_sync() {/,/^}/p' "$HERE/../scripts/lib/certs.sh" | grep -c 'kube_revocation_bump')" 1
+# runtime_export under kubernetes: the pod + service CIDR are reserved (K-P11).
+expect_eq "runtime_export kubernetes: PORTCULLIS_VPN_RUNTIME_POOLS = pod + service CIDR" \
+  "$(kt 'runtime_export; echo "$PORTCULLIS_VPN_RUNTIME_POOLS"' | head -n1)" "10.42.0.0/24 10.43.0.0/16"
+# hub_env_write: the _SOURCE pair (contract §2), the kube keys for the Hub.
+HW="$WORK/hw"; rm -rf "$HW"; mkdir -p "$HW/secrets/hub"
+( export PORTCULLIS_ROOT="$HW" CONTAINER_RUNTIME=docker PORTCULLIS_TRAEFIK_IP=172.31.250.2 PORTCULLIS_MCP_GATE_IP=172.31.250.3; hub_env_write )
+expect_eq "hub_env_write: PORTCULLIS_TRAEFIK_SOURCE / _MCP_GATE_SOURCE = <ip>/32 on docker, no kube keys" \
+  "$(grep -E '^PORTCULLIS_(TRAEFIK|MCP_GATE)_SOURCE=|^PORTCULLIS_(POD_CIDR|SERVICE_CIDR|WG_EDGE_SERVICE_IP|RUNTIME_ROOTS|KUBE_CONTEXT|KUBE_NODE_ADDRESSES)=' "$HW/secrets/hub/core.env")" \
+  "PORTCULLIS_TRAEFIK_SOURCE=172.31.250.2/32
+PORTCULLIS_MCP_GATE_SOURCE=172.31.250.3/32"
+kt "PORTCULLIS_ROOT='$HW'; PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.0.22 PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.1'; hub_env_write" >/dev/null
+expect_eq "hub_env_write: PORTCULLIS_TRAEFIK_SOURCE = the pod CIDR on kubernetes, plus the CIDRs, wg-edge, the runtime roots, the context and the node addresses" \
+  "$(grep -E '^PORTCULLIS_(TRAEFIK|MCP_GATE)_SOURCE=|^PORTCULLIS_(POD_CIDR|SERVICE_CIDR|WG_EDGE_SERVICE_IP|TRAEFIK_SERVICE_IP|RUNTIME_ROOTS|KUBE_CONTEXT|KUBE_NODE_ADDRESSES)=' "$HW/secrets/hub/core.env")" \
+  "PORTCULLIS_TRAEFIK_SOURCE=10.42.0.0/24
+PORTCULLIS_MCP_GATE_SOURCE=10.42.0.0/24
+PORTCULLIS_POD_CIDR=10.42.0.0/24
+PORTCULLIS_SERVICE_CIDR=10.43.0.0/16
+PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.0.22
+PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20
+PORTCULLIS_RUNTIME_ROOTS=/var/lib/rancher/k3s /var/lib/portcullis-storage
+PORTCULLIS_KUBE_CONTEXT=ci
+PORTCULLIS_KUBE_NODE_ADDRESSES=10.1.0.4 198.51.100.1"
+OUT="$(kt "PORTCULLIS_ROOT='$HW'; unset PORTCULLIS_POD_CIDR; hub_env_write")"
+case "$OUT" in *"PORTCULLIS_POD_CIDR is not set (.env): refusing to write an empty PORTCULLIS_TRAEFIK_SOURCE"*"rc=1") t_pass "hub_env_write kubernetes: no PORTCULLIS_POD_CIDR → refused (never an empty _SOURCE)" ;; *) t_fail "hub_env_write empty pod cidr: $OUT" ;; esac
+# jq 1.8: `A and B as $x | C` binds (A and B) to $x (jq 1.7 bound B
+# alone): the two readings differ, so the kubernetes filters write the
+# parentheses out.
+JQF='{"items":[{"ok":true,"n":1}]}'
+expect_eq "jq 1.8 precedence fixture: (A and B) as \$x and A and (B as \$x | …) differ" \
+  "$(printf '%s' "$JQF" | jq -c '.items[0] | (.ok and .n) as $x | [$x]')|$(printf '%s' "$JQF" | jq -c '.items[0] | .ok and (.n as $x | [$x])')" "[true]|true"
+expect_eq "every jq '... and/or ... as \$x' in the kubernetes code is parenthesised" \
+  "$(grep -nE '(and|or) [^|()]+ as [$]' "$HERE/../scripts/lib/kube.sh" || true)" ""
 
 echo ""
 echo "$PASS passed, $FAIL failed"

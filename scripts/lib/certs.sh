@@ -92,6 +92,9 @@ write_revoked_serials() {
 
 cert_sync() {
   write_revoked_serials "$REVOKED_FILE" || fail "Could not refresh $REVOKED_FILE (left unchanged)."
+  # Kubernetes: the certs-revocation ConfigMap now, and group-gate's pod
+  # annotation bumped so the kubelet resyncs the volume at once.
+  if _rt_is_kube; then kube_revocation_bump || fail "could not deliver the revoked-serial list to group-gate (ConfigMap certs-revocation)"; fi
   ok "Revoked-serial list updated: $REVOKED_FILE ($(grep -vc '^#' "$REVOKED_FILE" || true) serial(s))"
 }
 

@@ -1,0 +1,59 @@
+{{- /* group-gate (compose: group-gate). /etc/group-gate is one projected
+volume (map.conf, revocation/, ca/: compose's four binds, no nested
+mounts); its revocation list updates in place. Its VPN mode comes from its own env
+(vpn.mode / vpn.publicEnrol): break-glass `vpn mode apps` with the Hub at 0. */ -}}
+{{- $s := dict
+  "name" "group-gate" "uid" .Values.uids.groupGate "gid" .Values.uids.groupGate
+  "groups" (list .Values.uids.hub .Values.uids.vpnDoc)
+  "memory" "128Mi" "nets" (list "portcullis") "egress" true
+  "hashes" (list "config-group-gate" "certs" "certs-revocation")
+  "health" (dict "test" (list "sh" "-c" "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3)\"") "interval" 10 "timeout" 5 "retries" 3)
+  "ports" (list (dict "name" "http" "port" 8080))
+  "env" (list
+    (dict "name" "GATE_POLICY_FILE" "value" "/hub-data/group-gate-policy.json")
+    (dict "name" "GATE_ATTRIBUTES_FILE" "value" "/hub-data/user-attributes.json")
+    (dict "name" "GATE_PORTAL_FILE" "value" "/hub-data/portal-apps.json")
+    (dict "name" "GATE_REVOKED_FILE" "value" "/etc/group-gate/revocation/revoked-serials.txt")
+    (dict "name" "GATE_CRL_URLS" "value" "http://vault:8200/v1/pki_int/crl http://vault:8200/v1/pki_file/crl")
+    (dict "name" "GATE_DELTA_CRL_URLS" "value" "http://vault:8200/v1/pki_int/crl/delta http://vault:8200/v1/pki_file/crl/delta")
+    (dict "name" "GATE_YUBIKEY_CA_FILE" "value" "/etc/group-gate/ca/yubikey-ca.crt")
+    (dict "name" "GATE_BROWSER_CA_FILE" "value" "/etc/group-gate/ca/browser-ca.crt")
+    (dict "name" "GATE_OPENED_DIR" "value" "/data/opened")
+    (dict "name" "GATE_IMPERSONATION_FILE" "value" "/hub-data/impersonation.json")
+    (dict "name" "GATE_VPN_FILE" "value" "/vpn-doc/vpn.json")
+    (dict "name" "GATE_VPN_MODE" "value" .Values.vpn.mode)
+    (dict "name" "GATE_VPN_PUBLIC_ENROL" "value" (.Values.vpn.publicEnrol | toString))
+    (dict "name" "GATE_CORE_SUBNETS" "value" (printf "%s %s" .Values.vpn.coreSubnets .Values.vpn.reservedPools | trim))
+    (dict "name" "PORTCULLIS_DOMAIN" "value" (include "portcullis.domain" .)))
+  "mounts" (list
+    (dict "name" "etc" "mountPath" "/etc/group-gate" "readOnly" true)
+    (dict "name" "hub-data" "mountPath" "/hub-data" "readOnly" true)
+    (dict "name" "vpn-doc" "mountPath" "/vpn-doc" "readOnly" true)
+    (dict "name" "data" "mountPath" "/data")
+    (dict "name" "tmp" "mountPath" "/tmp"))
+  "volumes" (list
+    (dict "name" "etc" "projected" (dict "sources" (list
+      (dict "configMap" (dict "name" "config-group-gate" "items" (list (dict "key" "group-gate-map.conf" "path" "map.conf"))))
+      (dict "configMap" (dict "name" "certs-revocation" "items" (list (dict "key" "revoked-serials.txt" "path" "revocation/revoked-serials.txt"))))
+      (dict "configMap" (dict "name" "certs" "items" (list (dict "key" "yubikey-ca.crt" "path" "ca/yubikey-ca.crt") (dict "key" "browser-ca.crt" "path" "ca/browser-ca.crt")))))))
+    (dict "name" "hub-data" "persistentVolumeClaim" (dict "claimName" "hub-data" "readOnly" true))
+    (dict "name" "vpn-doc" "persistentVolumeClaim" (dict "claimName" "vpn-doc" "readOnly" true))
+    (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "group-gate-data"))
+    (dict "name" "tmp" "emptyDir" (dict "medium" "Memory")))
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+---
+{{ include "portcullis.pvc" (list . "group-gate-data" .Values.uids.groupGate .Values.uids.hub "0750") }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: group-gate
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    portcullis.io/component: group-gate
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

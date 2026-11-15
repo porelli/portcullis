@@ -27,7 +27,10 @@ runs:
         heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
         if ! [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || [ "$REF" = main ] || [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
             || ! awk -v r="refs/heads/$REF" '$2 == r { f = 1 } END { exit !f }' <<<"$heads"; then
-          img="$(docker compose config --format json | jq -r .services.keycloak.image)"
+          # compose's default, read without interpolation (no .env needed:
+          # e2e-k3s runs this before any exists); KEYCLOAK_IMAGE wins as in compose.
+          img="${KEYCLOAK_IMAGE:-$(docker compose config --no-interpolate --format json | jq -r .services.keycloak.image | sed -E 's/^\$\{KEYCLOAK_IMAGE:-(.*)\}$/\1/')}"
+          [[ "$img" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+(:[A-Za-z0-9._-]+)?(@sha256:[0-9a-f]{64})?$ ]] || { echo "::error::cannot read the Keycloak image from compose (got '$img')"; exit 1; }
           # Retried: a registry hiccup now and then.
           for i in 1 2 3; do
             docker pull --quiet "$img" >/dev/null && break

@@ -80,6 +80,7 @@ _vpn_set() {
 # line. Fails on a docker error (fail closed: init refuses to go on).
 _vpn_docker_subnets() {
   local ids
+  _rt_docker_only
   ids="$(docker network ls -q)" || return 1
   [ -n "$ids" ] || return 0
   # shellcheck disable=SC2086  # network ids
@@ -90,7 +91,7 @@ _vpn_docker_subnets() {
 # the Hub's control socket /tmp/hub-host.sock (0600) answers that uid only.
 # Arguments are names and ids; the public key goes on stdin.
 _vpn_hub() {
-  dc exec -T -u "$CT_UID_HUB:$CT_UID_HUB" hub hub vpn "$@"
+  rt_exec -i hub -- hub vpn "$@"
 }
 
 # _vpn_hub_wait — the Hub's host-info JSON object, waiting up to
@@ -103,7 +104,7 @@ _vpn_hub() {
 _vpn_hub_wait() {
   local limit="${VPN_HUB_WAIT:-120}" st info start=$SECONDS
   while :; do
-    st="$(container_health hub)"
+    st="$(rt_health hub)"
     case "$st" in
       healthy|running|starting|restarting) ;;
       *) fail "the Hub isn't running (state: $st): ./portcullis up first" ;;
@@ -204,6 +205,19 @@ _vpn_valid_subnet() {
 # root has no CAP_DAC_OVERRIDE here and couldn't write an operator-owned
 # 0640 file), no network, no capability, read-only; the key is never
 # printed. Then wg's group may read it (0640 group 10006).
+# vpn_genkey_kube — kubernetes (K16): a key pair from `/wg keypair` in the
+# running wg pod, kept in a shell variable; only the private key written,
+# in place, into secrets/wg/people.key (0640). Never argv, never a temp file.
+vpn_genkey_kube() {
+  local key="$PORTCULLIS_ROOT/secrets/wg/people.key" kp
+  [ -f "$key" ] || fail "$key is missing (./portcullis up creates the placeholder)"
+  kp="$(rt_exec wg -- /wg keypair)" || fail "wg keypair failed"
+  KP="$kp" jq -rn 'env.KP | fromjson | .private_key' > "$key" || { unset kp; fail "wg keypair: unexpected output"; }
+  unset kp
+  chmod 640 "$key"
+  [ -s "$key" ] || fail "wg keypair wrote no key"
+}
+
 vpn_genkey() {
   local key="$PORTCULLIS_ROOT/secrets/wg/people.key"
   [ -f "$key" ] || fail "$key is missing (./portcullis up creates the placeholder)"
@@ -237,8 +251,8 @@ vpn_status_json() {
   local st="" prov="" enabled=false
   if _vpn_profiles_has_wg; then
     enabled=true
-    st="$(dc exec -T wg /wg status 2>/dev/null)" || st=""
-    prov="$(dc exec -T wg /wg providers 2>/dev/null)" || prov=""
+    st="$(rt_exec wg -- /wg status 2>/dev/null)" || st=""
+    prov="$(rt_exec wg -- /wg providers 2>/dev/null)" || prov=""
   fi
   jq -n --argjson en "$enabled" --arg mode "${PORTCULLIS_VPN_MODE:-apps}" --arg pe "${PORTCULLIS_VPN_PUBLIC_ENROL:-true}" \
     --arg bi "${PORTCULLIS_VPN_BUILTIN:-off}" --arg port "${PORTCULLIS_VPN_PORT:-$VPN_DEFAULT_PORT}" \
@@ -397,7 +411,13 @@ vpn_init() {
     case "$pool" in fail*) fail "${pool#fail$'\t'}" ;; esac
   fi
   info="$(_vpn_hub_wait)" || exit 1  # _vpn_hub_wait printed why
-  subnets="$(_vpn_docker_subnets)" || fail "could not list the Docker networks' subnets"
+  # Kubernetes: the pod and service CIDRs and the node addresses (K-P11),
+  # instead of Docker's networks.
+  if _rt_is_kube; then
+    subnets="$(kube_vpn_reserved)" || fail "could not read the cluster's networks"
+  else
+    subnets="$(_vpn_docker_subnets)" || fail "could not list the Docker networks' subnets"
+  fi
   if [ "$builtin" = on ]; then
     conflicts="$(vpn_overlaps "$subnet" "$subnets" "$info")"
     if [ -n "$conflicts" ]; then
@@ -422,7 +442,7 @@ vpn_init() {
   _vpn_set COMPOSE_PROFILES "$(_vpn_profiles_with_wg)"
   _vpn_set PORTCULLIS_VPN_PORT "$port"
   _vpn_set PORTCULLIS_VPN_SUBNET "$subnet"
-  if [ "$builtin" = on ] && [ ! -s "$PORTCULLIS_ROOT/secrets/wg/people.key" ]; then
+  if [ "$builtin" = on ] && [ ! -s "$PORTCULLIS_ROOT/secrets/wg/people.key" ] && ! _rt_is_kube; then
     info "Generating the built-in VPN's key..."
     vpn_genkey
   fi
@@ -431,8 +451,17 @@ vpn_init() {
   vpn_prom_targets
   if declare -F monitoring_fix_perms >/dev/null; then monitoring_fix_perms; fi
   info "Starting wg, Traefik and the Hub..."
-  stack_compose_up wg traefik hub || fail "could not start wg, Traefik and the Hub"
+  rt_up wg traefik hub || fail "could not start wg, Traefik and the Hub"
   wait_healthy 120 wg
+  # Kubernetes (K16): wg runs the edge role alone with the empty key; the
+  # key is made by `wg keypair` in it, then synced and wg restarted.
+  if _rt_is_kube && [ "$builtin" = on ] && [ ! -s "$PORTCULLIS_ROOT/secrets/wg/people.key" ]; then
+    info "Generating the built-in VPN's key..."
+    vpn_genkey_kube
+    rt_up || fail "could not deliver the people key to wg"
+    rt_restart wg >/dev/null || fail "could not restart wg"
+    wait_healthy 120 wg
+  fi
   ok "The VPN service is up (built-in VPN $builtin$([ "$builtin" = on ] && echo ", UDP port $port, subnet $subnet")). Wire marketplace VPNs in the Hub; add devices on the Sign-in page or with ./portcullis vpn add-device."
 }
 
@@ -451,7 +480,7 @@ vpn_mode() {
   done < <(vpn_entrypoints "$mode" "$pe")
   hub_env_write
   info "Recreating core with VPN mode $mode..."
-  stack_compose_up || fail "could not recreate core (the .env is written: run ./portcullis up)"
+  rt_up || fail "could not recreate core (the .env is written: run ./portcullis up)"
   ok "VPN mode $mode."
 }
 
@@ -462,27 +491,36 @@ vpn_builtin() {
   _vpn_profiles_has_wg || fail "the VPN service isn't set up: run ./portcullis vpn init first"
   case "$1" in
     on)
-      [ -s "$key" ] || { info "Generating the built-in VPN's key..."; vpn_genkey; } ;;
+      if [ ! -s "$key" ]; then
+        info "Generating the built-in VPN's key..."
+        if _rt_is_kube; then vpn_genkey_kube; else vpn_genkey; fi
+      fi ;;
     off)
       [ -f "$key" ] || fail "$key is missing (./portcullis up creates the placeholder)"
       : > "$key" ;;
   esac
   _vpn_set PORTCULLIS_VPN_BUILTIN "$1"
   hub_env_write
+  if _rt_is_kube; then
+    # The release carries WG_PEOPLE and the key Secret: applied, wg rolled.
+    rt_up || fail "could not apply the release with the built-in VPN $1"
+    rt_restart wg >/dev/null || fail "could not restart wg"
+    ok "The built-in VPN is $1."
+    return 0
+  fi
   runtime_build_service wg || fail "could not build the wg image"
   # up applies a changed WG_PEOPLE; the restart makes wg read the key file
   # again (it reads it at start) when only the key changed.
-  # shellcheck disable=SC2046  # runtime_no_build prints one flag or nothing
-  dc up -d --no-deps $(runtime_no_build) wg || fail "could not recreate wg"
-  dc restart wg >/dev/null || fail "could not restart wg"
+  rt_up_service wg || fail "could not recreate wg"
+  rt_restart wg >/dev/null || fail "could not restart wg"
   ok "The built-in VPN is $1."
 }
 
 vpn_add_device() {
   local user="$1" name="$2" kp pub cfg conf
-  [ -n "$(dc ps -q --status running wg 2>/dev/null)" ] || fail "wg isn't running: ./portcullis vpn init first"
+  rt_running wg || fail "wg isn't running: ./portcullis vpn init first"
   _vpn_hub_ready || exit 1  # before the key pair: _vpn_hub_wait printed why
-  kp="$(dc exec -T wg /wg keypair)" || fail "wg keypair failed"
+  kp="$(rt_exec wg -- /wg keypair)" || fail "wg keypair failed"
   pub="$(KP="$kp" jq -rn 'env.KP | fromjson | .public_key')" || { unset kp; fail "wg keypair: unexpected output"; }
   cfg="$(printf '%s\n' "$pub" | _vpn_hub add-device --user "$user" --name "$name")" \
     || { unset kp; fail "the Hub refused the device (see above)"; }
@@ -492,7 +530,7 @@ vpn_add_device() {
     || { unset kp; fail "the Hub's answer isn't a device config"; }
   unset kp
   printf '# WireGuard config for %s (%s): import it, or scan the QR code below. Shown once.\n%s\n\n' "$user" "$name" "$conf"
-  printf '%s\n' "$conf" | dc exec -T wg /wg qr || warn "could not draw the QR code"
+  printf '%s\n' "$conf" | rt_exec -i wg -- /wg qr || warn "could not draw the QR code"
   unset conf
 }
 

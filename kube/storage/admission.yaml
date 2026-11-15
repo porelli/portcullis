@@ -1,0 +1,51 @@
+# Core's guard on portcullis-storage (core-only, not one of the Hub's five):
+# PSA can't be baseline there (the helper pods need their hostPath), so this
+# pins what runs: the provisioner (its ServiceAccount, its pinned image,
+# non-root, no capability) and its helper pods (the pinned helper image,
+# hostPath only under /var/lib/portcullis-storage, nothing added, no new
+# privileges). Anything else is refused.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: portcullis-storage-pods
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  variables:
+    - name: provisioner
+      expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == 'portcullis-local-path' && object.spec.containers.all(c, c.image == 'docker.io/rancher/local-path-provisioner:v0.0.37@sha256:e757967a5ec338f6a9b371c5a9688bedaa8c3578ea3dd4db329ea0084be0a86f')"
+    - name: helper
+      expression: "object.spec.containers.all(c, c.image == 'docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a')"
+  validations:
+    - expression: "variables.provisioner || variables.helper"
+      message: "only the Portcullis provisioner and its helper pods run in portcullis-storage"
+    - expression: >-
+        object.spec.containers.all(c, has(c.securityContext) && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false
+          && !(has(c.securityContext.privileged) && c.securityContext.privileged)
+          && (!has(c.securityContext.capabilities) || !has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0))
+      message: "no privileged container, no added capability, no privilege escalation"
+    - expression: "!(has(object.spec.hostNetwork) && object.spec.hostNetwork) && !(has(object.spec.hostPID) && object.spec.hostPID) && !(has(object.spec.hostIPC) && object.spec.hostIPC)"
+      message: "no host namespaces"
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(v, !has(v.hostPath)
+          || (variables.helper && !v.hostPath.path.contains('/..') && (v.hostPath.path == '/var/lib/portcullis-storage' || v.hostPath.path.startsWith('/var/lib/portcullis-storage/'))))
+      message: "hostPath only for the helpers, under /var/lib/portcullis-storage"
+    - expression: "variables.helper || (has(object.spec.securityContext) && has(object.spec.securityContext.runAsNonRoot) && object.spec.securityContext.runAsNonRoot)"
+      message: "the provisioner runs non-root"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: portcullis-storage-guard-pods
+spec:
+  policyName: portcullis-storage-pods
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: portcullis-storage

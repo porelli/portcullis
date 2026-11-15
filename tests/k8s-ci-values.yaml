@@ -1,0 +1,23 @@
+# The chart's values for the static checks (tests/k8s_*.py,
+# .github/ci/unit-tests-kube-static.sh): a k3s-default cluster, every
+# profile on. Images come from charts/portcullis/images.yaml (k8s_lib.py
+# gives the tag_refs fixed fake digests).
+domain: ci.example.org
+podCIDR: 10.42.0.0/24
+serviceCIDR: 10.43.0.0/16
+apiEndpoints: ["10.1.0.4:6443"]
+nodeAddresses: ["10.1.0.4", "198.51.100.1"]
+traefikServiceIP: 10.43.0.20
+traefikVPNServiceIP: 10.43.0.21
+wgEdgeServiceIP: 10.43.0.22
+monitoring:
+  enabled: true
+wg:
+  enabled: true
+vpn:
+  reservedPools: "10.42.0.0/24 10.43.0.0/16"
+acme:
+  email: admin@ci.example.org
+installID: 0b0e2b3c-1111-4222-8333-444455556666
+hashes:
+  certs: "0000"

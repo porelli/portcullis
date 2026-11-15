@@ -10,6 +10,7 @@
 # nothing when it serves, is off, or isn't running.
 _st_mcp_refusing() {
   local cid
+  _rt_docker_only
   cid="$(dc ps -q mcp-gate 2>/dev/null | head -n1)"
   [ -n "$cid" ] || return 0
   docker inspect --format '{{json .State.Health}}' "$cid" 2>/dev/null \
@@ -155,7 +156,7 @@ status_run() {
   [ "$(printf '%s' "$rt_json" | jq '[.checks[] | select(.status == "fail")] | length')" = 0 ] || problems=1
 
   # ── services ──
-  svc_raw="$(dc ps -a --format json 2>/dev/null || true)"
+  svc_raw="$(rt_ps --json 2>/dev/null || true)"
   # compose prints one object per line (or one array on older versions).
   services="$(printf '%s\n' "$svc_raw" | jq -cs '
       (if length == 1 and (.[0] | type) == "array" then .[0] else . end)
@@ -216,7 +217,7 @@ status_run() {
 
   # ── keycloak (health on the unpublished management port → docker health) ──
   local kc_health users=null realm=false fwd=false passkey=null otp=null
-  kc_health="$(container_health keycloak)"
+  kc_health="$(rt_health keycloak)"
   [ "$kc_health" = healthy ] || problems=1
   if [ "$kc_health" = healthy ] && [ -n "${KEYCLOAK_ADMIN_PASSWORD:-}" ] && (kc_login >/dev/null 2>&1); then
     kc_login >/dev/null 2>&1
@@ -241,17 +242,29 @@ status_run() {
   clock="$(status_clock_synced)"
 
   # ── lldap / traefik ──
-  lldap="$(jq -n --arg h "$(container_health lldap)" '{health: $h}')"
-  traefik="$(container_health traefik)"
+  lldap="$(jq -n --arg h "$(rt_health lldap)" '{health: $h}')"
+  traefik="$(rt_health traefik)"
   case "$traefik" in healthy|running) ;; *) problems=1 ;; esac
   # A non-core container answering to a core service name on portcullis-proxy
   # (network.sh proxy_dns_shadows; up / upgrade refuse to run while it lasts).
-  local shadows
-  # A docker error is a problem too (fail closed), shown as one line.
-  shadows="$(proxy_dns_shadows)" || shadows="(docker) the containers on portcullis-proxy can't be inspected"
+  local shadows kx='{}' mcp_refusing=""
+  if _rt_is_kube; then
+    # Kubernetes: no app Service may be named like a core one (structural,
+    # asserted), the CLI's NetworkPolicy probe, the six admission
+    # bindings, the kube API on the public address (K8, a warning).
+    kx="$(kube_status_extra)"
+    shadows="$(printf '%s' "$kx" | jq -r '.dns_shadows[] | "service/\(.) \(.)"')"
+    [ "$(printf '%s' "$kx" | jq -r '(.netpol == "proven") and (.admission == "ok")')" = true ] || problems=1
+    # A crash-looping or just-restarted Deployment (or an unreadable pod list).
+    [ "$(printf '%s' "$kx" | jq -r '.crashing != null and (.crashing | length) == 0')" = true ] || problems=1
+    # The cluster check the Hub reads: missing, failed or 24 h old = it refuses.
+    kube_cluster_check_lines "$(printf '%s' "$kx" | jq -c '.cluster_check')" >/dev/null || problems=1
+  else
+    # A docker error is a problem too (fail closed), shown as one line.
+    shadows="$(proxy_dns_shadows)" || shadows="(docker) the containers on portcullis-proxy can't be inspected"
+    mcp_refusing="$(_st_mcp_refusing)"
+  fi
   [ -z "$shadows" ] || problems=1
-  local mcp_refusing
-  mcp_refusing="$(_st_mcp_refusing)"
   [ -z "$mcp_refusing" ] || problems=1
 
   # ── DNS (the domains service's plans; Traefik's account for the pin) ──
@@ -275,18 +288,20 @@ status_run() {
   if [ "$json" = true ]; then
     jq -n --arg d "${PORTCULLIS_DOMAIN:-}" --argjson s "$services" --argjson v "$vault_json" --argjson vpn "$vpn_json" \
       --argjson k "$kc" --argjson l "$lldap" --arg t "$traefik" --argjson p "$problems" --arg sh "$shadows" --arg mr "$mcp_refusing" --arg dn "$dns_json" \
-      --argjson rt "$rt_json" --arg ck "$clock" \
+      --argjson rt "$rt_json" --argjson kx "$kx" --arg ck "$clock" \
       '{domain: $d, ok: ($p == 0), problems: $p, runtime: $rt,
         system: {clock_synced: (if $ck == "true" then true elif $ck == "false" then false else "unknown" end)}, services: $s, vault: $v, keycloak: $k, lldap: $l, traefik: {state: $t},
         dns_shadows: [$sh | split("\n")[] | select(. != "") | capture("^(?<container>[^ ]+) (?<name>.+)$")],
         mcp_gate: {refusing: (if $mr == "" then null else $mr end)},
-        dns: (if $dn == "" then null else ($dn | fromjson) end), vpn: $vpn}'
+        dns: (if $dn == "" then null else ($dn | fromjson) end), vpn: $vpn} + ($kx | del(.dns_shadows))'
     return "$problems"
   fi
 
   printf '\n%sRuntime%s\n' "$C_CYAN" "$C_NC"
   _st_line ok "runtime: $(printf '%s' "$rt_json" | jq -r '
-      if .name == "podman" then
+      if .name == "kubernetes" then
+        "kubernetes \(.version // "?") (context \(.context // "?"))"
+      elif .name == "podman" then
         "podman \(.version // "?") rootless, uid \(.uid), subuid \(.subuid_start // "?")+\(.subuid_count // "?"), ports ≥ \(.port_start)"
       else "docker \(.version // "?")" end')"
   local rst rtext
@@ -376,7 +391,7 @@ status_run() {
   [ "$out" = healthy ] && _st_line ok "lldap healthy" || _st_line fail "lldap $out"
   case "$traefik" in healthy|running) _st_line ok "traefik $traefik" ;; *) _st_line fail "traefik $traefik" ;; esac
   domains_status_lines
-  local shadow
+  local shadow cns cdep creason crest
   while read -r shadow; do
     [ -n "$shadow" ] || continue
     case "$shadow" in
@@ -386,6 +401,17 @@ status_run() {
     esac
   done <<< "$shadows"
   [ -z "$mcp_refusing" ] || _st_line fail "mcp-gate: $mcp_refusing"
+  if _rt_is_kube; then
+    if [ "$(printf '%s' "$kx" | jq -r '.crashing == null')" = true ]; then
+      _st_line fail "kubernetes: the pods can't be read (crash-loop check failed closed)"
+    else
+      while IFS=$'\t' read -r cns cdep creason crest; do
+        [ -n "$cdep" ] || continue
+        _st_line fail "kubernetes: $cns/$cdep is crashing ($creason, $crest restarts): kubectl -n $cns logs deploy/$cdep --previous"
+      done < <(printf '%s' "$kx" | jq -r '.crashing[] | [.namespace, .deployment, .reason, (.restarts | tostring)] | @tsv')
+    fi
+    kube_cluster_check_lines "$(printf '%s' "$kx" | jq -c '.cluster_check')" || true
+  fi
   _st_dns_lines "$dns_json" "$traefik_uri" "$env_uri"
   if declare -F vpn_status_lines >/dev/null; then vpn_status_lines "$vpn_json"; fi
 
@@ -472,7 +498,7 @@ hub_policy_check() {
   want="$(sed -n 's/^POLICY_VERSION = \([0-9][0-9]*\).*/\1/p' "$PORTCULLIS_HOME/group-gate/group-gate.py" | head -n1)"
   [ -n "$want" ] || return 0
   for i in $(seq 1 "$tries"); do
-    got="$(dc exec -T group-gate python3 -c 'import json
+    got="$(rt_exec group-gate -- python3 -c 'import json
 try:
     print(json.load(open("/hub-data/group-gate-policy.json")).get("version"))
 except FileNotFoundError:
@@ -482,7 +508,7 @@ except Exception:
     [ -z "$got" ] || [ "$got" = missing ] || break
     [ "$i" -eq "$tries" ] || sleep 3
   done
-  denied="$(dc logs --no-color --since 10m group-gate 2>/dev/null | grep -c 'is not supported (only' || true)"
+  denied="$(rt_logs group-gate --no-color --since 10m 2>/dev/null | grep -c 'is not supported (only' || true)"
   if { [ -n "$got" ] && [ "$got" != missing ] && [ "$got" != "$want" ]; } || [ "${denied:-0}" -gt 0 ]; then
     fix="run ./portcullis up (it pulls the Hub image this core expects)"
     [ -z "${HUB_IMAGE:-}" ] || fix="remove HUB_IMAGE=$HUB_IMAGE from .env (or set a Hub release that matches this core), then $fix"
@@ -496,10 +522,8 @@ except Exception:
 # hub_started_unix — the running Hub container's start time (epoch
 # seconds; 0: unknown).
 hub_started_unix() {
-  local cid at
-  cid="$(dc ps -q hub 2>/dev/null | head -n1)"
-  [ -n "$cid" ] || { echo 0; return 0; }
-  at="$(docker inspect --format '{{.State.StartedAt}}' "$cid" 2>/dev/null || true)"
+  local at
+  at="$(rt_started_at hub)"
   [ -n "$at" ] || { echo 0; return 0; }
   # GNU date reads any RFC 3339 offset (Podman reports the host's local
   # time); jq's fromdateiso8601 only a Z suffix (BSD date, Docker's UTC).
@@ -508,7 +532,7 @@ hub_started_unix() {
 
 # hub_sync_status — the Hub's last template sync (<data>/source-sync.json,
 # JSON; empty: none).
-hub_sync_status() { dc exec -T hub cat /data/source-sync.json 2>/dev/null || true; }
+hub_sync_status() { rt_exec hub -- cat /data/source-sync.json 2>/dev/null || true; }
 
 # hub_sources_sync [tries] — after a start: the Hub fast-forwards its
 # template sources (git) and reports the outcome. A Hub newer than its
@@ -536,7 +560,7 @@ hub_sources_sync() {
     return 0
   fi
   t0="$(date +%s)"
-  if ! dc kill -s HUP hub >/dev/null 2>&1; then
+  if ! rt_kill hub HUP >/dev/null 2>&1; then
     warn "Could not signal the Hub to sync its template sources: $fix."
     return 0
   fi
@@ -569,7 +593,7 @@ hub_sources_sync() {
 }
 
 version_run() {
-  local json="$1" ver hub src running="" cid="" kc kcsrc kcrunning="" rt="" rtv="" rtline=""
+  local json="$1" ver hub src running="" kc kcsrc kcrunning="" rt="" rtv="" rtline=""
   ver="$(portcullis_version)"
   # An installation: its runtime (a missing CONTAINER_RUNTIME is refused);
   # the engine's version best effort, but an engine contradicting
@@ -578,7 +602,10 @@ version_run() {
     env_load
     rt="$(runtime_name)" || exit 1
     runtime_export
-    if command -v docker >/dev/null 2>&1 && _rt_engine_probe; then
+    if [ "$rt" = kubernetes ]; then
+      rtv="$(kube_server_version 2>/dev/null || true)"
+      rtline="kubernetes ${rtv:-(cluster not reachable)}"
+    elif command -v docker >/dev/null 2>&1 && _rt_engine_probe; then
       [ "$_RT_ENGINE" = "$rt" ] || fail "CONTAINER_RUNTIME=$rt but the engine is $(_rt_engine_label "$_RT_ENGINE")"
       rtv="$_RT_ENGINE_VERSION"
       rtline="$rt $rtv"
@@ -589,11 +616,9 @@ version_run() {
   if [ -n "${HUB_IMAGE:-}" ]; then hub="$HUB_IMAGE" src="HUB_IMAGE"; else hub="$(hub_image_default)" src="default"; fi
   if [ -n "${KEYCLOAK_IMAGE:-}" ]; then kc="$KEYCLOAK_IMAGE" kcsrc="KEYCLOAK_IMAGE"; else kc="$(keycloak_image_default)" kcsrc="default"; fi
   # The running Hub and Keycloak, if this is an installation and Docker answers.
-  if [ -f "$(env_file)" ] && command -v docker >/dev/null 2>&1; then
-    cid="$(dc ps -q hub 2>/dev/null | head -n1 || true)"
-    [ -z "$cid" ] || running="$(docker inspect --format '{{.Config.Image}} ({{.Image}})' "$cid" 2>/dev/null || true)"
-    cid="$(dc ps -q keycloak 2>/dev/null | head -n1 || true)"
-    [ -z "$cid" ] || kcrunning="$(docker inspect --format '{{.Config.Image}} ({{.Image}})' "$cid" 2>/dev/null || true)"
+  if [ -f "$(env_file)" ] && { _rt_is_kube || command -v docker >/dev/null 2>&1; }; then
+    running="$(rt_image hub)"
+    kcrunning="$(rt_image keycloak)"
   fi
   if [ "$json" = true ]; then
     jq -n --arg v "$ver" --arg h "$hub" --arg s "$src" --arg r "$running" --arg k "$kc" --arg ks "$kcsrc" --arg kr "$kcrunning" \

@@ -86,7 +86,7 @@ done
 
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 35 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 35
+expect_eq "help lists 36 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 36
 while IFS= read -r c; do
   # shellcheck disable=SC2086
   run $c --help
@@ -151,7 +151,10 @@ init --domain|--domain needs a value
 init --domain --email|--domain needs a value
 init --frob|unknown argument: --frob
 init --runtime|--runtime needs a value
-init --runtime lxc|--runtime must be docker or podman
+init --runtime lxc|--runtime must be docker, podman or kubernetes
+init --runtime docker --kube-context ci|--kube-context goes with --runtime kubernetes
+init --runtime kubernetes|--runtime kubernetes needs --kube-context
+init --kube-context|--kube-context needs a value
 vault init --rotate-enroll-secret|unknown argument
 pki setup --with-server-certs|unknown argument
 cert enroll|expected <username> [email]
@@ -183,6 +186,8 @@ invite 'bad;user'|invalid user name
 invite a --frob|unknown option: --frob
 lldap-ui now|unknown argument: now
 signin reset-core --force|unknown argument: --force
+kube check --now|unknown argument: --now
+kube frob|unknown subcommand: frob
 signin reset-core|no terminal to confirm on: pass --yes
 vpn init extra|unexpected argument: extra
 vpn init --builtin|--builtin needs a value
@@ -214,7 +219,7 @@ EOF
 
 # ── no secret on a command line (CLAUDE.md: stdin, -H @<(...), key=-, jq
 # --rawfile / env.X) ── lines marked "secret-argv-ok" are reviewed exceptions.
-ARGV_RE='--arg(json)? [A-Za-z_]+ "?\$\(cat|--arg(json)? [A-Za-z_]+ "?\$\{?[A-Za-z_]*(PASSWORD|SECRET|TOKEN|PASS)\b|--(admin-)?password[ =]"?\$|--token[ =]"?\$|(PASSWORD|SECRET|TOKEN)=[^ ]*\$\(cat '
+ARGV_RE='--from-literal|--set(-string|-json)?[ =][^ ]*(secrets/|\$\(cat|PASSWORD|SECRET|TOKEN)|--arg(json)? [A-Za-z_]+ "?\$\(cat|--arg(json)? [A-Za-z_]+ "?\$\{?[A-Za-z_]*(PASSWORD|SECRET|TOKEN|PASS)\b|--(admin-)?password[ =]"?\$|--token[ =]"?\$|(PASSWORD|SECRET|TOKEN)=[^ ]*\$\(cat '
 HITS="$(grep -nE -e "$ARGV_RE" "$HERE/../portcullis" "$HERE"/../scripts/lib/*.sh | grep -v 'secret-argv-ok' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
 expect_eq "no secrets on argv in the CLI" "$HITS" ""
 # Container root is the operator under rootless Podman: an operator-owned
@@ -349,14 +354,75 @@ expect_eq "lint_images.sh flags short names in scripts/lib constants, workflow i
 scripts/lib/x.sh:1: alpine:3.24.3
 .github/workflows/x.yml:2: alpine:3
 .github/workflows/x.yml:4: restic/restic:0.19.1"
+# Kubernetes (K1, K3): images.yaml, the chart templates, kube/**/*.yaml.
+Z64=0000000000000000000000000000000000000000000000000000000000000000
+mkdir -p "$WORK/lint/charts/portcullis/templates" "$WORK/lint/kube/storage"
+printf 'images:\n  a: docker.io/library/postgres:18@sha256:%s\n  b: postgres:18@sha256:%s\n  c: docker.io/library/vault:2\n  d:\n    tag_ref: ghcr.io/porelli/portcullis-hub:edge\n  e:\n    tag_ref: docker.io/evil/hub:edge\n' "$Z64" "$Z64" > "$WORK/lint/charts/portcullis/images.yaml"
+printf 'spec:\n  containers:\n    - image: {{ .Values.images.vault }}\n    - image: busybox:1@sha256:%s\n' "$Z64" > "$WORK/lint/charts/portcullis/templates/x.yaml"
+printf 'spec:\n  image: docker.io/rancher/local-path-provisioner:v0.0.37\n' > "$WORK/lint/kube/storage/p.yaml"
+OUT="$("$WORK/lint/tests/lint_images.sh"; echo "rc=$?")"
+expect_eq "lint_images.sh flags an unqualified / unpinned images.yaml entry, a foreign tag_ref, and short or unpinned images in the chart templates and kube/" \
+  "$(printf '%s\n' "$OUT" | grep -E '^(charts|kube)' | sed 's/@sha256:.*//' | sort -u)" "charts/portcullis/images.yaml:3: postgres:18
+charts/portcullis/images.yaml:4: docker.io/library/vault:2 (not pinned tag@sha256)
+charts/portcullis/images.yaml:8: docker.io/evil/hub:edge (a tag_ref outside ghcr.io/porelli/portcullis-*)
+charts/portcullis/templates/x.yaml:4: busybox:1
+kube/storage/p.yaml:2: docker.io/rancher/local-path-provisioner:v0.0.37"
+# images.yaml is generated from compose (K1): a stale file fails --check.
+mkdir -p "$WORK/gen/scripts" "$WORK/gen/charts/portcullis"
+cp "$HERE/../scripts/gen-images-yaml.py" "$WORK/gen/scripts/"
+cp "$HERE/../docker-compose.yml" "$WORK/gen/"
+if python3 -c 'import yaml' 2>/dev/null; then
+  python3 "$WORK/gen/scripts/gen-images-yaml.py"
+  expect_eq "gen-images-yaml.py --check: a fresh file passes" "$(python3 "$WORK/gen/scripts/gen-images-yaml.py" --check 2>&1; echo "rc=$?")" "rc=0"
+  sed -i.bak 's/postgres:18[^ ]*/postgres:17/' "$WORK/gen/charts/portcullis/images.yaml"
+  expect_eq "gen-images-yaml.py --check: a stale file → exit 1" "$(python3 "$WORK/gen/scripts/gen-images-yaml.py" --check 2>&1; echo "rc=$?")" "charts/portcullis/images.yaml is stale: run scripts/gen-images-yaml.py
+rc=1"
+  expect_eq "charts/portcullis/images.yaml is current" "$(python3 "$HERE/../scripts/gen-images-yaml.py" --check 2>&1; echo "rc=$?")" "rc=0"
+  expect_eq "images.yaml: the five core-built images, the Hub and Keycloak are tag_refs; no socket proxy" \
+    "$(grep -c 'tag_ref: ghcr.io/porelli/portcullis-' "$HERE/../charts/portcullis/images.yaml"):$(grep -c 'socket-proxy' "$HERE/../charts/portcullis/images.yaml")" "8:0"
+else
+  t_fail "gen-images-yaml.py: python3 has no yaml module (pip install -r tests/k8s-requirements.txt)"
+fi
 expect_eq "the SELinux overlay adds only label=disable to security_opt (compose appends: a repeated no-new-privileges is a duplicate newer compose refuses)" \
   "$(grep -v '^[[:space:]]*#' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml" | grep -c 'no-new-privileges'):$(grep -c '^    security_opt: \["label=disable"\]$' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" "0:2"
 expect_eq "docker-compose.podman.yml sets restart: always and nothing else (podman-restart.service starts only those at boot)" \
   "$(grep -vE '^[[:space:]]*(#|$)|^services:$|^  [a-z][a-z0-9-]*:$|^    restart: always$' "$ROOT_DIR_SOCK/docker-compose.podman.yml"):$(grep -c '^    restart: always$' "$ROOT_DIR_SOCK/docker-compose.podman.yml" | awk '{print ($1 >= 20)}')" ":1"
 expect_eq "the SELinux overlay never names the engine socket" "$(grep -c 'docker.sock\|ENGINE_SOCKET' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" 0
 expect_eq "no ct_own \"\$(id -u)… in the CLI (ct_operator_id)" "$(grep -rnF 'ct_own "$(id -u)' "$HERE/../scripts/lib" "$HERE/../portcullis" || true)" ""
-case "$(printf '%s\n' '  jq -n --arg p "$(cat "$f")" x' '  jq --arg pass "$LLDAP_ADMIN_PASSWORD"' | grep -cE -e "$ARGV_RE")" in
-  2) t_pass "argv secret pattern catches --arg \"\$(cat ...)\" and secret variables" ;; *) t_fail "argv secret pattern" ;; esac
+# ── the runtime layer (rt_*): no dc / docker call outside the docker
+# branch. Every function (the libs sourced, bodies from `declare -f`, so
+# comments are gone) that calls dc or docker in a command position must be
+# `dc`, a `_rtd_*` docker-branch verb, or start with `_rt_docker_only`
+# (refused under kubernetes). Quoted text without a command substitution
+# (messages, hints) and the help_* texts are ignored.
+rt_docker_hits() {
+  ( set +eu
+    PORTCULLIS_ROOT="$WORK/rtlint-root"
+    for _l in common network vault pki certs keycloak users domains mcpgate sessions dns config status monitoring backup signin vpn stack; do
+      # shellcheck source=/dev/null
+      source "$HERE/../scripts/lib/$_l.sh"
+    done
+    for fn in $(declare -F | awk '{print $3}'); do
+      case "$fn" in dc|_rtd_*|help_*|rt_docker_hits) continue ;; esac
+      body="$(declare -f "$fn")"
+      hit="$(printf '%s\n' "$body" | perl -0777 -pe 's/('"'"'[^'"'"']*'"'"')|"((?:[^"\\]|\\.)*)"/ defined($1) ? q{} : index($2, q{$(}) >= 0 ? qq{"$2"} : q{""} /gse' \
+        | grep -vE '^[[:space:]]*[^ ()]+( \| [^ ()]+)*\)' | grep -E '(^|[;&|(!{`]|\$\(|then |do |else |&& |\|\| )[[:space:]]*(dc|docker)( |$)' || true)"
+      [ -n "$hit" ] || continue
+      first="$(printf '%s\n' "$body" | sed -n '3,$p' | grep -vE '^[[:space:]]*(local|declare) ' | head -n1 | tr -d ' ;')"
+      [ "$first" = _rt_docker_only ] || printf '%s\n' "$fn"
+    done ) 2>/dev/null
+}
+expect_eq "no dc / docker call outside the rt_* docker branch (functions starting with _rt_docker_only)" "$(rt_docker_hits | tr '\n' ' ')" ""
+expect_eq "the rt_* lint catches a docker call in a function without the guard" \
+  "$( (unguarded() { local x; x="$(dc ps -q)"; docker inspect "$x"; }; guarded() { local y=1; _rt_docker_only; docker ps "$y"; }
+       msg() { warn "run: docker compose logs (docker compose -p x down)"; }
+       for f in unguarded guarded msg; do body="$(declare -f "$f")"
+         hit="$(printf '%s\n' "$body" | perl -0777 -pe 's/('"'"'[^'"'"']*'"'"')|"((?:[^"\\]|\\.)*)"/ defined($1) ? q{} : index($2, q{$(}) >= 0 ? qq{"$2"} : q{""} /gse' | grep -vE '^[[:space:]]*[^ ()]+( \| [^ ()]+)*\)' | grep -E '(^|[;&|(!{`]|\$\(|then |do |else |&& |\|\| )[[:space:]]*(dc|docker)( |$)' || true)"
+         [ -n "$hit" ] || continue
+         first="$(printf '%s\n' "$body" | sed -n '3,$p' | grep -vE '^[[:space:]]*(local|declare) ' | head -n1 | tr -d ' ;')"
+         [ "$first" = _rt_docker_only ] || echo "$f"; done) 2>/dev/null)" "unguarded"
+case "$(printf '%s\n' '  jq -n --arg p "$(cat "$f")" x' '  jq --arg pass "$LLDAP_ADMIN_PASSWORD"' '  kube_ctl create secret generic x --from-literal=a=b' '  kube_helm upgrade --set hub.secret=$(cat secrets/hub/x)' '  helm upgrade --set-string pw=$POSTGRES_PASSWORD' | grep -cE -e "$ARGV_RE")" in
+  5) t_pass "argv secret pattern catches --arg \"\$(cat ...)\", secret variables, --from-literal and --set with a secret" ;; *) t_fail "argv secret pattern" ;; esac
 
 # version and backup schedule work without .env (and without docker).
 run version
@@ -400,7 +466,7 @@ expect_eq "version with .env but no CONTAINER_RUNTIME → refused" "$RC" 1
 case "$ERR" in *"CONTAINER_RUNTIME is not set in .env"*) t_pass "version names CONTAINER_RUNTIME" ;; *) t_fail "version without CONTAINER_RUNTIME: $ERR" ;; esac
 # need_env: every command needing the runtime refuses without it.
 run status
-expect_eq "need_env: no CONTAINER_RUNTIME → refused naming the variable" "$RC:$(printf '%s' "$ERR" | grep -c 'CONTAINER_RUNTIME is not set in .env (docker or podman)')" "1:1"
+expect_eq "need_env: no CONTAINER_RUNTIME → refused naming the variable" "$RC:$(printf '%s' "$ERR" | grep -c 'CONTAINER_RUNTIME is not set in .env (docker, podman or kubernetes)')" "1:1"
 rm -f "$PORTCULLIS_ROOT/.env"
 run restore --from-offsite
 expect_eq "restore --from-offsite without a repository exits 1" "$RC" 1
@@ -426,6 +492,32 @@ RC=0; XDG_RUNTIME_DIR=/run/user/4242 "$CLI" init --env-only --non-interactive --
 expect_eq "init --env-only writes CONTAINER_RUNTIME=podman and the rootless PORTCULLIS_ENGINE_SOCKET with --runtime podman" \
   "$RC:$(grep -c '^CONTAINER_RUNTIME=podman$' "$PORTCULLIS_ROOT/.env"):$(grep -c '^PORTCULLIS_ENGINE_SOCKET=/run/user/4242/podman/podman.sock$' "$PORTCULLIS_ROOT/.env")" "0:1:1"
 rm -f "$PORTCULLIS_ROOT/.env"
+# --runtime kubernetes: the context's networks detected, the kube keys
+# written (a kubectl stub on the context ci; any other context fails).
+mkdir -p "$WORK/kbin"
+cat > "$WORK/kbin/kubectl" <<'KSTUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$KUBE_CALLS"
+[ "$*" = "config get-contexts -o name" ] && { echo ci; exit 0; }
+[ "$1 $2" = "--context ci" ] || exit 97
+shift 2
+case "$*" in
+  "get nodes -o json") echo '{"items":[{"metadata":{"name":"n1"},"spec":{"podCIDRs":["10.42.0.0/24"]},"status":{"addresses":[{"type":"InternalIP","address":"10.1.0.4"}]}}]}' ;;
+  "create --dry-run=server -f -") cat >/dev/null; echo 'The Service "portcullis-cidr-probe" is invalid: spec.clusterIPs: Invalid value: []string{"0.0.0.1"}: failed to allocate IP 0.0.0.1: the provided IP (0.0.0.1) is not in the valid range. The range of valid IPs is 10.43.0.0/16' >&2; exit 1 ;;
+  "get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o json") echo '{"items":[{"ports":[{"port":6443}],"endpoints":[{"addresses":["10.1.0.4"]}]}]}' ;;
+  *) exit 98 ;;
+esac
+KSTUB
+chmod +x "$WORK/kbin/kubectl"
+RC=0; PATH="$WORK/kbin:$PATH" KUBE_CALLS="$WORK/kube-calls" STUB_CALLS="$WORK/kdocker-calls" "$CLI" init --env-only --non-interactive --domain ci.example.org --dns-provider none --runtime kubernetes --kube-context ci >/dev/null 2>"$WORK/err" </dev/null || RC=$?
+expect_eq "init --env-only --runtime kubernetes writes CONTAINER_RUNTIME=kubernetes, the context, namespaces, detected networks, the install id, registry images and the fixed ClusterIPs" \
+  "$RC:$(grep -cxE 'CONTAINER_RUNTIME=kubernetes|PORTCULLIS_KUBE_CONTEXT=ci|PORTCULLIS_NAMESPACE=portcullis|PORTCULLIS_APPS_NAMESPACE=portcullis-apps|PORTCULLIS_POD_CIDR=10\.42\.0\.0/24|PORTCULLIS_SERVICE_CIDR=10\.43\.0\.0/16|PORTCULLIS_KUBE_API_ENDPOINTS=10\.1\.0\.4:6443|PORTCULLIS_KUBE_INSTALL_ID=[0-9a-f-]{36}|PORTCULLIS_KUBE_IMAGES=registry|PORTCULLIS_TRAEFIK_SERVICE_IP=10\.43\.0\.20|PORTCULLIS_TRAEFIK_VPN_SERVICE_IP=10\.43\.0\.21|PORTCULLIS_WG_EDGE_SERVICE_IP=10\.43\.0\.22' "$PORTCULLIS_ROOT/.env"):$(grep -vc '^--context ci \|^config get-contexts' "$WORK/kube-calls")" "0:12:0"
+expect_eq "init --runtime kubernetes: no docker call" "$(cat "$WORK/kdocker-calls" 2>/dev/null)" ""
+run init --env-only --non-interactive --runtime docker
+expect_eq "init: CONTAINER_RUNTIME=kubernetes in .env, --runtime docker → refused" "$RC:$(grep -c 'never switched' <<< "$ERR")" "1:1"
+rm -f "$PORTCULLIS_ROOT/.env"
+RC=0; PATH="$WORK/kbin:$PATH" KUBE_CALLS="$WORK/kube-calls" "$CLI" init --env-only --non-interactive --domain ci.example.org --dns-provider none --runtime kubernetes --kube-context prod >/dev/null 2>"$WORK/err" </dev/null || RC=$?
+expect_eq "init --runtime kubernetes: a context that doesn't exist → refused, no .env" "$RC:$(grep -c "kube context prod doesn't exist" "$WORK/err"):$(test -e "$PORTCULLIS_ROOT/.env" && echo yes || echo no)" "1:1:no"
 run init --env-only --non-interactive --domain ci.example.org --dns-provider none --runtime docker
 expect_eq "init --env-only succeeds" "$RC" 0
 ENVF="$PORTCULLIS_ROOT/.env"
@@ -722,7 +814,7 @@ pk_status() {
     dc() { echo '{"Service":"keycloak","State":"running","Health":"healthy","Status":"Up"}'; }
     vault_health_code() { echo 200; }
     vault_admin_env() { return 1; }
-    container_health() { echo healthy; }
+    rt_health() { echo healthy; }
     proxy_dns_shadows() { :; }
     domains_status_lines() { :; }
     _st_mcp_refusing() { :; }
@@ -962,9 +1054,9 @@ printf '%s%s\n' "\$cmd" "\$args" >> "$DC_CALLS"
 exit 0
 DCSTUB
 chmod +x "$WORK/dcbin/docker"
-# Stub container_health: returns "healthy" for vault/lldap/keycloak, "healthy" for hub (its image HEALTHCHECK).
+# Stub rt_health: returns "healthy" for vault/lldap/keycloak, "healthy" for hub (its image HEALTHCHECK).
 cat > "$WORK/test-init-stub.sh" <<INITSTUB
-container_health() {
+rt_health() {
   case "\$1" in
     vault|lldap|keycloak|postgres) echo healthy ;;
     hub) echo healthy ;;
@@ -974,7 +1066,7 @@ container_health() {
 wait_healthy() {
   local timeout="\$1"; shift
   for svc in "\$@"; do
-    [ "\$(container_health "\$svc")" = healthy ] || return 1
+    [ "\$(rt_health "\$svc")" = healthy ] || return 1
   done
 }
 # Stub the functions init_run calls that touch Vault/Keycloak/DNS.
@@ -1031,12 +1123,12 @@ VAULT_INIT_FILE="$PORTCULLIS_ROOT/secrets/vault-init.json"
 mkdir -p "$PORTCULLIS_ROOT/secrets"
 echo '{}' > "$VAULT_INIT_FILE"
 cat > "$WORK/test-up-stub.sh" <<UPSTUB
-container_health() {
+rt_health() {
   case "\$1" in vault|lldap|keycloak|postgres) echo healthy ;; *) echo running ;; esac
 }
 wait_healthy() {
   local timeout="\$1"; shift
-  for svc in "\$@"; do [ "\$(container_health "\$svc")" = healthy ] || return 1; done
+  for svc in "\$@"; do [ "\$(rt_health "\$svc")" = healthy ] || return 1; done
 }
 vault_init() { :; }
 pki_setup() { PKI_CREATED=false; PKI_TRUSTSTORE_CHANGED=false; }

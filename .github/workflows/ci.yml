@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       jobs:
-        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn"
+        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s"
         type: string
         default: all
 
@@ -148,8 +148,25 @@ jobs:
             head -n1 /tmp/help.out | grep -q "^Usage: portcullis $cmd" || { echo "FAIL: '$cmd --help' has no usage line"; exit 1; }
             echo "::endgroup::"
           done
+      # PyYAML for the Kubernetes static checks (scripts/gen-images-yaml.py,
+      # tests/k8s_*.py), pinned with hashes; test_cli runs the generator too.
+      - name: Kubernetes check dependencies (pinned, hashes)
+        run: |
+          python3 -m venv /tmp/k8s-venv
+          /tmp/k8s-venv/bin/pip install --quiet --disable-pip-version-check \
+            --require-hashes --only-binary=:all: -r tests/k8s-requirements.txt
+      - name: charts/portcullis/images.yaml is generated from docker-compose.yml
+        run: /tmp/k8s-venv/bin/python scripts/gen-images-yaml.py --check
       - name: CLI argument parsing tests
-        run: bash tests/test_cli.sh
+        run: PATH="/tmp/k8s-venv/bin:$PATH" bash tests/test_cli.sh
+      # charts/portcullis (Task 13): helm lint, kubeconform -strict (pinned
+      # schemas + Traefik CRDs), parity with compose, the NetworkPolicy
+      # matrix, the hardening baseline, the Hub's byte copies (K13).
+      - name: Kubernetes chart static checks
+        timeout-minutes: 10
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: bash .github/ci/unit-tests-kube-static.sh
       - name: shell library tests (.env, proxy network, revocation sync, pki setup)
         run: bash tests/test_shell_libs.sh
       # group-gate's own pins (group-gate/requirements.txt, hashes), the same
@@ -4232,19 +4249,7 @@ jobs:
           ./portcullis init --runtime docker --non-interactive --domain portcullis.local \
             --email ci@portcullis.local --dns-provider none --no-config-repo 2>&1 | redact
           grep -qx 'CONTAINER_RUNTIME=docker' .env || { echo "FAIL: init --runtime docker wrote no CONTAINER_RUNTIME=docker"; exit 1; }
-          LLDAP_ADMIN_PASSWORD="$(grep '^LLDAP_ADMIN_PASSWORD=' .env | cut -d= -f2-)"; echo "::add-mask::$LLDAP_ADMIN_PASSWORD"
-          export LLDAP_ADMIN_PASSWORD
-          for i in $(seq 1 30); do
-            LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
-              | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token) && [ "$LLDAP_TOKEN" != null ] && break
-            [ "$i" -eq 30 ] && { echo "FAIL: LLDAP login"; exit 1; }
-            sleep 2
-          done
-          echo "::add-mask::$LLDAP_TOKEN"
-          jq -n '{query: "mutation { createUser(user: {id: \"rt-person\", email: \"rt-person@portcullis.local\"}) { id } }"}' \
-            | curl -sf http://127.0.0.1:17170/api/graphql -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") \
-                -H 'Content-Type: application/json' -d @- | jq -e '.errors == null' >/dev/null \
-            || { echo "FAIL: create the LLDAP person rt-person"; exit 1; }
+          bash .github/ci/lldap-create-person.sh rt-person
           ./portcullis backup
           B="$(find backups -mindepth 1 -maxdepth 1 -type d -name '2*' | sort | tail -n1)"
           [ -n "$B" ] && [ -f "$B/MANIFEST.json" ] || { echo "FAIL: no backup in backups/"; ls -la backups; exit 1; }
@@ -5146,3 +5151,78 @@ jobs:
             docker compose -p "$p" down -v 2>/dev/null || true
           done
           docker compose down -v
+
+  # Kubernetes end to end (spec § 10, Task 16): real k3s on the runner (the
+  # pin, sha256-checked, the § 6 flags, --node-external-ip for the netns
+  # client), never kind / k3d. A Docker phase first (the cross-runtime
+  # restore's backup, never an artifact), then init --runtime kubernetes
+  # with the K1 local images (the same-named Hub / Keycloak branches'
+  # included). Asserts (e2e-k3s-assert.sh, e2e_k3s.py): the probe, PSA
+  # restricted, kcinternal / Keycloak-only-from-Traefik, an app pod reaches
+  # no core service, :6443 or :10250, the client address through ServiceLB
+  # and status's --node-external-ip warning, PVC owners on the node and a
+  # Pending PVC without them, the admission guard by binding with the Hub's
+  # token and create-only pods/exec, revocation ≤ 10 s, the VPN port-bound
+  # rules, the Hub's instances (deploy / backup / restore / delete) and the
+  # fixer, vpn mode admin and the break-glass apps, the Docker → Kubernetes
+  # restore. Failure artifacts: logs and events only.
+  e2e-k3s:
+    needs: jobs-input
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-k3s,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-k3s ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-k3s,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-k3s ')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 90
+    env:
+      E2E_DOMAIN: portcullis.local
+      E2E_ARTIFACTS: e2e-artifacts
+      E2E_FOLDER: /srv/e2e-k3s
+      ACME_STAGING: "true"
+      # No CI compose override in this job (the Docker phase names its own):
+      # the image actions read compose's defaults before any .env exists.
+      COMPOSE_FILE: docker-compose.yml
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/keycloak-image
+      - name: Docker phase — init, one LLDAP person, backup, wipe
+        timeout-minutes: 30
+        run: bash .github/ci/e2e-k3s-phases.sh docker
+      - name: Install k3s (the pin, the § 6 flags, the netns client)
+        timeout-minutes: 10
+        run: bash .github/ci/e2e-k3s-install.sh --netns-client
+      - name: init --runtime kubernetes (K1 local images)
+        timeout-minutes: 30
+        run: bash .github/ci/e2e-k3s-phases.sh init
+      - name: Template source, the fixer's folder, a certificate to revoke
+        timeout-minutes: 10
+        run: bash .github/ci/e2e-k3s-phases.sh seed
+      - name: Kubernetes assertions (isolation, trust, PVC owners, admission, revocation, VPN rules)
+        timeout-minutes: 20
+        run: bash .github/ci/e2e-k3s-assert.sh
+      - name: The Hub on Kubernetes (e2e_k3s.py)
+        timeout-minutes: 30
+        run: bash .github/ci/e2e-k3s-phases.sh hub
+      - name: VPN on Kubernetes (vpn init, modes, break-glass)
+        timeout-minutes: 20
+        run: bash .github/ci/e2e-k3s-phases.sh vpn
+      - name: Docker → Kubernetes restore round trip
+        timeout-minutes: 30
+        run: bash .github/ci/e2e-k3s-phases.sh restore
+      - name: Collect logs and events
+        if: failure()
+        run: bash .github/ci/e2e-k3s-collect.sh
+      - name: Upload logs
+        timeout-minutes: 10
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-k3s-artifacts
+          path: e2e-artifacts/
+          retention-days: 7

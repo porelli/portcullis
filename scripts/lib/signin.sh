@@ -17,22 +17,22 @@ signin_reset_core() {
   local rc=0 out msg
   out="$(mktemp)"
   # Set before the stop: an interrupt at any point still starts the Hub.
-  trap 'dc start hub >/dev/null 2>&1 || true; rm -f "$out"; exit 130' INT TERM
+  trap 'rt_start hub >/dev/null 2>&1 || true; rm -f "$out"; exit 130' INT TERM
   info "Stopping the Hub..."
-  if ! dc stop hub; then
-    dc start hub >/dev/null 2>&1 || true
+  if ! rt_stop hub; then
+    rt_start hub >/dev/null 2>&1 || true
     trap - INT TERM; rm -f "$out"
     fail "could not stop the Hub: the reset didn't run"
   fi
   info "Resetting the Hub's core sign-in settings (hub signin reset-core)..."
   # The one-off carries the service's labels: never a Traefik target.
-  dc run --rm --no-deps -T --user "$CT_UID_HUB:$CT_UID_HUB" --label traefik.enable=false \
-    --entrypoint /usr/local/bin/hub hub signin reset-core >"$out" 2>&1 || rc=$?
+  rt_run hub --user "$CT_UID_HUB:$CT_UID_HUB" --label traefik.enable=false \
+    --entrypoint /usr/local/bin/hub -- signin reset-core >"$out" 2>&1 || rc=$?
   cat "$out"
   msg="$(grep -v '^[[:space:]]*$' "$out" | tail -n 1 || true)"
   rm -f "$out"
   info "Starting the Hub..."
-  if ! dc start hub; then
+  if ! rt_start hub; then
     trap - INT TERM
     if [ "$rc" -ne 0 ]; then
       fail "hub signin reset-core failed (exit $rc): ${msg:-no message}; the Hub could not be started again: run ./portcullis up"

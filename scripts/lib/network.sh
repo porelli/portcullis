@@ -289,6 +289,7 @@ CORE_PROXY_SERVICES="traefik mcp-gate grafana"
 proxy_dns_shadows() {
   local ids id core info project="${COMPOSE_PROJECT_NAME:-portcullis}" exempt out line
   local mcp=""
+  _rt_docker_only
   if ! ids="$(docker network inspect "$PROXY_NETWORK" --format '{{range $k, $v := .Containers}}{{$k}} {{end}}' 2>/dev/null)"; then
     local listed
     listed="$(docker network ls --format '{{.Name}}' 2>/dev/null)" || return 2
@@ -362,6 +363,7 @@ proxy_dns_shadows() {
 # claim another instance's project, override or service.
 _proxy_ai_alias_check() {
   local mcp="$1" cache rc=0 cid cname alias inst svc files want
+  _rt_docker_only
   cache="$(mktemp -d)" || return 2
   while read -r cid cname alias inst svc files; do
     [ -n "$cid" ] || continue
@@ -429,6 +431,7 @@ _override_alias_services() {
 # exactly the expected one (and absent when none is expected).
 network_state() {
   local config cur_subnet cur_range
+  _rt_docker_only
   if ! config="$(docker network inspect "$1" --format '{{json .IPAM.Config}}' 2>/dev/null)"; then
     echo missing
     return 0
@@ -481,6 +484,7 @@ vpn_edge_network_state() { network_state "$VPN_EDGE_NETWORK" "$(vpn_edge_subnet)
 # one and Traefik would not get its static IP).
 network_check() {
   local err st
+  _rt_docker_only
   err="$(validate_proxy_network_config)" || fail "Invalid portcullis-proxy settings in .env: $err"
   err="$(validate_mcp_gate_ip)" || fail "Invalid mcp-gate address in .env: $err"
   err="$(validate_auth_network_config)" || fail "Invalid portcullis-auth settings in .env: $err"

@@ -1,0 +1,134 @@
+{{- /* The monitoring profile (compose profile monitoring → monitoring.enabled):
+prometheus, alertmanager, blackbox, textfile-exporter, grafana. */ -}}
+{{- if .Values.monitoring.enabled }}
+{{- $d := include "portcullis.domain" . -}}
+{{- $n := .Values.uids.nobody -}}
+{{- $prom := dict
+  "name" "prometheus" "uid" $n "gid" $n
+  "memory" "1Gi" "nets" (list "monitoring" "portcullis" "portcullis-metrics-wg") "egress" true
+  "hashes" (list "config-monitoring-prometheus" "secrets-monitoring-prometheus")
+  "args" (list "--config.file=/etc/prometheus/prometheus.yml" "--storage.tsdb.path=/prometheus" (printf "--storage.tsdb.retention.time=%s" .Values.monitoring.prometheusRetention))
+  "health" (dict "test" (list "wget" "-q" "-O" "/dev/null" "http://127.0.0.1:9090/-/ready") "interval" 15 "timeout" 5 "retries" 5 "startPeriod" 30)
+  "ports" (list (dict "name" "http" "port" 9090))
+  "mounts" (list
+    (dict "name" "config" "mountPath" "/etc/prometheus" "readOnly" true)
+    (dict "name" "secrets" "mountPath" "/etc/portcullis" "readOnly" true)
+    (dict "name" "data" "mountPath" "/prometheus"))
+  "volumes" (list
+    (dict "name" "config" "configMap" (dict "name" "config-monitoring-prometheus" "items" (.Values.configItems.prometheus | default list)))
+    (dict "name" "secrets" "secret" (dict "secretName" "secrets-monitoring-prometheus" "defaultMode" 288))
+    (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "prometheus-data")))
+  "fsGroup" $n
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $prom) }}
+---
+{{ include "portcullis.pvc" (list . "prometheus-data" $n $n "0750" "10Gi") }}
+---
+{{- $am := dict
+  "name" "alertmanager" "uid" $n "gid" $n
+  "memory" "128Mi" "nets" (list "monitoring" "alerting") "egress" true
+  "hashes" (list "secrets-monitoring-alertmanager")
+  "args" (list "--config.file=/etc/portcullis/alertmanager.yml" "--storage.path=/alertmanager" "--cluster.listen-address=")
+  "health" (dict "test" (list "wget" "-q" "-O" "/dev/null" "http://127.0.0.1:9093/-/ready") "interval" 15 "timeout" 5 "retries" 5)
+  "ports" (list (dict "name" "http" "port" 9093))
+  "mounts" (list
+    (dict "name" "secrets" "mountPath" "/etc/portcullis" "readOnly" true)
+    (dict "name" "data" "mountPath" "/alertmanager"))
+  "volumes" (list
+    (dict "name" "secrets" "secret" (dict "secretName" "secrets-monitoring-alertmanager" "defaultMode" 288))
+    (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "alertmanager-data")))
+  "fsGroup" $n
+}}
+{{ include "portcullis.deployment" (dict "root" . "s" $am) }}
+---
+{{ include "portcullis.pvc" (list . "alertmanager-data" $n $n "0750") }}
+---
+{{- $bb := dict
+  "name" "blackbox" "uid" $n "gid" $n
+  "memory" "64Mi" "nets" (list "monitoring" "portcullis") "egress" true
+  "hashes" (list "config-monitoring-blackbox")
+  "args" (list "--config.file=/etc/blackbox_exporter/config.yml")
+  "hostAliases" (list (dict "ip" (required "traefikServiceIP is required" .Values.traefikServiceIP) "hostnames" (list (printf "auth.%s" $d))))
+  "health" (dict "test" (list "wget" "-q" "-O" "/dev/null" "http://127.0.0.1:9115/-/healthy") "interval" 15 "timeout" 5 "retries" 5)
+  "ports" (list (dict "name" "http" "port" 9115))
+  "mounts" (list (dict "name" "config" "mountPath" "/etc/blackbox_exporter" "readOnly" true))
+  "volumes" (list (dict "name" "config" "configMap" (dict "name" "config-monitoring-blackbox" "items" (list (dict "key" "blackbox.yml" "path" "config.yml")))))
+}}
+{{ include "portcullis.deployment" (dict "root" . "s" $bb) }}
+---
+{{- $tf := dict
+  "name" "textfile-exporter" "uid" $n "gid" $n
+  "memory" "64Mi" "nets" (list "monitoring")
+  "hashes" (list "config-monitoring-textfile")
+  "args" (list "--collector.disable-defaults" "--collector.textfile" "--collector.textfile.directory=/textfile")
+  "health" (dict "test" (list "wget" "-q" "-O" "/dev/null" "http://127.0.0.1:9100/metrics") "interval" 30 "timeout" 5 "retries" 3)
+  "ports" (list (dict "name" "http" "port" 9100))
+  "mounts" (list (dict "name" "textfile" "mountPath" "/textfile" "readOnly" true))
+  "volumes" (list (dict "name" "textfile" "configMap" (dict "name" "config-monitoring-textfile" "optional" true)))
+}}
+{{ include "portcullis.deployment" (dict "root" . "s" $tf) }}
+---
+{{- $gf := dict
+  "name" "grafana" "uid" .Values.uids.grafana "gid" .Values.uids.grafana
+  "memory" "512Mi" "nets" (list "monitoring" "portcullis-proxy") "egress" true
+  "extraLabels" (dict "portcullis.io/ingress" "bound")
+  "hashes" (list "config-monitoring-grafana-provisioning" "config-monitoring-grafana-dashboards" "secrets-monitoring-grafana")
+  "health" (dict "test" (list "wget" "-q" "-O" "/dev/null" "http://127.0.0.1:3000/api/health") "interval" 15 "timeout" 5 "retries" 5 "startPeriod" 30)
+  "ports" (list (dict "name" "http" "port" 3000))
+  "env" (list
+    (dict "name" "GF_SERVER_ROOT_URL" "value" (printf "https://metrics.%s/" $d))
+    (dict "name" "GF_LOG_MODE" "value" "console")
+    (dict "name" "GF_PATHS_PROVISIONING" "value" "/etc/grafana/provisioning")
+    (dict "name" "GF_AUTH_PROXY_ENABLED" "value" "true")
+    (dict "name" "GF_AUTH_PROXY_HEADER_NAME" "value" "X-Forwarded-User")
+    (dict "name" "GF_AUTH_PROXY_HEADER_PROPERTY" "value" "username")
+    (dict "name" "GF_AUTH_PROXY_AUTO_SIGN_UP" "value" "true")
+    (dict "name" "GF_AUTH_PROXY_ENABLE_LOGIN_TOKEN" "value" "false")
+    (dict "name" "GF_AUTH_PROXY_WHITELIST" "value" (required "podCIDR is required" .Values.podCIDR))
+    (dict "name" "GF_AUTH_DISABLE_LOGIN_FORM" "value" "true")
+    (dict "name" "GF_AUTH_DISABLE_SIGNOUT_MENU" "value" "true")
+    (dict "name" "GF_AUTH_BASIC_ENABLED" "value" "false")
+    (dict "name" "GF_AUTH_ANONYMOUS_ENABLED" "value" "false")
+    (dict "name" "GF_USERS_ALLOW_SIGN_UP" "value" "false")
+    (dict "name" "GF_USERS_AUTO_ASSIGN_ORG_ROLE" "value" "Admin")
+    (dict "name" "GF_SECURITY_ADMIN_PASSWORD__FILE" "value" "/run/secrets/grafana/admin-password")
+    (dict "name" "GF_SECURITY_COOKIE_SECURE" "value" "true")
+    (dict "name" "GF_SECURITY_DISABLE_GRAVATAR" "value" "true")
+    (dict "name" "GF_ANALYTICS_REPORTING_ENABLED" "value" "false")
+    (dict "name" "GF_ANALYTICS_CHECK_FOR_UPDATES" "value" "false")
+    (dict "name" "GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES" "value" "false")
+    (dict "name" "GF_NEWS_NEWS_FEED_ENABLED" "value" "false")
+    (dict "name" "GF_PLUGINS_PREINSTALL_DISABLED" "value" "true"))
+  "mounts" (list
+    (dict "name" "data" "mountPath" "/var/lib/grafana")
+    (dict "name" "provisioning" "mountPath" "/etc/grafana/provisioning" "readOnly" true)
+    (dict "name" "dashboards" "mountPath" "/var/lib/grafana-dashboards" "readOnly" true)
+    (dict "name" "secrets" "mountPath" "/run/secrets/grafana" "readOnly" true)
+    (dict "name" "tmp" "mountPath" "/tmp"))
+  "volumes" (list
+    (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "grafana-data"))
+    (dict "name" "provisioning" "configMap" (dict "name" "config-monitoring-grafana-provisioning" "items" (.Values.configItems.grafanaProvisioning | default list)))
+    (dict "name" "dashboards" "configMap" (dict "name" "config-monitoring-grafana-dashboards" "items" (.Values.configItems.grafanaDashboards | default list)))
+    (dict "name" "secrets" "secret" (dict "secretName" "secrets-monitoring-grafana" "defaultMode" 288))
+    (dict "name" "tmp" "emptyDir" (dict "medium" "Memory")))
+  "fsGroup" .Values.uids.grafana
+}}
+{{ include "portcullis.deployment" (dict "root" . "s" $gf) }}
+---
+{{ include "portcullis.pvc" (list . "grafana-data" .Values.uids.grafana .Values.uids.grafana "0750") }}
+{{- range $svc := list (list "prometheus" 9090) (list "alertmanager" 9093) (list "blackbox" 9115) (list "textfile-exporter" 9100) (list "grafana" 3000) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ index $svc 0 }}
+  namespace: {{ $.Release.Namespace }}
+spec:
+  selector:
+    portcullis.io/component: {{ index $svc 0 }}
+  ports:
+    - name: http
+      port: {{ index $svc 1 }}
+      targetPort: {{ index $svc 1 }}
+{{- end }}
+{{- end }}

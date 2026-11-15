@@ -155,6 +155,7 @@ PY
 # ── helpers ────────────────────────────────────────────────
 
 _backup_load_cfg() {
+  _rt_docker_only
   [ -n "$_BACKUP_CFG" ] || _BACKUP_CFG="$(dc config --format json 2>/dev/null)" \
     || fail "docker compose config failed (is .env complete?)"
   [ -n "$_BACKUP_CFG" ] || fail "docker compose config returned nothing"
@@ -165,6 +166,7 @@ _svc_image() { printf '%s' "$_BACKUP_CFG" | jq -r --arg s "$1" '.services[$s].im
 # first if this host does not have it yet (e.g. verify before the first `up`).
 _py_image() {
   local img
+  _rt_docker_only
   img="$(_svc_image group-gate)"
   [ -n "$img" ] || fail "group-gate has no image name in the compose config"
   docker image inspect "$img" >/dev/null 2>&1 || runtime_build_service group-gate >&2 \
@@ -240,13 +242,14 @@ _backup_vault_snapshot() {
 
 _backup_pg_dump() {
   local out="$1"
-  dc exec -T postgres pg_dump -U keycloak -d keycloak -Fc > "$out" || fail "pg_dump failed"
+  rt_exec postgres -- pg_dump -U keycloak -d keycloak -Fc > "$out" || fail "pg_dump failed"
   [ "$(head -c 5 "$out")" = PGDMP ] || fail "pg_dump output is not a custom-format dump"
 }
 
 # _backup_volume_files <volume> <uid> <gid> — tar.gz of the volume on stdout.
 _backup_volume_files() {
   local img
+  _rt_docker_only
   img="$(_py_image)" || return 1
   docker run --rm --network none --user "$2:$3" --cap-drop ALL --security-opt no-new-privileges:true \
     --read-only --tmpfs /tmp -e PYTHONDONTWRITEBYTECODE=1 -v "$1:$BACKUP_PY_MOUNT" \
@@ -295,8 +298,13 @@ _backup_prune_local() {
 
 # ── backup ─────────────────────────────────────────────────
 
-backup_create() {
+# backup_create — a consistent, online backup (docker / podman: compose
+# volumes and helper containers; kubernetes: scripts/lib/kube.sh).
+backup_create() { if _rt_is_kube; then _backup_create_kube; else _backup_create_docker; fi; }
+
+_backup_create_docker() {
   local dir work started="" svc t0 old_umask spec key uid gid full f
+  _rt_docker_only
   require_cmd docker jq curl gzip tar
   t0="$(date +%s)"
   _backup_load_cfg
@@ -307,7 +315,7 @@ backup_create() {
   # The dumps talk to the running Vault and Postgres; start them if needed
   # (and stop them again afterwards).
   for svc in postgres vault; do
-    [ -n "$(dc ps -q --status running "$svc" 2>/dev/null)" ] || started="$started $svc"
+    rt_running "$svc" || started="$started $svc"
   done
   if [ -n "$started" ]; then
     info "Starting$started for the backup..."
@@ -353,7 +361,7 @@ backup_create() {
 
   if [ -n "$started" ]; then
     # shellcheck disable=SC2086
-    dc stop $started >/dev/null 2>&1 || true
+    rt_stop $started >/dev/null 2>&1 || true
   fi
   # shellcheck disable=SC2034
   BACKUP_LAST_DIR="$dir"
@@ -394,8 +402,11 @@ _restic_require() {
 # password and provider credentials are passed by NAME (-e VAR), in a
 # subshell, so they never reach argv or this shell's later commands.
 # Extra mounts: _RESTIC_MOUNTS=(-v src:dst ...).
-_restic() {
+_restic() { if _rt_is_kube; then _restic_host "$@"; else _restic_docker "$@"; fi; }
+
+_restic_docker() {
   local repo="$BACKUP_REPOSITORY" path v user
+  _rt_docker_only
   if _rt_is_podman; then user=0:0; else user="$(id -u):$(id -g)"; fi
   local -a args=(run --rm -i --user "$user" --cap-drop ALL --security-opt no-new-privileges:true
     --read-only --tmpfs /tmp -e HOME=/tmp -e RESTIC_CACHE_DIR=/cache -v "$BACKUP_ROOT/.restic-cache:/cache"
@@ -475,15 +486,25 @@ _restic_restore_to() {
   _RESTIC_MOUNTS=(-v "$target:/restore")
   _restic restore "$snap" ${filter[@]+"${filter[@]}"} --target /restore >&2 || { _RESTIC_MOUNTS=(); fail "restic restore of $snap failed"; }
   _RESTIC_MOUNTS=()
-  [ -f "$target$BACKUP_SNAPSHOT_PATH/MANIFEST.json" ] || fail "snapshot $snap has no $BACKUP_SNAPSHOT_PATH/MANIFEST.json"
+  if [ ! -f "$target$BACKUP_SNAPSHOT_PATH/MANIFEST.json" ]; then
+    # A snapshot made by the host restic (kubernetes) keeps the host path.
+    local m
+    m="$(find "$target" -name MANIFEST.json -path '*/MANIFEST.json' 2>/dev/null | head -n1)"
+    [ -n "$m" ] || fail "snapshot $snap has no $BACKUP_SNAPSHOT_PATH/MANIFEST.json"
+    printf '%s' "$(dirname "$m")"
+    return 0
+  fi
   printf '%s' "$target$BACKUP_SNAPSHOT_PATH"
 }
 
 # ── verify ─────────────────────────────────────────────────
 
 # backup_verify_dir <dir> — checksums + every piece is usable.
-backup_verify_dir() {
+backup_verify_dir() { if _rt_is_kube; then _backup_verify_dir_kube "$@"; else _backup_verify_dir_docker "$@"; fi; }
+
+_backup_verify_dir_docker() {
   local dir="$1" t n rc=0 realms users kc pg_img py_img f
+  _rt_docker_only
   _backup_check_layout "$dir"
   _backup_check_manifest "$dir" || fail "checksum mismatch in $dir"
   ok "checksums match MANIFEST.json ($(jq '.files | length' "$dir/MANIFEST.json") files)"
@@ -541,6 +562,7 @@ backup_verify_dir() {
 
 _verify_pg() {
   local n="$1" dump="$2" i
+  _rt_docker_only
   for ((i = 0; i < 60; i++)); do
     docker exec "$n" pg_isready -U postgres -h 127.0.0.1 -q 2>/dev/null && break
     sleep 2
@@ -585,10 +607,10 @@ _restore_pg() {
   # TCP readiness = the final server (the image's init server only listens
   # on the socket).
   for ((i = 0; i < 90; i++)); do
-    dc exec -T postgres pg_isready -U keycloak -h 127.0.0.1 -q >/dev/null 2>&1 && break
+    rt_exec postgres -- pg_isready -U keycloak -h 127.0.0.1 -q >/dev/null 2>&1 && break
     sleep 2
   done
-  dc exec -T postgres pg_restore -U keycloak -d keycloak --no-owner --exit-on-error --single-transaction \
+  rt_exec -i postgres -- pg_restore -U keycloak -d keycloak --no-owner --exit-on-error --single-transaction \
     < "$dir/postgres.dump" || fail "pg_restore failed"
 }
 
@@ -598,6 +620,7 @@ _restore_pg() {
 # the original key.
 _restore_vault() {
   local dir="$1" init tmp_key tmp_root code
+  _rt_docker_only
   info "Restoring Vault (raft snapshot)..."
   unset VAULT_TOKEN
   _vault_start_and_status
@@ -621,25 +644,35 @@ _restore_vault() {
 # _strip_host_files <secrets dir> — removes what belongs to one host, not
 # the install: the last detected public addresses (domains.sh
 # domains_public_ips falls back to them) and a pending ACME flip's settle
-# point (acme-relax.env, dns.sh; _restore_secrets keeps the live one). A
+# point (acme-relax.env, dns.sh; _restore_secrets keeps the live one), the
+# CLI's Kubernetes state (secrets/kube: regenerated by the next up). A
 # backup never carries them, a
 # restore deletes them (older backups, or the same host: can't tell).
 _strip_host_files() {
   rm -f "$1/domains/last-public-ipv4" "$1/domains/last-public-ipv6" "$1/domains/acme-relax.env"
+  # The CLI's Kubernetes state (values, digests, the setup record) belongs
+  # to this host's cluster: never in a backup, never restored.
+  rm -rf "$1/kube"
 }
 
 _restore_secrets() {
-  local dir="$1" relax="$PORTCULLIS_ROOT/secrets/domains/acme-relax.env" keep=""
+  local dir="$1" relax="$PORTCULLIS_ROOT/secrets/domains/acme-relax.env" keep="" kube="$PORTCULLIS_ROOT/secrets/kube" keepk=""
   # A pending ACME flip's settle point describes live DNS caches, which a
   # restore doesn't change: the live one is kept (I6); none is ever in a
-  # backup.
+  # backup. Likewise this host's Kubernetes state (secrets/kube: the
+  # release's digests and values, the setup record) is kept as it is.
   if [ -f "$relax" ]; then keep="$(mktemp)" && cp -p "$relax" "$keep"; fi
+  if [ -d "$kube" ]; then keepk="$(mktemp -d)" && chmod 700 "$keepk" && cp -a "$kube" "$keepk/kube"; fi
   (umask 077 && rm -rf "$PORTCULLIS_ROOT/secrets.restore-tmp" && cp -a "$dir/secrets" "$PORTCULLIS_ROOT/secrets.restore-tmp")
   rm -rf "$PORTCULLIS_ROOT/secrets" && mv "$PORTCULLIS_ROOT/secrets.restore-tmp" "$PORTCULLIS_ROOT/secrets"
   _strip_host_files "$PORTCULLIS_ROOT/secrets"
   if [ -n "$keep" ]; then
     mkdir -p "$(dirname "$relax")" && cp -p "$keep" "$relax" && chmod 600 "$relax"
     rm -f "$keep"
+  fi
+  if [ -n "$keepk" ]; then
+    cp -a "$keepk/kube" "$kube" && chmod 700 "$kube"
+    rm -rf "$keepk"
   fi
   chmod 700 "$PORTCULLIS_ROOT/secrets"
   secrets_fix_perms
@@ -650,6 +683,7 @@ _restore_secrets() {
 # (stopped) lldap_data volume, or "missing".
 _restore_lldap_count() {
   local vol
+  _rt_docker_only
   vol="$(_volume_name lldap_data)"
   docker volume inspect "$vol" >/dev/null 2>&1 || { echo missing; return 0; }
   docker run --rm --network none --read-only --tmpfs /tmp --user "$CT_UID_LLDAP:$CT_UID_LLDAP" --cap-drop ALL \
@@ -661,7 +695,7 @@ _restore_lldap_count() {
 # linked to the LDAP federation (the restored database; Postgres is up),
 # besides admin; "" if unknown.
 _restore_kc_federated_count() {
-  dc exec -T postgres psql -U keycloak -d keycloak -tAc \
+  rt_exec postgres -- psql -U keycloak -d keycloak -tAc \
     "select count(*) from user_entity u join realm r on r.id = u.realm_id where r.name = 'portcullis' and u.federation_link is not null and u.username <> 'admin'" \
     2>/dev/null | tr -d '[:space:]'
 }
@@ -671,7 +705,7 @@ _restore_kc_federated_count() {
 # ones; <allow> = true (--allow-empty-lldap) only warns.
 _restore_lldap_guard() {
   local allow="$1" ll kcn
-  ll="$(_restore_lldap_count)"
+  if _rt_is_kube; then ll="$(_kube_restore_lldap_count)"; else ll="$(_restore_lldap_count)"; fi
   kcn="$(_restore_kc_federated_count)"
   case "$kcn" in ''|*[!0-9]*) kcn=0 ;; esac
   if { [ "$ll" = missing ] || [ "$ll" = 0 ]; } && [ "$kcn" -gt 0 ]; then
@@ -703,6 +737,7 @@ RESTORE_STOPPED_APPS=""
 _RESTORE_ERROR_MSG=""
 _restore_stop_secret_apps() {
   local vol="$1" core="$2" hub_stopped="${3:-false}" ids id p left empty
+  _rt_docker_only
   _RESTORE_ERROR_MSG=""
   if ! ids="$(docker ps -aq --filter "volume=$vol")"; then
     _RESTORE_ERROR_MSG="can't list the containers using $vol (docker ps failed): nothing was restored"
@@ -769,6 +804,15 @@ restore_runtime_from_host() {
   fi
   RESTORE_ENGINE_SOCKET=""
   [ "$RESTORE_RUNTIME" != podman ] || RESTORE_ENGINE_SOCKET="${PORTCULLIS_ENGINE_SOCKET:-}"
+  # Kubernetes: the cluster's keys stay this host's (context, namespaces,
+  # networks, install id, images, fixed ClusterIPs), never the backup's.
+  RESTORE_KUBE_KEYS=""
+  if [ "$RESTORE_RUNTIME" = kubernetes ]; then
+    local k
+    for k in $RESTORE_KUBE_KEY_NAMES; do
+      [ -z "${!k:-}" ] || RESTORE_KUBE_KEYS+="$k=${!k}"$'\n'
+    done
+  fi
   runtime_check
   runtime_require_host
 }
@@ -776,17 +820,32 @@ restore_runtime_from_host() {
 # _restore_runtime_keys — the restored .env keeps this host's runtime, never
 # the backup's: CONTAINER_RUNTIME always, the engine socket under podman; a
 # PORTCULLIS_ENGINE_SOCKET the backup carried is dropped under docker.
+# The .env keys that belong to a kubernetes host (restore keeps the host's).
+RESTORE_KUBE_KEY_NAMES="PORTCULLIS_KUBE_CONTEXT PORTCULLIS_NAMESPACE PORTCULLIS_APPS_NAMESPACE PORTCULLIS_POD_CIDR PORTCULLIS_SERVICE_CIDR PORTCULLIS_KUBE_API_ENDPOINTS PORTCULLIS_KUBE_INSTALL_ID PORTCULLIS_KUBE_IMAGES PORTCULLIS_TRAEFIK_SERVICE_IP PORTCULLIS_TRAEFIK_VPN_SERVICE_IP PORTCULLIS_WG_EDGE_SERVICE_IP"
+
 _restore_runtime_keys() {
+  local k line
   env_set CONTAINER_RUNTIME "$RESTORE_RUNTIME"
   if [ "$RESTORE_RUNTIME" = podman ]; then
     env_set PORTCULLIS_ENGINE_SOCKET "$RESTORE_ENGINE_SOCKET"
   else
     env_unset PORTCULLIS_ENGINE_SOCKET
   fi
+  # The backup's kubernetes keys (if any) never survive; this host's do.
+  for k in $RESTORE_KUBE_KEY_NAMES; do env_unset "$k"; done
+  if [ "$RESTORE_RUNTIME" = kubernetes ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      env_set "${line%%=*}" "${line#*=}"
+    done <<< "${RESTORE_KUBE_KEYS:-}"
+  fi
 }
 
-backup_restore() {
+backup_restore() { if _rt_is_kube; then _backup_restore_kube "$@"; else _backup_restore_docker "$@"; fi; }
+
+_backup_restore_docker() {
   local dir="$1" yes="$2" allow_empty_lldap="${3:-false}" pre had_env=false key uid gid full spec proj helper
+  _rt_docker_only
   require_cmd docker jq curl tar gzip
   [ -d "$dir" ] || fail "Backup directory not found: $dir"
   dir="$(cd "$dir" && pwd)"
@@ -810,12 +869,12 @@ backup_restore() {
   if [ "$had_env" = true ]; then
     _backup_load_cfg
     info "Stopping Hub..."
-    dc stop hub || fail "could not stop the Hub: nothing was restored"
+    rt_stop hub || fail "could not stop the Hub: nothing was restored"
     hub_stopped=true
     full="$(_volume_name hub_secrets)"
     if ! _restore_stop_secret_apps "${full:-portcullis_hub_secrets}" "$(_project_name)" true; then
       info "Restarting Hub..."
-      if dc start hub 2>/dev/null; then
+      if rt_start hub 2>/dev/null; then
         fail "$_RESTORE_ERROR_MSG, Hub running again"
       else
         fail "$_RESTORE_ERROR_MSG, Hub was stopped but could not be restarted"
@@ -832,7 +891,7 @@ backup_restore() {
       && { [ ! -d "$PORTCULLIS_ROOT/certs" ] || cp -a "$PORTCULLIS_ROOT/certs" "$pre/certs"; }); then
       if [ "$hub_stopped" = true ]; then
         info "Restarting Hub..."
-        if dc start hub 2>/dev/null; then
+        if rt_start hub 2>/dev/null; then
           fail "could not save pre-restore copy: nothing was restored, Hub running again"
         else
           fail "could not save pre-restore copy: nothing was restored, Hub was stopped but could not be restarted"
@@ -843,8 +902,8 @@ backup_restore() {
     fi
     _backup_load_cfg
     info "Stopping services..."
-    dc down
-    hub_stopped=false  # dc down includes the Hub, so it's not independently stopped anymore
+    rt_down
+    hub_stopped=false  # rt_down includes the Hub, so it's not independently stopped anymore
   fi
 
   # .env in place (keeps a symlink into config/ and the Hub's bind mount).
@@ -936,10 +995,10 @@ backup_restore() {
   # The core must come up; a non-core service (e.g. a Hub image that cannot
   # be pulled right now) must not abort a restore.
   # The local images are built on both runtimes, as up / upgrade do
-  # (stack_compose_up: docker --build, podman podman build + --no-build), so
+  # (rt_up: docker --build, podman podman build + --no-build), so
   # a restore never starts a container from an image older than this
   # checkout; compose recreates a container whose image content changed.
-  stack_compose_up || warn "some services did not start — check ./portcullis status"
+  rt_up || warn "some services did not start — check ./portcullis status"
   wait_healthy 300 vault postgres lldap keycloak
   ok "Restore complete.${pre:+ Previous .env/secrets/certs: $pre.} Verify with ./portcullis status"
   if [ -n "$RESTORE_STOPPED_APPS" ]; then
@@ -962,12 +1021,17 @@ _restore_lost_devices_note() {
 # backup_schedule_systemd <on-calendar> <output-dir|""> — system units
 # (docker: User=, After/Requires docker.service), or under rootless Podman
 # the operator's user units (After/Requires podman.socket, no User=,
-# WantedBy=default.target; they run while linger keeps the user manager up).
+# WantedBy=default.target; they run while linger keeps the user manager up),
+# or on Kubernetes system units with User= and no engine dependency but
+# k3s.service when this host runs it (a remote cluster: none).
 backup_schedule_systemd() {
   local cal="$1" out="$2" user offsite="" svc timer env_line="" after requires user_line wanted podman=false
   user="$(id -un)"
   if _rt_is_podman; then podman=true; fi
-  if [ "$podman" = true ]; then
+  if _rt_is_kube; then
+    after="network-online.target" requires="" user_line="User=$user" wanted="timers.target"
+    if systemctl cat k3s.service >/dev/null 2>&1; then after="$after k3s.service" requires="k3s.service"; fi
+  elif [ "$podman" = true ]; then
     after="network-online.target podman.socket" requires="podman.socket" user_line="" wanted="default.target"
   else
     after="network-online.target docker.service" requires="docker.service" user_line="User=$user" wanted="timers.target"
@@ -980,8 +1044,8 @@ backup_schedule_systemd() {
 Description=Portcullis backup$( [ -n "$offsite" ] && echo " (local + off-host, restic)" || echo " (local only: BACKUP_REPOSITORY is not set)")
 Wants=network-online.target
 After=$after
-Requires=$requires
-
+${requires:+Requires=$requires
+}
 [Service]
 Type=oneshot
 ${user_line:+$user_line

@@ -75,6 +75,7 @@ init_write_env() {
   done
   rtkeys="CONTAINER_RUNTIME=$rt"
   [ "$rt" != podman ] || rtkeys="$rtkeys"$'\n'"PORTCULLIS_ENGINE_SOCKET=$(runtime_podman_socket)"
+  [ "$rt" != kubernetes ] || rtkeys="$rtkeys"$'\n'"${INIT_KUBE_KEYS:?}"
   old_umask="$(umask)"
   umask 077
   cat > "$file" <<EOF
@@ -150,12 +151,17 @@ _init_runtime_existing() {
   local flag="$1" have rt
   have="$(env_get CONTAINER_RUNTIME)"
   if [ -n "$have" ]; then
-    case "$have" in docker|podman) ;; *) fail "CONTAINER_RUNTIME=$have in .env is neither docker nor podman" ;; esac
+    case "$have" in docker|podman|kubernetes) ;; *) fail "CONTAINER_RUNTIME=$have in .env is not docker, podman or kubernetes" ;; esac
     for rt in "$flag" "${CONTAINER_RUNTIME:-}"; do
       [ -z "$rt" ] || [ "$rt" = "$have" ] || fail "CONTAINER_RUNTIME is $have in .env and is never switched (backup → fresh init → restore)"
     done
+    if [ "$have" = kubernetes ] && [ -n "$2" ] && [ "$2" != "$(env_get PORTCULLIS_KUBE_CONTEXT)" ]; then
+      fail "PORTCULLIS_KUBE_CONTEXT is $(env_get PORTCULLIS_KUBE_CONTEXT) in .env: edit it there, not with --kube-context"
+    fi
     return 0
   fi
+  [ "$flag" != kubernetes ] && [ "${CONTAINER_RUNTIME:-}" != kubernetes ] \
+    || fail "CONTAINER_RUNTIME=kubernetes needs a fresh .env (init --runtime kubernetes --kube-context <ctx> writes its keys)"
   rt="$(runtime_detect "$flag")" || exit 1
   env_set CONTAINER_RUNTIME "$rt"
   info "Set CONTAINER_RUNTIME=$rt in .env"
@@ -167,12 +173,12 @@ _init_runtime_existing() {
 }
 
 init_run() {
-  local domain="$1" email="$2" provider="$3" env_only="$4" skip_dns="$5" config_repo="$6" runtime="${7:-}" v rt
+  local domain="$1" email="$2" provider="$3" env_only="$4" skip_dns="$5" config_repo="$6" runtime="${7:-}" kctx="${8:-}" v rt kubekeys=""
   require_cmd openssl
   if [ -f "$(env_file)" ]; then
     info "Using the existing $(env_file)."
     [ -z "$domain$email$provider" ] || warn "--domain/--email/--dns-provider are ignored: .env already exists (edit it instead)."
-    _init_runtime_existing "$runtime"
+    _init_runtime_existing "$runtime" "$kctx"
   else
     [ -n "$domain" ] || domain="${PORTCULLIS_DOMAIN:-}"
     if [ -z "$domain" ]; then
@@ -193,7 +199,18 @@ init_run() {
     [ -z "$runtime" ] || [ -z "${CONTAINER_RUNTIME:-}" ] || [ "$runtime" = "$CONTAINER_RUNTIME" ] \
       || fail "--runtime $runtime contradicts CONTAINER_RUNTIME=$CONTAINER_RUNTIME in the environment"
     rt="$(runtime_detect "$runtime")" || exit 1
-    init_write_env "$domain" "$email" "$provider" "$rt"
+    if [ "$rt" = kubernetes ]; then
+      # The cluster's networks are detected now (runtime_check re-checks
+      # them every run), before anything is written.
+      kctx="${kctx:-${PORTCULLIS_KUBE_CONTEXT:-}}"
+      [ -n "$kctx" ] || usage_error init "--runtime kubernetes needs --kube-context <ctx> (the current context is never used)"
+      require_cmd kubectl
+      kube_context_exists "$kctx" || fail "the kube context $kctx doesn't exist (kubectl config get-contexts)"
+      PORTCULLIS_KUBE_CONTEXT="$kctx" kube_detect_cidrs || fail "can't read the cluster behind $kctx: $_K_ERR"
+      ! _kube_ipv6_in "$_K_POD_CIDR $_K_SVC_CIDR" || fail "dual-stack or IPv6 cluster (pods $_K_POD_CIDR, services $_K_SVC_CIDR): Portcullis supports IPv4 single-stack only"
+      kubekeys="$(kube_env_keys "$kctx")" || exit 1
+    fi
+    INIT_KUBE_KEYS="$kubekeys" init_write_env "$domain" "$email" "$provider" "$rt"
     export CONTAINER_RUNTIME="$rt"
     ok "Created $(env_file) (0600)."
   fi
@@ -213,11 +230,15 @@ init_run() {
     return 0
   fi
 
-  require_cmd docker jq curl
+  if _rt_is_kube; then require_cmd kubectl helm jq curl; else require_cmd docker jq curl; fi
   runtime_check
   runtime_require_host
-  docker compose version >/dev/null 2>&1 || fail "the docker compose plugin is required"
-  network_check
+  rt_require_tools
+  if _rt_is_kube; then
+    kube_init_cluster
+  else
+    network_check
+  fi
 
   if [ "$skip_dns" = true ] || [ "${DNS_PROVIDER:-none}" = none ]; then
     info "Skipping DNS record setup."
@@ -228,6 +249,12 @@ init_run() {
   fi
 
   stack_prepare
+  if _rt_is_kube; then
+    # Kubernetes: the release first (not waited for: Vault is not
+    # initialised yet), then Vault initialised in its pod.
+    info "Installing the release..."
+    KUBE_HELM_WAIT=false rt_up || fail "helm could not install the release"
+  fi
   info "Initialising Vault..."
   vault_init false
   # ACME_STAGING → ACME_CA_SERVER, and the CA bundle (forward-auth
@@ -238,13 +265,19 @@ init_run() {
   info "Starting services..."
   # Start everything except hub (needs LLDAP service account + Keycloak clients first).
   local all_svcs hub_excluded=""
-  all_svcs="$(dc config --services | tr '\n' ' ')"
+  all_svcs="$(rt_services | tr '\n' ' ')"
   for s in $all_svcs; do
     [ "$s" = hub ] || hub_excluded="$hub_excluded $s"
   done
   sessions_restart_if_changed
-  # shellcheck disable=SC2086
-  stack_compose_up $hub_excluded
+  if _rt_is_kube; then
+    # The release is whole: the Hub starts too (it waits for its LLDAP
+    # account, delivered below); the unseal key reaches Vault's Secret.
+    KUBE_HELM_WAIT=false rt_up || fail "helm could not upgrade the release"
+  else
+    # shellcheck disable=SC2086
+    rt_up $hub_excluded
+  fi
   wait_healthy 300 vault postgres lldap keycloak
 
   info "Creating the Vault PKI..."
@@ -253,24 +286,35 @@ init_run() {
   # server.key was just written: give Traefik (group 0) read access.
   stack_prepare
   info "Restarting Traefik, the forward-auth services, Keycloak and group-gate to pick up the CA chain..."
-  dc restart traefik forward-auth forward-auth-ext keycloak group-gate
+  if _rt_is_kube; then
+    # The synced ConfigMaps change their pods' config hash: they roll.
+    KUBE_HELM_WAIT=false rt_up || fail "helm could not upgrade the release"
+  else
+    rt_restart traefik forward-auth forward-auth-ext keycloak group-gate
+  fi
   signin_ca_mark
   pki_files_mark
   config_mark
   wait_healthy 300 keycloak
+  ! _rt_is_kube || kube_forward_core
 
   keycloak_configure false
   oidc_register
   lldap_service_account
 
   info "Starting the Hub..."
-  # shellcheck disable=SC2046  # nothing or --no-build
-  dc up -d $(runtime_no_build) hub
+  if _rt_is_kube; then
+    # The LLDAP account's files reach the Hub's Secret; the whole release
+    # is waited for (helm --wait) this time.
+    rt_up || fail "the release did not become ready (see above)"
+  else
+    rt_up_service --deps hub
+  fi
   # The Hub's image has a HEALTHCHECK: wait until it reports healthy
   # (a missing check would show "running"; both count).
   local i st=""
   for ((i = 0; i < 120; i += 3)); do
-    st="$(container_health hub)"
+    st="$(rt_health hub)"
     case "$st" in healthy|running) break ;; esac
     sleep 3
   done
@@ -282,6 +326,9 @@ init_run() {
 
   # Traefik has run: pin the CAA (written CA-only above) to its account.
   dns_tighten_main
+  # The Hub refuses every runtime operation once the cluster check is 24 h
+  # old: a timer refreshes it every 6 h.
+  ! _rt_is_kube || kube_check_timer_install
 
   local d="$PORTCULLIS_DOMAIN"
   echo ""
@@ -338,7 +385,7 @@ signin_ca_reload() {
   sum="$(_ca_bundle_sum "$bundle")"
   if [ "$(cat "$stamp" 2>/dev/null)" != "$sum" ]; then
     info "Restarting the forward-auth services to pick up the new CA bundle..."
-    dc restart forward-auth forward-auth-ext >/dev/null || return 1
+    rt_restart forward-auth forward-auth-ext >/dev/null || return 1
     printf '%s\n' "$sum" > "$stamp"
   fi
 }
@@ -376,7 +423,7 @@ pki_files_reload() {
   [ "$(cat "$stamp" 2>/dev/null)" != "$sum" ] || return 0
   info "Restarting Traefik, Keycloak and group-gate to pick up the internal CA's files..."
   # shellcheck disable=SC2086
-  dc restart $PKI_FILES_SERVICES >/dev/null || return 1
+  rt_restart $PKI_FILES_SERVICES >/dev/null || return 1
   printf '%s\n' "$sum" > "$stamp"
 }
 
@@ -458,7 +505,7 @@ config_reload() {
     # shellcheck disable=SC2086
     info "Restarting services to pick up config changes:$to_restart"
     # shellcheck disable=SC2086
-    dc restart $to_restart >/dev/null || return 1
+    rt_restart $to_restart >/dev/null || return 1
     # Write stamps only after successful restart
     printf '%s' "$pending_stamps" | while IFS=' ' read -r stamp_path sum_val; do
       [ -n "$stamp_path" ] || continue
@@ -474,11 +521,11 @@ stack_up() {
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
   runtime_check
   runtime_require_host
-  network_check
+  rt_network_check
   stack_prepare
   config_apply
   sessions_restart_if_changed
-  stack_compose_up
+  rt_up
   runtime_proxies_refresh
   domains_restart_if_renewed
   monitoring_reload
@@ -493,7 +540,7 @@ stack_up() {
   lldap_service_account
   if [ "${LLDAP_SA_CHANGED:-false}" = true ]; then
     info "Restarting the Hub to pick up the updated LLDAP credentials..."
-    dc restart hub >/dev/null
+    rt_restart hub >/dev/null
   fi
   ok "Portcullis is up. Check: ./portcullis status"
 }
@@ -510,7 +557,7 @@ upgrade_run() {
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
   runtime_check
   runtime_require_host
-  network_check
+  rt_network_check
   hub_pinned_warn
 
   if [ "$skip_backup" = true ]; then
@@ -520,7 +567,7 @@ upgrade_run() {
   fi
 
   info "Pulling images..."
-  dc pull --quiet --ignore-buildable 2>/dev/null || dc pull --ignore-buildable
+  rt_pull
 
   stack_prepare
   vault_init false
@@ -529,7 +576,7 @@ upgrade_run() {
 
   info "Starting services..."
   sessions_restart_if_changed
-  stack_compose_up
+  rt_up
   runtime_proxies_refresh
   domains_restart_if_renewed
   monitoring_reload
@@ -549,11 +596,10 @@ upgrade_run() {
   lldap_service_account
   if [ "${LLDAP_SA_CHANGED:-false}" = true ]; then
     info "Restarting the Hub to pick up the updated LLDAP credentials..."
-    dc restart hub >/dev/null
+    rt_restart hub >/dev/null
   fi
   # Picks up a FORWARD_AUTH_CLIENT_SECRET generated above, if any.
-  # shellcheck disable=SC2046  # nothing or --no-build
-  dc up -d $(runtime_no_build) forward-auth forward-auth-ext >/dev/null
+  rt_up_service --deps forward-auth forward-auth-ext >/dev/null
   signin_ca_reload
   info "Checking the Hub's policy file against group-gate..."
   hub_policy_check
@@ -587,12 +633,19 @@ Options:
                           or another lego provider name (default: cloudflare)
   --non-interactive       never prompt; DNS credentials must be in the
                           environment (e.g. CLOUDFLARE_API_TOKEN=...)
-  --runtime docker|podman container runtime, written to .env as
+  --runtime docker|podman|kubernetes
+                          container runtime, written to .env as
                           CONTAINER_RUNTIME and never switched afterwards
                           (default: CONTAINER_RUNTIME from the environment,
                           else Docker if its engine answers, else rootless
                           Podman on the user socket; podman needs the host
-                          preparation of docs operations/rootless-podman)
+                          preparation of docs operations/rootless-podman;
+                          kubernetes is never detected: name it, with
+                          --kube-context, docs operations/kubernetes)
+  --kube-context CTX      the kubeconfig context of the cluster (required
+                          with --runtime kubernetes; written to .env as
+                          PORTCULLIS_KUBE_CONTEXT: the current context is
+                          never used)
   --env-only              only write/complete .env, then stop (refused
                           without --runtime when no engine answers)
   --skip-dns              do not create DNS records
@@ -651,7 +704,7 @@ EOF
 }
 
 cmd_init() {
-  local domain="" email="" provider="" env_only=false skip_dns=false config_repo=true runtime=""
+  local domain="" email="" provider="" env_only=false skip_dns=false config_repo=true runtime="" kube_context=""
   INIT_INTERACTIVE=true
   [ -t 0 ] || INIT_INTERACTIVE=false
   while [ $# -gt 0 ]; do
@@ -661,8 +714,9 @@ cmd_init() {
       --dns-provider) need_value init "$1" "${2:-}"; provider="$2"; shift ;;
       --runtime)
         need_value init "$1" "${2:-}"
-        case "$2" in docker|podman) runtime="$2" ;; *) usage_error init "--runtime must be docker or podman" ;; esac
+        case "$2" in docker|podman|kubernetes) runtime="$2" ;; *) usage_error init "--runtime must be docker, podman or kubernetes" ;; esac
         shift ;;
+      --kube-context) need_value init "$1" "${2:-}"; kube_context="$2"; shift ;;
       --non-interactive) INIT_INTERACTIVE=false ;;
       --env-only) env_only=true ;;
       --skip-dns) skip_dns=true ;;
@@ -672,7 +726,11 @@ cmd_init() {
     esac
     shift
   done
-  init_run "$domain" "$email" "$provider" "$env_only" "$skip_dns" "$config_repo" "$runtime"
+  [ -z "$kube_context" ] || [ "$runtime" = kubernetes ] || [ "${CONTAINER_RUNTIME:-}" = kubernetes ] \
+    || usage_error init "--kube-context goes with --runtime kubernetes"
+  [ "$runtime" != kubernetes ] || [ -n "$kube_context" ] || [ -n "${PORTCULLIS_KUBE_CONTEXT:-}" ] || [ -f "$(env_file)" ] \
+    || usage_error init "--runtime kubernetes needs --kube-context <ctx> (the current context is never used)"
+  init_run "$domain" "$email" "$provider" "$env_only" "$skip_dns" "$config_repo" "$runtime" "$kube_context"
 }
 
 cmd_up() {
@@ -695,7 +753,7 @@ cmd_down() {
   done
   need_env
   require_cmd docker
-  dc down
+  rt_down
 }
 
 cmd_upgrade() {
