@@ -245,6 +245,7 @@ kube_host_checks() {
   else
     _rt_chk warn "not k3s, or its node-args are unreadable: secrets encryption, the bundled ingress and ServiceLB can't be checked"
   fi
+  _kube_apparmor_check "$nodes"
   cfg="$(kube_ctl get --raw "/api/v1/nodes/$(printf '%s' "$nodes" | jq -r '.items[0].metadata.name // "?"' 2>/dev/null)/proxy/configz" 2>/dev/null || true)"
   pids="$(printf '%s' "$cfg" | jq -r '.kubeletconfig.podPidsLimit // empty' 2>/dev/null || true)"
   if [ "$pids" = 1024 ]; then
@@ -299,6 +300,35 @@ kube_host_checks() {
   else
     _rt_chk warn "the public IPv4 is unknown (PORTCULLIS_PUBLIC_IPV4): the client-address and exposed-API checks were skipped"
   fi
+}
+
+# _kube_apparmor_check <nodes json> — Ubuntu's
+# kernel.apparmor_restrict_unprivileged_unconfined=1 turns containerd's
+# profile change into a stack (…//&unconfined) its signal rules don't match:
+# every signal inside a container is denied and Postgres never finishes
+# starting (containerd#14485, k3s#13625). Checked on this host when the node
+# is this host; Portcullis never changes the setting itself. Overridable for
+# tests: KUBE_AA_SYSCTL, KUBE_AA_ENABLED, KUBE_AA_PROFILES. Drop it once a
+# fixed k3s / containerd is the pinned floor.
+_kube_apparmor_check() {
+  local nodes="$1" ips addrs local_node=false ip v
+  local sysctl="${KUBE_AA_SYSCTL:-/proc/sys/kernel/apparmor_restrict_unprivileged_unconfined}"
+  local enabled="${KUBE_AA_ENABLED:-/sys/module/apparmor/parameters/enabled}"
+  local profiles="${KUBE_AA_PROFILES:-/sys/kernel/security/apparmor/profiles}"
+  ips="$(printf '%s' "$nodes" | jq -r '[.items[0].status.addresses[]? | select(.type == "InternalIP" or .type == "ExternalIP") | .address] | join(" ")' 2>/dev/null || true)"
+  addrs=" $(_kube_local_addrs) "
+  for ip in $ips; do case "$addrs" in *" $ip "*) local_node=true ;; esac; done
+  if [ "$local_node" = false ]; then
+    _rt_chk warn "AppArmor stacking: the node isn't this host: check kernel.apparmor_restrict_unprivileged_unconfined there (1 + containerd's AppArmor profile denies signals in containers: containerd#14485)"; return 0
+  fi
+  if [ ! -r "$sysctl" ]; then _rt_chk ok "kernel.apparmor_restrict_unprivileged_unconfined: not on this kernel"; return 0; fi
+  v="$(tr -d '[:space:]' < "$sysctl")"
+  if [ "$v" != 1 ]; then _rt_chk ok "kernel.apparmor_restrict_unprivileged_unconfined = $v (containerd's AppArmor profile isn't stacked)"; return 0; fi
+  if [ "$(tr -d '[:space:]' < "$enabled" 2>/dev/null)" != Y ]; then _rt_chk ok "kernel.apparmor_restrict_unprivileged_unconfined = 1, AppArmor off"; return 0; fi
+  if [ -r "$profiles" ] && ! grep -q '^cri-containerd\.apparmor\.d' "$profiles" 2>/dev/null; then
+    _rt_chk warn "kernel.apparmor_restrict_unprivileged_unconfined = 1 but containerd's AppArmor profile isn't loaded yet: if it is (k3s loads it), signals in containers are denied (containerd#14485)"; return 0
+  fi
+  _rt_chk fail "kernel.apparmor_restrict_unprivileged_unconfined=1 with containerd's AppArmor profile: containers get a stacked label its signal rules don't match, so signals inside them are denied and Postgres never finishes starting (containerd#14485, k3s#13625). Either run sudo sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0 and keep it in /etc/sysctl.d/ (this relaxes an Ubuntu hardening for unprivileged profile changes), or wait for a k3s with the fix"
 }
 
 # kube_require_host — refuse (listing every failed item) while a † cluster

@@ -79,6 +79,17 @@ if [ "$netns" = true ]; then
   extra+=(--node-external-ip=198.51.100.1)
 fi
 
+# CI runner only (never the product: ./portcullis refuses such a host and
+# names the options): Ubuntu 26.04's
+# kernel.apparmor_restrict_unprivileged_unconfined=1 stacks containerd's
+# AppArmor profile, whose signal rules then deny signals inside containers
+# (Postgres never finishes starting; containerd#14485, k3s#13625).
+aa=/proc/sys/kernel/apparmor_restrict_unprivileged_unconfined
+if [ -r "$aa" ] && [ "$(cat "$aa")" = 1 ]; then
+  sudo sysctl -qw kernel.apparmor_restrict_unprivileged_unconfined=0
+  echo "CI runner: kernel.apparmor_restrict_unprivileged_unconfined 1 → $(cat "$aa") (containerd#14485)"
+fi
+
 # k3s as a systemd unit (the install script isn't pinned: the binary is).
 sudo tee /etc/systemd/system/k3s.service >/dev/null <<UNIT
 [Unit]

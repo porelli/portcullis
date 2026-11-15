@@ -4127,6 +4127,29 @@ kt() {
     ( eval "$1" ); echo "rc=$?" ) 2>&1
 }
 
+# The AppArmor stacking host check (containerd#14485 / k3s#13625): with
+# kernel.apparmor_restrict_unprivileged_unconfined=1 and containerd's
+# profile in use, signals inside containers are denied (Postgres never
+# finishes starting): refused, naming both ways out; never changed by us.
+AA="$WORK/aa"; mkdir -p "$AA/sys" "$AA/sec"
+LOCALNODE='{"items":[{"status":{"addresses":[{"type":"InternalIP","address":"10.1.0.4"}]}}]}'
+REMOTENODE='{"items":[{"status":{"addresses":[{"type":"InternalIP","address":"192.0.2.9"}]}}]}'
+aa() { # aa <sysctl value|-> <apparmor enabled Y|N> <profiles text|-> [node json]
+  rm -f "$AA/sys/x" "$AA/sec/profiles"; [ "$1" = - ] || echo "$1" > "$AA/sys/x"
+  echo "$2" > "$AA/enabled"; [ "$3" = - ] || printf '%s\n' "$3" > "$AA/sec/profiles"
+  kt "KUBE_AA_SYSCTL='$AA/sys/x' KUBE_AA_ENABLED='$AA/enabled' KUBE_AA_PROFILES='$AA/sec/profiles'; _kube_apparmor_check '${4:-$LOCALNODE}'"
+}
+OUT="$(aa 1 Y 'cri-containerd.apparmor.d (enforce)')"
+case "$OUT" in "fail	"*"apparmor_restrict_unprivileged_unconfined=1"*"containerd#14485"*"k3s#13625"*"sysctl -w kernel.apparmor_restrict_unprivileged_unconfined=0"*"relaxes"*"a k3s with the fix"*) t_pass "AppArmor check: sysctl 1 + containerd's profile → fail naming the cause and both options" ;; *) t_fail "aa 1: $OUT" ;; esac
+case "$(aa 1 Y -)" in "fail	"*) t_pass "AppArmor check: sysctl 1, profiles unreadable → fail (fail closed)" ;; *) t_fail "aa unreadable: $(aa 1 Y -)" ;; esac
+case "$(aa 0 Y 'cri-containerd.apparmor.d (enforce)')" in "ok	"*"= 0"*) t_pass "AppArmor check: sysctl 0 → ok, the value shown" ;; *) t_fail "aa 0: $(aa 0 Y x)" ;; esac
+case "$(aa - Y 'cri-containerd.apparmor.d (enforce)')" in "ok	"*"not on this kernel"*) t_pass "AppArmor check: no such sysctl → ok" ;; *) t_fail "aa none" ;; esac
+case "$(aa 1 N -)" in "ok	"*"AppArmor off"*) t_pass "AppArmor check: AppArmor off → ok" ;; *) t_fail "aa off: $(aa 1 N -)" ;; esac
+case "$(aa 1 Y 'docker-default (enforce)')" in "warn	"*"loaded yet"*) t_pass "AppArmor check: containerd's profile not loaded yet → warn" ;; *) t_fail "aa notloaded: $(aa 1 Y 'docker-default (enforce)')" ;; esac
+case "$(aa 1 Y 'cri-containerd.apparmor.d (enforce)' "$REMOTENODE")" in "warn	"*"isn't this host"*) t_pass "AppArmor check: a remote node → warn (checked there)" ;; *) t_fail "aa remote" ;; esac
+expect_eq "AppArmor check: the CLI never writes the sysctl (only the CI install script may)" \
+  "$(grep -n 'apparmor_restrict_unprivileged_unconfined=0' "$HERE"/../scripts/lib/*.sh "$HERE"/../portcullis | grep -v '_rt_chk\|#' | grep -c 'sysctl -w\|tee\|> */proc' || true)" 0
+expect_eq "AppArmor check runs in kube_host_checks (init / up refuse on fail; status shows it)" "$(sed -n '/^kube_host_checks() {/,/^}/p' "$HERE"/../scripts/lib/kube.sh | grep -c '_kube_apparmor_check')" 1
 # _rtk_health: a rolling Deployment is "starting" (the old pod's readiness
 # isn't the new config's); otherwise the newest non-terminating pod decides.
 RH_POD='{"status":{"phase":"Running","containerStatuses":[{"ready":%s,"started":true}]},"spec":{"containers":[{"readinessProbe":{}}]},"metadata":{"creationTimestamp":"%s"%s}}'
