@@ -131,8 +131,9 @@ func (cfg *Config) signNodeCert(ctx context.Context, role, cn, csrPEM string) (*
 
 // revokeNodeCert revokes serial on pki_node (unknown: 404; already
 // revoked: nil), then rotates pki_node's CRL (a failure is only logged).
-// Only node-worker certificates (*.node.portcullis.internal) are accepted;
-// node-control goes through the renewal flow.
+// Accepts any certificate whose chain verifies to the pki_node root (any
+// node role: node-worker, node-control, node-link). A cert that doesn't
+// chain to pki_node gets 403.
 func (cfg *Config) revokeNodeCert(ctx context.Context, serial string) error {
 	s := strings.ToLower(strings.TrimSpace(serial))
 	notFound := refuse(404, "no such certificate")
@@ -146,18 +147,22 @@ func (cfg *Config) revokeNodeCert(ctx context.Context, serial string) error {
 	if ic == nil {
 		return notFound
 	}
-	// Parse the certificate to check its CN.
+	// Idempotent: already revoked succeeds before any role check.
+	if ic.Revoked {
+		log.Printf("node certificate %s: already revoked", s)
+		return nil
+	}
+	// Parse the certificate and verify it chains to pki_node's root.
 	cert, err := x509.ParseCertificate(ic.DER)
 	if err != nil {
 		return fmt.Errorf("parsing certificate %s: %w", s, err)
 	}
-	// Accept only node-worker certificates (*.node.portcullis.internal).
-	if !nodeWorkerCNRe.MatchString(cert.Subject.CommonName) {
-		return refuse(403, "only node-worker certificates can be revoked here")
+	ca, err := cfg.caCert(ctx, mountNode)
+	if err != nil {
+		return err
 	}
-	if ic.Revoked {
-		log.Printf("node certificate %s: already revoked", s)
-		return nil
+	if !issuedBy(cert, ca) {
+		return refuse(403, "the certificate doesn't chain to pki_node")
 	}
 	err = cfg.vault.do(func(vc *vault.Client) error {
 		_, err := vc.Logical().WriteWithContext(ctx, mountNode+"/revoke", map[string]interface{}{"serial_number": s})

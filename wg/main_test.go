@@ -430,14 +430,14 @@ func TestLinkRoleStatus(t *testing.T) {
 	os.WriteFile(docPath, []byte(`{"version":1}`), 0o640)
 	wait(func(s *status.Link) bool { return !s.OK && len(s.Peers) == 0 })
 
-	// status.json: "link" only when the role is on.
+	// status.json: "link": null when the role is off (contract §17.2).
 	p := filepath.Join(dir, "status.json")
 	status.Write(p, status.Doc{Mode: "apps"}, time.Now())
-	if b, _ := os.ReadFile(p); bytes.Contains(b, []byte(`"link"`)) {
-		t.Fatalf("link key while off: %s", b)
+	if b, _ := os.ReadFile(p); !bytes.Contains(b, []byte(`"link":null`)) {
+		t.Fatalf("link must be null while off: %s", b)
 	}
 	status.Write(p, status.Doc{Mode: "apps", Link: &status.Link{}}, time.Now())
-	if b, _ := os.ReadFile(p); !bytes.Contains(b, []byte(`"link":{"ok":false,"error":"","peers":[]}`)) {
+	if b, _ := os.ReadFile(p); !bytes.Contains(b, []byte(`"link":{"ok":false,"error":"","public_key":"","port":0,"peers":[]}`)) {
 		t.Fatalf("link block: %s", b)
 	}
 }
