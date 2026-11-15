@@ -171,6 +171,26 @@ _mail_recreate() {
   dc up -d --no-deps $(runtime_no_build) mail >/dev/null
 }
 
+# _mail_recovery_start — mail in recovery mode with no egress: created,
+# detached from every network but portcullis-mail, then started. A first
+# start (any start of a store without one) creates Stalwart's WebUI
+# Application, which fetches webui.zip from GitHub; without a route it
+# fails and Stalwart carries on. The bootstrap needs only mailctl on
+# portcullis-mail. The normal recreate after the session reattaches all.
+_mail_recovery_start() {
+  local cid net
+  _rt_docker_only
+  # shellcheck disable=SC2046  # "--no-build" or nothing
+  dc create $(runtime_no_build) mail >/dev/null || return 1
+  cid="$(dc ps -aq mail)"
+  [ -n "$cid" ] || return 1
+  for net in $(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$cid"); do
+    [ "$net" = "$MAIL_NETWORK" ] || docker network disconnect "$net" "$cid" >/dev/null || return 1
+  done
+  [ "$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$cid")" = "$MAIL_NETWORK " ] || return 1
+  dc start mail >/dev/null
+}
+
 # _mail_recovery_end — the session's trap: the recovery admin goes away
 # whatever happened (the env file, then a recreate without it).
 _mail_recovery_end() {
@@ -198,7 +218,7 @@ mail_recovery_session() {
   trap '_mail_recovery_end' EXIT
   trap '_mail_recovery_end; exit 130' INT TERM
   info "Starting mail in recovery mode..."
-  if ! _mail_recreate || ! _mail_wait_healthy; then
+  if ! _mail_recovery_start || ! _mail_wait_healthy; then
     rc=1
     warn "mail didn't become healthy in recovery mode: docker compose logs mail"
   else

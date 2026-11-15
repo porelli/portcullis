@@ -4861,6 +4861,7 @@ mt() {
     dc() {
       echo "$*" >> "$ML/argv"
       case "$*" in
+        "ps -aq mail") echo cid1 ;;
         "run --rm --no-deps -T mailctl bootstrap --verify-gone") cat >> "$ML/stdin"; return "${ML_GONE_RC:-0}" ;;
         "run --rm --no-deps -T mailctl bootstrap"*) cat >> "$ML/stdin"; printf '%s\n' "${ML_BOOT_OUT:-$ML_BOOT_DEFAULT}" ;;
       esac
@@ -4869,6 +4870,13 @@ mt() {
     }
     rt_health() { echo healthy; }
     runtime_build_service() { :; }
+    docker() {
+      echo "docker $*" >> "$ML/argv"
+      case "$1" in
+        inspect) if [ -f "$ML/detached" ]; then echo "portcullis-mail "; else echo "portcullis_mail-egress portcullis-mail portcullis_portcullis-metrics-mail "; fi ;;
+        network) touch "$ML/detached" ;;
+      esac
+    }
     ct_group_read() { echo "ct_group_read $*" >> "$ML/argv"; }
     eval "$1"
   ) >"$ML/out" 2>&1
@@ -4877,8 +4885,11 @@ mt() {
 ok_fn() { IFS= read -r p <&3; printf '%s' "$p" > "$ML/seen-pw"; }
 bad_fn() { return 3; }
 mt 'mail_recovery_session bad_fn'; rc=$?
-expect_eq "mail_recovery_session removes recovery.env when fn fails (exit 1, mail recreated twice)" \
-  "$rc:$([ -e "$ML/root/secrets/mail/recovery.env" ] && echo left || echo gone):$(grep -c '^up -d --no-deps mail$' "$ML/argv")" "1:gone:2"
+expect_eq "mail_recovery_session removes recovery.env when fn fails (exit 1, mail recreated without it)" \
+  "$rc:$([ -e "$ML/root/secrets/mail/recovery.env" ] && echo left || echo gone):$(grep -c '^up -d --no-deps mail$' "$ML/argv")" "1:gone:1"
+expect_eq "mail_recovery_session: recovery mode starts with no egress (created, every network but portcullis-mail disconnected, then started)" \
+  "$(grep -E '^(create|start|docker network)' "$ML/argv" | tr '\n' '|')" \
+  "create mail|docker network disconnect portcullis_mail-egress cid1|docker network disconnect portcullis_portcullis-metrics-mail cid1|start mail|"
 expect_eq "mail_recovery_session: mailctl stopped first, not started after a failure" "$(head -n1 "$ML/argv"):$(grep -c 'mailctl$' "$ML/argv")" "stop mailctl:1"
 mt 'mail_recovery_session ok_fn'; rc=$?
 PW="$(cat "$ML/seen-pw" 2>/dev/null)"
