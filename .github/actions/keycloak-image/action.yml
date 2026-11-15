@@ -27,9 +27,17 @@ runs:
         heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
         if ! [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || [ "$REF" = main ] || [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
             || ! awk -v r="refs/heads/$REF" '$2 == r { f = 1 } END { exit !f }' <<<"$heads"; then
-          # compose's default, read without interpolation (no .env needed:
-          # e2e-k3s runs this before any exists); KEYCLOAK_IMAGE wins as in compose.
-          img="${KEYCLOAK_IMAGE:-$(docker compose config --no-interpolate --format json | jq -r .services.keycloak.image | sed -E 's/^\$\{KEYCLOAK_IMAGE:-(.*)\}$/\1/')}"
+          # compose's default: the keycloak service's image key in
+          # docker-compose.yml, read as text (never a compose parse: no .env
+          # is needed — e2e-k3s runs this before any exists — and other files'
+          # ${VAR:-…} volume specs can't break it). No other compose file may
+          # set Keycloak's image; KEYCLOAK_IMAGE wins as in compose.
+          kc_image_key() { awk '/^  [A-Za-z0-9_.-]+:/ { s = ($0 ~ /^  keycloak:/) } s && /^    image:/ { sub(/^    image:[ \t]*/, ""); print }' "$1"; }
+          for f in ${COMPOSE_FILE//:/ }; do
+            [ "$f" = docker-compose.yml ] || [ ! -f "$f" ] || [ -z "$(kc_image_key "$f")" ] \
+              || { echo "::error::$f sets the keycloak service's image: only docker-compose.yml's default and KEYCLOAK_IMAGE choose it"; exit 1; }
+          done
+          img="${KEYCLOAK_IMAGE:-$(kc_image_key docker-compose.yml | sed -E 's/^\$\{KEYCLOAK_IMAGE:-(.*)\}$/\1/')}"
           [[ "$img" =~ ^[a-z0-9.-]+(:[0-9]+)?/[a-z0-9._/-]+(:[A-Za-z0-9._-]+)?(@sha256:[0-9a-f]{64})?$ ]] || { echo "::error::cannot read the Keycloak image from compose (got '$img')"; exit 1; }
           # Retried: a registry hiccup now and then.
           for i in 1 2 3; do
