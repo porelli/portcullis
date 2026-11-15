@@ -1580,9 +1580,11 @@ services:
       STALWART_HEALTHCHECK_URL: http://127.0.0.1:8080/healthz/live
     # The image's own binary and arguments behind one gate (security
     # review): while a restore's mail passwords aren't voided
-    # (secrets/mail/gate/void-pending), only a recovery-mode start runs —
-    # any other start (up, the Hub's restart, a reboot) exits non-zero.
-    entrypoint: ["/bin/sh", "-c", "if [ -e /run/portcullis/mail/gate/void-pending ] && [ \"$${STALWART_RECOVERY_MODE:-}\" != 1 ]; then echo 'mail passwords from a restore are not voided yet: ./portcullis mail enable' >&2; exit 1; fi; exec /usr/local/bin/stalwart \"$$@\"", "stalwart"]
+    # (secrets/mail/gate/void-pending), only a recovery-mode start inside a
+    # live recovery session (gate/recovery-session) runs — any other start
+    # (up, the Hub's restart, a reboot, a leftover recovery container)
+    # exits non-zero.
+    entrypoint: ["/bin/sh", "-c", "if [ -e /run/portcullis/mail/gate/void-pending ] && ! { [ \"$${STALWART_RECOVERY_MODE:-}\" = 1 ] && [ -e /run/portcullis/mail/gate/recovery-session ]; }; then echo 'mail passwords from a restore are not voided yet: ./portcullis mail enable' >&2; exit 1; fi; exec /usr/local/bin/stalwart \"$$@\"", "stalwart"]
     command: ["--config", "/etc/stalwart/config.json"]
     # STALWART_RECOVERY_MODE / _ADMIN: exists only during a recovery session
     # (./portcullis mail enable, upgrade, restore's voiding; 0600).

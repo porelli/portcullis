@@ -136,7 +136,8 @@ _mail_cert_input() {
     map="$(jq -c --arg v "$var" --arg k "$key" '. + [{var: $v, key: $k}]' <<<"$map")"
   done < <(_dns_cred_keys "$provider")
   caa="$(_dns_flag DNS_CAA true)" || return 1
-  jq -n --arg host "$(mail_hostname)" --arg ca "$(_dns_ca_server)" --arg email "${ACME_EMAIL:-admin@${PORTCULLIS_DOMAIN}}" \
+  # MAIL_ACME_CA_SERVER: another CA for the mail certificate than Traefik's.
+  jq -n --arg host "$(mail_hostname)" --arg ca "${MAIL_ACME_CA_SERVER:-$(_dns_ca_server)}" --arg email "${ACME_EMAIL:-admin@${PORTCULLIS_DOMAIN}}" \
     --arg provider "$provider" --argjson map "$map" --argjson caa "$caa" --arg issuer "${DNS_CAA_ISSUER:-}" \
     --arg iodef "${DNS_CAA_IODEF:-}" --argjson days "$MAIL_CERT_RENEW_DAYS" '
     {hostname: $host, ca_server: $ca, email: $email, provider: $provider,
@@ -225,16 +226,21 @@ _mail_recovery_start() {
 # whatever happened (the env file, then a recreate without it).
 _mail_recovery_end() {
   _rt_docker_only
-  rm -f "$(_mail_dir)/recovery.env"
-  # Restored passwords not voided (the void failed): mail stays stopped,
+  rm -f "$(_mail_dir)/recovery.env" "$(mail_session_file)"
+  # No container started with the recovery env outlives the session
+  # (security review): removed, also when the step failed.
+  dc rm -sf mail >/dev/null 2>&1 || warn "could not remove the recovery-mode mail container: docker compose rm -sf mail"
+  # Restored passwords not voided (the void failed): mail stays down,
   # never back in normal mode with them.
-  if mail_void_pending; then
-    dc stop mail >/dev/null 2>&1 || warn "could not stop mail: stop it by hand (docker compose stop mail)"
-    return 0
-  fi
+  mail_void_pending && return 0
   # shellcheck disable=SC2046  # "--no-build" or nothing
   dc up -d --no-deps $(runtime_no_build) mail >/dev/null 2>&1 || warn "could not recreate mail without the recovery admin: ./portcullis up"
 }
+
+# mail_session_file — secrets/mail/gate/recovery-session: exists only while a
+# recovery session runs; mail's entrypoint admits a recovery-mode start with
+# the void-pending marker only together with it.
+mail_session_file() { printf '%s/gate/recovery-session' "$(_mail_dir)"; }
 
 # mail_recovery_session <fn> — Stalwart in recovery mode for one step
 # (contract §19.4): mailctl stopped (the one-shot takes its pinned
@@ -250,8 +256,10 @@ mail_recovery_session() {
   pw="$(openssl rand -base64 32 | tr -d '\n')"
   [ -n "$pw" ] || fail "could not generate the recovery password"
   dc stop mailctl >/dev/null 2>&1 || true
-  # The start gate's one exception (_mail_void_gate).
+  # The start gate's one exception (_mail_void_gate), and the session
+  # file the entrypoint wants with recovery mode (both gone at the end).
   export MAIL_RECOVERY_SESSION=1
+  (umask 077 && mkdir -p "$(_mail_dir)/gate" && : > "$(mail_session_file)")
   (umask 077 && printf 'STALWART_RECOVERY_MODE=1\nSTALWART_RECOVERY_ADMIN=%s:%s\n' "$MAIL_RECOVERY_USER" "$pw" > "$f")
   trap '_mail_recovery_end' EXIT
   trap '_mail_recovery_end; exit 130' INT TERM

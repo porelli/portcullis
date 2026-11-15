@@ -66,7 +66,7 @@ mail_rule() {  # <config json>
     # The start gate: a non-recovery start refuses while the marker exists,
     # then the image binary and its arguments.
     and ($m.entrypoint | length) == 4 and $m.entrypoint[0:2] == ["/bin/sh", "-c"]
-    and ($m.entrypoint[2] | test("-e /run/portcullis/mail/gate/void-pending") and test("STALWART_RECOVERY_MODE") and test("exit 1") and test("exec /usr/local/bin/stalwart"))
+    and ($m.entrypoint[2] | test("-e /run/portcullis/mail/gate/void-pending") and test("STALWART_RECOVERY_MODE") and test("-e /run/portcullis/mail/gate/recovery-session") and test("exit 1") and test("exec /usr/local/bin/stalwart"))
     and $m.command == ["--config", "/etc/stalwart/config.json"]
     and (binds("/secrets/mail/") == ["hub", "mail", "mailctl"])
     and (binds("/mail/unbound\\.conf$") == ["mail-resolver"])

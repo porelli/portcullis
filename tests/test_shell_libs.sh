@@ -5057,7 +5057,16 @@ expect_eq "up with the marker: the void session first, then mail starts normally
 mt ': > "$(mail_void_marker)"; mail_after_up'; rc=$?
 expect_eq "mail_after_up never recreates mail while the marker exists" "$rc:$(cat "$ML/argv" 2>/dev/null | grep -c .)" "0:0"
 mt ': > "$(mail_void_marker)"; _mail_recovery_end'
-expect_eq "a recovery session ending with the marker stops mail, never back to normal mode" "$(tr '\n' '|' < "$ML/argv")" "stop mail|"
+expect_eq "a recovery session ending with the marker removes the recovery-mode container, never back to normal mode" "$(tr '\n' '|' < "$ML/argv")" "rm -sf mail|"
+mt ': > "$(mail_session_file)"; _mail_recovery_end'
+expect_eq "a recovery session ending normally removes the recovery-mode container, then recreates mail; the session file is gone" \
+  "$(tr '\n' '|' < "$ML/argv"):$([ -e "$ML/root/secrets/mail/gate/recovery-session" ] && echo left || echo gone)" "rm -sf mail|up -d --no-deps mail|:gone"
+sess_fn() { [ -e "$PORTCULLIS_ROOT/secrets/mail/gate/recovery-session" ] && echo present > "$ML/sess"; IFS= read -r _ <&3; }
+mt 'mail_recovery_session sess_fn'
+expect_eq "the session file exists while the recovery step runs, and is gone after" \
+  "$(cat "$ML/sess" 2>/dev/null):$([ -e "$ML/root/secrets/mail/gate/recovery-session" ] && echo left || echo gone)" "present:gone"
+mt ': > "$(mail_session_file)"; runtime_build_all() { :; }; stack_compose_up'
+expect_eq "a leftover session file (no live session) is removed by the next up" "$([ -e "$ML/root/secrets/mail/gate/recovery-session" ] && echo left || echo gone)" gone
 mt 'rt_health() { echo healthy; }; rt_exec() { printf "%s" "$MSTAT"; }; _mail_timer_state() { echo active; }; : > "$(mail_void_marker)"
   mail_status_json > "$ML/sj"; mail_status_lines "$(cat "$ML/sj")" | sed "s/\x1b\[[0-9;]*m//g" > "$ML/sl"'
 expect_eq "status: the marker is a problem line" "$(jq -r .void_pending "$ML/sj"):$(grep -c '✗ mail passwords from a restore are not voided yet' "$ML/sl")" "true:1"

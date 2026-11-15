@@ -722,8 +722,10 @@ secrets_fix_perms() {
 # session (MAIL_RECOVERY_SESSION=1). The container's entrypoint refuses too.
 _mail_void_gate() {
   local s p out=""
-  [ -e "$PORTCULLIS_ROOT/secrets/mail/gate/void-pending" ] || return 0
   [ "${MAIL_RECOVERY_SESSION:-}" != 1 ] || return 0
+  # A recovery-session file without a live session (a killed CLI) goes first.
+  rm -f "$PORTCULLIS_ROOT/secrets/mail/gate/recovery-session"
+  [ -e "$PORTCULLIS_ROOT/secrets/mail/gate/void-pending" ] || return 0
   for s in "$@"; do
     case "$s" in
       mail|mailctl) fail "mail passwords from a restore are not voided yet: ./portcullis mail enable voids them first" ;;
