@@ -380,7 +380,11 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-      start_period: 60s
+      # Long, like Keycloak's: on Kubernetes this is the startup probe's
+      # window, and a kill during initdb or WAL recovery leaves a cluster
+      # that never starts (a slow CI disk took initdb past 110 s). Docker
+      # reports healthy as soon as pg_isready answers.
+      start_period: 300s
     mem_limit: 1g
     pids_limit: 256
     shm_size: 128m

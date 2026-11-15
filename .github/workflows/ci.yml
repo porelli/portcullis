@@ -5217,16 +5217,7 @@ jobs:
         run: bash .github/ci/e2e-k3s-phases.sh restore
       - name: Collect logs and events
         if: failure()
-        run: |
-          mkdir -p e2e-artifacts
-          for ns in portcullis portcullis-apps portcullis-storage; do
-            kubectl --context ci -n "$ns" get pods -o wide > "e2e-artifacts/$ns-pods.txt" 2>&1 || true
-            kubectl --context ci -n "$ns" get events --sort-by=.lastTimestamp > "e2e-artifacts/$ns-events.txt" 2>&1 || true
-            for d in $(kubectl --context ci -n "$ns" get deploy -o name 2>/dev/null); do
-              kubectl --context ci -n "$ns" logs "$d" --all-containers --tail=500 > "e2e-artifacts/$ns-${d#*/}.log" 2>&1 || true
-            done
-          done
-          sudo journalctl -u k3s --no-pager | tail -n 500 > e2e-artifacts/k3s.log 2>&1 || true
+        run: bash .github/ci/e2e-k3s-collect.sh
       - name: Upload logs
         timeout-minutes: 10
         if: failure()

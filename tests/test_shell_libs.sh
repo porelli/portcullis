@@ -4396,7 +4396,8 @@ expect_eq "setup.sh 10006/10001/2750 → chmod 2750 while root's, then chown (a 
 printf '#!/bin/sh\necho "chmod $*" >> "$SETUP_LOG"\nexec /bin/chmod 0750 "$2"\n' > "$SB/chmod.lossy"
 OUT="$(mv "$SB/chmod" "$SB/chmod.real"; cp "$SB/chmod.lossy" "$SB/chmod"; chmod +x "$SB/chmod"; setup_run 10006 10001 2750; mv "$SB/chmod.real" "$SB/chmod")"
 case "$OUT" in *"portcullis-setup REFUSED:"*"is mode 750 after chmod 2750 and chown (want 2750)"*"rc=1") t_pass "setup.sh: a mode that doesn't stick (750 for 2750) refuses" ;; *) t_fail "setup.sh lossy chmod: $OUT" ;; esac
-printf '#!/bin/sh\necho "chown $*" >> "$SETUP_LOG"\nexec /bin/chmod 0750 "$2"\n' > "$SB/chown.lossy"
+# g-s, not a numeric mode: GNU chmod keeps a directory's setgid for 0750.
+printf '#!/bin/sh\necho "chown $*" >> "$SETUP_LOG"\nexec /bin/chmod g-s "$2"\n' > "$SB/chown.lossy"
 OUT="$(mv "$SB/chown" "$SB/chown.real"; cp "$SB/chown.lossy" "$SB/chown"; chmod +x "$SB/chown"; setup_run 10006 10001 2750; mv "$SB/chown.real" "$SB/chown")"
 case "$OUT" in *"portcullis-setup REFUSED:"*"is mode 750 after chmod 2750 and chown (want 2750)"*"rc=1") t_pass "setup.sh: a chown that clears setgid refuses (the mode is read back after it)" ;; *) t_fail "setup.sh lossy chown: $OUT" ;; esac
 expect_eq "setup.sh: a refusal after the mkdir removes the directory (a retry can succeed)" "$(test -e "$WORK/volp/vol" && echo left || echo removed)" removed
