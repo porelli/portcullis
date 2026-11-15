@@ -27,11 +27,11 @@ vol() { docker run --rm --network none -v "portcullis_$1:/v:ro" "$ALPINE_IMG" ca
 
 # hubapi <method> <path> [body file] — as the Hub: portcullis-mailctl's
 # pinned .18 (the Hub is stopped meanwhile), the bearer from the secret
-# file inside the container (never on an argv).
+# file inside the container (never on an argv), read as the Hub (10001).
 hubapi() {
   local body=()
   [ -z "${3:-}" ] || body=(-v "$3:/body.json:ro")
-  docker run --rm --network portcullis-mailctl --ip 172.31.255.18 -v "$PWD/secrets/mail/hub-secret:/s:ro" "${body[@]}" \
+  docker run --rm --network portcullis-mailctl --ip 172.31.255.18 --user 10001:10001 -v "$PWD/secrets/mail/hub-secret:/s:ro" "${body[@]}" \
     --entrypoint sh "$CURL_IMG" -c 'printf "Authorization: Bearer %s\n" "$(cat /s)" > /tmp/h
       if [ -f /body.json ]; then curl -s -H @/tmp/h -H "Content-Type: application/json" -X "$0" --data-binary @/body.json -w "\n%{http_code}" "http://172.31.255.19:8080$1"
       else curl -s -H @/tmp/h -X "$0" -w "\n%{http_code}" "http://172.31.255.19:8080$1"; fi' "$1" "$2"
@@ -132,7 +132,7 @@ setup)
   echo "PASS: outbound TCP 25/465/587 rejected from mail-egress too"
   # 1. Users, capabilities, read-only.
   docker inspect "$(cid mail)" | jq -e '.[0] | .Config.User == "2000:2000" and .HostConfig.ReadonlyRootfs
-      and .HostConfig.CapAdd == ["NET_BIND_SERVICE"] and (.HostConfig.CapDrop | index("ALL")) != null and .HostConfig.Privileged == false' >/dev/null \
+      and (.HostConfig.CapAdd | map(ltrimstr("CAP_"))) == ["NET_BIND_SERVICE"] and (.HostConfig.CapDrop | map(ltrimstr("CAP_")) | index("ALL")) != null and .HostConfig.Privileged == false' >/dev/null \
     || fail "mail container: $(docker inspect "$(cid mail)" | jq -c '.[0] | {u: .Config.User, ro: .HostConfig.ReadonlyRootfs, add: .HostConfig.CapAdd, drop: .HostConfig.CapDrop}')"
   docker inspect "$(cid mailctl)" | jq -e '.[0] | .Config.User == "10010:10010" and .HostConfig.GroupAdd == ["10001"] and .HostConfig.ReadonlyRootfs
       and (.HostConfig.CapAdd // []) == []' >/dev/null || fail "mailctl container"
@@ -141,8 +141,12 @@ setup)
   [ ! -e secrets/mail/recovery.env ] || fail "recovery.env left behind"
   [ "$(stat -c '%a %g' secrets/mail/api-key)" = "640 10010" ] || fail "api-key is $(stat -c '%a %g' secrets/mail/api-key)"
   [ -s secrets/mail/api-key ] || fail "api-key empty"
+  # (mailctl's fixed addresses: the one-shot runs while the service is stopped.)
+  docker compose --profile mail stop mailctl >/dev/null
   head -c 24 /dev/urandom | base64 | jq -Rc '{recovery_user: "portcullis-recovery", recovery_password: .}' \
     | docker compose --profile mail run --rm --no-deps -T mailctl bootstrap --verify-gone || fail "a recovery login isn't refused"
+  docker compose --profile mail start mailctl >/dev/null
+  wait_healthy mailctl
   echo "PASS: no recovery.env, a recovery login gets 401, api-key 0640 group 10010"
   # 3. The management listener: unreachable from portcullis-proxy, 404 for
   # anyone else on portcullis-mail (the API key too), /admin 404.
@@ -150,7 +154,7 @@ setup)
     fail "the management listener answered on portcullis-proxy"
   fi
   for path in /jmap /admin /api/schema; do
-    code="$(docker run --rm --network portcullis-mail --ip 172.31.255.9 -v "$PWD/secrets/mail/api-key:/k:ro" --entrypoint sh "$CURL_IMG" \
+    code="$(docker run --rm --network portcullis-mail --ip 172.31.255.9 --user 10010:10010 -v "$PWD/secrets/mail/api-key:/k:ro" --entrypoint sh "$CURL_IMG" \
       -c 'printf "Authorization: Bearer %s\n" "$(cat /k)" > /tmp/h; curl -s -o /dev/null -w "%{http_code}" -H @/tmp/h "http://172.31.255.2:8080$0"' "$path")"
     [ "$code" = 404 ] || fail "$path from 172.31.255.9 with the API key got $code (want 404)"
   done
@@ -181,10 +185,13 @@ setup)
       | .aliases = [] | .lists = [] | .postmaster = ["mailtest"] | .local_networks = [] | .spam.allow = [] | .spam.block = []' \
     mailctl/internal/state/testdata/mailstate_v1.json > "$ST/doc.json"
   out="$(hubapi PUT /v1/state "$ST/doc.json")"; [ "$(tail -n1 <<<"$out")" = 202 ] || fail "PUT /v1/state: $out"
+  # (Whole answers, then the first line: a head in the pipe breaks docker's
+  # stdout under pipefail.)
   for _ in $(seq 1 40); do
-    hubapi GET /v1/state | head -n1 | jq -e '.applied_generation == 1000' >/dev/null && break; sleep 3
+    out="$(hubapi GET /v1/state)"; head -n1 <<<"$out" | jq -e '.applied_generation == 1000' >/dev/null && break; sleep 3
   done
-  hubapi GET /v1/state | head -n1 | jq -e '.applied_generation == 1000 and .bootstrap == true' >/dev/null || fail "state: $(hubapi GET /v1/state)"
+  out="$(hubapi GET /v1/state)"
+  head -n1 <<<"$out" | jq -e '.applied_generation == 1000 and .bootstrap == true' >/dev/null || fail "state: $out"
   printf '{"username":"mailtest","uuid":"%s","label":"ci","expires_at":null}' "$UUID" > "$ST/cred.json"
   out="$(hubapi POST /v1/credentials "$ST/cred.json")"; [ "$(tail -n1 <<<"$out")" = 201 ] || fail "POST /v1/credentials: $(tail -n1 <<<"$out")"
   head -n1 <<<"$out" | jq -r .secret > "$ST/pw"; chmod 600 "$ST/pw"; echo "::add-mask::$(cat "$ST/pw")"
