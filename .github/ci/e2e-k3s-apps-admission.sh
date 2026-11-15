@@ -31,7 +31,8 @@ cleanup() {
   K -n "$APPS" delete networkpolicy e2e-old-np e2e-old-np-cli --ignore-not-found --wait=false >/dev/null 2>&1 || true
   K -n "$APPS" delete service a--e2e-old a--e2e-old-cli --ignore-not-found --wait=false >/dev/null 2>&1 || true
   K -n "$APPS" delete secret a--e2e-old a--e2e-old-cli --ignore-not-found --wait=false >/dev/null 2>&1 || true
-  K -n "$APPS" delete pvc a--e2e-old a--e2e-old-cli b--e2e-old-cli --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  K -n "$APPS" delete pod a--e2e-bind --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  K -n "$APPS" delete pvc a--e2e-old a--e2e-old-cli b--e2e-old-cli a--e2e-bind --ignore-not-found --wait=false >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 # want <admit|refuse> <what> — stdin is the object (cases run at pipeline ends: count in files).
@@ -251,11 +252,28 @@ pvc "{\"metadata\":{\"name\":\"a--e2e-old\",\"labels\":$OWN}}" | KH create -f - 
 K -n "$APPS" get pvc a--e2e-old -o json | jq '.metadata.labels.x = "y"' | wantk admit "the Hub updates its own claim" replace --dry-run=server -f -
 K -n "$APPS" get pvc a--e2e-old -o json | jq '.metadata.labels["portcullis.io/instance"] = "b"' | wantk refuse "the Hub moves its claim to another instance" replace --dry-run=server -f -
 K -n "$APPS" get pvc a--e2e-old -o json | jq '.metadata.labels["portcullis.io/owner"] = "core"' | wantk refuse "the Hub relabels its claim owner=core" replace --dry-run=server -f -
+K -n "$APPS" get pvc a--e2e-old -o json | jq '.spec.volumeName = "pvc-e2e-other"' | wantk refuse "the Hub binds its claim to a volume of its choosing (only the volume binder sets volumeName)" replace --dry-run=server -f -
 wantk admit "the Hub deletes its own claim" delete --dry-run=server pvc a--e2e-old
 pvc '{"metadata":{"name":"a--e2e-old-cli"}}' | K -n "$APPS" create -f - >/dev/null
 wantk refuse "the Hub deletes a claim without owner=hub" delete --dry-run=server pvc a--e2e-old-cli
+wantk refuse "the Hub strips the pvc-protection finalizer of a claim without owner=hub" patch --dry-run=server pvc a--e2e-old-cli --type=merge -p '{"metadata":{"finalizers":null}}'
+K -n "$APPS" get pvc a--e2e-old -o json | jq '.metadata.finalizers = []' | wantk admit "the Hub strips the finalizer of its own claim (owner=hub: judged as an update of its own)" replace --dry-run=server -f -
 pvc "{\"metadata\":{\"name\":\"b--e2e-old-cli\",\"labels\":$OWN}}" | K -n "$APPS" create -f - >/dev/null
 wantk refuse "the Hub deletes an owner=hub claim named after another instance" delete --dry-run=server pvc b--e2e-old-cli
+# The PVC protection controller still removes its finalizer from claims the Hub can't touch: deletion completes.
+K -n "$APPS" delete pvc a--e2e-old-cli b--e2e-old-cli --timeout=60s >/dev/null \
+  || fail "claims without owner=hub never finished deleting (the pvc-protection controller refused?)"
+
+# A real claim the Hub makes binds (the volume binder sets volumeName) once a pod uses it.
+pvc '{"metadata":{"name":"a--e2e-bind","labels":{"portcullis.io/owner":"hub"}}}' | KH create -f - >/dev/null || fail "the Hub can't create a claim to bind"
+jq -n --arg a "$A" '{apiVersion: "v1", kind: "Pod", metadata: {name: "a--e2e-bind", labels: {"portcullis.io/instance": "a", "portcullis.io/service": "web"}},
+  spec: {automountServiceAccountToken: false, restartPolicy: "Never", volumes: [{name: "d", persistentVolumeClaim: {claimName: "a--e2e-bind"}}],
+    securityContext: {runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000, seccompProfile: {type: "RuntimeDefault"}},
+    containers: [{name: "c", image: $a, command: ["true"], volumeMounts: [{name: "d", mountPath: "/d"}],
+      securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: ["ALL"]}}}]}}' | KH create -f - >/dev/null || fail "the Hub can't create the binding pod"
+K -n "$APPS" wait --for=jsonpath='{.status.phase}'=Bound pvc/a--e2e-bind --timeout=120s >/dev/null \
+  || fail "the Hub's claim a--e2e-bind never bound (the volume binder refused?): $(K -n "$APPS" get pvc a--e2e-bind -o jsonpath='{.status.phase}')"
+K -n "$APPS" delete pod a--e2e-bind --wait=false >/dev/null 2>&1 || true
 
 # ── a real one-shot Job: the job controller's pod is admitted and runs as root ──
 jq -n --arg a "$A" --argjson s "$RS" '{apiVersion: "batch/v1", kind: "Job",

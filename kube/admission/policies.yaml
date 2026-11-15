@@ -404,6 +404,24 @@ spec:
   # DELETE has no object: the object checks skip it (the old-object rule judges it).
   - name: skipObj
     expression: "variables.cli || request.operation == 'DELETE'"
+  # Two exact controller changes to a claim (nothing else is exempt): the
+  # volume binder setting spec.volumeName once, from empty; the PVC
+  # protection controller removing only its kubernetes.io/pvc-protection
+  # finalizer (spec, labels and annotations unchanged).
+  - name: pvBind
+    expression: >-
+      request.operation == 'UPDATE' && request.kind.kind == 'PersistentVolumeClaim'
+      && request.userInfo.username in ['system:serviceaccount:kube-system:persistent-volume-binder', 'system:kube-controller-manager']
+      && !has(oldObject.spec.volumeName) && has(object.spec.volumeName) && object.spec.volumeName != ''
+  - name: pvcUnprotect
+    expression: >-
+      request.operation == 'UPDATE' && request.kind.kind == 'PersistentVolumeClaim'
+      && request.userInfo.username in ['system:serviceaccount:kube-system:pvc-protection-controller', 'system:kube-controller-manager']
+      && has(oldObject.metadata.finalizers) && 'kubernetes.io/pvc-protection' in oldObject.metadata.finalizers
+      && (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == oldObject.metadata.finalizers.filter(f, f != 'kubernetes.io/pvc-protection')
+      && object.spec == oldObject.spec
+      && (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {})
+      && (has(object.metadata.annotations) ? object.metadata.annotations : {}) == (has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {})
   - name: spec
     expression: object.spec.template.spec
   - name: meta
@@ -747,7 +765,7 @@ spec:
   # The same for claims, whose old name must also be the old instance's own
   # (<instance>--…).
   - expression: |-
-      variables.cli || request.operation == 'CREATE' || request.kind.kind != 'PersistentVolumeClaim' || (
+      variables.cli || variables.pvcUnprotect || request.operation == 'CREATE' || request.kind.kind != 'PersistentVolumeClaim' || (
         (has(oldObject.metadata.labels) && 'portcullis.io/owner' in oldObject.metadata.labels
           && oldObject.metadata.labels['portcullis.io/owner'] == 'hub' && 'portcullis.io/instance' in oldObject.metadata.labels
           && oldObject.metadata.labels['portcullis.io/instance'] != ''
@@ -761,18 +779,21 @@ spec:
   # The Hub's claims: the apps StorageClass (never core's Retain one or
   # another provisioner), no pre-bound volume or data source, named
   # <instance>--… after its own instance label, a plain 3-digit mode
-  # (an optional leading 0: no setuid, setgid or sticky bit).
+  # (an optional leading 0: no setuid, setgid or sticky bit). volumeName:
+  # only the volume binder sets it (a controller), never the Hub; it stays.
   - expression: |-
-      variables.skipObj || object.kind != 'PersistentVolumeClaim' || (
+      variables.skipObj || variables.pvcUnprotect || object.kind != 'PersistentVolumeClaim' || (
         has(object.spec.storageClassName) && object.spec.storageClassName == 'portcullis-apps'
-        && !has(object.spec.volumeName) && !has(object.spec.dataSource) && !has(object.spec.dataSourceRef)
+        && (!has(object.spec.volumeName) || variables.pvBind
+            || (request.operation == 'UPDATE' && has(oldObject.spec.volumeName) && oldObject.spec.volumeName == object.spec.volumeName))
+        && !has(object.spec.dataSource) && !has(object.spec.dataSourceRef)
         && has(object.metadata.labels) && 'portcullis.io/instance' in object.metadata.labels
         && object.metadata.labels['portcullis.io/instance'] != ''
         && object.metadata.name.startsWith(object.metadata.labels['portcullis.io/instance'] + '--')
         && has(object.metadata.annotations) && 'portcullis.io/mode' in object.metadata.annotations
         && object.metadata.annotations['portcullis.io/mode'].matches('^0?[0-7]{3}$')
       )
-    message: "a claim must use the portcullis-apps StorageClass, set no volumeName or dataSource / dataSourceRef, be named <instance>--… after its portcullis.io/instance label, and have a 3-digit portcullis.io/mode"
+    message: "a claim must use the portcullis-apps StorageClass, set no volumeName (only the volume binder does) or dataSource / dataSourceRef, be named <instance>--… after its portcullis.io/instance label, and have a 3-digit portcullis.io/mode"
 
 ---
 apiVersion: admissionregistration.k8s.io/v1
