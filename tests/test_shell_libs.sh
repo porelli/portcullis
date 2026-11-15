@@ -4164,6 +4164,12 @@ expect_eq "status counts the cluster check (kube_cluster_check_lines) towards pr
 OUT="$(kt "kube_psa() { echo 'privileged baseline baseline'; }; kube_bindings_missing() { echo 'binding x missing'; }; kube_ctl() { case \"\$*\" in *'get namespace'*) echo '{\"metadata\":{\"labels\":{\"pod-security.kubernetes.io/enforce\":\"privileged\",\"pod-security.kubernetes.io/warn\":\"baseline\",\"pod-security.kubernetes.io/audit\":\"baseline\"}}}' ;; *apply*) cat > '$KCT/applied' ;; esac; }; kube_cluster_check 2>/dev/null; echo \"why=\$_K_CHECK_WHY\"; jq -r '.data.ok' '$KCT/applied'")"
 expect_eq "kube_cluster_check: a missing binding → recorded for the Hub (ok false) and for kube check's exit status" "$(printf '%s\n' "$OUT" | head -n2 | tr '\n' ' ')" "why=binding x missing false "
 expect_eq "cmd_kube check exits 1 on a failed check" "$(sed -n '/^cmd_kube() {/,/^}/p' "$HERE"/../scripts/lib/kube.sh | grep -c '\[ -z "\$_K_CHECK_WHY" \] || exit 1')" 1
+# No CLI path deletes the apps or edge namespace (only the probe's own): the
+# apps policies judge DELETE by the old object, and the namespace controller
+# isn't exempt, so such a path would first have to delete the owner=core
+# objects there as the CLI identity (ruling) — add that ordering with it.
+expect_eq "the CLI deletes no namespace but the NetworkPolicy probe's" \
+  "$(grep -rn 'delete namespace\|delete ns ' "$HERE"/../scripts/lib "$HERE"/../portcullis | grep -v '^[^:]*:[0-9]*: *#' | grep -vc 'KUBE_PROBE_NS' || true)" 0
 # The AppArmor stacking host check (containerd#14485 / k3s#13625): with
 # kernel.apparmor_restrict_unprivileged_unconfined=1 and containerd's
 # profile in use, signals inside containers are denied (Postgres never
