@@ -286,8 +286,15 @@ ino="$(file_inode "$SP_ROOT/secrets/mail/relay-password")"
   stack_prepare ) >/dev/null 2>&1
 expect_eq "stack_prepare makes the mail volumes only with the mail profile (owners, modes)" "$(grep '^volume_own mail' "$STUB_DIR/sp-vol" | sort | tr '\n' '|')" \
   "volume_own mail_acme 10004:10004 0700|volume_own mail_data 2000:2000|volume_own mail_etc 2000:2000|volume_own mail_tls 10004:2000 2750|volume_own mailctl_data 10010:10010 0700|"
+expect_eq "stack_prepare: with the mail profile, the Hub secret is generated (48 characters)" "$(wc -c < "$SP_ROOT/secrets/mail/hub-secret" | tr -d ' ')" 48
 expect_eq "stack_prepare: relay-password and dqs-key from .env, in place; api-key kept" \
   "$(cat "$SP_ROOT/secrets/mail/relay-password")|$(cat "$SP_ROOT/secrets/mail/dqs-key")|$(cat "$SP_ROOT/secrets/mail/api-key")|$([ "$(file_inode "$SP_ROOT/secrets/mail/relay-password")" = "$ino" ] && echo same)" "r3lay pw|dqskey|API_k|same"
+HS_NOW="$(cat "$SP_ROOT/secrets/mail/hub-secret")"
+( PORTCULLIS_ROOT="$SP_ROOT"; export COMPOSE_PROFILES=mail
+  volume_own() { :; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  unset -f users_secret_files monitoring_prepare domains_prepare mcpgate_ensure_secrets
+  stack_prepare ) >/dev/null 2>&1
+expect_eq "stack_prepare: the Hub secret is kept on the next run" "$(cat "$SP_ROOT/secrets/mail/hub-secret")" "$HS_NOW"
 ( PORTCULLIS_ROOT="$SP_ROOT"
   volume_own() { :; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
   unset -f users_secret_files monitoring_prepare domains_prepare mcpgate_ensure_secrets
