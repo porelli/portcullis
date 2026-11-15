@@ -32,7 +32,7 @@ var MailctlRolePermissions = func() []string {
 		"sysDkimSignatureGet", "sysDkimSignatureCreate", "sysDkimSignatureUpdate", "sysDkimSignatureDestroy", "sysDkimSignatureQuery",
 		"sysAppPasswordGet", "sysAppPasswordCreate", "sysAppPasswordUpdate", "sysAppPasswordDestroy", "sysAppPasswordQuery",
 		"sysMailingListGet", "sysMailingListCreate", "sysMailingListUpdate", "sysMailingListDestroy", "sysMailingListQuery",
-		"sysQueuedMessageGet", "sysQueuedMessageQuery",
+		"sysQueuedMessageGet", "sysQueuedMessageQuery", "sysCertificateGet", "sysCertificateQuery",
 		"sysActionCreate", "actionReloadSettings", "actionReloadTlsCertificates", "actionInvalidateCaches", "actionReloadLookupStores",
 		"sysDmarcExternalReportGet", "sysDmarcExternalReportQuery", "sysTlsExternalReportGet", "sysTlsExternalReportQuery",
 		"sysSpamSettingsGet", "sysSpamSettingsUpdate",

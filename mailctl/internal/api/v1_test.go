@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/portcullis/mailctl/internal/logx"
+	"github.com/portcullis/mailctl/internal/machines"
 	"github.com/portcullis/mailctl/internal/reconcile"
 	"github.com/portcullis/mailctl/internal/stalwart"
 	"github.com/portcullis/mailctl/internal/stalwart/fake"
@@ -39,6 +40,8 @@ func newV1(t *testing.T) *v1env {
 	lg := logx.New(&buf)
 	r := reconcile.NewRunner(c, st, time.Hour, false, lg.Printf)
 	v := &V1{Store: st, C: c, Runner: r, Logf: lg.Printf}
+	v.M = machines.New(c, st, machines.Config{MainDomain: "example.com", Hostname: "mail.example.com", RotateEvery: time.Hour, Reachable: true}, lg.Printf)
+	v.M.Visible = func(context.Context, string, string) bool { return false }
 	srv, _ := newServer(t, "172.31.255.16/28")
 	srv.Handler = v.Handler()
 	return &v1env{f: f, v: v, s: srv, log: &buf}
@@ -157,5 +160,68 @@ func TestCredentialsRoutes(t *testing.T) {
 	e.f.Fail("x:AppPassword", 1)
 	if w := e.do("GET", "/v1/credentials?user=alice", ""); w.Code != 503 || !strings.Contains(w.Body.String(), "mail server unreachable") {
 		t.Fatalf("stalwart down: %d %s", w.Code, w.Body)
+	}
+}
+
+// GET /v1/dns, /v1/status and the actions (contract §19.5).
+func TestDNSStatusActions(t *testing.T) {
+	e := newV1(t)
+	if w := e.do("GET", "/v1/dns/example.com", ""); w.Code != 404 {
+		t.Fatalf("dns before a document: %d", w.Code)
+	}
+	e.do("PUT", "/v1/state", vec(t, 12))
+	_ = e.v.M.Step(context.Background())
+	w := e.do("GET", "/v1/dns/example.com", "")
+	var set map[string]any
+	json.Unmarshal(w.Body.Bytes(), &set)
+	if w.Code != 200 || set["domain"] != "example.com" || set["dkim"] != "auto" || len(set["records"].([]any)) < 10 {
+		t.Fatalf("dns %d %s", w.Code, w.Body)
+	}
+	if !strings.HasPrefix(set["tlsa"].(string), "withheld") {
+		t.Fatalf("tlsa without a key: %v", set["tlsa"])
+	}
+	if w := e.do("GET", "/v1/dns/team-b.example.org?wildcard=false", ""); w.Code != 200 || strings.Count(w.Body.String(), `"CNAME"`) != 3 {
+		t.Fatalf("no wildcard %d %s", w.Code, w.Body)
+	}
+	if w := e.do("GET", "/v1/dns/team-b.example.org?wildcard=no", ""); w.Code != 400 {
+		t.Fatalf("bad wildcard %d", w.Code)
+	}
+	if w := e.do("GET", "/v1/dns/nope.example", ""); w.Code != 404 {
+		t.Fatalf("unknown domain %d", w.Code)
+	}
+	w = e.do("GET", "/v1/status", "")
+	var st map[string]any
+	json.Unmarshal(w.Body.Bytes(), &st)
+	for _, k := range []string{"bootstrap", "stalwart_version", "cert", "dkim", "mtasts", "dmarc", "queue", "client_ip", "restored_at", "timer_seen_at", "former"} {
+		if _, ok := st[k]; !ok {
+			t.Fatalf("status lacks %s: %s", k, w.Body)
+		}
+	}
+	if st["client_ip"] != "preserved" || len(st["dkim"].([]any)) != 2 {
+		t.Fatalf("status %s", w.Body)
+	}
+	cases := []struct {
+		path, body string
+		code       int
+	}{
+		{"/v1/actions/dkim-rotate", `{"domain":"nope.example"}`, 404},
+		{"/v1/actions/dkim-rotate", `{"domain":"example.com"}`, 409}, // keys pending
+		{"/v1/actions/dmarc-promote", `{"domain":"example.com"}`, 409},
+		{"/v1/actions/mtasts-enforce", `{"domain":"example.com"}`, 409},
+		{"/v1/actions/mtasts-enforce", `{"domain":"example.com","x":1}`, 400},
+		{"/v1/actions/mtasts-enforce", `{"domain":"a","domain":"b"}`, 400},
+		{"/v1/actions/mtasts-enforce", `{}`, 400},
+		{"/v1/actions/nope", `{"domain":"example.com"}`, 404},
+	}
+	for _, c := range cases {
+		if w := e.do("POST", c.path, c.body); w.Code != c.code {
+			t.Errorf("%s %s: %d %s", c.path, c.body, w.Code, w.Body)
+		} else if c.code == 409 && !strings.Contains(w.Body.String(), `"error"`) {
+			t.Errorf("409 without a reason: %s", w.Body)
+		}
+	}
+	e.f.Fail("x:Certificate", 1)
+	if w := e.do("GET", "/v1/status", ""); w.Code != 503 || !strings.Contains(w.Body.String(), "mail server unreachable") {
+		t.Fatalf("status with Stalwart down: %d %s", w.Code, w.Body)
 	}
 }

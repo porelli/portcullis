@@ -23,20 +23,25 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/portcullis/mailctl/internal/admin"
 	"github.com/portcullis/mailctl/internal/api"
 	"github.com/portcullis/mailctl/internal/bootstrap"
 	"github.com/portcullis/mailctl/internal/config"
 	"github.com/portcullis/mailctl/internal/creds"
 	"github.com/portcullis/mailctl/internal/export"
 	"github.com/portcullis/mailctl/internal/logx"
+	"github.com/portcullis/mailctl/internal/machines"
 	"github.com/portcullis/mailctl/internal/metrics"
 	"github.com/portcullis/mailctl/internal/reconcile"
 	"github.com/portcullis/mailctl/internal/spamrules"
 	"github.com/portcullis/mailctl/internal/stalwart"
 	"github.com/portcullis/mailctl/internal/state"
+	"github.com/portcullis/mailctl/internal/wellknown"
 )
 
 const usage = `usage: mailctl [serve|healthcheck|bootstrap [--rotate-key|--verify-gone]|void|dns|rotate|reload-tls|status|export|test]`
@@ -44,7 +49,7 @@ const usage = `usage: mailctl [serve|healthcheck|bootstrap [--rotate-key|--verif
 // later are the subcommands later tasks fill (each talks to the running
 // serve process or to Stalwart directly, as its task says).
 var later = map[string]bool{
-	"dns": true, "rotate": true, "status": true, "test": true,
+	"test": true,
 }
 
 func main() { os.Exit(run(os.Args[1:], os.Getenv, os.Stdout, os.Stderr)) }
@@ -74,6 +79,8 @@ func run(args []string, env func(string) string, stdout, stderr io.Writer) int {
 		return exportCmd(args[1:], env, stdout, stderr)
 	case cmd == "reload-tls":
 		return reloadTLS(env, stderr)
+	case cmd == "dns" || cmd == "rotate" || cmd == "status":
+		return adminCmd(cmd, args[1:], os.Stdin, stdout, stderr)
 	case later[cmd]:
 		fmt.Fprintf(stderr, "mailctl %s: not available in this build\n", cmd)
 		return 1
@@ -154,15 +161,25 @@ func serve(env func(string) string, stderr io.Writer) error {
 	runner := reconcile.NewRunner(sw, st, cfg.FormerRetain, cfg.LANOnly, logger.Printf)
 	rewritten := cfg.ClientIP == config.ClientIPRewritten
 	runner.Rewritten = rewritten
-	v1 := &api.V1{Store: st, C: sw, Runner: runner, LANOnly: cfg.LANOnly, Rewritten: rewritten, Logf: logger.Printf}
+	mc := machines.New(sw, st, machinesConfig(cfg), logger.Printf)
+	v1 := &api.V1{Store: st, C: sw, Runner: runner, LANOnly: cfg.LANOnly, Rewritten: rewritten, Logf: logger.Printf, M: mc}
 	apiSrv := &api.Server{Subnet: cfg.APISubnet, SecretFile: cfg.HubSecretFile, Logf: logger.Printf, Handler: v1.Handler()}
 	servers := []*http.Server{
 		newServer(cfg.APIAddr, apiSrv),
-		// The well-known files (Task 8); until then every path is 404.
-		newServer(cfg.WellKnownAddr, http.NotFoundHandler()),
+		newServer(cfg.WellKnownAddr, wellknown.Handler(mc)),
 		newServer(cfg.RulesAddr, spamrules.Handler()),
 		newServer(cfg.MetricsAddr, m.Handler()),
 	}
+	adminLn, err := admin.Listen(admin.Socket)
+	if err != nil {
+		return fmt.Errorf("the control socket %s: %w", admin.Socket, err)
+	}
+	clientIP := config.ClientIPPreserved
+	if rewritten {
+		clientIP = config.ClientIPRewritten
+	}
+	adminSrv := newServer("", admin.Handler(mc, admin.Status{Bootstrapped: v1.Bootstrapped, ClientIP: clientIP}))
+	adminSrv.WriteTimeout = 5 * time.Minute
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	errc := make(chan error, len(servers))
@@ -177,8 +194,15 @@ func serve(env func(string) string, stderr io.Writer) error {
 			}
 		}(s, ln)
 	}
+	go func() {
+		if err := adminSrv.Serve(adminLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errc <- fmt.Errorf("%s: %w", admin.Socket, err)
+		}
+	}()
+	servers = append(servers, adminSrv)
 	go keepLookupsOff(ctx, sw, logger.Printf)
 	go runner.Run(ctx)
+	go mc.Loop(ctx)
 	logger.Printf("mailctl: serving the Hub API on %s, well-known files on %s, spam rules on %s, metrics on %s",
 		cfg.APIAddr, cfg.WellKnownAddr, cfg.RulesAddr, cfg.MetricsAddr)
 	select {
@@ -191,6 +215,55 @@ func serve(env func(string) string, stderr io.Writer) error {
 		s.Shutdown(sctx)
 	}
 	return err
+}
+
+// machinesConfig is the state machines' part of the environment.
+func machinesConfig(cfg config.Config) machines.Config {
+	mc := machines.Config{MainDomain: cfg.MainDomain, Hostname: cfg.Hostname, Resolvers: cfg.Resolvers,
+		RotateEvery: cfg.DKIMRotate, Reachable: slices.Contains(cfg.WellKnownEntry, "websecure")}
+	if cfg.Relay != nil {
+		mc.SPFInclude = cfg.Relay.SPFInclude
+	}
+	return mc
+}
+
+// adminCmd is `mailctl dns --main --json`, `mailctl rotate --json` (stdin:
+// {"dnssec_state", "spki": {"current", "next"}}) and `mailctl status
+// --json`: one call on the running serve's control socket, its JSON on
+// stdout.
+func adminCmd(cmd string, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	want := map[string][]string{"dns": {"--main", "--json"}, "rotate": {"--json"}, "status": {"--json"}}[cmd]
+	if !slices.Equal(args, want) {
+		fmt.Fprintf(stderr, "usage: mailctl %s %s\n", cmd, strings.Join(want, " "))
+		return 2
+	}
+	var (
+		b   []byte
+		err error
+	)
+	switch cmd {
+	case "dns":
+		b, err = admin.Call(admin.Socket, http.MethodGet, "/dns/main", nil)
+	case "status":
+		b, err = admin.Call(admin.Socket, http.MethodGet, "/status", nil)
+	case "rotate":
+		in, rerr := io.ReadAll(io.LimitReader(stdin, 64<<10))
+		if rerr != nil {
+			fmt.Fprintf(stderr, "mailctl rotate: reading stdin: %v\n", rerr)
+			return 2
+		}
+		if _, perr := admin.ParseRotate(in); perr != nil {
+			fmt.Fprintf(stderr, "mailctl rotate: %v\n", perr)
+			return 2
+		}
+		b, err = admin.Call(admin.Socket, http.MethodPost, "/rotate", in)
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl %s: %s\n", cmd, logx.Redact(err.Error()))
+		return 1
+	}
+	stdout.Write(b)
+	return 0
 }
 
 func newServer(addr string, h http.Handler) *http.Server {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/portcullis/mailctl/internal/creds"
+	"github.com/portcullis/mailctl/internal/machines"
 	"github.com/portcullis/mailctl/internal/reconcile"
 	"github.com/portcullis/mailctl/internal/stalwart"
 	"github.com/portcullis/mailctl/internal/state"
@@ -30,6 +31,8 @@ type V1 struct {
 	Rewritten bool
 	Now       func() time.Time
 	Logf      func(string, ...any)
+	// M runs the state machines (DNS set, status, actions).
+	M *machines.Machines
 
 	mu        sync.Mutex
 	bootAt    time.Time
@@ -44,6 +47,9 @@ func (v *V1) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/credentials", v.listCreds)
 	mux.HandleFunc("POST /v1/credentials", v.createCred)
 	mux.HandleFunc("DELETE /v1/credentials/{id}", v.deleteCred)
+	mux.HandleFunc("GET /v1/dns/{domain}", v.getDNS)
+	mux.HandleFunc("GET /v1/status", v.getStatus)
+	mux.HandleFunc("POST /v1/actions/{action}", v.action)
 	return mux
 }
 
@@ -123,7 +129,9 @@ func (v *V1) putState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]int64{"generation": doc.Generation})
 }
 
-// bootstrapped: the API key works (cached 10 s).
+// Bootstrapped: the API key works (cached 10 s).
+func (v *V1) Bootstrapped(ctx context.Context) bool { return v.bootstrapped(ctx) }
+
 func (v *V1) bootstrapped(ctx context.Context) bool {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -262,4 +270,86 @@ func (v *V1) deleteCred(w http.ResponseWriter, r *http.Request) {
 		v.Logf("credentials: revoked mail password %s of %s", r.PathValue("id"), user)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (v *V1) clientIP() string {
+	if v.Rewritten {
+		return "rewritten"
+	}
+	return "preserved"
+}
+
+func (v *V1) getDNS(w http.ResponseWriter, r *http.Request) {
+	var noWild bool
+	switch r.URL.Query().Get("wildcard") {
+	case "", "true":
+	case "false":
+		noWild = true
+	default:
+		writeErr(w, http.StatusBadRequest, "wildcard must be true or false")
+		return
+	}
+	set, err := v.M.SetFor(strings.ToLower(r.PathValue("domain")), noWild)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "not a mail domain")
+		return
+	}
+	writeJSON(w, http.StatusOK, set)
+}
+
+func (v *V1) getStatus(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	st, err := v.M.Status(ctx, v.bootstrapped(ctx), v.clientIP())
+	if err != nil {
+		v.unreachable(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+func (v *V1) action(w http.ResponseWriter, r *http.Request) {
+	b, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Domain *string `json:"domain"`
+	}
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.DisallowUnknownFields()
+	if state.NoDuplicateKeys(b) != nil || d.Decode(&req) != nil || d.More() || req.Domain == nil {
+		writeErr(w, http.StatusBadRequest, "the body must be {domain}")
+		return
+	}
+	domain := strings.ToLower(*req.Domain)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	var err error
+	switch r.PathValue("action") {
+	case "dkim-rotate":
+		err = v.M.DKIMRotate(ctx, domain)
+	case "dmarc-promote":
+		err = v.M.DMARCPromote(domain)
+	case "mtasts-enforce":
+		err = v.M.MTASTSEnforce(ctx, domain)
+	default:
+		writeErr(w, http.StatusNotFound, "no such action")
+		return
+	}
+	var nothing machines.ErrNothingToDo
+	switch {
+	case errors.Is(err, machines.ErrNotMailDomain):
+		writeErr(w, http.StatusNotFound, "not a mail domain")
+	case errors.As(err, &nothing):
+		writeErr(w, http.StatusConflict, nothing.Why)
+	case err != nil:
+		v.unreachable(w, err)
+	default:
+		if v.Logf != nil {
+			v.Logf("actions: %s %s", r.PathValue("action"), domain)
+		}
+		v.M.Trigger()
+		writeJSON(w, http.StatusAccepted, map[string]string{})
+	}
 }

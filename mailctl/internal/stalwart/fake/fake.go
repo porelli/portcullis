@@ -6,7 +6,12 @@
 package fake
 
 import (
+	"crypto/ed25519"
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -310,6 +315,14 @@ func (s *Server) setLocked(method, obj, st string, args map[string]json.RawMessa
 					}
 				}
 			}
+			if obj == "DkimSignature" {
+				pub, err := dkimPublic(o["privateKey"])
+				if err != nil {
+					notCreated[cid] = map[string]any{"type": "invalidProperties", "properties": []string{"privateKey"}, "description": err.Error()}
+					continue
+				}
+				o["publicKey"], o["privateKey"] = pub, map[string]any{"@type": "Text"}
+			}
 			if obj == "AppPassword" || obj == "ApiKey" || obj == "Account" {
 				o["createdAt"] = s.Now().UTC().Format(time.RFC3339)
 			}
@@ -379,4 +392,27 @@ func (s *Server) nameTakenLocked(name, domainID, except string) bool {
 		}
 	}
 	return false
+}
+
+// dkimPublic derives the p= value from a SecretText PEM (PKCS#8): raw
+// ed25519, RSA SubjectPublicKeyInfo. The secret itself isn't kept.
+func dkimPublic(v any) (string, error) {
+	m, _ := v.(map[string]any)
+	sec, _ := m["secret"].(string)
+	b, _ := pem.Decode([]byte(sec))
+	if b == nil {
+		return "", fmt.Errorf("no PEM private key")
+	}
+	k, err := x509.ParsePKCS8PrivateKey(b.Bytes)
+	if err != nil {
+		return "", err
+	}
+	switch k := k.(type) {
+	case ed25519.PrivateKey:
+		return base64.StdEncoding.EncodeToString(k.Public().(ed25519.PublicKey)), nil
+	case *rsa.PrivateKey:
+		der, err := x509.MarshalPKIXPublicKey(&k.PublicKey)
+		return base64.StdEncoding.EncodeToString(der), err
+	}
+	return "", fmt.Errorf("unsupported key")
 }

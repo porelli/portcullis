@@ -144,8 +144,10 @@ _mail_cert_input() {
      caa: {enabled: $caa, issuer: $issuer, iodef: $iodef}, renew_below_days: $days}'
 }
 
-# mail_cert_ensure — run mail-cert (issue / renew below 30 days); sets
-# MAIL_CERT_RENEWED=true|false. Its output line has no secret.
+# mail_cert_ensure [--switch-key] — run mail-cert (issue / renew below 30
+# days; --switch-key: issue with the next key, the TLSA rollover's last
+# step); sets MAIL_CERT_RENEWED=true|false and MAIL_CERT_SPKI (the key's
+# sha256 SPKI, hex). Its output line has no secret.
 mail_cert_ensure() {
   local input out
   _rt_docker_only
@@ -155,8 +157,10 @@ mail_cert_ensure() {
   volume_own mail_acme "$CT_UID_DOMAINS:$CT_UID_DOMAINS" 0700
   info "Mail certificate for $(mail_hostname)..."
   # shellcheck disable=SC2034  # read by the callers
-  out="$(printf '%s' "$input" | rt_run mail-cert -i --)" || fail "the mail certificate could not be issued (see above)"
+  out="$(printf '%s' "$input" | rt_run mail-cert -i -- "$@")" || fail "the mail certificate could not be issued (see above)"
   MAIL_CERT_RENEWED="$(printf '%s' "$out" | tail -n1 | jq -r '.renewed // false' 2>/dev/null || echo false)"
+  # shellcheck disable=SC2034  # read by mail_rotate
+  MAIL_CERT_SPKI="$(printf '%s' "$out" | tail -n1 | jq -r '.spki_sha256 // ""' 2>/dev/null || true)"
   printf '%s' "$out" | tail -n1 | jq -r '"    not after \(.not_after // "?"), renewed: \(.renewed)"' 2>/dev/null || true
 }
 
@@ -399,6 +403,10 @@ mail_disable() {
   else
     warn "--force: mail goes now; senders with a cached MTA-STS policy may bounce mail until its max_age."
   fi
+  if _dns_automated "${DNS_PROVIDER:-none}"; then
+    DNS_SETS=mail DNS_MAIL_RECORDS='[]' _dns_tool apply >/dev/null \
+      || warn "the main domain's mail records could not be removed: run ./portcullis dns setup"
+  fi
   _mail_set COMPOSE_PROFILES "$(_mail_profiles_without_mail)"
   _mail_stop_services
   hub_env_write
@@ -410,10 +418,39 @@ _mail_stop_services() {
   dc --profile mail stop mailctl mail mail-resolver >/dev/null 2>&1 || true
 }
 
-# mail_rotate — the daily timer's step (contract §19.3): renewal, a TLS
-# reload after a change, the state machines and the main domain's set.
+# _mail_main_dnssec — the main zone's DNSSEC state from the domains
+# service's main plan (`domains report --main`), "unknown" when it can't
+# be read (mailctl then withholds TLSA: fail closed).
+_mail_main_dnssec() {
+  local st
+  st="$(rt_exec domains -- domains report --main --json 2>/dev/null | jq -r '.dnssec.state // empty' 2>/dev/null)" || st=""
+  printf '%s' "${st:-unknown}"
+}
+
+# _mail_rotate_once <next spki> — `mailctl rotate --json` (stdin: the
+# DNSSEC state and the SPKIs; contract §19.7), then the main domain's mail
+# set through the dns tool; sets MAIL_SWITCH_KEY=true|false.
+_mail_rotate_once() {
+  local out in
+  in="$(jq -cn --arg st "$(_mail_main_dnssec)" --arg cur "${MAIL_CERT_SPKI:-}" --arg next "$1" \
+    '{dnssec_state: $st, spki: {current: $cur, next: $next}}')"
+  out="$(printf '%s' "$in" | rt_exec -i mailctl -- mailctl rotate --json)" || fail "mailctl rotate failed"
+  MAIL_SWITCH_KEY="$(printf '%s' "$out" | jq -r '.switch_key == true')"
+  printf '%s' "$out" | jq -r '"    TLSA: \(.tlsa)"' 2>/dev/null || true
+  if ! _dns_automated "${DNS_PROVIDER:-none}"; then
+    warn "No automatic DNS for provider '${DNS_PROVIDER:-none}': ./portcullis dns plan shows the mail records to create by hand."
+    return 0
+  fi
+  DNS_SETS=mail DNS_MAIL_RECORDS="$(printf '%s' "$out" | jq -c '.records // []')" _dns_tool apply >/dev/null \
+    || fail "the main domain's mail records could not be written"
+}
+
+# mail_rotate [--next-key] — the daily timer's step (contract §19.3):
+# renewal, a TLS reload after a change, the state machines and the main
+# domain's set; the TLSA rollover's switch when mailctl says it's due.
+# --next-key starts a rollover (mail-cert --next-key: both SPKIs published).
 mail_rotate() {
-  local out
+  local next="" out
   mail_refuse_kube
   mail_profile_on || fail "mail is off: ./portcullis mail enable"
   _rt_docker_only
@@ -421,9 +458,19 @@ mail_rotate() {
   if [ "${MAIL_CERT_RENEWED:-false}" = true ]; then
     rt_exec mailctl -- mailctl reload-tls || fail "mailctl reload-tls failed"
   fi
-  out="$(rt_exec -i mailctl -- mailctl rotate --json)" || fail "mailctl rotate failed"
-  DNS_SETS=mail DNS_MAIL_RECORDS="$(printf '%s' "$out" | jq -c '.records // []')" _dns_tool apply >/dev/null \
-    || fail "the main domain's mail records could not be written"
+  if [ "${1:-}" = --next-key ]; then
+    out="$(rt_run mail-cert -- --next-key </dev/null)" || fail "mail-cert --next-key failed"
+    next="$(printf '%s' "$out" | tail -n1 | jq -r '.spki_sha256 // ""')"
+    [ -n "$next" ] || fail "mail-cert --next-key printed no key"
+    info "Next mail key $next: published next to the current one; the switch follows in about a day."
+  fi
+  _mail_rotate_once "$next"
+  if [ "${MAIL_SWITCH_KEY:-false}" = true ]; then
+    info "Switching the mail certificate to the next key (TLSA rollover)..."
+    mail_cert_ensure --switch-key
+    rt_exec mailctl -- mailctl reload-tls || fail "mailctl reload-tls failed"
+    _mail_rotate_once ""
+  fi
   ok "Mail rotation done."
 }
 
@@ -544,7 +591,7 @@ help_mail_status() { echo "Usage: portcullis mail status [--json]"; echo; echo "
 help_mail_test() { echo "Usage: portcullis mail test --to <address>"; echo; echo "Send a signed test message as postmaster@<primary domain>."; }
 help_mail_dkim() { echo "Usage: portcullis mail dkim rotate <domain>"; echo; echo "Make a new DKIM key pair for the domain now."; }
 help_mail_cert() { echo "Usage: portcullis mail cert"; echo; echo "Issue or renew the mail certificate (renewal below 30 days); reloads Stalwart on a change."; }
-help_mail_rotate() { echo "Usage: portcullis mail rotate"; echo; echo "The daily timer's step: certificate, DKIM / MTA-STS / TLSA state, the main domain's mail records."; }
+help_mail_rotate() { echo "Usage: portcullis mail rotate [--next-key]"; echo; echo "The daily timer's step: certificate, DKIM / MTA-STS / TLSA state, the main domain's mail records."; echo "--next-key starts a mail key rollover (both TLSA records published; the timer switches after 2×TTL + 1 day)."; }
 help_mail_schedule() { echo "Usage: portcullis mail schedule --systemd [--out DIR]"; echo; echo "Write portcullis-mail.service and .timer (daily) and print how to install them."; }
 help_mail_export() { echo "Usage: portcullis mail export <former-id> [--out FILE]"; echo; echo "Export a former account's mailbox as mbox (0600) under backups/mail-export/."; }
 
@@ -556,7 +603,7 @@ cmd_mail() {
     enable|disable|status|test|dkim|cert|rotate|schedule|export) ;;
     *) usage_error mail "unknown subcommand: $sub" ;;
   esac
-  local fn="help_mail_$sub" host="" lan="" yes=false force=false rotkey=false systemd=false out="" to="" json=false
+  local fn="help_mail_$sub" host="" lan="" yes=false force=false rotkey=false systemd=false out="" to="" json=false nextkey=""
   local -a pos=()
   while [ $# -gt 0 ]; do
     case "$sub:$1" in
@@ -566,6 +613,7 @@ cmd_mail() {
       enable:--rotate-key) rotkey=true ;;
       enable:--yes|disable:--yes) yes=true ;;
       disable:--force) force=true ;;
+      rotate:--next-key) nextkey=--next-key ;;
       schedule:--systemd) systemd=true ;;
       schedule:--out|export:--out) need_value "mail $sub" "$1" "${2:-}"; out="$2"; shift ;;
       test:--to) need_value "mail test" "$1" "${2:-}"; to="$2"; shift ;;
@@ -614,7 +662,7 @@ cmd_mail() {
       mail_profile_on || fail "mail is off: ./portcullis mail enable"
       mail_cert_ensure
       if [ "${MAIL_CERT_RENEWED:-false}" = true ] && rt_running mailctl; then rt_exec mailctl -- mailctl reload-tls || fail "mailctl reload-tls failed"; fi ;;
-    rotate) mail_rotate ;;
+    rotate) mail_rotate "$nextkey" ;;
     schedule) mail_schedule_systemd "$out" ;;
     status|test|dkim|export)
       mail_refuse_kube

@@ -2437,7 +2437,7 @@ case "$OUT" in *"create these records by hand"*"add A ci.example.org 203.0.113.1
 expect_eq "dns setup: manual provider — plan only, read-only" "$(paste -sd' ' "$STUB_DIR/dt/order"):$(dtin plan 'has("credentials")')" "plan:false"
 
 RC=0; "$CLI" dns setup --only bogus >/dev/null 2>"$WORK/dterr" </dev/null || RC=$?
-expect_eq "dns setup --only bogus: usage error" "$RC:$(grep -c -- '--only must be address, caa or nomail' "$WORK/dterr")" "2:1"
+expect_eq "dns setup --only bogus: usage error" "$RC:$(grep -c -- '--only must be address, caa, nomail or mail' "$WORK/dterr")" "2:1"
 dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 dns_setup true false caa' >/dev/null
 expect_eq "dns setup --only caa: only that set" "$(dtin apply '.sets | join(",")')" "caa"
 dt 'DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=tok-SECRET-123 DNS_NOMAIL=true dns_setup true false ""' >/dev/null
@@ -4942,6 +4942,48 @@ expect_eq "mail schedule --systemd writes the timer (podman shape: user units)" 
   "$(grep -c '^WantedBy=default.target$' "$U/portcullis-mail.timer"):$(grep -c '^User=' "$U/portcullis-mail.service"):$(grep -c '^Requires=podman.socket$' "$U/portcullis-mail.service")" "1:0:1"
 expect_eq "mail_profiles: added once, removed" "$(COMPOSE_PROFILES=monitoring _mail_profiles_with_mail):$(COMPOSE_PROFILES=monitoring,mail _mail_profiles_with_mail):$(COMPOSE_PROFILES=monitoring,mail,wg _mail_profiles_without_mail)" "monitoring,mail:monitoring,mail:monitoring,wg"
 expect_eq "mail_client_ip_mode: docker preserved, podman rewritten" "$(CONTAINER_RUNTIME=docker mail_client_ip_mode):$(CONTAINER_RUNTIME=podman mail_client_ip_mode)" "preserved:rewritten"
+
+# The main domain's mail set (contract §19.7): mailctl's records reach the
+# dns tool on its stdin only (with mail_hostname), never on argv.
+export MREC='{"domain":"mail.example","records":[{"name":"mail.example","type":"MX","ttl":3600,"value":"10 mx.mail.example."}],"dkim":"auto","tlsa":"withheld: dnssec unsigned"}'
+mt 'source "$HERE/../scripts/lib/stack.sh"; source "$HERE/../scripts/lib/dns.sh"; export MAIL_HOSTNAME=mx.mail.example DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=cf-secret-token
+  rt_exec() { echo "rt_exec $*" >> "$ML/argv"; printf "%s" "$MREC"; }
+  rt_run() { echo "rt_run $*" >> "$ML/argv"; cat > "$ML/stdin"; }
+  domains_image_ensure() { :; }
+  _dns_mail_records true; DNS_SETS="$(_dns_default_sets)"; export DNS_SETS; _dns_tool apply'
+expect_eq "dns: with mail on, mailctl's main set and mail_hostname go on the tool's stdin; the default sets include mail" \
+  "$(jq -c '{mail, mail_hostname, sets}' "$ML/stdin" 2>/dev/null)" \
+  '{"mail":[{"name":"mail.example","type":"MX","ttl":3600,"value":"10 mx.mail.example."}],"mail_hostname":"mx.mail.example","sets":["address","caa","mail"]}'
+expect_eq "dns: neither the records nor a credential on any argv" "$(grep -c 'mx.mail.example\|cf-secret-token' "$ML/argv")" 0
+expect_eq "dns: the records come from mailctl dns --main --json" "$(grep -c '^rt_exec mailctl -- mailctl dns --main --json$' "$ML/argv")" 1
+mt 'source "$HERE/../scripts/lib/stack.sh"; source "$HERE/../scripts/lib/dns.sh"; rt_exec() { return 1; }; _dns_mail_records true'; rc=$?
+expect_eq "dns setup --only mail: mailctl not answering → refused" "$rc:$(grep -c "mailctl didn't answer" "$ML/out")" "1:1"
+mt 'source "$HERE/../scripts/lib/stack.sh"; source "$HERE/../scripts/lib/dns.sh"; export COMPOSE_PROFILES=; rt_exec() { echo called >> "$ML/argv"; }; _dns_mail_records true; printf "[%s]" "${DNS_MAIL_RECORDS:-}" > "$ML/recs"'
+expect_eq "dns: mail off → no mail set, mailctl never asked" "$(cat "$ML/recs"):$(grep -c called "$ML/argv" 2>/dev/null || echo 0)" "[]:0"
+
+# mail rotate: the DNSSEC state and the SPKI on mailctl rotate's stdin, the
+# answer's records to the dns tool, the rollover's switch when due.
+mt 'source "$HERE/../scripts/lib/stack.sh"; source "$HERE/../scripts/lib/dns.sh"; export DNS_PROVIDER=cloudflare
+  mail_cert_ensure() { echo "cert $*" >> "$ML/argv"; MAIL_CERT_RENEWED=false; MAIL_CERT_SPKI="$( [ "${1:-}" = --switch-key ] && echo bb || echo aa)"; }
+  ML_N=0
+  rt_exec() {
+    echo "rt_exec $*" >> "$ML/argv"
+    case "$*" in
+      *"domains report --main --json") echo "{\"dnssec\":{\"state\":\"secure\"}}" ;;
+      *"mailctl rotate --json") cat >> "$ML/stdin"; echo >> "$ML/stdin"; ML_N=$((ML_N+1)); if [ "$ML_N" = 1 ]; then echo "{\"records\":[],\"tlsa\":\"published\",\"switch_key\":true}"; else echo "{\"records\":[],\"tlsa\":\"published\",\"switch_key\":false}"; fi ;;
+    esac
+  }
+  _dns_tool() { echo "dns_tool $* sets=$DNS_SETS recs=$DNS_MAIL_RECORDS" >> "$ML/argv"; }
+  mail_rotate'
+expect_eq "mail rotate: stdin {dnssec_state, spki} each pass (current after the switch = the new key)" \
+  "$(jq -sc 'map([.dnssec_state, .spki.current, .spki.next])' "$ML/stdin" 2>/dev/null)" '[["secure","aa",""],["secure","bb",""]]'
+expect_eq "mail rotate: switch_key → mail-cert --switch-key, reload-tls, the set written twice" \
+  "$(grep -c '^cert --switch-key$' "$ML/argv"):$(grep -c 'mailctl reload-tls$' "$ML/argv"):$(grep -c '^dns_tool apply sets=mail recs=\[\]$' "$ML/argv")" "1:1:2"
+mt 'source "$HERE/../scripts/lib/stack.sh"; source "$HERE/../scripts/lib/dns.sh"; export DNS_PROVIDER=cloudflare
+  mail_cert_ensure() { MAIL_CERT_SPKI=aa; }
+  rt_exec() { case "$*" in *"domains report"*) return 1 ;; *"mailctl rotate --json") cat > "$ML/stdin"; echo "{\"records\":[]}" ;; esac; }
+  _dns_tool() { :; }; mail_rotate'
+expect_eq "mail rotate: an unreadable DNSSEC state is passed as unknown (TLSA withheld)" "$(jq -r .dnssec_state "$ML/stdin" 2>/dev/null)" unknown
 
 echo ""
 echo "$PASS passed, $FAIL failed"

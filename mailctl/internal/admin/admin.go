@@ -1,0 +1,189 @@
+// Package admin is mailctl's control socket for the CLI (`docker compose
+// exec mailctl mailctl dns|rotate|status`): a unix socket inside the
+// container, 0600, so only mailctl's own uid (the exec's user) reaches it.
+// Nothing listens on a network for these.
+package admin
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"syscall"
+	"time"
+
+	"github.com/portcullis/mailctl/internal/machines"
+	"github.com/portcullis/mailctl/internal/state"
+)
+
+// Socket is the control socket's path (mailctl's tmpfs /tmp).
+const Socket = "/tmp/mailctl.sock"
+
+// Status is the extra status input serve owns.
+type Status struct {
+	Bootstrapped func(context.Context) bool
+	ClientIP     string
+}
+
+// Handler serves the socket's routes.
+func Handler(m *machines.Machines, st Status) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /dns/main", func(w http.ResponseWriter, r *http.Request) {
+		set, err := m.Set(m.Cfg.MainDomain)
+		if err != nil {
+			writeErr(w, http.StatusNotFound, "the main domain isn't a mail domain of the applied document (has the Hub sent one?)")
+			return
+		}
+		writeJSON(w, http.StatusOK, set)
+	})
+	mux.HandleFunc("POST /rotate", func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<10))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "unreadable input")
+			return
+		}
+		in, err := ParseRotate(b)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+		defer cancel()
+		out, err := m.Rotate(ctx, in)
+		if errors.Is(err, machines.ErrNotMailDomain) {
+			writeErr(w, http.StatusNotFound, "the main domain isn't a mail domain of the applied document (has the Hub sent one?)")
+			return
+		}
+		if err != nil && out.Domain == "" {
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		// A failed machine step still answers the set (the records stay
+		// what the state says); the error goes to mailctl's log.
+		writeJSON(w, http.StatusOK, out)
+	})
+	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		boot := st.Bootstrapped != nil && st.Bootstrapped(ctx)
+		s, err := m.Status(ctx, boot, st.ClientIP)
+		if err != nil {
+			writeErr(w, http.StatusServiceUnavailable, "mail server unreachable")
+			return
+		}
+		writeJSON(w, http.StatusOK, s)
+	})
+	return mux
+}
+
+// ParseRotate reads `mailctl rotate --json`'s stdin strictly:
+// {"dnssec_state", "spki": {"current", "next"}}.
+func ParseRotate(b []byte) (machines.RotateIn, error) {
+	var in machines.RotateIn
+	bad := fmt.Errorf(`the input must be {"dnssec_state", "spki": {"current", "next"}}`)
+	if state.NoDuplicateKeys(b) != nil {
+		return in, bad
+	}
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.DisallowUnknownFields()
+	if d.Decode(&in) != nil || d.More() {
+		return in, bad
+	}
+	var keys struct {
+		DNSSEC *string `json:"dnssec_state"`
+		SPKI   *struct {
+			Current *string `json:"current"`
+			Next    *string `json:"next"`
+		} `json:"spki"`
+	}
+	_ = json.Unmarshal(b, &keys)
+	if keys.DNSSEC == nil || keys.SPKI == nil || keys.SPKI.Current == nil || keys.SPKI.Next == nil {
+		return in, bad
+	}
+	for _, s := range []string{in.SPKI.Current, in.SPKI.Next} {
+		if s != "" && !isHex64(s) {
+			return in, fmt.Errorf("spki values are sha256 hex digests or empty")
+		}
+	}
+	if len(in.DNSSECState) > 32 {
+		return in, fmt.Errorf("dnssec_state is too long")
+	}
+	return in, nil
+}
+
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func writeJSON(w http.ResponseWriter, status int, body any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+func writeErr(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// Listen makes the socket 0600 (a stale one is replaced).
+func Listen(path string) (net.Listener, error) {
+	_ = os.Remove(path)
+	old := syscall.Umask(0o177)
+	ln, err := net.Listen("unix", path)
+	syscall.Umask(old)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	return ln, nil
+}
+
+// Call is the client: one request on the socket, the answer's body on
+// success, else an error with the server's message.
+func Call(path, method, route string, body []byte) ([]byte, error) {
+	c := &http.Client{Timeout: 3 * time.Minute, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", path)
+		}}}
+	req, err := http.NewRequest(method, "http://mailctl"+route, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("mailctl isn't serving (%v)", err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		var e struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(b, &e)
+		if e.Error == "" {
+			e.Error = resp.Status
+		}
+		return nil, errors.New(e.Error)
+	}
+	return b, nil
+}

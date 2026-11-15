@@ -1692,6 +1692,20 @@ services:
     mem_limit: 256m
     pids_limit: 128
     restart: unless-stopped
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: portcullis-proxy
+      traefik.http.services.mailctl-wellknown.loadbalancer.server.port: "8081"
+      # The main domain's MTA-STS policy, autoconfig and autodiscover
+      # (contract §19.7); added domains' hosts come from the Hub's
+      # mail-wellknown-<domain> routers. Like every core router without
+      # group-gate it follows VPN-only mode (no public exception):
+      # MAILCTL_WELLKNOWN_ENTRYPOINTS is the same value.
+      traefik.http.routers.mail-wellknown.rule: Host(`mta-sts.${PORTCULLIS_DOMAIN:-portcullis.local}`) || Host(`autoconfig.${PORTCULLIS_DOMAIN:-portcullis.local}`) || Host(`autodiscover.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.mail-wellknown.entrypoints: ${PORTCULLIS_EP_CORE:-websecure,vpnsecure}
+      traefik.http.routers.mail-wellknown.tls.options: authaware@file
+      traefik.http.routers.mail-wellknown.middlewares: rate-limit@file,security-headers@file
+      traefik.http.routers.mail-wellknown.service: mailctl-wellknown
 
   # A validating recursive resolver for mail and mailctl only (contract
   # §19.1): Unbound from the root servers, the image's trust anchor, on

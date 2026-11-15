@@ -1311,7 +1311,7 @@ BAD=""
 for r in $ROUTERS; do
   grep -qE "^[[:space:]]+traefik\.http\.routers\.$r\.tls\.options: authaware@file$" "$ROOT_DIR/docker-compose.yml" || BAD="$BAD $r"
 done
-expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:24"
+expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:25"
 expect_eq "no other tls.options in docker-compose.yml" "$(grep -E 'tls\.options:' "$ROOT_DIR/docker-compose.yml" | grep -vc 'authaware@file$' || true)" 0
 # VPN (contract §16, security ruling): every core router's entrypoints
 # label is literally its class: routers without group-gate take
@@ -1328,6 +1328,7 @@ for r in portal people; do EP_WANT="$EP_WANT$r \${PORTCULLIS_WEB_CORE:-websecure
 EP_WANT="${EP_WANT}people-vpn-enrol \${PORTCULLIS_WEB_ENROL:-websecure}"$'\n'
 for r in lldap mcp hub-mcp people-mcp; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ADMIN:-websecure,vpnsecure}"$'\n'; done
 for r in keycloak keycloak-resources oauth2-callback enroll-invite; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ENROL:-websecure,vpnsecure}"$'\n'; done
+EP_WANT="${EP_WANT}mail-wellknown \${PORTCULLIS_EP_CORE:-websecure,vpnsecure}"$'\n'
 for r in dashboard keycloak-admin hub grafana-metrics portal people people-vpn-enrol; do EP_WANT="$EP_WANT$r-vpn vpnsecure"$'\n'; done
 for r in core-vpn-required keycloak-admin-vpn-required; do EP_WANT="$EP_WANT$r websecure"$'\n'; done
 EP_WANT="$(printf '%s' "$EP_WANT" | LC_ALL=C sort | tr '\n' ';')"
