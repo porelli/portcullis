@@ -583,6 +583,39 @@ jobs:
                 # CI only: Traefik's API on its internal :8080 entrypoint, for
                 # the "no @http object" checks of the domains test.
                 TRAEFIK_API_INSECURE: "true"
+            # Mail (step "Test the mail service"): mail-cert against its own
+            # Pebble (accepts the one-shot's own fake-DNS challenge; its TLS
+            # certificate from the step's CI CA), mail-resolver forwarding
+            # every name to the domains fake DNS, mailctl's "public"
+            # resolvers = mail-resolver: no DNS or SMTP leaves the runner.
+            pebble-mail:
+              image: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
+              profiles: [mail]
+              command: ["-config", "/ci/pebble.json", "-dnsserver", "127.0.0.1:53"]
+              environment:
+                PEBBLE_VA_ALWAYS_VALID: "1"
+                PEBBLE_VA_NOSLEEP: "1"
+                PEBBLE_WFE_NONCEREJECT: "0"
+              volumes:
+                - /tmp/pebble-mail:/ci:ro
+              networks: [domains-egress]
+            mail-cert:
+              environment:
+                LEGO_CA_CERTIFICATES: /run/ci/pebble-mail-ca.pem
+                DOMAINS_RESOLVERS: 127.0.0.1:8053
+              volumes:
+                - /tmp/pebble-mail/ca.pem:/run/ci/pebble-mail-ca.pem:ro
+            mail-resolver:
+              volumes:
+                - /tmp/unbound-ci.conf:/etc/unbound/custom.conf:ro
+              networks:
+                domains-egress: {}
+              healthcheck:
+                test: ["CMD", "drill-hc", "-p", "5353", "@127.0.0.1", "team-b.ci-domains.test"]
+            mailctl:
+              environment:
+                MAILCTL_RESOLVERS: 172.31.255.4:5353
+                MAILCTL_PUBLIC_IPV4: 203.0.113.25
           YML
           sed -i 's/^          //' docker-compose.ci.yml
           docker compose config -q
@@ -1760,6 +1793,10 @@ jobs:
       - name: Test the session store (oauth2-proxy sessions in Valkey, a ticket cookie, the ACL)
         run: bash .github/ci/build-and-test-session-store.sh
 
+      - name: Test the mail service (bootstrap, recovery gone, isolation, certificate, open relay, status, timer)
+        timeout-minutes: 20
+        run: bash .github/ci/build-and-test-mail-service.sh setup
+
       - name: portcullis status
         run: |
           ./portcullis status || true   # hub/forward-auth are not started in CI
@@ -1792,6 +1829,9 @@ jobs:
           grep -q '^portcullis_vault_active 1$' monitoring/textfile/status.prom || { echo "FAIL: status --textfile"; cat monitoring/textfile/status.prom; exit 1; }
           echo "PASS: logical backup while running, verify --local, corruption detected, metrics"
 
+      - name: "Mail: the backup stopped and restarted mail, archived its volumes"
+        run: bash .github/ci/build-and-test-mail-service.sh after-backup
+
       - name: Off-host backup (restic, local repository), verify, wrong password
         timeout-minutes: 15
         run: |
@@ -1818,6 +1858,9 @@ jobs:
       - name: Restore from off-host into a fresh stack (new host)
         timeout-minutes: 15
         run: bash .github/ci/build-and-test-restore-from-off-host-fresh.sh
+
+      - name: "Mail: the restore voided the mail passwords, mailctl_data came back"
+        run: bash .github/ci/build-and-test-mail-service.sh after-restore
 
       - name: Collect service status
         if: always()

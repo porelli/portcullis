@@ -136,9 +136,22 @@ _mail_cert_input() {
     map="$(jq -c --arg v "$var" --arg k "$key" '. + [{var: $v, key: $k}]' <<<"$map")"
   done < <(_dns_cred_keys "$provider")
   caa="$(_dns_flag DNS_CAA true)" || return 1
-  # MAIL_ACME_CA_SERVER: another CA for the mail certificate than Traefik's.
-  jq -n --arg host "$(mail_hostname)" --arg ca "${MAIL_ACME_CA_SERVER:-$(_dns_ca_server)}" --arg email "${ACME_EMAIL:-admin@${PORTCULLIS_DOMAIN}}" \
-    --arg provider "$provider" --argjson map "$map" --argjson caa "$caa" --arg issuer "${DNS_CAA_ISSUER:-}" \
+  # MAIL_ACME_CA_SERVER: another CA for the mail certificate than Traefik's
+  # (a testing knob; https only). Its CAA issuer domain is MAIL_CAA_ISSUER
+  # (never DNS_CAA_ISSUER, which is Traefik's CA's): mail-cert pins it at
+  # the hostname, and refuses with CAA on when it isn't known.
+  local ca issuer
+  if [ -n "${MAIL_ACME_CA_SERVER:-}" ]; then
+    case "$MAIL_ACME_CA_SERVER" in
+      https://?*) ;;
+      *) fail "MAIL_ACME_CA_SERVER must be an https:// ACME directory URL" ;;
+    esac
+    ca="$MAIL_ACME_CA_SERVER" issuer="${MAIL_CAA_ISSUER:-}"
+  else
+    ca="$(_dns_ca_server)" issuer="${MAIL_CAA_ISSUER:-${DNS_CAA_ISSUER:-}}"
+  fi
+  jq -n --arg host "$(mail_hostname)" --arg ca "$ca" --arg email "${ACME_EMAIL:-admin@${PORTCULLIS_DOMAIN}}" \
+    --arg provider "$provider" --argjson map "$map" --argjson caa "$caa" --arg issuer "$issuer" \
     --arg iodef "${DNS_CAA_IODEF:-}" --argjson days "$MAIL_CERT_RENEW_DAYS" '
     {hostname: $host, ca_server: $ca, email: $email, provider: $provider,
      credentials: ($map | map({key: .key, value: env[.var]}) | from_entries),

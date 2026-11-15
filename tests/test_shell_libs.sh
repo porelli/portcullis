@@ -5092,6 +5092,29 @@ mt 'mail_ipv6_refuse'; rc=$?
 expect_eq "MAIL_IPV6 unset → fine" "$rc" 0
 expect_eq "no [::] port and no MAIL_IPV6 in compose" "$(grep -cE '\[::\]:(25|465|587|993):|MAIL_IPV6' "$HERE/../docker-compose.yml")" 0
 
+# The mail certificate's CA (security review): MAIL_ACME_CA_SERVER is
+# https only, and its CAA issuer is MAIL_CAA_ISSUER, never Traefik's.
+# (stack.sh / dns.sh: loaded in the subshell only.)
+SDL='source "$HERE/../scripts/lib/stack.sh"; source "$HERE/../scripts/lib/dns.sh"; '
+mci() { mt "$SDL"'export DNS_PROVIDER=porkbun PORKBUN_API_KEY=k PORKBUN_SECRET_API_KEY=s DNS_CAA_ISSUER=traefik-ca.test '"$1"'; _mail_cert_input > "$ML/in"'; }
+mci 'export MAIL_ACME_CA_SERVER=http://ca.test/dir'; rc=$?
+expect_eq "MAIL_ACME_CA_SERVER http:// → refused" "$rc:$(grep -c 'must be an https://' "$ML/out")" "1:1"
+mci 'export MAIL_ACME_CA_SERVER=ftp://ca.test/dir'; rc=$?
+expect_eq "MAIL_ACME_CA_SERVER not https → refused" "$rc" 1
+mci 'export MAIL_ACME_CA_SERVER=https://ca.test/dir'; rc=$?
+expect_eq "MAIL_ACME_CA_SERVER https, no MAIL_CAA_ISSUER → issuer empty (mail-cert refuses), not DNS_CAA_ISSUER" \
+  "$rc:$(jq -c '{ca_server, i: .caa.issuer}' "$ML/in")" '0:{"ca_server":"https://ca.test/dir","i":""}'
+mci 'export MAIL_ACME_CA_SERVER=https://ca.test/dir MAIL_CAA_ISSUER=ca.test'; rc=$?
+expect_eq "MAIL_ACME_CA_SERVER + MAIL_CAA_ISSUER → that issuer" "$rc:$(jq -r .caa.issuer "$ML/in")" "0:ca.test"
+mci ':'; rc=$?
+expect_eq "no MAIL_ACME_CA_SERVER → Traefik's CA and DNS_CAA_ISSUER" "$rc:$(jq -r '.ca_server + " " + .caa.issuer' "$ML/in")" \
+  "0:https://acme-v02.api.letsencrypt.org/directory traefik-ca.test"
+# The fake DNS provider: CI only.
+mt "$SDL"'_dns_automated fake'; rc=$?
+expect_eq "DNS_PROVIDER=fake without PORTCULLIS_TESTPROVIDER=1 → not automated" "$rc" 1
+mt "$SDL"'export PORTCULLIS_TESTPROVIDER=1; _dns_automated fake && [ "$(_dns_cred_keys fake)" = FAKE_API_TOKEN:api_token ]'; rc=$?
+expect_eq "fake with PORTCULLIS_TESTPROVIDER=1 → automated, FAKE_API_TOKEN" "$rc" 0
+
 # export: 0600 under backups/mail-export; nothing left on failure.
 mt 'rt_exec() { printf "From MAILER-DAEMON Sun Nov 15 10:00:00 2026\nSubject: x\n\nhi\n"; }; mail_export former-6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b ""'; rc=$?
 F="$(ls "$ML/root/backups/mail-export/"*.mbox 2>/dev/null | head -n1)"

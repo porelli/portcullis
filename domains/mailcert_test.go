@@ -345,6 +345,33 @@ func TestMailCertNextKey(t *testing.T) {
 	}
 }
 
+// CAA on and a CA whose issuer domain isn't known: refused before
+// anything is written (fail closed), not issued unpinned.
+func TestMailCertRefusesUnknownCAAIssuer(t *testing.T) {
+	f := newMailCertFixture(t)
+	code, out, errs := f.run(nil, f.input(func(m map[string]any) {
+		m["caa"] = map[string]any{"enabled": true, "issuer": "", "iodef": ""}
+	}))
+	if code != exitProblem || out != "" || !strings.Contains(errs, "MAIL_CAA_ISSUER") {
+		t.Fatalf("unknown issuer = %d %q %s", code, out, errs)
+	}
+	if rrs := f.zone.Records(mcHost); len(rrs) != 0 {
+		t.Fatalf("records written at %s: %v", mcHost, rrs)
+	}
+	for _, n := range []string{"fullchain.pem", "privkey.pem"} {
+		if _, err := os.Stat(filepath.Join(f.tls, n)); !os.IsNotExist(err) {
+			t.Errorf("%s written: %v", n, err)
+		}
+	}
+	// CAA off: issued without a pin.
+	code, _, errs = f.run(nil, f.input(func(m map[string]any) {
+		m["caa"] = map[string]any{"enabled": false, "issuer": "", "iodef": ""}
+	}))
+	if code != 0 {
+		t.Fatalf("CAA off = %d %s", code, errs)
+	}
+}
+
 func TestMailCertStdinRefusesUnknownKey(t *testing.T) {
 	f := newMailCertFixture(t)
 	for what, in := range map[string]string{

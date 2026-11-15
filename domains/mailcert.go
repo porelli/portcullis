@@ -131,6 +131,11 @@ func runMailCert(args []string, e toolEnv) int {
 	}
 	host := strings.ToLower(strings.TrimSuffix(in.Hostname, "."))
 	issuer, known := dnsplan.IssuerFor(in.CAServer, in.CAA.Issuer)
+	if in.CAA.Enabled && !known {
+		// Fail closed: a certificate from a CA the hostname's CAA doesn't
+		// name would be refused, or (no pin written) leave the parent's.
+		return fail(exitProblem, fmt.Errorf("CAA is on but the CAA issuer domain of %s isn't known: set MAIL_CAA_ISSUER (or DNS_CAA=false)", in.CAServer))
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute+orDur(e.caaWait, mailCertCAAWait))
 	defer cancel()
 
@@ -164,15 +169,13 @@ func runMailCert(args []string, e toolEnv) int {
 	uri := u.reg.URI
 
 	// The CAA at the hostname pins this account (issue only); CAA off
-	// removes the pin it wrote. An unknown CA: nothing written.
+	// removes the pin it wrote. An unknown CA with CAA on was refused above.
 	pin := in.CAA.Enabled && known
 	if known {
 		sp := dnsplan.Spec{Name: host, CAA: in.CAA.Enabled, Issuer: issuer, AccountURI: uri, IODEF: strings.TrimSpace(in.CAA.IODEF), NoWild: true, Main: true}
 		if _, _, err := dnsplan.Apply(ctx, dnsplan.Input{Spec: sp, Zone: zone, Provider: p, ProviderName: in.Provider, Resolvers: e.resolvers}, []string{dnsplan.SetCAA}); err != nil {
 			return fail(exitFailure, fmt.Errorf("setting the CAA of %s: %w", host, err))
 		}
-	} else if in.CAA.Enabled {
-		fmt.Fprintf(e.stderr, "domains mail-cert: CAA skipped for %s: unknown CA (set DNS_CAA_ISSUER to its CAA issuer domain)\n", host)
 	}
 
 	now := time.Now()
