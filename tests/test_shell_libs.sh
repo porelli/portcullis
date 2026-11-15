@@ -298,7 +298,7 @@ expect_eq "stack_prepare: an unset MAIL_RELAY_PASSWORD / MAIL_SPAMHAUS_DQS_KEY e
   unset -f monitoring_fix_perms domains_fix_perms mcpgate_fix_perms sessions_fix_perms
   secrets_fix_perms ) >/dev/null 2>&1
 expect_eq "secrets_fix_perms: the mail files' groups (mailctl 10010, Hub 10001, mail 2000)" "$(grep 'secrets/mail' "$STUB_DIR/sfp-mail" | tr '\n' '|')" \
-  "ct_group_read 10010 $SP_ROOT/secrets/mail/api-key $SP_ROOT/secrets/mail/dqs-key|ct_group_read 10001 $SP_ROOT/secrets/mail/hub-secret|ct_group_read 2000 $SP_ROOT/secrets/mail/metrics-secret $SP_ROOT/secrets/mail/relay-password|"
+  "ct_group_read 10010 $SP_ROOT/secrets/mail/api-key $SP_ROOT/secrets/mail/dqs-key|ct_group_read 10001 $SP_ROOT/secrets/mail/hub-secret|ct_group_read 2000 $SP_ROOT/secrets/mail/metrics-secret $SP_ROOT/secrets/mail/relay-password $SP_ROOT/secrets/mail/gate|"
 rm -f "$STUB_DIR/sfp-mail"
 rm -rf "$SP_ROOT/secrets/mail/hub-secret"; mkdir "$SP_ROOT/secrets/mail/hub-secret"
 rc=0; ( PORTCULLIS_ROOT="$SP_ROOT"
@@ -4863,7 +4863,7 @@ ML_BOOT_DEFAULT='{"api_key":"API_testkey0123456789"}'
 # mt <script> — a subshell with a fresh root and stub dc / health / build;
 # dc's argv goes to $ML/argv, its stdin (for `run`) to $ML/stdin.
 mt() {
-  rm -rf "$ML"; mkdir -p "$ML/root/secrets/mail"
+  rm -rf "$ML"; mkdir -p "$ML/root/secrets/mail/gate"
   printf 'PORTCULLIS_DOMAIN=mail.example\nCOMPOSE_PROFILES=mail\n' > "$ML/root/.env"
   : > "$ML/root/secrets/mail/api-key"
   (
@@ -5035,25 +5035,25 @@ expect_eq "backup / restore: the recovery admin, update.env and the image stamp 
 VP='mail_recovery_session() { echo "session $*" >> "$ML/argv"; "$1" 3<<<pw; }; rt_stop() { echo "stop $*" >> "$ML/argv"; }'
 mt "$VP"'; : > "$(mail_void_marker)"; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; return 1; }; _restore_mail_void "$ML"'; rc=$?
 expect_eq "restore: the void fails → refused, mail and mailctl stopped, the marker kept" \
-  "$rc:$(grep -E '^(session|stop)' "$ML/argv" | tr '\n' '|'):$([ -e "$ML/root/secrets/mail/void-pending" ] && echo kept)" "1:session mail_void_restore|stop mail mailctl|:kept"
+  "$rc:$(grep -E '^(session|stop)' "$ML/argv" | tr '\n' '|'):$([ -e "$ML/root/secrets/mail/gate/void-pending" ] && echo kept)" "1:session mail_void_restore|stop mail mailctl|:kept"
 mt "$VP"'; : > "$(mail_void_marker)"; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; }; _restore_mail_void "$ML"'; rc=$?
 expect_eq "restore: voided → the marker removed, nothing stopped" \
-  "$rc:$(grep -E '^(session|stop)' "$ML/argv" | tr '\n' '|'):$([ -e "$ML/root/secrets/mail/void-pending" ] && echo kept || echo gone)" "0:session mail_void_restore|:gone"
+  "$rc:$(grep -E '^(session|stop)' "$ML/argv" | tr '\n' '|'):$([ -e "$ML/root/secrets/mail/gate/void-pending" ] && echo kept || echo gone)" "0:session mail_void_restore|:gone"
 mt "$VP"'; _restore_mail_void "$ML"'; rc=$?
 expect_eq "restore: no marker (no mail store in the backup) → no session" "$rc:$(cat "$ML/argv" 2>/dev/null | grep -c session)" "0:0"
 mt 'RESTORE_MAIL_UNVOIDED=true; _restore_mail_outcome'; rc=$?
 expect_eq "restore: the unvoided outcome fails with the retry hint" "$rc:$(grep -c 'mail passwords could not be voided: mail stays stopped (./portcullis mail enable to retry)' "$ML/out")" "1:1"
 mt 'dc() { echo "dc $*" >> "$ML/argv"; cat > "$ML/stdin"; }; : > "$(mail_void_marker)"; mail_void_restore 3<<<"s3cret-pw"'
 expect_eq "restore: mailctl void gets the recovery credentials on stdin only; success removes the marker" \
-  "$(grep -c '^dc run --rm --no-deps -T mailctl void --reason restore$' "$ML/argv"):$(grep -c s3cret "$ML/argv"):$(jq -r .recovery_password "$ML/stdin"):$([ -e "$ML/root/secrets/mail/void-pending" ] && echo kept || echo gone)" "1:0:s3cret-pw:gone"
+  "$(grep -c '^dc run --rm --no-deps -T mailctl void --reason restore$' "$ML/argv"):$(grep -c s3cret "$ML/argv"):$(jq -r .recovery_password "$ML/stdin"):$([ -e "$ML/root/secrets/mail/gate/void-pending" ] && echo kept || echo gone)" "1:0:s3cret-pw:gone"
 # up / upgrade with the marker: never mail without the void first.
 UP='mail_port_start_ok() { :; }; mail_config_present() { :; }; mail_tls_present() { :; }; printf API_k > "$PORTCULLIS_ROOT/secrets/mail/api-key"'
 mt "$VP; $UP"'; : > "$(mail_void_marker)"; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; [ "$1" != run ]; }; mail_up_steps up; printf "%s" "$COMPOSE_PROFILES" > "$ML/prof"'; rc=$?
 expect_eq "up with the marker and a failing void: mail and mailctl stopped, the stack starts without the mail profile, the marker kept" \
-  "$rc:$(grep -c '^dc --profile mail stop mail mailctl$' "$ML/argv"):$(cat "$ML/prof"):$(grep -c 'not voided yet' "$ML/out"):$([ -e "$ML/root/secrets/mail/void-pending" ] && echo kept)" "0:1::1:kept"
+  "$rc:$(grep -c '^dc --profile mail stop mail mailctl$' "$ML/argv"):$(cat "$ML/prof"):$(grep -c 'not voided yet' "$ML/out"):$([ -e "$ML/root/secrets/mail/gate/void-pending" ] && echo kept)" "0:1::1:kept"
 mt "$VP; $UP"'; : > "$(mail_void_marker)"; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; }; mail_up_steps up; printf "%s" "$COMPOSE_PROFILES" > "$ML/prof"'; rc=$?
 expect_eq "up with the marker: the void session first, then mail starts normally (profile kept), the marker gone" \
-  "$rc:$(grep -m1 '^session' "$ML/argv"):$(cat "$ML/prof"):$([ -e "$ML/root/secrets/mail/void-pending" ] && echo kept || echo gone)" "0:session mail_void_restore:mail:gone"
+  "$rc:$(grep -m1 '^session' "$ML/argv"):$(cat "$ML/prof"):$([ -e "$ML/root/secrets/mail/gate/void-pending" ] && echo kept || echo gone)" "0:session mail_void_restore:mail:gone"
 mt ': > "$(mail_void_marker)"; mail_after_up'; rc=$?
 expect_eq "mail_after_up never recreates mail while the marker exists" "$rc:$(cat "$ML/argv" 2>/dev/null | grep -c .)" "0:0"
 mt ': > "$(mail_void_marker)"; _mail_recovery_end'
@@ -5062,6 +5062,18 @@ mt 'rt_health() { echo healthy; }; rt_exec() { printf "%s" "$MSTAT"; }; _mail_ti
   mail_status_json > "$ML/sj"; mail_status_lines "$(cat "$ML/sj")" | sed "s/\x1b\[[0-9;]*m//g" > "$ML/sl"'
 expect_eq "status: the marker is a problem line" "$(jq -r .void_pending "$ML/sj"):$(grep -c '✗ mail passwords from a restore are not voided yet' "$ML/sl")" "true:1"
 
+# The start gate (security review): with the marker, no CLI start reaches
+# mail / mailctl except the recovery session; the container refuses too.
+mt ': > "$(mail_void_marker)"; runtime_build_all() { :; }; export COMPOSE_PROFILES=monitoring,mail; stack_compose_up; printf "%s" "$COMPOSE_PROFILES" > "$ML/prof"'
+expect_eq "marker + a generic up: the mail profile stripped (up runs without it)" "$(cat "$ML/prof"):$(grep -c '^up -d --no-build$' "$ML/argv")" "monitoring:1"
+for verb in "stack_compose_up mail" "_rtd_up_service mailctl" "_rtd_start mail" "_rtd_restart mail"; do
+  mt ': > "$(mail_void_marker)"; runtime_build_all() { :; }; '"$verb"; rc=$?
+  expect_eq "marker + $verb → refused before any compose call" "$rc:$(cat "$ML/argv" 2>/dev/null | grep -c .):$(grep -c 'not voided yet' "$ML/out")" "1:0:1"
+done
+mt ': > "$(mail_void_marker)"; export MAIL_RECOVERY_SESSION=1; _rtd_start mail'; rc=$?
+expect_eq "marker + the recovery session's flag → allowed" "$rc:$(grep -c '^start mail$' "$ML/argv")" "0:1"
+mt 'runtime_build_all() { :; }; stack_compose_up mail'; rc=$?
+expect_eq "no marker → mail starts as usual" "$rc:$(grep -c '^up -d --no-build mail$' "$ML/argv")" "0:1"
 # IPv6 for mail isn't supported yet: a set MAIL_IPV6 is refused.
 mt 'export MAIL_IPV6=on; mail_ipv6_refuse'; rc=$?
 expect_eq "MAIL_IPV6 set → refused (isn't supported yet)" "$rc:$(grep -c "MAIL_IPV6 isn't supported yet" "$ML/out")" "1:1"

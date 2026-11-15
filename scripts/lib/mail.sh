@@ -250,6 +250,8 @@ mail_recovery_session() {
   pw="$(openssl rand -base64 32 | tr -d '\n')"
   [ -n "$pw" ] || fail "could not generate the recovery password"
   dc stop mailctl >/dev/null 2>&1 || true
+  # The start gate's one exception (_mail_void_gate).
+  export MAIL_RECOVERY_SESSION=1
   (umask 077 && printf 'STALWART_RECOVERY_MODE=1\nSTALWART_RECOVERY_ADMIN=%s:%s\n' "$MAIL_RECOVERY_USER" "$pw" > "$f")
   trap '_mail_recovery_end' EXIT
   trap '_mail_recovery_end; exit 130' INT TERM
@@ -262,6 +264,7 @@ mail_recovery_session() {
   fi
   _mail_recovery_end
   trap - EXIT INT TERM
+  unset MAIL_RECOVERY_SESSION
   [ "$rc" = 0 ] || { pw=""; fail "the mail bootstrap failed (the recovery admin was removed; mail runs without it)"; }
   _mail_wait_healthy || { pw=""; fail "mail didn't become healthy after the recovery session: docker compose logs mail"; }
   _mail_verify_gone 3<<<"$pw" || { pw=""; fail "the recovery admin still works: stop mail and inspect"; }
@@ -273,7 +276,7 @@ mail_recovery_session() {
 # mail_void_marker — secrets/mail/void-pending (0600): written by restore
 # before the mail store comes back, removed only once its passwords are
 # voided. While it exists mail never starts normally (M7, security review).
-mail_void_marker() { printf '%s/void-pending' "$(_mail_dir)"; }
+mail_void_marker() { printf '%s/gate/void-pending' "$(_mail_dir)"; }
 mail_void_pending() { [ -e "$(mail_void_marker)" ]; }
 
 # mail_void_restore (fd 3: the password) — `mailctl void --reason restore`:

@@ -62,6 +62,12 @@ mail_rule() {  # <config json>
     and (binds("/secrets/mail/hub-secret$") == ["hub", "mailctl"])
     and (binds("/secrets/mail/dqs-key$") == ["mailctl"])
     and (binds("/secrets/mail/(metrics-secret|relay-password)$") == ["mail"])
+    and (binds("/secrets/mail/gate$") == ["mail"])
+    # The start gate: a non-recovery start refuses while the marker exists,
+    # then the image binary and its arguments.
+    and ($m.entrypoint | length) == 4 and $m.entrypoint[0:2] == ["/bin/sh", "-c"]
+    and ($m.entrypoint[2] | test("-e /run/portcullis/mail/gate/void-pending") and test("STALWART_RECOVERY_MODE") and test("exit 1") and test("exec /usr/local/bin/stalwart"))
+    and $m.command == ["--config", "/etc/stalwart/config.json"]
     and (binds("/secrets/mail/") == ["hub", "mail", "mailctl"])
     and (binds("/mail/unbound\\.conf$") == ["mail-resolver"])
     and ([.services[].volumes[]? | select(.type == "bind" and (.source | test("/secrets/mail/"))) | .read_only] | all)
@@ -125,7 +131,7 @@ echo "$CFG" | jq -e '[.services.mail.restart, .services.mailctl.restart, .servic
 echo "$CFG_SELINUX" | jq -e --arg p "$PWD/" '
     [.services | to_entries[] | .key as $s | .value.volumes[]? | select(.type == "bind" and (.source | test("/secrets/mail/|/mail/unbound\\.conf$")))
      | "\($s) \(.source | ltrimstr($p)) \(.bind.selinux // "-")"] | sort
-    == ["hub secrets/mail/hub-secret z", "mail secrets/mail/metrics-secret Z", "mail secrets/mail/relay-password Z",
+    == ["hub secrets/mail/hub-secret z", "mail secrets/mail/gate Z", "mail secrets/mail/metrics-secret Z", "mail secrets/mail/relay-password Z",
         "mail-resolver mail/unbound.conf Z", "mailctl secrets/mail/api-key Z", "mailctl secrets/mail/dqs-key Z", "mailctl secrets/mail/hub-secret z"]' >/dev/null \
   || { echo "FAIL: the SELinux overlay's mail binds (Z one reader, z the shared hub-secret)"; exit 1; }
 # The recovery admin reaches mail only through its optional env file

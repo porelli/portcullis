@@ -1007,7 +1007,7 @@ _backup_restore_docker() {
   # The mail store comes back with its old mail passwords: the marker first,
   # so no start path serves them before the void (M7).
   if [ -f "$dir/mail_data.tar.gz" ]; then
-    (umask 077 && mkdir -p "$(_mail_dir)" && : > "$(mail_void_marker)") || fail "could not write $(mail_void_marker)"
+    (umask 077 && mkdir -p "$(_mail_dir)/gate" && : > "$(mail_void_marker)") || fail "could not write $(mail_void_marker)"
     chmod 600 "$(mail_void_marker)"
   fi
   for spec in $BACKUP_FILE_VOLUMES $BACKUP_MAIL_STOPPED_VOLUMES; do

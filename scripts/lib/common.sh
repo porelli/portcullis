@@ -263,6 +263,7 @@ rt_up() { if _rt_is_kube; then _rtk_up "$@"; else stack_compose_up "$@"; fi; }
 # dependencies).
 rt_up_service() { if _rt_is_kube; then _rtk_up_service "$@"; else _rtd_up_service "$@"; fi; }
 _rtd_up_service() {
+  _mail_void_gate "$@"
   local deps=--no-deps
   [ "$1" != --deps ] || { deps=""; shift; }
   # shellcheck disable=SC2046,SC2086  # nothing or --no-build; nothing or --no-deps
@@ -341,11 +342,11 @@ _rtd_running() { [ -n "$(dc ps -q --status running "$1" 2>/dev/null)" ]; }
 
 # rt_restart <service>... / rt_stop <service>... / rt_start <service>...
 rt_restart() { if _rt_is_kube; then _rtk_restart "$@"; else _rtd_restart "$@"; fi; }
-_rtd_restart() { dc restart "$@"; }
+_rtd_restart() { _mail_void_gate "$@"; dc restart "$@"; }
 rt_stop() { if _rt_is_kube; then _rtk_stop "$@"; else _rtd_stop "$@"; fi; }
 _rtd_stop() { dc stop "$@"; }
 rt_start() { if _rt_is_kube; then _rtk_start "$@"; else _rtd_start "$@"; fi; }
-_rtd_start() { dc start "$@"; }
+_rtd_start() { _mail_void_gate "$@"; dc start "$@"; }
 
 # rt_kill <service> <signal> — send a signal to the service's main process.
 rt_kill() { if _rt_is_kube; then _rtk_kill "$1" "$2"; else _rtd_kill "$1" "$2"; fi; }
@@ -710,7 +711,28 @@ secrets_fix_perms() {
   [ ! -d "$s/mail" ] || chmod 700 "$s/mail"
   ct_group_read "$CT_UID_MAILCTL" "$s/mail/api-key" "$s/mail/dqs-key"
   ct_group_read "$CT_UID_HUB" "$s/mail/hub-secret"
-  ct_group_read "$CT_UID_MAIL" "$s/mail/metrics-secret" "$s/mail/relay-password"
+  ct_group_read "$CT_UID_MAIL" "$s/mail/metrics-secret" "$s/mail/relay-password" "$s/mail/gate"
+}
+
+# _mail_void_gate [svc…] — every start primitive's first step (security
+# review): while a restore's mail passwords aren't voided
+# (secrets/mail/gate/void-pending), mail and mailctl never start through
+# the CLI — the mail profile is stripped from COMPOSE_PROFILES and an
+# explicit mail / mailctl service is refused — except inside the recovery
+# session (MAIL_RECOVERY_SESSION=1). The container's entrypoint refuses too.
+_mail_void_gate() {
+  local s p out=""
+  [ -e "$PORTCULLIS_ROOT/secrets/mail/gate/void-pending" ] || return 0
+  [ "${MAIL_RECOVERY_SESSION:-}" != 1 ] || return 0
+  for s in "$@"; do
+    case "$s" in
+      mail|mailctl) fail "mail passwords from a restore are not voided yet: ./portcullis mail enable voids them first" ;;
+    esac
+  done
+  IFS=, read -ra p <<< "${COMPOSE_PROFILES:-}"
+  for s in "${p[@]}"; do [ "$s" = mail ] || out="${out:+$out,}$s"; done
+  COMPOSE_PROFILES="$out"
+  export COMPOSE_PROFILES
 }
 
 # Core variables the Hub may copy into app .env files (templates reference
@@ -856,6 +878,8 @@ mail_prepare() {
   local d="$PORTCULLIS_ROOT/secrets/mail" f
   (umask 077 && mkdir -p "$d")
   chmod 700 "$d"
+  # gate/: only the restore's void-pending marker (mail binds the dir).
+  (umask 077 && mkdir -p "$d/gate")
   for f in api-key hub-secret metrics-secret relay-password dqs-key; do
     [ ! -d "$d/$f" ] || fail "$d/$f is a directory (made by Docker): remove it (rmdir) and run again"
     [ -f "$d/$f" ] || (umask 077 && : > "$d/$f")

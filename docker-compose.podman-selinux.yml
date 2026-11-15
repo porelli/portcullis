@@ -144,6 +144,7 @@ services:
     volumes:
       - {type: bind, source: ./secrets/mail/metrics-secret, target: /run/portcullis/mail/metrics-secret, read_only: true, bind: {selinux: Z}}
       - {type: bind, source: ./secrets/mail/relay-password, target: /run/portcullis/mail/relay-password, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/mail/gate, target: /run/portcullis/mail/gate, read_only: true, bind: {selinux: Z}}
 
   mailctl:
     volumes:
