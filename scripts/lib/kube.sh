@@ -19,7 +19,7 @@
 # Overridable for tests: KUBE_LOCAL_ADDRS (the node's local IPv4 addresses,
 # space-separated), KUBE_PROBE_DIR, KUBE_TCP_PROBE (a function name).
 
-KUBE_MIN_VERSION="1.32"
+KUBE_MIN_VERSION="1.33"
 KUBE_STORAGE_NS="portcullis-storage"
 # Traefik's only watched namespace (the chart's edgeNamespace): the core
 # IngressRoutes and Middlewares, hub-proxy-secret, never a Secret.
@@ -218,7 +218,7 @@ kube_host_checks() {
   if _ver_ge "${ver#v}" "$KUBE_MIN_VERSION"; then
     _rt_chk ok "Kubernetes $ver (>= $KUBE_MIN_VERSION)"
   else
-    _rt_chk fail "Kubernetes $ver: Portcullis needs >= $KUBE_MIN_VERSION (ValidatingAdmissionPolicy GA)"
+    _rt_chk fail "Kubernetes $ver: Portcullis needs >= $KUBE_MIN_VERSION (supplementalGroupsPolicy Strict for host-folder pods)"
   fi
   case "$ver" in *+k3s*) _rt_chk ok "k3s" ;; *) _rt_chk warn "not k3s ($ver): should work, not CI-tested" ;; esac
   nodes="$(kube_ctl get nodes -o json 2>/dev/null || true)"

@@ -7,7 +7,7 @@
 # generation (<name>-<generation> on portcullis-admission-params-<generation>
 # in the core namespace, create-before-delete; scripts/lib/kube.sh
 # kube_admission_params_apply). Core is this file's only editor (tested on
-# k3s 1.32 and 1.37: .github/ci/e2e-k3s-*.sh); the Hub keeps a byte copy in
+# k3s 1.33 and 1.37: .github/ci/e2e-k3s-*.sh); the Hub keeps a byte copy in
 # internal/runtime/kube/testdata/admission/ (envtest vectors), compared in
 # core CI (K13).
 apiVersion: admissionregistration.k8s.io/v1
@@ -285,12 +285,15 @@ spec:
       a pod with a hostPath volume: every container (init and ephemeral included) needs runAsNonRoot or a runAsUser
       above 0, and allowPrivilegeEscalation false
   # ... and never group 0 (files it creates in host folders would be root's
-  # group): every container's effective runAsGroup explicit and above 0, no
-  # pod runAsGroup, fsGroup or supplemental group 0.
+  # group): supplementalGroupsPolicy Strict (the kubelet adds no group from
+  # the image's /etc/group, which could hold 0; Kubernetes >= 1.33), every
+  # container's effective runAsGroup explicit and above 0, no pod
+  # runAsGroup, fsGroup or supplemental group 0.
   - expression: |-
       variables.cli || (
         variables.helper != '' || !variables.volumes.exists(v, has(v.hostPath))
-        || (!(has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsGroup) && variables.spec.securityContext.runAsGroup == 0)
+        || (has(variables.spec.securityContext) && has(variables.spec.securityContext.supplementalGroupsPolicy) && variables.spec.securityContext.supplementalGroupsPolicy == 'Strict'
+            && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsGroup) && variables.spec.securityContext.runAsGroup == 0)
             && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.fsGroup) && variables.spec.securityContext.fsGroup == 0)
             && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.supplementalGroups) && 0 in variables.spec.securityContext.supplementalGroups)
             && variables.containers.all(c,
@@ -299,8 +302,8 @@ spec:
                    : (has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsGroup) && variables.spec.securityContext.runAsGroup > 0)))
       )
     message: >-
-      a pod with a hostPath volume: every container (init and ephemeral included) needs an explicit runAsGroup above 0,
-      and no runAsGroup, fsGroup or supplemental group 0
+      a pod with a hostPath volume needs supplementalGroupsPolicy Strict, every container (init and ephemeral included)
+      an explicit runAsGroup above 0, and no runAsGroup, fsGroup or supplemental group 0
   # Compose names (ruling): the Hub's hostname / subdomain / search domain only.
   - expression: |-
       variables.cli || (
@@ -389,6 +392,7 @@ spec:
       operations:
       - CREATE
       - UPDATE
+      - DELETE
       resources:
       - persistentvolumeclaims
   variables:
@@ -663,12 +667,15 @@ spec:
       a pod with a hostPath volume: every container (init and ephemeral included) needs runAsNonRoot or a runAsUser
       above 0, and allowPrivilegeEscalation false
   # ... and never group 0 (files it creates in host folders would be root's
-  # group): every container's effective runAsGroup explicit and above 0, no
-  # pod runAsGroup, fsGroup or supplemental group 0.
+  # group): supplementalGroupsPolicy Strict (the kubelet adds no group from
+  # the image's /etc/group, which could hold 0; Kubernetes >= 1.33), every
+  # container's effective runAsGroup explicit and above 0, no pod
+  # runAsGroup, fsGroup or supplemental group 0.
   - expression: |-
       variables.skipObj || (object.kind in ['Secret', 'PersistentVolumeClaim'] ||
         variables.helper != '' || !variables.volumes.exists(v, has(v.hostPath))
-        || (!(has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsGroup) && variables.spec.securityContext.runAsGroup == 0)
+        || (has(variables.spec.securityContext) && has(variables.spec.securityContext.supplementalGroupsPolicy) && variables.spec.securityContext.supplementalGroupsPolicy == 'Strict'
+            && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsGroup) && variables.spec.securityContext.runAsGroup == 0)
             && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.fsGroup) && variables.spec.securityContext.fsGroup == 0)
             && !(has(variables.spec.securityContext) && has(variables.spec.securityContext.supplementalGroups) && 0 in variables.spec.securityContext.supplementalGroups)
             && variables.containers.all(c,
@@ -677,8 +684,8 @@ spec:
                    : (has(variables.spec.securityContext) && has(variables.spec.securityContext.runAsGroup) && variables.spec.securityContext.runAsGroup > 0)))
       )
     message: >-
-      a pod with a hostPath volume: every container (init and ephemeral included) needs an explicit runAsGroup above 0,
-      and no runAsGroup, fsGroup or supplemental group 0
+      a pod with a hostPath volume needs supplementalGroupsPolicy Strict, every container (init and ephemeral included)
+      an explicit runAsGroup above 0, and no runAsGroup, fsGroup or supplemental group 0
   # Compose names (ruling): the Hub's hostname / subdomain / search domain only.
   - expression: |-
       variables.skipObj || (
@@ -737,6 +744,20 @@ spec:
           && object.metadata.labels['portcullis.io/instance'] == oldObject.metadata.labels['portcullis.io/instance']))
       )
     message: "only the Hub's own Secrets (portcullis.io/owner=hub, an instance label) may be changed or deleted; owner and instance can't change"
+  # The same for claims, whose old name must also be the old instance's own
+  # (<instance>--…).
+  - expression: |-
+      variables.cli || request.operation == 'CREATE' || request.kind.kind != 'PersistentVolumeClaim' || (
+        (has(oldObject.metadata.labels) && 'portcullis.io/owner' in oldObject.metadata.labels
+          && oldObject.metadata.labels['portcullis.io/owner'] == 'hub' && 'portcullis.io/instance' in oldObject.metadata.labels
+          && oldObject.metadata.labels['portcullis.io/instance'] != ''
+          && oldObject.metadata.name.startsWith(oldObject.metadata.labels['portcullis.io/instance'] + '--'))
+        && (request.operation == 'DELETE' || (has(object.metadata.labels)
+          && 'portcullis.io/owner' in object.metadata.labels && object.metadata.labels['portcullis.io/owner'] == 'hub'
+          && 'portcullis.io/instance' in object.metadata.labels
+          && object.metadata.labels['portcullis.io/instance'] == oldObject.metadata.labels['portcullis.io/instance']))
+      )
+    message: "only the Hub's own claims (portcullis.io/owner=hub, an instance label, named <instance>--…) may be changed or deleted; owner and instance can't change"
   # The Hub's claims: the apps StorageClass (never core's Retain one or
   # another provisioner), no pre-bound volume or data source, named
   # <instance>--… after its own instance label, a plain 3-digit mode

@@ -29,6 +29,7 @@ tag's version as its release notes.
 
 ### Changed
 
+- **Kubernetes floor 1.32 → 1.33** (`KUBE_MIN_VERSION`, the chart's `kubeVersion`, e2e-k3s `K3S_LINE=1.33` = k3s v1.33.13+k3s2): pods with a hostPath volume must set `supplementalGroupsPolicy: Strict` (beta, on by default from 1.33), so the kubelet adds no group from the image's `/etc/group`.
 - **Postgres `start_period` 60 s → 300 s** (`docker-compose.yml`, held equal to the chart's startup probe by `tests/k8s_parity.py`): on Kubernetes the window is the startup probe's, and a kill during initdb or WAL recovery leaves a cluster that never starts. On Docker and Podman a healthy Postgres still turns healthy as soon as `pg_isready` answers, but a broken one now stays `starting` for up to five minutes before it is reported unhealthy.
 - **Core no longer carries Headscale / Headplane**: `headscale/config.yaml`, their services and volume in `docker-compose.apps.yml`, their optional Keycloak clients in `./portcullis oidc register` and the `headscale-config.yaml` copy in backups are gone (the headscale marketplace template owns them; NetBird's optional client stays).
 

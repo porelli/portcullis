@@ -15,7 +15,7 @@ KUBECONFORM_VERSION=v0.8.0
 KUBECONFORM_SHA256=9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
 # yannh/kubernetes-json-schema at a fixed commit, the API floor's schemas.
 K8S_SCHEMA_COMMIT=2bfaff3898a7a4fa4e4760da3d2656211c9b4c71
-K8S_VERSION=1.32.0
+K8S_VERSION=1.33.0
 
 TOOLS="${RUNNER_TEMP:-/tmp}/k8s-tools"
 mkdir -p "$TOOLS"

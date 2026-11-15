@@ -4264,9 +4264,9 @@ case "$OUT" in *"fail	dual-stack or IPv6 cluster"*) t_pass "kube_host_checks: an
 OUT="$(kt 'runtime_check')"
 case "$OUT" in *"dual-stack or IPv6 cluster"*"rc=1") t_pass "runtime_check: an IPv6 pod CIDR → refused" ;; *) t_fail "kube ipv6 runtime_check: $OUT" ;; esac
 k_fixtures
-echo '{"serverVersion":{"gitVersion":"v1.31.9+k3s1"}}' > "$KS/kube/version.json"
+echo '{"serverVersion":{"gitVersion":"v1.32.13+k3s1"}}' > "$KS/kube/version.json"
 OUT="$(kt 'kube_host_checks')"
-case "$OUT" in *"fail	Kubernetes v1.31.9+k3s1: Portcullis needs >= 1.32"*) t_pass "kube_host_checks: server v1.31 → refused" ;; *) t_fail "kube v1.31: $OUT" ;; esac
+case "$OUT" in *"fail	Kubernetes v1.32.13+k3s1: Portcullis needs >= 1.33"*) t_pass "kube_host_checks: server v1.32 → refused (the floor is 1.33)" ;; *) t_fail "kube v1.31: $OUT" ;; esac
 k_fixtures
 echo '{"kubeletconfig":{"podPidsLimit":-1}}' > "$KS/kube/configz.json"
 sed -i.bak 's/\\"--secrets-encryption\\",//' "$KS/kube/nodes.json"

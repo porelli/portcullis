@@ -30,19 +30,19 @@ case "$(uname -m)" in
     HELM_SHA256=8cf8f66ecbc252ac8f7f06cca68aba88508ddfde3a6a34feb1678ad1694b4f88 ;;
   *) echo "FAIL: no pinned k3s / kubectl / helm for $(uname -m)"; exit 1 ;;
 esac
-# K3S_LINE=1.32: the oldest supported minor (CEL without flatten() etc.),
-# for a run by hand; CI runs the default, 1.37.
+# K3S_LINE=1.33: the oldest supported minor (the floor: supplementalGroupsPolicy
+# Strict, CEL without flatten() etc.); CI runs the default, 1.37.
 case "${K3S_LINE:-1.37}" in
   1.37) ;;
-  1.32)
-    K3S_VERSION="v1.32.13+k3s1" KUBECTL_VERSION="v1.32.13"
+  1.33)
+    K3S_VERSION="v1.33.13+k3s2" KUBECTL_VERSION="v1.33.13"
     case "$ARCH" in
-      amd64) K3S_SHA256=4aaf9825a92dc885856baab578f18e1881e8d381d42578bcbdabd5d7b7285865
-             KUBECTL_SHA256=db2ae479a63f3665d7f704ab18c0d4d4050144237980763221835b7305703c4c ;;
-      arm64) K3S_SHA256=66b5f9991fe6973169b3eb6e2200022474bb7242d702ada825fa467991717d3a
-             KUBECTL_SHA256=b1f87f196633a89208546d79bfa4e2470bda70e7bf42c4d3adb008ec208da9d1 ;;
+      amd64) K3S_SHA256=1572f0f23bd5a844bd405b71875877aacacc7ab79e279d3d73735654c37c7735
+             KUBECTL_SHA256=316d712726d857c20744c57cb36aa47cfc79bc0af7e82cebf3780244b654c073 ;;
+      arm64) K3S_SHA256=cf6afb3944f9ecf120fa2837b542479018c08f9ea1d1d181d4a68445e7717a8d
+             KUBECTL_SHA256=9fe8aadd5aab9421978c7ac95de6fad304a3c4c0ce9dbf4127579779e0699080 ;;
     esac ;;
-  *) echo "FAIL: K3S_LINE is 1.37 (default) or 1.32"; exit 2 ;;
+  *) echo "FAIL: K3S_LINE is 1.37 (default) or 1.33"; exit 2 ;;
 esac
 
 netns=false
