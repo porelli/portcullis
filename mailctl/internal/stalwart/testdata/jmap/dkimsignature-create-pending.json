@@ -1,0 +1,59 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:DkimSignature/set",
+        {
+          "create": {
+            "e": {
+              "@type": "Dkim1Ed25519Sha256",
+              "domainId": "b",
+              "selector": "v1-ed25519-20261115",
+              "stage": "pending",
+              "privateKey": {
+                "@type": "Text",
+                "secret": "-----BEGIN PRIVATE KEY-----\n<redacted>\n-----END PRIVATE KEY-----\n"
+              }
+            },
+            "r": {
+              "@type": "Dkim1RsaSha256",
+              "domainId": "b",
+              "selector": "v1-rsa-20261115",
+              "stage": "pending",
+              "privateKey": {
+                "@type": "Text",
+                "secret": "-----BEGIN PRIVATE KEY-----\n<redacted>\n-----END PRIVATE KEY-----\n"
+              }
+            }
+          }
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:DkimSignature/set",
+        {
+          "accountId": "b",
+          "created": {
+            "r": {
+              "id": "jout7jdgaeaa"
+            },
+            "e": {
+              "id": "jout7jdgadqa"
+            }
+          }
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "fc380151"
+  }
+}

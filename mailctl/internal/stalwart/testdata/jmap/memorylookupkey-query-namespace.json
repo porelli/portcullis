@@ -1,0 +1,72 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:MemoryLookupKey/query",
+        {
+          "filter": {
+            "namespace": "list-posters"
+          }
+        },
+        "0"
+      ],
+      [
+        "x:MemoryLookupKey/get",
+        {
+          "#ids": {
+            "resultOf": "0",
+            "name": "x:MemoryLookupKey/query",
+            "path": "/ids"
+          }
+        },
+        "1"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:MemoryLookupKey/query",
+        {
+          "accountId": "b",
+          "queryState": "n",
+          "canCalculateChanges": true,
+          "position": 0,
+          "ids": [
+            "joutvrluadaa",
+            "joutqeykabaa"
+          ]
+        },
+        "0"
+      ],
+      [
+        "x:MemoryLookupKey/get",
+        {
+          "accountId": "b",
+          "list": [
+            {
+              "namespace": "list-posters",
+              "key": "team@spike.test|bob",
+              "isGlobPattern": false,
+              "id": "joutvrluadaa"
+            },
+            {
+              "namespace": "list-posters",
+              "key": "team@spike.test|alice@spike.test",
+              "isGlobPattern": false,
+              "id": "joutqeykabaa"
+            }
+          ],
+          "notFound": []
+        },
+        "1"
+      ]
+    ],
+    "sessionState": "acafeef1"
+  }
+}

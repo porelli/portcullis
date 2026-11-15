@@ -1,0 +1,37 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:SpamSettings/set",
+        {
+          "update": {
+            "singleton": {
+              "spamFilterRulesUrl": "http://192.168.231.3:8082/spam-filter-rules.json.gz"
+            }
+          }
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:SpamSettings/set",
+        {
+          "accountId": "f",
+          "updated": {
+            "singleton": null
+          }
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "fc380151"
+  }
+}

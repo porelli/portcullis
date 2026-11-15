@@ -1,0 +1,65 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:MemoryLookupKey/set",
+        {
+          "create": {
+            "m1": {
+              "namespace": "list-members-only",
+              "key": "team@spike.test",
+              "isGlobPattern": false
+            },
+            "p1": {
+              "namespace": "list-posters",
+              "key": "team@spike.test|bob@spike.test",
+              "isGlobPattern": false
+            },
+            "p2": {
+              "namespace": "list-posters",
+              "key": "team@spike.test|alice@spike.test",
+              "isGlobPattern": false
+            },
+            "p3": {
+              "namespace": "list-posters",
+              "key": "team@spike.test|bob",
+              "isGlobPattern": false
+            }
+          }
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:MemoryLookupKey/set",
+        {
+          "accountId": "b",
+          "created": {
+            "p1": {
+              "id": "joutqeykaaqa"
+            },
+            "p3": {
+              "id": "joutqeykabqa"
+            },
+            "m1": {
+              "id": "joutqeykaaaa"
+            },
+            "p2": {
+              "id": "joutqeykabaa"
+            }
+          }
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "fc380151"
+  }
+}

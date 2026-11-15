@@ -1,0 +1,37 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:Asn/set",
+        {
+          "update": {
+            "singleton": {
+              "@type": "Disabled"
+            }
+          }
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:Asn/set",
+        {
+          "accountId": "f",
+          "updated": {
+            "singleton": null
+          }
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "c5dc3d1b"
+  }
+}

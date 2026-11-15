@@ -1,0 +1,118 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:DmarcExternalReport/query",
+        {},
+        "0"
+      ],
+      [
+        "x:DmarcExternalReport/get",
+        {
+          "#ids": {
+            "resultOf": "0",
+            "name": "x:DmarcExternalReport/query",
+            "path": "/ids"
+          }
+        },
+        "1"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:DmarcExternalReport/query",
+        {
+          "accountId": "b",
+          "queryState": "n",
+          "canCalculateChanges": true,
+          "position": 0,
+          "ids": [
+            "jouvhxmsaaqa"
+          ]
+        },
+        "0"
+      ],
+      [
+        "x:DmarcExternalReport/get",
+        {
+          "accountId": "b",
+          "list": [
+            {
+              "report": {
+                "version": 0.0,
+                "orgName": "remote.example",
+                "email": "noreply-dmarc@remote.example",
+                "extraContactInfo": null,
+                "reportId": "spike-1794761695",
+                "dateRangeStart": "2026-11-14T23:46:40Z",
+                "dateRangeEnd": "2026-11-15T23:46:39Z",
+                "errors": {},
+                "policyDomain": "spike.test",
+                "policyVersion": null,
+                "policyAdkim": "strict",
+                "policyAspf": "strict",
+                "policyDisposition": "none",
+                "policySubdomainDisposition": "none",
+                "policyTestingMode": false,
+                "policyFailureReportingOptions": {},
+                "records": {
+                  "0": {
+                    "sourceIp": "192.0.2.10",
+                    "count": 2,
+                    "evaluatedDisposition": "none",
+                    "evaluatedDkim": "pass",
+                    "evaluatedSpf": "fail",
+                    "policyOverrideReasons": {},
+                    "envelopeTo": null,
+                    "envelopeFrom": "",
+                    "headerFrom": "spike.test",
+                    "dkimResults": {
+                      "0": {
+                        "domain": "spike.test",
+                        "selector": "v1-ed25519-20261115",
+                        "result": "pass",
+                        "humanResult": null
+                      }
+                    },
+                    "spfResults": {
+                      "0": {
+                        "domain": "spike.test",
+                        "scope": "unspecified",
+                        "result": "fail",
+                        "humanResult": null
+                      }
+                    },
+                    "extensions": {}
+                  }
+                },
+                "extensions": {},
+                "generator": null,
+                "policyNp": "unspecified",
+                "policyDiscoveryMethod": "unspecified"
+              },
+              "from": "noreply-dmarc@remote.example",
+              "subject": "Report Domain: spike.test Submitter: remote.example Report-ID: spike",
+              "to": {
+                "dmarc-reports@spike.test": true
+              },
+              "receivedAt": "2026-11-15T16:54:56Z",
+              "expiresAt": "2026-12-15T16:54:56Z",
+              "memberTenantId": null,
+              "id": "jouvhxmsaaqa"
+            }
+          ],
+          "notFound": []
+        },
+        "1"
+      ]
+    ],
+    "sessionState": "acafeef1"
+  }
+}

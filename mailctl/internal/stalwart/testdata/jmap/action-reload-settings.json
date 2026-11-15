@@ -1,0 +1,42 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:Action/set",
+        {
+          "create": {
+            "a": {
+              "@type": "ReloadSettings"
+            }
+          }
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:Action/set",
+        {
+          "accountId": "b",
+          "created": {
+            "a": {
+              "warnings": {
+                "DnsResolver: The configured DNS resolver cannot validate DNSSEC. DANE has been disabled to avoid deferring mail. Ensure the resolver is DNSSEC-capable and reachable over TCP.": true
+              },
+              "id": "bvptyac"
+            }
+          }
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "fc380151"
+  }
+}

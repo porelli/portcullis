@@ -1,0 +1,62 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:Account/set",
+        {
+          "update": {
+            "c": {
+              "name": "x",
+              "domainId": "c",
+              "aliases": {}
+            }
+          }
+        },
+        "0"
+      ],
+      [
+        "x:Action/set",
+        {
+          "create": {
+            "a": {
+              "@type": "InvalidateCaches"
+            }
+          }
+        },
+        "1"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:Account/set",
+        {
+          "accountId": "b",
+          "updated": {
+            "c": null
+          }
+        },
+        "0"
+      ],
+      [
+        "x:Action/set",
+        {
+          "accountId": "b",
+          "created": {
+            "a": {
+              "id": "bvptyad"
+            }
+          }
+        },
+        "1"
+      ]
+    ],
+    "sessionState": "fc380151"
+  }
+}

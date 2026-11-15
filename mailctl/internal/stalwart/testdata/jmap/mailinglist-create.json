@@ -1,0 +1,45 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:MailingList/set",
+        {
+          "create": {
+            "l": {
+              "name": "team",
+              "domainId": "b",
+              "description": "team list",
+              "recipients": {
+                "alice@spike.test": true,
+                "bob@spike.test": true
+              }
+            }
+          }
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:MailingList/set",
+        {
+          "accountId": "b",
+          "created": {
+            "l": {
+              "id": "b"
+            }
+          }
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "fc380151"
+  }
+}
