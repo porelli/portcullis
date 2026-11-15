@@ -152,7 +152,9 @@ func serve(env func(string) string, stderr io.Writer) error {
 		return err
 	}
 	runner := reconcile.NewRunner(sw, st, cfg.FormerRetain, cfg.LANOnly, logger.Printf)
-	v1 := &api.V1{Store: st, C: sw, Runner: runner, LANOnly: cfg.LANOnly, Logf: logger.Printf}
+	rewritten := cfg.ClientIP == config.ClientIPRewritten
+	runner.Rewritten = rewritten
+	v1 := &api.V1{Store: st, C: sw, Runner: runner, LANOnly: cfg.LANOnly, Rewritten: rewritten, Logf: logger.Printf}
 	apiSrv := &api.Server{Subnet: cfg.APISubnet, SecretFile: cfg.HubSecretFile, Logf: logger.Printf, Handler: v1.Handler()}
 	servers := []*http.Server{
 		newServer(cfg.APIAddr, apiSrv),
@@ -394,8 +396,13 @@ func exportCmd(args []string, env func(string) string, stdout, stderr io.Writer)
 	}
 	logx.AddSecret(key)
 	u, _ := url.Parse(cfg.StalwartURL)
+	st, err := state.Open(cfg.DataDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl export: %v\n", err)
+		return 1
+	}
 	e := &export.Exporter{C: stalwart.New(cfg.StalwartURL, stalwart.Bearer(key)), IMAPAddr: net.JoinHostPort(u.Hostname(), "10993"),
-		ServerName: cfg.Hostname, MailctlIP: cfg.MailIP}
+		ServerName: cfg.Hostname, MailctlIP: cfg.MailIP, SPKI: state.SPKIs(st.Get())}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 	n, err := e.Export(ctx, args[1], stdout)

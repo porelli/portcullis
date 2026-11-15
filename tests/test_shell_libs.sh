@@ -192,6 +192,17 @@ expect_ok   "hub env: HUB_SHARED_ENV" grep -qx 'MY_APP_VAR=shared' "$HE"
 expect_ok   "hub env: mcp-gate IP (compose default, G42)" grep -qx 'PORTCULLIS_MCP_GATE_IP=172.31.250.3' "$HE"
 expect_fail "hub env: never a core secret" grep -Eq 'pg-secret|hub-secret|kc-secret' "$HE"
 expect_fail "hub env: never an optional secret (MAIL_RELAY_PASSWORD), even through HUB_SHARED_ENV" grep -q 'relay-secret' "$HE"
+expect_eq "hub env: mail off without the profile, the derived mail keys" \
+  "$(grep -E '^PORTCULLIS_MAIL' "$HE" | tr '\n' ' ')" \
+  "PORTCULLIS_MAIL=off PORTCULLIS_MAIL_HOSTNAME=mail.hub.test PORTCULLIS_MAIL_SUBMISSION_LAN_ONLY=false PORTCULLIS_MAIL_RELAY=off PORTCULLIS_MAIL_FORMER_RETENTION=720h PORTCULLIS_MAIL_DQS=off PORTCULLIS_MAILCTL_API_IP=172.31.255.19 "
+mkdir -p "$HR/secrets/mail"; printf 'API_k' > "$HR/secrets/mail/api-key"
+( PORTCULLIS_ROOT="$HR"; export COMPOSE_PROFILES=mail MAIL_HOSTNAME=mx.hub.test MAIL_SUBMISSION_LAN_ONLY=true MAIL_RELAY_HOST=smtp.relay.test MAIL_FORMER_RETENTION=240h MAIL_SPAMHAUS_DQS_KEY=dqs-secret-value
+  unset PORTCULLIS_DOMAIN; env_load; hub_env_write 2>/dev/null )
+expect_eq "hub env: mail on (profile + API key), hostname, LAN-only, relay / DQS only on|off, the retention" \
+  "$(grep -E '^PORTCULLIS_MAIL' "$HE" | tr '\n' ' ')" \
+  "PORTCULLIS_MAIL=on PORTCULLIS_MAIL_HOSTNAME=mx.hub.test PORTCULLIS_MAIL_SUBMISSION_LAN_ONLY=true PORTCULLIS_MAIL_RELAY=on PORTCULLIS_MAIL_FORMER_RETENTION=240h PORTCULLIS_MAIL_DQS=on PORTCULLIS_MAILCTL_API_IP=172.31.255.19 "
+expect_fail "hub env: never the DQS key or the relay host" grep -qE 'dqs-secret-value|smtp\.relay\.test' "$HE"
+rm -rf "$HR/secrets/mail"; hub_env_run
 INODE_BEFORE="$(file_inode "$HE")"
 hub_env_run
 expect_eq "hub env: rewritten in place" "$(file_inode "$HE")" "$INODE_BEFORE"
@@ -4919,6 +4930,8 @@ expect_eq "mail_up_steps refuses without mail_etc/config.json" "$rc:$(grep -c 'r
 mt 'mail_port_start_ok() { :; }; mail_config_present() { :; }; mail_tls_present() { :; }; mail_recovery_session() { echo "session $*" >> "$ML/argv"; }; printf API_k > "$PORTCULLIS_ROOT/secrets/mail/api-key"; mail_up_steps up; mail_up_steps upgrade'
 expect_eq "mail_up_steps: up skips the bootstrap with a key, upgrade always re-runs it; MAILCTL_CLIENT_IP written" \
   "$(grep -c '^session mail_bootstrap_apply$' "$ML/argv"):$(grep -c '^MAILCTL_CLIENT_IP=preserved$' "$ML/root/.env")" "1:1"
+mt 'export CONTAINER_RUNTIME=podman MAIL_SUBMISSION_LAN_ONLY=true; mail_port_start_ok() { :; }; mail_config_present() { :; }; mail_up_steps up'; rc=$?
+expect_eq "mail_up_steps (up / upgrade) refuses LAN-only under rootless Podman" "$rc:$(grep -c 'LAN-only needs the real client address; rootless Podman rewrites it' "$ML/out")" "1:1"
 # The timer: docker = system units (User=, docker.service), podman = user units.
 mt 'mail_schedule_systemd "$PORTCULLIS_ROOT/units"'
 U="$ML/root/units"

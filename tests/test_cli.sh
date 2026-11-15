@@ -246,6 +246,16 @@ for c in "mail enable --yes" "mail disable --yes" "mail cert" "mail rotate" "mai
   expect_eq "$c on kubernetes → exit 1 with the text" "$RC:$(grep -c "mail isn't available on Kubernetes yet (Docker or rootless Podman only)" "$WORK/err")" "1:1"
 done
 expect_eq "mail on kubernetes: no engine call" "$(cat "$WORK/mail-calls")" ""
+echo 25 > "$WORK/port-start25"
+for args in "mail enable --yes --lan-only true" "mail enable --yes"; do
+  printf 'PORTCULLIS_DOMAIN=mail.example\nCONTAINER_RUNTIME=podman\nDNS_PROVIDER=cloudflare\nMAIL_SUBMISSION_LAN_ONLY=true\n' > "$MR/.env"
+  RC=0
+  # shellcheck disable=SC2086
+  PATH="$WORK/noengine:$PATH" STUB_CALLS_NOENGINE="$WORK/mail-calls" RT_PROC_PORT_START="$WORK/port-start25" PORTCULLIS_ROOT="$MR" \
+    "$CLI" $args >/dev/null 2>"$WORK/err" </dev/null || RC=$?
+  expect_eq "$args on rootless Podman with LAN-only → refused (the client address is rewritten)" \
+    "$RC:$(grep -c "LAN-only needs the real client address; rootless Podman rewrites it" "$WORK/err")" "1:1"
+done
 printf 'PORTCULLIS_DOMAIN=mail.example\nCONTAINER_RUNTIME=podman\nDNS_PROVIDER=cloudflare\n' > "$MR/.env"
 echo 80 > "$WORK/port-start"
 RC=0; PATH="$WORK/noengine:$PATH" STUB_CALLS_NOENGINE="$WORK/mail-calls" RT_PROC_PORT_START="$WORK/port-start" PORTCULLIS_ROOT="$MR" \
@@ -355,7 +365,7 @@ expect_eq "lint_ci_size.sh passes 450,000 bytes and fails 450,001" \
 expect_eq "CI's same-named branch lookups: no v* tag glob, no ls-remote pattern lookup" \
   "$(grep -rnE '"\$REF" *(==|!=) *v\*|ls-remote --exit-code' "$HERE/../.github" | wc -l | tr -d ' ')" 0
 expect_eq "CI's same-named branch lookups: every one lists the heads once and fails loudly" \
-  "$(grep -cF 'heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }' "$HERE/../.github/workflows/ci.yml" "$HERE/../.github/actions/hub-image/action.yml" "$HERE/../.github/actions/keycloak-image/action.yml" | awk -F: '{ s += $2 } END { print s }')" 11
+  "$(grep -cF 'heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }' "$HERE/../.github/workflows/ci.yml" "$HERE/../.github/actions/hub-image/action.yml" "$HERE/../.github/actions/keycloak-image/action.yml" | awk -F: '{ s += $2 } END { print s }')" 12
 # Client forwarded / address headers Traefik doesn't manage are deleted on
 # every websecure and vpnsecure router (entrypoint http.middlewares).
 expect_eq "strip-client-forwarded@file deletes Forwarded, X-Real-Ip's look-alikes and every unmanaged X-Forwarded-*" \

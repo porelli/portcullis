@@ -3,9 +3,17 @@ package export
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"net/netip"
 	"strings"
@@ -37,7 +45,7 @@ func setup(t *testing.T) (*fake.Server, *Exporter, string, string) {
 		"description": reconcile.DescPrefix + "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b"})
 	_ = active
 	e := &Exporter{C: stalwart.New(f.URL(), stalwart.Bearer("API_k")), IMAPAddr: "127.0.0.1:1", ServerName: "mail.example.com",
-		MailctlIP: netip.MustParseAddr("172.31.255.3"), Now: func() time.Time { return time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC) }}
+		MailctlIP: netip.MustParseAddr("172.31.255.3"), SPKI: []string{"00"}, Now: func() time.Time { return time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC) }}
 	return f, e, former, active
 }
 
@@ -154,3 +162,78 @@ type lit struct {
 func (l lit) Size() int64 { return l.n }
 
 func literal(s string) imap.LiteralReader { return lit{strings.NewReader(s), int64(len(s))} }
+
+// A step failing mid-export (the password can't be made) still leaves
+// the account disabled.
+func TestExportFailingMidwayDisablesAgain(t *testing.T) {
+	f, e, former, _ := setup(t)
+	f.Refuse("AppPassword", "no")
+	if _, err := e.Export(context.Background(), "former-"+uuid, &bytes.Buffer{}); err == nil {
+		t.Fatal("export succeeded")
+	}
+	dis := f.Get("Account", "", former)["permissions"].(map[string]any)["disabledPermissions"].(map[string]any)
+	if dis["authenticate"] != true {
+		t.Fatalf("authenticate left lifted: %v", dis)
+	}
+}
+
+func TestExportRefusesWithoutPin(t *testing.T) {
+	f, e, former, _ := setup(t)
+	e.SPKI = nil
+	if _, err := e.Export(context.Background(), "former-"+uuid, &bytes.Buffer{}); err == nil || !strings.Contains(err.Error(), "key isn't known") {
+		t.Fatalf("no pin: %v", err)
+	}
+	if f.Count("x:AppPassword/set create") != 0 {
+		t.Fatal("a password was made without a pin")
+	}
+	if a := f.Get("Account", "", former); a["permissions"].(map[string]any)["disabledPermissions"].(map[string]any)["authenticate"] != true {
+		t.Fatal("not disabled")
+	}
+}
+
+// The leaf must be the mail certificate's key: another self-signed
+// certificate for the same host name is refused.
+func TestExportTLSPin(t *testing.T) {
+	good, goodSPKI := selfSigned(t, "mail.example.com")
+	bad, _ := selfSigned(t, "mail.example.com")
+	for _, tc := range []struct {
+		cert tls.Certificate
+		ok   bool
+	}{{good, true}, {bad, false}} {
+		f, e, _, _ := setup(t)
+		_ = f
+		mem := imapmemserver.New()
+		user := imapmemserver.NewUser("former-"+uuid+"@"+state.ParkingDomain, fmt.Sprintf("app_%036d", 1))
+		mem.AddUser(user)
+		user.Create("INBOX", nil)
+		srv := imapserver.New(&imapserver.Options{NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+			return mem.NewSession(), nil, nil
+		}, Caps: imap.CapSet{imap.CapIMAP4rev1: {}}})
+		ln, _ := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{tc.cert}})
+		go srv.Serve(ln)
+		e.IMAPAddr, e.SPKI, e.Dial = ln.Addr().String(), []string{goodSPKI}, nil
+		e.Now = time.Now
+		_, err := e.Export(context.Background(), "former-"+uuid, &bytes.Buffer{})
+		srv.Close()
+		if tc.ok && err != nil {
+			t.Fatalf("pinned certificate refused: %v", err)
+		}
+		if !tc.ok && (err == nil || !strings.Contains(err.Error(), "SPKI")) {
+			t.Fatalf("another certificate accepted: %v", err)
+		}
+	}
+}
+
+func selfSigned(t *testing.T, host string) (tls.Certificate, string) {
+	t.Helper()
+	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: host}, DNSNames: []string{host},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &k.PublicKey, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, _ := x509.ParseCertificate(der)
+	sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: k}, hex.EncodeToString(sum[:])
+}

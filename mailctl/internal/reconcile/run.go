@@ -25,6 +25,10 @@ type Runner struct {
 	Store     *state.Store
 	Retention time.Duration
 	LANOnly   bool
+	// Rewritten: client addresses are rewritten (rootless Podman), so the
+	// Local networks can't be told apart; LAN-only then admits loopback
+	// only (fail closed). The CLI refuses LAN-only there.
+	Rewritten bool
 	Now       func() time.Time
 	Logf      func(string, ...any)
 	wake      chan struct{}
@@ -106,10 +110,16 @@ func (r *Runner) Once(ctx context.Context) error {
 
 func (r *Runner) once(ctx context.Context, p state.Persistent) error {
 	doc := p.Doc
-	l, err := Read(ctx, r.C)
-	if err != nil {
-		return err
+	l, readErr := Read(ctx, r.C)
+	// LAN-only first, on its own path: a failing plan never skips it.
+	lanErr := r.lanOnly(ctx, l, doc, p)
+	if readErr != nil {
+		return errors.Join(readErr, lanErr)
 	}
+	return errors.Join(r.apply(ctx, l, doc, p), lanErr)
+}
+
+func (r *Runner) apply(ctx context.Context, l *Live, doc *state.Doc, p state.Persistent) error {
 	ops, err := Plan(l, doc, p.Former, r.Now(), r.Retention)
 	if err != nil {
 		return err
@@ -132,7 +142,7 @@ func (r *Runner) once(ctx context.Context, p state.Persistent) error {
 	for _, a := range doc.Accounts {
 		active[a.UUID] = true
 	}
-	if err := r.Store.Update(func(s *state.Persistent) error {
+	return r.Store.Update(func(s *state.Persistent) error {
 		for _, u := range ops.PurgedUUIDs {
 			delete(s.Former, u)
 		}
@@ -142,16 +152,22 @@ func (r *Runner) once(ctx context.Context, p state.Persistent) error {
 			}
 		}
 		return nil
-	}); err != nil {
-		return err
+	})
+}
+
+// LocalNets are the networks LAN-only admits: the document's, or none at
+// all (= loopback only) when client addresses are rewritten.
+func LocalNets(doc *state.Doc, rewritten bool) []string {
+	if rewritten || doc == nil {
+		return nil
 	}
-	return r.lanOnly(ctx, l, doc, p)
+	return doc.LocalNetworks
 }
 
 // lanOnly keeps the SASL rule and every mail password's allowedIps on the
 // Local networks while MAIL_SUBMISSION_LAN_ONLY is on.
 func (r *Runner) lanOnly(ctx context.Context, l *Live, doc *state.Doc, p state.Persistent) error {
-	expr := SASLExpression(r.LANOnly, doc.LocalNetworks)
+	expr := SASLExpression(r.LANOnly, LocalNets(doc, r.Rewritten))
 	b, _ := json.Marshal(expr)
 	prev := string(p.Ext[extLAN])
 	if r.LANOnly || prev != "" {
@@ -178,7 +194,10 @@ func (r *Runner) lanOnly(ctx context.Context, l *Live, doc *state.Doc, p state.P
 	if !r.LANOnly {
 		return nil
 	}
-	allowed := creds.AllowedIPs(true, doc.LocalNetworks)
+	if l == nil {
+		return errors.New("LAN-only: can't read the accounts to restrict their mail passwords")
+	}
+	allowed := creds.AllowedIPs(true, LocalNets(doc, r.Rewritten))
 	var errs []error
 	for _, a := range doc.Accounts {
 		if id := FindAccount(l, doc, a.Username); id != "" {

@@ -36,6 +36,7 @@ type LiveAccount struct {
 	UUID     string
 	Aliases  []string // full addresses
 	Disabled bool     // authenticate disabled
+	Parkedok bool     // authenticate, emailSend and emailReceive all disabled
 	Quota    int64
 	Roles    string // the roles' @type
 }
@@ -148,6 +149,7 @@ func Read(ctx context.Context, c *stalwart.Client) (*Live, error) {
 		}
 		_ = json.Unmarshal(a["permissions"], &perms)
 		la.Disabled = perms.Disabled["authenticate"]
+		la.Parkedok = perms.Disabled["authenticate"] && perms.Disabled["emailSend"] && perms.Disabled["emailReceive"]
 		var q map[string]int64
 		_ = json.Unmarshal(a["quotas"], &q)
 		la.Quota = q["maxDiskQuota"]

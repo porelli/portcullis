@@ -9,8 +9,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -40,11 +42,12 @@ type Exporter struct {
 	ServerName string     // MAIL_HOSTNAME (SNI)
 	MailctlIP  netip.Addr // the password is pinned to it
 	Now        func() time.Time
-	// Dial connects (tests replace it). The chain isn't verified against
-	// public roots (a staging chain wouldn't verify), but the leaf must
-	// name MAIL_HOSTNAME and be valid now; the peer is mail's pinned
-	// address on the internal portcullis-mail network (only mail, mailctl
-	// and mail-resolver are on it).
+	// SPKI are the mail certificate's key pins (sha256 of the leaf's
+	// SubjectPublicKeyInfo, hex), as mail-cert reported them (`mailctl
+	// rotate` stores them): the leaf Stalwart presents must be one of them,
+	// name MAIL_HOSTNAME and be valid now. No pin, no export.
+	SPKI []string
+	// Dial connects (tests replace it).
 	Dial func(addr string, cfg *tls.Config) (*imapclient.Client, error)
 }
 
@@ -76,16 +79,12 @@ func (e *Exporter) Export(ctx context.Context, formerID string, w io.Writer) (n 
 	if e.Now != nil {
 		now = e.Now
 	}
-	// Lift authenticate only (sending and receiving stay off).
-	lifted := map[string]any{"@type": "Merge", "enabledPermissions": map[string]bool{},
-		"disabledPermissions": map[string]bool{"emailSend": true, "emailReceive": true}}
-	r, err := e.C.Set(ctx, "Account", nil, map[string]map[string]any{id: {"permissions": lifted}}, nil)
-	if err := setErr("Account", r, err); err != nil {
-		return 0, err
-	}
+	// The restore is registered before anything changes: whatever fails
+	// after this point (the lift itself included), the export password
+	// goes and the account is disabled again. The reconciler re-asserts
+	// Disabled on every parked account on each pass as well.
 	var pwID string
 	defer func() {
-		// Always: the password goes, authenticate goes off again.
 		cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if pwID != "" {
@@ -99,6 +98,16 @@ func (e *Exporter) Export(ctx context.Context, formerID string, w io.Writer) (n 
 			err = errors.Join(err, fmt.Errorf("could not disable %s again: %w", formerID, derr))
 		}
 	}()
+	if len(e.SPKI) == 0 {
+		return 0, errors.New("the mail certificate's key isn't known to mailctl yet (run ./portcullis mail rotate)")
+	}
+	// Lift authenticate only (sending and receiving stay off).
+	lifted := map[string]any{"@type": "Merge", "enabledPermissions": map[string]bool{},
+		"disabledPermissions": map[string]bool{"emailSend": true, "emailReceive": true}}
+	r, err := e.C.Set(ctx, "Account", nil, map[string]map[string]any{id: {"permissions": lifted}}, nil)
+	if err := setErr("Account", r, err); err != nil {
+		return 0, err
+	}
 	perms := map[string]bool{}
 	for _, p := range stalwart.ExportPermissions {
 		perms[p] = true
@@ -176,7 +185,7 @@ func (e *Exporter) Export(ctx context.Context, formerID string, w io.Writer) (n 
 func (e *Exporter) tlsConfig(now time.Time) *tls.Config {
 	return &tls.Config{
 		ServerName: e.ServerName, MinVersion: tls.VersionTLS12,
-		InsecureSkipVerify: true, // replaced by VerifyPeerCertificate below
+		InsecureSkipVerify: true, //nolint:gosec // replaced by the SPKI pin in VerifyPeerCertificate
 		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
 			if len(raw) == 0 {
 				return errors.New("imap: no certificate")
@@ -184,6 +193,16 @@ func (e *Exporter) tlsConfig(now time.Time) *tls.Config {
 			leaf, err := x509.ParseCertificate(raw[0])
 			if err != nil {
 				return fmt.Errorf("imap: certificate: %w", err)
+			}
+			sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
+			pinned := false
+			for _, p := range e.SPKI {
+				if strings.EqualFold(p, hex.EncodeToString(sum[:])) {
+					pinned = true
+				}
+			}
+			if !pinned {
+				return errors.New("imap: the certificate's key isn't the mail certificate's (SPKI pin)")
 			}
 			if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
 				return errors.New("imap: the certificate isn't valid now")

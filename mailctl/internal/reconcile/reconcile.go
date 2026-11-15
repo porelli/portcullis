@@ -54,6 +54,7 @@ type ThrottleSpec struct {
 type Ops struct {
 	Removals       []Removal
 	Purges         []string // former accounts past retention (ids)
+	Redisable      []string // parked accounts whose permissions aren't Disabled (ids)
 	PurgedUUIDs    []string
 	Domains        []string // to create
 	Accounts       []AccountSpec
@@ -108,6 +109,10 @@ func Plan(l *Live, want *state.Doc, former map[string]state.Former, now time.Tim
 			if f, ok := former[la.UUID]; ok && now.Sub(f.Since) >= retention {
 				ops.Purges = append(ops.Purges, la.ID)
 				ops.PurgedUUIDs = append(ops.PurgedUUIDs, la.UUID)
+			} else if !la.Parkedok {
+				// Fail closed: a parked account is always Disabled (an
+				// export that died mid-way, a hand edit).
+				ops.Redisable = append(ops.Redisable, la.ID)
 			}
 		default:
 			_ = wa
@@ -237,7 +242,7 @@ func Plan(l *Live, want *state.Doc, former map[string]state.Former, now time.Tim
 			ops.Throttles = append(ops.Throttles, t)
 		}
 	}
-	ops.Empty = len(ops.Removals)+len(ops.Purges)+len(ops.Domains)+len(ops.Accounts)+len(ops.Lists)+
+	ops.Empty = len(ops.Removals)+len(ops.Purges)+len(ops.Redisable)+len(ops.Domains)+len(ops.Accounts)+len(ops.Lists)+
 		len(ops.DestroyLists)+len(ops.Keys)+len(ops.DestroyKeys)+len(ops.Throttles) == 0 && ops.MailctlAliases == nil
 	return ops, nil
 }
@@ -335,6 +340,16 @@ func Apply(ctx context.Context, c *stalwart.Client, l *Live, want *state.Doc, op
 			return fmt.Errorf("InvalidateCaches: %w", err)
 		}
 	}
+	if len(ops.Redisable) > 0 {
+		upd := map[string]map[string]any{}
+		for _, id := range ops.Redisable {
+			upd[id] = map[string]any{"permissions": Disabled}
+		}
+		r, err := c.Set(ctx, "Account", nil, upd, nil)
+		if err := setErr("Account", r, err); err != nil {
+			return err
+		}
+	}
 	if len(ops.Purges) > 0 {
 		for _, id := range ops.Purges {
 			if err := DestroyAppPasswords(ctx, c, id); err != nil {
@@ -363,7 +378,9 @@ func Apply(ctx context.Context, c *stalwart.Client, l *Live, want *state.Doc, op
 		}
 	}
 	primary := l.Domains[want.PrimaryDomain]
-	accountsChanged := len(ops.Removals) > 0
+	// Every change Stalwart may hold in its caches (logins, addresses,
+	// aliases, lists, permissions) ends with InvalidateCaches.
+	changed := len(ops.Redisable)+len(ops.Purges)+len(ops.Accounts)+len(ops.Lists)+len(ops.DestroyLists) > 0 || ops.MailctlAliases != nil
 	for _, a := range ops.Accounts {
 		aliases, err := aliasList(a.Aliases, l.Domains)
 		if err != nil {
@@ -393,7 +410,6 @@ func Apply(ctx context.Context, c *stalwart.Client, l *Live, want *state.Doc, op
 		}
 		if a.Enable {
 			fields["permissions"] = map[string]any{"@type": "Inherit"}
-			accountsChanged = true
 		}
 		r, err := c.Set(ctx, "Account", nil, map[string]map[string]any{a.ID: fields}, nil)
 		if err := setErr("Account", r, err); err != nil {
@@ -466,7 +482,7 @@ func Apply(ctx context.Context, c *stalwart.Client, l *Live, want *state.Doc, op
 			return fmt.Errorf("ReloadSettings: %w", err)
 		}
 	}
-	if accountsChanged && len(ops.Removals) == 0 {
+	if changed {
 		if err := c.Action(ctx, "InvalidateCaches"); err != nil {
 			return fmt.Errorf("InvalidateCaches: %w", err)
 		}

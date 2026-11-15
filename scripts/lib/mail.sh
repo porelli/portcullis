@@ -19,6 +19,7 @@
 # echoed). jq reads secrets through env.X only.
 
 MAIL_KUBE_REFUSED="mail isn't available on Kubernetes yet (Docker or rootless Podman only)"
+MAIL_LAN_PODMAN_REFUSED="LAN-only needs the real client address; rootless Podman rewrites it"
 MAIL_RECOVERY_USER=portcullis-recovery
 MAIL_CERT_RENEW_DAYS=30
 MAIL_HEALTH_WAIT="${MAIL_HEALTH_WAIT:-180}"
@@ -50,6 +51,14 @@ _mail_profiles_without_mail() {
 # address) or rewritten (rootless Podman's rootlessport, M9).
 mail_client_ip_mode() {
   if _rt_is_podman; then echo rewritten; else echo preserved; fi
+}
+
+# mail_lan_only_ok <true|false> — LAN-only (MAIL_SUBMISSION_LAN_ONLY) is
+# refused under rootless Podman (fail closed): every client seems to come
+# from the rootlessport gateway, so the Local networks can't be told apart.
+mail_lan_only_ok() {
+  [ "$1" = true ] || return 0
+  ! _rt_is_podman || fail "$MAIL_LAN_PODMAN_REFUSED"
 }
 
 # mail_refuse_kube — the Kubernetes refusal (contract §19.12).
@@ -320,6 +329,7 @@ mail_up_steps() {
   mail_refuse_kube
   _rt_docker_only
   mail_port_start_ok || fail "$(mail_port_start_text)"
+  mail_lan_only_ok "${MAIL_SUBMISSION_LAN_ONLY:-false}"
   [ "${MAILCTL_CLIENT_IP:-}" = "$(mail_client_ip_mode)" ] || _mail_set MAILCTL_CLIENT_IP "$(mail_client_ip_mode)"
   mail_config_present || fail "mail is in COMPOSE_PROFILES but mail_etc/config.json is missing (Stalwart would start in bootstrap mode): run ./portcullis mail enable"
   mail_tls_present || mail_cert_ensure
@@ -343,6 +353,7 @@ mail_enable() {
   mail_port_start_ok || fail "$(mail_port_start_text)"
   require_cmd docker jq openssl
   _dns_automated "${DNS_PROVIDER:-none}" || fail "mail needs a DNS provider Portcullis can write (see setup/mail.md): DNS_PROVIDER=${DNS_PROVIDER:-none}"
+  mail_lan_only_ok "${lan:-${MAIL_SUBMISSION_LAN_ONLY:-false}}"
   [ -z "$host" ] || _mail_set MAIL_HOSTNAME "$host"
   [ -z "$lan" ] || _mail_set MAIL_SUBMISSION_LAN_ONLY "$lan"
   _mail_set MAILCTL_CLIENT_IP "$(mail_client_ip_mode)"
@@ -590,7 +601,10 @@ cmd_mail() {
   env_load
   # Refused before anything touches the runtime (contract §19.12, M9).
   mail_refuse_kube
-  if [ "$sub" = enable ]; then mail_port_start_ok || fail "$(mail_port_start_text)"; fi
+  if [ "$sub" = enable ]; then
+    mail_port_start_ok || fail "$(mail_port_start_text)"
+    mail_lan_only_ok "${lan:-${MAIL_SUBMISSION_LAN_ONLY:-false}}"
+  fi
   runtime_check
   case "$sub" in
     enable) MAIL_ROTATE_KEY="$rotkey" mail_enable "$host" "$lan" "$yes" ;;

@@ -2,6 +2,8 @@ package reconcile
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -291,7 +293,7 @@ func TestMassRemovalRefused(t *testing.T) {
 	dropAccount(d, "bob")
 	dropAccount(d, "root")
 	d.Postmaster = []string{"alice"}
-	if err := e.apply(d); err != ErrMassRemoval {
+	if err := e.apply(d); !errors.Is(err, ErrMassRemoval) {
 		t.Fatalf("2 of 3 removed: %v", err)
 	}
 	if e.account("bob") == nil {
@@ -372,4 +374,121 @@ func TestLANOnlySASLAndRestrict(t *testing.T) {
 	if e.f.Count("x:MtaStageAuth/set") != 0 {
 		t.Fatal("the SASL rule is rewritten on every pass")
 	}
+}
+
+// A parked account whose permissions were lifted (an export that died) is
+// disabled again on the next pass.
+func TestParkedReDisabled(t *testing.T) {
+	e := newEnv(t)
+	e.mustApply(baseDoc(t))
+	bob := e.account("bob")["id"].(string)
+	d := baseDoc(t)
+	d.Generation = 13
+	dropAccount(d, "bob")
+	e.mustApply(d)
+	// Lift as an export would.
+	c := e.c
+	if _, err := c.Set(context.Background(), "Account", nil, map[string]map[string]any{bob: {"permissions": map[string]any{"@type": "Merge",
+		"enabledPermissions": map[string]bool{}, "disabledPermissions": map[string]bool{"emailSend": true, "emailReceive": true}}}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.f.ResetCalls()
+	e.mustApply(d)
+	dis := e.f.Get("Account", "", bob)["permissions"].(map[string]any)["disabledPermissions"].(map[string]any)
+	if dis["authenticate"] != true {
+		t.Fatalf("not disabled again: %v", dis)
+	}
+	if e.f.Count("x:Action/set InvalidateCaches") != 1 {
+		t.Fatal("no InvalidateCaches after re-disabling")
+	}
+}
+
+// LAN-only is applied on its own path even when the plan's Apply fails.
+func TestLANOnlyEvenWhenApplyFails(t *testing.T) {
+	e := newEnv(t)
+	e.mustApply(baseDoc(t))
+	alice := e.account("alice")["id"].(string)
+	e.f.Put("AppPassword", alice, map[string]any{"description": "phone"})
+	e.r.LANOnly = true
+	d := baseDoc(t)
+	d.Generation = 13
+	d.Accounts[1].QuotaBytes = 1 // forces an account update, which fails
+	e.f.Fail("x:Account/set", 5)
+	if err := e.apply(d); err == nil {
+		t.Fatal("apply succeeded with a failing Account/set")
+	}
+	if e.f.Get("MtaStageAuth", "", "singleton") == nil {
+		t.Fatal("the LAN-only SASL rule wasn't written")
+	}
+	ips, _ := e.f.Objects("AppPassword", alice)[0]["allowedIps"].(map[string]any)
+	if ips["10.0.0.0/8"] != true {
+		t.Fatalf("passwords not restricted: %v", ips)
+	}
+}
+
+// Rewritten client addresses: LAN-only admits loopback only.
+func TestLANOnlyRewrittenLoopbackOnly(t *testing.T) {
+	e := newEnv(t)
+	e.r.LANOnly, e.r.Rewritten = true, true
+	e.mustApply(baseDoc(t))
+	cond := e.f.Get("MtaStageAuth", "", "singleton")["saslMechanisms"].(map[string]any)["match"].(map[string]any)["0"].(map[string]any)["if"].(string)
+	if strings.Contains(cond, "10.0.0.0/8") || !strings.Contains(cond, "127.0.0.1/32") {
+		t.Fatalf("rewritten LAN-only rule %q", cond)
+	}
+}
+
+// Every account / alias / list change ends with InvalidateCaches.
+func TestInvalidateCachesOnEveryChange(t *testing.T) {
+	for name, mut := range map[string]func(d *state.Doc){
+		"alias": func(d *state.Doc) {
+			d.Aliases = append(d.Aliases, state.Alias{Address: "info@example.com", Username: "bob"})
+		},
+		"address": func(d *state.Doc) {
+			d.Accounts[1].Addresses = append(d.Accounts[1].Addresses, "bob@team-b.example.org")
+		},
+		"list member": func(d *state.Doc) { d.Lists[0].Members = []string{"alice"} },
+		"new list": func(d *state.Doc) {
+			d.Lists = append(d.Lists, state.List{Address: "ops@example.com", Members: []string{"root"}, Posting: "anyone"})
+		},
+		"domain off": func(d *state.Doc) {
+			d.Domains[1].Mail = state.MailOff
+			d.Accounts[0].Addresses = d.Accounts[0].Addresses[:1]
+		},
+		"primary": func(d *state.Doc) { d.PrimaryDomain = "team-b.example.org"; fixPrimary(d) },
+	} {
+		e := newEnv(t)
+		e.mustApply(baseDoc(t))
+		d := baseDoc(t)
+		d.Generation = 13
+		mut(d)
+		if _, err := state.Parse(mustJSON(t, d)); err != nil {
+			t.Fatalf("%s: the test document is invalid: %v", name, err)
+		}
+		e.f.ResetCalls()
+		e.mustApply(d)
+		if e.f.Count("x:Action/set InvalidateCaches") < 1 {
+			t.Errorf("%s: no InvalidateCaches", name)
+		}
+	}
+}
+
+func fixPrimary(d *state.Doc) {
+	for i := range d.Accounts {
+		a := &d.Accounts[i]
+		var rest []string
+		for _, x := range a.Addresses {
+			if x != a.Username+"@example.com" && x != a.Username+"@team-b.example.org" {
+				rest = append(rest, x)
+			}
+		}
+		a.Addresses = append([]string{a.Username + "@team-b.example.org"}, rest...)
+	}
+}
+
+func mustJSON(t *testing.T, d *state.Doc) []byte {
+	b, err := json.Marshal(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
 }

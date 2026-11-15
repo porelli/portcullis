@@ -26,8 +26,10 @@ type V1 struct {
 	C       *stalwart.Client
 	Runner  *reconcile.Runner
 	LANOnly bool
-	Now     func() time.Time
-	Logf    func(string, ...any)
+	// Rewritten client addresses: LAN-only admits loopback only.
+	Rewritten bool
+	Now       func() time.Time
+	Logf      func(string, ...any)
 
 	mu        sync.Mutex
 	bootAt    time.Time
@@ -229,7 +231,7 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	cr, err := creds.Create(ctx, v.C, id, req.Label, req.ExpiresAt, creds.AllowedIPs(v.LANOnly, doc.LocalNetworks), v.now())
+	cr, err := creds.Create(ctx, v.C, id, req.Label, req.ExpiresAt, creds.AllowedIPs(v.LANOnly, reconcile.LocalNets(doc, v.Rewritten)), v.now())
 	switch {
 	case errors.Is(err, creds.ErrLimit):
 		writeErr(w, http.StatusConflict, err.Error())

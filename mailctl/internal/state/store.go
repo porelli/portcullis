@@ -109,3 +109,34 @@ func (s *Store) Update(fn func(*Persistent) error) error {
 	s.p = c
 	return nil
 }
+
+// TLSAState is the mail certificate's key pins (Ext["tlsa"]), as mail-cert
+// reported them through `mailctl rotate`: the current key, the next one
+// during a rollover, and an old one until its record is dropped.
+type TLSAState struct {
+	Current    string     `json:"current"`
+	Next       string     `json:"next"`
+	NextSince  *time.Time `json:"next_since"`
+	Old        string     `json:"old"`
+	OldUntil   *time.Time `json:"old_until"`
+	SwitchedAt *time.Time `json:"switched_at"`
+}
+
+// TLSA reads Ext["tlsa"].
+func TLSA(p Persistent) TLSAState {
+	var t TLSAState
+	_ = json.Unmarshal(p.Ext["tlsa"], &t)
+	return t
+}
+
+// SPKIs are the keys the mail certificate may present right now.
+func SPKIs(p Persistent) []string {
+	t := TLSA(p)
+	var out []string
+	for _, s := range []string{t.Current, t.Next, t.Old} {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}

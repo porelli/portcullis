@@ -736,7 +736,7 @@ hub_env_write() {
     case " $CORE_SECRETS $OPTIONAL_SECRETS " in *" $v "*) warn "HUB_SHARED_ENV: refusing to share core secret $v with the Hub"; continue ;; esac
     case "$content" in "$v="*|*$'\n'"$v="*) continue ;; esac
     # Written below from the host (podman / kubernetes only), never shared by name.
-    case "$v" in PORTCULLIS_UNPRIVILEGED_PORT_START|PORTCULLIS_POD_CIDR|PORTCULLIS_SERVICE_CIDR|PORTCULLIS_WG_EDGE_SERVICE_IP|PORTCULLIS_TRAEFIK_SERVICE_IP|PORTCULLIS_RUNTIME_ROOTS|PORTCULLIS_KUBE_*) continue ;; esac
+    case "$v" in PORTCULLIS_UNPRIVILEGED_PORT_START|PORTCULLIS_POD_CIDR|PORTCULLIS_SERVICE_CIDR|PORTCULLIS_WG_EDGE_SERVICE_IP|PORTCULLIS_TRAEFIK_SERVICE_IP|PORTCULLIS_RUNTIME_ROOTS|PORTCULLIS_KUBE_*|PORTCULLIS_MAIL*) continue ;; esac
     case "$v" in
       PORTCULLIS_DOMAIN) val="${PORTCULLIS_DOMAIN:-portcullis.local}" ;;
       PORTCULLIS_TRAEFIK_IP) val="$(proxy_traefik_ip)" ;;
@@ -772,6 +772,18 @@ hub_env_write() {
     esac
     content+="$v=$val"$'\n'
   done
+  # Mail (contract §2, §19.1): derived, never from .env and never a
+  # secret: on only with the profile and mailctl's API key; the DQS key and
+  # the relay's host / credentials are only on / off.
+  local mail=off
+  if mail_profile_on && [ -s "$PORTCULLIS_ROOT/secrets/mail/api-key" ]; then mail=on; fi
+  content+="PORTCULLIS_MAIL=$mail"$'\n'
+  content+="PORTCULLIS_MAIL_HOSTNAME=${MAIL_HOSTNAME:-mail.${PORTCULLIS_DOMAIN:-portcullis.local}}"$'\n'
+  content+="PORTCULLIS_MAIL_SUBMISSION_LAN_ONLY=$([ "${MAIL_SUBMISSION_LAN_ONLY:-false}" = true ] && echo true || echo false)"$'\n'
+  content+="PORTCULLIS_MAIL_RELAY=$([ -n "${MAIL_RELAY_HOST:-}" ] && echo on || echo off)"$'\n'
+  content+="PORTCULLIS_MAIL_FORMER_RETENTION=${MAIL_FORMER_RETENTION:-720h}"$'\n'
+  content+="PORTCULLIS_MAIL_DQS=$([ -n "${MAIL_SPAMHAUS_DQS_KEY:-}" ] && echo on || echo off)"$'\n'
+  content+="PORTCULLIS_MAILCTL_API_IP=$(mailctl_api_ip)"$'\n'
   # Rootless Podman: the host's ip_unprivileged_port_start (a per-netns
   # sysctl the Hub can't read from inside its container; RootlessCompat).
   if _rt_is_podman; then
