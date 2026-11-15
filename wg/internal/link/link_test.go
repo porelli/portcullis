@@ -249,6 +249,15 @@ func echoes(t *testing.T, c net.Conn, br *bufio.Reader, msg string) {
 	}
 }
 
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 // waitClosed fails unless c reads EOF (or a reset) within d.
 func waitClosed(t *testing.T, c net.Conn, br *bufio.Reader, d time.Duration) {
 	t.Helper()
