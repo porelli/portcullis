@@ -322,20 +322,39 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, cr)
 }
 
+// deleteCred revokes credential {id} inside the account of ?uuid= (live
+// or parked), never the username's current holder. An unknown uuid or id
+// is a success: nothing can hold it (the Hub retries).
 func (v *V1) deleteCred(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-	user := r.URL.Query().Get("user")
-	id, _, ok := v.account(w, ctx, user)
-	if !ok {
+	q := r.URL.Query()
+	uuid := strings.ToLower(q.Get("uuid"))
+	if _, ok := q["user"]; ok || uuid == "" || len(q) != 1 {
+		writeErr(w, http.StatusBadRequest, "DELETE /v1/credentials/{id} takes exactly ?uuid=<account uuid>")
 		return
 	}
-	if err := creds.Revoke(ctx, v.C, id, r.PathValue("id")); err != nil {
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	live, err := reconcile.Read(ctx, v.C)
+	if err != nil {
+		v.unreachable(w, err)
+		return
+	}
+	acct := ""
+	for _, la := range live.Accounts {
+		if strings.EqualFold(la.UUID, uuid) {
+			acct = la.ID
+		}
+	}
+	if acct == "" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if err := creds.Revoke(ctx, v.C, acct, r.PathValue("id")); err != nil {
 		v.unreachable(w, err)
 		return
 	}
 	if v.Logf != nil {
-		v.Logf("credentials: revoked mail password %s of %s", r.PathValue("id"), user)
+		v.Logf("credentials: revoked mail password %s of account %s", r.PathValue("id"), uuid)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

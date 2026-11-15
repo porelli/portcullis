@@ -164,11 +164,16 @@ func TestCredentialsRoutes(t *testing.T) {
 		t.Errorf("unknown user: %d", w.Code)
 	}
 	id := cr["id"].(string)
-	if w := e.do("DELETE", "/v1/credentials/"+id+"?user=alice", ""); w.Code != 204 {
+	if w := e.do("DELETE", "/v1/credentials/"+id+"?uuid=6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b", ""); w.Code != 204 {
 		t.Fatalf("delete: %d", w.Code)
 	}
-	if w := e.do("DELETE", "/v1/credentials/"+id+"?user=alice", ""); w.Code != 204 {
+	if w := e.do("DELETE", "/v1/credentials/"+id+"?uuid=6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b", ""); w.Code != 204 {
 		t.Fatalf("delete again: %d", w.Code)
+	}
+	for _, q := range []string{"", "?user=alice", "?uuid=6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b&user=alice"} {
+		if w := e.do("DELETE", "/v1/credentials/"+id+q, ""); w.Code != 400 {
+			t.Errorf("DELETE %q: %d", q, w.Code)
+		}
 	}
 	for i := 0; i < 5; i++ {
 		e.do("POST", "/v1/credentials", `{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"p","expires_at":null}`)
@@ -177,7 +182,7 @@ func TestCredentialsRoutes(t *testing.T) {
 		t.Fatalf("sixth: %d", w.Code)
 	}
 	// A revoke of an unknown id is a success (the Hub retries).
-	if w := e.do("DELETE", "/v1/credentials/no-such-id?user=alice", ""); w.Code != 204 {
+	if w := e.do("DELETE", "/v1/credentials/no-such-id?uuid=6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b", ""); w.Code != 204 {
 		t.Fatalf("unknown id: %d", w.Code)
 	}
 	e.f.Fail("x:AppPassword", 1)
@@ -359,5 +364,38 @@ func TestCreateCredentialSnapshot(t *testing.T) {
 	}
 	if len(e.f.Objects("AppPassword", alice)) != 1 || len(e.f.Objects("AppPassword", bob)) != 0 {
 		t.Fatalf("the password went to the wrong account: alice %d bob %d", len(e.f.Objects("AppPassword", alice)), len(e.f.Objects("AppPassword", bob)))
+	}
+}
+
+// DELETE goes by the account's uuid: a username re-created under a new
+// uuid keeps its own same-numbered credential when the old person's is
+// revoked; an unknown uuid is 204.
+func TestDeleteCredentialByUUID(t *testing.T) {
+	e := newV1(t)
+	e.do("PUT", "/v1/state", vec(t, 12))
+	_ = e.v.Runner.Once(context.Background())
+	var park, alice string
+	for _, d := range e.f.Objects("Domain", "") {
+		if d["name"] == state.ParkingDomain {
+			park = d["id"].(string)
+		}
+	}
+	for _, a := range e.f.Objects("Account", "") {
+		if a["name"] == "alice" {
+			alice = a["id"].(string)
+		}
+	}
+	const old = "aaaaaaaa-0000-4000-8000-000000000001"
+	former := e.f.Put("Account", "", map[string]any{"@type": "User", "name": "former-" + old, "domainId": park, "description": "portcullis:" + old})
+	e.f.PutID("AppPassword", former, "p1", map[string]any{"description": "old phone"})
+	e.f.PutID("AppPassword", alice, "p1", map[string]any{"description": "new phone"})
+	if w := e.do("DELETE", "/v1/credentials/p1?uuid="+old, ""); w.Code != 204 {
+		t.Fatalf("delete: %d %s", w.Code, w.Body)
+	}
+	if len(e.f.Objects("AppPassword", former)) != 0 || len(e.f.Objects("AppPassword", alice)) != 1 {
+		t.Fatalf("former %d alice %d", len(e.f.Objects("AppPassword", former)), len(e.f.Objects("AppPassword", alice)))
+	}
+	if w := e.do("DELETE", "/v1/credentials/p1?uuid=bbbbbbbb-0000-4000-8000-000000000002", ""); w.Code != 204 || len(e.f.Objects("AppPassword", alice)) != 1 {
+		t.Fatalf("unknown uuid: %d", w.Code)
 	}
 }

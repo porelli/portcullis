@@ -83,6 +83,18 @@ func (s *Server) Put(obj, acct string, fields map[string]any) string {
 	return s.putLocked(store(obj, acct), fields)
 }
 
+// PutID stores an object under a given id (Stalwart reuses AppPassword ids
+// per account: two accounts can hold the same id).
+func (s *Server) PutID(obj, acct, id string, fields map[string]any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := store(obj, acct)
+	if s.objs[st] == nil {
+		s.objs[st] = map[string]map[string]any{}
+	}
+	s.objs[st][id] = normalize(fields)
+}
+
 func (s *Server) putLocked(st string, fields map[string]any) string {
 	if s.objs[st] == nil {
 		s.objs[st] = map[string]map[string]any{}
