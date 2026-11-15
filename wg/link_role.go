@@ -102,8 +102,10 @@ func loadLinkKey(path string) ([32]byte, error) {
 
 // linkRole is the running link role (nil when WG_LINK=off).
 type linkRole struct {
-	l        *link.Link
-	gatherer prometheus.Gatherer
+	l         *link.Link
+	gatherer  prometheus.Gatherer
+	publicKey string
+	port      int
 
 	mu       sync.Mutex
 	startErr string
@@ -124,7 +126,7 @@ func (r *linkRole) setLnErr(which, msg string) {
 func (r *linkRole) status() *status.Link {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	st := &status.Link{}
+	st := &status.Link{PublicKey: r.publicKey, Port: r.port}
 	switch {
 	case r.startErr != "":
 		st.Role = status.Role{OK: false, Error: r.startErr}
@@ -169,6 +171,8 @@ func startLink(ctx context.Context, cfg *config, reg *prometheus.Registry) *link
 		return r
 	}
 	go func() { <-ctx.Done(); stack.Close() }()
+	r.publicKey = stack.PublicKey()
+	r.port = cfg.LinkPort
 	var doc atomic.Pointer[linkdoc.Doc]
 	r.l = link.New(stack, doc.Load)
 	reg.MustRegister(r.l.Collectors()...)

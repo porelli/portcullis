@@ -53,7 +53,7 @@ const (
 const (
 	MaxPeers  = 250
 	MaxRelays = 4096
-	MaxSize   = 4 << 20
+	MaxSize   = 1 << 20
 )
 
 // IDRe constrains server ids (the Hub's servers.IDRe).

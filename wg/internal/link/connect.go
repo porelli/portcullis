@@ -177,8 +177,27 @@ func parseRelayTarget(hostport string) (Preamble, bool) {
 
 // newStreamLocked registers a stream for peer p (nil when at the cap).
 func (l *Link) newStreamLocked(parent context.Context, path string, p *linkdoc.Peer) *stream {
-	if len(l.streams) >= l.MaxStreams {
-		return nil
+	// Count existing streams by type (control vs data).
+	var controlCount, dataCount int
+	for s := range l.streams {
+		if s.path == "control" {
+			controlCount++
+		} else {
+			dataCount++
+		}
+	}
+	// Check the appropriate cap for this stream type.
+	var cap int
+	if path == "control" {
+		cap = l.MaxControlStreams
+		if controlCount >= cap {
+			return nil
+		}
+	} else {
+		cap = l.MaxDataStreams
+		if dataCount >= cap {
+			return nil
+		}
 	}
 	// The stream outlives the request handler (hijacked), not the server.
 	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))

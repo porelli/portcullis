@@ -57,7 +57,9 @@ type LinkPeer struct {
 // Link is the link role's state; nil (the key absent) while the role is off.
 type Link struct {
 	Role
-	Peers []LinkPeer `json:"peers"`
+	PublicKey string     `json:"public_key"`
+	Port      int        `json:"port"`
+	Peers     []LinkPeer `json:"peers"`
 }
 
 type Doc struct {
@@ -66,7 +68,7 @@ type Doc struct {
 	Mode    string    `json:"mode"`
 	Edge    Role      `json:"edge"`
 	People  *People   `json:"people"`
-	Link    *Link     `json:"link,omitempty"`
+	Link    *Link     `json:"link"`
 }
 
 // Write replaces path atomically (temp file in the same directory +

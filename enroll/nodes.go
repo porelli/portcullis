@@ -131,6 +131,8 @@ func (cfg *Config) signNodeCert(ctx context.Context, role, cn, csrPEM string) (*
 
 // revokeNodeCert revokes serial on pki_node (unknown: 404; already
 // revoked: nil), then rotates pki_node's CRL (a failure is only logged).
+// Only node-worker certificates (*.node.portcullis.internal) are accepted;
+// node-control goes through the renewal flow.
 func (cfg *Config) revokeNodeCert(ctx context.Context, serial string) error {
 	s := strings.ToLower(strings.TrimSpace(serial))
 	notFound := refuse(404, "no such certificate")
@@ -143,6 +145,15 @@ func (cfg *Config) revokeNodeCert(ctx context.Context, serial string) error {
 	}
 	if ic == nil {
 		return notFound
+	}
+	// Parse the certificate to check its CN.
+	cert, err := x509.ParseCertificate(ic.DER)
+	if err != nil {
+		return fmt.Errorf("parsing certificate %s: %w", s, err)
+	}
+	// Accept only node-worker certificates (*.node.portcullis.internal).
+	if !nodeWorkerCNRe.MatchString(cert.Subject.CommonName) {
+		return refuse(403, "only node-worker certificates can be revoked here")
 	}
 	if ic.Revoked {
 		log.Printf("node certificate %s: already revoked", s)

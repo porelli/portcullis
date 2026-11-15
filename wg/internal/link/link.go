@@ -43,8 +43,9 @@ const MTU = 1380
 
 // Defaults.
 const (
-	DefaultDialTimeout = 10 * time.Second
-	DefaultMaxStreams  = 8192
+	DefaultDialTimeout       = 10 * time.Second
+	DefaultMaxControlStreams = 256
+	DefaultMaxDataStreams    = 8192
 )
 
 // Link is the running role.
@@ -52,10 +53,12 @@ type Link struct {
 	stack *tunnel.Stack
 	doc   func() *linkdoc.Doc
 
-	// DialTimeout bounds a dial into the tunnel; MaxStreams caps open
-	// streams (control + data) — beyond it a CONNECT gets 503.
-	DialTimeout time.Duration
-	MaxStreams  int
+	// DialTimeout bounds a dial into the tunnel; MaxControlStreams caps
+	// control CONNECTs; MaxDataStreams caps data CONNECTs. Each is checked
+	// independently: control has reserved capacity data can't use up.
+	DialTimeout       time.Duration
+	MaxControlStreams int
+	MaxDataStreams    int
 
 	mu      sync.Mutex
 	cur     *linkdoc.Doc // the document Reload applied (nil: none / failed)
@@ -71,12 +74,13 @@ type Link struct {
 // allowed both by it and by the document the last Reload applied.
 func New(stack *tunnel.Stack, doc func() *linkdoc.Doc) *Link {
 	return &Link{
-		stack:       stack,
-		doc:         doc,
-		DialTimeout: DefaultDialTimeout,
-		MaxStreams:  DefaultMaxStreams,
-		syncErr:     "link.json: not read yet",
-		streams:     map[*stream]struct{}{},
+		stack:             stack,
+		doc:               doc,
+		DialTimeout:       DefaultDialTimeout,
+		MaxControlStreams: DefaultMaxControlStreams,
+		MaxDataStreams:    DefaultMaxDataStreams,
+		syncErr:           "link.json: not read yet",
+		streams:           map[*stream]struct{}{},
 		rejected: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "wg_link_connect_rejected_total", Help: "CONNECT requests link refused, by path and reason.",
 		}, []string{"path", "reason"}),
