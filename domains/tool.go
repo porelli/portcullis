@@ -12,6 +12,9 @@ package main
 //	    visible (or, --settle, before the old records' caches expired: the
 //	    records were written either way, see wait.go); 2 usage or input; 3 provider or lookup failure (the
 //	    message on stderr, redacted).
+//	domains mail-cert [--next-key | --switch-key]
+//	    the mail certificate for MAIL_HOSTNAME (mailcert.go), run as the
+//	    compose tools service mail-cert.
 //	domains traefik-account-uri <acme.json>
 //	    prints exactly Traefik's ACME account URI (the file holds private
 //	    keys: nothing else of it is ever printed).
@@ -87,6 +90,12 @@ type toolEnv struct {
 	stdin          io.Reader
 	stdout, stderr io.Writer
 	resolvers      []string
+	// mail-cert only ("" / 0 = the defaults in mailcert.go): its volumes,
+	// lego's HTTP client (tests: Pebble's TLS) and its waits.
+	acmeDir, tlsDir           string
+	acmeHTTPClient            *http.Client
+	caaWait, caaPoll          time.Duration
+	propTimeout, propInterval time.Duration
 }
 
 func resolversFromEnv() []string {

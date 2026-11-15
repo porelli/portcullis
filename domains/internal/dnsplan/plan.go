@@ -133,6 +133,9 @@ type Spec struct {
 	// off). Main: the main domain (removal by signature instead).
 	Owned []Ref
 	Main  bool
+	// NoWild: the CAA entries are issue only, no issuewild (mail-cert's
+	// pin at MAIL_HOSTNAME, a single-name certificate).
+	NoWild bool
 }
 
 // Provider is what the plan needs from a libdns provider.

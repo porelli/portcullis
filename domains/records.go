@@ -408,15 +408,23 @@ func (s *Service) applySets(ctx context.Context, p dnsProvider, d *Domain, sets 
 // accountURI at every resolver, each asked on its own (one may still
 // cache the old pin), bounded by RecordsWait.
 func (s *Service) waitCAA(ctx context.Context, name, accountURI string) error {
-	deadline := time.Now().Add(s.cfg.RecordsWait)
+	return waitIssuable(ctx, s.cfg.Resolvers, s.cfg.CAAIssuer, accountURI, []string{name, "*." + name}, s.cfg.RecordsWait, s.cfg.RecordsPoll)
+}
+
+// waitIssuable polls until the CA (issuer) would issue for every name
+// ("*." = a wildcard) to accountURI at every resolver, each asked on its
+// own, bounded by wait (polled every poll). mail-cert uses it without a
+// Service.
+func waitIssuable(ctx context.Context, resolvers []string, issuer, accountURI string, names []string, wait, poll time.Duration) error {
+	deadline := time.Now().Add(wait)
 	check := func() error {
-		for _, r := range s.cfg.Resolvers {
-			for _, n := range []string{name, "*." + name} {
+		for _, r := range resolvers {
+			for _, n := range names {
 				_, rrs, err := dnsplan.EffectiveCAA(ctx, []string{r}, n)
 				if err != nil {
 					return err
 				}
-				if !dnsplan.WouldIssue(rrs, s.cfg.CAAIssuer, accountURI, strings.HasPrefix(n, "*.")) {
+				if !dnsplan.WouldIssue(rrs, issuer, accountURI, strings.HasPrefix(n, "*.")) {
 					return fmt.Errorf("%s at %s doesn't allow issuance to this ACME account yet", n, r)
 				}
 			}
@@ -425,13 +433,13 @@ func (s *Service) waitCAA(ctx context.Context, name, accountURI string) error {
 	}
 	for {
 		err := check()
-		if err == nil || time.Now().Add(s.cfg.RecordsPoll).After(deadline) {
+		if err == nil || time.Now().Add(poll).After(deadline) {
 			return err
 		}
 		select {
 		case <-ctx.Done():
 			return errors.Join(err, ctx.Err())
-		case <-time.After(s.cfg.RecordsPoll):
+		case <-time.After(poll):
 		}
 	}
 }
