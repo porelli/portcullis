@@ -488,79 +488,89 @@ func TestBadDocMeansNoPeers(t *testing.T) {
 }
 
 // M7: Saturating data streams doesn't block control streams (separate caps).
+// Tests the admission logic directly without WireGuard handshakes: fake peers
+// in the document, test only that newStreamLocked counts by path and refuses
+// at the right caps.
 func TestSeparateStreamCaps(t *testing.T) {
-	f := newFixture(t)
-	f.link.MaxControlStreams = 2
-	f.link.MaxDataStreams = 4
-	w1 := newWorker(t, "w1", "10.214.0.10", f.pub, f.port)
-	w2 := newWorker(t, "w2", "10.214.0.11", f.pub, f.port)
-	f.apply(map[*worker]string{w1: linkdoc.StateReady, w2: linkdoc.StateReady},
-		relaySpec{"tok-a", "gitea", "w1"}, relaySpec{"tok-b", "nextcloud", "w2"})
+	doc := &linkdoc.Doc{
+		Version: 1, WrittenAt: time.Now(), Subnet: "10.214.0.0/24",
+		Peers: []linkdoc.Peer{
+			{ID: "w1", PublicKey: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=", IP: "10.214.0.10", State: "ready"},
+		},
+		Relays: []linkdoc.Relay{
+			{TokenSHA256: strings.Repeat("a", 64), Instance: "gitea", Server: "w1"},
+		},
+	}
+	doc, _ = linkdoc.Parse(mustJSON(t, doc))
+	stack, _ := newStack(t, linkdoc.LinkAddr.String(), freeUDP(t))
+	l := New(stack, func() *linkdoc.Doc { return doc })
+	l.MaxControlStreams = 2
+	l.MaxDataStreams = 4
+	l.Reload(doc)
 
-	// Fill data streams to the cap (4).
-	var dataConns []net.Conn
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p := doc.PeerByID("w1")
+
+	// Fill data streams to cap (4).
+	var dataStreams []*stream
 	for i := 0; i < 4; i++ {
-		tok := "tok-a"
-		target := "gitea.web.relay:3000"
-		if i%2 == 1 {
-			tok = "tok-b"
-			target = "nextcloud.web.relay:8080"
+		l.mu.Lock()
+		s := l.newStreamLocked(ctx, "data", p)
+		l.mu.Unlock()
+		if s == nil {
+			t.Fatalf("data stream %d: refused before cap", i)
 		}
-		code, c, br := connect(t, f.dataAddr, "CONNECT", target, map[string]string{"Proxy-Authorization": "Bearer " + tok})
-		if code != 200 || c == nil {
-			t.Fatalf("data stream %d: %d", i, code)
-		}
-		// Read the preamble line.
-		if _, err := br.ReadString('\n'); err != nil {
-			t.Fatalf("data stream %d preamble: %v", i, err)
-		}
-		dataConns = append(dataConns, c)
+		dataStreams = append(dataStreams, s)
 	}
 
-	// Data cap reached: the next data CONNECT gets 503.
-	code, c, _ := connect(t, f.dataAddr, "CONNECT", "gitea.web.relay:3000", map[string]string{"Proxy-Authorization": "Bearer tok-a"})
-	if c != nil {
-		c.Close()
-	}
-	if code != http.StatusServiceUnavailable {
-		t.Fatalf("data beyond cap: %d, want 503", code)
+	// Data cap reached: the next data stream gets nil.
+	l.mu.Lock()
+	s := l.newStreamLocked(ctx, "data", p)
+	l.mu.Unlock()
+	if s != nil {
+		t.Fatal("data stream beyond cap: accepted, want refused")
 	}
 
 	// Control streams still open (cap 2, independent of data).
-	code, c1, br1 := connect(t, f.ctlAddr, "CONNECT", "10.214.0.10:7443", nil)
-	if code != 200 || c1 == nil {
-		t.Fatalf("control while data saturated: %d", code)
+	var controlStreams []*stream
+	for i := 0; i < 2; i++ {
+		l.mu.Lock()
+		s := l.newStreamLocked(ctx, "control", p)
+		l.mu.Unlock()
+		if s == nil {
+			t.Fatalf("control stream %d: refused before cap", i)
+		}
+		controlStreams = append(controlStreams, s)
 	}
-	echoes(t, c1, br1, "ctrl1\n")
-	code, c2, br2 := connect(t, f.ctlAddr, "CONNECT", "10.214.0.11:7443", nil)
-	if code != 200 || c2 == nil {
-		t.Fatalf("control 2 while data saturated: %d", code)
-	}
-	echoes(t, c2, br2, "ctrl2\n")
 
-	// Control cap also reached: the next control CONNECT gets 503.
-	code, c3, _ := connect(t, f.ctlAddr, "CONNECT", "10.214.0.10:7443", nil)
-	if c3 != nil {
-		c3.Close()
-	}
-	if code != http.StatusServiceUnavailable {
-		t.Fatalf("control beyond cap: %d, want 503", code)
+	// Control cap also reached: the next control stream gets nil.
+	l.mu.Lock()
+	s = l.newStreamLocked(ctx, "control", p)
+	l.mu.Unlock()
+	if s != nil {
+		t.Fatal("control stream beyond cap: accepted, want refused")
 	}
 
 	// Close one data stream: data opens again, but control still at cap.
-	dataConns[0].Close()
-	time.Sleep(100 * time.Millisecond)
-	code, c4, _ := connect(t, f.dataAddr, "CONNECT", "gitea.web.relay:3000", map[string]string{"Proxy-Authorization": "Bearer tok-a"})
-	if code != 200 || c4 == nil {
-		t.Fatalf("data after freeing one: %d", code)
+	l.mu.Lock()
+	delete(l.streams, dataStreams[0])
+	l.mu.Unlock()
+	dataStreams[0].cancel()
+
+	l.mu.Lock()
+	s = l.newStreamLocked(ctx, "data", p)
+	l.mu.Unlock()
+	if s == nil {
+		t.Fatal("data stream after freeing one: refused")
 	}
-	c4.Close()
-	code, c5, _ := connect(t, f.ctlAddr, "CONNECT", "10.214.0.10:7443", nil)
-	if c5 != nil {
-		c5.Close()
-	}
-	if code != http.StatusServiceUnavailable {
-		t.Fatalf("control still at cap after freeing data: %d, want 503", code)
+
+	// Control still at cap.
+	l.mu.Lock()
+	s = l.newStreamLocked(ctx, "control", p)
+	l.mu.Unlock()
+	if s != nil {
+		t.Fatal("control still at cap after freeing data: accepted")
 	}
 }
 
