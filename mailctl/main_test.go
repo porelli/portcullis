@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/portcullis/mailctl/internal/config"
+	"github.com/portcullis/mailctl/internal/stalwart"
 )
 
 func startCfg(t *testing.T, key, hub string) config.Config {
@@ -78,5 +79,21 @@ func TestSubcommands(t *testing.T) {
 	}
 	if rc := run([]string{"serve"}, env, &out, &errb); rc != 1 || !strings.Contains(errb.String(), "MAILCTL_API_SUBNET is required") {
 		t.Errorf("serve without config: %d %s", rc, errb.String())
+	}
+}
+
+// M13 over every package mailctl links: each object, field, variant and
+// enum value sent is in the v1.1.0 schema snapshot.
+func TestEveryUsedFieldInSchema(t *testing.T) {
+	raw, err := os.ReadFile("internal/stalwart/testdata/schema-v1.1.0.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := stalwart.ParseSchema(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bad := s.Check(stalwart.Used); len(bad) > 0 {
+		t.Fatalf("not in the schema:\n%s", strings.Join(bad, "\n"))
 	}
 }

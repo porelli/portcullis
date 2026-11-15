@@ -30,7 +30,7 @@ var MailctlRolePermissions = func() []string {
 		"sysAccountGet", "sysAccountCreate", "sysAccountUpdate", "sysAccountDestroy", "sysAccountQuery",
 		"sysDomainGet", "sysDomainCreate", "sysDomainUpdate", "sysDomainDestroy", "sysDomainQuery",
 		"sysDkimSignatureGet", "sysDkimSignatureCreate", "sysDkimSignatureUpdate", "sysDkimSignatureDestroy", "sysDkimSignatureQuery",
-		"sysAppPasswordGet", "sysAppPasswordCreate", "sysAppPasswordDestroy", "sysAppPasswordQuery",
+		"sysAppPasswordGet", "sysAppPasswordCreate", "sysAppPasswordUpdate", "sysAppPasswordDestroy", "sysAppPasswordQuery",
 		"sysMailingListGet", "sysMailingListCreate", "sysMailingListUpdate", "sysMailingListDestroy", "sysMailingListQuery",
 		"sysQueuedMessageGet", "sysQueuedMessageQuery",
 		"sysActionCreate", "actionReloadSettings", "actionReloadTlsCertificates", "actionInvalidateCaches", "actionReloadLookupStores",
@@ -43,6 +43,11 @@ var MailctlRolePermissions = func() []string {
 		"sysHttpLookupGet", "sysHttpLookupQuery", "sysHttpLookupUpdate",
 		"sysSpamDnsblServerGet", "sysSpamDnsblServerQuery", "sysSpamDnsblServerUpdate",
 		"sysSenderAuthGet", "sysSenderAuthUpdate",
+		// The per-account limits (MtaInboundThrottle) and, with
+		// MAIL_SUBMISSION_LAN_ONLY, the SASL rule (MtaStageAuth).
+		"sysMtaInboundThrottleGet", "sysMtaInboundThrottleCreate", "sysMtaInboundThrottleUpdate",
+		"sysMtaInboundThrottleDestroy", "sysMtaInboundThrottleQuery",
+		"sysMtaStageAuthGet", "sysMtaStageAuthUpdate",
 	}
 	seen := map[string]bool{}
 	var out []string

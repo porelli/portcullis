@@ -29,10 +29,14 @@ import (
 	"github.com/portcullis/mailctl/internal/api"
 	"github.com/portcullis/mailctl/internal/bootstrap"
 	"github.com/portcullis/mailctl/internal/config"
+	"github.com/portcullis/mailctl/internal/creds"
+	"github.com/portcullis/mailctl/internal/export"
 	"github.com/portcullis/mailctl/internal/logx"
 	"github.com/portcullis/mailctl/internal/metrics"
+	"github.com/portcullis/mailctl/internal/reconcile"
 	"github.com/portcullis/mailctl/internal/spamrules"
 	"github.com/portcullis/mailctl/internal/stalwart"
+	"github.com/portcullis/mailctl/internal/state"
 )
 
 const usage = `usage: mailctl [serve|healthcheck|bootstrap [--rotate-key|--verify-gone]|void|dns|rotate|reload-tls|status|export|test]`
@@ -40,7 +44,7 @@ const usage = `usage: mailctl [serve|healthcheck|bootstrap [--rotate-key|--verif
 // later are the subcommands later tasks fill (each talks to the running
 // serve process or to Stalwart directly, as its task says).
 var later = map[string]bool{
-	"void": true, "dns": true, "rotate": true, "status": true, "export": true, "test": true,
+	"dns": true, "rotate": true, "status": true, "test": true,
 }
 
 func main() { os.Exit(run(os.Args[1:], os.Getenv, os.Stdout, os.Stderr)) }
@@ -64,6 +68,10 @@ func run(args []string, env func(string) string, stdout, stderr io.Writer) int {
 		return healthcheck(env)
 	case cmd == "bootstrap":
 		return bootstrapCmd(args[1:], env, os.Stdin, stdout, stderr)
+	case cmd == "void":
+		return voidCmd(args[1:], env, os.Stdin, stdout, stderr)
+	case cmd == "export":
+		return exportCmd(args[1:], env, stdout, stderr)
 	case cmd == "reload-tls":
 		return reloadTLS(env, stderr)
 	case later[cmd]:
@@ -139,7 +147,13 @@ func serve(env func(string) string, stderr io.Writer) error {
 	key, _ := api.ReadSecret(cfg.APIKeyFile, 1)
 	sw := stalwart.New(cfg.StalwartURL, stalwart.Bearer(key))
 
-	apiSrv := &api.Server{Subnet: cfg.APISubnet, SecretFile: cfg.HubSecretFile, Logf: logger.Printf}
+	st, err := state.Open(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	runner := reconcile.NewRunner(sw, st, cfg.FormerRetain, cfg.LANOnly, logger.Printf)
+	v1 := &api.V1{Store: st, C: sw, Runner: runner, LANOnly: cfg.LANOnly, Logf: logger.Printf}
+	apiSrv := &api.Server{Subnet: cfg.APISubnet, SecretFile: cfg.HubSecretFile, Logf: logger.Printf, Handler: v1.Handler()}
 	servers := []*http.Server{
 		newServer(cfg.APIAddr, apiSrv),
 		// The well-known files (Task 8); until then every path is 404.
@@ -162,6 +176,7 @@ func serve(env func(string) string, stderr io.Writer) error {
 		}(s, ln)
 	}
 	go keepLookupsOff(ctx, sw, logger.Printf)
+	go runner.Run(ctx)
 	logger.Printf("mailctl: serving the Hub API on %s, well-known files on %s, spam rules on %s, metrics on %s",
 		cfg.APIAddr, cfg.WellKnownAddr, cfg.RulesAddr, cfg.MetricsAddr)
 	select {
@@ -317,5 +332,82 @@ func reloadTLS(env func(string) string, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "mailctl reload-tls: %s\n", logx.Redact(err.Error()))
 		return 1
 	}
+	return 0
+}
+
+// voidCmd is `mailctl void --reason restore` (stdin: the recovery
+// credentials; contract §19.11): every app password of every account is
+// destroyed and restored_at recorded. Prints {"voided": n}.
+func voidCmd(args []string, env func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) != 2 || args[0] != "--reason" || args[1] != "restore" {
+		fmt.Fprintln(stderr, "usage: mailctl void --reason restore < credentials.json")
+		return 2
+	}
+	cfg, err := config.Load(env)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl void: %v\n", err)
+		return 1
+	}
+	cr, err := bootstrap.ReadCredentials(stdin)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl void: %v\n", err)
+		return 2
+	}
+	logx.AddSecret(cr.RecoveryPassword)
+	st, err := state.Open(cfg.DataDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl void: %v\n", err)
+		return 1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	n, err := creds.VoidAll(ctx, stalwart.New(cfg.StalwartURL, stalwart.Basic(cr.RecoveryUser, cr.RecoveryPassword)))
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl void: %s (voided %d)\n", logx.Redact(err.Error()), n)
+		return 1
+	}
+	now := time.Now().UTC()
+	if err := st.Update(func(p *state.Persistent) error { p.RestoredAt = &now; return nil }); err != nil {
+		fmt.Fprintf(stderr, "mailctl void: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(stdout, "{\"voided\":%d}\n", n)
+	return 0
+}
+
+// exportCmd is `mailctl export --former <former-id>` (M5): mbox to stdout,
+// one log line on stderr (no content). A non-former account exits 2.
+func exportCmd(args []string, env func(string) string, stdout, stderr io.Writer) int {
+	if len(args) != 2 || args[0] != "--former" {
+		fmt.Fprintln(stderr, "usage: mailctl export --former <former-id>")
+		return 2
+	}
+	cfg, err := config.Load(env)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl export: %v\n", err)
+		return 1
+	}
+	key, err := api.ReadSecret(cfg.APIKeyFile, 1)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl export: Stalwart's API key: %v\n", err)
+		return 1
+	}
+	logx.AddSecret(key)
+	u, _ := url.Parse(cfg.StalwartURL)
+	e := &export.Exporter{C: stalwart.New(cfg.StalwartURL, stalwart.Bearer(key)), IMAPAddr: net.JoinHostPort(u.Hostname(), "10993"),
+		ServerName: cfg.Hostname, MailctlIP: cfg.MailIP}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+	defer cancel()
+	n, err := e.Export(ctx, args[1], stdout)
+	logger := logx.New(stderr)
+	if errors.Is(err, export.ErrNotFormer) {
+		fmt.Fprintf(stderr, "mailctl export: %s: %v\n", args[1], err)
+		return 2
+	}
+	if err != nil {
+		logger.Printf("export former=%s messages=%d failed: %v", args[1], n, err)
+		return 1
+	}
+	logger.Printf("export former=%s messages=%d", args[1], n)
 	return 0
 }
