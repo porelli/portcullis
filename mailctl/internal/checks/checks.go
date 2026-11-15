@@ -65,7 +65,6 @@ type Config struct {
 	MainDomain    string
 	PublicIPv4    netip.Addr
 	PublicIPv6    netip.Addr
-	IPv6          bool
 	Resolvers     []string // the public resolvers
 	LocalResolver string   // mail-resolver
 	DQSKeyFile    string

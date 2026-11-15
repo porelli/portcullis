@@ -154,13 +154,7 @@ runtime_export() {
     PORTCULLIS_VPN_RUNTIME_POOLS="$(printf '%s' "$PORTCULLIS_VPN_RUNTIME_POOLS" | xargs)"
     return 0
   fi
-  if ! _rt_is_podman; then
-    # Mail's IPv6 ports (MAIL_IPV6=on, Docker only): the CLI's override.
-    if [ "${MAIL_IPV6:-off}" = on ] && [ -f "$PORTCULLIS_ROOT/secrets/mail/ipv6.override.yml" ]; then
-      _rt_compose_add "$PORTCULLIS_ROOT/secrets/mail/ipv6.override.yml"
-    fi
-    return 0
-  fi
+  _rt_is_podman || return 0
   export PORTCULLIS_VPN_RUNTIME_POOLS="$RT_PODMAN_POOLS"
   sock="$(runtime_podman_socket)"
   if [ -n "${DOCKER_HOST:-}" ] && [ "$DOCKER_HOST" != "unix://$sock" ]; then
@@ -177,18 +171,6 @@ runtime_export() {
   for f in "${add[@]}"; do
     case ":$files:" in *":$f:"*|*":${f##*/}:"*) ;; *) files="$files:$f" ;; esac
   done
-  export COMPOSE_FILE="$files"
-}
-
-# _rt_compose_add <file> — COMPOSE_FILE gains <file> once (compose's
-# defaults first when it was unset).
-_rt_compose_add() {
-  local files="${COMPOSE_FILE:-}"
-  if [ -z "$files" ]; then
-    files="$PORTCULLIS_ROOT/docker-compose.yml"
-    [ ! -f "$PORTCULLIS_ROOT/docker-compose.override.yml" ] || files="$files:$PORTCULLIS_ROOT/docker-compose.override.yml"
-  fi
-  case ":$files:" in *":$1:"*) ;; *) files="$files:$1" ;; esac
   export COMPOSE_FILE="$files"
 }
 

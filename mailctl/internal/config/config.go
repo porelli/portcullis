@@ -51,7 +51,6 @@ type Config struct {
 	DKIMRotate   time.Duration
 	FormerRetain time.Duration
 	LANOnly      bool // MAIL_SUBMISSION_LAN_ONLY
-	IPv6         bool // MAIL_IPV6=on
 
 	Relay *Relay // nil without MAIL_RELAY_HOST
 
@@ -262,8 +261,10 @@ func Load(env func(string) string) (Config, error) {
 	if c.LANOnly, err = boolTF(env, "MAIL_SUBMISSION_LAN_ONLY"); err != nil {
 		return c, err
 	}
-	if c.IPv6, err = onOff(env, "MAIL_IPV6"); err != nil {
-		return c, err
+	// IPv6 for mail isn't supported yet (published [::] ports go through
+	// docker-proxy, which rewrites client addresses): refused, not ignored.
+	if strings.TrimSpace(env("MAIL_IPV6")) != "" {
+		return c, fmt.Errorf("MAIL_IPV6 isn't supported yet")
 	}
 
 	if h := strings.TrimSpace(env("MAIL_RELAY_HOST")); h != "" {

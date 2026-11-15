@@ -1004,6 +1004,12 @@ _backup_restore_docker() {
   _restore_pg "$dir"
   _restore_vault "$dir"
 
+  # The mail store comes back with its old mail passwords: the marker first,
+  # so no start path serves them before the void (M7).
+  if [ -f "$dir/mail_data.tar.gz" ]; then
+    (umask 077 && mkdir -p "$(_mail_dir)" && : > "$(mail_void_marker)") || fail "could not write $(mail_void_marker)"
+    chmod 600 "$(mail_void_marker)"
+  fi
   for spec in $BACKUP_FILE_VOLUMES $BACKUP_MAIL_STOPPED_VOLUMES; do
     IFS=: read -r key uid gid <<< "$spec"
     [ -f "$dir/$key.tar.gz" ] || continue
@@ -1072,14 +1078,15 @@ _backup_restore_docker() {
   _restore_lost_devices_note
 }
 
-# _restore_mail_void <backup dir> — M7: with the mail profile and a mail
-# store in the backup, every restored mail password is voided in a recovery
-# session before mail serves anyone. Returns 1 (mail and mailctl stopped)
-# when that fails.
+# _restore_mail_void <backup dir> — M7: with the mail profile and the
+# void-pending marker (written before the mail store was restored), every
+# restored mail password is voided in a recovery session before mail serves
+# anyone. Returns 1 (mail and mailctl stopped, the marker kept) when that
+# fails.
 _restore_mail_void() {
-  mail_profile_on && [ -f "$1/mail_data.tar.gz" ] || return 0
-  info "Voiding the restored mail passwords (recovery session)..."
-  if (mail_recovery_session mail_void_restore); then return 0; fi
+  # Without the profile the marker stays: mail enable voids first.
+  mail_profile_on && mail_void_pending || return 0
+  if mail_void_if_pending; then return 0; fi
   rt_stop mail mailctl >/dev/null 2>&1 || true
   return 1
 }

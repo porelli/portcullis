@@ -247,7 +247,7 @@ func machinesConfig(cfg config.Config) machines.Config {
 // checksConfig is the checks' part of the environment.
 func checksConfig(cfg config.Config) checks.Config {
 	return checks.Config{Hostname: cfg.Hostname, MainDomain: cfg.MainDomain, PublicIPv4: cfg.PublicIPv4, PublicIPv6: cfg.PublicIPv6,
-		IPv6: cfg.IPv6, Resolvers: cfg.Resolvers, LocalResolver: cfg.LocalResolver, DQSKeyFile: cfg.DQSKeyFile,
+		Resolvers: cfg.Resolvers, LocalResolver: cfg.LocalResolver, DQSKeyFile: cfg.DQSKeyFile,
 		ClientIP: cfg.ClientIP, MailIP: mailIP(cfg.StalwartURL)}
 }
 

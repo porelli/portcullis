@@ -4994,7 +4994,7 @@ expect_eq "mail_prom_targets: profile on → mail + mailctl targets, the metrics
 mt 'export MONITORING_SECRETS="$PORTCULLIS_ROOT/secrets/monitoring" COMPOSE_PROFILES=monitoring; mkdir -p "$MONITORING_SECRETS/prometheus"; printf x > "$MONITORING_SECRETS/prometheus/mail-metrics-secret"; mail_prom_targets'
 expect_eq "mail_prom_targets: profile off → [] and an empty password copy" "$(cat "$P/mail-targets.json"):$(wc -c < "$P/mail-metrics-secret" | tr -d ' ')" "[]:0"
 
-# ── mail status / backup / restore / IPv6 / export (Task 10) ──
+# ── mail status / backup / restore / export (Task 10) ──
 mt 'export COMPOSE_PROFILES=monitoring; out="$(mail_status_json)"; printf "[%s]" "$out" > "$ML/sj"'
 expect_eq "mail_status_json: nothing with the profile off (status --json has no mail key)" "$(cat "$ML/sj")" "[]"
 export MSTAT='{"status":{"cert":{"not_after":"2027-02-01T00:00:00Z","sans":["mail.mail.example"]},"dkim":[{"domain":"mail.example","selector":"v1-ed25519-20261115","stage":"active"}],"mtasts":[{"domain":"mail.example","mode":"testing","enforce_ready":false}],"dmarc":[{"domain":"mail.example","policy":"reject","proposed":null}],"queue":{"messages":2,"deferred":1},"former":[]},"checks":{"checks":[{"id":"cert","severity":"problem","detail":"expired"},{"id":"port25","severity":"info","detail":"not known"},{"id":"blocklist","severity":"ok","detail":"not listed"}]}}'
@@ -5029,31 +5029,47 @@ mkdir -p "$WORK/strip/mail" && touch "$WORK/strip/mail/recovery.env" "$WORK/stri
 _strip_host_files "$WORK/strip"
 expect_eq "backup / restore: the recovery admin, update.env and the image stamp are never kept (P51)" "$(ls -A "$WORK/strip/mail" | tr '\n' ' ')" "api-key "
 
-# Restore (M7): void in a recovery session; on failure mail and mailctl stay stopped.
-mt 'touch "$ML/mail_data.tar.gz"; mail_recovery_session() { echo "session $*" >> "$ML/argv"; return 1; }; rt_stop() { echo "stop $*" >> "$ML/argv"; }; _restore_mail_void "$ML"'; rc=$?
-expect_eq "restore: voiding fails → mail and mailctl stopped, refused" "$rc:$(grep -E '^(session|stop)' "$ML/argv" | tr '\n' '|')" "1:session mail_void_restore|stop mail mailctl|"
+# Restore (M7, security review): the void-pending marker gates every start.
+# The session stub runs the step with a password on fd 3; dc's void answer
+# is ML_VOID_RC.
+VP='mail_recovery_session() { echo "session $*" >> "$ML/argv"; "$1" 3<<<pw; }; rt_stop() { echo "stop $*" >> "$ML/argv"; }'
+mt "$VP"'; : > "$(mail_void_marker)"; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; return 1; }; _restore_mail_void "$ML"'; rc=$?
+expect_eq "restore: the void fails → refused, mail and mailctl stopped, the marker kept" \
+  "$rc:$(grep -E '^(session|stop)' "$ML/argv" | tr '\n' '|'):$([ -e "$ML/root/secrets/mail/void-pending" ] && echo kept)" "1:session mail_void_restore|stop mail mailctl|:kept"
+mt "$VP"'; : > "$(mail_void_marker)"; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; }; _restore_mail_void "$ML"'; rc=$?
+expect_eq "restore: voided → the marker removed, nothing stopped" \
+  "$rc:$(grep -E '^(session|stop)' "$ML/argv" | tr '\n' '|'):$([ -e "$ML/root/secrets/mail/void-pending" ] && echo kept || echo gone)" "0:session mail_void_restore|:gone"
+mt "$VP"'; _restore_mail_void "$ML"'; rc=$?
+expect_eq "restore: no marker (no mail store in the backup) → no session" "$rc:$(cat "$ML/argv" 2>/dev/null | grep -c session)" "0:0"
 mt 'RESTORE_MAIL_UNVOIDED=true; _restore_mail_outcome'; rc=$?
 expect_eq "restore: the unvoided outcome fails with the retry hint" "$rc:$(grep -c 'mail passwords could not be voided: mail stays stopped (./portcullis mail enable to retry)' "$ML/out")" "1:1"
-mt 'touch "$ML/mail_data.tar.gz"; mail_recovery_session() { echo "session $*" >> "$ML/argv"; }; rt_stop() { echo "stop $*" >> "$ML/argv"; }; _restore_mail_void "$ML"'; rc=$?
-expect_eq "restore: voided in a recovery session, nothing stopped" "$rc:$(grep -E '^(session|stop)' "$ML/argv" | tr '\n' '|')" "0:session mail_void_restore|"
-mt 'mail_recovery_session() { echo session >> "$ML/argv"; }; _restore_mail_void "$ML"'; rc=$?
-expect_eq "restore: a backup without a mail store → no session" "$rc:$(cat "$ML/argv" 2>/dev/null | grep -c session)" "0:0"
-mt 'MAIL_PW_SEEN=""; dc() { echo "dc $*" >> "$ML/argv"; cat > "$ML/stdin"; }; mail_void_restore 3<<<"s3cret-pw"'
-expect_eq "restore: mailctl void gets the recovery credentials on stdin only" \
-  "$(grep -c '^dc run --rm --no-deps -T mailctl void --reason restore$' "$ML/argv"):$(grep -c s3cret "$ML/argv"):$(jq -r .recovery_password "$ML/stdin")" "1:0:s3cret-pw"
+mt 'dc() { echo "dc $*" >> "$ML/argv"; cat > "$ML/stdin"; }; : > "$(mail_void_marker)"; mail_void_restore 3<<<"s3cret-pw"'
+expect_eq "restore: mailctl void gets the recovery credentials on stdin only; success removes the marker" \
+  "$(grep -c '^dc run --rm --no-deps -T mailctl void --reason restore$' "$ML/argv"):$(grep -c s3cret "$ML/argv"):$(jq -r .recovery_password "$ML/stdin"):$([ -e "$ML/root/secrets/mail/void-pending" ] && echo kept || echo gone)" "1:0:s3cret-pw:gone"
+# up / upgrade with the marker: never mail without the void first.
+UP='mail_port_start_ok() { :; }; mail_config_present() { :; }; mail_tls_present() { :; }; printf API_k > "$PORTCULLIS_ROOT/secrets/mail/api-key"'
+mt "$VP; $UP"'; : > "$(mail_void_marker)"; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; [ "$1" != run ]; }; mail_up_steps up; printf "%s" "$COMPOSE_PROFILES" > "$ML/prof"'; rc=$?
+expect_eq "up with the marker and a failing void: mail and mailctl stopped, the stack starts without the mail profile, the marker kept" \
+  "$rc:$(grep -c '^dc --profile mail stop mail mailctl$' "$ML/argv"):$(cat "$ML/prof"):$(grep -c 'not voided yet' "$ML/out"):$([ -e "$ML/root/secrets/mail/void-pending" ] && echo kept)" "0:1::1:kept"
+mt "$VP; $UP"'; : > "$(mail_void_marker)"; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; }; mail_up_steps up; printf "%s" "$COMPOSE_PROFILES" > "$ML/prof"'; rc=$?
+expect_eq "up with the marker: the void session first, then mail starts normally (profile kept), the marker gone" \
+  "$rc:$(grep -m1 '^session' "$ML/argv"):$(cat "$ML/prof"):$([ -e "$ML/root/secrets/mail/void-pending" ] && echo kept || echo gone)" "0:session mail_void_restore:mail:gone"
+mt ': > "$(mail_void_marker)"; mail_after_up'; rc=$?
+expect_eq "mail_after_up never recreates mail while the marker exists" "$rc:$(cat "$ML/argv" 2>/dev/null | grep -c .)" "0:0"
+mt ': > "$(mail_void_marker)"; _mail_recovery_end'
+expect_eq "a recovery session ending with the marker stops mail, never back to normal mode" "$(tr '\n' '|' < "$ML/argv")" "stop mail|"
+mt 'rt_health() { echo healthy; }; rt_exec() { printf "%s" "$MSTAT"; }; _mail_timer_state() { echo active; }; : > "$(mail_void_marker)"
+  mail_status_json > "$ML/sj"; mail_status_lines "$(cat "$ML/sj")" | sed "s/\x1b\[[0-9;]*m//g" > "$ML/sl"'
+expect_eq "status: the marker is a problem line" "$(jq -r .void_pending "$ML/sj"):$(grep -c '✗ mail passwords from a restore are not voided yet' "$ML/sl")" "true:1"
 
-# IPv6 (P48): refused under Podman and without Docker's ip6tables; the override's four [::] lines.
-mt 'export MAIL_IPV6=on CONTAINER_RUNTIME=podman; mail_ipv6_ok'; rc=$?
-expect_eq "MAIL_IPV6=on refused on rootless Podman" "$rc:$(grep -c 'rootless Podman: it rewrites IPv6 client addresses' "$ML/out")" "1:1"
-mt 'export MAIL_IPV6=on DOCKER_DAEMON_JSON="$ML/daemon.json"; echo "{\"ipv6\":true,\"ip6tables\":false}" > "$DOCKER_DAEMON_JSON"; mail_ipv6_ok'; rc=$?
-expect_eq "MAIL_IPV6=on refused without ip6tables" "$rc:$(grep -c '"ip6tables": false' "$ML/out")" "1:1"
-mt 'export MAIL_IPV6=on DOCKER_DAEMON_JSON="$ML/none.json"; docker() { echo "docker $*" >> "$ML/argv"; [ "$2" != create ]; }; mail_ipv6_ok'; rc=$?
-expect_eq "MAIL_IPV6=on refused when Docker can't make an IPv6 network" "$rc:$(grep -c "can't create an IPv6 network" "$ML/out")" "1:1"
-mt 'export MAIL_IPV6=on DOCKER_DAEMON_JSON="$ML/none.json"; docker() { echo "docker $*" >> "$ML/argv"; }; mail_ipv6_ok && mail_ipv6_override && printf "%s" "$COMPOSE_FILE" > "$ML/cf"'; rc=$?
-expect_eq "MAIL_IPV6=on: the probe network removed, the override's four [::] lines, COMPOSE_FILE gains it" \
-  "$rc:$(grep -c '^docker network rm portcullis-ipv6-probe-' "$ML/argv"):$(grep -c '"\[::\]:' "$ML/root/secrets/mail/ipv6.override.yml"):$(grep -c 'ipv6.override.yml' "$ML/cf")" "0:1:4:1"
-mt 'touch "$PORTCULLIS_ROOT/secrets/mail/ipv6.override.yml"; mail_ipv6_ok && mail_ipv6_override'
-expect_eq "MAIL_IPV6=off: no check, the override removed" "$([ -e "$ML/root/secrets/mail/ipv6.override.yml" ] && echo kept || echo gone)" gone
+# IPv6 for mail isn't supported yet: a set MAIL_IPV6 is refused.
+mt 'export MAIL_IPV6=on; mail_ipv6_refuse'; rc=$?
+expect_eq "MAIL_IPV6 set → refused (isn't supported yet)" "$rc:$(grep -c "MAIL_IPV6 isn't supported yet" "$ML/out")" "1:1"
+mt 'export MAIL_IPV6=off; mail_ipv6_refuse'; rc=$?
+expect_eq "MAIL_IPV6=off is refused too (any value)" "$rc" 1
+mt 'mail_ipv6_refuse'; rc=$?
+expect_eq "MAIL_IPV6 unset → fine" "$rc" 0
+expect_eq "no [::] port and no MAIL_IPV6 in compose" "$(grep -cE '\[::\]:(25|465|587|993):|MAIL_IPV6' "$HERE/../docker-compose.yml")" 0
 
 # export: 0600 under backups/mail-export; nothing left on failure.
 mt 'rt_exec() { printf "From MAILER-DAEMON Sun Nov 15 10:00:00 2026\nSubject: x\n\nhi\n"; }; mail_export former-6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b ""'; rc=$?

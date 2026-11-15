@@ -35,7 +35,7 @@ func TestLoadDefaults(t *testing.T) {
 	if strings.Join(c.Resolvers, " ") != "1.1.1.1:53 8.8.8.8:53" {
 		t.Fatalf("resolvers %v", c.Resolvers)
 	}
-	if c.DKIMRotate != 4320*time.Hour || c.FormerRetain != 720*time.Hour || c.LANOnly || c.IPv6 || c.Relay != nil {
+	if c.DKIMRotate != 4320*time.Hour || c.FormerRetain != 720*time.Hour || c.LANOnly || c.Relay != nil {
 		t.Fatalf("defaults: %+v", c)
 	}
 	if strings.Join(c.WellKnownEntry, ",") != "websecure,vpnsecure" {
@@ -69,7 +69,7 @@ func TestLoadRefusesBad(t *testing.T) {
 		"MAIL_DKIM_ROTATE":         "180d",
 		"MAIL_FORMER_RETENTION":    "-1h",
 		"MAIL_SUBMISSION_LAN_ONLY": "yes",
-		"MAIL_IPV6":                "true",
+		"MAIL_IPV6":                "off",
 		"MAILCTL_PUBLIC_IPV4":      "2001:db8::1",
 		"DOMAINS_PUBLIC_IPV6":      "192.0.2.1",
 		"MAIL_RELAY_PORT":          "465",

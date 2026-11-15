@@ -226,6 +226,12 @@ _mail_recovery_start() {
 _mail_recovery_end() {
   _rt_docker_only
   rm -f "$(_mail_dir)/recovery.env"
+  # Restored passwords not voided (the void failed): mail stays stopped,
+  # never back in normal mode with them.
+  if mail_void_pending; then
+    dc stop mail >/dev/null 2>&1 || warn "could not stop mail: stop it by hand (docker compose stop mail)"
+    return 0
+  fi
   # shellcheck disable=SC2046  # "--no-build" or nothing
   dc up -d --no-deps $(runtime_no_build) mail >/dev/null 2>&1 || warn "could not recreate mail without the recovery admin: ./portcullis up"
 }
@@ -264,15 +270,30 @@ mail_recovery_session() {
   dc up -d --no-deps $(runtime_no_build) mailctl >/dev/null 2>&1 || warn "could not start mailctl: ./portcullis up"
 }
 
+# mail_void_marker — secrets/mail/void-pending (0600): written by restore
+# before the mail store comes back, removed only once its passwords are
+# voided. While it exists mail never starts normally (M7, security review).
+mail_void_marker() { printf '%s/void-pending' "$(_mail_dir)"; }
+mail_void_pending() { [ -e "$(mail_void_marker)" ]; }
+
 # mail_void_restore (fd 3: the password) — `mailctl void --reason restore`:
-# every mail password destroyed, restored_at recorded (M7). Credentials on
-# stdin only.
+# every mail password destroyed, restored_at recorded (M7), then the
+# marker removed. Credentials on stdin only.
 mail_void_restore() {
   local pw
   _rt_docker_only
   IFS= read -r pw <&3
   MAIL_PW="$pw" jq -n --arg u "$MAIL_RECOVERY_USER" '{recovery_user: $u, recovery_password: env.MAIL_PW}' \
-    | dc run --rm --no-deps -T mailctl void --reason restore
+    | dc run --rm --no-deps -T mailctl void --reason restore || return 1
+  rm -f "$(mail_void_marker)"
+}
+
+# mail_void_if_pending — with the marker: the void in a recovery session
+# (no egress) first; 0 when nothing is pending or the void succeeded.
+mail_void_if_pending() {
+  mail_void_pending || return 0
+  info "Mail passwords from a restore aren't voided yet: voiding them first (recovery session)..."
+  (mail_recovery_session mail_void_restore) && ! mail_void_pending
 }
 
 # _mail_verify_gone (fd 3: the password) — mailctl's one-shot checks that
@@ -363,66 +384,35 @@ mail_up_steps() {
   mail_port_start_ok || fail "$(mail_port_start_text)"
   mail_lan_only_ok "${MAIL_SUBMISSION_LAN_ONLY:-false}"
   [ "${MAILCTL_CLIENT_IP:-}" = "$(mail_client_ip_mode)" ] || _mail_set MAILCTL_CLIENT_IP "$(mail_client_ip_mode)"
-  mail_ipv6_ok
-  mail_ipv6_override
+  mail_ipv6_refuse
   mail_config_present || fail "mail is in COMPOSE_PROFILES but mail_etc/config.json is missing (Stalwart would start in bootstrap mode): run ./portcullis mail enable"
+  # A restore's passwords are voided before mail starts; if that fails
+  # mail and mailctl stay stopped and the rest starts without the profile.
+  if ! mail_void_if_pending; then
+    _rt_docker_only
+    dc --profile mail stop mail mailctl >/dev/null 2>&1 || true
+    COMPOSE_PROFILES="$(_mail_profiles_without_mail)"; export COMPOSE_PROFILES
+    warn "mail passwords from a restore are not voided yet: mail stays stopped (./portcullis mail enable to retry)"
+    return 0
+  fi
   mail_tls_present || mail_cert_ensure
   if [ "$mode" = upgrade ] || [ ! -s "$(_mail_dir)/api-key" ]; then
     mail_recovery_session mail_bootstrap_apply
   fi
 }
 
-# mail_ipv6_ok — MAIL_IPV6=on is possible here (P48): never under rootless
-# Podman (it rewrites IPv6 client addresses); under Docker the daemon must
-# keep ip6tables (daemon.json "ip6tables": false refuses; absent = Docker
-# ≥ 27's default true) and an IPv6 network must be creatable (a probe
-# network, removed at once).
-mail_ipv6_ok() {
-  local probe="portcullis-ipv6-probe-$$" cfg="${DOCKER_DAEMON_JSON:-/etc/docker/daemon.json}"
-  [ "${MAIL_IPV6:-off}" = on ] || return 0
-  if _rt_is_podman; then
-    fail "MAIL_IPV6=on is refused under rootless Podman: it rewrites IPv6 client addresses (set MAIL_IPV6=off)"
-  fi
-  if [ -r "$cfg" ] && [ "$(jq -r 'if type == "object" and has("ip6tables") then .ip6tables else true end' "$cfg" 2>/dev/null)" = false ]; then
-    fail "MAIL_IPV6=on needs Docker's ip6tables: $cfg says \"ip6tables\": false (Docker wouldn't filter IPv6 to the mail ports)"
-  fi
-  _mail_ipv6_probe "$probe" || fail "MAIL_IPV6=on: Docker can't create an IPv6 network here (enable IPv6 in the daemon: \"ipv6\": true, \"ip6tables\": true)"
-}
-
-# _mail_ipv6_probe <name> — an IPv6 network can be created (removed at once).
-_mail_ipv6_probe() {
-  _rt_docker_only
-  docker network create --ipv6 "$1" >/dev/null 2>&1 || return 1
-  docker network rm "$1" >/dev/null 2>&1 || true
-}
-
-# mail_ipv6_override — secrets/mail/ipv6.override.yml with mail's four
-# [::] port lines while MAIL_IPV6=on (added to COMPOSE_FILE by
-# runtime_export, and now), else removed.
-mail_ipv6_override() {
-  local f
-  f="$(_mail_dir)/ipv6.override.yml"
-  if [ "${MAIL_IPV6:-off}" != on ]; then
-    rm -f "$f"
-    return 0
-  fi
-  cat > "$f" <<'YML'
-# Written by ./portcullis (MAIL_IPV6=on): mail's ports on IPv6 too.
-services:
-  mail:
-    ports:
-      - "[::]:25:10025"
-      - "[::]:465:10465"
-      - "[::]:587:10587"
-      - "[::]:993:10993"
-YML
-  chmod 644 "$f"
-  _rt_compose_add "$f"
+# mail_ipv6_refuse — IPv6 for mail isn't supported yet: [::] ports onto an
+# IPv4-only network go through docker-proxy, which rewrites the client
+# address (LAN-only, SPF and the blocklists would judge the proxy). A set
+# MAIL_IPV6 is refused, never ignored.
+mail_ipv6_refuse() {
+  [ -z "${MAIL_IPV6:-}" ] || fail "MAIL_IPV6 isn't supported yet: remove it from .env"
 }
 
 # mail_after_up — after the stack is up: the image-change recreate.
 mail_after_up() {
   mail_profile_on || return 0
+  ! mail_void_pending || return 0
   _rt_docker_only
   mail_image_update
 }
@@ -436,7 +426,7 @@ mail_enable() {
   require_cmd docker jq openssl
   _dns_automated "${DNS_PROVIDER:-none}" || fail "mail needs a DNS provider Portcullis can write (see setup/mail.md): DNS_PROVIDER=${DNS_PROVIDER:-none}"
   mail_lan_only_ok "${lan:-${MAIL_SUBMISSION_LAN_ONLY:-false}}"
-  mail_ipv6_ok
+  mail_ipv6_refuse
   [ -z "$host" ] || _mail_set MAIL_HOSTNAME "$host"
   [ -z "$lan" ] || _mail_set MAIL_SUBMISSION_LAN_ONLY "$lan"
   _mail_set MAILCTL_CLIENT_IP "$(mail_client_ip_mode)"
@@ -447,10 +437,10 @@ mail_enable() {
   info "Mail for $(mail_hostname) (client addresses: $MAILCTL_CLIENT_IP)"
   mail_config_present || mail_config_install
   mail_cert_ensure
+  mail_void_if_pending || fail "mail passwords could not be voided: mail stays stopped (./portcullis mail enable to retry)"
   mail_recovery_session mail_bootstrap_apply
   hub_env_write
   mail_prom_targets
-  mail_ipv6_override
   if declare -F monitoring_fix_perms >/dev/null; then monitoring_fix_perms; fi
   stack_compose_up mail mail-resolver mailctl traefik hub
   mail_image_update
@@ -650,12 +640,12 @@ mail_status_json() {
   done
   ms="$(rt_exec mailctl -- mailctl status --json 2>/dev/null)" || ms=""
   printf '%s' "$ms" | jq -e 'type == "object"' >/dev/null 2>&1 || ms=""
-  jq -cn --argjson hs "$hs" --arg ms "$ms" --arg timer "$(_mail_timer_state)" \
+  jq -cn --argjson hs "$hs" --arg ms "$ms" --arg timer "$(_mail_timer_state)" --argjson vp "$(mail_void_pending && echo true || echo false)" \
     --arg cip "${MAILCTL_CLIENT_IP:-$(mail_client_ip_mode)}" --arg host "$(mail_hostname)" '
     ($ms | if . == "" then null else fromjson end) as $m
     | {enabled: true, hostname: $host, services: $hs, timer: $timer, client_ip: $cip,
-       mailctl: ($m.status // null), checks: ($m.checks // null)}
-    | .problem = (([.services[] | select(. != "healthy")] | length) > 0 or .mailctl == null
+       mailctl: ($m.status // null), checks: ($m.checks // null), void_pending: $vp}
+    | .problem = (.void_pending or ([.services[] | select(. != "healthy")] | length) > 0 or .mailctl == null
                   or ([(.checks.checks // [])[] | select(.severity == "problem")] | length) > 0)'
 }
 
@@ -668,6 +658,7 @@ mail_status_lines() {
     [ -n "$st" ] && _st_line "$st" "$text"
   done < <(printf '%s' "$j" | jq -r '
     def sev: if . == "problem" then "fail" elif . == "warning" then "warn" elif . == "info" then "note" else "ok" end;
+    (if .void_pending then ["fail", "mail passwords from a restore are not voided yet: mail stays stopped (./portcullis mail enable)"] else empty end),
     (.services | to_entries[] | [(if .value == "healthy" then "ok" else "fail" end), "\(.key): \(.value)"]),
     (if .mailctl == null then ["fail", "mailctl didn'"'"'t answer (its status and checks are unknown)"] else
       (.mailctl as $s
