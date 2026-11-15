@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/portcullis/mailctl/internal/checks"
 	"github.com/portcullis/mailctl/internal/creds"
 	"github.com/portcullis/mailctl/internal/machines"
 	"github.com/portcullis/mailctl/internal/reconcile"
@@ -33,6 +34,8 @@ type V1 struct {
 	Logf      func(string, ...any)
 	// M runs the state machines (DNS set, status, actions).
 	M *machines.Machines
+	// Checks are GET /v1/checks.
+	Checks *checks.Runner
 
 	mu        sync.Mutex
 	bootAt    time.Time
@@ -49,6 +52,7 @@ func (v *V1) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/credentials/{id}", v.deleteCred)
 	mux.HandleFunc("GET /v1/dns/{domain}", v.getDNS)
 	mux.HandleFunc("GET /v1/status", v.getStatus)
+	mux.HandleFunc("GET /v1/checks", v.getChecks)
 	mux.HandleFunc("POST /v1/actions/{action}", v.action)
 	return mux
 }
@@ -110,7 +114,8 @@ func (v *V1) putState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := reconcile.Plan(live, doc, p.Former, v.now(), 1<<62); errors.Is(err, reconcile.ErrMassRemoval) {
-		writeErr(w, http.StatusConflict, err.Error())
+		// The Hub branches on error_kind (contract §19.5).
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "error_kind": "mass_removal"})
 		return
 	}
 	if err := v.Store.Update(func(s *state.Persistent) error {
@@ -352,4 +357,17 @@ func (v *V1) action(w http.ResponseWriter, r *http.Request) {
 		v.M.Trigger()
 		writeJSON(w, http.StatusAccepted, map[string]string{})
 	}
+}
+
+func (v *V1) getChecks(w http.ResponseWriter, r *http.Request) {
+	refresh := false
+	switch r.URL.Query().Get("refresh") {
+	case "":
+	case "1":
+		refresh = true
+	default:
+		writeErr(w, http.StatusBadRequest, "refresh must be 1")
+		return
+	}
+	writeJSON(w, http.StatusOK, v.Checks.Get(r.Context(), refresh))
 }

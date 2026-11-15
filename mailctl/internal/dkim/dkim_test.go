@@ -149,3 +149,21 @@ func TestGenerate(t *testing.T) {
 		}
 	}
 }
+
+func TestSelfTest(t *testing.T) {
+	for _, a := range Algorithms {
+		k, p, err := Generate(a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, pub := range p {
+			if err := SelfTest(k, a, pub); err != nil {
+				t.Fatalf("%s %s: %v", a, pub[:8], err)
+			}
+		}
+		_, other, _ := Generate(a)
+		if err := SelfTest(k, a, other[0]); err == nil {
+			t.Fatalf("%s: verified with another key", a)
+		}
+	}
+}

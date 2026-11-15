@@ -16,7 +16,7 @@ import (
 
 // ErrMassRemoval: the document would remove more than half of the live
 // accounts without confirm_mass_removal (contract §19.5: 409).
-var ErrMassRemoval = errors.New("the document removes more than 50 % of the mail accounts without confirm_mass_removal")
+var ErrMassRemoval = errors.New("mass removal refused: the document removes more than 50 % of the mail accounts without confirm_mass_removal")
 
 // Removal parks one account (M4): its app passwords destroyed, then
 // authenticate / emailSend / emailReceive disabled, the aliases cleared,

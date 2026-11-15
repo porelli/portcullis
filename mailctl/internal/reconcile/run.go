@@ -29,9 +29,11 @@ type Runner struct {
 	// Local networks can't be told apart; LAN-only then admits loopback
 	// only (fail closed). The CLI refuses LAN-only there.
 	Rewritten bool
-	Now       func() time.Time
-	Logf      func(string, ...any)
-	wake      chan struct{}
+	// DQSKeyFile: the Spamhaus DQS key (Settings).
+	DQSKeyFile string
+	Now        func() time.Time
+	Logf       func(string, ...any)
+	wake       chan struct{}
 }
 
 // NewRunner returns a runner.
@@ -113,10 +115,13 @@ func (r *Runner) once(ctx context.Context, p state.Persistent) error {
 	l, readErr := Read(ctx, r.C)
 	// LAN-only first, on its own path: a failing plan never skips it.
 	lanErr := r.lanOnly(ctx, l, doc, p)
+	// Spam scores, DNSBLs, allow / block, outbound limits: on their own
+	// path too.
+	setErr := Settings(ctx, r.C, doc, SettingsOpts{Rewritten: r.Rewritten, DQSKeyFile: r.DQSKeyFile})
 	if readErr != nil {
-		return errors.Join(readErr, lanErr)
+		return errors.Join(readErr, lanErr, setErr)
 	}
-	return errors.Join(r.apply(ctx, l, doc, p), lanErr)
+	return errors.Join(r.apply(ctx, l, doc, p), lanErr, setErr)
 }
 
 func (r *Runner) apply(ctx context.Context, l *Live, doc *state.Doc, p state.Persistent) error {

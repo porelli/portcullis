@@ -3,12 +3,14 @@ package machines
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/portcullis/mailctl/internal/dkim"
+	"github.com/portcullis/mailctl/internal/dmarc"
 	"github.com/portcullis/mailctl/internal/mtasts"
 	"github.com/portcullis/mailctl/internal/stalwart"
 	"github.com/portcullis/mailctl/internal/stalwart/fake"
@@ -23,6 +25,9 @@ type env struct {
 	st  *state.Store
 	now time.Time
 	vis map[string]bool // name|value → visible
+	// dkimFrom: From domain → the d= of a passing DKIM signature (absent:
+	// no passing signature).
+	dkimFrom map[string]string
 }
 
 func newEnv(t *testing.T, mutate func(*state.Doc)) *env {
@@ -49,6 +54,10 @@ func newEnv(t *testing.T, mutate func(*state.Doc)) *env {
 	e.m = New(c, st, Config{MainDomain: "example.com", Hostname: "mail.example.com", RotateEvery: 180 * 24 * time.Hour, Reachable: true}, t.Logf)
 	e.m.Now = func() time.Time { return e.now }
 	e.m.Visible = func(_ context.Context, name, value string) bool { return e.vis[name+"|"+value] }
+	e.m.Verify = func(_ context.Context, r Report) (string, bool) {
+		d, ok := e.dkimFrom[r.From]
+		return d, ok
+	}
 	return e
 }
 
@@ -298,14 +307,181 @@ func TestActions(t *testing.T) {
 	if !strings.Contains(e.m.Policy("example.com"), "mode: enforce") {
 		t.Fatal(e.m.Policy("example.com"))
 	}
-	// A TLS-RPT failure since → back to testing at the next pass.
-	e.f.Put("TlsExternalReport", "", map[string]any{"report": map[string]any{
-		"dateRangeEnd": e.now.Add(time.Hour).Format(time.RFC3339),
-		"policies":     map[string]any{"0": map[string]any{"policyDomain": "example.com", "totalFailedSessions": 3}}}})
+	// Ruling: reports never move enforce back, even authenticated ones
+	// from independent reporters.
+	e.dkimFrom = map[string]string{"google.com": "google.com", "microsoft.com": "microsoft.com"}
+	tlsReport(e, "a", "Google Inc.", "noreply@google.com", e.now.Add(time.Hour), 3)
+	tlsReport(e, "c", "Microsoft", "tlsrpt@microsoft.com", e.now.Add(time.Hour), 2)
 	e.now = e.now.Add(2 * time.Hour)
 	e.step(t)
+	if m := modeOf(t, e, "example.com"); m != mtasts.Enforce {
+		t.Fatalf("reports downgraded: %s", m)
+	}
+	// Local evidence does: the certificate check failing.
+	e.m.CertOK = func() (bool, bool) { return false, true }
+	e.now = e.now.Add(time.Hour)
+	e.step(t)
 	if m := modeOf(t, e, "example.com"); m != mtasts.Testing {
-		t.Fatalf("after a failure %s", m)
+		t.Fatalf("a failed certificate check didn't move back to testing: %s", m)
+	}
+}
+
+// tlsReport stores one TLS-RPT aggregate report about example.com.
+func tlsReport(e *env, id, org, from string, end time.Time, failed int) {
+	e.f.Put("TlsExternalReport", "", map[string]any{"from": from, "to": map[string]any{"tls-reports@example.com": true},
+		"report": map[string]any{"organizationName": org, "dateRangeEnd": end.Format(time.RFC3339),
+			"policies": map[string]any{"0": map[string]any{"policyDomain": "example.com", "totalFailedSessions": failed}}}})
+}
+
+func enforceRefused(t *testing.T, e *env) bool {
+	t.Helper()
+	var nothing ErrNothingToDo
+	err := e.m.MTASTSEnforce(context.Background(), "example.com")
+	if err != nil && !errors.As(err, &nothing) {
+		t.Fatal(err)
+	}
+	return err != nil
+}
+
+// Untrusted reports (ruling): only a report whose message passed DKIM
+// aligned with its From counts, by registrable domain; anything else never
+// holds a progression. Future-dated, misaddressed or old ones are dropped.
+func TestReportsMustBeAuthenticated(t *testing.T) {
+	setup := func(t *testing.T) *env {
+		e := newEnv(t, nil)
+		e.step(t)
+		e.now = t0.Add(8 * 24 * time.Hour)
+		return e
+	}
+	// Forged From, no DKIM at all: two "reporters", neither counts.
+	e := setup(t)
+	tlsReport(e, "1", "Google", "noreply@google.com", t0.Add(time.Hour), 1)
+	tlsReport(e, "2", "Microsoft", "x@microsoft.com", t0.Add(time.Hour), 1)
+	if enforceRefused(t, e) {
+		t.Fatal("unauthenticated reports held enforce")
+	}
+	// DKIM passes but d= isn't aligned with the From domain.
+	e = setup(t)
+	e.dkimFrom = map[string]string{"google.com": "attacker.example", "microsoft.com": "attacker2.example"}
+	tlsReport(e, "1", "Google", "noreply@google.com", t0.Add(time.Hour), 1)
+	tlsReport(e, "2", "Microsoft", "x@microsoft.com", t0.Add(time.Hour), 1)
+	if enforceRefused(t, e) {
+		t.Fatal("unaligned DKIM held enforce")
+	}
+	// Two senders under one registrable domain are one reporter.
+	e = setup(t)
+	e.dkimFrom = map[string]string{"mx1.google.com": "google.com", "mx2.google.com": "mail.google.com"}
+	tlsReport(e, "1", "Google A", "a@mx1.google.com", t0.Add(time.Hour), 1)
+	tlsReport(e, "2", "Google B", "b@mx2.google.com", t0.Add(time.Hour), 1)
+	if enforceRefused(t, e) {
+		t.Fatal("one registrable domain counted twice")
+	}
+	// Two independent authenticated reporters hold enforce (never weaken).
+	e = setup(t)
+	e.dkimFrom = map[string]string{"google.com": "google.com", "microsoft.com": "microsoft.com"}
+	tlsReport(e, "1", "Google", "noreply@google.com", t0.Add(time.Hour), 1)
+	tlsReport(e, "2", "Microsoft", "x@microsoft.com", t0.Add(time.Hour), 1)
+	if !enforceRefused(t, e) {
+		t.Fatal("authenticated reports didn't hold enforce")
+	}
+	// ... but future-dated or misaddressed ones don't.
+	e = setup(t)
+	var logs []string
+	e.m.Logf = func(f string, a ...any) { logs = append(logs, fmt.Sprintf(f, a...)) }
+	e.dkimFrom = map[string]string{"google.com": "google.com", "microsoft.com": "microsoft.com"}
+	tlsReport(e, "1", "Google", "noreply@google.com", e.now.Add(48*time.Hour), 1)
+	e.f.Put("TlsExternalReport", "", map[string]any{"from": "x@microsoft.com", "to": map[string]any{"tls-reports@elsewhere.example": true},
+		"report": map[string]any{"organizationName": "Microsoft", "dateRangeEnd": t0.Add(time.Hour).Format(time.RFC3339),
+			"policies": map[string]any{"0": map[string]any{"policyDomain": "example.com", "totalFailedSessions": 1}}}})
+	if enforceRefused(t, e) {
+		t.Fatal("dropped reports held enforce")
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "dated in the future") || !strings.Contains(joined, "not sent to tls-reports@example.com") ||
+		!strings.Contains(joined, `from "google" (google.com, DKIM google.com)`) {
+		t.Fatalf("logs:\n%s", joined)
+	}
+	n := len(logs)
+	enforceRefused(t, e)
+	if len(logs) != n {
+		t.Fatal("logged again")
+	}
+	// DMARC: authenticated failures hold the proposal, never lower p=;
+	// unauthenticated or future-dated ones don't touch LastFailure.
+	e = setup(t)
+	put := func(from string, end time.Time) {
+		e.f.Put("DmarcExternalReport", "", map[string]any{"from": from, "to": map[string]any{"dmarc-reports@team-b.example.org": true},
+			"report": map[string]any{"policyDomain": "team-b.example.org", "orgName": "X", "dateRangeEnd": end.Format(time.RFC3339),
+				"records": map[string]any{"0": map[string]any{"evaluatedDkim": "fail", "evaluatedSpf": "fail"}}}})
+	}
+	put("a@forged.example", e.now.Add(-time.Hour))
+	put("b@forged2.example", e.now.Add(365*24*time.Hour))
+	e.step(t)
+	if d := read[map[string]dmarc.Domain](e.st.Get(), extDMARC)["team-b.example.org"]; d.LastFailure != nil || d.Policy != "none" {
+		t.Fatalf("unauthenticated DMARC reports moved state: %+v", d)
+	}
+	e.dkimFrom = map[string]string{"google.com": "google.com", "yahoo.com": "yahoo.com"}
+	put("r@google.com", e.now.Add(-time.Hour))
+	put("r@yahoo.com", e.now.Add(-time.Hour))
+	e.step(t)
+	if d := read[map[string]dmarc.Domain](e.st.Get(), extDMARC)["team-b.example.org"]; d.LastFailure == nil || d.Policy != "none" {
+		t.Fatalf("authenticated DMARC reports: %+v", d)
+	}
+}
+
+// A failed stage change rolls the whole unit back: Stalwart and the state
+// keep the old stages, and the next pass tries again.
+func TestDKIMStageFailureRollsBack(t *testing.T) {
+	e := newEnv(t, nil)
+	e.step(t)
+	for _, k := range e.keys("example.com") {
+		e.vis[dkim.Name(k)+"|"+dkim.TXT(k)] = true
+	}
+	e.now = t0.Add(time.Hour)
+	e.step(t) // active
+	if err := e.m.DKIMRotate(context.Background(), "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	e.now = t0.Add(2 * time.Hour)
+	e.step(t) // new pending pair
+	for _, k := range e.keys("example.com") {
+		e.vis[dkim.Name(k)+"|"+dkim.TXT(k)] = true
+	}
+	before := map[string]dkim.Key{}
+	for _, k := range e.keys("example.com") {
+		before[k.ID] = k
+	}
+	e.f.Fail("x:DkimSignature/set", 2) // both algorithms' units fail
+	e.now = t0.Add(3 * time.Hour)
+	if err := e.m.Step(context.Background()); err == nil || !strings.Contains(err.Error(), "rolled back") {
+		t.Fatalf("no rollback error: %v", err)
+	}
+	for _, k := range e.keys("example.com") {
+		b := before[k.ID]
+		if k.Stage != b.Stage || !k.Since.Equal(b.Since) {
+			t.Fatalf("state moved: %+v was %+v", k, b)
+		}
+		if e.f.Get("DkimSignature", "", k.ID)["stage"] != b.Stage {
+			t.Fatalf("stalwart moved: %v", e.f.Get("DkimSignature", "", k.ID))
+		}
+	}
+	// The next pass does it.
+	e.now = t0.Add(4 * time.Hour)
+	e.step(t)
+	act, ret := 0, 0
+	for _, k := range e.keys("example.com") {
+		switch k.Stage {
+		case dkim.Active:
+			act++
+		case dkim.Retiring:
+			ret++
+		}
+		if e.f.Get("DkimSignature", "", k.ID)["stage"] != k.Stage {
+			t.Fatalf("stalwart %v vs state %s", e.f.Get("DkimSignature", "", k.ID), k.Stage)
+		}
+	}
+	if act != 2 || ret != 2 {
+		t.Fatalf("after the retry %d active %d retiring", act, ret)
 	}
 }
 
@@ -317,8 +493,8 @@ func TestDMARCProposal(t *testing.T) {
 	if st.DMARC[1].Policy != "none" || st.DMARC[1].Proposed != nil {
 		t.Fatalf("%+v", st.DMARC[1])
 	}
-	e.f.Put("DmarcExternalReport", "", map[string]any{"report": map[string]any{
-		"policyDomain": "team-b.example.org", "dateRangeEnd": t0.Add(15 * 24 * time.Hour).Format(time.RFC3339),
+	e.f.Put("DmarcExternalReport", "", map[string]any{"from": "r@google.com", "to": map[string]any{"dmarc-reports@team-b.example.org": true}, "report": map[string]any{
+		"policyDomain": "team-b.example.org", "orgName": "google.com", "dateRangeEnd": t0.Add(15 * 24 * time.Hour).Format(time.RFC3339),
 		"records": map[string]any{"0": map[string]any{"evaluatedDkim": "pass", "evaluatedSpf": "fail"}}}})
 	e.now = t0.Add(15 * 24 * time.Hour)
 	e.step(t)

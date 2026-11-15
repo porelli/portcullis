@@ -31,6 +31,7 @@ import (
 	"github.com/portcullis/mailctl/internal/admin"
 	"github.com/portcullis/mailctl/internal/api"
 	"github.com/portcullis/mailctl/internal/bootstrap"
+	"github.com/portcullis/mailctl/internal/checks"
 	"github.com/portcullis/mailctl/internal/config"
 	"github.com/portcullis/mailctl/internal/creds"
 	"github.com/portcullis/mailctl/internal/export"
@@ -38,6 +39,7 @@ import (
 	"github.com/portcullis/mailctl/internal/machines"
 	"github.com/portcullis/mailctl/internal/metrics"
 	"github.com/portcullis/mailctl/internal/reconcile"
+	"github.com/portcullis/mailctl/internal/resolve"
 	"github.com/portcullis/mailctl/internal/spamrules"
 	"github.com/portcullis/mailctl/internal/stalwart"
 	"github.com/portcullis/mailctl/internal/state"
@@ -161,8 +163,21 @@ func serve(env func(string) string, stderr io.Writer) error {
 	runner := reconcile.NewRunner(sw, st, cfg.FormerRetain, cfg.LANOnly, logger.Printf)
 	rewritten := cfg.ClientIP == config.ClientIPRewritten
 	runner.Rewritten = rewritten
+	runner.DQSKeyFile = cfg.DQSKeyFile
 	mc := machines.New(sw, st, machinesConfig(cfg), logger.Printf)
-	v1 := &api.V1{Store: st, C: sw, Runner: runner, LANOnly: cfg.LANOnly, Rewritten: rewritten, Logf: logger.Printf, M: mc}
+	ck := &checks.Runner{D: checks.Deps{C: sw, M: mc, Store: st, Cfg: checksConfig(cfg), DNS: resolve.Query, Logf: logger.Printf},
+		OnResult: func(r checks.Result) {
+			vals := map[string]float64{}
+			for _, c := range r.Checks {
+				vals[c.ID] = checks.Value(c.Severity)
+			}
+			m.SetChecks(vals)
+		}}
+	mc.CertOK = func() (bool, bool) {
+		c, ok := ck.Last("cert")
+		return ok && c.Severity == checks.OK, ok
+	}
+	v1 := &api.V1{Store: st, C: sw, Runner: runner, LANOnly: cfg.LANOnly, Rewritten: rewritten, Logf: logger.Printf, M: mc, Checks: ck}
 	apiSrv := &api.Server{Subnet: cfg.APISubnet, SecretFile: cfg.HubSecretFile, Logf: logger.Printf, Handler: v1.Handler()}
 	servers := []*http.Server{
 		newServer(cfg.APIAddr, apiSrv),
@@ -203,6 +218,8 @@ func serve(env func(string) string, stderr io.Writer) error {
 	go keepLookupsOff(ctx, sw, logger.Printf)
 	go runner.Run(ctx)
 	go mc.Loop(ctx)
+	go ck.Loop(ctx, 6*time.Hour)
+	go statusMetrics(ctx, mc, m, v1)
 	logger.Printf("mailctl: serving the Hub API on %s, well-known files on %s, spam rules on %s, metrics on %s",
 		cfg.APIAddr, cfg.WellKnownAddr, cfg.RulesAddr, cfg.MetricsAddr)
 	select {
@@ -225,6 +242,45 @@ func machinesConfig(cfg config.Config) machines.Config {
 		mc.SPFInclude = cfg.Relay.SPFInclude
 	}
 	return mc
+}
+
+// checksConfig is the checks' part of the environment.
+func checksConfig(cfg config.Config) checks.Config {
+	return checks.Config{Hostname: cfg.Hostname, MainDomain: cfg.MainDomain, PublicIPv4: cfg.PublicIPv4, PublicIPv6: cfg.PublicIPv6,
+		IPv6: cfg.IPv6, Resolvers: cfg.Resolvers, LocalResolver: cfg.LocalResolver, DQSKeyFile: cfg.DQSKeyFile,
+		ClientIP: cfg.ClientIP, MailIP: mailIP(cfg.StalwartURL)}
+}
+
+// mailIP is mail's address from MAILCTL_STALWART_URL (http://<ip>:8080).
+func mailIP(u string) string {
+	if p, err := url.Parse(u); err == nil {
+		return p.Hostname()
+	}
+	return ""
+}
+
+// statusMetrics refreshes the status gauges every minute.
+func statusMetrics(ctx context.Context, mc *machines.Machines, m *metrics.Metrics, v1 *api.V1) {
+	for {
+		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if st, err := mc.Status(cctx, v1.Bootstrapped(cctx), ""); err == nil {
+			var na time.Time
+			if st.Cert != nil {
+				na = st.Cert.NotAfter
+			}
+			stages := make([]metrics.Stage, 0, len(st.DKIM))
+			for _, k := range st.DKIM {
+				stages = append(stages, metrics.Stage{Domain: k.Domain, Stage: k.Stage})
+			}
+			m.SetStatus(na, st.Queue.Messages, st.Queue.Deferred, stages)
+		}
+		cancel()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Minute):
+		}
+	}
 }
 
 // adminCmd is `mailctl dns --main --json`, `mailctl rotate --json` (stdin:

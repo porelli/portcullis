@@ -8,6 +8,8 @@
 package dkim
 
 import (
+	"bytes"
+	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
@@ -16,7 +18,10 @@ import (
 	"encoding/pem"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
+
+	msgdkim "github.com/emersion/go-msgauth/dkim"
 )
 
 // Stages and algorithms.
@@ -227,3 +232,43 @@ func Variant(algo string) string {
 }
 
 func b64(b []byte) string { return base64.StdEncoding.EncodeToString(b) }
+
+// selfTestMessage is the fixed message SelfTest signs.
+const selfTestMessage = "From: selftest@portcullis.invalid\r\nTo: selftest@portcullis.invalid\r\nSubject: DKIM self-test\r\nDate: Sun, 15 Nov 2026 10:00:00 +0000\r\nMessage-ID: <selftest@portcullis.invalid>\r\n\r\nPortcullis DKIM self-test.\r\n"
+
+// SelfTest signs a fixed message with the PEM (PKCS#8) private key and
+// verifies it against the p= value, in-process (go-msgauth; no DNS): the
+// key pair is consistent before it leaves mailctl (P2).
+func SelfTest(pemKey, algo, p string) error {
+	b, _ := pem.Decode([]byte(pemKey))
+	if b == nil {
+		return fmt.Errorf("no PEM private key")
+	}
+	k, err := x509.ParsePKCS8PrivateKey(b.Bytes)
+	if err != nil {
+		return err
+	}
+	signer, ok := k.(crypto.Signer)
+	if !ok {
+		return fmt.Errorf("the key can't sign")
+	}
+	var out bytes.Buffer
+	opts := &msgdkim.SignOptions{Domain: "portcullis.invalid", Selector: "selftest", Signer: signer,
+		HeaderKeys: []string{"From", "To", "Subject", "Date", "Message-ID"}}
+	if err := msgdkim.Sign(&out, strings.NewReader(selfTestMessage), opts); err != nil {
+		return fmt.Errorf("signing: %w", err)
+	}
+	txt := fmt.Sprintf("v=DKIM1; k=%s; p=%s", algo, p)
+	vs, err := msgdkim.VerifyWithOptions(&out, &msgdkim.VerifyOptions{
+		LookupTXT: func(string) ([]string, error) { return []string{txt}, nil }})
+	if err != nil {
+		return fmt.Errorf("verifying: %w", err)
+	}
+	if len(vs) != 1 || vs[0].Err != nil {
+		if len(vs) == 1 {
+			return fmt.Errorf("verifying: %w", vs[0].Err)
+		}
+		return fmt.Errorf("verifying: %d signatures", len(vs))
+	}
+	return nil
+}

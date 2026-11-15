@@ -148,6 +148,66 @@ groups:
             Its devices are denied until the Hub publishes a fresh map (the identity
             hook fails or the gateway is down). See the instance's VPN tab in the Hub.
 
+      # Mail (profile mail, contract §19.8): mailctl's gauges (job mailctl).
+      - alert: MailQueueHigh
+        expr: portcullis_mail_queue_messages > 100
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $value }} messages wait in the mail queue"
+          description: >-
+            Outbound mail isn't leaving. Run ./portcullis mail status (port 25, blocklists,
+            the relay) and look at the doctor's mail findings.
+
+      - alert: MailDeferralsHigh
+        expr: portcullis_mail_queue_deferred_ratio > 0.2
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: More than a fifth of the queued mail is deferred
+          description: >-
+            Remote servers keep refusing or timing out. Run ./portcullis mail status
+            (reverse DNS, blocklists, port 25).
+
+      - alert: MailCertExpiring
+        expr: portcullis_mail_cert_expiry_seconds - time() < 14 * 86400
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: The mail certificate expires within 14 days (or is missing)
+          description: >-
+            The daily timer should have renewed it. Run ./portcullis mail cert and
+            check ./portcullis mail schedule --systemd is installed.
+
+      - alert: MailBlocklisted
+        expr: portcullis_mail_check{check="blocklist"} == 0
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: The mail server's address is on a blocklist (or a list refused the query)
+          description: >-
+            Receivers will refuse its mail. ./portcullis mail status names the list and
+            the delisting steps.
+
+      - alert: MailDKIMStuck
+        expr: portcullis_mail_check{check=~"dkim_stuck:.*"} == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "A DKIM key of {{ $labels.check }} has waited more than 24 h for DNS"
+          description: >-
+            The rotation can't finish until both public resolvers serve the new TXT
+            record. Check the domain's mail records (./portcullis dns plan, or the
+            domain in the Hub).
+
+      - alert: MailCheckFailing
+        expr: portcullis_mail_check{check!="blocklist",check!~"dkim_stuck:.*"} == 0
+        for: 1h
+        labels: {severity: warning}
+        annotations:
+          summary: "The mail check {{ $labels.check }} is failing"
+          description: Run ./portcullis mail status, or see the Hub's doctor.
+
       - alert: PortcullisStatusProblems
         expr: portcullis_status_ok == 0
         for: 1h

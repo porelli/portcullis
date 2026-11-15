@@ -157,7 +157,9 @@ func TestListMembersOnlyLookup(t *testing.T) {
 	e.mustApply(d)
 	keys := map[string]bool{}
 	for _, k := range e.f.Objects("MemoryLookupKey", "") {
-		keys[k["namespace"].(string)+" "+k["key"].(string)] = true
+		if ns := k["namespace"].(string); ns != NSSpamAllow && ns != NSSpamBlock {
+			keys[ns+" "+k["key"].(string)] = true
+		}
 	}
 	want := []string{NSMembersOnly + " team@example.com", NSPosters + " team@example.com|alice@example.com", NSPosters + " team@example.com|bob@example.com"}
 	if len(keys) != len(want) {
@@ -168,7 +170,7 @@ func TestListMembersOnlyLookup(t *testing.T) {
 			t.Errorf("missing %s", w)
 		}
 	}
-	if e.f.Count("x:Action/set ReloadLookupStores") != 1 {
+	if e.f.Count("x:Action/set ReloadLookupStores") < 1 {
 		t.Error("no ReloadLookupStores after the lookup change")
 	}
 	// bob leaves the list: his poster entry goes.

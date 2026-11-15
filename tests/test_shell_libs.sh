@@ -4985,6 +4985,15 @@ mt 'source "$HERE/../scripts/lib/stack.sh"; source "$HERE/../scripts/lib/dns.sh"
   _dns_tool() { :; }; mail_rotate'
 expect_eq "mail rotate: an unreadable DNSSEC state is passed as unknown (TLSA withheld)" "$(jq -r .dnssec_state "$ML/stdin" 2>/dev/null)" unknown
 
+# Prometheus' mail targets: both with the profile, [] and an empty password copy without.
+mt 'export MONITORING_SECRETS="$PORTCULLIS_ROOT/secrets/monitoring"; mkdir -p "$MONITORING_SECRETS/prometheus"; printf "m3tr1cs-pw" > "$PORTCULLIS_ROOT/secrets/mail/metrics-secret"; mail_prom_targets'
+P="$ML/root/secrets/monitoring/prometheus"
+expect_eq "mail_prom_targets: profile on → mail + mailctl targets, the metrics password copied" \
+  "$(jq -c '[.[] | {t: .targets[0], s: .labels.service}]' "$P/mail-targets.json"):$(cat "$P/mail-metrics-secret"):$(file_mode "$P/mail-metrics-secret")" \
+  '[{"t":"mail-metrics:9180","s":"mail"},{"t":"mailctl-metrics:9100","s":"mailctl"}]:m3tr1cs-pw:600'
+mt 'export MONITORING_SECRETS="$PORTCULLIS_ROOT/secrets/monitoring" COMPOSE_PROFILES=monitoring; mkdir -p "$MONITORING_SECRETS/prometheus"; printf x > "$MONITORING_SECRETS/prometheus/mail-metrics-secret"; mail_prom_targets'
+expect_eq "mail_prom_targets: profile off → [] and an empty password copy" "$(cat "$P/mail-targets.json"):$(wc -c < "$P/mail-metrics-secret" | tr -d ' ')" "[]:0"
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

@@ -1,0 +1,208 @@
+// Package checks is mailctl's deliverability checks (contract §19.8,
+// GET /v1/checks): every 6 h and on refresh (one run at a time; a refresh
+// within 60 s answers the last result). No check ever dials port 25 of
+// anyone: port25 reads Stalwart's queue only, and the certificate check
+// dials mail's own listeners on portcullis-mail (10025 / 10465 / 10587 /
+// 10993).
+package checks
+
+import (
+	"context"
+	"net"
+	"net/netip"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/miekg/dns"
+
+	"github.com/portcullis/mailctl/internal/machines"
+	"github.com/portcullis/mailctl/internal/stalwart"
+	"github.com/portcullis/mailctl/internal/state"
+)
+
+// Severities.
+const (
+	OK      = "ok"
+	Info    = "info"
+	Warning = "warning"
+	Problem = "problem"
+)
+
+// Check is one result.
+type Check struct {
+	ID       string   `json:"id"`
+	Severity string   `json:"severity"`
+	Detail   string   `json:"detail"`
+	Steps    []string `json:"steps"`
+	// Reason: fcrdns_v4 / fcrdns_v6 when not ok, "missing" | "mismatch".
+	Reason string `json:"reason,omitempty"`
+}
+
+// Result is GET /v1/checks.
+type Result struct {
+	CheckedAt time.Time `json:"checked_at"`
+	Checks    []Check   `json:"checks"`
+}
+
+// Value is the metric value of a severity (1 ok / info, 0 otherwise).
+func Value(sev string) float64 {
+	if sev == OK || sev == Info {
+		return 1
+	}
+	return 0
+}
+
+// Querier asks a DNS server one question (resolve.Query).
+type Querier func(ctx context.Context, server, name string, qtype uint16, dnssec bool) (*dns.Msg, error)
+
+// Config is what the checks need from the environment.
+type Config struct {
+	Hostname      string
+	MainDomain    string
+	PublicIPv4    netip.Addr
+	PublicIPv6    netip.Addr
+	IPv6          bool
+	Resolvers     []string // the public resolvers
+	LocalResolver string   // mail-resolver
+	DQSKeyFile    string
+	ClientIP      string // preserved | rewritten
+	MailIP        string // mail's portcullis-mail address (the certificate check)
+}
+
+// Deps are the checks' inputs.
+type Deps struct {
+	C     *stalwart.Client
+	M     *machines.Machines
+	Store *state.Store
+	Cfg   Config
+	Now   func() time.Time
+	DNS   Querier
+	Dial  func(ctx context.Context, network, addr string) (net.Conn, error)
+	Logf  func(string, ...any)
+}
+
+func (d Deps) now() time.Time {
+	if d.Now != nil {
+		return d.Now().UTC()
+	}
+	return time.Now().UTC()
+}
+
+// Run runs every check once.
+func Run(ctx context.Context, d Deps) Result {
+	ctx, cancel := context.WithTimeout(ctx, 100*time.Second)
+	defer cancel()
+	p := d.Store.Get()
+	var out []Check
+	q, qerr := readQueue(ctx, d)
+	out = append(out, port25(d, q, qerr, p))
+	out = append(out, fcrdns(ctx, d, d.Cfg.PublicIPv4, false), fcrdns(ctx, d, d.Cfg.PublicIPv6, true))
+	out = append(out, blocklist(ctx, d, p.Doc))
+	out = append(out, certCheck(ctx, d))
+	out = append(out, dkimChecks(ctx, d, p.Doc)...)
+	out = append(out, reportChecks(ctx, d, p.Doc)...)
+	out = append(out, clientIP(d))
+	out = append(out, rateHeld(d, q, qerr, p.Doc)...)
+	out = append(out, dane(ctx, d))
+	for i := range out {
+		if out[i].Steps == nil {
+			out[i].Steps = []string{}
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return Result{CheckedAt: d.now(), Checks: out}
+}
+
+// Runner caches the last result.
+type Runner struct {
+	D        Deps
+	OnResult func(Result)
+
+	mu      sync.Mutex // one run at a time
+	last    *Result
+	lastAt  time.Time
+	lastGen int64 // the document generation the last run saw
+}
+
+// RefreshWithin: a refresh within this answers the last result.
+const RefreshWithin = 60 * time.Second
+
+// Get answers the last result (running the first one), or a fresh run
+// on refresh unless the last is younger than RefreshWithin and saw the
+// current document.
+func (r *Runner) Get(ctx context.Context, refresh bool) Result {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	gen := r.D.Store.Get().Generation
+	if r.last != nil && (!refresh || (r.D.now().Sub(r.lastAt) < RefreshWithin && gen == r.lastGen)) {
+		return *r.last
+	}
+	res := Run(ctx, r.D)
+	r.last, r.lastAt, r.lastGen = &res, r.D.now(), gen
+	if r.OnResult != nil {
+		r.OnResult(res)
+	}
+	return res
+}
+
+// Last is the last result's check by id (ok=false: none yet).
+func (r *Runner) Last(id string) (Check, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.last == nil {
+		return Check{}, false
+	}
+	for _, c := range r.last.Checks {
+		if c.ID == id {
+			return c, true
+		}
+	}
+	return Check{}, false
+}
+
+// Loop runs every 6 h (the first run at once).
+func (r *Runner) Loop(ctx context.Context, every time.Duration) {
+	for {
+		r.Get(ctx, true)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(every):
+		}
+	}
+}
+
+// query asks each server in turn; the first answer wins.
+func query(ctx context.Context, d Deps, servers []string, name string, qtype uint16, dnssec bool) (*dns.Msg, error) {
+	var last error
+	for _, s := range servers {
+		m, err := d.DNS(ctx, s, name, qtype, dnssec)
+		if err == nil {
+			return m, nil
+		}
+		last = err
+	}
+	if last == nil {
+		last = errNoResolver
+	}
+	return nil, last
+}
+
+type errString string
+
+func (e errString) Error() string { return string(e) }
+
+const errNoResolver = errString("no resolver configured")
+
+func joinMax(items []string, n int) string {
+	if len(items) > n {
+		return strings.Join(items[:n], ", ") + ", …"
+	}
+	return strings.Join(items, ", ")
+}
+
+const dnsTypeTXT = dns.TypeTXT
+
+type dnsTXT = dns.TXT

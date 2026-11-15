@@ -5,6 +5,7 @@ package metrics
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -50,4 +51,37 @@ func (m *Metrics) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{}))
 	return mux
+}
+
+// SetChecks replaces portcullis_mail_check with one value per check id
+// (1 ok / info, 0 warning / problem).
+func (m *Metrics) SetChecks(vals map[string]float64) {
+	m.Check.Reset()
+	for id, v := range vals {
+		m.Check.WithLabelValues(id).Set(v)
+	}
+}
+
+// Stage is one DKIM key's (domain, stage).
+type Stage struct{ Domain, Stage string }
+
+// SetStatus sets the status gauges: the certificate's expiry (zero = no
+// certificate: the gauge is 0, which MailCertExpiring catches), the queue
+// and every DKIM key's stage.
+func (m *Metrics) SetStatus(certNotAfter time.Time, messages, deferred int, stages []Stage) {
+	if certNotAfter.IsZero() {
+		m.CertExpiry.Set(0)
+	} else {
+		m.CertExpiry.Set(float64(certNotAfter.Unix()))
+	}
+	m.QueueMessages.Set(float64(messages))
+	ratio := 0.0
+	if messages > 0 {
+		ratio = float64(deferred) / float64(messages)
+	}
+	m.QueueDeferred.Set(ratio)
+	m.DKIMStage.Reset()
+	for _, s := range stages {
+		m.DKIMStage.WithLabelValues(s.Domain, s.Stage).Add(1)
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/miekg/dns"
+
+	"github.com/portcullis/mailctl/internal/checks"
 	"github.com/portcullis/mailctl/internal/logx"
 	"github.com/portcullis/mailctl/internal/machines"
 	"github.com/portcullis/mailctl/internal/reconcile"
@@ -42,6 +46,11 @@ func newV1(t *testing.T) *v1env {
 	v := &V1{Store: st, C: c, Runner: r, Logf: lg.Printf}
 	v.M = machines.New(c, st, machines.Config{MainDomain: "example.com", Hostname: "mail.example.com", RotateEvery: time.Hour, Reachable: true}, lg.Printf)
 	v.M.Visible = func(context.Context, string, string) bool { return false }
+	v.Checks = &checks.Runner{D: checks.Deps{C: c, M: v.M, Store: st, Cfg: checks.Config{Hostname: "mail.example.com", MailIP: "192.0.2.1"},
+		DNS: func(context.Context, string, string, uint16, bool) (*dns.Msg, error) {
+			return nil, errors.New("offline")
+		},
+		Dial: func(context.Context, string, string) (net.Conn, error) { return nil, errors.New("offline") }}}
 	srv, _ := newServer(t, "172.31.255.16/28")
 	srv.Handler = v.Handler()
 	return &v1env{f: f, v: v, s: srv, log: &buf}
@@ -102,8 +111,17 @@ func TestMassRemoval409AtPut(t *testing.T) {
 	m["postmaster"] = []string{"alice"}
 	b, _ := json.Marshal(m)
 	doc := string(b)
-	if w := e.do("PUT", "/v1/state", doc); w.Code != 409 || !strings.Contains(w.Body.String(), "50 %") {
+	w := e.do("PUT", "/v1/state", doc)
+	var body map[string]string
+	if w.Code != 409 || json.Unmarshal(w.Body.Bytes(), &body) != nil || body["error_kind"] != "mass_removal" ||
+		!strings.Contains(body["error"], "mass removal") || !strings.Contains(body["error"], "50 %") || len(body) != 2 {
 		t.Fatalf("mass removal: %d %s", w.Code, w.Body)
+	}
+	// A stale generation's 409 has no error_kind.
+	w = e.do("PUT", "/v1/state", vec(t, 12))
+	json.Unmarshal(w.Body.Bytes(), &body)
+	if w.Code != 409 || strings.Contains(w.Body.String(), "error_kind") {
+		t.Fatalf("stale: %d %s", w.Code, w.Body)
 	}
 }
 
@@ -223,5 +241,24 @@ func TestDNSStatusActions(t *testing.T) {
 	e.f.Fail("x:Certificate", 1)
 	if w := e.do("GET", "/v1/status", ""); w.Code != 503 || !strings.Contains(w.Body.String(), "mail server unreachable") {
 		t.Fatalf("status with Stalwart down: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestChecksRoute(t *testing.T) {
+	e := newV1(t)
+	e.do("PUT", "/v1/state", vec(t, 12))
+	w := e.do("GET", "/v1/checks", "")
+	var res struct {
+		CheckedAt time.Time `json:"checked_at"`
+		Checks    []map[string]any
+	}
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &res) != nil || res.CheckedAt.IsZero() || len(res.Checks) < 8 {
+		t.Fatalf("%d %s", w.Code, w.Body)
+	}
+	if w := e.do("GET", "/v1/checks?refresh=yes", ""); w.Code != 400 {
+		t.Fatalf("bad refresh %d", w.Code)
+	}
+	if w := e.do("GET", "/v1/checks?refresh=1", ""); w.Code != 200 {
+		t.Fatalf("refresh %d", w.Code)
 	}
 }

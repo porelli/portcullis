@@ -64,3 +64,23 @@ func VisibleAll(ctx context.Context, servers []string, name, value string) bool 
 	}
 	return true
 }
+
+// Query asks server one question (recursion desired, EDNS0; dnssec sets
+// the DO bit), over TCP when the UDP answer is truncated. Any rcode is
+// returned in the message; err is a transport failure.
+func Query(ctx context.Context, server, name string, qtype uint16, dnssec bool) (*dns.Msg, error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(name), qtype)
+	m.RecursionDesired = true
+	m.SetEdns0(1232, dnssec)
+	c := &dns.Client{Timeout: 5 * time.Second}
+	in, _, err := c.ExchangeContext(ctx, m, server)
+	if err == nil && in.Truncated {
+		c.Net = "tcp"
+		in, _, err = c.ExchangeContext(ctx, m, server)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%s %s at %s: %w", dns.TypeToString[qtype], name, server, err)
+	}
+	return in, nil
+}

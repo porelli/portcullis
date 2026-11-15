@@ -422,6 +422,61 @@ func TestDegradedSenderAuth(t *testing.T) {
 	}
 }
 
+// Review Focus 1: the degraded plan's values, exactly.
+func TestClientIPRewrittenPlanDisablesIPChecks(t *testing.T) {
+	p := params()
+	p.ClientIP = "rewritten"
+	got, _ := json.Marshal(p.senderAuth())
+	want := `{"arcVerify":{"else":"disable","match":{"0":{"if":"local_port == 10025","then":"relaxed"}}},` +
+		`"dkimVerify":{"else":"disable","match":{"0":{"if":"local_port == 10025","then":"relaxed"}}},` +
+		`"dmarcVerify":{"else":"disable","match":{"0":{"if":"local_port == 10025","then":"relaxed"}}},` +
+		`"reverseIpVerify":{"else":"disable","match":{}},"spfEhloVerify":{"else":"disable","match":{}},"spfFromVerify":{"else":"disable","match":{}}}`
+	if string(got) != want {
+		t.Fatalf("degraded SenderAuth\n got %s\nwant %s", got, want)
+	}
+	var sec map[string]any
+	for _, s := range p.Singletons() {
+		if s.Object == "Security" {
+			sec = s.Patch
+		}
+	}
+	if b, _ := json.Marshal(sec); string(b) != `{"abuseBanRate":null,"authBanRate":null,"loiterBanRate":null,"scanBanRate":null}` {
+		t.Fatalf("degraded Security %s", b)
+	}
+	p.ClientIP = "preserved"
+	for _, s := range p.Singletons() {
+		if s.Object == "Security" {
+			t.Fatal("Security patched with preserved addresses")
+		}
+	}
+	if b, _ := json.Marshal(p.senderAuth()["spfFromVerify"]); string(b) != `{"else":"disable","match":{"0":{"if":"local_port == 10025","then":"relaxed"}}}` {
+		t.Fatalf("preserved SPF %s", b)
+	}
+}
+
+// The allow / block rules: allow needs DMARC, both by domain or address.
+func TestSpamListRules(t *testing.T) {
+	var rules []map[string]any
+	for _, n := range params().Collections() {
+		if n.Object == "SpamRule" {
+			rules = n.Want
+		}
+	}
+	if len(rules) != 2 {
+		t.Fatalf("%v", rules)
+	}
+	b, _ := json.Marshal(rules)
+	for _, w := range []string{
+		`$DMARC_POLICY_ALLOW \u0026\u0026 (key_exists('portcullis-allow', from.domain) || key_exists('portcullis-allow', from.local + '@' + from.domain))`,
+		`"then":"'TRUSTED_DOMAIN'"`, `"then":"'BLOCKED_DOMAIN'"`,
+		`(key_exists('portcullis-block', from.domain) || key_exists('portcullis-block', from.local + '@' + from.domain))`,
+	} {
+		if !strings.Contains(string(b), w) {
+			t.Errorf("missing %s in %s", w, b)
+		}
+	}
+}
+
 func TestAllowedEndpointsPinsMailctl(t *testing.T) {
 	b := fmt.Sprint(params().AllowedEndpoints())
 	for _, want := range []string{"listener == 'management' && remote_ip == '172.31.255.3'", "listener == 'metrics' && path == '/metrics/prometheus'", "else:404"} {

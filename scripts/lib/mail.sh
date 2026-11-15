@@ -164,6 +164,23 @@ mail_cert_ensure() {
   printf '%s' "$out" | tail -n1 | jq -r '"    not after \(.not_after // "?"), renewed: \(.renewed)"' 2>/dev/null || true
 }
 
+# mail_prom_targets — Prometheus' file_sd for jobs mail and mailctl
+# (mail-targets.json: both targets while the profile is on, else []) and
+# the copy of Stalwart's metrics password the mail job sends (empty while
+# off); monitoring_fix_perms gives both Prometheus' group.
+mail_prom_targets() {
+  local d="${MONITORING_SECRETS:-$PORTCULLIS_ROOT/secrets/monitoring}/prometheus" src="$PORTCULLIS_ROOT/secrets/mail/metrics-secret"
+  [ -d "$d" ] || return 0
+  [ -f "$d/mail-metrics-secret" ] || (umask 077 && : > "$d/mail-metrics-secret")
+  if mail_profile_on && [ -s "$src" ]; then
+    jq -n '[{targets: ["mail-metrics:9180"], labels: {service: "mail"}}, {targets: ["mailctl-metrics:9100"], labels: {service: "mailctl"}}]' > "$d/mail-targets.json"
+    cmp -s "$src" "$d/mail-metrics-secret" || cat "$src" > "$d/mail-metrics-secret"
+  else
+    echo '[]' > "$d/mail-targets.json"
+    : > "$d/mail-metrics-secret"
+  fi
+}
+
 # _mail_wait_healthy [timeout] — mail's health check passes.
 _mail_wait_healthy() {
   local limit="${1:-$MAIL_HEALTH_WAIT}" start=$SECONDS st
@@ -370,6 +387,8 @@ mail_enable() {
   mail_cert_ensure
   mail_recovery_session mail_bootstrap_apply
   hub_env_write
+  mail_prom_targets
+  if declare -F monitoring_fix_perms >/dev/null; then monitoring_fix_perms; fi
   stack_compose_up mail mail-resolver mailctl traefik hub
   mail_image_update
   ok "Mail is on. DNS: ./portcullis dns setup --only mail; status: ./portcullis mail status"
@@ -409,6 +428,7 @@ mail_disable() {
   fi
   _mail_set COMPOSE_PROFILES "$(_mail_profiles_without_mail)"
   _mail_stop_services
+  mail_prom_targets
   hub_env_write
   ok "Mail is off (its volumes are kept)."
 }

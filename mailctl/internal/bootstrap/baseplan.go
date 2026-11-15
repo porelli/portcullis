@@ -160,12 +160,56 @@ func (p Params) senderAuth() map[string]any {
 		"reverseIpVerify": relaxed25,
 	}
 	if p.ClientIP == "rewritten" {
-		// M9 degraded mode: every client seems to come from one gateway
-		// address, so the IP-based checks would fail for everyone.
-		off := expr("disable")
-		sa["spfEhloVerify"], sa["spfFromVerify"], sa["reverseIpVerify"] = off, off, off
+		for k, v := range DegradedSenderAuth() {
+			sa[k] = v
+		}
 	}
 	return sa
+}
+
+// DegradedSenderAuth is M9's sender authentication for rewritten client
+// addresses (rootless Podman): every client seems to come from one
+// gateway address, so SPF (HELO and MAIL FROM) and iprev would judge the
+// gateway: off. DMARC stays relaxed (it evaluates DKIM alignment; relaxed
+// never rejects on a DMARC failure), DKIM and ARC as normal. The IP-type
+// DNSBLs are off too (reconcile), and the ban rates (DegradedSecurity).
+func DegradedSenderAuth() map[string]any {
+	off := expr("disable")
+	return map[string]any{"spfEhloVerify": off, "spfFromVerify": off, "reverseIpVerify": off,
+		"dmarcVerify": expr("disable", [2]string{on25, "relaxed"})}
+}
+
+// DegradedSecurity: no automatic bans with rewritten client addresses —
+// every client is the gateway, so a ban would lock everyone out (the
+// server would ban itself). Brute force is still bounded by the auth
+// throttles and the per-password allowedIps.
+func DegradedSecurity() map[string]any {
+	return map[string]any{"authBanRate": nil, "abuseBanRate": nil, "loiterBanRate": nil, "scanBanRate": nil}
+}
+
+// Spam allow / block lists (contract §19.8) by domain or address, in
+// mailctl's own lookup namespaces (the stock trusted-domains list holds
+// the rules' defaults). Allow needs DMARC to pass (an unauthenticated From
+// is never trusted) and reuses the stock TRUSTED_DOMAIN score; block
+// reuses BLOCKED_DOMAIN (reject).
+const (
+	NSSpamAllow = "portcullis-allow"
+	NSSpamBlock = "portcullis-block"
+)
+
+func spamRules() Named {
+	from := func(ns string) string {
+		return fmt.Sprintf("(key_exists('%s', from.domain) || key_exists('%s', from.local + '@' + from.domain))", ns, ns)
+	}
+	rule := func(name, cond, tag string) map[string]any {
+		return map[string]any{"@type": "Any", "name": name, "enable": true, "priority": 16,
+			"description": "Portcullis (mailctl base plan)",
+			"condition":   expr("false", [2]string{cond, "'" + tag + "'"})}
+	}
+	return Named{Object: "SpamRule", Key: "name", Immutable: []string{"name"}, Want: []map[string]any{
+		rule("PORTCULLIS_ALLOW", "$DMARC_POLICY_ALLOW && "+from(NSSpamAllow), "TRUSTED_DOMAIN"),
+		rule("PORTCULLIS_BLOCK", from(NSSpamBlock), "BLOCKED_DOMAIN"),
+	}}
 }
 
 // rcptScript selects the trusted Sieve script that refuses at RCPT: the
@@ -222,7 +266,7 @@ func (p Params) Singletons() []Singleton {
 	if p.Relay != nil {
 		tlsStrategy, route = "'relay-strict'", "'relay'"
 	}
-	return []Singleton{
+	ss := []Singleton{
 		{"SystemSettings", map[string]any{"defaultHostname": p.Hostname, "maxBufferedMemory": 134217728}},
 		{"Cache", map[string]any{"messagesLarge": 0, "groupwareLarge": 0, "messages": 67108864}},
 		{"DnsResolver", map[string]any{"@type": "Custom", "servers": list(
@@ -265,6 +309,10 @@ func (p Params) Singletons() []Singleton {
 			"inboundReportForwarding": false,
 		}},
 	}
+	if p.ClientIP == "rewritten" {
+		ss = append(ss, Singleton{"Security", DegradedSecurity()})
+	}
+	return ss
 }
 
 // Collections the plan owns by name (created in this order).
@@ -296,6 +344,7 @@ func (p Params) Collections() []Named {
 		p.listeners(),
 		{Object: "Tracer", Key: "@type", DestroyOthers: true, Want: []map[string]any{{"@type": "Stdout", "ansi": false, "enable": true, "level": "info"}}},
 		sieveScripts(),
+		spamRules(),
 		{Object: "MtaTlsStrategy", Key: "name", Immutable: []string{"name"}, Want: strategies},
 		{Object: "MtaRoute", Key: "name", Immutable: []string{"name"}, Want: routes},
 		// The spam rules' external feeds (openphish, phishtank, …): made

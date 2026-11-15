@@ -43,6 +43,9 @@ var MailctlRolePermissions = func() []string {
 		"sysHttpLookupGet", "sysHttpLookupQuery", "sysHttpLookupUpdate",
 		"sysSpamDnsblServerGet", "sysSpamDnsblServerQuery", "sysSpamDnsblServerUpdate",
 		"sysSenderAuthGet", "sysSenderAuthUpdate",
+		// Task 9: the outbound limit (rate_held), the DANE switch.
+		"sysMtaOutboundThrottleGet", "sysMtaOutboundThrottleCreate", "sysMtaOutboundThrottleUpdate", "sysMtaOutboundThrottleDestroy", "sysMtaOutboundThrottleQuery",
+		"sysMtaTlsStrategyGet", "sysMtaTlsStrategyQuery", "sysMtaTlsStrategyUpdate",
 		// The per-account limits (MtaInboundThrottle) and, with
 		// MAIL_SUBMISSION_LAN_ONLY, the SASL rule (MtaStageAuth).
 		"sysMtaInboundThrottleGet", "sysMtaInboundThrottleCreate", "sysMtaInboundThrottleUpdate",

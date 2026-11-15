@@ -56,9 +56,14 @@ type Inputs struct {
 	Mail      string // on | draining | off (the document)
 	Reachable bool   // the well-known router is on websecure
 	MX        string // MAIL_HOSTNAME
-	// Failure: the certificate check failed or a TLS-RPT report since the
-	// given time shows failures.
+	// Failure: the certificate check failed or TLS-RPT reports since the
+	// given time show failures, strong enough to downgrade enforce to
+	// testing (the caller requires independent reporters: reports are
+	// unauthenticated mail).
 	Failure func(since time.Time) bool
+	// Blocking: any failure since the given time that keeps testing from
+	// becoming enforce (one accepted report is enough). nil = Failure.
+	Blocking func(since time.Time) bool
 }
 
 func (d *Domain) publish(mode, mx string, maxAge int, now time.Time) {
@@ -142,7 +147,7 @@ func EnforceReady(d Domain, in Inputs, now time.Time) error {
 		return fmt.Errorf("MTA-STS is %s, not testing", d.Mode)
 	case now.Sub(d.Since) < EnforceAfter:
 		return fmt.Errorf("MTA-STS has been testing for less than 7 days (since %s)", d.Since.UTC().Format(time.RFC3339))
-	case in.Failure != nil && in.Failure(d.Since):
+	case in.Blocking != nil && in.Blocking(d.Since), in.Blocking == nil && in.Failure != nil && in.Failure(d.Since):
 		return errors.New("the certificate check or a TLS-RPT report failed since testing began")
 	}
 	return nil

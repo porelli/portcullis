@@ -25,6 +25,7 @@ import (
 	"github.com/portcullis/mailctl/internal/stalwart"
 	"github.com/portcullis/mailctl/internal/state"
 	"github.com/portcullis/mailctl/internal/tlsa"
+	"golang.org/x/net/publicsuffix"
 )
 
 // Ext keys.
@@ -63,11 +64,19 @@ type Machines struct {
 	Logf  func(string, ...any)
 	// Visible overrides the resolver lookup (tests).
 	Visible func(ctx context.Context, name, value string) bool
-	// CertOK: the certificate check (Task 9's checks; nil = ok).
-	CertOK func() bool
+	// CertOK: the last certificate check (ok, known). nil = ok. Only a
+	// known failure moves enforce back (local evidence); anything but a
+	// known pass holds testing.
+	CertOK func() (ok, known bool)
+	// Verify authenticates report messages (nil: every report is
+	// unauthenticated, display only).
+	Verify Verify
 
 	mu   sync.Mutex
 	wake chan struct{}
+
+	seenMu sync.Mutex
+	seen   map[string]bool // reports already logged
 }
 
 // New returns the driver.
@@ -144,18 +153,93 @@ func (m *Machines) domainIDs(ctx context.Context) (map[string]string, error) {
 	return out, nil
 }
 
-// tlsFailures: aggregate TLS reports for the domain with failed sessions,
-// by their end time.
-func (m *Machines) reports(ctx context.Context) (dm map[string][]dmarc.Report, tl map[string][]time.Time, err error) {
-	dm, tl = map[string][]dmarc.Report{}, map[string][]time.Time{}
+// Report is one aggregate report as received (DMARC or TLS-RPT). Reports
+// are unauthenticated mail: anyone can send one. Security ruling (T9):
+// reports never weaken a policy on their own. A report counts for state
+// (holding a progression) or a doctor Problem only when authenticated:
+// its message passed DKIM aligned with its From domain, by the mail
+// server's own verification (Verify); Sender is then that DKIM d= domain's
+// registrable domain. Org and From are display only.
+type Report struct {
+	Kind          string // dmarc | tls
+	ID            string
+	Domain        string          // the report's policy domain, lowercase
+	To            map[string]bool // the addresses it was sent to, lowercase
+	Org           string          // the reporting organisation (display only)
+	From          string          // the From address's domain (display only)
+	End           time.Time
+	Failing       bool
+	Authenticated bool   // aligned DKIM pass (Verify)
+	Sender        string // the registrable domain of the aligned DKIM d= ("" unless authenticated)
+}
+
+// Verify gives a report message's DKIM result: the d= domain of a passing
+// signature and whether it passed. Stalwart v1.1.0's x:DmarcExternalReport
+// / x:TlsExternalReport carry no verification result, so serve sets none
+// and every report is unauthenticated (display only) until a verified
+// source exists.
+type Verify func(ctx context.Context, r Report) (dkimDomain string, pass bool)
+
+// Registrable is a domain's registrable part (eTLD+1), "" when it has none.
+func Registrable(d string) string {
+	d = strings.TrimSuffix(strings.ToLower(d), ".")
+	r, err := publicsuffix.EffectiveTLDPlusOne(d)
+	if err != nil {
+		return ""
+	}
+	return r
+}
+
+// authenticate fills Authenticated / Sender: a DKIM pass whose d= is
+// aligned (relaxed: same registrable domain) with the From domain.
+func (m *Machines) authenticate(ctx context.Context, rs []Report) {
+	if m.Verify == nil {
+		return
+	}
+	for i := range rs {
+		dd, pass := m.Verify(ctx, rs[i])
+		from := Registrable(rs[i].From)
+		if pass && from != "" && Registrable(dd) == from {
+			rs[i].Authenticated, rs[i].Sender = true, from
+		}
+	}
+}
+
+// skew: a report ending later than now + skew is dropped.
+const skew = 5 * time.Minute
+
+func domainOf(addr string) string {
+	if i := strings.LastIndexByte(addr, '@'); i >= 0 {
+		return strings.ToLower(addr[i+1:])
+	}
+	return ""
+}
+
+func lowerSet(m map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	for k, v := range m {
+		if v {
+			out[strings.ToLower(k)] = true
+		}
+	}
+	return out
+}
+
+// reports reads every aggregate report Stalwart holds.
+func (m *Machines) reports(ctx context.Context) ([]Report, error) {
+	var out []Report
 	ids, err := m.C.Query(ctx, "DmarcExternalReport", nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if len(ids) > 0 {
 		var rs []struct {
+			ID     string          `json:"id"`
+			From   string          `json:"from"`
+			To     map[string]bool `json:"to"`
 			Report struct {
 				PolicyDomain string    `json:"policyDomain"`
+				OrgName      string    `json:"orgName"`
 				End          time.Time `json:"dateRangeEnd"`
 				Records      map[string]struct {
 					Dkim string `json:"evaluatedDkim"`
@@ -163,8 +247,8 @@ func (m *Machines) reports(ctx context.Context) (dm map[string][]dmarc.Report, t
 				} `json:"records"`
 			} `json:"report"`
 		}
-		if err := m.C.Get(ctx, "DmarcExternalReport", ids, []string{"report"}, &rs); err != nil {
-			return nil, nil, err
+		if err := m.C.Get(ctx, "DmarcExternalReport", ids, []string{"id", "from", "to", "report"}, &rs); err != nil {
+			return nil, err
 		}
 		for _, r := range rs {
 			fail := false
@@ -173,17 +257,21 @@ func (m *Machines) reports(ctx context.Context) (dm map[string][]dmarc.Report, t
 					fail = true
 				}
 			}
-			d := strings.ToLower(r.Report.PolicyDomain)
-			dm[d] = append(dm[d], dmarc.Report{End: r.Report.End, Failing: fail})
+			out = append(out, Report{Kind: "dmarc", ID: r.ID, Domain: strings.ToLower(r.Report.PolicyDomain), To: lowerSet(r.To),
+				Org: strings.ToLower(strings.TrimSpace(r.Report.OrgName)), From: domainOf(r.From), End: r.Report.End, Failing: fail})
 		}
 	}
 	ids, err = m.C.Query(ctx, "TlsExternalReport", nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if len(ids) > 0 {
 		var rs []struct {
+			ID     string          `json:"id"`
+			From   string          `json:"from"`
+			To     map[string]bool `json:"to"`
 			Report struct {
+				Org      string    `json:"organizationName"`
 				End      time.Time `json:"dateRangeEnd"`
 				Policies map[string]struct {
 					Domain string `json:"policyDomain"`
@@ -191,37 +279,131 @@ func (m *Machines) reports(ctx context.Context) (dm map[string][]dmarc.Report, t
 				} `json:"policies"`
 			} `json:"report"`
 		}
-		if err := m.C.Get(ctx, "TlsExternalReport", ids, []string{"report"}, &rs); err != nil {
-			return nil, nil, err
+		if err := m.C.Get(ctx, "TlsExternalReport", ids, []string{"id", "from", "to", "report"}, &rs); err != nil {
+			return nil, err
 		}
 		for _, r := range rs {
+			per := map[string]bool{}
 			for _, p := range r.Report.Policies {
-				if p.Failed > 0 {
-					d := strings.ToLower(p.Domain)
-					tl[d] = append(tl[d], r.Report.End)
-				}
+				d := strings.ToLower(p.Domain)
+				per[d] = per[d] || p.Failed > 0
+			}
+			for d, fail := range per {
+				out = append(out, Report{Kind: "tls", ID: r.ID, Domain: d, To: lowerSet(r.To),
+					Org: strings.ToLower(strings.TrimSpace(r.Report.Org)), From: domainOf(r.From), End: r.Report.End, Failing: fail})
 			}
 		}
 	}
-	return dm, tl, nil
+	m.authenticate(ctx, out)
+	return out, nil
 }
 
-func (m *Machines) failure(tl map[string][]time.Time, domain string) func(time.Time) bool {
-	return func(since time.Time) bool {
-		if m.CertOK != nil && !m.CertOK() {
-			return true
-		}
-		for _, t := range tl[domain] {
-			if t.After(since) {
-				return true
-			}
-		}
-		return false
+// Accepted are the reports of kind for domain that count: about that
+// domain, received at its own report address (dmarc-reports@ /
+// tls-reports@), ending no later than now + skew and not before since.
+// Every dropped failing report is logged once (reporter and policy
+// domain, never the body).
+func (m *Machines) Accepted(rs []Report, kind, domain string, since, now time.Time) []Report {
+	rua := "dmarc-reports@" + domain
+	if kind == "tls" {
+		rua = "tls-reports@" + domain
 	}
+	var out []Report
+	for _, r := range rs {
+		if r.Kind != kind || r.Domain != domain {
+			continue
+		}
+		why := ""
+		switch {
+		case !r.To[rua]:
+			why = "not sent to " + rua
+		case r.End.After(now.Add(skew)):
+			why = "dated in the future"
+		case r.End.Before(since):
+			why = "older than the current policy"
+		}
+		if why != "" {
+			if r.Failing {
+				m.logOnce(r, "ignored ("+why+")")
+			}
+			continue
+		}
+		if r.Failing {
+			m.logOnce(r, "counted")
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
-func (m *Machines) inputs(d state.Domain, tl map[string][]time.Time) mtasts.Inputs {
-	return mtasts.Inputs{Mail: d.Mail, Reachable: m.Cfg.Reachable, MX: m.Cfg.Hostname, Failure: m.failure(tl, d.Name)}
+func (m *Machines) logOnce(r Report, what string) {
+	key := r.Kind + "|" + r.ID + "|" + r.Domain + "|" + what
+	m.seenMu.Lock()
+	defer m.seenMu.Unlock()
+	if m.seen == nil {
+		m.seen = map[string]bool{}
+	}
+	if m.seen[key] || m.Logf == nil {
+		return
+	}
+	m.seen[key] = true
+	auth := "unauthenticated"
+	if r.Authenticated {
+		auth = "DKIM " + r.Sender
+	}
+	m.Logf("reports: a failing %s report for %s from %q (%s, %s) %s", r.Kind, r.Domain, r.Org, r.From, auth, what)
+}
+
+// Reporters counts independent reporters among failing, authenticated
+// reports: distinct registrable domains of the aligned DKIM signature.
+// Unauthenticated reports never count.
+func Reporters(rs []Report) int {
+	seen := map[string]bool{}
+	for _, r := range rs {
+		if r.Failing && r.Authenticated && r.Sender != "" {
+			seen[r.Sender] = true
+		}
+	}
+	return len(seen)
+}
+
+// MinReporters authenticated registrable domains are what holding a
+// progression or a doctor Problem needs.
+const MinReporters = 2
+
+// inputs: MTA-STS moves back to testing only on local evidence (the
+// certificate check), never on reports (ruling); reports from
+// MinReporters authenticated reporters only hold testing from becoming
+// enforce, which never weakens the current policy.
+func (m *Machines) inputs(d state.Domain, rs []Report, now time.Time) mtasts.Inputs {
+	cert := func() (bool, bool) {
+		if m.CertOK == nil {
+			return true, true
+		}
+		return m.CertOK()
+	}
+	return mtasts.Inputs{Mail: d.Mail, Reachable: m.Cfg.Reachable, MX: m.Cfg.Hostname,
+		Failure: func(time.Time) bool { ok, known := cert(); return known && !ok },
+		Blocking: func(since time.Time) bool {
+			ok, known := cert()
+			return !(ok && known) || Reporters(m.Accepted(rs, "tls", d.Name, since, now)) >= MinReporters
+		}}
+}
+
+// dmarcReports are what the DMARC machine observes: failing reports hold
+// a proposal only when MinReporters authenticated reporters sent them
+// (holding a progression never lowers p=; nothing here ever lowers it).
+func dmarcReports(rs []Report) []dmarc.Report {
+	if Reporters(rs) < MinReporters {
+		return nil
+	}
+	var out []dmarc.Report
+	for _, r := range rs {
+		if r.Authenticated {
+			out = append(out, dmarc.Report{End: r.End, Failing: r.Failing})
+		}
+	}
+	return out
 }
 
 // Step is one pass over every domain of the applied document.
@@ -238,7 +420,7 @@ func (m *Machines) Step(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	dmRep, tlRep, rerr := m.reports(ctx)
+	reps, rerr := m.reports(ctx)
 	ks := read[dkim.State](p, extDKIM)
 	sts := read[map[string]mtasts.Domain](p, extMTASTS)
 	dms := read[map[string]dmarc.Domain](p, extDMARC)
@@ -253,16 +435,19 @@ func (m *Machines) Step(ctx context.Context) error {
 		errs = append(errs, rerr)
 	}
 	for _, d := range doc.Domains {
-		sts[d.Name] = mtasts.Step(sts[d.Name], m.inputs(d, tlRep), now)
+		if rerr == nil {
+			// A failed read never downgrades (no reports = no failures).
+			sts[d.Name] = mtasts.Step(sts[d.Name], m.inputs(d, reps, now), now)
+		}
 		if _, ok := dms[d.Name]; !ok {
 			dms[d.Name] = dmarc.Start(d.DMARCStart, now)
 		}
-		dms[d.Name] = dmarc.Observe(dms[d.Name], dmRep[d.Name])
+		dms[d.Name] = dmarc.Observe(dms[d.Name], dmarcReports(m.Accepted(reps, "dmarc", d.Name, dms[d.Name].Since, now)))
 		if d.Mail != state.MailOn || ids[d.Name] == "" {
 			continue
 		}
 		next, acts := dkim.Step(ks, d.Name, now, m.Cfg.RotateEvery, func(n, v string) bool { return m.visible(ctx, n, v) })
-		next, err := m.execute(ctx, next, acts, ids[d.Name])
+		next, err := m.execute(ctx, ks, next, acts, ids[d.Name])
 		if err != nil {
 			errs = append(errs, fmt.Errorf("dkim %s: %w", d.Name, err))
 		}
@@ -279,58 +464,52 @@ func (m *Machines) Step(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// execute runs the DKIM actions; a failed create leaves its key without
-// an ID (retried next pass), a failed stage change keeps the old stage.
-func (m *Machines) execute(ctx context.Context, next dkim.State, acts []dkim.Action, domainID string) (dkim.State, error) {
+// execute runs the DKIM actions. A failed create leaves its key without
+// an ID (retried next pass). Stage changes go in one unit per algorithm
+// (the old active's retiring and the pending key's active together): if
+// any of them fails, the ones that went through are put back in Stalwart
+// and every key of the unit keeps its previous stage and since in the
+// returned state, so the next pass tries again.
+func (m *Machines) execute(ctx context.Context, prev, next dkim.State, acts []dkim.Action, domainID string) (dkim.State, error) {
 	var errs []error
-	staged := false
+	prevKey := map[string]dkim.Key{}
+	for _, k := range prev.Keys {
+		if k.ID != "" {
+			prevKey[k.ID] = k
+		}
+	}
+	algoOf := func(id string) string {
+		for _, k := range next.Keys {
+			if k.ID == id {
+				return k.Algorithm
+			}
+		}
+		return prevKey[id].Algorithm
+	}
+	units := map[string][]dkim.Action{}
+	var order []string
 	for _, a := range acts {
 		switch a.Kind {
 		case "create":
-			pemKey, pubs, err := dkim.Generate(a.Key.Algorithm)
+			id, pub, err := m.create(ctx, a.Key, domainID)
 			if err != nil {
 				errs = append(errs, err)
-				continue
-			}
-			r, err := m.C.Set(ctx, "DkimSignature", map[string]any{"k": map[string]any{
-				"@type": dkim.Variant(a.Key.Algorithm), "domainId": domainID, "selector": a.Key.Selector,
-				"stage": dkim.Pending, "privateKey": map[string]any{"@type": "Text", "secret": pemKey},
-			}}, nil, nil)
-			pemKey = ""
-			if err == nil {
-				err = r.Failed()
-			}
-			if err != nil {
-				errs = append(errs, err)
-				continue
-			}
-			id := r.CreatedID("k")
-			var got []struct {
-				PublicKey string `json:"publicKey"`
-			}
-			if err := m.C.Get(ctx, "DkimSignature", []string{id}, []string{"publicKey"}, &got); err != nil || len(got) != 1 {
-				errs = append(errs, fmt.Errorf("reading the new key's publicKey: %v", err))
-				continue
-			}
-			if !slices.Contains(pubs, got[0].PublicKey) {
-				errs = append(errs, fmt.Errorf("Stalwart's publicKey for %s isn't the generated key's", a.Key.Selector))
 				continue
 			}
 			for i := range next.Keys {
 				if next.Keys[i].Domain == a.Key.Domain && next.Keys[i].Selector == a.Key.Selector {
-					next.Keys[i].ID, next.Keys[i].PublicKey = id, got[0].PublicKey
+					next.Keys[i].ID, next.Keys[i].PublicKey = id, pub
 				}
 			}
 		case "stage":
-			r, err := m.C.Set(ctx, "DkimSignature", nil, map[string]map[string]any{a.ID: {"stage": a.Stage}}, nil)
-			if err == nil {
-				err = r.Failed()
-			}
-			if err != nil {
-				errs = append(errs, err)
+			if a.ID == "" {
 				continue
 			}
-			staged = true
+			al := algoOf(a.ID)
+			if _, ok := units[al]; !ok {
+				order = append(order, al)
+			}
+			units[al] = append(units[al], a)
 		case "destroy":
 			r, err := m.C.Set(ctx, "DkimSignature", nil, nil, []string{a.ID})
 			if err == nil {
@@ -338,16 +517,98 @@ func (m *Machines) execute(ctx context.Context, next dkim.State, acts []dkim.Act
 			}
 			if err != nil {
 				errs = append(errs, err)
+				// Keep the retired key: destroyed next pass.
+				if k, ok := prevKey[a.ID]; ok {
+					next.Keys = append(next.Keys, k)
+				}
+			}
+		}
+	}
+	staged := false
+	for _, al := range order {
+		unit := units[al]
+		update := map[string]map[string]any{}
+		for _, a := range unit {
+			update[a.ID] = map[string]any{"stage": a.Stage}
+		}
+		r, err := m.C.Set(ctx, "DkimSignature", nil, update, nil)
+		if err == nil {
+			err = r.Failed()
+		}
+		if err == nil {
+			staged = true
+			continue
+		}
+		errs = append(errs, fmt.Errorf("dkim %s stage change (rolled back): %w", al, err))
+		// Put back what went through (r.Updated), then the state.
+		undo := map[string]map[string]any{}
+		for id := range r.Updated {
+			if k, ok := prevKey[id]; ok {
+				undo[id] = map[string]any{"stage": k.Stage}
+			}
+		}
+		if len(undo) > 0 {
+			ur, uerr := m.C.Set(ctx, "DkimSignature", nil, undo, nil)
+			if uerr == nil {
+				uerr = ur.Failed()
+			}
+			if uerr != nil {
+				errs = append(errs, fmt.Errorf("dkim %s: putting the stage back: %w", al, uerr))
+			}
+			staged = true
+		}
+		for _, a := range unit {
+			for i := range next.Keys {
+				if next.Keys[i].ID == a.ID {
+					if k, ok := prevKey[a.ID]; ok {
+						next.Keys[i].Stage, next.Keys[i].Since = k.Stage, k.Since
+					}
+				}
 			}
 		}
 	}
 	if staged {
-		// Signers are cached (P55): harmless, and the contract's rule.
+		// Signers are cached (P55): every stage change is followed by it.
 		if err := m.C.Action(ctx, "InvalidateCaches"); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return next, errors.Join(errs...)
+}
+
+// create makes one key in Stalwart: generated here, signed and verified
+// in-process while the private half is still in memory (P2), sent once,
+// and Stalwart's derived publicKey checked against it.
+func (m *Machines) create(ctx context.Context, k dkim.Key, domainID string) (string, string, error) {
+	pemKey, pubs, err := dkim.Generate(k.Algorithm)
+	if err != nil {
+		return "", "", err
+	}
+	if err := dkim.SelfTest(pemKey, k.Algorithm, pubs[0]); err != nil {
+		return "", "", fmt.Errorf("dkim %s: the new key fails its own signature test: %w", k.Selector, err)
+	}
+	r, err := m.C.Set(ctx, "DkimSignature", map[string]any{"k": map[string]any{
+		"@type": dkim.Variant(k.Algorithm), "domainId": domainID, "selector": k.Selector,
+		"stage": dkim.Pending, "privateKey": map[string]any{"@type": "Text", "secret": pemKey},
+	}}, nil, nil)
+	pemKey = ""
+	if err == nil {
+		err = r.Failed()
+	}
+	if err != nil {
+		return "", "", err
+	}
+	id := r.CreatedID("k")
+	var got []struct {
+		PublicKey string `json:"publicKey"`
+	}
+	if err := m.C.Get(ctx, "DkimSignature", []string{id}, []string{"publicKey"}, &got); err != nil || len(got) != 1 {
+		return "", "", fmt.Errorf("reading the new key's publicKey: %v", err)
+	}
+	if !slices.Contains(pubs, got[0].PublicKey) {
+		return "", "", fmt.Errorf("Stalwart's publicKey for %s isn't the generated key's", k.Selector)
+	}
+	return id, got[0].PublicKey, nil
 }
 
 // mainSecure is the main zone's DNSSEC state: the newest mailctl holds
@@ -533,7 +794,7 @@ func (m *Machines) MTASTSEnforce(ctx context.Context, domain string) error {
 	if !m.mailOn(domain) {
 		return ErrNotMailDomain
 	}
-	_, tl, err := m.reports(ctx)
+	reps, err := m.reports(ctx)
 	if err != nil {
 		return err
 	}
@@ -546,7 +807,7 @@ func (m *Machines) MTASTSEnforce(ctx context.Context, domain string) error {
 	}
 	return m.Store.Update(func(s *state.Persistent) error {
 		sts := read[map[string]mtasts.Domain](*s, extMTASTS)
-		d, err := mtasts.DoEnforce(sts[domain], m.inputs(dom, tl), m.now())
+		d, err := mtasts.DoEnforce(sts[domain], m.inputs(dom, reps, m.now()), m.now())
 		if err != nil {
 			return ErrNothingToDo{err.Error()}
 		}
@@ -593,7 +854,7 @@ func (m *Machines) Statuses(ctx context.Context) ([]DKIMStatus, []MTASTSStatus, 
 	}
 	ms, ds := []MTASTSStatus{}, []DMARCStatus{}
 	if p.Doc != nil {
-		_, tl, _ := m.reports(ctx)
+		reps, _ := m.reports(ctx)
 		for _, d := range p.Doc.Domains {
 			st := sts[d.Name]
 			mode := st.Mode
@@ -601,7 +862,7 @@ func (m *Machines) Statuses(ctx context.Context) ([]DKIMStatus, []MTASTSStatus, 
 				mode = mtasts.Off
 			}
 			ms = append(ms, MTASTSStatus{Domain: d.Name, Mode: mode, Since: st.Since,
-				EnforceReady: mtasts.EnforceReady(st, m.inputs(d, tl), m.now()) == nil})
+				EnforceReady: mtasts.EnforceReady(st, m.inputs(d, reps, m.now()), m.now()) == nil})
 			dm := dms[d.Name]
 			var prop *string
 			if pp := dmarc.Proposed(dm, m.now()); pp != "" {
@@ -646,4 +907,17 @@ func init() {
 	} {
 		stalwart.Used = append(stalwart.Used, u)
 	}
+}
+
+// Reports reads every aggregate report Stalwart holds (the checks).
+func (m *Machines) Reports(ctx context.Context) ([]Report, error) { return m.reports(ctx) }
+
+// Keys are every domain's DKIM keys as the state holds them.
+func (m *Machines) Keys() []dkim.Key { return read[dkim.State](m.Store.Get(), extDKIM).Keys }
+
+// TLSAWanted are the SPKIs published at _25._tcp.<MAIL_HOSTNAME> right now
+// (none unless the main zone is secure).
+func (m *Machines) TLSAWanted() []string {
+	p := m.Store.Get()
+	return tlsa.Wanted(state.TLSA(p), m.mainState(p) == "secure")
 }

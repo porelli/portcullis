@@ -63,6 +63,30 @@ scrape_configs:
     file_sd_configs:
       - files: [/etc/portcullis/wg-targets.json]
 
+  # Mail (profile mail, contract §19.8): over portcullis-metrics-mail, from
+  # one file_sd written by ./portcullis (mail-targets.json: both targets
+  # while the profile is on, else []), each job keeping its own service.
+  # Stalwart's endpoint needs Basic auth (prometheus + a copy of
+  # secrets/mail/metrics-secret).
+  - job_name: mail
+    metrics_path: /metrics/prometheus
+    basic_auth:
+      username: prometheus
+      password_file: /etc/portcullis/mail-metrics-secret
+    file_sd_configs:
+      - files: [/etc/portcullis/mail-targets.json]
+    relabel_configs:
+      - source_labels: [service]
+        regex: mail
+        action: keep
+  - job_name: mailctl
+    file_sd_configs:
+      - files: [/etc/portcullis/mail-targets.json]
+    relabel_configs:
+      - source_labels: [service]
+        regex: mailctl
+        action: keep
+
   # Textfile metrics written by ./portcullis (backup age, client-cert and CA
   # expiry, `portcullis status` service health).
   - job_name: portcullis
