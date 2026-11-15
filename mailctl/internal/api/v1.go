@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -116,9 +117,20 @@ func (v *V1) putState(w http.ResponseWriter, r *http.Request) {
 		v.unreachable(w, err)
 		return
 	}
-	if _, err := reconcile.Plan(live, doc, p.Former, v.now(), 1<<62); errors.Is(err, reconcile.ErrMassRemoval) {
-		// The Hub branches on error_kind (contract §19.5).
-		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "error_kind": "mass_removal"})
+	if ops, err := reconcile.Plan(live, doc, p.Former, v.now(), 1<<62); errors.Is(err, reconcile.ErrMassRemoval) {
+		// The Hub branches on error_kind and shows the accounts the
+		// document would remove (from this one live read): username and
+		// uuid only, sorted by username (contract §19.5).
+		type gone struct {
+			Username string `json:"username"`
+			UUID     string `json:"uuid"`
+		}
+		removed := make([]gone, 0, len(ops.Removals))
+		for _, r := range ops.Removals {
+			removed = append(removed, gone{Username: r.Username, UUID: r.UUID})
+		}
+		sort.Slice(removed, func(i, j int) bool { return removed[i].Username < removed[j].Username })
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "error_kind": "mass_removal", "removed": removed})
 		return
 	}
 	if err := v.Store.Update(func(s *state.Persistent) error {

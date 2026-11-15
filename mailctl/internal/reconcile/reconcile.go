@@ -120,7 +120,8 @@ func Plan(l *Live, want *state.Doc, former map[string]state.Former, now time.Tim
 		}
 	}
 	if !want.ConfirmMassRemoval && active > 0 && len(ops.Removals)*2 > active {
-		return Ops{}, ErrMassRemoval
+		// Only the removals: the caller names them (contract §19.5).
+		return Ops{Removals: ops.Removals}, ErrMassRemoval
 	}
 	for _, d := range want.Domains {
 		if _, ok := l.Domains[d.Name]; !ok {

@@ -112,10 +112,20 @@ func TestMassRemoval409AtPut(t *testing.T) {
 	b, _ := json.Marshal(m)
 	doc := string(b)
 	w := e.do("PUT", "/v1/state", doc)
-	var body map[string]string
-	if w.Code != 409 || json.Unmarshal(w.Body.Bytes(), &body) != nil || body["error_kind"] != "mass_removal" ||
-		!strings.Contains(body["error"], "mass removal") || !strings.Contains(body["error"], "50 %") || len(body) != 2 {
+	var body struct {
+		Error     string `json:"error"`
+		ErrorKind string `json:"error_kind"`
+		Removed   []map[string]any
+	}
+	var raw map[string]json.RawMessage
+	json.Unmarshal(w.Body.Bytes(), &raw)
+	if w.Code != 409 || json.Unmarshal(w.Body.Bytes(), &body) != nil || body.ErrorKind != "mass_removal" ||
+		!strings.Contains(body.Error, "mass removal") || !strings.Contains(body.Error, "50 %") || len(raw) != 3 {
 		t.Fatalf("mass removal: %d %s", w.Code, w.Body)
+	}
+	// The accounts it would remove: username and uuid only, sorted.
+	if b, _ := json.Marshal(body.Removed); string(b) != `[{"username":"bob","uuid":"0b9d8c7a-6e5f-4a3b-9c2d-1e0f9a8b7c6d"},{"username":"root","uuid":"3e5a7c9b-1d2f-4a6b-8c0e-2f4a6b8c0d1e"}]` {
+		t.Fatalf("removed %s", b)
 	}
 	// A stale generation's 409 has no error_kind.
 	w = e.do("PUT", "/v1/state", vec(t, 12))
