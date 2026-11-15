@@ -36,7 +36,7 @@ func setRRsets(sp Spec, live []liveRec, sets []string) [][2]string {
 		case SetNoMail:
 			out = append(out, [2]string{d, "MX"}, [2]string{d, "TXT"}, [2]string{"_dmarc." + d, "TXT"})
 		case SetMail:
-			for _, p := range mailPairs(sp, d, specHosts(sp, d), live) {
+			for _, p := range mailPairs(sp, d, liveHosts(sp, d, live), live) {
 				out = append(out, [2]string{p.name, p.typ})
 			}
 		}

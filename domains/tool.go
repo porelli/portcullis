@@ -66,6 +66,10 @@ type toolInput struct {
 	// rotate --json, contract §19.7); [] = mail off (its records go). The
 	// mail set is applied only with it present.
 	Mail *[]dnsplan.MailRecord `json:"mail"`
+	// MailHostname: MAIL_HOSTNAME, required with mail (and only with it):
+	// its HELO SPF and TLSA are the set's, removed when the set is empty or
+	// the host changed (never derived from the MX target).
+	MailHostname string `json:"mail_hostname"`
 }
 
 // toolInputMax bounds stdin; toolInputMailMax with the mail set.
@@ -385,7 +389,7 @@ func readToolInput(r io.Reader) (toolInput, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&in); err != nil {
 		// Never quote the input (it holds the credentials).
-		return in, errors.New("stdin must be one JSON object with the documented keys (name, provider, credentials, ipv4, ipv6, ca_server, caa, nomail, sets, mail_from, mail)")
+		return in, errors.New("stdin must be one JSON object with the documented keys (name, provider, credentials, ipv4, ipv6, ca_server, caa, nomail, sets, mail_from, mail, mail_hostname)")
 	}
 	if dec.Decode(&struct{}{}) != io.EOF {
 		return in, errors.New("stdin must hold exactly one JSON object")
@@ -427,11 +431,18 @@ func (in toolInput) spec() (dnsplan.Spec, error) {
 	issuer, _ := dnsplan.IssuerFor(in.CAServer, in.CAA.Issuer)
 	sp := dnsplan.Spec{Name: name, IPv4: v4, IPv6: v6, CAA: in.CAA.Enabled, Issuer: issuer, AccountURI: in.CAA.AccountURI,
 		IODEF: strings.TrimSpace(in.CAA.IODEF), NoMail: in.NoMail, Main: true}
-	if in.Mail != nil {
-		if err := dnsplan.ValidateMainMail(name, *in.Mail); err != nil {
+	switch {
+	case in.Mail != nil:
+		host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(in.MailHostname), "."))
+		if !validHostname(host) {
+			return dnsplan.Spec{}, fmt.Errorf("mail needs mail_hostname (MAIL_HOSTNAME), a valid hostname: %q", in.MailHostname)
+		}
+		if err := dnsplan.ValidateMainMail(name, host, *in.Mail); err != nil {
 			return dnsplan.Spec{}, fmt.Errorf("mail: %w", err)
 		}
-		sp.Mail = *in.Mail
+		sp.Mail, sp.MailHost = *in.Mail, host
+	case in.MailHostname != "":
+		return dnsplan.Spec{}, errors.New("mail_hostname goes with mail (the mail set's records)")
 	}
 	return sp, nil
 }

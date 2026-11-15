@@ -478,7 +478,12 @@ func TestToolApplyMainMail(t *testing.T) {
 		{Name: "_submissions._tcp." + d, Type: "SRV", TTL: 3600, Value: "0 1 465 " + h + "."},
 		{Name: "_25._tcp." + h, Type: "TLSA", TTL: 3600, Value: "3 1 1 " + spki},
 	}
-	in := toolJSON(func(m map[string]any) { m["sets"] = []string{"mail"}; m["mail"] = mail; m["nomail"] = true })
+	in := toolJSON(func(m map[string]any) {
+		m["sets"] = []string{"mail"}
+		m["mail"] = mail
+		m["mail_hostname"] = h
+		m["nomail"] = true
+	})
 	code, out, errs := f.run([]string{"apply"}, in)
 	if code != exitOK {
 		t.Fatalf("apply = %d %s %s", code, out, errs)
@@ -516,8 +521,37 @@ func TestToolApplyMainMail(t *testing.T) {
 	}
 	bad := append([]dnsplan.MailRecord(nil), mail...)
 	bad = append(bad, dnsplan.MailRecord{Name: d, Type: "CAA", TTL: 300, Value: `0 issue "letsencrypt.org"`})
-	if code, _, _ := f.run([]string{"apply"}, toolJSON(func(m map[string]any) { m["sets"] = []string{"mail"}; m["mail"] = bad })); code != exitUsage {
+	if code, _, _ := f.run([]string{"apply"}, toolJSON(func(m map[string]any) {
+		m["sets"] = []string{"mail"}
+		m["mail"] = bad
+		m["mail_hostname"] = h
+	})); code != exitUsage {
 		t.Fatalf("CAA in the mail set = %d", code)
+	}
+	// mail_hostname is required with mail, and only with it.
+	if code, _, errs := f.run([]string{"apply"}, toolJSON(func(m map[string]any) { m["sets"] = []string{"mail"}; m["mail"] = mail })); code != exitUsage || !strings.Contains(errs, "mail_hostname") {
+		t.Fatalf("no mail_hostname = %d %s", code, errs)
+	}
+	if code, _, _ := f.run([]string{"plan"}, toolJSON(func(m map[string]any) { m["mail_hostname"] = h })); code != exitUsage {
+		t.Fatalf("mail_hostname alone = %d", code)
+	}
+	// Mail off ([]): MAIL_HOSTNAME's HELO SPF and TLSA go with the rest.
+	if code, out, errs := f.run([]string{"apply"}, toolJSON(func(m map[string]any) {
+		m["sets"] = []string{"mail"}
+		m["mail"] = []dnsplan.MailRecord{}
+		m["mail_hostname"] = h
+	})); code != exitOK {
+		t.Fatalf("mail off = %d %s %s", code, out, errs)
+	}
+	for _, n := range []string{h, "_25._tcp." + h, "_submissions._tcp." + d, "v1-ed25519-20261115._domainkey." + d} {
+		if rrs := f.zone.Records(n); len(rrs) != 0 {
+			t.Errorf("left at %s after mail off: %v", n, rrs)
+		}
+	}
+	for _, rr := range f.zone.Records(d) {
+		if rr.Type == "MX" || rr.Type == "TXT" {
+			t.Errorf("left at %s after mail off: %v", d, rr)
+		}
 	}
 	// Over 64 KiB is accepted with mail (up to 256 KiB), refused without.
 	pad := strings.Repeat("x", 70<<10)

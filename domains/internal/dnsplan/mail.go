@@ -66,21 +66,28 @@ var (
 // the CAA at MAIL_HOSTNAME is mail-cert's), TTL 60–86400, at most 200
 // records, no CNAME next to another type at one name, and well-formed
 // values.
-func ValidateMail(d string, recs []MailRecord) error { return validateMail(d, recs, false) }
+func ValidateMail(d string, recs []MailRecord) error { return validateMail(d, "", recs) }
 
 // ValidateMainMail is ValidateMail for the main domain, whose set may also
-// name MAIL_HOSTNAME — the MX target(s) of the set — for its HELO SPF and
-// its TLSA (`_25._tcp.<MAIL_HOSTNAME>`), also outside d.
-func ValidateMainMail(d string, recs []MailRecord) error { return validateMail(d, recs, true) }
+// name host — MAIL_HOSTNAME, given explicitly (dns-tool's mail_hostname),
+// never derived — for its HELO SPF and its TLSA (`_25._tcp.<host>`), also
+// outside d; every MX of the set targets it.
+func ValidateMainMail(d, host string, recs []MailRecord) error {
+	host = bare(host)
+	if !validName(host) || strings.HasPrefix(host, "_") {
+		return fmt.Errorf("mail_hostname %q is not a valid host name", host)
+	}
+	return validateMail(d, host, recs)
+}
 
-func validateMail(d string, recs []MailRecord, main bool) error {
+func validateMail(d, host string, recs []MailRecord) error {
 	d = bare(d)
 	if len(recs) > MaxMailRecords {
 		return fmt.Errorf("the mail set has more than %d records (%d)", MaxMailRecords, len(recs))
 	}
 	var hosts []string
-	if main {
-		hosts = mailHosts(d, recs)
+	if host != "" {
+		hosts = []string{host}
 	}
 	seen := map[string]bool{}
 	types := map[string]map[string]bool{} // name → types
@@ -102,6 +109,9 @@ func validateMail(d string, recs []MailRecord, main bool) error {
 		v, err := canonMail(t, r.Value)
 		if err != nil {
 			return fmt.Errorf("%s: %w", where, err)
+		}
+		if t == "MX" && host != "" && strings.Fields(v)[1] != fqdn(host) {
+			return fmt.Errorf("%s: the MX targets %s, not mail_hostname %s", where, strings.Fields(v)[1], host)
 		}
 		k := n + " " + t + " " + v
 		if seen[k] {
@@ -147,18 +157,36 @@ func validName(n string) bool {
 // under: n is d or a name under it.
 func under(n, d string) bool { return n == d || strings.HasSuffix(n, "."+d) }
 
-// mailHosts: the MX targets of the set at d (MAIL_HOSTNAME).
-func mailHosts(d string, recs []MailRecord) []string {
-	var out []string
-	for _, r := range recs {
-		if bare(r.Name) != d || !strings.EqualFold(r.Type, "MX") {
+// heloSPF is the HELO SPF the mail set writes at MAIL_HOSTNAME.
+const heloSPF = "v=spf1 a -all"
+
+// liveHosts: MAIL_HOSTNAME (the spec's, main domain only) plus a previous
+// one: a target of a live MX at d other than it whose TXT holds exactly
+// the set's HELO SPF — after a MAIL_HOSTNAME change the old host's HELO
+// SPF and TLSA are the set's to remove. Only names the provider read
+// (at or under d or MAIL_HOSTNAME) count.
+func liveHosts(s Spec, d string, live []liveRec) []string {
+	hosts := specHosts(s, d)
+	if len(hosts) == 0 {
+		return nil
+	}
+	for _, rr := range pick(live, d, "MX") {
+		f := strings.Fields(rr.Data)
+		if len(f) != 2 || f[1] == "." {
 			continue
 		}
-		if f := strings.Fields(r.Value); len(f) == 2 && f[1] != "." && !contains(out, bare(f[1])) {
-			out = append(out, bare(f[1]))
+		x := bare(f[1])
+		if contains(hosts, x) {
+			continue
+		}
+		for _, t := range pick(live, x, "TXT") {
+			if txtJoin(t.Data) == heloSPF {
+				hosts = append(hosts, x)
+				break
+			}
 		}
 	}
-	return out
+	return hosts
 }
 
 // hostName: n is one of MAIL_HOSTNAME's names (the host or its TLSA owner).
@@ -418,10 +446,10 @@ func nomailOwns(d string, p mailPair) bool {
 // specHosts: MAIL_HOSTNAME's names for the spec (main domain only: an
 // added domain's set never names them).
 func specHosts(s Spec, d string) []string {
-	if !s.Main {
+	if !s.Main || s.MailHost == "" {
 		return nil
 	}
-	return mailHosts(d, s.Mail)
+	return []string{bare(s.MailHost)}
 }
 
 // cannotWrite: the provider can't write type t (Input.NoWrite).
@@ -440,7 +468,7 @@ func qtypeOf(t string) uint16 { return dns.StringToType[t] }
 // every resolver, plus one per stale RRset the provider still holds.
 func mailItems(ctx context.Context, in Input, d string, fix Fix, live []liveRec) []Item {
 	s := in.Spec
-	hosts := specHosts(s, d)
+	hosts := liveHosts(s, d, live)
 	want := map[mailPair][]string{}
 	ttl := map[mailPair]int{}
 	for _, r := range s.Mail {
@@ -558,7 +586,7 @@ func applyMail(ctx context.Context, in Input, d, zone string, live []liveRec) (w
 	if err != nil {
 		return nil, nil, err
 	}
-	hosts := specHosts(s, d)
+	hosts := liveHosts(s, d, live)
 	for _, h := range hosts {
 		if !under(h, bare(zone)) {
 			return nil, nil, fmt.Errorf("MAIL_HOSTNAME %s isn't in the DNS zone %s of %s", h, bare(zone), d)

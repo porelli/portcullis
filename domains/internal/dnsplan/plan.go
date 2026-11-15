@@ -129,6 +129,9 @@ type Spec struct {
 	// on and replaces nomail (no nomail items, nomail never applied).
 	// Empty with the mail set applied removes the records it owns.
 	Mail []MailRecord
+	// MailHost: MAIL_HOSTNAME (main domain only, dns-tool's mail_hostname):
+	// its HELO SPF and TLSA are the mail set's (an empty set removes them).
+	MailHost string
 	// Owned: the CAA entries an enrolled domain wrote (removed with CAA
 	// off). Main: the main domain (removal by signature instead).
 	Owned []Ref
@@ -991,12 +994,15 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 		}
 	}
 	zone = dns.Fqdn(zone)
-	if contains(sets, SetMail) && len(s.Mail) > 0 {
-		check := ValidateMail
-		if s.Main {
-			check = ValidateMainMail
+	if contains(sets, SetMail) {
+		var err error
+		switch {
+		case s.Main:
+			err = ValidateMainMail(bare(d), s.MailHost, s.Mail)
+		case len(s.Mail) > 0:
+			err = ValidateMail(bare(d), s.Mail)
 		}
-		if err := check(bare(d), s.Mail); err != nil {
+		if err != nil {
 			return nil, nil, err
 		}
 	}

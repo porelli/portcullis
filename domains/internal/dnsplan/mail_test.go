@@ -67,6 +67,7 @@ func mailEnv(t *testing.T, split bool) (*env, *opCount) {
 	ops := &opCount{n: map[string]int{}}
 	e.in.Provider = &fakedns.Provider{Zone: e.zone, ZoneName: pz, TXTSplit255: split, Hook: ops.hook}
 	e.in.Spec.Main = true
+	e.in.Spec.MailHost = mh
 	e.in.Spec.Mail = mainMail()
 	return e, ops
 }
@@ -268,11 +269,18 @@ func TestValidateMailRefuses(t *testing.T) {
 		r.Value = strings.ReplaceAll(r.Value, mh, "mail.example.test")
 		m = append(m, r)
 	}
-	if err := ValidateMainMail(pd, m); err != nil {
+	if err := ValidateMainMail(pd, "mail.example.test", m); err != nil {
 		t.Fatalf("main set refused: %v", err)
 	}
 	if err := ValidateMail(pd, m); err == nil {
 		t.Fatal("an added domain's set named MAIL_HOSTNAME outside it")
+	}
+	// MAIL_HOSTNAME is explicit: never the MX target's guess.
+	if err := ValidateMainMail(pd, mh, m); err == nil || !strings.Contains(err.Error(), "not mail_hostname") {
+		t.Fatalf("MX at another host: %v", err)
+	}
+	if err := ValidateMainMail(pd, "", nil); err == nil {
+		t.Fatal("no mail_hostname accepted")
 	}
 }
 
@@ -366,4 +374,104 @@ func TestMailCNAMEsNotForeign(t *testing.T) {
 		}
 	}
 	find(t, p, SetMail, "mta-sts."+pd, "CNAME", StatusOK)
+}
+
+func hostRecords(e *env, h string) (spf, tlsa []string) {
+	for _, rr := range e.zone.Records(h) {
+		if rr.Type == "TXT" {
+			spf = append(spf, rr.Data)
+		}
+	}
+	for _, rr := range e.zone.Records("_25._tcp." + h) {
+		tlsa = append(tlsa, rr.Data)
+	}
+	return spf, tlsa
+}
+
+// TestMainMailEmptyRemovesHostRecords: the main domain's set turned off
+// (empty, mail_hostname given) removes MAIL_HOSTNAME's HELO SPF and TLSA
+// with the rest; another TXT at the host stays.
+func TestMainMailEmptyRemovesHostRecords(t *testing.T) {
+	e, _ := mailEnv(t, false)
+	e.zone.Set(mh, libdns.RR{Name: "mail.portcullis", Type: "TXT", Data: "keep=me", TTL: time.Hour})
+	ctx := context.Background()
+	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err != nil {
+		t.Fatal(err)
+	}
+	if spf, tlsa := hostRecords(e, mh); len(spf) != 2 || len(tlsa) != 1 {
+		t.Fatalf("after apply: %v %v", spf, tlsa)
+	}
+	e.in.Spec.Mail = []MailRecord{}
+	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err != nil {
+		t.Fatal(err)
+	}
+	if spf, tlsa := hostRecords(e, mh); len(spf) != 1 || spf[0] != "keep=me" || len(tlsa) != 0 {
+		t.Fatalf("after mail off: TXT %v TLSA %v", spf, tlsa)
+	}
+	if got := e.zone.Records(pd); len(got) != 0 {
+		t.Fatalf("left at %s: %v", pd, got)
+	}
+	// Without mail_hostname the main domain's set is refused.
+	e.in.Spec.MailHost = ""
+	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err == nil || !strings.Contains(err.Error(), "mail_hostname") {
+		t.Fatalf("no mail_hostname: %v", err)
+	}
+}
+
+// TestMainMailHostChangeRemovesOld: MAIL_HOSTNAME changed — the old host's
+// HELO SPF and TLSA go (found through the live MX and its exact HELO SPF),
+// the new host's are written; the old host's other TXT stays.
+func TestMainMailHostChangeRemovesOld(t *testing.T) {
+	e, _ := mailEnv(t, true)
+	e.zone.Set(mh, libdns.RR{Name: "mail.portcullis", Type: "TXT", Data: "keep=me", TTL: time.Hour})
+	ctx := context.Background()
+	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err != nil {
+		t.Fatal(err)
+	}
+	const nh = "mx." + pd
+	var moved []MailRecord
+	for _, r := range mainMail() {
+		r.Name = strings.ReplaceAll(r.Name, mh, nh)
+		r.Value = strings.ReplaceAll(r.Value, mh, nh)
+		moved = append(moved, r)
+	}
+	e.in.Spec.Mail, e.in.Spec.MailHost = moved, nh
+	pre := Build(ctx, e.in)
+	find(t, pre, SetMail, "_25._tcp."+mh, "TLSA", StatusWrong)
+	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err != nil {
+		t.Fatal(err)
+	}
+	if spf, tlsa := hostRecords(e, mh); len(spf) != 1 || spf[0] != "keep=me" || len(tlsa) != 0 {
+		t.Fatalf("old host: TXT %v TLSA %v", spf, tlsa)
+	}
+	if spf, tlsa := hostRecords(e, nh); len(spf) != 1 || spf[0] != heloSPF || len(tlsa) != 1 {
+		t.Fatalf("new host: TXT %v TLSA %v", spf, tlsa)
+	}
+	if got := rrs(e.zone, pd, "MX"); len(got) != 1 || !strings.HasPrefix(got[0], "10 "+nh+". ") {
+		t.Fatalf("MX %v", got)
+	}
+	p := Build(ctx, e.in)
+	assertMailOK(t, p)
+	for _, it := range p.Items {
+		if it.Name == mh || it.Name == "_25._tcp."+mh {
+			t.Fatalf("an item for the old host after the move: %+v", it)
+		}
+	}
+}
+
+// TestMainMailOwnMXHostUntouched: a user's own mail host (a live MX at d
+// whose TXT isn't the set's exact HELO SPF) is not taken for an old
+// MAIL_HOSTNAME: its SPF and TLSA stay when mail goes on.
+func TestMainMailOwnMXHostUntouched(t *testing.T) {
+	e, _ := mailEnv(t, false)
+	const own = "mx1." + pd
+	e.zone.Set(pd, libdns.RR{Name: "portcullis", Type: "MX", Data: "10 " + own + ".", TTL: time.Hour})
+	e.zone.Set(own, libdns.RR{Name: "mx1.portcullis", Type: "TXT", Data: "v=spf1 ip4:198.51.100.7 -all", TTL: time.Hour})
+	e.zone.Set("_25._tcp."+own, libdns.RR{Name: "_25._tcp.mx1.portcullis", Type: "TLSA", Data: "3 1 1 " + strings.Repeat("ab", 32), TTL: time.Hour})
+	if _, _, err := Apply(context.Background(), e.in, []string{SetMail}); err != nil {
+		t.Fatal(err)
+	}
+	if spf, tlsa := hostRecords(e, own); len(spf) != 1 || len(tlsa) != 1 {
+		t.Fatalf("own host touched: TXT %v TLSA %v", spf, tlsa)
+	}
 }
