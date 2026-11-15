@@ -129,7 +129,7 @@ func TestCredentialsRoutes(t *testing.T) {
 	e := newV1(t)
 	e.do("PUT", "/v1/state", vec(t, 12))
 	_ = e.v.Runner.Once(context.Background())
-	w := e.do("POST", "/v1/credentials", `{"username":"alice","label":"phone","expires_at":null}`)
+	w := e.do("POST", "/v1/credentials", `{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"phone","expires_at":null}`)
 	if w.Code != 201 || w.Header().Get("Cache-Control") != "no-store" {
 		t.Fatalf("create: %d %s", w.Code, w.Body)
 	}
@@ -148,12 +148,13 @@ func TestCredentialsRoutes(t *testing.T) {
 		t.Fatalf("list: %d %s", w.Code, w.Body)
 	}
 	for body, code := range map[string]int{
-		`{"username":"carol","label":"x","expires_at":null}`:                   404,
-		`{"username":"alice","label":"","expires_at":null}`:                    400,
-		`{"username":"alice","label":"x","expires_at":"2020-01-01T00:00:00Z"}`: 400,
-		`{"username":"alice","label":"x"}`:                                     400,
-		`{"username":"alice","label":"x","expires_at":null,"extra":1}`:         400,
-		`{"username":"alice","label":"x","label":"y","expires_at":null}`:       400,
+		`{"username":"carol","uuid":"x","label":"x","expires_at":null}`:                                                      404,
+		`{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"","expires_at":null}`:                    400,
+		`{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"x","expires_at":"2020-01-01T00:00:00Z"}`: 400,
+		`{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"x"}`:                                     400,
+		`{"username":"alice","label":"x","expires_at":null}`:                                                                 400,
+		`{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"x","expires_at":null,"extra":1}`:         400,
+		`{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"x","label":"y","expires_at":null}`:       400,
 	} {
 		if w := e.do("POST", "/v1/credentials", body); w.Code != code {
 			t.Errorf("%s: %d, want %d", body, w.Code, code)
@@ -170,10 +171,14 @@ func TestCredentialsRoutes(t *testing.T) {
 		t.Fatalf("delete again: %d", w.Code)
 	}
 	for i := 0; i < 5; i++ {
-		e.do("POST", "/v1/credentials", `{"username":"alice","label":"p","expires_at":null}`)
+		e.do("POST", "/v1/credentials", `{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"p","expires_at":null}`)
 	}
-	if w := e.do("POST", "/v1/credentials", `{"username":"alice","label":"p","expires_at":null}`); w.Code != 409 {
+	if w := e.do("POST", "/v1/credentials", `{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"p","expires_at":null}`); w.Code != 409 {
 		t.Fatalf("sixth: %d", w.Code)
+	}
+	// A revoke of an unknown id is a success (the Hub retries).
+	if w := e.do("DELETE", "/v1/credentials/no-such-id?user=alice", ""); w.Code != 204 {
+		t.Fatalf("unknown id: %d", w.Code)
 	}
 	e.f.Fail("x:AppPassword", 1)
 	if w := e.do("GET", "/v1/credentials?user=alice", ""); w.Code != 503 || !strings.Contains(w.Body.String(), "mail server unreachable") {
@@ -260,5 +265,55 @@ func TestChecksRoute(t *testing.T) {
 	}
 	if w := e.do("GET", "/v1/checks?refresh=1", ""); w.Code != 200 {
 		t.Fatalf("refresh %d", w.Code)
+	}
+}
+
+// Security review: the request names the person by uuid; another uuid or
+// a parked account under that username is refused (409 account_mismatch).
+func TestCreateCredentialAccountMismatch(t *testing.T) {
+	e := newV1(t)
+	e.do("PUT", "/v1/state", vec(t, 12))
+	_ = e.v.Runner.Once(context.Background())
+	kind := func(w *httptest.ResponseRecorder) string {
+		var b map[string]string
+		json.Unmarshal(w.Body.Bytes(), &b)
+		return b["error_kind"]
+	}
+	w := e.do("POST", "/v1/credentials", `{"username":"alice","uuid":"0b9d8c7a-6e5f-4a3b-9c2d-1e0f9a8b7c6d","label":"x","expires_at":null}`)
+	if w.Code != 409 || kind(w) != "account_mismatch" || !strings.Contains(w.Body.String(), "the account alice belongs to another person") {
+		t.Fatalf("other uuid: %d %s", w.Code, w.Body)
+	}
+	// The live account named alice carries another uuid (a re-created
+	// LLDAP name the reconciler hasn't caught up with).
+	for _, a := range e.f.Objects("Account", "") {
+		if a["name"] == "alice" {
+			e.f.Put("Account", "", map[string]any{"id": a["id"], "@type": "User", "name": "alice", "domainId": a["domainId"], "description": "portcullis:aaaaaaaa-0000-4000-8000-000000000000"})
+		}
+	}
+	w = e.do("POST", "/v1/credentials", `{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"x","expires_at":null}`)
+	if w.Code != 409 || kind(w) != "account_mismatch" {
+		t.Fatalf("live uuid differs: %d %s", w.Code, w.Body)
+	}
+	if n := len(e.f.Objects("AppPassword", "")); n != 0 {
+		t.Fatalf("%d passwords made", n)
+	}
+	// bob's account is parked (removed, the rejoin not reconciled yet).
+	e2 := newV1(t)
+	e2.do("PUT", "/v1/state", vec(t, 12))
+	_ = e2.v.Runner.Once(context.Background())
+	var park string
+	for _, d := range e2.f.Objects("Domain", "") {
+		if d["name"] == state.ParkingDomain {
+			park = d["id"].(string)
+		}
+	}
+	for _, a := range e2.f.Objects("Account", "") {
+		if a["name"] == "bob" {
+			e2.f.Put("Account", "", map[string]any{"@type": "User", "name": "former-0b9d8c7a-6e5f-4a3b-9c2d-1e0f9a8b7c6d", "domainId": park, "description": "portcullis:0b9d8c7a-6e5f-4a3b-9c2d-1e0f9a8b7c6d"})
+		}
+	}
+	w = e2.do("POST", "/v1/credentials", `{"username":"bob","uuid":"0b9d8c7a-6e5f-4a3b-9c2d-1e0f9a8b7c6d","label":"x","expires_at":null}`)
+	if w.Code != 409 || kind(w) != "account_mismatch" {
+		t.Fatalf("parked: %d %s", w.Code, w.Body)
 	}
 }

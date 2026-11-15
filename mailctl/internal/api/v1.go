@@ -202,8 +202,29 @@ func (v *V1) listCreds(w http.ResponseWriter, r *http.Request) {
 
 type createReq struct {
 	Username  string     `json:"username"`
+	UUID      string     `json:"uuid"`
 	Label     string     `json:"label"`
 	ExpiresAt *time.Time `json:"expires_at"`
+}
+
+// mismatch: the account under this username isn't the person the Hub
+// names (another uuid, or the username's account is parked).
+func mismatch(live *reconcile.Live, doc *state.Doc, user, uuid string) bool {
+	user = strings.ToLower(user)
+	a, ok := doc.Account(user)
+	if !ok || !strings.EqualFold(a.UUID, uuid) {
+		return true
+	}
+	primary := live.Domains[doc.PrimaryDomain]
+	for _, la := range live.Accounts {
+		if la.Name == user && la.DomainID == primary && !strings.EqualFold(la.UUID, uuid) {
+			return true
+		}
+		if strings.EqualFold(la.UUID, uuid) && la.Parked(live) {
+			return true
+		}
+	}
+	return false
 }
 
 func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
@@ -213,18 +234,18 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 	}
 	var req createReq
 	if err := state.NoDuplicateKeys(b); err != nil {
-		writeErr(w, http.StatusBadRequest, "the body must be {username, label, expires_at}")
+		writeErr(w, http.StatusBadRequest, "the body must be {username, uuid, label, expires_at}")
 		return
 	}
 	d := json.NewDecoder(bytes.NewReader(b))
 	d.DisallowUnknownFields()
 	if err := d.Decode(&req); err != nil || d.More() {
-		writeErr(w, http.StatusBadRequest, "the body must be {username, label, expires_at}")
+		writeErr(w, http.StatusBadRequest, "the body must be {username, uuid, label, expires_at}")
 		return
 	}
 	var keys map[string]json.RawMessage
 	_ = json.Unmarshal(b, &keys)
-	for _, k := range []string{"username", "label", "expires_at"} {
+	for _, k := range []string{"username", "uuid", "label", "expires_at"} {
 		if _, ok := keys[k]; !ok {
 			writeErr(w, http.StatusBadRequest, "missing "+k)
 			return
@@ -240,6 +261,19 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
+	if p := v.Store.Get(); p.Doc != nil {
+		if _, known := p.Doc.Account(req.Username); known {
+			live, err := reconcile.Read(ctx, v.C)
+			if err != nil {
+				v.unreachable(w, err)
+				return
+			}
+			if mismatch(live, p.Doc, req.Username, req.UUID) {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": "the account " + strings.ToLower(req.Username) + " belongs to another person", "error_kind": "account_mismatch"})
+				return
+			}
+		}
+	}
 	id, doc, ok := v.account(w, ctx, req.Username)
 	if !ok {
 		return
