@@ -2,7 +2,12 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -10,6 +15,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/portcullis/wg/internal/status"
 	"github.com/portcullis/wg/internal/tunnel"
@@ -276,4 +283,161 @@ func inode(t *testing.T, p string) uint64 {
 		t.Fatal(err)
 	}
 	return fi.Sys().(*syscall.Stat_t).Ino
+}
+
+func TestLoadConfigLink(t *testing.T) {
+	base := map[string]string{
+		"WG_VPN_ADDR": "172.31.254.3", "WG_EDGE_ADDR": "172.31.254.67", "WG_TRAEFIK": "172.31.254.66:8443",
+		"WG_LINK": "on", "WG_LINK_CONTROL_ADDR": "172.31.254.83:3128", "WG_LINK_DATA_ADDR": "172.31.254.130:3129",
+	}
+	get := func(over map[string]string) func(string) string {
+		return func(k string) string {
+			if v, ok := over[k]; ok {
+				return v
+			}
+			return base[k]
+		}
+	}
+	c, err := loadConfig(get(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Link || c.LinkPort != 51821 || c.LinkKey != "/run/portcullis/wg/link.key" || c.LinkFile != "/link-doc/link.json" ||
+		c.LinkControl != netip.MustParseAddrPort("172.31.254.83:3128") || c.LinkData != netip.MustParseAddrPort("172.31.254.130:3129") ||
+		c.LinkTLSKey != defaultLinkTLSKey || c.LinkTLSCert != defaultLinkTLSCert || c.LinkCAFile != defaultLinkCA {
+		t.Fatalf("link defaults %+v", c)
+	}
+	if c, err := loadConfig(get(map[string]string{"WG_LINK": ""})); err != nil || c.Link {
+		t.Fatalf("link off by default: %+v %v", c, err)
+	}
+	for name, over := range map[string]map[string]string{
+		"link bogus":            {"WG_LINK": "yes"},
+		"port":                  {"WG_LINK_PORT": "0"},
+		"port = people port":    {"WG_PEOPLE": "on", "WG_DOMAIN": "example.org", "WG_LINK_PORT": "51820"},
+		"no control addr":       {"WG_LINK_CONTROL_ADDR": ""},
+		"no data addr":          {"WG_LINK_DATA_ADDR": ""},
+		"control hostname":      {"WG_LINK_CONTROL_ADDR": "wg:3128"},
+		"control loopback":      {"WG_LINK_CONTROL_ADDR": "127.0.0.1:3128"},
+		"control any":           {"WG_LINK_CONTROL_ADDR": "0.0.0.0:3128"},
+		"data v6":               {"WG_LINK_DATA_ADDR": "[fd00::1]:3129"},
+		"control = data":        {"WG_LINK_DATA_ADDR": "172.31.254.83:3129"},
+		"control on vpn net":    {"WG_LINK_CONTROL_ADDR": "172.31.254.3:3128"},
+		"data on edge net":      {"WG_LINK_DATA_ADDR": "172.31.254.67:3129"},
+		"pod mode (Kubernetes)": {"WG_ADDR_MODE": "pod", "WG_EDGE_ADDR": "172.31.254.3", "WG_METRICS": "off"},
+	} {
+		if _, err := loadConfig(get(over)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestGenkeyTLSAndLinkCSR(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "link-tls.key")
+	if err := os.WriteFile(p, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ino := inode(t, p)
+	code, out, errOut := runCLI(t, "", "genkey-tls", p)
+	if code != 0 || out != "" || errOut != "" {
+		t.Fatalf("genkey-tls: %d %q %q", code, out, errOut)
+	}
+	if inode(t, p) != ino {
+		t.Fatal("genkey-tls replaced the file")
+	}
+	if fi, _ := os.Stat(p); fi.Mode().Perm() != 0o640 {
+		t.Fatalf("mode %v", fi.Mode().Perm())
+	}
+	if code, _, _ := runCLI(t, "", "genkey-tls"); code != 2 {
+		t.Fatal("genkey-tls without a path")
+	}
+	var o, e bytes.Buffer
+	code = cli([]string{"link-csr"}, strings.NewReader(""), &o, &e, func(k string) string {
+		if k == "WG_LINK_TLS_KEY" {
+			return p
+		}
+		return ""
+	})
+	if code != 0 {
+		t.Fatalf("link-csr: %d %s", code, e.String())
+	}
+	key, _ := os.ReadFile(p)
+	if strings.Contains(o.String(), "PRIVATE KEY") || bytes.Contains(o.Bytes(), bytes.TrimSpace(key)) {
+		t.Fatal("link-csr printed the key")
+	}
+	blk, _ := pem.Decode(o.Bytes())
+	if blk == nil || blk.Type != "CERTIFICATE REQUEST" {
+		t.Fatalf("no CSR: %q", o.String())
+	}
+	csr, err := x509.ParseCertificateRequest(blk.Bytes)
+	if err != nil || csr.CheckSignature() != nil || csr.Subject.CommonName != "link.control" || len(csr.DNSNames)+len(csr.IPAddresses) != 0 {
+		t.Fatalf("csr %+v %v", csr, err)
+	}
+	if pk, ok := csr.PublicKey.(*ecdsa.PublicKey); !ok || pk.Curve != elliptic.P256() {
+		t.Fatal("not a P-256 key")
+	}
+	// A WireGuard key (or nothing) is refused.
+	os.WriteFile(p, []byte("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=\n"), 0o640)
+	if code := cli([]string{"link-csr"}, strings.NewReader(""), &o, &e, func(k string) string {
+		if k == "WG_LINK_TLS_KEY" {
+			return p
+		}
+		return ""
+	}); code != 1 {
+		t.Fatalf("link-csr of a non-TLS key: %d", code)
+	}
+}
+
+// TestLinkRoleStatus: the status block follows the key and the document;
+// absent while the role is off.
+func TestLinkRoleStatus(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "link.key")
+	os.WriteFile(keyPath, nil, 0o640)
+	docPath := filepath.Join(dir, "link.json")
+	cfg := &config{Link: true, LinkKey: keyPath, LinkFile: docPath, LinkPort: udpPort(t),
+		LinkControl: netip.MustParseAddrPort("127.0.0.1:0"), LinkData: netip.MustParseAddrPort("127.0.0.1:0")}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if r := startLink(ctx, cfg, prometheus.NewRegistry()); r.status().OK || !strings.Contains(r.status().Error, "link init") {
+		t.Fatalf("no key: %+v", r.status())
+	}
+	if r := startLink(ctx, &config{}, prometheus.NewRegistry()); r != nil {
+		t.Fatal("role started while off")
+	}
+	k, _ := tunnel.GenerateKey()
+	os.WriteFile(keyPath, []byte(tunnel.KeyString(k)+"\n"), 0o640)
+	r := startLink(ctx, cfg, prometheus.NewRegistry())
+	wait := func(cond func(*status.Link) bool) *status.Link {
+		for i := 0; i < 100; i++ {
+			if st := r.status(); cond(st) {
+				return st
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatalf("status never matched: %+v", r.status())
+		return nil
+	}
+	wait(func(s *status.Link) bool { return !s.OK && strings.Contains(s.Error, "missing") })
+	peer, _ := tunnel.GenerateKey()
+	doc := `{"version":1,"written_at":"2026-11-15T10:00:00Z","subnet":"10.214.0.0/24","peers":[{"id":"w1","public_key":"` +
+		tunnel.KeyString(tunnel.PublicKeyOf(peer)) + `","ip":"10.214.0.10","state":"enrolling"}],"relays":[]}`
+	os.WriteFile(docPath, []byte(doc), 0o640)
+	st := wait(func(s *status.Link) bool { return s.OK && len(s.Peers) == 1 })
+	if st.Peers[0].ID != "w1" || st.Peers[0].IP != "10.214.0.10" || st.Peers[0].Handshake != nil {
+		t.Fatalf("peers %+v", st.Peers)
+	}
+	os.WriteFile(docPath, []byte(`{"version":1}`), 0o640)
+	wait(func(s *status.Link) bool { return !s.OK && len(s.Peers) == 0 })
+
+	// status.json: "link" only when the role is on.
+	p := filepath.Join(dir, "status.json")
+	status.Write(p, status.Doc{Mode: "apps"}, time.Now())
+	if b, _ := os.ReadFile(p); bytes.Contains(b, []byte(`"link"`)) {
+		t.Fatalf("link key while off: %s", b)
+	}
+	status.Write(p, status.Doc{Mode: "apps", Link: &status.Link{}}, time.Now())
+	if b, _ := os.ReadFile(p); !bytes.Contains(b, []byte(`"link":{"ok":false,"error":"","peers":[]}`)) {
+		t.Fatalf("link block: %s", b)
+	}
 }
