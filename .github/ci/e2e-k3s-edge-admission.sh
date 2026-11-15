@@ -161,6 +161,21 @@ ir '.spec.routes[0].middlewares += [{name: "x@kubernetescrd"}]' | refused "a pro
 ir '.spec.tls.secretName = "secrets-certs"' | refused "a TLS secretName" "${C[@]}"
 ir '.spec.tls.options = {name: "default"}' | refused "tls.options outside the tiers" "${C[@]}"
 ir '.spec.tls.certResolver = "other"' | refused "another cert resolver" "${C[@]}"
+# Multi-layer routing, an ingress class, the rule syntax, TLS domains (final review I3, M8).
+CORE_IR="$(K -n "$EDGE" get ingressroute -l portcullis.io/owner=core -o jsonpath='{.items[0].metadata.name}')"
+[ -n "$CORE_IR" ] || fail "no core IngressRoute in $EDGE to name as a parent"
+ir ".spec.parentRefs = [{name: \"$CORE_IR\"}]" | refused "a parentRef to the core IngressRoute $CORE_IR (its routers would become the core router's children)" "${C[@]}"
+ir ".spec.parentRefs = [{name: \"$CORE_IR\", namespace: \"$EDGE\"}]" | refused "a parentRef to $CORE_IR with its namespace" "${C[@]}"
+ir '.spec.parentRefs = [{name: "e2e-app"}]' | refused "a parentRef to its own IngressRoute" "${C[@]}"
+ir '.spec.ingressClassName = "traefik"' | refused "an ingressClassName" "${C[@]}"
+ir '.spec.routes[0].syntax = "v2"' | refused "route syntax v2" "${C[@]}"
+ir '.spec.routes[0].syntax = "v3"' | admitted "route syntax v3" "${C[@]}"
+ir '.spec.tls.domains = [{main: "e2e.example.org"}]' | refused "tls.domains (its own host)" "${C[@]}"
+ir ".spec.tls.domains = [{main: \"$APEX\", sans: [\"*.$APEX\"]}]" | refused "tls.domains: the apex and a wildcard" "${C[@]}"
+# A Middleware is named after its own instance (final review M7).
+mw '{"stripPrefix": {"prefixes": ["/x"]}}' | jq '.metadata.name = "other--strip"' | refused "a Middleware named after another instance" "${C[@]}"
+mw '{"stripPrefix": {"prefixes": ["/x"]}}' | jq '.metadata.name = "e2e--a--b"' | refused "a Middleware name with a second --" "${C[@]}"
+mw '{"stripPrefix": {"prefixes": ["/x"]}}' | jq '.metadata.name = "strip"' | refused "a Middleware without the instance prefix" "${C[@]}"
 
 # ── Middleware shapes ──
 mw '{"forwardAuth": {"address": "http://group-gate.portcullis.svc.cluster.local:8080"}}' | refused "a forwardAuth Middleware" "${C[@]}"

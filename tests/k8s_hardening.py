@@ -162,6 +162,24 @@ def main():
             # A YAML '' escape leaked into CEL (apps'' …) or an odd count.
             if e.replace("\\'", "").count("'") % 2 or re.search(r"[A-Za-z]''[A-Za-z ]", e):
                 F.add(f"policy {d['metadata']['name']}: broken quotes in CEL: {e[:120]}")
+    # The root shape is written once per policy (rootPod, rootShaped) and
+    # used by both oneShot and the root init containers: the pods and the
+    # workloads policies must agree on it, and on oneShot's tail.
+    pols = {d["metadata"]["name"]: d for d in yaml.safe_load_all((K.ROOT / "kube" / "admission" / "policies.yaml").read_text())
+            if d and d.get("kind") == "ValidatingAdmissionPolicy"}
+    def var(pol, name):
+        return next((" ".join(v["expression"].split()) for v in pols.get(pol, {}).get("spec", {}).get("variables", []) if v["name"] == name), None)
+    for name in ("rootPod", "rootShaped"):
+        a, b = var("portcullis-apps-pods", name), var("portcullis-apps-workloads", name)
+        if not a or a != b:
+            F.add(f"policies: the {name} variable differs between portcullis-apps-pods and portcullis-apps-workloads (or is missing)")
+    tails = [(var(p, "oneShot") or "").partition("&& variables.rootPod")[2] for p in ("portcullis-apps-pods", "portcullis-apps-workloads")]
+    if not tails[0] or tails[0] != tails[1] or "variables.rootShaped" not in tails[0]:
+        F.add("policies: oneShot's root-shape tail (rootPod, own volumes, rootShaped) differs between the pods and workloads policies")
+    for p in ("portcullis-apps-pods", "portcullis-apps-workloads"):
+        if not any("c.name in variables.initNames && variables.rootPod && c.name in variables.rootShaped" in " ".join(v["expression"].split())
+                   for v in pols.get(p, {}).get("spec", {}).get("validations", [])):
+            F.add(f"policy {p}: the root init-container rule doesn't use rootPod and rootShaped")
     for r in hub_roles:
         if r["metadata"]["namespace"] == K.EDGE_NS and any("services" in x["resources"] for x in r["rules"]) and not (judges_svc and pins):
             F.add(f"the Hub's Role in {K.EDGE_NS} grants services but portcullis-edge-routes doesn't judge and pin Services (CREATE / UPDATE / DELETE, externalName = <name>.<apps ns>.svc.cluster.local)")

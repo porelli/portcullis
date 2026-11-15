@@ -8,6 +8,11 @@
 #             (no hostPath at all, groups ≠ 0, own volumes only)
 #   names     hostname / subdomain <instance>--pods / its search domain
 #   hostAliases, Service names, NetworkPolicy endPort
+#   hostPath  every container non-root (runAsNonRoot / a uid > 0), no
+#             escalation, an explicit group > 0, no fsGroup / supplemental 0
+#   claims    the portcullis-apps class, no volumeName / dataSource, own name, 3-digit mode
+#   old objects  UPDATE / DELETE of NetworkPolicies (default-deny included),
+#             Services and Secrets only when the old object is owner=hub
 #   template files: only the instance's own <instance>--tpl-*
 # Then a real one-shot Job, whose pod the job controller creates, runs as uid 0.
 #   bash .github/ci/e2e-k3s-apps-admission.sh [<context>]   (default ci)
@@ -19,7 +24,14 @@ K() { kubectl --context "$CTX" "$@"; }
 KH() { K -n "$APPS" --as="$HUB" --as-group=system:masters "$@"; }
 fail() { echo "FAIL: $*"; exit 1; }
 CNT="$(mktemp -d)"
-trap 'rm -rf "$CNT"; K -n "$APPS" delete job e2e-apps-oneshot --ignore-not-found --wait=false >/dev/null 2>&1 || true' EXIT
+cleanup() {
+  rm -rf "$CNT"
+  K -n "$APPS" delete job e2e-apps-oneshot --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  K -n "$APPS" delete networkpolicy e2e-old-np e2e-old-np-cli --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  K -n "$APPS" delete service a--e2e-old a--e2e-old-cli --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  K -n "$APPS" delete secret a--e2e-old a--e2e-old-cli --ignore-not-found --wait=false >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 # want <admit|refuse> <what> — stdin is the object (cases run at pipeline ends: count in files).
 want() {
   local out
@@ -63,7 +75,10 @@ np() { jq -n --argjson e "$1" '{apiVersion: "networking.k8s.io/v1", kind: "Netwo
   spec: {podSelector: {matchLabels: {"portcullis.io/instance": "a", "portcullis.io/egress": "true"}}, policyTypes: ["Egress"], egress: [$e]}}'; }
 IA='{"portcullis.io/instance":"a"}'
 DNS='{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"kube-system"}},"podSelector":{"matchLabels":{"k8s-app":"kube-dns"}}}'
-HP='{"name":"h","hostPath":{"path":"/srv/share"}}'
+# A host path under the params' first shared-folder root (a rebind may move them).
+ROOT1="$(printf '%s' "$PARAMS" | jq -r '.data.bindRoots | split(" ") | map(select(. != ""))[0] // empty')"
+[ -n "$ROOT1" ] || fail "no bindRoots in $PREF"
+HP="$(jq -nc --arg p "$ROOT1/share" '{name: "h", hostPath: {path: $p}}')"
 
 # ── root ──
 pod "{\"spec\":{\"containers\":[$(rc)]}}" | want refuse "a root app container"
@@ -122,6 +137,104 @@ np "{\"to\":[$DNS],\"ports\":[{\"port\":53,\"endPort\":65535,\"protocol\":\"TCP\
 np "{\"to\":[$DNS],\"ports\":[]}" | want refuse "kube-dns without ports"
 np "{\"to\":[{\"ipBlock\":{\"cidr\":\"$NODE/32\"}}],\"ports\":[{\"port\":443,\"endPort\":6443,\"protocol\":\"TCP\"}]}" | want refuse "a node 443-6443 (endPort)"
 np '{"to":[{"podSelector":{"matchLabels":{"portcullis.io/instance":"a"}}}],"ports":[{"port":80,"endPort":90}]}' | want refuse "its own pods 80-90 (endPort)"
+
+# ── a pod with a hostPath volume: provably non-root, no escalation, never group 0 (final review I1) ──
+NR='{"allowPrivilegeEscalation":false,"runAsUser":1000,"runAsGroup":1000}'
+# hpod <container securityContext> [<pod securityContext>] [<init container securityContext>] — the hostPath mounted by the app container.
+hpod() {
+  jq -n --arg a "$A" --argjson hp "$HP" --argjson s "$1" --argjson ps "${2:-"{}"}" --argjson is "${3:-null}" '{apiVersion: "v1", kind: "Pod",
+    metadata: {name: "p", labels: {"portcullis.io/instance": "a", "portcullis.io/service": "web"}},
+    spec: ({automountServiceAccountToken: false, volumes: [$hp], securityContext: $ps,
+      containers: [{name: "c", image: $a, command: ["true"], securityContext: $s, volumeMounts: [{name: "h", mountPath: "/h"}]}]}
+      + (if $is == null then {} else {initContainers: [{name: "i", image: $a, command: ["true"], securityContext: $is}]} end))}'
+}
+hpod "$NR" | want admit "a hostPath pod: uid 1000, gid 1000, no escalation"
+hpod '{"allowPrivilegeEscalation":false,"runAsNonRoot":true,"runAsGroup":1000}' | want admit "a hostPath pod: runAsNonRoot, gid 1000, no escalation"
+hpod '{"allowPrivilegeEscalation":false}' '{"runAsUser":1000,"runAsGroup":1000}' | want admit "a hostPath pod: uid / gid from the pod, no escalation"
+hpod '{"allowPrivilegeEscalation":false,"runAsGroup":1000}' | want refuse "a hostPath pod without a uid (the image's USER, maybe root)"
+hpod '{"runAsUser":1000,"runAsGroup":1000}' | want refuse "a hostPath pod: uid 1000 but escalation not off (a setuid binary)"
+hpod '{"allowPrivilegeEscalation":true,"runAsUser":1000,"runAsGroup":1000}' | want refuse "a hostPath pod: uid 1000 with escalation on"
+hpod '{"allowPrivilegeEscalation":false,"runAsNonRoot":false,"runAsGroup":1000}' | want refuse "a hostPath pod: runAsNonRoot false, no uid"
+hpod "$NR" '{}' '{}' | want refuse "a hostPath pod whose init container has no securityContext"
+hpod "$NR" '{}' '{"allowPrivilegeEscalation":false,"runAsGroup":1000}' | want refuse "a hostPath pod whose init container has no uid"
+hpod "$NR" '{}' "$NR" | want admit "a hostPath pod whose init container is non-root too"
+hpod '{"allowPrivilegeEscalation":false,"runAsUser":1000}' | want refuse "a hostPath pod without a runAsGroup"
+hpod '{"allowPrivilegeEscalation":false,"runAsUser":1000,"runAsGroup":0}' | want refuse "a hostPath pod: container runAsGroup 0"
+hpod "$NR" '{"runAsGroup":0}' | want refuse "a hostPath pod: pod runAsGroup 0 (the containers' own groups set)"
+hpod '{"allowPrivilegeEscalation":false,"runAsUser":1000}' '{"runAsGroup":0}' | want refuse "a hostPath pod: the effective group 0 from the pod"
+hpod "$NR" '{"fsGroup":0}' | want refuse "a hostPath pod: fsGroup 0"
+hpod "$NR" '{"supplementalGroups":[1000,0]}' | want refuse "a hostPath pod: supplemental group 0"
+hpod "$NR" '{}' '{"allowPrivilegeEscalation":false,"runAsUser":1000}' | want refuse "a hostPath pod whose init container has no runAsGroup"
+dep() { jq -n --argjson p "$(hpod "$1" | jq -c .spec)" '{apiVersion: "apps/v1", kind: "Deployment",
+  metadata: {name: "d", labels: {"portcullis.io/instance": "a"}},
+  spec: {replicas: 1, selector: {matchLabels: {"portcullis.io/instance": "a", "portcullis.io/service": "web"}},
+    template: {metadata: {labels: {"portcullis.io/instance": "a", "portcullis.io/service": "web"}}, spec: $p}}}'; }
+dep "$NR" | want admit "a hostPath Deployment: uid / gid 1000, no escalation"
+dep '{"allowPrivilegeEscalation":false,"runAsGroup":1000}' | want refuse "a hostPath Deployment without a uid"
+dep '{"allowPrivilegeEscalation":false,"runAsUser":1000}' | want refuse "a hostPath Deployment without a runAsGroup"
+# ── PersistentVolumeClaims (final review M6) ──
+pvc() { jq -n --argjson x "${1:-"{}"}" '{apiVersion: "v1", kind: "PersistentVolumeClaim",
+  metadata: {name: "a--data", labels: {"portcullis.io/instance": "a"}, annotations: {"portcullis.io/uid": "1000", "portcullis.io/gid": "1000", "portcullis.io/mode": "0750"}},
+  spec: {accessModes: ["ReadWriteOnce"], storageClassName: "portcullis-apps", resources: {requests: {storage: "1Gi"}}}} * $x'; }
+pvc | want admit "a claim: portcullis-apps, <instance>--…, mode 0750"
+pvc '{"metadata":{"annotations":{"portcullis.io/mode":"750"}}}' | want admit "a claim: mode 750"
+pvc '{"spec":{"storageClassName":"portcullis-core"}}' | want refuse "a claim on portcullis-core (Retain)"
+pvc '{"spec":{"storageClassName":"local-path"}}' | want refuse "a claim on k3s local-path"
+pvc '{"spec":{"volumeName":"pvc-x"}}' | want refuse "a claim pre-bound to a volume"
+pvc '{"spec":{"dataSource":{"kind":"PersistentVolumeClaim","name":"b--data"}}}' | want refuse "a claim cloned from another instance's"
+pvc '{"spec":{"dataSourceRef":{"kind":"PersistentVolumeClaim","name":"b--data"}}}' | want refuse "a claim with a dataSourceRef"
+pvc '{"metadata":{"name":"b--data"}}' | want refuse "a claim named after another instance"
+pvc '{"metadata":{"annotations":{"portcullis.io/mode":"2750"}}}' | want refuse "a claim with mode 2750 (setgid)"
+pvc '{"metadata":{"annotations":{"portcullis.io/mode":"4755"}}}' | want refuse "a claim with mode 4755 (setuid)"
+pvc | jq 'del(.metadata.annotations["portcullis.io/mode"])' | want refuse "a claim without a mode"
+# ── UPDATE / DELETE judged by the old object (final review I2) ──
+# wantk <admit|refuse> <what> <kubectl args…> — as the Hub in the apps namespace; stdin as given.
+wantk() {
+  local w="$1" what="$2" out; shift 2
+  if out="$(KH "$@" 2>&1)"; then
+    [ "$w" = admit ] || fail "admitted, want refused: $what"
+  else
+    [ "$w" = refuse ] || fail "refused, want admitted: $what: $(printf '%s' "$out" | sed -n 1p | cut -c1-400)"
+    printf '%s' "$out" | grep -q "with binding 'portcullis-apps-guard-" \
+      || fail "refused, but not by an apps binding: $what: $(printf '%s' "$out" | sed -n 1p | cut -c1-400)"
+  fi
+  echo . >> "$CNT/$w"
+}
+OWN='{"portcullis.io/owner":"hub","portcullis.io/instance":"a"}'
+# The chart's default-deny (owner=core): the Hub can neither delete nor rewrite it.
+K -n "$APPS" get networkpolicy default-deny >/dev/null || fail "no default-deny NetworkPolicy in $APPS"
+wantk refuse "the Hub deletes the apps default-deny" delete --dry-run=server networkpolicy default-deny
+K -n "$APPS" get networkpolicy default-deny -o json \
+  | jq '.metadata.labels["portcullis.io/owner"] = "hub" | .metadata.labels["portcullis.io/instance"] = "a" | .spec.podSelector = {matchLabels: {"portcullis.io/instance": "a"}}' \
+  | wantk refuse "the Hub rewrites default-deny into an instance-shaped owner=hub policy" replace --dry-run=server -f -
+wantk refuse "the Hub patches default-deny's selector" patch --dry-run=server networkpolicy default-deny --type=merge \
+  -p '{"spec":{"podSelector":{"matchLabels":{"portcullis.io/instance":"a"}}}}'
+# The Hub's own objects (created as the Hub, owner=hub): changed and deleted, but never moved to another instance or owner.
+np "{\"to\":[$DNS],\"ports\":[{\"port\":53,\"protocol\":\"UDP\"}]}" | jq --argjson l "$OWN" '.metadata.name = "e2e-old-np" | .metadata.labels = $l' \
+  | KH create -f - >/dev/null || fail "the Hub can't create its own NetworkPolicy"
+K -n "$APPS" get networkpolicy e2e-old-np -o json | jq '.metadata.labels.x = "y"' | wantk admit "the Hub updates its own NetworkPolicy" replace --dry-run=server -f -
+K -n "$APPS" get networkpolicy e2e-old-np -o json | jq '.spec.podSelector.matchLabels["portcullis.io/instance"] = "b"' \
+  | wantk refuse "the Hub moves its NetworkPolicy to another instance's pods" replace --dry-run=server -f -
+K -n "$APPS" get networkpolicy e2e-old-np -o json | jq '.metadata.labels["portcullis.io/owner"] = "core"' \
+  | wantk refuse "the Hub relabels its NetworkPolicy owner=core" replace --dry-run=server -f -
+wantk admit "the Hub deletes its own NetworkPolicy" delete --dry-run=server networkpolicy e2e-old-np
+# Objects not owner=hub (made here by the CLI identity): the Hub can't change or delete them.
+np "{\"to\":[$DNS],\"ports\":[{\"port\":53,\"protocol\":\"UDP\"}]}" | jq '.metadata.name = "e2e-old-np-cli"' | K -n "$APPS" create -f - >/dev/null
+wantk refuse "the Hub deletes a NetworkPolicy without owner=hub" delete --dry-run=server networkpolicy e2e-old-np-cli
+svc a--e2e-old "$OWN" | KH create -f - >/dev/null || fail "the Hub can't create its own Service"
+K -n "$APPS" get service a--e2e-old -o json | jq '.metadata.labels.x = "y"' | wantk admit "the Hub updates its own Service" replace --dry-run=server -f -
+K -n "$APPS" get service a--e2e-old -o json | jq '.metadata.labels["portcullis.io/owner"] = "core"' | wantk refuse "the Hub relabels its Service owner=core" replace --dry-run=server -f -
+wantk admit "the Hub deletes its own Service" delete --dry-run=server service a--e2e-old
+svc a--e2e-old-cli "$IA" | K -n "$APPS" create -f - >/dev/null
+wantk refuse "the Hub deletes a Service without owner=hub" delete --dry-run=server service a--e2e-old-cli
+sec() { jq -n --arg n "$1" --argjson l "$2" '{apiVersion: "v1", kind: "Secret", type: "Opaque", metadata: {name: $n, labels: $l}, data: {k: "dg=="}}'; }
+sec a--e2e-old "$OWN" | KH create -f - >/dev/null || fail "the Hub can't create its own Secret"
+K -n "$APPS" get secret a--e2e-old -o json | jq '.data.k = "dw=="' | wantk admit "the Hub updates its own Secret" replace --dry-run=server -f -
+K -n "$APPS" get secret a--e2e-old -o json | jq '.metadata.labels["portcullis.io/instance"] = "b"' | wantk refuse "the Hub moves its Secret to another instance" replace --dry-run=server -f -
+wantk admit "the Hub deletes its own Secret" delete --dry-run=server secret a--e2e-old
+sec a--e2e-old-cli "$IA" | K -n "$APPS" create -f - >/dev/null
+wantk refuse "the Hub deletes a Secret without owner=hub" delete --dry-run=server secret a--e2e-old-cli
+wantk refuse "the Hub empties a Secret without owner=hub" patch --dry-run=server secret a--e2e-old-cli --type=merge -p '{"data":{"k":"eA=="}}'
 
 # ── a real one-shot Job: the job controller's pod is admitted and runs as root ──
 jq -n --arg a "$A" --argjson s "$RS" '{apiVersion: "batch/v1", kind: "Job",
