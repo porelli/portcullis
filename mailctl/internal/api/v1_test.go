@@ -317,3 +317,47 @@ func TestCreateCredentialAccountMismatch(t *testing.T) {
 		t.Fatalf("parked: %d %s", w.Code, w.Body)
 	}
 }
+
+// Security review (TOCTOU): one document snapshot and one live read decide
+// the account; a document swapped in meanwhile can't redirect the password,
+// and no document at all is 503 (never a skipped check).
+func TestCreateCredentialSnapshot(t *testing.T) {
+	e := newV1(t)
+	body := `{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"x","expires_at":null}`
+	if w := e.do("POST", "/v1/credentials", body); w.Code != 503 || !strings.Contains(w.Body.String(), "no accepted mail document") {
+		t.Fatalf("no document: %d %s", w.Code, w.Body)
+	}
+	e.do("PUT", "/v1/state", vec(t, 12))
+	_ = e.v.Runner.Once(context.Background())
+	var alice, bob string
+	for _, a := range e.f.Objects("Account", "") {
+		switch a["name"] {
+		case "alice":
+			alice = a["id"].(string)
+		case "bob":
+			bob = a["id"].(string)
+		}
+	}
+	// Between the check and the create, the stored document gives alice
+	// bob's uuid (and bob alice's).
+	e.v.beforeCreate = func() {
+		e.v.Store.Update(func(p *state.Persistent) error {
+			for i := range p.Doc.Accounts {
+				switch p.Doc.Accounts[i].Username {
+				case "alice":
+					p.Doc.Accounts[i].UUID = "0b9d8c7a-6e5f-4a3b-9c2d-1e0f9a8b7c6d"
+				case "bob":
+					p.Doc.Accounts[i].UUID = "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b"
+				}
+			}
+			return nil
+		})
+	}
+	w := e.do("POST", "/v1/credentials", body)
+	if w.Code != 201 {
+		t.Fatalf("create: %d %s", w.Code, w.Body)
+	}
+	if len(e.f.Objects("AppPassword", alice)) != 1 || len(e.f.Objects("AppPassword", bob)) != 0 {
+		t.Fatalf("the password went to the wrong account: alice %d bob %d", len(e.f.Objects("AppPassword", alice)), len(e.f.Objects("AppPassword", bob)))
+	}
+}

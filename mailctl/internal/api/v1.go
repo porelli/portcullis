@@ -36,6 +36,9 @@ type V1 struct {
 	M *machines.Machines
 	// Checks are GET /v1/checks.
 	Checks *checks.Runner
+	// beforeCreate runs between the account checks and the password's
+	// creation (tests: a document swap there must change nothing).
+	beforeCreate func()
 
 	mu        sync.Mutex
 	bootAt    time.Time
@@ -261,21 +264,47 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	if p := v.Store.Get(); p.Doc != nil {
-		if _, known := p.Doc.Account(req.Username); known {
-			live, err := reconcile.Read(ctx, v.C)
-			if err != nil {
-				v.unreachable(w, err)
-				return
-			}
-			if mismatch(live, p.Doc, req.Username, req.UUID) {
-				writeJSON(w, http.StatusConflict, map[string]string{"error": "the account " + strings.ToLower(req.Username) + " belongs to another person", "error_kind": "account_mismatch"})
-				return
-			}
+	// One snapshot of the document and one live read decide everything
+	// (no time-of-check / time-of-use gap). No document yet: refused.
+	p := v.Store.Get()
+	doc := p.Doc
+	if doc == nil {
+		writeErr(w, http.StatusServiceUnavailable, "mailctl has no accepted mail document yet")
+		return
+	}
+	if _, known := doc.Account(req.Username); !known {
+		writeErr(w, http.StatusNotFound, "no such account")
+		return
+	}
+	live, err := reconcile.Read(ctx, v.C)
+	if err != nil {
+		v.unreachable(w, err)
+		return
+	}
+	refuse := func() {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "the account " + strings.ToLower(req.Username) + " belongs to another person", "error_kind": "account_mismatch"})
+	}
+	if mismatch(live, doc, req.Username, req.UUID) {
+		refuse()
+		return
+	}
+	id := reconcile.FindAccount(live, doc, req.Username)
+	if id == "" {
+		writeErr(w, http.StatusNotFound, "no such account")
+		return
+	}
+	if v.beforeCreate != nil {
+		v.beforeCreate()
+	}
+	// The resolved account is the person the Hub names.
+	resolved := false
+	for _, la := range live.Accounts {
+		if la.ID == id && strings.EqualFold(la.UUID, req.UUID) && !la.Parked(live) {
+			resolved = true
 		}
 	}
-	id, doc, ok := v.account(w, ctx, req.Username)
-	if !ok {
+	if !resolved {
+		refuse()
 		return
 	}
 	cr, err := creds.Create(ctx, v.C, id, req.Label, req.ExpiresAt, creds.AllowedIPs(v.LANOnly, reconcile.LocalNets(doc, v.Rewritten)), v.now())
