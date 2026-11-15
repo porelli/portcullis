@@ -93,6 +93,16 @@ func main() {
 			}
 			setHTTPDefaults(2 * time.Minute)
 			os.Exit(runDNSTool(os.Args[2:], toolEnv{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr, resolvers: resolversFromEnv()}))
+		case "mail-cert":
+			if err := startTestProvider(toolLogger()); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(exitFailure)
+			}
+			setHTTPDefaults(2 * time.Minute)
+			resolvers := resolversFromEnv()
+			// lego's propagation check asks the same resolvers.
+			_ = dns01.AddRecursiveNameservers(resolvers)(nil)
+			os.Exit(runMailCert(os.Args[2:], toolEnv{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr, resolvers: resolvers}))
 		case "traefik-account-uri":
 			os.Exit(runTraefikAccountURI(os.Args[2:], os.Stdout, os.Stderr))
 		case "report":
@@ -103,7 +113,7 @@ func main() {
 			}
 			os.Exit(runReport(os.Args[2:], "http://127.0.0.1"+env("DOMAINS_API_ADDR", ":8080"), secret, os.Stdout, os.Stderr))
 		default:
-			fmt.Fprintf(os.Stderr, "usage: domains [keygen|healthcheck|enrolled|dns|traefik-account-uri|report]\n")
+			fmt.Fprintf(os.Stderr, "usage: domains [keygen|healthcheck|enrolled|dns|mail-cert|traefik-account-uri|report]\n")
 			os.Exit(2)
 		}
 	}
@@ -281,6 +291,9 @@ func run() error {
 	// the same public resolvers as the records check.
 	_ = dns01.AddRecursiveNameservers(resolvers)(nil)
 
+	if h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("DOMAINS_MAIL_HOSTNAME")), ".")); h != "" && !validHostname(h) {
+		return fmt.Errorf("DOMAINS_MAIL_HOSTNAME=%q is not a valid hostname", h)
+	}
 	caaOn, err := envBool("DNS_CAA", true)
 	if err != nil {
 		return err
@@ -297,6 +310,7 @@ func run() error {
 		CAAIODEF:       strings.TrimSpace(os.Getenv("DNS_CAA_IODEF")),
 		MainAccountURI: strings.TrimSpace(os.Getenv("DOMAINS_MAIN_ACME_ACCOUNT_URI")),
 		MailFrom:       strings.TrimSpace(os.Getenv("ALERT_SMTP_FROM")),
+		MailHostname:   strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("DOMAINS_MAIL_HOSTNAME")), ".")),
 	}
 	if u := cfg.MainAccountURI; u != "" && !dnsplan.ValidAccountURI(u) {
 		return fmt.Errorf("DOMAINS_MAIN_ACME_ACCOUNT_URI=%q is not an ACME account URI (secrets/domains/main-domain.env)", u)

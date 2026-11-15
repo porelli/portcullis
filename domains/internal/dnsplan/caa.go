@@ -104,9 +104,9 @@ func signature(c libdns.CAA, issuer string) bool {
 // ownCAA are the entries Portcullis writes for s.
 func ownCAA(s Spec) []libdns.CAA {
 	v := CAAValue(s.Issuer, s.AccountURI)
-	out := []libdns.CAA{
-		{Name: "@", TTL: TTLCAA, Flags: 0, Tag: "issue", Value: v},
-		{Name: "@", TTL: TTLCAA, Flags: 0, Tag: "issuewild", Value: v},
+	out := []libdns.CAA{{Name: "@", TTL: TTLCAA, Flags: 0, Tag: "issue", Value: v}}
+	if !s.NoWild {
+		out = append(out, libdns.CAA{Name: "@", TTL: TTLCAA, Flags: 0, Tag: "issuewild", Value: v})
 	}
 	if s.IODEF != "" {
 		out = append(out, libdns.CAA{Name: "@", TTL: TTLCAA, Flags: 0, Tag: "iodef", Value: s.IODEF})

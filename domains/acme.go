@@ -11,6 +11,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/go-acme/lego/v4/certcrypto"
@@ -38,17 +39,65 @@ func (u *acmeUser) GetPrivateKey() crypto.PrivateKey        { return u.key }
 
 // legoConfig is the lego client configuration for user.
 func (s *Service) legoConfig(u *acmeUser) *lego.Config {
+	return legoConfigFor(u, s.cfg.CAServer, s.cfg.ACMEHTTPClient)
+}
+
+// legoConfigFor is the lego client configuration for user at the ACME
+// directory caServer (hc: lego's HTTP client, nil = its default).
+func legoConfigFor(u *acmeUser, caServer string, hc *http.Client) *lego.Config {
 	cfg := lego.NewConfig(u)
-	cfg.CADirURL = s.cfg.CAServer
+	cfg.CADirURL = caServer
 	cfg.Certificate.KeyType = certcrypto.EC256
 	cfg.UserAgent = "portcullis-domains"
-	if s.cfg.ACMEHTTPClient != nil {
+	if hc != nil {
 		// A copy: lego wraps the client's transport in place, so a shared
 		// client would be raced (and re-wrapped) by concurrent orders.
-		hc := *s.cfg.ACMEHTTPClient
-		cfg.HTTPClient = &hc
+		c := *hc
+		cfg.HTTPClient = &c
 	}
 	return cfg
+}
+
+// registerAccount registers a new ACME account (fresh EC P-256 key) for
+// email at caServer.
+func registerAccount(email, caServer string, hc *http.Client) (*acmeUser, *Account, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	u := &acmeUser{email: email, key: key}
+	client, err := lego.NewClient(legoConfigFor(u, caServer, hc))
+	if err != nil {
+		return nil, nil, fmt.Errorf("ACME directory %s: %w", caServer, err)
+	}
+	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
+	if err != nil {
+		return nil, nil, fmt.Errorf("ACME account registration: %w", err)
+	}
+	u.reg = reg
+	regJSON, err := json.Marshal(reg)
+	if err != nil {
+		return nil, nil, err
+	}
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, nil, err
+	}
+	return u, &Account{Email: email, CAServer: caServer, Registration: regJSON,
+		KeyPEM: string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}))}, nil
+}
+
+// accountUser is the lego user of a stored account.
+func accountUser(a *Account) (*acmeUser, error) {
+	key, err := parseECKey(a.KeyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("stored ACME account key: %w", err)
+	}
+	var reg registration.Resource
+	if err := json.Unmarshal(a.Registration, &reg); err != nil {
+		return nil, fmt.Errorf("stored ACME registration: %w", err)
+	}
+	return &acmeUser{email: a.Email, reg: &reg, key: key}, nil
 }
 
 // accountCurrentLocked: the stored account matches the configured CA and
@@ -81,41 +130,14 @@ func (s *Service) account() (*acmeUser, error) {
 	acct := s.doc.Account
 	s.mu.Unlock()
 	if acct != nil && acct.CAServer == s.cfg.CAServer && acct.Email == s.cfg.Email && len(acct.Registration) > 0 {
-		key, err := parseECKey(acct.KeyPEM)
-		if err != nil {
-			return nil, fmt.Errorf("stored ACME account key: %w", err)
-		}
-		var reg registration.Resource
-		if err := json.Unmarshal(acct.Registration, &reg); err != nil {
-			return nil, fmt.Errorf("stored ACME registration: %w", err)
-		}
-		return &acmeUser{email: acct.Email, reg: &reg, key: key}, nil
+		return accountUser(acct)
 	}
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-	u := &acmeUser{email: s.cfg.Email, key: key}
-	client, err := lego.NewClient(s.legoConfig(u))
-	if err != nil {
-		return nil, fmt.Errorf("ACME directory %s: %w", s.cfg.CAServer, err)
-	}
-	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
-	if err != nil {
-		return nil, fmt.Errorf("ACME account registration: %w", err)
-	}
-	u.reg = reg
-	regJSON, err := json.Marshal(reg)
-	if err != nil {
-		return nil, err
-	}
-	der, err := x509.MarshalECPrivateKey(key)
+	u, a, err := registerAccount(s.cfg.Email, s.cfg.CAServer, s.cfg.ACMEHTTPClient)
 	if err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
-	s.doc.Account = &Account{Email: s.cfg.Email, CAServer: s.cfg.CAServer, Registration: regJSON,
-		KeyPEM: string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}))}
+	s.doc.Account = a
 	err = s.store.Save(s.doc)
 	s.mu.Unlock()
 	if err != nil {
@@ -132,15 +154,40 @@ func parseECKey(p string) (*ecdsa.PrivateKey, error) {
 	return x509.ParseECPrivateKey(b.Bytes)
 }
 
-// challengeProvider presents DNS-01 TXT records with a libdns provider.
+// challengeProvider is the service's DNS-01 provider: dns01Provider with
+// the service's zone lookup and propagation timeouts.
 type challengeProvider struct {
 	s *Service
 	p dnsProvider
 }
 
-func (c *challengeProvider) txt(domain, keyAuth string) (zone string, rec libdns.TXT, err error) {
+func (c *challengeProvider) free() *dns01Provider {
+	return &dns01Provider{p: c.p, zoneOf: func(fqdn string) (string, error) { return c.s.zoneOf(c.p, fqdn) },
+		timeout: c.s.cfg.PropagationTimeout, interval: c.s.cfg.PropagationInterval}
+}
+
+func (c *challengeProvider) Present(domain, token, keyAuth string) error {
+	return c.free().Present(domain, token, keyAuth)
+}
+
+func (c *challengeProvider) CleanUp(domain, token, keyAuth string) error {
+	return c.free().CleanUp(domain, token, keyAuth)
+}
+
+func (c *challengeProvider) Timeout() (timeout, interval time.Duration) { return c.free().Timeout() }
+
+// dns01Provider presents DNS-01 TXT records with a libdns provider p;
+// zoneOf finds the zone holding an FQDN (the service's lookup, or the
+// tool's: mail-cert has no Service).
+type dns01Provider struct {
+	p                 dnsProvider
+	zoneOf            func(fqdn string) (string, error)
+	timeout, interval time.Duration
+}
+
+func (c *dns01Provider) txt(domain, keyAuth string) (zone string, rec libdns.TXT, err error) {
 	info := dns01.GetChallengeInfo(domain, keyAuth)
-	zone, err = c.s.zoneOf(c.p, info.EffectiveFQDN)
+	zone, err = c.zoneOf(info.EffectiveFQDN)
 	if err != nil {
 		return "", rec, fmt.Errorf("finding the DNS zone of %s: %w", info.EffectiveFQDN, err)
 	}
@@ -149,7 +196,7 @@ func (c *challengeProvider) txt(domain, keyAuth string) (zone string, rec libdns
 
 // Present adds the challenge TXT record (appended: <name> and *.<name>
 // share _acme-challenge.<name>).
-func (c *challengeProvider) Present(domain, _, keyAuth string) error {
+func (c *dns01Provider) Present(domain, _, keyAuth string) error {
 	zone, rec, err := c.txt(domain, keyAuth)
 	if err != nil {
 		return err
@@ -163,7 +210,7 @@ func (c *challengeProvider) Present(domain, _, keyAuth string) error {
 }
 
 // CleanUp removes the challenge TXT record.
-func (c *challengeProvider) CleanUp(domain, _, keyAuth string) error {
+func (c *dns01Provider) CleanUp(domain, _, keyAuth string) error {
 	zone, rec, err := c.txt(domain, keyAuth)
 	if err != nil {
 		return err
@@ -178,8 +225,16 @@ func (c *challengeProvider) CleanUp(domain, _, keyAuth string) error {
 }
 
 // Timeout bounds the propagation wait.
-func (c *challengeProvider) Timeout() (timeout, interval time.Duration) {
-	return c.s.cfg.PropagationTimeout, c.s.cfg.PropagationInterval
+func (c *dns01Provider) Timeout() (timeout, interval time.Duration) {
+	return c.timeout, c.interval
+}
+
+// skipsPropagation: the provider has no authoritative nameservers for
+// lego's propagation check (the test provider).
+func skipsPropagation(p dnsProvider) bool {
+	in, _ := unwrap(p)
+	ps, ok := in.(propagationSkipper)
+	return ok && ps.SkipPropagationCheck()
 }
 
 // obtain orders a certificate for <name> and *.<name> (fresh EC P-256 key)
@@ -190,14 +245,7 @@ func (s *Service) obtain(name string, p dnsProvider, u *acmeUser) (certPEM, keyP
 	if err != nil {
 		return "", "", time.Time{}, fmt.Errorf("ACME directory %s: %w", s.cfg.CAServer, err)
 	}
-	skip := false
-	if ps, ok := func() (propagationSkipper, bool) {
-		in, _ := unwrap(p)
-		ps, ok := in.(propagationSkipper)
-		return ps, ok
-	}(); ok {
-		skip = ps.SkipPropagationCheck()
-	}
+	skip := skipsPropagation(p)
 	err = client.Challenge.SetDNS01Provider(&challengeProvider{s: s, p: p},
 		dns01.CondOption(skip, dns01.WrapPreCheck(func(_, _, _ string, _ dns01.PreCheckFunc) (bool, error) { return true, nil })))
 	if err != nil {

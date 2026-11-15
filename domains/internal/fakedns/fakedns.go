@@ -1,6 +1,7 @@
 // Package fakedns is a test DNS provider: an in-memory zone behind the
 // libdns interfaces, plus a small DNS server that answers A, AAAA, TXT,
-// CAA, MX and CNAME queries from it (wildcards included), SOA for marked
+// CAA, MX, CNAME, SRV and TLSA queries from it (wildcards included; a TXT
+// longer than 255 bytes as several ≤ 255-byte strings), SOA for marked
 // zone apexes, DNSKEY / DS for signed zones, and NXDOMAIN for names that
 // don't exist. In validating mode it plays a validating resolver: AD for
 // a secure chain, SERVFAIL for a broken one (answered with CD set). The domains service's tests and
@@ -109,6 +110,96 @@ type Provider struct {
 	// also raises a TTL under 600 s to 600 on every write (append, and
 	// SetRecords' edits), as the library does (porkbunTTL).
 	DeleteMode string
+	// TXTSplit255 stores a TXT longer than 255 bytes as several quoted
+	// ≤ 255-byte strings (`"…" "…"`), as Porkbun serves it, and reads it
+	// back in that form; without it a long TXT is stored whole (as
+	// Cloudflare). Either way the DNS side serves ≤ 255-byte strings.
+	TXTSplit255 bool
+	// RefuseTypes: record types the provider can't write (append / set
+	// fail, as a real API refusing the type).
+	RefuseTypes []string
+}
+
+// store is rr as this provider stores it.
+func (p *Provider) store(rr libdns.RR) libdns.RR {
+	if p.porkbunLib() {
+		rr.TTL = porkbunTTL(rr.TTL)
+	}
+	if p.TXTSplit255 && rr.Type == "TXT" && len(rr.Data) > 255 {
+		var parts []string
+		for _, c := range chunk255(rr.Data) {
+			parts = append(parts, strconv.Quote(c))
+		}
+		rr.Data = strings.Join(parts, " ")
+	}
+	return rr
+}
+
+// refuse fails a write of a type the provider can't write.
+func (p *Provider) refuse(recs []libdns.Record) error {
+	for _, r := range recs {
+		for _, t := range p.RefuseTypes {
+			if strings.EqualFold(r.RR().Type, t) {
+				return fmt.Errorf("record type %s is not supported", t)
+			}
+		}
+	}
+	return nil
+}
+
+// chunk255 splits s into ≤ 255-byte pieces.
+func chunk255(s string) []string {
+	var out []string
+	for len(s) > 255 {
+		out = append(out, s[:255])
+		s = s[255:]
+	}
+	return append(out, s)
+}
+
+// txtStrings are a stored TXT's character-strings: the quoted form
+// (`"a" "b"`, TXTSplit255) parsed, else the data in ≤ 255-byte pieces.
+func txtStrings(data string) []string {
+	if parts, ok := quotedStrings(data); ok {
+		return parts
+	}
+	return chunk255(data)
+}
+
+// quotedStrings parses `"a" "b"` (one space between); false otherwise.
+func quotedStrings(data string) ([]string, bool) {
+	if !strings.HasPrefix(data, `"`) {
+		return nil, false
+	}
+	var out []string
+	rest := data
+	for {
+		q, err := strconv.QuotedPrefix(rest)
+		if err != nil {
+			return nil, false
+		}
+		u, err := strconv.Unquote(q)
+		if err != nil {
+			return nil, false
+		}
+		out = append(out, u)
+		rest = rest[len(q):]
+		if rest == "" {
+			return out, true
+		}
+		if !strings.HasPrefix(rest, ` "`) {
+			return nil, false
+		}
+		rest = rest[1:]
+	}
+}
+
+// txtJoined is a stored TXT's value (its strings joined).
+func txtJoined(data string) string {
+	if parts, ok := quotedStrings(data); ok {
+		return strings.Join(parts, "")
+	}
+	return data
 }
 
 // porkbunLib: DeleteMode "porkbun" plays the whole library: it also reads
@@ -205,13 +296,13 @@ func (p *Provider) AppendRecords(_ context.Context, zone string, recs []libdns.R
 	if err := p.auth("append", recs); err != nil {
 		return nil, err
 	}
+	if err := p.refuse(recs); err != nil {
+		return nil, err
+	}
 	p.Zone.mu.Lock()
 	defer p.Zone.mu.Unlock()
 	for _, r := range recs {
-		rr := r.RR()
-		if p.porkbunLib() {
-			rr.TTL = porkbunTTL(rr.TTL)
-		}
+		rr := p.store(r.RR())
 		n := abs(rr.Name, zone)
 		p.Zone.recs[n] = append(p.Zone.recs[n], rr)
 	}
@@ -223,14 +314,14 @@ func (p *Provider) SetRecords(_ context.Context, zone string, recs []libdns.Reco
 	if err := p.auth("set", recs); err != nil {
 		return nil, err
 	}
+	if err := p.refuse(recs); err != nil {
+		return nil, err
+	}
 	p.Zone.mu.Lock()
 	defer p.Zone.mu.Unlock()
 	if p.SetMode != "" {
 		for _, r := range recs {
-			rr := r.RR()
-			if p.porkbunLib() {
-				rr.TTL = porkbunTTL(rr.TTL)
-			}
+			rr := p.store(r.RR())
 			n := abs(rr.Name, zone)
 			var idx []int
 			for i, old := range p.Zone.recs[n] {
@@ -252,7 +343,7 @@ func (p *Provider) SetRecords(_ context.Context, zone string, recs []libdns.Reco
 	type key struct{ n, t string }
 	cleared := map[key]bool{}
 	for _, r := range recs {
-		rr := r.RR()
+		rr := p.store(r.RR())
 		n := abs(rr.Name, zone)
 		if k := (key{n, rr.Type}); !cleared[k] {
 			cleared[k] = true
@@ -337,7 +428,8 @@ func (p *Provider) DeleteRecords(_ context.Context, zone string, recs []libdns.R
 		n := abs(want.Name, zone)
 		var keep []libdns.RR
 		for _, old := range p.Zone.recs[n] {
-			if (want.Type == "" || want.Type == old.Type) && (want.TTL == 0 || want.TTL == old.TTL) && (want.Data == "" || want.Data == old.Data) {
+			if (want.Type == "" || want.Type == old.Type) && (want.TTL == 0 || want.TTL == old.TTL) && (want.Data == "" || want.Data == old.Data ||
+				p.TXTSplit255 && old.Type == "TXT" && txtJoined(want.Data) == txtJoined(old.Data)) {
 				deleted = append(deleted, parsed(old))
 				continue
 			}
@@ -545,16 +637,19 @@ func toDNS(qname string, rr libdns.RR) dns.RR {
 		}
 		return &dns.AAAA{Hdr: hdr, AAAA: ip.AsSlice()}
 	case "TXT":
-		return &dns.TXT{Hdr: hdr, Txt: []string{rr.Data}}
+		return &dns.TXT{Hdr: hdr, Txt: txtStrings(rr.Data)}
 	case "CNAME":
 		return &dns.CNAME{Hdr: hdr, Target: dns.Fqdn(rr.Data)}
-	case "MX", "CAA":
+	case "MX", "CAA", "SRV", "TLSA":
 		out, err := dns.NewRR(fmt.Sprintf("%s %d IN %s %s", qname, ttl, rr.Type, rr.Data))
 		if err != nil || out == nil {
 			return nil
 		}
-		if mx, ok := out.(*dns.MX); ok {
-			mx.Mx = dns.Fqdn(mx.Mx)
+		switch v := out.(type) {
+		case *dns.MX:
+			v.Mx = dns.Fqdn(v.Mx)
+		case *dns.SRV:
+			v.Target = dns.Fqdn(v.Target)
 		}
 		return out
 	}
@@ -753,8 +848,15 @@ func ServeWith(z *Zone, addr string, o Options) (*Server, error) {
 			}
 		}
 		z.mu.Unlock()
+		size := dns.MinMsgSize
 		if opt := req.IsEdns0(); opt != nil {
 			m.SetEdns0(opt.UDPSize(), opt.Do())
+			size = int(opt.UDPSize())
+		}
+		// Over UDP an answer too large for the client is truncated (TC),
+		// as a real server does: the client retries over TCP.
+		if _, udp := w.LocalAddr().(*net.UDPAddr); udp {
+			m.Truncate(size)
 		}
 		_ = w.WriteMsg(m)
 	})
