@@ -86,7 +86,7 @@ binds() {  # <config json> — "service target read_only selinux" of every proje
 }
 [ -z "$(binds "$CFG_ALL" | awk '$4 != "-"')" ] || { echo "FAIL: docker-compose.yml relabels a bind (selinux): only the overlay may"; exit 1; }
 NBINDS="$(binds "$CFG_ALL" | wc -l | tr -d ' ')"
-[ "$NBINDS" = 46 ] || { echo "FAIL: expected 46 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
+[ "$NBINDS" = 53 ] || { echo "FAIL: expected 53 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
 diff <({ binds "$CFG_ALL" | grep -vx 'hub /project true -' | awk '{print $1, $2, $3}'; echo "hub /project/group-gate/group-gate-map.conf true"; } | sort) \
      <(binds "$OV_ALL" | awk '{print $1, $2, $3}' | sort) \
   || { echo "FAIL: docker-compose.podman-selinux.yml must re-declare every project bind (but the Hub's /project root) with the same target / read_only, plus the Hub's map file"; exit 1; }
@@ -297,7 +297,7 @@ echo "$CFG_ALL" | jq -e '.services["dns-tool"] as $t
     and $t.entrypoint == ["domains", "dns"] and ($t.ports // []) == []
     and $t.healthcheck.disable == true
     and ([$t.labels // {} | keys[] | select(startswith("traefik."))] == [])
-    and ([.services | to_entries[] | select((.value.networks // {}) | has("domains-egress")) | .key] | sort == ["dns-tool", "domains"])' >/dev/null \
+    and ([.services | to_entries[] | select((.value.networks // {}) | has("domains-egress")) | .key] | sort == ["dns-tool", "domains", "mail-cert"])' >/dev/null \
   || { echo "FAIL: dns-tool wiring (contract §12.1: egress only, no volumes / env, credentials on stdin)"; exit 1; }
 # Contract §15 / §5 / §6: mcp-gate. Networks exactly portcullis +
 # portcullis-proxy at the pinned address; group 10001 only (G74);
@@ -570,7 +570,7 @@ PORTCULLIS_VPN_MODE=server PORTCULLIS_VPN_PUBLIC_ENROL=false docker compose -f d
 # PORTCULLIS_VPN_RUNTIME_POOLS: runtime_export, test_shell_libs), with the
 # defaults and with every subnet moved. Compared word by word.
 for pools in "" "10.88.0.0/16 10.89.0.0/16"; do
-  for over in "" "PORTCULLIS_PROXY_SUBNET=10.80.0.0/24 PORTCULLIS_PROXY_IP_RANGE=10.80.0.128/25 PORTCULLIS_TRAEFIK_IP=10.80.0.2 PORTCULLIS_AUTH_SUBNET=10.81.0.0/28 PORTCULLIS_DOMAINS_SUBNET=10.82.0.0/28 PORTCULLIS_MCP_SUBNET=10.83.0.0/28 PORTCULLIS_VPN_NET=10.84.0.0/26 PORTCULLIS_VPN_EDGE_SUBNET=10.85.0.0/28"; do
+  for over in "" "PORTCULLIS_PROXY_SUBNET=10.80.0.0/24 PORTCULLIS_PROXY_IP_RANGE=10.80.0.128/25 PORTCULLIS_TRAEFIK_IP=10.80.0.2 PORTCULLIS_AUTH_SUBNET=10.81.0.0/28 PORTCULLIS_DOMAINS_SUBNET=10.82.0.0/28 PORTCULLIS_MCP_SUBNET=10.83.0.0/28 PORTCULLIS_VPN_NET=10.84.0.0/26 PORTCULLIS_VPN_EDGE_SUBNET=10.85.0.0/28 PORTCULLIS_MAIL_SUBNET=10.86.0.0/28 PORTCULLIS_MAILCTL_SUBNET=10.87.0.0/28"; do
     # shellcheck disable=SC2086  # VAR=value words
     HUBLIST="$(env $over PORTCULLIS_VPN_RUNTIME_POOLS="$pools" bash -c 'source scripts/lib/common.sh; source scripts/lib/network.sh; vpn_reserved_ranges')"
     # shellcheck disable=SC2086

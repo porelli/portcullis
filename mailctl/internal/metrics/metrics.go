@@ -1,0 +1,53 @@
+// Package metrics is mailctl's Prometheus registry (contract §19.8),
+// served only on its portcullis-metrics-mail address (MAILCTL_METRICS_ADDR,
+// the alias mailctl-metrics).
+package metrics
+
+import (
+	"net/http"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// Metrics holds mailctl's gauges on their own registry (no Go runtime or
+// process collectors: nothing but the mail metrics is exposed).
+type Metrics struct {
+	Registry      *prometheus.Registry
+	Check         *prometheus.GaugeVec // portcullis_mail_check{check} 0/1
+	DKIMStage     *prometheus.GaugeVec // portcullis_mail_dkim_stage{domain,stage}
+	CertExpiry    prometheus.Gauge     // portcullis_mail_cert_expiry_seconds
+	QueueMessages prometheus.Gauge     // portcullis_mail_queue_messages
+	QueueDeferred prometheus.Gauge     // portcullis_mail_queue_deferred_ratio
+}
+
+// New registers every gauge.
+func New() *Metrics {
+	m := &Metrics{
+		Registry: prometheus.NewRegistry(),
+		Check: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "portcullis_mail_check", Help: "1 when the mail check passes, 0 when it fails.",
+		}, []string{"check"}),
+		DKIMStage: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "portcullis_mail_dkim_stage", Help: "1 for each DKIM key's current stage per domain.",
+		}, []string{"domain", "stage"}),
+		CertExpiry: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "portcullis_mail_cert_expiry_seconds", Help: "Unix time the mail certificate expires.",
+		}),
+		QueueMessages: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "portcullis_mail_queue_messages", Help: "Messages in Stalwart's outbound queue.",
+		}),
+		QueueDeferred: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "portcullis_mail_queue_deferred_ratio", Help: "Share of queued messages whose last attempt was deferred.",
+		}),
+	}
+	m.Registry.MustRegister(m.Check, m.DKIMStage, m.CertExpiry, m.QueueMessages, m.QueueDeferred)
+	return m
+}
+
+// Handler serves /metrics; anything else is 404.
+func (m *Metrics) Handler() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{}))
+	return mux
+}

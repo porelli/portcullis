@@ -173,6 +173,9 @@ env_require() {
 # Secrets every core service needs (docker-compose.yml uses ${VAR:?}).
 # shellcheck disable=SC2034  # used by stack.sh
 CORE_SECRETS="POSTGRES_PASSWORD KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD LLDAP_JWT_SECRET FORWARD_AUTH_CLIENT_SECRET FORWARD_AUTH_COOKIE_SECRET FORWARD_AUTH_REDIS_PASSWORD FORWARD_AUTH_EXT_REDIS_PASSWORD HUB_PROXY_SECRET"
+# Optional secrets in .env (empty = not used): never generated or required,
+# never shared with the Hub. Mail: written to secrets/mail/ by mail_prepare.
+OPTIONAL_SECRETS="MAIL_RELAY_PASSWORD MAIL_SPAMHAUS_DQS_KEY"
 # Subset that can be (re)generated on an existing install without losing
 # data: nothing on disk is encrypted with them, `portcullis oidc register`
 # pushes FORWARD_AUTH_CLIENT_SECRET to Keycloak, and the session store's
@@ -467,6 +470,16 @@ CT_UID_WG=10006      # wg/Dockerfile (USER 10006:10006; no other group)
 # vpn_doc's group (vpn.json, contract §16): the Hub (writer), wg and
 # group-gate (readers) only — never the Hub's own 10001.
 CT_GID_VPN_DOC=10007
+# Mail (contract §19.1): Stalwart's image user (2000:2000), mailctl
+# (mailctl/Dockerfile, USER 10010:10010, + group 10001 for the Hub secret;
+# not 10006 = wg, 10008 / 10009 reserved by multi-server) and the Unbound
+# image's unbound user (101:102).
+CT_UID_MAIL=2000
+CT_UID_MAILCTL=10010
+# shellcheck disable=SC2034  # documents mail-resolver's compose user
+CT_UID_MAIL_RESOLVER=101
+# shellcheck disable=SC2034  # documents mail-resolver's compose user
+CT_GID_MAIL_RESOLVER=102
 CT_GID_TRAEFIK=0      # Traefik runs as root, but without CAP_DAC_OVERRIDE
 # shellcheck disable=SC2034  # used by sessions.sh
 CT_UID_SESSIONS=999   # valkey/valkey alpine: valkey = 999:1000 (compose user: "999:1000")
@@ -692,6 +705,12 @@ secrets_fix_perms() {
   if declare -F sessions_fix_perms >/dev/null; then sessions_fix_perms; fi
   # secrets/wg/: the built-in people VPN's key (contract §16), wg reads it.
   ct_group_read "$CT_UID_WG" "$s/wg" "$s/wg/people.key"
+  # secrets/mail/ (contract §19.1): the directory 0700 (each reader binds
+  # its own files), each file 0640 with its reader's group.
+  [ ! -d "$s/mail" ] || chmod 700 "$s/mail"
+  ct_group_read "$CT_UID_MAILCTL" "$s/mail/api-key" "$s/mail/dqs-key"
+  ct_group_read "$CT_UID_HUB" "$s/mail/hub-secret"
+  ct_group_read "$CT_UID_MAIL" "$s/mail/metrics-secret" "$s/mail/relay-password"
 }
 
 # Core variables the Hub may copy into app .env files (templates reference
@@ -714,7 +733,7 @@ hub_env_write() {
   done
   for v in "${names[@]}"; do
     [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-    case " $CORE_SECRETS " in *" $v "*) warn "HUB_SHARED_ENV: refusing to share core secret $v with the Hub"; continue ;; esac
+    case " $CORE_SECRETS $OPTIONAL_SECRETS " in *" $v "*) warn "HUB_SHARED_ENV: refusing to share core secret $v with the Hub"; continue ;; esac
     case "$content" in "$v="*|*$'\n'"$v="*) continue ;; esac
     # Written below from the host (podman / kubernetes only), never shared by name.
     case "$v" in PORTCULLIS_UNPRIVILEGED_PORT_START|PORTCULLIS_POD_CIDR|PORTCULLIS_SERVICE_CIDR|PORTCULLIS_WG_EDGE_SERVICE_IP|PORTCULLIS_TRAEFIK_SERVICE_IP|PORTCULLIS_RUNTIME_ROOTS|PORTCULLIS_KUBE_*) continue ;; esac
@@ -802,6 +821,43 @@ _ensure_secrets_volume_docker() {
     || fail "could not set hub_secrets volume to $CT_UID_HUB:$CT_UID_HUB mode 0700"
 }
 
+# mail_profile_on — COMPOSE_PROFILES (as compose sees it) names mail.
+mail_profile_on() {
+  case ",${COMPOSE_PROFILES:-}," in *,mail,*) return 0 ;; esac
+  return 1
+}
+
+# _mail_secret_from_env <file> <VAR> — the file holds .env's VAR (empty =
+# none), rewritten in place only when it differs (the bind pins the inode).
+_mail_secret_from_env() {
+  local f="$1" v="${!2:-}"
+  if [ "$(cat "$f" 2>/dev/null)" != "$v" ]; then printf '%s' "$v" > "$f"; fi
+}
+
+# mail_prepare — the mail profile's bind sources and volumes (contract
+# §19.1). The placeholder files always exist (the Hub binds hub-secret
+# even without mail; a bind must never make a directory and the SELinux
+# overlay's sources must exist); empty = not set. relay-password and
+# dqs-key follow .env's MAIL_RELAY_PASSWORD / MAIL_SPAMHAUS_DQS_KEY. The
+# volumes are created and owned only with mail in COMPOSE_PROFILES.
+mail_prepare() {
+  local d="$PORTCULLIS_ROOT/secrets/mail" f
+  (umask 077 && mkdir -p "$d")
+  chmod 700 "$d"
+  for f in api-key hub-secret metrics-secret relay-password dqs-key; do
+    [ ! -d "$d/$f" ] || fail "$d/$f is a directory (made by Docker): remove it (rmdir) and run again"
+    [ -f "$d/$f" ] || (umask 077 && : > "$d/$f")
+  done
+  _mail_secret_from_env "$d/relay-password" MAIL_RELAY_PASSWORD
+  _mail_secret_from_env "$d/dqs-key" MAIL_SPAMHAUS_DQS_KEY
+  mail_profile_on || return 0
+  volume_own mail_data "$CT_UID_MAIL:$CT_UID_MAIL"
+  volume_own mail_etc "$CT_UID_MAIL:$CT_UID_MAIL"
+  volume_own mail_tls "$CT_UID_DOMAINS:$CT_UID_MAIL" 2750
+  volume_own mail_acme "$CT_UID_DOMAINS:$CT_UID_DOMAINS" 0700
+  volume_own mailctl_data "$CT_UID_MAILCTL:$CT_UID_MAILCTL" 0700
+}
+
 # stack_prepare — bind-mount sources must exist before compose runs, or
 # Docker creates them root-owned (as directories) and nothing can write
 # them afterwards. Also sets the ownership/modes the non-root containers
@@ -869,6 +925,7 @@ stack_prepare() {
   [ ! -d "$PORTCULLIS_ROOT/secrets/wg/people.key" ] || fail "$PORTCULLIS_ROOT/secrets/wg/people.key is a directory (made by Docker): remove it (rmdir) and run again"
   [ -f "$PORTCULLIS_ROOT/secrets/wg/people.key" ] || (umask 027 && : > "$PORTCULLIS_ROOT/secrets/wg/people.key")
   chmod 640 "$PORTCULLIS_ROOT/secrets/wg/people.key"
+  mail_prepare
   # wg_data: wg (10006) writes status.json, the Hub reads it through group
   # 10001 (V5); setgid, so every file wg makes there carries 10001 although
   # wg isn't in that group.

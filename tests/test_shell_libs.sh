@@ -169,11 +169,12 @@ KEYCLOAK_ADMIN_PASSWORD=kc-secret
 HEADSCALE_OIDC_CLIENT_SECRET=hs-secret
 NETBIRD_OIDC_CLIENT_SECRET=nb-secret
 MY_APP_VAR=shared
-HUB_SHARED_ENV=MY_APP_VAR POSTGRES_PASSWORD
+MAIL_RELAY_PASSWORD=relay-secret
+HUB_SHARED_ENV=MY_APP_VAR POSTGRES_PASSWORD MAIL_RELAY_PASSWORD
 ENVEOF
 hub_env_run() (
   PORTCULLIS_ROOT="$HR"
-  unset PORTCULLIS_DOMAIN HEADSCALE_OIDC_CLIENT_SECRET NETBIRD_OIDC_CLIENT_SECRET MY_APP_VAR HUB_SHARED_ENV POSTGRES_PASSWORD HUB_PROXY_SECRET KEYCLOAK_ADMIN_PASSWORD
+  unset PORTCULLIS_DOMAIN HEADSCALE_OIDC_CLIENT_SECRET NETBIRD_OIDC_CLIENT_SECRET MY_APP_VAR HUB_SHARED_ENV POSTGRES_PASSWORD HUB_PROXY_SECRET KEYCLOAK_ADMIN_PASSWORD MAIL_RELAY_PASSWORD
   env_load
   hub_env_write 2>/dev/null
 )
@@ -186,10 +187,11 @@ expect_fail "hub env: no HEADSCALE_ / HEADPLANE_ prefix any more (core carries n
 expect_ok   "hub env: wg's portcullis-vpn address (compose default; the Hub's PORTCULLIS_VPN_EDGE for gateways)" \
   grep -qx 'PORTCULLIS_VPN_WG_IP=172.31.254.3' "$HE"
 expect_ok   "hub env: the VPN reserved ranges (what wg / group-gate refuse) for the Hub" \
-  grep -qx 'PORTCULLIS_VPN_RESERVED_RANGES=172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28' "$HE"
+  grep -qx 'PORTCULLIS_VPN_RESERVED_RANGES=172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28 172.31.255.0/28 172.31.255.16/28' "$HE"
 expect_ok   "hub env: HUB_SHARED_ENV" grep -qx 'MY_APP_VAR=shared' "$HE"
 expect_ok   "hub env: mcp-gate IP (compose default, G42)" grep -qx 'PORTCULLIS_MCP_GATE_IP=172.31.250.3' "$HE"
 expect_fail "hub env: never a core secret" grep -Eq 'pg-secret|hub-secret|kc-secret' "$HE"
+expect_fail "hub env: never an optional secret (MAIL_RELAY_PASSWORD), even through HUB_SHARED_ENV" grep -q 'relay-secret' "$HE"
 INODE_BEFORE="$(file_inode "$HE")"
 hub_env_run
 expect_eq "hub env: rewritten in place" "$(file_inode "$HE")" "$INODE_BEFORE"
@@ -255,6 +257,44 @@ expect_eq "stack_prepare: an existing people.key is kept" "$(cat "$SP_ROOT/secre
   secrets_fix_perms ) >/dev/null 2>&1
 expect_ok "secrets_fix_perms: secrets/wg and people.key group 10006" \
   grep -qx "ct_group_read 10006 $SP_ROOT/secrets/wg $SP_ROOT/secrets/wg/people.key" "$STUB_DIR/sfp-wg"
+# Mail (contract §19.1): the placeholders always (the Hub binds hub-secret
+# without the profile too; a bind must never make a directory), 0640, the
+# directory 0700; relay-password / dqs-key follow .env; the volumes only
+# with mail in COMPOSE_PROFILES.
+expect_eq "stack_prepare: the mail placeholders exist, empty, 0600 before secrets_fix_perms" \
+  "$(for f in api-key hub-secret metrics-secret relay-password dqs-key; do [ -f "$SP_ROOT/secrets/mail/$f" ] && [ ! -s "$SP_ROOT/secrets/mail/$f" ] && file_mode "$SP_ROOT/secrets/mail/$f"; done | tr '\n' ' ')" "600 600 600 600 600 "
+expect_eq "stack_prepare: secrets/mail is 0700" "$(file_mode "$SP_ROOT/secrets/mail")" 700
+expect_fail "stack_prepare makes no mail volume without the mail profile" grep -q 'volume_own mail' "$STUB_DIR/sp-vol"
+rm -f "$STUB_DIR/sp-vol"
+printf 'API_k' > "$SP_ROOT/secrets/mail/api-key"
+ino="$(file_inode "$SP_ROOT/secrets/mail/relay-password")"
+( PORTCULLIS_ROOT="$SP_ROOT"; export COMPOSE_PROFILES=monitoring,mail MAIL_RELAY_PASSWORD='r3lay pw' MAIL_SPAMHAUS_DQS_KEY=dqskey
+  volume_own() { echo "volume_own $*" >> "$STUB_DIR/sp-vol"; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  unset -f users_secret_files monitoring_prepare domains_prepare mcpgate_ensure_secrets
+  stack_prepare ) >/dev/null 2>&1
+expect_eq "stack_prepare makes the mail volumes only with the mail profile (owners, modes)" "$(grep '^volume_own mail' "$STUB_DIR/sp-vol" | sort | tr '\n' '|')" \
+  "volume_own mail_acme 10004:10004 0700|volume_own mail_data 2000:2000|volume_own mail_etc 2000:2000|volume_own mail_tls 10004:2000 2750|volume_own mailctl_data 10010:10010 0700|"
+expect_eq "stack_prepare: relay-password and dqs-key from .env, in place; api-key kept" \
+  "$(cat "$SP_ROOT/secrets/mail/relay-password")|$(cat "$SP_ROOT/secrets/mail/dqs-key")|$(cat "$SP_ROOT/secrets/mail/api-key")|$([ "$(file_inode "$SP_ROOT/secrets/mail/relay-password")" = "$ino" ] && echo same)" "r3lay pw|dqskey|API_k|same"
+( PORTCULLIS_ROOT="$SP_ROOT"
+  volume_own() { :; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  unset -f users_secret_files monitoring_prepare domains_prepare mcpgate_ensure_secrets
+  stack_prepare ) >/dev/null 2>&1
+expect_eq "stack_prepare: an unset MAIL_RELAY_PASSWORD / MAIL_SPAMHAUS_DQS_KEY empties the files" "$(wc -c < "$SP_ROOT/secrets/mail/relay-password" | tr -d ' ')$(wc -c < "$SP_ROOT/secrets/mail/dqs-key" | tr -d ' ')" 00
+( PORTCULLIS_ROOT="$SP_ROOT"
+  ct_group_read() { echo "ct_group_read $*" >> "$STUB_DIR/sfp-mail"; }
+  unset -f monitoring_fix_perms domains_fix_perms mcpgate_fix_perms sessions_fix_perms
+  secrets_fix_perms ) >/dev/null 2>&1
+expect_eq "secrets_fix_perms: the mail files' groups (mailctl 10010, Hub 10001, mail 2000)" "$(grep 'secrets/mail' "$STUB_DIR/sfp-mail" | tr '\n' '|')" \
+  "ct_group_read 10010 $SP_ROOT/secrets/mail/api-key $SP_ROOT/secrets/mail/dqs-key|ct_group_read 10001 $SP_ROOT/secrets/mail/hub-secret|ct_group_read 2000 $SP_ROOT/secrets/mail/metrics-secret $SP_ROOT/secrets/mail/relay-password|"
+rm -f "$STUB_DIR/sfp-mail"
+rm -rf "$SP_ROOT/secrets/mail/hub-secret"; mkdir "$SP_ROOT/secrets/mail/hub-secret"
+rc=0; ( PORTCULLIS_ROOT="$SP_ROOT"
+  volume_own() { :; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  unset -f users_secret_files monitoring_prepare domains_prepare mcpgate_ensure_secrets
+  stack_prepare ) >/dev/null 2>&1 || rc=$?
+expect_eq "stack_prepare: a mail secret Docker made a directory is refused" "$rc" 1
+rmdir "$SP_ROOT/secrets/mail/hub-secret"
 # group_gate_data (sign-in part 2, contract §4 "Opened log"): group-gate
 # (10003) writes the opened log, the Hub (group 10001) reads and prunes it.
 expect_ok "the stack's volume setup owns group_gate_data 10003:10001" grep -qx 'volume_own group_gate_data 10003:10001' "$STUB_DIR/sp-vol"
@@ -432,6 +472,48 @@ rm -f "$STUB_DIR/ipam-json-portcullis-vpn" "$STUB_DIR/ipam-json-portcullis-vpn-e
 expect_fail "guard: invalid vpn settings abort" bash -c "PORTCULLIS_VPN_WG_IP=172.31.254.9; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 expect_fail "guard: invalid vpn edge settings abort" bash -c "PORTCULLIS_VPN_EDGE_WG_IP=172.31.254.66; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
 expect_ok "CORE_SERVICE_NAMES has wg" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; case \" \$CORE_SERVICE_NAMES \" in *' wg '*) exit 0;; esac; exit 1"
+# ── mail networks (contract §19.1): portcullis-mail (mail, mailctl,
+# mail-resolver pinned) and portcullis-mailctl (the Hub, mailctl pinned);
+# mailctl pinned on portcullis-proxy. Validated always (the Hub joins
+# portcullis-mailctl without the profile too).
+unset PORTCULLIS_MAIL_SUBNET PORTCULLIS_MAIL_IP_RANGE PORTCULLIS_MAIL_IP PORTCULLIS_MAILCTL_MAIL_IP PORTCULLIS_MAIL_RESOLVER_IP \
+  PORTCULLIS_MAILCTL_SUBNET PORTCULLIS_MAILCTL_IP_RANGE PORTCULLIS_MAILCTL_HUB_IP PORTCULLIS_MAILCTL_API_IP PORTCULLIS_MAILCTL_PROXY_IP
+expect_eq "mail nets: defaults" "$(mail_subnet) $(mail_ip_range) $(mail_ip) $(mailctl_ip) $(mail_resolver_ip) $(mailctl_subnet) $(mailctl_ip_range) $(mailctl_hub_ip) $(mailctl_api_ip) $(mailctl_proxy_ip)" \
+  "172.31.255.0/28 172.31.255.8/29 172.31.255.2 172.31.255.3 172.31.255.4 172.31.255.16/28 172.31.255.24/29 172.31.255.18 172.31.255.19 172.31.250.4"
+expect_ok "mail nets: default valid" validate_mail_network_config
+# check_mailnet <VAR=value>... — validate with these overrides (unbound.conf
+# not consulted unless PORTCULLIS_HOME points at one).
+check_mailnet() { (export PORTCULLIS_HOME="$WORK/no-home"; for a in "$@"; do export "${a?}"; done; validate_mail_network_config); }
+expect_ok   "mail nets: moved, valid" check_mailnet PORTCULLIS_MAIL_SUBNET=10.86.0.0/28 PORTCULLIS_MAIL_IP_RANGE=10.86.0.8/29 PORTCULLIS_MAIL_IP=10.86.0.2 PORTCULLIS_MAILCTL_MAIL_IP=10.86.0.3 PORTCULLIS_MAIL_RESOLVER_IP=10.86.0.4
+expect_fail "validate_mail_network_config refuses an overlap with portcullis-vpn" check_mailnet PORTCULLIS_MAIL_SUBNET=172.31.254.0/28 PORTCULLIS_MAIL_IP_RANGE=172.31.254.8/29 PORTCULLIS_MAIL_IP=172.31.254.2 PORTCULLIS_MAILCTL_MAIL_IP=172.31.254.3 PORTCULLIS_MAIL_RESOLVER_IP=172.31.254.4
+expect_fail "validate_mail_network_config refuses portcullis-mailctl overlapping portcullis-mcp" check_mailnet PORTCULLIS_MAILCTL_SUBNET=172.31.253.0/28 PORTCULLIS_MAILCTL_IP_RANGE=172.31.253.8/29 PORTCULLIS_MAILCTL_HUB_IP=172.31.253.4 PORTCULLIS_MAILCTL_API_IP=172.31.253.5
+expect_fail "validate_mail_network_config refuses the two mail subnets overlapping" check_mailnet PORTCULLIS_MAILCTL_SUBNET=172.31.255.0/27 PORTCULLIS_MAILCTL_IP_RANGE=172.31.255.24/29 PORTCULLIS_MAILCTL_HUB_IP=172.31.255.18 PORTCULLIS_MAILCTL_API_IP=172.31.255.19
+expect_fail "validate_mail_network_config refuses the mailctl proxy IP = Traefik's" check_mailnet PORTCULLIS_MAILCTL_PROXY_IP=172.31.250.2
+expect_fail "validate_mail_network_config refuses the mailctl proxy IP = mcp-gate's" check_mailnet PORTCULLIS_MAILCTL_PROXY_IP=172.31.250.3
+expect_fail "validate_mail_network_config refuses the mailctl proxy IP in the proxy range" check_mailnet PORTCULLIS_MAILCTL_PROXY_IP=172.31.250.200
+expect_fail "validate_mail_network_config refuses a pinned IP in the range" check_mailnet PORTCULLIS_MAILCTL_MAIL_IP=172.31.255.9
+expect_fail "validate_mail_network_config refuses a pinned IP outside the subnet" check_mailnet PORTCULLIS_MAIL_IP=172.31.255.40
+expect_fail "validate_mail_network_config refuses the gateway address" check_mailnet PORTCULLIS_MAIL_RESOLVER_IP=172.31.255.1
+expect_fail "validate_mail_network_config refuses the broadcast address" check_mailnet PORTCULLIS_MAILCTL_API_IP=172.31.255.31
+expect_fail "validate_mail_network_config refuses two mail pins on one address" check_mailnet PORTCULLIS_MAIL_RESOLVER_IP=172.31.255.3
+expect_fail "validate_mail_network_config refuses the Hub and mailctl on one address" check_mailnet PORTCULLIS_MAILCTL_HUB_IP=172.31.255.19
+expect_fail "validate_mail_network_config refuses an invalid subnet" check_mailnet PORTCULLIS_MAIL_SUBNET=172.31.255.0/33
+# mail-resolver's access-control follows PORTCULLIS_MAIL_SUBNET.
+expect_ok   "validate_mail_network_config: the repo's unbound.conf allows the default subnet" bash -c "PORTCULLIS_HOME='$HERE/..'; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; validate_mail_network_config"
+expect_fail "validate_mail_network_config refuses a subnet unbound.conf doesn't allow" bash -c "PORTCULLIS_HOME='$HERE/..'; PORTCULLIS_MAIL_SUBNET=10.86.0.0/28 PORTCULLIS_MAIL_IP_RANGE=10.86.0.8/29 PORTCULLIS_MAIL_IP=10.86.0.2 PORTCULLIS_MAILCTL_MAIL_IP=10.86.0.3 PORTCULLIS_MAIL_RESOLVER_IP=10.86.0.4; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; validate_mail_network_config"
+expect_eq "vpn_reserved_ranges includes both mail subnets" "$(vpn_reserved_ranges | tr ' ' '\n' | grep -c '^172\.31\.255\.')" 2
+printf '%s' '[{"Subnet":"172.31.255.0/28","IPRange":"172.31.255.8/29"}]' > "$STUB_DIR/ipam-json-portcullis-mail"
+printf '%s' '[{"Subnet":"172.31.255.16/28","IPRange":"172.31.255.24/29"}]' > "$STUB_DIR/ipam-json-portcullis-mailctl"
+expect_eq "mail nets: state ok" "$(mail_network_state) $(mailctl_network_state)" "ok ok"
+expect_ok "guard: mail networks matching" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+printf '%s' '[{"Subnet":"172.31.255.0/27","IPRange":"172.31.255.8/29"}]' > "$STUB_DIR/ipam-json-portcullis-mail"
+expect_fail "guard: portcullis-mail mismatch aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+printf '%s' '[{"Subnet":"172.31.255.0/28","IPRange":"172.31.255.8/29"}]' > "$STUB_DIR/ipam-json-portcullis-mail"
+printf '%s' '[{"Subnet":"172.31.255.16/28"}]' > "$STUB_DIR/ipam-json-portcullis-mailctl"
+expect_fail "guard: portcullis-mailctl mismatch aborts" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+rm -f "$STUB_DIR/ipam-json-portcullis-mail" "$STUB_DIR/ipam-json-portcullis-mailctl"
+expect_fail "guard: invalid mail settings abort" bash -c "PORTCULLIS_MAILCTL_PROXY_IP=172.31.250.2; source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; network_check"
+expect_ok "CORE_PROXY_SERVICES has mailctl, CORE_SERVICE_NAMES the four mail services" bash -c "source '$HERE/../scripts/lib/common.sh'; source '$HERE/../scripts/lib/network.sh'; case \" \$CORE_PROXY_SERVICES \" in *' mailctl '*) ;; *) exit 1;; esac; for s in mail mailctl mail-resolver mail-cert; do case \" \$CORE_SERVICE_NAMES \" in *\" \$s \"*) ;; *) exit 1;; esac; done"
 
 # The gate never resolves keycloak / hub through DNS: compose maps both
 # names to the pinned addresses (extra_hosts) where they are pinned.
@@ -3113,7 +3195,7 @@ rc=0|[]
 rc=0"
 expect_eq "vpn_reserved_ranges: under podman Podman's pools follow the core subnets" \
   "$(rt "CONTAINER_RUNTIME=podman; getenforce() { echo Permissive; }; runtime_export; vpn_reserved_ranges")" \
-  "172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28 10.88.0.0/16 10.89.0.0/16
+  "172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28 172.31.255.0/28 172.31.255.16/28 10.88.0.0/16 10.89.0.0/16
 rc=0"
 expect_eq "runtime_export: an existing COMPOSE_FILE gets the overlay once" \
   "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman COMPOSE_FILE=docker-compose.yml:ci.yml; getenforce() { echo Enforcing; }; runtime_export; runtime_export; echo \"\$COMPOSE_FILE\"")" \

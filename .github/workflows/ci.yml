@@ -274,6 +274,8 @@ jobs:
         run: docker compose version && jq --version && yq --version
       - name: compose files are valid with a generated .env
         run: bash .github/ci/unit-tests-compose-files-are-valid-generated.sh
+      - name: mail profile wiring (networks, addresses, mounts, users, caps, pins; contract §19.1)
+        run: bash .github/ci/unit-tests-mail-wiring.sh
 
       - name: every image is pinned tag@sha256 (all compose files, all profiles, CLI, workflows)
         run: |
@@ -290,13 +292,14 @@ jobs:
             case "$svc" in hub|keycloak) continue ;; esac
             # dns-tool runs the locally built domains image (no build of its own).
             [ "$svc:$img" != dns-tool:portcullis-domains ] || continue
+            [ "$svc:$img" != mail-cert:portcullis-domains ] || continue
             [[ "$img" =~ ^[^@[:space:]]+:[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || { echo "UNPINNED: $svc → $img"; bad=1; }
           done < /tmp/images
-          for df in enroll/Dockerfile group-gate/Dockerfile domains/Dockerfile mcp-gate/Dockerfile wg/Dockerfile forwarder/Dockerfile; do
+          for df in enroll/Dockerfile group-gate/Dockerfile domains/Dockerfile mcp-gate/Dockerfile wg/Dockerfile forwarder/Dockerfile mailctl/Dockerfile; do
             if grep -E '^FROM ' "$df" | grep -v '@sha256:'; then echo "UNPINNED base image in $df"; bad=1; fi
           done
           # One Go builder (tag and digest) for every locally built Go service.
-          GO_DFS="enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile wg/Dockerfile forwarder/Dockerfile"
+          GO_DFS="enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile wg/Dockerfile forwarder/Dockerfile mailctl/Dockerfile"
           # shellcheck disable=SC2086  # a list of paths
           if [ "$(grep -hE '^FROM docker.io/library/golang:' $GO_DFS | awk '{print $2}' | sort -u | wc -l | tr -d ' ')" != 1 ]; then
             # shellcheck disable=SC2086
@@ -367,9 +370,9 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum', 'mcp-gate/go.sum', 'wg/go.sum', 'forwarder/go.sum', 'tests/e2e/vpn-client/go.sum') }}-${{ hashFiles('enroll/**/*.go', 'domains/**/*.go', 'mcp-gate/**/*.go', 'wg/**/*.go', 'forwarder/**/*.go', 'tests/e2e/vpn-client/**/*.go') }}
+          key: go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum', 'mcp-gate/go.sum', 'wg/go.sum', 'forwarder/go.sum', 'mailctl/go.sum', 'tests/e2e/vpn-client/go.sum') }}-${{ hashFiles('enroll/**/*.go', 'domains/**/*.go', 'mcp-gate/**/*.go', 'wg/**/*.go', 'forwarder/**/*.go', 'mailctl/**/*.go', 'tests/e2e/vpn-client/**/*.go') }}
           restore-keys: |
-            go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum', 'mcp-gate/go.sum', 'wg/go.sum', 'forwarder/go.sum', 'tests/e2e/vpn-client/go.sum') }}-
+            go-${{ runner.os }}-${{ env.GO_VERSION }}-${{ hashFiles('enroll/go.sum', 'domains/go.sum', 'mcp-gate/go.sum', 'wg/go.sum', 'forwarder/go.sum', 'mailctl/go.sum', 'tests/e2e/vpn-client/go.sum') }}-
       - name: enroll unit tests
         working-directory: enroll
         env:
@@ -418,6 +421,15 @@ jobs:
           go vet ./...
           test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
           CGO_ENABLED=0 go build -o /dev/null .
+          CGO_ENABLED=1 go test -race ./...
+      - name: mailctl unit tests (config, the Hub API guard, the JMAP envelope, the schema snapshot, spam rules; contract §19)
+        working-directory: mailctl
+        run: |
+          go mod verify
+          go vet ./...
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "FAIL: gofmt"; exit 1; }
+          CGO_ENABLED=0 go build -o /dev/null .
+          test -s internal/stalwart/testdata/schema-v1.1.0.json
           CGO_ENABLED=1 go test -race ./...
       - name: VPN client unit tests (tests/e2e/vpn-client, the e2e jobs' WireGuard client)
         working-directory: tests/e2e/vpn-client
