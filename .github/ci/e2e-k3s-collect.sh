@@ -31,5 +31,21 @@ done
   echo "## top memory"; ps -eo pid,rss,args --sort=-rss | head -n 25
   echo "## node"; K describe node 2>&1 | sed -n '/Conditions:/,/Events:/p'
 } > "$A/node.txt" 2>&1
+# Postgres from inside and from the node: a hang shows as process states /
+# kernel stacks and the socket's accept backlog (no statement, no secret).
+{
+  echo "## uname"; uname -a
+  echo "## dmesg"; sudo dmesg 2>/dev/null | tail -n 80
+  echo "## postgres processes"; ps -eo pid,ppid,stat,wchan:32,etime,args | awk 'NR == 1 || /postgres/' | grep -v awk
+  for p in $(pgrep -f '^postgres' 2>/dev/null; pgrep -x postgres 2>/dev/null); do
+    echo "### $p $(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | cut -c1-120)"
+    sudo cat "/proc/$p/stack" 2>/dev/null; echo "syscall: $(sudo cat "/proc/$p/syscall" 2>/dev/null)"
+    grep -E '^(State|Threads|SigBlk|SigPnd|ShdPnd)' "/proc/$p/status" 2>/dev/null
+  done
+  echo "## unix sockets (backlog)"; sudo ss -xlp 2>/dev/null | grep -i 'PGSQL' 
+  echo "## data dir on the node"; sudo sh -c 'ls -ld /var/lib/portcullis-storage/*postgres-data* /var/lib/portcullis-storage/*postgres-data*/* /var/lib/portcullis-storage/*postgres-data*/*/* 2>&1 | head -20'
+  echo "## in the pod"
+  K -n portcullis exec deploy/postgres -- sh -c 'id; ls -la /var/run/postgresql; start=$(date +%s); pg_isready -t 10 -U keycloak; echo "pg_isready rc=$? after $(( $(date +%s) - start ))s"; start=$(date +%s); timeout 15 psql -U keycloak -d postgres -Atc "select 1" 2>&1; echo "psql rc=$? after $(( $(date +%s) - start ))s"; ps -o pid,stat,args 2>/dev/null || ps' 2>&1
+} > "$A/postgres-node.txt" 2>&1
 sudo journalctl -u k3s --no-pager 2>/dev/null | grep -v 'failed to read memory cgroup\|failed to read memory.max\|failed to read cpu.max' | tail -n 3000 > "$A/k3s.log" || true
 exit 0
