@@ -243,7 +243,12 @@ kube_host_checks() {
       *) _rt_chk ok "k3s ServiceLB on" ;;
     esac
   else
-    _rt_chk warn "not k3s, or its node-args are unreadable: secrets encryption, the bundled ingress and ServiceLB can't be checked"
+    # On k3s the flags must be readable: they hold secrets encryption and the
+    # network policy controller (fail closed); another distribution only warns.
+    case "$ver" in
+      *+k3s*) _rt_chk fail "k3s, but its node-args (k3s.io/node-args) are unreadable: secrets encryption, the network policy controller, the bundled ingress and ServiceLB can't be checked" ;;
+      *) _rt_chk warn "not k3s: secrets encryption, the bundled ingress and ServiceLB can't be checked" ;;
+    esac
   fi
   _kube_apparmor_check "$nodes"
   cfg="$(kube_ctl get --raw "/api/v1/nodes/$(printf '%s' "$nodes" | jq -r '.items[0].metadata.name // "?"' 2>/dev/null)/proxy/configz" 2>/dev/null || true)"
@@ -265,10 +270,13 @@ kube_host_checks() {
         [ -z "${!v:-}" ] || [ "${!v}" = "${a#*:}" ] || _rt_chk fail "$v=${!v} in .env, but the cluster has ${a#*:}"
       done
       band="$(_kube_static_band "$_K_SVC_CIDR")"
-      svcs="$(kube_ctl get services -A -o json 2>/dev/null || echo '{"items":[]}')"
-      _kube_svc_ip_check PORTCULLIS_TRAEFIK_SERVICE_IP "${PORTCULLIS_TRAEFIK_SERVICE_IP:-$(kube_svc_ip "$KUBE_TRAEFIK_SVC_OFFSET" "$_K_SVC_CIDR")}" "$_K_SVC_CIDR" "$band" "$svcs"
-      _kube_svc_ip_check PORTCULLIS_TRAEFIK_VPN_SERVICE_IP "${PORTCULLIS_TRAEFIK_VPN_SERVICE_IP:-$(kube_svc_ip "$KUBE_TRAEFIK_VPN_SVC_OFFSET" "$_K_SVC_CIDR")}" "$_K_SVC_CIDR" "$band" "$svcs"
-      _kube_svc_ip_check PORTCULLIS_WG_EDGE_SERVICE_IP "${PORTCULLIS_WG_EDGE_SERVICE_IP:-$(kube_svc_ip "$KUBE_WG_EDGE_SVC_OFFSET" "$_K_SVC_CIDR")}" "$_K_SVC_CIDR" "$band" "$svcs"
+      if ! svcs="$(kube_ctl get services -A -o json 2>/dev/null)" || ! printf '%s' "$svcs" | jq -e '.items | type == "array"' >/dev/null 2>&1; then
+        _rt_chk fail "can't list Services: the fixed ClusterIPs can't be checked free"
+        svcs=''
+      fi
+      [ -z "$svcs" ] || _kube_svc_ip_check PORTCULLIS_TRAEFIK_SERVICE_IP "${PORTCULLIS_TRAEFIK_SERVICE_IP:-$(kube_svc_ip "$KUBE_TRAEFIK_SVC_OFFSET" "$_K_SVC_CIDR")}" "$_K_SVC_CIDR" "$band" "$svcs"
+      [ -z "$svcs" ] || _kube_svc_ip_check PORTCULLIS_TRAEFIK_VPN_SERVICE_IP "${PORTCULLIS_TRAEFIK_VPN_SERVICE_IP:-$(kube_svc_ip "$KUBE_TRAEFIK_VPN_SVC_OFFSET" "$_K_SVC_CIDR")}" "$_K_SVC_CIDR" "$band" "$svcs"
+      [ -z "$svcs" ] || _kube_svc_ip_check PORTCULLIS_WG_EDGE_SERVICE_IP "${PORTCULLIS_WG_EDGE_SERVICE_IP:-$(kube_svc_ip "$KUBE_WG_EDGE_SVC_OFFSET" "$_K_SVC_CIDR")}" "$_K_SVC_CIDR" "$band" "$svcs"
     fi
   else
     _rt_chk fail "can't read the cluster's networks: $_K_ERR"
@@ -655,7 +663,8 @@ _rtk_up_service() {
 # ── the docker-only helpers' kubernetes forms ──
 
 # _kube_keygen <svc> <uid> — `<svc> keygen` (an age identity, offline) in a
-# one-shot pod of the service's image: no network label, no volume, its uid.
+# one-shot pod of the service's image: no network label, its uid, the key in
+# a memory emptyDir read by exec (never through the container log).
 _kube_keygen() {
   local svc="$1" u="$2" img name ns out rc=0
   kube_images_ready
@@ -664,23 +673,30 @@ _kube_keygen() {
   ns="$(kube_ns)"
   name="keygen-$svc-$(openssl rand -hex 3)"
   # Created, waited for, read, deleted (not `kubectl run -i`: a pod that
-  # never starts must say why — _kube_pod_diag).
+  # never starts must say why — _kube_pod_diag). The key never reaches the
+  # container log (the node's /var/log/pods, any log shipper): keygen writes
+  # it into a memory emptyDir, the pod then idles, and the CLI reads it with
+  # exec cat before deleting the pod.
   N="$name" NS="$ns" IMG="$img" U="$u" S="$svc" jq -n '
     {apiVersion: "v1", kind: "Pod", metadata: {name: env.N, namespace: env.NS, labels: {"portcullis.io/component": "keygen"}},
-     spec: {restartPolicy: "Never", automountServiceAccountToken: false, enableServiceLinks: false,
+     spec: {restartPolicy: "Never", automountServiceAccountToken: false, enableServiceLinks: false, terminationGracePeriodSeconds: 1,
        securityContext: {runAsNonRoot: true, runAsUser: (env.U | tonumber), runAsGroup: (env.U | tonumber), seccompProfile: {type: "RuntimeDefault"}},
-       containers: [{name: "keygen", image: env.IMG, command: [env.S, "keygen"],
+       volumes: [{name: "k", emptyDir: {medium: "Memory", sizeLimit: "1Mi"}}],
+       containers: [{name: "keygen", image: env.IMG,
+         command: ["sh", "-c", "umask 077; \"$0\" keygen > /k/key.tmp && mv /k/key.tmp /k/key && exec sleep 600", env.S],
+         volumeMounts: [{name: "k", mountPath: "/k"}],
          resources: {limits: {memory: "64Mi"}, requests: {memory: "64Mi"}},
          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: ["ALL"]}}}]}}' \
     | kube_ctl create -f - >/dev/null || { warn "the $svc keygen pod was refused (see above)"; return 1; }
-  if ! kube_ctl -n "$ns" wait --for=jsonpath='{.status.phase}'=Succeeded "pod/$name" --timeout="${KUBE_POD_WAIT:-180}s" >/dev/null 2>&1; then
+  if ! kube_ctl -n "$ns" wait --for=condition=Ready "pod/$name" --timeout="${KUBE_POD_WAIT:-180}s" >/dev/null 2>&1; then
     _kube_pod_diag "$name"
     kube_ctl -n "$ns" delete pod "$name" --wait=false >/dev/null 2>&1 || true
     return 1
   fi
-  out="$(kube_ctl -n "$ns" logs "pod/$name" 2>/dev/null)" || rc=$?
+  # Ready = keygen may still be writing: wait (≤ 30 s) for the renamed file.
+  out="$(kube_ctl -n "$ns" exec "$name" -c keygen -- sh -c 'i=0; while [ ! -s /k/key ] && [ "$i" -lt 300 ]; do sleep 0.1; i=$((i + 1)); done; cat /k/key' 2>/dev/null)" || rc=$?
   kube_ctl -n "$ns" delete pod "$name" --wait=false >/dev/null 2>&1 || true
-  [ "$rc" = 0 ] && [ -n "$out" ] || { warn "could not read the $svc keygen pod's output"; return 1; }
+  [ "$rc" = 0 ] && [ -n "$out" ] || { warn "could not read the $svc keygen pod's key"; return 1; }
   printf '%s\n' "$out"
 }
 
@@ -783,7 +799,7 @@ kube_crashing_json() {
 }
 
 kube_status_extra() {
-  local np adm b shadows pub api=false a crash
+  local np adm b shadows pub api=false a crash ck
   np="$(kube_ctl -n "$(kube_apps_ns)" get configmap portcullis-netpol-probe -o json 2>/dev/null | jq -r '.data.proven_at // empty' 2>/dev/null || true)"
   adm=ok
   [ -z "$(kube_bindings_missing)" ] || adm=missing
@@ -795,9 +811,10 @@ kube_status_extra() {
     for a in 6443 10250; do _kube_tcp_open "$pub" "$a" && api=true; done
   fi
   crash="$(kube_crashing_json)"
-  jq -nc --arg np "$np" --arg adm "$adm" --argjson sh "$shadows" --argjson api "$api" --argjson cr "$crash" \
+  ck="$(kube_cluster_check_json)"
+  jq -nc --arg np "$np" --arg adm "$adm" --argjson sh "$shadows" --argjson api "$api" --argjson cr "$crash" --argjson ck "$ck" \
     '{netpol: (if $np == "" then "unproven" else "proven" end), netpol_proven_at: (if $np == "" then null else $np end),
-      admission: $adm, dns_shadows: $sh, kube_api_public: $api, crashing: $cr}'
+      admission: $adm, dns_shadows: $sh, kube_api_public: $api, crashing: $cr, cluster_check: $ck}'
 }
 
 _rtk_kill() { _rtk_exec "$1" -- kill -s "$2" 1; }
@@ -962,6 +979,8 @@ kube_reserved_hosts() {
 #   5. every owner=hub object in the edge namespace is re-judged (server
 #      dry-run replace as the probe identity); one the policies now refuse
 #      is deleted and named.
+# The bindings select the apps namespace (kube_apps_ns) and the edge one by
+# name: bindings.yaml's portcullis-apps / portcullis-edge are rewritten.
 # A ConfigMap is never replaced under a live binding, so the API server's
 # stale-params cache (seen on k3s 1.37 after a key-set change) can't apply.
 kube_admission_params_apply() {
@@ -980,10 +999,12 @@ kube_admission_params_apply() {
   kube_ctl create configmap "portcullis-admission-params-$gen" -n "$pns" --from-file="$tmp/data" --dry-run=client -o json \
     | G="$gen" jq '.metadata.labels = {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/params-generation": env.G}' > "$tmp/params.json" \
     && kube_ctl create -f "$adm/bindings.yaml" --dry-run=client -o json \
-    | G="$gen" NS="$pns" jq -s '{apiVersion: "v1", kind: "List", items: [.[] | (if .kind == "List" then .items[] else . end)
+    | G="$gen" NS="$pns" APPS="$(kube_apps_ns)" EDGE="$KUBE_EDGE_NS" jq -s '{apiVersion: "v1", kind: "List", items: [.[] | (if .kind == "List" then .items[] else . end)
         | .metadata.labels = {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/binding": .metadata.name, "portcullis.io/params-generation": env.G}
         | .metadata.name += "-" + env.G
-        | .spec.paramRef.name = "portcullis-admission-params-" + env.G | .spec.paramRef.namespace = env.NS]}' > "$tmp/bindings.json" \
+        | .spec.paramRef.name = "portcullis-admission-params-" + env.G | .spec.paramRef.namespace = env.NS
+        | .spec.matchResources.namespaceSelector.matchLabels["kubernetes.io/metadata.name"] |=
+            ({"portcullis-apps": env.APPS, "portcullis-edge": env.EDGE}[.] // error("a binding selects namespace \(.), neither portcullis-apps nor portcullis-edge"))]}' > "$tmp/bindings.json" \
     || { rm -rf "$tmp"; fail "could not build the admission params / bindings"; }
   [ "$(jq '.items | length' "$tmp/bindings.json")" = "$(printf '%s\n' $KUBE_BINDINGS | wc -l | tr -d ' ')" ] \
     || { rm -rf "$tmp"; fail "kube/admission/bindings.yaml doesn't hold the $(printf '%s\n' $KUBE_BINDINGS | wc -l | tr -d ' ') bindings KUBE_BINDINGS names"; }
@@ -1604,6 +1625,9 @@ kube_health_report() {
 # kube_cluster_check — the Hub's cluster check input (contract §6): the apps
 # namespace's PSA labels and the six bindings, written as the ConfigMap
 # portcullis-cluster-check (checked_at RFC 3339 UTC, ok true|false, why).
+# The Hub refuses every runtime operation once it is 24 h old: `up` writes
+# it, and so does `kube check`, which the portcullis-kube-check.timer init
+# installs runs every 6 h; status warns past 20 h.
 kube_cluster_check() {
   local ns why="" b psa want
   ns="$(kube_apps_ns)"
@@ -1616,8 +1640,10 @@ kube_cluster_check() {
      metadata: {name: "portcullis-cluster-check", namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis"}},
      data: {checked_at: env.AT, ok: env.OK, why: env.WHY}}' \
     | kube_ctl apply --server-side --force-conflicts --field-manager="$KUBE_FIELD_MANAGER" -f - >/dev/null \
-    || warn "could not write portcullis-cluster-check"
+    || { warn "could not write portcullis-cluster-check"; why="${why:-could not write portcullis-cluster-check}"; }
   [ -z "$why" ] || warn "cluster check: $why"
+  # For `kube check` (exit 1): up only warns, the Hub reads ok / why.
+  _K_CHECK_WHY="$why"
 }
 
 # _rtk_up [service...] — the whole release (a service list is accepted and
@@ -2131,4 +2157,164 @@ _backup_verify_dir_kube() {
     tar -tzf "$f" >/dev/null 2>&1 && ok "$(basename "$f") is a readable archive" || { rc=1; warn "$(basename "$f") is corrupt"; }
   done
   return "$rc"
+}
+
+# ── the cluster check's refresh: `kube check`, its timer, status ──
+
+KUBE_CHECK_WARN_S=72000   # 20 h: status warns
+KUBE_CHECK_MAX_S=86400    # 24 h: the Hub refuses (its guard's clusterCheckMaxAge)
+
+# kube_check_timer_units <dir> — portcullis-kube-check.service / .timer:
+# backup schedule's system-unit pattern (User=, After network-online and
+# k3s.service when this host runs it, Requires it then), every 6 h
+# (Persistent: a host that was off catches up at boot). KUBECONFIG goes
+# along when set (the operator's kubeconfig, never copied).
+kube_check_timer_units() {
+  local out="$1" user after="network-online.target" requires="" env_root="" env_kc=""
+  user="$(id -un)"
+  if systemctl cat k3s.service >/dev/null 2>&1; then after="$after k3s.service" requires="k3s.service"; fi
+  [ "$PORTCULLIS_ROOT" = "$PORTCULLIS_HOME" ] || env_root="Environment=PORTCULLIS_ROOT=$PORTCULLIS_ROOT"
+  [ -z "${KUBECONFIG:-}" ] || env_kc="Environment=KUBECONFIG=$KUBECONFIG"
+  mkdir -p "$out"
+  cat > "$out/portcullis-kube-check.service" <<UNIT
+# portcullis-kube-check.service — generated by ./portcullis init (kubernetes)
+[Unit]
+Description=Portcullis cluster check (the Hub refuses runtime operations once it is 24 h old)
+Wants=network-online.target
+After=$after
+${requires:+Requires=$requires
+}
+[Service]
+Type=oneshot
+User=$user
+WorkingDirectory=$PORTCULLIS_ROOT
+Environment=NO_COLOR=1
+${env_root}
+${env_kc}
+ExecStart=$PORTCULLIS_HOME/portcullis kube check
+TimeoutStartSec=10min
+UNIT
+  cat > "$out/portcullis-kube-check.timer" <<UNIT
+# portcullis-kube-check.timer — generated by ./portcullis init (kubernetes)
+[Unit]
+Description=Portcullis cluster check every 6 hours
+
+[Timer]
+OnCalendar=*-*-* 00/6:00:00
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+
+# kube_check_timer_install — init on kubernetes: the units into
+# /etc/systemd/system (root, else sudo), enabled and started. Without
+# systemd or after a failed install: a warning with the manual steps (status
+# warns at 20 h, the Hub refuses at 24 h: fail closed either way).
+kube_check_timer_install() {
+  local tmp sudo="" kd="$PORTCULLIS_ROOT/secrets/kube/systemd"
+  if ! command -v systemctl >/dev/null 2>&1 || [ ! -d "${KUBE_SYSTEMD_RUN:-/run/systemd/system}" ]; then
+    warn "No systemd: run ./portcullis kube check at least every 20 h (cron); the Hub refuses every runtime operation once the cluster check is 24 h old."
+    return 0
+  fi
+  [ "$(id -u)" = 0 ] || sudo=sudo
+  tmp="$(mktemp -d)"
+  kube_check_timer_units "$tmp"
+  info "Installing portcullis-kube-check.timer (the cluster check every 6 h)..."
+  if $sudo install -m 0644 "$tmp/portcullis-kube-check.service" "$tmp/portcullis-kube-check.timer" /etc/systemd/system/ \
+     && $sudo systemctl daemon-reload && $sudo systemctl enable --now portcullis-kube-check.timer >/dev/null 2>&1; then
+    ok "portcullis-kube-check.timer enabled (systemctl list-timers portcullis-kube-check.timer)"
+  else
+    kube_check_timer_units "$kd"
+    warn "Could not install portcullis-kube-check.timer. As root:"
+    printf '  install -m 0644 %s %s /etc/systemd/system/\n  systemctl daemon-reload && systemctl enable --now portcullis-kube-check.timer\n' \
+      "$(_sq "$kd/portcullis-kube-check.service")" "$(_sq "$kd/portcullis-kube-check.timer")" >&2
+  fi
+  rm -rf "$tmp"
+}
+
+# kube_cluster_check_json — the live portcullis-cluster-check as status
+# reads it: {checked_at, ok, why, age_s}, null when missing or unreadable
+# (KUBE_NOW: a fixed now, for tests).
+kube_cluster_check_json() {
+  local d
+  d="$(kube_ctl -n "$(kube_ns)" get configmap portcullis-cluster-check -o json 2>/dev/null)" || { echo null; return 0; }
+  printf '%s' "$d" | jq -c --argjson now "${KUBE_NOW:-null}" '(.data // {}) | if (.checked_at // "") == "" then null else
+      {checked_at, ok: (.ok == "true"), why: (.why // ""),
+       age_s: ((($now // now) - ((.checked_at | fromdateiso8601)? // 0)) | floor)} end' 2>/dev/null || echo null
+}
+
+# kube_cluster_check_lines <json> — status's line for it; 1 when the Hub
+# refuses (missing, failed, 24 h old), else 0 (a warning from 20 h).
+kube_cluster_check_lines() {
+  local j="$1" ok age why h
+  if [ -z "$j" ] || [ "$j" = null ]; then
+    _st_line fail "kubernetes: no cluster check (ConfigMap portcullis-cluster-check): the Hub refuses every runtime operation; run ./portcullis kube check"
+    return 1
+  fi
+  ok="$(printf '%s' "$j" | jq -r '.ok')"; age="$(printf '%s' "$j" | jq -r '.age_s')"; why="$(printf '%s' "$j" | jq -r '.why')"
+  h=$((age / 3600))
+  if [ "$ok" != true ]; then
+    _st_line fail "kubernetes: the cluster check failed (${why:-no reason}): the Hub refuses every runtime operation; fix it, then ./portcullis kube check"
+    return 1
+  fi
+  if [ "$age" -ge "$KUBE_CHECK_MAX_S" ]; then
+    _st_line fail "kubernetes: the cluster check is $h h old: the Hub refuses every runtime operation past 24 h; run ./portcullis kube check (is portcullis-kube-check.timer running? systemctl list-timers portcullis-kube-check.timer)"
+    return 1
+  fi
+  if [ "$age" -ge "$KUBE_CHECK_WARN_S" ]; then
+    _st_line warn "kubernetes: the cluster check is $h h old: the Hub refuses every runtime operation once it is 24 h old; portcullis-kube-check.timer refreshes it every 6 h (systemctl list-timers portcullis-kube-check.timer), or ./portcullis kube check"
+    return 0
+  fi
+  _st_line ok "kubernetes: cluster check ok ($h h old)"
+}
+
+help_kube() {
+  cat <<'HELP'
+Usage: portcullis kube <subcommand>
+
+  check   Refresh the cluster check the Hub reads (Kubernetes only)
+
+Run 'portcullis kube <subcommand> --help' for details.
+HELP
+}
+
+help_kube_check() {
+  cat <<'HELP'
+Usage: portcullis kube check
+
+Kubernetes only. Re-checks the apps namespace's Pod Security labels and the
+six admission bindings and writes the result into the ConfigMap
+portcullis-cluster-check (checked_at, ok, why), which the Hub reads: it
+refuses every runtime operation while the check failed or is more than 24 h
+old. `up` writes it too; init installs portcullis-kube-check.timer, which
+runs this every 6 h. status warns once the check is 20 h old.
+
+Exit status: 0 the check passed, 1 it failed (the reason is printed and
+recorded for the Hub).
+HELP
+}
+
+cmd_kube() {
+  local sub="${1:-}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    ""|-h|--help|help) help_kube; [ -n "$sub" ] || exit 2; return 0 ;;
+    check) ;;
+    *) usage_error kube "unknown subcommand: $sub" ;;
+  esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) help_kube_check; return 0 ;;
+      *) usage_error "kube check" "unknown argument: $1" ;;
+    esac
+  done
+  need_env
+  _rt_is_kube || { warn "kube check: CONTAINER_RUNTIME is $(runtime_name), not kubernetes"; exit 1; }
+  _K_CHECK_WHY=""
+  kube_cluster_check
+  [ -z "$_K_CHECK_WHY" ] || exit 1
+  ok "cluster check ok (portcullis-cluster-check written)"
 }

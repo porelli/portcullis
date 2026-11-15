@@ -326,6 +326,9 @@ init_run() {
 
   # Traefik has run: pin the CAA (written CA-only above) to its account.
   dns_tighten_main
+  # The Hub refuses every runtime operation once the cluster check is 24 h
+  # old: a timer refreshes it every 6 h.
+  ! _rt_is_kube || kube_check_timer_install
 
   local d="$PORTCULLIS_DOMAIN"
   echo ""

@@ -86,7 +86,7 @@ done
 
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 35 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 35
+expect_eq "help lists 36 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 36
 while IFS= read -r c; do
   # shellcheck disable=SC2086
   run $c --help
@@ -186,6 +186,8 @@ invite 'bad;user'|invalid user name
 invite a --frob|unknown option: --frob
 lldap-ui now|unknown argument: now
 signin reset-core --force|unknown argument: --force
+kube check --now|unknown argument: --now
+kube frob|unknown subcommand: frob
 signin reset-core|no terminal to confirm on: pass --yes
 vpn init extra|unexpected argument: extra
 vpn init --builtin|--builtin needs a value

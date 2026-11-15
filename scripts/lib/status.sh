@@ -257,6 +257,8 @@ status_run() {
     [ "$(printf '%s' "$kx" | jq -r '(.netpol == "proven") and (.admission == "ok")')" = true ] || problems=1
     # A crash-looping or just-restarted Deployment (or an unreadable pod list).
     [ "$(printf '%s' "$kx" | jq -r '.crashing != null and (.crashing | length) == 0')" = true ] || problems=1
+    # The cluster check the Hub reads: missing, failed or 24 h old = it refuses.
+    kube_cluster_check_lines "$(printf '%s' "$kx" | jq -c '.cluster_check')" >/dev/null || problems=1
   else
     # A docker error is a problem too (fail closed), shown as one line.
     shadows="$(proxy_dns_shadows)" || shadows="(docker) the containers on portcullis-proxy can't be inspected"
@@ -408,6 +410,7 @@ status_run() {
         _st_line fail "kubernetes: $cns/$cdep is crashing ($creason, $crest restarts): kubectl -n $cns logs deploy/$cdep --previous"
       done < <(printf '%s' "$kx" | jq -r '.crashing[] | [.namespace, .deployment, .reason, (.restarts | tostring)] | @tsv')
     fi
+    kube_cluster_check_lines "$(printf '%s' "$kx" | jq -c '.cluster_check')" || true
   fi
   _st_dns_lines "$dns_json" "$traefik_uri" "$env_uri"
   if declare -F vpn_status_lines >/dev/null; then vpn_status_lines "$vpn_json"; fi

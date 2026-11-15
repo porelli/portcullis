@@ -1,7 +1,8 @@
 {{- /* The Hub's access (K2, contract §6 "On Kubernetes"): one ServiceAccount
 here, one Role in the apps namespace and one in portcullis-edge (only
-IngressRoutes and Middlewares: the apps' routes, held to owner=hub and the
-Hub's shapes by the portcullis-edge-routes admission policy) —
+IngressRoutes, Middlewares and Services: the apps' routes and their pinned
+ExternalName backends, held to owner=hub and the Hub's shapes by the
+portcullis-edge-routes admission policy) —
 files/hub-role.yaml and files/hub-role-edge.yaml, byte copies of the Hub's
 internal/runtime/kube/testdata/role.yaml and role-edge.yaml, compared in CI; nothing in this
 namespace, nothing cluster-scoped. */ -}}
