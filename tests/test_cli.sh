@@ -1484,14 +1484,19 @@ pki_int/revoke update
 pki_file/revoke update
 pki_int/crl/rotate read
 pki_file/crl/rotate read
+pki_node/sign/node-worker update deny=alt_names,ip_sans,uri_sans,other_sans
+pki_node/sign/node-control update deny=alt_names,ip_sans,uri_sans,other_sans
+pki_node/cert/* read
+pki_node/revoke update
+pki_node/crl/rotate read
 EOF
 )"
-expect_eq "enroll.hcl grants exactly the D21 paths (sign/client-cert, sign/browser-cert, certs list, cert read, revoke, crl/rotate on both mounts) and nothing else" \
+expect_eq "enroll.hcl grants exactly the D21 paths (sign/client-cert, sign/browser-cert, certs list, cert read, revoke, crl/rotate on both mounts) and the pki_node ones (sign node-worker / node-control, cert read, revoke, crl/rotate), nothing else" \
   "$POLICY_GOT" "$POLICY_WANT"
 expect_eq "enroll.hcl has one path block per grant" \
-  "$(grep -c '^[[:space:]]*path[[:space:]]' "$HERE/../vault/policies/enroll.hcl")" 10
+  "$(grep -c '^[[:space:]]*path[[:space:]]' "$HERE/../vault/policies/enroll.hcl")" 15
 expect_eq "enroll.hcl: only capabilities and denied_parameters (no allowed_parameters, no wildcard grants)" \
-  "$(grep -vE '^[[:space:]]*(#|$|path "pki_(int|file)/[a-z/-]+\*?" \{|capabilities = \["(update|list|read)"\]|denied_parameters = \{|"(alt_names|ip_sans|uri_sans|other_sans)" += \[\]|\})' "$HERE/../vault/policies/enroll.hcl")" ""
+  "$(grep -vE '^[[:space:]]*(#|$|path "pki_(int|file|node)/[a-z/-]+\*?" \{|capabilities = \["(update|list|read)"\]|denied_parameters = \{|"(alt_names|ip_sans|uri_sans|other_sans)" += \[\]|\})' "$HERE/../vault/policies/enroll.hcl")" ""
 
 # ── cert list / revoke / enroll over both CAs (stub vault + ykman) ──
 CT_ROOT="$WORK/cert-root"

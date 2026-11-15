@@ -713,12 +713,19 @@ mkpem file "example.test Browser Certificate CA" root
 mkpem file-samecn "example.test Intermediate CA" root
 mkleaf leaf-yk alice int
 mkleaf leaf-br alice file
+# pki_node: its own root (ruling P1); node-root = the flaw (under pki).
+mkpem node "example.test Node CA"
+mkpem node-root "example.test Node CA" root
+mkleaf leaf-node w1.node.portcullis.internal node
+mkleaf leaf-node-root w1.node.portcullis.internal node-root
 # A scripted vault stub: $PKI_STATE selects which PKI pieces "exist":
 #   none (fresh Vault), complete (pki, pki_int, pki_file), nofile (pki_file
 #   missing), norole (client-cert role missing), samecn (pki_file has
 #   pki_int's CN), partial (mounts but no issuers), sealed, intbroken
 #   (exit 1), int403 (403 on pki_int/issuers, exit 2 like the real CLI),
-#   fileerr (sealed answer on pki_file/issuers, exit 2), roleerr (403 on the role).
+#   fileerr (sealed answer on pki_file/issuers, exit 2), roleerr (403 on the role),
+#   nonode (pki_node missing), nodepartial (pki_node without an issuer),
+#   nodeunderroot (pki_node's CA signed by the root: refused).
 mkdir -p "$WORK/pki-bin"
 cat > "$WORK/pki-bin/vault" <<'STUB'
 #!/usr/bin/env bash
@@ -729,8 +736,13 @@ case "$PKI_STATE:$*" in
     case "$PKI_STATE" in
       none) echo '{"secret/":{}}' ;;
       nofile) echo '{"pki/":{},"pki_int/":{}}' ;;
-      *) echo '{"pki/":{},"pki_int/":{},"pki_file/":{}}' ;;
+      nonode) echo '{"pki/":{},"pki_int/":{},"pki_file/":{}}' ;;
+      *) echo '{"pki/":{},"pki_int/":{},"pki_file/":{},"pki_node/":{}}' ;;
     esac ;;
+  nodepartial:list*pki_node/issuers*) echo "No value found at $3" >&2; exit 2 ;;
+  nonode:list*pki_*/issuers*|nodepartial:list*pki_*/issuers*|nodeunderroot:list*pki_*/issuers*) echo '["abc"]' ;;
+  nodeunderroot:read\ -field=certificate\ pki_node/cert/ca) cat "$STUB_DIR/pem/node-root" ;;
+  *:read\ -field=certificate\ pki_node/cert/ca) cat "$STUB_DIR/pem/node" ;;
   complete:list*pki_*/issuers*|norole:list*pki_*/issuers*|samecn:list*pki_*/issuers*) echo '["abc"]' ;;
   nofile:list*pki_int/issuers*) echo '["abc"]' ;;
   intbroken:list*pki_int/issuers*) echo "Error: permission denied" >&2; exit 1 ;;
@@ -950,6 +962,95 @@ expect_ok "pki_setup's refusal names the same CN" grep -q 'same CN' "$WORK/pki-o
 expect_ok "pki_setup's refusal leaves ca-chain.crt alone" cmp -s "$CERTS/ca-chain.crt" "$WORK/chain-before"
 expect_fail "pki_setup's refusal writes no ca-chain-yubikey.crt" test -e "$CERTS/ca-chain-yubikey.crt"
 expect_eq "pki setup (CLI) exits 1 on equal CNs" "$(run_pki samecn --keep)" 1
+
+# ── test_pki_node_ca_not_trusted: pki_node is its own root, in no trust list (ruling P1) ──
+expect_eq "pki_node: fresh install succeeds" "$(run_pki none)" 0
+expect_ok "pki_node: fresh install enables pki_node" grep -qx 'secrets enable -path=pki_node pki' "$STUB_DIR/pki-calls"
+expect_ok "pki_node: its own self-signed root (root/generate on pki_node, 10 y, EC P-256)" \
+  grep -q 'write -format=json pki_node/root/generate/internal common_name=example.test Node CA ttl=87600h key_type=ec key_bits=256' "$STUB_DIR/pki-calls"
+expect_fail "pki_node: never an intermediate, never signed by pki" \
+  grep -Eq 'pki_node/intermediate|pki_node/.*set-signed' "$STUB_DIR/pki-calls"
+expect_eq "pki_node: exactly one root/sign-intermediate per non-node CA (pki_int, pki_file)" \
+  "$(grep -c 'pki/root/sign-intermediate' "$STUB_DIR/pki-calls")" 2
+expect_ok "pki_node: node-worker role (client + server, 30 d, subdomains of node.portcullis.internal)" \
+  grep -q 'write pki_node/roles/node-worker allowed_domains=node.portcullis.internal allow_subdomains=true allow_bare_domains=false .* client_flag=true server_flag=true .* key_type=ec key_bits=256 ttl=720h max_ttl=720h no_store=false not_before_duration=30s' "$STUB_DIR/pki-calls"
+expect_ok "pki_node: node-control role (hub.control, client only, 30 d)" \
+  grep -q 'write pki_node/roles/node-control allowed_domains=hub.control allow_subdomains=false allow_bare_domains=true .* client_flag=true server_flag=false .* ttl=720h max_ttl=720h no_store=false not_before_duration=30s' "$STUB_DIR/pki-calls"
+expect_ok "pki_node: node-link role (link.control, client only, 90 d)" \
+  grep -q 'write pki_node/roles/node-link allowed_domains=link.control allow_subdomains=false allow_bare_domains=true .* client_flag=true server_flag=false .* ttl=2160h max_ttl=2160h no_store=false not_before_duration=30s' "$STUB_DIR/pki-calls"
+expect_eq "pki_node: every node role refuses IP / URI / other SANs and the CSR's names" \
+  "$(grep 'write pki_node/roles/' "$STUB_DIR/pki-calls" | grep -c 'allow_any_name=false allow_localhost=false allow_wildcard_certificates=false enforce_hostnames=true use_csr_common_name=false use_csr_sans=false allow_ip_sans=false allowed_uri_sans= allowed_other_sans=')" 3
+expect_ok "pki_node: CRL auto-rebuild + delta" grep -q 'write pki_node/config/crl .*enable_delta=true' "$STUB_DIR/pki-calls"
+NODE_C="$PKI_ROOT/certs"
+expect_ok "pki_node: certs/node-ca.crt is pki_node's CA" cmp -s "$NODE_C/node-ca.crt" "$STUB_DIR/pem/node"
+NODE_BODY="$(sed -n '2p' "$STUB_DIR/pem/node")"
+for f in ca-chain.crt ca-chain-yubikey.crt yubikey-ca.crt browser-ca.crt root-ca.crt intermediate-ca.crt \
+         truststore/portcullis-ca-chain.pem truststore/portcullis-yubikey-ca.pem truststore/portcullis-browser-ca.pem; do
+  expect_fail "pki_node: node-ca.crt is not in $f" grep -qF "$NODE_BODY" "$NODE_C/$f"
+done
+expect_eq "pki_node: no chain / truststore / group-gate file holds the node CA (whole certs/ tree but node-ca.crt)" \
+  "$(grep -rlF "$NODE_BODY" "$NODE_C" | grep -v '/node-ca.crt$' || true)" ""
+# The handshakes themselves, with Go's semantics (every caFiles certificate
+# an anchor, the client's chain untrusted input): a node-worker leaf sending
+# the node CA fails Traefik's protected, protected-any and authaware
+# options and Keycloak's truststore.
+NODE_SENT="$STUB_DIR/pem/node-sent"; cat "$STUB_DIR/pem/node" > "$NODE_SENT"
+for ca in ca-chain-yubikey.crt ca-chain.crt truststore/portcullis-ca-chain.pem truststore/portcullis-yubikey-ca.pem \
+          truststore/portcullis-browser-ca.pem yubikey-ca.crt browser-ca.crt; do
+  expect_eq "pki_node: a node-worker leaf sending its CA is refused by $ca" \
+    "$(hs "$NODE_C/$ca" "$NODE_SENT" "$STUB_DIR/pem/leaf-node")" refused
+  expect_eq "pki_node: a node-worker leaf sent alone is refused by $ca" \
+    "$(hs "$NODE_C/$ca" "" "$STUB_DIR/pem/leaf-node")" refused
+done
+expect_eq "pki_node: the node leaf is valid under node-ca.crt (control)" \
+  "$(hs "$NODE_C/node-ca.crt" "" "$STUB_DIR/pem/leaf-node")" accepted
+# The check catches the flaw ruling P1 removed: a node CA under the root
+# would pass Traefik's protected-any / authaware.
+cat "$STUB_DIR/pem/node-root" "$STUB_DIR/pem/root" > "$STUB_DIR/pem/node-root-sent"
+expect_eq "pki_node: the handshake check detects a node CA under the root (ca-chain.crt would accept it)" \
+  "$(hs "$NODE_C/ca-chain.crt" "$STUB_DIR/pem/node-root-sent" "$STUB_DIR/pem/leaf-node-root")" accepted
+# pki setup refuses such a pki_node and exports nothing of it.
+rm -f "$NODE_C/node-ca.crt"
+expect_eq "pki_node: pki setup refuses a pki_node signed by the root" "$(run_pki nodeunderroot --keep)" 1
+expect_ok "pki_node: the refusal says why" grep -q 'not its own self-signed root' "$WORK/pki-out"
+expect_fail "pki_node: the refusal writes no node-ca.crt" test -e "$NODE_C/node-ca.crt"
+# Re-runs: present = roles only; missing = created; partial = wiped + redone.
+expect_eq "pki_node: complete PKI" "$(run_pki complete --keep)" 0
+expect_fail "pki_node: complete PKI creates no node CA" grep -Eq 'pki_node/root/generate|secrets (enable|disable) .*pki_node' "$STUB_DIR/pki-calls"
+expect_ok "pki_node: complete PKI rewrites the node roles" grep -q 'write pki_node/roles/node-worker' "$STUB_DIR/pki-calls"
+rm -f "$NODE_C/node-ca.crt"
+expect_eq "pki_node: missing pki_node next to the other CAs" "$(run_pki nonode --keep)" 0
+expect_ok "pki_node: missing pki_node is created" grep -qx 'secrets enable -path=pki_node pki' "$STUB_DIR/pki-calls"
+expect_fail "pki_node: creating pki_node touches no other CA" grep -Eq 'secrets disable|pki(_int|_file)?/(root|intermediate)/generate' "$STUB_DIR/pki-calls"
+expect_eq "pki_node: missing pki_node but node-ca.crt on disk is refused" "$(run_pki nonode --keep)" 1
+expect_ok "pki_node: that refusal names node-ca.crt" grep -q 'node-ca.crt exists' "$WORK/pki-out"
+expect_fail "pki_node: that refusal creates nothing" grep -Eq 'secrets enable|generate' "$STUB_DIR/pki-calls"
+rm -f "$NODE_C/node-ca.crt"
+expect_eq "pki_node: a partial pki_node (no issuer)" "$(run_pki nodepartial --keep)" 0
+expect_ok "pki_node: a partial pki_node is wiped first" grep -qx 'secrets disable pki_node' "$STUB_DIR/pki-calls"
+expect_ok "pki_node: then created" grep -q 'pki_node/root/generate/internal' "$STUB_DIR/pki-calls"
+expect_eq "pki_node: --force over a complete PKI" "$(run_pki complete --keep --force)" 0
+expect_ok "pki_node: --force destroys pki_node" grep -qx 'secrets disable pki_node' "$STUB_DIR/pki-calls"
+expect_ok "pki_node: --force makes a new node root" grep -q 'pki_node/root/generate/internal' "$STUB_DIR/pki-calls"
+
+# ── test_enroll_policy_node_paths: enroll may sign node-worker / node-control only ──
+NODE_POLICY="$(awk '
+  function flush() { if (p != "") print p " " c (d != "" ? " deny=" d : ""); p = ""; c = ""; d = "" }
+  /^[[:space:]]*path[[:space:]]+"/ { flush(); p = $2; gsub(/"/, "", p); ind = 0; next }
+  /capabilities/ { c = $0; sub(/.*\[/, "", c); sub(/\].*/, "", c); gsub(/[" ]/, "", c); next }
+  /denied_parameters/ { ind = 1; next }
+  ind && /=[[:space:]]*\[\]/ { k = $1; gsub(/"/, "", k); d = (d == "" ? k : d "," k); next }
+  ind && /^[[:space:]]*}/ { ind = 0; next }
+  END { flush() }
+' "$HERE/../vault/policies/enroll.hcl" | grep '^pki_node/' | sort)"
+NODE_POLICY_WANT="$(printf '%s\n' \
+  'pki_node/sign/node-worker update deny=alt_names,ip_sans,uri_sans,other_sans' \
+  'pki_node/sign/node-control update deny=alt_names,ip_sans,uri_sans,other_sans' \
+  'pki_node/cert/* read' 'pki_node/revoke update' 'pki_node/crl/rotate read' | sort)"
+expect_eq "enroll.hcl: the pki_node paths are exactly sign node-worker / node-control (no SANs), cert read, revoke, crl/rotate" \
+  "$NODE_POLICY" "$NODE_POLICY_WANT"
+expect_fail "enroll.hcl: never node-link, issue, roles, root or a pki_node wildcard" \
+  grep -Eq 'path "pki_node/(sign/node-link|issue|roles|root|sign-verbatim|intermediate|config|\*|sign/\*)' "$HERE/../vault/policies/enroll.hcl"
 
 # ══ portcullis cert sync (dispatch through the CLI) ════════
 mkdir -p "$PKI_ROOT/certs/revocation"

@@ -796,6 +796,20 @@ jobs:
             denied write pki_file/sign/browser-cert csr=not-a-csr common_name=ci-policy-check "$san"
             denied write pki_int/sign/client-cert csr=not-a-csr common_name=ci-policy-check "$san"
           done
+          # pki_node (contract §17): sign node-worker / node-control, cert read,
+          # revoke, crl/rotate; never node-link, issue, roles or SANs.
+          allowed write pki_node/sign/node-worker csr=not-a-csr common_name=ci.node.portcullis.internal
+          allowed write pki_node/sign/node-control csr=not-a-csr common_name=hub.control
+          allowed read pki_node/cert/ca
+          allowed write pki_node/revoke serial_number=00:00:00:00
+          allowed read -format=json pki_node/crl/rotate
+          denied write pki_node/sign/node-link csr=not-a-csr common_name=link.control
+          denied write pki_node/issue/node-worker common_name=ci.node.portcullis.internal
+          denied write pki_node/roles/node-worker max_ttl=87600h
+          denied write -f pki_node/root/generate/internal common_name=x
+          for san in alt_names=evil.example ip_sans=10.0.0.1 uri_sans=spiffe://evil other_sans="1.2.3.4;UTF8:evil"; do
+            denied write pki_node/sign/node-worker csr=not-a-csr common_name=ci.node.portcullis.internal "$san"
+          done
           denied read sys/auth
           denied read sys/mounts
           denied policy write evil -
@@ -1215,6 +1229,9 @@ jobs:
 
       - name: Test Keycloak X.509 login - via Traefik works, a forged cert header does not
         run: bash .github/ci/build-and-test-keycloak-x-509-login-traefik.sh
+
+      - name: Test a node certificate (pki_node) passes no TLS tier and no Keycloak X.509
+        run: bash .github/ci/build-and-test-node-ca-untrusted.sh
 
       - name: Test client-cert headers cannot be spoofed and path rules see X-Forwarded-Uri
         run: |

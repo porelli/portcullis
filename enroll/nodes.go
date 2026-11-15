@@ -1,0 +1,232 @@
+package main
+
+// Node certificates for multiple servers (contract §17), on the Hub's
+// internal listener (:8444, the invite bearer; never the loopback one):
+//
+//	POST /internal/nodes/sign   {"role","common_name","csr"}
+//	     → 201 {"certificate","serial","not_after","ca"}
+//	POST /internal/nodes/revoke {"serial"} → 204
+//
+// pki_node is its own self-signed root (ruling P1), never under pki: no
+// Traefik, Keycloak or group-gate trust list holds it, so a node
+// certificate can't sign anyone in. Only the node-worker
+// (<server id>.node.portcullis.internal) and node-control (hub.control)
+// roles are signed here; node-link is signed by the CLI with the root
+// token, never by enroll (its policy has no path for it either). The CSR
+// must be one P-256 request naming exactly that CN and nothing else
+// (no SANs of any kind); Vault takes the CN from common_name only
+// (use_csr_common_name=false, use_csr_sans=false). CSRs and certificates
+// never reach a log.
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/x509"
+	"encoding/asn1"
+	"encoding/pem"
+	"fmt"
+	"log"
+	"net/http"
+	"regexp"
+	"strings"
+	"time"
+
+	vault "github.com/hashicorp/vault/api"
+)
+
+const (
+	mountNode       = "pki_node"
+	roleNodeWorker  = "node-worker"
+	roleNodeControl = "node-control"
+	// nodeTTL is both roles' lifetime (30 d; the Hub renews at ⅓ left).
+	nodeTTL = "720h"
+	// NodeDomain names workers: <server id>.node.portcullis.internal.
+	nodeDomain = "node.portcullis.internal"
+	// controlCN is the Hub's control certificate.
+	controlCN = "hub.control"
+)
+
+// nodeWorkerCNRe: the server id grammar (the Hub's servers.IDRe) under
+// nodeDomain. "primary" is reserved (the local engine).
+var nodeWorkerCNRe = regexp.MustCompile(`^([a-z][a-z0-9-]{0,30})\.node\.portcullis\.internal$`)
+
+// nodeCertResult is a signed node certificate and the pki_node CA.
+type nodeCertResult struct {
+	PEM      string
+	Serial   string
+	NotAfter time.Time
+	CA       string
+}
+
+// checkNodeRequest refuses (before Vault) a role other than node-worker /
+// node-control, a CN outside the role's pattern, and any CSR but one
+// signed P-256 request whose subject is exactly that CN with no SANs.
+func checkNodeRequest(role, cn, csrPEM string) error {
+	switch role {
+	case roleNodeWorker:
+		m := nodeWorkerCNRe.FindStringSubmatch(cn)
+		if m == nil || m[1] == "primary" {
+			return refuse(400, "common_name must be <server id>.%s", nodeDomain)
+		}
+	case roleNodeControl:
+		if cn != controlCN {
+			return refuse(400, "common_name must be %s", controlCN)
+		}
+	default:
+		return refuse(403, "only the node-worker and node-control roles are signed here")
+	}
+	b, rest := pem.Decode([]byte(csrPEM))
+	if b == nil || b.Type != "CERTIFICATE REQUEST" || strings.TrimSpace(string(rest)) != "" {
+		return refuse(400, "csr must be one PEM CERTIFICATE REQUEST block")
+	}
+	csr, err := x509.ParseCertificateRequest(b.Bytes)
+	if err != nil || csr.CheckSignature() != nil {
+		return refuse(400, "csr must be one PEM CERTIFICATE REQUEST block")
+	}
+	if pk, ok := csr.PublicKey.(*ecdsa.PublicKey); !ok || pk.Curve != elliptic.P256() {
+		return refuse(400, "the csr's key must be ECDSA P-256")
+	}
+	if csr.Subject.CommonName != cn || len(csr.Subject.Names) != 1 {
+		return refuse(400, "the csr's subject must be exactly CN=%s", cn)
+	}
+	if len(csr.DNSNames)+len(csr.IPAddresses)+len(csr.EmailAddresses)+len(csr.URIs) != 0 {
+		return refuse(400, "the csr must carry no alternative names")
+	}
+	for _, e := range csr.Extensions {
+		if e.Id.Equal(oidSAN) {
+			return refuse(400, "the csr must carry no alternative names")
+		}
+	}
+	return nil
+}
+
+var oidSAN = asn1.ObjectIdentifier{2, 5, 29, 17}
+
+// signNodeCert signs csrPEM on pki_node/sign/<role> for cn. The answer is
+// checked: CN, the CSR's key, issued by pki_node's own CA.
+func (cfg *Config) signNodeCert(ctx context.Context, role, cn, csrPEM string) (*nodeCertResult, error) {
+	if err := checkNodeRequest(role, cn, csrPEM); err != nil {
+		return nil, err
+	}
+	ca, err := cfg.caCert(ctx, mountNode)
+	if err != nil {
+		return nil, err
+	}
+	signed, err := cfg.signOn(ctx, mountNode, role, cn, csrPEM, nodeTTL)
+	if err != nil {
+		return nil, err
+	}
+	if !issuedBy(signed.Leaf, ca) {
+		return nil, fmt.Errorf("vault sign on %s: the certificate isn't issued by pki_node's CA", mountNode)
+	}
+	log.Printf("node certificate %s for %s (%s)", signed.Serial, cn, role)
+	return &nodeCertResult{
+		PEM:      string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: signed.Leaf.Raw})),
+		Serial:   signed.Serial,
+		NotAfter: signed.Leaf.NotAfter.UTC(),
+		CA:       string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Raw})),
+	}, nil
+}
+
+// revokeNodeCert revokes serial on pki_node (unknown: 404; already
+// revoked: nil), then rotates pki_node's CRL (a failure is only logged).
+func (cfg *Config) revokeNodeCert(ctx context.Context, serial string) error {
+	s := strings.ToLower(strings.TrimSpace(serial))
+	notFound := refuse(404, "no such certificate")
+	if !serialRe.MatchString(s) {
+		return notFound
+	}
+	ic, err := cfg.lookupIssued(ctx, mountNode, s)
+	if err != nil {
+		return err
+	}
+	if ic == nil {
+		return notFound
+	}
+	if ic.Revoked {
+		log.Printf("node certificate %s: already revoked", s)
+		return nil
+	}
+	err = cfg.vault.do(func(vc *vault.Client) error {
+		_, err := vc.Logical().WriteWithContext(ctx, mountNode+"/revoke", map[string]interface{}{"serial_number": s})
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("revoke %s on %s: %w", s, mountNode, err)
+	}
+	log.Printf("revoked node certificate %s", s)
+	err = cfg.vault.do(func(vc *vault.Client) error {
+		_, err := vc.Logical().ReadWithContext(ctx, mountNode+"/crl/rotate")
+		return err
+	})
+	if err != nil {
+		log.Printf("WARNING: %s/crl/rotate after revoking %s failed: %v", mountNode, s, err)
+	}
+	return nil
+}
+
+// POST /internal/nodes/sign
+func (s *inviteService) handleNodeSign(w http.ResponseWriter, r *http.Request) {
+	if !s.apiAuthorized(w, r) {
+		return
+	}
+	op := s.signNode
+	if op == nil {
+		jsonError(w, http.StatusServiceUnavailable, "node certificates unavailable")
+		return
+	}
+	var req struct {
+		Role       string `json:"role"`
+		CommonName string `json:"common_name"`
+		CSR        string `json:"csr"`
+	}
+	if !decodeAction(w, r, &req) {
+		return
+	}
+	// Refused before Vault (and before op), with the request's own text.
+	if err := checkNodeRequest(req.Role, req.CommonName, req.CSR); err != nil {
+		actionFailed(w, "node sign", "a node", err)
+		return
+	}
+	res, err := withDeadline(r.Context(), func(ctx context.Context) (*nodeCertResult, error) {
+		return op(ctx, req.Role, req.CommonName, req.CSR)
+	}, nil)
+	if err != nil {
+		actionFailed(w, "node sign", req.CommonName, err)
+		return
+	}
+	writeCreated(w, struct {
+		Certificate string `json:"certificate"`
+		Serial      string `json:"serial"`
+		NotAfter    string `json:"not_after"`
+		CA          string `json:"ca"`
+	}{res.PEM, res.Serial, res.NotAfter.UTC().Format(time.RFC3339), res.CA})
+}
+
+// POST /internal/nodes/revoke
+func (s *inviteService) handleNodeRevoke(w http.ResponseWriter, r *http.Request) {
+	if !s.apiAuthorized(w, r) {
+		return
+	}
+	op := s.revokeNode
+	if op == nil {
+		jsonError(w, http.StatusServiceUnavailable, "node revocation unavailable")
+		return
+	}
+	var req struct {
+		Serial string `json:"serial"`
+	}
+	if !decodeAction(w, r, &req) {
+		return
+	}
+	_, err := withDeadline(r.Context(), func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, op(ctx, req.Serial)
+	}, nil)
+	if err != nil {
+		actionFailed(w, "node revoke", "a node", err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
