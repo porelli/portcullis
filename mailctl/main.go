@@ -173,10 +173,7 @@ func serve(env func(string) string, stderr io.Writer) error {
 			}
 			m.SetChecks(vals)
 		}}
-	mc.CertOK = func() (bool, bool) {
-		c, ok := ck.Last("cert")
-		return ok && c.Severity == checks.OK, ok
-	}
+	mc.CertOK = ck.CertState
 	v1 := &api.V1{Store: st, C: sw, Runner: runner, LANOnly: cfg.LANOnly, Rewritten: rewritten, Logf: logger.Printf, M: mc, Checks: ck}
 	apiSrv := &api.Server{Subnet: cfg.APISubnet, SecretFile: cfg.HubSecretFile, Logf: logger.Printf, Handler: v1.Handler()}
 	servers := []*http.Server{

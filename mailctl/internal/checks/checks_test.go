@@ -474,21 +474,170 @@ func TestReportsProblemNoPolicyChange(t *testing.T) {
 func TestDANESwitch(t *testing.T) {
 	e := newEnv(t)
 	id := e.f.Put("MtaTlsStrategy", "", map[string]any{"name": "default", "dane": "optional"})
-	e.dns[loc+"|dnssec.works|A"] = func(m *dns.Msg) { m.AuthenticatedData = true; rr("dnssec.works. 300 IN A 5.45.107.88")(m) }
-	e.dns[loc+"|fail01.dnssec.works|A"] = func(m *dns.Msg) { m.Rcode = dns.RcodeServerFailure }
-	if c := dane(context.Background(), e.d); c.Severity != OK || e.f.Get("MtaTlsStrategy", "", id)["dane"] != "optional" {
+	daneOf := func() any { return e.f.Get("MtaTlsStrategy", "", id)["dane"] }
+	valid := func() {
+		e.dns[loc+"||DNSKEY"] = func(m *dns.Msg) { m.AuthenticatedData = true; rr(". 300 IN DNSKEY 257 3 8 AwEAAa==")(m) }
+		e.dns[loc+"|fail01.dnssec.works|A"] = func(m *dns.Msg) { m.Rcode = dns.RcodeServerFailure }
+	}
+	invalid := func() {
+		e.dns[loc+"||DNSKEY"] = rr(". 300 IN DNSKEY 257 3 8 AwEAAa==")
+		e.dns[loc+"|fail01.dnssec.works|A"] = rr("fail01.dnssec.works. 300 IN A 192.0.2.1")
+	}
+	valid()
+	if c := dane(context.Background(), e.d); c.Severity != OK || daneOf() != "optional" {
 		t.Fatalf("validating %+v", c)
 	}
-	// No AD bit: DANE off, then on again once it validates.
-	e.dns[loc+"|dnssec.works|A"] = rr("dnssec.works. 300 IN A 5.45.107.88")
-	c := dane(context.Background(), e.d)
-	if c.Severity != Info || c.Detail != "DANE is off: the resolver can't validate DNSSEC" || e.f.Get("MtaTlsStrategy", "", id)["dane"] != "disable" {
-		t.Fatalf("not validating %+v %v", c, e.f.Get("MtaTlsStrategy", "", id))
+	// Unknown shapes change nothing: SERVFAIL on the good probe, a
+	// timeout, AD on the good probe but the broken one answering.
+	for name, set := range map[string]func(){
+		"servfail on good": func() {
+			e.dns[loc+"||DNSKEY"] = func(m *dns.Msg) { m.Rcode = dns.RcodeServerFailure }
+		},
+		"timeout": func() {
+			delete(e.dns, loc+"||DNSKEY")
+			e.d.DNS = func(context.Context, string, string, uint16, bool) (*dns.Msg, error) {
+				return nil, errors.New("i/o timeout")
+			}
+		},
+		"mixed": func() {
+			e.dns[loc+"||DNSKEY"] = func(m *dns.Msg) { m.AuthenticatedData = true }
+			e.dns[loc+"|fail01.dnssec.works|A"] = rr("fail01.dnssec.works. 300 IN A 192.0.2.1")
+		},
+	} {
+		e.d.DNS = e.dns.q
+		set()
+		for i := 0; i < 5; i++ {
+			e.now = e.now.Add(time.Hour)
+			if c := dane(context.Background(), e.d); c.Severity != Info || daneOf() != "optional" {
+				t.Fatalf("%s: %+v %v", name, c, daneOf())
+			}
+		}
+		e.d.DNS = e.dns.q
 	}
-	e.dns[loc+"|dnssec.works|A"] = func(m *dns.Msg) { m.AuthenticatedData = true; rr("dnssec.works. 300 IN A 5.45.107.88")(m) }
+	// Definite not-validating: off only after 3 in a row over ≥ 30 min.
+	invalid()
+	e.now = t0.Add(48 * time.Hour)
+	for i := 0; i < 3; i++ {
+		c := dane(context.Background(), e.d)
+		if c.Severity != Warning || daneOf() != "optional" {
+			t.Fatalf("invalid #%d (within 30 min): %+v", i+1, c)
+		}
+		e.now = e.now.Add(10 * time.Minute)
+	}
+	c := dane(context.Background(), e.d) // the 4th, 30 min after the first
+	if c.Severity != Problem || c.Detail != "DANE is off: the resolver can't validate DNSSEC" || daneOf() != "disable" {
+		t.Fatalf("off: %+v %v", c, daneOf())
+	}
+	// Still a Problem while off; an unknown result keeps it off.
+	e.d.DNS = func(context.Context, string, string, uint16, bool) (*dns.Msg, error) {
+		return nil, errors.New("timeout")
+	}
+	if c := dane(context.Background(), e.d); c.Severity != Problem || daneOf() != "disable" {
+		t.Fatalf("unknown while off: %+v", c)
+	}
+	e.d.DNS = e.dns.q
+	// The first definite validating verdict switches it back on.
+	valid()
+	if c := dane(context.Background(), e.d); c.Severity != OK || daneOf() != "optional" {
+		t.Fatalf("back on: %+v %v", c, daneOf())
+	}
+	// A valid verdict resets the streak.
+	invalid()
+	e.now = e.now.Add(time.Hour)
 	dane(context.Background(), e.d)
-	if e.f.Get("MtaTlsStrategy", "", id)["dane"] != "optional" {
-		t.Fatal("DANE not switched back on")
+	e.now = e.now.Add(time.Hour)
+	if c := dane(context.Background(), e.d); daneOf() != "optional" || c.Severity != Warning {
+		t.Fatalf("streak not reset: %+v", c)
+	}
+}
+
+// Security ruling: a cert failure from a timeout, a cancelled request or
+// an unreachable listener is unknown and never moves MTA-STS back; one
+// definite failure doesn't either; two definite failures ≥ 15 min apart do.
+func TestCertStateConfirmed(t *testing.T) {
+	e := newEnv(t)
+	r := &Runner{D: e.d}
+	// Unreachable listeners (the default dial stub): unknown.
+	res := r.Get(context.Background(), false)
+	c := find(t, res.Checks, "cert")
+	if c.Severity != Info || !strings.Contains(c.Detail, "couldn't be checked") {
+		t.Fatalf("unreachable %+v", c)
+	}
+	if ok, known := r.CertState(); ok || known {
+		t.Fatal("unknown reported as known")
+	}
+	// A cancelled request: the run doesn't inherit the cancellation.
+	cert, _ := selfSigned(t, "mail.example.com", t0.Add(60*24*time.Hour))
+	withListeners(t, e, cert)
+	r.D = e.d
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	e.now = e.now.Add(2 * time.Minute)
+	res = r.Get(ctx, true)
+	if c := find(t, res.Checks, "cert"); c.Severity != OK {
+		t.Fatalf("cancelled request %+v", c)
+	}
+	if ok, known := r.CertState(); !ok || !known {
+		t.Fatal("pass not known")
+	}
+	// A definite failure (another name): once → no downgrade.
+	bad, _ := selfSigned(t, "other.example.com", t0.Add(60*24*time.Hour))
+	withListeners(t, e, bad)
+	r.D = e.d
+	e.now = e.now.Add(2 * time.Minute)
+	r.Get(context.Background(), true)
+	if ok, known := r.CertState(); ok || known {
+		t.Fatal("one failure confirmed")
+	}
+	// Again 10 min later: still not 15 min apart.
+	e.now = e.now.Add(10 * time.Minute)
+	r.Get(context.Background(), true)
+	if _, known := r.CertState(); known {
+		t.Fatal("confirmed before 15 min")
+	}
+	// An unknown in between keeps the streak; a failure 15 min after the
+	// first confirms it.
+	keep := r.D.Dial
+	r.D.Dial = func(context.Context, string, string) (net.Conn, error) { return nil, errors.New("i/o timeout") }
+	e.now = e.now.Add(2 * time.Minute)
+	r.Get(context.Background(), true)
+	if _, known := r.CertState(); known {
+		t.Fatal("an unknown result confirmed a failure")
+	}
+	r.D.Dial = keep
+	e.now = e.now.Add(3 * time.Minute)
+	r.Get(context.Background(), true)
+	if ok, known := r.CertState(); ok || !known {
+		t.Fatal("two definite failures ≥ 15 min apart not confirmed")
+	}
+	// The MTA-STS machine: enforce → testing only now.
+	if c := find(t, r.last.Checks, "cert"); c.Severity != Problem {
+		t.Fatalf("no Problem %+v", c)
+	}
+}
+
+// The machine side: unknown or unconfirmed cert state never moves enforce
+// back; the confirmed one does.
+func TestCertDowngradeOnlyConfirmed(t *testing.T) {
+	e := newEnv(t)
+	e.m.Step(context.Background())
+	e.now = t0.Add(8 * 24 * time.Hour)
+	if err := e.m.MTASTSEnforce(context.Background(), "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	for _, st := range [][2]bool{{false, false}, {false, false}} {
+		e.m.CertOK = func() (bool, bool) { return st[0], st[1] }
+		e.now = e.now.Add(time.Hour)
+		e.m.Step(context.Background())
+		if s, _ := e.m.Status(context.Background(), true, ""); s.MTASTS[0].Mode != "enforce" {
+			t.Fatalf("downgraded on %v", st)
+		}
+	}
+	e.m.CertOK = func() (bool, bool) { return false, true }
+	e.now = e.now.Add(time.Hour)
+	e.m.Step(context.Background())
+	if s, _ := e.m.Status(context.Background(), true, ""); s.MTASTS[0].Mode != "testing" {
+		t.Fatalf("confirmed failure didn't downgrade: %+v", s.MTASTS)
 	}
 }
 

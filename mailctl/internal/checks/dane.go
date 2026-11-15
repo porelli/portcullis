@@ -3,16 +3,53 @@ package checks
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"time"
 
 	"github.com/miekg/dns"
+
+	"github.com/portcullis/mailctl/internal/state"
 )
 
-// DANE probe names: a signed name (AD expected) and a deliberately broken
-// one (SERVFAIL expected).
+// DANE probes (security ruling): the good probe is the root DNSKEY with
+// DO through mail-resolver (AD expected; no third party involved); a
+// deliberately broken third-party name is only the control (SERVFAIL
+// expected).
 const (
-	DANESigned = "dnssec.works"
+	DANEGood   = "."
 	DANEBroken = "fail01.dnssec.works"
 )
+
+// Switching DANE off needs DANEOffAfter consecutive definite
+// not-validating verdicts spanning at least DANEOffSpan.
+const (
+	DANEOffAfter = 3
+	DANEOffSpan  = 30 * time.Minute
+)
+
+const extDANE = "dane_streak"
+
+// daneStreak is the run of definite not-validating verdicts.
+type daneStreak struct {
+	First *time.Time `json:"first"`
+	Count int        `json:"count"`
+}
+
+// verdict: "valid", "invalid" (a definite not-validating answer) or
+// "unknown" (anything else: errors, timeouts, other rcodes, SERVFAIL on
+// the good probe).
+func verdict(good, broken *dns.Msg) string {
+	switch {
+	case good == nil || broken == nil:
+		return "unknown"
+	case good.Rcode == dns.RcodeSuccess && good.AuthenticatedData && broken.Rcode == dns.RcodeServerFailure:
+		return "valid"
+	case good.Rcode == dns.RcodeSuccess && !good.AuthenticatedData && broken.Rcode == dns.RcodeSuccess:
+		// The resolver answers both and validates neither.
+		return "invalid"
+	}
+	return "unknown"
+}
 
 // clientIP: rewritten client addresses (rootless Podman) → Warning.
 func clientIP(d Deps) Check {
@@ -25,35 +62,85 @@ func clientIP(d Deps) Check {
 	return c
 }
 
-// dane: mail-resolver validates DNSSEC (a signed name answers with AD, a
-// broken one with SERVFAIL). When it can't, outbound DANE is switched off
-// (every MtaTlsStrategy dane: disable; MTA-STS and STARTTLS still apply),
-// and on again once the check passes. A failed probe changes nothing.
+// dane: mail-resolver validates DNSSEC. Only definite verdicts act: the
+// first valid one switches DANE on (every MtaTlsStrategy dane: optional);
+// DANEOffAfter consecutive invalid ones over DANEOffSpan switch it off
+// (MTA-STS and STARTTLS still apply); an unknown result changes nothing.
+// While DANE is off the check is a Problem (mail_dane_off).
 func dane(ctx context.Context, d Deps) Check {
-	c := Check{ID: "dane", Severity: OK, Detail: "mail-resolver validates DNSSEC: outbound DANE is on"}
-	good, err := askRetry(ctx, d, DANESigned)
-	if err != nil {
-		c.Severity, c.Detail = Info, "mail-resolver couldn't be asked: DANE left as it was"
+	c := Check{ID: "dane"}
+	good, gerr := askRetry(ctx, d, DANEGood, dns.TypeDNSKEY)
+	broken, berr := askRetry(ctx, d, DANEBroken, dns.TypeA)
+	if gerr != nil || berr != nil {
+		good, broken = nil, nil
+	}
+	v := verdict(good, broken)
+	now := d.now()
+	var st daneStreak
+	_ = json.Unmarshal(d.Store.Get().Ext[extDANE], &st)
+	switch v {
+	case "valid":
+		st = daneStreak{}
+		if err := setDANE(ctx, d, "optional"); err != nil {
+			c.Severity, c.Detail = Warning, "mail-resolver validates DNSSEC, but switching DANE on failed: "+err.Error()
+		}
+	case "invalid":
+		if st.First == nil {
+			t := now
+			st.First = &t
+		}
+		st.Count++
+		if st.Count >= DANEOffAfter && now.Sub(*st.First) >= DANEOffSpan {
+			if err := setDANE(ctx, d, "disable"); err != nil {
+				c.Severity, c.Detail = Warning, "switching DANE off failed: "+err.Error()
+			}
+		}
+	}
+	_ = d.Store.Update(func(s *state.Persistent) error {
+		b, _ := json.Marshal(st)
+		s.Ext[extDANE] = b
+		return nil
+	})
+	if c.Severity != "" {
 		return c
 	}
-	broken, err := askRetry(ctx, d, DANEBroken)
-	if err != nil {
-		c.Severity, c.Detail = Info, "mail-resolver couldn't be asked: DANE left as it was"
-		return c
-	}
-	validates := good.Rcode == dns.RcodeSuccess && good.AuthenticatedData && broken.Rcode == dns.RcodeServerFailure
-	want := "optional"
-	if !validates {
-		want = "disable"
-		c.Severity = Info
+	off, err := daneOff(ctx, d)
+	switch {
+	case err != nil:
+		c.Severity, c.Detail = Info, "the DANE setting couldn't be read"
+	case off:
+		c.Severity = Problem
 		c.Detail = "DANE is off: the resolver can't validate DNSSEC"
-		c.Steps = []string{"mail-resolver needs to reach the root servers over UDP and TCP port 53; check the host's firewall."}
-	}
-	if err := setDANE(ctx, d, want); err != nil {
+		c.Steps = []string{"mail-resolver needs to reach the root servers over UDP and TCP port 53; check the host's firewall. DANE switches back on at the first check that validates."}
+	case v == "valid":
+		c.Severity, c.Detail = OK, "mail-resolver validates DNSSEC: outbound DANE is on"
+	case v == "invalid":
 		c.Severity = Warning
-		c.Detail += "; switching DANE failed: " + err.Error()
+		c.Detail = fmt.Sprintf("mail-resolver didn't validate DNSSEC (%d time(s) in a row); DANE stays on until it fails %d times over %s", st.Count, DANEOffAfter, DANEOffSpan)
+	default:
+		c.Severity, c.Detail = Info, "mail-resolver gave no definite answer: DANE left as it was"
 	}
 	return c
+}
+
+// daneOff: Portcullis's strategies have DANE disabled.
+func daneOff(ctx context.Context, d Deps) (bool, error) {
+	ids, err := d.C.Query(ctx, "MtaTlsStrategy", nil)
+	if err != nil || len(ids) == 0 {
+		return false, err
+	}
+	var ss []struct {
+		DANE string `json:"dane"`
+	}
+	if err := d.C.Get(ctx, "MtaTlsStrategy", ids, []string{"dane"}, &ss); err != nil {
+		return false, err
+	}
+	for _, s := range ss {
+		if s.DANE == "disable" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func setDANE(ctx context.Context, d Deps, want string) error {
@@ -94,11 +181,11 @@ func setDANE(ctx context.Context, d Deps, want string) error {
 
 // askRetry: a cold resolver can take longer than one query's timeout on
 // a broken chain; it caches the verdict, so ask up to three times.
-func askRetry(ctx context.Context, d Deps, name string) (*dns.Msg, error) {
+func askRetry(ctx context.Context, d Deps, name string, qtype uint16) (*dns.Msg, error) {
 	var err error
 	for i := 0; i < 3; i++ {
 		var m *dns.Msg
-		if m, err = d.DNS(ctx, d.Cfg.LocalResolver, name, dns.TypeA, true); err == nil {
+		if m, err = d.DNS(ctx, d.Cfg.LocalResolver, name, qtype, true); err == nil {
 			return m, nil
 		}
 		if ctx.Err() != nil {

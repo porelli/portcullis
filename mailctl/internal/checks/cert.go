@@ -82,9 +82,14 @@ func leafAt(ctx context.Context, d Deps, port int, starttls bool) (*x509.Certifi
 
 // certCheck: every TLS listener presents MAIL_HOSTNAME's certificate, not
 // expired (a Warning within 14 days), and with TLSA published its SPKI is
-// one of them.
+// one of them. Only those are definite failures (outcome "fail"); a
+// listener that can't be reached or a handshake / timeout error is
+// "unknown", never a failure (security ruling). It has its own deadline.
 func certCheck(ctx context.Context, d Deps) Check {
-	c := Check{ID: "cert", Severity: OK}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+	defer cancel()
+	c := Check{ID: "cert", Severity: OK, outcome: "pass"}
+	unknown := 0
 	now := d.now()
 	tlsaWant := d.M.TLSAWanted()
 	var notes []string
@@ -97,8 +102,8 @@ func certCheck(ctx context.Context, d Deps) Check {
 	for _, p := range certPorts {
 		leaf, err := leafAt(ctx, d, p.Port, p.StartTLS)
 		if err != nil {
-			raise(Problem)
-			notes = append(notes, fmt.Sprintf("%s (%d): no TLS: %v", p.Name, p.Port, err))
+			unknown++
+			notes = append(notes, fmt.Sprintf("%s (%d) couldn't be checked: %v", p.Name, p.Port, err))
 			continue
 		}
 		if err := leaf.VerifyHostname(d.Cfg.Hostname); err != nil {
@@ -129,6 +134,15 @@ func certCheck(ctx context.Context, d Deps) Check {
 		return c
 	}
 	c.Detail = strings.Join(notes, "; ")
+	switch {
+	case c.Severity == Problem:
+		c.outcome = "fail"
+	case unknown > 0:
+		c.outcome = "unknown"
+		if c.Severity == OK {
+			c.Severity = Info
+		}
+	}
 	c.Steps = []string{"Run ./portcullis mail cert (it renews below 30 days and reloads Stalwart); ./portcullis mail rotate also republishes TLSA."}
 	return c
 }

@@ -38,6 +38,8 @@ type Check struct {
 	Steps    []string `json:"steps"`
 	// Reason: fcrdns_v4 / fcrdns_v6 when not ok, "missing" | "mismatch".
 	Reason string `json:"reason,omitempty"`
+	// outcome: the cert check's "pass" | "fail" (definite) | "unknown".
+	outcome string
 }
 
 // Result is GET /v1/checks.
@@ -124,6 +126,51 @@ type Runner struct {
 	last    *Result
 	lastAt  time.Time
 	lastGen int64 // the document generation the last run saw
+
+	certMu    sync.Mutex
+	certLast  string      // the last cert outcome
+	certFails []time.Time // consecutive definite cert failures
+}
+
+// CertDowngradeGap: MTA-STS enforce → testing needs two consecutive
+// definite cert failures at least this far apart (security ruling).
+const CertDowngradeGap = 15 * time.Minute
+
+// CertState is the certificate check for the MTA-STS machine: ok and
+// known. A definite pass is (true, true). An unknown result, or a failure
+// not yet confirmed (two consecutive definite failures ≥ 15 min apart), is
+// (false, false): it holds testing but never moves enforce back. Only the
+// confirmed failure is (false, true).
+func (r *Runner) CertState() (bool, bool) {
+	r.certMu.Lock()
+	defer r.certMu.Unlock()
+	switch r.certLast {
+	case "pass":
+		return true, true
+	case "fail":
+		n := len(r.certFails)
+		if n >= 2 && r.certFails[n-1].Sub(r.certFails[0]) >= CertDowngradeGap {
+			return false, true
+		}
+	}
+	return false, false
+}
+
+func (r *Runner) noteCert(res Result) {
+	r.certMu.Lock()
+	defer r.certMu.Unlock()
+	for _, c := range res.Checks {
+		if c.ID != "cert" {
+			continue
+		}
+		switch c.outcome {
+		case "pass":
+			r.certFails = nil
+		case "fail":
+			r.certFails = append(r.certFails, res.CheckedAt)
+		}
+		r.certLast = c.outcome
+	}
 }
 
 // RefreshWithin: a refresh within this answers the last result.
@@ -139,8 +186,11 @@ func (r *Runner) Get(ctx context.Context, refresh bool) Result {
 	if r.last != nil && (!refresh || (r.D.now().Sub(r.lastAt) < RefreshWithin && gen == r.lastGen)) {
 		return *r.last
 	}
-	res := Run(ctx, r.D)
+	// The run never inherits the request's cancellation (a client hanging
+	// up mustn't turn checks into failures); Run has its own timeout.
+	res := Run(context.WithoutCancel(ctx), r.D)
 	r.last, r.lastAt, r.lastGen = &res, r.D.now(), gen
+	r.noteCert(res)
 	if r.OnResult != nil {
 		r.OnResult(res)
 	}
