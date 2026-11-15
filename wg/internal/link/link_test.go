@@ -487,6 +487,83 @@ func TestBadDocMeansNoPeers(t *testing.T) {
 	}
 }
 
+// M7: Saturating data streams doesn't block control streams (separate caps).
+func TestSeparateStreamCaps(t *testing.T) {
+	f := newFixture(t)
+	f.link.MaxControlStreams = 2
+	f.link.MaxDataStreams = 4
+	w1 := newWorker(t, "w1", "10.214.0.10", f.pub, f.port)
+	w2 := newWorker(t, "w2", "10.214.0.11", f.pub, f.port)
+	f.apply(map[*worker]string{w1: linkdoc.StateReady, w2: linkdoc.StateReady},
+		relaySpec{"tok-a", "gitea", "w1"}, relaySpec{"tok-b", "nextcloud", "w2"})
+
+	// Fill data streams to the cap (4).
+	var dataConns []net.Conn
+	for i := 0; i < 4; i++ {
+		tok := "tok-a"
+		target := "gitea.web.relay:3000"
+		if i%2 == 1 {
+			tok = "tok-b"
+			target = "nextcloud.web.relay:8080"
+		}
+		code, c, br := connect(t, f.dataAddr, "CONNECT", target, map[string]string{"Proxy-Authorization": "Bearer " + tok})
+		if code != 200 || c == nil {
+			t.Fatalf("data stream %d: %d", i, code)
+		}
+		// Read the preamble line.
+		if _, err := br.ReadString('\n'); err != nil {
+			t.Fatalf("data stream %d preamble: %v", i, err)
+		}
+		dataConns = append(dataConns, c)
+	}
+
+	// Data cap reached: the next data CONNECT gets 503.
+	code, c, _ := connect(t, f.dataAddr, "CONNECT", "gitea.web.relay:3000", map[string]string{"Proxy-Authorization": "Bearer tok-a"})
+	if c != nil {
+		c.Close()
+	}
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("data beyond cap: %d, want 503", code)
+	}
+
+	// Control streams still open (cap 2, independent of data).
+	code, c1, br1 := connect(t, f.ctlAddr, "CONNECT", "10.214.0.10:7443", nil)
+	if code != 200 || c1 == nil {
+		t.Fatalf("control while data saturated: %d", code)
+	}
+	echoes(t, c1, br1, "ctrl1\n")
+	code, c2, br2 := connect(t, f.ctlAddr, "CONNECT", "10.214.0.11:7443", nil)
+	if code != 200 || c2 == nil {
+		t.Fatalf("control 2 while data saturated: %d", code)
+	}
+	echoes(t, c2, br2, "ctrl2\n")
+
+	// Control cap also reached: the next control CONNECT gets 503.
+	code, c3, _ := connect(t, f.ctlAddr, "CONNECT", "10.214.0.10:7443", nil)
+	if c3 != nil {
+		c3.Close()
+	}
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("control beyond cap: %d, want 503", code)
+	}
+
+	// Close one data stream: data opens again, but control still at cap.
+	dataConns[0].Close()
+	time.Sleep(100 * time.Millisecond)
+	code, c4, _ := connect(t, f.dataAddr, "CONNECT", "gitea.web.relay:3000", map[string]string{"Proxy-Authorization": "Bearer tok-a"})
+	if code != 200 || c4 == nil {
+		t.Fatalf("data after freeing one: %d", code)
+	}
+	c4.Close()
+	code, c5, _ := connect(t, f.ctlAddr, "CONNECT", "10.214.0.10:7443", nil)
+	if c5 != nil {
+		c5.Close()
+	}
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("control still at cap after freeing data: %d, want 503", code)
+	}
+}
+
 // TestLinkZeroNetstackListeners: from a peer's own netstack every TCP port
 // of 10.214.0.1 answers RST, with the CONNECT servers running.
 func TestLinkZeroNetstackListeners(t *testing.T) {

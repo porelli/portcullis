@@ -125,6 +125,50 @@ func TestReasons(t *testing.T) {
 	}
 }
 
+// M4: Instance IDs the Hub accepts but the old server-id pattern refused
+// (64 chars, digit-first, etc.) are accepted and keep every peer.
+func TestInstanceIDsHubAccepts(t *testing.T) {
+	// Instance IDs the old pattern (^[a-z][a-z0-9-]{0,30}$) refused:
+	// - 64 characters (old pattern max was 31)
+	// - digit-first (old pattern required ^[a-z])
+	// - lowercase labels only (both patterns require this)
+	cases := []struct {
+		name string
+		id   string
+	}{
+		{"64 chars", strings.Repeat("a", 64)},
+		{"digit first", "0gitea"},
+		{"digit with hyphens", "1-app-2"},
+		{"max with hyphens", strings.Repeat("a", 32) + "-" + strings.Repeat("b", 31)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			d := goodDoc()
+			d["relays"] = []any{
+				map[string]any{"token_sha256": strings.Repeat("a", 64), "instance": c.id, "server": "w1"},
+			}
+			doc, err := Parse(mustJSON(t, d))
+			if err != nil {
+				t.Fatalf("Parse refused %q: %v", c.id, err)
+			}
+			// Document loads successfully with all peers.
+			if len(doc.Peers) != 1 || doc.Peers[0].ID != "w1" {
+				t.Fatalf("peers lost: %+v", doc.Peers)
+			}
+			// Relay is accessible.
+			if r := doc.RelayByToken(strings.Repeat("a", 64)); r == nil || r.Instance != c.id {
+				t.Fatalf("relay lookup failed: %+v", r)
+			}
+		})
+	}
+	// Double hyphen still refused (Hub vectors mark it invalid).
+	d := goodDoc()
+	d["relays"] = []any{map[string]any{"token_sha256": strings.Repeat("a", 64), "instance": "a--b", "server": "w1"}}
+	if _, err := Parse(mustJSON(t, d)); err == nil || !strings.Contains(err.Error(), "relays[0].instance") {
+		t.Fatalf("a--b accepted: %v", err)
+	}
+}
+
 // Errors never quote values (keys, hashes or ids).
 func TestErrorsCarryNoValues(t *testing.T) {
 	d := goodDoc()
