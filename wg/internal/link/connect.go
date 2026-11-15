@@ -165,7 +165,7 @@ func parseRelayTarget(hostport string) (Preamble, bool) {
 		return Preamble{}, false
 	}
 	inst, svc, ok := strings.Cut(name, ".")
-	if !ok || !linkdoc.IDRe.MatchString(inst) || !serviceRe.MatchString(svc) {
+	if !ok || !linkdoc.ValidInstance(inst) || !serviceRe.MatchString(svc) {
 		return Preamble{}, false
 	}
 	port, err := strconv.Atoi(ps)

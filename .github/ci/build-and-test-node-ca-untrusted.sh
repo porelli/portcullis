@@ -13,7 +13,6 @@ VAULT_TOKEN=$(jq -r .root_token secrets/vault-init.json); export VAULT_TOKEN
 echo "::add-mask::$VAULT_TOKEN"
 D="$(mktemp -d)"
 chmod 700 "$D"
-WHOAMI=docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
 cleanup() {
   docker compose -p ci-node-any -f "$D/any.yml" down -v >/dev/null 2>&1 || true
   rm -rf "$D"
@@ -54,7 +53,7 @@ openssl x509 -in "$D/node-worker.crt" -noout -ext extendedKeyUsage | grep -q 'TL
 cat > "$D/any.yml" <<YML
 services:
   whoami:
-    image: $WHOAMI
+    image: docker.io/traefik/whoami:v1.12.0@sha256:c4717a8d1f0134a7444e24f881160e033991f23027c6c5a9a3f8fd22e70d1d44
     networks: [portcullis-proxy]
     labels:
       traefik.enable: "true"

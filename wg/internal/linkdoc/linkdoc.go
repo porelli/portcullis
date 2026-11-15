@@ -56,9 +56,19 @@ const (
 	MaxSize   = 4 << 20
 )
 
-// IDRe constrains server ids and instance ids (the Hub's servers.IDRe and
-// templates.InstanceIDRe).
+// IDRe constrains server ids (the Hub's servers.IDRe).
 var IDRe = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
+
+// InstanceRe constrains relays' instance ids (the Hub's linkdoc rule:
+// lowercase labels joined by single hyphens, never "--"), at most
+// MaxInstanceLen characters.
+var InstanceRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+// MaxInstanceLen bounds an instance id.
+const MaxInstanceLen = 64
+
+// ValidInstance reports whether s is an instance id link.json may name.
+func ValidInstance(s string) bool { return len(s) <= MaxInstanceLen && InstanceRe.MatchString(s) }
 
 // ReservedServerID is the local engine's name; no peer may take it.
 const ReservedServerID = "primary"
@@ -127,7 +137,10 @@ func (d *Doc) validate() error {
 		return fmt.Errorf("version %d, want %d", d.Version, Version)
 	}
 	if d.WrittenAt.IsZero() {
-		return errors.New("written_at: zero")
+		return errors.New("written_at: not set")
+	}
+	if _, off := d.WrittenAt.Zone(); off != 0 {
+		return errors.New("written_at: must be UTC (Z)")
 	}
 	sn, err := netip.ParsePrefix(d.Subnet)
 	if err != nil || sn != Subnet {
@@ -183,7 +196,7 @@ func (d *Doc) validate() error {
 		if _, dup := d.byToken[r.TokenSHA256]; dup {
 			return fmt.Errorf("relays[%d].token_sha256: duplicate token", i)
 		}
-		if !IDRe.MatchString(r.Instance) {
+		if !ValidInstance(r.Instance) {
 			return fmt.Errorf("relays[%d].instance: not an instance id", i)
 		}
 		p := d.PeerByID(r.Server)
