@@ -58,7 +58,13 @@ type providerSpec struct {
 	// dnssec, if set, reads the zone's DNSSEC status from the provider's
 	// API; a dnssec.Signer can also turn signing on (nil = neither).
 	dnssec func(c map[string]string) (dnssec.StatusReader, error)
+	// noTypes: record types the library can't write (the mail set's TLSA
+	// becomes a manual step).
+	noTypes []string
 }
+
+// noWrite is the record types provider can't write.
+func noWrite(provider string) []string { return providers[provider].noTypes }
 
 // fixedZone is a route53 provider with a hosted zone id: the zone is the
 // domain itself (records are named relative to it).
@@ -99,7 +105,9 @@ func (p porkbunCAARead) GetRecords(ctx context.Context, zone string) ([]libdns.R
 var providers = map[string]providerSpec{
 	"cloudflare": {required: []string{"api_token"}, build: func(c map[string]string) (dnsProvider, error) {
 		return &cloudflare.Provider{APIToken: c["api_token"], HTTPClient: &http.Client{Timeout: providerTimeout}}, nil
-	}, dnssec: newCloudflareDNSSEC},
+		// libdns/cloudflare v0.2.2 sends TLSA as content only; the API wants
+		// its data fields.
+	}, dnssec: newCloudflareDNSSEC, noTypes: []string{"TLSA"}},
 	"porkbun": {required: []string{"api_key", "secret_api_key"}, build: func(c map[string]string) (dnsProvider, error) {
 		return newPorkbunProvider(&porkbun.Provider{APIKey: c["api_key"], APISecretKey: c["secret_api_key"]},
 			newPorkbunAPI(c["api_key"], c["secret_api_key"])), nil
@@ -120,7 +128,7 @@ var providers = map[string]providerSpec{
 	}, dnssec: func(c map[string]string) (dnssec.StatusReader, error) { return newRoute53DNSSEC(c, ""), nil }},
 	"digitalocean": {required: []string{"auth_token"}, build: func(c map[string]string) (dnsProvider, error) {
 		return newDOProvider(c["auth_token"]), nil
-	}},
+	}, noTypes: []string{"TLSA"}}, // DigitalOcean's DNS has no TLSA
 	// hetzner: the legacy DNS API (dns.hetzner.com); hetzner-cloud: DNS in
 	// the Hetzner Cloud API (libdns/hetzner/v2, a Cloud API token).
 	"hetzner": {required: []string{"api_token"}, build: func(c map[string]string) (dnsProvider, error) {
@@ -367,8 +375,12 @@ func (s *Service) spec(d *Domain, accountURI string) dnsplan.Spec {
 			}
 		}
 	}
-	return dnsplan.Spec{Name: d.Name, IPv4: s.cfg.IPv4, IPv6: s.cfg.IPv6, CAA: s.cfg.CAA, Issuer: s.cfg.CAAIssuer,
+	sp := dnsplan.Spec{Name: d.Name, IPv4: s.cfg.IPv4, IPv6: s.cfg.IPv6, CAA: s.cfg.CAA, Issuer: s.cfg.CAAIssuer,
 		AccountURI: accountURI, IODEF: s.cfg.CAAIODEF, NoMail: contains(d.Sets, dnsplan.SetNoMail), Owned: refsToPlan(owned)}
+	if contains(d.Sets, dnsplan.SetMail) {
+		sp.Mail = d.MailWanted
+	}
+	return sp
 }
 
 // applySets writes the given record sets of d (dnsplan.Apply): the
@@ -387,7 +399,8 @@ func (s *Service) applySets(ctx context.Context, p dnsProvider, d *Domain, sets 
 		}
 	}
 	sp.Owned = refsToPlan(owned)
-	written, removed, err := dnsplan.Apply(ctx, dnsplan.Input{Spec: sp, Zone: zone, Provider: p, Resolvers: s.cfg.Resolvers}, sets)
+	written, removed, err := dnsplan.Apply(ctx, dnsplan.Input{Spec: sp, Zone: zone, Provider: p, Resolvers: s.cfg.Resolvers,
+		ProviderName: d.Provider, NoWrite: noWrite(d.Provider)}, sets)
 	return refsFromPlan(written), refsFromPlan(removed), zone, err
 }
 

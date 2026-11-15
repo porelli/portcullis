@@ -166,3 +166,52 @@ func TestPorkbunTTLFloor(t *testing.T) {
 		t.Fatalf("c = %v", rr)
 	}
 }
+
+// TestServesSRVTLSAAndLongTXT: SRV and TLSA answers; a long TXT stored
+// split (TXTSplit255) or whole is served as ≤ 255-byte strings, and too
+// large for a plain UDP answer it is truncated (TC).
+func TestServesSRVTLSAAndLongTXT(t *testing.T) {
+	long := strings.Repeat("a", 300) + strings.Repeat("b", 300)
+	for _, split := range []bool{true, false} {
+		z := NewZone()
+		p := &Provider{Zone: z, TXTSplit255: split, RefuseTypes: []string{"HINFO"}}
+		ctx := context.Background()
+		if _, err := p.AppendRecords(ctx, "d.test.", []libdns.Record{
+			libdns.TXT{Name: "k._domainkey", TTL: time.Hour, Text: long},
+			libdns.SRV{Service: "imaps", Transport: "tcp", Name: "@", TTL: time.Hour, Priority: 0, Weight: 1, Port: 993, Target: "mail.d.test."},
+			libdns.RR{Name: "_25._tcp.mail", Type: "TLSA", TTL: time.Hour, Data: "3 1 1 abcd"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := p.AppendRecords(ctx, "d.test.", []libdns.Record{libdns.RR{Name: "x", Type: "HINFO", Data: "a b"}}); err == nil {
+			t.Fatal("a refused type was written")
+		}
+		stored := z.Records("k._domainkey.d.test")[0].Data
+		if split != strings.HasPrefix(stored, `"`) || txtJoined(stored) != long {
+			t.Fatalf("split=%v stored %q", split, stored)
+		}
+		s := serve(t, z, Options{})
+		txt := ask(t, s, "k._domainkey.d.test", dns.TypeTXT, false).Answer[0].(*dns.TXT).Txt
+		if len(txt) != 3 || len(txt[0]) != 255 || strings.Join(txt, "") != long {
+			t.Fatalf("served %q", txt)
+		}
+		srv := ask(t, s, "_imaps._tcp.d.test", dns.TypeSRV, false).Answer[0].(*dns.SRV)
+		if srv.Port != 993 || srv.Target != "mail.d.test." {
+			t.Fatalf("SRV %v", srv)
+		}
+		tlsa := ask(t, s, "_25._tcp.mail.d.test", dns.TypeTLSA, false).Answer[0].(*dns.TLSA)
+		if tlsa.Usage != 3 || tlsa.Certificate != "abcd" {
+			t.Fatalf("TLSA %v", tlsa)
+		}
+		m := new(dns.Msg)
+		m.SetQuestion("k._domainkey.d.test.", dns.TypeTXT)
+		in, _, err := (&dns.Client{Timeout: 2 * time.Second}).Exchange(m, s.Addr)
+		if err != nil || !in.Truncated {
+			t.Fatalf("plain UDP: %v %v", in, err)
+		}
+		// Deleting by the joined value removes the split record.
+		if del, err := p.DeleteRecords(ctx, "d.test.", []libdns.Record{libdns.TXT{Name: "k._domainkey", Text: long}}); err != nil || len(del) != 1 {
+			t.Fatalf("delete %v %v", del, err)
+		}
+	}
+}

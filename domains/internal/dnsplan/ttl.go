@@ -19,8 +19,11 @@ type RRset struct {
 	Data []string
 }
 
-// setRRsets are the (bare absolute name, type) RRsets a set writes at d.
-func setRRsets(d string, sets []string) [][2]string {
+// setRRsets are the (bare absolute name, type) RRsets a set writes at
+// the spec's name (mail: the RRsets the spec wants plus, live, every other
+// one the set owns).
+func setRRsets(sp Spec, live []liveRec, sets []string) [][2]string {
+	d := bare(sp.Name)
 	var out [][2]string
 	for _, s := range sets {
 		switch s {
@@ -32,6 +35,10 @@ func setRRsets(d string, sets []string) [][2]string {
 			out = append(out, [2]string{d, "CAA"})
 		case SetNoMail:
 			out = append(out, [2]string{d, "MX"}, [2]string{d, "TXT"}, [2]string{"_dmarc." + d, "TXT"})
+		case SetMail:
+			for _, p := range mailPairs(sp, d, specHosts(sp, d), live) {
+				out = append(out, [2]string{p.name, p.typ})
+			}
 		}
 	}
 	return out
@@ -39,14 +46,14 @@ func setRRsets(d string, sets []string) [][2]string {
 
 // Stored reads the provider's RRsets of the sets at name (keyed
 // "<name> <TYPE>", the name bare absolute; an empty RRset has no key).
-func Stored(ctx context.Context, p Provider, zone, name string, sets []string) (map[string]RRset, error) {
-	d := bare(name)
-	live, err := providerRecords(ctx, p, dns.Fqdn(zone), d)
+func Stored(ctx context.Context, p Provider, zone string, sp Spec, sets []string) (map[string]RRset, error) {
+	d := bare(sp.Name)
+	live, err := providerRecords(ctx, p, dns.Fqdn(zone), d, specHosts(sp, d)...)
 	if err != nil {
 		return nil, err
 	}
 	out := map[string]RRset{}
-	for _, k := range setRRsets(d, sets) {
+	for _, k := range setRRsets(sp, live, sets) {
 		rrs := pick(live, k[0], k[1])
 		if len(rrs) == 0 {
 			continue

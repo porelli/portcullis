@@ -5,7 +5,8 @@ package main
 //	domains dns plan|apply [--wait auto [--wait-max <dur>]|<dur>] [--settle [--settle-after <unix>]]|ttl|check|dnssec-enable
 //	    the main domain's DNS plan, run by ./portcullis as the compose
 //	    service dns-tool (egress only, no volumes, no environment). Input:
-//	    one JSON object on stdin — the provider credentials only ever
+//	    one JSON object on stdin (≤ 64 KiB; ≤ 256 KiB with "mail", the
+//	    mail set's records) — the provider credentials only ever
 //	    arrive there. Output: the plan JSON on stdout. Exit 0 ok; 1 check
 //	    found a problem / apply --wait ended before every applied set was
 //	    visible (or, --settle, before the old records' caches expired: the
@@ -58,9 +59,17 @@ type toolInput struct {
 	// MailFrom: ALERT_SMTP_FROM; drops the nomail recommendation as the
 	// service does (F15d).
 	MailFrom string `json:"mail_from"`
+	// Mail: the main domain's wanted mail set (mailctl dns --main --json /
+	// rotate --json, contract §19.7); [] = mail off (its records go). The
+	// mail set is applied only with it present.
+	Mail *[]dnsplan.MailRecord `json:"mail"`
 }
 
-const toolInputMax = 64 << 10
+// toolInputMax bounds stdin; toolInputMailMax with the mail set.
+const (
+	toolInputMax     = 64 << 10
+	toolInputMailMax = 256 << 10
+)
 
 // Tool exit codes.
 const (
@@ -186,7 +195,7 @@ func runDNSTool(args []string, e toolEnv) int {
 		if err != nil {
 			return fail(exitFailure, err)
 		}
-		write.Provider, write.DNSSEC, write.CanSign = p, r, can
+		write.Provider, write.DNSSEC, write.CanSign, write.NoWrite = p, r, can, noWrite(in.Provider)
 		if z, err := toolZone(ctx, p, spec.Name, e.resolvers); err == nil {
 			write.Zone = z
 		} else if sub == "apply" || sub == "ttl" {
@@ -207,7 +216,7 @@ func runDNSTool(args []string, e toolEnv) int {
 			return fail(exitUsage, err)
 		}
 		// Fail closed (I7): a TTL nobody reports can't be a settle point.
-		cur, err := dnsplan.Stored(ctx, write.Provider, write.Zone, spec.Name, in.Sets)
+		cur, err := dnsplan.Stored(ctx, write.Provider, write.Zone, spec, in.Sets)
 		if err != nil {
 			return fail(exitFailure, fmt.Errorf("reading the records of %s failed (nothing changed): %w", spec.Name, err))
 		}
@@ -262,6 +271,9 @@ func runDNSTool(args []string, e toolEnv) int {
 	if err := checkSets(in.Sets); err != nil {
 		return fail(exitUsage, err)
 	}
+	if contains(in.Sets, dnsplan.SetMail) && in.Mail == nil {
+		return fail(exitUsage, errors.New(`the mail set needs its records ("mail": [...], [] turns mail off)`))
+	}
 	// The RRsets as the provider stores them before and after the write,
 	// and as the authoritative servers serve them: their TTLs bound the
 	// wait. A failed read assumes the worst (the whole cap).
@@ -271,7 +283,7 @@ func runDNSTool(args []string, e toolEnv) int {
 	var beforeTTL map[string]time.Duration
 	if wait.on() {
 		auth = toolAuthServers(ctx, e.resolvers, write.Zone)
-		before, readErr = dnsplan.Stored(ctx, write.Provider, write.Zone, spec.Name, in.Sets)
+		before, readErr = dnsplan.Stored(ctx, write.Provider, write.Zone, spec, in.Sets)
 		var unknown []string
 		beforeTTL, unknown = effectiveTTLs(ctx, before, auth)
 		// --settle fails closed before the write (I7): its settle point is
@@ -290,7 +302,7 @@ func runDNSTool(args []string, e toolEnv) int {
 		return printPlan(e, build(write), exitOK)
 	}
 	writtenAt := toolNow()
-	after, err := dnsplan.Stored(ctx, write.Provider, write.Zone, spec.Name, in.Sets)
+	after, err := dnsplan.Stored(ctx, write.Provider, write.Zone, spec, in.Sets)
 	afterTTL, _ := effectiveTTLs(ctx, after, auth)
 	ttl := ttlBound(beforeTTL, afterTTL, dnsplan.NegativeTTL(ctx, auth, e.resolvers, write.Zone))
 	// A guess only sets how long a plain wait lasts; under --settle the
@@ -327,7 +339,7 @@ func unknownTTLError(name, provider string, keys []string) error {
 // checkSets: apply and ttl need known sets.
 func checkSets(sets []string) error {
 	if len(sets) == 0 {
-		return errors.New("needs sets (address, caa, nomail)")
+		return errors.New("needs sets (" + strings.Join(dnsplan.Sets, ", ") + ")")
 	}
 	for _, s := range sets {
 		if !contains(dnsplan.Sets, s) {
@@ -353,21 +365,25 @@ func sameRRsets(a, b map[string]dnsplan.RRset) bool {
 
 func readToolInput(r io.Reader) (toolInput, error) {
 	var in toolInput
-	raw, err := io.ReadAll(io.LimitReader(r, toolInputMax+1))
+	raw, err := io.ReadAll(io.LimitReader(r, toolInputMailMax+1))
 	if err != nil {
 		return in, fmt.Errorf("reading stdin: %w", err)
 	}
-	if len(raw) > toolInputMax {
-		return in, fmt.Errorf("stdin holds more than %d bytes", toolInputMax)
+	if len(raw) > toolInputMailMax {
+		return in, fmt.Errorf("stdin holds more than %d bytes", toolInputMailMax)
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&in); err != nil {
 		// Never quote the input (it holds the credentials).
-		return in, errors.New("stdin must be one JSON object with the documented keys (name, provider, credentials, ipv4, ipv6, ca_server, caa, nomail, sets, mail_from)")
+		return in, errors.New("stdin must be one JSON object with the documented keys (name, provider, credentials, ipv4, ipv6, ca_server, caa, nomail, sets, mail_from, mail)")
 	}
 	if dec.Decode(&struct{}{}) != io.EOF {
 		return in, errors.New("stdin must hold exactly one JSON object")
+	}
+	// Up to 256 KiB only for the mail set (contract §12.1).
+	if len(raw) > toolInputMax && in.Mail == nil {
+		return toolInput{}, fmt.Errorf("stdin holds more than %d bytes", toolInputMax)
 	}
 	return in, nil
 }
@@ -400,8 +416,15 @@ func (in toolInput) spec() (dnsplan.Spec, error) {
 		return dnsplan.Spec{}, fmt.Errorf("caa.account_uri %q is not an ACME account URI (https, no spaces, quotes or ';')", u)
 	}
 	issuer, _ := dnsplan.IssuerFor(in.CAServer, in.CAA.Issuer)
-	return dnsplan.Spec{Name: name, IPv4: v4, IPv6: v6, CAA: in.CAA.Enabled, Issuer: issuer, AccountURI: in.CAA.AccountURI,
-		IODEF: strings.TrimSpace(in.CAA.IODEF), NoMail: in.NoMail, Main: true}, nil
+	sp := dnsplan.Spec{Name: name, IPv4: v4, IPv6: v6, CAA: in.CAA.Enabled, Issuer: issuer, AccountURI: in.CAA.AccountURI,
+		IODEF: strings.TrimSpace(in.CAA.IODEF), NoMail: in.NoMail, Main: true}
+	if in.Mail != nil {
+		if err := dnsplan.ValidateMainMail(name, *in.Mail); err != nil {
+			return dnsplan.Spec{}, fmt.Errorf("mail: %w", err)
+		}
+		sp.Mail = *in.Mail
+	}
+	return sp, nil
 }
 
 // toolZone: the provider's own zone, else the SOA lookup.

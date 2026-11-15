@@ -241,6 +241,8 @@ func (s *Service) APIHandler() http.Handler {
 	mux.HandleFunc("GET /domains/{name}/dns", s.handlePlan)
 	mux.HandleFunc("POST /domains/{name}/dns/apply", s.handleApply)
 	mux.HandleFunc("POST /domains/{name}/dnssec", s.handleDNSSEC)
+	mux.HandleFunc("PUT /domains/{name}/sets/mail", s.handleMailPut)
+	mux.HandleFunc("DELETE /domains/{name}/sets/mail", s.handleMailDelete)
 	mux.HandleFunc("GET /main/dns", s.handleMainPlan)
 	mux.HandleFunc("POST /main/dns/refresh", s.handleMainRefresh)
 	mux.HandleFunc("GET /acme/account", s.handleAccount)
@@ -1261,6 +1263,18 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, name+" is not enrolled")
 		return
 	}
+	// The mail set is written only while mail is on (PUT …/sets/mail):
+	// applied with mail off it would remove the domain's own MX and SPF.
+	if contains(b.Sets, dnsplan.SetMail) && !contains(d.Sets, dnsplan.SetMail) {
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, "mail is off for "+name+": PUT /domains/"+name+"/sets/mail turns it on")
+		return
+	}
+	if contains(b.Sets, dnsplan.SetNoMail) && contains(d.Sets, dnsplan.SetMail) {
+		s.mu.Unlock()
+		writeError(w, http.StatusConflict, "mail is on for "+name+": its mail set replaces nomail (DELETE /domains/"+name+"/sets/mail first)")
+		return
+	}
 	oldSets, oldDue := d.Sets, d.DueSets
 	for _, set := range b.Sets {
 		if set == dnsplan.SetNoMail && !contains(d.Sets, set) {
@@ -1346,7 +1360,7 @@ func (s *Service) buildPlan(ctx context.Context, d *Domain, p dnsProvider) dnspl
 		uri = d.CAAAccountURI
 	}
 	s.mu.Unlock()
-	in := dnsplan.Input{Spec: s.spec(d, uri), ProviderName: d.Provider, Resolvers: s.cfg.Resolvers, Now: s.cfg.Now()}
+	in := dnsplan.Input{Spec: s.spec(d, uri), ProviderName: d.Provider, NoWrite: noWrite(d.Provider), Resolvers: s.cfg.Resolvers, Now: s.cfg.Now()}
 	if p != nil {
 		in.Provider = p
 		if zone, err := s.zoneOf(p, d.Name); err == nil {
@@ -1425,6 +1439,110 @@ func mergeRecords(old, add []RecordRef) []RecordRef {
 		if !seen[r] {
 			seen[r] = true
 			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// mailBodyMax bounds PUT …/sets/mail (200 records with long DKIM TXT).
+const mailBodyMax = 256 << 10
+
+// handleMailPut is PUT /domains/{name}/sets/mail {"records": [...]}: the
+// records become the domain's MailWanted, mail goes into its Sets and
+// nomail out of them (remembered as NoMailBeforeMail), both made due.
+func (s *Service) handleMailPut(w http.ResponseWriter, r *http.Request) {
+	name, ok := s.pathName(w, r)
+	if !ok {
+		return
+	}
+	var b struct {
+		Records []dnsplan.MailRecord `json:"records"`
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, mailBodyMax))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&b); err != nil || dec.Decode(&struct{}{}) != io.EOF || b.Records == nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf(`body must be {"records": [{"name", "type", "ttl", "value"}, ...]} (at most %d KiB)`, mailBodyMax>>10))
+		return
+	}
+	if len(b.Records) == 0 {
+		writeError(w, http.StatusBadRequest, "the mail set needs records (DELETE /domains/"+name+"/sets/mail turns mail off)")
+		return
+	}
+	if err := dnsplan.ValidateMail(name, b.Records); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.updateMailSet(w, name, func(d *Domain) {
+		if contains(d.Sets, dnsplan.SetNoMail) {
+			d.NoMailBeforeMail = true
+		}
+		d.Sets = withSet(without(d.Sets, dnsplan.SetNoMail), dnsplan.SetMail)
+		d.DueSets = withSet(withSet(d.DueSets, dnsplan.SetNoMail), dnsplan.SetMail)
+		d.MailWanted = b.Records
+	}, fmt.Sprintf("mail set wanted (%d records)", len(b.Records)))
+}
+
+// handleMailDelete is DELETE /domains/{name}/sets/mail: mail leaves Sets
+// and is made due (its records are removed); nomail comes back, made due,
+// when it was on before mail.
+func (s *Service) handleMailDelete(w http.ResponseWriter, r *http.Request) {
+	name, ok := s.pathName(w, r)
+	if !ok {
+		return
+	}
+	s.updateMailSet(w, name, func(d *Domain) {
+		d.Sets = without(d.Sets, dnsplan.SetMail)
+		d.DueSets = withSet(d.DueSets, dnsplan.SetMail)
+		if d.NoMailBeforeMail {
+			d.Sets = withSet(d.Sets, dnsplan.SetNoMail)
+			d.DueSets = withSet(d.DueSets, dnsplan.SetNoMail)
+		}
+		d.NoMailBeforeMail, d.MailWanted = false, nil
+	}, "mail set off")
+}
+
+// updateMailSet applies f to the enrolled domain name and saves (on a
+// failed save nothing changes), then kicks the worker: 202 with the view.
+func (s *Service) updateMailSet(w http.ResponseWriter, name string, f func(d *Domain), what string) {
+	s.mu.Lock()
+	d, exists := s.doc.Domains[name]
+	if !exists || d.Deleting {
+		s.mu.Unlock()
+		writeError(w, http.StatusNotFound, name+" is not enrolled")
+		return
+	}
+	old := *d
+	f(d)
+	d.NextAttempt = time.Time{}
+	err := s.store.Save(s.doc)
+	if err != nil {
+		*d = old
+	}
+	v := s.viewLocked(d)
+	s.mu.Unlock()
+	if err != nil {
+		s.logf("mail set %s: saving the store failed: %v", name, err)
+		writeError(w, http.StatusInternalServerError, "saving the store failed")
+		return
+	}
+	s.logf("domain %s: %s", name, what)
+	s.Kick()
+	writeJSON(w, http.StatusAccepted, v)
+}
+
+// withSet / without return a new list with / without x.
+func withSet(list []string, x string) []string {
+	if contains(list, x) {
+		return list
+	}
+	return append(append([]string(nil), list...), x)
+}
+
+func without(list []string, x string) []string {
+	var out []string
+	for _, y := range list {
+		if y != x {
+			out = append(out, y)
 		}
 	}
 	return out
