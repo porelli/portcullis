@@ -4,7 +4,11 @@
 package spamrules
 
 import (
+	"bytes"
+	"compress/gzip"
 	_ "embed"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 )
@@ -34,4 +38,20 @@ func Handler() http.Handler {
 			w.Write(rules)
 		}
 	})
+}
+
+// HTTPLookups returns the rules file's HttpLookup objects (the external
+// feeds the import would create enabled).
+func HTTPLookups() ([]map[string]any, error) {
+	zr, err := gzip.NewReader(bytes.NewReader(rules))
+	if err != nil {
+		return nil, fmt.Errorf("spam rules: %w", err)
+	}
+	var doc struct {
+		HttpLookup []map[string]any `json:"HttpLookup"`
+	}
+	if err := json.NewDecoder(zr).Decode(&doc); err != nil {
+		return nil, fmt.Errorf("spam rules: %w", err)
+	}
+	return doc.HttpLookup, nil
 }

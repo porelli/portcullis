@@ -262,7 +262,8 @@ expect_ok "secrets_fix_perms: secrets/wg and people.key group 10006" \
 # directory 0700; relay-password / dqs-key follow .env; the volumes only
 # with mail in COMPOSE_PROFILES.
 expect_eq "stack_prepare: the mail placeholders exist, empty, 0600 before secrets_fix_perms" \
-  "$(for f in api-key hub-secret metrics-secret relay-password dqs-key; do [ -f "$SP_ROOT/secrets/mail/$f" ] && [ ! -s "$SP_ROOT/secrets/mail/$f" ] && file_mode "$SP_ROOT/secrets/mail/$f"; done | tr '\n' ' ')" "600 600 600 600 600 "
+  "$(for f in api-key hub-secret relay-password dqs-key; do [ -f "$SP_ROOT/secrets/mail/$f" ] && [ ! -s "$SP_ROOT/secrets/mail/$f" ] && file_mode "$SP_ROOT/secrets/mail/$f"; done | tr '\n' ' ')" "600 600 600 600 "
+expect_eq "stack_prepare: the metrics scrape password is generated once (40 characters)" "$(wc -c < "$SP_ROOT/secrets/mail/metrics-secret" | tr -d ' ')" 40
 expect_eq "stack_prepare: secrets/mail is 0700" "$(file_mode "$SP_ROOT/secrets/mail")" 700
 expect_fail "stack_prepare makes no mail volume without the mail profile" grep -q 'volume_own mail' "$STUB_DIR/sp-vol"
 rm -f "$STUB_DIR/sp-vol"
@@ -4842,6 +4843,81 @@ expect_eq "jq 1.8 precedence fixture: (A and B) as \$x and A and (B as \$x | …
   "$(printf '%s' "$JQF" | jq -c '.items[0] | (.ok and .n) as $x | [$x]')|$(printf '%s' "$JQF" | jq -c '.items[0] | .ok and (.n as $x | [$x])')" "[true]|true"
 expect_eq "every jq '... and/or ... as \$x' in the kubernetes code is parenthesised" \
   "$(grep -nE '(and|or) [^|()]+ as [$]' "$HERE/../scripts/lib/kube.sh" || true)" ""
+
+# ══ mail (contract §19.4): the recovery session, the bootstrap, the timer ══
+# shellcheck source=../scripts/lib/mail.sh
+source "$HERE/../scripts/lib/mail.sh"
+ML="$WORK/mail"
+ML_BOOT_DEFAULT='{"api_key":"API_testkey0123456789"}'
+# mt <script> — a subshell with a fresh root and stub dc / health / build;
+# dc's argv goes to $ML/argv, its stdin (for `run`) to $ML/stdin.
+mt() {
+  rm -rf "$ML"; mkdir -p "$ML/root/secrets/mail"
+  printf 'PORTCULLIS_DOMAIN=mail.example\nCOMPOSE_PROFILES=mail\n' > "$ML/root/.env"
+  : > "$ML/root/secrets/mail/api-key"
+  (
+    export PORTCULLIS_ROOT="$ML/root"
+    env_load
+    dc() {
+      echo "$*" >> "$ML/argv"
+      case "$*" in
+        "run --rm --no-deps -T mailctl bootstrap --verify-gone") cat >> "$ML/stdin"; return "${ML_GONE_RC:-0}" ;;
+        "run --rm --no-deps -T mailctl bootstrap"*) cat >> "$ML/stdin"; printf '%s\n' "${ML_BOOT_OUT:-$ML_BOOT_DEFAULT}" ;;
+      esac
+      [ ! -f "$PORTCULLIS_ROOT/secrets/mail/recovery.env" ] || file_mode "$PORTCULLIS_ROOT/secrets/mail/recovery.env" >> "$ML/modes"
+      return 0
+    }
+    rt_health() { echo healthy; }
+    runtime_build_service() { :; }
+    ct_group_read() { echo "ct_group_read $*" >> "$ML/argv"; }
+    eval "$1"
+  ) >"$ML/out" 2>&1
+}
+# A failing step: recovery.env removed, mail recreated without it, exit 1.
+ok_fn() { IFS= read -r p <&3; printf '%s' "$p" > "$ML/seen-pw"; }
+bad_fn() { return 3; }
+mt 'mail_recovery_session bad_fn'; rc=$?
+expect_eq "mail_recovery_session removes recovery.env when fn fails (exit 1, mail recreated twice)" \
+  "$rc:$([ -e "$ML/root/secrets/mail/recovery.env" ] && echo left || echo gone):$(grep -c '^up -d --no-deps mail$' "$ML/argv")" "1:gone:2"
+expect_eq "mail_recovery_session: mailctl stopped first, not started after a failure" "$(head -n1 "$ML/argv"):$(grep -c 'mailctl$' "$ML/argv")" "stop mailctl:1"
+mt 'mail_recovery_session ok_fn'; rc=$?
+PW="$(cat "$ML/seen-pw" 2>/dev/null)"
+expect_eq "mail_recovery_session: ok → the step got a 44-character password on fd 3, recovery.env was 0600 and is gone, mailctl started last" \
+  "$rc:${#PW}:$(sort -u "$ML/modes"):$([ -e "$ML/root/secrets/mail/recovery.env" ] && echo left || echo gone):$(tail -n1 "$ML/argv")" "0:44:600:gone:up -d --no-deps mailctl"
+expect_eq "the recovery password never on argv (only on stdin, for --verify-gone)" \
+  "$(grep -cF -- "$PW" "$ML/argv"):$(jq -r '.recovery_password' "$ML/stdin" | grep -cxF -- "$PW")" "0:1"
+mt 'ML_GONE_RC=1; mail_recovery_session ok_fn'; rc=$?
+expect_eq "mail_recovery_session: a recovery login that still works → refused, mailctl not started" \
+  "$rc:$(grep -c 'the recovery admin still works: stop mail and inspect' "$ML/out"):$(grep -c '^up -d --no-deps mailctl$' "$ML/argv")" "1:1:0"
+# The bootstrap: the key straight from mailctl's answer into api-key.
+mt 'mail_bootstrap_apply 3<<<"s3cret-recovery-pw"'; rc=$?
+expect_eq "mail_bootstrap_apply writes the printed key into secrets/mail/api-key, group 10010; the password only on stdin" \
+  "$rc:$(cat "$ML/root/secrets/mail/api-key"):$(grep -c "ct_group_read 10010 $ML/root/secrets/mail/api-key" "$ML/argv"):$(grep -c 's3cret-recovery-pw' "$ML/argv"):$(jq -r .recovery_password "$ML/stdin")" \
+  "0:API_testkey0123456789:1:0:s3cret-recovery-pw"
+expect_eq "mail_bootstrap_apply: the input's fields" "$(jq -c '{recovery_user, hostname, primary_domain, client_ip, lan_only, relay, metrics_user}' "$ML/stdin")" \
+  '{"recovery_user":"portcullis-recovery","hostname":"mail.mail.example","primary_domain":"mail.example","client_ip":"preserved","lan_only":false,"relay":null,"metrics_user":"prometheus"}'
+mt 'printf API_old > "$PORTCULLIS_ROOT/secrets/mail/api-key"; ML_BOOT_OUT="{\"api_key\":null}"; mail_bootstrap_apply 3<<<pw'; rc=$?
+expect_eq "mail_bootstrap_apply: null keeps the existing key" "$rc:$(cat "$ML/root/secrets/mail/api-key")" "0:API_old"
+mt 'ML_BOOT_OUT="{\"api_key\":null}"; mail_bootstrap_apply 3<<<pw'; rc=$?
+expect_eq "mail_bootstrap_apply: null with an empty key file → refused (rotate the key)" "$rc:$(grep -c -- '--rotate-key' "$ML/out")" "1:1"
+mt 'MAIL_RELAY_HOST=smtp.relay.example MAIL_RELAY_PORT=587 MAIL_RELAY_USERNAME=u MAIL_ROTATE_KEY=true mail_bootstrap_apply 3<<<pw'
+expect_eq "mail_bootstrap_apply: the relay (never its password) and --rotate-key" "$(jq -c .relay "$ML/stdin"):$(grep -c 'bootstrap --rotate-key$' "$ML/argv")" '{"host":"smtp.relay.example","port":587,"username":"u"}:1'
+# up / upgrade never start mail without its store config (P49).
+mt 'mail_port_start_ok() { :; }; mail_config_present() { return 1; }; mail_up_steps up'; rc=$?
+expect_eq "mail_up_steps refuses without mail_etc/config.json" "$rc:$(grep -c 'run ./portcullis mail enable' "$ML/out")" "1:1"
+mt 'mail_port_start_ok() { :; }; mail_config_present() { :; }; mail_tls_present() { :; }; mail_recovery_session() { echo "session $*" >> "$ML/argv"; }; printf API_k > "$PORTCULLIS_ROOT/secrets/mail/api-key"; mail_up_steps up; mail_up_steps upgrade'
+expect_eq "mail_up_steps: up skips the bootstrap with a key, upgrade always re-runs it; MAILCTL_CLIENT_IP written" \
+  "$(grep -c '^session mail_bootstrap_apply$' "$ML/argv"):$(grep -c '^MAILCTL_CLIENT_IP=preserved$' "$ML/root/.env")" "1:1"
+# The timer: docker = system units (User=, docker.service), podman = user units.
+mt 'mail_schedule_systemd "$PORTCULLIS_ROOT/units"'
+U="$ML/root/units"
+expect_eq "mail schedule --systemd writes the timer (docker shape)" \
+  "$(grep -c '^OnCalendar=daily$\|^RandomizedDelaySec=1h$\|^Persistent=true$\|^WantedBy=timers.target$' "$U/portcullis-mail.timer"):$(grep -c "^ExecStart=.*/portcullis mail rotate$\|^User=\|^Requires=docker.service$" "$U/portcullis-mail.service")" "4:3"
+mt 'export CONTAINER_RUNTIME=podman; mail_schedule_systemd "$PORTCULLIS_ROOT/units"'
+expect_eq "mail schedule --systemd writes the timer (podman shape: user units)" \
+  "$(grep -c '^WantedBy=default.target$' "$U/portcullis-mail.timer"):$(grep -c '^User=' "$U/portcullis-mail.service"):$(grep -c '^Requires=podman.socket$' "$U/portcullis-mail.service")" "1:0:1"
+expect_eq "mail_profiles: added once, removed" "$(COMPOSE_PROFILES=monitoring _mail_profiles_with_mail):$(COMPOSE_PROFILES=monitoring,mail _mail_profiles_with_mail):$(COMPOSE_PROFILES=monitoring,mail,wg _mail_profiles_without_mail)" "monitoring,mail:monitoring,mail:monitoring,wg"
+expect_eq "mail_client_ip_mode: docker preserved, podman rewritten" "$(CONTAINER_RUNTIME=docker mail_client_ip_mode):$(CONTAINER_RUNTIME=podman mail_client_ip_mode)" "preserved:rewritten"
 
 echo ""
 echo "$PASS passed, $FAIL failed"

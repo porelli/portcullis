@@ -32,3 +32,15 @@ func TestHandlerServesOnlyThePath(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPLookups(t *testing.T) {
+	ls, err := HTTPLookups()
+	if err != nil || len(ls) != 4 {
+		t.Fatalf("%d lookups, %v", len(ls), err)
+	}
+	for _, l := range ls {
+		if l["namespace"] == "" || l["url"] == "" {
+			t.Fatalf("lookup without namespace / url: %v", l)
+		}
+	}
+}

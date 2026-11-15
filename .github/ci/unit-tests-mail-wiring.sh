@@ -130,8 +130,8 @@ echo "$CFG_SELINUX" | jq -e --arg p "$PWD/" '
   || { echo "FAIL: the SELinux overlay's mail binds (Z one reader, z the shared hub-secret)"; exit 1; }
 # The recovery admin reaches mail only through its optional env file
 # (compose folds env_file into environment, so read the source).
-yq -o=json ".services.mail.env_file" docker-compose.yml 2>/dev/null | jq -e '. == [{"path": "./secrets/mail/recovery.env", "required": false}]' >/dev/null \
-  || { echo "FAIL: mail's only env_file is ./secrets/mail/recovery.env, required: false"; exit 1; }
+yq -o=json ".services.mail.env_file" docker-compose.yml 2>/dev/null | jq -e '. == [{"path": "./secrets/mail/recovery.env", "required": false}, {"path": "./secrets/mail/update.env", "required": false}]' >/dev/null \
+  || { echo "FAIL: mail's only env_files are ./secrets/mail/recovery.env and update.env, required: false"; exit 1; }
 # Moved subnets follow everywhere they are used.
 MOVED="$(PORTCULLIS_MAIL_SUBNET=10.86.0.0/28 PORTCULLIS_MAIL_IP_RANGE=10.86.0.8/29 PORTCULLIS_MAIL_IP=10.86.0.2 PORTCULLIS_MAILCTL_MAIL_IP=10.86.0.3 PORTCULLIS_MAIL_RESOLVER_IP=10.86.0.4 \
   PORTCULLIS_MAILCTL_SUBNET=10.87.0.0/28 PORTCULLIS_MAILCTL_IP_RANGE=10.87.0.8/29 PORTCULLIS_MAILCTL_HUB_IP=10.87.0.2 PORTCULLIS_MAILCTL_API_IP=10.87.0.3 \

@@ -1583,6 +1583,10 @@ services:
     env_file:
       - path: ./secrets/mail/recovery.env
         required: false
+      # STALWART_UPDATE_ROLE_PERMISSIONS=true for one start after an image
+      # change (0600, removed once healthy).
+      - path: ./secrets/mail/update.env
+        required: false
     volumes:
       - mail_data:/var/lib/stalwart
       - mail_etc:/etc/stalwart

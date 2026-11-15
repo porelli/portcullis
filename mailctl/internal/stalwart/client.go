@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -41,9 +42,18 @@ func Basic(user, pass string) Auth { return basic{user, pass} }
 
 // Client talks to the management listener.
 type Client struct {
-	url  string
-	auth Auth
-	hc   *http.Client
+	url       string
+	auth      Auth
+	hc        *http.Client
+	accountID string
+}
+
+// As returns a client whose calls name accountID (`accountId`: the
+// account an ApiKey or AppPassword belongs to).
+func (c *Client) As(accountID string) *Client {
+	cp := *c
+	cp.accountID = accountID
+	return &cp
 }
 
 // New returns a client for the management listener at url (no trailing /jmap).
@@ -98,6 +108,11 @@ const maxResponse = 64 << 20
 func (c *Client) Call(ctx context.Context, method string, args any, out any) error {
 	if args == nil {
 		args = map[string]any{}
+	}
+	if c.accountID != "" {
+		if m, ok := args.(map[string]any); ok {
+			m["accountId"] = c.accountID
+		}
 	}
 	body, err := json.Marshal(request{Using: Using, MethodCalls: [][3]any{{method, args, "0"}}})
 	if err != nil {
@@ -162,15 +177,25 @@ func (c *Client) Call(ctx context.Context, method string, args any, out any) err
 
 // SetError is one refused create / update / destroy.
 type SetError struct {
-	Type        string   `json:"type"`
-	Description string   `json:"description,omitempty"`
-	Properties  []string `json:"properties,omitempty"`
+	Type             string   `json:"type"`
+	Description      string   `json:"description,omitempty"`
+	Properties       []string `json:"properties,omitempty"`
+	ValidationErrors []struct {
+		Type     string `json:"type"`
+		Property string `json:"property"`
+	} `json:"validationErrors,omitempty"`
 }
 
 func (e SetError) Error() string {
 	s := e.Type
 	if e.Description != "" {
 		s += ": " + e.Description
+	}
+	if len(e.Properties) > 0 {
+		s += " (" + strings.Join(e.Properties, ", ") + ")"
+	}
+	for _, v := range e.ValidationErrors {
+		s += " [" + v.Property + ": " + v.Type + "]"
 	}
 	return s
 }

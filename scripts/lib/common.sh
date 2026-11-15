@@ -848,6 +848,8 @@ mail_prepare() {
     [ ! -d "$d/$f" ] || fail "$d/$f is a directory (made by Docker): remove it (rmdir) and run again"
     [ -f "$d/$f" ] || (umask 077 && : > "$d/$f")
   done
+  # The Prometheus scrape password (Stalwart's metrics listener): generated once.
+  [ -s "$d/metrics-secret" ] || gen_alnum 40 > "$d/metrics-secret"
   _mail_secret_from_env "$d/relay-password" MAIL_RELAY_PASSWORD
   _mail_secret_from_env "$d/dqs-key" MAIL_SPAMHAUS_DQS_KEY
   mail_profile_on || return 0

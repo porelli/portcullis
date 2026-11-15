@@ -86,7 +86,7 @@ done
 
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 36 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 36
+expect_eq "help lists 45 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 45
 while IFS= read -r c; do
   # shellcheck disable=SC2086
   run $c --help
@@ -115,7 +115,7 @@ expect_eq "every --help works with no engine: the engine was never asked" "$(cat
 run init --help
 case "$OUT" in *"--runtime docker|podman"*"CONTAINER_RUNTIME"*"never switched"*) t_pass "init --help documents --runtime" ;; *) t_fail "init --help lacks --runtime" ;; esac
 
-for g in vault pki keycloak oidc dns cert config signin vpn; do
+for g in vault pki keycloak oidc dns cert config signin vpn mail; do
   run "$g";        expect_eq "'$g' without subcommand exits 2" "$RC" 2
   run "$g" --help; expect_eq "'$g --help' exits 0" "$RC" 0
   run "$g" bogus;  expect_eq "'$g bogus' exits 2" "$RC" 2
@@ -215,7 +215,43 @@ vpn revoke|expected exactly one <device-id>
 vpn revoke a b|expected exactly one <device-id>
 vpn revoke 'x;y'|invalid device id
 vpn revoke --all|unknown option: --all
+mail enable --lan-only maybe|--lan-only must be true or false
+mail enable --hostname Mail.Example|--hostname must be a lowercase host name
+mail enable --hostname|--hostname needs a value
+mail enable extra|unexpected argument: extra
+mail enable --frob|unknown option: --frob
+mail disable now|unexpected argument: now
+mail schedule|--systemd is required
+mail schedule --systemd --out|--out needs a value
+mail test|--to <address> is required
+mail test --to nobody|--to <address> is required
+mail dkim|expected: dkim rotate <domain>
+mail dkim rotate|expected: dkim rotate <domain>
+mail export|expected exactly one <former-id>
+mail export alice|invalid former id
+mail cert x|unexpected argument: x
+mail rotate --now|unknown option: --now
 EOF
+
+# ── mail (contract §19.12, M9): refused on Kubernetes, and on rootless
+# Podman unless unprivileged ports start at 25 — before any engine call ──
+MR="$WORK/mail-root"
+mkdir -p "$MR"
+printf 'PORTCULLIS_DOMAIN=mail.example\nCONTAINER_RUNTIME=kubernetes\nPORTCULLIS_KUBE_CONTEXT=ci\nDNS_PROVIDER=cloudflare\n' > "$MR/.env"
+: > "$WORK/mail-calls"
+for c in "mail enable --yes" "mail disable --yes" "mail cert" "mail rotate" "mail status"; do
+  RC=0
+  # shellcheck disable=SC2086
+  PATH="$WORK/noengine:$PATH" STUB_CALLS_NOENGINE="$WORK/mail-calls" PORTCULLIS_ROOT="$MR" "$CLI" $c >/dev/null 2>"$WORK/err" </dev/null || RC=$?
+  expect_eq "$c on kubernetes → exit 1 with the text" "$RC:$(grep -c "mail isn't available on Kubernetes yet (Docker or rootless Podman only)" "$WORK/err")" "1:1"
+done
+expect_eq "mail on kubernetes: no engine call" "$(cat "$WORK/mail-calls")" ""
+printf 'PORTCULLIS_DOMAIN=mail.example\nCONTAINER_RUNTIME=podman\nDNS_PROVIDER=cloudflare\n' > "$MR/.env"
+echo 80 > "$WORK/port-start"
+RC=0; PATH="$WORK/noengine:$PATH" STUB_CALLS_NOENGINE="$WORK/mail-calls" RT_PROC_PORT_START="$WORK/port-start" PORTCULLIS_ROOT="$MR" \
+  "$CLI" mail enable --yes >/dev/null 2>"$WORK/err" </dev/null || RC=$?
+expect_eq "mail enable on podman with port start 80 → refused naming net.ipv4.ip_unprivileged_port_start=25" \
+  "$RC:$(grep -c 'sysctl -w net.ipv4.ip_unprivileged_port_start=25' "$WORK/err"):$(cat "$WORK/mail-calls")" "1:1:"
 
 # ── no secret on a command line (CLAUDE.md: stdin, -H @<(...), key=-, jq
 # --rawfile / env.X) ── lines marked "secret-argv-ok" are reviewed exceptions.
