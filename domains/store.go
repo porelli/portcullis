@@ -74,6 +74,10 @@ type Domain struct {
 	// PUT / DELETE /domains/{name}/sets/mail).
 	Sets    []string `json:"sets,omitempty"`
 	DueSets []string `json:"due_sets,omitempty"`
+	// SetGens counts the requests per set (markDue): a records step clears
+	// a due set only when no request came after the snapshot it applied,
+	// so a PUT / DELETE racing a running step is never lost.
+	SetGens map[string]int `json:"set_gens,omitempty"`
 	// MailWanted: the mail set's records (PUT …/sets/mail; empty while
 	// mail is off). NoMailBeforeMail: nomail was on when mail replaced it,
 	// so DELETE …/sets/mail brings it back.

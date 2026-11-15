@@ -621,7 +621,7 @@ func TestServesOnlyOwnCertificates(t *testing.T) {
 	add("leaving.example.org", []string{"leaving.example.org", "*.leaving.example.org"}, nil, nb, na)
 	domains["leaving.example.org"].Deleting = true
 
-	doc, dropped := buildDynamic(domains, testMain, now)
+	doc, dropped := buildDynamic(domains, testMain, "", now)
 	b, _ := json.Marshal(doc)
 	var raw map[string]any
 	json.Unmarshal(b, &raw)
@@ -643,7 +643,7 @@ func TestServesOnlyOwnCertificates(t *testing.T) {
 		}
 	}
 	// Nothing at all: still the bare shape.
-	empty, _ := buildDynamic(map[string]*Domain{}, testMain, now)
+	empty, _ := buildDynamic(map[string]*Domain{}, testMain, "", now)
 	if b, _ := json.Marshal(empty); string(b) != `{"tls":{"certificates":[]}}` {
 		t.Fatalf("empty document %s", b)
 	}
@@ -2214,5 +2214,67 @@ func TestSetsMailEndpoint(t *testing.T) {
 		if rrs := e.zone.Records(n); len(rrs) != 0 {
 			t.Errorf("left at %s after the domain's DELETE: %v", n, rrs)
 		}
+	}
+}
+
+// TestSetsMailDueRaceNotLost (review finding 1): a DELETE …/sets/mail
+// that arrives while a records step for the PUT before it is running
+// (mail already due in its snapshot) is not lost: the step's end leaves
+// mail due, and the next step removes the records.
+func TestSetsMailDueRaceNotLost(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-mr.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) && len(e.domain(name).DueSets) == 0 })
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	e.setHook(func(op string, _ []libdns.Record, _ string) error {
+		once.Do(func() { close(entered); <-release })
+		return nil
+	})
+	if code, body := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetBody(name), true); code != 202 {
+		t.Fatalf("PUT = %d %s", code, body)
+	}
+	select {
+	case <-entered: // the step holds a snapshot with mail on and due
+	case <-time.After(30 * time.Second):
+		t.Fatal("the records step never started")
+	}
+	if code, body := e.do("DELETE", "/domains/"+name+"/sets/mail", "", true); code != 202 {
+		t.Fatalf("DELETE = %d %s", code, body)
+	}
+	close(release)
+	e.waitFor("the mail records removed", 30*time.Second, func() bool {
+		return !e.hasRR(name, "MX", "") && len(e.zone.Records("v1-rsa-20261115._domainkey."+name)) == 0 &&
+			e.idle(name) && len(e.domain(name).DueSets) == 0
+	})
+	if d := e.domain(name); contains(d.Sets, "mail") || len(d.MailWanted) != 0 {
+		t.Fatalf("sets %v wanted %d", d.Sets, len(d.MailWanted))
+	}
+}
+
+// TestSetsMailNeverMainMailNames (review finding 2): MAIL_HOSTNAME and
+// the names the main mail set owns are never an added domain, and a
+// domain enrolled before MAIL_HOSTNAME became one of its names gets no
+// mail set.
+func TestSetsMailNeverMainMailNames(t *testing.T) {
+	e := newEnvWith(t, false, func(c *Config) { c.MailHostname = "mx.team-mh.example.org" })
+	for _, n := range []string{"mx.team-mh.example.org", "a.mx.team-mh.example.org", "mail." + testMain, "mta-sts." + testMain, "autoconfig." + testMain} {
+		if code, body := e.do("PUT", "/domains/"+n, creds(goodToken), true); code != 400 {
+			t.Errorf("enroll %s = %d %s", n, code, body)
+		}
+	}
+	const name = "team-mh.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	if code, body := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetBody(name), true); code != 202 {
+		t.Fatalf("PUT = %d %s", code, body)
+	}
+	e.waitFor("idle", 30*time.Second, func() bool { return e.idle(name) && len(e.domain(name).DueSets) == 0 })
+	// MAIL_HOSTNAME moved onto the domain itself: its mail set is refused.
+	e.restart(func(c *Config) { c.MailHostname = name })
+	if code, body := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetBody(name), true); code != 400 {
+		t.Fatalf("PUT with MAIL_HOSTNAME = the domain: %d %s", code, body)
 	}
 }

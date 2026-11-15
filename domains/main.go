@@ -281,6 +281,9 @@ func run() error {
 	// the same public resolvers as the records check.
 	_ = dns01.AddRecursiveNameservers(resolvers)(nil)
 
+	if h := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("DOMAINS_MAIL_HOSTNAME")), ".")); h != "" && !validHostname(h) {
+		return fmt.Errorf("DOMAINS_MAIL_HOSTNAME=%q is not a valid hostname", h)
+	}
 	caaOn, err := envBool("DNS_CAA", true)
 	if err != nil {
 		return err
@@ -297,6 +300,7 @@ func run() error {
 		CAAIODEF:       strings.TrimSpace(os.Getenv("DNS_CAA_IODEF")),
 		MainAccountURI: strings.TrimSpace(os.Getenv("DOMAINS_MAIN_ACME_ACCOUNT_URI")),
 		MailFrom:       strings.TrimSpace(os.Getenv("ALERT_SMTP_FROM")),
+		MailHostname:   strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("DOMAINS_MAIL_HOSTNAME")), ".")),
 	}
 	if u := cfg.MainAccountURI; u != "" && !dnsplan.ValidAccountURI(u) {
 		return fmt.Errorf("DOMAINS_MAIN_ACME_ACCOUNT_URI=%q is not an ACME account URI (secrets/domains/main-domain.env)", u)

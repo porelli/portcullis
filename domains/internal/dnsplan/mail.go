@@ -649,3 +649,7 @@ func txtJoin(v string) string {
 	}
 	return strings.Join(parts, "")
 }
+
+// MailNameOwned: an added domain d's own mail set would use name n (any
+// type): the names of the contract §19.7 table under d.
+func MailNameOwned(d, n string) bool { return mailNameOwned(bare(d), nil, bare(n)) }

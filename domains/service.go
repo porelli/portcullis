@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
 	"net/netip"
 	"sort"
@@ -67,6 +68,9 @@ type Config struct {
 	MainAccountURI string
 	// MailFrom: ALERT_SMTP_FROM (no nomail recommendation for its domain).
 	MailFrom string
+	// MailHostname: MAIL_HOSTNAME (DOMAINS_MAIL_HOSTNAME; "" = mail.<main>):
+	// never an added domain, nor at or under one's mail names (checkName).
+	MailHostname string
 	// ACMEHTTPClient overrides lego's HTTP client (tests: Pebble's TLS).
 	ACMEHTTPClient *http.Client
 	Now            func() time.Time
@@ -224,7 +228,7 @@ func (s *Service) viewLocked(d *Domain) View {
 	v := View{Name: d.Name, Provider: d.Provider, RecordsOK: d.RecordsOK, LastError: d.LastError, State: d.State,
 		CAAOK: d.CAAOK, DNSSEC: d.DNSSEC}
 	// cert_not_after is the expiry of the certificate actually served.
-	if d.CertNotAfter != nil && servable(d, s.cfg.MainDomain, s.cfg.Now()) == nil {
+	if d.CertNotAfter != nil && servable(d, s.cfg.MainDomain, s.cfg.MailHostname, s.cfg.Now()) == nil {
 		t := d.CertNotAfter.UTC().Format(time.RFC3339)
 		v.CertNotAfter = &t
 	}
@@ -275,7 +279,7 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 // pathName validates {name} (contract §12.2).
 func (s *Service) pathName(w http.ResponseWriter, r *http.Request) (string, bool) {
 	name := r.PathValue("name")
-	if err := checkName(name, s.cfg.MainDomain); err != nil {
+	if err := checkName(name, s.cfg.MainDomain, s.cfg.MailHostname); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return "", false
 	}
@@ -477,6 +481,7 @@ func copyDomain(d *Domain) *Domain {
 	for k, v := range d.Credentials {
 		c.Credentials[k] = v
 	}
+	c.SetGens = maps.Clone(d.SetGens)
 	c.Records = make(map[string][]RecordRef, len(d.Records))
 	for z, refs := range d.Records {
 		c.Records[z] = append([]RecordRef(nil), refs...)
@@ -492,7 +497,7 @@ func (s *Service) CertsHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /traefik/dynamic", func(w http.ResponseWriter, _ *http.Request) {
 		s.mu.Lock()
-		doc, dropped := buildDynamic(s.doc.Domains, s.cfg.MainDomain, s.cfg.Now())
+		doc, dropped := buildDynamic(s.doc.Domains, s.cfg.MainDomain, s.cfg.MailHostname, s.cfg.Now())
 		if d := strings.Join(dropped, "; "); d != s.lastDropped {
 			s.lastDropped = d
 			if d != "" {
@@ -540,7 +545,7 @@ func (s *Service) Run(ctx context.Context) {
 func (s *Service) Wait() { s.wg.Wait() }
 
 func (s *Service) needsCert(d *Domain, now time.Time) bool {
-	return d.CertNotAfter == nil || servable(d, s.cfg.MainDomain, now) != nil || d.CertNotAfter.Sub(now) < renewBefore
+	return d.CertNotAfter == nil || servable(d, s.cfg.MainDomain, s.cfg.MailHostname, now) != nil || d.CertNotAfter.Sub(now) < renewBefore
 }
 
 func (s *Service) dueLocked(d *Domain, now time.Time) bool {
@@ -591,7 +596,7 @@ func (s *Service) dispatch(ctx context.Context) {
 		}
 		// A stored name that breaks the rules (e.g. the main domain changed
 		// to a parent of it) gets no records and no ACME order — ever.
-		if err := checkName(name, s.cfg.MainDomain); err != nil {
+		if err := checkName(name, s.cfg.MainDomain, s.cfg.MailHostname); err != nil {
 			msg := "this name can't be served: " + err.Error()
 			if d.State != StateError || d.LastError != msg {
 				d.State, d.LastError, d.RecordsOK = StateError, msg, false
@@ -708,7 +713,7 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 		return
 	}
 	needCert := s.needsCert(snap, now)
-	hasValid := snap.CertNotAfter != nil && servable(snap, s.cfg.MainDomain, now) == nil
+	hasValid := snap.CertNotAfter != nil && servable(snap, s.cfg.MainDomain, s.cfg.MailHostname, now) == nil
 	s.mu.Lock()
 	caaDue := s.caaDueLocked(snap, s.accountURILocked())
 	s.mu.Unlock()
@@ -823,11 +828,13 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 			fail(err)
 			return
 		}
-		requested := snap.DueSets
+		requested, reqGens := snap.DueSets, snap.SetGens
 		s.update(name, gen, func(d *Domain) {
 			var left []string
 			for _, x := range d.DueSets {
-				if !contains(requested, x) { // requested meanwhile: next step
+				// Requested meanwhile (a new set, or the same one again
+				// after the snapshot: its generation moved): next step.
+				if !contains(requested, x) || d.SetGens[x] != reqGens[x] {
 					left = append(left, x)
 				}
 			}
@@ -868,7 +875,7 @@ func (s *Service) work(ctx context.Context, snap *Domain, j *job) {
 		// would refuse to serve.
 		probe := copyDomain(snap)
 		probe.CertPEM, probe.KeyPEM, probe.CertNotAfter = certPEM, keyPEM, &notAfter
-		if err := servable(probe, s.cfg.MainDomain, s.cfg.Now()); err != nil {
+		if err := servable(probe, s.cfg.MainDomain, s.cfg.MailHostname, s.cfg.Now()); err != nil {
 			fail(fmt.Errorf("the issued certificate can't be served: %w", err))
 			return
 		}
@@ -1275,19 +1282,17 @@ func (s *Service) handleApply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "mail is on for "+name+": its mail set replaces nomail (DELETE /domains/"+name+"/sets/mail first)")
 		return
 	}
-	oldSets, oldDue := d.Sets, d.DueSets
+	oldSets, oldDue, oldGens := d.Sets, d.DueSets, d.SetGens
 	for _, set := range b.Sets {
 		if set == dnsplan.SetNoMail && !contains(d.Sets, set) {
 			d.Sets = append(append([]string(nil), d.Sets...), set)
 		}
-		if !contains(d.DueSets, set) {
-			d.DueSets = append(append([]string(nil), d.DueSets...), set)
-		}
+		markDue(d, set)
 	}
 	d.NextAttempt = time.Time{}
 	err := s.store.Save(s.doc)
 	if err != nil {
-		d.Sets, d.DueSets = oldSets, oldDue
+		d.Sets, d.DueSets, d.SetGens = oldSets, oldDue, oldGens
 	}
 	v := s.viewLocked(d)
 	s.mu.Unlock()
@@ -1472,12 +1477,30 @@ func (s *Service) handleMailPut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Never the main mail set's names (pathName's checkName already keeps
+	// such a domain out; fail closed anyway).
+	host := s.cfg.MailHostname
+	if host == "" {
+		host = "mail." + s.cfg.MainDomain
+	}
+	if dnsplan.MailNameOwned(name, host) {
+		writeError(w, http.StatusBadRequest, "MAIL_HOSTNAME "+host+" is a name of "+name+"'s mail set")
+		return
+	}
+	for _, rec := range b.Records {
+		// ValidateMail keeps every name under name.
+		if n := strings.ToLower(strings.TrimSuffix(rec.Name, ".")); n == host || strings.HasSuffix(n, "."+host) {
+			writeError(w, http.StatusBadRequest, rec.Type+" "+n+": at or under MAIL_HOSTNAME "+host+" (the main domain's mail)")
+			return
+		}
+	}
 	s.updateMailSet(w, name, func(d *Domain) {
 		if contains(d.Sets, dnsplan.SetNoMail) {
 			d.NoMailBeforeMail = true
 		}
 		d.Sets = withSet(without(d.Sets, dnsplan.SetNoMail), dnsplan.SetMail)
-		d.DueSets = withSet(withSet(d.DueSets, dnsplan.SetNoMail), dnsplan.SetMail)
+		markDue(d, dnsplan.SetNoMail)
+		markDue(d, dnsplan.SetMail)
 		d.MailWanted = b.Records
 	}, fmt.Sprintf("mail set wanted (%d records)", len(b.Records)))
 }
@@ -1492,10 +1515,10 @@ func (s *Service) handleMailDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	s.updateMailSet(w, name, func(d *Domain) {
 		d.Sets = without(d.Sets, dnsplan.SetMail)
-		d.DueSets = withSet(d.DueSets, dnsplan.SetMail)
+		markDue(d, dnsplan.SetMail)
 		if d.NoMailBeforeMail {
 			d.Sets = withSet(d.Sets, dnsplan.SetNoMail)
-			d.DueSets = withSet(d.DueSets, dnsplan.SetNoMail)
+			markDue(d, dnsplan.SetNoMail)
 		}
 		d.NoMailBeforeMail, d.MailWanted = false, nil
 	}, "mail set off")
@@ -1528,6 +1551,18 @@ func (s *Service) updateMailSet(w http.ResponseWriter, name string, f func(d *Do
 	s.logf("domain %s: %s", name, what)
 	s.Kick()
 	writeJSON(w, http.StatusAccepted, v)
+}
+
+// markDue makes set due on d's next records step and counts the request
+// (SetGens, a fresh map: snapshots share none).
+func markDue(d *Domain, set string) {
+	d.DueSets = withSet(d.DueSets, set)
+	g := maps.Clone(d.SetGens)
+	if g == nil {
+		g = map[string]int{}
+	}
+	g[set]++
+	d.SetGens = g
 }
 
 // withSet / without return a new list with / without x.
