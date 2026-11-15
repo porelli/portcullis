@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
@@ -28,6 +29,8 @@ const Socket = "/tmp/mailctl.sock"
 type Status struct {
 	Bootstrapped func(context.Context) bool
 	ClientIP     string
+	// Checks is the last checks result (nil: none).
+	Checks func(context.Context) any
 }
 
 // Handler serves the socket's routes.
@@ -76,7 +79,33 @@ func Handler(m *machines.Machines, st Status) http.Handler {
 			writeErr(w, http.StatusServiceUnavailable, "mail server unreachable")
 			return
 		}
-		writeJSON(w, http.StatusOK, s)
+		var ck any
+		if st.Checks != nil {
+			ck = st.Checks(ctx)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": s, "checks": ck})
+	})
+	mux.HandleFunc("POST /dkim-rotate", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Domain string `json:"domain"`
+		}
+		d := json.NewDecoder(io.LimitReader(r.Body, 4096))
+		d.DisallowUnknownFields()
+		if d.Decode(&req) != nil || req.Domain == "" {
+			writeErr(w, http.StatusBadRequest, `the input must be {"domain"}`)
+			return
+		}
+		var nothing machines.ErrNothingToDo
+		switch err := m.DKIMRotate(r.Context(), strings.ToLower(req.Domain)); {
+		case errors.Is(err, machines.ErrNotMailDomain):
+			writeErr(w, http.StatusNotFound, req.Domain+" isn't a mail domain")
+		case errors.As(err, &nothing):
+			writeErr(w, http.StatusConflict, nothing.Why)
+		case err != nil:
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
+		default:
+			writeJSON(w, http.StatusOK, map[string]string{"domain": strings.ToLower(req.Domain), "result": "a new DKIM key pair is being made; it goes active once both public resolvers serve it"})
+		}
 	})
 	return mux
 }

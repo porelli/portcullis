@@ -264,6 +264,17 @@ mail_recovery_session() {
   dc up -d --no-deps $(runtime_no_build) mailctl >/dev/null 2>&1 || warn "could not start mailctl: ./portcullis up"
 }
 
+# mail_void_restore (fd 3: the password) — `mailctl void --reason restore`:
+# every mail password destroyed, restored_at recorded (M7). Credentials on
+# stdin only.
+mail_void_restore() {
+  local pw
+  _rt_docker_only
+  IFS= read -r pw <&3
+  MAIL_PW="$pw" jq -n --arg u "$MAIL_RECOVERY_USER" '{recovery_user: $u, recovery_password: env.MAIL_PW}' \
+    | dc run --rm --no-deps -T mailctl void --reason restore
+}
+
 # _mail_verify_gone (fd 3: the password) — mailctl's one-shot checks that
 # the recovery login now gets 401.
 _mail_verify_gone() {
@@ -352,11 +363,61 @@ mail_up_steps() {
   mail_port_start_ok || fail "$(mail_port_start_text)"
   mail_lan_only_ok "${MAIL_SUBMISSION_LAN_ONLY:-false}"
   [ "${MAILCTL_CLIENT_IP:-}" = "$(mail_client_ip_mode)" ] || _mail_set MAILCTL_CLIENT_IP "$(mail_client_ip_mode)"
+  mail_ipv6_ok
+  mail_ipv6_override
   mail_config_present || fail "mail is in COMPOSE_PROFILES but mail_etc/config.json is missing (Stalwart would start in bootstrap mode): run ./portcullis mail enable"
   mail_tls_present || mail_cert_ensure
   if [ "$mode" = upgrade ] || [ ! -s "$(_mail_dir)/api-key" ]; then
     mail_recovery_session mail_bootstrap_apply
   fi
+}
+
+# mail_ipv6_ok — MAIL_IPV6=on is possible here (P48): never under rootless
+# Podman (it rewrites IPv6 client addresses); under Docker the daemon must
+# keep ip6tables (daemon.json "ip6tables": false refuses; absent = Docker
+# ≥ 27's default true) and an IPv6 network must be creatable (a probe
+# network, removed at once).
+mail_ipv6_ok() {
+  local probe="portcullis-ipv6-probe-$$" cfg="${DOCKER_DAEMON_JSON:-/etc/docker/daemon.json}"
+  [ "${MAIL_IPV6:-off}" = on ] || return 0
+  if _rt_is_podman; then
+    fail "MAIL_IPV6=on is refused under rootless Podman: it rewrites IPv6 client addresses (set MAIL_IPV6=off)"
+  fi
+  if [ -r "$cfg" ] && [ "$(jq -r 'if type == "object" and has("ip6tables") then .ip6tables else true end' "$cfg" 2>/dev/null)" = false ]; then
+    fail "MAIL_IPV6=on needs Docker's ip6tables: $cfg says \"ip6tables\": false (Docker wouldn't filter IPv6 to the mail ports)"
+  fi
+  _mail_ipv6_probe "$probe" || fail "MAIL_IPV6=on: Docker can't create an IPv6 network here (enable IPv6 in the daemon: \"ipv6\": true, \"ip6tables\": true)"
+}
+
+# _mail_ipv6_probe <name> — an IPv6 network can be created (removed at once).
+_mail_ipv6_probe() {
+  _rt_docker_only
+  docker network create --ipv6 "$1" >/dev/null 2>&1 || return 1
+  docker network rm "$1" >/dev/null 2>&1 || true
+}
+
+# mail_ipv6_override — secrets/mail/ipv6.override.yml with mail's four
+# [::] port lines while MAIL_IPV6=on (added to COMPOSE_FILE by
+# runtime_export, and now), else removed.
+mail_ipv6_override() {
+  local f
+  f="$(_mail_dir)/ipv6.override.yml"
+  if [ "${MAIL_IPV6:-off}" != on ]; then
+    rm -f "$f"
+    return 0
+  fi
+  cat > "$f" <<'YML'
+# Written by ./portcullis (MAIL_IPV6=on): mail's ports on IPv6 too.
+services:
+  mail:
+    ports:
+      - "[::]:25:10025"
+      - "[::]:465:10465"
+      - "[::]:587:10587"
+      - "[::]:993:10993"
+YML
+  chmod 644 "$f"
+  _rt_compose_add "$f"
 }
 
 # mail_after_up — after the stack is up: the image-change recreate.
@@ -375,6 +436,7 @@ mail_enable() {
   require_cmd docker jq openssl
   _dns_automated "${DNS_PROVIDER:-none}" || fail "mail needs a DNS provider Portcullis can write (see setup/mail.md): DNS_PROVIDER=${DNS_PROVIDER:-none}"
   mail_lan_only_ok "${lan:-${MAIL_SUBMISSION_LAN_ONLY:-false}}"
+  mail_ipv6_ok
   [ -z "$host" ] || _mail_set MAIL_HOSTNAME "$host"
   [ -z "$lan" ] || _mail_set MAIL_SUBMISSION_LAN_ONLY "$lan"
   _mail_set MAILCTL_CLIENT_IP "$(mail_client_ip_mode)"
@@ -388,6 +450,7 @@ mail_enable() {
   mail_recovery_session mail_bootstrap_apply
   hub_env_write
   mail_prom_targets
+  mail_ipv6_override
   if declare -F monitoring_fix_perms >/dev/null; then monitoring_fix_perms; fi
   stack_compose_up mail mail-resolver mailctl traefik hub
   mail_image_update
@@ -562,6 +625,127 @@ EOF
 
 # ── help / commands ────────────────────────────────────────
 
+# ── status (contract §19.10) ──
+
+# _mail_timer_state — portcullis-mail.timer: active | inactive | unknown
+# (no systemd here). Podman installs it as the operator's user unit.
+_mail_timer_state() {
+  local scope=()
+  command -v systemctl >/dev/null 2>&1 || { echo unknown; return 0; }
+  ! _rt_is_podman || scope=(--user)
+  if systemctl "${scope[@]}" is-active --quiet portcullis-mail.timer 2>/dev/null; then echo active; else echo inactive; fi
+}
+
+# mail_status_json — the mail block of status (absent with the profile
+# off: nothing printed): the services' health, mailctl's status and checks
+# (`mailctl status --json` on its control socket), the timer, the client
+# address mode and `problem` (a service not healthy, mailctl unreachable,
+# a Problem check).
+mail_status_json() {
+  local svc h hs="{}" ms=""
+  mail_profile_on || return 0
+  for svc in mail mailctl mail-resolver; do
+    h="$(rt_health "$svc" 2>/dev/null)" || h=missing
+    hs="$(jq -c --arg s "$svc" --arg h "$h" '. + {($s): $h}' <<<"$hs")"
+  done
+  ms="$(rt_exec mailctl -- mailctl status --json 2>/dev/null)" || ms=""
+  printf '%s' "$ms" | jq -e 'type == "object"' >/dev/null 2>&1 || ms=""
+  jq -cn --argjson hs "$hs" --arg ms "$ms" --arg timer "$(_mail_timer_state)" \
+    --arg cip "${MAILCTL_CLIENT_IP:-$(mail_client_ip_mode)}" --arg host "$(mail_hostname)" '
+    ($ms | if . == "" then null else fromjson end) as $m
+    | {enabled: true, hostname: $host, services: $hs, timer: $timer, client_ip: $cip,
+       mailctl: ($m.status // null), checks: ($m.checks // null)}
+    | .problem = (([.services[] | select(. != "healthy")] | length) > 0 or .mailctl == null
+                  or ([(.checks.checks // [])[] | select(.severity == "problem")] | length) > 0)'
+}
+
+# mail_status_lines <json> — the "Mail" block in status's vocabulary.
+mail_status_lines() {
+  local j="$1" st text
+  [ -n "$j" ] || return 0
+  printf '\n%sMail%s\n' "$C_CYAN" "$C_NC"
+  while IFS=$'\t' read -r st text; do
+    [ -n "$st" ] && _st_line "$st" "$text"
+  done < <(printf '%s' "$j" | jq -r '
+    def sev: if . == "problem" then "fail" elif . == "warning" then "warn" elif . == "info" then "note" else "ok" end;
+    (.services | to_entries[] | [(if .value == "healthy" then "ok" else "fail" end), "\(.key): \(.value)"]),
+    (if .mailctl == null then ["fail", "mailctl didn'"'"'t answer (its status and checks are unknown)"] else
+      (.mailctl as $s
+       | (if $s.cert == null then ["fail", "no mail certificate for \(.hostname): ./portcullis mail cert"]
+          else ["ok", "certificate \($s.cert.sans | join(", ")) valid until \($s.cert.not_after)"] end),
+         ($s.dkim | group_by(.domain)[] | ["ok", "DKIM \(.[0].domain): " + (map("\(.selector) \(.stage)") | join(", "))]),
+         ($s.mtasts[] | [(if .mode == "testing" and .enforce_ready then "note" else "ok" end),
+            "MTA-STS \(.domain): \(.mode)" + (if .enforce_ready then " (ready to enforce: the doctor fix)" else "" end)]),
+         ($s.dmarc[] | [(if .proposed != null then "note" else "ok" end),
+            "DMARC \(.domain): p=\(.policy)" + (if .proposed != null then " (\(.proposed) proposed: the doctor fix)" else "" end)]),
+         ["ok", "queue: \($s.queue.messages) message(s), \($s.queue.deferred) deferred"],
+         (if ($s.former | length) > 0 then ["note", "former accounts: " + ($s.former | map("\(.username) (\(.id))") | join(", "))] else empty end))
+     end),
+    ((.checks.checks // [])[] | select(.severity != "ok") | [(.severity | sev), "check \(.id): \(.detail)"]),
+    (if .timer == "active" then ["ok", "daily timer portcullis-mail.timer active"]
+     elif .timer == "inactive" then ["warn", "daily timer portcullis-mail.timer missing or inactive: ./portcullis mail schedule --systemd (certificate renewal, DKIM, TLSA)"]
+     else ["note", "daily timer: unknown (no systemd here)"] end),
+    (if .client_ip == "rewritten" then ["warn", "client addresses rewritten (rootless Podman): SPF, iprev and the IP blocklists are off"] else ["ok", "client addresses preserved"] end)
+    | @tsv')
+}
+
+# mail_status <json> — `mail status [--json]`; exit 1 on a problem.
+mail_status() {
+  local j
+  mail_profile_on || fail "mail is off: ./portcullis mail enable"
+  j="$(mail_status_json)"
+  if [ "$1" = true ]; then printf '%s\n' "$j"; else mail_status_lines "$j"; echo; fi
+  [ "$(printf '%s' "$j" | jq -r .problem)" != true ]
+}
+
+# mail_test <to> — `mailctl test --to`: a message from the first postmaster
+# account, signed by the primary domain's DKIM keys (contract §19.10).
+mail_test() {
+  local to="$1" out
+  mail_profile_on || fail "mail is off: ./portcullis mail enable"
+  out="$(rt_exec mailctl -- mailctl test --to "$to")" || fail "the test message could not be sent (see above)"
+  printf '%s' "$out" | jq -r '"Sent from \(.from) to \(.to): \(.queued)", "Message-ID: <\(.message_id)>"'
+  echo "    Open the message's headers (\"Show original\" / \"View source\") and check Authentication-Results:"
+  echo "    dkim=pass, spf=pass and dmarc=pass mean receivers can verify mail from this server."
+}
+
+# mail_dkim_rotate <domain> — a new DKIM key pair now (mailctl's
+# dkim-rotate action on its control socket).
+mail_dkim_rotate() {
+  local d="$1" out
+  mail_profile_on || fail "mail is off: ./portcullis mail enable"
+  out="$(rt_exec mailctl -- mailctl dkim rotate "$d" --json)" || fail "DKIM rotation of $d refused (see above)"
+  ok "$(printf '%s' "$out" | jq -r '"\(.domain): \(.result)"')"
+  if [ "$d" = "${PORTCULLIS_DOMAIN:-}" ]; then
+    echo "    The main domain's records follow at the next ./portcullis mail rotate (or ./portcullis dns setup --only mail)."
+  else
+    echo "    The Hub publishes the new TXT records for $d."
+  fi
+}
+
+# mail_export <former-id> <out> — a former account's mailbox as mbox
+# (0600) under backups/mail-export/ (or <out>), streamed from `mailctl
+# export`; nothing is left behind when it fails.
+mail_export() {
+  local id="$1" out="$2" dir tmp
+  mail_profile_on || fail "mail is off: ./portcullis mail enable"
+  if [ -z "$out" ]; then
+    dir="$PORTCULLIS_ROOT/backups/mail-export"
+    (umask 077 && mkdir -p "$dir")
+    chmod 700 "$dir"
+    out="$dir/$id-$(date -u +%Y%m%dT%H%M%SZ).mbox"
+  fi
+  [ ! -e "$out" ] || fail "$out exists: choose another --out"
+  tmp="$out.part"
+  if ! (umask 077 && rt_exec mailctl -- mailctl export --former "$id" > "$tmp"); then
+    rm -f "$tmp"
+    fail "the export of $id failed (see above); the account stays disabled"
+  fi
+  chmod 600 "$tmp"
+  mv "$tmp" "$out"
+  ok "Exported $id to $out ($(grep -c '^From ' "$out" 2>/dev/null || echo 0) messages, mode 0600)."
+}
+
 help_mail() {
   cat <<'EOF'
 Usage: portcullis mail <subcommand>
@@ -569,7 +753,7 @@ Usage: portcullis mail <subcommand>
   enable        Turn the mail server on (profile mail, certificate, bootstrap)
   disable       Turn mail off for every domain (drains first)
   status        Mail status: certificate, DKIM, MTA-STS, DMARC, queue, checks
-  test          Send a signed test message as postmaster@<primary domain>
+  test          Send a signed test message from the postmaster account
   dkim          dkim rotate <domain>: a new DKIM key now
   cert          Issue or renew the mail certificate (below 30 days)
   rotate        The daily step: certificate, DKIM / MTA-STS / TLSA, the main domain's records
@@ -608,7 +792,7 @@ EOF
 }
 
 help_mail_status() { echo "Usage: portcullis mail status [--json]"; echo; echo "Mail status (certificate, DKIM, MTA-STS, DMARC, queue, checks)."; }
-help_mail_test() { echo "Usage: portcullis mail test --to <address>"; echo; echo "Send a signed test message as postmaster@<primary domain>."; }
+help_mail_test() { echo "Usage: portcullis mail test --to <address>"; echo; echo "Send a DKIM-signed test message from the first postmaster account (<user>@<primary domain>) and print its queue id."; }
 help_mail_dkim() { echo "Usage: portcullis mail dkim rotate <domain>"; echo; echo "Make a new DKIM key pair for the domain now."; }
 help_mail_cert() { echo "Usage: portcullis mail cert"; echo; echo "Issue or renew the mail certificate (renewal below 30 days); reloads Stalwart on a change."; }
 help_mail_rotate() { echo "Usage: portcullis mail rotate [--next-key]"; echo; echo "The daily timer's step: certificate, DKIM / MTA-STS / TLSA state, the main domain's mail records."; echo "--next-key starts a mail key rollover (both TLSA records published; the timer switches after 2×TTL + 1 day)."; }
@@ -684,9 +868,9 @@ cmd_mail() {
       if [ "${MAIL_CERT_RENEWED:-false}" = true ] && rt_running mailctl; then rt_exec mailctl -- mailctl reload-tls || fail "mailctl reload-tls failed"; fi ;;
     rotate) mail_rotate "$nextkey" ;;
     schedule) mail_schedule_systemd "$out" ;;
-    status|test|dkim|export)
-      mail_refuse_kube
-      fail "mail $sub isn't available in this version yet" ;;
+    status) mail_status "$json" ;;
+    test) mail_test "$to" ;;
+    dkim) mail_dkim_rotate "${pos[1]}" ;;
+    export) mail_export "${pos[0]}" "$out" ;;
   esac
-  : "$json" "$to"
 }

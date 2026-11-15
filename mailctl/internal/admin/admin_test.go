@@ -83,7 +83,17 @@ func TestSocket(t *testing.T) {
 	if out, err = Call(path, "GET", "/dns/main", nil); err != nil || !strings.Contains(string(out), `"domain":"example.com"`) {
 		t.Fatalf("dns %s %v", out, err)
 	}
-	if out, err = Call(path, "GET", "/status", nil); err != nil || !strings.Contains(string(out), `"timer_seen_at":"`) {
+	// The rotate pass made pending keys: a second rotation is refused.
+	if _, err := Call(path, "POST", "/dkim-rotate", []byte(`{"domain":"Example.com"}`)); err == nil || !strings.Contains(err.Error(), "already running") {
+		t.Fatalf("dkim rotate while pending %v", err)
+	}
+	if out, err = Call(path, "POST", "/dkim-rotate", []byte(`{"domain":"team-b.example.org"}`)); err != nil || !strings.Contains(string(out), `"domain":"team-b.example.org"`) {
+		t.Fatalf("dkim rotate %s %v", out, err)
+	}
+	if _, err := Call(path, "POST", "/dkim-rotate", []byte(`{"domain":"nope.example"}`)); err == nil || !strings.Contains(err.Error(), "isn't a mail domain") {
+		t.Fatalf("unknown domain %v", err)
+	}
+	if out, err = Call(path, "GET", "/status", nil); err != nil || !strings.Contains(string(out), `"timer_seen_at":"`) || !strings.Contains(string(out), `"checks":null`) {
 		t.Fatalf("status %s %v", out, err)
 	}
 	if _, err := Call(path, "POST", "/rotate", []byte(`{}`)); err == nil {

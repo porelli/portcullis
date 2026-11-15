@@ -4994,6 +4994,74 @@ expect_eq "mail_prom_targets: profile on → mail + mailctl targets, the metrics
 mt 'export MONITORING_SECRETS="$PORTCULLIS_ROOT/secrets/monitoring" COMPOSE_PROFILES=monitoring; mkdir -p "$MONITORING_SECRETS/prometheus"; printf x > "$MONITORING_SECRETS/prometheus/mail-metrics-secret"; mail_prom_targets'
 expect_eq "mail_prom_targets: profile off → [] and an empty password copy" "$(cat "$P/mail-targets.json"):$(wc -c < "$P/mail-metrics-secret" | tr -d ' ')" "[]:0"
 
+# ── mail status / backup / restore / IPv6 / export (Task 10) ──
+mt 'export COMPOSE_PROFILES=monitoring; out="$(mail_status_json)"; printf "[%s]" "$out" > "$ML/sj"'
+expect_eq "mail_status_json: nothing with the profile off (status --json has no mail key)" "$(cat "$ML/sj")" "[]"
+export MSTAT='{"status":{"cert":{"not_after":"2027-02-01T00:00:00Z","sans":["mail.mail.example"]},"dkim":[{"domain":"mail.example","selector":"v1-ed25519-20261115","stage":"active"}],"mtasts":[{"domain":"mail.example","mode":"testing","enforce_ready":false}],"dmarc":[{"domain":"mail.example","policy":"reject","proposed":null}],"queue":{"messages":2,"deferred":1},"former":[]},"checks":{"checks":[{"id":"cert","severity":"problem","detail":"expired"},{"id":"port25","severity":"info","detail":"not known"},{"id":"blocklist","severity":"ok","detail":"not listed"}]}}'
+mt 'rt_health() { echo healthy; }; rt_exec() { echo "rt_exec $*" >> "$ML/argv"; printf "%s" "$MSTAT"; }; _mail_timer_state() { echo inactive; }
+  mail_status_json > "$ML/sj"; mail_status_lines "$(cat "$ML/sj")" | sed "s/\x1b\[[0-9;]*m//g" > "$ML/sl"'
+expect_eq "mail_status_json: services, mailctl's status and checks, a Problem check → problem" \
+  "$(jq -c '{p: .problem, s: .services.mail, t: .timer, c: .client_ip, q: .mailctl.queue.messages, n: (.checks.checks | length)}' "$ML/sj")" \
+  '{"p":true,"s":"healthy","t":"inactive","c":"preserved","q":2,"n":3}'
+expect_eq "mail status: the timer missing is a warning line; a Problem check a ✗ line; ok checks not listed" \
+  "$(grep -c '! daily timer portcullis-mail.timer missing or inactive' "$ML/sl"):$(grep -c '✗ check cert: expired' "$ML/sl"):$(grep -c '· check port25: not known' "$ML/sl"):$(grep -c 'check blocklist' "$ML/sl")" "1:1:1:0"
+expect_eq "mail status: the status read is mailctl's socket call" "$(grep -c '^rt_exec mailctl -- mailctl status --json$' "$ML/argv")" 1
+mt 'rt_health() { echo healthy; }; rt_exec() { return 1; }; _mail_timer_state() { echo active; }; mail_status_json > "$ML/sj"'
+expect_eq "mail_status_json: mailctl not answering → problem, mailctl null" "$(jq -c '{p: .problem, m: .mailctl}' "$ML/sj")" '{"p":true,"m":null}'
+
+# Backup (M11): mail stopped for its copy and started again, even when the copy fails.
+mt '_volume_name() { echo "portcullis_$1"; }; rt_running() { [ "$1" = mail ]; }
+  rt_stop() { echo "stop $*" >> "$ML/argv"; }; rt_start() { echo "start $*" >> "$ML/argv"; }
+  _backup_volume_files() { echo "copy $1 $2:$3" >> "$ML/argv"; [ "$1" != portcullis_mail_etc ]; }
+  mkdir -p "$ML/w"; _backup_mail_data "$ML/w"'; rc=$?
+expect_eq "backup: mail stopped, mail_data copied, mail_etc's copy fails → mail started again, the backup fails" \
+  "$rc:$(grep -E '^(stop|start|copy)' "$ML/argv" | tr '\n' '|'):$(grep -c 'could not back up volume mail_etc (mail was started again)' "$ML/out")" \
+  "1:stop mail|copy portcullis_mail_data 2000:2000|copy portcullis_mail_etc 2000:2000|start mail|:1"
+mt '_volume_name() { echo "portcullis_$1"; }; rt_running() { [ "$1" = mail ]; }
+  rt_stop() { echo "stop $*" >> "$ML/argv"; }; rt_start() { echo "start $*" >> "$ML/argv"; }
+  _backup_volume_files() { echo "copy $1" >> "$ML/argv"; }; mkdir -p "$ML/w"; _backup_mail_data "$ML/w"'; rc=$?
+expect_eq "backup: both mail volumes copied with mail stopped, then started" "$rc:$(grep -E '^(stop|start|copy)' "$ML/argv" | tr '\n' '|')" \
+  "0:stop mail|copy portcullis_mail_data|copy portcullis_mail_etc|start mail|"
+mt 'export COMPOSE_PROFILES=monitoring; _backup_volume_files() { echo copy >> "$ML/argv"; }; _backup_mail_data "$ML"'
+expect_eq "backup: no mail copy without the profile" "$(cat "$ML/argv" 2>/dev/null | grep -c copy)" 0
+expect_eq "backup: mailctl_data / mail_acme / mail_tls archived online" "$(tr ' ' '\n' <<<"$BACKUP_FILE_VOLUMES" | grep -E '^(mailctl_data|mail_acme|mail_tls):' | tr '\n' ' ')" "mailctl_data:10010:10010 mail_acme:10004:10004 mail_tls:10004:2000 "
+mkdir -p "$WORK/strip/mail" && touch "$WORK/strip/mail/recovery.env" "$WORK/strip/mail/update.env" "$WORK/strip/mail/.stalwart-image" "$WORK/strip/mail/api-key"
+_strip_host_files "$WORK/strip"
+expect_eq "backup / restore: the recovery admin, update.env and the image stamp are never kept (P51)" "$(ls -A "$WORK/strip/mail" | tr '\n' ' ')" "api-key "
+
+# Restore (M7): void in a recovery session; on failure mail and mailctl stay stopped.
+mt 'touch "$ML/mail_data.tar.gz"; mail_recovery_session() { echo "session $*" >> "$ML/argv"; return 1; }; rt_stop() { echo "stop $*" >> "$ML/argv"; }; _restore_mail_void "$ML"'; rc=$?
+expect_eq "restore: voiding fails → mail and mailctl stopped, refused" "$rc:$(grep -E '^(session|stop)' "$ML/argv" | tr '\n' '|')" "1:session mail_void_restore|stop mail mailctl|"
+mt 'RESTORE_MAIL_UNVOIDED=true; _restore_mail_outcome'; rc=$?
+expect_eq "restore: the unvoided outcome fails with the retry hint" "$rc:$(grep -c 'mail passwords could not be voided: mail stays stopped (./portcullis mail enable to retry)' "$ML/out")" "1:1"
+mt 'touch "$ML/mail_data.tar.gz"; mail_recovery_session() { echo "session $*" >> "$ML/argv"; }; rt_stop() { echo "stop $*" >> "$ML/argv"; }; _restore_mail_void "$ML"'; rc=$?
+expect_eq "restore: voided in a recovery session, nothing stopped" "$rc:$(grep -E '^(session|stop)' "$ML/argv" | tr '\n' '|')" "0:session mail_void_restore|"
+mt 'mail_recovery_session() { echo session >> "$ML/argv"; }; _restore_mail_void "$ML"'; rc=$?
+expect_eq "restore: a backup without a mail store → no session" "$rc:$(cat "$ML/argv" 2>/dev/null | grep -c session)" "0:0"
+mt 'MAIL_PW_SEEN=""; dc() { echo "dc $*" >> "$ML/argv"; cat > "$ML/stdin"; }; mail_void_restore 3<<<"s3cret-pw"'
+expect_eq "restore: mailctl void gets the recovery credentials on stdin only" \
+  "$(grep -c '^dc run --rm --no-deps -T mailctl void --reason restore$' "$ML/argv"):$(grep -c s3cret "$ML/argv"):$(jq -r .recovery_password "$ML/stdin")" "1:0:s3cret-pw"
+
+# IPv6 (P48): refused under Podman and without Docker's ip6tables; the override's four [::] lines.
+mt 'export MAIL_IPV6=on CONTAINER_RUNTIME=podman; mail_ipv6_ok'; rc=$?
+expect_eq "MAIL_IPV6=on refused on rootless Podman" "$rc:$(grep -c 'rootless Podman: it rewrites IPv6 client addresses' "$ML/out")" "1:1"
+mt 'export MAIL_IPV6=on DOCKER_DAEMON_JSON="$ML/daemon.json"; echo "{\"ipv6\":true,\"ip6tables\":false}" > "$DOCKER_DAEMON_JSON"; mail_ipv6_ok'; rc=$?
+expect_eq "MAIL_IPV6=on refused without ip6tables" "$rc:$(grep -c '"ip6tables": false' "$ML/out")" "1:1"
+mt 'export MAIL_IPV6=on DOCKER_DAEMON_JSON="$ML/none.json"; docker() { echo "docker $*" >> "$ML/argv"; [ "$2" != create ]; }; mail_ipv6_ok'; rc=$?
+expect_eq "MAIL_IPV6=on refused when Docker can't make an IPv6 network" "$rc:$(grep -c "can't create an IPv6 network" "$ML/out")" "1:1"
+mt 'export MAIL_IPV6=on DOCKER_DAEMON_JSON="$ML/none.json"; docker() { echo "docker $*" >> "$ML/argv"; }; mail_ipv6_ok && mail_ipv6_override && printf "%s" "$COMPOSE_FILE" > "$ML/cf"'; rc=$?
+expect_eq "MAIL_IPV6=on: the probe network removed, the override's four [::] lines, COMPOSE_FILE gains it" \
+  "$rc:$(grep -c '^docker network rm portcullis-ipv6-probe-' "$ML/argv"):$(grep -c '"\[::\]:' "$ML/root/secrets/mail/ipv6.override.yml"):$(grep -c 'ipv6.override.yml' "$ML/cf")" "0:1:4:1"
+mt 'touch "$PORTCULLIS_ROOT/secrets/mail/ipv6.override.yml"; mail_ipv6_ok && mail_ipv6_override'
+expect_eq "MAIL_IPV6=off: no check, the override removed" "$([ -e "$ML/root/secrets/mail/ipv6.override.yml" ] && echo kept || echo gone)" gone
+
+# export: 0600 under backups/mail-export; nothing left on failure.
+mt 'rt_exec() { printf "From MAILER-DAEMON Sun Nov 15 10:00:00 2026\nSubject: x\n\nhi\n"; }; mail_export former-6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b ""'; rc=$?
+F="$(ls "$ML/root/backups/mail-export/"*.mbox 2>/dev/null | head -n1)"
+expect_eq "mail export writes 0600 under backups/mail-export (dir 0700)" "$rc:$(file_mode "$F"):$(file_mode "$ML/root/backups/mail-export"):$(grep -c '^From ' "$F")" "0:600:700:1"
+mt 'rt_exec() { printf partial; return 1; }; mail_export former-6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b ""'; rc=$?
+expect_eq "mail export: a failure leaves no file" "$rc:$(ls -A "$ML/root/backups/mail-export" | wc -l | tr -d ' ')" "1:0"
+
 echo ""
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

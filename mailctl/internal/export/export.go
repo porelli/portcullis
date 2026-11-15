@@ -182,32 +182,36 @@ func (e *Exporter) Export(ctx context.Context, formerID string, w io.Writer) (n 
 	return n, nil
 }
 
-func (e *Exporter) tlsConfig(now time.Time) *tls.Config {
+func (e *Exporter) tlsConfig(now time.Time) *tls.Config { return PinnedTLS(e.ServerName, e.SPKI, now) }
+
+// PinnedTLS trusts exactly the mail certificate: its key one of spki
+// (sha256 of the SPKI, hex), valid now, naming serverName.
+func PinnedTLS(serverName string, spki []string, now time.Time) *tls.Config {
 	return &tls.Config{
-		ServerName: e.ServerName, MinVersion: tls.VersionTLS12,
+		ServerName: serverName, MinVersion: tls.VersionTLS12,
 		InsecureSkipVerify: true, //nolint:gosec // replaced by the SPKI pin in VerifyPeerCertificate
 		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
 			if len(raw) == 0 {
-				return errors.New("imap: no certificate")
+				return errors.New("tls: no certificate")
 			}
 			leaf, err := x509.ParseCertificate(raw[0])
 			if err != nil {
-				return fmt.Errorf("imap: certificate: %w", err)
+				return fmt.Errorf("tls: certificate: %w", err)
 			}
 			sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
 			pinned := false
-			for _, p := range e.SPKI {
+			for _, p := range spki {
 				if strings.EqualFold(p, hex.EncodeToString(sum[:])) {
 					pinned = true
 				}
 			}
 			if !pinned {
-				return errors.New("imap: the certificate's key isn't the mail certificate's (SPKI pin)")
+				return errors.New("tls: the certificate's key isn't the mail certificate's (SPKI pin)")
 			}
 			if now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
-				return errors.New("imap: the certificate isn't valid now")
+				return errors.New("tls: the certificate isn't valid now")
 			}
-			return leaf.VerifyHostname(e.ServerName)
+			return leaf.VerifyHostname(serverName)
 		},
 	}
 }

@@ -13,6 +13,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +38,7 @@ import (
 	"github.com/portcullis/mailctl/internal/export"
 	"github.com/portcullis/mailctl/internal/logx"
 	"github.com/portcullis/mailctl/internal/machines"
+	"github.com/portcullis/mailctl/internal/mailtest"
 	"github.com/portcullis/mailctl/internal/metrics"
 	"github.com/portcullis/mailctl/internal/reconcile"
 	"github.com/portcullis/mailctl/internal/resolve"
@@ -50,9 +52,7 @@ const usage = `usage: mailctl [serve|healthcheck|bootstrap [--rotate-key|--verif
 
 // later are the subcommands later tasks fill (each talks to the running
 // serve process or to Stalwart directly, as its task says).
-var later = map[string]bool{
-	"test": true,
-}
+var later = map[string]bool{}
 
 func main() { os.Exit(run(os.Args[1:], os.Getenv, os.Stdout, os.Stderr)) }
 
@@ -81,8 +81,10 @@ func run(args []string, env func(string) string, stdout, stderr io.Writer) int {
 		return exportCmd(args[1:], env, stdout, stderr)
 	case cmd == "reload-tls":
 		return reloadTLS(env, stderr)
-	case cmd == "dns" || cmd == "rotate" || cmd == "status":
+	case cmd == "dns" || cmd == "rotate" || cmd == "status" || cmd == "dkim":
 		return adminCmd(cmd, args[1:], os.Stdin, stdout, stderr)
+	case cmd == "test":
+		return testCmd(args[1:], env, stdout, stderr)
 	case later[cmd]:
 		fmt.Fprintf(stderr, "mailctl %s: not available in this build\n", cmd)
 		return 1
@@ -190,7 +192,8 @@ func serve(env func(string) string, stderr io.Writer) error {
 	if rewritten {
 		clientIP = config.ClientIPRewritten
 	}
-	adminSrv := newServer("", admin.Handler(mc, admin.Status{Bootstrapped: v1.Bootstrapped, ClientIP: clientIP}))
+	adminSrv := newServer("", admin.Handler(mc, admin.Status{Bootstrapped: v1.Bootstrapped, ClientIP: clientIP,
+		Checks: func(ctx context.Context) any { return ck.Get(ctx, false) }}))
 	adminSrv.WriteTimeout = 5 * time.Minute
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -280,12 +283,59 @@ func statusMetrics(ctx context.Context, mc *machines.Machines, m *metrics.Metric
 	}
 }
 
+// testCmd is `mailctl test --to <addr>`: the test message (contract
+// §19.10), one JSON line on stdout.
+func testCmd(args []string, env func(string) string, stdout, stderr io.Writer) int {
+	if len(args) != 2 || args[0] != "--to" || !strings.Contains(args[1], "@") || strings.ContainsAny(args[1], " <>\r\n") {
+		fmt.Fprintln(stderr, "usage: mailctl test --to <address>")
+		return 2
+	}
+	cfg, err := config.Load(env)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl test: %v\n", err)
+		return 1
+	}
+	key, err := api.ReadSecret(cfg.APIKeyFile, 1)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl test: Stalwart's API key: %v\n", err)
+		return 1
+	}
+	logx.AddSecret(key)
+	st, err := state.Open(cfg.DataDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl test: %v\n", err)
+		return 1
+	}
+	p := st.Get()
+	spki := state.SPKIs(p)
+	if len(spki) == 0 {
+		fmt.Fprintln(stderr, "mailctl test: the mail certificate's key isn't known to mailctl yet (run ./portcullis mail rotate)")
+		return 1
+	}
+	s := &mailtest.Sender{C: stalwart.New(cfg.StalwartURL, stalwart.Bearer(key)), Doc: p.Doc,
+		SubmitAddr: net.JoinHostPort(mailIP(cfg.StalwartURL), "10587"), MailctlIP: cfg.MailIP,
+		TLS: func(now time.Time) *tls.Config { return export.PinnedTLS(cfg.Hostname, spki, now) }}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	res, err := s.Send(ctx, args[1])
+	if err != nil {
+		fmt.Fprintf(stderr, "mailctl test: %s\n", logx.Redact(err.Error()))
+		return 1
+	}
+	json.NewEncoder(stdout).Encode(res)
+	return 0
+}
+
 // adminCmd is `mailctl dns --main --json`, `mailctl rotate --json` (stdin:
 // {"dnssec_state", "spki": {"current", "next"}}) and `mailctl status
 // --json`: one call on the running serve's control socket, its JSON on
 // stdout.
 func adminCmd(cmd string, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	want := map[string][]string{"dns": {"--main", "--json"}, "rotate": {"--json"}, "status": {"--json"}}[cmd]
+	want := map[string][]string{"dns": {"--main", "--json"}, "rotate": {"--json"}, "status": {"--json"}, "dkim": {"rotate", "<domain>", "--json"}}[cmd]
+	var domain string
+	if cmd == "dkim" && len(args) == 3 && args[0] == "rotate" && args[2] == "--json" {
+		domain, args = strings.ToLower(args[1]), []string{"rotate", "<domain>", "--json"}
+	}
 	if !slices.Equal(args, want) {
 		fmt.Fprintf(stderr, "usage: mailctl %s %s\n", cmd, strings.Join(want, " "))
 		return 2
@@ -299,6 +349,9 @@ func adminCmd(cmd string, args []string, stdin io.Reader, stdout, stderr io.Writ
 		b, err = admin.Call(admin.Socket, http.MethodGet, "/dns/main", nil)
 	case "status":
 		b, err = admin.Call(admin.Socket, http.MethodGet, "/status", nil)
+	case "dkim":
+		body, _ := json.Marshal(map[string]string{"domain": domain})
+		b, err = admin.Call(admin.Socket, http.MethodPost, "/dkim-rotate", body)
 	case "rotate":
 		in, rerr := io.ReadAll(io.LimitReader(stdin, 64<<10))
 		if rerr != nil {
