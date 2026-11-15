@@ -45,12 +45,19 @@ block_egress() {
   sudo ip6tables -I FORWARD -p tcp -m multiport --dports 25,465,587 -j REJECT --reject-with tcp-reset
   sudo ip6tables -I OUTPUT -p tcp -m multiport --dports 25,465,587 ! -d ::1/128 -j REJECT --reject-with tcp-reset
   # Probes to TEST-NET-1: refused at once (exit 7), never a timeout.
-  set +e
-  docker run --rm --network portcullis_mail-egress "$CURL_IMG" -s --connect-timeout 5 telnet://192.0.2.1:25 </dev/null; rc=$?
-  set -e
-  [ "$rc" = 7 ] || fail "outbound 25 from a container isn't refused (curl exit $rc)"
+  probe_egress bridge
   if timeout 5 bash -c 'exec 3<>/dev/tcp/192.0.2.1/25' 2>/dev/null; then fail "outbound 25 from the runner connected"; fi
   echo "PASS: outbound TCP 25/465/587 rejected (containers and runner)"
+}
+# probe_egress <network> — every SMTP port to TEST-NET-1 is refused (exit 7).
+probe_egress() {
+  local p rc
+  for p in 25 465 587; do
+    set +e
+    docker run --rm --network "$1" "$CURL_IMG" -s --connect-timeout 5 "telnet://192.0.2.1:$p" </dev/null; rc=$?
+    set -e
+    [ "$rc" = 7 ] || fail "outbound $p from a container on $1 isn't refused (curl exit $rc)"
+  done
 }
 
 # smtp.py — the host-side SMTP / IMAP checks (stdlib).
@@ -121,6 +128,8 @@ setup)
   ./portcullis mail enable --yes 2>&1 | tee "$ST/enable.out"
   [ "${PIPESTATUS[0]}" = 0 ] || fail "mail enable"
   for s in mail mailctl mail-resolver; do wait_healthy "$s"; done
+  probe_egress portcullis_mail-egress
+  echo "PASS: outbound TCP 25/465/587 rejected from mail-egress too"
   # 1. Users, capabilities, read-only.
   docker inspect "$(cid mail)" | jq -e '.[0] | .Config.User == "2000:2000" and .HostConfig.ReadonlyRootfs
       and .HostConfig.CapAdd == ["NET_BIND_SERVICE"] and (.HostConfig.CapDrop | index("ALL")) != null and .HostConfig.Privileged == false' >/dev/null \
