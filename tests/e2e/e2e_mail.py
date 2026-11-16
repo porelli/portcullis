@@ -506,15 +506,15 @@ def setup(browser) -> None:
         create_user(u)
     gid = next(g["id"] for g in gql("{ groups { id displayName } }")["groups"] if g["displayName"] == "lldap_admin")
     gql("mutation($u: String!, $g: Int!) { addUserToGroup(userId: $u, groupId: $g) { ok } }", {"u": "root", "g": gid})
-    hub_ok("PUT", f"/api/mail/domains/{DOMAIN}", {"enabled": True, "groups": []})
+    hub_ok("PUT", f"/api/mail/domains/{DOMAIN}", {"enabled": True, "groups": []}, want=(200, 204))
     until("mail_users made by the Hub", lambda: any(g["displayName"] == "mail_users" for g in gql("{ groups { id displayName } }")["groups"]), 60)
     for u in ("alice", "bob", "root"):
         member("add", "mail_users", u)
-    hub_ok("PUT", f"/api/mail/domains/{EXTRA}", {"enabled": True, "groups": ["mail_users"]})
+    hub_ok("PUT", f"/api/mail/domains/{EXTRA}", {"enabled": True, "groups": ["mail_users"]}, want=(200, 204))
     hub_ok("POST", "/api/directory/groups", {"name": "team"}, want=(200, 201))
     for u in ("alice", "bob"):
         member("add", "team", u)
-    hub_ok("PUT", "/api/directory/groups/team/mail-list", {"enabled": True, "domain": DOMAIN, "posting": "members"})
+    hub_ok("PUT", "/api/directory/groups/team/mail-list", {"enabled": True, "domain": DOMAIN, "posting": "members"}, want=(200, 204))
     # Additions are debounced 60 s: every address answers RCPT once applied.
     for a in (f"alice@{DOMAIN}", f"bob@{DOMAIN}", f"root@{DOMAIN}", f"bob@{EXTRA}", f"team@{DOMAIN}"):
         until(f"{a} accepted at RCPT", lambda a=a: smtp25("probe@relay-test.example", a)[1] == 250, 240, every=5)

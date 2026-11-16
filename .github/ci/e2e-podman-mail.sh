@@ -77,7 +77,12 @@ services:
       MAILCTL_RESOLVERS: 172.31.255.4:5353
       MAILCTL_PUBLIC_IPV4: 203.0.113.25
 YML
-export COMPOSE_FILE="$COMPOSE_FILE:docker-compose.ci-mail.yml"
+# This file LAST: runtime_export only adds the Podman overlays when
+# missing, and the SELinux overlay re-declares mail-resolver's config bind
+# (the later file wins: the production resolver would ask the root servers).
+cf="$COMPOSE_FILE:docker-compose.podman.yml"
+[ "$(getenforce 2>/dev/null)" != Enforcing ] || cf="$cf:docker-compose.podman-selinux.yml"
+export COMPOSE_FILE="$cf:docker-compose.ci-mail.yml"
 export PORTCULLIS_TESTPROVIDER=1 DNS_PROVIDER=fake FAKE_API_TOKEN=ci-podman-fake-token-0123 \
   MAIL_ACME_CA_SERVER=https://e2e-pebble-mail:14000/dir MAIL_CAA_ISSUER=pebble.test
 # The domains test build first (its fake DNS answers mail-resolver).
@@ -103,6 +108,9 @@ podman run -d --name e2e-pebble-mail --network portcullis_domains-egress -v /tmp
 ./portcullis mail enable --yes 2>&1 | tee /tmp/mail-enable.out
 [ "${PIPESTATUS[0]}" = 0 ] || fail "mail enable on rootless Podman"
 grep -qx 'MAILCTL_CLIENT_IP=rewritten' .env || fail "MAILCTL_CLIENT_IP is $(grep '^MAILCTL_CLIENT_IP=' .env)"
+# The CI resolver is in use (iterator only: no DNSSEC validator, no root servers).
+docker compose --profile mail logs mail-resolver 2>&1 | grep -q 'init module 0: iterator' \
+  || fail "mail-resolver doesn't run the CI config: $(docker compose --profile mail logs mail-resolver 2>&1 | grep 'init module' | head -2)"
 for s in mail mailctl mail-resolver; do
   for i in $(seq 1 60); do
     [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q "$s")")" = healthy ] && break
@@ -127,7 +135,7 @@ for i in $(seq 1 30); do
 done
 smtp_to() {  # smtp_to <rcpt> — one message from a CI container to the host's port 25
   printf 'From: probe@relay-test.example\r\nTo: %s\r\nSubject: e2e-podman mail\r\n\r\npodman\r\n' "$1" \
-    | podman run --rm -i "$CURL_IMG" -sS --max-time 30 "smtp://host.containers.internal:25" \
+    | podman run --rm -i "$CURL_IMG" -sS --max-time 30 "smtp://host.containers.internal:25/relay-test.example" \
         --mail-from probe@relay-test.example --mail-rcpt "$1" -T -
 }
 for i in $(seq 1 60); do
