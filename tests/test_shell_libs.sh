@@ -5451,7 +5451,7 @@ expect_ok "link_cert_due: an empty file is due" link_cert_due /dev/null
 lt() {
   vt "mkdir -p \"\$PORTCULLIS_ROOT/certs\"; cp '$LCA/ca.crt' \"\$PORTCULLIS_ROOT/certs/node-ca.crt\"
       for f in link.key link-tls.key link-tls.crt; do : > \"\$PORTCULLIS_ROOT/secrets/wg/\$f\"; done
-      export VAULT_TOKEN=s.vault-root-token-xyz
+      export VAULT_TOKEN=s.vault-root-token-xyz LINK_UP_WAIT=0
       curl() {
         printf '%s\n' \"\$*\" >> \"$WORK/vt/curl-argv\"
         case \"\$*\" in *sys/health*) printf 200; return 0 ;; esac

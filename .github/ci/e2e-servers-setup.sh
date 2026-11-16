@@ -69,8 +69,11 @@ done
 
 # The link role (contract §17.2): wg with the tunnel the workers dial.
 ./portcullis link init
-./portcullis link status --json | jq -e '.up and .port == 51821' >/dev/null \
-  || { echo "FAIL: link status after link init: $(./portcullis link status --json)"; exit 1; }
+for i in $(seq 1 40); do
+  ./portcullis link status --json | jq -e '.up and .port == 51821' >/dev/null && break
+  [ "$i" -eq 40 ] && { echo "FAIL: link status after link init: $(./portcullis link status --json)"; docker compose logs --tail=40 wg hub; exit 1; }
+  sleep 3
+done
 # The address workers reach the primary's link port at (the runner's, not
 # loopback: a dind or rootless worker has its own).
 RUNNER_IP="$(ip -4 -o route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p')"

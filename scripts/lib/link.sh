@@ -192,6 +192,17 @@ link_init() {
   info "Starting wg, Traefik and the Hub..."
   rt_up wg traefik hub || fail "could not start wg, Traefik and the Hub"
   wait_healthy 120 wg
+  # link answers once the Hub has written link.json (it does when it sees
+  # the role in wg's status): up to LINK_UP_WAIT (90 s).
+  info "Waiting for the Hub to publish link.json..."
+  local start=$SECONDS
+  until [ "$(link_status_json | jq -r .up)" = true ]; do
+    if [ $((SECONDS - start)) -ge "${LINK_UP_WAIT:-90}" ]; then
+      warn "link isn't up yet ($(link_status_json | jq -r '.error // "no status"')): check ./portcullis link status, and the Hub's log"
+      break
+    fi
+    sleep 3
+  done
   ok "The link role is up (UDP port $port, subnet $VPN_LINK_SUBNET). Open UDP $port in your firewall, then add servers in the Hub (Settings → Servers)."
 }
 
