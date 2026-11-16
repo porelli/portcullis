@@ -652,12 +652,14 @@ def exchange_both_ways() -> None:
         for r in reps:
             if r.get("deliverAt", "") > due:
                 j.set("DmarcInternalReport", update={r["id"]: {"deliverAt": due}})
-        tasks = [t for t in j.get_all("Task") if t.get("@type") in ("DmarcReport", "ReportWindow")]
+        # The aggregation window (DmarcReportWindow) closes early: it then
+        # makes the internal report and its DmarcReport task.
+        tasks = [t for t in j.get_all("Task") if t.get("@type") in ("DmarcReport", "DmarcReportWindow")]
         for t in tasks:
             st = t.get("status") or {}
             if st.get("@type") in ("Pending", "Retry"):
                 j.set("Task", update={t["id"]: {"status": {"@type": "Pending", "due": due}}})
-        return reps or tasks
+        return reps or [t for t in tasks if t.get("@type") == "DmarcReport"]
 
     try:
         until("the remote's DMARC report (internal report or task)", forced, 180, every=5)
