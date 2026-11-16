@@ -436,6 +436,8 @@ func TestMainMailHostChangeRemovesOld(t *testing.T) {
 		moved = append(moved, r)
 	}
 	e.in.Spec.Mail, e.in.Spec.MailHost = moved, nh
+	// The CLI recorded the old host (secrets/mail/former-hostnames).
+	e.in.Spec.FormerMailHosts = []string{mh}
 	pre := Build(ctx, e.in)
 	find(t, pre, SetMail, "_25._tcp."+mh, "TLSA", StatusWrong)
 	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err != nil {
@@ -473,5 +475,22 @@ func TestMainMailOwnMXHostUntouched(t *testing.T) {
 	}
 	if spf, tlsa := hostRecords(e, own); len(spf) != 1 || len(tlsa) != 1 {
 		t.Fatalf("own host touched: TXT %v TLSA %v", spf, tlsa)
+	}
+}
+
+// Final review L7: an operator's own MX host carrying exactly the set's
+// HELO SPF is not adopted unless the CLI recorded it as a former
+// MAIL_HOSTNAME: its SPF and TLSA stay when mail goes on.
+func TestMainMailSameSPFHostNotAdoptedUnlessRecorded(t *testing.T) {
+	e, _ := mailEnv(t, false)
+	const own = "mx1." + pd
+	e.zone.Set(pd, libdns.RR{Name: "portcullis", Type: "MX", Data: "10 " + own + ".", TTL: time.Hour})
+	e.zone.Set(own, libdns.RR{Name: "mx1.portcullis", Type: "TXT", Data: heloSPF, TTL: time.Hour})
+	e.zone.Set("_25._tcp."+own, libdns.RR{Name: "_25._tcp.mx1.portcullis", Type: "TLSA", Data: "3 1 1 " + strings.Repeat("ab", 32), TTL: time.Hour})
+	if _, _, err := Apply(context.Background(), e.in, []string{SetMail}); err != nil {
+		t.Fatal(err)
+	}
+	if spf, tlsa := hostRecords(e, own); len(spf) != 1 || len(tlsa) != 1 {
+		t.Fatalf("an unrecorded host with the same SPF was adopted: TXT %v TLSA %v", spf, tlsa)
 	}
 }

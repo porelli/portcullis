@@ -68,12 +68,14 @@ _dns_tool_input() {
     --argjson caa "$caa" --arg issuer "${DNS_CAA_ISSUER:-}" --arg uri "${DNS_ACCOUNT_URI:-}" --arg iodef "${DNS_CAA_IODEF:-}" \
     --argjson nomail "$nomail" --arg sets "${DNS_SETS:-}" --arg mail "${ALERT_SMTP_FROM:-}" \
     --arg mailrecs "${DNS_MAIL_RECORDS:-}" --arg mailhost "${MAIL_HOSTNAME:-mail.$PORTCULLIS_DOMAIN}" \
-    --argjson mailon "$(declare -F mail_profile_on >/dev/null && mail_profile_on && echo true || echo false)" '
+    --argjson mailon "$(declare -F mail_profile_on >/dev/null && mail_profile_on && echo true || echo false)" \
+    --argjson former "$(declare -F mail_former_hosts_json >/dev/null && mail_former_hosts_json || echo '[]')" '
     {name: $name, ipv4: $ipv4, ipv6: $ipv6, ca_server: $ca,
      caa: {enabled: $caa, issuer: $issuer, account_uri: $uri, iodef: $iodef},
      nomail: $nomail, sets: ($sets | split(" ") | map(select(. != ""))), mail_from: $mail}
     + (if $mailon or $mailrecs != "" then {mail_hostname: $mailhost} else {} end)
     + (if $mailrecs != "" then {mail: ($mailrecs | fromjson)} else {} end)
+    + (if $mailrecs != "" and ($former | length) > 0 then {mail_former_hosts: $former} else {} end)
     + (if $mode == "write"
        then {provider: $provider, credentials: ($map | map({key: .key, value: env[.var]}) | from_entries)}
        else {provider: ""} end)'

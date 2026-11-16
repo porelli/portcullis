@@ -71,6 +71,11 @@ type toolInput struct {
 	// its HELO SPF and TLSA are the set's, removed when the set is empty or
 	// the host changed (never derived from the MX target).
 	MailHostname string `json:"mail_hostname"`
+	// MailFormerHosts: earlier MAIL_HOSTNAMEs the CLI recorded when the
+	// host changed (secrets/mail/former-hostnames): only these may be
+	// adopted as a former host, whose HELO SPF and TLSA the set then
+	// removes (final review L7: never a host merely shaped like one).
+	MailFormerHosts []string `json:"mail_former_hosts,omitempty"`
 }
 
 // toolInputMax bounds stdin; toolInputMailMax with the mail set.
@@ -442,6 +447,15 @@ func (in toolInput) spec() (dnsplan.Spec, error) {
 			return dnsplan.Spec{}, fmt.Errorf("mail: %w", err)
 		}
 		sp.Mail, sp.MailHost = *in.Mail, host
+		for _, f := range in.MailFormerHosts {
+			f = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(f), "."))
+			if !validHostname(f) {
+				return dnsplan.Spec{}, fmt.Errorf("mail_former_hosts: %q isn't a valid hostname", f)
+			}
+			if f != host {
+				sp.FormerMailHosts = append(sp.FormerMailHosts, f)
+			}
+		}
 	case in.MailHostname != "":
 		// Mail on, its records not known yet (no Hub document): the address
 		// set still owns MAIL_HOSTNAME's A / AAAA; no mail items.

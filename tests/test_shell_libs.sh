@@ -310,7 +310,8 @@ expect_eq "stack_prepare: an unset MAIL_RELAY_PASSWORD / MAIL_SPAMHAUS_DQS_KEY e
   unset -f monitoring_fix_perms domains_fix_perms mcpgate_fix_perms sessions_fix_perms
   secrets_fix_perms ) >/dev/null 2>&1
 expect_eq "secrets_fix_perms: the mail files' groups (mailctl 10010, Hub 10001, mail 2000)" "$(grep 'secrets/mail' "$STUB_DIR/sfp-mail" | tr '\n' '|')" \
-  "ct_group_read 10010 $SP_ROOT/secrets/mail/api-key $SP_ROOT/secrets/mail/dqs-key $SP_ROOT/secrets/mail/mailctl-metrics-secret|ct_group_read 10001 $SP_ROOT/secrets/mail/hub-secret|ct_group_read 2000 $SP_ROOT/secrets/mail/metrics-secret $SP_ROOT/secrets/mail/relay-password $SP_ROOT/secrets/mail/gate|"
+  "ct_group_read 10010 $SP_ROOT/secrets/mail/api-key $SP_ROOT/secrets/mail/dqs-key $SP_ROOT/secrets/mail/mailctl-metrics-secret|ct_group_read 10001 $SP_ROOT/secrets/mail/hub-secret|ct_group_read 2000 $SP_ROOT/secrets/mail/metrics-secret $SP_ROOT/secrets/mail/relay-password $SP_ROOT/secrets/mail/gate $SP_ROOT/secrets/mail/gate/.present|"
+expect_eq "stack_prepare: the gate's sentinel (mail's entrypoint must read it)" "$(cat "$SP_ROOT/secrets/mail/gate/.present" 2>/dev/null)" portcullis-mail-gate
 rm -f "$STUB_DIR/sfp-mail"
 rm -rf "$SP_ROOT/secrets/mail/hub-secret"; mkdir "$SP_ROOT/secrets/mail/hub-secret"
 rc=0; ( PORTCULLIS_ROOT="$SP_ROOT"
@@ -4895,6 +4896,8 @@ mt() {
     env_load
     dc() {
       echo "$*" >> "$ML/argv"
+      printf '%s\n' "${COMPOSE_PROFILES:-}" >> "$ML/dcprof"
+      printf '%s %s\n' "$1" "${COMPOSE_FILE:-}" >> "$ML/dcfiles"
       case "$*" in
         "ps -aq mail") echo cid1 ;;
         "run --rm --no-deps -T mailctl bootstrap --verify-gone") cat >> "$ML/stdin"; return "${ML_GONE_RC:-0}" ;;
@@ -4907,24 +4910,35 @@ mt() {
     runtime_build_service() { :; }
     docker() {
       echo "docker $*" >> "$ML/argv"
-      case "$1" in
-        inspect) if [ -f "$ML/detached" ]; then echo "portcullis-mail "; else echo "portcullis_mail-egress portcullis-mail portcullis_portcullis-metrics-mail "; fi ;;
-        network) touch "$ML/detached" ;;
+      # The recovery overlay's container: portcullis-mail only, no port,
+      # restart no (ML_REC_NETS / ML_REC_PORTS / ML_INTERNAL override).
+      case "$1 ${2:-}" in
+        "network inspect") echo "${ML_INTERNAL:-true}" ;;
+        inspect*) case "$*" in
+            *PortBindings*) echo "${ML_REC_PORTS:-0:no}" ;;
+            *) echo "${ML_REC_NETS:-portcullis-mail }" ;;
+          esac ;;
       esac
     }
     ct_group_read() { echo "ct_group_read $*" >> "$ML/argv"; }
+    # MT_E=1 (mte): the case runs under errexit, as ./portcullis does
+    # (set -euo pipefail): a failing assignment or command is fatal here
+    # too (final review M7).
+    [ "${MT_E:-}" != 1 ] || set -e
     eval "$1"
   ) >"$ML/out" 2>&1
 }
+# mte — mt under errexit (production's set -e).
+mte() { MT_E=1 mt "$@"; }
 # A failing step: recovery.env removed, mail recreated without it, exit 1.
 ok_fn() { IFS= read -r p <&3; printf '%s' "$p" > "$ML/seen-pw"; }
 bad_fn() { return 3; }
 mt 'mail_recovery_session bad_fn'; rc=$?
 expect_eq "mail_recovery_session removes recovery.env when fn fails (exit 1, mail recreated without it)" \
   "$rc:$([ -e "$ML/root/secrets/mail/recovery.env" ] && echo left || echo gone):$(grep -c '^up -d --no-deps mail$' "$ML/argv")" "1:gone:1"
-expect_eq "mail_recovery_session: recovery mode starts with no egress (created, every network but portcullis-mail disconnected, then started)" \
-  "$(grep -E '^(create|start|docker network)' "$ML/argv" | tr '\n' '|')" \
-  "create mail|docker network disconnect portcullis_mail-egress cid1|docker network disconnect portcullis_portcullis-metrics-mail cid1|start mail|"
+expect_eq "mail_recovery_session: recovery mode from the overlay (created with docker-compose.mail-recovery.yml last, portcullis-mail checked internal, then started)" \
+  "$(grep -E '^(create|start|docker network)' "$ML/argv" | tr '\n' '|'):$(grep -E '^create ' "$ML/dcfiles" | grep -c 'docker-compose.mail-recovery.yml$')" \
+  "create mail|docker network inspect -f {{.Internal}} portcullis-mail|start mail|:1"
 expect_eq "mail_recovery_session: mailctl stopped first, not started after a failure" "$(head -n1 "$ML/argv"):$(grep -c 'mailctl$' "$ML/argv")" "stop mailctl:1"
 mt 'mail_recovery_session ok_fn'; rc=$?
 PW="$(cat "$ML/seen-pw" 2>/dev/null)"
@@ -4965,6 +4979,8 @@ mt 'export CONTAINER_RUNTIME=podman; mail_schedule_systemd "$PORTCULLIS_ROOT/uni
 expect_eq "mail schedule --systemd writes the timer (podman shape: user units)" \
   "$(grep -c '^WantedBy=default.target$' "$U/portcullis-mail.timer"):$(grep -c '^User=' "$U/portcullis-mail.service"):$(grep -c '^Requires=podman.socket$' "$U/portcullis-mail.service")" "1:0:1"
 expect_eq "mail_profiles: added once, removed" "$(COMPOSE_PROFILES=monitoring _mail_profiles_with_mail):$(COMPOSE_PROFILES=monitoring,mail _mail_profiles_with_mail):$(COMPOSE_PROFILES=monitoring,mail,wg _mail_profiles_without_mail)" "monitoring,mail:monitoring,mail:monitoring,wg"
+expect_eq "mail_profiles: mail alone → empty, status 0 under errexit + pipefail (final review M1)" \
+  "$(bash -c 'set -euo pipefail; COMPOSE_PROFILES=mail; '"$(declare -f _mail_profiles_without_mail)"'; X="$(_mail_profiles_without_mail)"; echo "rc0:[$X]"' 2>&1 | tail -n1)" "rc0:[]"
 expect_eq "mail_client_ip_mode: docker preserved, podman rewritten" "$(CONTAINER_RUNTIME=docker mail_client_ip_mode):$(CONTAINER_RUNTIME=podman mail_client_ip_mode)" "preserved:rewritten"
 
 # The main domain's mail set (contract §19.7): mailctl's records reach the
@@ -5066,19 +5082,40 @@ done
 mt 'rt_health() { echo healthy; }; rt_exec() { return 1; }; _mail_timer_state() { echo active; }; mail_status_json > "$ML/sj"'
 expect_eq "mail_status_json: mailctl not answering → problem, mailctl null" "$(jq -c '{p: .problem, m: .mailctl}' "$ML/sj")" '{"p":true,"m":null}'
 
-# Backup (M11): mail stopped for its copy and started again, even when the copy fails.
-mt '_volume_name() { echo "portcullis_$1"; }; rt_running() { [ "$1" = mail ]; }
-  rt_stop() { echo "stop $*" >> "$ML/argv"; }; rt_start() { echo "start $*" >> "$ML/argv"; }
+# Final review L2: the stack-changing commands run one at a time, shared
+# with the timers (a held lock makes a second one wait, then refuse).
+mkdir -p "$ML.lock-root"
+( exec 8>>"$ML.lock-root/.portcullis.lock"; flock 8; sleep 4 ) & lockpid=$!
+sleep 1
+rc=0; ( export PORTCULLIS_ROOT="$ML.lock-root" PORTCULLIS_LOCK_WAIT=1; unset PORTCULLIS_LOCKED; cli_lock backup ) >/dev/null 2>&1 || rc=$?
+expect_eq "cli_lock: a held lock → backup waits, then refuses" "$rc" 1
+rc=0; ( export PORTCULLIS_ROOT="$ML.lock-root" PORTCULLIS_LOCK_WAIT=1; unset PORTCULLIS_LOCKED; cli_lock mail rotate --help; cli_lock status ) >/dev/null 2>&1 || rc=$?
+expect_eq "cli_lock: --help and read-only commands never wait" "$rc" 0
+wait "$lockpid" 2>/dev/null
+rc=0; ( export PORTCULLIS_ROOT="$ML.lock-root" PORTCULLIS_LOCK_WAIT=1; unset PORTCULLIS_LOCKED; cli_lock mail rotate ) >/dev/null 2>&1 || rc=$?
+expect_eq "cli_lock: free → taken" "$rc" 0
+rm -rf "$ML.lock-root"
+# Backup (M11): mail stopped for its copy and started again, even when the
+# copy fails; the Hub (which restarts mail on a revocation) stopped too and
+# started after mail (final review L3); a mail started during the copy
+# fails the backup.
+BK='_volume_name() { echo "portcullis_$1"; }
+  rt_running() { case "$1" in mail|hub) [ ! -e "$ML/stopped-$1" ] ;; *) return 1 ;; esac; }
+  rt_stop() { echo "stop $*" >> "$ML/argv"; : > "$ML/stopped-$1"; }; rt_start() { echo "start $*" >> "$ML/argv"; rm -f "$ML/stopped-$1"; }'
+mte "$BK"'
   _backup_volume_files() { echo "copy $1 $2:$3" >> "$ML/argv"; [ "$1" != portcullis_mail_etc ]; }
   mkdir -p "$ML/w"; _backup_mail_data "$ML/w"'; rc=$?
-expect_eq "backup: mail stopped, mail_data copied, mail_etc's copy fails → mail started again, the backup fails" \
+expect_eq "backup: the Hub and mail stopped, mail_data copied, mail_etc's copy fails → mail then the Hub started again, the backup fails" \
   "$rc:$(grep -E '^(stop|start|copy)' "$ML/argv" | tr '\n' '|'):$(grep -c 'could not back up volume mail_etc (mail was started again)' "$ML/out")" \
-  "1:stop mail|copy portcullis_mail_data 2000:2000|copy portcullis_mail_etc 2000:2000|start mail|:1"
-mt '_volume_name() { echo "portcullis_$1"; }; rt_running() { [ "$1" = mail ]; }
-  rt_stop() { echo "stop $*" >> "$ML/argv"; }; rt_start() { echo "start $*" >> "$ML/argv"; }
+  "1:stop hub|stop mail|copy portcullis_mail_data 2000:2000|copy portcullis_mail_etc 2000:2000|start mail|start hub|:1"
+mte "$BK"'
   _backup_volume_files() { echo "copy $1" >> "$ML/argv"; }; mkdir -p "$ML/w"; _backup_mail_data "$ML/w"'; rc=$?
-expect_eq "backup: both mail volumes copied with mail stopped, then started" "$rc:$(grep -E '^(stop|start|copy)' "$ML/argv" | tr '\n' '|')" \
-  "0:stop mail|copy portcullis_mail_data|copy portcullis_mail_etc|start mail|"
+expect_eq "backup: both mail volumes copied with the Hub and mail stopped, then started" "$rc:$(grep -E '^(stop|start|copy)' "$ML/argv" | tr '\n' '|')" \
+  "0:stop hub|stop mail|copy portcullis_mail_data|copy portcullis_mail_etc|start mail|start hub|"
+mte "$BK"'
+  _backup_volume_files() { echo "copy $1" >> "$ML/argv"; rm -f "$ML/stopped-mail"; }; mkdir -p "$ML/w"; _backup_mail_data "$ML/w"'; rc=$?
+expect_eq "backup: mail started by something else during its copy → the backup fails (a torn copy)" \
+  "$rc:$(grep -c 'mail was started during its copy' "$ML/out"):$(grep -c '^start hub$' "$ML/argv")" "1:1:1"
 mt 'export COMPOSE_PROFILES=monitoring; _backup_volume_files() { echo copy >> "$ML/argv"; }; _backup_mail_data "$ML"'
 expect_eq "backup: no mail copy without the profile" "$(cat "$ML/argv" 2>/dev/null | grep -c copy)" 0
 expect_eq "backup: mailctl_data / mail_acme / mail_tls archived online" "$(tr ' ' '\n' <<<"$BACKUP_FILE_VOLUMES" | grep -E '^(mailctl_data|mail_acme|mail_tls):' | tr '\n' ' ')" "mailctl_data:10010:10010 mail_acme:10004:10004 mail_tls:10004:2000 "
@@ -5096,6 +5133,43 @@ expect_eq "restore: the void fails → refused, mail and mailctl stopped, the ma
 mt "$VP"'; : > "$(mail_void_marker)"; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; }; _restore_mail_void "$ML"'; rc=$?
 expect_eq "restore: voided → the marker removed, nothing stopped" \
   "$rc:$(grep -E '^(session|stop)' "$ML/argv" | tr '\n' '|'):$([ -e "$ML/root/secrets/mail/gate/void-pending" ] && echo kept || echo gone)" "0:session mail_void_restore|:gone"
+# Final review L7: a MAIL_HOSTNAME change records the old host; only
+# recorded hosts reach the dns tool as mail_former_hosts.
+mte '. "$HERE/../scripts/lib/dns.sh"; export MAIL_HOSTNAME=mail.mail.example; mail_hostname_track; mail_hostname_track; export MAIL_HOSTNAME=mx.mail.example; mail_hostname_track
+  DNS_SETS=mail DNS_MAIL_RECORDS="[]" _dns_tool_input read > "$ML/dnsin"'; rc=$?
+expect_eq "MAIL_HOSTNAME change → the old host recorded once, passed as mail_former_hosts" \
+  "$rc:$(tr '\n' ' ' < "$ML/root/secrets/mail/former-hostnames"):$(cat "$ML/root/secrets/mail/hostname"):$(jq -c '[.mail_hostname, .mail_former_hosts]' "$ML/dnsin")" \
+  '0:mail.mail.example :mx.mail.example:["mx.mail.example",["mail.mail.example"]]'
+mte '. "$HERE/../scripts/lib/dns.sh"; DNS_SETS=mail DNS_MAIL_RECORDS="[]" _dns_tool_input read > "$ML/dnsin"'; rc=$?
+expect_eq "no recorded former host → no mail_former_hosts" "$rc:$(jq -c 'has("mail_former_hosts")' "$ML/dnsin")" "0:false"
+# Final review L5: mailctl rotate's exit 3 (the main domain isn't a mail
+# domain) is a no-op with an info line, no DNS write, rc 0.
+mte 'mail_cert_ensure() { MAIL_CERT_SPKI=aa; }; rt_exec() { case "$*" in *"domains report"*) return 1 ;; *"mailctl rotate --json") cat >/dev/null; return 3 ;; esac; }; _dns_tool() { echo dns >> "$ML/argv"; }; _dns_automated() { :; }; mail_rotate'; rc=$?
+expect_eq "mail rotate on a main domain that isn't a mail domain: a no-op with an info line" \
+  "$rc:$(grep -c "isn't a mail domain (yet): nothing to rotate" "$ML/out"):$(cat "$ML/argv" 2>/dev/null | grep -c '^dns$')" "0:1:0"
+# Final review M6: mail disable with DNS_NOMAIL=true puts the null-mail
+# records back in the same run as the mail set's removal.
+MD='. "$HERE/../scripts/lib/dns.sh"; _dns_automated() { :; }; _dns_tool() { _dns_tool_input read > "$ML/dnsin"; }; _mail_stop_services() { :; }; mail_prom_targets() { :; }; hub_env_write() { :; }; _mail_set() { :; }'
+mte "$MD"'; export DNS_PROVIDER=cloudflare DNS_NOMAIL=true; mail_disable true true'; rc=$?
+expect_eq "mail disable --force, DNS_NOMAIL=true → sets nomail + mail, mail [], nomail on" \
+  "$rc:$(jq -c '[.sets, .mail, .nomail]' "$ML/dnsin" 2>/dev/null)" '0:[["nomail","mail"],[],true]'
+mte "$MD"'; export DNS_PROVIDER=cloudflare DNS_NOMAIL=false; mail_disable true true'; rc=$?
+expect_eq "mail disable --force, DNS_NOMAIL=false → the mail set alone" \
+  "$rc:$(jq -c '[.sets, .mail, .nomail]' "$ML/dnsin" 2>/dev/null)" '0:[["mail"],[],false]'
+mte "$MD"'; mkdir -p "$PORTCULLIS_ROOT/secrets/domains"; printf "DOMAINS_PUBLIC_IPV4=203.0.113.5\nDOMAINS_PUBLIC_IPV6=\nDOMAINS_MAIL=on\n" > "$PORTCULLIS_ROOT/secrets/domains/public-ips.env"
+  rt_running() { [ "$1" = domains ]; }; rt_up_service() { echo "up_service $*" >> "$ML/argv"; }; export DNS_PROVIDER=none; mail_disable true true'; rc=$?
+expect_eq "mail disable: DOMAINS_MAIL=off at once, the domains service recreated (final review L6)" \
+  "$rc:$(tr '\n' ' ' < "$ML/root/secrets/domains/public-ips.env"):$(grep -c '^up_service domains$' "$ML/argv")" "0:DOMAINS_PUBLIC_IPV4=203.0.113.5 DOMAINS_PUBLIC_IPV6= DOMAINS_MAIL=off :1"
+# Final review M5: the marker whenever the profile is on, a mail store in
+# the backup or not; without either nothing.
+mkdir -p "$ML.bk-nomail" "$ML.bk-mail"; : > "$ML.bk-mail/mail_data.tar.gz"
+mte '_restore_mail_marker "'"$ML.bk-nomail"'"'; rc=$?
+expect_eq "restore without mail_data, mail profile on → the void marker written" "$rc:$([ -e "$ML/root/secrets/mail/gate/void-pending" ] && file_mode "$ML/root/secrets/mail/gate/void-pending")" "0:600"
+mte 'export COMPOSE_PROFILES=monitoring; _restore_mail_marker "'"$ML.bk-nomail"'"'; rc=$?
+expect_eq "restore without mail_data, mail profile off → no marker" "$rc:$([ -e "$ML/root/secrets/mail/gate/void-pending" ] && echo kept || echo none)" "0:none"
+mte 'export COMPOSE_PROFILES=monitoring; _restore_mail_marker "'"$ML.bk-mail"'"'; rc=$?
+expect_eq "restore with mail_data, profile off → the marker (mail enable voids first)" "$rc:$([ -e "$ML/root/secrets/mail/gate/void-pending" ] && echo kept || echo none)" "0:kept"
+rm -rf "$ML.bk-nomail" "$ML.bk-mail"
 mt "$VP"'; _restore_mail_void "$ML"'; rc=$?
 expect_eq "restore: no marker (no mail store in the backup) → no session" "$rc:$(cat "$ML/argv" 2>/dev/null | grep -c session)" "0:0"
 mt 'RESTORE_MAIL_UNVOIDED=true; _restore_mail_outcome'; rc=$?
@@ -5105,24 +5179,36 @@ expect_eq "restore: mailctl void gets the recovery credentials on stdin only; su
   "$(grep -c '^dc run --rm --no-deps -T mailctl void --reason restore$' "$ML/argv"):$(grep -c s3cret "$ML/argv"):$(jq -r .recovery_password "$ML/stdin"):$([ -e "$ML/root/secrets/mail/gate/void-pending" ] && echo kept || echo gone)" "1:0:s3cret-pw:gone"
 # up / upgrade with the marker: never mail without the void first.
 UP='mail_port_start_ok() { :; }; mail_config_present() { :; }; mail_tls_present() { :; }; printf API_k > "$PORTCULLIS_ROOT/secrets/mail/api-key"'
-mt "$VP; $UP"'; : > "$(mail_void_marker)"; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; [ "$1" != run ]; }; mail_up_steps up; printf "%s" "$COMPOSE_PROFILES" > "$ML/prof"'; rc=$?
-expect_eq "up with the marker and a failing void: mail and mailctl stopped, the stack starts without the mail profile, the marker kept" \
+mte "$VP; $UP"'; : > "$(mail_void_marker)"; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; [ "$1" != run ]; }; mail_up_steps up; printf "%s" "$COMPOSE_PROFILES" > "$ML/prof"'; rc=$?
+expect_eq "up with the marker and a failing void (errexit, COMPOSE_PROFILES=mail): mail and mailctl stopped, the stack starts without the mail profile, the marker kept" \
   "$rc:$(grep -c '^dc --profile mail stop mail mailctl$' "$ML/argv"):$(cat "$ML/prof"):$(grep -c 'not voided yet' "$ML/out"):$([ -e "$ML/root/secrets/mail/gate/void-pending" ] && echo kept)" "0:1::1:kept"
-mt "$VP; $UP"'; : > "$(mail_void_marker)"; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; }; mail_up_steps up; printf "%s" "$COMPOSE_PROFILES" > "$ML/prof"'; rc=$?
+mte "$VP; $UP"'; export COMPOSE_PROFILES=monitoring,mail; : > "$(mail_void_marker)"; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; [ "$1" != run ]; }; mail_up_steps up; printf "%s" "$COMPOSE_PROFILES" > "$ML/prof"'; rc=$?
+expect_eq "up with the marker and a failing void (errexit, monitoring,mail): the rest keeps its profiles" "$rc:$(cat "$ML/prof")" "0:monitoring"
+mte "$VP; $UP"'; : > "$(mail_void_marker)"; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; }; mail_up_steps up; printf "%s" "$COMPOSE_PROFILES" > "$ML/prof"'; rc=$?
 expect_eq "up with the marker: the void session first, then mail starts normally (profile kept), the marker gone" \
   "$rc:$(grep -m1 '^session' "$ML/argv"):$(cat "$ML/prof"):$([ -e "$ML/root/secrets/mail/gate/void-pending" ] && echo kept || echo gone)" "0:session mail_void_restore:mail:gone"
-mt ': > "$(mail_void_marker)"; mail_after_up'; rc=$?
+mte ': > "$(mail_void_marker)"; mail_after_up'; rc=$?
 expect_eq "mail_after_up never recreates mail while the marker exists" "$rc:$(cat "$ML/argv" 2>/dev/null | grep -c .)" "0:0"
-mt ': > "$(mail_void_marker)"; _mail_recovery_end'
+mte ': > "$(mail_void_marker)"; _mail_recovery_end'
 expect_eq "a recovery session ending with the marker removes the recovery-mode container, never back to normal mode" "$(tr '\n' '|' < "$ML/argv")" "rm -sf mail|"
-mt ': > "$(mail_session_file)"; _mail_recovery_end'
+mte ': > "$(mail_session_file)"; _mail_recovery_end'
 expect_eq "a recovery session ending normally removes the recovery-mode container, then recreates mail; the session file is gone" \
   "$(tr '\n' '|' < "$ML/argv"):$([ -e "$ML/root/secrets/mail/gate/recovery-session" ] && echo left || echo gone)" "rm -sf mail|up -d --no-deps mail|:gone"
+# Final review M4: any doubt refuses the recovery start.
+for v in "ML_INTERNAL=false" "ML_REC_NETS='portcullis_mail-egress portcullis-mail '" "ML_REC_PORTS=4:no" "ML_REC_PORTS=0:unless-stopped"; do
+  mte "export $v; ok_fn() { :; }; mail_recovery_session ok_fn"; rc=$?
+  expect_eq "mail_recovery_session refuses a recovery start when $v (nothing started)" "$rc:$(grep -c '^start mail$' "$ML/argv")" "1:0"
+done
+# Final review M3: the session file holds this boot's id; HUP is trapped.
+sess_boot() { cat "$PORTCULLIS_ROOT/secrets/mail/gate/recovery-session" > "$ML/sessboot"; IFS= read -r _ <&3; }
+mte '_mail_boot_id() { echo 11111111-2222-4333-8444-555555555555; }; mail_recovery_session sess_boot'
+expect_eq "the session file holds the host's boot id" "$(cat "$ML/sessboot" 2>/dev/null)" "11111111-2222-4333-8444-555555555555"
+expect_eq "the recovery session traps HUP too" "$(declare -f mail_recovery_session | grep -c "trap '_mail_recovery_end; exit 130' INT TERM HUP")" 1
 sess_fn() { [ -e "$PORTCULLIS_ROOT/secrets/mail/gate/recovery-session" ] && echo present > "$ML/sess"; IFS= read -r _ <&3; }
-mt 'mail_recovery_session sess_fn'
+mte 'mail_recovery_session sess_fn'
 expect_eq "the session file exists while the recovery step runs, and is gone after" \
   "$(cat "$ML/sess" 2>/dev/null):$([ -e "$ML/root/secrets/mail/gate/recovery-session" ] && echo left || echo gone)" "present:gone"
-mt ': > "$(mail_session_file)"; runtime_build_all() { :; }; stack_compose_up'
+mte ': > "$(mail_session_file)"; runtime_build_all() { :; }; stack_compose_up'
 expect_eq "a leftover session file (no live session) is removed by the next up" "$([ -e "$ML/root/secrets/mail/gate/recovery-session" ] && echo left || echo gone)" gone
 mt 'rt_health() { echo healthy; }; rt_exec() { printf "%s" "$MSTAT"; }; _mail_timer_state() { echo active; }; : > "$(mail_void_marker)"
   mail_status_json > "$ML/sj"; mail_status_lines "$(cat "$ML/sj")" | sed "s/\x1b\[[0-9;]*m//g" > "$ML/sl"'
@@ -5130,15 +5216,20 @@ expect_eq "status: the marker is a problem line" "$(jq -r .void_pending "$ML/sj"
 
 # The start gate (security review): with the marker, no CLI start reaches
 # mail / mailctl except the recovery session; the container refuses too.
-mt ': > "$(mail_void_marker)"; runtime_build_all() { :; }; export COMPOSE_PROFILES=monitoring,mail; stack_compose_up; printf "%s" "$COMPOSE_PROFILES" > "$ML/prof"'
-expect_eq "marker + a generic up: the mail profile stripped (up runs without it)" "$(cat "$ML/prof"):$(grep -c '^up -d --no-build$' "$ML/argv")" "monitoring:1"
+mte ': > "$(mail_void_marker)"; runtime_build_all() { :; }; export COMPOSE_PROFILES=monitoring,mail; stack_compose_up; printf "%s" "$COMPOSE_PROFILES" > "$ML/prof"'
+expect_eq "marker + a generic up: compose runs without the mail profile, the caller's COMPOSE_PROFILES untouched (final review L1)" \
+  "$(tail -n1 "$ML/dcprof"):$(grep -c '^up -d --no-build$' "$ML/argv"):$(cat "$ML/prof")" "monitoring:1:monitoring,mail"
+# L1: a gated restart earlier in up (sessions_restart_if_changed,
+# config_apply) doesn't keep up's own void retry from running.
+mte "$VP; $UP"'; export COMPOSE_PROFILES=monitoring,mail; : > "$(mail_void_marker)"; _rtd_restart sessions; dc() { echo "dc $*" >> "$ML/argv"; cat >/dev/null; }; mail_up_steps up'; rc=$?
+expect_eq "marker + a gated restart, then mail_up_steps: the void session still runs" "$rc:$(grep -c '^session mail_void_restore' "$ML/argv")" "0:1"
 for verb in "stack_compose_up mail" "_rtd_up_service mailctl" "_rtd_start mail" "_rtd_restart mail"; do
-  mt ': > "$(mail_void_marker)"; runtime_build_all() { :; }; '"$verb"; rc=$?
+  mte ': > "$(mail_void_marker)"; runtime_build_all() { :; }; '"$verb"; rc=$?
   expect_eq "marker + $verb → refused before any compose call" "$rc:$(cat "$ML/argv" 2>/dev/null | grep -c .):$(grep -c 'not voided yet' "$ML/out")" "1:0:1"
 done
-mt ': > "$(mail_void_marker)"; export MAIL_RECOVERY_SESSION=1; _rtd_start mail'; rc=$?
+mte ': > "$(mail_void_marker)"; export MAIL_RECOVERY_SESSION=1; _rtd_start mail'; rc=$?
 expect_eq "marker + the recovery session's flag → allowed" "$rc:$(grep -c '^start mail$' "$ML/argv")" "0:1"
-mt 'runtime_build_all() { :; }; stack_compose_up mail'; rc=$?
+mte 'runtime_build_all() { :; }; stack_compose_up mail'; rc=$?
 expect_eq "no marker → mail starts as usual" "$rc:$(grep -c '^up -d --no-build mail$' "$ML/argv")" "0:1"
 # mail enable gives mailctl the certificate's key (mail test pins it)
 # before the Hub's first document; on stdin, never argv.

@@ -253,7 +253,15 @@ func Call(path, method, route string, body []byte) ([]byte, error) {
 		if e.Error == "" {
 			e.Error = resp.Status
 		}
-		return nil, errors.New(e.Error)
+		return nil, &StatusError{Code: resp.StatusCode, Msg: e.Error}
 	}
 	return b, nil
 }
+
+// StatusError is a control-socket answer other than 200.
+type StatusError struct {
+	Code int
+	Msg  string
+}
+
+func (e *StatusError) Error() string { return e.Msg }

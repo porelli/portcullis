@@ -383,6 +383,12 @@ func adminCmd(cmd string, args []string, stdin io.Reader, stdout, stderr io.Writ
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "mailctl %s: %s\n", cmd, logx.Redact(err.Error()))
+		// rotate: the main domain isn't a mail domain (yet, or any more)
+		// is exit 3, the CLI's no-op (final review L5).
+		var se *admin.StatusError
+		if cmd == "rotate" && errors.As(err, &se) && se.Code == http.StatusNotFound {
+			return 3
+		}
 		return 1
 	}
 	stdout.Write(b)

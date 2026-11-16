@@ -132,6 +132,9 @@ type Spec struct {
 	// MailHost: MAIL_HOSTNAME (main domain only, dns-tool's mail_hostname):
 	// its HELO SPF and TLSA are the mail set's (an empty set removes them).
 	MailHost string
+	// FormerMailHosts: earlier MAIL_HOSTNAMEs (recorded by the CLI): a live
+	// MX target is adopted as a former host only when it is one of them.
+	FormerMailHosts []string
 	// Owned: the CAA entries an enrolled domain wrote (removed with CAA
 	// off). Main: the main domain (removal by signature instead).
 	Owned []Ref

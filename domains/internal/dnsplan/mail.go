@@ -161,7 +161,9 @@ func under(n, d string) bool { return n == d || strings.HasSuffix(n, "."+d) }
 const heloSPF = "v=spf1 a -all"
 
 // liveHosts: MAIL_HOSTNAME (the spec's, main domain only) plus a previous
-// one: a target of a live MX at d other than it whose TXT holds exactly
+// one: a target of a live MX at d other than it, recorded as a former
+// MAIL_HOSTNAME (FormerMailHosts; final review L7: an operator's own MX
+// host with the same SPF is never adopted), whose TXT holds exactly
 // the set's HELO SPF — after a MAIL_HOSTNAME change the old host's HELO
 // SPF and TLSA are the set's to remove. Only names the provider read
 // (at or under d or MAIL_HOSTNAME) count.
@@ -176,7 +178,7 @@ func liveHosts(s Spec, d string, live []liveRec) []string {
 			continue
 		}
 		x := bare(f[1])
-		if contains(hosts, x) {
+		if contains(hosts, x) || !contains(bareAll(s.FormerMailHosts), x) {
 			continue
 		}
 		for _, t := range pick(live, x, "TXT") {
@@ -187,6 +189,14 @@ func liveHosts(s Spec, d string, live []liveRec) []string {
 		}
 	}
 	return hosts
+}
+
+func bareAll(ns []string) []string {
+	out := make([]string, 0, len(ns))
+	for _, n := range ns {
+		out = append(out, bare(n))
+	}
+	return out
 }
 
 // hostName: n is one of MAIL_HOSTNAME's names (the host or its TLSA owner).

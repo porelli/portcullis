@@ -36,6 +36,28 @@ _mail_set() {
 # mail_hostname — MAIL_HOSTNAME, else mail.<main domain>.
 mail_hostname() { printf '%s' "${MAIL_HOSTNAME:-mail.${PORTCULLIS_DOMAIN:-portcullis.local}}"; }
 
+# mail_hostname_track — records MAIL_HOSTNAME changes (final review L7):
+# secrets/mail/hostname is the one last used; when it differs from today's
+# (mail enable --hostname, or .env edited by hand) the old one goes into
+# secrets/mail/former-hostnames, the only hosts the dns tool may adopt as
+# a former MAIL_HOSTNAME (its HELO SPF and TLSA then removed).
+mail_hostname_track() {
+  local d cur last
+  d="$(_mail_dir)"
+  cur="$(mail_hostname | tr '[:upper:]' '[:lower:]')"
+  (umask 077 && mkdir -p "$d")
+  last="$(cat "$d/hostname" 2>/dev/null || true)"
+  if [ -n "$last" ] && [ "$last" != "$cur" ] && ! grep -qxF "$last" "$d/former-hostnames" 2>/dev/null; then
+    (umask 077 && printf '%s\n' "$last" >> "$d/former-hostnames")
+  fi
+  [ "$last" = "$cur" ] || (umask 077 && printf '%s\n' "$cur" > "$d/hostname")
+}
+
+# mail_former_hosts_json — secrets/mail/former-hostnames as a JSON array.
+mail_former_hosts_json() {
+  jq -Rnc '[inputs | select(length > 0)]' 2>/dev/null < "$(_mail_dir)/former-hostnames" || echo '[]'
+}
+
 # _mail_profiles_with_mail — COMPOSE_PROFILES with mail added once.
 _mail_profiles_with_mail() {
   if mail_profile_on; then printf '%s' "${COMPOSE_PROFILES:-}"; return 0; fi
@@ -453,6 +475,7 @@ mail_up_steps() {
   mail_lan_only_ok "${MAIL_SUBMISSION_LAN_ONLY:-false}"
   [ "${MAILCTL_CLIENT_IP:-}" = "$(mail_client_ip_mode)" ] || _mail_set MAILCTL_CLIENT_IP "$(mail_client_ip_mode)"
   mail_ipv6_refuse
+  mail_hostname_track
   mail_config_present || fail "mail is in COMPOSE_PROFILES but mail_etc/config.json is missing (Stalwart would start in bootstrap mode): run ./portcullis mail enable"
   # A restore's passwords are voided before mail starts; if that fails
   # mail and mailctl stay stopped and the rest starts without the profile.
@@ -510,6 +533,7 @@ mail_enable() {
   mail_lan_only_ok "${lan:-${MAIL_SUBMISSION_LAN_ONLY:-false}}"
   mail_ipv6_refuse
   [ -z "$host" ] || _mail_set MAIL_HOSTNAME "$host"
+  mail_hostname_track
   [ -z "$lan" ] || _mail_set MAIL_SUBMISSION_LAN_ONLY "$lan"
   _mail_set MAILCTL_CLIENT_IP "$(mail_client_ip_mode)"
   mail_profile_on || _mail_set COMPOSE_PROFILES "$(_mail_profiles_with_mail)"
@@ -560,15 +584,35 @@ mail_disable() {
   else
     warn "--force: mail goes now; senders with a cached MTA-STS policy may bounce mail until its max_age."
   fi
+  # The mail set goes, and with DNS_NOMAIL=true the null-mail records come
+  # back in the same run (final review M6: never a window without SPF -all,
+  # DMARC and the null MX).
   if _dns_automated "${DNS_PROVIDER:-none}"; then
-    DNS_SETS=mail DNS_MAIL_RECORDS='[]' _dns_tool apply >/dev/null \
+    local sets=mail
+    [ "$(_dns_flag DNS_NOMAIL false)" != true ] || sets="nomail mail"
+    DNS_SETS="$sets" DNS_MAIL_RECORDS='[]' _dns_tool apply >/dev/null \
       || warn "the main domain's mail records could not be removed: run ./portcullis dns setup"
   fi
   _mail_set COMPOSE_PROFILES "$(_mail_profiles_without_mail)"
   _mail_stop_services
   mail_prom_targets
   hub_env_write
+  _mail_domains_flag_off
   ok "Mail is off (its volumes are kept)."
+}
+
+# _mail_domains_flag_off — the domains service's env file says mail is
+# off at once (final review L6: not only at the next up), and a running
+# domains service is recreated with it (its main plan stops owning
+# MAIL_HOSTNAME's address).
+_mail_domains_flag_off() {
+  local f
+  f="$(_domains_dir)/public-ips.env"
+  [ -f "$f" ] && grep -qx 'DOMAINS_MAIL=on' "$f" || return 0
+  (umask 077 && sed 's/^DOMAINS_MAIL=on$/DOMAINS_MAIL=off/' "$f" > "$f.tmp" && cat "$f.tmp" > "$f"); rm -f "$f.tmp"
+  if rt_running domains; then
+    rt_up_service domains >/dev/null 2>&1 || warn "could not recreate the domains service with mail off: ./portcullis up"
+  fi
 }
 
 _mail_stop_services() {
@@ -589,10 +633,19 @@ _mail_main_dnssec() {
 # DNSSEC state and the SPKIs; contract §19.7), then the main domain's mail
 # set through the dns tool; sets MAIL_SWITCH_KEY=true|false.
 _mail_rotate_once() {
-  local out in
+  local out in rc=0
   in="$(jq -cn --arg st "$(_mail_main_dnssec)" --arg cur "${MAIL_CERT_SPKI:-}" --arg next "$1" \
     '{dnssec_state: $st, spki: {current: $cur, next: $next}}')"
-  out="$(printf '%s' "$in" | rt_exec -i mailctl -- mailctl rotate --json)" || fail "mailctl rotate failed"
+  out="$(printf '%s' "$in" | rt_exec -i mailctl -- mailctl rotate --json)" || rc=$?
+  # Exit 3: the main domain isn't a mail domain of the Hub's document (mail
+  # off for it, or no document yet): nothing to rotate, a no-op (final
+  # review L5) — the timer doesn't fail every day.
+  if [ "$rc" = 3 ]; then
+    MAIL_SWITCH_KEY=false
+    info "The main domain isn't a mail domain (yet): nothing to rotate for it."
+    return 0
+  fi
+  [ "$rc" = 0 ] || fail "mailctl rotate failed"
   MAIL_SWITCH_KEY="$(printf '%s' "$out" | jq -r '.switch_key == true')"
   printf '%s' "$out" | jq -r '"    TLSA: \(.tlsa)"' 2>/dev/null || true
   if ! _dns_automated "${DNS_PROVIDER:-none}"; then
@@ -829,7 +882,7 @@ mail_export() {
   fi
   chmod 600 "$tmp"
   mv "$tmp" "$out"
-  ok "Exported $id to $out ($(grep -c '^From ' "$out" 2>/dev/null || echo 0) messages, mode 0600)."
+  ok "Exported $id to $out ($(grep -c '^From ' "$out" 2>/dev/null || true) messages, mode 0600)."
 }
 
 help_mail() {
