@@ -82,7 +82,8 @@ echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
 
 # People: the admin (the Hub API's actor, its fresh sign-ins) and alice
 # (an echo user), each from a setup link; alice in users_<instance>.
-SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
+# (GITHUB_ENV reaches only the later steps: read the password from .env.)
+LLDAP_ADMIN_PASSWORD="$(grep '^LLDAP_ADMIN_PASSWORD=' .env | cut -d= -f2-)"; export LLDAP_ADMIN_PASSWORD
 LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
   | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
 echo "::add-mask::$LLDAP_TOKEN"
