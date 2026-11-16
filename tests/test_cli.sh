@@ -590,8 +590,8 @@ done
 expect_eq "worker Podman overlay: restart always on both, nothing else" \
   "$(grep -vE '^[[:space:]]*(#|$)|^services:$|^  (agent|socket-proxy-agent):$|^    restart: always$' "$ROOT_DIR_SOCK/docker-compose.worker.podman.yml"):$(grep -c '^    restart: always$' "$ROOT_DIR_SOCK/docker-compose.worker.podman.yml")" ":2"
 expect_eq "worker SELinux overlay: label=disable on exactly the agent and its socket proxy, and nothing else in their security_opt" \
-  "$(yq -o=json '.services' "$ROOT_DIR_SOCK/docker-compose.worker.podman-selinux.yml" | jq -c '[to_entries[] | select((.value.security_opt // []) | index("label=disable")) | .key] | sort as $l
-      | {label_disable: $l, other: [to_entries[] | .value.security_opt // [] | .[] | select(. != "label=disable")]}')" \
+  "$(yq -o=json '.services' "$ROOT_DIR_SOCK/docker-compose.worker.podman-selinux.yml" | jq -c '. as $s | ([$s | to_entries[] | select((.value.security_opt // []) | index("label=disable")) | .key] | sort) as $l
+      | {label_disable: $l, other: [$s | to_entries[] | .value.security_opt // [] | .[] | select(. != "label=disable")]}')" \
   '{"label_disable":["agent","socket-proxy-agent"],"other":[]}'
 expect_eq "no other compose file gives a worker service label=disable" \
   "$(grep -l 'label=disable' "$ROOT_DIR_SOCK"/docker-compose.worker*.yml | sed 's|.*/||')" "docker-compose.worker.podman-selinux.yml"
