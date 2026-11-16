@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -407,5 +408,74 @@ func TestDeleteCredentialByUUID(t *testing.T) {
 	}
 	if w := e.do("DELETE", "/v1/credentials/p1?uuid=bbbbbbbb-0000-4000-8000-000000000002", ""); w.Code != 204 || len(e.f.Objects("AppPassword", alice)) != 1 {
 		t.Fatalf("unknown uuid: %d", w.Code)
+	}
+}
+
+// A create racing a pass that parks the account (final review M2): the
+// pass waits for the create (the pass lock), then parks the account and
+// destroys every password, the new one included; never a password left
+// on a parked account.
+func TestCreateCredentialRacesPark(t *testing.T) {
+	e := newV1(t)
+	e.do("PUT", "/v1/state", vec(t, 12))
+	_ = e.v.Runner.Once(context.Background())
+	var alice string
+	for _, a := range e.f.Objects("Account", "") {
+		if a["name"] == "alice" {
+			alice = a["id"].(string)
+		}
+	}
+	done := make(chan struct{})
+	e.v.beforeCreate = func() {
+		// The Hub's next document drops alice; the runner's pass starts
+		// now, between the checks and the create.
+		e.v.Store.Update(func(p *state.Persistent) error {
+			var keep []state.Account
+			for _, a := range p.Doc.Accounts {
+				if a.Username != "alice" {
+					keep = append(keep, a)
+				}
+			}
+			p.Doc.Accounts = keep
+			var al []state.Alias
+			for _, a := range p.Doc.Aliases {
+				if a.Username != "alice" {
+					al = append(al, a)
+				}
+			}
+			p.Doc.Aliases = al
+			for i := range p.Doc.Lists {
+				var m []string
+				for _, x := range p.Doc.Lists[i].Members {
+					if x != "alice" {
+						m = append(m, x)
+					}
+				}
+				p.Doc.Lists[i].Members = m
+			}
+			var pm []string
+			for _, x := range p.Doc.Postmaster {
+				if x != "alice" {
+					pm = append(pm, x)
+				}
+			}
+			p.Doc.Postmaster = pm
+			p.Doc.Generation, p.Generation = 13, 13
+			return nil
+		})
+		go func() { _ = e.v.Runner.Once(context.Background()); close(done) }()
+		time.Sleep(200 * time.Millisecond) // the pass is waiting for the create
+	}
+	w := e.do("POST", "/v1/credentials", `{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"x","expires_at":null}`)
+	<-done
+	if w.Code != 201 && w.Code != 404 {
+		t.Fatalf("create: %d %s", w.Code, w.Body)
+	}
+	a := e.f.Get("Account", "", alice)
+	if a == nil || !strings.HasPrefix(fmt.Sprint(a["name"]), "former-") {
+		t.Fatalf("alice not parked: %v", a)
+	}
+	if n := len(e.f.Objects("AppPassword", alice)); n != 0 {
+		t.Fatalf("%d password(s) left on the parked account", n)
 	}
 }

@@ -410,6 +410,13 @@ func Apply(ctx context.Context, c *stalwart.Client, l *Live, want *state.Doc, op
 			fields["name"], fields["domainId"] = a.Username, primary
 		}
 		if a.Enable {
+			// A rejoin never revives a password: a parked account holds
+			// none legitimately (one made in a race with the park, an
+			// export's), so all go before the permissions come back
+			// (final review M2).
+			if err := DestroyAppPasswords(ctx, c, a.ID); err != nil {
+				return fmt.Errorf("account %s: clearing its mail passwords before the rejoin: %w", a.Username, err)
+			}
 			fields["permissions"] = map[string]any{"@type": "Inherit"}
 		}
 		r, err := c.Set(ctx, "Account", nil, map[string]map[string]any{a.ID: fields}, nil)

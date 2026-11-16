@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/portcullis/mailctl/internal/creds"
@@ -34,7 +35,15 @@ type Runner struct {
 	Now        func() time.Time
 	Logf       func(string, ...any)
 	wake       chan struct{}
+	// pass serialises a whole pass with the API's credential creates
+	// (LockPass): a create never lands on an account a pass is parking.
+	pass sync.Mutex
 }
+
+// LockPass / UnlockPass: held by the API from its snapshot to the
+// password's create (final review M2).
+func (r *Runner) LockPass()   { r.pass.Lock() }
+func (r *Runner) UnlockPass() { r.pass.Unlock() }
 
 // NewRunner returns a runner.
 func NewRunner(c *stalwart.Client, st *state.Store, retention time.Duration, lanOnly bool, logf func(string, ...any)) *Runner {
@@ -88,6 +97,8 @@ func sameJSON(raw json.RawMessage, v any) bool {
 
 // Once is one pass.
 func (r *Runner) Once(ctx context.Context) error {
+	r.pass.Lock()
+	defer r.pass.Unlock()
 	p := r.Store.Get()
 	if p.Doc == nil {
 		return nil

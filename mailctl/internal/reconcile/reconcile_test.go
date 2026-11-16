@@ -506,3 +506,25 @@ func mustJSON(t *testing.T, d *state.Doc) []byte {
 	}
 	return b
 }
+
+// A rejoin (the same uuid back) destroys whatever password the parked
+// account still holds before its permissions come back (final review M2).
+func TestRejoinDestroysPasswords(t *testing.T) {
+	e := newEnv(t)
+	e.mustApply(baseDoc(t))
+	bob := e.account("bob")["id"].(string)
+	d := baseDoc(t)
+	d.Generation = 13
+	dropAccount(d, "bob")
+	e.mustApply(d)
+	e.f.Put("AppPassword", bob, map[string]any{"description": "made in a race with the park"})
+	back := baseDoc(t)
+	back.Generation = 14
+	e.mustApply(back)
+	if n := len(e.f.Objects("AppPassword", bob)); n != 0 {
+		t.Fatalf("%d password(s) survived the rejoin", n)
+	}
+	if p, _ := e.f.Get("Account", "", bob)["permissions"].(map[string]any); p["@type"] != "Inherit" {
+		t.Fatalf("permissions after the rejoin: %v", p)
+	}
+}

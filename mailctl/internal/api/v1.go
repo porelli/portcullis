@@ -277,7 +277,13 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 	// One snapshot of the document and one live read decide everything
-	// (no time-of-check / time-of-use gap). No document yet: refused.
+	// (no time-of-check / time-of-use gap), under the runner's pass lock:
+	// no pass parks the account between the checks and the create (final
+	// review M2). No document yet: refused.
+	if v.Runner != nil {
+		v.Runner.LockPass()
+		defer v.Runner.UnlockPass()
+	}
 	p := v.Store.Get()
 	doc := p.Doc
 	if doc == nil {
