@@ -96,8 +96,11 @@ DOCKERFILE
   [ "$keep" = true ] || trap "docker rm -f '$name' >/dev/null 2>&1 || true; docker volume rm '$name-docker' '$name-containerd' '$name-rancher' '$name-srv' >/dev/null 2>&1 || true" EXIT
   # E2E_K3S_RUNNER_ARGS: extra docker run options, e.g. a GitHub runner's
   # size: "--cpus 4 --memory 16g --memory-swap 20g".
+  # A local developer's runner container (never run by CI): privileged for
+  # its own systemd, docker and k3s.
+  local priv=(--privileged) # reviewed exception
   # shellcheck disable=SC2086  # options, split on purpose
-  docker run -d --name "$name" --privileged --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw ${E2E_K3S_RUNNER_ARGS:-} \
+  docker run -d --name "$name" "${priv[@]}" --cgroupns=host -v /sys/fs/cgroup:/sys/fs/cgroup:rw ${E2E_K3S_RUNNER_ARGS:-} \
     -v "$name-docker:/var/lib/docker" -v "$name-containerd:/var/lib/containerd" -v "$name-rancher:/var/lib/rancher" -v "$name-srv:/srv" --tmpfs /run --tmpfs /run/lock "$img" >/dev/null
   for i in $(seq 1 60); do docker exec "$name" docker info >/dev/null 2>&1 && break; [ "$i" = 60 ] && { echo "FAIL: docker in the runner didn't start"; exit 1; }; sleep 2; done
   local w=/home/runner/work/portcullis/portcullis

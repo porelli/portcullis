@@ -1,0 +1,17 @@
+#!/bin/sh
+# Echo the Cookie header the app received; set a host-only and a
+# parent-domain cookie (the relay rewrites the second to host-only).
+# ?stream: a long-lived response (a line a second for 4 minutes), for the
+# revocation test.
+if [ "${QUERY_STRING:-}" = stream ]; then
+  printf 'Content-Type: text/plain\r\n\r\n'
+  i=0; while [ "$i" -lt 240 ]; do echo "tick $i"; i=$((i + 1)); sleep 1; done
+  exit 0
+fi
+printf 'Content-Type: text/plain\r\n'
+printf 'Set-Cookie: own=1; Path=/\r\n'
+printf 'Set-Cookie: wide=1; Domain=.%s; Path=/\r\n' "${HTTP_HOST#*.}"
+printf '\r\n'
+printf 'COOKIE=%s\n' "${HTTP_COOKIE:-}"
+printf 'HOST=%s\n' "${HTTP_HOST:-}"
+[ ! -r /data/marker ] || printf 'MARKER=%s\n' "$(cat /data/marker)"
