@@ -170,12 +170,32 @@ func fqdn(n string) string { return dns.Fqdn(strings.ToLower(strings.TrimSuffix(
 
 func bare(n string) string { return strings.TrimSuffix(strings.ToLower(n), ".") }
 
+// addressNames are the names the address set owns: the domain, its
+// wildcard and, with mail on, MAIL_HOSTNAME when it is under the domain.
+// The mail set gives MAIL_HOSTNAME records of its own (its HELO SPF,
+// TLSA; mail-cert's CAA pin), and a name with any record of its own is no
+// longer answered from the wildcard (RFC 4592): without its own A/AAAA
+// the MX target would have no address.
+func addressNames(s Spec, d string) []string {
+	out := []string{d, "*." + d}
+	if s.MailHost != "" {
+		h := bare(s.MailHost)
+		if strings.HasSuffix(d, ".") {
+			h = fqdn(h) // d's form: Wanted's names are absolute, the items' bare
+		}
+		if h != d && strings.HasSuffix(h, "."+d) && !strings.HasPrefix(h, "*.") {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
 // Wanted is every record Portcullis wants, by set (absolute names with a
 // trailing dot). No caa key with CAA off or an unknown CA.
 func Wanted(s Spec) map[string][]libdns.Record {
 	d := fqdn(s.Name)
 	out := map[string][]libdns.Record{}
-	for _, n := range []string{d, "*." + d} {
+	for _, n := range addressNames(s, d) {
 		for _, ip := range []netip.Addr{s.IPv4, s.IPv6} {
 			if ip.IsValid() {
 				out[SetAddress] = append(out[SetAddress], libdns.Address{Name: n, TTL: TTLAddress, IP: ip})
@@ -494,9 +514,9 @@ func cloudflareAddr(s string) bool {
 func addressItems(ctx context.Context, in Input, d string, fix Fix, cnameAt func(string) []libdns.RR) []Item {
 	s := in.Spec
 	var out []Item
-	for _, n := range []string{d, "*." + d} {
+	for _, n := range addressNames(s, d) {
 		qname := n
-		if n != d {
+		if n == "*."+d {
 			qname = ProbeLabel + "." + d
 		}
 		for _, t := range []struct {
@@ -1019,7 +1039,7 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 	for _, set := range sets {
 		switch set {
 		case SetAddress:
-			for _, n := range []string{d, "*." + d} {
+			for _, n := range addressNames(s, d) {
 				if c := pick(live, n, "CNAME"); len(c) > 0 {
 					return written, removed, fmt.Errorf("a CNAME %s → %s exists: remove it first (Portcullis doesn't put A/AAAA records next to a CNAME)", bare(n), c[0].Data)
 				}
@@ -1030,7 +1050,7 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 			for _, r := range want[SetAddress] {
 				written = append(written, RefOf(r, zone))
 			}
-			for _, n := range []string{d, "*." + d} {
+			for _, n := range addressNames(s, d) {
 				for _, typ := range []string{"A", "AAAA"} {
 					var w []libdns.Record
 					for _, r := range want[SetAddress] {

@@ -483,7 +483,7 @@ mail_enable() {
   stack_compose_up mail mail-resolver mailctl traefik hub
   mail_image_update
   _mail_tls_key
-  ok "Mail is on. DNS: ./portcullis dns setup --only mail; status: ./portcullis mail status"
+  ok "Mail is on. DNS: ./portcullis dns setup (the mail records and $(mail_hostname)'s address); status: ./portcullis mail status"
   if [ "$yes" = true ] || confirm "Install the daily mail timer (certificate, DKIM, records) now?"; then
     mail_schedule_systemd ""
   fi
