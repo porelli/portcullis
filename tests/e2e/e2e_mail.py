@@ -456,9 +456,15 @@ def create_mail_password(page: Page, auth, who: str, label: str, strict: bool = 
 
     page.on("request", on_request)
     try:
-        with page.context.expect_page(timeout=30_000) as pinfo:
-            page.locator('[data-msi-act="mail-create-go"]').click()
-        popup = pinfo.value
+        try:
+            with page.context.expect_page(timeout=30_000) as pinfo:
+                page.locator('[data-msi-act="mail-create-go"]').click()
+            popup = pinfo.value
+        except PWError:
+            base.shot(page, f"{who}-mail-no-popup")
+            panel = page.locator('[data-msi-panel="mail"]')
+            msg = panel.first.inner_text() if panel.count() else "?"
+            raise AssertionError(f"no fresh-auth popup for {who}'s mail password; the panel says: {msg[:300]!r}") from None
         n = POPUPS[who] = POPUPS.get(who, 0) + 1
         copies = [dict(c, signCount=c.get("signCount", 0) + 1000 * (n - 1)) for c in auth.credentials()]
         base.Authenticator(popup, credentials=copies)
