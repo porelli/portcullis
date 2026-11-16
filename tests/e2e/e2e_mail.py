@@ -907,11 +907,26 @@ def restore_voids_mail_passwords(browser) -> None:
     pw = st["pw_alice"]
     mask(pw)
     a = f"alice@{DOMAIN}"
-    rows = hub_ok("GET", "/api/directory/users/alice/mail")["passwords"]
-    assert rows and all(r["status"] == "voided" for r in rows if r["status"] != "revoked"), f"after the restore: {rows}"
+    # Stalwart first: the pre-restore password is refused by IMAP and SMTP.
+    until("mail serving again after the restore", lambda: socket.create_connection(("127.0.0.1", 993), 5).close() is None, 180)
+    assert imap_refused(a, pw), "a mail password from before the restore still logs in (IMAP)"
+    try:
+        submit(a, pw, a, [a], message(a, a, "e2e after restore"))
+        raise AssertionError("a mail password from before the restore still authenticates (SMTP AUTH)")
+    except smtplib.SMTPAuthenticationError:
+        pass
+    # Then the Hub's rows: reset by the restore.
+    def voided():
+        rows = hub_ok("GET", "/api/directory/users/alice/mail")["passwords"]
+        live = [r for r in rows if r["status"] != "revoked"]
+        return rows if live and all(r["status"] == "voided" for r in live) else None
+    try:
+        until("the Hub's rows voided after the restore", voided, 120, every=10)
+    except AssertionError:
+        raise AssertionError(f"Stalwart refuses the old password, but the Hub's rows aren't voided: "
+                             f"{hub_ok('GET', '/api/directory/users/alice/mail')['passwords']}") from None
     audit = json.dumps(hub_ok("GET", "/api/directory/audit"))
     assert "mail_credential.void_restore" in audit, "no mail_credential.void_restore in the audit"
-    assert imap_refused(a, pw), "a mail password from before the restore still logs in"
     ctx, page, _ = sign_in(browser, "alice")
     open_mail(page)
     assert "reset by a restore" in page.locator("[data-msi-mail-body]").first.inner_text(), "no 'reset by a restore' on the Sign-in page"
