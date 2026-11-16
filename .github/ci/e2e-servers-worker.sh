@@ -83,8 +83,9 @@ case "$kind" in
       sudo loginctl enable-linger "$WUSER"
       uid="$(id -u "$WUSER")"
       # Linger starts the user manager; start it explicitly too (a new user).
+      # /run/user/<uid> is the worker's (0700): test its bus as root.
       sudo systemctl start "user@$uid.service" || true
-      for i in $(seq 1 60); do [ -S "/run/user/$uid/bus" ] && break; [ "$i" -eq 60 ] && { echo "FAIL: no user manager for $WUSER"; systemctl status "user@$uid.service" --no-pager | tail -20; exit 1; }; sleep 1; done
+      for i in $(seq 1 60); do sudo test -S "/run/user/$uid/bus" && break; [ "$i" -eq 60 ] && { echo "FAIL: no user manager for $WUSER"; systemctl status "user@$uid.service" --no-pager | tail -20; exit 1; }; sleep 1; done
       sudo -u "$WUSER" -H env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
         systemctl --user enable --now podman.socket podman-restart.service
     fi
