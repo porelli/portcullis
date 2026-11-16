@@ -42,9 +42,15 @@ _mail_profiles_with_mail() {
   if [ -z "${COMPOSE_PROFILES:-}" ]; then printf 'mail'; else printf '%s,mail' "$COMPOSE_PROFILES"; fi
 }
 
-# _mail_profiles_without_mail — COMPOSE_PROFILES without mail.
+# _mail_profiles_without_mail — COMPOSE_PROFILES without mail. Pure bash
+# (final review M1): no pipeline whose grep finds nothing and fails under
+# errexit + pipefail (COMPOSE_PROFILES=mail → "", status 0).
 _mail_profiles_without_mail() {
-  printf '%s' "${COMPOSE_PROFILES:-}" | tr ',' '\n' | grep -vx mail | paste -sd, -
+  local -a p=()
+  local s out=""
+  IFS=, read -ra p <<< "${COMPOSE_PROFILES:-}"
+  for s in "${p[@]}"; do [ "$s" = mail ] || [ -z "$s" ] || out="${out:+$out,}$s"; done
+  printf '%s' "$out"
 }
 
 # mail_client_ip_mode — preserved (Docker: IPv4 DNAT keeps the client
@@ -220,25 +226,52 @@ _mail_recreate() {
   dc up -d --no-deps $(runtime_no_build) mail >/dev/null
 }
 
-# _mail_recovery_start — mail in recovery mode with no egress: created,
-# detached from every network but portcullis-mail, then started. A first
-# start (any start of a store without one) creates Stalwart's WebUI
-# Application, which fetches webui.zip from GitHub; without a route it
-# fails and Stalwart carries on. The bootstrap needs only mailctl on
-# portcullis-mail. The normal recreate after the session reattaches all.
+# _mail_recovery_files — COMPOSE_FILE for the recovery-mode start: the
+# current list (or docker-compose.yml plus the override when it exists,
+# as compose itself would load) with docker-compose.mail-recovery.yml
+# last (no ports, portcullis-mail only, restart "no").
+_mail_recovery_files() {
+  local files="${COMPOSE_FILE:-}" o="$PORTCULLIS_HOME/docker-compose.mail-recovery.yml"
+  if [ -z "$files" ]; then
+    files="$PORTCULLIS_ROOT/docker-compose.yml"
+    [ ! -f "$PORTCULLIS_ROOT/docker-compose.override.yml" ] || files="$files:$PORTCULLIS_ROOT/docker-compose.override.yml"
+  fi
+  printf '%s:%s' "$files" "$o"
+}
+
+# _mail_recovery_start — mail in recovery mode with no exposure (final
+# review M4): rendered with the recovery overlay (no published port, the
+# internal portcullis-mail network only, restart "no"), created, checked
+# (portcullis-mail is internal; the container is on it alone and publishes
+# nothing), then started; any doubt refuses. A first start (any start of a
+# store without one) creates Stalwart's WebUI Application, which fetches
+# webui.zip from GitHub; without a route it fails and Stalwart carries on.
+# The bootstrap needs only mailctl on portcullis-mail. The normal
+# recreate after the session (without the overlay) reattaches all.
 _mail_recovery_start() {
-  local cid net
+  local cid
   _rt_docker_only
+  local -x COMPOSE_FILE
+  COMPOSE_FILE="$(_mail_recovery_files)"
   # shellcheck disable=SC2046  # "--no-build" or nothing
   dc create $(runtime_no_build) mail >/dev/null || return 1
   cid="$(dc ps -aq mail)"
   [ -n "$cid" ] || return 1
-  for net in $(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$cid"); do
-    [ "$net" = "$MAIL_NETWORK" ] || docker network disconnect "$net" "$cid" >/dev/null || return 1
-  done
+  if [ "$(docker network inspect -f '{{.Internal}}' "$MAIL_NETWORK" 2>/dev/null)" != true ]; then
+    warn "$MAIL_NETWORK isn't an internal network: mail won't start in recovery mode on it"
+    return 1
+  fi
   [ "$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$cid")" = "$MAIL_NETWORK " ] || return 1
+  case "$(docker inspect -f '{{len .HostConfig.PortBindings}}:{{.HostConfig.RestartPolicy.Name}}' "$cid")" in
+    0:no|0:) ;;  # Podman's compat API may answer an empty name for "no"
+    *) return 1 ;;
+  esac
   dc start mail >/dev/null
 }
+
+# _mail_boot_id — the host's boot id (the session file holds it; mail's
+# entrypoint compares it with its own: containers share the kernel).
+_mail_boot_id() { cat /proc/sys/kernel/random/boot_id 2>/dev/null; }
 
 # _mail_recovery_end — the session's trap: the recovery admin goes away
 # whatever happened (the env file, then a recreate without it).
@@ -277,10 +310,16 @@ mail_recovery_session() {
   # The start gate's one exception (_mail_void_gate), and the session
   # file the entrypoint wants with recovery mode (both gone at the end).
   export MAIL_RECOVERY_SESSION=1
-  (umask 077 && mkdir -p "$(_mail_dir)/gate" && : > "$(mail_session_file)")
+  # The session file holds this boot's id (final review M3): after a
+  # reboot a leftover one admits nothing. mail (uid 2000) reads it.
+  local boot
+  boot="$(_mail_boot_id)"
+  [ -n "$boot" ] || fail "could not read the host's boot id (/proc/sys/kernel/random/boot_id)"
+  (umask 077 && mkdir -p "$(_mail_dir)/gate" && printf '%s\n' "$boot" > "$(mail_session_file)")
+  ct_group_read "$CT_UID_MAIL" "$(mail_session_file)"
   (umask 077 && printf 'STALWART_RECOVERY_MODE=1\nSTALWART_RECOVERY_ADMIN=%s:%s\n' "$MAIL_RECOVERY_USER" "$pw" > "$f")
   trap '_mail_recovery_end' EXIT
-  trap '_mail_recovery_end; exit 130' INT TERM
+  trap '_mail_recovery_end; exit 130' INT TERM HUP
   info "Starting mail in recovery mode..."
   if ! _mail_recovery_start || ! _mail_wait_healthy; then
     rc=1
@@ -289,7 +328,7 @@ mail_recovery_session() {
     "$fn" 3<<<"$pw" || rc=$?
   fi
   _mail_recovery_end
-  trap - EXIT INT TERM
+  trap - EXIT INT TERM HUP
   unset MAIL_RECOVERY_SESSION
   [ "$rc" = 0 ] || { pw=""; fail "the mail bootstrap failed (the recovery admin was removed; mail runs without it)"; }
   _mail_wait_healthy || { pw=""; fail "mail didn't become healthy after the recovery session: docker compose logs mail"; }

@@ -535,6 +535,7 @@ stack_compose_up() {
   local rc=0 base chk i svc why wait="${STACK_UP_WAIT:-300}"
   _rt_docker_only
   _mail_void_gate "$@"
+  if [ "${_MAIL_GATED:-}" = 1 ]; then local -x COMPOSE_PROFILES="$_MAIL_GATED_PROFILES"; fi
   runtime_build_all || return 1
   dc up -d --no-build "$@" || rc=$?
   [ "$rc" -ne 0 ] || return 0

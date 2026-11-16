@@ -1579,12 +1579,17 @@ services:
     environment:
       STALWART_HEALTHCHECK_URL: http://127.0.0.1:8080/healthz/live
     # The image's own binary and arguments behind one gate (security
-    # review): while a restore's mail passwords aren't voided
-    # (secrets/mail/gate/void-pending), only a recovery-mode start inside a
-    # live recovery session (gate/recovery-session) runs — any other start
-    # (up, the Hub's restart, a reboot, a leftover recovery container)
-    # exits non-zero.
-    entrypoint: ["/bin/sh", "-c", "if [ -e /run/portcullis/mail/gate/void-pending ] && ! { [ \"$${STALWART_RECOVERY_MODE:-}\" = 1 ] && [ -e /run/portcullis/mail/gate/recovery-session ]; }; then echo 'mail passwords from a restore are not voided yet: ./portcullis mail enable' >&2; exit 1; fi; exec /usr/local/bin/stalwart \"$$@\"", "stalwart"]
+    # review; final review M2 / M3), failing closed:
+    # - recovery mode (STALWART_RECOVERY_MODE=1) runs only inside a live
+    #   recovery session OF THIS BOOT: gate/recovery-session must hold the
+    #   host's boot id (containers share the kernel's
+    #   /proc/sys/kernel/random/boot_id), so a recovery container left by
+    #   a killed CLI or brought back after a reboot is refused;
+    # - any other start needs the gate to be readable (gate/.present, which
+    #   the CLI always writes, says "portcullis-mail-gate": an unreadable
+    #   or missing gate can't hide a void-pending marker) and no marker
+    #   (a restore's passwords not voided yet).
+    entrypoint: ["/bin/sh", "-c", "G=/run/portcullis/mail/gate; if [ \"$${STALWART_RECOVERY_MODE:-}\" = 1 ]; then b=$$(cat /proc/sys/kernel/random/boot_id 2>/dev/null); s=$$(cat \"$$G/recovery-session\" 2>/dev/null); if [ -z \"$$b\" ] || [ \"$$s\" != \"$$b\" ]; then echo 'mail: a recovery-mode start outside a live recovery session of this boot: refused' >&2; exit 1; fi; else g=$$(cat \"$$G/.present\" 2>/dev/null); if [ \"$$g\" != portcullis-mail-gate ]; then echo \"the mail gate isn't readable ($$G/.present): mail stays stopped\" >&2; exit 1; fi; if [ -e \"$$G/void-pending\" ]; then echo 'mail passwords from a restore are not voided yet: ./portcullis mail enable' >&2; exit 1; fi; fi; exec /usr/local/bin/stalwart \"$$@\"", "stalwart"]
     command: ["--config", "/etc/stalwart/config.json"]
     # STALWART_RECOVERY_MODE / _ADMIN: exists only during a recovery session
     # (./portcullis mail enable, upgrade, restore's voiding; 0600).
