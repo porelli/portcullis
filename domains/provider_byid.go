@@ -138,6 +138,19 @@ func apiDo(hc *http.Client, req *http.Request, out any) error {
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		// The API's own message when it gives one (Porkbun: {"status":
+		// "ERROR","message":"…"}), trimmed; the redacting wrapper still
+		// cleans it.
+		var e struct {
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(body, &e) == nil && strings.TrimSpace(e.Message) != "" {
+			m := strings.TrimSpace(e.Message)
+			if len(m) > 300 {
+				m = m[:300]
+			}
+			return fmt.Errorf("%s %s: HTTP %d: %s", req.Method, req.URL.Path, resp.StatusCode, m)
+		}
 		return fmt.Errorf("%s %s: HTTP %d", req.Method, req.URL.Path, resp.StatusCode)
 	}
 	if out == nil {
@@ -159,7 +172,23 @@ func newPorkbunAPI(key, secret string) porkbunAPI {
 }
 
 func (a porkbunAPI) post(ctx context.Context, path string, out any) error {
-	body, err := json.Marshal(map[string]string{"apikey": a.key, "secretapikey": a.secret})
+	return a.postBody(ctx, path, nil, out)
+}
+
+// postBody posts the keys plus fields (a struct or nil) as one JSON object.
+func (a porkbunAPI) postBody(ctx context.Context, path string, fields any, out any) error {
+	m := map[string]any{}
+	if fields != nil {
+		b, err := json.Marshal(fields)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(b, &m); err != nil {
+			return err
+		}
+	}
+	m["apikey"], m["secretapikey"] = a.key, a.secret
+	body, err := json.Marshal(m)
 	if err != nil {
 		return err
 	}

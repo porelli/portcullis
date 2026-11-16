@@ -16,7 +16,6 @@ require (
 	github.com/libdns/hetzner v1.0.0
 	github.com/libdns/hetzner/v2 v2.0.1
 	github.com/libdns/libdns v1.1.1
-	github.com/libdns/porkbun v1.1.0
 	github.com/libdns/route53 v1.6.2
 	github.com/miekg/dns v1.1.73
 )
