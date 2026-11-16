@@ -80,6 +80,9 @@ _worker_inside() { [ "$1" = "$2" ] || [ "${1#"$2"/}" != "$1" ]; }
 # root-owned), and neither this install nor its worker-data lies inside one.
 worker_check_roots() {
   local r
+  # The agent (uid 10008) sees this install at the same path and must
+  # traverse it: its image's /root is 0700.
+  ! _worker_inside "$PORTCULLIS_ROOT" /root || fail "this install ($PORTCULLIS_ROOT) is under /root, which the agent (uid 10008) can't traverse: put the checkout elsewhere (e.g. /opt/portcullis)"
   while IFS= read -r r; do
     [ -d "$r" ] && [ ! -L "$r" ] || fail "the folder root $r doesn't exist (or is a link): create it, or set PORTCULLIS_WORKER_BIND_ROOTS in .env"
     ! _worker_inside "$PORTCULLIS_ROOT" "$r" || fail "this install ($PORTCULLIS_ROOT) is inside the folder root $r: move it out, or narrow PORTCULLIS_WORKER_BIND_ROOTS"

@@ -26,7 +26,7 @@ WUSER=worker
 wexec() {
   local n="$1"; shift
   if docker inspect "e2e-$n" >/dev/null 2>&1; then
-    docker exec -i -w /root/portcullis "e2e-$n" "$@"
+    docker exec -i -w /opt/portcullis "e2e-$n" "$@"
   else
     local uid; uid="$(id -u "$WUSER")"
     sudo -u "$WUSER" -H env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
@@ -60,9 +60,9 @@ case "$kind" in
       sleep 2
     done
     docker exec "e2e-$name" apk add --no-cache -q bash jq curl openssl coreutils util-linux >/dev/null
-    docker exec "e2e-$name" sh -c 'cp -a /src /root/portcullis && cd /root/portcullis && rm -rf .env secrets/* certs/* worker-data docker-compose.ci.yml'
+    docker exec "e2e-$name" sh -c 'cp -a /src /opt/portcullis && cd /opt/portcullis && rm -rf .env secrets/* certs/* worker-data docker-compose.ci.yml'
     docker save "$AGENT_IMAGE" | docker exec -i "e2e-$name" docker load -q
-    override "$RUNNER_IP" | docker exec -i "e2e-$name" sh -c 'cat > /root/portcullis/docker-compose.worker.override.yml'
+    override "$RUNNER_IP" | docker exec -i "e2e-$name" sh -c 'cat > /opt/portcullis/docker-compose.worker.override.yml'
     rt=docker ;;
   podman)
     if ! id "$WUSER" >/dev/null 2>&1; then

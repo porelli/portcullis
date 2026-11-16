@@ -50,16 +50,16 @@ echo "PASS: rogue 1: $(echo "$OUT" | jq -r .probed) TCP ports on 10.214.0.1 clos
 # 2. Another server's agent certificate on w1 → refused (dind: w3 exists).
 if [ "$kind" = dind ]; then
   D="$(data_dir)"
-  bash "$W" exec w1 sh -c "cp -a '$D/identity' /root/identity.saved"
+  bash "$W" exec w1 sh -c "cp -a '$D/identity' /opt/identity.saved"
   for f in tls.key tls.crt; do
-    docker exec e2e-w3 sh -c "cat \"\$(grep '^PORTCULLIS_WORKER_DATA=' /root/portcullis/.env | cut -d= -f2-)/identity/$f\"" \
+    docker exec e2e-w3 sh -c "cat \"\$(grep '^PORTCULLIS_WORKER_DATA=' /opt/portcullis/.env | cut -d= -f2-)/identity/$f\"" \
       | docker exec -i e2e-w1 sh -c "cat > '$D/identity/$f'"
   done
   bash "$W" compose w1 restart agent >/dev/null
   wait_state w1 offline 240
   hub /api/servers/w1 | jq -e 'tostring | test("server_identity_mismatch|identity")' >/dev/null \
     || echo "note: w1's view doesn't name the mismatch: $(hub /api/servers/w1 | jq -c '{state}')"
-  bash "$W" exec w1 sh -c "rm -rf '$D/identity' && cp -a /root/identity.saved '$D/identity' && rm -rf /root/identity.saved"
+  bash "$W" exec w1 sh -c "rm -rf '$D/identity' && cp -a /opt/identity.saved '$D/identity' && rm -rf /opt/identity.saved"
   bash "$W" compose w1 restart agent >/dev/null
   wait_state w1 ready 240
   echo "PASS: rogue 2: w3's certificate on w1 refused (w1 offline), w1 ready again with its own"

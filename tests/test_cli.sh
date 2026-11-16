@@ -558,6 +558,8 @@ expect_eq "--privileged only in .github/ci/e2e-servers-worker.sh (and e2e-k3s-lo
   "$(git -C "$ROOT_DIR_SOCK" grep -n -e '--privileged' -e 'privileged: *true' -- . ':!tests/test_cli.sh' ':!*.md' | grep -vE '^\.github/ci/(e2e-servers-worker|e2e-k3s-local)\.sh:[0-9]+:.*--privileged.*# reviewed exception$' || true)" ""
 expect_eq "the dind worker's privileged run is there (the exception the lint above allows)" \
   "$(grep -c -- '--privileged.*# reviewed exception$' "$ROOT_DIR_SOCK/.github/ci/e2e-servers-worker.sh")" 1
+expect_eq "worker join: an install under /root (the agent can't traverse it) → refused" \
+  "$( (source "$HERE/../scripts/lib/common.sh"; source "$HERE/../scripts/lib/worker.sh"; PORTCULLIS_ROOT=/root/portcullis; worker_check_roots) 2>&1 | grep -c "is under /root")" 1
 # test_socket_literal_count: twice in docker-compose.yml, once in the worker file.
 expect_eq "the engine-socket mount appears exactly once in docker-compose.worker.yml" \
   "$(grep -cF -- '- ${PORTCULLIS_ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro' "$ROOT_DIR_SOCK/docker-compose.worker.yml")" 1
