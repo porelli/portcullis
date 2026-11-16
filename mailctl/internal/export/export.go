@@ -101,20 +101,13 @@ func (e *Exporter) Export(ctx context.Context, formerID string, w io.Writer) (n 
 	if len(e.SPKI) == 0 {
 		return 0, errors.New("the mail certificate's key isn't known to mailctl yet (run ./portcullis mail rotate)")
 	}
-	// Lift authenticate only (sending and receiving stay off).
-	lifted := map[string]any{"@type": "Merge", "enabledPermissions": map[string]bool{},
-		"disabledPermissions": map[string]bool{"emailSend": true, "emailReceive": true}}
-	r, err := e.C.Set(ctx, "Account", nil, map[string]map[string]any{id: {"permissions": lifted}}, nil)
-	if err := setErr("Account", r, err); err != nil {
-		return 0, err
-	}
 	perms := map[string]bool{}
 	for _, p := range stalwart.ExportPermissions {
 		perms[p] = true
 	}
-	r, err = e.C.As(id).Set(ctx, "AppPassword", map[string]any{"x": map[string]any{
-		"description": "portcullis export",
-		"expiresAt":   now().Add(time.Hour).UTC().Format(time.RFC3339),
+	r, err := e.C.As(id).Set(ctx, "AppPassword", map[string]any{"x": map[string]any{
+		"description": reconcile.ExportDescription,
+		"expiresAt":   now().Add(reconcile.ExportLifetime).UTC().Format(time.RFC3339),
 		"allowedIps":  map[string]bool{netip.PrefixFrom(e.MailctlIP, 32).String(): true},
 		"permissions": map[string]any{"@type": "Replace", "permissions": perms},
 	}}, nil, nil)
@@ -126,6 +119,15 @@ func (e *Exporter) Export(ctx context.Context, formerID string, w io.Writer) (n 
 	_ = json.Unmarshal(r.Created["x"]["secret"], &secret)
 	if pwID == "" || secret == "" {
 		return 0, errors.New("x:AppPassword/set: no id or secret in the answer")
+	}
+	// Lifted only once the password exists: the reconciler sees the valid
+	// export password and leaves the lift alone (final review L8).
+	// Lift authenticate only (sending and receiving stay off).
+	lifted := map[string]any{"@type": "Merge", "enabledPermissions": map[string]bool{},
+		"disabledPermissions": map[string]bool{"emailSend": true, "emailReceive": true}}
+	r, err = e.C.Set(ctx, "Account", nil, map[string]map[string]any{id: {"permissions": lifted}}, nil)
+	if err := setErr("Account", r, err); err != nil {
+		return 0, err
 	}
 	dial := e.Dial
 	if dial == nil {
@@ -146,7 +148,7 @@ func (e *Exporter) Export(ctx context.Context, formerID string, w io.Writer) (n 
 	if err != nil {
 		return 0, fmt.Errorf("imap list: %w", err)
 	}
-	bw := bufio.NewWriter(w)
+	bw := bufio.NewWriterSize(w, 64<<10)
 	for _, b := range boxes {
 		if hasAttr(b.Attrs, imap.MailboxAttrNoSelect) {
 			continue
@@ -155,21 +157,21 @@ func (e *Exporter) Export(ctx context.Context, formerID string, w io.Writer) (n 
 		if err != nil {
 			return n, fmt.Errorf("imap examine %s: %w", b.Mailbox, err)
 		}
-		for start := uint32(1); start <= sel.NumMessages; start += 50 {
-			end := min(start+49, sel.NumMessages)
+		// The UIDs and dates in batches (small), then one message at a
+		// time, its body streamed straight into the mbox through a
+		// bounded buffer (final review M5: never a whole message, let
+		// alone a batch of them, in memory).
+		for start := uint32(1); start <= sel.NumMessages; start += 500 {
+			end := min(start+499, sel.NumMessages)
 			var set imap.SeqSet
 			set.AddRange(start, end)
-			msgs, err := c.Fetch(set, &imap.FetchOptions{InternalDate: true, BodySection: []*imap.FetchItemBodySection{{Peek: true}}}).Collect()
+			heads, err := c.Fetch(set, &imap.FetchOptions{UID: true, InternalDate: true}).Collect()
 			if err != nil {
 				return n, fmt.Errorf("imap fetch %s: %w", b.Mailbox, err)
 			}
-			for _, m := range msgs {
-				var body []byte
-				if len(m.BodySection) > 0 {
-					body = m.BodySection[0].Bytes
-				}
-				if err := WriteMbox(bw, m.InternalDate, body); err != nil {
-					return n, err
+			for _, h := range heads {
+				if err := streamOne(c, h.UID, h.InternalDate, bw); err != nil {
+					return n, fmt.Errorf("imap fetch %s: %w", b.Mailbox, err)
 				}
 				n++
 			}
@@ -180,6 +182,37 @@ func (e *Exporter) Export(ctx context.Context, formerID string, w io.Writer) (n 
 	}
 	_ = c.Logout().Wait()
 	return n, nil
+}
+
+// streamOne writes message uid as one mbox entry, its body read from the
+// IMAP literal as it arrives.
+func streamOne(c *imapclient.Client, uid imap.UID, date time.Time, w io.Writer) error {
+	cmd := c.Fetch(imap.UIDSetNum(uid), &imap.FetchOptions{BodySection: []*imap.FetchItemBodySection{{Peek: true}}})
+	wrote := false
+	for msg := cmd.Next(); msg != nil; msg = cmd.Next() {
+		for item := msg.Next(); item != nil; item = msg.Next() {
+			body, ok := item.(imapclient.FetchItemDataBodySection)
+			if !ok || wrote {
+				continue
+			}
+			var r io.Reader = strings.NewReader("")
+			if body.Literal != nil {
+				r = body.Literal
+			}
+			if err := WriteMboxFrom(w, date, r); err != nil {
+				_ = cmd.Close()
+				return err
+			}
+			wrote = true
+		}
+	}
+	if err := cmd.Close(); err != nil {
+		return err
+	}
+	if !wrote {
+		return fmt.Errorf("UID %d: no body in the answer", uid)
+	}
+	return nil
 }
 
 func (e *Exporter) tlsConfig(now time.Time) *tls.Config { return PinnedTLS(e.ServerName, e.SPKI, now) }
@@ -230,27 +263,80 @@ var fromLine = regexp.MustCompile(`^>*From `)
 // WriteMbox writes one message in mboxrd form: a "From " separator line,
 // LF line ends, ">"-quoted "From " lines, a blank line after.
 func WriteMbox(w io.Writer, date time.Time, msg []byte) error {
+	return WriteMboxFrom(w, date, bytes.NewReader(msg))
+}
+
+// mboxChunk bounds what WriteMboxFrom holds of a message: one line, or a
+// piece of a longer one.
+const mboxChunk = 32 << 10
+
+var lf = []byte("\n")
+
+// WriteMboxFrom is WriteMbox reading the message from r, holding at most
+// mboxChunk bytes of it at a time.
+func WriteMboxFrom(w io.Writer, date time.Time, r io.Reader) error {
 	if date.IsZero() {
 		date = time.Unix(0, 0)
 	}
 	if _, err := fmt.Fprintf(w, "From MAILER-DAEMON %s\n", date.UTC().Format("Mon Jan _2 15:04:05 2006")); err != nil {
 		return err
 	}
-	msg = bytes.ReplaceAll(msg, []byte("\r\n"), []byte("\n"))
-	for _, line := range bytes.SplitAfter(msg, []byte("\n")) {
-		if len(line) == 0 {
-			continue
+	br := bufio.NewReaderSize(r, mboxChunk)
+	lineStart, cr, empty, lastLF := true, false, true, false
+	write := func(b []byte) error {
+		if len(b) == 0 {
+			return nil
 		}
-		if fromLine.Match(line) {
-			if _, err := w.Write([]byte(">")); err != nil {
-				return err
+		empty, lastLF = false, b[len(b)-1] == '\n'
+		_, err := w.Write(b)
+		return err
+	}
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if err != nil && err != bufio.ErrBufferFull && err != io.EOF {
+			return err
+		}
+		if len(chunk) > 0 {
+			// A CR held back from the previous piece: a CRLF split
+			// across pieces becomes LF, a lone CR stays.
+			if cr {
+				cr = false
+				if chunk[0] != '\n' {
+					if err := write([]byte("\r")); err != nil {
+						return err
+					}
+				}
 			}
+			if lineStart && fromLine.Match(chunk) {
+				if err := write([]byte(">")); err != nil {
+					return err
+				}
+			}
+			out, tail := chunk, []byte(nil)
+			switch {
+			case bytes.HasSuffix(out, []byte("\r\n")):
+				out, tail = out[:len(out)-2], lf
+			case out[len(out)-1] == '\r':
+				out, cr = out[:len(out)-1], true
+			}
+			if werr := write(out); werr != nil {
+				return werr
+			}
+			if werr := write(tail); werr != nil {
+				return werr
+			}
+			lineStart = chunk[len(chunk)-1] == '\n'
 		}
-		if _, err := w.Write(line); err != nil {
+		if err == io.EOF {
+			break
+		}
+	}
+	if cr {
+		if err := write([]byte("\r")); err != nil {
 			return err
 		}
 	}
-	if len(msg) > 0 && msg[len(msg)-1] != '\n' {
+	if !empty && !lastLF {
 		if _, err := w.Write([]byte("\n")); err != nil {
 			return err
 		}

@@ -682,3 +682,46 @@ func TestOffDomainNotCreated(t *testing.T) {
 		}
 	}
 }
+
+// Final review M5 / L8: the sweep destroys an expired export password and
+// any other password of a parked account, re-locking it; a valid export
+// password (an export under way) keeps its lift until it expires.
+func TestSweepParkedExports(t *testing.T) {
+	e := newEnv(t)
+	e.mustApply(baseDoc(t))
+	bob := e.account("bob")["id"].(string)
+	d := baseDoc(t)
+	d.Generation = 13
+	dropAccount(d, "bob")
+	e.mustApply(d)
+	lift := func() {
+		if _, err := e.c.Set(context.Background(), "Account", nil, map[string]map[string]any{bob: {"permissions": map[string]any{"@type": "Merge",
+			"enabledPermissions": map[string]bool{}, "disabledPermissions": map[string]bool{"emailSend": true, "emailReceive": true}}}}, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	locked := func() bool {
+		return e.f.Get("Account", "", bob)["permissions"].(map[string]any)["disabledPermissions"].(map[string]any)["authenticate"] == true
+	}
+	lift()
+	e.f.Put("AppPassword", bob, map[string]any{"description": ExportDescription, "expiresAt": e.now.Add(30 * time.Minute).Format(time.RFC3339)})
+	e.mustApply(d)
+	if locked() || len(e.f.Objects("AppPassword", bob)) != 1 {
+		t.Fatal("an export under way was cut off")
+	}
+	// Expired (the export died): the password goes, the account is locked.
+	e.now = e.now.Add(31 * time.Minute)
+	e.mustApply(d)
+	if !locked() || len(e.f.Objects("AppPassword", bob)) != 0 {
+		t.Fatalf("after expiry: locked %v, passwords %d", locked(), len(e.f.Objects("AppPassword", bob)))
+	}
+	// Any other password on a parked account goes at once; so does an
+	// "export" one that would live longer than an export's.
+	lift()
+	e.f.Put("AppPassword", bob, map[string]any{"description": "phone"})
+	e.f.Put("AppPassword", bob, map[string]any{"description": ExportDescription, "expiresAt": e.now.Add(5 * time.Hour).Format(time.RFC3339)})
+	e.mustApply(d)
+	if !locked() || len(e.f.Objects("AppPassword", bob)) != 0 {
+		t.Fatalf("stray passwords: locked %v, passwords %d", locked(), len(e.f.Objects("AppPassword", bob)))
+	}
+}

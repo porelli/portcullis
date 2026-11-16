@@ -13,11 +13,14 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/netip"
+	"runtime"
 	"strings"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -237,3 +240,144 @@ func selfSigned(t *testing.T, host string) (tls.Certificate, string) {
 	sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: k}, hex.EncodeToString(sum[:])
 }
+
+// Final review M5: the mbox writer holds a bounded piece of a message,
+// whatever its size, and quotes / converts exactly as the whole-message
+// form did (CRLF split across pieces, lone CR, long lines, From lines).
+func TestWriteMboxFromBounded(t *testing.T) {
+	cases := []string{
+		"", "x", "From a\r\nb\r\n", ">From x\nFrom y\nok", "a\rb\r\n",
+		strings.Repeat("y", mboxChunk-1) + "\r\nFrom z\r\n",
+		strings.Repeat("y", mboxChunk) + "From not-a-line-start\r\n",
+		strings.Repeat("y", 3*mboxChunk+7) + "\r",
+	}
+	for i, c := range cases {
+		var a, b bytes.Buffer
+		if err := writeMboxWhole(&a, t0, []byte(c)); err != nil {
+			t.Fatal(err)
+		}
+		if err := WriteMboxFrom(&b, t0, iotest.OneByteReader(strings.NewReader(c))); err != nil {
+			t.Fatal(err)
+		}
+		if a.String() != b.String() {
+			t.Fatalf("case %d: streamed %q, whole %q", i, trim(b.String()), trim(a.String()))
+		}
+	}
+	// 64 MiB through it allocates a few pieces' worth, not the message.
+	const size = 64 << 20
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	if err := WriteMboxFrom(io.Discard, t0, &lines{left: size}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
+		t.Fatalf("a %d-byte message allocated %d bytes", size, got)
+	}
+}
+
+var t0 = time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+
+func trim(s string) string {
+	if len(s) > 120 {
+		return s[:60] + "…" + s[len(s)-60:]
+	}
+	return s
+}
+
+// lines yields left bytes of CRLF lines, some starting with "From ".
+type lines struct{ left, n int }
+
+func (l *lines) Read(p []byte) (int, error) {
+	if l.left == 0 {
+		return 0, io.EOF
+	}
+	w := 0
+	for w < len(p) && l.left > 0 {
+		line := "From someone\r\n"
+		if l.n%3 != 0 {
+			line = "an ordinary line of the message body, long enough\r\n"
+		}
+		k := copy(p[w:], line[:min(len(line), l.left)])
+		if k < len(line) {
+			l.left -= k
+			w += k
+			break
+		}
+		l.n++
+		l.left -= k
+		w += k
+	}
+	return w, nil
+}
+
+// writeMboxWhole is the reference: the whole-message form.
+func writeMboxWhole(w io.Writer, date time.Time, msg []byte) error {
+	fmt.Fprintf(w, "From MAILER-DAEMON %s\n", date.UTC().Format("Mon Jan _2 15:04:05 2006"))
+	msg = bytes.ReplaceAll(msg, []byte("\r\n"), []byte("\n"))
+	for _, line := range bytes.SplitAfter(msg, []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		if fromLine.Match(line) {
+			w.Write([]byte(">"))
+		}
+		w.Write(line)
+	}
+	if len(msg) > 0 && msg[len(msg)-1] != '\n' {
+		w.Write([]byte("\n"))
+	}
+	_, err := w.Write([]byte("\n"))
+	return err
+}
+
+// Final review M5: a large message goes through the export one piece at
+// a time (the client side never holds it: the in-memory server's own
+// copy is all the size there is).
+func TestExportLargeMessageStreams(t *testing.T) {
+	_, e, _, _ := setup(t)
+	mem := imapmemserver.New()
+	user := imapmemserver.NewUser("former-"+uuid+"@"+state.ParkingDomain, fmt.Sprintf("app_%036d", 1))
+	mem.AddUser(user)
+	user.Create("INBOX", nil)
+	const size = 24 << 20
+	big := "From: a@example.org\r\nSubject: big\r\n\r\n" + strings.Repeat("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd\r\n", size/64)
+	for i := 0; i < 3; i++ {
+		if _, err := user.Append("INBOX", literal(big), &imap.AppendOptions{Time: t0}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv := imapserver.New(&imapserver.Options{NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+		return mem.NewSession(), nil, nil
+	}, Caps: imap.CapSet{imap.CapIMAP4rev1: {}}, InsecureAuth: true})
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+	e.Dial = func(string, *tls.Config) (*imapclient.Client, error) {
+		return imapclient.DialInsecure(ln.Addr().String(), nil)
+	}
+	cw := &countWriter{}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	n, err := e.Export(context.Background(), "former-"+uuid, cw)
+	runtime.ReadMemStats(&after)
+	if err != nil || n != 3 {
+		t.Fatalf("export: %d %v", n, err)
+	}
+	want := 3 * (len("From MAILER-DAEMON Fri Jan  2 03:04:05 2026\n") + len(big) - strings.Count(big, "\r") + 1)
+	if cw.n != want {
+		t.Fatalf("wrote %d bytes, want %d", cw.n, want)
+	}
+	// The in-memory server copies each message once (3 × size); the
+	// client's share must stay small (the batch-collecting export
+	// allocated 326 MiB here).
+	if got := after.TotalAlloc - before.TotalAlloc; got > 3*size+16<<20 {
+		t.Fatalf("3 × %d MiB exported, %d MiB allocated", size>>20, got>>20)
+	}
+}
+
+type countWriter struct{ n int }
+
+func (c *countWriter) Write(p []byte) (int, error) { c.n += len(p); return len(p), nil }

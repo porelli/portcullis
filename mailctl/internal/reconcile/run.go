@@ -136,7 +136,27 @@ func (r *Runner) once(ctx context.Context, p state.Persistent) error {
 }
 
 func (r *Runner) apply(ctx context.Context, l *Live, doc *state.Doc, p state.Persistent) error {
+	exporting, sweepErr := SweepParked(ctx, r.C, l, r.Now())
 	ops, err := Plan(l, doc, p.Former, r.Now(), r.Retention, p.MassRemoval)
+	// An export under way (its password not expired yet) keeps its lift
+	// until it ends (final review L8); the export's own defer re-locks,
+	// and so does this pass once the password expired.
+	var redisable []string
+	for _, id := range ops.Redisable {
+		if !exporting[id] {
+			redisable = append(redisable, id)
+		}
+	}
+	ops.Redisable = redisable
+	// A failed sweep never skips the rest of the pass (an account whose
+	// passwords couldn't be read counts as not exporting: re-disabled).
+	if err := r.applyOps(ctx, l, doc, ops, err); err != nil || sweepErr != nil {
+		return errors.Join(sweepErr, err)
+	}
+	return nil
+}
+
+func (r *Runner) applyOps(ctx context.Context, l *Live, doc *state.Doc, ops Ops, err error) error {
 	if errors.Is(err, ErrMassRemoval) && len(ops.Redisable) > 0 {
 		// A pending mass removal never keeps a parked account lifted.
 		if rerr := Apply(ctx, r.C, l, doc, Ops{Redisable: ops.Redisable}, nil); rerr != nil {
@@ -176,6 +196,60 @@ func (r *Runner) apply(ctx context.Context, l *Live, doc *state.Doc, p state.Per
 		return nil
 	})
 }
+
+// SweepParked reads every parked account's app passwords (final review
+// M5): an expired export password, or any other password (a parked
+// account never has one), is destroyed; an export password still valid
+// marks an export under way (its account id in the answer).
+func SweepParked(ctx context.Context, c *stalwart.Client, l *Live, now time.Time) (map[string]bool, error) {
+	exporting := map[string]bool{}
+	var errs []error
+	for _, la := range l.Accounts {
+		if !la.Parked(l) {
+			continue
+		}
+		ac := c.As(la.ID)
+		ids, err := ac.Query(ctx, "AppPassword", nil)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("x:AppPassword/query: %w", err))
+			continue
+		}
+		if len(ids) == 0 {
+			continue
+		}
+		var ps []struct {
+			ID          string     `json:"id"`
+			Description string     `json:"description"`
+			ExpiresAt   *time.Time `json:"expiresAt"`
+		}
+		if err := ac.Get(ctx, "AppPassword", ids, []string{"id", "description", "expiresAt"}, &ps); err != nil {
+			errs = append(errs, fmt.Errorf("x:AppPassword/get: %w", err))
+			continue
+		}
+		var gone []string
+		for _, p := range ps {
+			if p.Description == ExportDescription && p.ExpiresAt != nil && now.Before(*p.ExpiresAt) && p.ExpiresAt.Sub(now) <= ExportLifetime {
+				exporting[la.ID] = true
+				continue
+			}
+			gone = append(gone, p.ID)
+		}
+		if len(gone) > 0 {
+			res, err := ac.Set(ctx, "AppPassword", nil, nil, gone)
+			if err := setErr("AppPassword", res, err); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return exporting, errors.Join(errs...)
+}
+
+// ExportDescription / ExportLifetime: the export's password (mailctl
+// export): its description and the most it lives.
+const (
+	ExportDescription = "portcullis export"
+	ExportLifetime    = time.Hour
+)
 
 // LocalNets are the networks LAN-only admits: the document's, or none at
 // all (= loopback only) when client addresses are rewritten.
