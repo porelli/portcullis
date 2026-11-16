@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"filippo.io/age"
+
+	"github.com/portcullis/domains/internal/dnsplan"
 )
 
 // Everything the service keeps — credentials, the ACME account key,
@@ -67,10 +69,20 @@ type Domain struct {
 	CAAOK bool `json:"caa_ok"`
 	// DNSSEC: the last chain check's state (dnssec.State).
 	DNSSEC string `json:"dnssec"`
-	// Sets: the optional record sets opted in (nomail); DueSets: sets to
-	// apply on the next records step (POST /domains/{name}/dns/apply).
+	// Sets: the optional record sets opted in (nomail, mail); DueSets:
+	// sets to apply on the next records step (POST /domains/{name}/dns/apply,
+	// PUT / DELETE /domains/{name}/sets/mail).
 	Sets    []string `json:"sets,omitempty"`
 	DueSets []string `json:"due_sets,omitempty"`
+	// SetGens counts the requests per set (markDue): a records step clears
+	// a due set only when no request came after the snapshot it applied,
+	// so a PUT / DELETE racing a running step is never lost.
+	SetGens map[string]int `json:"set_gens,omitempty"`
+	// MailWanted: the mail set's records (PUT …/sets/mail; empty while
+	// mail is off). NoMailBeforeMail: nomail was on when mail replaced it,
+	// so DELETE …/sets/mail brings it back.
+	MailWanted       []dnsplan.MailRecord `json:"mail_wanted,omitempty"`
+	NoMailBeforeMail bool                 `json:"nomail_before_mail,omitempty"`
 	// SignRequested: turn DNSSEC signing on in the next records step.
 	SignRequested bool `json:"sign_requested,omitempty"`
 	// Deleting: a DELETE is in progress (not persisted). No new work

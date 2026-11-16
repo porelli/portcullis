@@ -50,7 +50,10 @@ _mcpgate_keygen_docker() {
     && grep -q '^AGE-SECRET-KEY-1' "$tmp" \
     && grep -Eq '^# public key: age1[0-9a-z]+$' "$tmp" \
     || { rm -f "$tmp"; fail "could not generate secrets/mcp-gate/age.key"; }
-  mv -f "$tmp" "$f"
+  # In place (inode kept): the containers bind the file itself, and a
+  # running one never sees a replaced file.
+  [ -e "$f" ] || (umask 077 && : > "$f")
+  cat "$tmp" > "$f" && rm -f "$tmp"
   ok "Generated secrets/mcp-gate/age.key (decrypts the Hub's AI credentials; backed up with secrets/)."
 }
 
@@ -63,7 +66,12 @@ mcpgate_ensure_secrets() {
   d="$(_mcpgate_dir)"
   (umask 077 && mkdir -p "$d")
   if [ ! -s "$d/hub-secret" ] || [ "$(tr -d '[:space:]' < "$d/hub-secret" | wc -c | tr -d ' ')" -lt 32 ]; then
-    (umask 077 && gen_alnum 48 > "$d/hub-secret.new") && mv -f "$d/hub-secret.new" "$d/hub-secret"
+    # In place: the Hub and mcp-gate bind the file itself (inode kept).
+    [ -e "$d/hub-secret" ] || (umask 077 && : > "$d/hub-secret")
+    local hs
+    hs="$(gen_alnum 48)"
+    printf '%s' "$hs" > "$d/hub-secret"
+    unset hs
     info "Generated secrets/mcp-gate/hub-secret (shared by mcp-gate and the Hub)."
   fi
   if [ ! -s "$d/age.key" ]; then
@@ -77,7 +85,9 @@ mcpgate_ensure_secrets() {
   [ -n "$pub" ] || fail "secrets/mcp-gate/age.key has no '# public key: age1...' line: restore it from a backup. A new key can't decrypt the AI credentials the Hub stored (the Hub never re-keys them): mcp-gate would refuse its files and every AI resource would answer 503 until each app_token AI companion is switched off and on in the Hub."
   cur="$(cat "$d/age.pub" 2>/dev/null || true)"
   if [ "$cur" != "$pub" ]; then
-    (umask 077 && printf '%s\n' "$pub" > "$d/age.pub.new") && mv -f "$d/age.pub.new" "$d/age.pub"
+    # In place: the Hub binds the file itself (inode kept).
+    [ -e "$d/age.pub" ] || (umask 077 && : > "$d/age.pub")
+    printf '%s\n' "$pub" > "$d/age.pub"
     info "Wrote secrets/mcp-gate/age.pub (the gate's recipient, for the Hub)."
   fi
   mcpgate_fix_perms

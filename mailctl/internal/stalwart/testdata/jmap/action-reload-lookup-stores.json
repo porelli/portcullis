@@ -1,0 +1,39 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:Action/set",
+        {
+          "create": {
+            "a": {
+              "@type": "ReloadLookupStores"
+            }
+          }
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:Action/set",
+        {
+          "accountId": "f",
+          "created": {
+            "a": {
+              "id": "bvptyeb"
+            }
+          }
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "fc380151"
+  }
+}

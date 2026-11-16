@@ -1,0 +1,118 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:QueuedMessage/get",
+        {
+          "ids": [
+            "jouulpnyaiaa",
+            "joutmwiuadqa"
+          ]
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:QueuedMessage/get",
+        {
+          "accountId": "b",
+          "list": [
+            {
+              "createdAt": "2026-11-15T16:47:13Z",
+              "nextRetry": "2026-11-15T17:02:14Z",
+              "nextNotify": "2026-11-16T16:47:13Z",
+              "blobId": "gazujlap7oi1ekmapcwosib7knoqs7jkihkmp7sakyt9sagotubg9agaqdol9c0f9uca",
+              "returnPath": "alice@spike.test",
+              "recipients": {
+                "someone@remote.example": {
+                  "retryCount": 3,
+                  "retryDue": "2026-11-15T17:02:14Z",
+                  "notifyCount": 0,
+                  "notifyDue": "2026-11-16T16:47:13Z",
+                  "expires": {
+                    "expiresAt": "2026-11-18T16:47:13Z",
+                    "@type": "Ttl"
+                  },
+                  "queueName": "remote",
+                  "status": {
+                    "errorType": "connectionError",
+                    "errorMessage": "I/O error: Connection refused (os error 111)",
+                    "errorCommand": null,
+                    "responseHostname": "mx.remote.example",
+                    "responseCode": null,
+                    "responseEnhanced": null,
+                    "responseMessage": null,
+                    "@type": "TemporaryFailure"
+                  },
+                  "flags": {},
+                  "orcpt": null
+                }
+              },
+              "receivedFromIp": "192.168.231.3",
+              "receivedViaPort": 10587,
+              "flags": {
+                "authenticated": true
+              },
+              "envId": null,
+              "priority": 0,
+              "size": 80,
+              "id": "jouulpnyaiaa"
+            },
+            {
+              "createdAt": "2026-11-15T16:38:49Z",
+              "nextRetry": "2026-11-15T17:22:14Z",
+              "nextNotify": "2026-11-16T16:38:49Z",
+              "blobId": "gcvxbuzm0ntu2ps2gszq13mhq92khcy0ruycwk7jmdattmsh2llgbae2qcfnt9fe9uca",
+              "returnPath": "<>",
+              "recipients": {
+                "someone@remote.example": {
+                  "retryCount": 2,
+                  "retryDue": "2026-11-15T17:22:14Z",
+                  "notifyCount": 0,
+                  "notifyDue": "2026-11-16T16:38:49Z",
+                  "expires": {
+                    "expiresAttempts": 10,
+                    "@type": "Attempts"
+                  },
+                  "queueName": "dsn",
+                  "status": {
+                    "errorType": "connectionError",
+                    "errorMessage": "I/O error: Connection refused (os error 111)",
+                    "errorCommand": null,
+                    "responseHostname": "mx.remote.example",
+                    "responseCode": null,
+                    "responseEnhanced": null,
+                    "responseMessage": null,
+                    "@type": "TemporaryFailure"
+                  },
+                  "flags": {},
+                  "orcpt": null
+                }
+              },
+              "receivedFromIp": "127.0.0.1",
+              "receivedViaPort": 0,
+              "flags": {
+                "dsn": true
+              },
+              "envId": null,
+              "priority": 0,
+              "size": 2999,
+              "id": "joutmwiuadqa"
+            }
+          ],
+          "notFound": []
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "b4af13e9"
+  }
+}

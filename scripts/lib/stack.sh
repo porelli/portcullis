@@ -15,6 +15,8 @@ _dns_cred_keys() {
     digitalocean) echo "DO_AUTH_TOKEN:auth_token" ;;
     hetzner) echo "HETZNER_API_KEY:api_token" ;;
     hetzner-cloud) echo "HETZNER_API_TOKEN:api_token" ;;
+    # CI only (PORTCULLIS_TESTPROVIDER=1 with the testprovider domains image).
+    fake) echo "FAKE_API_TOKEN:api_token" ;;
   esac
   return 0
 }
@@ -28,6 +30,9 @@ _dns_cred_vars() {
 # (the domains image's dns tool); any other provider: records by hand.
 _dns_automated() {
   case "$1" in cloudflare|porkbun|route53|digitalocean|hetzner|hetzner-cloud) return 0 ;; esac
+  # The CI-only fake provider (the domains image's testprovider build),
+  # never accepted without PORTCULLIS_TESTPROVIDER=1.
+  [ "$1" = fake ] && [ "${PORTCULLIS_TESTPROVIDER:-}" = 1 ] && return 0
   return 1
 }
 
@@ -519,13 +524,16 @@ stack_up() {
   env_require PORTCULLIS_DOMAIN $CORE_SECRETS
   require_cmd docker jq curl
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
+  ! mail_profile_on || mail_refuse_kube
   runtime_check
   runtime_require_host
   rt_network_check
   stack_prepare
   config_apply
   sessions_restart_if_changed
+  _rt_is_kube || mail_up_steps up
   rt_up
+  _rt_is_kube || mail_after_up
   runtime_proxies_refresh
   domains_restart_if_renewed
   monitoring_reload
@@ -555,6 +563,7 @@ upgrade_run() {
   # shellcheck disable=SC2086
   env_require PORTCULLIS_DOMAIN $CORE_SECRETS
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
+  ! mail_profile_on || mail_refuse_kube
   runtime_check
   runtime_require_host
   rt_network_check
@@ -576,7 +585,9 @@ upgrade_run() {
 
   info "Starting services..."
   sessions_restart_if_changed
+  _rt_is_kube || mail_up_steps upgrade
   rt_up
+  _rt_is_kube || mail_after_up
   runtime_proxies_refresh
   domains_restart_if_renewed
   monitoring_reload

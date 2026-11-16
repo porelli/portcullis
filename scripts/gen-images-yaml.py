@@ -27,7 +27,8 @@ OUT_JSON = ROOT / "charts" / "portcullis" / "images.json"
 
 REGISTRY = "ghcr.io/porelli/portcullis-"
 CORE_BUILT = ("group-gate", "enroll", "domains", "mcp-gate", "wg")
-ABSENT = ("socket-proxy-traefik", "socket-proxy-hub")
+# Mail is Docker / Podman only (contract §19.12): no chart images.
+ABSENT = ("socket-proxy-traefik", "socket-proxy-hub", "mail", "mailctl", "mail-resolver", "mail-cert")
 PINNED = re.compile(r"^[a-z0-9.-]+\.[a-z]+(:[0-9]+)?/[a-z0-9._/-]+:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$")
 DEFAULT = re.compile(r"^\$\{[A-Z_]+:-(ghcr\.io/porelli/portcullis-[a-z-]+:edge)\}$")
 

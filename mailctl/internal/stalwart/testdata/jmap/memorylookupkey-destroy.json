@@ -1,0 +1,35 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:MemoryLookupKey/set",
+        {
+          "destroy": [
+            "joutqeykabqa"
+          ]
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:MemoryLookupKey/set",
+        {
+          "accountId": "b",
+          "destroyed": [
+            "joutqeykabqa"
+          ]
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "fc380151"
+  }
+}

@@ -99,6 +99,36 @@ networks:
   # Prometheus → wg's metrics only (monitoring profile + profile wg).
   portcullis-metrics-wg:
     internal: true
+  # Mail (profile mail, contract §19.1). portcullis-mail: mail, mailctl and
+  # mail-resolver only, pinned outside the dynamic range (Stalwart's
+  # management listener trusts mailctl's address there; its API key is
+  # pinned to it). No egress. network.sh validates PORTCULLIS_MAIL_*.
+  portcullis-mail:
+    name: portcullis-mail
+    internal: true
+    ipam:
+      config:
+        - subnet: ${PORTCULLIS_MAIL_SUBNET:-172.31.255.0/28}
+          ip_range: ${PORTCULLIS_MAIL_IP_RANGE:-172.31.255.8/29}
+  # The Hub ⇄ mailctl API only (contract §19.5): mailctl answers only
+  # connections addressed to it here (MAILCTL_API_SUBNET). The Hub joins it
+  # always (it tolerates a missing mailctl).
+  portcullis-mailctl:
+    name: portcullis-mailctl
+    internal: true
+    ipam:
+      config:
+        - subnet: ${PORTCULLIS_MAILCTL_SUBNET:-172.31.255.16/28}
+          ip_range: ${PORTCULLIS_MAILCTL_IP_RANGE:-172.31.255.24/29}
+  # Prometheus → mail's and mailctl's metrics only.
+  portcullis-metrics-mail:
+    internal: true
+  # Mail's egress: SMTP to other servers (mail), the public resolvers
+  # (mailctl's checks), the root servers (mail-resolver). IPv4 only, set
+  # explicitly (final review L4): a daemon with IPv6 on by default would
+  # give mail an outbound v6 address without a PTR.
+  mail-egress:
+    enable_ipv6: false
 
 # Hardening defaults (see docs/hardening.md for per-service exceptions).
 x-hardening: &hardening
@@ -898,7 +928,7 @@ services:
       # subnets, = network.sh vpn_reserved_ranges (the Hub's core.env
       # PORTCULLIS_VPN_RESERVED_RANGES; CI compares). vpn.json naming one is
       # refused whole.
-      GATE_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28} ${PORTCULLIS_VPN_RUNTIME_POOLS:-}"
+      GATE_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28} ${PORTCULLIS_MAIL_SUBNET:-172.31.255.0/28} ${PORTCULLIS_MAILCTL_SUBNET:-172.31.255.16/28} ${PORTCULLIS_VPN_RUNTIME_POOLS:-}"
       # Required: core hosts are <sub>.<PORTCULLIS_DOMAIN> (map.conf) and
       # app hosts <label>.<PORTCULLIS_DOMAIN> or on an enrolled domain
       # (policy v5 extra_domains); any other X-Forwarded-Host is denied.
@@ -1086,6 +1116,10 @@ services:
       HUB_VPN_STATUS_FILE: /wg-data/status.json
       HUB_VPN_DOC_DIR: /vpn-doc
       HUB_VPN_DOC_GID: "10007"
+      # Mail (contract §19.1): mailctl's API over portcullis-mailctl, the
+      # bearer secret from a file (an empty one = mail is off).
+      HUB_MAILCTL_API_URL: http://mailctl:8080
+      HUB_MAILCTL_SECRET_FILE: /run/portcullis/mail/hub-secret
     volumes:
       - .:/project:ro
       # Writable overlay: before every `compose up` the Hub copies each app's
@@ -1122,6 +1156,8 @@ services:
       - ./secrets/hub/lldap:/run/portcullis/lldap:ro
       - ./secrets/hub/invite:/run/portcullis/invite:ro
       - ./secrets/domains/api-secret:/run/portcullis/domains/api-secret:ro
+      # mailctl's Hub secret (contract §19.1; an empty placeholder without mail).
+      - ./secrets/mail/hub-secret:/run/portcullis/mail/hub-secret:ro
       # mcp-gate (contract §15): the shared secret, the gate's age recipient
       # and its access log (written by the gate only).
       - ./secrets/mcp-gate/hub-secret:/run/portcullis/mcp-gate/hub-secret:ro
@@ -1146,6 +1182,9 @@ services:
       # mcp-gate → the Hub's :8890 listener (contract §15.7), at this pinned address.
       portcullis-mcp:
         ipv4_address: ${PORTCULLIS_MCP_HUB_IP:-172.31.253.3}
+      # The Hub → mailctl's API (contract §19.5), at this pinned address.
+      portcullis-mailctl:
+        ipv4_address: ${PORTCULLIS_MAILCTL_HUB_IP:-172.31.255.18}
     # vpn.json's group (vpn_doc, 10007): shared with wg and group-gate only.
     group_add: ["10007"]
     mem_limit: 1g
@@ -1299,6 +1338,8 @@ services:
       DNS_CAA_ISSUER: ${DNS_CAA_ISSUER:-}
       DNS_CAA_IODEF: ${DNS_CAA_IODEF:-}
       ALERT_SMTP_FROM: ${ALERT_SMTP_FROM:-}
+      # Mail (contract §19.3): the MX host of the mail set ("" = mail.<main domain>).
+      DOMAINS_MAIL_HOSTNAME: ${MAIL_HOSTNAME:-}
     # DOMAINS_PUBLIC_IPV4 / _IPV6: PORTCULLIS_PUBLIC_IPV4 / _IPV6 from .env,
     # else detected (the last detected address kept when a lookup fails) —
     # written by ./portcullis up, so a manual `docker compose up` gets them
@@ -1475,7 +1516,7 @@ services:
       # the link subnet 10.214.0.0/24; under podman ending in Podman's pools
       # 10.88.0.0/16 10.89.0.0/16, PORTCULLIS_VPN_RUNTIME_POOLS from the CLI;
       # = GATE_CORE_SUBNETS).
-      WG_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28} ${PORTCULLIS_VPN_RUNTIME_POOLS:-}"
+      WG_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28} ${PORTCULLIS_MAIL_SUBNET:-172.31.255.0/28} ${PORTCULLIS_MAILCTL_SUBNET:-172.31.255.16/28} ${PORTCULLIS_VPN_RUNTIME_POOLS:-}"
       WG_TRAEFIK: ${PORTCULLIS_VPN_EDGE_TRAEFIK_IP:-172.31.254.66}:8443
       WG_DNS_UPSTREAM: ${PORTCULLIS_VPN_DNS_UPSTREAM:-1.1.1.1,9.9.9.9}
       WG_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
@@ -1516,6 +1557,233 @@ services:
     pids_limit: 128
     restart: unless-stopped
 
+  # ── Mail (profile mail, contract §19; ./portcullis mail enable adds it to
+  # COMPOSE_PROFILES). Stalwart, unmodified and pinned; its configuration
+  # lives in its store, written only by mailctl. It never starts while
+  # mail_etc/config.json is missing (./portcullis refuses: Stalwart would
+  # start in bootstrap mode and log a generated admin password).
+  mail:
+    image: docker.io/stalwartlabs/stalwart:v1.1.0@sha256:f772aa6ef8cd8018969fa491640f1436b0270eb14e2c219b5f37f1a77020837e
+    profiles: [mail]
+    <<: *hardening
+    # The image's binary carries the file capability cap_net_bind_service
+    # (+ep), which can't be executed under cap_drop ALL ("operation not
+    # permitted", Task 2): the one exception. It binds only ports ≥ 10025.
+    cap_add: [NET_BIND_SERVICE]
+    user: "2000:2000"
+    read_only: true
+    init: true
+    tmpfs:
+      - /tmp:size=64m
+      # The default Tracer's path (the base plan logs to stdout instead).
+      - /var/log/stalwart:size=16m
+    ulimits:
+      nofile: {soft: 65536, hard: 65536}
+    environment:
+      STALWART_HEALTHCHECK_URL: http://127.0.0.1:8080/healthz/live
+    # The image's own binary and arguments behind one gate (security
+    # review; final review M2 / M3), failing closed:
+    # - recovery mode (STALWART_RECOVERY_MODE=1) runs only inside a live
+    #   recovery session OF THIS BOOT: gate/recovery-session must hold the
+    #   host's boot id (containers share the kernel's
+    #   /proc/sys/kernel/random/boot_id), so a recovery container left by
+    #   a killed CLI or brought back after a reboot is refused;
+    # - any other start needs the gate to be readable (gate/.present, which
+    #   the CLI always writes, says "portcullis-mail-gate": an unreadable
+    #   or missing gate can't hide a void-pending marker) and no marker
+    #   (a restore's passwords not voided yet).
+    entrypoint: ["/bin/sh", "-c", "G=/run/portcullis/mail/gate; if [ \"$${STALWART_RECOVERY_MODE:-}\" = 1 ]; then b=$$(cat /proc/sys/kernel/random/boot_id 2>/dev/null); s=$$(cat \"$$G/recovery-session\" 2>/dev/null); if [ -z \"$$b\" ] || [ \"$$s\" != \"$$b\" ]; then echo 'mail: a recovery-mode start outside a live recovery session of this boot: refused' >&2; exit 1; fi; else g=$$(cat \"$$G/.present\" 2>/dev/null); if [ \"$$g\" != portcullis-mail-gate ]; then echo \"the mail gate isn't readable ($$G/.present): mail stays stopped\" >&2; exit 1; fi; if [ -e \"$$G/void-pending\" ]; then echo 'mail passwords from a restore are not voided yet: ./portcullis mail enable' >&2; exit 1; fi; fi; exec /usr/local/bin/stalwart \"$$@\"", "stalwart"]
+    command: ["--config", "/etc/stalwart/config.json"]
+    # STALWART_RECOVERY_MODE / _ADMIN: exists only during a recovery session
+    # (./portcullis mail enable, upgrade, restore's voiding; 0600).
+    env_file:
+      - path: ./secrets/mail/recovery.env
+        required: false
+      # STALWART_UPDATE_ROLE_PERMISSIONS=true for one start after an image
+      # change (0600, removed once healthy).
+      - path: ./secrets/mail/update.env
+        required: false
+    volumes:
+      - mail_data:/var/lib/stalwart
+      - mail_etc:/etc/stalwart
+      - mail_tls:/run/portcullis/mail/tls:ro
+      - ./secrets/mail/metrics-secret:/run/portcullis/mail/metrics-secret:ro
+      - ./secrets/mail/relay-password:/run/portcullis/mail/relay-password:ro
+      # The restore's void-pending marker (only it lives here): the
+      # entrypoint below refuses a normal start while it exists.
+      - ./secrets/mail/gate:/run/portcullis/mail/gate:ro
+    networks:
+      portcullis-mail:
+        ipv4_address: ${PORTCULLIS_MAIL_IP:-172.31.255.2}
+      mail-egress: {}
+      portcullis-metrics-mail:
+        aliases: [mail-metrics]
+    # Published directly (no Traefik TCP entrypoint); never lan_only: 25 is
+    # public. IPv4 only (IPv6 for mail isn't supported yet).
+    ports:
+      - "0.0.0.0:25:10025"
+      - "0.0.0.0:465:10465"
+      - "0.0.0.0:587:10587"
+      - "0.0.0.0:993:10993"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8080/healthz/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    mem_limit: 1g
+    pids_limit: 256
+    restart: unless-stopped
+
+  # The only holder of Stalwart's API key (contract §19.1): no engine
+  # access, no LLDAP / Keycloak / DNS credentials. The Hub API on its
+  # portcullis-mailctl address only; the spam rules on its portcullis-mail
+  # address only; the well-known files for Traefik on portcullis-proxy;
+  # metrics on portcullis-metrics-mail.
+  mailctl:
+    build:
+      context: ./mailctl
+    image: portcullis-mailctl
+    profiles: [mail]
+    <<: *hardening
+    # USER 10010:10010 in mailctl/Dockerfile; group 10001 only to read the
+    # Hub secret (secrets/mail/hub-secret).
+    user: "10010:10010"
+    group_add: ["10001"]
+    read_only: true
+    tmpfs:
+      - /tmp
+    environment:
+      MAILCTL_API_ADDR: ":8080"
+      MAILCTL_API_SUBNET: ${PORTCULLIS_MAILCTL_SUBNET:-172.31.255.16/28}
+      MAILCTL_HUB_SECRET_FILE: /run/portcullis/mail/hub-secret
+      MAILCTL_METRICS_SECRET_FILE: /run/portcullis/mail/metrics-secret
+      MAILCTL_API_KEY_FILE: /run/portcullis/mail/api-key
+      MAILCTL_DQS_KEY_FILE: /run/portcullis/mail/dqs-key
+      MAILCTL_STALWART_URL: http://${PORTCULLIS_MAIL_IP:-172.31.255.2}:8080
+      MAILCTL_WELLKNOWN_ADDR: ":8081"
+      # The well-known router's entrypoints (MTA-STS follows VPN-only mode).
+      MAILCTL_WELLKNOWN_ENTRYPOINTS: ${PORTCULLIS_EP_CORE:-websecure,vpnsecure}
+      MAILCTL_RULES_ADDR: ${PORTCULLIS_MAILCTL_MAIL_IP:-172.31.255.3}:8082
+      MAILCTL_METRICS_ADDR: mailctl-metrics:9100
+      MAILCTL_DATA: /data
+      MAILCTL_LOCAL_RESOLVER: ${PORTCULLIS_MAIL_RESOLVER_IP:-172.31.255.4}:5353
+      MAILCTL_RESOLVERS: ${MAILCTL_RESOLVERS:-1.1.1.1:53 8.8.8.8:53}
+      # preserved | rewritten: written by ./portcullis from the runtime.
+      MAILCTL_CLIENT_IP: ${MAILCTL_CLIENT_IP:-}
+      MAILCTL_PUBLIC_IPV4: ${MAILCTL_PUBLIC_IPV4:-}
+      MAILCTL_PUBLIC_IPV6: ${MAILCTL_PUBLIC_IPV6:-}
+      PORTCULLIS_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
+      MAIL_HOSTNAME: ${MAIL_HOSTNAME:-mail.${PORTCULLIS_DOMAIN:-portcullis.local}}
+      MAIL_DKIM_ROTATE: ${MAIL_DKIM_ROTATE:-4320h}
+      MAIL_FORMER_RETENTION: ${MAIL_FORMER_RETENTION:-720h}
+      MAIL_SUBMISSION_LAN_ONLY: ${MAIL_SUBMISSION_LAN_ONLY:-false}
+      MAIL_RELAY_HOST: ${MAIL_RELAY_HOST:-}
+      MAIL_RELAY_PORT: ${MAIL_RELAY_PORT:-}
+      MAIL_RELAY_USERNAME: ${MAIL_RELAY_USERNAME:-}
+      MAIL_RELAY_SPF_INCLUDE: ${MAIL_RELAY_SPF_INCLUDE:-}
+      GOMEMLIMIT: 200MiB
+    # DOMAINS_PUBLIC_IPV4 / _IPV6 (the domains service's file, ./portcullis up).
+    env_file:
+      - path: ./secrets/domains/public-ips.env
+        required: false
+    volumes:
+      - mailctl_data:/data
+      - ./secrets/mail/api-key:/run/portcullis/mail/api-key:ro
+      - ./secrets/mail/hub-secret:/run/portcullis/mail/hub-secret:ro
+      - ./secrets/mail/dqs-key:/run/portcullis/mail/dqs-key:ro
+      # Its /metrics password (Basic auth, user prometheus).
+      - ./secrets/mail/mailctl-metrics-secret:/run/portcullis/mail/metrics-secret:ro
+    networks:
+      portcullis-mail:
+        ipv4_address: ${PORTCULLIS_MAILCTL_MAIL_IP:-172.31.255.3}
+      portcullis-mailctl:
+        ipv4_address: ${PORTCULLIS_MAILCTL_API_IP:-172.31.255.19}
+      portcullis-proxy:
+        ipv4_address: ${PORTCULLIS_MAILCTL_PROXY_IP:-172.31.250.4}
+      mail-egress: {}
+      portcullis-metrics-mail:
+        aliases: [mailctl-metrics]
+    healthcheck:
+      test: ["CMD", "mailctl", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    mem_limit: 256m
+    pids_limit: 128
+    restart: unless-stopped
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: portcullis-proxy
+      traefik.http.services.mailctl-wellknown.loadbalancer.server.port: "8081"
+      # The main domain's MTA-STS policy, autoconfig and autodiscover
+      # (contract §19.7); added domains' hosts come from the Hub's
+      # mail-wellknown-<domain> routers. Like every core router without
+      # group-gate it follows VPN-only mode (no public exception):
+      # MAILCTL_WELLKNOWN_ENTRYPOINTS is the same value.
+      traefik.http.routers.mail-wellknown.rule: Host(`mta-sts.${PORTCULLIS_DOMAIN:-portcullis.local}`) || Host(`autoconfig.${PORTCULLIS_DOMAIN:-portcullis.local}`) || Host(`autodiscover.${PORTCULLIS_DOMAIN:-portcullis.local}`)
+      traefik.http.routers.mail-wellknown.entrypoints: ${PORTCULLIS_EP_CORE:-websecure,vpnsecure}
+      traefik.http.routers.mail-wellknown.tls.options: authaware@file
+      traefik.http.routers.mail-wellknown.middlewares: rate-limit@file,security-headers@file
+      traefik.http.routers.mail-wellknown.service: mailctl-wellknown
+
+  # A validating recursive resolver for mail and mailctl only (contract
+  # §19.1): Unbound from the root servers, the image's trust anchor, on
+  # 5353 (non-root, no capability). The image has no shell: exec-form check.
+  mail-resolver:
+    image: docker.io/klutchell/unbound:v1.26.2@sha256:50cbeb32b5838a829a7226b19cb151f9535bd7f9f3190f950780f452fe807478
+    profiles: [mail]
+    <<: *hardening
+    # The image's unbound user (CT_UID_MAIL_RESOLVER).
+    user: "101:102"
+    read_only: true
+    tmpfs:
+      - /tmp
+    command: ["-d", "-c", "/etc/unbound/custom.conf"]
+    volumes:
+      - ./mail/unbound.conf:/etc/unbound/custom.conf:ro
+    networks:
+      portcullis-mail:
+        ipv4_address: ${PORTCULLIS_MAIL_RESOLVER_IP:-172.31.255.4}
+      mail-egress: {}
+    healthcheck:
+      # -p before the server operand (drill stops at the first operand).
+      test: ["CMD", "drill-hc", "-p", "5353", "@127.0.0.1", "dnssec.works"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    mem_limit: 128m
+    pids_limit: 64
+    restart: unless-stopped
+
+  # The domains image's one-shot mail certificate tool (contract §19.3):
+  # `domains mail-cert`, its own ACME account and one reused key in
+  # mail_acme, the chain in mail_tls (read-only in mail). ./portcullis runs
+  # it with `run --rm --no-deps -T` and the DNS credentials on stdin.
+  mail-cert:
+    image: portcullis-domains
+    pull_policy: never
+    profiles: [tools]
+    <<: *hardening
+    read_only: true
+    user: "10004:2000"
+    entrypoint: ["domains", "mail-cert"]
+    stdin_open: true
+    # The resolvers its CAA wait and lego's DNS-01 checks ask (CI overrides
+    # them, plus LEGO_CA_CERTIFICATES for Pebble).
+    environment:
+      DOMAINS_RESOLVERS: 1.1.1.1:53,8.8.8.8:53
+    healthcheck:
+      disable: true
+    volumes:
+      - mail_acme:/acme
+      - mail_tls:/tls
+    networks: [domains-egress]
+    mem_limit: 128m
+    pids_limit: 64
+
   prometheus:
     image: docker.io/prom/prometheus:v3.16.0@sha256:e04987641b57704f408e31f6373ba4138ecf27cb4a165d24aabb6c38fddd0f06
     profiles: [monitoring]
@@ -1535,6 +1803,8 @@ services:
       - portcullis
       # wg's metrics (profile wg), the only other member.
       - portcullis-metrics-wg
+      # mail's and mailctl's metrics (profile mail), the only other members.
+      - portcullis-metrics-mail
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
       interval: 15s
@@ -1716,6 +1986,15 @@ volumes:
   # read by wg and group-gate through group 10007. Regenerated by the Hub
   # from its state: not backed up.
   vpn_doc:
+  # Mail (contract §19.1): Stalwart's store and its store-only config.json
+  # (2000:2000, mail only), the mail certificate (10004:2000 2750, read-only
+  # in mail) and its ACME account + reused key (10004:10004 0700, mail-cert
+  # only), mailctl's state (10010:10010 0700).
+  mail_data:
+  mail_etc:
+  mail_tls:
+  mail_acme:
+  mailctl_data:
   prometheus_data:
   alertmanager_data:
   grafana_data:

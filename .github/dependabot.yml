@@ -74,6 +74,19 @@ updates:
       - dependency-name: "golang"
         versions: [">= 1.28.a, < 1.28", ">= 1.29.a, < 1.29", ">= 1.30.a, < 1.30"]
 
+  # mailctl/Dockerfile base images (golang, alpine; the same builder as
+  # every Go service). The Stalwart and Unbound pins are compose images.
+  - package-ecosystem: docker
+    directory: /mailctl
+    schedule:
+      interval: weekly
+    groups:
+      mailctl-images:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "golang"
+        versions: [">= 1.28.a, < 1.28", ">= 1.29.a, < 1.29", ">= 1.30.a, < 1.30"]
+
   # group-gate/Dockerfile base image (python).
   - package-ecosystem: docker
     directory: /group-gate
@@ -144,6 +157,15 @@ updates:
       interval: weekly
     groups:
       vpn-go:
+        patterns: ["*"]
+
+  # mailctl/go.mod (Prometheus client; miekg/dns, go-msgauth, go-imap later).
+  - package-ecosystem: gomod
+    directory: /mailctl
+    schedule:
+      interval: weekly
+    groups:
+      mailctl-go:
         patterns: ["*"]
 
   # Actions are pinned by commit SHA with a `# vX.Y.Z` comment; Dependabot

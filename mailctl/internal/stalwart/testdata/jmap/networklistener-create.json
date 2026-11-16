@@ -1,0 +1,106 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:NetworkListener/set",
+        {
+          "create": {
+            "smtp": {
+              "name": "smtp",
+              "protocol": "smtp",
+              "bind": {
+                "[::]:10025": true
+              },
+              "useTls": true,
+              "implicitTls": false
+            },
+            "submissions": {
+              "name": "submissions",
+              "protocol": "smtp",
+              "bind": {
+                "[::]:10465": true
+              },
+              "useTls": true,
+              "implicitTls": true
+            },
+            "submission": {
+              "name": "submission",
+              "protocol": "smtp",
+              "bind": {
+                "[::]:10587": true
+              },
+              "useTls": true,
+              "implicitTls": false
+            },
+            "imaps": {
+              "name": "imaps",
+              "protocol": "imap",
+              "bind": {
+                "[::]:10993": true
+              },
+              "useTls": true,
+              "implicitTls": true
+            },
+            "management": {
+              "name": "management",
+              "protocol": "http",
+              "bind": {
+                "192.168.231.12:8080": true,
+                "127.0.0.1:8080": true
+              },
+              "useTls": false,
+              "implicitTls": false
+            },
+            "metrics": {
+              "name": "metrics",
+              "protocol": "http",
+              "bind": {
+                "192.168.231.12:9180": true
+              },
+              "useTls": false,
+              "implicitTls": false
+            }
+          }
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:NetworkListener/set",
+        {
+          "accountId": "d333333",
+          "created": {
+            "submission": {
+              "id": "jouvmtsaabaa"
+            },
+            "imaps": {
+              "id": "jouvmtsaabqa"
+            },
+            "smtp": {
+              "id": "jouvmtsaaaaa"
+            },
+            "management": {
+              "id": "jouvmtsaacaa"
+            },
+            "metrics": {
+              "id": "jouvmtsaacqa"
+            },
+            "submissions": {
+              "id": "jouvmtsaaaqa"
+            }
+          }
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "97e42ea5"
+  }
+}

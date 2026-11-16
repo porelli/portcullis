@@ -41,3 +41,6 @@ appfiles/
 __pycache__/
 *.pyc
 .venv/
+
+# ./portcullis one-at-a-time lock (cli_lock)
+.portcullis.lock

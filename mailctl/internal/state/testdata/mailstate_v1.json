@@ -1,0 +1,12 @@
+{"version":1,"generation":12,"primary_domain":"example.com","confirm_mass_removal":false,
+ "domains":[{"name":"example.com","dmarc_start":"reject","mail":"on","dnssec":"secure"},
+            {"name":"team-b.example.org","dmarc_start":"none","mail":"on","dnssec":"unsigned"}],
+ "accounts":[{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","display_name":"Alice A.","addresses":["alice@example.com","alice@team-b.example.org"],"quota_bytes":10737418240},
+             {"username":"bob","uuid":"0b9d8c7a-6e5f-4a3b-9c2d-1e0f9a8b7c6d","display_name":"Bob B.","addresses":["bob@example.com"],"quota_bytes":10737418240},
+             {"username":"root","uuid":"3e5a7c9b-1d2f-4a6b-8c0e-2f4a6b8c0d1e","display_name":"Root","addresses":["root@example.com"],"quota_bytes":10737418240}],
+ "aliases":[{"address":"sales@example.com","username":"alice"}],
+ "lists":[{"address":"team@example.com","members":["alice","bob"],"posting":"members"}],
+ "postmaster":["root"],
+ "limits":{"recipients_per_hour":300,"recipients_per_day":1000},
+ "spam":{"reject_score":15,"junk_score":5,"dnsbl":{"spamhaus":true,"spamcop":true,"barracuda":true},"allow":["example.org"],"block":["spam@example.net"]},
+ "local_networks":["10.0.0.0/8"]}

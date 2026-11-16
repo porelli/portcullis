@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The chart against docker-compose.yml, service by service (spec §3, Task 13):
 image, uid/gid and groups, capabilities, read-only root, memory, environment
-keys, mount targets (every one of the 46 project binds a ConfigMap / Secret
+keys, mount targets (every one of the 55 project binds a ConfigMap / Secret
 mount), probes (Task 4's mapping, K17), network labels; then every core
 router's entrypoints for vpn mode apps|admin|server, its rule, priority,
 middlewares and service; the entrypoint middlewares; the Traefik CRD bundle
@@ -360,8 +360,8 @@ def main():
     comp = K.compose()
     docs = K.render()
     nb = count_binds(comp)
-    if nb != 46:
-        F.add(f"compose has {nb} project binds, the parity map expects 46 (update this check and docker-compose.podman-selinux.yml)")
+    if nb != 55:
+        F.add(f"compose has {nb} project binds, the parity map expects 55 (update this check and docker-compose.podman-selinux.yml)")
     check_services(comp, docs)
     check_routers(comp)
     check_traefik(comp, docs)
