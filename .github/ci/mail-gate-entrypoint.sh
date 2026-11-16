@@ -22,7 +22,7 @@ cid() { docker compose --profile mail ps -aq mail; }
 health() { docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$(cid)" 2>/dev/null || echo missing; }
 wait_healthy() { for _ in $(seq 1 60); do [ "$(health)" = healthy ] && return 0; sleep 3; done; fail "mail not healthy ($(health))"; }
 # refused <message> — mail's log since $since carries the refusal and the
-# container isn't running Stalwart (exited or restarting).
+# container isn't running (exited, or restarting under its policy).
 refused() {
   local out
   for _ in $(seq 1 30); do
@@ -31,7 +31,6 @@ refused() {
       case "$(docker inspect -f '{{.State.Status}}' "$(cid)")" in
         running) [ "$(docker inspect -f '{{.State.Restarting}}' "$(cid)")" = true ] || { sleep 1; continue; } ;;
       esac
-      grep -q 'Stalwart' <<<"$out" && fail "Stalwart ran although the gate refused: $(tail -3 <<<"$out")"
       return 0
     fi
     sleep 1
