@@ -325,23 +325,48 @@ func TestCertTLSAMismatch(t *testing.T) {
 	if c := certCheck(context.Background(), e.d); c.Severity != OK || !strings.Contains(c.Detail, "valid until") {
 		t.Fatalf("ok %+v", c)
 	}
-	// TLSA published (secure) with another SPKI → Problem on every port.
-	in := machines.RotateIn{DNSSECState: "secure"}
-	in.SPKI.Current = strings.Repeat("ab", 32)
-	if _, err := e.m.Rotate(context.Background(), in); err != nil {
-		t.Fatal(err)
-	}
+	// TLSA served with another SPKI → Problem on every port.
+	other := strings.Repeat("ab", 32)
+	e.dns[loc+"|_25._tcp.mail.example.com|TLSA"] = rr("_25._tcp.mail.example.com. 300 IN TLSA 3 1 1 " + other)
 	c := certCheck(context.Background(), e.d)
 	if c.Severity != Problem || strings.Count(c.Detail, "doesn't match the published TLSA") != 4 {
 		t.Fatalf("mismatch %+v", c)
 	}
-	in.SPKI.Current = SPKI(leaf)
-	e.m.Rotate(context.Background(), in)
-	e.now = t0.Add(3 * 24 * time.Hour) // the old record dropped after 2×TTL
-	e.m.Rotate(context.Background(), in)
+	e.dns[loc+"|_25._tcp.mail.example.com|TLSA"] = func(m *dns.Msg) {
+		rr("_25._tcp.mail.example.com. 300 IN TLSA 3 1 1 " + other)(m)
+		rr("_25._tcp.mail.example.com. 300 IN TLSA 3 1 1 " + SPKI(leaf))(m)
+	}
 	if c := certCheck(context.Background(), e.d); c.Severity != OK || !strings.Contains(c.Detail, "matching TLSA") {
 		t.Fatalf("match %+v", c)
 	}
+	// Final review M6: mailctl wants the live key (B) while DNS still
+	// serves only the old one (A) → Problem: the served record decides.
+	in := machines.RotateIn{DNSSECState: "secure"}
+	in.SPKI.Current = SPKI(leaf)
+	if _, err := e.m.Rotate(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	e.dns[loc+"|_25._tcp.mail.example.com|TLSA"] = rr("_25._tcp.mail.example.com. 300 IN TLSA 3 1 1 " + other)
+	if c := certCheck(context.Background(), e.d); c.Severity != Problem || c.outcome != "fail" {
+		t.Fatalf("served A, wanted and live B: %+v", c)
+	}
+	// A lookup that fails (timeout, SERVFAIL) decides nothing: unknown.
+	e.d.DNS = func(context.Context, string, string, uint16, bool) (*dns.Msg, error) {
+		return nil, errors.New("i/o timeout")
+	}
+	if c := certCheck(context.Background(), e.d); c.Severity != Info || c.outcome != "unknown" {
+		t.Fatalf("timeout: %+v", c)
+	}
+	e.d.DNS = func(_ context.Context, _, name string, qtype uint16, _ bool) (*dns.Msg, error) {
+		m := new(dns.Msg)
+		m.SetQuestion(dns.Fqdn(name), qtype)
+		m.Rcode = dns.RcodeServerFailure
+		return m, nil
+	}
+	if c := certCheck(context.Background(), e.d); c.Severity != Info || c.outcome != "unknown" {
+		t.Fatalf("SERVFAIL: %+v", c)
+	}
+	e.d.DNS = e.dns.q
 	// Expiring soon → Warning; another name → Problem.
 	e2 := newEnv(t)
 	cert2, _ := selfSigned(t, "mail.example.com", t0.Add(5*24*time.Hour))

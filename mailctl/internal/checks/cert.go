@@ -12,6 +12,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/miekg/dns"
 )
 
 // certPorts are mail's own listeners (portcullis-mail; never port 25).
@@ -80,9 +82,42 @@ func leafAt(ctx context.Context, d Deps, port int, starttls bool) (*x509.Certifi
 	return st.PeerCertificates[0], nil
 }
 
+// servedTLSA is the 3 1 1 data served at _25._tcp.<MAIL_HOSTNAME> through
+// mail-resolver (DO bit): known with an answer (NOERROR or NXDOMAIN; none
+// = no TLSA), unknown on an error, a SERVFAIL or a record mailctl doesn't
+// publish (anything but 3 1 1: not judged).
+func servedTLSA(ctx context.Context, d Deps) ([]string, bool, error) {
+	if d.DNS == nil || d.Cfg.LocalResolver == "" {
+		return nil, false, errNoResolver
+	}
+	m, err := askRetry(ctx, d, "_25._tcp."+d.Cfg.Hostname, dns.TypeTLSA)
+	if err != nil {
+		return nil, false, err
+	}
+	switch m.Rcode {
+	case dns.RcodeNameError:
+		return nil, true, nil
+	case dns.RcodeSuccess:
+	default:
+		return nil, false, fmt.Errorf("%s", dns.RcodeToString[m.Rcode])
+	}
+	var out []string
+	for _, rr := range m.Answer {
+		t, ok := rr.(*dns.TLSA)
+		if !ok {
+			continue
+		}
+		if t.Usage != 3 || t.Selector != 1 || t.MatchingType != 1 {
+			return nil, false, fmt.Errorf("a TLSA %d %d %d record is served (not judged)", t.Usage, t.Selector, t.MatchingType)
+		}
+		out = append(out, strings.ToLower(t.Certificate))
+	}
+	return out, true, nil
+}
+
 // certCheck: every TLS listener presents MAIL_HOSTNAME's certificate, not
-// expired (a Warning within 14 days), and with TLSA published its SPKI is
-// one of them. Only those are definite failures (outcome "fail"); a
+// expired (a Warning within 14 days), and with TLSA served its SPKI is
+// one of the served records. Only those are definite failures (outcome "fail"); a
 // listener that can't be reached or a handshake / timeout error is
 // "unknown", never a failure (security ruling). It has its own deadline.
 func certCheck(ctx context.Context, d Deps) Check {
@@ -91,8 +126,15 @@ func certCheck(ctx context.Context, d Deps) Check {
 	c := Check{ID: "cert", Severity: OK, outcome: "pass"}
 	unknown := 0
 	now := d.now()
-	tlsaWant := d.M.TLSAWanted()
+	// The TLSA actually served (final review M6), never mailctl's own
+	// wish: a key change DNS hasn't caught up with is what DANE senders
+	// see. A failed lookup decides nothing.
+	served, tlsaKnown, tlsaErr := servedTLSA(ctx, d)
 	var notes []string
+	if !tlsaKnown {
+		unknown++
+		notes = append(notes, fmt.Sprintf("the TLSA record at _25._tcp.%s couldn't be read: %v", d.Cfg.Hostname, tlsaErr))
+	}
 	var soonest time.Time
 	raise := func(sev string) {
 		if sevRank[sev] > sevRank[c.Severity] {
@@ -118,7 +160,7 @@ func certCheck(ctx context.Context, d Deps) Check {
 			raise(Warning)
 			notes = append(notes, fmt.Sprintf("%s (%d): the certificate expires %s", p.Name, p.Port, leaf.NotAfter.UTC().Format(time.RFC3339)))
 		}
-		if len(tlsaWant) > 0 && !slices.Contains(tlsaWant, SPKI(leaf)) {
+		if len(served) > 0 && !slices.Contains(served, SPKI(leaf)) {
 			raise(Problem)
 			notes = append(notes, fmt.Sprintf("%s (%d): the key doesn't match the published TLSA record", p.Name, p.Port))
 		}
@@ -128,7 +170,7 @@ func certCheck(ctx context.Context, d Deps) Check {
 	}
 	if len(notes) == 0 {
 		c.Detail = fmt.Sprintf("%s's certificate on 465 / 993 / 25 / 587, valid until %s", d.Cfg.Hostname, soonest.UTC().Format(time.RFC3339))
-		if len(tlsaWant) > 0 {
+		if len(served) > 0 {
 			c.Detail += ", matching TLSA"
 		}
 		return c
