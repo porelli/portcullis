@@ -69,6 +69,11 @@ jq -n --arg dkim "$dkim" '{op: "append", zone: "remote.test.", token: "ci-fake-t
   {name: "_dmarc", type: "TXT", ttl: 300, data: "v=DMARC1; p=reject; rua=mailto:postmaster@remote.test"}]}' \
   | curl -sf -H 'Content-Type: application/json' --data-binary @- "$FAKE_API" | jq -e '.error == null' >/dev/null \
   || fail "remote.test's records into the fake zone"
+# Its reverse name (a real MX has one: RDNS_NONE otherwise).
+jq -n '{op: "append", zone: "88.30.172.in-addr.arpa.", token: "ci-fake-token-0123456789",
+        records: [{name: "25", type: "PTR", ttl: 300, data: "mx.remote.test."}]}' \
+  | curl -sf -H 'Content-Type: application/json' --data-binary @- "$FAKE_API" | jq -e '.error == null' >/dev/null \
+  || fail "the remote's PTR into the fake zone"
 jq -n '{op: "get", zone: "remote.test.", token: "ci-fake-token-0123456789", records: []}' \
   | curl -sf -H 'Content-Type: application/json' --data-binary @- "$FAKE_API" \
   | jq -e 'any(.records[]; .type == "MX" and .data == "10 mx.remote.test.")' >/dev/null || fail "remote.test's MX isn't in the fake zone"

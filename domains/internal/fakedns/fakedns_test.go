@@ -265,3 +265,17 @@ func TestRemoteSharesTheZone(t *testing.T) {
 		t.Fatalf("FindZone = %q %v", z, err)
 	}
 }
+
+// PTR (CI: the remote mail server's reverse name).
+func TestServesPTR(t *testing.T) {
+	z := NewZone()
+	z.Set("25.88.30.172.in-addr.arpa", libdns.RR{Name: "25", Type: "PTR", TTL: time.Hour, Data: "mx.remote.test"})
+	s := serve(t, z, Options{})
+	m := ask(t, s, "25.88.30.172.in-addr.arpa", dns.TypePTR, false)
+	if len(m.Answer) != 1 {
+		t.Fatalf("answer %v", m.Answer)
+	}
+	if p, ok := m.Answer[0].(*dns.PTR); !ok || p.Ptr != "mx.remote.test." {
+		t.Fatalf("PTR %v", m.Answer[0])
+	}
+}

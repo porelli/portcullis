@@ -575,6 +575,12 @@ def setup(browser) -> None:
     for u in ("alice", "bob", "root"):
         member("add", "mail_users", u)
     hub_ok("PUT", f"/api/mail/domains/{EXTRA}", {"enabled": True, "groups": ["mail_users"]}, want=(200, 204))
+    # The remote on the spam allow list (the product's own path: DMARC must
+    # pass, then TRUSTED_DOMAIN): CI's .test names score like spam otherwise.
+    cur = hub_ok("GET", "/api/mail/settings")
+    spam_s = dict(cur["spam"], allow=sorted(set((cur["spam"].get("allow") or []) + ["remote.test"])))
+    hub_ok("PUT", "/api/mail/settings", {"primary_domain": cur["primary_domain"], "spam": spam_s,
+                                          "limits": cur["limits"], "quotas": cur.get("quotas") or []})
     hub_ok("POST", "/api/directory/groups", {"name": "team"}, want=(200, 201))
     for u in ("alice", "bob"):
         member("add", "team", u)
@@ -629,7 +635,8 @@ def exchange_both_ways() -> None:
     print(f"    remote: {len(passes)} dkim=pass ({', '.join(algos)}), spf=pass, dmarc=pass", flush=True)
     subj2 = f"e2e in {uuidlib.uuid4().hex[:8]}"
     remote_send(f"alice@{DOMAIN}", message(REMOTE_ADDR, f"alice@{DOMAIN}", subj2))
-    wait_mail(lambda: imap_login(f"alice@{DOMAIN}", state["pw_alice"]), subj2)
+    raw2 = wait_mail(lambda: imap_login(f"alice@{DOMAIN}", state["pw_alice"]), subj2)
+    assert "TRUSTED_DOMAIN" in spam_headers(raw2), f"the allow-listed remote without TRUSTED_DOMAIN: {spam_headers(raw2)}"
     # A forged message from ci.example.org straight into the remote's 25
     # (the runner's address: neither SPF nor DKIM aligned), so its
     # aggregate report carries a failure.
@@ -681,21 +688,26 @@ def spam() -> None:
         return r if r and r.get("severity") == "ok" else None
     until("the spam rules imported (check spam_rules ok)", rules_in, 300, every=65)
     gtube = "XJS*C4JDBQADN1.NSBN3*2IDNEN*GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X"
-    stage, code, text = smtp25("probe@relay-test.example", f"bob@{DOMAIN}",
-                               message("probe@relay-test.example", f"bob@{DOMAIN}", "e2e gtube", gtube + "\r\n"))
+    probe, helo = "probe@example.com", "client.example.com"
+    # Stalwart v1.1.0 recognises GTUBE in the Subject (refused at DATA) and
+    # not in the body (pinned: a bump that changes it is noticed).
+    stage, code, text = smtp25(probe, f"bob@{DOMAIN}", message(probe, f"bob@{DOMAIN}", gtube), helo=helo)
     if not (stage == "data" and code == 550 and text.startswith("5.7.1")):
         i = imap_login(f"bob@{DOMAIN}", state["pw_bob"])
         try:
-            raw = until("the GTUBE message somewhere", lambda: find(i, "e2e gtube", junk_folder(i)) or find(i, "e2e gtube"), 30)
+            raw = until("the GTUBE message somewhere", lambda: find(i, gtube[:20], junk_folder(i)) or find(i, gtube[:20]), 30)
         finally:
             i.logout()
-        raise AssertionError(f"GTUBE: {stage} {code} {text}; its spam headers: {spam_headers(raw)}")
+        raise AssertionError(f"GTUBE in the Subject: {stage} {code} {text}; its spam headers: {spam_headers(raw)}")
     print(f"    gtube_rejected_at_data: {code} {text[:80]}", flush=True)
+    stage, code, text = smtp25(probe, f"bob@{DOMAIN}", message(probe, f"bob@{DOMAIN}", "e2e gtube body", gtube + "\r\n"), helo=helo)
+    assert stage == "data" and code == 250, f"GTUBE in the body (Stalwart doesn't recognise it there): {stage} {code} {text}"
     subj = f"URGENT OFFER {uuidlib.uuid4().hex[:6].upper()}"
-    # No Date / Message-ID / MIME-Version, all-caps subject: 5 < score < 15
-    # (MISSING_DATE 1, MISSING_MID 2.5, MISSING_MIME_VERSION 2,
-    # SUBJ_ALL_CAPS 3; SPF / DKIM / DMARC pass through the remote).
-    remote_send(f"bob@{DOMAIN}", message(REMOTE_ADDR, f"bob@{DOMAIN}", subj, "buy now\r\n", plain=True))
+    # A sender off the allow list, no Date / Message-ID / MIME-Version, an
+    # all-caps subject: 5 < score < 15 (MISSING_DATE 1, MISSING_MID 2.5,
+    # SUBJ_ALL_CAPS 3, plus AUTH_NA / DMARC_NA / RDNS for a direct client).
+    stage, code, text = smtp25(probe, f"bob@{DOMAIN}", message(probe, f"bob@{DOMAIN}", subj, "buy now\r\n", plain=True), helo=helo)
+    assert stage == "data" and code == 250, f"the 5–15 message: {stage} {code} {text}"
 
     def in_junk():
         i = imap_login(f"bob@{DOMAIN}", state["pw_bob"])
@@ -707,8 +719,10 @@ def spam() -> None:
     h = BytesHeaderParser().parsebytes(raw)
     xs = {k: v for k, v in h.items() if k.lower().startswith("x-spam")}
     assert xs, "no X-Spam-* header on the junk message"
+    m = re.search(r"score=([0-9.]+)", h.get("X-Spam-Score") or "")
+    assert m and 5 <= float(m.group(1)) < 15, f"the junk message's score: {h.get('X-Spam-Score')}"
     save("junk-headers.txt", raw.decode(errors="replace"))
-    print(f"    between_thresholds_to_junk: {json.dumps(xs)[:300]}", flush=True)
+    print(f"    between_thresholds_to_junk: {h.get('X-Spam-Score')}", flush=True)
 
 
 def mail_password_flow() -> None:
@@ -775,7 +789,7 @@ def members_only_list() -> None:
 
 def postmaster_to_admins() -> None:
     needs("setup")
-    subj = f"e2e postmaster {uuidlib.uuid4().hex[:8]}"
+    subj = f"e2e admins {uuidlib.uuid4().hex[:8]}"
     remote_send(f"postmaster@{DOMAIN}", message(REMOTE_ADDR, f"postmaster@{DOMAIN}", subj))
     wait_mail(lambda: imap_login(f"root@{DOMAIN}", state["pw_root"]), subj)
 
