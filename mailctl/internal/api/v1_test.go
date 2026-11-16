@@ -490,3 +490,37 @@ func TestCreateCredentialRacesPark(t *testing.T) {
 		t.Fatalf("%d password(s) left on the parked account", n)
 	}
 }
+
+// Final review L9: two accounts carrying the same uuid both lose the
+// password id; 204 only once both did.
+func TestDeleteCredentialEveryUUIDMatch(t *testing.T) {
+	e := newV1(t)
+	e.do("PUT", "/v1/state", vec(t, 12))
+	_ = e.v.Runner.Once(context.Background())
+	const u = "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b"
+	var alice string
+	for _, a := range e.f.Objects("Account", "") {
+		if a["name"] == "alice" {
+			alice = fmt.Sprint(a["id"])
+		}
+	}
+	twin := e.f.Put("Account", "", map[string]any{"@type": "User", "name": "alice2", "domainId": "x", "description": reconcile.DescPrefix + u})
+	p1 := e.f.Put("AppPassword", alice, map[string]any{"description": "phone"})
+	e.f.Put("AppPassword", twin, map[string]any{"description": "phone"})
+	// The fake numbers ids store-wide: give the twin's the same id.
+	for _, p := range e.f.Objects("AppPassword", twin) {
+		e.f.Delete("AppPassword", twin, fmt.Sprint(p["id"]))
+	}
+	e.f.PutID("AppPassword", twin, p1, map[string]any{"description": "phone"})
+	if w := e.do("DELETE", "/v1/credentials/"+p1+"?uuid="+u, ""); w.Code != 204 {
+		t.Fatalf("delete: %d %s", w.Code, w.Body)
+	}
+	if len(e.f.Objects("AppPassword", alice))+len(e.f.Objects("AppPassword", twin)) != 0 {
+		t.Fatal("a twin account kept the password")
+	}
+	e.f.PutID("AppPassword", twin, p1, map[string]any{"description": "phone"})
+	e.f.Fail("x:AppPassword/set", 2)
+	if w := e.do("DELETE", "/v1/credentials/"+p1+"?uuid="+u, ""); w.Code == 204 {
+		t.Fatal("204 although a revoke failed")
+	}
+}

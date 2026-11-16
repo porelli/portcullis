@@ -499,3 +499,4 @@ func (s *Server) Delete(obj, acct, id string) {
 	defer s.mu.Unlock()
 	delete(s.objs[store(obj, acct)], id)
 }
+

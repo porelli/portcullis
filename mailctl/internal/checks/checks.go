@@ -121,7 +121,7 @@ type Runner struct {
 	D        Deps
 	OnResult func(Result)
 
-	mu      sync.Mutex // the fields below; never held during a run
+	mu      sync.Mutex    // the fields below; never held during a run
 	running chan struct{} // closed when the run in flight ends (nil: none)
 	last    *Result
 	lastAt  time.Time

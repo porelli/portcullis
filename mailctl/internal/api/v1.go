@@ -367,18 +367,23 @@ func (v *V1) deleteCred(w http.ResponseWriter, r *http.Request) {
 		v.unreachable(w, err)
 		return
 	}
-	acct := ""
+	// Every account with that uuid (final review L9: two can carry it
+	// after a hand edit or a half-failed create): the revoke goes to each,
+	// and 204 only once it went everywhere.
+	var accts []string
 	for _, la := range live.Accounts {
 		if strings.EqualFold(la.UUID, uuid) {
-			acct = la.ID
+			accts = append(accts, la.ID)
 		}
 	}
-	if acct == "" {
-		w.WriteHeader(http.StatusNoContent)
-		return
+	for _, acct := range accts {
+		if err := creds.Revoke(ctx, v.C, acct, r.PathValue("id")); err != nil {
+			v.unreachable(w, err)
+			return
+		}
 	}
-	if err := creds.Revoke(ctx, v.C, acct, r.PathValue("id")); err != nil {
-		v.unreachable(w, err)
+	if len(accts) == 0 {
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if v.Logf != nil {
