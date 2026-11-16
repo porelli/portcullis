@@ -5513,9 +5513,9 @@ expect_eq "link cert: no node CA exported yet → refused (pki setup)" "$RC:$(pr
 # Renewal on up / upgrade: only with the role on, only when due.
 OUT="$(LINK_NOW=$(( $(date +%s) + 70 * 86400 )) VT_SIGNED="$LCA/l2.crt" VT_ENV=$'PORTCULLIS_DOMAIN=x.org\nPORTCULLIS_LINK=on' lt 'printf S > "$PORTCULLIS_ROOT/secrets/wg/link-tls.key"; cp "'"$LCA"'/l.crt" "$PORTCULLIS_ROOT/secrets/wg/link-tls.crt"; link_cert_renew' 2>&1)"; RC=$?
 expect_eq "link_cert_renew: 20 d left of 90 → re-signed" "$RC:$(grep -c 'node-link' "$WORK/vt/curl-argv"):$(cmp -s "$LCA/l2.crt" "$WORK/vt/root/secrets/wg/link-tls.crt" && echo new)" "0:1:new"
-OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=x.org\nPORTCULLIS_LINK=on' lt 'cp "'"$LCA"'/l.crt" "$PORTCULLIS_ROOT/secrets/wg/link-tls.crt"; link_cert_renew' 2>&1)"; RC=$?; echo "DEBUG: $OUT" >&2
+OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=x.org\nPORTCULLIS_LINK=on' lt 'cp "'"$LCA"'/l.crt" "$PORTCULLIS_ROOT/secrets/wg/link-tls.crt"; link_cert_renew' 2>&1)"; RC=$?
 expect_eq "link_cert_renew: a fresh certificate → nothing asked" "$RC:$(cat "$WORK/vt/curl-argv" 2>/dev/null | grep -c node-link || true)" "0:0"
-OUT="$(lt 'link_cert_renew' 2>&1)"; RC=$?; echo "DEBUG: $OUT" >&2
+OUT="$(lt 'link_cert_renew' 2>&1)"; RC=$?
 expect_eq "link_cert_renew: the role off → nothing" "$RC:$(cat "$WORK/vt/curl-argv" 2>/dev/null | wc -l | tr -d ' ')" "0:0"
 expect_eq "up and upgrade renew the link certificate after Vault is healthy" \
   "$( (source "$HERE/../scripts/lib/stack.sh"; declare -f stack_up upgrade_run) 2>/dev/null | grep -c '^ *link_cert_renew')" 2

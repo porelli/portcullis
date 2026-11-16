@@ -1,0 +1,14 @@
+# Rootless Podman workers only: ./portcullis adds this file to COMPOSE_FILE
+# with docker-compose.worker.yml when PORTCULLIS_ROLE=worker and
+# CONTAINER_RUNTIME=podman (scripts/lib/worker.sh worker_compose_files).
+# Never on Docker, never by hand. The core overlay (docker-compose.podman.yml)
+# names core services and is never merged with the worker file (ruling P13).
+#
+# restart: always: after a reboot the user's podman-restart.service starts
+# only containers with restart-policy=always.
+
+services:
+  agent:
+    restart: always
+  socket-proxy-agent:
+    restart: always

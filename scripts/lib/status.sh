@@ -722,6 +722,14 @@ cmd_status() {
     esac
     shift
   done
+  # A worker server (contract §17.7): its own status.
+  if [ "$(worker_role)" = worker ]; then
+    [ "$textfile" != true ] || fail "status --textfile is a primary's (the worker's agent exports its metrics to the primary)"
+    export _PORTCULLIS_WORKER_CMD=1
+    need_env
+    worker_status "$json"
+    return
+  fi
   need_env
   if [ "$textfile" = true ]; then status_textfile; return; fi
   status_run "$json"

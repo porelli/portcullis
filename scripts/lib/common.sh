@@ -154,10 +154,15 @@ env_unset() {
 }
 
 # need_env — load .env (fail if missing), then check the container runtime
-# (CONTAINER_RUNTIME, the engine behind it: scripts/lib/runtime.sh).
+# (CONTAINER_RUNTIME, the engine behind it: scripts/lib/runtime.sh). On a
+# worker (PORTCULLIS_ROLE=worker) it refuses but for `worker …`.
 need_env() {
   [ -f "$(env_file)" ] || fail "$(env_file) not found. Run ./portcullis init first."
   env_load
+  # A worker server (contract §17.7): only `worker …` (worker.sh) loads it.
+  if [ "${PORTCULLIS_ROLE:-}" = worker ] && [ "${_PORTCULLIS_WORKER_CMD:-}" != 1 ]; then
+    fail "this host is a Portcullis worker: use ./portcullis worker …"
+  fi
   runtime_check
 }
 

@@ -1,0 +1,15 @@
+# Rootless Podman workers on SELinux-enforcing hosts only (added by the CLI
+# after docker-compose.worker.podman.yml). worker-data is the agent's alone
+# (Z). Nothing labels this checkout, the engine's data root or a folder root
+# (ruling M2: never a label on folder roots): the agent only compares them
+# by device and inode, so it runs label=disable, like the socket proxy —
+# it drives the engine through that proxy already. Release gate: checked by
+# hand on Fedora / RHEL (CLAUDE.md).
+
+services:
+  socket-proxy-agent:
+    security_opt: ["label=disable"]
+  agent:
+    security_opt: ["label=disable"]
+    volumes:
+      - {type: bind, source: ./worker-data, target: "${PORTCULLIS_WORKER_DATA:?}", read_only: false, bind: {selinux: Z}}

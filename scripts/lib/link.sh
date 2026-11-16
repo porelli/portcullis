@@ -103,7 +103,7 @@ link_cert_sign() {
   if [ "$(openssl x509 -in "$tmp/crt" -noout -subject -nameopt RFC2253 2>/dev/null)" != "subject=CN=$LINK_CN" ] \
      || ! openssl verify -CAfile "$ca" -purpose sslclient "$tmp/crt" >/dev/null 2>&1; then
     rm -rf "$tmp"
-    fail "Vault's link certificate isn't a $LINK_CN client certificate under certs/node-ca.crt: nothing written"
+    fail "Vault's link certificate isn't a $LINK_CN certificate (client auth) under certs/node-ca.crt: nothing written"
   fi
   rm -rf "$tmp"
   # In place: the single-file bind pins the inode.

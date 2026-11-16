@@ -86,7 +86,7 @@ done
 
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 45 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 45
+expect_eq "help lists 53 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 53
 while IFS= read -r c; do
   # shellcheck disable=SC2086
   run $c --help
@@ -223,6 +223,17 @@ link init --port 70000|--port must be a UDP port number
 link init --subnet 10.214.0.0/24|unknown option: --subnet
 link status --frob|unknown option: --frob
 link status now|unexpected argument: now
+worker frob|unknown subcommand: frob
+worker join --runtime|--runtime needs a value
+worker join --runtime lxc|--runtime must be docker or podman
+worker join --code x|unknown option: --code
+worker status --frob|unknown option: --frob
+worker status now|unexpected argument: now
+worker upgrade now|unexpected argument: now
+worker leave now|unexpected argument: now
+worker stop|expected exactly one <instance>
+worker stop a b|expected exactly one <instance>
+worker start 'Bad;id'|invalid instance id
 mail enable --lan-only maybe|--lan-only must be true or false
 mail enable --hostname Mail.Example|--hostname must be a lowercase host name
 mail enable --hostname|--hostname needs a value
@@ -443,6 +454,144 @@ expect_eq "docker-compose.podman.yml sets restart: always and nothing else (podm
   "$(grep -vE '^[[:space:]]*(#|$)|^services:$|^  [a-z][a-z0-9-]*:$|^    restart: always$' "$ROOT_DIR_SOCK/docker-compose.podman.yml"):$(grep -c '^    restart: always$' "$ROOT_DIR_SOCK/docker-compose.podman.yml" | awk '{print ($1 >= 20)}')" ":1"
 expect_eq "the SELinux overlay never names the engine socket" "$(grep -c 'docker.sock\|ENGINE_SOCKET' "$ROOT_DIR_SOCK/docker-compose.podman-selinux.yml")" 0
 expect_eq "no ct_own \"\$(id -u)… in the CLI (ct_operator_id)" "$(grep -rnF 'ct_own "$(id -u)' "$HERE/../scripts/lib" "$HERE/../portcullis" || true)" ""
+# ── worker servers (contract §17.7) ──
+# test_worker_join_refuses_argv_code: never a code on the command line.
+for a in "worker join pcj1.eyJ2IjoxfQ" "worker join --force pcj1.eyJ2IjoxfQ" "worker join --runtime docker pcj1.x"; do
+  # shellcheck disable=SC2086
+  run $a
+  expect_eq "'$a' → exit 2 with the copy" "$RC:$(printf '%s' "$ERR" | grep -c 'the join code is a secret: paste it when asked, or pipe it in')" "2:1"
+done
+expect_eq "worker join: the code-on-argv refusal comes before any engine call" "$(cat "$STUB_CALLS" 2>/dev/null | grep -c . || true)" 0
+# test_worker_refuses_kubernetes
+run worker join --runtime kubernetes
+expect_eq "worker join --runtime kubernetes → exit 2" "$RC:$(printf '%s' "$ERR" | grep -c "Kubernetes workers aren't supported")" "2:1"
+WK="$WORK/wk-kube"; mkdir -p "$WK"
+RC=0; printf 'pcj1.abc' | PATH="$WORK/noengine:$PATH" STUB_CALLS_NOENGINE="$WORK/wk-calls" CONTAINER_RUNTIME=kubernetes PORTCULLIS_ROOT="$WK" "$CLI" worker join >/dev/null 2>"$WORK/err" || RC=$?
+expect_eq "worker join with CONTAINER_RUNTIME=kubernetes → exit 1, no engine call, nothing written" \
+  "$RC:$(grep -c "Kubernetes workers aren't supported" "$WORK/err"):$(cat "$WORK/wk-calls" 2>/dev/null | grep -c . || true):$([ -e "$WK/.env" ] && echo env || echo none)" "1:1:0:none"
+# A primary (an .env without PORTCULLIS_ROLE, or =primary) is refused.
+for role in "" "PORTCULLIS_ROLE=primary"; do
+  WK="$WORK/wk-prim"; rm -rf "$WK"; mkdir -p "$WK"; printf 'PORTCULLIS_DOMAIN=p.example\nCONTAINER_RUNTIME=docker\n%s\n' "$role" > "$WK/.env"
+  RC=0; printf 'pcj1.abc' | PORTCULLIS_ROOT="$WK" "$CLI" worker join >/dev/null 2>"$WORK/err" || RC=$?
+  expect_eq "worker join on a primary (${role:-no role}) → exit 1" "$RC:$(grep -c 'this host is a Portcullis primary' "$WORK/err")" "1:1"
+done
+# test_worker_role_guard: on a worker every command but worker, help,
+# version and status refuses, before any engine call.
+WK="$WORK/wk-role"; mkdir -p "$WK"; printf 'PORTCULLIS_ROLE=worker\nCONTAINER_RUNTIME=docker\n' > "$WK/.env"
+: > "$WORK/wk-calls"
+for c in up down upgrade "backup" "restore x" "vpn init" "link init" "pki setup" "mail status" "cert list" "invite bob"; do
+  RC=0
+  # shellcheck disable=SC2086
+  PATH="$WORK/noengine:$PATH" STUB_CALLS_NOENGINE="$WORK/wk-calls" PORTCULLIS_ROOT="$WK" "$CLI" $c >/dev/null 2>"$WORK/err" </dev/null || RC=$?
+  expect_eq "'$c' on a worker → exit 1 with the copy" "$RC:$(grep -c 'this host is a Portcullis worker: use ./portcullis worker …' "$WORK/err")" "1:1"
+done
+expect_eq "the role guard: no engine call" "$(grep -c . "$WORK/wk-calls" || true)" 0
+RC=0; PORTCULLIS_ROOT="$WK" "$CLI" help >/dev/null 2>&1 </dev/null || RC=$?
+expect_eq "help on a worker → 0" "$RC" 0
+RC=0; PORTCULLIS_ROOT="$WK" "$CLI" up --help >/dev/null 2>&1 </dev/null || RC=$?
+expect_eq "up --help on a worker → 0 (help never refuses)" "$RC" 0
+expect_eq "need_env refuses on a worker but for worker … (defence in depth)" \
+  "$( (source "$HERE/../scripts/lib/common.sh"; PORTCULLIS_ROOT="$WK"; need_env) 2>&1 | grep -c 'this host is a Portcullis worker')" 1
+WK="$WORK/wk-prim2"; mkdir -p "$WK"; printf 'PORTCULLIS_DOMAIN=p.example\nCONTAINER_RUNTIME=docker\n' > "$WK/.env"
+for c in "worker status" "worker leave --yes" "worker stop gitea"; do
+  RC=0
+  # shellcheck disable=SC2086
+  PATH="$WORK/noengine:$PATH" STUB_CALLS_NOENGINE="$WORK/wk-calls" PORTCULLIS_ROOT="$WK" "$CLI" $c >/dev/null 2>"$WORK/err" </dev/null || RC=$?
+  expect_eq "'$c' on a primary → exit 1" "$RC:$(grep -c "this host isn't a Portcullis worker" "$WORK/err")" "1:1"
+done
+
+# test_worker_join_reads_stdin: the code reaches `portcullis-agent join`
+# on stdin only; .env is the worker's; worker-data 0750 10008:10001.
+WK="$WORK/wk-join"; mkdir -p "$WK/bin" "$WK/root" "$WK/engine" "$WK/srv" "$WK/mnt"
+cat > "$WK/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
+printf '%s\n' "$*" >> "$WK_LOG"
+[ "$1" != compose ] || printf 'COMPOSE_FILE=%s\n' "${COMPOSE_FILE:-}" >> "$WK_LOG"
+case "$*" in
+  "info --format {{.DockerRootDir}}") echo "$WK_ENGINE" ;;
+  *" run --rm --no-deps -T --entrypoint portcullis-agent agent join") cat > "$WK_STDIN" ;;
+  *" exec -T agent portcullis-agent status") echo '{"state":"ready","server_id":"nas","tunnel_ip":"10.214.0.10"}' ;;
+esac
+exit 0
+STUB
+chmod +x "$WK/bin/docker"
+CODE="pcj1.eyJ2IjoxLCJzZWNyZXQiOiJ0b3Atc2VjcmV0LXRlc3QtY29kZSJ9"
+RC=0; printf '%s\n' "$CODE" | PATH="$WK/bin:$PATH" WK_LOG="$WK/log" WK_STDIN="$WK/stdin" WK_ENGINE="$WK/engine" \
+  PORTCULLIS_ROOT="$WK/root" PORTCULLIS_WORKER_BIND_ROOTS="$WK/srv:$WK/mnt" WORKER_JOIN_WAIT=5 \
+  "$CLI" worker join --runtime docker >"$WORK/out" 2>"$WORK/err" || RC=$?
+expect_eq "worker join (stdin): exit 0, ready" "$RC:$(grep -c 'This worker is ready' "$WORK/out" "$WORK/err" | awk -F: '{ s += $2 } END { print s }')" "0:1"
+expect_eq "worker join: the agent's join got the code on stdin" "$(cat "$WK/stdin")" "$CODE"
+expect_eq "worker join: the code is on no argv and in no output" \
+  "$(cat "$WK/log" "$WORK/out" "$WORK/err" | grep -c 'eyJ2IjoxLCJzZWNyZXQi' || true)" 0
+expect_eq "worker join: .env (role, runtime, data, install, roots, engine root, port start), 0600" \
+  "$(grep -cxE "PORTCULLIS_ROLE=worker|CONTAINER_RUNTIME=docker|PORTCULLIS_WORKER_DATA=$WK/root/worker-data|PORTCULLIS_WORKER_INSTALL=$WK/root|PORTCULLIS_WORKER_BIND_ROOTS=$WK/srv:$WK/mnt|PORTCULLIS_WORKER_ENGINE_ROOT=$WK/engine|AGENT_UNPRIVILEGED_PORT_START=[0-9]+" "$WK/root/.env"):$(file_mode "$WK/root/.env")" "7:600"
+expect_eq "worker join: no AGENT_SELF_IMAGE_ID / AGENT_CONTAINER_ID written" "$(grep -c 'AGENT_SELF_IMAGE_ID\|AGENT_CONTAINER_ID' "$WK/root/.env" || true)" 0
+expect_eq "worker join: worker-data 0750, chowned to 10008:10001" \
+  "$(file_mode "$WK/root/worker-data"):$(grep -c "src=$WK/root/worker-data,dst=/t/0 .* chown 10008:10001 /t/0" "$WK/log")" "750:1"
+expect_eq "worker join: the folder roots bound read-only at their paths (generated)" \
+  "$(grep -c "{type: bind, source: $WK/srv, target: $WK/srv, read_only: true}\|{type: bind, source: $WK/mnt, target: $WK/mnt, read_only: true}" "$WK/root/docker-compose.worker.roots.yml")" 2
+expect_eq "worker join: compose on the worker files only (never docker-compose.yml)" \
+  "$(grep '^COMPOSE_FILE=' "$WK/log" | sort -u)" "COMPOSE_FILE=$ROOT_DIR_SOCK/docker-compose.worker.yml:$WK/root/docker-compose.worker.roots.yml"
+expect_eq "worker join: the agent's join runs before up" "$(grep -oE '^compose .* (run --rm|up -d)' "$WK/log" | grep -oE '(run --rm|up -d)$' | tr '\n' ' ')" "run --rm up -d "
+RC=0; printf '%s\n' "$CODE" | PATH="$WK/bin:$PATH" WK_LOG="$WK/log2" WK_STDIN="$WK/stdin2" WK_ENGINE="$WK/engine" \
+  PORTCULLIS_ROOT="$WK/root" WORKER_JOIN_WAIT=5 sh -c 'mkdir -p "$PORTCULLIS_ROOT/worker-data/identity" && : > "$PORTCULLIS_ROOT/worker-data/identity/pins.json" && "$0" worker join' "$CLI" >/dev/null 2>"$WORK/err" || RC=$?
+expect_eq "worker join over an existing identity, no --force → exit 1, the agent not asked" \
+  "$RC:$(grep -c 'already has an identity' "$WORK/err"):$([ -s "$WK/stdin2" ] && echo asked || echo no)" "1:1:no"
+WK2="$WORK/wk-noroot"; mkdir -p "$WK2"
+RC=0; printf '%s\n' "$CODE" | PATH="$WK/bin:$PATH" WK_LOG="$WK/log3" WK_STDIN="$WK/stdin3" WK_ENGINE="$WK/engine" \
+  PORTCULLIS_ROOT="$WK2" PORTCULLIS_WORKER_BIND_ROOTS="$WK/nope" "$CLI" worker join --runtime docker >/dev/null 2>"$WORK/err" || RC=$?
+expect_eq "worker join: a missing folder root → refused before the agent" \
+  "$RC:$(grep -c "the folder root $WK/nope doesn't exist" "$WORK/err"):$([ -s "$WK/stdin3" ] && echo asked || echo no)" "1:1:no"
+RC=0; printf '%s\n' "$CODE" | PATH="$WK/bin:$PATH" WK_LOG="$WK/log4" WK_STDIN="$WK/stdin4" WK_ENGINE="$WK/engine" \
+  PORTCULLIS_ROOT="$WK/srv/inst" PORTCULLIS_WORKER_BIND_ROOTS="$WK/srv" sh -c 'mkdir -p "$PORTCULLIS_ROOT" && "$0" worker join --runtime docker' "$CLI" >/dev/null 2>"$WORK/err" || RC=$?
+expect_eq "worker join: an install inside a folder root → refused" "$RC:$(grep -c 'is inside the folder root' "$WORK/err")" "1:1"
+for bad in "nope" "pcj1.a b" ""; do
+  RC=0; printf '%s' "$bad" | PATH="$WK/bin:$PATH" WK_LOG="$WK/log5" WK_STDIN="$WK/stdin5" PORTCULLIS_ROOT="$WORK/wk-bad" "$CLI" worker join --runtime docker >/dev/null 2>"$WORK/err" || RC=$?
+  expect_eq "worker join: stdin '$bad' → refused, nothing written" "$RC:$([ -e "$WORK/wk-bad/.env" ] && echo env || echo none)" "1:none"
+done
+
+# test_socket_literal_count: twice in docker-compose.yml, once in the worker file.
+expect_eq "the engine-socket mount appears exactly once in docker-compose.worker.yml" \
+  "$(grep -cF -- '- ${PORTCULLIS_ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro' "$ROOT_DIR_SOCK/docker-compose.worker.yml")" 1
+# test_worker_compose_hardening: the baseline over the worker file (with
+# its overlays), the socket on the proxy alone, the agent's shape.
+WENV=(PORTCULLIS_WORKER_DATA=/home/op/portcullis/worker-data PORTCULLIS_WORKER_INSTALL=/home/op/portcullis
+      PORTCULLIS_WORKER_ENGINE_ROOT=/var/lib/docker AGENT_UNPRIVILEGED_PORT_START=1024 CONTAINER_RUNTIME=docker)
+for files in "-f docker-compose.worker.yml" "-f docker-compose.worker.yml -f docker-compose.worker.podman.yml -f docker-compose.worker.podman-selinux.yml"; do
+  # shellcheck disable=SC2086
+  WCFG="$(cd "$ROOT_DIR_SOCK" && env -u COMPOSE_FILE "${WENV[@]}" PATH="${PATH#"$WORK/bin:"}" docker compose $files config --format json 2>&1)"
+  expect_eq "worker compose ($files): the hardening baseline, the socket on the proxy alone (ro), the agent's shape" \
+    "$(printf '%s' "$WCFG" | jq -r '
+      .name == "portcullis-worker"
+      and ([.services | keys[]] == ["agent", "socket-proxy-agent"])
+      and ([.services[] | select((.security_opt // [] | index("no-new-privileges:true") | not) or ((.cap_drop // []) != ["ALL"]) or .mem_limit == null or .pids_limit == null or (.read_only != true))] == [])
+      and ([.services | to_entries[] | select([.value.volumes[]? | .source] | index("/var/run/docker.sock")) | .key] == ["socket-proxy-agent"])
+      and ([.services["socket-proxy-agent"].volumes[] | select(.source == "/var/run/docker.sock") | "\(.target):\(.read_only)"] == ["/var/run/docker.sock:true"])
+      and .services.agent.user == "10008:10008" and .services.agent.group_add == ["10001"] and (.services.agent.cap_add // []) == []
+      and (.services.agent.privileged // false) == false and (.services.agent.ports // []) == []
+      and .services.agent.environment.AGENT_ENGINE == "tcp://socket-proxy-agent:2375"
+      and .services.agent.environment.AGENT_DATA == "/home/op/portcullis/worker-data"
+      and (.services.agent.environment | has("AGENT_SELF_IMAGE_ID") | not)
+      and ([.services.agent.volumes[] | "\(.target):\(.read_only // false)"] | sort
+           == ["/home/op/portcullis/worker-data:false", "/home/op/portcullis:true", "/var/lib/docker:true"])
+      and ([.services.agent.volumes[] | select(.target == "/var/lib/docker") | .source] == ["/var/lib/docker"])
+      and ([.services.agent.networks | keys[]] == ["socket-proxy-agent", "worker-egress"])
+      and .networks["socket-proxy-agent"].internal == true
+      and ([.services | to_entries[] | select(.value.networks | has("socket-proxy-agent")) | .key] | sort == ["agent", "socket-proxy-agent"])' 2>&1)" true
+done
+expect_eq "worker Podman overlay: restart always on both, nothing else" \
+  "$(grep -vE '^[[:space:]]*(#|$)|^services:$|^  (agent|socket-proxy-agent):$|^    restart: always$' "$ROOT_DIR_SOCK/docker-compose.worker.podman.yml"):$(grep -c '^    restart: always$' "$ROOT_DIR_SOCK/docker-compose.worker.podman.yml")" ":2"
+expect_eq "worker SELinux overlay: labels only worker-data (Z), never the checkout, the engine root or a folder root" \
+  "$(grep -c 'selinux: [zZ]' "$ROOT_DIR_SOCK/docker-compose.worker.podman-selinux.yml"):$(grep -c 'source: ./worker-data,.*selinux: Z' "$ROOT_DIR_SOCK/docker-compose.worker.podman-selinux.yml")" "1:1"
+expect_eq "the worker files: healthchecks lint" \
+  "$(cd "$ROOT_DIR_SOCK" && env "${WENV[@]}" PATH="${PATH#"$WORK/bin:"}" "$HERE/lint_healthchecks.sh" "$WORK/hl-root/.env" "docker-compose.worker.yml -f docker-compose.worker.podman.yml -f docker-compose.worker.podman-selinux.yml" 2>&1; echo "rc=$?")" "rc=0"
+expect_eq "the worker files: every image fully qualified and pinned (the agent's edge default aside)" \
+  "$(grep -E '^\s+image:' "$ROOT_DIR_SOCK/docker-compose.worker.yml" | grep -vE 'image: \$\{AGENT_IMAGE:-ghcr\.io/porelli/portcullis-agent:edge\}$|image: ghcr\.io/[^ ]+:[^ @]+@sha256:[0-9a-f]{64}$' || true)" ""
+expect_eq "the agent's socket proxy = socket-proxy-hub's image, environment and limits" \
+  "$(diff <(yq -o=json '.services["socket-proxy-hub"] | {image, environment, mem_limit, pids_limit, cap_add, read_only, tmpfs, healthcheck}' "$ROOT_DIR_SOCK/docker-compose.yml") \
+          <(yq -o=json '.services["socket-proxy-agent"] | {image, environment, mem_limit, pids_limit, cap_add, read_only, tmpfs, healthcheck}' "$ROOT_DIR_SOCK/docker-compose.worker.yml") && echo same)" same
+
 # ── the runtime layer (rt_*): no dc / docker call outside the docker
 # branch. Every function (the libs sourced, bodies from `declare -f`, so
 # comments are gone) that calls dc or docker in a command position must be
@@ -452,7 +601,7 @@ expect_eq "no ct_own \"\$(id -u)… in the CLI (ct_operator_id)" "$(grep -rnF 'c
 rt_docker_hits() {
   ( set +eu
     PORTCULLIS_ROOT="$WORK/rtlint-root"
-    for _l in common network vault pki certs keycloak users domains mcpgate sessions dns config status monitoring backup signin vpn stack; do
+    for _l in common network vault pki certs keycloak users domains mcpgate sessions dns config status monitoring backup signin vpn link worker stack; do
       # shellcheck source=/dev/null
       source "$HERE/../scripts/lib/$_l.sh"
     done
@@ -1405,7 +1554,7 @@ expect_eq "the hub service mounts nothing under traefik/ read-write" \
 expect_eq "the hub mounts the checkout read-only" "$(printf '%s\n' "$HUB_SVC" | grep -c '^      - \.:/project:ro$')" 1
 expect_eq "the Hub's writable mounts are exactly templates/, appfiles/, its volumes and the masking tmpfs" \
   "$(hub_writable_mounts "$ROOT_DIR/docker-compose.yml" | LC_ALL=C sort | tr '\n' ';')" \
-  "(tmpfs) -> /project/backups;(tmpfs) -> /project/secrets;./appfiles -> /project/appfiles;./templates -> /project/templates;group_gate_data -> /group-gate-data;hub_data -> /data;hub_secrets -> /secrets;vpn_doc -> /vpn-doc;"
+  "(tmpfs) -> /project/backups;(tmpfs) -> /project/secrets;./appfiles -> /project/appfiles;./templates -> /project/templates;group_gate_data -> /group-gate-data;hub_data -> /data;hub_secrets -> /secrets;link_doc -> /link-doc;vpn_doc -> /vpn-doc;"
 # The check itself catches both syntaxes (planted mounts on a copy).
 awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      - ./traefik/dynamic:/project/traefik/dynamic" }' "$ROOT_DIR/docker-compose.yml" > "$WORK/compose-short.yml"
 awk '{ print } /^      - \.\/templates:\/project\/templates:rw$/ { print "      - type: bind"; print "        source: ./traefik"; print "        target: /etc/x"; print "        read_only: false" }' "$ROOT_DIR/docker-compose.yml" > "$WORK/compose-long.yml"
