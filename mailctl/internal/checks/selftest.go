@@ -86,9 +86,13 @@ func selftest(ctx context.Context, d Deps, keys dkim.State, domain string) Check
 			continue
 		}
 		for _, srv := range d.Cfg.Resolvers {
-			vals, err := resolve.TXT(ctx, srv, dkim.Name(k))
+			// One lookup per resolver (final review L11).
+			var vals []string
+			var err error
 			if d.DNS != nil {
 				vals, err = txtVia(ctx, d, srv, dkim.Name(k))
+			} else {
+				vals, err = resolve.TXT(ctx, srv, dkim.Name(k))
 			}
 			if err != nil {
 				bad = append(bad, fmt.Sprintf("%s (%s: lookup failed)", k.Selector, srv))

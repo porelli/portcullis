@@ -407,10 +407,25 @@ func TestSelftestFailsOnWrongDNSKey(t *testing.T) {
 		txt := dkim.TXT(k)
 		e.dns["*|"+dkim.Name(k)+"|TXT"] = rr(fmt.Sprintf("%s. 300 IN TXT %q", dkim.Name(k), txt))
 	}
+	// Final review L11: one lookup per key and resolver.
+	asked := map[string]int{}
+	e.d.DNS = func(ctx context.Context, server, name string, qtype uint16, do bool) (*dns.Msg, error) {
+		asked[server+"|"+name]++
+		return e.dns.q(ctx, server, name, qtype, do)
+	}
 	c := selftest(context.Background(), e.d, dkim.State{Keys: e.m.Keys()}, "example.com")
 	if c.Severity != OK {
 		t.Fatalf("ok %+v", c)
 	}
+	for q, n := range asked {
+		if n != 1 {
+			t.Fatalf("%s asked %d times", q, n)
+		}
+	}
+	if len(asked) != 2*len(active) {
+		t.Fatalf("lookups %v", asked)
+	}
+	e.d.DNS = e.dns.q
 	k := active[0]
 	_, other, _ := dkim.Generate(k.Algorithm)
 	e.dns[pub2+"|"+dkim.Name(k)+"|TXT"] = rr(fmt.Sprintf("%s. 300 IN TXT %q", dkim.Name(k), "v=DKIM1; k="+k.Algorithm+"; p="+other[0]))
