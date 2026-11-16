@@ -4978,6 +4978,19 @@ expect_eq "dns: with mail on, mailctl's main set and mail_hostname go on the too
   '{"mail":[{"name":"mail.example","type":"MX","ttl":3600,"value":"10 mx.mail.example."}],"mail_hostname":"mx.mail.example","sets":["address","caa","mail"]}'
 expect_eq "dns: neither the records nor a credential on any argv" "$(grep -c 'mx.mail.example\|cf-secret-token' "$ML/argv")" 0
 expect_eq "dns: the records come from mailctl dns --main --json" "$(grep -c '^rt_exec mailctl -- mailctl dns --main --json$' "$ML/argv")" 1
+# mail enable, then dns setup before the Hub's first document: mailctl has
+# no records yet, but mail_hostname still goes along (the address set owns
+# MAIL_HOSTNAME's A / AAAA), and the default sets leave mail out.
+mt 'source "$HERE/../scripts/lib/stack.sh"; source "$HERE/../scripts/lib/dns.sh"; export MAIL_HOSTNAME=mx.mail.example DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=cf-secret-token
+  rt_exec() { return 1; }
+  rt_run() { cat > "$ML/stdin"; }
+  domains_image_ensure() { :; }
+  _dns_mail_records false; DNS_SETS="$(_dns_default_sets)"; export DNS_SETS; _dns_tool apply'
+expect_eq "dns: mail on without mailctl's records → mail_hostname on the tool's stdin, no mail key, no mail set" \
+  "$(jq -c '{mail, mail_hostname, sets}' "$ML/stdin" 2>/dev/null)" '{"mail":null,"mail_hostname":"mx.mail.example","sets":["address","caa"]}'
+mt 'source "$HERE/../scripts/lib/stack.sh"; source "$HERE/../scripts/lib/dns.sh"; export COMPOSE_PROFILES= DNS_PROVIDER=cloudflare CLOUDFLARE_API_TOKEN=cf-secret-token
+  rt_run() { cat > "$ML/stdin"; }; domains_image_ensure() { :; }; DNS_SETS=address; export DNS_SETS; _dns_tool apply'
+expect_eq "dns: mail off → no mail_hostname" "$(jq -c '.mail_hostname' "$ML/stdin" 2>/dev/null)" "null"
 mt 'source "$HERE/../scripts/lib/stack.sh"; source "$HERE/../scripts/lib/dns.sh"; rt_exec() { return 1; }; _dns_mail_records true'; rc=$?
 expect_eq "dns setup --only mail: mailctl not answering → refused" "$rc:$(grep -c "mailctl didn't answer" "$ML/out")" "1:1"
 mt 'source "$HERE/../scripts/lib/stack.sh"; source "$HERE/../scripts/lib/dns.sh"; export COMPOSE_PROFILES=; rt_exec() { echo called >> "$ML/argv"; }; _dns_mail_records true; printf "[%s]" "${DNS_MAIL_RECORDS:-}" > "$ML/recs"'

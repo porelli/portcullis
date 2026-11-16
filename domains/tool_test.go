@@ -528,12 +528,26 @@ func TestToolApplyMainMail(t *testing.T) {
 	})); code != exitUsage {
 		t.Fatalf("CAA in the mail set = %d", code)
 	}
-	// mail_hostname is required with mail, and only with it.
+	// mail_hostname is required with mail. Alone (mail on, no records yet:
+	// no Hub document) the address set owns its A, the mail set stays off.
 	if code, _, errs := f.run([]string{"apply"}, toolJSON(func(m map[string]any) { m["sets"] = []string{"mail"}; m["mail"] = mail })); code != exitUsage || !strings.Contains(errs, "mail_hostname") {
 		t.Fatalf("no mail_hostname = %d %s", code, errs)
 	}
-	if code, _, _ := f.run([]string{"plan"}, toolJSON(func(m map[string]any) { m["mail_hostname"] = h })); code != exitUsage {
-		t.Fatalf("mail_hostname alone = %d", code)
+	if code, _, errs := f.run([]string{"apply"}, toolJSON(func(m map[string]any) { m["sets"] = []string{"mail"}; m["mail_hostname"] = h })); code != exitUsage {
+		t.Fatalf("the mail set with mail_hostname but no records = %d %s", code, errs)
+	}
+	if code, out, errs := f.run([]string{"apply"}, toolJSON(func(m map[string]any) { m["sets"] = []string{"address"}; m["mail_hostname"] = h })); code != exitOK {
+		t.Fatalf("address with mail_hostname alone = %d %s %s", code, out, errs)
+	}
+	gotA := false
+	for _, rr := range f.zone.Records(h) {
+		gotA = gotA || rr.Type == "A"
+	}
+	if !gotA {
+		t.Fatalf("no A at %s from the address set with mail_hostname alone: %v", h, f.zone.Records(h))
+	}
+	if code, _, _ := f.run([]string{"plan"}, toolJSON(func(m map[string]any) { m["mail_hostname"] = "not a host" })); code != exitUsage {
+		t.Fatalf("a bad mail_hostname alone = %d", code)
 	}
 	// Mail off ([]): MAIL_HOSTNAME's HELO SPF and TLSA go with the rest.
 	if code, out, errs := f.run([]string{"apply"}, toolJSON(func(m map[string]any) {
@@ -544,8 +558,11 @@ func TestToolApplyMainMail(t *testing.T) {
 		t.Fatalf("mail off = %d %s %s", code, out, errs)
 	}
 	for _, n := range []string{h, "_25._tcp." + h, "_submissions._tcp." + d, "v1-ed25519-20261115._domainkey." + d} {
-		if rrs := f.zone.Records(n); len(rrs) != 0 {
-			t.Errorf("left at %s after mail off: %v", n, rrs)
+		for _, rr := range f.zone.Records(n) {
+			// MAIL_HOSTNAME's A is the address set's (written above), not the mail set's.
+			if !(n == h && rr.Type == "A") {
+				t.Errorf("left at %s after mail off: %v", n, rr)
+			}
 		}
 	}
 	for _, rr := range f.zone.Records(d) {

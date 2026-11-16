@@ -66,7 +66,8 @@ type toolInput struct {
 	// rotate --json, contract §19.7); [] = mail off (its records go). The
 	// mail set is applied only with it present.
 	Mail *[]dnsplan.MailRecord `json:"mail"`
-	// MailHostname: MAIL_HOSTNAME, required with mail (and only with it):
+	// MailHostname: MAIL_HOSTNAME, required with mail; alone (mail on, no
+	// records yet) it makes the address set own the host's A / AAAA:
 	// its HELO SPF and TLSA are the set's, removed when the set is empty or
 	// the host changed (never derived from the MX target).
 	MailHostname string `json:"mail_hostname"`
@@ -442,7 +443,13 @@ func (in toolInput) spec() (dnsplan.Spec, error) {
 		}
 		sp.Mail, sp.MailHost = *in.Mail, host
 	case in.MailHostname != "":
-		return dnsplan.Spec{}, errors.New("mail_hostname goes with mail (the mail set's records)")
+		// Mail on, its records not known yet (no Hub document): the address
+		// set still owns MAIL_HOSTNAME's A / AAAA; no mail items.
+		host := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(in.MailHostname), "."))
+		if !validHostname(host) {
+			return dnsplan.Spec{}, fmt.Errorf("mail_hostname (MAIL_HOSTNAME) isn't a valid hostname: %q", in.MailHostname)
+		}
+		sp.MailHost = host
 	}
 	return sp, nil
 }
