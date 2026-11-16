@@ -645,15 +645,26 @@ def exchange_both_ways() -> None:
     j = remote_jmap()
 
     def forced():
+        # The aggregate data waits as an internal report until its window
+        # closes (then a DmarcReport task sends it): both are pulled forward.
         due = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5))
+        reps = [r for r in j.get_all("DmarcInternalReport") if r.get("domain") == DOMAIN]
+        for r in reps:
+            if r.get("deliverAt", "") > due:
+                j.set("DmarcInternalReport", update={r["id"]: {"deliverAt": due}})
         tasks = [t for t in j.get_all("Task") if t.get("@type") in ("DmarcReport", "ReportWindow")]
         for t in tasks:
             st = t.get("status") or {}
             if st.get("@type") in ("Pending", "Retry"):
                 j.set("Task", update={t["id"]: {"status": {"@type": "Pending", "due": due}}})
-        return tasks
+        return reps or tasks
 
-    until("the remote's DMARC report task", forced, 120, every=5)
+    try:
+        until("the remote's DMARC report (internal report or task)", forced, 180, every=5)
+    except AssertionError:
+        print("    remote tasks: " + json.dumps([{k: t.get(k) for k in ("@type", "status", "due")} for t in j.get_all("Task")])[:800], flush=True)
+        print("    remote internal reports: " + json.dumps(j.get_all("DmarcInternalReport"))[:800], flush=True)
+        raise
 
     def in_checks():
         forced()

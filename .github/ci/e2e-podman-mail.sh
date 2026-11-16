@@ -90,7 +90,13 @@ export PORTCULLIS_TESTPROVIDER=1 DNS_PROVIDER=fake FAKE_API_TOKEN=ci-podman-fake
 DOM_CID="$(docker compose ps -q domains)"
 FAKEDNS="$(podman inspect -f '{{(index .NetworkSettings.Networks "portcullis_domains-egress").IPAddress}}' "$DOM_CID")"
 [ -n "$FAKEDNS" ] || fail "no domains address on domains-egress"
-podman logs "$DOM_CID" 2>&1 | grep -q 'provider "fake" enabled' || fail "the domains service isn't the test build"
+# The recreated container's banner (it may still be starting).
+for i in $(seq 1 30); do
+  docker compose logs domains 2>&1 | grep -q 'provider "fake" enabled' && break
+  [ "$i" -eq 30 ] && fail "the domains service isn't the test build: $(docker compose logs --tail=5 domains 2>&1)"
+  sleep 2
+done
+DOM_CID="$(docker compose ps -q domains)"
 # One name for mail-resolver's health check in the fake zone.
 jq -n '{op: "append", zone: "portcullis.test.", token: "ci-podman-fake-token-0123",
         records: [{name: "ci-probe", type: "A", ttl: 300, data: "192.0.2.10"}]}' \
