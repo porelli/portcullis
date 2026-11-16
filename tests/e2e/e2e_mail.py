@@ -669,8 +669,17 @@ def exchange_both_ways() -> None:
         print("    remote internal reports: " + json.dumps(j.get_all("DmarcInternalReport"))[:800], flush=True)
         raise
 
+    def queued_now():
+        # The report then waits in the remote's queue (Stalwart staggers
+        # reports by up to hours): its next try a few seconds from now.
+        soon = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 3))
+        for q in j.get_all("QueuedMessage"):
+            if "dmarc-reports@" + DOMAIN in json.dumps(q.get("recipients")) and (q.get("nextRetry") or "") > soon:
+                j.set("QueuedMessage", update={q["id"]: {"nextRetry": soon}})
+
     def in_checks():
         forced()
+        queued_now()
         c = hub_ok("GET", "/api/mail/checks?refresh=1")
         dm = next((x for x in c.get("checks") or [] if x.get("id") == "dmarc_reports"), None)
         # The remote's report has the forged message's failure: shown
