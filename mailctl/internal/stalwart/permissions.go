@@ -36,9 +36,11 @@ var MailctlRolePermissions = func() []string {
 		"sysActionCreate", "actionReloadSettings", "actionReloadTlsCertificates", "actionInvalidateCaches", "actionReloadLookupStores",
 		"sysDmarcExternalReportGet", "sysDmarcExternalReportQuery", "sysTlsExternalReportGet", "sysTlsExternalReportQuery",
 		"sysSpamSettingsGet", "sysSpamSettingsUpdate",
-		// The vendored rules' import (SpamFilterMaintenance updateRules)
-		// and its proof (every vendored rule name present).
-		"sysTaskCreate", "sysSpamRuleGet", "sysSpamRuleQuery",
+		// The vendored rules' import (SpamFilterMaintenance updateRules:
+		// the task-type permission too, Stalwart refuses it otherwise; the
+		// task read back until it is done) and its proof (every vendored
+		// rule name present).
+		"sysTaskCreate", "sysTaskGet", "taskSpamFilterMaintenance", "sysSpamRuleGet", "sysSpamRuleQuery",
 		"sysMemoryLookupKeyGet", "sysMemoryLookupKeyCreate", "sysMemoryLookupKeyUpdate", "sysMemoryLookupKeyDestroy", "sysMemoryLookupKeyQuery",
 		// Settings mailctl edits after the bootstrap: the spam rules'
 		// external lookups (kept disabled), the DNSBL servers and sender
