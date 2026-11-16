@@ -80,6 +80,10 @@ RUNNER_IP="$(ip -4 -o route get 1.1.1.1 | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
 [[ "$RUNNER_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "FAIL: no runner address"; exit 1; }
 echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
 
+# The browser and the test reach the primary's Traefik by name.
+echo "127.0.0.1 $E2E_DOMAIN auth.$E2E_DOMAIN enroll.$E2E_DOMAIN hub.$E2E_DOMAIN people.$E2E_DOMAIN se0.$E2E_DOMAIN se1.$E2E_DOMAIN oe1.$E2E_DOMAIN" \
+  | sudo tee -a /etc/hosts >/dev/null
+
 # People: the admin (the Hub API's actor, its fresh sign-ins) and alice
 # (an echo user), each from a setup link; alice in users_<instance>.
 # (GITHUB_ENV reaches only the later steps: read the password from .env.)
