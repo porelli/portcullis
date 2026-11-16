@@ -212,7 +212,11 @@ worker_join() {
       ready) ok "This worker is ready (./portcullis worker status). Place apps on it in the Hub."; return 0 ;;
       refused) fail "the primary refused the enrolment: ask the Hub for a new code, then ./portcullis worker join --force" ;;
     esac
-    [ $((SECONDS - start)) -lt "$WORKER_JOIN_WAIT" ] || fail "not ready after ${WORKER_JOIN_WAIT}s (state: ${st:-unknown}): check the Hub's Servers page and ./portcullis worker status"
+    if [ $((SECONDS - start)) -ge "$WORKER_JOIN_WAIT" ]; then
+      # The agent's last lines (it never logs the code or a key).
+      dc logs --no-color --tail=15 agent >&2 2>/dev/null || true
+      fail "not ready after ${WORKER_JOIN_WAIT}s (state: ${st:-unknown}): check the Hub's Servers page and ./portcullis worker status"
+    fi
     sleep 3
   done
 }
