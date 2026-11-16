@@ -385,15 +385,26 @@ _backup_create_docker() {
 # stopped for the copy (RocksDB isn't copied while written) and started
 # again afterwards, also when the copy fails. Only with the mail profile.
 _backup_mail_data() {
-  local work="$1" spec key uid gid full was=false rc=0 failed=""
+  local work="$1" spec key uid gid full was=false hub=false rc=0 failed=""
   _rt_docker_only
   mail_profile_on || return 0
   full="$(_volume_name mail_data)"
   [ -n "$full" ] && docker volume inspect "$full" >/dev/null 2>&1 || return 0
   if rt_running mail; then
     was=true
+    # The Hub restarts mail on a revocation (its own engine path, outside
+    # this CLI's lock): it stops for the copy too, so nothing restarts mail
+    # mid-copy (final review L3), and starts again afterwards.
+    if rt_running hub; then
+      hub=true
+      rt_stop hub >/dev/null 2>&1 || { rt_start hub >/dev/null 2>&1 || true; fail "could not stop the Hub for mail's backup (it keeps running)"; }
+    fi
     printf '  %-26s' "mail (stopped for the copy)"
-    rt_stop mail >/dev/null 2>&1 || { rt_start mail >/dev/null 2>&1 || true; fail "could not stop mail for its backup (it keeps running)"; }
+    rt_stop mail >/dev/null 2>&1 || {
+      rt_start mail >/dev/null 2>&1 || true
+      [ "$hub" != true ] || rt_start hub >/dev/null 2>&1 || true
+      fail "could not stop mail for its backup (it keeps running)"
+    }
     printf ' %sstopped%s\n' "$C_GREEN" "$C_NC"
   fi
   for spec in $BACKUP_MAIL_STOPPED_VOLUMES; do
@@ -407,8 +418,16 @@ _backup_mail_data() {
     fi
     printf ' %sdone%s %s\n' "$C_GREEN" "$C_NC" "$(cat "$work/.err")"
   done
+  # Whatever started mail meanwhile tore the copy: refused.
+  if [ "$rc" = 0 ] && [ "$was" = true ] && rt_running mail; then
+    rc=1 failed="mail_data (mail was started during its copy)"
+    : > "$work/.err"
+  fi
   if [ "$was" = true ]; then
     rt_start mail >/dev/null 2>&1 || warn "mail could not be started again after its backup: ./portcullis up"
+  fi
+  if [ "$hub" = true ]; then
+    rt_start hub >/dev/null 2>&1 || warn "the Hub could not be started again after mail's backup: ./portcullis up"
   fi
   if [ "$rc" != 0 ]; then
     cat "$work/.err" >&2
@@ -1008,11 +1027,11 @@ _backup_restore_docker() {
   _restore_vault "$dir"
 
   # The mail store comes back with its old mail passwords: the marker first,
-  # so no start path serves them before the void (M7).
-  if [ -f "$dir/mail_data.tar.gz" ]; then
-    (umask 077 && mkdir -p "$(_mail_dir)/gate" && : > "$(mail_void_marker)") || fail "could not write $(mail_void_marker)"
-    chmod 600 "$(mail_void_marker)"
-  fi
+  # so no start path serves them before the void (M7). Also whenever the
+  # mail profile is on without a mail store in the backup (final review
+  # M5): the live store's passwords don't match the restored Hub either —
+  # a restore voids every mail password either way.
+  _restore_mail_marker "$dir"
   for spec in $BACKUP_FILE_VOLUMES $BACKUP_MAIL_STOPPED_VOLUMES; do
     IFS=: read -r key uid gid <<< "$spec"
     [ -f "$dir/$key.tar.gz" ] || continue
@@ -1079,6 +1098,16 @@ _backup_restore_docker() {
   RESTORE_MAIL_UNVOIDED="$mail_unvoided"
   # Always the last line, on both restore paths (local and --from-offsite).
   _restore_lost_devices_note
+}
+
+# _restore_mail_marker <backup dir> — the void-pending marker, before any
+# mail volume comes back: when the backup holds a mail store, and whenever
+# the mail profile is on (final review M5: the live store's passwords then
+# don't match the restored Hub; a restore voids every mail password).
+_restore_mail_marker() {
+  [ -f "$1/mail_data.tar.gz" ] || mail_profile_on || return 0
+  (umask 077 && mkdir -p "$(_mail_dir)/gate" && : > "$(mail_void_marker)") || fail "could not write $(mail_void_marker)"
+  chmod 600 "$(mail_void_marker)"
 }
 
 # _restore_mail_void <backup dir> — M7: with the mail profile and the

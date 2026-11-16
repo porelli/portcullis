@@ -108,6 +108,7 @@ main() {
     "") help_main >&2; return 2 ;;
   esac
   cd "$PORTCULLIS_ROOT"
+  cli_lock "$cmd" "$@"
   case "$cmd" in
     init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert|signin|vpn|mail|kube)
       "cmd_$cmd" "$@" ;;

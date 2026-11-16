@@ -247,6 +247,31 @@ _rt_docker_only() {
     || fail "internal: ${FUNCNAME[1]:-?} runs on docker / podman only (CONTAINER_RUNTIME=kubernetes)"
 }
 
+# cli_lock <cmd> [args] — the commands that change the stack (up, down,
+# upgrade, restore, backup, mail enable|disable|rotate|cert) run one at a
+# time: an exclusive flock on $PORTCULLIS_ROOT/.portcullis.lock, held for
+# the process's life, shared with the backup and mail timers (they run
+# these commands). Waits up to PORTCULLIS_LOCK_WAIT seconds (1800), then
+# refuses (final review L2). --help never locks.
+cli_lock() {
+  local cmd="$1" a sub="${2:-}"
+  shift
+  for a in "$@"; do case "$a" in -h|--help) return 0 ;; esac; done
+  case "$cmd" in
+    up|down|upgrade|restore|backup) ;;
+    mail) case "$sub" in enable|disable|rotate|cert) ;; *) return 0 ;; esac ;;
+    *) return 0 ;;
+  esac
+  [ -z "${PORTCULLIS_LOCKED:-}" ] || return 0
+  command -v flock >/dev/null 2>&1 || fail "flock (util-linux) is required: ./portcullis $cmd runs one at a time with the backup and mail timers"
+  exec 9>>"$PORTCULLIS_ROOT/.portcullis.lock" || fail "could not open $PORTCULLIS_ROOT/.portcullis.lock"
+  if ! flock -n 9; then
+    info "Waiting for another ./portcullis command (a backup or mail timer?) to finish..."
+    flock -w "${PORTCULLIS_LOCK_WAIT:-1800}" 9 || fail "another ./portcullis command still holds $PORTCULLIS_ROOT/.portcullis.lock after ${PORTCULLIS_LOCK_WAIT:-1800}s"
+  fi
+  export PORTCULLIS_LOCKED=1
+}
+
 # dc <args> — docker compose for the core project. COMPOSE_FILE (e.g. CI
 # overrides) is honoured because we run from the project root.
 dc() { _rt_docker_only; docker compose --project-directory "$PORTCULLIS_ROOT" "$@"; }
