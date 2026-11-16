@@ -645,13 +645,12 @@ def exchange_both_ways() -> None:
     j = remote_jmap()
 
     def forced():
-        # The aggregate data waits as an internal report until its window
-        # closes (then a DmarcReport task sends it): both are pulled forward.
+        # The aggregate data waits in the aggregation window
+        # (DmarcReportWindow) until it closes; then an internal report and
+        # its DmarcReport task exist. The tasks' due dates are pulled forward
+        # (an internal report's deliverAt can't be set to the past).
         due = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5))
         reps = [r for r in j.get_all("DmarcInternalReport") if r.get("domain") == DOMAIN]
-        for r in reps:
-            if r.get("deliverAt", "") > due:
-                j.set("DmarcInternalReport", update={r["id"]: {"deliverAt": due}})
         # The aggregation window (DmarcReportWindow) closes early: it then
         # makes the internal report and its DmarcReport task.
         tasks = [t for t in j.get_all("Task") if t.get("@type") in ("DmarcReport", "DmarcReportWindow")]
@@ -659,7 +658,9 @@ def exchange_both_ways() -> None:
             st = t.get("status") or {}
             if st.get("@type") in ("Pending", "Retry"):
                 j.set("Task", update={t["id"]: {"status": {"@type": "Pending", "due": due}}})
-        return reps or [t for t in tasks if t.get("@type") == "DmarcReport"]
+        # Done once the DmarcReport task is due now (its internal report
+        # then goes out).
+        return [t for t in tasks if t.get("@type") == "DmarcReport"] if reps else []
 
     try:
         until("the remote's DMARC report (internal report or task)", forced, 180, every=5)
