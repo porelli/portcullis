@@ -146,10 +146,20 @@ const ExtLookups = "external_lookups"
 // couldn't be turned off), and the last time it turned some off.
 type LookupsState struct {
 	CheckedAt  *time.Time `json:"checked_at"`
-	Error      string     `json:"error"`
+	Error      string     `json:"error"` // set after lookupsFlagAfter failed passes in a row
+	Failures   int        `json:"failures"`
 	DisabledAt *time.Time `json:"disabled_at"`
 	Disabled   int        `json:"disabled"`
 }
+
+// lookupsTries / lookupsBackoff: attempts within one pass (Stalwart
+// answers 400 for a moment while it starts); lookupsFlagAfter: failed
+// passes in a row before the external_lookups Problem.
+var (
+	lookupsTries     = 3
+	lookupsBackoff   = 5 * time.Second
+	lookupsFlagAfter = 2
+)
 
 // ReadLookups is the recorded lookups-off check.
 func ReadLookups(p state.Persistent) LookupsState {
@@ -182,15 +192,35 @@ func SpamRulesPass(ctx context.Context, c *stalwart.Client, st *state.Store, now
 		lastFast = now
 	}
 	dctx, dcancel := context.WithTimeout(ctx, time.Minute)
-	n, derr := DisableExternalLookups(dctx, c)
+	var (
+		n    int
+		derr error
+	)
+	for try := 1; try <= lookupsTries; try++ {
+		if n, derr = DisableExternalLookups(dctx, c); derr == nil || try == lookupsTries {
+			break
+		}
+		select {
+		case <-dctx.Done():
+		case <-time.After(lookupsBackoff):
+		}
+	}
 	dcancel()
 	t := time.Now().UTC()
 	ls := ReadLookups(st.Get())
-	ls.CheckedAt, ls.Error = &t, ""
+	ls.CheckedAt = &t
 	switch {
 	case derr != nil:
-		ls.Error = derr.Error()
-		logf("spam rules: external lookups may be on and couldn't be turned off: %v", derr)
+		ls.Failures++
+		if ls.Failures >= lookupsFlagAfter {
+			ls.Error = derr.Error()
+		}
+		logf("spam rules: external lookups may be on and couldn't be turned off (%d failed pass(es) in a row): %v", ls.Failures, derr)
+	default:
+		ls.Failures, ls.Error = 0, ""
+	}
+	switch {
+	case derr != nil:
 	case n > 0:
 		ls.DisabledAt, ls.Disabled = &t, n
 		logf("spam rules: disabled %d external lookups", n)

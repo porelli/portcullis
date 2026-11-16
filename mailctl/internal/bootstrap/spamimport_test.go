@@ -17,9 +17,9 @@ func spamEnv(t *testing.T) (*fake.Server, *stalwart.Client, *state.Store) {
 	f := fake.New()
 	t.Cleanup(f.Close)
 	st, _ := state.Open(t.TempDir())
-	old := [3]time.Duration{spamTaskEvery, spamTaskWait, spamTaskPoll}
+	old := [4]time.Duration{spamTaskEvery, spamTaskWait, spamTaskPoll, lookupsBackoff}
 	spamTaskWait, spamTaskPoll = 200*time.Millisecond, 20*time.Millisecond
-	t.Cleanup(func() { spamTaskEvery, spamTaskWait, spamTaskPoll = old[0], old[1], old[2] })
+	t.Cleanup(func() { spamTaskEvery, spamTaskWait, spamTaskPoll, lookupsBackoff = old[0], old[1], old[2], old[3] })
 	return f, stalwart.New(f.URL(), stalwart.Bearer("API_k")), st
 }
 
@@ -135,12 +135,34 @@ func TestSpamRulesPassLateTaskAndReenabledLookup(t *testing.T) {
 	if s := ReadLookups(st.Get()); s.Error != "" || s.Disabled != 1 || s.CheckedAt == nil {
 		t.Fatalf("lookups state %+v", s)
 	}
-	// Can't be turned off: recorded, and the next pass comes in a minute.
+	// A failure retried within the pass (Stalwart starting): no flag.
+	lookupsBackoff = 10 * time.Millisecond
 	f.Put("HttpLookup", "", map[string]any{"namespace": "x", "enable": true})
-	f.Fail("x:HttpLookup/set", 1)
-	_, wait = SpamRulesPass(ctx, c, st, start.Add(2*time.Hour), last, logf)
-	if s := ReadLookups(st.Get()); s.Error == "" || wait != time.Minute {
-		t.Fatalf("a failed turn-off: %+v, wait %v", s, wait)
+	f.Fail("x:HttpLookup/query", 1)
+	_, _ = SpamRulesPass(ctx, c, st, start.Add(2*time.Hour), last, logf)
+	if s := ReadLookups(st.Get()); s.Error != "" || s.Failures != 0 {
+		t.Fatalf("a transient failure flagged: %+v", s)
+	}
+	for _, l := range f.Objects("HttpLookup", "") {
+		if l["enable"] != false {
+			t.Fatalf("left on after the retry: %v", l)
+		}
+	}
+	// Failing every try: one failed pass isn't flagged yet, two are; the
+	// next pass comes in a minute.
+	f.Put("HttpLookup", "", map[string]any{"namespace": "y", "enable": true})
+	f.Fail("x:HttpLookup/query", 2*lookupsTries)
+	_, wait = SpamRulesPass(ctx, c, st, start.Add(3*time.Hour), last, logf)
+	if s := ReadLookups(st.Get()); s.Error != "" || s.Failures != 1 || wait != time.Minute {
+		t.Fatalf("one failed pass: %+v, wait %v", s, wait)
+	}
+	_, _ = SpamRulesPass(ctx, c, st, start.Add(3*time.Hour+time.Minute), last, logf)
+	if s := ReadLookups(st.Get()); s.Error == "" || s.Failures != 2 {
+		t.Fatalf("two failed passes not flagged: %+v", s)
+	}
+	_, _ = SpamRulesPass(ctx, c, st, start.Add(3*time.Hour+2*time.Minute), last, logf)
+	if s := ReadLookups(st.Get()); s.Error != "" || s.Failures != 0 {
+		t.Fatalf("not cleared after a good pass: %+v", s)
 	}
 	if !strings.Contains(strings.Join(logs, "|"), "couldn't be turned off") {
 		t.Fatalf("not logged: %v", logs)
