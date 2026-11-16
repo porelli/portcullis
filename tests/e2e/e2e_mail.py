@@ -515,7 +515,24 @@ def dns_diagnostics() -> None:
         with urllib.request.urlopen(urllib.request.Request("http://172.30.87.53:8054", data=body,
                                                            headers={"Content-Type": "application/json"}), timeout=30) as r:
             save("fakezone-extra.json", json.loads(r.read()))
-        print("    diagnostics saved: hub-domains.json, mail-status.json, domains-extra.json, fakezone-extra.json", flush=True)
+        # mailctl's own view: the document's domains and the DKIM keys
+        # (public data only), and what mail-resolver / the fake DNS answer.
+        st = json.loads(docker("run", "--rm", "--network", "none", "-v", "portcullis_mailctl_data:/d:ro",
+                               "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+                               "cat", "/d/state.json"))
+        save("mailctl-view.json", {"domains": [{k: d.get(k) for k in ("name", "mail", "dmarc_start")} for d in (st.get("doc") or {}).get("domains") or []],
+                                   "generation": st.get("generation"), "applied_generation": st.get("applied_generation"),
+                                   "errors": st.get("errors"), "dkim": json.loads(json.dumps((st.get("ext") or {}).get("dkim")))})
+        for k in ((st.get("ext") or {}).get("dkim") or {}).get("keys") or []:
+            if k.get("domain") != EXTRA:
+                continue
+            name = f"{k['selector']}._domainkey.{EXTRA}"
+            for srv in (["-p", "5353", "@127.0.0.1"], ["-p", "8053", "@172.30.87.53"]):
+                out = docker("compose", "--profile", "mail", "exec", "-T", "mail-resolver", "drill", *srv, "TXT", name, check_rc=False)
+                ans = [ln for ln in out.splitlines() if "\tTXT\t" in ln or "rcode" in ln]
+                print(f"    drill {srv[-1]} {name}: {ans[:3]}", flush=True)
+            print(f"    mailctl wants: v=DKIM1; k={k['algorithm']}; p={k.get('public_key', '')[:24]}… (id {k.get('id') or '-'}, {k.get('stage')})", flush=True)
+        print("    diagnostics saved: hub-domains.json, mail-status.json, domains-extra.json, fakezone-extra.json, mailctl-view.json", flush=True)
         for ln in p.stdout.splitlines()[:1]:
             print("    domains: " + scrub(ln)[:600], flush=True)
     except Exception as e:  # noqa: BLE001
