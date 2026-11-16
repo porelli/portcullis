@@ -128,8 +128,10 @@ func Plan(l *Live, want *state.Doc, former map[string]state.Former, now time.Tim
 		// confirm_mass_removal lifts the guard only for the set it was
 		// bound to at the PUT (final review L2).
 		if !want.ConfirmMassRemoval || !confirmed.Covers(want.Generation, uuids) {
-			// Only the removals: the caller names them (contract §19.5).
-			return Ops{Removals: ops.Removals}, ErrMassRemoval
+			// The removals (the caller names them, contract §19.5) and
+			// the re-disable of parked accounts, which only restricts
+			// (final review L1).
+			return Ops{Removals: ops.Removals, Redisable: ops.Redisable}, ErrMassRemoval
 		}
 	}
 	for _, d := range want.Domains {

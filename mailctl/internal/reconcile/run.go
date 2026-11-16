@@ -137,6 +137,12 @@ func (r *Runner) once(ctx context.Context, p state.Persistent) error {
 
 func (r *Runner) apply(ctx context.Context, l *Live, doc *state.Doc, p state.Persistent) error {
 	ops, err := Plan(l, doc, p.Former, r.Now(), r.Retention, p.MassRemoval)
+	if errors.Is(err, ErrMassRemoval) && len(ops.Redisable) > 0 {
+		// A pending mass removal never keeps a parked account lifted.
+		if rerr := Apply(ctx, r.C, l, doc, Ops{Redisable: ops.Redisable}, nil); rerr != nil {
+			return errors.Join(err, rerr)
+		}
+	}
 	if err != nil {
 		return err
 	}

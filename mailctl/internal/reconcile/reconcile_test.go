@@ -617,3 +617,39 @@ func TestBrokenPagingChangesNothing(t *testing.T) {
 	}
 }
 
+// Final review L1: a pending mass removal doesn't keep a lifted parked
+// account lifted.
+func TestRedisableDuringMassRemoval(t *testing.T) {
+	e := newEnv(t)
+	e.mustApply(baseDoc(t))
+	bob := e.account("bob")["id"].(string)
+	d := baseDoc(t)
+	d.Generation = 13
+	dropAccount(d, "bob")
+	e.mustApply(d)
+	if _, err := e.c.Set(context.Background(), "Account", nil, map[string]map[string]any{bob: {"permissions": map[string]any{"@type": "Merge",
+		"enabledPermissions": map[string]bool{}, "disabledPermissions": map[string]bool{"emailSend": true, "emailReceive": true}}}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Now a document that would remove root and alice of the 2 active
+	// (mass removal).
+	d2 := baseDoc(t)
+	d2.Generation = 14
+	dropAccount(d2, "bob")
+	dropAccount(d2, "alice")
+	d2.Postmaster = []string{"root"}
+	for i := range d2.Lists {
+		d2.Lists[i].Members = []string{"root"}
+	}
+	d2.Accounts[0].UUID = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
+	if err := e.apply(d2); !errors.Is(err, ErrMassRemoval) {
+		t.Fatalf("want the mass-removal refusal: %v", err)
+	}
+	dis := e.f.Get("Account", "", bob)["permissions"].(map[string]any)["disabledPermissions"].(map[string]any)
+	if dis["authenticate"] != true {
+		t.Fatalf("parked bob stayed lifted during the pending mass removal: %v", dis)
+	}
+	if e.account("root") == nil {
+		t.Fatal("root removed")
+	}
+}
