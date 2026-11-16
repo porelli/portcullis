@@ -124,8 +124,11 @@ networks:
   portcullis-metrics-mail:
     internal: true
   # Mail's egress: SMTP to other servers (mail), the public resolvers
-  # (mailctl's checks), the root servers (mail-resolver).
-  mail-egress: {}
+  # (mailctl's checks), the root servers (mail-resolver). IPv4 only, set
+  # explicitly (final review L4): a daemon with IPv6 on by default would
+  # give mail an outbound v6 address without a PTR.
+  mail-egress:
+    enable_ipv6: false
 
 # Hardening defaults (see docs/hardening.md for per-service exceptions).
 x-hardening: &hardening

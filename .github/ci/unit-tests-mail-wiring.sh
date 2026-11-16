@@ -27,6 +27,7 @@ mail_rule() {  # <config json>
     and .networks["portcullis-mailctl"].internal == true and .networks["portcullis-mailctl"].name == "portcullis-mailctl"
     and .networks["portcullis-metrics-mail"].internal == true
     and (.networks["mail-egress"].internal // false) == false
+    and .networks["mail-egress"].enable_ipv6 == false
     and .networks["portcullis-mail"].ipam.config[0].subnet == "172.31.255.0/28"
     and .networks["portcullis-mail"].ipam.config[0].ip_range == "172.31.255.8/29"
     and .networks["portcullis-mailctl"].ipam.config[0].subnet == "172.31.255.16/28"
