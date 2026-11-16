@@ -579,10 +579,6 @@ def setup(browser) -> None:
             return True
         print("    DKIM keys: " + ", ".join(f"{k['domain']} {k['algorithm']} {k['selector']} {k['stage']}" for k in ks), flush=True)
         return False
-    # The address set again now that mailctl holds the Hub's document: the
-    # dns tool gets mail_hostname only with the mail set, and MAIL_HOSTNAME's
-    # own A (its HELO SPF / CAA hide the wildcard) is written then.
-    run("./portcullis", "dns", "setup", "--yes", "--only", "address", timeout=900)
     try:
         until("DKIM ed25519 + rsa active on both domains", dkim_active, 420, every=10)
     except AssertionError:
