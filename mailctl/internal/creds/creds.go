@@ -287,3 +287,19 @@ func init() {
 	}
 	stalwart.Used = append(stalwart.Used, stalwart.Use{Object: "x:CredentialPermissions", Variant: "Replace", Field: "permissions"})
 }
+
+// SASLExpression is MtaStageAuth.saslMechanisms (contract §19.6): PLAIN /
+// LOGIN on the TLS listeners other than smtpPort (port 25), and with
+// LAN-only on only from the Local networks (AllowedIPs: loopback when
+// none). The base plan and the runner write exactly this.
+func SASLExpression(lanOnly bool, local []string, smtpPort int) map[string]any {
+	cond := fmt.Sprintf("local_port != %d && is_tls", smtpPort)
+	if lanOnly {
+		var any []string
+		for _, n := range AllowedIPs(true, local) {
+			any = append(any, fmt.Sprintf("is_ip_in_cidr(remote_ip, '%s')", n))
+		}
+		cond += " && (" + strings.Join(any, " || ") + ")"
+	}
+	return map[string]any{"match": map[string]any{"0": map[string]any{"if": cond, "then": "[plain, login]"}}, "else": "false"}
+}

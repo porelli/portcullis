@@ -376,6 +376,18 @@ func TestLANOnlySASLAndRestrict(t *testing.T) {
 	if e.f.Count("x:MtaStageAuth/set") != 0 {
 		t.Fatal("the SASL rule is rewritten on every pass")
 	}
+	// A bootstrap run (mail enable, upgrade) wrote the rule without the
+	// Local networks: the next pass compares the live rule and puts the
+	// LAN-only one back (final review M1).
+	if _, err := e.r.C.Set(context.Background(), "MtaStageAuth", nil, map[string]map[string]any{"singleton": {
+		"saslMechanisms": SASLExpression(false, nil)}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	e.mustApply(baseDoc(t))
+	cond = e.f.Get("MtaStageAuth", "", "singleton")["saslMechanisms"].(map[string]any)["match"].(map[string]any)["0"].(map[string]any)["if"].(string)
+	if !strings.Contains(cond, "is_ip_in_cidr(remote_ip, '10.0.0.0/8')") {
+		t.Fatalf("the LAN-only rule wasn't restored after the overwrite: %q", cond)
+	}
 }
 
 // A parked account whose permissions were lifted (an export that died) is

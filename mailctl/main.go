@@ -489,7 +489,7 @@ func planParams(cfg config.Config, in bootstrap.Input) (bootstrap.Params, error)
 		Hostname: in.Hostname, PrimaryDomain: in.PrimaryDomain, MailIP: mailIP, MailctlIP: cfg.MailIP,
 		ResolverIP: res.Addr(), ResolverPort: int(res.Port()),
 		RulesURL: "http://" + cfg.RulesAddr + spamrules.Path, ClientIP: in.ClientIP,
-		Relay: in.Relay, MetricsUser: in.MetricsUser, HTTPLookups: lookups, LocalNetworks: in.LocalNetworks,
+		Relay: in.Relay, MetricsUser: in.MetricsUser, HTTPLookups: lookups, LocalNetworks: in.LocalNetworks, LANOnly: in.LANOnly,
 	}, nil
 }
 

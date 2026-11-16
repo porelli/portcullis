@@ -7,6 +7,7 @@ package bootstrap
 
 import (
 	"fmt"
+	"github.com/portcullis/mailctl/internal/creds"
 	"net/netip"
 
 	"github.com/portcullis/mailctl/internal/stalwart"
@@ -64,6 +65,18 @@ type Params struct {
 	MetricsUser   string
 	HTTPLookups   []map[string]any // the spam rules' HttpLookups (created disabled)
 	LocalNetworks []string
+	// LANOnly: MAIL_SUBMISSION_LAN_ONLY (the SASL rule admits only the
+	// Local networks; loopback only with rewritten client addresses).
+	LANOnly bool
+}
+
+// saslNets: the Local networks the SASL rule admits (none with rewritten
+// client addresses: loopback only, as the runner's LocalNets).
+func (p Params) saslNets() []string {
+	if p.ClientIP == "rewritten" {
+		return nil
+	}
+	return p.LocalNetworks
 }
 
 func set(vals ...string) map[string]bool {
@@ -276,7 +289,7 @@ func (p Params) Singletons() []Singleton {
 		{"Http", map[string]any{"allowedEndpoints": p.AllowedEndpoints()}},
 		{"Metrics", map[string]any{"prometheus": map[string]any{"@type": "Enabled", "authUsername": p.MetricsUser, "authSecret": file(MetricsSecret)}}},
 		{"MtaStageAuth", map[string]any{
-			"saslMechanisms":  expr("false", [2]string{fmt.Sprintf("local_port != %d && is_tls", SMTPPort), "[plain, login]"}),
+			"saslMechanisms":  creds.SASLExpression(p.LANOnly, p.saslNets(), SMTPPort),
 			"require":         expr(fmt.Sprintf("local_port != %d", SMTPPort)),
 			"mustMatchSender": expr("true"),
 		}},

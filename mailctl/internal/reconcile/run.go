@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
+	"reflect"
 	"time"
 
 	"github.com/portcullis/mailctl/internal/creds"
@@ -73,18 +73,18 @@ func (r *Runner) Run(ctx context.Context) {
 // on the submission listeners, and with LAN-only only from the networks
 // (defence in depth next to every mail password's allowedIps).
 func SASLExpression(lanOnly bool, local []string) map[string]any {
-	cond := fmt.Sprintf("local_port != %d && is_tls", SMTPPort)
-	if lanOnly {
-		var any []string
-		for _, n := range creds.AllowedIPs(true, local) {
-			any = append(any, fmt.Sprintf("is_ip_in_cidr(remote_ip, '%s')", n))
-		}
-		cond += " && (" + strings.Join(any, " || ") + ")"
-	}
-	return map[string]any{"match": map[string]any{"0": map[string]any{"if": cond, "then": "[plain, login]"}}, "else": "false"}
+	return creds.SASLExpression(lanOnly, local, SMTPPort)
 }
 
-const extLAN = "lan_sasl"
+// sameJSON: raw (Stalwart's answer) and v encode the same value.
+func sameJSON(raw json.RawMessage, v any) bool {
+	var a, b any
+	wb, _ := json.Marshal(v)
+	if json.Unmarshal(raw, &a) != nil || json.Unmarshal(wb, &b) != nil {
+		return false
+	}
+	return reflect.DeepEqual(a, b)
+}
 
 // Once is one pass.
 func (r *Runner) Once(ctx context.Context) error {
@@ -172,28 +172,25 @@ func LocalNets(doc *state.Doc, rewritten bool) []string {
 // lanOnly keeps the SASL rule and every mail password's allowedIps on the
 // Local networks while MAIL_SUBMISSION_LAN_ONLY is on.
 func (r *Runner) lanOnly(ctx context.Context, l *Live, doc *state.Doc, p state.Persistent) error {
+	// The live rule, every pass (a bootstrap run, a hand edit): never a
+	// cached copy of what was written.
 	expr := SASLExpression(r.LANOnly, LocalNets(doc, r.Rewritten))
-	b, _ := json.Marshal(expr)
-	prev := string(p.Ext[extLAN])
-	if r.LANOnly || prev != "" {
-		if prev != string(b) {
-			res, err := r.C.Set(ctx, "MtaStageAuth", nil, map[string]map[string]any{"singleton": {"saslMechanisms": expr}}, nil)
-			if err := setErr("MtaStageAuth", res, err); err != nil {
-				return err
-			}
-			if err := r.C.Action(ctx, "ReloadSettings"); err != nil {
-				return fmt.Errorf("ReloadSettings: %w", err)
-			}
-			if err := r.Store.Update(func(s *state.Persistent) error {
-				if r.LANOnly {
-					s.Ext[extLAN] = b
-				} else {
-					delete(s.Ext, extLAN)
-				}
-				return nil
-			}); err != nil {
-				return err
-			}
+	var live []struct {
+		SASL json.RawMessage `json:"saslMechanisms"`
+	}
+	if err := r.C.Get(ctx, "MtaStageAuth", []string{"singleton"}, []string{"saslMechanisms"}, &live); err != nil {
+		return fmt.Errorf("x:MtaStageAuth/get: %w", err)
+	}
+	if len(live) != 1 || !sameJSON(live[0].SASL, expr) {
+		res, err := r.C.Set(ctx, "MtaStageAuth", nil, map[string]map[string]any{"singleton": {"saslMechanisms": expr}}, nil)
+		if err := setErr("MtaStageAuth", res, err); err != nil {
+			return err
+		}
+		if err := r.C.Action(ctx, "ReloadSettings"); err != nil {
+			return fmt.Errorf("ReloadSettings: %w", err)
+		}
+		if r.Logf != nil {
+			r.Logf("reconcile: the SASL rule differed from the wanted one (LAN-only %v): rewritten", r.LANOnly)
 		}
 	}
 	if !r.LANOnly {

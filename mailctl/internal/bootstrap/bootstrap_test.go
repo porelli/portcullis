@@ -567,3 +567,29 @@ func TestFromCheckSieveShape(t *testing.T) {
 		t.Fatalf("MtaStageData.script %v", data["script"])
 	}
 }
+
+// LAN-only: the base plan writes the SASL rule with the Local networks
+// (final review M1); loopback only with rewritten client addresses.
+func TestBasePlanSASLLANOnly(t *testing.T) {
+	sasl := func(p Params) string {
+		for _, s := range p.Singletons() {
+			if s.Object == "MtaStageAuth" {
+				b, _ := json.Marshal(s.Patch["saslMechanisms"])
+				return string(b)
+			}
+		}
+		return ""
+	}
+	p := params()
+	if got := sasl(p); strings.Contains(got, "is_ip_in_cidr") {
+		t.Fatalf("not LAN-only: %s", got)
+	}
+	p.LANOnly, p.LocalNetworks = true, []string{"192.168.1.0/24"}
+	if got := sasl(p); !strings.Contains(got, "is_ip_in_cidr(remote_ip, '192.168.1.0/24')") {
+		t.Fatalf("LAN-only: %s", got)
+	}
+	p.ClientIP = "rewritten"
+	if got := sasl(p); strings.Contains(got, "192.168.1.0/24") || !strings.Contains(got, "127.0.0.1/32") {
+		t.Fatalf("LAN-only, rewritten: %s", got)
+	}
+}
