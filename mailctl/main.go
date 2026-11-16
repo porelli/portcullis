@@ -163,6 +163,7 @@ func serve(env func(string) string, stderr io.Writer) error {
 		return err
 	}
 	runner := reconcile.NewRunner(sw, st, cfg.FormerRetain, cfg.LANOnly, logger.Printf)
+	runner.MailctlIP = cfg.MailIP
 	rewritten := cfg.ClientIP == config.ClientIPRewritten
 	runner.Rewritten = rewritten
 	runner.DQSKeyFile = cfg.DQSKeyFile
@@ -581,7 +582,7 @@ func exportCmd(args []string, env func(string) string, stdout, stderr io.Writer)
 		return 1
 	}
 	e := &export.Exporter{C: stalwart.New(cfg.StalwartURL, stalwart.Bearer(key)), IMAPAddr: net.JoinHostPort(u.Hostname(), "10993"),
-		ServerName: cfg.Hostname, MailctlIP: cfg.MailIP, SPKI: state.SPKIs(st.Get())}
+		ServerName: cfg.Hostname, MailctlIP: cfg.MailIP, SPKI: state.SPKIs(st.Get()), DataDir: cfg.DataDir}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 	n, err := e.Export(ctx, args[1], stdout)

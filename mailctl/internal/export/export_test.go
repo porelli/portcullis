@@ -48,7 +48,7 @@ func setup(t *testing.T) (*fake.Server, *Exporter, string, string) {
 		"description": reconcile.DescPrefix + "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b"})
 	_ = active
 	e := &Exporter{C: stalwart.New(f.URL(), stalwart.Bearer("API_k")), IMAPAddr: "127.0.0.1:1", ServerName: "mail.example.com",
-		MailctlIP: netip.MustParseAddr("172.31.255.3"), SPKI: []string{"00"}, Now: func() time.Time { return time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC) }}
+		MailctlIP: netip.MustParseAddr("172.31.255.3"), SPKI: []string{"00"}, DataDir: t.TempDir(), Now: func() time.Time { return time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC) }}
 	return f, e, former, active
 }
 
@@ -139,7 +139,26 @@ func TestExportPasswordShape(t *testing.T) {
 		}
 		return nil, errors.New("stop")
 	}
+	var recs map[string]state.ExportRecord
+	dial := e.Dial
+	e.Dial = func(a string, c *tls.Config) (*imapclient.Client, error) {
+		recs, _ = state.Exports(e.DataDir)
+		return dial(a, c)
+	}
 	e.Export(context.Background(), "former-"+uuid, &bytes.Buffer{})
+	// Recorded while it ran (this account, this password, its expiry),
+	// gone after the cleanup.
+	if len(recs) != 1 {
+		t.Fatalf("records during the export: %v", recs)
+	}
+	for id, r := range recs {
+		if r.AccountID != former || id != fmt.Sprint(seen["id"]) && seen["id"] != nil || !r.ExpiresAt.Equal(time.Date(2026, 11, 15, 13, 0, 0, 0, time.UTC)) {
+			t.Fatalf("record %s %+v", id, r)
+		}
+	}
+	if after, _ := state.Exports(e.DataDir); len(after) != 0 {
+		t.Fatalf("records after the export: %v", after)
+	}
 	ips := seen["allowedIps"].(map[string]any)
 	if len(ips) != 1 || ips["172.31.255.3/32"] != true || seen["expiresAt"] != "2026-11-15T13:00:00Z" {
 		t.Fatalf("password %v", seen)

@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net/netip"
 	"os"
 	"strings"
 	"testing"
@@ -683,11 +685,14 @@ func TestOffDomainNotCreated(t *testing.T) {
 	}
 }
 
-// Final review M5 / L8: the sweep destroys an expired export password and
-// any other password of a parked account, re-locking it; a valid export
-// password (an export under way) keeps its lift until it expires.
+// Final review M5 / L8 (and the sweep ruling): only a password mailctl
+// recorded for this account, still valid, pinned to mailctl's /32 with
+// exactly the export permissions is an export under way (its lift kept);
+// a look-alike (same description, future expiry) is destroyed, and the
+// real one goes once it expires, the account re-locked.
 func TestSweepParkedExports(t *testing.T) {
 	e := newEnv(t)
+	e.r.MailctlIP = netip.MustParseAddr("172.31.255.3")
 	e.mustApply(baseDoc(t))
 	bob := e.account("bob")["id"].(string)
 	d := baseDoc(t)
@@ -703,25 +708,54 @@ func TestSweepParkedExports(t *testing.T) {
 	locked := func() bool {
 		return e.f.Get("Account", "", bob)["permissions"].(map[string]any)["disabledPermissions"].(map[string]any)["authenticate"] == true
 	}
-	lift()
-	e.f.Put("AppPassword", bob, map[string]any{"description": ExportDescription, "expiresAt": e.now.Add(30 * time.Minute).Format(time.RFC3339)})
-	e.mustApply(d)
-	if locked() || len(e.f.Objects("AppPassword", bob)) != 1 {
-		t.Fatal("an export under way was cut off")
+	perms := map[string]any{}
+	for _, p := range stalwart.ExportPermissions {
+		perms[p] = true
 	}
-	// Expired (the export died): the password goes, the account is locked.
+	shape := func(desc string, exp time.Time, ips map[string]any, perms map[string]any) map[string]any {
+		return map[string]any{"description": desc, "expiresAt": exp.Format(time.RFC3339), "allowedIps": ips,
+			"permissions": map[string]any{"@type": "Replace", "permissions": perms}}
+	}
+	pin := map[string]any{"172.31.255.3": true} // as Stalwart answers a /32
+	exp := e.now.Add(30 * time.Minute)
+	lift()
+	real := e.f.Put("AppPassword", bob, shape(ExportDescription, exp, pin, perms))
+	if err := state.RecordExport(e.st.Dir(), state.ExportRecord{AccountID: bob, PasswordID: real, ExpiresAt: exp}); err != nil {
+		t.Fatal(err)
+	}
+	look := e.f.Put("AppPassword", bob, shape(ExportDescription, exp, pin, perms)) // not recorded
+	wider := map[string]any{}
+	for k, v := range perms {
+		wider[k] = v
+	}
+	wider["emailSend"] = true
+	wrongPerms := e.f.Put("AppPassword", bob, shape(ExportDescription, exp, pin, wider))
+	wrongIP := e.f.Put("AppPassword", bob, shape(ExportDescription, exp, map[string]any{"0.0.0.0/0": true}, perms))
+	// Recorded ids that lie: another account's record, a wrong pin.
+	state.RecordExport(e.st.Dir(), state.ExportRecord{AccountID: "zz", PasswordID: wrongPerms, ExpiresAt: exp})
+	state.RecordExport(e.st.Dir(), state.ExportRecord{AccountID: bob, PasswordID: wrongIP, ExpiresAt: exp})
+	e.mustApply(d)
+	left := map[string]bool{}
+	for _, p := range e.f.Objects("AppPassword", bob) {
+		left[fmt.Sprint(p["id"])] = true
+	}
+	if !left[real] || left[look] || left[wrongPerms] || left[wrongIP] || len(left) != 1 {
+		t.Fatalf("passwords left %v (real %s)", left, real)
+	}
+	if locked() {
+		t.Fatal("the export under way was cut off")
+	}
+	if recs, _ := state.Exports(e.st.Dir()); len(recs) != 1 || recs[real].AccountID != bob {
+		t.Fatalf("records %v", recs)
+	}
+	// Expired (the export died): the password and its record go, the
+	// account is locked.
 	e.now = e.now.Add(31 * time.Minute)
 	e.mustApply(d)
 	if !locked() || len(e.f.Objects("AppPassword", bob)) != 0 {
 		t.Fatalf("after expiry: locked %v, passwords %d", locked(), len(e.f.Objects("AppPassword", bob)))
 	}
-	// Any other password on a parked account goes at once; so does an
-	// "export" one that would live longer than an export's.
-	lift()
-	e.f.Put("AppPassword", bob, map[string]any{"description": "phone"})
-	e.f.Put("AppPassword", bob, map[string]any{"description": ExportDescription, "expiresAt": e.now.Add(5 * time.Hour).Format(time.RFC3339)})
-	e.mustApply(d)
-	if !locked() || len(e.f.Objects("AppPassword", bob)) != 0 {
-		t.Fatalf("stray passwords: locked %v, passwords %d", locked(), len(e.f.Objects("AppPassword", bob)))
+	if recs, _ := state.Exports(e.st.Dir()); len(recs) != 0 {
+		t.Fatalf("records after expiry %v", recs)
 	}
 }

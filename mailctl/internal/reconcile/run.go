@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"reflect"
 	"sync"
 	"time"
@@ -30,6 +31,9 @@ type Runner struct {
 	// Local networks can't be told apart; LAN-only then admits loopback
 	// only (fail closed). The CLI refuses LAN-only there.
 	Rewritten bool
+	// MailctlIP: mailctl's portcullis-mail address (an export password is
+	// pinned to it).
+	MailctlIP netip.Addr
 	// DQSKeyFile: the Spamhaus DQS key (Settings).
 	DQSKeyFile string
 	Now        func() time.Time
@@ -136,7 +140,7 @@ func (r *Runner) once(ctx context.Context, p state.Persistent) error {
 }
 
 func (r *Runner) apply(ctx context.Context, l *Live, doc *state.Doc, p state.Persistent) error {
-	exporting, sweepErr := SweepParked(ctx, r.C, l, r.Now())
+	exporting, sweepErr := SweepParked(ctx, r.C, l, r.Now(), r.Store.Dir(), r.MailctlIP)
 	ops, err := Plan(l, doc, p.Former, r.Now(), r.Retention, p.MassRemoval)
 	// An export under way (its password not expired yet) keeps its lift
 	// until it ends (final review L8); the export's own defer re-locks,
@@ -198,12 +202,25 @@ func (r *Runner) applyOps(ctx context.Context, l *Live, doc *state.Doc, ops Ops,
 }
 
 // SweepParked reads every parked account's app passwords (final review
-// M5): an expired export password, or any other password (a parked
-// account never has one), is destroyed; an export password still valid
-// marks an export under way (its account id in the answer).
-func SweepParked(ctx context.Context, c *stalwart.Client, l *Live, now time.Time) (map[string]bool, error) {
+// M5). A password counts as an export under way only when mailctl itself
+// recorded it (state.Exports: this account, this password id, not
+// expired), its allowedIps is exactly mailctl's /32 and its permissions
+// are exactly stalwart.ExportPermissions; its account id is in the
+// answer. Every other password of a parked account (a parked account has
+// none; a look-alike's description and expiry prove nothing) is
+// destroyed. Records whose password is gone or expired are removed.
+func SweepParked(ctx context.Context, c *stalwart.Client, l *Live, now time.Time, dataDir string, mailctlIP netip.Addr) (map[string]bool, error) {
 	exporting := map[string]bool{}
-	var errs []error
+	recs, err := state.Exports(dataDir)
+	if err != nil {
+		recs = map[string]state.ExportRecord{} // fail closed: nothing spared
+	}
+	errs := []error{err}
+	want := map[string]bool{}
+	for _, p := range stalwart.ExportPermissions {
+		want[p] = true
+	}
+	alive := map[string]bool{}
 	for _, la := range l.Accounts {
 		if !la.Parked(l) {
 			continue
@@ -218,18 +235,24 @@ func SweepParked(ctx context.Context, c *stalwart.Client, l *Live, now time.Time
 			continue
 		}
 		var ps []struct {
-			ID          string     `json:"id"`
-			Description string     `json:"description"`
-			ExpiresAt   *time.Time `json:"expiresAt"`
+			ID          string          `json:"id"`
+			AllowedIPs  map[string]bool `json:"allowedIps"`
+			Permissions struct {
+				Type        string          `json:"@type"`
+				Permissions map[string]bool `json:"permissions"`
+			} `json:"permissions"`
 		}
-		if err := ac.Get(ctx, "AppPassword", ids, []string{"id", "description", "expiresAt"}, &ps); err != nil {
+		if err := ac.Get(ctx, "AppPassword", ids, []string{"id", "allowedIps", "permissions"}, &ps); err != nil {
 			errs = append(errs, fmt.Errorf("x:AppPassword/get: %w", err))
 			continue
 		}
 		var gone []string
 		for _, p := range ps {
-			if p.Description == ExportDescription && p.ExpiresAt != nil && now.Before(*p.ExpiresAt) && p.ExpiresAt.Sub(now) <= ExportLifetime {
+			rec, ok := recs[p.ID]
+			if ok && rec.AccountID == la.ID && now.Before(rec.ExpiresAt) && pinnedTo(p.AllowedIPs, mailctlIP) &&
+				p.Permissions.Type == "Replace" && sameSet(p.Permissions.Permissions, want) {
 				exporting[la.ID] = true
+				alive[p.ID] = true
 				continue
 			}
 			gone = append(gone, p.ID)
@@ -241,7 +264,45 @@ func SweepParked(ctx context.Context, c *stalwart.Client, l *Live, now time.Time
 			}
 		}
 	}
+	for id := range recs {
+		if !alive[id] {
+			if err := state.RemoveExport(dataDir, id); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
 	return exporting, errors.Join(errs...)
+}
+
+// pinnedTo: allowedIps is exactly ip (Stalwart answers a /32 as the bare
+// address: checked on the builder).
+func pinnedTo(ips map[string]bool, ip netip.Addr) bool {
+	if !ip.IsValid() || len(ips) != 1 {
+		return false
+	}
+	for k, v := range ips {
+		if !v {
+			return false
+		}
+		if a, err := netip.ParseAddr(k); err == nil {
+			return a == ip
+		}
+		p, err := netip.ParsePrefix(k)
+		return err == nil && p.Bits() == ip.BitLen() && p.Addr() == ip
+	}
+	return false
+}
+
+// sameSet: got's true keys are exactly want's.
+func sameSet(got, want map[string]bool) bool {
+	n := 0
+	for k, v := range got {
+		if !v || !want[k] {
+			return false
+		}
+		n++
+	}
+	return n == len(want)
 }
 
 // ExportDescription / ExportLifetime: the export's password (mailctl

@@ -47,6 +47,10 @@ type Exporter struct {
 	// rotate` stores them): the leaf Stalwart presents must be one of them,
 	// name MAIL_HOSTNAME and be valid now. No pin, no export.
 	SPKI []string
+	// DataDir is mailctl_data: the export password is recorded there
+	// (state.RecordExport) so the reconcile sweep can tell it from a
+	// look-alike.
+	DataDir string
 	// Dial connects (tests replace it).
 	Dial func(addr string, cfg *tls.Config) (*imapclient.Client, error)
 }
@@ -92,6 +96,10 @@ func (e *Exporter) Export(ctx context.Context, formerID string, w io.Writer) (n 
 			if derr := setErr("AppPassword", r, derr); derr != nil {
 				err = errors.Join(err, derr)
 			}
+			// Always: an unrecorded password is a stray to the sweep.
+			if derr := state.RemoveExport(e.DataDir, pwID); derr != nil {
+				err = errors.Join(err, derr)
+			}
 		}
 		r, derr := e.C.Set(cctx, "Account", nil, map[string]map[string]any{id: {"permissions": reconcile.Disabled}}, nil)
 		if derr := setErr("Account", r, derr); derr != nil {
@@ -105,9 +113,13 @@ func (e *Exporter) Export(ctx context.Context, formerID string, w io.Writer) (n 
 	for _, p := range stalwart.ExportPermissions {
 		perms[p] = true
 	}
+	if e.DataDir == "" {
+		return 0, errors.New("export: no data directory to record the export in")
+	}
+	expires := now().Add(reconcile.ExportLifetime).UTC().Truncate(time.Second)
 	r, err := e.C.As(id).Set(ctx, "AppPassword", map[string]any{"x": map[string]any{
 		"description": reconcile.ExportDescription,
-		"expiresAt":   now().Add(reconcile.ExportLifetime).UTC().Format(time.RFC3339),
+		"expiresAt":   expires.Format(time.RFC3339),
 		"allowedIps":  map[string]bool{netip.PrefixFrom(e.MailctlIP, 32).String(): true},
 		"permissions": map[string]any{"@type": "Replace", "permissions": perms},
 	}}, nil, nil)
@@ -119,6 +131,10 @@ func (e *Exporter) Export(ctx context.Context, formerID string, w io.Writer) (n 
 	_ = json.Unmarshal(r.Created["x"]["secret"], &secret)
 	if pwID == "" || secret == "" {
 		return 0, errors.New("x:AppPassword/set: no id or secret in the answer")
+	}
+	// Recorded before the lift: the sweep spares only a recorded export.
+	if err := state.RecordExport(e.DataDir, state.ExportRecord{AccountID: id, PasswordID: pwID, ExpiresAt: expires}); err != nil {
+		return 0, err
 	}
 	// Lifted only once the password exists: the reconciler sees the valid
 	// export password and leaves the lift alone (final review L8).
