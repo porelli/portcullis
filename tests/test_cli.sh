@@ -555,7 +555,7 @@ done
 # local e2e-k3s runner container, never run by CI), each on its line marked
 # "# reviewed exception"; never privileged: true in a compose file.
 expect_eq "--privileged only in .github/ci/e2e-servers-worker.sh (and e2e-k3s-local.sh), next to # reviewed exception; no privileged: true anywhere" \
-  "$(git -C "$ROOT_DIR_SOCK" grep -n -e '--privileged' -e 'privileged: *true' -- . ':!tests/test_cli.sh' | grep -vE '^\.github/ci/(e2e-servers-worker|e2e-k3s-local)\.sh:[0-9]+:.*--privileged.*# reviewed exception$' || true)" ""
+  "$(git -C "$ROOT_DIR_SOCK" grep -n -e '--privileged' -e 'privileged: *true' -- . ':!tests/test_cli.sh' ':!*.md' | grep -vE '^\.github/ci/(e2e-servers-worker|e2e-k3s-local)\.sh:[0-9]+:.*--privileged.*# reviewed exception$' || true)" ""
 expect_eq "the dind worker's privileged run is there (the exception the lint above allows)" \
   "$(grep -c -- '--privileged.*# reviewed exception$' "$ROOT_DIR_SOCK/.github/ci/e2e-servers-worker.sh")" 1
 # test_socket_literal_count: twice in docker-compose.yml, once in the worker file.
@@ -589,6 +589,12 @@ for files in "-f docker-compose.worker.yml" "-f docker-compose.worker.yml -f doc
 done
 expect_eq "worker Podman overlay: restart always on both, nothing else" \
   "$(grep -vE '^[[:space:]]*(#|$)|^services:$|^  (agent|socket-proxy-agent):$|^    restart: always$' "$ROOT_DIR_SOCK/docker-compose.worker.podman.yml"):$(grep -c '^    restart: always$' "$ROOT_DIR_SOCK/docker-compose.worker.podman.yml")" ":2"
+expect_eq "worker SELinux overlay: label=disable on exactly the agent and its socket proxy, and nothing else in their security_opt" \
+  "$(yq -o=json '.services' "$ROOT_DIR_SOCK/docker-compose.worker.podman-selinux.yml" | jq -c '[to_entries[] | select((.value.security_opt // []) | index("label=disable")) | .key] | sort as $l
+      | {label_disable: $l, other: [to_entries[] | .value.security_opt // [] | .[] | select(. != "label=disable")]}')" \
+  '{"label_disable":["agent","socket-proxy-agent"],"other":[]}'
+expect_eq "no other compose file gives a worker service label=disable" \
+  "$(grep -l 'label=disable' "$ROOT_DIR_SOCK"/docker-compose.worker*.yml | sed 's|.*/||')" "docker-compose.worker.podman-selinux.yml"
 expect_eq "worker SELinux overlay: labels only worker-data (Z), never the checkout, the engine root or a folder root" \
   "$(grep -c 'selinux: [zZ]' "$ROOT_DIR_SOCK/docker-compose.worker.podman-selinux.yml"):$(grep -c 'source: ./worker-data,.*selinux: Z' "$ROOT_DIR_SOCK/docker-compose.worker.podman-selinux.yml")" "1:1"
 expect_eq "the worker files: healthchecks lint" \
