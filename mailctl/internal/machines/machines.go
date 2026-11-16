@@ -7,9 +7,12 @@ package machines
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -77,6 +80,10 @@ type Machines struct {
 
 	seenMu sync.Mutex
 	seen   map[string]bool // reports already logged
+
+	hashMu  sync.Mutex
+	hashKey string            // the state revision and the main zone's DNSSEC state
+	hashes  map[string]string // DNSHashes' last answer for hashKey
 }
 
 // New returns the driver.
@@ -634,6 +641,57 @@ type DNSSet struct {
 	Records []dnsset.Record `json:"records"`
 	DKIM    string          `json:"dkim"`
 	TLSA    string          `json:"tlsa"`
+}
+
+// DNSHashes is MailStatus.dns: every mail domain of the document (the
+// main one included) → sha256 of the canonical record set Set serves at
+// /v1/dns/<domain> (records sorted by name, type, value, TTL). It changes
+// whenever the set does (a key made or moving stage, the MTA-STS id, a
+// DMARC step, the TLSA …): the Hub rewrites an added domain's set then.
+// Cached per state revision and the main zone's DNSSEC state (the one
+// input Set reads besides the state: its 48 h freshness).
+func (m *Machines) DNSHashes() map[string]string {
+	p, rev := m.Store.GetRev()
+	out := map[string]string{}
+	if p.Doc == nil {
+		return out
+	}
+	key := fmt.Sprintf("%d|%s", rev, m.mainState(p))
+	m.hashMu.Lock()
+	defer m.hashMu.Unlock()
+	if m.hashes != nil && m.hashKey == key {
+		return maps.Clone(m.hashes)
+	}
+	for _, d := range p.Doc.Domains {
+		set, err := m.Set(d.Name)
+		if err != nil {
+			continue
+		}
+		out[d.Name] = setHash(set.Records)
+	}
+	m.hashKey, m.hashes = key, out
+	return maps.Clone(out)
+}
+
+// setHash: sha256 hex of the records in canonical order.
+func setHash(recs []dnsset.Record) string {
+	rs := append([]dnsset.Record(nil), recs...)
+	sort.Slice(rs, func(i, j int) bool {
+		a, b := rs[i], rs[j]
+		if a.Name != b.Name {
+			return a.Name < b.Name
+		}
+		if a.Type != b.Type {
+			return a.Type < b.Type
+		}
+		if a.Value != b.Value {
+			return a.Value < b.Value
+		}
+		return a.TTL < b.TTL
+	})
+	b, _ := json.Marshal(rs)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // Set renders one domain's wanted mail set (an added domain with its

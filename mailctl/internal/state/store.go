@@ -38,6 +38,7 @@ type Store struct {
 	mu   sync.Mutex
 	path string
 	p    Persistent
+	rev  uint64 // bumped by every Update (caches keyed on the state)
 }
 
 // Open reads dir/state.json (a missing file is an empty state).
@@ -107,7 +108,16 @@ func (s *Store) Update(fn func(*Persistent) error) error {
 		return fmt.Errorf("state: %w", err)
 	}
 	s.p = c
+	s.rev++
 	return nil
+}
+
+// GetRev returns a deep copy of the state and its revision (bumped by
+// every Update since Open).
+func (s *Store) GetRev() (Persistent, uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.copyLocked(), s.rev
 }
 
 // TLSAState is the mail certificate's key pins (Ext["tlsa"]), as mail-cert

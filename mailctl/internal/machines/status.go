@@ -45,6 +45,8 @@ type MailStatus struct {
 	RestoredAt      *time.Time     `json:"restored_at"`
 	TimerSeenAt     *time.Time     `json:"timer_seen_at"`
 	Former          []FormerStatus `json:"former"`
+	// DNS: each mail domain's set hash (DNSHashes).
+	DNS map[string]string `json:"dns"`
 }
 
 // queueFetchMax bounds the messages read for the deferred count.
@@ -131,7 +133,7 @@ func (m *Machines) Status(ctx context.Context, bootstrapped bool, clientIP strin
 	sort.Slice(former, func(i, j int) bool { return former[i].ID < former[j].ID })
 	return MailStatus{Bootstrap: bootstrapped, StalwartVersion: StalwartVersion, Cert: cert,
 		DKIM: dk, MTASTS: ms, DMARC: ds, Queue: q, ClientIP: clientIP,
-		RestoredAt: p.RestoredAt, TimerSeenAt: p.TimerSeenAt, Former: former}, nil
+		RestoredAt: p.RestoredAt, TimerSeenAt: p.TimerSeenAt, Former: former, DNS: m.DNSHashes()}, nil
 }
 
 func init() {

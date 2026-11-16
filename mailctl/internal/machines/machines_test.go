@@ -538,3 +538,64 @@ func TestStatusCertQueueFormer(t *testing.T) {
 		t.Fatal("a Stalwart failure isn't an error")
 	}
 }
+
+// MailStatus.dns: a hash per mail domain of exactly the set /v1/dns
+// serves: stable (and cached) while nothing changes, new when the set
+// changes (a key made, a key retired). A key moving pending → active keeps
+// the same published records, so the hash too.
+func TestDNSHashesFollowTheSet(t *testing.T) {
+	e := newEnv(t, nil)
+	h0 := e.m.DNSHashes()
+	if len(h0) == 0 || h0["example.com"] == "" || h0["team-b.example.org"] == "" {
+		t.Fatalf("hashes before any key: %v", h0)
+	}
+	if h := e.m.DNSHashes(); h["example.com"] != h0["example.com"] {
+		t.Fatal("the hash changed without a state change")
+	}
+	e.step(t) // keys made (pending, published)
+	h1 := e.m.DNSHashes()
+	for _, d := range []string{"example.com", "team-b.example.org"} {
+		if h1[d] == h0[d] {
+			t.Fatalf("%s: a new key didn't change the hash", d)
+		}
+	}
+	for _, k := range e.keys("team-b.example.org") {
+		e.vis[dkim.Name(k)+"|"+dkim.TXT(k)] = true
+	}
+	e.now = t0.Add(time.Hour)
+	e.step(t) // pending → active: the same records
+	for _, k := range e.keys("team-b.example.org") {
+		if k.Stage != dkim.Active {
+			t.Fatalf("team-b key %s is %s, not active", k.Selector, k.Stage)
+		}
+	}
+	h2 := e.m.DNSHashes()
+	if h2["team-b.example.org"] != h1["team-b.example.org"] {
+		t.Fatal("pending → active changed the hash although the records are the same")
+	}
+	// The set itself changing (here: a key gone) changes the hash.
+	if err := e.st.Update(func(p *state.Persistent) error {
+		ks := read[dkim.State](*p, extDKIM)
+		var keep []dkim.Key
+		for _, k := range ks.Keys {
+			if !(k.Domain == "team-b.example.org" && k.Algorithm == dkim.RSA) {
+				keep = append(keep, k)
+			}
+		}
+		ks.Keys = keep
+		put(p, extDKIM, ks)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if h3 := e.m.DNSHashes(); h3["team-b.example.org"] == h2["team-b.example.org"] || h3["example.com"] != h2["example.com"] {
+		t.Fatalf("a removed key: team-b %v → %v, example.com %v → %v", h2["team-b.example.org"], h3["team-b.example.org"], h2["example.com"], h3["example.com"])
+	}
+	st, err := e.m.Status(context.Background(), true, "preserved")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.DNS["team-b.example.org"] != e.m.DNSHashes()["team-b.example.org"] {
+		t.Fatalf("status dns %v", st.DNS)
+	}
+}
