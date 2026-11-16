@@ -162,7 +162,10 @@ PY
 
 _backup_load_cfg() {
   _rt_docker_only
-  [ -n "$_BACKUP_CFG" ] || _BACKUP_CFG="$(dc config --format json 2>/dev/null)" \
+  # Every profile: a volume only a one-shot of another profile mounts
+  # (mail_acme: mail-cert, tools) is in the config only then. Volumes are
+  # archived only when they exist.
+  [ -n "$_BACKUP_CFG" ] || _BACKUP_CFG="$(dc --profile '*' config --format json 2>/dev/null)" \
     || fail "docker compose config failed (is .env complete?)"
   [ -n "$_BACKUP_CFG" ] || fail "docker compose config returned nothing"
 }

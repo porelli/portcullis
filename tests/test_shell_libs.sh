@@ -1699,6 +1699,11 @@ esac
 # The MANIFEST of a backup must never list hub_secrets as a file.
 expect_ok "backup: BACKUP_FILE_VOLUMES does not contain hub_secrets" bash -c '! echo "$BACKUP_FILE_VOLUMES" | grep -q hub_secrets'
 
+# The backup reads the config of every profile (mail_acme is mounted only
+# by the tools one-shot mail-cert).
+( dc() { printf '%s\n' "$*" > "$WORK/bcfg-args"; echo '{"volumes":{}}'; }; _rt_docker_only() { :; }
+  _BACKUP_CFG=""; _backup_load_cfg )
+expect_eq "backup: the compose config of every profile" "$(cat "$WORK/bcfg-args")" "--profile * config --format json"
 # Test server 2026-11-13: an empty domains_data turned 10003:10001 0750
 # (group-gate's /data) at a backup — Docker copies the image's mountpoint
 # owner and mode onto an empty named volume. The python helpers (group-gate's
