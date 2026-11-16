@@ -657,6 +657,12 @@ def enrolled_domain_alias() -> None:
 
 def spam() -> None:
     needs("setup")
+    # The vendored rules are imported (mailctl's own copy, no network).
+    def rules_in():
+        c = hub_ok("GET", "/api/mail/checks?refresh=1")
+        r = next((x for x in c.get("checks") or [] if x.get("id") == "spam_rules"), None)
+        return r if r and r.get("severity") == "ok" else None
+    until("the spam rules imported (check spam_rules ok)", rules_in, 300, every=65)
     gtube = "XJS*C4JDBQADN1.NSBN3*2IDNEN*GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X"
     stage, code, text = smtp25("probe@relay-test.example", f"bob@{DOMAIN}",
                                message("probe@relay-test.example", f"bob@{DOMAIN}", "e2e gtube", gtube + "\r\n"))
@@ -777,11 +783,18 @@ def revoke_within_8s() -> None:
     assert imap_refused(a, pw), "the revoked password still logs in"
 
 
+def mail_started_at() -> str:
+    return docker("inspect", "-f", "{{.State.StartedAt}}", docker("compose", "ps", "-q", "mail").strip()).strip()
+
+
 def leave_ends_idle_session() -> None:
     needs("setup")
     b = f"bob@{DOMAIN}"
     state["bob_old_uuid"] = uuid_of("bob")
-    i = imap_login(b, state["pw_bob"])
+    # The revoke before made the Hub restart mail (contract §19.6): IMAP
+    # back first.
+    i = until("IMAP accepting bob again", lambda: imap_login(b, state["pw_bob"]), 120, every=3)
+    started = mail_started_at()
     i.select("INBOX")
     tag = i._new_tag().decode()
     i.send(f"{tag} IDLE\r\n".encode())
@@ -805,6 +818,11 @@ def leave_ends_idle_session() -> None:
     LATENCY["leave_ends_idle_session"] = took
     print(f"LATENCY leave → IDLE session gone: {took:.1f} s", flush=True)
     assert gone and took <= SLA_S, f"bob's IDLE session lasted {took:.1f} s after leaving mail_users (SLA {SLA_S} s)"
+    # The cut is the leave's: the Hub restarted mail (not a crash), and
+    # audited the leave's revocation.
+    until("mail running again after the Hub's restart", lambda: mail_started_at() != started
+          and docker("inspect", "-f", "{{.State.Running}} {{.State.OOMKilled}}", docker("compose", "ps", "-q", "mail").strip()).strip() == "true false", 60)
+    assert "mail_credential.revoke_leave" in json.dumps(hub_ok("GET", "/api/directory/audit")), "no mail_credential.revoke_leave in the audit"
     stage, code, text = until("RCPT bob@ refused 550 5.1.1", lambda: (lambda r: r if r[1] == 550 else None)(smtp25(REMOTE_ADDR, b)), 30, every=2)
     assert stage == "rcpt" and text.startswith("5.1.1"), f"RCPT {b}: {stage} {code} {text}"
 

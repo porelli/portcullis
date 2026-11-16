@@ -3839,9 +3839,12 @@ jobs:
     timeout-minutes: 60
     env:
       E2E_DOMAIN: ci.example.org
-      # The workflow's PORTCULLIS_DOMAIN (portcullis.local) would win over
-      # .env (the shell's value wins, as with compose).
+      # The workflow's PORTCULLIS_DOMAIN (portcullis.local) and public
+      # addresses would win over .env (the shell's value wins, as with
+      # compose): mail's mail-egress address is the server's (SPF, the MX).
       PORTCULLIS_DOMAIN: ci.example.org
+      PORTCULLIS_PUBLIC_IPV4: 172.30.88.2
+      PORTCULLIS_PUBLIC_IPV6: ""
       E2E_EXTRA: team-b.test
       E2E_ARTIFACTS: e2e-artifacts
     steps:

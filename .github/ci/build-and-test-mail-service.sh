@@ -128,6 +128,11 @@ setup)
   ./portcullis mail enable --yes 2>&1 | tee "$ST/enable.out"
   [ "${PIPESTATUS[0]}" = 0 ] || fail "mail enable"
   for s in mail mailctl mail-resolver; do wait_healthy "$s"; done
+  # The Hub stops now: it sends mailctl its own documents and restarts
+  # mail on changes, which would cut the checks below. Its document here
+  # is the step's (as the Hub at .18).
+  docker compose stop hub >/dev/null
+  wait_healthy mail
   probe_egress portcullis_mail-egress
   echo "PASS: outbound TCP 25/465/587 rejected from mail-egress too"
   # 1. Users, capabilities, read-only.
@@ -178,8 +183,9 @@ setup)
   done
   echo "PASS: certificate SAN DNS:$HOST, key kept by a second mail cert, presented on 25/465/587/993"
   # A mail document (as the Hub) with one account, and its mail password.
-  docker compose stop hub >/dev/null
-  jq --arg u "$UUID" '.generation = 1000 | .primary_domain = "portcullis.local"
+  # Above any generation the Hub sent before it stopped.
+  GEN=$(( $(hubapi GET /v1/state | head -n1 | jq -r '.generation // 0') + 1000 ))
+  jq --arg u "$UUID" --argjson g "$GEN" '.generation = $g | .primary_domain = "portcullis.local"
       | .domains = [{name: "portcullis.local", dmarc_start: "reject", mail: "on", dnssec: "unsigned"}]
       | .accounts = [{username: "mailtest", uuid: $u, display_name: "Mail Test", addresses: ["mailtest@portcullis.local"], quota_bytes: 104857600}]
       | .aliases = [] | .lists = [] | .postmaster = ["mailtest"] | .local_networks = [] | .spam.allow = [] | .spam.block = []' \
@@ -188,10 +194,10 @@ setup)
   # (Whole answers, then the first line: a head in the pipe breaks docker's
   # stdout under pipefail.)
   for _ in $(seq 1 40); do
-    out="$(hubapi GET /v1/state)"; head -n1 <<<"$out" | jq -e '.applied_generation == 1000' >/dev/null && break; sleep 3
+    out="$(hubapi GET /v1/state)"; head -n1 <<<"$out" | jq -e --argjson g "$GEN" '.applied_generation == $g' >/dev/null && break; sleep 3
   done
   out="$(hubapi GET /v1/state)"
-  head -n1 <<<"$out" | jq -e '.applied_generation == 1000 and .bootstrap == true' >/dev/null || fail "state: $out"
+  head -n1 <<<"$out" | jq -e --argjson g "$GEN" '.applied_generation == $g and .bootstrap == true' >/dev/null || fail "state: $out"
   printf '{"username":"mailtest","uuid":"%s","label":"ci","expires_at":null}' "$UUID" > "$ST/cred.json"
   out="$(hubapi POST /v1/credentials "$ST/cred.json")"; [ "$(tail -n1 <<<"$out")" = 201 ] || fail "POST /v1/credentials: $(tail -n1 <<<"$out")"
   head -n1 <<<"$out" | jq -r .secret > "$ST/pw"; chmod 600 "$ST/pw"; echo "::add-mask::$(cat "$ST/pw")"
