@@ -121,3 +121,47 @@ func TestMTASTSUnreachable(t *testing.T) {
 		t.Fatalf("back %+v", d)
 	}
 }
+
+// Final review L4: mail off without a drain never drops a published
+// policy at once: enforce → testing for the enforce max_age, then off.
+func TestOffWithoutDrainDwellsInTesting(t *testing.T) {
+	d := Step(Domain{}, on(false), t0)
+	d, _ = DoEnforce(d, on(false), t0.Add(8*24*time.Hour))
+	off := Inputs{Mail: "off", Reachable: true, MX: "mail.example.com"}
+	at := t0.Add(9 * 24 * time.Hour)
+	d = Step(d, off, at)
+	if d.Mode != Testing || !strings.Contains(d.Policy, "mode: testing") || d.ID == "" {
+		t.Fatalf("enforce → off: %+v", d)
+	}
+	d = Step(d, off, at.Add(MaxAgeEnforce*time.Second-time.Second))
+	if d.Mode != Testing {
+		t.Fatalf("off before the enforce max_age: %+v", d)
+	}
+	d = Step(d, off, at.Add(MaxAgeEnforce*time.Second))
+	if d.Mode != Off || d.Policy != "" {
+		t.Fatalf("after the dwell: %+v", d)
+	}
+	if d = Step(d, off, at.Add(MaxAgeEnforce*time.Second+time.Hour)); d.Mode != Off {
+		t.Fatalf("off stays off: %+v", d)
+	}
+	// From testing: a day.
+	d = Step(Domain{}, on(false), t0)
+	d = Step(d, off, t0.Add(time.Hour))
+	if d.Mode != Testing {
+		t.Fatalf("testing → off at once: %+v", d)
+	}
+	if d = Step(d, off, t0.Add(time.Hour+MaxAgeTesting*time.Second)); d.Mode != Off {
+		t.Fatalf("testing dwell: %+v", d)
+	}
+	// A drain under way runs to its end.
+	d = Step(Domain{}, on(false), t0)
+	d = Step(d, Inputs{Mail: "draining", Reachable: true, MX: "mail.example.com"}, t0.Add(time.Hour))
+	d = Step(d, off, t0.Add(2*time.Hour))
+	if d.Mode != None {
+		t.Fatalf("drain then off: %+v", d)
+	}
+	// Never published: off at once.
+	if d := Step(Domain{}, off, t0); d.Mode != Off {
+		t.Fatalf("never published: %+v", d)
+	}
+}

@@ -3,7 +3,8 @@
 // 7 days of testing with the certificate check ok and no TLS-RPT failure
 // since testing began; any failure goes back to testing. Turning mail off
 // makes the domain drain: mode none for the full max_age of the last
-// published policy, then off. MTA-STS follows VPN-only mode: while the
+// published policy, then off. A document that says off without the drain
+// goes enforce → testing for that max_age, then off (never straight off). MTA-STS follows VPN-only mode: while the
 // well-known router isn't reachable from the internet nothing is
 // published, and a drain waits max_age from the later of its start and
 // the moment the policy stopped being reachable.
@@ -115,26 +116,57 @@ func Step(d Domain, in Inputs, now time.Time) Domain {
 			}
 			d.Mode = None
 		}
-		if !in.Reachable && d.HiddenSince == nil {
+		return dwell(d, in, None, now)
+	default:
+		// Off (or anything else): never straight to off from a published
+		// policy. enforce → testing, which dwells for the max_age of the
+		// last published policy (senders cached it), then off; a drain
+		// already under way (mode none) runs to its end.
+		switch d.Mode {
+		case Enforce:
 			t := now
-			d.HiddenSince = &t
-		}
-		start := *d.DrainStart
-		if d.HiddenSince != nil && d.HiddenSince.After(start) {
-			start = *d.HiddenSince
-		}
-		if now.Sub(start) >= time.Duration(d.MaxAge)*time.Second {
+			d.Mode, d.Since, d.DrainStart = Testing, now, &t
+		case Testing:
+			if d.DrainStart == nil {
+				t := now
+				d.DrainStart = &t
+			}
+		case None:
+			if d.DrainStart == nil {
+				t := now
+				d.DrainStart = &t
+			}
+		default:
 			return Domain{Mode: Off, Since: now}
 		}
-		if in.Reachable {
-			d.publish(None, in.MX, MaxAgeTesting, now)
-		} else {
-			d.Policy, d.ID = "", ""
+		if d.MaxAge == 0 {
+			return Domain{Mode: Off, Since: now}
 		}
-		return d
-	default:
+		return dwell(d, in, d.Mode, now)
+	}
+}
+
+// dwell publishes mode (none or testing) until max_age of the last
+// published policy has passed since the later of the drain's start and
+// the moment the policy stopped being reachable, then the domain is off.
+func dwell(d Domain, in Inputs, mode string, now time.Time) Domain {
+	if !in.Reachable && d.HiddenSince == nil {
+		t := now
+		d.HiddenSince = &t
+	}
+	start := *d.DrainStart
+	if d.HiddenSince != nil && d.HiddenSince.After(start) {
+		start = *d.HiddenSince
+	}
+	if now.Sub(start) >= time.Duration(d.MaxAge)*time.Second {
 		return Domain{Mode: Off, Since: now}
 	}
+	if in.Reachable {
+		d.publish(mode, in.MX, MaxAgeTesting, now)
+	} else {
+		d.Policy, d.ID = "", ""
+	}
+	return d
 }
 
 // EnforceReady: the mtasts-enforce action would be accepted now (nil) or
