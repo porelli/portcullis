@@ -68,7 +68,7 @@ type Doc struct {
 	Mode    string    `json:"mode"`
 	Edge    Role      `json:"edge"`
 	People  *People   `json:"people"`
-	Link    *Link     `json:"link,omitempty"`
+	Link    *Link     `json:"link"`
 }
 
 // Write replaces path atomically (temp file in the same directory +
