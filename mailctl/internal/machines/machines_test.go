@@ -599,3 +599,73 @@ func TestDNSHashesFollowTheSet(t *testing.T) {
 		t.Fatalf("status dns %v", st.DNS)
 	}
 }
+
+// Final review M4: a domain whose mail is off for good leaves Stalwart
+// (is_local_domain false: our users' mail goes to its new MX) after its
+// MTA-STS dwell, its DKIM keys first; never the primary domain.
+func TestMailOffDomainRetired(t *testing.T) {
+	e := newEnv(t, nil)
+	e.step(t)
+	if len(e.keys("team-b.example.org")) != 2 {
+		t.Fatal("no team-b keys to start with")
+	}
+	teamB := ""
+	for _, d := range e.f.Objects("Domain", "") {
+		if d["name"] == "team-b.example.org" {
+			teamB = fmt.Sprint(d["id"])
+		}
+	}
+	// A domain Stalwart has and no document names, never published:
+	// gone at the next step.
+	old := e.f.Put("Domain", "", map[string]any{"name": "old.example.net"})
+	e.f.Put("DkimSignature", "", map[string]any{"domainId": old, "selector": "x", "stage": "active"})
+	e.st.Update(func(p *state.Persistent) error {
+		for i := range p.Doc.Domains {
+			if p.Doc.Domains[i].Name == "team-b.example.org" {
+				p.Doc.Domains[i].Mail = state.MailOff
+			}
+		}
+		return nil
+	})
+	e.now = e.now.Add(time.Hour)
+	e.step(t)
+	has := func(name string) bool {
+		for _, d := range e.f.Objects("Domain", "") {
+			if d["name"] == name {
+				return true
+			}
+		}
+		return false
+	}
+	if has("old.example.net") {
+		t.Fatal("old.example.net stayed")
+	}
+	if !has("team-b.example.org") || len(e.keys("team-b.example.org")) != 2 {
+		t.Fatal("team-b went before its MTA-STS dwell was over")
+	}
+	e.now = e.now.Add(mtasts.MaxAgeTesting * time.Second)
+	e.step(t)
+	if has("team-b.example.org") {
+		t.Fatal("team-b stayed after its dwell")
+	}
+	if len(e.keys("team-b.example.org")) != 0 {
+		t.Fatalf("team-b's keys stayed in the state: %+v", e.keys("team-b.example.org"))
+	}
+	for _, k := range e.f.Objects("DkimSignature", "") {
+		if fmt.Sprint(k["domainId"]) == teamB || fmt.Sprint(k["domainId"]) == old {
+			t.Fatalf("a DKIM signature of a retired domain stayed: %v", k)
+		}
+	}
+	if !has("example.com") || len(e.keys("example.com")) != 2 {
+		t.Fatal("the primary domain was touched")
+	}
+	if e.f.Count("x:Action/set InvalidateCaches") == 0 {
+		t.Fatal("no InvalidateCaches after the removal")
+	}
+	// A linked domain (an alias left on it) stays, with the error.
+	gone := e.f.Put("Domain", "", map[string]any{"name": "linked.example.net"})
+	e.f.Put("Account", "", map[string]any{"@type": "User", "name": "x", "domainId": "p", "aliases": map[string]any{"0": map[string]any{"name": "x", "domainId": gone}}})
+	if err := e.m.Step(context.Background()); err == nil || !has("linked.example.net") {
+		t.Fatalf("a linked domain: %v", err)
+	}
+}

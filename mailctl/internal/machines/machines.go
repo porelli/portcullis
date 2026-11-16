@@ -460,6 +460,19 @@ func (m *Machines) Step(ctx context.Context) error {
 		}
 		ks = next
 	}
+	// A domain gone from the document keeps its MTA-STS dwell (cached
+	// policies name our MX) until it is off.
+	listed := map[string]state.Domain{}
+	for _, d := range doc.Domains {
+		listed[d.Name] = d
+	}
+	for name := range sts {
+		if _, ok := listed[name]; !ok {
+			sts[name] = mtasts.Step(sts[name], m.inputs(state.Domain{Name: name, Mail: state.MailOff}, reps, now), now)
+		}
+	}
+	ks, rerrs := m.retireDomains(ctx, doc, ids, ks, sts, listed)
+	errs = append(errs, rerrs...)
 	if err := m.Store.Update(func(s *state.Persistent) error {
 		put(s, extDKIM, ks)
 		put(s, extMTASTS, sts)
@@ -469,6 +482,96 @@ func (m *Machines) Step(ctx context.Context) error {
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// retireDomains removes from Stalwart every domain whose mail is off for
+// good (final review M4): gone from the document or listed off, and its
+// MTA-STS dwell over. Its DKIM signatures are destroyed (Stalwart refuses
+// to destroy a Domain that a DkimSignature or an alias links to, so the
+// keys go first and an alias left by hand keeps it, with the error), then
+// the Domain: is_local_domain is false once it's gone (checked on the
+// builder: RCPT turns from 5.1.1 unknown mailbox to 5.7.1 relay), so mail
+// from our users goes to the domain's new MX instead of bouncing locally.
+// Never the primary domain or the parking domain.
+func (m *Machines) retireDomains(ctx context.Context, doc *state.Doc, ids map[string]string, ks dkim.State, sts map[string]mtasts.Domain, listed map[string]state.Domain) (dkim.State, []error) {
+	var errs []error
+	var gone []string
+	for name := range ids {
+		d, inDoc := listed[name]
+		if name == state.ParkingDomain || name == doc.PrimaryDomain || (inDoc && d.Mail != state.MailOff) {
+			continue
+		}
+		if st, ok := sts[name]; ok && st.Mode != mtasts.Off && st.Mode != "" {
+			continue // still dwelling
+		}
+		gone = append(gone, name)
+	}
+	if len(gone) == 0 {
+		return ks, nil
+	}
+	sort.Strings(gone)
+	var sigs []struct {
+		ID       string `json:"id"`
+		DomainID string `json:"domainId"`
+	}
+	sigIDs, err := m.C.Query(ctx, "DkimSignature", nil)
+	if err == nil && len(sigIDs) > 0 {
+		err = m.C.Get(ctx, "DkimSignature", sigIDs, []string{"id", "domainId"}, &sigs)
+	}
+	if err != nil {
+		return ks, []error{fmt.Errorf("retiring %s: x:DkimSignature: %w", strings.Join(gone, ", "), err)}
+	}
+	changed := false
+	for _, name := range gone {
+		id := ids[name]
+		var destroy []string
+		for _, sg := range sigs {
+			if sg.DomainID == id {
+				destroy = append(destroy, sg.ID)
+			}
+		}
+		if len(destroy) > 0 {
+			r, err := m.C.Set(ctx, "DkimSignature", nil, nil, destroy)
+			if err == nil {
+				err = r.Failed()
+			}
+			if err != nil {
+				errs = append(errs, fmt.Errorf("retiring %s: its DKIM keys: %w", name, err))
+				continue
+			}
+			changed = true
+		}
+		// The keys are retired: out of the state (no record, no rotation).
+		var keep []dkim.Key
+		for _, k := range ks.Keys {
+			if k.Domain != name {
+				keep = append(keep, k)
+			}
+		}
+		ks.Keys = keep
+		delete(ks.RotateNow, name)
+		r, err := m.C.Set(ctx, "Domain", nil, nil, []string{id})
+		if err == nil {
+			err = r.Failed()
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("retiring %s: x:Domain: %w", name, err))
+			continue
+		}
+		changed = true
+		if _, inDoc := listed[name]; !inDoc {
+			delete(sts, name)
+		}
+		if m.Logf != nil {
+			m.Logf("machines: %s: mail is off: the domain and its DKIM keys are removed from Stalwart", name)
+		}
+	}
+	if changed {
+		if err := m.C.Action(ctx, "InvalidateCaches"); err != nil {
+			errs = append(errs, fmt.Errorf("InvalidateCaches: %w", err))
+		}
+	}
+	return ks, errs
 }
 
 // execute runs the DKIM actions. A failed create leaves its key without

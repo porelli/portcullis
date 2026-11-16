@@ -653,3 +653,32 @@ func TestRedisableDuringMassRemoval(t *testing.T) {
 		t.Fatal("root removed")
 	}
 }
+
+// Final review M4: an off domain is never (re)created (the machines
+// remove it from Stalwart after its MTA-STS dwell).
+func TestOffDomainNotCreated(t *testing.T) {
+	e := newEnv(t)
+	d := baseDoc(t)
+	for i := range d.Domains {
+		if d.Domains[i].Name == "team-b.example.org" {
+			d.Domains[i].Mail = state.MailOff
+		}
+	}
+	d.Aliases = nil
+	for i := range d.Accounts {
+		d.Accounts[i].Addresses = d.Accounts[i].Addresses[:1]
+	}
+	var lists []state.List
+	for _, l := range d.Lists {
+		if !strings.HasSuffix(l.Address, "@team-b.example.org") {
+			lists = append(lists, l)
+		}
+	}
+	d.Lists = lists
+	e.mustApply(d)
+	for _, o := range e.f.Objects("Domain", "") {
+		if o["name"] == "team-b.example.org" {
+			t.Fatal("the off domain was created")
+		}
+	}
+}

@@ -135,7 +135,9 @@ func Plan(l *Live, want *state.Doc, former map[string]state.Former, now time.Tim
 		}
 	}
 	for _, d := range want.Domains {
-		if _, ok := l.Domains[d.Name]; !ok {
+		// An off domain is never (re)created: the machines remove it
+		// from Stalwart once its MTA-STS dwell is over (final review M4).
+		if _, ok := l.Domains[d.Name]; !ok && (d.Mail != state.MailOff || d.Name == want.PrimaryDomain) {
 			ops.Domains = append(ops.Domains, d.Name)
 		}
 	}

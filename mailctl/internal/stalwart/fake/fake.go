@@ -308,13 +308,23 @@ func (s *Server) setLocked(method, obj, st string, args map[string]json.RawMessa
 	if len(destroy) > 0 {
 		s.Calls = append(s.Calls, method+" destroy "+strings.Join(destroy, ","))
 		done := []string{}
+		notDone := map[string]any{}
 		for _, id := range destroy {
 			if _, ok := s.objs[st][id]; ok {
+				if obj == "Domain" && s.domainLinkedLocked(id) {
+					// Stalwart v1.1.0 (checked on the builder): a Domain
+					// an alias or a DkimSignature links to stays.
+					notDone[id] = map[string]any{"type": "objectIsLinked"}
+					continue
+				}
 				delete(s.objs[st], id)
 				done = append(done, id)
 			}
 		}
 		res["destroyed"] = done
+		if len(notDone) > 0 {
+			res["notDestroyed"] = notDone
+		}
 	}
 	if len(create) > 0 {
 		cids := make([]string, 0, len(create))
@@ -454,4 +464,31 @@ func dkimPublic(v any) (string, error) {
 		return base64.StdEncoding.EncodeToString(der), err
 	}
 	return "", fmt.Errorf("unsupported key")
+}
+
+// domainLinkedLocked: a DkimSignature, an account's alias or a list
+// names domain id.
+func (s *Server) domainLinkedLocked(id string) bool {
+	for _, o := range s.objs["DkimSignature"] {
+		if fmt.Sprint(o["domainId"]) == id {
+			return true
+		}
+	}
+	for _, a := range s.objs["Account"] {
+		if fmt.Sprint(a["domainId"]) == id {
+			return true
+		}
+		al, _ := a["aliases"].(map[string]any)
+		for _, v := range al {
+			if m, ok := v.(map[string]any); ok && fmt.Sprint(m["domainId"]) == id {
+				return true
+			}
+		}
+	}
+	for _, l := range s.objs["MailingList"] {
+		if fmt.Sprint(l["domainId"]) == id {
+			return true
+		}
+	}
+	return false
 }
