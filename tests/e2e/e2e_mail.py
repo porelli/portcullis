@@ -315,6 +315,11 @@ def find(i: imaplib.IMAP4_SSL, subject: str, folder: str = "INBOX") -> bytes | N
     return None
 
 
+def spam_headers(raw: bytes) -> str:
+    h = BytesHeaderParser().parsebytes(raw)
+    return json.dumps({k: v for k, v in h.items() if k.lower().startswith("x-spam")})[:1500]
+
+
 def wait_mail(login, subject: str, folder: str = "INBOX", seconds: float = 120) -> bytes:
     def got():
         i = login()
@@ -325,7 +330,19 @@ def wait_mail(login, subject: str, folder: str = "INBOX", seconds: float = 120) 
                 i.logout()
             except (imaplib.IMAP4.error, OSError):
                 pass
-    return until(f"{subject!r} in {folder}", got, seconds, every=3)
+    try:
+        return until(f"{subject!r} in {folder}", got, seconds, every=3)
+    except AssertionError:
+        if folder == "INBOX":
+            # Filed as spam? Its scores say why.
+            i = login()
+            try:
+                raw = find(i, subject, junk_folder(i))
+            finally:
+                i.logout()
+            if raw:
+                raise AssertionError(f"{subject!r} landed in Junk, not INBOX: {spam_headers(raw)}") from None
+        raise
 
 
 def junk_folder(i: imaplib.IMAP4_SSL) -> str:
@@ -666,7 +683,13 @@ def spam() -> None:
     gtube = "XJS*C4JDBQADN1.NSBN3*2IDNEN*GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X"
     stage, code, text = smtp25("probe@relay-test.example", f"bob@{DOMAIN}",
                                message("probe@relay-test.example", f"bob@{DOMAIN}", "e2e gtube", gtube + "\r\n"))
-    assert stage == "data" and code == 550 and text.startswith("5.7.1"), f"GTUBE: {stage} {code} {text}"
+    if not (stage == "data" and code == 550 and text.startswith("5.7.1")):
+        i = imap_login(f"bob@{DOMAIN}", state["pw_bob"])
+        try:
+            raw = until("the GTUBE message somewhere", lambda: find(i, "e2e gtube", junk_folder(i)) or find(i, "e2e gtube"), 30)
+        finally:
+            i.logout()
+        raise AssertionError(f"GTUBE: {stage} {code} {text}; its spam headers: {spam_headers(raw)}")
     print(f"    gtube_rejected_at_data: {code} {text[:80]}", flush=True)
     subj = f"URGENT OFFER {uuidlib.uuid4().hex[:6].upper()}"
     # No Date / Message-ID / MIME-Version, all-caps subject: 5 < score < 15
