@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/portcullis/mailctl/internal/bootstrap"
 	"github.com/portcullis/mailctl/internal/spamrules"
@@ -25,5 +26,25 @@ func TestSpamRulesCheck(t *testing.T) {
 	p.Ext[bootstrap.ExtSpamRules] = b
 	if c := spamRulesCheck(p); c.Severity != OK {
 		t.Fatalf("imported: %+v", c)
+	}
+}
+
+// external_lookups: a Problem when lookups were found on and couldn't be
+// turned off.
+func TestLookupsCheck(t *testing.T) {
+	p := state.Persistent{Ext: map[string]json.RawMessage{}}
+	if c := lookupsCheck(p); c.Severity != Info {
+		t.Fatalf("never checked: %+v", c)
+	}
+	now := time.Now()
+	b, _ := json.Marshal(bootstrap.LookupsState{CheckedAt: &now, Error: "x:HttpLookup/set: stalwart: HTTP 500"})
+	p.Ext[bootstrap.ExtLookups] = b
+	if c := lookupsCheck(p); c.Severity != Problem || !strings.Contains(c.Detail, "couldn't be turned off") {
+		t.Fatalf("on and stuck: %+v", c)
+	}
+	b, _ = json.Marshal(bootstrap.LookupsState{CheckedAt: &now})
+	p.Ext[bootstrap.ExtLookups] = b
+	if c := lookupsCheck(p); c.Severity != OK {
+		t.Fatalf("off: %+v", c)
 	}
 }

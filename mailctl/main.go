@@ -389,31 +389,14 @@ func newServer(addr string, h http.Handler) *http.Server {
 		MaxHeaderBytes: 64 << 10}
 }
 
-// keepLookupsOff imports the vendored spam rules until they are in place
-// (bootstrap.EnsureSpamRules: first start, image updates) and re-checks
-// the rules' external lookups after it (contract §19.8: no surprise
-// egress; an import makes them): every minute for the first 10 minutes
-// and while the rules aren't there yet, then every 15 minutes.
+// keepLookupsOff runs bootstrap.SpamRulesPass forever: the vendored
+// spam rules' import, then the external lookups turned off again (contract
+// §19.8: no surprise egress; an import turns them on).
 func keepLookupsOff(ctx context.Context, sw *stalwart.Client, st *state.Store, logf func(string, ...any)) {
-	start := time.Now()
+	lastFast := time.Now()
 	for {
-		cctx, cancel := context.WithTimeout(ctx, time.Minute)
-		rulesOK, rerr := bootstrap.EnsureSpamRules(cctx, sw, st, time.Now())
-		if rerr != nil {
-			logf("spam rules: %v", rerr)
-		}
-		n, err := bootstrap.DisableExternalLookups(cctx, sw)
-		cancel()
-		switch {
-		case err != nil:
-			logf("spam rules: can't check the external lookups: %v", err)
-		case n > 0:
-			logf("spam rules: disabled %d external lookups", n)
-		}
-		wait := 15 * time.Minute
-		if time.Since(start) < 10*time.Minute || !rulesOK {
-			wait = time.Minute
-		}
+		var wait time.Duration
+		lastFast, wait = bootstrap.SpamRulesPass(ctx, sw, st, time.Now(), lastFast, logf)
 		select {
 		case <-ctx.Done():
 			return
