@@ -5129,6 +5129,10 @@ jobs:
           [ -z "$left" ] || { echo "FAIL: restored secrets/ entries not owned by the operator: $left"; exit 1; }
           echo "PASS: Docker → Podman: the .env kept CONTAINER_RUNTIME=podman and the rootless socket, status clean, the CA chain and rt-person are the Docker phase's, secrets/ operator-owned"
 
+      - name: Mail on rootless Podman (port 25, rewritten client addresses, the doctor, delivery, no BlockedIp)
+        timeout-minutes: 20
+        run: bash .github/ci/e2e-podman-mail.sh
+
       - name: Collect logs
         if: failure()
         run: |
