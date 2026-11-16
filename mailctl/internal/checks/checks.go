@@ -106,7 +106,7 @@ func Run(ctx context.Context, d Deps) Result {
 	out = append(out, reportChecks(ctx, d, p.Doc)...)
 	out = append(out, clientIP(d))
 	out = append(out, rateHeld(d, q, qerr, p.Doc)...)
-	out = append(out, dane(ctx, d))
+	out = append(out, dane(ctx, d), spamRulesCheck(p))
 	for i := range out {
 		if out[i].Steps == nil {
 			out[i].Steps = []string{}

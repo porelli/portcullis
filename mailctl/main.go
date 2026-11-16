@@ -215,7 +215,7 @@ func serve(env func(string) string, stderr io.Writer) error {
 		}
 	}()
 	servers = append(servers, adminSrv)
-	go keepLookupsOff(ctx, sw, logger.Printf)
+	go keepLookupsOff(ctx, sw, st, logger.Printf)
 	go runner.Run(ctx)
 	go mc.Loop(ctx)
 	go ck.Loop(ctx, 6*time.Hour)
@@ -389,13 +389,19 @@ func newServer(addr string, h http.Handler) *http.Server {
 		MaxHeaderBytes: 64 << 10}
 }
 
-// keepLookupsOff re-checks the spam rules' external lookups (contract
-// §19.8: no surprise egress): every minute for the first 10 minutes (the
-// first import runs after the first normal start), then every 15 minutes.
-func keepLookupsOff(ctx context.Context, sw *stalwart.Client, logf func(string, ...any)) {
+// keepLookupsOff imports the vendored spam rules until they are in place
+// (bootstrap.EnsureSpamRules: first start, image updates) and re-checks
+// the rules' external lookups after it (contract §19.8: no surprise
+// egress; an import makes them): every minute for the first 10 minutes
+// and while the rules aren't there yet, then every 15 minutes.
+func keepLookupsOff(ctx context.Context, sw *stalwart.Client, st *state.Store, logf func(string, ...any)) {
 	start := time.Now()
 	for {
 		cctx, cancel := context.WithTimeout(ctx, time.Minute)
+		rulesOK, rerr := bootstrap.EnsureSpamRules(cctx, sw, st, time.Now())
+		if rerr != nil {
+			logf("spam rules: %v", rerr)
+		}
 		n, err := bootstrap.DisableExternalLookups(cctx, sw)
 		cancel()
 		switch {
@@ -405,7 +411,7 @@ func keepLookupsOff(ctx context.Context, sw *stalwart.Client, logf func(string, 
 			logf("spam rules: disabled %d external lookups", n)
 		}
 		wait := 15 * time.Minute
-		if time.Since(start) < 10*time.Minute {
+		if time.Since(start) < 10*time.Minute || !rulesOK {
 			wait = time.Minute
 		}
 		select {

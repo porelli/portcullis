@@ -36,6 +36,9 @@ var MailctlRolePermissions = func() []string {
 		"sysActionCreate", "actionReloadSettings", "actionReloadTlsCertificates", "actionInvalidateCaches", "actionReloadLookupStores",
 		"sysDmarcExternalReportGet", "sysDmarcExternalReportQuery", "sysTlsExternalReportGet", "sysTlsExternalReportQuery",
 		"sysSpamSettingsGet", "sysSpamSettingsUpdate",
+		// The vendored rules' import (SpamFilterMaintenance updateRules)
+		// and its proof (every vendored rule name present).
+		"sysTaskCreate", "sysSpamRuleGet", "sysSpamRuleQuery",
 		"sysMemoryLookupKeyGet", "sysMemoryLookupKeyCreate", "sysMemoryLookupKeyUpdate", "sysMemoryLookupKeyDestroy", "sysMemoryLookupKeyQuery",
 		// Settings mailctl edits after the bootstrap: the spam rules'
 		// external lookups (kept disabled), the DNSBL servers and sender
