@@ -691,7 +691,7 @@ def mail_password_flow() -> None:
     imap_login(a, pw).logout()
     for port in (465, 587):
         submit(a, pw, a, [a], message(a, a, f"e2e self {port}"), port=port)
-    out = hub_ok("POST", "/api/directory/users/alice/password", {"generate": True})
+    out = hub_ok("POST", "/api/directory/users/alice/password", {"generate": True}, want=(200, 201))
     lp = out["password"]
     mask(lp)
     assert imap_refused(a, lp), "alice's LLDAP password opened IMAP"
@@ -759,7 +759,7 @@ def revoke_within_8s() -> None:
     row = next(p for p in my_mail(page)["passwords"] if p["label"] == "e2e laptop" and p["status"] == "active")
     i = imap_login(a, pw)
     i.select("INBOX")
-    r = page.request.delete(PEOPLE + f"/api/me/mail/passwords/{row['id']}")
+    r = page.request.delete(PEOPLE + f"/api/me/mail/passwords/{row['id']}", headers={"Content-Type": "application/json"})
     t0 = time.time()
     assert r.status == 204, f"revoke: HTTP {r.status}"
     while time.time() - t0 < SLA_S + 4:
