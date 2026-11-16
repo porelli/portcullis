@@ -599,6 +599,9 @@ mail_disable() {
   hub_env_write
   _mail_domains_flag_off
   ok "Mail is off (its volumes are kept)."
+  # Left in DNS on purpose (harmless: the A still names this server, the
+  # CAA only restricts issuance); the admin may delete them by hand.
+  info "Kept in DNS: $(mail_hostname)'s A / AAAA record and its CAA pin (mail-cert's); delete them by hand if no mail will come back."
 }
 
 # _mail_domains_flag_off — the domains service's env file says mail is

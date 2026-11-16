@@ -5162,6 +5162,8 @@ mte "$MD"'; export DNS_PROVIDER=cloudflare DNS_NOMAIL=true; mail_disable true tr
 expect_eq "mail disable --force, DNS_NOMAIL=true → sets nomail + mail, mail [], nomail on" \
   "$rc:$(jq -c '[.sets, .mail, .nomail]' "$ML/dnsin" 2>/dev/null)" '0:[["nomail","mail"],[],true]'
 mte "$MD"'; export DNS_PROVIDER=cloudflare DNS_NOMAIL=false; mail_disable true true'; rc=$?
+expect_eq "mail disable names the records it leaves for the admin (MAIL_HOSTNAME's A / AAAA and CAA pin)" \
+  "$(grep -c "Kept in DNS: mail.mail.example's A / AAAA record and its CAA pin" "$ML/out")" 1
 expect_eq "mail disable --force, DNS_NOMAIL=false → the mail set alone" \
   "$rc:$(jq -c '[.sets, .mail, .nomail]' "$ML/dnsin" 2>/dev/null)" '0:[["mail"],[],false]'
 mte "$MD"'; mkdir -p "$PORTCULLIS_ROOT/secrets/domains"; printf "DOMAINS_PUBLIC_IPV4=203.0.113.5\nDOMAINS_PUBLIC_IPV6=\nDOMAINS_MAIL=on\n" > "$PORTCULLIS_ROOT/secrets/domains/public-ips.env"
