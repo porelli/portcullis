@@ -86,6 +86,11 @@ paths, dbs = [], {}
 for root, dirs, files in os.walk(SRC):
     dirs.sort()
     paths.append(root)
+    # A link to a directory is listed in dirs and never walked: kept as
+    # the link itself (mail_tls's current -> .gen-*, mail-cert's pair).
+    for d in dirs:
+        if os.path.islink(os.path.join(root, d)):
+            paths.append(os.path.join(root, d))
     for fn in sorted(files):
         paths.append(os.path.join(root, fn))
 skip = set()

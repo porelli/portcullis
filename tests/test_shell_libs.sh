@@ -5082,6 +5082,14 @@ done
 mt 'rt_health() { echo healthy; }; rt_exec() { return 1; }; _mail_timer_state() { echo active; }; mail_status_json > "$ML/sj"'
 expect_eq "mail_status_json: mailctl not answering → problem, mailctl null" "$(jq -c '{p: .problem, m: .mailctl}' "$ML/sj")" '{"p":true,"m":null}'
 
+# A link to a directory survives a volume archive (mail_tls: current ->
+# .gen-*, mail-cert's pair, final review L8).
+SN="$WORK/snap-links"; mkdir -p "$SN/vol/.gen-a"; echo k > "$SN/vol/.gen-a/privkey.pem"
+ln -s .gen-a "$SN/vol/current"; ln -s current/privkey.pem "$SN/vol/privkey.pem"
+printf '%s' "$_BACKUP_PY_SNAPSHOT" | sed "s#SRC = \"/vol\"#SRC = \"$SN/vol\"#" > "$SN/snap.py"
+expect_eq "volume archive: links kept, a link to a directory included" \
+  "$(python3 "$SN/snap.py" 2>/dev/null | tar -tzvf - | awk '$1 ~ /^l/ {print $(NF-2), $NF}' | sort | tr '\n' '|')" \
+  "./current .gen-a|./privkey.pem current/privkey.pem|"
 # Final review L2: the stack-changing commands run one at a time, shared
 # with the timers (a held lock makes a second one wait, then refuse).
 mkdir -p "$ML.lock-root"
