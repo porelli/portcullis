@@ -36,8 +36,8 @@ type dynamicCert struct {
 // domain, a parent of it, or at / under a core host), the leaf's SANs are
 // exactly {<name>, *.<name>} (DNS names only: no IP, email or URI SANs),
 // it is valid now, and the key belongs to it.
-func servable(d *Domain, main string, now time.Time) error {
-	if err := checkName(d.Name, main); err != nil {
+func servable(d *Domain, main, mailHost string, now time.Time) error {
+	if err := checkName(d.Name, main, mailHost); err != nil {
 		return err
 	}
 	if d.CertPEM == "" || d.KeyPEM == "" {
@@ -85,7 +85,7 @@ func servable(d *Domain, main string, now time.Time) error {
 // buildDynamic returns the document for every enrolled domain whose
 // certificate is servable, sorted by name; dropped lists (name, reason)
 // of the others that have a certificate (logged without key material).
-func buildDynamic(domains map[string]*Domain, main string, now time.Time) (dynamicDoc, []string) {
+func buildDynamic(domains map[string]*Domain, main, mailHost string, now time.Time) (dynamicDoc, []string) {
 	doc := dynamicDoc{TLS: dynamicTLS{Certificates: []dynamicCert{}}}
 	names := make([]string, 0, len(domains))
 	for n := range domains {
@@ -102,7 +102,7 @@ func buildDynamic(domains map[string]*Domain, main string, now time.Time) (dynam
 			dropped = append(dropped, fmt.Sprintf("%s: stored under another name (%s)", n, d.Name))
 			continue
 		}
-		if err := servable(d, main, now); err != nil {
+		if err := servable(d, main, mailHost, now); err != nil {
 			dropped = append(dropped, fmt.Sprintf("%s: %v", n, err))
 			continue
 		}

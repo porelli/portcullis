@@ -1,0 +1,54 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:Account/set",
+        {
+          "create": {
+            "m": {
+              "@type": "User",
+              "name": "portcullis-mailctl",
+              "domainId": "c",
+              "description": "Portcullis mailctl",
+              "credentials": {
+                "0": {
+                  "@type": "Password",
+                  "secret": "<redacted>"
+                }
+              },
+              "roles": {
+                "@type": "Custom",
+                "roleIds": {
+                  "b": true
+                }
+              }
+            }
+          }
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:Account/set",
+        {
+          "accountId": "d333333",
+          "created": {
+            "m": {
+              "id": "b"
+            }
+          }
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "6f6b367f"
+  }
+}

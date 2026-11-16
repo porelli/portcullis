@@ -42,6 +42,12 @@ BACKUP_RESTIC_IMAGE="docker.io/restic/restic:0.19.1@sha256:136600b6ff6843d61d355
 # is emptied by restore (contract §11.6: a restored hash could revive a
 # leaked password). It is handled separately in cmd_restore.
 BACKUP_FILE_VOLUMES="lldap_data:$CT_UID_LLDAP:$CT_UID_LLDAP hub_data:$CT_UID_HUB:$CT_UID_HUB traefik_acme:0:0 domains_data:$CT_UID_DOMAINS:$CT_UID_DOMAINS mcp_gate_data:$CT_UID_MCP_GATE:$CT_UID_HUB group_gate_data:$CT_UID_GROUP_GATE:$CT_UID_HUB"
+# Mail (profile mail): mailctl's state, the mail certificate's ACME account
+# and files are plain files, archived online (in BACKUP_FILE_VOLUMES, so a
+# missing volume is skipped); Stalwart's store (RocksDB) and its config are
+# archived with mail stopped (M11, _backup_mail_data).
+BACKUP_FILE_VOLUMES="$BACKUP_FILE_VOLUMES mailctl_data:$CT_UID_MAILCTL:$CT_UID_MAILCTL mail_acme:$CT_UID_DOMAINS:$CT_UID_DOMAINS mail_tls:$CT_UID_DOMAINS:$CT_UID_MAIL"
+BACKUP_MAIL_STOPPED_VOLUMES="mail_data:$CT_UID_MAIL:$CT_UID_MAIL mail_etc:$CT_UID_MAIL:$CT_UID_MAIL"
 # restic: fixed host + path, so snapshots of every run form one series.
 BACKUP_RESTIC_HOST="portcullis"
 BACKUP_SNAPSHOT_PATH="/portcullis-backup"
@@ -80,6 +86,11 @@ paths, dbs = [], {}
 for root, dirs, files in os.walk(SRC):
     dirs.sort()
     paths.append(root)
+    # A link to a directory is listed in dirs and never walked: kept as
+    # the link itself (mail_tls's current -> .gen-*, mail-cert's pair).
+    for d in dirs:
+        if os.path.islink(os.path.join(root, d)):
+            paths.append(os.path.join(root, d))
     for fn in sorted(files):
         paths.append(os.path.join(root, fn))
 skip = set()
@@ -156,7 +167,10 @@ PY
 
 _backup_load_cfg() {
   _rt_docker_only
-  [ -n "$_BACKUP_CFG" ] || _BACKUP_CFG="$(dc config --format json 2>/dev/null)" \
+  # Every profile: a volume only a one-shot of another profile mounts
+  # (mail_acme: mail-cert, tools) is in the config only then. Volumes are
+  # archived only when they exist.
+  [ -n "$_BACKUP_CFG" ] || _BACKUP_CFG="$(dc --profile '*' config --format json 2>/dev/null)" \
     || fail "docker compose config failed (is .env complete?)"
   [ -n "$_BACKUP_CFG" ] || fail "docker compose config returned nothing"
 }
@@ -352,6 +366,7 @@ _backup_create_docker() {
     printf ' %sdone%s %s\n' "$C_GREEN" "$C_NC" "$(cat "$work/.err")"
     rm -f "$work/.err"
   done
+  _backup_mail_data "$work"
   for f in "$work"/*.tar.gz; do
     [ -f "$f" ] && { gzip -t "$f" || fail "$f is corrupt"; }
   done
@@ -369,6 +384,61 @@ _backup_create_docker() {
   _backup_prune_local
   ok "Backup saved to $dir"
   warn "It contains secrets/ (Vault root token + unseal key): protect it like the keys themselves."
+}
+
+# _backup_mail_data <work> — Stalwart's store and config (M11): mail is
+# stopped for the copy (RocksDB isn't copied while written) and started
+# again afterwards, also when the copy fails. Only with the mail profile.
+_backup_mail_data() {
+  local work="$1" spec key uid gid full was=false hub=false rc=0 failed=""
+  _rt_docker_only
+  mail_profile_on || return 0
+  full="$(_volume_name mail_data)"
+  [ -n "$full" ] && docker volume inspect "$full" >/dev/null 2>&1 || return 0
+  if rt_running mail; then
+    was=true
+    # The Hub restarts mail on a revocation (its own engine path, outside
+    # this CLI's lock): it stops for the copy too, so nothing restarts mail
+    # mid-copy (final review L3), and starts again afterwards.
+    if rt_running hub; then
+      hub=true
+      rt_stop hub >/dev/null 2>&1 || { rt_start hub >/dev/null 2>&1 || true; fail "could not stop the Hub for mail's backup (it keeps running)"; }
+    fi
+    printf '  %-26s' "mail (stopped for the copy)"
+    rt_stop mail >/dev/null 2>&1 || {
+      rt_start mail >/dev/null 2>&1 || true
+      [ "$hub" != true ] || rt_start hub >/dev/null 2>&1 || true
+      fail "could not stop mail for its backup (it keeps running)"
+    }
+    printf ' %sstopped%s\n' "$C_GREEN" "$C_NC"
+  fi
+  for spec in $BACKUP_MAIL_STOPPED_VOLUMES; do
+    IFS=: read -r key uid gid <<< "$spec"
+    full="$(_volume_name "$key")"
+    [ -n "$full" ] && docker volume inspect "$full" >/dev/null 2>&1 || continue
+    printf '  %-26s' "$key"
+    if ! _backup_volume_files "$full" "$uid" "$gid" > "$work/$key.tar.gz" 2>"$work/.err"; then
+      rc=1 failed="$key"
+      break
+    fi
+    printf ' %sdone%s %s\n' "$C_GREEN" "$C_NC" "$(cat "$work/.err")"
+  done
+  # Whatever started mail meanwhile tore the copy: refused.
+  if [ "$rc" = 0 ] && [ "$was" = true ] && rt_running mail; then
+    rc=1 failed="mail_data (mail was started during its copy)"
+    : > "$work/.err"
+  fi
+  if [ "$was" = true ]; then
+    rt_start mail >/dev/null 2>&1 || warn "mail could not be started again after its backup: ./portcullis up"
+  fi
+  if [ "$hub" = true ]; then
+    rt_start hub >/dev/null 2>&1 || warn "the Hub could not be started again after mail's backup: ./portcullis up"
+  fi
+  if [ "$rc" != 0 ]; then
+    cat "$work/.err" >&2
+    fail "could not back up volume $failed (mail was started again)"
+  fi
+  rm -f "$work/.err"
 }
 
 backup_list() {
@@ -650,6 +720,9 @@ _restore_vault() {
 # restore deletes them (older backups, or the same host: can't tell).
 _strip_host_files() {
   rm -f "$1/domains/last-public-ipv4" "$1/domains/last-public-ipv6" "$1/domains/acme-relax.env"
+  # A recovery session's admin and the image stamp (P51): never archived,
+  # never restored.
+  rm -f "$1/mail/recovery.env" "$1/mail/update.env" "$1/mail/.stalwart-image"
   # The CLI's Kubernetes state (values, digests, the setup record) belongs
   # to this host's cluster: never in a backup, never restored.
   rm -rf "$1/kube"
@@ -676,6 +749,12 @@ _restore_secrets() {
   fi
   chmod 700 "$PORTCULLIS_ROOT/secrets"
   secrets_fix_perms
+}
+
+# _restore_mail_outcome — after the restore: the mail passwords couldn't
+# be voided → mail stayed stopped, and restore fails saying so (M7).
+_restore_mail_outcome() {
+  [ "${RESTORE_MAIL_UNVOIDED:-false}" != true ] || fail "mail passwords could not be voided: mail stays stopped (./portcullis mail enable to retry)"
 }
 
 # backup_restore <dir> <assume-yes>
@@ -952,7 +1031,13 @@ _backup_restore_docker() {
   _restore_pg "$dir"
   _restore_vault "$dir"
 
-  for spec in $BACKUP_FILE_VOLUMES; do
+  # The mail store comes back with its old mail passwords: the marker first,
+  # so no start path serves them before the void (M7). Also whenever the
+  # mail profile is on without a mail store in the backup (final review
+  # M5): the live store's passwords don't match the restored Hub either —
+  # a restore voids every mail password either way.
+  _restore_mail_marker "$dir"
+  for spec in $BACKUP_FILE_VOLUMES $BACKUP_MAIL_STOPPED_VOLUMES; do
     IFS=: read -r key uid gid <<< "$spec"
     [ -f "$dir/$key.tar.gz" ] || continue
     full="$(_volume_name "$key")"
@@ -992,20 +1077,55 @@ _backup_restore_docker() {
   # Refreshes the enroll AppRole creds and the metrics token, verifies the
   # restored root token works.
   vault_init false
+  # Mail (M7): every mail password of the restored store is voided in a
+  # recovery session before mail serves anyone. A failure keeps mail (and
+  # mailctl) stopped: the rest of the stack starts without the profile.
+  local mail_unvoided=false
+  _restore_mail_void "$dir" || mail_unvoided=true
   # The core must come up; a non-core service (e.g. a Hub image that cannot
   # be pulled right now) must not abort a restore.
   # The local images are built on both runtimes, as up / upgrade do
   # (rt_up: docker --build, podman podman build + --no-build), so
   # a restore never starts a container from an image older than this
   # checkout; compose recreates a container whose image content changed.
-  rt_up || warn "some services did not start — check ./portcullis status"
+  if [ "$mail_unvoided" = true ]; then
+    COMPOSE_PROFILES="$(_mail_profiles_without_mail)" rt_up || warn "some services did not start — check ./portcullis status"
+    rt_stop mail mailctl >/dev/null 2>&1 || true
+  else
+    rt_up || warn "some services did not start — check ./portcullis status"
+  fi
   wait_healthy 300 vault postgres lldap keycloak
   ok "Restore complete.${pre:+ Previous .env/secrets/certs: $pre.} Verify with ./portcullis status"
   if [ -n "$RESTORE_STOPPED_APPS" ]; then
     warn "Taken down for the restore and NOT started again: $RESTORE_STOPPED_APPS. Their file-share passwords were voided by the restore (people create new ones on My apps). Start each one again from the Hub: its drift shows it as not running (resolve the drift there, or restart the app)."
   fi
+  # restore's caller fails on it, after the last line below (M7).
+  RESTORE_MAIL_UNVOIDED="$mail_unvoided"
   # Always the last line, on both restore paths (local and --from-offsite).
   _restore_lost_devices_note
+}
+
+# _restore_mail_marker <backup dir> — the void-pending marker, before any
+# mail volume comes back: when the backup holds a mail store, and whenever
+# the mail profile is on (final review M5: the live store's passwords then
+# don't match the restored Hub; a restore voids every mail password).
+_restore_mail_marker() {
+  [ -f "$1/mail_data.tar.gz" ] || mail_profile_on || return 0
+  (umask 077 && mkdir -p "$(_mail_dir)/gate" && : > "$(mail_void_marker)") || fail "could not write $(mail_void_marker)"
+  chmod 600 "$(mail_void_marker)"
+}
+
+# _restore_mail_void <backup dir> — M7: with the mail profile and the
+# void-pending marker (written before the mail store was restored), every
+# restored mail password is voided in a recovery session before mail serves
+# anyone. Returns 1 (mail and mailctl stopped, the marker kept) when that
+# fails.
+_restore_mail_void() {
+  # Without the profile the marker stays: mail enable voids first.
+  mail_profile_on && mail_void_pending || return 0
+  if mail_void_if_pending; then return 0; fi
+  rt_stop mail mailctl >/dev/null 2>&1 || true
+  return 1
 }
 
 # _restore_lost_devices_note — restore's last line (contract §8.1
@@ -1297,6 +1417,7 @@ cmd_restore() {
     info "Restoring snapshot $snap from $BACKUP_REPOSITORY into $tmp..."
     dir="$(_restic_restore_to "$snap" "$tmp")"
     backup_restore "$dir" "$yes" "$allow"
+    _restore_mail_outcome
     return
   fi
   [ -n "$dir" ] || usage_error restore "expected <backup-dir> or --from-offsite (see --list)"
@@ -1308,4 +1429,5 @@ cmd_restore() {
   need_env
   restore_runtime_from_host
   backup_restore "$dir" "$yes" "$allow"
+  _restore_mail_outcome
 }

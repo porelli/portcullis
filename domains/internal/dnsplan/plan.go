@@ -28,8 +28,9 @@ const (
 	SetNoMail  = "nomail"
 )
 
-// Sets lists every set, in apply order.
-var Sets = []string{SetAddress, SetCAA, SetNoMail}
+// Sets lists every set, in apply order (mail last: on removal nomail is
+// written first and the mail set leaves nomail's records alone).
+var Sets = []string{SetAddress, SetCAA, SetNoMail, SetMail}
 
 // TTLs per set (spec §3).
 const (
@@ -124,10 +125,23 @@ type Spec struct {
 	AccountURI string
 	IODEF      string
 	NoMail     bool
+	// Mail: the mail set's wanted records (mail.go); non-empty = mail is
+	// on and replaces nomail (no nomail items, nomail never applied).
+	// Empty with the mail set applied removes the records it owns.
+	Mail []MailRecord
+	// MailHost: MAIL_HOSTNAME (main domain only, dns-tool's mail_hostname):
+	// its HELO SPF and TLSA are the mail set's (an empty set removes them).
+	MailHost string
+	// FormerMailHosts: earlier MAIL_HOSTNAMEs (recorded by the CLI): a live
+	// MX target is adopted as a former host only when it is one of them.
+	FormerMailHosts []string
 	// Owned: the CAA entries an enrolled domain wrote (removed with CAA
 	// off). Main: the main domain (removal by signature instead).
 	Owned []Ref
 	Main  bool
+	// NoWild: the CAA entries are issue only, no issuewild (mail-cert's
+	// pin at MAIL_HOSTNAME, a single-name certificate).
+	NoWild bool
 }
 
 // Provider is what the plan needs from a libdns provider.
@@ -148,20 +162,43 @@ type Input struct {
 	DNSSEC       dnssec.StatusReader
 	CanSign      bool
 	ProviderName string
-	Resolvers    []string
-	Now          time.Time
+	// NoWrite: record types the provider can't write (the mail set leaves
+	// them to a manual step).
+	NoWrite   []string
+	Resolvers []string
+	Now       time.Time
 }
 
 func fqdn(n string) string { return dns.Fqdn(strings.ToLower(strings.TrimSuffix(n, "."))) }
 
 func bare(n string) string { return strings.TrimSuffix(strings.ToLower(n), ".") }
 
+// addressNames are the names the address set owns: the domain, its
+// wildcard and, with mail on, MAIL_HOSTNAME when it is under the domain.
+// The mail set gives MAIL_HOSTNAME records of its own (its HELO SPF,
+// TLSA; mail-cert's CAA pin), and a name with any record of its own is no
+// longer answered from the wildcard (RFC 4592): without its own A/AAAA
+// the MX target would have no address.
+func addressNames(s Spec, d string) []string {
+	out := []string{d, "*." + d}
+	if s.MailHost != "" {
+		h := bare(s.MailHost)
+		if strings.HasSuffix(d, ".") {
+			h = fqdn(h) // d's form: Wanted's names are absolute, the items' bare
+		}
+		if h != d && strings.HasSuffix(h, "."+d) && !strings.HasPrefix(h, "*.") {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
 // Wanted is every record Portcullis wants, by set (absolute names with a
 // trailing dot). No caa key with CAA off or an unknown CA.
 func Wanted(s Spec) map[string][]libdns.Record {
 	d := fqdn(s.Name)
 	out := map[string][]libdns.Record{}
-	for _, n := range []string{d, "*." + d} {
+	for _, n := range addressNames(s, d) {
 		for _, ip := range []netip.Addr{s.IPv4, s.IPv6} {
 			if ip.IsValid() {
 				out[SetAddress] = append(out[SetAddress], libdns.Address{Name: n, TTL: TTLAddress, IP: ip})
@@ -174,7 +211,11 @@ func Wanted(s Spec) map[string][]libdns.Record {
 			out[SetCAA] = append(out[SetCAA], c)
 		}
 	}
-	if s.NoMail {
+	if len(s.Mail) > 0 {
+		if recs, err := mailRecords(s.Mail); err == nil {
+			out[SetMail] = recs
+		}
+	} else if s.NoMail {
 		out[SetNoMail] = []libdns.Record{
 			libdns.MX{Name: d, TTL: TTLNoMail, Preference: 0, Target: "."},
 			libdns.TXT{Name: d, TTL: TTLNoMail, Text: spfNone},
@@ -201,18 +242,26 @@ type liveRec struct {
 	rr  libdns.RR
 }
 
-func providerRecords(ctx context.Context, p Provider, zone, name string) ([]liveRec, error) {
+// providerRecords: the provider's records at or under name (and at or
+// under each extra name: MAIL_HOSTNAME outside <d>).
+func providerRecords(ctx context.Context, p Provider, zone, name string, extra ...string) ([]liveRec, error) {
 	recs, err := p.GetRecords(ctx, zone)
 	if err != nil {
 		return nil, err
 	}
-	d := bare(name)
+	roots := []string{bare(name)}
+	for _, x := range extra {
+		roots = append(roots, bare(x))
+	}
 	var out []liveRec
 	for _, r := range recs {
 		rr := r.RR()
 		abs := bare(libdns.AbsoluteName(rr.Name, zone))
-		if abs == d || strings.HasSuffix(abs, "."+d) {
-			out = append(out, liveRec{abs: abs, rr: rr})
+		for _, d := range roots {
+			if under(abs, d) {
+				out = append(out, liveRec{abs: abs, rr: rr})
+				break
+			}
 		}
 	}
 	return out, nil
@@ -248,6 +297,12 @@ func rrData(rr dns.RR) (string, bool) {
 		return fmt.Sprintf("%d %s", v.Preference, v.Mx), true
 	case *dns.TXT:
 		return strings.Join(v.Txt, ""), true
+	case *dns.SRV:
+		return fmt.Sprintf("%d %d %d %s", v.Priority, v.Weight, v.Port, v.Target), true
+	case *dns.TLSA:
+		return fmt.Sprintf("%d %d %d %s", v.Usage, v.Selector, v.MatchingType, v.Certificate), true
+	case *dns.CNAME:
+		return v.Target, true
 	}
 	return "", false
 }
@@ -319,7 +374,7 @@ func Build(ctx context.Context, in Input) Plan {
 		if zone == "" {
 			liveErr = errors.New("the DNS zone of " + d + " wasn't found")
 		} else {
-			live, liveErr = providerRecords(ctx, in.Provider, zone, d)
+			live, liveErr = providerRecords(ctx, in.Provider, zone, d, specHosts(s, d)...)
 		}
 		if liveErr != nil {
 			p.Items = append(p.Items, Item{Set: SetAddress, Name: d, Type: "", Want: []string{}, Live: []string{}, Status: StatusUnknown, Severity: SevWarning, Fix: FixNone,
@@ -333,7 +388,12 @@ func Build(ctx context.Context, in Input) Plan {
 	// questions could hit different caches (anycast) and disagree.
 	caaView := lookup(ctx, in.Resolvers, d, dns.TypeCAA)
 	p.Items = append(p.Items, caaItems(ctx, in, d, zone, fix, live, caaView)...)
-	p.Items = append(p.Items, nomailItems(ctx, in, d, fix)...)
+	if len(s.Mail) > 0 {
+		p.Items = append(p.Items, mailItems(ctx, in, d, fix, live)...)
+	}
+	if len(s.Mail) == 0 {
+		p.Items = append(p.Items, nomailItems(ctx, in, d, fix)...)
+	}
 	if in.Provider != nil && liveErr == nil {
 		p.Items = append(p.Items, foreignItems(ctx, in, d, live)...)
 	}
@@ -457,9 +517,9 @@ func cloudflareAddr(s string) bool {
 func addressItems(ctx context.Context, in Input, d string, fix Fix, cnameAt func(string) []libdns.RR) []Item {
 	s := in.Spec
 	var out []Item
-	for _, n := range []string{d, "*." + d} {
+	for _, n := range addressNames(s, d) {
 		qname := n
-		if n != d {
+		if n == "*."+d {
 			qname = ProbeLabel + "." + d
 		}
 		for _, t := range []struct {
@@ -731,9 +791,14 @@ func nomailItems(ctx context.Context, in Input, d string, fix Fix) []Item {
 
 func foreignItems(ctx context.Context, in Input, d string, live []liveRec) []Item {
 	var out []Item
+	hosts := specHosts(in.Spec, d)
 	for _, l := range live {
 		t := strings.ToUpper(l.rr.Type)
 		own := l.abs == d || l.abs == "*."+d
+		// Names the mail set owns are judged by it (P44), never foreign.
+		if len(in.Spec.Mail) > 0 && t == "CNAME" && mailOwns(d, hosts, l.abs, t) {
+			continue
+		}
 		it := Item{Set: SetAddress, Name: l.abs, Type: t, Want: []string{}, Live: []string{l.rr.Data}, Status: StatusForeign, Fix: FixManual}
 		switch {
 		case t == "TXT" && l.abs == "_acme-challenge."+d:
@@ -839,6 +904,12 @@ func rel(r libdns.Record, zone string) libdns.Record {
 	case libdns.TXT:
 		v.Name = libdns.RelativeName(v.Name, zone)
 		return v
+	case libdns.CNAME:
+		v.Name = libdns.RelativeName(v.Name, zone)
+		return v
+	case libdns.SRV:
+		v.Name = libdns.RelativeName(v.Name, zone)
+		return v
 	}
 	rr := r.RR()
 	rr.Name = libdns.RelativeName(rr.Name, zone)
@@ -860,9 +931,16 @@ func DataKey(typ, data string) string {
 	case libdns.MX:
 		return fmt.Sprintf("MX %d %s", v.Preference, fqdn(v.Target))
 	case libdns.TXT:
-		return "TXT " + v.Text
+		return "TXT " + txtJoin(v.Text)
 	case libdns.CNAME:
 		return "CNAME " + fqdn(v.Target)
+	case libdns.SRV:
+		return fmt.Sprintf("SRV %d %d %d %s", v.Priority, v.Weight, v.Port, canonTarget(v.Target))
+	}
+	if strings.EqualFold(typ, "TLSA") {
+		if c, err := canonMail("TLSA", data); err == nil {
+			return "TLSA " + c
+		}
 	}
 	return typ + " " + strings.TrimSpace(data)
 }
@@ -919,8 +997,10 @@ func parsedRR(rr libdns.RR) libdns.Record {
 // Apply writes the given sets through the provider: written are the
 // records Portcullis now owns (refs for tracking), removed the ones it
 // deleted (or, CAA off, owned refs that are no longer live). It touches
-// only <d>, *.<d> and _dmarc.<d>, never NS / SOA, and never uses libdns
-// SetRecords (see syncSet).
+// only <d>, *.<d> and _dmarc.<d> and the mail set's own names (mail.go:
+// _mta-sts, _smtp._tls, the DKIM selectors, the SRV names, the mail
+// CNAMEs, and on the main domain MAIL_HOSTNAME and its TLSA owner), never
+// NS / SOA, and never uses libdns SetRecords (see syncSet).
 func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref, err error) {
 	if in.Provider == nil {
 		return nil, nil, errors.New("no provider: the records must be created by hand")
@@ -937,7 +1017,19 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 		}
 	}
 	zone = dns.Fqdn(zone)
-	live, err := providerRecords(ctx, in.Provider, zone, d)
+	if contains(sets, SetMail) {
+		var err error
+		switch {
+		case s.Main:
+			err = ValidateMainMail(bare(d), s.MailHost, s.Mail)
+		case len(s.Mail) > 0:
+			err = ValidateMail(bare(d), s.Mail)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	live, err := providerRecords(ctx, in.Provider, zone, d, specHosts(s, bare(d))...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("reading the records of %s: %w", bare(d), err)
 	}
@@ -950,7 +1042,7 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 	for _, set := range sets {
 		switch set {
 		case SetAddress:
-			for _, n := range []string{d, "*." + d} {
+			for _, n := range addressNames(s, d) {
 				if c := pick(live, n, "CNAME"); len(c) > 0 {
 					return written, removed, fmt.Errorf("a CNAME %s → %s exists: remove it first (Portcullis doesn't put A/AAAA records next to a CNAME)", bare(n), c[0].Data)
 				}
@@ -961,7 +1053,7 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 			for _, r := range want[SetAddress] {
 				written = append(written, RefOf(r, zone))
 			}
-			for _, n := range []string{d, "*." + d} {
+			for _, n := range addressNames(s, d) {
 				for _, typ := range []string{"A", "AAAA"} {
 					var w []libdns.Record
 					for _, r := range want[SetAddress] {
@@ -1036,8 +1128,8 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 				return written, removed, fmt.Errorf("setting the CAA records of %s: %w", bare(d), err)
 			}
 		case SetNoMail:
-			if !s.NoMail {
-				continue
+			if !s.NoMail || len(s.Mail) > 0 {
+				continue // off, or replaced by the mail set
 			}
 			for _, r := range want[SetNoMail] {
 				written = append(written, RefOf(r, zone))
@@ -1062,6 +1154,12 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 				if err != nil {
 					return written, removed, fmt.Errorf("setting the nomail records of %s: %w", bare(d), err)
 				}
+			}
+		case SetMail:
+			w, r, err := applyMail(ctx, in, bare(d), zone, live)
+			written, removed = append(written, w...), append(removed, r...)
+			if err != nil {
+				return written, removed, err
 			}
 		default:
 			return written, removed, fmt.Errorf("unknown record set %q (one of %s)", set, strings.Join(Sets, ", "))

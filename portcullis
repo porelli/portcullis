@@ -20,7 +20,7 @@ PORTCULLIS_ROOT="${PORTCULLIS_ROOT:-$PORTCULLIS_HOME}"
 PORTCULLIS_CALLER_PWD="$PWD"
 unset _self _dir
 
-for _lib in common network vault pki certs keycloak users domains mcpgate sessions dns config status monitoring backup signin vpn stack; do
+for _lib in common network vault pki certs keycloak users domains mcpgate sessions dns config status monitoring backup signin vpn mail stack; do
   # shellcheck source=/dev/null
   source "$PORTCULLIS_LIB/$_lib.sh"
 done
@@ -72,6 +72,17 @@ VPN:
   vpn devices                 List VPN devices of every provider
   vpn revoke                  Remove a built-in VPN device
 
+Mail:
+  mail enable                 Turn the mail server on (Stalwart, the mail certificate, bootstrap)
+  mail disable                Turn mail off for every domain (drains first)
+  mail status                 Mail status: certificate, DKIM, MTA-STS, DMARC, queue, checks
+  mail test                   Send a signed test message
+  mail dkim                   dkim rotate <domain>: a new DKIM key now
+  mail cert                   Issue or renew the mail certificate
+  mail rotate                 The daily step: certificate, DKIM / MTA-STS / TLSA, records
+  mail schedule               Install the daily mail timer (--systemd)
+  mail export                 Export a former account's mailbox as mbox
+
 Kubernetes:
   kube check                  Refresh the cluster check the Hub reads (init's timer: every 6 h)
 
@@ -97,8 +108,9 @@ main() {
     "") help_main >&2; return 2 ;;
   esac
   cd "$PORTCULLIS_ROOT"
+  cli_lock "$cmd" "$@"
   case "$cmd" in
-    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert|signin|vpn|kube)
+    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert|signin|vpn|mail|kube)
       "cmd_$cmd" "$@" ;;
     lldap-ui) cmd_lldap_ui "$@" ;;
     *)

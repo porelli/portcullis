@@ -15,6 +15,8 @@
 
 RT_PODMAN_MIN="5.4"
 RT_PORT_START_MAX=80
+# With the mail profile: 25 / 465 / 587 are published too (contract §19.4).
+RT_PORT_START_MAX_MAIL=25
 RT_MIN_IDS=65536
 
 # runtime_name — docker|podman|kubernetes from CONTAINER_RUNTIME; anything
@@ -360,6 +362,14 @@ runtime_host_checks() {
   else
     _rt_chk fail "net.ipv4.ip_unprivileged_port_start = $pstart: Traefik publishes 80 and 443 (sysctl -w net.ipv4.ip_unprivileged_port_start=$RT_PORT_START_MAX, and keep it in /etc/sysctl.d/)"
   fi
+  case ",${COMPOSE_PROFILES:-}," in
+    *,mail,*)
+      if [ "$pstart" -le "$RT_PORT_START_MAX_MAIL" ]; then
+        _rt_chk ok "net.ipv4.ip_unprivileged_port_start = $pstart: mail can publish 25, 465 and 587"
+      else
+        _rt_chk fail "net.ipv4.ip_unprivileged_port_start = $pstart: mail publishes ports 25, 465 and 587 (sysctl -w net.ipv4.ip_unprivileged_port_start=$RT_PORT_START_MAX_MAIL, and keep it in /etc/sysctl.d/; unprivileged users may then bind 25-79)"
+      fi ;;
+  esac
   if command -v nft >/dev/null 2>&1 || command -v iptables >/dev/null 2>&1; then
     _rt_chk ok "nft or iptables present (rootlessport keeps remote TCP client addresses)"
   else
@@ -524,6 +534,8 @@ runtime_build_all() {
 stack_compose_up() {
   local rc=0 base chk i svc why wait="${STACK_UP_WAIT:-300}"
   _rt_docker_only
+  _mail_void_gate "$@"
+  if [ "${_MAIL_GATED:-}" = 1 ]; then local -x COMPOSE_PROFILES="$_MAIL_GATED_PROFILES"; fi
   runtime_build_all || return 1
   dc up -d --no-build "$@" || rc=$?
   [ "$rc" -ne 0 ] || return 0

@@ -1,0 +1,41 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:DkimSignature/set",
+        {
+          "update": {
+            "jout7jdgadqa": {
+              "stage": "active"
+            },
+            "jout7jdgaeaa": {
+              "stage": "active"
+            }
+          }
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:DkimSignature/set",
+        {
+          "accountId": "b",
+          "updated": {
+            "jout7jdgadqa": null,
+            "jout7jdgaeaa": null
+          }
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "fc380151"
+  }
+}

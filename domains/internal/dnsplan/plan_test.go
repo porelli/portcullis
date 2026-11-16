@@ -585,3 +585,31 @@ func TestWouldIssueClimbsFromItemView(t *testing.T) {
 		t.Fatal("would_issue under a parent CAA allowing only another CA")
 	}
 }
+
+// With mail on, MAIL_HOSTNAME under the domain gets its own address
+// records in the address set: its HELO SPF / TLSA / CAA make it a name of
+// its own, which the wildcard no longer answers (RFC 4592). A host
+// outside the domain is never written.
+func TestAddressSetOwnsMailHostname(t *testing.T) {
+	e := newPlanEnv(t)
+	mh := "mail." + pd
+	e.in.Spec.MailHost = mh
+	e.zone.Set(mh, libdns.TXT{Name: "mail.portcullis", Text: "v=spf1 a -all", TTL: time.Hour}.RR())
+	find(t, Build(context.Background(), e.in), SetAddress, mh, "A", StatusMissing)
+	if _, _, err := Apply(context.Background(), e.in, []string{SetAddress}); err != nil {
+		t.Fatal(err)
+	}
+	if got := rrs(e.zone, mh, "A"); len(got) != 1 || got[0] != ipv4+" 5m0s" {
+		t.Fatalf("A at %s = %v", mh, got)
+	}
+	if got := rrs(e.zone, mh, "TXT"); len(got) != 1 {
+		t.Fatalf("the HELO SPF at %s changed: %v", mh, got)
+	}
+	find(t, Build(context.Background(), e.in), SetAddress, mh, "A", StatusOK)
+	e.in.Spec.MailHost = "mx.elsewhere.test"
+	for _, it := range items(Build(context.Background(), e.in), SetAddress) {
+		if strings.Contains(it.Name, "elsewhere") {
+			t.Fatalf("a host outside the domain in the address set: %+v", it)
+		}
+	}
+}

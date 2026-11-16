@@ -1,0 +1,48 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:Domain/set",
+        {
+          "create": {
+            "d2": {
+              "name": "portcullis-former.internal",
+              "dkimManagement": {
+                "@type": "Manual"
+              },
+              "certificateManagement": {
+                "@type": "Manual"
+              },
+              "dnsManagement": {
+                "@type": "Manual"
+              }
+            }
+          }
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:Domain/set",
+        {
+          "accountId": "d333333",
+          "created": {
+            "d2": {
+              "id": "c"
+            }
+          }
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "6f6b367f"
+  }
+}

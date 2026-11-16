@@ -621,7 +621,7 @@ func TestServesOnlyOwnCertificates(t *testing.T) {
 	add("leaving.example.org", []string{"leaving.example.org", "*.leaving.example.org"}, nil, nb, na)
 	domains["leaving.example.org"].Deleting = true
 
-	doc, dropped := buildDynamic(domains, testMain, now)
+	doc, dropped := buildDynamic(domains, testMain, "", now)
 	b, _ := json.Marshal(doc)
 	var raw map[string]any
 	json.Unmarshal(b, &raw)
@@ -643,7 +643,7 @@ func TestServesOnlyOwnCertificates(t *testing.T) {
 		}
 	}
 	// Nothing at all: still the bare shape.
-	empty, _ := buildDynamic(map[string]*Domain{}, testMain, now)
+	empty, _ := buildDynamic(map[string]*Domain{}, testMain, "", now)
 	if b, _ := json.Marshal(empty); string(b) != `{"tls":{"certificates":[]}}` {
 		t.Fatalf("empty document %s", b)
 	}
@@ -1760,6 +1760,27 @@ func TestMainPlanReadOnly(t *testing.T) {
 	}
 }
 
+// With mail on, the main plan's address set lists MAIL_HOSTNAME's A
+// (the Hub reads this plan): never as a stray record, never without mail.
+func TestMainPlanMailHostAddress(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		e := newEnvWith(t, false, func(c *Config) { c.MailOn = on })
+		host := "mail." + testMain
+		got := false
+		for _, it := range e.planOf("/main/dns?refresh=1").Items {
+			if it.Name == host && it.Type == "A" {
+				if it.Set != dnsplan.SetAddress {
+					t.Fatalf("mail %v: %s A in set %s", on, host, it.Set)
+				}
+				got = true
+			}
+		}
+		if got != on {
+			t.Fatalf("mail %v: %s's A item listed = %v", on, host, got)
+		}
+	}
+}
+
 func TestAccountEndpoint(t *testing.T) {
 	e := newEnv(t, false)
 	var a map[string]string
@@ -2077,5 +2098,204 @@ func TestPlanHealthyWouldIssue(t *testing.T) {
 	pl.CAA.Issuer = "" // unknown CA: would_issue can't be judged
 	if planHealthy(pl) {
 		t.Fatal("an unknown would_issue counts as healthy")
+	}
+}
+
+// ── the mail set (mail plan Task 3) ───────────────────────
+
+// mailSetBody is PUT /domains/{name}/sets/mail's body for name (MX at
+// MAIL_HOSTNAME, SPF, a long RSA DKIM TXT, DMARC, an SRV).
+func mailSetBody(name string) string {
+	h := "mail." + testMain + "."
+	recs := []dnsplan.MailRecord{
+		{Name: name, Type: "MX", TTL: 3600, Value: "10 " + h},
+		{Name: name, Type: "TXT", TTL: 3600, Value: "v=spf1 mx -all"},
+		{Name: "v1-rsa-20261115._domainkey." + name, Type: "TXT", TTL: 3600, Value: "v=DKIM1; k=rsa; p=" + strings.Repeat("MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A", 12)},
+		{Name: "_dmarc." + name, Type: "TXT", TTL: 3600, Value: "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@" + name},
+		{Name: "_imaps._tcp." + name, Type: "SRV", TTL: 3600, Value: "0 1 993 " + h},
+	}
+	b, _ := json.Marshal(map[string]any{"records": recs})
+	return string(b)
+}
+
+func (e *testEnv) hasRR(name, typ, data string) bool {
+	for _, rr := range e.zone.Records(name) {
+		if rr.Type == typ && (data == "" || rr.Data == data) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSetsMailEndpoint(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-ml.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	e.do("POST", "/domains/"+name+"/dns/apply", `{"sets":["nomail"]}`, true)
+	e.waitFor("the null MX", 30*time.Second, func() bool { return e.hasRR(name, "MX", "0 .") })
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) && len(e.domain(name).DueSets) == 0 })
+
+	// Refusals: unknown key, a bad record, an empty set, too big, not added.
+	big := `{"records":[{"name":"` + name + `","type":"TXT","ttl":3600,"value":"` + strings.Repeat("v", 300<<10) + `"}]}`
+	for _, body := range []string{`{"records":[],"x":1}`, `{"sets":["mail"]}`, `{"records":[]}`, `nope`, big,
+		`{"records":[{"name":"other.example.org","type":"MX","ttl":3600,"value":"10 mail.example.org."}]}`,
+		`{"records":[{"name":"` + name + `","type":"CAA","ttl":300,"value":"0 issue \"pebble.test\""}]}`} {
+		if code, resp := e.do("PUT", "/domains/"+name+"/sets/mail", body, true); code != 400 {
+			t.Errorf("%.80s = %d %s", body, code, resp)
+		}
+	}
+	for _, m := range []string{"PUT", "DELETE"} {
+		if code, _ := e.do(m, "/domains/nope.example.org/sets/mail", mailSetBody("nope.example.org"), true); code != 404 {
+			t.Errorf("%s not added = %d", m, code)
+		}
+	}
+	if code, _ := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetBody(name), false); code != 401 {
+		t.Errorf("without the bearer = %d", code)
+	}
+	// While the worker is held, the stored sets show the switch.
+	release := make(chan struct{})
+	e.setHook(func(string, []libdns.Record, string) error { <-release; return nil })
+	code, body := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetBody(name), true)
+	d := e.domain(name)
+	close(release)
+	e.setHook(nil)
+	if code != 202 || !strings.Contains(body, `"name":"`+name+`"`) {
+		t.Fatalf("PUT = %d %s", code, body)
+	}
+	if !contains(d.Sets, "mail") || contains(d.Sets, "nomail") || !contains(d.DueSets, "mail") || !contains(d.DueSets, "nomail") ||
+		!d.NoMailBeforeMail || len(d.MailWanted) != 5 {
+		t.Fatalf("sets %v due %v nomail-before %v wanted %d", d.Sets, d.DueSets, d.NoMailBeforeMail, len(d.MailWanted))
+	}
+	e.waitFor("the mail MX", 30*time.Second, func() bool {
+		return e.hasRR(name, "MX", "10 mail."+testMain+".") && !e.hasRR(name, "MX", "0 .") && e.hasRR("_imaps._tcp."+name, "SRV", "")
+	})
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) && len(e.domain(name).DueSets) == 0 })
+	pl := e.planOf("/domains/" + name + "/dns?refresh=1")
+	n := 0
+	for _, it := range pl.Items {
+		switch it.Set {
+		case dnsplan.SetNoMail:
+			t.Errorf("nomail item next to mail: %+v", it)
+		case dnsplan.SetMail:
+			n++
+			if it.Status != dnsplan.StatusOK {
+				t.Errorf("mail item %+v", it)
+			}
+		}
+	}
+	if n != 5 {
+		t.Fatalf("%d mail items", n)
+	}
+
+	// DELETE: the mail records go and nomail comes back (it was there).
+	if code, body := e.do("DELETE", "/domains/"+name+"/sets/mail", "", true); code != 202 {
+		t.Fatalf("DELETE = %d %s", code, body)
+	}
+	e.waitFor("nomail back", 30*time.Second, func() bool {
+		return e.hasRR(name, "MX", "0 .") && !e.hasRR(name, "MX", "10 mail."+testMain+".") &&
+			len(e.zone.Records("v1-rsa-20261115._domainkey."+name)) == 0 && len(e.zone.Records("_imaps._tcp."+name)) == 0
+	})
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) && len(e.domain(name).DueSets) == 0 })
+	if d := e.domain(name); contains(d.Sets, "mail") || !contains(d.Sets, "nomail") || d.NoMailBeforeMail || len(d.MailWanted) != 0 {
+		t.Fatalf("after DELETE: sets %v nomail-before %v wanted %d", d.Sets, d.NoMailBeforeMail, len(d.MailWanted))
+	}
+	if !e.hasRR("_dmarc."+name, "TXT", "v=DMARC1; p=reject;") {
+		t.Fatalf("nomail's DMARC missing: %v", e.zone.Records("_dmarc."+name))
+	}
+
+	// Without nomail before: DELETE leaves no nomail.
+	const other = "team-mo.example.org"
+	e.do("PUT", "/domains/"+other, creds(goodToken), true)
+	e.waitState(other, StateReady, 60*time.Second)
+	e.do("PUT", "/domains/"+other+"/sets/mail", mailSetBody(other), true)
+	e.waitFor("the mail MX", 30*time.Second, func() bool { return e.hasRR(other, "MX", "10 mail."+testMain+".") })
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(other) && len(e.domain(other).DueSets) == 0 })
+	// nomail can't be applied while mail is on.
+	if code, _ := e.do("POST", "/domains/"+other+"/dns/apply", `{"sets":["nomail"]}`, true); code != 409 {
+		t.Fatalf("nomail apply while mail is on = %d", code)
+	}
+	e.do("DELETE", "/domains/"+other+"/sets/mail", "", true)
+	e.waitFor("the mail records gone", 30*time.Second, func() bool { return !e.hasRR(other, "MX", "") && !e.hasRR(other, "TXT", "") })
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(other) && len(e.domain(other).DueSets) == 0 })
+	if d := e.domain(other); contains(d.Sets, "nomail") || contains(d.Sets, "mail") {
+		t.Fatalf("sets %v", d.Sets)
+	}
+	// Applying the mail set with mail off is refused (it would remove the
+	// domain's own MX and SPF).
+	if code, _ := e.do("POST", "/domains/"+other+"/dns/apply", `{"sets":["mail"]}`, true); code != 409 {
+		t.Fatalf("mail apply while mail is off = %d", code)
+	}
+	// The domain's DELETE removes the mail records it tracks too.
+	e.do("PUT", "/domains/"+other+"/sets/mail", mailSetBody(other), true)
+	e.waitFor("the mail MX", 30*time.Second, func() bool { return e.hasRR(other, "MX", "10 mail."+testMain+".") })
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(other) && len(e.domain(other).DueSets) == 0 })
+	e.do("DELETE", "/domains/"+other, "", true)
+	for _, n := range []string{other, "v1-rsa-20261115._domainkey." + other, "_dmarc." + other, "_imaps._tcp." + other} {
+		if rrs := e.zone.Records(n); len(rrs) != 0 {
+			t.Errorf("left at %s after the domain's DELETE: %v", n, rrs)
+		}
+	}
+}
+
+// TestSetsMailDueRaceNotLost (review finding 1): a DELETE …/sets/mail
+// that arrives while a records step for the PUT before it is running
+// (mail already due in its snapshot) is not lost: the step's end leaves
+// mail due, and the next step removes the records.
+func TestSetsMailDueRaceNotLost(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-mr.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	e.waitFor("idle", 10*time.Second, func() bool { return e.idle(name) && len(e.domain(name).DueSets) == 0 })
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	e.setHook(func(op string, _ []libdns.Record, _ string) error {
+		once.Do(func() { close(entered); <-release })
+		return nil
+	})
+	if code, body := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetBody(name), true); code != 202 {
+		t.Fatalf("PUT = %d %s", code, body)
+	}
+	select {
+	case <-entered: // the step holds a snapshot with mail on and due
+	case <-time.After(30 * time.Second):
+		t.Fatal("the records step never started")
+	}
+	if code, body := e.do("DELETE", "/domains/"+name+"/sets/mail", "", true); code != 202 {
+		t.Fatalf("DELETE = %d %s", code, body)
+	}
+	close(release)
+	e.waitFor("the mail records removed", 30*time.Second, func() bool {
+		return !e.hasRR(name, "MX", "") && len(e.zone.Records("v1-rsa-20261115._domainkey."+name)) == 0 &&
+			e.idle(name) && len(e.domain(name).DueSets) == 0
+	})
+	if d := e.domain(name); contains(d.Sets, "mail") || len(d.MailWanted) != 0 {
+		t.Fatalf("sets %v wanted %d", d.Sets, len(d.MailWanted))
+	}
+}
+
+// TestSetsMailNeverMainMailNames (review finding 2): MAIL_HOSTNAME and
+// the names the main mail set owns are never an added domain, and a
+// domain enrolled before MAIL_HOSTNAME became one of its names gets no
+// mail set.
+func TestSetsMailNeverMainMailNames(t *testing.T) {
+	e := newEnvWith(t, false, func(c *Config) { c.MailHostname = "mx.team-mh.example.org" })
+	for _, n := range []string{"mx.team-mh.example.org", "a.mx.team-mh.example.org", "mail." + testMain, "mta-sts." + testMain, "autoconfig." + testMain} {
+		if code, body := e.do("PUT", "/domains/"+n, creds(goodToken), true); code != 400 {
+			t.Errorf("enroll %s = %d %s", n, code, body)
+		}
+	}
+	const name = "team-mh.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	if code, body := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetBody(name), true); code != 202 {
+		t.Fatalf("PUT = %d %s", code, body)
+	}
+	e.waitFor("idle", 30*time.Second, func() bool { return e.idle(name) && len(e.domain(name).DueSets) == 0 })
+	// MAIL_HOSTNAME moved onto the domain itself: its mail set is refused.
+	e.restart(func(c *Config) { c.MailHostname = name })
+	if code, body := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetBody(name), true); code != 400 {
+		t.Fatalf("PUT with MAIL_HOSTNAME = the domain: %d %s", code, body)
 	}
 }

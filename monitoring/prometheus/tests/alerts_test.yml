@@ -214,3 +214,98 @@ tests:
               summary: "The VPN provider headscale has a stale device map"
               description: >-
                 Its devices are denied until the Hub publishes a fresh map (the identity hook fails or the gateway is down). See the instance's VPN tab in the Hub.
+
+  # Mail: the queue over 100 for 30m, deferrals over 0.2 for 1h.
+  - interval: 5m
+    input_series:
+      - series: 'portcullis_mail_queue_messages{job="mailctl",instance="mailctl-metrics:9100"}'
+        values: '150x20'
+      - series: 'portcullis_mail_queue_deferred_ratio{job="mailctl",instance="mailctl-metrics:9100"}'
+        values: '0.5x20'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: MailQueueHigh
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: MailQueueHigh
+        exp_alerts:
+          - exp_labels: {severity: warning, job: mailctl, instance: "mailctl-metrics:9100"}
+            exp_annotations:
+              summary: "150 messages wait in the mail queue"
+              description: >-
+                Outbound mail isn't leaving. Run ./portcullis mail status (port 25, blocklists, the relay) and look at the doctor's mail findings.
+      - eval_time: 55m
+        alertname: MailDeferralsHigh
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: MailDeferralsHigh
+        exp_alerts:
+          - exp_labels: {severity: warning, job: mailctl, instance: "mailctl-metrics:9100"}
+            exp_annotations:
+              summary: More than a fifth of the queued mail is deferred
+              description: >-
+                Remote servers keep refusing or timing out. Run ./portcullis mail status (reverse DNS, blocklists, port 25).
+
+  # Mail: the certificate 10 days from expiry (time() starts at 0 in
+  # promtool: 864000 = 10 days); a healthy one 60 days out → nothing.
+  - interval: 5m
+    input_series:
+      - series: 'portcullis_mail_cert_expiry_seconds{job="mailctl",instance="mailctl-metrics:9100"}'
+        values: '864000x6'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: MailCertExpiring
+        exp_alerts:
+          - exp_labels: {severity: warning, job: mailctl, instance: "mailctl-metrics:9100"}
+            exp_annotations:
+              summary: The mail certificate expires within 14 days (or is missing)
+              description: >-
+                The daily timer should have renewed it. Run ./portcullis mail cert and check ./portcullis mail schedule --systemd is installed.
+  - interval: 5m
+    input_series:
+      - series: 'portcullis_mail_cert_expiry_seconds{job="mailctl",instance="mailctl-metrics:9100"}'
+        values: '5184000x6'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: MailCertExpiring
+        exp_alerts: []
+
+  # Mail: blocklisted, a stuck DKIM key, another check failing for 1h; the
+  # specific ones don't also raise MailCheckFailing.
+  - interval: 5m
+    input_series:
+      - series: 'portcullis_mail_check{job="mailctl",instance="mailctl-metrics:9100",check="blocklist"}'
+        values: '0x15'
+      - series: 'portcullis_mail_check{job="mailctl",instance="mailctl-metrics:9100",check="dkim_stuck:example.com"}'
+        values: '0x15'
+      - series: 'portcullis_mail_check{job="mailctl",instance="mailctl-metrics:9100",check="fcrdns_v4"}'
+        values: '0x15'
+      - series: 'portcullis_mail_check{job="mailctl",instance="mailctl-metrics:9100",check="cert"}'
+        values: '1x15'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: MailBlocklisted
+        exp_alerts:
+          - exp_labels: {severity: critical, job: mailctl, instance: "mailctl-metrics:9100", check: blocklist}
+            exp_annotations:
+              summary: The mail server's address is on a blocklist (or a list refused the query)
+              description: >-
+                Receivers will refuse its mail. ./portcullis mail status names the list and the delisting steps.
+      - eval_time: 15m
+        alertname: MailDKIMStuck
+        exp_alerts:
+          - exp_labels: {severity: warning, job: mailctl, instance: "mailctl-metrics:9100", check: "dkim_stuck:example.com"}
+            exp_annotations:
+              summary: "A DKIM key of dkim_stuck:example.com has waited more than 24 h for DNS"
+              description: >-
+                The rotation can't finish until both public resolvers serve the new TXT record. Check the domain's mail records (./portcullis dns plan, or the domain in the Hub).
+      - eval_time: 55m
+        alertname: MailCheckFailing
+        exp_alerts: []
+      - eval_time: 65m
+        alertname: MailCheckFailing
+        exp_alerts:
+          - exp_labels: {severity: warning, job: mailctl, instance: "mailctl-metrics:9100", check: fcrdns_v4}
+            exp_annotations:
+              summary: "The mail check fcrdns_v4 is failing"
+              description: Run ./portcullis mail status, or see the Hub's doctor.

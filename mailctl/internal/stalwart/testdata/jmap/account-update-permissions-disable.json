@@ -1,0 +1,45 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:Account/set",
+        {
+          "update": {
+            "c": {
+              "permissions": {
+                "@type": "Merge",
+                "enabledPermissions": {},
+                "disabledPermissions": {
+                  "authenticate": true,
+                  "emailSend": true,
+                  "emailReceive": true
+                }
+              }
+            }
+          }
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:Account/set",
+        {
+          "accountId": "b",
+          "updated": {
+            "c": null
+          }
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "fc380151"
+  }
+}

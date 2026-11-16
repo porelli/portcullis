@@ -1,0 +1,84 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:Role/set",
+        {
+          "create": {
+            "r": {
+              "description": "portcullis-mailctl",
+              "enabledPermissions": {
+                "authenticate": true,
+                "impersonate": true,
+                "sysAccountGet": true,
+                "sysAccountCreate": true,
+                "sysAccountUpdate": true,
+                "sysAccountDestroy": true,
+                "sysAccountQuery": true,
+                "sysDomainGet": true,
+                "sysDomainCreate": true,
+                "sysDomainUpdate": true,
+                "sysDomainDestroy": true,
+                "sysDomainQuery": true,
+                "sysDkimSignatureGet": true,
+                "sysDkimSignatureCreate": true,
+                "sysDkimSignatureUpdate": true,
+                "sysDkimSignatureDestroy": true,
+                "sysDkimSignatureQuery": true,
+                "sysAppPasswordGet": true,
+                "sysAppPasswordCreate": true,
+                "sysAppPasswordDestroy": true,
+                "sysAppPasswordQuery": true,
+                "sysMailingListGet": true,
+                "sysMailingListCreate": true,
+                "sysMailingListUpdate": true,
+                "sysMailingListDestroy": true,
+                "sysMailingListQuery": true,
+                "sysQueuedMessageGet": true,
+                "sysQueuedMessageQuery": true,
+                "sysActionCreate": true,
+                "actionReloadSettings": true,
+                "actionReloadTlsCertificates": true,
+                "actionInvalidateCaches": true,
+                "sysDmarcExternalReportGet": true,
+                "sysDmarcExternalReportQuery": true,
+                "sysTlsExternalReportGet": true,
+                "sysTlsExternalReportQuery": true,
+                "sysSpamSettingsGet": true,
+                "sysSpamSettingsUpdate": true,
+                "sysMemoryLookupKeyGet": true,
+                "sysMemoryLookupKeyCreate": true,
+                "sysMemoryLookupKeyUpdate": true,
+                "sysMemoryLookupKeyDestroy": true,
+                "sysMemoryLookupKeyQuery": true
+              }
+            }
+          }
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:Role/set",
+        {
+          "accountId": "d333333",
+          "created": {
+            "r": {
+              "id": "b"
+            }
+          }
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "6f6b367f"
+  }
+}

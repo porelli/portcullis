@@ -1,0 +1,47 @@
+{
+  "request": {
+    "using": [
+      "urn:ietf:params:jmap:core",
+      "urn:stalwart:jmap"
+    ],
+    "methodCalls": [
+      [
+        "x:ApiKey/set",
+        {
+          "accountId": "b",
+          "create": {
+            "k": {
+              "description": "mailctl",
+              "permissions": {
+                "@type": "Inherit"
+              },
+              "allowedIps": {
+                "192.168.231.3/32": true
+              }
+            }
+          }
+        },
+        "0"
+      ]
+    ]
+  },
+  "status": 200,
+  "response": {
+    "methodResponses": [
+      [
+        "x:ApiKey/set",
+        {
+          "accountId": "b",
+          "created": {
+            "k": {
+              "id": "b",
+              "secret": "API_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            }
+          }
+        },
+        "0"
+      ]
+    ],
+    "sessionState": "6f6b367f"
+  }
+}

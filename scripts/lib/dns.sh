@@ -66,10 +66,16 @@ _dns_tool_input() {
   jq -n --arg mode "$mode" --arg name "$PORTCULLIS_DOMAIN" --arg provider "$provider" --argjson map "$map" \
     --arg ipv4 "${DNS_IPV4:-}" --arg ipv6 "${DNS_IPV6:-}" --arg ca "$(_dns_ca_server)" \
     --argjson caa "$caa" --arg issuer "${DNS_CAA_ISSUER:-}" --arg uri "${DNS_ACCOUNT_URI:-}" --arg iodef "${DNS_CAA_IODEF:-}" \
-    --argjson nomail "$nomail" --arg sets "${DNS_SETS:-}" --arg mail "${ALERT_SMTP_FROM:-}" '
+    --argjson nomail "$nomail" --arg sets "${DNS_SETS:-}" --arg mail "${ALERT_SMTP_FROM:-}" \
+    --arg mailrecs "${DNS_MAIL_RECORDS:-}" --arg mailhost "${MAIL_HOSTNAME:-mail.$PORTCULLIS_DOMAIN}" \
+    --argjson mailon "$(declare -F mail_profile_on >/dev/null && mail_profile_on && echo true || echo false)" \
+    --argjson former "$(declare -F mail_former_hosts_json >/dev/null && mail_former_hosts_json || echo '[]')" '
     {name: $name, ipv4: $ipv4, ipv6: $ipv6, ca_server: $ca,
      caa: {enabled: $caa, issuer: $issuer, account_uri: $uri, iodef: $iodef},
      nomail: $nomail, sets: ($sets | split(" ") | map(select(. != ""))), mail_from: $mail}
+    + (if $mailon or $mailrecs != "" then {mail_hostname: $mailhost} else {} end)
+    + (if $mailrecs != "" then {mail: ($mailrecs | fromjson)} else {} end)
+    + (if $mailrecs != "" and ($former | length) > 0 then {mail_former_hosts: $former} else {} end)
     + (if $mode == "write"
        then {provider: $provider, credentials: ($map | map({key: .key, value: env[.var]}) | from_entries)}
        else {provider: ""} end)'
@@ -208,7 +214,27 @@ _dns_prepare() {
 _dns_default_sets() {
   local s="address caa"
   [ "$(_dns_flag DNS_NOMAIL false)" != true ] || s="$s nomail"
+  [ -z "${DNS_MAIL_RECORDS:-}" ] || s="$s mail"
   printf '%s' "$s"
+}
+
+# _dns_mail_records <required> — DNS_MAIL_RECORDS: the main domain's
+# wanted mail set from mailctl (`mailctl dns --main --json`, contract
+# §19.7) whenever the mail profile is on, so every plan / apply sees it
+# (with mail_hostname). Already set (mail rotate) = kept. mailctl not
+# answering: required → fail, else a warning and no mail set.
+_dns_mail_records() {
+  local out
+  [ -z "${DNS_MAIL_RECORDS:-}" ] || return 0
+  mail_profile_on || return 0
+  if out="$(rt_exec mailctl -- mailctl dns --main --json 2>/dev/null)" \
+    && DNS_MAIL_RECORDS="$(printf '%s' "$out" | jq -ce '.records | arrays')"; then
+    export DNS_MAIL_RECORDS
+    return 0
+  fi
+  DNS_MAIL_RECORDS=""
+  [ "$1" != true ] || fail "mailctl didn't answer the main domain's mail records (is mail up? ./portcullis status)"
+  warn "mailctl didn't answer the main domain's mail records: the mail set is left out of this plan"
 }
 
 # _dns_render — the plan JSON (stdin) as a table, then the CAA and DNSSEC
@@ -233,6 +259,7 @@ _dns_render() {
 dns_plan() {
   local json="$1" out rc=0
   _dns_prepare
+  _dns_mail_records false
   out="$(_dns_tool plan)" || rc=$?
   [ -n "$out" ] || fail "the dns tool failed (exit $rc)"
   if [ "$json" = true ]; then printf '%s\n' "$out"; else printf '%s' "$out" | _dns_render; fi
@@ -271,6 +298,7 @@ _dns_plan_replaces_pin() {
 dns_setup() {
   local yes="$1" dnssec="$2" only="$3" provider="${DNS_PROVIDER:-none}" out rc=0 reply
   _dns_prepare
+  if [ "$only" = mail ]; then _dns_mail_records true; else _dns_mail_records false; fi
   DNS_SETS="${only:-$(_dns_default_sets)}"
   # Never replace a live pin with CA-only because the account read failed.
   if [ -n "${DNS_TRAEFIK_UNREADABLE:-}" ]; then
@@ -781,7 +809,7 @@ EOF
 
 help_dns_setup() {
   cat <<'EOF'
-Usage: portcullis dns setup [--yes] [--dnssec] [--only address|caa|nomail]
+Usage: portcullis dns setup [--yes] [--dnssec] [--only address|caa|nomail|mail]
 
 Show the plan, ask to apply it (--yes: don't ask; required without a
 terminal), write the record sets through DNS_PROVIDER's API with its
@@ -799,7 +827,8 @@ Options:
   --yes       apply without asking
   --dnssec    also turn on DNSSEC signing (the whole zone; cloudflare only;
               others print the steps). Signing is never turned off.
-  --only SET  apply one record set: address, caa or nomail
+  --only SET  apply one record set: address, caa, nomail or mail (the
+              mail server's records from mailctl; mail must be on)
 EOF
 }
 
@@ -832,7 +861,7 @@ cmd_dns() {
       setup:--dnssec) dnssec=true ;;
       setup:--only)
         need_value "dns setup" --only "${2:-}"
-        case "$2" in address|caa|nomail) only="$2" ;; *) usage_error "dns setup" "--only must be address, caa or nomail" ;; esac
+        case "$2" in address|caa|nomail|mail) only="$2" ;; *) usage_error "dns setup" "--only must be address, caa, nomail or mail" ;; esac
         shift ;;
       setup:--check) usage_error "dns setup" "unknown argument --check (use: ./portcullis dns check)" ;;
       *) usage_error "dns $sub" "unknown argument: $1" ;;
