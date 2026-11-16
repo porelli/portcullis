@@ -117,7 +117,17 @@ func (v *V1) putState(w http.ResponseWriter, r *http.Request) {
 		v.unreachable(w, err)
 		return
 	}
-	if ops, err := reconcile.Plan(live, doc, p.Former, v.now(), 1<<62); errors.Is(err, reconcile.ErrMassRemoval) {
+	var confirmed *state.MassRemoval
+	ops, err := reconcile.Plan(live, doc, p.Former, v.now(), 1<<62, nil)
+	if errors.Is(err, reconcile.ErrMassRemoval) && doc.ConfirmMassRemoval {
+		// Bound to the set this live read removes: a later pass that
+		// would remove anything else is refused again (final review L2).
+		var uuids []string
+		for _, r := range ops.Removals {
+			uuids = append(uuids, r.UUID)
+		}
+		confirmed = state.NewMassRemoval(doc.Generation, uuids)
+	} else if errors.Is(err, reconcile.ErrMassRemoval) {
 		// The Hub branches on error_kind and shows the accounts the
 		// document would remove (from this one live read): username and
 		// uuid only, sorted by username (contract §19.5).
@@ -137,7 +147,7 @@ func (v *V1) putState(w http.ResponseWriter, r *http.Request) {
 		if doc.Generation <= s.Generation {
 			return errors.New("stale")
 		}
-		s.Doc, s.Generation = doc, doc.Generation
+		s.Doc, s.Generation, s.MassRemoval = doc, doc.Generation, confirmed
 		return nil
 	}); err != nil {
 		writeErr(w, http.StatusConflict, "generation is not greater than the last accepted one")

@@ -128,6 +128,17 @@ func TestMassRemoval409AtPut(t *testing.T) {
 	if b, _ := json.Marshal(body.Removed); string(b) != `[{"username":"bob","uuid":"0b9d8c7a-6e5f-4a3b-9c2d-1e0f9a8b7c6d"},{"username":"root","uuid":"3e5a7c9b-1d2f-4a6b-8c0e-2f4a6b8c0d1e"}]` {
 		t.Fatalf("removed %s", b)
 	}
+	// Confirmed: accepted and bound to exactly that set (final review L2).
+	m["confirm_mass_removal"] = true
+	b, _ = json.Marshal(m)
+	if w := e.do("PUT", "/v1/state", string(b)); w.Code != 202 {
+		t.Fatalf("confirmed: %d %s", w.Code, w.Body)
+	}
+	mr := e.v.Store.Get().MassRemoval
+	if mr == nil || mr.Generation != 13 || len(mr.UUIDs) != 2 || !mr.Covers(13, []string{"0b9d8c7a-6e5f-4a3b-9c2d-1e0f9a8b7c6d", "3e5a7c9b-1d2f-4a6b-8c0e-2f4a6b8c0d1e"}) ||
+		mr.Covers(13, []string{"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b"}) {
+		t.Fatalf("binding %+v", mr)
+	}
 	// A stale generation's 409 has no error_kind.
 	w = e.do("PUT", "/v1/state", vec(t, 12))
 	json.Unmarshal(w.Body.Bytes(), &body)

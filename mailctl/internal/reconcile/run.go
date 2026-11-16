@@ -136,7 +136,7 @@ func (r *Runner) once(ctx context.Context, p state.Persistent) error {
 }
 
 func (r *Runner) apply(ctx context.Context, l *Live, doc *state.Doc, p state.Persistent) error {
-	ops, err := Plan(l, doc, p.Former, r.Now(), r.Retention)
+	ops, err := Plan(l, doc, p.Former, r.Now(), r.Retention, p.MassRemoval)
 	if err != nil {
 		return err
 	}

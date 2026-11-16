@@ -302,9 +302,62 @@ func TestMassRemovalRefused(t *testing.T) {
 		t.Fatal("removed anyway")
 	}
 	d.ConfirmMassRemoval = true
+	// A confirmation not bound to this set (no PUT binding): refused.
+	if err := e.apply(d); !errors.Is(err, ErrMassRemoval) {
+		t.Fatalf("unbound confirmation: %v", err)
+	}
+	e.bind(d, uBob, uRoot)
 	e.mustApply(d)
 	if e.account("bob") != nil {
 		t.Fatal("confirmed removal not applied")
+	}
+}
+
+// bind records the PUT's binding of confirm_mass_removal to uuids.
+func (e *env) bind(d *state.Doc, uuids ...string) {
+	e.t.Helper()
+	if err := e.st.Update(func(p *state.Persistent) error {
+		p.MassRemoval = state.NewMassRemoval(d.Generation, uuids)
+		return nil
+	}); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+// Final review L2: the confirmation covers the set it was bound to; an
+// account that turns up later and would be removed too is refused.
+func TestMassRemovalBoundToItsSet(t *testing.T) {
+	e := newEnv(t)
+	e.mustApply(baseDoc(t))
+	d := baseDoc(t)
+	d.Generation = 13
+	dropAccount(d, "bob")
+	dropAccount(d, "root")
+	d.Postmaster = []string{"alice"}
+	d.ConfirmMassRemoval = true
+	e.bind(d, uBob) // root wasn't in the confirmed set
+	if err := e.apply(d); !errors.Is(err, ErrMassRemoval) {
+		t.Fatalf("a removal outside the confirmed set: %v", err)
+	}
+	if e.account("bob") == nil || e.account("root") == nil {
+		t.Fatal("removed anyway")
+	}
+	// Bound to another generation: refused too.
+	e.st.Update(func(p *state.Persistent) error {
+		p.MassRemoval = state.NewMassRemoval(12, []string{uBob, uRoot})
+		return nil
+	})
+	if err := e.apply(d); !errors.Is(err, ErrMassRemoval) {
+		t.Fatalf("another generation's binding: %v", err)
+	}
+	// A tampered hash: refused.
+	e.st.Update(func(p *state.Persistent) error {
+		p.MassRemoval = state.NewMassRemoval(13, []string{uBob, uRoot})
+		p.MassRemoval.SHA256 = strings.Repeat("0", 64)
+		return nil
+	})
+	if err := e.apply(d); !errors.Is(err, ErrMassRemoval) {
+		t.Fatalf("a binding whose hash doesn't match: %v", err)
 	}
 }
 
@@ -563,3 +616,4 @@ func TestBrokenPagingChangesNothing(t *testing.T) {
 		t.Fatal("bob not removed once the reads add up")
 	}
 }
+

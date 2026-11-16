@@ -1,10 +1,14 @@
 package state
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -27,10 +31,55 @@ type Persistent struct {
 	Errors            []string          `json:"errors"`
 	Former            map[string]Former `json:"former"` // old uuid → record
 	RestoredAt        *time.Time        `json:"restored_at"`
+	// MassRemoval: the removal set a confirm_mass_removal PUT confirmed
+	// (from the live read at that PUT); the guard is lifted only for it.
+	MassRemoval *MassRemoval `json:"mass_removal"`
 	TimerSeenAt       *time.Time        `json:"timer_seen_at"`
 	// Ext holds the state machines' records (DKIM, MTA-STS, TLSA, DMARC,
 	// checks: Tasks 8 and 9), kept verbatim by this package.
 	Ext map[string]json.RawMessage `json:"ext"`
+}
+
+// MassRemoval binds a document's confirm_mass_removal to the removals it
+// confirmed: the generation, the parked-to-be uuids (sorted) and their
+// hash (RemovalSetHash).
+type MassRemoval struct {
+	Generation int64    `json:"generation"`
+	UUIDs      []string `json:"uuids"`
+	SHA256     string   `json:"sha256"`
+}
+
+// RemovalSetHash is the hex sha256 of the sorted uuids, one per line.
+func RemovalSetHash(uuids []string) string {
+	u := append([]string(nil), uuids...)
+	sort.Strings(u)
+	h := sha256.Sum256([]byte(strings.Join(u, "\n")))
+	return hex.EncodeToString(h[:])
+}
+
+// NewMassRemoval is the binding for generation and uuids.
+func NewMassRemoval(generation int64, uuids []string) *MassRemoval {
+	u := append([]string(nil), uuids...)
+	sort.Strings(u)
+	return &MassRemoval{Generation: generation, UUIDs: u, SHA256: RemovalSetHash(u)}
+}
+
+// Covers: m confirms exactly this generation and every uuid of removals
+// (a pass that parked part of the set and failed finishes the rest).
+func (m *MassRemoval) Covers(generation int64, removals []string) bool {
+	if m == nil || m.Generation != generation || m.SHA256 != RemovalSetHash(m.UUIDs) {
+		return false
+	}
+	in := map[string]bool{}
+	for _, u := range m.UUIDs {
+		in[u] = true
+	}
+	for _, u := range removals {
+		if !in[u] {
+			return false
+		}
+	}
+	return true
 }
 
 // Store is the file and an in-memory copy, behind one lock.

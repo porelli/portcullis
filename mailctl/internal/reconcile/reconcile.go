@@ -84,8 +84,9 @@ func sortedEq(a, b []string) bool {
 
 // Plan computes the ops that make Stalwart match want. former is mailctl's
 // record of parked accounts (old uuid → since); retention is
-// MAIL_FORMER_RETENTION.
-func Plan(l *Live, want *state.Doc, former map[string]state.Former, now time.Time, retention time.Duration) (Ops, error) {
+// MAIL_FORMER_RETENTION; confirmed is the removal set the document's
+// confirm_mass_removal was bound to at its PUT (nil = none).
+func Plan(l *Live, want *state.Doc, former map[string]state.Former, now time.Time, retention time.Duration, confirmed *state.MassRemoval) (Ops, error) {
 	var ops Ops
 	byUUID := map[string]state.Account{}
 	for _, a := range want.Accounts {
@@ -119,9 +120,17 @@ func Plan(l *Live, want *state.Doc, former map[string]state.Former, now time.Tim
 			keep = append(keep, la)
 		}
 	}
-	if !want.ConfirmMassRemoval && active > 0 && len(ops.Removals)*2 > active {
-		// Only the removals: the caller names them (contract §19.5).
-		return Ops{Removals: ops.Removals}, ErrMassRemoval
+	if active > 0 && len(ops.Removals)*2 > active {
+		var uuids []string
+		for _, rm := range ops.Removals {
+			uuids = append(uuids, rm.UUID)
+		}
+		// confirm_mass_removal lifts the guard only for the set it was
+		// bound to at the PUT (final review L2).
+		if !want.ConfirmMassRemoval || !confirmed.Covers(want.Generation, uuids) {
+			// Only the removals: the caller names them (contract §19.5).
+			return Ops{Removals: ops.Removals}, ErrMassRemoval
+		}
 	}
 	for _, d := range want.Domains {
 		if _, ok := l.Domains[d.Name]; !ok {
