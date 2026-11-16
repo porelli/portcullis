@@ -1,0 +1,348 @@
+{
+ "_comment": [
+  "e2e-mail's remote Stalwart (the same pin as mail, plain config): one domain remote.test, one account,",
+  "DKIM Ed25519, applied by e2e_mail.py remote-setup over its JMAP as the recovery admin.",
+  "{{VAR}} is filled from the environment; @id:<Object>:<key> is the id of an object made earlier.",
+  "Port 25 offers no STARTTLS (Portcullis's mail never accepts an invalid certificate: it sends in clear",
+  "to a server without STARTTLS); mail to ci.example.org / team-b.test goes to Portcullis's listener",
+  "({{PORTCULLIS_MX}}:10025, the port behind the host's 25) through the route 'portcullis'.",
+  "Nothing is ever downloaded: no ASN / Geo, no spam rules, the WebUI disabled."
+ ],
+ "collections": [
+  {
+   "object": "NetworkListener",
+   "key": "name",
+   "destroy_others": true,
+   "want": [
+    {
+     "name": "smtp",
+     "protocol": "smtp",
+     "bind": {
+      "[::]:25": true
+     },
+     "useTls": false,
+     "implicitTls": false
+    },
+    {
+     "name": "submission",
+     "protocol": "smtp",
+     "bind": {
+      "[::]:587": true
+     },
+     "useTls": true,
+     "implicitTls": false
+    },
+    {
+     "name": "imaps",
+     "protocol": "imap",
+     "bind": {
+      "[::]:993": true
+     },
+     "useTls": true,
+     "implicitTls": true
+    },
+    {
+     "name": "management",
+     "protocol": "http",
+     "bind": {
+      "[::]:8080": true
+     },
+     "useTls": false,
+     "implicitTls": false
+    }
+   ]
+  },
+  {
+   "object": "Tracer",
+   "key": "@type",
+   "destroy_others": true,
+   "want": [
+    {
+     "@type": "Stdout",
+     "ansi": false,
+     "enable": true,
+     "level": "info"
+    }
+   ]
+  },
+  {
+   "object": "Certificate",
+   "key": "_none",
+   "want": [
+    {
+     "certificate": {
+      "@type": "File",
+      "filePath": "/run/remote/tls/fullchain.pem"
+     },
+     "privateKey": {
+      "@type": "File",
+      "filePath": "/run/remote/tls/privkey.pem"
+     }
+    }
+   ]
+  },
+  {
+   "object": "MtaTlsStrategy",
+   "key": "name",
+   "want": [
+    {
+     "name": "lax",
+     "dane": "disable",
+     "mtaSts": "disable",
+     "startTls": "optional",
+     "allowInvalidCerts": true
+    }
+   ]
+  },
+  {
+   "object": "MtaRoute",
+   "key": "name",
+   "want": [
+    {
+     "@type": "Local",
+     "name": "local"
+    },
+    {
+     "@type": "Relay",
+     "name": "portcullis",
+     "host": "{{PORTCULLIS_MX}}",
+     "port": 10025,
+     "implicitTls": false,
+     "protocol": "smtp",
+     "allowInvalidCerts": true,
+     "authUsername": null,
+     "authSecret": {
+      "@type": "None"
+     }
+    }
+   ]
+  },
+  {
+   "object": "Role",
+   "key": "description",
+   "want": [
+    {
+     "description": "remote-user",
+     "enabledPermissions": {
+      "authenticate": true,
+      "emailSend": true,
+      "emailReceive": true,
+      "imapAuthenticate": true,
+      "imapAclGet": true,
+      "imapAclSet": true,
+      "imapMyRights": true,
+      "imapListRights": true,
+      "imapAppend": true,
+      "imapCapability": true,
+      "imapId": true,
+      "imapCopy": true,
+      "imapMove": true,
+      "imapCreate": true,
+      "imapDelete": true,
+      "imapEnable": true,
+      "imapExpunge": true,
+      "imapFetch": true,
+      "imapIdle": true,
+      "imapList": true,
+      "imapLsub": true,
+      "imapNamespace": true,
+      "imapRename": true,
+      "imapSearch": true,
+      "imapSort": true,
+      "imapSelect": true,
+      "imapExamine": true,
+      "imapStatus": true,
+      "imapStore": true,
+      "imapSubscribe": true,
+      "imapThread": true,
+      "imapMetadataGet": true,
+      "imapMetadataSet": true,
+      "imapMetadataPrivate": true
+     }
+    }
+   ]
+  },
+  {
+   "object": "Domain",
+   "key": "name",
+   "want": [
+    {
+     "name": "remote.test",
+     "certificateManagement": {
+      "@type": "Manual"
+     },
+     "dnsManagement": {
+      "@type": "Manual"
+     },
+     "dkimManagement": {
+      "@type": "Manual"
+     }
+    }
+   ]
+  },
+  {
+   "object": "Account",
+   "key": "name",
+   "want": [
+    {
+     "@type": "User",
+     "name": "{{REMOTE_USER}}",
+     "domainId": "@id:Domain:remote.test",
+     "description": "e2e remote",
+     "credentials": {
+      "0": {
+       "@type": "Password",
+       "secret": "{{REMOTE_PASSWORD}}"
+      }
+     },
+     "roles": {
+      "@type": "Custom",
+      "roleIds": {
+       "@id:Role:remote-user": true
+      }
+     }
+    }
+   ]
+  },
+  {
+   "object": "DkimSignature",
+   "key": "selector",
+   "want": [
+    {
+     "@type": "Dkim1Ed25519Sha256",
+     "domainId": "@id:Domain:remote.test",
+     "selector": "rem1",
+     "stage": "active",
+     "privateKey": {
+      "@type": "Text",
+      "secret": "{{REMOTE_DKIM_PEM}}"
+     }
+    }
+   ]
+  }
+ ],
+ "singletons": [
+  {
+   "object": "SystemSettings",
+   "patch": {
+    "defaultHostname": "mx.remote.test",
+    "defaultDomainId": "@id:Domain:remote.test",
+    "defaultCertificateId": "@id:Certificate:_none"
+   }
+  },
+  {
+   "object": "DnsResolver",
+   "patch": {
+    "@type": "Custom",
+    "servers": {
+     "0": {
+      "protocol": "udp",
+      "address": "{{RESOLVER_IP}}",
+      "port": "#{{RESOLVER_PORT}}"
+     },
+     "1": {
+      "protocol": "tcp",
+      "address": "{{RESOLVER_IP}}",
+      "port": "#{{RESOLVER_PORT}}"
+     }
+    }
+   }
+  },
+  {
+   "object": "MtaOutboundStrategy",
+   "patch": {
+    "route": {
+     "match": {
+      "0": {
+       "if": "is_local_domain(rcpt_domain)",
+       "then": "'local'"
+      }
+     },
+     "else": "'portcullis'"
+    },
+    "tls": {
+     "match": {},
+     "else": "'lax'"
+    }
+   }
+  },
+  {
+   "object": "MtaStageAuth",
+   "patch": {
+    "saslMechanisms": {
+     "match": {
+      "0": {
+       "if": "local_port == 587 && is_tls",
+       "then": "[plain, login]"
+      }
+     },
+     "else": "false"
+    },
+    "require": {
+     "match": {},
+     "else": "local_port == 587"
+    },
+    "mustMatchSender": {
+     "match": {},
+     "else": "true"
+    }
+   }
+  },
+  {
+   "object": "SpamSettings",
+   "patch": {
+    "enable": false,
+    "spamFilterRulesUrl": null
+   }
+  },
+  {
+   "object": "SpamAi",
+   "patch": {
+    "@type": "Disable"
+   }
+  },
+  {
+   "object": "SpamPyzor",
+   "patch": {
+    "enable": false
+   }
+  },
+  {
+   "object": "DmarcReportSettings",
+   "patch": {
+    "aggregateSendFrequency": {
+     "match": {},
+     "else": "hourly"
+    }
+   }
+  },
+  {
+   "object": "Asn",
+   "patch": {
+    "@type": "Resource",
+    "asnUrls": {},
+    "geoUrls": {}
+   }
+  },
+  {
+   "object": "Asn",
+   "patch": {
+    "@type": "Disabled"
+   }
+  },
+  {
+   "object": "Authentication",
+   "patch": {
+    "defaultUserRoleIds": {
+     "@id:Role:remote-user": true
+    }
+   }
+  }
+ ],
+ "disable": [
+  "Application"
+ ],
+ "actions": [
+  "ReloadSettings"
+ ]
+}

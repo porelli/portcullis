@@ -2,6 +2,10 @@ package fakedns
 
 import (
 	"context"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -213,5 +217,51 @@ func TestServesSRVTLSAAndLongTXT(t *testing.T) {
 		if del, err := p.DeleteRecords(ctx, "d.test.", []libdns.Record{libdns.TXT{Name: "k._domainkey", Text: long}}); err != nil || len(del) != 1 {
 			t.Fatalf("delete %v %v", del, err)
 		}
+	}
+}
+
+// Remote writes into the zone behind APIHandler: the records answer DNS
+// there; a refused token is ErrAuth and never echoed back by the server.
+func TestRemoteSharesTheZone(t *testing.T) {
+	z := NewZone()
+	srv := httptest.NewServer(APIHandler(z, func(tok string) bool { return tok != "bad-token-0000" }))
+	defer srv.Close()
+	ctx := context.Background()
+	p := &Remote{URL: srv.URL, Token: "good-token-1234"}
+	mx := libdns.RR{Name: "@", Type: "MX", TTL: time.Hour, Data: "10 mail.example.test."}
+	txt := libdns.RR{Name: "@", Type: "TXT", TTL: time.Hour, Data: "v=spf1 mx -all"}
+	if _, err := p.AppendRecords(ctx, "example.test.", []libdns.Record{mx, txt}); err != nil {
+		t.Fatal(err)
+	}
+	if got := z.lookup("example.test", "MX"); len(got) != 1 || got[0].Data != "10 mail.example.test." {
+		t.Fatalf("MX in the shared zone = %v", got)
+	}
+	recs, err := p.GetRecords(ctx, "example.test.")
+	if err != nil || len(recs) != 2 {
+		t.Fatalf("get = %v %v", recs, err)
+	}
+	if _, err := p.SetRecords(ctx, "example.test.", []libdns.Record{libdns.RR{Name: "@", Type: "TXT", TTL: time.Hour, Data: "v=spf1 -all"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := z.lookup("example.test", "TXT"); len(got) != 1 || got[0].Data != "v=spf1 -all" {
+		t.Fatalf("TXT after set = %v", got)
+	}
+	if del, err := p.DeleteRecords(ctx, "example.test.", []libdns.Record{mx}); err != nil || len(del) != 1 {
+		t.Fatalf("delete = %v %v", del, err)
+	}
+	if got := z.lookup("example.test", "MX"); len(got) != 0 {
+		t.Fatalf("MX after delete = %v", got)
+	}
+	bad := &Remote{URL: srv.URL, Token: "bad-token-0000"}
+	if _, err := bad.GetRecords(ctx, "example.test."); !errors.Is(err, ErrAuth) {
+		t.Fatalf("bad token = %v", err)
+	}
+	res, _ := http.Post(srv.URL, "application/json", strings.NewReader(`{"op":"get","zone":"example.test.","token":"bad-token-0000","records":[]}`))
+	b, _ := io.ReadAll(res.Body)
+	if strings.Contains(string(b), "bad-token-0000") {
+		t.Fatalf("the server echoed the token: %s", b)
+	}
+	if z, err := p.FindZone("_acme-challenge.mail.example.test."); err != nil || z != "mail.example.test." {
+		t.Fatalf("FindZone = %q %v", z, err)
 	}
 }
