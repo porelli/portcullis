@@ -187,7 +187,7 @@ expect_fail "hub env: no HEADSCALE_ / HEADPLANE_ prefix any more (core carries n
 expect_ok   "hub env: wg's portcullis-vpn address (compose default; the Hub's PORTCULLIS_VPN_EDGE for gateways)" \
   grep -qx 'PORTCULLIS_VPN_WG_IP=172.31.254.3' "$HE"
 expect_ok   "hub env: the VPN reserved ranges (what wg / group-gate refuse) for the Hub" \
-  grep -qx 'PORTCULLIS_VPN_RESERVED_RANGES=172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28 172.31.255.0/28 172.31.255.16/28' "$HE"
+  grep -qx 'PORTCULLIS_VPN_RESERVED_RANGES=172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28 172.31.255.0/28 172.31.255.16/28 172.31.254.80/29 172.31.254.128/26' "$HE"
 expect_ok   "hub env: HUB_SHARED_ENV" grep -qx 'MY_APP_VAR=shared' "$HE"
 expect_ok   "hub env: mcp-gate IP (compose default, G42)" grep -qx 'PORTCULLIS_MCP_GATE_IP=172.31.250.3' "$HE"
 expect_fail "hub env: never a core secret" grep -Eq 'pg-secret|hub-secret|kc-secret' "$HE"
@@ -267,7 +267,7 @@ expect_eq "stack_prepare: an existing people.key is kept" "$(cat "$SP_ROOT/secre
   unset -f monitoring_fix_perms domains_fix_perms mcpgate_fix_perms sessions_fix_perms
   secrets_fix_perms ) >/dev/null 2>&1
 expect_ok "secrets_fix_perms: secrets/wg and people.key group 10006" \
-  grep -qx "ct_group_read 10006 $SP_ROOT/secrets/wg $SP_ROOT/secrets/wg/people.key" "$STUB_DIR/sfp-wg"
+  grep -qx "ct_group_read 10006 $SP_ROOT/secrets/wg $SP_ROOT/secrets/wg/people.key $SP_ROOT/secrets/wg/link.key $SP_ROOT/secrets/wg/link-tls.key $SP_ROOT/secrets/wg/link-tls.crt" "$STUB_DIR/sfp-wg"
 # Mail (contract §19.1): the placeholders always (the Hub binds hub-secret
 # without the profile too; a bind must never make a directory), 0640, the
 # directory 0700; relay-password / dqs-key follow .env; the volumes only
@@ -3333,7 +3333,7 @@ rc=0|[]
 rc=0"
 expect_eq "vpn_reserved_ranges: under podman Podman's pools follow the core subnets" \
   "$(rt "CONTAINER_RUNTIME=podman; getenforce() { echo Permissive; }; runtime_export; vpn_reserved_ranges")" \
-  "172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28 172.31.255.0/28 172.31.255.16/28 10.88.0.0/16 10.89.0.0/16
+  "172.16.0.0/12 192.168.0.0/16 10.214.0.0/24 172.31.250.0/24 172.31.251.0/28 172.31.252.0/28 172.31.253.0/28 172.31.254.0/26 172.31.254.64/28 172.31.255.0/28 172.31.255.16/28 172.31.254.80/29 172.31.254.128/26 10.88.0.0/16 10.89.0.0/16
 rc=0"
 expect_eq "runtime_export: an existing COMPOSE_FILE gets the overlay once" \
   "$(rt "PORTCULLIS_ROOT='$RX' CONTAINER_RUNTIME=podman COMPOSE_FILE=docker-compose.yml:ci.yml; getenforce() { echo Enforcing; }; runtime_export; runtime_export; echo \"\$COMPOSE_FILE\"")" \
@@ -5392,6 +5392,145 @@ F="$(ls "$ML/root/backups/mail-export/"*.mbox 2>/dev/null | head -n1)"
 expect_eq "mail export writes 0600 under backups/mail-export (dir 0700)" "$rc:$(file_mode "$F"):$(file_mode "$ML/root/backups/mail-export"):$(grep -c '^From ' "$F")" "0:600:700:1"
 mt 'rt_exec() { printf partial; return 1; }; mail_export former-6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b ""'; rc=$?
 expect_eq "mail export: a failure leaves no file" "$rc:$(ls -A "$ML/root/backups/mail-export" | wc -l | tr -d ' ')" "1:0"
+
+# ══ link: ./portcullis link … (scripts/lib/link.sh, contract §17) ═══════
+# shellcheck source=../scripts/lib/link.sh
+source "$HERE/../scripts/lib/link.sh"
+# test_link_network_validation
+expect_ok "link nets: the defaults are valid" validate_link_network_config
+check_lnet() { PORTCULLIS_LINK_NET="$1" PORTCULLIS_LINK_HUB_IP="$2" PORTCULLIS_LINK_WG_IP="$3" PORTCULLIS_LINK_DATA_NET="$4" PORTCULLIS_LINK_DATA_IP_RANGE="$5" PORTCULLIS_LINK_DATA_WG_IP="$6" validate_link_network_config; }
+expect_ok "link nets: moved together → valid" check_lnet 10.79.0.0/29 10.79.0.2 10.79.0.3 10.79.1.0/26 10.79.1.32/27 10.79.1.2
+expect_fail "link nets: the Hub and wg at one address → fail" check_lnet 172.31.254.80/29 172.31.254.83 172.31.254.83 172.31.254.128/26 172.31.254.160/27 172.31.254.130
+expect_fail "link nets: wg outside portcullis-link → fail" check_lnet 172.31.254.80/29 172.31.254.82 172.31.254.99 172.31.254.128/26 172.31.254.160/27 172.31.254.130
+expect_fail "link nets: the gateway address → fail" check_lnet 172.31.254.80/29 172.31.254.81 172.31.254.83 172.31.254.128/26 172.31.254.160/27 172.31.254.130
+expect_fail "link nets: wg's data address in the relays' range → fail" check_lnet 172.31.254.80/29 172.31.254.82 172.31.254.83 172.31.254.128/26 172.31.254.160/27 172.31.254.161
+expect_fail "link nets: the two subnets overlap → fail" check_lnet 172.31.254.128/29 172.31.254.130 172.31.254.131 172.31.254.128/26 172.31.254.160/27 172.31.254.140
+expect_fail "link nets: overlapping portcullis-vpn → fail" check_lnet 172.31.254.0/29 172.31.254.2 172.31.254.3 172.31.254.128/26 172.31.254.160/27 172.31.254.130
+expect_fail "link nets: overlapping the link tunnel 10.214.0.0/24 → fail" check_lnet 10.214.0.0/29 10.214.0.2 10.214.0.3 172.31.254.128/26 172.31.254.160/27 172.31.254.130
+expect_fail "link nets: not a CIDR → fail" check_lnet nope 172.31.254.82 172.31.254.83 172.31.254.128/26 172.31.254.160/27 172.31.254.130
+expect_eq "vpn_reserved_ranges ends with the two link nets (= WG_CORE_SUBNETS' order)" \
+  "$(vpn_reserved_ranges | awk '{print $(NF-1), $NF}')" "172.31.254.80/29 172.31.254.128/26"
+expect_eq "network_check validates the link nets and guards both" \
+  "$(declare -f network_check | grep -c 'validate_link_network_config\|link_network_state\|link_data_network_state')" 3
+expect_eq "hub_env_write gives the Hub PORTCULLIS_LINK_DATA_WG_IP (the relays' upstream)" \
+  "$( (export PORTCULLIS_ROOT="$WORK/lhe"; mkdir -p "$PORTCULLIS_ROOT"; hub_env_write; grep -x 'PORTCULLIS_LINK_DATA_WG_IP=172.31.254.130' "$PORTCULLIS_ROOT/secrets/hub/core.env") 2>/dev/null)" \
+  "PORTCULLIS_LINK_DATA_WG_IP=172.31.254.130"
+
+# test_link_doc_owner: stack_prepare owns link_doc 10001:10009 2750 and
+# makes the link placeholders (0640, empty) and certs/node-ca.crt.
+LP="$WORK/lp"; mkdir -p "$LP"
+( PORTCULLIS_ROOT="$LP"
+  volume_own() { echo "volume_own $*" >> "$STUB_DIR/lp-vol"; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  unset -f users_secret_files monitoring_prepare domains_prepare mcpgate_ensure_secrets sessions_prepare
+  stack_prepare ) >/dev/null 2>&1
+expect_ok "stack_prepare: link_doc owned 10001:10009, mode 2750" grep -qx 'volume_own link_doc 10001:10009 2750' "$STUB_DIR/lp-vol"
+expect_eq "stack_prepare: link.key / link-tls.key / link-tls.crt empty placeholders 0640" \
+  "$(for f in link.key link-tls.key link-tls.crt; do [ -f "$LP/secrets/wg/$f" ] && [ ! -s "$LP/secrets/wg/$f" ] && file_mode "$LP/secrets/wg/$f"; done | tr '\n' ' ')" "640 640 640 "
+expect_eq "stack_prepare: certs/node-ca.crt an empty 0644 placeholder" \
+  "$([ -f "$LP/certs/node-ca.crt" ] && [ ! -s "$LP/certs/node-ca.crt" ] && file_mode "$LP/certs/node-ca.crt")" 644
+expect_eq "CT_GID_LINK_DOC is 10009 (never the Hub's 10001)" "$CT_GID_LINK_DOC" 10009
+expect_eq "secrets_fix_perms keeps the link files wg's (group 10006)" \
+  "$(declare -f secrets_fix_perms | grep -c 'CT_UID_WG.*link.key.*link-tls.key.*link-tls.crt')" 1
+
+# A test CA standing in for pki_node, and a link.control cert from it.
+LCA="$WORK/lca"; mkdir -p "$LCA"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$LCA/ca.key" -out "$LCA/ca.crt" -subj "/CN=t Node CA" -days 3650 >/dev/null 2>&1
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$LCA/l.key" -out "$LCA/l.csr" -subj "/CN=link.control" >/dev/null 2>&1
+printf 'extendedKeyUsage=clientAuth\n' > "$LCA/ext"
+openssl x509 -req -in "$LCA/l.csr" -CA "$LCA/ca.crt" -CAkey "$LCA/ca.key" -CAcreateserial -out "$LCA/l.crt" -days 90 -extfile "$LCA/ext" >/dev/null 2>&1
+openssl x509 -req -in "$LCA/l.csr" -CA "$LCA/ca.crt" -CAkey "$LCA/ca.key" -CAcreateserial -out "$LCA/old.crt" -days 20 -extfile "$LCA/ext" >/dev/null 2>&1
+# Off-CA: the same CN under another root.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$LCA/x.key" -out "$LCA/x.crt" -subj "/CN=link.control" -days 90 >/dev/null 2>&1
+expect_fail "link_cert_due: a fresh 90 d certificate isn't due" link_cert_due "$LCA/l.crt"
+expect_ok "link_cert_due: 90 d with 20 d left (< ⅓) is due" link_cert_due "$LCA/l.crt" "$(( $(date +%s) + 70 * 86400 ))"
+expect_ok "link_cert_due: an empty file is due" link_cert_due /dev/null
+
+# lt <script> — vt plus the link placeholders, certs/node-ca.crt and a
+# stubbed Vault (curl logs argv to $WORK/vt/curl-argv and stdin to
+# $WORK/vt/curl-stdin, answers $VT_SIGNED).
+lt() {
+  vt "mkdir -p \"\$PORTCULLIS_ROOT/certs\"; cp '$LCA/ca.crt' \"\$PORTCULLIS_ROOT/certs/node-ca.crt\"
+      for f in link.key link-tls.key link-tls.crt; do : > \"\$PORTCULLIS_ROOT/secrets/wg/\$f\"; done
+      export VAULT_TOKEN=s.vault-root-token-xyz
+      curl() {
+        printf '%s\n' \"\$*\" >> \"$WORK/vt/curl-argv\"
+        case \"\$*\" in *sys/health*) printf 200; return 0 ;; esac
+        cat >> \"$WORK/vt/curl-stdin\"
+        local o=\"\"
+        while [ \$# -gt 0 ]; do case \"\$1\" in -o) o=\"\$2\"; shift ;; -H) case \"\$2\" in @/dev/fd/*|@/proc/*) cat \"\${2#@}\" >> \"$WORK/vt/curl-hdr\" ;; esac; shift ;; esac; shift; done
+        jq -n --rawfile c \"\${VT_SIGNED:-$LCA/l.crt}\" '{data: {certificate: \$c}}' > \"\$o\"; printf '%s' \"\${VT_SIGN_CODE:-200}\"
+      }
+      _link_wg_run() { echo \"_link_wg_run \$*\" >> \"\$L\"; case \"\$*\" in *link-csr*) cat '$LCA/l.csr' ;; *) printf 'S0VZ\\n' > \"\$1\" ;; esac; }
+      $1"
+}
+# test_link_init_refuses_overlap
+for c in 'VT_DOCKER_SUBNETS=10.214.0.0/16|10.214.0.0/16 (a Docker network)' \
+         'VT_HOSTINFO={"local_networks":["10.0.0.0/8","10.214.0.0/23"],"provider_ranges":[]}|10.214.0.0/23 (a Local network, Hub Settings)' \
+         'VT_HOSTINFO={"local_networks":[],"provider_ranges":["10.214.0.0/20"]}|10.214.0.0/20 (a wired VPN provider'"'"'s range)' \
+         'VT_ENV=PORTCULLIS_VPN_SUBNET=10.214.0.0/22|10.214.0.0/22 (the built-in VPN'"'"'s subnet)' \
+         'PORTCULLIS_AUTH_SUBNET=10.214.0.16/28|10.214.0.16/28 (a reserved range)'; do
+  set_="${c%%|*}"; want="${c#*|}"
+  # shellcheck disable=SC2163  # VAR=value
+  OUT="$(export "$set_"; lt 'link_init 51821' 2>&1)"; RC=$?
+  expect_eq "link init: overlapping ${want%% (*} → refused naming it" "$RC:$(printf '%s' "$OUT" | grep -cF "  $want")" "1:1"
+  expect_eq "link init: refused with ${want%% (*} → nothing written" "$(vte | grep -c 'PORTCULLIS_LINK\|COMPOSE_PROFILES' || true)" 0
+done
+OUT="$(lt 'link_init 51821' 2>&1)"; RC=$?
+expect_eq "link init: the Hub's default Local networks (10.0.0.0/8) don't refuse" "$RC" 0
+OUT="$(lt 'CONTAINER_RUNTIME=kubernetes; link_init 51821' 2>&1)"; RC=$?
+expect_eq "link init on Kubernetes → refused (servers need a Docker or Podman primary), nothing asked" \
+  "$RC:$(printf '%s' "$OUT" | grep -c 'servers need a Docker or Podman primary'):$(cat "$WORK/vt/log" 2>/dev/null | grep -c 'host-info' || true)" "1:1:0"
+OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=x.org\nCOMPOSE_PROFILES=wg\nPORTCULLIS_VPN_PORT=51830' lt 'link_init 51830' 2>&1)"; RC=$?
+expect_eq "link init: the built-in VPN's port → refused" "$RC:$(printf '%s' "$OUT" | grep -c "the built-in VPN's port")" "1:1"
+# test_link_init_idempotent: keys once, wg once in COMPOSE_PROFILES, the
+# certificate signed once while it isn't due; the second run regenerates
+# nothing and signs nothing.
+OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=x.org\nCOMPOSE_PROFILES=monitoring' lt 'link_init 51821 && cp "$PORTCULLIS_ROOT/.env" "$WORK/vt-env1" && cp -a "$PORTCULLIS_ROOT/secrets/wg" "$WORK/vt-wg1" && link_init 51821; cp "$WORK/vt/curl-argv" "$WORK/vt-curl" 2>/dev/null; true' 2>&1)"; RC=$?
+expect_eq "link init twice: exit 0" "$RC" 0
+expect_eq "link init: COMPOSE_PROFILES gains wg once; PORTCULLIS_LINK=on and the port, once each" \
+  "$(grep -c '^COMPOSE_PROFILES=monitoring,wg$' "$WORK/vt/root/.env"):$(grep -c '^PORTCULLIS_LINK=on$' "$WORK/vt/root/.env"):$(grep -c '^PORTCULLIS_LINK_PORT=51821$' "$WORK/vt/root/.env")" "1:1:1"
+expect_eq "link init: the second run writes the same .env" "$(diff "$WORK/vt-env1" "$WORK/vt/root/.env" && echo same)" same
+expect_eq "link init: each key generated once (genkey, genkey-tls), the CSR made once" \
+  "$(grep -c '_link_wg_run .* rw genkey /k' "$WORK/vt/log"):$(grep -c '_link_wg_run .* rw genkey-tls /k' "$WORK/vt/log"):$(grep -c '_link_wg_run .* ro link-csr' "$WORK/vt/log")" "1:1:1"
+expect_eq "link init: signed once with pki_node/sign/node-link" "$(grep -c 'pki_node/sign/node-link' "$WORK/vt-curl")" 1
+expect_eq "link init: the certificate written in place, the keys kept on the second run" \
+  "$(cmp -s "$LCA/l.crt" "$WORK/vt/root/secrets/wg/link-tls.crt" && echo crt):$(cmp -s "$WORK/vt-wg1/link.key" "$WORK/vt/root/secrets/wg/link.key" && echo key)" "crt:key"
+expect_eq "link init: hub_env_write, then wg, Traefik and the Hub" \
+  "$(grep -c '^hub_env_write$' "$WORK/vt/log"):$(grep -c '^stack_compose_up wg traefik hub$' "$WORK/vt/log")" "2:2"
+# test_link_no_secret_argv: the token through -H @<(...), the CSR on stdin.
+expect_eq "link cert: the Vault token is never on curl's argv" "$(grep -c 'vault-root-token' "$WORK/vt-curl" || true)" 0
+expect_eq "link cert: the CSR is never on curl's or jq's argv" "$(cat "$WORK/vt-curl" "$WORK/vt/jq" 2>/dev/null | grep -c 'BEGIN CERTIFICATE REQUEST' || true)" 0
+expect_eq "link cert: the CSR goes in the request body (stdin)" "$(jq -r '.common_name + " " + .ttl + " " + (.csr | test("BEGIN CERTIFICATE REQUEST") | tostring)' "$WORK/vt/curl-stdin" | head -n1)" "link.control 2160h true"
+expect_eq "link cert: the token header comes from a process substitution" "$(grep -c '^X-Vault-Token: s.vault-root-token-xyz$' "$WORK/vt/curl-hdr")" 1
+OUT="$(VT_SIGNED="$LCA/x.crt" lt 'printf S > "$PORTCULLIS_ROOT/secrets/wg/link-tls.key"; link_cert_sign' 2>&1)"; RC=$?
+expect_eq "link cert: a certificate not under certs/node-ca.crt → refused, nothing written" \
+  "$RC:$(printf '%s' "$OUT" | grep -c 'nothing written'):$(wc -c < "$WORK/vt/root/secrets/wg/link-tls.crt" | tr -d ' ')" "1:1:0"
+OUT="$(VT_SIGN_CODE=403 lt 'printf S > "$PORTCULLIS_ROOT/secrets/wg/link-tls.key"; link_cert_sign' 2>&1)"; RC=$?
+expect_eq "link cert: Vault's refusal → exit 1 naming the path, nothing written" \
+  "$RC:$(printf '%s' "$OUT" | grep -c 'pki_node/sign/node-link, HTTP 403'):$(wc -c < "$WORK/vt/root/secrets/wg/link-tls.crt" | tr -d ' ')" "1:1:0"
+OUT="$(lt 'printf S > "$PORTCULLIS_ROOT/secrets/wg/link-tls.key"; : > "$PORTCULLIS_ROOT/certs/node-ca.crt"; link_cert_sign' 2>&1)"; RC=$?
+expect_eq "link cert: no node CA exported yet → refused (pki setup)" "$RC:$(printf '%s' "$OUT" | grep -c 'pki setup')" "1:1"
+# Renewal on up / upgrade: only with the role on, only when due.
+OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=x.org\nPORTCULLIS_LINK=on' lt 'printf S > "$PORTCULLIS_ROOT/secrets/wg/link-tls.key"; cp "'"$LCA"'/old.crt" "$PORTCULLIS_ROOT/secrets/wg/link-tls.crt"; link_cert_renew' 2>&1)"; RC=$?; echo "DEBUG: $OUT" >&2
+expect_eq "link_cert_renew: 20 d left of 90 → re-signed" "$RC:$(grep -c 'node-link' "$WORK/vt/curl-argv"):$(cmp -s "$LCA/l.crt" "$WORK/vt/root/secrets/wg/link-tls.crt" && echo new)" "0:1:new"
+OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=x.org\nPORTCULLIS_LINK=on' lt 'cp "'"$LCA"'/l.crt" "$PORTCULLIS_ROOT/secrets/wg/link-tls.crt"; link_cert_renew' 2>&1)"; RC=$?; echo "DEBUG: $OUT" >&2
+expect_eq "link_cert_renew: a fresh certificate → nothing asked" "$RC:$(cat "$WORK/vt/curl-argv" 2>/dev/null | grep -c node-link || true)" "0:0"
+OUT="$(lt 'link_cert_renew' 2>&1)"; RC=$?; echo "DEBUG: $OUT" >&2
+expect_eq "link_cert_renew: the role off → nothing" "$RC:$(cat "$WORK/vt/curl-argv" 2>/dev/null | wc -l | tr -d ' ')" "0:0"
+expect_eq "up and upgrade renew the link certificate after Vault is healthy" \
+  "$( (source "$HERE/../scripts/lib/stack.sh"; declare -f stack_up upgrade_run) 2>/dev/null | grep -c '^ *link_cert_renew')" 2
+
+# status: the Servers block (link down, or a worker silent > 3 min).
+NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; OLD="$(date -u -d '-10 min' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-10M +%Y-%m-%dT%H:%M:%SZ)"
+LST="{\"version\":1,\"written\":\"$NOW\",\"link\":{\"ok\":true,\"error\":\"\",\"public_key\":\"K\",\"port\":51821,\"peers\":[{\"id\":\"nas\",\"ip\":\"10.214.0.10\",\"handshake\":\"$NOW\",\"rx\":1,\"tx\":2},{\"id\":\"new\",\"ip\":\"10.214.0.11\",\"handshake\":null,\"rx\":0,\"tx\":0}]}}"
+ls_json() { ( export PORTCULLIS_LINK="$1" LS_ANSWER="$2"; rt_exec() { printf '%s' "$LS_ANSWER"; }; link_status_json ); }
+expect_eq "link status: the role off → not a problem, no wg call" "$(ls_json off '' | jq -c '{enabled, problem}')" '{"enabled":false,"problem":false}'
+expect_eq "link status: up, a fresh and a never-shaken peer → no problem" \
+  "$(ls_json on "$LST" | jq -c '{up, problem, peers: [.peers[] | {id, stale}]}')" '{"up":true,"problem":false,"peers":[{"id":"nas","stale":false},{"id":"new","stale":false}]}'
+expect_eq "link status: a peer silent for 10 min → stale, a problem" \
+  "$(ls_json on "${LST/\"handshake\":\"$NOW\"/\"handshake\":\"$OLD\"}" | jq -c '{problem, s: [.peers[] | .stale]}')" '{"problem":true,"s":[true,false]}'
+expect_eq "link status: the role on, wg not answering → a problem" "$(ls_json on '' | jq -c '{up, problem}')" '{"up":false,"problem":true}'
+expect_eq "link status: link null in a fresh status.json → down" "$(ls_json on "{\"version\":1,\"written\":\"$NOW\",\"link\":null}" | jq -c '{up, problem}')" '{"up":false,"problem":true}'
 
 echo ""
 echo "$PASS passed, $FAIL failed"

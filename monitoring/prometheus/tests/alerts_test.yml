@@ -215,6 +215,85 @@ tests:
               description: >-
                 Its devices are denied until the Hub publishes a fresh map (the identity hook fails or the gateway is down). See the instance's VPN tab in the Hub.
 
+  # Servers: no handshake for 5 min → PortcullisServerDown after 1m; a
+  # server shaking hands keeps quiet.
+  - interval: 1m
+    input_series:
+      - series: 'wg_link_peer_handshake_age_seconds{job="link",instance="wg-metrics:9100",server="nas"}'
+        values: '60 120 180 240 300 360 420 480'
+      - series: 'wg_link_peer_handshake_age_seconds{job="link",instance="wg-metrics:9100",server="box"}'
+        values: '30x8'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PortcullisServerDown
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: PortcullisServerDown
+        exp_alerts:
+          - exp_labels: {severity: critical, job: link, instance: "wg-metrics:9100", server: nas}
+            exp_annotations:
+              summary: "The server nas has had no tunnel handshake for 5 minutes"
+              description: >-
+                Its apps are unreachable (nothing routes to an offline server); their containers keep running there. Check the worker's network and ./portcullis worker status on it.
+
+  # Servers: under 10 % free (engine root on nas, data dir on box) for 15m;
+  # 50 % free stays quiet.
+  - interval: 5m
+    input_series:
+      - series: 'portcullis_agent_disk_free_bytes{job="link",instance="wg-metrics:9100",server="nas"}'
+        values: '5x6'
+      - series: 'portcullis_agent_disk_total_bytes{job="link",instance="wg-metrics:9100",server="nas"}'
+        values: '100x6'
+      - series: 'portcullis_agent_data_free_bytes{job="link",instance="wg-metrics:9100",server="nas"}'
+        values: '50x6'
+      - series: 'portcullis_agent_data_total_bytes{job="link",instance="wg-metrics:9100",server="nas"}'
+        values: '100x6'
+      - series: 'portcullis_agent_disk_free_bytes{job="link",instance="wg-metrics:9100",server="box"}'
+        values: '50x6'
+      - series: 'portcullis_agent_disk_total_bytes{job="link",instance="wg-metrics:9100",server="box"}'
+        values: '100x6'
+      - series: 'portcullis_agent_data_free_bytes{job="link",instance="wg-metrics:9100",server="box"}'
+        values: '8x6'
+      - series: 'portcullis_agent_data_total_bytes{job="link",instance="wg-metrics:9100",server="box"}'
+        values: '100x6'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: PortcullisServerDiskLow
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: PortcullisServerDiskLow
+        exp_alerts:
+          - exp_labels: {severity: warning, job: link, instance: "wg-metrics:9100", server: nas}
+            exp_annotations:
+              summary: "The server nas has less than 10 % disk free"
+              description: >-
+                The engine's data root or the agent's data dir is nearly full: images, volumes and backups on that server will fail. Free space on the worker.
+          - exp_labels: {severity: warning, job: link, instance: "wg-metrics:9100", server: box}
+            exp_annotations:
+              summary: "The server box has less than 10 % disk free"
+              description: >-
+                The engine's data root or the agent's data dir is nearly full: images, volumes and backups on that server will fail. Free space on the worker.
+
+  # Servers: an unhealthy container for 5m.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_agent_container_unhealthy{job="link",instance="wg-metrics:9100",exported_instance="gitea",server="nas",service="server"}'
+        values: '0 1 1 1 1 1 1 1'
+      - series: 'portcullis_agent_container_unhealthy{job="link",instance="wg-metrics:9100",exported_instance="gitea",server="nas",service="db"}'
+        values: '0x8'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: PortcullisServerContainerUnhealthy
+        exp_alerts: []
+      - eval_time: 7m
+        alertname: PortcullisServerContainerUnhealthy
+        exp_alerts:
+          - exp_labels: {severity: warning, job: link, instance: "wg-metrics:9100", exported_instance: gitea, server: nas, service: server}
+            exp_annotations:
+              summary: "gitea / server is unhealthy on the server nas"
+              description: >-
+                Its healthcheck has failed for 5 minutes. See the instance in the Hub (logs, restart).
+
   # Mail: the queue over 100 for 30m, deferrals over 0.2 for 1h.
   - interval: 5m
     input_series:

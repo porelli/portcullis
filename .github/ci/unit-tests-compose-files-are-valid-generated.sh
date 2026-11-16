@@ -86,7 +86,7 @@ binds() {  # <config json> — "service target read_only selinux" of every proje
 }
 [ -z "$(binds "$CFG_ALL" | awk '$4 != "-"')" ] || { echo "FAIL: docker-compose.yml relabels a bind (selinux): only the overlay may"; exit 1; }
 NBINDS="$(binds "$CFG_ALL" | wc -l | tr -d ' ')"
-[ "$NBINDS" = 55 ] || { echo "FAIL: expected 55 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
+[ "$NBINDS" = 59 ] || { echo "FAIL: expected 59 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
 diff <({ binds "$CFG_ALL" | grep -vx 'hub /project true -' | awk '{print $1, $2, $3}'; echo "hub /project/group-gate/group-gate-map.conf true"; } | sort) \
      <(binds "$OV_ALL" | awk '{print $1, $2, $3}' | sort) \
   || { echo "FAIL: docker-compose.podman-selinux.yml must re-declare every project bind (but the Hub's /project root) with the same target / read_only, plus the Hub's map file"; exit 1; }
@@ -466,12 +466,14 @@ vpn_rule() {  # <config json>
       and ($w.privileged // false) == false and ($w.network_mode // null) == null
       and ($w.cap_drop == ["ALL"]) and ($w.security_opt | index("no-new-privileges:true")) != null
       and ([$w.volumes[] | select(.target == "/var/run/docker.sock" or (.source // "" | test("docker\\.sock$|podman\\.sock$")))] == [])
-      and $w.user == "10006:10006" and $w.group_add == ["10007"] and $w.read_only == true and $w.profiles == ["wg"]
+      and $w.user == "10006:10006" and $w.group_add == ["10007", "10009"] and $w.read_only == true and $w.profiles == ["wg"]
       and $w.image == "portcullis-wg"
-      and ([$w.ports[] | "\(.target)/\(.protocol)"] == ["51820/udp"])
-      and ([$w.volumes[] | "\(.type):\(.source | sub("^.*/secrets/"; "secrets/")):\(.target):\(.read_only // false)"] | sort
-           == ["bind:secrets/wg/people.key:/run/portcullis/wg/people.key:true", "volume:vpn_doc:/vpn-doc:true", "volume:wg_data:/data:false"])
-      and ([$w.networks | keys[]] | sort == ["portcullis-metrics-wg", "portcullis-vpn", "portcullis-vpn-edge", "wg-egress"])
+      and ([$w.ports[] | "\(.target)/\(.protocol)"] == ["51820/udp", "51821/udp"])
+      and ([$w.volumes[] | "\(.type):\(.source | sub("^.*/(?<d>secrets|certs)/"; "\(.d)/")):\(.target):\(.read_only // false)"] | sort
+           == ["bind:certs/node-ca.crt:/run/portcullis/wg/node-ca.crt:true", "bind:secrets/wg/link-tls.crt:/run/portcullis/wg/link-tls.crt:true",
+               "bind:secrets/wg/link-tls.key:/run/portcullis/wg/link-tls.key:true", "bind:secrets/wg/link.key:/run/portcullis/wg/link.key:true",
+               "bind:secrets/wg/people.key:/run/portcullis/wg/people.key:true", "volume:link_doc:/link-doc:true", "volume:vpn_doc:/vpn-doc:true", "volume:wg_data:/data:false"])
+      and ([$w.networks | keys[]] | sort == ["portcullis-link", "portcullis-link-data", "portcullis-metrics-wg", "portcullis-vpn", "portcullis-vpn-edge", "wg-egress"])
       and $w.networks["portcullis-metrics-wg"].aliases == ["wg-metrics"]
       and $w.environment.WG_PEOPLE == "off" and $w.environment.WG_MODE == "apps"
       and $w.environment.WG_VPN_FILE == "/vpn-doc/vpn.json"
@@ -482,7 +484,7 @@ vpn_rule() {  # <config json>
       and $w.environment.WG_EDGE_MAX_PER_PROVIDER == "1024" and $w.environment.WG_EDGE_MAX_PER_USER == "128"
       and $w.environment.WG_EDGE_MAX_PER_CLIENT == "32" and $w.environment.WG_EDGE_PRESSURE_PERCENT == "90"
       and $w.environment.WG_EDGE_PRESSURE_IDLE == "2m"
-      and ([$w.environment | keys[] | select(test("KEY$|SECRET|TOKEN|PASSWORD"))] == ["WG_PEOPLE_KEY"])
+      and ([$w.environment | keys[] | select(test("KEY$|SECRET|TOKEN|PASSWORD"))] | sort == ["WG_LINK_KEY", "WG_LINK_TLS_KEY", "WG_PEOPLE_KEY"])
       and $w.environment.WG_PEOPLE_KEY == "/run/portcullis/wg/people.key"
       and $t.environment.TRAEFIK_ENTRYPOINTS_VPNSECURE_PROXYPROTOCOL_TRUSTEDIPS == "\($w.networks["portcullis-vpn-edge"].ipv4_address)/32"
       and $t.environment.TRAEFIK_ENTRYPOINTS_VPNSECURE_ADDRESS == "\($t.networks["portcullis-vpn-edge"].ipv4_address):8443"
@@ -547,6 +549,36 @@ vpn_rule() {  # <config json>
                 else empty end]
            | (map(select(.vpn)) | length) > 0 and (map(select(.vpn | not)) | length) > 0 and all(.[]; .ok))' >/dev/null
 }
+# Multiple servers (contract §17.2): portcullis-link holds exactly the Hub
+# and wg (both pinned, no dynamic range), portcullis-link-data exactly wg
+# in core (relays join per instance); both internal and named; link_doc
+# is the Hub's (rw) and wg's (ro) alone, group 10009 theirs alone; link's
+# CONNECT addresses are wg's pinned ones and the Hub's proxy is the
+# control one; wg never mounts hub_data; the role is off by default.
+link_rule() {  # <config json>
+  printf '%s' "$1" | jq -e '.services.wg as $w | .services.hub as $h
+      | def nets: .networks | if . == null then {} elif type == "object" then . else error("networks: not a map") end;
+        def gids: .group_add | if . == null then [] elif type == "array" then . else error("group_add: not a list") end;
+        def members($n): [.services | to_entries[] | select(.value | nets | has($n)) | .key] | sort;
+        def mounts($src): [.services | to_entries[] | select([.value.volumes[]? | select(.type == "volume" and .source == $src)] | length > 0) | .key] | sort;
+        def vmount($svc; $src): [.services[$svc].volumes[]? | select(.type == "volume" and .source == $src) | "\(.target):\(.read_only // false)"];
+      .networks["portcullis-link"].name == "portcullis-link" and .networks["portcullis-link"].internal == true
+      and (.networks["portcullis-link"].ipam.config[0].ip_range // null) == null
+      and .networks["portcullis-link-data"].name == "portcullis-link-data" and .networks["portcullis-link-data"].internal == true
+      and (members("portcullis-link") == ["hub", "wg"]) and (members("portcullis-link-data") == ["wg"])
+      and ($h.networks["portcullis-link"].ipv4_address != null) and ($w.networks["portcullis-link"].ipv4_address != null)
+      and ($w.networks["portcullis-link-data"].ipv4_address != null)
+      and $w.environment.WG_LINK_CONTROL_ADDR == "\($w.networks["portcullis-link"].ipv4_address):3128"
+      and $w.environment.WG_LINK_DATA_ADDR == "\($w.networks["portcullis-link-data"].ipv4_address):3129"
+      and $h.environment.HUB_LINK_PROXY == $w.environment.WG_LINK_CONTROL_ADDR
+      and $w.environment.WG_LINK == "off" and $w.environment.WG_LINK_FILE == "/link-doc/link.json"
+      and $w.environment.WG_LINK_PORT == "51821" and $w.environment.WG_LINK_CA == "/run/portcullis/wg/node-ca.crt"
+      and (mounts("link_doc") == ["hub", "wg"]) and vmount("hub"; "link_doc") == ["/link-doc:false"] and vmount("wg"; "link_doc") == ["/link-doc:true"]
+      and ([.services | to_entries[] | select(.value | gids | any(.[]; . == "10009")) | .key] | sort == ["hub", "wg"])
+      and $h.environment.HUB_LINK_DOC_DIR == "/link-doc" and $h.environment.HUB_LINK_DOC_GID == "10009"
+      and ($h.environment.HUB_RELAY_IMAGE | test("^ghcr\\.io/porelli/portcullis-relay(:edge|@sha256:[0-9a-f]{64}|:[^@]+@sha256:[0-9a-f]{64})$"))
+      and (mounts("hub_data") | index("wg") | not)' >/dev/null
+}
 # With the monitoring profile, Prometheus is wg's metrics network's only other member.
 echo "$CFG_ALL" | jq -e '[.services | to_entries[] | select((.value.networks // {}) | has("portcullis-metrics-wg")) | .key] | sort == ["prometheus", "wg"]' >/dev/null \
   || { echo "FAIL: portcullis-metrics-wg must hold exactly prometheus and wg"; exit 1; }
@@ -556,6 +588,9 @@ CFG_PODMAN_ALL="$(CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET="$PODMAN_SOC
 OV_PODMAN_ALL="$(CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET="$PODMAN_SOCK" docker compose -f docker-compose.yml -f docker-compose.podman.yml -f docker-compose.podman-selinux.yml --profile '*' config --format json)"
 for c in CFG_ALL CFG_PODMAN_ALL OV_ALL OV_PODMAN_ALL; do
   vpn_rule "${!c}" || { echo "FAIL: VPN wiring (wg userspace only and least privilege, vpnsecure PROXY trust on portcullis-vpn-edge, network members, vpn_doc / wg_data, people-vpn-enrol, entrypoint classes) in $c"; exit 1; }
+done
+for c in CFG_ALL CFG_PODMAN_ALL OV_ALL OV_PODMAN_ALL; do
+  link_rule "${!c}" || { echo "FAIL: link wiring (portcullis-link / -data members and pins, link_doc / group 10009, CONNECT addresses, the Hub's link env) in $c"; exit 1; }
 done
 echo "$CFG_PODMAN_ALL" | jq -e '.services.wg.restart == "always"' >/dev/null || { echo "FAIL: docker-compose.podman.yml must name wg"; exit 1; }
 # group-gate's VPN mode follows .env (I3 ruling: authoritative for the
@@ -570,7 +605,7 @@ PORTCULLIS_VPN_MODE=server PORTCULLIS_VPN_PUBLIC_ENROL=false docker compose -f d
 # PORTCULLIS_VPN_RUNTIME_POOLS: runtime_export, test_shell_libs), with the
 # defaults and with every subnet moved. Compared word by word.
 for pools in "" "10.88.0.0/16 10.89.0.0/16"; do
-  for over in "" "PORTCULLIS_PROXY_SUBNET=10.80.0.0/24 PORTCULLIS_PROXY_IP_RANGE=10.80.0.128/25 PORTCULLIS_TRAEFIK_IP=10.80.0.2 PORTCULLIS_AUTH_SUBNET=10.81.0.0/28 PORTCULLIS_DOMAINS_SUBNET=10.82.0.0/28 PORTCULLIS_MCP_SUBNET=10.83.0.0/28 PORTCULLIS_VPN_NET=10.84.0.0/26 PORTCULLIS_VPN_EDGE_SUBNET=10.85.0.0/28 PORTCULLIS_MAIL_SUBNET=10.86.0.0/28 PORTCULLIS_MAILCTL_SUBNET=10.87.0.0/28"; do
+  for over in "" "PORTCULLIS_PROXY_SUBNET=10.80.0.0/24 PORTCULLIS_PROXY_IP_RANGE=10.80.0.128/25 PORTCULLIS_TRAEFIK_IP=10.80.0.2 PORTCULLIS_AUTH_SUBNET=10.81.0.0/28 PORTCULLIS_DOMAINS_SUBNET=10.82.0.0/28 PORTCULLIS_MCP_SUBNET=10.83.0.0/28 PORTCULLIS_VPN_NET=10.84.0.0/26 PORTCULLIS_VPN_EDGE_SUBNET=10.85.0.0/28 PORTCULLIS_MAIL_SUBNET=10.86.0.0/28 PORTCULLIS_MAILCTL_SUBNET=10.87.0.0/28 PORTCULLIS_LINK_NET=10.79.0.0/29 PORTCULLIS_LINK_DATA_NET=10.79.1.0/26 PORTCULLIS_LINK_DATA_IP_RANGE=10.79.1.32/27"; do
     # shellcheck disable=SC2086  # VAR=value words
     HUBLIST="$(env $over PORTCULLIS_VPN_RUNTIME_POOLS="$pools" bash -c 'source scripts/lib/common.sh; source scripts/lib/network.sh; vpn_reserved_ranges')"
     # shellcheck disable=SC2086

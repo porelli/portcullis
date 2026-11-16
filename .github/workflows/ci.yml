@@ -243,11 +243,10 @@ jobs:
       # vectors internal/vpn/testdata/vpn_json_vectors.json, on the
       # same-named Hub branch when it exists, else main — like the sign-in
       # vectors above.
-      - name: Shared vpn.json vectors match the Hub
+      - name: Shared vpn.json and link.json vectors match the Hub
         env:
           REF: ${{ github.head_ref || github.ref_name }}
         run: |
-          own=tests/vpn_json_vectors.json
           url="https://github.com/porelli/portcullis-hub"
           heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
           ref=main
@@ -258,14 +257,19 @@ jobs:
           sha=$(awk -v r="refs/heads/$ref" '$2 == r { print $1 }' <<<"$heads")
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::portcullis-hub has no single commit for refs/heads/$ref"; exit 1; }
           echo "portcullis-hub (vpn.json vectors): $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
-          hub="$RUNNER_TEMP/hub_vpn_json_vectors.json"
-          code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/internal/vpn/testdata/vpn_json_vectors.json")
-          [ "$code" = 200 ] || { echo "::error::fetching the Hub's vpn.json vectors from $ref ($sha): HTTP $code"; exit 1; }
-          if ! cmp "$own" "$hub"; then
-            echo "::error::$own differs from portcullis-hub $ref ($sha) internal/vpn/testdata/vpn_json_vectors.json: copy it byte for byte"
-            exit 1
-          fi
-          echo "vpn.json vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
+          # link.json v1 (contract §17.2) too: tests/link_json_vectors.json.
+          for pair in "tests/vpn_json_vectors.json internal/vpn/testdata/vpn_json_vectors.json" \
+                      "tests/link_json_vectors.json internal/linkdoc/testdata/link_json_vectors.json"; do
+            read -r own theirs <<<"$pair"
+            hub="$RUNNER_TEMP/hub_$(basename "$own")"
+            code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/$theirs")
+            [ "$code" = 200 ] || { echo "::error::fetching the Hub's $theirs from $ref ($sha): HTTP $code"; exit 1; }
+            if ! cmp "$own" "$hub"; then
+              echo "::error::$own differs from portcullis-hub $ref ($sha) $theirs: copy it byte for byte"
+              exit 1
+            fi
+          done
+          echo "vpn.json and link.json vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
       # e2e_filesharing's run_op (busy-409 retry, scrubbing) on a fake Hub:
       # stdlib only, no stack.
       - name: e2e helper unit tests (e2e_fsops)

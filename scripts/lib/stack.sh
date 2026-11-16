@@ -541,6 +541,8 @@ stack_up() {
   pki_files_reload
   config_reload
   wait_healthy 300 vault postgres lldap keycloak
+  # The link.control certificate at ⅓ of its life left (contract §17.5).
+  link_cert_renew
   # Traefik is up: pin the main domain's CAA to its ACME account.
   dns_tighten_main
   # If the service account was created or its password changed, restart the Hub
@@ -599,6 +601,7 @@ upgrade_run() {
   signin_ca_reload
   config_reload
   wait_healthy 300 vault postgres lldap keycloak
+  link_cert_renew
   dns_tighten_main
   keycloak_configure false
   oidc_register

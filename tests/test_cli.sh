@@ -215,6 +215,14 @@ vpn revoke|expected exactly one <device-id>
 vpn revoke a b|expected exactly one <device-id>
 vpn revoke 'x;y'|invalid device id
 vpn revoke --all|unknown option: --all
+link frob|unknown subcommand: frob
+link init extra|unexpected argument: extra
+link init --port|--port needs a value
+link init --port 0|--port must be a UDP port number
+link init --port 70000|--port must be a UDP port number
+link init --subnet 10.214.0.0/24|unknown option: --subnet
+link status --frob|unknown option: --frob
+link status now|unexpected argument: now
 mail enable --lan-only maybe|--lan-only must be true or false
 mail enable --hostname Mail.Example|--hostname must be a lowercase host name
 mail enable --hostname|--hostname needs a value

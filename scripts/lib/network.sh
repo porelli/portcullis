@@ -44,6 +44,14 @@
 #   PORTCULLIS_MAILCTL_HUB_IP  default 172.31.255.18
 #   PORTCULLIS_MAILCTL_API_IP  default 172.31.255.19 (mailctl's Hub API)
 #   PORTCULLIS_MAILCTL_PROXY_IP default 172.31.250.4 (mailctl on portcullis-proxy)
+#   PORTCULLIS_LINK_NET        default 172.31.254.80/29 (portcullis-link: exactly
+#                              the Hub and wg, both pinned; contract §17.2)
+#   PORTCULLIS_LINK_HUB_IP     default 172.31.254.82
+#   PORTCULLIS_LINK_WG_IP      default 172.31.254.83 (link's control CONNECT :3128)
+#   PORTCULLIS_LINK_DATA_NET   default 172.31.254.128/26 (portcullis-link-data:
+#                              wg pinned + the instances' relays)
+#   PORTCULLIS_LINK_DATA_IP_RANGE default 172.31.254.160/27 (the relays)
+#   PORTCULLIS_LINK_DATA_WG_IP default 172.31.254.130 (link's data CONNECT :3129)
 
 PROXY_NETWORK="${PROXY_NETWORK:-portcullis-proxy}"
 AUTH_NETWORK="${AUTH_NETWORK:-portcullis-auth}"
@@ -54,6 +62,8 @@ VPN_NETWORK="${VPN_NETWORK:-portcullis-vpn}"
 VPN_EDGE_NETWORK="${VPN_EDGE_NETWORK:-portcullis-vpn-edge}"
 MAIL_NETWORK="${MAIL_NETWORK:-portcullis-mail}"
 MAILCTL_NETWORK="${MAILCTL_NETWORK:-portcullis-mailctl}"
+LINK_NETWORK="${LINK_NETWORK:-portcullis-link}"
+LINK_DATA_NETWORK="${LINK_DATA_NETWORK:-portcullis-link-data}"
 
 proxy_subnet()   { echo "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24}"; }
 proxy_ip_range() { echo "${PORTCULLIS_PROXY_IP_RANGE:-172.31.250.128/25}"; }
@@ -84,6 +94,12 @@ mailctl_ip_range()  { echo "${PORTCULLIS_MAILCTL_IP_RANGE:-172.31.255.24/29}"; }
 mailctl_hub_ip()    { echo "${PORTCULLIS_MAILCTL_HUB_IP:-172.31.255.18}"; }
 mailctl_api_ip()    { echo "${PORTCULLIS_MAILCTL_API_IP:-172.31.255.19}"; }
 mailctl_proxy_ip()  { echo "${PORTCULLIS_MAILCTL_PROXY_IP:-172.31.250.4}"; }
+link_net()          { echo "${PORTCULLIS_LINK_NET:-172.31.254.80/29}"; }
+link_hub_ip()       { echo "${PORTCULLIS_LINK_HUB_IP:-172.31.254.82}"; }
+link_wg_ip()        { echo "${PORTCULLIS_LINK_WG_IP:-172.31.254.83}"; }
+link_data_net()     { echo "${PORTCULLIS_LINK_DATA_NET:-172.31.254.128/26}"; }
+link_data_ip_range() { echo "${PORTCULLIS_LINK_DATA_IP_RANGE:-172.31.254.160/27}"; }
+link_data_wg_ip()   { echo "${PORTCULLIS_LINK_DATA_WG_IP:-172.31.254.130}"; }
 
 # ip_to_int <a.b.c.d> — prints the address as an integer; fails if invalid.
 ip_to_int() {
@@ -260,7 +276,7 @@ VPN_LINK_SUBNET="10.214.0.0/24"
 # the Hub gets it as
 # core.env's PORTCULLIS_VPN_RESERVED_RANGES and refuses them first.
 vpn_reserved_ranges() {
-  echo "172.16.0.0/12 192.168.0.0/16 $VPN_LINK_SUBNET $(proxy_subnet) $(auth_subnet) $(domains_subnet) $(mcp_subnet) $(vpn_net) $(vpn_edge_subnet) $(mail_subnet) $(mailctl_subnet)${PORTCULLIS_VPN_RUNTIME_POOLS:+ $PORTCULLIS_VPN_RUNTIME_POOLS}"
+  echo "172.16.0.0/12 192.168.0.0/16 $VPN_LINK_SUBNET $(proxy_subnet) $(auth_subnet) $(domains_subnet) $(mcp_subnet) $(vpn_net) $(vpn_edge_subnet) $(mail_subnet) $(mailctl_subnet) $(link_net) $(link_data_net)${PORTCULLIS_VPN_RUNTIME_POOLS:+ $PORTCULLIS_VPN_RUNTIME_POOLS}"
 }
 
 # validate_vpn_edge_network_config — portcullis-vpn-edge (contract §16):
@@ -540,6 +556,38 @@ _podman_lease_state() {
   if [ "$got" = "$want" ]; then echo ok; else echo mismatch; fi
 }
 
+# validate_link_network_config — the two link networks (contract §17.2):
+# portcullis-link holds exactly the Hub and wg, both pinned (no dynamic
+# range: nothing else joins it), at distinct usable addresses of the
+# subnet; portcullis-link-data has wg pinned outside its dynamic range (the
+# relays'); the subnets are disjoint from each other and from every other
+# fixed core network.
+validate_link_network_config() {
+  local sub dsub sf sl ip n var other
+  sub="$(link_net)"; dsub="$(link_data_net)"
+  read -r sf sl <<< "$(cidr_bounds "$sub" 2>/dev/null)" || true
+  [ -n "${sf:-}" ] || { echo "PORTCULLIS_LINK_NET=$sub is not a valid IPv4 CIDR"; return 1; }
+  for var in PORTCULLIS_LINK_HUB_IP PORTCULLIS_LINK_WG_IP; do
+    case "$var" in PORTCULLIS_LINK_HUB_IP) ip="$(link_hub_ip)" ;; *) ip="$(link_wg_ip)" ;; esac
+    n="$(ip_to_int "$ip" 2>/dev/null)" || { echo "$var=$ip is not a valid IPv4 address"; return 1; }
+    { [ "$n" -ge "$sf" ] && [ "$n" -le "$sl" ]; } || { echo "$var=$ip is not inside PORTCULLIS_LINK_NET=$sub"; return 1; }
+    { [ "$n" -gt $((sf + 1)) ] && [ "$n" -lt "$sl" ]; } || { echo "$var=$ip collides with the network/gateway/broadcast address"; return 1; }
+  done
+  if [ "$(ip_to_int "$(link_hub_ip)")" = "$(ip_to_int "$(link_wg_ip)")" ]; then
+    echo "PORTCULLIS_LINK_HUB_IP and PORTCULLIS_LINK_WG_IP are the same address ($(link_wg_ip))"; return 1
+  fi
+  _validate_net PORTCULLIS_LINK_DATA "$dsub" "$(link_data_ip_range)" "$(link_data_wg_ip)" PORTCULLIS_LINK_DATA_WG_IP || return 1
+  if _overlaps "$sub" "$dsub"; then echo "PORTCULLIS_LINK_NET=$sub overlaps PORTCULLIS_LINK_DATA_NET=$dsub"; return 1; fi
+  for other in "PORTCULLIS_PROXY_SUBNET=$(proxy_subnet)" "PORTCULLIS_AUTH_SUBNET=$(auth_subnet)" \
+               "PORTCULLIS_DOMAINS_SUBNET=$(domains_subnet)" "PORTCULLIS_MCP_SUBNET=$(mcp_subnet)" \
+               "PORTCULLIS_VPN_NET=$(vpn_net)" "PORTCULLIS_VPN_EDGE_SUBNET=$(vpn_edge_subnet)" \
+               "PORTCULLIS_MAIL_SUBNET=$(mail_subnet)" "PORTCULLIS_MAILCTL_SUBNET=$(mailctl_subnet)" \
+               "the link tunnel $VPN_LINK_SUBNET"; do
+    if _overlaps "$sub" "${other##*[= ]}"; then echo "PORTCULLIS_LINK_NET=$sub overlaps ${other%=*}"; return 1; fi
+    if _overlaps "$dsub" "${other##*[= ]}"; then echo "PORTCULLIS_LINK_DATA_NET=$dsub overlaps ${other%=*}"; return 1; fi
+  done
+}
+
 proxy_network_state() { network_state "$PROXY_NETWORK" "$(proxy_subnet)" "$(proxy_ip_range)"; }
 auth_network_state()  { network_state "$AUTH_NETWORK" "$(auth_subnet)" "$(auth_ip_range)"; }
 domains_network_state() { network_state "$DOMAINS_NETWORK" "$(domains_subnet)" ""; }
@@ -548,6 +596,8 @@ vpn_network_state()   { network_state "$VPN_NETWORK" "$(vpn_net)" "$(vpn_ip_rang
 vpn_edge_network_state() { network_state "$VPN_EDGE_NETWORK" "$(vpn_edge_subnet)" "$(vpn_edge_ip_range)"; }
 mail_network_state()  { network_state "$MAIL_NETWORK" "$(mail_subnet)" "$(mail_ip_range)"; }
 mailctl_network_state() { network_state "$MAILCTL_NETWORK" "$(mailctl_subnet)" "$(mailctl_ip_range)"; }
+link_network_state()  { network_state "$LINK_NETWORK" "$(link_net)" ""; }
+link_data_network_state() { network_state "$LINK_DATA_NETWORK" "$(link_data_net)" "$(link_data_ip_range)"; }
 
 # network_check — validate the .env settings and refuse to continue if the
 # existing network does not match them (compose would silently keep the old
@@ -564,6 +614,8 @@ network_check() {
   err="$(validate_vpn_edge_network_config)" || fail "Invalid portcullis-vpn-edge settings in .env: $err"
   # Always (the Hub joins portcullis-mailctl with or without the profile).
   err="$(validate_mail_network_config)" || fail "Invalid mail network settings in .env: $err"
+  # Always (the Hub joins portcullis-link with or without the link role).
+  err="$(validate_link_network_config)" || fail "Invalid link network settings in .env: $err"
   st="$(proxy_network_state)"
   [ "$st" != unknown ] || fail "can't read the IP range of $PROXY_NETWORK (podman network inspect failed): refusing to go on unverified"
   if [ "$st" = mismatch ]; then
@@ -621,6 +673,21 @@ network_check() {
     fail "Docker network $MAILCTL_NETWORK exists with a different IPAM config than .env
        ($(mailctl_subnet), range $(mailctl_ip_range)). Only the Hub and mailctl use it:
        ./portcullis down && ./portcullis up recreates it."
+  fi
+  st="$(link_network_state)"
+  [ "$st" != unknown ] || fail "can't read the IP range of $LINK_NETWORK (podman network inspect failed): refusing to go on unverified"
+  if [ "$st" = mismatch ]; then
+    fail "Docker network $LINK_NETWORK exists with a different IPAM config than .env
+       ($(link_net)). Only the Hub and wg use it:
+       ./portcullis down && ./portcullis up recreates it."
+  fi
+  st="$(link_data_network_state)"
+  [ "$st" != unknown ] || fail "can't read the IP range of $LINK_DATA_NETWORK (podman network inspect failed): refusing to go on unverified"
+  if [ "$st" = mismatch ]; then
+    fail "Docker network $LINK_DATA_NETWORK exists with a different IPAM config than .env
+       ($(link_data_net), range $(link_data_ip_range)). wg and the instances' relays use it:
+       disable the apps placed on other servers in the Hub, run ./portcullis down, then
+       docker network rm $LINK_DATA_NETWORK && ./portcullis up"
   fi
   local shadows
   shadows="$(proxy_dns_shadows)" || fail "could not inspect the containers on $PROXY_NETWORK (docker error): refusing to go on without the core-name check"
