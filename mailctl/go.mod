@@ -7,6 +7,7 @@ require (
 	github.com/emersion/go-msgauth v0.7.0
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/emersion/go-smtp v0.26.0
+	github.com/google/renameio/v2 v2.0.2
 	github.com/miekg/dns v1.1.73
 	github.com/prometheus/client_golang v1.25.0
 	golang.org/x/net v0.62.0

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/renameio/v2"
 )
 
 // Former is a parked account: removed or replaced (uuid change), kept for
@@ -34,7 +36,7 @@ type Persistent struct {
 	// MassRemoval: the removal set a confirm_mass_removal PUT confirmed
 	// (from the live read at that PUT); the guard is lifted only for it.
 	MassRemoval *MassRemoval `json:"mass_removal"`
-	TimerSeenAt       *time.Time        `json:"timer_seen_at"`
+	TimerSeenAt *time.Time   `json:"timer_seen_at"`
 	// Ext holds the state machines' records (DKIM, MTA-STS, TLSA, DMARC,
 	// checks: Tasks 8 and 9), kept verbatim by this package.
 	Ext map[string]json.RawMessage `json:"ext"`
@@ -149,16 +151,36 @@ func (s *Store) Update(fn func(*Persistent) error) error {
 	if err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return fmt.Errorf("state: %w", err)
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
+	if err := writeDurable(s.path, b); err != nil {
 		return fmt.Errorf("state: %w", err)
 	}
 	s.p = c
 	s.rev++
 	return nil
+}
+
+// writeDurable replaces path with b so that a power cut leaves the old
+// file or the new one, never a torn or empty one (final review L6): a
+// temporary file in the same directory, fsynced, renamed over path
+// (renameio), then the directory fsynced so the rename itself is on disk.
+func writeDurable(path string, b []byte) error {
+	t, err := renameio.NewPendingFile(path, renameio.WithStaticPermissions(0o600))
+	if err != nil {
+		return err
+	}
+	defer t.Cleanup()
+	if _, err := t.Write(b); err != nil {
+		return err
+	}
+	if err := t.CloseAtomicallyReplace(); err != nil {
+		return err
+	}
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // GetRev returns a deep copy of the state and its revision (bumped by
