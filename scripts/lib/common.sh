@@ -709,7 +709,7 @@ secrets_fix_perms() {
   # secrets/mail/ (contract §19.1): the directory 0700 (each reader binds
   # its own files), each file 0640 with its reader's group.
   [ ! -d "$s/mail" ] || chmod 700 "$s/mail"
-  ct_group_read "$CT_UID_MAILCTL" "$s/mail/api-key" "$s/mail/dqs-key"
+  ct_group_read "$CT_UID_MAILCTL" "$s/mail/api-key" "$s/mail/dqs-key" "$s/mail/mailctl-metrics-secret"
   ct_group_read "$CT_UID_HUB" "$s/mail/hub-secret"
   ct_group_read "$CT_UID_MAIL" "$s/mail/metrics-secret" "$s/mail/relay-password" "$s/mail/gate"
 }
@@ -882,12 +882,15 @@ mail_prepare() {
   chmod 700 "$d"
   # gate/: only the restore's void-pending marker (mail binds the dir).
   (umask 077 && mkdir -p "$d/gate")
-  for f in api-key hub-secret metrics-secret relay-password dqs-key; do
+  for f in api-key hub-secret metrics-secret mailctl-metrics-secret relay-password dqs-key; do
     [ ! -d "$d/$f" ] || fail "$d/$f is a directory (made by Docker): remove it (rmdir) and run again"
     [ -f "$d/$f" ] || (umask 077 && : > "$d/$f")
   done
   # The Prometheus scrape password (Stalwart's metrics listener): generated once.
   [ -s "$d/metrics-secret" ] || gen_alnum 40 > "$d/metrics-secret"
+  # mailctl's own (its /metrics, Basic auth as for Stalwart's): another
+  # file because each secret file has one reader group.
+  [ -s "$d/mailctl-metrics-secret" ] || gen_alnum 40 > "$d/mailctl-metrics-secret"
   _mail_secret_from_env "$d/relay-password" MAIL_RELAY_PASSWORD
   _mail_secret_from_env "$d/dqs-key" MAIL_SPAMHAUS_DQS_KEY
   mail_profile_on || return 0

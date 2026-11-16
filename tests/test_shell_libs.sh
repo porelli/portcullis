@@ -275,6 +275,8 @@ expect_ok "secrets_fix_perms: secrets/wg and people.key group 10006" \
 expect_eq "stack_prepare: the mail placeholders exist, empty, 0600 before secrets_fix_perms" \
   "$(for f in api-key hub-secret relay-password dqs-key; do [ -f "$SP_ROOT/secrets/mail/$f" ] && [ ! -s "$SP_ROOT/secrets/mail/$f" ] && file_mode "$SP_ROOT/secrets/mail/$f"; done | tr '\n' ' ')" "600 600 600 600 "
 expect_eq "stack_prepare: the metrics scrape password is generated once (40 characters)" "$(wc -c < "$SP_ROOT/secrets/mail/metrics-secret" | tr -d ' ')" 40
+expect_eq "stack_prepare: mailctl's own metrics password too, another one (40 characters)" \
+  "$(wc -c < "$SP_ROOT/secrets/mail/mailctl-metrics-secret" | tr -d ' '):$(cmp -s "$SP_ROOT/secrets/mail/metrics-secret" "$SP_ROOT/secrets/mail/mailctl-metrics-secret" && echo same || echo apart)" 40:apart
 expect_eq "stack_prepare: secrets/mail is 0700" "$(file_mode "$SP_ROOT/secrets/mail")" 700
 expect_fail "stack_prepare makes no mail volume without the mail profile" grep -q 'volume_own mail' "$STUB_DIR/sp-vol"
 rm -f "$STUB_DIR/sp-vol"
@@ -308,7 +310,7 @@ expect_eq "stack_prepare: an unset MAIL_RELAY_PASSWORD / MAIL_SPAMHAUS_DQS_KEY e
   unset -f monitoring_fix_perms domains_fix_perms mcpgate_fix_perms sessions_fix_perms
   secrets_fix_perms ) >/dev/null 2>&1
 expect_eq "secrets_fix_perms: the mail files' groups (mailctl 10010, Hub 10001, mail 2000)" "$(grep 'secrets/mail' "$STUB_DIR/sfp-mail" | tr '\n' '|')" \
-  "ct_group_read 10010 $SP_ROOT/secrets/mail/api-key $SP_ROOT/secrets/mail/dqs-key|ct_group_read 10001 $SP_ROOT/secrets/mail/hub-secret|ct_group_read 2000 $SP_ROOT/secrets/mail/metrics-secret $SP_ROOT/secrets/mail/relay-password $SP_ROOT/secrets/mail/gate|"
+  "ct_group_read 10010 $SP_ROOT/secrets/mail/api-key $SP_ROOT/secrets/mail/dqs-key $SP_ROOT/secrets/mail/mailctl-metrics-secret|ct_group_read 10001 $SP_ROOT/secrets/mail/hub-secret|ct_group_read 2000 $SP_ROOT/secrets/mail/metrics-secret $SP_ROOT/secrets/mail/relay-password $SP_ROOT/secrets/mail/gate|"
 rm -f "$STUB_DIR/sfp-mail"
 rm -rf "$SP_ROOT/secrets/mail/hub-secret"; mkdir "$SP_ROOT/secrets/mail/hub-secret"
 rc=0; ( PORTCULLIS_ROOT="$SP_ROOT"
@@ -5021,13 +5023,15 @@ mt 'source "$HERE/../scripts/lib/stack.sh"; source "$HERE/../scripts/lib/dns.sh"
 expect_eq "mail rotate: an unreadable DNSSEC state is passed as unknown (TLSA withheld)" "$(jq -r .dnssec_state "$ML/stdin" 2>/dev/null)" unknown
 
 # Prometheus' mail targets: both with the profile, [] and an empty password copy without.
-mt 'export MONITORING_SECRETS="$PORTCULLIS_ROOT/secrets/monitoring"; mkdir -p "$MONITORING_SECRETS/prometheus"; printf "m3tr1cs-pw" > "$PORTCULLIS_ROOT/secrets/mail/metrics-secret"; mail_prom_targets'
+mt 'export MONITORING_SECRETS="$PORTCULLIS_ROOT/secrets/monitoring"; mkdir -p "$MONITORING_SECRETS/prometheus"; printf "m3tr1cs-pw" > "$PORTCULLIS_ROOT/secrets/mail/metrics-secret"; printf "m41lctl-pw" > "$PORTCULLIS_ROOT/secrets/mail/mailctl-metrics-secret"; mail_prom_targets'
 P="$ML/root/secrets/monitoring/prometheus"
-expect_eq "mail_prom_targets: profile on → mail + mailctl targets, the metrics password copied" \
-  "$(jq -c '[.[] | {t: .targets[0], s: .labels.service}]' "$P/mail-targets.json"):$(cat "$P/mail-metrics-secret"):$(file_mode "$P/mail-metrics-secret")" \
-  '[{"t":"mail-metrics:9180","s":"mail"},{"t":"mailctl-metrics:9100","s":"mailctl"}]:m3tr1cs-pw:600'
-mt 'export MONITORING_SECRETS="$PORTCULLIS_ROOT/secrets/monitoring" COMPOSE_PROFILES=monitoring; mkdir -p "$MONITORING_SECRETS/prometheus"; printf x > "$MONITORING_SECRETS/prometheus/mail-metrics-secret"; mail_prom_targets'
-expect_eq "mail_prom_targets: profile off → [] and an empty password copy" "$(cat "$P/mail-targets.json"):$(wc -c < "$P/mail-metrics-secret" | tr -d ' ')" "[]:0"
+expect_eq "mail_prom_targets: profile on → mail + mailctl targets, both metrics passwords copied" \
+  "$(jq -c '[.[] | {t: .targets[0], s: .labels.service}]' "$P/mail-targets.json"):$(cat "$P/mail-metrics-secret"):$(file_mode "$P/mail-metrics-secret"):$(cat "$P/mailctl-metrics-secret"):$(file_mode "$P/mailctl-metrics-secret")" \
+  '[{"t":"mail-metrics:9180","s":"mail"},{"t":"mailctl-metrics:9100","s":"mailctl"}]:m3tr1cs-pw:600:m41lctl-pw:600'
+mt 'export MONITORING_SECRETS="$PORTCULLIS_ROOT/secrets/monitoring"; mkdir -p "$MONITORING_SECRETS/prometheus"; printf "m3tr1cs-pw" > "$PORTCULLIS_ROOT/secrets/mail/metrics-secret"; : > "$PORTCULLIS_ROOT/secrets/mail/mailctl-metrics-secret"; mail_prom_targets'
+expect_eq "mail_prom_targets: no mailctl password → no targets (never an unauthenticated scrape)" "$(cat "$P/mail-targets.json")" "[]"
+mt 'export MONITORING_SECRETS="$PORTCULLIS_ROOT/secrets/monitoring" COMPOSE_PROFILES=monitoring; mkdir -p "$MONITORING_SECRETS/prometheus"; printf x > "$MONITORING_SECRETS/prometheus/mail-metrics-secret"; printf x > "$MONITORING_SECRETS/prometheus/mailctl-metrics-secret"; mail_prom_targets'
+expect_eq "mail_prom_targets: profile off → [] and empty password copies" "$(cat "$P/mail-targets.json"):$(wc -c < "$P/mail-metrics-secret" | tr -d ' '):$(wc -c < "$P/mailctl-metrics-secret" | tr -d ' ')" "[]:0:0"
 
 # ── mail status / backup / restore / export (Task 10) ──
 mt 'export COMPOSE_PROFILES=monitoring; out="$(mail_status_json)"; printf "[%s]" "$out" > "$ML/sj"'

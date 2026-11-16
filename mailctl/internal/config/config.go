@@ -32,8 +32,11 @@ type Config struct {
 	APIAddr       string       // MAILCTL_API_ADDR: the Hub API (":8080")
 	APISubnet     netip.Prefix // MAILCTL_API_SUBNET: the portcullis-mailctl subnet
 	HubSecretFile string       // MAILCTL_HUB_SECRET_FILE
-	APIKeyFile    string       // MAILCTL_API_KEY_FILE: Stalwart's API key
-	DQSKeyFile    string       // MAILCTL_DQS_KEY_FILE (empty file = no DQS key)
+	// MetricsSecretFile is the metrics scrape password (Basic auth,
+	// user prometheus): MAILCTL_METRICS_SECRET_FILE.
+	MetricsSecretFile string
+	APIKeyFile        string // MAILCTL_API_KEY_FILE: Stalwart's API key
+	DQSKeyFile        string // MAILCTL_DQS_KEY_FILE (empty file = no DQS key)
 
 	StalwartURL    string // MAILCTL_STALWART_URL: the management listener
 	WellKnownAddr  string // MAILCTL_WELLKNOWN_ADDR (":8081", behind Traefik)
@@ -187,6 +190,7 @@ func Load(env func(string) string) (Config, error) {
 		return c, fmt.Errorf("MAILCTL_API_SUBNET=%q is not an IPv4 network (e.g. 172.31.255.16/28)", sub)
 	}
 	c.HubSecretFile = get(env, "MAILCTL_HUB_SECRET_FILE", "/run/portcullis/mail/hub-secret")
+	c.MetricsSecretFile = get(env, "MAILCTL_METRICS_SECRET_FILE", "/run/portcullis/mail/metrics-secret")
 	c.APIKeyFile = get(env, "MAILCTL_API_KEY_FILE", "/run/portcullis/mail/api-key")
 	c.DQSKeyFile = get(env, "MAILCTL_DQS_KEY_FILE", "/run/portcullis/mail/dqs-key")
 

@@ -129,6 +129,11 @@ func checkStart(cfg config.Config, addrs func() ([]net.Addr, error)) error {
 		return fmt.Errorf("the Hub secret: %w", err)
 	}
 	logx.AddSecret(hub)
+	ms, err := api.ReadSecret(cfg.MetricsSecretFile, metrics.MinSecret)
+	if err != nil {
+		return fmt.Errorf("the metrics secret: %w", err)
+	}
+	logx.AddSecret(ms)
 	as, err := addrs()
 	if err != nil {
 		return fmt.Errorf("reading this container's addresses: %w", err)
@@ -183,7 +188,7 @@ func serve(env func(string) string, stderr io.Writer) error {
 		newServer(cfg.APIAddr, apiSrv),
 		newServer(cfg.WellKnownAddr, wellknown.Handler(mc)),
 		newServer(cfg.RulesAddr, spamrules.Handler()),
-		newServer(cfg.MetricsAddr, m.Handler()),
+		newServer(cfg.MetricsAddr, m.Handler(cfg.MetricsSecretFile, api.ReadSecret, logger.Printf)),
 	}
 	adminLn, err := admin.Listen(admin.Socket)
 	if err != nil {

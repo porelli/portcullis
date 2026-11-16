@@ -1649,6 +1649,7 @@ services:
       MAILCTL_API_ADDR: ":8080"
       MAILCTL_API_SUBNET: ${PORTCULLIS_MAILCTL_SUBNET:-172.31.255.16/28}
       MAILCTL_HUB_SECRET_FILE: /run/portcullis/mail/hub-secret
+      MAILCTL_METRICS_SECRET_FILE: /run/portcullis/mail/metrics-secret
       MAILCTL_API_KEY_FILE: /run/portcullis/mail/api-key
       MAILCTL_DQS_KEY_FILE: /run/portcullis/mail/dqs-key
       MAILCTL_STALWART_URL: http://${PORTCULLIS_MAIL_IP:-172.31.255.2}:8080
@@ -1683,6 +1684,8 @@ services:
       - ./secrets/mail/api-key:/run/portcullis/mail/api-key:ro
       - ./secrets/mail/hub-secret:/run/portcullis/mail/hub-secret:ro
       - ./secrets/mail/dqs-key:/run/portcullis/mail/dqs-key:ro
+      # Its /metrics password (Basic auth, user prometheus).
+      - ./secrets/mail/mailctl-metrics-secret:/run/portcullis/mail/metrics-secret:ro
     networks:
       portcullis-mail:
         ipv4_address: ${PORTCULLIS_MAILCTL_MAIL_IP:-172.31.255.3}

@@ -19,7 +19,9 @@ func startCfg(t *testing.T, key, hub string) config.Config {
 	kf, hf := filepath.Join(d, "api-key"), filepath.Join(d, "hub-secret")
 	os.WriteFile(kf, []byte(key), 0o600)
 	os.WriteFile(hf, []byte(hub), 0o600)
-	return config.Config{APIKeyFile: kf, HubSecretFile: hf, APISubnet: netip.MustParsePrefix("172.31.255.16/28")}
+	mf := filepath.Join(d, "metrics-secret")
+	os.WriteFile(mf, []byte("m3tr1cs-0123456789abcdef0123456789abcdef"), 0o600)
+	return config.Config{APIKeyFile: kf, HubSecretFile: hf, MetricsSecretFile: mf, APISubnet: netip.MustParsePrefix("172.31.255.16/28")}
 }
 
 func addrs(ips ...string) func() ([]net.Addr, error) {
@@ -53,6 +55,17 @@ func TestStartRefusesEmptyAPIKey(t *testing.T) {
 func TestStartRefusesHubSecret(t *testing.T) {
 	for _, s := range []string{"", "short"} {
 		if err := checkStart(startCfg(t, "API_x", s), addrs("172.31.255.19/28")); err == nil || !strings.Contains(err.Error(), "Hub secret") {
+			t.Errorf("secret %q: %v", s, err)
+		}
+	}
+}
+
+// Final review I1: no metrics secret (or a short one), no start.
+func TestStartRefusesMetricsSecret(t *testing.T) {
+	for _, s := range []string{"", "short"} {
+		c := startCfg(t, "API_x", hub)
+		os.WriteFile(c.MetricsSecretFile, []byte(s), 0o600)
+		if err := checkStart(c, addrs("172.31.255.19/28")); err == nil || !strings.Contains(err.Error(), "metrics secret") {
 			t.Errorf("secret %q: %v", s, err)
 		}
 	}

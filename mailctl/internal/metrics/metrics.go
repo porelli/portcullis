@@ -1,9 +1,11 @@
 // Package metrics is mailctl's Prometheus registry (contract §19.8),
 // served only on its portcullis-metrics-mail address (MAILCTL_METRICS_ADDR,
-// the alias mailctl-metrics).
+// the alias mailctl-metrics), behind Basic auth (MAILCTL_METRICS_SECRET_FILE).
 package metrics
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"net/http"
 	"time"
 
@@ -46,10 +48,38 @@ func New() *Metrics {
 	return m
 }
 
-// Handler serves /metrics; anything else is 404.
-func (m *Metrics) Handler() http.Handler {
+// User is the scrape login (Prometheus' job mailctl, as for mail).
+const User = "prometheus"
+
+// MinSecret: a shorter metrics secret refuses every scrape.
+const MinSecret = 32
+
+// Handler serves /metrics behind Basic auth (final review I1): User and
+// the secret in secretFile (re-read on every request; unreadable or
+// shorter than MinSecret refuses everything); anything else is 404.
+// readSecret is api.ReadSecret (passed in: no import cycle).
+func (m *Metrics) Handler(secretFile string, readSecret func(string, int) (string, error), logf func(string, ...any)) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("GET /metrics", promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{}))
+	inner := promhttp.HandlerFor(m.Registry, promhttp.HandlerOpts{})
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		secret, err := readSecret(secretFile, MinSecret)
+		if err != nil {
+			if logf != nil {
+				logf("metrics: refusing every scrape: the metrics secret %v", err)
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		want := sha256.Sum256([]byte(User + "\x00" + secret))
+		u, p, ok := r.BasicAuth()
+		got := sha256.Sum256([]byte(u + "\x00" + p))
+		if !ok || len(r.Header.Values("Authorization")) != 1 || subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="mailctl"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		inner.ServeHTTP(w, r)
+	})
 	return mux
 }
 

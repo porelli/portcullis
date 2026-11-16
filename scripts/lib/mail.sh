@@ -180,18 +180,23 @@ mail_cert_ensure() {
 
 # mail_prom_targets — Prometheus' file_sd for jobs mail and mailctl
 # (mail-targets.json: both targets while the profile is on, else []) and
-# the copy of Stalwart's metrics password the mail job sends (empty while
-# off); monitoring_fix_perms gives both Prometheus' group.
+# the copies of Stalwart's and mailctl's metrics passwords the two jobs
+# send (empty while off); monitoring_fix_perms gives them Prometheus'
+# group.
 mail_prom_targets() {
-  local d="${MONITORING_SECRETS:-$PORTCULLIS_ROOT/secrets/monitoring}/prometheus" src="$PORTCULLIS_ROOT/secrets/mail/metrics-secret"
+  local d="${MONITORING_SECRETS:-$PORTCULLIS_ROOT/secrets/monitoring}/prometheus" s="$PORTCULLIS_ROOT/secrets/mail" f
   [ -d "$d" ] || return 0
-  [ -f "$d/mail-metrics-secret" ] || (umask 077 && : > "$d/mail-metrics-secret")
-  if mail_profile_on && [ -s "$src" ]; then
+  for f in mail-metrics-secret mailctl-metrics-secret; do
+    [ -f "$d/$f" ] || (umask 077 && : > "$d/$f")
+  done
+  if mail_profile_on && [ -s "$s/metrics-secret" ] && [ -s "$s/mailctl-metrics-secret" ]; then
     jq -n '[{targets: ["mail-metrics:9180"], labels: {service: "mail"}}, {targets: ["mailctl-metrics:9100"], labels: {service: "mailctl"}}]' > "$d/mail-targets.json"
-    cmp -s "$src" "$d/mail-metrics-secret" || cat "$src" > "$d/mail-metrics-secret"
+    cmp -s "$s/metrics-secret" "$d/mail-metrics-secret" || cat "$s/metrics-secret" > "$d/mail-metrics-secret"
+    cmp -s "$s/mailctl-metrics-secret" "$d/mailctl-metrics-secret" || cat "$s/mailctl-metrics-secret" > "$d/mailctl-metrics-secret"
   else
     echo '[]' > "$d/mail-targets.json"
     : > "$d/mail-metrics-secret"
+    : > "$d/mailctl-metrics-secret"
   fi
 }
 

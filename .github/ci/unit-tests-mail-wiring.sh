@@ -61,6 +61,8 @@ mail_rule() {  # <config json>
     and (binds("/secrets/mail/api-key$") == ["mailctl"])
     and (binds("/secrets/mail/hub-secret$") == ["hub", "mailctl"])
     and (binds("/secrets/mail/dqs-key$") == ["mailctl"])
+    and (binds("/secrets/mail/mailctl-metrics-secret$") == ["mailctl"])
+    and $c.environment.MAILCTL_METRICS_SECRET_FILE == "/run/portcullis/mail/metrics-secret"
     and (binds("/secrets/mail/(metrics-secret|relay-password)$") == ["mail"])
     and (binds("/secrets/mail/gate$") == ["mail"])
     # The start gate: a non-recovery start refuses while the marker exists,
@@ -132,7 +134,8 @@ echo "$CFG_SELINUX" | jq -e --arg p "$PWD/" '
     [.services | to_entries[] | .key as $s | .value.volumes[]? | select(.type == "bind" and (.source | test("/secrets/mail/|/mail/unbound\\.conf$")))
      | "\($s) \(.source | ltrimstr($p)) \(.bind.selinux // "-")"] | sort
     == ["hub secrets/mail/hub-secret z", "mail secrets/mail/gate Z", "mail secrets/mail/metrics-secret Z", "mail secrets/mail/relay-password Z",
-        "mail-resolver mail/unbound.conf Z", "mailctl secrets/mail/api-key Z", "mailctl secrets/mail/dqs-key Z", "mailctl secrets/mail/hub-secret z"]' >/dev/null \
+        "mail-resolver mail/unbound.conf Z", "mailctl secrets/mail/api-key Z", "mailctl secrets/mail/dqs-key Z", "mailctl secrets/mail/hub-secret z",
+        "mailctl secrets/mail/mailctl-metrics-secret Z"]' >/dev/null \
   || { echo "FAIL: the SELinux overlay's mail binds (Z one reader, z the shared hub-secret)"; exit 1; }
 # The recovery admin reaches mail only through its optional env file
 # (compose folds env_file into environment, so read the source).

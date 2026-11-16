@@ -79,7 +79,12 @@ scrape_configs:
       - source_labels: [service]
         regex: mail
         action: keep
+  # mailctl's endpoint needs Basic auth too (its own password, a copy of
+  # secrets/mail/mailctl-metrics-secret).
   - job_name: mailctl
+    basic_auth:
+      username: prometheus
+      password_file: /etc/portcullis/mailctl-metrics-secret
     file_sd_configs:
       - files: [/etc/portcullis/mail-targets.json]
     relabel_configs:

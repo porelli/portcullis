@@ -151,6 +151,7 @@ services:
       - {type: bind, source: ./secrets/mail/api-key, target: /run/portcullis/mail/api-key, read_only: true, bind: {selinux: Z}}
       - {type: bind, source: ./secrets/mail/hub-secret, target: /run/portcullis/mail/hub-secret, read_only: true, bind: {selinux: z}}
       - {type: bind, source: ./secrets/mail/dqs-key, target: /run/portcullis/mail/dqs-key, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/mail/mailctl-metrics-secret, target: /run/portcullis/mail/metrics-secret, read_only: true, bind: {selinux: Z}}
 
   mail-resolver:
     volumes:
