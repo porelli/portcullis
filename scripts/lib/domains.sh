@@ -154,7 +154,10 @@ _domains_age_keygen_docker() {
     --user "$CT_UID_DOMAINS:$CT_UID_DOMAINS" "$DOMAINS_IMAGE_NAME" keygen > "$tmp" \
     && grep -q '^AGE-SECRET-KEY-1' "$tmp" \
     || { rm -f "$tmp"; fail "could not generate secrets/domains/age.key"; }
-  mv -f "$tmp" "$f"
+  # In place (inode kept): the containers bind the file itself, and a
+  # running one never sees a replaced file.
+  [ -e "$f" ] || (umask 077 && : > "$f")
+  cat "$tmp" > "$f" && rm -f "$tmp"
   ok "Generated secrets/domains/age.key (encrypts the domains service's DNS credentials; backed up with secrets/)."
 }
 

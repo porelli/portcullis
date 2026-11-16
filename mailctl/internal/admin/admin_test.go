@@ -83,6 +83,9 @@ func TestSocketTLSKeyWithoutDocument(t *testing.T) {
 	if p.TimerSeenAt != nil {
 		t.Fatal("tls-key counted as the timer's visit")
 	}
+	if out, err := Call(path, "GET", "/status", nil); err == nil && !strings.Contains(string(out), `"document":null`) {
+		t.Fatalf("status without a document: %s", out)
+	}
 	if _, err := Call(path, "POST", "/tls-key", []byte(`{"current":"x"}`)); err == nil {
 		t.Fatal("bad input accepted")
 	}
@@ -141,7 +144,7 @@ func TestSocket(t *testing.T) {
 	if _, err := Call(path, "POST", "/dkim-rotate", []byte(`{"domain":"nope.example"}`)); err == nil || !strings.Contains(err.Error(), "isn't a mail domain") {
 		t.Fatalf("unknown domain %v", err)
 	}
-	if out, err = Call(path, "GET", "/status", nil); err != nil || !strings.Contains(string(out), `"timer_seen_at":"`) || !strings.Contains(string(out), `"checks":null`) {
+	if out, err = Call(path, "GET", "/status", nil); err != nil || !strings.Contains(string(out), `"timer_seen_at":"`) || !strings.Contains(string(out), `"checks":null`) || !strings.Contains(string(out), `"document":{"applied_generation":`) {
 		t.Fatalf("status %s %v", out, err)
 	}
 	if _, err := Call(path, "POST", "/rotate", []byte(`{}`)); err == nil {

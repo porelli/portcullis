@@ -100,7 +100,13 @@ func Handler(m *machines.Machines, st Status) http.Handler {
 		if st.Checks != nil {
 			ck = st.Checks(ctx)
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"status": s, "checks": ck})
+		// document: the Hub's last accepted document (null: none yet —
+		// with mail on, the Hub isn't reaching mailctl; the CLI says so).
+		var doc any
+		if p := m.Store.Get(); p.Doc != nil {
+			doc = map[string]int64{"generation": p.Generation, "applied_generation": p.AppliedGeneration}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": s, "checks": ck, "document": doc})
 	})
 	mux.HandleFunc("POST /dkim-rotate", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {

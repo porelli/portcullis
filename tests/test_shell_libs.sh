@@ -280,6 +280,7 @@ expect_fail "stack_prepare makes no mail volume without the mail profile" grep -
 rm -f "$STUB_DIR/sp-vol"
 printf 'API_k' > "$SP_ROOT/secrets/mail/api-key"
 ino="$(file_inode "$SP_ROOT/secrets/mail/relay-password")"
+HS_INO="$(file_inode "$SP_ROOT/secrets/mail/hub-secret")"
 ( PORTCULLIS_ROOT="$SP_ROOT"; export COMPOSE_PROFILES=monitoring,mail MAIL_RELAY_PASSWORD='r3lay pw' MAIL_SPAMHAUS_DQS_KEY=dqskey
   volume_own() { echo "volume_own $*" >> "$STUB_DIR/sp-vol"; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
   unset -f users_secret_files monitoring_prepare domains_prepare mcpgate_ensure_secrets
@@ -287,6 +288,8 @@ ino="$(file_inode "$SP_ROOT/secrets/mail/relay-password")"
 expect_eq "stack_prepare makes the mail volumes only with the mail profile (owners, modes)" "$(grep '^volume_own mail' "$STUB_DIR/sp-vol" | sort | tr '\n' '|')" \
   "volume_own mail_acme 10004:10004 0700|volume_own mail_data 2000:2000|volume_own mail_etc 2000:2000|volume_own mail_tls 10004:2000 2750|volume_own mailctl_data 10010:10010 0700|"
 expect_eq "stack_prepare: with the mail profile, the Hub secret is generated (48 characters)" "$(wc -c < "$SP_ROOT/secrets/mail/hub-secret" | tr -d ' ')" 48
+expect_eq "stack_prepare: the Hub secret is written in place (the Hub's single-file bind keeps its inode)" \
+  "$(file_inode "$SP_ROOT/secrets/mail/hub-secret")" "$HS_INO"
 expect_eq "stack_prepare: relay-password and dqs-key from .env, in place; api-key kept" \
   "$(cat "$SP_ROOT/secrets/mail/relay-password")|$(cat "$SP_ROOT/secrets/mail/dqs-key")|$(cat "$SP_ROOT/secrets/mail/api-key")|$([ "$(file_inode "$SP_ROOT/secrets/mail/relay-password")" = "$ino" ] && echo same)" "r3lay pw|dqskey|API_k|same"
 HS_NOW="$(cat "$SP_ROOT/secrets/mail/hub-secret")"
@@ -1468,11 +1471,15 @@ expect_eq "mcp-gate: re-run keeps the key, recipient and secret (no keygen)" \
 case "$MOUT" in *"$SECRET_NOW"*|*AGE-SECRET-KEY*) t_fail "mcp-gate: a secret was printed on re-run" ;; *) t_pass "mcp-gate: no secret printed on re-run" ;; esac
 # A lost or stale recipient is rewritten from the key; a short secret is replaced.
 rm -f "$M/age.pub"; printf 'short' > "$M/hub-secret"
+HS_INO="$(file_inode "$M/hub-secret")"
 mcp mcpgate_ensure_secrets >/dev/null 2>&1
+expect_eq "mcp-gate: hub-secret regenerated in place (the binds keep its inode)" "$(file_inode "$M/hub-secret")" "$HS_INO"
 expect_eq "mcp-gate: missing age.pub rebuilt from age.key" "$(cat "$M/age.pub")" "age1mcpgatetestrecipientqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 expect_ok "mcp-gate: a hub-secret under 32 characters is regenerated" grep -Eqx '[A-Za-z0-9]{48}' "$M/hub-secret"
 echo 'age1stale' > "$M/age.pub"
+PUB_INO="$(file_inode "$M/age.pub")"
 mcp mcpgate_ensure_secrets >/dev/null 2>&1
+expect_eq "mcp-gate: age.pub rewritten in place (the Hub's bind keeps its inode)" "$(file_inode "$M/age.pub")" "$PUB_INO"
 expect_eq "mcp-gate: stale age.pub rewritten" "$(cat "$M/age.pub")" "age1mcpgatetestrecipientqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 # A key without its recipient line: refuse (never guess, never regenerate over it).
 printf 'AGE-SECRET-KEY-1XYZ\n' > "$M/age.key"
@@ -5021,6 +5028,24 @@ expect_eq "mail_status_json: services, mailctl's status and checks, a Problem ch
 expect_eq "mail status: the timer missing is a warning line; a Problem check a ✗ line; ok checks not listed" \
   "$(grep -c '! daily timer portcullis-mail.timer missing or inactive' "$ML/sl"):$(grep -c '✗ check cert: expired' "$ML/sl"):$(grep -c '· check port25: not known' "$ML/sl"):$(grep -c 'check blocklist' "$ML/sl")" "1:1:1:0"
 expect_eq "mail status: the status read is mailctl's socket call" "$(grep -c '^rt_exec mailctl -- mailctl status --json$' "$ML/argv")" 1
+# The Hub ⇄ mailctl link is a problem line, never hidden (CI run
+# 43794865309: a hub-secret the Hub couldn't see, only logged by the Hub).
+MOK='{"status":{"cert":null,"dkim":[],"mtasts":[],"dmarc":[],"queue":{"messages":0,"deferred":0},"former":[]},"checks":{"checks":[]}'
+for c in "doc:48:"',"document":{"generation":3,"applied_generation":3}}' "nodoc:48:"',"document":null}' "short:5:"',"document":{"generation":3,"applied_generation":3}}'; do
+  IFS=: read -r name n tail <<<"$c"
+  export MS1="$MOK$tail" HSN="$n"
+  mt 'rt_health() { echo healthy; }; rt_exec() { printf "%s" "$MS1"; }; _mail_timer_state() { echo active; }
+    head -c "$HSN" /dev/zero | tr "\0" a > "$(_mail_dir)/hub-secret"
+    mail_status_json > "$ML/sj"; mail_status_lines "$(cat "$ML/sj")" | sed "s/\x1b\[[0-9;]*m//g" > "$ML/sl"'
+  case "$name" in
+    doc) expect_eq "mail status: the Hub's document there, the secret long enough → the link ok" \
+           "$(jq -c '{s: .hub.secret_ok, g: .hub.document.generation}' "$ML/sj"):$(grep -c "✓ the Hub's document: generation 3, applied 3" "$ML/sl")" '{"s":true,"g":3}:1' ;;
+    nodoc) expect_eq "mail status: mailctl answers but has no document from the Hub → problem line" \
+           "$(jq -r .problem "$ML/sj"):$(grep -c "✗ mailctl has no document from the Hub" "$ML/sl")" "true:1" ;;
+    short) expect_eq "mail status: hub-secret under 32 characters → problem line" \
+           "$(jq -r .problem "$ML/sj"):$(grep -c "✗ the Hub can't reach mailctl: secrets/mail/hub-secret is empty or too short" "$ML/sl")" "true:1" ;;
+  esac
+done
 mt 'rt_health() { echo healthy; }; rt_exec() { return 1; }; _mail_timer_state() { echo active; }; mail_status_json > "$ML/sj"'
 expect_eq "mail_status_json: mailctl not answering → problem, mailctl null" "$(jq -c '{p: .problem, m: .mailctl}' "$ML/sj")" '{"p":true,"m":null}'
 

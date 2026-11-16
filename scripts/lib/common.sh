@@ -892,9 +892,14 @@ mail_prepare() {
   _mail_secret_from_env "$d/dqs-key" MAIL_SPAMHAUS_DQS_KEY
   mail_profile_on || return 0
   # The Hub ↔ mailctl bearer (both bind it): generated once with mail on;
-  # one shorter than mailctl's 32 is replaced.
+  # one shorter than mailctl's 32 is replaced. Written IN PLACE: a
+  # single-file bind pins the inode, and the Hub binds the placeholder
+  # before mail is on (a new file would stay invisible to it).
   if [ "$(tr -d '[:space:]' < "$d/hub-secret" | wc -c | tr -d ' ')" -lt 32 ]; then
-    (umask 077 && gen_alnum 48 > "$d/hub-secret.new") && mv -f "$d/hub-secret.new" "$d/hub-secret"
+    local hs
+    hs="$(gen_alnum 48)"
+    printf '%s' "$hs" > "$d/hub-secret"
+    unset hs
   fi
   volume_own mail_data "$CT_UID_MAIL:$CT_UID_MAIL"
   volume_own mail_etc "$CT_UID_MAIL:$CT_UID_MAIL"

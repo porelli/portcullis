@@ -681,12 +681,18 @@ mail_status_json() {
   done
   ms="$(rt_exec mailctl -- mailctl status --json 2>/dev/null)" || ms=""
   printf '%s' "$ms" | jq -e 'type == "object"' >/dev/null 2>&1 || ms=""
+  # The Hub ⇄ mailctl link (loud: the Hub only logs "mail disabled"): the
+  # bearer long enough on disk, and mailctl holding a document from the Hub.
+  local hsok=false
+  [ "$(tr -d '[:space:]' < "$(_mail_dir)/hub-secret" 2>/dev/null | wc -c | tr -d ' ')" -lt 32 ] || hsok=true
   jq -cn --argjson hs "$hs" --arg ms "$ms" --arg timer "$(_mail_timer_state)" --argjson vp "$(mail_void_pending && echo true || echo false)" \
-    --arg cip "${MAILCTL_CLIENT_IP:-$(mail_client_ip_mode)}" --arg host "$(mail_hostname)" '
+    --arg cip "${MAILCTL_CLIENT_IP:-$(mail_client_ip_mode)}" --arg host "$(mail_hostname)" --argjson hsok "$hsok" '
     ($ms | if . == "" then null else fromjson end) as $m
     | {enabled: true, hostname: $host, services: $hs, timer: $timer, client_ip: $cip,
-       mailctl: ($m.status // null), checks: ($m.checks // null), void_pending: $vp}
+       mailctl: ($m.status // null), checks: ($m.checks // null), void_pending: $vp,
+       hub: {secret_ok: $hsok, document: ($m.document // null)}}
     | .problem = (.void_pending or ([.services[] | select(. != "healthy")] | length) > 0 or .mailctl == null
+                  or (.hub.secret_ok | not) or (.mailctl != null and .hub.document == null)
                   or ([(.checks.checks // [])[] | select(.severity == "problem")] | length) > 0)'
 }
 
@@ -701,6 +707,10 @@ mail_status_lines() {
     def sev: if . == "problem" then "fail" elif . == "warning" then "warn" elif . == "info" then "note" else "ok" end;
     (if .void_pending then ["fail", "mail passwords from a restore are not voided yet: mail stays stopped (./portcullis mail enable)"] else empty end),
     (.services | to_entries[] | [(if .value == "healthy" then "ok" else "fail" end), "\(.key): \(.value)"]),
+    (if (.hub.secret_ok | not) then ["fail", "the Hub can'"'"'t reach mailctl: secrets/mail/hub-secret is empty or too short (./portcullis up)"]
+     elif .mailctl != null and .hub.document == null then ["fail", "mailctl has no document from the Hub: the Hub isn'"'"'t reaching mailctl (its log says why; ./portcullis up restarts it)"]
+     elif .hub.document != null then ["ok", "the Hub'"'"'s document: generation \(.hub.document.generation), applied \(.hub.document.applied_generation)"]
+     else empty end),
     (if .mailctl == null then ["fail", "mailctl didn'"'"'t answer (its status and checks are unknown)"] else
       (.mailctl as $s
        | (if $s.cert == null then ["fail", "no mail certificate for \(.hostname): ./portcullis mail cert"]
