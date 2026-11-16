@@ -187,3 +187,23 @@ func TestSpamRulesPassLateTaskAndReenabledLookup(t *testing.T) {
 		t.Fatalf("not logged: %v", logs)
 	}
 }
+
+// Final review L10: a lookup whose enable is absent is not known to be
+// off: written false once, read back, then left alone (no write, no
+// reload on every pass).
+func TestDisableLookupsAbsentEnable(t *testing.T) {
+	f, c, _ := spamEnv(t)
+	ctx := context.Background()
+	id := f.Put("HttpLookup", "", map[string]any{"namespace": "openphish"})
+	f.Put("HttpLookup", "", map[string]any{"namespace": "phishtank", "enable": false})
+	if n, err := DisableExternalLookups(ctx, c); n != 1 || err != nil {
+		t.Fatalf("first: %d %v", n, err)
+	}
+	if e := f.Get("HttpLookup", "", id)["enable"]; e != false {
+		t.Fatalf("enable %v", e)
+	}
+	f.ResetCalls()
+	if n, err := DisableExternalLookups(ctx, c); n != 0 || err != nil || f.Count("x:HttpLookup/set") != 0 || f.Count("x:Action/set ReloadSettings") != 0 {
+		t.Fatalf("second: %d %v %v", n, err, f.Calls)
+	}
+}

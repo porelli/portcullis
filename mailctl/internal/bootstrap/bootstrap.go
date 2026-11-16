@@ -507,14 +507,38 @@ func ensureAPIKey(ctx context.Context, c *stalwart.Client, mailctlIP netip.Addr,
 // external feeds; mailctl has none of its own) and reloads the settings
 // when it changed one. It returns how many it disabled.
 func DisableExternalLookups(ctx context.Context, c *stalwart.Client) (int, error) {
-	ls, err := getAll(ctx, c, "HttpLookup")
+	enabled := func(ids []string) (map[string]*bool, error) {
+		var ls []struct {
+			ID     string `json:"id"`
+			Enable *bool  `json:"enable"`
+		}
+		if len(ids) > 0 {
+			if err := c.Get(ctx, "HttpLookup", ids, []string{"id", "enable"}, &ls); err != nil {
+				return nil, err
+			}
+		}
+		out := map[string]*bool{}
+		for _, l := range ls {
+			out[l.ID] = l.Enable
+		}
+		return out, nil
+	}
+	ids, err := c.Query(ctx, "HttpLookup", nil)
 	if err != nil {
 		return 0, err
 	}
+	cur, err := enabled(ids)
+	if err != nil {
+		return 0, err
+	}
+	// Only an explicit false is off (final review L10): absent is not
+	// known to be off, so it is written too.
 	off := map[string]map[string]any{}
-	for _, l := range ls {
-		if string(l["enable"]) != "false" {
-			off[str(l, "id")] = map[string]any{"enable": false}
+	var changed []string
+	for id, e := range cur {
+		if e == nil || *e {
+			off[id] = map[string]any{"enable": false}
+			changed = append(changed, id)
 		}
 	}
 	if len(off) == 0 {
@@ -524,7 +548,20 @@ func DisableExternalLookups(ctx context.Context, c *stalwart.Client) (int, error
 	if err := checkSet("HttpLookup", r, err); err != nil {
 		return 0, err
 	}
-	return len(off), c.Action(ctx, "ReloadSettings")
+	if err := c.Action(ctx, "ReloadSettings"); err != nil {
+		return len(off), err
+	}
+	// Read back: every one written must now say false.
+	after, err := enabled(changed)
+	if err != nil {
+		return len(off), err
+	}
+	for _, id := range changed {
+		if e, ok := after[id]; ok && (e == nil || *e) {
+			return len(off), fmt.Errorf("x:HttpLookup %s: enable isn't false after turning it off", id)
+		}
+	}
+	return len(off), nil
 }
 
 // ErrStillWorks: the recovery admin still authenticates.
