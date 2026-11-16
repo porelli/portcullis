@@ -1039,16 +1039,23 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 		}
 	}
 	want := Wanted(s)
+	// Each set is applied on its own: a set that fails is reported and the
+	// others still go (a provider refusing a mail record must not keep
+	// the address or CAA sets from being written, or the reverse).
+	var errs []error
+sets:
 	for _, set := range sets {
 		switch set {
 		case SetAddress:
 			for _, n := range addressNames(s, d) {
 				if c := pick(live, n, "CNAME"); len(c) > 0 {
-					return written, removed, fmt.Errorf("a CNAME %s → %s exists: remove it first (Portcullis doesn't put A/AAAA records next to a CNAME)", bare(n), c[0].Data)
+					errs = append(errs, fmt.Errorf("a CNAME %s → %s exists: remove it first (Portcullis doesn't put A/AAAA records next to a CNAME)", bare(n), c[0].Data))
+					continue sets
 				}
 			}
 			if !s.IPv4.IsValid() {
-				return written, removed, errors.New("the server's public IPv4 is unknown (./portcullis up detects it — run it again — or set PORTCULLIS_PUBLIC_IPV4 in .env)")
+				errs = append(errs, errors.New("the server's public IPv4 is unknown (./portcullis up detects it — run it again — or set PORTCULLIS_PUBLIC_IPV4 in .env)"))
+				continue sets
 			}
 			for _, r := range want[SetAddress] {
 				written = append(written, RefOf(r, zone))
@@ -1064,7 +1071,8 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 					del, err := syncSet(ctx, in.Provider, zone, n, typ, w, live)
 					gone(del)
 					if err != nil {
-						return written, removed, fmt.Errorf("setting the %s records of %s: %w", typ, bare(n), err)
+						errs = append(errs, fmt.Errorf("setting the %s records of %s: %w", typ, bare(n), err))
+						continue sets
 					}
 				}
 			}
@@ -1106,7 +1114,8 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 				del, err := in.Provider.DeleteRecords(ctx, zone, recs)
 				gone(del)
 				if err != nil {
-					return written, removed, fmt.Errorf("removing the CAA records of %s: %w", bare(d), err)
+					errs = append(errs, fmt.Errorf("removing the CAA records of %s: %w", bare(d), err))
+					continue sets
 				}
 				continue
 			}
@@ -1125,7 +1134,8 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 			del, err := syncSet(ctx, in.Provider, zone, d, "CAA", w, live)
 			gone(del)
 			if err != nil {
-				return written, removed, fmt.Errorf("setting the CAA records of %s: %w", bare(d), err)
+				errs = append(errs, fmt.Errorf("setting the CAA records of %s: %w", bare(d), err))
+				continue sets
 			}
 		case SetNoMail:
 			if !s.NoMail || len(s.Mail) > 0 {
@@ -1152,20 +1162,22 @@ func Apply(ctx context.Context, in Input, sets []string) (written, removed []Ref
 				del, err := syncSet(ctx, in.Provider, zone, x.name, x.typ, x.want, live)
 				gone(del)
 				if err != nil {
-					return written, removed, fmt.Errorf("setting the nomail records of %s: %w", bare(d), err)
+					errs = append(errs, fmt.Errorf("setting the nomail records of %s: %w", bare(d), err))
+					continue sets
 				}
 			}
 		case SetMail:
 			w, r, err := applyMail(ctx, in, bare(d), zone, live)
 			written, removed = append(written, w...), append(removed, r...)
 			if err != nil {
-				return written, removed, err
+				errs = append(errs, err)
 			}
 		default:
-			return written, removed, fmt.Errorf("unknown record set %q (one of %s)", set, strings.Join(Sets, ", "))
+			errs = append(errs, fmt.Errorf("unknown record set %q (one of %s)", set, strings.Join(Sets, ", ")))
+			continue sets
 		}
 	}
-	return written, removed, nil
+	return written, removed, errors.Join(errs...)
 }
 
 func refIn(list []Ref, r Ref) bool {

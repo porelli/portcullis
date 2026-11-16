@@ -33,10 +33,11 @@ func deleteModes() []string { return []string{"porkbun", "hetzner"} }
 
 // modeProvider is the fake zone behind the library's delete (and, for
 // porkbun, read) semantics, wrapped as buildProvider wraps the real one.
-func modeProvider(z *fakedns.Zone, mode string) dnsProvider {
+func modeProvider(t testing.TB, z *fakedns.Zone, mode string) dnsProvider {
 	raw := &fakedns.Provider{Zone: z, ZoneName: bzone, DeleteMode: mode}
-	if mode == "porkbun" {
-		return newPorkbunProvider(raw, fakeIDs{raw})
+	if mode == "porkbun" { // our own Porkbun API client, against a fake Porkbun
+		api, _ := newFakePorkbun(t, raw)
+		return newPorkbunProvider(api)
 	}
 	return newByIDDelete(raw, fakeIDs{raw})
 }
@@ -65,7 +66,7 @@ func TestDeleteModeAccountSwitchKeepsCAA(t *testing.T) {
 			z.Set(bname, libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issue", Value: "digicert.com"}.RR(),
 				libdns.CAA{Name: "portcullis", TTL: dnsplan.TTLCAA, Tag: "issue", Value: ov}.RR(),
 				libdns.CAA{Name: "portcullis", TTL: dnsplan.TTLCAA, Tag: "issuewild", Value: ov}.RR())
-			in := dnsplan.Input{Spec: bspec(cur), Zone: bzone, Provider: modeProvider(z, mode)}
+			in := dnsplan.Input{Spec: bspec(cur), Zone: bzone, Provider: modeProvider(t, z, mode)}
 			if _, _, err := dnsplan.Apply(context.Background(), in, []string{dnsplan.SetCAA}); err != nil {
 				t.Fatal(err)
 			}
@@ -85,7 +86,7 @@ func TestDeleteModeIPChangeKeepsA(t *testing.T) {
 			z := fakedns.NewZone()
 			z.Set(bname, libdns.RR{Name: "portcullis", Type: "A", TTL: dnsplan.TTLAddress, Data: "198.51.100.1"})
 			z.Set("*."+bname, libdns.RR{Name: "*.portcullis", Type: "A", TTL: dnsplan.TTLAddress, Data: "198.51.100.1"})
-			in := dnsplan.Input{Spec: bspec(""), Zone: bzone, Provider: modeProvider(z, mode)}
+			in := dnsplan.Input{Spec: bspec(""), Zone: bzone, Provider: modeProvider(t, z, mode)}
 			in.Spec.CAA = false
 			if _, _, err := dnsplan.Apply(context.Background(), in, []string{dnsplan.SetAddress}); err != nil {
 				t.Fatal(err)
@@ -105,7 +106,7 @@ func TestDeleteModeNoMailKeepsUserTXT(t *testing.T) {
 			z := fakedns.NewZone()
 			z.Set(bname, libdns.TXT{Name: "portcullis", TTL: time.Hour, Text: "google-site-verification=abc"}.RR(),
 				libdns.TXT{Name: "portcullis", TTL: time.Hour, Text: "v=spf1 include:mail.test -all"}.RR())
-			in := dnsplan.Input{Spec: bspec(""), Zone: bzone, Provider: modeProvider(z, mode)}
+			in := dnsplan.Input{Spec: bspec(""), Zone: bzone, Provider: modeProvider(t, z, mode)}
 			in.Spec.CAA, in.Spec.NoMail = false, true
 			if _, _, err := dnsplan.Apply(context.Background(), in, []string{dnsplan.SetNoMail}); err != nil {
 				t.Fatal(err)
@@ -137,7 +138,7 @@ func TestDeleteModeDeleteLeavesUserRecords(t *testing.T) {
 				refs = append(refs, RecordRef{Name: rr.Name, Type: rr.Type, Value: rr.Data})
 			}
 			z.Set(bname, rrs...)
-			if err := deleteRecords(context.Background(), modeProvider(z, mode), bzone, refs); err != nil {
+			if err := deleteRecords(context.Background(), modeProvider(t, z, mode), bzone, refs); err != nil {
 				t.Fatal(err)
 			}
 			if got := sortedRRs(z, bname, "CAA"); strings.Join(got, "|") != `0 issue "digicert.com"` {
@@ -170,8 +171,8 @@ func (f fakeIDs) deleteID(ctx context.Context, zone, id string) error {
 	return f.p.DeleteID(ctx, zone, id)
 }
 
-// TestByIDWiring: buildProvider wraps porkbun and hetzner (and only they
-// need it) so their deletes go by record ID.
+// TestByIDWiring: porkbun is our own API client (porkbunProvider); hetzner
+// is wrapped so its deletes go by record ID.
 func TestByIDWiring(t *testing.T) {
 	for name, c := range map[string]map[string]string{
 		"porkbun": {"api_key": "pk1_aaaaaaaa", "secret_api_key": "sk1_bbbbbbbb"},
@@ -182,25 +183,20 @@ func TestByIDWiring(t *testing.T) {
 			t.Fatal(err)
 		}
 		inner, _ := unwrap(p)
+		if name == "porkbun" {
+			pp, ok := inner.(porkbunProvider)
+			if !ok || pp.api.base != porkbunBase || pp.api.key != c["api_key"] || pp.api.secret != c["secret_api_key"] || pp.api.hc.Timeout != providerTimeout {
+				t.Fatalf("porkbun: provider %T %+v", inner, pp)
+			}
+			continue
+		}
 		b, ok := inner.(byIDDelete)
 		if !ok {
 			t.Fatalf("%s: provider %T, want byIDDelete", name, inner)
 		}
-		// Only porkbun's reads are unquoted (porkbunCAARead).
-		if _, pr := b.dnsProvider.(porkbunCAARead); pr != (name == "porkbun") {
-			t.Fatalf("%s: library %T", name, b.dnsProvider)
-		}
-		switch api := b.api.(type) {
-		case porkbunAPI:
-			if name != "porkbun" || api.base != porkbunBase || api.key != c["api_key"] || api.secret != c["secret_api_key"] || api.hc.Timeout != providerTimeout {
-				t.Fatalf("%s: api %+v", name, api)
-			}
-		case hetznerAPI:
-			if name != "hetzner" || api.base != hetznerBase || api.token != c["api_token"] || api.hc.Timeout != providerTimeout {
-				t.Fatalf("%s: api %+v", name, api)
-			}
-		default:
-			t.Fatalf("%s: api %T", name, b.api)
+		api, ok := b.api.(hetznerAPI)
+		if !ok || api.base != hetznerBase || api.token != c["api_token"] || api.hc.Timeout != providerTimeout {
+			t.Fatalf("%s: api %T %+v", name, b.api, b.api)
 		}
 	}
 }
@@ -208,7 +204,7 @@ func TestByIDWiring(t *testing.T) {
 func TestByIDRefusesWholeRRset(t *testing.T) {
 	z := fakedns.NewZone()
 	z.Set(bname, libdns.TXT{Name: "portcullis", Text: "keep"}.RR())
-	p := modeProvider(z, "porkbun")
+	p := modeProvider(t, z, "porkbun")
 	for _, r := range []libdns.Record{libdns.RR{Name: "portcullis", Type: "TXT"}, libdns.RR{Name: "portcullis", Data: "keep"}} {
 		if _, err := p.DeleteRecords(context.Background(), bzone, []libdns.Record{r}); err == nil {
 			t.Fatalf("%+v accepted", r)
@@ -311,7 +307,7 @@ func TestChallengeCleanupPorkbun(t *testing.T) {
 	for _, mode := range deleteModes() {
 		t.Run(mode, func(t *testing.T) {
 			z := fakedns.NewZone()
-			p := modeProvider(z, mode)
+			p := modeProvider(t, z, mode)
 			s := &Service{findZone: func(string) (string, error) { return bzone, nil }}
 			c := &challengeProvider{s: s, p: p}
 			if err := c.Present(bname, "tok", "key-a"); err != nil {
@@ -398,7 +394,7 @@ func TestPorkbunSecondSetupNoop(t *testing.T) {
 		}
 		return nil
 	}}
-	in := dnsplan.Input{Spec: bspec(acct), Zone: bzone, Provider: newPorkbunProvider(raw, fakeIDs{raw})}
+	in := dnsplan.Input{Spec: bspec(acct), Zone: bzone, Provider: newPorkbunProvider(fakePorkbunAPI(t, raw))}
 	if _, _, err := dnsplan.Apply(context.Background(), in, []string{dnsplan.SetAddress, dnsplan.SetCAA}); err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +428,7 @@ func TestPorkbunRelaxThenTighten(t *testing.T) {
 		libdns.CAA{Name: "portcullis", TTL: dnsplan.TTLCAA, Tag: "issuewild", Value: ov}.RR())
 	apply := func(uri string) []string {
 		t.Helper()
-		in := dnsplan.Input{Spec: bspec(uri), Zone: bzone, Provider: modeProvider(z, "porkbun")}
+		in := dnsplan.Input{Spec: bspec(uri), Zone: bzone, Provider: modeProvider(t, z, "porkbun")}
 		if _, _, err := dnsplan.Apply(context.Background(), in, []string{dnsplan.SetCAA}); err != nil {
 			t.Fatal(err)
 		}
@@ -456,7 +452,7 @@ func TestPorkbunForeignCAAKept(t *testing.T) {
 	z := fakedns.NewZone()
 	z.Set(bname, libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issue", Value: "digicert.com; cansignhttpexchanges=yes"}.RR(),
 		libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issuewild", Value: "sectigo.com"}.RR())
-	in := dnsplan.Input{Spec: bspec("https://acme-v02.api.letsencrypt.org/acme/acct/123"), Zone: bzone, Provider: modeProvider(z, "porkbun")}
+	in := dnsplan.Input{Spec: bspec("https://acme-v02.api.letsencrypt.org/acme/acct/123"), Zone: bzone, Provider: modeProvider(t, z, "porkbun")}
 	for i := 0; i < 2; i++ {
 		if _, _, err := dnsplan.Apply(context.Background(), in, []string{dnsplan.SetCAA}); err != nil {
 			t.Fatal(err)
@@ -496,7 +492,7 @@ func TestPorkbunDeleteReadRecordByID(t *testing.T) {
 	v := dnsplan.CAAValue("letsencrypt.org", "https://acme-v02.api.letsencrypt.org/acme/acct/123")
 	z.Set(bname, libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issue", Value: "digicert.com"}.RR(),
 		libdns.CAA{Name: "portcullis", TTL: dnsplan.TTLCAA, Tag: "issue", Value: v}.RR())
-	p := modeProvider(z, "porkbun")
+	p := modeProvider(t, z, "porkbun")
 	recs, err := p.GetRecords(context.Background(), bzone)
 	if err != nil {
 		t.Fatal(err)
@@ -535,7 +531,7 @@ func TestTightenLiteralQuotedLeftover(t *testing.T) {
 				libdns.CAA{Name: "portcullis", TTL: dnsplan.TTLCAA, Tag: "issuewild", Value: ov}.RR(), leftover)
 			var p dnsProvider = &fakedns.Provider{Zone: z, ZoneName: bzone}
 			if mode == "porkbun" {
-				p = modeProvider(z, mode)
+				p = modeProvider(t, z, mode)
 			}
 			in := dnsplan.Input{Spec: bspec(cur), Zone: bzone, Provider: p}
 			if _, _, err := dnsplan.Apply(context.Background(), in, []string{dnsplan.SetCAA}); err != nil {
@@ -581,7 +577,7 @@ func TestBuildPorkbunQuotedCAA(t *testing.T) {
 		libdns.CAA{Name: "portcullis", TTL: dnsplan.TTLCAA, Tag: "issuewild", Value: v}.RR(),
 		libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issue", Value: "digicert.com"}.RR(),
 		libdns.CAA{Name: "portcullis", TTL: time.Hour, Tag: "issuewild", Value: "digicert.com"}.RR())
-	pl := dnsplan.Build(context.Background(), dnsplan.Input{Spec: bspec(acct), Zone: bzone, Provider: modeProvider(z, "porkbun"),
+	pl := dnsplan.Build(context.Background(), dnsplan.Input{Spec: bspec(acct), Zone: bzone, Provider: modeProvider(t, z, "porkbun"),
 		ProviderName: "porkbun", Resolvers: []string{srv.Addr}, Now: time.Unix(1_800_000_000, 0)})
 	var ok, foreign *dnsplan.Item
 	for i, it := range pl.Items {

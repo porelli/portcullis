@@ -59,7 +59,7 @@ func newToolFixture(t *testing.T) *toolFixture {
 				return nil
 			}}
 		if f.deleteMode == "porkbun" { // wrapped as buildProvider wraps the real one
-			return zoneKnown{newPorkbunProvider(raw, fakeIDs{raw}), "example.test."}, nil
+			return zoneKnown{newPorkbunProvider(fakePorkbunAPI(t, raw)), "example.test."}, nil
 		}
 		if f.storedTTL != nil {
 			return zoneKnown{ttlReport{raw, *f.storedTTL}, "example.test."}, nil
