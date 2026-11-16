@@ -110,18 +110,15 @@ func TestAllowedIPs(t *testing.T) {
 	if strings.Join(got, " ") != "127.0.0.1/32 ::1/128" {
 		t.Fatalf("loopback only: %v", got)
 	}
-	got = AllowedIPs(true, []string{"0.0.0.0/6"})
-	if len(got) != 4 || got[0] != "0.0.0.0/8" || got[3] != "3.0.0.0/8" {
-		t.Fatalf("/6 split: %v", got)
+	// Final review L3: an "anywhere" range is never split into allowed
+	// pieces: left out (loopback only when nothing else is left).
+	got = AllowedIPs(true, []string{"0.0.0.0/0", "::/0", "0.0.0.0/1", "128.0.0.0/1", "0.0.0.0/6", "::ffff:0.0.0.0/96"})
+	if strings.Join(got, " ") != "127.0.0.1/32 ::1/128" {
+		t.Fatalf("anywhere ranges: %v", got)
 	}
-	got = AllowedIPs(true, []string{"0.0.0.0/0", "::/0"})
-	if len(got) != 256 {
-		t.Fatalf("/0 → 256 /8s and no ::/0: %d", len(got))
-	}
-	for _, g := range got {
-		if strings.HasSuffix(g, "/0") {
-			t.Fatal("a /0 written")
-		}
+	got = AllowedIPs(true, []string{"0.0.0.0/0", "192.168.1.0/24"})
+	if strings.Join(got, " ") != "192.168.1.0/24" {
+		t.Fatalf("mixed: %v", got)
 	}
 	if !sort.StringsAreSorted(got) {
 		t.Fatal("unsorted")

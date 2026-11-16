@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/portcullis/mailctl/internal/stalwart"
+	"github.com/portcullis/mailctl/internal/state"
 )
 
 // MaxActive is the most active mail passwords per person.
@@ -48,8 +49,8 @@ func ValidLabel(l string) bool {
 
 // AllowedIPs is a mail password's allowedIps (contract §19.6): nil (the
 // field left out: anywhere; Stalwart refuses /0 and an empty set means
-// anywhere) without LAN-only; with it the Local networks, an IPv4 prefix
-// shorter than /8 split into its /8s, and none at all = loopback only
+// anywhere) without LAN-only; with it the Local networks (never one that
+// amounts to anywhere: state.LocalNetworkOK), and none at all = loopback only
 // (127.0.0.1/32 + ::1/128), never an empty set.
 func AllowedIPs(lanOnly bool, local []string) []string {
 	if !lanOnly {
@@ -62,18 +63,12 @@ func AllowedIPs(lanOnly bool, local []string) []string {
 			continue
 		}
 		p = p.Masked()
-		switch {
-		case p.Addr().Is4() && p.Bits() < 8:
-			base := p.Addr().As4()
-			for i := 0; i < 1<<(8-p.Bits()); i++ {
-				out = append(out, netip.PrefixFrom(netip.AddrFrom4([4]byte{base[0] + byte(i), 0, 0, 0}), 8).String())
-			}
-		case p.Addr().Is6() && p.Bits() == 0:
-			// ::/0 can't be written and isn't a local network: left out
-			// (narrower, never wider).
-		default:
-			out = append(out, p.String())
+		// The document is refused with such a network (state.Parse);
+		// here too it is left out, never split or widened (L3).
+		if state.LocalNetworkOK(p) != nil {
+			continue
 		}
+		out = append(out, p.String())
 	}
 	if len(out) == 0 {
 		out = []string{"127.0.0.1/32", "::1/128"}

@@ -382,11 +382,54 @@ func (d *Doc) validate() error {
 			return fmt.Errorf("spam: %q is neither a domain nor an address", e)
 		}
 	}
+	if len(d.LocalNetworks) > MaxLocalNetworks {
+		return fmt.Errorf("local_networks: more than %d networks", MaxLocalNetworks)
+	}
 	for _, n := range d.LocalNetworks {
 		p, err := netip.ParsePrefix(n)
 		if err != nil || p.Masked() != p {
 			return fmt.Errorf("local_networks: %q is not a network", n)
 		}
+		if err := LocalNetworkOK(p); err != nil {
+			return fmt.Errorf("local_networks: %s: %w", n, err)
+		}
+	}
+	return nil
+}
+
+// MaxLocalNetworks bounds local_networks: with the per-network bounds
+// below, the list can never amount to anywhere.
+const MaxLocalNetworks = 64
+
+// localBlocks are the private and special-use ranges a LAN uses: a
+// network inside one of them may be as wide as the block.
+var localBlocks = []netip.Prefix{
+	netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"), netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("169.254.0.0/16"), netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("fc00::/7"), netip.MustParsePrefix("fe80::/10"), netip.MustParsePrefix("::1/128"),
+}
+
+// LocalNetworkOK refuses a network that is, or helps amount to,
+// "anywhere" (final review L3): inside a private block any width up to
+// the block; elsewhere at most an IPv4 /16 or an IPv6 /32 (a site, never
+// a slice of the internet). IPv4-mapped and NAT64 prefixes (which name
+// IPv4 space in IPv6) are refused. Nothing is ever split or widened.
+func LocalNetworkOK(p netip.Prefix) error {
+	a := p.Addr()
+	if a.Is4In6() || netip.MustParsePrefix("64:ff9b::/96").Overlaps(p) {
+		return errors.New("an IPv4-mapped or NAT64 range is not a local network")
+	}
+	for _, b := range localBlocks {
+		if b.Bits() <= p.Bits() && b.Contains(a) {
+			return nil
+		}
+	}
+	if a.Is4() && p.Bits() < 16 {
+		return errors.New("a public IPv4 range wider than /16 is not a local network")
+	}
+	if a.Is6() && p.Bits() < 32 {
+		return errors.New("a public IPv6 range wider than /32 is not a local network")
 	}
 	return nil
 }
