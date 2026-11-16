@@ -1,5 +1,5 @@
 // Package admin is mailctl's control socket for the CLI (`docker compose
-// exec mailctl mailctl dns|rotate|status`): a unix socket inside the
+// exec mailctl mailctl dns|rotate|tls-key|status`): a unix socket inside the
 // container, 0600, so only mailctl's own uid (the exec's user) reaches it.
 // Nothing listens on a network for these.
 package admin
@@ -70,6 +70,23 @@ func Handler(m *machines.Machines, st Status) http.Handler {
 		// what the state says); the error goes to mailctl's log.
 		writeJSON(w, http.StatusOK, out)
 	})
+	mux.HandleFunc("POST /tls-key", func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 4096))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, "unreadable input")
+			return
+		}
+		cur, err := ParseTLSKey(b)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := m.RecordKey(cur); err != nil {
+			writeErr(w, http.StatusServiceUnavailable, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"current": cur})
+	})
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
@@ -108,6 +125,24 @@ func Handler(m *machines.Machines, st Status) http.Handler {
 		}
 	})
 	return mux
+}
+
+// ParseTLSKey reads `mailctl tls-key --json`'s stdin strictly:
+// {"current": <sha256 hex>} (lowercased).
+func ParseTLSKey(b []byte) (string, error) {
+	bad := fmt.Errorf(`the input must be {"current": <the certificate's SPKI sha256 hex>}`)
+	var in struct {
+		Current *string `json:"current"`
+	}
+	if state.NoDuplicateKeys(b) != nil {
+		return "", bad
+	}
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.DisallowUnknownFields()
+	if d.Decode(&in) != nil || d.More() || in.Current == nil || !isHex64(*in.Current) {
+		return "", bad
+	}
+	return strings.ToLower(*in.Current), nil
 }
 
 // ParseRotate reads `mailctl rotate --json`'s stdin strictly:

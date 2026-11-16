@@ -5090,6 +5090,14 @@ mt ': > "$(mail_void_marker)"; export MAIL_RECOVERY_SESSION=1; _rtd_start mail';
 expect_eq "marker + the recovery session's flag → allowed" "$rc:$(grep -c '^start mail$' "$ML/argv")" "0:1"
 mt 'runtime_build_all() { :; }; stack_compose_up mail'; rc=$?
 expect_eq "no marker → mail starts as usual" "$rc:$(grep -c '^up -d --no-build mail$' "$ML/argv")" "0:1"
+# mail enable gives mailctl the certificate's key (mail test pins it)
+# before the Hub's first document; on stdin, never argv.
+mt 'rt_exec() { echo "rt_exec $*" >> "$ML/argv"; cat >> "$ML/stdin"; }; MAIL_CERT_SPKI='"$(printf 'a%.0s' $(seq 64))"'; _mail_tls_key'; rc=$?
+expect_eq "_mail_tls_key: {current} on mailctl tls-key's stdin" "$rc:$(grep -c '^rt_exec -i mailctl -- mailctl tls-key --json$' "$ML/argv"):$(jq -r '.current | length' "$ML/stdin")" "0:1:64"
+mt 'rt_exec() { echo "rt_exec $*" >> "$ML/argv"; }; MAIL_CERT_SPKI=; _mail_tls_key'; rc=$?
+expect_eq "_mail_tls_key: no key from mail-cert → refused, nothing sent" "$rc:$(cat "$ML/argv" 2>/dev/null | grep -c 'rt_exec')" "1:0"
+mt 'rt_exec() { return 1; }; MAIL_CERT_SPKI='"$(printf 'b%.0s' $(seq 64))"'; _mail_tls_key'; rc=$?
+expect_eq "_mail_tls_key: mailctl refusing → enable fails" "$rc:$(grep -c "tls-key failed" "$ML/out")" "1:1"
 # IPv6 for mail isn't supported yet: a set MAIL_IPV6 is refused.
 mt 'export MAIL_IPV6=on; mail_ipv6_refuse'; rc=$?
 expect_eq "MAIL_IPV6 set → refused (isn't supported yet)" "$rc:$(grep -c "MAIL_IPV6 isn't supported yet" "$ML/out")" "1:1"

@@ -728,6 +728,19 @@ func (m *Machines) Rotate(ctx context.Context, in RotateIn) (RotateOut, error) {
 	return RotateOut{DNSSet: set, SwitchKey: sw}, err
 }
 
+// RecordKey records the mail certificate's current SPKI only (`mailctl
+// tls-key`: mail enable, before the Hub's first document — Rotate needs
+// one for the main domain's set). The same TLSA update as Rotate's with
+// no next key; nothing else (no pass, not the timer's visit).
+func (m *Machines) RecordKey(current string) error {
+	now := m.now()
+	return m.Store.Update(func(s *state.Persistent) error {
+		ts, _ := tlsa.Update(state.TLSA(*s), strings.ToLower(current), "", now)
+		put(s, extTLSA, ts)
+		return nil
+	})
+}
+
 // DKIMRotate is the dkim-rotate action.
 func (m *Machines) DKIMRotate(ctx context.Context, domain string) error {
 	m.mu.Lock() // Step rewrites these records: no action in between

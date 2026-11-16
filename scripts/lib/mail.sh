@@ -441,6 +441,20 @@ mail_after_up() {
   mail_image_update
 }
 
+# _mail_tls_key — mailctl learns the mail certificate's current key now
+# (mail-cert's spki_sha256 in MAIL_CERT_SPKI), not at the timer's first
+# rotate: that one needs the Hub's document, and mail test pins the key.
+_mail_tls_key() {
+  local start=$SECONDS
+  [ -n "${MAIL_CERT_SPKI:-}" ] || fail "mail-cert printed no key (spki_sha256)"
+  until [ "$(rt_health mailctl)" = healthy ]; do
+    [ $((SECONDS - start)) -lt "$MAIL_HEALTH_WAIT" ] || fail "mailctl didn't become healthy: docker compose logs mailctl"
+    sleep 2
+  done
+  jq -cn --arg c "$MAIL_CERT_SPKI" '{current: $c}' | rt_exec -i mailctl -- mailctl tls-key --json >/dev/null \
+    || fail "mailctl tls-key failed (the mail certificate's key isn't recorded)"
+}
+
 # mail_enable <hostname> <lan_only> <yes> <rotate>
 mail_enable() {
   local host="$1" lan="$2" yes="$3"
@@ -468,6 +482,7 @@ mail_enable() {
   if declare -F monitoring_fix_perms >/dev/null; then monitoring_fix_perms; fi
   stack_compose_up mail mail-resolver mailctl traefik hub
   mail_image_update
+  _mail_tls_key
   ok "Mail is on. DNS: ./portcullis dns setup --only mail; status: ./portcullis mail status"
   if [ "$yes" = true ] || confirm "Install the daily mail timer (certificate, DKIM, records) now?"; then
     mail_schedule_systemd ""
@@ -787,7 +802,8 @@ Turn the mail server on (contract §19): adds mail to COMPOSE_PROFILES,
 writes MAIL_HOSTNAME (default mail.<domain>) and MAILCTL_CLIENT_IP, issues
 the mail certificate through your DNS provider (mail-cert), bootstraps
 Stalwart in recovery mode (the recovery admin exists only during it and is
-checked gone after), and starts mail, mail-resolver and mailctl. Idempotent.
+checked gone after), starts mail, mail-resolver and mailctl, and gives
+mailctl the certificate's key. Idempotent.
 --lan-only true: mail passwords work only from the Hub's Local networks.
 --rotate-key: replace mailctl's Stalwart API key.
 Docker or rootless Podman only; rootless Podman needs

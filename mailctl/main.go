@@ -48,7 +48,7 @@ import (
 	"github.com/portcullis/mailctl/internal/wellknown"
 )
 
-const usage = `usage: mailctl [serve|healthcheck|bootstrap [--rotate-key|--verify-gone]|void|dns|rotate|reload-tls|status|export|test]`
+const usage = `usage: mailctl [serve|healthcheck|bootstrap [--rotate-key|--verify-gone]|void|dns|rotate|tls-key|reload-tls|status|export|test]`
 
 // later are the subcommands later tasks fill (each talks to the running
 // serve process or to Stalwart directly, as its task says).
@@ -81,7 +81,7 @@ func run(args []string, env func(string) string, stdout, stderr io.Writer) int {
 		return exportCmd(args[1:], env, stdout, stderr)
 	case cmd == "reload-tls":
 		return reloadTLS(env, stderr)
-	case cmd == "dns" || cmd == "rotate" || cmd == "status" || cmd == "dkim":
+	case cmd == "dns" || cmd == "rotate" || cmd == "tls-key" || cmd == "status" || cmd == "dkim":
 		return adminCmd(cmd, args[1:], os.Stdin, stdout, stderr)
 	case cmd == "test":
 		return testCmd(args[1:], env, stdout, stderr)
@@ -328,10 +328,10 @@ func testCmd(args []string, env func(string) string, stdout, stderr io.Writer) i
 
 // adminCmd is `mailctl dns --main --json`, `mailctl rotate --json` (stdin:
 // {"dnssec_state", "spki": {"current", "next"}}) and `mailctl status
-// --json`: one call on the running serve's control socket, its JSON on
+// --json`, `mailctl tls-key --json` (stdin: {"current"}): one call on the running serve's control socket, its JSON on
 // stdout.
 func adminCmd(cmd string, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	want := map[string][]string{"dns": {"--main", "--json"}, "rotate": {"--json"}, "status": {"--json"}, "dkim": {"rotate", "<domain>", "--json"}}[cmd]
+	want := map[string][]string{"dns": {"--main", "--json"}, "rotate": {"--json"}, "tls-key": {"--json"}, "status": {"--json"}, "dkim": {"rotate", "<domain>", "--json"}}[cmd]
 	var domain string
 	if cmd == "dkim" && len(args) == 3 && args[0] == "rotate" && args[2] == "--json" {
 		domain, args = strings.ToLower(args[1]), []string{"rotate", "<domain>", "--json"}
@@ -363,6 +363,17 @@ func adminCmd(cmd string, args []string, stdin io.Reader, stdout, stderr io.Writ
 			return 2
 		}
 		b, err = admin.Call(admin.Socket, http.MethodPost, "/rotate", in)
+	case "tls-key":
+		in, rerr := io.ReadAll(io.LimitReader(stdin, 4096))
+		if rerr != nil {
+			fmt.Fprintf(stderr, "mailctl tls-key: reading stdin: %v\n", rerr)
+			return 2
+		}
+		if _, perr := admin.ParseTLSKey(in); perr != nil {
+			fmt.Fprintf(stderr, "mailctl tls-key: %v\n", perr)
+			return 2
+		}
+		b, err = admin.Call(admin.Socket, http.MethodPost, "/tls-key", in)
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "mailctl %s: %s\n", cmd, logx.Redact(err.Error()))
