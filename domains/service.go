@@ -71,6 +71,10 @@ type Config struct {
 	// MailHostname: MAIL_HOSTNAME (DOMAINS_MAIL_HOSTNAME; "" = mail.<main>):
 	// never an added domain, nor at or under one's mail names (checkName).
 	MailHostname string
+	// MailOn: mail is on (DOMAINS_MAIL=on, the CLI's public-ips.env): the
+	// read-only main plan's address set owns MAIL_HOSTNAME's A / AAAA too
+	// (the dns tool's does with mail_hostname).
+	MailOn bool
 	// ACMEHTTPClient overrides lego's HTTP client (tests: Pebble's TLS).
 	ACMEHTTPClient *http.Client
 	Now            func() time.Time
@@ -1183,6 +1187,12 @@ var errMainUnavailable = errors.New("the main domain's DNS plan isn't ready yet:
 func (s *Service) buildMainPlan(ctx context.Context) dnsplan.Plan {
 	sp := dnsplan.Spec{Name: s.cfg.MainDomain, IPv4: s.cfg.IPv4, IPv6: s.cfg.IPv6, CAA: s.cfg.CAA, Issuer: s.cfg.CAAIssuer,
 		AccountURI: s.cfg.MainAccountURI, IODEF: s.cfg.CAAIODEF, Main: true}
+	if s.cfg.MailOn {
+		sp.MailHost = s.cfg.MailHostname
+		if sp.MailHost == "" {
+			sp.MailHost = "mail." + s.cfg.MainDomain
+		}
+	}
 	return s.finishPlan(dnsplan.Build(ctx, dnsplan.Input{Spec: sp, Resolvers: s.cfg.Resolvers, Now: s.cfg.Now()}))
 }
 

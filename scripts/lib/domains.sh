@@ -241,7 +241,11 @@ domains_public_ips() {
   fi
   unset -f _enrolled
   export PORTCULLIS_PUBLIC_IPV4="$v4" PORTCULLIS_PUBLIC_IPV6="$v6"
-  (umask 077 && printf 'DOMAINS_PUBLIC_IPV4=%s\nDOMAINS_PUBLIC_IPV6=%s\n' "$v4" "$v6" > "$(_domains_dir)/public-ips.env")
+  # DOMAINS_MAIL: mail is on (the main plan's address set then owns
+  # MAIL_HOSTNAME's addresses too).
+  local mail=off
+  if declare -F mail_profile_on >/dev/null && mail_profile_on; then mail=on; fi
+  (umask 077 && printf 'DOMAINS_PUBLIC_IPV4=%s\nDOMAINS_PUBLIC_IPV6=%s\nDOMAINS_MAIL=%s\n' "$v4" "$v6" "$mail" > "$(_domains_dir)/public-ips.env")
 }
 
 # domains_prepare — every file the domains service, the Hub and Traefik

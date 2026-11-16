@@ -1396,7 +1396,8 @@ expect_ok "domains: client cert clientAuth" sh -c "openssl x509 -in '$E/client.c
 expect_ok "domains: ECDSA P-256" sh -c "openssl x509 -in '$E/server.crt' -noout -text | grep -qE 'prime256v1|P-256'"
 expect_ok "domains: server/client valid until the CA expires (~10 years)" sh -c "openssl x509 -checkend $((3600*86400)) -noout -in '$E/server.crt' && openssl x509 -checkend $((3600*86400)) -noout -in '$E/client.crt' && ! openssl x509 -checkend $((3660*86400)) -noout -in '$E/client.crt'"
 expect_eq "domains: public-ips.env written for compose (env_file)" "$(cat "$DR/secrets/domains/public-ips.env")" "DOMAINS_PUBLIC_IPV4=203.0.113.9
-DOMAINS_PUBLIC_IPV6="
+DOMAINS_PUBLIC_IPV6=
+DOMAINS_MAIL=off"
 expect_eq "domains: public-ips.env 0600" "$(file_mode "$DR/secrets/domains/public-ips.env")" 600
 expect_ok "domains: CA valid ~10 years" sh -c "openssl x509 -checkend $((3600*86400)) -noout -in '$E/ca.crt'"
 dom domains_fix_perms >/dev/null 2>&1
@@ -1631,7 +1632,8 @@ echo 0 > "$STUB_DIR/enrolled"
 ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.8
 expect_eq "domains: confirmed 0, failed lookups = no address (not the last one)" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6 | tail -n1)" "/"
 expect_eq "domains: confirmed 0, failed lookups write empty addresses" "$(cat "$PORTCULLIS_ROOT/secrets/domains/public-ips.env")" "DOMAINS_PUBLIC_IPV4=
-DOMAINS_PUBLIC_IPV6="
+DOMAINS_PUBLIC_IPV6=
+DOMAINS_MAIL=off"
 # Enrolled, a transient IPv6 / IPv4 detection failure keeps the last address.
 echo 2 > "$STUB_DIR/enrolled"
 ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.7
@@ -1640,7 +1642,8 @@ expect_eq "domains: explicit empty IPv6 still means none" "$(pubips export PORTC
 ipans https://api.ipify.org 198.51.99.7 https://ipv4.icanhazip.com 198.51.99.8
 expect_eq "domains: enrolled, IPv4 detection failure keeps the last address" "$(pubips unset PORTCULLIS_PUBLIC_IPV4 PORTCULLIS_PUBLIC_IPV6)" "198.51.99.7/2a01:4f8::5"
 expect_eq "domains: the env file has the kept addresses" "$(cat "$PORTCULLIS_ROOT/secrets/domains/public-ips.env")" "DOMAINS_PUBLIC_IPV4=198.51.99.7
-DOMAINS_PUBLIC_IPV6=2a01:4f8::5"
+DOMAINS_PUBLIC_IPV6=2a01:4f8::5
+DOMAINS_MAIL=off"
 # `down` then `up` of an enrolled server: domains_prepare runs before the
 # service starts (unknown); a transient IPv6 failure keeps the last IPv6
 # (an empty one would remove the AAAA records at <d> and *.<d>).
@@ -5103,6 +5106,10 @@ mt 'rt_exec() { echo "rt_exec $*" >> "$ML/argv"; }; MAIL_CERT_SPKI=; _mail_tls_k
 expect_eq "_mail_tls_key: no key from mail-cert → refused, nothing sent" "$rc:$(cat "$ML/argv" 2>/dev/null | grep -c 'rt_exec')" "1:0"
 mt 'rt_exec() { return 1; }; MAIL_CERT_SPKI='"$(printf 'b%.0s' $(seq 64))"'; _mail_tls_key'; rc=$?
 expect_eq "_mail_tls_key: mailctl refusing → enable fails" "$rc:$(grep -c "tls-key failed" "$ML/out")" "1:1"
+# With the mail profile the domains service's env file says mail is on
+# (its main plan then owns MAIL_HOSTNAME's addresses).
+mt 'mkdir -p "$ML/root/secrets/domains"; export PORTCULLIS_PUBLIC_IPV4=203.0.113.25 PORTCULLIS_PUBLIC_IPV6=; domains_public_ips'
+expect_eq "domains env file: DOMAINS_MAIL=on with the mail profile" "$(grep '^DOMAINS_MAIL=' "$ML/root/secrets/domains/public-ips.env" 2>/dev/null)" "DOMAINS_MAIL=on"
 # IPv6 for mail isn't supported yet: a set MAIL_IPV6 is refused.
 mt 'export MAIL_IPV6=on; mail_ipv6_refuse'; rc=$?
 expect_eq "MAIL_IPV6 set → refused (isn't supported yet)" "$rc:$(grep -c "MAIL_IPV6 isn't supported yet" "$ML/out")" "1:1"

@@ -1760,6 +1760,27 @@ func TestMainPlanReadOnly(t *testing.T) {
 	}
 }
 
+// With mail on, the main plan's address set lists MAIL_HOSTNAME's A
+// (the Hub reads this plan): never as a stray record, never without mail.
+func TestMainPlanMailHostAddress(t *testing.T) {
+	for _, on := range []bool{true, false} {
+		e := newEnvWith(t, false, func(c *Config) { c.MailOn = on })
+		host := "mail." + testMain
+		got := false
+		for _, it := range e.planOf("/main/dns?refresh=1").Items {
+			if it.Name == host && it.Type == "A" {
+				if it.Set != dnsplan.SetAddress {
+					t.Fatalf("mail %v: %s A in set %s", on, host, it.Set)
+				}
+				got = true
+			}
+		}
+		if got != on {
+			t.Fatalf("mail %v: %s's A item listed = %v", on, host, got)
+		}
+	}
+}
+
 func TestAccountEndpoint(t *testing.T) {
 	e := newEnv(t, false)
 	var a map[string]string

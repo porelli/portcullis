@@ -480,7 +480,9 @@ mail_enable() {
   hub_env_write
   mail_prom_targets
   if declare -F monitoring_fix_perms >/dev/null; then monitoring_fix_perms; fi
-  stack_compose_up mail mail-resolver mailctl traefik hub
+  # domains too: its env file now says mail is on (the main plan's
+  # MAIL_HOSTNAME address).
+  stack_compose_up mail mail-resolver mailctl traefik hub domains
   mail_image_update
   _mail_tls_key
   ok "Mail is on. DNS: ./portcullis dns setup (the mail records and $(mail_hostname)'s address); status: ./portcullis mail status"

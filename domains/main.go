@@ -311,6 +311,7 @@ func run() error {
 		MainAccountURI: strings.TrimSpace(os.Getenv("DOMAINS_MAIN_ACME_ACCOUNT_URI")),
 		MailFrom:       strings.TrimSpace(os.Getenv("ALERT_SMTP_FROM")),
 		MailHostname:   strings.ToLower(strings.TrimSuffix(strings.TrimSpace(os.Getenv("DOMAINS_MAIL_HOSTNAME")), ".")),
+		MailOn:         strings.TrimSpace(os.Getenv("DOMAINS_MAIL")) == "on",
 	}
 	if u := cfg.MainAccountURI; u != "" && !dnsplan.ValidAccountURI(u) {
 		return fmt.Errorf("DOMAINS_MAIN_ACME_ACCOUNT_URI=%q is not an ACME account URI (secrets/domains/main-domain.env)", u)
