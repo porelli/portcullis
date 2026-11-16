@@ -82,7 +82,7 @@ func (f *fakeStalwart) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				ids = append(ids, id)
 			}
 		}
-		out = map[string]any{"ids": ids}
+		out = map[string]any{"ids": ids, "total": len(f.objs[store])}
 	case "get":
 		var ids []string
 		json.Unmarshal(args["ids"], &ids)

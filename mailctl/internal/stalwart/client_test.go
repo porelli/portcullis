@@ -133,10 +133,18 @@ func TestQueryPagesAndGetChunks(t *testing.T) {
 		var out any
 		switch method {
 		case "x:MemoryLookupKey/query":
-			var pos int
+			var pos, limit int
+			var withTotal bool
 			json.Unmarshal(args["position"], &pos)
+			json.Unmarshal(args["limit"], &limit)
+			json.Unmarshal(args["calculateTotal"], &withTotal)
+			if limit != QueryPage || !withTotal {
+				t.Errorf("query args: limit %d calculateTotal %v", limit, withTotal)
+			}
+			// The server's own cap (250) is below the asked limit:
+			// Query keeps paging until the total.
 			end := min(pos+250, len(ids))
-			out = map[string]any{"ids": ids[pos:end], "position": pos}
+			out = map[string]any{"ids": ids[pos:end], "position": pos, "total": len(ids)}
 		case "x:MemoryLookupKey/get":
 			var want []string
 			json.Unmarshal(args["ids"], &want)
@@ -160,5 +168,54 @@ func TestQueryPagesAndGetChunks(t *testing.T) {
 	var objs []struct{ ID string }
 	if err := c.Get(context.Background(), "MemoryLookupKey", got, nil, &objs); err != nil || len(objs) != 600 {
 		t.Fatalf("get: %d %v", len(objs), err)
+	}
+}
+
+// TestQueryFailsClosed: Stalwart v1.1.0 pages by position + limit and
+// answers total (checked on the builder with 1500 objects); any other
+// answer is an error, never a partial list.
+func TestQueryFailsClosed(t *testing.T) {
+	cases := map[string]func(pos int) map[string]any{
+		"no total": func(pos int) map[string]any {
+			return map[string]any{"ids": []string{"a", "b"}[min(pos, 2):]}
+		},
+		"position ignored": func(pos int) map[string]any {
+			return map[string]any{"ids": []string{"a", "b"}, "total": 4}
+		},
+		"short read": func(pos int) map[string]any {
+			if pos > 0 {
+				return map[string]any{"ids": []string{}, "total": 4}
+			}
+			return map[string]any{"ids": []string{"a", "b"}, "total": 4}
+		},
+		"total moved": func(pos int) map[string]any {
+			if pos > 0 {
+				return map[string]any{"ids": []string{"c"}, "total": 3}
+			}
+			return map[string]any{"ids": []string{"a", "b"}, "total": 4}
+		},
+		"more than the total": func(pos int) map[string]any {
+			return map[string]any{"ids": []string{"a", "b", "c"}, "total": 2}
+		},
+	}
+	for name, answer := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					MethodCalls [][3]json.RawMessage `json:"methodCalls"`
+				}
+				json.NewDecoder(r.Body).Decode(&req)
+				var args map[string]json.RawMessage
+				json.Unmarshal(req.MethodCalls[0][1], &args)
+				var pos int
+				json.Unmarshal(args["position"], &pos)
+				json.NewEncoder(w).Encode(map[string]any{"methodResponses": []any{[]any{"x:AppPassword/query", answer(pos), "0"}}})
+			}))
+			defer srv.Close()
+			got, err := New(srv.URL, Bearer("k")).Query(context.Background(), "AppPassword", nil)
+			if err == nil || got != nil {
+				t.Fatalf("want an error and no ids, got %v %v", got, err)
+			}
+		})
 	}
 }

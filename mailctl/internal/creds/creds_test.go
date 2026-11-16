@@ -143,3 +143,35 @@ func TestVoidAll(t *testing.T) {
 		t.Fatal("passwords left")
 	}
 }
+
+// TestVoidAllPagesFailClosed: more passwords and accounts than a page;
+// a broken page is an error, never "voided".
+func TestVoidAllPagesFailClosed(t *testing.T) {
+	old := stalwart.QueryPage
+	stalwart.QueryPage = 2
+	t.Cleanup(func() { stalwart.QueryPage = old })
+	f, c, id := setup(t)
+	others := []string{
+		f.Put("Account", "", map[string]any{"@type": "User", "name": "bob", "domainId": "x"}),
+		f.Put("Account", "", map[string]any{"@type": "User", "name": "carol", "domainId": "x"}),
+	}
+	for i := 0; i < 5; i++ {
+		f.Put("AppPassword", id, map[string]any{"description": "a"})
+	}
+	for _, o := range others {
+		f.Put("AppPassword", o, map[string]any{"description": "b"})
+		f.Put("AppPassword", o, map[string]any{"description": "c"})
+		f.Put("AppPassword", o, map[string]any{"description": "d"})
+	}
+	n, err := VoidAll(context.Background(), c)
+	if err != nil || n != 11 {
+		t.Fatalf("voided %d: %v", n, err)
+	}
+	f.Put("AppPassword", others[1], map[string]any{"description": "e"})
+	for _, mode := range []string{"short", "no-total", "ignore-position"} {
+		f.QueryMode = mode
+		if _, err := VoidAll(context.Background(), c); err == nil {
+			t.Fatalf("%s: a broken page voided", mode)
+		}
+	}
+}

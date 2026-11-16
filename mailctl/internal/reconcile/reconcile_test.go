@@ -528,3 +528,38 @@ func TestRejoinDestroysPasswords(t *testing.T) {
 		t.Fatalf("permissions after the rejoin: %v", p)
 	}
 }
+
+// TestBrokenPagingChangesNothing: a live read that doesn't add up to the
+// total stops the pass before any decision or write (no mass-removal
+// verdict, no deletes).
+func TestBrokenPagingChangesNothing(t *testing.T) {
+	old := stalwart.QueryPage
+	stalwart.QueryPage = 1
+	t.Cleanup(func() { stalwart.QueryPage = old })
+	e := newEnv(t)
+	e.mustApply(baseDoc(t))
+	d := baseDoc(t)
+	d.Generation = 13
+	dropAccount(d, "bob")
+	for _, mode := range []string{"short", "no-total", "ignore-position"} {
+		e.f.QueryMode = mode
+		e.f.Calls = nil
+		err := e.apply(d)
+		if err == nil || errors.Is(err, ErrMassRemoval) {
+			t.Fatalf("%s: %v", mode, err)
+		}
+		for _, call := range e.f.Calls {
+			if strings.Contains(call, "/set") {
+				t.Fatalf("%s: wrote %s on a broken read", mode, call)
+			}
+		}
+		if e.account("bob") == nil {
+			t.Fatalf("%s: bob removed", mode)
+		}
+	}
+	e.f.QueryMode = ""
+	e.mustApply(d)
+	if e.account("bob") != nil {
+		t.Fatal("bob not removed once the reads add up")
+	}
+}

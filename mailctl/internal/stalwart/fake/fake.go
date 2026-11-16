@@ -32,6 +32,11 @@ type Server struct {
 	Now     func() time.Time
 	HTTP    *httptest.Server
 	secrets int
+	// QueryMode breaks /query paging for the fail-closed tests: "" is
+	// Stalwart's (position, limit, total), "ignore-position" repeats the
+	// first page, "no-total" leaves the total out, "short" answers an
+	// empty page after the first.
+	QueryMode string
 }
 
 // New starts the fake on a loopback port.
@@ -224,23 +229,45 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		json.Unmarshal(args["filter"], &filter)
 		var pos int
 		json.Unmarshal(args["position"], &pos)
+		limit := -1
+		if raw, ok := args["limit"]; ok {
+			json.Unmarshal(raw, &limit)
+		}
+		var withTotal bool
+		json.Unmarshal(args["calculateTotal"], &withTotal)
 		ids := []string{}
-		if pos == 0 {
-			for id, o := range s.objs[st] {
-				ok := true
-				for k, v := range filter {
-					if fmt.Sprint(o[k]) != fmt.Sprint(v) {
-						ok = false
-					}
-				}
-				if ok {
-					ids = append(ids, id)
+		for id, o := range s.objs[st] {
+			ok := true
+			for k, v := range filter {
+				if fmt.Sprint(o[k]) != fmt.Sprint(v) {
+					ok = false
 				}
 			}
-			sort.Strings(ids)
+			if ok {
+				ids = append(ids, id)
+			}
+		}
+		sort.Strings(ids)
+		total := len(ids)
+		if s.QueryMode == "ignore-position" {
+			pos = 0
+		}
+		if pos > len(ids) {
+			pos = len(ids)
+		}
+		ids = ids[pos:]
+		if limit >= 0 && limit < len(ids) {
+			ids = ids[:limit]
+		}
+		if s.QueryMode == "short" && pos > 0 {
+			ids = []string{}
 		}
 		s.Calls = append(s.Calls, method)
-		out = map[string]any{"ids": ids}
+		res := map[string]any{"ids": ids, "position": pos}
+		if withTotal && s.QueryMode != "no-total" {
+			res["total"] = total
+		}
+		out = res
 	case "get":
 		var ids []string
 		json.Unmarshal(args["ids"], &ids)

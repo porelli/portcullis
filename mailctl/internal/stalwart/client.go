@@ -257,12 +257,22 @@ func (c *Client) Set(ctx context.Context, object string, create map[string]any, 
 	return r, err
 }
 
-// Query returns every id matching filter (nil = all), page by page.
+// QueryPage is the page size of Query (Stalwart v1.1.0 honours
+// position + limit and answers total with calculateTotal; verified on
+// 1500 objects in pages of 400 and 500).
+var QueryPage = 500
+
+// Query returns every id matching filter (nil = all), page by page,
+// verified against the server's total. Fail closed: a missing total, a
+// page that repeats ids, a short read or a total that moves is an error,
+// never a partial list (callers decide "none left" or "remove the rest"
+// from it).
 func (c *Client) Query(ctx context.Context, object string, filter any) ([]string, error) {
 	var all []string
 	seen := map[string]bool{}
-	for page := 0; page < 10000; page++ {
-		args := map[string]any{"position": len(all)}
+	total := -1
+	for page := 0; page < 100000; page++ {
+		args := map[string]any{"position": len(all), "limit": QueryPage, "calculateTotal": true}
 		if filter != nil {
 			args["filter"] = filter
 		}
@@ -273,18 +283,28 @@ func (c *Client) Query(ctx context.Context, object string, filter any) ([]string
 		if err := c.Call(ctx, "x:"+object+"/query", args, &r); err != nil {
 			return nil, err
 		}
-		fresh := 0
-		for _, id := range r.IDs {
-			if !seen[id] {
-				seen[id] = true
-				all = append(all, id)
-				fresh++
-			}
+		if r.Total == nil || *r.Total < 0 {
+			return nil, fmt.Errorf("stalwart: x:%s/query: no total in the answer", object)
 		}
-		// The last page: nothing new, or the total reached. A server
-		// that ignored `position` repeats ids and stops here too.
-		if fresh == 0 || (r.Total != nil && len(all) >= *r.Total) {
+		if total >= 0 && *r.Total != total {
+			return nil, fmt.Errorf("stalwart: x:%s/query: the total moved from %d to %d while paging", object, total, *r.Total)
+		}
+		total = *r.Total
+		for _, id := range r.IDs {
+			if seen[id] {
+				return nil, fmt.Errorf("stalwart: x:%s/query: id %q repeated across pages", object, id)
+			}
+			seen[id] = true
+			all = append(all, id)
+		}
+		if len(all) > total {
+			return nil, fmt.Errorf("stalwart: x:%s/query: %d ids read, more than the total %d", object, len(all), total)
+		}
+		if len(all) == total {
 			return all, nil
+		}
+		if len(r.IDs) == 0 {
+			return nil, fmt.Errorf("stalwart: x:%s/query: short read: %d of %d ids", object, len(all), total)
 		}
 	}
 	return nil, fmt.Errorf("stalwart: x:%s/query: too many pages", object)

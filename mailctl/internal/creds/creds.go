@@ -278,6 +278,17 @@ func VoidAll(ctx context.Context, c *stalwart.Client) (int, error) {
 		}
 		n += len(r.Destroyed)
 	}
+	// Fail closed: "voided" only once a fresh, total-verified read finds
+	// no password left on any account.
+	for _, id := range ids {
+		left, err := c.As(id).Query(ctx, "AppPassword", nil)
+		if err != nil {
+			return n, err
+		}
+		if len(left) > 0 {
+			return n, fmt.Errorf("x:AppPassword: %d app passwords left on account %s after the void", len(left), id)
+		}
+	}
 	return n, nil
 }
 
