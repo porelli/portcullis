@@ -175,3 +175,18 @@ func TestVoidAllPagesFailClosed(t *testing.T) {
 		}
 	}
 }
+
+// Stalwart answers a /32 as the bare address: Restrict leaves such a
+// password alone instead of rewriting it every pass.
+func TestRestrictStalwartForm(t *testing.T) {
+	f, c, id := setup(t)
+	f.Put("AppPassword", id, map[string]any{"description": "a", "allowedIps": map[string]any{"127.0.0.1": true, "::1": true}})
+	n, err := Restrict(context.Background(), c, id, AllowedIPs(true, nil))
+	if err != nil || n != 0 {
+		t.Fatalf("rewrote %d: %v", n, err)
+	}
+	f.Put("AppPassword", id, map[string]any{"description": "b", "allowedIps": map[string]any{"10.0.0.1": true}})
+	if n, err := Restrict(context.Background(), c, id, AllowedIPs(true, nil)); err != nil || n != 1 {
+		t.Fatalf("a wider one: %d %v", n, err)
+	}
+}

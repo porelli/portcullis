@@ -240,7 +240,27 @@ func Restrict(ctx context.Context, c *stalwart.Client, accountID string, allowed
 	return len(upd), nil
 }
 
+// canonIPs maps allowedIps keys to one form: Stalwart answers a /32 or
+// /128 as the bare address (checked on the builder), so "127.0.0.1" and
+// "127.0.0.1/32" are the same entry.
+func canonIPs(m map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	for k, v := range m {
+		if !v {
+			continue
+		}
+		if a, err := netip.ParseAddr(k); err == nil {
+			k = netip.PrefixFrom(a, a.BitLen()).String()
+		} else if p, err := netip.ParsePrefix(k); err == nil {
+			k = p.Masked().String()
+		}
+		out[k] = true
+	}
+	return out
+}
+
 func sameSet(a, b map[string]bool) bool {
+	a, b = canonIPs(a), canonIPs(b)
 	if len(a) != len(b) {
 		return false
 	}
