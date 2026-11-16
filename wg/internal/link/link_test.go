@@ -502,7 +502,7 @@ func TestBadDocMeansNoPeers(t *testing.T) {
 // at the right caps.
 func TestSeparateStreamCaps(t *testing.T) {
 	doc := &linkdoc.Doc{
-		Version: 1, WrittenAt: time.Now(), Subnet: "10.214.0.0/24",
+		Version: 1, WrittenAt: time.Now().UTC(), Subnet: "10.214.0.0/24",
 		Peers: []linkdoc.Peer{
 			{ID: "w1", PublicKey: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=", IP: "10.214.0.10", State: "ready"},
 		},
@@ -510,7 +510,10 @@ func TestSeparateStreamCaps(t *testing.T) {
 			{TokenSHA256: strings.Repeat("a", 64), Instance: "gitea", Server: "w1"},
 		},
 	}
-	doc, _ = linkdoc.Parse(mustJSON(t, doc))
+	doc, err := linkdoc.Parse(mustJSON(t, doc))
+	if err != nil {
+		t.Fatal(err)
+	}
 	stack, _ := newStack(t, linkdoc.LinkAddr.String(), freeUDP(t))
 	l := New(stack, func() *linkdoc.Doc { return doc })
 	l.MaxControlStreams = 2
