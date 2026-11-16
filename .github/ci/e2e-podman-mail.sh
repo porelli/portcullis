@@ -8,7 +8,7 @@
 #   mail_client_ip_rewritten; a message from a CI container to the host's
 #   port 25 is delivered, and no BlockedIp appears (Review Focus 1: every
 #   client is the gateway under rootless Podman, so a ban would lock
-#   everyone out).
+#   everyone out; Stalwart's ban events in its log).
 #
 # Nothing leaves the runner: outbound 25 / 465 / 587 is rejected for the
 # runner and pasta (rootless Podman's egress is the user's own sockets);
@@ -158,17 +158,9 @@ for i in $(seq 1 60); do
 done
 echo "PASS: the doctor names mail_client_ip_rewritten"
 
-# 6. No BlockedIp (Stalwart's own bans): read through the management API as
-# mailctl (its pinned address; mailctl stopped meanwhile).
-docker compose --profile mail stop mailctl >/dev/null
-set +e
-out="$(podman run --rm --network portcullis-mail --ip 172.31.255.3 --user 10010:10010 -v "$PWD/secrets/mail/api-key:/k:ro" --entrypoint sh "$CURL_IMG" \
-  -c 'printf "Authorization: Bearer %s\n" "$(cat /k)" > /tmp/h; curl -s -H @/tmp/h -H "Content-Type: application/json" \
-      -d "{\"using\":[\"urn:ietf:params:jmap:core\",\"urn:stalwart:jmap\"],\"methodCalls\":[[\"x:BlockedIp/query\",{},\"0\"]]}" \
-      http://172.31.255.2:8080/jmap')"
-set -e
-docker compose --profile mail start mailctl >/dev/null
-jq -e '.methodResponses[0][0] == "x:BlockedIp/query" and (.methodResponses[0][1].ids | length) == 0' <<<"$out" >/dev/null \
-  || fail "BlockedIp: $(head -c 400 <<<"$out")"
-echo "PASS: no BlockedIp after the delivery (rewritten client addresses never ban the gateway)"
+# 6. No ban: mailctl's role can't read BlockedIp (and isn't widened for a
+# test), so Stalwart's own ban events in its log are the evidence.
+bans="$(docker compose --profile mail logs mail 2>&1 | grep -iE 'security\.[a-z-]*ban|ip-blocked|blocked-ip|banned' || true)"
+[ -z "$bans" ] || fail "Stalwart banned an address: $(head -3 <<<"$bans")"
+echo "PASS: no ban after the delivery (rewritten client addresses never ban the gateway)"
 podman rm -f e2e-pebble-mail >/dev/null 2>&1 || true

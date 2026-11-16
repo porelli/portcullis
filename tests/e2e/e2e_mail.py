@@ -498,6 +498,30 @@ def my_mail(page: Page) -> dict:
     return r.json()
 
 
+def dns_diagnostics() -> None:
+    """On a stuck DKIM activation: the Hub's domain rows, the domains
+    service's plan of the added domain (its last error, the mail items),
+    and what the fake zone holds there (artifacts, no secret)."""
+    try:
+        save("hub-domains.json", hub_ok("GET", "/api/domains"))
+        save("mail-status.json", mailstatus())
+        p = subprocess.run(["docker", "run", "--rm", "-i", "--network", "portcullis_portcullis-domains", "--entrypoint", "sh",
+                            "docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93",
+                            "-c", 'read -r t; printf "Authorization: Bearer %s\n" "$t" > /tmp/h; '
+                                  'curl -s -H @/tmp/h "http://domains:8080/domains/$0"; echo; curl -s -H @/tmp/h "http://domains:8080/domains/$0/dns"', EXTRA],
+                           input=open("secrets/domains/api-secret").read().strip() + "\n", capture_output=True, text=True, timeout=120)
+        save("domains-extra.json", p.stdout)
+        body = json.dumps({"op": "get", "zone": EXTRA + ".", "token": "ci-fake-token-0123456789", "records": []}).encode()
+        with urllib.request.urlopen(urllib.request.Request("http://172.30.87.53:8054", data=body,
+                                                           headers={"Content-Type": "application/json"}), timeout=30) as r:
+            save("fakezone-extra.json", json.loads(r.read()))
+        print("    diagnostics saved: hub-domains.json, mail-status.json, domains-extra.json, fakezone-extra.json", flush=True)
+        for ln in p.stdout.splitlines()[:1]:
+            print("    domains: " + scrub(ln)[:600], flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"    diagnostics failed: {type(e).__name__}: {e}", flush=True)
+
+
 # ── scenarios ──
 
 def setup(browser) -> None:
@@ -528,8 +552,15 @@ def setup(browser) -> None:
         ks = (mailstatus().get("status") or {}).get("dkim") or []
         act = {(k["domain"], k["algorithm"]) for k in ks if k.get("stage") == "active"}
         want = {(d, a) for d in (DOMAIN, EXTRA) for a in ("ed25519", "rsa")}
-        return want <= act or (print(f"    DKIM active so far: {sorted(act)}", flush=True) and False)
-    until("DKIM ed25519 + rsa active on both domains", dkim_active, 420, every=10)
+        if want <= act:
+            return True
+        print("    DKIM keys: " + ", ".join(f"{k['domain']} {k['algorithm']} {k['selector']} {k['stage']}" for k in ks), flush=True)
+        return False
+    try:
+        until("DKIM ed25519 + rsa active on both domains", dkim_active, 420, every=10)
+    except AssertionError:
+        dns_diagnostics()
+        raise
     for who in ("alice", "bob", "root"):
         ctx, page, auth = sign_in(browser, who)
         state[f"ctx_{who}"], state[f"page_{who}"], state[f"auth_{who}"] = ctx, page, auth
