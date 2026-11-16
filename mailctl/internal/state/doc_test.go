@@ -2,6 +2,7 @@ package state
 
 import (
 	"encoding/json"
+	"net/netip"
 	"os"
 	"strings"
 	"testing"
@@ -112,5 +113,31 @@ func TestStoreRoundTrip(t *testing.T) {
 	s2, err := Open(dir)
 	if err != nil || s2.Get().Generation != 12 || s2.Get().Doc.PrimaryDomain != "example.com" {
 		t.Fatalf("reopen: %v %+v", err, s2.Get())
+	}
+}
+
+// The local_networks ruling: an IPv6 network overlapping a range that
+// names IPv4 space is refused whatever its start, and one outside ULA,
+// link-local and global unicast; the minimum widths stay.
+func TestLocalNetworkOK(t *testing.T) {
+	refused := []string{
+		"0.0.0.0/0", "::/0", "0.0.0.0/1", "128.0.0.0/1", "11.0.0.0/8", "8.0.0.0/15",
+		"::ffff:0:0/96", "::ffff:10.0.0.0/104", "::ffff:0:0/95", "::/64", "::/96", "::1/128", "::/127",
+		"64:ff9b::/96", "64:ff9b::/64", "64:ff9b:1::/48", "64:ff9b:1:2::/64", "64:ff9b::/32",
+		"2001::/16", "2000::/3", "2000::/31", "ff02::/16", "100::/64", "3fff::/20",
+	}
+	for _, n := range refused {
+		if err := LocalNetworkOK(netip.MustParsePrefix(n)); err == nil {
+			t.Errorf("%s accepted", n)
+		}
+	}
+	accepted := []string{
+		"10.0.0.0/8", "172.16.0.0/12", "192.168.1.0/24", "100.64.0.0/10", "203.0.113.0/24", "198.51.0.0/16",
+		"fd00::/8", "fc00::/7", "fe80::/10", "2001:db8::/32", "2001:db8:1::/48", "2a01:4f8:1:2::/64",
+	}
+	for _, n := range accepted {
+		if err := LocalNetworkOK(netip.MustParsePrefix(n)); err != nil {
+			t.Errorf("%s refused: %v", n, err)
+		}
 	}
 }

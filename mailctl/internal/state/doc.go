@@ -401,29 +401,58 @@ func (d *Doc) validate() error {
 // below, the list can never amount to anywhere.
 const MaxLocalNetworks = 64
 
-// localBlocks are the private and special-use ranges a LAN uses: a
+// localBlocks are the private and special-use IPv4 ranges a LAN uses: a
 // network inside one of them may be as wide as the block.
 var localBlocks = []netip.Prefix{
 	netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("172.16.0.0/12"),
 	netip.MustParsePrefix("192.168.0.0/16"), netip.MustParsePrefix("100.64.0.0/10"),
 	netip.MustParsePrefix("169.254.0.0/16"), netip.MustParsePrefix("127.0.0.0/8"),
-	netip.MustParsePrefix("fc00::/7"), netip.MustParsePrefix("fe80::/10"), netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("fc00::/7"), netip.MustParsePrefix("fe80::/10"),
+}
+
+// v6Embeds are the IPv6 ranges that name IPv4 space (IPv4-mapped,
+// IPv4-compatible, NAT64 well-known and local-use): a local network that
+// overlaps any of them is refused, whatever its start address.
+var v6Embeds = []netip.Prefix{
+	netip.MustParsePrefix("::ffff:0:0/96"), netip.MustParsePrefix("::/96"),
+	netip.MustParsePrefix("64:ff9b::/96"), netip.MustParsePrefix("64:ff9b:1::/48"),
+}
+
+// v6Allowed: an IPv6 local network lies inside one of these (ULA,
+// link-local, global unicast); anything else is refused.
+var v6Allowed = []netip.Prefix{
+	netip.MustParsePrefix("fc00::/7"), netip.MustParsePrefix("fe80::/10"), netip.MustParsePrefix("2000::/3"),
+}
+
+func inside(p netip.Prefix, blocks []netip.Prefix) bool {
+	for _, b := range blocks {
+		if b.Bits() <= p.Bits() && b.Contains(p.Addr()) {
+			return true
+		}
+	}
+	return false
 }
 
 // LocalNetworkOK refuses a network that is, or helps amount to,
 // "anywhere" (final review L3): inside a private block any width up to
 // the block; elsewhere at most an IPv4 /16 or an IPv6 /32 (a site, never
-// a slice of the internet). IPv4-mapped and NAT64 prefixes (which name
-// IPv4 space in IPv6) are refused. Nothing is ever split or widened.
+// a slice of the internet). An IPv6 network overlapping a range that
+// names IPv4 space (v6Embeds) is refused, and one outside ULA,
+// link-local and global unicast too. Nothing is ever split or widened.
 func LocalNetworkOK(p netip.Prefix) error {
 	a := p.Addr()
-	if a.Is4In6() || netip.MustParsePrefix("64:ff9b::/96").Overlaps(p) {
-		return errors.New("an IPv4-mapped or NAT64 range is not a local network")
-	}
-	for _, b := range localBlocks {
-		if b.Bits() <= p.Bits() && b.Contains(a) {
-			return nil
+	if a.Is6() {
+		for _, e := range v6Embeds {
+			if e.Overlaps(p) {
+				return fmt.Errorf("it overlaps %s (IPv4 space in IPv6): not a local network", e)
+			}
 		}
+		if !inside(p, v6Allowed) {
+			return errors.New("an IPv6 local network lies in ULA (fc00::/7), link-local (fe80::/10) or global unicast (2000::/3)")
+		}
+	}
+	if inside(p, localBlocks) {
+		return nil
 	}
 	if a.Is4() && p.Bits() < 16 {
 		return errors.New("a public IPv4 range wider than /16 is not a local network")
