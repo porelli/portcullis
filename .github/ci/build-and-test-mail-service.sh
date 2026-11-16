@@ -221,7 +221,13 @@ setup)
   st="$(./portcullis status --json || true)"
   [ "$(jq -r .mail.timer <<<"$st")" = active ] || fail "timer not active after schedule --systemd: $(jq -c .mail <<<"$st")"
   echo "PASS: status --json .mail (bootstrap, cert, timer warning → active after schedule --systemd)"
-  # For the backup / restore checks.
+  # For the backup / restore checks: the DKIM keys made (a pass: mail
+  # rotate), then saved.
+  ./portcullis mail rotate >/dev/null 2>&1 || true
+  for _ in $(seq 1 60); do
+    [ "$(docker run --rm --network none -v portcullis_mailctl_data:/d:ro "$ALPINE_IMG" cat /d/state.json | jq '[.ext.dkim.keys[]? | select(.public_key != "")] | length')" -ge 2 ] && break
+    sleep 5
+  done
   docker inspect -f '{{.State.StartedAt}}' "$(cid mail)" > "$ST/started"
   docker run --rm --network none -v portcullis_mailctl_data:/d:ro "$ALPINE_IMG" cat /d/state.json | jq -c '.ext.dkim.keys' > "$ST/dkim.json"
   docker compose start hub >/dev/null

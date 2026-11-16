@@ -23,10 +23,11 @@ D="${E2E_DOMAIN:-portcullis.local}"
 fail() { echo "FAIL: $*"; docker compose --profile mail logs --tail=60 mail mailctl mail-resolver 2>/dev/null || true; exit 1; }
 
 # 1. No outbound SMTP (the runner, and pasta's sockets for the containers).
+# Only to the host's own addresses (pasta turns a container's connection to
+# host.containers.internal into a host socket to one of them).
 for t in iptables ip6tables; do
-  lo=127.0.0.0/8; [ "$t" = ip6tables ] && lo=::1/128
   sudo "$t" -I OUTPUT -p tcp -m multiport --dports 25,465,587 -j REJECT --reject-with tcp-reset
-  sudo "$t" -I OUTPUT -p tcp -m multiport --dports 25,465,587 -d "$lo" -j ACCEPT
+  sudo "$t" -I OUTPUT -p tcp -m multiport --dports 25,465,587 -m addrtype --dst-type LOCAL -j ACCEPT
 done
 podman pull -q "$CURL_IMG" >/dev/null
 set +e
@@ -126,7 +127,7 @@ for i in $(seq 1 30); do
 done
 smtp_to() {  # smtp_to <rcpt> — one message from a CI container to the host's port 25
   printf 'From: probe@relay-test.example\r\nTo: %s\r\nSubject: e2e-podman mail\r\n\r\npodman\r\n' "$1" \
-    | podman run --rm -i "$CURL_IMG" -s --max-time 30 "smtp://host.containers.internal:25" \
+    | podman run --rm -i "$CURL_IMG" -sS --max-time 30 "smtp://host.containers.internal:25" \
         --mail-from probe@relay-test.example --mail-rcpt "$1" -T -
 }
 for i in $(seq 1 60); do
