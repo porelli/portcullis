@@ -50,7 +50,7 @@ case "$kind" in
   dind)
     # reviewed exception: the CI worker is a privileged docker:dind (its own
     # daemon needs it); never in a compose file or the product (the lint in
-    # tests/test_cli.sh allows --privileged here only).
+    # tests/test_cli.sh allows a privileged run here only).
     priv=(--privileged) # reviewed exception
     docker run -d "${priv[@]}" --name "e2e-$name" --hostname "$name" -e DOCKER_TLS_CERTDIR= \
       -v "$PWD:/src:ro" "$DIND_IMG" >/dev/null
