@@ -18,8 +18,10 @@ package main
 //     renew_below_days, or its key or SANs differ (or the account is new:
 //     another CA). A chain whose SANs aren't exactly {hostname} or whose
 //     key isn't the reused key is refused; the old files stay.
-//   - Writes /tls/fullchain.pem and /tls/privkey.pem atomically (0640;
-//     the volume's setgid directory gives them Stalwart's group) and
+//   - Writes /tls/fullchain.pem and /tls/privkey.pem as one pair (0640;
+//     the volume's setgid directory gives them Stalwart's group): both are
+//     links into current/, a generation directory swapped by one rename
+//     (writeTLSPair), so a reader never pairs a key with another chain; and
 //     prints one line {"renewed", "not_after", "spki_sha256"}.
 //   - --next-key creates /acme/mail.next.key (once) and prints its
 //     spki_sha256 (TLSA rollover); --switch-key issues with it and, once
@@ -215,10 +217,7 @@ func runMailCert(args []string, e toolEnv) int {
 	if err != nil {
 		return fail(exitProblem, err)
 	}
-	if err := writeAtomic(filepath.Join(tlsDir, "privkey.pem"), kp, 0o640); err != nil {
-		return fail(exitProblem, err)
-	}
-	if err := writeAtomic(filepath.Join(tlsDir, "fullchain.pem"), res.Certificate, 0o640); err != nil {
+	if err := writeTLSPair(tlsDir, kp, res.Certificate); err != nil {
 		return fail(exitProblem, err)
 	}
 	if switchKey {
@@ -427,6 +426,89 @@ func parseKeyPEM(b []byte) (*ecdsa.PrivateKey, error) {
 		return nil, errors.New("not an EC P-256 key")
 	}
 	return ec, nil
+}
+
+// writeTLSPair writes privkey.pem and fullchain.pem as one unit (final
+// review L8): a new generation directory .gen-* in dir holds both files,
+// then the link current → it replaces the old one by a single rename.
+// fullchain.pem / privkey.pem are links to current/<name> (made once; a
+// store whose files are still plain is first moved into a generation of
+// its own, so the switch to links never mixes old and new). Older
+// generations are removed after the swap.
+func writeTLSPair(dir string, key, chain []byte) error {
+	gen := func(k, c []byte) (string, error) {
+		g, err := os.MkdirTemp(dir, ".gen-")
+		if err != nil {
+			return "", err
+		}
+		// Stalwart's group reads it (the volume's setgid directory gives
+		// new entries its group; the mode keeps it).
+		if err := os.Chmod(g, 0o2750); err != nil {
+			return "", err
+		}
+		if err := writeAtomic(filepath.Join(g, "privkey.pem"), k, 0o640); err != nil {
+			return "", err
+		}
+		if err := writeAtomic(filepath.Join(g, "fullchain.pem"), c, 0o640); err != nil {
+			return "", err
+		}
+		return filepath.Base(g), nil
+	}
+	swap := func(link, target string) error {
+		tmp := filepath.Join(dir, ".tmp-"+filepath.Base(link)+"-link")
+		_ = os.Remove(tmp)
+		if err := os.Symlink(target, tmp); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, link); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+		return nil
+	}
+	cur := filepath.Join(dir, "current")
+	isLink := func(name string) bool {
+		t, err := os.Readlink(filepath.Join(dir, name))
+		return err == nil && t == filepath.Join("current", name)
+	}
+	if !isLink("privkey.pem") || !isLink("fullchain.pem") {
+		// Plain files (or none): current points at a copy of them first.
+		oldK, kerr := os.ReadFile(filepath.Join(dir, "privkey.pem"))
+		oldC, cerr := os.ReadFile(filepath.Join(dir, "fullchain.pem"))
+		if kerr != nil || cerr != nil {
+			oldK, oldC = key, chain // nothing to keep: the new pair at once
+		}
+		g, err := gen(oldK, oldC)
+		if err != nil {
+			return fmt.Errorf("the TLS pair: %w", err)
+		}
+		if err := swap(cur, g); err != nil {
+			return fmt.Errorf("the TLS pair: %w", err)
+		}
+		for _, n := range []string{"privkey.pem", "fullchain.pem"} {
+			if err := swap(filepath.Join(dir, n), filepath.Join("current", n)); err != nil {
+				return fmt.Errorf("the TLS pair: %w", err)
+			}
+		}
+	}
+	g, err := gen(key, chain)
+	if err != nil {
+		return fmt.Errorf("the TLS pair: %w", err)
+	}
+	if err := swap(cur, g); err != nil {
+		return fmt.Errorf("the TLS pair: %w", err)
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
+	ents, _ := os.ReadDir(dir)
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), ".gen-") && e.Name() != g {
+			_ = os.RemoveAll(filepath.Join(dir, e.Name()))
+		}
+	}
+	return nil
 }
 
 // writeAtomic writes data to path through a temporary file in the same

@@ -196,6 +196,46 @@ func TestMailCertIssuesAndReusesKey(t *testing.T) {
 	if spkiOfKey(t, k) != o.SPKI {
 		t.Fatal("privkey.pem isn't the reused key")
 	}
+	// Final review L8: the pair is one unit: both names are links into
+	// current/, one generation directory (the older one removed).
+	for _, n := range []string{"fullchain.pem", "privkey.pem"} {
+		if tg, err := os.Readlink(filepath.Join(f.tls, n)); err != nil || tg != filepath.Join("current", n) {
+			t.Fatalf("%s: link %q %v", n, tg, err)
+		}
+	}
+	gens, _ := filepath.Glob(filepath.Join(f.tls, ".gen-*"))
+	cur, _ := os.Readlink(filepath.Join(f.tls, "current"))
+	if len(gens) != 1 || filepath.Base(gens[0]) != cur {
+		t.Fatalf("generations %v, current %q", gens, cur)
+	}
+}
+
+// Final review L8: plain files from before are moved into a generation of
+// their own first, then the new pair replaces both by one rename.
+func TestWriteTLSPairFromPlainFiles(t *testing.T) {
+	d := t.TempDir()
+	os.WriteFile(filepath.Join(d, "privkey.pem"), []byte("old-key"), 0o640)
+	os.WriteFile(filepath.Join(d, "fullchain.pem"), []byte("old-chain"), 0o640)
+	if err := writeTLSPair(d, []byte("new-key"), []byte("new-chain")); err != nil {
+		t.Fatal(err)
+	}
+	k, _ := os.ReadFile(filepath.Join(d, "privkey.pem"))
+	c, _ := os.ReadFile(filepath.Join(d, "fullchain.pem"))
+	if string(k) != "new-key" || string(c) != "new-chain" {
+		t.Fatalf("pair %q %q", k, c)
+	}
+	if err := writeTLSPair(d, []byte("k3"), []byte("c3")); err != nil {
+		t.Fatal(err)
+	}
+	k, _ = os.ReadFile(filepath.Join(d, "privkey.pem"))
+	c, _ = os.ReadFile(filepath.Join(d, "fullchain.pem"))
+	gens, _ := filepath.Glob(filepath.Join(d, ".gen-*"))
+	if string(k) != "k3" || string(c) != "c3" || len(gens) != 1 {
+		t.Fatalf("pair %q %q, generations %v", k, c, gens)
+	}
+	if m := mode(t, filepath.Join(d, "privkey.pem")); m != 0o640 {
+		t.Fatalf("mode %o", m)
+	}
 }
 
 func spkiOfKey(t *testing.T, k *ecdsa.PrivateKey) string {
