@@ -274,12 +274,42 @@ def imap_login(user: str, pw: str, host: str = "127.0.0.1") -> imaplib.IMAP4_SSL
     return i
 
 
-def imap_refused(user: str, pw: str, host: str = "127.0.0.1") -> bool:
-    try:
-        imap_login(user, pw, host).logout()
-        return False
-    except (imaplib.IMAP4.error, OSError):
-        return True
+def imap_refused(user: str, pw: str, host: str = "127.0.0.1", wait: float = 120) -> bool:
+    """True only when a connected IMAP server answers the login with a
+    refusal (NO / BAD / AUTHENTICATIONFAILED); False when it logs in. A
+    server that can't be reached (mail restarting: a revoke restarts it)
+    is waited for, never counted as a refusal (final review M8); one that
+    never answers fails the check."""
+    deadline = time.monotonic() + wait
+    last = ""
+    while True:
+        try:
+            i = imaplib.IMAP4_SSL(host, 993, ssl_context=TLS, timeout=20)
+        except (OSError, imaplib.IMAP4.abort) as e:
+            last = f"{type(e).__name__}: {e}"
+        else:
+            try:
+                i.login(user, pw)
+            except imaplib.IMAP4.abort as e:  # dropped mid-login: not an answer
+                last = f"abort: {e}"
+            except imaplib.IMAP4.error:
+                # imaplib raises IMAP4.error (not abort) only for the
+                # server's tagged NO / BAD answer to LOGIN: a refusal.
+                return True
+            else:
+                try:
+                    i.logout()
+                except (OSError, imaplib.IMAP4.error):
+                    pass
+                return False
+            finally:
+                try:
+                    i.shutdown()
+                except OSError:
+                    pass
+        if time.monotonic() > deadline:
+            raise AssertionError(f"IMAP on {host}:993 never answered a login within {wait:.0f}s: {last}")
+        time.sleep(2)
 
 
 def submit(user: str, pw: str, frm: str, to: list[str], msg: bytes, port: int = 587, host: str = "127.0.0.1"):

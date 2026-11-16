@@ -28,7 +28,11 @@ set +e
 docker run --rm "$CURL_IMG" -s --connect-timeout 5 telnet://192.0.2.1:25 </dev/null; rc=$?
 set -e
 [ "$rc" = 7 ] || fail "outbound 25 from a container isn't refused (curl exit $rc)"
-if timeout 5 bash -c 'exec 3<>/dev/tcp/192.0.2.1/25' 2>/dev/null; then fail "outbound 25 from the runner connected"; fi
+# Refused (rc 1: the REJECT's reset), never a timeout (124) or a connect.
+set +e
+timeout 5 bash -c 'exec 3<>/dev/tcp/192.0.2.1/25' 2>/dev/null; rc=$?
+set -e
+[ "$rc" = 1 ] || fail "outbound 25 from the runner: rc $rc (want 1: refused at once)"
 echo "PASS: outbound TCP 25/465/587 rejected (containers and runner)"
 
 # 2. The stack (as e2e-filesharing), Pebble's root for the domains service

@@ -46,7 +46,12 @@ block_egress() {
   sudo ip6tables -I OUTPUT -p tcp -m multiport --dports 25,465,587 ! -d ::1/128 -j REJECT --reject-with tcp-reset
   # Probes to TEST-NET-1: refused at once (exit 7), never a timeout.
   probe_egress bridge
-  if timeout 5 bash -c 'exec 3<>/dev/tcp/192.0.2.1/25' 2>/dev/null; then fail "outbound 25 from the runner connected"; fi
+  # Refused (rc 1: the REJECT's reset), never a timeout (124) or a connect.
+  local rc
+  set +e
+  timeout 5 bash -c 'exec 3<>/dev/tcp/192.0.2.1/25' 2>/dev/null; rc=$?
+  set -e
+  [ "$rc" = 1 ] || fail "outbound 25 from the runner: rc $rc (want 1: refused at once)"
   echo "PASS: outbound TCP 25/465/587 rejected (containers and runner)"
 }
 # probe_egress <network> — every SMTP port to TEST-NET-1 is refused (exit 7).
@@ -125,8 +130,22 @@ setup)
     rm -f ca.key req.csr ext.cnf ca.srl; chmod 644 ./*
   )
   docker compose --profile mail up -d pebble-mail
+  # The session's recovery password, captured while it exists (test only:
+  # the CLI keeps it in recovery.env during the session), so the check
+  # below tries the REAL recovery login (final review M9).
+  ( while [ ! -e "$ST/enable.done" ]; do
+      [ ! -s secrets/mail/recovery.env ] || cp -f secrets/mail/recovery.env "$ST/recovery.env" 2>/dev/null || true
+      sleep 0.2
+    done ) &
+  watch_pid=$!
   ./portcullis mail enable --yes 2>&1 | tee "$ST/enable.out"
-  [ "${PIPESTATUS[0]}" = 0 ] || fail "mail enable"
+  rc="${PIPESTATUS[0]}"
+  : > "$ST/enable.done"; wait "$watch_pid" || true
+  [ "$rc" = 0 ] || fail "mail enable"
+  RPW="$(sed -n 's/^STALWART_RECOVERY_ADMIN=portcullis-recovery://p' "$ST/recovery.env" 2>/dev/null || true)"
+  rm -f "$ST/recovery.env"
+  [ -n "$RPW" ] || fail "the recovery session's password wasn't captured"
+  echo "::add-mask::$RPW"
   for s in mail mailctl mail-resolver; do wait_healthy "$s"; done
   # The Hub stops now: it sends mailctl its own documents and restarts
   # mail on changes, which would cut the checks below. Its document here
@@ -148,11 +167,15 @@ setup)
   [ -s secrets/mail/api-key ] || fail "api-key empty"
   # (mailctl's fixed addresses: the one-shot runs while the service is stopped.)
   docker compose --profile mail stop mailctl >/dev/null
-  head -c 24 /dev/urandom | base64 | jq -Rc '{recovery_user: "portcullis-recovery", recovery_password: .}' \
-    | docker compose --profile mail run --rm --no-deps -T mailctl bootstrap --verify-gone || fail "a recovery login isn't refused"
+  RPW="$RPW" jq -nc '{recovery_user: "portcullis-recovery", recovery_password: env.RPW}' \
+    | docker compose --profile mail run --rm --no-deps -T mailctl bootstrap --verify-gone || fail "the session's real recovery login isn't refused"
+  RPW=""
+  # And no container keeps the recovery env (no leftover recovery mode).
+  docker inspect -f '{{json .Config.Env}}' "$(cid mail)" | jq -e 'map(select(startswith("STALWART_RECOVERY_"))) == []' >/dev/null \
+    || fail "mail still runs with a STALWART_RECOVERY_* variable"
   docker compose --profile mail start mailctl >/dev/null
   wait_healthy mailctl
-  echo "PASS: no recovery.env, a recovery login gets 401, api-key 0640 group 10010"
+  echo "PASS: no recovery.env, the session's real recovery login gets 401, no recovery env left, api-key 0640 group 10010"
   # 3. The management listener: unreachable from portcullis-proxy, 404 for
   # anyone else on portcullis-mail (the API key too), /admin 404.
   if docker run --rm --network portcullis-proxy "$CURL_IMG" -s --connect-timeout 5 -o /dev/null http://172.31.255.2:8080/healthz/live; then
@@ -163,7 +186,19 @@ setup)
       -c 'printf "Authorization: Bearer %s\n" "$(cat /k)" > /tmp/h; curl -s -o /dev/null -w "%{http_code}" -H @/tmp/h "http://172.31.255.2:8080$0"' "$path")"
     [ "$code" = 404 ] || fail "$path from 172.31.255.9 with the API key got $code (want 404)"
   done
-  echo "PASS: management listener: unreachable from portcullis-proxy, 404 from another portcullis-mail address (API key too)"
+  # Mail's mail-egress address (the host and every mail-egress member
+  # reach it): nothing listens there on 8080 (final review L11).
+  EGRESS_IP="$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis_mail-egress").IPAddress}}' "$(cid mail)")"
+  [ -n "$EGRESS_IP" ] || fail "mail has no mail-egress address"
+  set +e
+  docker run --rm --network portcullis_mail-egress "$CURL_IMG" -s --connect-timeout 5 -o /dev/null "http://$EGRESS_IP:8080/healthz/live"; rc=$?
+  set -e
+  [ "$rc" = 7 ] || fail "the management listener on mail-egress ($EGRESS_IP) from a mail-egress container: curl exit $rc (want 7: refused)"
+  set +e
+  curl -s --connect-timeout 5 -o /dev/null "http://$EGRESS_IP:8080/healthz/live"; rc=$?
+  set -e
+  [ "$rc" = 7 ] || fail "the management listener on mail-egress ($EGRESS_IP) from the runner: curl exit $rc (want 7: refused)"
+  echo "PASS: management listener: unreachable from portcullis-proxy, refused on mail-egress (a member and the runner), 404 from another portcullis-mail address (API key too)"
   # 4. The certificate: SAN exactly the host, the key reused by a second
   # mail cert, presented on all four ports.
   vol mail_tls fullchain.pem > "$ST/fullchain.pem"
@@ -228,9 +263,11 @@ setup)
   st="$(./portcullis status --json || true)"
   [ "$(jq -r .mail.timer <<<"$st")" = active ] || fail "timer not active after schedule --systemd: $(jq -c .mail <<<"$st")"
   echo "PASS: status --json .mail (bootstrap, cert, timer warning → active after schedule --systemd)"
+  # The container's start gate, for real (final review M2 / M3 / M4).
+  bash .github/ci/mail-gate-entrypoint.sh docker
   # For the backup / restore checks: the DKIM keys made (a pass: mail
-  # rotate), then saved.
-  ./portcullis mail rotate >/dev/null 2>&1 || true
+  # rotate, the daily timer's only job: it must succeed), then saved.
+  ./portcullis mail rotate > "$ST/rotate.out" 2>&1 || { cat "$ST/rotate.out"; fail "mail rotate"; }
   for _ in $(seq 1 60); do
     [ "$(docker run --rm --network none -v portcullis_mailctl_data:/d:ro "$ALPINE_IMG" cat /d/state.json | jq '[.ext.dkim.keys[]? | select(.public_key != "")] | length')" -ge 2 ] && break
     sleep 5
@@ -247,7 +284,8 @@ after-backup)
   done
   [ "$(docker inspect -f '{{.State.StartedAt}}' "$(cid mail)")" != "$(cat "$ST/started")" ] || fail "the backup didn't stop and restart mail"
   wait_healthy mail
-  tar -tzf "$B/mailctl_data.tar.gz" | grep -qx './state.json' || fail "state.json not in mailctl_data's archive"
+  members="$(tar -tzf "$B/mailctl_data.tar.gz")"
+  grep -qx './state.json' <<<"$members" || fail "state.json not in mailctl_data's archive"
   [ ! -e "$B/secrets/mail/recovery.env" ] || fail "recovery.env in the backup"
   echo "PASS: the backup stopped mail for its store, restarted it, archived mail_data / mail_etc / mailctl_data / mail_tls / mail_acme"
   ;;

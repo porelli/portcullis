@@ -92,7 +92,8 @@ FAKEDNS="$(podman inspect -f '{{(index .NetworkSettings.Networks "portcullis_dom
 [ -n "$FAKEDNS" ] || fail "no domains address on domains-egress"
 # The recreated container's banner (it may still be starting).
 for i in $(seq 1 30); do
-  docker compose logs domains 2>&1 | grep -q 'provider "fake" enabled' && break
+  out="$(docker compose logs domains 2>&1 || true)"
+  grep -q 'provider "fake" enabled' <<<"$out" && break
   [ "$i" -eq 30 ] && fail "the domains service isn't the test build: $(docker compose logs --tail=5 domains 2>&1)"
   sleep 2
 done
@@ -115,7 +116,8 @@ podman run -d --name e2e-pebble-mail --network portcullis_domains-egress -v /tmp
 [ "${PIPESTATUS[0]}" = 0 ] || fail "mail enable on rootless Podman"
 grep -qx 'MAILCTL_CLIENT_IP=rewritten' .env || fail "MAILCTL_CLIENT_IP is $(grep '^MAILCTL_CLIENT_IP=' .env)"
 # The CI resolver is in use (iterator only: no DNSSEC validator, no root servers).
-docker compose --profile mail logs mail-resolver 2>&1 | grep -q 'init module 0: iterator' \
+out="$(docker compose --profile mail logs mail-resolver 2>&1 || true)"
+grep -q 'init module 0: iterator' <<<"$out" \
   || fail "mail-resolver doesn't run the CI config: $(docker compose --profile mail logs mail-resolver 2>&1 | grep 'init module' | head -2)"
 for s in mail mailctl mail-resolver; do
   for i in $(seq 1 60); do
@@ -150,7 +152,8 @@ for i in $(seq 1 60); do
   sleep 5
 done
 for i in $(seq 1 30); do
-  docker compose logs mail 2>&1 | grep -E 'message-ingest' | grep -q "rt-person@$D" && break
+  out="$(docker compose logs mail 2>&1 || true)"
+  grep -E 'message-ingest' <<<"$out" | grep -qF "rt-person@$D" && break
   [ "$i" -eq 30 ] && fail "the message to rt-person@$D wasn't delivered"
   sleep 2
 done
@@ -164,9 +167,33 @@ for i in $(seq 1 60); do
 done
 echo "PASS: the doctor names mail_client_ip_rewritten"
 
-# 6. No ban: mailctl's role can't read BlockedIp (and isn't widened for a
-# test), so Stalwart's own ban events in its log are the evidence.
-bans="$(docker compose --profile mail logs mail 2>&1 | grep -iE 'security\.[a-z-]*ban|ip-blocked|blocked-ip|banned' || true)"
+# 6. No ban (final review L12): past Stalwart's default auth ban rate
+# (100 failed logins a day) from one container, then a delivery from
+# another still works: every client is the gateway under rootless Podman,
+# so a ban would lock everyone out (DegradedSecurity turns the rates off).
+# mailctl's role can't read BlockedIp, so Stalwart's own ban events in its
+# log are the second signal.
+podman run --rm --entrypoint sh "$CURL_IMG" -c '
+  n=0; i=0
+  while [ "$i" -lt 110 ]; do
+    i=$((i + 1))
+    curl -s --max-time 10 --ssl-reqd -k -u "nobody@'"$D"':wrong-$i" "smtp://host.containers.internal:587/relay-test.example" \
+      --mail-from "nobody@'"$D"'" --mail-rcpt "x@'"$D"'" -T /dev/null >/dev/null 2>&1 && n=$((n + 1))
+  done
+  echo "accepted=$n"' > /tmp/mail-badauth.out
+grep -qx 'accepted=0' /tmp/mail-badauth.out || fail "a wrong password was accepted: $(cat /tmp/mail-badauth.out)"
+for i in $(seq 1 12); do
+  smtp_to "rt-person@$D" && break
+  [ "$i" -eq 12 ] && fail "after 110 failed logins a delivery from another container is refused (a ban on the gateway?)"
+  sleep 5
+done
+out="$(docker compose --profile mail logs mail 2>&1 || true)"
+bans="$(grep -iE 'security\.[a-z-]*ban|ip-blocked|blocked-ip|banned' <<<"$out" || true)"
 [ -z "$bans" ] || fail "Stalwart banned an address: $(head -3 <<<"$bans")"
-echo "PASS: no ban after the delivery (rewritten client addresses never ban the gateway)"
+echo "PASS: no ban after 110 failed logins (rewritten client addresses never ban the gateway): another container still delivers"
+
+# 7. The container's start gate, for real on rootless Podman (final
+# review M2 / M3 / M4: refusals, recovery only with this boot's session
+# file, no port published meanwhile).
+bash .github/ci/mail-gate-entrypoint.sh podman
 podman rm -f e2e-pebble-mail >/dev/null 2>&1 || true
