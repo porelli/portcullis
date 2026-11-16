@@ -121,7 +121,8 @@ type Runner struct {
 	D        Deps
 	OnResult func(Result)
 
-	mu      sync.Mutex // one run at a time
+	mu      sync.Mutex // the fields below; never held during a run
+	running chan struct{} // closed when the run in flight ends (nil: none)
 	last    *Result
 	lastAt  time.Time
 	lastGen int64 // the document generation the last run saw
@@ -177,23 +178,50 @@ const RefreshWithin = 60 * time.Second
 
 // Get answers the last result (running the first one), or a fresh run
 // on refresh unless the last is younger than RefreshWithin and saw the
-// current document.
+// current document. Single flight (final review L7): one run at a time,
+// every caller waits for the run in flight instead of starting another,
+// and no longer than its own context (then it gets the last result, with
+// its checked_at; none yet: an empty one).
 func (r *Runner) Get(ctx context.Context, refresh bool) Result {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	gen := r.D.Store.Get().Generation
-	if r.last != nil && (!refresh || (r.D.now().Sub(r.lastAt) < RefreshWithin && gen == r.lastGen)) {
-		return *r.last
+	if r.running == nil && r.last != nil && (!refresh || (r.D.now().Sub(r.lastAt) < RefreshWithin && gen == r.lastGen)) {
+		res := *r.last
+		r.mu.Unlock()
+		return res
 	}
-	// The run never inherits the request's cancellation (a client hanging
-	// up mustn't turn checks into failures); Run has its own timeout.
-	res := Run(context.WithoutCancel(ctx), r.D)
-	r.last, r.lastAt, r.lastGen = &res, r.D.now(), gen
-	r.noteCert(res)
-	if r.OnResult != nil {
-		r.OnResult(res)
+	if r.running == nil {
+		done := make(chan struct{})
+		r.running = done
+		// The run never inherits the request's cancellation (a client
+		// hanging up mustn't turn checks into failures); Run has its own
+		// timeout.
+		go func() {
+			res := Run(context.WithoutCancel(ctx), r.D)
+			r.noteCert(res)
+			r.mu.Lock()
+			r.last, r.lastAt, r.lastGen = &res, r.D.now(), gen
+			r.running = nil
+			r.mu.Unlock()
+			// Before the waiters wake (OnResult must not call Get).
+			if r.OnResult != nil {
+				r.OnResult(res)
+			}
+			close(done)
+		}()
 	}
-	return res
+	done := r.running
+	r.mu.Unlock()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.last == nil {
+		return Result{}
+	}
+	return *r.last
 }
 
 // Last is the last result's check by id (ok=false: none yet).

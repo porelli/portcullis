@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -598,7 +599,12 @@ func TestCertStateConfirmed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	e.now = e.now.Add(2 * time.Minute)
-	res = r.Get(ctx, true)
+	// The cancelled caller gets the last result at once; the run goes on
+	// and the next caller waits for it (single flight).
+	if res = r.Get(ctx, true); find(t, res.Checks, "cert").Severity != Info {
+		t.Fatalf("cancelled request didn't get the last result: %+v", find(t, res.Checks, "cert"))
+	}
+	res = r.Get(context.Background(), false)
 	if c := find(t, res.Checks, "cert"); c.Severity != OK {
 		t.Fatalf("cancelled request %+v", c)
 	}
@@ -694,5 +700,24 @@ func TestRunShape(t *testing.T) {
 		if !ids[w] {
 			t.Errorf("no %s", w)
 		}
+	}
+}
+
+// Final review L7: concurrent refreshes share one run.
+func TestChecksSingleFlight(t *testing.T) {
+	e := newEnv(t)
+	var mu sync.Mutex
+	runs := 0
+	r := &Runner{D: e.d, OnResult: func(Result) { mu.Lock(); runs++; mu.Unlock() }}
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); r.Get(context.Background(), true) }()
+	}
+	wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if runs != 1 {
+		t.Fatalf("%d runs for 5 concurrent refreshes", runs)
 	}
 }
