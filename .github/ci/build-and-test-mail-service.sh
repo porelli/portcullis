@@ -184,7 +184,8 @@ setup)
   echo "PASS: certificate SAN DNS:$HOST, key kept by a second mail cert, presented on 25/465/587/993"
   # A mail document (as the Hub) with one account, and its mail password.
   # Above any generation the Hub sent before it stopped.
-  GEN=$(( $(hubapi GET /v1/state | head -n1 | jq -r '.generation // 0') + 1000 ))
+  out="$(hubapi GET /v1/state)"
+  GEN=$(( $(head -n1 <<<"$out" | jq -r '.generation // 0') + 1000 ))
   jq --arg u "$UUID" --argjson g "$GEN" '.generation = $g | .primary_domain = "portcullis.local"
       | .domains = [{name: "portcullis.local", dmarc_start: "reject", mail: "on", dnssec: "unsigned"}]
       | .accounts = [{username: "mailtest", uuid: $u, display_name: "Mail Test", addresses: ["mailtest@portcullis.local"], quota_bytes: 104857600}]
