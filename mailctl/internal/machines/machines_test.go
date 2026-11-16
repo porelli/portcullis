@@ -669,3 +669,37 @@ func TestMailOffDomainRetired(t *testing.T) {
 		t.Fatalf("a linked domain: %v", err)
 	}
 }
+
+// Final review L12: status reads share one report read per 5 minutes,
+// and the queue count never pages (the total, at most queueFetchMax ids).
+func TestStatusReportsCachedQueueCapped(t *testing.T) {
+	e := newEnv(t, nil)
+	e.step(t)
+	e.f.ResetCalls()
+	for i := 0; i < 3; i++ {
+		e.m.Statuses(context.Background())
+	}
+	if n := e.f.Count("x:DmarcExternalReport/query"); n != 0 {
+		t.Fatalf("status reads re-read the reports %d times right after a step", n)
+	}
+	e.now = e.now.Add(ReportsCacheFor)
+	e.m.Statuses(context.Background())
+	e.m.Statuses(context.Background())
+	if n := e.f.Count("x:DmarcExternalReport/query"); n != 1 {
+		t.Fatalf("%d report reads after the cache aged", n)
+	}
+	old := stalwart.QueryPage
+	stalwart.QueryPage = 7
+	t.Cleanup(func() { stalwart.QueryPage = old })
+	for i := 0; i < queueFetchMax+20; i++ {
+		e.f.Put("QueuedMessage", "", map[string]any{"recipients": map[string]any{"a": map[string]any{"retryCount": 1}}})
+	}
+	e.f.ResetCalls()
+	q, err := e.m.Queue(context.Background())
+	if err != nil || q.Messages != queueFetchMax+20 || q.Deferred != queueFetchMax {
+		t.Fatalf("queue %+v %v", q, err)
+	}
+	if n := e.f.Count("x:QueuedMessage/query"); n != 1 {
+		t.Fatalf("%d queue queries", n)
+	}
+}

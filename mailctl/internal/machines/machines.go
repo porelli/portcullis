@@ -81,6 +81,10 @@ type Machines struct {
 	seenMu sync.Mutex
 	seen   map[string]bool // reports already logged
 
+	repMu sync.Mutex
+	repAt time.Time // the last report read (the cache below), 0: none
+	reps  []Report
+
 	hashMu  sync.Mutex
 	hashKey string            // the state revision and the main zone's DNSSEC state
 	hashes  map[string]string // DNSHashes' last answer for hashKey
@@ -232,8 +236,40 @@ func lowerSet(m map[string]bool) map[string]bool {
 	return out
 }
 
-// reports reads every aggregate report Stalwart holds.
+// ReportsCacheFor: a status read answers the reports read at most this
+// long ago (final review L12: the Hub polls status every minute, and the
+// reports can be large); Step and the actions always read them fresh.
+const ReportsCacheFor = 5 * time.Minute
+
+// cachedReports is the last report read when it's younger than
+// ReportsCacheFor, else a fresh one.
+func (m *Machines) cachedReports(ctx context.Context) ([]Report, error) {
+	m.repMu.Lock()
+	if !m.repAt.IsZero() && m.now().Sub(m.repAt) < ReportsCacheFor && !m.now().Before(m.repAt) {
+		r := append([]Report(nil), m.reps...)
+		m.repMu.Unlock()
+		m.authenticate(ctx, r)
+		return r, nil
+	}
+	m.repMu.Unlock()
+	return m.reports(ctx)
+}
+
+// reports reads every aggregate report Stalwart holds (and caches it).
 func (m *Machines) reports(ctx context.Context) ([]Report, error) {
+	out, err := m.readReports(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Cached as read; authenticated on every use (a copy).
+	m.repMu.Lock()
+	m.repAt, m.reps = m.now(), append([]Report(nil), out...)
+	m.repMu.Unlock()
+	m.authenticate(ctx, out)
+	return out, nil
+}
+
+func (m *Machines) readReports(ctx context.Context) ([]Report, error) {
 	var out []Report
 	ids, err := m.C.Query(ctx, "DmarcExternalReport", nil)
 	if err != nil {
@@ -301,7 +337,6 @@ func (m *Machines) reports(ctx context.Context) ([]Report, error) {
 			}
 		}
 	}
-	m.authenticate(ctx, out)
 	return out, nil
 }
 
@@ -1028,7 +1063,7 @@ func (m *Machines) Statuses(ctx context.Context) ([]DKIMStatus, []MTASTSStatus, 
 	}
 	ms, ds := []MTASTSStatus{}, []DMARCStatus{}
 	if p.Doc != nil {
-		reps, _ := m.reports(ctx)
+		reps, _ := m.cachedReports(ctx)
 		for _, d := range p.Doc.Domains {
 			st := sts[d.Name]
 			mode := st.Mode
@@ -1084,7 +1119,7 @@ func init() {
 }
 
 // Reports reads every aggregate report Stalwart holds (the checks).
-func (m *Machines) Reports(ctx context.Context) ([]Report, error) { return m.reports(ctx) }
+func (m *Machines) Reports(ctx context.Context) ([]Report, error) { return m.cachedReports(ctx) }
 
 // Keys are every domain's DKIM keys as the state holds them.
 func (m *Machines) Keys() []dkim.Key { return read[dkim.State](m.Store.Get(), extDKIM).Keys }

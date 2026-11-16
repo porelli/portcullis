@@ -310,6 +310,29 @@ func (c *Client) Query(ctx context.Context, object string, filter any) ([]string
 	return nil, fmt.Errorf("stalwart: x:%s/query: too many pages", object)
 }
 
+// QueryFirst reads only the first max ids and the total (a count that
+// needn't page through everything). A missing total is an error.
+func (c *Client) QueryFirst(ctx context.Context, object string, filter any, max int) ([]string, int, error) {
+	args := map[string]any{"position": 0, "limit": max, "calculateTotal": true}
+	if filter != nil {
+		args["filter"] = filter
+	}
+	var r struct {
+		IDs   []string `json:"ids"`
+		Total *int     `json:"total"`
+	}
+	if err := c.Call(ctx, "x:"+object+"/query", args, &r); err != nil {
+		return nil, 0, err
+	}
+	if r.Total == nil || *r.Total < len(r.IDs) {
+		return nil, 0, fmt.Errorf("stalwart: x:%s/query: no total (or less than the ids) in the answer", object)
+	}
+	if len(r.IDs) > max {
+		r.IDs = r.IDs[:max]
+	}
+	return r.IDs, *r.Total, nil
+}
+
 // getChunk bounds the ids of one /get.
 const getChunk = 256
 

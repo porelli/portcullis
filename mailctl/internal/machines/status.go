@@ -84,16 +84,16 @@ func (m *Machines) Cert(ctx context.Context) (*CertStatus, error) {
 
 // Queue counts the queued messages; deferred = a recipient already retried.
 func (m *Machines) Queue(ctx context.Context) (QueueStatus, error) {
-	ids, err := m.C.Query(ctx, "QueuedMessage", nil)
+	// The total from the first page, at most queueFetchMax ids read
+	// (final review L12: a large queue never pages to the cap); deferred
+	// is counted over those (a lower bound past queueFetchMax).
+	ids, total, err := m.C.QueryFirst(ctx, "QueuedMessage", nil, queueFetchMax)
 	if err != nil {
 		return QueueStatus{}, err
 	}
-	q := QueueStatus{Messages: len(ids)}
+	q := QueueStatus{Messages: total}
 	if len(ids) == 0 {
 		return q, nil
-	}
-	if len(ids) > queueFetchMax {
-		ids = ids[:queueFetchMax]
 	}
 	var ms []struct {
 		Recipients map[string]struct {
