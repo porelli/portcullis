@@ -3,6 +3,7 @@ package dnsplan
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -492,5 +493,30 @@ func TestMainMailSameSPFHostNotAdoptedUnlessRecorded(t *testing.T) {
 	}
 	if spf, tlsa := hostRecords(e, own); len(spf) != 1 || len(tlsa) != 1 {
 		t.Fatalf("an unrecorded host with the same SPF was adopted: TXT %v TLSA %v", spf, tlsa)
+	}
+}
+
+// A set the provider refuses doesn't keep the other sets from being
+// written (test server 2026-11-16: Porkbun refused the mail set's MX); the
+// error names the failed set, and a set after it still goes.
+func TestApplyFailedSetDoesNotStopTheOthers(t *testing.T) {
+	e, _ := mailEnv(t, false)
+	e.in.Provider = &fakedns.Provider{Zone: e.zone, ZoneName: pz, Hook: func(op string, recs []libdns.Record) error {
+		for _, r := range recs {
+			if op == "append" && r.RR().Type == "MX" {
+				return errors.New("Create error: We were unable to create the DNS record.")
+			}
+		}
+		return nil
+	}}
+	_, _, err := Apply(context.Background(), e.in, []string{SetMail, SetAddress})
+	if err == nil || !strings.Contains(err.Error(), "unable to create") {
+		t.Fatalf("want the mail set's error, got %v", err)
+	}
+	if got := rrs(e.zone, mh, "A"); len(got) != 1 {
+		t.Fatalf("the address set after the failed mail set wasn't written: A at %s = %v", mh, got)
+	}
+	if got := rrs(e.zone, pd, "MX"); len(got) != 0 {
+		t.Fatalf("MX %v", got)
 	}
 }
