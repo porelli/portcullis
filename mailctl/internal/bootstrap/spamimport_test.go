@@ -2,6 +2,7 @@ package bootstrap
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -70,8 +71,26 @@ func TestEnsureSpamRules(t *testing.T) {
 		t.Fatalf("recorded %+v", s)
 	}
 	f.ResetCalls()
-	if ok, _, _ := EnsureSpamRules(ctx, c, st, now.Add(time.Hour)); !ok || len(f.Calls) != 0 {
-		t.Fatalf("after the import: ok %v, calls %v", ok, f.Calls)
+	if ok, _, _ := EnsureSpamRules(ctx, c, st, now.Add(10*time.Minute)); !ok || len(f.Calls) != 0 {
+		t.Fatalf("right after the import: ok %v, calls %v", ok, f.Calls)
+	}
+	// Final review L5: looked for again every 15 min (reads only while
+	// they're there); gone (mail_data reset on its own) → imported again.
+	if ok, req, _ := EnsureSpamRules(ctx, c, st, now.Add(time.Hour)); !ok || req || tasks() != 2 || len(f.Calls) == 0 {
+		t.Fatalf("re-verify: ok %v req %v tasks %d calls %v", ok, req, tasks(), f.Calls)
+	}
+	for _, r := range f.Objects("SpamRule", "") {
+		f.Delete("SpamRule", "", fmt.Sprint(r["id"]))
+	}
+	if ok, req, _ := EnsureSpamRules(ctx, c, st, now.Add(time.Hour+16*time.Minute)); ok || !req || tasks() != 3 {
+		t.Fatalf("rules gone: ok %v req %v tasks %d", ok, req, tasks())
+	}
+	if s := ReadSpamRules(st.Get()); s.Imported != "" {
+		t.Fatalf("still recorded as imported: %+v", s)
+	}
+	putAllRules(f)
+	if ok, _, _ := EnsureSpamRules(ctx, c, st, now.Add(time.Hour+17*time.Minute)); !ok {
+		t.Fatal("not verified once back")
 	}
 	put(st, SpamRulesState{Imported: "older"})
 	if ok, _, _ := EnsureSpamRules(ctx, c, st, now.Add(2*time.Hour)); !ok {

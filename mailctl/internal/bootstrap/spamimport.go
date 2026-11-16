@@ -20,6 +20,8 @@ const ExtSpamRules = "spam_rules"
 type SpamRulesState struct {
 	Imported   string     `json:"imported"`
 	ImportedAt *time.Time `json:"imported_at"`
+	// VerifiedAt: the last time every vendored rule name was found.
+	VerifiedAt *time.Time `json:"verified_at"`
 	TaskAt     *time.Time `json:"task_at"`
 	Error      string     `json:"error"`
 }
@@ -37,6 +39,9 @@ var (
 	spamTaskEvery = 5 * time.Minute
 	spamTaskWait  = 2 * time.Minute
 	spamTaskPoll  = 2 * time.Second
+	// spamVerifyEvery: once imported, the rules are looked for again at
+	// this pace (mail_data reset or restored on its own: final review L5).
+	spamVerifyEvery = 15 * time.Minute
 )
 
 // EnsureSpamRules imports the vendored spam rules into Stalwart (contract
@@ -52,7 +57,7 @@ var (
 // lookups on: the caller turns them off after it).
 func EnsureSpamRules(ctx context.Context, c *stalwart.Client, st *state.Store, now time.Time) (ok, requested bool, err error) {
 	cur := ReadSpamRules(st.Get())
-	if cur.Imported == spamrules.SHA256 {
+	if cur.Imported == spamrules.SHA256 && cur.VerifiedAt != nil && now.Sub(*cur.VerifiedAt) < spamVerifyEvery && !now.Before(*cur.VerifiedAt) {
 		return true, false, nil
 	}
 	names, err := spamrules.RuleNames()
@@ -62,6 +67,10 @@ func EnsureSpamRules(ctx context.Context, c *stalwart.Client, st *state.Store, n
 	missing, err := missingRules(ctx, c, names)
 	if err != nil {
 		return false, false, record(st, cur, err)
+	}
+	if cur.Imported == spamrules.SHA256 && missing > 0 {
+		// Imported once, gone now: import again (never trusted forever).
+		cur.Imported, cur.ImportedAt = "", nil
 	}
 	if missing > 0 && (cur.TaskAt == nil || now.Sub(*cur.TaskAt) >= spamTaskEvery) {
 		r, err := c.Set(ctx, "Task", map[string]any{"t": map[string]any{
@@ -80,7 +89,10 @@ func EnsureSpamRules(ctx context.Context, c *stalwart.Client, st *state.Store, n
 	}
 	if missing == 0 && len(names) > 0 {
 		t := now.UTC()
-		cur.Imported, cur.ImportedAt, cur.Error = spamrules.SHA256, &t, ""
+		if cur.Imported != spamrules.SHA256 {
+			cur.Imported, cur.ImportedAt = spamrules.SHA256, &t
+		}
+		cur.VerifiedAt, cur.Error = &t, ""
 		return true, requested, put(st, cur)
 	}
 	cur.Error = fmt.Sprintf("%d of %d vendored rules not in Stalwart yet (import requested)", missing, len(names))

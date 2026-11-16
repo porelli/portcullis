@@ -492,3 +492,10 @@ func (s *Server) domainLinkedLocked(id string) bool {
 	}
 	return false
 }
+
+// Delete removes an object directly.
+func (s *Server) Delete(obj, acct, id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.objs[store(obj, acct)], id)
+}
