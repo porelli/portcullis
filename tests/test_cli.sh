@@ -1432,7 +1432,7 @@ expect_eq "group-gate has GATE_IMPERSONATION_FILE under /hub-data; hub has HUB_I
 expect_eq "hub mounts group_gate_data; HUB_CLIENT_CERT_TTL follows CLIENT_CERT_TTL" \
   "$(svc hub | grep -cxE '      - group_gate_data:/group-gate-data|      HUB_GROUP_GATE_DATA_DIR: /group-gate-data|      HUB_CLIENT_CERT_TTL: \$\{CLIENT_CERT_TTL:-720h\}|      HUB_CERT_EXPIRY_WARN_DAYS: \$\{CERT_EXPIRY_WARN_DAYS:-7\}')" 4
 expect_eq "only group-gate and the Hub mount group_gate_data, and it is a declared volume" \
-  "$(for s in $(grep -E '^  [a-z][a-z0-9-]*:$' "$DC" | tr -d ' :' | sort -u); do svc "$s" | grep -q '^      - group_gate_data:' && echo "$s"; done | tr '\n' ' ')$(awk '/^volumes:$/ { v = 1; next } v && /^  group_gate_data:$/ { print "declared" }' "$DC")" "group-gate hub declared"
+  "$(for s in $(grep -E '^  [a-z][a-z0-9-]*:$' "$DC" | tr -d ' :' | sort -u); do grep -q '^      - group_gate_data:' <<<"$(svc "$s")" && echo "$s"; done | tr '\n' ' ')$(awk '/^volumes:$/ { v = 1; next } v && /^  group_gate_data:$/ { print "declared" }' "$DC")" "group-gate hub declared"
 # shellcheck disable=SC2016  # a literal ${PORTCULLIS_DOMAIN:-...}
 expect_eq "keycloak gets PORTCULLIS_SIGNIN_URL = the Sign-in page" \
   "$(svc keycloak | sed -n 's/^      PORTCULLIS_SIGNIN_URL: //p')" 'https://people.${PORTCULLIS_DOMAIN:-portcullis.local}/signin'
