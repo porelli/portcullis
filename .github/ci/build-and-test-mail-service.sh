@@ -211,11 +211,15 @@ setup)
   st="$(./portcullis status --json || true)"
   jq -e '.mail.mailctl.bootstrap == true and .mail.mailctl.cert.sans == ["'"$HOST"'"] and .mail.timer == "inactive" and .mail.void_pending == false' <<<"$st" >/dev/null \
     || fail "status --json .mail: $(jq -c .mail <<<"$st")"
-  ./portcullis status | grep -q 'daily timer portcullis-mail.timer missing or inactive' || fail "no timer warning"
+  # (Whole outputs first: status exits 1 on a warning, and a grep -q in the
+  # pipe would break it under pipefail.)
+  st_text="$(./portcullis status 2>&1 || true)"
+  grep -q 'daily timer portcullis-mail.timer missing or inactive' <<<"$st_text" || fail "no timer warning: $(grep -i mail <<<"$st_text" | head -20)"
   ./portcullis mail schedule --systemd --out "$ST/units"
   sudo install -m 0644 "$ST/units/portcullis-mail.service" "$ST/units/portcullis-mail.timer" /etc/systemd/system/
   sudo systemctl daemon-reload && sudo systemctl enable --now portcullis-mail.timer
-  [ "$(./portcullis status --json | jq -r .mail.timer)" = active ] || fail "timer not active after schedule --systemd"
+  st="$(./portcullis status --json || true)"
+  [ "$(jq -r .mail.timer <<<"$st")" = active ] || fail "timer not active after schedule --systemd: $(jq -c .mail <<<"$st")"
   echo "PASS: status --json .mail (bootstrap, cert, timer warning → active after schedule --systemd)"
   # For the backup / restore checks.
   docker inspect -f '{{.State.StartedAt}}' "$(cid mail)" > "$ST/started"
