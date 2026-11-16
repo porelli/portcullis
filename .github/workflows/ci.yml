@@ -3856,6 +3856,8 @@ jobs:
           # The CI-only fake provider for the main domain (records into the
           # shared zone), mail-cert against Pebble, the public address =
           # mail's pinned mail-egress address (SPF / the remote's MX target).
+          # (init wrote DNS_PROVIDER=none: the first line of a key wins.)
+          sed -i '/^DNS_PROVIDER=/d' .env
           cat >> .env <<'ENV'
           DNS_PROVIDER=fake
           FAKE_API_TOKEN=ci-fake-token-0123456789

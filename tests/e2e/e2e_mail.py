@@ -578,7 +578,9 @@ def exchange_both_ways() -> None:
         forced()
         c = hub_ok("GET", "/api/mail/checks?refresh=1")
         dm = next((x for x in c.get("checks") or [] if x.get("id") == "dmarc_reports"), None)
-        return dm if dm and "remote.test" in json.dumps(dm) or (dm and DOMAIN in (dm.get("detail") or "") and dm.get("severity") != "ok") else None
+        # The remote's report has the forged message's failure: shown
+        # (display-only, contract §19.8), naming the remote as its source.
+        return dm if dm and dm.get("severity") != "ok" and "remote.test" in (dm.get("detail") or "") else None
     dm = until("the remote's DMARC report in GET /api/mail/checks", in_checks, 600, every=65)
     save("checks-dmarc.json", dm)
     print(f"    dmarc_reports: {dm.get('severity')}: {dm.get('detail')}", flush=True)

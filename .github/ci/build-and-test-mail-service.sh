@@ -245,7 +245,12 @@ after-restore)
   [ ! -e secrets/mail/recovery.env ] || fail "recovery.env left after the restore"
   python3 "$ST/smtp.py" imap mailtest@portcullis.local "$ST/pw" refused
   docker run --rm --network none -v portcullis_mailctl_data:/d:ro "$ALPINE_IMG" cat /d/state.json > "$ST/state-after.json"
-  [ "$(jq -c '.ext.dkim.keys' "$ST/state-after.json")" = "$(cat "$ST/dkim.json")" ] || fail "the DKIM state changed across backup / restore"
+  # The same keys (a pass after the restore may move a stage / since):
+  # every key from before, by domain, algorithm, selector and public key.
+  ids='[.[]? | {domain, algorithm, selector, public_key}] | sort'
+  before="$(jq -c "$ids" "$ST/dkim.json")" after="$(jq -c ".ext.dkim.keys | $ids" "$ST/state-after.json")"
+  jq -e --argjson b "$before" --argjson a "$after" '($b | length) > 0 and ($b - $a) == []' -n >/dev/null \
+    || fail "DKIM keys lost across backup / restore: before $before, after $after"
   jq -e '.restored_at != null' "$ST/state-after.json" >/dev/null || fail "restored_at not recorded"
   echo "PASS: after the restore: the old mail password is voided (IMAP refused), mail healthy, mailctl_data restored (DKIM state equal, restored_at)"
   ;;
