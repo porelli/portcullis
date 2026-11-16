@@ -291,7 +291,7 @@ func TestWriteMboxFromBounded(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime.ReadMemStats(&after)
-	if got := after.TotalAlloc - before.TotalAlloc; got > 1<<20 {
+	if got := after.TotalAlloc - before.TotalAlloc; !raceOn && got > 1<<20 {
 		t.Fatalf("a %d-byte message allocated %d bytes", size, got)
 	}
 }
@@ -392,7 +392,7 @@ func TestExportLargeMessageStreams(t *testing.T) {
 	// The in-memory server copies each message once (3 × size); the
 	// client's share must stay small (the batch-collecting export
 	// allocated 326 MiB here).
-	if got := after.TotalAlloc - before.TotalAlloc; got > 3*size+16<<20 {
+	if got := after.TotalAlloc - before.TotalAlloc; !raceOn && got > 3*size+16<<20 {
 		t.Fatalf("3 × %d MiB exported, %d MiB allocated", size>>20, got>>20)
 	}
 }
