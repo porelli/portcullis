@@ -173,13 +173,12 @@ groups:
             and backups on that server will fail. Free space on the worker.
 
       - alert: PortcullisServerContainerUnhealthy
-        # The agent's own label instance (the instance id) is scraped as
-        # exported_instance (instance is the target's).
+        # app = the instance id (instance is Prometheus' target label).
         expr: portcullis_agent_container_unhealthy == 1
         for: 5m
         labels: {severity: warning}
         annotations:
-          summary: "{{ $labels.exported_instance }} / {{ $labels.service }} is unhealthy on the server {{ $labels.server }}"
+          summary: "{{ $labels.app }} / {{ $labels.service }} is unhealthy on the server {{ $labels.server }}"
           description: >-
             Its healthcheck has failed for 5 minutes. See the instance in the Hub (logs, restart).
 

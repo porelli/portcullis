@@ -113,9 +113,9 @@ link_cert_sign() {
 }
 
 # link_cert_due <crt> [now] — the certificate is missing, unreadable or
-# has at most ⅓ of its life left.
+# has at most ⅓ of its life left (LINK_NOW: tests' clock).
 link_cert_due() {
-  local crt="$1" now="${2:-$(date +%s)}" nb na
+  local crt="$1" now="${2:-${LINK_NOW:-$(date +%s)}}" nb na
   [ -s "$crt" ] || return 0
   nb="$(to_epoch "$(openssl x509 -in "$crt" -noout -startdate 2>/dev/null | cut -d= -f2)")"
   na="$(to_epoch "$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null | cut -d= -f2)")"

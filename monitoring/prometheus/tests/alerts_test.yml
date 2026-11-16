@@ -277,9 +277,9 @@ tests:
   # Servers: an unhealthy container for 5m.
   - interval: 1m
     input_series:
-      - series: 'portcullis_agent_container_unhealthy{job="link",instance="wg-metrics:9100",exported_instance="gitea",server="nas",service="server"}'
+      - series: 'portcullis_agent_container_unhealthy{job="link",instance="wg-metrics:9100",app="gitea",server="nas",service="server"}'
         values: '0 1 1 1 1 1 1 1'
-      - series: 'portcullis_agent_container_unhealthy{job="link",instance="wg-metrics:9100",exported_instance="gitea",server="nas",service="db"}'
+      - series: 'portcullis_agent_container_unhealthy{job="link",instance="wg-metrics:9100",app="gitea",server="nas",service="db"}'
         values: '0x8'
     alert_rule_test:
       - eval_time: 4m
@@ -288,7 +288,7 @@ tests:
       - eval_time: 7m
         alertname: PortcullisServerContainerUnhealthy
         exp_alerts:
-          - exp_labels: {severity: warning, job: link, instance: "wg-metrics:9100", exported_instance: gitea, server: nas, service: server}
+          - exp_labels: {severity: warning, job: link, instance: "wg-metrics:9100", app: gitea, server: nas, service: server}
             exp_annotations:
               summary: "gitea / server is unhealthy on the server nas"
               description: >-

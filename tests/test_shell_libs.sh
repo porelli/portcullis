@@ -5438,7 +5438,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$L
 openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$LCA/l.key" -out "$LCA/l.csr" -subj "/CN=link.control" >/dev/null 2>&1
 printf 'extendedKeyUsage=clientAuth\n' > "$LCA/ext"
 openssl x509 -req -in "$LCA/l.csr" -CA "$LCA/ca.crt" -CAkey "$LCA/ca.key" -CAcreateserial -out "$LCA/l.crt" -days 90 -extfile "$LCA/ext" >/dev/null 2>&1
-openssl x509 -req -in "$LCA/l.csr" -CA "$LCA/ca.crt" -CAkey "$LCA/ca.key" -CAcreateserial -out "$LCA/old.crt" -days 20 -extfile "$LCA/ext" >/dev/null 2>&1
+openssl x509 -req -in "$LCA/l.csr" -CA "$LCA/ca.crt" -CAkey "$LCA/ca.key" -CAcreateserial -out "$LCA/l2.crt" -days 90 -extfile "$LCA/ext" >/dev/null 2>&1
 # Off-CA: the same CN under another root.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$LCA/x.key" -out "$LCA/x.crt" -subj "/CN=link.control" -days 90 >/dev/null 2>&1
 expect_fail "link_cert_due: a fresh 90 d certificate isn't due" link_cert_due "$LCA/l.crt"
@@ -5511,8 +5511,8 @@ expect_eq "link cert: Vault's refusal → exit 1 naming the path, nothing writte
 OUT="$(lt 'printf S > "$PORTCULLIS_ROOT/secrets/wg/link-tls.key"; : > "$PORTCULLIS_ROOT/certs/node-ca.crt"; link_cert_sign' 2>&1)"; RC=$?
 expect_eq "link cert: no node CA exported yet → refused (pki setup)" "$RC:$(printf '%s' "$OUT" | grep -c 'pki setup')" "1:1"
 # Renewal on up / upgrade: only with the role on, only when due.
-OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=x.org\nPORTCULLIS_LINK=on' lt 'printf S > "$PORTCULLIS_ROOT/secrets/wg/link-tls.key"; cp "'"$LCA"'/old.crt" "$PORTCULLIS_ROOT/secrets/wg/link-tls.crt"; link_cert_renew' 2>&1)"; RC=$?; echo "DEBUG: $OUT" >&2
-expect_eq "link_cert_renew: 20 d left of 90 → re-signed" "$RC:$(grep -c 'node-link' "$WORK/vt/curl-argv"):$(cmp -s "$LCA/l.crt" "$WORK/vt/root/secrets/wg/link-tls.crt" && echo new)" "0:1:new"
+OUT="$(LINK_NOW=$(( $(date +%s) + 70 * 86400 )) VT_SIGNED="$LCA/l2.crt" VT_ENV=$'PORTCULLIS_DOMAIN=x.org\nPORTCULLIS_LINK=on' lt 'printf S > "$PORTCULLIS_ROOT/secrets/wg/link-tls.key"; cp "'"$LCA"'/l.crt" "$PORTCULLIS_ROOT/secrets/wg/link-tls.crt"; link_cert_renew' 2>&1)"; RC=$?
+expect_eq "link_cert_renew: 20 d left of 90 → re-signed" "$RC:$(grep -c 'node-link' "$WORK/vt/curl-argv"):$(cmp -s "$LCA/l2.crt" "$WORK/vt/root/secrets/wg/link-tls.crt" && echo new)" "0:1:new"
 OUT="$(VT_ENV=$'PORTCULLIS_DOMAIN=x.org\nPORTCULLIS_LINK=on' lt 'cp "'"$LCA"'/l.crt" "$PORTCULLIS_ROOT/secrets/wg/link-tls.crt"; link_cert_renew' 2>&1)"; RC=$?; echo "DEBUG: $OUT" >&2
 expect_eq "link_cert_renew: a fresh certificate → nothing asked" "$RC:$(cat "$WORK/vt/curl-argv" 2>/dev/null | grep -c node-link || true)" "0:0"
 OUT="$(lt 'link_cert_renew' 2>&1)"; RC=$?; echo "DEBUG: $OUT" >&2
