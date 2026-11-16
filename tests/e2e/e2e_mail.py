@@ -516,8 +516,11 @@ def setup(browser) -> None:
         member("add", "team", u)
     hub_ok("PUT", "/api/directory/groups/team/mail-list", {"enabled": True, "domain": DOMAIN, "posting": "members"}, want=(200, 204))
     # Additions are debounced 60 s: every address answers RCPT once applied.
-    for a in (f"alice@{DOMAIN}", f"bob@{DOMAIN}", f"root@{DOMAIN}", f"bob@{EXTRA}", f"team@{DOMAIN}"):
+    for a in (f"alice@{DOMAIN}", f"bob@{DOMAIN}", f"root@{DOMAIN}", f"bob@{EXTRA}"):
         until(f"{a} accepted at RCPT", lambda a=a: smtp25("probe@relay-test.example", a)[1] == 250, 240, every=5)
+    # The members-only list exists once an outsider gets its 5.7.1 (not 5.1.1).
+    until(f"team@{DOMAIN} a members-only list at RCPT",
+          lambda: (lambda r: r[1] == 550 and r[2].startswith("5.7.1"))(smtp25("probe@relay-test.example", f"team@{DOMAIN}")), 240, every=5)
     # DKIM: the keys go active once both resolvers serve them (the main
     # domain's set is the CLI's: mail rotate; team-b.test's the Hub's).
     def dkim_active():

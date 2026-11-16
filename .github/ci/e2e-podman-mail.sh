@@ -162,7 +162,7 @@ echo "PASS: the doctor names mail_client_ip_rewritten"
 # mailctl (its pinned address; mailctl stopped meanwhile).
 docker compose --profile mail stop mailctl >/dev/null
 set +e
-out="$(podman run --rm --network portcullis-mail --ip 172.31.255.3 -v "$PWD/secrets/mail/api-key:/k:ro" --entrypoint sh "$CURL_IMG" \
+out="$(podman run --rm --network portcullis-mail --ip 172.31.255.3 --user 10010:10010 -v "$PWD/secrets/mail/api-key:/k:ro" --entrypoint sh "$CURL_IMG" \
   -c 'printf "Authorization: Bearer %s\n" "$(cat /k)" > /tmp/h; curl -s -H @/tmp/h -H "Content-Type: application/json" \
       -d "{\"using\":[\"urn:ietf:params:jmap:core\",\"urn:stalwart:jmap\"],\"methodCalls\":[[\"x:BlockedIp/query\",{},\"0\"]]}" \
       http://172.31.255.2:8080/jmap')"
