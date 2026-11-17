@@ -1162,6 +1162,285 @@
         }
       ],
       "want_error": "mail set: example.org MX: not under example.com"
+    },
+    {
+      "name": "a tab in an spf value refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx\t-all"
+        }
+      ],
+      "want_error": "mail set: example.com TXT: the value must be printable ASCII"
+    },
+    {
+      "name": "a newline in a dkim value refused",
+      "records": [
+        {
+          "name": "s1._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=\nx=y"
+        }
+      ],
+      "want_error": "mail set: s1._domainkey.example.com TXT: the value must be printable ASCII"
+    },
+    {
+      "name": "a non-ascii byte in a dmarc value refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; rua=mailto:dmarc-reports@example.com é"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: the value must be printable ASCII"
+    },
+    {
+      "name": "a txt value of 2049 characters refused",
+      "records": [
+        {
+          "name": "s1._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=rsa; p=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }
+      ],
+      "want_error": "mail set: s1._domainkey.example.com TXT: the value is longer than 2048 characters"
+    },
+    {
+      "name": "a txt value of 2048 characters ok",
+      "records": [
+        {
+          "name": "s1._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=rsa; p=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "ttl 59 refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 59,
+          "value": "10 mail.example.com."
+        }
+      ],
+      "want_error": "mail set: example.com MX: ttl must be 60–86400"
+    },
+    {
+      "name": "ttl 86401 refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 86401,
+          "value": "10 mail.example.com."
+        }
+      ],
+      "want_error": "mail set: example.com MX: ttl must be 60–86400"
+    },
+    {
+      "name": "ttl 60 and 86400 ok",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 60,
+          "value": "10 mail.example.com."
+        },
+        {
+          "name": "_mta-sts.example.com",
+          "type": "TXT",
+          "ttl": 86400,
+          "value": "v=STSv1; id=9c1f4b7e2a6d8c0e1f3aT1763200000"
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "mx priority 99999 refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "99999 mail.example.com."
+        }
+      ],
+      "want_error": "mail set: example.com MX: the priority must be 0–65535"
+    },
+    {
+      "name": "mx priority 65535 ok",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "65535 mail.example.com."
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "srv weight 70000 refused",
+      "records": [
+        {
+          "name": "_imaps._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 70000 993 mail.example.com."
+        }
+      ],
+      "want_error": "mail set: _imaps._tcp.example.com SRV: priority and weight must be 0–65535"
+    },
+    {
+      "name": "dkim without p= refused",
+      "records": [
+        {
+          "name": "s1._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519"
+        }
+      ],
+      "want_error": "mail set: s1._domainkey.example.com TXT: the DKIM tags must be <name>=<value>, with p=<base64>"
+    },
+    {
+      "name": "dkim p= not base64 refused",
+      "records": [
+        {
+          "name": "s1._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=not*base64"
+        }
+      ],
+      "want_error": "mail set: s1._domainkey.example.com TXT: the DKIM tags must be <name>=<value>, with p=<base64>"
+    },
+    {
+      "name": "dkim a tag twice refused",
+      "records": [
+        {
+          "name": "s1._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=; p=AAAA"
+        }
+      ],
+      "want_error": "mail set: s1._domainkey.example.com TXT: the DKIM tags must be <name>=<value>, with p=<base64>"
+    },
+    {
+      "name": "dkim revoked empty p= ok",
+      "records": [
+        {
+          "name": "s1._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; p="
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "dmarc adkim=x refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; adkim=x; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: adkim must be r or s"
+    },
+    {
+      "name": "dmarc aspf free text refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; aspf=strict please; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: aspf must be r or s"
+    },
+    {
+      "name": "dmarc fo=2 refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; fo=1:2; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: fo must be 0, 1, d or s, colon-separated"
+    },
+    {
+      "name": "dmarc fo=0:1:d:s ok",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; fo=0:1:d:s; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "dmarc rf=iodef refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; rf=iodef; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: rf must be afrf"
+    },
+    {
+      "name": "dmarc ri not a number refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; ri=1d; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: ri must be a whole number of seconds"
     }
   ]
 }
