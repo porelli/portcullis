@@ -1519,6 +1519,63 @@
         }
       ],
       "want_error": "mail set: s1._domainkey.example.com TXT: the value has leading or trailing whitespace"
+    },
+    {
+      "name": "dmarc with an empty tag refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1;; p=reject; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: an empty tag is not allowed"
+    },
+    {
+      "name": "dmarc with a final separator ok",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com;"
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "srv 0 0 0 . with extra spaces refused",
+      "records": [
+        {
+          "name": "_imap._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0   0 0 ."
+        }
+      ],
+      "want_error": "mail set: _imap._tcp.example.com SRV: must be 0 0 0 ."
+    },
+    {
+      "name": "a non-ascii name refused",
+      "context": {
+        "domain": "kitchen.com"
+      },
+      "records": [
+        {
+          "name": "_dmarc.Kitchen.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.Kitchen.com TXT: the name must be ASCII letters, digits, '.', '-' and '_'"
     }
   ]
 }
