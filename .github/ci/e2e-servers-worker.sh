@@ -22,15 +22,22 @@ kind="${1:?dind|podman|exec}" name="${2:?worker name}"
 [[ "$name" =~ ^[a-z][a-z0-9-]{0,20}$ ]] || { echo "bad worker name"; exit 2; }
 WUSER=worker
 
+# asworker <cmd…> — as the Podman worker's operator, with a clean
+# environment (the runner's XDG_* / DOCKER_* must never leak in).
+asworker() {
+  local uid; uid="$(id -u "$WUSER")"
+  sudo -u "$WUSER" env -i HOME="/home/$WUSER" USER="$WUSER" LOGNAME="$WUSER" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 \
+    XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+    DOCKER_HOST="unix:///run/user/$uid/podman/podman.sock" "$@"
+}
+
 # wexec <name> <cmd…> — a command in the worker's checkout.
 wexec() {
   local n="$1"; shift
   if docker inspect "e2e-$n" >/dev/null 2>&1; then
     docker exec -i -w /opt/portcullis "e2e-$n" "$@"
   else
-    local uid; uid="$(id -u "$WUSER")"
-    sudo -u "$WUSER" -H env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-      DOCKER_HOST="unix:///run/user/$uid/podman/podman.sock" bash -c 'cd "$HOME/portcullis" && exec "$@"' bash "$@"
+    asworker bash -c 'cd "$HOME/portcullis" && exec "$@"' bash "$@"
   fi
 }
 
@@ -86,15 +93,13 @@ case "$kind" in
       # /run/user/<uid> is the worker's (0700): test its bus as root.
       sudo systemctl start "user@$uid.service" || true
       for i in $(seq 1 60); do sudo test -S "/run/user/$uid/bus" && break; [ "$i" -eq 60 ] && { echo "FAIL: no user manager for $WUSER"; systemctl status "user@$uid.service" --no-pager | tail -20; exit 1; }; sleep 1; done
-      sudo -u "$WUSER" -H env XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-        sh -c 'systemctl --user enable --now podman.socket && systemctl --user enable podman-restart.service' 
+      asworker sh -c 'systemctl --user enable --now podman.socket && systemctl --user enable podman-restart.service' 
     fi
     sudo rm -rf "/home/$WUSER/portcullis"
     sudo cp -a "$PWD" "/home/$WUSER/portcullis"
     sudo rm -rf "/home/$WUSER/portcullis/.env" "/home/$WUSER/portcullis/secrets/"* "/home/$WUSER/portcullis/certs/"* "/home/$WUSER/portcullis/docker-compose.ci.yml"
     sudo chown -R "$WUSER:$WUSER" "/home/$WUSER/portcullis"
-    uid="$(id -u "$WUSER")"
-    docker save "$AGENT_IMAGE" | sudo -u "$WUSER" -H env XDG_RUNTIME_DIR="/run/user/$uid" podman load -q
+    docker save "$AGENT_IMAGE" | asworker podman load -q
     override host-gateway | sudo -u "$WUSER" tee "/home/$WUSER/portcullis/docker-compose.worker.override.yml" >/dev/null
     rt=podman ;;
   *) echo "usage: $0 dind|podman|exec <name>"; exit 2 ;;
