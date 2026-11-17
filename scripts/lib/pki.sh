@@ -3,8 +3,12 @@
 # `portcullis pki setup` — the internal certificate authority in Vault: a
 # root CA (`pki`) and two intermediates signed by it, `pki_int` (YubiKey
 # certificates, role client-cert) and `pki_file` (browser certificates,
-# role browser-cert), and optionally a self-signed wildcard server cert for
-# local dev / CI.
+# role browser-cert); the node CA `pki_node` (multiple servers, contract
+# §17: roles node-worker, node-control, node-link), its OWN self-signed
+# root, never under `pki` (ruling P1: ca-chain.crt is Traefik's and
+# Keycloak's client-certificate trust list, and a node certificate must
+# fail those handshakes); and optionally a self-signed wildcard server
+# cert for local dev / CI.
 #
 # Root and intermediate keys are generated `internal`: they never leave
 # Vault and are persisted (encrypted) in Vault's raft storage.
@@ -129,6 +133,103 @@ _pki_create_browser_ca() {
 
 pki_yubikey_ca_cn() { echo "$1 Intermediate CA"; }
 pki_browser_ca_cn() { echo "$1 Browser Certificate CA"; }
+pki_node_ca_cn() { echo "$1 Node CA"; }
+
+# _pki_create_node_ca <domain> — pki_node, its own self-signed root (10 y,
+# EC P-256; its key never leaves Vault). Never signed by pki: nothing that
+# trusts the Portcullis root may ever accept a node certificate.
+_pki_create_node_ca() {
+  local domain="$1"
+  info "Creating the node certificate CA (pki_node, its own root)..."
+  vault secrets enable -path=pki_node pki >/dev/null
+  vault secrets tune -max-lease-ttl="$PKI_TTL_ROOT" pki_node >/dev/null
+  vault write -format=json pki_node/root/generate/internal \
+    common_name="$(pki_node_ca_cn "$domain")" ttl="$PKI_TTL_ROOT" key_type=ec key_bits=256 >/dev/null \
+    || fail "pki_node: generating its root failed"
+  vault write pki_node/config/urls \
+    issuing_certificates="$VAULT_ADDR/v1/pki_node/ca" \
+    crl_distribution_points="$VAULT_ADDR/v1/pki_node/crl" >/dev/null
+}
+
+# _pki_write_node_role <role> <allowed_domains> <subdomains> <bare> <server_flag> <ttl>
+# EC P-256, no IP / URI / other SANs, the CN only from common_name (never
+# the CSR's, and CSR SANs ignored), stored (revocable), not_before 30 s
+# back (issuance-time skew only; a worker's clock tolerance, ±5 min, is the agent's, §17.4).
+_pki_write_node_role() {
+  vault write "pki_node/roles/$1" \
+    allowed_domains="$2" allow_subdomains="$3" allow_bare_domains="$4" \
+    allow_glob_domains=false allow_any_name=false allow_localhost=false allow_wildcard_certificates=false \
+    enforce_hostnames=true use_csr_common_name=false use_csr_sans=false \
+    allow_ip_sans=false allowed_uri_sans="" allowed_other_sans="" \
+    client_flag=true server_flag="$5" code_signing_flag=false email_protection_flag=false \
+    key_type=ec key_bits=256 ttl="$6" max_ttl="$6" no_store=false not_before_duration=30s >/dev/null
+}
+
+# _pki_write_node_roles — every pki setup run (contract §17):
+#   node-worker  <server id>.node.portcullis.internal, client + server, 30 d
+#   node-control hub.control (the Hub), client only, 30 d
+#   node-link    link.control (wg's link role), client only, 90 d — signed
+#                by the CLI with the root token, never by enroll
+_pki_write_node_roles() {
+  info "Writing the node roles on pki_node..."
+  _pki_write_node_role node-worker node.portcullis.internal true false true 720h
+  _pki_write_node_role node-control hub.control false true false 720h
+  _pki_write_node_role node-link link.control false true false 2160h
+}
+
+# _pki_ensure_node_ca <domain> <certs> <have_node> — create pki_node when it
+# has no issuer (a mount without one is a partial run: wiped and redone),
+# refusing when certs/node-ca.crt says one existed (servers depend on it);
+# then the roles and the CRL config.
+_pki_ensure_node_ca() {
+  local domain="$1" certs="$2" have_node="$3" node_issuer=false
+  if [ "$have_node" = true ] && _vault_probe list -format=json pki_node/issuers; then
+    node_issuer=true
+  fi
+  if [ "$node_issuer" != true ]; then
+    if [ -s "$certs/node-ca.crt" ]; then
+      fail "Vault has no node CA (pki_node) but $certs/node-ca.crt exists (Vault data lost?).
+       Restore vault_data + secrets/ (./portcullis restore), or delete $certs/node-ca.crt and
+       run ./portcullis pki setup again (every worker server must then be added again)."
+    fi
+    if [ "$have_node" = true ]; then
+      warn "Found an INCOMPLETE node CA (pki_node) — wiping it and starting over."
+      vault secrets disable pki_node >/dev/null
+    fi
+    _pki_create_node_ca "$domain"
+  fi
+  _pki_write_node_roles
+  _pki_configure_crl pki_node
+}
+
+# _pki_export_node <certs> — certs/node-ca.crt (pki_node's CA, for wg's
+# agent metrics and the Hub). Refused unless it is self-signed, not issued
+# by the Portcullis root, and has a CN of its own. It is in NO trust list:
+# never ca-chain.crt, ca-chain-yubikey.crt, the truststore or group-gate's
+# CA files.
+_pki_export_node() {
+  local certs="$1" node root tmp cn subj iss f
+  node="$(_pki_ca_pem pki_node)" || exit 1
+  root="$(_pki_ca_pem pki)" || exit 1
+  tmp="$(mktemp -d)" || fail "no temporary directory"
+  printf '%s\n' "$node" > "$tmp/node.pem"
+  printf '%s\n' "$root" > "$tmp/root.pem"
+  subj="$(openssl x509 -in "$tmp/node.pem" -noout -subject -nameopt RFC2253 2>/dev/null)"
+  iss="$(openssl x509 -in "$tmp/node.pem" -noout -issuer -nameopt RFC2253 2>/dev/null)"
+  if [ -z "$subj" ] || [ "${subj#subject=}" != "${iss#issuer=}" ] \
+     || ! openssl verify -CAfile "$tmp/node.pem" "$tmp/node.pem" >/dev/null 2>&1 \
+     || openssl verify -CAfile "$tmp/root.pem" "$tmp/node.pem" >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    fail "pki_node's CA certificate is not its own self-signed root: a node certificate
+       could pass Traefik / Keycloak. Nothing was exported."
+  fi
+  rm -rf "$tmp"
+  cn="$(_pki_cn "$node")"
+  for f in pki pki_int pki_file; do
+    [ "$(_pki_cn "$(_pki_ca_pem "$f")")" != "$cn" ] || fail "pki_node has the same CN as $f ($cn)"
+  done
+  _pki_same "$certs/node-ca.crt" "$node" || _pki_put "$certs/node-ca.crt" "$node"
+}
 
 # _pki_ca_pem <mount> — the mount's CA certificate (PEM), read from Vault.
 # Fails on any error: a chain file is never written from a guess.
@@ -281,7 +382,7 @@ ssh_setup() {
 pki_setup() {
   local force="$1" server_cert="$2"
   local domain="${PORTCULLIS_DOMAIN:-portcullis.local}" certs="$PORTCULLIS_ROOT/certs"
-  local mounts have_pki=false have_int=false have_file=false int_issuer=false file_issuer=false
+  local mounts have_pki=false have_int=false have_file=false have_node=false int_issuer=false file_issuer=false
   local file_created=false int_pem
   require_cmd jq openssl
   vault_admin
@@ -293,6 +394,7 @@ pki_setup() {
   printf '%s' "$mounts" | jq -e 'has("pki/")' >/dev/null && have_pki=true
   printf '%s' "$mounts" | jq -e 'has("pki_int/")' >/dev/null && have_int=true
   printf '%s' "$mounts" | jq -e 'has("pki_file/")' >/dev/null && have_file=true
+  printf '%s' "$mounts" | jq -e 'has("pki_node/")' >/dev/null && have_node=true
   if [ "$have_int" = true ] && _vault_probe list -format=json pki_int/issuers; then
     int_issuer=true
   fi
@@ -335,7 +437,9 @@ pki_setup() {
     _pki_write_browser_role "$domain"
     _pki_configure_crl pki_file
     [ -f "$certs/revocation/revoked-serials.txt" ] || : > "$certs/revocation/revoked-serials.txt"
+    _pki_ensure_node_ca "$domain" "$certs" "$have_node"
     _pki_export "$certs" "$file_created"
+    _pki_export_node "$certs"
     if [ "$server_cert" = true ] && [ ! -s "$certs/server.crt" ]; then
       _pki_issue_server_cert "$domain" "$certs"
     fi
@@ -346,18 +450,19 @@ pki_setup() {
   # No CA in Vault, but a complete CA chain on disk: Vault data was lost
   # (or secrets/ belong to another Vault). A new CA silently invalidates
   # every enrolled cert, so that needs an explicit --force.
-  if [ "$force" != true ] && { [ -s "$certs/ca-chain.crt" ] || [ -s "$certs/browser-ca.crt" ]; }; then
-    fail "Vault has no CA but $certs/ca-chain.crt or browser-ca.crt exists (Vault data lost?).
+  if [ "$force" != true ] && { [ -s "$certs/ca-chain.crt" ] || [ -s "$certs/browser-ca.crt" ] || [ -s "$certs/node-ca.crt" ]; }; then
+    fail "Vault has no CA but $certs/ca-chain.crt, browser-ca.crt or node-ca.crt exists (Vault data lost?).
        Restore vault_data + secrets/ (./portcullis restore), or create a NEW CA
        with ./portcullis pki setup --force (every YubiKey and browser certificate must be issued again)."
   fi
 
-  if [ "$force" = true ] || [ "$have_pki" = true ] || [ "$have_int" = true ] || [ "$have_file" = true ]; then
+  if [ "$force" = true ] || [ "$have_pki" = true ] || [ "$have_int" = true ] || [ "$have_file" = true ] || [ "$have_node" = true ]; then
     if [ "$force" = true ]; then
-      warn "--force: disabling existing PKI mounts (both CAs and their issued-cert records are destroyed)..."
+      warn "--force: disabling existing PKI mounts (every CA and its issued-cert records are destroyed)..."
     else
       warn "Found an INCOMPLETE PKI (earlier run aborted?) — wiping it and starting over."
     fi
+    if [ "$have_node" = true ]; then vault secrets disable pki_node >/dev/null; fi
     if [ "$have_file" = true ]; then vault secrets disable pki_file >/dev/null; fi
     if [ "$have_int" = true ]; then vault secrets disable pki_int >/dev/null; fi
     if [ "$have_pki" = true ]; then vault secrets disable pki >/dev/null; fi
@@ -393,8 +498,13 @@ pki_setup() {
   _pki_write_browser_role "$domain"
   _pki_configure_crl pki_file
 
+  # A new node CA (--force or a wiped partial run: no worker survives it).
+  rm -f "$certs/node-ca.crt"
+  _pki_ensure_node_ca "$domain" "$certs" false
+
   # New CA → old revocations are meaningless; start an empty serial list.
   : > "$certs/revocation/revoked-serials.txt"
+  _pki_export_node "$certs"
   # Chains + truststore last (ca-chain.crt marks a complete setup).
   _pki_export "$certs" true
 
@@ -404,7 +514,7 @@ pki_setup() {
   ssh_setup "$mounts"
   # shellcheck disable=SC2034  # read by stack.sh
   PKI_CREATED=true
-  ok "Vault PKI ready: $certs/ca-chain.crt (both CAs), ca-chain-yubikey.crt, yubikey-ca.crt, browser-ca.crt"
+  ok "Vault PKI ready: $certs/ca-chain.crt (both CAs), ca-chain-yubikey.crt, yubikey-ca.crt, browser-ca.crt, node-ca.crt (in no trust list)"
 }
 
 help_pki() {
@@ -427,6 +537,14 @@ CLIENT_CERT_TTL (default 720h = 30 days), CN taken from the caller, never
 from the CSR. Enables CRL auto-rebuild + delta CRLs (rebuilt every minute)
 on both intermediates.
 
+Also the node CA for multiple servers (pki_node, CN "<domain> Node CA",
+10y): its OWN self-signed root, never signed by pki, so no Traefik tier,
+Keycloak or group-gate ever accepts a node certificate. Roles (rewritten
+every run): node-worker (<server id>.node.portcullis.internal, client +
+server, 30 days), node-control (hub.control, client, 30 days), node-link
+(link.control, client, 90 days). Exported as certs/node-ca.crt, which is in
+no trust list.
+
 Writes certs/root-ca.crt, intermediate-ca.crt, yubikey-ca.crt,
 browser-ca.crt, ca-chain.crt (root + both intermediates: Traefik's
 protected-any and authaware options), ca-chain-yubikey.crt (the YubiKey
@@ -443,9 +561,10 @@ CA is created or a chain file is out of date, both chain files and the
 truststore are rewritten. The next `up` or `upgrade` restarts Traefik,
 Keycloak and group-gate whenever these files differ from the ones they
 were started with (certs/.pki-files.loaded, written after the restart).
-Refuses when the two intermediates have the same CN, and refuses to create
-a new CA when Vault has none but certs/ca-chain.crt exists (Vault data
-lost) — restore a backup or use --force.
+Refuses when the two intermediates have the same CN, when pki_node is not
+its own self-signed root, and refuses to create a new CA when Vault has
+none but certs/ca-chain.crt (or node-ca.crt) exists (Vault data lost) —
+restore a backup or use --force.
 
 SSH (contract §18.7): the ssh_user mount (people's SSH certificates, max
 lease 12h) and ssh_host (host certificates, 2160h), each with an ed25519
@@ -455,8 +574,9 @@ or CA key type stops setup with the fix to make. --force never touches
 the SSH CAs.
 
 Options:
-  --force              DESTROY both CAs and create new ones (every YubiKey
-                       and browser certificate stops working)
+  --force              DESTROY every CA and create new ones (every YubiKey
+                       and browser certificate stops working, every worker
+                       server must be added again)
   --with-server-cert   Also issue a self-signed *.<domain> server cert
                        (certs/server.crt, server.key 0640 group 0) for local dev/CI
 

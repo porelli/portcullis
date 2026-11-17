@@ -163,7 +163,10 @@ type inviteService struct {
 	// LLDAP lookup a user certificate needs; nil = 503.
 	ssh           sshBackend
 	sshUserExists func(string) error
-	now           func() time.Time
+	// Node certificates (nodes.go, contract §17); nil = 503.
+	signNode   func(ctx context.Context, role, cn, csrPEM string) (*nodeCertResult, error)
+	revokeNode func(ctx context.Context, serial string) error
+	now        func() time.Time
 
 	mu          sync.Mutex
 	invites     map[string]*invite     // sha256(token) → invite
@@ -833,6 +836,8 @@ func (s *inviteService) apiHandler(local bool) http.Handler {
 		m.HandleFunc("POST /internal/yubikey-certificates/renew", s.handleYubiKeyRenew)
 		m.HandleFunc("POST /internal/certificates/revoke", s.handleRevoke)
 		s.registerSSH(m)
+		m.HandleFunc("POST /internal/nodes/sign", s.handleNodeSign)
+		m.HandleFunc("POST /internal/nodes/revoke", s.handleNodeRevoke)
 	}
 	return m
 }

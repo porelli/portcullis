@@ -154,13 +154,22 @@ runtime_export() {
     PORTCULLIS_VPN_RUNTIME_POOLS="$(printf '%s' "$PORTCULLIS_VPN_RUNTIME_POOLS" | xargs)"
     return 0
   fi
-  _rt_is_podman || return 0
-  export PORTCULLIS_VPN_RUNTIME_POOLS="$RT_PODMAN_POOLS"
-  sock="$(runtime_podman_socket)"
-  if [ -n "${DOCKER_HOST:-}" ] && [ "$DOCKER_HOST" != "unix://$sock" ]; then
-    fail "DOCKER_HOST=$DOCKER_HOST, but CONTAINER_RUNTIME=podman talks to unix://$sock: unset DOCKER_HOST"
+  if _rt_is_podman; then
+    export PORTCULLIS_VPN_RUNTIME_POOLS="$RT_PODMAN_POOLS"
+    sock="$(runtime_podman_socket)"
+    if [ -n "${DOCKER_HOST:-}" ] && [ "$DOCKER_HOST" != "unix://$sock" ]; then
+      fail "DOCKER_HOST=$DOCKER_HOST, but CONTAINER_RUNTIME=podman talks to unix://$sock: unset DOCKER_HOST"
+    fi
+    export DOCKER_HOST="unix://$sock"
   fi
-  export DOCKER_HOST="unix://$sock"
+  # A worker server (contract §17.7): its own compose files only, on both
+  # runtimes (worker.sh worker_compose_files; never the core overlays, P13).
+  if [ "${PORTCULLIS_ROLE:-}" = worker ]; then
+    export COMPOSE_FILE
+    COMPOSE_FILE="$(worker_compose_files)"
+    return 0
+  fi
+  _rt_is_podman || return 0
   add=("$PORTCULLIS_HOME/docker-compose.podman.yml")
   if _rt_selinux_enforcing; then add+=("$PORTCULLIS_HOME/docker-compose.podman-selinux.yml"); fi
   files="${COMPOSE_FILE:-}"

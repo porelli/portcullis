@@ -290,20 +290,27 @@ status_run() {
   if declare -F ssh_status_json >/dev/null; then ssh_json="$(ssh_status_json)" || ssh_json='{"reachable":false,"enabled":null,"problem":false,"problems":[],"hosts":[]}'; fi
   [ "$(printf '%s' "$ssh_json" | jq -r '.problem')" != true ] || problems=1
 
+  # ── Servers (contract §17): link down, or a worker silent > 3 min ──
+  local servers_json='{"enabled":false,"peers":[],"problem":false}'
+  if declare -F link_status_json >/dev/null; then
+    servers_json="$(link_status_json)" || servers_json='{"enabled":true,"peers":[],"problem":true}'
+  fi
+  [ "$(printf '%s' "$servers_json" | jq -r '.problem')" != true ] || problems=1
+
   # ── Mail (contract §19.10): absent with the profile off ──
   local mail_json=""
   if declare -F mail_status_json >/dev/null; then mail_json="$(mail_status_json)" || mail_json=""; fi
   if [ -n "$mail_json" ] && [ "$(printf '%s' "$mail_json" | jq -r '.problem')" = true ]; then problems=1; fi
 
   if [ "$json" = true ]; then
-    jq -n --arg d "${PORTCULLIS_DOMAIN:-}" --argjson s "$services" --argjson v "$vault_json" --argjson vpn "$vpn_json" --argjson ssh "$ssh_json" \
+    jq -n --arg d "${PORTCULLIS_DOMAIN:-}" --argjson s "$services" --argjson v "$vault_json" --argjson vpn "$vpn_json" --argjson srv "$servers_json" --argjson ssh "$ssh_json" \
       --argjson k "$kc" --argjson l "$lldap" --arg t "$traefik" --argjson p "$problems" --arg sh "$shadows" --arg mr "$mcp_refusing" --arg dn "$dns_json" \
       --argjson rt "$rt_json" --argjson kx "$kx" --arg ck "$clock" --arg ml "$mail_json" \
       '{domain: $d, ok: ($p == 0), problems: $p, runtime: $rt,
         system: {clock_synced: (if $ck == "true" then true elif $ck == "false" then false else "unknown" end)}, services: $s, vault: $v, keycloak: $k, lldap: $l, traefik: {state: $t},
         dns_shadows: [$sh | split("\n")[] | select(. != "") | capture("^(?<container>[^ ]+) (?<name>.+)$")],
         mcp_gate: {refusing: (if $mr == "" then null else $mr end)},
-        dns: (if $dn == "" then null else ($dn | fromjson) end), vpn: $vpn, ssh: $ssh} + ($kx | del(.dns_shadows))
+        dns: (if $dn == "" then null else ($dn | fromjson) end), vpn: $vpn, servers: $srv, ssh: $ssh} + ($kx | del(.dns_shadows))
         + (if $ml == "" then {} else {mail: ($ml | fromjson)} end)'
     return "$problems"
   fi
@@ -425,6 +432,7 @@ status_run() {
   fi
   _st_dns_lines "$dns_json" "$traefik_uri" "$env_uri"
   if declare -F vpn_status_lines >/dev/null; then vpn_status_lines "$vpn_json"; fi
+  if declare -F link_status_lines >/dev/null; then link_status_lines "$servers_json"; fi
   if declare -F ssh_status_lines >/dev/null; then ssh_status_lines "$ssh_json"; fi
   if declare -F mail_status_lines >/dev/null; then mail_status_lines "$mail_json"; fi
 
@@ -722,6 +730,14 @@ cmd_status() {
     esac
     shift
   done
+  # A worker server (contract §17.7): its own status.
+  if [ "$(worker_role)" = worker ]; then
+    [ "$textfile" != true ] || fail "status --textfile is a primary's (the worker's agent exports its metrics to the primary)"
+    export _PORTCULLIS_WORKER_CMD=1
+    need_env
+    worker_status "$json"
+    return
+  fi
   need_env
   if [ "$textfile" = true ]; then status_textfile; return; fi
   status_run "$json"

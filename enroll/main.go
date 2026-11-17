@@ -541,6 +541,8 @@ func main() {
 	inv.revoke = cfg.revokeCert
 	inv.ssh = &cfg
 	inv.sshUserExists = func(u string) error { _, err := cfg.existingUser(u); return err }
+	inv.signNode = cfg.signNodeCert
+	inv.revokeNode = cfg.revokeNodeCert
 	mux := publicMux(srv, inv)
 	for _, l := range []struct {
 		addr string

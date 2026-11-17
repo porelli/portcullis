@@ -27,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       jobs:
-        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s e2e-mail"
+        description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s e2e-mail e2e-servers e2e-servers-podman"
         type: string
         default: all
       # `-f scenarios="4 members_only_list"`: only those scenarios of the e2e
@@ -277,11 +277,10 @@ jobs:
       # vectors internal/vpn/testdata/vpn_json_vectors.json, on the
       # same-named Hub branch when it exists, else main — like the sign-in
       # vectors above.
-      - name: Shared vpn.json vectors match the Hub
+      - name: Shared vpn.json and link.json vectors match the Hub
         env:
           REF: ${{ github.head_ref || github.ref_name }}
         run: |
-          own=tests/vpn_json_vectors.json
           url="https://github.com/porelli/portcullis-hub"
           heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
           ref=main
@@ -292,14 +291,19 @@ jobs:
           sha=$(awk -v r="refs/heads/$ref" '$2 == r { print $1 }' <<<"$heads")
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::portcullis-hub has no single commit for refs/heads/$ref"; exit 1; }
           echo "portcullis-hub (vpn.json vectors): $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
-          hub="$RUNNER_TEMP/hub_vpn_json_vectors.json"
-          code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/internal/vpn/testdata/vpn_json_vectors.json")
-          [ "$code" = 200 ] || { echo "::error::fetching the Hub's vpn.json vectors from $ref ($sha): HTTP $code"; exit 1; }
-          if ! cmp "$own" "$hub"; then
-            echo "::error::$own differs from portcullis-hub $ref ($sha) internal/vpn/testdata/vpn_json_vectors.json: copy it byte for byte"
-            exit 1
-          fi
-          echo "vpn.json vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
+          # link.json v1 (contract §17.2) too: tests/link_json_vectors.json.
+          for pair in "tests/vpn_json_vectors.json internal/vpn/testdata/vpn_json_vectors.json" \
+                      "tests/link_json_vectors.json internal/linkdoc/testdata/link_json_vectors.json"; do
+            read -r own theirs <<<"$pair"
+            hub="$RUNNER_TEMP/hub_$(basename "$own")"
+            code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/$theirs")
+            [ "$code" = 200 ] || { echo "::error::fetching the Hub's $theirs from $ref ($sha): HTTP $code"; exit 1; }
+            if ! cmp "$own" "$hub"; then
+              echo "::error::$own differs from portcullis-hub $ref ($sha) $theirs: copy it byte for byte"
+              exit 1
+            fi
+          done
+          echo "vpn.json and link.json vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
       # enroll/testdata/ssh_vectors.json drives enroll's SSH checks
       # (contract §18): a byte copy of the Hub's internal/cliapi/testdata/
       # vectors.json, same-named Hub branch when it exists, else main.
@@ -334,6 +338,13 @@ jobs:
       # closure, the per-job check (tests/e2e/scenarios.py; stdlib only).
       - name: e2e scenario filter unit tests (scenarios.py)
         run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_e2e_scenarios.py
+      # The local runner's ::add-mask:: (never written, values *** after).
+      - name: local CI runner masking unit tests (steps.py)
+        run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_local_steps.py
+      # Job wg never keeps a worker agent's series (server-labelled);
+      # job link keeps only wg_link_* / portcullis_agent_* (contract §17.2).
+      - name: Prometheus relabel rules (worker metrics)
+        run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_prometheus_relabel.py
       - name: Tool versions (the compose / jq checks depend on them)
         run: docker compose version && jq --version && yq --version
       - name: compose files are valid with a generated .env
@@ -604,7 +615,7 @@ jobs:
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',build-and-test,') || contains(format(' ,{0}, ', inputs.jobs), ',build-and-test ') || contains(format(' ,{0}, ', inputs.jobs), ' build-and-test,') || contains(format(' ,{0}, ', inputs.jobs), ' build-and-test ')
     runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -966,6 +977,20 @@ jobs:
           for san in alt_names=evil.example ip_sans=10.0.0.1 uri_sans=spiffe://evil other_sans="1.2.3.4;UTF8:evil"; do
             denied write pki_file/sign/browser-cert csr=not-a-csr common_name=ci-policy-check "$san"
             denied write pki_int/sign/client-cert csr=not-a-csr common_name=ci-policy-check "$san"
+          done
+          # pki_node (contract §17): sign node-worker / node-control, cert read,
+          # revoke, crl/rotate; never node-link, issue, roles or SANs.
+          allowed write pki_node/sign/node-worker csr=not-a-csr common_name=ci.node.portcullis.internal
+          allowed write pki_node/sign/node-control csr=not-a-csr common_name=hub.control
+          allowed read pki_node/cert/ca
+          allowed write pki_node/revoke serial_number=00:00:00:00
+          allowed read -format=json pki_node/crl/rotate
+          denied write pki_node/sign/node-link csr=not-a-csr common_name=link.control
+          denied write pki_node/issue/node-worker common_name=ci.node.portcullis.internal
+          denied write pki_node/roles/node-worker max_ttl=87600h
+          denied write -f pki_node/root/generate/internal common_name=x
+          for san in alt_names=evil.example ip_sans=10.0.0.1 uri_sans=spiffe://evil other_sans="1.2.3.4;UTF8:evil"; do
+            denied write pki_node/sign/node-worker csr=not-a-csr common_name=ci.node.portcullis.internal "$san"
           done
           denied read sys/auth
           denied read sys/mounts
@@ -1386,6 +1411,9 @@ jobs:
 
       - name: Test Keycloak X.509 login - via Traefik works, a forged cert header does not
         run: bash .github/ci/build-and-test-keycloak-x-509-login-traefik.sh
+
+      - name: Test a node certificate (pki_node) passes no TLS tier and no Keycloak X.509
+        run: bash .github/ci/build-and-test-node-ca-untrusted.sh
 
       - name: Test client-cert headers cannot be spoofed and path rules see X-Forwarded-Uri
         run: |
@@ -5846,5 +5874,143 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-k3s-artifacts
+          path: e2e-artifacts/
+          retention-days: 7
+
+  # Multiple servers (contract §17; tests/e2e/e2e_servers.py): the primary
+  # on Docker with `link init`, docker:dind workers (privileged: CI only, the reviewed exception)
+  # joined with the code on stdin. Thin: the steps are .github/ci/e2e-servers-*.sh.
+  e2e-servers:
+    needs: jobs-input
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-servers,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-servers ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-servers,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-servers ')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    env:
+      E2E_DOMAIN: portcullis.local
+      E2E_ARTIFACTS: e2e-artifacts
+      E2E_WORKER_KIND: dind
+      ALPINE: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      CURL_IMG: docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Hub, agent and relay images (same-named Hub branch → built here, else the published ones)
+        timeout-minutes: 25
+        uses: ./.github/actions/hub-image
+        with:
+          e2etest: "true"
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/keycloak-image
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Build the WireGuard probe client (tests/e2e/vpn-client)
+        working-directory: tests/e2e/vpn-client
+        run: CGO_ENABLED=0 go build -o "$RUNNER_TEMP/vpn-client" . && echo "E2E_VPN_CLIENT=$RUNNER_TEMP/vpn-client" >> "$GITHUB_ENV"
+      - name: Primary — the whole stack, the Hub, link init, setup links
+        timeout-minutes: 25
+        run: bash .github/ci/e2e-servers-setup.sh
+      - name: Install Playwright (pinned) and trust core's CA
+        timeout-minutes: 10
+        run: |
+          python3 -m venv /tmp/e2e-venv
+          /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
+          sudo /tmp/e2e-venv/bin/playwright install-deps chromium
+          /tmp/e2e-venv/bin/playwright install chromium
+          sudo apt-get install -y -qq libnss3-tools >/dev/null
+          mkdir -p "$HOME/.pki/nssdb"
+          certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
+          certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
+      - name: Servers (join, routing, cookies, move, fail closed, rogue worker, revoke)
+        timeout-minutes: 35
+        run: NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_servers.py
+      - name: Collect logs (never .env, secrets/, a join code)
+        if: failure()
+        run: |
+          mkdir -p e2e-artifacts
+          docker compose logs --no-color > e2e-artifacts/primary.log 2>&1 || true
+          for w in w1 w1b w3; do bash .github/ci/e2e-servers-worker.sh compose "$w" logs --no-color > "e2e-artifacts/$w.log" 2>&1 || true; done
+          # The apps' containers on each worker (state + last lines; never env).
+          # shellcheck disable=SC2016
+          for w in w1 w3; do bash .github/ci/e2e-servers-worker.sh exec "$w" sh -c 'docker ps -a --filter label=com.docker.compose.project --format "{{.Names}} {{.Status}}"; for c in $(docker ps -aq --filter label=com.docker.compose.project); do n=$(docker inspect -f "{{.Name}}" "$c"); case "$n" in /portcullis-worker-*) continue ;; esac; echo "== $n"; docker logs --tail 50 "$c" 2>&1; done' > "e2e-artifacts/$w-apps.log" 2>&1 || true; done
+          grep -l 'pcj1\.' e2e-artifacts/* | xargs -r rm -f
+      - name: Upload logs
+        timeout-minutes: 10
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-servers-artifacts
+          path: e2e-artifacts/
+          retention-days: 7
+
+  # Multiple servers (contract §17; tests/e2e/e2e_servers.py): the primary
+  # on Docker with `link init`, a rootless Podman worker in a pinned quay.io/podman/stable container (systemd, user `podman`)
+  # joined with the code on stdin. Thin: the steps are .github/ci/e2e-servers-*.sh.
+  e2e-servers-podman:
+    needs: jobs-input
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-servers-podman,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-servers-podman ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-servers-podman,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-servers-podman ')
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    env:
+      E2E_DOMAIN: portcullis.local
+      E2E_ARTIFACTS: e2e-artifacts
+      E2E_WORKER_KIND: podman
+      ALPINE: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+      CURL_IMG: docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Hub, agent and relay images (same-named Hub branch → built here, else the published ones)
+        timeout-minutes: 25
+        uses: ./.github/actions/hub-image
+        with:
+          e2etest: "true"
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/keycloak-image
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Build the WireGuard probe client (tests/e2e/vpn-client)
+        working-directory: tests/e2e/vpn-client
+        run: CGO_ENABLED=0 go build -o "$RUNNER_TEMP/vpn-client" . && echo "E2E_VPN_CLIENT=$RUNNER_TEMP/vpn-client" >> "$GITHUB_ENV"
+      - name: Primary — the whole stack, the Hub, link init, setup links
+        timeout-minutes: 25
+        run: bash .github/ci/e2e-servers-setup.sh
+      - name: Install Playwright (pinned) and trust core's CA
+        timeout-minutes: 10
+        run: |
+          python3 -m venv /tmp/e2e-venv
+          /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
+          sudo /tmp/e2e-venv/bin/playwright install-deps chromium
+          /tmp/e2e-venv/bin/playwright install chromium
+          sudo apt-get install -y -qq libnss3-tools >/dev/null
+          mkdir -p "$HOME/.pki/nssdb"
+          certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
+          certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
+      - name: Servers (join, routing, cookies, move, fail closed, rogue worker, revoke)
+        timeout-minutes: 35
+        run: NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_servers.py
+      - name: Collect logs (never .env, secrets/, a join code)
+        if: failure()
+        run: |
+          mkdir -p e2e-artifacts
+          docker compose logs --no-color > e2e-artifacts/primary.log 2>&1 || true
+          for w in w1 w1b w3; do bash .github/ci/e2e-servers-worker.sh compose "$w" logs --no-color > "e2e-artifacts/$w.log" 2>&1 || true; done
+          # The apps' containers on each worker (state + last lines; never env).
+          # shellcheck disable=SC2016
+          for w in w1 w3; do bash .github/ci/e2e-servers-worker.sh exec "$w" sh -c 'docker ps -a --filter label=com.docker.compose.project --format "{{.Names}} {{.Status}}"; for c in $(docker ps -aq --filter label=com.docker.compose.project); do n=$(docker inspect -f "{{.Name}}" "$c"); case "$n" in /portcullis-worker-*) continue ;; esac; echo "== $n"; docker logs --tail 50 "$c" 2>&1; done' > "e2e-artifacts/$w-apps.log" 2>&1 || true; done
+          grep -l 'pcj1\.' e2e-artifacts/* | xargs -r rm -f
+      - name: Upload logs
+        timeout-minutes: 10
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-servers-podman-artifacts
           path: e2e-artifacts/
           retention-days: 7

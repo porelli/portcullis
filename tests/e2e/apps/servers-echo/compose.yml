@@ -1,0 +1,34 @@
+services:
+  # busybox httpd + one CGI (www/cgi-bin/echo): it echoes the request's
+  # Cookie header and sets two cookies, one host-only and one for the
+  # parent domain (the relay must rewrite it host-only, contract §17.1).
+  # Its own volume, for the move test's marker file.
+  web:
+    image: docker.io/library/busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
+    user: "65534:65534"
+    # The Hub's data file is 0640 group 10001 (contract §13.7).
+    group_add: ["10001"]
+    command: ["httpd", "-f", "-p", "8080", "-h", "/www"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [default, portcullis-proxy]
+    volumes:
+      - ./templates/servers-echo/www:/www:ro
+      - marker:/data
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.secho.rule: Host(`${PORTCULLIS_HOST_SECHO:-secho.portcullis.local}`)
+      traefik.http.routers.secho.entrypoints: websecure
+      traefik.http.routers.secho.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.secho.loadbalancer.server.port: "8080"
+
+# Not `data`: the default instances of every local template share the
+# core project's volume prefix (the Hub skips a template whose default
+# instance would reuse echo's portcullis_data).
+volumes:
+  marker: {}
+
+networks:
+  portcullis-proxy:
+    external: true

@@ -154,10 +154,15 @@ env_unset() {
 }
 
 # need_env — load .env (fail if missing), then check the container runtime
-# (CONTAINER_RUNTIME, the engine behind it: scripts/lib/runtime.sh).
+# (CONTAINER_RUNTIME, the engine behind it: scripts/lib/runtime.sh). On a
+# worker (PORTCULLIS_ROLE=worker) it refuses but for `worker …`.
 need_env() {
   [ -f "$(env_file)" ] || fail "$(env_file) not found. Run ./portcullis init first."
   env_load
+  # A worker server (contract §17.7): only `worker …` (worker.sh) loads it.
+  if [ "${PORTCULLIS_ROLE:-}" = worker ] && [ "${_PORTCULLIS_WORKER_CMD:-}" != 1 ]; then
+    fail "this host is a Portcullis worker: use ./portcullis worker …"
+  fi
   runtime_check
 }
 
@@ -505,6 +510,11 @@ CT_UID_WG=10006      # wg/Dockerfile (USER 10006:10006; no other group)
 # vpn_doc's group (vpn.json, contract §16): the Hub (writer), wg and
 # group-gate (readers) only — never the Hub's own 10001.
 CT_GID_VPN_DOC=10007
+# Multiple servers (contract §17): link_doc's group (link.json; the Hub
+# writes, wg reads — never 10001) and the worker agent's uid.
+CT_GID_LINK_DOC=10009
+# shellcheck disable=SC2034  # used by worker.sh
+CT_UID_AGENT=10008
 # Mail (contract §19.1): Stalwart's image user (2000:2000), mailctl
 # (mailctl/Dockerfile, USER 10010:10010, + group 10001 for the Hub secret;
 # not 10006 = wg, 10008 / 10009 reserved by multi-server) and the Unbound
@@ -739,7 +749,7 @@ secrets_fix_perms() {
   # secrets/sessions/ (scripts/lib/sessions.sh)
   if declare -F sessions_fix_perms >/dev/null; then sessions_fix_perms; fi
   # secrets/wg/: the built-in people VPN's key (contract §16), wg reads it.
-  ct_group_read "$CT_UID_WG" "$s/wg" "$s/wg/people.key"
+  ct_group_read "$CT_UID_WG" "$s/wg" "$s/wg/people.key" "$s/wg/link.key" "$s/wg/link-tls.key" "$s/wg/link-tls.crt"
   # secrets/ssh/ (scripts/lib/ssh.sh): the break-glass record, the Hub's.
   if declare -F ssh_fix_perms >/dev/null; then ssh_fix_perms; fi
   # secrets/mail/ (contract §19.1): the directory 0700 (each reader binds
@@ -779,7 +789,7 @@ _mail_void_gate() {
 # Core variables the Hub may copy into app .env files (templates reference
 # them as ${VAR}); everything else in .env is a core secret the Hub never
 # sees. Operators can add names via HUB_SHARED_ENV="VAR1 VAR2".
-HUB_ENV_VARS="PORTCULLIS_DOMAIN PORTCULLIS_TRAEFIK_IP PORTCULLIS_MCP_GATE_IP PORTCULLIS_TRAEFIK_SOURCE PORTCULLIS_MCP_GATE_SOURCE PORTCULLIS_PROXY_SUBNET PORTCULLIS_PROXY_IP_RANGE PORTAL_DISPLAY_NAME PORTCULLIS_VPN_MODE PORTCULLIS_VPN_PUBLIC_ENROL PORTCULLIS_VPN_NET PORTCULLIS_VPN_WG_IP PORTCULLIS_VPN_BUILTIN PORTCULLIS_VPN_RESERVED_RANGES"
+HUB_ENV_VARS="PORTCULLIS_DOMAIN PORTCULLIS_TRAEFIK_IP PORTCULLIS_MCP_GATE_IP PORTCULLIS_TRAEFIK_SOURCE PORTCULLIS_MCP_GATE_SOURCE PORTCULLIS_PROXY_SUBNET PORTCULLIS_PROXY_IP_RANGE PORTAL_DISPLAY_NAME PORTCULLIS_VPN_MODE PORTCULLIS_VPN_PUBLIC_ENROL PORTCULLIS_VPN_NET PORTCULLIS_VPN_WG_IP PORTCULLIS_VPN_BUILTIN PORTCULLIS_VPN_RESERVED_RANGES PORTCULLIS_LINK_DATA_WG_IP"
 HUB_ENV_PREFIXES="NETBIRD_ COTURN_"
 
 # hub_env_write — secrets/hub/core.env, mounted read-only as the Hub's
@@ -831,6 +841,9 @@ hub_env_write() {
       PORTCULLIS_VPN_BUILTIN) val="${PORTCULLIS_VPN_BUILTIN:-off}" ;;
       # Derived, never from .env: what wg and group-gate refuse (network.sh).
       PORTCULLIS_VPN_RESERVED_RANGES) val="$(vpn_reserved_ranges)" ;;
+      # Multiple servers (contract §17.2): link's data CONNECT address, the
+      # relays' upstream (never a template variable: the prefix is reserved).
+      PORTCULLIS_LINK_DATA_WG_IP) val="$(link_data_wg_ip)" ;;
       *) val="${!v:-}" ;;
     esac
     content+="$v=$val"$'\n'
@@ -990,7 +1003,9 @@ stack_prepare() {
   [ ! -d "$PORTCULLIS_ROOT/certs/ca-bundle.crt" ] || fail "$PORTCULLIS_ROOT/certs/ca-bundle.crt is a directory (made by Docker before config apply): remove it (rmdir) and run again"
   [ -f "$PORTCULLIS_ROOT/certs/ca-bundle.crt" ] || { : > "$PORTCULLIS_ROOT/certs/ca-bundle.crt"; chmod 644 "$PORTCULLIS_ROOT/certs/ca-bundle.crt"; }
   local ca
-  for ca in yubikey-ca.crt browser-ca.crt; do
+  # wg binds certs/node-ca.crt (the agents' CA, contract §17.5; never in a
+  # trust list): empty until pki setup exports it.
+  for ca in yubikey-ca.crt browser-ca.crt node-ca.crt; do
     [ ! -d "$PORTCULLIS_ROOT/certs/$ca" ] || fail "$PORTCULLIS_ROOT/certs/$ca is a directory (made by Docker before pki setup): remove it (rmdir) and run again"
     [ -f "$PORTCULLIS_ROOT/certs/$ca" ] || { : > "$PORTCULLIS_ROOT/certs/$ca"; chmod 644 "$PORTCULLIS_ROOT/certs/$ca"; }
   done
@@ -1022,6 +1037,15 @@ stack_prepare() {
   [ ! -d "$PORTCULLIS_ROOT/secrets/wg/people.key" ] || fail "$PORTCULLIS_ROOT/secrets/wg/people.key is a directory (made by Docker): remove it (rmdir) and run again"
   [ -f "$PORTCULLIS_ROOT/secrets/wg/people.key" ] || (umask 027 && : > "$PORTCULLIS_ROOT/secrets/wg/people.key")
   chmod 640 "$PORTCULLIS_ROOT/secrets/wg/people.key"
+  # The link role's key and link.control certificate (contract §17.2,
+  # §17.5): empty placeholders until ./portcullis link init (an empty
+  # link.key = the role off), each rewritten in place by link.sh.
+  local lf
+  for lf in link.key link-tls.key link-tls.crt; do
+    [ ! -d "$PORTCULLIS_ROOT/secrets/wg/$lf" ] || fail "$PORTCULLIS_ROOT/secrets/wg/$lf is a directory (made by Docker): remove it (rmdir) and run again"
+    [ -f "$PORTCULLIS_ROOT/secrets/wg/$lf" ] || (umask 027 && : > "$PORTCULLIS_ROOT/secrets/wg/$lf")
+    chmod 640 "$PORTCULLIS_ROOT/secrets/wg/$lf"
+  done
   mail_prepare
   # secrets/ssh/: the break-glass record the Hub imports (contract §18.10).
   if declare -F ssh_prepare >/dev/null; then ssh_prepare; fi
@@ -1034,6 +1058,9 @@ stack_prepare() {
   # the Hub for it. setgid so the Hub's files carry 10007. Not backed up:
   # the Hub rewrites it from its state.
   volume_own vpn_doc "$CT_UID_HUB:$CT_GID_VPN_DOC" 2750
+  # link_doc: the Hub writes link.json (0640) there; wg reads it through
+  # group 10009 (contract §17.2). setgid; not backed up (the Hub rewrites it).
+  volume_own link_doc "$CT_UID_HUB:$CT_GID_LINK_DOC" 2750
   # hub_secrets: per-person password hashes (contract §6, file sharing). The
   # Hub checks ownership and mode at start; ensure it here.
   _ensure_secrets_volume

@@ -1,11 +1,21 @@
 name: Hub image
 description: >-
   Cross-repo feature branches: when porelli/portcullis-hub has a branch with
-  this run's branch name (not main), build the Hub from it and use that image
-  (HUB_IMAGE=portcullis-hub:ci, HUB_LOCAL=1 for the later steps), so core and
+  this run's branch name (not main), build the Hub, its worker agent and its
+  relay from it and use those images (HUB_IMAGE=portcullis-hub:ci, HUB_LOCAL=1,
+  AGENT_IMAGE=localhost/portcullis-agent:ci, RELAY_IMAGE=localhost/portcullis-relay:edge for the
+  later steps; CI-only test hooks built in, GO_TAGS=e2etest), so core and
   Hub changes that must ship together are tested together without publishing
   an image. Otherwise nothing changes: the compose default (the published
-  edge image) is pulled as before.
+  edge image) is pulled as before — except with `e2etest: "true"` (the
+  servers jobs, whose setup needs the Hub's and agent's CI-only hooks):
+  then main of porelli/portcullis-hub is built the same way.
+
+inputs:
+  e2etest:
+    description: Build from the Hub's main when there is no same-named branch (the published image has no e2etest hooks).
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -14,6 +24,7 @@ runs:
       shell: bash
       env:
         REF: ${{ github.head_ref || github.ref_name }}
+        E2ETEST: ${{ inputs.e2etest }}
       run: |
         url=https://github.com/porelli/portcullis-hub
         # The heads, listed once: a failed listing fails the step instead of
@@ -22,15 +33,29 @@ runs:
         heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
         if ! [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || [ "$REF" = main ] || [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
             || ! awk -v r="refs/heads/$REF" '$2 == r { f = 1 } END { exit !f }' <<<"$heads"; then
-          echo "Hub: the published image ($(docker compose config --format json | jq -r .services.hub.image))" | tee -a "$GITHUB_STEP_SUMMARY"
-          exit 0
+          if [ "$E2ETEST" != true ]; then
+            echo "Hub: the published image ($(docker compose config --format json | jq -r .services.hub.image))" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          REF=main
         fi
         git clone --quiet --depth=1 --branch "$REF" "$url" "$RUNNER_TEMP/portcullis-hub"
         echo "Hub: built from portcullis-hub@$REF ($(git -C "$RUNNER_TEMP/portcullis-hub" rev-parse --short HEAD))" | tee -a "$GITHUB_STEP_SUMMARY"
+        # The Hub, the worker's agent and the relay (multiple servers, contract
+        # §17), all three with the CI-only test hooks (GO_TAGS=e2etest: the
+        # Hub's HUB_DEV_CLOCK_OFFSET, the agent's AGENT_TEST_OVERSIZE_INFO;
+        # a build without the tag refuses those variables). Never published.
         # Retried: the module download from proxy.golang.org fails now and then.
-        for i in 1 2 3; do
-          docker buildx build --load --provenance=false -t portcullis-hub:ci "$RUNNER_TEMP/portcullis-hub" && break
-          [ "$i" = 3 ] && { echo "::error::the Hub image did not build"; exit 1; }
-          sleep 20
+        # The relay's tag ends in :edge under a registry-style name: the Hub
+        # accepts only a digest or :edge in HUB_RELAY_IMAGE.
+        for spec in "portcullis-hub:ci Dockerfile" "localhost/portcullis-agent:ci Dockerfile.agent" "localhost/portcullis-relay:edge Dockerfile.relay"; do
+          read -r tag file <<<"$spec"
+          for i in 1 2 3; do
+            docker buildx build --load --provenance=false --build-arg GO_TAGS=e2etest -f "$RUNNER_TEMP/portcullis-hub/$file" \
+              -t "$tag" "$RUNNER_TEMP/portcullis-hub" && break
+            [ "$i" = 3 ] && { echo "::error::$tag did not build ($file)"; exit 1; }
+            sleep 20
+          done
         done
-        { echo "HUB_IMAGE=portcullis-hub:ci"; echo "HUB_LOCAL=1"; } >> "$GITHUB_ENV"
+        { echo "HUB_IMAGE=portcullis-hub:ci"; echo "HUB_LOCAL=1"
+          echo "AGENT_IMAGE=localhost/portcullis-agent:ci"; echo "RELAY_IMAGE=localhost/portcullis-relay:edge"; } >> "$GITHUB_ENV"

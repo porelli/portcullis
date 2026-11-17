@@ -45,12 +45,30 @@ type People struct {
 	Peers     []Peer `json:"peers"`
 }
 
+// LinkPeer is one worker server of the link role (contract §17).
+type LinkPeer struct {
+	ID        string     `json:"id"`
+	IP        string     `json:"ip"`
+	Handshake *time.Time `json:"handshake"`
+	Rx        int64      `json:"rx"`
+	Tx        int64      `json:"tx"`
+}
+
+// Link is the link role's state; nil (the key absent) while the role is off.
+type Link struct {
+	Role
+	PublicKey string     `json:"public_key"`
+	Port      int        `json:"port"`
+	Peers     []LinkPeer `json:"peers"`
+}
+
 type Doc struct {
 	Version int       `json:"version"`
 	Written time.Time `json:"written"`
 	Mode    string    `json:"mode"`
 	Edge    Role      `json:"edge"`
 	People  *People   `json:"people"`
+	Link    *Link     `json:"link"`
 }
 
 // Write replaces path atomically (temp file in the same directory +
@@ -62,6 +80,9 @@ func Write(path string, d Doc, now time.Time) error {
 	d.Written = now.UTC().Truncate(time.Second)
 	if d.People != nil && d.People.Peers == nil {
 		d.People.Peers = []Peer{}
+	}
+	if d.Link != nil && d.Link.Peers == nil {
+		d.Link.Peers = []LinkPeer{}
 	}
 	b, err := json.Marshal(d)
 	if err != nil {
