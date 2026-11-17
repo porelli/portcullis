@@ -480,6 +480,11 @@ jobs:
           CGO_ENABLED=0 go build -o /dev/null .
           test -s internal/stalwart/testdata/schema-v1.1.0.json
           CGO_ENABLED=1 go test -race ./...
+      - name: mail-fake and the mail provider conformance suite (tests/e2e/mail-fake, tests/mail-conformance; plan Task 26)
+        run: |
+          (cd tests/e2e/mail-fake && go vet ./... && test -z "$(gofmt -l .)" && CGO_ENABLED=1 go test -race ./...)
+          python3 -m py_compile tests/mail-conformance/run.py tests/mail-conformance/checks_api.py tests/mail-conformance/checks_proto.py
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/mail-conformance/test_run.py
       - name: VPN client unit tests (tests/e2e/vpn-client, the e2e jobs' WireGuard client)
         working-directory: tests/e2e/vpn-client
         run: |
