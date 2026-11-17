@@ -609,6 +609,24 @@ expect_eq "the dind worker's privileged run is there (the exception the lint abo
   "$(grep -c -- '--privileged.*# reviewed exception$' "$ROOT_DIR_SOCK/.github/ci/e2e-servers-worker.sh")" 1
 expect_eq "worker join: an install under /root (the agent can't traverse it) → refused" \
   "$( (source "$HERE/../scripts/lib/common.sh"; source "$HERE/../scripts/lib/worker.sh"; PORTCULLIS_ROOT=/root/portcullis; worker_check_roots) 2>&1 | grep -c "is under /root")" 1
+ln -s /root "$WORK/to-root"
+expect_eq "worker join: an install under /root through a symlink → refused" \
+  "$( (source "$HERE/../scripts/lib/common.sh"; source "$HERE/../scripts/lib/worker.sh"; PORTCULLIS_ROOT="$WORK/to-root/portcullis"; worker_check_roots) 2>&1 | grep -c "is under /root")" 1
+# test_worker_roots_overlap (L9): a folder root containing the engine
+# socket (resolved: /var/run is usually a link), the engine's data root or
+# worker-data is refused before anything is written.
+WK="$WORK/wk-ov"; mkdir -p "$WK/run" "$WK/vlib/docker" "$WK/inst" "$WK/srv" "$WK/varrun-target"
+ln -s "$WK/run" "$WK/varrun"
+python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$WK/run/docker.sock"
+ov() { ( source "$HERE/../scripts/lib/common.sh"; source "$HERE/../scripts/lib/worker.sh"
+         _worker_engine_root() { printf '%s' "$WK/vlib/docker"; }
+         PORTCULLIS_ROOT="$WK/inst" PORTCULLIS_ENGINE_SOCKET="$WK/varrun/docker.sock" PORTCULLIS_WORKER_BIND_ROOTS="$1" worker_check_roots ) 2>&1; }
+expect_eq "a folder root holding the engine socket (given through a symlinked dir) → refused" \
+  "$(ov "$WK/run" | grep -c "the folder root $WK/run contains the engine socket")" 1
+expect_eq "a folder root holding the engine's data root → refused" "$(ov "$WK/vlib" | grep -c "contains the engine data root")" 1
+mkdir -p "$WK/inst/worker-data"
+expect_eq "a folder root that is the install's parent → refused (install inside)" "$(ov "$WK" | grep -c "is inside the folder root $WK")" 1
+expect_eq "a folder root next to them all → accepted" "$(ov "$WK/srv"; echo "rc=$?")" "rc=0"
 # test_socket_literal_count: twice in docker-compose.yml, once in the worker file.
 expect_eq "the engine-socket mount appears exactly once in docker-compose.worker.yml" \
   "$(grep -cF -- '- ${PORTCULLIS_ENGINE_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock:ro' "$ROOT_DIR_SOCK/docker-compose.worker.yml")" 1

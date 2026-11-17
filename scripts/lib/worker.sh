@@ -77,17 +77,50 @@ _worker_roots() {
 # _worker_inside <path> <dir> — path is dir or below it.
 _worker_inside() { [ "$1" = "$2" ] || [ "${1#"$2"/}" != "$1" ]; }
 
+# _worker_real <path> — path with every symlink resolved; a part that
+# can't be resolved (missing, or behind a directory this user can't
+# search, e.g. /root) is kept as written below the resolved rest.
+_worker_real() {
+  local p="$1" r
+  # GNU readlink prints nothing when it fails; BSD's prints its best (rc 1).
+  r="$(readlink -f -- "$p" 2>/dev/null)" || true
+  if [ -n "$r" ]; then printf '%s' "$r"; return 0; fi
+  [ "$p" != / ] && [ "$p" != . ] || { printf '%s' "$p"; return 0; }
+  r="$(_worker_real "$(dirname -- "$p")")"
+  printf '%s/%s' "${r%/}" "$(basename -- "$p")"
+}
+
+# _worker_engine_socket — the engine socket the proxy mounts (compose's
+# ${PORTCULLIS_ENGINE_SOCKET:-/var/run/docker.sock}), resolved
+# (/var/run is usually a link to /run).
+_worker_engine_socket() { _worker_real "${PORTCULLIS_ENGINE_SOCKET:-/var/run/docker.sock}"; }
+
 # worker_check_roots — every folder root is an existing directory (the
 # agent refuses to start otherwise; compose would make a missing one
-# root-owned), and neither this install nor its worker-data lies inside one.
+# root-owned), and none contains (all paths resolved) this install, its
+# worker-data, the engine socket or the engine's data root.
 worker_check_roots() {
-  local r
+  local r rr inst sock eroot what p
+  inst="$(_worker_real "$PORTCULLIS_ROOT")"
   # The agent (uid 10008) sees this install at the same path and must
-  # traverse it: its image's /root is 0700.
-  ! _worker_inside "$PORTCULLIS_ROOT" /root || fail "this install ($PORTCULLIS_ROOT) is under /root, which the agent (uid 10008) can't traverse: put the checkout elsewhere (e.g. /opt/portcullis)"
+  # traverse it: its image's /root is 0700 (also through a symlink).
+  ! _worker_inside "$PORTCULLIS_ROOT" /root && ! _worker_inside "$inst" /root \
+    || fail "this install ($PORTCULLIS_ROOT) is under /root, which the agent (uid 10008) can't traverse: put the checkout elsewhere (e.g. /opt/portcullis)"
+  sock="$(_worker_engine_socket)"
+  eroot="$(_worker_engine_root)" || exit 1
+  eroot="$(_worker_real "$eroot")"
   while IFS= read -r r; do
     [ -d "$r" ] && [ ! -L "$r" ] || fail "the folder root $r doesn't exist (or is a link): create it, or set PORTCULLIS_WORKER_BIND_ROOTS in .env"
-    ! _worker_inside "$PORTCULLIS_ROOT" "$r" || fail "this install ($PORTCULLIS_ROOT) is inside the folder root $r: move it out, or narrow PORTCULLIS_WORKER_BIND_ROOTS"
+    rr="$(_worker_real "$r")"
+    for what in "install:$inst" "worker-data:$inst/worker-data" "engine socket:$sock" "engine data root:$eroot"; do
+      p="${what#*:}"
+      if _worker_inside "$p" "$rr"; then
+        case "${what%%:*}" in
+          install) fail "this install ($PORTCULLIS_ROOT) is inside the folder root $r: move it out, or narrow PORTCULLIS_WORKER_BIND_ROOTS" ;;
+          *) fail "the folder root $r contains the ${what%%:*} ($p): an app could reach it; narrow PORTCULLIS_WORKER_BIND_ROOTS" ;;
+        esac
+      fi
+    done
   done < <(_worker_roots "${PORTCULLIS_WORKER_BIND_ROOTS:-}")
 }
 
