@@ -43,9 +43,9 @@ func newV1(t *testing.T) *v1env {
 	c := stalwart.New(f.URL(), stalwart.Bearer("API_k"))
 	var buf bytes.Buffer
 	lg := logx.New(&buf)
-	r := reconcile.NewRunner(c, st, time.Hour, false, lg.Printf)
+	r := reconcile.NewRunner(c, st, lg.Printf)
 	v := &V1{Store: st, C: c, Runner: r, Logf: lg.Printf}
-	v.M = machines.New(c, st, machines.Config{MainDomain: "example.com", Hostname: "mail.example.com", RotateEvery: time.Hour, Reachable: true}, lg.Printf)
+	v.M = machines.New(c, st, machines.Config{Reachable: true}, lg.Printf)
 	v.M.Visible = func(context.Context, string, string) bool { return false }
 	v.Checks = &checks.Runner{D: checks.Deps{C: c, M: v.M, Store: st, Cfg: checks.Config{Hostname: "mail.example.com", MailIP: "192.0.2.1"},
 		DNS: func(context.Context, string, string, uint16, bool) (*dns.Msg, error) {
@@ -67,7 +67,7 @@ func (e *v1env) do(method, path, body string) *httptest.ResponseRecorder {
 }
 
 func vec(t *testing.T, gen int) string {
-	b, err := os.ReadFile("../state/testdata/mailstate_v1.json")
+	b, err := os.ReadFile("../state/testdata/mailstate_v2.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestCredentialsRoutes(t *testing.T) {
 	if strings.Contains(e.log.String(), secret) {
 		t.Fatal("the secret was logged")
 	}
-	w = e.do("GET", "/v1/credentials?user=alice", "")
+	w = e.do("GET", "/v1/credentials?uuid=6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b", "")
 	if w.Code != 200 || strings.Contains(w.Body.String(), secret) || !strings.Contains(w.Body.String(), `"label":"phone"`) || !strings.Contains(w.Body.String(), `"last_used":null`) {
 		t.Fatalf("list: %d %s", w.Code, w.Body)
 	}
@@ -182,7 +182,7 @@ func TestCredentialsRoutes(t *testing.T) {
 			t.Errorf("%s: %d, want %d", body, w.Code, code)
 		}
 	}
-	if w := e.do("GET", "/v1/credentials?user=carol", ""); w.Code != 404 {
+	if w := e.do("GET", "/v1/credentials?uuid=0c0c0c0c-0c0c-4c0c-8c0c-0c0c0c0c0c0c", ""); w.Code != 404 {
 		t.Errorf("unknown user: %d", w.Code)
 	}
 	id := cr["id"].(string)
@@ -208,7 +208,7 @@ func TestCredentialsRoutes(t *testing.T) {
 		t.Fatalf("unknown id: %d", w.Code)
 	}
 	e.f.Fail("x:AppPassword", 1)
-	if w := e.do("GET", "/v1/credentials?user=alice", ""); w.Code != 503 || !strings.Contains(w.Body.String(), "mail server unreachable") {
+	if w := e.do("GET", "/v1/credentials?uuid=6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b", ""); w.Code != 503 || !strings.Contains(w.Body.String(), "mail server unreachable") {
 		t.Fatalf("stalwart down: %d %s", w.Code, w.Body)
 	}
 }
@@ -227,8 +227,8 @@ func TestDNSStatusActions(t *testing.T) {
 	if w.Code != 200 || set["domain"] != "example.com" || set["dkim"] != "auto" || len(set["records"].([]any)) < 10 {
 		t.Fatalf("dns %d %s", w.Code, w.Body)
 	}
-	if !strings.HasPrefix(set["tlsa"].(string), "withheld") {
-		t.Fatalf("tlsa without a key: %v", set["tlsa"])
+	if _, ok := set["tlsa"]; ok || len(set) != 3 {
+		t.Fatalf("the set's keys: %s", w.Body)
 	}
 	if w := e.do("GET", "/v1/dns/team-b.example.org?wildcard=false", ""); w.Code != 200 || strings.Count(w.Body.String(), `"CNAME"`) != 3 {
 		t.Fatalf("no wildcard %d %s", w.Code, w.Body)
@@ -242,12 +242,12 @@ func TestDNSStatusActions(t *testing.T) {
 	w = e.do("GET", "/v1/status", "")
 	var st map[string]any
 	json.Unmarshal(w.Body.Bytes(), &st)
-	for _, k := range []string{"bootstrap", "stalwart_version", "cert", "dkim", "mtasts", "dmarc", "queue", "client_ip", "restored_at", "timer_seen_at", "former"} {
+	for _, k := range []string{"bootstrap", "provider", "cert", "dkim", "mtasts", "dmarc", "queue", "restored_at", "former", "dns"} {
 		if _, ok := st[k]; !ok {
 			t.Fatalf("status lacks %s: %s", k, w.Body)
 		}
 	}
-	if st["client_ip"] != "preserved" || len(st["dkim"].([]any)) != 2 {
+	if len(st) != 10 || len(st["dkim"].([]any)) != 2 || st["provider"].(map[string]any)["name"] != "Stalwart" {
 		t.Fatalf("status %s", w.Body)
 	}
 	cases := []struct {
@@ -270,7 +270,7 @@ func TestDNSStatusActions(t *testing.T) {
 			t.Errorf("409 without a reason: %s", w.Body)
 		}
 	}
-	e.f.Fail("x:Certificate", 1)
+	e.f.Fail("x:QueuedMessage", 1)
 	if w := e.do("GET", "/v1/status", ""); w.Code != 503 || !strings.Contains(w.Body.String(), "mail server unreachable") {
 		t.Fatalf("status with Stalwart down: %d %s", w.Code, w.Body)
 	}

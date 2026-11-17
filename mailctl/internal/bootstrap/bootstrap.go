@@ -166,9 +166,15 @@ func checkSet(obj string, r stalwart.SetResult, err error) error {
 // update differing, destroy unnamed ones when DestroyOthers, and duplicate
 // keys always) and returns key → id.
 func Ensure(ctx context.Context, c *stalwart.Client, n Named) (map[string]string, error) {
+	ids, _, err := ensure(ctx, c, n)
+	return ids, err
+}
+
+// ensure is Ensure, also saying whether it wrote anything.
+func ensure(ctx context.Context, c *stalwart.Client, n Named) (map[string]string, bool, error) {
 	have, err := getAll(ctx, c, n.Object)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	skip := map[string]bool{n.Key: true, "@type": true}
 	for _, f := range n.Immutable {
@@ -221,23 +227,23 @@ func Ensure(ctx context.Context, c *stalwart.Client, n Named) (map[string]string
 	if len(destroy) > 0 {
 		r, err := c.Set(ctx, n.Object, nil, nil, destroy)
 		if err := checkSet(n.Object, r, err); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	if len(create) > 0 || len(update) > 0 {
 		r, err := c.Set(ctx, n.Object, create, update, nil)
 		if err := checkSet(n.Object, r, err); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		for cid, k := range keys {
 			id := r.CreatedID(cid)
 			if id == "" {
-				return nil, fmt.Errorf("x:%s/set: no id for the new %q", n.Object, k)
+				return nil, false, fmt.Errorf("x:%s/set: no id for the new %q", n.Object, k)
 			}
 			ids[k] = id
 		}
 	}
-	return ids, nil
+	return ids, len(destroy) > 0 || len(create) > 0 || len(update) > 0, nil
 }
 
 func updateSingleton(ctx context.Context, c *stalwart.Client, s Singleton) error {

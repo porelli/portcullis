@@ -8,7 +8,9 @@ import (
 	"sort"
 )
 
-// TTL of every record of the set (CAA at MAIL_HOSTNAME is mail-cert's).
+// TTL of every record of the set. Never A, AAAA, CAA or TLSA, and nothing
+// at MAIL_HOSTNAME: its CAA is mail-cert's, its TLSA, HELO SPF and address
+// records are core's (contract §19.3, §19.7).
 const TTL = 3600
 
 // Record is one wanted record.
@@ -25,17 +27,15 @@ type DKIMRecord struct{ Selector, Value string }
 // Input is one domain's state.
 type Input struct {
 	Domain     string
-	Main       bool   // the main domain: MAIL_HOSTNAME's HELO SPF and TLSA
-	Hostname   string // MAIL_HOSTNAME
-	SPFInclude string // MAIL_RELAY_SPF_INCLUDE
+	Hostname   string // MAIL_HOSTNAME (the document's mail_hostname)
+	SPFInclude string // the relay's spf_include
 	Mail       string // on | draining | off
 	DMARC      string // none | quarantine | reject
 	DKIM       []DKIMRecord
-	MTASTSID   string   // "" = no _mta-sts record
-	TLSA       []string // SPKI sha256 hex; only on the main domain, only while secure
-	// NoWildcard: an added domain whose plan has no *.<e> address record
-	// gets CNAME <h>. at mta-sts / autoconfig / autodiscover (never the
-	// main domain: its *.<d> is core's).
+	MTASTSID   string // "" = no _mta-sts record
+	// NoWildcard: the Hub asked with wildcard=false (the domain's plan has
+	// no *.<e> address record): CNAME <h>. at mta-sts / autoconfig /
+	// autodiscover.
 	NoWildcard bool
 }
 
@@ -63,9 +63,6 @@ func Wanted(in Input) []Record {
 		spf += " include:" + in.SPFInclude
 	}
 	add(in.Domain, "TXT", spf+" -all")
-	if in.Main {
-		add(in.Hostname, "TXT", "v=spf1 a -all")
-	}
 	dk := append([]DKIMRecord(nil), in.DKIM...)
 	sort.Slice(dk, func(i, j int) bool { return dk[i].Selector < dk[j].Selector })
 	for _, k := range dk {
@@ -82,14 +79,9 @@ func Wanted(in Input) []Record {
 	for _, s := range []string{"_imap._tcp.", "_pop3._tcp.", "_pop3s._tcp."} {
 		add(s+in.Domain, "SRV", "0 0 0 .")
 	}
-	if in.NoWildcard && !in.Main {
+	if in.NoWildcard {
 		for _, l := range []string{"mta-sts.", "autoconfig.", "autodiscover."} {
 			add(l+in.Domain, "CNAME", h)
-		}
-	}
-	if in.Main {
-		for _, spki := range in.TLSA {
-			add("_25._tcp."+in.Hostname, "TLSA", "3 1 1 "+spki)
 		}
 	}
 	return out

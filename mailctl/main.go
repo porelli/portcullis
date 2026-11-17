@@ -14,6 +14,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,16 +26,13 @@ import (
 	"os"
 	"os/signal"
 	"slices"
-	"strings"
 	"syscall"
 	"time"
 
-	"github.com/portcullis/mailctl/internal/admin"
 	"github.com/portcullis/mailctl/internal/api"
 	"github.com/portcullis/mailctl/internal/bootstrap"
 	"github.com/portcullis/mailctl/internal/checks"
 	"github.com/portcullis/mailctl/internal/config"
-	"github.com/portcullis/mailctl/internal/creds"
 	"github.com/portcullis/mailctl/internal/export"
 	"github.com/portcullis/mailctl/internal/logx"
 	"github.com/portcullis/mailctl/internal/machines"
@@ -45,10 +43,11 @@ import (
 	"github.com/portcullis/mailctl/internal/spamrules"
 	"github.com/portcullis/mailctl/internal/stalwart"
 	"github.com/portcullis/mailctl/internal/state"
+	"github.com/portcullis/mailctl/internal/tlsprobe"
 	"github.com/portcullis/mailctl/internal/wellknown"
 )
 
-const usage = `usage: mailctl [serve|healthcheck|bootstrap [--rotate-key|--verify-gone]|void|dns|rotate|tls-key|reload-tls|status|export|test]`
+const usage = `usage: mailctl [serve|healthcheck|bootstrap [--rotate-key|--verify-gone]|export]`
 
 // later are the subcommands later tasks fill (each talks to the running
 // serve process or to Stalwart directly, as its task says).
@@ -75,16 +74,8 @@ func run(args []string, env func(string) string, stdout, stderr io.Writer) int {
 		return healthcheck(env)
 	case cmd == "bootstrap":
 		return bootstrapCmd(args[1:], env, os.Stdin, stdout, stderr)
-	case cmd == "void":
-		return voidCmd(args[1:], env, os.Stdin, stdout, stderr)
 	case cmd == "export":
 		return exportCmd(args[1:], env, stdout, stderr)
-	case cmd == "reload-tls":
-		return reloadTLS(env, stderr)
-	case cmd == "dns" || cmd == "rotate" || cmd == "tls-key" || cmd == "status" || cmd == "dkim":
-		return adminCmd(cmd, args[1:], os.Stdin, stdout, stderr)
-	case cmd == "test":
-		return testCmd(args[1:], env, stdout, stderr)
 	case later[cmd]:
 		fmt.Fprintf(stderr, "mailctl %s: not available in this build\n", cmd)
 		return 1
@@ -167,10 +158,8 @@ func serve(env func(string) string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	runner := reconcile.NewRunner(sw, st, cfg.FormerRetain, cfg.LANOnly, logger.Printf)
+	runner := reconcile.NewRunner(sw, st, logger.Printf)
 	runner.MailctlIP = cfg.MailIP
-	rewritten := cfg.ClientIP == config.ClientIPRewritten
-	runner.Rewritten = rewritten
 	runner.DQSKeyFile = cfg.DQSKeyFile
 	mc := machines.New(sw, st, machinesConfig(cfg), logger.Printf)
 	ck := &checks.Runner{D: checks.Deps{C: sw, M: mc, Store: st, Cfg: checksConfig(cfg), DNS: resolve.Query, Logf: logger.Printf},
@@ -182,7 +171,12 @@ func serve(env func(string) string, stderr io.Writer) error {
 			m.SetChecks(vals)
 		}}
 	mc.CertOK = ck.CertState
-	v1 := &api.V1{Store: st, C: sw, Runner: runner, LANOnly: cfg.LANOnly, Rewritten: rewritten, Logf: logger.Printf, M: mc, Checks: ck}
+	serving := func(ctx context.Context) (*x509.Certificate, error) {
+		return tlsprobe.Leaf(ctx, nil, net.JoinHostPort(mailIP(cfg.StalwartURL), "10465"), mc.Hostname(), false)
+	}
+	mc.Serving = serving
+	v1 := &api.V1{Store: st, C: sw, Runner: runner, Logf: logger.Printf, M: mc, Checks: ck,
+		TLSDir: bootstrap.TLSDir, Serving: serving, Export: true, Test: testSender(cfg, sw)}
 	apiSrv := &api.Server{Subnet: cfg.APISubnet, SecretFile: cfg.HubSecretFile, Logf: logger.Printf, Handler: v1.Handler()}
 	servers := []*http.Server{
 		newServer(cfg.APIAddr, apiSrv),
@@ -190,17 +184,6 @@ func serve(env func(string) string, stderr io.Writer) error {
 		newServer(cfg.RulesAddr, spamrules.Handler()),
 		newServer(cfg.MetricsAddr, m.Handler(cfg.MetricsSecretFile, api.ReadSecret, logger.Printf)),
 	}
-	adminLn, err := admin.Listen(admin.Socket)
-	if err != nil {
-		return fmt.Errorf("the control socket %s: %w", admin.Socket, err)
-	}
-	clientIP := config.ClientIPPreserved
-	if rewritten {
-		clientIP = config.ClientIPRewritten
-	}
-	adminSrv := newServer("", admin.Handler(mc, admin.Status{Bootstrapped: v1.Bootstrapped, ClientIP: clientIP,
-		Checks: func(ctx context.Context) any { return ck.Get(ctx, false) }}))
-	adminSrv.WriteTimeout = 5 * time.Minute
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	errc := make(chan error, len(servers))
@@ -215,12 +198,6 @@ func serve(env func(string) string, stderr io.Writer) error {
 			}
 		}(s, ln)
 	}
-	go func() {
-		if err := adminSrv.Serve(adminLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errc <- fmt.Errorf("%s: %w", admin.Socket, err)
-		}
-	}()
-	servers = append(servers, adminSrv)
 	go keepLookupsOff(ctx, sw, st, logger.Printf)
 	go runner.Run(ctx)
 	go mc.Loop(ctx)
@@ -242,19 +219,13 @@ func serve(env func(string) string, stderr io.Writer) error {
 
 // machinesConfig is the state machines' part of the environment.
 func machinesConfig(cfg config.Config) machines.Config {
-	mc := machines.Config{MainDomain: cfg.MainDomain, Hostname: cfg.Hostname, Resolvers: cfg.Resolvers,
-		RotateEvery: cfg.DKIMRotate, Reachable: slices.Contains(cfg.WellKnownEntry, "websecure")}
-	if cfg.Relay != nil {
-		mc.SPFInclude = cfg.Relay.SPFInclude
-	}
-	return mc
+	return machines.Config{Resolvers: cfg.Resolvers, Reachable: slices.Contains(cfg.WellKnownEntry, "websecure")}
 }
 
 // checksConfig is the checks' part of the environment.
 func checksConfig(cfg config.Config) checks.Config {
-	return checks.Config{Hostname: cfg.Hostname, MainDomain: cfg.MainDomain, PublicIPv4: cfg.PublicIPv4, PublicIPv6: cfg.PublicIPv6,
-		Resolvers: cfg.Resolvers, LocalResolver: cfg.LocalResolver, DQSKeyFile: cfg.DQSKeyFile,
-		ClientIP: cfg.ClientIP, MailIP: mailIP(cfg.StalwartURL)}
+	return checks.Config{PublicIPv4: cfg.PublicIPv4, PublicIPv6: cfg.PublicIPv6,
+		Resolvers: cfg.Resolvers, LocalResolver: cfg.LocalResolver, DQSKeyFile: cfg.DQSKeyFile, MailIP: mailIP(cfg.StalwartURL)}
 }
 
 // mailIP is mail's address from MAILCTL_STALWART_URL (http://<ip>:8080).
@@ -269,16 +240,12 @@ func mailIP(u string) string {
 func statusMetrics(ctx context.Context, mc *machines.Machines, m *metrics.Metrics, v1 *api.V1) {
 	for {
 		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		if st, err := mc.Status(cctx, v1.Bootstrapped(cctx), ""); err == nil {
-			var na time.Time
-			if st.Cert != nil {
-				na = st.Cert.NotAfter
-			}
+		if st, err := mc.Status(cctx, v1.Bootstrapped(cctx)); err == nil {
 			stages := make([]metrics.Stage, 0, len(st.DKIM))
 			for _, k := range st.DKIM {
 				stages = append(stages, metrics.Stage{Domain: k.Domain, Stage: k.Stage})
 			}
-			m.SetStatus(na, st.Queue.Messages, st.Queue.Deferred, stages)
+			m.SetStatus(st.Queue.Messages, st.Queue.Deferred, stages)
 		}
 		cancel()
 		select {
@@ -289,110 +256,15 @@ func statusMetrics(ctx context.Context, mc *machines.Machines, m *metrics.Metric
 	}
 }
 
-// testCmd is `mailctl test --to <addr>`: the test message (contract
-// §19.10), one JSON line on stdout.
-func testCmd(args []string, env func(string) string, stdout, stderr io.Writer) int {
-	if len(args) != 2 || args[0] != "--to" || !strings.Contains(args[1], "@") || strings.ContainsAny(args[1], " <>\r\n") {
-		fmt.Fprintln(stderr, "usage: mailctl test --to <address>")
-		return 2
+// testSender is POST /v1/actions/test: a message from the first postmaster
+// account, submitted on Stalwart's 10587 with the document's SPKIs pinned.
+func testSender(cfg config.Config, sw *stalwart.Client) func(ctx context.Context, doc *state.Doc, to string) (string, error) {
+	return func(ctx context.Context, doc *state.Doc, to string) (string, error) {
+		s := &mailtest.Sender{C: sw, Doc: doc, SubmitAddr: net.JoinHostPort(mailIP(cfg.StalwartURL), "10587"), MailctlIP: cfg.MailIP,
+			TLS: func(now time.Time) *tls.Config { return export.PinnedTLS(doc.MailHostname, doc.TLS.SPKISHA256, now) }}
+		res, err := s.Send(ctx, to)
+		return res.Queued, err
 	}
-	cfg, err := config.Load(env)
-	if err != nil {
-		fmt.Fprintf(stderr, "mailctl test: %v\n", err)
-		return 1
-	}
-	key, err := api.ReadSecret(cfg.APIKeyFile, 1)
-	if err != nil {
-		fmt.Fprintf(stderr, "mailctl test: Stalwart's API key: %v\n", err)
-		return 1
-	}
-	logx.AddSecret(key)
-	st, err := state.Open(cfg.DataDir)
-	if err != nil {
-		fmt.Fprintf(stderr, "mailctl test: %v\n", err)
-		return 1
-	}
-	p := st.Get()
-	spki := state.SPKIs(p)
-	if len(spki) == 0 {
-		fmt.Fprintln(stderr, "mailctl test: the mail certificate's key isn't known to mailctl yet (run ./portcullis mail rotate)")
-		return 1
-	}
-	s := &mailtest.Sender{C: stalwart.New(cfg.StalwartURL, stalwart.Bearer(key)), Doc: p.Doc,
-		SubmitAddr: net.JoinHostPort(mailIP(cfg.StalwartURL), "10587"), MailctlIP: cfg.MailIP,
-		TLS: func(now time.Time) *tls.Config { return export.PinnedTLS(cfg.Hostname, spki, now) }}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	res, err := s.Send(ctx, args[1])
-	if err != nil {
-		fmt.Fprintf(stderr, "mailctl test: %s\n", logx.Redact(err.Error()))
-		return 1
-	}
-	json.NewEncoder(stdout).Encode(res)
-	return 0
-}
-
-// adminCmd is `mailctl dns --main --json`, `mailctl rotate --json` (stdin:
-// {"dnssec_state", "spki": {"current", "next"}}) and `mailctl status
-// --json`, `mailctl tls-key --json` (stdin: {"current"}): one call on the running serve's control socket, its JSON on
-// stdout.
-func adminCmd(cmd string, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
-	want := map[string][]string{"dns": {"--main", "--json"}, "rotate": {"--json"}, "tls-key": {"--json"}, "status": {"--json"}, "dkim": {"rotate", "<domain>", "--json"}}[cmd]
-	var domain string
-	if cmd == "dkim" && len(args) == 3 && args[0] == "rotate" && args[2] == "--json" {
-		domain, args = strings.ToLower(args[1]), []string{"rotate", "<domain>", "--json"}
-	}
-	if !slices.Equal(args, want) {
-		fmt.Fprintf(stderr, "usage: mailctl %s %s\n", cmd, strings.Join(want, " "))
-		return 2
-	}
-	var (
-		b   []byte
-		err error
-	)
-	switch cmd {
-	case "dns":
-		b, err = admin.Call(admin.Socket, http.MethodGet, "/dns/main", nil)
-	case "status":
-		b, err = admin.Call(admin.Socket, http.MethodGet, "/status", nil)
-	case "dkim":
-		body, _ := json.Marshal(map[string]string{"domain": domain})
-		b, err = admin.Call(admin.Socket, http.MethodPost, "/dkim-rotate", body)
-	case "rotate":
-		in, rerr := io.ReadAll(io.LimitReader(stdin, 64<<10))
-		if rerr != nil {
-			fmt.Fprintf(stderr, "mailctl rotate: reading stdin: %v\n", rerr)
-			return 2
-		}
-		if _, perr := admin.ParseRotate(in); perr != nil {
-			fmt.Fprintf(stderr, "mailctl rotate: %v\n", perr)
-			return 2
-		}
-		b, err = admin.Call(admin.Socket, http.MethodPost, "/rotate", in)
-	case "tls-key":
-		in, rerr := io.ReadAll(io.LimitReader(stdin, 4096))
-		if rerr != nil {
-			fmt.Fprintf(stderr, "mailctl tls-key: reading stdin: %v\n", rerr)
-			return 2
-		}
-		if _, perr := admin.ParseTLSKey(in); perr != nil {
-			fmt.Fprintf(stderr, "mailctl tls-key: %v\n", perr)
-			return 2
-		}
-		b, err = admin.Call(admin.Socket, http.MethodPost, "/tls-key", in)
-	}
-	if err != nil {
-		fmt.Fprintf(stderr, "mailctl %s: %s\n", cmd, logx.Redact(err.Error()))
-		// rotate: the main domain isn't a mail domain (yet, or any more)
-		// is exit 3, the CLI's no-op (final review L5).
-		var se *admin.StatusError
-		if cmd == "rotate" && errors.As(err, &se) && se.Code == http.StatusNotFound {
-			return 3
-		}
-		return 1
-	}
-	stdout.Write(b)
-	return 0
 }
 
 func newServer(addr string, h http.Handler) *http.Server {
@@ -503,69 +375,6 @@ func planParams(cfg config.Config, in bootstrap.Input) (bootstrap.Params, error)
 		RulesURL: "http://" + cfg.RulesAddr + spamrules.Path, ClientIP: in.ClientIP,
 		Relay: in.Relay, MetricsUser: in.MetricsUser, HTTPLookups: lookups, LocalNetworks: in.LocalNetworks, LANOnly: in.LANOnly,
 	}, nil
-}
-
-// reloadTLS is `mailctl reload-tls`: Stalwart rereads the certificate
-// files (after mail-cert renewed them).
-func reloadTLS(env func(string) string, stderr io.Writer) int {
-	cfg, err := config.Load(env)
-	if err != nil {
-		fmt.Fprintf(stderr, "mailctl reload-tls: %v\n", err)
-		return 1
-	}
-	key, err := api.ReadSecret(cfg.APIKeyFile, 1)
-	if err != nil {
-		fmt.Fprintf(stderr, "mailctl reload-tls: Stalwart's API key: %v\n", err)
-		return 1
-	}
-	logx.AddSecret(key)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	if err := stalwart.New(cfg.StalwartURL, stalwart.Bearer(key)).Action(ctx, "ReloadTlsCertificates"); err != nil {
-		fmt.Fprintf(stderr, "mailctl reload-tls: %s\n", logx.Redact(err.Error()))
-		return 1
-	}
-	return 0
-}
-
-// voidCmd is `mailctl void --reason restore` (stdin: the recovery
-// credentials; contract §19.11): every app password of every account is
-// destroyed and restored_at recorded. Prints {"voided": n}.
-func voidCmd(args []string, env func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	if len(args) != 2 || args[0] != "--reason" || args[1] != "restore" {
-		fmt.Fprintln(stderr, "usage: mailctl void --reason restore < credentials.json")
-		return 2
-	}
-	cfg, err := config.Load(env)
-	if err != nil {
-		fmt.Fprintf(stderr, "mailctl void: %v\n", err)
-		return 1
-	}
-	cr, err := bootstrap.ReadCredentials(stdin)
-	if err != nil {
-		fmt.Fprintf(stderr, "mailctl void: %v\n", err)
-		return 2
-	}
-	logx.AddSecret(cr.RecoveryPassword)
-	st, err := state.Open(cfg.DataDir)
-	if err != nil {
-		fmt.Fprintf(stderr, "mailctl void: %v\n", err)
-		return 1
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	n, err := creds.VoidAll(ctx, stalwart.New(cfg.StalwartURL, stalwart.Basic(cr.RecoveryUser, cr.RecoveryPassword)))
-	if err != nil {
-		fmt.Fprintf(stderr, "mailctl void: %s (voided %d)\n", logx.Redact(err.Error()), n)
-		return 1
-	}
-	now := time.Now().UTC()
-	if err := st.Update(func(p *state.Persistent) error { p.RestoredAt = &now; return nil }); err != nil {
-		fmt.Fprintf(stderr, "mailctl void: %v\n", err)
-		return 1
-	}
-	fmt.Fprintf(stdout, "{\"voided\":%d}\n", n)
-	return 0
 }
 
 // exportCmd is `mailctl export --former <former-id>` (M5): mbox to stdout,

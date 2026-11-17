@@ -1,5 +1,5 @@
-// Package state is MailState v1, the Hub's desired-state document
-// (contract §19.5), and mailctl's own persistent state (state.json).
+// Package state is MailState v2, the Hub's desired-state document
+// (contract §19.5), and the adapter's own persistent state (state.json).
 package state
 
 import (
@@ -12,10 +12,11 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // Version is the only document version.
-const Version = 1
+const Version = 2
 
 // ParkingDomain is never a mail domain of a document (M4).
 const ParkingDomain = "portcullis-former.internal"
@@ -27,11 +28,20 @@ const (
 	MailDraining = "draining"
 )
 
-// Doc is MailState v1. Every key is required.
+// Doc is MailState v2. Every key is required; only relay may be null.
 type Doc struct {
-	Version            int       `json:"version"`
-	Generation         int64     `json:"generation"`
-	PrimaryDomain      string    `json:"primary_domain"`
+	Version           int    `json:"version"`
+	Generation        int64  `json:"generation"`
+	PrimaryDomain     string `json:"primary_domain"`
+	MailHostname      string `json:"mail_hostname"`
+	ClientIP          string `json:"client_ip"`
+	SubmissionLANOnly bool   `json:"submission_lan_only"`
+	DKIMRotate        string `json:"dkim_rotate"`
+	FormerRetention   string `json:"former_retention"`
+	// Relay: nil = deliver directly. Its password is the slot's
+	// relay-password file, never in the document.
+	Relay              *Relay    `json:"relay" nullable:"true"`
+	TLS                TLS       `json:"tls"`
 	ConfirmMassRemoval bool      `json:"confirm_mass_removal"`
 	Domains            []Domain  `json:"domains"`
 	Accounts           []Account `json:"accounts"`
@@ -43,10 +53,30 @@ type Doc struct {
 	LocalNetworks      []string  `json:"local_networks"`
 }
 
+// Client address modes (client_ip, contract §19.8).
+const (
+	ClientIPPreserved = "preserved"
+	ClientIPRewritten = "rewritten"
+)
+
+// Relay is the optional smarthost.
+type Relay struct {
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	Username   string `json:"username"`
+	SPFInclude string `json:"spf_include"`
+}
+
+// TLS is the mail certificate's current and next key (core's, §19.3).
+type TLS struct {
+	SPKISHA256 []string `json:"spki_sha256"`
+}
+
 // Domain is one mail domain.
 type Domain struct {
 	Name       string `json:"name"`
 	DMARCStart string `json:"dmarc_start"`
+	DMARCFloor string `json:"dmarc_floor"`
 	Mail       string `json:"mail"`
 	DNSSEC     string `json:"dnssec"`
 }
@@ -104,7 +134,36 @@ var (
 	reLabel    = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 	reLocal    = regexp.MustCompile(`^[a-z0-9!#$%&'*+/=?^_{|}~-]+(\.[a-z0-9!#$%&'*+/=?^_{|}~-]+)*$`)
 	reDNSSEC   = regexp.MustCompile(`^[a-z_]{1,32}$`)
+	reSPKI     = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
+
+// Duration bounds of dkim_rotate and former_retention.
+const (
+	MinPeriod = 24 * time.Hour
+	MaxPeriod = 8760 * time.Hour
+)
+
+// Period parses dkim_rotate / former_retention (validated by Parse).
+func Period(s string) time.Duration {
+	d, _ := time.ParseDuration(s)
+	return d
+}
+
+func validPeriod(s string) bool {
+	d, err := time.ParseDuration(s)
+	return err == nil && d >= MinPeriod && d <= MaxPeriod
+}
+
+// Rewritten: client addresses are rewritten (rootless Podman, degraded mode).
+func (d *Doc) Rewritten() bool { return d != nil && d.ClientIP == ClientIPRewritten }
+
+// SPFInclude is the relay's SPF include ("" without one).
+func (d *Doc) SPFInclude() string {
+	if d == nil || d.Relay == nil {
+		return ""
+	}
+	return d.Relay.SPFInclude
+}
 
 // ValidDomain is a lowercase DNS name with at least two labels.
 func ValidDomain(d string) bool {
@@ -118,6 +177,25 @@ func ValidDomain(d string) bool {
 	}
 	return true
 }
+
+var reDNSLabel = regexp.MustCompile(`^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9])?$`)
+
+// ValidDNSName is a lowercase DNS name of at least two labels whose labels
+// may also hold underscores (an SPF include such as _spf.example.net).
+func ValidDNSName(d string) bool {
+	if len(d) > 253 || !strings.Contains(d, ".") {
+		return false
+	}
+	for _, l := range strings.Split(d, ".") {
+		if !reDNSLabel.MatchString(l) {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidUUID is a lowercase UUID (an LLDAP user uuid).
+func ValidUUID(u string) bool { return reUUID.MatchString(u) }
 
 // SplitAddress splits a lowercase address into local part and domain.
 func SplitAddress(a string) (local, domain string, ok bool) {
@@ -227,9 +305,16 @@ func requireKeys(raw []byte, t reflect.Type, where string) error {
 				return fmt.Errorf("%s: missing key %q", where, name)
 			}
 			if string(v) == "null" {
+				if f.Tag.Get("nullable") == "true" {
+					continue
+				}
 				return fmt.Errorf("%s.%s: null", where, name)
 			}
-			if err := requireKeys(v, f.Type, where+"."+name); err != nil {
+			ft := f.Type
+			if ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+			if err := requireKeys(v, ft, where+"."+name); err != nil {
 				return err
 			}
 		}
@@ -257,6 +342,40 @@ func (d *Doc) validate() error {
 	if d.Generation < 1 {
 		return errors.New("generation must be a positive integer")
 	}
+	if !ValidDomain(d.MailHostname) {
+		return fmt.Errorf("mail_hostname %q is not a host name", d.MailHostname)
+	}
+	if d.ClientIP != ClientIPPreserved && d.ClientIP != ClientIPRewritten {
+		return errors.New("client_ip must be preserved or rewritten")
+	}
+	if !validPeriod(d.DKIMRotate) {
+		return errors.New("dkim_rotate must be a duration of 24h-8760h")
+	}
+	if !validPeriod(d.FormerRetention) {
+		return errors.New("former_retention must be a duration of 24h-8760h")
+	}
+	if r := d.Relay; r != nil {
+		if !ValidDomain(r.Host) {
+			return fmt.Errorf("relay: host %q is not a host name", r.Host)
+		}
+		if r.Port < 1 || r.Port > 65535 {
+			return errors.New("relay: port must be 1-65535")
+		}
+		if strings.ContainsAny(r.Username, "\r\n\x00") || len(r.Username) > 256 {
+			return errors.New("relay: username must be one line")
+		}
+		if r.SPFInclude != "" && !ValidDNSName(r.SPFInclude) {
+			return fmt.Errorf("relay: spf_include %q is not a host name", r.SPFInclude)
+		}
+	}
+	if n := len(d.TLS.SPKISHA256); n < 1 || n > 2 {
+		return errors.New("tls.spki_sha256 must hold 1-2 keys")
+	}
+	for _, k := range d.TLS.SPKISHA256 {
+		if !reSPKI.MatchString(k) {
+			return fmt.Errorf("tls.spki_sha256: %q is not 64 lowercase hex", k)
+		}
+	}
 	doms := map[string]bool{}
 	for _, dm := range d.Domains {
 		if !ValidDomain(dm.Name) {
@@ -271,6 +390,9 @@ func (d *Doc) validate() error {
 		doms[dm.Name] = true
 		if dm.DMARCStart != "reject" && dm.DMARCStart != "none" {
 			return fmt.Errorf("domains: %s: dmarc_start must be reject or none", dm.Name)
+		}
+		if !validFloor(dm.DMARCFloor) {
+			return fmt.Errorf("domains: %s: dmarc_floor must be none, quarantine or reject", dm.Name)
 		}
 		if dm.Mail != MailOn && dm.Mail != MailOff && dm.Mail != MailDraining {
 			return fmt.Errorf("domains: %s: mail must be on, off or draining", dm.Name)
@@ -462,6 +584,8 @@ func LocalNetworkOK(p netip.Prefix) error {
 	}
 	return nil
 }
+
+func validFloor(p string) bool { return p == "none" || p == "quarantine" || p == "reject" }
 
 // Account looks up an account by username.
 func (d *Doc) Account(username string) (Account, bool) {

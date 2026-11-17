@@ -56,6 +56,13 @@ var MailctlRolePermissions = func() []string {
 		"sysMtaInboundThrottleGet", "sysMtaInboundThrottleCreate", "sysMtaInboundThrottleUpdate",
 		"sysMtaInboundThrottleDestroy", "sysMtaInboundThrottleQuery",
 		"sysMtaStageAuthGet", "sysMtaStageAuthUpdate",
+		// MailState v2's part of the base plan (bootstrap.ApplyDoc): the
+		// host name, the relay route and its TLS strategy, the outbound
+		// strategy and degraded mode's sender authentication / security.
+		"sysSystemSettingsGet", "sysSystemSettingsUpdate",
+		"sysMtaRouteGet", "sysMtaRouteQuery", "sysMtaRouteCreate", "sysMtaRouteUpdate", "sysMtaRouteDestroy",
+		"sysMtaTlsStrategyCreate", "sysMtaOutboundStrategyGet", "sysMtaOutboundStrategyUpdate",
+		"sysSecurityGet", "sysSecurityUpdate",
 	}
 	seen := map[string]bool{}
 	var out []string

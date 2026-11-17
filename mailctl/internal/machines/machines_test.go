@@ -2,8 +2,16 @@ package machines
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"strings"
 	"testing"
@@ -36,7 +44,7 @@ func newEnv(t *testing.T, mutate func(*state.Doc)) *env {
 	t.Cleanup(f.Close)
 	f.Put("Domain", "", map[string]any{"name": "example.com"})
 	f.Put("Domain", "", map[string]any{"name": "team-b.example.org"})
-	b, err := os.ReadFile("../state/testdata/mailstate_v1.json")
+	b, err := os.ReadFile("../state/testdata/mailstate_v2.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +59,7 @@ func newEnv(t *testing.T, mutate func(*state.Doc)) *env {
 	st.Update(func(p *state.Persistent) error { p.Doc, p.Generation = doc, doc.Generation; return nil })
 	e := &env{f: f, st: st, now: t0, vis: map[string]bool{}}
 	c := stalwart.New(f.URL(), stalwart.Bearer("API_k"))
-	e.m = New(c, st, Config{MainDomain: "example.com", Hostname: "mail.example.com", RotateEvery: 180 * 24 * time.Hour, Reachable: true}, t.Logf)
+	e.m = New(c, st, Config{Reachable: true}, t.Logf)
 	e.m.Now = func() time.Time { return e.now }
 	e.m.Visible = func(_ context.Context, name, value string) bool { return e.vis[name+"|"+value] }
 	e.m.Verify = func(_ context.Context, r Report) (string, bool) {
@@ -174,57 +182,9 @@ func TestDKIMCreateRetried(t *testing.T) {
 	}
 }
 
-// TLSA only while the main zone is secure (mailctl rotate's state wins over
-// the document's), with the rollover's switch_key answer.
-func TestRotateTLSA(t *testing.T) {
-	e := newEnv(t, nil)
-	in := RotateIn{DNSSECState: "insecure"}
-	in.SPKI.Current = "AA"
-	out, err := e.m.Rotate(context.Background(), in)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out.TLSA != "withheld: dnssec insecure" || out.SwitchKey || out.NextKey {
-		t.Fatalf("%+v", out)
-	}
-	for _, r := range out.Records {
-		if r.Type == "TLSA" {
-			t.Fatal("TLSA while insecure")
-		}
-	}
-	if e.st.Get().TimerSeenAt == nil {
-		t.Fatal("timer_seen_at not recorded")
-	}
-	in.DNSSECState = "secure"
-	in.SPKI.Next = "BB"
-	out, _ = e.m.Rotate(context.Background(), in)
-	rec := map[string][]string{}
-	for _, r := range out.Records {
-		rec[r.Type+" "+r.Name] = append(rec[r.Type+" "+r.Name], r.Value)
-	}
-	if strings.Join(rec["TLSA _25._tcp.mail.example.com"], ",") != "3 1 1 aa,3 1 1 bb" || out.TLSA != "published" {
-		t.Fatalf("%v %s", rec, out.TLSA)
-	}
-	e.now = t0.Add(2*time.Hour + 24*time.Hour)
-	out, _ = e.m.Rotate(context.Background(), in)
-	if !out.SwitchKey {
-		t.Fatal("no switch_key after 2×TTL + 1 day")
-	}
-	// An added domain never gets TLSA.
-	if s, _ := e.m.Set("team-b.example.org"); !strings.HasPrefix(s.TLSA, "withheld") {
-		t.Fatalf("added domain %s", s.TLSA)
-	}
-	// Without a fresh rotate state the document's dnssec counts.
-	e.now = t0.Add(80 * time.Hour)
-	e.st.Update(func(p *state.Persistent) error { p.Doc.Domains[0].DNSSEC = "bogus"; return nil })
-	if s, _ := e.m.Set("example.com"); s.TLSA != "withheld: dnssec bogus" {
-		t.Fatalf("stale rotate state: %s", s.TLSA)
-	}
-}
-
 func modeOf(t *testing.T, e *env, domain string) string {
 	t.Helper()
-	st, err := e.m.Status(context.Background(), true, "preserved")
+	st, err := e.m.Status(context.Background(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +449,7 @@ func TestDKIMStageFailureRollsBack(t *testing.T) {
 func TestDMARCProposal(t *testing.T) {
 	e := newEnv(t, nil)
 	e.step(t)
-	st, _ := e.m.Status(context.Background(), true, "preserved")
+	st, _ := e.m.Status(context.Background(), true)
 	if st.DMARC[1].Policy != "none" || st.DMARC[1].Proposed != nil {
 		t.Fatalf("%+v", st.DMARC[1])
 	}
@@ -498,7 +458,7 @@ func TestDMARCProposal(t *testing.T) {
 		"records": map[string]any{"0": map[string]any{"evaluatedDkim": "pass", "evaluatedSpf": "fail"}}}})
 	e.now = t0.Add(15 * 24 * time.Hour)
 	e.step(t)
-	st, _ = e.m.Status(context.Background(), true, "preserved")
+	st, _ = e.m.Status(context.Background(), true)
 	if st.DMARC[1].Proposed == nil || *st.DMARC[1].Proposed != "quarantine" {
 		t.Fatalf("%+v", st.DMARC[1])
 	}
@@ -512,29 +472,41 @@ func TestDMARCProposal(t *testing.T) {
 
 func TestStatusCertQueueFormer(t *testing.T) {
 	e := newEnv(t, nil)
-	e.f.Put("Certificate", "", map[string]any{"notValidAfter": "2027-02-01T00:00:00Z", "subjectAlternativeNames": map[string]any{"mail.example.com": true}})
-	e.f.Put("Certificate", "", map[string]any{"notValidAfter": "2028-02-01T00:00:00Z", "subjectAlternativeNames": map[string]any{"other.example.com": true}})
+	leaf := selfSigned(t, "mail.example.com", time.Date(2027, 2, 1, 0, 0, 0, 0, time.UTC))
+	probes := 0
+	e.m.Serving = func(context.Context) (*x509.Certificate, error) { probes++; return leaf, nil }
 	e.f.Put("QueuedMessage", "", map[string]any{"recipients": map[string]any{"a@x.org": map[string]any{"retryCount": 0}}})
 	e.f.Put("QueuedMessage", "", map[string]any{"recipients": map[string]any{"a@x.org": map[string]any{"retryCount": 2}}})
 	e.st.Update(func(p *state.Persistent) error {
 		p.Former["6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b"] = state.Former{Username: "alice", Since: t0}
 		return nil
 	})
-	st, err := e.m.Status(context.Background(), true, "rewritten")
+	st, err := e.m.Status(context.Background(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Cert == nil || st.Cert.NotAfter.Year() != 2027 || st.Cert.SANs[0] != "mail.example.com" {
+	sum := sha256.Sum256(leaf.RawSubjectPublicKeyInfo)
+	if st.Cert == nil || st.Cert.NotAfter.Year() != 2027 || st.Cert.SANs[0] != "mail.example.com" || st.Cert.SPKISHA256 != hex.EncodeToString(sum[:]) {
 		t.Fatalf("cert %+v", st.Cert)
 	}
-	if st.Queue.Messages != 2 || st.Queue.Deferred != 1 || st.ClientIP != "rewritten" || st.StalwartVersion != "1.1.0" {
+	if st.Queue.Messages != 2 || st.Queue.Deferred != 1 || st.Provider != (ProviderInfo{Name: "Stalwart", Version: "1.1.0"}) {
 		t.Fatalf("%+v", st)
+	}
+	// The probe is cached a minute; a failed probe is cert null.
+	e.m.Status(context.Background(), true)
+	if probes != 1 {
+		t.Fatalf("%d probes", probes)
+	}
+	e.m.ForgetCert()
+	e.m.Serving = func(context.Context) (*x509.Certificate, error) { return nil, errors.New("refused") }
+	if st, _ := e.m.Status(context.Background(), true); st.Cert != nil {
+		t.Fatalf("cert after a failed probe %+v", st.Cert)
 	}
 	if len(st.Former) != 1 || st.Former[0].ID != "former-6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b" {
 		t.Fatalf("%+v", st.Former)
 	}
 	e.f.Fail("x:QueuedMessage", 1)
-	if _, err := e.m.Status(context.Background(), true, "preserved"); err == nil {
+	if _, err := e.m.Status(context.Background(), true); err == nil {
 		t.Fatal("a Stalwart failure isn't an error")
 	}
 }
@@ -591,7 +563,7 @@ func TestDNSHashesFollowTheSet(t *testing.T) {
 	if h3 := e.m.DNSHashes(); h3["team-b.example.org"] == h2["team-b.example.org"] || h3["example.com"] != h2["example.com"] {
 		t.Fatalf("a removed key: team-b %v → %v, example.com %v → %v", h2["team-b.example.org"], h3["team-b.example.org"], h2["example.com"], h3["example.com"])
 	}
-	st, err := e.m.Status(context.Background(), true, "preserved")
+	st, err := e.m.Status(context.Background(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -702,4 +674,23 @@ func TestStatusReportsCachedQueueCapped(t *testing.T) {
 	if n := e.f.Count("x:QueuedMessage/query"); n != 1 {
 		t.Fatalf("%d queue queries", n)
 	}
+}
+
+func selfSigned(t *testing.T, host string, notAfter time.Time) *x509.Certificate {
+	t.Helper()
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: host}, DNSNames: []string{host},
+		NotBefore: notAfter.Add(-90 * 24 * time.Hour), NotAfter: notAfter}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &k.PublicKey, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
 }

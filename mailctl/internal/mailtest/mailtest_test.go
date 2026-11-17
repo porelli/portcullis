@@ -76,7 +76,7 @@ func TestSendSignedTestAndDestroyPassword(t *testing.T) {
 	t.Cleanup(f.Close)
 	dom := f.Put("Domain", "", map[string]any{"name": "example.com"})
 	acct := f.Put("Account", "", map[string]any{"@type": "User", "name": "root", "domainId": dom, "description": "portcullis:3e5a7c9b-1d2f-4a6b-8c0e-2f4a6b8c0d1e"})
-	b, _ := os.ReadFile("../state/testdata/mailstate_v1.json")
+	b, _ := os.ReadFile("../state/testdata/mailstate_v2.json")
 	doc, err := state.Parse(b)
 	if err != nil {
 		t.Fatal(err)

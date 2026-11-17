@@ -16,7 +16,7 @@ import (
 )
 
 // Former is a parked account: removed or replaced (uuid change), kept for
-// MAIL_FORMER_RETENTION, then destroyed (M4).
+// the document's former_retention, then destroyed (M4).
 type Former struct {
 	Username string    `json:"username"`
 	Since    time.Time `json:"since"`
@@ -36,9 +36,8 @@ type Persistent struct {
 	// MassRemoval: the removal set a confirm_mass_removal PUT confirmed
 	// (from the live read at that PUT); the guard is lifted only for it.
 	MassRemoval *MassRemoval `json:"mass_removal"`
-	TimerSeenAt *time.Time   `json:"timer_seen_at"`
-	// Ext holds the state machines' records (DKIM, MTA-STS, TLSA, DMARC,
-	// checks: Tasks 8 and 9), kept verbatim by this package.
+	// Ext holds the state machines' records (DKIM, MTA-STS, DMARC,
+	// checks), kept verbatim by this package.
 	Ext map[string]json.RawMessage `json:"ext"`
 }
 
@@ -191,33 +190,11 @@ func (s *Store) GetRev() (Persistent, uint64) {
 	return s.copyLocked(), s.rev
 }
 
-// TLSAState is the mail certificate's key pins (Ext["tlsa"]), as mail-cert
-// reported them through `mailctl rotate`: the current key, the next one
-// during a rollover, and an old one until its record is dropped.
-type TLSAState struct {
-	Current    string     `json:"current"`
-	Next       string     `json:"next"`
-	NextSince  *time.Time `json:"next_since"`
-	Old        string     `json:"old"`
-	OldUntil   *time.Time `json:"old_until"`
-	SwitchedAt *time.Time `json:"switched_at"`
-}
-
-// TLSA reads Ext["tlsa"].
-func TLSA(p Persistent) TLSAState {
-	var t TLSAState
-	_ = json.Unmarshal(p.Ext["tlsa"], &t)
-	return t
-}
-
-// SPKIs are the keys the mail certificate may present right now.
+// SPKIs are the keys the mail certificate may present right now: the
+// accepted document's tls.spki_sha256 (core's current and next key).
 func SPKIs(p Persistent) []string {
-	t := TLSA(p)
-	var out []string
-	for _, s := range []string{t.Current, t.Next, t.Old} {
-		if s != "" {
-			out = append(out, s)
-		}
+	if p.Doc == nil {
+		return nil
 	}
-	return out
+	return append([]string(nil), p.Doc.TLS.SPKISHA256...)
 }

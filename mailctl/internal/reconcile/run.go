@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/portcullis/mailctl/internal/bootstrap"
 	"github.com/portcullis/mailctl/internal/creds"
 	"github.com/portcullis/mailctl/internal/logx"
 	"github.com/portcullis/mailctl/internal/stalwart"
@@ -22,15 +23,14 @@ const SMTPPort = 10025
 // Runner applies the accepted document: at once on every new one, every
 // 5 s while something failed (a removal is retried until it is done), and
 // every minute otherwise (drift).
+//
+// LAN-only (submission_lan_only), the client address mode (client_ip:
+// rewritten = the Local networks can't be told apart, so LAN-only admits
+// loopback only, fail closed) and former_retention are the accepted
+// document's (MailState v2), never the environment's.
 type Runner struct {
-	C         *stalwart.Client
-	Store     *state.Store
-	Retention time.Duration
-	LANOnly   bool
-	// Rewritten: client addresses are rewritten (rootless Podman), so the
-	// Local networks can't be told apart; LAN-only then admits loopback
-	// only (fail closed). The CLI refuses LAN-only there.
-	Rewritten bool
+	C     *stalwart.Client
+	Store *state.Store
 	// MailctlIP: mailctl's portcullis-mail address (an export password is
 	// pinned to it).
 	MailctlIP netip.Addr
@@ -50,8 +50,8 @@ func (r *Runner) LockPass()   { r.pass.Lock() }
 func (r *Runner) UnlockPass() { r.pass.Unlock() }
 
 // NewRunner returns a runner.
-func NewRunner(c *stalwart.Client, st *state.Store, retention time.Duration, lanOnly bool, logf func(string, ...any)) *Runner {
-	return &Runner{C: c, Store: st, Retention: retention, LANOnly: lanOnly, Now: time.Now, Logf: logf, wake: make(chan struct{}, 1)}
+func NewRunner(c *stalwart.Client, st *state.Store, logf func(string, ...any)) *Runner {
+	return &Runner{C: c, Store: st, Now: time.Now, Logf: logf, wake: make(chan struct{}, 1)}
 }
 
 // Trigger asks for a pass now.
@@ -132,16 +132,19 @@ func (r *Runner) once(ctx context.Context, p state.Persistent) error {
 	lanErr := r.lanOnly(ctx, l, doc, p)
 	// Spam scores, DNSBLs, allow / block, outbound limits: on their own
 	// path too.
-	setErr := Settings(ctx, r.C, doc, SettingsOpts{Rewritten: r.Rewritten, DQSKeyFile: r.DQSKeyFile})
+	setErr := Settings(ctx, r.C, doc, SettingsOpts{Rewritten: doc.Rewritten(), DQSKeyFile: r.DQSKeyFile})
+	// The host name, the relay and degraded mode (MailState v2's part of
+	// the base plan): their own path too.
+	_, baseErr := bootstrap.ApplyDoc(ctx, r.C, doc)
 	if readErr != nil {
-		return errors.Join(readErr, lanErr, setErr)
+		return errors.Join(readErr, lanErr, setErr, baseErr)
 	}
-	return errors.Join(r.apply(ctx, l, doc, p), lanErr, setErr)
+	return errors.Join(r.apply(ctx, l, doc, p), lanErr, setErr, baseErr)
 }
 
 func (r *Runner) apply(ctx context.Context, l *Live, doc *state.Doc, p state.Persistent) error {
 	exporting, sweepErr := SweepParked(ctx, r.C, l, r.Now(), r.Store.Dir(), r.MailctlIP)
-	ops, err := Plan(l, doc, p.Former, r.Now(), r.Retention, p.MassRemoval)
+	ops, err := Plan(l, doc, p.Former, r.Now(), state.Period(doc.FormerRetention), p.MassRemoval)
 	// An export under way (its password not expired yet) keeps its lift
 	// until it ends (final review L8); the export's own defer re-locks,
 	// and so does this pass once the password expired.
@@ -322,11 +325,12 @@ func LocalNets(doc *state.Doc, rewritten bool) []string {
 }
 
 // lanOnly keeps the SASL rule and every mail password's allowedIps on the
-// Local networks while MAIL_SUBMISSION_LAN_ONLY is on.
+// Local networks while the document's submission_lan_only is on.
 func (r *Runner) lanOnly(ctx context.Context, l *Live, doc *state.Doc, p state.Persistent) error {
 	// The live rule, every pass (a bootstrap run, a hand edit): never a
 	// cached copy of what was written.
-	expr := SASLExpression(r.LANOnly, LocalNets(doc, r.Rewritten))
+	lan := doc.SubmissionLANOnly
+	expr := SASLExpression(lan, LocalNets(doc, doc.Rewritten()))
 	var live []struct {
 		SASL json.RawMessage `json:"saslMechanisms"`
 	}
@@ -342,16 +346,16 @@ func (r *Runner) lanOnly(ctx context.Context, l *Live, doc *state.Doc, p state.P
 			return fmt.Errorf("ReloadSettings: %w", err)
 		}
 		if r.Logf != nil {
-			r.Logf("reconcile: the SASL rule differed from the wanted one (LAN-only %v): rewritten", r.LANOnly)
+			r.Logf("reconcile: the SASL rule differed from the wanted one (LAN-only %v): rewritten", lan)
 		}
 	}
-	if !r.LANOnly {
+	if !lan {
 		return nil
 	}
 	if l == nil {
 		return errors.New("LAN-only: can't read the accounts to restrict their mail passwords")
 	}
-	allowed := creds.AllowedIPs(true, LocalNets(doc, r.Rewritten))
+	allowed := creds.AllowedIPs(true, LocalNets(doc, doc.Rewritten()))
 	var errs []error
 	for _, a := range doc.Accounts {
 		if id := FindAccount(l, doc, a.Username); id != "" {

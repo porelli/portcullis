@@ -47,14 +47,14 @@ func newEnv(t *testing.T) *env {
 	}
 	c := stalwart.New(f.URL(), stalwart.Bearer("API_test"))
 	e := &env{t: t, f: f, c: c, st: st, now: time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)}
-	e.r = NewRunner(c, st, 720*time.Hour, false, nil)
+	e.r = NewRunner(c, st, nil)
 	e.r.Now = func() time.Time { return e.now }
 	return e
 }
 
 func baseDoc(t *testing.T) *state.Doc {
 	t.Helper()
-	b, err := os.ReadFile("../state/testdata/mailstate_v1.json")
+	b, err := os.ReadFile("../state/testdata/mailstate_v2.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -410,8 +410,9 @@ func TestFormerDestroyedAfterRetention(t *testing.T) {
 
 func TestLANOnlySASLAndRestrict(t *testing.T) {
 	e := newEnv(t)
-	e.r.LANOnly = true
-	e.mustApply(baseDoc(t))
+	lan := baseDoc(t)
+	lan.SubmissionLANOnly = true
+	e.mustApply(lan)
 	auth := e.f.Get("MtaStageAuth", "", "singleton")
 	cond := auth["saslMechanisms"].(map[string]any)["match"].(map[string]any)["0"].(map[string]any)["if"].(string)
 	if !strings.Contains(cond, "is_ip_in_cidr(remote_ip, '10.0.0.0/8')") || !strings.Contains(cond, "local_port != 10025 && is_tls") {
@@ -419,7 +420,7 @@ func TestLANOnlySASLAndRestrict(t *testing.T) {
 	}
 	alice := e.account("alice")["id"].(string)
 	e.f.Put("AppPassword", alice, map[string]any{"description": "old phone"})
-	e.mustApply(baseDoc(t))
+	e.mustApply(lan)
 	for _, p := range e.f.Objects("AppPassword", alice) {
 		ips := p["allowedIps"].(map[string]any)
 		if len(ips) != 1 || ips["10.0.0.0/8"] != true {
@@ -427,7 +428,7 @@ func TestLANOnlySASLAndRestrict(t *testing.T) {
 		}
 	}
 	e.f.ResetCalls()
-	e.mustApply(baseDoc(t))
+	e.mustApply(lan)
 	if e.f.Count("x:MtaStageAuth/set") != 0 {
 		t.Fatal("the SASL rule is rewritten on every pass")
 	}
@@ -438,7 +439,7 @@ func TestLANOnlySASLAndRestrict(t *testing.T) {
 		"saslMechanisms": SASLExpression(false, nil)}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	e.mustApply(baseDoc(t))
+	e.mustApply(lan)
 	cond = e.f.Get("MtaStageAuth", "", "singleton")["saslMechanisms"].(map[string]any)["match"].(map[string]any)["0"].(map[string]any)["if"].(string)
 	if !strings.Contains(cond, "is_ip_in_cidr(remote_ip, '10.0.0.0/8')") {
 		t.Fatalf("the LAN-only rule wasn't restored after the overwrite: %q", cond)
@@ -478,8 +479,8 @@ func TestLANOnlyEvenWhenApplyFails(t *testing.T) {
 	e.mustApply(baseDoc(t))
 	alice := e.account("alice")["id"].(string)
 	e.f.Put("AppPassword", alice, map[string]any{"description": "phone"})
-	e.r.LANOnly = true
 	d := baseDoc(t)
+	d.SubmissionLANOnly = true
 	d.Generation = 13
 	d.Accounts[1].QuotaBytes = 1 // forces an account update, which fails
 	e.f.Fail("x:Account/set", 5)
@@ -498,8 +499,9 @@ func TestLANOnlyEvenWhenApplyFails(t *testing.T) {
 // Rewritten client addresses: LAN-only admits loopback only.
 func TestLANOnlyRewrittenLoopbackOnly(t *testing.T) {
 	e := newEnv(t)
-	e.r.LANOnly, e.r.Rewritten = true, true
-	e.mustApply(baseDoc(t))
+	rw := baseDoc(t)
+	rw.SubmissionLANOnly, rw.ClientIP = true, state.ClientIPRewritten
+	e.mustApply(rw)
 	cond := e.f.Get("MtaStageAuth", "", "singleton")["saslMechanisms"].(map[string]any)["match"].(map[string]any)["0"].(map[string]any)["if"].(string)
 	if strings.Contains(cond, "10.0.0.0/8") || !strings.Contains(cond, "127.0.0.1/32") {
 		t.Fatalf("rewritten LAN-only rule %q", cond)

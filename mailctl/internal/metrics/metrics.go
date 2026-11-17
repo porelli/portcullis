@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"net/http"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -19,7 +18,6 @@ type Metrics struct {
 	Registry      *prometheus.Registry
 	Check         *prometheus.GaugeVec // portcullis_mail_check{check} 0/1
 	DKIMStage     *prometheus.GaugeVec // portcullis_mail_dkim_stage{domain,stage}
-	CertExpiry    prometheus.Gauge     // portcullis_mail_cert_expiry_seconds
 	QueueMessages prometheus.Gauge     // portcullis_mail_queue_messages
 	QueueDeferred prometheus.Gauge     // portcullis_mail_queue_deferred_ratio
 }
@@ -34,9 +32,6 @@ func New() *Metrics {
 		DKIMStage: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "portcullis_mail_dkim_stage", Help: "1 for each DKIM key's current stage per domain.",
 		}, []string{"domain", "stage"}),
-		CertExpiry: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "portcullis_mail_cert_expiry_seconds", Help: "Unix time the mail certificate expires.",
-		}),
 		QueueMessages: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "portcullis_mail_queue_messages", Help: "Messages in Stalwart's outbound queue.",
 		}),
@@ -44,7 +39,7 @@ func New() *Metrics {
 			Name: "portcullis_mail_queue_deferred_ratio", Help: "Share of queued messages whose last attempt was deferred.",
 		}),
 	}
-	m.Registry.MustRegister(m.Check, m.DKIMStage, m.CertExpiry, m.QueueMessages, m.QueueDeferred)
+	m.Registry.MustRegister(m.Check, m.DKIMStage, m.QueueMessages, m.QueueDeferred)
 	return m
 }
 
@@ -95,15 +90,9 @@ func (m *Metrics) SetChecks(vals map[string]float64) {
 // Stage is one DKIM key's (domain, stage).
 type Stage struct{ Domain, Stage string }
 
-// SetStatus sets the status gauges: the certificate's expiry (zero = no
-// certificate: the gauge is 0, which MailCertExpiring catches), the queue
-// and every DKIM key's stage.
-func (m *Metrics) SetStatus(certNotAfter time.Time, messages, deferred int, stages []Stage) {
-	if certNotAfter.IsZero() {
-		m.CertExpiry.Set(0)
-	} else {
-		m.CertExpiry.Set(float64(certNotAfter.Unix()))
-	}
+// SetStatus sets the status gauges: the queue and every DKIM key's stage.
+// The certificate's expiry is core's own metric (contract §19.8).
+func (m *Metrics) SetStatus(messages, deferred int, stages []Stage) {
 	m.QueueMessages.Set(float64(messages))
 	ratio := 0.0
 	if messages > 0 {

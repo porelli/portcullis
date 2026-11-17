@@ -15,12 +15,11 @@ func lines(rs []Record) string {
 }
 
 func TestWantedMatchesSpecTable(t *testing.T) {
-	main := Input{Domain: "example.com", Main: true, Hostname: "mail.example.com", Mail: "on", DMARC: "reject",
+	main := Input{Domain: "example.com", Hostname: "mail.example.com", Mail: "on", DMARC: "reject",
 		DKIM:     []DKIMRecord{{"v1-rsa-20261115", "v=DKIM1; k=rsa; p=R"}, {"v1-ed25519-20261115", "v=DKIM1; k=ed25519; p=E"}},
-		MTASTSID: "0123456789abcdef0123T1794700000", TLSA: []string{"aa", "bb"}}
+		MTASTSID: "0123456789abcdef0123T1794700000"}
 	want := `example.com MX 10 mail.example.com.
 example.com TXT v=spf1 mx -all
-mail.example.com TXT v=spf1 a -all
 v1-ed25519-20261115._domainkey.example.com TXT v=DKIM1; k=ed25519; p=E
 v1-rsa-20261115._domainkey.example.com TXT v=DKIM1; k=rsa; p=R
 _dmarc.example.com TXT v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com
@@ -32,14 +31,12 @@ _submission._tcp.example.com SRV 0 1 587 mail.example.com.
 _imap._tcp.example.com SRV 0 0 0 .
 _pop3._tcp.example.com SRV 0 0 0 .
 _pop3s._tcp.example.com SRV 0 0 0 .
-_25._tcp.mail.example.com TLSA 3 1 1 aa
-_25._tcp.mail.example.com TLSA 3 1 1 bb
 `
 	if got := lines(Wanted(main)); got != want {
 		t.Fatalf("main:\n%s\nwant:\n%s", got, want)
 	}
 	added := main
-	added.Domain, added.Main, added.DMARC, added.SPFInclude, added.MTASTSID = "team-b.example.org", false, "none", "spf.relay.example", ""
+	added.Domain, added.DMARC, added.SPFInclude, added.MTASTSID = "team-b.example.org", "none", "spf.relay.example", ""
 	got := lines(Wanted(added))
 	for _, w := range []string{"team-b.example.org TXT v=spf1 mx include:spf.relay.example -all", "p=none", "team-b.example.org MX 10 mail.example.com."} {
 		if !strings.Contains(got, w) {
@@ -73,8 +70,8 @@ func TestDrainingAndOff(t *testing.T) {
 	}
 }
 
-// An added domain without a wildcard address record: the three CNAMEs;
-// the main domain never.
+// A domain without a wildcard address record (the Hub asked with
+// wildcard=false): the three CNAMEs; never while draining.
 func TestCNAMEsWithoutWildcard(t *testing.T) {
 	in := Input{Domain: "team-b.example.org", Hostname: "mail.example.com", Mail: "on", DMARC: "none", NoWildcard: true}
 	n := 0
@@ -89,16 +86,31 @@ func TestCNAMEsWithoutWildcard(t *testing.T) {
 	if n != 3 {
 		t.Fatalf("%d CNAMEs", n)
 	}
-	in.Main, in.Domain = true, "example.com"
-	for _, r := range Wanted(in) {
-		if r.Type == "CNAME" {
-			t.Fatal("CNAME on the main domain")
-		}
-	}
-	in.Main, in.Mail = false, "draining"
+	in.Mail = "draining"
 	for _, r := range Wanted(in) {
 		if r.Type == "CNAME" {
 			t.Fatal("CNAME while draining")
+		}
+	}
+}
+
+// The provider's set never carries a record the contract keeps for core
+// or mail-cert (§19.3, §19.7): no TLSA, no A / AAAA / CAA, and nothing at
+// MAIL_HOSTNAME (its HELO SPF and address records are core's), on any
+// domain, in any state, with or without a relay or the CNAMEs.
+func TestDNSSetHasNoTLSAOrHELO(t *testing.T) {
+	for _, mail := range []string{"on", "draining", "off"} {
+		for _, wild := range []bool{false, true} {
+			in := Input{Domain: "example.com", Hostname: "mail.example.com", Mail: mail, DMARC: "reject", SPFInclude: "_spf.relay.example",
+				MTASTSID: "x", NoWildcard: wild, DKIM: []DKIMRecord{{"v1-ed25519-20261115", "v=DKIM1; k=ed25519; p=E"}}}
+			for _, r := range Wanted(in) {
+				switch {
+				case r.Type == "TLSA" || r.Type == "A" || r.Type == "AAAA" || r.Type == "CAA":
+					t.Errorf("%s %v: %+v", mail, wild, r)
+				case r.Name == "mail.example.com" || strings.HasSuffix(r.Name, ".mail.example.com"):
+					t.Errorf("%s %v: a record at MAIL_HOSTNAME %+v", mail, wild, r)
+				}
+			}
 		}
 	}
 }

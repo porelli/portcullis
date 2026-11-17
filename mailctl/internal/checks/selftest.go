@@ -43,7 +43,7 @@ func dkimChecks(ctx context.Context, d Deps, doc *state.Doc) []Check {
 			}
 			st.Severity = Warning
 			st.Detail = fmt.Sprintf("DKIM key %s has waited more than 24 h for its TXT record at both public resolvers", strings.Join(sels, ", "))
-			st.Steps = []string{fmt.Sprintf("Check the domain's DNS records (Settings → Domains, or ./portcullis dns plan for %s): the TXT at <selector>._domainkey.%s must be exactly mailctl's.", d.Cfg.MainDomain, dom.Name)}
+			st.Steps = []string{fmt.Sprintf("Check the domain's DNS records (Settings → Domains, or ./portcullis dns plan for the main domain): the TXT at <selector>._domainkey.%s must be exactly the mail server's.", dom.Name)}
 		}
 		out = append(out, st)
 		out = append(out, selftest(ctx, d, keys, dom.Name))
@@ -115,7 +115,7 @@ func selftest(ctx context.Context, d Deps, keys dkim.State, domain string) Check
 	}
 	c.Severity = Problem
 	c.Detail = "the DKIM key in DNS isn't the one Stalwart signs with: " + joinMax(bad, 4)
-	c.Steps = []string{fmt.Sprintf("Republish the mail records (Settings → Domains for an added domain; ./portcullis dns setup --only mail for %s).", d.Cfg.MainDomain)}
+	c.Steps = []string{"Republish the mail records (Settings → Domains for an added domain; ./portcullis dns setup --only mail for the main domain)."}
 	return c
 }
 
