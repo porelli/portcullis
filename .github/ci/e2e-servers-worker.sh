@@ -5,7 +5,7 @@
 #
 #   e2e-servers-worker.sh dind <name>     a docker:dind container with its own
 #                                         daemon and a copy of this checkout
-#   e2e-servers-worker.sh podman <name>   rootless Podman as the runner user
+#   e2e-servers-worker.sh podman <name>   rootless Podman as the runner user pcci-worker
 #                                         `worker` (its own user socket)
 #   e2e-servers-worker.sh exec <name> <cmd…>   a command in that worker's
 #                                         checkout (as its operator)
@@ -20,7 +20,10 @@ set -euo pipefail
 DIND_IMG="docker.io/library/docker:29.9.3-dind@sha256:7bf70dcb85c822e3fa6f2d332143e474b99147b9d7b39102b0cfe8b04a7dd61b"
 kind="${1:?dind|podman|exec}" name="${2:?worker name}"
 [[ "$name" =~ ^[a-z][a-z0-9-]{0,20}$ ]] || { echo "bad worker name"; exit 2; }
-WUSER=worker
+# Its own user (the runner image may already have a `worker`): set up once,
+# marked by a stamp file, not by the user existing.
+WUSER=pcci-worker
+WSTAMP=/var/tmp/pcci-worker.setup
 
 # asworker <cmd…> — as the Podman worker's operator, with a clean
 # environment (the runner's XDG_* / DOCKER_* must never leak in).
@@ -73,8 +76,9 @@ case "$kind" in
     override "$RUNNER_IP" | docker exec -i "e2e-$name" sh -c 'cat > /opt/portcullis/docker-compose.worker.override.yml'
     rt=docker ;;
   podman)
-    if ! id "$WUSER" >/dev/null 2>&1; then
+    if [ ! -e "$WSTAMP" ]; then
       echo "== podman worker: packages, the user, linger"
+      ! id "$WUSER" >/dev/null 2>&1 || { echo "FAIL: the user $WUSER already exists on this runner"; exit 1; }
       sudo apt-get update -qq && sudo apt-get install -y -qq podman passt uidmap >/dev/null
       sudo useradd -m -s /bin/bash "$WUSER"
       grep -q "^$WUSER:" /etc/subuid || sudo usermod --add-subuids 200000-265535 "$WUSER"
@@ -105,6 +109,7 @@ case "$kind" in
       # shellcheck disable=SC2016
       asworker env ENVVARS="$envvars" sh -c '[ -z "$ENVVARS" ] || systemctl --user unset-environment $ENVVARS; systemctl --user set-environment XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" && systemctl --user enable --now podman.socket && systemctl --user enable podman-restart.service'
       echo "== podman worker: the user manager's environment: $(asworker systemctl --user show-environment 2>&1 | cut -d= -f1 | tr '\n' ' ')"
+      sudo touch "$WSTAMP"
     fi
     echo "== podman worker: the user's socket"
     for i in $(seq 1 30); do
