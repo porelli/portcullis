@@ -13,7 +13,7 @@ services:
     networks: [default, portcullis-proxy]
     volumes:
       - ./templates/servers-echo/www:/www:ro
-      - data:/data
+      - marker:/data
     labels:
       traefik.enable: "true"
       traefik.http.routers.echo.rule: Host(`${PORTCULLIS_HOST_ECHO:-echo.portcullis.local}`)
@@ -21,8 +21,11 @@ services:
       traefik.http.routers.echo.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
       traefik.http.services.echo.loadbalancer.server.port: "8080"
 
+# Not `data`: the default instances of every local template share the
+# core project's volume prefix (the Hub skips a template whose default
+# instance would reuse echo's portcullis_data).
 volumes:
-  data: {}
+  marker: {}
 
 networks:
   portcullis-proxy:

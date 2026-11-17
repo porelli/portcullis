@@ -336,7 +336,7 @@ def parent_domain_set_cookie_stripped():
 
 
 def marker(where: str, write: str | None = None) -> str:
-    vol = "portcullis-se1_data"
+    vol = "portcullis-se1_marker"
     cmd = f"printf %s {write} > /d/marker && chmod 644 /d/marker" if write else "cat /d/marker"
     if where == "primary":
         return sh("docker", "run", "--rm", "-v", f"{vol}:/d", os.environ["ALPINE"], "sh", "-c", cmd).stdout
