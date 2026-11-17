@@ -619,6 +619,11 @@ jobs:
                 DNS_CAA_ISSUER: pebble.test
               volumes:
                 - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
+              # The fake DNS for the mail template's resolver (its egress
+              # network reaches the runner, never this network).
+              ports:
+                - "8053:8053/udp"
+                - "8053:8053/tcp"
             pebble:
               image: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
               command: ["-config", "/test/config/pebble-config.json", "-dnsserver", "domains:8053"]
@@ -636,14 +641,15 @@ jobs:
                 # CI only: Traefik's API on its internal :8080 entrypoint, for
                 # the "no @http object" checks of the domains test.
                 TRAEFIK_API_INSECURE: "true"
-            # Mail (step "Test the mail service"): mail-cert against its own
+            # Mail (step "Test the mail provider"): mail-cert against its own
             # Pebble (accepts the one-shot's own fake-DNS challenge; its TLS
-            # certificate from the step's CI CA), mail-resolver forwarding
-            # every name to the domains fake DNS, mailctl's "public"
-            # resolvers = mail-resolver: no DNS or SMTP leaves the runner.
+            # certificate from the step's CI CA). The stalwart template's
+            # resolver forwards every name to the fake DNS on the runner's
+            # port 8053 (mail-templates-checkout.sh): no DNS or SMTP leaves
+            # the runner.
             pebble-mail:
               image: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
-              profiles: [mail]
+              profiles: [ci-mail]
               command: ["-config", "/ci/pebble.json", "-dnsserver", "127.0.0.1:53"]
               environment:
                 PEBBLE_VA_ALWAYS_VALID: "1"
@@ -658,17 +664,6 @@ jobs:
                 DOMAINS_RESOLVERS: 127.0.0.1:8053
               volumes:
                 - /tmp/pebble-mail/ca.pem:/run/ci/pebble-mail-ca.pem:ro
-            mail-resolver:
-              volumes:
-                - /tmp/unbound-ci.conf:/etc/unbound/custom.conf:ro
-              networks:
-                domains-egress: {}
-              healthcheck:
-                test: ["CMD", "drill-hc", "-p", "5353", "@127.0.0.1", "team-b.ci-domains.test"]
-            mailctl:
-              environment:
-                MAILCTL_RESOLVERS: 172.31.255.4:5353
-                MAILCTL_PUBLIC_IPV4: 203.0.113.25
           YML
           sed -i 's/^          //' docker-compose.ci.yml
           docker compose config -q
@@ -1863,8 +1858,24 @@ jobs:
       - name: Test the session store (oauth2-proxy sessions in Valkey, a ticket cookie, the ACL)
         run: bash .github/ci/build-and-test-session-store.sh
 
-      - name: Test the mail service (bootstrap, recovery gone, isolation, certificate, open relay, status, timer)
-        timeout-minutes: 20
+      - name: Build the mail adapter (mailctl/ → portcullis-mailctl:ci, P2)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: mailctl
+          tags: portcullis-mailctl:ci
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=mailctl
+          cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=mailctl,mode=max' || '' }}
+      - name: Templates for mail (same-named templates branch, else main; the local adapter, the fake DNS)
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+          MAIL_CI_DNS_PROBE: team-b.ci-domains.test
+        run: bash .github/ci/mail-templates-checkout.sh "$RUNNER_TEMP/templates" "$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}')"
+      - name: Test the mail provider (the stalwart template wired — bootstrap, isolation, certificate, open relay, gate, status, timer)
+        timeout-minutes: 25
         run: bash .github/ci/build-and-test-mail-service.sh setup
 
       - name: portcullis status
@@ -1899,7 +1910,7 @@ jobs:
           grep -q '^portcullis_vault_active 1$' monitoring/textfile/status.prom || { echo "FAIL: status --textfile"; cat monitoring/textfile/status.prom; exit 1; }
           echo "PASS: logical backup while running, verify --local, corruption detected, metrics"
 
-      - name: "Mail: the backup stopped and restarted mail, archived its volumes"
+      - name: "Mail: the backup holds the provider's instance archive"
         run: bash .github/ci/build-and-test-mail-service.sh after-backup
 
       - name: Off-host backup (restic, local repository), verify, wrong password
@@ -1929,7 +1940,7 @@ jobs:
         timeout-minutes: 15
         run: bash .github/ci/build-and-test-restore-from-off-host-fresh.sh
 
-      - name: "Mail: the restore voided the mail passwords, mailctl_data came back"
+      - name: "Mail: the restore restored the provider and voided its mail passwords"
         run: bash .github/ci/build-and-test-mail-service.sh after-restore
 
       - name: Collect service status
@@ -5207,7 +5218,7 @@ jobs:
           [ -z "$left" ] || { echo "FAIL: restored secrets/ entries not owned by the operator: $left"; exit 1; }
           echo "PASS: Docker → Podman: the .env kept CONTAINER_RUNTIME=podman and the rootless socket, status clean, the CA chain and rt-person are the Docker phase's, secrets/ operator-owned"
 
-      - name: Mail on rootless Podman (port 25, rewritten client addresses, the doctor, delivery, no BlockedIp)
+      - name: Mail on rootless Podman (the stalwart template — port start, rewritten client addresses, cold start, the doctor, delivery, no ban, the gate)
         timeout-minutes: 20
         run: bash .github/ci/e2e-podman-mail.sh
 
