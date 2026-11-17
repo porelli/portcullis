@@ -110,20 +110,31 @@ func (r *RedactingWriter) Write(p []byte) (int, error) {
 		}
 		r.buf = r.buf[i+1:]
 	}
-	if len(r.buf) > redactMax {
+	for len(r.buf) > redactMax {
 		cut := safeCut(string(r.buf))
-		// No safe cut (one secret-shaped token fills the buffer): past
-		// twice the bound, the whole buffer goes out redacted (L-c), never
-		// an unbounded hold.
-		forced := false
-		if cut == 0 && len(r.buf) > 2*redactMax {
-			cut, forced = len(r.buf), true
+		if cut == 0 {
+			// A match starts the buffer and crosses the cut: cut right after
+			// it when it ends inside the buffer (the rest is judged again).
+			end := matchEndAtStart(string(r.buf))
+			if end > 0 && end < len(r.buf) {
+				cut = end
+			} else if len(r.buf) > 2*redactMax {
+				// It runs to the end and past twice the bound (L-c): the
+				// whole buffer goes as one [redacted] and the token's
+				// continuation is dropped too (fail closed).
+				if _, err := io.WriteString(r.w, "[redacted]"); err != nil {
+					return n, err
+				}
+				r.buf, r.inToken = nil, true
+				break
+			} else {
+				break
+			}
 		}
 		if _, err := io.WriteString(r.w, Redact(string(r.buf[:cut]))); err != nil {
 			return n, err
 		}
 		r.buf = append([]byte(nil), r.buf[cut:]...)
-		r.inToken = forced
 	}
 	return n, nil
 }
@@ -138,6 +149,23 @@ func (r *RedactingWriter) Close() error {
 	_, err := io.WriteString(r.w, Redact(string(r.buf)))
 	r.buf = nil
 	return err
+}
+
+// matchEndAtStart: the end of the longest secret or shape match that
+// starts at s[0], 0 when none does.
+func matchEndAtStart(s string) int {
+	end := 0
+	if m := shapes.FindStringIndex(s); m != nil && m[0] == 0 {
+		end = m[1]
+	}
+	mu.RLock()
+	for _, x := range secrets {
+		if strings.HasPrefix(s, x) && len(x) > end {
+			end = len(x)
+		}
+	}
+	mu.RUnlock()
+	return end
 }
 
 // safeCut: where s may be cut: len(s) minus the longest secret (or

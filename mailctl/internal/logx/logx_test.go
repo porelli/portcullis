@@ -85,3 +85,61 @@ func TestRedactingWriterHugeShapeBounded(t *testing.T) {
 		t.Fatal("the token went out unredacted")
 	}
 }
+
+// Two secrets (and an API key shape) placed across the flush cut points,
+// written in many chunkings: no 8-byte window of any of them ever reaches
+// the output (security review of the fix round).
+func TestRedactingWriterNoWindowAcrossChunkings(t *testing.T) {
+	s1 := "Q1w2E3r4T5y6U7i8O9p0-first-secret-QQ"
+	s2 := "Z9y8X7w6V5u4T3s2R1q0-second-secret-ZZ"
+	AddSecret(s1)
+	AddSecret(s2)
+	key := "API_" + strings.Repeat("K", 30) + "k1k2k3k4"
+	toks := []string{s1, s2, key}
+	windows := func(out string) string {
+		for _, tok := range toks {
+			for i := 0; i+8 <= len(tok); i++ {
+				if strings.Contains(out, tok[i:i+8]) {
+					return tok[i : i+8]
+				}
+			}
+		}
+		return ""
+	}
+	chunkings := []int{1, 7, 13, 255, 256, 4096, 65535, 65536, 65537, 100000}
+	for _, base := range []int{redactMax - 40, redactMax - 3, redactMax, 2*redactMax - 20, 2 * redactMax, 3*redactMax - 7} {
+		for gap := 0; gap <= 300; gap += 37 {
+			for _, ch := range chunkings {
+				// Filler without newlines; the first secret ends near base,
+				// the second starts gap bytes after it, the key after that.
+				text := strings.Repeat(".", base-len(s1)/2) + s1 + strings.Repeat(".", gap) + s2 + " " + key + strings.Repeat(".", 500)
+				var b strings.Builder
+				w := NewRedactingWriter(&b)
+				for i := 0; i < len(text); i += ch {
+					w.Write([]byte(text[i:min(len(text), i+ch)]))
+				}
+				w.Close()
+				if win := windows(b.String()); win != "" {
+					t.Fatalf("base %d gap %d chunk %d: %q reached the output", base, gap, ch, win)
+				}
+			}
+		}
+	}
+	// A token longer than twice the buffer, a secret right after it: the
+	// forced flush must not let the secret's start through.
+	huge := "API_" + strings.Repeat("K", 2*redactMax+100)
+	for _, sep := range []string{" ", ";", ""} {
+		for _, ch := range []int{1000, 4099, 65536, 65600, 131072, 131100, 200000} {
+			text := huge + sep + s1 + strings.Repeat(".", 300) + s2 + strings.Repeat(".", 300)
+			var b strings.Builder
+			w := NewRedactingWriter(&b)
+			for i := 0; i < len(text); i += ch {
+				w.Write([]byte(text[i:min(len(text), i+ch)]))
+			}
+			w.Close()
+			if win := windows(b.String()); win != "" && !strings.HasPrefix(win, "KKKK") {
+				t.Fatalf("huge token, sep %q chunk %d: %q reached the output", sep, ch, win)
+			}
+		}
+	}
+}
