@@ -56,31 +56,23 @@ func New(w io.Writer) *Logger { return &Logger{l: log.New(w, "", log.LstdFlags)}
 // Printf logs one redacted line.
 func (l *Logger) Printf(format string, a ...any) { l.l.Print(Redact(fmt.Sprintf(format, a...))) }
 
-// RedactingWriter writes w's input line by line through Redact. A line
-// split across writes is held until its newline. A line longer than
-// redactMax is flushed in parts, each cut where no secret (or secret
-// shape) can straddle it: the last tailKeep bytes, and any match crossing
-// the cut, stay for the next part. Close redacts and writes the rest.
+// RedactingWriter writes w's input line by line through Redact (Ruling
+// R2-LOG): a line is held until its newline and redacted whole. A line
+// longer than redactMax is never cut: it is dropped whole and replaced by
+// one marker line. Close does the same with the last partial line.
 type RedactingWriter struct {
 	mu  sync.Mutex
 	w   io.Writer
 	buf []byte
-	// inToken: a secret-shaped token was flushed whole while it still ran
-	// on; its continuation is dropped until the first non-token byte.
-	inToken bool
+	// over: the current line passed redactMax; it is being dropped.
+	over bool
 }
 
-// tokenByte: a byte a secret-shaped token may continue with.
-func tokenByte(c byte) bool {
-	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || strings.IndexByte("+/=_-", c) >= 0
-}
+// redactMax bounds one log line.
+const redactMax = 64 << 10
 
-const (
-	redactMax = 64 << 10
-	// shapeMax bounds a secret-shaped token the cut keeps whole (API keys
-	// are 42 bytes, app passwords 40).
-	shapeMax = 256
-)
+// lineDropped replaces a line over redactMax.
+const lineDropped = "[log line over 64 KiB dropped]"
 
 // NewRedactingWriter wraps w.
 func NewRedactingWriter(w io.Writer) *RedactingWriter { return &RedactingWriter{w: w} }
@@ -89,119 +81,44 @@ func (r *RedactingWriter) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	n := len(p)
-	if r.inToken {
-		i := 0
-		for i < len(p) && tokenByte(p[i]) {
-			i++
-		}
-		if i == len(p) {
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		if i < 0 {
+			if !r.over {
+				r.buf = append(r.buf, p...)
+				if len(r.buf) > redactMax {
+					r.buf, r.over = nil, true
+				}
+			}
 			return n, nil
 		}
-		p, r.inToken = p[i:], false
-	}
-	r.buf = append(r.buf, p...)
-	for {
-		i := bytes.IndexByte(r.buf, '\n')
-		if i < 0 {
-			break
+		line := p[:i+1]
+		p = p[i+1:]
+		var out string
+		if r.over || len(r.buf)+len(line) > redactMax+1 {
+			out = lineDropped + "\n"
+		} else {
+			out = Redact(string(append(r.buf, line...)))
 		}
-		if _, err := io.WriteString(r.w, Redact(string(r.buf[:i+1]))); err != nil {
+		r.buf, r.over = nil, false
+		if _, err := io.WriteString(r.w, out); err != nil {
 			return n, err
 		}
-		r.buf = r.buf[i+1:]
-	}
-	for len(r.buf) > redactMax {
-		cut := safeCut(string(r.buf))
-		if cut == 0 {
-			// A match starts the buffer and crosses the cut: cut right after
-			// it when it ends inside the buffer (the rest is judged again).
-			end := matchEndAtStart(string(r.buf))
-			if end > 0 && end < len(r.buf) {
-				cut = end
-			} else if len(r.buf) > 2*redactMax {
-				// It runs to the end and past twice the bound (L-c): the
-				// whole buffer goes as one [redacted] and the token's
-				// continuation is dropped too (fail closed).
-				if _, err := io.WriteString(r.w, "[redacted]"); err != nil {
-					return n, err
-				}
-				r.buf, r.inToken = nil, true
-				break
-			} else {
-				break
-			}
-		}
-		if _, err := io.WriteString(r.w, Redact(string(r.buf[:cut]))); err != nil {
-			return n, err
-		}
-		r.buf = append([]byte(nil), r.buf[cut:]...)
 	}
 	return n, nil
 }
 
-// Close redacts and writes what is left (the child exited).
+// Close writes the last partial line the same way (the child exited).
 func (r *RedactingWriter) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.buf) == 0 {
-		return nil
+	var err error
+	switch {
+	case r.over:
+		_, err = io.WriteString(r.w, lineDropped)
+	case len(r.buf) > 0:
+		_, err = io.WriteString(r.w, Redact(string(r.buf)))
 	}
-	_, err := io.WriteString(r.w, Redact(string(r.buf)))
-	r.buf = nil
+	r.buf, r.over = nil, false
 	return err
-}
-
-// matchEndAtStart: the end of the longest secret or shape match that
-// starts at s[0], 0 when none does.
-func matchEndAtStart(s string) int {
-	end := 0
-	if m := shapes.FindStringIndex(s); m != nil && m[0] == 0 {
-		end = m[1]
-	}
-	mu.RLock()
-	for _, x := range secrets {
-		if strings.HasPrefix(s, x) && len(x) > end {
-			end = len(x)
-		}
-	}
-	mu.RUnlock()
-	return end
-}
-
-// safeCut: where s may be cut: len(s) minus the longest secret (or
-// shapeMax) less one, moved back to the start of any secret or shape
-// match crossing it.
-func safeCut(s string) int {
-	keep := shapeMax
-	mu.RLock()
-	for _, x := range secrets {
-		if len(x) > keep {
-			keep = len(x)
-		}
-	}
-	cut := len(s) - (keep - 1)
-	for moved := true; moved && cut > 0; {
-		moved = false
-		for _, x := range secrets {
-			from := cut - len(x) + 1
-			if from < 0 {
-				from = 0
-			}
-			if j := strings.Index(s[from:min(len(s), cut+len(x)-1)], x); j >= 0 && from+j < cut {
-				cut, moved = from+j, true
-			}
-		}
-		// The whole buffer: a shape match longer than shapeMax may cross
-		// the cut from far before it.
-		for _, m := range shapes.FindAllStringIndex(s, -1) {
-			if m[0] < cut && m[1] > cut {
-				cut, moved = m[0], true
-			}
-		}
-	}
-	mu.RUnlock()
-	if cut < 0 {
-		cut = 0
-	}
-	return cut
 }

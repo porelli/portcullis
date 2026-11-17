@@ -35,33 +35,30 @@ func TestRedactingWriter(t *testing.T) {
 	}
 }
 
-// A line longer than the buffer: a secret or an API-key shape across the
-// flush cut is still redacted, and Close redacts the rest (fix round 1).
-func TestRedactingWriterLongLineAcrossCut(t *testing.T) {
+// R2-LOG: a line over 64 KiB is dropped whole (one marker), never cut;
+// the next line is written as usual; Close treats the last partial line
+// the same way.
+func TestRedactingWriterLongLineDropped(t *testing.T) {
 	const sec = "straddling-secret-value-0123456789"
 	AddSecret(sec)
-	key := "API_" + strings.Repeat("k", 38)
-	for _, tok := range []string{sec, key} {
-		for k := 2; k < len(tok)-1; k += 3 {
-			var b strings.Builder
-			w := NewRedactingWriter(&b)
-			// The first write overflows the buffer with the token's first
-			// k bytes at its end; the rest comes with the next write.
-			w.Write([]byte(strings.Repeat("x", redactMax) + " " + tok[:k]))
-			w.Write([]byte(tok[k:] + " " + strings.Repeat("y", 2000)))
-			w.Close()
-			out := b.String()
-			if strings.Contains(out, tok[:k]) || strings.Contains(out, tok[k:]) || !strings.Contains(out, "[redacted]") {
-				t.Fatalf("token %.8s… cut at %d escaped the redaction", tok, k)
-			}
-			if !strings.HasSuffix(out, "y") || strings.Count(out, "x") != redactMax {
-				t.Fatalf("cut %d: output lost or duplicated", k)
-			}
-		}
-	}
-	// Close with a held partial line redacts it.
 	var b strings.Builder
 	w := NewRedactingWriter(&b)
+	w.Write([]byte(strings.Repeat("x", redactMax) + " " + sec[:10]))
+	w.Write([]byte(sec[10:] + " tail\nnext " + sec + "\n"))
+	w.Close()
+	if b.String() != lineDropped+"\nnext [redacted]\n" {
+		t.Fatalf("%.200q", b.String())
+	}
+	b.Reset()
+	w = NewRedactingWriter(&b)
+	w.Write([]byte(strings.Repeat("y", redactMax+1)))
+	w.Close()
+	if b.String() != lineDropped {
+		t.Fatalf("close over the bound: %.100q", b.String())
+	}
+	// Close with a held partial line redacts it.
+	b.Reset()
+	w = NewRedactingWriter(&b)
 	w.Write([]byte("tail " + sec))
 	w.Close()
 	if b.String() != "tail [redacted]" {
@@ -69,25 +66,6 @@ func TestRedactingWriterLongLineAcrossCut(t *testing.T) {
 	}
 }
 
-// One secret-shaped token longer than the buffer: the writer doesn't hold
-// it forever, and what it writes is redacted (L-c).
-func TestRedactingWriterHugeShapeBounded(t *testing.T) {
-	var b strings.Builder
-	w := NewRedactingWriter(&b)
-	w.Write([]byte("API_"))
-	for i := 0; i < 3; i++ {
-		w.Write([]byte(strings.Repeat("k", redactMax)))
-	}
-	if b.Len() == 0 || len(w.buf) > 2*redactMax {
-		t.Fatalf("held %d bytes, wrote %d", len(w.buf), b.Len())
-	}
-	if strings.Contains(b.String(), "kkkkkkkkkkkkkkkkkkkk") {
-		t.Fatal("the token went out unredacted")
-	}
-}
-
-// Two secrets (and an API key shape) placed across the flush cut points,
-// written in many chunkings: no 8-byte window of any of them ever reaches
 // the output (security review of the fix round).
 func TestRedactingWriterNoWindowAcrossChunkings(t *testing.T) {
 	s1 := "Q1w2E3r4T5y6U7i8O9p0-first-secret-QQ"
@@ -112,15 +90,23 @@ func TestRedactingWriterNoWindowAcrossChunkings(t *testing.T) {
 			for _, ch := range chunkings {
 				// Filler without newlines; the first secret ends near base,
 				// the second starts gap bytes after it, the key after that.
-				text := strings.Repeat(".", base-len(s1)/2) + s1 + strings.Repeat(".", gap) + s2 + " " + key + strings.Repeat(".", 500)
-				var b strings.Builder
-				w := NewRedactingWriter(&b)
-				for i := 0; i < len(text); i += ch {
-					w.Write([]byte(text[i:min(len(text), i+ch)]))
-				}
-				w.Close()
-				if win := windows(b.String()); win != "" {
-					t.Fatalf("base %d gap %d chunk %d: %q reached the output", base, gap, ch, win)
+				for _, nl := range []string{"", "\n"} {
+					// With nl, short lines around the secrets (redacted
+					// whole); without, one long line (dropped or redacted
+					// whole on Close).
+					text := strings.Repeat(".", base-len(s1)/2) + nl + s1 + strings.Repeat(".", gap) + nl + s2 + " " + key + nl + strings.Repeat(".", 500)
+					if nl != "" {
+						text = strings.Repeat(".", 80) + nl + s1 + strings.Repeat(".", gap%61) + nl + s2 + " " + key + nl + strings.Repeat(".", base%5000)
+					}
+					var b strings.Builder
+					w := NewRedactingWriter(&b)
+					for i := 0; i < len(text); i += ch {
+						w.Write([]byte(text[i:min(len(text), i+ch)]))
+					}
+					w.Close()
+					if win := windows(b.String()); win != "" {
+						t.Fatalf("base %d gap %d chunk %d nl %q: %q reached the output", base, gap, ch, nl, win)
+					}
 				}
 			}
 		}
@@ -137,7 +123,7 @@ func TestRedactingWriterNoWindowAcrossChunkings(t *testing.T) {
 				w.Write([]byte(text[i:min(len(text), i+ch)]))
 			}
 			w.Close()
-			if win := windows(b.String()); win != "" && !strings.HasPrefix(win, "KKKK") {
+			if win := windows(b.String()); win != "" {
 				t.Fatalf("huge token, sep %q chunk %d: %q reached the output", sep, ch, win)
 			}
 		}
