@@ -110,6 +110,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_login as base  # noqa: E402  (Authenticator, passkey_flow, shot)
 import e2e_fsops  # noqa: E402  (run_op, scrub; unit-tested without the stack)
 from e2e_fsops import HASHES, PASSWORDS, scrub  # noqa: E402
+import scenarios  # noqa: E402  (E2E_SCENARIOS: single-scenario reruns)
 
 DOMAIN = os.environ["E2E_DOMAIN"]
 ART = os.environ.get("E2E_ARTIFACTS", "e2e-artifacts")
@@ -139,6 +140,8 @@ POPUPS: dict[str, int] = {}   # fresh-auth popups per person (signature counter 
 
 
 def check(name: str, fn) -> None:
+    if scenarios.skip(name):  # E2E_SCENARIOS (tests/e2e/scenarios.py)
+        return
     try:
         fn()
         results.append((name, True, ""))

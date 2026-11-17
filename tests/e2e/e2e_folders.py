@@ -65,6 +65,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_ops  # noqa: E402  (the op record poll, contract §11.7)
+import scenarios  # noqa: E402  (E2E_SCENARIOS: single-scenario reruns)
 
 HUB_API = f"http://{os.environ['HUB_IP']}:8888"
 SECRET = os.environ["E2E_HUB_SECRET"]
@@ -83,6 +84,8 @@ state: dict = {}
 
 
 def check(name: str, fn) -> None:
+    if scenarios.skip(name):  # E2E_SCENARIOS (tests/e2e/scenarios.py)
+        return
     try:
         fn()
         results.append((name, True, ""))
