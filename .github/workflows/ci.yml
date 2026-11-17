@@ -5670,6 +5670,8 @@ jobs:
       - name: Hub, agent and relay images (same-named Hub branch → built here, else the published ones)
         timeout-minutes: 25
         uses: ./.github/actions/hub-image
+        with:
+          e2etest: "true"
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
         timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
@@ -5737,6 +5739,8 @@ jobs:
       - name: Hub, agent and relay images (same-named Hub branch → built here, else the published ones)
         timeout-minutes: 25
         uses: ./.github/actions/hub-image
+        with:
+          e2etest: "true"
       - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
         timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
