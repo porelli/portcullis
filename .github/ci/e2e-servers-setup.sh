@@ -2,7 +2,7 @@
 # ci.yml jobs e2e-servers / e2e-servers-podman, step "Primary: the whole
 # stack + Hub + link init" (multiple servers, contract §17). The primary on
 # Docker: .env, the CI override (the Hub's dev hooks, its API on the
-# runner, the virtual authenticator), the CI template source (echo), the
+# runner, the virtual authenticator), the CI template source (echo, servers-echo, oidc-echo), the
 # stack, `./portcullis link init`, the admin's and alice's setup links.
 # Run from the workspace root (bash -e). Writes HUB_IP, the setup links
 # (masked) and the runner's address to $GITHUB_ENV.
@@ -42,10 +42,10 @@ docker compose up -d postgres lldap
 ./portcullis pki setup --with-server-cert
 ./portcullis config apply --bundle-only
 printf 'tls:\n  certificates:\n    - certFile: /certs/server.crt\n      keyFile: /certs/server.key\n' > traefik/dynamic/ci-certs.yml
-# The Hub's only template source: the CI template echo (a local source).
+# The Hub's only template source: the CI templates echo, servers-echo, oidc-echo (a local source).
 docker volume create --label com.docker.compose.project=portcullis --label com.docker.compose.volume=hub_data portcullis_hub_data >/dev/null
 docker run --rm -v portcullis_hub_data:/data -v "$PWD/tests/e2e/apps:/src:ro" "$ALPINE" sh -c '
-  mkdir -p /data/repos/ci && cp -r /src/echo /data/repos/ci/ &&
+  mkdir -p /data/repos/ci && cp -r /src/echo /src/servers-echo /src/oidc-echo /data/repos/ci/ &&
   printf "sources:\n  - name: ci\n    url: \"\"\n    path: /data/repos/ci\n" > /data/state.yaml &&
   chown -R 10001:10001 /data && chmod 600 /data/state.yaml'
 # shellcheck disable=SC2046
