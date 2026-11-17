@@ -406,8 +406,12 @@ def echo_on_worker_signed_in():
     assert {k: a.get(k) for k in ("template", "tier")} == {k: b.get(k) for k in ("template", "tier")}, f"tiers differ: {a} / {b}"
     ps = wexec("w1", "docker", "ps", "--filter", "label=com.docker.compose.project=portcullis-se1", "--format", "{{.Names}}").stdout
     assert ps.strip(), "se1 has no container on w1"
-    assert not sh("docker", "ps", "-q", "--filter", "label=com.docker.compose.service=web",
-                  "--filter", "label=com.docker.compose.project=portcullis-se1").stdout.strip(), "se1's app runs on the primary"
+    # On the primary, se1's project holds only its relays (the same compose
+    # project and service labels as the app's — contract §5 relays), never
+    # the app's image.
+    imgs = sh("docker", "ps", "-a", "--filter", "label=com.docker.compose.project=portcullis-se1",
+              "--format", "{{.Image}}").stdout.split()
+    assert imgs and all(i == os.environ["RELAY_IMAGE"] for i in imgs), f"se1's project on the primary runs {imgs}, not only the relay"
     state["se1"] = True
 
 
