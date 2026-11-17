@@ -497,7 +497,12 @@ def wg_back_routes_again():
     needs("se1")  # echo_on_worker_signed_in
     # link back first (the Hub reads servers as off until wg's status is
     # fresh again), then w1 ready, then the app through it.
-    wait_for("servers on again", lambda: hub("GET", "/api/servers")[0] == 200, 120)
+    # (GET /api/servers lists servers even while they are off: link's own
+    # status, the file the Hub's servers-on check reads, is the signal.)
+    def link_up():
+        st = json.loads(sh("./portcullis", "link", "status", "--json", check=False).stdout or "{}")
+        return st.get("up") is True
+    wait_for("link up again", link_up, 120)
     wait_for("w1 ready again", lambda: server_state("w1") == "ready", 180)
     wait_for("se1 routed again", lambda: reach(state["alice_page"], "se1"), 240)
 
