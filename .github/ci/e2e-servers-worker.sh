@@ -96,6 +96,16 @@ case "$kind" in
       for i in $(seq 1 60); do sudo test -S "/run/user/$uid/bus" && break; [ "$i" -eq 60 ] && { echo "FAIL: no user manager for $WUSER"; systemctl status "user@$uid.service" --no-pager | tail -20; exit 1; }; sleep 1; done
       asworker sh -c 'systemctl --user enable --now podman.socket && systemctl --user enable podman-restart.service' 
     fi
+    for i in $(seq 1 30); do
+      asworker docker version --format '{{json .Server.Components}}' >/dev/null 2>&1 && break
+      if [ "$i" -eq 30 ]; then
+        echo "FAIL: $WUSER's Podman socket doesn't answer"
+        asworker docker version 2>&1 | tail -5
+        asworker systemctl --user status podman.socket podman.service --no-pager 2>&1 | tail -20
+        exit 1
+      fi
+      sleep 2
+    done
     sudo rm -rf "/home/$WUSER/portcullis"
     sudo cp -a "$PWD" "/home/$WUSER/portcullis"
     sudo rm -rf "/home/$WUSER/portcullis/.env" "/home/$WUSER/portcullis/secrets/"* "/home/$WUSER/portcullis/certs/"* "/home/$WUSER/portcullis/docker-compose.ci.yml"
