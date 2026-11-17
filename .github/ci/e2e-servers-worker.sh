@@ -93,7 +93,8 @@ case "$kind" in
     sudo cp -a "$PWD" "/home/$WUSER/portcullis"
     sudo rm -rf "/home/$WUSER/portcullis/.env" "/home/$WUSER/portcullis/secrets/"* "/home/$WUSER/portcullis/certs/"* "/home/$WUSER/portcullis/docker-compose.ci.yml"
     sudo chown -R "$WUSER:$WUSER" "/home/$WUSER/portcullis"
-    docker save "$AGENT_IMAGE" | sudo -u "$WUSER" -H podman load -q
+    uid="$(id -u "$WUSER")"
+    docker save "$AGENT_IMAGE" | sudo -u "$WUSER" -H env XDG_RUNTIME_DIR="/run/user/$uid" podman load -q
     override host-gateway | sudo -u "$WUSER" tee "/home/$WUSER/portcullis/docker-compose.worker.override.yml" >/dev/null
     rt=podman ;;
   *) echo "usage: $0 dind|podman|exec <name>"; exit 2 ;;
