@@ -42,7 +42,6 @@ import secrets
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import urllib.error
 import urllib.parse
@@ -538,47 +537,50 @@ def revoke_drops_handshake_and_rotates():
                                       "hosts": {"oidc": f"oe1.{DOMAIN}"}, "server": "w1"})
     run_op("POST", "/api/templates/enable", {"id": "oe1"}, timeout=900)
     before = keycloak_secret("oe1")
-    # A long-lived stream through the relay, open across the revocation.
-    stream = {"closed_after": None, "first": None, "bytes": 0, "status": None, "error": ""}
+    # A long-lived stream through the relay, open across the revocation:
+    # a fetch() in alice's own page (the browser's cookies and connection
+    # handling), read chunk by chunk; its progress polled from the page.
+    sp = state["alice_ctx"].new_page()
+    sp.goto(f"https://se1.{DOMAIN}/cgi-bin/echo", wait_until="domcontentloaded")
+    sp.evaluate("""() => {
+      window.__s = {status: null, bytes: 0, first: null, done: null, err: null};
+      fetch('/cgi-bin/echo?stream', {credentials: 'same-origin'}).then(async (r) => {
+        window.__s.status = r.status;
+        const rd = r.body.getReader();
+        for (;;) {
+          const {done, value} = await rd.read();
+          if (done) break;
+          if (window.__s.first === null) window.__s.first = Date.now();
+          window.__s.bytes += value.length;
+        }
+        window.__s.done = Date.now();
+      }).catch((e) => { window.__s.err = String(e); window.__s.done = Date.now(); });
+    }""")
 
-    def hold():
-        # The cookies a browser would send to se1 (Playwright's domain
-        # matching), never Keycloak's auth.<domain> ones: busybox httpd
-        # stalls on an oversized request header.
-        st = state["alice_ctx"].cookies(f"https://se1.{DOMAIN}/cgi-bin/echo")
-        hdr = "; ".join(f"{c['name']}={c['value']}" for c in st)
-        req = urllib.request.Request(f"https://se1.{DOMAIN}/cgi-bin/echo?stream", headers={"Cookie": hdr})
-        try:
-            with urllib.request.urlopen(req, timeout=300, context=_tls()) as r:
-                stream["status"] = r.status
-                while r.read(1):
-                    stream["bytes"] += 1
-                    if stream["first"] is None:
-                        stream["first"] = time.time()
-        except Exception as e:  # noqa: BLE001
-            stream["error"] = f"{type(e).__name__}: {redact(str(e))[:200]}"
-        stream["closed_after"] = time.time()
-    t = threading.Thread(target=hold, daemon=True)
-    t.start()
+    def sstate() -> dict:
+        return sp.evaluate("() => window.__s")
     # The stream must be flowing through the relay before the revocation
     # (else nothing is being cut).
-    wait_for("the stream through the relay started", lambda: stream["first"] is not None or stream["closed_after"] is not None, 30, every=1)
-    assert stream["first"] is not None, f"the stream never started: {stream}"
+    wait_for("the stream through the relay started", lambda: sstate()["first"] is not None or sstate()["done"] is not None, 30, every=1)
+    if sstate()["first"] is None:
+        plain = sp.evaluate("() => fetch('/cgi-bin/echo').then(r => r.status, e => String(e))")
+        raise AssertionError(f"the stream never started: {sstate()}; a plain GET: {plain}")
     t0 = time.time()
     body = dict(confirm="w1", **fresh_proof(state["admin_page"], "revoke-w1"))
     hub_ok("POST", "/api/servers/w1/revoke", body)
     wait_for("w1 out of link", lambda: all(p["id"] != "w1" for p in link_peers()), 15, every=1)
     assert server_state("w1") == "revoked", f"w1 is {server_state('w1')}"
     wait_for("oe1's client secret rotated", lambda: keycloak_secret("oe1") != before, 120)
-    t.join(timeout=60)
-    state["stream"] = (t0, stream["closed_after"])
-    state["stream_note"] = {k: stream[k] for k in ("status", "bytes", "error")}
-
-
-def _tls():
-    import ssl
-    c = ssl.create_default_context(cafile="certs/ca-chain.crt")
-    return c
+    # The page's clock (ms) → the stream's end relative to the revoke.
+    deadline = time.time() + 60
+    while sstate()["done"] is None and time.time() < deadline:
+        time.sleep(1)
+    s = sstate()
+    now_page = sp.evaluate("() => Date.now()") / 1000.0
+    closed = None if s["done"] is None else time.time() - (now_page - s["done"] / 1000.0)
+    state["stream"] = (t0, closed)
+    state["stream_note"] = {k: s[k] for k in ("status", "bytes", "err")}
+    sp.close()
 
 
 def revoke_cuts_websocket():
