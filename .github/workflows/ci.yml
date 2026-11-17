@@ -5710,7 +5710,7 @@ jobs:
           retention-days: 7
 
   # Multiple servers (contract §17; tests/e2e/e2e_servers.py): the primary
-  # on Docker with `link init`, a rootless Podman worker as the runner user `pcci-worker`
+  # on Docker with `link init`, a rootless Podman worker in a pinned quay.io/podman/stable container (systemd, user `podman`)
   # joined with the code on stdin. Thin: the steps are .github/ci/e2e-servers-*.sh.
   e2e-servers-podman:
     needs: jobs-input
