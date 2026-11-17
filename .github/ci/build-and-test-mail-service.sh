@@ -294,8 +294,23 @@ setup)
   echo "PASS: the gate: without .present a raw start of stalwart exits $rc before serving; with it, healthy again"
 
   # The pass the daily timer runs (it must succeed), then the Hub again.
+  # The Hub's start brings the instance up again (its containers may be
+  # recreated: the alias mail-api is gone meanwhile), so the pass waits
+  # for the provider to be healthy and reachable through the Hub.
   docker compose start hub >/dev/null
-  for _ in $(seq 1 40); do hub_mail provider >/dev/null 2>&1 && break; sleep 3; done
+  provider_ready() {
+    for _ in $(seq 1 60); do
+      st="$(hub_mail status 2>/dev/null || true)"
+      if jq -e '.wired == true and .reachable == true' <<<"$st" >/dev/null 2>&1 \
+         && [ "$(health stalwart)" = healthy ] && [ "$(health adapter)" = healthy ]; then
+        return 0
+      fi
+      sleep 5
+    done
+    fail "the provider isn't reachable through the Hub after its start: $st"
+  }
+  provider_ready
+  sleep 10; provider_ready  # still there (not mid-recreate)
   ./portcullis mail rotate > "$ST/rotate.out" 2>&1 || { cat "$ST/rotate.out"; fail "mail rotate"; }
   echo "PASS: the mail provider"
   ;;
