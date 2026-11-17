@@ -591,23 +591,53 @@ func KeyInPlace(ctx context.Context, c *stalwart.Client, mailctlIP netip.Addr, f
 		return false, nil
 	}
 	k := keys[0]
-	var ips map[string]bool
 	var perm struct {
 		Type string `json:"@type"`
 	}
-	_ = json.Unmarshal(k["allowedIps"], &ips)
 	_ = json.Unmarshal(k["permissions"], &perm)
-	want := netip.PrefixFrom(mailctlIP, 32).String()
-	if str(k, "description") != APIKeyName || perm.Type != "Inherit" || len(ips) != 1 || !ips[want] {
+	if str(k, "description") != APIKeyName || perm.Type != "Inherit" || !onlyPrefix(k["allowedIps"], netip.PrefixFrom(mailctlIP, 32)) {
 		return false, nil
 	}
-	if raw, ok := k["enabled"]; ok {
-		var en bool
-		if json.Unmarshal(raw, &en) != nil || !en {
-			return false, nil
-		}
+	// No expiry (the key is minted without one).
+	if raw, ok := k["expiresAt"]; ok && string(raw) != "null" {
+		return false, nil
+	}
+	// The secret, when the server hands it back in clear (Stalwart 1.1
+	// returns the field), must be the file's; a masked or hashed value
+	// can't be compared and says nothing.
+	if sec := str(k, "secret"); strings.HasPrefix(sec, "API_") && sec != fileKey {
+		return false, nil
 	}
 	return true, nil
+}
+
+// onlyPrefix: the JMAP set (an object of value → true, or a list) holds
+// exactly one network, want, compared canonically: Stalwart 1.1 answers a
+// /32 as the bare address ({"172.31.255.3": true}).
+func onlyPrefix(raw json.RawMessage, want netip.Prefix) bool {
+	var vals []string
+	var set map[string]bool
+	if json.Unmarshal(raw, &set) == nil && set != nil {
+		for v, on := range set {
+			if on {
+				vals = append(vals, v)
+			}
+		}
+	} else if json.Unmarshal(raw, &vals) != nil {
+		return false
+	}
+	if len(vals) != 1 {
+		return false
+	}
+	p, err := netip.ParsePrefix(vals[0])
+	if err != nil {
+		a, aerr := netip.ParseAddr(vals[0])
+		if aerr != nil {
+			return false
+		}
+		p = netip.PrefixFrom(a, a.BitLen())
+	}
+	return p.Masked() == want.Masked()
 }
 
 // mailctlAccount: the id of mailctl's account on the parking domain, ""

@@ -582,3 +582,48 @@ func TestBasePlanSASLLANOnly(t *testing.T) {
 		t.Fatalf("LAN-only, rewritten: %s", got)
 	}
 }
+
+// KeyInPlace against the shapes real Stalwart 1.1 answers (seen on the
+// builder smoke, core fix round 2): allowedIps a set holding the bare
+// address, the secret returned in clear, expiresAt null.
+func TestKeyInPlaceRealShapes(t *testing.T) {
+	ip := netip.MustParseAddr("172.31.255.3")
+	for name, c := range map[string]struct {
+		key  map[string]any
+		file string
+		want bool
+	}{
+		"real shape":       {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3": true}, "secret": "API_x1", "createdAt": "2026-11-17T10:00:00Z", "expiresAt": nil}, "API_x1", true},
+		"with /32":         {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3/32": true}}, "API_x1", true},
+		"another secret":   {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3": true}, "secret": "API_other"}, "API_x1", false},
+		"masked secret":    {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3": true}, "secret": "********"}, "API_x1", true},
+		"widened":          {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3": true, "0.0.0.0/0": true}}, "API_x1", false},
+		"another address":  {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.4": true}}, "API_x1", false},
+		"expiring":         {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3": true}, "expiresAt": "2027-01-01T00:00:00Z"}, "API_x1", false},
+		"other permission": {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Replace"}, "allowedIps": map[string]any{"172.31.255.3": true}}, "API_x1", false},
+		"no key file":      {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3": true}}, "", false},
+	} {
+		f := newFake()
+		d := f.put("Domain", map[string]any{"name": ParkingDomain})
+		a := f.put("Account", map[string]any{"name": MailctlAccount, "domainId": d})
+		f.put("ApiKey@"+a, c.key)
+		srv := httptest.NewServer(f)
+		ok, err := KeyInPlace(context.Background(), stalwart.New(srv.URL, stalwart.Basic("r", "p")), ip, c.file)
+		srv.Close()
+		if err != nil || ok != c.want {
+			t.Errorf("%s: %v %v, want %v", name, ok, err, c.want)
+		}
+	}
+	// Two keys (an old one not destroyed): not in place.
+	f := newFake()
+	d := f.put("Domain", map[string]any{"name": ParkingDomain})
+	a := f.put("Account", map[string]any{"name": MailctlAccount, "domainId": d})
+	for i := 0; i < 2; i++ {
+		f.put("ApiKey@"+a, map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3": true}})
+	}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	if ok, _ := KeyInPlace(context.Background(), stalwart.New(srv.URL, stalwart.Basic("r", "p")), ip, "API_x1"); ok {
+		t.Fatal("two keys judged in place")
+	}
+}
