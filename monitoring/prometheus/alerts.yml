@@ -148,6 +148,32 @@ groups:
             Its devices are denied until the Hub publishes a fresh map (the identity
             hook fails or the gateway is down). See the instance's VPN tab in the Hub.
 
+      # Usage (the Hub's usage metrics, job hub-usage, contract §16.2): the
+      # doctor's thresholds, so Alertmanager notifies what the doctor shows.
+      - alert: PortcullisAppMemoryNearLimit
+        expr: portcullis_container_memory_working_set_bytes / portcullis_container_memory_limit_bytes > 0.9
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.instance }}'s {{ $labels.service }}.{{ $labels.number }} is near its memory limit"
+          description: Its working set has been above 90 % of its memory limit for 10 minutes. Raise the limit or look at its logs (Hub → Usage).
+
+      - alert: PortcullisDiskNearlyFull
+        expr: portcullis_filesystem_free_bytes / portcullis_filesystem_total_bytes < 0.10
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "The filesystem {{ $labels.dev }} has less than 10 % free"
+          description: Free space or move the data (Hub → Usage → Storage shows what is on it, largest first).
+
+      - alert: PortcullisUsageSamplerStale
+        expr: (time() - portcullis_usage_sampler_last_success_timestamp_seconds > 600) and on() (up{job="hub-usage"} == 1)
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: The Hub's usage sampler has had no good sample for 10 minutes
+          description: The Usage page and these metrics are out of date. Check the Hub's log for usage lines and GET /api/runtime.
+
       # Mail (profile mail, contract §19.8): mailctl's gauges (job mailctl).
       - alert: MailQueueHigh
         expr: portcullis_mail_queue_messages > 100

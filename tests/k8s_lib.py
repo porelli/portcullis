@@ -21,7 +21,9 @@ STORAGE_NS = "portcullis-storage"
 ABSENT = {"socket-proxy-traefik", "socket-proxy-hub", "mail", "mailctl", "mail-resolver", "mail-cert"}
 # Compose networks with no Kubernetes form.
 ABSENT_NETS = {"socket-proxy-traefik", "socket-proxy-hub",
-               "portcullis-mail", "portcullis-mailctl", "portcullis-metrics-mail", "mail-egress"}
+               "portcullis-mail", "portcullis-mailctl", "portcullis-metrics-mail", "mail-egress",
+               # The Hub's usage metrics listener is Docker / Podman only (U20).
+               "portcullis-metrics-hub"}
 # The VPN networks: port-bound rules only (netpol-wg-edge.yaml), K7.
 VPN_NETS = {"portcullis-vpn", "portcullis-vpn-edge", "portcullis-metrics-wg"}
 

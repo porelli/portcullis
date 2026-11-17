@@ -309,3 +309,77 @@ tests:
             exp_annotations:
               summary: "The mail check fcrdns_v4 is failing"
               description: Run ./portcullis mail status, or see the Hub's doctor.
+
+  # Usage (contract §16.2): a container at 95 % of its limit for 10 min
+  # fires, one at 85 % doesn't; a disk at 8 % free for 30 min fires; the
+  # sampler's last success 10 min old while the Hub is scraped fires, a
+  # fresh one doesn't.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_container_memory_working_set_bytes{job="hub-usage",instance="paperless",service="web",number="1"}'
+        values: '95x15'
+      - series: 'portcullis_container_memory_limit_bytes{job="hub-usage",instance="paperless",service="web",number="1"}'
+        values: '100x15'
+      - series: 'portcullis_container_memory_working_set_bytes{job="hub-usage",instance="vikunja",service="api",number="1"}'
+        values: '85x15'
+      - series: 'portcullis_container_memory_limit_bytes{job="hub-usage",instance="vikunja",service="api",number="1"}'
+        values: '100x15'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PortcullisAppMemoryNearLimit
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: PortcullisAppMemoryNearLimit
+        exp_alerts:
+          - exp_labels: {severity: warning, job: hub-usage, instance: paperless, service: web, number: "1"}
+            exp_annotations:
+              summary: "paperless's web.1 is near its memory limit"
+              description: Its working set has been above 90 % of its memory limit for 10 minutes. Raise the limit or look at its logs (Hub → Usage).
+  - interval: 5m
+    input_series:
+      - series: 'portcullis_filesystem_free_bytes{job="hub-usage",instance="hub-metrics:9100",dev="2049"}'
+        values: '8x10'
+      - series: 'portcullis_filesystem_total_bytes{job="hub-usage",instance="hub-metrics:9100",dev="2049"}'
+        values: '100x10'
+      - series: 'portcullis_filesystem_free_bytes{job="hub-usage",instance="hub-metrics:9100",dev="2050"}'
+        values: '30x10'
+      - series: 'portcullis_filesystem_total_bytes{job="hub-usage",instance="hub-metrics:9100",dev="2050"}'
+        values: '100x10'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PortcullisDiskNearlyFull
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: PortcullisDiskNearlyFull
+        exp_alerts:
+          - exp_labels: {severity: warning, job: hub-usage, instance: "hub-metrics:9100", dev: "2049"}
+            exp_annotations:
+              summary: "The filesystem 2049 has less than 10 % free"
+              description: Free space or move the data (Hub → Usage → Storage shows what is on it, largest first).
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_usage_sampler_last_success_timestamp_seconds{job="hub-usage",instance="hub-metrics:9100"}'
+        values: '0x20'
+      - series: 'up{job="hub-usage",instance="hub-metrics:9100"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PortcullisUsageSamplerStale
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: PortcullisUsageSamplerStale
+        exp_alerts:
+          - exp_labels: {severity: warning, job: hub-usage, instance: "hub-metrics:9100"}
+            exp_annotations:
+              summary: The Hub's usage sampler has had no good sample for 10 minutes
+              description: The Usage page and these metrics are out of date. Check the Hub's log for usage lines and GET /api/runtime.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_usage_sampler_last_success_timestamp_seconds{job="hub-usage",instance="hub-metrics:9100"}'
+        values: '0+60x20'
+      - series: 'up{job="hub-usage",instance="hub-metrics:9100"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: PortcullisUsageSamplerStale
+        exp_alerts: []

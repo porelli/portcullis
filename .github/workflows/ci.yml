@@ -395,6 +395,7 @@ jobs:
             docker run --rm -v /tmp/am:/c:ro --entrypoint amtool "$AM" check-config /c/alertmanager.yml
           done
           jq -e '.uid == "portcullis" and (.panels | length) > 0' monitoring/grafana/dashboards/portcullis.json >/dev/null
+          jq -e '.uid == "portcullis-usage" and .title == "Portcullis usage" and (.panels | length) >= 5' monitoring/grafana/dashboards/usage.json >/dev/null
           echo "PASS: prometheus config + rules (+ rule tests), alertmanager receivers, blackbox modules, dashboard"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
