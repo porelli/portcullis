@@ -190,7 +190,10 @@ worker_join() {
   _worker_host_env
   worker_roots_write
   (umask 027 && mkdir -p "$data")
-  chmod 750 "$data"
+  # 0751: the apps' own users traverse to their template files (the
+  # agent's files/ tree, 0755 dirs as the primary's templates/); the agent's
+  # identity, bundles and resolved models stay 0700 inside.
+  chmod 751 "$data"
   ct_own "$CT_UID_AGENT:$CT_UID_HUB" "$data"
   # Images: compose run / up pull the missing ones (worker upgrade pulls).
   if [ "$force" = true ]; then

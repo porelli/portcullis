@@ -501,7 +501,7 @@ for c in "worker status" "worker leave --yes" "worker stop gitea"; do
 done
 
 # test_worker_join_reads_stdin: the code reaches `portcullis-agent join`
-# on stdin only; .env is the worker's; worker-data 0750 10008:10001.
+# on stdin only; .env is the worker's; worker-data 0751 10008:10001.
 WK="$WORK/wk-join"; mkdir -p "$WK/bin" "$WK/root" "$WK/engine" "$WK/srv" "$WK/mnt"
 cat > "$WK/bin/docker" <<'STUB'
 #!/usr/bin/env bash
@@ -534,8 +534,8 @@ expect_eq "worker join: the code is on no argv and in no output" \
 expect_eq "worker join: .env (role, runtime, data, install, roots, engine root, port start), 0600" \
   "$(grep -cxE "PORTCULLIS_ROLE=worker|CONTAINER_RUNTIME=docker|PORTCULLIS_WORKER_DATA=$WK/root/worker-data|PORTCULLIS_WORKER_INSTALL=$WK/root|PORTCULLIS_WORKER_BIND_ROOTS=$WK/srv:$WK/mnt|PORTCULLIS_WORKER_ENGINE_ROOT=$WK/engine|AGENT_UNPRIVILEGED_PORT_START=[0-9]+" "$WK/root/.env"):$(file_mode "$WK/root/.env")" "7:600"
 expect_eq "worker join: no AGENT_SELF_IMAGE_ID / AGENT_CONTAINER_ID written" "$(grep -c 'AGENT_SELF_IMAGE_ID\|AGENT_CONTAINER_ID' "$WK/root/.env" || true)" 0
-expect_eq "worker join: worker-data 0750, chowned to 10008:10001" \
-  "$(file_mode "$WK/root/worker-data"):$(grep -c "src=$WK/root/worker-data,dst=/t/0 .* chown 10008:10001 /t/0" "$WK/log")" "750:1"
+expect_eq "worker join: worker-data 0751 (traversable for the apps), chowned to 10008:10001" \
+  "$(file_mode "$WK/root/worker-data"):$(grep -c "src=$WK/root/worker-data,dst=/t/0 .* chown 10008:10001 /t/0" "$WK/log")" "751:1"
 expect_eq "worker join: the folder roots bound read-only at their paths (generated)" \
   "$(grep -c "{type: bind, source: $WK/srv, target: $WK/srv, read_only: true}\|{type: bind, source: $WK/mnt, target: $WK/mnt, read_only: true}" "$WK/root/docker-compose.worker.roots.yml")" 2
 expect_eq "worker join: compose on the worker files only (never docker-compose.yml)" \
