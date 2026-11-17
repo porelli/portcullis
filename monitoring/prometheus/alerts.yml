@@ -150,8 +150,10 @@ groups:
 
       # Multiple servers (contract §17): link's handshake ages and the worker
       # agents' gauges (job link, labelled server=<id>).
+      # Only servers that enrolled (link.json ready): one added but never
+      # joined isn't down (the Hub's server_enrol op reports it).
       - alert: PortcullisServerDown
-        expr: wg_link_peer_handshake_age_seconds > 300
+        expr: wg_link_peer_handshake_age_seconds > 300 and on(job, instance, server) wg_link_peer_ready == 1
         for: 1m
         labels: {severity: critical}
         annotations:

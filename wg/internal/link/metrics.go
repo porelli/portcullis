@@ -35,6 +35,11 @@ var (
 	rxDesc   = prometheus.NewDesc("wg_link_peer_rx_bytes_total", "Bytes received from the server.", []string{"server"}, nil)
 	txDesc   = prometheus.NewDesc("wg_link_peer_tx_bytes_total", "Bytes sent to the server.", []string{"server"}, nil)
 	openDesc = prometheus.NewDesc("wg_link_open_streams", "Open CONNECT streams.", nil, nil)
+	// readyDesc: the server enrolled (link.json state ready) — 0 while it is
+	// still enrolling. PortcullisServerDown fires only for ready servers: a
+	// server added but never joined isn't down (server_enrol reports it).
+	readyDesc = prometheus.NewDesc("wg_link_peer_ready",
+		"1 when the server is ready in link.json (enrolled), 0 while it is enrolling.", []string{"server"}, nil)
 )
 
 // Collectors are the role's own metrics.
@@ -49,6 +54,7 @@ func (c peerCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- rxDesc
 	ch <- txDesc
 	ch <- openDesc
+	ch <- readyDesc
 }
 
 func (c peerCollector) Collect(ch chan<- prometheus.Metric) {
@@ -62,6 +68,18 @@ func (c peerCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(handshakeDesc, prometheus.GaugeValue, age, p.ID)
 		ch <- prometheus.MustNewConstMetric(rxDesc, prometheus.CounterValue, float64(p.Rx), p.ID)
 		ch <- prometheus.MustNewConstMetric(txDesc, prometheus.CounterValue, float64(p.Tx), p.ID)
+	}
+	c.l.mu.Lock()
+	d := c.l.cur
+	c.l.mu.Unlock()
+	if d != nil {
+		for i := range d.Peers {
+			v := 0.0
+			if d.Peers[i].State == linkdoc.StateReady {
+				v = 1
+			}
+			ch <- prometheus.MustNewConstMetric(readyDesc, prometheus.GaugeValue, v, d.Peers[i].ID)
+		}
 	}
 }
 

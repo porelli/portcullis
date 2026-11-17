@@ -216,13 +216,22 @@ tests:
                 Its devices are denied until the Hub publishes a fresh map (the identity hook fails or the gateway is down). See the instance's VPN tab in the Hub.
 
   # Servers: no handshake for 5 min → PortcullisServerDown after 1m; a
-  # server shaking hands keeps quiet.
+  # server shaking hands keeps quiet, and so does one never enrolled.
   - interval: 1m
     input_series:
       - series: 'wg_link_peer_handshake_age_seconds{job="link",instance="wg-metrics:9100",server="nas"}'
         values: '60 120 180 240 300 360 420 480'
       - series: 'wg_link_peer_handshake_age_seconds{job="link",instance="wg-metrics:9100",server="box"}'
         values: '30x8'
+      # Added, never joined (enrolling, no handshake): not down.
+      - series: 'wg_link_peer_handshake_age_seconds{job="link",instance="wg-metrics:9100",server="new"}'
+        values: '+Inf+0x8'
+      - series: 'wg_link_peer_ready{job="link",instance="wg-metrics:9100",server="new"}'
+        values: '0x8'
+      - series: 'wg_link_peer_ready{job="link",instance="wg-metrics:9100",server="nas"}'
+        values: '1x8'
+      - series: 'wg_link_peer_ready{job="link",instance="wg-metrics:9100",server="box"}'
+        values: '1x8'
     alert_rule_test:
       - eval_time: 5m
         alertname: PortcullisServerDown

@@ -820,7 +820,7 @@ func TestAgentMetricsRelabelled(t *testing.T) {
 		}
 	}
 	all := strings.Join(lines, "\n")
-	for _, want := range []string{"portcullis_agent_up{server=a} 1", "wg_link_agent_scrape_ok{server=a} 1", "wg_link_agent_scrape_ok{server=b} 0", "wg_link_peer_handshake_age_seconds{server=a}"} {
+	for _, want := range []string{"portcullis_agent_up{server=a} 1", "wg_link_agent_scrape_ok{server=a} 1", "wg_link_agent_scrape_ok{server=b} 0", "wg_link_peer_handshake_age_seconds{server=a}", "wg_link_peer_ready{server=a} 1"} {
 		if !strings.Contains(all, want) {
 			t.Fatalf("missing %q in\n%s", want, all)
 		}
