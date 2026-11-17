@@ -84,6 +84,9 @@ from playwright.sync_api import Page, sync_playwright
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_login as base  # noqa: E402  (Authenticator, passkey_flow, shot)
 import e2e_ops  # noqa: E402  (the op record poll, contract §11.7)
+import scenarios  # noqa: E402  (E2E_SCENARIOS: single-scenario reruns)
+
+scenarios.always("ai_on")  # the master switch: every MCP scenario needs it
 
 DOMAIN = os.environ["E2E_DOMAIN"]
 ART = os.environ.get("E2E_ARTIFACTS", "e2e-artifacts")
@@ -127,6 +130,8 @@ SSL = ssl.create_default_context(cafile=CA)
 
 
 def check(name: str, fn) -> None:
+    if scenarios.skip(name):  # E2E_SCENARIOS (tests/e2e/scenarios.py)
+        return
     try:
         fn()
         results.append((name, True, ""))

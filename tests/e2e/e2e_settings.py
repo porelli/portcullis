@@ -97,6 +97,7 @@ from playwright.sync_api import Page, sync_playwright
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_login as base  # noqa: E402  (Authenticator, passkey_flow, shot)
+import scenarios  # noqa: E402  (E2E_SCENARIOS: single-scenario reruns)
 
 DOMAIN = os.environ["E2E_DOMAIN"]
 ART = os.environ.get("E2E_ARTIFACTS", "e2e-artifacts")
@@ -126,6 +127,8 @@ state: dict = {}
 
 
 def check(name: str, fn) -> None:
+    if scenarios.skip(name):  # E2E_SCENARIOS (tests/e2e/scenarios.py)
+        return
     try:
         fn()
         results.append((name, True, ""))

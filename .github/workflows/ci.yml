@@ -30,6 +30,24 @@ on:
         description: "Jobs to run: all, or a comma/space-separated list of unit-tests build-and-test e2e e2e-instances e2e-signin e2e-settings e2e-folders e2e-filesharing e2e-ai e2e-podman e2e-vpn e2e-k3s e2e-mail"
         type: string
         default: all
+      # `-f scenarios="4 members_only_list"`: only those scenarios of the e2e
+      # runners (tests/e2e/*.py check() names; `python3 tests/e2e/scenarios.py
+      # list`) plus their setup and the scenarios they need; empty = all. A
+      # name none of the chosen jobs' runners knows fails `jobs-input`.
+      scenarios:
+        description: "e2e scenarios to run (comma/space list of tests/e2e check names; empty = all)"
+        type: string
+        default: ""
+      # `-f runner=builder`: the jobs run on the self-hosted dev builder
+      # (labels self-hosted, linux, x64, pc-builder; ephemeral, one job per
+      # registration). Only a workflow_dispatch can pick it: push,
+      # pull_request and workflow_call always run on GitHub's runners.
+      # e2e-podman and e2e-k3s never do (they stop Docker / install k3s).
+      runner:
+        description: "Where the jobs run: github (GitHub-hosted) or builder (self-hosted dev builder)"
+        type: choice
+        options: [github, builder]
+        default: github
 
 
 # A newer push to the same ref supersedes the older run (runners are shared
@@ -64,6 +82,9 @@ env:
   # per build, 30+ minutes after e2e-settings' tests had all passed.
   DOCKER_BUILD_SUMMARY: "false"
   DOCKER_BUILD_RECORD_UPLOAD: "false"
+  # workflow_dispatch input `scenarios` for the e2e runners
+  # (tests/e2e/scenarios.py); empty (push, pull_request, workflow_call) = all.
+  E2E_SCENARIOS: ${{ inputs.scenarios }}
   # Pebble (ACME test CA) for the domains service test (also in the CI override).
   PEBBLE_IMG: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
 
@@ -88,7 +109,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: github.event_name == 'workflow_dispatch'
         with:
-          sparse-checkout: .github/workflows/ci.yml
+          sparse-checkout: |
+            .github/workflows/ci.yml
+            .github/ci/
+            tests/e2e/*.py
           sparse-checkout-cone-mode: false
       - name: Check the jobs input
         if: github.event_name == 'workflow_dispatch'
@@ -110,6 +134,14 @@ jobs:
           [ -z "$bad" ] || { echo "::error::jobs: unknown job name(s):$bad (known: $known; or \`all\` alone)"; exit 1; }
           [ -n "$picked" ] || { echo "::error::jobs: no job names given (known: $known; or \`all\` alone)"; exit 1; }
           echo "jobs:$picked"
+      - name: Check the scenarios input
+        if: github.event_name == 'workflow_dispatch' && inputs.scenarios != ''
+        env:
+          JOBS: ${{ inputs.jobs }}
+          SCENARIOS: ${{ inputs.scenarios }}
+        run: |
+          [[ "$SCENARIOS" != *$'\n'* ]] || { echo "::error::scenarios: one line of names separated by commas and/or spaces"; exit 1; }
+          python3 tests/e2e/scenarios.py check --jobs "$JOBS" --scenarios "$SCENARIOS"
 
   unit-tests:
     needs: jobs-input
@@ -118,12 +150,12 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',unit-tests,') || contains(format(' ,{0}, ', inputs.jobs), ',unit-tests ') || contains(format(' ,{0}, ', inputs.jobs), ' unit-tests,') || contains(format(' ,{0}, ', inputs.jobs), ' unit-tests ')
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: shellcheck
-        run: shellcheck -S warning portcullis scripts/lib/*.sh tests/*.sh tests/e2e/*.sh vault/entrypoint.sh .github/automerge/*.sh .github/ci/*.sh
+        run: shellcheck -S warning portcullis scripts/lib/*.sh tests/*.sh tests/e2e/*.sh vault/entrypoint.sh .github/automerge/*.sh .github/ci/*.sh .github/ci/local/*.sh .github/ci/local/runner/*.sh
       - name: ci.yml stays under GitHub's workflow size limit (lint at 450,000 bytes; GitHub refuses 500 KB)
         run: tests/lint_ci_size.sh
       - name: Dependabot auto-merge tests (fake gh + fixtures)
@@ -515,7 +547,7 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',build-and-test,') || contains(format(' ,{0}, ', inputs.jobs), ',build-and-test ') || contains(format(' ,{0}, ', inputs.jobs), ' build-and-test,') || contains(format(' ,{0}, ', inputs.jobs), ' build-and-test ')
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
     timeout-minutes: 20
 
     steps:
@@ -1892,7 +1924,7 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e ')
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
@@ -2184,7 +2216,7 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-instances,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-instances ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-instances,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-instances ')
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
@@ -2510,7 +2542,7 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-signin,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-signin ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-signin,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-signin ')
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
     # 40 (part 3): the impersonation cases add the 2 min 10 s expiry wait.
     timeout-minutes: 40
     env:
@@ -2837,7 +2869,7 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-settings,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-settings ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-settings,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-settings ')
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
       E2E_DOMAIN: portcullis.local
@@ -3219,7 +3251,7 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-folders,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-folders ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-folders,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-folders ')
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
@@ -3522,7 +3554,7 @@ jobs:
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-filesharing,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-filesharing ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-filesharing,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-filesharing ')
     # The smbclient pin below is the 24.04 package.
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
@@ -3835,7 +3867,7 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-mail,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-mail ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-mail,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-mail ')
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
     timeout-minutes: 60
     env:
       E2E_DOMAIN: ci.example.org
@@ -4112,7 +4144,7 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ai,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ai ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ai,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ai ')
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
@@ -5223,7 +5255,7 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-vpn,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-vpn ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-vpn,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-vpn ')
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
     timeout-minutes: 45
     env:
       E2E_DOMAIN: portcullis.local
