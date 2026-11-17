@@ -32,6 +32,7 @@ Anything else fails the step, named.
 from __future__ import annotations
 
 import argparse
+import base64
 import glob
 import hashlib
 import json
@@ -43,7 +44,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -271,8 +274,58 @@ def _contains(hay, needle):
 
 # ── the job ──────────────────────────────────────────────────────────────────
 
+class Masker:
+    """GitHub's ::add-mask:: as the runner does it: the command line is never
+    written, and every later occurrence of the value (and its common
+    encodings: URL-encoded, JSON-escaped, base64; each line of a multi-line
+    value) is written as ***, in the console stream and so in run.log."""
+
+    CMD = re.compile(r"^\s*::add-mask::(.*)$")
+
+    def __init__(self):
+        self.values: set[str] = set()
+        self._re = None
+
+    def add(self, value: str) -> None:
+        for v in [value, *value.splitlines()]:
+            v = v.strip("\r")
+            if len(v.strip()) < 1:
+                continue
+            forms = {v, urllib.parse.quote(v, safe=""), urllib.parse.quote(v), urllib.parse.quote_plus(v),
+                     json.dumps(v)[1:-1]}
+            b = v.encode()
+            forms |= {base64.b64encode(b).decode().rstrip("="), base64.urlsafe_b64encode(b).decode().rstrip("=")}
+            self.values |= {f for f in forms if f}
+        # Longest first: a value inside another is masked with it.
+        self._re = re.compile("|".join(re.escape(x) for x in sorted(self.values, key=len, reverse=True))) if self.values else None
+
+    def line(self, s: str) -> str | None:
+        """One line of output: None for an ::add-mask:: command (recorded),
+        else the line with every masked value as ***."""
+        m = self.CMD.match(s.rstrip("\n"))
+        if m:
+            self.add(m.group(1))
+            return None
+        return self._re.sub("***", s) if self._re else s
+
+
+MASK = Masker()
+
+
 def log(msg: str) -> None:
-    print(msg, flush=True)
+    out = [x for x in (MASK.line(ln) for ln in str(msg).split("\n")) if x is not None]
+    if out or not str(msg):
+        print("\n".join(out), flush=True)
+
+
+def _pump(src, mask: Masker, dst) -> None:
+    """A child's output, line by line, through mask, to dst."""
+    for raw in iter(src.readline, b""):
+        s = mask.line(raw.decode("utf-8", errors="replace"))
+        if s is not None:
+            dst.write(s)
+            dst.flush()
+    src.close()
 
 
 class Cancelled(Exception):
@@ -678,9 +731,16 @@ def _kv_file(p: Path) -> dict:
 
 def _run(argv, cwd, env, limit):
     """Run argv in its own process group; 'timeout' after limit seconds."""
-    p = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True)
+    p = subprocess.Popen(argv, cwd=cwd, env=env, start_new_session=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # Every line through MASK (a daemon thread: a background process the
+    # step started may hold the pipe open past the step's end).
+    pump = threading.Thread(target=_pump, args=(p.stdout, MASK, sys.stdout), daemon=True)
+    pump.start()
     try:
-        return p.wait(timeout=max(1, limit))
+        rc = p.wait(timeout=max(1, limit))
+        pump.join(timeout=5)
+        return rc
     except subprocess.TimeoutExpired:
         os.killpg(p.pid, signal.SIGTERM)
         try:

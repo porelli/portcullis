@@ -312,6 +312,9 @@ jobs:
       # closure, the per-job check (tests/e2e/scenarios.py; stdlib only).
       - name: e2e scenario filter unit tests (scenarios.py)
         run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_e2e_scenarios.py
+      # The local runner's ::add-mask:: (never written, values *** after).
+      - name: local CI runner masking unit tests (steps.py)
+        run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_local_steps.py
       - name: Tool versions (the compose / jq checks depend on them)
         run: docker compose version && jq --version && yq --version
       - name: compose files are valid with a generated .env
