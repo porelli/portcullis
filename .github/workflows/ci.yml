@@ -2029,7 +2029,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
@@ -2323,7 +2324,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-instances,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-instances ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-instances,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-instances ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
@@ -2668,7 +2670,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-signin,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-signin ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-signin,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-signin ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     # 40 (part 3): the impersonation cases add the 2 min 10 s expiry wait.
     timeout-minutes: 40
     env:
@@ -2995,7 +2998,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-settings,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-settings ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-settings,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-settings ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     timeout-minutes: 30
     env:
       E2E_DOMAIN: portcullis.local
@@ -3993,7 +3997,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-mail,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-mail ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-mail,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-mail ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     timeout-minutes: 60
     env:
       E2E_DOMAIN: ci.example.org
@@ -4270,7 +4275,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ai,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ai ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ai,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ai ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
@@ -5381,7 +5387,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ssh,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ssh ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ssh,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ssh ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     timeout-minutes: 45
     env:
       E2E_DOMAIN: portcullis.local
@@ -5545,7 +5552,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-vpn,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-vpn ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-vpn,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-vpn ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     timeout-minutes: 45
     env:
       E2E_DOMAIN: portcullis.local
