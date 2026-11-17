@@ -27,6 +27,7 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
       systemd systemd-sysv dbus sudo ca-certificates curl wget gnupg git jq python3 python3-venv python3-pip \
       python3-yaml iproute2 iptables kmod procps acl attr file openssl rsync unzip xz-utils zstd \
       dnsutils netcat-openbsd libnss3-tools gcc libc6-dev make sqlite3 tzdata lsb-release less \
+      bsdextrautils bc xxd gettext-base zip bzip2 lsof tree time net-tools parallel patch \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
     && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable" > /etc/apt/sources.list.d/docker.list \
