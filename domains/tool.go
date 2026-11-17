@@ -70,6 +70,14 @@ type toolInput struct {
 	// MailTLSA: the SPKIs `domains mail-tlsa status` says to publish (1–2,
 	// 64 lowercase hex), with mail only.
 	MailTLSA []string `json:"mail_tlsa,omitempty"`
+	// MailRules: the shared rules' inputs for the main domain's provider
+	// set (the Hub's dns-main answer): required with a non-empty mail set,
+	// so core judges it too (M6, spec §10.2).
+	MailRules *struct {
+		RelayInclude string `json:"relay_include"`
+		DMARCFloor   string `json:"dmarc_floor"`
+		Draining     bool   `json:"draining"`
+	} `json:"mail_rules,omitempty"`
 	// MailHostname: MAIL_HOSTNAME, required with mail; alone (mail on, no
 	// records yet) it makes the address set own the host's A / AAAA:
 	// its HELO SPF and TLSA are the set's, removed when the set is empty or
@@ -420,7 +428,7 @@ func readToolInput(r io.Reader) (toolInput, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&in); err != nil {
 		// Never quote the input (it holds the credentials).
-		return in, errors.New("stdin must be one JSON object with the documented keys (name, provider, credentials, ipv4, ipv6, ca_server, caa, nomail, sets, mail_from, mail, mail_tlsa, mail_hostname)")
+		return in, errors.New("stdin must be one JSON object with the documented keys (name, provider, credentials, ipv4, ipv6, ca_server, caa, nomail, sets, mail_from, mail, mail_tlsa, mail_rules, mail_hostname)")
 	}
 	if dec.Decode(&struct{}{}) != io.EOF {
 		return in, errors.New("stdin must hold exactly one JSON object")
@@ -483,6 +491,19 @@ func (in toolInput) spec() (dnsplan.Spec, error) {
 					return dnsplan.Spec{}, fmt.Errorf("mail: MX %s targets %q, not mail_hostname %s", r.Name, r.Value, host)
 				}
 			}
+		}
+		if len(*in.Mail) > 0 {
+			r := in.MailRules
+			if r == nil || (r.DMARCFloor != "none" && r.DMARCFloor != "quarantine" && r.DMARCFloor != "reject") {
+				return dnsplan.Spec{}, errors.New("mail needs mail_rules {relay_include, dmarc_floor, draining} (the Hub's dns-main answer)")
+			}
+			// The main domain always has core's *.<d>: no mail CNAMEs.
+			rc := dnsplan.RuleContext{Domain: name, MailHostname: host, RelayInclude: r.RelayInclude, DMARCFloor: r.DMARCFloor, Wildcard: true, Draining: r.Draining}
+			if err := dnsplan.ValidateMailSet(rc, *in.Mail); err != nil {
+				return dnsplan.Spec{}, err
+			}
+		} else if in.MailRules != nil {
+			return dnsplan.Spec{}, errors.New("mail_rules needs a non-empty mail set")
 		}
 		if len(in.MailTLSA) > 2 {
 			return dnsplan.Spec{}, errors.New("mail_tlsa holds at most two SPKIs")

@@ -250,7 +250,7 @@ func TestValidateMailRefuses(t *testing.T) {
 		"201":       {many, "more than 200 records"},
 		"caa at e":  {with(MailRecord{Name: e, Type: "CAA", TTL: 300, Value: `0 issue "letsencrypt.org"`}), "never holds CAA"},
 		"caa at h":  {with(MailRecord{Name: "mail." + e, Type: "CAA", TTL: 300, Value: `0 issue "letsencrypt.org"`}), "never holds CAA"},
-		"ttl":       {with(MailRecord{Name: "_smtp._tls." + e, Type: "TXT", TTL: 30, Value: "v=TLSRPTv1; rua=mailto:x@" + e}), "TTL 30"},
+		"ttl":       {with(MailRecord{Name: "_smtp._tls." + e, Type: "TXT", TTL: 0, Value: "v=TLSRPTv1; rua=mailto:x@" + e}), "TTL 0"},
 		"a":         {with(MailRecord{Name: "mail." + e, Type: "A", TTL: 300, Value: "203.0.113.10"}), "type A"},
 		"txt at e":  {with(MailRecord{Name: e, Type: "TXT", TTL: 3600, Value: "google-site-verification=x"}), "only an SPF"},
 		"quote":     {with(MailRecord{Name: "_dmarc." + e, Type: "TXT", TTL: 3600, Value: `v=DMARC1; "p=none"`}), "quote"},

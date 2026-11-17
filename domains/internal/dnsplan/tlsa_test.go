@@ -16,7 +16,7 @@ var (
 // switch due after 2×TTL + 1 day → mail-cert switched → the old key kept
 // 2×TTL → dropped.
 func TestTLSARolloverStates(t *testing.T) {
-	s, phase, due := TLSAStep(nil, spkiA, "", tT0)
+	s, phase, due := TLSAStep(nil, spkiA, "", false, tT0)
 	if s.Current != spkiA || s.Next != nil || phase != TLSASteady || due != "" || strings.Join(s.Publish(), ",") != spkiA {
 		t.Fatalf("fresh %+v %s %s", s, phase, due)
 	}
@@ -30,10 +30,28 @@ func TestTLSARolloverStates(t *testing.T) {
 	if strings.Join(s.Publish(), ",") != spkiA+","+spkiB {
 		t.Fatalf("both %v", s.Publish())
 	}
-	if _, phase, due = TLSAStep(&s, spkiA, spkiB, tT0.Add(TLSASwitchAfter-time.Second)); phase != TLSARollover || due != "" {
+	if _, phase, due = TLSAStep(&s, spkiA, spkiB, true, tT0.Add(TLSASwitchAfter-time.Second)); phase != TLSARollover || due != "" {
 		t.Fatalf("early %s %s", phase, due)
 	}
-	if _, phase, due = TLSAStep(&s, spkiA, spkiB, tT0.Add(TLSASwitchAfter)); phase != TLSARollover || due != TLSADueSwitch {
+	// R-H4: time alone never makes the switch due: the next key's TLSA
+	// must be seen live, and for ≥ TTL.
+	if _, phase, due = TLSAStep(&s, spkiA, spkiB, false, tT0.Add(TLSASwitchAfter+48*time.Hour)); phase != TLSARollover || due != "" {
+		t.Fatalf("due without the TLSA live %s %s", phase, due)
+	}
+	seen := tT0.Add(TLSASwitchAfter)
+	s, _, due = TLSAStep(&s, spkiA, spkiB, true, seen)
+	if due != "" || s.NextSeenAt == nil || !s.NextSeenAt.Equal(seen) {
+		t.Fatalf("first seen: %s %+v", due, s.NextSeenAt)
+	}
+	if _, _, due = TLSAStep(&s, spkiA, spkiB, true, seen.Add(TLSATTL*time.Second-time.Second)); due != "" {
+		t.Fatal("due before the TLSA was live a TTL")
+	}
+	// Seen gone again: the clock restarts.
+	gone, _, _ := TLSAStep(&s, spkiA, spkiB, false, seen.Add(30*time.Minute))
+	if gone.NextSeenAt != nil {
+		t.Fatal("a vanished TLSA kept its seen time")
+	}
+	if _, phase, due = TLSAStep(&s, spkiA, spkiB, true, seen.Add(TLSATTL*time.Second)); phase != TLSARollover || due != TLSADueSwitch {
 		t.Fatalf("due %s %s", phase, due)
 	}
 	if TLSASwitchAfter != 7200*time.Second+86400*time.Second || TLSADropAfter != 7200*time.Second {
@@ -41,7 +59,7 @@ func TestTLSARolloverStates(t *testing.T) {
 	}
 	// mail-cert --switch-key: B is the current key, A retiring.
 	sw := tT0.Add(TLSASwitchAfter + time.Hour)
-	s2, phase, due := TLSAStep(&s, spkiB, "", sw)
+	s2, phase, due := TLSAStep(&s, spkiB, "", false, sw)
 	if s2.Current != spkiB || s2.Next == nil || *s2.Next != spkiA || !s2.BothSince.Equal(sw) || phase != TLSARetiring || due != "" {
 		t.Fatalf("switched %+v %s %s", s2, phase, due)
 	}
@@ -54,7 +72,7 @@ func TestTLSARolloverStates(t *testing.T) {
 	if _, err := TLSADrop(s2, phase, due); err == nil {
 		t.Fatal("dropped early")
 	}
-	s3, phase, due := TLSAStep(&s2, spkiB, "", sw.Add(TLSADropAfter))
+	s3, phase, due := TLSAStep(&s2, spkiB, "", false, sw.Add(TLSADropAfter))
 	if due != TLSADueDrop {
 		t.Fatalf("drop not due %s %s", phase, due)
 	}
@@ -63,14 +81,14 @@ func TestTLSARolloverStates(t *testing.T) {
 		t.Fatalf("dropped %+v %v", s4, err)
 	}
 	// An unknown current key (nobody recorded it): it alone, fail closed.
-	s5, phase, _ := TLSAStep(&s, strings.Repeat("c", 64), "", sw)
+	s5, phase, _ := TLSAStep(&s, strings.Repeat("c", 64), "", false, sw)
 	if s5.Next != nil || phase != TLSASteady || s5.Current != strings.Repeat("c", 64) {
 		t.Fatalf("unknown key %+v", s5)
 	}
 }
 
 func TestTLSAJSONStrict(t *testing.T) {
-	ok := `{"version":1,"current":"` + spkiA + `","next":"` + spkiB + `","both_since":"2026-11-17T10:00:00Z"}`
+	ok := `{"version":1,"current":"` + spkiA + `","next":"` + spkiB + `","both_since":"2026-11-17T10:00:00Z","next_seen_at":null}`
 	s, err := ParseTLSAState([]byte(ok))
 	if err != nil || *s.Next != spkiB {
 		t.Fatalf("%v", err)
@@ -78,11 +96,13 @@ func TestTLSAJSONStrict(t *testing.T) {
 	if s2, err := ParseTLSAState(s.Marshal()); err != nil || s2.Current != spkiA || !s2.BothSince.Equal(*s.BothSince) {
 		t.Fatalf("round trip %v", err)
 	}
-	if _, err := ParseTLSAState([]byte(`{"version":1,"current":"` + spkiA + `","next":null,"both_since":null}`)); err != nil {
+	if _, err := ParseTLSAState([]byte(`{"version":1,"current":"` + spkiA + `","next":null,"both_since":null,"next_seen_at":null}`)); err != nil {
 		t.Fatalf("steady: %v", err)
 	}
 	for _, bad := range []string{
 		``, `[]`, `{"version":1}`,
+		`{"version":1,"current":"` + spkiA + `","next":null,"both_since":null}`,
+		`{"version":1,"current":"` + spkiA + `","next":null,"both_since":null,"next_seen_at":"2026-11-17T10:00:00Z"}`,
 		`{"version":2,"current":"` + spkiA + `","next":null,"both_since":null}`,
 		`{"version":1,"current":"` + strings.ToUpper(spkiA) + `","next":null,"both_since":null}`,
 		`{"version":1,"current":"` + spkiA + `","next":"` + spkiB + `","both_since":null}`,

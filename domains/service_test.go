@@ -2126,7 +2126,7 @@ func mailSetJSON(recs []dnsplan.MailRecord, floor string) string {
 }
 
 func mailSetJSONHost(recs []dnsplan.MailRecord, floor, host string) string {
-	b, _ := json.Marshal(map[string]any{"records": recs, "mail_hostname": host, "relay_include": "", "dmarc_floor": floor, "wildcard": true})
+	b, _ := json.Marshal(map[string]any{"records": recs, "mail_hostname": host, "relay_include": "", "dmarc_floor": floor, "wildcard": true, "draining": false})
 	return string(b)
 }
 
@@ -2152,10 +2152,22 @@ func TestSetsMailRefused400(t *testing.T) {
 		}
 	}
 	ok := []dnsplan.MailRecord{{Name: name, Type: "MX", TTL: 3600, Value: "10 " + h}}
+	// R-H3: a floor above none needs its _dmarc; draining needs none.
+	if code, resp := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetJSON(ok, "quarantine"), true); code != 400 || !strings.Contains(resp, "required while the DMARC floor is quarantine") {
+		t.Errorf("no _dmarc under a floor: %d %s", code, resp)
+	}
+	sts := []dnsplan.MailRecord{{Name: "_mta-sts." + name, Type: "TXT", TTL: 3600, Value: "v=STSv1; id=abc1"}}
+	drain := `{"records":` + mustJSON(sts) + `,"mail_hostname":"mail.` + testMain + `","relay_include":"","dmarc_floor":"reject","wildcard":true,"draining":true}`
+	if code, resp := e.do("PUT", "/domains/"+name+"/sets/mail", drain, true); code != 202 {
+		t.Errorf("a draining set: %d %s", code, resp)
+	}
+	e.do("DELETE", "/domains/"+name+"/sets/mail", "", true)
+	ok = append(ok, dnsplan.MailRecord{Name: "_dmarc." + name, Type: "TXT", TTL: 3600, Value: "v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@" + name})
 	for _, body := range []string{
 		`{"records":` + mustJSON(ok) + `}`,
-		`{"records":` + mustJSON(ok) + `,"mail_hostname":"mail.other.example","relay_include":"","dmarc_floor":"none","wildcard":true}`,
-		`{"records":` + mustJSON(ok) + `,"mail_hostname":"mail.` + testMain + `","relay_include":"","dmarc_floor":"strict","wildcard":true}`,
+		`{"records":` + mustJSON(ok) + `,"mail_hostname":"mail.` + testMain + `","relay_include":"","dmarc_floor":"none","wildcard":true}`,
+		`{"records":` + mustJSON(ok) + `,"mail_hostname":"mail.other.example","relay_include":"","dmarc_floor":"none","wildcard":true,"draining":false}`,
+		`{"records":` + mustJSON(ok) + `,"mail_hostname":"mail.` + testMain + `","relay_include":"","dmarc_floor":"strict","wildcard":true,"draining":false}`,
 	} {
 		if code, resp := e.do("PUT", "/domains/"+name+"/sets/mail", body, true); code != 400 {
 			t.Errorf("%.120s = %d %s", body, code, resp)

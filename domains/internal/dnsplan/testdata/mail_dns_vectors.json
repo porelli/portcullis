@@ -3,12 +3,16 @@
     "domain": "example.com",
     "mail_hostname": "mail.example.com",
     "relay_include": "_spf.relay.example.net",
-    "dmarc_floor": "reject",
-    "wildcard": false
+    "dmarc_floor": "none",
+    "wildcard": false,
+    "draining": false
   },
   "cases": [
     {
       "name": "the stalwart set ok",
+      "context": {
+        "dmarc_floor": "reject"
+      },
       "records": [
         {
           "name": "example.com",
@@ -120,12 +124,61 @@
     },
     {
       "name": "dmarc at the floor ok",
+      "context": {
+        "dmarc_floor": "reject"
+      },
       "records": [
         {
           "name": "_dmarc.example.com",
           "type": "TXT",
           "ttl": 3600,
           "value": "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "dmarc pct=100 and sp=reject ok",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; sp=reject; pct=100; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "dmarc with every known tag ok",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; sp=reject; np=reject; adkim=s; aspf=s; fo=1; rf=afrf; ri=86400; pct=100; t=n; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "a draining set without dmarc ok",
+      "context": {
+        "dmarc_floor": "reject",
+        "draining": true
+      },
+      "records": [
+        {
+          "name": "_mta-sts.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=STSv1; id=9c1f4b7e2a6d8c0e1f3aT1763200000"
         }
       ],
       "want_error": ""
@@ -756,6 +809,9 @@
     },
     {
       "name": "dmarc p=none under floor reject refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
       "records": [
         {
           "name": "_dmarc.example.com",
@@ -765,6 +821,200 @@
         }
       ],
       "want_error": "mail set: _dmarc.example.com TXT: p=none is below the floor reject"
+    },
+    {
+      "name": "dmarc sp=none under floor reject refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; sp=none; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: sp=none is below the floor reject"
+    },
+    {
+      "name": "dmarc tag p twice refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=none; p=reject; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: tag p is given twice"
+    },
+    {
+      "name": "dmarc pct=0 refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; pct=0; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: pct must be 100 or absent"
+    },
+    {
+      "name": "dmarc t=y refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; t=y; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: t=y is not allowed"
+    },
+    {
+      "name": "two dmarc records refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com"
+        },
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=none; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: more than one DMARC record"
+    },
+    {
+      "name": "dmarc np=none under floor reject refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; np=none; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: np=none is below the floor reject"
+    },
+    {
+      "name": "dmarc unknown tag refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; psd=y; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: tag psd is not allowed"
+    },
+    {
+      "name": "dmarc P=none;p=reject refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; P=none; p=reject; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: tag P must be lowercase"
+    },
+    {
+      "name": "dmarc uppercase tag refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; ADKIM=s; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: tag ADKIM must be lowercase"
+    },
+    {
+      "name": "a draining set with an MX refused",
+      "context": {
+        "dmarc_floor": "reject",
+        "draining": true
+      },
+      "records": [
+        {
+          "name": "_mta-sts.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=STSv1; id=9c1f4b7e2a6d8c0e1f3aT1763200000"
+        },
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.example.com."
+        }
+      ],
+      "want_error": "mail set: example.com MX: a draining set holds only _mta-sts.example.com"
+    },
+    {
+      "name": "a draining set with an SPF refused",
+      "context": {
+        "dmarc_floor": "reject",
+        "draining": true
+      },
+      "records": [
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx -all"
+        }
+      ],
+      "want_error": "mail set: example.com TXT: a draining set holds only _mta-sts.example.com"
+    },
+    {
+      "name": "dmarc missing under floor reject refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.example.com."
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: required while the DMARC floor is reject"
     },
     {
       "name": "dmarc rua off-domain refused",

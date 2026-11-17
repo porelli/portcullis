@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -14,7 +15,7 @@ import (
 func tlsaRun(t *testing.T, dir, cmd string) (int, mailTLSAOutput) {
 	t.Helper()
 	var out, errb bytes.Buffer
-	code := runMailTLSA([]string{cmd}, toolEnv{stdout: &out, stderr: &errb, acmeDir: dir})
+	code := runMailTLSA([]string{cmd, "--hostname", "mail.example.com"}, toolEnv{stdout: &out, stderr: &errb, acmeDir: dir})
 	var o mailTLSAOutput
 	if code == exitOK {
 		if err := json.Unmarshal(out.Bytes(), &o); err != nil {
@@ -31,7 +32,9 @@ func TestMailTLSACommand(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 11, 17, 10, 0, 0, 0, time.UTC)
 	tlsaNow = func() time.Time { return now }
-	t.Cleanup(func() { tlsaNow = time.Now })
+	live := false
+	tlsaLive = func(_ context.Context, host, spki string) bool { return live && host == "mail.example.com" }
+	t.Cleanup(func() { tlsaNow = time.Now; tlsaLive = func(context.Context, string, string) bool { return false } })
 	if code, _ := tlsaRun(t, dir, "status"); code != exitProblem {
 		t.Fatal("status without a key")
 	}
@@ -54,6 +57,15 @@ func TestMailTLSACommand(t *testing.T) {
 		t.Fatal("switch before 2×TTL + 1 day")
 	}
 	now = now.Add(dnsplan.TLSASwitchAfter)
+	// R-H4: the time is up but the next key's TLSA isn't served: no switch.
+	if code, _ := tlsaRun(t, dir, "switch"); code != exitProblem {
+		t.Fatal("switch with the next TLSA not published")
+	}
+	live = true
+	if code, o = tlsaRun(t, dir, "status"); code != exitOK || !o.NextLive || o.Due != nil {
+		t.Fatalf("first seen %d %+v", code, o)
+	}
+	now = now.Add(dnsplan.TLSATTL * time.Second)
 	if code, o = tlsaRun(t, dir, "switch"); code != exitOK || o.Due == nil || *o.Due != dnsplan.TLSADueSwitch {
 		t.Fatalf("switch due %d %+v", code, o)
 	}
@@ -76,5 +88,9 @@ func TestMailTLSACommand(t *testing.T) {
 	}
 	if code, _ := tlsaRun(t, dir, "rotate"); code != exitUsage {
 		t.Fatal("unknown subcommand")
+	}
+	var out, errb bytes.Buffer
+	if code := runMailTLSA([]string{"status"}, toolEnv{stdout: &out, stderr: &errb, acmeDir: dir}); code != exitUsage {
+		t.Fatal("status without --hostname")
 	}
 }

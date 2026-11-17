@@ -31,12 +31,13 @@ func ruleContext(t *testing.T, base, over map[string]any) RuleContext {
 		RelayInclude string `json:"relay_include"`
 		DMARCFloor   string `json:"dmarc_floor"`
 		Wildcard     bool   `json:"wildcard"`
+		Draining     bool   `json:"draining"`
 	}
 	b, _ := json.Marshal(m)
 	if err := json.Unmarshal(b, &c); err != nil {
 		t.Fatal(err)
 	}
-	return RuleContext{Domain: c.Domain, MailHostname: c.MailHostname, RelayInclude: c.RelayInclude, DMARCFloor: c.DMARCFloor, Wildcard: c.Wildcard}
+	return RuleContext{Domain: c.Domain, MailHostname: c.MailHostname, RelayInclude: c.RelayInclude, DMARCFloor: c.DMARCFloor, Wildcard: c.Wildcard, Draining: c.Draining}
 }
 
 // The shared vectors (a byte copy of the Hub's; CI compares them): every
@@ -59,5 +60,21 @@ func TestMailRuleVectors(t *testing.T) {
 		if got != c.WantError {
 			t.Errorf("%s: got %q, want %q", c.Name, got, c.WantError)
 		}
+	}
+}
+
+// M5: a set the shared rules accept (any one-label selector, any TTL ≥ 1)
+// passes the structural check too: the Hub and core agree.
+func TestSharedRulesAndStructureAgree(t *testing.T) {
+	c := RuleContext{Domain: "example.com", MailHostname: "mail.example.com", DMARCFloor: "none"}
+	recs := []MailRecord{
+		{Name: "default._domainkey.example.com", Type: "TXT", TTL: 3600, Value: "v=DKIM1; k=rsa; p=AAAA"},
+		{Name: "example.com", Type: "MX", TTL: 30, Value: "10 mail.example.com."},
+	}
+	if err := ValidateMailSet(c, recs); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateMail("example.com", recs); err != nil {
+		t.Fatalf("structural check refuses what the rules accept: %v", err)
 	}
 }

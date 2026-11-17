@@ -1463,7 +1463,7 @@ func mergeRecords(old, add []RecordRef) []RecordRef {
 const mailBodyMax = 256 << 10
 
 // handleMailPut is PUT /domains/{name}/sets/mail {"records": [...],
-// "mail_hostname", "relay_include", "dmarc_floor", "wildcard"} (contract
+// "mail_hostname", "relay_include", "dmarc_floor", "wildcard", "draining"} (contract
 // §12.2, §19.7): the set is judged by the shared mail rules
 // (dnsplan.ValidateMailSet, 400 with the rule's text), then the records
 // become the domain's MailWanted, mail goes into its Sets and nomail out
@@ -1479,12 +1479,13 @@ func (s *Service) handleMailPut(w http.ResponseWriter, r *http.Request) {
 		RelayInclude *string              `json:"relay_include"`
 		DMARCFloor   *string              `json:"dmarc_floor"`
 		Wildcard     *bool                `json:"wildcard"`
+		Draining     *bool                `json:"draining"`
 	}
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, mailBodyMax))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&b); err != nil || dec.Decode(&struct{}{}) != io.EOF || b.Records == nil ||
-		b.MailHostname == nil || b.RelayInclude == nil || b.DMARCFloor == nil || b.Wildcard == nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf(`body must be {"records": [{"name", "type", "ttl", "value"}, ...], "mail_hostname", "relay_include", "dmarc_floor", "wildcard"} (at most %d KiB)`, mailBodyMax>>10))
+		b.MailHostname == nil || b.RelayInclude == nil || b.DMARCFloor == nil || b.Wildcard == nil || b.Draining == nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf(`body must be {"records": [{"name", "type", "ttl", "value"}, ...], "mail_hostname", "relay_include", "dmarc_floor", "wildcard", "draining"} (at most %d KiB)`, mailBodyMax>>10))
 		return
 	}
 	if len(b.Records) == 0 {
@@ -1506,7 +1507,7 @@ func (s *Service) handleMailPut(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "dmarc_floor must be none, quarantine or reject")
 		return
 	}
-	rc := dnsplan.RuleContext{Domain: name, MailHostname: host, RelayInclude: *b.RelayInclude, DMARCFloor: *b.DMARCFloor, Wildcard: *b.Wildcard}
+	rc := dnsplan.RuleContext{Domain: name, MailHostname: host, RelayInclude: *b.RelayInclude, DMARCFloor: *b.DMARCFloor, Wildcard: *b.Wildcard, Draining: *b.Draining}
 	if err := dnsplan.ValidateMailSet(rc, b.Records); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return

@@ -27,6 +27,9 @@ type RuleContext struct {
 	RelayInclude string // the relay's SPF include ("" = none)
 	DMARCFloor   string // none | quarantine | reject
 	Wildcard     bool   // the domain's plan has a *.<e> address record (no CNAMEs then)
+	// Draining: the domain is draining (its set holds only _mta-sts), so
+	// no _dmarc is required (Ruling R-H3).
+	Draining bool
 }
 
 var (
@@ -51,7 +54,7 @@ var srvNull = []string{"_imap._tcp", "_pop3._tcp", "_pop3s._tcp"}
 func ValidateMailSet(c RuleContext, rs []MailRecord) error {
 	e := bare(c.Domain)
 	h := bare(c.MailHostname)
-	spf := 0
+	spf, dmarcs := 0, 0
 	for _, r := range rs {
 		n, t := bare(r.Name), strings.ToUpper(r.Type)
 		refuse := func(why string) error { return fmt.Errorf("mail set: %s %s: %s", n, t, why) }
@@ -62,6 +65,10 @@ func ValidateMailSet(c RuleContext, rs []MailRecord) error {
 			return refuse(t + " records are not allowed")
 		}
 		rel := strings.TrimSuffix(strings.TrimSuffix(n, e), ".")
+		// A draining domain publishes only its _mta-sts (mode none).
+		if c.Draining && (rel != "_mta-sts" || t != "TXT") {
+			return refuse("a draining set holds only _mta-sts." + e)
+		}
 		v := strings.TrimSpace(r.Value)
 		switch {
 		case n == e:
@@ -103,6 +110,10 @@ func ValidateMailSet(c RuleContext, rs []MailRecord) error {
 		case rel == "_dmarc":
 			if t != "TXT" {
 				return refuse("only TXT here")
+			}
+			// RFC 7489 §6.6.3: two records = no policy at all.
+			if dmarcs++; dmarcs > 1 {
+				return refuse("more than one DMARC record")
 			}
 			if err := dmarcRule(v, e, c.DMARCFloor); err != "" {
 				return refuse(err)
@@ -151,24 +162,51 @@ func ValidateMailSet(c RuleContext, rs []MailRecord) error {
 			return refuse("not a mail record name")
 		}
 	}
+	// Ruling R-H3: a floor above none needs its record (deleting it would
+	// lower the policy to none); a draining set holds only _mta-sts.
+	if dmarcs == 0 && !c.Draining && (c.DMARCFloor == "quarantine" || c.DMARCFloor == "reject") {
+		return fmt.Errorf("mail set: _dmarc.%s TXT: required while the DMARC floor is %s", e, c.DMARCFloor)
+	}
 	return nil
 }
 
-// dmarcRule: "" or the why. p= at or above the floor, rua only mailto:
-// addresses on e, no ruf.
+// dmarcRule: "" or the why (Ruling R-H3). After the v=DMARC1; prefix,
+// each tag in order: lowercase, given twice (v counts), the allowlist,
+// then its own rule (ruf, t=y, pct other than 100, rua off the domain);
+// then p (required), sp and np (when given), each at or above the floor.
 func dmarcRule(v, e, floor string) string {
 	if !strings.HasPrefix(v, "v=DMARC1;") {
 		return "must start with v=DMARC1;"
 	}
-	p := ""
+	seen := map[string]bool{"v": true}
+	p, sp, np, hasSP, hasNP := "", "", "", false, false
 	for _, tag := range strings.Split(v, ";")[1:] {
+		if strings.TrimSpace(tag) == "" {
+			continue
+		}
 		k, val, _ := strings.Cut(strings.TrimSpace(tag), "=")
-		k, val = strings.ToLower(strings.TrimSpace(k)), strings.TrimSpace(val)
+		k, val = strings.TrimSpace(k), strings.TrimSpace(val)
+		if k != strings.ToLower(k) {
+			return "tag " + k + " must be lowercase"
+		}
+		if seen[k] {
+			return "tag " + k + " is given twice"
+		}
+		seen[k] = true
+		if !dmarcTags[k] {
+			return "tag " + k + " is not allowed"
+		}
 		switch k {
-		case "p":
-			p = strings.ToLower(val)
 		case "ruf":
 			return "ruf is not allowed"
+		case "t":
+			if strings.EqualFold(val, "y") {
+				return "t=y is not allowed"
+			}
+		case "pct":
+			if val != "100" {
+				return "pct must be 100 or absent"
+			}
 		case "rua":
 			for _, u := range strings.Split(val, ",") {
 				u = strings.TrimSpace(u)
@@ -177,17 +215,46 @@ func dmarcRule(v, e, floor string) string {
 					return "rua " + u + " is not on " + e
 				}
 			}
+		case "p":
+			p = strings.ToLower(val)
+		case "sp":
+			sp, hasSP = strings.ToLower(val), true
+		case "np":
+			np, hasNP = strings.ToLower(val), true
 		}
 	}
+	rf, hasFloor := dmarcRank[floor]
 	rp, ok := dmarcRank[p]
 	if !ok {
 		return "must carry p=none, quarantine or reject"
 	}
-	if rf, ok := dmarcRank[floor]; ok && rp < rf {
+	if hasFloor && rp < rf {
 		return "p=" + p + " is below the floor " + floor
+	}
+	if hasSP {
+		rs, ok := dmarcRank[sp]
+		if !ok {
+			return "must carry sp=none, quarantine or reject"
+		}
+		if hasFloor && rs < rf {
+			return "sp=" + sp + " is below the floor " + floor
+		}
+	}
+	if hasNP {
+		rn, ok := dmarcRank[np]
+		if !ok {
+			return "must carry np=none, quarantine or reject"
+		}
+		if hasFloor && rn < rf {
+			return "np=" + np + " is below the floor " + floor
+		}
 	}
 	return ""
 }
+
+// dmarcTags: the tags a DMARC record may carry (RFC 7489 + np).
+var dmarcTags = map[string]bool{"v": true, "p": true, "sp": true, "np": true, "rua": true, "ruf": true,
+	"adkim": true, "aspf": true, "fo": true, "rf": true, "ri": true, "pct": true, "t": true}
 
 // onDomain: a is one address whose domain is exactly e.
 func onDomain(a, e string) bool {

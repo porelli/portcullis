@@ -484,6 +484,7 @@ func TestToolApplyMainMail(t *testing.T) {
 		m["sets"] = []string{"mail"}
 		m["mail"] = mail
 		m["mail_tlsa"] = []string{spki}
+		m["mail_rules"] = map[string]any{"relay_include": "", "dmarc_floor": "none", "draining": false}
 		m["mail_hostname"] = h
 		m["nomail"] = true
 	})
@@ -574,7 +575,6 @@ func TestToolApplyMainMail(t *testing.T) {
 		}
 	}
 	// Over 64 KiB is accepted with mail (up to 256 KiB), refused without.
-	_ = spki
 	pad := strings.Repeat("x", 70<<10)
 	if code, _, errs := f.run([]string{"plan"}, toolJSON(func(m map[string]any) { m["mail_from"] = pad })); code != exitUsage || !strings.Contains(errs, "65536") {
 		t.Fatalf("70 KiB without mail = %d %s", code, errs)
@@ -595,6 +595,7 @@ func TestMainSetMergesProviderRecords(t *testing.T) {
 			m["sets"] = []string{"mail"}
 			m["mail"] = recs
 			m["mail_tlsa"] = tlsa
+			m["mail_rules"] = map[string]any{"relay_include": "", "dmarc_floor": "none", "draining": false}
 			m["mail_hostname"] = h
 		}))
 		return code, errs
@@ -635,5 +636,39 @@ func TestMainSetMergesProviderRecords(t *testing.T) {
 	}
 	if has("_25._tcp."+h, "TLSA", "3 1 1 "+spki) || !has(h, "TXT", "v=spf1 a -all") {
 		t.Fatalf("insecure: %v %v", f.zone.Records("_25._tcp."+h), f.zone.Records(h))
+	}
+}
+
+// M6: the main domain's provider set is judged by the shared rules in
+// core too (the Hub's rule inputs on stdin); without them, refused.
+func TestMainSetSharedRules(t *testing.T) {
+	f := newToolFixture(t)
+	const d, h = "portcullis.example.test", "mail.portcullis.example.test"
+	mx := dnsplan.MailRecord{Name: d, Type: "MX", TTL: 3600, Value: "10 " + h + "."}
+	run := func(recs []dnsplan.MailRecord, rules any) (int, string) {
+		code, _, errs := f.run([]string{"plan"}, toolJSON(func(m map[string]any) {
+			readOnly(m)
+			m["sets"] = []string{"mail"}
+			m["mail"] = recs
+			if rules != nil {
+				m["mail_rules"] = rules
+			}
+			m["mail_hostname"] = h
+		}))
+		return code, errs
+	}
+	if code, errs := run([]dnsplan.MailRecord{mx}, nil); code != exitUsage || !strings.Contains(errs, "mail_rules") {
+		t.Fatalf("no rules: %d %s", code, errs)
+	}
+	floor := map[string]any{"relay_include": "", "dmarc_floor": "reject", "draining": false}
+	if code, errs := run([]dnsplan.MailRecord{mx}, floor); code != exitUsage || !strings.Contains(errs, "required while the DMARC floor is reject") {
+		t.Fatalf("missing _dmarc: %d %s", code, errs)
+	}
+	spf := dnsplan.MailRecord{Name: d, Type: "TXT", TTL: 3600, Value: "v=spf1 mx include:_spf.evil.example -all"}
+	if code, errs := run([]dnsplan.MailRecord{mx, spf}, map[string]any{"relay_include": "", "dmarc_floor": "none", "draining": false}); code != exitUsage || !strings.Contains(errs, "SPF term include:_spf.evil.example is not allowed") {
+		t.Fatalf("widened SPF: %d %s", code, errs)
+	}
+	if code, errs := run([]dnsplan.MailRecord{mx}, map[string]any{"relay_include": "", "dmarc_floor": "none", "draining": false}); code != exitOK {
+		t.Fatalf("ok: %d %s", code, errs)
 	}
 }

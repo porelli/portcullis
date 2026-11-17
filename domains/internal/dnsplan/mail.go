@@ -1,9 +1,10 @@
 package dnsplan
 
-// The mail record set (contract §19.7, §12.2 / §12.4): the records
-// mailctl renders for a mail domain — MX, SPF, DKIM, DMARC, MTA-STS,
-// TLS-RPT, SRV, the mail CNAMEs and, for the main domain, the HELO SPF and
-// the TLSA at MAIL_HOSTNAME. The set replaces nomail while it is on. It
+// The mail record set (contract §19.7, §12.2 / §12.4): the records the
+// wired mail provider renders for a mail domain — MX, SPF, DKIM, DMARC,
+// MTA-STS, TLS-RPT, SRV, the mail CNAMEs — judged by the shared rules
+// (mailrules.go), and, for the main domain, core's HELO SPF and TLSA at
+// MAIL_HOSTNAME (tlsa.go). The set replaces nomail while it is on. It
 // owns exactly the names of the contract's table (below), so a record it
 // stops wanting (a retired DKIM selector, a withheld TLSA) is removed; it
 // never touches A / AAAA / CAA (the address and caa sets) and, at <e> and
@@ -31,7 +32,8 @@ const SetMail = "mail"
 const MaxMailRecords = 200
 
 const (
-	mailTTLMin = 60
+	// Any provider's TTLs (M5: parity with the shared rules; never 0).
+	mailTTLMin = 1
 	mailTTLMax = 86400
 	// mailTXTMax bounds one TXT value (an RSA-4096 DKIM key fits).
 	mailTXTMax = 2048
@@ -49,9 +51,9 @@ type MailRecord struct {
 }
 
 var (
-	// dkimLabel: the selectors mailctl makes (v1-{ed25519,rsa}-YYYYMMDD,
-	// -2, … on a same-day re-rotation).
-	dkimLabel = regexp.MustCompile(`^v1-(ed25519|rsa)-[0-9]{8}(-[0-9]{1,3})?$`)
+	// dkimLabel: any provider's DKIM selector, one DNS label (M5: parity
+	// with the shared rules; the set owns every <sel>._domainkey.<e>).
+	dkimLabel = regexp.MustCompile(`^[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$`)
 	// mailTXTLabels / mailSRVLabels / mailCNAMELabels: the other names
 	// under <e> the set owns, by type.
 	mailTXTLabels   = []string{"_dmarc", "_mta-sts", "_smtp._tls"}

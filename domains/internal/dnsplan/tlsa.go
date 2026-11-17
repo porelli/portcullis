@@ -10,12 +10,18 @@ package dnsplan
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"regexp"
+	"strings"
 	"time"
+
+	"github.com/miekg/dns"
+
+	"github.com/portcullis/domains/internal/dnssec"
 )
 
 // TLSA timing.
@@ -34,12 +40,15 @@ const (
 	TLSADueDrop   = "drop"
 )
 
-// TLSAState is mail_acme/tlsa.json.
+// TLSAState is mail_acme/tlsa.json. NextSeenAt (Ruling R-H4): since when
+// every authoritative server of the zone serves the next key's TLSA (nil:
+// not seen, or seen gone again); the switch waits for it ≥ TTL.
 type TLSAState struct {
-	Version   int        `json:"version"`
-	Current   string     `json:"current"`
-	Next      *string    `json:"next"`
-	BothSince *time.Time `json:"both_since"`
+	Version    int        `json:"version"`
+	Current    string     `json:"current"`
+	Next       *string    `json:"next"`
+	BothSince  *time.Time `json:"both_since"`
+	NextSeenAt *time.Time `json:"next_seen_at"`
 }
 
 var reSPKIHex = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -53,7 +62,7 @@ func ParseTLSAState(b []byte) (TLSAState, error) {
 	if err := json.Unmarshal(b, &keys); err != nil || keys == nil {
 		return s, errors.New("tlsa.json: not a JSON object")
 	}
-	for _, k := range []string{"version", "current", "next", "both_since"} {
+	for _, k := range []string{"version", "current", "next", "both_since", "next_seen_at"} {
 		if _, ok := keys[k]; !ok {
 			return s, fmt.Errorf("tlsa.json: missing %q", k)
 		}
@@ -78,6 +87,8 @@ func ParseTLSAState(b []byte) (TLSAState, error) {
 		return s, errors.New("tlsa.json: next and both_since go together")
 	case s.Next != nil && (!reSPKIHex.MatchString(*s.Next) || *s.Next == s.Current):
 		return s, errors.New("tlsa.json: next isn't another 64 lowercase hex SPKI")
+	case s.NextSeenAt != nil && s.Next == nil:
+		return s, errors.New("tlsa.json: next_seen_at without next")
 	}
 	return s, nil
 }
@@ -122,12 +133,16 @@ func (s TLSAState) Publish() []string {
 }
 
 // TLSAStep reconciles s with mail-cert's keys: cur the SPKI of
-// /acme/mail.key, next that of /acme/mail.next.key ("" = none). It answers
-// the new state, its phase and the step due ("" = none). A switch
+// /acme/mail.key, next that of /acme/mail.next.key ("" = none); nextLive:
+// every authoritative server serves the next key's TLSA right now. It
+// answers the new state, its phase and the step due ("" = none). The
+// switch is due only after 2×TTL + 1 day of both published AND the next
+// key's TLSA seen live for ≥ TTL (Ruling R-H4: never a switch to a key
+// DNS doesn't pin). A switch
 // mail-cert made (the current key is the recorded next one) starts the
 // retiring phase with the old key; an unknown current key (a key nobody
 // recorded) resets to it alone.
-func TLSAStep(s *TLSAState, cur, next string, now time.Time) (TLSAState, string, string) {
+func TLSAStep(s *TLSAState, cur, next string, nextLive bool, now time.Time) (TLSAState, string, string) {
 	now = now.UTC().Truncate(time.Second)
 	var st TLSAState
 	switch {
@@ -146,9 +161,20 @@ func TLSAStep(s *TLSAState, cur, next string, now time.Time) (TLSAState, string,
 			phase = TLSARollover
 		}
 	}
+	if phase == TLSARollover {
+		switch {
+		case !nextLive:
+			st.NextSeenAt = nil
+		case st.NextSeenAt == nil:
+			st.NextSeenAt = &now
+		}
+	} else {
+		st.NextSeenAt = nil
+	}
 	due := ""
 	switch {
-	case phase == TLSARollover && !now.Before(st.BothSince.Add(TLSASwitchAfter)):
+	case phase == TLSARollover && !now.Before(st.BothSince.Add(TLSASwitchAfter)) &&
+		st.NextSeenAt != nil && !now.Before(st.NextSeenAt.Add(TLSATTL*time.Second)):
 		due = TLSADueSwitch
 	case phase == TLSARetiring && !now.Before(st.BothSince.Add(TLSADropAfter)):
 		due = TLSADueDrop
@@ -179,7 +205,7 @@ func TLSADrop(s TLSAState, phase, due string) (TLSAState, error) {
 	if phase != TLSARetiring || due != TLSADueDrop {
 		return s, fmt.Errorf("nothing to drop yet (phase %s)", phase)
 	}
-	s.Next, s.BothSince = nil, nil
+	s.Next, s.BothSince, s.NextSeenAt = nil, nil, nil
 	return s, nil
 }
 
@@ -196,4 +222,34 @@ func CoreMailRecords(host string, spkis []string, secure bool) []MailRecord {
 		}
 	}
 	return out
+}
+
+// TLSAServed: every authoritative server of host's zone serves
+// `_25._tcp.<host> TLSA 3 1 1 <spki>` (none found, a server not
+// answering it or a failed lookup: false — fail closed).
+func TLSAServed(ctx context.Context, resolvers []string, host, spki string) bool {
+	zone, err := dnssec.FindZone(ctx, resolvers, host)
+	if err != nil || zone == "" {
+		return false
+	}
+	servers := AuthServers(ctx, resolvers, zone)
+	if len(servers) == 0 {
+		return false
+	}
+	for _, srv := range servers {
+		in, err := exchange(ctx, srv, "_25._tcp."+bare(host), dns.TypeTLSA)
+		if err != nil {
+			return false
+		}
+		found := false
+		for _, rr := range in.Answer {
+			if t, ok := rr.(*dns.TLSA); ok && t.Usage == 3 && t.Selector == 1 && t.MatchingType == 1 && strings.EqualFold(t.Certificate, spki) {
+				found = true
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
