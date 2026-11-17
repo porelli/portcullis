@@ -151,9 +151,10 @@ def join(kind: str, name: str, code_file: str, wait: int = 240, check=True) -> s
         os.chmod(log, 0o600)
         try:
             rc = subprocess.run(["bash", WORKER_SH, kind, name], stdin=f, stdout=out, stderr=subprocess.STDOUT,
-                                timeout=wait + 600, env=dict(os.environ, WORKER_JOIN_WAIT=str(wait))).returncode
+                                timeout=wait + 420, env=dict(os.environ, WORKER_JOIN_WAIT=str(wait))).returncode
         except subprocess.TimeoutExpired:
             rc = "timeout"
+            diag(name)
     text = open(log, errors="replace").read()
     assert "pcj1." not in text, "the join code reached the worker script's output"
     print(f"::group::worker {name} ({kind}): exit {rc}\n{text[-6000:]}\n::endgroup::", flush=True)
@@ -232,6 +233,10 @@ def diag(name: str) -> None:
         (f"{name} agent routes", ["bash", WORKER_SH, "exec", name, "docker", "exec", "portcullis-worker-agent-1", "sh", "-c",
                                   "ip route; ip -4 addr; cat /etc/resolv.conf"]),
         (f"{name} networks", ["bash", WORKER_SH, "exec", name, "docker", "network", "ls"]),
+        (f"{name} containers", ["bash", WORKER_SH, "exec", name, "docker", "ps", "-a", "--format", "{{.Names}} {{.Status}}"]),
+        (f"{name} proxy health", ["bash", WORKER_SH, "exec", name, "docker", "inspect", "--format", "{{json .State.Health}}",
+                                  "portcullis-worker-socket-proxy-agent-1"]),
+        (f"{name} proxy log", ["bash", WORKER_SH, "compose", name, "logs", "--no-color", "--tail=30", "socket-proxy-agent"]),
         (f"{name} agent log", ["bash", WORKER_SH, "compose", name, "logs", "--no-color", "--tail=60", "agent"]),
     ):
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
