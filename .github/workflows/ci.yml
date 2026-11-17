@@ -2161,6 +2161,11 @@ jobs:
       # pip wheels + Playwright's browsers, keyed on the pinned
       # tests/e2e/requirements.txt (the browser build is tied to the
       # Playwright version).
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         id: pw-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -2168,7 +2173,7 @@ jobs:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust the CA
         timeout-minutes: 10
@@ -2499,13 +2504,18 @@ jobs:
       - name: Extra domain, instances, users, setup links (through the Hub's API)
         run: bash .github/ci/e2e-instances-extra-domain-instances-users-setup.sh
 
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA and Pebble's root
         timeout-minutes: 10
@@ -2882,13 +2892,18 @@ jobs:
       - name: Users, groups, templates, instances, certificates, a password (through the Hub's API)
         run: bash .github/ci/e2e-signin-users-groups-templates-instances-certificates.sh
 
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt', 'tests/e2e/requirements-totp.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt', 'tests/e2e/requirements-totp.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
         timeout-minutes: 10
@@ -3297,13 +3312,18 @@ jobs:
             echo "$var=$url" >> "$GITHUB_ENV"
           done
 
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
         timeout-minutes: 10
@@ -3909,13 +3929,18 @@ jobs:
           echo "PASS: the Hub loaded samba and timemachine"
           echo "127.0.0.1 portcullis.local auth.portcullis.local enroll.portcullis.local hub.portcullis.local people.portcullis.local" | sudo tee -a /etc/hosts
 
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
         timeout-minutes: 10
@@ -4189,13 +4214,18 @@ jobs:
         timeout-minutes: 10
         run: bash .github/ci/e2e-mail-remote.sh
 
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
         timeout-minutes: 10
@@ -4528,13 +4558,18 @@ jobs:
             echo "$var=$url" >> "$GITHUB_ENV"
           done
 
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
         timeout-minutes: 10
@@ -5763,13 +5798,18 @@ jobs:
         timeout-minutes: 15
         run: bash .github/ci/e2e-vpn-instances-users-headscale-provider-setup.sh
 
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
         timeout-minutes: 10
