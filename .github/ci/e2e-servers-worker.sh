@@ -82,6 +82,9 @@ case "$kind" in
     override "$RUNNER_IP" | docker exec -i "e2e-$name" sh -c 'cat > /opt/portcullis/docker-compose.worker.override.yml'
     rt=docker ;;
   podman)
+    # The setup never reads this script's stdin: that is the join code,
+    # for worker join below (docker exec -i would swallow it).
+    {
     echo "== podman worker $name: the image (systemd, passt, the CLI's tools)"
     printf '%s\n' "FROM $PODMAN_IMG" \
       "RUN dnf -y -q install systemd passt jq openssl procps-ng util-linux sudo findutils diffutils && dnf -y -q clean all && rm -rf /etc/containers/containers.conf /home/podman/.config/containers && echo net.ipv4.ip_unprivileged_port_start=80 > /etc/sysctl.d/90-pcci.conf" \
@@ -114,6 +117,7 @@ case "$kind" in
     docker exec "e2e-$name" sh -c 'cp -a /src /home/podman/portcullis && cd /home/podman/portcullis && rm -rf .env secrets/* certs/* worker-data docker-compose.ci.yml && chown -R podman:podman /home/podman/portcullis'
     docker save "$AGENT_IMAGE" | pexec "$name" podman load -q
     override "$RUNNER_IP" | pexec "$name" sh -c 'cat > portcullis/docker-compose.worker.override.yml'
+    } </dev/null
     rt=podman ;;
   *) echo "usage: $0 dind|podman|exec <name>"; exit 2 ;;
 esac
