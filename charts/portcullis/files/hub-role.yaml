@@ -3,7 +3,8 @@
 # chart keeps a byte copy (core CI compares the two). pods/exec is create
 # only: get alone opens a WebSocket exec on 1.32. Routes live in the edge
 # namespace (role-edge.yaml). Nothing in the core namespace, nothing
-# cluster-scoped.
+# cluster-scoped. metrics.k8s.io pods (get, list): the Usage page's pod
+# CPU and memory, read-only; never nodes, nodes/stats or nodes/proxy.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -36,3 +37,6 @@ rules:
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
