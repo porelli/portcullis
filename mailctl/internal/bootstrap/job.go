@@ -223,10 +223,11 @@ func (j *Job) keyFile() string {
 // Run is the whole job, under the store's lock (Ruling T17-c, R-H2):
 //   - an unmarked store: the base plan (recovery mode), the key, the
 //     recovery login refused, then the marker;
-//   - a marked store: never the plan. A normal start (with the role update
-//     after a server image change) checks the key works; a missing, empty
-//     or refused key is replaced by a new one (a recovery start that mints
-//     only the key), anything else fails closed.
+//   - a marked store: never the plan. A recovery start judges the key
+//     (KeyInPlace: never by using it, Ruling R2-N2b); a missing or
+//     out-of-scope key is replaced by a new one only (Ruling R-H2); then
+//     the normal start (with the role update after a server image change)
+//     must refuse the recovery login.
 func (j *Job) Run(ctx context.Context) (err error) {
 	if j.Start == nil {
 		return errors.New("no server to start")
@@ -261,16 +262,21 @@ func (j *Job) Run(ctx context.Context) (err error) {
 		j.logf("bootstrap: done (the base plan, the recovery login refused)")
 		return nil
 	}
-	ok, err := j.keyWorks(ctx)
-	if err != nil {
-		return err
-	}
-	if ok {
-		j.logf("bootstrap: the store is bootstrapped and the API key works; nothing to do")
-		return nil
-	}
-	j.logf("bootstrap: the API key is missing or refused: a new key only (the store's settings untouched)")
-	return j.recovery(ctx, func(c *stalwart.Client) (string, error) { return MintKey(ctx, c, j.Params.MailctlIP) })
+	// Ruling R2-N2b: the key is judged through the recovery admin, never
+	// used (it is pinned to the adapter's address).
+	return j.recovery(ctx, func(c *stalwart.Client) (string, error) {
+		b, _ := os.ReadFile(j.keyFile())
+		ok, err := KeyInPlace(ctx, c, j.Params.MailctlIP, strings.TrimSpace(string(b)))
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			j.logf("bootstrap: the store is bootstrapped and its API key is in place; nothing to do")
+			return "", nil
+		}
+		j.logf("bootstrap: the API key is missing or out of scope: a new key only (the store's settings untouched)")
+		return MintKey(ctx, c, j.Params.MailctlIP)
+	})
 }
 
 func (j *Job) imageUpdate() bool {
@@ -293,40 +299,10 @@ func (j *Job) normalEnv() []string {
 	return nil
 }
 
-// keyWorks: one normal start; true when the key file holds a key the
-// server accepts, false when it is missing, empty or refused (401); any
-// other failure is an error (fail closed).
-func (j *Job) keyWorks(ctx context.Context) (ok bool, err error) {
-	stop, err := j.Start(ctx, j.normalEnv())
-	if err != nil {
-		return false, fmt.Errorf("starting the mail server: %w", err)
-	}
-	defer func() {
-		if serr := stop(); serr != nil && err == nil {
-			err = serr
-		}
-	}()
-	if err := j.waitReady(ctx); err != nil {
-		return false, err
-	}
-	b, _ := os.ReadFile(j.keyFile())
-	key := strings.TrimSpace(string(b))
-	if key == "" {
-		return false, nil
-	}
-	if _, qerr := stalwart.New(j.URL, stalwart.Bearer(key)).Query(ctx, "Domain", nil); qerr != nil {
-		if stalwart.IsUnauthorized(qerr) {
-			return false, nil
-		}
-		return false, fmt.Errorf("checking the API key: %w", qerr)
-	}
-	return true, j.recordImage()
-}
-
 // recovery is one recovery-mode start (a password made here, the session
 // nonce in SessionFile) running step as the recovery admin; the key step
 // answers (if any) is written; then one normal start must refuse the
-// recovery login and, with a new key, accept it.
+// recovery login. The key itself is never used here (Ruling R2-N2b).
 func (j *Job) recovery(ctx context.Context, step func(*stalwart.Client) (string, error)) (err error) {
 	pw, err := randomSecret(32)
 	if err != nil {
@@ -385,11 +361,6 @@ func (j *Job) recovery(ctx context.Context, step func(*stalwart.Client) (string,
 	}
 	if err := VerifyGone(ctx, j.URL, Credentials{RecoveryUser: RecoveryUser, RecoveryPassword: pw}); err != nil {
 		return err
-	}
-	if key != "" {
-		if _, err := stalwart.New(j.URL, stalwart.Bearer(key)).Query(ctx, "Domain", nil); err != nil {
-			return fmt.Errorf("the new API key doesn't work: %w", err)
-		}
 	}
 	return j.recordImage()
 }

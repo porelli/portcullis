@@ -68,3 +68,20 @@ func TestRedactingWriterLongLineAcrossCut(t *testing.T) {
 		t.Fatalf("close: %q", b.String())
 	}
 }
+
+// One secret-shaped token longer than the buffer: the writer doesn't hold
+// it forever, and what it writes is redacted (L-c).
+func TestRedactingWriterHugeShapeBounded(t *testing.T) {
+	var b strings.Builder
+	w := NewRedactingWriter(&b)
+	w.Write([]byte("API_"))
+	for i := 0; i < 3; i++ {
+		w.Write([]byte(strings.Repeat("k", redactMax)))
+	}
+	if b.Len() == 0 || len(w.buf) > 2*redactMax {
+		t.Fatalf("held %d bytes, wrote %d", len(w.buf), b.Len())
+	}
+	if strings.Contains(b.String(), "kkkkkkkkkkkkkkkkkkkk") {
+		t.Fatal("the token went out unredacted")
+	}
+}

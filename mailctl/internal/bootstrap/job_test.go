@@ -2,7 +2,6 @@ package bootstrap
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -23,8 +22,10 @@ type jobServer struct {
 	recovery bool
 	leak     bool // a normal start that still accepts the recovery admin
 	starts   [][]string
-	// keyFile set: a Bearer must be the fake's latest API key (else 401).
-	keyFile string
+	// bearer counts API-key (Bearer) requests: real Stalwart refuses one
+	// from an address outside the key's allowedIps (the adapter's /32
+	// only), so the job, on loopback, must never send one (Ruling R2-N2b).
+	bearer int
 }
 
 func (s *jobServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -38,14 +39,14 @@ func (s *jobServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/healthz/live" {
 		return
 	}
-	if h := r.Header.Get("Authorization"); s.keyFile != "" && strings.HasPrefix(h, "Bearer ") {
-		s.f.mu.Lock()
-		want := fmt.Sprintf("Bearer API_%038d", s.f.keyNext)
-		s.f.mu.Unlock()
-		if h != want {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
+	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+		// As real Stalwart: the key's allowedIps hold only the adapter's
+		// address, never this loopback client (security.ip-unauthorized).
+		s.mu.Lock()
+		s.bearer++
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusForbidden)
+		return
 	}
 	if u, _, _ := r.BasicAuth(); u == RecoveryUser && !rec {
 		if leak {
@@ -107,7 +108,6 @@ func TestBootstrapJobVerifiesRecoveryRefused(t *testing.T) {
 	if !markerValid(j.StoreDir) {
 		t.Fatal("no marker after the plan")
 	}
-	s.keyFile = KeyFile(j.DataDir)
 	sets := func() string {
 		s.f.mu.Lock()
 		defer s.f.mu.Unlock()
@@ -126,32 +126,55 @@ func TestBootstrapJobVerifiesRecoveryRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	b2, _ := os.ReadFile(KeyFile(j.DataDir))
-	if string(b2) != string(b) || inode(t, KeyFile(j.DataDir)) != ino || len(s.starts) != 1 || len(s.starts[0]) != 0 || sets() != "" {
+	// R2-N2b: the key is judged by the recovery admin (one recovery start,
+	// then the normal start), never used; nothing is written.
+	if string(b2) != string(b) || inode(t, KeyFile(j.DataDir)) != ino || len(s.starts) != 2 || len(s.starts[1]) != 0 || sets() != "" ||
+		strings.Contains(strings.Join(s.f.calls, ","), "x:ApiKey/set") {
 		t.Fatalf("second run: key %q starts %q sets %s", b2, s.starts, sets())
 	}
-	// A server image change: the check's start runs the role update.
+	// A server image change: the normal start runs the role update.
 	j.ServerImage = "docker.io/stalwartlabs/stalwart:v1.1.1@sha256:bb"
 	s.starts = nil
-	if err := j.Run(context.Background()); err != nil || len(s.starts) != 1 || strings.Join(s.starts[0], " ") != "STALWART_UPDATE_ROLE_PERMISSIONS=true" {
+	if err := j.Run(context.Background()); err != nil || len(s.starts) != 2 || strings.Join(s.starts[1], " ") != "STALWART_UPDATE_ROLE_PERMISSIONS=true" {
 		t.Fatalf("image change: %v %q", err, s.starts)
 	}
-	// R-H2: a marked store with its key lost or refused mints a new key
-	// only: the check's start, a recovery start, the normal start; no
-	// object but the API key is written, and the new key works.
+	// R-H2: a marked store whose key is missing, empty or out of scope
+	// (the store's key widened) mints a new key only: the recovery start,
+	// the normal start; no object but the API key is written.
+	widen := func() {
+		s.f.mu.Lock()
+		for st, objs := range s.f.objs {
+			if strings.HasPrefix(st, "ApiKey@") {
+				for _, k := range objs {
+					k["allowedIps"] = map[string]any{"0.0.0.0/0": true}
+				}
+			}
+		}
+		s.f.mu.Unlock()
+	}
 	for name, lose := range map[string]func(){
-		"missing": func() { os.Remove(KeyFile(j.DataDir)) },
-		"empty":   func() { os.WriteFile(KeyFile(j.DataDir), nil, 0o640) },
-		"refused": func() { os.WriteFile(KeyFile(j.DataDir), []byte("API_stale"), 0o640) },
+		"missing":      func() { os.Remove(KeyFile(j.DataDir)) },
+		"empty":        func() { os.WriteFile(KeyFile(j.DataDir), nil, 0o640) },
+		"out of scope": widen,
 	} {
 		lose()
+		old, _ := os.ReadFile(KeyFile(j.DataDir))
 		s.starts = nil
 		s.f.calls = nil
-		if err := j.Run(context.Background()); err != nil || len(s.starts) != 3 || sets() != "" || !markerValid(j.StoreDir) {
+		if err := j.Run(context.Background()); err != nil || len(s.starts) != 2 || sets() != "" || !markerValid(j.StoreDir) {
 			t.Fatalf("%s key: %v starts %q sets %s", name, err, s.starts, sets())
 		}
-		if k, _ := os.ReadFile(KeyFile(j.DataDir)); !strings.HasPrefix(string(k), "API_") || string(k) == "API_stale" {
+		if k, _ := os.ReadFile(KeyFile(j.DataDir)); !strings.HasPrefix(string(k), "API_") || string(k) == string(old) {
 			t.Fatalf("%s key: new key %q", name, k)
 		}
+	}
+	// A key file whose secret isn't the store's key can't be told by the
+	// job without using it: in scope = in place; the adapter's first call
+	// finds out and fails closed.
+	os.WriteFile(KeyFile(j.DataDir), []byte("API_stale"), 0o640)
+	s.starts = nil
+	if err := j.Run(context.Background()); err != nil || len(s.starts) != 2 {
+		t.Fatalf("stale key file: %v %q", err, s.starts)
 	}
 	// No temporary key file left behind (written by rename).
 	if _, err := os.Stat(KeyFile(j.DataDir) + ".tmp"); !os.IsNotExist(err) {
@@ -170,7 +193,6 @@ func TestBootstrapJobVerifiesRecoveryRefused(t *testing.T) {
 	if err := j.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "no mailctl account") || sets() != "" {
 		t.Fatalf("no account: %v sets %s", err, sets())
 	}
-	s.keyFile = ""
 	// An invalid marker runs the plan again (fail closed).
 	os.WriteFile(filepath.Join(j.StoreDir, planMarker), []byte(`{"version":2}`), 0o600)
 	s.starts = nil
@@ -220,6 +242,11 @@ func TestBootstrapJobVerifiesRecoveryRefused(t *testing.T) {
 	j2.Start = func(ctx context.Context, env []string) (func() error, error) { return func() error { return nil }, nil }
 	if err := j2.Run(context.Background()); err == nil {
 		t.Fatal("no server: accepted")
+	}
+	// Ruling R2-N2b: not one request with the API key, ever (the fake, as
+	// real Stalwart, refuses it from loopback).
+	if s.bearer != 0 {
+		t.Fatalf("the job used the API key %d times", s.bearer)
 	}
 }
 

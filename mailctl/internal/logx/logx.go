@@ -65,6 +65,14 @@ type RedactingWriter struct {
 	mu  sync.Mutex
 	w   io.Writer
 	buf []byte
+	// inToken: a secret-shaped token was flushed whole while it still ran
+	// on; its continuation is dropped until the first non-token byte.
+	inToken bool
+}
+
+// tokenByte: a byte a secret-shaped token may continue with.
+func tokenByte(c byte) bool {
+	return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || strings.IndexByte("+/=_-", c) >= 0
 }
 
 const (
@@ -80,6 +88,17 @@ func NewRedactingWriter(w io.Writer) *RedactingWriter { return &RedactingWriter{
 func (r *RedactingWriter) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	n := len(p)
+	if r.inToken {
+		i := 0
+		for i < len(p) && tokenByte(p[i]) {
+			i++
+		}
+		if i == len(p) {
+			return n, nil
+		}
+		p, r.inToken = p[i:], false
+	}
 	r.buf = append(r.buf, p...)
 	for {
 		i := bytes.IndexByte(r.buf, '\n')
@@ -87,18 +106,26 @@ func (r *RedactingWriter) Write(p []byte) (int, error) {
 			break
 		}
 		if _, err := io.WriteString(r.w, Redact(string(r.buf[:i+1]))); err != nil {
-			return len(p), err
+			return n, err
 		}
 		r.buf = r.buf[i+1:]
 	}
 	if len(r.buf) > redactMax {
 		cut := safeCut(string(r.buf))
+		// No safe cut (one secret-shaped token fills the buffer): past
+		// twice the bound, the whole buffer goes out redacted (L-c), never
+		// an unbounded hold.
+		forced := false
+		if cut == 0 && len(r.buf) > 2*redactMax {
+			cut, forced = len(r.buf), true
+		}
 		if _, err := io.WriteString(r.w, Redact(string(r.buf[:cut]))); err != nil {
-			return len(p), err
+			return n, err
 		}
 		r.buf = append([]byte(nil), r.buf[cut:]...)
+		r.inToken = forced
 	}
-	return len(p), nil
+	return n, nil
 }
 
 // Close redacts and writes what is left (the child exited).
@@ -136,10 +163,11 @@ func safeCut(s string) int {
 				cut, moved = from+j, true
 			}
 		}
-		for _, m := range shapes.FindAllStringIndex(s[max(0, cut-shapeMax):], -1) {
-			a, b := m[0]+max(0, cut-shapeMax), m[1]+max(0, cut-shapeMax)
-			if a < cut && b > cut {
-				cut, moved = a, true
+		// The whole buffer: a shape match longer than shapeMax may cross
+		// the cut from far before it.
+		for _, m := range shapes.FindAllStringIndex(s, -1) {
+			if m[0] < cut && m[1] > cut {
+				cut, moved = m[0], true
 			}
 		}
 	}

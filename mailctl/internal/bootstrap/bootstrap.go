@@ -400,7 +400,7 @@ func ensureAccount(ctx context.Context, c *stalwart.Client, domainID, roleID str
 }
 
 // ensureAPIKey makes mailctl's one API key (Inherit, pinned to the
-// adapter's address and 127.0.0.1, no expiry) unless one exists; rotate replaces it.
+// adapter's address, no expiry) unless one exists; rotate replaces it.
 func ensureAPIKey(ctx context.Context, c *stalwart.Client, mailctlIP netip.Addr, rotate bool) (string, error) {
 	keys, err := getAll(ctx, c, "ApiKey")
 	if err != nil {
@@ -422,10 +422,9 @@ func ensureAPIKey(ctx context.Context, c *stalwart.Client, mailctlIP netip.Addr,
 	r, err := c.Set(ctx, "ApiKey", map[string]any{"k": map[string]any{
 		"description": APIKeyName,
 		"permissions": map[string]any{"@type": "Inherit"},
-		// The adapter's address, and loopback for the bootstrap job's own
-		// server child (MAILCTL_JOB_LOCAL_URL; Ruling R2-N2): the real
-		// server's loopback is only its own container.
-		"allowedIps": set(netip.PrefixFrom(mailctlIP, 32).String(), "127.0.0.1/32"),
+		// The adapter's address only (Ruling R2-N2b): the job never
+		// authenticates with the key.
+		"allowedIps": set(netip.PrefixFrom(mailctlIP, 32).String()),
 	}}, nil, nil)
 	if err := checkSet("ApiKey", r, err); err != nil {
 		return "", err
@@ -569,19 +568,87 @@ func StoreEmpty(ctx context.Context, c *stalwart.Client, p Params) error {
 	return nil
 }
 
-// MintKey replaces mailctl's API key only (Ruling R-H2: a marked store
-// whose key is lost): the existing account of mailctl on the parking
-// domain gets a new key; no other object is touched. No such account is
-// an error (fail closed: the store isn't what the marker says).
-func MintKey(ctx context.Context, c *stalwart.Client, mailctlIP netip.Addr) (string, error) {
+// KeyInPlace (Ruling R2-N2b) judges mailctl's API key through the
+// recovery admin, never by using it: mailctl's account on the parking
+// domain holds exactly one key, named APIKeyName, Inherit, not disabled,
+// whose allowedIps are exactly the adapter's /32; and the key file holds
+// an API_ secret. Stalwart exposes no hash of the secret, so whether the
+// file's secret is that key's is the adapter's first call to find out (it
+// fails closed: every route 503, state.bootstrap false).
+func KeyInPlace(ctx context.Context, c *stalwart.Client, mailctlIP netip.Addr, fileKey string) (bool, error) {
+	if !strings.HasPrefix(fileKey, "API_") {
+		return false, nil
+	}
+	acct, err := mailctlAccount(ctx, c)
+	if err != nil || acct == "" {
+		return false, err
+	}
+	keys, err := getAll(ctx, c.As(acct), "ApiKey")
+	if err != nil {
+		return false, err
+	}
+	if len(keys) != 1 {
+		return false, nil
+	}
+	k := keys[0]
+	var ips map[string]bool
+	var perm struct {
+		Type string `json:"@type"`
+	}
+	_ = json.Unmarshal(k["allowedIps"], &ips)
+	_ = json.Unmarshal(k["permissions"], &perm)
+	want := netip.PrefixFrom(mailctlIP, 32).String()
+	if str(k, "description") != APIKeyName || perm.Type != "Inherit" || len(ips) != 1 || !ips[want] {
+		return false, nil
+	}
+	if raw, ok := k["enabled"]; ok {
+		var en bool
+		if json.Unmarshal(raw, &en) != nil || !en {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// mailctlAccount: the id of mailctl's account on the parking domain, ""
+// when there is none.
+func mailctlAccount(ctx context.Context, c *stalwart.Client) (string, error) {
+	doms, err := getAll(ctx, c, "Domain")
+	if err != nil {
+		return "", err
+	}
+	parking := ""
+	for _, d := range doms {
+		if strings.EqualFold(str(d, "name"), ParkingDomain) {
+			parking = str(d, "id")
+		}
+	}
+	if parking == "" {
+		return "", nil
+	}
 	accts, err := getAll(ctx, c, "Account")
 	if err != nil {
 		return "", err
 	}
 	for _, a := range accts {
-		if str(a, "name") == MailctlAccount {
-			return ensureAPIKey(ctx, c.As(str(a, "id")), mailctlIP, true)
+		if str(a, "name") == MailctlAccount && str(a, "domainId") == parking {
+			return str(a, "id"), nil
 		}
 	}
-	return "", errors.New("the store is marked bootstrapped but has no mailctl account: restore the store or start a fresh one")
+	return "", nil
+}
+
+// MintKey replaces mailctl's API key only (Ruling R-H2: a marked store
+// whose key is lost): the existing account of mailctl on the parking
+// domain gets a new key; no other object is touched. No such account is
+// an error (fail closed: the store isn't what the marker says).
+func MintKey(ctx context.Context, c *stalwart.Client, mailctlIP netip.Addr) (string, error) {
+	acct, err := mailctlAccount(ctx, c)
+	if err != nil {
+		return "", err
+	}
+	if acct == "" {
+		return "", errors.New("the store is marked bootstrapped but has no mailctl account: restore the store or start a fresh one")
+	}
+	return ensureAPIKey(ctx, c.As(acct), mailctlIP, true)
 }
