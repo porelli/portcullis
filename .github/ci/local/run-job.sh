@@ -55,6 +55,10 @@ die() { echo "run-job: $*" >&2; exit 2; }
 
 cleanup_named() { # cleanup_named <container name>: the container, its run volumes and network
   local n="$1"
+  # A kept container's engine may sit on a reused image store: its stack goes
+  # first (a later run's dockerd would restart it and its binds would create
+  # root-owned paths in the new workspace).
+  docker exec "$n" pcci-docker-sanitize >/dev/null 2>&1 || true
   docker rm -f "$n" >/dev/null 2>&1 || true
   docker volume ls -q --filter "label=pcci.run=$n" | xargs -r docker volume rm -f >/dev/null 2>&1 || true
   docker network rm "$n" >/dev/null 2>&1 || true
@@ -176,6 +180,9 @@ for i in $(seq 1 90); do
   sleep 2
 done
 docker exec "$name" pcci-docker-sanitize
+# Belt and braces: a reused store's containers restarted by this dockerd
+# before the sanitize may have made bind paths in the fresh workspace.
+docker exec "$name" sh -c 'find /home/runner/work -mindepth 1 -maxdepth 1 -exec rm -rf {} +'
 docker exec "$name" chown runner:runner /home/runner/work /home/runner/.cache /home/runner/go /opt/hostedtoolcache /srv 2>/dev/null || true
 docker exec "$name" chmod 0755 /srv
 docker exec "$name" chmod 1777 /tmp
