@@ -199,6 +199,21 @@ func TestLiveSSHVault(t *testing.T) {
 	refused("an extension outside the role", "ssh_user/sign/hg-live", signBody("extensions", map[string]any{"permit-pty": "", "permit-port-forwarding": ""}))
 	refused("a role without hg-", "ssh_user/sign/web", signBody("", nil))
 
+	// Ruling RR3: a role of approved principals only (sp:/up:, sorted first
+	// as "sp:…") passes the policy, and Vault signs one.
+	_, err = cfg.putSSHRole(ctx, "appr", sshRoleSpec{Principals: []string{"sp:deploy@appr", "up:alice@appr"}, Extensions: "permit-pty", SourceAddress: []string{}, MaxTTLSeconds: 3600})
+	must(err, "a role of sp:/up: principals")
+	{
+		r := sshUserSign{User: "alice", HostGroup: "appr", Principals: []string{"sp:deploy@appr", "up:alice@appr"}, ValidSeconds: 3600, Extensions: []string{"permit-pty"}, KeyID: "pc:alice:appr:0123456789abcdef", PublicKey: edLine}
+		got, err := cfg.signSSHUser(ctx, r, edK, edLine)
+		if err != nil {
+			t.Errorf("RR3: signing sp:/up: principals: %v", err)
+		} else if c, _, _, _, _ := ssh.ParseAuthorizedKey([]byte(got.Certificate)); c == nil || strings.Join(c.(*ssh.Certificate).ValidPrincipals, ",") != "sp:deploy@appr,up:alice@appr" {
+			t.Errorf("RR3: certificate principals %v", c)
+		}
+		_, _ = ec.Logical().DeleteWithContext(ctx, "ssh_user/roles/hg-appr")
+	}
+
 	// An embedded "*" passes the policy (s:/u: prefix) but is no wildcard
 	// in Vault, and an exact entry is no glob.
 	_, err = ec.Logical().WriteWithContext(ctx, "ssh_user/roles/hg-star", func() map[string]any {

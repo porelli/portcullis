@@ -63,7 +63,9 @@ const (
 // against the shared vectors: testdata/ssh_vectors.json).
 var (
 	sshHostGroupRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}$`)
-	sshPrincipalRE = regexp.MustCompile(`^([us]):([a-z_][a-z0-9._-]{0,31})@([a-z][a-z0-9-]{0,30})$`)
+	// u:/s: and the approved namespaces up:/sp: (a privileged grant's
+	// principals, Ruling RR3); m[1] is the base kind either way.
+	sshPrincipalRE = regexp.MustCompile(`^([us])p?:([a-z_][a-z0-9._-]{0,31})@([a-z][a-z0-9-]{0,30})$`)
 	sshKeyIDRE     = regexp.MustCompile(`^pc:([a-z0-9][a-z0-9._-]{0,63}):([a-z][a-z0-9-]{0,30}):([0-9a-f]{16})$`)
 	sshHostIDRE    = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 	sshDNSLabelRE  = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
@@ -139,7 +141,7 @@ func checkRole(hg string, spec *sshRoleSpec) error {
 	for _, p := range spec.Principals {
 		m := sshPrincipalRE.FindStringSubmatch(p)
 		if m == nil || m[3] != hg {
-			return refuse(400, "principal %q isn't u:<user>@%s or s:<account>@%s", clipText(p), hg, hg)
+			return refuse(400, "principal %q isn't u:/up:<user>@%s or s:/sp:<account>@%s", clipText(p), hg, hg)
 		}
 		if seen[p] {
 			return refuse(400, "principal %q twice", p)
@@ -327,7 +329,7 @@ func checkUserSign(r *sshUserSign) (ssh.PublicKey, string, error) {
 	for _, p := range r.Principals {
 		m := sshPrincipalRE.FindStringSubmatch(p)
 		if m == nil || m[3] != r.HostGroup {
-			return nil, "", refuse(400, "principal %q isn't u:<user>@%s or s:<account>@%s", clipText(p), r.HostGroup, r.HostGroup)
+			return nil, "", refuse(400, "principal %q isn't u:/up:<user>@%s or s:/sp:<account>@%s", clipText(p), r.HostGroup, r.HostGroup)
 		}
 		// A person's own-account principal names that person only.
 		if m[1] == "u" && m[2] != r.User {

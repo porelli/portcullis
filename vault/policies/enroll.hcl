@@ -121,13 +121,17 @@ path "pki_node/crl/rotate" {
 # checked live on Vault 2.2.1 by TestLiveSSHVault):
 #   - allowed_users: NOT a fence for which principals. It is one
 #     comma-joined string and a policy glob sees only its start, so "s:*" /
-#     "u:*" refuse just a bare "*" (Vault's "any principal"); a stolen token
+#     "sp:*" / "u:*" / "up:*" refuse just a bare "*" (Vault's "any
+#     principal"; sp:/up: are the approved namespaces of privileged grants,
+#     Ruling RR3 — a stolen token can write those too, which is why the host
+#     is the fence, below); a stolen token
 #     can still write "u:a@x,root" and Vault then signs "root" (live, Vault
 #     2.2.1). Entries are matched exactly (no glob, an embedded "*" entry is
 #     no wildcard, live) and allowed_users_template can't be set. The fence
 #     for bare principals is the host: every Portcullis host's sshd reads
 #     AuthorizedPrincipalsFile for every account, root included, and those
-#     files hold only u:/s: names, so a certificate for "root" or a bare
+#     files hold only u:/s: (up:/sp:) names of that account — only up:/sp:
+#     for an account with sudo — so a certificate for "root" or a bare
 #     account name opens nothing (the Hub's real-sshd test, three distros).
 #     A narrower role-writing token can't help: a policy can pin a path's
 #     parameters only to fixed values, and the per-host-group principal
@@ -160,7 +164,7 @@ path "ssh_user/roles/hg-*" {
     "allow_user_certificates"  = ["true"]
     "allow_host_certificates"  = ["false"]
     "allow_user_key_ids"       = ["true"]
-    "allowed_users"            = ["s:*", "u:*"]
+    "allowed_users"            = ["s:*", "sp:*", "u:*", "up:*"]
     "allowed_extensions"       = ["permit-pty", "permit-pty,permit-port-forwarding",
                                   "permit-pty,permit-agent-forwarding",
                                   "permit-pty,permit-port-forwarding,permit-agent-forwarding"]

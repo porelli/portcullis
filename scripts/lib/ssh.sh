@@ -8,6 +8,7 @@
 #       the one-time code on standard input (never argv).
 #   ssh breakglass-cert (--user <name> | --account <name>) --host-group <hg>
 #                       --ttl <5m–12h> --key <public key file> [--note <text>]
+#                       [--privileged]
 #       the Hub is down, Vault is up: a user certificate signed directly on
 #       ssh_user/sign/hg-<hg> with the root token (vault_admin: by name in
 #       the container's environment, never argv), key id
@@ -76,6 +77,7 @@ help_ssh_breakglass_cert() {
   cat <<'EOF'
 Usage: portcullis ssh breakglass-cert (--user <name> | --account <name>) --host-group <hg>
                                       --ttl <duration> --key <public key file> [--note <text>]
+                                      [--privileged]
 
 For when the Hub is down and Vault is up: signs one SSH user certificate
 directly on Vault's ssh_user/sign/hg-<hg> with the root token from
@@ -90,6 +92,9 @@ by name, never on a command line) and prints it.
                       their security-key forms)
   --note <text>       why (default "breakglass"): the key id is
                       pc-breakglass:<note>, which every host's sshd logs
+  --privileged        the approved principal up:<name>@<hg> / sp:<name>@<hg>
+                      (a privileged grant's): the only kind an account with
+                      sudo on a host accepts
 
 Every use is appended to secrets/ssh/breakglass.jsonl; the Hub writes it to
 its audit (ssh.certificate.breakglass) at its next start and the doctor
@@ -108,7 +113,7 @@ _ssh_ttl_seconds() {
 }
 
 ssh_breakglass_cert() {
-  local person="$1" account="$2" hg="$3" ttl="$4" keyfile="$5" note="$6"
+  local person="$1" account="$2" hg="$3" ttl="$4" keyfile="$5" note="$6" privileged="${7:-false}"
   local kind name principal secs pub type out signed info serial vb fp rec got
   require_cmd jq ssh-keygen
   if [ -n "$person" ] && [ -n "$account" ]; then usage_error "ssh breakglass-cert" "--user or --account, not both"; fi
@@ -132,6 +137,9 @@ ssh_breakglass_cert() {
   case "$pub" in *PRIVATE*) fail "$keyfile is a private key: pass the .pub file" ;; esac
   fp="$(printf '%s\n' "$pub" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')"
   [[ "$fp" == SHA256:* ]] || fail "$keyfile isn't an SSH public key"
+  # The approved namespace (Ruling RR3) when asked: an account with sudo
+  # accepts only up:/sp: principals.
+  [ "$privileged" = true ] && kind="${kind}p"
   principal="$kind:$name@$hg"
   vault_admin
   out="$(jq -n --arg pk "$pub" --arg p "$principal" --arg t "${secs}s" --arg k "pc-breakglass:$note" \
@@ -199,7 +207,7 @@ cmd_ssh() {
     enroll-self|breakglass-cert) ;;
     *) usage_error ssh "unknown subcommand: $sub" ;;
   esac
-  local fn="help_ssh_${sub//-/_}" noop=false cafile="" person="" account="" hg="" ttl="" key="" note="breakglass"
+  local fn="help_ssh_${sub//-/_}" noop=false cafile="" person="" account="" hg="" ttl="" key="" note="breakglass" privileged=false
   while [ $# -gt 0 ]; do
     case "$sub:$1" in
       *:-h|*:--help) "$fn"; return 0 ;;
@@ -211,6 +219,7 @@ cmd_ssh() {
       breakglass-cert:--ttl) need_value "ssh breakglass-cert" "$1" "${2:-}"; ttl="$2"; shift ;;
       breakglass-cert:--key) need_value "ssh breakglass-cert" "$1" "${2:-}"; key="$2"; shift ;;
       breakglass-cert:--note) need_value "ssh breakglass-cert" "$1" "${2:-}"; note="$2"; shift ;;
+      breakglass-cert:--privileged) privileged=true ;;
       *:-*) usage_error "ssh $sub" "unknown option: $1" ;;
       *) usage_error "ssh $sub" "unexpected argument (the code goes on standard input): $1" ;;
     esac
@@ -220,7 +229,7 @@ cmd_ssh() {
     enroll-self)
       [ "$noop" = false ] || return 0
       ssh_enroll_self "$cafile" ;;
-    breakglass-cert) ssh_breakglass_cert "$person" "$account" "$hg" "$ttl" "$key" "$note" ;;
+    breakglass-cert) ssh_breakglass_cert "$person" "$account" "$hg" "$ttl" "$key" "$note" "$privileged" ;;
   esac
 }
 

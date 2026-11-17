@@ -1806,7 +1806,7 @@ allowed_parameters = {
 "allow_user_certificates"  = ["true"]
 "allow_host_certificates"  = ["false"]
 "allow_user_key_ids"       = ["true"]
-"allowed_users"            = ["s:*", "u:*"]
+"allowed_users"            = ["s:*", "sp:*", "u:*", "up:*"]
 "allowed_extensions"       = ["permit-pty", "permit-pty,permit-port-forwarding",
 "permit-pty,permit-agent-forwarding",
 "permit-pty,permit-port-forwarding,permit-agent-forwarding"]
@@ -2061,11 +2061,15 @@ expect_eq "ssh breakglass-cert refuses a private key file (nothing signed)" "$RC
 bg --account deploy --host-group web --ttl 30m --key "$WORK/bg-user.pub"
 expect_eq "ssh breakglass-cert: a certificate naming other principals than asked is refused, nothing recorded" \
   "$RC:$(jq -r '.valid_principals' "$WORK/bg-stdin"):$(wc -l < "$BG_ROOT/secrets/ssh/breakglass.jsonl" | tr -d ' ')" "1:s:deploy@web:1"
+# Ruling RR3: --privileged asks for the approved principal (up:).
+ssh-keygen -q -s "$WORK/bg-ca" -I pc-breakglass:outage -n up:alice@web -z 4244 -V +1h "$WORK/bg-user.pub" >/dev/null 2>&1
+bg --user alice --host-group web --ttl 1h --key "$WORK/bg-user.pub" --privileged
+expect_eq "ssh breakglass-cert --privileged signs up:alice@web" "$RC:$(jq -r '.valid_principals' "$WORK/bg-stdin")" "0:up:alice@web"
 # L-A6: a certificate naming the asked principal and another one too.
 ssh-keygen -q -s "$WORK/bg-ca" -I pc-breakglass:outage -n u:alice@web,u:bob@web -z 4243 -V +1h -O clear "$WORK/bg-user.pub" >/dev/null 2>&1
 bg --user alice --host-group web --ttl 1h --key "$WORK/bg-user.pub"
 expect_eq "ssh breakglass-cert: a certificate naming the principal and another one is refused, nothing recorded" \
-  "$RC:$(wc -l < "$BG_ROOT/secrets/ssh/breakglass.jsonl" | tr -d ' ')" "1:1"
+  "$RC:$(wc -l < "$BG_ROOT/secrets/ssh/breakglass.jsonl" | tr -d ' ')" "1:2"
 RC=0; PORTCULLIS_ROOT="$BG_ROOT" "$CLI" ssh enroll-self pcenrol1.abc >/dev/null 2>&1 </dev/null || RC=$?
 expect_eq "ssh enroll-self: a code on the command line is refused (exit 2)" "$RC" 2
 RC=0; PORTCULLIS_ROOT="$BG_ROOT" "$CLI" ssh enroll-self --no-ssh >/dev/null 2>&1 </dev/null || RC=$?
