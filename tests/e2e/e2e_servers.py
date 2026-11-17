@@ -277,11 +277,23 @@ def lldap_member(user: str, group: str) -> None:
     assert not r.get("errors"), r
 
 
+def fresh_get(page: Page, url: str):
+    """GET url with page's cookies on new connections (a throwaway context
+    with its storage state): a kept-alive connection set up before a host
+    had a router keeps answering 421 Misdirected Request, and Playwright's
+    request client — unlike a browser — never retries on a new one."""
+    ctx = state["browser"].new_context(storage_state=page.context.storage_state())
+    try:
+        r = ctx.request.get(url, max_redirects=0)
+        return r.status, r.text(), [h["value"] for h in r.headers_array if h["name"].lower() == "set-cookie"], r.headers.get("location", "")
+    finally:
+        ctx.close()
+
+
 def echo(page: Page, iid: str):
     """alice's GET of the instance's CGI through the primary: (status, body, set-cookies)."""
-    r = page.request.get(f"https://{iid}.{DOMAIN}/cgi-bin/echo", max_redirects=0)
-    cookies = [h["value"] for h in r.headers_array if h["name"].lower() == "set-cookie"]
-    return r.status, r.text(), cookies
+    st, body, cookies, _ = fresh_get(page, f"https://{iid}.{DOMAIN}/cgi-bin/echo")
+    return st, body, cookies
 
 
 def reach(page: Page, iid: str) -> bool:
@@ -289,11 +301,9 @@ def reach(page: Page, iid: str) -> bool:
     kept for the failure message: status, Location's path and whether the
     body names the host — never the body: it echoes her session cookie)."""
     try:
-        r = page.request.get(f"https://{iid}.{DOMAIN}/cgi-bin/echo", max_redirects=0)
-        body = r.text()
-        loc = r.headers.get("location", "").split("?")[0]
-        state[f"last_reach_{iid}"] = f"{r.status} {loc} host-line={'HOST=' in body} {len(body)} bytes"
-        return r.status == 200 and f"HOST={iid}.{DOMAIN}" in body
+        st, body, _, loc = fresh_get(page, f"https://{iid}.{DOMAIN}/cgi-bin/echo")
+        state[f"last_reach_{iid}"] = f"{st} {loc.split('?')[0]} host-line={'HOST=' in body} {len(body)} bytes"
+        return st == 200 and f"HOST={iid}.{DOMAIN}" in body
     except Exception as e:  # noqa: BLE001
         state[f"last_reach_{iid}"] = f"{type(e).__name__}: {redact(str(e))[:200]}"
         return False
