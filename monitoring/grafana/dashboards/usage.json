@@ -51,8 +51,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (instance) (rate(portcullis_container_cpu_seconds_total[5m]))",
-          "legendFormat": "{{instance}}"
+          "expr": "sum by (app) (rate(portcullis_container_cpu_seconds_total[5m]))",
+          "legendFormat": "{{app}}"
         }
       ]
     },
@@ -93,8 +93,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (instance) (portcullis_container_memory_working_set_bytes)",
-          "legendFormat": "{{instance}}"
+          "expr": "sum by (app) (portcullis_container_memory_working_set_bytes)",
+          "legendFormat": "{{app}}"
         }
       ]
     },
@@ -136,7 +136,7 @@
             "uid": "prometheus"
           },
           "expr": "portcullis_container_memory_working_set_bytes / portcullis_container_memory_limit_bytes",
-          "legendFormat": "{{instance}} {{service}}.{{number}}"
+          "legendFormat": "{{app}} {{service}}.{{number}}"
         }
       ]
     },
@@ -177,8 +177,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (instance, kind, target) (portcullis_storage_alloc_bytes)",
-          "legendFormat": "{{instance}} {{kind}} {{target}}"
+          "expr": "sum by (app, kind, target) (portcullis_storage_alloc_bytes)",
+          "legendFormat": "{{app}} {{kind}} {{target}}"
         }
       ]
     },
@@ -196,7 +196,7 @@
         "w": 12,
         "h": 8
       },
-      "description": "Each filesystem with Portcullis data; above 0.9 for 30 min raises PortcullisDiskNearlyFull.",
+      "description": "Each filesystem with Portcullis data; under 10 % or 5 GiB free for 30 min raises PortcullisDiskNearlyFull (under 3 % or 1 GiB: PortcullisDiskAlmostFull).",
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit"

@@ -2443,6 +2443,8 @@ jobs:
             echo "FAIL: the metrics listener answers on the core network"; exit 1
           fi
           echo "PASS: usage metrics on portcullis-metrics-hub only"
+          # Through a real Prometheus scrape (FR-H1): the target labels apply.
+          .github/ci/usage-prometheus-labels.sh echo-b
 
       - name: Instance backup → guarded delete → restore into a new id (real daemon)
         timeout-minutes: 15
