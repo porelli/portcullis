@@ -1,0 +1,25 @@
+# Ephemeral self-hosted GitHub Actions runner (one job per start) — see
+# .github/ci/local/runner/runner-loop.sh. Installed by install.sh.
+[Unit]
+Description=Ephemeral GitHub Actions runner %i (pc-builder)
+After=docker.service network-online.target
+Requires=docker.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ghrunner
+Group=ghrunner
+SupplementaryGroups=docker
+ExecStart=/opt/pcci-runner/runner-loop.sh %i
+Restart=always
+RestartSec=5
+TimeoutStopSec=60
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/pcci-runner
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

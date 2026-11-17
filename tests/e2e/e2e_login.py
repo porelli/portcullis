@@ -69,6 +69,7 @@ import urllib.parse
 
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import Page, sync_playwright
+import scenarios  # noqa: E402  (E2E_SCENARIOS: single-scenario reruns)
 
 DOMAIN = os.environ["E2E_DOMAIN"]
 ART = os.environ.get("E2E_ARTIFACTS", "e2e-artifacts")
@@ -250,6 +251,8 @@ def goto_status(page: Page, url: str) -> int:
 
 
 def check(name: str, fn) -> None:
+    if scenarios.skip(name):  # E2E_SCENARIOS (tests/e2e/scenarios.py)
+        return
     try:
         fn()
         results.append((name, True, ""))

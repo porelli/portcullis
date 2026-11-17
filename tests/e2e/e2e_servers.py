@@ -455,12 +455,21 @@ def main() -> int:
                                        until=until, label=f"servers-{who}", expect_stepups=1)
                 state[f"{who}_ctx"], state[f"{who}_page"], state[f"{who}_key"] = ctx, page, key
             base.check(f"{who} signs in from a setup link", signs_in)
-        for fn in (join_ok, join_code_reused_refused, join_code_expired_refused,
-                   echo_on_worker_signed_in, echo_on_worker_denied_without_sign_in,
-                   no_portcullis_cookie_reaches_app, parent_domain_set_cookie_stripped,
-                   move_worker_primary_worker_keeps_data, wg_stopped_fails_closed, wg_back_routes_again,
-                   rogue_worker, revoke_drops_handshake_and_rotates, revoke_cuts_websocket, socket_rule_both_stacks):
-            base.check(fn.__name__, fn)
+        # One check each, by a literal name (tests/e2e/scenarios.py reads them).
+        base.check("join_ok", join_ok)
+        base.check("join_code_reused_refused", join_code_reused_refused)
+        base.check("join_code_expired_refused", join_code_expired_refused)
+        base.check("echo_on_worker_signed_in", echo_on_worker_signed_in)
+        base.check("echo_on_worker_denied_without_sign_in", echo_on_worker_denied_without_sign_in)
+        base.check("no_portcullis_cookie_reaches_app", no_portcullis_cookie_reaches_app)
+        base.check("parent_domain_set_cookie_stripped", parent_domain_set_cookie_stripped)
+        base.check("move_worker_primary_worker_keeps_data", move_worker_primary_worker_keeps_data)
+        base.check("wg_stopped_fails_closed", wg_stopped_fails_closed)
+        base.check("wg_back_routes_again", wg_back_routes_again)
+        base.check("rogue_worker", rogue_worker)
+        base.check("revoke_drops_handshake_and_rotates", revoke_drops_handshake_and_rotates)
+        base.check("revoke_cuts_websocket", revoke_cuts_websocket)
+        base.check("socket_rule_both_stacks", socket_rule_both_stacks)
         browser.close()
     failed = [n for n, ok, _ in base.results if not ok]
     print(f"\n{len(base.results) - len(failed)} passed, {len(failed)} failed: {failed}")
