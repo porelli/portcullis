@@ -344,11 +344,11 @@ jobs:
             [ "$svc:$img" != mail-cert:portcullis-domains ] || continue
             [[ "$img" =~ ^[^@[:space:]]+:[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || { echo "UNPINNED: $svc → $img"; bad=1; }
           done < /tmp/images
-          for df in enroll/Dockerfile group-gate/Dockerfile domains/Dockerfile mcp-gate/Dockerfile wg/Dockerfile forwarder/Dockerfile mailctl/Dockerfile; do
+          for df in enroll/Dockerfile group-gate/Dockerfile domains/Dockerfile mcp-gate/Dockerfile wg/Dockerfile forwarder/Dockerfile mailctl/Dockerfile tests/e2e/mail-fake/Dockerfile; do
             if grep -E '^FROM ' "$df" | grep -v '@sha256:'; then echo "UNPINNED base image in $df"; bad=1; fi
           done
           # One Go builder (tag and digest) for every locally built Go service.
-          GO_DFS="enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile wg/Dockerfile forwarder/Dockerfile mailctl/Dockerfile"
+          GO_DFS="enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile wg/Dockerfile forwarder/Dockerfile mailctl/Dockerfile tests/e2e/mail-fake/Dockerfile"
           # shellcheck disable=SC2086  # a list of paths
           if [ "$(grep -hE '^FROM docker.io/library/golang:' $GO_DFS | awk '{print $2}' | sort -u | wc -l | tr -d ' ')" != 1 ]; then
             # shellcheck disable=SC2086
@@ -371,7 +371,8 @@ jobs:
           if grep -nE '^\s+image: ' .github/workflows/*.yml .github/ci/*.sh | grep -v '@sha256:'; then echo "UNPINNED image in a workflow"; bad=1; fi
           if grep -nE '(ALPINE|_IMG|IMAGE): [a-z]' .github/workflows/*.yml .github/ci/*.sh | grep -v '@sha256:'; then echo "UNPINNED image variable in a workflow"; bad=1; fi
           # The CI-only app templates (job e2e-instances).
-          if grep -nE '^\s+image: ' tests/e2e/apps/*/compose.yml | grep -v '@sha256:'; then echo "UNPINNED image in a CI template"; bad=1; fi
+          # (Local CI builds — portcullis-mail-fake:ci — are exempt.)
+          if grep -nE '^\s+image: ' tests/e2e/apps/*/compose.yml | grep -v '@sha256:' | grep -vE 'image: portcullis-[a-z-]+:ci$'; then echo "UNPINNED image in a CI template"; bad=1; fi
           # Actions by full commit SHA.
           if grep -nE '^\s+(- )?uses: ' .github/workflows/*.yml .github/actions/*/action.yml | grep -vE 'uses: (\./|[^@]+@[0-9a-f]{40} # v[0-9]+\.[0-9]+\.[0-9]+$)'; then echo "Action not pinned by commit SHA (# vX.Y.Z)"; bad=1; fi
           [ "$bad" = 0 ] || exit 1
