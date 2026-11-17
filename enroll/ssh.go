@@ -238,6 +238,12 @@ func sshRoleRead(data map[string]any) (*sshRoleSpec, error) {
 	if b, _ := data["allow_host_certificates"].(bool); b {
 		return nil, errors.New("the role reads back allowing host certificates")
 	}
+	if de, ok := data["default_extensions"].(map[string]any); ok && len(de) > 0 {
+		return nil, errors.New("the role reads back with default extensions")
+	}
+	if b, _ := data["allowed_users_template"].(bool); b {
+		return nil, errors.New("the role reads back with allowed_users_template")
+	}
 	users, _ := data["allowed_users"].(string)
 	ext, _ := data["allowed_extensions"].(string)
 	ttl, ok := numberOf(data["max_ttl"])
@@ -245,6 +251,11 @@ func sshRoleRead(data map[string]any) (*sshRoleSpec, error) {
 		return nil, errors.New("the role reads back without a max_ttl")
 	}
 	out := &sshRoleSpec{Principals: splitList(users), Extensions: ext, SourceAddress: []string{}, MaxTTLSeconds: int(ttl)}
+	for _, p := range out.Principals {
+		if !sshPrincipalRE.MatchString(p) {
+			return nil, fmt.Errorf("the role reads back with the principal %q", clipText(p))
+		}
+	}
 	if dc, ok := data["default_critical_options"].(map[string]any); ok {
 		if sa, _ := dc["source-address"].(string); sa != "" {
 			out.SourceAddress = splitList(sa)

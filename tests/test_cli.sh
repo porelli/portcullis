@@ -1561,11 +1561,11 @@ allowed_parameters = {
 "allow_user_certificates"  = ["true"]
 "allow_host_certificates"  = ["false"]
 "allow_user_key_ids"       = ["true"]
-"allowed_users"            = []
+"allowed_users"            = ["s:*", "u:*"]
 "allowed_extensions"       = ["permit-pty", "permit-pty,permit-port-forwarding",
 "permit-pty,permit-agent-forwarding",
 "permit-pty,permit-port-forwarding,permit-agent-forwarding"]
-"default_extensions"       = []
+"default_extensions"       = [{}]
 "allowed_critical_options" = ["", "source-address"]
 "default_critical_options" = []
 "allowed_user_key_lengths" = []

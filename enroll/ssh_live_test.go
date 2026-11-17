@@ -135,6 +135,17 @@ func TestLiveSSHVault(t *testing.T) {
 	refused("role force-command", "ssh_user/roles/hg-live", with("allowed_critical_options", "force-command"))
 	refused("role key_type otp", "ssh_user/roles/hg-live", with("key_type", "otp"))
 	refused("a role outside hg-*", "ssh_user/roles/web", base)
+	// Security review: no wildcard principal, no default extension.
+	refused("role allowed_users *", "ssh_user/roles/hg-live", with("allowed_users", "*"))
+	refused("role allowed_users * with a permit-pty default", "ssh_user/roles/hg-live", func() map[string]any {
+		m := with("allowed_users", "*")
+		m["default_extensions"] = map[string]any{"permit-pty": ""}
+		return m
+	}())
+	refused("role default_extensions permit-pty", "ssh_user/roles/hg-live", with("default_extensions", map[string]any{"permit-pty": ""}))
+	refused("role default_extensions X11", "ssh_user/roles/hg-live", with("default_extensions", map[string]any{"permit-X11-forwarding": ""}))
+	refused("role allowed_users_template", "ssh_user/roles/hg-live", with("allowed_users_template", "true"))
+	refused("role allowed_users not s:/u:", "ssh_user/roles/hg-live", with("allowed_users", "root"))
 	refused("the host role", "ssh_host/roles/host", map[string]any{"key_type": "ca", "allow_user_certificates": "true"})
 	refused("a new user CA", "ssh_user/config/ca", map[string]any{"generate_signing_key": "true"})
 	if back, err := ec.Logical().ReadWithContext(ctx, "ssh_user/roles/hg-live"); err != nil || back == nil {
@@ -187,6 +198,22 @@ func TestLiveSSHVault(t *testing.T) {
 	refused("a principal outside the role", "ssh_user/sign/hg-live", signBody("valid_principals", "u:bob@live"))
 	refused("an extension outside the role", "ssh_user/sign/hg-live", signBody("extensions", map[string]any{"permit-pty": "", "permit-port-forwarding": ""}))
 	refused("a role without hg-", "ssh_user/sign/web", signBody("", nil))
+
+	// An embedded "*" passes the policy (s:/u: prefix) but is no wildcard
+	// in Vault, and an exact entry is no glob.
+	_, err = ec.Logical().WriteWithContext(ctx, "ssh_user/roles/hg-star", func() map[string]any {
+		m := sshRoleWrite(sshRoleSpec{Principals: []string{"u:alice@star", "*"}, Extensions: "permit-pty", SourceAddress: []string{}, MaxTTLSeconds: 3600})
+		return m
+	}())
+	if err == nil {
+		refused("the embedded * signs root", "ssh_user/sign/hg-star", signBody("valid_principals", "root"))
+		refused("the embedded * signs u:bob", "ssh_user/sign/hg-star", signBody("valid_principals", "u:bob@star"))
+		_, _ = ec.Logical().DeleteWithContext(ctx, "ssh_user/roles/hg-star")
+	}
+	_, err = ec.Logical().WriteWithContext(ctx, "ssh_user/roles/hg-glob", sshRoleWrite(sshRoleSpec{Principals: []string{"u:*"}, Extensions: "permit-pty", SourceAddress: []string{}, MaxTTLSeconds: 3600}))
+	must(err, "glob role (passes the policy)")
+	refused("u:* isn't a glob in Vault", "ssh_user/sign/hg-glob", signBody("valid_principals", "u:bob@glob"))
+	_, _ = ec.Logical().DeleteWithContext(ctx, "ssh_user/roles/hg-glob")
 
 	// An empty principal list signs nothing.
 	_, err = cfg.putSSHRole(ctx, "empty", sshRoleSpec{Principals: []string{}, Extensions: "permit-pty", SourceAddress: []string{}, MaxTTLSeconds: 3600})

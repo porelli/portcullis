@@ -532,6 +532,17 @@ func TestSSHRoleStringEncoding(t *testing.T) {
 	if body["ttl"] != "14400" || body["max_ttl"] != "14400" || body["allowed_critical_options"] != "source-address" {
 		t.Errorf("write %v", body)
 	}
+	// A tampered read-back is refused (fail closed).
+	for name, d := range map[string]map[string]any{
+		"wildcard":          {"key_type": "ca", "allowed_users": "u:alice@web,*", "allowed_extensions": "permit-pty", "max_ttl": 3600},
+		"default extension": {"key_type": "ca", "allowed_users": "u:alice@web", "allowed_extensions": "permit-pty", "max_ttl": 3600, "default_extensions": map[string]any{"permit-pty": ""}},
+		"template":          {"key_type": "ca", "allowed_users": "u:alice@web", "allowed_extensions": "permit-pty", "max_ttl": 3600, "allowed_users_template": true},
+		"host certs":        {"key_type": "ca", "allowed_users": "u:alice@web", "allowed_extensions": "permit-pty", "max_ttl": 3600, "allow_host_certificates": true},
+	} {
+		if _, err := sshRoleRead(d); err == nil {
+			t.Errorf("read-back %s accepted", name)
+		}
+	}
 	roles, err := cfg.listSSHRoles(context.Background())
 	if err != nil || !reflect.DeepEqual(roles, []string{"hg-all", "hg-web"}) {
 		t.Errorf("list %v %v", roles, err)

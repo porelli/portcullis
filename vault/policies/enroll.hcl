@@ -79,6 +79,26 @@ path "pki_file/crl/rotate" {
 # the 12 h limit. Even with this policy enroll can't make a role that
 # issues host certificates, X11 / user-rc / force-command certificates or
 # certificates over 12 h.
+#
+# What a stolen enroll token can still do on a role (security review,
+# checked live on Vault 2.2.1 by TestLiveSSHVault):
+#   - allowed_users: only "s:…" / "u:…" lists (so never "*", whose bare
+#     value Vault reads as "any principal"); Vault matches every entry
+#     exactly (no glob, an embedded "*" entry isn't a wildcard, live), and
+#     allowed_users_template can't be set. The list's contents (which
+#     principals) can't be pinned here: enroll checks the grammar and the
+#     host group of each, and the Hub compares the read-back.
+#   - default_extensions: only {} (Vault applies a role's defaults without
+#     checking allowed_extensions, so a default could add X11 / user-rc;
+#     enroll sends the extensions map on every sign instead).
+#   - default_critical_options: not pinnable (the per-host-group
+#     source-address). The only OpenSSH critical options (force-command,
+#     source-address, verify-required) restrict a certificate, so the worst
+#     a stolen token does here is drop source-address — which writing the
+#     role with allowed_critical_options "" does as well.
+#   - allowed_user_key_lengths: not pinnable (Vault compares the policy's
+#     numbers with the request's JSON numbers by type and never matches, live);
+#     enroll accepts only the four key types itself.
 path "ssh_user/sign/hg-*" {
   capabilities = ["update"]
   # source-address comes from the role only; never a host certificate.
@@ -95,11 +115,11 @@ path "ssh_user/roles/hg-*" {
     "allow_user_certificates"  = ["true"]
     "allow_host_certificates"  = ["false"]
     "allow_user_key_ids"       = ["true"]
-    "allowed_users"            = []
+    "allowed_users"            = ["s:*", "u:*"]
     "allowed_extensions"       = ["permit-pty", "permit-pty,permit-port-forwarding",
                                   "permit-pty,permit-agent-forwarding",
                                   "permit-pty,permit-port-forwarding,permit-agent-forwarding"]
-    "default_extensions"       = []
+    "default_extensions"       = [{}]
     "allowed_critical_options" = ["", "source-address"]
     "default_critical_options" = []
     "allowed_user_key_lengths" = []
