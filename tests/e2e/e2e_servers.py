@@ -13,7 +13,8 @@ Cases, in this order (one function each):
   echo_on_worker_denied_without_sign_in
   no_portcullis_cookie_reaches_app      the app sees no Portcullis cookie
   parent_domain_set_cookie_stripped     a Set-Cookie for the parent domain comes back host-only
-  move_worker_primary_worker_keeps_data the volume's marker survives w1 → primary → w1
+  move_worker_primary_worker_keeps_data the volume's marker survives w1 → primary (move) → w1 (Undo move)
+  move_back_onto_kept_copy_refused      a direct move onto a server holding a kept copy is 409
   wg_stopped_fails_closed         wg down: the app is unreachable, its containers still run on w1
   wg_back_routes_again
   rogue_worker                    .github/ci/e2e-servers-rogue.sh (dind job: two workers)
@@ -458,10 +459,28 @@ def move_worker_primary_worker_keeps_data():
     mark = secrets.token_hex(8)
     marker("w1", mark)
     page = state["alice_page"]
-    for to, where in (("", "primary"), ("w1", "w1")):
-        run_op("POST", "/api/instances/se1/move", {"server": to}, timeout=900)
-        assert marker(where).strip() == mark, f"the marker after the move to {where or 'primary'}"
-        wait_for(f"se1 on {where}", lambda: f"MARKER={mark}" in echo(page, "se1")[1], 180)
+    run_op("POST", "/api/instances/se1/move", {"server": ""}, timeout=900)
+    assert marker("primary").strip() == mark, "the marker after the move to the primary"
+    wait_for("se1 on the primary", lambda: f"MARKER={mark}" in echo(page, "se1")[1], 180)
+    # Back onto w1, which keeps the previous copy: Undo move (contract
+    # §17.6 "Kept copies"; a direct move there is refused — next case).
+    body = dict(confirm="se1", **fresh_proof(state["admin_page"], "undo-se1"))
+    run_op("POST", "/api/instances/se1/move/undo", body, timeout=900)
+    assert marker("w1").strip() == mark, "the marker after the undo back to w1"
+    wait_for("se1 on w1 again", lambda: f"MARKER={mark}" in echo(page, "se1")[1], 180)
+    state["se1_moved"] = True
+
+
+def move_back_onto_kept_copy_refused():
+    needs("se1_moved")  # move_worker_primary_worker_keeps_data
+    # The undo left the primary's copy kept: a direct move there is refused
+    # up front, nothing sent, se1 still on w1.
+    code, ans = hub("POST", "/api/instances/se1/move", {"server": ""})
+    assert code == 409 and "still holds a previous copy of se1" in str(ans), f"a move onto the kept copy: {code} {str(ans)[:300]}"
+    lst = get("/api/instances")
+    rows = lst if isinstance(lst, list) else lst.get("instances", [])
+    se1 = [r for r in rows if r.get("id") == "se1"]
+    assert se1 and se1[0].get("server") == "w1", f"se1 left w1: {se1}"
 
 
 def wg_stopped_fails_closed():
@@ -581,6 +600,7 @@ def main() -> int:
         check("no_portcullis_cookie_reaches_app", no_portcullis_cookie_reaches_app)
         check("parent_domain_set_cookie_stripped", parent_domain_set_cookie_stripped)
         check("move_worker_primary_worker_keeps_data", move_worker_primary_worker_keeps_data)
+        check("move_back_onto_kept_copy_refused", move_back_onto_kept_copy_refused)
         check("wg_stopped_fails_closed", wg_stopped_fails_closed)
         check("wg_back_routes_again", wg_back_routes_again)
         check("rogue_worker", rogue_worker)
