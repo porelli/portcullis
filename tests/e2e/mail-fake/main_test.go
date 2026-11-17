@@ -107,6 +107,11 @@ func TestHonestPassesOwnAPI(t *testing.T) {
 	if c, b := call("PUT", "/v1/state", doc(2, false)); c != 409 || !bytes.Contains(b, []byte(`"removed"`)) {
 		t.Fatalf("mass removal: %d %s", c, b)
 	}
+	// The honest set: the MX on the document's mail host (a set the Hub's
+	// shared rules accept).
+	if c, b := call("GET", "/v1/dns/example.org?wildcard=false", ""); c != 200 || !bytes.Contains(b, []byte("10 mail.example.org.")) || bytes.Contains(b, []byte("attacker")) {
+		t.Fatalf("honest dns: %d %s", c, b)
+	}
 	if c, b := call("POST", "/v1/void", `{"reason":"restore"}`); c != 200 {
 		t.Fatalf("void: %d %s", c, b)
 	}

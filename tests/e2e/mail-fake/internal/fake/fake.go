@@ -270,8 +270,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			set, ok = mailprovider.DNSSet{Domain: d, DKIM: "auto", Records: []mailprovider.Record{{Name: "_mta-sts." + d, Type: "TXT", TTL: 3600, Value: "v=STSv1; id=fakedrain1"}}}, true
 		}
 		if !ok {
-			set = mailprovider.DNSSet{Domain: d, Records: []mailprovider.Record{{Name: d, Type: "MX", TTL: 3600, Value: "10 mail.example.org."},
-				{Name: "_dmarc." + d, Type: "TXT", TTL: 3600, Value: "v=DMARC1; p=reject; rua=mailto:dmarc-reports@" + d}}, DKIM: "auto"}
+			set = honestSet(d, s.Doc.MailHostname)
 		}
 		writeJSON(w, 200, set)
 	case p == "/v1/checks" && r.Method == http.MethodGet:
