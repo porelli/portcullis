@@ -1473,6 +1473,7 @@ jobs:
           dcli docker compose -p ci-hubproxy logs web >/dev/null || { echo "FAIL: compose logs"; exit 1; }
           dcli docker compose -p ci-hubproxy exec -T web /whoami --help >/dev/null 2>&1 || dcli docker compose -p ci-hubproxy top >/dev/null 2>&1 || true
           dcli docker compose -p ci-hubproxy restart web || { echo "FAIL: compose restart"; exit 1; }
+          .github/ci/usage-proxy-asserts.sh "$NET" "$(dcli docker compose -p ci-hubproxy ps -q web)"
           dcli docker compose -p ci-hubproxy down -v || { echo "FAIL: compose down -v"; exit 1; }
           for denied in "docker swarm init" "docker system df" "docker plugin ls" "docker secret ls" "docker node ls"; do
             # shellcheck disable=SC2086
@@ -2422,6 +2423,13 @@ jobs:
           E2E_CERT: /tmp/alice.crt
           E2E_KEY: /tmp/alice.key
         run: NODE_EXTRA_CA_CERTS=/tmp/e2e-ca-bundle.pem /tmp/e2e-venv/bin/python tests/e2e/e2e_instances.py
+
+      - name: The Usage page (e2e_usage.py)
+        timeout-minutes: 15
+        run: |
+          E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
+          export E2E_HUB_SECRET HUB_API="http://$HUB_IP:8888" E2E_PEOPLE_API="http://$HUB_IP:8889" E2E_USAGE_INSTANCE=echo-b
+          python3 tests/e2e/e2e_usage.py live
 
       - name: Instance backup → guarded delete → restore into a new id (real daemon)
         timeout-minutes: 15
@@ -4927,6 +4935,7 @@ jobs:
           dcli docker compose -p ci-hubproxy ps --format json | grep -q '"State":"running"' || { echo "FAIL: compose ps"; exit 1; }
           dcli docker compose -p ci-hubproxy logs web >/dev/null || { echo "FAIL: compose logs"; exit 1; }
           dcli docker compose -p ci-hubproxy restart web || { echo "FAIL: compose restart"; exit 1; }
+          .github/ci/usage-proxy-asserts.sh "$NET" "$(dcli docker compose -p ci-hubproxy ps -q web)" podman
           dcli docker compose -p ci-hubproxy down -v || { echo "FAIL: compose down -v"; exit 1; }
           for denied in "docker swarm init" "docker system df" "docker plugin ls" "docker secret ls" "docker node ls"; do
             # shellcheck disable=SC2086
@@ -5040,6 +5049,7 @@ jobs:
             sleep 2
           done
           python3 tests/e2e/e2e_podman.py
+          E2E_RUNTIME=podman python3 tests/e2e/e2e_usage.py live
 
       # V25: the VPN service under rootless Podman, as on Docker: vpn init,
       # wg healthy as 10006 with no capability, one built-in device's
