@@ -230,7 +230,12 @@ func (cfg *Config) revokeCert(ctx context.Context, user, serial string) error {
 // decodeAction decodes exactly one JSON object into v: ≤ maxActionBody
 // (else 413), no unknown fields, nothing after it (else 400).
 func decodeAction(w http.ResponseWriter, r *http.Request, v any) bool {
-	r.Body = http.MaxBytesReader(w, r.Body, maxActionBody)
+	return decodeActionMax(w, r, v, maxActionBody)
+}
+
+// decodeActionMax is decodeAction with its own cap.
+func decodeActionMax(w http.ResponseWriter, r *http.Request, v any, max int64) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, max)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	err := dec.Decode(v)

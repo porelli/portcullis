@@ -690,3 +690,20 @@ func TestSSHSignLogsNoKey(t *testing.T) {
 		t.Error("the answer echoes the public key")
 	}
 }
+
+// L-A2: a role of sshMaxPrincipals principals of the longest grammar fits
+// the role PUT's body cap (64 KiB, the other actions' cap, refused ~1,800).
+func TestSSHRoleMaxPrincipalsFits(t *testing.T) {
+	s, _ := sshTestService(t)
+	ps := make([]string, 0, sshMaxPrincipals)
+	for i := 0; i < sshMaxPrincipals; i++ {
+		ps = append(ps, fmt.Sprintf("u:%s%05d@%s", strings.Repeat("a", 27), i, strings.Repeat("w", 31)))
+	}
+	body := roleBody(ps, "permit-pty", nil, 3600)
+	if len(body) <= maxActionBody {
+		t.Fatalf("the body (%d bytes) doesn't exceed the general cap", len(body))
+	}
+	if w := sshDo(s, "PUT", "/internal/ssh-roles/"+strings.Repeat("w", 31), body); w.Code == 413 {
+		t.Errorf("a full role is refused as too large")
+	}
+}

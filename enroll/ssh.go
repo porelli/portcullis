@@ -45,7 +45,11 @@ const (
 	sshUserCap = 43200
 	sshHostCap = 7776000
 	// Limits (§18.8).
-	sshMaxPrincipals     = 4096
+	sshMaxPrincipals = 4096
+	// sshMaxRoleBody fits sshMaxPrincipals principals of the longest
+	// grammar (u: + 32 + @ + 31 = 66 characters, JSON-quoted with a comma:
+	// 69) and the rest of the role (L-A2: 64 KiB refused ~1,800).
+	sshMaxRoleBody       = 512 << 10
 	sshMaxCIDRs          = 16
 	sshMaxHostPrincipals = 64
 	sshMinValidSeconds   = 300
@@ -685,7 +689,7 @@ func (s *inviteService) handleSSHPutRole(w http.ResponseWriter, r *http.Request)
 	}
 	hg := r.PathValue("hg")
 	var spec sshRoleSpec
-	if !decodeAction(w, r, &spec) {
+	if !decodeActionMax(w, r, &spec, sshMaxRoleBody) {
 		return
 	}
 	if err := checkRole(hg, &spec); err != nil {

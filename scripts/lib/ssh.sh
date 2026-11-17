@@ -109,7 +109,7 @@ _ssh_ttl_seconds() {
 
 ssh_breakglass_cert() {
   local person="$1" account="$2" hg="$3" ttl="$4" keyfile="$5" note="$6"
-  local kind name principal secs pub type out signed info serial vb fp rec
+  local kind name principal secs pub type out signed info serial vb fp rec got
   require_cmd jq ssh-keygen
   if [ -n "$person" ] && [ -n "$account" ]; then usage_error "ssh breakglass-cert" "--user or --account, not both"; fi
   if [ -n "$person" ]; then kind=u name="$person"; elif [ -n "$account" ]; then kind=s name="$account"; else usage_error "ssh breakglass-cert" "--user or --account is required"; fi
@@ -144,7 +144,9 @@ ssh_breakglass_cert() {
   serial="$(printf '%s\n' "$info" | awk '$1 == "Serial:" {print $2; exit}')"
   vb="$(printf '%s\n' "$info" | awk '$1 == "Valid:" {print $5; exit}')"
   [[ "$serial" =~ ^[0-9]+$ ]] && [ -n "$vb" ] || fail "Vault's certificate lacks a serial or validity"
-  printf '%s\n' "$info" | grep -qx "[[:space:]]*$principal" || fail "Vault's certificate names other principals"
+  # Exactly the one principal asked for (L-A6: not a pattern, not "among").
+  got="$(printf '%s\n' "$info" | awk '/^[[:space:]]*Principals:/ {p = 1; next} /^[[:space:]]*Critical Options:/ {p = 0} p {sub(/^[[:space:]]+/, ""); print}')"
+  [ "$got" = "$principal" ] || fail "Vault's certificate names other principals"
   rec="$(jq -cn --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg u "$name" --arg hg "$hg" --arg p "$principal" --arg fp "$fp" \
       --arg s "$serial" --arg vb "${vb}Z" --arg n "$note" \
       '{time: $t, user: $u, host_group: $hg, principals: [$p], key_fp: $fp, serial: $s, valid_before: $vb, note: $n}')"

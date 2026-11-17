@@ -144,6 +144,16 @@
     {"in": "-web.example.com", "pattern": false, "name": false},
     {"in": "web..example.com", "pattern": false, "name": false},
     {"in": "!!web", "pattern": false, "name": false},
+    {"in": "*", "pattern": false, "name": false},
+    {"in": "!*", "pattern": false, "name": false},
+    {"in": "*.*", "pattern": false, "name": false},
+    {"in": "*.org", "pattern": false, "name": false},
+    {"in": "*.co.uk", "pattern": false, "name": false},
+    {"in": "*.lab", "pattern": false, "name": false},
+    {"in": "web-?.org", "pattern": false, "name": false},
+    {"in": "*.example.*", "pattern": false, "name": false},
+    {"in": "*.example.org", "pattern": true, "name": false},
+    {"in": "bastion", "pattern": true, "name": true},
     {"in": "", "pattern": false, "name": false}
   ],
   "key_types": [
