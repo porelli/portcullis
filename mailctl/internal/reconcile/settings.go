@@ -60,7 +60,7 @@ func DQSKey(path string) (string, error) {
 		return "", nil
 	}
 	if !reDQSKey.MatchString(k) {
-		return "", errors.New("MAIL_SPAMHAUS_DQS_KEY must be 8-64 letters and digits")
+		return "", errors.New("the stalwart app's dqs_key setting must be 8-64 letters and digits")
 	}
 	logx.AddSecret(k)
 	return k, nil

@@ -1,12 +1,15 @@
-// Command mailctl is the only holder of Stalwart's API key (integration
-// contract §19): it turns the Hub's desired state into Stalwart objects,
-// renders the mail record set, runs the DKIM / MTA-STS / TLSA / DMARC state
-// machines, serves the well-known files and the spam rules, runs the
-// checks and exposes metrics.
+// Command mailctl is the stalwart template's adapter (integration
+// contract §19): it serves the provider API v1 to the Hub, turns MailState
+// v2 into Stalwart objects, renders each mail domain's record set, runs the
+// DKIM / MTA-STS / DMARC state machines, serves the well-known files and
+// the spam rules, runs the checks and exposes metrics. It is the only
+// holder of Stalwart's API key; it has no control socket and no engine,
+// DNS, LLDAP or Keycloak access.
 //
-//	mailctl [serve]      run the service (the Hub API, well-known files, rules, metrics)
-//	mailctl healthcheck  exit 0 when the API answers /healthz on loopback
-//	mailctl bootstrap | void | dns | rotate | reload-tls | status | export | test
+//	mailctl [serve]                            run the adapter (gated: contract §19.4)
+//	mailctl healthcheck                        exit 0 when the API answers /healthz on loopback
+//	mailctl bootstrap --job -- <server argv…>  the template's one-off bootstrap job
+//	mailctl export --former <former-id>        one former account as mbox on stdout
 //
 // Unknown subcommands exit 2.
 package main
@@ -15,7 +18,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -24,8 +26,10 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -34,6 +38,7 @@ import (
 	"github.com/portcullis/mailctl/internal/checks"
 	"github.com/portcullis/mailctl/internal/config"
 	"github.com/portcullis/mailctl/internal/export"
+	"github.com/portcullis/mailctl/internal/gate"
 	"github.com/portcullis/mailctl/internal/logx"
 	"github.com/portcullis/mailctl/internal/machines"
 	"github.com/portcullis/mailctl/internal/mailtest"
@@ -47,7 +52,7 @@ import (
 	"github.com/portcullis/mailctl/internal/wellknown"
 )
 
-const usage = `usage: mailctl [serve|healthcheck|bootstrap [--rotate-key|--verify-gone]|export]`
+const usage = `usage: mailctl [serve | healthcheck | bootstrap --job -- <server argv…> | export --former <former-id>]`
 
 // later are the subcommands later tasks fill (each talks to the running
 // serve process or to Stalwart directly, as its task says).
@@ -73,7 +78,7 @@ func run(args []string, env func(string) string, stdout, stderr io.Writer) int {
 	case cmd == "healthcheck":
 		return healthcheck(env)
 	case cmd == "bootstrap":
-		return bootstrapCmd(args[1:], env, os.Stdin, stdout, stderr)
+		return bootstrapCmd(args[1:], env, stderr)
 	case cmd == "export":
 		return exportCmd(args[1:], env, stdout, stderr)
 	case later[cmd]:
@@ -106,25 +111,30 @@ func healthcheck(env func(string) string) int {
 	return 0
 }
 
-// checkStart is the fail-closed start check (contract §19.5): the API key
-// and the Hub secret are present, and one of this container's addresses is
-// inside MAILCTL_API_SUBNET (its portcullis-mailctl address).
+// checkStart is the fail-closed start check (contract §19.4, §19.5): the
+// gate predicate (P3) over the slot's files, the API secret, the metrics
+// secret and Stalwart's API key present, PORTCULLIS_MAIL_API_SUBNET parsed
+// (config.Load) and one of this container's addresses inside it (the
+// override's pinned provider address on portcullis-mail-api).
 func checkStart(cfg config.Config, addrs func() ([]net.Addr, error)) error {
-	key, err := api.ReadSecret(cfg.APIKeyFile, 1)
-	if err != nil {
-		return fmt.Errorf("Stalwart's API key: %w (run ./portcullis mail enable)", err)
+	if err := gate.Check(cfg.SlotDir, cfg.VoidSession); err != nil {
+		return err
 	}
-	logx.AddSecret(key)
-	hub, err := api.ReadSecret(cfg.HubSecretFile, api.MinSecret)
+	hub, err := api.ReadSecret(cfg.APISecretFile(), api.MinSecret)
 	if err != nil {
-		return fmt.Errorf("the Hub secret: %w", err)
+		return fmt.Errorf("the API secret: %w", err)
 	}
 	logx.AddSecret(hub)
-	ms, err := api.ReadSecret(cfg.MetricsSecretFile, metrics.MinSecret)
+	ms, err := api.ReadSecret(cfg.MetricsSecretFile(), metrics.MinSecret)
 	if err != nil {
 		return fmt.Errorf("the metrics secret: %w", err)
 	}
 	logx.AddSecret(ms)
+	key, err := api.ReadSecret(cfg.APIKeyFile, 1)
+	if err != nil {
+		return fmt.Errorf("Stalwart's API key: %w (the bootstrap job writes it)", err)
+	}
+	logx.AddSecret(key)
 	as, err := addrs()
 	if err != nil {
 		return fmt.Errorf("reading this container's addresses: %w", err)
@@ -138,7 +148,7 @@ func checkStart(cfg config.Config, addrs func() ([]net.Addr, error)) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("no address of this container is inside MAILCTL_API_SUBNET=%s (not on portcullis-mailctl?)", cfg.APISubnet)
+	return fmt.Errorf("no address of this container is inside PORTCULLIS_MAIL_API_SUBNET=%s (not wired on portcullis-mail-api?)", cfg.APISubnet)
 }
 
 func serve(env func(string) string, stderr io.Writer) error {
@@ -176,13 +186,13 @@ func serve(env func(string) string, stderr io.Writer) error {
 	}
 	mc.Serving = serving
 	v1 := &api.V1{Store: st, C: sw, Runner: runner, Logf: logger.Printf, M: mc, Checks: ck,
-		TLSDir: bootstrap.TLSDir, Serving: serving, Export: true, Test: testSender(cfg, sw)}
-	apiSrv := &api.Server{Subnet: cfg.APISubnet, SecretFile: cfg.HubSecretFile, Logf: logger.Printf, Handler: v1.Handler()}
+		TLSDir: cfg.TLSDir, Serving: serving, Export: true, Test: testSender(cfg, sw)}
+	apiSrv := &api.Server{Subnet: cfg.APISubnet, SecretFile: cfg.APISecretFile(), Logf: logger.Printf, Handler: v1.Handler()}
 	servers := []*http.Server{
 		newServer(cfg.APIAddr, apiSrv),
 		newServer(cfg.WellKnownAddr, wellknown.Handler(mc)),
 		newServer(cfg.RulesAddr, spamrules.Handler()),
-		newServer(cfg.MetricsAddr, m.Handler(cfg.MetricsSecretFile, api.ReadSecret, logger.Printf)),
+		newServer(cfg.MetricsAddr, m.Handler(cfg.MetricsSecretFile(), api.ReadSecret, logger.Printf)),
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -289,92 +299,87 @@ func keepLookupsOff(ctx context.Context, sw *stalwart.Client, st *state.Store, l
 	}
 }
 
-// bootstrapCmd is `mailctl bootstrap [--rotate-key]` (stdin: the input,
-// contract §19.4) and `mailctl bootstrap --verify-gone` (stdin: the
-// recovery credentials; exit 0 only when the login is refused).
-func bootstrapCmd(args []string, env func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
-	rotate, verify := false, false
-	for _, a := range args {
-		switch a {
-		case "--rotate-key":
-			rotate = true
-		case "--verify-gone":
-			verify = true
-		default:
-			fmt.Fprintln(stderr, "usage: mailctl bootstrap [--rotate-key | --verify-gone] < input.json")
-			return 2
-		}
-	}
-	if rotate && verify {
-		fmt.Fprintln(stderr, "mailctl bootstrap: --rotate-key and --verify-gone exclude each other")
+// bootstrapCmd is `mailctl bootstrap --job -- <server argv…>`: the
+// template's one-off job (bootstrap.Job). The server argv is started as a
+// child process (its environment plus the job's; the recovery password
+// only ever in that environment), never through a shell.
+func bootstrapCmd(args []string, env func(string) string, stderr io.Writer) int {
+	if len(args) < 3 || args[0] != "--job" || args[1] != "--" {
+		fmt.Fprintln(stderr, "usage: mailctl bootstrap --job -- <server argv…>")
 		return 2
 	}
-	cfg, err := config.Load(env)
+	argv := args[2:]
+	cfg, err := config.LoadJob(env)
 	if err != nil {
 		fmt.Fprintf(stderr, "mailctl bootstrap: %s\n", logx.Redact(err.Error()))
 		return 1
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	if verify {
-		cr, err := bootstrap.ReadCredentials(stdin)
-		if err != nil {
-			fmt.Fprintf(stderr, "mailctl bootstrap --verify-gone: %v\n", err)
-			return 2
-		}
-		logx.AddSecret(cr.RecoveryPassword)
-		if err := bootstrap.VerifyGone(ctx, cfg.StalwartURL, cr); err != nil {
-			fmt.Fprintf(stderr, "mailctl bootstrap --verify-gone: %s\n", logx.Redact(err.Error()))
-			return 1
-		}
-		return 0
-	}
-	in, err := bootstrap.ReadInput(stdin)
+	p, err := planParams(cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "mailctl bootstrap: %v\n", err)
-		return 2
+		return 1
 	}
-	logx.AddSecret(in.RecoveryPassword)
 	logger := logx.New(stderr)
-	p, err := planParams(cfg, in)
-	if err != nil {
-		fmt.Fprintf(stderr, "mailctl bootstrap: %v\n", err)
-		return 1
-	}
-	res, err := bootstrap.Apply(ctx, stalwart.New(cfg.StalwartURL, stalwart.Basic(in.RecoveryUser, in.RecoveryPassword)), p, rotate, logger.Printf)
-	if err != nil {
+	j := &bootstrap.Job{URL: cfg.StalwartURL, DataDir: cfg.DataDir, SessionFile: cfg.JobSessionFile, ServerImage: cfg.ServerImage,
+		Params: p, Start: childServer(argv, stderr), Logf: logger.Printf}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	if err := j.Run(ctx); err != nil {
 		fmt.Fprintf(stderr, "mailctl bootstrap: %s\n", logx.Redact(err.Error()))
 		return 1
 	}
-	out := map[string]any{"api_key": nil}
-	if res.APIKey != "" {
-		out["api_key"] = res.APIKey
-	}
-	b, _ := json.Marshal(out)
-	fmt.Fprintln(stdout, string(b))
 	return 0
 }
 
-func planParams(cfg config.Config, in bootstrap.Input) (bootstrap.Params, error) {
+// childServer starts argv with the job's environment plus env; stop sends
+// SIGTERM and waits (30 s, then SIGKILL).
+func childServer(argv []string, out io.Writer) bootstrap.Server {
+	return func(ctx context.Context, extra []string) (func() error, error) {
+		for _, e := range extra {
+			if strings.HasPrefix(e, "STALWART_RECOVERY_ADMIN=") {
+				_, pw, _ := strings.Cut(strings.TrimPrefix(e, "STALWART_RECOVERY_ADMIN="), ":")
+				logx.AddSecret(pw)
+			}
+		}
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Env = append(os.Environ(), extra...)
+		cmd.Stdout, cmd.Stderr = out, out
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		done := make(chan error, 1)
+		go func() { done <- cmd.Wait() }()
+		return func() error {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+			select {
+			case <-done:
+			case <-time.After(30 * time.Second):
+				_ = cmd.Process.Kill()
+				<-done
+			}
+			return nil
+		}, nil
+	}
+}
+
+// planParams is the neutral part of the base plan from the template's
+// wiring (the document's part comes from adapter_data or ApplyDoc).
+func planParams(cfg config.Config) (bootstrap.Params, error) {
 	u, err := url.Parse(cfg.StalwartURL)
 	if err != nil {
 		return bootstrap.Params{}, err
 	}
 	mailIP, err := netip.ParseAddr(u.Hostname())
 	if err != nil {
-		return bootstrap.Params{}, fmt.Errorf("MAILCTL_STALWART_URL=%s: the host must be mail's address", cfg.StalwartURL)
+		return bootstrap.Params{}, fmt.Errorf("MAILCTL_STALWART_URL=%s: the host must be the server's address", cfg.StalwartURL)
 	}
 	res, _ := netip.ParseAddrPort(cfg.LocalResolver)
 	lookups, err := spamrules.HTTPLookups()
 	if err != nil {
 		return bootstrap.Params{}, err
 	}
-	return bootstrap.Params{
-		Hostname: in.Hostname, PrimaryDomain: in.PrimaryDomain, MailIP: mailIP, MailctlIP: cfg.MailIP,
-		ResolverIP: res.Addr(), ResolverPort: int(res.Port()),
-		RulesURL: "http://" + cfg.RulesAddr + spamrules.Path, ClientIP: in.ClientIP,
-		Relay: in.Relay, MetricsUser: in.MetricsUser, HTTPLookups: lookups, LocalNetworks: in.LocalNetworks, LANOnly: in.LANOnly,
-	}, nil
+	return bootstrap.Params{MailIP: mailIP, MailctlIP: cfg.MailIP, ResolverIP: res.Addr(), ResolverPort: int(res.Port()),
+		RulesURL: "http://" + cfg.RulesAddr + spamrules.Path, MetricsUser: metrics.User, HTTPLookups: lookups}, nil
 }
 
 // exportCmd is `mailctl export --former <former-id>` (M5): mbox to stdout,
@@ -402,7 +407,7 @@ func exportCmd(args []string, env func(string) string, stdout, stderr io.Writer)
 		return 1
 	}
 	e := &export.Exporter{C: stalwart.New(cfg.StalwartURL, stalwart.Bearer(key)), IMAPAddr: net.JoinHostPort(u.Hostname(), "10993"),
-		ServerName: cfg.Hostname, MailctlIP: cfg.MailIP, SPKI: state.SPKIs(st.Get()), DataDir: cfg.DataDir}
+		ServerName: hostOf(st.Get()), MailctlIP: cfg.MailIP, SPKI: state.SPKIs(st.Get()), DataDir: cfg.DataDir}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 	n, err := e.Export(ctx, args[1], stdout)
@@ -417,4 +422,12 @@ func exportCmd(args []string, env func(string) string, stdout, stderr io.Writer)
 	}
 	logger.Printf("export former=%s messages=%d", args[1], n)
 	return 0
+}
+
+// hostOf is the accepted document's mail_hostname ("" = none yet).
+func hostOf(p state.Persistent) string {
+	if p.Doc == nil {
+		return ""
+	}
+	return p.Doc.MailHostname
 }

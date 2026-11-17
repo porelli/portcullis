@@ -91,7 +91,7 @@ const extPort25 = "port25_reached_at"
 
 // Port25Steps are the provider guidance when outbound port 25 is blocked.
 var Port25Steps = []string{
-	"Your hosting provider blocks outbound port 25: ask it to open the port for this server, or send through a relay (MAIL_RELAY_HOST in .env, then ./portcullis mail enable).",
+	"Your hosting provider blocks outbound port 25: ask it to open the port for this server, or send through a relay (Settings → Mail → Relay).",
 	"Hetzner: request it in the Cloud Console once the first invoice is paid (Support → Limits → \"Unblock port 25\").",
 	"DigitalOcean: outbound SMTP stays blocked on new accounts; ask support or use a relay.",
 	"AWS EC2: submit the \"Request to remove email sending limitations\" form for the instance's Elastic IP.",

@@ -84,7 +84,7 @@ func sortedEq(a, b []string) bool {
 
 // Plan computes the ops that make Stalwart match want. former is mailctl's
 // record of parked accounts (old uuid → since); retention is
-// MAIL_FORMER_RETENTION; confirmed is the removal set the document's
+// the document's former_retention; confirmed is the removal set the document's
 // confirm_mass_removal was bound to at its PUT (nil = none).
 func Plan(l *Live, want *state.Doc, former map[string]state.Former, now time.Time, retention time.Duration, confirmed *state.MassRemoval) (Ops, error) {
 	var ops Ops

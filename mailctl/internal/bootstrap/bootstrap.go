@@ -1,7 +1,6 @@
 package bootstrap
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -19,88 +18,10 @@ import (
 	"github.com/portcullis/mailctl/internal/stalwart"
 )
 
-// Input is `mailctl bootstrap`'s stdin (contract §19.4).
-type Input struct {
-	RecoveryUser     string   `json:"recovery_user"`
-	RecoveryPassword string   `json:"recovery_password"`
-	Hostname         string   `json:"hostname"`
-	PrimaryDomain    string   `json:"primary_domain"`
-	ClientIP         string   `json:"client_ip"`
-	LANOnly          bool     `json:"lan_only"`
-	LocalNetworks    []string `json:"local_networks"`
-	Relay            *Relay   `json:"relay"`
-	MetricsUser      string   `json:"metrics_user"`
-}
-
-// Credentials is `mailctl bootstrap --verify-gone`'s stdin.
+// Credentials are a recovery admin's login (VerifyGone).
 type Credentials struct {
-	RecoveryUser     string `json:"recovery_user"`
-	RecoveryPassword string `json:"recovery_password"`
-}
-
-// decodeStrict reads exactly one JSON object (≤ 64 KiB): unknown keys and
-// trailing data refused.
-func decodeStrict(r io.Reader, v any) error {
-	b, err := io.ReadAll(io.LimitReader(r, 64<<10+1))
-	if err != nil {
-		return fmt.Errorf("reading stdin: %w", err)
-	}
-	if len(b) > 64<<10 {
-		return errors.New("stdin is larger than 64 KiB")
-	}
-	d := json.NewDecoder(bytes.NewReader(b))
-	d.DisallowUnknownFields()
-	if err := d.Decode(v); err != nil {
-		return fmt.Errorf("stdin: %w", err)
-	}
-	if d.More() {
-		return errors.New("stdin: trailing data after the object")
-	}
-	if _, err := d.Token(); err != io.EOF {
-		return errors.New("stdin: trailing data after the object")
-	}
-	return nil
-}
-
-// ReadInput decodes and checks the bootstrap input.
-func ReadInput(r io.Reader) (Input, error) {
-	var in Input
-	if err := decodeStrict(r, &in); err != nil {
-		return in, err
-	}
-	switch {
-	case in.RecoveryUser == "" || in.RecoveryPassword == "":
-		return in, errors.New("recovery_user and recovery_password are required")
-	case in.Hostname == "" || !strings.Contains(in.Hostname, "."):
-		return in, errors.New("hostname is required (MAIL_HOSTNAME)")
-	case in.PrimaryDomain == "":
-		return in, errors.New("primary_domain is required")
-	case in.ClientIP != "preserved" && in.ClientIP != "rewritten":
-		return in, errors.New("client_ip must be preserved or rewritten")
-	case in.MetricsUser == "":
-		return in, errors.New("metrics_user is required")
-	}
-	for _, n := range in.LocalNetworks {
-		if _, err := netip.ParsePrefix(n); err != nil {
-			return in, fmt.Errorf("local_networks: %q is not a network", n)
-		}
-	}
-	if r := in.Relay; r != nil && (r.Host == "" || r.Port < 1 || r.Port > 65535) {
-		return in, errors.New("relay needs a host and a port")
-	}
-	return in, nil
-}
-
-// ReadCredentials decodes --verify-gone's input.
-func ReadCredentials(r io.Reader) (Credentials, error) {
-	var c Credentials
-	if err := decodeStrict(r, &c); err != nil {
-		return c, err
-	}
-	if c.RecoveryUser == "" || c.RecoveryPassword == "" {
-		return c, errors.New("recovery_user and recovery_password are required")
-	}
-	return c, nil
+	RecoveryUser     string
+	RecoveryPassword string
 }
 
 type object = map[string]json.RawMessage
@@ -319,7 +240,9 @@ func Apply(ctx context.Context, c *stalwart.Client, p Params, rotateKey bool, lo
 	for _, s := range p.Singletons() {
 		if s.Object == "SystemSettings" {
 			s.Patch["defaultCertificateId"] = certID
-			s.Patch["defaultDomainId"] = ids["Domain"][p.PrimaryDomain]
+			if p.PrimaryDomain != "" {
+				s.Patch["defaultDomainId"] = ids["Domain"][p.PrimaryDomain]
+			}
 		}
 		if err := updateSingleton(ctx, c, s); err != nil {
 			return res, err

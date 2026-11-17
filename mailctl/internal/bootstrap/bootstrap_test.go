@@ -490,24 +490,6 @@ func TestAllowedEndpointsPinsMailctl(t *testing.T) {
 	}
 }
 
-func TestReadInputStrict(t *testing.T) {
-	ok := `{"recovery_user":"u","recovery_password":"p","hostname":"mail.example.com","primary_domain":"example.com","client_ip":"preserved","lan_only":false,"local_networks":["10.0.0.0/8"],"relay":null,"metrics_user":"prometheus"}`
-	if _, err := ReadInput(strings.NewReader(ok)); err != nil {
-		t.Fatal(err)
-	}
-	for _, bad := range []string{
-		strings.Replace(ok, `"lan_only"`, `"extra":1,"lan_only"`, 1),
-		ok + `{}`,
-		strings.Replace(ok, `"preserved"`, `"auto"`, 1),
-		strings.Replace(ok, `"10.0.0.0/8"`, `"ten"`, 1),
-		strings.Replace(ok, `"recovery_password":"p"`, `"recovery_password":""`, 1),
-	} {
-		if _, err := ReadInput(strings.NewReader(bad)); err == nil {
-			t.Errorf("accepted %s", bad)
-		}
-	}
-}
-
 func TestEveryUsedFieldInSchema(t *testing.T) {
 	raw, err := os.ReadFile("../stalwart/testdata/schema-v1.1.0.json")
 	if err != nil {

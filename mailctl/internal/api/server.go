@@ -1,6 +1,6 @@
 // Package api is mailctl's Hub API (integration contract §19.5): served on
-// mailctl's portcullis-mailctl address only, behind the Hub ⇄ mailctl
-// bearer secret. A request addressed outside MAILCTL_API_SUBNET, or with
+// the adapter's portcullis-mail-api address only, behind the Hub ⇄ provider
+// bearer secret. A request addressed outside PORTCULLIS_MAIL_API_SUBNET, or with
 // another bearer, gets 403 and an empty body; GET /healthz answers on
 // loopback only (the container's health check).
 package api
@@ -43,7 +43,7 @@ func ReadSecret(path string, min int) (string, error) {
 
 // Server guards Handler (the v1 routes).
 type Server struct {
-	Subnet     netip.Prefix // MAILCTL_API_SUBNET
+	Subnet     netip.Prefix // PORTCULLIS_MAIL_API_SUBNET
 	SecretFile string       // read at every request (a rotated secret works at once)
 	Handler    http.Handler
 	Logf       func(string, ...any)
@@ -85,7 +85,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte("ok\n"))
 			return
 		}
-		s.logf("api: refused a request to %s (not on portcullis-mailctl)", ip)
+		s.logf("api: refused a request to %s (not on portcullis-mail-api)", ip)
 		refuse(w)
 		return
 	}

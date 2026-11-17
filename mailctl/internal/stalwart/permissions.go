@@ -52,7 +52,7 @@ var MailctlRolePermissions = func() []string {
 		"sysMtaOutboundThrottleGet", "sysMtaOutboundThrottleCreate", "sysMtaOutboundThrottleUpdate", "sysMtaOutboundThrottleDestroy", "sysMtaOutboundThrottleQuery",
 		"sysMtaTlsStrategyGet", "sysMtaTlsStrategyQuery", "sysMtaTlsStrategyUpdate",
 		// The per-account limits (MtaInboundThrottle) and, with
-		// MAIL_SUBMISSION_LAN_ONLY, the SASL rule (MtaStageAuth).
+		// submission_lan_only, the SASL rule (MtaStageAuth).
 		"sysMtaInboundThrottleGet", "sysMtaInboundThrottleCreate", "sysMtaInboundThrottleUpdate",
 		"sysMtaInboundThrottleDestroy", "sysMtaInboundThrottleQuery",
 		"sysMtaStageAuthGet", "sysMtaStageAuthUpdate",

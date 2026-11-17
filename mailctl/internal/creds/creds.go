@@ -1,7 +1,7 @@
 // Package creds is mail passwords: Stalwart app passwords created only for
 // a person (contract §19.6), at most 5 active, permissions Replace =
 // MailPasswordPermissions (M6), allowed IPs the Local networks with
-// MAIL_SUBMISSION_LAN_ONLY. The secret exists once, in the create answer.
+// submission_lan_only. The secret exists once, in the create answer.
 package creds
 
 import (

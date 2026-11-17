@@ -25,9 +25,12 @@ const (
 	APIKeyName     = "mailctl"
 	SMTPPort       = 10025 // the MX listener (host port 25)
 	TLSDir         = "/run/portcullis/mail/tls"
-	MetricsSecret  = "/run/portcullis/mail/metrics-secret"
-	RelaySecret    = "/run/portcullis/mail/relay-password"
-	RulesPath      = "/spam-filter-rules.json.gz"
+	// The slot's files, mounted by the Hub's override at a fixed path
+	// into the gated services (contract §19.1).
+	SlotDir       = "/run/portcullis/mail/slot"
+	MetricsSecret = SlotDir + "/metrics-secret"
+	RelaySecret   = SlotDir + "/relay-password"
+	RulesPath     = "/spam-filter-rules.json.gz"
 )
 
 // Sieve scripts selected by the RCPT and DATA stage expressions (trusted
@@ -65,7 +68,7 @@ type Params struct {
 	MetricsUser   string
 	HTTPLookups   []map[string]any // the spam rules' HttpLookups (created disabled)
 	LocalNetworks []string
-	// LANOnly: MAIL_SUBMISSION_LAN_ONLY (the SASL rule admits only the
+	// LANOnly: submission_lan_only (the SASL rule admits only the
 	// Local networks; loopback only with rewritten client addresses).
 	LANOnly bool
 }
@@ -281,6 +284,24 @@ if not address :all :is "from" "${ef}" {
 }
 `
 
+// systemSettings: the host name only once a document named it (the
+// bootstrap job's first run has none; ApplyDoc writes it).
+func (p Params) systemSettings() map[string]any {
+	m := map[string]any{"maxBufferedMemory": 134217728}
+	if p.Hostname != "" {
+		m["defaultHostname"] = p.Hostname
+	}
+	return m
+}
+
+func (p Params) domains() []map[string]any {
+	d := []map[string]any{{"name": ParkingDomain}}
+	if p.PrimaryDomain != "" {
+		d = append(d, map[string]any{"name": p.PrimaryDomain})
+	}
+	return d
+}
+
 // Singletons are the settings the plan sets on every run.
 func (p Params) Singletons() []Singleton {
 	tlsStrategy := "'default'"
@@ -289,7 +310,7 @@ func (p Params) Singletons() []Singleton {
 		tlsStrategy, route = "'relay-strict'", "'relay'"
 	}
 	ss := []Singleton{
-		{"SystemSettings", map[string]any{"defaultHostname": p.Hostname, "maxBufferedMemory": 134217728}},
+		{"SystemSettings", p.systemSettings()},
 		{"Cache", map[string]any{"messagesLarge": 0, "groupwareLarge": 0, "messages": 67108864}},
 		{"DnsResolver", map[string]any{"@type": "Custom", "servers": list(
 			map[string]any{"protocol": "udp", "address": p.ResolverIP.String(), "port": p.ResolverPort},
@@ -380,7 +401,7 @@ func (p Params) Collections() []Named {
 			{"description": MailctlRole, "enabledPermissions": set(stalwart.MailctlRolePermissions...)},
 			{"description": UserRole, "enabledPermissions": set(stalwart.MailPasswordPermissions...)},
 		}},
-		{Object: "Domain", Key: "name", Immutable: []string{"name"}, Want: []map[string]any{{"name": ParkingDomain}, {"name": p.PrimaryDomain}}},
+		{Object: "Domain", Key: "name", Immutable: []string{"name"}, Want: p.domains()},
 	}
 }
 
@@ -406,6 +427,7 @@ func init() {
 		ResolverIP: netip.MustParseAddr("192.0.2.4"), ResolverPort: 5353, ClientIP: "rewritten",
 		Relay: &Relay{Host: "r.example", Port: 465, Username: "u"}, MetricsUser: "prometheus",
 		HTTPLookups: []map[string]any{{"namespace": "x", "url": "https://x.example", "format": map[string]any{"@type": "List"}}}}
+	stalwart.Used = append(stalwart.Used, stalwart.Use{Object: "x:SystemSettings", Field: "defaultHostname"})
 	reg := func(obj string, m map[string]any) {
 		variant := ""
 		if t, ok := m["@type"].(string); ok {
