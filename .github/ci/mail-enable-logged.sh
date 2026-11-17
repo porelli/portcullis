@@ -12,7 +12,7 @@ out="${2:?usage: mail-enable-logged.sh <provider> <out file>}"
 logs="${MAIL_CI_LOGS:-/tmp/mail-instance-logs}"
 rm -rf "$logs" && mkdir -p "$logs"
 # Every container of the project, once per id (a job re-run is a new
-# container): its log appended as <service>.log, its state kept; polled
+# container): its log as <service>.<id>.log, its state kept; polled
 # every half second (the Hub removes a failed install's containers within
 # seconds).
 (
@@ -20,7 +20,8 @@ rm -rf "$logs" && mkdir -p "$logs"
     for c in $(docker ps -aq --filter "label=com.docker.compose.project=portcullis-$provider" 2>/dev/null); do
       n="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$c" 2>/dev/null)" || continue
       st="$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "$c" 2>/dev/null)" || continue
-      docker logs "$c" > "$logs/$n.$c.log" 2>&1 || true
+      # Kept only when read (a container removed meanwhile keeps its last copy).
+      docker logs "$c" > "$logs/.tmp" 2>&1 && mv "$logs/.tmp" "$logs/$n.$c.log"
       echo "$st" > "$logs/$n.$c.state"
     done
     sleep 0.5
