@@ -5692,7 +5692,7 @@ jobs:
           certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
       - name: Servers (join, routing, cookies, move, fail closed, rogue worker, revoke)
         timeout-minutes: 35
-        run: /tmp/e2e-venv/bin/python tests/e2e/e2e_servers.py
+        run: NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_servers.py
       - name: Collect logs (never .env, secrets/, a join code)
         if: failure()
         run: |
@@ -5759,7 +5759,7 @@ jobs:
           certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
       - name: Servers (join, routing, cookies, move, fail closed, rogue worker, revoke)
         timeout-minutes: 35
-        run: /tmp/e2e-venv/bin/python tests/e2e/e2e_servers.py
+        run: NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_servers.py
       - name: Collect logs (never .env, secrets/, a join code)
         if: failure()
         run: |
