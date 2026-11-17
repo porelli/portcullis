@@ -34,6 +34,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
@@ -166,9 +167,12 @@ type result struct {
 	// within --hold (Closed false).
 	Closed bool    `json:"closed,omitempty"`
 	HeldS  float64 `json:"held_s,omitempty"`
-	// --probe: the TCP ports that accepted a connection, of Probed.
-	Open   []int `json:"open,omitempty"`
-	Probed int   `json:"probed,omitempty"`
+	// --probe: the TCP ports that accepted a connection, of Probed;
+	// Refused counts the ports that answered with a reset (closed for
+	// sure); the rest (timeouts, other errors) prove nothing.
+	Open    []int `json:"open,omitempty"`
+	Probed  int   `json:"probed,omitempty"`
+	Refused int   `json:"refused"`
 }
 
 // closeConn tells when the HTTP transport closes its connection (it does
@@ -276,7 +280,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return emit(0)
 	}
 	if *probe != "" {
-		out.Open, out.Probed = probeTCP(tnet, probeAddr, probePorts), len(probePorts)
+		out.Open, out.Refused = probeTCP(tnet, probeAddr, probePorts)
+		out.Probed = len(probePorts)
 		return emit(0)
 	}
 	if err := fetch(ctx, tnet, *get, res, *caFile, *headerFile, *hold, &out); err != nil {
@@ -478,12 +483,12 @@ func parsePorts(v string) ([]int, error) {
 }
 
 // probeTCP dials every port (64 at a time, 2 s each): the ports that
-// accepted a connection, sorted.
-func probeTCP(tnet *netstack.Net, addr netip.Addr, ports []int) []int {
+// accepted a connection, sorted, and how many answered with a reset.
+func probeTCP(tnet *netstack.Net, addr netip.Addr, ports []int) ([]int, int) {
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 64)
-	open := []int{}
+	open, refused := []int{}, 0
 	for _, p := range ports {
 		wg.Add(1)
 		sem <- struct{}{}
@@ -492,15 +497,25 @@ func probeTCP(tnet *netstack.Net, addr netip.Addr, ports []int) []int {
 			defer func() { <-sem }()
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			if c, err := tnet.DialContextTCPAddrPort(ctx, netip.AddrPortFrom(addr, uint16(p))); err == nil {
+			c, err := tnet.DialContextTCPAddrPort(ctx, netip.AddrPortFrom(addr, uint16(p)))
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
 				c.Close()
-				mu.Lock()
 				open = append(open, p)
-				mu.Unlock()
+			case isRefused(err):
+				refused++
 			}
 		}(p)
 	}
 	wg.Wait()
 	sort.Ints(open)
-	return open
+	return open, refused
+}
+
+// isRefused: the dial was answered with a reset (gVisor's "connection was
+// refused"), not a timeout.
+func isRefused(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) || strings.Contains(err.Error(), "refused")
 }
