@@ -406,6 +406,7 @@ jobs:
             docker run --rm -v /tmp/am:/c:ro --entrypoint amtool "$AM" check-config /c/alertmanager.yml
           done
           jq -e '.uid == "portcullis" and (.panels | length) > 0' monitoring/grafana/dashboards/portcullis.json >/dev/null
+          jq -e '.uid == "portcullis-usage" and .title == "Portcullis usage" and (.panels | length) >= 5' monitoring/grafana/dashboards/usage.json >/dev/null
           echo "PASS: prometheus config + rules (+ rule tests), alertmanager receivers, blackbox modules, dashboard"
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -1501,6 +1502,7 @@ jobs:
           dcli docker compose -p ci-hubproxy logs web >/dev/null || { echo "FAIL: compose logs"; exit 1; }
           dcli docker compose -p ci-hubproxy exec -T web /whoami --help >/dev/null 2>&1 || dcli docker compose -p ci-hubproxy top >/dev/null 2>&1 || true
           dcli docker compose -p ci-hubproxy restart web || { echo "FAIL: compose restart"; exit 1; }
+          .github/ci/usage-proxy-asserts.sh "$NET" "$(dcli docker compose -p ci-hubproxy ps -q web)"
           dcli docker compose -p ci-hubproxy down -v || { echo "FAIL: compose down -v"; exit 1; }
           for denied in "docker swarm init" "docker system df" "docker plugin ls" "docker secret ls" "docker node ls"; do
             # shellcheck disable=SC2086
@@ -2176,6 +2178,8 @@ jobs:
           for i in $(seq 1 40); do
             UP="$(qq 'up == 1' | jq -r '[.data.result[].metric.job] | unique | join(" ")')"
             DOWN="$(qq 'up == 0' | jq -r '[.data.result[].metric.job] | unique | join(" ")')"
+            # The Hub's usage metrics (job hub-usage): this job runs no Hub.
+            [ -n "$(docker compose ps -q hub 2>/dev/null)" ] || DOWN="$(tr ' ' '\n' <<<"$DOWN" | grep -vx hub-usage | xargs)"
             missing=""
             for j in $want; do [[ " $UP " == *" $j "* ]] || missing="$missing $j"; done
             [ -z "$missing" ] && [ -z "$DOWN" ] && break
@@ -2450,6 +2454,25 @@ jobs:
           E2E_CERT: /tmp/alice.crt
           E2E_KEY: /tmp/alice.key
         run: NODE_EXTRA_CA_CERTS=/tmp/e2e-ca-bundle.pem /tmp/e2e-venv/bin/python tests/e2e/e2e_instances.py
+
+      - name: The Usage page (e2e_usage.py)
+        timeout-minutes: 15
+        run: |
+          E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
+          export E2E_HUB_SECRET HUB_API="http://$HUB_IP:8888" E2E_PEOPLE_API="http://$HUB_IP:8889" E2E_USAGE_INSTANCE=echo-b
+          python3 tests/e2e/e2e_usage.py live
+          python3 tests/e2e/e2e_usage.py storage
+          # The usage metrics listener (contract §16.2): reachable on
+          # portcullis-metrics-hub only, never from the core network.
+          BB=docker.io/library/busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
+          docker run --rm --network portcullis_portcullis-metrics-hub "$BB" wget -qO- http://hub-metrics:9100/metrics \
+            | grep -q '^portcullis_container_memory_working_set_bytes{' || { echo "FAIL: hub-metrics:9100/metrics on portcullis-metrics-hub"; exit 1; }
+          if docker run --rm --network portcullis "$BB" wget -q -T 5 -O /dev/null "http://$HUB_IP:9100/metrics"; then
+            echo "FAIL: the metrics listener answers on the core network"; exit 1
+          fi
+          echo "PASS: usage metrics on portcullis-metrics-hub only"
+          # Through a real Prometheus scrape (FR-H1): the target labels apply.
+          .github/ci/usage-prometheus-labels.sh echo-b
 
       - name: Instance backup → guarded delete → restore into a new id (real daemon)
         timeout-minutes: 15
@@ -4955,6 +4978,7 @@ jobs:
           dcli docker compose -p ci-hubproxy ps --format json | grep -q '"State":"running"' || { echo "FAIL: compose ps"; exit 1; }
           dcli docker compose -p ci-hubproxy logs web >/dev/null || { echo "FAIL: compose logs"; exit 1; }
           dcli docker compose -p ci-hubproxy restart web || { echo "FAIL: compose restart"; exit 1; }
+          .github/ci/usage-proxy-asserts.sh "$NET" "$(dcli docker compose -p ci-hubproxy ps -q web)" podman
           dcli docker compose -p ci-hubproxy down -v || { echo "FAIL: compose down -v"; exit 1; }
           for denied in "docker swarm init" "docker system df" "docker plugin ls" "docker secret ls" "docker node ls"; do
             # shellcheck disable=SC2086
@@ -5068,6 +5092,8 @@ jobs:
             sleep 2
           done
           python3 tests/e2e/e2e_podman.py
+          E2E_RUNTIME=podman python3 tests/e2e/e2e_usage.py live
+          E2E_RUNTIME=podman python3 tests/e2e/e2e_usage.py storage
 
       # V25: the VPN service under rootless Podman, as on Docker: vpn init,
       # wg healthy as 10006 with no capability, one built-in device's

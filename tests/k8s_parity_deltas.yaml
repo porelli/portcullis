@@ -29,6 +29,7 @@ env-missing:
   - {service: hub, item: DOCKER_HOST, reason: "no engine on Kubernetes: the Hub uses its in-cluster ServiceAccount (HUB_CONTAINER_RUNTIME=kubernetes)"}
   - {service: hub, item: HUB_MAILCTL_API_URL, reason: "mail profile: Docker/Podman only (mail plan)"}
   - {service: hub, item: HUB_MAILCTL_SECRET_FILE, reason: "mail profile: Docker/Podman only (mail plan)"}
+  - {service: hub, item: HUB_METRICS_ADDR, reason: "the usage metrics listener: Docker/Podman only (contract §16.2, U20)"}
   - {service: hub, item: HUB_LINK_DOC_DIR, reason: "multiple servers: Docker/Podman primaries only (contract §17.1; Servers is off on Kubernetes)"}
   - {service: hub, item: HUB_LINK_DOC_GID, reason: "multiple servers: Docker/Podman primaries only (contract §17.1; Servers is off on Kubernetes)"}
   - {service: hub, item: HUB_LINK_PROXY, reason: "multiple servers: Docker/Podman primaries only (contract §17.1; Servers is off on Kubernetes)"}
