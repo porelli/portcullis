@@ -24,12 +24,13 @@ WUSER=worker
 
 # asworker <cmd…> — as the Podman worker's operator, with a clean
 # environment (the runner's XDG_* / DOCKER_* must never leak in).
-asworker() {
+asworker() (
   local uid; uid="$(id -u "$WUSER")"
-  sudo -u "$WUSER" env -i HOME="/home/$WUSER" USER="$WUSER" LOGNAME="$WUSER" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 \
+  # From / : the runner's workspace isn't the worker's to enter.
+  cd / && sudo -u "$WUSER" env -i HOME="/home/$WUSER" USER="$WUSER" LOGNAME="$WUSER" PATH=/usr/local/bin:/usr/bin:/bin LANG=C.UTF-8 \
     XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
     DOCKER_HOST="unix:///run/user/$uid/podman/podman.sock" "$@"
-}
+)
 
 # wexec <name> <cmd…> — a command in the worker's checkout.
 wexec() {
