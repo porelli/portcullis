@@ -60,11 +60,13 @@ override() {  # <extra_hosts value>
 }
 
 case "$kind" in
-  exec) shift 2; wexec "$name" "$@"; exit ;;
+  # The CI agent image (never the published :edge) for whatever compose
+  # these run on the worker: worker join got it from the environment only.
+  exec) shift 2; wexec "$name" env AGENT_IMAGE="$AGENT_IMAGE" "$@"; exit ;;
   compose)
     shift 2
     # shellcheck disable=SC2016  # expanded by the worker's bash
-    wexec "$name" bash -c 'export PORTCULLIS_HOME="$PWD" PORTCULLIS_ROOT="$PWD" PORTCULLIS_LIB="$PWD/scripts/lib"
+    wexec "$name" env AGENT_IMAGE="$AGENT_IMAGE" bash -c 'export PORTCULLIS_HOME="$PWD" PORTCULLIS_ROOT="$PWD" PORTCULLIS_LIB="$PWD/scripts/lib"
       source scripts/lib/common.sh; source scripts/lib/worker.sh; env_load; runtime_export
       exec docker compose --project-directory "$PWD" "$@"' bash "$@"
     exit ;;
