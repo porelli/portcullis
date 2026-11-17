@@ -304,6 +304,10 @@ jobs:
       # stdlib only, no stack.
       - name: e2e helper unit tests (e2e_fsops)
         run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_e2e_fsops.py
+      # E2E_SCENARIOS (the `scenarios` input): names, setup, the needs()
+      # closure, the per-job check (tests/e2e/scenarios.py; stdlib only).
+      - name: e2e scenario filter unit tests (scenarios.py)
+        run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_e2e_scenarios.py
       - name: Tool versions (the compose / jq checks depend on them)
         run: docker compose version && jq --version && yq --version
       - name: compose files are valid with a generated .env

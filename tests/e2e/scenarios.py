@@ -201,7 +201,7 @@ def _validate_env() -> None:
         print(f"FAIL: {ENV}: unknown scenario name(s): {' '.join(bad)} "
               f"(`python3 tests/e2e/scenarios.py list` names them)", file=sys.stderr, flush=True)
         sys.exit(2)
-    extra = sorted(_wanted_set() - want)
+    extra = sorted(_wanted_set() - want - _ALWAYS)
     print(f"{ENV}: only {' '.join(sorted(want))}" + (f" + what they need: {' '.join(extra)}" if extra else "")
           + " (plus setup)", flush=True)
 
