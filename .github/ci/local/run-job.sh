@@ -20,7 +20,7 @@
 #   --keep        keep the container (and its volumes) afterwards for
 #                 `docker exec -it <name> bash`; remove with --cleanup <name>
 #   --no-cache    fresh image store / caches (default: this job's image store
-#                 and the shared pip / Playwright / Go caches are reused,
+#                 and the shared pip / Playwright / go-build and Go module caches are reused (the Go toolchain is downloaded and sha256-checked every run),
 #                 one run of a job at a time; a second concurrent run of the
 #                 same job gets a throwaway store)
 #   --cpus/--memory  the container's limits (default 4 / 16g: a GitHub runner)
@@ -134,7 +134,7 @@ work="$(vol work)" srv="$(vol srv)"
 if [ "$cache" = true ] && exec 9>"$base/locks/$job.lock" && flock -n 9; then
   dk="pcci-cache-$job-docker" ct="pcci-cache-$job-containerd"
   docker volume create "$dk" >/dev/null; docker volume create "$ct" >/dev/null
-  home_cache=(-v pcci-cache-home:/home/runner/.cache -v pcci-cache-gopath:/home/runner/go -v pcci-cache-tools:/opt/hostedtoolcache)
+  home_cache=(-v pcci-cache-home:/home/runner/.cache -v pcci-cache-gopath:/home/runner/go)
   echo "run-job: reusing the image store of $job (pcci-cache-$job-*) and the shared caches"
 else
   dk="$(vol docker)" ct="$(vol containerd)"
