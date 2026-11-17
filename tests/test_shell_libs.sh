@@ -4841,18 +4841,21 @@ ML="$WORK/mail"
 # runtime) and stubs: `hub mail <cmd>` (rt_exec hub) answers from
 # $ML/hub-<cmd> (exit $ML/hub-<cmd>.rc), its stdin to $ML/hub-<cmd>.in;
 # mail-cert / mail-tlsa (rt_run) answer from $ML/cert / $ML/tlsa-<sub>;
-# every call goes to $ML/argv.
+# every call goes to $ML/argv (docker's argv elements %q-quoted: one
+# element stays one).
 mt() {
   rm -rf "$ML"; mkdir -p "$ML/root/secrets/mail"
   printf 'PORTCULLIS_DOMAIN=mail.example\nPORTCULLIS_MAIL=on\nCONTAINER_RUNTIME=docker\nDNS_PROVIDER=porkbun\nPORKBUN_API_KEY=k\nPORKBUN_SECRET_API_KEY=s\n' > "$ML/root/.env"
   printf '%s' '{"renewed":false,"not_after":"2027-02-01T00:00:00Z","spki_sha256":"'"$(printf 'a%.0s' $(seq 64))"'"}' > "$ML/cert"
   printf '%s' '{"version":1,"current":"aa","next":null,"both_since":null,"phase":"steady","due":null,"publish":["aa"]}' > "$ML/tlsa-status"
   printf '%s' '{"slot":"open","wired":false,"warning":"This app becomes the mail server for every person and every mail domain."}' > "$ML/hub-provider"
-  for c in install unwire tls test action; do printf '{}' > "$ML/hub-$c"; done
+  for c in tls test action; do printf '{}' > "$ML/hub-$c"; done
+  for c in install unwire; do printf '%s' '{"op_id":"op1","op":"mail-'"$c"'","instance":"stalwart","poll":"/api/instances/stalwart/op?op_id=op1"}' > "$ML/hub-$c"; done
+  printf '%s' '{"op_id":"op1","running":false,"ok":true}' > "$ML/hub-op"
   printf '%s' '[{"name":"mail.example","state":"off"}]' > "$ML/hub-domains"
-  printf '%s' '{"records":[{"name":"mail.example","type":"MX","ttl":3600,"value":"10 mail.mail.example."}]}' > "$ML/hub-dns-main"
+  printf '%s' '{"records":[{"name":"mail.example","type":"MX","ttl":3600,"value":"10 mail.mail.example."}],"rules":{"relay_include":"","dmarc_floor":"none","draining":false}}' > "$ML/hub-dns-main"
   (
-    export PORTCULLIS_ROOT="$ML/root"
+    export PORTCULLIS_ROOT="$ML/root" MAIL_OP_POLL=0
     env_load
     # shellcheck source=../scripts/lib/stack.sh
     . "$HERE/../scripts/lib/stack.sh"
@@ -4874,7 +4877,7 @@ mt() {
     rt_run() {
       echo "rt_run $*" >> "$ML/argv"
       case "$*" in
-        *"mail-tlsa "*) local all="$*" sub; sub="${all##* }"; cat "$ML/tlsa-$sub" 2>/dev/null || cat "$ML/tlsa-status"; return "$(cat "$ML/tlsa-$sub.rc" 2>/dev/null || echo 0)" ;;
+        *"mail-tlsa "*) local all="$*" sub; sub="${all#*mail-tlsa }"; sub="${sub%% *}"; cat "$ML/tlsa-$sub" 2>/dev/null || cat "$ML/tlsa-status"; return "$(cat "$ML/tlsa-$sub.rc" 2>/dev/null || echo 0)" ;;
         *--next-key*) printf '%s\n' '{"spki_sha256":"bb"}' ;;
         *) cat > "$ML/cert.in"; cat "$ML/cert" ;;
       esac
@@ -4890,8 +4893,8 @@ mt() {
     domains_image_ensure() { :; }
     volume_own() { echo "volume_own $*" >> "$ML/argv"; }
     mail_schedule_systemd() { echo "mail_schedule_systemd" >> "$ML/argv"; }
-    _dns_tool() { echo "dns_tool $* sets=${DNS_SETS:-} recs=${DNS_MAIL_RECORDS:-} tlsa=${DNS_MAIL_TLSA:-}" >> "$ML/argv"; }
-    docker() { echo "docker $*" >> "$ML/argv"; case "$1" in ps) echo cid9 ;; exec) printf 'From MAILER-DAEMON Sun Nov 15 10:00:00 2026\nSubject: x\n\nhi\n' ;; esac; }
+    _dns_tool() { echo "dns_tool $* sets=${DNS_SETS:-} recs=${DNS_MAIL_RECORDS:-} tlsa=${DNS_MAIL_TLSA:-} rules=${DNS_MAIL_RULES:-}" >> "$ML/argv"; }
+    docker() { { printf docker; printf ' %q' "$@"; echo; } >> "$ML/argv"; case "$1" in ps) echo cid9 ;; exec) printf 'From MAILER-DAEMON Sun Nov 15 10:00:00 2026\nSubject: x\n\nhi\n' ;; esac; }
     [ "${MT_E:-}" != 1 ] || set -e
     eval "$1"
   ) >"$ML/out" 2>&1
@@ -4905,6 +4908,15 @@ mte 'mail_enable "" "" stalwart true'; rc=$?
 expect_eq "mail enable: rc 0, PORTCULLIS_MAIL=on in .env" "$rc:$(grep -c '^PORTCULLIS_MAIL=on$' "$ML/root/.env")" "0:1"
 expect_eq "mail enable: the warning printed before the install" "$(grep -c 'This app becomes the mail server' "$ML/out")" 1
 expect_eq "mail enable: hub mail install with the typed id" "$(jq -c . "$ML/hub-install.in")" '{"template":"stalwart","source":"portcullis","confirm":"stalwart"}'
+expect_eq "mail enable: the install's op polled to its end (hub mail op {instance, op_id})" "$(jq -c . "$ML/hub-op.in"):$(grep -c 'is this server'"'"'s mail provider' "$ML/out")" '{"instance":"stalwart","op_id":"op1"}:1'
+mte 'printf "%s" "{\"op_id\":\"op1\",\"running\":false,\"ok\":false,\"error\":\"void failed\"}" > "$ML/hub-op"; mail_enable "" "" stalwart true'; rc=$?
+expect_eq "mail enable: a failed install op → refused, never \"is this server's mail provider\"" "$rc:$(grep -c 'op op1 failed: void failed' "$ML/out"):$(grep -c 'is this server'"'"'s mail provider' "$ML/out")" "1:1:0"
+mte 'printf "%s" "{}" > "$ML/hub-install"; mail_enable "" "" stalwart true'; rc=$?
+expect_eq "mail enable: an install answer with no op → refused" "$rc:$(grep -c 'started no op' "$ML/out")" "1:1"
+mte 'printf "%s" "{\"op_id\":\"op1\",\"running\":true}" > "$ML/hub-op"; export MAIL_OP_WAIT=0; mail_enable "" "" stalwart true'; rc=$?
+expect_eq "mail enable: an install op still running after MAIL_OP_WAIT → refused" "$rc:$(grep -c 'still runs after 0 s' "$ML/out")" "1:1"
+mte 'printf "%s" "{\"op_id\":\"op2\",\"running\":false,\"ok\":true}" > "$ML/hub-op"; mail_enable "" "" stalwart true'; rc=$?
+expect_eq "mail enable: the op record of another op → refused" "$rc:$(grep -c 'answered another op than op1' "$ML/out")" "1:1"
 expect_eq "mail enable: the keys and not_after to hub mail tls" "$(jq -c . "$ML/hub-tls.in")" '{"spki_sha256":["aa"],"not_after":"2027-02-01T00:00:00Z"}'
 expect_eq "mail enable: order (prepare, cert, hub_env_write, the Hub and domains restarted, then the Hub)" \
   "$(grep -oE '^(stack_prepare|rt_run mail-cert -i|hub_env_write|stack_compose_up hub domains)' "$ML/argv" | tr '\n' '|')" \
@@ -4944,13 +4956,23 @@ mte 'echo 1 > "$ML/hub-unwire.rc"; printf "an unwire is already running\n" > "$M
 expect_eq "mail disable: any other refusal fails" "$rc:$(grep -c '^PORTCULLIS_MAIL=on$' "$ML/root/.env"):$(grep -c 'an unwire is already running' "$ML/out")" "1:1:1"
 mte 'echo 1 > "$ML/hub-unwire.rc"; mail_disable true true'; rc=$?
 expect_eq "mail disable: the Hub refusing the unwire → refused, the slot stays open" "$rc:$(grep -c '^PORTCULLIS_MAIL=on$' "$ML/root/.env")" "1:1"
+mte 'printf "%s" "{\"op_id\":\"op1\",\"running\":true}" > "$ML/hub-op"; export MAIL_OP_WAIT=0; mail_disable true true'; rc=$?
+expect_eq "mail disable --force: the unwire op still running → the slot stays open, the Hub not restarted (R-H6)" \
+  "$rc:$(grep -c '^PORTCULLIS_MAIL=on$' "$ML/root/.env"):$(grep -c '^rt_up_service' "$ML/argv"):$(grep -c '^dns_tool' "$ML/argv")" "1:1:0:0"
+mte 'printf "%s" "{\"op_id\":\"op1\",\"running\":false,\"ok\":false,\"error\":\"stop failed\"}" > "$ML/hub-op"; mail_disable true true'; rc=$?
+expect_eq "mail disable --force: a failed unwire op → the slot stays open" "$rc:$(grep -c '^PORTCULLIS_MAIL=on$' "$ML/root/.env"):$(grep -c 'op op1 failed: stop failed' "$ML/out")" "1:1:1"
+mte 'mail_disable true true'; rc=$?
+expect_eq "mail disable: the unwire op polled before the slot closes" "$rc:$(jq -c . "$ML/hub-op.in"):$(awk '/hub mail op/ && !o {o=NR} /^dns_tool/ && !d {d=NR} END {print (o > 0 && o < d)}' "$ML/argv")" '0:{"instance":"stalwart","op_id":"op1"}:1'
+# test_mail_disable_removes_cert_metric (L11).
+mte '_mail_cert_metric 2027-02-01T00:00:00Z; mail_disable true true'; rc=$?
+expect_eq "mail disable: the certificate metric goes with the slot" "$rc:$([ -e "$ML/root/monitoring/textfile/mail_cert.prom" ] && echo kept || echo gone)" "0:gone"
 # test_mail_export_argv_no_shell: the block's argv with {former_id}
 # replaced as ONE element, exec'd in export.service, never a shell.
 EXP='{"slot":"open","wired":true,"instance":"stalwart","template":"stalwart","warning":"w","export":{"service":"adapter","argv":["mailctl","export","--former","{former_id}"]}}'
 mte 'printf "%s" '"'$EXP'"' > "$ML/hub-provider"; mail_export "former-6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b;touch pwned" ""'; rc=$?
 F="$(ls "$ML/root/backups/mail-export/"*.mbox 2>/dev/null | head -n1)"
 expect_eq "mail export: docker exec of the block's argv in the instance's service, the id one element" \
-  "$rc:$(grep '^docker exec' "$ML/argv")" "0:docker exec -i cid9 mailctl export --former former-6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b;touch pwned"
+  "$rc:$(grep '^docker exec' "$ML/argv")" '0:docker exec -i cid9 mailctl export --former former-6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b\;touch\ pwned'
 expect_eq "mail export: the container found by the instance's project and the block's service" \
   "$(grep -c '^docker ps -q --filter label=com.docker.compose.project=portcullis-stalwart --filter label=com.docker.compose.service=adapter --filter status=running$' "$ML/argv")" 1
 expect_eq "mail export writes 0600 under backups/mail-export (dir 0700)" "$(file_mode "$F"):$(file_mode "$ML/root/backups/mail-export"):$(grep -c '^From ' "$F")" "600:700:1"
@@ -4972,6 +4994,13 @@ for p in '.void_owed = {"reason":"restore"}' '.held = {"reason":"template_change
   mt '_mail_cert_metric 2027-02-01T00:00:00Z; printf "%s" '"'$J'"' > "$ML/hub-status"; mail_status_json > "$ML/st.json"'
   expect_eq "mail status: $p → problem" "$(jq -r .problem "$ML/st.json")" true
 done
+# void_owed / held false → none (M7); true → owed with no detail.
+J="$(printf '%s' "$HS" | jq -c '.void_owed = false | .held = false')"
+mt '_mail_cert_metric 2027-02-01T00:00:00Z; printf "%s" '"'$J'"' > "$ML/hub-status"; mail_status_json > "$ML/st.json"; mail_status_lines "$(cat "$ML/st.json")"'
+expect_eq "mail status: void_owed / held false → no problem, the block complete" "$(jq -c '[.problem, .hub.void_owed, .hub.held]' "$ML/st.json"):$(grep -c 'TLSA: steady' "$ML/out"):$(grep -c 'Cannot index' "$ML/out")" '[false,null,null]:1:0'
+J="$(printf '%s' "$HS" | jq -c '.void_owed = true')"
+mt '_mail_cert_metric 2027-02-01T00:00:00Z; printf "%s" '"'$J'"' > "$ML/hub-status"; mail_status_json > "$ML/st.json"; mail_status_lines "$(cat "$ML/st.json")"'
+expect_eq "mail status: void_owed true → a problem with no detail" "$(jq -r .problem "$ML/st.json"):$(grep -c 'a void of every mail password is owed (?)' "$ML/out")" 'true:1'
 mt '_mail_cert_metric 2027-02-01T00:00:00Z; echo 1 > "$ML/hub-status.rc"; rm -f "$ML/hub-status"; mail_status_json > "$ML/st.json"'
 expect_eq "mail status: the Hub not answering → problem, hub null" "$(jq -c '[.problem, .hub]' "$ML/st.json")" '[true,null]'
 mt 'printf "%s" '"'$HS'"' > "$ML/hub-status"; mail_status_json > "$ML/st.json"'
@@ -4982,21 +5011,34 @@ expect_eq "mail status with the slot closed: nothing" "$(wc -c < "$ML/st.json" |
 # state, the metric, the keys to the Hub, the main domain's set (the
 # provider's records + mail_tlsa) through the dns tool.
 mte 'mail_rotate ""'; rc=$?
-expect_eq "mail rotate: rc 0, the metric, hub mail tls, the dns tool with the Hub's records and the TLSA keys" \
-  "$rc:$(grep -c '^portcullis_mail_cert_expiry_seconds 1801440000$' "$ML/root/monitoring/textfile/mail_cert.prom"):$(jq -c .spki_sha256 "$ML/hub-tls.in"):$(grep -c '^dns_tool apply sets=mail recs=\[{"name":"mail.example","type":"MX","ttl":3600,"value":"10 mail.mail.example."}\] tlsa=\["aa"\]$' "$ML/argv")" \
+expect_eq "mail rotate: rc 0, the metric, hub mail tls, the dns tool with the Hub's records, rules and the TLSA keys" \
+  "$rc:$(grep -c '^portcullis_mail_cert_expiry_seconds 1801440000$' "$ML/root/monitoring/textfile/mail_cert.prom"):$(jq -c .spki_sha256 "$ML/hub-tls.in"):$(grep -c '^dns_tool apply sets=mail recs=\[{"name":"mail.example","type":"MX","ttl":3600,"value":"10 mail.mail.example."}\] tlsa=\["aa"\] rules={"relay_include":"","dmarc_floor":"none","draining":false}$' "$ML/argv")" \
   '0:1:["aa"]:1'
+expect_eq "mail rotate: mail-tlsa gets --hostname (the switch checks the live TLSA)" "$(grep -c 'mail-tlsa status --hostname mail.mail.example$' "$ML/argv")" 1
 mte 'printf "%s" "{\"phase\":\"rollover\",\"due\":\"switch\",\"publish\":[\"aa\",\"bb\"]}" > "$ML/tlsa-status"; printf "{}" > "$ML/tlsa-switch"; mail_rotate ""'; rc=$?
 expect_eq "mail rotate: a due switch → mail-tlsa switch, then mail-cert --switch-key" \
   "$rc:$(grep -oE '^rt_run mail-cert (--entrypoint domains -- mail-tlsa switch|-i -- --switch-key)' "$ML/argv" | tr '\n' '|')" \
   "0:rt_run mail-cert --entrypoint domains -- mail-tlsa switch|rt_run mail-cert -i -- --switch-key|"
-mte 'printf "%s" "{\"phase\":\"retiring\",\"due\":\"drop\",\"publish\":[\"bb\",\"aa\"]}" > "$ML/tlsa-status"; printf "%s" "{\"phase\":\"steady\",\"due\":null,\"publish\":[\"bb\"]}" > "$ML/tlsa-drop"; mail_rotate ""'; rc=$?
+mte 'printf "%s" "{\"current\":\"bb\",\"phase\":\"retiring\",\"due\":\"drop\",\"publish\":[\"bb\",\"aa\"]}" > "$ML/tlsa-status"; printf "%s" "{\"phase\":\"steady\",\"due\":null,\"publish\":[\"bb\"]}" > "$ML/tlsa-drop"; mail_rotate ""'; rc=$?
 expect_eq "mail rotate: a due drop → mail-tlsa drop, its keys to the Hub" "$rc:$(jq -c .spki_sha256 "$ML/hub-tls.in")" '0:["bb"]'
+expect_eq "mail rotate: before the drop the Hub confirms the key that stays (hub mail tls, then mail-tlsa drop)" \
+  "$(grep -oE 'hub mail tls|mail-tlsa drop' "$ML/argv" | tr '\n' '|')" "hub mail tls|mail-tlsa drop|hub mail tls|"
+mte 'printf "%s" "{\"current\":\"bb\",\"phase\":\"retiring\",\"due\":\"drop\",\"publish\":[\"bb\",\"aa\"]}" > "$ML/tlsa-status"; echo 1 > "$ML/hub-tls.rc"; mail_rotate ""'; rc=$?
+expect_eq "mail rotate: the Hub not confirming the staying key → no drop (M3)" "$rc:$(grep -c 'mail-tlsa drop' "$ML/argv"):$(jq -c .spki_sha256 "$ML/hub-tls.in")" '1:0:["bb"]'
 mte 'mail_rotate --next-key'; rc=$?
 expect_eq "mail rotate --next-key: mail-cert --next-key, then mail-tlsa next" \
   "$rc:$(grep -oE '^rt_run mail-cert (-- --next-key|--entrypoint domains -- mail-tlsa next)' "$ML/argv" | tr '\n' '|')" \
   "0:rt_run mail-cert -- --next-key|rt_run mail-cert --entrypoint domains -- mail-tlsa next|"
-mte 'echo 1 > "$ML/hub-dns-main.rc"; rm -f "$ML/hub-dns-main"; mail_rotate ""'; rc=$?
-expect_eq "mail rotate with nothing wired: no DNS write, rc 0, an info line" "$rc:$(grep -c '^dns_tool' "$ML/argv"):$(grep -c 'No mail provider is wired' "$ML/out")" "0:0:1"
+mte 'echo 1 > "$ML/hub-dns-main.rc"; rm -f "$ML/hub-dns-main"; printf "no mail provider is wired\n" > "$ML/hub-dns-main.err"; mail_rotate ""'; rc=$?
+expect_eq "mail rotate with exactly nothing wired: the main set withdrawn, rc 0 (H5)" "$rc:$(grep -c '^dns_tool apply sets=mail recs=\[\] tlsa= rules=$' "$ML/argv"):$(grep -c 'mail records are withdrawn' "$ML/out")" "0:1:1"
+mte 'echo 1 > "$ML/hub-dns-main.rc"; rm -f "$ML/hub-dns-main"; printf "no mail provider is wired\n" > "$ML/hub-dns-main.err"; export DNS_NOMAIL=true; mail_rotate ""'; rc=$?
+expect_eq "mail rotate, nothing wired, DNS_NOMAIL=true: the null-mail set back in the same run" "$rc:$(grep -c '^dns_tool apply sets=nomail mail recs=\[\]' "$ML/argv")" "0:1"
+for f in '1|the provider has no set for mail.example yet' '1|' '2|hub: cannot reach the Hub'; do
+  mt "echo ${f%%|*} > \"\$ML/hub-dns-main.rc\"; rm -f \"\$ML/hub-dns-main\"; printf '%s\n' '${f#*|}' > \"\$ML/hub-dns-main.err\"; mail_rotate ''"; rc=$?
+  expect_eq "mail rotate: dns-main failing otherwise (rc ${f%%|*}: ${f#*|}) → exit 1, no DNS write, never done" "$rc:$(grep -c '^dns_tool' "$ML/argv"):$(grep -c 'Mail rotation done' "$ML/out")" "1:0:0"
+done
+mt 'printf "%s" "{\"records\":[]}" > "$ML/hub-dns-main"; mail_rotate ""'; rc=$?
+expect_eq "mail rotate: a dns-main answer without rules → exit 1, no DNS write" "$rc:$(grep -c '^dns_tool' "$ML/argv"):$(grep -c 'answered no rules' "$ML/out")" "1:0:1"
 mt 'export PORTCULLIS_MAIL=off; mail_rotate ""'; rc=$?
 expect_eq "mail rotate with the slot closed: refused" "$rc:$(grep -c 'mail is off' "$ML/out")" "1:1"
 # test / dkim rotate through the Hub's routes.
@@ -5008,12 +5050,28 @@ expect_eq "mail dkim rotate: hub mail action" "$rc:$(jq -c . "$ML/hub-action.in"
 mte '. "$HERE/../scripts/lib/dns.sh"; _dns_mail_records false; printf "%s|%s" "$DNS_MAIL_RECORDS" "$DNS_MAIL_TLSA" > "$ML/dnsrec"'; rc=$?
 expect_eq "dns: the main set from hub mail dns-main, the TLSA keys from mail-tlsa status" \
   "$rc:$(cat "$ML/dnsrec")" '0:[{"name":"mail.example","type":"MX","ttl":3600,"value":"10 mail.mail.example."}]|["aa"]'
+mte '. "$HERE/../scripts/lib/dns.sh"; _dns_mail_records false; printf "%s" "$DNS_MAIL_RULES" > "$ML/dnsrec"'; rc=$?
+expect_eq "dns: the main set's rules from hub mail dns-main" "$rc:$(cat "$ML/dnsrec")" '0:{"relay_include":"","dmarc_floor":"none","draining":false}'
+# M4: an unreadable TLSA state leaves the mail set out (never published
+# without its TLSA); --only mail fails. L10 / H5: a failing Hub says so.
+mte '. "$HERE/../scripts/lib/dns.sh"; echo 1 > "$ML/tlsa-status.rc"; _dns_mail_records false; printf "[%s]" "$DNS_MAIL_RECORDS" > "$ML/dnsrec"'; rc=$?
+expect_eq "dns: the TLSA state unreadable → no mail set this run, a warning" "$rc:$(cat "$ML/dnsrec"):$(grep -c "TLSA state couldn't be read" "$ML/out")" "0:[]:1"
+mt '. "$HERE/../scripts/lib/dns.sh"; echo 1 > "$ML/tlsa-status.rc"; _dns_mail_records true'; rc=$?
+expect_eq "dns --only mail: the TLSA state unreadable → refused" "$rc" 1
+mte '. "$HERE/../scripts/lib/dns.sh"; echo 2 > "$ML/hub-dns-main.rc"; _dns_mail_records false; printf "[%s]" "$DNS_MAIL_RECORDS" > "$ML/dnsrec"'; rc=$?
+expect_eq "dns: the Hub failing → no mail set this run, a warning" "$rc:$(cat "$ML/dnsrec"):$(grep -c "left out of this run" "$ML/out")" "0:[]:1"
+mt '. "$HERE/../scripts/lib/dns.sh"; echo 2 > "$ML/hub-dns-main.rc"; _dns_mail_records true'; rc=$?
+expect_eq "dns --only mail: the Hub failing → refused" "$rc" 1
+mt '. "$HERE/../scripts/lib/dns.sh"; echo 1 > "$ML/hub-dns-main.rc"; printf "no mail provider is wired\n" > "$ML/hub-dns-main.err"; _dns_mail_records true'; rc=$?
+expect_eq "dns --only mail: nothing wired → refused" "$rc:$(grep -c 'no mail provider is wired: nothing to write' "$ML/out")" "1:1"
 mte '. "$HERE/../scripts/lib/dns.sh"; DNS_SETS=mail DNS_MAIL_RECORDS="[]" DNS_MAIL_TLSA="[\"aa\"]" _dns_tool_input read > "$ML/dnsin"'; rc=$?
 expect_eq "dns tool input: mail [] carries no mail_tlsa" "$rc:$(jq -c '[.mail, has("mail_tlsa")]' "$ML/dnsin")" '0:[[],false]'
 mte '. "$HERE/../scripts/lib/dns.sh"; DNS_SETS=mail DNS_MAIL_RECORDS="[{\"name\":\"mail.example\",\"type\":\"MX\",\"ttl\":3600,\"value\":\"10 mail.mail.example.\"}]" DNS_MAIL_TLSA="[\"aa\"]" _dns_tool_input read > "$ML/dnsin"'; rc=$?
 expect_eq "dns tool input: records + mail_tlsa + mail_hostname on stdin" "$rc:$(jq -c '[.mail_tlsa, .mail_hostname]' "$ML/dnsin")" '0:[["aa"],"mail.mail.example"]'
 mt '. "$HERE/../scripts/lib/dns.sh"; echo 1 > "$ML/hub-dns-main.rc"; rm -f "$ML/hub-dns-main"; _dns_mail_records true'; rc=$?
-expect_eq "dns setup --only mail with nothing wired: refused" "$rc:$(grep -c 'no mail provider is wired' "$ML/out")" "1:1"
+expect_eq "dns setup --only mail with dns-main refused (not the not-wired text): refused" "$rc:$(grep -c "The Hub didn't give\|the Hub didn't give" "$ML/out")" "1:1"
+mte '. "$HERE/../scripts/lib/dns.sh"; DNS_SETS=mail DNS_MAIL_RECORDS="[{\"name\":\"mail.example\",\"type\":\"MX\",\"ttl\":3600,\"value\":\"10 mail.mail.example.\"}]" DNS_MAIL_RULES="{\"relay_include\":\"\",\"dmarc_floor\":\"reject\",\"draining\":false}" _dns_tool_input read > "$ML/dnsin"; DNS_SETS=mail DNS_MAIL_RECORDS="[]" DNS_MAIL_RULES="{\"dmarc_floor\":\"reject\"}" _dns_tool_input read > "$ML/dnsin2"'; rc=$?
+expect_eq "dns tool input: mail_rules with a non-empty set only" "$rc:$(jq -c .mail_rules "$ML/dnsin"):$(jq -c 'has("mail_rules")' "$ML/dnsin2")" '0:{"relay_include":"","dmarc_floor":"reject","draining":false}:false'
 # up / upgrade with the slot open: the refusals and the certificate when
 # mail_tls has none.
 mte 'mail_tls_present() { return 1; }; mail_up_steps up'; rc=$?
@@ -5143,20 +5201,26 @@ bmp '' ':'; rc=$?
 expect_eq "backup with the slot closed: no Hub call, no manifest key" "$rc:$(grep -c 'hub mail' "$BM/calls"):$(jq -c 'has("mail_provider_archive")' "$(bm_dir)/MANIFEST.json")" "0:0:false"
 expect_eq "backup: mail_acme and mail_tls archived online (tlsa.json and the keys), mail_slot never" \
   "$(tr ' ' '\n' <<<"$BACKUP_FILE_VOLUMES" | grep -E '^mail_' | tr '\n' ' ')" "mail_acme:10004:10004 mail_tls:10004:2000 "
-# test_restore_empties_hub_secrets_then_restores_provider: the provider's
-# volumes missing → hub mail restore {archive} after the stack is up; present
-# → nothing (the Hub owes a void from the emptied hub_secrets); a refusal
-# fails the restore at its end.
+# test_restore_mail_provider_first (Ruling R-C1, M8, M9): the manifest
+# names an archive and the slot is open → the hold file into hub_data, the
+# Hub started alone, `hub mail restore {archive}` waited for to its op's
+# end — whether the instance's volumes exist or not; any failure returns 1
+# (never an exit) and fails the restore at its end.
 rmp() {
   rm -rf "$BM"; mkdir -p "$BM/root" "$BM/bk"
   printf 'PORTCULLIS_MAIL=on\nCONTAINER_RUNTIME=docker\n' > "$BM/root/.env"
   printf '%s' '{"mail_provider_archive":"stalwart/20261117T100000Z.tar"}' > "$BM/bk/MANIFEST.json"
-  printf '%s' '{"wired":true}' > "$BM/hub-provider"; printf '{}' > "$BM/hub-restore"
+  printf '%s' '{"wired":true}' > "$BM/hub-provider"
+  printf '%s' '{"op_id":"op7","op":"mail-restore","instance":"stalwart","poll":"/api/instances/stalwart/op?op_id=op7"}' > "$BM/hub-restore"
+  printf '%s' '{"op_id":"op7","running":false,"ok":true}' > "$BM/hub-op"
   (
-    export PORTCULLIS_ROOT="$BM/root"
+    export PORTCULLIS_ROOT="$BM/root" MAIL_OP_POLL=0
     env_load
+    _BACKUP_CFG='{"volumes":{"hub_data":{"name":"portcullis_hub_data"}}}'
     rt_health() { echo healthy; }
-    docker() { echo "docker $*" >> "$BM/calls"; [ "$1 $2" != "volume ls" ] || cat "$BM/vols" 2>/dev/null; }
+    rt_up_service() { echo "rt_up_service $*" >> "$BM/calls"; }
+    ct_run() { echo "ct_run $*" >> "$BM/calls"; cat > "$BM/hold"; }
+    docker() { echo "docker $*" >> "$BM/calls"; }
     rt_exec() {
       local -a a=("$@"); local i=0
       while [ "${a[$i]}" != -- ]; do i=$((i + 1)); done
@@ -5169,22 +5233,80 @@ rmp() {
     RESTORE_MAIL_FAILED=false
     # shellcheck disable=SC2034
     _restore_mail_provider "$BM/bk" || RESTORE_MAIL_FAILED=true
+    echo "after the provider restore" >> "$BM/calls"
     _restore_mail_outcome
   ) >"$BM/out" 2>&1
 }
 rmp ':'; rc=$?
-expect_eq "restore: the provider's volumes missing → hub mail restore with the manifest's archive" \
-  "$rc:$(jq -c . "$BM/hub-restore.in"):$(grep -c 'label=com.docker.compose.project=portcullis-stalwart' "$BM/calls")" '0:{"archive":"stalwart/20261117T100000Z.tar"}:1'
-rmp 'echo portcullis-stalwart_data > "$BM/vols"'; rc=$?
-expect_eq "restore: the provider's volumes present → no hub mail restore" "$rc:$(grep -c 'hub mail restore' "$BM/calls")" "0:0"
+expect_eq "restore: the hold, the Hub alone, hub mail restore {archive}, its op polled" \
+  "$rc:$(jq -c . "$BM/hub-restore.in"):$(jq -c . "$BM/hub-op.in"):$(cat "$BM/hold"):$(grep -E '^(ct_run|rt_up_service|hub mail (restore|op))' "$BM/calls" | sed 's/ -v .*//' | tr '\n' '|')" \
+  '0:{"archive":"stalwart/20261117T100000Z.tar"}:{"instance":"stalwart","op_id":"op7"}:stalwart/20261117T100000Z.tar:ct_run --rm -i --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true --user 10001:10001|rt_up_service --deps hub|hub mail restore|hub mail op|'
+expect_eq "restore: the hold written into hub_data as mail-restore-pending" "$(grep -c "portcullis_hub_data:/d .*cat > /d/mail-restore-pending" "$BM/calls")" 1
+rmp 'docker() { echo "docker $*" >> "$BM/calls"; [ "$1 $2" != "volume ls" ] || echo portcullis-stalwart_data; }'; rc=$?
+expect_eq "restore: the provider's volumes present → restored all the same (M9)" "$rc:$(grep -c 'hub mail restore' "$BM/calls")" "0:1"
 rmp 'echo 1 > "$BM/hub-restore.rc"'; rc=$?
-expect_eq "restore: the Hub refusing the provider restore fails the restore at its end" "$rc:$(grep -c "couldn't be restored from its archive" "$BM/out")" "1:1"
+expect_eq "restore: the Hub refusing the provider restore fails the restore at its end" "$rc:$(grep -c "couldn't be restored from its archive" "$BM/out"):$(grep -c 'after the provider restore' "$BM/calls")" "1:1:1"
+rmp 'printf "%s" "{\"op_id\":\"op7\",\"running\":false,\"ok\":false,\"error\":\"tar: bad\"}" > "$BM/hub-op"'; rc=$?
+expect_eq "restore: a failed restore op fails the restore at its end" "$rc:$(grep -c 'op op7 failed: tar: bad' "$BM/out")" "1:1"
+rmp 'printf "%s" "{\"op_id\":\"op7\",\"running\":true}" > "$BM/hub-op"; export MAIL_OP_WAIT=0'; rc=$?
+expect_eq "restore: an op still running after MAIL_OP_WAIT fails (never done early)" "$rc:$(grep -c 'still runs after 0 s' "$BM/out")" "1:1"
+rmp 'rt_health() { echo exited; }'; rc=$?
+expect_eq "restore: a Hub that never answers → no exit mid-restore, failed at the end (M8)" "$rc:$(grep -c 'after the provider restore' "$BM/calls"):$(grep -c 'hub mail restore' "$BM/calls")" "1:1:0"
+rmp 'export PORTCULLIS_MAIL=off'; rc=$?
+expect_eq "restore: an archive with the slot closed → loud, failed at the end" "$rc:$(grep -c 'the mail slot is closed here' "$BM/out"):$(grep -c 'hub mail' "$BM/calls")" "1:1:0"
 rmp 'printf "%s" "{}" > "$BM/bk/MANIFEST.json"'; rc=$?
-expect_eq "restore: no archive in the manifest → nothing" "$rc:$(wc -l < "$BM/calls" 2>/dev/null | tr -d ' ' || echo 0)" "0:0"
-expect_eq "restore empties hub_secrets (the gate sentinel and the API secret go: the Hub owes a mail void)" \
-  "$(grep -c 'Emptying hub_secrets volume' "$HERE/../scripts/lib/backup.sh"):$(awk '/Emptying hub_secrets/{e=NR} /_restore_mail_provider "\$dir"/{r=NR} END{print (e < r)}' "$HERE/../scripts/lib/backup.sh")" "1:1"
+expect_eq "restore: no archive in the manifest → nothing" "$rc:$(grep -vc 'after the provider restore' "$BM/calls")" "0:0"
+# test_restore_order_behaviour (L15): the restore's own tail run with its
+# steps stubbed — hub_secrets emptied, then the provider restore, then the
+# stack up, then "Restore complete" only when the provider was restored.
+rto() {
+  rm -rf "$BM"; mkdir -p "$BM"
+  (
+    body="$(awk '/^_backup_restore_docker\(\) \{/{f=1} f && /info "Emptying hub_secrets volume\.\.\."/{p=1} p{print} f && p && /^}/{exit}' "$HERE/../scripts/lib/backup.sh")"
+    eval "_rto_tail() { local dir=\"\$BM\" proj=portcullis helper=h full allow_empty_lldap=false pre=\"\" RESTORE_STOPPED_APPS=\"\"
+$body"
+    _volume_name() { echo "portcullis_$1"; }
+    docker() { echo "docker $1 $2" >> "$BM/calls"; [ "$1 $2" != "volume inspect" ]; }
+    _restore_lldap_guard() { :; }; stack_prepare() { :; }; config_build_ca_bundle() { :; }; vault_init() { :; }
+    wait_healthy() { :; }; _restore_lost_devices_note() { echo "last line" >> "$BM/calls"; }
+    rt_up() { echo "rt_up" >> "$BM/calls"; }
+    _restore_mail_provider() { echo "provider restore" >> "$BM/calls"; eval "${RTO_MAIL:-:}"; }
+    _rto_tail
+  ) >"$BM/out" 2>&1
+}
+rto; rc=$?
+expect_eq "restore order: hub_secrets emptied, the provider restored, then the stack up, complete" \
+  "$rc:$(grep -E '^(docker volume rm|provider restore|rt_up|last line)' "$BM/calls" | tr '\n' '|'):$(grep -c 'Restore complete' "$BM/out")" \
+  "0:docker volume rm|provider restore|rt_up|last line|:1"
+RTO_MAIL='return 1' rto; rc=$?
+expect_eq "restore order: a failed provider restore → never \"Restore complete\"" "$rc:$(grep -c 'Restore complete' "$BM/out"):$(grep -c 'NOT restored from its archive' "$BM/out")" "0:0:1"
+# test_backup_verify_mail_archive (M10): the archive the manifest names
+# is a readable tar inside hub_data.tar.gz.
+bvm() {
+  rm -rf "$BM"; mkdir -p "$BM/bk" "$BM/src/backups/stalwart" "$BM/inner"
+  printf '%s' '{"mail_provider_archive":"stalwart/20261117T100000Z.tar"}' > "$BM/bk/MANIFEST.json"
+  echo m > "$BM/inner/msg"
+  eval "$1"
+  ( cd "$BM/src" && tar -czf "$BM/bk/hub_data.tar.gz" . )
+  ( _backup_verify_mail_archive "$BM/bk" ) >"$BM/out" 2>&1
+}
+bvm 'tar -cf "$BM/src/backups/stalwart/20261117T100000Z.tar" -C "$BM/inner" msg'; rc=$?
+expect_eq "backup verify: the provider's archive in hub_data.tar.gz → ok" "$rc:$(grep -c 'is in hub_data.tar.gz' "$BM/out")" "0:1"
+bvm ':'; rc=$?
+expect_eq "backup verify: the provider's archive missing from hub_data.tar.gz → fails" "$rc:$(grep -c 'missing from hub_data.tar.gz' "$BM/out")" "1:1"
+bvm 'echo garbage > "$BM/src/backups/stalwart/20261117T100000Z.tar"'; rc=$?
+expect_eq "backup verify: a provider archive that isn't a tar → fails" "$rc" "1"
+bvm 'printf "%s" "{}" > "$BM/bk/MANIFEST.json"'; rc=$?
+expect_eq "backup verify: no provider archive named → nothing to check" "$rc:$(wc -c < "$BM/out" | tr -d ' ')" "0:0"
 expect_eq "no mail store copy, recovery session or void marker left in backup.sh" \
   "$(grep -cE '_backup_mail_data|BACKUP_MAIL_STOPPED|mail_void|recovery|mailctl' "$HERE/../scripts/lib/backup.sh")" 0
+
+# test_no_committed_mailctl_binary (H1): the build output is ignored and
+# not tracked (a checkout only; a tarball has no .git).
+if git -C "$HERE/.." rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  expect_eq "mailctl/mailctl: ignored, never tracked" \
+    "$(git -C "$HERE/.." check-ignore -q --no-index mailctl/mailctl && echo ignored || echo not-ignored):$(git -C "$HERE/.." ls-files mailctl/mailctl | wc -l | tr -d ' ')" "ignored:0"
+fi
 
 echo ""
 echo "$PASS passed, $FAIL failed"

@@ -173,9 +173,6 @@ env_require() {
 # Secrets every core service needs (docker-compose.yml uses ${VAR:?}).
 # shellcheck disable=SC2034  # used by stack.sh
 CORE_SECRETS="POSTGRES_PASSWORD KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD LLDAP_JWT_SECRET FORWARD_AUTH_CLIENT_SECRET FORWARD_AUTH_COOKIE_SECRET FORWARD_AUTH_REDIS_PASSWORD FORWARD_AUTH_EXT_REDIS_PASSWORD HUB_PROXY_SECRET"
-# Optional secrets in .env (empty = not used): never generated or required,
-# never shared with the Hub.
-OPTIONAL_SECRETS=""
 # Subset that can be (re)generated on an existing install without losing
 # data: nothing on disk is encrypted with them, `portcullis oidc register`
 # pushes FORWARD_AUTH_CLIENT_SECRET to Keycloak, and the session store's
@@ -755,7 +752,7 @@ hub_env_write() {
   done
   for v in "${names[@]}"; do
     [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-    case " $CORE_SECRETS $OPTIONAL_SECRETS " in *" $v "*) warn "HUB_SHARED_ENV: refusing to share core secret $v with the Hub"; continue ;; esac
+    case " $CORE_SECRETS " in *" $v "*) warn "HUB_SHARED_ENV: refusing to share core secret $v with the Hub"; continue ;; esac
     case "$content" in "$v="*|*$'\n'"$v="*) continue ;; esac
     # Written below from the host (podman / kubernetes only), never shared by name.
     case "$v" in PORTCULLIS_UNPRIVILEGED_PORT_START|PORTCULLIS_POD_CIDR|PORTCULLIS_SERVICE_CIDR|PORTCULLIS_WG_EDGE_SERVICE_IP|PORTCULLIS_TRAEFIK_SERVICE_IP|PORTCULLIS_RUNTIME_ROOTS|PORTCULLIS_KUBE_*|PORTCULLIS_MAIL*) continue ;; esac

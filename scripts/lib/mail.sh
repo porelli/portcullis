@@ -171,9 +171,10 @@ mail_cert_ensure() {
 
 # _mail_tlsa <status|next|switch|drop> — `domains mail-tlsa` in the
 # mail-cert one-shot (mail_acme's tlsa.json and keys, no credentials): its
-# JSON on stdout (contract §19.3).
+# JSON on stdout (contract §19.3). --hostname: the switch checks the next
+# key's TLSA at <hostname>'s authoritative servers (Ruling R-H4).
 _mail_tlsa() {
-  rt_run mail-cert --entrypoint domains -- mail-tlsa "$1" </dev/null
+  rt_run mail-cert --entrypoint domains -- mail-tlsa "$1" --hostname "$(mail_hostname)" </dev/null
 }
 
 # _mail_cert_metric <not_after> — portcullis_mail_cert_expiry_seconds
@@ -206,6 +207,57 @@ _mail_hub() {
   fi
 }
 
+# _mail_not_wired <rc> <stderr> — exactly the Hub's 409 "no mail provider
+# is wired" (exit 1, the whole trimmed text): nothing is wired. Any other
+# refusal or error is not this.
+_mail_not_wired() {
+  [ "$1" = 1 ] && [ "$(printf '%s' "$2" | tr -d '\r' | sed -e 's/^[[:space:]]*//;s/[[:space:]]*$//')" = "no mail provider is wired" ]
+}
+
+# _mail_hub_op <command> <body> — `hub mail <command>` that starts a Hub
+# op (install, unwire, restore: the answer {op_id, op, instance, poll}),
+# then `hub mail op` {instance, op_id} every MAIL_OP_POLL s until the
+# op's record is no longer running (Ruling R-H6), at most MAIL_OP_WAIT s.
+# Returns 0 only when the record says ok; 1 on a refusal (its text on
+# stderr unless MAIL_HUB_QUIET=1; MAIL_HUB_ERR / MAIL_HUB_RC), a failed or another op's record,
+# or the wait running out. The start's answer goes to stdout.
+_mail_hub_op() {
+  local cmd="$1" body="$2" out errf rc=0 id inst rec t0=$SECONDS
+  MAIL_HUB_ERR="" MAIL_HUB_RC=0
+  errf="$(mktemp)"
+  out="$(_mail_hub "$cmd" "$body" 2>"$errf")" || rc=$?
+  MAIL_HUB_ERR="$(cat "$errf")"; MAIL_HUB_RC=$rc
+  rm -f "$errf"
+  if [ "$rc" != 0 ]; then
+    [ "${MAIL_HUB_QUIET:-}" = 1 ] || [ -z "$MAIL_HUB_ERR" ] || printf '%s\n' "$MAIL_HUB_ERR" >&2
+    return 1
+  fi
+  id="$(printf '%s' "$out" | jq -r '.op_id | strings' 2>/dev/null)"
+  inst="$(printf '%s' "$out" | jq -r '.instance | strings' 2>/dev/null)"
+  if [ -z "$id" ] || [ -z "$inst" ]; then
+    warn "hub mail $cmd started no op (no op_id / instance in its answer)"
+    return 1
+  fi
+  printf '%s\n' "$out"
+  while :; do
+    rec="$(_mail_hub op "$(jq -cn --arg i "$inst" --arg o "$id" '{instance: $i, op_id: $o}')" 2>/dev/null)" || rec=""
+    if printf '%s' "$rec" | jq -e --arg o "$id" '.op_id == $o and .running == false' >/dev/null 2>&1; then
+      printf '%s' "$rec" | jq -e '.ok == true' >/dev/null 2>&1 && return 0
+      warn "the Hub's $cmd op $id failed: $(printf '%s' "$rec" | jq -r '.error // "no error given"' 2>/dev/null)"
+      return 1
+    fi
+    if printf '%s' "$rec" | jq -e --arg o "$id" '(.op_id | strings) != $o' >/dev/null 2>&1; then
+      warn "hub mail op answered another op than $id"
+      return 1
+    fi
+    if [ $((SECONDS - t0)) -ge "${MAIL_OP_WAIT:-1800}" ]; then
+      warn "the Hub's $cmd op $id still runs after ${MAIL_OP_WAIT:-1800} s: ./portcullis mail status"
+      return 1
+    fi
+    sleep "${MAIL_OP_POLL:-2}"
+  done
+}
+
 # _mail_hub_wait — `hub mail provider`'s answer, waiting up to
 # MAIL_HUB_WAIT seconds for the Hub to answer (it answers while its health
 # is still starting right after an up). A Hub missing or stopped is
@@ -229,28 +281,69 @@ _mail_hub_wait() {
 
 # _mail_tls_post <tlsa status JSON> — the SPKIs the TLSA publishes and
 # the certificate's not_after to the Hub (`hub mail tls`, contract §19.3):
-# it records them and the timer's visit, and reloads a wired provider.
+# it records them and the timer's visit, and reloads a wired provider; it
+# exits 0 only when the key the provider serves is one of them (M3).
 _mail_tls_post() {
   local body
   body="$(printf '%s' "$1" | jq -ce --arg na "${MAIL_CERT_NOT_AFTER:-}" '{spki_sha256: .publish, not_after: $na}')" || fail "domains mail-tlsa status printed no keys"
   _mail_hub tls "$body" >/dev/null || fail "the Hub refused the mail certificate's keys (hub mail tls)"
 }
 
-# _mail_main_set <tlsa status JSON> — the main domain's mail set through
-# the dns tool: the provider's records (`hub mail dns-main`, validated by
-# the Hub) plus core's HELO SPF and, while secure, the TLSA. Nothing
-# wired: an info line, nothing written.
-_mail_main_set() {
-  local recs
-  if ! recs="$(_mail_hub dns-main 2>/dev/null | jq -ce '.records | arrays')"; then
-    info "No mail provider is wired: the main domain's mail records wait for one."
-    return 0
+# _mail_dns_main — `hub mail dns-main` (contract §19.7): MAIL_MAIN_RECS
+# (the provider's validated records) and MAIL_MAIN_RULES ({relay_include,
+# dmarc_floor, draining}: the shared rules' inputs, re-checked by the dns
+# tool). 0 = read; 3 = exactly the Hub's "no mail provider is wired"; 1 =
+# any other failure (its text on stderr).
+_mail_dns_main() {
+  local out errf rc=0 err
+  MAIL_MAIN_RECS="" MAIL_MAIN_RULES=""
+  errf="$(mktemp)"
+  out="$(_mail_hub dns-main 2>"$errf")" || rc=$?
+  err="$(cat "$errf")"; rm -f "$errf"
+  if [ "$rc" != 0 ]; then
+    _mail_not_wired "$rc" "$err" && return 3
+    [ -z "$err" ] || printf '%s\n' "$err" >&2
+    return 1
   fi
+  MAIL_MAIN_RECS="$(printf '%s' "$out" | jq -ce '.records | arrays' 2>/dev/null)" || { warn "hub mail dns-main answered no records"; return 1; }
+  MAIL_MAIN_RULES="$(printf '%s' "$out" | jq -ce '.rules | select(type == "object" and (.relay_include | type) == "string"
+      and (.dmarc_floor | IN("none", "quarantine", "reject")) and (.draining | type) == "boolean")
+    | {relay_include, dmarc_floor, draining}' 2>/dev/null)" || { MAIL_MAIN_RECS=""; warn "hub mail dns-main answered no rules {relay_include, dmarc_floor, draining}"; return 1; }
+  return 0
+}
+
+# _mail_withdraw_main — the main domain's mail set removed (with
+# DNS_NOMAIL=true the null-mail records come back in the same run: never
+# a window without SPF -all, DMARC and the null MX). 1 when it fails.
+_mail_withdraw_main() {
+  local sets=mail
+  _dns_automated "${DNS_PROVIDER:-none}" || { warn "No automatic DNS for provider '${DNS_PROVIDER:-none}': remove the main domain's mail records by hand (./portcullis dns plan)."; return 0; }
+  [ "$(_dns_flag DNS_NOMAIL false)" != true ] || sets="nomail mail"
+  DNS_SETS="$sets" DNS_MAIL_RECORDS='[]' DNS_MAIL_TLSA='' DNS_MAIL_RULES='' _dns_tool apply >/dev/null
+}
+
+# _mail_main_set <tlsa status JSON> — the main domain's mail set through
+# the dns tool: the provider's records and rules (`hub mail dns-main`,
+# validated by the Hub, re-checked by the tool) plus core's HELO SPF and,
+# while secure, the TLSA. Exactly nothing wired: the set is withdrawn
+# (spec §5.3: the timer's next pass after an unwire). Any other Hub
+# failure fails (the published records stay; H5).
+_mail_main_set() {
+  local rc=0
+  _mail_dns_main || rc=$?
+  case "$rc" in
+    0) ;;
+    3)
+      _mail_withdraw_main || fail "no mail provider is wired, and the main domain's mail records could not be withdrawn"
+      info "No mail provider is wired: the main domain's mail records are withdrawn."
+      return 0 ;;
+    *) fail "the Hub didn't give the main domain's mail set (hub mail dns-main, see above): the published records are left as they are" ;;
+  esac
   if ! _dns_automated "${DNS_PROVIDER:-none}"; then
     warn "No automatic DNS for provider '${DNS_PROVIDER:-none}': ./portcullis dns plan shows the mail records to create by hand."
     return 0
   fi
-  DNS_SETS=mail DNS_MAIL_RECORDS="$recs" DNS_MAIL_TLSA="$(printf '%s' "$1" | jq -c '.publish // []')" _dns_tool apply >/dev/null \
+  DNS_SETS=mail DNS_MAIL_RECORDS="$MAIL_MAIN_RECS" DNS_MAIL_RULES="$MAIL_MAIN_RULES" DNS_MAIL_TLSA="$(printf '%s' "$1" | jq -c '.publish // []')" _dns_tool apply >/dev/null \
     || fail "the main domain's mail records could not be written"
 }
 
@@ -320,8 +413,8 @@ mail_enable() {
       IFS= read -r typed || typed=""
     fi
     [ "$typed" = "$id" ] || fail "type the instance id to confirm"
-    _mail_hub install "$(jq -cn --arg t "$provider" --arg s "$MAIL_DEFAULT_SOURCE" --arg c "$typed" '{template: $t, source: $s, confirm: $c}')" >/dev/null \
-      || fail "the Hub didn't wire $provider (see above)"
+    _mail_hub_op install "$(jq -cn --arg t "$provider" --arg s "$MAIL_DEFAULT_SOURCE" --arg c "$typed" '{template: $t, source: $s, confirm: $c}')" >/dev/null \
+      || fail "the Hub didn't wire $provider (see above): ./portcullis mail status"
     ok "$id is this server's mail provider."
   fi
   ok "Mail is on. DNS: ./portcullis dns setup ($(mail_hostname)'s address now; the mail records once the provider has its first document, then the daily timer keeps them); status: ./portcullis mail status"
@@ -343,14 +436,14 @@ mail_disable() {
   _mail_hub_wait >/dev/null
   # Nothing wired is exactly the Hub's 409 "no mail provider is wired":
   # already unwired (any other refusal or error fails).
-  local err rc=0
-  err="$(_mail_hub unwire "$(jq -cn --argjson d "$drain" '{drain: $d}')" 2>&1 >/dev/null)" || rc=$?
-  if [ "$rc" != 0 ]; then
-    if [ "$rc" = 1 ] && [ "$(printf '%s' "$err" | tr -d '\r' | sed -e 's/^[[:space:]]*//;s/[[:space:]]*$//')" = "no mail provider is wired" ]; then
+  # The unwire op is waited for to its end (Ruling R-H6): the slot never
+  # closes while it runs, and a failed op keeps it open.
+  if ! MAIL_HUB_QUIET=1 _mail_hub_op unwire "$(jq -cn --argjson d "$drain" '{drain: $d}')" >/dev/null; then
+    if [ "$MAIL_HUB_RC" != 0 ] && _mail_not_wired "$MAIL_HUB_RC" "$MAIL_HUB_ERR"; then
       info "No mail provider is wired (already unwired)."
     else
-      [ -z "$err" ] || printf '%s\n' "$err" >&2
-      fail "the Hub didn't unwire the mail provider (see above)"
+      [ -z "$MAIL_HUB_ERR" ] || printf '%s\n' "$MAIL_HUB_ERR" >&2
+      fail "the Hub didn't unwire the mail provider (see above): the slot stays open"
     fi
   fi
   if [ "$force" != true ]; then
@@ -367,13 +460,11 @@ mail_disable() {
   # The main domain's mail set goes, and with DNS_NOMAIL=true the null-mail
   # records come back in the same run (never a window without SPF -all,
   # DMARC and the null MX).
-  if _dns_automated "${DNS_PROVIDER:-none}"; then
-    local sets=mail
-    [ "$(_dns_flag DNS_NOMAIL false)" != true ] || sets="nomail mail"
-    DNS_SETS="$sets" DNS_MAIL_RECORDS='[]' _dns_tool apply >/dev/null \
-      || warn "the main domain's mail records could not be removed: run ./portcullis dns setup"
-  fi
+  _mail_withdraw_main || warn "the main domain's mail records could not be removed: run ./portcullis dns setup"
   _mail_set PORTCULLIS_MAIL off
+  # The certificate metric goes with the slot (MailCertExpiring must not
+  # fire for a closed slot; L11).
+  rm -f "$PORTCULLIS_ROOT/monitoring/textfile/mail_cert.prom"
   hub_env_write
   _mail_domains_flag_off
   if rt_running hub; then rt_up_service hub >/dev/null 2>&1 || warn "could not restart the Hub with the slot closed: ./portcullis up"; fi
@@ -381,6 +472,9 @@ mail_disable() {
   # Left in DNS on purpose (harmless: the A still names this server, the
   # CAA only restricts issuance); the admin may delete them by hand.
   info "Kept in DNS: $(mail_hostname)'s A / AAAA record and its CAA pin (mail-cert's); delete them by hand if no mail will come back."
+  if [ "$(_mail_timer_state)" = active ]; then
+    info "The daily mail timer is still installed: systemctl$(_rt_is_podman && echo " --user") disable --now portcullis-mail.timer (it fails every day while mail is off)."
+  fi
 }
 
 # mail_rotate [--next-key] — the daily timer's step (contract §19.3):
@@ -407,6 +501,10 @@ mail_rotate() {
     mail_cert_ensure --switch-key
     st="$(_mail_tlsa status)" || fail "domains mail-tlsa status failed after the switch"
   elif [ "$due" = drop ]; then
+    # The drop is committed only after the Hub confirmed the provider
+    # serves the key that stays (hub mail tls exits 0 only then; M3).
+    _mail_hub_wait >/dev/null
+    _mail_tls_post "$(printf '%s' "$st" | jq -c '{publish: [.current | strings]}')"
     st="$(_mail_tlsa drop)" || fail "domains mail-tlsa drop failed"
   fi
   printf '%s' "$st" | jq -r '"    TLSA: \(.phase), publishing \(.publish | length) key(s)"' 2>/dev/null || true
@@ -513,7 +611,10 @@ mail_status_json() {
   jq -cn --arg hub "$hub" --arg tlsa "$tlsa" --arg exp "${exp:-0}" --arg timer "$(_mail_timer_state)" \
     --arg cip "$(_rt_is_podman && echo rewritten || echo preserved)" --arg host "$(mail_hostname)" \
     --argjson lan "$([ "${MAIL_SUBMISSION_LAN_ONLY:-false}" = true ] && echo true || echo false)" '
-    ($hub | if . == "" then null else fromjson end) as $h
+    # void_owed / held: null or an object (the interface); false = none,
+    # any other non-object value = owed / held with no detail (M7).
+    def owed: if type == "object" then . elif . == null or . == false then null else {} end;
+    ($hub | if . == "" then null else (fromjson | .void_owed |= owed | .held |= owed) end) as $h
     | ($exp | tonumber? // 0) as $e
     | {enabled: true, hostname: $host, hub: $h, timer: $timer, client_ip: $cip, lan_only: $lan,
        cert: {not_after: (if $e > 0 then ($e | todate) else null end)},
@@ -535,7 +636,7 @@ mail_status_lines() {
     (if .hub == null then ["fail", "the Hub didn'"'"'t answer hub mail status (./portcullis up)"]
      elif .hub.wired != true then ["fail", "no mail provider is wired: wire one in the Hub (Settings → Mail)"]
      else ["ok", "provider \(.hub.instance // "?") (\(.hub.label // .hub.template // "?")\(if .hub.version then " " + .hub.version else "" end))"] end),
-    (if .hub.void_owed != null then ["fail", "a void of every mail password is owed (\(.hub.void_owed.reason // "?")): the provider stays in void mode until it succeeds"] else empty end),
+    (if .hub.void_owed != null then ["fail", "a void of every mail password is owed (\(.hub.void_owed.reason // "?" | tostring)): the provider stays in void mode until it succeeds"] else empty end),
     (if .hub.held != null then ["fail", "the mail provider'"'"'s template changed: review and confirm on its Mail tab"] else empty end),
     (if .hub != null and .hub.wired == true and .hub.reachable == false then ["fail", "the mail provider isn'"'"'t reachable"] else empty end),
     (if .hub.generation != null then ["ok", "the Hub'"'"'s document: generation \(.hub.generation), applied \(.hub.applied_generation // "?")"] else empty end),
