@@ -11,14 +11,19 @@ provider="${1:?usage: mail-enable-logged.sh <provider> <out file>}"
 out="${2:?usage: mail-enable-logged.sh <provider> <out file>}"
 logs="${MAIL_CI_LOGS:-/tmp/mail-instance-logs}"
 rm -rf "$logs" && mkdir -p "$logs"
+# Every container of the project, once per id (a job re-run is a new
+# container): its log appended as <service>.log, its state kept; polled
+# every half second (the Hub removes a failed install's containers within
+# seconds).
 (
   while :; do
     for c in $(docker ps -aq --filter "label=com.docker.compose.project=portcullis-$provider" 2>/dev/null); do
       n="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$c" 2>/dev/null)" || continue
-      docker logs "$c" > "$logs/$n.log.tmp" 2>&1 && mv "$logs/$n.log.tmp" "$logs/$n.log"
-      docker inspect -f '{{.State.Status}} {{.State.ExitCode}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "$c" > "$logs/$n.state" 2>/dev/null || true
+      st="$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "$c" 2>/dev/null)" || continue
+      docker logs "$c" > "$logs/$n.$c.log" 2>&1 || true
+      echo "$st" > "$logs/$n.$c.state"
     done
-    sleep 3
+    sleep 0.5
   done
 ) &
 keeper=$!
@@ -32,7 +37,7 @@ if [ "$rc" != 0 ]; then
     [ -e "$f" ] || continue
     s="${f%.log}.state"
     echo "--- $(basename "$f" .log) ($(cat "$s" 2>/dev/null))"
-    tail -n 60 "$f"
+    tail -n 40 "$f"
   done
 fi
 exit "$rc"
