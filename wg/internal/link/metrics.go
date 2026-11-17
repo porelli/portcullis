@@ -182,11 +182,22 @@ func (g *AgentGatherer) Gather() ([]*dto.MetricFamily, error) {
 		}
 		okFam.Metric = append(okFam.Metric, &dto.Metric{Label: []*dto.LabelPair{{Name: proto.String("server"), Value: proto.String(r.id)}}, Gauge: &dto.Gauge{Value: proto.Float64(v)}})
 		for name, f := range r.fams {
-			if strings.HasPrefix(name, "wg_") {
+			// An agent is untrusted: only its own families pass (an
+			// allowlist), never one the primary's alerts read.
+			if !strings.HasPrefix(name, AgentMetricPrefix) {
 				continue
 			}
+			kept := f.Metric[:0]
 			for _, m := range f.Metric {
+				if forgedServer(m, r.id) {
+					continue
+				}
 				relabel(m, r.id)
+				kept = append(kept, m)
+			}
+			f.Metric = kept
+			if len(kept) == 0 {
+				continue
 			}
 			if have, ok := merged[name]; ok {
 				if have.GetType() != f.GetType() {
@@ -208,6 +219,21 @@ func (g *AgentGatherer) Gather() ([]*dto.MetricFamily, error) {
 		out = append(out, merged[n])
 	}
 	return out, nil
+}
+
+// AgentMetricPrefix is the only family prefix wg passes from an agent
+// (contract §17.2 Metrics).
+const AgentMetricPrefix = "portcullis_agent_"
+
+// forgedServer reports a series carrying a server label other than the
+// agent's own id (dropped, not relabelled).
+func forgedServer(m *dto.Metric, id string) bool {
+	for _, lp := range m.Label {
+		if lp.GetName() == "server" && lp.GetValue() != id {
+			return true
+		}
+	}
+	return false
 }
 
 func relabel(m *dto.Metric, id string) {

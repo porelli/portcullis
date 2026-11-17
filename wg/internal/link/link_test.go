@@ -800,7 +800,13 @@ func TestAgentMetricsRelabelled(t *testing.T) {
 	b := newWorker(t, "b", "10.214.0.11", f.pub, f.port)
 	f.apply(map[*worker]string{a: linkdoc.StateReady, b: linkdoc.StateReady})
 	p := newPKI(t)
-	p.serveAgent(t, a, "a.node.portcullis.internal", "# TYPE portcullis_agent_up gauge\nportcullis_agent_up{server=\"forged\"} 1\n# TYPE wg_link_peer_rx_bytes_total counter\nwg_link_peer_rx_bytes_total{server=\"x\"} 9\n")
+	p.serveAgent(t, a, "a.node.portcullis.internal", "# TYPE portcullis_agent_up gauge\nportcullis_agent_up 1\nportcullis_agent_up{server=\"forged\",x=\"1\"} 1\n"+
+		"# TYPE portcullis_agent_info gauge\nportcullis_agent_info{server=\"a\",version=\"v1\"} 1\n"+
+		"# TYPE wg_link_peer_rx_bytes_total counter\nwg_link_peer_rx_bytes_total{server=\"x\"} 9\n"+
+		// Families the primary's alerts read: never passed from an agent.
+		"# TYPE portcullis_status_ok gauge\nportcullis_status_ok 0\n"+
+		"# TYPE portcullis_backup_last_success_timestamp_seconds gauge\nportcullis_backup_last_success_timestamp_seconds 1\n"+
+		"# TYPE go_goroutines gauge\ngo_goroutines 3\n")
 	// b presents a's name: refused by the ServerName check.
 	p.serveAgent(t, b, "a.node.portcullis.internal", "# TYPE portcullis_agent_up gauge\nportcullis_agent_up 1\n")
 	g := &AgentGatherer{Link: f.link, CertFile: p.certFile, KeyFile: p.keyFile, CAFile: p.caFile, Timeout: 5 * time.Second,
@@ -831,7 +837,10 @@ func TestAgentMetricsRelabelled(t *testing.T) {
 			t.Fatalf("missing %q in\n%s", want, all)
 		}
 	}
-	for _, bad := range []string{"forged", "server=x", "portcullis_agent_up{server=b}"} {
+	if !strings.Contains(all, "portcullis_agent_info{server=a,version=v1} 1") {
+		t.Fatalf("the agent's own server label: missing in\n%s", all)
+	}
+	for _, bad := range []string{"forged", "x=1", "server=x", "portcullis_agent_up{server=b}", "portcullis_status_ok", "portcullis_backup_last_success", "go_goroutines"} {
 		if strings.Contains(all, bad) {
 			t.Fatalf("%q in\n%s", bad, all)
 		}

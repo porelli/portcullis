@@ -66,6 +66,11 @@ scrape_configs:
       - source_labels: [__name__]
         regex: 'wg_link_.*|portcullis_agent_.*'
         action: drop
+      # A server-labelled series is a worker's (job link's), never wg's own:
+      # nothing a worker returns reaches the families the alerts read.
+      - source_labels: [server]
+        regex: '.+'
+        action: drop
 
   # Multiple servers (contract §17.2): the link role's own metrics and the
   # worker agents' (fetched over the tunnel by wg, labelled server=<id>),
