@@ -233,6 +233,13 @@ def server_state(sid: str):
     return s.get("state") if code == 200 and isinstance(s, dict) else code
 
 
+def needs(*keys: str) -> None:
+    """An earlier case's state (scenarios.py reads these calls: running one
+    case runs the cases that set its keys)."""
+    missing = [k for k in keys if k not in state]
+    assert not missing, f"needs {', '.join(missing)} (an earlier case failed)"
+
+
 def wait_for(what: str, fn, timeout: float, every: float = 3):
     deadline, last = time.time() + timeout, None
     while time.time() < deadline:
@@ -323,7 +330,7 @@ def join_ok():
 
 
 def join_code_reused_refused():
-    assert state.get("w1"), "needs join_ok"
+    needs("w1")  # join_ok
     p = join(KIND if KIND == "dind" else "dind", "w1b", state["w1_op"]["code_file"], wait=60, check=False)
     assert p.returncode != 0, "a used code enrolled a second worker"
     names = [s["id"] for s in get("/api/servers")["servers"]]
@@ -356,7 +363,7 @@ def join_code_expired_refused():
 
 
 def echo_on_worker_signed_in():
-    assert state.get("w1"), "needs join_ok"
+    needs("w1")  # join_ok
     for iid, srv in (("se0", ""), ("se1", "w1")):
         run_op("POST", "/api/instances", {"template": "servers-echo", "id": iid, "label": iid.upper(),
                                           "hosts": {"secho": f"{iid}.{DOMAIN}"}, "server": srv})
@@ -375,7 +382,7 @@ def echo_on_worker_signed_in():
 
 
 def echo_on_worker_denied_without_sign_in():
-    assert state.get("se1"), "needs echo_on_worker_signed_in"
+    needs("se1")  # echo_on_worker_signed_in
     ctx = state["browser"].new_context(ignore_https_errors=True)
     try:
         r = ctx.request.get(f"https://se1.{DOMAIN}/cgi-bin/echo", max_redirects=0)
@@ -385,7 +392,7 @@ def echo_on_worker_denied_without_sign_in():
 
 
 def no_portcullis_cookie_reaches_app():
-    assert state.get("se1"), "needs echo_on_worker_signed_in"
+    needs("se1")  # echo_on_worker_signed_in
     st, body, _ = echo(state["alice_page"], "se1")
     line = [ln for ln in body.splitlines() if ln.startswith("COOKIE=")][0]
     for bad in ("_oauth2_proxy", "__Host-portcullis_ext", "_oauth2_proxy_csrf"):
@@ -393,7 +400,7 @@ def no_portcullis_cookie_reaches_app():
 
 
 def parent_domain_set_cookie_stripped():
-    assert state.get("se1"), "needs echo_on_worker_signed_in"
+    needs("se1")  # echo_on_worker_signed_in
     _, _, cookies = echo(state["alice_page"], "se1")
     wide = [c for c in cookies if c.startswith("wide=")]
     assert wide and all("domain=" not in c.lower() for c in wide), f"Set-Cookie for the parent domain: {cookies}"
@@ -409,7 +416,7 @@ def marker(where: str, write: str | None = None) -> str:
 
 
 def move_worker_primary_worker_keeps_data():
-    assert state.get("se1"), "needs echo_on_worker_signed_in"
+    needs("se1")  # echo_on_worker_signed_in
     mark = secrets.token_hex(8)
     marker("w1", mark)
     page = state["alice_page"]
@@ -420,7 +427,7 @@ def move_worker_primary_worker_keeps_data():
 
 
 def wg_stopped_fails_closed():
-    assert state.get("se1"), "needs echo_on_worker_signed_in"
+    needs("se1")  # echo_on_worker_signed_in
     sh("docker", "compose", "stop", "wg")
     page = state["alice_page"]
     wait_for("se1 unreachable with wg down", lambda: not reach(page, "se1"), 60)
@@ -430,12 +437,12 @@ def wg_stopped_fails_closed():
 
 def wg_back_routes_again():
     sh("docker", "compose", "start", "wg")  # always: later cases need wg
-    assert state.get("se1"), "needs echo_on_worker_signed_in"
+    needs("se1")  # echo_on_worker_signed_in
     wait_for("se1 routed again", lambda: reach(state["alice_page"], "se1"), 240)
 
 
 def rogue_worker():
-    assert state.get("w1"), "needs join_ok"
+    needs("w1")  # join_ok
     if KIND == "dind":
         ans = add_server("w3")
         join("dind", "w3", ans["code_file"])
@@ -460,7 +467,7 @@ def keycloak_secret(client_like: str) -> str:
 
 
 def revoke_drops_handshake_and_rotates():
-    assert state.get("se1"), "needs echo_on_worker_signed_in"
+    needs("se1")  # echo_on_worker_signed_in
     run_op("POST", "/api/instances", {"template": "oidc-echo", "id": "oe1", "label": "OE1",
                                       "hosts": {"oidc": f"oe1.{DOMAIN}"}, "server": "w1"})
     run_op("POST", "/api/templates/enable", {"id": "oe1"}, timeout=900)
@@ -499,8 +506,8 @@ def _tls():
 
 
 def revoke_cuts_websocket():
-    t0, closed = state.get("stream", (None, None))
-    assert t0, "needs revoke_drops_handshake_and_rotates"
+    needs("stream")  # revoke_drops_handshake_and_rotates
+    t0, closed = state["stream"]
     assert closed is not None and closed - t0 < 30, f"the stream outlived the revocation ({None if closed is None else round(closed - t0)} s)"
 
 
