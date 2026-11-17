@@ -341,8 +341,18 @@ mail_disable() {
   fi
   [ "$force" != true ] || drain=false
   _mail_hub_wait >/dev/null
-  _mail_hub unwire "$(jq -cn --argjson d "$drain" '{drain: $d}')" >/dev/null \
-    || fail "the Hub didn't unwire the mail provider (see above)"
+  # Nothing wired is exactly the Hub's 409 "no mail provider is wired":
+  # already unwired (any other refusal or error fails).
+  local err rc=0
+  err="$(_mail_hub unwire "$(jq -cn --argjson d "$drain" '{drain: $d}')" 2>&1 >/dev/null)" || rc=$?
+  if [ "$rc" != 0 ]; then
+    if [ "$rc" = 1 ] && [ "$(printf '%s' "$err" | tr -d '\r' | sed -e 's/^[[:space:]]*//;s/[[:space:]]*$//')" = "no mail provider is wired" ]; then
+      info "No mail provider is wired (already unwired)."
+    else
+      [ -z "$err" ] || printf '%s\n' "$err" >&2
+      fail "the Hub didn't unwire the mail provider (see above)"
+    fi
+  fi
   if [ "$force" != true ]; then
     doms="$(_mail_hub domains)" || fail "the Hub didn't answer hub mail domains"
     off="$(printf '%s' "$doms" | jq -r 'if type == "array" and all(.[]; .state == "off") then "yes" else "no" end' 2>/dev/null || echo no)"

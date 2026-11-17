@@ -4866,6 +4866,7 @@ mt() {
         local c="${a[$((i + 3))]}"
         cat > "$ML/hub-$c.in"
         [ ! -f "$ML/hub-$c" ] || cat "$ML/hub-$c"
+        [ ! -f "$ML/hub-$c.err" ] || cat "$ML/hub-$c.err" >&2
         return "$(cat "$ML/hub-$c.rc" 2>/dev/null || echo 0)"
       fi
       return 1
@@ -4937,6 +4938,10 @@ mte 'printf "%s" "[{\"name\":\"mail.example\",\"state\":\"draining\"}]" > "$ML/h
 expect_eq "mail disable while a domain drains: the slot stays open" "$rc:$(grep -c '^PORTCULLIS_MAIL=on$' "$ML/root/.env"):$(grep -c 'dns_tool' "$ML/argv")" "0:1:0"
 mte 'mail_disable true true'; rc=$?
 expect_eq "mail disable --force: {drain: false}, off at once" "$rc:$(jq -c . "$ML/hub-unwire.in"):$(grep -c '^PORTCULLIS_MAIL=off$' "$ML/root/.env")" '0:{"drain":false}:1'
+mte 'echo 1 > "$ML/hub-unwire.rc"; printf "no mail provider is wired\n" > "$ML/hub-unwire.err"; mail_disable true true'; rc=$?
+expect_eq "mail disable: the Hub's 409 no mail provider is wired → already unwired, the slot closed" "$rc:$(grep -c '^PORTCULLIS_MAIL=off$' "$ML/root/.env"):$(grep -c 'already unwired' "$ML/out")" "0:1:1"
+mte 'echo 1 > "$ML/hub-unwire.rc"; printf "an unwire is already running\n" > "$ML/hub-unwire.err"; mail_disable true true'; rc=$?
+expect_eq "mail disable: any other refusal fails" "$rc:$(grep -c '^PORTCULLIS_MAIL=on$' "$ML/root/.env"):$(grep -c 'an unwire is already running' "$ML/out")" "1:1:1"
 mte 'echo 1 > "$ML/hub-unwire.rc"; mail_disable true true'; rc=$?
 expect_eq "mail disable: the Hub refusing the unwire → refused, the slot stays open" "$rc:$(grep -c '^PORTCULLIS_MAIL=on$' "$ML/root/.env")" "1:1"
 # test_mail_export_argv_no_shell: the block's argv with {former_id}
@@ -5086,6 +5091,100 @@ mt "$SDL"'_dns_automated fake'; rc=$?
 expect_eq "DNS_PROVIDER=fake without PORTCULLIS_TESTPROVIDER=1 → not automated" "$rc" 1
 mt "$SDL"'export PORTCULLIS_TESTPROVIDER=1; _dns_automated fake && [ "$(_dns_cred_keys fake)" = FAKE_API_TOKEN:api_token ]'; rc=$?
 expect_eq "fake with PORTCULLIS_TESTPROVIDER=1 → automated, FAKE_API_TOKEN" "$rc" 0
+
+# ── backup / restore of the mail provider (contract §19.11, mail provider Task 24) ──
+# bmp <.env extra> <script> — backup_create in a fresh root (set -e, as
+# ./portcullis runs) with the Hub's `hub mail` stubbed ($BM/hub-<cmd>,
+# calls in $BM/calls) and hub_data the one file volume (its archive call
+# logged, so the order shows).
+BM="$WORK/bmail"
+bmp() {
+  rm -rf "$BM"; mkdir -p "$BM/root/secrets" "$BM/root/certs"
+  printf 'PORTCULLIS_DOMAIN=x\nCONTAINER_RUNTIME=docker\n%s\n' "$1" > "$BM/root/.env"
+  printf '%s' '{"wired":true,"instance":"stalwart","template":"stalwart","warning":"w"}' > "$BM/hub-provider"
+  printf '%s' '{"archive":"stalwart/20261117T100000Z.tar"}' > "$BM/hub-backup"
+  (
+    set -e
+    export PORTCULLIS_ROOT="$BM/root" BACKUP_ROOT="$BM/root/backups" BACKUP_FILE_VOLUMES="hub_data:10001:10001"
+    env_load
+    _BACKUP_CFG='{"services":{"hub":{"image":"hub:1"}},"volumes":{"hub_data":{"name":"portcullis_hub_data"}}}'
+    dc() { :; }; wait_healthy() { :; }; vault_wait_active() { :; }; vault_admin_env() { echo t; }
+    _backup_vault_snapshot() { echo snap > "$1"; }; _backup_pg_dump() { echo PGDMP > "$1"; }
+    _backup_metrics() { :; }; rt_health() { echo healthy; }; rt_running() { return 0; }
+    docker() { :; }
+    _backup_volume_files() { echo "archive $1" >> "$BM/calls"; printf 'x' | gzip; }
+    rt_exec() {
+      local -a a=("$@"); local i=0
+      while [ "${a[$i]}" != -- ]; do i=$((i + 1)); done
+      local c="${a[$((i + 3))]}"
+      echo "hub mail $c" >> "$BM/calls"
+      cat > /dev/null
+      cat "$BM/hub-$c"
+      return "$(cat "$BM/hub-$c.rc" 2>/dev/null || echo 0)"
+    }
+    eval "$2"
+    backup_create
+  ) >"$BM/out" 2>&1
+}
+bm_dir() { find "$BM/root/backups" -mindepth 1 -maxdepth 1 -type d -name '2*' ! -name '*.partial' | head -n1; }
+# test_backup_calls_hub_mail_backup_first
+bmp 'PORTCULLIS_MAIL=on' ':'; rc=$?
+expect_eq "backup: hub mail backup before hub_data is archived" "$rc:$(grep -vx 'hub mail provider' "$BM/calls" | tr '\n' '|')" "0:hub mail backup|archive portcullis_hub_data|"
+# test_backup_manifest_names_archive
+expect_eq "backup: MANIFEST.json names the provider's archive" "$(jq -r .mail_provider_archive "$(bm_dir)/MANIFEST.json")" "stalwart/20261117T100000Z.tar"
+bmp 'PORTCULLIS_MAIL=on' 'echo 1 > "$BM/hub-backup.rc"'; rc=$?
+expect_eq "backup: a failed provider backup fails the backup (nothing saved)" "$rc:$([ -n "$(bm_dir)" ] && echo saved || echo none)" "1:none"
+bmp 'PORTCULLIS_MAIL=on' 'printf "%s" "{\"archive\":\"../../etc/x.tar\"}" > "$BM/hub-backup"'; rc=$?
+expect_eq "backup: a malformed archive name from the Hub fails the backup" "$rc:$(grep -c 'names no archive' "$BM/out")" "1:1"
+bmp 'PORTCULLIS_MAIL=on' 'printf "%s" "{\"wired\":false,\"warning\":\"w\"}" > "$BM/hub-provider"'; rc=$?
+expect_eq "backup: the slot open, nothing wired → no provider backup, no manifest key" "$rc:$(grep -c 'hub mail backup' "$BM/calls"):$(jq -c 'has("mail_provider_archive")' "$(bm_dir)/MANIFEST.json")" "0:0:false"
+# test_backup_without_slot_skips (set -e harness)
+bmp '' ':'; rc=$?
+expect_eq "backup with the slot closed: no Hub call, no manifest key" "$rc:$(grep -c 'hub mail' "$BM/calls"):$(jq -c 'has("mail_provider_archive")' "$(bm_dir)/MANIFEST.json")" "0:0:false"
+expect_eq "backup: mail_acme and mail_tls archived online (tlsa.json and the keys), mail_slot never" \
+  "$(tr ' ' '\n' <<<"$BACKUP_FILE_VOLUMES" | grep -E '^mail_' | tr '\n' ' ')" "mail_acme:10004:10004 mail_tls:10004:2000 "
+# test_restore_empties_hub_secrets_then_restores_provider: the provider's
+# volumes missing → hub mail restore {archive} after the stack is up; present
+# → nothing (the Hub owes a void from the emptied hub_secrets); a refusal
+# fails the restore at its end.
+rmp() {
+  rm -rf "$BM"; mkdir -p "$BM/root" "$BM/bk"
+  printf 'PORTCULLIS_MAIL=on\nCONTAINER_RUNTIME=docker\n' > "$BM/root/.env"
+  printf '%s' '{"mail_provider_archive":"stalwart/20261117T100000Z.tar"}' > "$BM/bk/MANIFEST.json"
+  printf '%s' '{"wired":true}' > "$BM/hub-provider"; printf '{}' > "$BM/hub-restore"
+  (
+    export PORTCULLIS_ROOT="$BM/root"
+    env_load
+    rt_health() { echo healthy; }
+    docker() { echo "docker $*" >> "$BM/calls"; [ "$1 $2" != "volume ls" ] || cat "$BM/vols" 2>/dev/null; }
+    rt_exec() {
+      local -a a=("$@"); local i=0
+      while [ "${a[$i]}" != -- ]; do i=$((i + 1)); done
+      local c="${a[$((i + 3))]}"
+      echo "hub mail $c" >> "$BM/calls"; cat > "$BM/hub-$c.in"; cat "$BM/hub-$c"
+      return "$(cat "$BM/hub-$c.rc" 2>/dev/null || echo 0)"
+    }
+    eval "$1"
+    # shellcheck disable=SC2034  # read by _restore_mail_outcome
+    RESTORE_MAIL_FAILED=false
+    # shellcheck disable=SC2034
+    _restore_mail_provider "$BM/bk" || RESTORE_MAIL_FAILED=true
+    _restore_mail_outcome
+  ) >"$BM/out" 2>&1
+}
+rmp ':'; rc=$?
+expect_eq "restore: the provider's volumes missing → hub mail restore with the manifest's archive" \
+  "$rc:$(jq -c . "$BM/hub-restore.in"):$(grep -c 'label=com.docker.compose.project=portcullis-stalwart' "$BM/calls")" '0:{"archive":"stalwart/20261117T100000Z.tar"}:1'
+rmp 'echo portcullis-stalwart_data > "$BM/vols"'; rc=$?
+expect_eq "restore: the provider's volumes present → no hub mail restore" "$rc:$(grep -c 'hub mail restore' "$BM/calls")" "0:0"
+rmp 'echo 1 > "$BM/hub-restore.rc"'; rc=$?
+expect_eq "restore: the Hub refusing the provider restore fails the restore at its end" "$rc:$(grep -c "couldn't be restored from its archive" "$BM/out")" "1:1"
+rmp 'printf "%s" "{}" > "$BM/bk/MANIFEST.json"'; rc=$?
+expect_eq "restore: no archive in the manifest → nothing" "$rc:$(wc -l < "$BM/calls" 2>/dev/null | tr -d ' ' || echo 0)" "0:0"
+expect_eq "restore empties hub_secrets (the gate sentinel and the API secret go: the Hub owes a mail void)" \
+  "$(grep -c 'Emptying hub_secrets volume' "$HERE/../scripts/lib/backup.sh"):$(awk '/Emptying hub_secrets/{e=NR} /_restore_mail_provider "\$dir"/{r=NR} END{print (e < r)}' "$HERE/../scripts/lib/backup.sh")" "1:1"
+expect_eq "no mail store copy, recovery session or void marker left in backup.sh" \
+  "$(grep -cE '_backup_mail_data|BACKUP_MAIL_STOPPED|mail_void|recovery|mailctl' "$HERE/../scripts/lib/backup.sh")" 0
 
 echo ""
 echo "$PASS passed, $FAIL failed"
