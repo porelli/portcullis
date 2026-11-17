@@ -1253,8 +1253,12 @@ def conformance(level: str, inst: str, service: str) -> None:
     try:
         args = ["--level", level, "--api-url", "http://172.31.255.19:8080", "--secret-file", "/hs/api-secret"]
         if level == "full":
-            args += ["--smtp-host", "172.30.88.2", "--imap-host", "172.30.88.2"]
-        p = subprocess.run(["docker", "run", "--rm", "--network", "portcullis-mail-api", "--ip", "172.31.255.18",
+            # The published ports through the runner's address (a container
+            # can't reach the stack's 127.0.0.1).
+            host = subprocess.run(["sh", "-c", "ip -4 route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == \"src\") print $(i + 1)}'"],
+                                  capture_output=True, text=True).stdout.strip()
+            args += ["--smtp-host", host, "--imap-host", host]
+        p = subprocess.run(["docker", "run", "--rm", "--user", "0:0", "--network", "portcullis-mail-api", "--ip", "172.31.255.18",
                             "-v", f"portcullis_hub_secrets:/hsv:ro", "-v", f"{os.path.dirname(CONF)}:/c:ro",
                             "--entrypoint", "sh", "portcullis-group-gate", "-c",
                             f'mkdir -p /hs && cp /hsv/{inst}/_mail/api-secret /hs/ && python3 /c/run.py "$@"', "x", *args],
