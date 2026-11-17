@@ -542,8 +542,11 @@ def revoke_drops_handshake_and_rotates():
     stream = {"closed_after": None, "first": None, "bytes": 0, "status": None, "error": ""}
 
     def hold():
-        st = state["alice_ctx"].cookies()
-        hdr = "; ".join(f"{c['name']}={c['value']}" for c in st if DOMAIN in c["domain"])
+        # The cookies a browser would send to se1 (Playwright's domain
+        # matching), never Keycloak's auth.<domain> ones: busybox httpd
+        # stalls on an oversized request header.
+        st = state["alice_ctx"].cookies(f"https://se1.{DOMAIN}/cgi-bin/echo")
+        hdr = "; ".join(f"{c['name']}={c['value']}" for c in st)
         req = urllib.request.Request(f"https://se1.{DOMAIN}/cgi-bin/echo?stream", headers={"Cookie": hdr})
         try:
             with urllib.request.urlopen(req, timeout=300, context=_tls()) as r:
