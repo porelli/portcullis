@@ -106,6 +106,7 @@ case "$kind" in
         echo "::warning::$WUSER's podman.socket doesn't answer after 20 s: $(asworker systemctl --user is-active podman.socket 2>&1 | head -1)"
         sudo ls -la "/run/user/$(id -u "$WUSER")" "/run/user/$(id -u "$WUSER")/podman" 2>&1 | tail -8
         asworker systemctl --user status podman.socket --no-pager 2>&1 | tail -8 || true
+        sudo journalctl "_UID=$(id -u "$WUSER")" --no-pager -n 40 2>&1 | grep -iv 'gpg-agent\|ssh-agent\|dirmngr\|keyboxd' | tail -30 || true
         asworker sh -c 'mkdir -p "$XDG_RUNTIME_DIR/podman" && setsid nohup podman system service --time=0 "unix://$XDG_RUNTIME_DIR/podman/podman.sock" >"$HOME/podman-service.log" 2>&1 < /dev/null &'
       fi
       if [ "$i" -eq 30 ]; then
