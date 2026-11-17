@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Multiple servers end to end (contract §17; ci.yml jobs e2e-servers and
 e2e-servers-podman). The primary runs the whole stack with `link init`; the
-workers are docker:dind containers (or rootless Podman as the runner user
-`worker`), joined with `./portcullis worker join` and the code on stdin.
+workers are docker:dind containers (or a pinned quay.io/podman/stable
+container running rootless Podman as its user `podman`), joined with `./portcullis worker join` and the code on stdin.
 
 Cases, in this order (one function each):
 
@@ -52,6 +52,7 @@ from playwright.sync_api import Page, sync_playwright
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_login as base  # noqa: E402
 import e2e_ops  # noqa: E402
+import scenarios  # noqa: E402
 
 DOMAIN = os.environ["E2E_DOMAIN"]
 KIND = os.environ.get("E2E_WORKER_KIND", "dind")  # dind | podman
@@ -102,8 +103,11 @@ def mint_link(user: str, to: str) -> str:
     return url
 
 
+# check is base.check with every failure's text redacted (its traceback too).
 def check(name: str, fn) -> None:
-    """base.check with every failure's text redacted (its traceback too)."""
+    if scenarios.skip(name):  # E2E_SCENARIOS (tests/e2e/scenarios.py)
+        return
+
     def run():
         try:
             fn()
