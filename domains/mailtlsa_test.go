@@ -33,8 +33,9 @@ func TestMailTLSACommand(t *testing.T) {
 	now := time.Date(2026, 11, 17, 10, 0, 0, 0, time.UTC)
 	tlsaNow = func() time.Time { return now }
 	live := false
+	realLive := tlsaLive
 	tlsaLive = func(_ context.Context, host, spki string) bool { return live && host == "mail.example.com" }
-	t.Cleanup(func() { tlsaNow = time.Now; tlsaLive = func(context.Context, string, string) bool { return false } })
+	t.Cleanup(func() { tlsaNow = time.Now; tlsaLive = realLive })
 	if code, _ := tlsaRun(t, dir, "status"); code != exitProblem {
 		t.Fatal("status without a key")
 	}

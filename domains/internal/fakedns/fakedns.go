@@ -640,7 +640,7 @@ func toDNS(qname string, rr libdns.RR) dns.RR {
 		return &dns.TXT{Hdr: hdr, Txt: txtStrings(rr.Data)}
 	case "CNAME":
 		return &dns.CNAME{Hdr: hdr, Target: dns.Fqdn(rr.Data)}
-	case "MX", "CAA", "SRV", "TLSA", "PTR":
+	case "MX", "CAA", "SRV", "TLSA", "PTR", "NS":
 		out, err := dns.NewRR(fmt.Sprintf("%s %d IN %s %s", qname, ttl, rr.Type, rr.Data))
 		if err != nil || out == nil {
 			return nil
@@ -652,6 +652,8 @@ func toDNS(qname string, rr libdns.RR) dns.RR {
 			v.Target = dns.Fqdn(v.Target)
 		case *dns.PTR:
 			v.Ptr = dns.Fqdn(v.Ptr)
+		case *dns.NS:
+			v.Ns = dns.Fqdn(v.Ns)
 		}
 		return out
 	}

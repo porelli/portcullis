@@ -1441,6 +1441,84 @@
         }
       ],
       "want_error": "mail set: _dmarc.example.com TXT: ri must be a whole number of seconds"
+    },
+    {
+      "name": "dmarc with a leading space refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": " v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: the value has leading or trailing whitespace"
+    },
+    {
+      "name": "dmarc with a trailing space refused",
+      "context": {
+        "dmarc_floor": "reject"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com "
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: the value has leading or trailing whitespace"
+    },
+    {
+      "name": "spf with a leading space refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": " v=spf1 mx -all"
+        }
+      ],
+      "want_error": "mail set: example.com TXT: the value has leading or trailing whitespace"
+    },
+    {
+      "name": "spf with a trailing space refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx -all "
+        }
+      ],
+      "want_error": "mail set: example.com TXT: the value has leading or trailing whitespace"
+    },
+    {
+      "name": "dkim with a leading space refused",
+      "records": [
+        {
+          "name": "s1._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": " v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+        }
+      ],
+      "want_error": "mail set: s1._domainkey.example.com TXT: the value has leading or trailing whitespace"
+    },
+    {
+      "name": "dkim with a trailing space refused",
+      "records": [
+        {
+          "name": "s1._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo= "
+        }
+      ],
+      "want_error": "mail set: s1._domainkey.example.com TXT: the value has leading or trailing whitespace"
     }
   ]
 }

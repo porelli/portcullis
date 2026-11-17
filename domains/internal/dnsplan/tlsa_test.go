@@ -1,9 +1,14 @@
 package dnsplan
 
 import (
+	"context"
+	"net"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/libdns/libdns"
+	"github.com/portcullis/domains/internal/fakedns"
 )
 
 var (
@@ -50,6 +55,16 @@ func TestTLSARolloverStates(t *testing.T) {
 	gone, _, _ := TLSAStep(&s, spkiA, spkiB, false, seen.Add(30*time.Minute))
 	if gone.NextSeenAt != nil {
 		t.Fatal("a vanished TLSA kept its seen time")
+	}
+	// From the restart (fed forward): seen again later, the TTL counts
+	// from then, never from the first sighting (L-f).
+	again := seen.Add(time.Hour)
+	g2, _, due := TLSAStep(&gone, spkiA, spkiB, true, again)
+	if due != "" || g2.NextSeenAt == nil || !g2.NextSeenAt.Equal(again) {
+		t.Fatalf("seen again: %s %+v", due, g2.NextSeenAt)
+	}
+	if _, _, due = TLSAStep(&g2, spkiA, spkiB, true, again.Add(TLSATTL*time.Second-time.Second)); due != "" {
+		t.Fatal("the switch counted from the first sighting")
 	}
 	if _, phase, due = TLSAStep(&s, spkiA, spkiB, true, seen.Add(TLSATTL*time.Second)); phase != TLSARollover || due != TLSADueSwitch {
 		t.Fatalf("due %s %s", phase, due)
@@ -137,5 +152,44 @@ func TestHELOSPFAtHostname(t *testing.T) {
 	r := CoreMailRecords("mx.other.example", nil, true)
 	if len(r) != 1 || r[0] != (MailRecord{Name: "mx.other.example", Type: "TXT", TTL: 3600, Value: "v=spf1 a -all"}) {
 		t.Fatalf("%+v", r)
+	}
+}
+
+// Ruling R2-N6: TLSAServed asks every IPv4 address of every name server
+// (a fake zone on 127.0.0.1 standing in for them); an IPv6 address is
+// never asked; a name server with no IPv4 address, or one address
+// without the record, is false.
+func TestTLSAServedEveryIPv4(t *testing.T) {
+	const spki = "aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11aa11"
+	z := fakedns.NewZone()
+	z.SetSOA("example.test")
+	z.Set("example.test", libdns.RR{Name: "@", Type: "NS", Data: "ns1.example.test."})
+	z.Set("ns1.example.test", libdns.RR{Name: "ns1", Type: "A", Data: "127.0.0.1"}, libdns.RR{Name: "ns1", Type: "AAAA", Data: "2001:db8::53"})
+	s, err := fakedns.Serve(z, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	_, port, _ := net.SplitHostPort(s.Addr)
+	old := authPort
+	authPort = port
+	t.Cleanup(func() { authPort = old })
+	r := []string{s.Addr}
+	ctx := context.Background()
+	if TLSAServed(ctx, r, "mail.example.test", spki) {
+		t.Fatal("served without the record")
+	}
+	z.Set("_25._tcp.mail.example.test", libdns.RR{Name: "_25._tcp.mail", Type: "TLSA", Data: "3 1 1 " + spki})
+	if !TLSAServed(ctx, r, "mail.example.test", spki) {
+		t.Fatal("not served with the record on the only IPv4 (the IPv6 address must not count)")
+	}
+	if TLSAServed(ctx, r, "mail.example.test", strings.Repeat("bb", 32)) {
+		t.Fatal("another key judged served")
+	}
+	// A second name server with only an IPv6 address can't be checked.
+	z.Set("example.test", libdns.RR{Name: "@", Type: "NS", Data: "ns1.example.test."}, libdns.RR{Name: "@", Type: "NS", Data: "ns2.example.test."})
+	z.Set("ns2.example.test", libdns.RR{Name: "ns2", Type: "AAAA", Data: "2001:db8::54"})
+	if TLSAServed(ctx, r, "mail.example.test", spki) {
+		t.Fatal("served although a name server has no IPv4 address")
 	}
 }

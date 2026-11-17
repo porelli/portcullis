@@ -572,3 +572,36 @@ func TestMailForeignDKIMSurvives(t *testing.T) {
 		t.Fatalf("written selectors left: %v %v", e.zone.Records(dkimRS), e.zone.Records(dkimED))
 	}
 }
+
+// Ruling R2-N7: the set never takes over a DKIM name another sender's key
+// holds (not in its written list): nothing is written, the plan names it
+// as a Problem; once the name is the set's own (written), it is replaced.
+func TestMailRefusesForeignDKIMTakeover(t *testing.T) {
+	e, _ := mailEnv(t, false)
+	ctx := context.Background()
+	const g = "google._domainkey." + pd
+	e.zone.Set(g, libdns.RR{Name: "google._domainkey.portcullis", Type: "TXT", Data: "v=DKIM1; k=rsa; p=WORKSPACE", TTL: time.Hour})
+	e.in.Spec.Mail = append(e.in.Spec.Mail, MailRecord{Name: g, Type: "TXT", TTL: 3600, Value: "v=DKIM1; k=rsa; p=PROVIDER"})
+	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err == nil || !strings.Contains(err.Error(), "didn't write") {
+		t.Fatalf("a foreign DKIM name taken over: %v", err)
+	}
+	if got := rrs(e.zone, g, "TXT"); len(got) != 1 || !strings.Contains(got[0], "WORKSPACE") {
+		t.Fatalf("the foreign key changed: %v", got)
+	}
+	found := false
+	for _, it := range Build(ctx, e.in).Items {
+		if it.Set == SetMail && it.Name == g {
+			found = it.Severity == SevProblem && len(it.Steps) == 1 && strings.Contains(it.Steps[0], "didn't write")
+		}
+	}
+	if !found {
+		t.Fatal("the plan doesn't name the foreign DKIM key as a Problem")
+	}
+	e.in.Spec.MailDKIMWritten = []string{g}
+	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err != nil {
+		t.Fatal(err)
+	}
+	if got := rrs(e.zone, g, "TXT"); len(got) != 1 || !strings.Contains(got[0], "PROVIDER") {
+		t.Fatalf("the set's own name not replaced: %v", got)
+	}
+}

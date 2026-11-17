@@ -62,6 +62,12 @@ func valueShape(t string, ttl int, v string) string {
 			return "the value must be printable ASCII"
 		}
 	}
+	// The raw value is what DNS gets (R2-N3): never trimmed, so a leading
+	// or trailing space is refused (" v=DMARC1; …" is no DMARC record for
+	// receivers).
+	if v != strings.TrimSpace(v) {
+		return "the value has leading or trailing whitespace"
+	}
 	max := ruleTargetMax
 	if t == "TXT" {
 		max = ruleTXTMax
@@ -137,7 +143,7 @@ func ValidateMailSet(c RuleContext, rs []MailRecord) error {
 		if why := valueShape(t, r.TTL, r.Value); why != "" {
 			return refuse(why)
 		}
-		v := strings.TrimSpace(r.Value)
+		v := r.Value
 		switch {
 		case n == e:
 			switch t {

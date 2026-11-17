@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"regexp"
 	"strings"
 	"time"
@@ -224,32 +225,83 @@ func CoreMailRecords(host string, spkis []string, secure bool) []MailRecord {
 	return out
 }
 
-// TLSAServed: every authoritative server of host's zone serves
-// `_25._tcp.<host> TLSA 3 1 1 <spki>` (none found, a server not
-// answering it or a failed lookup: false — fail closed).
+// authPort is the authoritative servers' port (tests serve elsewhere).
+var authPort = "53"
+
+// TLSAServed (Ruling R2-N6): every IPv4 address of every name server of
+// host's zone serves `_25._tcp.<host> TLSA 3 1 1 <spki>`. IPv6 addresses
+// are unknown on an IPv4-only egress: never a pass or a fail, but a name
+// server with no IPv4 address can't be checked, so the answer is false.
+// No name server, a lookup failure or one server without the record:
+// false (fail closed).
 func TLSAServed(ctx context.Context, resolvers []string, host, spki string) bool {
 	zone, err := dnssec.FindZone(ctx, resolvers, host)
 	if err != nil || zone == "" {
 		return false
 	}
-	servers := AuthServers(ctx, resolvers, zone)
-	if len(servers) == 0 {
+	names := nsNames(ctx, resolvers, zone)
+	if len(names) == 0 {
 		return false
 	}
-	for _, srv := range servers {
-		in, err := exchange(ctx, srv, "_25._tcp."+bare(host), dns.TypeTLSA)
-		if err != nil {
+	for _, ns := range names {
+		ips := nsIPv4(ctx, resolvers, ns)
+		if len(ips) == 0 {
 			return false
 		}
-		found := false
-		for _, rr := range in.Answer {
-			if t, ok := rr.(*dns.TLSA); ok && t.Usage == 3 && t.Selector == 1 && t.MatchingType == 1 && strings.EqualFold(t.Certificate, spki) {
-				found = true
+		for _, ip := range ips {
+			in, err := exchange(ctx, net.JoinHostPort(ip, authPort), "_25._tcp."+bare(host), dns.TypeTLSA)
+			if err != nil {
+				return false
 			}
-		}
-		if !found {
-			return false
+			found := false
+			for _, rr := range in.Answer {
+				if t, ok := rr.(*dns.TLSA); ok && t.Usage == 3 && t.Selector == 1 && t.MatchingType == 1 && strings.EqualFold(t.Certificate, spki) {
+					found = true
+				}
+			}
+			if !found {
+				return false
+			}
 		}
 	}
 	return true
+}
+
+// nsNames: the zone's NS targets, from the first resolver that answers.
+func nsNames(ctx context.Context, resolvers []string, zone string) []string {
+	for _, r := range resolvers {
+		in, err := exchange(ctx, r, zone, dns.TypeNS)
+		if err != nil {
+			continue
+		}
+		var out []string
+		for _, rr := range in.Answer {
+			if ns, ok := rr.(*dns.NS); ok && !contains(out, ns.Ns) {
+				out = append(out, ns.Ns)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return nil
+}
+
+// nsIPv4: every A address of a name server, from the first resolver that
+// answers.
+func nsIPv4(ctx context.Context, resolvers []string, ns string) []string {
+	for _, r := range resolvers {
+		in, err := exchange(ctx, r, ns, dns.TypeA)
+		if err != nil {
+			continue
+		}
+		var out []string
+		for _, rr := range in.Answer {
+			if a, ok := rr.(*dns.A); ok && !contains(out, a.A.String()) {
+				out = append(out, a.A.String())
+			}
+		}
+		return out
+	}
+	return nil
 }
