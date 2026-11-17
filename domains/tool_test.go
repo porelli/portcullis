@@ -22,6 +22,8 @@ import (
 const toolToken = "tool-Tk9vZXJ5U2VjcmV0VG9rZW4xMjM0"
 
 type toolFixture struct {
+	// insecure: the main zone's DNSSEC state isn't secure (TLSA withheld).
+	insecure  bool
 	zone      *fakedns.Zone
 	resolvers []string
 	hook      func(op string, recs []libdns.Record) error
@@ -118,7 +120,8 @@ func toolJSON(mod func(m map[string]any)) string {
 
 func (f *toolFixture) run(args []string, stdin string) (int, string, string) {
 	var out, errb bytes.Buffer
-	code := runDNSTool(args, toolEnv{stdin: strings.NewReader(stdin), stdout: &out, stderr: &errb, resolvers: f.resolvers})
+	code := runDNSTool(args, toolEnv{stdin: strings.NewReader(stdin), stdout: &out, stderr: &errb, resolvers: f.resolvers,
+		mainSecure: func(context.Context, string) bool { return !f.insecure }})
 	return code, out.String(), errb.String()
 }
 
@@ -465,7 +468,8 @@ func TestToolCheckCAATTL(t *testing.T) {
 }
 
 // TestToolApplyMainMail: dns-tool writes the main domain's mail set from
-// stdin (sets ["mail"], with MAIL_HOSTNAME's HELO SPF and TLSA).
+// stdin (sets ["mail"]: the provider's records) plus core's own at
+// MAIL_HOSTNAME (the HELO SPF and the TLSA from mail_tlsa).
 func TestToolApplyMainMail(t *testing.T) {
 	f := newToolFixture(t)
 	const d, h = "portcullis.example.test", "mail.portcullis.example.test"
@@ -473,14 +477,13 @@ func TestToolApplyMainMail(t *testing.T) {
 	mail := []dnsplan.MailRecord{
 		{Name: d, Type: "MX", TTL: 3600, Value: "10 " + h + "."},
 		{Name: d, Type: "TXT", TTL: 3600, Value: "v=spf1 mx -all"},
-		{Name: h, Type: "TXT", TTL: 3600, Value: "v=spf1 a -all"},
 		{Name: "v1-ed25519-20261115._domainkey." + d, Type: "TXT", TTL: 3600, Value: "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="},
 		{Name: "_submissions._tcp." + d, Type: "SRV", TTL: 3600, Value: "0 1 465 " + h + "."},
-		{Name: "_25._tcp." + h, Type: "TLSA", TTL: 3600, Value: "3 1 1 " + spki},
 	}
 	in := toolJSON(func(m map[string]any) {
 		m["sets"] = []string{"mail"}
 		m["mail"] = mail
+		m["mail_tlsa"] = []string{spki}
 		m["mail_hostname"] = h
 		m["nomail"] = true
 	})
@@ -512,8 +515,8 @@ func TestToolApplyMainMail(t *testing.T) {
 			}
 		}
 	}
-	if n != len(mail) {
-		t.Fatalf("%d mail items", n)
+	if n != len(mail)+2 {
+		t.Fatalf("%d mail items (the provider's %d + the HELO SPF + the TLSA)", n, len(mail))
 	}
 	// The mail set needs its records; a bad record is a usage error.
 	if code, _, errs := f.run([]string{"apply"}, toolJSON(func(m map[string]any) { m["sets"] = []string{"mail"} })); code != exitUsage || !strings.Contains(errs, "mail") {
@@ -571,8 +574,66 @@ func TestToolApplyMainMail(t *testing.T) {
 		}
 	}
 	// Over 64 KiB is accepted with mail (up to 256 KiB), refused without.
+	_ = spki
 	pad := strings.Repeat("x", 70<<10)
 	if code, _, errs := f.run([]string{"plan"}, toolJSON(func(m map[string]any) { m["mail_from"] = pad })); code != exitUsage || !strings.Contains(errs, "65536") {
 		t.Fatalf("70 KiB without mail = %d %s", code, errs)
+	}
+}
+
+// The provider's main-domain set merges with core's records at
+// MAIL_HOSTNAME; a provider record there (a TLSA, an HELO SPF, an A) or a
+// foreign MX target is refused; without a secure main zone the TLSA is
+// withheld, and a published one removed.
+func TestMainSetMergesProviderRecords(t *testing.T) {
+	f := newToolFixture(t)
+	const d, h = "portcullis.example.test", "mail.portcullis.example.test"
+	spki := strings.Repeat("ab", 32)
+	mail := []dnsplan.MailRecord{{Name: d, Type: "MX", TTL: 3600, Value: "10 " + h + "."}, {Name: d, Type: "TXT", TTL: 3600, Value: "v=spf1 mx -all"}}
+	run := func(recs []dnsplan.MailRecord, tlsa []string) (int, string) {
+		code, _, errs := f.run([]string{"apply"}, toolJSON(func(m map[string]any) {
+			m["sets"] = []string{"mail"}
+			m["mail"] = recs
+			m["mail_tlsa"] = tlsa
+			m["mail_hostname"] = h
+		}))
+		return code, errs
+	}
+	has := func(n, typ, v string) bool {
+		for _, rr := range f.zone.Records(n) {
+			if rr.Type == typ && rr.Data == v {
+				return true
+			}
+		}
+		return false
+	}
+	if code, errs := run(mail, []string{spki}); code != exitOK {
+		t.Fatalf("apply %d %s", code, errs)
+	}
+	if !has(d, "MX", "10 "+h+".") || !has(h, "TXT", "v=spf1 a -all") || !has("_25._tcp."+h, "TLSA", "3 1 1 "+spki) {
+		t.Fatalf("merged set missing: %v %v", f.zone.Records(h), f.zone.Records("_25._tcp."+h))
+	}
+	for _, bad := range []dnsplan.MailRecord{
+		{Name: "_25._tcp." + h, Type: "TLSA", TTL: 3600, Value: "3 1 1 " + spki},
+		{Name: h, Type: "TXT", TTL: 3600, Value: "v=spf1 a -all"},
+		{Name: d, Type: "MX", TTL: 3600, Value: "10 mx.attacker.example."},
+	} {
+		if code, errs := run(append(append([]dnsplan.MailRecord{}, mail[1:]...), bad), nil); code != exitUsage {
+			t.Errorf("%s %s accepted: %d %s", bad.Type, bad.Name, code, errs)
+		}
+	}
+	for _, tl := range [][]string{{"ABC"}, {spki, spki, spki}} {
+		if code, _ := run(mail, tl); code != exitUsage {
+			t.Errorf("mail_tlsa %v accepted", tl)
+		}
+	}
+	// Not secure: the TLSA is withheld and the published one removed; the
+	// HELO SPF stays.
+	f.insecure = true
+	if code, errs := run(mail, []string{spki}); code != exitOK {
+		t.Fatalf("insecure apply %d %s", code, errs)
+	}
+	if has("_25._tcp."+h, "TLSA", "3 1 1 "+spki) || !has(h, "TXT", "v=spf1 a -all") {
+		t.Fatalf("insecure: %v %v", f.zone.Records("_25._tcp."+h), f.zone.Records(h))
 	}
 }

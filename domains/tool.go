@@ -62,10 +62,14 @@ type toolInput struct {
 	// MailFrom: ALERT_SMTP_FROM; drops the nomail recommendation as the
 	// service does (F15d).
 	MailFrom string `json:"mail_from"`
-	// Mail: the main domain's wanted mail set (mailctl dns --main --json /
-	// rotate --json, contract §19.7); [] = mail off (its records go). The
-	// mail set is applied only with it present.
+	// Mail: the wired provider's set for the main domain (hub mail
+	// dns-main, contract §19.7: no record at MAIL_HOSTNAME); [] = mail off
+	// (its records go). The tool adds core's own (the HELO SPF and, while
+	// the main zone is secure, the TLSA). Applied only with it present.
 	Mail *[]dnsplan.MailRecord `json:"mail"`
+	// MailTLSA: the SPKIs `domains mail-tlsa status` says to publish (1–2,
+	// 64 lowercase hex), with mail only.
+	MailTLSA []string `json:"mail_tlsa,omitempty"`
 	// MailHostname: MAIL_HOSTNAME, required with mail; alone (mail on, no
 	// records yet) it makes the address set own the host's A / AAAA:
 	// its HELO SPF and TLSA are the set's, removed when the set is empty or
@@ -100,12 +104,23 @@ type toolEnv struct {
 	stdin          io.Reader
 	stdout, stderr io.Writer
 	resolvers      []string
+	// mainSecure: the main zone's DNSSEC state is secure (nil =
+	// dnssec.Check through resolvers; tests replace it).
+	mainSecure func(ctx context.Context, name string) bool
 	// mail-cert only ("" / 0 = the defaults in mailcert.go): its volumes,
 	// lego's HTTP client (tests: Pebble's TLS) and its waits.
 	acmeDir, tlsDir           string
 	acmeHTTPClient            *http.Client
 	caaWait, caaPoll          time.Duration
 	propTimeout, propInterval time.Duration
+}
+
+// secure: the main zone's DNSSEC chain is secure right now.
+func (e toolEnv) secure(ctx context.Context, name string) bool {
+	if e.mainSecure != nil {
+		return e.mainSecure(ctx, name)
+	}
+	return dnssec.Check(ctx, e.resolvers, name).State == dnssec.Secure
 }
 
 func resolversFromEnv() []string {
@@ -199,6 +214,16 @@ func runDNSTool(args []string, e toolEnv) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute+wait.ctxBudget())
 	defer cancel()
+	if len(spec.Mail) > 0 {
+		// Core's records at MAIL_HOSTNAME (contract §19.3): the HELO SPF,
+		// and the TLSA only while the main zone is secure (any other state,
+		// no known state or a failed check withholds it: the mail set then
+		// removes a published one).
+		spec.Mail = append(spec.Mail, dnsplan.CoreMailRecords(spec.MailHost, in.MailTLSA, e.secure(ctx, spec.Name))...)
+		if err := dnsplan.ValidateMainMail(spec.Name, spec.MailHost, spec.Mail); err != nil {
+			return fail(exitUsage, fmt.Errorf("mail: %w", err))
+		}
+	}
 	base := dnsplan.Input{Spec: spec, ProviderName: in.Provider, Resolvers: e.resolvers}
 	write := base
 	if sub != "check" && in.Provider != "" {
@@ -395,7 +420,7 @@ func readToolInput(r io.Reader) (toolInput, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&in); err != nil {
 		// Never quote the input (it holds the credentials).
-		return in, errors.New("stdin must be one JSON object with the documented keys (name, provider, credentials, ipv4, ipv6, ca_server, caa, nomail, sets, mail_from, mail, mail_hostname)")
+		return in, errors.New("stdin must be one JSON object with the documented keys (name, provider, credentials, ipv4, ipv6, ca_server, caa, nomail, sets, mail_from, mail, mail_tlsa, mail_hostname)")
 	}
 	if dec.Decode(&struct{}{}) != io.EOF {
 		return in, errors.New("stdin must hold exactly one JSON object")
@@ -443,8 +468,29 @@ func (in toolInput) spec() (dnsplan.Spec, error) {
 		if !validHostname(host) {
 			return dnsplan.Spec{}, fmt.Errorf("mail needs mail_hostname (MAIL_HOSTNAME), a valid hostname: %q", in.MailHostname)
 		}
-		if err := dnsplan.ValidateMainMail(name, host, *in.Mail); err != nil {
+		// The provider's set: the domain's names only (never a record at
+		// MAIL_HOSTNAME: its HELO SPF, TLSA and address records are core's),
+		// every MX targeting MAIL_HOSTNAME.
+		if err := dnsplan.ValidateMail(name, *in.Mail); err != nil {
 			return dnsplan.Spec{}, fmt.Errorf("mail: %w", err)
+		}
+		for _, r := range *in.Mail {
+			if n := strings.ToLower(strings.TrimSuffix(r.Name, ".")); n == host || strings.HasSuffix(n, "."+host) {
+				return dnsplan.Spec{}, fmt.Errorf("mail: %s %s: a record at MAIL_HOSTNAME is core's, never the provider's", r.Type, r.Name)
+			}
+			if strings.EqualFold(r.Type, "MX") {
+				if f := strings.Fields(r.Value); len(f) != 2 || strings.ToLower(f[1]) != host+"." {
+					return dnsplan.Spec{}, fmt.Errorf("mail: MX %s targets %q, not mail_hostname %s", r.Name, r.Value, host)
+				}
+			}
+		}
+		if len(in.MailTLSA) > 2 {
+			return dnsplan.Spec{}, errors.New("mail_tlsa holds at most two SPKIs")
+		}
+		for _, k := range in.MailTLSA {
+			if len(k) != 64 || strings.Trim(k, "0123456789abcdef") != "" {
+				return dnsplan.Spec{}, fmt.Errorf("mail_tlsa: %q isn't 64 lowercase hex", k)
+			}
 		}
 		sp.Mail, sp.MailHost = *in.Mail, host
 		for _, f := range in.MailFormerHosts {
@@ -456,6 +502,8 @@ func (in toolInput) spec() (dnsplan.Spec, error) {
 				sp.FormerMailHosts = append(sp.FormerMailHosts, f)
 			}
 		}
+	case len(in.MailTLSA) > 0:
+		return dnsplan.Spec{}, errors.New("mail_tlsa needs the mail set")
 	case in.MailHostname != "":
 		// Mail on, its records not known yet (no Hub document): the address
 		// set still owns MAIL_HOSTNAME's A / AAAA; no mail items.
