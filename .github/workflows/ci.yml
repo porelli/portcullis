@@ -5699,6 +5699,9 @@ jobs:
           mkdir -p e2e-artifacts
           docker compose logs --no-color > e2e-artifacts/primary.log 2>&1 || true
           for w in w1 w1b w3; do bash .github/ci/e2e-servers-worker.sh compose "$w" logs --no-color > "e2e-artifacts/$w.log" 2>&1 || true; done
+          # The apps' containers on each worker (state + last lines; never env).
+          # shellcheck disable=SC2016
+          for w in w1 w3; do bash .github/ci/e2e-servers-worker.sh exec "$w" sh -c 'docker ps -a --filter label=com.docker.compose.project --format "{{.Names}} {{.Status}}"; for c in $(docker ps -aq --filter label=com.docker.compose.project); do n=$(docker inspect -f "{{.Name}}" "$c"); case "$n" in /portcullis-worker-*) continue ;; esac; echo "== $n"; docker logs --tail 50 "$c" 2>&1; done' > "e2e-artifacts/$w-apps.log" 2>&1 || true; done
           grep -l 'pcj1\.' e2e-artifacts/* | xargs -r rm -f
       - name: Upload logs
         timeout-minutes: 10
@@ -5763,6 +5766,9 @@ jobs:
           mkdir -p e2e-artifacts
           docker compose logs --no-color > e2e-artifacts/primary.log 2>&1 || true
           for w in w1 w1b w3; do bash .github/ci/e2e-servers-worker.sh compose "$w" logs --no-color > "e2e-artifacts/$w.log" 2>&1 || true; done
+          # The apps' containers on each worker (state + last lines; never env).
+          # shellcheck disable=SC2016
+          for w in w1 w3; do bash .github/ci/e2e-servers-worker.sh exec "$w" sh -c 'docker ps -a --filter label=com.docker.compose.project --format "{{.Names}} {{.Status}}"; for c in $(docker ps -aq --filter label=com.docker.compose.project); do n=$(docker inspect -f "{{.Name}}" "$c"); case "$n" in /portcullis-worker-*) continue ;; esac; echo "== $n"; docker logs --tail 50 "$c" 2>&1; done' > "e2e-artifacts/$w-apps.log" 2>&1 || true; done
           grep -l 'pcj1\.' e2e-artifacts/* | xargs -r rm -f
       - name: Upload logs
         timeout-minutes: 10
