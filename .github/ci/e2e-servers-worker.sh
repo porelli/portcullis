@@ -95,7 +95,10 @@ case "$kind" in
       # /run/user/<uid> is the worker's (0700): test its bus as root.
       sudo systemctl start "user@$uid.service" || true
       for i in $(seq 1 60); do sudo test -S "/run/user/$uid/bus" && break; [ "$i" -eq 60 ] && { echo "FAIL: no user manager for $WUSER"; systemctl status "user@$uid.service" --no-pager | tail -20; exit 1; }; sleep 1; done
-      asworker sh -c 'systemctl --user enable --now podman.socket && systemctl --user enable podman-restart.service' 
+      # The runner's image sets XDG_RUNTIME_DIR for every login (pam_env:
+      # /run/user/<the runner>): the worker's user manager must have its own,
+      # or podman.service fails "mkdir /run/user/<runner>/libpod".
+      asworker sh -c 'systemctl --user set-environment XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" && systemctl --user enable --now podman.socket && systemctl --user enable podman-restart.service' 
     fi
     echo "== podman worker: the user's socket"
     for i in $(seq 1 30); do
