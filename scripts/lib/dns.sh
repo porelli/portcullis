@@ -371,6 +371,8 @@ dns_setup() {
   info "Applying the record sets: $DNS_SETS (then waiting for the public resolvers: the TTL the provider stored + 1 min, at most 15 min)..."
   rc=0
   out="$(DNS_ON_SETTLE="$settle_hook" _dns_apply_quiet --wait auto)" || rc=$?
+  # Recorded only after the write: the tool reads the list to tell the
+  # set's own DKIM names from another sender's (Ruling R2-N7).
   if { [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ] || [ "$rc" -eq 4 ]; } && [[ " $DNS_SETS " == *" mail "* ]] && [ -n "${DNS_MAIL_RECORDS:-}" ] && declare -F mail_dkim_record >/dev/null; then
     mail_dkim_record "$DNS_MAIL_RECORDS"
   fi

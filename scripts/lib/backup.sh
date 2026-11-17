@@ -745,7 +745,7 @@ _restore_secrets() {
 # instance couldn't be restored from its archive → restore fails saying so
 # (the Hub owes a void either way: hub_secrets was emptied).
 _restore_mail_outcome() {
-  [ "${RESTORE_MAIL_FAILED:-false}" != true ] || fail "the mail provider couldn't be restored from its archive: ./portcullis mail status, then restore it from the Hub (its instance page); its mailboxes are NOT back yet"
+  [ "${RESTORE_MAIL_FAILED:-false}" != true ] || fail "the mail provider couldn't be restored from its archive (its mailboxes are NOT back yet; the Hub holds it): fix the cause and run ./portcullis restore again, or lift the hold with ./portcullis mail restore-hold clear (the provider then starts on what its volumes hold)"
 }
 
 # backup_restore <dir> <assume-yes>
@@ -1113,7 +1113,10 @@ _restore_mail_provider() {
   info "Restoring the mail provider from $a (the Hub voids every mail password first)..."
   rt_up_service --deps hub >/dev/null 2>&1 || { warn "the Hub didn't start for the mail provider's restore"; return 1; }
   ( _mail_hub_wait >/dev/null ) || { warn "the Hub didn't answer for the mail provider's restore"; return 1; }
-  ( _mail_hub_op restore "$(jq -cn --arg a "$a" '{archive: $a}')" ) || { warn "the Hub couldn't restore the mail provider from $a"; return 1; }
+  # A store restore can take long (L-d): its own wait, the op's start
+  # answer kept out of the restore's output.
+  ( MAIL_OP_WAIT="${MAIL_RESTORE_WAIT:-21600}" _mail_hub_op restore "$(jq -cn --arg a "$a" '{archive: $a}')" >/dev/null ) \
+    || { warn "the Hub couldn't restore the mail provider from $a"; return 1; }
 }
 
 # _restore_mail_hold <archive> — hub_data/mail-restore-pending (0600,

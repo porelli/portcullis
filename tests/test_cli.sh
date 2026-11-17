@@ -252,6 +252,9 @@ mail export|expected exactly one <former-id>
 mail export alice|invalid former id
 mail cert x|unexpected argument: x
 mail rotate --now|unknown option: --now
+mail restore-hold|expected: restore-hold clear
+mail restore-hold drop|expected: restore-hold clear
+mail restore-hold clear --force|unknown option: --force
 EOF
 
 # ── mail (contract §19.12, M9): refused on Kubernetes, and on rootless

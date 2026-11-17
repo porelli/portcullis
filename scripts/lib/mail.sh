@@ -305,12 +305,33 @@ _mail_hub_wait() {
 
 # _mail_tls_post <tlsa status JSON> — the SPKIs the TLSA publishes and
 # the certificate's not_after to the Hub (`hub mail tls`, contract §19.3):
-# it records them and the timer's visit, and reloads a wired provider; it
-# exits 0 only when the key the provider serves is one of them (M3).
+# it records them and the timer's visit, and reloads the provider; it
+# exits 0 only when the key the provider serves is one of them (M3). A
+# refusal fails: only the TLSA drop calls it (the one step that needs it).
 _mail_tls_post() {
   local body
   body="$(printf '%s' "$1" | jq -ce --arg na "${MAIL_CERT_NOT_AFTER:-}" '{spki_sha256: .publish, not_after: $na}')" || fail "domains mail-tlsa status printed no keys"
   _mail_hub tls "$body" >/dev/null || fail "the Hub refused the mail certificate's keys (hub mail tls)"
+}
+
+# _mail_serving — `hub mail status`: a provider is wired and serving
+# (reachable, no void owed, not held). Only then is `hub mail tls` asked
+# (Ruling R2-H5/N1: it fails whenever nothing serves).
+_mail_serving() {
+  local st
+  st="$(_mail_hub status 2>/dev/null)" || return 1
+  printf '%s' "$st" | jq -e '.wired == true and .reachable == true
+      and (.void_owed == null or .void_owed == false) and (.held == null or .held == false)' >/dev/null 2>&1
+}
+
+# _mail_tls_offer <tlsa status JSON> — the keys to a serving provider (it
+# reloads); nothing serving: nothing asked. A refusal (the provider
+# serves another key) is a warning: mail status shows it.
+_mail_tls_offer() {
+  local body
+  _mail_serving || { info "No mail provider is serving: its keys reach it when it is."; return 0; }
+  body="$(printf '%s' "$1" | jq -ce --arg na "${MAIL_CERT_NOT_AFTER:-}" '{spki_sha256: .publish, not_after: $na}')" || fail "domains mail-tlsa status printed no keys"
+  _mail_hub tls "$body" >/dev/null || warn "the Hub refused the mail certificate's keys (hub mail tls): ./portcullis mail status"
 }
 
 # _mail_dns_main — `hub mail dns-main` (contract §19.7): MAIL_MAIN_RECS
@@ -369,7 +390,35 @@ _mail_main_set() {
   fi
   DNS_SETS=mail DNS_MAIL_RECORDS="$MAIL_MAIN_RECS" DNS_MAIL_RULES="$MAIL_MAIN_RULES" DNS_MAIL_TLSA="$(printf '%s' "$1" | jq -c '.publish // []')" _dns_tool apply >/dev/null \
     || fail "the main domain's mail records could not be written"
+  # Recorded only after the write: the tool reads the list to tell the
+  # set's own DKIM names from another sender's (Ruling R2-N7).
   mail_dkim_record "$MAIL_MAIN_RECS"
+}
+
+# mail_restore_hold_clear <yes> — `mail restore-hold clear` (Ruling
+# R2-N5): removes hub_data/mail-restore-pending after the operator typed
+# `clear` (--yes: no prompt). Nothing else ever removes it but the Hub's
+# successful restore. Logged (stdout and the system log).
+mail_restore_hold_clear() {
+  local yes="$1" typed full a
+  _rt_docker_only
+  full="$(_mail_volume hub_data)"
+  a="$(ct_run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+        --user "$CT_UID_HUB:$CT_UID_HUB" -v "$full:/d:ro" "$PORTCULLIS_HELPER_IMAGE" \
+        sh -c 'cat /d/mail-restore-pending 2>/dev/null || true')" || fail "couldn't read hub_data"
+  [ -n "$a" ] || { ok "No mail restore hold."; return 0; }
+  warn "A core restore holds the mail provider until it is restored from $a. Lifting the hold starts the provider on what its volumes hold now (maybe nothing)."
+  if [ "$yes" != true ]; then
+    [ -t 0 ] || fail "type clear to confirm: run this on a terminal, or pass --yes"
+    printf 'Type clear to lift the hold: '
+    IFS= read -r typed || typed=""
+    [ "$typed" = clear ] || fail "Aborted."
+  fi
+  ct_run --rm --network none --cap-drop ALL --security-opt no-new-privileges:true \
+    --user "$CT_UID_HUB:$CT_UID_HUB" -v "$full:/d" "$PORTCULLIS_HELPER_IMAGE" rm -f /d/mail-restore-pending \
+    || fail "couldn't remove hub_data/mail-restore-pending"
+  if command -v logger >/dev/null 2>&1; then logger -t portcullis "mail restore hold cleared (archive $a) by $(id -un)" || true; fi
+  ok "Mail restore hold cleared (it named $a). Logged."
 }
 
 # mail_ipv6_refuse — IPv6 for mail isn't supported yet: [::] ports onto an
@@ -422,7 +471,6 @@ mail_enable() {
   # plan owns MAIL_HOSTNAME's address).
   stack_compose_up hub domains
   pinfo="$(_mail_hub_wait)"
-  _mail_tls_post "$st"
   if [ "$provider" = none ]; then
     ok "The mail slot is open; no provider wired (--provider none): wire one in the Hub (the instance's Mail tab or Settings → Mail)."
   elif [ "$(printf '%s' "$pinfo" | jq -r --arg t "$provider" '.wired == true and .template == $t')" = true ]; then
@@ -442,6 +490,7 @@ mail_enable() {
       || fail "the Hub didn't wire $provider (see above): ./portcullis mail status"
     ok "$id is this server's mail provider."
   fi
+  [ "$provider" = none ] || _mail_tls_offer "$st"
   ok "Mail is on. DNS: ./portcullis dns setup ($(mail_hostname)'s address now; the mail records once the provider has its first document, then the daily timer keeps them); status: ./portcullis mail status"
   if [ "$yes" = true ] || confirm "Install the daily mail timer (certificate, TLSA, the main domain's records) now?"; then
     mail_schedule_systemd ""
@@ -527,16 +576,23 @@ mail_rotate() {
     st="$(_mail_tlsa status)" || fail "domains mail-tlsa status failed after the switch"
   elif [ "$due" = drop ]; then
     # The drop is committed only after the Hub confirmed the provider
-    # serves the key that stays (hub mail tls exits 0 only then; M3).
+    # serves the key that stays (hub mail tls exits 0 only then; M3); with
+    # no provider serving it waits (both keys stay published).
     _mail_hub_wait >/dev/null
-    _mail_tls_post "$(printf '%s' "$st" | jq -c '{publish: [.current | strings]}')"
-    st="$(_mail_tlsa drop)" || fail "domains mail-tlsa drop failed"
+    if _mail_serving; then
+      _mail_tls_post "$(printf '%s' "$st" | jq -c '{publish: [.current | strings]}')"
+      st="$(_mail_tlsa drop)" || fail "domains mail-tlsa drop failed"
+    else
+      info "The TLSA drop waits for a serving mail provider (it must confirm the key that stays)."
+    fi
   fi
   printf '%s' "$st" | jq -r '"    TLSA: \(.phase), publishing \(.publish | length) key(s)"' 2>/dev/null || true
   _mail_cert_metric "${MAIL_CERT_NOT_AFTER:-}"
   _mail_hub_wait >/dev/null
-  _mail_tls_post "$st"
+  # The main set first (nothing wired: withdrawn; Ruling R2-H5/N1), then
+  # the keys to a serving provider.
   _mail_main_set "$st"
+  _mail_tls_offer "$st"
   ok "Mail rotation done."
 }
 
@@ -788,6 +844,7 @@ Usage: portcullis mail <subcommand>
   rotate        The daily step: certificate, TLSA, the main domain's records
   schedule      schedule --systemd: install the daily timer
   export        Export a former account's mailbox as mbox
+  restore-hold  restore-hold clear: lift a core restore's stale hold on the provider
 
 Run 'portcullis mail <subcommand> --help' for details.
 EOF
@@ -828,6 +885,18 @@ help_mail_dkim() { echo "Usage: portcullis mail dkim rotate <domain>"; echo; ech
 help_mail_cert() { echo "Usage: portcullis mail cert"; echo; echo "Issue or renew the mail certificate (renewal below 30 days); the Hub reloads the provider on a change."; }
 help_mail_rotate() { echo "Usage: portcullis mail rotate [--next-key]"; echo; echo "The daily timer's step: certificate, the TLSA rollover, the main domain's mail records."; echo "--next-key starts a mail key rollover (both TLSA records published; the timer switches after 2×TTL + 1 day)."; }
 help_mail_schedule() { echo "Usage: portcullis mail schedule --systemd [--out DIR]"; echo; echo "Write portcullis-mail.service and .timer (daily) and print how to install them."; }
+help_mail_restore-hold() {
+  cat <<'HOLD'
+Usage: portcullis mail restore-hold clear [--yes]
+
+A core restore holds the mail provider (hub_data/mail-restore-pending: the
+Hub refuses to start it) until `hub mail restore` restored it from the
+backup's archive. When that restore can't run, this lifts the hold: the
+provider then starts on what its volumes hold now, which may be empty.
+Type `clear` to confirm (--yes: no prompt, for scripts). Logged.
+HOLD
+}
+
 help_mail_export() { echo "Usage: portcullis mail export <former-id> [--out FILE]"; echo; echo "Export a former account's mailbox as mbox (0600) under backups/mail-export/ (the provider's export command)."; }
 
 cmd_mail() {
@@ -835,7 +904,7 @@ cmd_mail() {
   [ $# -gt 0 ] && shift
   case "$sub" in
     ""|-h|--help|help) help_mail; [ -n "$sub" ] || exit 2; return 0 ;;
-    enable|disable|status|test|dkim|cert|rotate|schedule|export) ;;
+    enable|disable|status|test|dkim|cert|rotate|schedule|export|restore-hold) ;;
     *) usage_error mail "unknown subcommand: $sub" ;;
   esac
   local fn="help_mail_$sub" host="" lan="" provider="$MAIL_DEFAULT_PROVIDER" yes=false force=false systemd=false out="" to="" json=false nextkey=""
@@ -846,7 +915,7 @@ cmd_mail() {
       enable:--hostname) need_value "mail enable" "$1" "${2:-}"; host="$2"; shift ;;
       enable:--lan-only) need_value "mail enable" "$1" "${2:-}"; lan="$2"; shift ;;
       enable:--provider) need_value "mail enable" "$1" "${2:-}"; provider="$2"; shift ;;
-      enable:--yes|disable:--yes) yes=true ;;
+      enable:--yes|disable:--yes|restore-hold:--yes) yes=true ;;
       disable:--force) force=true ;;
       rotate:--next-key) nextkey=--next-key ;;
       schedule:--systemd) systemd=true ;;
@@ -877,6 +946,8 @@ cmd_mail() {
       [[ "$to" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || usage_error "mail test" "--to <address> is required" ;;
     dkim)
       [ "$npos" -eq 2 ] && [ "${pos[0]}" = rotate ] || usage_error "mail dkim" "expected: dkim rotate <domain>" ;;
+    restore-hold)
+      [ "$npos" -eq 1 ] && [ "${pos[0]}" = clear ] || usage_error "mail restore-hold" "expected: restore-hold clear" ;;
     export)
       [ "$npos" -eq 1 ] || usage_error "mail export" "expected exactly one <former-id>"
       [[ "${pos[0]}" =~ ^former-[0-9a-f-]{36}$ ]] || usage_error "mail export" "invalid former id: ${pos[0]} (former-<uuid>)" ;;
@@ -900,6 +971,7 @@ cmd_mail() {
     test) mail_test "$to" ;;
     dkim) mail_dkim_rotate "${pos[1]}" ;;
     export) mail_export "${pos[0]}" "$out" ;;
+    restore-hold) mail_restore_hold_clear "$yes" ;;
   esac
 }
 
@@ -913,5 +985,5 @@ mail_cert_cmd() {
   [ "${MAIL_CERT_RENEWED:-false}" = true ] || return 0
   st="$(_mail_tlsa status)" || fail "domains mail-tlsa status failed"
   _mail_hub_wait >/dev/null
-  _mail_tls_post "$st"
+  _mail_tls_offer "$st"
 }
