@@ -12,7 +12,7 @@ auth:
   admin_group: admin_servers-echo
 urls:
   - label: Echo
-    url: "https://{{HOST_ECHO}}/cgi-bin/echo"
+    url: "https://{{HOST_SECHO}}/cgi-bin/echo"
 
 # AI support (contract §3.2, required in every manifest): a CI fixture.
 ai:

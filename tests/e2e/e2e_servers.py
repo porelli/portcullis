@@ -132,6 +132,9 @@ def add_server(sid: str) -> dict:
     """POST /api/servers (fresh sign-in): the code goes to a 0700 file only."""
     body = dict(id=sid, name=sid.upper(), **fresh_proof(state["admin_page"], f"add-{sid}"))
     code, ans = hub("POST", "/api/servers", body)
+    if code >= 500:  # the Hub's view of its data dir (no secret in a listing)
+        print(sh("docker", "compose", "exec", "-T", "hub", "sh", "-c",
+                 "id; ls -lan /data /data/nodes; stat -c '%A %u:%g %n' /data/nodes/* 2>&1", check=False).stdout, flush=True)
     assert code == 201 and isinstance(ans, dict) and ans.get("code", "").startswith("pcj1."), f"add {sid}: {code} {str(ans)[:200]}"
     print(f"::add-mask::{ans['code']}", flush=True)
     path = os.path.join(TMP, f"{sid}.code")

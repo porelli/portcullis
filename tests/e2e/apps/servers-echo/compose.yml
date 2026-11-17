@@ -16,10 +16,10 @@ services:
       - marker:/data
     labels:
       traefik.enable: "true"
-      traefik.http.routers.echo.rule: Host(`${PORTCULLIS_HOST_ECHO:-echo.portcullis.local}`)
-      traefik.http.routers.echo.entrypoints: websecure
-      traefik.http.routers.echo.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
-      traefik.http.services.echo.loadbalancer.server.port: "8080"
+      traefik.http.routers.secho.rule: Host(`${PORTCULLIS_HOST_SECHO:-secho.portcullis.local}`)
+      traefik.http.routers.secho.entrypoints: websecure
+      traefik.http.routers.secho.middlewares: client-headers@file,portcullis-auth@docker,portcullis-groups@docker,security-headers@file
+      traefik.http.services.secho.loadbalancer.server.port: "8080"
 
 # Not `data`: the default instances of every local template share the
 # core project's volume prefix (the Hub skips a template whose default
