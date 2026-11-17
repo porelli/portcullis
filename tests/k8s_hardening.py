@@ -393,8 +393,8 @@ def check_edge(docs):
                 and (m.get("labels") or {}).get("portcullis.io/owner") != "core":
             F.add(f"{d['kind']} {m.get('namespace')}/{m['name']}: a chart object the policies judge without portcullis.io/owner=core")
     # The params' edgeCoreMiddlewares (no Hub route may name them) = the
-    # chart's edge Middlewares + the CLI's hub-proxy-secret.
-    want = sorted(["hub-proxy-secret"] + [d["metadata"]["name"] for d in K.by_kind(docs, "Middleware")])
+    # chart's edge Middlewares + the CLI's hub-proxy-secret / hub-cli-proxy-secret.
+    want = sorted(["hub-proxy-secret", "hub-cli-proxy-secret"] + [d["metadata"]["name"] for d in K.by_kind(docs, "Middleware")])
     params = yaml.safe_load((K.ROOT / "kube" / "admission" / "params.yaml").read_text())["data"]
     if sorted(params["edgeCoreMiddlewares"].split()) != want:
         F.add(f"kube/admission/params.yaml edgeCoreMiddlewares {params['edgeCoreMiddlewares']!r} != the core edge Middlewares {want}")

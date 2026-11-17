@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The chart against docker-compose.yml, service by service (spec §3, Task 13):
 image, uid/gid and groups, capabilities, read-only root, memory, environment
-keys, mount targets (every one of the 55 project binds a ConfigMap / Secret
+keys, mount targets (every one of the 56 project binds a ConfigMap / Secret
 mount), probes (Task 4's mapping, K17), network labels; then every core
 router's entrypoints for vpn mode apps|admin|server, its rule, priority,
 middlewares and service; the entrypoint middlewares; the Traefik CRD bundle
@@ -233,7 +233,7 @@ DOCKER_TO_K8S = {
     "portcullis-groups": "portcullis-groups@file", "portcullis-groups-vpn": "portcullis-groups-vpn@file",
     "portcullis-public-guard": "portcullis-public-guard@file", "portcullis-public-guard-vpn": "portcullis-public-guard-vpn@file",
     "vpn-required-path": "vpn-required-path@file",
-    "hub-proxy-secret": "hub-proxy-secret", "portcullis-auth-console": "portcullis-auth-console",
+    "hub-proxy-secret": "hub-proxy-secret", "hub-cli-proxy-secret": "hub-cli-proxy-secret", "portcullis-auth-console": "portcullis-auth-console",
     "portal-path": "portal-path", "portal-vpn-path": "portal-vpn-path", "directory-redirect": "directory-redirect",
 }
 
@@ -324,7 +324,7 @@ def check_routers(comp):
                     F.add(f"router {rname}: port {m.group(2)} != compose {want_port}")
             elif not gs.endswith("@internal"):
                 F.add(f"router {rname}: service {gs} isn't a core-<service>-<port>@file or @internal service")
-            if gs != svc and not (svc == "hub-people" and gs == "hub") and not (svc == rname and gs == r["owner"]) \
+            if gs != svc and not (svc in ("hub-people", "hub-cli") and gs == "hub") and not (svc == rname and gs == r["owner"]) \
                and not (svc == "grafana-metrics" and gs == "grafana"):
                 F.add(f"router {rname}: service {gs} != compose {svc}")
             if ir["spec"].get("tls", {}).get("options", {}).get("name") != r.get("tls.options"):
@@ -360,8 +360,8 @@ def main():
     comp = K.compose()
     docs = K.render()
     nb = count_binds(comp)
-    if nb != 55:
-        F.add(f"compose has {nb} project binds, the parity map expects 55 (update this check and docker-compose.podman-selinux.yml)")
+    if nb != 56:
+        F.add(f"compose has {nb} project binds, the parity map expects 56 (update this check and docker-compose.podman-selinux.yml)")
     check_services(comp, docs)
     check_routers(comp)
     check_traefik(comp, docs)

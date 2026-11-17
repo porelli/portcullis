@@ -10,8 +10,8 @@ every up / upgrade) is read-only at /run/portcullis/cluster-check. */ -}}
   "name" "hub" "uid" .Values.uids.hub "gid" .Values.uids.hub "groups" (list .Values.uids.vpnDoc)
   "memory" "1Gi" "nets" (list "portcullis" "portcullis-domains" "portcullis-mcp") "egress" true
   "token" true "serviceAccount" "portcullis-hub" "grace" 60
-  "hashes" (list "portcullis-env" "secrets-hub" "secrets-hub-lldap" "secrets-hub-invite" "secrets-domains" "secrets-mcp-gate" "config-group-gate")
-  "ports" (list (dict "name" "admin" "port" 8888) (dict "name" "people" "port" 8889) (dict "name" "mcp" "port" 8890))
+  "hashes" (list "portcullis-env" "secrets-hub" "secrets-hub-lldap" "secrets-hub-invite" "secrets-domains" "secrets-mcp-gate" "secrets-ssh" "config-group-gate")
+  "ports" (list (dict "name" "admin" "port" 8888) (dict "name" "people" "port" 8889) (dict "name" "mcp" "port" 8890) (dict "name" "cli" "port" 8891))
   "env" (list
     (dict "name" "PROJECT_DIR" "value" "/project")
     (dict "name" "PROJECT_HOST_DIR" "value" "/project")
@@ -50,7 +50,10 @@ every up / upgrade) is read-only at /run/portcullis/cluster-check. */ -}}
     (dict "name" "HUB_IMPERSONATION_MAX_MINUTES" "value" (.Values.hub.impersonationMaxMinutes | toString))
     (dict "name" "HUB_VPN_STATUS_FILE" "value" "/wg-data/status.json")
     (dict "name" "HUB_VPN_DOC_DIR" "value" "/vpn-doc")
-    (dict "name" "HUB_VPN_DOC_GID" "value" (.Values.uids.vpnDoc | toString)))
+    (dict "name" "HUB_VPN_DOC_GID" "value" (.Values.uids.vpnDoc | toString))
+    (dict "name" "HUB_CLI_ADDR" "value" ":8891")
+    (dict "name" "HUB_CLI_PROXY_SECRET" "valueFrom" (dict "secretKeyRef" (dict "name" "portcullis-env" "key" "HUB_CLI_PROXY_SECRET")))
+    (dict "name" "HUB_SSH_BREAKGLASS_FILE" "value" "/run/portcullis/ssh/breakglass.jsonl"))
   "mounts" (list
     (dict "name" "project" "mountPath" "/project")
     (dict "name" "core-env" "mountPath" "/project/.env" "subPath" "core.env" "readOnly" true)
@@ -60,6 +63,7 @@ every up / upgrade) is read-only at /run/portcullis/cluster-check. */ -}}
     (dict "name" "data" "mountPath" "/data")
     (dict "name" "lldap" "mountPath" "/run/portcullis/lldap" "readOnly" true)
     (dict "name" "invite" "mountPath" "/run/portcullis/invite" "readOnly" true)
+    (dict "name" "ssh" "mountPath" "/run/portcullis/ssh" "readOnly" true)
     (dict "name" "domains" "mountPath" "/run/portcullis/domains" "readOnly" true)
     (dict "name" "mcp-gate" "mountPath" "/run/portcullis/mcp-gate" "readOnly" true)
     (dict "name" "cluster-check" "mountPath" "/run/portcullis/cluster-check" "readOnly" true)
@@ -79,6 +83,7 @@ every up / upgrade) is read-only at /run/portcullis/cluster-check. */ -}}
     (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "hub-data"))
     (dict "name" "lldap" "secret" (dict "secretName" "secrets-hub-lldap" "defaultMode" 288))
     (dict "name" "invite" "secret" (dict "secretName" "secrets-hub-invite" "defaultMode" 288))
+    (dict "name" "ssh" "secret" (dict "secretName" "secrets-ssh" "defaultMode" 288 "optional" true))
     (dict "name" "domains" "secret" (dict "secretName" "secrets-domains" "defaultMode" 288 "items" (list (dict "key" "api-secret" "path" "api-secret"))))
     (dict "name" "mcp-gate" "secret" (dict "secretName" "secrets-mcp-gate" "defaultMode" 288 "items" (list (dict "key" "hub-secret" "path" "hub-secret") (dict "key" "age.pub" "path" "age.pub"))))
     (dict "name" "cluster-check" "configMap" (dict "name" "portcullis-cluster-check" "optional" true))
@@ -117,3 +122,6 @@ spec:
     - name: mcp
       port: 8890
       targetPort: 8890
+    - name: cli
+      port: 8891
+      targetPort: 8891

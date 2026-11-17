@@ -20,7 +20,7 @@ PORTCULLIS_ROOT="${PORTCULLIS_ROOT:-$PORTCULLIS_HOME}"
 PORTCULLIS_CALLER_PWD="$PWD"
 unset _self _dir
 
-for _lib in common network vault pki certs keycloak users domains mcpgate sessions dns config status monitoring backup signin vpn mail stack; do
+for _lib in common network vault pki certs keycloak users domains mcpgate sessions dns config status monitoring backup signin vpn mail ssh stack; do
   # shellcheck source=/dev/null
   source "$PORTCULLIS_LIB/$_lib.sh"
 done
@@ -83,6 +83,10 @@ Mail:
   mail schedule               Install the daily mail timer (--systemd)
   mail export                 Export a former account's mailbox as mbox
 
+SSH access:
+  ssh enroll-self             Make this server a managed SSH host (one-time code on stdin)
+  ssh breakglass-cert         Sign an SSH certificate straight from Vault (the Hub is down)
+
 Kubernetes:
   kube check                  Refresh the cluster check the Hub reads (init's timer: every 6 h)
 
@@ -110,7 +114,7 @@ main() {
   cd "$PORTCULLIS_ROOT"
   cli_lock "$cmd" "$@"
   case "$cmd" in
-    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert|signin|vpn|mail|kube)
+    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert|signin|vpn|mail|ssh|kube)
       "cmd_$cmd" "$@" ;;
     lldap-ui) cmd_lldap_ui "$@" ;;
     *)

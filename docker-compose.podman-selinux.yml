@@ -89,6 +89,7 @@ services:
       - {type: bind, source: ./secrets/hub/core.env, target: /project/.env, read_only: true, bind: {selinux: Z}}
       - {type: bind, source: ./secrets/hub/lldap, target: /run/portcullis/lldap, read_only: true, bind: {selinux: Z}}
       - {type: bind, source: ./secrets/hub/invite, target: /run/portcullis/invite, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/ssh, target: /run/portcullis/ssh, read_only: true, bind: {selinux: Z}}
       - {type: bind, source: ./secrets/domains/api-secret, target: /run/portcullis/domains/api-secret, read_only: true, bind: {selinux: z}}
       - {type: bind, source: ./secrets/mcp-gate/hub-secret, target: /run/portcullis/mcp-gate/hub-secret, read_only: true, bind: {selinux: z}}
       - {type: bind, source: ./secrets/mcp-gate/age.pub, target: /run/portcullis/mcp-gate/age.pub, read_only: true, bind: {selinux: Z}}

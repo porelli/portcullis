@@ -1120,6 +1120,13 @@ services:
       # bearer secret from a file (an empty one = mail is off).
       HUB_MAILCTL_API_URL: http://mailctl:8080
       HUB_MAILCTL_SECRET_FILE: /run/portcullis/mail/hub-secret
+      # SSH access (contract §18.3): the CLI listener (:8891, only
+      # /api/cli/v1/*, routed by people-cli alone) and its own proxy secret,
+      # never equal to HUB_PROXY_SECRET (the Hub refuses to start then);
+      # the break-glass record ./portcullis ssh breakglass-cert writes.
+      HUB_CLI_ADDR: ":8891"
+      HUB_CLI_PROXY_SECRET: ${HUB_CLI_PROXY_SECRET:?HUB_CLI_PROXY_SECRET is not set — run ./portcullis init}
+      HUB_SSH_BREAKGLASS_FILE: /run/portcullis/ssh/breakglass.jsonl
     volumes:
       - .:/project:ro
       # Writable overlay: before every `compose up` the Hub copies each app's
@@ -1155,6 +1162,8 @@ services:
       # secrets/ is masked above; these two subdirectories are the Hub's.
       - ./secrets/hub/lldap:/run/portcullis/lldap:ro
       - ./secrets/hub/invite:/run/portcullis/invite:ro
+      # SSH break-glass record (contract §18.10; group 10001, read-only).
+      - ./secrets/ssh:/run/portcullis/ssh:ro
       - ./secrets/domains/api-secret:/run/portcullis/domains/api-secret:ro
       # mailctl's Hub secret (contract §19.1; an empty placeholder without mail).
       - ./secrets/mail/hub-secret:/run/portcullis/mail/hub-secret:ro
@@ -1224,6 +1233,19 @@ services:
       traefik.http.routers.people-vpn.middlewares: rate-limit@file,client-cert-pem@file,portcullis-auth@docker,portcullis-groups-vpn@docker,hub-proxy-secret@docker,security-headers@file
       traefik.http.routers.people-vpn.service: hub-people
       traefik.http.services.hub-people.loadbalancer.server.port: "8889"
+      # The Portcullis CLI (contract §18.3): people.<domain>/api/cli/v1/* to
+      # the Hub's CLI listener (:8891). No forward-auth: the fresh sign-in
+      # proof (or a host's signature) is the authentication, as on keycloak
+      # and enroll-invite; strip-identity empties every identity header and
+      # its own proxy secret goes last. Wherever a person reaches Keycloak.
+      traefik.http.routers.people-cli.rule: Host(`people.${PORTCULLIS_DOMAIN:-portcullis.local}`) && PathPrefix(`/api/cli/v1/`)
+      traefik.http.routers.people-cli.entrypoints: ${PORTCULLIS_EP_ENROL:-websecure,vpnsecure}
+      traefik.http.routers.people-cli.priority: "200"
+      traefik.http.routers.people-cli.tls.options: authaware@file
+      traefik.http.routers.people-cli.middlewares: rate-limit-auth@file,strip-identity@file,security-headers@file,hub-cli-proxy-secret@docker
+      traefik.http.routers.people-cli.service: hub-cli
+      traefik.http.middlewares.hub-cli-proxy-secret.headers.customrequestheaders.X-Portcullis-Proxy-Secret: ${HUB_CLI_PROXY_SECRET:?HUB_CLI_PROXY_SECRET is not set — run ./portcullis init}
+      traefik.http.services.hub-cli.loadbalancer.server.port: "8891"
       # The VPN device page and its API (contract §5.1): the people chain and
       # service, but its own entrypoint class (enrol), so in server mode
       # with public enrolment /vpn/ stays on the internet while the rest of

@@ -31,6 +31,14 @@ docker compose -f docker-compose.yml config --format json \
 if HUB_PROXY_SECRET='' docker compose -f docker-compose.yml config -q 2>/dev/null; then
   echo "FAIL: compose accepted an empty HUB_PROXY_SECRET"; exit 1
 fi
+# The CLI router's own secret (contract §18.3): generated, required, never
+# the main one.
+docker compose -f docker-compose.yml config --format json \
+  | jq -e '.services.hub.environment as $e | ($e.HUB_CLI_PROXY_SECRET | test("^[0-9a-f]{64}$")) and $e.HUB_CLI_PROXY_SECRET != $e.HUB_PROXY_SECRET' >/dev/null \
+  || { echo "FAIL: hub has no generated HUB_CLI_PROXY_SECRET (or it equals HUB_PROXY_SECRET)"; exit 1; }
+if HUB_CLI_PROXY_SECRET='' docker compose -f docker-compose.yml config -q 2>/dev/null; then
+  echo "FAIL: compose accepted an empty HUB_CLI_PROXY_SECRET"; exit 1
+fi
 for v in FORWARD_AUTH_REDIS_PASSWORD FORWARD_AUTH_EXT_REDIS_PASSWORD; do
   if env "$v=" docker compose -f docker-compose.yml config -q 2>/dev/null; then
     echo "FAIL: compose accepted an empty $v"; exit 1
@@ -86,7 +94,7 @@ binds() {  # <config json> — "service target read_only selinux" of every proje
 }
 [ -z "$(binds "$CFG_ALL" | awk '$4 != "-"')" ] || { echo "FAIL: docker-compose.yml relabels a bind (selinux): only the overlay may"; exit 1; }
 NBINDS="$(binds "$CFG_ALL" | wc -l | tr -d ' ')"
-[ "$NBINDS" = 55 ] || { echo "FAIL: expected 55 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
+[ "$NBINDS" = 56 ] || { echo "FAIL: expected 56 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
 diff <({ binds "$CFG_ALL" | grep -vx 'hub /project true -' | awk '{print $1, $2, $3}'; echo "hub /project/group-gate/group-gate-map.conf true"; } | sort) \
      <(binds "$OV_ALL" | awk '{print $1, $2, $3}' | sort) \
   || { echo "FAIL: docker-compose.podman-selinux.yml must re-declare every project bind (but the Hub's /project root) with the same target / read_only, plus the Hub's map file"; exit 1; }
@@ -426,6 +434,40 @@ PORT8890="$(for files in "docker-compose.yml" "docker-compose.yml -f docker-comp
       | jq -r '.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.services\\.[^.]+\\.loadbalancer\\.server\\.port$")) | select(.value == "8890") | .key'
   done)"
 [ -z "$PORT8890" ] || { echo "FAIL: a Traefik service targets the Hub's MCP listener :8890: $PORT8890"; exit 1; }
+# people-cli (contract §18.3): the only router to the Hub's CLI listener
+# :8891, exactly the contract's rule, priority, TLS options, middlewares in
+# order (no forward-auth), entrypoints and service; the Hub's env, the
+# break-glass record bind.
+docker compose -f docker-compose.yml config --format json | jq -e --arg d "$(grep '^PORTCULLIS_DOMAIN=' .env | cut -d= -f2-)" '
+  .services.hub as $h | $h.labels as $l
+  | $l["traefik.http.routers.people-cli.rule"] == "Host(`people.\($d)`) && PathPrefix(`/api/cli/v1/`)"
+    and $l["traefik.http.routers.people-cli.priority"] == "200"
+    and $l["traefik.http.routers.people-cli.tls.options"] == "authaware@file"
+    and $l["traefik.http.routers.people-cli.middlewares"] == "rate-limit-auth@file,strip-identity@file,security-headers@file,hub-cli-proxy-secret@docker"
+    and $l["traefik.http.routers.people-cli.entrypoints"] == "websecure,vpnsecure"
+    and $l["traefik.http.routers.people-cli.service"] == "hub-cli"
+    and $l["traefik.http.services.hub-cli.loadbalancer.server.port"] == "8891"
+    and $l["traefik.http.middlewares.hub-cli-proxy-secret.headers.customrequestheaders.X-Portcullis-Proxy-Secret"] == $h.environment.HUB_CLI_PROXY_SECRET
+    and $h.environment.HUB_CLI_ADDR == ":8891"
+    and $h.environment.HUB_SSH_BREAKGLASS_FILE == "/run/portcullis/ssh/breakglass.jsonl"
+    and ([$h.volumes[] | select(.target == "/run/portcullis/ssh") | [(.source | endswith("/secrets/ssh")), .read_only]] == [[true, true]])' >/dev/null \
+  || { echo "FAIL: people-cli / hub-cli / the CLI listener's env and binds (contract §18.3)"; exit 1; }
+PORT8891="$(for files in "docker-compose.yml" "docker-compose.yml -f docker-compose.apps.yml" "docker-compose.test.yml"; do
+    # shellcheck disable=SC2086
+    docker compose -f $files --profile '*' config --format json \
+      | jq -r '.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.services\\.[^.]+\\.loadbalancer\\.server\\.port$")) | select(.value == "8891") | .key'
+  done | sort -u)"
+[ "$PORT8891" = "traefik.http.services.hub-cli.loadbalancer.server.port" ] || { echo "FAIL: Traefik services on the Hub's CLI listener :8891: $PORT8891 (only hub-cli)"; exit 1; }
+CLIROUTERS="$(docker compose -f docker-compose.yml --profile '*' config --format json \
+  | jq -r '.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.service$")) | select(.value == "hub-cli") | .key')"
+[ "$CLIROUTERS" = "traefik.http.routers.people-cli.service" ] || { echo "FAIL: routers on hub-cli: $CLIROUTERS (only people-cli)"; exit 1; }
+if grep -rnE '(^|[^0-9])8891([^0-9]|$)' traefik/dynamic/; then
+  echo "FAIL: traefik/dynamic references the Hub's CLI listener :8891"; exit 1
+fi
+# strip-identity empties exactly the contract's identity headers.
+yq -o=json '.http.middlewares["strip-identity"].headers.customRequestHeaders' traefik/dynamic/middlewares.yml \
+  | jq -e '(keys | sort) == (["X-Forwarded-User","X-Forwarded-Email","X-Forwarded-Preferred-Username","X-Auth-Request-User","X-Auth-Request-Email","X-Auth-Request-Groups","X-Auth-Request-Preferred-Username","X-Forwarded-Access-Token","Authorization","X-Forwarded-Impersonator","X-Forwarded-Impersonation","X-Portcullis-Proxy-Secret"] | sort) and ([.[]] | unique == [""])' >/dev/null \
+  || { echo "FAIL: strip-identity@file must empty exactly the contract §18.3 headers"; exit 1; }
 # ... nor does the file provider (a server URL, a port, hub:8890).
 if grep -rnE '(^|[^0-9])8890([^0-9]|$)' traefik/dynamic/; then
   echo "FAIL: traefik/dynamic references the Hub's MCP listener :8890"; exit 1
