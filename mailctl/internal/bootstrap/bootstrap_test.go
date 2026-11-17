@@ -444,9 +444,13 @@ func TestClientIPRewrittenPlanDisablesIPChecks(t *testing.T) {
 		t.Fatalf("degraded Security %s", b)
 	}
 	p.ClientIP = "preserved"
+	// Preserved addresses: Stalwart's default ban rates, written
+	// explicitly (leaving degraded mode restores the bans).
 	for _, s := range p.Singletons() {
 		if s.Object == "Security" {
-			t.Fatal("Security patched with preserved addresses")
+			if b, _ := json.Marshal(s.Patch); string(b) != `{"abuseBanRate":{"count":35,"period":86400000},"authBanRate":{"count":100,"period":86400000},"loiterBanRate":{"count":150,"period":86400000},"scanBanRate":{"count":30,"period":86400000}}` {
+				t.Fatalf("normal Security %s", b)
+			}
 		}
 	}
 	if b, _ := json.Marshal(p.senderAuth()["spfFromVerify"]); string(b) != `{"else":"disable","match":{"0":{"if":"local_port == 10025","then":"relaxed"}}}` {

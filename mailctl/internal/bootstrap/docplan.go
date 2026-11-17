@@ -54,6 +54,14 @@ func ApplyDoc(ctx context.Context, c *stalwart.Client, doc *state.Doc) (bool, er
 		if !docCollections[n.Object] {
 			continue
 		}
+		if n.Object == "MtaTlsStrategy" {
+			ch, err := tightenStrategies(ctx, c, n.Want)
+			if err != nil {
+				return changed, err
+			}
+			changed = changed || ch
+			continue
+		}
 		if n.Object == "MtaRoute" {
 			n.DestroyOthers = true
 		}
@@ -82,4 +90,62 @@ func ApplyDoc(ctx context.Context, c *stalwart.Client, doc *state.Doc) (bool, er
 		}
 	}
 	return changed, nil
+}
+
+// tlsRank orders a strategy's dane / mtaSts / startTls values (stricter =
+// higher; unknown = strictest, never touched).
+var tlsRank = map[string]int{"disable": 0, "optional": 1, "require": 2}
+
+// tightenStrategies creates the wanted TLS strategies that are missing and
+// only ever tightens an existing one (mtaSts, startTls up; allowInvalidCerts
+// to false): a loosening happens only on the DANE / MTA-STS machines' gated
+// paths. dane is the DANE machine's: never changed here, and a new strategy
+// takes "disable" while any existing one has it (DANE is off).
+func tightenStrategies(ctx context.Context, c *stalwart.Client, want []map[string]any) (bool, error) {
+	have, err := getAll(ctx, c, "MtaTlsStrategy")
+	if err != nil {
+		return false, err
+	}
+	byName := map[string]object{}
+	daneOff := false
+	for _, o := range have {
+		byName[str(o, "name")] = o
+		if str(o, "dane") == "disable" {
+			daneOff = true
+		}
+	}
+	create := map[string]any{}
+	update := map[string]map[string]any{}
+	for i, w := range want {
+		o, ok := byName[w["name"].(string)]
+		if !ok {
+			nw := map[string]any{}
+			for k, v := range w {
+				nw[k] = v
+			}
+			if daneOff {
+				nw["dane"] = "disable"
+			}
+			create[fmt.Sprintf("c%d", i)] = nw
+			continue
+		}
+		patch := map[string]any{}
+		for _, k := range []string{"mtaSts", "startTls"} {
+			cur, ok := tlsRank[str(o, k)]
+			if wv, _ := w[k].(string); ok && tlsRank[wv] > cur {
+				patch[k] = wv
+			}
+		}
+		if string(o["allowInvalidCerts"]) == "true" && w["allowInvalidCerts"] == false {
+			patch["allowInvalidCerts"] = false
+		}
+		if len(patch) > 0 {
+			update[str(o, "id")] = patch
+		}
+	}
+	if len(create) == 0 && len(update) == 0 {
+		return false, nil
+	}
+	r, err := c.Set(ctx, "MtaTlsStrategy", create, update, nil)
+	return true, checkSet("MtaTlsStrategy", r, err)
 }

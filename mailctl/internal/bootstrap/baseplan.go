@@ -192,6 +192,15 @@ func DegradedSenderAuth() map[string]any {
 		"dmarcVerify": expr("disable", [2]string{on25, "relaxed"})}
 }
 
+// NormalSecurity is Stalwart v1.1.0's default ban rates (the schema
+// snapshot's x:Security defaults), written explicitly so leaving degraded
+// mode restores the bans.
+func NormalSecurity() map[string]any {
+	day := 86400000
+	r := func(n int) map[string]any { return map[string]any{"count": n, "period": day} }
+	return map[string]any{"authBanRate": r(100), "abuseBanRate": r(35), "loiterBanRate": r(150), "scanBanRate": r(30)}
+}
+
 // DegradedSecurity: no automatic bans with rewritten client addresses —
 // every client is the gateway, so a ban would lock everyone out (the
 // server would ban itself). Brute force is still bounded by the auth
@@ -322,8 +331,11 @@ func (p Params) Singletons() []Singleton {
 			"inboundReportForwarding": false,
 		}},
 	}
+	// Always managed: every switch between the modes rewrites it.
 	if p.ClientIP == "rewritten" {
 		ss = append(ss, Singleton{"Security", DegradedSecurity()})
+	} else {
+		ss = append(ss, Singleton{"Security", NormalSecurity()})
 	}
 	return ss
 }

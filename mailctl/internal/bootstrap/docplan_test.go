@@ -57,4 +57,54 @@ func TestApplyDocFollowsDocument(t *testing.T) {
 	if !strings.Contains(string(sa), `"spfFromVerify":{"else":"disable"`) {
 		t.Fatalf("degraded sender auth %s", sa)
 	}
+	sec, _ := json.Marshal(f.Get("Security", "", "singleton"))
+	if !strings.Contains(string(sec), `"authBanRate":null`) {
+		t.Fatalf("degraded security %s", sec)
+	}
+	// Back to preserved: the bans come back (explicit non-null rates).
+	doc.ClientIP = state.ClientIPPreserved
+	if _, err := ApplyDoc(context.Background(), c, doc); err != nil {
+		t.Fatal(err)
+	}
+	sec, _ = json.Marshal(f.Get("Security", "", "singleton"))
+	for _, k := range []string{`"authBanRate":{"count":100`, `"abuseBanRate":{"count":35`, `"loiterBanRate":{"count":150`, `"scanBanRate":{"count":30`} {
+		if !strings.Contains(string(sec), k) {
+			t.Fatalf("normal security lacks %s: %s", k, sec)
+		}
+	}
+}
+
+// ApplyDoc only creates missing TLS strategies and tightens existing ones:
+// an entry stricter than wanted stays, dane is never touched (the DANE
+// machine's), and a new strategy follows DANE being off.
+func TestApplyDocTightensTLSStrategiesOnly(t *testing.T) {
+	f := fake.New()
+	t.Cleanup(f.Close)
+	c := stalwart.New(f.URL(), stalwart.Bearer("API_k"))
+	f.Put("MtaTlsStrategy", "", map[string]any{"name": "default", "dane": "disable", "mtaSts": "require", "startTls": "require", "allowInvalidCerts": false})
+	b, _ := os.ReadFile("../state/testdata/mailstate_v2.json")
+	doc, _ := state.Parse(b)
+	if _, err := ApplyDoc(context.Background(), c, doc); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]map[string]any{}
+	for _, o := range f.Objects("MtaTlsStrategy", "") {
+		got[o["name"].(string)] = o
+	}
+	if d := got["default"]; d["dane"] != "disable" || d["mtaSts"] != "require" || d["startTls"] != "require" {
+		t.Fatalf("default loosened: %v", d)
+	}
+	if r := got["relay-strict"]; r == nil || r["dane"] != "disable" || r["startTls"] != "require" {
+		t.Fatalf("relay-strict %v", r)
+	}
+	// A looser existing entry is tightened.
+	f.Put("MtaTlsStrategy", "", map[string]any{"id": got["relay-strict"]["id"], "name": "relay-strict", "dane": "disable", "mtaSts": "optional", "startTls": "optional", "allowInvalidCerts": true})
+	if _, err := ApplyDoc(context.Background(), c, doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range f.Objects("MtaTlsStrategy", "") {
+		if o["name"] == "relay-strict" && (o["startTls"] != "require" || o["allowInvalidCerts"] != false || o["dane"] != "disable") {
+			t.Fatalf("not tightened: %v", o)
+		}
+	}
 }
