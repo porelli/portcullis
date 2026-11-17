@@ -71,7 +71,7 @@ for h in web-1 web-2; do
   docker rm -f "e2e-$h" >/dev/null 2>&1 || true
   docker run -d --name "e2e-$h" --hostname "$h.$E2E_DOMAIN" --network portcullis-proxy portcullis-e2e-sshd >/dev/null
   docker cp "$RUNNER_TEMP/portcullis" "e2e-$h:/usr/local/bin/portcullis"
-  docker cp certs/root-ca.crt "e2e-$h:/ca.pem"
+  docker cp certs/ca-chain.crt "e2e-$h:/ca.pem"
   docker exec "e2e-$h" sh -c 'chown root:root /usr/local/bin/portcullis /ca.pem && chmod 0755 /usr/local/bin/portcullis && chmod 0644 /ca.pem'
   ip="$(docker inspect -f '{{(index .NetworkSettings.Networks "portcullis-proxy").IPAddress}}' "e2e-$h")"
   [ -n "$ip" ] || { echo "FAIL: e2e-$h has no portcullis-proxy address"; exit 1; }

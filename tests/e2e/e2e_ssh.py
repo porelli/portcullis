@@ -63,7 +63,9 @@ import scenarios  # noqa: E402
 DOMAIN = os.environ["E2E_DOMAIN"]
 PC = os.environ["E2E_PORTCULLIS"]
 PEOPLE = f"https://people.{DOMAIN}"
-CA = os.path.abspath("certs/root-ca.crt")
+# The CI CA chain (root + intermediates): Traefik serves the Vault
+# wildcard leaf alone, so the root by itself can't verify it.
+CA = os.path.abspath("certs/ca-chain.crt")
 WEB1, WEB2 = f"web-1.{DOMAIN}", f"web-2.{DOMAIN}"
 HOME = os.path.expanduser("~")
 results: list[tuple[str, bool, str]] = []
@@ -83,9 +85,11 @@ def check(name: str, fn) -> None:
         traceback.print_exc()
 
 
-def secret(v: str) -> str:
+def secret(v: str, kind: str = "code") -> str:
+    """A value no log, audit or output may hold (masked in the job log).
+    kind: code (an OAuth authorization code), verifier, nonce, enrol."""
     print(f"::add-mask::{v}", flush=True)
-    state["secrets"].append(v)
+    state["secrets"].append((kind, v))
     return v
 
 
@@ -118,7 +122,7 @@ def until(what: str, fn, seconds: float, every: float = 2):
 
 
 def pkce() -> tuple[str, str]:
-    v = secret(secrets.token_urlsafe(48))
+    v = secret(secrets.token_urlsafe(48), "verifier")
     return v, base64.urlsafe_b64encode(hashlib.sha256(v.encode()).digest()).rstrip(b"=").decode()
 
 
@@ -128,7 +132,7 @@ def code_via(page: Page, authorize: str, client: str, redirect_uri: str, label: 
     seen: list[str] = []
     page.on("request", lambda r: seen.append(r.url) if r.url.startswith(redirect_uri + "?") else None)
     verifier, challenge = pkce()
-    nonce = secret(secrets.token_urlsafe(16))
+    nonce = secret(secrets.token_urlsafe(16), "nonce")
     q = {"client_id": client, "response_type": "code", "scope": "openid", "redirect_uri": redirect_uri,
          "state": secrets.token_urlsafe(12), "nonce": nonce, "code_challenge": challenge, "code_challenge_method": "S256"}
     if fresh:
@@ -302,14 +306,15 @@ def main() -> int:
             root = person("root")
             p = fresh_proof(root, "ssh-on")
             api_ok("PUT", "/api/ssh/settings", dict(enabled=True, default_ttl_hours=8, **p))
-            st = api_ok("GET", "/api/ssh/settings")
-            assert st["enabled"] and st["user_cas"] and st["host_cas"], st
+            # The CA keys come with the next compile (enroll's GET /internal/ssh-ca).
+            st = until("the CA keys", lambda: (lambda v: v if v["user_cas"] and v["host_cas"] else None)(api_ok("GET", "/api/ssh/settings")), 90)
+            assert st["enabled"], st
             assert not st["problems"], st["problems"]
             state["user_ca"] = st["user_cas"][0]
             api_ok("POST", "/api/ssh/hostgroups", {"id": "web", "label": "Web", "patterns": [WEB2]})
             p = fresh_proof(root, "host-web-1")
             out = api_ok("POST", "/api/ssh/hosts", dict(id="web-1", names=[WEB1], host_groups=["web"], managed=True, **p))
-            code = secret(out["code"])
+            code = secret(out["code"], "enrol")
             r = dexec("web-1", "portcullis", "host", "enroll", "--service", "none", "--ca-file", "/ca.pem", input_=code + "\n")
             assert r.returncode == 0, f"enroll: {r.stdout[-300:]} {r.stderr[-600:]}"
             run(["docker", "exec", "-d", "e2e-web-1", "portcullis", "host", "sync"])
@@ -379,7 +384,7 @@ def main() -> int:
         check("wrong_key_proof_refused", wrong_key_proof_refused)
 
         def cli_client_shape():
-            cs = S.kc("/admin/realms/portcullis/clients?clientId=portcullis-cli")
+            cs = S.kc("/clients?clientId=portcullis-cli")
             assert len(cs) == 1, cs
             c = cs[0]
             assert c["publicClient"] and not c.get("serviceAccountsEnabled") and not c.get("directAccessGrantsEnabled"), c
@@ -436,16 +441,28 @@ def main() -> int:
         check("hub_stopped_valid_certs_and_breakglass_work", hub_stopped_valid_certs_and_breakglass_work)
 
         def no_secret_anywhere():
-            texts = [run(["docker", "compose", "logs", "--no-color"]).stdout]
+            # Traefik's access log holds every request line, the browser's
+            # redirects with an OAuth code included (core-wide, every OIDC
+            # sign-in): codes and nonces are checked everywhere else; the
+            # verifier, enrolment code and private keys everywhere.
+            services = run(["docker", "compose", "config", "--services"]).stdout.split()
+            sources = {svc: run(["docker", "compose", "logs", "--no-color", svc]).stdout for svc in services}
             for h in ("web-1", "web-2"):
-                texts.append(run(["docker", "logs", f"e2e-{h}"]).stdout + run(["docker", "logs", f"e2e-{h}"]).stderr)
-            texts.append(run(["docker", "run", "--rm", "-v", "portcullis_hub_data:/d:ro", os.environ["ALPINE"], "sh", "-c",
-                              "cat /d/audit*.jsonl /d/audit/*.jsonl /d/ssh/issued.jsonl 2>/dev/null; true"]).stdout)
-            texts.extend(state["cli_out"])
-            blob = "\n".join(texts)
-            leaked = [s[:6] + "…" for s in state["secrets"] if len(s) >= 12 and s in blob]
-            assert not leaked, f"secrets found in logs / audit / CLI output: {leaked}"
-            assert "PRIVATE KEY" not in blob, "a private key in the logs"
+                sources[f"sshd {h}"] = run(["docker", "logs", f"e2e-{h}"]).stdout + run(["docker", "logs", f"e2e-{h}"]).stderr
+            sources["hub data (audit, issued.jsonl)"] = run(["docker", "run", "--rm", "-v", "portcullis_hub_data:/d:ro", os.environ["ALPINE"], "sh", "-c",
+                                                             "cat /d/audit*.jsonl /d/audit/*.jsonl /d/ssh/issued.jsonl 2>/dev/null; true"]).stdout
+            sources["CLI output"] = "\n".join(state["cli_out"])
+            leaked = []
+            for where, text in sources.items():
+                for kind, v in state["secrets"]:
+                    if len(v) < 12 or v not in text:
+                        continue
+                    if where == "traefik" and kind in ("code", "nonce"):
+                        continue
+                    leaked.append(f"{kind} {v[:4]}… in {where}")
+                if "PRIVATE KEY" in text:
+                    leaked.append(f"a private key in {where}")
+            assert not leaked, f"secrets found: {leaked}"
         check("no_secret_anywhere", no_secret_anywhere)
 
         def finally_():
