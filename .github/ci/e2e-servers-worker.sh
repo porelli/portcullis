@@ -87,7 +87,7 @@ case "$kind" in
     {
     echo "== podman worker $name: the image (systemd, passt, the CLI's tools)"
     printf '%s\n' "FROM $PODMAN_IMG" \
-      "RUN dnf -y -q install systemd passt jq openssl procps-ng util-linux sudo findutils diffutils && dnf -y -q clean all && rm -rf /etc/containers/containers.conf /home/podman/.config/containers && echo net.ipv4.ip_unprivileged_port_start=80 > /etc/sysctl.d/90-pcci.conf" \
+      "RUN dnf -y -q install systemd passt jq openssl procps-ng util-linux sudo findutils diffutils && dnf -y -q clean all && rm -rf /etc/containers/containers.conf /home/podman/.config/containers && echo net.ipv4.ip_unprivileged_port_start=80 > /etc/sysctl.d/90-pcci.conf && echo podman:100000:65536 > /etc/subuid && cp /etc/subuid /etc/subgid" \
       "STOPSIGNAL SIGRTMIN+3" 'CMD ["/sbin/init"]' | docker build -q -t "$PODMAN_WORKER_IMG" - >/dev/null
     docker run -d "${priv[@]}" --cgroupns=private --tmpfs /run --tmpfs /run/lock --label pcci.worker=podman \
       --name "e2e-$name" --hostname "$name" -v "$PWD:/src:ro" "$PODMAN_WORKER_IMG" >/dev/null
