@@ -69,3 +69,80 @@ path "pki_int/crl/rotate" {
 path "pki_file/crl/rotate" {
   capabilities = ["read"]
 }
+
+# ── SSH (contract §18.7, spike S4/S4b–S4f) ──────────────────────────────
+# People's SSH certificates: one role per host group, ssh_user/roles/hg-<id>,
+# written only by enroll from the Hub's compilation. Every role field is a
+# string (JSON booleans are refused by allowed_parameters). ttl / max_ttl
+# are pinned to the twelve whole-hour values up to 12 h: a role's max_ttl
+# above the mount's max-lease-ttl would sign past it (S4c), so this list is
+# the 12 h limit. Even with this policy enroll can't make a role that
+# issues host certificates, X11 / user-rc / force-command certificates or
+# certificates over 12 h.
+path "ssh_user/sign/hg-*" {
+  capabilities = ["update"]
+  # source-address comes from the role only; never a host certificate.
+  denied_parameters = {
+    "cert_type"        = []
+    "critical_options" = []
+  }
+}
+
+path "ssh_user/roles/hg-*" {
+  capabilities = ["create", "update", "read", "delete"]
+  allowed_parameters = {
+    "key_type"                 = ["ca"]
+    "allow_user_certificates"  = ["true"]
+    "allow_host_certificates"  = ["false"]
+    "allow_user_key_ids"       = ["true"]
+    "allowed_users"            = []
+    "allowed_extensions"       = ["permit-pty", "permit-pty,permit-port-forwarding",
+                                  "permit-pty,permit-agent-forwarding",
+                                  "permit-pty,permit-port-forwarding,permit-agent-forwarding"]
+    "default_extensions"       = []
+    "allowed_critical_options" = ["", "source-address"]
+    "default_critical_options" = []
+    "allowed_user_key_lengths" = []
+    "ttl"                      = ["3600", "7200", "10800", "14400", "18000", "21600",
+                                  "25200", "28800", "32400", "36000", "39600", "43200"]
+    "max_ttl"                  = ["3600", "7200", "10800", "14400", "18000", "21600",
+                                  "25200", "28800", "32400", "36000", "39600", "43200"]
+  }
+}
+
+# Stale hg-* roles (the Hub deletes roles without grants).
+path "ssh_user/roles/" {
+  capabilities = ["list"]
+}
+
+# Host certificates: exactly cert_type=host (the default, user, is refused
+# by the host role), plus key_id and the documented fields.
+path "ssh_host/sign/host" {
+  capabilities = ["update"]
+  allowed_parameters = {
+    "cert_type" = ["host"]
+    "*"         = []
+  }
+}
+
+# GET /internal/ssh-ca: the CA public keys and the §18.7 checks (no sudo
+# needed for the tunes, S4d).
+path "ssh_user/config/ca" {
+  capabilities = ["read"]
+}
+
+path "ssh_host/config/ca" {
+  capabilities = ["read"]
+}
+
+path "sys/mounts/ssh_user/tune" {
+  capabilities = ["read"]
+}
+
+path "sys/mounts/ssh_host/tune" {
+  capabilities = ["read"]
+}
+
+path "ssh_host/roles/host" {
+  capabilities = ["read"]
+}

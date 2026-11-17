@@ -365,7 +365,7 @@ expect_eq "lint_ci_size.sh passes 450,000 bytes and fails 450,001" \
 expect_eq "CI's same-named branch lookups: no v* tag glob, no ls-remote pattern lookup" \
   "$(grep -rnE '"\$REF" *(==|!=) *v\*|ls-remote --exit-code' "$HERE/../.github" | wc -l | tr -d ' ')" 0
 expect_eq "CI's same-named branch lookups: every one lists the heads once and fails loudly" \
-  "$(grep -cF 'heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }' "$HERE/../.github/workflows/ci.yml" "$HERE/../.github/actions/hub-image/action.yml" "$HERE/../.github/actions/keycloak-image/action.yml" | awk -F: '{ s += $2 } END { print s }')" 12
+  "$(grep -cF 'heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }' "$HERE/../.github/workflows/ci.yml" "$HERE/../.github/actions/hub-image/action.yml" "$HERE/../.github/actions/keycloak-image/action.yml" | awk -F: '{ s += $2 } END { print s }')" 13
 # Client forwarded / address headers Traefik doesn't manage are deleted on
 # every websecure and vpnsecure router (entrypoint http.middlewares).
 expect_eq "strip-client-forwarded@file deletes Forwarded, X-Real-Ip's look-alikes and every unmanaged X-Forwarded-*" \
@@ -1511,6 +1511,9 @@ expect_eq "signin reset-core --yes without .env exits 1 before docker" "$RC:$(ca
 mv "$SR_ROOT/.env.x" "$SR_ROOT/.env"
 
 # ── enroll's Vault policy: exactly the D21 paths (contract §8.1) ──
+# The client certificate part: everything before the SSH section.
+POLICY_PKI="$WORK/enroll-pki.hcl"
+sed '/^# ── SSH (contract §18.7/,$d' "$HERE/../vault/policies/enroll.hcl" > "$POLICY_PKI"
 POLICY_GOT="$(awk '
   function flush() { if (p != "") print p " " c (d != "" ? " deny=" d : ""); p = ""; c = ""; d = "" }
   /^[[:space:]]*path[[:space:]]+"/ { flush(); p = $2; gsub(/"/, "", p); ind = 0; next }
@@ -1519,7 +1522,7 @@ POLICY_GOT="$(awk '
   ind && /=[[:space:]]*\[\]/ { k = $1; gsub(/"/, "", k); d = (d == "" ? k : d "," k); next }
   ind && /^[[:space:]]*}/ { ind = 0; next }
   END { flush() }
-' "$HERE/../vault/policies/enroll.hcl" | sort)"
+' "$POLICY_PKI" | sort)"
 POLICY_WANT="$(sort <<'EOF'
 pki_int/sign/client-cert update deny=alt_names,ip_sans,uri_sans,other_sans
 pki_file/sign/browser-cert update deny=alt_names,ip_sans,uri_sans,other_sans
@@ -1535,10 +1538,136 @@ EOF
 )"
 expect_eq "enroll.hcl grants exactly the D21 paths (sign/client-cert, sign/browser-cert, certs list, cert read, revoke, crl/rotate on both mounts) and nothing else" \
   "$POLICY_GOT" "$POLICY_WANT"
-expect_eq "enroll.hcl has one path block per grant" \
-  "$(grep -c '^[[:space:]]*path[[:space:]]' "$HERE/../vault/policies/enroll.hcl")" 10
-expect_eq "enroll.hcl: only capabilities and denied_parameters (no allowed_parameters, no wildcard grants)" \
-  "$(grep -vE '^[[:space:]]*(#|$|path "pki_(int|file)/[a-z/-]+\*?" \{|capabilities = \["(update|list|read)"\]|denied_parameters = \{|"(alt_names|ip_sans|uri_sans|other_sans)" += \[\]|\})' "$HERE/../vault/policies/enroll.hcl")" ""
+expect_eq "enroll.hcl's client certificate part has one path block per grant" \
+  "$(grep -c '^[[:space:]]*path[[:space:]]' "$POLICY_PKI")" 10
+expect_eq "enroll.hcl's client certificate part: only capabilities and denied_parameters (no allowed_parameters, no wildcard grants)" \
+  "$(grep -vE '^[[:space:]]*(#|$|path "pki_(int|file)/[a-z/-]+\*?" \{|capabilities = \["(update|list|read)"\]|denied_parameters = \{|"(alt_names|ip_sans|uri_sans|other_sans)" += \[\]|\})' "$POLICY_PKI")" ""
+# The SSH part (contract §18.7), comments and blank lines aside, is exactly
+# this: no role TTL above 12 h (ttl / max_ttl pinned to whole hours up to
+# 43200), no host certificates from a user role, no critical options or
+# cert_type on user signs, host signs only with cert_type=host.
+SSH_POLICY_WANT="$(cat <<'EOF'
+path "ssh_user/sign/hg-*" {
+capabilities = ["update"]
+denied_parameters = {
+"cert_type"        = []
+"critical_options" = []
+}
+}
+path "ssh_user/roles/hg-*" {
+capabilities = ["create", "update", "read", "delete"]
+allowed_parameters = {
+"key_type"                 = ["ca"]
+"allow_user_certificates"  = ["true"]
+"allow_host_certificates"  = ["false"]
+"allow_user_key_ids"       = ["true"]
+"allowed_users"            = []
+"allowed_extensions"       = ["permit-pty", "permit-pty,permit-port-forwarding",
+"permit-pty,permit-agent-forwarding",
+"permit-pty,permit-port-forwarding,permit-agent-forwarding"]
+"default_extensions"       = []
+"allowed_critical_options" = ["", "source-address"]
+"default_critical_options" = []
+"allowed_user_key_lengths" = []
+"ttl"                      = ["3600", "7200", "10800", "14400", "18000", "21600",
+"25200", "28800", "32400", "36000", "39600", "43200"]
+"max_ttl"                  = ["3600", "7200", "10800", "14400", "18000", "21600",
+"25200", "28800", "32400", "36000", "39600", "43200"]
+}
+}
+path "ssh_user/roles/" {
+capabilities = ["list"]
+}
+path "ssh_host/sign/host" {
+capabilities = ["update"]
+allowed_parameters = {
+"cert_type" = ["host"]
+"*"         = []
+}
+}
+path "ssh_user/config/ca" {
+capabilities = ["read"]
+}
+path "ssh_host/config/ca" {
+capabilities = ["read"]
+}
+path "sys/mounts/ssh_user/tune" {
+capabilities = ["read"]
+}
+path "sys/mounts/ssh_host/tune" {
+capabilities = ["read"]
+}
+path "ssh_host/roles/host" {
+capabilities = ["read"]
+}
+EOF
+)"
+expect_eq "enroll.hcl's SSH part is exactly contract §18.7's" \
+  "$(sed -n '/^# ── SSH (contract §18.7/,$p' "$HERE/../vault/policies/enroll.hcl" | grep -vE '^[[:space:]]*(#|$)' | sed 's/^[[:space:]]*//')" "$SSH_POLICY_WANT"
+SSH_TTLS="$(sed -n '/^# ── SSH (contract §18.7/,$p' "$HERE/../vault/policies/enroll.hcl" | tr -d '\n' | grep -oE '"(max_)?ttl" += \[[^]]*\]' | grep -oE '"[0-9]+"' | tr -d '"' | sort -n | uniq)"
+expect_eq "enroll.hcl: ssh_user role TTLs are exactly the whole hours up to 12 h (none above)" "$(printf '%s\n' "$SSH_TTLS" | tr '\n' ' ')" "3600 7200 10800 14400 18000 21600 25200 28800 32400 36000 39600 43200 "
+
+# ── ssh_setup: the SSH CA mounts (contract §18.7; stub vault) ──
+# State in $SS_DIR: mounts.json (vault secrets list -format=json),
+# ca-<mount> (its CA public key line; absent = no CA yet). Every call is
+# logged to $SS_DIR/calls.
+SS_DIR="$WORK/ssh-setup"; SS_BIN="$WORK/ssh-setup-bin"
+mkdir -p "$SS_DIR" "$SS_BIN"
+cat > "$SS_BIN/vault" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$SS_DIR/calls"
+case "$1 $2" in
+  "secrets enable") m="${3#-path=}"; jq --arg m "$m/" '. + {($m): {type: "ssh", config: {max_lease_ttl: 2764800}}}' "$SS_DIR/mounts.json" > "$SS_DIR/m" && mv "$SS_DIR/m" "$SS_DIR/mounts.json" ;;
+  "secrets tune") ;;
+  "read -field=public_key")
+    m="${3%/config/ca}"
+    if [ -f "$SS_DIR/ca-$m" ]; then cat "$SS_DIR/ca-$m"; else
+      printf 'Error reading %s/config/ca: Error making API request.\n\nCode: 400. Errors:\n\n* keys haven'"'"'t been configured yet\n' "$m" >&2; exit 2; fi ;;
+  "write ssh_user/config/ca"|"write ssh_host/config/ca") m="${2%/config/ca}"; echo "ssh-ed25519 AAAA$m" > "$SS_DIR/ca-$m" ;;
+  "write ssh_host/roles/host") ;;
+  *) echo "unexpected vault call: $*" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$SS_BIN/vault"
+ss() {
+  RC=0; : > "$SS_DIR/calls"
+  OUT="$(PATH="$SS_BIN:$PATH" SS_DIR="$SS_DIR" bash -c '
+    source "$1/scripts/lib/common.sh"; source "$1/scripts/lib/vault.sh"; source "$1/scripts/lib/pki.sh"
+    ssh_setup "$(cat "$SS_DIR/mounts.json")"' _ "$HERE/.." 2>&1)" || RC=$?
+}
+echo '{"pki_int/": {"type": "pki", "config": {"max_lease_ttl": 157680000}}}' > "$SS_DIR/mounts.json"
+ss
+expect_eq "ssh_setup: a fresh Vault exits 0" "$RC" 0
+expect_eq "ssh_setup: a fresh Vault gets both mounts, caps, ed25519 CAs and the host role (contract §18.7)" "$(grep -v '^read ' "$SS_DIR/calls")" \
+'secrets enable -path=ssh_user ssh
+secrets tune -max-lease-ttl=12h ssh_user
+write ssh_user/config/ca generate_signing_key=true key_type=ed25519
+secrets enable -path=ssh_host ssh
+secrets tune -max-lease-ttl=2160h ssh_host
+write ssh_host/config/ca generate_signing_key=true key_type=ed25519
+write ssh_host/roles/host key_type=ca allow_host_certificates=true allow_user_certificates=false allow_user_key_ids=true allowed_domains=* allow_subdomains=true allow_bare_domains=true ttl=2160h max_ttl=2160h'
+# The tuned caps as Vault lists them.
+jq '."ssh_user/".config.max_lease_ttl = 43200 | ."ssh_host/".config.max_lease_ttl = 7776000' "$SS_DIR/mounts.json" > "$SS_DIR/m" && mv "$SS_DIR/m" "$SS_DIR/mounts.json"
+ss
+expect_eq "ssh_setup: a second run exits 0" "$RC" 0
+expect_eq "ssh_setup: a second run creates nothing (only the host role is rewritten)" "$(grep -cE '^(secrets |write ssh_(user|host)/config/ca)' "$SS_DIR/calls"):$(grep -c '^write ssh_host/roles/host ' "$SS_DIR/calls")" "0:1"
+jq '."ssh_user/".config.max_lease_ttl = 86400' "$SS_DIR/mounts.json" > "$SS_DIR/bad.json"
+cp "$SS_DIR/mounts.json" "$SS_DIR/good.json"; cp "$SS_DIR/bad.json" "$SS_DIR/mounts.json"
+ss
+expect_eq "ssh_setup: another cap on ssh_user fails" "$RC" 1
+case "$OUT" in *"ssh_user/ has max_lease_ttl 86400 s, not 12h"*) t_pass "ssh_setup: the cap failure names the mount and the fix" ;; *) t_fail "ssh_setup cap: $OUT" ;; esac
+expect_eq "ssh_setup: a cap failure changes nothing" "$(grep -cE '^(secrets |write )' "$SS_DIR/calls")" 0
+cp "$SS_DIR/good.json" "$SS_DIR/mounts.json"
+echo "ssh-rsa AAAAold" > "$SS_DIR/ca-ssh_host"
+ss
+expect_eq "ssh_setup: a non-ed25519 CA fails (never replaced)" "$RC:$(grep -c 'config/ca generate' "$SS_DIR/calls")" "1:0"
+case "$OUT" in *"the ssh_host CA is not ed25519 (ssh-rsa)"*) t_pass "ssh_setup: the CA failure names the mount and the type" ;; *) t_fail "ssh_setup CA type: $OUT" ;; esac
+echo "ssh-ed25519 AAAAssh_host" > "$SS_DIR/ca-ssh_host"
+jq '."ssh_user/".type = "kv"' "$SS_DIR/good.json" > "$SS_DIR/mounts.json"
+ss
+expect_eq "ssh_setup: ssh_user as another engine fails" "$RC" 1
+case "$OUT" in *"ssh_user/ is a kv engine, not ssh"*) t_pass "ssh_setup: the engine failure names it" ;; *) t_fail "ssh_setup engine: $OUT" ;; esac
+expect_eq "pki_setup calls ssh_setup on both paths (existing CA and new CA)" "$(grep -cE '^ +ssh_setup "[$]mounts"$' "$HERE/../scripts/lib/pki.sh")" 2
 
 # ── cert list / revoke / enroll over both CAs (stub vault + ykman) ──
 CT_ROOT="$WORK/cert-root"

@@ -300,6 +300,32 @@ jobs:
             exit 1
           fi
           echo "vpn.json vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
+      # enroll/testdata/ssh_vectors.json drives enroll's SSH checks
+      # (contract §18): a byte copy of the Hub's internal/cliapi/testdata/
+      # vectors.json, same-named Hub branch when it exists, else main.
+      - name: Shared SSH vectors match the Hub
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          own=enroll/testdata/ssh_vectors.json
+          url="https://github.com/porelli/portcullis-hub"
+          heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
+          ref=main
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] \
+            && awk -v r="refs/heads/$REF" '$2 == r { f = 1 } END { exit !f }' <<<"$heads"; then
+            ref="$REF"
+          fi
+          sha=$(awk -v r="refs/heads/$ref" '$2 == r { print $1 }' <<<"$heads")
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::portcullis-hub has no single commit for refs/heads/$ref"; exit 1; }
+          echo "portcullis-hub (SSH vectors): $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
+          hub="$RUNNER_TEMP/hub_ssh_vectors.json"
+          code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/internal/cliapi/testdata/vectors.json")
+          [ "$code" = 200 ] || { echo "::error::fetching the Hub's SSH vectors from $ref ($sha): HTTP $code"; exit 1; }
+          if ! cmp "$own" "$hub"; then
+            echo "::error::$own differs from portcullis-hub $ref ($sha) internal/cliapi/testdata/vectors.json: copy it byte for byte"
+            exit 1
+          fi
+          echo "SSH vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
       # e2e_filesharing's run_op (busy-409 retry, scrubbing) on a fake Hub:
       # stdlib only, no stack.
       - name: e2e helper unit tests (e2e_fsops)
@@ -421,6 +447,30 @@ jobs:
           go mod verify
           go vet ./...
           go test ./...
+      # Spike S1 / S4 for good (contract §18.7): enroll's SSH paths against a
+      # real Vault (the compose pin, dev mode, throwaway) with the real
+      # vault/policies/enroll.hcl — every refusal (no role above 12 h, no
+      # host certificates from a user role, cert_type / critical_options),
+      # the four key types, the host sign's cert_type, the CA checks.
+      - name: enroll SSH against a real Vault (TestLiveSSHVault)
+        working-directory: enroll
+        timeout-minutes: 5
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          img=$(grep -oE 'docker\.io/hashicorp/vault:[^ ]+@sha256:[0-9a-f]{64}' ../docker-compose.yml | head -1)
+          [ -n "$img" ] || { echo "::error::no pinned Vault image in docker-compose.yml"; exit 1; }
+          VAULT_DEV_ROOT_TOKEN_ID=$(openssl rand -hex 16)
+          echo "::add-mask::$VAULT_DEV_ROOT_TOKEN_ID"
+          export VAULT_DEV_ROOT_TOKEN_ID
+          docker run -d --rm --name ssh-live-vault -p 127.0.0.1:18200:8200 --cap-add IPC_LOCK \
+            -e VAULT_DEV_ROOT_TOKEN_ID -e SKIP_SETCAP=1 "$img" server -dev >/dev/null
+          trap 'docker rm -f ssh-live-vault >/dev/null 2>&1' EXIT
+          for _ in $(seq 60); do curl -fsS http://127.0.0.1:18200/v1/sys/health >/dev/null 2>&1 && break; sleep 1; done
+          PORTCULLIS_VAULT_LIVE_ADDR=http://127.0.0.1:18200 PORTCULLIS_VAULT_LIVE_TOKEN="$VAULT_DEV_ROOT_TOKEN_ID" \
+            go test -count=1 -v -run 'TestLiveSSHVault' . 2>&1 | tee "$RUNNER_TEMP/ssh-live.log"
+          test "${PIPESTATUS[0]}" = 0
+          grep -q -- '--- PASS: TestLiveSSHVault' "$RUNNER_TEMP/ssh-live.log" || { echo "::error::TestLiveSSHVault didn't run"; exit 1; }
       - name: domains unit tests (in-process Pebble, fake libdns provider + DNS server)
         working-directory: domains
         run: |
@@ -889,6 +939,23 @@ jobs:
           allowed write pki_file/revoke serial_number=00:00:00:00
           allowed read -format=json pki_int/crl/rotate
           allowed read -format=json pki_file/crl/rotate
+          # SSH (contract §18.7): pki setup's ssh_setup made both mounts; the
+          # policy reads the CAs and checks, never a role above 12 h, a host
+          # role, a CA, or cert_type / critical_options on a user sign.
+          allowed read ssh_user/config/ca
+          allowed read ssh_host/config/ca
+          allowed read sys/mounts/ssh_user/tune
+          allowed read sys/mounts/ssh_host/tune
+          allowed read ssh_host/roles/host
+          allowed list ssh_user/roles
+          denied write ssh_user/roles/hg-ci key_type=ca max_ttl=86400
+          denied write ssh_user/roles/hg-ci key_type=ca allow_host_certificates=true
+          denied write ssh_user/roles/ci key_type=ca
+          denied write ssh_host/roles/host key_type=ca allow_user_certificates=true
+          denied write ssh_user/config/ca generate_signing_key=true
+          denied write ssh_user/sign/hg-ci public_key=x cert_type=host
+          denied write ssh_user/sign/hg-ci public_key=x critical_options=force-command=sh
+          denied write ssh_host/sign/host public_key=x cert_type=user
           denied write -f pki/root/generate/internal common_name=x
           denied write pki_int/issue/server-cert common_name=x.portcullis.local
           denied write pki_file/issue/browser-cert common_name=x
