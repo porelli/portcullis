@@ -2430,6 +2430,7 @@ jobs:
           E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
           export E2E_HUB_SECRET HUB_API="http://$HUB_IP:8888" E2E_PEOPLE_API="http://$HUB_IP:8889" E2E_USAGE_INSTANCE=echo-b
           python3 tests/e2e/e2e_usage.py live
+          python3 tests/e2e/e2e_usage.py storage
 
       - name: Instance backup → guarded delete → restore into a new id (real daemon)
         timeout-minutes: 15
@@ -5050,6 +5051,7 @@ jobs:
           done
           python3 tests/e2e/e2e_podman.py
           E2E_RUNTIME=podman python3 tests/e2e/e2e_usage.py live
+          E2E_RUNTIME=podman python3 tests/e2e/e2e_usage.py storage
 
       # V25: the VPN service under rootless Podman, as on Docker: vpn init,
       # wg healthy as 10006 with no capability, one built-in device's
