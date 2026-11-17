@@ -17,8 +17,11 @@
 #   --local       test this working tree instead (uncommitted changes included;
 #                 GITHUB_REF_NAME = its branch, so same-named Hub / Keycloak /
 #                 templates branches are used as in CI)
-#   --keep        keep the container (and its volumes) afterwards for
-#                 `docker exec -it <name> bash`; remove with --cleanup <name>
+#   --keep        keep the container (and its volumes) afterwards, with the
+#                 job's stack as the job left it (no final sanitize), for
+#                 `docker exec -it <name> bash`; remove with --cleanup <name>.
+#                 While it stays, runs of the same job use a throwaway image
+#                 store (never two dockerds on one cache volume)
 #   --no-cache    fresh image store / caches (default: this job's image store
 #                 and the shared pip / Playwright / go-build and Go module
 #                 caches are reused (the Go toolchain is downloaded and
@@ -136,14 +139,19 @@ rm -rf "$ctx"
 # ── volumes: the run's own, and the reused caches ──
 vol() { docker volume create --label "pcci.run=$name" "$name-$1" >/dev/null; echo "$name-$1"; }
 work="$(vol work)" srv="$(vol srv)" tmp="$(vol tmp)"   # /tmp too: a real filesystem (ext4, ACLs), as on GitHub
+if [ "$cache" = true ] && [ -n "$(docker ps -aq --filter "label=pcci.cache=$job")" ]; then
+  echo "run-job: a kept $job container holds its image store ($0 --cleanup <name> frees it): throwaway image store"
+  cache=false
+fi
 if [ "$cache" = true ] && exec 9>"$base/locks/$job.lock" && flock -n 9; then
   dk="pcci-cache-$job-docker" ct="pcci-cache-$job-containerd"
   docker volume create "$dk" >/dev/null; docker volume create "$ct" >/dev/null
   home_cache=(-v pcci-cache-home:/home/runner/.cache -v pcci-cache-gopath:/home/runner/go)
+  cache_label=(--label "pcci.cache=$job")
   echo "run-job: reusing the image store of $job (pcci-cache-$job-*) and the shared caches"
 else
   dk="$(vol docker)" ct="$(vol containerd)"
-  home_cache=()
+  home_cache=() cache_label=()
   echo "run-job: throwaway image store and caches"
 fi
 
@@ -157,7 +165,7 @@ docker network inspect "$name" >/dev/null 2>&1 || die "no free 10.250.x.0/24 net
 # The runner container stands in for a GitHub VM (systemd, its own dockerd):
 # local builder only, never run by CI.
 priv=(--privileged) # reviewed exception
-docker run -d --name "$name" --hostname "pcci-$job" --label "pcci.run=$name" \
+docker run -d --name "$name" --hostname "pcci-$job" --label "pcci.run=$name" "${cache_label[@]}" \
   "${priv[@]}" --cgroupns=private --tmpfs /run --tmpfs /run/lock --network "$name" \
   --cpus "$cpus" --memory "$memory" --memory-swap "$memory" \
   -v "$dk:/var/lib/docker-store" -v "$ct:/var/lib/containerd" -v "$work:/home/runner/work" -v "$srv:/srv" -v "$tmp:/tmp" \
@@ -189,8 +197,14 @@ fi
 rc=0
 docker exec -u runner -w "$w" "${envs[@]}" "$name" python3 /pcci/steps.py --job "$job" --ref-name "$ref_name" --sha "$sha" \
   --input "jobs=$job" --input "scenarios=$scenarios" --input runner=github || rc=$?
-docker exec "$name" pcci-docker-sanitize || true
-if [ "$keep" = true ]; then echo "run-job: kept $name ($0 --cleanup $name)"; fi
+if [ "$keep" = true ]; then
+  # The job's stack stays as the job left it (no sanitize): inspect it.
+  echo "run-job: kept $name, with the job's stack as it ended. Inspect it:"
+  echo "run-job:   docker exec -it -u runner -w $w $name bash    (then docker compose ps / logs …)"
+  echo "run-job: clean up by hand: $0 --cleanup $name"
+else
+  docker exec "$name" pcci-docker-sanitize || true
+fi
 [ -z "$(ls -A "$run/artifacts")" ] || echo "run-job: artifacts in $run/artifacts"
 echo "run-job: $job $([ "$rc" = 0 ] && echo PASSED || echo "FAILED ($rc)") — log $log"
 exit "$rc"
