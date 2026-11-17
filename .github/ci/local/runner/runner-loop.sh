@@ -22,7 +22,7 @@
 # workflow_dispatch of WORKFLOW in REPO by OWNER, before any step runs: the
 # privileged container and the shared caches are acceptable only under that
 # rule. New for every job and removed with the container: the workspace,
-# /srv, the image store (docker + containerd) and the tool cache. Kept per
+# /srv, /tmp (volumes: ext4 with ACLs, as on GitHub), the image store (docker + containerd) and the tool cache. Kept per
 # instance (owner-dispatched jobs only, see the hook): pip / Playwright /
 # go-build (~/.cache) and the Go module cache (~/go; go.sum-verified,
 # GOFLAGS=-mod=readonly).
@@ -38,7 +38,7 @@ api="https://api.github.com/repos/$REPO/actions/runners"
 
 clean() {
   docker rm -f "$c" >/dev/null 2>&1 || true
-  for v in work srv docker containerd tools; do docker volume rm -f "$c-$v" >/dev/null 2>&1 || true; done
+  for v in work srv tmp docker containerd tools; do docker volume rm -f "$c-$v" >/dev/null 2>&1 || true; done
 }
 trap clean EXIT
 clean
@@ -67,11 +67,11 @@ if [ -z "$token" ] || [ "$token" = null ]; then
 fi
 
 docker network inspect "$c" >/dev/null 2>&1 || docker network create --subnet "$SUBNET" "$c" >/dev/null
-for v in home gopath work srv docker containerd tools; do docker volume create "$c-$v" >/dev/null; done
+for v in home gopath work srv tmp docker containerd tools; do docker volume create "$c-$v" >/dev/null; done
 docker run -d --name "$c" --hostname "$c" --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
   --network "$c" -e GOFLAGS=-mod=readonly --cpus "$CPUS" --memory "$MEMORY" --memory-swap "$MEMORY" \
   -v "$c-docker:/var/lib/docker" -v "$c-containerd:/var/lib/containerd" \
-  -v "$c-work:/home/runner/work" -v "$c-srv:/srv" -v "$c-home:/home/runner/.cache" \
+  -v "$c-work:/home/runner/work" -v "$c-srv:/srv" -v "$c-tmp:/tmp" -v "$c-home:/home/runner/.cache" \
   -v "$c-gopath:/home/runner/go" -v "$c-tools:/opt/hostedtoolcache" "$img" >/dev/null
 for i in $(seq 1 90); do
   docker exec "$c" docker info >/dev/null 2>&1 && break
@@ -81,6 +81,7 @@ done
 docker exec "$c" pcci-docker-sanitize
 docker exec "$c" chown runner:runner /home/runner/work /home/runner/.cache /home/runner/go /opt/hostedtoolcache /srv
 docker exec "$c" chmod 0755 /srv
+docker exec "$c" chmod 1777 /tmp
 docker cp "$(dirname "$0")/job-started-hook.sh" "$c:/usr/local/bin/pcci-job-started.sh"
 docker exec "$c" chmod 0755 /usr/local/bin/pcci-job-started.sh
 

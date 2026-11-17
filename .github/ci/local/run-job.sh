@@ -3,7 +3,7 @@
 # the way GitHub's runner does, in its own isolated job container.
 #
 #   .github/ci/local/run-job.sh <job> [--scenario <name>]… [--ref <branch|sha>] [--local <dir>]
-#                               [--keep] [--no-cache] [--cpus N] [--memory SIZE] [--shell]
+#                               [--keep] [--no-cache] [--cpus N] [--memory SIZE] [--timeout-factor F] [--shell]
 #
 #   <job>         a ci.yml job: build-and-test, e2e, e2e-instances, e2e-signin,
 #                 e2e-settings, e2e-folders, e2e-filesharing, e2e-mail, e2e-ai,
@@ -20,10 +20,14 @@
 #   --keep        keep the container (and its volumes) afterwards for
 #                 `docker exec -it <name> bash`; remove with --cleanup <name>
 #   --no-cache    fresh image store / caches (default: this job's image store
-#                 and the shared pip / Playwright / go-build and Go module caches are reused (the Go toolchain is downloaded and sha256-checked every run),
+#                 and the shared pip / Playwright / go-build and Go module
+#                 caches are reused (the Go toolchain is downloaded and
+#                 sha256-checked every run),
 #                 one run of a job at a time; a second concurrent run of the
 #                 same job gets a throwaway store)
 #   --cpus/--memory  the container's limits (default 4 / 16g: a GitHub runner)
+#   --timeout-factor every job / step timeout-minutes times this (default
+#                 1.5: ci.yml's limits are sized for a fresh GitHub runner)
 #   --shell       open a shell in the prepared container instead of the steps
 #
 # How (the same model as e2e-k3s-local.sh's container mode): every run is a
@@ -53,7 +57,7 @@ cleanup_named() { # cleanup_named <container name>: the container, its run volum
   docker network rm "$n" >/dev/null 2>&1 || true
 }
 
-job="" ref=main local_dir="" keep=false cache=true cpus=4 memory=16g shell=false scen=()
+job="" ref=main local_dir="" keep=false cache=true cpus=4 memory=16g shell=false factor=1.5 scen=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --scenario) scen+=("${2:?--scenario needs a name}"); shift 2 ;;
@@ -63,6 +67,7 @@ while [ $# -gt 0 ]; do
     --no-cache) cache=false; shift ;;
     --cpus) cpus="${2:?}"; shift 2 ;;
     --memory) memory="${2:?}"; shift 2 ;;
+    --timeout-factor) factor="${2:?}"; shift 2 ;;
     --shell) shell=true; keep=true; shift ;;
     --cleanup) cleanup_named "${2:?}"; echo "removed $2"; exit 0 ;;
     -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -130,7 +135,7 @@ rm -rf "$ctx"
 
 # ── volumes: the run's own, and the reused caches ──
 vol() { docker volume create --label "pcci.run=$name" "$name-$1" >/dev/null; echo "$name-$1"; }
-work="$(vol work)" srv="$(vol srv)"
+work="$(vol work)" srv="$(vol srv)" tmp="$(vol tmp)"   # /tmp too: a real filesystem (ext4, ACLs), as on GitHub
 if [ "$cache" = true ] && exec 9>"$base/locks/$job.lock" && flock -n 9; then
   dk="pcci-cache-$job-docker" ct="pcci-cache-$job-containerd"
   docker volume create "$dk" >/dev/null; docker volume create "$ct" >/dev/null
@@ -152,7 +157,7 @@ docker network inspect "$name" >/dev/null 2>&1 || die "no free 10.250.x.0/24 net
 docker run -d --name "$name" --hostname "pcci-$job" --label "pcci.run=$name" \
   --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock --network "$name" \
   --cpus "$cpus" --memory "$memory" --memory-swap "$memory" \
-  -v "$dk:/var/lib/docker" -v "$ct:/var/lib/containerd" -v "$work:/home/runner/work" -v "$srv:/srv" \
+  -v "$dk:/var/lib/docker" -v "$ct:/var/lib/containerd" -v "$work:/home/runner/work" -v "$srv:/srv" -v "$tmp:/tmp" \
   "${home_cache[@]}" -v "$run/artifacts:/pcci/artifacts" "$tag" >/dev/null
 for i in $(seq 1 90); do
   docker exec "$name" docker info >/dev/null 2>&1 && break
@@ -162,6 +167,7 @@ done
 docker exec "$name" pcci-docker-sanitize
 docker exec "$name" chown runner:runner /home/runner/work /home/runner/.cache /home/runner/go /opt/hostedtoolcache /srv 2>/dev/null || true
 docker exec "$name" chmod 0755 /srv
+docker exec "$name" chmod 1777 /tmp
 
 w=/home/runner/work/portcullis/portcullis
 docker exec -u runner "$name" mkdir -p "$w" /home/runner/work/_temp
@@ -170,6 +176,7 @@ docker cp "$here/steps.py" "$name:/pcci/steps.py" >/dev/null
 
 scenarios="${scen[*]:-}"
 envs=(-e HOME=/home/runner -e USER=runner -e RUNNER_TEMP=/home/runner/work/_temp -e PCCI_ARTIFACTS=/pcci/artifacts
+      -e "PCCI_TIMEOUT_FACTOR=$factor"
       -e "PCCI_EXTRA_ENV=${scenarios:+E2E_SCENARIOS=$scenarios}")
 if [ "$shell" = true ]; then
   echo "run-job: prepared. Steps: docker exec -it -u runner -w $w ${envs[*]} $name python3 /pcci/steps.py --job $job --ref-name $ref_name"

@@ -9,7 +9,7 @@ for r in portcullis portcullis-hub; do
   systemctl disable --now "pcci-runner@$r.service" 2>/dev/null || true
   c="pcci-runner-$r"
   docker rm -f "$c" >/dev/null 2>&1 || true
-  for v in work srv docker containerd home gopath tools; do docker volume rm -f "$c-$v" >/dev/null 2>&1 || true; done
+  for v in work srv tmp docker containerd home gopath tools; do docker volume rm -f "$c-$v" >/dev/null 2>&1 || true; done
   docker network rm "$c" >/dev/null 2>&1 || true
 done
 rm -f /etc/systemd/system/pcci-runner@.service

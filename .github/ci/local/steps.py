@@ -308,7 +308,11 @@ class Job:
         self.paths: list[str] = []
         self.failed = False
         self.cancelled = False
-        self.deadline = time.time() + float(self.job.get("timeout-minutes", 360)) * 60
+        # PCCI_TIMEOUT_FACTOR (run-job.sh --timeout-factor): every job / step
+        # timeout-minutes times this (a shared host is slower than a fresh
+        # GitHub runner; ci.yml's limits are sized for GitHub).
+        self.factor = float(os.environ.get("PCCI_TIMEOUT_FACTOR") or 1)
+        self.deadline = time.time() + float(self.job.get("timeout-minutes", 360)) * 60 * self.factor
         self.summary = self.temp / "_step_summary.md"
         self.summary.touch()
         self.results: list[tuple[str, str, float]] = []
@@ -415,7 +419,7 @@ class Job:
                 n, _, v = kv.partition("=")
                 self.env[n] = v
         log(f"LOCAL {self.a.job}: {len(self.job.get('steps', []))} steps, ref {self.github['ref_name']} "
-            f"({self.github['sha'][:12]}), timeout {self.job.get('timeout-minutes', 360)} min")
+            f"({self.github['sha'][:12]}), timeout {self.job.get('timeout-minutes', 360)} min × {self.factor:g}")
         self.run_steps(self.job.get("steps", []), {}, None, prefix="")
         log("")
         log(f"LOCAL {self.a.job}: {self.status().upper()}")
@@ -473,7 +477,7 @@ class Job:
         tmo = st.get("timeout-minutes")
         limit = self.deadline - time.time()
         if tmo is not None:
-            limit = min(limit, float(self.sub(tmo, ctx_steps, inputs)) * 60)
+            limit = min(limit, float(self.sub(tmo, ctx_steps, inputs)) * 60 * self.factor)
         if self.cancelled:
             limit = max(limit, 600)  # always() steps after a cancel: 10 min each
         if "run" in st:
