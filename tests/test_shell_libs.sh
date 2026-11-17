@@ -836,7 +836,7 @@ case "$PKI_STATE:$*" in
     case "$PKI_STATE" in
       none) echo '{"secret/":{}}' ;;
       nofile) echo '{"pki/":{},"pki_int/":{}}' ;;
-      *) echo '{"pki/":{},"pki_int/":{},"pki_file/":{}}' ;;
+      *) echo '{"pki/":{},"pki_int/":{},"pki_file/":{},"ssh_user/":{"type":"ssh","config":{"max_lease_ttl":43200}},"ssh_host/":{"type":"ssh","config":{"max_lease_ttl":7776000}}}' ;;
     esac ;;
   complete:list*pki_*/issuers*|norole:list*pki_*/issuers*|samecn:list*pki_*/issuers*) echo '["abc"]' ;;
   nofile:list*pki_int/issuers*) echo '["abc"]' ;;
@@ -860,6 +860,8 @@ case "$PKI_STATE:$*" in
   *:write\ -format=json\ pki_*/intermediate/generate*) echo '{"data":{"csr":"CSR"}}' ;;
   *:write\ -format=json\ pki/root/sign-intermediate*) echo '{"data":{"certificate":"INT"}}' ;;
   *:write\ -format=json\ pki_int/issue/server-cert*) echo '{"data":{"certificate":"SRV","private_key":"KEY"}}' ;;
+  # ssh_setup (contract §18.7): the SSH CAs exist (tests/test_cli.sh has its own cases).
+  *:read\ -field=public_key\ ssh_*/config/ca) echo "ssh-ed25519 AAAAstub" ;;
 esac
 exit 0
 STUB

@@ -82,12 +82,20 @@ path "pki_file/crl/rotate" {
 #
 # What a stolen enroll token can still do on a role (security review,
 # checked live on Vault 2.2.1 by TestLiveSSHVault):
-#   - allowed_users: only "s:…" / "u:…" lists (so never "*", whose bare
-#     value Vault reads as "any principal"); Vault matches every entry
-#     exactly (no glob, an embedded "*" entry isn't a wildcard, live), and
-#     allowed_users_template can't be set. The list's contents (which
-#     principals) can't be pinned here: enroll checks the grammar and the
-#     host group of each, and the Hub compares the read-back.
+#   - allowed_users: NOT a fence for which principals. It is one
+#     comma-joined string and a policy glob sees only its start, so "s:*" /
+#     "u:*" refuse just a bare "*" (Vault's "any principal"); a stolen token
+#     can still write "u:a@x,root" and Vault then signs "root" (live, Vault
+#     2.2.1). Entries are matched exactly (no glob, an embedded "*" entry is
+#     no wildcard, live) and allowed_users_template can't be set. The fence
+#     for bare principals is the host: every Portcullis host's sshd reads
+#     AuthorizedPrincipalsFile for every account, root included, and those
+#     files hold only u:/s: names, so a certificate for "root" or a bare
+#     account name opens nothing (the Hub's real-sshd test, three distros).
+#     A narrower role-writing token can't help: a policy can pin a path's
+#     parameters only to fixed values, and the per-host-group principal
+#     lists change with every grant (it would need a sudo token rewriting
+#     the policy itself).
 #   - default_extensions: only {} (Vault applies a role's defaults without
 #     checking allowed_extensions, so a default could add X11 / user-rc;
 #     enroll sends the extensions map on every sign instead).

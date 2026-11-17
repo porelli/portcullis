@@ -215,6 +215,38 @@ func TestLiveSSHVault(t *testing.T) {
 	refused("u:* isn't a glob in Vault", "ssh_user/sign/hg-glob", signBody("valid_principals", "u:bob@glob"))
 	_, _ = ec.Logical().DeleteWithContext(ctx, "ssh_user/roles/hg-glob")
 
+	// Security review 2: allowed_users is one comma-joined string and the
+	// policy's s:* / u:* globs see only its start, so a stolen enroll token
+	// CAN write a role that lists a bare principal after a u:/s: one, and
+	// Vault then signs it. The fence for this is on the host: every
+	// Portcullis host's sshd uses AuthorizedPrincipalsFile, whose files hold
+	// only u:/s: names (host_sshd_test.go: certificates for "root" and a bare
+	// "alice" are refused on all three distributions).
+	for _, list := range []string{"u:a@sneak,root", "s:x@sneak,*"} {
+		m := sshRoleWrite(sshRoleSpec{Principals: []string{"u:a@sneak"}, Extensions: "permit-pty", SourceAddress: []string{}, MaxTTLSeconds: 3600})
+		m["allowed_users"] = list
+		if _, err := ec.Logical().WriteWithContext(ctx, "ssh_user/roles/hg-sneak", m); err != nil {
+			t.Logf("allowed_users %q: the policy refused the write (%v)", list, err)
+			continue
+		}
+		b := signBody("valid_principals", "root")
+		b["key_id"] = "pc:a:sneak:0123456789abcdef"
+		_, serr := ec.Logical().WriteWithContext(ctx, "ssh_user/sign/hg-sneak", b)
+		switch {
+		case list == "u:a@sneak,root" && serr != nil:
+			t.Errorf("allowed_users %q: Vault refused root (%v); the contract says it signs — update §18.7", list, serr)
+		case list == "s:x@sneak,*" && serr == nil:
+			t.Errorf("allowed_users %q: Vault signed root (an embedded * would be a wildcard)", list)
+		}
+		t.Logf("allowed_users %q: the policy admits the write; signing root: %v", list, func() any {
+			if serr != nil {
+				return "refused"
+			}
+			return "SIGNED (the host's AuthorizedPrincipalsFile is the fence)"
+		}())
+		_, _ = ec.Logical().DeleteWithContext(ctx, "ssh_user/roles/hg-sneak")
+	}
+
 	// An empty principal list signs nothing.
 	_, err = cfg.putSSHRole(ctx, "empty", sshRoleSpec{Principals: []string{}, Extensions: "permit-pty", SourceAddress: []string{}, MaxTTLSeconds: 3600})
 	must(err, "empty role")
