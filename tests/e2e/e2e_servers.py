@@ -162,6 +162,22 @@ def sh(*args, check=True, stdin=None, timeout=900) -> subprocess.CompletedProces
     return p
 
 
+def goto(page: Page, url: str) -> None:
+    """page.goto, retried on Chromium's net::ERR_NETWORK_CHANGED (an
+    instance's network created or removed on the runner, e.g. by a move,
+    aborts in-flight requests). Only for repeatable navigations."""
+    for i in range(3):
+        try:
+            page.goto(url, wait_until="domcontentloaded")
+            if not page.url.startswith("chrome-error://"):
+                return
+        except Exception as e:  # noqa: BLE001
+            if "ERR_NETWORK_CHANGED" not in str(e) or i == 2:
+                raise
+        page.wait_for_timeout(2000)
+    raise AssertionError(f"{url.split('?')[0]}: still a Chromium error page")
+
+
 def fresh_proof(page: Page, label: str) -> dict:
     """The Hub's fresh sign-in (prompt=login, max_age=0, PKCE S256) as the
     Servers page's popup runs it: the proof a † route takes."""
@@ -176,7 +192,7 @@ def fresh_proof(page: Page, label: str) -> dict:
          "code_challenge_method": "S256", "prompt": "login", "max_age": "0"}
     if fa.get("pc_method"):
         q["pc_method"] = fa["pc_method"]
-    page.goto(fa["authorize_url"] + "?" + urllib.parse.urlencode(q), wait_until="domcontentloaded")
+    goto(page, fa["authorize_url"] + "?" + urllib.parse.urlencode(q))
     deadline = time.time() + 60
     while time.time() < deadline:
         for u in seen:
@@ -541,7 +557,7 @@ def revoke_drops_handshake_and_rotates():
     # a fetch() in alice's own page (the browser's cookies and connection
     # handling), read chunk by chunk; its progress polled from the page.
     sp = state["alice_ctx"].new_page()
-    sp.goto(f"https://se1.{DOMAIN}/cgi-bin/echo", wait_until="domcontentloaded")
+    goto(sp, f"https://se1.{DOMAIN}/cgi-bin/echo")
     sp.evaluate("""() => {
       window.__s = {status: null, bytes: 0, first: null, done: null, err: null};
       fetch('/cgi-bin/echo?stream', {credentials: 'same-origin'}).then(async (r) => {
