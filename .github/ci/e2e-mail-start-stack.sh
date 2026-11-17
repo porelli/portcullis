@@ -107,8 +107,7 @@ echo "PASS: $EXTRA enrolled and ready in the Hub"
 # 4. Mail on: mail-cert through the shared zone against Pebble (DNS-01),
 # the resolver forwarding every name to the fake zone. The main domain's
 # address / caa records too (dns-tool, the fake provider).
-./portcullis mail enable --provider stalwart --yes 2>&1 | tee /tmp/mail-enable.out
-[ "${PIPESTATUS[0]}" = 0 ] || fail "mail enable"
+bash .github/ci/mail-enable-logged.sh stalwart /tmp/mail-enable.out || fail "mail enable"
 # Pebble's issuing root (its management API): e2e_mail.py verifies mail's
 # certificate chain against it (E2E_MAIL_CA, with the remote's).
 docker run --rm --network portcullis_domains-egress -v /tmp/pebble.minica.pem:/ca.pem:ro "$CURL_IMG" \

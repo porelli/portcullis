@@ -134,8 +134,7 @@ set -e
 ! grep -q '^PORTCULLIS_MAIL=on$' .env || fail "the refused mail enable opened the slot"
 echo "PASS: mail enable refused while ip_unprivileged_port_start > 25, nothing written"
 sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=25
-./portcullis mail enable --provider stalwart --yes 2>&1 | redact | tee /tmp/mail-enable.out
-[ "${PIPESTATUS[0]}" = 0 ] || fail "mail enable on rootless Podman"
+bash .github/ci/mail-enable-logged.sh stalwart /tmp/mail-enable.out | redact || fail "mail enable on rootless Podman"
 for s in resolver stalwart adapter; do wait_healthy "$s"; done
 [ "$(podman inspect -f '{{.State.ExitCode}}' "$(cid bootstrap)")" = 0 ] || fail "the bootstrap job failed"
 podman logs "$(cid bootstrap)" 2>&1 | grep -q 'bootstrap: done (the base plan, the recovery login refused)' \

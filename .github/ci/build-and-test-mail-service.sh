@@ -161,8 +161,7 @@ setup)
   )
   docker compose --profile ci-mail up -d pebble-mail
   seed_source
-  ./portcullis mail enable --provider stalwart --yes 2>&1 | tee "$ST/enable.out"
-  [ "${PIPESTATUS[0]}" = 0 ] || fail "mail enable"
+  bash .github/ci/mail-enable-logged.sh stalwart "$ST/enable.out" || fail "mail enable"
   hub_mail provider | jq -e --arg i "$INST" '.wired == true and .instance == $i' >/dev/null || fail "not wired: $(hub_mail provider)"
   for s in resolver stalwart adapter; do wait_healthy "$s"; done
   probe_egress "${PROJ}_egress"
