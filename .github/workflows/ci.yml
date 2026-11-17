@@ -2150,6 +2150,8 @@ jobs:
           for i in $(seq 1 40); do
             UP="$(qq 'up == 1' | jq -r '[.data.result[].metric.job] | unique | join(" ")')"
             DOWN="$(qq 'up == 0' | jq -r '[.data.result[].metric.job] | unique | join(" ")')"
+            # The Hub's usage metrics (job hub-usage): this job runs no Hub.
+            [ -n "$(docker compose ps -q hub 2>/dev/null)" ] || DOWN="$(tr ' ' '\n' <<<"$DOWN" | grep -vx hub-usage | xargs)"
             missing=""
             for j in $want; do [[ " $UP " == *" $j "* ]] || missing="$missing $j"; done
             [ -z "$missing" ] && [ -z "$DOWN" ] && break
@@ -2432,6 +2434,15 @@ jobs:
           export E2E_HUB_SECRET HUB_API="http://$HUB_IP:8888" E2E_PEOPLE_API="http://$HUB_IP:8889" E2E_USAGE_INSTANCE=echo-b
           python3 tests/e2e/e2e_usage.py live
           python3 tests/e2e/e2e_usage.py storage
+          # The usage metrics listener (contract §16.2): reachable on
+          # portcullis-metrics-hub only, never from the core network.
+          BB=docker.io/library/busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
+          docker run --rm --network portcullis_portcullis-metrics-hub "$BB" wget -qO- http://hub-metrics:9100/metrics \
+            | grep -q '^portcullis_container_memory_working_set_bytes{' || { echo "FAIL: hub-metrics:9100/metrics on portcullis-metrics-hub"; exit 1; }
+          if docker run --rm --network portcullis_portcullis "$BB" wget -q -T 5 -O /dev/null "http://$HUB_IP:9100/metrics"; then
+            echo "FAIL: the metrics listener answers on the core network"; exit 1
+          fi
+          echo "PASS: usage metrics on portcullis-metrics-hub only"
 
       - name: Instance backup → guarded delete → restore into a new id (real daemon)
         timeout-minutes: 15
