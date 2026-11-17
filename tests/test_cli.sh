@@ -559,10 +559,10 @@ for bad in "nope" "pcj1.a b" ""; do
 done
 
 # Ruling P30: --privileged only in the CI's docker:dind worker (and the
-# local e2e-k3s runner container, never run by CI), each on its line marked
+# local runner containers, e2e-k3s-local, run-job and the builder's runner-loop), each on its line marked
 # "# reviewed exception"; never privileged: true in a compose file.
-expect_eq "--privileged only in .github/ci/e2e-servers-worker.sh (and e2e-k3s-local.sh), next to # reviewed exception; no privileged: true anywhere" \
-  "$(git -C "$ROOT_DIR_SOCK" grep -n -e '--privileged' -e 'privileged: *true' -- . ':!tests/test_cli.sh' ':!*.md' | grep -vE '^\.github/ci/(e2e-servers-worker|e2e-k3s-local)\.sh:[0-9]+:.*--privileged.*# reviewed exception$' || true)" ""
+expect_eq "--privileged only in .github/ci/e2e-servers-worker.sh (and the local runner containers), next to # reviewed exception; no privileged: true anywhere" \
+  "$(git -C "$ROOT_DIR_SOCK" grep -n -e '--privileged' -e 'privileged: *true' -- . ':!tests/test_cli.sh' ':!*.md' | grep -vE '^\.github/ci/(e2e-servers-worker|e2e-k3s-local|local/run-job|local/runner/runner-loop)\.sh:[0-9]+:.*--privileged.*# reviewed exception$' || true)" ""
 expect_eq "the dind worker's privileged run is there (the exception the lint above allows)" \
   "$(grep -c -- '--privileged.*# reviewed exception$' "$ROOT_DIR_SOCK/.github/ci/e2e-servers-worker.sh")" 1
 expect_eq "worker join: an install under /root (the agent can't traverse it) → refused" \

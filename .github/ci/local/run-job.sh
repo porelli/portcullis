@@ -154,8 +154,11 @@ for _ in $(seq 1 50); do
 done
 docker network inspect "$name" >/dev/null 2>&1 || die "no free 10.250.x.0/24 network"
 
+# The runner container stands in for a GitHub VM (systemd, its own dockerd):
+# local builder only, never run by CI.
+priv=(--privileged) # reviewed exception
 docker run -d --name "$name" --hostname "pcci-$job" --label "pcci.run=$name" \
-  --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock --network "$name" \
+  "${priv[@]}" --cgroupns=private --tmpfs /run --tmpfs /run/lock --network "$name" \
   --cpus "$cpus" --memory "$memory" --memory-swap "$memory" \
   -v "$dk:/var/lib/docker-store" -v "$ct:/var/lib/containerd" -v "$work:/home/runner/work" -v "$srv:/srv" -v "$tmp:/tmp" \
   "${home_cache[@]}" -v "$run/artifacts:/pcci/artifacts" "$tag" >/dev/null
