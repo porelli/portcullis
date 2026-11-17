@@ -630,8 +630,9 @@ def main() -> int:
             set_reach(["builtin"])
             try:
                 until("the tailnet refused under via builtin", lambda: ts_get("alice", cookie_file=state["alice_cookie"])[0] == 403, 120)
-                r = tunnel(state["alice_conf"], cookie_file=state["alice_cookie"])
-                assert r.get("status") == 200, f"the built-in under via builtin: {r.get('status')}"
+                # The reach change recreates the app: the built-in opens once
+                # it's back (no single-shot request during the restart).
+                until("the built-in under via builtin", lambda: tunnel(state["alice_conf"], cookie_file=state["alice_cookie"]).get("status") == 200, 60)
             finally:
                 set_reach(["*"])
             until("the tailnet back under via *", lambda: opens(*ts_get("alice", cookie_file=state["alice_cookie"])), 120)
