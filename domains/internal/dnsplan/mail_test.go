@@ -520,3 +520,25 @@ func TestApplyFailedSetDoesNotStopTheOthers(t *testing.T) {
 		t.Fatalf("MX %v", got)
 	}
 }
+
+// M5: any provider's DKIM selector (one DNS label) is accepted and owned
+// by the set (so a stale one is cleaned up); a dotted selector is not.
+func TestMailAnyDKIMSelector(t *testing.T) {
+	const e = "team-b.example.test"
+	recs := []MailRecord{
+		{Name: e, Type: "MX", TTL: 3600, Value: "10 " + mh + "."},
+		{Name: "google._domainkey." + e, Type: "TXT", TTL: 300, Value: rsaTXT()},
+		{Name: "s1._domainkey." + e, Type: "TXT", TTL: 300, Value: rsaTXT()},
+	}
+	if err := ValidateMail(e, recs); err != nil {
+		t.Fatalf("a non-mailctl selector refused: %v", err)
+	}
+	for _, n := range []string{"google._domainkey." + e, "s1._domainkey." + e, "selector_2._domainkey." + e} {
+		if !MailNameOwned(e, n) {
+			t.Errorf("%s not owned by the mail set", n)
+		}
+	}
+	if MailNameOwned(e, "a.b._domainkey."+e) {
+		t.Error("a dotted selector is owned")
+	}
+}
