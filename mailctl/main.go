@@ -168,6 +168,7 @@ func serve(env func(string) string, stderr io.Writer) error {
 	runner.MailctlIP = cfg.MailIP
 	runner.DQSKeyFile = cfg.DQSKeyFile
 	mc := machines.New(sw, st, machinesConfig(cfg), logger.Printf)
+	runner.OnApplied = mc.Trigger
 	ck := &checks.Runner{D: checks.Deps{C: sw, M: mc, Store: st, Cfg: checksConfig(cfg), DNS: resolve.Query, Logf: logger.Printf},
 		OnResult: func(r checks.Result) {
 			vals := map[string]float64{}

@@ -694,3 +694,27 @@ func selfSigned(t *testing.T, host string, notAfter time.Time) *x509.Certificate
 	}
 	return c
 }
+
+// The next pass: 5 minutes, but 30 s while a DKIM key waits for its
+// records (activation follows publication without a 5-minute lag).
+func TestLoopWaitShortWhilePending(t *testing.T) {
+	e := newEnv(t, nil)
+	if w := e.m.loopWait(); w != 5*time.Minute {
+		t.Fatalf("no keys: %v", w)
+	}
+	e.step(t)
+	if w := e.m.loopWait(); w != PendingRecheck {
+		t.Fatalf("keys pending: %v", w)
+	}
+	for _, k := range e.keys("example.com") {
+		e.vis[dkim.Name(k)+"|"+dkim.TXT(k)] = true
+	}
+	for _, k := range e.keys("team-b.example.org") {
+		e.vis[dkim.Name(k)+"|"+dkim.TXT(k)] = true
+	}
+	e.now = t0.Add(time.Hour)
+	e.step(t)
+	if w := e.m.loopWait(); w != 5*time.Minute {
+		t.Fatalf("all active: %v (%+v)", w, read[dkim.State](e.st.Get(), extDKIM).Keys)
+	}
+}

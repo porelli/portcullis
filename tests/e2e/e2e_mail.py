@@ -595,10 +595,11 @@ def dns_diagnostics() -> None:
             if k.get("domain") != EXTRA:
                 continue
             name = f"{k['selector']}._domainkey.{EXTRA}"
-            for srv in (["-p", "5353", "@127.0.0.1"], ["-p", "8053", "@172.30.87.53"]):
-                out = docker("exec", pcid("resolver"), "drill", *srv, "TXT", name, check_rc=False)
-                ans = [ln for ln in out.splitlines() if "\tTXT\t" in ln or "rcode" in ln]
-                print(f"    drill {srv[-1]} {name}: {ans[:3]}", flush=True)
+            # The template resolver (mailctl's only resolver here; the fake
+            # zone itself is in fakezone-extra.json).
+            out = docker("exec", pcid("resolver"), "drill", "-p", "5353", "@127.0.0.1", "TXT", name, check_rc=False)
+            ans = [ln for ln in out.splitlines() if "\tTXT\t" in ln or "rcode" in ln]
+            print(f"    drill the template resolver {name}: {ans[:3]}", flush=True)
             print(f"    mailctl wants: v=DKIM1; k={k['algorithm']}; p={k.get('public_key', '')[:24]}… (id {k.get('id') or '-'}, {k.get('stage')})", flush=True)
         print("    diagnostics saved: hub-domains.json, mail-status.json, domains-extra.json, fakezone-extra.json, mailctl-view.json", flush=True)
         for ln in p.stdout.splitlines()[:1]:

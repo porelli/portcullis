@@ -122,7 +122,22 @@ func (m *Machines) Trigger() {
 	}
 }
 
-// Loop runs a pass every 5 minutes and on Trigger.
+// PendingRecheck: the pass interval while a DKIM key waits for its
+// records (a few TXT lookups).
+const PendingRecheck = 30 * time.Second
+
+// loopWait: 5 minutes, PendingRecheck while a DKIM key is pending.
+func (m *Machines) loopWait() time.Duration {
+	for _, k := range read[dkim.State](m.Store.Get(), extDKIM).Keys {
+		if k.Stage == dkim.Pending {
+			return PendingRecheck
+		}
+	}
+	return 5 * time.Minute
+}
+
+// Loop runs a pass every 5 minutes (PendingRecheck while a DKIM key is
+// pending) and on Trigger.
 func (m *Machines) Loop(ctx context.Context) {
 	for {
 		if err := m.Step(ctx); err != nil && m.Logf != nil {
@@ -132,7 +147,7 @@ func (m *Machines) Loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-m.wake:
-		case <-time.After(5 * time.Minute):
+		case <-time.After(m.loopWait()):
 		}
 	}
 }

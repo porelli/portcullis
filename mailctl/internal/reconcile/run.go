@@ -38,7 +38,10 @@ type Runner struct {
 	DQSKeyFile string
 	Now        func() time.Time
 	Logf       func(string, ...any)
-	wake       chan struct{}
+	// OnApplied: called after a pass applied a new generation (mailctl
+	// wakes its machines: a new domain's DKIM keys at once).
+	OnApplied func()
+	wake      chan struct{}
 	// pass serialises a whole pass with the API's credential creates
 	// (LockPass): a create never lands on an account a pass is parking.
 	pass sync.Mutex
@@ -113,14 +116,18 @@ func (r *Runner) Once(ctx context.Context) error {
 		msg = []string{logx.Redact(err.Error())}
 	}
 	gen := p.Doc.Generation
+	applied := false
 	if uerr := r.Store.Update(func(s *state.Persistent) error {
 		s.Errors = msg
 		if err == nil && s.Doc != nil && s.Doc.Generation == gen {
+			applied = s.AppliedGeneration != gen
 			s.AppliedGeneration = gen
 		}
 		return nil
 	}); uerr != nil && err == nil {
 		err = uerr
+	} else if uerr == nil && applied && r.OnApplied != nil {
+		r.OnApplied()
 	}
 	return err
 }

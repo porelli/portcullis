@@ -761,3 +761,30 @@ func TestSweepParkedExports(t *testing.T) {
 		t.Fatalf("records after expiry %v", recs)
 	}
 }
+
+// A pass that applies a new generation calls OnApplied (mailctl wakes the
+// DKIM / MTA-STS machines: a fresh document's keys start at once, not at
+// the machines' next 5-minute tick); a drift pass of the same generation
+// doesn't.
+func TestOnAppliedOncePerGeneration(t *testing.T) {
+	e := newEnv(t)
+	n := 0
+	e.r.OnApplied = func() { n++ }
+	d := baseDoc(t)
+	e.mustApply(d)
+	if n != 1 {
+		t.Fatalf("after the first apply: %d calls", n)
+	}
+	if err := e.r.Once(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("a drift pass called OnApplied: %d", n)
+	}
+	d2 := baseDoc(t)
+	d2.Generation = d.Generation + 1
+	e.mustApply(d2)
+	if n != 2 {
+		t.Fatalf("after a new generation: %d calls", n)
+	}
+}
