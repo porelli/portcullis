@@ -92,7 +92,6 @@ services:
       - {type: bind, source: ./secrets/domains/api-secret, target: /run/portcullis/domains/api-secret, read_only: true, bind: {selinux: z}}
       - {type: bind, source: ./secrets/mcp-gate/hub-secret, target: /run/portcullis/mcp-gate/hub-secret, read_only: true, bind: {selinux: z}}
       - {type: bind, source: ./secrets/mcp-gate/age.pub, target: /run/portcullis/mcp-gate/age.pub, read_only: true, bind: {selinux: Z}}
-      - {type: bind, source: ./secrets/mail/hub-secret, target: /run/portcullis/mail/hub-secret, read_only: true, bind: {selinux: z}}
       - {type: bind, source: ./group-gate/group-gate-map.conf, target: /project/group-gate/group-gate-map.conf, read_only: true, bind: {selinux: z}}
 
   enroll:
@@ -139,20 +138,3 @@ services:
   wg:
     volumes:
       - {type: bind, source: ./secrets/wg/people.key, target: /run/portcullis/wg/people.key, read_only: true, bind: {selinux: Z}}
-
-  mail:
-    volumes:
-      - {type: bind, source: ./secrets/mail/metrics-secret, target: /run/portcullis/mail/metrics-secret, read_only: true, bind: {selinux: Z}}
-      - {type: bind, source: ./secrets/mail/relay-password, target: /run/portcullis/mail/relay-password, read_only: true, bind: {selinux: Z}}
-      - {type: bind, source: ./secrets/mail/gate, target: /run/portcullis/mail/gate, read_only: true, bind: {selinux: Z}}
-
-  mailctl:
-    volumes:
-      - {type: bind, source: ./secrets/mail/api-key, target: /run/portcullis/mail/api-key, read_only: true, bind: {selinux: Z}}
-      - {type: bind, source: ./secrets/mail/hub-secret, target: /run/portcullis/mail/hub-secret, read_only: true, bind: {selinux: z}}
-      - {type: bind, source: ./secrets/mail/dqs-key, target: /run/portcullis/mail/dqs-key, read_only: true, bind: {selinux: Z}}
-      - {type: bind, source: ./secrets/mail/mailctl-metrics-secret, target: /run/portcullis/mail/metrics-secret, read_only: true, bind: {selinux: Z}}
-
-  mail-resolver:
-    volumes:
-      - {type: bind, source: ./mail/unbound.conf, target: /etc/unbound/custom.conf, read_only: true, bind: {selinux: Z}}

@@ -7,7 +7,7 @@ cluster check's result (portcullis-cluster-check, written by the CLI at
 every up / upgrade) is read-only at /run/portcullis/cluster-check. */ -}}
 {{- $d := include "portcullis.domain" . -}}
 {{- $s := dict
-  "name" "hub" "uid" .Values.uids.hub "gid" .Values.uids.hub "groups" (list .Values.uids.vpnDoc)
+  "name" "hub" "uid" .Values.uids.hub "gid" .Values.uids.hub "groups" (list .Values.uids.vpnDoc .Values.uids.mailProvider)
   "memory" "1Gi" "nets" (list "portcullis" "portcullis-domains" "portcullis-mcp") "egress" true
   "token" true "serviceAccount" "portcullis-hub" "grace" 60
   "hashes" (list "portcullis-env" "secrets-hub" "secrets-hub-lldap" "secrets-hub-invite" "secrets-domains" "secrets-mcp-gate" "config-group-gate")

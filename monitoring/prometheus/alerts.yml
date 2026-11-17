@@ -148,7 +148,8 @@ groups:
             Its devices are denied until the Hub publishes a fresh map (the identity
             hook fails or the gateway is down). See the instance's VPN tab in the Hub.
 
-      # Mail (profile mail, contract §19.8): mailctl's gauges (job mailctl).
+      # Mail (contract §19.8): the wired provider's contract gauges (job
+      # mail-provider); MailCertExpiring is core's textfile metric.
       - alert: MailQueueHigh
         expr: portcullis_mail_queue_messages > 100
         for: 30m

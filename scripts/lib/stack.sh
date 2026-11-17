@@ -524,7 +524,7 @@ stack_up() {
   env_require PORTCULLIS_DOMAIN $CORE_SECRETS
   require_cmd docker jq curl
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
-  ! mail_profile_on || mail_refuse_kube
+  ! mail_slot_open || mail_refuse_kube
   runtime_check
   runtime_require_host
   rt_network_check
@@ -563,7 +563,7 @@ upgrade_run() {
   # shellcheck disable=SC2086
   env_require PORTCULLIS_DOMAIN $CORE_SECRETS
   [ -s "$VAULT_INIT_FILE" ] || fail "Vault was never initialised ($VAULT_INIT_FILE missing). Run ./portcullis init."
-  ! mail_profile_on || mail_refuse_kube
+  ! mail_slot_open || mail_refuse_kube
   runtime_check
   runtime_require_host
   rt_network_check

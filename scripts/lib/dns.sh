@@ -68,7 +68,7 @@ _dns_tool_input() {
     --argjson caa "$caa" --arg issuer "${DNS_CAA_ISSUER:-}" --arg uri "${DNS_ACCOUNT_URI:-}" --arg iodef "${DNS_CAA_IODEF:-}" \
     --argjson nomail "$nomail" --arg sets "${DNS_SETS:-}" --arg mail "${ALERT_SMTP_FROM:-}" \
     --arg mailrecs "${DNS_MAIL_RECORDS:-}" --arg mailhost "${MAIL_HOSTNAME:-mail.$PORTCULLIS_DOMAIN}" \
-    --argjson mailon "$(declare -F mail_profile_on >/dev/null && mail_profile_on && echo true || echo false)" \
+    --argjson mailon "$(declare -F mail_slot_open >/dev/null && mail_slot_open && echo true || echo false)" \
     --argjson former "$(declare -F mail_former_hosts_json >/dev/null && mail_former_hosts_json || echo '[]')" '
     {name: $name, ipv4: $ipv4, ipv6: $ipv6, ca_server: $ca,
      caa: {enabled: $caa, issuer: $issuer, account_uri: $uri, iodef: $iodef},
@@ -226,7 +226,7 @@ _dns_default_sets() {
 _dns_mail_records() {
   local out
   [ -z "${DNS_MAIL_RECORDS:-}" ] || return 0
-  mail_profile_on || return 0
+  mail_slot_open || return 0
   if out="$(rt_exec mailctl -- mailctl dns --main --json 2>/dev/null)" \
     && DNS_MAIL_RECORDS="$(printf '%s' "$out" | jq -ce '.records | arrays')"; then
     export DNS_MAIL_RECORDS

@@ -42,6 +42,9 @@ uids:
   mcpGate: 10005
   wg: 10006
   vpnDoc: 10007
+  # The mail-provider group (CT_GID_MAIL_PROVIDER): the Hub's group_add as
+  # on Docker; the mail slot itself is Docker / Podman only (§19.12).
+  mailProvider: 2000
   nobody: 65534
   grafana: 472
 

@@ -17,11 +17,11 @@ APPS_NS = "portcullis-apps"
 EDGE_NS = "portcullis-edge"
 STORAGE_NS = "portcullis-storage"
 # Compose services with no Kubernetes form (the Roles replace the socket
-# proxies; mail is Docker / Podman only, contract §19.12).
-ABSENT = {"socket-proxy-traefik", "socket-proxy-hub", "mail", "mailctl", "mail-resolver", "mail-cert"}
+# proxies; the mail slot is Docker / Podman only, contract §19.12).
+ABSENT = {"socket-proxy-traefik", "socket-proxy-hub", "mail-cert"}
 # Compose networks with no Kubernetes form.
 ABSENT_NETS = {"socket-proxy-traefik", "socket-proxy-hub",
-               "portcullis-mail", "portcullis-mailctl", "portcullis-metrics-mail", "mail-egress"}
+               "portcullis-mail-api", "portcullis-metrics-mail"}
 # The VPN networks: port-bound rules only (netpol-wg-edge.yaml), K7.
 VPN_NETS = {"portcullis-vpn", "portcullis-vpn-edge", "portcullis-metrics-wg"}
 

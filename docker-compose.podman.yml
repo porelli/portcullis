@@ -32,12 +32,6 @@ services:
     restart: always
   lldap:
     restart: always
-  mail:
-    restart: always
-  mail-resolver:
-    restart: always
-  mailctl:
-    restart: always
   mcp-gate:
     restart: always
   postgres:

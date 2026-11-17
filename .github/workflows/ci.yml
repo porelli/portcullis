@@ -312,7 +312,7 @@ jobs:
         run: docker compose version && jq --version && yq --version
       - name: compose files are valid with a generated .env
         run: bash .github/ci/unit-tests-compose-files-are-valid-generated.sh
-      - name: mail profile wiring (networks, addresses, mounts, users, caps, pins; contract §19.1)
+      - name: mail slot wiring (portcullis-mail-api, mail_slot, the Hub's group 2000; contract §19.1)
         run: bash .github/ci/unit-tests-mail-wiring.sh
 
       - name: every image is pinned tag@sha256 (all compose files, all profiles, CLI, workflows)

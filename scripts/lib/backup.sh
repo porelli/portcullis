@@ -42,12 +42,12 @@ BACKUP_RESTIC_IMAGE="docker.io/restic/restic:0.19.1@sha256:136600b6ff6843d61d355
 # is emptied by restore (contract §11.6: a restored hash could revive a
 # leaked password). It is handled separately in cmd_restore.
 BACKUP_FILE_VOLUMES="lldap_data:$CT_UID_LLDAP:$CT_UID_LLDAP hub_data:$CT_UID_HUB:$CT_UID_HUB traefik_acme:0:0 domains_data:$CT_UID_DOMAINS:$CT_UID_DOMAINS mcp_gate_data:$CT_UID_MCP_GATE:$CT_UID_HUB group_gate_data:$CT_UID_GROUP_GATE:$CT_UID_HUB"
-# Mail (profile mail): mailctl's state, the mail certificate's ACME account
-# and files are plain files, archived online (in BACKUP_FILE_VOLUMES, so a
-# missing volume is skipped); Stalwart's store (RocksDB) and its config are
-# archived with mail stopped (M11, _backup_mail_data).
-BACKUP_FILE_VOLUMES="$BACKUP_FILE_VOLUMES mailctl_data:$CT_UID_MAILCTL:$CT_UID_MAILCTL mail_acme:$CT_UID_DOMAINS:$CT_UID_DOMAINS mail_tls:$CT_UID_DOMAINS:$CT_UID_MAIL"
-BACKUP_MAIL_STOPPED_VOLUMES="mail_data:$CT_UID_MAIL:$CT_UID_MAIL mail_etc:$CT_UID_MAIL:$CT_UID_MAIL"
+# Mail (contract §19.11): the mail certificate's ACME account, key and
+# tlsa.json and its files are plain files, archived online (in
+# BACKUP_FILE_VOLUMES, so a missing volume is skipped; links preserved).
+# The provider's store is its instance's (a Hub instance backup).
+BACKUP_FILE_VOLUMES="$BACKUP_FILE_VOLUMES mail_acme:$CT_UID_DOMAINS:$CT_UID_DOMAINS mail_tls:$CT_UID_DOMAINS:$CT_GID_MAIL_PROVIDER"
+BACKUP_MAIL_STOPPED_VOLUMES=""
 # restic: fixed host + path, so snapshots of every run form one series.
 BACKUP_RESTIC_HOST="portcullis"
 BACKUP_SNAPSHOT_PATH="/portcullis-backup"
