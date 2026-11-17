@@ -28,6 +28,10 @@ monitoring/textfile/*
 # Hub-written settings data files (see hub volumes in docker-compose.yml)
 appfiles/
 .hub/
+# A worker server's agent data and generated folder-root binds (./portcullis worker)
+/worker-data/
+/docker-compose.worker.roots.yml
+/docker-compose.worker.override.yml
 !certs/.gitkeep
 !traefik/dynamic/local/.gitkeep
 

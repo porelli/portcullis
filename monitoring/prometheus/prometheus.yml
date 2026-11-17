@@ -62,6 +62,27 @@ scrape_configs:
   - job_name: wg
     file_sd_configs:
       - files: [/etc/portcullis/wg-targets.json]
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'wg_link_.*|portcullis_agent_.*'
+        action: drop
+      # A server-labelled series is a worker's (job link's), never wg's own:
+      # nothing a worker returns reaches the families the alerts read.
+      - source_labels: [server]
+        regex: '.+'
+        action: drop
+
+  # Multiple servers (contract §17.2): the link role's own metrics and the
+  # worker agents' (fetched over the tunnel by wg, labelled server=<id>),
+  # from the same wg target as job wg (one process, ruling P25); each job
+  # keeps only its own families.
+  - job_name: link
+    file_sd_configs:
+      - files: [/etc/portcullis/wg-targets.json]
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'wg_link_.*|portcullis_agent_.*'
+        action: keep
 
   # The wired mail provider (contract §19.8, P7): the Hub writes
   # mail_slot/mail-targets.json (file_sd; [] while nothing is wired, so

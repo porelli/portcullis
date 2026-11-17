@@ -44,7 +44,7 @@ func TestStatusDocument(t *testing.T) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatal(err)
 	}
-	if got := keys(m); !reflect.DeepEqual(got, []string{"edge", "mode", "people", "version", "written"}) {
+	if got := keys(m); !reflect.DeepEqual(got, []string{"edge", "link", "mode", "people", "version", "written"}) {
 		t.Fatalf("top keys %v", got)
 	}
 	if m["version"].(float64) != 1 || m["written"] != "2026-11-13T10:00:00Z" {
@@ -72,6 +72,9 @@ func TestStatusDocument(t *testing.T) {
 	json.Unmarshal(b, &m)
 	if v, ok := m["people"]; !ok || v != nil {
 		t.Fatalf("people must be null when off: %v", m["people"])
+	}
+	if v, ok := m["link"]; !ok || v != nil {
+		t.Fatalf("link must be null when off: %v", m["link"])
 	}
 
 	// Run writes at once and every interval.

@@ -159,7 +159,10 @@ type inviteService struct {
 	issueYubiKey func(ctx context.Context, user, csrPEM string) (*yubiKeyCertResult, error)
 	renewYubiKey func(ctx context.Context, user, presentedPEM, csrPEM string) (*yubiKeyCertResult, error)
 	revoke       func(ctx context.Context, user, serial string) error
-	now          func() time.Time
+	// Node certificates (nodes.go, contract §17); nil = 503.
+	signNode   func(ctx context.Context, role, cn, csrPEM string) (*nodeCertResult, error)
+	revokeNode func(ctx context.Context, serial string) error
+	now        func() time.Time
 
 	mu          sync.Mutex
 	invites     map[string]*invite     // sha256(token) → invite
@@ -828,6 +831,8 @@ func (s *inviteService) apiHandler(local bool) http.Handler {
 		m.HandleFunc("POST /internal/yubikey-certificates", s.handleYubiKeyIssue)
 		m.HandleFunc("POST /internal/yubikey-certificates/renew", s.handleYubiKeyRenew)
 		m.HandleFunc("POST /internal/certificates/revoke", s.handleRevoke)
+		m.HandleFunc("POST /internal/nodes/sign", s.handleNodeSign)
+		m.HandleFunc("POST /internal/nodes/revoke", s.handleNodeRevoke)
 	}
 	return m
 }
