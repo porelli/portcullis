@@ -17,25 +17,47 @@ WG_CID="$(docker compose ps -q wg)"
 docker inspect "$WG_CID" | jq -e '.[0] | .Config.User == "10006:10006"
     and (.HostConfig.CapAdd // [] | length) == 0 and .HostConfig.CapDrop == ["ALL"]
     and (.HostConfig.Privileged | not) and (.HostConfig.Devices // [] | length) == 0
-    and .HostConfig.GroupAdd == ["10007"] and .HostConfig.ReadonlyRootfs
+    and .HostConfig.GroupAdd == ["10007", "10009"] and .HostConfig.ReadonlyRootfs
     and ([.Mounts[] | select(.Source | test("docker\\.sock|podman\\.sock"))] == [])
     and (.State.Health.Status == "healthy")' >/dev/null \
   || { echo "FAIL: wg container: $(docker inspect "$WG_CID" | jq -c '.[0] | {User: .Config.User, CapAdd: .HostConfig.CapAdd, GroupAdd: .HostConfig.GroupAdd, Health: .State.Health.Status}')"; docker compose logs --tail=40 wg; exit 1; }
 docker compose exec -T wg sh -c 'id -u; id -G; stat -c "%a %u %g" /data /data/status.json' > /tmp/wg-ids.txt
-[ "$(cat /tmp/wg-ids.txt | tr '\n' '|')" = "10006|10006 10007|2750 10006 10001|640 10006 10001|" ] \
+[ "$(cat /tmp/wg-ids.txt | tr '\n' '|')" = "10006|10006 10007 10009|2750 10006 10001|640 10006 10001|" ] \
   || { echo "FAIL: wg's ids / wg_data modes: $(cat /tmp/wg-ids.txt | tr '\n' '|')"; exit 1; }
 for i in $(seq 1 40); do
   docker compose exec -T wg /wg status | jq -e '.version == 1 and .people.ok and .edge.ok and (.people.public_key | length) == 44
-      and .people.port == 51820 and .people.subnet == "10.213.0.0/22" and .people.mtu == 1280' >/dev/null 2>&1 && break
+      and .people.port == 51820 and .people.subnet == "10.213.0.0/22" and .people.mtu == 1280 and .link == null' >/dev/null 2>&1 && break
   [ "$i" -eq 40 ] && { echo "FAIL: wg status: $(docker compose exec -T wg /wg status)"; docker compose logs --tail=40 wg hub; exit 1; }
   sleep 3
 done
 # The Hub reads status.json read-only through group 10001, never the engine.
-docker compose exec -T hub sh -c 'test -r /wg-data/status.json && ! test -w /wg-data/status.json && test -w /vpn-doc' \
+docker compose exec -T hub sh -c 'test -r /wg-data/status.json && ! test -w /wg-data/status.json && test -w /vpn-doc && test -w /link-doc' \
   || { echo "FAIL: the Hub's wg_data / vpn_doc access"; exit 1; }
 # The people key: 0640 group 10006, never printed (a 44-character base64 key).
 [ "$(stat -c '%a %g %s' secrets/wg/people.key)" = "640 10006 45" ] || { echo "FAIL: people.key $(stat -c '%a %g %s' secrets/wg/people.key)"; exit 1; }
-echo "PASS: vpn init: wg healthy as 10006 (group 10007 only), no capability / device / privilege, wg_data 2750 10006:10001, status.json 0640 group 10001, the people role on"
+echo "PASS: vpn init: wg healthy as 10006 (groups 10007, 10009 only), link null while off, no capability / device / privilege, wg_data 2750 10006:10001, status.json 0640 group 10001, the people role on"
+
+# The link role (contract §17.2): link init on the same wg — the key, the
+# TLS key and the link.control certificate (pki_node), link's status up on
+# its port with no peer, link_doc 2750 10001:10009.
+./portcullis link init
+grep -qx 'PORTCULLIS_LINK=on' .env || { echo "FAIL: link init did not write PORTCULLIS_LINK=on"; exit 1; }
+for i in $(seq 1 40); do
+  docker compose exec -T wg /wg status | jq -e '.link.ok and .link.port == 51821 and (.link.public_key | length) == 44 and .link.peers == []' >/dev/null 2>&1 && break
+  [ "$i" -eq 40 ] && { echo "FAIL: link status: $(docker compose exec -T wg /wg status | jq -c .link)"; docker compose logs --tail=40 wg; exit 1; }
+  sleep 3
+done
+[ "$(stat -c '%a %g' secrets/wg/link.key secrets/wg/link-tls.key secrets/wg/link-tls.crt | sort -u)" = "640 10006" ] \
+  || { echo "FAIL: link key files: $(stat -c '%n %a %g' secrets/wg/link*)"; exit 1; }
+openssl x509 -in secrets/wg/link-tls.crt -noout -subject -nameopt RFC2253 | grep -qx 'subject=CN=link.control' \
+  && openssl verify -CAfile certs/node-ca.crt -purpose sslclient secrets/wg/link-tls.crt >/dev/null \
+  && ! openssl verify -CAfile certs/ca-chain.crt secrets/wg/link-tls.crt >/dev/null 2>&1 \
+  || { echo "FAIL: link-tls.crt is not a link.control client cert under the node CA alone"; exit 1; }
+docker run --rm -v portcullis_link_doc:/d:ro "${ALPINE:-docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a}" stat -c '%a %u %g' /d | grep -qx '2750 10001 10009' \
+  || { echo "FAIL: link_doc owner / mode"; exit 1; }
+./portcullis link status --json | jq -e '.enabled and .up and .problem == false and .port == 51821' >/dev/null \
+  || { echo "FAIL: link status --json: $(./portcullis link status --json)"; exit 1; }
+echo "PASS: link init: link up on 51821 with its own key, link.control signed by pki_node only, link_doc 2750 10001:10009, link status up"
 
 # A whoami on both entrypoints (no middleware): it echoes what a backend gets.
 cat > /tmp/ci-vpnecho.yml <<'YML'

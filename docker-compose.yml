@@ -99,6 +99,26 @@ networks:
   # Prometheus → wg's metrics only (monitoring profile + profile wg).
   portcullis-metrics-wg:
     internal: true
+  # Multiple servers (contract §17.2): link's CONNECT listeners, never in
+  # its netstack. portcullis-link: exactly the Hub and wg, both pinned (the
+  # Hub's control path to the workers' agents, wg's :3128). No egress.
+  # network.sh validates PORTCULLIS_LINK_*.
+  portcullis-link:
+    name: portcullis-link
+    internal: true
+    ipam:
+      config:
+        - subnet: ${PORTCULLIS_LINK_NET:-172.31.254.80/29}
+  # portcullis-link-data: wg pinned (its data CONNECT :3129) and the
+  # instances' relays (the Hub's relay projects, from the dynamic range).
+  # No egress; core puts nothing else on it.
+  portcullis-link-data:
+    name: portcullis-link-data
+    internal: true
+    ipam:
+      config:
+        - subnet: ${PORTCULLIS_LINK_DATA_NET:-172.31.254.128/26}
+          ip_range: ${PORTCULLIS_LINK_DATA_IP_RANGE:-172.31.254.160/27}
   # Mail (profile mail, contract §19.1). portcullis-mail: mail, mailctl and
   # mail-resolver only, pinned outside the dynamic range (Stalwart's
   # management listener trusts mailctl's address there; its API key is
@@ -928,7 +948,7 @@ services:
       # subnets, = network.sh vpn_reserved_ranges (the Hub's core.env
       # PORTCULLIS_VPN_RESERVED_RANGES; CI compares). vpn.json naming one is
       # refused whole.
-      GATE_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28} ${PORTCULLIS_MAIL_SUBNET:-172.31.255.0/28} ${PORTCULLIS_MAILCTL_SUBNET:-172.31.255.16/28} ${PORTCULLIS_VPN_RUNTIME_POOLS:-}"
+      GATE_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28} ${PORTCULLIS_MAIL_SUBNET:-172.31.255.0/28} ${PORTCULLIS_MAILCTL_SUBNET:-172.31.255.16/28} ${PORTCULLIS_LINK_NET:-172.31.254.80/29} ${PORTCULLIS_LINK_DATA_NET:-172.31.254.128/26} ${PORTCULLIS_VPN_RUNTIME_POOLS:-}"
       # Required: core hosts are <sub>.<PORTCULLIS_DOMAIN> (map.conf) and
       # app hosts <label>.<PORTCULLIS_DOMAIN> or on an enrolled domain
       # (policy v5 extra_domains); any other X-Forwarded-Host is denied.
@@ -1120,6 +1140,14 @@ services:
       # bearer secret from a file (an empty one = mail is off).
       HUB_MAILCTL_API_URL: http://mailctl:8080
       HUB_MAILCTL_SECRET_FILE: /run/portcullis/mail/hub-secret
+      # Multiple servers (contract §17): link.json goes to link_doc (group
+      # 10009, read by wg only); the workers' agents through link's control
+      # CONNECT; each placed instance's relays run this image. Servers is
+      # off while link's status says the role is off.
+      HUB_LINK_DOC_DIR: /link-doc
+      HUB_LINK_DOC_GID: "10009"
+      HUB_LINK_PROXY: ${PORTCULLIS_LINK_WG_IP:-172.31.254.83}:3128
+      HUB_RELAY_IMAGE: ${RELAY_IMAGE:-ghcr.io/porelli/portcullis-relay:edge}
     volumes:
       - .:/project:ro
       # Writable overlay: before every `compose up` the Hub copies each app's
@@ -1171,6 +1199,9 @@ services:
       # vpn.json (contract §4/§16): written by the Hub only (0640, group
       # 10007, read by wg and group-gate).
       - vpn_doc:/vpn-doc
+      # link.json (contract §17.2): written by the Hub only (0640, group
+      # 10009, read by wg).
+      - link_doc:/link-doc
       # Per-person secrets (contract §6): file-share password hashes, never
       # backed up, emptied by restore. The Hub checks ownership (10001:10001
       # 0700) at start; ./portcullis init/upgrade/restore ensure it.
@@ -1185,8 +1216,12 @@ services:
       # The Hub → mailctl's API (contract §19.5), at this pinned address.
       portcullis-mailctl:
         ipv4_address: ${PORTCULLIS_MAILCTL_HUB_IP:-172.31.255.18}
-    # vpn.json's group (vpn_doc, 10007): shared with wg and group-gate only.
-    group_add: ["10007"]
+      # The Hub → link's control CONNECT (contract §17.2), at this pinned address.
+      portcullis-link:
+        ipv4_address: ${PORTCULLIS_LINK_HUB_IP:-172.31.254.82}
+    # vpn.json's group (vpn_doc, 10007): shared with wg and group-gate only;
+    # link.json's (link_doc, 10009): shared with wg only.
+    group_add: ["10007", "10009"]
     mem_limit: 1g
     pids_limit: 512
     labels:
@@ -1498,10 +1533,11 @@ services:
     image: portcullis-wg
     <<: *hardening
     profiles: [wg]
-    # Its own uid and group, plus 10007 for vpn.json (vpn_doc); never the
-    # Hub's 10001, no hub_data: it is the internet-exposed service.
+    # Its own uid and group, plus 10007 for vpn.json (vpn_doc) and 10009
+    # for link.json (link_doc); never the Hub's 10001, no hub_data: it is
+    # the internet-exposed service.
     user: "10006:10006"
-    group_add: ["10007"]
+    group_add: ["10007", "10009"]
     read_only: true
     environment:
       WG_VPN_FILE: /vpn-doc/vpn.json
@@ -1516,7 +1552,7 @@ services:
       # the link subnet 10.214.0.0/24; under podman ending in Podman's pools
       # 10.88.0.0/16 10.89.0.0/16, PORTCULLIS_VPN_RUNTIME_POOLS from the CLI;
       # = GATE_CORE_SUBNETS).
-      WG_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28} ${PORTCULLIS_MAIL_SUBNET:-172.31.255.0/28} ${PORTCULLIS_MAILCTL_SUBNET:-172.31.255.16/28} ${PORTCULLIS_VPN_RUNTIME_POOLS:-}"
+      WG_CORE_SUBNETS: "${PORTCULLIS_PROXY_SUBNET:-172.31.250.0/24} ${PORTCULLIS_AUTH_SUBNET:-172.31.251.0/28} ${PORTCULLIS_DOMAINS_SUBNET:-172.31.252.0/28} ${PORTCULLIS_MCP_SUBNET:-172.31.253.0/28} ${PORTCULLIS_VPN_NET:-172.31.254.0/26} ${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28} ${PORTCULLIS_MAIL_SUBNET:-172.31.255.0/28} ${PORTCULLIS_MAILCTL_SUBNET:-172.31.255.16/28} ${PORTCULLIS_LINK_NET:-172.31.254.80/29} ${PORTCULLIS_LINK_DATA_NET:-172.31.254.128/26} ${PORTCULLIS_VPN_RUNTIME_POOLS:-}"
       WG_TRAEFIK: ${PORTCULLIS_VPN_EDGE_TRAEFIK_IP:-172.31.254.66}:8443
       WG_DNS_UPSTREAM: ${PORTCULLIS_VPN_DNS_UPSTREAM:-1.1.1.1,9.9.9.9}
       WG_DOMAIN: ${PORTCULLIS_DOMAIN:-portcullis.local}
@@ -1533,10 +1569,29 @@ services:
       WG_EDGE_MAX_PER_CLIENT: ${PORTCULLIS_VPN_EDGE_MAX_PER_CLIENT:-32}
       WG_EDGE_PRESSURE_PERCENT: ${PORTCULLIS_VPN_EDGE_PRESSURE_PERCENT:-90}
       WG_EDGE_PRESSURE_IDLE: ${PORTCULLIS_VPN_EDGE_PRESSURE_IDLE:-2m}
+      # The link role (multiple servers, contract §17; ./portcullis link
+      # init): the workers' tunnel on its own port (10.214.0.0/24, fixed),
+      # link.json from link_doc, the two CONNECT listeners at wg's pinned
+      # addresses, the link.control certificate for the agents' metrics
+      # (CA certs/node-ca.crt). An empty link.key means the role is off.
+      WG_LINK: ${PORTCULLIS_LINK:-off}
+      WG_LINK_KEY: /run/portcullis/wg/link.key
+      WG_LINK_PORT: ${PORTCULLIS_LINK_PORT:-51821}
+      WG_LINK_FILE: /link-doc/link.json
+      WG_LINK_CONTROL_ADDR: ${PORTCULLIS_LINK_WG_IP:-172.31.254.83}:3128
+      WG_LINK_DATA_ADDR: ${PORTCULLIS_LINK_DATA_WG_IP:-172.31.254.130}:3129
+      WG_LINK_TLS_KEY: /run/portcullis/wg/link-tls.key
+      WG_LINK_TLS_CERT: /run/portcullis/wg/link-tls.crt
+      WG_LINK_CA: /run/portcullis/wg/node-ca.crt
     volumes:
       - vpn_doc:/vpn-doc:ro
+      - link_doc:/link-doc:ro
       - wg_data:/data
       - ./secrets/wg/people.key:/run/portcullis/wg/people.key:ro
+      - ./secrets/wg/link.key:/run/portcullis/wg/link.key:ro
+      - ./secrets/wg/link-tls.key:/run/portcullis/wg/link-tls.key:ro
+      - ./secrets/wg/link-tls.crt:/run/portcullis/wg/link-tls.crt:ro
+      - ./certs/node-ca.crt:/run/portcullis/wg/node-ca.crt:ro
     networks:
       portcullis-vpn:
         ipv4_address: ${PORTCULLIS_VPN_WG_IP:-172.31.254.3}
@@ -1545,8 +1600,15 @@ services:
       wg-egress: {}
       portcullis-metrics-wg:
         aliases: [wg-metrics]
+      portcullis-link:
+        ipv4_address: ${PORTCULLIS_LINK_WG_IP:-172.31.254.83}
+      portcullis-link-data:
+        ipv4_address: ${PORTCULLIS_LINK_DATA_WG_IP:-172.31.254.130}
     ports:
       - "${PORTCULLIS_VPN_PORT:-51820}:${PORTCULLIS_VPN_PORT:-51820}/udp"
+      # The workers' tunnel (closed while the link role is off). The same
+      # number inside: link's status reports it for the join codes.
+      - "${PORTCULLIS_LINK_PORT:-51821}:${PORTCULLIS_LINK_PORT:-51821}/udp"
     healthcheck:
       test: ["CMD", "/wg", "healthcheck"]
       interval: 10s
@@ -1986,6 +2048,10 @@ volumes:
   # read by wg and group-gate through group 10007. Regenerated by the Hub
   # from its state: not backed up.
   vpn_doc:
+  # link.json (contract §17.2): written by the Hub (10001:10009, 2750),
+  # read by wg through group 10009. Regenerated by the Hub from its state:
+  # not backed up.
+  link_doc:
   # Mail (contract §19.1): Stalwart's store and its store-only config.json
   # (2000:2000, mail only), the mail certificate (10004:2000 2750, read-only
   # in mail) and its ACME account + reused key (10004:10004 0700, mail-cert

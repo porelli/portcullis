@@ -53,3 +53,15 @@ func TestResolveFlag(t *testing.T) {
 		t.Fatal("bad --resolve accepted")
 	}
 }
+
+func TestParsePorts(t *testing.T) {
+	got, err := parsePorts("22, 80,7000-7002,80")
+	if err != nil || len(got) != 5 || got[0] != 22 || got[4] != 7002 {
+		t.Fatalf("parsePorts: %v %v", got, err)
+	}
+	for _, bad := range []string{"", "0", "70000", "9-3", "x", "1-"} {
+		if _, err := parsePorts(bad); err == nil {
+			t.Errorf("parsePorts(%q) accepted", bad)
+		}
+	}
+}

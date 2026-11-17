@@ -192,6 +192,7 @@ func (s *Stack) resyncLocked() {
 type peerState struct {
 	key       [32]byte
 	sec, nsec int64
+	rx, tx    int64
 }
 
 func (p peerState) handshake() time.Time {
@@ -231,6 +232,10 @@ func parsePeers(cfg string) []peerState {
 			out[len(out)-1].sec = n
 		case "last_handshake_time_nsec":
 			out[len(out)-1].nsec = n
+		case "rx_bytes":
+			out[len(out)-1].rx = n
+		case "tx_bytes":
+			out[len(out)-1].tx = n
 		}
 	}
 	return out
@@ -246,6 +251,25 @@ func (s *Stack) Handshakes() (map[string]time.Time, error) {
 	out := map[string]time.Time{}
 	for _, p := range parsePeers(cfg) {
 		out[KeyString(p.key)] = p.handshake()
+	}
+	return out, nil
+}
+
+// PeerStat is one peer's last handshake (zero when none) and byte counts.
+type PeerStat struct {
+	Handshake time.Time
+	Rx, Tx    int64
+}
+
+// PeerStats maps each peer's base64 public key to its PeerStat.
+func (s *Stack) PeerStats() (map[string]PeerStat, error) {
+	cfg, err := s.dev.IpcGet()
+	if err != nil {
+		return nil, errors.New("tunnel: device state unreadable")
+	}
+	out := map[string]PeerStat{}
+	for _, p := range parsePeers(cfg) {
+		out[KeyString(p.key)] = PeerStat{Handshake: p.handshake(), Rx: p.rx, Tx: p.tx}
 	}
 	return out, nil
 }

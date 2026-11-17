@@ -1,12 +1,16 @@
 // Command wg is Portcullis' VPN service (contract §16): the edge (the only
-// PROXY v2 client of Traefik's vpnsecure entrypoint) and the built-in
-// people VPN role, on userspace WireGuard (wireguard-go + gVisor
-// netstack): no capability, no TUN device. It reads /vpn-doc/vpn.json (the
-// vpn_doc volume; Hub-written, public data only) and writes wg_data/status.json.
+// PROXY v2 client of Traefik's vpnsecure entrypoint), the built-in
+// people VPN role and the link role for worker servers (contract §17), on
+// userspace WireGuard (wireguard-go + gVisor netstack): no capability, no
+// TUN device. It reads /vpn-doc/vpn.json (the vpn_doc volume) and
+// /link-doc/link.json (the link_doc volume; both Hub-written, public data
+// only) and writes wg_data/status.json.
 //
 //	wg run            the service
 //	wg genkey <path>  write a new private key into <path> in place (0640); prints nothing
 //	wg keypair        {"private_key","public_key"} on stdout (the host CLI only)
+//	wg genkey-tls <path>  write a new P-256 key (PKCS#8 PEM) into <path> in place (0640); prints nothing
+//	wg link-csr       a CSR for CN link.control (key WG_LINK_TLS_KEY) on stdout
 //	wg qr             stdin text → terminal QR code on stdout
 //	wg healthcheck    exit 0 while status.json is fresh
 //	wg status         print status.json
@@ -50,6 +54,8 @@ const usage = `usage: wg <command>
   run              run the service (environment WG_*)
   genkey <path>    write a new private key into <path> (0640); prints nothing
   keypair          print {"private_key","public_key"} (for the host CLI)
+  genkey-tls <path>  write a new P-256 TLS key into <path> (0640); prints nothing
+  link-csr         print a CSR for CN link.control (key: WG_LINK_TLS_KEY)
   qr               read text on stdin, print a terminal QR code
   healthcheck      exit 0 while the status file is fresh
   status           print the status file
@@ -81,6 +87,28 @@ func cli(args []string, stdin io.Reader, stdout, stderr io.Writer, getenv func(s
 			fmt.Fprintf(stderr, "wg genkey: %v\n", err)
 			return 1
 		}
+		return 0
+	case "genkey-tls":
+		if len(rest) != 1 {
+			fmt.Fprint(stderr, "usage: wg genkey-tls <path>\n")
+			return 2
+		}
+		if err := genkeyTLS(rest[0]); err != nil {
+			fmt.Fprintf(stderr, "wg genkey-tls: %v\n", err)
+			return 1
+		}
+		return 0
+	case "link-csr":
+		if len(rest) != 0 {
+			fmt.Fprint(stderr, "usage: wg link-csr\n")
+			return 2
+		}
+		b, err := linkCSR(envOr(getenv, "WG_LINK_TLS_KEY", defaultLinkTLSKey))
+		if err != nil {
+			fmt.Fprintf(stderr, "wg link-csr: %v\n", err)
+			return 1
+		}
+		stdout.Write(b)
 		return 0
 	case "keypair":
 		if len(rest) != 0 {
@@ -244,6 +272,70 @@ type config struct {
 	// The edge's connection caps and pressure eviction (contract §16).
 	MaxPerProvider, MaxPerUser, MaxPerClient, PressurePercent int
 	PressureIdle                                              time.Duration
+	// The link role (contract §17).
+	Link                                bool
+	LinkKey, LinkFile                   string
+	LinkPort                            int
+	LinkControl, LinkData               netip.AddrPort
+	LinkTLSKey, LinkTLSCert, LinkCAFile string
+}
+
+const (
+	defaultLinkTLSKey  = "/run/portcullis/wg/link-tls.key"
+	defaultLinkTLSCert = "/run/portcullis/wg/link-tls.crt"
+	defaultLinkCA      = "/run/portcullis/wg/node-ca.crt"
+)
+
+// linkConfig reads WG_LINK (on|off, default off) and, when on, the role's
+// key, port, document, the two CONNECT listener addresses (required:
+// wg's own IPv4 addresses on portcullis-link and portcullis-link-data,
+// different from each other and from the VPN ones) and the link.control
+// certificate files. The tunnel subnet is fixed (10.214.0.0/24, ruling P3).
+// Kubernetes (WG_ADDR_MODE=pod) has no link role: refused.
+func linkConfig(getenv func(string) string, c *config) error {
+	switch v := envOr(getenv, "WG_LINK", "off"); v {
+	case "on":
+		c.Link = true
+	case "off":
+		return nil
+	default:
+		return errors.New("WG_LINK must be on or off")
+	}
+	if c.AddrMode == "pod" {
+		return errors.New("WG_LINK=on needs WG_ADDR_MODE=docker (servers need a Docker or Podman primary)")
+	}
+	c.LinkKey = envOr(getenv, "WG_LINK_KEY", "/run/portcullis/wg/link.key")
+	c.LinkFile = envOr(getenv, "WG_LINK_FILE", "/link-doc/link.json")
+	c.LinkTLSKey = envOr(getenv, "WG_LINK_TLS_KEY", defaultLinkTLSKey)
+	c.LinkTLSCert = envOr(getenv, "WG_LINK_TLS_CERT", defaultLinkTLSCert)
+	c.LinkCAFile = envOr(getenv, "WG_LINK_CA", defaultLinkCA)
+	p, err := strconv.Atoi(envOr(getenv, "WG_LINK_PORT", "51821"))
+	if err != nil || p < 1 || p > 65535 || (c.People && p == c.Port) {
+		return errors.New("WG_LINK_PORT must be a port number other than WG_PORT")
+	}
+	c.LinkPort = p
+	addr := func(k, what string) (netip.AddrPort, error) {
+		a, err := netip.ParseAddrPort(getenv(k))
+		if err != nil || !a.Addr().Is4() || a.Port() == 0 || a.Addr().IsUnspecified() || a.Addr().IsLoopback() {
+			return netip.AddrPort{}, fmt.Errorf("%s must be wg's <ipv4>:<port> on %s", k, what)
+		}
+		return a, nil
+	}
+	if c.LinkControl, err = addr("WG_LINK_CONTROL_ADDR", "portcullis-link"); err != nil {
+		return err
+	}
+	if c.LinkData, err = addr("WG_LINK_DATA_ADDR", "portcullis-link-data"); err != nil {
+		return err
+	}
+	for _, a := range []netip.Addr{c.LinkControl.Addr(), c.LinkData.Addr()} {
+		if a == c.VPNAddr || a == c.EdgeAddr {
+			return errors.New("WG_LINK_CONTROL_ADDR / WG_LINK_DATA_ADDR must be on their own networks (not a VPN address)")
+		}
+	}
+	if c.LinkControl.Addr() == c.LinkData.Addr() {
+		return errors.New("WG_LINK_CONTROL_ADDR and WG_LINK_DATA_ADDR must be on different networks")
+	}
+	return nil
 }
 
 // edgeLimits reads WG_EDGE_MAX_PER_PROVIDER / _USER / _CLIENT,
@@ -373,6 +465,9 @@ func loadConfig(getenv func(string) string) (*config, error) {
 		c.Metrics = m
 	}
 	if err := edgeLimits(getenv, c); err != nil {
+		return nil, err
+	}
+	if err := linkConfig(getenv, c); err != nil {
 		return nil, err
 	}
 	return c, nil
@@ -550,8 +645,13 @@ func serve(ctx context.Context, cfg *config) error {
 		}()
 	}
 
+	lr := startLink(ctx, cfg, reg)
+	var gatherer prometheus.Gatherer = reg
+	if lr != nil && lr.gatherer != nil {
+		gatherer = prometheus.Gatherers{reg, lr.gatherer}
+	}
 	if cfg.Metrics != "" {
-		go serveMetrics(ctx, cfg, reg)
+		go serveMetrics(ctx, cfg, gatherer)
 	}
 
 	build := func() status.Doc {
@@ -598,6 +698,10 @@ func serve(ctx context.Context, cfg *config) error {
 			roleUp.WithLabelValues("people").Set(b2f(p.OK))
 			peersG.Set(float64(len(p.Peers)))
 		}
+		if lr != nil {
+			st.Link = lr.status()
+			roleUp.WithLabelValues("link").Set(b2f(st.Link.OK))
+		}
 		return st
 	}
 	if err := status.CheckDir(filepath.Dir(cfg.StatusFile)); err != nil {
@@ -616,7 +720,7 @@ func b2f(b bool) float64 {
 	return 0
 }
 
-func serveMetrics(ctx context.Context, cfg *config, reg *prometheus.Registry) {
+func serveMetrics(ctx context.Context, cfg *config, reg prometheus.Gatherer) {
 	var addr netip.AddrPort
 	var err error
 	for i := 0; i < 30; i++ {
@@ -635,7 +739,7 @@ func serveMetrics(ctx context.Context, cfg *config, reg *prometheus.Registry) {
 		return
 	}
 	mux := http.NewServeMux()
-	mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+	mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{ErrorHandling: promhttp.ContinueOnError}))
 	srv := &http.Server{Addr: addr.String(), Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { <-ctx.Done(); srv.Close() }()
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

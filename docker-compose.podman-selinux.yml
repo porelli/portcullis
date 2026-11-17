@@ -139,6 +139,11 @@ services:
   wg:
     volumes:
       - {type: bind, source: ./secrets/wg/people.key, target: /run/portcullis/wg/people.key, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/wg/link.key, target: /run/portcullis/wg/link.key, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/wg/link-tls.key, target: /run/portcullis/wg/link-tls.key, read_only: true, bind: {selinux: Z}}
+      - {type: bind, source: ./secrets/wg/link-tls.crt, target: /run/portcullis/wg/link-tls.crt, read_only: true, bind: {selinux: Z}}
+      # certs/ is Traefik's too (z).
+      - {type: bind, source: ./certs/node-ca.crt, target: /run/portcullis/wg/node-ca.crt, read_only: true, bind: {selinux: z}}
 
   mail:
     volumes:

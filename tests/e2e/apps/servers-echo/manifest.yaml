@@ -1,0 +1,36 @@
+# CI-only template for the e2e-servers jobs (.github/workflows/ci.yml): a
+# cookie echo behind Portcullis sign-in, placed on a worker server. Not a
+# marketplace template: the job hands it to the Hub as a local source.
+name: Servers echo
+description: Cookie echo (CI)
+category: misc
+instances: multi
+auth:
+  method: forward-auth
+  group_access: true
+  access_group: users_servers-echo
+  admin_group: admin_servers-echo
+urls:
+  - label: Echo
+    url: "https://{{HOST_SECHO}}/cgi-bin/echo"
+# A data file (contract §13.7: 0640 group 10001 on the primary and on a
+# worker): the CGI reports whether the app reads it (group_add 10001).
+files:
+  - {name: people, service: web, mount: /portcullis}
+settings:
+  options:
+    - key: seats
+      label: Seats
+      description: Written to people.json for each person with access.
+      type: int
+      min: 1
+      max: 100
+      scope: person
+      default: 1
+      resolve: max
+      applies: restart
+      delivery: [{file: {name: people}}]
+
+# AI support (contract §3.2, required in every manifest): a CI fixture.
+ai:
+  unsupported: "A CI test fixture with no app API for an AI to act through"

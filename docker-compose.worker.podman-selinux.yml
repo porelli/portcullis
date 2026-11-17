@@ -1,0 +1,24 @@
+# Rootless Podman workers on SELinux-enforcing hosts only (added by the CLI
+# after docker-compose.worker.podman.yml). Never on Docker, never by hand.
+#
+# label=disable on exactly two services (tests/test_cli.sh checks it):
+#   socket-proxy-agent  mounts the engine socket, as the primary's proxies;
+#   agent               reads this checkout, the engine's data root and the
+#                       folder roots read-only, comparing them by device and
+#                       inode. Relabelling those would be harmful (the
+#                       checkout holds .env; ruling M2: never a label on a
+#                       folder root), and the agent already drives the engine
+#                       through its proxy (root-equivalent for this user), so
+#                       SELinux confinement would add little.
+# The app containers the agent starts keep normal SELinux labelling: nothing
+# here reaches them (the agent injects no label option).
+# worker-data is the agent's alone (Z). Release gate: checked by hand on
+# Fedora / RHEL (CLAUDE.md).
+
+services:
+  socket-proxy-agent:
+    security_opt: ["label=disable"]
+  agent:
+    security_opt: ["label=disable"]
+    volumes:
+      - {type: bind, source: ./worker-data, target: "${PORTCULLIS_WORKER_DATA:?}", read_only: false, bind: {selinux: Z}}
