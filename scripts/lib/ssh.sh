@@ -148,8 +148,8 @@ ssh_breakglass_cert() {
   got="$(printf '%s\n' "$info" | awk '/^[[:space:]]*Principals:/ {p = 1; next} /^[[:space:]]*Critical Options:/ {p = 0} p {sub(/^[[:space:]]+/, ""); print}')"
   [ "$got" = "$principal" ] || fail "Vault's certificate names other principals"
   rec="$(jq -cn --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg u "$name" --arg hg "$hg" --arg p "$principal" --arg fp "$fp" \
-      --arg s "$serial" --arg vb "${vb}Z" --arg n "$note" \
-      '{time: $t, user: $u, host_group: $hg, principals: [$p], key_fp: $fp, serial: $s, valid_before: $vb, note: $n}')"
+      --arg s "$serial" --arg vb "${vb}Z" --arg n "$note" --arg pk "$pub" \
+      '{time: $t, user: $u, host_group: $hg, principals: [$p], key_fp: $fp, serial: $s, valid_before: $vb, note: $n, public_key: $pk}')"
   # Appended to the record ./portcullis up made (group 10001 for the Hub);
   # made here if missing (then `up` gives the Hub its group).
   if [ ! -f "$PORTCULLIS_ROOT/$SSH_BREAKGLASS_FILE_REL" ]; then

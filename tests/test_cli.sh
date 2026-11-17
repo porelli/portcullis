@@ -2040,8 +2040,8 @@ expect_eq "ssh breakglass-cert: the sign body (principal, ttl, permit-pty map, k
   "$(jq -c '[.valid_principals, .ttl, .extensions, .key_id, (.public_key | startswith("ssh-ed25519 "))]' "$WORK/bg-stdin")" \
   '["u:alice@web","3600s",{"permit-pty":""},"pc-breakglass:outage",true]'
 expect_eq "ssh breakglass-cert: the record line (serial, principal, fingerprint, note) in secrets/ssh/breakglass.jsonl" \
-  "$(jq -c '[.user, .host_group, .principals, .serial, (.key_fp | startswith("SHA256:")), .note, (.valid_before | endswith("Z"))]' "$BG_ROOT/secrets/ssh/breakglass.jsonl")" \
-  '["alice","web",["u:alice@web"],"4242",true,"outage",true]'
+  "$(jq -c '[.user, .host_group, .principals, .serial, (.key_fp | startswith("SHA256:")), .note, (.valid_before | endswith("Z")), (.public_key | startswith("ssh-ed25519 "))]' "$BG_ROOT/secrets/ssh/breakglass.jsonl")" \
+  '["alice","web",["u:alice@web"],"4242",true,"outage",true,true]'
 expect_eq "ssh breakglass-cert: the record 0640, its directory 0750" "$(file_mode "$BG_ROOT/secrets/ssh/breakglass.jsonl"):$(file_mode "$BG_ROOT/secrets/ssh")" "640:750"
 for bad in "--user alice --account deploy --host-group web --ttl 1h --key $WORK/bg-user.pub" \
            "--host-group web --ttl 1h --key $WORK/bg-user.pub" \

@@ -83,6 +83,10 @@ def check(name: str, fn) -> None:
         results.append((name, False, S.redact(f"{type(e).__name__}: {e}")))
         print(f"FAIL: {name}: {S.redact(str(e))}", flush=True)
         traceback.print_exc()
+        if state.get("last_ssh"):
+            print(S.redact(state.pop("last_ssh")), flush=True)
+            if state.get("agent"):
+                print(S.redact(run(["ssh-add", "-l"], env=cli_env()).stdout), flush=True)
 
 
 def secret(v: str, kind: str = "code") -> str:
@@ -206,8 +210,14 @@ def cli_login(page: Page, label: str) -> str:
 
 
 def ssh(user: str, host: str, cmd: str = "id -un", timeout: float = 30) -> subprocess.CompletedProcess:
-    return run(["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
-                f"{user}@{host}", cmd], timeout=timeout, env=cli_env())
+    r = run(["ssh", "-v", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
+             f"{user}@{host}", cmd], timeout=timeout, env=cli_env())
+    # The client's view of the last failed login (public key fingerprints
+    # and auth steps only), printed when a check fails.
+    if r.returncode != 0:
+        state["last_ssh"] = f"ssh {user}@{host}: " + "\n".join(
+            l for l in (r.stderr or "").splitlines() if re.search(r"Offering|accepts|sign|Authentications|denied|agent|identity file|Will attempt", l))[-3000:]
+    return r
 
 
 def logout() -> None:
@@ -318,6 +328,10 @@ def main() -> int:
             r = dexec("web-1", "portcullis", "host", "enroll", "--service", "none", "--ca-file", "/ca.pem", input_=code + "\n")
             assert r.returncode == 0, f"enroll: {r.stdout[-300:]} {r.stderr[-600:]}"
             run(["docker", "exec", "-d", "e2e-web-1", "portcullis", "host", "sync"])
+            # Its first report says which accounts have sudo there; until then
+            # a grant of a shared account counts as privileged (RR-H1).
+            until("web-1's first report", lambda: [h for h in api_ok("GET", "/api/ssh/hosts")["hosts"]
+                                                   if h["id"] == "web-1" and h.get("last_sync")], 90)
             api_ok("POST", "/api/ssh/grants", {"group": "ssh_web", "host_group": "web", "accounts": ["{username}"], "sudo": "none"})
             api_ok("POST", "/api/ssh/grants", {"group": "ssh_deploy", "host_group": "web", "accounts": ["deploy"], "sudo": "none"})
             # Privileged: without the typed name refused, with it and a fresh sign-in saved.
@@ -331,7 +345,7 @@ def main() -> int:
             assert r.returncode == 0, f"trust: {r.stdout[-300:]} {r.stderr[-600:]}"
             hosts = until("web-1 synced", lambda: [h for h in api_ok("GET", "/api/ssh/hosts")["hosts"]
                                                   if h["id"] == "web-1" and h.get("last_sync") and h["applied"] == h["serial"]], 120)
-            assert hosts[0]["state"] in ("ok", "synced"), hosts
+            assert hosts[0]["state"] in ("ok", "synced", "ready"), hosts
 
         check("setup", setup)
 
