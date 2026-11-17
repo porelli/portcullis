@@ -98,10 +98,18 @@ case "$kind" in
     fi
     for i in $(seq 1 30); do
       asworker docker version --format '{{json .Server.Components}}' >/dev/null 2>&1 && break
+      if [ "$i" -eq 10 ]; then
+        # Diagnostics, then the socket's service by hand (the unit stays
+        # enabled, which is what the host checks read).
+        echo "::warning::$WUSER's podman.socket doesn't answer after 20 s: $(asworker systemctl --user is-active podman.socket 2>&1 | head -1)"
+        sudo ls -la "/run/user/$(id -u "$WUSER")" "/run/user/$(id -u "$WUSER")/podman" 2>&1 | tail -8
+        asworker systemctl --user status podman.socket --no-pager 2>&1 | tail -8 || true
+        asworker sh -c 'mkdir -p "$XDG_RUNTIME_DIR/podman" && setsid nohup podman system service --time=0 "unix://$XDG_RUNTIME_DIR/podman/podman.sock" >"$HOME/podman-service.log" 2>&1 < /dev/null &'
+      fi
       if [ "$i" -eq 30 ]; then
         echo "FAIL: $WUSER's Podman socket doesn't answer"
-        asworker docker version 2>&1 | tail -5
-        asworker systemctl --user status podman.socket podman.service --no-pager 2>&1 | tail -20
+        asworker docker version 2>&1 | tail -3
+        sudo tail -20 "/home/$WUSER/podman-service.log" 2>/dev/null || true
         exit 1
       fi
       sleep 2
