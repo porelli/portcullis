@@ -56,4 +56,35 @@ sed "s/__FAKEDNS__/$fakedns/" tests/e2e/mail/unbound-ci.conf > "$T/unbound/unbou
 grep -q '"drill-hc", "-p", "5353", "@127.0.0.1", "dnssec.works"' "$T/compose.yml" \
   || { echo "::error::$T/compose.yml: the resolver's health check changed (dnssec.works)"; exit 1; }
 sed -i "s/\"@127.0.0.1\", \"dnssec.works\"/\"@127.0.0.1\", \"$probe\"/" "$T/compose.yml"
+# e2e-mail (MAIL_CI_EGRESS="<subnet> <stalwart's address>"): the egress
+# network's subnet pinned and stalwart's address on it (the remote mail
+# server and the fake zone's records name it).
+if [ -n "${MAIL_CI_EGRESS:-}" ]; then
+  read -r esub eip <<<"$MAIL_CI_EGRESS"
+  [[ "$esub" =~ ^[0-9.]+/[0-9]+$ && "$eip" =~ ^[0-9.]+$ ]] || { echo "::error::MAIL_CI_EGRESS must be '<subnet> <address>'"; exit 1; }
+  ESUB="$esub" EIP="$eip" python3 - "$T/compose.yml" <<'PY'
+import os, sys
+p = sys.argv[1]
+lines = open(p).read().split("\n")
+svc, out, done = None, [], {"svc": False, "net": False}
+for ln in lines:
+    if ln.startswith("  ") and not ln.startswith("   ") and ln.rstrip().endswith(":"):
+        svc = ln.strip()[:-1]
+    if ln and not ln.startswith((" ", "#")):
+        svc = None if ln.strip() != "networks:" else "networks"
+    if svc == "stalwart" and ln == "      egress: {}":
+        out += ["      egress:", "        ipv4_address: " + os.environ["EIP"]]
+        done["svc"] = True
+        continue
+    if ln == "  egress: {}":
+        out += ["  egress:", "    ipam:", "      config:", "        - subnet: " + os.environ["ESUB"]]
+        done["net"] = True
+        continue
+    out.append(ln)
+if not all(done.values()):
+    sys.exit("the template's egress lines changed: %r" % done)
+open(p, "w").write("\n".join(out))
+PY
+  echo "PASS: stalwart template: egress $esub, stalwart at $eip"
+fi
 echo "PASS: stalwart template: adapter image portcullis-mailctl:ci, resolver → $fakedns:8053 (probe $probe)"

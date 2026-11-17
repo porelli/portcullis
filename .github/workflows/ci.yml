@@ -3900,12 +3900,15 @@ jobs:
           docker compose down -v
           sudo rm -rf "$E2E_FAMILY"
 
-  # Mail end to end (contract §19, mail plan Task 12): the whole stack + the
-  # Hub (same-named Hub branch) + domains (Pebble, the fake provider with
-  # ONE fake zone: the domains service serves it, the dns tool and
-  # mail-cert write into it over DOMAINS_FAKEDNS_REMOTE) and the enrolled
-  # team-b.test; mail on for ci.example.org and team-b.test; a second
-  # Stalwart (remote.test, .github/ci/e2e-mail-remote.sh) on mail-egress.
+  # Mail end to end (contract §19; mail provider plan Task 27): the whole
+  # stack + the Hub (same-named Hub branch) + domains (Pebble, the fake
+  # provider with ONE fake zone: the domains service serves it, the dns
+  # tool and mail-cert write into it over DOMAINS_FAKEDNS_REMOTE) and the
+  # enrolled team-b.test; the stalwart template wired (`mail enable
+  # --provider stalwart`, the templates checkout as the Hub's source with
+  # the CI-only mail-fake); mail on for ci.example.org and team-b.test; a
+  # second Stalwart (remote.test, .github/ci/e2e-mail-remote.sh) on the
+  # template's egress network.
   # Nothing leaves the runner: outbound 25 / 465 / 587 rejected outside
   # 172.16.0.0/12 (containers and the runner), every name the fake zone's,
   # the remote fenced to the stack's networks. tests/e2e/e2e_mail.py:
@@ -3927,7 +3930,7 @@ jobs:
       E2E_DOMAIN: ci.example.org
       # The workflow's PORTCULLIS_DOMAIN (portcullis.local) and public
       # addresses would win over .env (the shell's value wins, as with
-      # compose): mail's mail-egress address is the server's (SPF, the MX).
+      # compose): stalwart's pinned egress address is the server's (SPF, the MX).
       PORTCULLIS_DOMAIN: ci.example.org
       PORTCULLIS_PUBLIC_IPV4: 172.30.88.2
       PORTCULLIS_PUBLIC_IPV6: ""
@@ -3947,7 +3950,8 @@ jobs:
           done
           # The CI-only fake provider for the main domain (records into the
           # shared zone), mail-cert against Pebble, the public address =
-          # mail's pinned mail-egress address (SPF / the remote's MX target).
+          # stalwart's pinned address on the template's egress network
+          # (the CI checkout pins it: SPF / the remote's MX target).
           # (init wrote DNS_PROVIDER=none: the first line of a key wins.)
           sed -i '/^DNS_PROVIDER=/d' .env
           cat >> .env <<'ENV'
@@ -3985,6 +3989,11 @@ jobs:
                 DOMAINS_FAKEDNS_API_ADDR: ":8054"
               volumes:
                 - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
+              # The fake zone for the mail template's resolver (its egress
+              # network reaches the runner, never domains-egress).
+              ports:
+                - "8053:8053/udp"
+                - "8053:8053/tcp"
               networks:
                 domains-egress:
                   ipv4_address: 172.30.87.53
@@ -4006,40 +4015,20 @@ jobs:
                 DOMAINS_FAKEDNS_REMOTE: http://172.30.87.53:8054
               volumes:
                 - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
-            mail-resolver:
-              volumes:
-                - /tmp/unbound-ci.conf:/etc/unbound/custom.conf:ro
-              networks:
-                domains-egress: {}
-              healthcheck:
-                test: ["CMD", "drill-hc", "-p", "5353", "@127.0.0.1", "team-b.test"]
-            mail:
-              networks:
-                mail-egress:
-                  ipv4_address: 172.30.88.2
-            mailctl:
-              environment:
-                MAILCTL_RESOLVERS: 172.31.255.4:5353
-                MAILCTL_PUBLIC_IPV4: 172.30.88.2
           networks:
             domains-egress:
               ipam:
                 config:
                   - subnet: 172.30.87.0/24
-            mail-egress:
-              ipam:
-                config:
-                  - subnet: 172.30.88.0/24
           YML
-          docker compose --profile mail config -q
-          docker compose --profile mail config --format json | jq -e '.services.mail.networks["mail-egress"].ipv4_address == "172.30.88.2"
-              and .services.domains.networks["domains-egress"].ipv4_address == "172.30.87.53"' >/dev/null \
-            || { echo "FAIL: the egress pins aren't applied"; exit 1; }
+          docker compose config -q
+          docker compose config --format json | jq -e '.services.domains.networks["domains-egress"].ipv4_address == "172.30.87.53"' >/dev/null \
+            || { echo "FAIL: the egress pin isn't applied"; exit 1; }
 
       - name: List the images this job runs
         run: |
           {
-            docker compose --profile mail config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate|mailctl)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/ci/e2e-mail-*.sh scripts/lib/common.sh \
               | grep -E '^docker\.io/(library/alpine|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
@@ -4104,8 +4093,15 @@ jobs:
         timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
-      - name: Start the whole stack, team-b.test, mail on
+      - name: Build the mail adapter and mail-fake (P2; the CI-only provider)
+        timeout-minutes: 15
+        run: |
+          docker build -q -t portcullis-mailctl:ci mailctl >/dev/null
+          docker build -q -t portcullis-mail-fake:ci tests/e2e/mail-fake >/dev/null
+      - name: Start the whole stack, team-b.test, mail on (the stalwart template wired)
         timeout-minutes: 25
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
         run: bash .github/ci/e2e-mail-start-stack.sh
 
       - name: The remote mail server (remote.test)
@@ -4144,7 +4140,11 @@ jobs:
         run: |
           ./portcullis backup
           B="$(find backups -maxdepth 1 -type d -name '2*' | sort | tail -n1)"
+          # The remote leaves the template's egress network (the restore
+          # takes the provider's project down, which removes it), then comes back.
+          docker network disconnect portcullis-stalwart_egress e2e-remote
           ./portcullis restore --yes "$B"
+          docker network connect --ip 172.30.88.25 portcullis-stalwart_egress e2e-remote
           E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
           export E2E_HUB_SECRET
           NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_mail.py restore
@@ -4153,9 +4153,12 @@ jobs:
         if: failure()
         run: |
           mkdir -p e2e-artifacts
-          docker compose --profile mail ps -a > e2e-artifacts/compose-ps.txt 2>&1 || true
-          for svc in mail mailctl mail-resolver domains hub traefik keycloak; do
-            docker compose --profile mail logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
+          docker compose ps -a > e2e-artifacts/compose-ps.txt 2>&1 || true
+          for svc in domains hub traefik keycloak; do
+            docker compose logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
+          done
+          for c in $(docker ps -aq --filter label=com.docker.compose.project=portcullis-stalwart) $(docker ps -aq --filter label=com.docker.compose.project=portcullis-mail-fake); do
+            docker logs "$c" > "e2e-artifacts/$(docker inspect -f '{{.Name}}' "$c" | tr -d /).log" 2>&1 || true
           done
           docker logs e2e-remote > e2e-artifacts/remote.log 2>&1 || true
 
@@ -4173,7 +4176,7 @@ jobs:
         run: |
           docker rm -f e2e-remote 2>/dev/null || true
           docker volume rm e2e-remote-data 2>/dev/null || true
-          docker compose --profile mail down -v
+          docker compose down -v
           sudo rm -rf /tmp/e2e-remote /tmp/e2e-mail-state.json
 
   # AI support end to end (contract §15, plan 4 Task 30): the whole stack +

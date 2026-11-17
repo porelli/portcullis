@@ -6,7 +6,8 @@ Runs in CI (job `e2e-mail` in .github/workflows/ci.yml): the whole core
 stack + the Hub (same-named Hub branch) + domains (Pebble, the fake
 provider; ONE fake zone shared with the dns tool and mail-cert), mail on
 for ci.example.org and the enrolled team-b.test, and a remote Stalwart
-(e2e-mail-remote.sh: remote.test, account carla) on mail-egress. Nothing
+(e2e-mail-remote.sh: remote.test, account carla) on the wired stalwart
+template's egress network. Nothing
 leaves the runner: outbound 25 / 465 / 587 is rejected outside the
 stack's networks, every name is the fake zone's.
 
@@ -194,6 +195,16 @@ def persist() -> None:
 
 
 # ── the Hub's admin API (as Traefik calls it: proxy secret + identity) ──
+
+PROVIDER_PROJECT = "portcullis-stalwart"
+
+
+def pcid(service: str, project: str = PROVIDER_PROJECT) -> str:
+    """The wired provider instance's container of service (any state)."""
+    out = docker("ps", "-aq", "--filter", f"label=com.docker.compose.project={project}",
+                 "--filter", f"label=com.docker.compose.service={service}").split()
+    return out[0] if out else ""
+
 
 def hub_ip() -> str:
     cid = docker("compose", "ps", "-q", "hub").strip()
@@ -573,7 +584,7 @@ def dns_diagnostics() -> None:
             save("fakezone-extra.json", json.loads(r.read()))
         # mailctl's own view: the document's domains and the DKIM keys
         # (public data only), and what mail-resolver / the fake DNS answer.
-        st = json.loads(docker("run", "--rm", "--network", "none", "-v", "portcullis_mailctl_data:/d:ro",
+        st = json.loads(docker("run", "--rm", "--network", "none", "-v", PROVIDER_PROJECT + "_adapter_data:/d:ro",
                                "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
                                "cat", "/d/state.json"))
         save("mailctl-view.json", {"domains": [{k: d.get(k) for k in ("name", "mail", "dmarc_start")} for d in (st.get("doc") or {}).get("domains") or []],
@@ -584,7 +595,7 @@ def dns_diagnostics() -> None:
                 continue
             name = f"{k['selector']}._domainkey.{EXTRA}"
             for srv in (["-p", "5353", "@127.0.0.1"], ["-p", "8053", "@172.30.87.53"]):
-                out = docker("compose", "--profile", "mail", "exec", "-T", "mail-resolver", "drill", *srv, "TXT", name, check_rc=False)
+                out = docker("exec", pcid("resolver"), "drill", *srv, "TXT", name, check_rc=False)
                 ans = [ln for ln in out.splitlines() if "\tTXT\t" in ln or "rcode" in ln]
                 print(f"    drill {srv[-1]} {name}: {ans[:3]}", flush=True)
             print(f"    mailctl wants: v=DKIM1; k={k['algorithm']}; p={k.get('public_key', '')[:24]}… (id {k.get('id') or '-'}, {k.get('stage')})", flush=True)
@@ -795,30 +806,31 @@ def mail_password_flow() -> None:
     mask(lp)
     assert imap_refused(a, lp), "alice's LLDAP password opened IMAP"
     assert lldap_login("alice", pw) == 401, "the mail password signed in to LLDAP"
-    # The management listener: 404 from another portcullis-mail address;
-    # from mailctl's own address Basic auth authenticates but the method
-    # is forbidden (mailctl stopped meanwhile: its address is pinned).
+    # The management listener: 404 from another address on the template's
+    # internal network; from the adapter's own address Basic auth
+    # authenticates but the method is forbidden (the adapter stopped
+    # meanwhile: its address is pinned).
     curl = "docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93"
     body = json.dumps({"using": remote.USING, "methodCalls": [["x:Account/get", {"ids": None}, "0"]]})
     tok = base64.b64encode(f"{a}:{pw}".encode()).decode()
 
     def mgmt(ip: str) -> str:
-        p = subprocess.run(["docker", "run", "--rm", "-i", "--network", "portcullis-mail", "--ip", ip, "--entrypoint", "sh", curl,
+        p = subprocess.run(["docker", "run", "--rm", "-i", "--network", PROVIDER_PROJECT + "_internal", "--ip", ip, "--entrypoint", "sh", curl,
                             "-c", 'read -r h; printf "Authorization: Basic %s\\n" "$h" > /tmp/h; '
                                   'curl -s -H @/tmp/h -H "Content-Type: application/json" -d "$0" -w "\\n%{http_code}" http://172.31.255.2:8080/jmap', body],
                            input=tok + "\n", capture_output=True, text=True, timeout=60)
         return p.stdout
     out = mgmt("172.31.255.9")
     assert out.strip().endswith("404"), f"from 172.31.255.9: {scrub(out)[-300:]}"
-    docker("compose", "--profile", "mail", "stop", "mailctl")
+    adapter = pcid("adapter")
+    docker("stop", adapter)
     try:
         out = mgmt("172.31.255.3")
     finally:
-        docker("compose", "--profile", "mail", "start", "mailctl")
+        docker("start", adapter)
     lines = out.strip().splitlines()
-    assert lines and lines[-1] == "200" and "forbidden" in out, f"from mailctl's address: {scrub(out)[-400:]}"
-    until("mailctl healthy again", lambda: docker("inspect", "-f", "{{.State.Health.Status}}",
-                                                   docker("compose", "ps", "-q", "mailctl").strip()).strip() == "healthy", 120)
+    assert lines and lines[-1] == "200" and "forbidden" in out, f"from the adapter's address: {scrub(out)[-400:]}"
+    until("the adapter healthy again", lambda: docker("inspect", "-f", "{{.State.Health.Status}}", pcid("adapter")).strip() == "healthy", 120)
     # Up to five: three more, then the sixth is 409 (checked before any proof).
     for n in range(3):
         create_mail_password(page, auth, "alice", f"e2e extra {n}")
@@ -877,7 +889,7 @@ def revoke_within_8s() -> None:
 
 
 def mail_started_at() -> str:
-    return docker("inspect", "-f", "{{.State.StartedAt}}", docker("compose", "ps", "-q", "mail").strip()).strip()
+    return docker("inspect", "-f", "{{.State.StartedAt}}", pcid("stalwart")).strip()
 
 
 def leave_ends_idle_session() -> None:
@@ -914,7 +926,7 @@ def leave_ends_idle_session() -> None:
     # The cut is the leave's: the Hub restarted mail (not a crash), and
     # audited the leave's revocation.
     until("mail running again after the Hub's restart", lambda: mail_started_at() != started
-          and docker("inspect", "-f", "{{.State.Running}} {{.State.OOMKilled}}", docker("compose", "ps", "-q", "mail").strip()).strip() == "true false", 60)
+          and docker("inspect", "-f", "{{.State.Running}} {{.State.OOMKilled}}", pcid("stalwart")).strip() == "true false", 60)
     assert "mail_credential.revoke_leave" in json.dumps(hub_ok("GET", "/api/directory/audit")), "no mail_credential.revoke_leave in the audit"
     stage, code, text = until("RCPT bob@ refused 550 5.1.1", lambda: (lambda r: r if r[1] == 550 else None)(smtp25(REMOTE_ADDR, b)), 30, every=2)
     assert stage == "rcpt" and text.startswith("5.1.1"), f"RCPT {b}: {stage} {code} {text}"

@@ -2,16 +2,18 @@
 # ci.yml job e2e-mail, step "The remote mail server (remote.test)".
 # Runs from the workspace root with GitHub's default shell behaviour (bash -e).
 #
-# A second Stalwart (mail's own pin, plain config) as remote.test's MX:
-# on mail-egress at 172.30.88.25 (it reaches Portcullis's mail at
-# 172.30.88.2, the address behind the host's published 25) and on
+# A second Stalwart (the stalwart template's pin and plain config) as
+# remote.test's MX: on the wired template's egress network
+# (portcullis-stalwart_egress, pinned 172.30.88.0/24 by the CI checkout)
+# at 172.30.88.25 (it reaches Portcullis's mail at 172.30.88.2) and on
 # domains-egress at 172.30.87.25 (its resolver: the fake zone at
 # 172.30.87.53:8053). It reaches nothing else (DOCKER-USER), downloads
 # nothing (plan.json), and its records go into the shared fake zone.
 # Writes REMOTE_* (the recovery admin and the account's password, masked)
 # to GITHUB_ENV for e2e_mail.py.
 set -euo pipefail
-S="$(docker compose --profile mail config --format json | jq -r .services.mail.image)"
+S="$(awk '/^  stalwart:$/ {f = 1} f && /^    image: / {print $2; exit}' "$RUNNER_TEMP/templates/stalwart/compose.yml")"
+[[ "$S" =~ ^docker\.io/stalwartlabs/stalwart:[^@]+@sha256:[0-9a-f]{64}$ ]] || { echo "FAIL: the template's Stalwart image: $S"; exit 1; }
 R=/tmp/e2e-remote
 FAKE_API=http://172.30.87.53:8054
 fail() { echo "FAIL: $*"; docker logs --tail 60 e2e-remote 2>&1 || true; exit 1; }
@@ -20,7 +22,7 @@ sudo rm -rf "$R"; mkdir -p "$R/tls" "$R/etc"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=mx.remote.test \
   -addext subjectAltName=DNS:mx.remote.test -keyout "$R/tls/privkey.pem" -out "$R/tls/fullchain.pem" 2>/dev/null
 openssl genpkey -algorithm ed25519 -out "$R/dkim.pem" 2>/dev/null
-cp mail/config.json "$R/etc/config.json"
+cp "$RUNNER_TEMP/templates/stalwart/config/config.json" "$R/etc/config.json"
 chmod -R a+rX "$R/tls" "$R/etc"
 ADMIN_PW="$(openssl rand -hex 24)"; echo "::add-mask::$ADMIN_PW"
 REMOTE_PASSWORD="$(openssl rand -hex 16)"; echo "::add-mask::$REMOTE_PASSWORD"
@@ -34,7 +36,7 @@ done
 
 run_remote() {
   docker rm -f e2e-remote >/dev/null 2>&1 || true
-  docker create --name e2e-remote --network portcullis_mail-egress --ip 172.30.88.25 \
+  docker create --name e2e-remote --network portcullis-stalwart_egress --ip 172.30.88.25 \
     -v e2e-remote-data:/var/lib/stalwart -v "$R/etc:/etc/stalwart:ro" -v "$R/tls:/run/remote/tls:ro" \
     --env-file <(echo "STALWART_RECOVERY_ADMIN=portcullis-recovery:$ADMIN_PW") "$@" "$S" --config /etc/stalwart/config.json >/dev/null
   docker network connect --ip 172.30.87.25 portcullis_domains-egress e2e-remote

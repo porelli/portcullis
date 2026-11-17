@@ -12,7 +12,15 @@ set -euo pipefail
 CURL_IMG=docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
 EXTRA=team-b.test
 
-fail() { echo "FAIL: $*"; docker compose --profile mail logs --tail=60 mail mailctl mail-resolver domains 2>/dev/null || true; exit 1; }
+PROJ=portcullis-stalwart
+ALPINE=docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+cid() { docker ps -aq --filter "label=com.docker.compose.project=$PROJ" --filter "label=com.docker.compose.service=$1" | head -n1; }
+fail() {
+  echo "FAIL: $*"
+  for s in bootstrap stalwart adapter resolver; do c="$(cid "$s")"; [ -z "$c" ] || { echo "--- $s"; docker logs --tail=40 "$c" 2>&1 | tail -n 40; }; done
+  docker compose logs --tail=60 domains hub 2>/dev/null || true
+  exit 1
+}
 
 # 1. Outbound SMTP never leaves (containers and the runner).
 sudo iptables -I DOCKER-USER -p tcp -m multiport --dports 25,465,587 ! -d 172.16.0.0/12 -j REJECT --reject-with tcp-reset
@@ -40,6 +48,18 @@ echo "PASS: outbound TCP 25/465/587 rejected (containers and runner)"
 PEBBLE_IMG=$(docker compose config --format json | jq -r .services.pebble.image)
 cid="$(docker create "$PEBBLE_IMG")"; docker cp "$cid:/test/certs/pebble.minica.pem" /tmp/pebble.minica.pem; docker rm "$cid" >/dev/null
 chmod 644 /tmp/pebble.minica.pem
+# The Hub's "portcullis" source before its first start: the templates
+# checkout (stalwart: the adapter built here, the resolver on the fake DNS
+# through the runner's :8053, egress pinned at 172.30.88.0/24 with stalwart
+# at .2) plus the CI-only mail-fake, a local source (never pulled).
+MAIL_CI_DNS_PROBE="$EXTRA" MAIL_CI_EGRESS="172.30.88.0/24 172.30.88.2" \
+  bash .github/ci/mail-templates-checkout.sh "$RUNNER_TEMP/templates" "$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}')"
+docker volume create --label com.docker.compose.project=portcullis --label com.docker.compose.volume=hub_data portcullis_hub_data >/dev/null
+docker run --rm --network none -v portcullis_hub_data:/data -v "$RUNNER_TEMP/templates:/tpl:ro" -v "$PWD/tests/e2e/apps:/src:ro" "$ALPINE" sh -c '
+  mkdir -p /data/repos/portcullis &&
+  cp -r /tpl/stalwart /src/mail-fake /data/repos/portcullis/ &&
+  printf "sources:\n  - name: portcullis\n    url: \"\"\n    path: /data/repos/portcullis\n" > /data/state.yaml &&
+  chown -R 10001:10001 /data && chmod 600 /data/state.yaml'
 docker compose up -d postgres lldap
 ./portcullis vault init
 ./portcullis pki setup --with-server-cert
@@ -87,9 +107,7 @@ echo "PASS: $EXTRA enrolled and ready in the Hub"
 # 4. Mail on: mail-cert through the shared zone against Pebble (DNS-01),
 # the resolver forwarding every name to the fake zone. The main domain's
 # address / caa records too (dns-tool, the fake provider).
-sed "s/__FAKEDNS__/172.30.87.53/" tests/e2e/mail/unbound-ci.conf > /tmp/unbound-ci.conf
-chmod 644 /tmp/unbound-ci.conf
-./portcullis mail enable --yes 2>&1 | tee /tmp/mail-enable.out
+./portcullis mail enable --provider stalwart --yes 2>&1 | tee /tmp/mail-enable.out
 [ "${PIPESTATUS[0]}" = 0 ] || fail "mail enable"
 # Pebble's issuing root (its management API): e2e_mail.py verifies mail's
 # certificate chain against it (E2E_MAIL_CA, with the remote's).
@@ -98,15 +116,15 @@ docker run --rm --network portcullis_domains-egress -v /tmp/pebble.minica.pem:/c
 grep -q 'BEGIN CERTIFICATE' /tmp/e2e-pebble-root.pem || fail "Pebble's issuing root"
 ./portcullis dns setup --yes --only address
 ./portcullis dns setup --yes --only caa
-for s in mail mailctl mail-resolver; do
-  for i in $(seq 1 60); do
-    [ "$(docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q "$s")")" = healthy ] && break
-    [ "$i" -eq 60 ] && fail "$s not healthy"
+for s in resolver stalwart adapter; do
+  for i in $(seq 1 100); do
+    [ "$(docker inspect -f '{{.State.Health.Status}}' "$(cid "$s")" 2>/dev/null)" = healthy ] && break
+    [ "$i" -eq 100 ] && fail "$s not healthy"
     sleep 3
   done
 done
 set +e
-docker run --rm --network portcullis_mail-egress "$CURL_IMG" -s --connect-timeout 5 telnet://192.0.2.1:25 </dev/null; rc=$?
+docker run --rm --network "${PROJ}_egress" "$CURL_IMG" -s --connect-timeout 5 telnet://192.0.2.1:25 </dev/null; rc=$?
 set -e
-[ "$rc" = 7 ] || fail "outbound 25 from mail-egress isn't refused (curl exit $rc)"
-echo "PASS: mail on (mail, mailctl, mail-resolver healthy; mail-egress refuses outbound 25)"
+[ "$rc" = 7 ] || fail "outbound 25 from the template's egress network isn't refused (curl exit $rc)"
+echo "PASS: mail on: the stalwart template wired (resolver, stalwart, adapter healthy; its egress refuses outbound 25)"
