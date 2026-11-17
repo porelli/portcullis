@@ -83,6 +83,7 @@ from playwright.sync_api import Page, sync_playwright
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_login as base  # noqa: E402  (Authenticator, passkey_flow, shot)
 import e2e_mailremote as remote  # noqa: E402
+import e2e_ops  # noqa: E402  (the Hub's 202 op records)
 import scenarios  # noqa: E402  (E2E_SCENARIOS: single-scenario reruns)
 
 DOMAIN = os.environ["E2E_DOMAIN"]
@@ -987,6 +988,303 @@ def restore_voids_mail_passwords(browser) -> None:
     ctx.close()
 
 
+# ── the provider scenarios (mail provider plan Task 27) ──
+
+FAKE = "mail-fake"
+CONF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mail-conformance", "run.py")
+
+
+def get_as(actor: str):
+    return lambda path: hub_ok_as("GET", path, actor)
+
+
+def hub_ok_as(method: str, path: str, actor: str, body=None, want=(200,)):
+    code, ans = hub(method, path, body, actor=actor)
+    assert code in want, f"{method} {path} as {actor}: HTTP {code} {scrub(json.dumps(ans))[:400]}"
+    return ans
+
+
+def run_op_as(actor: str, method: str, path: str, body=None, timeout: float = 900) -> dict:
+    acc = e2e_ops.accepted(hub_ok_as(method, path, actor, body, want=(202,)))
+    rec = e2e_ops.wait(get_as(actor), acc, timeout)
+    return e2e_ops.check_ok(acc, rec)
+
+
+def fresh_proof(page: Page, fa: dict, label: str) -> dict:
+    """The Hub listener's fresh sign-in (prompt=login, max_age=0, PKCE
+    S256), as the instance's Mail tab runs it: the wiring's proof."""
+    import hashlib
+    import secrets as pysecrets
+    import urllib.parse
+    redirect = fa["redirect_uri"]
+    seen: list[str] = []
+    page.on("request", lambda r: seen.append(r.url) if r.url.startswith(redirect + "?") else None)
+    verifier, nonce = pysecrets.token_urlsafe(48), pysecrets.token_urlsafe(16)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    q = {"client_id": fa["client_id"], "response_type": "code", "scope": "openid", "redirect_uri": redirect,
+         "state": pysecrets.token_urlsafe(12), "nonce": nonce, "code_challenge": challenge,
+         "code_challenge_method": "S256", "prompt": "login", "max_age": "0"}
+    if fa.get("pc_method"):
+        q["pc_method"] = fa["pc_method"]
+    page.goto(fa["authorize_url"] + "?" + urllib.parse.urlencode(q), wait_until="domcontentloaded")
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        for u in seen:
+            code = urllib.parse.parse_qs(urllib.parse.urlsplit(u).query).get("code")
+            if code:
+                return {"code": code[0], "code_verifier": verifier, "nonce": nonce}
+        if page.url.startswith(AUTH) and page.locator("#authenticateWebAuthnButton").is_visible():
+            page.click("#authenticateWebAuthnButton")
+        page.wait_for_timeout(700)
+    base.shot(page, f"{label}-fresh-timeout")
+    raise AssertionError(f"{label}: no fresh-auth code (stuck at {page.url.split('?')[0]})")
+
+
+def provider_view(inst: str, actor: str = "root") -> dict:
+    return hub_ok_as("GET", f"/api/instances/{inst}/mail-provider", actor)
+
+
+def ensure_fake_instance() -> None:
+    """The CI-only mail-fake as an instance (created once, not wired)."""
+    listed = hub_ok("GET", "/api/instances")
+    if any((i.get("id") if isinstance(i, dict) else i) == FAKE for i in (listed if isinstance(listed, list) else listed.get("instances") or [])):
+        return
+    run_op_as("admin", "POST", "/api/instances", {"template": "mail-fake", "id": FAKE, "label": "Mail fake"}, 600)
+
+
+def remote_off_egress() -> None:
+    # The remote leaves stalwart's egress network (a stop / down removes it).
+    docker("network", "disconnect", "portcullis-stalwart_egress", "e2e-remote", check_rc=False)
+
+
+def remote_on_egress() -> None:
+    docker("network", "connect", "--ip", REMOTE_IP, "portcullis-stalwart_egress", "e2e-remote", check_rc=False)
+
+
+def switch_to(inst: str) -> dict:
+    """POST /api/mail/provider/switch as root: the typed id, the typed
+    "<n> mailboxes start empty" (the Hub names n when it differs), a fresh
+    proof each attempt."""
+    page = state["page_root"]
+    phrase = state.get("empty_phrase", "0 mailboxes start empty")
+    for _ in range(2):
+        v = provider_view(inst)
+        body = {"to": inst, "confirm": inst, "confirm_empty": phrase, **fresh_proof(page, v["fresh_auth"], f"switch-{inst}")}
+        code, ans = hub("POST", "/api/mail/provider/switch", body, actor="root")
+        txt = ans if isinstance(ans, str) else json.dumps(ans)
+        m = re.search(r'(\d+) mailboxes start empty', txt)
+        if code == 400 and m:
+            phrase = state["empty_phrase"] = m.group(1) + " mailboxes start empty"
+            continue
+        assert code == 202, f"switch to {inst}: HTTP {code} {scrub(json.dumps(ans))[:400]}"
+        acc = e2e_ops.accepted(ans)
+        return e2e_ops.check_ok(acc, e2e_ops.wait(get_as("root"), acc, 1200))
+    raise AssertionError(f"switch to {inst}: the typed phrase was refused twice")
+
+
+def zone(name: str) -> list[dict]:
+    body = json.dumps({"op": "get", "zone": name + ".", "token": "ci-fake-token-0123456789", "records": []}).encode()
+    with urllib.request.urlopen(urllib.request.Request("http://172.30.87.53:8054", data=body,
+                                                       headers={"Content-Type": "application/json"}), timeout=30) as r:
+        return json.loads(r.read()).get("records") or []
+
+
+def banner(port: int) -> bytes:
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as c:
+        c.settimeout(5)
+        try:
+            return c.recv(64)
+        except OSError:
+            return b""
+
+
+def switch_provider() -> None:
+    """11: to mail-fake (honest): the sets replaced per domain (the old
+    DKIM keys kept, retiring), the mail passwords' rows provider_changed,
+    the ports reach the fake (no SMTP banner), stalwart stopped with its
+    volumes, mail.provider_switched audited; then back (voids again)."""
+    needs("setup")
+    ensure_fake_instance()
+    old_dkim = {r["name"] for r in zone(DOMAIN) if r.get("type") == "TXT" and "._domainkey" in r.get("name", "")}
+    remote_off_egress()
+    try:
+        switch_to(FAKE)
+        until("the Hub says mail-fake is wired", lambda: (hub_ok("GET", "/api/mail/status").get("provider") or {}).get("instance") == FAKE, 120)
+        run("./portcullis", "mail", "rotate", timeout=600)
+        names = {(r["name"], r["type"]) for r in zone(DOMAIN)}
+        assert any(n.startswith("fake._domainkey.") for n, _ in names), f"the fake's DKIM key isn't published: {sorted(names)}"
+        assert old_dkim and all((n, "TXT") in names or n.split(".", 1)[0] + "._domainkey" in {x.split(".", 1)[0] + "._domainkey" for x, _ in names}
+                                for n in old_dkim), f"the old DKIM keys went at the switch: {sorted(old_dkim)} vs {sorted(names)}"
+        rows = hub_ok("GET", "/api/directory/users/alice/mail").get("passwords") or []
+        assert rows and all(r.get("status") in ("provider_changed", "revoked") for r in rows), f"alice's rows: {rows}"
+        assert not banner(25).startswith(b"220"), "port 25 still answers like Stalwart"
+        st = docker("inspect", "-f", "{{.State.Status}}", pcid("stalwart")).strip()
+        assert st in ("exited", "created"), f"stalwart is {st} after the switch"
+        assert "stalwart_data" in docker("volume", "ls", "-q"), "stalwart's store volume went with the switch"
+        assert "mail.provider_switched" in json.dumps(hub_ok("GET", "/api/directory/audit")), "no mail.provider_switched in the audit"
+        state["switched"] = True
+    finally:
+        switch_to("stalwart")
+        remote_on_egress()
+    until("stalwart wired again", lambda: (hub_ok("GET", "/api/mail/status").get("provider") or {}).get("instance") == "stalwart", 120)
+    st = hub_ok("GET", "/api/mail/status")
+    assert not (st.get("provider") or {}).get("void"), f"a void still owed after the switch back: {(st.get('provider') or {}).get('void')}"
+    assert imap_refused(f"alice@{DOMAIN}", state["pw_alice"]), "alice's old mail password survived two switches"
+
+
+def hostile_provider_contained() -> None:
+    """12: mail-fake in hostile mode while wired: none of its forbidden
+    records reaches the zone (mail_records_wrong names them), no
+    mass-removal document is sent, the wide allowed_ips row is revoked
+    (mail_lan_only_unenforced), the failed void stops the instance
+    (mail_void_pending)."""
+    needs("setup")
+    ensure_fake_instance()
+    remote_off_egress()
+    try:
+        switch_to(FAKE)
+        docker("exec", pcid("fake", "portcullis-" + FAKE), "mail-fake", "mode", "hostile")
+        time.sleep(3)
+        run("./portcullis", "mail", "rotate", timeout=600, check_rc=False)
+        recs = zone(DOMAIN)
+        bad = [r for r in recs if (r.get("type") == "A" and r.get("data") == "192.0.2.66") or "attacker" in json.dumps(r)
+               or (r.get("name", "").startswith("_dmarc.") and "p=none" in r.get("data", ""))]
+        assert not bad, f"forbidden records in the zone: {bad}"
+        findings = json.dumps(hub_ok("GET", "/api/doctor"))
+        assert "mail_records_wrong" in findings, "no mail_records_wrong finding"
+        # LAN-only on: the provider answers 0.0.0.0/0 → the row is revoked.
+        cur = hub_ok("GET", "/api/mail/settings")
+        hub_ok("PUT", "/api/mail/settings", {**{k: cur[k] for k in ("primary_domain", "spam", "limits")}, "quotas": cur.get("quotas") or [],
+                                              "submission_lan_only": True}, want=(200, 204))
+        until("mail_lan_only_unenforced", lambda: "mail_lan_only_unenforced" in json.dumps(hub_ok("GET", "/api/doctor")), 180, every=10)
+        hub_ok("PUT", "/api/mail/settings", {**{k: cur[k] for k in ("primary_domain", "spam", "limits")}, "quotas": cur.get("quotas") or [],
+                                              "submission_lan_only": False}, want=(200, 204))
+        # A void that keeps a credential fails its verification: stopped.
+        code, ans = hub("POST", "/api/mail/provider/retry-void", actor="root")
+        if code == 202:
+            e2e_ops.wait(get_as("root"), e2e_ops.accepted(ans), 600)
+        until("mail_void_pending", lambda: "mail_void_pending" in json.dumps(hub_ok("GET", "/api/doctor")), 300, every=10)
+        st = docker("inspect", "-f", "{{.State.Status}}", pcid("fake", "portcullis-" + FAKE)).strip()
+        assert st != "running", f"the hostile provider still runs after a failed void ({st})"
+    finally:
+        fid = pcid("fake", "portcullis-" + FAKE)
+        if fid:
+            docker("start", fid, check_rc=False)
+            docker("exec", fid, "mail-fake", "mode", "honest", check_rc=False)
+        switch_to("stalwart")
+        remote_on_egress()
+
+
+def wiring_guards() -> None:
+    """13: wiring is refused without a fresh proof (403), with a wrong
+    typed id (400), for an AI / MCP actor (403) and for a delegate (403);
+    with all of them it succeeds (the CI-only source's template)."""
+    needs("setup")
+    ensure_fake_instance()
+    page = state["page_root"]
+    path = f"/api/instances/{FAKE}/mail-provider"
+    code, _ = hub("PUT", path, {"wired": True, "confirm": FAKE}, actor="root")
+    assert code == 403, f"no fresh proof: HTTP {code} (want 403)"
+    v = provider_view(FAKE)
+    code, _ = hub("PUT", path, {"wired": True, "confirm": "stalwart", **fresh_proof(page, v["fresh_auth"], "wire-typo")}, actor="root")
+    assert code == 400, f"a wrong typed id: HTTP {code} (want 400)"
+    # An AI / MCP actor: the Hub's Portcullis MCP has no tool that wires,
+    # switches or unwires a provider (contract §19.9), and the listener
+    # refuses outright when AI support is off.
+    with open("secrets/mcp-gate/hub-secret") as f:
+        mcp_secret = f.read().strip()
+    data = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}).encode()
+    req = urllib.request.Request(f"http://{state['hub_ip']}:8890/mcp/admin", data=data, method="POST", headers={
+        "Content-Type": "application/json", "Accept": "application/json, text/event-stream", "Mcp-Protocol-Version": "2025-11-25",
+        "X-Portcullis-MCP-Secret": mcp_secret, "X-Forwarded-User": "root",
+        "X-Portcullis-AI-Client": "portcullis-ai-claude-code", "X-Portcullis-AI-Resource": f"https://hub.{DOMAIN}/mcp"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read().decode()
+        tools = json.dumps(raw)
+        assert not any(w in tools for w in ("mail_provider", "mail-provider", "switch_mail", "wire_mail", "unwire")), \
+            "the Portcullis MCP lists a mail provider tool"
+    except urllib.error.HTTPError as e:
+        assert e.code in (403, 404, 503), f"the MCP listener: HTTP {e.code}"
+    code, _ = hub("PUT", path, {"wired": True, "confirm": FAKE}, actor="alice")
+    assert code == 403, f"a non-admin / delegate: HTTP {code} (want 403)"
+    remote_off_egress()
+    try:
+        v = provider_view(FAKE)
+        run_op_as("root", "PUT", path, {"wired": True, "confirm": FAKE, **fresh_proof(page, v["fresh_auth"], "wire-ok")}, 900)
+    finally:
+        switch_to("stalwart")
+        remote_on_egress()
+
+
+def template_change_holds() -> None:
+    """14: the wired template's files change (a comment line), the Hub
+    syncs: no container recreated, mail_provider_refused, the mail routes
+    503; a re-wire (it voids) clears the hold."""
+    needs("setup")
+    before = {s: docker("inspect", "-f", "{{.Id}}", pcid(s)).strip() for s in ("stalwart", "adapter")}
+    docker("run", "--rm", "--network", "none", "-v", "portcullis_hub_data:/d",
+           "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+           "sh", "-c", "echo '# e2e-mail 14' >> /d/repos/portcullis/stalwart/compose.yml")
+    docker("kill", "-s", "HUP", docker("compose", "ps", "-q", "hub").strip())
+    until("mail_provider_refused", lambda: "mail_provider_refused" in json.dumps(hub_ok("GET", "/api/doctor")), 180, every=5)
+    after = {s: docker("inspect", "-f", "{{.Id}}", pcid(s)).strip() for s in ("stalwart", "adapter")}
+    assert after == before, "a container was recreated on the template change"
+    code, _ = hub("GET", "/api/mail/checks")
+    assert code == 503, f"the mail routes answer {code} while held (want 503)"
+    page = state["page_root"]
+    v = provider_view("stalwart")
+    remote_off_egress()
+    try:
+        run_op_as("root", "PUT", "/api/instances/stalwart/mail-provider",
+                  {"wired": True, "confirm": "stalwart", "block_hash": v.get("block_hash", ""), **fresh_proof(page, v["fresh_auth"], "rewire")}, 900)
+    finally:
+        remote_on_egress()
+    until("the hold cleared", lambda: "mail_provider_refused" not in json.dumps(hub_ok("GET", "/api/doctor")), 180, every=5)
+    code, _ = hub("GET", "/api/mail/checks")
+    assert code == 200, f"the mail routes answer {code} after the re-wire"
+
+
+def conformance(level: str, inst: str, service: str) -> None:
+    """The conformance suite against the wired provider, as the Hub (its
+    pinned portcullis-mail-api address; the Hub stopped meanwhile)."""
+    hub_cid = docker("compose", "ps", "-q", "hub").strip()
+    docker("stop", hub_cid)
+    try:
+        args = ["--level", level, "--api-url", "http://172.31.255.19:8080", "--secret-file", "/hs/api-secret"]
+        if level == "full":
+            args += ["--smtp-host", "172.30.88.2", "--imap-host", "172.30.88.2"]
+        p = subprocess.run(["docker", "run", "--rm", "--network", "portcullis-mail-api", "--ip", "172.31.255.18",
+                            "-v", f"portcullis_hub_secrets:/hsv:ro", "-v", f"{os.path.dirname(CONF)}:/c:ro",
+                            "--entrypoint", "sh", "portcullis-group-gate", "-c",
+                            f'mkdir -p /hs && cp /hsv/{inst}/_mail/api-secret /hs/ && python3 /c/run.py "$@"', "x", *args],
+                           capture_output=True, text=True, timeout=600)
+        save(f"conformance-{level}.txt", p.stdout + p.stderr)
+        print(scrub(p.stdout), flush=True)
+        assert p.returncode == 0, f"conformance {level} on {inst}: exit {p.returncode}: {scrub(p.stdout)[-600:]}"
+    finally:
+        docker("start", hub_cid)
+
+
+def conformance_stalwart() -> None:
+    """15: run.py --level full against the wired stalwart."""
+    needs("setup")
+    conformance("full", "stalwart", "adapter")
+
+
+def conformance_fake_api() -> None:
+    """16: run.py --level api against mail-fake, wired for the run."""
+    needs("setup")
+    ensure_fake_instance()
+    remote_off_egress()
+    try:
+        switch_to(FAKE)
+        conformance("api", FAKE, "fake")
+    finally:
+        switch_to("stalwart")
+        remote_on_egress()
+
+
 def report() -> int:
     failed = [r for r in results if not r[1]]
     for name, ok, msg in results:
@@ -1016,6 +1314,12 @@ def main() -> int:
             check("5 revoke_within_8s", revoke_within_8s)
             check("6 leave_ends_idle_session", leave_ends_idle_session)
             check("7 recreated_username_fresh_mailbox", lambda: recreated_username_fresh_mailbox(browser))
+            check("13 wiring_guards", wiring_guards)
+            check("11 switch_provider", switch_provider)
+            check("12 hostile_provider_contained", hostile_provider_contained)
+            check("14 template_change_holds", template_change_holds)
+            check("15 conformance_stalwart", conformance_stalwart)
+            check("16 conformance_fake_api", conformance_fake_api)
             if "pw_alice" in state:
                 persist()
         finally:
