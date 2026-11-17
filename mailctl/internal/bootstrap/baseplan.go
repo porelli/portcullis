@@ -288,14 +288,19 @@ if not address :all :is "from" "${ef}" {
 }
 `
 
-// systemSettings: the host name only once a document named it (the
-// bootstrap job's first run has none; ApplyDoc writes it).
+// PlaceholderHostname is defaultHostname before any document (Ruling
+// T17-d: Stalwart 1.1 requires one): a name on the parking domain, never
+// in DNS; ApplyDoc replaces it with the document's mail_hostname.
+const PlaceholderHostname = "mail." + ParkingDomain
+
+// systemSettings: the document's host name, else the placeholder (the
+// bootstrap job's first run has no document; ApplyDoc writes the real one).
 func (p Params) systemSettings() map[string]any {
-	m := map[string]any{"maxBufferedMemory": 134217728}
-	if p.Hostname != "" {
-		m["defaultHostname"] = p.Hostname
+	h := p.Hostname
+	if h == "" {
+		h = PlaceholderHostname
 	}
-	return m
+	return map[string]any{"maxBufferedMemory": 134217728, "defaultHostname": h}
 }
 
 func (p Params) domains() []map[string]any {

@@ -1,9 +1,11 @@
 package bootstrap
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/portcullis/mailctl/internal/stalwart"
@@ -39,8 +42,14 @@ type Server func(ctx context.Context, env []string) (stop func() error, err erro
 //     update after a server image change) and exits nil only when the
 //     recovery login is refused there.
 type Job struct {
-	URL         string // the server's management listener (MAILCTL_STALWART_URL)
-	DataDir     string // adapter_data
+	URL     string // the job's own server over loopback (MAILCTL_JOB_LOCAL_URL)
+	DataDir string // adapter_data (the adapter's state.json)
+	// KeyFile is where the API key goes (MAILCTL_API_KEY_FILE, 0640).
+	KeyFile string
+	// StoreDir is the server's store volume as the job mounts it
+	// (MAILCTL_STORE_DIR): the lock and the base-plan marker live there
+	// (Ruling T17-c: the plan runs once per store).
+	StoreDir    string
 	SessionFile string // job-only tmpfs: the recovery session's nonce ("" = none)
 	ServerImage string // MAILCTL_SERVER_IMAGE: the pinned server image ("" = never update roles)
 	Params      Params // the neutral base plan inputs (resolver, rules URL, …)
@@ -55,8 +64,60 @@ func (j *Job) logf(f string, a ...any) {
 	}
 }
 
-// KeyFile is the API key's file in adapter_data.
+// KeyFile is the API key's default file in adapter_data.
 func KeyFile(dataDir string) string { return filepath.Join(dataDir, "api-key") }
+
+// The base plan's marker and the job's lock in the store volume.
+const (
+	planMarker = ".portcullis-base-plan"
+	jobLock    = ".portcullis-bootstrap.lock"
+)
+
+type markerDoc struct {
+	Version   int       `json:"version"`
+	AppliedAt time.Time `json:"applied_at"`
+}
+
+// markerValid: the store's marker exists and reads as version 1 with a
+// time (anything else: the plan runs again, fail closed).
+func markerValid(store string) bool {
+	b, err := os.ReadFile(filepath.Join(store, planMarker))
+	if err != nil {
+		return false
+	}
+	var m markerDoc
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.DisallowUnknownFields()
+	return d.Decode(&m) == nil && m.Version == 1 && !m.AppliedAt.IsZero()
+}
+
+// writeMarker records the base plan (written whole, then renamed).
+func writeMarker(store string, now time.Time) error {
+	b, _ := json.Marshal(markerDoc{Version: 1, AppliedAt: now.UTC().Truncate(time.Second)})
+	tmp := filepath.Join(store, planMarker+".tmp")
+	if err := WriteInPlace(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(store, planMarker))
+}
+
+// lockStore takes the job's exclusive lock in the store volume (two jobs
+// never overlap); release it with the returned func.
+func lockStore(store string) (func(), error) {
+	fi, err := os.Stat(store)
+	if err != nil || !fi.IsDir() {
+		return nil, fmt.Errorf("the store volume %s isn't readable", store)
+	}
+	f, err := os.OpenFile(filepath.Join(store, jobLock), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("the store's lock: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("the store's lock: %w", err)
+	}
+	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
+}
 
 func imageFile(dataDir string) string { return filepath.Join(dataDir, ".server-image") }
 
@@ -116,11 +177,60 @@ func randomHex(n int) (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// Run is the whole job.
+func (j *Job) keyFile() string {
+	if j.KeyFile != "" {
+		return j.KeyFile
+	}
+	return KeyFile(j.DataDir)
+}
+
+// Run is the whole job: under the store's lock, the base plan once per
+// store (Ruling T17-c); a bootstrapped store with its key only gets the
+// role-permission start after a server image change.
 func (j *Job) Run(ctx context.Context) (err error) {
 	if j.Start == nil {
 		return errors.New("no server to start")
 	}
+	if j.StoreDir == "" {
+		return errors.New("no store volume (MAILCTL_STORE_DIR)")
+	}
+	unlock, err := lockStore(j.StoreDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if key, _ := os.ReadFile(j.keyFile()); markerValid(j.StoreDir) && strings.TrimSpace(string(key)) != "" {
+		return j.imageUpdate(ctx)
+	}
+	return j.plan(ctx)
+}
+
+// imageUpdate: after a server image change, one normal start with
+// STALWART_UPDATE_ROLE_PERMISSIONS=true (recorded once it came up).
+func (j *Job) imageUpdate(ctx context.Context) error {
+	recorded, _ := os.ReadFile(imageFile(j.DataDir))
+	if j.ServerImage == "" || strings.TrimSpace(string(recorded)) == j.ServerImage {
+		j.logf("bootstrap: the store is bootstrapped; nothing to do")
+		return nil
+	}
+	j.logf("bootstrap: the server image changed: one start with the role-permission update")
+	stop, err := j.Start(ctx, []string{"STALWART_UPDATE_ROLE_PERMISSIONS=true"})
+	if err != nil {
+		return fmt.Errorf("starting the mail server: %w", err)
+	}
+	if err := j.waitReady(ctx); err != nil {
+		_ = stop()
+		return err
+	}
+	if err := stop(); err != nil {
+		return err
+	}
+	return WriteInPlace(imageFile(j.DataDir), []byte(j.ServerImage), 0o600)
+}
+
+// plan runs the base plan (recovery mode), writes the key, verifies the
+// recovery login is refused on a normal start, then marks the store.
+func (j *Job) plan(ctx context.Context) (err error) {
 	pw, err := randomSecret(32)
 	if err != nil {
 		return err
@@ -146,7 +256,7 @@ func (j *Job) Run(ctx context.Context) (err error) {
 	if p.ClientIP == "" {
 		p.ClientIP = state.ClientIPPreserved
 	}
-	old, _ := os.ReadFile(KeyFile(j.DataDir))
+	old, _ := os.ReadFile(j.keyFile())
 	rotate := strings.TrimSpace(string(old)) == ""
 
 	stop, err := j.Start(ctx, []string{"STALWART_RECOVERY_MODE=1", "STALWART_RECOVERY_ADMIN=" + RecoveryUser + ":" + pw, "MAILCTL_RECOVERY_SESSION=" + nonce})
@@ -169,7 +279,8 @@ func (j *Job) Run(ctx context.Context) (err error) {
 		return err
 	}
 	if res.APIKey != "" {
-		if err := WriteInPlace(KeyFile(j.DataDir), []byte(res.APIKey), 0o600); err != nil {
+		// 0640: the adapter reads it through the template's shared group.
+		if err := WriteInPlace(j.keyFile(), []byte(res.APIKey), 0o640); err != nil {
 			return fmt.Errorf("writing the API key: %w", err)
 		}
 		j.logf("bootstrap: a new API key written")
@@ -206,6 +317,9 @@ func (j *Job) Run(ctx context.Context) (err error) {
 		if err := WriteInPlace(imageFile(j.DataDir), []byte(j.ServerImage), 0o600); err != nil {
 			return fmt.Errorf("recording the server image: %w", err)
 		}
+	}
+	if err := writeMarker(j.StoreDir, time.Now()); err != nil {
+		return fmt.Errorf("marking the store bootstrapped: %w", err)
 	}
 	j.logf("bootstrap: done (the recovery login is refused)")
 	return nil

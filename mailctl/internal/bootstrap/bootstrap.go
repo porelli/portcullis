@@ -240,8 +240,13 @@ func Apply(ctx context.Context, c *stalwart.Client, p Params, rotateKey bool, lo
 	for _, s := range p.Singletons() {
 		if s.Object == "SystemSettings" {
 			s.Patch["defaultCertificateId"] = certID
+			// Stalwart 1.1 requires a default domain (Ruling T17-d): the
+			// primary domain once a document named it, else the parking
+			// domain (ApplyDoc moves it to the primary domain).
 			if p.PrimaryDomain != "" {
 				s.Patch["defaultDomainId"] = ids["Domain"][p.PrimaryDomain]
+			} else {
+				s.Patch["defaultDomainId"] = ids["Domain"][ParkingDomain]
 			}
 		}
 		if err := updateSingleton(ctx, c, s); err != nil {

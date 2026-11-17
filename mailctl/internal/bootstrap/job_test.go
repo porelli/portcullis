@@ -61,7 +61,7 @@ func (s *jobServer) start(_ context.Context, env []string) (func() error, error)
 func newJob(t *testing.T, s *jobServer) *Job {
 	srv := httptest.NewServer(s)
 	t.Cleanup(srv.Close)
-	return &Job{URL: srv.URL, DataDir: t.TempDir(), SessionFile: filepath.Join(t.TempDir(), "recovery-session"),
+	return &Job{URL: srv.URL, DataDir: t.TempDir(), StoreDir: t.TempDir(), SessionFile: filepath.Join(t.TempDir(), "recovery-session"),
 		ServerImage: "docker.io/stalwartlabs/stalwart:v1.1.0@sha256:aa", Params: params(), Start: s.start, Ready: 5 * time.Second}
 }
 
@@ -75,7 +75,7 @@ func TestBootstrapJobVerifiesRecoveryRefused(t *testing.T) {
 	}
 	fi, err := os.Stat(KeyFile(j.DataDir))
 	b, _ := os.ReadFile(KeyFile(j.DataDir))
-	if err != nil || fi.Mode().Perm() != 0o600 || !strings.HasPrefix(string(b), "API_") {
+	if err != nil || fi.Mode().Perm() != 0o640 || !strings.HasPrefix(string(b), "API_") {
 		t.Fatalf("key %v %v %q", err, fi, b)
 	}
 	if len(s.starts) != 2 || !strings.HasPrefix(strings.Join(s.starts[0], " "), "STALWART_RECOVERY_MODE=1 STALWART_RECOVERY_ADMIN=portcullis-recovery:") ||
@@ -88,24 +88,65 @@ func TestBootstrapJobVerifiesRecoveryRefused(t *testing.T) {
 	if s.up {
 		t.Fatal("the server was left running")
 	}
-	// Again: the key is kept, the image already recorded (no role update).
+	// Ruling T17-c: the store is marked; a cold start takes the lock, sees
+	// the marker and the key, and starts nothing (no settings touched).
+	if !markerValid(j.StoreDir) {
+		t.Fatal("no marker after the plan")
+	}
 	ino := inode(t, KeyFile(j.DataDir))
 	s.starts = nil
 	if err := j.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	b2, _ := os.ReadFile(KeyFile(j.DataDir))
-	if string(b2) != string(b) || inode(t, KeyFile(j.DataDir)) != ino || len(s.starts[1]) != 0 {
+	if string(b2) != string(b) || inode(t, KeyFile(j.DataDir)) != ino || len(s.starts) != 0 {
 		t.Fatalf("second run: key %q starts %q", b2, s.starts)
 	}
-	// A normal start that still accepts the recovery admin fails the job.
+	// A server image change: one normal start with the role update only.
+	j.ServerImage = "docker.io/stalwartlabs/stalwart:v1.1.1@sha256:bb"
+	s.starts = nil
+	if err := j.Run(context.Background()); err != nil || len(s.starts) != 1 || strings.Join(s.starts[0], " ") != "STALWART_UPDATE_ROLE_PERMISSIONS=true" {
+		t.Fatalf("image change: %v %q", err, s.starts)
+	}
+	// An invalid marker (or a missing key) runs the plan again (fail closed).
+	os.WriteFile(filepath.Join(j.StoreDir, planMarker), []byte(`{"version":2}`), 0o600)
+	s.starts = nil
+	if err := j.Run(context.Background()); err != nil || len(s.starts) != 2 {
+		t.Fatalf("invalid marker: %v %q", err, s.starts)
+	}
+	os.Remove(KeyFile(j.DataDir))
+	s.starts = nil
+	if err := j.Run(context.Background()); err != nil || len(s.starts) != 2 {
+		t.Fatalf("missing key: %v %q", err, s.starts)
+	}
+	// The key at MAILCTL_API_KEY_FILE when set.
+	j.KeyFile = filepath.Join(t.TempDir(), "key")
+	os.Remove(filepath.Join(j.StoreDir, planMarker))
+	if err := j.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(j.KeyFile); err != nil || fi.Mode().Perm() != 0o640 {
+		t.Fatalf("key file %v %v", fi, err)
+	}
+	// No store volume: refused before anything starts.
+	j2 := newJob(t, &jobServer{f: newFake()})
+	j2.StoreDir = filepath.Join(t.TempDir(), "missing")
+	if err := j2.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "store volume") {
+		t.Fatalf("missing store: %v", err)
+	}
+	// A normal start that still accepts the recovery admin fails the job,
+	// and leaves the store unmarked.
+	os.Remove(filepath.Join(j.StoreDir, planMarker))
 	s.leak = true
 	if err := j.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "still works") {
 		t.Fatalf("leak: %v", err)
 	}
+	if markerValid(j.StoreDir) {
+		t.Fatal("a failed plan marked the store")
+	}
 	// A server that never comes up fails it too, and stops it.
 	s2 := &jobServer{f: newFake()}
-	j2 := newJob(t, s2)
+	j2 = newJob(t, s2)
 	j2.Ready = 1500 * time.Millisecond
 	j2.Start = func(ctx context.Context, env []string) (func() error, error) { return func() error { return nil }, nil }
 	if err := j2.Run(context.Background()); err == nil {

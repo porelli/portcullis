@@ -207,7 +207,7 @@ func TestEveryUsedFieldInSchema(t *testing.T) {
 // never MAILCTL_STALWART_URL (the real server's pinned address); a
 // non-loopback MAILCTL_JOB_LOCAL_URL is refused.
 func TestBootstrapJobNeverDialsStalwartURL(t *testing.T) {
-	env := map[string]string{"MAILCTL_LOCAL_RESOLVER": "172.31.255.4:5353", "MAILCTL_STALWART_URL": "http://172.31.255.2:8080"}
+	env := map[string]string{"MAILCTL_LOCAL_RESOLVER": "172.31.255.4:5353", "MAILCTL_STALWART_URL": "http://172.31.255.2:8080", "MAILCTL_STORE_DIR": "/var/lib/stalwart"}
 	get := func(k string) string { return env[k] }
 	cfg, err := config.LoadJob(get)
 	if err != nil {

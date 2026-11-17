@@ -4,6 +4,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -29,7 +30,10 @@ type Config struct {
 	// VoidSession is PORTCULLIS_MAIL_VOID_SESSION, byte for byte (void mode only).
 	VoidSession string
 
-	APIKeyFile string // <data>/api-key: Stalwart's API key (the bootstrap job writes it)
+	// APIKeyFile is Stalwart's API key (MAILCTL_API_KEY_FILE, default
+	// <data>/api-key; Ruling T17-d): the bootstrap job writes it 0640, the
+	// adapter reads it.
+	APIKeyFile string
 	DQSKeyFile string // STALWART_DQS_KEY_FILE: the template's dqs_key setting ("" = none)
 
 	StalwartURL    string // MAILCTL_STALWART_URL: the management listener
@@ -50,6 +54,9 @@ type Config struct {
 	// its own container: loopback only (MAILCTL_JOB_LOCAL_URL, Ruling
 	// T17-b); the job never dials StalwartURL.
 	JobLocalURL string
+	// StoreDir is the server's store volume in the job (MAILCTL_STORE_DIR,
+	// required): the base plan's marker and the job's lock (Ruling T17-c).
+	StoreDir    string
 	ServerImage string // the bootstrap job only (LoadJob)
 }
 
@@ -196,6 +203,13 @@ func LoadJob(env func(string) string) (Config, error) {
 	if c.JobSessionFile != "" && !filepath.IsAbs(c.JobSessionFile) {
 		return c, fmt.Errorf("MAILCTL_JOB_SESSION_FILE=%q is not an absolute path", c.JobSessionFile)
 	}
+	c.StoreDir = strings.TrimSpace(env("MAILCTL_STORE_DIR"))
+	if c.StoreDir == "" {
+		return c, errors.New("MAILCTL_STORE_DIR is required (the server's store volume in the job)")
+	}
+	if !filepath.IsAbs(c.StoreDir) || filepath.Clean(c.StoreDir) != c.StoreDir || c.StoreDir == "/" {
+		return c, fmt.Errorf("MAILCTL_STORE_DIR=%q is not a clean absolute directory", c.StoreDir)
+	}
 	c.JobLocalURL = get(env, "MAILCTL_JOB_LOCAL_URL", "http://127.0.0.1:8080")
 	u, err := url.Parse(c.JobLocalURL)
 	ok := err == nil && u.Scheme == "http" && u.Path == "" && u.RawQuery == "" && u.User == nil && u.Fragment == ""
@@ -236,7 +250,13 @@ func loadOwn(env func(string) string, c *Config) error {
 		return err
 	}
 	c.DataDir = get(env, "MAILCTL_DATA", "/data")
-	c.APIKeyFile = filepath.Join(c.DataDir, "api-key")
+	if !filepath.IsAbs(c.DataDir) || filepath.Clean(c.DataDir) != c.DataDir {
+		return fmt.Errorf("MAILCTL_DATA=%q is not a clean absolute path", c.DataDir)
+	}
+	c.APIKeyFile = get(env, "MAILCTL_API_KEY_FILE", filepath.Join(c.DataDir, "api-key"))
+	if !filepath.IsAbs(c.APIKeyFile) || filepath.Clean(c.APIKeyFile) != c.APIKeyFile || strings.HasSuffix(env("MAILCTL_API_KEY_FILE"), "/") {
+		return fmt.Errorf("MAILCTL_API_KEY_FILE=%q is not a clean absolute file path", c.APIKeyFile)
+	}
 	lr, err := required(env, "MAILCTL_LOCAL_RESOLVER")
 	if err != nil {
 		return err

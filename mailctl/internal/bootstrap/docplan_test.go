@@ -108,3 +108,28 @@ func TestApplyDocTightensTLSStrategiesOnly(t *testing.T) {
 		}
 	}
 }
+
+// Ruling T17-d: the document-less plan is valid on Stalwart 1.1 (a
+// placeholder host on the parking domain, the parking domain as the
+// default); ApplyDoc moves both to the document's.
+func TestDocumentlessPlanPlaceholders(t *testing.T) {
+	p := Params{}
+	for _, s := range p.Singletons() {
+		if s.Object == "SystemSettings" && s.Patch["defaultHostname"] != "mail.portcullis-former.internal" {
+			t.Fatalf("defaultHostname %v", s.Patch["defaultHostname"])
+		}
+	}
+	f := fake.New()
+	t.Cleanup(f.Close)
+	c := stalwart.New(f.URL(), stalwart.Bearer("API_k"))
+	prim := f.Put("Domain", "", map[string]any{"name": "example.com"})
+	b, _ := os.ReadFile("../state/testdata/mailstate_v2.json")
+	doc, _ := state.Parse(b)
+	if _, err := ApplyDoc(context.Background(), c, doc); err != nil {
+		t.Fatal(err)
+	}
+	ss, _ := json.Marshal(f.Get("SystemSettings", "", "singleton"))
+	if !strings.Contains(string(ss), `"defaultDomainId":"`+prim+`"`) || !strings.Contains(string(ss), `"defaultHostname":"mail.example.com"`) {
+		t.Fatalf("%s", ss)
+	}
+}

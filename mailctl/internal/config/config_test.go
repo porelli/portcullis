@@ -101,3 +101,34 @@ func TestLoadRefusesBad(t *testing.T) {
 		t.Fatalf("an old key was read: %v", err)
 	}
 }
+
+// Ruling T17-d / T17-c: MAILCTL_API_KEY_FILE (both the job and the
+// adapter), MAILCTL_STORE_DIR (the job, required), each a clean absolute path.
+func TestKeyFileAndStoreDir(t *testing.T) {
+	m := base()
+	m["MAILCTL_API_KEY_FILE"] = "/run/adapter/api-key"
+	if c, err := Load(envOf(m)); err != nil || c.APIKeyFile != "/run/adapter/api-key" {
+		t.Fatalf("%v %v", c.APIKeyFile, err)
+	}
+	for _, bad := range []string{"api-key", "/run/../etc/key", "/run/adapter/", "/run//key"} {
+		m["MAILCTL_API_KEY_FILE"] = bad
+		if _, err := Load(envOf(m)); err == nil || !strings.Contains(err.Error(), "MAILCTL_API_KEY_FILE") {
+			t.Errorf("%s: %v", bad, err)
+		}
+	}
+	j := map[string]string{"MAILCTL_LOCAL_RESOLVER": "172.31.255.4:5353"}
+	if _, err := LoadJob(envOf(j)); err == nil || !strings.Contains(err.Error(), "MAILCTL_STORE_DIR is required") {
+		t.Fatalf("no store: %v", err)
+	}
+	for _, bad := range []string{"store", "/", "/var/lib/../x"} {
+		j["MAILCTL_STORE_DIR"] = bad
+		if _, err := LoadJob(envOf(j)); err == nil {
+			t.Errorf("store %s accepted", bad)
+		}
+	}
+	j["MAILCTL_STORE_DIR"] = "/var/lib/stalwart"
+	j["MAILCTL_API_KEY_FILE"] = "/data/key"
+	if c, err := LoadJob(envOf(j)); err != nil || c.StoreDir != "/var/lib/stalwart" || c.APIKeyFile != "/data/key" {
+		t.Fatalf("%+v %v", c, err)
+	}
+}

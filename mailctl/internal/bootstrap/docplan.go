@@ -76,7 +76,15 @@ func ApplyDoc(ctx context.Context, c *stalwart.Client, doc *state.Doc) (bool, er
 			continue
 		}
 		if s.Object == "SystemSettings" {
-			s = Singleton{s.Object, map[string]any{"defaultHostname": p.Hostname}}
+			patch := map[string]any{"defaultHostname": p.Hostname}
+			// The default domain follows the primary domain once it exists
+			// (the bootstrap left the parking domain there).
+			if id, err := domainID(ctx, c, p.PrimaryDomain); err != nil {
+				return changed, err
+			} else if id != "" {
+				patch["defaultDomainId"] = id
+			}
+			s = Singleton{s.Object, patch}
 		}
 		ch, err := ensureSingleton(ctx, c, s)
 		if err != nil {
@@ -148,4 +156,18 @@ func tightenStrategies(ctx context.Context, c *stalwart.Client, want []map[strin
 	}
 	r, err := c.Set(ctx, "MtaTlsStrategy", create, update, nil)
 	return true, checkSet("MtaTlsStrategy", r, err)
+}
+
+// domainID is the id of the Domain named name ("" = none yet).
+func domainID(ctx context.Context, c *stalwart.Client, name string) (string, error) {
+	doms, err := getAll(ctx, c, "Domain")
+	if err != nil {
+		return "", err
+	}
+	for _, d := range doms {
+		if str(d, "name") == name {
+			return str(d, "id"), nil
+		}
+	}
+	return "", nil
 }

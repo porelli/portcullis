@@ -336,7 +336,7 @@ func jobFor(cfg config.Config, argv []string, stderr io.Writer) (*bootstrap.Job,
 		return nil, err
 	}
 	logger := logx.New(stderr)
-	return &bootstrap.Job{URL: cfg.JobLocalURL, DataDir: cfg.DataDir, SessionFile: cfg.JobSessionFile, ServerImage: cfg.ServerImage,
+	return &bootstrap.Job{URL: cfg.JobLocalURL, DataDir: cfg.DataDir, KeyFile: cfg.APIKeyFile, StoreDir: cfg.StoreDir, SessionFile: cfg.JobSessionFile, ServerImage: cfg.ServerImage,
 		Params: p, Start: childServer(argv, stderr), Logf: logger.Printf}, nil
 }
 
