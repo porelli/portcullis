@@ -61,6 +61,30 @@ mail_former_hosts_json() {
   jq -Rnc '[inputs | select(length > 0)]' 2>/dev/null < "$(_mail_dir)/former-hostnames" || echo '[]'
 }
 
+# mail_dkim_written_json — secrets/mail/dkim-written (the main domain's
+# <selector>._domainkey names the mail set wrote) as a JSON array: the dns
+# tool removes a stale DKIM record only when it is listed (a foreign one
+# stays).
+mail_dkim_written_json() {
+  jq -Rnc '[inputs | select(length > 0)]' 2>/dev/null < "$(_mail_dir)/dkim-written" || echo '[]'
+}
+
+# mail_dkim_record <records JSON> — after a successful write of the main
+# set: its <selector>._domainkey.<domain> TXT names added to
+# secrets/mail/dkim-written.
+mail_dkim_record() {
+  local d f n
+  d="$(printf '%s' "${PORTCULLIS_DOMAIN:-}" | tr '[:upper:]' '[:lower:]')"
+  f="$(_mail_dir)/dkim-written"
+  (umask 077 && mkdir -p "$(_mail_dir)" && touch "$f")
+  while IFS= read -r n; do
+    [ -n "$n" ] && ! grep -qxF "$n" "$f" && (umask 077 && printf '%s\n' "$n" >> "$f")
+  done < <(printf '%s' "$1" | jq -r --arg d "$d" '.[]? | select((.type | ascii_upcase) == "TXT")
+      | .name | ascii_downcase | rtrimstr(".") | select(endswith("._domainkey." + $d))
+      | select(rtrimstr("._domainkey." + $d) | test("^[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?$"))' 2>/dev/null)
+  return 0
+}
+
 # mail_lan_only_ok <true|false> — LAN-only (MAIL_SUBMISSION_LAN_ONLY) is
 # refused under rootless Podman (fail closed): every client seems to come
 # from the rootlessport gateway, so the Local networks can't be told apart.
@@ -345,6 +369,7 @@ _mail_main_set() {
   fi
   DNS_SETS=mail DNS_MAIL_RECORDS="$MAIL_MAIN_RECS" DNS_MAIL_RULES="$MAIL_MAIN_RULES" DNS_MAIL_TLSA="$(printf '%s' "$1" | jq -c '.publish // []')" _dns_tool apply >/dev/null \
     || fail "the main domain's mail records could not be written"
+  mail_dkim_record "$MAIL_MAIN_RECS"
 }
 
 # mail_ipv6_refuse — IPv6 for mail isn't supported yet: [::] ports onto an

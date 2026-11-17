@@ -135,6 +135,12 @@ type Spec struct {
 	// FormerMailHosts: earlier MAIL_HOSTNAMEs (recorded by the CLI): a live
 	// MX target is adopted as a former host only when it is one of them.
 	FormerMailHosts []string
+	// MailDKIMWritten: the <selector>._domainkey.<d> names the mail set
+	// wrote before (the domain's committed records; for the main domain
+	// the CLI's secrets/mail/dkim-written). Any single-label selector is
+	// valid in the set, but a stale one is removed only when it is listed
+	// here: a DKIM record someone else wrote is never deleted.
+	MailDKIMWritten []string
 	// Owned: the CAA entries an enrolled domain wrote (removed with CAA
 	// off). Main: the main domain (removal by signature instead).
 	Owned []Ref

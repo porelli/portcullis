@@ -356,7 +356,11 @@ func childServer(argv []string, out io.Writer) bootstrap.Server {
 			return nil, err
 		}
 		done := make(chan error, 1)
-		go func() { done <- cmd.Wait() }()
+		go func() {
+			err := cmd.Wait() // every write of the child's output is done
+			_ = rw.Close()
+			done <- err
+		}()
 		return func() error {
 			_ = cmd.Process.Signal(syscall.SIGTERM)
 			select {

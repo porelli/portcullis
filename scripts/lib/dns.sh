@@ -69,6 +69,7 @@ _dns_tool_input() {
     --argjson nomail "$nomail" --arg sets "${DNS_SETS:-}" --arg mail "${ALERT_SMTP_FROM:-}" \
     --arg mailrecs "${DNS_MAIL_RECORDS:-}" --arg mailtlsa "${DNS_MAIL_TLSA:-}" --arg mailrules "${DNS_MAIL_RULES:-}" --arg mailhost "${MAIL_HOSTNAME:-mail.$PORTCULLIS_DOMAIN}" \
     --argjson mailon "$(declare -F mail_slot_open >/dev/null && mail_slot_open && echo true || echo false)" \
+    --argjson dkimw "$(declare -F mail_dkim_written_json >/dev/null && mail_dkim_written_json || echo '[]')" \
     --argjson former "$(declare -F mail_former_hosts_json >/dev/null && mail_former_hosts_json || echo '[]')" '
     {name: $name, ipv4: $ipv4, ipv6: $ipv6, ca_server: $ca,
      caa: {enabled: $caa, issuer: $issuer, account_uri: $uri, iodef: $iodef},
@@ -78,6 +79,7 @@ _dns_tool_input() {
     + (if $mailrecs != "" and $mailrecs != "[]" and $mailtlsa != "" and ($mailtlsa | fromjson | length) > 0 then {mail_tlsa: ($mailtlsa | fromjson)} else {} end)
     + (if $mailrecs != "" and $mailrecs != "[]" and $mailrules != "" then {mail_rules: ($mailrules | fromjson)} else {} end)
     + (if $mailrecs != "" and ($former | length) > 0 then {mail_former_hosts: $former} else {} end)
+    + (if $mailrecs != "" and ($dkimw | length) > 0 then {mail_dkim_written: $dkimw} else {} end)
     + (if $mode == "write"
        then {provider: $provider, credentials: ($map | map({key: .key, value: env[.var]}) | from_entries)}
        else {provider: ""} end)'
@@ -369,6 +371,9 @@ dns_setup() {
   info "Applying the record sets: $DNS_SETS (then waiting for the public resolvers: the TTL the provider stored + 1 min, at most 15 min)..."
   rc=0
   out="$(DNS_ON_SETTLE="$settle_hook" _dns_apply_quiet --wait auto)" || rc=$?
+  if { [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ] || [ "$rc" -eq 4 ]; } && [[ " $DNS_SETS " == *" mail "* ]] && [ -n "${DNS_MAIL_RECORDS:-}" ] && declare -F mail_dkim_record >/dev/null; then
+    mail_dkim_record "$DNS_MAIL_RECORDS"
+  fi
   [ "$rc" -ne 4 ] || { dns_main_refresh; fail "the records were written, but the flip's settle point couldn't be saved ($(_dns_relax_file)): don't flip ACME_STAGING before the old CAA pin's TTL has passed"; }
   # A pin written again while a flip's settle point is saved (ACME_STAGING
   # reverted mid-flip) only moves the point later (I10).

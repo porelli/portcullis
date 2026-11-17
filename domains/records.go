@@ -337,10 +337,14 @@ func refsFromPlan(refs []dnsplan.Ref) []RecordRef {
 // sets), pinned to accountURI.
 func (s *Service) spec(d *Domain, accountURI string) dnsplan.Spec {
 	var owned []RecordRef
-	for _, refs := range d.Records {
+	var dkim []dnsplan.MailRecord
+	for zone, refs := range d.Records {
 		for _, r := range refs {
 			if r.Type == "CAA" {
 				owned = append(owned, r)
+			}
+			if r.Type == "TXT" {
+				dkim = append(dkim, dnsplan.MailRecord{Name: libdns.AbsoluteName(r.Name, zone), Type: r.Type})
 			}
 		}
 	}
@@ -349,6 +353,9 @@ func (s *Service) spec(d *Domain, accountURI string) dnsplan.Spec {
 	if contains(d.Sets, dnsplan.SetMail) {
 		sp.Mail = d.MailWanted
 	}
+	// Only the DKIM names this domain's records step wrote are removed
+	// when stale (a foreign <selector>._domainkey stays).
+	sp.MailDKIMWritten = dnsplan.DKIMNames(d.Name, dkim)
 	return sp
 }
 

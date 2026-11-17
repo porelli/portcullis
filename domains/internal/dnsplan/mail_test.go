@@ -297,10 +297,13 @@ func TestMailRemovalBringsNoMailBack(t *testing.T) {
 	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err != nil {
 		t.Fatal(err)
 	}
-	// A rotation drops the old RSA selector: its TXT goes.
+	// A rotation drops the old RSA selector: its TXT goes (the caller
+	// recorded it as written).
+	e.in.Spec.MailDKIMWritten = DKIMNames(pd, e.in.Spec.Mail)
 	rot := mainMail()
 	rot[3].Name = "v1-rsa-20270514._domainkey." + pd
 	e.in.Spec.Mail = rot
+	e.in.Spec.MailDKIMWritten = append(e.in.Spec.MailDKIMWritten, DKIMNames(pd, rot)...)
 	_, removed, err := Apply(ctx, e.in, []string{SetMail})
 	if err != nil {
 		t.Fatal(err)
@@ -540,5 +543,32 @@ func TestMailAnyDKIMSelector(t *testing.T) {
 	}
 	if MailNameOwned(e, "a.b._domainkey."+e) {
 		t.Error("a dotted selector is owned")
+	}
+}
+
+// A DKIM record the set never wrote (another sender's selector) survives
+// a sync and the set's removal; a written stale selector goes (security
+// review, fix round 1).
+func TestMailForeignDKIMSurvives(t *testing.T) {
+	e, _ := mailEnv(t, false)
+	ctx := context.Background()
+	const foreign = "x._domainkey." + pd
+	e.zone.Set(foreign, libdns.RR{Name: "x._domainkey.portcullis", Type: "TXT", Data: "v=DKIM1; k=rsa; p=FOREIGN", TTL: time.Hour})
+	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.zone.Records(foreign)) != 1 {
+		t.Fatal("a foreign DKIM record was removed by the sync")
+	}
+	e.in.Spec.MailDKIMWritten = DKIMNames(pd, e.in.Spec.Mail)
+	e.in.Spec.Mail = []MailRecord{}
+	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.zone.Records(foreign)) != 1 {
+		t.Fatal("a foreign DKIM record was removed with the set")
+	}
+	if len(e.zone.Records(dkimRS)) != 0 || len(e.zone.Records(dkimED)) != 0 {
+		t.Fatalf("written selectors left: %v %v", e.zone.Records(dkimRS), e.zone.Records(dkimED))
 	}
 }

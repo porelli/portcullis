@@ -34,3 +34,37 @@ func TestRedactingWriter(t *testing.T) {
 		t.Fatalf("%q", b.String())
 	}
 }
+
+// A line longer than the buffer: a secret or an API-key shape across the
+// flush cut is still redacted, and Close redacts the rest (fix round 1).
+func TestRedactingWriterLongLineAcrossCut(t *testing.T) {
+	const sec = "straddling-secret-value-0123456789"
+	AddSecret(sec)
+	key := "API_" + strings.Repeat("k", 38)
+	for _, tok := range []string{sec, key} {
+		for k := 2; k < len(tok)-1; k += 3 {
+			var b strings.Builder
+			w := NewRedactingWriter(&b)
+			// The first write overflows the buffer with the token's first
+			// k bytes at its end; the rest comes with the next write.
+			w.Write([]byte(strings.Repeat("x", redactMax) + " " + tok[:k]))
+			w.Write([]byte(tok[k:] + " " + strings.Repeat("y", 2000)))
+			w.Close()
+			out := b.String()
+			if strings.Contains(out, tok[:k]) || strings.Contains(out, tok[k:]) || !strings.Contains(out, "[redacted]") {
+				t.Fatalf("token %.8s… cut at %d escaped the redaction", tok, k)
+			}
+			if !strings.HasSuffix(out, "y") || strings.Count(out, "x") != redactMax {
+				t.Fatalf("cut %d: output lost or duplicated", k)
+			}
+		}
+	}
+	// Close with a held partial line redacts it.
+	var b strings.Builder
+	w := NewRedactingWriter(&b)
+	w.Write([]byte("tail " + sec))
+	w.Close()
+	if b.String() != "tail [redacted]" {
+		t.Fatalf("close: %q", b.String())
+	}
+}

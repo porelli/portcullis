@@ -5072,6 +5072,14 @@ mt '. "$HERE/../scripts/lib/dns.sh"; echo 1 > "$ML/hub-dns-main.rc"; rm -f "$ML/
 expect_eq "dns setup --only mail with dns-main refused (not the not-wired text): refused" "$rc:$(grep -c "The Hub didn't give\|the Hub didn't give" "$ML/out")" "1:1"
 mte '. "$HERE/../scripts/lib/dns.sh"; DNS_SETS=mail DNS_MAIL_RECORDS="[{\"name\":\"mail.example\",\"type\":\"MX\",\"ttl\":3600,\"value\":\"10 mail.mail.example.\"}]" DNS_MAIL_RULES="{\"relay_include\":\"\",\"dmarc_floor\":\"reject\",\"draining\":false}" _dns_tool_input read > "$ML/dnsin"; DNS_SETS=mail DNS_MAIL_RECORDS="[]" DNS_MAIL_RULES="{\"dmarc_floor\":\"reject\"}" _dns_tool_input read > "$ML/dnsin2"'; rc=$?
 expect_eq "dns tool input: mail_rules with a non-empty set only" "$rc:$(jq -c .mail_rules "$ML/dnsin"):$(jq -c 'has("mail_rules")' "$ML/dnsin2")" '0:{"relay_include":"","dmarc_floor":"reject","draining":false}:false'
+# test_mail_dkim_written (security review): the main set's DKIM names are
+# recorded after a write and passed back, so only those are removed.
+mte 'printf "%s" "{\"records\":[{\"name\":\"Sel1._domainkey.mail.example.\",\"type\":\"TXT\",\"ttl\":3600,\"value\":\"v=DKIM1; p=x\"},{\"name\":\"a.b._domainkey.mail.example\",\"type\":\"TXT\",\"ttl\":3600,\"value\":\"v=DKIM1; p=y\"},{\"name\":\"mail.example\",\"type\":\"MX\",\"ttl\":3600,\"value\":\"10 mail.mail.example.\"}],\"rules\":{\"relay_include\":\"\",\"dmarc_floor\":\"none\",\"draining\":false}}" > "$ML/hub-dns-main"; mail_rotate ""; mail_rotate ""'; rc=$?
+expect_eq "mail rotate: the written DKIM names recorded once (single-label selectors only)" "$rc:$(cat "$ML/root/secrets/mail/dkim-written" 2>/dev/null | tr '\n' '|')" "0:sel1._domainkey.mail.example|"
+mte '. "$HERE/../scripts/lib/dns.sh"; mkdir -p "$PORTCULLIS_ROOT/secrets/mail"; echo sel1._domainkey.mail.example > "$PORTCULLIS_ROOT/secrets/mail/dkim-written"; DNS_SETS=mail DNS_MAIL_RECORDS="[]" _dns_tool_input read > "$ML/dnsin"'; rc=$?
+expect_eq "dns tool input: mail_dkim_written passed (also when the set is withdrawn)" "$rc:$(jq -c .mail_dkim_written "$ML/dnsin")" '0:["sel1._domainkey.mail.example"]'
+mte 'echo 1 > "$ML/hub-dns-main.rc"; rm -f "$ML/hub-dns-main"; printf "no mail provider is wired\n" > "$ML/hub-dns-main.err"; mail_rotate ""'; rc=$?
+expect_eq "mail rotate: a withdrawal records nothing" "$rc:$([ -s "$ML/root/secrets/mail/dkim-written" ] && echo some || echo none)" "0:none"
 # up / upgrade with the slot open: the refusals and the certificate when
 # mail_tls has none.
 mte 'mail_tls_present() { return 1; }; mail_up_steps up'; rc=$?

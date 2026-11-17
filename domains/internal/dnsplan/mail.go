@@ -255,6 +255,25 @@ func mailOwns(d string, hosts []string, n, t string) bool {
 // records (<e> and MAIL_HOSTNAME): other TXT records stay.
 func txtSPFOnly(d string, hosts []string, n string) bool { return n == d || contains(hosts, n) }
 
+// isDKIMName: n is <selector>._domainkey.<d>.
+func isDKIMName(d, n string) bool {
+	sel, ok := strings.CutSuffix(n, "._domainkey."+d)
+	return ok && dkimLabel.MatchString(sel)
+}
+
+// DKIMNames: the <selector>._domainkey.<d> names among recs (what the
+// caller records as written once the set is applied).
+func DKIMNames(d string, recs []MailRecord) []string {
+	d = bare(d)
+	var out []string
+	for _, r := range recs {
+		if n := bare(r.Name); strings.EqualFold(r.Type, "TXT") && isDKIMName(d, n) && !contains(out, n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // mailNameOwned: n is a name the mail set may write at d (any type).
 func mailNameOwned(d string, hosts []string, n string) bool {
 	for _, t := range mailTypes {
@@ -428,6 +447,9 @@ func mailPairs(s Spec, d string, hosts []string, live []liveRec) []mailPair {
 			continue
 		}
 		if p.typ == "TXT" && txtSPFOnly(d, hosts, p.name) && !isSPF(txtJoin(l.rr.Data)) {
+			continue
+		}
+		if p.typ == "TXT" && isDKIMName(d, p.name) && !contains(bareAll(s.MailDKIMWritten), p.name) {
 			continue
 		}
 		if len(s.Mail) == 0 && s.NoMail && nomailOwns(d, p) {

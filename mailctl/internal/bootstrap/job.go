@@ -245,6 +245,9 @@ func (j *Job) Run(ctx context.Context) (err error) {
 			if p.ClientIP == "" {
 				p.ClientIP = state.ClientIPPreserved
 			}
+			if err := StoreEmpty(ctx, c, p); err != nil {
+				return "", err
+			}
 			old, _ := os.ReadFile(j.keyFile())
 			res, err := Apply(ctx, c, p, strings.TrimSpace(string(old)) == "", j.logf)
 			return res.APIKey, err

@@ -558,6 +558,8 @@ func TestToolApplyMainMail(t *testing.T) {
 		m["sets"] = []string{"mail"}
 		m["mail"] = []dnsplan.MailRecord{}
 		m["mail_hostname"] = h
+		// The CLI's record of the DKIM names it wrote (only those go).
+		m["mail_dkim_written"] = []string{"v1-ed25519-20261115._domainkey." + d, "v1-rsa-20261115._domainkey." + d}
 	})); code != exitOK {
 		t.Fatalf("mail off = %d %s %s", code, out, errs)
 	}
@@ -670,5 +672,30 @@ func TestMainSetSharedRules(t *testing.T) {
 	}
 	if code, errs := run([]dnsplan.MailRecord{mx}, map[string]any{"relay_include": "", "dmarc_floor": "none", "draining": false}); code != exitOK {
 		t.Fatalf("ok: %d %s", code, errs)
+	}
+}
+
+// mail_dkim_written: only <selector>._domainkey.<name> names (security
+// review, fix round 1).
+func TestToolMailDKIMWritten(t *testing.T) {
+	f := newToolFixture(t)
+	const d, h = "portcullis.example.test", "mail.portcullis.example.test"
+	run := func(names []string) (int, string) {
+		code, _, errs := f.run([]string{"plan"}, toolJSON(func(m map[string]any) {
+			readOnly(m)
+			m["sets"] = []string{"mail"}
+			m["mail"] = []dnsplan.MailRecord{}
+			m["mail_hostname"] = h
+			m["mail_dkim_written"] = names
+		}))
+		return code, errs
+	}
+	if code, errs := run([]string{"s1._domainkey." + d}); code != exitOK {
+		t.Fatalf("a DKIM name refused: %d %s", code, errs)
+	}
+	for _, bad := range []string{"_dmarc." + d, "a.b._domainkey." + d, "s1._domainkey.other.test"} {
+		if code, errs := run([]string{bad}); code != exitUsage || !strings.Contains(errs, "mail_dkim_written") {
+			t.Fatalf("%s: %d %s", bad, code, errs)
+		}
 	}
 }

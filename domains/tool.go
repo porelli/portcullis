@@ -88,6 +88,10 @@ type toolInput struct {
 	// adopted as a former host, whose HELO SPF and TLSA the set then
 	// removes (final review L7: never a host merely shaped like one).
 	MailFormerHosts []string `json:"mail_former_hosts,omitempty"`
+	// MailDKIMWritten: the <selector>._domainkey.<name> names the CLI
+	// recorded as written (secrets/mail/dkim-written): only these are
+	// removed when stale; a foreign DKIM record stays.
+	MailDKIMWritten []string `json:"mail_dkim_written,omitempty"`
 }
 
 // toolInputMax bounds stdin; toolInputMailMax with the mail set.
@@ -428,7 +432,7 @@ func readToolInput(r io.Reader) (toolInput, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&in); err != nil {
 		// Never quote the input (it holds the credentials).
-		return in, errors.New("stdin must be one JSON object with the documented keys (name, provider, credentials, ipv4, ipv6, ca_server, caa, nomail, sets, mail_from, mail, mail_tlsa, mail_rules, mail_hostname)")
+		return in, errors.New("stdin must be one JSON object with the documented keys (name, provider, credentials, ipv4, ipv6, ca_server, caa, nomail, sets, mail_from, mail, mail_tlsa, mail_rules, mail_hostname, mail_former_hosts, mail_dkim_written)")
 	}
 	if dec.Decode(&struct{}{}) != io.EOF {
 		return in, errors.New("stdin must hold exactly one JSON object")
@@ -514,6 +518,13 @@ func (in toolInput) spec() (dnsplan.Spec, error) {
 			}
 		}
 		sp.Mail, sp.MailHost = *in.Mail, host
+		for _, n := range in.MailDKIMWritten {
+			n = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(n), "."))
+			if len(dnsplan.DKIMNames(sp.Name, []dnsplan.MailRecord{{Name: n, Type: "TXT"}})) != 1 {
+				return dnsplan.Spec{}, fmt.Errorf("mail_dkim_written: %q isn't <selector>._domainkey.%s", n, sp.Name)
+			}
+			sp.MailDKIMWritten = append(sp.MailDKIMWritten, n)
+		}
 		for _, f := range in.MailFormerHosts {
 			f = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(f), "."))
 			if !validHostname(f) {

@@ -222,3 +222,39 @@ func TestBootstrapJobVerifiesRecoveryRefused(t *testing.T) {
 		t.Fatal("no server: accepted")
 	}
 }
+
+// Ruling R-H2b: an unmarked store holding data (a lost marker) never gets
+// the document-less base plan: the job fails closed and writes nothing.
+// The plan's own objects (mailctl's account, the parking domain) don't
+// count, so a first plan that failed half way runs again.
+func TestBootstrapJobRefusesPlanOnUnmarkedStoreWithData(t *testing.T) {
+	for name, seed := range map[string]func(f *fakeStalwart){
+		"account": func(f *fakeStalwart) { f.put("Account", map[string]any{"name": "alice", "domainId": "d1"}) },
+		"domain":  func(f *fakeStalwart) { f.put("Domain", map[string]any{"name": "example.org"}) },
+	} {
+		s := &jobServer{f: newFake()}
+		seed(s.f)
+		j := newJob(t, s)
+		err := j.Run(context.Background())
+		var sets []string
+		for _, c := range s.f.calls {
+			if strings.Contains(c, "/set") {
+				sets = append(sets, c)
+			}
+		}
+		if err == nil || !strings.Contains(err.Error(), "R-H2b") || len(sets) != 0 || markerValid(j.StoreDir) {
+			t.Fatalf("%s: %v sets %q marked %v", name, err, sets, markerValid(j.StoreDir))
+		}
+		if _, err := os.Stat(KeyFile(j.DataDir)); !os.IsNotExist(err) {
+			t.Fatalf("%s: a key was written", name)
+		}
+	}
+	// Only the plan's own objects: the plan runs (a half-done first plan).
+	s := &jobServer{f: newFake()}
+	d9 := s.f.put("Domain", map[string]any{"name": ParkingDomain})
+	s.f.put("Account", map[string]any{"name": MailctlAccount, "domainId": d9})
+	j := newJob(t, s)
+	if err := j.Run(context.Background()); err != nil || !markerValid(j.StoreDir) {
+		t.Fatalf("plan-only objects: %v", err)
+	}
+}
