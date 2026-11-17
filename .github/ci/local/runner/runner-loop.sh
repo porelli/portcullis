@@ -81,8 +81,8 @@ done
 docker exec "$c" pcci-docker-sanitize
 docker exec "$c" chown runner:runner /home/runner/work /home/runner/.cache /home/runner/go /opt/hostedtoolcache /srv
 docker exec "$c" chmod 0755 /srv
-docker cp "$(dirname "$0")/job-started-hook.sh" "$c:/usr/local/bin/pcci-job-started"
-docker exec "$c" chmod 0755 /usr/local/bin/pcci-job-started
+docker cp "$(dirname "$0")/job-started-hook.sh" "$c:/usr/local/bin/pcci-job-started.sh"
+docker exec "$c" chmod 0755 /usr/local/bin/pcci-job-started.sh
 
 export ACTIONS_RUNNER_INPUT_TOKEN="$token"
 docker exec -u runner -w /home/runner/actions-runner -e ACTIONS_RUNNER_INPUT_TOKEN "$c" ./config.sh --unattended \
@@ -91,6 +91,6 @@ docker exec -u runner -w /home/runner/actions-runner -e ACTIONS_RUNNER_INPUT_TOK
 unset ACTIONS_RUNNER_INPUT_TOKEN token
 echo "registered $NAME on $REPO (ephemeral): waiting for one job"
 docker exec -u runner -w /home/runner/actions-runner -e HOME=/home/runner -e GOFLAGS=-mod=readonly \
-  -e ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/pcci-job-started \
+  -e ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/pcci-job-started.sh \
   -e PCCI_ALLOWED_REPO="$REPO" -e PCCI_ALLOWED_WORKFLOW="$WORKFLOW" -e PCCI_ALLOWED_ACTOR="$OWNER" "$c" ./run.sh || true
 echo "$NAME: job done; removing the container"
