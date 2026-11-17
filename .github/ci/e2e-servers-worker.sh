@@ -95,10 +95,16 @@ case "$kind" in
       # /run/user/<uid> is the worker's (0700): test its bus as root.
       sudo systemctl start "user@$uid.service" || true
       for i in $(seq 1 60); do sudo test -S "/run/user/$uid/bus" && break; [ "$i" -eq 60 ] && { echo "FAIL: no user manager for $WUSER"; systemctl status "user@$uid.service" --no-pager | tail -20; exit 1; }; sleep 1; done
-      # The runner's image sets XDG_RUNTIME_DIR for every login (pam_env:
-      # /run/user/<the runner>): the worker's user manager must have its own,
-      # or podman.service fails "mkdir /run/user/<runner>/libpod".
-      asworker sh -c 'systemctl --user set-environment XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" && systemctl --user enable --now podman.socket && systemctl --user enable podman-restart.service' 
+      # The runner's image puts its own paths in /etc/environment
+      # (XDG_RUNTIME_DIR=/run/user/<the runner>, XDG_CONFIG_HOME=/home/runner/
+      # .config, ...), which pam_env hands to every user manager: podman.service
+      # then fails ("mkdir /run/user/<runner>/libpod", "faccessat /home/runner/
+      # .config/containers/storage.conf: permission denied"). Drop them all
+      # (PATH stays) and give the worker's manager its own runtime dir.
+      envvars="$(sed -En 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' /etc/environment 2>/dev/null | grep -vx PATH | tr '\n' ' ')"
+      # shellcheck disable=SC2016
+      asworker env ENVVARS="$envvars" sh -c '[ -z "$ENVVARS" ] || systemctl --user unset-environment $ENVVARS; systemctl --user set-environment XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" && systemctl --user enable --now podman.socket && systemctl --user enable podman-restart.service'
+      echo "== podman worker: the user manager's environment: $(asworker systemctl --user show-environment 2>&1 | cut -d= -f1 | tr '\n' ' ')"
     fi
     echo "== podman worker: the user's socket"
     for i in $(seq 1 30); do
