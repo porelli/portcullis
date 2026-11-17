@@ -48,3 +48,6 @@ __pycache__/
 
 # ./portcullis one-at-a-time lock (cli_lock)
 .portcullis.lock
+
+# A local `go build` in enroll/ (final review M10).
+/enroll/enroll

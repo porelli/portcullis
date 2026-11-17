@@ -158,6 +158,8 @@ jobs:
         run: shellcheck -S warning portcullis scripts/lib/*.sh tests/*.sh tests/e2e/*.sh vault/entrypoint.sh .github/automerge/*.sh .github/ci/*.sh .github/ci/local/*.sh .github/ci/local/runner/*.sh
       - name: ci.yml stays under GitHub's workflow size limit (lint at 450,000 bytes; GitHub refuses 500 KB)
         run: tests/lint_ci_size.sh
+      - name: No compiled program is tracked (tests/lint_no_binaries.sh)
+        run: bash tests/lint_no_binaries.sh
       - name: No Actions cache write from the builder (runner=builder jobs; tests/lint_builder_cache.sh)
         run: bash tests/lint_builder_cache.sh .github/workflows/ci.yml
       - name: Dependabot auto-merge tests (fake gh + fixtures)
