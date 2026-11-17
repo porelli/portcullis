@@ -63,6 +63,12 @@ var MailctlRolePermissions = func() []string {
 		"sysMtaRouteGet", "sysMtaRouteQuery", "sysMtaRouteCreate", "sysMtaRouteUpdate", "sysMtaRouteDestroy",
 		"sysMtaTlsStrategyCreate", "sysMtaOutboundStrategyGet", "sysMtaOutboundStrategyUpdate",
 		"sysSecurityGet", "sysSecurityUpdate",
+		// An account is created with the built-in User role, and Stalwart
+		// refuses to grant a role whose permissions the caller lacks: 1.1's
+		// User role (after the role-permission update) holds the passkey
+		// set, so the key holds it too (seen in core CI: every account
+		// create refused "not authorized to grant permissions: sysPasskey…").
+		"sysPasskeyGet", "sysPasskeyCreate", "sysPasskeyUpdate", "sysPasskeyDestroy", "sysPasskeyQuery",
 	}
 	seen := map[string]bool{}
 	var out []string
