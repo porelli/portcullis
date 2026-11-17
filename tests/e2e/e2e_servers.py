@@ -297,7 +297,7 @@ def echo_on_worker_signed_in():
     assert state.get("w1"), "needs join_ok"
     for iid, srv in (("se0", ""), ("se1", "w1")):
         run_op("POST", "/api/instances", {"template": "servers-echo", "id": iid, "label": iid.upper(),
-                                          "hosts": {"echo": f"{iid}.{DOMAIN}"}, "server": srv})
+                                          "hosts": {"secho": f"{iid}.{DOMAIN}"}, "server": srv})
         lldap_member("alice", f"users_{iid}")
         run_op("POST", "/api/templates/enable", {"id": iid}, timeout=900)
     page = state["alice_page"]
