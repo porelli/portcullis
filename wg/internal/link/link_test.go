@@ -71,6 +71,12 @@ type worker struct {
 
 func newWorker(t *testing.T, id, ip string, linkPub [32]byte, linkPort int) *worker {
 	t.Helper()
+	return newWorkerCtl(t, id, ip, linkPub, linkPort, func(c net.Conn) { io.Copy(c, c) })
+}
+
+// newWorkerCtl is newWorker with its own control (7443) handler.
+func newWorkerCtl(t *testing.T, id, ip string, linkPub [32]byte, linkPort int, ctlH func(net.Conn)) *worker {
+	t.Helper()
 	s, pub := newStack(t, ip, 0)
 	if err := s.SyncPeers([]tunnel.PeerConfig{{PublicKey: linkPub, IP: linkdoc.LinkAddr,
 		Endpoint: netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(linkPort)), Keepalive: 1}}); err != nil {
@@ -82,7 +88,7 @@ func newWorker(t *testing.T, id, ip string, linkPub [32]byte, linkPort int) *wor
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { ctl.Close() })
-	go acceptLoop(ctl, func(c net.Conn) { io.Copy(c, c) })
+	go acceptLoop(ctl, ctlH)
 	data, err := s.ListenTCP(DataPort)
 	if err != nil {
 		t.Fatal(err)
@@ -850,5 +856,111 @@ func TestNoNetstackListenCalls(t *testing.T) {
 				t.Errorf("%s calls %s", f, bad)
 			}
 		}
+	}
+}
+
+// TestPerPeerCapsDontStarveOthers: a worker holding its whole control
+// share open gets 503 busy, and another worker's control CONNECT still
+// answers 200 and echoes.
+func TestPerPeerCapsDontStarveOthers(t *testing.T) {
+	f := newFixture(t)
+	f.link.MaxControlPerPeer = 2
+	a := newWorker(t, "a", "10.214.0.10", f.pub, f.port)
+	b := newWorker(t, "b", "10.214.0.11", f.pub, f.port)
+	f.apply(map[*worker]string{a: linkdoc.StateReady, b: linkdoc.StateReady})
+	for i := 0; i < 2; i++ {
+		code, c, br := connect(t, f.ctlAddr, "CONNECT", "10.214.0.10:7443", nil)
+		if code != 200 {
+			t.Fatalf("a's stream %d: %d", i, code)
+		}
+		echoes(t, c, br, fmt.Sprintf("a%d", i))
+	}
+	if code, _, _ := connect(t, f.ctlAddr, "CONNECT", "10.214.0.10:7443", nil); code != http.StatusServiceUnavailable {
+		t.Fatalf("a beyond its share: %d, want 503", code)
+	}
+	code, c, br := connect(t, f.ctlAddr, "CONNECT", "10.214.0.11:7443", nil)
+	if code != 200 {
+		t.Fatalf("b while a is at its share: %d, want 200", code)
+	}
+	echoes(t, c, br, "b")
+	if n := f.link.OpenStreams(); n != 3 {
+		t.Fatalf("open streams: %d, want 3", n)
+	}
+}
+
+// TestPerPeerDataCap: the data share is per server too (admission).
+func TestPerPeerDataCap(t *testing.T) {
+	doc := &linkdoc.Doc{
+		Version: 1, WrittenAt: time.Now().UTC(), Subnet: "10.214.0.0/24",
+		Peers: []linkdoc.Peer{
+			{ID: "w1", PublicKey: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=", IP: "10.214.0.10", State: "ready"},
+			{ID: "w2", PublicKey: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=", IP: "10.214.0.11", State: "ready"},
+		},
+		Relays: []linkdoc.Relay{},
+	}
+	doc, err := linkdoc.Parse(mustJSON(t, doc))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stack, _ := newStack(t, linkdoc.LinkAddr.String(), freeUDP(t))
+	l := New(stack, func() *linkdoc.Doc { return doc })
+	l.MaxDataPerPeer = 3
+	l.Reload(doc)
+	ctx := context.Background()
+	open := func(id string) *stream {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		return l.newStreamLocked(ctx, "data", doc.PeerByID(id))
+	}
+	for i := 0; i < 3; i++ {
+		if open("w1") == nil {
+			t.Fatalf("w1 data %d refused under its share", i)
+		}
+	}
+	if open("w1") != nil {
+		t.Fatal("w1 beyond its data share: accepted")
+	}
+	if open("w2") == nil {
+		t.Fatal("w2 refused while w1 is at its share")
+	}
+	// The control share is separate from the data share.
+	l.mu.Lock()
+	s := l.newStreamLocked(ctx, "control", doc.PeerByID("w1"))
+	l.mu.Unlock()
+	if s == nil {
+		t.Fatal("w1 control refused because of its data streams")
+	}
+}
+
+// TestDrainTimeoutEndsHalfClosedStream: the client closes; a worker that
+// reads but never answers nor closes can hold the stream only for the
+// drain timeout.
+func TestDrainTimeoutEndsHalfClosedStream(t *testing.T) {
+	f := newFixture(t)
+	f.link.DrainTimeout = 500 * time.Millisecond
+	hold := make(chan struct{})
+	t.Cleanup(func() { close(hold) })
+	w := newWorkerCtl(t, "w1", "10.214.0.10", f.pub, f.port, func(c net.Conn) {
+		io.Copy(io.Discard, c) // reads to EOF, never writes, never closes
+		<-hold
+	})
+	f.apply(map[*worker]string{w: linkdoc.StateReady})
+	code, c, _ := connect(t, f.ctlAddr, "CONNECT", "10.214.0.10:7443", nil)
+	if code != 200 {
+		t.Fatalf("CONNECT: %d", code)
+	}
+	if _, err := c.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.link.OpenStreams(); n != 1 {
+		t.Fatalf("open streams: %d, want 1", n)
+	}
+	c.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for f.link.OpenStreams() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("stream still open %v after the client closed (drain 500ms)", 3*time.Second)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

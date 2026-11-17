@@ -175,29 +175,25 @@ func parseRelayTarget(hostport string) (Preamble, bool) {
 	return Preamble{Instance: inst, Service: svc, Port: port}, true
 }
 
-// newStreamLocked registers a stream for peer p (nil when at the cap).
+// newStreamLocked registers a stream for peer p (nil when at the global
+// cap for its kind or at p's own share of it).
 func (l *Link) newStreamLocked(parent context.Context, path string, p *linkdoc.Peer) *stream {
-	// Count existing streams by type (control vs data).
-	var controlCount, dataCount int
+	total, mine := 0, 0
 	for s := range l.streams {
-		if s.path == "control" {
-			controlCount++
-		} else {
-			dataCount++
+		if s.path != path {
+			continue
+		}
+		total++
+		if s.peerID == p.ID {
+			mine++
 		}
 	}
-	// Check the appropriate cap for this stream type.
-	var cap int
+	lim, perPeer := l.MaxDataStreams, l.MaxDataPerPeer
 	if path == "control" {
-		cap = l.MaxControlStreams
-		if controlCount >= cap {
-			return nil
-		}
-	} else {
-		cap = l.MaxDataStreams
-		if dataCount >= cap {
-			return nil
-		}
+		lim, perPeer = l.MaxControlStreams, l.MaxControlPerPeer
+	}
+	if total >= lim || mine >= perPeer {
+		return nil
 	}
 	// The stream outlives the request handler (hijacked), not the server.
 	ctx, cancel := context.WithCancel(context.WithoutCancel(parent))
@@ -270,9 +266,14 @@ func (l *Link) splice(w http.ResponseWriter, s *stream, to netip.AddrPort, pream
 	}()
 	select {
 	case <-done:
-		// One side ended: give the other a moment to drain, then end.
+		// One side ended: the other gets DrainTimeout to finish, then the
+		// stream ends (drop closes both connections): a peer that never
+		// closes its side can't hold the slot.
+		t := time.NewTimer(l.DrainTimeout)
+		defer t.Stop()
 		select {
 		case <-done:
+		case <-t.C:
 		case <-s.ctx.Done():
 		}
 	case <-s.ctx.Done():

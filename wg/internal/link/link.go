@@ -46,6 +46,11 @@ const (
 	DefaultDialTimeout       = 10 * time.Second
 	DefaultMaxControlStreams = 256
 	DefaultMaxDataStreams    = 8192
+	// Per server, under the global caps: one worker can't use up another's.
+	DefaultMaxControlPerPeer = 32
+	DefaultMaxDataPerPeer    = 1024
+	// After one side of a stream ends, the other gets this long to finish.
+	DefaultDrainTimeout = 5 * time.Second
 )
 
 // Link is the running role.
@@ -56,9 +61,16 @@ type Link struct {
 	// DialTimeout bounds a dial into the tunnel; MaxControlStreams caps
 	// control CONNECTs; MaxDataStreams caps data CONNECTs. Each is checked
 	// independently: control has reserved capacity data can't use up.
+	// MaxControlPerPeer / MaxDataPerPeer cap one server's streams of each
+	// kind (a worker is untrusted: holding its own streams open must not
+	// starve the others). DrainTimeout bounds the second direction once
+	// the first has ended.
 	DialTimeout       time.Duration
 	MaxControlStreams int
 	MaxDataStreams    int
+	MaxControlPerPeer int
+	MaxDataPerPeer    int
+	DrainTimeout      time.Duration
 
 	mu      sync.Mutex
 	cur     *linkdoc.Doc // the document Reload applied (nil: none / failed)
@@ -79,6 +91,9 @@ func New(stack *tunnel.Stack, doc func() *linkdoc.Doc) *Link {
 		DialTimeout:       DefaultDialTimeout,
 		MaxControlStreams: DefaultMaxControlStreams,
 		MaxDataStreams:    DefaultMaxDataStreams,
+		MaxControlPerPeer: DefaultMaxControlPerPeer,
+		MaxDataPerPeer:    DefaultMaxDataPerPeer,
+		DrainTimeout:      DefaultDrainTimeout,
 		syncErr:           "link.json: not read yet",
 		streams:           map[*stream]struct{}{},
 		rejected: prometheus.NewCounterVec(prometheus.CounterOpts{
