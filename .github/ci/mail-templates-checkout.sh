@@ -56,13 +56,16 @@ sed "s/__FAKEDNS__/$fakedns/" tests/e2e/mail/unbound-ci.conf > "$T/unbound/unbou
 grep -q '"drill-hc", "-p", "5353", "@127.0.0.1", "dnssec.works"' "$T/compose.yml" \
   || { echo "::error::$T/compose.yml: the resolver's health check changed (dnssec.works)"; exit 1; }
 sed -i "s/\"@127.0.0.1\", \"dnssec.works\"/\"@127.0.0.1\", \"$probe\"/" "$T/compose.yml"
-# e2e-mail (MAIL_CI_EGRESS="<subnet> <stalwart's address>"): the egress
-# network's subnet pinned and stalwart's address on it (the remote mail
-# server and the fake zone's records name it).
+# e2e-mail (MAIL_CI_EGRESS="<subnet> <dynamic range> <stalwart's address>"):
+# the egress network's subnet pinned, its dynamic range away from the pins
+# (the resolver starts first and would take stalwart's address), and
+# stalwart's address on it (the remote mail server and the fake zone's
+# records name it).
 if [ -n "${MAIL_CI_EGRESS:-}" ]; then
-  read -r esub eip <<<"$MAIL_CI_EGRESS"
-  [[ "$esub" =~ ^[0-9.]+/[0-9]+$ && "$eip" =~ ^[0-9.]+$ ]] || { echo "::error::MAIL_CI_EGRESS must be '<subnet> <address>'"; exit 1; }
-  ESUB="$esub" EIP="$eip" python3 - "$T/compose.yml" <<'PY'
+  read -r esub erange eip <<<"$MAIL_CI_EGRESS"
+  [[ "$esub" =~ ^[0-9.]+/[0-9]+$ && "$erange" =~ ^[0-9.]+/[0-9]+$ && "$eip" =~ ^[0-9.]+$ ]] \
+    || { echo "::error::MAIL_CI_EGRESS must be '<subnet> <range> <address>'"; exit 1; }
+  ESUB="$esub" ERANGE="$erange" EIP="$eip" python3 - "$T/compose.yml" <<'PY'
 import os, sys
 p = sys.argv[1]
 lines = open(p).read().split("\n")
@@ -77,7 +80,8 @@ for ln in lines:
         done["svc"] = True
         continue
     if ln == "  egress: {}":
-        out += ["  egress:", "    ipam:", "      config:", "        - subnet: " + os.environ["ESUB"]]
+        out += ["  egress:", "    ipam:", "      config:", "        - subnet: " + os.environ["ESUB"],
+                "          ip_range: " + os.environ["ERANGE"]]
         done["net"] = True
         continue
     out.append(ln)
@@ -85,6 +89,6 @@ if not all(done.values()):
     sys.exit("the template's egress lines changed: %r" % done)
 open(p, "w").write("\n".join(out))
 PY
-  echo "PASS: stalwart template: egress $esub, stalwart at $eip"
+  echo "PASS: stalwart template: egress $esub (dynamic $erange), stalwart at $eip"
 fi
 echo "PASS: stalwart template: adapter image portcullis-mailctl:ci, resolver → $fakedns:8053 (probe $probe)"

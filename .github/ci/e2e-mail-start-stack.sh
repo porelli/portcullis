@@ -52,7 +52,7 @@ chmod 644 /tmp/pebble.minica.pem
 # checkout (stalwart: the adapter built here, the resolver on the fake DNS
 # through the runner's :8053, egress pinned at 172.30.88.0/24 with stalwart
 # at .2) plus the CI-only mail-fake, a local source (never pulled).
-MAIL_CI_DNS_PROBE="$EXTRA" MAIL_CI_EGRESS="172.30.88.0/24 172.30.88.2" \
+MAIL_CI_DNS_PROBE="$EXTRA" MAIL_CI_EGRESS="172.30.88.0/24 172.30.88.128/25 172.30.88.2" \
   bash .github/ci/mail-templates-checkout.sh "$RUNNER_TEMP/templates" "$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}')"
 docker volume create --label com.docker.compose.project=portcullis --label com.docker.compose.volume=hub_data portcullis_hub_data >/dev/null
 docker run --rm --network none -v portcullis_hub_data:/data -v "$RUNNER_TEMP/templates:/tpl:ro" -v "$PWD/tests/e2e/apps:/src:ro" "$ALPINE" sh -c '
