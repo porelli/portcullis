@@ -63,7 +63,7 @@ def doc(ctx, accounts, lan_only=False, local=None, confirm=False):
             "confirm_mass_removal": confirm,
             "domains": [{"name": "conformance.test", "dmarc_start": "reject", "dmarc_floor": "reject", "mail": "on", "dnssec": "unsigned"}],
             "accounts": accts, "aliases": [], "lists": [], "postmaster": [], "limits": {"recipients_per_hour": 100, "recipients_per_day": 1000},
-            "spam": {"junk_score": 5, "reject_score": 10, "allow": [], "block": []},
+            "spam": {"junk_score": 5, "reject_score": 10, "dnsbl": {"spamhaus": False, "spamcop": False, "barracuda": False}, "allow": [], "block": []},
             "local_networks": local if local is not None else ["192.168.77.0/24"]}
 
 

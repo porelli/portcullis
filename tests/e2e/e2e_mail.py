@@ -753,9 +753,9 @@ def spam() -> None:
     # The vendored rules are imported (mailctl's own copy, no network).
     def rules_in():
         c = hub_ok("GET", "/api/mail/checks?refresh=1")
-        r = next((x for x in c.get("checks") or [] if x.get("id") == "spam_rules"), None)
+        r = next((x for x in c.get("checks") or [] if x.get("id") == "x-spam_rules"), None)
         return r if r and r.get("severity") == "ok" else None
-    until("the spam rules imported (check spam_rules ok)", rules_in, 300, every=65)
+    until("the spam rules imported (check x-spam_rules ok)", rules_in, 300, every=65)
     gtube = "XJS*C4JDBQADN1.NSBN3*2IDNEN*GTUBE-STANDARD-ANTI-UBE-TEST-EMAIL*C.34X"
     probe, helo = "probe@example.com", "client.example.com"
     # Stalwart v1.1.0 recognises GTUBE in the Subject (refused at DATA) and
@@ -1011,9 +1011,25 @@ def run_op_as(actor: str, method: str, path: str, body=None, timeout: float = 90
     return e2e_ops.check_ok(acc, rec)
 
 
+def counter_ahead(page: Page) -> None:
+    """The page's virtual authenticator ahead of every copy made so far:
+    a popup's copy (mail passwords) raised Keycloak's stored signature
+    counter past this page's, and Keycloak refuses a counter that goes
+    back ("Malicious counter value is detected")."""
+    auth = next((state.get("auth_" + k[5:]) for k in list(state) if k.startswith("page_") and state[k] is page), None)
+    if auth is None:
+        return
+    state["sign_bump"] = state.get("sign_bump", 0) + 100000
+    for c in auth.credentials():
+        auth.cdp.send("WebAuthn.removeCredential", {"authenticatorId": auth.id, "credentialId": c["credentialId"]})
+        auth.cdp.send("WebAuthn.addCredential", {"authenticatorId": auth.id,
+                                                 "credential": dict(c, signCount=c.get("signCount", 0) + state["sign_bump"])})
+
+
 def fresh_proof(page: Page, fa: dict, label: str) -> dict:
     """The Hub listener's fresh sign-in (prompt=login, max_age=0, PKCE
     S256), as the instance's Mail tab runs it: the wiring's proof."""
+    counter_ahead(page)
     import hashlib
     import secrets as pysecrets
     import urllib.parse
@@ -1220,8 +1236,9 @@ def wiring_guards() -> None:
 
 def template_change_holds() -> None:
     """14: the wired template's files change (a comment line), the Hub
-    syncs: no container recreated, mail_provider_refused, the mail routes
-    503; a re-wire (it voids) clears the hold."""
+    syncs: no container recreated, mail_provider_refused, the provider
+    held (Ruling R-HH1: the running, confirmed containers keep taking the
+    mail routes and documents); a re-wire clears the hold."""
     needs("setup")
     before = {s: docker("inspect", "-f", "{{.Id}}", pcid(s)).strip() for s in ("stalwart", "adapter")}
     docker("run", "--rm", "--network", "none", "-v", "portcullis_hub_data:/d",
@@ -1231,8 +1248,10 @@ def template_change_holds() -> None:
     until("mail_provider_refused", lambda: "mail_provider_refused" in json.dumps(hub_ok("GET", "/api/doctor")), 180, every=5)
     after = {s: docker("inspect", "-f", "{{.Id}}", pcid(s)).strip() for s in ("stalwart", "adapter")}
     assert after == before, "a container was recreated on the template change"
+    prov = (hub_ok("GET", "/api/mail/status").get("provider") or {})
+    assert prov.get("held") is True, f"the provider isn't held: {scrub(json.dumps(prov))[:300]}"
     code, _ = hub("GET", "/api/mail/checks")
-    assert code == 503, f"the mail routes answer {code} while held (want 503)"
+    assert code == 200, f"the mail routes answer {code} while held (R-HH1: the held provider still serves)"
     page = state["page_root"]
     v = provider_view("stalwart")
     remote_off_egress()
@@ -1242,6 +1261,7 @@ def template_change_holds() -> None:
     finally:
         remote_on_egress()
     until("the hold cleared", lambda: "mail_provider_refused" not in json.dumps(hub_ok("GET", "/api/doctor")), 180, every=5)
+    assert (hub_ok("GET", "/api/mail/status").get("provider") or {}).get("held") is False, "still held after the re-wire"
     code, _ = hub("GET", "/api/mail/checks")
     assert code == 200, f"the mail routes answer {code} after the re-wire"
 
@@ -1259,16 +1279,39 @@ def conformance(level: str, inst: str, service: str) -> None:
             host = subprocess.run(["sh", "-c", "ip -4 route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == \"src\") print $(i + 1)}'"],
                                   capture_output=True, text=True).stdout.strip()
             args += ["--smtp-host", host, "--imap-host", host]
-        p = subprocess.run(["docker", "run", "--rm", "--user", "0:0", "--network", "portcullis-mail-api", "--ip", "172.31.255.18",
-                            "-v", "portcullis_mail_provider_slot:/hsv:ro", "-v", f"{os.path.dirname(CONF)}:/c:ro",
-                            "--entrypoint", "sh", "portcullis-group-gate", "-c",
-                            'mkdir -p /hs && cp /hsv/api-secret /hs/ && python3 /c/run.py "$@"', "x", *args],
-                           capture_output=True, text=True, timeout=600)
+        # The Hub's address on portcullis-mail-api (internal); the full
+        # level also needs a route to the runner's published ports: the
+        # default bridge as a second network.
+        name = f"e2e-mail-conformance-{level}"
+        docker("rm", "-f", name, check_rc=False)
+        docker("create", "--name", name, "--user", "0:0", "--network", "portcullis-mail-api", "--ip", "172.31.255.18",
+               "-v", "portcullis_mail_provider_slot:/hsv:ro", "-v", f"{os.path.dirname(CONF)}:/c:ro",
+               "--entrypoint", "sh", "portcullis-group-gate", "-c",
+               'mkdir -p /hs && cp /hsv/api-secret /hs/ && python3 /c/run.py "$@"', "x", *args)
+        if level == "full":
+            docker("network", "connect", "bridge", name)
+        try:
+            p = subprocess.run(["docker", "start", "-a", name], capture_output=True, text=True, timeout=600)
+        finally:
+            docker("rm", "-f", name, check_rc=False)
         save(f"conformance-{level}.txt", p.stdout + p.stderr)
         print(scrub(p.stdout), flush=True)
         assert p.returncode == 0, f"conformance {level} on {inst}: exit {p.returncode}: {scrub(p.stdout)[-600:]}"
     finally:
         docker("start", hub_cid)
+        hub_answers()
+
+
+def hub_answers() -> None:
+    """The Hub's API answers again (after a stop / start; its address may
+    have changed)."""
+    def ok():
+        state.pop("hub_ip", None)
+        try:
+            return hub("GET", "/api/mail/status")[0] == 200
+        except OSError:
+            return False
+    until("the Hub's API answers", ok, 180, every=3)
 
 
 def conformance_stalwart() -> None:

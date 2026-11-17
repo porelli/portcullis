@@ -69,6 +69,9 @@ class Recorded:
                 return 400, {"error": "bad"}
             if "strict" not in self.d and (set(d) != set(KEYS)):
                 return 400, {"error": "keys"}
+            # As mailctl: MailState v2's spam block is complete (dnsbl too).
+            if set((d.get("spam") or {}).keys()) != {"junk_score", "reject_score", "dnsbl", "allow", "block"}:
+                return 400, {"error": 'document.spam: missing key "dnsbl"'}
             if self.doc and len(self.doc["accounts"]) > 0 and "mass" not in self.d:
                 now = {a["uuid"] for a in d["accounts"]}
                 gone = [a for a in self.doc["accounts"] if a["uuid"] not in now]
