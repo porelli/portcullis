@@ -1194,6 +1194,12 @@ services:
       # The mail slot (contract §19.1): Prometheus' targets and the
       # metrics secret, read-only in Prometheus.
       - mail_slot:/mail-slot
+      # The wired provider's slot files (Ruling R-POD2: api-secret,
+      # metrics-secret, relay-password, .present, void-pending,
+      # void-session) at the volume's root; the Hub's override mounts the
+      # whole volume read-only into the provider's gated services. Nobody
+      # else in core mounts it; never backed up, emptied by restore.
+      - mail_provider_slot:/mail-provider-slot
     networks:
       portcullis: {}
       socket-proxy-hub: {}
@@ -1853,6 +1859,11 @@ volumes:
   mail_tls:
   mail_acme:
   mail_slot:
+  # The wired provider's slot files (R-POD2), 10001:2000 2750 setgid (the
+  # provider reads them through group 2000). A fixed name: the Hub's
+  # override mounts it as an external volume.
+  mail_provider_slot:
+    name: portcullis_mail_provider_slot
   prometheus_data:
   alertmanager_data:
   grafana_data:

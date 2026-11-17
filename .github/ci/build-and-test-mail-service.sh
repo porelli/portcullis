@@ -41,18 +41,17 @@ health() { docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else
 wait_healthy() { for _ in $(seq 1 100); do [ "$(health "$1")" = healthy ] && return 0; sleep 3; done; fail "$1 not healthy ($(health "$1"))"; }
 # vol <volume> <file> — a file of a named volume (read as root, offline).
 vol() { docker run --rm --network none -v "$1:/v:ro" "$ALPINE_IMG" cat "/v/$2"; }
-SLOT="$INST/_mail"
 
 # hubapi <method> <path> [body file] — as the Hub: its pinned address on
 # portcullis-mail-api (.18, the Hub stopped meanwhile), the provider at
-# .19, the API secret from the Hub's slot files (never on an argv).
+# .19, the API secret from the slot volume (R-POD2; never on an argv).
 hubapi() {
   local body=()
   [ -z "${3:-}" ] || body=(-v "$3:/body.json:ro")
-  docker run --rm --network portcullis-mail-api --ip 172.31.255.18 -v portcullis_hub_secrets:/hs:ro "${body[@]}" \
-    --entrypoint sh "$CURL_IMG" -c 'printf "Authorization: Bearer %s\n" "$(cat "/hs/$2/api-secret")" > /tmp/h
+  docker run --rm --network portcullis-mail-api --ip 172.31.255.18 --user 0:0 -v portcullis_mail_provider_slot:/hs:ro "${body[@]}" \
+    --entrypoint sh "$CURL_IMG" -c 'printf "Authorization: Bearer %s\n" "$(cat /hs/api-secret)" > /tmp/h
       if [ -f /body.json ]; then curl -s -H @/tmp/h -H "Content-Type: application/json" -X "$0" --data-binary @/body.json -w "\n%{http_code}" "http://172.31.255.19:8080$1"
-      else curl -s -H @/tmp/h -X "$0" -w "\n%{http_code}" "http://172.31.255.19:8080$1"; fi' "$1" "$2" "$SLOT"
+      else curl -s -H @/tmp/h -X "$0" -w "\n%{http_code}" "http://172.31.255.19:8080$1"; fi' "$1" "$2"
 }
 hub_mail() { docker compose exec -T hub hub mail "$@"; }
 
@@ -275,17 +274,18 @@ setup)
   docker run --rm --network "${PROJ}_egress" -v "$ST/smtp.py:/smtp.py:ro" --entrypoint python3 portcullis-group-gate /smtp.py relay25 "$EGRESS_IP" 10025
   echo "PASS: no AUTH and no relay on 25 (host and from the egress network), submission refuses a foreign envelope and a foreign From:, own mail accepted"
 
-  # 8. The gate, for real (P3): the slot files gone (as after a core
-  # restore empties hub_secrets), a raw start of the server fails before
+  # 8. The gate, for real (P3): the sentinel gone (as after a core restore
+  # empties the slot volume, R-POD2), a raw start of the server fails before
   # it opens the store; the files back, it starts.
-  docker run --rm --network none -v portcullis_hub_secrets:/hs "$ALPINE_IMG" mv "/hs/$SLOT/.present" "/hs/$SLOT/.present.ci"
+  docker run --rm --network none -v portcullis_mail_provider_slot:/hs "$ALPINE_IMG" rm /hs/.present
+  sentinel_back() { docker run --rm --network none -v portcullis_mail_provider_slot:/hs "$ALPINE_IMG" sh -c 'printf "portcullis-mail-gate\n" > /hs/.present && chown 10001:2000 /hs/.present && chmod 0640 /hs/.present'; }
   docker stop "$(cid stalwart)" >/dev/null
   set +e
   docker start -a "$(cid stalwart)" > "$ST/gate.out" 2>&1; rc=$?
   set -e
   [ "$rc" != 0 ] || fail "stalwart started without the gate sentinel"
   grep -qi 'gate\|refus\|not wired' "$ST/gate.out" || fail "stalwart failed for another reason: $(tail -5 "$ST/gate.out")"
-  docker run --rm --network none -v portcullis_hub_secrets:/hs "$ALPINE_IMG" mv "/hs/$SLOT/.present.ci" "/hs/$SLOT/.present"
+  sentinel_back
   docker start "$(cid stalwart)" >/dev/null
   wait_healthy stalwart
   echo "PASS: the gate: without .present a raw start of stalwart exits $rc before serving; with it, healthy again"

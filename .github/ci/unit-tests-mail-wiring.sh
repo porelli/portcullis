@@ -42,6 +42,11 @@ slot_rule() {  # <config json>
     and (mounts("mail_slot") == ["hub", "prometheus"])
     and vmount("hub"; "mail_slot") == ["/mail-slot:false"]
     and vmount("prometheus"; "mail_slot") == ["/mail-slot:true"]
+    # mail_provider_slot (R-POD2): the Hub rw at /mail-provider-slot,
+    # nobody else in core; a fixed name (the override mounts it external).
+    and (mounts("mail_provider_slot") == ["hub"])
+    and vmount("hub"; "mail_provider_slot") == ["/mail-provider-slot:false"]
+    and .volumes["mail_provider_slot"].name == "portcullis_mail_provider_slot"
     # The Hub: group 2000 (P6), the slot env, no mailctl leftovers.
     and ($h.group_add | index("2000")) != null and ($h.group_add | index("10007")) != null
     and $h.environment.HUB_MAIL_SLOT_DIR == "/mail-slot"
@@ -79,4 +84,4 @@ echo "$MOVED" | jq -e '.networks["portcullis-mail-api"].ipam.config[0].subnet ==
     and (.services["group-gate"].environment.GATE_CORE_SUBNETS | split(" ") | index("10.87.0.0/28")) != null
     and (.services.wg.environment.WG_CORE_SUBNETS | split(" ") | index("10.87.0.0/28")) != null' >/dev/null \
   || { echo "FAIL: a moved PORTCULLIS_MAIL_API_SUBNET doesn't follow into the Hub's address and the core subnet lists"; exit 1; }
-echo "PASS: mail slot wiring (portcullis-mail-api, portcullis-metrics-mail, mail_slot, the Hub's group 2000, mail-cert; Docker, Podman, SELinux)"
+echo "PASS: mail slot wiring (portcullis-mail-api, portcullis-metrics-mail, mail_slot, mail_provider_slot, the Hub's group 2000, mail-cert; Docker, Podman, SELinux)"

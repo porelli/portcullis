@@ -878,6 +878,9 @@ mail_prepare() {
   (umask 077 && mkdir -p "$d")
   chmod 700 "$d"
   volume_own mail_slot "$CT_UID_HUB:$CT_GID_PROMETHEUS" 2750
+  # The wired provider's slot files (R-POD2): the Hub writes them, the
+  # provider's gated services read them through group 2000.
+  volume_own mail_provider_slot "$CT_UID_HUB:$CT_GID_MAIL_PROVIDER" 2750
   mail_slot_open || return 0
   volume_own mail_tls "$CT_UID_DOMAINS:$CT_GID_MAIL_PROVIDER" 2750
   volume_own mail_acme "$CT_UID_DOMAINS:$CT_UID_DOMAINS" 0700

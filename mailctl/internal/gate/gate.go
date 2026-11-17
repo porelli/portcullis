@@ -66,10 +66,11 @@ func Check(slotDir, session string) error {
 var slotFiles = map[string]bool{"api-secret": true, "metrics-secret": true, "relay-password": true,
 	".present": true, "void-pending": true, "void-session": true}
 
-// CheckLayout refuses a slot mount that shows anything but the _mail/
-// files (Ruling T3-c): a runtime that ignored the hub_secrets subpath
-// would show every instance's directory; the start is refused, never
-// guessed at. An unreadable directory is refused too.
+// CheckLayout refuses a slot mount that shows anything but the slot files
+// (Rulings T3-c, R-POD2): the mount is the mail_provider_slot volume's
+// root, which holds the wired provider's files alone; anything else there
+// (a directory, a stray file, another volume mounted by mistake) refuses
+// the start, never guessed at. An unreadable directory is refused too.
 func CheckLayout(slotDir string) error {
 	ents, err := os.ReadDir(slotDir)
 	if err != nil {
@@ -77,7 +78,7 @@ func CheckLayout(slotDir string) error {
 	}
 	for _, e := range ents {
 		if !slotFiles[e.Name()] || e.IsDir() {
-			return fmt.Errorf("the mail slot mount shows %q: not an instance's _mail/ files (was the hub_secrets subpath ignored?)", e.Name())
+			return fmt.Errorf("the mail slot mount shows %q: not the wired provider's slot files (the mail_provider_slot volume's root)", e.Name())
 		}
 	}
 	return nil

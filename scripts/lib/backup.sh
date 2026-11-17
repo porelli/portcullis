@@ -1052,6 +1052,14 @@ _backup_restore_docker() {
   docker run --rm --network none -v "$full:/data" "$helper" \
     sh -c "chown $CT_UID_HUB:$CT_UID_HUB /data && chmod 0700 /data" \
     || fail "could not prepare hub_secrets volume"
+  # The wired provider's slot files (R-POD2) go too: a raw start of the
+  # provider then fails its gate until the Hub's void writes them again.
+  full="$(_volume_name mail_provider_slot)"
+  [ -n "$full" ] || full="portcullis_mail_provider_slot"
+  if docker volume inspect "$full" >/dev/null 2>&1; then
+    docker run --rm --network none -v "$full:/data" "$helper" sh -c 'find /data -mindepth 1 -delete' \
+      || fail "could not empty the mail provider slot volume $full"
+  fi
 
   # Keycloak deletes its copy of a federated user — passkeys included —
   # as soon as a lookup (a sign-in attempt, the Hub's sweep) finds the user

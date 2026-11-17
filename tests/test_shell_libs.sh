@@ -271,6 +271,7 @@ expect_ok "secrets_fix_perms: secrets/wg and people.key group 10006" \
 # mail_tls 10004:2000 2750 and mail_acme 10004:10004 0700 only with the slot
 # open (PORTCULLIS_MAIL exactly on). secrets/mail/ 0700, no secret in it.
 expect_ok "stack_prepare: mail_slot owned 10001:65534, mode 2750 (setgid)" grep -qx 'volume_own mail_slot 10001:65534 2750' "$STUB_DIR/sp-vol"
+expect_ok "stack_prepare: mail_provider_slot owned 10001:2000, mode 2750, also with the slot closed (R-POD2)" grep -qx 'volume_own mail_provider_slot 10001:2000 2750' "$STUB_DIR/sp-vol"
 expect_fail "stack_prepare: no mail_tls / mail_acme with the slot closed" grep -qE '^volume_own mail_(tls|acme) ' "$STUB_DIR/sp-vol"
 expect_eq "stack_prepare: secrets/mail is 0700 and holds no secret" "$(file_mode "$SP_ROOT/secrets/mail"):$(find "$SP_ROOT/secrets/mail" -type f | wc -l | tr -d ' ')" 700:0
 for v in yes On 1; do
@@ -287,7 +288,7 @@ rm -f "$STUB_DIR/sp-vol"
   unset -f users_secret_files monitoring_prepare domains_prepare mcpgate_ensure_secrets
   stack_prepare ) >/dev/null 2>&1
 expect_eq "stack_prepare: with the slot open, the slot and mail-cert's volumes (owners, modes)" "$(grep '^volume_own mail' "$STUB_DIR/sp-vol" | sort | tr '\n' '|')" \
-  "volume_own mail_acme 10004:10004 0700|volume_own mail_slot 10001:65534 2750|volume_own mail_tls 10004:2000 2750|"
+  "volume_own mail_acme 10004:10004 0700|volume_own mail_provider_slot 10001:2000 2750|volume_own mail_slot 10001:65534 2750|volume_own mail_tls 10004:2000 2750|"
 expect_eq "CT_GID_MAIL_PROVIDER is 2000" "$CT_GID_MAIL_PROVIDER" 2000
 # group_gate_data (sign-in part 2, contract §4 "Opened log"): group-gate
 # (10003) writes the opened log, the Hub (group 10001) reads and prunes it.
@@ -5417,6 +5418,19 @@ rto; rc=$?
 expect_eq "restore order: hub_secrets emptied, the provider restored, then the stack up, complete" \
   "$rc:$(grep -E '^(docker volume rm|provider restore|rt_up|last line)' "$BM/calls" | tr '\n' '|'):$(grep -c 'Restore complete' "$BM/out")" \
   "0:docker volume rm|provider restore|rt_up|last line|:1"
+# The provider slot volume (R-POD2) emptied with hub_secrets, when it exists.
+rm -rf "$BM"; mkdir -p "$BM"
+(
+  body="$(awk '/^_backup_restore_docker\(\) \{/{f=1} f && /info "Emptying hub_secrets volume\.\.\."/{p=1} p{print} f && p && /^}/{exit}' "$HERE/../scripts/lib/backup.sh")"
+  eval "_rto_tail() { local dir=\"\$BM\" proj=portcullis helper=h full allow_empty_lldap=false pre=\"\" RESTORE_STOPPED_APPS=\"\"
+$body"
+  _volume_name() { echo "portcullis_$1"; }
+  docker() { echo "docker $*" >> "$BM/calls"; case "$1 $2 $3" in "volume inspect portcullis_hub_secrets") return 1 ;; esac; return 0; }
+  _restore_lldap_guard() { :; }; stack_prepare() { :; }; config_build_ca_bundle() { :; }; vault_init() { :; }
+  wait_healthy() { :; }; _restore_lost_devices_note() { :; }; rt_up() { :; }; _restore_mail_provider() { :; }
+  _rto_tail
+) >"$BM/out" 2>&1
+expect_eq "restore empties the mail provider slot volume too (R-POD2)" "$(grep -c "docker run --rm --network none -v portcullis_mail_provider_slot:/data h sh -c find /data -mindepth 1 -delete" "$BM/calls")" 1
 RTO_MAIL='return 1' rto; rc=$?
 expect_eq "restore order: a failed provider restore → never \"Restore complete\"" "$rc:$(grep -c 'Restore complete' "$BM/out"):$(grep -c 'NOT restored from its archive' "$BM/out")" "0:0:1"
 # test_backup_verify_mail_archive (M10): the archive the manifest names

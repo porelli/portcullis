@@ -68,6 +68,7 @@ mount:
   - {service: hub, item: /project/secrets, reason: "a tmpfs mask over the checkout's secrets/ on Docker; /project holds no secrets/ on Kubernetes"}
   - {service: hub, item: /project/backups, reason: "a tmpfs mask over the checkout's backups/ on Docker; nothing to mask on Kubernetes"}
   - {service: hub, item: /mail-slot, reason: "mail slot: Docker/Podman only (mail provider plan)"}
+  - {service: hub, item: /mail-provider-slot, reason: "mail slot: Docker/Podman only (mail provider plan, R-POD2)"}
   - {service: prometheus, item: /mail-slot, reason: "mail slot: Docker/Podman only (mail provider plan)"}
   - {service: hub, item: /link-doc, reason: "multiple servers: Docker/Podman primaries only (contract §17.1; Servers is off on Kubernetes)"}
   - {service: wg, item: /link-doc, reason: "multiple servers: Docker/Podman primaries only (contract §17.1; Servers is off on Kubernetes)"}

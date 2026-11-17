@@ -26,7 +26,6 @@ ALPINE_IMG=docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d
 D="${E2E_DOMAIN:-portcullis.local}"
 INST=stalwart
 PROJ="portcullis-$INST"
-SLOT="$INST/_mail"
 cid() { podman ps -aq --filter "label=com.docker.compose.project=$PROJ" --filter "label=com.docker.compose.service=$1" | head -n1; }
 health() { podman inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$(cid "$1")" 2>/dev/null || echo missing; }
 fail() {
@@ -217,12 +216,12 @@ echo "PASS: no ban after 110 failed logins: another container still delivers"
 
 # 8. The gate (P3) on rootless Podman: without the slot sentinel a raw
 # start of the server fails before it serves; with it, healthy again.
-podman run --rm --network none -v portcullis_hub_secrets:/hs "$ALPINE_IMG" mv "/hs/$SLOT/.present" "/hs/$SLOT/.present.ci"
+podman run --rm --network none -v portcullis_mail_provider_slot:/hs "$ALPINE_IMG" rm /hs/.present
 podman stop "$(cid stalwart)" >/dev/null
 set +e
 podman start -a "$(cid stalwart)" > /tmp/mail-gate.out 2>&1; rc=$?
 set -e
-podman run --rm --network none -v portcullis_hub_secrets:/hs "$ALPINE_IMG" mv "/hs/$SLOT/.present.ci" "/hs/$SLOT/.present"
+podman run --rm --network none -v portcullis_mail_provider_slot:/hs "$ALPINE_IMG" sh -c 'printf "portcullis-mail-gate\n" > /hs/.present && chown 10001:2000 /hs/.present && chmod 0640 /hs/.present'
 [ "$rc" != 0 ] || fail "stalwart started without the gate sentinel"
 podman start "$(cid stalwart)" >/dev/null
 wait_healthy stalwart

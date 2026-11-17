@@ -1259,9 +1259,9 @@ def conformance(level: str, inst: str, service: str) -> None:
                                   capture_output=True, text=True).stdout.strip()
             args += ["--smtp-host", host, "--imap-host", host]
         p = subprocess.run(["docker", "run", "--rm", "--user", "0:0", "--network", "portcullis-mail-api", "--ip", "172.31.255.18",
-                            "-v", f"portcullis_hub_secrets:/hsv:ro", "-v", f"{os.path.dirname(CONF)}:/c:ro",
+                            "-v", "portcullis_mail_provider_slot:/hsv:ro", "-v", f"{os.path.dirname(CONF)}:/c:ro",
                             "--entrypoint", "sh", "portcullis-group-gate", "-c",
-                            f'mkdir -p /hs && cp /hsv/{inst}/_mail/api-secret /hs/ && python3 /c/run.py "$@"', "x", *args],
+                            'mkdir -p /hs && cp /hsv/api-secret /hs/ && python3 /c/run.py "$@"', "x", *args],
                            capture_output=True, text=True, timeout=600)
         save(f"conformance-{level}.txt", p.stdout + p.stderr)
         print(scrub(p.stdout), flush=True)
