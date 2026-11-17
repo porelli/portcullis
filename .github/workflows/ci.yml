@@ -516,9 +516,11 @@ jobs:
           done
           [ "$fail" = 0 ] || exit 1
           echo "mcp-gate vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
-      # MailState v1 (contract §19.5): mailctl's vector is a byte copy of the
-      # Hub's, on the same-named Hub branch when it exists, else main.
-      - name: mailctl MailState vector matches the Hub
+      # The shared mail vectors (contract §19.5, §19.7): MailState v2
+      # (mailctl's) and the mail DNS rule vectors (domains') are byte copies
+      # of the Hub's internal/mailprovider/testdata, on the same-named Hub
+      # branch when it exists, else main.
+      - name: MailState v2 and the mail DNS rule vectors match the Hub
         env:
           REF: ${{ github.head_ref || github.ref_name }}
         run: |
@@ -531,12 +533,14 @@ jobs:
           fi
           sha=$(awk -v r="refs/heads/$ref" '$2 == r { print $1 }' <<<"$heads")
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::portcullis-hub has no single commit for refs/heads/$ref"; exit 1; }
-          hub="$RUNNER_TEMP/hub_mailstate_v1.json"
-          code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/internal/mailctl/testdata/mailstate_v1.json")
-          [ "$code" = 200 ] || { echo "::error::fetching the Hub's MailState vector from $ref ($sha): HTTP $code"; exit 1; }
-          cmp mailctl/internal/state/testdata/mailstate_v1.json "$hub" \
-            || { echo "::error::mailctl/internal/state/testdata/mailstate_v1.json differs from portcullis-hub $ref ($sha): copy it byte for byte"; exit 1; }
-          echo "MailState vector matches portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
+          for pair in mailstate_v2.json:mailctl/internal/state/testdata/mailstate_v2.json \
+                      mail_dns_vectors.json:domains/internal/dnsplan/testdata/mail_dns_vectors.json; do
+            f="${pair%%:*}" ours="${pair#*:}" hub="$RUNNER_TEMP/hub_${pair%%:*}"
+            code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/internal/mailprovider/testdata/$f")
+            [ "$code" = 200 ] || { echo "::error::fetching the Hub's $f from $ref ($sha): HTTP $code"; exit 1; }
+            cmp "$ours" "$hub" || { echo "::error::$ours differs from portcullis-hub $ref ($sha): copy it byte for byte"; exit 1; }
+          done
+          echo "MailState v2 and mail DNS rule vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Save the Go module and build cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

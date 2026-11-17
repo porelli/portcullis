@@ -1462,36 +1462,58 @@ func mergeRecords(old, add []RecordRef) []RecordRef {
 // mailBodyMax bounds PUT …/sets/mail (200 records with long DKIM TXT).
 const mailBodyMax = 256 << 10
 
-// handleMailPut is PUT /domains/{name}/sets/mail {"records": [...]}: the
-// records become the domain's MailWanted, mail goes into its Sets and
-// nomail out of them (remembered as NoMailBeforeMail), both made due.
+// handleMailPut is PUT /domains/{name}/sets/mail {"records": [...],
+// "mail_hostname", "relay_include", "dmarc_floor", "wildcard"} (contract
+// §12.2, §19.7): the set is judged by the shared mail rules
+// (dnsplan.ValidateMailSet, 400 with the rule's text), then the records
+// become the domain's MailWanted, mail goes into its Sets and nomail out
+// of them (remembered as NoMailBeforeMail), both made due.
 func (s *Service) handleMailPut(w http.ResponseWriter, r *http.Request) {
 	name, ok := s.pathName(w, r)
 	if !ok {
 		return
 	}
 	var b struct {
-		Records []dnsplan.MailRecord `json:"records"`
+		Records      []dnsplan.MailRecord `json:"records"`
+		MailHostname *string              `json:"mail_hostname"`
+		RelayInclude *string              `json:"relay_include"`
+		DMARCFloor   *string              `json:"dmarc_floor"`
+		Wildcard     *bool                `json:"wildcard"`
 	}
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, mailBodyMax))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&b); err != nil || dec.Decode(&struct{}{}) != io.EOF || b.Records == nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf(`body must be {"records": [{"name", "type", "ttl", "value"}, ...]} (at most %d KiB)`, mailBodyMax>>10))
+	if err := dec.Decode(&b); err != nil || dec.Decode(&struct{}{}) != io.EOF || b.Records == nil ||
+		b.MailHostname == nil || b.RelayInclude == nil || b.DMARCFloor == nil || b.Wildcard == nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf(`body must be {"records": [{"name", "type", "ttl", "value"}, ...], "mail_hostname", "relay_include", "dmarc_floor", "wildcard"} (at most %d KiB)`, mailBodyMax>>10))
 		return
 	}
 	if len(b.Records) == 0 {
 		writeError(w, http.StatusBadRequest, "the mail set needs records (DELETE /domains/"+name+"/sets/mail turns mail off)")
 		return
 	}
-	if err := dnsplan.ValidateMail(name, b.Records); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
 	// Never the main mail set's names (pathName's checkName already keeps
-	// such a domain out; fail closed anyway).
+	// such a domain out; fail closed anyway). The Hub names MAIL_HOSTNAME;
+	// it must be this service's.
 	host := s.cfg.MailHostname
 	if host == "" {
 		host = "mail." + s.cfg.MainDomain
+	}
+	if !strings.EqualFold(strings.TrimSuffix(*b.MailHostname, "."), host) {
+		writeError(w, http.StatusBadRequest, "mail_hostname "+*b.MailHostname+" isn't MAIL_HOSTNAME "+host)
+		return
+	}
+	if *b.DMARCFloor != "none" && *b.DMARCFloor != "quarantine" && *b.DMARCFloor != "reject" {
+		writeError(w, http.StatusBadRequest, "dmarc_floor must be none, quarantine or reject")
+		return
+	}
+	rc := dnsplan.RuleContext{Domain: name, MailHostname: host, RelayInclude: *b.RelayInclude, DMARCFloor: *b.DMARCFloor, Wildcard: *b.Wildcard}
+	if err := dnsplan.ValidateMailSet(rc, b.Records); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := dnsplan.ValidateMail(name, b.Records); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	if dnsplan.MailNameOwned(name, host) {
 		writeError(w, http.StatusBadRequest, "MAIL_HOSTNAME "+host+" is a name of "+name+"'s mail set")

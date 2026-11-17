@@ -2105,8 +2105,11 @@ func TestPlanHealthyWouldIssue(t *testing.T) {
 
 // mailSetBody is PUT /domains/{name}/sets/mail's body for name (MX at
 // MAIL_HOSTNAME, SPF, a long RSA DKIM TXT, DMARC, an SRV).
-func mailSetBody(name string) string {
-	h := "mail." + testMain + "."
+func mailSetBody(name string) string { return mailSetBodyHost(name, "mail."+testMain) }
+
+// mailSetBodyHost is that body for MAIL_HOSTNAME host.
+func mailSetBodyHost(name, host string) string {
+	h := host + "."
 	recs := []dnsplan.MailRecord{
 		{Name: name, Type: "MX", TTL: 3600, Value: "10 " + h},
 		{Name: name, Type: "TXT", TTL: 3600, Value: "v=spf1 mx -all"},
@@ -2114,9 +2117,59 @@ func mailSetBody(name string) string {
 		{Name: "_dmarc." + name, Type: "TXT", TTL: 3600, Value: "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@" + name},
 		{Name: "_imaps._tcp." + name, Type: "SRV", TTL: 3600, Value: "0 1 993 " + h},
 	}
-	b, _ := json.Marshal(map[string]any{"records": recs})
+	return mailSetJSONHost(recs, "none", host)
+}
+
+// mailSetJSON is the body with the rule inputs (contract §12.2).
+func mailSetJSON(recs []dnsplan.MailRecord, floor string) string {
+	return mailSetJSONHost(recs, floor, "mail."+testMain)
+}
+
+func mailSetJSONHost(recs []dnsplan.MailRecord, floor, host string) string {
+	b, _ := json.Marshal(map[string]any{"records": recs, "mail_hostname": host, "relay_include": "", "dmarc_floor": floor, "wildcard": true})
 	return string(b)
 }
+
+// The set is judged by the shared rules first: a refusal is 400 with the
+// rule's text (the Hub's), and nothing changes; the rule inputs are
+// required and MAIL_HOSTNAME must be the service's.
+func TestSetsMailRefused400(t *testing.T) {
+	e := newEnv(t, false)
+	const name = "team-rl.example.org"
+	e.do("PUT", "/domains/"+name, creds(goodToken), true)
+	e.waitState(name, StateReady, 60*time.Second)
+	h := "mail." + testMain + "."
+	for recs, want := range map[*[]dnsplan.MailRecord]string{
+		{{Name: name, Type: "MX", TTL: 3600, Value: "10 mx.evil.example.net."}}:                                         "mail set: " + name + " MX: the target must be " + h,
+		{{Name: name, Type: "A", TTL: 3600, Value: "203.0.113.9"}}:                                                      "mail set: " + name + " A: A records are not allowed",
+		{{Name: name, Type: "TXT", TTL: 3600, Value: "v=spf1 mx include:_spf.evil.example.net -all"}}:                   "mail set: " + name + " TXT: SPF term include:_spf.evil.example.net is not allowed",
+		{{Name: "_dmarc." + name, Type: "TXT", TTL: 3600, Value: "v=DMARC1; p=none; rua=mailto:dmarc-reports@" + name}}: "mail set: _dmarc." + name + " TXT: p=none is below the floor quarantine",
+		{{Name: "mta-sts." + name, Type: "CNAME", TTL: 3600, Value: h}}:                                                 "mail set: mta-sts." + name + " CNAME: only when the Hub asked with wildcard=false",
+	} {
+		code, resp := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetJSON(*recs, "quarantine"), true)
+		if code != 400 || !strings.Contains(resp, want) {
+			t.Errorf("%v: %d %s, want %q", (*recs)[0], code, resp, want)
+		}
+	}
+	ok := []dnsplan.MailRecord{{Name: name, Type: "MX", TTL: 3600, Value: "10 " + h}}
+	for _, body := range []string{
+		`{"records":` + mustJSON(ok) + `}`,
+		`{"records":` + mustJSON(ok) + `,"mail_hostname":"mail.other.example","relay_include":"","dmarc_floor":"none","wildcard":true}`,
+		`{"records":` + mustJSON(ok) + `,"mail_hostname":"mail.` + testMain + `","relay_include":"","dmarc_floor":"strict","wildcard":true}`,
+	} {
+		if code, resp := e.do("PUT", "/domains/"+name+"/sets/mail", body, true); code != 400 {
+			t.Errorf("%.120s = %d %s", body, code, resp)
+		}
+	}
+	if d := e.domain(name); contains(d.Sets, dnsplan.SetMail) || d.MailWanted != nil {
+		t.Fatalf("a refused set changed the domain: %+v", d.Sets)
+	}
+	if code, resp := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetJSON(ok, "quarantine"), true); code != 202 {
+		t.Fatalf("ok set = %d %s", code, resp)
+	}
+}
+
+func mustJSON(v any) string { b, _ := json.Marshal(v); return string(b) }
 
 func (e *testEnv) hasRR(name, typ, data string) bool {
 	for _, rr := range e.zone.Records(name) {
@@ -2289,13 +2342,13 @@ func TestSetsMailNeverMainMailNames(t *testing.T) {
 	const name = "team-mh.example.org"
 	e.do("PUT", "/domains/"+name, creds(goodToken), true)
 	e.waitState(name, StateReady, 60*time.Second)
-	if code, body := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetBody(name), true); code != 202 {
+	if code, body := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetBodyHost(name, "mx.team-mh.example.org"), true); code != 202 {
 		t.Fatalf("PUT = %d %s", code, body)
 	}
 	e.waitFor("idle", 30*time.Second, func() bool { return e.idle(name) && len(e.domain(name).DueSets) == 0 })
 	// MAIL_HOSTNAME moved onto the domain itself: its mail set is refused.
 	e.restart(func(c *Config) { c.MailHostname = name })
-	if code, body := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetBody(name), true); code != 400 {
+	if code, body := e.do("PUT", "/domains/"+name+"/sets/mail", mailSetBodyHost(name, name), true); code != 400 {
 		t.Fatalf("PUT with MAIL_HOSTNAME = the domain: %d %s", code, body)
 	}
 }

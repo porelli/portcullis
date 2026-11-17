@@ -1,0 +1,917 @@
+{
+  "context": {
+    "domain": "example.com",
+    "mail_hostname": "mail.example.com",
+    "relay_include": "_spf.relay.example.net",
+    "dmarc_floor": "reject",
+    "wildcard": false
+  },
+  "cases": [
+    {
+      "name": "the stalwart set ok",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.example.com."
+        },
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx include:_spf.relay.example.net -all"
+        },
+        {
+          "name": "v1-ed25519-20261115._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+        },
+        {
+          "name": "v1-rsa-20261115._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA"
+        },
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com"
+        },
+        {
+          "name": "_mta-sts.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=STSv1; id=9c1f4b7e2a6d8c0e1f3aT1763200000"
+        },
+        {
+          "name": "_smtp._tls.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=TLSRPTv1; rua=mailto:tls-reports@example.com"
+        },
+        {
+          "name": "_submissions._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 465 mail.example.com."
+        },
+        {
+          "name": "_imaps._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 993 mail.example.com."
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "mx ok",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.example.com."
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "spf with the relay include ok",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx include:_spf.relay.example.net -all"
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "spf softfail without a relay ok",
+      "context": {
+        "relay_include": ""
+      },
+      "records": [
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx ~all"
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "dkim ok",
+      "records": [
+        {
+          "name": "v1-ed25519-20261115-2._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "dmarc at the floor ok",
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "dmarc above the floor ok",
+      "context": {
+        "dmarc_floor": "none"
+      },
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=quarantine; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "mta-sts id ok",
+      "records": [
+        {
+          "name": "_mta-sts.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=STSv1; id=9c1f4b7e2a6d8c0e1f3aT1763200000"
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "tls-rpt ok",
+      "records": [
+        {
+          "name": "_smtp._tls.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=TLSRPTv1; rua=mailto:tls-reports@example.com"
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "srv submissions, submission and imaps ok",
+      "records": [
+        {
+          "name": "_submissions._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 465 mail.example.com."
+        },
+        {
+          "name": "_submission._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "10 1 587 mail.example.com."
+        },
+        {
+          "name": "_imaps._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 993 mail.example.com."
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "srv 0 0 0 . ok",
+      "records": [
+        {
+          "name": "_imap._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 0 0 ."
+        },
+        {
+          "name": "_pop3._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 0 0 ."
+        },
+        {
+          "name": "_pop3s._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 0 0 ."
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "cnames without a wildcard ok",
+      "records": [
+        {
+          "name": "mta-sts.example.com",
+          "type": "CNAME",
+          "ttl": 3600,
+          "value": "mail.example.com."
+        },
+        {
+          "name": "autoconfig.example.com",
+          "type": "CNAME",
+          "ttl": 3600,
+          "value": "mail.example.com."
+        },
+        {
+          "name": "autodiscover.example.com",
+          "type": "CNAME",
+          "ttl": 3600,
+          "value": "mail.example.com."
+        }
+      ],
+      "want_error": ""
+    },
+    {
+      "name": "A record refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.example.com."
+        },
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx include:_spf.relay.example.net -all"
+        },
+        {
+          "name": "v1-ed25519-20261115._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+        },
+        {
+          "name": "v1-rsa-20261115._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA"
+        },
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com"
+        },
+        {
+          "name": "_mta-sts.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=STSv1; id=9c1f4b7e2a6d8c0e1f3aT1763200000"
+        },
+        {
+          "name": "_smtp._tls.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=TLSRPTv1; rua=mailto:tls-reports@example.com"
+        },
+        {
+          "name": "_submissions._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 465 mail.example.com."
+        },
+        {
+          "name": "_imaps._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 993 mail.example.com."
+        },
+        {
+          "name": "example.com",
+          "type": "A",
+          "ttl": 3600,
+          "value": "203.0.113.10"
+        }
+      ],
+      "want_error": "mail set: example.com A: A records are not allowed"
+    },
+    {
+      "name": "AAAA record refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.example.com."
+        },
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx include:_spf.relay.example.net -all"
+        },
+        {
+          "name": "v1-ed25519-20261115._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+        },
+        {
+          "name": "v1-rsa-20261115._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA"
+        },
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com"
+        },
+        {
+          "name": "_mta-sts.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=STSv1; id=9c1f4b7e2a6d8c0e1f3aT1763200000"
+        },
+        {
+          "name": "_smtp._tls.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=TLSRPTv1; rua=mailto:tls-reports@example.com"
+        },
+        {
+          "name": "_submissions._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 465 mail.example.com."
+        },
+        {
+          "name": "_imaps._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 993 mail.example.com."
+        },
+        {
+          "name": "mail.example.com",
+          "type": "AAAA",
+          "ttl": 3600,
+          "value": "2001:db8::10"
+        }
+      ],
+      "want_error": "mail set: mail.example.com AAAA: AAAA records are not allowed"
+    },
+    {
+      "name": "CAA record refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.example.com."
+        },
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx include:_spf.relay.example.net -all"
+        },
+        {
+          "name": "v1-ed25519-20261115._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+        },
+        {
+          "name": "v1-rsa-20261115._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA"
+        },
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com"
+        },
+        {
+          "name": "_mta-sts.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=STSv1; id=9c1f4b7e2a6d8c0e1f3aT1763200000"
+        },
+        {
+          "name": "_smtp._tls.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=TLSRPTv1; rua=mailto:tls-reports@example.com"
+        },
+        {
+          "name": "_submissions._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 465 mail.example.com."
+        },
+        {
+          "name": "_imaps._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 993 mail.example.com."
+        },
+        {
+          "name": "example.com",
+          "type": "CAA",
+          "ttl": 3600,
+          "value": "0 issue \"letsencrypt.org\""
+        }
+      ],
+      "want_error": "mail set: example.com CAA: CAA records are not allowed"
+    },
+    {
+      "name": "NS record refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.example.com."
+        },
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx include:_spf.relay.example.net -all"
+        },
+        {
+          "name": "v1-ed25519-20261115._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+        },
+        {
+          "name": "v1-rsa-20261115._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA"
+        },
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com"
+        },
+        {
+          "name": "_mta-sts.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=STSv1; id=9c1f4b7e2a6d8c0e1f3aT1763200000"
+        },
+        {
+          "name": "_smtp._tls.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=TLSRPTv1; rua=mailto:tls-reports@example.com"
+        },
+        {
+          "name": "_submissions._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 465 mail.example.com."
+        },
+        {
+          "name": "_imaps._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 993 mail.example.com."
+        },
+        {
+          "name": "example.com",
+          "type": "NS",
+          "ttl": 3600,
+          "value": "ns1.evil.example.net."
+        }
+      ],
+      "want_error": "mail set: example.com NS: NS records are not allowed"
+    },
+    {
+      "name": "DS record refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.example.com."
+        },
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx include:_spf.relay.example.net -all"
+        },
+        {
+          "name": "v1-ed25519-20261115._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+        },
+        {
+          "name": "v1-rsa-20261115._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA"
+        },
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com"
+        },
+        {
+          "name": "_mta-sts.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=STSv1; id=9c1f4b7e2a6d8c0e1f3aT1763200000"
+        },
+        {
+          "name": "_smtp._tls.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=TLSRPTv1; rua=mailto:tls-reports@example.com"
+        },
+        {
+          "name": "_submissions._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 465 mail.example.com."
+        },
+        {
+          "name": "_imaps._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 993 mail.example.com."
+        },
+        {
+          "name": "example.com",
+          "type": "DS",
+          "ttl": 3600,
+          "value": "12345 13 2 abababababababababababababababababababababababababababababababab"
+        }
+      ],
+      "want_error": "mail set: example.com DS: DS records are not allowed"
+    },
+    {
+      "name": "TLSA record refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.example.com."
+        },
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx include:_spf.relay.example.net -all"
+        },
+        {
+          "name": "v1-ed25519-20261115._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+        },
+        {
+          "name": "v1-rsa-20261115._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=rsa; p=MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA"
+        },
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com"
+        },
+        {
+          "name": "_mta-sts.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=STSv1; id=9c1f4b7e2a6d8c0e1f3aT1763200000"
+        },
+        {
+          "name": "_smtp._tls.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=TLSRPTv1; rua=mailto:tls-reports@example.com"
+        },
+        {
+          "name": "_submissions._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 465 mail.example.com."
+        },
+        {
+          "name": "_imaps._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 993 mail.example.com."
+        },
+        {
+          "name": "_25._tcp.mail.example.com",
+          "type": "TLSA",
+          "ttl": 3600,
+          "value": "3 1 1 99ad5d8130ef75b24fa9a72e9ca7d0db45cee16a25405bdaa9d317a6d9dac9c6"
+        }
+      ],
+      "want_error": "mail set: _25._tcp.mail.example.com TLSA: TLSA records are not allowed"
+    },
+    {
+      "name": "mx to a foreign host refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mx.evil.example.net."
+        }
+      ],
+      "want_error": "mail set: example.com MX: the target must be mail.example.com."
+    },
+    {
+      "name": "spf with a refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 a mx -all"
+        }
+      ],
+      "want_error": "mail set: example.com TXT: SPF term a is not allowed"
+    },
+    {
+      "name": "spf with ip4 refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx ip4:203.0.113.0/24 -all"
+        }
+      ],
+      "want_error": "mail set: example.com TXT: SPF term ip4:203.0.113.0/24 is not allowed"
+    },
+    {
+      "name": "spf include without a relay refused",
+      "context": {
+        "relay_include": ""
+      },
+      "records": [
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx include:_spf.relay.example.net -all"
+        }
+      ],
+      "want_error": "mail set: example.com TXT: SPF term include:_spf.relay.example.net is not allowed"
+    },
+    {
+      "name": "spf include of another host refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx include:_spf.evil.example.net -all"
+        }
+      ],
+      "want_error": "mail set: example.com TXT: SPF term include:_spf.evil.example.net is not allowed"
+    },
+    {
+      "name": "two spf records refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx -all"
+        },
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx ~all"
+        }
+      ],
+      "want_error": "mail set: example.com TXT: more than one SPF record"
+    },
+    {
+      "name": "txt at the domain not spf refused",
+      "records": [
+        {
+          "name": "example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "google-site-verification=abc123"
+        }
+      ],
+      "want_error": "mail set: example.com TXT: only one v=spf1 TXT here"
+    },
+    {
+      "name": "dkim selector with a dot refused",
+      "records": [
+        {
+          "name": "a.b._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+        }
+      ],
+      "want_error": "mail set: a.b._domainkey.example.com TXT: the DKIM selector must be one DNS label"
+    },
+    {
+      "name": "dkim not v=DKIM1 refused",
+      "records": [
+        {
+          "name": "v1._domainkey.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "k=ed25519; p=x"
+        }
+      ],
+      "want_error": "mail set: v1._domainkey.example.com TXT: must start with v=DKIM1;"
+    },
+    {
+      "name": "dmarc p=none under floor reject refused",
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=none; rua=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: p=none is below the floor reject"
+    },
+    {
+      "name": "dmarc rua off-domain refused",
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; rua=mailto:dmarc-reports@example.com,mailto:reports@evil.example.net"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: rua mailto:reports@evil.example.net is not on example.com"
+    },
+    {
+      "name": "dmarc ruf refused",
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; adkim=s; aspf=s; rua=mailto:dmarc-reports@example.com; ruf=mailto:dmarc-reports@example.com"
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com TXT: ruf is not allowed"
+    },
+    {
+      "name": "mta-sts id of 33 characters refused",
+      "records": [
+        {
+          "name": "_mta-sts.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=STSv1; id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "want_error": "mail set: _mta-sts.example.com TXT: must be v=STSv1; id=<1–32 letters or digits>"
+    },
+    {
+      "name": "tls-rpt rua off-domain refused",
+      "records": [
+        {
+          "name": "_smtp._tls.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=TLSRPTv1; rua=mailto:tls@evil.example.net"
+        }
+      ],
+      "want_error": "mail set: _smtp._tls.example.com TXT: must be v=TLSRPTv1; rua=mailto:<an address on example.com>"
+    },
+    {
+      "name": "srv on a wrong port refused",
+      "records": [
+        {
+          "name": "_submissions._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 587 mail.example.com."
+        }
+      ],
+      "want_error": "mail set: _submissions._tcp.example.com SRV: must be <priority> <weight> 465 mail.example.com."
+    },
+    {
+      "name": "srv to a foreign host refused",
+      "records": [
+        {
+          "name": "_imaps._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 993 imap.evil.example.net."
+        }
+      ],
+      "want_error": "mail set: _imaps._tcp.example.com SRV: must be <priority> <weight> 993 mail.example.com."
+    },
+    {
+      "name": "_imap._tcp not 0 0 0 . refused",
+      "records": [
+        {
+          "name": "_imap._tcp.example.com",
+          "type": "SRV",
+          "ttl": 3600,
+          "value": "0 1 143 mail.example.com."
+        }
+      ],
+      "want_error": "mail set: _imap._tcp.example.com SRV: must be 0 0 0 ."
+    },
+    {
+      "name": "cname with wildcard=true refused",
+      "context": {
+        "wildcard": true
+      },
+      "records": [
+        {
+          "name": "mta-sts.example.com",
+          "type": "CNAME",
+          "ttl": 3600,
+          "value": "mail.example.com."
+        }
+      ],
+      "want_error": "mail set: mta-sts.example.com CNAME: only when the Hub asked with wildcard=false"
+    },
+    {
+      "name": "cname to a foreign host refused",
+      "records": [
+        {
+          "name": "autoconfig.example.com",
+          "type": "CNAME",
+          "ttl": 3600,
+          "value": "evil.example.net."
+        }
+      ],
+      "want_error": "mail set: autoconfig.example.com CNAME: the target must be mail.example.com."
+    },
+    {
+      "name": "mx at _dmarc refused",
+      "records": [
+        {
+          "name": "_dmarc.example.com",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.example.com."
+        }
+      ],
+      "want_error": "mail set: _dmarc.example.com MX: only TXT here"
+    },
+    {
+      "name": "a name outside the table refused",
+      "records": [
+        {
+          "name": "www.example.com",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx -all"
+        }
+      ],
+      "want_error": "mail set: www.example.com TXT: not a mail record name"
+    },
+    {
+      "name": "a name under another domain refused",
+      "records": [
+        {
+          "name": "example.org",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.example.com."
+        }
+      ],
+      "want_error": "mail set: example.org MX: not under example.com"
+    }
+  ]
+}
