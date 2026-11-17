@@ -324,6 +324,16 @@ _mail_serving() {
       and (.void_owed == null or .void_owed == false) and (.held == null or .held == false)' >/dev/null 2>&1
 }
 
+# _mail_wait_serving — _mail_serving within MAIL_SERVING_WAIT seconds
+# (default 180), asked every MAIL_SERVING_POLL (5).
+_mail_wait_serving() {
+  local start=$SECONDS
+  until _mail_serving; do
+    [ $((SECONDS - start)) -lt "${MAIL_SERVING_WAIT:-180}" ] || return 1
+    sleep "${MAIL_SERVING_POLL:-5}"
+  done
+}
+
 # _mail_tls_offer <tlsa status JSON> — the keys to a serving provider (it
 # reloads); nothing serving: nothing asked. A refusal (the provider
 # serves another key) is a warning: mail status shows it.
@@ -490,7 +500,12 @@ mail_enable() {
       || fail "the Hub didn't wire $provider (see above): ./portcullis mail status"
     ok "$id is this server's mail provider."
   fi
-  [ "$provider" = none ] || _mail_tls_offer "$st"
+  if [ "$provider" != none ]; then
+    # Right after the install op the provider may still be starting:
+    # nothing else posts its keys before the daily timer.
+    _mail_wait_serving || warn "the mail provider is not serving yet: its keys reach it at ./portcullis mail rotate (the daily timer), or run it once it is"
+    _mail_tls_offer "$st"
+  fi
   ok "Mail is on. DNS: ./portcullis dns setup ($(mail_hostname)'s address now; the mail records once the provider has its first document, then the daily timer keeps them); status: ./portcullis mail status"
   if [ "$yes" = true ] || confirm "Install the daily mail timer (certificate, TLSA, the main domain's records) now?"; then
     mail_schedule_systemd ""

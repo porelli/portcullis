@@ -5035,6 +5035,16 @@ mte 'mail_enable "" "" stalwart false </dev/null'; rc=$?
 expect_eq "mail enable without --yes and no terminal: refused, nothing installed" "$rc:$([ -f "$ML/hub-install.in" ] && echo installed || echo none):$(grep -c 'type the instance id to confirm' "$ML/out")" "1:none:1"
 mte 'printf "%s" "{\"slot\":\"open\",\"wired\":true,\"instance\":\"stalwart\",\"template\":\"stalwart\",\"warning\":\"w\"}" > "$ML/hub-provider"; mail_enable "" "" stalwart true'; rc=$?
 expect_eq "mail enable: already wired → no second install" "$rc:$([ -f "$ML/hub-install.in" ] && echo installed || echo none)" "0:none"
+# test_mail_enable_waits_for_the_provider: right after the install op the
+# provider may not serve yet (its containers starting): mail enable waits
+# (MAIL_SERVING_WAIT) and then gives it the keys, never "its keys reach it
+# when it is" (nothing else posts them before the daily timer).
+mte 'n=0; _mail_serving() { n=$((n + 1)); [ "$n" -ge 3 ]; }; export MAIL_SERVING_WAIT=30 MAIL_SERVING_POLL=0; mail_enable "" "" stalwart true'; rc=$?
+expect_eq "mail enable: a provider serving only on the third look still gets the keys" \
+  "$rc:$(jq -c . "$ML/hub-tls.in" 2>/dev/null):$(grep -c 'its keys reach it when it is' "$ML/out")" '0:{"spki_sha256":["aa"],"not_after":"2027-02-01T00:00:00Z"}:0'
+mte '_mail_serving() { return 1; }; export MAIL_SERVING_WAIT=0 MAIL_SERVING_POLL=0; mail_enable "" "" stalwart true'; rc=$?
+expect_eq "mail enable: a provider never serving: rc 0, no keys posted, a warning naming mail rotate" \
+  "$rc:$([ -f "$ML/hub-tls.in" ] && echo posted || echo none):$(grep -c 'not serving yet.*mail rotate' "$ML/out")" "0:none:1"
 # test_mail_enable_provider_none: the slot only.
 mte 'mail_enable "" "" none true'; rc=$?
 expect_eq "mail enable --provider none: the slot open, no install" "$rc:$([ -f "$ML/hub-install.in" ] && echo installed || echo none):$(grep -c '^PORTCULLIS_MAIL=on$' "$ML/root/.env")" "0:none:1"
