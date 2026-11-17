@@ -10,6 +10,7 @@ Cases, in this order (one function each):
   join_code_reused_refused        the same code on another worker never enrols
   join_code_expired_refused       a code past its 15 min (the Hub's clock, a CI-only hook) is refused
   echo_on_worker_signed_in        an instance placed on w1 answers through the primary, same tier as one on the primary
+  stream_non_browser_clients      curl (HTTP/1.1 and HTTP/2, alice's cookies) streams through Traefik, forward-auth and the relay
   echo_on_worker_denied_without_sign_in
   no_portcullis_cookie_reaches_app      the app sees no Portcullis cookie
   parent_domain_set_cookie_stripped     a Set-Cookie for the parent domain comes back host-only
@@ -17,9 +18,10 @@ Cases, in this order (one function each):
   move_back_onto_kept_copy_refused      a direct move onto a server holding a kept copy is 409
   wg_stopped_fails_closed         wg down: the app is unreachable, its containers still run on w1
   wg_back_routes_again
+  worker_break_glass_stop_start   ./portcullis worker stop / start se1 on w1 (as its operator), routed again
   rogue_worker                    .github/ci/e2e-servers-rogue.sh (dind job: two workers)
   revoke_drops_handshake_and_rotates    the peer gone, the instance's client secret new
-  revoke_cuts_websocket           a long-lived stream through the relay ends at the revocation
+  revoke_cuts_relayed_stream      a long-lived stream through the relay ends ≤ 10 s after the revoke
   socket_rule_both_stacks         .github/ci/e2e-servers-asserts.sh
 
 The join code is a secret: written only to a 0700 temp dir and piped to
@@ -431,6 +433,34 @@ def echo_on_worker_signed_in():
     state["se1"] = True
 
 
+def stream_non_browser_clients():
+    needs("se1")  # echo_on_worker_signed_in
+    # A non-browser client streams through Traefik, forward-auth and the
+    # relay too: curl over HTTP/1.1 and over HTTP/2, alice's se1 cookies in
+    # a 0600 header file (never an argument), the first ticks within 8 s.
+    st = state["alice_ctx"].cookies(f"https://se1.{DOMAIN}/cgi-bin/echo")
+    hdr = os.path.join(TMP, "se1-cookie.hdr")
+    with os.fdopen(os.open(hdr, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+        f.write("Cookie: " + "; ".join(f"{c['name']}={c['value']}" for c in st) + "\n")
+    try:
+        for proto in ("--http1.1", "--http2"):
+            t0 = time.time()
+            p = subprocess.Popen(["curl", "-sS", "-N", proto, "--cacert", "certs/ca-chain.crt", "-H", f"@{hdr}",
+                                  "-o", "-", "-w", "\nHTTP=%{http_version} %{http_code}\n", "--max-time", "8",
+                                  f"https://se1.{DOMAIN}/cgi-bin/echo?stream"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            first, ticks = None, 0
+            for line in p.stdout:
+                if line.startswith("tick "):
+                    ticks += 1
+                    first = first if first is not None else time.time() - t0
+            p.wait()
+            err = redact(p.stderr.read())[-200:]
+            assert first is not None and first < 5 and ticks >= 3, \
+                f"curl {proto}: no stream through the primary (first tick {first}, {ticks} ticks in 8 s; {err.strip()})"
+    finally:
+        os.unlink(hdr)
+
+
 def echo_on_worker_denied_without_sign_in():
     needs("se1")  # echo_on_worker_signed_in
     ctx = state["browser"].new_context(ignore_https_errors=True)
@@ -522,6 +552,21 @@ def wg_back_routes_again():
     wait_for("se1 routed again", lambda: reach(state["alice_page"], "se1"), 240)
 
 
+def worker_break_glass_stop_start():
+    needs("se1")  # echo_on_worker_signed_in
+    # The worker's break-glass as its operator (the rootless Podman user on
+    # the podman job): the instance found through the engine's labels.
+    def se1_running() -> bool:
+        out = wexec("w1", "docker", "ps", "--filter", "label=com.docker.compose.project=portcullis-se1",
+                    "--format", "{{.State}}", check=False).stdout
+        return "running" in out
+    wexec("w1", "./portcullis", "worker", "stop", "se1")
+    wait_for("se1 stopped on w1", lambda: not se1_running(), 60)
+    wexec("w1", "./portcullis", "worker", "start", "se1")
+    wait_for("se1 running on w1 again", se1_running, 60)
+    wait_for("se1 routed again", lambda: reach(state["alice_page"], "se1"), 240)
+
+
 def rogue_worker():
     needs("w1")  # join_ok
     if KIND == "dind":
@@ -599,10 +644,11 @@ def revoke_drops_handshake_and_rotates():
     sp.close()
 
 
-def revoke_cuts_websocket():
+def revoke_cuts_relayed_stream():
     needs("stream")  # revoke_drops_handshake_and_rotates
     t0, closed = state["stream"]
-    assert closed is not None and closed - t0 < 30, f"the stream outlived the revocation ({None if closed is None else round(closed - t0)} s; {state.get('stream_note')})"
+    assert closed is not None and closed - t0 <= 10, f"the stream outlived the revocation ({None if closed is None else round(closed - t0, 1)} s after it, want ≤ 10; {state.get('stream_note')})"
+    print(f"  the relayed stream ended {round(closed - t0, 1)} s after the revoke", flush=True)
 
 
 def socket_rule_both_stacks():
@@ -629,6 +675,7 @@ def main() -> int:
         check("join_code_reused_refused", join_code_reused_refused)
         check("join_code_expired_refused", join_code_expired_refused)
         check("echo_on_worker_signed_in", echo_on_worker_signed_in)
+        check("stream_non_browser_clients", stream_non_browser_clients)
         check("echo_on_worker_denied_without_sign_in", echo_on_worker_denied_without_sign_in)
         check("no_portcullis_cookie_reaches_app", no_portcullis_cookie_reaches_app)
         check("parent_domain_set_cookie_stripped", parent_domain_set_cookie_stripped)
@@ -636,9 +683,10 @@ def main() -> int:
         check("move_back_onto_kept_copy_refused", move_back_onto_kept_copy_refused)
         check("wg_stopped_fails_closed", wg_stopped_fails_closed)
         check("wg_back_routes_again", wg_back_routes_again)
+        check("worker_break_glass_stop_start", worker_break_glass_stop_start)
         check("rogue_worker", rogue_worker)
         check("revoke_drops_handshake_and_rotates", revoke_drops_handshake_and_rotates)
-        check("revoke_cuts_websocket", revoke_cuts_websocket)
+        check("revoke_cuts_relayed_stream", revoke_cuts_relayed_stream)
         check("socket_rule_both_stacks", socket_rule_both_stacks)
         browser.close()
     failed = [n for n, ok, _ in base.results if not ok]
