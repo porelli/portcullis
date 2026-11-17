@@ -35,15 +35,15 @@ type Server func(ctx context.Context, env []string) (stop func() error, err erro
 // overlap). It
 //  1. starts the server in recovery mode (a random password made here; the
 //     session nonce in SessionFile for the server's entrypoint wrapper),
-//  2. applies the base plan as the recovery admin (the document's parts
-//     from the adapter's last accepted document, when there is one),
+//  2. applies the document-less base plan as the recovery admin, only on
+//     an unmarked, empty store (Ruling R-H2b), always minting a new key,
 //  3. writes the API key (MAILCTL_API_KEY_FILE, 0640, by rename),
 //  4. stops the server, starts it normally once (with the role-permission
 //     update after a server image change) and exits nil only when the
 //     recovery login is refused there.
 type Job struct {
 	URL     string // the job's own server over loopback (MAILCTL_JOB_LOCAL_URL)
-	DataDir string // adapter_data (the adapter's state.json)
+	DataDir string // job_data: the job's own files (.server-image)
 	// KeyFile is where the API key goes (MAILCTL_API_KEY_FILE, 0640).
 	KeyFile string
 	// StoreDir is the server's store volume as the job mounts it
@@ -248,8 +248,9 @@ func (j *Job) Run(ctx context.Context) (err error) {
 			if err := StoreEmpty(ctx, c, p); err != nil {
 				return "", err
 			}
-			old, _ := os.ReadFile(j.keyFile())
-			res, err := Apply(ctx, c, p, strings.TrimSpace(string(old)) == "", j.logf)
+			// Always a new key (L-a): a half-done first plan may have left a
+			// key in the store that the key file doesn't hold.
+			res, err := Apply(ctx, c, p, true, j.logf)
 			return res.APIKey, err
 		}); err != nil {
 			return err

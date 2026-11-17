@@ -330,7 +330,8 @@ func TestBootstrapPrintsKeyOnce(t *testing.T) {
 			n += len(objs)
 			for _, k := range objs {
 				ips := k["allowedIps"].(map[string]any)
-				if len(ips) != 1 || ips["172.31.255.3/32"] != true || k["permissions"].(map[string]any)["@type"] != "Inherit" {
+				// The adapter's /32 and the job's loopback (Ruling R2-N2).
+				if len(ips) != 2 || ips["172.31.255.3/32"] != true || ips["127.0.0.1/32"] != true || k["permissions"].(map[string]any)["@type"] != "Inherit" {
 					t.Fatalf("api key %v", k)
 				}
 			}

@@ -231,6 +231,11 @@ func TestBootstrapJobRefusesPlanOnUnmarkedStoreWithData(t *testing.T) {
 	for name, seed := range map[string]func(f *fakeStalwart){
 		"account": func(f *fakeStalwart) { f.put("Account", map[string]any{"name": "alice", "domainId": "d1"}) },
 		"domain":  func(f *fakeStalwart) { f.put("Domain", map[string]any{"name": "example.org"}) },
+		// mailctl's name on another domain isn't the plan's account (L-f).
+		"mailctl elsewhere": func(f *fakeStalwart) {
+			f.put("Domain", map[string]any{"name": ParkingDomain})
+			f.put("Account", map[string]any{"name": MailctlAccount, "domainId": "elsewhere"})
+		},
 	} {
 		s := &jobServer{f: newFake()}
 		seed(s.f)
