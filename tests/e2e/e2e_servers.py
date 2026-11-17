@@ -539,7 +539,7 @@ def revoke_drops_handshake_and_rotates():
     run_op("POST", "/api/templates/enable", {"id": "oe1"}, timeout=900)
     before = keycloak_secret("oe1")
     # A long-lived stream through the relay, open across the revocation.
-    stream = {"closed_after": None}
+    stream = {"closed_after": None, "first": None, "bytes": 0, "status": None, "error": ""}
 
     def hold():
         st = state["alice_ctx"].cookies()
@@ -547,14 +547,20 @@ def revoke_drops_handshake_and_rotates():
         req = urllib.request.Request(f"https://se1.{DOMAIN}/cgi-bin/echo?stream", headers={"Cookie": hdr})
         try:
             with urllib.request.urlopen(req, timeout=300, context=_tls()) as r:
+                stream["status"] = r.status
                 while r.read(1):
-                    pass
-        except Exception:  # noqa: BLE001
-            pass
+                    stream["bytes"] += 1
+                    if stream["first"] is None:
+                        stream["first"] = time.time()
+        except Exception as e:  # noqa: BLE001
+            stream["error"] = f"{type(e).__name__}: {redact(str(e))[:200]}"
         stream["closed_after"] = time.time()
     t = threading.Thread(target=hold, daemon=True)
     t.start()
-    time.sleep(5)
+    # The stream must be flowing through the relay before the revocation
+    # (else nothing is being cut).
+    wait_for("the stream through the relay started", lambda: stream["first"] is not None or stream["closed_after"] is not None, 30, every=1)
+    assert stream["first"] is not None, f"the stream never started: {stream}"
     t0 = time.time()
     body = dict(confirm="w1", **fresh_proof(state["admin_page"], "revoke-w1"))
     hub_ok("POST", "/api/servers/w1/revoke", body)
@@ -563,6 +569,7 @@ def revoke_drops_handshake_and_rotates():
     wait_for("oe1's client secret rotated", lambda: keycloak_secret("oe1") != before, 120)
     t.join(timeout=60)
     state["stream"] = (t0, stream["closed_after"])
+    state["stream_note"] = {k: stream[k] for k in ("status", "bytes", "error")}
 
 
 def _tls():
@@ -574,7 +581,7 @@ def _tls():
 def revoke_cuts_websocket():
     needs("stream")  # revoke_drops_handshake_and_rotates
     t0, closed = state["stream"]
-    assert closed is not None and closed - t0 < 30, f"the stream outlived the revocation ({None if closed is None else round(closed - t0)} s)"
+    assert closed is not None and closed - t0 < 30, f"the stream outlived the revocation ({None if closed is None else round(closed - t0)} s; {state.get('stream_note')})"
 
 
 def socket_rule_both_stacks():
