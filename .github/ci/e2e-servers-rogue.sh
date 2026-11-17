@@ -73,7 +73,8 @@ printf 'Proxy-Authorization: Bearer %s\n' "$(cat "$T/token")" > "$T/good.hdr"
 printf 'Proxy-Authorization: Bearer %s\n' "$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=')" > "$T/bogus.hdr"
 : > "$T/none.hdr"
 connect() {  # <header file> <target> → the CONNECT's HTTP status
-  docker run --rm --network portcullis-link-data -v "$T:/t:ro" "$CURL_IMG" -s -o /dev/null -w '%{http_code}' --max-time 15 \
+  # As the runner's uid: $T is 0700 (the token), curl's own user can't read it.
+  docker run --rm --network portcullis-link-data --user "$(id -u):$(id -g)" -v "$T:/t:ro" "$CURL_IMG" -s -o /dev/null -w '%{http_code}' --max-time 15 \
     --proxytunnel -x http://172.31.254.130:3129 --proxy-header "@/t/$1" "http://$2/" 2>/dev/null || true
 }
 for c in "none.hdr se1.web.relay:8080" "bogus.hdr se1.web.relay:8080" "good.hdr se0.web.relay:8080" "good.hdr gitea.web.relay:3000"; do
