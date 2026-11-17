@@ -383,3 +383,19 @@ tests:
       - eval_time: 15m
         alertname: PortcullisUsageSamplerStale
         exp_alerts: []
+
+  # The Hub's usage metrics target down (a real install always runs the
+  # Hub): TargetDown fires for job hub-usage (only CI's e2e job, which
+  # runs no Hub, skips it in its own targets check).
+  - interval: 1m
+    input_series:
+      - series: 'up{job="hub-usage",instance="hub-metrics:9100"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: TargetDown
+        exp_alerts:
+          - exp_labels: {severity: warning, job: hub-usage, instance: "hub-metrics:9100"}
+            exp_annotations:
+              summary: "hub-usage cannot be scraped"
+              description: "hub-metrics:9100 (hub-usage) has been unreachable for 5 minutes."
