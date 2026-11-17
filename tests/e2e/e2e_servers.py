@@ -364,7 +364,8 @@ def wg_stopped_fails_closed():
 
 
 def wg_back_routes_again():
-    sh("docker", "compose", "start", "wg")
+    sh("docker", "compose", "start", "wg")  # always: later cases need wg
+    assert state.get("se1"), "needs echo_on_worker_signed_in"
     wait_for("se1 routed again", lambda: reach(state["alice_page"], "se1"), 240)
 
 

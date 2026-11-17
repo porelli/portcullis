@@ -207,14 +207,21 @@ worker_join() {
   start=$SECONDS
   while :; do
     st="$(_worker_state)"
-    if [ -n "$st" ] && [ "$st" != "$last" ]; then info "agent: $st"; last="$st"; fi
+    if [ -n "$st" ] && [ "$st" != "$last" ] && ! { [ "$st" = ready ] && [ "$last" = "ready (containers starting)" ]; }; then info "agent: $st"; last="$st"; fi
     case "$st" in
-      ready) ok "This worker is ready (./portcullis worker status). Place apps on it in the Hub."; return 0 ;;
+      ready)
+        # Enrolled: ready once its containers are healthy too (worker status's
+        # rule), else `worker status` right after join would still fail.
+        if [ "$(worker_status_json | jq -r .problem)" = false ]; then
+          ok "This worker is ready (./portcullis worker status). Place apps on it in the Hub."; return 0
+        fi
+        [ "$last" = "ready (containers starting)" ] || { info "agent: waiting for the containers' health checks"; last="ready (containers starting)"; st="$last"; } ;;
       refused) fail "the primary refused the enrolment: ask the Hub for a new code, then ./portcullis worker join --force" ;;
     esac
     if [ $((SECONDS - start)) -ge "$WORKER_JOIN_WAIT" ]; then
       # The agent's last lines (it never logs the code or a key).
       dc logs --no-color --tail=15 agent >&2 2>/dev/null || true
+      [ "$st" != "ready (containers starting)" ] || fail "enrolled, but its containers aren't healthy after ${WORKER_JOIN_WAIT}s: ./portcullis worker status"
       fail "not ready after ${WORKER_JOIN_WAIT}s (state: ${st:-unknown}): check the Hub's Servers page and ./portcullis worker status"
     fi
     sleep 3

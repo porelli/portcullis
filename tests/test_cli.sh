@@ -512,6 +512,11 @@ case "$*" in
   "info --format {{.DockerRootDir}}") echo "$WK_ENGINE" ;;
   *" run --rm --no-deps -T --entrypoint portcullis-agent agent join") cat > "$WK_STDIN" ;;
   *" exec -T agent portcullis-agent status") echo '{"state":"ready","server_id":"nas","tunnel_ip":"10.214.0.10"}' ;;
+  *" ps -a --format json")
+    # The agent's health check passes on the second look (join waits for it).
+    n=$(cat "$WK_LOG.ps" 2>/dev/null || echo 0); echo $((n + 1)) > "$WK_LOG.ps"
+    h=healthy; [ "$n" -ge 1 ] || h=starting
+    printf '{"Service":"agent","State":"running","Health":"%s"}\n{"Service":"socket-proxy-agent","State":"running","Health":"healthy"}\n' "$h" ;;
 esac
 exit 0
 STUB
@@ -521,6 +526,8 @@ RC=0; printf '%s\n' "$CODE" | PATH="$WK/bin:$PATH" WK_LOG="$WK/log" WK_STDIN="$W
   PORTCULLIS_ROOT="$WK/root" PORTCULLIS_WORKER_BIND_ROOTS="$WK/srv:$WK/mnt" WORKER_JOIN_WAIT=5 \
   "$CLI" worker join --runtime docker >"$WORK/out" 2>"$WORK/err" || RC=$?
 expect_eq "worker join (stdin): exit 0, ready" "$RC:$(grep -c 'This worker is ready' "$WORK/out" "$WORK/err" | awk -F: '{ s += $2 } END { print s }')" "0:1"
+expect_eq "worker join: ready only once its containers are healthy (it waited for the agent's check)" \
+  "$(cat "$WORK/out" "$WORK/err" | grep -c "waiting for the containers' health checks")" 1
 expect_eq "worker join: the agent's join got the code on stdin" "$(cat "$WK/stdin")" "$CODE"
 expect_eq "worker join: the code is on no argv and in no output" \
   "$(cat "$WK/log" "$WORK/out" "$WORK/err" | grep -c 'eyJ2IjoxLCJzZWNyZXQi' || true)" 0
