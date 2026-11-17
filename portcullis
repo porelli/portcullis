@@ -92,6 +92,7 @@ Mail:
   mail rotate                 The daily step: certificate, TLSA, the main domain's records
   mail schedule               Install the daily mail timer (--systemd)
   mail export                 Export a former account's mailbox as mbox
+  mail restore-hold           restore-hold clear: lift a core restore's stale hold on the provider
 
 Kubernetes:
   kube check                  Refresh the cluster check the Hub reads (init's timer: every 6 h)
