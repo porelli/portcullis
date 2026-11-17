@@ -873,6 +873,21 @@ mail_slot_open() { [ "${PORTCULLIS_MAIL:-}" = on ]; }
 # setgid, so the Hub's files carry Prometheus' group); mail_tls and
 # mail_acme with the slot open (mail-cert's). secrets/mail/ holds only the
 # CLI's records (hostname, former-hostnames).
+#
+# _mail_metrics_network — portcullis-metrics-mail exists with the slot
+# open: the wired provider's override joins it as external, and compose
+# makes it only for a member (Prometheus, the monitoring profile), so
+# without monitoring the install's normal-mode up failed ("declared as
+# external, but could not be found"). Made as compose would (internal,
+# its labels: compose adopts it).
+_mail_metrics_network() {
+  _rt_docker_only
+  docker network inspect portcullis-metrics-mail >/dev/null 2>&1 && return 0
+  docker network create --internal --label "com.docker.compose.project=${COMPOSE_PROJECT_NAME:-portcullis}" \
+    --label com.docker.compose.network=portcullis-metrics-mail portcullis-metrics-mail >/dev/null \
+    || fail "could not create the network portcullis-metrics-mail"
+}
+
 mail_prepare() {
   local d="$PORTCULLIS_ROOT/secrets/mail"
   (umask 077 && mkdir -p "$d")
@@ -882,6 +897,7 @@ mail_prepare() {
   # provider's gated services read them through group 2000.
   volume_own mail_provider_slot "$CT_UID_HUB:$CT_GID_MAIL_PROVIDER" 2750
   mail_slot_open || return 0
+  _mail_metrics_network
   volume_own mail_tls "$CT_UID_DOMAINS:$CT_GID_MAIL_PROVIDER" 2750
   volume_own mail_acme "$CT_UID_DOMAINS:$CT_UID_DOMAINS" 0700
 }

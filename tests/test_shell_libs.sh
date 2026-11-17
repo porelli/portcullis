@@ -285,10 +285,13 @@ done
 rm -f "$STUB_DIR/sp-vol"
 ( PORTCULLIS_ROOT="$SP_ROOT"; export PORTCULLIS_MAIL=on
   volume_own() { echo "volume_own $*" >> "$STUB_DIR/sp-vol"; }; hub_env_write() { :; }; secrets_fix_perms() { :; }
+  docker() { echo "docker $*" >> "$STUB_DIR/sp-net"; [ "$1 $2" != "network inspect" ]; }
   unset -f users_secret_files monitoring_prepare domains_prepare mcpgate_ensure_secrets
   stack_prepare ) >/dev/null 2>&1
 expect_eq "stack_prepare: with the slot open, the slot and mail-cert's volumes (owners, modes)" "$(grep '^volume_own mail' "$STUB_DIR/sp-vol" | sort | tr '\n' '|')" \
   "volume_own mail_acme 10004:10004 0700|volume_own mail_provider_slot 10001:2000 2750|volume_own mail_slot 10001:65534 2750|volume_own mail_tls 10004:2000 2750|"
+expect_eq "stack_prepare with the slot open: portcullis-metrics-mail made (internal, compose's labels) when missing" \
+  "$(grep -c '^docker network create --internal --label com.docker.compose.project=portcullis --label com.docker.compose.network=portcullis-metrics-mail portcullis-metrics-mail$' "$STUB_DIR/sp-net" 2>/dev/null)" 1
 expect_eq "CT_GID_MAIL_PROVIDER is 2000" "$CT_GID_MAIL_PROVIDER" 2000
 # group_gate_data (sign-in part 2, contract §4 "Opened log"): group-gate
 # (10003) writes the opened log, the Hub (group 10001) reads and prunes it.
