@@ -157,7 +157,7 @@ docker network inspect "$name" >/dev/null 2>&1 || die "no free 10.250.x.0/24 net
 docker run -d --name "$name" --hostname "pcci-$job" --label "pcci.run=$name" \
   --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock --network "$name" \
   --cpus "$cpus" --memory "$memory" --memory-swap "$memory" \
-  -v "$dk:/var/lib/docker" -v "$ct:/var/lib/containerd" -v "$work:/home/runner/work" -v "$srv:/srv" -v "$tmp:/tmp" \
+  -v "$dk:/var/lib/docker-store" -v "$ct:/var/lib/containerd" -v "$work:/home/runner/work" -v "$srv:/srv" -v "$tmp:/tmp" \
   "${home_cache[@]}" -v "$run/artifacts:/pcci/artifacts" "$tag" >/dev/null
 for i in $(seq 1 90); do
   docker exec "$name" docker info >/dev/null 2>&1 && break

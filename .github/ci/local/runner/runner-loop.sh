@@ -70,7 +70,7 @@ docker network inspect "$c" >/dev/null 2>&1 || docker network create --subnet "$
 for v in home gopath work srv tmp docker containerd tools; do docker volume create "$c-$v" >/dev/null; done
 docker run -d --name "$c" --hostname "$c" --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
   --network "$c" -e GOFLAGS=-mod=readonly --cpus "$CPUS" --memory "$MEMORY" --memory-swap "$MEMORY" \
-  -v "$c-docker:/var/lib/docker" -v "$c-containerd:/var/lib/containerd" \
+  -v "$c-docker:/var/lib/docker-store" -v "$c-containerd:/var/lib/containerd" \
   -v "$c-work:/home/runner/work" -v "$c-srv:/srv" -v "$c-tmp:/tmp" -v "$c-home:/home/runner/.cache" \
   -v "$c-gopath:/home/runner/go" -v "$c-tools:/opt/hostedtoolcache" "$img" >/dev/null
 for i in $(seq 1 90); do

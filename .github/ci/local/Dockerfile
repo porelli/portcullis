@@ -6,7 +6,10 @@
 # docker group), Docker CE + buildx + compose, git, jq, yq, shellcheck,
 # python3 + venv, gcc (go test -race), Node.js LTS, Playwright's system
 # packages, the official actions/runner. Go comes from actions/setup-go (or
-# its local emulation) into /opt/hostedtoolcache.
+# its local emulation) into /opt/hostedtoolcache. dockerd's data-root is
+# /var/lib/docker-store/docker (the volume is mounted at /var/lib/docker-store):
+# a container's /proc/self/mountinfo then names `…/docker/containers/<id>/`,
+# as on GitHub (the Hub's selfContainerID reads it), not a volume's `_data/`.
 FROM docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
 
 ARG YQ_VERSION=v4.54.3
@@ -39,6 +42,8 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
     && rm -rf /tmp/sc.tar.xz "/tmp/shellcheck-${SHELLCHECK_VERSION}" \
     && useradd -m -u 1001 -s /bin/bash runner && usermod -aG docker,systemd-journal runner \
     && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner && chmod 0440 /etc/sudoers.d/runner \
+    && mkdir -p /etc/docker /var/lib/docker-store \
+    && echo '{"data-root": "/var/lib/docker-store/docker"}' > /etc/docker/daemon.json \
     && systemctl enable docker containerd \
     && systemctl mask systemd-resolved.service getty.target console-getty.service systemd-logind.service 2>/dev/null || true
 
