@@ -5330,6 +5330,9 @@ bmp() {
       local c="${a[$((i + 3))]}"
       echo "hub mail $c" >> "$BM/calls"
       cat > /dev/null
+      # $BM/hub-<cmd>.busy: that many answers of the Hub's 409 "in progress" first.
+      local b; b="$(cat "$BM/hub-$c.busy" 2>/dev/null || echo 0)"
+      if [ "$b" -gt 0 ]; then echo $((b - 1)) > "$BM/hub-$c.busy"; echo "stalwart: an operation is in progress: try again" >&2; return 1; fi
       cat "$BM/hub-$c"
       return "$(cat "$BM/hub-$c.rc" 2>/dev/null || echo 0)"
     }
@@ -5343,6 +5346,12 @@ bmp 'PORTCULLIS_MAIL=on' ':'; rc=$?
 expect_eq "backup: hub mail backup before hub_data is archived" "$rc:$(grep -vx 'hub mail provider' "$BM/calls" | tr '\n' '|')" "0:hub mail backup|archive portcullis_hub_data|"
 # test_backup_manifest_names_archive
 expect_eq "backup: MANIFEST.json names the provider's archive" "$(jq -r .mail_provider_archive "$(bm_dir)/MANIFEST.json")" "stalwart/20261117T100000Z.tar"
+# test_backup_retries_hub_busy: the Hub's 409 "in progress" (a start-time
+# void holds the instance lock) is retried within MAIL_OP_WAIT.
+bmp 'PORTCULLIS_MAIL=on' 'echo 2 > "$BM/hub-backup.busy"; export MAIL_OP_POLL=0'; rc=$?
+expect_eq "backup: hub mail backup busy twice, then done" "$rc:$(grep -c 'hub mail backup' "$BM/calls"):$(jq -r .mail_provider_archive "$(bm_dir)/MANIFEST.json")" "0:3:stalwart/20261117T100000Z.tar"
+bmp 'PORTCULLIS_MAIL=on' 'echo 99 > "$BM/hub-backup.busy"; export MAIL_OP_POLL=0 MAIL_OP_WAIT=0'; rc=$?
+expect_eq "backup: busy past MAIL_OP_WAIT fails (nothing saved)" "$rc:$([ -n "$(bm_dir)" ] && echo saved || echo none)" "1:none"
 bmp 'PORTCULLIS_MAIL=on' 'echo 1 > "$BM/hub-backup.rc"'; rc=$?
 expect_eq "backup: a failed provider backup fails the backup (nothing saved)" "$rc:$([ -n "$(bm_dir)" ] && echo saved || echo none)" "1:none"
 bmp 'PORTCULLIS_MAIL=on' 'printf "%s" "{\"archive\":\"../../etc/x.tar\"}" > "$BM/hub-backup"'; rc=$?
@@ -5378,7 +5387,10 @@ rmp() {
       local -a a=("$@"); local i=0
       while [ "${a[$i]}" != -- ]; do i=$((i + 1)); done
       local c="${a[$((i + 3))]}"
-      echo "hub mail $c" >> "$BM/calls"; cat > "$BM/hub-$c.in"; cat "$BM/hub-$c"
+      echo "hub mail $c" >> "$BM/calls"; cat > "$BM/hub-$c.in"
+      local b; b="$(cat "$BM/hub-$c.busy" 2>/dev/null || echo 0)"
+      if [ "$b" -gt 0 ]; then echo $((b - 1)) > "$BM/hub-$c.busy"; echo "stalwart: an operation is in progress: try again" >&2; return 1; fi
+      cat "$BM/hub-$c"
       return "$(cat "$BM/hub-$c.rc" 2>/dev/null || echo 0)"
     }
     eval "$1"
@@ -5397,6 +5409,9 @@ expect_eq "restore: the hold, the Hub alone, hub mail restore {archive}, its op 
 expect_eq "restore: the hold written into hub_data as mail-restore-pending" "$(grep -c "portcullis_hub_data:/d .*cat > /d/mail-restore-pending" "$BM/calls")" 1
 rmp 'docker() { echo "docker $*" >> "$BM/calls"; [ "$1 $2" != "volume ls" ] || echo portcullis-stalwart_data; }'; rc=$?
 expect_eq "restore: the provider's volumes present → restored all the same (M9)" "$rc:$(grep -c 'hub mail restore' "$BM/calls")" "0:1"
+# test_restore_retries_hub_busy
+rmp 'echo 2 > "$BM/hub-restore.busy"'; rc=$?
+expect_eq "restore: hub mail restore busy twice, then its op polled to ok" "$rc:$(grep -c 'hub mail restore' "$BM/calls"):$(grep -c 'hub mail op' "$BM/calls")" "0:3:1"
 rmp 'echo 1 > "$BM/hub-restore.rc"'; rc=$?
 expect_eq "restore: the Hub refusing the provider restore fails the restore at its end" "$rc:$(grep -c "couldn't be restored from its archive" "$BM/out"):$(grep -c 'after the provider restore' "$BM/calls")" "1:1:1"
 rmp 'printf "%s" "{\"op_id\":\"op7\",\"running\":false,\"ok\":false,\"error\":\"tar: bad\"}" > "$BM/hub-op"'; rc=$?

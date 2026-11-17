@@ -238,6 +238,29 @@ _mail_not_wired() {
   [ "$1" = 1 ] && [ "$(printf '%s' "$2" | tr -d '\r' | sed -e 's/^[[:space:]]*//;s/[[:space:]]*$//')" = "no mail provider is wired" ]
 }
 
+# _mail_hub_retrying <command> [body] — `hub mail <command>`, its answer in
+# MAIL_HUB_OUT (called directly, never in $(): it sets globals); the
+# Hub's 409 "… in progress" (another op holds the instance, e.g. a
+# start-time void) is asked again every MAIL_OP_POLL s within
+# MAIL_OP_WAIT s. Its last refusal's text in MAIL_HUB_ERR (rc in
+# MAIL_HUB_RC), never printed here.
+_mail_hub_retrying() {
+  local cmd="$1" body="${2:-}" errf rc t0=$SECONDS
+  errf="$(mktemp)"
+  while :; do
+    rc=0
+    MAIL_HUB_OUT="$(_mail_hub "$cmd" "$body" 2>"$errf")" || rc=$?
+    MAIL_HUB_ERR="$(cat "$errf")"; MAIL_HUB_RC=$rc
+    if [ "$rc" = 0 ] || ! printf '%s' "$MAIL_HUB_ERR" | grep -qi 'in progress' \
+       || [ $((SECONDS - t0)) -ge "${MAIL_OP_WAIT:-1800}" ]; then
+      break
+    fi
+    sleep "${MAIL_OP_POLL:-2}"
+  done
+  rm -f "$errf"
+  return "$rc"
+}
+
 # _mail_hub_op <command> <body> — `hub mail <command>` that starts a Hub
 # op (install, unwire, restore: the answer {op_id, op, instance, poll}),
 # then `hub mail op` {instance, op_id} every MAIL_OP_POLL s until the
@@ -246,12 +269,10 @@ _mail_not_wired() {
 # stderr unless MAIL_HUB_QUIET=1; MAIL_HUB_ERR / MAIL_HUB_RC), a failed or another op's record,
 # or the wait running out. The start's answer goes to stdout.
 _mail_hub_op() {
-  local cmd="$1" body="$2" out errf rc=0 id inst rec t0=$SECONDS
+  local cmd="$1" body="$2" out rc=0 id inst rec t0=$SECONDS
   MAIL_HUB_ERR="" MAIL_HUB_RC=0
-  errf="$(mktemp)"
-  out="$(_mail_hub "$cmd" "$body" 2>"$errf")" || rc=$?
-  MAIL_HUB_ERR="$(cat "$errf")"; MAIL_HUB_RC=$rc
-  rm -f "$errf"
+  _mail_hub_retrying "$cmd" "$body" || rc=$?
+  out="$MAIL_HUB_OUT"
   if [ "$rc" != 0 ]; then
     [ "${MAIL_HUB_QUIET:-}" = 1 ] || [ -z "$MAIL_HUB_ERR" ] || printf '%s\n' "$MAIL_HUB_ERR" >&2
     return 1

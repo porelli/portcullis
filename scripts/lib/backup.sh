@@ -406,7 +406,9 @@ _backup_mail_provider() {
     return 0
   fi
   printf '  %-26s' "mail provider (instance)"
-  out="$(_mail_hub backup)" || fail "the mail provider's instance backup failed (hub mail backup): no backup made"
+  _mail_hub_retrying backup || { [ -z "${MAIL_HUB_ERR:-}" ] || printf '%s\n' "$MAIL_HUB_ERR" >&2
+    fail "the mail provider's instance backup failed (hub mail backup): no backup made"; }
+  out="$MAIL_HUB_OUT"
   a="$(printf '%s' "$out" | jq -r '.archive // ""' 2>/dev/null)"
   [[ "$a" =~ ^[a-z0-9][a-z0-9-]{0,62}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.tar$ ]] || fail "the Hub's mail backup answer names no archive"
   BACKUP_MAIL_ARCHIVE="$a"
