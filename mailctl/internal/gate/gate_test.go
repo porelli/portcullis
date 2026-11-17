@@ -45,3 +45,27 @@ func TestGatePredicate(t *testing.T) {
 		}
 	}
 }
+
+// Ruling T3-c: only the _mail/ files; a directory or another entry (the
+// whole hub_secrets volume because a subpath was ignored) refuses.
+func TestCheckLayout(t *testing.T) {
+	d := t.TempDir()
+	for _, f := range []string{".present", "api-secret", "metrics-secret", "relay-password", "void-pending", "void-session"} {
+		os.WriteFile(filepath.Join(d, f), []byte("x"), 0o640)
+	}
+	if err := CheckLayout(d); err != nil {
+		t.Fatal(err)
+	}
+	os.Mkdir(filepath.Join(d, "stalwart"), 0o750)
+	if err := CheckLayout(d); err == nil {
+		t.Fatal("an instance directory accepted")
+	}
+	os.Remove(filepath.Join(d, "stalwart"))
+	os.WriteFile(filepath.Join(d, "people.json"), nil, 0o640)
+	if err := CheckLayout(d); err == nil {
+		t.Fatal("a foreign file accepted")
+	}
+	if err := CheckLayout(filepath.Join(d, "missing")); err == nil {
+		t.Fatal("a missing slot accepted")
+	}
+}

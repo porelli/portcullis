@@ -527,3 +527,20 @@ func VerifyGone(ctx context.Context, url string, cr Credentials) error {
 		return fmt.Errorf("can't confirm the recovery admin is gone: HTTP %d", resp.StatusCode)
 	}
 }
+
+// MintKey replaces mailctl's API key only (Ruling R-H2: a marked store
+// whose key is lost): the existing account of mailctl on the parking
+// domain gets a new key; no other object is touched. No such account is
+// an error (fail closed: the store isn't what the marker says).
+func MintKey(ctx context.Context, c *stalwart.Client, mailctlIP netip.Addr) (string, error) {
+	accts, err := getAll(ctx, c, "Account")
+	if err != nil {
+		return "", err
+	}
+	for _, a := range accts {
+		if str(a, "name") == MailctlAccount {
+			return ensureAPIKey(ctx, c.As(str(a, "id")), mailctlIP, true)
+		}
+	}
+	return "", errors.New("the store is marked bootstrapped but has no mailctl account: restore the store or start a fresh one")
+}

@@ -54,10 +54,6 @@ import (
 
 const usage = `usage: mailctl [serve | healthcheck | bootstrap --job -- <server argv…> | export --former <former-id>]`
 
-// later are the subcommands later tasks fill (each talks to the running
-// serve process or to Stalwart directly, as its task says).
-var later = map[string]bool{}
-
 func main() { os.Exit(run(os.Args[1:], os.Getenv, os.Stdout, os.Stderr)) }
 
 func run(args []string, env func(string) string, stdout, stderr io.Writer) int {
@@ -81,9 +77,6 @@ func run(args []string, env func(string) string, stdout, stderr io.Writer) int {
 		return bootstrapCmd(args[1:], env, stderr)
 	case cmd == "export":
 		return exportCmd(args[1:], env, stdout, stderr)
-	case later[cmd]:
-		fmt.Fprintf(stderr, "mailctl %s: not available in this build\n", cmd)
-		return 1
 	default:
 		fmt.Fprintln(stderr, usage)
 		return 2
@@ -117,6 +110,9 @@ func healthcheck(env func(string) string) int {
 // (config.Load) and one of this container's addresses inside it (the
 // override's pinned provider address on portcullis-mail-api).
 func checkStart(cfg config.Config, addrs func() ([]net.Addr, error)) error {
+	if err := gate.CheckLayout(cfg.SlotDir); err != nil {
+		return err
+	}
 	if err := gate.Check(cfg.SlotDir, cfg.VoidSession); err != nil {
 		return err
 	}
@@ -352,7 +348,10 @@ func childServer(argv []string, out io.Writer) bootstrap.Server {
 		}
 		cmd := exec.Command(argv[0], argv[1:]...)
 		cmd.Env = append(os.Environ(), extra...)
-		cmd.Stdout, cmd.Stderr = out, out
+		// The child's output goes through the redaction (the recovery
+		// password is a registered secret).
+		rw := logx.NewRedactingWriter(out)
+		cmd.Stdout, cmd.Stderr = rw, rw
 		if err := cmd.Start(); err != nil {
 			return nil, err
 		}

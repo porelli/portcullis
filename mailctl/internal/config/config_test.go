@@ -132,3 +132,25 @@ func TestKeyFileAndStoreDir(t *testing.T) {
 		t.Fatalf("%+v %v", c, err)
 	}
 }
+
+// L5: both server URLs are exactly http://<ip>:<port> (the key is sent
+// there): no userinfo, path, query, fragment, name or other scheme.
+func TestServerURLsStrict(t *testing.T) {
+	for _, bad := range []string{"http://u:p@172.31.255.2:8080", "http://172.31.255.2:8080/x", "http://172.31.255.2:8080?", "http://172.31.255.2:8080#",
+		"HTTP://172.31.255.2:8080", "http://stalwart:8080", "http://172.31.255.2", "https://172.31.255.2:8080"} {
+		m := base()
+		m["MAILCTL_STALWART_URL"] = bad
+		if _, err := Load(envOf(m)); err == nil {
+			t.Errorf("STALWART_URL %s accepted", bad)
+		}
+		j := map[string]string{"MAILCTL_LOCAL_RESOLVER": "172.31.255.4:5353", "MAILCTL_STORE_DIR": "/s", "MAILCTL_JOB_LOCAL_URL": strings.Replace(bad, "172.31.255.2", "127.0.0.1", 1)}
+		if _, err := LoadJob(envOf(j)); err == nil {
+			t.Errorf("JOB_LOCAL_URL %s accepted", j["MAILCTL_JOB_LOCAL_URL"])
+		}
+	}
+	m := base()
+	m["MAILCTL_STALWART_URL"] = "http://172.31.255.2:8080/"
+	if c, err := Load(envOf(m)); err != nil || c.StalwartURL != "http://172.31.255.2:8080" {
+		t.Fatalf("%v %v", c.StalwartURL, err)
+	}
+}

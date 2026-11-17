@@ -229,3 +229,12 @@ func TestBootstrapJobNeverDialsStalwartURL(t *testing.T) {
 		}
 	}
 }
+
+// Ruling T3-c at start: a slot mount showing another entry is refused.
+func TestStartRefusedForeignSlotEntry(t *testing.T) {
+	c := startCfg(t)
+	os.Mkdir(filepath.Join(c.SlotDir, "other-instance"), 0o750)
+	if err := checkStart(c, addrs(inside)); err == nil || !strings.Contains(err.Error(), "other-instance") {
+		t.Fatalf("%v", err)
+	}
+}

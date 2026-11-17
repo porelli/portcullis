@@ -2,12 +2,14 @@ package bootstrap
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -21,6 +23,8 @@ type jobServer struct {
 	recovery bool
 	leak     bool // a normal start that still accepts the recovery admin
 	starts   [][]string
+	// keyFile set: a Bearer must be the fake's latest API key (else 401).
+	keyFile string
 }
 
 func (s *jobServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -33,6 +37,15 @@ func (s *jobServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/healthz/live" {
 		return
+	}
+	if h := r.Header.Get("Authorization"); s.keyFile != "" && strings.HasPrefix(h, "Bearer ") {
+		s.f.mu.Lock()
+		want := fmt.Sprintf("Bearer API_%038d", s.f.keyNext)
+		s.f.mu.Unlock()
+		if h != want {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 	}
 	if u, _, _ := r.BasicAuth(); u == RecoveryUser && !rec {
 		if leak {
@@ -88,36 +101,81 @@ func TestBootstrapJobVerifiesRecoveryRefused(t *testing.T) {
 	if s.up {
 		t.Fatal("the server was left running")
 	}
-	// Ruling T17-c: the store is marked; a cold start takes the lock, sees
-	// the marker and the key, and starts nothing (no settings touched).
+	// Ruling T17-c / R-H2: the store is marked; a cold start takes the
+	// lock, sees the marker, and only checks the key on one normal start
+	// (no plan, no settings touched).
 	if !markerValid(j.StoreDir) {
 		t.Fatal("no marker after the plan")
 	}
+	s.keyFile = KeyFile(j.DataDir)
+	sets := func() string {
+		s.f.mu.Lock()
+		defer s.f.mu.Unlock()
+		var out []string
+		for _, c := range s.f.calls {
+			if strings.Contains(c, "/set") && !strings.Contains(c, "x:ApiKey/set") {
+				out = append(out, c)
+			}
+		}
+		return strings.Join(out, ",")
+	}
 	ino := inode(t, KeyFile(j.DataDir))
 	s.starts = nil
+	s.f.calls = nil
 	if err := j.Run(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	b2, _ := os.ReadFile(KeyFile(j.DataDir))
-	if string(b2) != string(b) || inode(t, KeyFile(j.DataDir)) != ino || len(s.starts) != 0 {
-		t.Fatalf("second run: key %q starts %q", b2, s.starts)
+	if string(b2) != string(b) || inode(t, KeyFile(j.DataDir)) != ino || len(s.starts) != 1 || len(s.starts[0]) != 0 || sets() != "" {
+		t.Fatalf("second run: key %q starts %q sets %s", b2, s.starts, sets())
 	}
-	// A server image change: one normal start with the role update only.
+	// A server image change: the check's start runs the role update.
 	j.ServerImage = "docker.io/stalwartlabs/stalwart:v1.1.1@sha256:bb"
 	s.starts = nil
 	if err := j.Run(context.Background()); err != nil || len(s.starts) != 1 || strings.Join(s.starts[0], " ") != "STALWART_UPDATE_ROLE_PERMISSIONS=true" {
 		t.Fatalf("image change: %v %q", err, s.starts)
 	}
-	// An invalid marker (or a missing key) runs the plan again (fail closed).
+	// R-H2: a marked store with its key lost or refused mints a new key
+	// only: the check's start, a recovery start, the normal start; no
+	// object but the API key is written, and the new key works.
+	for name, lose := range map[string]func(){
+		"missing": func() { os.Remove(KeyFile(j.DataDir)) },
+		"empty":   func() { os.WriteFile(KeyFile(j.DataDir), nil, 0o640) },
+		"refused": func() { os.WriteFile(KeyFile(j.DataDir), []byte("API_stale"), 0o640) },
+	} {
+		lose()
+		s.starts = nil
+		s.f.calls = nil
+		if err := j.Run(context.Background()); err != nil || len(s.starts) != 3 || sets() != "" || !markerValid(j.StoreDir) {
+			t.Fatalf("%s key: %v starts %q sets %s", name, err, s.starts, sets())
+		}
+		if k, _ := os.ReadFile(KeyFile(j.DataDir)); !strings.HasPrefix(string(k), "API_") || string(k) == "API_stale" {
+			t.Fatalf("%s key: new key %q", name, k)
+		}
+	}
+	// No temporary key file left behind (written by rename).
+	if _, err := os.Stat(KeyFile(j.DataDir) + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("a temporary key file is left")
+	}
+	// A marked store without mailctl's account: fail closed (no plan).
+	s.f.mu.Lock()
+	for id, a := range s.f.objs["Account"] {
+		if a["name"] == MailctlAccount {
+			delete(s.f.objs["Account"], id)
+		}
+	}
+	s.f.mu.Unlock()
+	os.Remove(KeyFile(j.DataDir))
+	s.f.calls = nil
+	if err := j.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "no mailctl account") || sets() != "" {
+		t.Fatalf("no account: %v sets %s", err, sets())
+	}
+	s.keyFile = ""
+	// An invalid marker runs the plan again (fail closed).
 	os.WriteFile(filepath.Join(j.StoreDir, planMarker), []byte(`{"version":2}`), 0o600)
 	s.starts = nil
 	if err := j.Run(context.Background()); err != nil || len(s.starts) != 2 {
 		t.Fatalf("invalid marker: %v %q", err, s.starts)
-	}
-	os.Remove(KeyFile(j.DataDir))
-	s.starts = nil
-	if err := j.Run(context.Background()); err != nil || len(s.starts) != 2 {
-		t.Fatalf("missing key: %v %q", err, s.starts)
 	}
 	// The key at MAILCTL_API_KEY_FILE when set.
 	j.KeyFile = filepath.Join(t.TempDir(), "key")
@@ -127,6 +185,17 @@ func TestBootstrapJobVerifiesRecoveryRefused(t *testing.T) {
 	}
 	if fi, err := os.Stat(j.KeyFile); err != nil || fi.Mode().Perm() != 0o640 {
 		t.Fatalf("key file %v %v", fi, err)
+	}
+	// A held lock: the job gives up at its deadline, never hangs (L1).
+	f, _ := os.OpenFile(filepath.Join(j.StoreDir, jobLock), os.O_RDWR|os.O_CREATE, 0o600)
+	syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	err = j.Run(ctx)
+	cancel()
+	syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	f.Close()
+	if err == nil || !strings.Contains(err.Error(), "locked by another bootstrap") {
+		t.Fatalf("held lock: %v", err)
 	}
 	// No store volume: refused before anything starts.
 	j2 := newJob(t, &jobServer{f: newFake()})

@@ -211,13 +211,7 @@ func LoadJob(env func(string) string) (Config, error) {
 		return c, fmt.Errorf("MAILCTL_STORE_DIR=%q is not a clean absolute directory", c.StoreDir)
 	}
 	c.JobLocalURL = get(env, "MAILCTL_JOB_LOCAL_URL", "http://127.0.0.1:8080")
-	u, err := url.Parse(c.JobLocalURL)
-	ok := err == nil && u.Scheme == "http" && u.Path == "" && u.RawQuery == "" && u.User == nil && u.Fragment == ""
-	if ok {
-		ap, perr := netip.ParseAddrPort(u.Host)
-		ok = perr == nil && ap.Addr().IsLoopback() && ap.Port() != 0
-	}
-	if !ok {
+	if !plainHTTPURL(c.JobLocalURL, true) {
 		return c, fmt.Errorf("MAILCTL_JOB_LOCAL_URL=%q is not http://<loopback ip>:<port>", c.JobLocalURL)
 	}
 	c.ServerImage = strings.TrimSpace(env("MAILCTL_SERVER_IMAGE"))
@@ -230,11 +224,10 @@ func LoadJob(env func(string) string) (Config, error) {
 // loadOwn reads the MAILCTL_* part.
 func loadOwn(env func(string) string, c *Config) error {
 	var err error
-	c.StalwartURL = get(env, "MAILCTL_STALWART_URL", "http://172.31.255.2:8080")
-	if !strings.HasPrefix(c.StalwartURL, "http://") || strings.ContainsAny(c.StalwartURL, " \t\n") {
-		return fmt.Errorf("MAILCTL_STALWART_URL=%q is not an http:// URL", c.StalwartURL)
+	c.StalwartURL = strings.TrimSuffix(get(env, "MAILCTL_STALWART_URL", "http://172.31.255.2:8080"), "/")
+	if !plainHTTPURL(c.StalwartURL, false) {
+		return fmt.Errorf("MAILCTL_STALWART_URL=%q is not http://<ip>:<port>", c.StalwartURL)
 	}
-	c.StalwartURL = strings.TrimSuffix(c.StalwartURL, "/")
 	c.WellKnownAddr = get(env, "MAILCTL_WELLKNOWN_ADDR", ":8081")
 	if err := listenAddr("MAILCTL_WELLKNOWN_ADDR", c.WellKnownAddr); err != nil {
 		return err
@@ -278,4 +271,19 @@ func loadOwn(env func(string) string, c *Config) error {
 		return err
 	}
 	return nil
+}
+
+// plainHTTPURL: exactly http://<ip literal>:<port> (lowercase scheme, no
+// userinfo, path, query or fragment — the API key is sent there);
+// loopback: the address must be a loopback one.
+func plainHTTPURL(raw string, loopback bool) bool {
+	if !strings.HasPrefix(raw, "http://") || strings.ContainsAny(raw, " \t\n?#@") {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "http" || u.Path != "" || u.RawQuery != "" || u.User != nil || u.Fragment != "" || u.Opaque != "" {
+		return false
+	}
+	ap, err := netip.ParseAddrPort(u.Host)
+	return err == nil && ap.Port() != 0 && (!loopback || ap.Addr().IsLoopback())
 }

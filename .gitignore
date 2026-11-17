@@ -44,3 +44,6 @@ __pycache__/
 
 # ./portcullis one-at-a-time lock (cli_lock)
 .portcullis.lock
+
+# The mailctl build output (go build in mailctl/): never committed.
+/mailctl/mailctl

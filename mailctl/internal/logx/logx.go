@@ -4,6 +4,7 @@
 package logx
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -54,3 +55,36 @@ func New(w io.Writer) *Logger { return &Logger{l: log.New(w, "", log.LstdFlags)}
 
 // Printf logs one redacted line.
 func (l *Logger) Printf(format string, a ...any) { l.l.Print(Redact(fmt.Sprintf(format, a...))) }
+
+// RedactingWriter writes w's input line by line through Redact (a line
+// split across writes is held until its newline; the rest on Close-less
+// streams flushes with the next line).
+type RedactingWriter struct {
+	mu  sync.Mutex
+	w   io.Writer
+	buf []byte
+}
+
+// NewRedactingWriter wraps w.
+func NewRedactingWriter(w io.Writer) *RedactingWriter { return &RedactingWriter{w: w} }
+
+func (r *RedactingWriter) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.buf = append(r.buf, p...)
+	for {
+		i := bytes.IndexByte(r.buf, '\n')
+		if i < 0 {
+			break
+		}
+		if _, err := io.WriteString(r.w, Redact(string(r.buf[:i+1]))); err != nil {
+			return len(p), err
+		}
+		r.buf = r.buf[i+1:]
+	}
+	if len(r.buf) > 64<<10 {
+		_, _ = io.WriteString(r.w, Redact(string(r.buf)))
+		r.buf = nil
+	}
+	return len(p), nil
+}

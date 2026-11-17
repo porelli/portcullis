@@ -60,3 +60,25 @@ func Check(slotDir, session string) error {
 	}
 	return nil
 }
+
+// slotFiles are the only entries of a wired instance's _mail/ (contract
+// §19.1).
+var slotFiles = map[string]bool{"api-secret": true, "metrics-secret": true, "relay-password": true,
+	".present": true, "void-pending": true, "void-session": true}
+
+// CheckLayout refuses a slot mount that shows anything but the _mail/
+// files (Ruling T3-c): a runtime that ignored the hub_secrets subpath
+// would show every instance's directory; the start is refused, never
+// guessed at. An unreadable directory is refused too.
+func CheckLayout(slotDir string) error {
+	ents, err := os.ReadDir(slotDir)
+	if err != nil {
+		return errors.New("the mail slot isn't readable: the slot's files are missing (is this instance wired?)")
+	}
+	for _, e := range ents {
+		if !slotFiles[e.Name()] || e.IsDir() {
+			return fmt.Errorf("the mail slot mount shows %q: not an instance's _mail/ files (was the hub_secrets subpath ignored?)", e.Name())
+		}
+	}
+	return nil
+}

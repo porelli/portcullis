@@ -21,3 +21,16 @@ func TestRedact(t *testing.T) {
 		t.Errorf("redaction: %s", out)
 	}
 }
+
+// L2: the bootstrap's server child writes through this: a registered
+// secret never reaches the job's log, also split across writes.
+func TestRedactingWriter(t *testing.T) {
+	AddSecret("s3cret-recovery-pass")
+	var b strings.Builder
+	w := NewRedactingWriter(&b)
+	w.Write([]byte("admin pw s3cret-rec"))
+	w.Write([]byte("overy-pass ok\nnext line\n"))
+	if strings.Contains(b.String(), "s3cret") || !strings.Contains(b.String(), "next line") {
+		t.Fatalf("%q", b.String())
+	}
+}
