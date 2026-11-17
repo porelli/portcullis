@@ -221,11 +221,33 @@ def reach(page: Page, iid: str) -> bool:
 
 # ── the cases ──
 
+def diag(name: str) -> None:
+    """What a failed enrolment needs to be understood (no secret in any
+    of it): link's peers, the agent's routes / addresses / log, its
+    networks."""
+    out = []
+    for title, cmd in (
+        ("link status", ["docker", "compose", "exec", "-T", "wg", "/wg", "status"]),
+        ("wg log", ["docker", "compose", "logs", "--no-color", "--tail=40", "wg"]),
+        (f"{name} agent routes", ["bash", WORKER_SH, "exec", name, "docker", "exec", "portcullis-worker-agent-1", "sh", "-c",
+                                  "ip route; ip -4 addr; cat /etc/resolv.conf"]),
+        (f"{name} networks", ["bash", WORKER_SH, "exec", name, "docker", "network", "ls"]),
+        (f"{name} agent log", ["bash", WORKER_SH, "compose", name, "logs", "--no-color", "--tail=60", "agent"]),
+    ):
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        out.append(f"--- {title} (exit {p.returncode})\n{(p.stdout + p.stderr)[-3000:]}")
+    text = "\n".join(out)
+    assert "pcj1." not in text
+    print(f"::group::diagnostics {name}\n{text}\n::endgroup::", flush=True)
+
+
 def join_ok():
     ans = add_server("w1")
     state["w1_op"] = ans
     join(KIND, "w1", ans["code_file"])
     rec = e2e_ops.wait(get, {"op_id": ans["op_id"], "poll": ans["poll"], "op": "server_enrol"}, 300)
+    if not rec.get("ok"):
+        diag("w1")
     assert rec.get("ok"), f"server_enrol: {e2e_ops.describe(rec)}"
     assert "pcj1." not in json.dumps(rec), "the code is in the op record"
     wait_for("w1 ready", lambda: server_state("w1") == "ready", 120)
