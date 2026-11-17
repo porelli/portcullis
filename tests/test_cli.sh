@@ -558,6 +558,48 @@ for bad in "nope" "pcj1.a b" ""; do
   expect_eq "worker join: stdin '$bad' → refused, nothing written" "$RC:$([ -e "$WORK/wk-bad/.env" ] && echo env || echo none)" "1:none"
 done
 
+# test_worker_break_glass: stop / start / leave find the app instances
+# through the engine's compose project labels (portcullis-<id>, never the
+# agent's own portcullis-worker), not worker-data/projects (0700, the
+# agent's uid); leave never reports success with app containers left.
+WK="$WORK/wk-bg"; mkdir -p "$WK/bin" "$WK/root/worker-data/projects"
+printf 'PORTCULLIS_ROLE=worker\nCONTAINER_RUNTIME=docker\nPORTCULLIS_WORKER_DATA=%s/root/worker-data\n' "$WK" > "$WK/root/.env"
+cat > "$WK/bin/docker" <<'STUB'
+#!/usr/bin/env bash
+[ "$1 $3" = "version {{json .Server.Components}}" ] && { echo '[{"Name":"Engine","Version":"29.0.0"}]'; exit 0; }
+printf '%s\n' "$*" >> "$WK_LOG"
+case "$*" in
+  'ps -a --format {{.Label "com.docker.compose.project"}}') cat "$WK_PROJECTS" ;;
+  "compose -p portcullis-"*" down")
+    p="${3}"; [ -n "${WK_STUCK:-}" ] || { grep -vx "$p" "$WK_PROJECTS" > "$WK_PROJECTS.n" || true; mv "$WK_PROJECTS.n" "$WK_PROJECTS"; } ;;
+  *" exec -T agent portcullis-agent "*) exit 1 ;;  # the agent doesn't answer
+esac
+exit 0
+STUB
+chmod +x "$WK/bin/docker"
+printf '%s\n' portcullis-worker portcullis-se1 portcullis-se1 "" portcullis-Bad_1 other-app portcullis-gitea > "$WK/projects"
+chmod 000 "$WK/root/worker-data/projects"
+bg() { RC=0; PATH="$WK/bin:$PATH" WK_LOG="$WK/log" WK_PROJECTS="$WK/projects" PORTCULLIS_ROOT="$WK/root" "$CLI" "$@" >"$WORK/out" 2>"$WORK/err" </dev/null || RC=$?; }
+: > "$WK/log"; bg worker stop se1
+expect_eq "worker stop se1 (worker-data/projects unreadable): compose -p portcullis-se1 stop" \
+  "$RC:$(grep -cx 'compose -p portcullis-se1 stop' "$WK/log")" "0:1"
+bg worker start gitea
+expect_eq "worker start gitea: compose -p portcullis-gitea start" "$RC:$(grep -cx 'compose -p portcullis-gitea start' "$WK/log")" "0:1"
+: > "$WK/log"
+for id in worker other-app nope; do
+  bg worker stop "$id"
+  expect_eq "worker stop $id (not an app instance on this engine) → exit 1, no compose call" \
+    "$RC:$(grep -c "no app instance $id on this worker" "$WORK/err"):$(grep -c '^compose' "$WK/log" || true)" "1:1:0"
+done
+chmod 755 "$WK/root/worker-data/projects"; rmdir "$WK/root/worker-data/projects"
+: > "$WK/log"; WK_STUCK=1 bg worker leave --yes
+expect_eq "worker leave with an app that won't go down → exit 1, the agent kept, worker-data kept" \
+  "$RC:$(grep -c 'app containers are still here (portcullis-gitea portcullis-se1)' "$WORK/err"):$(grep -c 'down -v' "$WK/log" || true):$([ -d "$WK/root/worker-data" ] && echo kept)" "1:1:0:kept"
+expect_eq "worker leave never says it left while apps run" "$(grep -c 'This host left' "$WORK/out" "$WORK/err" | awk -F: '{ s += $2 } END { print s }')" 0
+: > "$WK/log"; bg worker leave --yes
+expect_eq "worker leave (agent unreachable): every listed app down, then the agent, then worker-data removed" \
+  "$RC:$(grep -cxE 'compose -p portcullis-(se1|gitea) down' "$WK/log"):$(grep -c 'down -v' "$WK/log"):$([ -d "$WK/root/worker-data" ] && echo kept || echo gone):$(grep -c 'This host left' "$WORK/out" "$WORK/err" | awk -F: '{ s += $2 } END { print s }')" "0:2:1:gone:1"
+
 # Ruling P30: --privileged only in the CI's docker:dind worker (and the
 # local runner containers, e2e-k3s-local, run-job and the builder's runner-loop), each on its line marked
 # "# reviewed exception"; never privileged: true in a compose file.

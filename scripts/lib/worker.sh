@@ -18,6 +18,8 @@
 WORKER_JOIN_WAIT="${WORKER_JOIN_WAIT:-300}"
 WORKER_DEFAULT_ROOTS="/srv:/mnt:/media"
 WORKER_CODE_MAX=4096
+# The agent's own compose project (docker-compose.worker.yml name:).
+WORKER_PROJECT=portcullis-worker
 # The copy for a code on the command line (contract §17.7).
 WORKER_CODE_ARGV_MSG="the join code is a secret: paste it when asked, or pipe it in"
 
@@ -278,14 +280,21 @@ worker_upgrade() {
   ok "The worker is up to date (./portcullis worker status)."
 }
 
-# _worker_projects — the instance ids with a bundle in worker-data.
+# _worker_projects — the app instances on this engine: the compose
+# projects portcullis-<id> with a valid id (the agent's own scope rule),
+# never the agent's own project. Read from the engine's labels, never from
+# worker-data/projects (0700, the agent's uid: a non-root operator or a
+# rootless Podman user can't list it). Fails when the engine doesn't answer.
 _worker_projects() {
-  local d
-  for d in "$(_worker_data)"/projects/*/; do
-    [ -d "$d" ] || continue
-    d="${d%/}"; d="${d##*/}"
-    [[ "$d" =~ ^[a-z][a-z0-9-]{0,30}$ ]] && printf '%s\n' "$d"
-  done
+  local out p id
+  _rt_docker_only
+  out="$(docker ps -a --format '{{.Label "com.docker.compose.project"}}')" || return 1
+  while IFS= read -r p; do
+    id="${p#portcullis-}"
+    if [ "$id" != "$p" ] && [ "$p" != "$WORKER_PROJECT" ] && [[ "$id" =~ ^[a-z][a-z0-9-]{0,30}$ ]]; then
+      printf '%s\n' "$id"
+    fi
+  done < <(printf '%s\n' "$out" | sort -u)
 }
 
 # _worker_compose_p <instance> <args> — `docker compose -p portcullis-<id>`
@@ -314,8 +323,15 @@ _worker_wipe() {
   rmdir -- "$d" || fail "could not remove $d"
 }
 
+# _worker_none_left <what stays> — fail while any app container is here.
+_worker_none_left() {
+  local left
+  left="$(_worker_projects)" || fail "the engine doesn't list its containers: $1"
+  [ -z "$left" ] || fail "app containers are still here ($(printf '%s' "$left" | sed 's/^/portcullis-/' | tr '\n' ' ' | sed 's/ $//')): $1; take them down (docker compose -p portcullis-<id> down) and run ./portcullis worker leave again"
+}
+
 worker_leave() {
-  local yes="$1" id ans sid
+  local yes="$1" id ans sid projects
   _rt_docker_only
   sid="$(_worker_agent status 2>/dev/null | jq -r '.server_id // empty' 2>/dev/null || true)"
   if [ "$yes" != true ]; then
@@ -324,20 +340,26 @@ worker_leave() {
     IFS= read -r ans || true
     [ "$ans" = leave ] || fail "not confirmed: nothing changed"
   fi
-  while IFS= read -r id; do
+  projects="$(_worker_projects)" || fail "the engine doesn't list its containers: nothing changed"
+  for id in $projects; do
     info "Taking portcullis-$id down (volumes kept)..."
     _worker_compose_p "$id" down || warn "could not take portcullis-$id down"
-  done < <(_worker_projects)
+  done
+  # Never a leave with apps still here: the identity and worker-data stay
+  # until every app container is gone (run leave again).
+  _worker_none_left "the identity and worker-data are kept"
   _worker_agent leave >/dev/null 2>&1 || warn "the agent didn't answer: its identity goes with worker-data"
   info "Stopping the agent..."
   dc down -v || fail "could not take the worker down (docker compose logs agent)"
+  _worker_none_left "worker-data is kept"
   _worker_wipe "$(_worker_data)"
   ok "This host left${sid:+ as $sid}. Remove the server in the Hub; ./portcullis worker join to join again."
 }
 
 worker_stop_start() {
-  local verb="$1" id="$2"
-  [ -d "$(_worker_data)/projects/$id" ] || fail "no app instance $id on this worker"
+  local verb="$1" id="$2" projects
+  projects="$(_worker_projects)" || fail "the engine doesn't list its containers"
+  printf '%s\n' "$projects" | grep -qx -- "$id" || fail "no app instance $id on this worker"
   if [ "$verb" = stop ]; then
     warn "break-glass: the primary still routes $id here; its users get errors until it runs again (the Hub shows it as stopped)"
   fi
