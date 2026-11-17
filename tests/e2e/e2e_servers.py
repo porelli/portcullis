@@ -286,12 +286,13 @@ def echo(page: Page, iid: str):
 
 def reach(page: Page, iid: str) -> bool:
     """The instance answers alice through the primary (the last answer is
-    kept for the failure message: status, Location's path, body's start)."""
+    kept for the failure message: status, Location's path and whether the
+    body names the host — never the body: it echoes her session cookie)."""
     try:
         r = page.request.get(f"https://{iid}.{DOMAIN}/cgi-bin/echo", max_redirects=0)
         body = r.text()
         loc = r.headers.get("location", "").split("?")[0]
-        state[f"last_reach_{iid}"] = f"{r.status} {loc} {redact(body[:120])!r}"
+        state[f"last_reach_{iid}"] = f"{r.status} {loc} host-line={'HOST=' in body} {len(body)} bytes"
         return r.status == 200 and f"HOST={iid}.{DOMAIN}" in body
     except Exception as e:  # noqa: BLE001
         state[f"last_reach_{iid}"] = f"{type(e).__name__}: {redact(str(e))[:200]}"
