@@ -973,3 +973,37 @@ func TestDrainTimeoutEndsHalfClosedStream(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// TestWorkerCantReachWorkerThroughLink: worker a routes worker b's address
+// into its link tunnel; link's netstack forwards nothing, so a's dial to
+// b's :7443 fails while link's own CONNECT to b answers (the control).
+func TestWorkerCantReachWorkerThroughLink(t *testing.T) {
+	f := newFixture(t)
+	a := newWorker(t, "a", "10.214.0.10", f.pub, f.port)
+	b := newWorker(t, "b", "10.214.0.11", f.pub, f.port)
+	f.apply(map[*worker]string{a: linkdoc.StateReady, b: linkdoc.StateReady})
+	code, c, br := connect(t, f.ctlAddr, "CONNECT", "10.214.0.11:7443", nil)
+	if code != 200 {
+		t.Fatalf("link → b (the control): %d", code)
+	}
+	echoes(t, c, br, "b")
+	// a's tunnel now carries b's address to link (same key and endpoint).
+	if err := a.stack.SyncPeers([]tunnel.PeerConfig{{PublicKey: f.pub, IP: b.ip,
+		Endpoint: netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(f.port)), Keepalive: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	if c, err := a.stack.DialTCP(ctx, netip.AddrPortFrom(b.ip, ControlPort)); err == nil {
+		c.Close()
+		t.Fatal("worker a reached worker b's :7443 through link")
+	}
+	// a's packets did reach link (its handshake is fresh): link dropped them.
+	st, err := f.stack.PeerStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, ok := st[keyB64(a.pub)]; !ok || s.Handshake.IsZero() || time.Since(s.Handshake) > 30*time.Second {
+		t.Fatalf("a's tunnel to link isn't up: %+v", st[keyB64(a.pub)])
+	}
+}
