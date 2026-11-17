@@ -16,7 +16,7 @@ kind="${1:?dind|podman}"
 : "${RUNNER_IP:?}" "${HUB_IP:?}" "${ALPINE:?}" "${CURL_IMG:?}"
 W=".github/ci/e2e-servers-worker.sh"
 T="$(mktemp -d)"; chmod 700 "$T"; trap 'rm -rf "$T"' EXIT
-SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$SECRET"
+SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"  # never printed, not even masked
 hub() { curl -s -H @<(printf 'X-Portcullis-Proxy-Secret: %s\nX-Forwarded-User: admin\n' "$SECRET") "http://$HUB_IP:8888$1"; }
 srv_state() { hub "/api/servers/$1" | jq -r '.state // empty'; }
 wait_state() {  # <server> <state> <seconds>
@@ -69,7 +69,6 @@ fi
 docker run --rm -v portcullis_hub_data:/d:ro --user 10001:10001 "$ALPINE" cat /d/env/se1.relay.env \
   | sed -n 's/^PORTCULLIS_RELAY_TOKEN=//p' > "$T/token"
 [ -s "$T/token" ] || { echo "FAIL: no relay token for se1"; exit 1; }
-echo "::add-mask::$(cat "$T/token")"
 printf 'Proxy-Authorization: Bearer %s\n' "$(cat "$T/token")" > "$T/good.hdr"
 printf 'Proxy-Authorization: Bearer %s\n' "$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=')" > "$T/bogus.hdr"
 : > "$T/none.hdr"

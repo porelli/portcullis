@@ -5,17 +5,19 @@
 # runner, the virtual authenticator), the CI template source (echo, servers-echo, oidc-echo), the
 # stack, `./portcullis link init`, the admin's and alice's setup links.
 # Run from the workspace root (bash -e). Writes HUB_IP, the setup links
-# (masked) and the runner's address to $GITHUB_ENV.
+# (0600 files, never in $GITHUB_ENV) and the runner's address to $GITHUB_ENV.
 set -euo pipefail
 : "${E2E_DOMAIN:?}" "${ALPINE:?}" "${GITHUB_ENV:?}"
 
 ./portcullis init --env-only --runtime docker --non-interactive --domain "$E2E_DOMAIN" \
   --email "ci@$E2E_DOMAIN" --dns-provider none
-for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
-  val="$(grep "^$v=" .env | cut -d= -f2-)"
-  [ "$v" = KEYCLOAK_ADMIN ] || echo "::add-mask::$val"
-  echo "$v=$val" >> "$GITHUB_ENV"
-done
+# No secret in $GITHUB_ENV (each later step's header lists it) nor in any
+# output, not even an ::add-mask:: line (run-job's log keeps every line):
+# the later steps read core's .env, and the setup links are 0600 files in
+# a 0700 dir named in $GITHUB_ENV.
+SECRETS_DIR="${RUNNER_TEMP:-/tmp}/e2e-servers-secrets"
+rm -rf "$SECRETS_DIR"; mkdir -m 0700 "$SECRETS_DIR"
+echo "E2E_SERVERS_SECRETS=$SECRETS_DIR" >> "$GITHUB_ENV"
 # CI only: the Hub's dev hooks (an e2etest build: the clock offset for the
 # expired join code, a file re-read live), Chromium's virtual authenticator as a security key,
 # Keycloak's health port.
@@ -90,13 +92,12 @@ echo "127.0.0.1 $E2E_DOMAIN auth.$E2E_DOMAIN enroll.$E2E_DOMAIN hub.$E2E_DOMAIN 
 LLDAP_ADMIN_PASSWORD="$(grep '^LLDAP_ADMIN_PASSWORD=' .env | cut -d= -f2-)"; export LLDAP_ADMIN_PASSWORD
 LLDAP_TOKEN=$(jq -n '{username: "admin", password: env.LLDAP_ADMIN_PASSWORD}' \
   | curl -sf http://127.0.0.1:17170/auth/simple/login -H 'Content-Type: application/json' -d @- | jq -r .token)
-echo "::add-mask::$LLDAP_TOKEN"
 jq -n --arg q 'mutation { createUser(user: {id: "alice", email: "alice@portcullis.local"}) { id } }' '{query: $q}' \
   | curl -sf http://127.0.0.1:17170/api/graphql -H @<(printf 'Authorization: Bearer %s\n' "$LLDAP_TOKEN") \
       -H 'Content-Type: application/json' -d @- | jq -e '.errors == null' >/dev/null
 for who in admin:hub alice:portal; do
-  url="$(./portcullis invite "${who%%:*}" --to "${who#*:}" --json | jq -r .url)"
-  echo "::add-mask::$url"
-  echo "E2E_$(printf '%s' "${who%%:*}" | tr '[:lower:]' '[:upper:]')_INVITE=$url" >> "$GITHUB_ENV"
+  (umask 077; ./portcullis invite "${who%%:*}" --to "${who#*:}" --json | jq -r .url > "$SECRETS_DIR/${who%%:*}.invite")
+  grep -qE '^https://enroll\.[A-Za-z0-9.-]+/invite/[A-Za-z0-9_-]{43}$' "$SECRETS_DIR/${who%%:*}.invite" \
+    || { echo "FAIL: no setup link for ${who%%:*}"; exit 1; }
 done
 echo "PASS: primary up (Hub at $HUB_IP, link on UDP 51821 at $RUNNER_IP), setup links for admin and alice"

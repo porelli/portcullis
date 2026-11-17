@@ -21,8 +21,13 @@ Cases, in this order (one function each):
   revoke_cuts_websocket           a long-lived stream through the relay ends at the revocation
   socket_rule_both_stacks         .github/ci/e2e-servers-asserts.sh
 
-The join code is a secret: it is masked, written only to a 0700 temp dir
-and piped to the worker; never an argument, an artifact or a log line.
+The join code is a secret: written only to a 0700 temp dir and piped to
+the worker; never an argument, an artifact or a log line. No secret is ever
+printed, not even in an ::add-mask:: line (run-job's log keeps every line):
+every failure text and command output goes through redact() (the known
+secrets, join codes, bearer tokens, setup-link and OAuth code paths become
+"[redacted]"); credentials come from core's .env, the setup links from
+e2e-servers-setup.sh's 0600 files ($E2E_SERVERS_SECRETS).
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -53,7 +59,59 @@ HUB_API = f"http://{os.environ['HUB_IP']}:8888"
 AUTH = f"https://auth.{DOMAIN}"
 HUB = f"https://hub.{DOMAIN}"
 PORTAL = f"https://{DOMAIN}/"
-SECRET = open(".env").read().split("HUB_PROXY_SECRET=", 1)[1].split("\n", 1)[0]
+
+
+def dotenv(key: str) -> str:
+    """A value of core's .env (secrets never pass through the step env)."""
+    for line in open(".env"):
+        if line.startswith(key + "="):
+            return line[len(key) + 1:].rstrip("\n")
+    raise KeyError(key)
+
+
+def secret_file(name: str) -> str:
+    """A 0600 file of e2e-servers-setup.sh's 0700 dir (the setup links)."""
+    return open(os.path.join(os.environ["E2E_SERVERS_SECRETS"], name)).read().strip()
+
+
+SECRET = dotenv("HUB_PROXY_SECRET")
+# Never in any output (CI's and run-job's logs keep everything): each known
+# secret and every token-shaped value becomes a fixed placeholder.
+SECRETS: list[str] = [SECRET, dotenv("LLDAP_ADMIN_PASSWORD"), dotenv("KEYCLOAK_ADMIN_PASSWORD")]
+TOKEN_RES = [re.compile(r"pcj1\.[A-Za-z0-9_.-]+"), re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+"),
+             re.compile(r"::add-mask::.*"), re.compile(r"(/setup/|/invite/|[?&](?:token|code|key|code_verifier)=)[A-Za-z0-9._~%-]+")]
+
+
+def redact(s: str) -> str:
+    for v in SECRETS:
+        if v and len(v) >= 6:
+            s = s.replace(v, "[redacted]")
+    for r in TOKEN_RES:
+        s = r.sub(lambda m: (m.group(1) if m.re.groups else "") + "[redacted]", s)
+    return s
+
+
+def mint_link(user: str, to: str) -> str:
+    """A new setup link, as e2e_login.mint_setup_link but printing nothing
+    (no ::add-mask:: line: run-job's log keeps every line)."""
+    out = subprocess.run(["./portcullis", "invite", user, "--to", to, "--json"], capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, redact(f"portcullis invite {user}: exit {out.returncode} {out.stderr[-300:]}")
+    url = json.loads(out.stdout)["url"]
+    assert re.fullmatch(r"https://enroll\.[A-Za-z0-9.-]+/invite/[A-Za-z0-9_-]{43}", url), "malformed setup link"
+    SECRETS.append(url)
+    return url
+
+
+def check(name: str, fn) -> None:
+    """base.check with every failure's text redacted (its traceback too)."""
+    def run():
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            raise AssertionError(redact(f"{type(e).__name__}: {e}" if not isinstance(e, AssertionError) else str(e))) from None
+    base.check(name=name, fn=run)
+
+
 TMP = tempfile.mkdtemp(prefix="e2e-servers-")
 os.chmod(TMP, 0o700)
 WORKER_SH = ".github/ci/e2e-servers-worker.sh"
@@ -96,7 +154,7 @@ def run_op(method: str, path: str, body=None, timeout: float = 600) -> dict:
 def sh(*args, check=True, stdin=None, timeout=900) -> subprocess.CompletedProcess:
     p = subprocess.run(list(args), stdin=stdin, capture_output=True, text=True, timeout=timeout)
     if check and p.returncode != 0:
-        raise AssertionError(f"{' '.join(args[:4])}: exit {p.returncode}: {p.stdout[-800:]} {p.stderr[-800:]}")
+        raise AssertionError(redact(f"{' '.join(args[:4])}: exit {p.returncode}: {p.stdout[-800:]} {p.stderr[-800:]}"))
     return p
 
 
@@ -133,10 +191,9 @@ def add_server(sid: str) -> dict:
     body = dict(id=sid, name=sid.upper(), **fresh_proof(state["admin_page"], f"add-{sid}"))
     code, ans = hub("POST", "/api/servers", body)
     if code >= 500:  # the Hub's view of its data dir (no secret in a listing)
-        print(sh("docker", "compose", "exec", "-T", "hub", "sh", "-c",
-                 "id; ls -lan /data /data/nodes; stat -c '%A %u:%g %n' /data/nodes/* 2>&1", check=False).stdout, flush=True)
+        print(redact(sh("docker", "compose", "exec", "-T", "hub", "sh", "-c",
+                        "id; ls -lan /data /data/nodes; stat -c '%A %u:%g %n' /data/nodes/* 2>&1", check=False).stdout), flush=True)
     assert code == 201 and isinstance(ans, dict) and ans.get("code", "").startswith("pcj1."), f"add {sid}: {code} {str(ans)[:200]}"
-    print(f"::add-mask::{ans['code']}", flush=True)
     path = os.path.join(TMP, f"{sid}.code")
     with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
         f.write(ans["code"])
@@ -160,6 +217,7 @@ def join(kind: str, name: str, code_file: str, wait: int = 240, check=True) -> s
             diag(name)
     text = open(log, errors="replace").read()
     assert "pcj1." not in text, "the join code reached the worker script's output"
+    text = redact(text)
     print(f"::group::worker {name} ({kind}): exit {rc}\n{text[-6000:]}\n::endgroup::", flush=True)
     if check and rc != 0:
         raise AssertionError(f"worker {name}: exit {rc}: {text[-800:]}")
@@ -196,7 +254,7 @@ def link_peers() -> list:
 def lldap_member(user: str, group: str) -> None:
     tok = json.loads(urllib.request.urlopen(urllib.request.Request(
         "http://127.0.0.1:17170/auth/simple/login", method="POST", headers={"Content-Type": "application/json"},
-        data=json.dumps({"username": "admin", "password": os.environ["LLDAP_ADMIN_PASSWORD"]}).encode()), timeout=20).read())["token"]
+        data=json.dumps({"username": "admin", "password": dotenv("LLDAP_ADMIN_PASSWORD")}).encode()), timeout=20).read())["token"]
 
     def gql(q: str) -> dict:
         return json.loads(urllib.request.urlopen(urllib.request.Request(
@@ -246,7 +304,7 @@ def diag(name: str) -> None:
         out.append(f"--- {title} (exit {p.returncode})\n{(p.stdout + p.stderr)[-3000:]}")
     text = "\n".join(out)
     assert "pcj1." not in text
-    print(f"::group::diagnostics {name}\n{text}\n::endgroup::", flush=True)
+    print(f"::group::diagnostics {name}\n{redact(text)}\n::endgroup::", flush=True)
 
 
 def join_ok():
@@ -388,15 +446,17 @@ def rogue_worker():
 def keycloak_secret(client_like: str) -> str:
     tok = json.loads(urllib.request.urlopen(urllib.request.Request(
         "http://127.0.0.1:8080/realms/master/protocol/openid-connect/token", method="POST",
-        data=urllib.parse.urlencode({"client_id": "admin-cli", "grant_type": "password", "username": os.environ["KEYCLOAK_ADMIN"],
-                                     "password": os.environ["KEYCLOAK_ADMIN_PASSWORD"]}).encode()), timeout=20).read())["access_token"]
+        data=urllib.parse.urlencode({"client_id": "admin-cli", "grant_type": "password", "username": dotenv("KEYCLOAK_ADMIN"),
+                                     "password": dotenv("KEYCLOAK_ADMIN_PASSWORD")}).encode()), timeout=20).read())["access_token"]
 
     def kc(path: str):
         return json.loads(urllib.request.urlopen(urllib.request.Request(
             "http://127.0.0.1:8080/admin/realms/portcullis" + path, headers={"Authorization": f"Bearer {tok}"}), timeout=20).read())
     cl = [c for c in kc("/clients?max=500") if client_like in c.get("clientId", "")]
     assert cl, f"no Keycloak client like {client_like}"
-    return kc(f"/clients/{cl[0]['id']}/client-secret")["value"]
+    v = kc(f"/clients/{cl[0]['id']}/client-secret")["value"]
+    SECRETS.append(v)
+    return v
 
 
 def revoke_drops_handshake_and_rotates():
@@ -458,26 +518,26 @@ def main() -> int:
                 ctx.set_default_timeout(30_000)
                 page = ctx.new_page()
                 key = base.Authenticator(page)
-                base.setup_link_signin(page, os.environ[f"E2E_{who.upper()}_INVITE"], who=who,
-                                       mint=lambda: base.mint_setup_link(who, "hub" if who == "admin" else "portal"),
+                base.setup_link_signin(page, secret_file(f"{who}.invite"), who=who,
+                                       mint=lambda: mint_link(who, "hub" if who == "admin" else "portal"),
                                        until=until, label=f"servers-{who}", expect_stepups=1)
                 state[f"{who}_ctx"], state[f"{who}_page"], state[f"{who}_key"] = ctx, page, key
-            base.check(f"{who} signs in from a setup link", signs_in)
+            check(f"{who} signs in from a setup link", signs_in)
         # One check each, by a literal name (tests/e2e/scenarios.py reads them).
-        base.check("join_ok", join_ok)
-        base.check("join_code_reused_refused", join_code_reused_refused)
-        base.check("join_code_expired_refused", join_code_expired_refused)
-        base.check("echo_on_worker_signed_in", echo_on_worker_signed_in)
-        base.check("echo_on_worker_denied_without_sign_in", echo_on_worker_denied_without_sign_in)
-        base.check("no_portcullis_cookie_reaches_app", no_portcullis_cookie_reaches_app)
-        base.check("parent_domain_set_cookie_stripped", parent_domain_set_cookie_stripped)
-        base.check("move_worker_primary_worker_keeps_data", move_worker_primary_worker_keeps_data)
-        base.check("wg_stopped_fails_closed", wg_stopped_fails_closed)
-        base.check("wg_back_routes_again", wg_back_routes_again)
-        base.check("rogue_worker", rogue_worker)
-        base.check("revoke_drops_handshake_and_rotates", revoke_drops_handshake_and_rotates)
-        base.check("revoke_cuts_websocket", revoke_cuts_websocket)
-        base.check("socket_rule_both_stacks", socket_rule_both_stacks)
+        check("join_ok", join_ok)
+        check("join_code_reused_refused", join_code_reused_refused)
+        check("join_code_expired_refused", join_code_expired_refused)
+        check("echo_on_worker_signed_in", echo_on_worker_signed_in)
+        check("echo_on_worker_denied_without_sign_in", echo_on_worker_denied_without_sign_in)
+        check("no_portcullis_cookie_reaches_app", no_portcullis_cookie_reaches_app)
+        check("parent_domain_set_cookie_stripped", parent_domain_set_cookie_stripped)
+        check("move_worker_primary_worker_keeps_data", move_worker_primary_worker_keeps_data)
+        check("wg_stopped_fails_closed", wg_stopped_fails_closed)
+        check("wg_back_routes_again", wg_back_routes_again)
+        check("rogue_worker", rogue_worker)
+        check("revoke_drops_handshake_and_rotates", revoke_drops_handshake_and_rotates)
+        check("revoke_cuts_websocket", revoke_cuts_websocket)
+        check("socket_rule_both_stacks", socket_rule_both_stacks)
         browser.close()
     failed = [n for n, ok, _ in base.results if not ok]
     print(f"\n{len(base.results) - len(failed)} passed, {len(failed)} failed: {failed}")
