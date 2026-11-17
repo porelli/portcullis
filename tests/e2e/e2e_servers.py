@@ -443,7 +443,10 @@ def parent_domain_set_cookie_stripped():
 
 
 def marker(where: str, write: str | None = None) -> str:
-    vol = "portcullis-se1_marker"
+    vol = "portcullis_se1-marker"  # the Hub's name for se1's volume (portcullis_<id>-<volume>)
+    # Never create it: a mistyped name would silently make an empty one.
+    probe = (lambda *c: sh(*c, check=False)) if where == "primary" else (lambda *c: wexec("w1", *c, check=False))
+    assert probe("docker", "volume", "inspect", vol).returncode == 0, f"no volume {vol} on {where}"
     cmd = f"printf %s {write} > /d/marker && chmod 644 /d/marker" if write else "cat /d/marker"
     if where == "primary":
         return sh("docker", "run", "--rm", "-v", f"{vol}:/d", os.environ["ALPINE"], "sh", "-c", cmd).stdout
@@ -473,6 +476,10 @@ def wg_stopped_fails_closed():
 def wg_back_routes_again():
     sh("docker", "compose", "start", "wg")  # always: later cases need wg
     needs("se1")  # echo_on_worker_signed_in
+    # link back first (the Hub reads servers as off until wg's status is
+    # fresh again), then w1 ready, then the app through it.
+    wait_for("servers on again", lambda: hub("GET", "/api/servers")[0] == 200, 120)
+    wait_for("w1 ready again", lambda: server_state("w1") == "ready", 180)
     wait_for("se1 routed again", lambda: reach(state["alice_page"], "se1"), 240)
 
 
