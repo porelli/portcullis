@@ -2,12 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"net"
+	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/portcullis/mailctl/internal/bootstrap"
 	"github.com/portcullis/mailctl/internal/config"
@@ -236,5 +241,61 @@ func TestStartRefusedForeignSlotEntry(t *testing.T) {
 	os.Mkdir(filepath.Join(c.SlotDir, "other-instance"), 0o750)
 	if err := checkStart(c, addrs(inside)); err == nil || !strings.Contains(err.Error(), "other-instance") {
 		t.Fatalf("%v", err)
+	}
+}
+
+// Void mode doesn't attach the metrics network: the metrics alias doesn't
+// resolve, the adapter starts anyway and serves metrics once it resolves.
+func TestServeWhenResolvable(t *testing.T) {
+	var n atomic.Int32
+	lns := make(chan net.Listener, 1)
+	listen := func(network, addr string) (net.Listener, error) {
+		if n.Add(1) < 3 {
+			return nil, &net.DNSError{Err: "no such host", Name: "mail-provider-metrics", IsNotFound: true}
+		}
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err == nil {
+			lns <- ln
+		}
+		return ln, err
+	}
+	srv := &http.Server{Addr: "mail-provider-metrics:9100", Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("m")) })}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		serveWhenResolvable(ctx, srv, listen, 10*time.Millisecond, func(string, ...any) {}, errc)
+		close(done)
+	}()
+	var got net.Listener
+	select {
+	case got = <-lns:
+	case <-time.After(5 * time.Second):
+		t.Fatal("never listened")
+	}
+	if n.Load() != 3 {
+		t.Fatalf("listened %d times", n.Load())
+	}
+	var resp *http.Response
+	var err error
+	for i := 0; i < 50; i++ {
+		if resp, err = http.Get("http://" + got.Addr().String()); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("metrics not served: %v", err)
+	}
+	resp.Body.Close()
+	srv.Close()
+	<-done
+	// Another listen error goes to errc.
+	errc2 := make(chan error, 1)
+	serveWhenResolvable(ctx, &http.Server{Addr: "x:1"}, func(string, string) (net.Listener, error) { return nil, errors.New("boom") },
+		time.Millisecond, func(string, ...any) {}, errc2)
+	if err := <-errc2; err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("errc: %v", err)
 	}
 }

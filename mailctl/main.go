@@ -193,9 +193,17 @@ func serve(env func(string) string, stderr io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	errc := make(chan error, len(servers))
-	for _, s := range servers {
+	for i, s := range servers {
 		ln, err := net.Listen("tcp", s.Addr)
 		if err != nil {
+			// The metrics address is an alias on portcullis-metrics-mail,
+			// which void mode doesn't attach: no listener until it
+			// resolves (a metrics outage, never a refused start).
+			var dnsErr *net.DNSError
+			if i == len(servers)-1 && errors.As(err, &dnsErr) {
+				go serveWhenResolvable(ctx, s, net.Listen, 30*time.Second, logger.Printf, errc)
+				continue
+			}
 			return fmt.Errorf("listening on %s: %w", s.Addr, err)
 		}
 		go func(s *http.Server, ln net.Listener) {
@@ -221,6 +229,35 @@ func serve(env func(string) string, stderr io.Writer) error {
 		s.Shutdown(sctx)
 	}
 	return err
+}
+
+// serveWhenResolvable retries s's listener every period while its host
+// name doesn't resolve (the metrics alias outside void mode's networks),
+// then serves; any other listen error goes to errc. It stops with ctx.
+func serveWhenResolvable(ctx context.Context, s *http.Server, listen func(string, string) (net.Listener, error),
+	period time.Duration, logf func(string, ...any), errc chan<- error) {
+	logf("mailctl: metrics off until %s resolves (not on portcullis-metrics-mail: void mode)", s.Addr)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(period):
+		}
+		ln, err := listen("tcp", s.Addr)
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) {
+			continue
+		}
+		if err != nil {
+			errc <- fmt.Errorf("listening on %s: %w", s.Addr, err)
+			return
+		}
+		logf("mailctl: metrics on %s", s.Addr)
+		if err := s.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errc <- fmt.Errorf("%s: %w", s.Addr, err)
+		}
+		return
+	}
 }
 
 // machinesConfig is the state machines' part of the environment.
