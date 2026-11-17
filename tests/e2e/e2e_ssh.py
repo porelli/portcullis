@@ -228,7 +228,7 @@ def members(group: str, user: str, add: bool) -> None:
     if add:
         api_ok("POST", f"/api/directory/groups/{group}/members", {"username": user})
     else:
-        api_ok("DELETE", f"/api/directory/groups/{group}/members/{user}")
+        api_ok("DELETE", f"/api/directory/groups/{group}/members/{user}", {})
 
 
 def signed_cert_request(page: Page, key: str, proof_key: str | None = None) -> dict:
@@ -352,7 +352,7 @@ def main() -> int:
         def alice_reaches_both_no_sudo():
             cli_login(person("alice"), "alice-login")
             for h in (WEB1, WEB2):
-                r = until(f"alice@{h}", lambda h=h: (lambda r: r if r.returncode == 0 else None)(ssh("alice", h, "id -un; sudo -n true 2>/dev/null && echo SUDO")), 90)
+                r = until(f"alice@{h}", lambda h=h: (lambda r: r if r.returncode == 0 else None)(ssh("alice", h, "id -un; sudo -n true 2>/dev/null && echo SUDO; true")), 90)
                 assert r.stdout.split()[0] == "alice" and "SUDO" not in r.stdout, r.stdout
         check("alice_reaches_both_no_sudo", alice_reaches_both_no_sudo)
 

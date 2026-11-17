@@ -8,7 +8,7 @@
 #       the one-time code on standard input (never argv).
 #   ssh breakglass-cert (--user <name> | --account <name>) --host-group <hg>
 #                       --ttl <5m–12h> --key <public key file> [--note <text>]
-#                       [--privileged]
+#                       [--approved]
 #       the Hub is down, Vault is up: a user certificate signed directly on
 #       ssh_user/sign/hg-<hg> with the root token (vault_admin: by name in
 #       the container's environment, never argv), key id
@@ -77,7 +77,7 @@ help_ssh_breakglass_cert() {
   cat <<'EOF'
 Usage: portcullis ssh breakglass-cert (--user <name> | --account <name>) --host-group <hg>
                                       --ttl <duration> --key <public key file> [--note <text>]
-                                      [--privileged]
+                                      [--approved]
 
 For when the Hub is down and Vault is up: signs one SSH user certificate
 directly on Vault's ssh_user/sign/hg-<hg> with the root token from
@@ -92,7 +92,7 @@ by name, never on a command line) and prints it.
                       their security-key forms)
   --note <text>       why (default "breakglass"): the key id is
                       pc-breakglass:<note>, which every host's sshd logs
-  --privileged        the approved principal up:<name>@<hg> / sp:<name>@<hg>
+  --approved          the approved principal up:<name>@<hg> / sp:<name>@<hg>
                       (a privileged grant's): the only kind an account with
                       sudo on a host accepts
 
@@ -219,7 +219,7 @@ cmd_ssh() {
       breakglass-cert:--ttl) need_value "ssh breakglass-cert" "$1" "${2:-}"; ttl="$2"; shift ;;
       breakglass-cert:--key) need_value "ssh breakglass-cert" "$1" "${2:-}"; key="$2"; shift ;;
       breakglass-cert:--note) need_value "ssh breakglass-cert" "$1" "${2:-}"; note="$2"; shift ;;
-      breakglass-cert:--privileged) privileged=true ;;
+      breakglass-cert:--approved) privileged=true ;;
       *:-*) usage_error "ssh $sub" "unknown option: $1" ;;
       *) usage_error "ssh $sub" "unexpected argument (the code goes on standard input): $1" ;;
     esac
