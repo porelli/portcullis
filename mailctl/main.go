@@ -314,14 +314,11 @@ func bootstrapCmd(args []string, env func(string) string, stderr io.Writer) int 
 		fmt.Fprintf(stderr, "mailctl bootstrap: %s\n", logx.Redact(err.Error()))
 		return 1
 	}
-	p, err := planParams(cfg)
+	j, err := jobFor(cfg, argv, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "mailctl bootstrap: %v\n", err)
 		return 1
 	}
-	logger := logx.New(stderr)
-	j := &bootstrap.Job{URL: cfg.StalwartURL, DataDir: cfg.DataDir, SessionFile: cfg.JobSessionFile, ServerImage: cfg.ServerImage,
-		Params: p, Start: childServer(argv, stderr), Logf: logger.Printf}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 	if err := j.Run(ctx); err != nil {
@@ -329,6 +326,18 @@ func bootstrapCmd(args []string, env func(string) string, stderr io.Writer) int 
 		return 1
 	}
 	return 0
+}
+
+// jobFor is the job of cfg: it reaches its own server over loopback
+// (JobLocalURL), never the adapter's MAILCTL_STALWART_URL (Ruling T17-b).
+func jobFor(cfg config.Config, argv []string, stderr io.Writer) (*bootstrap.Job, error) {
+	p, err := planParams(cfg)
+	if err != nil {
+		return nil, err
+	}
+	logger := logx.New(stderr)
+	return &bootstrap.Job{URL: cfg.JobLocalURL, DataDir: cfg.DataDir, SessionFile: cfg.JobSessionFile, ServerImage: cfg.ServerImage,
+		Params: p, Start: childServer(argv, stderr), Logf: logger.Printf}, nil
 }
 
 // childServer starts argv with the job's environment plus env; stop sends
@@ -365,20 +374,12 @@ func childServer(argv []string, out io.Writer) bootstrap.Server {
 // planParams is the neutral part of the base plan from the template's
 // wiring (the document's part comes from adapter_data or ApplyDoc).
 func planParams(cfg config.Config) (bootstrap.Params, error) {
-	u, err := url.Parse(cfg.StalwartURL)
-	if err != nil {
-		return bootstrap.Params{}, err
-	}
-	mailIP, err := netip.ParseAddr(u.Hostname())
-	if err != nil {
-		return bootstrap.Params{}, fmt.Errorf("MAILCTL_STALWART_URL=%s: the host must be the server's address", cfg.StalwartURL)
-	}
 	res, _ := netip.ParseAddrPort(cfg.LocalResolver)
 	lookups, err := spamrules.HTTPLookups()
 	if err != nil {
 		return bootstrap.Params{}, err
 	}
-	return bootstrap.Params{MailIP: mailIP, MailctlIP: cfg.MailIP, ResolverIP: res.Addr(), ResolverPort: int(res.Port()),
+	return bootstrap.Params{MailctlIP: cfg.MailIP, ResolverIP: res.Addr(), ResolverPort: int(res.Port()),
 		RulesURL: "http://" + cfg.RulesAddr + spamrules.Path, MetricsUser: metrics.User, HTTPLookups: lookups}, nil
 }
 

@@ -24,6 +24,7 @@ const (
 	MailctlAccount = "portcullis-mailctl"
 	APIKeyName     = "mailctl"
 	SMTPPort       = 10025 // the MX listener (host port 25)
+	MgmtPort       = 8080  // the management listener (JMAP / API)
 	TLSDir         = "/run/portcullis/mail/tls"
 	// The slot's files, mounted by the Hub's override at a fixed path
 	// into the gated services (contract §19.1).
@@ -58,7 +59,6 @@ type Relay struct {
 type Params struct {
 	Hostname      string     // MAIL_HOSTNAME
 	PrimaryDomain string     // the domain of every login (Stalwart's default domain)
-	MailIP        netip.Addr // Stalwart's portcullis-mail address (management listener)
 	MailctlIP     netip.Addr // mailctl's portcullis-mail address (access rule, API key)
 	ResolverIP    netip.Addr // mail-resolver
 	ResolverPort  int
@@ -143,9 +143,13 @@ func (p Params) listeners() Named {
 		l("submissions", "smtp", true, true, "[::]:10465"),
 		l("submission", "smtp", true, false, "[::]:10587"),
 		l("imaps", "imap", true, true, "[::]:10993"),
-		// Loopback too: the image's health check (loopback bypasses the
-		// access rule; only Stalwart runs in the container).
-		l("management", "http", false, false, p.MailIP.String()+":8080", "127.0.0.1:8080"),
+		// The wildcard (Ruling T17-b): the real server answers the adapter
+		// on the template's internal network and the bootstrap job's server
+		// its own job over loopback; the access rule admits only the
+		// adapter's address off loopback (loopback bypasses it: only
+		// Stalwart runs in its container), and the network isolation is the
+		// real control.
+		l("management", "http", false, false, fmt.Sprintf("[::]:%d", MgmtPort)),
 		// portcullis-metrics-mail is unpinned, so the metrics listener binds
 		// every address; the access rule answers it only /metrics/prometheus,
 		// with the scrape password.
@@ -423,7 +427,7 @@ func (p Params) RoutePlanText() string {
 
 func init() {
 	// Register every object, field and variant the plan sends.
-	p := Params{Hostname: "h.example", PrimaryDomain: "example.com", MailIP: netip.MustParseAddr("192.0.2.2"), MailctlIP: netip.MustParseAddr("192.0.2.3"),
+	p := Params{Hostname: "h.example", PrimaryDomain: "example.com", MailctlIP: netip.MustParseAddr("192.0.2.3"),
 		ResolverIP: netip.MustParseAddr("192.0.2.4"), ResolverPort: 5353, ClientIP: "rewritten",
 		Relay: &Relay{Host: "r.example", Port: 465, Username: "u"}, MetricsUser: "prometheus",
 		HTTPLookups: []map[string]any{{"namespace": "x", "url": "https://x.example", "format": map[string]any{"@type": "List"}}}}

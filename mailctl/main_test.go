@@ -202,3 +202,30 @@ func TestEveryUsedFieldInSchema(t *testing.T) {
 		t.Fatalf("not in the schema:\n%s", strings.Join(bad, "\n"))
 	}
 }
+
+// Ruling T17-b: the job reaches the server it runs over loopback only,
+// never MAILCTL_STALWART_URL (the real server's pinned address); a
+// non-loopback MAILCTL_JOB_LOCAL_URL is refused.
+func TestBootstrapJobNeverDialsStalwartURL(t *testing.T) {
+	env := map[string]string{"MAILCTL_LOCAL_RESOLVER": "172.31.255.4:5353", "MAILCTL_STALWART_URL": "http://172.31.255.2:8080"}
+	get := func(k string) string { return env[k] }
+	cfg, err := config.LoadJob(get)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var errb bytes.Buffer
+	j, err := jobFor(cfg, []string{"/bin/true"}, &errb)
+	if err != nil || j.URL != "http://127.0.0.1:8080" || strings.Contains(j.URL, "172.31.255.2") {
+		t.Fatalf("job URL %v %v", j, err)
+	}
+	env["MAILCTL_JOB_LOCAL_URL"] = "http://[::1]:9080"
+	if cfg, _ = config.LoadJob(get); cfg.JobLocalURL != "http://[::1]:9080" {
+		t.Fatalf("%q", cfg.JobLocalURL)
+	}
+	for _, bad := range []string{"http://172.31.255.2:8080", "https://127.0.0.1:8080", "http://localhost:8080", "http://127.0.0.1", "http://127.0.0.1:8080/x", "http://u:p@127.0.0.1:8080"} {
+		env["MAILCTL_JOB_LOCAL_URL"] = bad
+		if _, err := config.LoadJob(get); err == nil || !strings.Contains(err.Error(), "MAILCTL_JOB_LOCAL_URL") {
+			t.Errorf("%s: %v", bad, err)
+		}
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -45,7 +46,11 @@ type Config struct {
 	PublicIPv6 netip.Addr // MAILCTL_PUBLIC_IPV6
 
 	JobSessionFile string // the bootstrap job only (LoadJob)
-	ServerImage    string // the bootstrap job only (LoadJob)
+	// JobLocalURL is how the bootstrap job reaches the server it runs in
+	// its own container: loopback only (MAILCTL_JOB_LOCAL_URL, Ruling
+	// T17-b); the job never dials StalwartURL.
+	JobLocalURL string
+	ServerImage string // the bootstrap job only (LoadJob)
 }
 
 // The slot's files (contract §19.1).
@@ -190,6 +195,16 @@ func LoadJob(env func(string) string) (Config, error) {
 	c.JobSessionFile = strings.TrimSpace(env("MAILCTL_JOB_SESSION_FILE"))
 	if c.JobSessionFile != "" && !filepath.IsAbs(c.JobSessionFile) {
 		return c, fmt.Errorf("MAILCTL_JOB_SESSION_FILE=%q is not an absolute path", c.JobSessionFile)
+	}
+	c.JobLocalURL = get(env, "MAILCTL_JOB_LOCAL_URL", "http://127.0.0.1:8080")
+	u, err := url.Parse(c.JobLocalURL)
+	ok := err == nil && u.Scheme == "http" && u.Path == "" && u.RawQuery == "" && u.User == nil && u.Fragment == ""
+	if ok {
+		ap, perr := netip.ParseAddrPort(u.Host)
+		ok = perr == nil && ap.Addr().IsLoopback() && ap.Port() != 0
+	}
+	if !ok {
+		return c, fmt.Errorf("MAILCTL_JOB_LOCAL_URL=%q is not http://<loopback ip>:<port>", c.JobLocalURL)
 	}
 	c.ServerImage = strings.TrimSpace(env("MAILCTL_SERVER_IMAGE"))
 	if strings.ContainsAny(c.ServerImage, " \t\n") {

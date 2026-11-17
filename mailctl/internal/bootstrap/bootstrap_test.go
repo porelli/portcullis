@@ -155,7 +155,7 @@ func (f *fakeStalwart) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func params() Params {
 	return Params{
-		Hostname: "mail.example.com", PrimaryDomain: "example.com", MailIP: netip.MustParseAddr("172.31.255.2"), MailctlIP: netip.MustParseAddr("172.31.255.3"),
+		Hostname: "mail.example.com", PrimaryDomain: "example.com", MailctlIP: netip.MustParseAddr("172.31.255.3"),
 		ResolverIP: netip.MustParseAddr("172.31.255.4"), ResolverPort: 5353, RulesURL: "http://172.31.255.3:8082/spam-filter-rules.json.gz",
 		ClientIP: "preserved", MetricsUser: "prometheus",
 		HTTPLookups: []map[string]any{{"namespace": "stwt_openphish", "url": "https://openphish.com/feed.txt", "format": map[string]any{"@type": "List"}, "enable": true}},
@@ -214,7 +214,9 @@ func TestBasePlanDeletesDefaultListeners(t *testing.T) {
 	for _, o := range f.objs["NetworkListener"] {
 		if o["name"] == "management" {
 			b := o["bind"].(map[string]any)
-			if len(b) != 2 || b["172.31.255.2:8080"] != true || b["127.0.0.1:8080"] != true {
+			// Ruling T17-b: the wildcard, never loopback only (the adapter
+			// reaches the real server on the internal network).
+			if len(b) != 1 || b["[::]:8080"] != true {
 				t.Fatalf("management bind %v", b)
 			}
 		}
