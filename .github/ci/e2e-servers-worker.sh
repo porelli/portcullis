@@ -99,15 +99,20 @@ case "$kind" in
       # /run/user/<uid> is the worker's (0700): test its bus as root.
       sudo systemctl start "user@$uid.service" || true
       for i in $(seq 1 60); do sudo test -S "/run/user/$uid/bus" && break; [ "$i" -eq 60 ] && { echo "FAIL: no user manager for $WUSER"; systemctl status "user@$uid.service" --no-pager | tail -20; exit 1; }; sleep 1; done
-      # The runner's image puts its own paths in /etc/environment
-      # (XDG_RUNTIME_DIR=/run/user/<the runner>, XDG_CONFIG_HOME=/home/runner/
-      # .config, ...), which pam_env hands to every user manager: podman.service
-      # then fails ("mkdir /run/user/<runner>/libpod", "faccessat /home/runner/
-      # .config/containers/storage.conf: permission denied"). Drop them all
-      # (PATH stays) and give the worker's manager its own runtime dir.
-      envvars="$(sed -En 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=.*/\2/p' /etc/environment 2>/dev/null | grep -vx PATH | tr '\n' ' ')"
+      # The runner's image hands its own environment to every user manager
+      # (pam_env's /etc/environment and more: XDG_RUNTIME_DIR=/run/user/<the
+      # runner>, XDG_CONFIG_HOME=/home/runner/.config, ...): podman.service
+      # then fails ("faccessat /home/runner/.config/containers/storage.conf:
+      # permission denied"). The worker's manager keeps an allowlist only,
+      # gets its own runtime dir, and the socket starts afresh.
       # shellcheck disable=SC2016
-      asworker env ENVVARS="$envvars" sh -c '[ -z "$ENVVARS" ] || systemctl --user unset-environment $ENVVARS; systemctl --user set-environment XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" && systemctl --user enable --now podman.socket && systemctl --user enable podman-restart.service'
+      asworker sh -c '
+        keep="^(PATH|HOME|USER|LOGNAME|SHELL|LANG|LANGUAGE|LC_[A-Z_]+|TERM|XDG_RUNTIME_DIR|DBUS_SESSION_BUS_ADDRESS|MANAGERPID|INVOCATION_ID|SYSTEMD_EXEC_PID|JOURNAL_STREAM|MEMORY_PRESSURE_WATCH|MEMORY_PRESSURE_WRITE|NOTIFY_SOCKET)="
+        drop="$(systemctl --user show-environment | grep -Ev "$keep" | cut -d= -f1 | tr "\n" " ")"
+        [ -z "$drop" ] || systemctl --user unset-environment $drop
+        systemctl --user set-environment XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" HOME="$HOME"
+        systemctl --user reset-failed podman.socket podman.service 2>/dev/null || true
+        systemctl --user enable podman.socket podman-restart.service && systemctl --user restart podman.socket'
       echo "== podman worker: the user manager's environment: $(asworker systemctl --user show-environment 2>&1 | cut -d= -f1 | tr '\n' ' ')"
       sudo touch "$WSTAMP"
     fi
