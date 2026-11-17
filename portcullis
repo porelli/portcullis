@@ -73,13 +73,13 @@ VPN:
   vpn revoke                  Remove a built-in VPN device
 
 Mail:
-  mail enable                 Turn the mail server on (Stalwart, the mail certificate, bootstrap)
-  mail disable                Turn mail off for every domain (drains first)
-  mail status                 Mail status: certificate, DKIM, MTA-STS, DMARC, queue, checks
+  mail enable                 Open the mail slot (certificate) and wire the mail provider
+  mail disable                Unwire the mail provider (drains every domain first)
+  mail status                 Mail status: the provider, its checks, certificate, TLSA, timer
   mail test                   Send a signed test message
   mail dkim                   dkim rotate <domain>: a new DKIM key now
   mail cert                   Issue or renew the mail certificate
-  mail rotate                 The daily step: certificate, DKIM / MTA-STS / TLSA, records
+  mail rotate                 The daily step: certificate, TLSA, the main domain's records
   mail schedule               Install the daily mail timer (--systemd)
   mail export                 Export a former account's mailbox as mbox
 

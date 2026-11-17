@@ -67,7 +67,7 @@ _dns_tool_input() {
     --arg ipv4 "${DNS_IPV4:-}" --arg ipv6 "${DNS_IPV6:-}" --arg ca "$(_dns_ca_server)" \
     --argjson caa "$caa" --arg issuer "${DNS_CAA_ISSUER:-}" --arg uri "${DNS_ACCOUNT_URI:-}" --arg iodef "${DNS_CAA_IODEF:-}" \
     --argjson nomail "$nomail" --arg sets "${DNS_SETS:-}" --arg mail "${ALERT_SMTP_FROM:-}" \
-    --arg mailrecs "${DNS_MAIL_RECORDS:-}" --arg mailhost "${MAIL_HOSTNAME:-mail.$PORTCULLIS_DOMAIN}" \
+    --arg mailrecs "${DNS_MAIL_RECORDS:-}" --arg mailtlsa "${DNS_MAIL_TLSA:-}" --arg mailhost "${MAIL_HOSTNAME:-mail.$PORTCULLIS_DOMAIN}" \
     --argjson mailon "$(declare -F mail_slot_open >/dev/null && mail_slot_open && echo true || echo false)" \
     --argjson former "$(declare -F mail_former_hosts_json >/dev/null && mail_former_hosts_json || echo '[]')" '
     {name: $name, ipv4: $ipv4, ipv6: $ipv6, ca_server: $ca,
@@ -75,6 +75,7 @@ _dns_tool_input() {
      nomail: $nomail, sets: ($sets | split(" ") | map(select(. != ""))), mail_from: $mail}
     + (if $mailon or $mailrecs != "" then {mail_hostname: $mailhost} else {} end)
     + (if $mailrecs != "" then {mail: ($mailrecs | fromjson)} else {} end)
+    + (if $mailrecs != "" and $mailrecs != "[]" and $mailtlsa != "" and ($mailtlsa | fromjson | length) > 0 then {mail_tlsa: ($mailtlsa | fromjson)} else {} end)
     + (if $mailrecs != "" and ($former | length) > 0 then {mail_former_hosts: $former} else {} end)
     + (if $mode == "write"
        then {provider: $provider, credentials: ($map | map({key: .key, value: env[.var]}) | from_entries)}
@@ -218,23 +219,28 @@ _dns_default_sets() {
   printf '%s' "$s"
 }
 
-# _dns_mail_records <required> — DNS_MAIL_RECORDS: the main domain's
-# wanted mail set from mailctl (`mailctl dns --main --json`, contract
-# §19.7) whenever the mail profile is on, so every plan / apply sees it
-# (with mail_hostname). Already set (mail rotate) = kept. mailctl not
-# answering: required → fail, else a warning and no mail set.
+# _dns_mail_records <required> — DNS_MAIL_RECORDS / DNS_MAIL_TLSA: the
+# main domain's wanted mail set whenever the slot is open, so every plan /
+# apply sees it (with mail_hostname): the wired provider's records through
+# the Hub (`hub mail dns-main`, validated there; contract §19.7) and the
+# SPKIs the TLSA publishes (`domains mail-tlsa status`; the dns tool adds
+# core's HELO SPF and, while secure, the TLSA). Already set (mail rotate)
+# = kept. Nothing wired, or the Hub not answering: no mail set (refused
+# when <required>, dns setup --only mail).
 _dns_mail_records() {
-  local out
+  local out st
   [ -z "${DNS_MAIL_RECORDS:-}" ] || return 0
   mail_slot_open || return 0
-  if out="$(rt_exec mailctl -- mailctl dns --main --json 2>/dev/null)" \
+  if out="$(_mail_hub dns-main 2>/dev/null)" \
     && DNS_MAIL_RECORDS="$(printf '%s' "$out" | jq -ce '.records | arrays')"; then
     export DNS_MAIL_RECORDS
+    if st="$(_mail_tlsa status 2>/dev/null)" && DNS_MAIL_TLSA="$(printf '%s' "$st" | jq -ce '.publish | arrays')"; then
+      export DNS_MAIL_TLSA
+    fi
     return 0
   fi
   DNS_MAIL_RECORDS=""
-  [ "$1" != true ] || fail "mailctl didn't answer the main domain's mail records (is mail up? ./portcullis status)"
-  warn "mailctl didn't answer the main domain's mail records: the mail set is left out of this plan"
+  [ "${1:-false}" != true ] || fail "no mail provider is wired (or the Hub didn't answer hub mail dns-main): nothing to write for --only mail"
 }
 
 # _dns_render — the plan JSON (stdin) as a table, then the CAA and DNSSEC
@@ -828,7 +834,7 @@ Options:
   --dnssec    also turn on DNSSEC signing (the whole zone; cloudflare only;
               others print the steps). Signing is never turned off.
   --only SET  apply one record set: address, caa, nomail or mail (the
-              mail server's records from mailctl; mail must be on)
+              wired mail provider's records through the Hub; mail must be on)
 EOF
 }
 

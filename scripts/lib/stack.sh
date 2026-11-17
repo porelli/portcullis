@@ -533,7 +533,6 @@ stack_up() {
   sessions_restart_if_changed
   _rt_is_kube || mail_up_steps up
   rt_up
-  _rt_is_kube || mail_after_up
   runtime_proxies_refresh
   domains_restart_if_renewed
   monitoring_reload
@@ -587,7 +586,6 @@ upgrade_run() {
   sessions_restart_if_changed
   _rt_is_kube || mail_up_steps upgrade
   rt_up
-  _rt_is_kube || mail_after_up
   runtime_proxies_refresh
   domains_restart_if_renewed
   monitoring_reload
