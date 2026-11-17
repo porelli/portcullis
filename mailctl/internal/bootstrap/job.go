@@ -205,6 +205,11 @@ func WriteInPlace(path string, b []byte, mode os.FileMode) error {
 	return f.Close()
 }
 
+// recoveryPassword: the recovery admin's password for one start, hex
+// (32 random bytes). Stalwart 1.1 refuses a recovery password starting
+// with "_" (measured), which base64url gave one start in 64.
+func recoveryPassword() (string, error) { return randomHex(32) }
+
 func randomHex(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -304,7 +309,7 @@ func (j *Job) normalEnv() []string {
 // answers (if any) is written; then one normal start must refuse the
 // recovery login. The key itself is never used here (Ruling R2-N2b).
 func (j *Job) recovery(ctx context.Context, step func(*stalwart.Client) (string, error)) (err error) {
-	pw, err := randomSecret(32)
+	pw, err := recoveryPassword()
 	if err != nil {
 		return err
 	}

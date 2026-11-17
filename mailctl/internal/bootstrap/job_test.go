@@ -48,6 +48,12 @@ func (s *jobServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
+	// As Stalwart 1.1 (measured): a recovery admin whose password starts
+	// with "_" is refused (401, nothing logged), whatever the mode.
+	if u, pw, _ := r.BasicAuth(); u == RecoveryUser && strings.HasPrefix(pw, "_") {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
 	if u, _, _ := r.BasicAuth(); u == RecoveryUser && !rec {
 		if leak {
 			w.Write([]byte(`{"methodResponses":[]}`))
@@ -288,5 +294,24 @@ func TestBootstrapJobRefusesPlanOnUnmarkedStoreWithData(t *testing.T) {
 	j := newJob(t, s)
 	if err := j.Run(context.Background()); err != nil || !markerValid(j.StoreDir) {
 		t.Fatalf("plan-only objects: %v", err)
+	}
+}
+
+// Stalwart 1.1 refuses a recovery password starting with "_" (1 in 64 of
+// the base64url ones: a cold start failed "x:Domain/query: HTTP 401" now
+// and then). The job's passwords are hex: 400 cold starts all pass.
+func TestBootstrapJobRecoveryPasswordAlwaysAccepted(t *testing.T) {
+	s := &jobServer{f: newFake()}
+	j := newJob(t, s)
+	for i := 0; i < 400; i++ {
+		if err := j.Run(context.Background()); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+	}
+	for i := 0; i < 2000; i++ {
+		pw, err := recoveryPassword()
+		if err != nil || len(pw) != 64 || strings.Trim(pw, "0123456789abcdef") != "" {
+			t.Fatalf("recovery password %q %v", pw, err)
+		}
 	}
 }
