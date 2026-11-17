@@ -179,8 +179,11 @@ setup)
   # variable; the store is marked; the key file 0640 group 2010.
   [ "$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$(cid bootstrap)")" = "exited 0" ] \
     || fail "the bootstrap job: $(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "$(cid bootstrap)")"
-  docker logs "$(cid bootstrap)" 2>&1 | grep -q 'bootstrap: done (the base plan, the recovery login refused)' \
-    || fail "the bootstrap job didn't run the base plan on the fresh store (R-H2b): $(docker logs --tail=20 "$(cid bootstrap)" 2>&1)"
+  # The install ran the job more than once (void mode, then normal mode,
+  # each a new container): the plan on the fresh store (R-H2b) shows as the
+  # store's marker (written only after it); the last run is the marked path.
+  docker logs "$(cid bootstrap)" 2>&1 | grep -qE 'bootstrap: done \(the base plan, the recovery login refused\)|its API key is in place; nothing to do' \
+    || fail "the bootstrap job's last run: $(docker logs --tail=20 "$(cid bootstrap)" 2>&1)"
   for s in stalwart adapter bootstrap; do
     docker inspect -f '{{json .Config.Env}}' "$(cid "$s")" | jq -e 'map(select(startswith("STALWART_RECOVERY_"))) == []' >/dev/null \
       || fail "$s carries a STALWART_RECOVERY_* variable"

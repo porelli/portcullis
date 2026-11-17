@@ -136,8 +136,10 @@ sudo sysctl -qw net.ipv4.ip_unprivileged_port_start=25
 bash .github/ci/mail-enable-logged.sh stalwart /tmp/mail-enable.out | redact || fail "mail enable on rootless Podman"
 for s in resolver stalwart adapter; do wait_healthy "$s"; done
 [ "$(podman inspect -f '{{.State.ExitCode}}' "$(cid bootstrap)")" = 0 ] || fail "the bootstrap job failed"
-podman logs "$(cid bootstrap)" 2>&1 | grep -q 'bootstrap: done (the base plan, the recovery login refused)' \
-  || fail "the bootstrap job didn't plan the fresh store (R-H2b)"
+podman logs "$(cid bootstrap)" 2>&1 | grep -qE 'bootstrap: done \(the base plan, the recovery login refused\)|its API key is in place; nothing to do' \
+  || fail "the bootstrap job's last run: $(podman logs --tail=20 "$(cid bootstrap)" 2>&1)"
+podman run --rm --network none -v "${PROJ}_data:/v:ro" "$ALPINE_IMG" cat /v/.portcullis-base-plan | jq -e '.version == 1' >/dev/null \
+  || fail "the store has no base-plan marker (the plan never ran on the fresh store)"
 ./portcullis mail status --json > /tmp/mail-status.json || true
 jq -e --arg i "$INST" '.hub.wired == true and .hub.instance == $i and .client_ip == "rewritten"' /tmp/mail-status.json >/dev/null \
   || fail "mail status --json: $(cat /tmp/mail-status.json)"
