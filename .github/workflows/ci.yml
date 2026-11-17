@@ -2439,7 +2439,7 @@ jobs:
           BB=docker.io/library/busybox:1.38.0-musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6
           docker run --rm --network portcullis_portcullis-metrics-hub "$BB" wget -qO- http://hub-metrics:9100/metrics \
             | grep -q '^portcullis_container_memory_working_set_bytes{' || { echo "FAIL: hub-metrics:9100/metrics on portcullis-metrics-hub"; exit 1; }
-          if docker run --rm --network portcullis_portcullis "$BB" wget -q -T 5 -O /dev/null "http://$HUB_IP:9100/metrics"; then
+          if docker run --rm --network portcullis "$BB" wget -q -T 5 -O /dev/null "http://$HUB_IP:9100/metrics"; then
             echo "FAIL: the metrics listener answers on the core network"; exit 1
           fi
           echo "PASS: usage metrics on portcullis-metrics-hub only"
