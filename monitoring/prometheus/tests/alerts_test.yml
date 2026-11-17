@@ -397,3 +397,149 @@ tests:
             exp_annotations:
               summary: "The mail check fcrdns_v4 is failing"
               description: Run ./portcullis mail status, or see the Hub's doctor.
+
+  # Usage (contract §16.2). The series are what Prometheus stores after
+  # scraping the Hub (honor_labels false, FR-H1): job and instance are the
+  # target's, the Hub's own label is app. A container at 95 % of its limit
+  # for 10 min fires, one at 85 % doesn't; the summary names the app, not
+  # the target.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_container_memory_working_set_bytes{job="hub-usage",instance="hub-metrics:9100",app="paperless",service="web",number="1"}'
+        values: '95x15'
+      - series: 'portcullis_container_memory_limit_bytes{job="hub-usage",instance="hub-metrics:9100",app="paperless",service="web",number="1"}'
+        values: '100x15'
+      - series: 'portcullis_container_memory_working_set_bytes{job="hub-usage",instance="hub-metrics:9100",app="vikunja",service="api",number="1"}'
+        values: '85x15'
+      - series: 'portcullis_container_memory_limit_bytes{job="hub-usage",instance="hub-metrics:9100",app="vikunja",service="api",number="1"}'
+        values: '100x15'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PortcullisAppMemoryNearLimit
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: PortcullisAppMemoryNearLimit
+        exp_alerts:
+          - exp_labels: {severity: warning, job: hub-usage, instance: "hub-metrics:9100", app: paperless, service: web, number: "1"}
+            exp_annotations:
+              summary: "paperless's web.1 is near its memory limit"
+              description: Its working set has been above 90 % of its memory limit for 10 minutes. Raise the limit or look at its logs (Hub → Usage).
+  # The doctor's disk bands: 8 % free (of 100 GiB) is a warning, 30 % free
+  # isn't, 40 % free but only 4 GiB (of 10 GiB) is a warning, 2 % free is
+  # also critical; 50 % of 100 GiB is neither.
+  - interval: 5m
+    input_series:
+      - series: 'portcullis_filesystem_free_bytes{job="hub-usage",instance="hub-metrics:9100",dev="2049"}'
+        values: '8589934592x10'
+      - series: 'portcullis_filesystem_total_bytes{job="hub-usage",instance="hub-metrics:9100",dev="2049"}'
+        values: '107374182400x10'
+      - series: 'portcullis_filesystem_free_bytes{job="hub-usage",instance="hub-metrics:9100",dev="2050"}'
+        values: '53687091200x10'
+      - series: 'portcullis_filesystem_total_bytes{job="hub-usage",instance="hub-metrics:9100",dev="2050"}'
+        values: '107374182400x10'
+      - series: 'portcullis_filesystem_free_bytes{job="hub-usage",instance="hub-metrics:9100",dev="2051"}'
+        values: '4294967296x10'
+      - series: 'portcullis_filesystem_total_bytes{job="hub-usage",instance="hub-metrics:9100",dev="2051"}'
+        values: '10737418240x10'
+      - series: 'portcullis_filesystem_free_bytes{job="hub-usage",instance="hub-metrics:9100",dev="2052"}'
+        values: '2147483648x10'
+      - series: 'portcullis_filesystem_total_bytes{job="hub-usage",instance="hub-metrics:9100",dev="2052"}'
+        values: '107374182400x10'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PortcullisDiskNearlyFull
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: PortcullisDiskNearlyFull
+        exp_alerts:
+          - exp_labels: {severity: warning, job: hub-usage, instance: "hub-metrics:9100", dev: "2049"}
+            exp_annotations:
+              summary: "A filesystem with Portcullis data (device 2049) is nearly full"
+              description: Less than 10 % or 5 GiB is free. Free space or move the data (Hub → Usage → Storage names the filesystem and what is on it, largest first).
+          - exp_labels: {severity: warning, job: hub-usage, instance: "hub-metrics:9100", dev: "2051"}
+            exp_annotations:
+              summary: "A filesystem with Portcullis data (device 2051) is nearly full"
+              description: Less than 10 % or 5 GiB is free. Free space or move the data (Hub → Usage → Storage names the filesystem and what is on it, largest first).
+          - exp_labels: {severity: warning, job: hub-usage, instance: "hub-metrics:9100", dev: "2052"}
+            exp_annotations:
+              summary: "A filesystem with Portcullis data (device 2052) is nearly full"
+              description: Less than 10 % or 5 GiB is free. Free space or move the data (Hub → Usage → Storage names the filesystem and what is on it, largest first).
+      - eval_time: 15m
+        alertname: PortcullisDiskAlmostFull
+        exp_alerts:
+          - exp_labels: {severity: critical, job: hub-usage, instance: "hub-metrics:9100", dev: "2052"}
+            exp_annotations:
+              summary: "A filesystem with Portcullis data (device 2052) is almost full"
+              description: Less than 3 % or 1 GiB is free. When it fills, apps can't write; databases stop, uploads and backups fail. Free space now (Hub → Usage → Storage).
+  # The sampler's last success 10 min old while the Hub is scraped fires,
+  # a fresh one doesn't; a Hub scraped with no success yet (the series
+  # absent) fires NeverRan after 15 min, a Hub that is down doesn't.
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_usage_sampler_last_success_timestamp_seconds{job="hub-usage",instance="hub-metrics:9100"}'
+        values: '0x20'
+      - series: 'up{job="hub-usage",instance="hub-metrics:9100"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: PortcullisUsageSamplerStale
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: PortcullisUsageSamplerStale
+        exp_alerts:
+          - exp_labels: {severity: warning, job: hub-usage, instance: "hub-metrics:9100"}
+            exp_annotations:
+              summary: The Hub's usage sampler has had no good sample for 10 minutes
+              description: The Usage page and these metrics are out of date. Check the Hub's log for usage lines and GET /api/runtime.
+      - eval_time: 20m
+        alertname: PortcullisUsageSamplerNeverRan
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: 'portcullis_usage_sampler_last_success_timestamp_seconds{job="hub-usage",instance="hub-metrics:9100"}'
+        values: '0+60x20'
+      - series: 'up{job="hub-usage",instance="hub-metrics:9100"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: PortcullisUsageSamplerStale
+        exp_alerts: []
+  - interval: 1m
+    input_series:
+      - series: 'up{job="hub-usage",instance="hub-metrics:9100"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: PortcullisUsageSamplerNeverRan
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: PortcullisUsageSamplerNeverRan
+        exp_alerts:
+          - exp_labels: {severity: warning}
+            exp_annotations:
+              summary: The Hub's usage sampler has never had a good sample
+              description: The Hub is scraped but has measured nothing for 15 minutes. Check the Hub's log for usage lines and GET /api/runtime.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="hub-usage",instance="hub-metrics:9100"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PortcullisUsageSamplerNeverRan
+        exp_alerts: []
+
+  # The Hub's usage metrics target down (a real install always runs the
+  # Hub): TargetDown fires for job hub-usage (only CI's e2e job, which
+  # runs no Hub, skips it in its own targets check).
+  - interval: 1m
+    input_series:
+      - series: 'up{job="hub-usage",instance="hub-metrics:9100"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: TargetDown
+        exp_alerts:
+          - exp_labels: {severity: warning, job: hub-usage, instance: "hub-metrics:9100"}
+            exp_annotations:
+              summary: "hub-usage cannot be scraped"
+              description: "hub-metrics:9100 (hub-usage) has been unreachable for 5 minutes."

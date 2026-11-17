@@ -624,6 +624,14 @@ link_rule() {  # <config json>
 # With the monitoring profile, Prometheus is wg's metrics network's only other member.
 echo "$CFG_ALL" | jq -e '[.services | to_entries[] | select((.value.networks // {}) | has("portcullis-metrics-wg")) | .key] | sort == ["prometheus", "wg"]' >/dev/null \
   || { echo "FAIL: portcullis-metrics-wg must hold exactly prometheus and wg"; exit 1; }
+# The Hub's usage metrics (contract §16.2): exactly the Hub (alias
+# hub-metrics, HUB_METRICS_ADDR bound there) and Prometheus, internal.
+echo "$CFG_ALL" | jq -e '([.services | to_entries[] | select((.value.networks // {}) | has("portcullis-metrics-hub")) | .key] | sort == ["hub", "prometheus"])
+    and .networks["portcullis-metrics-hub"].internal == true
+    and .services.hub.networks["portcullis-metrics-hub"].aliases == ["hub-metrics"]
+    and .services.hub.environment.HUB_METRICS_ADDR == "hub-metrics:9100"
+    and ([.services.hub.networks | keys[]] | sort == ["portcullis", "portcullis-domains", "portcullis-link", "portcullis-mailctl", "portcullis-mcp", "portcullis-metrics-hub", "socket-proxy-hub"])' >/dev/null \
+  || { echo "FAIL: portcullis-metrics-hub must hold exactly hub (alias hub-metrics, HUB_METRICS_ADDR) and prometheus, internal"; exit 1; }
 # shellcheck disable=SC2034  # read through ${!c} below
 CFG_PODMAN_ALL="$(CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET="$PODMAN_SOCK" docker compose -f docker-compose.yml -f docker-compose.podman.yml --profile '*' config --format json)"
 # shellcheck disable=SC2034  # read through ${!c} below

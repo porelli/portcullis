@@ -99,6 +99,11 @@ networks:
   # Prometheus → wg's metrics only (monitoring profile + profile wg).
   portcullis-metrics-wg:
     internal: true
+  # Prometheus → the Hub's usage metrics only (contract §16.2): exactly the
+  # Hub (alias hub-metrics, the only address its listener binds) and
+  # Prometheus (monitoring profile).
+  portcullis-metrics-hub:
+    internal: true
   # Multiple servers (contract §17.2): link's CONNECT listeners, never in
   # its netstack. portcullis-link: exactly the Hub and wg, both pinned (the
   # Hub's control path to the workers' agents, wg's :3128). No egress.
@@ -1103,6 +1108,9 @@ services:
       # import; per-request permission checks), routed as people.<domain>
       # for every signed-in user (contract §5.1).
       HUB_PEOPLE_ADDR: ":8889"
+      # The usage metrics listener (contract §16.2): bound only to the
+      # Hub's address on portcullis-metrics-hub.
+      HUB_METRICS_ADDR: hub-metrics:9100
       # Per-person secrets volume (contract §6, file sharing): the Hub checks
       # ownership and mode at start; core ensures it.
       HUB_SECRETS_DIR: /secrets
@@ -1225,6 +1233,9 @@ services:
       # The Hub → mailctl's API (contract §19.5), at this pinned address.
       portcullis-mailctl:
         ipv4_address: ${PORTCULLIS_MAILCTL_HUB_IP:-172.31.255.18}
+      # Prometheus → the Hub's usage metrics (HUB_METRICS_ADDR, §16.2).
+      portcullis-metrics-hub:
+        aliases: [hub-metrics]
       # The Hub → link's control CONNECT (contract §17.2), at this pinned address.
       portcullis-link:
         ipv4_address: ${PORTCULLIS_LINK_HUB_IP:-172.31.254.82}
@@ -1889,6 +1900,8 @@ services:
       - portcullis-metrics-wg
       # mail's and mailctl's metrics (profile mail), the only other members.
       - portcullis-metrics-mail
+      # the Hub's usage metrics, the only other member.
+      - portcullis-metrics-hub
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/ready"]
       interval: 15s

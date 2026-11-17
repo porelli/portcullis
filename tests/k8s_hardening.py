@@ -193,6 +193,10 @@ def main():
                 F.add(f"the Hub's Role: {rule['resources']}")
             if set(rule["verbs"]) & {"escalate", "bind", "impersonate", "*"}:
                 F.add(f"the Hub's Role: verbs {rule['verbs']}")
+            if "metrics.k8s.io" in rule.get("apiGroups", []) and (rule["resources"] != ["pods"] or sorted(rule["verbs"]) != ["get", "list"]):
+                F.add("the Hub's Role: metrics.k8s.io only pods get/list (the Usage page; never nodes)")
+            if any(x.startswith("nodes") for x in rule["resources"]):
+                F.add(f"the Hub's Role: never nodes, nodes/stats or nodes/proxy ({rule['resources']})")
     # What Traefik 3.7's CRD provider lists in a watched namespace: a
     # resource it can't list keeps it from loading any route (e2e-k3s saw
     # configmaps forbidden → every core route 404).

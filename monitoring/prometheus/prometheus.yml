@@ -55,6 +55,12 @@ scrape_configs:
     static_configs:
       - targets: ["grafana:3000"]
 
+  # The Hub's usage metrics (contract §16.2): over portcullis-metrics-hub
+  # (exactly the Hub and Prometheus); no host paths, null figures absent.
+  - job_name: hub-usage
+    static_configs:
+      - targets: ["hub-metrics:9100"]
+
   # The VPN service (profile wg, contract §16): over portcullis-metrics-wg.
   # file_sd, written by ./portcullis (up / vpn init): the target only while
   # the profile is on, so an install without the VPN has no wg target and
