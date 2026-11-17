@@ -5439,6 +5439,9 @@ openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$LCA/l.k
 printf 'extendedKeyUsage=clientAuth\n' > "$LCA/ext"
 openssl x509 -req -in "$LCA/l.csr" -CA "$LCA/ca.crt" -CAkey "$LCA/ca.key" -CAcreateserial -out "$LCA/l.crt" -days 90 -extfile "$LCA/ext" >/dev/null 2>&1
 openssl x509 -req -in "$LCA/l.csr" -CA "$LCA/ca.crt" -CAkey "$LCA/ca.key" -CAcreateserial -out "$LCA/l2.crt" -days 90 -extfile "$LCA/ext" >/dev/null 2>&1
+# The same CN and CA, another key (not link-tls.key's).
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$LCA/o.key" -out "$LCA/o.csr" -subj "/CN=link.control" >/dev/null 2>&1
+openssl x509 -req -in "$LCA/o.csr" -CA "$LCA/ca.crt" -CAkey "$LCA/ca.key" -CAcreateserial -out "$LCA/o.crt" -days 90 -extfile "$LCA/ext" >/dev/null 2>&1
 # Off-CA: the same CN under another root.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$LCA/x.key" -out "$LCA/x.crt" -subj "/CN=link.control" -days 90 >/dev/null 2>&1
 expect_fail "link_cert_due: a fresh 90 d certificate isn't due" link_cert_due "$LCA/l.crt"
@@ -5505,6 +5508,9 @@ expect_eq "link cert: the token header comes from a process substitution" "$(gre
 OUT="$(VT_SIGNED="$LCA/x.crt" lt 'printf S > "$PORTCULLIS_ROOT/secrets/wg/link-tls.key"; link_cert_sign' 2>&1)"; RC=$?
 expect_eq "link cert: a certificate not under certs/node-ca.crt → refused, nothing written" \
   "$RC:$(printf '%s' "$OUT" | grep -c 'nothing written'):$(wc -c < "$WORK/vt/root/secrets/wg/link-tls.crt" | tr -d ' ')" "1:1:0"
+OUT="$(VT_SIGNED="$LCA/o.crt" lt 'printf S > "$PORTCULLIS_ROOT/secrets/wg/link-tls.key"; link_cert_sign' 2>&1)"; RC=$?
+expect_eq "link cert: a valid link.control certificate for another key → refused, nothing written" \
+  "$RC:$(printf '%s' "$OUT" | grep -c 'for link-tls.key under certs/node-ca.crt: nothing written'):$(wc -c < "$WORK/vt/root/secrets/wg/link-tls.crt" | tr -d ' ')" "1:1:0"
 OUT="$(VT_SIGN_CODE=403 lt 'printf S > "$PORTCULLIS_ROOT/secrets/wg/link-tls.key"; link_cert_sign' 2>&1)"; RC=$?
 expect_eq "link cert: Vault's refusal → exit 1 naming the path, nothing written" \
   "$RC:$(printf '%s' "$OUT" | grep -c 'pki_node/sign/node-link, HTTP 403'):$(wc -c < "$WORK/vt/root/secrets/wg/link-tls.crt" | tr -d ' ')" "1:1:0"

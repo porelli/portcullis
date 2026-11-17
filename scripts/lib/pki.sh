@@ -154,7 +154,7 @@ _pki_create_node_ca() {
 # _pki_write_node_role <role> <allowed_domains> <subdomains> <bare> <server_flag> <ttl>
 # EC P-256, no IP / URI / other SANs, the CN only from common_name (never
 # the CSR's, and CSR SANs ignored), stored (revocable), not_before 30 s
-# back (a worker's clock may be a little off, Review Focus 1).
+# back (issuance-time skew only; a worker's clock tolerance, ±5 min, is the agent's, §17.4).
 _pki_write_node_role() {
   vault write "pki_node/roles/$1" \
     allowed_domains="$2" allow_subdomains="$3" allow_bare_domains="$4" \

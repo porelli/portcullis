@@ -75,9 +75,10 @@ _link_vault_ready() {
 # link_cert_sign — a link.control certificate for link-tls.key: the CSR
 # from `wg link-csr`, signed by Vault pki_node/sign/node-link (CSR on
 # stdin, token through -H @<(...)), checked (CN, chains to
-# certs/node-ca.crt, the key's) and written in place.
+# certs/node-ca.crt, the CSR's public key — i.e. link-tls.key's, which the
+# CLI may not read) and written in place.
 link_cert_sign() {
-  local tls crt ca csr resp code cert tmp
+  local tls crt ca csr resp code cert tmp want
   tls="$(_link_secret link-tls.key)"; crt="$(_link_secret link-tls.crt)"; ca="$PORTCULLIS_ROOT/certs/node-ca.crt"
   [ -s "$tls" ] || fail "$tls is empty: run ./portcullis link init"
   [ -s "$ca" ] || fail "$ca is empty: the node CA isn't exported yet (./portcullis pki setup, or ./portcullis upgrade)"
@@ -86,6 +87,8 @@ link_cert_sign() {
   runtime_build_service wg || fail "could not build the wg image"
   csr="$(_link_wg_run "$tls" ro link-csr)" || fail "could not make the link CSR (wg link-csr)"
   case "$csr" in *"-----BEGIN CERTIFICATE REQUEST-----"*) ;; *) fail "wg link-csr printed no CSR" ;; esac
+  want="$(printf '%s\n' "$csr" | openssl req -noout -pubkey 2>/dev/null)"
+  [ -n "$want" ] || fail "wg link-csr's CSR has no readable public key"
   tmp="$(mktemp -d)" || fail "no temporary directory"
   chmod 700 "$tmp"
   code="$(printf '%s' "$csr" | jq -Rs --arg cn "$LINK_CN" --arg ttl "$LINK_CERT_TTL" '{csr: ., common_name: $cn, ttl: $ttl, format: "pem"}' \
@@ -101,9 +104,10 @@ link_cert_sign() {
   cert="$(jq -r '.data.certificate // empty' "$tmp/resp" 2>/dev/null)"
   printf '%s\n' "$cert" > "$tmp/crt"
   if [ "$(openssl x509 -in "$tmp/crt" -noout -subject -nameopt RFC2253 2>/dev/null)" != "subject=CN=$LINK_CN" ] \
-     || ! openssl verify -CAfile "$ca" -purpose sslclient "$tmp/crt" >/dev/null 2>&1; then
+     || ! openssl verify -CAfile "$ca" -purpose sslclient "$tmp/crt" >/dev/null 2>&1 \
+     || [ "$(openssl x509 -in "$tmp/crt" -noout -pubkey 2>/dev/null)" != "$want" ]; then
     rm -rf "$tmp"
-    fail "Vault's link certificate isn't a $LINK_CN certificate (client auth) under certs/node-ca.crt: nothing written"
+    fail "Vault's link certificate isn't a $LINK_CN certificate (client auth) for link-tls.key under certs/node-ca.crt: nothing written"
   fi
   rm -rf "$tmp"
   # In place: the single-file bind pins the inode.
