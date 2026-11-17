@@ -438,7 +438,7 @@ PORT8890="$(for files in "docker-compose.yml" "docker-compose.yml -f docker-comp
 # :8891, exactly the contract's rule, priority, TLS options, middlewares in
 # order (no forward-auth), entrypoints and service; the Hub's env, the
 # break-glass record bind.
-docker compose -f docker-compose.yml config --format json | jq -e --arg d "$(grep '^PORTCULLIS_DOMAIN=' .env | cut -d= -f2-)" '
+echo "$CFG" | jq -e --arg d "${PORTCULLIS_DOMAIN:-ci.example.org}" '
   .services.hub as $h | $h.labels as $l
   | $l["traefik.http.routers.people-cli.rule"] == "Host(`people.\($d)`) && PathPrefix(`/api/cli/v1/`)"
     and $l["traefik.http.routers.people-cli.priority"] == "200"
