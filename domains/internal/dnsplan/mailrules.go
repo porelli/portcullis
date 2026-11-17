@@ -33,12 +33,75 @@ type RuleContext struct {
 }
 
 var (
-	reSTS    = regexp.MustCompile(`^v=STSv1; id=[A-Za-z0-9]{1,32}$`)
-	reTLSRPT = regexp.MustCompile(`^v=TLSRPTv1; rua=mailto:(\S+)$`)
-	reSRV    = regexp.MustCompile(`^([0-9]{1,5}) ([0-9]{1,5}) ([0-9]{1,5}) (\S+)$`)
-	reMX     = regexp.MustCompile(`^([0-9]{1,5}) (\S+)$`)
-	reLabel1 = regexp.MustCompile(`^[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$`)
+	reSTS     = regexp.MustCompile(`^v=STSv1; id=[A-Za-z0-9]{1,32}$`)
+	reTLSRPT  = regexp.MustCompile(`^v=TLSRPTv1; rua=mailto:(\S+)$`)
+	reSRV     = regexp.MustCompile(`^([0-9]{1,5}) ([0-9]{1,5}) ([0-9]{1,5}) (\S+)$`)
+	reMX      = regexp.MustCompile(`^([0-9]{1,5}) (\S+)$`)
+	reLabel1  = regexp.MustCompile(`^[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$`)
+	reSeconds = regexp.MustCompile(`^[0-9]{1,10}$`)
+	reDKIMTag = regexp.MustCompile(`^[a-z]{1,8}$`)
+	reBase64  = regexp.MustCompile(`^[A-Za-z0-9+/]*={0,2}$`)
 )
+
+// Value shape bounds (the Hub's M12, shared vectors).
+const (
+	ruleTTLMin    = 60
+	ruleTTLMax    = 86400
+	ruleTXTMax    = 2048 // a 4096-bit RSA DKIM key fits
+	ruleTargetMax = 255
+)
+
+// valueShape: "" or the why — the TTL in range, printable ASCII only,
+// at most ruleTXTMax (TXT) or ruleTargetMax (others) characters.
+func valueShape(t string, ttl int, v string) string {
+	if ttl < ruleTTLMin || ttl > ruleTTLMax {
+		return fmt.Sprintf("ttl must be %d–%d", ruleTTLMin, ruleTTLMax)
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] < 0x20 || v[i] > 0x7e {
+			return "the value must be printable ASCII"
+		}
+	}
+	max := ruleTargetMax
+	if t == "TXT" {
+		max = ruleTXTMax
+	}
+	if len(v) > max {
+		return fmt.Sprintf("the value is longer than %d characters", max)
+	}
+	return ""
+}
+
+// u16: a decimal 0–65535.
+func u16(s string) bool {
+	n := 0
+	for _, c := range s {
+		n = n*10 + int(c-'0')
+	}
+	return len(s) > 0 && len(s) <= 5 && n <= 65535
+}
+
+// dkimTagsOK: after v=DKIM1; every tag is <lowercase name>=<value>,
+// each once, and p= (base64, empty = revoked) is there.
+func dkimTagsOK(v string) bool {
+	seen := map[string]bool{}
+	for _, tag := range strings.Split(v, ";")[1:] {
+		tag = strings.TrimSpace(tag)
+		if tag == "" {
+			continue
+		}
+		k, val, ok := strings.Cut(tag, "=")
+		k, val = strings.TrimSpace(k), strings.TrimSpace(val)
+		if !ok || !reDKIMTag.MatchString(k) || seen[k] {
+			return false
+		}
+		seen[k] = true
+		if k == "p" && !reBase64.MatchString(val) {
+			return false
+		}
+	}
+	return seen["p"]
+}
 
 var dmarcRank = map[string]int{"none": 0, "quarantine": 1, "reject": 2}
 
@@ -69,6 +132,11 @@ func ValidateMailSet(c RuleContext, rs []MailRecord) error {
 		if c.Draining && (rel != "_mta-sts" || t != "TXT") {
 			return refuse("a draining set holds only _mta-sts." + e)
 		}
+		// The value's shape before its meaning: printable ASCII only (no
+		// tab, newline or control byte reaches DNS), a bounded length and TTL.
+		if why := valueShape(t, r.TTL, r.Value); why != "" {
+			return refuse(why)
+		}
 		v := strings.TrimSpace(r.Value)
 		switch {
 		case n == e:
@@ -77,6 +145,9 @@ func ValidateMailSet(c RuleContext, rs []MailRecord) error {
 				m := reMX.FindStringSubmatch(v)
 				if m == nil || !strings.EqualFold(m[2], h+".") {
 					return refuse("the target must be " + h + ".")
+				}
+				if !u16(m[1]) {
+					return refuse("the priority must be 0–65535")
 				}
 			case "TXT":
 				if !strings.HasPrefix(v, "v=spf1 ") {
@@ -106,6 +177,9 @@ func ValidateMailSet(c RuleContext, rs []MailRecord) error {
 			}
 			if !strings.HasPrefix(v, "v=DKIM1;") {
 				return refuse("must start with v=DKIM1;")
+			}
+			if !dkimTagsOK(v) {
+				return refuse("the DKIM tags must be <name>=<value>, with p=<base64>")
 			}
 		case rel == "_dmarc":
 			if t != "TXT" {
@@ -140,6 +214,9 @@ func ValidateMailSet(c RuleContext, rs []MailRecord) error {
 			m := reSRV.FindStringSubmatch(v)
 			if m == nil || m[3] != srvPorts[rel] || !strings.EqualFold(m[4], h+".") {
 				return refuse("must be <priority> <weight> " + srvPorts[rel] + " " + h + ".")
+			}
+			if !u16(m[1]) || !u16(m[2]) {
+				return refuse("priority and weight must be 0–65535")
 			}
 		case contains(srvNull, rel):
 			if t != "SRV" {
@@ -206,6 +283,24 @@ func dmarcRule(v, e, floor string) string {
 		case "pct":
 			if val != "100" {
 				return "pct must be 100 or absent"
+			}
+		case "adkim", "aspf":
+			if val != "r" && val != "s" {
+				return k + " must be r or s"
+			}
+		case "fo":
+			for _, o := range strings.Split(val, ":") {
+				if o != "0" && o != "1" && o != "d" && o != "s" {
+					return "fo must be 0, 1, d or s, colon-separated"
+				}
+			}
+		case "rf":
+			if val != "afrf" {
+				return "rf must be afrf"
+			}
+		case "ri":
+			if !reSeconds.MatchString(val) {
+				return "ri must be a whole number of seconds"
 			}
 		case "rua":
 			for _, u := range strings.Split(val, ",") {
