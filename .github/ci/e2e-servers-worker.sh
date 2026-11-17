@@ -74,6 +74,7 @@ case "$kind" in
     rt=docker ;;
   podman)
     if ! id "$WUSER" >/dev/null 2>&1; then
+      echo "== podman worker: packages, the user, linger"
       sudo apt-get update -qq && sudo apt-get install -y -qq podman passt uidmap >/dev/null
       sudo useradd -m -s /bin/bash "$WUSER"
       grep -q "^$WUSER:" /etc/subuid || sudo usermod --add-subuids 200000-265535 "$WUSER"
@@ -96,6 +97,7 @@ case "$kind" in
       for i in $(seq 1 60); do sudo test -S "/run/user/$uid/bus" && break; [ "$i" -eq 60 ] && { echo "FAIL: no user manager for $WUSER"; systemctl status "user@$uid.service" --no-pager | tail -20; exit 1; }; sleep 1; done
       asworker sh -c 'systemctl --user enable --now podman.socket && systemctl --user enable podman-restart.service' 
     fi
+    echo "== podman worker: the user's socket"
     for i in $(seq 1 30); do
       asworker docker version --format '{{json .Server.Components}}' >/dev/null 2>&1 && break
       if [ "$i" -eq 10 ]; then
@@ -114,6 +116,7 @@ case "$kind" in
       fi
       sleep 2
     done
+    echo "== podman worker: the checkout, the agent image"
     sudo rm -rf "/home/$WUSER/portcullis"
     sudo cp -a "$PWD" "/home/$WUSER/portcullis"
     sudo rm -rf "/home/$WUSER/portcullis/.env" "/home/$WUSER/portcullis/secrets/"* "/home/$WUSER/portcullis/certs/"* "/home/$WUSER/portcullis/docker-compose.ci.yml"
@@ -125,6 +128,7 @@ case "$kind" in
 esac
 
 # The code: this script's stdin, straight into worker join's stdin.
+echo "== $kind worker $name: worker join"
 wexec "$name" env AGENT_IMAGE="$AGENT_IMAGE" WORKER_JOIN_WAIT="${WORKER_JOIN_WAIT:-240}" ./portcullis worker join --runtime "$rt"
 wexec "$name" ./portcullis worker status --json | jq -e '.agent.state == "ready"' >/dev/null \
   || { echo "FAIL: $name: $(wexec "$name" ./portcullis worker status --json)"; exit 1; }

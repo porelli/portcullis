@@ -143,14 +143,23 @@ def add_server(sid: str) -> dict:
 
 
 def join(kind: str, name: str, code_file: str, wait: int = 240, check=True) -> subprocess.CompletedProcess:
-    with open(code_file) as f:
-        p = subprocess.run(["bash", WORKER_SH, kind, name], stdin=f, capture_output=True, text=True, timeout=wait + 600,
-                           env=dict(os.environ, WORKER_JOIN_WAIT=str(wait)))
-    out = p.stdout + p.stderr
-    assert "pcj1." not in out, "the join code reached the worker script's output"
-    if check and p.returncode != 0:
-        raise AssertionError(f"worker {name}: exit {p.returncode}: {out[-1500:]}")
-    return p
+    """The worker script with the code on stdin; its output goes to a
+    0600 file (checked for the code, then printed), also on a timeout."""
+    log = os.path.join(TMP, f"{name}.join.log")
+    rc = None
+    with open(code_file) as f, open(log, "w") as out:
+        os.chmod(log, 0o600)
+        try:
+            rc = subprocess.run(["bash", WORKER_SH, kind, name], stdin=f, stdout=out, stderr=subprocess.STDOUT,
+                                timeout=wait + 600, env=dict(os.environ, WORKER_JOIN_WAIT=str(wait))).returncode
+        except subprocess.TimeoutExpired:
+            rc = "timeout"
+    text = open(log, errors="replace").read()
+    assert "pcj1." not in text, "the join code reached the worker script's output"
+    print(f"::group::worker {name} ({kind}): exit {rc}\n{text[-6000:]}\n::endgroup::", flush=True)
+    if check and rc != 0:
+        raise AssertionError(f"worker {name}: exit {rc}: {text[-800:]}")
+    return subprocess.CompletedProcess([WORKER_SH, kind, name], rc if isinstance(rc, int) else 124, text, "")
 
 
 def wexec(name: str, *cmd, check=True) -> subprocess.CompletedProcess:
