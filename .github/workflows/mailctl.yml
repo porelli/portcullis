@@ -10,7 +10,10 @@ name: Mail adapter image
 # the checkout.
 on:
   push:
-    branches: [main]
+    # TEMP mailprov — remove in Task 29: `mailprov` until the workflow is on
+    # main (a dispatch needs it on the default branch); its pushes get only
+    # the signed dev-mailprov-<sha7> tag (the Tag step), never edge or latest.
+    branches: [main, mailprov]
     paths:
       - 'mailctl/**'
       - '.github/workflows/mailctl.yml'
