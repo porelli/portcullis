@@ -291,6 +291,10 @@ def join_code_expired_refused():
     finally:
         set_clock("")
         sh("docker", "rm", "-f", "e2e-w2x", check=False)
+    # A Hub clock 16 min ahead reads link's status as stale: w1 goes offline
+    # (fail closed) until the next status write after the reset.
+    if state.get("w1"):
+        wait_for("w1 ready again after the clock reset", lambda: server_state("w1") == "ready", 180)
 
 
 def echo_on_worker_signed_in():
