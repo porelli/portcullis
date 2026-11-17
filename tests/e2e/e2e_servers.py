@@ -376,6 +376,11 @@ def echo_on_worker_signed_in():
     page = state["alice_page"]
     wait_for("se1 through the relay", lambda: reach(page, "se1"), 180)
     assert reach(page, "se0"), "se0 (on the primary) isn't reachable"
+    # The data file (0640 group 10001) is readable by the app through its
+    # group_add, on the primary and on the worker alike (§13.7 parity).
+    for iid in ("se0", "se1"):
+        body = echo(page, iid)[1]
+        assert "DATAFILE=readable" in body, f"{iid}: the app can't read its data file: {body[-200:]}"
     a, b = get("/api/instances/se0/signin"), get("/api/instances/se1/signin")
     assert {k: a.get(k) for k in ("template", "tier")} == {k: b.get(k) for k in ("template", "tier")}, f"tiers differ: {a} / {b}"
     ps = wexec("w1", "docker", "ps", "--filter", "label=com.docker.compose.project=portcullis-se1", "--format", "{{.Names}}").stdout

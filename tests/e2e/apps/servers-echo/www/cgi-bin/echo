@@ -15,3 +15,5 @@ printf '\r\n'
 printf 'COOKIE=%s\n' "${HTTP_COOKIE:-}"
 printf 'HOST=%s\n' "${HTTP_HOST:-}"
 [ ! -r /data/marker ] || printf 'MARKER=%s\n' "$(cat /data/marker)"
+# The Hub's data file (group 10001, read through group_add).
+if [ -r /portcullis/people.json ]; then echo DATAFILE=readable; else echo DATAFILE=unreadable; fi
