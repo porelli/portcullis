@@ -78,6 +78,27 @@ jobs:
           [ "$GOT" = "$KD" ] || { echo "::error::ghcr.io/porelli/portcullis-keycloak:$KV is $GOT, docker-compose.yml pins $KD"; exit 1; }
           echo "PASS: Keycloak image $KV pinned at $KD"
 
+      # Multiple servers (contract §17): the worker's agent and the primary's
+      # relays are the Hub's images, released with it: both pinned to the
+      # released Hub version's digests.
+      - name: AGENT_IMAGE and RELAY_IMAGE defaults are the released Hub version pinned by digest
+        run: |
+          # shellcheck disable=SC2016  # literal ${HUB_IMAGE:-...} defaults
+          HV="$(sed -n 's/.*\${HUB_IMAGE:-ghcr\.io\/porelli\/portcullis-hub:\([0-9.]*\)@.*/\1/p' docker-compose.yml | head -n1)"
+          [ -n "$HV" ] || { echo "::error::no released HUB_IMAGE version to pin the agent and relay to"; exit 1; }
+          for pair in "AGENT_IMAGE docker-compose.worker.yml portcullis-agent" "RELAY_IMAGE docker-compose.yml portcullis-relay"; do
+            read -r var file img <<<"$pair"
+            REF="$(sed -n "s/.*\${$var:-\([^}]*\)}.*/\1/p" "$file" | head -n1)"
+            echo "$var default: $REF"
+            [[ "$REF" =~ ^ghcr\.io/porelli/$img:([0-9]+\.[0-9]+\.[0-9]+)@(sha256:[0-9a-f]{64})$ ]] \
+              || { echo "::error::$var default ($file) must be ghcr.io/porelli/$img:X.Y.Z@sha256:<digest> (got $REF)"; exit 1; }
+            V="${BASH_REMATCH[1]}" D="${BASH_REMATCH[2]}"
+            [ "$V" = "$HV" ] || { echo "::error::$var is $V, the Hub $HV: the agent and relay ship with the Hub"; exit 1; }
+            GOT="$(docker buildx imagetools inspect "ghcr.io/porelli/$img:$V" --format '{{json .Manifest}}' | jq -r .digest)"
+            [ "$GOT" = "$D" ] || { echo "::error::ghcr.io/porelli/$img:$V is $GOT, $file pins $D"; exit 1; }
+            echo "PASS: $img $V pinned at $D"
+          done
+
   ci:
     needs: preflight
     uses: ./.github/workflows/ci.yml

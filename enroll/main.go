@@ -539,6 +539,8 @@ func main() {
 	inv.issueYubiKey = cfg.issueYubiKeyCert
 	inv.renewYubiKey = cfg.renewYubiKeyCert
 	inv.revoke = cfg.revokeCert
+	inv.signNode = cfg.signNodeCert
+	inv.revokeNode = cfg.revokeNodeCert
 	mux := publicMux(srv, inv)
 	for _, l := range []struct {
 		addr string

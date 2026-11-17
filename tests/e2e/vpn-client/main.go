@@ -7,7 +7,8 @@
 //
 //	vpn-client [--endpoint host:port] [--wait-handshake 20s] [--timeout 20s]
 //	    (--get https://<host>/<path> [--resolve host:port:addr] [--ca-file f] [--header-file f]
-//	     | --dns <name> [--type A|AAAA] [--server 10.213.0.1:53]) < wg.conf
+//	     | --dns <name> [--type A|AAAA] [--server 10.213.0.1:53]
+//	     | --probe <ipv4> --ports 1-1024,7000) < wg.conf
 //
 // The config's private key and any header file are secrets: they are never
 // printed. The answer's body is clipped.
@@ -29,9 +30,11 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
@@ -164,6 +167,12 @@ type result struct {
 	// within --hold (Closed false).
 	Closed bool    `json:"closed,omitempty"`
 	HeldS  float64 `json:"held_s,omitempty"`
+	// --probe: the TCP ports that accepted a connection, of Probed;
+	// Refused counts the ports that answered with a reset (closed for
+	// sure); the rest (timeouts, other errors) prove nothing.
+	Open    []int `json:"open,omitempty"`
+	Probed  int   `json:"probed,omitempty"`
+	Refused int   `json:"refused"`
 }
 
 // closeConn tells when the HTTP transport closes its connection (it does
@@ -193,15 +202,36 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	dnsName := fs.String("dns", "", "a name to look up through the tunnel")
 	dnsType := fs.String("type", "A", "A or AAAA")
 	dnsServer := fs.String("server", "", "resolver (default: the config's DNS, port 53)")
+	probe := fs.String("probe", "", "an IPv4 address to probe TCP ports on through the tunnel (--ports)")
+	ports := fs.String("ports", "", "--probe's ports: a comma list of ports and lo-hi ranges")
 	hold := fs.Duration("hold", 0, "after the --get response, keep the connection open this long and report when the far end closes it")
 	var resolve multi
 	fs.Var(&resolve, "resolve", "host:port:addr (repeatable), like curl")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if (*get == "") == (*dnsName == "") || fs.NArg() != 0 {
-		fmt.Fprintln(stderr, "vpn-client: exactly one of --get and --dns")
+	modes := 0
+	for _, m := range []string{*get, *dnsName, *probe} {
+		if m != "" {
+			modes++
+		}
+	}
+	if modes != 1 || fs.NArg() != 0 {
+		fmt.Fprintln(stderr, "vpn-client: exactly one of --get, --dns and --probe")
 		return 2
+	}
+	var probeAddr netip.Addr
+	var probePorts []int
+	if *probe != "" {
+		var err error
+		if probeAddr, err = netip.ParseAddr(*probe); err != nil || !probeAddr.Is4() {
+			fmt.Fprintln(stderr, "vpn-client: --probe: an IPv4 address")
+			return 2
+		}
+		if probePorts, err = parsePorts(*ports); err != nil {
+			fmt.Fprintln(stderr, "vpn-client:", err)
+			return 2
+		}
 	}
 	res, err := parseResolve(resolve)
 	if err != nil {
@@ -247,6 +277,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			out.Error = err.Error()
 			return emit(3)
 		}
+		return emit(0)
+	}
+	if *probe != "" {
+		out.Open, out.Refused = probeTCP(tnet, probeAddr, probePorts)
+		out.Probed = len(probePorts)
 		return emit(0)
 	}
 	if err := fetch(ctx, tnet, *get, res, *caFile, *headerFile, *hold, &out); err != nil {
@@ -418,4 +453,69 @@ func lookup(ctx context.Context, tnet *netstack.Net, server, name, typ string, o
 		out.Answers = append(out.Answers, strings.Join(strings.Fields(a.String()), " "))
 	}
 	return nil
+}
+
+// parsePorts reads "22,80,1000-1010": 1–65535, no duplicates, ≤ 65535.
+func parsePorts(v string) ([]int, error) {
+	seen := map[int]bool{}
+	var out []int
+	for _, part := range strings.Split(v, ",") {
+		lo, hi, isRange := strings.Cut(strings.TrimSpace(part), "-")
+		a, err := strconv.Atoi(lo)
+		b := a
+		if err == nil && isRange {
+			b, err = strconv.Atoi(hi)
+		}
+		if err != nil || a < 1 || b > 65535 || a > b {
+			return nil, fmt.Errorf("--ports: %q isn't a port or lo-hi range", part)
+		}
+		for p := a; p <= b; p++ {
+			if !seen[p] {
+				seen[p] = true
+				out = append(out, p)
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("--ports: none given")
+	}
+	return out, nil
+}
+
+// probeTCP dials every port (64 at a time, 2 s each): the ports that
+// accepted a connection, sorted, and how many answered with a reset.
+func probeTCP(tnet *netstack.Net, addr netip.Addr, ports []int) ([]int, int) {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 64)
+	open, refused := []int{}, 0
+	for _, p := range ports {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(p int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			c, err := tnet.DialContextTCPAddrPort(ctx, netip.AddrPortFrom(addr, uint16(p)))
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				c.Close()
+				open = append(open, p)
+			case isRefused(err):
+				refused++
+			}
+		}(p)
+	}
+	wg.Wait()
+	sort.Ints(open)
+	return open, refused
+}
+
+// isRefused: the dial was answered with a reset (gVisor's "connection was
+// refused"), not a timeout.
+func isRefused(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) || strings.Contains(err.Error(), "refused")
 }

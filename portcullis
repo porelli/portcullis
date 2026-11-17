@@ -20,7 +20,7 @@ PORTCULLIS_ROOT="${PORTCULLIS_ROOT:-$PORTCULLIS_HOME}"
 PORTCULLIS_CALLER_PWD="$PWD"
 unset _self _dir
 
-for _lib in common network vault pki certs keycloak users domains mcpgate sessions dns config status monitoring backup signin vpn mail stack; do
+for _lib in common network vault pki certs keycloak users domains mcpgate sessions dns config status monitoring backup signin vpn link mail worker stack; do
   # shellcheck source=/dev/null
   source "$PORTCULLIS_LIB/$_lib.sh"
 done
@@ -72,6 +72,16 @@ VPN:
   vpn devices                 List VPN devices of every provider
   vpn revoke                  Remove a built-in VPN device
 
+Servers:
+  link init                   Set up the link role: the tunnel worker servers dial out to
+  link status                 The link role and each worker server's last handshake
+  worker join                 Join this host to a primary as a worker server (the code on stdin)
+  worker status               The worker's agent and containers
+  worker upgrade              Pull and restart the worker's agent
+  worker leave                Take this worker's apps down and wipe its identity
+  worker stop                 Stop one app instance on this worker (break-glass)
+  worker start                Start an app instance on this worker again
+
 Mail:
   mail enable                 Turn the mail server on (Stalwart, the mail certificate, bootstrap)
   mail disable                Turn mail off for every domain (drains first)
@@ -108,9 +118,11 @@ main() {
     "") help_main >&2; return 2 ;;
   esac
   cd "$PORTCULLIS_ROOT"
+  # A worker server runs only `worker …`, help, version and status (§17.7).
+  worker_role_guard "$cmd" "$@"
   cli_lock "$cmd" "$@"
   case "$cmd" in
-    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert|signin|vpn|mail|kube)
+    init|up|down|upgrade|status|version|backup|restore|config|dns|vault|pki|keycloak|oidc|invite|cert|signin|vpn|link|mail|kube|worker)
       "cmd_$cmd" "$@" ;;
     lldap-ui) cmd_lldap_ui "$@" ;;
     *)

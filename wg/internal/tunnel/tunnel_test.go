@@ -105,6 +105,10 @@ func TestTunnelRoundTrip(t *testing.T) {
 	if ts, ok := hs[KeyString(cliPub)]; !ok || ts.IsZero() {
 		t.Fatalf("no handshake recorded for the client: %v", hs)
 	}
+	st, err := srv.PeerStats()
+	if err != nil || st[KeyString(cliPub)].Rx == 0 || st[KeyString(cliPub)].Tx == 0 || st[KeyString(cliPub)].Handshake.IsZero() {
+		t.Fatalf("PeerStats: %+v %v", st, err)
+	}
 	if srv.PublicKey() != KeyString(srvPub) {
 		t.Fatal("PublicKey mismatch")
 	}

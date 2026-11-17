@@ -68,7 +68,10 @@ fi
 
 docker network inspect "$c" >/dev/null 2>&1 || docker network create --subnet "$SUBNET" "$c" >/dev/null
 for v in home gopath work srv tmp docker containerd tools; do docker volume create "$c-$v" >/dev/null; done
-docker run -d --name "$c" --hostname "$c" --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
+# The runner container stands in for a GitHub VM (systemd, its own dockerd):
+# the dev builder's self-hosted runner only.
+priv=(--privileged) # reviewed exception
+docker run -d --name "$c" --hostname "$c" "${priv[@]}" --cgroupns=private --tmpfs /run --tmpfs /run/lock \
   --network "$c" -e GOFLAGS=-mod=readonly --cpus "$CPUS" --memory "$MEMORY" --memory-swap "$MEMORY" \
   -v "$c-docker:/var/lib/docker-store" -v "$c-containerd:/var/lib/containerd" \
   -v "$c-work:/home/runner/work" -v "$c-srv:/srv" -v "$c-tmp:/tmp" -v "$c-home:/home/runner/.cache" \
