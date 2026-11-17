@@ -14,11 +14,15 @@ ARG YQ_SHA256=129534601871538efe0ba4c5e62a34fb1d5f469bcb975c4fddeb467d82974973
 ARG RUNNER_VERSION=2.338.2
 ARG RUNNER_SHA256=baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40
 ARG NODE_MAJOR=26
+# ShellCheck from its release (Ubuntu's 0.9.0 flags SC2120 cases GitHub's
+# runner image doesn't: ci.yml's shellcheck step must agree with GitHub).
+ARG SHELLCHECK_VERSION=v0.11.0
+ARG SHELLCHECK_SHA256=8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
       systemd systemd-sysv dbus sudo ca-certificates curl wget gnupg git jq python3 python3-venv python3-pip \
-      python3-yaml iproute2 iptables kmod procps acl attr file openssl rsync unzip xz-utils zstd shellcheck \
+      python3-yaml iproute2 iptables kmod procps acl attr file openssl rsync unzip xz-utils zstd \
       dnsutils netcat-openbsd libnss3-tools gcc libc6-dev make sqlite3 tzdata lsb-release less \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
@@ -29,6 +33,10 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
       docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin nodejs \
     && curl -fsSL -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
     && echo "${YQ_SHA256}  /usr/local/bin/yq" | sha256sum -c - && chmod 0755 /usr/local/bin/yq \
+    && curl -fsSL -o /tmp/sc.tar.xz "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+    && echo "${SHELLCHECK_SHA256}  /tmp/sc.tar.xz" | sha256sum -c - \
+    && tar -C /tmp -xJf /tmp/sc.tar.xz && install -m 0755 "/tmp/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck \
+    && rm -rf /tmp/sc.tar.xz "/tmp/shellcheck-${SHELLCHECK_VERSION}" \
     && useradd -m -u 1001 -s /bin/bash runner && usermod -aG docker,systemd-journal runner \
     && echo 'runner ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/runner && chmod 0440 /etc/sudoers.d/runner \
     && systemctl enable docker containerd \
