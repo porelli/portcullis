@@ -391,7 +391,7 @@ def echo_on_worker_signed_in():
     # group_add, on the primary and on the worker alike (§13.7 parity).
     for iid in ("se0", "se1"):
         body = echo(page, iid)[1]
-        assert "DATAFILE=readable" in body, f"{iid}: the app can't read its data file: {body[-200:]}"
+        assert "DATAFILE=readable" in body, f"{iid}: the app can't read its data file (DATAFILE=unreadable: {'DATAFILE=unreadable' in body})"
     a, b = get("/api/instances/se0/signin"), get("/api/instances/se1/signin")
     assert {k: a.get(k) for k in ("template", "tier")} == {k: b.get(k) for k in ("template", "tier")}, f"tiers differ: {a} / {b}"
     ps = wexec("w1", "docker", "ps", "--filter", "label=com.docker.compose.project=portcullis-se1", "--format", "{{.Names}}").stdout
@@ -416,7 +416,8 @@ def no_portcullis_cookie_reaches_app():
     st, body, _ = echo(state["alice_page"], "se1")
     line = [ln for ln in body.splitlines() if ln.startswith("COOKIE=")][0]
     for bad in ("_oauth2_proxy", "__Host-portcullis_ext", "_oauth2_proxy_csrf"):
-        assert bad not in line, f"the app on w1 saw {bad}: {line[:200]}"
+        names = [c.split("=", 1)[0].strip() for c in line[len("COOKIE="):].split(";") if c.strip()]
+        assert bad not in line, f"the app on w1 saw {bad} (cookie names: {names})"  # never the values
 
 
 def parent_domain_set_cookie_stripped():
