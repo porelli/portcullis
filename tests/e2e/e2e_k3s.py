@@ -125,6 +125,57 @@ def sh(*argv: str) -> str:
     return subprocess.run(argv, check=True, capture_output=True, text=True).stdout
 
 
+def wait_for(what: str, fn, timeout: float, every: float = 5):
+    deadline, last = time.time() + timeout, None
+    while True:
+        try:
+            out = fn()
+            if out:
+                return out
+        except AssertionError as e:
+            last = e
+        if time.time() > deadline:
+            raise AssertionError(f"{what}: not within {timeout:.0f} s ({last})")
+        time.sleep(every)
+
+
+def usage_k3s() -> None:
+    """The Usage page on Kubernetes (contract §11.11, Task 18): CPU and
+    working set from metrics-server within 2 min, PIDs null, the core group
+    not measured; a storage measure of the instance sizes its PVC."""
+    def sampled():
+        v = hub_ok("GET", "/api/usage")
+        g = next((a for a in v.get("apps") or [] if a.get("instance") == ECHO), None)
+        assert g and g.get("containers"), f"no sampled group {ECHO}: {[a.get('instance') for a in v.get('apps') or []]}"
+        for c in g["containers"]:
+            sm = c.get("sample") or {}
+            assert isinstance(sm.get("cpu_cores"), (int, float)) and isinstance(sm.get("mem_bytes"), int), f"{c.get('service')}: {sm} ({c.get('error')})"
+            assert sm.get("pids") is None and sm.get("net_rx_bps") is None, f"{c.get('service')}: pids/net not null: {sm}"
+        return v, g
+    v, g = wait_for("the echo pods sampled from metrics-server", sampled, 120)
+    save("usage-overview.json", v)
+    core = v.get("core") or {}
+    assert core.get("status") == "not_measured" and core.get("why") == "not measured on Kubernetes yet", f"core {core}"
+    assert v.get("not_shown") == 0, f"not_shown {v.get('not_shown')}"
+    acc = e2e_ops.accepted(hub_ok("POST", "/api/usage/storage/measure", {"instance": ECHO}, want=202), op="usage_measure")
+    rec = e2e_ops.wait(hub_get, acc, 300)
+    save(f"op-usage_measure-{acc['op_id']}.json", rec)
+    e2e_ops.check_ok(acc, rec)
+    inst = hub_ok("GET", f"/api/usage/instances/{ECHO}")
+    save("usage-instance.json", inst)
+    items = (inst.get("storage") or {}).get("items") or []
+    vols = [i for i in items if i.get("kind") == "volume"]
+    assert vols and all(isinstance(i.get("alloc_bytes"), int) and i["alloc_bytes"] > 0 for i in vols), f"PVC items {vols} (items {items})"
+    layers = [i for i in items if i.get("kind") == "layer"]
+    assert layers and all(i.get("alloc_bytes") is None for i in layers), f"layers {layers}"
+    def no_helper():
+        left = json.loads(kubectl("-n", APPS, "get", "pods", "-l", "portcullis.io/helper", "-o", "json"))["items"]
+        assert not left, f"helper pods left: {[p['metadata']['name'] for p in left]}"
+        return True
+    wait_for("the usage helper pod removed", no_helper, 90)
+    print(f"    usage: {len(g['containers'])} containers sampled, {len(vols)} PVC(s) measured", flush=True)
+
+
 def main() -> int:
     def runtime():
         rt = hub_ok("GET", "/api/runtime")
@@ -158,6 +209,7 @@ def main() -> int:
                  "--resolve", f"{host}:443:198.51.100.1", f"https://{host}/")
         code, _, loc = out.partition(" ")
         assert code in ("302", "303", "307") and ("auth." + DOMAIN) in loc, f"{host}: {out}"
+        usage_k3s()
         rec = run_op("POST", f"/api/instances/{ECHO}/backups", {})
         archive = (rec.get("result") or {}).get("archive")
         assert archive, f"backup without an archive: {e2e_ops.describe(rec)}"
