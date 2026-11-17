@@ -252,7 +252,7 @@ setup)
       | .domains = [{name: "portcullis.local", dmarc_start: "reject", dmarc_floor: "reject", mail: "on", dnssec: "unsigned"}]
       | .accounts = [{username: "mailtest", uuid: $u, display_name: "Mail Test", addresses: ["mailtest@portcullis.local"], quota_bytes: 104857600}]
       | .aliases = [] | .lists = [] | .postmaster = ["mailtest"] | .local_networks = [] | .spam.allow = [] | .spam.block = []
-      | .relay = null | .confirm_mass_removal = null' \
+      | .relay = null | .confirm_mass_removal = false' \
     mailctl/internal/state/testdata/mailstate_v2.json > "$ST/doc.json"
   out="$(hubapi PUT /v1/state "$ST/doc.json")"; [ "$(tail -n1 <<<"$out")" = 202 ] || fail "PUT /v1/state: $out"
   for _ in $(seq 1 40); do
