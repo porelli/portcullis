@@ -285,10 +285,16 @@ def echo(page: Page, iid: str):
 
 
 def reach(page: Page, iid: str) -> bool:
+    """The instance answers alice through the primary (the last answer is
+    kept for the failure message: status, Location's path, body's start)."""
     try:
-        st, body, _ = echo(page, iid)
-        return st == 200 and f"HOST={iid}.{DOMAIN}" in body
-    except Exception:  # noqa: BLE001
+        r = page.request.get(f"https://{iid}.{DOMAIN}/cgi-bin/echo", max_redirects=0)
+        body = r.text()
+        loc = r.headers.get("location", "").split("?")[0]
+        state[f"last_reach_{iid}"] = f"{r.status} {loc} {redact(body[:120])!r}"
+        return r.status == 200 and f"HOST={iid}.{DOMAIN}" in body
+    except Exception as e:  # noqa: BLE001
+        state[f"last_reach_{iid}"] = f"{type(e).__name__}: {redact(str(e))[:200]}"
         return False
 
 
@@ -374,7 +380,11 @@ def echo_on_worker_signed_in():
         lldap_member("alice", f"users_{iid}")
         run_op("POST", "/api/templates/enable", {"id": iid}, timeout=900)
     page = state["alice_page"]
-    wait_for("se1 through the relay", lambda: reach(page, "se1"), 180)
+    try:
+        wait_for("se1 through the relay", lambda: reach(page, "se1"), 180)
+    except AssertionError as e:
+        reach(page, "se0")
+        raise AssertionError(f"{e}; se1's last answer: {state.get('last_reach_se1')}; se0's: {state.get('last_reach_se0')}") from None
     assert reach(page, "se0"), "se0 (on the primary) isn't reachable"
     # The data file (0640 group 10001) is readable by the app through its
     # group_add, on the primary and on the worker alike (§13.7 parity).
