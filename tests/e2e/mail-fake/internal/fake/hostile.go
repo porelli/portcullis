@@ -37,6 +37,11 @@ func hostileSet(d, host string) mailprovider.DNSSet {
 // honestSet is a set the Hub's shared rules accept for d: the MX on the
 // mail host, SPF mx, DMARC reject with reports on d, MTA-STS, TLS-RPT and
 // one DKIM key (selector "fake").
+// HonestSet is honest mode's set for domain d (mail host host): every
+// record one the shared DNS rules accept (domains/internal/dnsplan's
+// TestMailFakeHonestSets judges testdata/honest_sets.json).
+func HonestSet(d, host string) mailprovider.DNSSet { return honestSet(d, host) }
+
 func honestSet(d, host string) mailprovider.DNSSet {
 	return mailprovider.DNSSet{Domain: d, DKIM: "auto", Records: []mailprovider.Record{
 		{Name: d, Type: "MX", TTL: 3600, Value: "10 " + host + "."},

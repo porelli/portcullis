@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/portcullis/mail-fake/internal/fake"
+	"github.com/portcullis/mail-fake/internal/mailprovider"
 )
 
 const testSecret = "mail-fake-test-secret-0123456789abcdefgh"
@@ -189,5 +190,42 @@ func TestGateRefusesWithoutPresent(t *testing.T) {
 		return ""
 	}) != 1 {
 		t.Fatal("serve started past the gate")
+	}
+}
+
+// honestSetsFile is the honest mode's sets for the e2e domains, judged by
+// core's shared DNS rules in domains/internal/dnsplan (the 86 vectors'
+// ValidateMailSet): this test keeps the file equal to what the fake serves.
+const honestSetsFile = "testdata/honest_sets.json"
+
+type honestCase struct {
+	Domain       string              `json:"domain"`
+	MailHostname string              `json:"mail_hostname"`
+	Set          mailprovider.DNSSet `json:"set"`
+}
+
+func honestCases() []honestCase {
+	var out []honestCase
+	for _, d := range []string{"ci.example.org", "team-b.test", "example.org"} {
+		host := "mail.ci.example.org"
+		if d == "example.org" {
+			host = "mail.example.org"
+		}
+		out = append(out, honestCase{Domain: d, MailHostname: host, Set: fake.HonestSet(d, host)})
+	}
+	return out
+}
+
+func TestHonestSetsFileMatches(t *testing.T) {
+	want, _ := json.MarshalIndent(honestCases(), "", "  ")
+	want = append(want, '\n')
+	if os.Getenv("MAIL_FAKE_UPDATE") == "1" {
+		if err := os.WriteFile(honestSetsFile, want, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := os.ReadFile(honestSetsFile)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("%s differs from the honest sets (regenerate with MAIL_FAKE_UPDATE=1 go test ./...): %v", honestSetsFile, err)
 	}
 }

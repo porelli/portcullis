@@ -1,0 +1,140 @@
+[
+  {
+    "domain": "ci.example.org",
+    "mail_hostname": "mail.ci.example.org",
+    "set": {
+      "domain": "ci.example.org",
+      "records": [
+        {
+          "name": "ci.example.org",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.ci.example.org."
+        },
+        {
+          "name": "ci.example.org",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx -all"
+        },
+        {
+          "name": "_dmarc.ci.example.org",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; rua=mailto:dmarc-reports@ci.example.org"
+        },
+        {
+          "name": "_mta-sts.ci.example.org",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=STSv1; id=fake1"
+        },
+        {
+          "name": "_smtp._tls.ci.example.org",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=TLSRPTv1; rua=mailto:tls-reports@ci.example.org"
+        },
+        {
+          "name": "fake._domainkey.ci.example.org",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+        }
+      ],
+      "dkim": "auto"
+    }
+  },
+  {
+    "domain": "team-b.test",
+    "mail_hostname": "mail.ci.example.org",
+    "set": {
+      "domain": "team-b.test",
+      "records": [
+        {
+          "name": "team-b.test",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.ci.example.org."
+        },
+        {
+          "name": "team-b.test",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx -all"
+        },
+        {
+          "name": "_dmarc.team-b.test",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; rua=mailto:dmarc-reports@team-b.test"
+        },
+        {
+          "name": "_mta-sts.team-b.test",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=STSv1; id=fake1"
+        },
+        {
+          "name": "_smtp._tls.team-b.test",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=TLSRPTv1; rua=mailto:tls-reports@team-b.test"
+        },
+        {
+          "name": "fake._domainkey.team-b.test",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+        }
+      ],
+      "dkim": "auto"
+    }
+  },
+  {
+    "domain": "example.org",
+    "mail_hostname": "mail.example.org",
+    "set": {
+      "domain": "example.org",
+      "records": [
+        {
+          "name": "example.org",
+          "type": "MX",
+          "ttl": 3600,
+          "value": "10 mail.example.org."
+        },
+        {
+          "name": "example.org",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=spf1 mx -all"
+        },
+        {
+          "name": "_dmarc.example.org",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DMARC1; p=reject; rua=mailto:dmarc-reports@example.org"
+        },
+        {
+          "name": "_mta-sts.example.org",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=STSv1; id=fake1"
+        },
+        {
+          "name": "_smtp._tls.example.org",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=TLSRPTv1; rua=mailto:tls-reports@example.org"
+        },
+        {
+          "name": "fake._domainkey.example.org",
+          "type": "TXT",
+          "ttl": 3600,
+          "value": "v=DKIM1; k=ed25519; p=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo="
+        }
+      ],
+      "dkim": "auto"
+    }
+  }
+]

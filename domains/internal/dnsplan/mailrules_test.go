@@ -121,3 +121,37 @@ func TestMailSetValueShape(t *testing.T) {
 		t.Fatalf("a well-shaped set refused: %v", err)
 	}
 }
+
+// mail-fake's honest mode (core CI's provider fake, tests/e2e/mail-fake)
+// serves only sets the shared rules accept, for the main and an added
+// domain, with every DMARC floor and with or without the wildcard
+// (mail-fake's own test keeps the file equal to what it serves).
+func TestMailFakeHonestSets(t *testing.T) {
+	b, err := os.ReadFile("../../../tests/e2e/mail-fake/testdata/honest_sets.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []struct {
+		Domain       string `json:"domain"`
+		MailHostname string `json:"mail_hostname"`
+		Set          struct {
+			Records []MailRecord `json:"records"`
+		} `json:"set"`
+	}
+	if err := json.Unmarshal(b, &cases); err != nil || len(cases) == 0 {
+		t.Fatalf("honest sets: %v", err)
+	}
+	for _, c := range cases {
+		for _, floor := range []string{"none", "quarantine", "reject"} {
+			for _, wc := range []bool{false, true} {
+				rc := RuleContext{Domain: c.Domain, MailHostname: c.MailHostname, DMARCFloor: floor, Wildcard: wc}
+				if err := ValidateMailSet(rc, c.Set.Records); err != nil {
+					t.Errorf("%s (floor %s, wildcard %v): %v", c.Domain, floor, wc, err)
+				}
+			}
+		}
+		if err := ValidateMail(c.Domain, c.Set.Records); err != nil {
+			t.Errorf("%s: the structural check: %v", c.Domain, err)
+		}
+	}
+}
