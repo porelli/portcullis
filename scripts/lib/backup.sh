@@ -747,7 +747,7 @@ _restore_secrets() {
 # instance couldn't be restored from its archive → restore fails saying so
 # (the Hub owes a void either way: hub_secrets was emptied).
 _restore_mail_outcome() {
-  [ "${RESTORE_MAIL_FAILED:-false}" != true ] || fail "the mail provider couldn't be restored from its archive (its mailboxes are NOT back yet; the Hub holds it): fix the cause and run ./portcullis restore again, or lift the hold with ./portcullis mail restore-hold clear (the provider then starts on what its volumes hold)"
+  [ "${RESTORE_MAIL_FAILED:-false}" != true ] || fail "the mail provider couldn't be restored from its archive (its mailboxes are NOT back yet; the Hub holds it): fix the cause and run ./portcullis restore again, or lift the hold with ./portcullis mail restore-hold clear (that starts nothing: the provider stays stopped until its Mail tab's Retry, then runs on what its volumes hold)"
 }
 
 # backup_restore <dir> <assume-yes>

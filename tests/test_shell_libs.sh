@@ -5501,6 +5501,8 @@ rmp 'echo 2 > "$BM/hub-restore.busy"'; rc=$?
 expect_eq "restore: hub mail restore busy twice, then its op polled to ok" "$rc:$(grep -c 'hub mail restore' "$BM/calls"):$(grep -c 'hub mail op' "$BM/calls")" "0:3:1"
 rmp 'echo 1 > "$BM/hub-restore.rc"'; rc=$?
 expect_eq "restore: the Hub refusing the provider restore fails the restore at its end" "$rc:$(grep -c "couldn't be restored from its archive" "$BM/out"):$(grep -c 'after the provider restore' "$BM/calls")" "1:1:1"
+expect_eq "restore: the failure names restore-hold clear as starting nothing (Retry starts the provider; FH-H3c)" \
+  "$(grep -c "restore-hold clear (that starts nothing: the provider stays stopped until its Mail tab's Retry" "$BM/out"):$(grep -c 'then starts on what its volumes hold' "$BM/out")" "1:0"
 rmp 'printf "%s" "{\"op_id\":\"op7\",\"running\":false,\"ok\":false,\"error\":\"tar: bad\"}" > "$BM/hub-op"'; rc=$?
 expect_eq "restore: a failed restore op fails the restore at its end" "$rc:$(grep -c 'op op7 failed: tar: bad' "$BM/out")" "1:1"
 rmp 'printf "%s" "{\"op_id\":\"op7\",\"running\":true}" > "$BM/hub-op"; export MAIL_RESTORE_WAIT=0'; rc=$?
