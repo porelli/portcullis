@@ -52,7 +52,10 @@ runs:
         {
           echo "list=$sorted"
           echo "dir=$RUNNER_TEMP/ci-images/$NAME"
-          echo "key=ci-images-$NAME-$(sha256sum "$sorted" | cut -c1-16)"
+          # The runner image (ImageOS: ubuntu24, ubuntu26, …; unset on the
+          # self-hosted builder) is part of the key: a tarball saved by one
+          # image's Docker doesn't load reliably on another's.
+          echo "key=ci-images-$NAME-${ImageOS:-self-hosted}-$(sha256sum "$sorted" | cut -c1-16)"
         } >> "$GITHUB_OUTPUT"
 
     - name: Restore image cache

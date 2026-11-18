@@ -1169,7 +1169,7 @@ _kube_probe_route() {
 
 # The owner=core Middlewares of portcullis-edge (the chart's four and the
 # CLI's hub-proxy-secret): no Hub route or chain may name them.
-KUBE_EDGE_CORE_MIDDLEWARES="hub-proxy-secret portcullis-auth-console portal-path portal-vpn-path directory-redirect"
+KUBE_EDGE_CORE_MIDDLEWARES="hub-proxy-secret hub-cli-proxy-secret portcullis-auth-console portal-path portal-vpn-path directory-redirect"
 
 # The @file names apps may use (K15, contract §5): middlewares.yml's six,
 # the core middlewares and the three core services of traefik-dynamic.
@@ -1364,7 +1364,7 @@ kube_resolve_images() {
 
 # The secret variables the pods read (portcullis-env): the core secrets and
 # the DNS providers' credentials present in .env.
-KUBE_ENV_SECRETS="POSTGRES_PASSWORD KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD LLDAP_JWT_SECRET FORWARD_AUTH_CLIENT_SECRET FORWARD_AUTH_COOKIE_SECRET FORWARD_AUTH_REDIS_PASSWORD FORWARD_AUTH_EXT_REDIS_PASSWORD HUB_PROXY_SECRET CLOUDFLARE_API_TOKEN PORKBUN_API_KEY PORKBUN_SECRET_API_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_HOSTED_ZONE_ID DO_AUTH_TOKEN HETZNER_API_KEY HETZNER_API_TOKEN"
+KUBE_ENV_SECRETS="POSTGRES_PASSWORD KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD LLDAP_JWT_SECRET FORWARD_AUTH_CLIENT_SECRET FORWARD_AUTH_COOKIE_SECRET FORWARD_AUTH_REDIS_PASSWORD FORWARD_AUTH_EXT_REDIS_PASSWORD HUB_PROXY_SECRET HUB_CLI_PROXY_SECRET CLOUDFLARE_API_TOKEN PORKBUN_API_KEY PORKBUN_SECRET_API_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_HOSTED_ZONE_ID DO_AUTH_TOKEN HETZNER_API_KEY HETZNER_API_TOKEN"
 
 # secrets/ files never synced: the CLI's own (kube/), the Vault root token
 # (nothing in the cluster mounts it),
@@ -1536,6 +1536,12 @@ kube_sync_secrets() {
       metadata: {name: "hub-proxy-secret", namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/owner": "core"}},
       spec: {headers: {customRequestHeaders: {"X-Portcullis-Proxy-Secret": env.HUB_PROXY_SECRET}}}}' > "$want" \
     && _kube_put "$want" || { rm -rf "$_K_STAGE"; fail "could not apply the hub-proxy-secret Middleware"; }
+  # The CLI router's own secret (people-cli, contract §18.3).
+  [ -n "${HUB_CLI_PROXY_SECRET:-}" ] || { rm -rf "$_K_STAGE"; fail "HUB_CLI_PROXY_SECRET is not set in .env"; }
+  NS="$KUBE_EDGE_NS" jq -n '{apiVersion: "traefik.io/v1alpha1", kind: "Middleware",
+      metadata: {name: "hub-cli-proxy-secret", namespace: env.NS, labels: {"app.kubernetes.io/managed-by": "portcullis", "portcullis.io/owner": "core"}},
+      spec: {headers: {customRequestHeaders: {"X-Portcullis-Proxy-Secret": env.HUB_CLI_PROXY_SECRET}}}}' > "$want" \
+    && _kube_put "$want" || { rm -rf "$_K_STAGE"; fail "could not apply the hub-cli-proxy-secret Middleware"; }
   rm -rf "$_K_STAGE"
 }
 

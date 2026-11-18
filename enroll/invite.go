@@ -159,6 +159,10 @@ type inviteService struct {
 	issueYubiKey func(ctx context.Context, user, csrPEM string) (*yubiKeyCertResult, error)
 	renewYubiKey func(ctx context.Context, user, presentedPEM, csrPEM string) (*yubiKeyCertResult, error)
 	revoke       func(ctx context.Context, user, serial string) error
+	// SSH (ssh.go, contract §18.8): Vault's SSH mounts (*Config) and the
+	// LLDAP lookup a user certificate needs; nil = 503.
+	ssh           sshBackend
+	sshUserExists func(string) error
 	// Node certificates (nodes.go, contract §17); nil = 503.
 	signNode   func(ctx context.Context, role, cn, csrPEM string) (*nodeCertResult, error)
 	revokeNode func(ctx context.Context, serial string) error
@@ -831,6 +835,7 @@ func (s *inviteService) apiHandler(local bool) http.Handler {
 		m.HandleFunc("POST /internal/yubikey-certificates", s.handleYubiKeyIssue)
 		m.HandleFunc("POST /internal/yubikey-certificates/renew", s.handleYubiKeyRenew)
 		m.HandleFunc("POST /internal/certificates/revoke", s.handleRevoke)
+		s.registerSSH(m)
 		m.HandleFunc("POST /internal/nodes/sign", s.handleNodeSign)
 		m.HandleFunc("POST /internal/nodes/revoke", s.handleNodeRevoke)
 	}

@@ -158,6 +158,8 @@ jobs:
         run: shellcheck -S warning portcullis scripts/lib/*.sh tests/*.sh tests/e2e/*.sh vault/entrypoint.sh .github/automerge/*.sh .github/ci/*.sh .github/ci/local/*.sh .github/ci/local/runner/*.sh
       - name: ci.yml stays under GitHub's workflow size limit (lint at 450,000 bytes; GitHub refuses 500 KB)
         run: tests/lint_ci_size.sh
+      - name: No compiled program is tracked (tests/lint_no_binaries.sh)
+        run: bash tests/lint_no_binaries.sh
       - name: No Actions cache write from the builder (runner=builder jobs; tests/lint_builder_cache.sh)
         run: bash tests/lint_builder_cache.sh .github/workflows/ci.yml
       - name: Dependabot auto-merge tests (fake gh + fixtures)
@@ -304,6 +306,32 @@ jobs:
             fi
           done
           echo "vpn.json and link.json vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
+      # enroll/testdata/ssh_vectors.json drives enroll's SSH checks
+      # (contract §18): a byte copy of the Hub's internal/cliapi/testdata/
+      # vectors.json, same-named Hub branch when it exists, else main.
+      - name: Shared SSH vectors match the Hub
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+        run: |
+          own=enroll/testdata/ssh_vectors.json
+          url="https://github.com/porelli/portcullis-hub"
+          heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }
+          ref=main
+          if [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] && [ "$REF" != main ] \
+            && awk -v r="refs/heads/$REF" '$2 == r { f = 1 } END { exit !f }' <<<"$heads"; then
+            ref="$REF"
+          fi
+          sha=$(awk -v r="refs/heads/$ref" '$2 == r { print $1 }' <<<"$heads")
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::portcullis-hub has no single commit for refs/heads/$ref"; exit 1; }
+          echo "portcullis-hub (SSH vectors): $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
+          hub="$RUNNER_TEMP/hub_ssh_vectors.json"
+          code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/internal/cliapi/testdata/vectors.json")
+          [ "$code" = 200 ] || { echo "::error::fetching the Hub's SSH vectors from $ref ($sha): HTTP $code"; exit 1; }
+          if ! cmp "$own" "$hub"; then
+            echo "::error::$own differs from portcullis-hub $ref ($sha) internal/cliapi/testdata/vectors.json: copy it byte for byte"
+            exit 1
+          fi
+          echo "SSH vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
       # e2e_filesharing's run_op (busy-409 retry, scrubbing) on a fake Hub:
       # stdlib only, no stack.
       - name: e2e helper unit tests (e2e_fsops)
@@ -433,6 +461,30 @@ jobs:
           go mod verify
           go vet ./...
           go test ./...
+      # Spike S1 / S4 for good (contract §18.7): enroll's SSH paths against a
+      # real Vault (the compose pin, dev mode, throwaway) with the real
+      # vault/policies/enroll.hcl — every refusal (no role above 12 h, no
+      # host certificates from a user role, cert_type / critical_options),
+      # the four key types, the host sign's cert_type, the CA checks.
+      - name: enroll SSH against a real Vault (TestLiveSSHVault)
+        working-directory: enroll
+        timeout-minutes: 5
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          img=$(grep -oE 'docker\.io/hashicorp/vault:[^ ]+@sha256:[0-9a-f]{64}' ../docker-compose.yml | head -1)
+          [ -n "$img" ] || { echo "::error::no pinned Vault image in docker-compose.yml"; exit 1; }
+          VAULT_DEV_ROOT_TOKEN_ID=$(openssl rand -hex 16)
+          echo "::add-mask::$VAULT_DEV_ROOT_TOKEN_ID"
+          export VAULT_DEV_ROOT_TOKEN_ID
+          docker run -d --rm --name ssh-live-vault -p 127.0.0.1:18200:8200 --cap-add IPC_LOCK \
+            -e VAULT_DEV_ROOT_TOKEN_ID -e SKIP_SETCAP=1 "$img" server -dev >/dev/null
+          trap 'docker rm -f ssh-live-vault >/dev/null 2>&1' EXIT
+          for _ in $(seq 60); do curl -fsS http://127.0.0.1:18200/v1/sys/health >/dev/null 2>&1 && break; sleep 1; done
+          PORTCULLIS_VAULT_LIVE_ADDR=http://127.0.0.1:18200 PORTCULLIS_VAULT_LIVE_TOKEN="$VAULT_DEV_ROOT_TOKEN_ID" \
+            go test -count=1 -v -run 'TestLiveSSHVault' . 2>&1 | tee "$RUNNER_TEMP/ssh-live.log"
+          test "${PIPESTATUS[0]}" = 0
+          grep -q -- '--- PASS: TestLiveSSHVault' "$RUNNER_TEMP/ssh-live.log" || { echo "::error::TestLiveSSHVault didn't run"; exit 1; }
       - name: domains unit tests (in-process Pebble, fake libdns provider + DNS server)
         working-directory: domains
         run: |
@@ -901,6 +953,23 @@ jobs:
           allowed write pki_file/revoke serial_number=00:00:00:00
           allowed read -format=json pki_int/crl/rotate
           allowed read -format=json pki_file/crl/rotate
+          # SSH (contract §18.7): pki setup's ssh_setup made both mounts; the
+          # policy reads the CAs and checks, never a role above 12 h, a host
+          # role, a CA, or cert_type / critical_options on a user sign.
+          allowed read ssh_user/config/ca
+          allowed read ssh_host/config/ca
+          allowed read sys/mounts/ssh_user/tune
+          allowed read sys/mounts/ssh_host/tune
+          allowed read ssh_host/roles/host
+          allowed list ssh_user/roles
+          denied write ssh_user/roles/hg-ci key_type=ca max_ttl=86400
+          denied write ssh_user/roles/hg-ci key_type=ca allow_host_certificates=true
+          denied write ssh_user/roles/ci key_type=ca
+          denied write ssh_host/roles/host key_type=ca allow_user_certificates=true
+          denied write ssh_user/config/ca generate_signing_key=true
+          denied write ssh_user/sign/hg-ci public_key=x cert_type=host
+          denied write ssh_user/sign/hg-ci public_key=x critical_options=force-command=sh
+          denied write ssh_host/sign/host public_key=x cert_type=user
           denied write -f pki/root/generate/internal common_name=x
           denied write pki_int/issue/server-cert common_name=x.portcullis.local
           denied write pki_file/issue/browser-cert common_name=x
@@ -1960,7 +2029,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
@@ -2091,6 +2161,11 @@ jobs:
       # pip wheels + Playwright's browsers, keyed on the pinned
       # tests/e2e/requirements.txt (the browser build is tied to the
       # Playwright version).
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         id: pw-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -2098,7 +2173,7 @@ jobs:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust the CA
         timeout-minutes: 10
@@ -2254,7 +2329,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-instances,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-instances ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-instances,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-instances ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
@@ -2428,13 +2504,18 @@ jobs:
       - name: Extra domain, instances, users, setup links (through the Hub's API)
         run: bash .github/ci/e2e-instances-extra-domain-instances-users-setup.sh
 
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA and Pebble's root
         timeout-minutes: 10
@@ -2599,7 +2680,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-signin,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-signin ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-signin,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-signin ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     # 40 (part 3): the impersonation cases add the 2 min 10 s expiry wait.
     timeout-minutes: 40
     env:
@@ -2810,13 +2892,18 @@ jobs:
       - name: Users, groups, templates, instances, certificates, a password (through the Hub's API)
         run: bash .github/ci/e2e-signin-users-groups-templates-instances-certificates.sh
 
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt', 'tests/e2e/requirements-totp.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt', 'tests/e2e/requirements-totp.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
         timeout-minutes: 10
@@ -2926,7 +3013,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-settings,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-settings ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-settings,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-settings ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     timeout-minutes: 30
     env:
       E2E_DOMAIN: portcullis.local
@@ -3224,13 +3312,18 @@ jobs:
             echo "$var=$url" >> "$GITHUB_ENV"
           done
 
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
         timeout-minutes: 10
@@ -3836,13 +3929,18 @@ jobs:
           echo "PASS: the Hub loaded samba and timemachine"
           echo "127.0.0.1 portcullis.local auth.portcullis.local enroll.portcullis.local hub.portcullis.local people.portcullis.local" | sudo tee -a /etc/hosts
 
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
         timeout-minutes: 10
@@ -3924,7 +4022,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-mail,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-mail ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-mail,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-mail ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     timeout-minutes: 60
     env:
       E2E_DOMAIN: ci.example.org
@@ -4115,13 +4214,18 @@ jobs:
         timeout-minutes: 10
         run: bash .github/ci/e2e-mail-remote.sh
 
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
         timeout-minutes: 10
@@ -4201,7 +4305,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ai,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ai ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ai,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ai ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     timeout-minutes: 20
     env:
       E2E_DOMAIN: portcullis.local
@@ -4453,13 +4558,18 @@ jobs:
             echo "$var=$url" >> "$GITHUB_ENV"
           done
 
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
         timeout-minutes: 10
@@ -5297,6 +5407,168 @@ jobs:
           path: e2e-artifacts/
           retention-days: 7
 
+  # SSH access end to end (contract §18): the whole stack with the Hub under
+  # test (same-named Hub branch), two SSH servers from tests/e2e/sshd on
+  # portcullis-proxy (web-1 enrolled, web-2 by host trust), the Portcullis
+  # CLI out of the Hub image on the runner (`login --no-browser`, Playwright
+  # opens the address with the virtual security key) and the runner's
+  # ssh-agent / ssh. tests/e2e/e2e_ssh.py documents the cases. Codes, keys
+  # and certificates stay in a 0700 temp dir; the artifacts are logs only,
+  # scanned for secrets before upload.
+  e2e-ssh:
+    needs: jobs-input
+    # Runs unless a workflow_dispatch named other jobs (input `jobs`: `all`, or
+    # names separated by commas and/or spaces; exact names, so `e2e` is not `e2e-ai`).
+    if: >-
+      github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
+      || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ssh,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-ssh ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ssh,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-ssh ')
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    env:
+      E2E_DOMAIN: portcullis.local
+      E2E_ARTIFACTS: e2e-artifacts
+      ACME_STAGING: "true"
+      ALPINE: docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Generate .env and the CI override (the trust list fixture, core hosts on Traefik for the SSH servers)
+        run: |
+          ./portcullis init --env-only --runtime docker --non-interactive --domain portcullis.local \
+            --email ci@portcullis.local --dns-provider none
+          for v in KEYCLOAK_ADMIN KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD; do
+            val="$(grep "^$v=" .env | cut -d= -f2-)"
+            [ "$v" = KEYCLOAK_ADMIN ] || echo "::add-mask::$val"
+            echo "$v=$val" >> "$GITHUB_ENV"
+          done
+          cat > docker-compose.ci.yml <<'YML'
+          services:
+            hub:
+              environment:
+                HUB_DEV: "1"
+                HUB_SIGNIN_EXTRA_AUTHENTICATORS: /run/portcullis/signin/extra-authenticators.json
+              volumes:
+                - ./tests/e2e/fixtures/virtual-authenticators.json:/run/portcullis/signin/extra-authenticators.json:ro
+            keycloak:
+              ports:
+                - "127.0.0.1:8080:8080"
+                - "127.0.0.1:9000:9000"
+            lldap:
+              ports:
+                - "127.0.0.1:17170:17170"
+            # The SSH servers (on portcullis-proxy) reach people.<d> through
+            # Traefik, as hosts on the internet would.
+            traefik:
+              networks:
+                portcullis-proxy:
+                  ipv4_address: ${PORTCULLIS_TRAEFIK_IP:-172.31.250.2}
+                  aliases: [portcullis.local, auth.portcullis.local, people.portcullis.local, hub.portcullis.local]
+          YML
+          sed -i 's/^          //' docker-compose.ci.yml
+          docker compose config -q
+          for h in portcullis.local auth.portcullis.local people.portcullis.local hub.portcullis.local enroll.portcullis.local; do
+            echo "127.0.0.1 $h" | sudo tee -a /etc/hosts >/dev/null
+          done
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build enrollment UI (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: enroll
+          tags: portcullis-enroll
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=enroll
+          cache-to: ""
+      - name: Build group-gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: group-gate
+          tags: portcullis-group-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=group-gate
+          cache-to: ""
+      - name: Build the domains service (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: domains
+          tags: portcullis-domains
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=domains
+          cache-to: ""
+      - name: Build the MCP gate (buildx, GitHub Actions layer cache)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: mcp-gate
+          tags: portcullis-mcp-gate
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=mcp-gate
+          cache-to: ""
+      - name: Hub image (same-named Hub branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/hub-image
+      - name: Keycloak image (same-named portcullis-keycloak branch → built here, else the published one)
+        timeout-minutes: 20
+        uses: ./.github/actions/keycloak-image
+
+      - name: Start the whole stack, the people and the two SSH servers
+        timeout-minutes: 25
+        run: bash .github/ci/e2e-ssh-stack.sh
+
+      - name: Install Playwright (pinned) and trust core's CA
+        timeout-minutes: 10
+        run: |
+          python3 -m venv /tmp/e2e-venv
+          /tmp/e2e-venv/bin/pip install --quiet -r tests/e2e/requirements.txt
+          /tmp/e2e-venv/bin/pip install --quiet --require-hashes --only-binary=:all: -r group-gate/requirements.txt
+          sudo /tmp/e2e-venv/bin/playwright install-deps chromium
+          /tmp/e2e-venv/bin/playwright install chromium
+          sudo apt-get install -y -qq libnss3-tools >/dev/null
+          mkdir -p "$HOME/.pki/nssdb"
+          certutil -d "sql:$HOME/.pki/nssdb" -N --empty-password 2>/dev/null || true
+          certutil -d "sql:$HOME/.pki/nssdb" -A -t "C,," -n portcullis-root -i certs/root-ca.crt
+
+      - name: Run the SSH scenarios (login, managed and unmanaged hosts, sudo, shared accounts, replay, key proof, the CLI client, revocation, Hub down, break-glass, no secrets)
+        timeout-minutes: 25
+        env:
+          E2E_FIXTURE: tests/e2e/fixtures/virtual-authenticators.json
+          E2E_PORTCULLIS: ${{ runner.temp }}/portcullis
+        run: |
+          E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
+          export E2E_HUB_SECRET
+          NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_ssh.py
+
+      - name: Collect logs (secret-scanned)
+        if: failure()
+        run: bash .github/ci/e2e-ssh-artifacts.sh
+
+      - name: Upload logs
+        timeout-minutes: 10
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-ssh-artifacts
+          path: e2e-artifacts/
+          retention-days: 7
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f e2e-web-1 e2e-web-2 >/dev/null 2>&1 || true
+          docker compose down -v
+
   # VPN-only access end to end (contract §4, §5, §16): the whole stack with
   # the VPN service (profile wg, `./portcullis vpn init`), the Hub (same-named
   # Hub branch) and one local template source = the CI template
@@ -5315,7 +5587,8 @@ jobs:
     if: >-
       github.event_name != 'workflow_dispatch' || inputs.jobs == '' || inputs.jobs == 'all'
       || contains(format(' ,{0}, ', inputs.jobs), ',e2e-vpn,') || contains(format(' ,{0}, ', inputs.jobs), ',e2e-vpn ') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-vpn,') || contains(format(' ,{0}, ', inputs.jobs), ' e2e-vpn ')
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-latest' }}
+    # Playwright's install-deps resolves its packages on 24.04 (26.04 lacks its font packages).
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'builder' && fromJSON('["self-hosted","linux","x64","pc-builder"]') || 'ubuntu-24.04' }}
     timeout-minutes: 45
     env:
       E2E_DOMAIN: portcullis.local
@@ -5525,13 +5798,18 @@ jobs:
         timeout-minutes: 15
         run: bash .github/ci/e2e-vpn-instances-users-headscale-provider-setup.sh
 
+      - name: The runner image (Playwright cache key)
+        id: image-os
+        # ImageOS (ubuntu24, ubuntu26, …; unset on the builder): browser builds
+        # are per distro, so 24.04 and 26.04 jobs never share one.
+        run: echo "os=${ImageOS:-self-hosted}" >> "$GITHUB_OUTPUT"
       - name: Restore the pip / Playwright browser cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cache/pip
             ~/.cache/ms-playwright
-          key: e2e-playwright-${{ runner.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
+          key: e2e-playwright-${{ runner.os }}-${{ steps.image-os.outputs.os }}-${{ hashFiles('tests/e2e/requirements.txt') }}
 
       - name: Install Playwright (pinned) and trust core's CA
         timeout-minutes: 10

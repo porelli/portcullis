@@ -1,0 +1,176 @@
+{
+  "comment": "Shared SSH vectors (contract §18). Byte-copied to core enroll/testdata/ssh_vectors.json; core's unit-tests compares the two.",
+  "principals": [
+    {"in": "u:alice@web", "ok": true, "kind": "u", "account": "alice", "host_group": "web"},
+    {"in": "s:deploy@web", "ok": true, "kind": "s", "account": "deploy", "host_group": "web"},
+    {"in": "s:_svc@all", "ok": true, "kind": "s", "account": "_svc", "host_group": "all"},
+    {"in": "u:a.b-c_d@lab-2", "ok": true, "kind": "u", "account": "a.b-c_d", "host_group": "lab-2"},
+    {"in": "u:a@portcullis-servers", "ok": true, "kind": "u", "account": "a", "host_group": "portcullis-servers"},
+    {"in": "u:abcdefghijklmnopqrstuvwxyzabcdef@web", "ok": true, "kind": "u", "account": "abcdefghijklmnopqrstuvwxyzabcdef", "host_group": "web"},
+    {"in": "up:alice@web", "ok": true, "kind": "u", "account": "alice", "host_group": "web"},
+    {"in": "sp:deploy@web", "ok": true, "kind": "s", "account": "deploy", "host_group": "web"},
+    {"in": "upp:alice@web", "ok": false},
+    {"in": "pu:alice@web", "ok": false},
+    {"in": "us:alice@web", "ok": false},
+    {"in": "p:alice@web", "ok": false},
+    {"in": "alice@web", "ok": false},
+    {"in": "x:alice@web", "ok": false},
+    {"in": "U:alice@web", "ok": false},
+    {"in": "u:s:alice@web", "ok": false},
+    {"in": "u:abcdefghijklmnopqrstuvwxyzabcdefg@web", "ok": false},
+    {"in": "u:Alice@web", "ok": false},
+    {"in": "u:alice@Web", "ok": false},
+    {"in": "u:1x@web", "ok": false},
+    {"in": "u:@web", "ok": false},
+    {"in": "u:alice@", "ok": false},
+    {"in": "u:alice@1web", "ok": false},
+    {"in": "u:alice@web@x", "ok": false},
+    {"in": "u:alice", "ok": false},
+    {"in": "u:alice@abcdefghijklmnopqrstuvwxyzabcdef", "ok": false},
+    {"in": "u:ali ce@web", "ok": false},
+    {"in": "u:alice@web\n", "ok": false}
+  ],
+  "host_group_ids": [
+    {"in": "web", "ok": true, "reserved": false},
+    {"in": "all", "ok": true, "reserved": false},
+    {"in": "lab-2", "ok": true, "reserved": false},
+    {"in": "portcullis-servers", "ok": true, "reserved": true},
+    {"in": "portcullis-x", "ok": true, "reserved": true},
+    {"in": "abcdefghijklmnopqrstuvwxyzabcde", "ok": true, "reserved": false},
+    {"in": "abcdefghijklmnopqrstuvwxyzabcdef", "ok": false},
+    {"in": "Web", "ok": false},
+    {"in": "1web", "ok": false},
+    {"in": "-web", "ok": false},
+    {"in": "we_b", "ok": false},
+    {"in": "", "ok": false}
+  ],
+  "usernames": [
+    {"in": "alice", "ok": true},
+    {"in": "1alice", "ok": true},
+    {"in": "a.b_c-d", "ok": true},
+    {"in": "Alice", "ok": false},
+    {"in": "_alice", "ok": false},
+    {"in": "", "ok": false},
+    {"in": "a@b", "ok": false}
+  ],
+  "key_ids": [
+    {"in": "pc:alice:web:0123456789abcdef", "ok": true, "user": "alice", "host_group": "web", "req": "0123456789abcdef"},
+    {"in": "pc:1alice:lab-2:ffffffffffffffff", "ok": true, "user": "1alice", "host_group": "lab-2", "req": "ffffffffffffffff"},
+    {"in": "pc:alice:web:0123456789abcde", "ok": false},
+    {"in": "pc:alice:web:0123456789ABCDEF", "ok": false},
+    {"in": "pc:alice:web:0123456789abcdef0", "ok": false},
+    {"in": "pc:Alice:web:0123456789abcdef", "ok": false},
+    {"in": "pc:alice:Web:0123456789abcdef", "ok": false},
+    {"in": "px:alice:web:0123456789abcdef", "ok": false},
+    {"in": "pc:alice:web", "ok": false},
+    {"in": "pc:alice:web:0123456789abcdef:x", "ok": false},
+    {"in": "pc-breakglass:outage 2026-11-15", "ok": false}
+  ],
+  "extensions": [
+    {"port_forwarding": false, "agent_forwarding": false, "value": "permit-pty"},
+    {"port_forwarding": true, "agent_forwarding": false, "value": "permit-pty,permit-port-forwarding"},
+    {"port_forwarding": false, "agent_forwarding": true, "value": "permit-pty,permit-agent-forwarding"},
+    {"port_forwarding": true, "agent_forwarding": true, "value": "permit-pty,permit-port-forwarding,permit-agent-forwarding"}
+  ],
+  "role_ttls": [
+    {"in": 1, "out": 3600, "ok": true},
+    {"in": 3600, "out": 3600, "ok": true},
+    {"in": 3601, "out": 7200, "ok": true},
+    {"in": 28800, "out": 28800, "ok": true},
+    {"in": 43200, "out": 43200, "ok": true},
+    {"in": 43201, "out": 46800, "ok": false},
+    {"in": 86400, "out": 86400, "ok": false},
+    {"in": 0, "out": 0, "ok": false}
+  ],
+  "key_proof_messages": [
+    {
+      "domain": "example.com",
+      "nonce": "n-0123456789",
+      "code": "SplxlOBeZQQYbYS6WxSbIA",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
+      "message": "{\"domain\":\"example.com\",\"nonce\":\"n-0123456789\",\"code_sha256\":\"a35b81a7d7927b70ec99270dd2362b88580a28574af812f2c02f56469579186f\",\"public_key\":\"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\"}"
+    },
+    {
+      "domain": "example.com",
+      "nonce": "q\"<&>",
+      "code": "ab/c+d=e&<x>",
+      "public_key": "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=",
+      "message": "{\"domain\":\"example.com\",\"nonce\":\"q\\\"\\u003c\\u0026\\u003e\",\"code_sha256\":\"795e7f4c5c6b1b348b16c89317dd48772735e1c301b74bb65e253f4ea7a61b92\",\"public_key\":\"ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=\"}"
+    }
+  ],
+  "enrol_messages": [
+    {"domain": "example.com", "host_id": "web-1", "challenge": "Zm9vYmFy", "message": "{\"domain\":\"example.com\",\"host_id\":\"web-1\",\"challenge\":\"Zm9vYmFy\"}"}
+  ],
+  "host_request_messages": [
+    {"host_id": "web-1", "method": "GET", "path": "/api/cli/v1/hosts/bundle", "query": "since=41", "time": "2026-11-15T09:00:00Z", "nonce": "AAECAwQFBgcICQoLDA0ODw", "body": "",
+     "message": "{\"host_id\":\"web-1\",\"method\":\"GET\",\"path\":\"/api/cli/v1/hosts/bundle\",\"query\":\"since=41\",\"time\":\"2026-11-15T09:00:00Z\",\"nonce\":\"AAECAwQFBgcICQoLDA0ODw\",\"body_sha256\":\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}"}
+  ],
+  "roles": [
+    {
+      "name": "example web (spec §9.2)",
+      "host_group": "web",
+      "spec": {"principals": ["s:deploy@web", "u:alice@web", "u:bob@web"], "extensions": "permit-pty", "source_address": [], "max_ttl_s": 28800},
+      "body": "{\"principals\":[\"s:deploy@web\",\"u:alice@web\",\"u:bob@web\"],\"extensions\":\"permit-pty\",\"source_address\":[],\"max_ttl_s\":28800}",
+      "vault": {
+        "key_type": "ca", "allow_user_certificates": "true", "allow_host_certificates": "false", "allow_user_key_ids": "true",
+        "allowed_users": "s:deploy@web,u:alice@web,u:bob@web", "allowed_extensions": "permit-pty", "default_extensions": {},
+        "allowed_critical_options": "", "default_critical_options": {},
+        "allowed_user_key_lengths": {"ssh-ed25519": [0], "ecdsa-sha2-nistp256": [256], "sk-ssh-ed25519@openssh.com": [0], "sk-ecdsa-sha2-nistp256@openssh.com": [256]},
+        "ttl": "28800", "max_ttl": "28800"
+      }
+    },
+    {
+      "name": "example all, sudo grant, VPN source address",
+      "host_group": "all",
+      "spec": {"principals": ["u:alice@all"], "extensions": "permit-pty,permit-port-forwarding", "source_address": ["192.0.2.0/24", "198.51.100.0/24"], "max_ttl_s": 14400},
+      "body": "{\"principals\":[\"u:alice@all\"],\"extensions\":\"permit-pty,permit-port-forwarding\",\"source_address\":[\"192.0.2.0/24\",\"198.51.100.0/24\"],\"max_ttl_s\":14400}",
+      "vault": {
+        "key_type": "ca", "allow_user_certificates": "true", "allow_host_certificates": "false", "allow_user_key_ids": "true",
+        "allowed_users": "u:alice@all", "allowed_extensions": "permit-pty,permit-port-forwarding", "default_extensions": {},
+        "allowed_critical_options": "source-address", "default_critical_options": {"source-address": "192.0.2.0/24,198.51.100.0/24"},
+        "allowed_user_key_lengths": {"ssh-ed25519": [0], "ecdsa-sha2-nistp256": [256], "sk-ssh-ed25519@openssh.com": [0], "sk-ecdsa-sha2-nistp256@openssh.com": [256]},
+        "ttl": "14400", "max_ttl": "14400"
+      }
+    }
+  ],
+  "host_patterns": [
+    {"in": "web-1.example.com", "pattern": true, "name": true},
+    {"in": "WEB-1.Example.com", "pattern": true, "name": true},
+    {"in": "192.0.2.11", "pattern": true, "name": true},
+    {"in": "2001:db8::11", "pattern": true, "name": true},
+    {"in": "*.lab.example.com", "pattern": true, "name": false},
+    {"in": "web-?.example.com", "pattern": true, "name": false},
+    {"in": "!bastion.example.com", "pattern": true, "name": false},
+    {"in": "fe80::1%eth0", "pattern": false, "name": false},
+    {"in": "web-1.example.com,evil", "pattern": false, "name": false},
+    {"in": "web-1.example.com IdentityFile /tmp/x", "pattern": false, "name": false},
+    {"in": "web-1.example.com\nProxyCommand x", "pattern": false, "name": false},
+    {"in": "\"web\"", "pattern": false, "name": false},
+    {"in": "web\t1", "pattern": false, "name": false},
+    {"in": "-web.example.com", "pattern": false, "name": false},
+    {"in": "web..example.com", "pattern": false, "name": false},
+    {"in": "!!web", "pattern": false, "name": false},
+    {"in": "*", "pattern": false, "name": false},
+    {"in": "!*", "pattern": false, "name": false},
+    {"in": "*.*", "pattern": false, "name": false},
+    {"in": "*.org", "pattern": false, "name": false},
+    {"in": "*.co.uk", "pattern": false, "name": false},
+    {"in": "*.lab", "pattern": false, "name": false},
+    {"in": "web-?.org", "pattern": false, "name": false},
+    {"in": "*.example.*", "pattern": false, "name": false},
+    {"in": "*.example.org", "pattern": true, "name": false},
+    {"in": "bastion", "pattern": true, "name": true},
+    {"in": "", "pattern": false, "name": false}
+  ],
+  "key_types": [
+    {"type": "ssh-ed25519", "accepted": true},
+    {"type": "ecdsa-sha2-nistp256", "accepted": true},
+    {"type": "sk-ssh-ed25519@openssh.com", "accepted": true, "sk": true},
+    {"type": "sk-ecdsa-sha2-nistp256@openssh.com", "accepted": true, "sk": true},
+    {"type": "ssh-rsa", "accepted": false},
+    {"type": "ssh-dss", "accepted": false},
+    {"type": "ecdsa-sha2-nistp384", "accepted": false},
+    {"type": "ecdsa-sha2-nistp521", "accepted": false},
+    {"type": "ssh-ed25519-cert-v01@openssh.com", "accepted": false}
+  ]
+}

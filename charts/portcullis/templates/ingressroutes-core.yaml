@@ -36,6 +36,7 @@ core Service's cluster DNS name. k8s_parity.py compares these with compose. */ -
   (dict "name" "people-vpn" "ep" "vpnsecure" "rule" $sub.people "mw" $peopleChainVPN "svc" "hub" "port" 8889)
   (dict "name" "people-vpn-enrol" "ep" $ep.web.enrol "rule" (printf "%s && PathPrefix(`/vpn/`)" $sub.people) "prio" 190 "mw" $peopleChain "svc" "hub" "port" 8889)
   (dict "name" "people-vpn-enrol-vpn" "ep" "vpnsecure" "rule" (printf "%s && PathPrefix(`/vpn/`)" $sub.people) "prio" 190 "mw" $peopleChainVPN "svc" "hub" "port" 8889)
+  (dict "name" "people-cli" "ep" $ep.ep.enrol "rule" (printf "%s && PathPrefix(`/api/cli/v1/`)" $sub.people) "prio" 200 "mw" (list "rate-limit-auth@file" "strip-identity@file" "security-headers@file" "hub-cli-proxy-secret") "svc" "hub" "port" 8891)
   (dict "name" "enroll-invite" "ep" $ep.ep.enrol "rule" (printf "%s && PathPrefix(`/invite/`)" $sub.enroll) "prio" 110 "mw" (list "rate-limit-auth@file" "client-headers@file" "security-headers@file") "svc" "enroll" "port" 8443)
   (dict "name" "mcp" "ep" $ep.ep.admin "rule" $sub.mcp "mw" (list "rate-limit@file" "security-headers@file") "svc" "mcp-gate" "port" 8080)
   (dict "name" "hub-mcp" "ep" $ep.ep.admin "rule" (printf "%s && %s" $sub.hub $mcpPaths) "prio" 200 "mw" (list "rate-limit@file" "security-headers@file") "svc" "mcp-gate" "port" 8080)
