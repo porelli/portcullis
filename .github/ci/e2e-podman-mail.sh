@@ -197,15 +197,26 @@ echo "PASS: the doctor names mail_client_ip_rewritten"
 # day) from one container, then a delivery from another still works
 # (every client is the gateway under rootless Podman, so a ban would lock
 # everyone out); Stalwart's own ban events in its log are the second signal.
-podman run --rm --entrypoint sh "$CURL_IMG" -c '
-  n=0; i=0
-  while [ "$i" -lt 110 ]; do
-    i=$((i + 1))
-    curl -s --max-time 10 --ssl-reqd -k -u "nobody@'"$D"':wrong-$i" "smtp://host.containers.internal:587/relay-test.example" \
-      --mail-from "nobody@'"$D"'" --mail-rcpt "x@'"$D"'" -T /dev/null >/dev/null 2>&1 && n=$((n + 1))
+# Ten at a time (Stalwart answers a failed AUTH after a delay: 110 one
+# by one outran the step), each at most 15 s, the whole at most 300 s.
+set +e
+podman rm -f e2e-badauth >/dev/null 2>&1 || true
+timeout 300 podman run --rm --name e2e-badauth --entrypoint sh "$CURL_IMG" -c '
+  try() { curl -s --max-time 15 --ssl-reqd -k -u "nobody@'"$D"':wrong-$1" "smtp://host.containers.internal:587/relay-test.example" \
+            --mail-from "nobody@'"$D"'" --mail-rcpt "x@'"$D"'" -T /dev/null >/dev/null 2>&1 && echo accepted; }
+  b=0
+  while [ "$b" -lt 11 ]; do
+    j=0
+    while [ "$j" -lt 10 ]; do try "$b-$j" & j=$((j + 1)); done
+    wait
+    b=$((b + 1))
   done
-  echo "accepted=$n"' > /tmp/mail-badauth.out
-grep -qx 'accepted=0' /tmp/mail-badauth.out || fail "a wrong password was accepted: $(cat /tmp/mail-badauth.out)"
+  echo all-tried' > /tmp/mail-badauth.out
+rc=$?
+set -e
+[ "$rc" = 0 ] || podman rm -f e2e-badauth >/dev/null 2>&1 || true
+[ "$rc" = 0 ] && grep -qx all-tried /tmp/mail-badauth.out || fail "the 110 failed logins didn't finish within 300 s (rc $rc): $(tail -3 /tmp/mail-badauth.out)"
+! grep -qx accepted /tmp/mail-badauth.out || fail "a wrong password was accepted ($(grep -cx accepted /tmp/mail-badauth.out) of 110)"
 for i in $(seq 1 12); do
   smtp_to "rt-person@$D" && break
   [ "$i" -eq 12 ] && fail "after 110 failed logins a delivery from another container is refused (a ban on the gateway?)"
