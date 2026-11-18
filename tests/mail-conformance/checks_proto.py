@@ -103,6 +103,9 @@ def check_lan_only_sasl(ctx):
             s.login("alice@conformance.test", pw)
         except smtplib.SMTPAuthenticationError:
             return None
+        except smtplib.SMTPNotSupportedError:
+            # AUTH not offered outside the local networks: refused too.
+            return None
         return "LAN-only: a login from outside the local networks was accepted"
     finally:
         try:

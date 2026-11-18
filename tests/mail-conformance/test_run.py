@@ -38,6 +38,7 @@ class Recorded:
     def __init__(self, defects=()):
         self.d = set(defects)
         self.doc = None
+        self.applied = 0
         self.creds = {}  # uuid -> [ {id, uuid, label, ...} ]
         self.n = 0
 
@@ -60,7 +61,9 @@ class Recorded:
         if p == "/v1/provider":
             return 200, {"name": "Rec", "version": "1", "api_version": 1, "checks": [], "actions": []}
         if p == "/v1/state" and m == "GET":
-            return 200, {"generation": self.doc["generation"] if self.doc else 0, "applied_generation": 0, "bootstrap": True, "errors": []}
+            # "noapply": a provider that never applies what it accepted.
+            g = self.doc["generation"] if self.doc else 0
+            return 200, {"generation": g, "applied_generation": self.applied, "bootstrap": True, "errors": []}
         if p == "/v1/state" and m == "PUT":
             raw = req.data
             try:
@@ -84,6 +87,8 @@ class Recorded:
                     return 409, {"error": "mass", "error_kind": "mass_removal",
                                  "removed": [{"username": a["username"], "uuid": a["uuid"]} for a in gone]}
             self.doc = d
+            if "noapply" not in self.d:
+                self.applied = d["generation"]
             return 202, {"generation": d["generation"]}
         if p == "/v1/credentials" and m == "POST":
             b = json.loads(req.data)
@@ -160,6 +165,26 @@ class RunTest(unittest.TestCase):
                        "--outside-url", "http://outside.test"], opener=rec, out=out)
         os.unlink(f.name)
         self.assertEqual(rc, 0, out.getvalue())
+
+    def test_put_waits_for_the_document_applied(self):
+        # A provider that never applies: every check that writes a document
+        # names it, never judges a half-applied state.
+        rec = Recorded(["noapply"])
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write(SECRET + "\n")
+        out = io.StringIO()
+        orig = run.checks_api.Ctx.__init__
+        def init(self, *a, **k):
+            orig(self, *a, **k)
+            self.sleep, self.apply_wait = (lambda s: None), 3
+        run.checks_api.Ctx.__init__ = init
+        try:
+            rc = run.main(["--level", "api", "--api-url", "http://provider.test", "--secret-file", f.name], opener=rec, out=out)
+        finally:
+            run.checks_api.Ctx.__init__ = orig
+            os.unlink(f.name)
+        self.assertEqual(rc, 1)
+        self.assertIn("not applied within 3 s", out.getvalue())
 
     def test_secret_file_too_short(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as f:

@@ -4,6 +4,7 @@ Every check takes a Ctx and returns None (pass) or a reason (fail). They
 write documents: run them only against a provider set aside for it (CI).
 """
 import json
+import time
 import urllib.error
 import urllib.request
 
@@ -22,6 +23,11 @@ class Ctx:
         # The key the provider serves (MailState v2: tls.spki_sha256 holds
         # 1-2 keys); a placeholder when the caller can't name it.
         self.spki = "0" * 64
+        # A provider applies an accepted document on its own time, and
+        # judges the next one against what it applied (its live accounts:
+        # mass removal, parking): put() waits for applied_generation.
+        self.sleep = time.sleep
+        self.apply_wait = 180
         self.created = []  # (uuid, id, secret) of passwords made here
 
     def call(self, method, path, body=None, bearer="default", base=None, raw=None):
@@ -71,8 +77,22 @@ def doc(ctx, accounts, lan_only=False, local=None, confirm=False):
 
 
 def put(ctx, d):
+    """PUT /v1/state; once accepted (202), waits until the provider says
+    it applied that generation (a provider judges the next document
+    against what it applied; contract §19.5)."""
     st, j, b = ctx.call("PUT", "/v1/state", d)
-    return st, j, b
+    if st != 202:
+        return st, j, b
+    gen = d.get("generation")
+    waited = 0
+    while waited < ctx.apply_wait:
+        s2, sj, _ = ctx.call("GET", "/v1/state")
+        if s2 == 200 and isinstance(sj, dict) and (sj.get("applied_generation") or 0) >= gen:
+            return st, j, b
+        ctx.sleep(1)
+        waited += 1
+    # Accepted but never applied: no check may judge it (status 0).
+    return 0, j, b + (" (not applied within %d s)" % ctx.apply_wait).encode()
 
 
 def cred(ctx, user, uuid, label="conformance"):
