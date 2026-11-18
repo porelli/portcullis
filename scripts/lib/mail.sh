@@ -508,7 +508,11 @@ mail_enable() {
   elif [ "$(printf '%s' "$pinfo" | jq -r --arg t "$provider" '.wired == true and .template == $t')" = true ]; then
     ok "$(printf '%s' "$pinfo" | jq -r '.instance') is already this server's mail provider."
   else
-    id="$provider"
+    # The instance install would wire (an existing one of the template, or
+    # a new one): the id the operator types (L3).
+    id="$(_mail_hub install-preview "$(jq -cn --arg t "$provider" --arg s "$MAIL_DEFAULT_SOURCE" '{template: $t, source: $s}')" \
+          | jq -r '.instance // empty' 2>/dev/null)" || id=""
+    [[ "$id" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] || fail "the Hub didn't say which instance of $provider it would wire (hub mail install-preview)"
     printf '\n%s\n\n' "$(printf '%s' "$pinfo" | jq -r '.warning')"
     if [ "$yes" = true ]; then
       typed="$id"

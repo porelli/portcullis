@@ -1090,6 +1090,15 @@ def rotate_when_set() -> None:
         if "no set for" not in last:
             break
         time.sleep(5)
+    # What the Hub knows of the provider then (generation sent / applied,
+    # reachable, void, hold): no secret in it.
+    st = run("./portcullis", "mail", "status", "--json", timeout=120, check_rc=False).stdout
+    save("rotate-failed-mail-status.json", st)
+    try:
+        h = json.loads(st).get("hub") or {}
+        print("    hub view: " + json.dumps({k: h.get(k) for k in ("instance", "mode", "reachable", "generation", "applied_generation", "void_owed", "held")}), flush=True)
+    except ValueError:
+        print("    mail status --json unreadable", flush=True)
     raise AssertionError(f"./portcullis mail rotate: {scrub(last[-1500:])}")
 
 

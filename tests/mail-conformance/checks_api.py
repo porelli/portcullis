@@ -115,6 +115,15 @@ def check_strict_json(ctx):
     return None
 
 
+def reset(ctx):
+    """Setup: a document with no account, mass removal confirmed (the
+    provider may hold accounts from before)."""
+    st, _, b = put(ctx, doc(ctx, [], confirm=True))
+    if st != 202:
+        return "the empty document (confirm_mass_removal): HTTP %d %s" % (st, b[:200])
+    return None
+
+
 def check_stale_generation(ctx):
     """A document whose generation isn't above the last accepted one: 409
     with error_kind generation (the Hub matches on error_kind, never on the

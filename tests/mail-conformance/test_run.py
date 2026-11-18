@@ -147,6 +147,20 @@ class RunTest(unittest.TestCase):
             self.assertEqual(rc, 1, (defect, out))
             self.assertIn("FAIL " + check + ":", out, defect)
 
+    def test_setup_empties_a_provider_holding_accounts(self):
+        # A provider that already holds accounts (e2e's stalwart): the setup
+        # document confirms the removal, so no check meets a mass-removal
+        # refusal it didn't ask for.
+        rec = Recorded()
+        rec.doc = {"generation": 0, "accounts": [{"username": u, "uuid": "u-" + u} for u in ("a", "b", "c")]}
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write(SECRET + "\n")
+        out = io.StringIO()
+        rc = run.main(["--level", "api", "--api-url", "http://provider.test", "--secret-file", f.name,
+                       "--outside-url", "http://outside.test"], opener=rec, out=out)
+        os.unlink(f.name)
+        self.assertEqual(rc, 0, out.getvalue())
+
     def test_secret_file_too_short(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as f:
             f.write("short\n")

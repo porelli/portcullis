@@ -4997,6 +4997,7 @@ mt() {
   for c in tls test action; do printf '{}' > "$ML/hub-$c"; done
   for c in install unwire; do printf '%s' '{"op_id":"op1","op":"mail-'"$c"'","instance":"stalwart","poll":"/api/instances/stalwart/op?op_id=op1"}' > "$ML/hub-$c"; done
   printf '%s' '{"op_id":"op1","running":false,"ok":true}' > "$ML/hub-op"
+  printf '%s' '{"instance":"stalwart","creates":true}' > "$ML/hub-install-preview"
   printf '%s' '[{"name":"mail.example","state":"off"}]' > "$ML/hub-domains"
   printf '%s' '{"records":[{"name":"mail.example","type":"MX","ttl":3600,"value":"10 mail.mail.example."}],"rules":{"relay_include":"","dmarc_floor":"none","draining":false}}' > "$ML/hub-dns-main"
   (
@@ -5082,6 +5083,14 @@ expect_eq "mail enable: a provider serving only on the third look still gets the
 mte '_mail_serving() { return 1; }; export MAIL_SERVING_WAIT=0 MAIL_SERVING_POLL=0; mail_enable "" "" stalwart true'; rc=$?
 expect_eq "mail enable: a provider never serving: rc 0, no keys posted, a warning naming mail rotate" \
   "$rc:$([ -f "$ML/hub-tls.in" ] && echo posted || echo none):$(grep -c 'not serving yet.*mail rotate' "$ML/out")" "0:none:1"
+# test_mail_enable_confirms_the_previewed_instance (L3): the Hub's
+# install-preview names the instance install would wire (an existing
+# stalwart-2): that id is the one typed and confirmed.
+mte 'printf "%s" "{\"instance\":\"stalwart-2\",\"creates\":false}" > "$ML/hub-install-preview"; mail_enable "" "" stalwart true'; rc=$?
+expect_eq "mail enable: the previewed instance is the confirmed id" \
+  "$rc:$(jq -c . "$ML/hub-install-preview.in"):$(jq -r .confirm "$ML/hub-install.in")" '0:{"template":"stalwart","source":"portcullis"}:stalwart-2'
+mte 'echo 1 > "$ML/hub-install-preview.rc"; rm -f "$ML/hub-install-preview"; mail_enable "" "" stalwart true'; rc=$?
+expect_eq "mail enable: no preview → refused, nothing installed" "$rc:$([ -f "$ML/hub-install.in" ] && echo installed || echo none)" "1:none"
 # test_mail_enable_provider_none: the slot only.
 mte 'mail_enable "" "" none true'; rc=$?
 expect_eq "mail enable --provider none: the slot open, no install" "$rc:$([ -f "$ML/hub-install.in" ] && echo installed || echo none):$(grep -c '^PORTCULLIS_MAIL=on$' "$ML/root/.env")" "0:none:1"

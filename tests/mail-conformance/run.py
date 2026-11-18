@@ -55,6 +55,13 @@ def main(argv=None, opener=None, out=sys.stdout):
     if a.level == "full":
         # The protocol checks before the void (the last API check).
         checks = checks[:-1] + checks_proto.PROTO_CHECKS + checks[-1:]
+    # The provider set aside for the run may hold accounts: one document
+    # without any (mass removal confirmed) first, so every check starts
+    # from the same empty provider.
+    why = checks_api.reset(ctx)
+    if why:
+        print("FAIL setup: %s" % why, file=out)
+        return 1
     failed = 0
     for name, fn in checks:
         try:
