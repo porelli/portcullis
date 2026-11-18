@@ -1096,7 +1096,8 @@ def rotate_when_set() -> None:
 def lan_only(on: bool, provider: str) -> None:
     """LAN-only is core's (MAIL_SUBMISSION_LAN_ONLY → core.env), set with
     mail enable --lan-only on the wired provider (no second install)."""
-    run("./portcullis", "mail", "enable", "--lan-only", "true" if on else "false", "--provider", provider, "--yes", timeout=900)
+    # --provider none: the slot's settings only (the wired provider stays).
+    run("./portcullis", "mail", "enable", "--lan-only", "true" if on else "false", "--provider", "none", "--yes", timeout=900)
     hub_answers()
 
 
@@ -1268,6 +1269,8 @@ def template_change_holds() -> None:
     held (Ruling R-HH1: the running, confirmed containers keep taking the
     mail routes and documents); a re-wire clears the hold."""
     needs("setup")
+    # Serving first (an earlier scenario's switch back may still be starting).
+    until("stalwart serves before the change (GET /api/mail/checks 200)", lambda: hub("GET", "/api/mail/checks")[0] == 200, 300, every=5)
     before = {s: docker("inspect", "-f", "{{.Id}}", pcid(s)).strip() for s in ("stalwart", "adapter")}
     docker("run", "--rm", "--network", "none", "-v", "portcullis_hub_data:/d",
            "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
@@ -1307,7 +1310,9 @@ def served_spki() -> str:
 
 def conformance(level: str, inst: str, service: str) -> None:
     """The conformance suite against the wired provider, as the Hub (its
-    pinned portcullis-mail-api address; the Hub stopped meanwhile)."""
+    pinned portcullis-mail-api address; the Hub stopped meanwhile), once
+    the provider answers (a switch back just before may still be starting)."""
+    until(f"{inst} answers the Hub (GET /api/mail/checks 200)", lambda: hub("GET", "/api/mail/checks")[0] == 200, 300, every=5)
     hub_cid = docker("compose", "ps", "-q", "hub").strip()
     docker("stop", hub_cid)
     try:

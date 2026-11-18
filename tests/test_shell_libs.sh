@@ -5180,6 +5180,12 @@ mte 'mail_rotate --next-key'; rc=$?
 expect_eq "mail rotate --next-key: mail-cert --next-key, then mail-tlsa next" \
   "$rc:$(grep -oE '^rt_run mail-cert (-- --next-key|--entrypoint domains -- mail-tlsa next)' "$ML/argv" | tr '\n' '|')" \
   "0:rt_run mail-cert -- --next-key|rt_run mail-cert --entrypoint domains -- mail-tlsa next|"
+# test_mail_rotate_keys_despite_no_set: a provider just wired has no set
+# until its first document, which the Hub sends only once its keys are
+# posted: rotate still gives the serving provider its keys, then fails.
+mte 'echo 1 > "$ML/hub-dns-main.rc"; rm -f "$ML/hub-dns-main"; printf "the provider has no set for mail.example yet: try again after its first document\n" > "$ML/hub-dns-main.err"; mail_rotate ""'; rc=$?
+expect_eq "mail rotate: no set yet → the keys still posted, then rc 1 naming the set" \
+  "$rc:$(jq -c .spki_sha256 "$ML/hub-tls.in" 2>/dev/null):$(grep -c "didn't give the main domain's mail set" "$ML/out")" '1:["aa"]:1'
 mte 'echo 1 > "$ML/hub-dns-main.rc"; rm -f "$ML/hub-dns-main"; printf "no mail provider is wired\n" > "$ML/hub-dns-main.err"; mail_rotate ""'; rc=$?
 expect_eq "mail rotate with exactly nothing wired: the main set withdrawn, rc 0 (H5)" "$rc:$(grep -c '^dns_tool apply sets=mail recs=\[\] tlsa= rules=$' "$ML/argv"):$(grep -c 'mail records are withdrawn' "$ML/out")" "0:1:1"
 # test_mail_tls_only_when_serving (Ruling R2-H5/N1): nothing wired (the

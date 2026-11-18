@@ -413,7 +413,8 @@ _mail_main_set() {
       _mail_withdraw_main || fail "no mail provider is wired, and the main domain's mail records could not be withdrawn"
       info "No mail provider is wired: the main domain's mail records are withdrawn."
       return 0 ;;
-    *) fail "the Hub didn't give the main domain's mail set (hub mail dns-main, see above): the published records are left as they are" ;;
+    *) warn "the Hub didn't give the main domain's mail set (hub mail dns-main, see above): the published records are left as they are"
+       return 2 ;;
   esac
   if ! _dns_automated "${DNS_PROVIDER:-none}"; then
     warn "No automatic DNS for provider '${DNS_PROVIDER:-none}': ./portcullis dns plan shows the mail records to create by hand."
@@ -626,9 +627,13 @@ mail_rotate() {
   _mail_cert_metric "${MAIL_CERT_NOT_AFTER:-}"
   _mail_hub_wait >/dev/null
   # The main set first (nothing wired: withdrawn; Ruling R2-H5/N1), then
-  # the keys to a serving provider.
-  _mail_main_set "$st"
+  # the keys to a serving provider — also when the set isn't there yet: a
+  # provider just wired gets its first document only once its keys are
+  # posted (else nothing would ever unblock it before the next run).
+  local setrc=0
+  _mail_main_set "$st" || setrc=$?
   _mail_tls_offer "$st"
+  [ "$setrc" = 0 ] || fail "mail rotation incomplete: the main domain's mail set (see above); run it again"
   ok "Mail rotation done."
 }
 
