@@ -149,6 +149,13 @@ denied pods "$(printf '%s' "$POD" | sed 's/"portcullis.io\/instance":"e2e"/"port
 [ "$(KH -n "$APPS" auth can-i get pods --subresource=exec)" = no ] || fail "the Hub's ServiceAccount may get pods/exec (K2: create only)"
 [ "$(KH -n "$APPS" auth can-i create pods --subresource=exec)" = yes ] || fail "the Hub's ServiceAccount can't create pods/exec"
 [ "$(KH -n "$NS" auth can-i get secrets)" = no ] || fail "the Hub's ServiceAccount reads core Secrets"
+# Usage (contract §11.11): pod metrics read in the apps namespace; never
+# the kubelet's stats or proxy (nodes are cluster-scoped: no grant at all).
+[ "$(KH -n "$APPS" auth can-i list pods.metrics.k8s.io)" = yes ] || fail "the Hub's ServiceAccount can't list pod metrics"
+for sub in stats proxy; do
+  [ "$(KH auth can-i get nodes --subresource="$sub" 2>/dev/null || true)" = no ] || fail "the Hub's ServiceAccount may get nodes/$sub"
+done
+[ "$(KH -n "$APPS" auth can-i list nodes.metrics.k8s.io 2>/dev/null || true)" = no ] || fail "the Hub's ServiceAccount lists node metrics"
 pass "the guard refuses a hostPath outside the roots, a NodePort, a foreign helper image and vpn-slot 47, each by its binding; pods/exec is create only"
 # The apps' Traefik objects live in portcullis-edge: every refusal there.
 bash .github/ci/e2e-k3s-edge-admission.sh ci

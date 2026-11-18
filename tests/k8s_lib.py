@@ -23,7 +23,9 @@ ABSENT = {"socket-proxy-traefik", "socket-proxy-hub", "mail-cert"}
 # needs a Docker or Podman primary, contract §17.1).
 ABSENT_NETS = {"socket-proxy-traefik", "socket-proxy-hub",
                "portcullis-mail-api", "portcullis-metrics-mail",
-               "portcullis-link", "portcullis-link-data"}
+               "portcullis-link", "portcullis-link-data",
+               # The Hub's usage metrics listener is Docker / Podman only (U20).
+               "portcullis-metrics-hub"}
 # The VPN networks: port-bound rules only (netpol-wg-edge.yaml), K7.
 VPN_NETS = {"portcullis-vpn", "portcullis-vpn-edge", "portcullis-metrics-wg"}
 

@@ -106,3 +106,112 @@ path "pki_node/revoke" {
 path "pki_node/crl/rotate" {
   capabilities = ["read"]
 }
+
+# ── SSH (contract §18.7, spike S4/S4b–S4f) ──────────────────────────────
+# People's SSH certificates: one role per host group, ssh_user/roles/hg-<id>,
+# written only by enroll from the Hub's compilation. Every role field is a
+# string (JSON booleans are refused by allowed_parameters). ttl / max_ttl
+# are pinned to the twelve whole-hour values up to 12 h: a role's max_ttl
+# above the mount's max-lease-ttl would sign past it (S4c), so this list is
+# the 12 h limit. Even with this policy enroll can't make a role that
+# issues host certificates, X11 / user-rc / force-command certificates or
+# certificates over 12 h.
+#
+# What a stolen enroll token can still do on a role (security review,
+# checked live on Vault 2.2.1 by TestLiveSSHVault):
+#   - allowed_users: NOT a fence for which principals. It is one
+#     comma-joined string and a policy glob sees only its start, so "s:*" /
+#     "sp:*" / "u:*" / "up:*" refuse just a bare "*" (Vault's "any
+#     principal"; sp:/up: are the approved namespaces of privileged grants,
+#     Ruling RR3 — a stolen token can write those too, which is why the host
+#     is the fence, below); a stolen token
+#     can still write "u:a@x,root" and Vault then signs "root" (live, Vault
+#     2.2.1). Entries are matched exactly (no glob, an embedded "*" entry is
+#     no wildcard, live) and allowed_users_template can't be set. The fence
+#     for bare principals is the host: every Portcullis host's sshd reads
+#     AuthorizedPrincipalsFile for every account, root included, and those
+#     files hold only u:/s: (up:/sp:) names of that account — only up:/sp:
+#     for an account with sudo — so a certificate for "root" or a bare
+#     account name opens nothing (the Hub's real-sshd test, three distros).
+#     A narrower role-writing token can't help: a policy can pin a path's
+#     parameters only to fixed values, and the per-host-group principal
+#     lists change with every grant (it would need a sudo token rewriting
+#     the policy itself).
+#   - default_extensions: only {} (Vault applies a role's defaults without
+#     checking allowed_extensions, so a default could add X11 / user-rc;
+#     enroll sends the extensions map on every sign instead).
+#   - default_critical_options: not pinnable (the per-host-group
+#     source-address). The only OpenSSH critical options (force-command,
+#     source-address, verify-required) restrict a certificate, so the worst
+#     a stolen token does here is drop source-address — which writing the
+#     role with allowed_critical_options "" does as well.
+#   - allowed_user_key_lengths: not pinnable (Vault compares the policy's
+#     numbers with the request's JSON numbers by type and never matches, live);
+#     enroll accepts only the four key types itself.
+path "ssh_user/sign/hg-*" {
+  capabilities = ["update"]
+  # source-address comes from the role only; never a host certificate.
+  denied_parameters = {
+    "cert_type"        = []
+    "critical_options" = []
+  }
+}
+
+path "ssh_user/roles/hg-*" {
+  capabilities = ["create", "update", "read", "delete"]
+  allowed_parameters = {
+    "key_type"                 = ["ca"]
+    "allow_user_certificates"  = ["true"]
+    "allow_host_certificates"  = ["false"]
+    "allow_user_key_ids"       = ["true"]
+    "allowed_users"            = ["s:*", "sp:*", "u:*", "up:*"]
+    "allowed_extensions"       = ["permit-pty", "permit-pty,permit-port-forwarding",
+                                  "permit-pty,permit-agent-forwarding",
+                                  "permit-pty,permit-port-forwarding,permit-agent-forwarding"]
+    "default_extensions"       = [{}]
+    "allowed_critical_options" = ["", "source-address"]
+    "default_critical_options" = []
+    "allowed_user_key_lengths" = []
+    "ttl"                      = ["3600", "7200", "10800", "14400", "18000", "21600",
+                                  "25200", "28800", "32400", "36000", "39600", "43200"]
+    "max_ttl"                  = ["3600", "7200", "10800", "14400", "18000", "21600",
+                                  "25200", "28800", "32400", "36000", "39600", "43200"]
+  }
+}
+
+# Stale hg-* roles (the Hub deletes roles without grants).
+path "ssh_user/roles/" {
+  capabilities = ["list"]
+}
+
+# Host certificates: exactly cert_type=host (the default, user, is refused
+# by the host role), plus key_id and the documented fields.
+path "ssh_host/sign/host" {
+  capabilities = ["update"]
+  allowed_parameters = {
+    "cert_type" = ["host"]
+    "*"         = []
+  }
+}
+
+# GET /internal/ssh-ca: the CA public keys and the §18.7 checks (no sudo
+# needed for the tunes, S4d).
+path "ssh_user/config/ca" {
+  capabilities = ["read"]
+}
+
+path "ssh_host/config/ca" {
+  capabilities = ["read"]
+}
+
+path "sys/mounts/ssh_user/tune" {
+  capabilities = ["read"]
+}
+
+path "sys/mounts/ssh_host/tune" {
+  capabilities = ["read"]
+}
+
+path "ssh_host/roles/host" {
+  capabilities = ["read"]
+}

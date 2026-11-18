@@ -148,6 +148,57 @@ groups:
             Its devices are denied until the Hub publishes a fresh map (the identity
             hook fails or the gateway is down). See the instance's VPN tab in the Hub.
 
+      # Usage (the Hub's usage metrics, job hub-usage, contract §16.2): the
+      # doctor's thresholds, so Alertmanager notifies what the doctor shows.
+      # The Hub's own label is app (the instance id or core); instance is
+      # Prometheus' scrape target, hub-metrics:9100 (FR-H1).
+      - alert: PortcullisAppMemoryNearLimit
+        expr: portcullis_container_memory_working_set_bytes / portcullis_container_memory_limit_bytes > 0.9
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.app }}'s {{ $labels.service }}.{{ $labels.number }} is near its memory limit"
+          description: Its working set has been above 90 % of its memory limit for 10 minutes. Raise the limit or look at its logs (Hub → Usage).
+
+      # The doctor's disk bands (disk_nearly_full): a warning under 10 % or
+      # 5 GiB free, a problem under 3 % or 1 GiB.
+      - alert: PortcullisDiskNearlyFull
+        expr: >-
+          portcullis_filesystem_free_bytes / portcullis_filesystem_total_bytes < 0.10
+          or portcullis_filesystem_free_bytes < 5 * 1024 * 1024 * 1024
+        for: 30m
+        labels: {severity: warning}
+        annotations:
+          summary: "A filesystem with Portcullis data (device {{ $labels.dev }}) is nearly full"
+          description: Less than 10 % or 5 GiB is free. Free space or move the data (Hub → Usage → Storage names the filesystem and what is on it, largest first).
+
+      - alert: PortcullisDiskAlmostFull
+        expr: >-
+          portcullis_filesystem_free_bytes / portcullis_filesystem_total_bytes < 0.03
+          or portcullis_filesystem_free_bytes < 1024 * 1024 * 1024
+        for: 10m
+        labels: {severity: critical}
+        annotations:
+          summary: "A filesystem with Portcullis data (device {{ $labels.dev }}) is almost full"
+          description: Less than 3 % or 1 GiB is free. When it fills, apps can't write; databases stop, uploads and backups fail. Free space now (Hub → Usage → Storage).
+
+      - alert: PortcullisUsageSamplerStale
+        expr: (time() - portcullis_usage_sampler_last_success_timestamp_seconds > 600) and on() (up{job="hub-usage"} == 1)
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: The Hub's usage sampler has had no good sample for 10 minutes
+          description: The Usage page and these metrics are out of date. Check the Hub's log for usage lines and GET /api/runtime.
+
+      # The sampler's timestamp is left out until its first good sweep: a
+      # Hub that is scraped but never sampled is caught here.
+      - alert: PortcullisUsageSamplerNeverRan
+        expr: absent(portcullis_usage_sampler_last_success_timestamp_seconds) and on() (up{job="hub-usage"} == 1)
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: The Hub's usage sampler has never had a good sample
+          description: The Hub is scraped but has measured nothing for 15 minutes. Check the Hub's log for usage lines and GET /api/runtime.
       # Multiple servers (contract §17): link's handshake ages and the worker
       # agents' gauges (job link, labelled server=<id>).
       # Only servers that enrolled (link.json ready): one added but never

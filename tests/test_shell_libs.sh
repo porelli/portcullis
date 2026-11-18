@@ -800,8 +800,8 @@ case "$PKI_STATE:$*" in
     case "$PKI_STATE" in
       none) echo '{"secret/":{}}' ;;
       nofile) echo '{"pki/":{},"pki_int/":{}}' ;;
-      nonode) echo '{"pki/":{},"pki_int/":{},"pki_file/":{}}' ;;
-      *) echo '{"pki/":{},"pki_int/":{},"pki_file/":{},"pki_node/":{}}' ;;
+      nonode) echo '{"pki/":{},"pki_int/":{},"pki_file/":{},"ssh_user/":{"type":"ssh","config":{"max_lease_ttl":43200}},"ssh_host/":{"type":"ssh","config":{"max_lease_ttl":7776000}}}' ;;
+      *) echo '{"pki/":{},"pki_int/":{},"pki_file/":{},"pki_node/":{},"ssh_user/":{"type":"ssh","config":{"max_lease_ttl":43200}},"ssh_host/":{"type":"ssh","config":{"max_lease_ttl":7776000}}}' ;;
     esac ;;
   nodepartial:list*pki_node/issuers*) echo "No value found at $3" >&2; exit 2 ;;
   nonode:list*pki_*/issuers*|nodepartial:list*pki_*/issuers*|nodeunderroot:list*pki_*/issuers*) echo '["abc"]' ;;
@@ -829,6 +829,8 @@ case "$PKI_STATE:$*" in
   *:write\ -format=json\ pki_*/intermediate/generate*) echo '{"data":{"csr":"CSR"}}' ;;
   *:write\ -format=json\ pki/root/sign-intermediate*) echo '{"data":{"certificate":"INT"}}' ;;
   *:write\ -format=json\ pki_int/issue/server-cert*) echo '{"data":{"certificate":"SRV","private_key":"KEY"}}' ;;
+  # ssh_setup (contract §18.7): the SSH CAs exist (tests/test_cli.sh has its own cases).
+  *:read\ -field=public_key\ ssh_*/config/ca) echo "ssh-ed25519 AAAAstub" ;;
 esac
 exit 0
 STUB
@@ -4113,6 +4115,34 @@ expect_eq "status textfile has portcullis_vpn_mode_restricted" "$(stf | grep '^p
 jq -n '{ok: true, services: [], vault: {active: true}, dns: null, vpn: {mode: "apps"}}' > "$STUB_DIR/stf.json"
 expect_eq "status textfile: apps → portcullis_vpn_mode_restricted 0" "$(stf | grep '^portcullis_vpn_mode_restricted ')" "portcullis_vpn_mode_restricted 0"
 
+# ── SSH access (contract §18): status's SSH block, the textfile gauge ──
+source "$HERE/../scripts/lib/ssh.sh"
+SSH_ST='{"enabled":true,"user_ca_fp":"SHA256:u","host_ca_fp":"SHA256:h","problems":[],"cli_client_ready":true,"hosts":[{"id":"web-1","state":"ok","last_sync":null,"sync_age_s":12,"findings":0}]}'
+SJ="$( (dc() { case "$*" in "exec -T hub hub ssh status") printf '%s' "$SSH_ST" ;; *) return 1 ;; esac; }; ssh_status_json) )"
+expect_eq "ssh_status_json: on, fingerprints, hosts, no problem" "$(printf '%s' "$SJ" | jq -c '[.reachable, .enabled, .user_ca_fp, (.hosts | length), .problem]')" '[true,true,"SHA256:u",1,false]'
+SJ="$( (dc() { case "$*" in "exec -T hub hub ssh status") printf '%s' '{"enabled":true,"problems":["ssh_user: no CA"],"cli_client_ready":true,"hosts":[]}' ;; *) return 1 ;; esac; }; ssh_status_json) )"
+expect_eq "ssh_status_json: on with an enroll problem → a problem" "$(printf '%s' "$SJ" | jq -c '[.problem, .problems]')" '[true,["ssh_user: no CA"]]'
+SJ="$( (dc() { case "$*" in "exec -T hub hub ssh status") printf '%s' '{"enabled":false,"problems":["ssh_user: no CA"],"hosts":[]}' ;; *) return 1 ;; esac; }; ssh_status_json) )"
+expect_eq "ssh_status_json: off → no problem whatever enroll says" "$(printf '%s' "$SJ" | jq -c '[.enabled, .problem]')" '[false,false]'
+SJ="$( (dc() { return 1; }; ssh_status_json) )"
+expect_eq "ssh_status_json: the Hub not answering → unknown, no problem of its own" "$(printf '%s' "$SJ" | jq -c '[.reachable, .enabled, .problem]')" '[false,null,false]'
+SJ="$( (require_cmd() { :; }; dc() { :; }; rt_health() { echo healthy; }; kc_login() { return 1; }
+        proxy_dns_shadows() { :; }; _st_mcp_refusing() { :; }; vault_health_code() { echo 200; }
+        vault_admin_env() { return 1; }; dns_status_json() { :; }
+        ssh_status_json() { echo '{"reachable":true,"enabled":true,"user_ca_fp":"SHA256:u","host_ca_fp":"SHA256:h","cli_client_ready":true,"problems":["x"],"hosts":[],"problem":true}'; }
+        status_run true 2>/dev/null) || true)"
+expect_eq "status --json has ssh{} and its problem counts" "$(printf '%s' "$SJ" | jq -c '[.ssh.enabled, .ssh.problem, .ok]')" '[true,true,false]'
+jq -n '{ok: true, services: [], vault: {active: true}, dns: null, vpn: {mode: "apps"}, ssh: {enabled: true, problems: []}}' > "$STUB_DIR/stf.json"
+expect_eq "status textfile: portcullis_ssh_ca_ok 1" "$(stf | grep '^portcullis_ssh_ca_ok ')" "portcullis_ssh_ca_ok 1"
+jq -n '{ok: true, services: [], vault: {active: true}, dns: null, vpn: {mode: "apps"}, ssh: {enabled: true, problems: ["x"]}}' > "$STUB_DIR/stf.json"
+expect_eq "status textfile: portcullis_ssh_ca_ok 0 on a problem" "$(stf | grep '^portcullis_ssh_ca_ok ')" "portcullis_ssh_ca_ok 0"
+jq -n '{ok: true, services: [], vault: {active: true}, dns: null, vpn: {mode: "apps"}, ssh: {enabled: false, problems: []}}' > "$STUB_DIR/stf.json"
+expect_eq "status textfile: no portcullis_ssh_ca_ok while SSH is off" "$(stf | grep -c '^portcullis_ssh_ca_ok ' || true)" 0
+# ssh_prepare: secrets/ssh/ 0750 and the record 0640, both group 10001.
+(export PORTCULLIS_ROOT="$WORK/sshp"; mkdir -p "$PORTCULLIS_ROOT/secrets"; ct_own() { echo "$*" > "$WORK/sshp-own"; }; ssh_prepare)
+expect_eq "ssh_prepare: secrets/ssh 0750, breakglass.jsonl 0640 (empty)" "$(file_mode "$WORK/sshp/secrets/ssh"):$(file_mode "$WORK/sshp/secrets/ssh/breakglass.jsonl"):$(wc -c < "$WORK/sshp/secrets/ssh/breakglass.jsonl" | tr -d ' ')" "750:640:0"
+expect_eq "ssh_prepare: both group 10001 (the Hub)" "$(cut -d' ' -f1 "$WORK/sshp-own" | cut -d: -f2)" 10001
+
 # Core's headscale leftovers are gone (V14: the template owns them).
 expect_eq "keycloak.sh registers no headscale client" "$(grep -ciE 'headscale|headplane' "$HERE/../scripts/lib/keycloak.sh" || true)" 0
 expect_eq "backup has no headscale-config.yaml" "$(grep -c 'headscale' "$HERE/../scripts/lib/backup.sh" || true)" 0
@@ -4703,7 +4733,7 @@ k15_root() {
   printf 'cert' > "$K15/certs/ca-chain.crt"; printf 'KEY' > "$K15/certs/server.key"; printf '1a\n' > "$K15/certs/revocation/revoked-serials.txt"
   echo "PORTCULLIS_DOMAIN=k.example.org" > "$K15/.env"
 }
-K15_ENV="export PORTCULLIS_ROOT='$K15' POSTGRES_PASSWORD=PG-SECRET-777 HUB_PROXY_SECRET=HUB-PROXY-SECRET-555 KEYCLOAK_ADMIN_PASSWORD=KC-SECRET PORTCULLIS_DOMAIN=k.example.org PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 PORTCULLIS_TRAEFIK_VPN_SERVICE_IP=10.43.0.21 PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.0.22"
+K15_ENV="export PORTCULLIS_ROOT='$K15' POSTGRES_PASSWORD=PG-SECRET-777 HUB_PROXY_SECRET=HUB-PROXY-SECRET-555 HUB_CLI_PROXY_SECRET=HUB-CLI-SECRET-666 KEYCLOAK_ADMIN_PASSWORD=KC-SECRET PORTCULLIS_DOMAIN=k.example.org PORTCULLIS_TRAEFIK_SERVICE_IP=10.43.0.20 PORTCULLIS_TRAEFIK_VPN_SERVICE_IP=10.43.0.21 PORTCULLIS_WG_EDGE_SERVICE_IP=10.43.0.22"
 k_fixtures; k15_root; rm -f "$KS/order"
 OUT="$(kt "set -euo pipefail; $K15_ENV; kube_sync_secrets" </dev/null)"
 expect_eq "sync: every object applied (under set -euo pipefail)" "$(printf '%s\n' "$OUT" | tail -n1)" "rc=0"
@@ -4713,6 +4743,8 @@ expect_eq "sync: Secrets from secrets/ dirs (--from-file), portcullis-env, Confi
   "$(grep -cE 'create secret generic secrets-hub-lldap .*--from-file=|create secret generic portcullis-env .*--from-file=|create configmap certs-revocation .*--from-file=|create secret generic secrets-certs .*--from-file=' "$KS/kubectl-calls"):$(grep -rlE 'ROOT-TOKEN-XYZ|CA-KEY-SECRET' "$KS/kubectl-stdin" 2>/dev/null | wc -l | tr -d ' ')" "4:0"
 expect_eq "sync: the hub-proxy-secret Middleware from stdin (jq), its secret not on argv" \
   "$(grep -c '"X-Portcullis-Proxy-Secret": "HUB-PROXY-SECRET-555"' "$KS/kubectl-stdin"):$(grep -c 'HUB-PROXY-SECRET-555' "$KS/kubectl-calls" || true)" "1:0"
+expect_eq "sync: the hub-cli-proxy-secret Middleware from stdin (jq), its secret not on argv" \
+  "$(grep -c '"X-Portcullis-Proxy-Secret": "HUB-CLI-SECRET-666"' "$KS/kubectl-stdin"):$(grep -c 'HUB-CLI-SECRET-666' "$KS/kubectl-calls" || true)" "1:0"
 # The live objects decide (no local cache): unchanged → nothing put; a hand
 # edit, a hand-added key or a deleted object → corrected; --full,
 # KUBE_SYNC_FULL=1 or an unreadable live list → every object put.
@@ -4721,8 +4753,8 @@ expect_eq "sync: the first run creates every object (no live one yet)" \
   "$(grep -c '^put create Secret.portcullis-env$' "$KS/order"):$(grep -c '^put replace ' "$KS/order" || true)" "1:0"
 rm -f "$KS/order"
 kt "$K15_ENV; kube_sync_secrets" >/dev/null
-expect_eq "sync: live objects equal → none put again (only the hub-proxy-secret Middleware)" \
-  "$(k15_puts):$(grep -c '^put .* Middleware.hub-proxy-secret$' "$KS/order")" "0:1"
+expect_eq "sync: live objects equal → none put again (only the two proxy-secret Middlewares)" \
+  "$(k15_puts):$(grep -c '^put .* Middleware.hub-proxy-secret$' "$KS/order"):$(grep -c '^put .* Middleware.hub-cli-proxy-secret$' "$KS/order")" "0:1:1"
 jq '.data.password = "SEFDS0VE" | .data.extra = "eA=="' "$KS/live/Secret.secrets-hub-lldap.json" > "$KS/live.tmp" && mv "$KS/live.tmp" "$KS/live/Secret.secrets-hub-lldap.json"
 rm -f "$KS/live/ConfigMap.certs-revocation.json" "$KS/order"
 kt "$K15_ENV; kube_sync_secrets" >/dev/null

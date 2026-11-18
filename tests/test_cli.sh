@@ -86,7 +86,7 @@ done
 
 # Every command listed in `portcullis help` must answer --help with its usage.
 COMMANDS="$(printf '%s\n' "$HELP" | sed -n 's/^  \([a-z][a-z -]*[a-z]\)  .*/\1/p')"
-expect_eq "help lists 54 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 54
+expect_eq "help lists 56 commands" "$(printf '%s\n' "$COMMANDS" | wc -l | tr -d ' ')" 56
 while IFS= read -r c; do
   # shellcheck disable=SC2086
   run $c --help
@@ -389,7 +389,7 @@ expect_eq "lint_ci_size.sh passes 450,000 bytes and fails 450,001" \
 expect_eq "CI's same-named branch lookups: no v* tag glob, no ls-remote pattern lookup" \
   "$(grep -rnE '"\$REF" *(==|!=) *v\*|ls-remote --exit-code' "$HERE/../.github" | wc -l | tr -d ' ')" 0
 expect_eq "CI's same-named branch lookups: every one lists the heads once and fails loudly" \
-  "$(grep -cF 'heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }' "$HERE/../.github/workflows/ci.yml" "$HERE/../.github/actions/hub-image/action.yml" "$HERE/../.github/actions/keycloak-image/action.yml" | awk -F: '{ s += $2 } END { print s }')" 12
+  "$(grep -cF 'heads=$(git ls-remote --heads "$url") || { echo "::error::git ls-remote $url failed"; exit 1; }' "$HERE/../.github/workflows/ci.yml" "$HERE/../.github/actions/hub-image/action.yml" "$HERE/../.github/actions/keycloak-image/action.yml" | awk -F: '{ s += $2 } END { print s }')" 13
 # Client forwarded / address headers Traefik doesn't manage are deleted on
 # every websecure and vpnsecure router (entrypoint http.middlewares).
 expect_eq "strip-client-forwarded@file deletes Forwarded, X-Real-Ip's look-alikes and every unmanaged X-Forwarded-*" \
@@ -820,11 +820,12 @@ expect_eq "email defaults to admin@domain" "$(get ACME_EMAIL)" admin@ci.example.
 expect_eq "LLDAP base DN from the domain" "$(get LLDAP_BASE_DN)" dc=ci,dc=example,dc=org
 for v in POSTGRES_PASSWORD KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD LLDAP_JWT_SECRET \
          FORWARD_AUTH_CLIENT_SECRET FORWARD_AUTH_COOKIE_SECRET FORWARD_AUTH_REDIS_PASSWORD \
-         FORWARD_AUTH_EXT_REDIS_PASSWORD HUB_PROXY_SECRET; do
+         FORWARD_AUTH_EXT_REDIS_PASSWORD HUB_PROXY_SECRET HUB_CLI_PROXY_SECRET; do
   val="$(get "$v")"
   if [ "${#val}" -ge 24 ]; then t_pass "$v generated"; else t_fail "$v not generated ('$val')"; fi
 done
 expect_eq "HUB_PROXY_SECRET is 64 hex chars" "$(get HUB_PROXY_SECRET | grep -Ec '^[0-9a-f]{64}$')" 1
+expect_eq "HUB_CLI_PROXY_SECRET is 64 hex chars, not HUB_PROXY_SECRET" "$(get HUB_CLI_PROXY_SECRET | grep -Ec '^[0-9a-f]{64}$'):$([ "$(get HUB_CLI_PROXY_SECRET)" != "$(get HUB_PROXY_SECRET)" ] && echo differ)" "1:differ"
 expect_eq "no public default forward-auth secret" "$(grep -c 'portcullis-forward-auth-secret' "$ENVF")" 0
 expect_eq "BACKUP_PASSWORD generated (48 chars)" "$(get BACKUP_PASSWORD | grep -Ec '^[A-Za-z0-9]{48}$')" 1
 # The two session-store passwords: 40 random [A-Za-z0-9] each (hashed into
@@ -1448,7 +1449,7 @@ rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
   export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x CONTAINER_RUNTIME=docker
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
-  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x HUB_CLI_PROXY_SECRET=y
   # shellcheck disable=SC1091
   . "$HERE/../scripts/lib/common.sh"
   # shellcheck disable=SC1091
@@ -1474,7 +1475,7 @@ rm -f "$DC_CALLS"
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
   export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x CONTAINER_RUNTIME=docker
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
-  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x HUB_CLI_PROXY_SECRET=y
   # shellcheck disable=SC1091
   . "$HERE/../scripts/lib/common.sh"
   # shellcheck disable=SC1091
@@ -1495,7 +1496,7 @@ rm -f "$DC_CALLS"
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
   export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x CONTAINER_RUNTIME=docker
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
-  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x HUB_CLI_PROXY_SECRET=y
   # shellcheck disable=SC1091
   . "$HERE/../scripts/lib/common.sh"
   # shellcheck disable=SC1091
@@ -1514,7 +1515,7 @@ rm -f "$LLDAP_ACCOUNT_CHANGED" "$DC_CALLS"
   export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT VAULT_INIT_FILE
   export PORTCULLIS_DOMAIN=test.example POSTGRES_PASSWORD=x KEYCLOAK_ADMIN_PASSWORD=x CONTAINER_RUNTIME=docker
   export LLDAP_ADMIN_PASSWORD=x LLDAP_JWT_SECRET=x FORWARD_AUTH_CLIENT_SECRET=x
-  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x
+  export FORWARD_AUTH_COOKIE_SECRET=x FORWARD_AUTH_REDIS_PASSWORD=x FORWARD_AUTH_EXT_REDIS_PASSWORD=y HUB_PROXY_SECRET=x HUB_CLI_PROXY_SECRET=y
   # shellcheck disable=SC1091
   . "$HERE/../scripts/lib/common.sh"
   # shellcheck disable=SC1091
@@ -1555,7 +1556,7 @@ BAD=""
 for r in $ROUTERS; do
   grep -qE "^[[:space:]]+traefik\.http\.routers\.$r\.tls\.options: authaware@file$" "$ROOT_DIR/docker-compose.yml" || BAD="$BAD $r"
 done
-expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:24"
+expect_eq "every core router in docker-compose.yml uses authaware@file" "${BAD:-none}:$(printf '%s\n' "$ROUTERS" | grep -c .)" "none:25"
 expect_eq "no other tls.options in docker-compose.yml" "$(grep -E 'tls\.options:' "$ROOT_DIR/docker-compose.yml" | grep -vc 'authaware@file$' || true)" 0
 # VPN (contract §16, security ruling): every core router's entrypoints
 # label is literally its class: routers without group-gate take
@@ -1571,7 +1572,7 @@ for r in dashboard keycloak-admin hub grafana-metrics; do EP_WANT="$EP_WANT$r \$
 for r in portal people; do EP_WANT="$EP_WANT$r \${PORTCULLIS_WEB_CORE:-websecure}"$'\n'; done
 EP_WANT="${EP_WANT}people-vpn-enrol \${PORTCULLIS_WEB_ENROL:-websecure}"$'\n'
 for r in lldap mcp hub-mcp people-mcp; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ADMIN:-websecure,vpnsecure}"$'\n'; done
-for r in keycloak keycloak-resources oauth2-callback enroll-invite; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ENROL:-websecure,vpnsecure}"$'\n'; done
+for r in keycloak keycloak-resources oauth2-callback enroll-invite people-cli; do EP_WANT="$EP_WANT$r \${PORTCULLIS_EP_ENROL:-websecure,vpnsecure}"$'\n'; done
 for r in dashboard keycloak-admin hub grafana-metrics portal people people-vpn-enrol; do EP_WANT="$EP_WANT$r-vpn vpnsecure"$'\n'; done
 for r in core-vpn-required keycloak-admin-vpn-required; do EP_WANT="$EP_WANT$r websecure"$'\n'; done
 EP_WANT="$(printf '%s' "$EP_WANT" | LC_ALL=C sort | tr '\n' ';')"
@@ -1754,6 +1755,9 @@ expect_eq "signin reset-core --yes without .env exits 1 before docker" "$RC:$(ca
 mv "$SR_ROOT/.env.x" "$SR_ROOT/.env"
 
 # ── enroll's Vault policy: exactly the D21 paths (contract §8.1) ──
+# The client certificate part: everything before the SSH section.
+POLICY_PKI="$WORK/enroll-pki.hcl"
+sed '/^# ── SSH (contract §18.7/,$d' "$HERE/../vault/policies/enroll.hcl" > "$POLICY_PKI"
 POLICY_GOT="$(awk '
   function flush() { if (p != "") print p " " c (d != "" ? " deny=" d : ""); p = ""; c = ""; d = "" }
   /^[[:space:]]*path[[:space:]]+"/ { flush(); p = $2; gsub(/"/, "", p); ind = 0; next }
@@ -1762,7 +1766,7 @@ POLICY_GOT="$(awk '
   ind && /=[[:space:]]*\[\]/ { k = $1; gsub(/"/, "", k); d = (d == "" ? k : d "," k); next }
   ind && /^[[:space:]]*}/ { ind = 0; next }
   END { flush() }
-' "$HERE/../vault/policies/enroll.hcl" | sort)"
+' "$POLICY_PKI" | sort)"
 POLICY_WANT="$(sort <<'EOF'
 pki_int/sign/client-cert update deny=alt_names,ip_sans,uri_sans,other_sans
 pki_file/sign/browser-cert update deny=alt_names,ip_sans,uri_sans,other_sans
@@ -1783,10 +1787,136 @@ EOF
 )"
 expect_eq "enroll.hcl grants exactly the D21 paths (sign/client-cert, sign/browser-cert, certs list, cert read, revoke, crl/rotate on both mounts) and the pki_node ones (sign node-worker / node-control, cert read, revoke, crl/rotate), nothing else" \
   "$POLICY_GOT" "$POLICY_WANT"
-expect_eq "enroll.hcl has one path block per grant" \
-  "$(grep -c '^[[:space:]]*path[[:space:]]' "$HERE/../vault/policies/enroll.hcl")" 15
-expect_eq "enroll.hcl: only capabilities and denied_parameters (no allowed_parameters, no wildcard grants)" \
-  "$(grep -vE '^[[:space:]]*(#|$|path "pki_(int|file|node)/[a-z/-]+\*?" \{|capabilities = \["(update|list|read)"\]|denied_parameters = \{|"(alt_names|ip_sans|uri_sans|other_sans)" += \[\]|\})' "$HERE/../vault/policies/enroll.hcl")" ""
+expect_eq "enroll.hcl's client certificate part has one path block per grant" \
+  "$(grep -c '^[[:space:]]*path[[:space:]]' "$POLICY_PKI")" 15
+expect_eq "enroll.hcl's client certificate part: only capabilities and denied_parameters (no allowed_parameters, no wildcard grants)" \
+  "$(grep -vE '^[[:space:]]*(#|$|path "pki_(int|file|node)/[a-z/-]+\*?" \{|capabilities = \["(update|list|read)"\]|denied_parameters = \{|"(alt_names|ip_sans|uri_sans|other_sans)" += \[\]|\})' "$POLICY_PKI")" ""
+# The SSH part (contract §18.7), comments and blank lines aside, is exactly
+# this: no role TTL above 12 h (ttl / max_ttl pinned to whole hours up to
+# 43200), no host certificates from a user role, no critical options or
+# cert_type on user signs, host signs only with cert_type=host.
+SSH_POLICY_WANT="$(cat <<'EOF'
+path "ssh_user/sign/hg-*" {
+capabilities = ["update"]
+denied_parameters = {
+"cert_type"        = []
+"critical_options" = []
+}
+}
+path "ssh_user/roles/hg-*" {
+capabilities = ["create", "update", "read", "delete"]
+allowed_parameters = {
+"key_type"                 = ["ca"]
+"allow_user_certificates"  = ["true"]
+"allow_host_certificates"  = ["false"]
+"allow_user_key_ids"       = ["true"]
+"allowed_users"            = ["s:*", "sp:*", "u:*", "up:*"]
+"allowed_extensions"       = ["permit-pty", "permit-pty,permit-port-forwarding",
+"permit-pty,permit-agent-forwarding",
+"permit-pty,permit-port-forwarding,permit-agent-forwarding"]
+"default_extensions"       = [{}]
+"allowed_critical_options" = ["", "source-address"]
+"default_critical_options" = []
+"allowed_user_key_lengths" = []
+"ttl"                      = ["3600", "7200", "10800", "14400", "18000", "21600",
+"25200", "28800", "32400", "36000", "39600", "43200"]
+"max_ttl"                  = ["3600", "7200", "10800", "14400", "18000", "21600",
+"25200", "28800", "32400", "36000", "39600", "43200"]
+}
+}
+path "ssh_user/roles/" {
+capabilities = ["list"]
+}
+path "ssh_host/sign/host" {
+capabilities = ["update"]
+allowed_parameters = {
+"cert_type" = ["host"]
+"*"         = []
+}
+}
+path "ssh_user/config/ca" {
+capabilities = ["read"]
+}
+path "ssh_host/config/ca" {
+capabilities = ["read"]
+}
+path "sys/mounts/ssh_user/tune" {
+capabilities = ["read"]
+}
+path "sys/mounts/ssh_host/tune" {
+capabilities = ["read"]
+}
+path "ssh_host/roles/host" {
+capabilities = ["read"]
+}
+EOF
+)"
+expect_eq "enroll.hcl's SSH part is exactly contract §18.7's" \
+  "$(sed -n '/^# ── SSH (contract §18.7/,$p' "$HERE/../vault/policies/enroll.hcl" | grep -vE '^[[:space:]]*(#|$)' | sed 's/^[[:space:]]*//')" "$SSH_POLICY_WANT"
+SSH_TTLS="$(sed -n '/^# ── SSH (contract §18.7/,$p' "$HERE/../vault/policies/enroll.hcl" | tr -d '\n' | grep -oE '"(max_)?ttl" += \[[^]]*\]' | grep -oE '"[0-9]+"' | tr -d '"' | sort -n | uniq)"
+expect_eq "enroll.hcl: ssh_user role TTLs are exactly the whole hours up to 12 h (none above)" "$(printf '%s\n' "$SSH_TTLS" | tr '\n' ' ')" "3600 7200 10800 14400 18000 21600 25200 28800 32400 36000 39600 43200 "
+
+# ── ssh_setup: the SSH CA mounts (contract §18.7; stub vault) ──
+# State in $SS_DIR: mounts.json (vault secrets list -format=json),
+# ca-<mount> (its CA public key line; absent = no CA yet). Every call is
+# logged to $SS_DIR/calls.
+SS_DIR="$WORK/ssh-setup"; SS_BIN="$WORK/ssh-setup-bin"
+mkdir -p "$SS_DIR" "$SS_BIN"
+cat > "$SS_BIN/vault" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$SS_DIR/calls"
+case "$1 $2" in
+  "secrets enable") m="${3#-path=}"; jq --arg m "$m/" '. + {($m): {type: "ssh", config: {max_lease_ttl: 2764800}}}' "$SS_DIR/mounts.json" > "$SS_DIR/m" && mv "$SS_DIR/m" "$SS_DIR/mounts.json" ;;
+  "secrets tune") ;;
+  "read -field=public_key")
+    m="${3%/config/ca}"
+    if [ -f "$SS_DIR/ca-$m" ]; then cat "$SS_DIR/ca-$m"; else
+      printf 'Error reading %s/config/ca: Error making API request.\n\nCode: 400. Errors:\n\n* keys haven'"'"'t been configured yet\n' "$m" >&2; exit 2; fi ;;
+  "write ssh_user/config/ca"|"write ssh_host/config/ca") m="${2%/config/ca}"; echo "ssh-ed25519 AAAA$m" > "$SS_DIR/ca-$m" ;;
+  "write ssh_host/roles/host") ;;
+  *) echo "unexpected vault call: $*" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$SS_BIN/vault"
+ss() {
+  RC=0; : > "$SS_DIR/calls"
+  OUT="$(PATH="$SS_BIN:$PATH" SS_DIR="$SS_DIR" bash -c '
+    source "$1/scripts/lib/common.sh"; source "$1/scripts/lib/vault.sh"; source "$1/scripts/lib/pki.sh"
+    ssh_setup "$(cat "$SS_DIR/mounts.json")"' _ "$HERE/.." 2>&1)" || RC=$?
+}
+echo '{"pki_int/": {"type": "pki", "config": {"max_lease_ttl": 157680000}}}' > "$SS_DIR/mounts.json"
+ss
+expect_eq "ssh_setup: a fresh Vault exits 0" "$RC" 0
+expect_eq "ssh_setup: a fresh Vault gets both mounts, caps, ed25519 CAs and the host role (contract §18.7)" "$(grep -v '^read ' "$SS_DIR/calls")" \
+'secrets enable -path=ssh_user ssh
+secrets tune -max-lease-ttl=12h ssh_user
+write ssh_user/config/ca generate_signing_key=true key_type=ed25519
+secrets enable -path=ssh_host ssh
+secrets tune -max-lease-ttl=2160h ssh_host
+write ssh_host/config/ca generate_signing_key=true key_type=ed25519
+write ssh_host/roles/host key_type=ca allow_host_certificates=true allow_user_certificates=false allow_user_key_ids=true allowed_domains=* allow_subdomains=true allow_bare_domains=true ttl=2160h max_ttl=2160h'
+# The tuned caps as Vault lists them.
+jq '."ssh_user/".config.max_lease_ttl = 43200 | ."ssh_host/".config.max_lease_ttl = 7776000' "$SS_DIR/mounts.json" > "$SS_DIR/m" && mv "$SS_DIR/m" "$SS_DIR/mounts.json"
+ss
+expect_eq "ssh_setup: a second run exits 0" "$RC" 0
+expect_eq "ssh_setup: a second run creates nothing (only the host role is rewritten)" "$(grep -cE '^(secrets |write ssh_(user|host)/config/ca)' "$SS_DIR/calls"):$(grep -c '^write ssh_host/roles/host ' "$SS_DIR/calls")" "0:1"
+jq '."ssh_user/".config.max_lease_ttl = 86400' "$SS_DIR/mounts.json" > "$SS_DIR/bad.json"
+cp "$SS_DIR/mounts.json" "$SS_DIR/good.json"; cp "$SS_DIR/bad.json" "$SS_DIR/mounts.json"
+ss
+expect_eq "ssh_setup: another cap on ssh_user fails" "$RC" 1
+case "$OUT" in *"ssh_user/ has max_lease_ttl 86400 s, not 12h"*) t_pass "ssh_setup: the cap failure names the mount and the fix" ;; *) t_fail "ssh_setup cap: $OUT" ;; esac
+expect_eq "ssh_setup: a cap failure changes nothing" "$(grep -cE '^(secrets |write )' "$SS_DIR/calls")" 0
+cp "$SS_DIR/good.json" "$SS_DIR/mounts.json"
+echo "ssh-rsa AAAAold" > "$SS_DIR/ca-ssh_host"
+ss
+expect_eq "ssh_setup: a non-ed25519 CA fails (never replaced)" "$RC:$(grep -c 'config/ca generate' "$SS_DIR/calls")" "1:0"
+case "$OUT" in *"the ssh_host CA is not ed25519 (ssh-rsa)"*) t_pass "ssh_setup: the CA failure names the mount and the type" ;; *) t_fail "ssh_setup CA type: $OUT" ;; esac
+echo "ssh-ed25519 AAAAssh_host" > "$SS_DIR/ca-ssh_host"
+jq '."ssh_user/".type = "kv"' "$SS_DIR/good.json" > "$SS_DIR/mounts.json"
+ss
+expect_eq "ssh_setup: ssh_user as another engine fails" "$RC" 1
+case "$OUT" in *"ssh_user/ is a kv engine, not ssh"*) t_pass "ssh_setup: the engine failure names it" ;; *) t_fail "ssh_setup engine: $OUT" ;; esac
+expect_eq "pki_setup calls ssh_setup on both paths (existing CA and new CA)" "$(grep -cE '^ +ssh_setup "[$]mounts"$' "$HERE/../scripts/lib/pki.sh")" 2
 
 # ── cert list / revoke / enroll over both CAs (stub vault + ykman) ──
 CT_ROOT="$WORK/cert-root"
@@ -1882,6 +2012,74 @@ expect_eq "cert enroll exits 0 (stub ykman)" "$RC" 0
 case "$OUT" in *"https://people.example.test/signin"*) t_pass "cert enroll's renewal hint names https://people.<domain>/signin" ;; *) t_fail "cert enroll's renewal hint: $OUT" ;; esac
 case "$OUT" in *"enroll.example.test"*) t_fail "cert enroll still names enroll.<domain>" ;; *) t_pass "cert enroll no longer names enroll.<domain>" ;; esac
 expect_eq "cert enroll signs with pki_int's client-cert role" "$(grep -c '^write -format=json pki_int/sign/client-cert .*common_name=alice' "$WORK/cert-calls")" 1
+
+# ── ssh breakglass-cert / enroll-self (contract §18.10; stub vault) ──
+BG_ROOT="$WORK/bg-root"; BG_BIN="$WORK/bg-bin"
+mkdir -p "$BG_ROOT/secrets" "$BG_BIN"
+ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/bg-ca" >/dev/null
+ssh-keygen -q -t ed25519 -N '' -C '' -f "$WORK/bg-user" >/dev/null
+ssh-keygen -q -s "$WORK/bg-ca" -I pc-breakglass:outage -n u:alice@web -z 4242 -V +1h "$WORK/bg-user.pub" >/dev/null 2>&1
+cat > "$BG_BIN/vault" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$BG_CALLS"
+cat > "$BG_STDIN"
+case "$*" in
+  "write -format=json ssh_user/sign/hg-web -") jq -n --rawfile c "$BG_CERT" '{data: {signed_key: $c, serial_number: "10:92"}}' ;;
+  *) echo "Error writing data: Code: 400" >&2; exit 2 ;;
+esac
+STUB
+chmod +x "$BG_BIN/vault"
+bg() {
+  RC=0; : > "$WORK/bg-calls"
+  PATH="$BG_BIN:$PATH" BG_CALLS="$WORK/bg-calls" BG_STDIN="$WORK/bg-stdin" BG_CERT="$WORK/bg-user-cert.pub" \
+    VAULT_TOKEN=ROOT-TOKEN-BG-777 PORTCULLIS_ROOT="$BG_ROOT" "$CLI" ssh breakglass-cert "$@" >"$WORK/out" 2>"$WORK/err" </dev/null || RC=$?
+  OUT="$(cat "$WORK/out")"; ERR="$(cat "$WORK/err")"
+}
+bg --user alice --host-group web --ttl 1h --key "$WORK/bg-user.pub" --note outage
+expect_eq "ssh breakglass-cert exits 0" "$RC" 0
+expect_eq "ssh breakglass-cert prints the certificate" "$(printf '%s\n' "$OUT" | grep -c '^ssh-ed25519-cert-v01@openssh.com ')" 1
+expect_eq "ssh breakglass-cert: one sign on ssh_user/sign/hg-web, the body on stdin" "$(cat "$WORK/bg-calls")" "write -format=json ssh_user/sign/hg-web -"
+expect_eq "ssh breakglass-cert: the root token is on no argv" "$(grep -c 'ROOT-TOKEN-BG-777' "$WORK/bg-calls" || true)" 0
+expect_eq "ssh breakglass-cert: the sign body (principal, ttl, permit-pty map, key id)" \
+  "$(jq -c '[.valid_principals, .ttl, .extensions, .key_id, (.public_key | startswith("ssh-ed25519 "))]' "$WORK/bg-stdin")" \
+  '["u:alice@web","3600s",{"permit-pty":""},"pc-breakglass:outage",true]'
+expect_eq "ssh breakglass-cert: the record line (serial, principal, fingerprint, note) in secrets/ssh/breakglass.jsonl" \
+  "$(jq -c '[.user, .host_group, .principals, .serial, (.key_fp | startswith("SHA256:")), .note, (.valid_before | endswith("Z")), (.public_key | startswith("ssh-ed25519 "))]' "$BG_ROOT/secrets/ssh/breakglass.jsonl")" \
+  '["alice","web",["u:alice@web"],"4242",true,"outage",true,true]'
+expect_eq "ssh breakglass-cert: the record 0640, its directory 0750" "$(file_mode "$BG_ROOT/secrets/ssh/breakglass.jsonl"):$(file_mode "$BG_ROOT/secrets/ssh")" "640:750"
+for bad in "--user alice --account deploy --host-group web --ttl 1h --key $WORK/bg-user.pub" \
+           "--host-group web --ttl 1h --key $WORK/bg-user.pub" \
+           "--user Alice --host-group web --ttl 1h --key $WORK/bg-user.pub" \
+           "--user alice --host-group portcullis-servers --ttl 1h --key $WORK/bg-user.pub" \
+           "--user alice --host-group web --ttl 13h --key $WORK/bg-user.pub" \
+           "--user alice --host-group web --ttl 4m --key $WORK/bg-user.pub" \
+           "--user alice --host-group web --ttl 1d --key $WORK/bg-user.pub" \
+           "--user alice --host-group web --ttl 1h --key $WORK/bg-user.pub --note bad;note" \
+           "--user alice --host-group web --ttl 1h"; do
+  # shellcheck disable=SC2086
+  bg $bad
+  expect_eq "ssh breakglass-cert $bad → exit 2, nothing signed" "$RC:$(wc -l < "$WORK/bg-calls" | tr -d ' ')" "2:0"
+done
+bg --user alice --host-group web --ttl 1h --key "$WORK/bg-user"
+expect_eq "ssh breakglass-cert refuses a private key file (nothing signed)" "$RC:$(wc -l < "$WORK/bg-calls" | tr -d ' ')" "1:0"
+bg --account deploy --host-group web --ttl 30m --key "$WORK/bg-user.pub"
+expect_eq "ssh breakglass-cert: a certificate naming other principals than asked is refused, nothing recorded" \
+  "$RC:$(jq -r '.valid_principals' "$WORK/bg-stdin"):$(wc -l < "$BG_ROOT/secrets/ssh/breakglass.jsonl" | tr -d ' ')" "1:s:deploy@web:1"
+# Ruling RR3: --approved asks for the approved principal (up:).
+ssh-keygen -q -s "$WORK/bg-ca" -I pc-breakglass:outage -n up:alice@web -z 4244 -V +1h "$WORK/bg-user.pub" >/dev/null 2>&1
+bg --user alice --host-group web --ttl 1h --key "$WORK/bg-user.pub" --approved
+expect_eq "ssh breakglass-cert --approved signs up:alice@web" "$RC:$(jq -r '.valid_principals' "$WORK/bg-stdin")" "0:up:alice@web"
+# L-A6: a certificate naming the asked principal and another one too.
+ssh-keygen -q -s "$WORK/bg-ca" -I pc-breakglass:outage -n u:alice@web,u:bob@web -z 4243 -V +1h -O clear "$WORK/bg-user.pub" >/dev/null 2>&1
+bg --user alice --host-group web --ttl 1h --key "$WORK/bg-user.pub"
+expect_eq "ssh breakglass-cert: a certificate naming the principal and another one is refused, nothing recorded" \
+  "$RC:$(wc -l < "$BG_ROOT/secrets/ssh/breakglass.jsonl" | tr -d ' ')" "1:2"
+RC=0; PORTCULLIS_ROOT="$BG_ROOT" "$CLI" ssh enroll-self pcenrol1.abc >/dev/null 2>&1 </dev/null || RC=$?
+expect_eq "ssh enroll-self: a code on the command line is refused (exit 2)" "$RC" 2
+RC=0; PORTCULLIS_ROOT="$BG_ROOT" "$CLI" ssh enroll-self --no-ssh >/dev/null 2>&1 </dev/null || RC=$?
+expect_eq "ssh enroll-self --no-ssh exits 0 and does nothing" "$RC" 0
+expect_eq "ssh enroll-self passes the code on stdin, never argv" \
+  "$(sed -n '/^ssh_enroll_self()/,/^}/p' "$HERE/../scripts/lib/ssh.sh" | grep -c 'printf .%s\\n. "$code" | "${sudo\[@\]}" "$SSH_PORTCULLIS_BIN" "${args\[@\]}"')" 1
 
 expect_eq "docker was never called" "$(cat "$STUB_CALLS" 2>/dev/null)" ""
 

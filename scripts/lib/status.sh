@@ -285,6 +285,11 @@ status_run() {
   fi
   [ "$(printf '%s' "$vpn_json" | jq -r '.problem')" != true ] || problems=1
 
+  # ── SSH access (contract §18): the Hub's view; a problem only when on ──
+  local ssh_json='{"reachable":false,"enabled":null,"problem":false,"problems":[],"hosts":[]}'
+  if declare -F ssh_status_json >/dev/null; then ssh_json="$(ssh_status_json)" || ssh_json='{"reachable":false,"enabled":null,"problem":false,"problems":[],"hosts":[]}'; fi
+  [ "$(printf '%s' "$ssh_json" | jq -r '.problem')" != true ] || problems=1
+
   # ── Servers (contract §17): link down, or a worker silent > 3 min ──
   local servers_json='{"enabled":false,"peers":[],"problem":false}'
   if declare -F link_status_json >/dev/null; then
@@ -298,14 +303,14 @@ status_run() {
   if [ -n "$mail_json" ] && [ "$(printf '%s' "$mail_json" | jq -r '.problem')" = true ]; then problems=1; fi
 
   if [ "$json" = true ]; then
-    jq -n --arg d "${PORTCULLIS_DOMAIN:-}" --argjson s "$services" --argjson v "$vault_json" --argjson vpn "$vpn_json" --argjson srv "$servers_json" \
+    jq -n --arg d "${PORTCULLIS_DOMAIN:-}" --argjson s "$services" --argjson v "$vault_json" --argjson vpn "$vpn_json" --argjson srv "$servers_json" --argjson ssh "$ssh_json" \
       --argjson k "$kc" --argjson l "$lldap" --arg t "$traefik" --argjson p "$problems" --arg sh "$shadows" --arg mr "$mcp_refusing" --arg dn "$dns_json" \
       --argjson rt "$rt_json" --argjson kx "$kx" --arg ck "$clock" --arg ml "$mail_json" \
       '{domain: $d, ok: ($p == 0), problems: $p, runtime: $rt,
         system: {clock_synced: (if $ck == "true" then true elif $ck == "false" then false else "unknown" end)}, services: $s, vault: $v, keycloak: $k, lldap: $l, traefik: {state: $t},
         dns_shadows: [$sh | split("\n")[] | select(. != "") | capture("^(?<container>[^ ]+) (?<name>.+)$")],
         mcp_gate: {refusing: (if $mr == "" then null else $mr end)},
-        dns: (if $dn == "" then null else ($dn | fromjson) end), vpn: $vpn, servers: $srv} + ($kx | del(.dns_shadows))
+        dns: (if $dn == "" then null else ($dn | fromjson) end), vpn: $vpn, servers: $srv, ssh: $ssh} + ($kx | del(.dns_shadows))
         + (if $ml == "" then {} else {mail: ($ml | fromjson)} end)'
     return "$problems"
   fi
@@ -428,6 +433,7 @@ status_run() {
   _st_dns_lines "$dns_json" "$traefik_uri" "$env_uri"
   if declare -F vpn_status_lines >/dev/null; then vpn_status_lines "$vpn_json"; fi
   if declare -F link_status_lines >/dev/null; then link_status_lines "$servers_json"; fi
+  if declare -F ssh_status_lines >/dev/null; then ssh_status_lines "$ssh_json"; fi
   if declare -F mail_status_lines >/dev/null; then mail_status_lines "$mail_json"; fi
 
   printf '\n%sDomain: %s — run with --json for machine-readable output%s\n\n' "$C_DIM" "${PORTCULLIS_DOMAIN:-?}" "$C_NC"
@@ -465,6 +471,8 @@ status_textfile() {
     ((.vault.client_certs // [])[] | "portcullis_client_cert_expiry_timestamp_seconds{cn=\"\(.cn | esc)\",kind=\"\(.kind | esc)\"} \(.epoch)"),
     g("portcullis_vpn_mode_restricted"; "1 when the VPN mode is admin or server (core surfaces VPN-only; PortcullisVPNDown watches wg)."),
     "portcullis_vpn_mode_restricted \(if ((.vpn.mode // "apps") == "apps") then 0 else 1 end)",
+    g("portcullis_ssh_ca_ok"; "1 if SSH access is on and enroll reports no Vault difference (mounts, caps, CAs, host role); absent while SSH access is off or the Hub does not answer."),
+    (if (.ssh.enabled // false) != true then empty else "portcullis_ssh_ca_ok \(if ((.ssh.problems // []) | length) == 0 then 1 else 0 end)" end),
     g("portcullis_dns_check"; "1 if the DNS check (address, caa, dnssec, foreign) of the name has no Warning or Problem (absent: DNS checks unavailable)."),
     (if .dns == null then empty else ([.dns.main] + [.dns.domains[]])[] | . as $d | ($d.checks | to_entries[] | "portcullis_dns_check{name=\"\($d.name | esc)\",check=\"\(.key)\"} \(.value)") end),
     g("portcullis_dnssec_state"; "1 for the current DNSSEC state of the name."),

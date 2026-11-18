@@ -193,6 +193,10 @@ def main():
                 F.add(f"the Hub's Role: {rule['resources']}")
             if set(rule["verbs"]) & {"escalate", "bind", "impersonate", "*"}:
                 F.add(f"the Hub's Role: verbs {rule['verbs']}")
+            if "metrics.k8s.io" in rule.get("apiGroups", []) and (rule["resources"] != ["pods"] or sorted(rule["verbs"]) != ["get", "list"]):
+                F.add("the Hub's Role: metrics.k8s.io only pods get/list (the Usage page; never nodes)")
+            if any(x.startswith("nodes") for x in rule["resources"]):
+                F.add(f"the Hub's Role: never nodes, nodes/stats or nodes/proxy ({rule['resources']})")
     # What Traefik 3.7's CRD provider lists in a watched namespace: a
     # resource it can't list keeps it from loading any route (e2e-k3s saw
     # configmaps forbidden → every core route 404).
@@ -393,8 +397,8 @@ def check_edge(docs):
                 and (m.get("labels") or {}).get("portcullis.io/owner") != "core":
             F.add(f"{d['kind']} {m.get('namespace')}/{m['name']}: a chart object the policies judge without portcullis.io/owner=core")
     # The params' edgeCoreMiddlewares (no Hub route may name them) = the
-    # chart's edge Middlewares + the CLI's hub-proxy-secret.
-    want = sorted(["hub-proxy-secret"] + [d["metadata"]["name"] for d in K.by_kind(docs, "Middleware")])
+    # chart's edge Middlewares + the CLI's hub-proxy-secret / hub-cli-proxy-secret.
+    want = sorted(["hub-proxy-secret", "hub-cli-proxy-secret"] + [d["metadata"]["name"] for d in K.by_kind(docs, "Middleware")])
     params = yaml.safe_load((K.ROOT / "kube" / "admission" / "params.yaml").read_text())["data"]
     if sorted(params["edgeCoreMiddlewares"].split()) != want:
         F.add(f"kube/admission/params.yaml edgeCoreMiddlewares {params['edgeCoreMiddlewares']!r} != the core edge Middlewares {want}")

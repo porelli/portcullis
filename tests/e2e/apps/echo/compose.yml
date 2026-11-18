@@ -23,6 +23,9 @@ services:
     command: ["sh", "-c", "trap '' TERM; while :; do sleep 1; done"]
     stop_grace_period: ${ECHO_STOP_GRACE:-1s}
     network_mode: none
+    # Limits the Usage e2e reads back (e2e_usage.py: hold's 32 MiB).
+    mem_limit: 32m
+    pids_limit: 32
     read_only: true
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

@@ -308,7 +308,10 @@ Idempotent; run by `portcullis init`, `upgrade` and `restore`.
      mounted read-only into vault, which auto-unseals on every start).
   3. Unseals Vault if it is sealed and waits until the raft node is active.
   4. Enables AppRole, writes the portcullis-enroll policy
-     (vault/policies/enroll.hcl) and role, and stores the enroll role-id /
+     (vault/policies/enroll.hcl: the YubiKey and browser certificate CAs, and SSH:
+     per-host-group roles on ssh_user with TTLs pinned to whole hours up
+     to 12h, user and host signing, the CA public keys) and role, and
+     stores the enroll role-id /
      secret-id in secrets/enroll/ (0640, group 10002 = the enroll user;
      mounted read-only into enroll).
   5. Writes the portcullis-metrics policy (vault/policies/metrics.hcl: read

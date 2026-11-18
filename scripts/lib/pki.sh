@@ -323,6 +323,61 @@ _pki_export() {
   PKI_TRUSTSTORE_CHANGED=true
 }
 
+# ── SSH certificate authorities (contract §18.7) ──────────────────────
+# Two ssh mounts, each with its own ed25519 CA: ssh_user (people's
+# certificates; mount cap 12h — the 12 h limit itself is enroll's policy,
+# which pins role TTLs) and ssh_host (host certificates, 2160h), plus the
+# host role. Idempotent: an existing mount is checked, never re-created;
+# another engine type, cap or CA key type is a fail naming it (the CAs
+# are what every host trusts: replacing one silently would lock people
+# out). pki setup --force never touches them.
+SSH_MOUNTS="ssh_user:43200:12h ssh_host:7776000:2160h"
+
+# _ssh_ca_state <mount> — prints the CA public key line; 2 = no CA yet
+# (Vault's "keys haven't been configured yet"); anything else aborts.
+_ssh_ca_state() {
+  local rc=0 out
+  out="$(vault read -field=public_key "$1/config/ca" 2>&1)" || rc=$?
+  if [ "$rc" = 0 ] && [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+  if [ "$rc" = 2 ] && printf '%s' "$out" | grep -q "keys haven't been configured yet"; then return 2; fi
+  printf "ERROR: 'vault read %s/config/ca' failed (exit %s):\n" "$1" "$rc" >&2
+  printf '%s\n' "$out" | sed 's/^/    /' >&2
+  exit 1
+}
+
+# ssh_setup <vault secrets list -format=json>
+ssh_setup() {
+  local mounts="$1" spec m secs human type cap ca rc
+  for spec in $SSH_MOUNTS; do
+    IFS=: read -r m secs human <<<"$spec"
+    type="$(printf '%s' "$mounts" | jq -r --arg m "$m/" '.[$m].type // empty')"
+    if [ -z "$type" ]; then
+      info "Creating the SSH CA mount $m (max lease $human)..."
+      vault secrets enable -path="$m" ssh >/dev/null || fail "cannot enable the ssh engine at $m"
+      vault secrets tune -max-lease-ttl="$human" "$m" >/dev/null || fail "cannot tune $m"
+    else
+      [ "$type" = ssh ] || fail "Vault mount $m/ is a $type engine, not ssh: move it away (Portcullis never replaces it)"
+      cap="$(printf '%s' "$mounts" | jq -r --arg m "$m/" '.[$m].config.max_lease_ttl // empty')"
+      [ "$cap" = "$secs" ] || fail "Vault mount $m/ has max_lease_ttl ${cap:-unset} s, not $human ($secs s): fix it with vault secrets tune -max-lease-ttl=$human $m"
+    fi
+    rc=0; ca="$(_ssh_ca_state "$m")" || rc=$?
+    if [ "$rc" = 2 ]; then
+      info "Generating the $m CA (ed25519, inside Vault)..."
+      vault write "$m/config/ca" generate_signing_key=true key_type=ed25519 >/dev/null || fail "cannot create the $m CA"
+    else
+      case "$ca" in
+        "ssh-ed25519 "*) ;;
+        *) fail "the $m CA is not ed25519 (${ca%% *}): Portcullis never replaces a CA hosts may trust; move it away by hand" ;;
+      esac
+    fi
+  done
+  # The host role: fixed values, rewritten every run.
+  vault write ssh_host/roles/host key_type=ca allow_host_certificates=true \
+    allow_user_certificates=false allow_user_key_ids=true allowed_domains="*" allow_subdomains=true \
+    allow_bare_domains=true ttl=2160h max_ttl=2160h >/dev/null || fail "cannot write ssh_host/roles/host"
+  ok "SSH CAs ready (ssh_user 12h, ssh_host 2160h, ed25519)"
+}
+
 # pki_setup <force> <with_server_cert>
 pki_setup() {
   local force="$1" server_cert="$2"
@@ -388,6 +443,7 @@ pki_setup() {
     if [ "$server_cert" = true ] && [ ! -s "$certs/server.crt" ]; then
       _pki_issue_server_cert "$domain" "$certs"
     fi
+    ssh_setup "$mounts"
     return 0
   fi
 
@@ -455,6 +511,7 @@ pki_setup() {
   if [ "$server_cert" = true ]; then
     _pki_issue_server_cert "$domain" "$certs"
   fi
+  ssh_setup "$mounts"
   # shellcheck disable=SC2034  # read by stack.sh
   PKI_CREATED=true
   ok "Vault PKI ready: $certs/ca-chain.crt (both CAs), ca-chain-yubikey.crt, yubikey-ca.crt, browser-ca.crt, node-ca.crt (in no trust list)"
@@ -464,7 +521,7 @@ help_pki() {
   cat <<'EOF'
 Usage: portcullis pki setup [--force] [--with-server-cert]
 
-  setup     Create the internal certificate authority (YubiKey and browser certificate CAs)
+  setup     Create the internal certificate authority (YubiKey and browser certificate CAs, SSH CAs)
 EOF
 }
 
@@ -508,6 +565,13 @@ Refuses when the two intermediates have the same CN, when pki_node is not
 its own self-signed root, and refuses to create a new CA when Vault has
 none but certs/ca-chain.crt (or node-ca.crt) exists (Vault data lost) —
 restore a backup or use --force.
+
+SSH (contract §18.7): the ssh_user mount (people's SSH certificates, max
+lease 12h) and ssh_host (host certificates, 2160h), each with an ed25519
+CA generated inside Vault, and the host role ssh_host/roles/host. An
+existing mount or CA is checked, never replaced: another engine type, cap
+or CA key type stops setup with the fix to make. --force never touches
+the SSH CAs.
 
 Options:
   --force              DESTROY every CA and create new ones (every YubiKey

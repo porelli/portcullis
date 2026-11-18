@@ -51,3 +51,5 @@ __pycache__/
 
 # The mailctl build output (go build in mailctl/): never committed.
 /mailctl/mailctl
+# A local `go build` in enroll/ (final review M10).
+/enroll/enroll
