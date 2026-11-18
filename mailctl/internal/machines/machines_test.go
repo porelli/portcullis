@@ -718,3 +718,54 @@ func TestLoopWaitShortWhilePending(t *testing.T) {
 		t.Fatalf("all active: %v (%+v)", w, read[dkim.State](e.st.Get(), extDKIM).Keys)
 	}
 }
+
+// Ruling X-H1: the DMARC stage starts at max(dmarc_start, dmarc_floor) and
+// never serves below the floor: a fresh store (start none, floor reject)
+// and a restored older store whose state says none both publish p=reject
+// (before and after a pass); the status shows reject, nothing proposed.
+func TestDMARCNeverBelowFloor(t *testing.T) {
+	floor := func(d *state.Doc) {
+		for i := range d.Domains {
+			if d.Domains[i].Name == "team-b.example.org" {
+				d.Domains[i].DMARCStart, d.Domains[i].DMARCFloor = "none", "reject"
+			}
+		}
+	}
+	dmarcTXT := func(e *env) string {
+		return strings.Join(records(t, e, "team-b.example.org")["TXT _dmarc.team-b.example.org"], "|")
+	}
+	// Fresh: before any pass, and after one.
+	e := newEnv(t, floor)
+	if v := dmarcTXT(e); !strings.Contains(v, "p=reject") {
+		t.Fatalf("fresh store before a pass: %q", v)
+	}
+	e.step(t)
+	if v := dmarcTXT(e); !strings.Contains(v, "p=reject") {
+		t.Fatalf("fresh store after a pass: %q", v)
+	}
+	st, _ := e.m.Status(context.Background(), true)
+	if st.DMARC[1].Policy != "reject" || st.DMARC[1].Proposed != nil {
+		t.Fatalf("status %+v", st.DMARC[1])
+	}
+	// Restored older store: its own state says none.
+	e2 := newEnv(t, floor)
+	e2.st.Update(func(p *state.Persistent) error {
+		put(p, extDMARC, map[string]dmarc.Domain{"team-b.example.org": {Policy: "none", Since: t0}})
+		return nil
+	})
+	if v := dmarcTXT(e2); !strings.Contains(v, "p=reject") {
+		t.Fatalf("restored store before a pass: %q", v)
+	}
+	e2.step(t)
+	if v := dmarcTXT(e2); !strings.Contains(v, "p=reject") {
+		t.Fatalf("restored store after a pass: %q", v)
+	}
+	if got := read[map[string]dmarc.Domain](e2.st.Get(), extDMARC)["team-b.example.org"].Policy; got != "reject" {
+		t.Fatalf("restored store's stage: %q", got)
+	}
+	// A quarantine floor lifts none to quarantine and keeps reject.
+	if dmarc.AtLeast(dmarc.Domain{Policy: "none"}, "quarantine", t0).Policy != "quarantine" ||
+		dmarc.AtLeast(dmarc.Domain{Policy: "reject"}, "quarantine", t0).Policy != "reject" {
+		t.Fatal("AtLeast")
+	}
+}

@@ -7,7 +7,8 @@
 # stack's own 172.16.0.0/12 networks); every DNS name the mail side asks
 # for is answered by the one fake zone (the domains service's, shared with
 # the dns tool and mail-cert through DOMAINS_FAKEDNS_REMOTE); the remote
-# mail server (e2e-mail-remote.sh) is a container on mail-egress.
+# mail server (e2e-mail-remote.sh) is a container on the template's egress
+# network (portcullis-stalwart_egress, pinned by the CI copy).
 set -euo pipefail
 CURL_IMG=docker.io/curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
 EXTRA=team-b.test

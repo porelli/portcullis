@@ -22,7 +22,7 @@ type Former struct {
 	Since    time.Time `json:"since"`
 }
 
-// Persistent is mailctl's state.json (mailctl_data, 0600): the last accepted
+// Persistent is mailctl's state.json (the adapter's data volume, 0600): the last accepted
 // document, what was applied, the former accounts and the state machines'
 // records (later tasks add theirs).
 type Persistent struct {

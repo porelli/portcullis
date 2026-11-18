@@ -11,6 +11,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -313,5 +316,32 @@ func TestActionsTest(t *testing.T) {
 	ready(t, e, noPM)
 	if w := e.do("POST", "/v1/actions/test", `{"to":"x@example.net"}`); w.Code != 409 {
 		t.Fatalf("no postmaster: %d %s", w.Code, w.Body)
+	}
+}
+
+// M6 (final cross review): the Hub's client gives up after 30 s while a
+// void may run for minutes; a request whose context is already cancelled
+// (the client gone) still voids to the end — the Hub's retry then finds
+// nothing left — rather than stopping half way.
+func TestVoidCompletesWhenTheClientIsGone(t *testing.T) {
+	e := newV1(t)
+	ready(t, e, vec(t, 12))
+	create(t, e, "alice", uuidAlice)
+	create(t, e, "bob", uuidBob)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r := httptest.NewRequest("POST", "/v1/void", strings.NewReader(`{"reason":"restore"}`)).WithContext(ctx)
+	r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey, &net.TCPAddr{IP: net.ParseIP("172.31.255.19")}))
+	r.RemoteAddr = "172.31.255.18:40000"
+	r.Header.Set("Authorization", "Bearer "+secretA)
+	w := httptest.NewRecorder()
+	e.s.ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("void with the client gone: %d %s", w.Code, w.Body.String())
+	}
+	for _, la := range e.f.Objects("Account", "") {
+		if n := len(e.f.Objects("AppPassword", la["id"].(string))); n != 0 {
+			t.Fatalf("%d passwords left on %v", n, la["name"])
+		}
 	}
 }

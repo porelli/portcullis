@@ -410,7 +410,7 @@ _backup_mail_provider() {
     fail "the mail provider's instance backup failed (hub mail backup): no backup made"; }
   out="$MAIL_HUB_OUT"
   a="$(printf '%s' "$out" | jq -r '.archive // ""' 2>/dev/null)"
-  [[ "$a" =~ ^[a-z0-9][a-z0-9-]{0,62}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.tar$ ]] || fail "the Hub's mail backup answer names no archive"
+  [[ "$a" =~ $MAIL_ARCHIVE_RE ]] || fail "the Hub's mail backup answer names no archive"
   BACKUP_MAIL_ARCHIVE="$a"
   printf ' %sdone%s %s\n' "$C_GREEN" "$C_NC" "$a"
 }
@@ -612,7 +612,7 @@ _backup_verify_mail_archive() {
   local dir="$1" a list
   a="$(jq -r '.mail_provider_archive // ""' "$dir/MANIFEST.json" 2>/dev/null)"
   [ -n "$a" ] || return 0
-  if ! [[ "$a" =~ ^[a-z0-9][a-z0-9-]{0,62}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.tar$ ]]; then
+  if ! [[ "$a" =~ $MAIL_ARCHIVE_RE ]]; then
     warn "MANIFEST.json's mail_provider_archive is malformed: $a"; return 1
   fi
   # The member itself, read as a tar (portable: no `tar -v` columns).
@@ -806,7 +806,70 @@ _restore_lldap_guard() {
 # If hub_stopped=true, returns error codes instead of calling fail (so the
 # caller can restart the Hub).
 RESTORE_STOPPED_APPS=""
+RESTORE_STOPPED_MAIL=""
+# The Hub's instance archive names (its archiveRe, internal/hub/backup.go:
+# instance ids may hold "_"; L4) and instance ids.
+MAIL_ARCHIVE_RE='^[a-z0-9][a-z0-9_-]{0,63}/[0-9]{8}T[0-9]{6}Z\.tar$'
 _RESTORE_ERROR_MSG=""
+
+# _restore_mail_instance — the wired mail provider's instance id as the
+# Hub names it (`hub mail status`), asked before the Hub stops; "" when
+# the slot is closed, nothing is wired or the Hub can't answer (the stop
+# below then goes by the volumes alone).
+_restore_mail_instance() {
+  local st
+  mail_slot_open || return 0
+  st="$(_mail_hub status 2>/dev/null)" || return 0
+  printf '%s' "$st" | jq -r 'select(.wired == true) | .instance // empty | select(test("^[a-z0-9][a-z0-9_-]{0,63}$"))' 2>/dev/null || true
+}
+
+# _restore_stop_mail_provider <instance or ""> <core project> — Ruling
+# X-H2: the provider mounts no hub_secrets since R-POD2, so the restore
+# stops it on its own, before anything changes (contract §19.11: the Hub
+# holds it until `hub mail restore` voided and restored it). Taken down
+# (volumes kept): the Hub's wired instance, and every project with a
+# container mounting the provider slot or mail_tls (the gated services;
+# also when the Hub couldn't name it), listed in RESTORE_STOPPED_MAIL.
+# Fail closed: an unlistable engine or a failed down returns 1 with
+# _RESTORE_ERROR_MSG.
+_restore_stop_mail_provider() {
+  local inst="$1" core="$2" vol full projects="" ids id p empty
+  _rt_docker_only
+  [ -z "$inst" ] || projects="portcullis-$inst"
+  for vol in mail_provider_slot mail_tls; do
+    full="$(_volume_name "$vol")"; full="${full:-portcullis_$vol}"
+    if ! ids="$(docker ps -aq --filter "volume=$full")"; then
+      _RESTORE_ERROR_MSG="can't list the containers using $full (docker ps failed): nothing was restored"
+      return 1
+    fi
+    for id in $ids; do
+      if ! p="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$id")"; then
+        _RESTORE_ERROR_MSG="can't inspect container $id (it mounts $full): nothing was restored"
+        return 1
+      fi
+      [ "$p" = "$core" ] && continue
+      if [ -z "$p" ]; then
+        _RESTORE_ERROR_MSG="container $id mounts $full but isn't part of a compose project: remove it (docker rm -f $id), then restore again. Nothing was restored"
+        return 1
+      fi
+      case " $projects " in *" $p "*) ;; *) projects="${projects:+$projects }$p" ;; esac
+    done
+  done
+  [ -n "$projects" ] || return 0
+  info "Taking down the mail provider (volumes kept; the Hub restores it): $projects"
+  empty="$(mktemp -d)"
+  for p in $projects; do
+    case " $RESTORE_STOPPED_APPS $RESTORE_STOPPED_MAIL " in *" $p "*) continue ;; esac
+    if ! (cd "$empty" && env -u COMPOSE_FILE -u COMPOSE_PROJECT_NAME docker compose -p "$p" down); then
+      rmdir "$empty" 2>/dev/null || true
+      _RESTORE_ERROR_MSG="could not take down the mail provider $p (docker compose -p $p down failed): nothing was restored"
+      return 1
+    fi
+    RESTORE_STOPPED_MAIL="${RESTORE_STOPPED_MAIL:+$RESTORE_STOPPED_MAIL }$p"
+  done
+  rmdir "$empty" 2>/dev/null || true
+}
+
 _restore_stop_secret_apps() {
   local vol="$1" core="$2" hub_stopped="${3:-false}" ids id p left empty
   _rt_docker_only
@@ -916,7 +979,7 @@ _restore_runtime_keys() {
 backup_restore() { if _rt_is_kube; then _backup_restore_kube "$@"; else _backup_restore_docker "$@"; fi; }
 
 _backup_restore_docker() {
-  local dir="$1" yes="$2" allow_empty_lldap="${3:-false}" pre had_env=false key uid gid full spec proj helper
+  local dir="$1" yes="$2" allow_empty_lldap="${3:-false}" pre had_env=false key uid gid full spec proj helper mail_inst=""
   _rt_docker_only
   require_cmd docker jq curl tar gzip
   [ -d "$dir" ] || fail "Backup directory not found: $dir"
@@ -940,11 +1003,13 @@ _backup_restore_docker() {
   hub_stopped=false
   if [ "$had_env" = true ]; then
     _backup_load_cfg
+    mail_inst="$(_restore_mail_instance)"
     info "Stopping Hub..."
     rt_stop hub || fail "could not stop the Hub: nothing was restored"
     hub_stopped=true
     full="$(_volume_name hub_secrets)"
-    if ! _restore_stop_secret_apps "${full:-portcullis_hub_secrets}" "$(_project_name)" true; then
+    if ! _restore_stop_secret_apps "${full:-portcullis_hub_secrets}" "$(_project_name)" true \
+       || ! _restore_stop_mail_provider "$mail_inst" "$(_project_name)"; then
       info "Restarting Hub..."
       if rt_start hub 2>/dev/null; then
         fail "$_RESTORE_ERROR_MSG, Hub running again"
@@ -954,6 +1019,7 @@ _backup_restore_docker() {
     fi
   else
     _restore_stop_secret_apps portcullis_hub_secrets portcullis false
+    _restore_stop_mail_provider "" portcullis || fail "$_RESTORE_ERROR_MSG"
   fi
   pre="$BACKUP_ROOT/pre-restore-$(date +%Y%m%d-%H%M%S)"
   if [ "$had_env" = true ]; then
@@ -1094,6 +1160,7 @@ _backup_restore_docker() {
   else
     ok "Restore complete.${pre:+ Previous .env/secrets/certs: $pre.} Verify with ./portcullis status"
   fi
+  [ -z "$RESTORE_STOPPED_MAIL" ] || info "The mail provider ($RESTORE_STOPPED_MAIL) was taken down for the restore: the Hub starts it again only after restoring it from the backup (above); else from its instance page."
   if [ -n "$RESTORE_STOPPED_APPS" ]; then
     warn "Taken down for the restore and NOT started again: $RESTORE_STOPPED_APPS. Their file-share passwords were voided by the restore (people create new ones on My apps). Start each one again from the Hub: its drift shows it as not running (resolve the drift there, or restart the app)."
   fi
@@ -1114,7 +1181,7 @@ _restore_mail_provider() {
   _rt_docker_only
   a="$(jq -r '.mail_provider_archive // ""' "$1/MANIFEST.json" 2>/dev/null)"
   [ -n "$a" ] || return 0
-  [[ "$a" =~ ^[a-z0-9][a-z0-9-]{0,62}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.tar$ ]] || { warn "MANIFEST.json's mail_provider_archive is malformed: not restored"; return 1; }
+  [[ "$a" =~ $MAIL_ARCHIVE_RE ]] || { warn "MANIFEST.json's mail_provider_archive is malformed: not restored"; return 1; }
   if ! mail_slot_open; then
     warn "The backup holds a mail provider ($a) but the mail slot is closed here: ./portcullis mail enable --provider none, then restore it from the Hub."
     return 1

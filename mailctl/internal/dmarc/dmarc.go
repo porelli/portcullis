@@ -39,6 +39,26 @@ func Start(dmarcStart string, now time.Time) Domain {
 	return Domain{Policy: None, Since: now}
 }
 
+func rank(p string) int {
+	switch p {
+	case Quarantine:
+		return 1
+	case Reject:
+		return 2
+	}
+	return 0
+}
+
+// AtLeast is d raised to floor (Ruling X-H1: the document's dmarc_floor
+// is the lowest policy the provider may publish, also for a store older
+// than the floor); a raise restarts the clean-day count.
+func AtLeast(d Domain, floor string, now time.Time) Domain {
+	if rank(d.Policy) < rank(floor) {
+		d.Policy, d.Since = floor, now
+	}
+	return d
+}
+
 // Observe records the reports' failures.
 func Observe(d Domain, reports []Report) Domain {
 	for _, r := range reports {

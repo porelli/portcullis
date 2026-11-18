@@ -142,7 +142,9 @@ func (v *V1) void(w http.ResponseWriter, r *http.Request) {
 		v.Runner.LockPass()
 		defer v.Runner.UnlockPass()
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
+	// Its own deadline, never the client's (M6): the Hub's client gives up
+	// after 30 s, and a void stopped half way only costs a retry.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Minute)
 	defer cancel()
 	n, err := creds.VoidAll(ctx, v.C)
 	if err != nil {
@@ -271,6 +273,11 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// writeKind is a refusal the Hub branches on (contract §19.5: error_kind).
+func writeKind(w http.ResponseWriter, status int, kind, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "error_kind": kind})
+}
+
 func (v *V1) unreachable(w http.ResponseWriter, err error) {
 	if v.Logf != nil {
 		v.Logf("api: stalwart: %v", err)
@@ -306,7 +313,7 @@ func (v *V1) putState(w http.ResponseWriter, r *http.Request) {
 	}
 	p := v.Store.Get()
 	if doc.Generation <= p.Generation {
-		writeErr(w, http.StatusConflict, "generation is not greater than the last accepted one")
+		writeKind(w, http.StatusConflict, "generation", "generation is not greater than the last accepted one")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
@@ -349,7 +356,7 @@ func (v *V1) putState(w http.ResponseWriter, r *http.Request) {
 		s.Doc, s.Generation, s.MassRemoval = doc, doc.Generation, confirmed
 		return nil
 	}); err != nil {
-		writeErr(w, http.StatusConflict, "generation is not greater than the last accepted one")
+		writeKind(w, http.StatusConflict, "generation", "generation is not greater than the last accepted one")
 		return
 	}
 	if v.Runner != nil {
@@ -537,7 +544,7 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 	cr, err := creds.Create(ctx, v.C, id, req.Label, req.ExpiresAt, creds.AllowedIPs(doc.SubmissionLANOnly, reconcile.LocalNets(doc, doc.Rewritten())), v.now())
 	switch {
 	case errors.Is(err, creds.ErrLimit):
-		writeErr(w, http.StatusConflict, err.Error())
+		writeKind(w, http.StatusConflict, "limit", err.Error())
 		return
 	case err != nil:
 		v.unreachable(w, err)

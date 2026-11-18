@@ -115,6 +115,20 @@ def check_strict_json(ctx):
     return None
 
 
+def check_stale_generation(ctx):
+    """A document whose generation isn't above the last accepted one: 409
+    with error_kind generation (the Hub matches on error_kind, never on the
+    text; contract §19.5)."""
+    d = doc(ctx, ["alice", "bob"])
+    st, _, b = put(ctx, d)
+    if st != 202:
+        return "PUT a document: HTTP %d %s" % (st, b[:200])
+    st, j, _ = put(ctx, dict(d))
+    if st != 409 or (j or {}).get("error_kind") != "generation":
+        return "the same generation again: HTTP %d %r (want 409 error_kind generation)" % (st, j)
+    return None
+
+
 def check_account_mismatch(ctx):
     st, j, b = put(ctx, doc(ctx, ["alice", "bob"]))
     if st != 202:
@@ -204,6 +218,7 @@ def check_void(ctx):
 API_CHECKS = [
     ("auth_refusals", check_auth),
     ("strict_json", check_strict_json),
+    ("stale_generation", check_stale_generation),
     ("account_mismatch", check_account_mismatch),
     ("uuid_echoed", check_uuid_echoed),
     ("revoke_by_uuid", check_revoke_by_uuid),

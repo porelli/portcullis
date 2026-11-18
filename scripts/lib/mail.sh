@@ -439,7 +439,7 @@ mail_restore_hold_clear() {
         --user "$CT_UID_HUB:$CT_UID_HUB" -v "$full:/d:ro" "$PORTCULLIS_HELPER_IMAGE" \
         sh -c 'cat /d/mail-restore-pending 2>/dev/null || true')" || fail "couldn't read hub_data"
   [ -n "$a" ] || { ok "No mail restore hold."; return 0; }
-  warn "A core restore holds the mail provider until it is restored from $a. Lifting the hold starts the provider on what its volumes hold now (maybe nothing)."
+  warn "A core restore holds the mail provider until it is restored from $a. Lifting the hold starts nothing: the provider stays stopped until you start it (the Mail tab's Retry), and then it runs on what its volumes hold now (maybe nothing)."
   if [ "$yes" != true ]; then
     [ -t 0 ] || fail "type clear to confirm: run this on a terminal, or pass --yes"
     printf 'Type clear to lift the hold: '
@@ -757,7 +757,7 @@ mail_status_lines() {
     def sev: if . == "problem" then "fail" elif . == "warning" then "warn" elif . == "info" then "note" else "ok" end;
     (if .hub == null then ["fail", "the Hub didn'"'"'t answer hub mail status (./portcullis up)"]
      elif .hub.wired != true then ["fail", "no mail provider is wired: wire one in the Hub (Settings → Mail)"]
-     else ["ok", "provider \(.hub.instance // "?") (\(.hub.label // .hub.template // "?")\(if .hub.version then " " + .hub.version else "" end))"] end),
+     else ["ok", "provider \(.hub.instance // "?") (\(.hub.provider.name // .hub.template // "?")\(if .hub.provider.version then " " + .hub.provider.version else "" end))"] end),
     (if .hub.void_owed != null then ["fail", "a void of every mail password is owed (\(.hub.void_owed.reason // "?" | tostring)): the provider stays in void mode until it succeeds"] else empty end),
     (if .hub.held != null then ["fail", "the mail provider'"'"'s template changed: review and confirm on its Mail tab"] else empty end),
     (if .hub != null and .hub.wired == true and .hub.reachable == false then ["fail", "the mail provider isn'"'"'t reachable"] else empty end),
@@ -833,7 +833,7 @@ mail_export() {
   [ "$(printf '%s' "$pinfo" | jq -r '.export != null')" = true ] || fail "the mail provider has no export"
   inst="$(printf '%s' "$pinfo" | jq -r '.instance')"
   svc="$(printf '%s' "$pinfo" | jq -r '.export.service')"
-  [[ "$inst" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]] && [[ "$svc" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$ ]] || fail "the Hub's export answer is malformed"
+  [[ "$inst" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]] && [[ "$svc" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$ ]] || fail "the Hub's export answer is malformed"
   n="$(printf '%s' "$pinfo" | jq -r '.export.argv | if type == "array" and all(.[]; type == "string") then length else -1 end')"
   [ "$n" -ge 1 ] || fail "the Hub's export argv is malformed"
   for ((i = 0; i < n; i++)); do
@@ -932,8 +932,9 @@ Usage: portcullis mail restore-hold clear [--yes]
 
 A core restore holds the mail provider (hub_data/mail-restore-pending: the
 Hub refuses to start it) until `hub mail restore` restored it from the
-backup's archive. When that restore can't run, this lifts the hold: the
-provider then starts on what its volumes hold now, which may be empty.
+backup's archive. When that restore can't run, this lifts the hold. It
+starts nothing: the provider stays stopped until you start it (its Mail
+tab's Retry), and then runs on what its volumes hold now, maybe nothing.
 Type `clear` to confirm (--yes: no prompt, for scripts). Logged.
 HOLD
 }

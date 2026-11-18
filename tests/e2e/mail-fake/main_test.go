@@ -103,6 +103,10 @@ func TestHonestPassesOwnAPI(t *testing.T) {
 	if c, b := call("GET", "/v1/credentials?uuid=00000000-0000-4000-8000-000000000001", ""); c != 200 || !bytes.Contains(b, []byte(`"id":"1"`)) {
 		t.Fatalf("list: %d %s", c, b)
 	}
+	// A stale generation: 409 error_kind generation (contract §19.5, L1).
+	if c, b := call("PUT", "/v1/state", doc(1, false, "alice", "bob")); c != 409 || !bytes.Contains(b, []byte(`"error_kind":"generation"`)) {
+		t.Fatalf("stale generation: %d %s", c, b)
+	}
 	// Mass removal: both accounts gone at once → 409 with removed.
 	if c, b := call("PUT", "/v1/state", doc(2, false)); c != 409 || !bytes.Contains(b, []byte(`"removed"`)) {
 		t.Fatalf("mass removal: %d %s", c, b)

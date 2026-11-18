@@ -1,6 +1,6 @@
 // Package metrics is mailctl's Prometheus registry (contract §19.8),
 // served only on its portcullis-metrics-mail address (MAILCTL_METRICS_ADDR,
-// the alias mailctl-metrics), behind Basic auth (MAILCTL_METRICS_SECRET_FILE).
+// the alias mail-provider-metrics), behind Basic auth (the slot's metrics-secret).
 package metrics
 
 import (

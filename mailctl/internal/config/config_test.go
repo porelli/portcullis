@@ -47,7 +47,7 @@ func TestLoadSlotEnvironment(t *testing.T) {
 	m["PORTCULLIS_MAIL_VOID_SESSION"] = "abc "
 	m["PORTCULLIS_MAIL_WELLKNOWN_ENTRYPOINTS"] = "websecure, vpnsecure"
 	m["STALWART_DQS_KEY_FILE"] = "/run/secrets/dqs"
-	m["MAILCTL_PUBLIC_IPV4"] = "203.0.113.5"
+	m["PORTCULLIS_MAIL_PUBLIC_IPV4"] = "203.0.113.5"
 	c, err := Load(envOf(m))
 	if err != nil {
 		t.Fatal(err)
@@ -71,18 +71,18 @@ func TestLoadRefusesMissing(t *testing.T) {
 
 func TestLoadRefusesBad(t *testing.T) {
 	cases := map[string]string{
-		"PORTCULLIS_MAIL_API_SUBNET": "172.31.255.17/28",
-		"PORTCULLIS_MAIL_API_HUB_IP": "172.31.250.18",
-		"PORTCULLIS_MAIL_SLOT_DIR":   "slot",
-		"PORTCULLIS_MAIL_TLS_DIR":    "../tls",
-		"STALWART_DQS_KEY_FILE":      "dqs",
-		"MAILCTL_LOCAL_RESOLVER":     "resolver:5353",
-		"MAILCTL_RULES_ADDR":         "[::1]:8082",
-		"MAILCTL_STALWART_URL":       "https://172.31.255.2:8080",
-		"MAILCTL_RESOLVERS":          "1.1.1.1",
-		"MAILCTL_PUBLIC_IPV4":        "2001:db8::1",
-		"MAILCTL_PUBLIC_IPV6":        "192.0.2.1",
-		"MAILCTL_API_ADDR":           ":99999",
+		"PORTCULLIS_MAIL_API_SUBNET":  "172.31.255.17/28",
+		"PORTCULLIS_MAIL_API_HUB_IP":  "172.31.250.18",
+		"PORTCULLIS_MAIL_SLOT_DIR":    "slot",
+		"PORTCULLIS_MAIL_TLS_DIR":     "../tls",
+		"STALWART_DQS_KEY_FILE":       "dqs",
+		"MAILCTL_LOCAL_RESOLVER":      "resolver:5353",
+		"MAILCTL_RULES_ADDR":          "[::1]:8082",
+		"MAILCTL_STALWART_URL":        "https://172.31.255.2:8080",
+		"MAILCTL_RESOLVERS":           "1.1.1.1",
+		"PORTCULLIS_MAIL_PUBLIC_IPV4": "2001:db8::1",
+		"PORTCULLIS_MAIL_PUBLIC_IPV6": "192.0.2.1",
+		"MAILCTL_API_ADDR":            ":99999",
 	}
 	for k, v := range cases {
 		m := base()

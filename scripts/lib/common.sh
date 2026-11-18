@@ -817,6 +817,16 @@ hub_env_write() {
   content+="PORTCULLIS_MAIL_API_SUBNET=$(mail_api_subnet)"$'\n'
   content+="PORTCULLIS_MAIL_API_HUB_IP=$(mail_api_hub_ip)"$'\n'
   content+="PORTCULLIS_MAIL_API_PROVIDER_IP=$(mail_api_provider_ip)"$'\n'
+  # The server's public addresses as domains detected them (its env file):
+  # the provider's PTR / FCrDNS and blocklist checks (contract §19.8);
+  # empty when unknown (those checks then say unknown).
+  local pubf="$PORTCULLIS_ROOT/secrets/domains/public-ips.env" pub4="" pub6=""
+  if [ -r "$pubf" ]; then
+    pub4="$(sed -n 's/^DOMAINS_PUBLIC_IPV4=\([0-9.]*\)$/\1/p' "$pubf" | head -n1)"
+    pub6="$(sed -n 's/^DOMAINS_PUBLIC_IPV6=\([0-9A-Fa-f:]*\)$/\1/p' "$pubf" | head -n1)"
+  fi
+  content+="PORTCULLIS_MAIL_PUBLIC_IPV4=$pub4"$'\n'
+  content+="PORTCULLIS_MAIL_PUBLIC_IPV6=$pub6"$'\n'
   # Rootless Podman: the host's ip_unprivileged_port_start (a per-netns
   # sysctl the Hub can't read from inside its container; RootlessCompat).
   if _rt_is_podman; then

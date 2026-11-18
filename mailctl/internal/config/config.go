@@ -23,7 +23,7 @@ type Config struct {
 	APIAddr   string       // MAILCTL_API_ADDR: the provider API (":8080")
 	APISubnet netip.Prefix // PORTCULLIS_MAIL_API_SUBNET: portcullis-mail-api
 	HubIP     netip.Addr   // PORTCULLIS_MAIL_API_HUB_IP (optional; inside the subnet)
-	// SlotDir is the Hub's _mail/ files (PORTCULLIS_MAIL_SLOT_DIR): the
+	// SlotDir is the provider slot (PORTCULLIS_MAIL_SLOT_DIR, core's mail_provider_slot volume): the
 	// gate, api-secret, metrics-secret, relay-password.
 	SlotDir string
 	TLSDir  string // PORTCULLIS_MAIL_TLS_DIR: fullchain.pem, privkey.pem
@@ -46,8 +46,8 @@ type Config struct {
 	LocalResolver  string     // MAILCTL_LOCAL_RESOLVER: the template's resolver, ip:port
 	Resolvers      []string   // MAILCTL_RESOLVERS: the public resolvers, ip:port
 
-	PublicIPv4 netip.Addr // MAILCTL_PUBLIC_IPV4 (may be unset: the address checks are unknown)
-	PublicIPv6 netip.Addr // MAILCTL_PUBLIC_IPV6
+	PublicIPv4 netip.Addr // PORTCULLIS_MAIL_PUBLIC_IPV4: core's detected address, passed by the Hub (empty: the address checks are unknown)
+	PublicIPv6 netip.Addr // PORTCULLIS_MAIL_PUBLIC_IPV6
 
 	JobSessionFile string // the bootstrap job only (LoadJob)
 	// JobLocalURL is how the bootstrap job reaches the server it runs in
@@ -264,10 +264,10 @@ func loadOwn(env func(string) string, c *Config) error {
 		}
 		c.Resolvers = append(c.Resolvers, r)
 	}
-	if c.PublicIPv4, err = publicIP(env, "MAILCTL_PUBLIC_IPV4", true); err != nil {
+	if c.PublicIPv4, err = publicIP(env, "PORTCULLIS_MAIL_PUBLIC_IPV4", true); err != nil {
 		return err
 	}
-	if c.PublicIPv6, err = publicIP(env, "MAILCTL_PUBLIC_IPV6", false); err != nil {
+	if c.PublicIPv6, err = publicIP(env, "PORTCULLIS_MAIL_PUBLIC_IPV6", false); err != nil {
 		return err
 	}
 	return nil

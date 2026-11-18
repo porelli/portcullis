@@ -615,7 +615,7 @@ func (s *Server) putState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.Doc != nil && d.Generation <= s.Doc.Generation {
-		errJSON(w, 409, "generation %d is not greater than %d", d.Generation, s.Doc.Generation)
+		writeJSON(w, 409, map[string]string{"error": fmt.Sprintf("generation %d is not greater than %d", d.Generation, s.Doc.Generation), "error_kind": "generation"})
 		return
 	}
 	if s.Doc != nil && len(s.Doc.Accounts) > 0 && !s.NoMassGuard && !s.Hostile {
@@ -697,7 +697,7 @@ func (s *Server) createCred(w http.ResponseWriter, r *http.Request) {
 	}
 	cs := s.creds[body.Username]
 	if len(cs) >= mailprovider.MaxActivePasswords {
-		errJSON(w, 409, "5 active mail passwords")
+		writeJSON(w, 409, map[string]string{"error": "5 active mail passwords", "error_kind": "limit"})
 		return
 	}
 	// Ids are reused: the next id is the highest + 1 (reused once the highest

@@ -184,7 +184,7 @@ func serve(env func(string) string, stderr io.Writer) error {
 	mc.Serving = serving
 	v1 := &api.V1{Store: st, C: sw, Runner: runner, Logf: logger.Printf, M: mc, Checks: ck,
 		TLSDir: cfg.TLSDir, Serving: serving, Export: true, Test: testSender(cfg, sw)}
-	apiSrv := &api.Server{Subnet: cfg.APISubnet, SecretFile: cfg.APISecretFile(), Logf: logger.Printf, Handler: v1.Handler()}
+	apiSrv := &api.Server{Subnet: cfg.APISubnet, HubIP: cfg.HubIP, SecretFile: cfg.APISecretFile(), Logf: logger.Printf, Handler: v1.Handler()}
 	servers := []*http.Server{
 		newServer(cfg.APIAddr, apiSrv),
 		newServer(cfg.WellKnownAddr, wellknown.Handler(mc)),

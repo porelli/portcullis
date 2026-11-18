@@ -500,6 +500,7 @@ func (m *Machines) Step(ctx context.Context) error {
 		if _, ok := dms[d.Name]; !ok {
 			dms[d.Name] = dmarc.Start(d.DMARCStart, now)
 		}
+		dms[d.Name] = dmarc.AtLeast(dms[d.Name], d.DMARCFloor, now)
 		dms[d.Name] = dmarc.Observe(dms[d.Name], dmarcReports(m.Accepted(reps, "dmarc", d.Name, dms[d.Name].Since, now)))
 		if d.Mail != state.MailOn || ids[d.Name] == "" {
 			continue
@@ -857,6 +858,8 @@ func (m *Machines) SetFor(domain string, noWildcard bool) (DNSSet, error) {
 	if in.DMARC == "" {
 		in.DMARC = dmarc.Start(dom.DMARCStart, m.now()).Policy
 	}
+	// Never below the floor, also before a pass raised the stage (X-H1).
+	in.DMARC = dmarc.AtLeast(dmarc.Domain{Policy: in.DMARC}, dom.DMARCFloor, m.now()).Policy
 	for _, k := range dkim.Published(ks, domain) {
 		in.DKIM = append(in.DKIM, dnsset.DKIMRecord{Selector: k.Selector, Value: dkim.TXT(k)})
 	}

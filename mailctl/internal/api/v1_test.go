@@ -60,6 +60,7 @@ func newV1(t *testing.T) *v1env {
 func (e *v1env) do(method, path, body string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, strings.NewReader(body))
 	r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey, &net.TCPAddr{IP: net.ParseIP("172.31.255.19")}))
+	r.RemoteAddr = "172.31.255.18:40000"
 	r.Header.Set("Authorization", "Bearer "+secretA)
 	w := httptest.NewRecorder()
 	e.s.ServeHTTP(w, r)
@@ -139,10 +140,11 @@ func TestMassRemoval409AtPut(t *testing.T) {
 		mr.Covers(13, []string{"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b"}) {
 		t.Fatalf("binding %+v", mr)
 	}
-	// A stale generation's 409 has no error_kind.
+	// A stale generation's 409 says error_kind generation (contract
+	// §19.5: the Hub matches on error_kind, never the text; L1).
 	w = e.do("PUT", "/v1/state", vec(t, 12))
 	json.Unmarshal(w.Body.Bytes(), &body)
-	if w.Code != 409 || strings.Contains(w.Body.String(), "error_kind") {
+	if w.Code != 409 || body.ErrorKind != "generation" {
 		t.Fatalf("stale: %d %s", w.Code, w.Body)
 	}
 }
@@ -200,8 +202,9 @@ func TestCredentialsRoutes(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		e.do("POST", "/v1/credentials", `{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"p","expires_at":null}`)
 	}
-	if w := e.do("POST", "/v1/credentials", `{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"p","expires_at":null}`); w.Code != 409 {
-		t.Fatalf("sixth: %d", w.Code)
+	if w := e.do("POST", "/v1/credentials", `{"username":"alice","uuid":"6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b","label":"p","expires_at":null}`); w.Code != 409 ||
+		!strings.Contains(w.Body.String(), `"error_kind":"limit"`) {
+		t.Fatalf("sixth: %d %s (want 409, error_kind limit)", w.Code, w.Body)
 	}
 	// A revoke of an unknown id is a success (the Hub retries).
 	if w := e.do("DELETE", "/v1/credentials/no-such-id?uuid=6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b", ""); w.Code != 204 {

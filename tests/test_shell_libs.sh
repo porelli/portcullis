@@ -192,12 +192,17 @@ expect_ok   "hub env: mcp-gate IP (compose default, G42)" grep -qx 'PORTCULLIS_M
 expect_fail "hub env: never a core secret" grep -Eq 'pg-secret|hub-secret|kc-secret' "$HE"
 expect_eq "hub env: the slot closed, the derived mail keys" \
   "$(grep -E '^PORTCULLIS_MAIL' "$HE" | tr '\n' ' ')" \
-  "PORTCULLIS_MAIL=off PORTCULLIS_MAIL_HOSTNAME=mail.hub.test PORTCULLIS_MAIL_SUBMISSION_LAN_ONLY=false PORTCULLIS_MAIL_CLIENT_IP=preserved PORTCULLIS_MAIL_API_SUBNET=172.31.255.16/28 PORTCULLIS_MAIL_API_HUB_IP=172.31.255.18 PORTCULLIS_MAIL_API_PROVIDER_IP=172.31.255.19 "
+  "PORTCULLIS_MAIL=off PORTCULLIS_MAIL_HOSTNAME=mail.hub.test PORTCULLIS_MAIL_SUBMISSION_LAN_ONLY=false PORTCULLIS_MAIL_CLIENT_IP=preserved PORTCULLIS_MAIL_API_SUBNET=172.31.255.16/28 PORTCULLIS_MAIL_API_HUB_IP=172.31.255.18 PORTCULLIS_MAIL_API_PROVIDER_IP=172.31.255.19 PORTCULLIS_MAIL_PUBLIC_IPV4= PORTCULLIS_MAIL_PUBLIC_IPV6= "
+# M2 (final cross review): the server's detected public addresses
+# (domains' public-ips.env) reach the Hub for the provider's PTR /
+# blocklist checks.
+mkdir -p "$HR/secrets/domains" && printf 'DOMAINS_PUBLIC_IPV4=203.0.113.7\nDOMAINS_PUBLIC_IPV6=2001:db8::7\nDOMAINS_MAIL=\n' > "$HR/secrets/domains/public-ips.env"
 ( PORTCULLIS_ROOT="$HR"; export PORTCULLIS_MAIL=on MAIL_HOSTNAME=mx.hub.test MAIL_SUBMISSION_LAN_ONLY=true PORTCULLIS_MAIL_API_SUBNET=10.87.0.0/28 PORTCULLIS_MAIL_API_HUB_IP=10.87.0.2 PORTCULLIS_MAIL_API_PROVIDER_IP=10.87.0.3
   unset PORTCULLIS_DOMAIN; env_load; hub_env_write 2>/dev/null )
-expect_eq "hub env: the slot open (exactly on), hostname, LAN-only, the API network's addresses" \
+expect_eq "hub env: the slot open (exactly on), hostname, LAN-only, the API network's addresses, the public addresses" \
   "$(grep -E '^PORTCULLIS_MAIL' "$HE" | tr '\n' ' ')" \
-  "PORTCULLIS_MAIL=on PORTCULLIS_MAIL_HOSTNAME=mx.hub.test PORTCULLIS_MAIL_SUBMISSION_LAN_ONLY=true PORTCULLIS_MAIL_CLIENT_IP=preserved PORTCULLIS_MAIL_API_SUBNET=10.87.0.0/28 PORTCULLIS_MAIL_API_HUB_IP=10.87.0.2 PORTCULLIS_MAIL_API_PROVIDER_IP=10.87.0.3 "
+  "PORTCULLIS_MAIL=on PORTCULLIS_MAIL_HOSTNAME=mx.hub.test PORTCULLIS_MAIL_SUBMISSION_LAN_ONLY=true PORTCULLIS_MAIL_CLIENT_IP=preserved PORTCULLIS_MAIL_API_SUBNET=10.87.0.0/28 PORTCULLIS_MAIL_API_HUB_IP=10.87.0.2 PORTCULLIS_MAIL_API_PROVIDER_IP=10.87.0.3 PORTCULLIS_MAIL_PUBLIC_IPV4=203.0.113.7 PORTCULLIS_MAIL_PUBLIC_IPV6=2001:db8::7 "
+rm -f "$HR/secrets/domains/public-ips.env"
 ( PORTCULLIS_ROOT="$HR"; export PORTCULLIS_MAIL=yes; unset PORTCULLIS_DOMAIN; env_load; hub_env_write 2>/dev/null )
 expect_ok "hub env: PORTCULLIS_MAIL other than on is off" grep -qx 'PORTCULLIS_MAIL=off' "$HE"
 rm -rf "$HR/secrets/mail"; hub_env_run
@@ -5134,7 +5139,9 @@ expect_eq "mail export: a failure leaves no file" "$rc:$(ls -A "$ML/root/backups
 # test_mail_status_rows: the Hub's view plus core's rows; a void owed, a
 # hold, nothing wired or a Problem check is a problem; the Hub not
 # answering too.
-HS='{"wired":true,"instance":"stalwart","label":"Stalwart","version":"1.1.0","reachable":true,"void_owed":null,"held":null,"generation":4,"applied_generation":4,"checks":{"checks":[{"id":"blocklist","severity":"warning","detail":"listed"}]}}'
+# The Hub's HostMailStatusView: the provider's own name and version under
+# .provider (L5: no top-level label / version).
+HS='{"wired":true,"instance":"stalwart","template":"stalwart","provider":{"name":"Stalwart","version":"1.1.0"},"reachable":true,"void_owed":null,"held":null,"generation":4,"applied_generation":4,"checks":{"checks":[{"id":"blocklist","severity":"warning","detail":"listed"}]}}'
 mt 'mail_cert_ensure >/dev/null; _mail_cert_metric 2027-02-01T00:00:00Z; printf "%s" '"'$HS'"' > "$ML/hub-status"; mail_status_json > "$ML/st.json"; mail_status_lines "$(cat "$ML/st.json")"'
 expect_eq "mail status: no problem, the provider and core rows" \
   "$(jq -c '[.problem, .hub.instance, .cert.not_after, .tlsa.phase, .client_ip]' "$ML/st.json")" '[false,"stalwart","2027-02-01T00:00:00Z","steady","preserved"]'
@@ -5209,6 +5216,7 @@ expect_eq "mail enable: hub mail tls only after the install" "$rc:$(awk '/hub ma
 # test_mail_restore_hold_clear (Ruling R2-N5): the hold read, typed clear
 # (or --yes), removed as the Hub's uid, logged; no hold → nothing.
 mte 'ct_run() { echo "ct_run $*" >> "$ML/argv"; case "$*" in *"cat /d/mail-restore-pending"*) cat "$ML/hold" 2>/dev/null || true ;; esac; }; echo stalwart/20261117T100000Z.tar > "$ML/hold"; mail_restore_hold_clear true'; rc=$?
+expect_eq "mail restore-hold clear: the warning says it starts nothing (FH-H3c; L6)" "$(grep -c 'Lifting the hold starts nothing' "$ML/out")" 1
 expect_eq "mail restore-hold clear --yes: removed as 10001, named, logged" "$rc:$(grep -c 'ct_run .*--user 10001:10001 -v portcullis_hub_data:/d .* rm -f /d/mail-restore-pending' "$ML/argv"):$(grep -c 'cleared (it named stalwart/20261117T100000Z.tar)' "$ML/out")" "0:1:1"
 mt 'ct_run() { echo "ct_run $*" >> "$ML/argv"; case "$*" in *"cat /d/mail-restore-pending"*) echo stalwart/20261117T100000Z.tar ;; esac; }; mail_restore_hold_clear false </dev/null'; rc=$?
 expect_eq "mail restore-hold clear without --yes and no terminal: refused, nothing removed" "$rc:$(grep -c 'rm -f /d/mail-restore-pending' "$ML/argv")" "1:0"
@@ -5392,6 +5400,9 @@ bmp 'PORTCULLIS_MAIL=on' 'echo 99 > "$BM/hub-backup.busy"; export MAIL_OP_POLL=0
 expect_eq "backup: busy past MAIL_OP_WAIT fails (nothing saved)" "$rc:$([ -n "$(bm_dir)" ] && echo saved || echo none)" "1:none"
 bmp 'PORTCULLIS_MAIL=on' 'echo 1 > "$BM/hub-backup.rc"'; rc=$?
 expect_eq "backup: a failed provider backup fails the backup (nothing saved)" "$rc:$([ -n "$(bm_dir)" ] && echo saved || echo none)" "1:none"
+# L4: an instance id with "_" (the Hub's archiveRe allows it) is a valid archive.
+bmp 'PORTCULLIS_MAIL=on' 'printf "%s" "{\"archive\":\"mail_2/20261117T100000Z.tar\"}" > "$BM/hub-backup"'; rc=$?
+expect_eq "backup: an instance id with _ names a valid archive" "$rc:$(jq -r .mail_provider_archive "$(bm_dir)/MANIFEST.json")" "0:mail_2/20261117T100000Z.tar"
 bmp 'PORTCULLIS_MAIL=on' 'printf "%s" "{\"archive\":\"../../etc/x.tar\"}" > "$BM/hub-backup"'; rc=$?
 expect_eq "backup: a malformed archive name from the Hub fails the backup" "$rc:$(grep -c 'names no archive' "$BM/out")" "1:1"
 bmp 'PORTCULLIS_MAIL=on' 'printf "%s" "{\"wired\":false,\"warning\":\"w\"}" > "$BM/hub-provider"'; rc=$?
@@ -5401,6 +5412,44 @@ bmp '' ':'; rc=$?
 expect_eq "backup with the slot closed: no Hub call, no manifest key" "$rc:$(grep -c 'hub mail' "$BM/calls"):$(jq -c 'has("mail_provider_archive")' "$(bm_dir)/MANIFEST.json")" "0:0:false"
 expect_eq "backup: mail_acme and mail_tls archived online (tlsa.json and the keys), mail_slot never" \
   "$(tr ' ' '\n' <<<"$BACKUP_FILE_VOLUMES" | grep -E '^mail_' | tr '\n' ' ')" "mail_acme:10004:10004 mail_tls:10004:2000 "
+# test_restore_stops_mail_provider (Ruling X-H2): the provider mounts no
+# hub_secrets since R-POD2, so the restore takes it down itself — the
+# Hub's wired instance and every project mounting the provider slot or
+# mail_tls (core's own containers skipped); an unlistable engine fails
+# closed. sp <script>: docker stubbed ($SP/ps-<volume> = ids,
+# $SP/proj-<id> = project, $SP/ps.rc, $SP/down.rc), calls in $SP/calls.
+SP="$WORK/stopmail"
+sp() {
+  rm -rf "$SP"; mkdir -p "$SP"
+  (
+    _BACKUP_CFG='{"volumes":{"mail_provider_slot":{"name":"portcullis_mail_provider_slot"},"mail_tls":{"name":"portcullis_mail_tls"}}}'
+    export CONTAINER_RUNTIME=docker
+    docker() {
+      echo "docker $*" >> "$SP/calls"
+      case "$1 $2" in
+        "ps -aq") local v="${4#volume=}"; [ ! -f "$SP/ps.rc" ] || return "$(cat "$SP/ps.rc")"; cat "$SP/ps-$v" 2>/dev/null; return 0 ;;
+        "inspect -f") cat "$SP/proj-$4"; return 0 ;;
+        "compose -p") return "$(cat "$SP/down.rc" 2>/dev/null || echo 0)" ;;
+      esac
+    }
+    eval "$1"
+  ) >"$SP/out" 2>&1
+}
+sp 'echo c1 > "$SP/ps-portcullis_mail_provider_slot"; echo portcullis-stalwart > "$SP/proj-c1"; echo "c2 c3" > "$SP/ps-portcullis_mail_tls"; echo portcullis-stalwart > "$SP/proj-c2"; echo portcullis > "$SP/proj-c3"
+    _restore_stop_mail_provider stalwart portcullis; echo "rc=$? mail=[$RESTORE_STOPPED_MAIL]"'
+expect_eq "restore: the wired provider taken down once (Hub's id + its slot mounts), core's mail-cert skipped" \
+  "$(grep -c 'compose -p portcullis-stalwart down' "$SP/calls"):$(grep -c 'compose -p portcullis down' "$SP/calls"):$(tail -n1 "$SP/out")" "1:0:rc=0 mail=[portcullis-stalwart]"
+sp 'echo c9 > "$SP/ps-portcullis_mail_tls"; echo portcullis-mail2 > "$SP/proj-c9"; _restore_stop_mail_provider "" portcullis; echo "rc=$? mail=[$RESTORE_STOPPED_MAIL]"'
+expect_eq "restore: the Hub unable to name it → the provider found by its volumes" "$(tail -n1 "$SP/out")" "rc=0 mail=[portcullis-mail2]"
+sp 'echo 1 > "$SP/ps.rc"; _restore_stop_mail_provider stalwart portcullis; echo "rc=$? msg=$_RESTORE_ERROR_MSG"'
+expect_eq "restore: an unlistable engine fails closed (nothing taken down)" \
+  "$(grep -c 'compose -p' "$SP/calls" || true):$(grep -c 'rc=1 msg=can.t list the containers' "$SP/out")" "0:1"
+sp 'echo c1 > "$SP/ps-portcullis_mail_provider_slot"; echo portcullis-stalwart > "$SP/proj-c1"; echo 1 > "$SP/down.rc"; _restore_stop_mail_provider stalwart portcullis; echo "rc=$? msg=$_RESTORE_ERROR_MSG"'
+expect_eq "restore: a failed down of the provider fails closed" "$(grep -c 'rc=1 msg=could not take down the mail provider portcullis-stalwart' "$SP/out")" 1
+sp 'echo c5 > "$SP/ps-portcullis_mail_provider_slot"; echo "" > "$SP/proj-c5"; _restore_stop_mail_provider "" portcullis; echo "rc=$?"'
+expect_eq "restore: a container outside any compose project mounting the slot fails closed" "$(tail -n1 "$SP/out")" "rc=1"
+expect_eq "restore: the provider stop runs right after the hub_secrets apps, before anything changes" \
+  "$(declare -f _backup_restore_docker | grep -cE '_restore_stop_mail_provider "\$mail_inst"|_restore_stop_mail_provider "" portcullis'):$(declare -f _backup_restore_docker | grep -c 'mail_inst="\$(_restore_mail_instance)"')" "2:1"
 # test_restore_mail_provider_first (Ruling R-C1, M8, M9): the manifest
 # names an archive and the slot is open → the hold file into hub_data, the
 # Hub started alone, `hub mail restore {archive}` waited for to its op's

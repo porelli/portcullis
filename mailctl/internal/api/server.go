@@ -1,8 +1,10 @@
 // Package api is mailctl's Hub API (integration contract §19.5): served on
 // the adapter's portcullis-mail-api address only, behind the Hub ⇄ provider
-// bearer secret. A request addressed outside PORTCULLIS_MAIL_API_SUBNET, or with
-// another bearer, gets 403 and an empty body; GET /healthz answers on
-// loopback only (the container's health check).
+// bearer secret. A request addressed outside PORTCULLIS_MAIL_API_SUBNET, from
+// a source outside it (or, with PORTCULLIS_MAIL_API_HUB_IP set, from any
+// address but the Hub's), or with another bearer, gets 403 and an empty
+// body; GET /healthz answers on loopback only (the container's health
+// check).
 package api
 
 import (
@@ -44,6 +46,7 @@ func ReadSecret(path string, min int) (string, error) {
 // Server guards Handler (the v1 routes).
 type Server struct {
 	Subnet     netip.Prefix // PORTCULLIS_MAIL_API_SUBNET
+	HubIP      netip.Addr   // PORTCULLIS_MAIL_API_HUB_IP (invalid = any source in Subnet)
 	SecretFile string       // read at every request (a rotated secret works at once)
 	Handler    http.Handler
 	Logf       func(string, ...any)
@@ -60,6 +63,14 @@ func localAddr(r *http.Request) (netip.Addr, bool) {
 	}
 	ip, ok := netip.AddrFromSlice(ta.IP)
 	return ip.Unmap(), ok
+}
+
+func remoteAddr(r *http.Request) (netip.Addr, bool) {
+	ap, err := netip.ParseAddrPort(r.RemoteAddr)
+	if err != nil {
+		return netip.Addr{}, false
+	}
+	return ap.Addr().Unmap(), true
 }
 
 func refuse(w http.ResponseWriter) {
@@ -86,6 +97,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.logf("api: refused a request to %s (not on portcullis-mail-api)", ip)
+		refuse(w)
+		return
+	}
+	// The source too (contract §19.5): rootless Podman's networks aren't
+	// isolated from each other.
+	src, ok := remoteAddr(r)
+	if !ok || !s.Subnet.Contains(src) || (s.HubIP.IsValid() && src != s.HubIP) {
+		s.logf("api: refused a request from %s (not the Hub on portcullis-mail-api)", r.RemoteAddr)
 		refuse(w)
 		return
 	}

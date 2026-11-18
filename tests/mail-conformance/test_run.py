@@ -75,6 +75,8 @@ class Recorded:
             # As mailctl: MailState v2's spam block is complete (dnsbl too).
             if set((d.get("spam") or {}).keys()) != {"junk_score", "reject_score", "dnsbl", "allow", "block"}:
                 return 400, {"error": 'document.spam: missing key "dnsbl"'}
+            if self.doc and d["generation"] <= self.doc["generation"]:
+                return 409, ({"error": "stale"} if "generation" in self.d else {"error": "stale", "error_kind": "generation"})
             if self.doc and len(self.doc["accounts"]) > 0 and "mass" not in self.d:
                 now = {a["uuid"] for a in d["accounts"]}
                 gone = [a for a in self.doc["accounts"] if a["uuid"] not in now]
@@ -134,12 +136,13 @@ class RunTest(unittest.TestCase):
         rc, out = runs()
         self.assertEqual(rc, 0, out)
         self.assertNotIn("FAIL", out)
-        self.assertIn("8 checks, 0 failed", out)
+        self.assertIn("9 checks, 0 failed", out)
 
     def test_each_defect_fails_its_check(self):
         for defect, check in [("auth", "auth_refusals"), ("outside", "auth_refusals"), ("strict", "strict_json"),
                               ("mismatch", "account_mismatch"), ("uuid", "uuid_echoed"), ("revoke", "revoke_by_uuid"),
-                              ("mass", "mass_removal"), ("lan", "allowed_ips_lan_only"), ("void", "void_empties_every_list")]:
+                              ("mass", "mass_removal"), ("lan", "allowed_ips_lan_only"), ("void", "void_empties_every_list"),
+                              ("generation", "stale_generation")]:
             rc, out = runs([defect])
             self.assertEqual(rc, 1, (defect, out))
             self.assertIn("FAIL " + check + ":", out, defect)
