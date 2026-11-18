@@ -69,6 +69,9 @@ class Recorded:
                 return 400, {"error": "bad"}
             if "strict" not in self.d and (set(d) != set(KEYS)):
                 return 400, {"error": "keys"}
+            # As mailctl: tls.spki_sha256 holds 1-2 keys.
+            if not (1 <= len(((d.get("tls") or {}).get("spki_sha256")) or []) <= 2):
+                return 400, {"error": "tls.spki_sha256 must hold 1-2 keys"}
             # As mailctl: MailState v2's spam block is complete (dnsbl too).
             if set((d.get("spam") or {}).keys()) != {"junk_score", "reject_score", "dnsbl", "allow", "block"}:
                 return 400, {"error": 'document.spam: missing key "dnsbl"'}

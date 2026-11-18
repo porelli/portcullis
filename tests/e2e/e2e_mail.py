@@ -1078,10 +1078,34 @@ def remote_on_egress() -> None:
     docker("network", "connect", "--ip", REMOTE_IP, "portcullis-stalwart_egress", "e2e-remote", check_rc=False)
 
 
+def rotate_when_set() -> None:
+    """./portcullis mail rotate once the provider has its first set (a
+    provider just wired answers "no set … yet" for a moment)."""
+    last = ""
+    for _ in range(36):
+        p = run("./portcullis", "mail", "rotate", timeout=600, check_rc=False)
+        if p.returncode == 0:
+            return
+        last = p.stdout + p.stderr
+        if "no set for" not in last:
+            break
+        time.sleep(5)
+    raise AssertionError(f"./portcullis mail rotate: {scrub(last[-1500:])}")
+
+
+def lan_only(on: bool, provider: str) -> None:
+    """LAN-only is core's (MAIL_SUBMISSION_LAN_ONLY → core.env), set with
+    mail enable --lan-only on the wired provider (no second install)."""
+    run("./portcullis", "mail", "enable", "--lan-only", "true" if on else "false", "--provider", provider, "--yes", timeout=900)
+    hub_answers()
+
+
 def switch_to(inst: str) -> dict:
     """POST /api/mail/provider/switch as root: the typed id, the typed
     "<n> mailboxes start empty" (the Hub names n when it differs), a fresh
     proof each attempt."""
+    if (hub_ok("GET", "/api/mail/status").get("provider") or {}).get("instance") == inst:
+        return {}
     page = state["page_root"]
     phrase = state.get("empty_phrase", "0 mailboxes start empty")
     for _ in range(2):
@@ -1127,7 +1151,7 @@ def switch_provider() -> None:
     try:
         switch_to(FAKE)
         until("the Hub says mail-fake is wired", lambda: (hub_ok("GET", "/api/mail/status").get("provider") or {}).get("instance") == FAKE, 120)
-        run("./portcullis", "mail", "rotate", timeout=600)
+        rotate_when_set()
         names = {(r["name"], r["type"]) for r in zone(DOMAIN)}
         assert any(n.startswith("fake._domainkey.") for n, _ in names), f"the fake's DKIM key isn't published: {sorted(names)}"
         assert old_dkim and all((n, "TXT") in names or n.split(".", 1)[0] + "._domainkey" in {x.split(".", 1)[0] + "._domainkey" for x, _ in names}
@@ -1170,12 +1194,11 @@ def hostile_provider_contained() -> None:
         findings = json.dumps(hub_ok("GET", "/api/doctor"))
         assert "mail_records_wrong" in findings, "no mail_records_wrong finding"
         # LAN-only on: the provider answers 0.0.0.0/0 → the row is revoked.
-        cur = hub_ok("GET", "/api/mail/settings")
-        hub_ok("PUT", "/api/mail/settings", {**{k: cur[k] for k in ("primary_domain", "spam", "limits")}, "quotas": cur.get("quotas") or [],
-                                              "submission_lan_only": True}, want=(200, 204))
-        until("mail_lan_only_unenforced", lambda: "mail_lan_only_unenforced" in json.dumps(hub_ok("GET", "/api/doctor")), 180, every=10)
-        hub_ok("PUT", "/api/mail/settings", {**{k: cur[k] for k in ("primary_domain", "spam", "limits")}, "quotas": cur.get("quotas") or [],
-                                              "submission_lan_only": False}, want=(200, 204))
+        lan_only(True, FAKE)
+        try:
+            until("mail_lan_only_unenforced", lambda: "mail_lan_only_unenforced" in json.dumps(hub_ok("GET", "/api/doctor")), 180, every=10)
+        finally:
+            lan_only(False, FAKE)
         # A void that keeps a credential fails its verification: stopped.
         code, ans = hub("POST", "/api/mail/provider/retry-void", actor="root")
         if code == 202:
@@ -1225,10 +1248,15 @@ def wiring_guards() -> None:
         assert e.code in (403, 404, 503), f"the MCP listener: HTTP {e.code}"
     code, _ = hub("PUT", path, {"wired": True, "confirm": FAKE}, actor="alice")
     assert code == 403, f"a non-admin / delegate: HTTP {code} (want 403)"
+    # Every guard met, but stalwart is wired: a second wiring is refused
+    # (409, switch instead); the guarded switch then succeeds.
+    v = provider_view(FAKE)
+    code, ans = hub("PUT", path, {"wired": True, "confirm": FAKE, **fresh_proof(page, v["fresh_auth"], "wire-ok")}, actor="root")
+    assert code == 409 and "switch" in json.dumps(ans), f"a second wiring: HTTP {code} {scrub(json.dumps(ans))[:300]} (want 409, switch instead)"
     remote_off_egress()
     try:
-        v = provider_view(FAKE)
-        run_op_as("root", "PUT", path, {"wired": True, "confirm": FAKE, **fresh_proof(page, v["fresh_auth"], "wire-ok")}, 900)
+        switch_to(FAKE)
+        assert (hub_ok("GET", "/api/mail/status").get("provider") or {}).get("instance") == FAKE, "the guarded switch didn't wire mail-fake"
     finally:
         switch_to("stalwart")
         remote_on_egress()
@@ -1266,13 +1294,24 @@ def template_change_holds() -> None:
     assert code == 200, f"the mail routes answer {code} after the re-wire"
 
 
+def served_spki() -> str:
+    """The sha256 of the mail certificate's key (core's mail_tls volume)."""
+    pem = docker("run", "--rm", "--network", "none", "-v", "portcullis_mail_tls:/t:ro",
+                 "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+                 "cat", "/t/fullchain.pem")
+    pub = subprocess.run(["openssl", "x509", "-pubkey", "-noout"], input=pem.encode(), capture_output=True, check=True).stdout
+    der = subprocess.run(["openssl", "pkey", "-pubin", "-outform", "der"], input=pub, capture_output=True, check=True).stdout
+    import hashlib
+    return hashlib.sha256(der).hexdigest()
+
+
 def conformance(level: str, inst: str, service: str) -> None:
     """The conformance suite against the wired provider, as the Hub (its
     pinned portcullis-mail-api address; the Hub stopped meanwhile)."""
     hub_cid = docker("compose", "ps", "-q", "hub").strip()
     docker("stop", hub_cid)
     try:
-        args = ["--level", level, "--api-url", "http://172.31.255.19:8080", "--secret-file", "/hs/api-secret"]
+        args = ["--level", level, "--api-url", "http://172.31.255.19:8080", "--secret-file", "/hs/api-secret", "--spki", served_spki()]
         if level == "full":
             # The published ports through the runner's address (a container
             # can't reach the stack's 127.0.0.1).

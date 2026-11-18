@@ -3,6 +3,7 @@
 
     run.py --level api|full --api-url URL --secret-file FILE
            [--outside-url URL] [--smtp-host H --imap-host H] [--ca-file PEM]
+           [--spki HEX]
 
 One line per check ("PASS <name>" / "FAIL <name>: <why>"); exit 1 on any
 failure, 2 on a usage error. `api` judges the provider API alone (any
@@ -28,7 +29,10 @@ def main(argv=None, opener=None, out=sys.stdout):
     ap.add_argument("--smtp-host")
     ap.add_argument("--imap-host")
     ap.add_argument("--ca-file")
+    ap.add_argument("--spki", help="the sha256 of the key the provider serves (hex); documents carry it")
     a = ap.parse_args(argv)
+    if a.spki is not None and not (len(a.spki) == 64 and all(c in "0123456789abcdef" for c in a.spki)):
+        ap.error("--spki must be 64 lowercase hex characters")
     if a.level == "full" and not (a.smtp_host and a.imap_host):
         ap.error("--level full needs --smtp-host and --imap-host")
     try:
@@ -45,6 +49,8 @@ def main(argv=None, opener=None, out=sys.stdout):
         checks_proto.CTX.check_hostname = False  # the mail host name isn't the address dialled
     ctx = checks_api.Ctx(a.api_url, secret, a.outside_url, opener)
     ctx.smtp_host, ctx.imap_host = a.smtp_host, a.imap_host
+    if a.spki:
+        ctx.spki = a.spki
     checks = list(checks_api.API_CHECKS)
     if a.level == "full":
         # The protocol checks before the void (the last API check).

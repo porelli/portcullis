@@ -19,6 +19,9 @@ class Ctx:
         self.outside_url = outside_url.rstrip("/") if outside_url else None
         self.open = opener or urllib.request.urlopen
         self.gen = None
+        # The key the provider serves (MailState v2: tls.spki_sha256 holds
+        # 1-2 keys); a placeholder when the caller can't name it.
+        self.spki = "0" * 64
         self.created = []  # (uuid, id, secret) of passwords made here
 
     def call(self, method, path, body=None, bearer="default", base=None, raw=None):
@@ -59,7 +62,7 @@ def doc(ctx, accounts, lan_only=False, local=None, confirm=False):
              for i, u in enumerate(accounts)]
     return {"version": 2, "generation": ctx.next_gen(), "primary_domain": "conformance.test",
             "mail_hostname": "mail.conformance.test", "client_ip": "preserved", "submission_lan_only": lan_only,
-            "dkim_rotate": "4380h", "former_retention": "720h", "relay": None, "tls": {"spki_sha256": []},
+            "dkim_rotate": "4380h", "former_retention": "720h", "relay": None, "tls": {"spki_sha256": [ctx.spki]},
             "confirm_mass_removal": confirm,
             "domains": [{"name": "conformance.test", "dmarc_start": "reject", "dmarc_floor": "reject", "mail": "on", "dnssec": "unsigned"}],
             "accounts": accts, "aliases": [], "lists": [], "postmaster": [], "limits": {"recipients_per_hour": 100, "recipients_per_day": 1000},
