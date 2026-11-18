@@ -860,7 +860,9 @@ _restore_stop_mail_provider() {
   empty="$(mktemp -d)"
   for p in $projects; do
     case " $RESTORE_STOPPED_APPS $RESTORE_STOPPED_MAIL " in *" $p "*) continue ;; esac
-    if ! (cd "$empty" && env -u COMPOSE_FILE -u COMPOSE_PROJECT_NAME docker compose -p "$p" down); then
+    # By project name alone, from an empty directory (the Hub wrote its
+    # compose files); a subshell without the core's compose variables.
+    if ! (cd "$empty" && unset COMPOSE_FILE COMPOSE_PROJECT_NAME && docker compose -p "$p" down); then
       rmdir "$empty" 2>/dev/null || true
       _RESTORE_ERROR_MSG="could not take down the mail provider $p (docker compose -p $p down failed): nothing was restored"
       return 1
