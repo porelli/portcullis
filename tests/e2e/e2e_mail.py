@@ -201,6 +201,12 @@ def persist() -> None:
 PROVIDER_PROJECT = "portcullis-stalwart"
 
 
+def running(project: str) -> list[str]:
+    """The running containers of a compose project (an unwire or a failed
+    void is a compose down: its containers are gone, its volumes kept)."""
+    return docker("ps", "-q", "--filter", f"label=com.docker.compose.project={project}").split()
+
+
 def pcid(service: str, project: str = PROVIDER_PROJECT) -> str:
     """The wired provider instance's container of service (any state)."""
     out = docker("ps", "-aq", "--filter", f"label=com.docker.compose.project={project}",
@@ -1205,8 +1211,9 @@ def switch_provider() -> None:
         problem = mailcheck.switch_voided_problem(rows, days, must=("e2e switch",))
         assert problem is None, f"alice's rows after the switch: {problem}: {rows}"
         assert not banner(25).startswith(b"220"), "port 25 still answers like Stalwart"
-        st = docker("inspect", "-f", "{{.State.Status}}", pcid("stalwart")).strip()
-        assert st in ("exited", "created"), f"stalwart is {st} after the switch"
+        # The unwire is a compose down: nothing of stalwart runs, its
+        # volumes stay.
+        assert not running(PROVIDER_PROJECT), f"stalwart's containers still run after the switch: {running(PROVIDER_PROJECT)}"
         assert "stalwart_data" in docker("volume", "ls", "-q"), "stalwart's store volume went with the switch"
         assert "mail.provider_switched" in json.dumps(hub_ok("GET", "/api/directory/audit")), "no mail.provider_switched in the audit"
         state["switched"] = True
@@ -1269,13 +1276,14 @@ def hostile_provider_contained() -> None:
         except AssertionError as e:
             print(f"    the void op: {scrub(str(e))[:200]} (a failed verification is the expected end)", flush=True)
         until("mail_void_pending", lambda: "mail_void_pending" in json.dumps(hub_ok("GET", "/api/doctor")), 300, every=10)
-        st = docker("inspect", "-f", "{{.State.Status}}", pcid("fake", "portcullis-" + FAKE)).strip()
-        assert st != "running", f"the hostile provider still runs after a failed void ({st})"
+        # A failed void stops it (compose down: no container left running).
+        assert not running("portcullis-" + FAKE), f"the hostile provider still runs after a failed void: {running('portcullis-' + FAKE)}"
     finally:
-        fid = pcid("fake", "portcullis-" + FAKE)
-        if fid:
-            docker("start", fid, check_rc=False)
-            docker("exec", fid, "mail-fake", "mode", "honest", check_rc=False)
+        # Honest again for 16: the mode file in its data volume (the
+        # failed void removed the container; a later start reads it).
+        docker("run", "--rm", "--network", "none", "--user", "10011:10011", "-v", f"portcullis-{FAKE}_data:/d",
+               "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+               "sh", "-c", "echo honest > /d/mode", check_rc=False)
         switch_to("stalwart")
         remote_on_egress()
 

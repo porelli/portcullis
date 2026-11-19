@@ -66,6 +66,10 @@ type Server struct {
 	// creds: username → its live passwords; nextNow the clock.
 	creds map[string][]fakeCred
 	Now   func() time.Time
+	// stateFile: the store's file (persist.go; "" = memory only); kept:
+	// the credential a hostile void kept (nil: none).
+	stateFile string
+	kept      *keptCred
 	// Created: every secret handed out (tests grep logs and state for them).
 	Created []string
 	// RevokeStatus: DELETE /v1/credentials answers it instead (0: 204).
@@ -196,6 +200,9 @@ func strict(r *http.Request, v any) error {
 func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if r.Method != http.MethodGet {
+		defer s.saveLocked() // under the lock (deferred calls run last first)
+	}
 	s.Requests = append(s.Requests, r.Method+" "+r.URL.Path)
 	if s.Down {
 		errJSON(w, 503, "mail server unreachable")
@@ -316,6 +323,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id := strings.TrimPrefix(p, "/v1/credentials/")
+		if s.Hostile && s.kept != nil && s.kept.User == u && s.kept.ID == id {
+			// The credential the hostile void kept: "revoked", still there.
+			w.WriteHeader(204)
+			return
+		}
 		keep := s.creds[u][:0]
 		for _, c := range s.creds[u] {
 			if c.ID != id {
@@ -390,15 +402,18 @@ func (s *Server) void(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case s.Hostile:
-		// Keeps one credential (the first account's first password).
+		// Keeps one credential (the first account's first password), and
+		// keeps it through the Hub's DELETE of it too (a provider that lies).
 		for u, cs := range s.creds {
 			if len(cs) > 0 {
 				s.creds = map[string][]fakeCred{u: cs[:1]}
+				s.kept = &keptCred{User: u, ID: cs[0].ID}
 				break
 			}
 		}
 	case !s.VoidKeeps:
 		s.creds = map[string][]fakeCred{}
+		s.kept = nil
 	}
 	now := s.Now()
 	s.StatusV.RestoredAt = &now

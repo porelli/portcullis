@@ -160,6 +160,102 @@ func TestHostileServesForbiddenSet(t *testing.T) {
 	}
 }
 
+// serveFakeAt is serveFake on a fake whose store is file (persist.go).
+func serveFakeAt(t *testing.T, file string) (*fake.Server, func(method, path, body string) (int, []byte)) {
+	t.Helper()
+	s, _, call := serveFake(t)
+	if err := s.UseStateFile(file); err != nil {
+		t.Fatal(err)
+	}
+	return s, func(method, path, body string) (int, []byte) { return call(method, path, body) }
+}
+
+const aliceUUID = "00000000-0000-4000-8000-000000000001"
+
+// The store survives a restart (a new fake on the same file), as a real
+// provider's does: the Hub's void starts the provider in void mode (a
+// recreated container) before it voids and verifies (core run
+// 44536396845's 12: an in-memory store passed every void).
+func TestStoreSurvivesRestart(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "state.json")
+	_, call := serveFakeAt(t, file)
+	call("PUT", "/v1/state", doc(4, false, "alice", "bob"))
+	if c, b := call("POST", "/v1/credentials", `{"username":"alice","uuid":"`+aliceUUID+`","label":"ci","expires_at":null}`); c != 201 {
+		t.Fatalf("create: %d %s", c, b)
+	}
+	if fi, err := os.Stat(file); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("the store file: %v %v", fi, err)
+	}
+	if b, _ := os.ReadFile(file); bytes.Contains(b, []byte("mailpw-")) {
+		t.Fatal("the store holds a password's secret")
+	}
+	_, call2 := serveFakeAt(t, file)
+	if c, b := call2("GET", "/v1/credentials?uuid="+aliceUUID, ""); c != 200 || !bytes.Contains(b, []byte(`"id":"1"`)) {
+		t.Fatalf("after the restart: %d %s", c, b)
+	}
+	if c, b := call2("GET", "/v1/state", ""); c != 200 || !bytes.Contains(b, []byte(`"applied_generation":4`)) {
+		t.Fatalf("the applied generation after the restart: %d %s", c, b)
+	}
+	if c, b := call2("PUT", "/v1/state", doc(4, false, "alice", "bob")); c != 409 || !bytes.Contains(b, []byte(`"error_kind":"generation"`)) {
+		t.Fatalf("a stale generation after the restart: %d %s", c, b)
+	}
+	// An honest void then empties it for good.
+	call2("POST", "/v1/void", `{"reason":"wire"}`)
+	_, call3 := serveFakeAt(t, file)
+	if _, b := call3("GET", "/v1/credentials?uuid="+aliceUUID, ""); string(bytes.TrimSpace(b)) != "[]" {
+		t.Fatalf("after an honest void and a restart: %s", b)
+	}
+	if err := (&fake.Server{}).UseStateFile(filepath.Join(t.TempDir(), "missing.json")); err != nil {
+		t.Fatalf("a missing store is an empty one: %v", err)
+	}
+	bad := filepath.Join(t.TempDir(), "bad.json")
+	os.WriteFile(bad, []byte("{"), 0o600)
+	if err := (&fake.Server{}).UseStateFile(bad); err == nil {
+		t.Fatal("an unreadable store was accepted")
+	}
+}
+
+// A hostile void keeps a credential through the Hub's whole verification
+// (list, revoke each leftover, list again: hub verifyMailVoid), also
+// across the void-mode restart; once honest again, the revoke works.
+func TestHostileVoidSurvivesVerification(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "state.json")
+	s, call := serveFakeAt(t, file)
+	call("PUT", "/v1/state", doc(1, false, "alice"))
+	call("POST", "/v1/credentials", `{"username":"alice","uuid":"`+aliceUUID+`","label":"keep","expires_at":null}`)
+	call("POST", "/v1/credentials", `{"username":"alice","uuid":"`+aliceUUID+`","label":"two","expires_at":null}`)
+	s.SetMode(fake.ModeHostile)
+	// The void-mode start: a new process on the same store, still hostile.
+	s2, call2 := serveFakeAt(t, file)
+	s2.SetMode(fake.ModeHostile)
+	if c, b := call2("POST", "/v1/void", `{"reason":"wire"}`); c != 200 {
+		t.Fatalf("void: %d %s", c, b)
+	}
+	list := func(call func(string, string, string) (int, []byte)) []mailprovider.Credential {
+		c, b := call("GET", "/v1/credentials?uuid="+aliceUUID, "")
+		var rows []mailprovider.Credential
+		if c != 200 || json.Unmarshal(b, &rows) != nil {
+			t.Fatalf("list: %d %s", c, b)
+		}
+		return rows
+	}
+	rows := list(call2)
+	if len(rows) != 1 || rows[0].Label != "keep" {
+		t.Fatalf("the hostile void kept %v (want the first one only)", rows)
+	}
+	if c, _ := call2("DELETE", "/v1/credentials/"+rows[0].ID+"?uuid="+aliceUUID, ""); c != 204 {
+		t.Fatalf("the revoke answered %d (want a lying 204)", c)
+	}
+	if left := list(call2); len(left) != 1 {
+		t.Fatalf("after the Hub's revoke: %v (the hostile provider still holds it)", left)
+	}
+	s2.SetMode(fake.ModeHonest)
+	call2("DELETE", "/v1/credentials/"+rows[0].ID+"?uuid="+aliceUUID, "")
+	if left := list(call2); len(left) != 0 {
+		t.Fatalf("an honest revoke left %v", left)
+	}
+}
+
 // The gate (P3): no .present, a wrong sentinel, void-pending without this
 // session: refused; the sentinel, or void mode with the session: started.
 func TestGateRefusesWithoutPresent(t *testing.T) {

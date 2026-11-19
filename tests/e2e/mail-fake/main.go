@@ -1,7 +1,7 @@
 // mail-fake is a CI-only mail provider (mail provider plan Task 26): the
-// provider API v1 (contract §19.5) over an in-memory store, honouring the
-// slot gate (P3), with no mail server behind it (its listeners accept and
-// close). Core e2e-mail switches to it (11), contains it in hostile mode
+// provider API v1 (contract §19.5) over a store kept in its data volume,
+// honouring the slot gate (P3), with no mail server behind it (its
+// listeners accept and close). Core e2e-mail switches to it (11), contains it in hostile mode
 // (12) and runs the conformance suite's api level against it (16).
 //
 //	mail-fake [serve]                 the provider (gate first)
@@ -10,9 +10,10 @@
 //
 // Environment: PORTCULLIS_MAIL_API_SUBNET (required: requests addressed
 // outside it are refused), MAIL_FAKE_NAME (the provider's label),
-// MAIL_FAKE_DATA (default /data: the mode file), MAIL_FAKE_SLOT (default
-// /run/portcullis/mail/slot), PORTCULLIS_MAIL_VOID_SESSION (void mode),
-// PORTCULLIS_MAIL_HOSTNAME (the MTA-STS policy's mx).
+// MAIL_FAKE_DATA (default /data: the mode file and the store, state.json,
+// which survives a restart like a real provider's), MAIL_FAKE_SLOT
+// (default /run/portcullis/mail/slot), PORTCULLIS_MAIL_VOID_SESSION (void
+// mode), PORTCULLIS_MAIL_HOSTNAME (the MTA-STS policy's mx).
 package main
 
 import (
@@ -74,6 +75,11 @@ func run(args []string, env func(string) string) int {
 	}
 	name := or(env("MAIL_FAKE_NAME"), "Mail fake")
 	s := fake.New(filepath.Join(slot, "api-secret"), sub, name)
+	// The store in the data volume: it survives the void-mode start.
+	if err := s.UseStateFile(filepath.Join(data, "state.json")); err != nil {
+		fmt.Fprintln(os.Stderr, "mail-fake: the store:", err)
+		return 1
+	}
 	go watchMode(s, filepath.Join(data, "mode"))
 	host := or(env("PORTCULLIS_MAIL_HOSTNAME"), "mail.invalid")
 	errc := make(chan error, 8)
