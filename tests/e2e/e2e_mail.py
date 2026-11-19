@@ -190,7 +190,7 @@ def docker(*args: str, check_rc: bool = True, timeout: float = 120) -> str:
 def persist() -> None:
     """The passwords and ids scenario 10 needs, for the restore phase (0600,
     /tmp, never an artifact)."""
-    keep = {k: state[k] for k in ("pw_alice", "pw_alice_ids") if k in state}
+    keep = {k: state[k] for k in ("pw_alice", "pw_alice_ids", "pw_restore") if k in state}
     fd = os.open(STATE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(keep, f)
@@ -964,10 +964,23 @@ def recreated_username_fresh_mailbox(browser) -> None:
     ctx.close()
 
 
+def restore_password() -> None:
+    """A mail password made under the wired stalwart after the last switch,
+    proven live (IMAP login) before the backup: scenario 10's."""
+    until("stalwart wired before the backup", lambda: (hub_ok("GET", "/api/mail/status").get("provider") or {}).get("instance") == "stalwart", 300)
+    pw = create_mail_password(state["page_alice"], state["auth_alice"], "alice", RESTORE_LABEL)
+    until("the restore password logs in (IMAP)", lambda: imap_login(f"alice@{DOMAIN}", pw).logout() and True, 120, every=5)
+    state["pw_restore"] = pw
+
+
+RESTORE_LABEL = "e2e restore"
+
+
 def restore_voids_mail_passwords(browser) -> None:
     with open(STATE_FILE) as f:
         st = json.load(f)
-    pw = st["pw_alice"]
+    assert "pw_restore" in st, "no mail password live at the backup (the main phase's restore_password failed)"
+    pw = st["pw_restore"]
     mask(pw)
     a = f"alice@{DOMAIN}"
     # Stalwart first: the pre-restore password is refused by IMAP and SMTP.
@@ -982,7 +995,9 @@ def restore_voids_mail_passwords(browser) -> None:
     def voided():
         rows = hub_ok("GET", "/api/directory/users/alice/mail")["passwords"]
         live = [r for r in rows if r["status"] != "revoked"]
-        return rows if live and all(r["status"] == "voided" for r in live) else None
+        mine = [r for r in rows if r.get("label") == RESTORE_LABEL]
+        return rows if (live and all(r["status"] == "voided" for r in live) and len(mine) == 1
+                        and mine[0].get("voided_reason") == "reset by a restore") else None
     try:
         until("the Hub's rows voided after the restore", voided, 120, every=10)
     except AssertionError:
@@ -1494,6 +1509,15 @@ def main() -> int:
             check("15 conformance_stalwart", conformance_stalwart)
             check("16 conformance_fake_api", conformance_fake_api)
             if "pw_alice" in state:
+                # Scenario 10's password, live at the backup: every earlier
+                # one was voided by the switches (11-13, 16), so a restore
+                # would have nothing left to void. Not filtered (10 needs it).
+                try:
+                    restore_password()
+                except Exception as e:  # noqa: BLE001
+                    msg = scrub(f"{type(e).__name__}: {e}")
+                    results.append(("restore_password: a mail password live at the backup (scenario 10's)", False, msg))
+                    print(f"FAIL: restore_password: {msg}", flush=True)
                 persist()
         finally:
             browser.close()
