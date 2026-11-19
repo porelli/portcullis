@@ -2,7 +2,8 @@ name: Mail adapter image
 
 # ghcr.io/porelli/portcullis-mailctl, the stalwart template's adapter
 # (contract §19; mail provider plan P2): built and pushed as `edge` on every
-# push to main that touches mailctl/ and on dispatch from main. Dispatched
+# push to main that touches mailctl/ and on dispatch from main, plus the
+# fixed tag main-<sha7> that templates pin. Dispatched
 # from another branch it pushes only `dev-<branch>-<sha7>` (never edge or a
 # release tag), so the templates branch can pin a signed digest before core
 # merges. Every push is cosign-signed keyless; amd64 + arm64. Release tags
@@ -68,7 +69,10 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           if [ "$REF" = refs/heads/main ]; then
+            # edge moves; main-<sha7> never does: templates pin it (their
+            # validator refuses floating tags, even with a digest).
             tag=edge
+            echo "fixed=main-${SHA:0:7}" >> "$GITHUB_OUTPUT"
           else
             branch=$(printf '%s' "$REF_NAME" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-80)
             tag="dev-${branch}-${SHA:0:7}"
@@ -98,6 +102,7 @@ jobs:
             latest=false
           tags: |
             type=raw,value=${{ steps.tag.outputs.tag }}
+            type=raw,value=${{ steps.tag.outputs.fixed }},enable=${{ steps.tag.outputs.fixed != '' }}
 
       - name: Build and push
         id: build
@@ -125,4 +130,5 @@ jobs:
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
           TAG: ${{ steps.tag.outputs.tag }}
-        run: echo "pushed ${ADAPTER_REPO}:${TAG}@${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
+          FIXED: ${{ steps.tag.outputs.fixed }}
+        run: echo "pushed ${ADAPTER_REPO}:${TAG}${FIXED:+ and :${FIXED}}@${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
