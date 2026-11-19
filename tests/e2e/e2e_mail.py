@@ -82,6 +82,7 @@ from playwright.sync_api import Page, sync_playwright
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import e2e_login as base  # noqa: E402  (Authenticator, passkey_flow, shot)
+import e2e_mailcheck as mailcheck  # noqa: E402  (pure helpers, unit tested)
 import e2e_mailremote as remote  # noqa: E402
 import e2e_ops  # noqa: E402  (the Hub's 202 op records)
 import scenarios  # noqa: E402  (E2E_SCENARIOS: single-scenario reruns)
@@ -1029,26 +1030,36 @@ def counter_ahead(page: Page) -> None:
 def fresh_proof(page: Page, fa: dict, label: str) -> dict:
     """The Hub listener's fresh sign-in (prompt=login, max_age=0, PKCE
     S256), as the instance's Mail tab runs it: the wiring's proof. A
-    container start aborts Chromium's navigation now and then
-    (net::ERR_NETWORK_CHANGED → chrome-error://): one new attempt then,
-    as the setup links get (noted in the job summary)."""
-    try:
-        return _fresh_proof(page, fa, label)
-    except AssertionError as e:
-        if "chrome-error://" not in str(e):
-            raise
-        base._note_retry(f"{label}: the fresh sign-in's page aborted (chrome-error://, a network change): one new attempt")
-        return _fresh_proof(page, fa, label + "-retry")
+    container start or a network attach on the runner makes Chromium
+    abort the navigation (net::ERR_NETWORK_CHANGED, raised by page.goto
+    itself or left as chrome-error://): a new attempt with a new PKCE
+    pair then, at most 4 in all, each noted in the job summary
+    (e2e_mailcheck.network_retries; any other failure fails at once)."""
+    return mailcheck.network_retries(lambda n: _fresh_proof(page, fa, label if n == 1 else f"{label}-retry{n - 1}"),
+                                     base._note_retry, f"{label}: the fresh sign-in")
 
 
 def _fresh_proof(page: Page, fa: dict, label: str) -> dict:
     counter_ahead(page)
+    redirect = fa["redirect_uri"]
+    seen: list[str] = []
+
+    def on_request(r):
+        if r.url.startswith(redirect + "?"):
+            seen.append(r.url)
+
+    page.on("request", on_request)
+    try:
+        return _fresh_proof_run(page, fa, label, seen)
+    finally:
+        page.remove_listener("request", on_request)
+
+
+def _fresh_proof_run(page: Page, fa: dict, label: str, seen: list) -> dict:
     import hashlib
     import secrets as pysecrets
     import urllib.parse
     redirect = fa["redirect_uri"]
-    seen: list[str] = []
-    page.on("request", lambda r: seen.append(r.url) if r.url.startswith(redirect + "?") else None)
     verifier, nonce = pysecrets.token_urlsafe(48), pysecrets.token_urlsafe(16)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     q = {"client_id": fa["client_id"], "response_type": "code", "scope": "openid", "redirect_uri": redirect,
@@ -1063,6 +1074,8 @@ def _fresh_proof(page: Page, fa: dict, label: str) -> dict:
             code = urllib.parse.parse_qs(urllib.parse.urlsplit(u).query).get("code")
             if code:
                 return {"code": code[0], "code_verifier": verifier, "nonce": nonce}
+        if page.url.startswith("chrome-error://"):
+            raise AssertionError(f"{label}: the fresh sign-in's page aborted (stuck at chrome-error://)")
         if page.url.startswith(AUTH) and page.locator("#authenticateWebAuthnButton").is_visible():
             page.click("#authenticateWebAuthnButton")
         page.wait_for_timeout(700)
@@ -1164,11 +1177,17 @@ def banner(port: int) -> bytes:
 
 def switch_provider() -> None:
     """11: to mail-fake (honest): the sets replaced per domain (the old
-    DKIM keys kept, retiring), the mail passwords' rows provider_changed,
-    the ports reach the fake (no SMTP banner), stalwart stopped with its
-    volumes, mail.provider_switched audited; then back (voids again)."""
+    DKIM keys kept, retiring), every mail password row voided "the mail
+    server changed on <date>" (a row made just before, under stalwart,
+    included: this switch's own void), the ports reach the fake (no SMTP
+    banner), stalwart stopped with its volumes, mail.provider_switched
+    audited; then back (voids again)."""
     needs("setup")
     ensure_fake_instance()
+    # Run 13 switched (and voided) before: this scenario's own row.
+    until("stalwart wired before the switch", lambda: (hub_ok("GET", "/api/mail/status").get("provider") or {}).get("instance") == "stalwart", 300)
+    pw_switch = create_mail_password(state["page_alice"], state["auth_alice"], "alice", "e2e switch")
+    days = {time.strftime("%Y-%m-%d", time.gmtime())}
     old_dkim = {r["name"] for r in zone(DOMAIN) if r.get("type") == "TXT" and "._domainkey" in r.get("name", "")}
     remote_off_egress()
     try:
@@ -1182,7 +1201,9 @@ def switch_provider() -> None:
         assert old_dkim and all((n, "TXT") in names or n.split(".", 1)[0] + "._domainkey" in {x.split(".", 1)[0] + "._domainkey" for x, _ in names}
                                 for n in old_dkim), f"the old DKIM keys went at the switch: {sorted(old_dkim)} vs {sorted(names)}"
         rows = hub_ok("GET", "/api/directory/users/alice/mail").get("passwords") or []
-        assert rows and all(r.get("status") in ("provider_changed", "revoked") for r in rows), f"alice's rows: {rows}"
+        days.add(time.strftime("%Y-%m-%d", time.gmtime()))
+        problem = mailcheck.switch_voided_problem(rows, days, must=("e2e switch",))
+        assert problem is None, f"alice's rows after the switch: {problem}: {rows}"
         assert not banner(25).startswith(b"220"), "port 25 still answers like Stalwart"
         st = docker("inspect", "-f", "{{.State.Status}}", pcid("stalwart")).strip()
         assert st in ("exited", "created"), f"stalwart is {st} after the switch"
@@ -1196,6 +1217,7 @@ def switch_provider() -> None:
     st = hub_ok("GET", "/api/mail/status")
     assert not (st.get("provider") or {}).get("void"), f"a void still owed after the switch back: {(st.get('provider') or {}).get('void')}"
     assert imap_refused(f"alice@{DOMAIN}", state["pw_alice"]), "alice's old mail password survived two switches"
+    assert imap_refused(f"alice@{DOMAIN}", pw_switch), "the mail password made before the switch survived it"
 
 
 def hostile_provider_contained() -> None:

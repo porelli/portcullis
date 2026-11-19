@@ -336,6 +336,10 @@ jobs:
       # stdlib only, no stack.
       - name: e2e helper unit tests (e2e_fsops)
         run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_e2e_fsops.py
+      # e2e_mail's pure helpers (network-abort retries, the switch's
+      # voided rows): stdlib only, no stack.
+      - name: e2e helper unit tests (e2e_mailcheck)
+        run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_e2e_mailcheck.py
       # E2E_SCENARIOS (the `scenarios` input): names, setup, the needs()
       # closure, the per-job check (tests/e2e/scenarios.py; stdlib only).
       - name: e2e scenario filter unit tests (scenarios.py)
