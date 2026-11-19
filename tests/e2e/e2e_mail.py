@@ -460,19 +460,31 @@ def sign_in(browser, who: str):
     return ctx, page, auth
 
 
+def goto(page: Page, url: str, what: str = ""):
+    """Every navigation of e2e_mail: page.goto through
+    e2e_mailcheck.navigate (a container start or a network attach on the
+    runner makes Chromium abort it: net::ERR_NETWORK_CHANGED; at most 4
+    attempts, each retry noted in the job summary)."""
+    return mailcheck.navigate(page, base._note_retry, what or url.split("?")[0], url)
+
+
+def reload(page: Page, what: str):
+    return mailcheck.navigate(page, base._note_retry, what)
+
+
 def open_mail(page: Page):
-    page.goto(PEOPLE + "/signin", wait_until="domcontentloaded")
+    goto(page, PEOPLE + "/signin")
     deadline = time.time() + 90
     while time.time() < deadline:
         if base.on_login_pages(page):
             base.passkey_flow(page, until=PEOPLE, label="people", expect_stepups=0)
-            page.goto(PEOPLE + "/signin", wait_until="domcontentloaded")
+            goto(page, PEOPLE + "/signin")
         body = page.locator("[data-msi-mail-body]")
         if body.count() and body.first.is_visible():
             return body.first
         page.wait_for_timeout(500)
         if time.time() > deadline - 60 and int(deadline - time.time()) % 15 == 0:
-            page.reload(wait_until="domcontentloaded")
+            reload(page, PEOPLE + "/signin (reload)")
     base.shot(page, "mail-section-missing")
     raise AssertionError(f"no Mail passwords section on the Sign-in page (at {page.url})")
 
@@ -1088,7 +1100,7 @@ def _fresh_proof_run(page: Page, fa: dict, label: str, seen: list) -> dict:
          "code_challenge_method": "S256", "prompt": "login", "max_age": "0"}
     if fa.get("pc_method"):
         q["pc_method"] = fa["pc_method"]
-    page.goto(fa["authorize_url"] + "?" + urllib.parse.urlencode(q), wait_until="domcontentloaded")
+    goto(page, fa["authorize_url"] + "?" + urllib.parse.urlencode(q), f"{label}: the fresh sign-in")
     deadline = time.time() + 60
     while time.time() < deadline:
         for u in seen:

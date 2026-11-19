@@ -67,6 +67,61 @@ class NetworkRetries(unittest.TestCase):
             self.run_with([ABORT, ABORT], tries=2)
 
 
+class FakePage:
+    """page.goto / page.reload: each call takes the next outcome (an
+    exception raised, or a URL the page ends on)."""
+
+    def __init__(self, outcomes):
+        self.outcomes, self.calls, self.url = list(outcomes), [], "about:blank"
+
+    def _nav(self, kind, target):
+        self.calls.append((kind, target))
+        o = self.outcomes.pop(0)
+        if isinstance(o, BaseException):
+            raise o
+        self.url = o
+        return "resp:" + o
+
+    def goto(self, url, wait_until=None):
+        assert wait_until == "domcontentloaded"
+        return self._nav("goto", url)
+
+    def reload(self, wait_until=None):
+        assert wait_until == "domcontentloaded"
+        return self._nav("reload", None)
+
+
+class Navigate(unittest.TestCase):
+    URL = "https://people.ci.example.org/signin"
+
+    def test_run_44584349925_goto_abort(self):
+        # 11: Page.goto: net::ERR_NETWORK_CHANGED at .../signin, on a plain navigation.
+        page, notes, sleeps = FakePage([PWError("Page.goto: net::ERR_NETWORK_CHANGED at " + self.URL), self.URL]), [], []
+        self.assertEqual(mc.navigate(page, notes.append, "signin", self.URL, sleep=sleeps.append), "resp:" + self.URL)
+        self.assertEqual(page.calls, [("goto", self.URL)] * 2)
+        self.assertEqual((len(notes), sleeps), (1, [3.0]))
+
+    def test_chrome_error_page_is_an_abort(self):
+        page = FakePage(["chrome-error://chromewebdata/", self.URL])
+        mc.navigate(page, lambda _: None, "signin", self.URL, sleep=lambda _: None)
+        self.assertEqual(len(page.calls), 2)
+
+    def test_reload(self):
+        page = FakePage([PWError("net::ERR_NETWORK_CHANGED"), self.URL])
+        mc.navigate(page, lambda _: None, "signin (reload)", sleep=lambda _: None)
+        self.assertEqual(page.calls, [("reload", None)] * 2)
+
+    def test_bounded_and_other_errors(self):
+        page = FakePage([PWError("net::ERR_NETWORK_CHANGED")] * 4)
+        with self.assertRaises(PWError):
+            mc.navigate(page, lambda _: None, "x", self.URL, sleep=lambda _: None)
+        self.assertEqual(len(page.calls), 4)
+        page = FakePage([PWError("net::ERR_CONNECTION_REFUSED"), self.URL])
+        with self.assertRaises(PWError):
+            mc.navigate(page, lambda _: None, "x", self.URL, sleep=lambda _: None)
+        self.assertEqual(len(page.calls), 1)
+
+
 def row(label, status="voided", reason=CHANGED):
     r = {"id": "m" + label, "label": label, "status": status}
     if reason is not None:

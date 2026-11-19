@@ -6,7 +6,8 @@ tested by tests/test_e2e_mailcheck.py.
   chrome-error:// page it leaves). A container start or a `docker
   network connect` adds an interface on the runner; Chromium then drops
   every navigation in flight. Each retry is noted (job summary), every
-  other failure is raised at once.
+  other failure is raised at once. navigate: page.goto / page.reload
+  through it (e2e_mail's every navigation).
 - switch_voided_problem: the Hub's mail-password rows after a provider
   switch (GET /api/directory/users/<u>/mail). The Hub shows a row voided
   by a provider change as status "voided" with the reason "the mail
@@ -143,3 +144,20 @@ def sync_problem(status: dict) -> str | None:
     if applied != gen:
         return f"applied generation {applied!r} of {gen}"
     return None
+
+
+def navigate(page, note, what: str, url: str | None = None, tries: int = 4, wait: float = 3.0, sleep=time.sleep):
+    """page.goto(url) (page.reload() when url is None), waiting for
+    domcontentloaded, through network_retries: a navigation Chromium
+    aborted on a network change (raised, or left on chrome-error://) is
+    made again, at most tries in all, each retry noted. The page's
+    response is returned."""
+    def once(_n):
+        if url is None:
+            resp = page.reload(wait_until="domcontentloaded")
+        else:
+            resp = page.goto(url, wait_until="domcontentloaded")
+        if str(getattr(page, "url", "")).startswith("chrome-error://"):
+            raise AssertionError(f"{what}: the page ended on chrome-error://")
+        return resp
+    return network_retries(once, note, what, tries=tries, wait=wait, sleep=sleep)
