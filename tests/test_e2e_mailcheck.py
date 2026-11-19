@@ -103,5 +103,22 @@ class SwitchVoided(unittest.TestCase):
         self.assertIsNotNone(mc.switch_voided_problem([row("a", reason=CHANGED + " (and more)")], {DAY}))
 
 
+class ConfirmRemoval(unittest.TestCase):
+    def test_phrase(self):
+        self.assertEqual(mc.confirm_phrase('type "remove 2 mailboxes" to confirm'), "remove 2 mailboxes")
+        # Inside a JSON error body (json.dumps of the Hub's answer).
+        self.assertEqual(mc.confirm_phrase('{"error": "type \\"remove 2 mailboxes\\" to confirm"}'), "remove 2 mailboxes")
+        for t in ("", "forbidden", 'type "" to confirm', None):
+            self.assertIsNone(mc.confirm_phrase(t), t)
+
+    def test_pending_uuids(self):
+        v = {"accounts": [{"username": "bob", "uuid": "u2"}, {"username": "alice", "uuid": "u1"}], "confirmed": False}
+        self.assertEqual(mc.pending_uuids(v), ["u1", "u2"])
+        for bad in (None, {}, {"accounts": []}, {"accounts": [{"uuid": ""}]},
+                    {"accounts": [{"uuid": "u1"}], "confirmed": True}):
+            with self.assertRaises(AssertionError):
+                mc.pending_uuids(bad)
+
+
 if __name__ == "__main__":
     unittest.main()

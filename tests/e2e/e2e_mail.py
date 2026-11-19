@@ -1455,14 +1455,21 @@ def hub_answers() -> None:
 
 
 def conformance_stalwart() -> None:
-    """15: run.py --level full against the wired stalwart."""
+    """15: run.py --level full against the wired stalwart. Its documents'
+    accounts stay in stalwart's store (R-SWITCH-BASE-3: kept, a real-world
+    case): 16's switch back meets them."""
     needs("setup")
     conformance("full", "stalwart", "adapter")
+    state["stalwart_conformed"] = True
 
 
 def conformance_fake_api() -> None:
-    """16: run.py --level api against mail-fake, wired for the run."""
-    needs("setup")
+    """16: run.py --level api against mail-fake, wired for the run; then
+    the switch back to stalwart, whose store still holds 15's conformance
+    accounts: its guard refuses the Hub's first document as a mass
+    removal, the Hub holds it for a full administrator's confirmation
+    (R-SWITCH-BASE-3), root confirms it, the sync converges."""
+    needs("setup", "stalwart_conformed")
     ensure_fake_instance()
     remote_off_egress()
     try:
@@ -1471,6 +1478,45 @@ def conformance_fake_api() -> None:
     finally:
         switch_to("stalwart")
         remote_on_egress()
+    confirm_pending_removal()
+
+
+def confirm_pending_removal() -> None:
+    """The pending removal (doctor mail_mass_removal_pending) confirmed
+    through POST /api/mail/confirm-removal: refused for a non-admin, without
+    a fresh sign-in and without the typed confirmation; accepted as root
+    with both; then the sync converges (no pending removal, no blocked
+    sync, the document applied)."""
+    until("mail_mass_removal_pending", lambda: "mail_mass_removal_pending" in json.dumps(hub_ok("GET", "/api/doctor")), 300, every=10)
+    v = hub_ok_as("GET", "/api/mail/settings", "root")
+    uuids = mailcheck.pending_uuids(v.get("pending_removal"))
+    path = "/api/mail/confirm-removal"
+    code, _ = hub("POST", path, {"accounts": uuids}, actor="alice")
+    assert code == 403, f"a non-admin's confirmation: HTTP {code} (want 403)"
+    code, ans = hub("POST", path, {"accounts": uuids}, actor="root")
+    assert code == 403, f"no fresh sign-in: HTTP {code} {scrub(json.dumps(ans))[:300]} (want 403)"
+    page = state["page_root"]
+    code, ans = hub("POST", path, {"accounts": uuids, **fresh_proof(page, v["fresh_auth"], "confirm-removal-untyped")}, actor="root")
+    txt = ans if isinstance(ans, str) else json.dumps(ans)
+    phrase = mailcheck.confirm_phrase(txt) if code == 400 else None
+    assert phrase, f"no typed confirmation: HTTP {code} {scrub(txt)[:300]} (want 400 naming what to type)"
+    v = hub_ok_as("GET", "/api/mail/settings", "root")
+    code, ans = hub("POST", path, {"accounts": mailcheck.pending_uuids(v.get("pending_removal")), "confirm": phrase,
+                                   **fresh_proof(page, v["fresh_auth"], "confirm-removal")}, actor="root")
+    assert code in (202, 204), f"the confirmation: HTTP {code} {scrub(json.dumps(ans))[:300]}"
+    if code == 202:
+        e2e_ops.check_ok(e2e_ops.accepted(ans), e2e_ops.wait(get_as("root"), e2e_ops.accepted(ans), 600))
+    assert "mail.confirm_removal" in json.dumps(hub_ok("GET", "/api/directory/audit")), "no mail.confirm_removal in the audit"
+
+    def converged():
+        d = json.dumps(hub_ok("GET", "/api/doctor"))
+        if "mail_mass_removal_pending" in d or "mail_sync_blocked" in d:
+            return False
+        if hub_ok_as("GET", "/api/mail/settings", "root").get("pending_removal") is not None:
+            return False
+        h = (json.loads(run("./portcullis", "mail", "status", "--json", timeout=120).stdout).get("hub") or {})
+        return h.get("reachable") and h.get("generation") and h.get("applied_generation") == h.get("generation")
+    until("the mail sync converged after the confirmation", converged, 300, every=10)
 
 
 def report() -> int:

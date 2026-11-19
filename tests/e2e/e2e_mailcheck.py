@@ -12,6 +12,9 @@ tested by tests/test_e2e_mailcheck.py.
   by a provider change as status "voided" with the reason "the mail
   server changed on <date>: create a new mail password" (a revoked row
   isn't listed); anything else is named.
+- confirm_phrase / pending_uuids: the confirmation of a pending mass
+  removal (R-SWITCH-BASE-3): the phrase the Hub asks to be typed, and the
+  pending accounts' uuids.
 """
 from __future__ import annotations
 
@@ -64,3 +67,28 @@ def switch_voided_problem(rows: list, days: set, must: tuple = ()) -> str | None
     if missing:
         return f"no row for {missing}"
     return None
+
+
+# The Hub's refusal of an untyped confirmation: 'type "<phrase>" to confirm'
+# (its statusErr form, also as a JSON-escaped string inside an error body).
+CONFIRM_PHRASE = re.compile(r'type \\?"([^"\\]{1,200})\\?" to confirm')
+
+
+def confirm_phrase(text: str) -> str | None:
+    """The phrase the Hub asks to be typed, from its 400 answer (None:
+    the answer names none)."""
+    m = CONFIRM_PHRASE.search(text or "")
+    return m.group(1) if m else None
+
+
+def pending_uuids(view) -> list:
+    """The pending removal's account uuids (GET /api/mail/settings
+    pending_removal), sorted; an absent, confirmed or empty one fails."""
+    if not isinstance(view, dict):
+        raise AssertionError(f"no pending removal: {view!r}")
+    if view.get("confirmed"):
+        raise AssertionError(f"the pending removal is already confirmed: {view!r}")
+    out = sorted(a.get("uuid") or "" for a in view.get("accounts") or [])
+    if not out or "" in out:
+        raise AssertionError(f"the pending removal names no (or a blank) account: {view!r}")
+    return out
