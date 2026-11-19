@@ -200,6 +200,23 @@ class RunTest(unittest.TestCase):
             pw, err = checks_proto._alice(ctx)
             self.assertIsNone(err, "attempt %d: %s" % (i + 1, err))
 
+    def test_a_passing_503_is_asked_again(self):
+        # The provider's mail server restarting answers 503 for a moment:
+        # the call is asked again, the check judges the real answer.
+        import checks_api
+
+        class Flaky(Recorded):
+            def __call__(self, req, timeout=None):
+                if req.get_method() == "POST" and req.full_url.endswith("/v1/void") and not getattr(self, "flaked", False):
+                    self.flaked = True
+                    raise urllib.error.HTTPError(req.full_url, 503, "", {}, io.BytesIO(b'{"error":"mail server unreachable"}'))
+                return Recorded.__call__(self, req, timeout)
+        rec = Flaky()
+        ctx = checks_api.Ctx("http://provider.test", SECRET, None, rec)
+        ctx.sleep = lambda s: None
+        st, _, _ = ctx.call("POST", "/v1/void", {"reason": "restore"})
+        self.assertEqual(st, 200)
+
     def test_secret_file_too_short(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as f:
             f.write("short\n")

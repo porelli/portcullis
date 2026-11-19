@@ -28,10 +28,22 @@ class Ctx:
         # mass removal, parking): put() waits for applied_generation.
         self.sleep = time.sleep
         self.apply_wait = 180
+        self.unavailable_wait = 90
         self.created = []  # (uuid, id, secret) of passwords made here
 
     def call(self, method, path, body=None, bearer="default", base=None, raw=None):
-        """(status, parsed JSON or None, raw bytes)."""
+        """(status, parsed JSON or None, raw bytes). A 503 (the provider's
+        mail server restarting, e.g. after a LAN-only change it applied)
+        is asked again for up to unavailable_wait seconds."""
+        waited = 0
+        while True:
+            st, j, b = self._call(method, path, body, bearer, base, raw)
+            if st != 503 or waited >= self.unavailable_wait:
+                return st, j, b
+            self.sleep(2)
+            waited += 2
+
+    def _call(self, method, path, body=None, bearer="default", base=None, raw=None):
         data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
         req = urllib.request.Request((base or self.api_url) + path, data=data, method=method)
         if bearer == "default":

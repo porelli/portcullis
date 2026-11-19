@@ -1176,7 +1176,9 @@ def switch_provider() -> None:
         until("the Hub says mail-fake is wired", lambda: (hub_ok("GET", "/api/mail/status").get("provider") or {}).get("instance") == FAKE, 120)
         rotate_when_set()
         names = {(r["name"], r["type"]) for r in zone(DOMAIN)}
-        assert any(n.startswith("fake._domainkey.") for n, _ in names), f"the fake's DKIM key isn't published: {sorted(names)}"
+        # The fake zone's names are relative to the zone (fake._domainkey).
+        assert any(n == "fake._domainkey" or n.startswith("fake._domainkey.") for n, t in names if t == "TXT"), \
+            f"the fake's DKIM key isn't published: {sorted(names)}"
         assert old_dkim and all((n, "TXT") in names or n.split(".", 1)[0] + "._domainkey" in {x.split(".", 1)[0] + "._domainkey" for x, _ in names}
                                 for n in old_dkim), f"the old DKIM keys went at the switch: {sorted(old_dkim)} vs {sorted(names)}"
         rows = hub_ok("GET", "/api/directory/users/alice/mail").get("passwords") or []
@@ -1230,9 +1232,20 @@ def hostile_provider_contained() -> None:
         finally:
             lan_only(False, FAKE)
         # A void that keeps a credential fails its verification: stopped.
+        # A credential first (LAN-only off: the hostile provider keeps the
+        # first one through any void), then a void owed: the slot's API
+        # secret removed (only a void writes a fresh one; contract §19.11),
+        # so the Mail tab's Retry runs one.
+        create_mail_password(state["page_alice"], state["auth_alice"], "alice", "e2e hostile keep")
+        docker("run", "--rm", "--network", "none", "-v", "portcullis_mail_provider_slot:/hs",
+               "docker.io/library/alpine:3.24.3@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a",
+               "rm", "-f", "/hs/api-secret")
         code, ans = hub("POST", "/api/mail/provider/retry-void", actor="root")
-        if code == 202:
+        assert code == 202, f"retry-void with the API secret gone: HTTP {code} {scrub(json.dumps(ans))[:300]} (want 202: a void owed)"
+        try:
             e2e_ops.wait(get_as("root"), e2e_ops.accepted(ans), 600)
+        except AssertionError as e:
+            print(f"    the void op: {scrub(str(e))[:200]} (a failed verification is the expected end)", flush=True)
         until("mail_void_pending", lambda: "mail_void_pending" in json.dumps(hub_ok("GET", "/api/doctor")), 300, every=10)
         st = docker("inspect", "-f", "{{.State.Status}}", pcid("fake", "portcullis-" + FAKE)).strip()
         assert st != "running", f"the hostile provider still runs after a failed void ({st})"
@@ -1342,6 +1355,15 @@ def conformance(level: str, inst: str, service: str) -> None:
     pinned portcullis-mail-api address; the Hub stopped meanwhile), once
     the provider answers (a switch back just before may still be starting)."""
     until(f"{inst} answers the Hub (GET /api/mail/checks 200)", lambda: hub("GET", "/api/mail/checks")[0] == 200, 300, every=5)
+
+    def serving():
+        p = run("./portcullis", "mail", "status", "--json", timeout=120, check_rc=False)
+        try:
+            h = json.loads(p.stdout).get("hub") or {}
+        except ValueError:
+            return False
+        return h.get("instance") == inst and h.get("reachable") is True and h.get("void_owed") is None and h.get("held") is None
+    until(f"{inst} reachable, no void owed, not held (./portcullis mail status --json)", serving, 300, every=5)
     hub_cid = docker("compose", "ps", "-q", "hub").strip()
     docker("stop", hub_cid)
     try:
