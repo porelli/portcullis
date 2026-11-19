@@ -127,5 +127,41 @@ class ConfirmRemoval(unittest.TestCase):
                 mc.pending_uuids(bad)
 
 
+def status(problem, **hub):
+    h = {"wired": True, "reachable": True, "void_owed": None, "held": None, "generation": 7, "applied_generation": 7}
+    h.update(hub)
+    return {"enabled": True, "hub": h, "problem": problem}
+
+
+class MailStatus(unittest.TestCase):
+    def test_rc1_problem_checks_are_read(self):
+        # Run 44577708246: rc 1, a valid document (the PTR check a Problem).
+        import json
+        j = mc.mail_status_view(1, json.dumps(status(True)))
+        self.assertIsNone(mc.sync_problem(j))
+        self.assertIsNone(mc.sync_problem(mc.mail_status_view(0, json.dumps(status(False)))))
+
+    def test_failed_reads(self):
+        import json
+        for rc, out in ((2, json.dumps(status(False))), (127, ""), (1, ""), (0, "not json"), (0, "[]"),
+                        (0, json.dumps({"hub": None})), (0, json.dumps(status(True))), (1, json.dumps(status(False)))):
+            with self.assertRaises(AssertionError, msg=(rc, out)):
+                mc.mail_status_view(rc, out)
+
+    def test_not_converged(self):
+        cases = {"applied generation 6 of 7": status(True, applied_generation=6),
+                 "applied generation None": status(True, applied_generation=None),
+                 "no generation sent": status(True, generation=None),
+                 "reachable is False": status(True, reachable=False),
+                 "wired is False": status(True, wired=False),
+                 "void_owed": status(True, void_owed={"reason": "wire"}),
+                 "held": status(True, held={"reason": "x"}),
+                 "the Hub didn't answer": {"hub": None, "problem": True}}
+        for want, st in cases.items():
+            got = mc.sync_problem(st)
+            self.assertIsNotNone(got, want)
+            self.assertIn(want, got)
+
+
 if __name__ == "__main__":
     unittest.main()

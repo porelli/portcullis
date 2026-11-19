@@ -1403,10 +1403,7 @@ def conformance(level: str, inst: str, service: str) -> None:
 
     def serving():
         p = run("./portcullis", "mail", "status", "--json", timeout=120, check_rc=False)
-        try:
-            h = json.loads(p.stdout).get("hub") or {}
-        except ValueError:
-            return False
+        h = mailcheck.mail_status_view(p.returncode, p.stdout).get("hub") or {}
         return h.get("instance") == inst and h.get("reachable") is True and h.get("void_owed") is None and h.get("held") is None
     until(f"{inst} reachable, no void owed, not held (./portcullis mail status --json)", serving, 300, every=5)
     hub_cid = docker("compose", "ps", "-q", "hub").strip()
@@ -1518,8 +1515,11 @@ def confirm_pending_removal() -> None:
             return False
         if hub_ok_as("GET", "/api/mail/settings", "root").get("pending_removal") is not None:
             return False
-        h = (json.loads(run("./portcullis", "mail", "status", "--json", timeout=120).stdout).get("hub") or {})
-        return h.get("reachable") and h.get("generation") and h.get("applied_generation") == h.get("generation")
+        p = run("./portcullis", "mail", "status", "--json", timeout=120, check_rc=False)
+        why = mailcheck.sync_problem(mailcheck.mail_status_view(p.returncode, p.stdout))
+        if why:
+            raise AssertionError(f"mail status: {why}")
+        return True
     try:
         until("the mail sync converged after the confirmation", converged, 300, every=10)
     except AssertionError:
