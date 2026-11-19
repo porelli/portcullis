@@ -97,6 +97,9 @@ class Recorded:
                 return 404, {"error": "no account"}
             if acct["uuid"] != b["uuid"] and "mismatch" not in self.d:
                 return 409, {"error": "uuid", "error_kind": "account_mismatch"}
+            # As mailctl: at most 5 active mail passwords per person.
+            if len(self.creds.get(b["uuid"], [])) >= 5:
+                return 409, {"error": "the account has 5 active mail passwords", "error_kind": "limit"}
             self.n += 1
             row = {"id": str(self.n), "uuid": b["uuid"], "label": b["label"], "created_at": "2026-11-17T10:00:00Z", "expires_at": None,
                    "last_used_at": None, "allowed_ips": []}
@@ -185,6 +188,17 @@ class RunTest(unittest.TestCase):
             os.unlink(f.name)
         self.assertEqual(rc, 1)
         self.assertIn("not applied within 3 s", out.getvalue())
+
+    def test_protocol_checks_never_reach_the_password_limit(self):
+        # Every protocol check makes alice a password: the earlier ones are
+        # revoked first, so the sixth and later never meet the 5-limit.
+        import checks_api
+        import checks_proto
+        rec = Recorded()
+        ctx = checks_api.Ctx("http://provider.test", SECRET, None, rec)
+        for i in range(8):
+            pw, err = checks_proto._alice(ctx)
+            self.assertIsNone(err, "attempt %d: %s" % (i + 1, err))
 
     def test_secret_file_too_short(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as f:

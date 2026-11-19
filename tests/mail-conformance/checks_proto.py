@@ -44,9 +44,14 @@ def _alice(ctx, lan_only=False, local=None):
     st, _, b = put(ctx, doc(ctx, ["alice", "bob"], lan_only=lan_only, local=local))
     if st != 202:
         return None, "PUT a document: HTTP %d %s" % (st, b[:200])
+    # The earlier checks' passwords revoked first: a provider holds at
+    # most 5 active ones per person (contract §19.5: error_kind limit).
+    st, rows, _ = ctx.call("GET", "/v1/credentials?uuid=" + UUIDS[0])
+    for r in rows if st == 200 and isinstance(rows, list) else []:
+        ctx.call("DELETE", "/v1/credentials/%s?uuid=%s" % (r.get("id"), UUIDS[0]))
     st, j = cred(ctx, "alice", UUIDS[0], "proto")
     if st != 201:
-        return None, "create a password: HTTP %d" % st
+        return None, "create a password: HTTP %d %s" % (st, (j or {}).get("error_kind") or (j or {}).get("error") or "")
     return j["secret"], None
 
 

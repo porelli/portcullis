@@ -1028,7 +1028,20 @@ def counter_ahead(page: Page) -> None:
 
 def fresh_proof(page: Page, fa: dict, label: str) -> dict:
     """The Hub listener's fresh sign-in (prompt=login, max_age=0, PKCE
-    S256), as the instance's Mail tab runs it: the wiring's proof."""
+    S256), as the instance's Mail tab runs it: the wiring's proof. A
+    container start aborts Chromium's navigation now and then
+    (net::ERR_NETWORK_CHANGED → chrome-error://): one new attempt then,
+    as the setup links get (noted in the job summary)."""
+    try:
+        return _fresh_proof(page, fa, label)
+    except AssertionError as e:
+        if "chrome-error://" not in str(e):
+            raise
+        base._note_retry(f"{label}: the fresh sign-in's page aborted (chrome-error://, a network change): one new attempt")
+        return _fresh_proof(page, fa, label + "-retry")
+
+
+def _fresh_proof(page: Page, fa: dict, label: str) -> dict:
     counter_ahead(page)
     import hashlib
     import secrets as pysecrets
@@ -1206,6 +1219,13 @@ def hostile_provider_contained() -> None:
         # LAN-only on: the provider answers 0.0.0.0/0 → the row is revoked.
         lan_only(True, FAKE)
         try:
+            # A mail password made under LAN-only: the hostile provider
+            # answers it 0.0.0.0/0, the Hub revokes it and names it (the
+            # switch voided every earlier one, so this is the row judged).
+            try:
+                create_mail_password(state["page_alice"], state["auth_alice"], "alice", "e2e hostile lan")
+            except AssertionError as e:
+                print(f"    the hostile provider's password: {scrub(str(e))[:200]} (the Hub may refuse it at once)", flush=True)
             until("mail_lan_only_unenforced", lambda: "mail_lan_only_unenforced" in json.dumps(hub_ok("GET", "/api/doctor")), 180, every=10)
         finally:
             lan_only(False, FAKE)
