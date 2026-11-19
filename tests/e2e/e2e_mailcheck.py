@@ -13,8 +13,9 @@ tested by tests/test_e2e_mailcheck.py.
   server changed on <date>: create a new mail password" (a revoked row
   isn't listed); anything else is named.
 - confirm_phrase / pending_uuids: the confirmation of a pending mass
-  removal (R-SWITCH-BASE-3): the phrase the Hub asks to be typed, and the
-  pending accounts' uuids.
+  removal (R-SWITCH-BASE-3, R-CONFIRM-REMOVAL): the phrase the Hub's 400
+  names, and the pending accounts' uuids; removal_phrase the phrase's
+  format ("remove <n> mailboxes", "remove 1 mailbox").
 """
 from __future__ import annotations
 
@@ -92,3 +93,9 @@ def pending_uuids(view) -> list:
     if not out or "" in out:
         raise AssertionError(f"the pending removal names no (or a blank) account: {view!r}")
     return out
+
+
+def removal_phrase(n: int) -> str:
+    """The typed confirmation of a pending removal of n mailboxes (Hub
+    R-CONFIRM-REMOVAL): "remove <n> mailboxes", "remove 1 mailbox"."""
+    return "remove 1 mailbox" if n == 1 else f"remove {n} mailboxes"

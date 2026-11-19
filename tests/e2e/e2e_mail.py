@@ -1483,30 +1483,34 @@ def conformance_fake_api() -> None:
 
 def confirm_pending_removal() -> None:
     """The pending removal (doctor mail_mass_removal_pending) confirmed
-    through POST /api/mail/confirm-removal: refused for a non-admin, without
-    a fresh sign-in and without the typed confirmation; accepted as root
-    with both; then the sync converges (no pending removal, no blocked
-    sync, the document applied)."""
+    through POST /api/mail/confirm-removal (Ruling R-CONFIRM-REMOVAL, Hub
+    dbe65d3): refused for a non-admin (403), without a fresh sign-in
+    whatever the phrase (403, presence first), with a wrong phrase (400
+    naming pending_removal.confirm_phrase, before the proof is spent);
+    then that same proof with the phrase: 204, audited with the count and
+    the uuids; then the sync converges."""
     until("mail_mass_removal_pending", lambda: "mail_mass_removal_pending" in json.dumps(hub_ok("GET", "/api/doctor")), 300, every=10)
     v = hub_ok_as("GET", "/api/mail/settings", "root")
-    uuids = mailcheck.pending_uuids(v.get("pending_removal"))
+    pr = v.get("pending_removal")
+    uuids = mailcheck.pending_uuids(pr)
+    phrase = pr.get("confirm_phrase")
+    assert phrase == mailcheck.removal_phrase(len(uuids)), f"confirm_phrase {phrase!r} for {len(uuids)} accounts"
     path = "/api/mail/confirm-removal"
-    code, _ = hub("POST", path, {"accounts": uuids}, actor="alice")
+    code, _ = hub("POST", path, {"accounts": uuids, "confirm": phrase}, actor="alice")
     assert code == 403, f"a non-admin's confirmation: HTTP {code} (want 403)"
-    code, ans = hub("POST", path, {"accounts": uuids}, actor="root")
-    assert code == 403, f"no fresh sign-in: HTTP {code} {scrub(json.dumps(ans))[:300]} (want 403)"
-    page = state["page_root"]
-    code, ans = hub("POST", path, {"accounts": uuids, **fresh_proof(page, v["fresh_auth"], "confirm-removal-untyped")}, actor="root")
+    code, ans = hub("POST", path, {"accounts": uuids, "confirm": phrase}, actor="root")
+    assert code == 403, f"no fresh sign-in (the right phrase): HTTP {code} {scrub(json.dumps(ans))[:300]} (want 403)"
+    proof = fresh_proof(state["page_root"], v["fresh_auth"], "confirm-removal")
+    code, ans = hub("POST", path, {"accounts": uuids, "confirm": "remove all mailboxes", **proof}, actor="root")
     txt = ans if isinstance(ans, str) else json.dumps(ans)
-    phrase = mailcheck.confirm_phrase(txt) if code == 400 else None
-    assert phrase, f"no typed confirmation: HTTP {code} {scrub(txt)[:300]} (want 400 naming what to type)"
-    v = hub_ok_as("GET", "/api/mail/settings", "root")
-    code, ans = hub("POST", path, {"accounts": mailcheck.pending_uuids(v.get("pending_removal")), "confirm": phrase,
-                                   **fresh_proof(page, v["fresh_auth"], "confirm-removal")}, actor="root")
-    assert code in (202, 204), f"the confirmation: HTTP {code} {scrub(json.dumps(ans))[:300]}"
-    if code == 202:
-        e2e_ops.check_ok(e2e_ops.accepted(ans), e2e_ops.wait(get_as("root"), e2e_ops.accepted(ans), 600))
-    assert "mail.confirm_removal" in json.dumps(hub_ok("GET", "/api/directory/audit")), "no mail.confirm_removal in the audit"
+    assert code == 400 and mailcheck.confirm_phrase(txt) == phrase, \
+        f"a wrong phrase: HTTP {code} {scrub(txt)[:300]} (want 400 naming {phrase!r})"
+    # The same proof again: the phrase is checked before the proof is spent.
+    code, ans = hub("POST", path, {"accounts": uuids, "confirm": phrase, **proof}, actor="root")
+    assert code == 204, f"the confirmation: HTTP {code} {scrub(json.dumps(ans))[:300]} (want 204)"
+    audit = json.dumps(hub_ok("GET", "/api/directory/audit"))
+    want = f"count={len(uuids)} accounts={','.join(uuids)}"
+    assert "mail.confirm_removal" in audit and want in audit, f"no mail.confirm_removal with {want} in the audit"
 
     def converged():
         d = json.dumps(hub_ok("GET", "/api/doctor"))

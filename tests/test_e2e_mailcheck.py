@@ -111,6 +111,13 @@ class ConfirmRemoval(unittest.TestCase):
         for t in ("", "forbidden", 'type "" to confirm', None):
             self.assertIsNone(mc.confirm_phrase(t), t)
 
+    def test_removal_phrase(self):
+        self.assertEqual(mc.removal_phrase(1), "remove 1 mailbox")
+        self.assertEqual(mc.removal_phrase(2), "remove 2 mailboxes")
+        self.assertEqual(mc.removal_phrase(12), "remove 12 mailboxes")
+        # The Hub's 400 names it and confirm_phrase reads it back.
+        self.assertEqual(mc.confirm_phrase('type "%s" to confirm' % mc.removal_phrase(1)), "remove 1 mailbox")
+
     def test_pending_uuids(self):
         v = {"accounts": [{"username": "bob", "uuid": "u2"}, {"username": "alice", "uuid": "u1"}], "confirmed": False}
         self.assertEqual(mc.pending_uuids(v), ["u1", "u2"])
