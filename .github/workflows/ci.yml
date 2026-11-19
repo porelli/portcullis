@@ -4272,11 +4272,15 @@ jobs:
         run: |
           ./portcullis backup
           B="$(find backups -maxdepth 1 -type d -name '2*' | sort | tail -n1)"
-          # The remote leaves the template's egress network (the restore
-          # takes the provider's project down, which removes it), then comes back.
+          # The remote leaves the template's egress network for good (the
+          # restore takes the provider's project down, which removes it).
+          # It never comes back: the Hub's void after the restore runs a
+          # compose up that recreates that network, which a foreign
+          # container attached to it makes fail (run 44542719009: "network
+          # portcullis-stalwart_egress … has active endpoints", stalwart
+          # left down); scenario 10 doesn't use the remote.
           docker network disconnect portcullis-stalwart_egress e2e-remote
           ./portcullis restore --yes "$B"
-          docker network connect --ip 172.30.88.25 portcullis-stalwart_egress e2e-remote
           E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
           export E2E_HUB_SECRET
           NODE_EXTRA_CA_CERTS="$PWD/certs/ca-chain.crt" /tmp/e2e-venv/bin/python tests/e2e/e2e_mail.py restore
