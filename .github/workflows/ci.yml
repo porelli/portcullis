@@ -336,6 +336,10 @@ jobs:
       # stdlib only, no stack.
       - name: e2e helper unit tests (e2e_fsops)
         run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_e2e_fsops.py
+      # e2e_mail's pure helpers (network-abort retries, the switch's
+      # voided rows): stdlib only, no stack.
+      - name: e2e helper unit tests (e2e_mailcheck)
+        run: PYTHONDONTWRITEBYTECODE=1 /tmp/gg-venv/bin/python tests/test_e2e_mailcheck.py
       # E2E_SCENARIOS (the `scenarios` input): names, setup, the needs()
       # closure, the per-job check (tests/e2e/scenarios.py; stdlib only).
       - name: e2e scenario filter unit tests (scenarios.py)
@@ -351,7 +355,7 @@ jobs:
         run: docker compose version && jq --version && yq --version
       - name: compose files are valid with a generated .env
         run: bash .github/ci/unit-tests-compose-files-are-valid-generated.sh
-      - name: mail profile wiring (networks, addresses, mounts, users, caps, pins; contract §19.1)
+      - name: mail slot wiring (portcullis-mail-api, mail_slot, the Hub's group 2000; contract §19.1)
         run: bash .github/ci/unit-tests-mail-wiring.sh
 
       - name: every image is pinned tag@sha256 (all compose files, all profiles, CLI, workflows)
@@ -372,11 +376,11 @@ jobs:
             [ "$svc:$img" != mail-cert:portcullis-domains ] || continue
             [[ "$img" =~ ^[^@[:space:]]+:[^@[:space:]]+@sha256:[0-9a-f]{64}$ ]] || { echo "UNPINNED: $svc → $img"; bad=1; }
           done < /tmp/images
-          for df in enroll/Dockerfile group-gate/Dockerfile domains/Dockerfile mcp-gate/Dockerfile wg/Dockerfile forwarder/Dockerfile mailctl/Dockerfile; do
+          for df in enroll/Dockerfile group-gate/Dockerfile domains/Dockerfile mcp-gate/Dockerfile wg/Dockerfile forwarder/Dockerfile mailctl/Dockerfile tests/e2e/mail-fake/Dockerfile; do
             if grep -E '^FROM ' "$df" | grep -v '@sha256:'; then echo "UNPINNED base image in $df"; bad=1; fi
           done
           # One Go builder (tag and digest) for every locally built Go service.
-          GO_DFS="enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile wg/Dockerfile forwarder/Dockerfile mailctl/Dockerfile"
+          GO_DFS="enroll/Dockerfile domains/Dockerfile mcp-gate/Dockerfile wg/Dockerfile forwarder/Dockerfile mailctl/Dockerfile tests/e2e/mail-fake/Dockerfile"
           # shellcheck disable=SC2086  # a list of paths
           if [ "$(grep -hE '^FROM docker.io/library/golang:' $GO_DFS | awk '{print $2}' | sort -u | wc -l | tr -d ' ')" != 1 ]; then
             # shellcheck disable=SC2086
@@ -399,7 +403,8 @@ jobs:
           if grep -nE '^\s+image: ' .github/workflows/*.yml .github/ci/*.sh | grep -v '@sha256:'; then echo "UNPINNED image in a workflow"; bad=1; fi
           if grep -nE '(ALPINE|_IMG|IMAGE): [a-z]' .github/workflows/*.yml .github/ci/*.sh | grep -v '@sha256:'; then echo "UNPINNED image variable in a workflow"; bad=1; fi
           # The CI-only app templates (job e2e-instances).
-          if grep -nE '^\s+image: ' tests/e2e/apps/*/compose.yml | grep -v '@sha256:'; then echo "UNPINNED image in a CI template"; bad=1; fi
+          # (Local CI builds — portcullis-mail-fake:ci — are exempt.)
+          if grep -nE '^\s+image: ' tests/e2e/apps/*/compose.yml | grep -v '@sha256:' | grep -vE 'image: portcullis-[a-z-]+:ci$'; then echo "UNPINNED image in a CI template"; bad=1; fi
           # Actions by full commit SHA.
           if grep -nE '^\s+(- )?uses: ' .github/workflows/*.yml .github/actions/*/action.yml | grep -vE 'uses: (\./|[^@]+@[0-9a-f]{40} # v[0-9]+\.[0-9]+\.[0-9]+$)'; then echo "Action not pinned by commit SHA (# vX.Y.Z)"; bad=1; fi
           [ "$bad" = 0 ] || exit 1
@@ -533,6 +538,11 @@ jobs:
           CGO_ENABLED=0 go build -o /dev/null .
           test -s internal/stalwart/testdata/schema-v1.1.0.json
           CGO_ENABLED=1 go test -race ./...
+      - name: mail-fake and the mail provider conformance suite (tests/e2e/mail-fake, tests/mail-conformance; plan Task 26)
+        run: |
+          (cd tests/e2e/mail-fake && go vet ./... && test -z "$(gofmt -l .)" && CGO_ENABLED=1 go test -race ./...)
+          python3 -m py_compile tests/mail-conformance/run.py tests/mail-conformance/checks_api.py tests/mail-conformance/checks_proto.py
+          PYTHONDONTWRITEBYTECODE=1 python3 tests/mail-conformance/test_run.py
       - name: VPN client unit tests (tests/e2e/vpn-client, the e2e jobs' WireGuard client)
         working-directory: tests/e2e/vpn-client
         run: |
@@ -580,9 +590,11 @@ jobs:
           done
           [ "$fail" = 0 ] || exit 1
           echo "mcp-gate vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
-      # MailState v1 (contract §19.5): mailctl's vector is a byte copy of the
-      # Hub's, on the same-named Hub branch when it exists, else main.
-      - name: mailctl MailState vector matches the Hub
+      # The shared mail vectors (contract §19.5, §19.7): MailState v2
+      # (mailctl's) and the mail DNS rule vectors (domains') are byte copies
+      # of the Hub's internal/mailprovider/testdata, on the same-named Hub
+      # branch when it exists, else main.
+      - name: MailState v2 and the mail DNS rule vectors match the Hub
         env:
           REF: ${{ github.head_ref || github.ref_name }}
         run: |
@@ -595,12 +607,14 @@ jobs:
           fi
           sha=$(awk -v r="refs/heads/$ref" '$2 == r { print $1 }' <<<"$heads")
           [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::portcullis-hub has no single commit for refs/heads/$ref"; exit 1; }
-          hub="$RUNNER_TEMP/hub_mailstate_v1.json"
-          code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/internal/mailctl/testdata/mailstate_v1.json")
-          [ "$code" = 200 ] || { echo "::error::fetching the Hub's MailState vector from $ref ($sha): HTTP $code"; exit 1; }
-          cmp mailctl/internal/state/testdata/mailstate_v1.json "$hub" \
-            || { echo "::error::mailctl/internal/state/testdata/mailstate_v1.json differs from portcullis-hub $ref ($sha): copy it byte for byte"; exit 1; }
-          echo "MailState vector matches portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
+          for pair in mailstate_v2.json:mailctl/internal/state/testdata/mailstate_v2.json \
+                      mail_dns_vectors.json:domains/internal/dnsplan/testdata/mail_dns_vectors.json; do
+            f="${pair%%:*}" ours="${pair#*:}" hub="$RUNNER_TEMP/hub_${pair%%:*}"
+            code=$(curl -sS -o "$hub" -w '%{http_code}' "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/internal/mailprovider/testdata/$f")
+            [ "$code" = 200 ] || { echo "::error::fetching the Hub's $f from $ref ($sha): HTTP $code"; exit 1; }
+            cmp "$ours" "$hub" || { echo "::error::$ours differs from portcullis-hub $ref ($sha): copy it byte for byte"; exit 1; }
+          done
+          echo "MailState v2 and mail DNS rule vectors match portcullis-hub $ref ($sha)" | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Save the Go module and build cache
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -668,6 +682,11 @@ jobs:
                 DNS_CAA_ISSUER: pebble.test
               volumes:
                 - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
+              # The fake DNS for the mail template's resolver (its egress
+              # network reaches the runner, never this network).
+              ports:
+                - "8053:8053/udp"
+                - "8053:8053/tcp"
             pebble:
               image: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
               command: ["-config", "/test/config/pebble-config.json", "-dnsserver", "domains:8053"]
@@ -685,14 +704,15 @@ jobs:
                 # CI only: Traefik's API on its internal :8080 entrypoint, for
                 # the "no @http object" checks of the domains test.
                 TRAEFIK_API_INSECURE: "true"
-            # Mail (step "Test the mail service"): mail-cert against its own
+            # Mail (step "Test the mail provider"): mail-cert against its own
             # Pebble (accepts the one-shot's own fake-DNS challenge; its TLS
-            # certificate from the step's CI CA), mail-resolver forwarding
-            # every name to the domains fake DNS, mailctl's "public"
-            # resolvers = mail-resolver: no DNS or SMTP leaves the runner.
+            # certificate from the step's CI CA). The stalwart template's
+            # resolver forwards every name to the fake DNS on the runner's
+            # port 8053 (mail-templates-checkout.sh): no DNS or SMTP leaves
+            # the runner.
             pebble-mail:
               image: ghcr.io/letsencrypt/pebble:2.10.1@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199
-              profiles: [mail]
+              profiles: [ci-mail]
               command: ["-config", "/ci/pebble.json", "-dnsserver", "127.0.0.1:53"]
               environment:
                 PEBBLE_VA_ALWAYS_VALID: "1"
@@ -707,17 +727,6 @@ jobs:
                 DOMAINS_RESOLVERS: 127.0.0.1:8053
               volumes:
                 - /tmp/pebble-mail/ca.pem:/run/ci/pebble-mail-ca.pem:ro
-            mail-resolver:
-              volumes:
-                - /tmp/unbound-ci.conf:/etc/unbound/custom.conf:ro
-              networks:
-                domains-egress: {}
-              healthcheck:
-                test: ["CMD", "drill-hc", "-p", "5353", "@127.0.0.1", "team-b.ci-domains.test"]
-            mailctl:
-              environment:
-                MAILCTL_RESOLVERS: 172.31.255.4:5353
-                MAILCTL_PUBLIC_IPV4: 203.0.113.25
           YML
           sed -i 's/^          //' docker-compose.ci.yml
           docker compose config -q
@@ -1930,8 +1939,24 @@ jobs:
       - name: Test the session store (oauth2-proxy sessions in Valkey, a ticket cookie, the ACL)
         run: bash .github/ci/build-and-test-session-store.sh
 
-      - name: Test the mail service (bootstrap, recovery gone, isolation, certificate, open relay, status, timer)
-        timeout-minutes: 20
+      - name: Build the mail adapter (mailctl/ → portcullis-mailctl:ci, P2)
+        timeout-minutes: 15
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: mailctl
+          tags: portcullis-mailctl:ci
+          load: true
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=mailctl
+          cache-to: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'type=gha,scope=mailctl,mode=max' || '' }}
+      - name: Templates for mail (same-named templates branch, else main; the local adapter, the fake DNS)
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
+          MAIL_CI_DNS_PROBE: team-b.ci-domains.test
+        run: bash .github/ci/mail-templates-checkout.sh "$RUNNER_TEMP/templates" "$(ip -4 route get 1.1.1.1 | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}')"
+      - name: Test the mail provider (the stalwart template wired — bootstrap, isolation, certificate, open relay, gate, status, timer)
+        timeout-minutes: 25
         run: bash .github/ci/build-and-test-mail-service.sh setup
 
       - name: portcullis status
@@ -1966,7 +1991,7 @@ jobs:
           grep -q '^portcullis_vault_active 1$' monitoring/textfile/status.prom || { echo "FAIL: status --textfile"; cat monitoring/textfile/status.prom; exit 1; }
           echo "PASS: logical backup while running, verify --local, corruption detected, metrics"
 
-      - name: "Mail: the backup stopped and restarted mail, archived its volumes"
+      - name: "Mail: the backup holds the provider's instance archive"
         run: bash .github/ci/build-and-test-mail-service.sh after-backup
 
       - name: Off-host backup (restic, local repository), verify, wrong password
@@ -1996,7 +2021,7 @@ jobs:
         timeout-minutes: 15
         run: bash .github/ci/build-and-test-restore-from-off-host-fresh.sh
 
-      - name: "Mail: the restore voided the mail passwords, mailctl_data came back"
+      - name: "Mail: the restore restored the provider and voided its mail passwords"
         run: bash .github/ci/build-and-test-mail-service.sh after-restore
 
       - name: Collect service status
@@ -4001,12 +4026,15 @@ jobs:
           docker compose down -v
           sudo rm -rf "$E2E_FAMILY"
 
-  # Mail end to end (contract §19, mail plan Task 12): the whole stack + the
-  # Hub (same-named Hub branch) + domains (Pebble, the fake provider with
-  # ONE fake zone: the domains service serves it, the dns tool and
-  # mail-cert write into it over DOMAINS_FAKEDNS_REMOTE) and the enrolled
-  # team-b.test; mail on for ci.example.org and team-b.test; a second
-  # Stalwart (remote.test, .github/ci/e2e-mail-remote.sh) on mail-egress.
+  # Mail end to end (contract §19; mail provider plan Task 27): the whole
+  # stack + the Hub (same-named Hub branch) + domains (Pebble, the fake
+  # provider with ONE fake zone: the domains service serves it, the dns
+  # tool and mail-cert write into it over DOMAINS_FAKEDNS_REMOTE) and the
+  # enrolled team-b.test; the stalwart template wired (`mail enable
+  # --provider stalwart`, the templates checkout as the Hub's source with
+  # the CI-only mail-fake); mail on for ci.example.org and team-b.test; a
+  # second Stalwart (remote.test, .github/ci/e2e-mail-remote.sh) on the
+  # template's egress network.
   # Nothing leaves the runner: outbound 25 / 465 / 587 rejected outside
   # 172.16.0.0/12 (containers and the runner), every name the fake zone's,
   # the remote fenced to the stack's networks. tests/e2e/e2e_mail.py:
@@ -4029,7 +4057,7 @@ jobs:
       E2E_DOMAIN: ci.example.org
       # The workflow's PORTCULLIS_DOMAIN (portcullis.local) and public
       # addresses would win over .env (the shell's value wins, as with
-      # compose): mail's mail-egress address is the server's (SPF, the MX).
+      # compose): stalwart's pinned egress address is the server's (SPF, the MX).
       PORTCULLIS_DOMAIN: ci.example.org
       PORTCULLIS_PUBLIC_IPV4: 172.30.88.2
       PORTCULLIS_PUBLIC_IPV6: ""
@@ -4049,7 +4077,8 @@ jobs:
           done
           # The CI-only fake provider for the main domain (records into the
           # shared zone), mail-cert against Pebble, the public address =
-          # mail's pinned mail-egress address (SPF / the remote's MX target).
+          # stalwart's pinned address on the template's egress network
+          # (the CI checkout pins it: SPF / the remote's MX target).
           # (init wrote DNS_PROVIDER=none: the first line of a key wins.)
           sed -i '/^DNS_PROVIDER=/d' .env
           cat >> .env <<'ENV'
@@ -4087,6 +4116,11 @@ jobs:
                 DOMAINS_FAKEDNS_API_ADDR: ":8054"
               volumes:
                 - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
+              # The fake zone for the mail template's resolver (its egress
+              # network reaches the runner, never domains-egress).
+              ports:
+                - "8053:8053/udp"
+                - "8053:8053/tcp"
               networks:
                 domains-egress:
                   ipv4_address: 172.30.87.53
@@ -4108,40 +4142,20 @@ jobs:
                 DOMAINS_FAKEDNS_REMOTE: http://172.30.87.53:8054
               volumes:
                 - /tmp/pebble.minica.pem:/run/ci/pebble.minica.pem:ro
-            mail-resolver:
-              volumes:
-                - /tmp/unbound-ci.conf:/etc/unbound/custom.conf:ro
-              networks:
-                domains-egress: {}
-              healthcheck:
-                test: ["CMD", "drill-hc", "-p", "5353", "@127.0.0.1", "team-b.test"]
-            mail:
-              networks:
-                mail-egress:
-                  ipv4_address: 172.30.88.2
-            mailctl:
-              environment:
-                MAILCTL_RESOLVERS: 172.31.255.4:5353
-                MAILCTL_PUBLIC_IPV4: 172.30.88.2
           networks:
             domains-egress:
               ipam:
                 config:
                   - subnet: 172.30.87.0/24
-            mail-egress:
-              ipam:
-                config:
-                  - subnet: 172.30.88.0/24
           YML
-          docker compose --profile mail config -q
-          docker compose --profile mail config --format json | jq -e '.services.mail.networks["mail-egress"].ipv4_address == "172.30.88.2"
-              and .services.domains.networks["domains-egress"].ipv4_address == "172.30.87.53"' >/dev/null \
-            || { echo "FAIL: the egress pins aren't applied"; exit 1; }
+          docker compose config -q
+          docker compose config --format json | jq -e '.services.domains.networks["domains-egress"].ipv4_address == "172.30.87.53"' >/dev/null \
+            || { echo "FAIL: the egress pin isn't applied"; exit 1; }
 
       - name: List the images this job runs
         run: |
           {
-            docker compose --profile mail config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate|mailctl)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
+            docker compose config --images | grep -vxE 'portcullis-(enroll|group-gate|domains|mcp-gate)|ghcr\.io/porelli/portcullis-(hub|keycloak):.*'
             grep -ohE '[a-z0-9][a-z0-9._/-]*:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}' .github/ci/e2e-mail-*.sh scripts/lib/common.sh \
               | grep -E '^docker\.io/(library/alpine|curlimages/curl):'
           } | sort -u > "$RUNNER_TEMP/images.txt"
@@ -4206,8 +4220,15 @@ jobs:
         timeout-minutes: 20
         uses: ./.github/actions/keycloak-image
 
-      - name: Start the whole stack, team-b.test, mail on
+      - name: Build the mail adapter and mail-fake (P2; the CI-only provider)
+        timeout-minutes: 15
+        run: |
+          docker build -q -t portcullis-mailctl:ci mailctl >/dev/null
+          docker build -q -t portcullis-mail-fake:ci tests/e2e/mail-fake >/dev/null
+      - name: Start the whole stack, team-b.test, mail on (the stalwart template wired)
         timeout-minutes: 25
+        env:
+          REF: ${{ github.head_ref || github.ref_name }}
         run: bash .github/ci/e2e-mail-start-stack.sh
 
       - name: The remote mail server (remote.test)
@@ -4251,6 +4272,14 @@ jobs:
         run: |
           ./portcullis backup
           B="$(find backups -maxdepth 1 -type d -name '2*' | sort | tail -n1)"
+          # The remote leaves the template's egress network for good (the
+          # restore takes the provider's project down, which removes it).
+          # It never comes back: the Hub's void after the restore runs a
+          # compose up that recreates that network, which a foreign
+          # container attached to it makes fail (run 44542719009: "network
+          # portcullis-stalwart_egress … has active endpoints", stalwart
+          # left down); scenario 10 doesn't use the remote.
+          docker network disconnect portcullis-stalwart_egress e2e-remote
           ./portcullis restore --yes "$B"
           E2E_HUB_SECRET="$(grep '^HUB_PROXY_SECRET=' .env | cut -d= -f2-)"; echo "::add-mask::$E2E_HUB_SECRET"
           export E2E_HUB_SECRET
@@ -4260,9 +4289,12 @@ jobs:
         if: failure()
         run: |
           mkdir -p e2e-artifacts
-          docker compose --profile mail ps -a > e2e-artifacts/compose-ps.txt 2>&1 || true
-          for svc in mail mailctl mail-resolver domains hub traefik keycloak; do
-            docker compose --profile mail logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
+          docker compose ps -a > e2e-artifacts/compose-ps.txt 2>&1 || true
+          for svc in domains hub traefik keycloak; do
+            docker compose logs --no-color "$svc" > "e2e-artifacts/$svc.log" 2>&1 || true
+          done
+          for c in $(docker ps -aq --filter label=com.docker.compose.project=portcullis-stalwart) $(docker ps -aq --filter label=com.docker.compose.project=portcullis-mail-fake); do
+            docker logs "$c" > "e2e-artifacts/$(docker inspect -f '{{.Name}}' "$c" | tr -d /).log" 2>&1 || true
           done
           docker logs e2e-remote > e2e-artifacts/remote.log 2>&1 || true
 
@@ -4280,7 +4312,7 @@ jobs:
         run: |
           docker rm -f e2e-remote 2>/dev/null || true
           docker volume rm e2e-remote-data 2>/dev/null || true
-          docker compose --profile mail down -v
+          docker compose down -v
           sudo rm -rf /tmp/e2e-remote /tmp/e2e-mail-state.json
 
   # AI support end to end (contract §15, plan 4 Task 30): the whole stack +
@@ -5339,7 +5371,7 @@ jobs:
           [ -z "$left" ] || { echo "FAIL: restored secrets/ entries not owned by the operator: $left"; exit 1; }
           echo "PASS: Docker → Podman: the .env kept CONTAINER_RUNTIME=podman and the rootless socket, status clean, the CA chain and rt-person are the Docker phase's, secrets/ operator-owned"
 
-      - name: Mail on rootless Podman (port 25, rewritten client addresses, the doctor, delivery, no BlockedIp)
+      - name: Mail on rootless Podman (the stalwart template — port start, rewritten client addresses, cold start, the doctor, delivery, no ban, the gate)
         timeout-minutes: 20
         run: bash .github/ci/e2e-podman-mail.sh
 

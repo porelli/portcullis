@@ -118,13 +118,13 @@ func blocklist(ctx context.Context, d Deps, doc *state.Doc) Check {
 	}
 	c.Detail = strings.Join(notes, "; ")
 	if pbl {
-		c.Steps = append(c.Steps, "The address is in a residential (dynamic) range that receivers refuse: send through a relay (MAIL_RELAY_HOST in .env).")
+		c.Steps = append(c.Steps, "The address is in a residential (dynamic) range that receivers refuse: send through a relay (Settings → Mail → Relay).")
 	}
 	if c.Severity == Problem {
 		c.Steps = append(c.Steps, "Request delisting at each list's lookup page (Spamhaus: check.spamhaus.org, SpamCop: spamcop.net/bl.shtml, Barracuda: barracudacentral.org/lookups) once the cause is fixed.")
 	}
 	if c.Severity == Warning && strings.Contains(c.Detail, "refused") {
-		c.Steps = append(c.Steps, "Spamhaus refuses queries from large public resolvers: set MAIL_SPAMHAUS_DQS_KEY (a free Data Query Service key) in .env.")
+		c.Steps = append(c.Steps, "Spamhaus refuses queries from large public resolvers: set the stalwart app's dqs_key setting (a free Spamhaus DQS key).")
 	}
 	return c
 }

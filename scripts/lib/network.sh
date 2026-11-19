@@ -33,17 +33,11 @@
 #   PORTCULLIS_VPN_EDGE_IP_RANGE    default 172.31.254.72/29
 #   PORTCULLIS_VPN_EDGE_TRAEFIK_IP  default 172.31.254.66 (vpnsecure)
 #   PORTCULLIS_VPN_EDGE_WG_IP       default 172.31.254.67 (the only PROXY-trusted address)
-#   PORTCULLIS_MAIL_SUBNET     default 172.31.255.0/28 (portcullis-mail: mail,
-#                              mailctl, mail-resolver; contract §19.1)
-#   PORTCULLIS_MAIL_IP_RANGE   default 172.31.255.8/29
-#   PORTCULLIS_MAIL_IP         default 172.31.255.2 (Stalwart's management listener)
-#   PORTCULLIS_MAILCTL_MAIL_IP default 172.31.255.3 (the API key and the access rule pin it)
-#   PORTCULLIS_MAIL_RESOLVER_IP default 172.31.255.4 (Unbound on :5353)
-#   PORTCULLIS_MAILCTL_SUBNET  default 172.31.255.16/28 (portcullis-mailctl: the Hub, mailctl)
-#   PORTCULLIS_MAILCTL_IP_RANGE default 172.31.255.24/29
-#   PORTCULLIS_MAILCTL_HUB_IP  default 172.31.255.18
-#   PORTCULLIS_MAILCTL_API_IP  default 172.31.255.19 (mailctl's Hub API)
-#   PORTCULLIS_MAILCTL_PROXY_IP default 172.31.250.4 (mailctl on portcullis-proxy)
+#   PORTCULLIS_MAIL_API_SUBNET default 172.31.255.16/28 (portcullis-mail-api: the
+#                              Hub and the wired mail provider's api service; §19.1)
+#   PORTCULLIS_MAIL_API_IP_RANGE    default 172.31.255.24/29
+#   PORTCULLIS_MAIL_API_HUB_IP      default 172.31.255.18
+#   PORTCULLIS_MAIL_API_PROVIDER_IP default 172.31.255.19 (the Hub's override pins it)
 #   PORTCULLIS_LINK_NET        default 172.31.254.80/29 (portcullis-link: exactly
 #                              the Hub and wg, both pinned; contract §17.2)
 #   PORTCULLIS_LINK_HUB_IP     default 172.31.254.82
@@ -60,8 +54,7 @@ DOMAINS_NETWORK="${DOMAINS_NETWORK:-portcullis_portcullis-domains}"
 MCP_NETWORK="${MCP_NETWORK:-portcullis-mcp}"
 VPN_NETWORK="${VPN_NETWORK:-portcullis-vpn}"
 VPN_EDGE_NETWORK="${VPN_EDGE_NETWORK:-portcullis-vpn-edge}"
-MAIL_NETWORK="${MAIL_NETWORK:-portcullis-mail}"
-MAILCTL_NETWORK="${MAILCTL_NETWORK:-portcullis-mailctl}"
+MAIL_API_NETWORK="${MAIL_API_NETWORK:-portcullis-mail-api}"
 LINK_NETWORK="${LINK_NETWORK:-portcullis-link}"
 LINK_DATA_NETWORK="${LINK_DATA_NETWORK:-portcullis-link-data}"
 
@@ -84,16 +77,10 @@ vpn_edge_subnet()     { echo "${PORTCULLIS_VPN_EDGE_SUBNET:-172.31.254.64/28}"; 
 vpn_edge_ip_range()   { echo "${PORTCULLIS_VPN_EDGE_IP_RANGE:-172.31.254.72/29}"; }
 vpn_edge_traefik_ip() { echo "${PORTCULLIS_VPN_EDGE_TRAEFIK_IP:-172.31.254.66}"; }
 vpn_edge_wg_ip()      { echo "${PORTCULLIS_VPN_EDGE_WG_IP:-172.31.254.67}"; }
-mail_subnet()       { echo "${PORTCULLIS_MAIL_SUBNET:-172.31.255.0/28}"; }
-mail_ip_range()     { echo "${PORTCULLIS_MAIL_IP_RANGE:-172.31.255.8/29}"; }
-mail_ip()           { echo "${PORTCULLIS_MAIL_IP:-172.31.255.2}"; }
-mailctl_ip()        { echo "${PORTCULLIS_MAILCTL_MAIL_IP:-172.31.255.3}"; }
-mail_resolver_ip()  { echo "${PORTCULLIS_MAIL_RESOLVER_IP:-172.31.255.4}"; }
-mailctl_subnet()    { echo "${PORTCULLIS_MAILCTL_SUBNET:-172.31.255.16/28}"; }
-mailctl_ip_range()  { echo "${PORTCULLIS_MAILCTL_IP_RANGE:-172.31.255.24/29}"; }
-mailctl_hub_ip()    { echo "${PORTCULLIS_MAILCTL_HUB_IP:-172.31.255.18}"; }
-mailctl_api_ip()    { echo "${PORTCULLIS_MAILCTL_API_IP:-172.31.255.19}"; }
-mailctl_proxy_ip()  { echo "${PORTCULLIS_MAILCTL_PROXY_IP:-172.31.250.4}"; }
+mail_api_subnet()      { echo "${PORTCULLIS_MAIL_API_SUBNET:-172.31.255.16/28}"; }
+mail_api_ip_range()    { echo "${PORTCULLIS_MAIL_API_IP_RANGE:-172.31.255.24/29}"; }
+mail_api_hub_ip()      { echo "${PORTCULLIS_MAIL_API_HUB_IP:-172.31.255.18}"; }
+mail_api_provider_ip() { echo "${PORTCULLIS_MAIL_API_PROVIDER_IP:-172.31.255.19}"; }
 link_net()          { echo "${PORTCULLIS_LINK_NET:-172.31.254.80/29}"; }
 link_hub_ip()       { echo "${PORTCULLIS_LINK_HUB_IP:-172.31.254.82}"; }
 link_wg_ip()        { echo "${PORTCULLIS_LINK_WG_IP:-172.31.254.83}"; }
@@ -276,7 +263,7 @@ VPN_LINK_SUBNET="10.214.0.0/24"
 # the Hub gets it as
 # core.env's PORTCULLIS_VPN_RESERVED_RANGES and refuses them first.
 vpn_reserved_ranges() {
-  echo "172.16.0.0/12 192.168.0.0/16 $VPN_LINK_SUBNET $(proxy_subnet) $(auth_subnet) $(domains_subnet) $(mcp_subnet) $(vpn_net) $(vpn_edge_subnet) $(mail_subnet) $(mailctl_subnet) $(link_net) $(link_data_net)${PORTCULLIS_VPN_RUNTIME_POOLS:+ $PORTCULLIS_VPN_RUNTIME_POOLS}"
+  echo "172.16.0.0/12 192.168.0.0/16 $VPN_LINK_SUBNET $(proxy_subnet) $(auth_subnet) $(domains_subnet) $(mcp_subnet) $(vpn_net) $(vpn_edge_subnet) $(mail_api_subnet) $(link_net) $(link_data_net)${PORTCULLIS_VPN_RUNTIME_POOLS:+ $PORTCULLIS_VPN_RUNTIME_POOLS}"
 }
 
 # validate_vpn_edge_network_config — portcullis-vpn-edge (contract §16):
@@ -299,55 +286,30 @@ validate_vpn_edge_network_config() {
   done
 }
 
-# validate_mail_network_config — the two mail networks (contract §19.1):
-# portcullis-mail (mail, mailctl, mail-resolver pinned) and
-# portcullis-mailctl (the Hub, mailctl pinned), each pinned address inside
-# its subnet, outside its range, apart from the others; the two subnets
-# disjoint from each other and from every other fixed core network; mailctl's
-# portcullis-proxy address inside that subnet, outside its range, never
-# Traefik's or mcp-gate's; mail-resolver's access-control (mail/unbound.conf)
-# covers PORTCULLIS_MAIL_SUBNET.
+# validate_mail_network_config — the mail slot's API network (contract
+# §19.1): portcullis-mail-api's subnet and range parse, the range inside
+# the subnet, the Hub's and the provider's pinned addresses inside it,
+# outside the range, off the gateway / broadcast and apart; the subnet
+# disjoint from every other fixed core network.
 validate_mail_network_config() {
-  local sub range csub crange other a b ip conf
-  sub="$(mail_subnet)"; range="$(mail_ip_range)"; csub="$(mailctl_subnet)"; crange="$(mailctl_ip_range)"
-  _validate_net PORTCULLIS_MAIL "$sub" "$range" "$(mail_ip)" PORTCULLIS_MAIL_IP || return 1
-  _validate_net PORTCULLIS_MAIL "$sub" "$range" "$(mailctl_ip)" PORTCULLIS_MAILCTL_MAIL_IP || return 1
-  _validate_net PORTCULLIS_MAIL "$sub" "$range" "$(mail_resolver_ip)" PORTCULLIS_MAIL_RESOLVER_IP || return 1
-  _validate_net PORTCULLIS_MAILCTL "$csub" "$crange" "$(mailctl_hub_ip)" PORTCULLIS_MAILCTL_HUB_IP || return 1
-  _validate_net PORTCULLIS_MAILCTL "$csub" "$crange" "$(mailctl_api_ip)" PORTCULLIS_MAILCTL_API_IP || return 1
-  for a in "PORTCULLIS_MAIL_IP=$(mail_ip)" "PORTCULLIS_MAILCTL_MAIL_IP=$(mailctl_ip)" "PORTCULLIS_MAIL_RESOLVER_IP=$(mail_resolver_ip)"; do
-    for b in "PORTCULLIS_MAIL_IP=$(mail_ip)" "PORTCULLIS_MAILCTL_MAIL_IP=$(mailctl_ip)" "PORTCULLIS_MAIL_RESOLVER_IP=$(mail_resolver_ip)"; do
-      [ "${a%%=*}" != "${b%%=*}" ] || continue
-      if [ "$(ip_to_int "${a#*=}")" = "$(ip_to_int "${b#*=}")" ]; then echo "${a%%=*} and ${b%%=*} are the same address (${a#*=})"; return 1; fi
-    done
-  done
-  if [ "$(ip_to_int "$(mailctl_hub_ip)")" = "$(ip_to_int "$(mailctl_api_ip)")" ]; then
-    echo "PORTCULLIS_MAILCTL_HUB_IP and PORTCULLIS_MAILCTL_API_IP are the same address ($(mailctl_api_ip))"; return 1
+  local sub range other
+  sub="$(mail_api_subnet)"; range="$(mail_api_ip_range)"
+  _validate_net PORTCULLIS_MAIL_API "$sub" "$range" "$(mail_api_hub_ip)" PORTCULLIS_MAIL_API_HUB_IP || return 1
+  _validate_net PORTCULLIS_MAIL_API "$sub" "$range" "$(mail_api_provider_ip)" PORTCULLIS_MAIL_API_PROVIDER_IP || return 1
+  if [ "$(ip_to_int "$(mail_api_hub_ip)")" = "$(ip_to_int "$(mail_api_provider_ip)")" ]; then
+    echo "PORTCULLIS_MAIL_API_HUB_IP and PORTCULLIS_MAIL_API_PROVIDER_IP are the same address ($(mail_api_hub_ip))"; return 1
   fi
-  if _overlaps "$sub" "$csub"; then echo "PORTCULLIS_MAIL_SUBNET=$sub overlaps PORTCULLIS_MAILCTL_SUBNET=$csub"; return 1; fi
   for other in "PORTCULLIS_PROXY_SUBNET=$(proxy_subnet)" "PORTCULLIS_AUTH_SUBNET=$(auth_subnet)" \
                "PORTCULLIS_DOMAINS_SUBNET=$(domains_subnet)" "PORTCULLIS_MCP_SUBNET=$(mcp_subnet)" \
                "PORTCULLIS_VPN_NET=$(vpn_net)" "PORTCULLIS_VPN_EDGE_SUBNET=$(vpn_edge_subnet)"; do
-    if _overlaps "$sub" "${other#*=}"; then echo "PORTCULLIS_MAIL_SUBNET=$sub overlaps $other"; return 1; fi
-    if _overlaps "$csub" "${other#*=}"; then echo "PORTCULLIS_MAILCTL_SUBNET=$csub overlaps $other"; return 1; fi
+    if _overlaps "$sub" "${other#*=}"; then echo "PORTCULLIS_MAIL_API_SUBNET=$sub overlaps $other"; return 1; fi
   done
-  ip="$(mailctl_proxy_ip)"
-  _validate_net PORTCULLIS_PROXY "$(proxy_subnet)" "$(proxy_ip_range)" "$ip" PORTCULLIS_MAILCTL_PROXY_IP || return 1
-  for other in "PORTCULLIS_TRAEFIK_IP=$(proxy_traefik_ip)" "PORTCULLIS_MCP_GATE_IP=$(mcp_gate_ip)"; do
-    if [ "$(ip_to_int "$ip")" = "$(ip_to_int "${other#*=}" 2>/dev/null)" ]; then
-      echo "PORTCULLIS_MAILCTL_PROXY_IP=$ip is ${other%%=*} (each needs its own address)"; return 1
-    fi
-  done
-  conf="${PORTCULLIS_HOME:-$PORTCULLIS_ROOT}/mail/unbound.conf"
-  if [ -f "$conf" ] && ! grep -qE "^[[:space:]]*access-control:[[:space:]]+${sub}[[:space:]]+allow[[:space:]]*$" "$conf"; then
-    echo "PORTCULLIS_MAIL_SUBNET=$sub isn't allowed in mail/unbound.conf (access-control: $sub allow): mail-resolver would refuse mail and mailctl"; return 1
-  fi
 }
 
 # Every core compose service (all profiles; CI checks the list against
 # docker-compose.yml), and the ones that are portcullis-proxy members.
-CORE_SERVICE_NAMES="socket-proxy-traefik socket-proxy-hub traefik postgres vault lldap keycloak sessions forward-auth forward-auth-ext group-gate hub enroll domains dns-tool mcp-gate prometheus alertmanager blackbox textfile-exporter grafana wg mail mailctl mail-resolver mail-cert"
-CORE_PROXY_SERVICES="traefik mcp-gate grafana mailctl"
+CORE_SERVICE_NAMES="socket-proxy-traefik socket-proxy-hub traefik postgres vault lldap keycloak sessions forward-auth forward-auth-ext group-gate hub enroll domains dns-tool mcp-gate prometheus alertmanager blackbox textfile-exporter grafana wg mail-cert"
+CORE_PROXY_SERVICES="traefik mcp-gate grafana"
 
 # proxy_dns_shadows — one "<container> <name>" line per container on
 # portcullis-proxy that could take core traffic by name. Core containers
@@ -581,7 +543,7 @@ validate_link_network_config() {
   for other in "PORTCULLIS_PROXY_SUBNET=$(proxy_subnet)" "PORTCULLIS_AUTH_SUBNET=$(auth_subnet)" \
                "PORTCULLIS_DOMAINS_SUBNET=$(domains_subnet)" "PORTCULLIS_MCP_SUBNET=$(mcp_subnet)" \
                "PORTCULLIS_VPN_NET=$(vpn_net)" "PORTCULLIS_VPN_EDGE_SUBNET=$(vpn_edge_subnet)" \
-               "PORTCULLIS_MAIL_SUBNET=$(mail_subnet)" "PORTCULLIS_MAILCTL_SUBNET=$(mailctl_subnet)" \
+               "PORTCULLIS_MAIL_API_SUBNET=$(mail_api_subnet)" \
                "the link tunnel $VPN_LINK_SUBNET"; do
     if _overlaps "$sub" "${other##*[= ]}"; then echo "PORTCULLIS_LINK_NET=$sub overlaps ${other%=*}"; return 1; fi
     if _overlaps "$dsub" "${other##*[= ]}"; then echo "PORTCULLIS_LINK_DATA_NET=$dsub overlaps ${other%=*}"; return 1; fi
@@ -594,8 +556,7 @@ domains_network_state() { network_state "$DOMAINS_NETWORK" "$(domains_subnet)" "
 mcp_network_state()   { network_state "$MCP_NETWORK" "$(mcp_subnet)" "$(mcp_ip_range)"; }
 vpn_network_state()   { network_state "$VPN_NETWORK" "$(vpn_net)" "$(vpn_ip_range)"; }
 vpn_edge_network_state() { network_state "$VPN_EDGE_NETWORK" "$(vpn_edge_subnet)" "$(vpn_edge_ip_range)"; }
-mail_network_state()  { network_state "$MAIL_NETWORK" "$(mail_subnet)" "$(mail_ip_range)"; }
-mailctl_network_state() { network_state "$MAILCTL_NETWORK" "$(mailctl_subnet)" "$(mailctl_ip_range)"; }
+mail_api_network_state() { network_state "$MAIL_API_NETWORK" "$(mail_api_subnet)" "$(mail_api_ip_range)"; }
 link_network_state()  { network_state "$LINK_NETWORK" "$(link_net)" ""; }
 link_data_network_state() { network_state "$LINK_DATA_NETWORK" "$(link_data_net)" "$(link_data_ip_range)"; }
 
@@ -612,7 +573,7 @@ network_check() {
   err="$(validate_mcp_network_config)" || fail "Invalid portcullis-mcp settings in .env: $err"
   err="$(validate_vpn_network_config)" || fail "Invalid portcullis-vpn settings in .env: $err"
   err="$(validate_vpn_edge_network_config)" || fail "Invalid portcullis-vpn-edge settings in .env: $err"
-  # Always (the Hub joins portcullis-mailctl with or without the profile).
+  # Always (the Hub joins portcullis-mail-api with or without a provider).
   err="$(validate_mail_network_config)" || fail "Invalid mail network settings in .env: $err"
   # Always (the Hub joins portcullis-link with or without the link role).
   err="$(validate_link_network_config)" || fail "Invalid link network settings in .env: $err"
@@ -660,19 +621,13 @@ network_check() {
        ($(vpn_edge_subnet), range $(vpn_edge_ip_range)). Only wg and Traefik use it:
        ./portcullis down && ./portcullis up recreates it."
   fi
-  st="$(mail_network_state)"
-  [ "$st" != unknown ] || fail "can't read the IP range of $MAIL_NETWORK (podman network inspect failed): refusing to go on unverified"
+  st="$(mail_api_network_state)"
+  [ "$st" != unknown ] || fail "can't read the IP range of $MAIL_API_NETWORK (podman network inspect failed): refusing to go on unverified"
   if [ "$st" = mismatch ]; then
-    fail "Docker network $MAIL_NETWORK exists with a different IPAM config than .env
-       ($(mail_subnet), range $(mail_ip_range)). Only mail, mailctl and mail-resolver use it:
-       ./portcullis down && ./portcullis up recreates it."
-  fi
-  st="$(mailctl_network_state)"
-  [ "$st" != unknown ] || fail "can't read the IP range of $MAILCTL_NETWORK (podman network inspect failed): refusing to go on unverified"
-  if [ "$st" = mismatch ]; then
-    fail "Docker network $MAILCTL_NETWORK exists with a different IPAM config than .env
-       ($(mailctl_subnet), range $(mailctl_ip_range)). Only the Hub and mailctl use it:
-       ./portcullis down && ./portcullis up recreates it."
+    fail "Docker network $MAIL_API_NETWORK exists with a different IPAM config than .env
+       ($(mail_api_subnet), range $(mail_api_ip_range)). Only the Hub and the wired mail
+       provider use it: unwire the provider (Settings → Mail), run ./portcullis down, then
+       docker network rm $MAIL_API_NETWORK && ./portcullis up"
   fi
   st="$(link_network_state)"
   [ "$st" != unknown ] || fail "can't read the IP range of $LINK_NETWORK (podman network inspect failed): refusing to go on unverified"

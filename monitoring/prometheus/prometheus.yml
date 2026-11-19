@@ -90,33 +90,31 @@ scrape_configs:
         regex: 'wg_link_.*|portcullis_agent_.*'
         action: keep
 
-  # Mail (profile mail, contract §19.8): over portcullis-metrics-mail, from
-  # one file_sd written by ./portcullis (mail-targets.json: both targets
-  # while the profile is on, else []), each job keeping its own service.
-  # Stalwart's endpoint needs Basic auth (prometheus + a copy of
-  # secrets/mail/metrics-secret).
-  - job_name: mail
-    metrics_path: /metrics/prometheus
+  # The wired mail provider (contract §19.8, P7): the Hub writes
+  # mail_slot/mail-targets.json (file_sd; [] while nothing is wired, so
+  # TargetDown never fires for an empty slot) and mail_slot/metrics-secret
+  # (Basic auth, user prometheus). The provider's contract metrics...
+  - job_name: mail-provider
     basic_auth:
       username: prometheus
-      password_file: /etc/portcullis/mail-metrics-secret
+      password_file: /mail-slot/metrics-secret
     file_sd_configs:
-      - files: [/etc/portcullis/mail-targets.json]
+      - files: [/mail-slot/mail-targets.json]
     relabel_configs:
       - source_labels: [service]
-        regex: mail
+        regex: provider
         action: keep
-  # mailctl's endpoint needs Basic auth too (its own password, a copy of
-  # secrets/mail/mailctl-metrics-secret).
-  - job_name: mailctl
+  # ...and, when its block has server_metrics, its server's own (the
+  # entry's __metrics_path__ is the block's path).
+  - job_name: mail-provider-server
     basic_auth:
       username: prometheus
-      password_file: /etc/portcullis/mailctl-metrics-secret
+      password_file: /mail-slot/metrics-secret
     file_sd_configs:
-      - files: [/etc/portcullis/mail-targets.json]
+      - files: [/mail-slot/mail-targets.json]
     relabel_configs:
       - source_labels: [service]
-        regex: mailctl
+        regex: server
         action: keep
 
   # Textfile metrics written by ./portcullis (backup age, client-cert and CA

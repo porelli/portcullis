@@ -10,6 +10,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -30,10 +31,11 @@ const (
 	Problem = "problem"
 )
 
-// Check is one result.
+// Check is one result. Title only on x- checks (contract §19.8).
 type Check struct {
 	ID       string   `json:"id"`
 	Severity string   `json:"severity"`
+	Title    string   `json:"title,omitempty"`
 	Detail   string   `json:"detail"`
 	Steps    []string `json:"steps"`
 	// Reason: fcrdns_v4 / fcrdns_v6 when not ok, "missing" | "mismatch".
@@ -59,10 +61,10 @@ func Value(sev string) float64 {
 // Querier asks a DNS server one question (resolve.Query).
 type Querier func(ctx context.Context, server, name string, qtype uint16, dnssec bool) (*dns.Msg, error)
 
-// Config is what the checks need from the environment.
+// Config is what the checks need besides the document. Hostname and
+// ClientIP are the accepted document's (Run fills them).
 type Config struct {
 	Hostname      string
-	MainDomain    string
 	PublicIPv4    netip.Addr
 	PublicIPv6    netip.Addr
 	Resolvers     []string // the public resolvers
@@ -96,12 +98,16 @@ func Run(ctx context.Context, d Deps) Result {
 	ctx, cancel := context.WithTimeout(ctx, 100*time.Second)
 	defer cancel()
 	p := d.Store.Get()
+	var want []string
+	if p.Doc != nil {
+		d.Cfg.Hostname, d.Cfg.ClientIP, want = p.Doc.MailHostname, p.Doc.ClientIP, p.Doc.TLS.SPKISHA256
+	}
 	var out []Check
 	q, qerr := readQueue(ctx, d)
 	out = append(out, port25(d, q, qerr, p))
 	out = append(out, fcrdns(ctx, d, d.Cfg.PublicIPv4, false), fcrdns(ctx, d, d.Cfg.PublicIPv6, true))
 	out = append(out, blocklist(ctx, d, p.Doc))
-	out = append(out, certCheck(ctx, d))
+	out = append(out, certCheck(ctx, d, want))
 	out = append(out, dkimChecks(ctx, d, p.Doc)...)
 	out = append(out, reportChecks(ctx, d, p.Doc)...)
 	out = append(out, clientIP(d))
@@ -283,3 +289,35 @@ func joinMax(items []string, n int) string {
 const dnsTypeTXT = dns.TypeTXT
 
 type dnsTXT = dns.TXT
+
+// Catalog is the ids the adapter reports (GET /v1/provider checks): the
+// neutral catalog's (contract §19.8; per-domain and per-account ids by
+// their prefix) and its own x- ids.
+var Catalog = []string{
+	"port25", "fcrdns_v4", "fcrdns_v6", "blocklist", "cert", "dane", "client_ip",
+	"dmarc_reports", "tlsrpt_reports", "dkim_selftest:", "dkim_stuck:", "rate_held:",
+	IDSpamRules, IDExternalLookups,
+}
+
+// neutral are the contract's fixed ids, prefixes ending in ":".
+var neutral = []string{
+	"port25", "fcrdns_v4", "fcrdns_v6", "blocklist", "cert", "dane", "client_ip", "dmarc_reports", "tlsrpt_reports",
+	"records:", "dkim_selftest:", "dkim_stuck:", "dkim_manual:", "rate_held:",
+}
+
+var reXID = regexp.MustCompile(`^x-[a-z0-9_]{1,40}$`)
+
+// InCatalog: id is one the contract allows (a neutral id, a prefixed one
+// with a non-empty suffix, or x-[a-z0-9_]{1,40}).
+func InCatalog(id string) bool {
+	for _, n := range neutral {
+		if strings.HasSuffix(n, ":") {
+			if rest, ok := strings.CutPrefix(id, n); ok && rest != "" {
+				return true
+			}
+		} else if id == n {
+			return true
+		}
+	}
+	return reXID.MatchString(id)
+}

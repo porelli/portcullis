@@ -81,7 +81,7 @@ func newEnv(t *testing.T) *env {
 	t.Cleanup(f.Close)
 	f.Put("Domain", "", map[string]any{"name": "example.com"})
 	f.Put("Domain", "", map[string]any{"name": "team-b.example.org"})
-	b, _ := os.ReadFile("../state/testdata/mailstate_v1.json")
+	b, _ := os.ReadFile("../state/testdata/mailstate_v2.json")
 	doc, err := state.Parse(b)
 	if err != nil {
 		t.Fatal(err)
@@ -90,11 +90,11 @@ func newEnv(t *testing.T) *env {
 	st.Update(func(p *state.Persistent) error { p.Doc, p.Generation = doc, doc.Generation; return nil })
 	c := stalwart.New(f.URL(), stalwart.Bearer("API_k"))
 	e := &env{f: f, st: st, dns: fakeDNS{}, now: t0}
-	e.m = machines.New(c, st, machines.Config{MainDomain: "example.com", Hostname: "mail.example.com", RotateEvery: 180 * 24 * time.Hour, Reachable: true}, t.Logf)
+	e.m = machines.New(c, st, machines.Config{Reachable: true}, t.Logf)
 	e.m.Now = func() time.Time { return e.now }
 	e.m.Visible = func(context.Context, string, string) bool { return false }
 	e.d = Deps{C: c, M: e.m, Store: st, Now: func() time.Time { return e.now }, DNS: e.dns.q, Logf: t.Logf,
-		Cfg: Config{Hostname: "mail.example.com", MainDomain: "example.com", PublicIPv4: netip.MustParseAddr("203.0.113.5"),
+		Cfg: Config{Hostname: "mail.example.com", PublicIPv4: netip.MustParseAddr("203.0.113.5"),
 			Resolvers: []string{pub1, pub2}, LocalResolver: loc, ClientIP: "preserved", MailIP: "172.31.255.2"},
 		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			if strings.HasSuffix(addr, ":25") {
@@ -319,66 +319,45 @@ func withListeners(t *testing.T, e *env, cert tls.Certificate) {
 	}
 }
 
-func TestCertTLSAMismatch(t *testing.T) {
+// The cert check judges the served key against the document's
+// tls.spki_sha256 (core's current and next key), never a DNS lookup.
+func TestCertSPKIFromDocument(t *testing.T) {
 	e := newEnv(t)
 	cert, leaf := selfSigned(t, "mail.example.com", t0.Add(60*24*time.Hour))
 	withListeners(t, e, cert)
-	if c := certCheck(context.Background(), e.d); c.Severity != OK || !strings.Contains(c.Detail, "valid until") {
+	other := strings.Repeat("ab", 32)
+	if c := certCheck(context.Background(), e.d, []string{other, SPKI(leaf)}); c.Severity != OK || c.outcome != "pass" || !strings.Contains(c.Detail, "valid until") {
 		t.Fatalf("ok %+v", c)
 	}
-	// TLSA served with another SPKI → Problem on every port.
-	other := strings.Repeat("ab", 32)
-	e.dns[loc+"|_25._tcp.mail.example.com|TLSA"] = rr("_25._tcp.mail.example.com. 300 IN TLSA 3 1 1 " + other)
-	c := certCheck(context.Background(), e.d)
-	if c.Severity != Problem || strings.Count(c.Detail, "doesn't match the published TLSA") != 4 {
+	c := certCheck(context.Background(), e.d, []string{other})
+	if c.Severity != Problem || c.outcome != "fail" || strings.Count(c.Detail, "the key isn't the mail certificate's") != 4 {
 		t.Fatalf("mismatch %+v", c)
 	}
-	e.dns[loc+"|_25._tcp.mail.example.com|TLSA"] = func(m *dns.Msg) {
-		rr("_25._tcp.mail.example.com. 300 IN TLSA 3 1 1 " + other)(m)
-		rr("_25._tcp.mail.example.com. 300 IN TLSA 3 1 1 " + SPKI(leaf))(m)
+	// No keys known (no document yet): unknown, never a failure.
+	if c := certCheck(context.Background(), e.d, nil); c.Severity != Info || c.outcome != "unknown" {
+		t.Fatalf("no keys %+v", c)
 	}
-	if c := certCheck(context.Background(), e.d); c.Severity != OK || !strings.Contains(c.Detail, "matching TLSA") {
-		t.Fatalf("match %+v", c)
+	// Run takes the keys from the document.
+	e.st.Update(func(p *state.Persistent) error { p.Doc.TLS.SPKISHA256 = []string{SPKI(leaf)}; return nil })
+	if c := find(t, Run(context.Background(), e.d).Checks, "cert"); c.Severity != OK {
+		t.Fatalf("run %+v", c)
 	}
-	// Final review M6: mailctl wants the live key (B) while DNS still
-	// serves only the old one (A) → Problem: the served record decides.
-	in := machines.RotateIn{DNSSECState: "secure"}
-	in.SPKI.Current = SPKI(leaf)
-	if _, err := e.m.Rotate(context.Background(), in); err != nil {
-		t.Fatal(err)
-	}
-	e.dns[loc+"|_25._tcp.mail.example.com|TLSA"] = rr("_25._tcp.mail.example.com. 300 IN TLSA 3 1 1 " + other)
-	if c := certCheck(context.Background(), e.d); c.Severity != Problem || c.outcome != "fail" {
-		t.Fatalf("served A, wanted and live B: %+v", c)
-	}
-	// A lookup that fails (timeout, SERVFAIL) decides nothing: unknown.
-	e.d.DNS = func(context.Context, string, string, uint16, bool) (*dns.Msg, error) {
-		return nil, errors.New("i/o timeout")
-	}
-	if c := certCheck(context.Background(), e.d); c.Severity != Info || c.outcome != "unknown" {
+	// A listener that can't be reached: unknown.
+	e.d.Dial = func(context.Context, string, string) (net.Conn, error) { return nil, errors.New("i/o timeout") }
+	if c := certCheck(context.Background(), e.d, []string{SPKI(leaf)}); c.Severity != Info || c.outcome != "unknown" {
 		t.Fatalf("timeout: %+v", c)
 	}
-	e.d.DNS = func(_ context.Context, _, name string, qtype uint16, _ bool) (*dns.Msg, error) {
-		m := new(dns.Msg)
-		m.SetQuestion(dns.Fqdn(name), qtype)
-		m.Rcode = dns.RcodeServerFailure
-		return m, nil
-	}
-	if c := certCheck(context.Background(), e.d); c.Severity != Info || c.outcome != "unknown" {
-		t.Fatalf("SERVFAIL: %+v", c)
-	}
-	e.d.DNS = e.dns.q
 	// Expiring soon → Warning; another name → Problem.
 	e2 := newEnv(t)
-	cert2, _ := selfSigned(t, "mail.example.com", t0.Add(5*24*time.Hour))
+	cert2, leaf2 := selfSigned(t, "mail.example.com", t0.Add(5*24*time.Hour))
 	withListeners(t, e2, cert2)
-	if c := certCheck(context.Background(), e2.d); c.Severity != Warning {
+	if c := certCheck(context.Background(), e2.d, []string{SPKI(leaf2)}); c.Severity != Warning {
 		t.Fatalf("expiring %+v", c)
 	}
 	e3 := newEnv(t)
-	cert3, _ := selfSigned(t, "other.example.com", t0.Add(60*24*time.Hour))
+	cert3, leaf3 := selfSigned(t, "other.example.com", t0.Add(60*24*time.Hour))
 	withListeners(t, e3, cert3)
-	if c := certCheck(context.Background(), e3.d); c.Severity != Problem || !strings.Contains(c.Detail, "isn't for mail.example.com") {
+	if c := certCheck(context.Background(), e3.d, []string{SPKI(leaf3)}); c.Severity != Problem || !strings.Contains(c.Detail, "isn't for mail.example.com") {
 		t.Fatalf("name %+v", c)
 	}
 }
@@ -608,7 +587,8 @@ func TestCertStateConfirmed(t *testing.T) {
 		t.Fatal("unknown reported as known")
 	}
 	// A cancelled request: the run doesn't inherit the cancellation.
-	cert, _ := selfSigned(t, "mail.example.com", t0.Add(60*24*time.Hour))
+	cert, leaf := selfSigned(t, "mail.example.com", t0.Add(60*24*time.Hour))
+	e.st.Update(func(p *state.Persistent) error { p.Doc.TLS.SPKISHA256 = []string{SPKI(leaf)}; return nil })
 	withListeners(t, e, cert)
 	r.D = e.d
 	ctx, cancel := context.WithCancel(context.Background())
@@ -675,14 +655,14 @@ func TestCertDowngradeOnlyConfirmed(t *testing.T) {
 		e.m.CertOK = func() (bool, bool) { return st[0], st[1] }
 		e.now = e.now.Add(time.Hour)
 		e.m.Step(context.Background())
-		if s, _ := e.m.Status(context.Background(), true, ""); s.MTASTS[0].Mode != "enforce" {
+		if s, _ := e.m.Status(context.Background(), true); s.MTASTS[0].Mode != "enforce" {
 			t.Fatalf("downgraded on %v", st)
 		}
 	}
 	e.m.CertOK = func() (bool, bool) { return false, true }
 	e.now = e.now.Add(time.Hour)
 	e.m.Step(context.Background())
-	if s, _ := e.m.Status(context.Background(), true, ""); s.MTASTS[0].Mode != "testing" {
+	if s, _ := e.m.Status(context.Background(), true); s.MTASTS[0].Mode != "testing" {
 		t.Fatalf("confirmed failure didn't downgrade: %+v", s.MTASTS)
 	}
 }
@@ -734,5 +714,48 @@ func TestChecksSingleFlight(t *testing.T) {
 	defer mu.Unlock()
 	if runs != 1 {
 		t.Fatalf("%d runs for 5 concurrent refreshes", runs)
+	}
+}
+
+// Every id a run reports is in the contract's catalog (or x-), and the
+// provider's own are x- with a title; the list GET /v1/provider sends
+// covers every reported id.
+func TestCheckIDsInCatalog(t *testing.T) {
+	e := newEnv(t)
+	res := Run(context.Background(), e.d)
+	if len(res.Checks) == 0 {
+		t.Fatal("no checks")
+	}
+	listed := func(id string) bool {
+		for _, c := range Catalog {
+			if c == id || (strings.HasSuffix(c, ":") && strings.HasPrefix(id, c)) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, c := range res.Checks {
+		if !InCatalog(c.ID) || !listed(c.ID) {
+			t.Errorf("%s: not in the catalog", c.ID)
+		}
+		if strings.HasPrefix(c.ID, "x-") != (c.Title != "") {
+			t.Errorf("%s: title %q (only x- checks have one)", c.ID, c.Title)
+		}
+	}
+	for _, id := range []string{IDSpamRules, IDExternalLookups} {
+		find(t, res.Checks, id)
+	}
+	for _, id := range Catalog {
+		if strings.HasSuffix(id, ":") {
+			id += "example.com"
+		}
+		if !InCatalog(id) {
+			t.Errorf("Catalog lists %s", id)
+		}
+	}
+	for _, bad := range []string{"spam_rules", "external_lookups", "x-", "x-Upper", "dkim_stuck:", "records", "tlsa", "x-" + strings.Repeat("a", 41)} {
+		if InCatalog(bad) {
+			t.Errorf("%q accepted", bad)
+		}
 	}
 }

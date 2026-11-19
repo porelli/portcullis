@@ -103,6 +103,8 @@ func main() {
 			// lego's propagation check asks the same resolvers.
 			_ = dns01.AddRecursiveNameservers(resolvers)(nil)
 			os.Exit(runMailCert(os.Args[2:], toolEnv{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr, resolvers: resolvers}))
+		case "mail-tlsa":
+			os.Exit(runMailTLSA(os.Args[2:], toolEnv{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr}))
 		case "traefik-account-uri":
 			os.Exit(runTraefikAccountURI(os.Args[2:], os.Stdout, os.Stderr))
 		case "report":
@@ -113,7 +115,7 @@ func main() {
 			}
 			os.Exit(runReport(os.Args[2:], "http://127.0.0.1"+env("DOMAINS_API_ADDR", ":8080"), secret, os.Stdout, os.Stderr))
 		default:
-			fmt.Fprintf(os.Stderr, "usage: domains [keygen|healthcheck|enrolled|dns|mail-cert|traefik-account-uri|report]\n")
+			fmt.Fprintf(os.Stderr, "usage: domains [keygen|healthcheck|enrolled|dns|mail-cert|mail-tlsa|traefik-account-uri|report]\n")
 			os.Exit(2)
 		}
 	}

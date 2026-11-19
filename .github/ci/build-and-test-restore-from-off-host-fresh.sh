@@ -33,7 +33,12 @@ docker compose down -v
 rm -rf .env secrets/* certs backups/2* backups/.verify-* monitoring/textfile/*.prom
 unset VAULT_TOKEN
 ./portcullis restore --yes --from-offsite 2>&1 | tee /tmp/restore.out
-[ "${PIPESTATUS[0]}" = 0 ] || { echo "FAIL: restore --from-offsite"; exit 1; }
+[ "${PIPESTATUS[0]}" = 0 ] || {
+  echo "FAIL: restore --from-offsite"
+  # The Hub's own reasons (the job's log tails stop at 40 lines).
+  docker compose logs --no-log-prefix hub 2>&1 | grep -iE 'mail|restor|host socket|void' | tail -n 80 || true
+  exit 1
+}
 # Its last line (T24, both restore paths): authenticator apps and passkeys
 # removed since the backup work again.
 tail -n1 /tmp/restore.out | sed 's/\x1b\[[0-9;]*m//g' \

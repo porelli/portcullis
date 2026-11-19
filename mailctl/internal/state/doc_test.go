@@ -6,27 +6,36 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func vector(t *testing.T) []byte {
 	t.Helper()
-	b, err := os.ReadFile("testdata/mailstate_v1.json")
+	b, err := os.ReadFile("testdata/mailstate_v2.json")
 	if err != nil {
 		t.Fatal(err)
 	}
 	return b
 }
 
-// The contract's vector (a byte copy of the Hub's) decodes, and encodes
-// back to the same values.
-func TestDocMatchesContractVector(t *testing.T) {
+// MailState v2: the contract's vector (a byte copy of the Hub's) decodes,
+// and encodes back to the same values.
+func TestMailStateV2Vector(t *testing.T) {
 	b := vector(t)
 	d, err := Parse(b)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Generation != 12 || d.PrimaryDomain != "example.com" || len(d.Accounts) != 3 || d.Lists[0].Posting != "members" || d.Spam.DNSBL.Barracuda != true {
+	if d.Generation != 12 || d.PrimaryDomain != "example.com" || len(d.Accounts) != 3 || d.Lists[0].Posting != "members" || d.Spam.DNSBL.Barracuda != true ||
+		d.MailHostname != "mail.example.com" || d.Rewritten() || d.SPFInclude() != "_spf.relay.example.net" || d.Relay.Port != 465 ||
+		Period(d.DKIMRotate) != 4320*time.Hour || Period(d.FormerRetention) != 720*time.Hour || len(d.TLS.SPKISHA256) != 1 ||
+		d.Domains[1].DMARCFloor != "none" {
 		t.Fatalf("decoded %+v", d)
+	}
+	// relay null: deliver directly.
+	nd, err := Parse([]byte(strings.Replace(string(b), `"relay":{"host":"smtp.relay.example.net","port":465,"username":"portcullis","spf_include":"_spf.relay.example.net"}`, `"relay":null`, 1)))
+	if err != nil || nd.Relay != nil || nd.SPFInclude() != "" {
+		t.Fatalf("relay null: %v", err)
 	}
 	out, _ := json.Marshal(d)
 	var a, z any
@@ -48,7 +57,23 @@ func TestParseRefuses(t *testing.T) {
 		return strings.Replace(base, old, new, 1)
 	}
 	cases := map[string]string{
-		"another version":               rep(`"version":1`, `"version":2`),
+		"another version":               rep(`"version":2`, `"version":1`),
+		"bad hostname":                  rep(`"mail_hostname":"mail.example.com"`, `"mail_hostname":"mail"`),
+		"bad client_ip":                 rep(`"client_ip":"preserved"`, `"client_ip":"nat"`),
+		"lan only not bool":             rep(`"submission_lan_only":false`, `"submission_lan_only":"no"`),
+		"rotate too short":              rep(`"dkim_rotate":"4320h"`, `"dkim_rotate":"23h"`),
+		"retention too long":            rep(`"former_retention":"720h"`, `"former_retention":"8761h"`),
+		"retention not a duration":      rep(`"former_retention":"720h"`, `"former_retention":"30d"`),
+		"relay port":                    rep(`"port":465`, `"port":0`),
+		"relay host":                    rep(`"host":"smtp.relay.example.net"`, `"host":"not a host"`),
+		"relay missing key":             rep(`,"spf_include":"_spf.relay.example.net"`, ``),
+		"relay bad include":             rep(`"spf_include":"_spf.relay.example.net"`, `"spf_include":"a b"`),
+		"tls null":                      rep(`"tls":{"spki_sha256":["99ad5d8130ef75b24fa9a72e9ca7d0db45cee16a25405bdaa9d317a6d9dac9c6"]}`, `"tls":null`),
+		"no spki":                       rep(`"spki_sha256":["99ad5d8130ef75b24fa9a72e9ca7d0db45cee16a25405bdaa9d317a6d9dac9c6"]`, `"spki_sha256":[]`),
+		"three spki":                    rep(`"spki_sha256":["99ad5d8130ef75b24fa9a72e9ca7d0db45cee16a25405bdaa9d317a6d9dac9c6"]`, `"spki_sha256":["99ad5d8130ef75b24fa9a72e9ca7d0db45cee16a25405bdaa9d317a6d9dac9c6","99ad5d8130ef75b24fa9a72e9ca7d0db45cee16a25405bdaa9d317a6d9dac9c6","99ad5d8130ef75b24fa9a72e9ca7d0db45cee16a25405bdaa9d317a6d9dac9c6"]`),
+		"uppercase spki":                rep(`"99ad5d8130ef75b24fa9a72e9ca7d0db45cee16a25405bdaa9d317a6d9dac9c6"`, `"99AD5D8130EF75B24FA9A72E9CA7D0DB45CEE16A25405BDAA9D317A6D9DAC9C6"`),
+		"bad floor":                     rep(`"dmarc_floor":"reject"`, `"dmarc_floor":"strict"`),
+		"missing floor":                 rep(`"dmarc_floor":"none",`, ``),
 		"unknown key":                   rep(`"confirm_mass_removal":false`, `"confirm_mass_removal":false,"extra":1`),
 		"duplicate key":                 rep(`"confirm_mass_removal":false`, `"confirm_mass_removal":false,"confirm_mass_removal":true`),
 		"duplicate nested key":          rep(`"username":"bob",`, `"username":"bob","username":"bob",`),

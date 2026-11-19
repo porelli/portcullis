@@ -1,0 +1,35 @@
+# CI-only mail provider template for the e2e-mail job (mail provider plan
+# Task 26; .github/workflows/ci.yml): tests/e2e/mail-fake, the provider
+# API v1 over an in-memory store, honouring the slot gate (P3); its
+# listeners accept and close (no mail). e2e-mail switches to it (11),
+# contains it in hostile mode (12) and runs the conformance suite's api
+# level on it (16). Not a marketplace template: the job hands it to the
+# Hub as a local source.
+name: Mail fake
+description: CI-only mail provider (provider API only)
+category: mail
+instances: single
+placement: primary_only
+auth:
+  method: custom
+  sso: false
+  group_access: false
+  group_admin: false
+  notes: >-
+    A CI test fixture: a mail provider whose API is an in-memory fake
+    (tests/e2e/mail-fake), its four listeners accept and close.
+mail:
+  label: Mail fake
+  api_version: 1
+  api:       {service: fake, port: 8080}
+  listeners: {service: fake, smtp: 10025, submissions: 10465, submission: 10587, imaps: 10993}
+  wellknown: {service: fake, port: 8081}
+  metrics:   {service: fake, port: 9100}
+  tls:       [fake]
+  gated:     [fake]
+  sessions:  {restart: fake}
+env: []
+keycloak_clients: []
+config_files: []
+ai:
+  unsupported: "A CI test fixture with no app API for an AI to act through"

@@ -155,7 +155,7 @@ func (f *fakeStalwart) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func params() Params {
 	return Params{
-		Hostname: "mail.example.com", PrimaryDomain: "example.com", MailIP: netip.MustParseAddr("172.31.255.2"), MailctlIP: netip.MustParseAddr("172.31.255.3"),
+		Hostname: "mail.example.com", PrimaryDomain: "example.com", MailctlIP: netip.MustParseAddr("172.31.255.3"),
 		ResolverIP: netip.MustParseAddr("172.31.255.4"), ResolverPort: 5353, RulesURL: "http://172.31.255.3:8082/spam-filter-rules.json.gz",
 		ClientIP: "preserved", MetricsUser: "prometheus",
 		HTTPLookups: []map[string]any{{"namespace": "stwt_openphish", "url": "https://openphish.com/feed.txt", "format": map[string]any{"@type": "List"}, "enable": true}},
@@ -214,7 +214,9 @@ func TestBasePlanDeletesDefaultListeners(t *testing.T) {
 	for _, o := range f.objs["NetworkListener"] {
 		if o["name"] == "management" {
 			b := o["bind"].(map[string]any)
-			if len(b) != 2 || b["172.31.255.2:8080"] != true || b["127.0.0.1:8080"] != true {
+			// Ruling T17-b: the wildcard, never loopback only (the adapter
+			// reaches the real server on the internal network).
+			if len(b) != 1 || b["[::]:8080"] != true {
 				t.Fatalf("management bind %v", b)
 			}
 		}
@@ -328,6 +330,7 @@ func TestBootstrapPrintsKeyOnce(t *testing.T) {
 			n += len(objs)
 			for _, k := range objs {
 				ips := k["allowedIps"].(map[string]any)
+				// The adapter's /32 only (Ruling R2-N2b).
 				if len(ips) != 1 || ips["172.31.255.3/32"] != true || k["permissions"].(map[string]any)["@type"] != "Inherit" {
 					t.Fatalf("api key %v", k)
 				}
@@ -444,9 +447,13 @@ func TestClientIPRewrittenPlanDisablesIPChecks(t *testing.T) {
 		t.Fatalf("degraded Security %s", b)
 	}
 	p.ClientIP = "preserved"
+	// Preserved addresses: Stalwart's default ban rates, written
+	// explicitly (leaving degraded mode restores the bans).
 	for _, s := range p.Singletons() {
 		if s.Object == "Security" {
-			t.Fatal("Security patched with preserved addresses")
+			if b, _ := json.Marshal(s.Patch); string(b) != `{"abuseBanRate":{"count":35,"period":86400000},"authBanRate":{"count":100,"period":86400000},"loiterBanRate":{"count":150,"period":86400000},"scanBanRate":{"count":30,"period":86400000}}` {
+				t.Fatalf("normal Security %s", b)
+			}
 		}
 	}
 	if b, _ := json.Marshal(p.senderAuth()["spfFromVerify"]); string(b) != `{"else":"disable","match":{"0":{"if":"local_port == 10025","then":"relaxed"}}}` {
@@ -482,24 +489,6 @@ func TestAllowedEndpointsPinsMailctl(t *testing.T) {
 	for _, want := range []string{"listener == 'management' && remote_ip == '172.31.255.3'", "listener == 'metrics' && path == '/metrics/prometheus'", "else:404"} {
 		if !strings.Contains(b, want) {
 			t.Errorf("rule lacks %s: %s", want, b)
-		}
-	}
-}
-
-func TestReadInputStrict(t *testing.T) {
-	ok := `{"recovery_user":"u","recovery_password":"p","hostname":"mail.example.com","primary_domain":"example.com","client_ip":"preserved","lan_only":false,"local_networks":["10.0.0.0/8"],"relay":null,"metrics_user":"prometheus"}`
-	if _, err := ReadInput(strings.NewReader(ok)); err != nil {
-		t.Fatal(err)
-	}
-	for _, bad := range []string{
-		strings.Replace(ok, `"lan_only"`, `"extra":1,"lan_only"`, 1),
-		ok + `{}`,
-		strings.Replace(ok, `"preserved"`, `"auto"`, 1),
-		strings.Replace(ok, `"10.0.0.0/8"`, `"ten"`, 1),
-		strings.Replace(ok, `"recovery_password":"p"`, `"recovery_password":""`, 1),
-	} {
-		if _, err := ReadInput(strings.NewReader(bad)); err == nil {
-			t.Errorf("accepted %s", bad)
 		}
 	}
 }
@@ -591,5 +580,50 @@ func TestBasePlanSASLLANOnly(t *testing.T) {
 	p.ClientIP = "rewritten"
 	if got := sasl(p); strings.Contains(got, "192.168.1.0/24") || !strings.Contains(got, "127.0.0.1/32") {
 		t.Fatalf("LAN-only, rewritten: %s", got)
+	}
+}
+
+// KeyInPlace against the shapes real Stalwart 1.1 answers (seen on the
+// builder smoke, core fix round 2): allowedIps a set holding the bare
+// address, the secret returned in clear, expiresAt null.
+func TestKeyInPlaceRealShapes(t *testing.T) {
+	ip := netip.MustParseAddr("172.31.255.3")
+	for name, c := range map[string]struct {
+		key  map[string]any
+		file string
+		want bool
+	}{
+		"real shape":       {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3": true}, "secret": "API_x1", "createdAt": "2026-11-17T10:00:00Z", "expiresAt": nil}, "API_x1", true},
+		"with /32":         {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3/32": true}}, "API_x1", true},
+		"another secret":   {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3": true}, "secret": "API_other"}, "API_x1", false},
+		"masked secret":    {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3": true}, "secret": "********"}, "API_x1", true},
+		"widened":          {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3": true, "0.0.0.0/0": true}}, "API_x1", false},
+		"another address":  {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.4": true}}, "API_x1", false},
+		"expiring":         {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3": true}, "expiresAt": "2027-01-01T00:00:00Z"}, "API_x1", false},
+		"other permission": {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Replace"}, "allowedIps": map[string]any{"172.31.255.3": true}}, "API_x1", false},
+		"no key file":      {map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3": true}}, "", false},
+	} {
+		f := newFake()
+		d := f.put("Domain", map[string]any{"name": ParkingDomain})
+		a := f.put("Account", map[string]any{"name": MailctlAccount, "domainId": d})
+		f.put("ApiKey@"+a, c.key)
+		srv := httptest.NewServer(f)
+		ok, err := KeyInPlace(context.Background(), stalwart.New(srv.URL, stalwart.Basic("r", "p")), ip, c.file)
+		srv.Close()
+		if err != nil || ok != c.want {
+			t.Errorf("%s: %v %v, want %v", name, ok, err, c.want)
+		}
+	}
+	// Two keys (an old one not destroyed): not in place.
+	f := newFake()
+	d := f.put("Domain", map[string]any{"name": ParkingDomain})
+	a := f.put("Account", map[string]any{"name": MailctlAccount, "domainId": d})
+	for i := 0; i < 2; i++ {
+		f.put("ApiKey@"+a, map[string]any{"description": "mailctl", "permissions": map[string]any{"@type": "Inherit"}, "allowedIps": map[string]any{"172.31.255.3": true}})
+	}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	if ok, _ := KeyInPlace(context.Background(), stalwart.New(srv.URL, stalwart.Basic("r", "p")), ip, "API_x1"); ok {
+		t.Fatal("two keys judged in place")
 	}
 }

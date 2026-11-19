@@ -1,0 +1,28 @@
+# CI-only mail provider (manifest.yaml): one service, the fake, built by
+# ci.yml's e2e-mail job as portcullis-mail-fake:ci. The Hub's override
+# wires it (ports, portcullis-mail-api, the slot files, the certificate).
+# MAIL_FAKE_NAME tells two copies apart; `mail-fake mode hostile` switches
+# a running one (its mode file in the data volume).
+services:
+  fake:
+    image: portcullis-mail-fake:ci
+    user: "10011:10011"
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    environment:
+      MAIL_FAKE_NAME: ${MAIL_FAKE_NAME:-Mail fake}
+    volumes:
+      - data:/data
+    healthcheck:
+      test: ["CMD", "mail-fake", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    mem_limit: 64m
+    pids_limit: 64
+    restart: unless-stopped
+
+volumes:
+  data: {}

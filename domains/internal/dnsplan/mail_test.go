@@ -250,7 +250,7 @@ func TestValidateMailRefuses(t *testing.T) {
 		"201":       {many, "more than 200 records"},
 		"caa at e":  {with(MailRecord{Name: e, Type: "CAA", TTL: 300, Value: `0 issue "letsencrypt.org"`}), "never holds CAA"},
 		"caa at h":  {with(MailRecord{Name: "mail." + e, Type: "CAA", TTL: 300, Value: `0 issue "letsencrypt.org"`}), "never holds CAA"},
-		"ttl":       {with(MailRecord{Name: "_smtp._tls." + e, Type: "TXT", TTL: 30, Value: "v=TLSRPTv1; rua=mailto:x@" + e}), "TTL 30"},
+		"ttl":       {with(MailRecord{Name: "_smtp._tls." + e, Type: "TXT", TTL: 0, Value: "v=TLSRPTv1; rua=mailto:x@" + e}), "TTL 0"},
 		"a":         {with(MailRecord{Name: "mail." + e, Type: "A", TTL: 300, Value: "203.0.113.10"}), "type A"},
 		"txt at e":  {with(MailRecord{Name: e, Type: "TXT", TTL: 3600, Value: "google-site-verification=x"}), "only an SPF"},
 		"quote":     {with(MailRecord{Name: "_dmarc." + e, Type: "TXT", TTL: 3600, Value: `v=DMARC1; "p=none"`}), "quote"},
@@ -297,10 +297,13 @@ func TestMailRemovalBringsNoMailBack(t *testing.T) {
 	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err != nil {
 		t.Fatal(err)
 	}
-	// A rotation drops the old RSA selector: its TXT goes.
+	// A rotation drops the old RSA selector: its TXT goes (the caller
+	// recorded it as written).
+	e.in.Spec.MailDKIMWritten = DKIMNames(pd, e.in.Spec.Mail)
 	rot := mainMail()
 	rot[3].Name = "v1-rsa-20270514._domainkey." + pd
 	e.in.Spec.Mail = rot
+	e.in.Spec.MailDKIMWritten = append(e.in.Spec.MailDKIMWritten, DKIMNames(pd, rot)...)
 	_, removed, err := Apply(ctx, e.in, []string{SetMail})
 	if err != nil {
 		t.Fatal(err)
@@ -518,5 +521,87 @@ func TestApplyFailedSetDoesNotStopTheOthers(t *testing.T) {
 	}
 	if got := rrs(e.zone, pd, "MX"); len(got) != 0 {
 		t.Fatalf("MX %v", got)
+	}
+}
+
+// M5: any provider's DKIM selector (one DNS label) is accepted and owned
+// by the set (so a stale one is cleaned up); a dotted selector is not.
+func TestMailAnyDKIMSelector(t *testing.T) {
+	const e = "team-b.example.test"
+	recs := []MailRecord{
+		{Name: e, Type: "MX", TTL: 3600, Value: "10 " + mh + "."},
+		{Name: "google._domainkey." + e, Type: "TXT", TTL: 300, Value: rsaTXT()},
+		{Name: "s1._domainkey." + e, Type: "TXT", TTL: 300, Value: rsaTXT()},
+	}
+	if err := ValidateMail(e, recs); err != nil {
+		t.Fatalf("a non-mailctl selector refused: %v", err)
+	}
+	for _, n := range []string{"google._domainkey." + e, "s1._domainkey." + e, "selector_2._domainkey." + e} {
+		if !MailNameOwned(e, n) {
+			t.Errorf("%s not owned by the mail set", n)
+		}
+	}
+	if MailNameOwned(e, "a.b._domainkey."+e) {
+		t.Error("a dotted selector is owned")
+	}
+}
+
+// A DKIM record the set never wrote (another sender's selector) survives
+// a sync and the set's removal; a written stale selector goes (security
+// review, fix round 1).
+func TestMailForeignDKIMSurvives(t *testing.T) {
+	e, _ := mailEnv(t, false)
+	ctx := context.Background()
+	const foreign = "x._domainkey." + pd
+	e.zone.Set(foreign, libdns.RR{Name: "x._domainkey.portcullis", Type: "TXT", Data: "v=DKIM1; k=rsa; p=FOREIGN", TTL: time.Hour})
+	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.zone.Records(foreign)) != 1 {
+		t.Fatal("a foreign DKIM record was removed by the sync")
+	}
+	e.in.Spec.MailDKIMWritten = DKIMNames(pd, e.in.Spec.Mail)
+	e.in.Spec.Mail = []MailRecord{}
+	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.zone.Records(foreign)) != 1 {
+		t.Fatal("a foreign DKIM record was removed with the set")
+	}
+	if len(e.zone.Records(dkimRS)) != 0 || len(e.zone.Records(dkimED)) != 0 {
+		t.Fatalf("written selectors left: %v %v", e.zone.Records(dkimRS), e.zone.Records(dkimED))
+	}
+}
+
+// Ruling R2-N7: the set never takes over a DKIM name another sender's key
+// holds (not in its written list): nothing is written, the plan names it
+// as a Problem; once the name is the set's own (written), it is replaced.
+func TestMailRefusesForeignDKIMTakeover(t *testing.T) {
+	e, _ := mailEnv(t, false)
+	ctx := context.Background()
+	const g = "google._domainkey." + pd
+	e.zone.Set(g, libdns.RR{Name: "google._domainkey.portcullis", Type: "TXT", Data: "v=DKIM1; k=rsa; p=WORKSPACE", TTL: time.Hour})
+	e.in.Spec.Mail = append(e.in.Spec.Mail, MailRecord{Name: g, Type: "TXT", TTL: 3600, Value: "v=DKIM1; k=rsa; p=PROVIDER"})
+	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err == nil || !strings.Contains(err.Error(), "didn't write") {
+		t.Fatalf("a foreign DKIM name taken over: %v", err)
+	}
+	if got := rrs(e.zone, g, "TXT"); len(got) != 1 || !strings.Contains(got[0], "WORKSPACE") {
+		t.Fatalf("the foreign key changed: %v", got)
+	}
+	found := false
+	for _, it := range Build(ctx, e.in).Items {
+		if it.Set == SetMail && it.Name == g {
+			found = it.Severity == SevProblem && len(it.Steps) == 1 && strings.Contains(it.Steps[0], "didn't write")
+		}
+	}
+	if !found {
+		t.Fatal("the plan doesn't name the foreign DKIM key as a Problem")
+	}
+	e.in.Spec.MailDKIMWritten = []string{g}
+	if _, _, err := Apply(ctx, e.in, []string{SetMail}); err != nil {
+		t.Fatal(err)
+	}
+	if got := rrs(e.zone, g, "TXT"); len(got) != 1 || !strings.Contains(got[0], "PROVIDER") {
+		t.Fatalf("the set's own name not replaced: %v", got)
 	}
 }

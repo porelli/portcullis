@@ -42,10 +42,14 @@ func TestMetricNames(t *testing.T) {
 	}
 	b, _ := io.ReadAll(resp.Body)
 	for _, want := range []string{`portcullis_mail_check{check="port25"} 1`, `portcullis_mail_dkim_stage{domain="example.com",stage="active"} 1`,
-		"portcullis_mail_cert_expiry_seconds", "portcullis_mail_queue_messages", "portcullis_mail_queue_deferred_ratio"} {
+		"portcullis_mail_queue_messages", "portcullis_mail_queue_deferred_ratio"} {
 		if !strings.Contains(string(b), want) {
 			t.Errorf("missing %s", want)
 		}
+	}
+	// The certificate's expiry is core's own textfile metric now.
+	if strings.Contains(string(b), "portcullis_mail_cert_expiry_seconds") {
+		t.Error("the adapter exposes the certificate expiry")
 	}
 	if strings.Contains(string(b), "go_goroutines") {
 		t.Error("runtime collectors exposed")

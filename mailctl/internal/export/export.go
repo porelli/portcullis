@@ -47,7 +47,7 @@ type Exporter struct {
 	// rotate` stores them): the leaf Stalwart presents must be one of them,
 	// name MAIL_HOSTNAME and be valid now. No pin, no export.
 	SPKI []string
-	// DataDir is mailctl_data: the export password is recorded there
+	// DataDir is the adapter's data volume (MAILCTL_DATA): the export password is recorded there
 	// (state.RecordExport) so the reconcile sweep can tell it from a
 	// look-alike.
 	DataDir string

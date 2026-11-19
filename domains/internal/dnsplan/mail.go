@@ -1,9 +1,10 @@
 package dnsplan
 
-// The mail record set (contract §19.7, §12.2 / §12.4): the records
-// mailctl renders for a mail domain — MX, SPF, DKIM, DMARC, MTA-STS,
-// TLS-RPT, SRV, the mail CNAMEs and, for the main domain, the HELO SPF and
-// the TLSA at MAIL_HOSTNAME. The set replaces nomail while it is on. It
+// The mail record set (contract §19.7, §12.2 / §12.4): the records the
+// wired mail provider renders for a mail domain — MX, SPF, DKIM, DMARC,
+// MTA-STS, TLS-RPT, SRV, the mail CNAMEs — judged by the shared rules
+// (mailrules.go), and, for the main domain, core's HELO SPF and TLSA at
+// MAIL_HOSTNAME (tlsa.go). The set replaces nomail while it is on. It
 // owns exactly the names of the contract's table (below), so a record it
 // stops wanting (a retired DKIM selector, a withheld TLSA) is removed; it
 // never touches A / AAAA / CAA (the address and caa sets) and, at <e> and
@@ -31,7 +32,8 @@ const SetMail = "mail"
 const MaxMailRecords = 200
 
 const (
-	mailTTLMin = 60
+	// Any provider's TTLs (M5: parity with the shared rules; never 0).
+	mailTTLMin = 1
 	mailTTLMax = 86400
 	// mailTXTMax bounds one TXT value (an RSA-4096 DKIM key fits).
 	mailTXTMax = 2048
@@ -49,9 +51,9 @@ type MailRecord struct {
 }
 
 var (
-	// dkimLabel: the selectors mailctl makes (v1-{ed25519,rsa}-YYYYMMDD,
-	// -2, … on a same-day re-rotation).
-	dkimLabel = regexp.MustCompile(`^v1-(ed25519|rsa)-[0-9]{8}(-[0-9]{1,3})?$`)
+	// dkimLabel: any provider's DKIM selector, one DNS label (M5: parity
+	// with the shared rules; the set owns every <sel>._domainkey.<e>).
+	dkimLabel = regexp.MustCompile(`^[A-Za-z0-9_]([A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?$`)
 	// mailTXTLabels / mailSRVLabels / mailCNAMELabels: the other names
 	// under <e> the set owns, by type.
 	mailTXTLabels   = []string{"_dmarc", "_mta-sts", "_smtp._tls"}
@@ -253,6 +255,50 @@ func mailOwns(d string, hosts []string, n, t string) bool {
 // records (<e> and MAIL_HOSTNAME): other TXT records stay.
 func txtSPFOnly(d string, hosts []string, n string) bool { return n == d || contains(hosts, n) }
 
+// foreignDKIM (Ruling R2-N7): p is a DKIM name the set wants, not one it
+// wrote before (MailDKIMWritten), and the provider holds a TXT record there
+// the set doesn't want: someone else's key, never taken over or deleted.
+func foreignDKIM(s Spec, d string, p mailPair, live []liveRec) bool {
+	if p.typ != "TXT" || !isDKIMName(d, p.name) || contains(bareAll(s.MailDKIMWritten), p.name) {
+		return false
+	}
+	want := map[string]bool{}
+	for _, r := range s.Mail {
+		if bare(r.Name) == p.name && strings.EqualFold(r.Type, "TXT") {
+			want[txtJoin(r.Value)] = true
+		}
+	}
+	for _, rr := range pick(live, p.name, "TXT") {
+		if !want[txtJoin(rr.Data)] {
+			return true
+		}
+	}
+	return false
+}
+
+func foreignDKIMText(n string) string {
+	return fmt.Sprintf("%s TXT already holds a DKIM key the mail set didn't write (another sender's): remove it by hand if it is unused, or the provider must use another selector", n)
+}
+
+// isDKIMName: n is <selector>._domainkey.<d>.
+func isDKIMName(d, n string) bool {
+	sel, ok := strings.CutSuffix(n, "._domainkey."+d)
+	return ok && dkimLabel.MatchString(sel)
+}
+
+// DKIMNames: the <selector>._domainkey.<d> names among recs (what the
+// caller records as written once the set is applied).
+func DKIMNames(d string, recs []MailRecord) []string {
+	d = bare(d)
+	var out []string
+	for _, r := range recs {
+		if n := bare(r.Name); strings.EqualFold(r.Type, "TXT") && isDKIMName(d, n) && !contains(out, n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 // mailNameOwned: n is a name the mail set may write at d (any type).
 func mailNameOwned(d string, hosts []string, n string) bool {
 	for _, t := range mailTypes {
@@ -428,6 +474,9 @@ func mailPairs(s Spec, d string, hosts []string, live []liveRec) []mailPair {
 		if p.typ == "TXT" && txtSPFOnly(d, hosts, p.name) && !isSPF(txtJoin(l.rr.Data)) {
 			continue
 		}
+		if p.typ == "TXT" && isDKIMName(d, p.name) && !contains(bareAll(s.MailDKIMWritten), p.name) {
+			continue
+		}
 		if len(s.Mail) == 0 && s.NoMail && nomailOwns(d, p) {
 			continue
 		}
@@ -528,6 +577,12 @@ func mailItems(ctx context.Context, in Input, d string, fix Fix, live []liveRec)
 			}
 		}
 		manual := in.cannotWrite(p.typ)
+		if len(w) > 0 && foreignDKIM(s, d, p, live) {
+			it.Status, it.Severity, it.Fix = StatusWrong, SevProblem, FixNone
+			it.Steps = []string{foreignDKIMText(p.name)}
+			out = append(out, it)
+			continue
+		}
 		switch it.Status {
 		case StatusOK:
 			it.Severity, it.Fix = SevOK, FixNone
@@ -613,6 +668,13 @@ func applyMail(ctx context.Context, in Input, d, zone string, live []liveRec) (w
 		byPair[p] = append(byPair[p], r)
 	}
 	pairs := mailPairs(s, d, hosts, live)
+	// A DKIM name another sender's record holds is never taken over
+	// (Ruling R2-N7): nothing is written.
+	for _, p := range pairs {
+		if len(byPair[p]) > 0 && foreignDKIM(s, d, p, live) {
+			return nil, nil, errors.New(foreignDKIMText(p.name))
+		}
+	}
 	// CNAMEs first checked against what the zone holds (fail closed).
 	for _, p := range pairs {
 		if len(byPair[p]) == 0 {

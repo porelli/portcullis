@@ -178,9 +178,6 @@ env_require() {
 # Secrets every core service needs (docker-compose.yml uses ${VAR:?}).
 # shellcheck disable=SC2034  # used by stack.sh
 CORE_SECRETS="POSTGRES_PASSWORD KEYCLOAK_ADMIN_PASSWORD LLDAP_ADMIN_PASSWORD LLDAP_JWT_SECRET FORWARD_AUTH_CLIENT_SECRET FORWARD_AUTH_COOKIE_SECRET FORWARD_AUTH_REDIS_PASSWORD FORWARD_AUTH_EXT_REDIS_PASSWORD HUB_PROXY_SECRET HUB_CLI_PROXY_SECRET"
-# Optional secrets in .env (empty = not used): never generated or required,
-# never shared with the Hub. Mail: written to secrets/mail/ by mail_prepare.
-OPTIONAL_SECRETS="MAIL_RELAY_PASSWORD MAIL_SPAMHAUS_DQS_KEY"
 # Subset that can be (re)generated on an existing install without losing
 # data: nothing on disk is encrypted with them, `portcullis oidc register`
 # pushes FORWARD_AUTH_CLIENT_SECRET to Keycloak, and the session store's
@@ -293,8 +290,6 @@ rt_up() { if _rt_is_kube; then _rtk_up "$@"; else stack_compose_up "$@"; fi; }
 # dependencies).
 rt_up_service() { if _rt_is_kube; then _rtk_up_service "$@"; else _rtd_up_service "$@"; fi; }
 _rtd_up_service() {
-  _mail_void_gate "$@"
-  if [ "${_MAIL_GATED:-}" = 1 ]; then local -x COMPOSE_PROFILES="$_MAIL_GATED_PROFILES"; fi
   local deps=--no-deps
   [ "$1" != --deps ] || { deps=""; shift; }
   # shellcheck disable=SC2046,SC2086  # nothing or --no-build; nothing or --no-deps
@@ -374,16 +369,12 @@ _rtd_running() { [ -n "$(dc ps -q --status running "$1" 2>/dev/null)" ]; }
 # rt_restart <service>... / rt_stop <service>... / rt_start <service>...
 rt_restart() { if _rt_is_kube; then _rtk_restart "$@"; else _rtd_restart "$@"; fi; }
 _rtd_restart() {
-  _mail_void_gate "$@"
-  if [ "${_MAIL_GATED:-}" = 1 ]; then local -x COMPOSE_PROFILES="$_MAIL_GATED_PROFILES"; fi
   dc restart "$@"
 }
 rt_stop() { if _rt_is_kube; then _rtk_stop "$@"; else _rtd_stop "$@"; fi; }
 _rtd_stop() { dc stop "$@"; }
 rt_start() { if _rt_is_kube; then _rtk_start "$@"; else _rtd_start "$@"; fi; }
 _rtd_start() {
-  _mail_void_gate "$@"
-  if [ "${_MAIL_GATED:-}" = 1 ]; then local -x COMPOSE_PROFILES="$_MAIL_GATED_PROFILES"; fi
   dc start "$@"
 }
 
@@ -510,21 +501,18 @@ CT_UID_WG=10006      # wg/Dockerfile (USER 10006:10006; no other group)
 # vpn_doc's group (vpn.json, contract §16): the Hub (writer), wg and
 # group-gate (readers) only — never the Hub's own 10001.
 CT_GID_VPN_DOC=10007
+# The mail-provider group (contract §19.1): mail_tls's files, the Hub's
+# <instance>/_mail/ files, and group_add of the Hub and of the wired
+# provider's tls / gated services (the Hub's override).
+CT_GID_MAIL_PROVIDER=2000
+# Prometheus' image user (65534): mail_slot's group, so it reads the Hub's
+# mail-targets.json and metrics-secret.
+CT_GID_PROMETHEUS=65534
 # Multiple servers (contract §17): link_doc's group (link.json; the Hub
 # writes, wg reads — never 10001) and the worker agent's uid.
 CT_GID_LINK_DOC=10009
 # shellcheck disable=SC2034  # used by worker.sh
 CT_UID_AGENT=10008
-# Mail (contract §19.1): Stalwart's image user (2000:2000), mailctl
-# (mailctl/Dockerfile, USER 10010:10010, + group 10001 for the Hub secret;
-# not 10006 = wg, 10008 / 10009 reserved by multi-server) and the Unbound
-# image's unbound user (101:102).
-CT_UID_MAIL=2000
-CT_UID_MAILCTL=10010
-# shellcheck disable=SC2034  # documents mail-resolver's compose user
-CT_UID_MAIL_RESOLVER=101
-# shellcheck disable=SC2034  # documents mail-resolver's compose user
-CT_GID_MAIL_RESOLVER=102
 CT_GID_TRAEFIK=0      # Traefik runs as root, but without CAP_DAC_OVERRIDE
 # shellcheck disable=SC2034  # used by sessions.sh
 CT_UID_SESSIONS=999   # valkey/valkey alpine: valkey = 999:1000 (compose user: "999:1000")
@@ -752,38 +740,8 @@ secrets_fix_perms() {
   ct_group_read "$CT_UID_WG" "$s/wg" "$s/wg/people.key" "$s/wg/link.key" "$s/wg/link-tls.key" "$s/wg/link-tls.crt"
   # secrets/ssh/ (scripts/lib/ssh.sh): the break-glass record, the Hub's.
   if declare -F ssh_fix_perms >/dev/null; then ssh_fix_perms; fi
-  # secrets/mail/ (contract §19.1): the directory 0700 (each reader binds
-  # its own files), each file 0640 with its reader's group.
+  # secrets/mail/ (the CLI's own records: hostname, former-hostnames).
   [ ! -d "$s/mail" ] || chmod 700 "$s/mail"
-  ct_group_read "$CT_UID_MAILCTL" "$s/mail/api-key" "$s/mail/dqs-key" "$s/mail/mailctl-metrics-secret"
-  ct_group_read "$CT_UID_HUB" "$s/mail/hub-secret"
-  ct_group_read "$CT_UID_MAIL" "$s/mail/metrics-secret" "$s/mail/relay-password" "$s/mail/gate" "$s/mail/gate/.present"
-}
-
-# _mail_void_gate [svc…] — every start primitive's first step (security
-# review): while a restore's mail passwords aren't voided
-# (secrets/mail/gate/void-pending), mail and mailctl never start through
-# the CLI — the mail profile is stripped from COMPOSE_PROFILES and an
-# explicit mail / mailctl service is refused — except inside the recovery
-# session (MAIL_RECOVERY_SESSION=1). The container's entrypoint refuses too.
-_mail_void_gate() {
-  local s
-  _MAIL_GATED=""
-  [ "${MAIL_RECOVERY_SESSION:-}" != 1 ] || return 0
-  # A recovery-session file without a live session (a killed CLI) goes first.
-  rm -f "$PORTCULLIS_ROOT/secrets/mail/gate/recovery-session"
-  [ -e "$PORTCULLIS_ROOT/secrets/mail/gate/void-pending" ] || return 0
-  for s in "$@"; do
-    case "$s" in
-      mail|mailctl) fail "mail passwords from a restore are not voided yet: ./portcullis mail enable voids them first" ;;
-    esac
-  done
-  # The stripped profiles go to this primitive's compose call only
-  # (each primitive: `local -x COMPOSE_PROFILES=$_MAIL_GATED_PROFILES`;
-  # final review L1): never exported to the rest of the command, so a
-  # later step (up's void retry, hub_env_write) still sees mail.
-  _MAIL_GATED=1
-  _MAIL_GATED_PROFILES="$(_mail_profiles_without_mail)"
 }
 
 # Core variables the Hub may copy into app .env files (templates reference
@@ -806,7 +764,7 @@ hub_env_write() {
   done
   for v in "${names[@]}"; do
     [[ "$v" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
-    case " $CORE_SECRETS $OPTIONAL_SECRETS " in *" $v "*) warn "HUB_SHARED_ENV: refusing to share core secret $v with the Hub"; continue ;; esac
+    case " $CORE_SECRETS " in *" $v "*) warn "HUB_SHARED_ENV: refusing to share core secret $v with the Hub"; continue ;; esac
     case "$content" in "$v="*|*$'\n'"$v="*) continue ;; esac
     # Written below from the host (podman / kubernetes only), never shared by name.
     case "$v" in PORTCULLIS_UNPRIVILEGED_PORT_START|PORTCULLIS_POD_CIDR|PORTCULLIS_SERVICE_CIDR|PORTCULLIS_WG_EDGE_SERVICE_IP|PORTCULLIS_TRAEFIK_SERVICE_IP|PORTCULLIS_RUNTIME_ROOTS|PORTCULLIS_KUBE_*|PORTCULLIS_MAIL*) continue ;; esac
@@ -848,18 +806,27 @@ hub_env_write() {
     esac
     content+="$v=$val"$'\n'
   done
-  # Mail (contract §2, §19.1): derived, never from .env and never a
-  # secret: on only with the profile and mailctl's API key; the DQS key and
-  # the relay's host / credentials are only on / off.
-  local mail=off
-  if mail_profile_on && [ -s "$PORTCULLIS_ROOT/secrets/mail/api-key" ]; then mail=on; fi
-  content+="PORTCULLIS_MAIL=$mail"$'\n'
+  # The mail slot (contract §2, §19.1): derived, never a secret. The slot
+  # is open only when .env's PORTCULLIS_MAIL is exactly on; the client
+  # address mode follows the runtime (rootless Podman rewrites it); the
+  # API network's addresses go into the provider's override.
+  content+="PORTCULLIS_MAIL=$(mail_slot_open && echo on || echo off)"$'\n'
   content+="PORTCULLIS_MAIL_HOSTNAME=${MAIL_HOSTNAME:-mail.${PORTCULLIS_DOMAIN:-portcullis.local}}"$'\n'
   content+="PORTCULLIS_MAIL_SUBMISSION_LAN_ONLY=$([ "${MAIL_SUBMISSION_LAN_ONLY:-false}" = true ] && echo true || echo false)"$'\n'
-  content+="PORTCULLIS_MAIL_RELAY=$([ -n "${MAIL_RELAY_HOST:-}" ] && echo on || echo off)"$'\n'
-  content+="PORTCULLIS_MAIL_FORMER_RETENTION=${MAIL_FORMER_RETENTION:-720h}"$'\n'
-  content+="PORTCULLIS_MAIL_DQS=$([ -n "${MAIL_SPAMHAUS_DQS_KEY:-}" ] && echo on || echo off)"$'\n'
-  content+="PORTCULLIS_MAILCTL_API_IP=$(mailctl_api_ip)"$'\n'
+  content+="PORTCULLIS_MAIL_CLIENT_IP=$(_rt_is_podman && echo rewritten || echo preserved)"$'\n'
+  content+="PORTCULLIS_MAIL_API_SUBNET=$(mail_api_subnet)"$'\n'
+  content+="PORTCULLIS_MAIL_API_HUB_IP=$(mail_api_hub_ip)"$'\n'
+  content+="PORTCULLIS_MAIL_API_PROVIDER_IP=$(mail_api_provider_ip)"$'\n'
+  # The server's public addresses as domains detected them (its env file):
+  # the provider's PTR / FCrDNS and blocklist checks (contract §19.8);
+  # empty when unknown (those checks then say unknown).
+  local pubf="$PORTCULLIS_ROOT/secrets/domains/public-ips.env" pub4="" pub6=""
+  if [ -r "$pubf" ]; then
+    pub4="$(sed -n 's/^DOMAINS_PUBLIC_IPV4=\([0-9.]*\)$/\1/p' "$pubf" | head -n1)"
+    pub6="$(sed -n 's/^DOMAINS_PUBLIC_IPV6=\([0-9A-Fa-f:]*\)$/\1/p' "$pubf" | head -n1)"
+  fi
+  content+="PORTCULLIS_MAIL_PUBLIC_IPV4=$pub4"$'\n'
+  content+="PORTCULLIS_MAIL_PUBLIC_IPV6=$pub6"$'\n'
   # Rootless Podman: the host's ip_unprivileged_port_start (a per-netns
   # sysctl the Hub can't read from inside its container; RootlessCompat).
   if _rt_is_podman; then
@@ -909,62 +876,42 @@ _ensure_secrets_volume_docker() {
     || fail "could not set hub_secrets volume to $CT_UID_HUB:$CT_UID_HUB mode 0700"
 }
 
-# mail_profile_on — COMPOSE_PROFILES (as compose sees it) names mail.
-mail_profile_on() {
-  case ",${COMPOSE_PROFILES:-}," in *,mail,*) return 0 ;; esac
-  return 1
+# mail_slot_open — the mail slot is open (contract §19.1): .env's
+# PORTCULLIS_MAIL is exactly on (anything else is off: fail closed).
+mail_slot_open() { [ "${PORTCULLIS_MAIL:-}" = on ]; }
+
+# mail_prepare — the mail slot's volumes (contract §19.1, §19.3):
+# mail_slot always (the Hub mounts it rw, Prometheus ro: 10001:65534 2750,
+# setgid, so the Hub's files carry Prometheus' group); mail_tls and
+# mail_acme with the slot open (mail-cert's). secrets/mail/ holds only the
+# CLI's records (hostname, former-hostnames).
+#
+# _mail_metrics_network — portcullis-metrics-mail exists with the slot
+# open: the wired provider's override joins it as external, and compose
+# makes it only for a member (Prometheus, the monitoring profile), so
+# without monitoring the install's normal-mode up failed ("declared as
+# external, but could not be found"). Made as compose would (internal,
+# its labels: compose adopts it).
+_mail_metrics_network() {
+  _rt_docker_only
+  docker network inspect portcullis-metrics-mail >/dev/null 2>&1 && return 0
+  docker network create --internal --label "com.docker.compose.project=${COMPOSE_PROJECT_NAME:-portcullis}" \
+    --label com.docker.compose.network=portcullis-metrics-mail portcullis-metrics-mail >/dev/null \
+    || fail "could not create the network portcullis-metrics-mail"
 }
 
-# _mail_secret_from_env <file> <VAR> — the file holds .env's VAR (empty =
-# none), rewritten in place only when it differs (the bind pins the inode).
-_mail_secret_from_env() {
-  local f="$1" v="${!2:-}"
-  if [ "$(cat "$f" 2>/dev/null)" != "$v" ]; then printf '%s' "$v" > "$f"; fi
-}
-
-# mail_prepare — the mail profile's bind sources and volumes (contract
-# §19.1). The placeholder files always exist (the Hub binds hub-secret
-# even without mail; a bind must never make a directory and the SELinux
-# overlay's sources must exist); empty = not set. relay-password and
-# dqs-key follow .env's MAIL_RELAY_PASSWORD / MAIL_SPAMHAUS_DQS_KEY. The
-# volumes are created and owned only with mail in COMPOSE_PROFILES.
 mail_prepare() {
-  local d="$PORTCULLIS_ROOT/secrets/mail" f
+  local d="$PORTCULLIS_ROOT/secrets/mail"
   (umask 077 && mkdir -p "$d")
   chmod 700 "$d"
-  # gate/: the restore's void-pending marker and the recovery session file
-  # (mail binds the dir). gate/.present is the sentinel mail's entrypoint
-  # must read to start at all (final review M2): a gate it can't read
-  # can't hide a marker.
-  (umask 077 && mkdir -p "$d/gate")
-  [ "$(cat "$d/gate/.present" 2>/dev/null)" = portcullis-mail-gate ] || (umask 077 && printf 'portcullis-mail-gate\n' > "$d/gate/.present")
-  for f in api-key hub-secret metrics-secret mailctl-metrics-secret relay-password dqs-key; do
-    [ ! -d "$d/$f" ] || fail "$d/$f is a directory (made by Docker): remove it (rmdir) and run again"
-    [ -f "$d/$f" ] || (umask 077 && : > "$d/$f")
-  done
-  # The Prometheus scrape password (Stalwart's metrics listener): generated once.
-  [ -s "$d/metrics-secret" ] || gen_alnum 40 > "$d/metrics-secret"
-  # mailctl's own (its /metrics, Basic auth as for Stalwart's): another
-  # file because each secret file has one reader group.
-  [ -s "$d/mailctl-metrics-secret" ] || gen_alnum 40 > "$d/mailctl-metrics-secret"
-  _mail_secret_from_env "$d/relay-password" MAIL_RELAY_PASSWORD
-  _mail_secret_from_env "$d/dqs-key" MAIL_SPAMHAUS_DQS_KEY
-  mail_profile_on || return 0
-  # The Hub ↔ mailctl bearer (both bind it): generated once with mail on;
-  # one shorter than mailctl's 32 is replaced. Written IN PLACE: a
-  # single-file bind pins the inode, and the Hub binds the placeholder
-  # before mail is on (a new file would stay invisible to it).
-  if [ "$(tr -d '[:space:]' < "$d/hub-secret" | wc -c | tr -d ' ')" -lt 32 ]; then
-    local hs
-    hs="$(gen_alnum 48)"
-    printf '%s' "$hs" > "$d/hub-secret"
-    unset hs
-  fi
-  volume_own mail_data "$CT_UID_MAIL:$CT_UID_MAIL"
-  volume_own mail_etc "$CT_UID_MAIL:$CT_UID_MAIL"
-  volume_own mail_tls "$CT_UID_DOMAINS:$CT_UID_MAIL" 2750
+  volume_own mail_slot "$CT_UID_HUB:$CT_GID_PROMETHEUS" 2750
+  # The wired provider's slot files (R-POD2): the Hub writes them, the
+  # provider's gated services read them through group 2000.
+  volume_own mail_provider_slot "$CT_UID_HUB:$CT_GID_MAIL_PROVIDER" 2750
+  mail_slot_open || return 0
+  _mail_metrics_network
+  volume_own mail_tls "$CT_UID_DOMAINS:$CT_GID_MAIL_PROVIDER" 2750
   volume_own mail_acme "$CT_UID_DOMAINS:$CT_UID_DOMAINS" 0700
-  volume_own mailctl_data "$CT_UID_MAILCTL:$CT_UID_MAILCTL" 0700
 }
 
 # stack_prepare — bind-mount sources must exist before compose runs, or

@@ -1,7 +1,6 @@
 package bootstrap
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -19,88 +18,10 @@ import (
 	"github.com/portcullis/mailctl/internal/stalwart"
 )
 
-// Input is `mailctl bootstrap`'s stdin (contract §19.4).
-type Input struct {
-	RecoveryUser     string   `json:"recovery_user"`
-	RecoveryPassword string   `json:"recovery_password"`
-	Hostname         string   `json:"hostname"`
-	PrimaryDomain    string   `json:"primary_domain"`
-	ClientIP         string   `json:"client_ip"`
-	LANOnly          bool     `json:"lan_only"`
-	LocalNetworks    []string `json:"local_networks"`
-	Relay            *Relay   `json:"relay"`
-	MetricsUser      string   `json:"metrics_user"`
-}
-
-// Credentials is `mailctl bootstrap --verify-gone`'s stdin.
+// Credentials are a recovery admin's login (VerifyGone).
 type Credentials struct {
-	RecoveryUser     string `json:"recovery_user"`
-	RecoveryPassword string `json:"recovery_password"`
-}
-
-// decodeStrict reads exactly one JSON object (≤ 64 KiB): unknown keys and
-// trailing data refused.
-func decodeStrict(r io.Reader, v any) error {
-	b, err := io.ReadAll(io.LimitReader(r, 64<<10+1))
-	if err != nil {
-		return fmt.Errorf("reading stdin: %w", err)
-	}
-	if len(b) > 64<<10 {
-		return errors.New("stdin is larger than 64 KiB")
-	}
-	d := json.NewDecoder(bytes.NewReader(b))
-	d.DisallowUnknownFields()
-	if err := d.Decode(v); err != nil {
-		return fmt.Errorf("stdin: %w", err)
-	}
-	if d.More() {
-		return errors.New("stdin: trailing data after the object")
-	}
-	if _, err := d.Token(); err != io.EOF {
-		return errors.New("stdin: trailing data after the object")
-	}
-	return nil
-}
-
-// ReadInput decodes and checks the bootstrap input.
-func ReadInput(r io.Reader) (Input, error) {
-	var in Input
-	if err := decodeStrict(r, &in); err != nil {
-		return in, err
-	}
-	switch {
-	case in.RecoveryUser == "" || in.RecoveryPassword == "":
-		return in, errors.New("recovery_user and recovery_password are required")
-	case in.Hostname == "" || !strings.Contains(in.Hostname, "."):
-		return in, errors.New("hostname is required (MAIL_HOSTNAME)")
-	case in.PrimaryDomain == "":
-		return in, errors.New("primary_domain is required")
-	case in.ClientIP != "preserved" && in.ClientIP != "rewritten":
-		return in, errors.New("client_ip must be preserved or rewritten")
-	case in.MetricsUser == "":
-		return in, errors.New("metrics_user is required")
-	}
-	for _, n := range in.LocalNetworks {
-		if _, err := netip.ParsePrefix(n); err != nil {
-			return in, fmt.Errorf("local_networks: %q is not a network", n)
-		}
-	}
-	if r := in.Relay; r != nil && (r.Host == "" || r.Port < 1 || r.Port > 65535) {
-		return in, errors.New("relay needs a host and a port")
-	}
-	return in, nil
-}
-
-// ReadCredentials decodes --verify-gone's input.
-func ReadCredentials(r io.Reader) (Credentials, error) {
-	var c Credentials
-	if err := decodeStrict(r, &c); err != nil {
-		return c, err
-	}
-	if c.RecoveryUser == "" || c.RecoveryPassword == "" {
-		return c, errors.New("recovery_user and recovery_password are required")
-	}
-	return c, nil
+	RecoveryUser     string
+	RecoveryPassword string
 }
 
 type object = map[string]json.RawMessage
@@ -166,9 +87,15 @@ func checkSet(obj string, r stalwart.SetResult, err error) error {
 // update differing, destroy unnamed ones when DestroyOthers, and duplicate
 // keys always) and returns key → id.
 func Ensure(ctx context.Context, c *stalwart.Client, n Named) (map[string]string, error) {
+	ids, _, err := ensure(ctx, c, n)
+	return ids, err
+}
+
+// ensure is Ensure, also saying whether it wrote anything.
+func ensure(ctx context.Context, c *stalwart.Client, n Named) (map[string]string, bool, error) {
 	have, err := getAll(ctx, c, n.Object)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	skip := map[string]bool{n.Key: true, "@type": true}
 	for _, f := range n.Immutable {
@@ -221,23 +148,23 @@ func Ensure(ctx context.Context, c *stalwart.Client, n Named) (map[string]string
 	if len(destroy) > 0 {
 		r, err := c.Set(ctx, n.Object, nil, nil, destroy)
 		if err := checkSet(n.Object, r, err); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
 	if len(create) > 0 || len(update) > 0 {
 		r, err := c.Set(ctx, n.Object, create, update, nil)
 		if err := checkSet(n.Object, r, err); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		for cid, k := range keys {
 			id := r.CreatedID(cid)
 			if id == "" {
-				return nil, fmt.Errorf("x:%s/set: no id for the new %q", n.Object, k)
+				return nil, false, fmt.Errorf("x:%s/set: no id for the new %q", n.Object, k)
 			}
 			ids[k] = id
 		}
 	}
-	return ids, nil
+	return ids, len(destroy) > 0 || len(create) > 0 || len(update) > 0, nil
 }
 
 func updateSingleton(ctx context.Context, c *stalwart.Client, s Singleton) error {
@@ -313,7 +240,14 @@ func Apply(ctx context.Context, c *stalwart.Client, p Params, rotateKey bool, lo
 	for _, s := range p.Singletons() {
 		if s.Object == "SystemSettings" {
 			s.Patch["defaultCertificateId"] = certID
-			s.Patch["defaultDomainId"] = ids["Domain"][p.PrimaryDomain]
+			// Stalwart 1.1 requires a default domain (Ruling T17-d): the
+			// primary domain once a document named it, else the parking
+			// domain (ApplyDoc moves it to the primary domain).
+			if p.PrimaryDomain != "" {
+				s.Patch["defaultDomainId"] = ids["Domain"][p.PrimaryDomain]
+			} else {
+				s.Patch["defaultDomainId"] = ids["Domain"][ParkingDomain]
+			}
 		}
 		if err := updateSingleton(ctx, c, s); err != nil {
 			return res, err
@@ -465,8 +399,8 @@ func ensureAccount(ctx context.Context, c *stalwart.Client, domainID, roleID str
 	return r.CreatedID("m"), nil
 }
 
-// ensureAPIKey makes mailctl's one API key (Inherit, pinned to its
-// portcullis-mail address, no expiry) unless one exists; rotate replaces it.
+// ensureAPIKey makes mailctl's one API key (Inherit, pinned to the
+// adapter's address, no expiry) unless one exists; rotate replaces it.
 func ensureAPIKey(ctx context.Context, c *stalwart.Client, mailctlIP netip.Addr, rotate bool) (string, error) {
 	keys, err := getAll(ctx, c, "ApiKey")
 	if err != nil {
@@ -488,7 +422,9 @@ func ensureAPIKey(ctx context.Context, c *stalwart.Client, mailctlIP netip.Addr,
 	r, err := c.Set(ctx, "ApiKey", map[string]any{"k": map[string]any{
 		"description": APIKeyName,
 		"permissions": map[string]any{"@type": "Inherit"},
-		"allowedIps":  set(netip.PrefixFrom(mailctlIP, 32).String()),
+		// The adapter's address only (Ruling R2-N2b): the job never
+		// authenticates with the key.
+		"allowedIps": set(netip.PrefixFrom(mailctlIP, 32).String()),
 	}}, nil, nil)
 	if err := checkSet("ApiKey", r, err); err != nil {
 		return "", err
@@ -592,4 +528,157 @@ func VerifyGone(ctx context.Context, url string, cr Credentials) error {
 	default:
 		return fmt.Errorf("can't confirm the recovery admin is gone: HTTP %d", resp.StatusCode)
 	}
+}
+
+// StoreEmpty (Ruling R-H2b): the document-less base plan runs only on a
+// store with no data — no account but mailctl's and no domain but the
+// plan's own (the parking domain, p.PrimaryDomain): a first plan that
+// failed half way may run again. mailctl's account counts only on the
+// parking domain. Anything else on an unmarked store (a lost marker)
+// fails closed: the plan would downgrade a live server's settings.
+func StoreEmpty(ctx context.Context, c *stalwart.Client, p Params) error {
+	own := map[string]bool{}
+	for _, d := range p.domains() {
+		own[strings.ToLower(fmt.Sprint(d["name"]))] = true
+	}
+	doms, err := getAll(ctx, c, "Domain")
+	if err != nil {
+		return err
+	}
+	parking := ""
+	for _, d := range doms {
+		if strings.EqualFold(str(d, "name"), ParkingDomain) {
+			parking = str(d, "id")
+		}
+	}
+	accts, err := getAll(ctx, c, "Account")
+	if err != nil {
+		return err
+	}
+	for _, a := range accts {
+		if str(a, "name") != MailctlAccount || parking == "" || str(a, "domainId") != parking {
+			return errors.New("the store has accounts but no bootstrap marker: refusing the base plan (restore the marker or the store; Ruling R-H2b)")
+		}
+	}
+	for _, d := range doms {
+		if !own[strings.ToLower(str(d, "name"))] {
+			return errors.New("the store has mail domains but no bootstrap marker: refusing the base plan (restore the marker or the store; Ruling R-H2b)")
+		}
+	}
+	return nil
+}
+
+// KeyInPlace (Ruling R2-N2b) judges mailctl's API key through the
+// recovery admin, never by using it: mailctl's account on the parking
+// domain holds exactly one key, named APIKeyName, Inherit, not disabled,
+// whose allowedIps are exactly the adapter's /32; and the key file holds
+// an API_ secret. Stalwart exposes no hash of the secret, so whether the
+// file's secret is that key's is the adapter's first call to find out (it
+// fails closed: every route 503, state.bootstrap false).
+func KeyInPlace(ctx context.Context, c *stalwart.Client, mailctlIP netip.Addr, fileKey string) (bool, error) {
+	if !strings.HasPrefix(fileKey, "API_") {
+		return false, nil
+	}
+	acct, err := mailctlAccount(ctx, c)
+	if err != nil || acct == "" {
+		return false, err
+	}
+	keys, err := getAll(ctx, c.As(acct), "ApiKey")
+	if err != nil {
+		return false, err
+	}
+	if len(keys) != 1 {
+		return false, nil
+	}
+	k := keys[0]
+	var perm struct {
+		Type string `json:"@type"`
+	}
+	_ = json.Unmarshal(k["permissions"], &perm)
+	if str(k, "description") != APIKeyName || perm.Type != "Inherit" || !onlyPrefix(k["allowedIps"], netip.PrefixFrom(mailctlIP, 32)) {
+		return false, nil
+	}
+	// No expiry (the key is minted without one).
+	if raw, ok := k["expiresAt"]; ok && string(raw) != "null" {
+		return false, nil
+	}
+	// The secret, when the server hands it back in clear (Stalwart 1.1
+	// returns the field), must be the file's; a masked or hashed value
+	// can't be compared and says nothing.
+	if sec := str(k, "secret"); strings.HasPrefix(sec, "API_") && sec != fileKey {
+		return false, nil
+	}
+	return true, nil
+}
+
+// onlyPrefix: the JMAP set (an object of value → true, or a list) holds
+// exactly one network, want, compared canonically: Stalwart 1.1 answers a
+// /32 as the bare address ({"172.31.255.3": true}).
+func onlyPrefix(raw json.RawMessage, want netip.Prefix) bool {
+	var vals []string
+	var set map[string]bool
+	if json.Unmarshal(raw, &set) == nil && set != nil {
+		for v, on := range set {
+			if on {
+				vals = append(vals, v)
+			}
+		}
+	} else if json.Unmarshal(raw, &vals) != nil {
+		return false
+	}
+	if len(vals) != 1 {
+		return false
+	}
+	p, err := netip.ParsePrefix(vals[0])
+	if err != nil {
+		a, aerr := netip.ParseAddr(vals[0])
+		if aerr != nil {
+			return false
+		}
+		p = netip.PrefixFrom(a, a.BitLen())
+	}
+	return p.Masked() == want.Masked()
+}
+
+// mailctlAccount: the id of mailctl's account on the parking domain, ""
+// when there is none.
+func mailctlAccount(ctx context.Context, c *stalwart.Client) (string, error) {
+	doms, err := getAll(ctx, c, "Domain")
+	if err != nil {
+		return "", err
+	}
+	parking := ""
+	for _, d := range doms {
+		if strings.EqualFold(str(d, "name"), ParkingDomain) {
+			parking = str(d, "id")
+		}
+	}
+	if parking == "" {
+		return "", nil
+	}
+	accts, err := getAll(ctx, c, "Account")
+	if err != nil {
+		return "", err
+	}
+	for _, a := range accts {
+		if str(a, "name") == MailctlAccount && str(a, "domainId") == parking {
+			return str(a, "id"), nil
+		}
+	}
+	return "", nil
+}
+
+// MintKey replaces mailctl's API key only (Ruling R-H2: a marked store
+// whose key is lost): the existing account of mailctl on the parking
+// domain gets a new key; no other object is touched. No such account is
+// an error (fail closed: the store isn't what the marker says).
+func MintKey(ctx context.Context, c *stalwart.Client, mailctlIP netip.Addr) (string, error) {
+	acct, err := mailctlAccount(ctx, c)
+	if err != nil {
+		return "", err
+	}
+	if acct == "" {
+		return "", errors.New("the store is marked bootstrapped but has no mailctl account: restore the store or start a fresh one")
+	}
+	return ensureAPIKey(ctx, c.As(acct), mailctlIP, true)
 }

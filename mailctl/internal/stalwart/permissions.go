@@ -52,10 +52,23 @@ var MailctlRolePermissions = func() []string {
 		"sysMtaOutboundThrottleGet", "sysMtaOutboundThrottleCreate", "sysMtaOutboundThrottleUpdate", "sysMtaOutboundThrottleDestroy", "sysMtaOutboundThrottleQuery",
 		"sysMtaTlsStrategyGet", "sysMtaTlsStrategyQuery", "sysMtaTlsStrategyUpdate",
 		// The per-account limits (MtaInboundThrottle) and, with
-		// MAIL_SUBMISSION_LAN_ONLY, the SASL rule (MtaStageAuth).
+		// submission_lan_only, the SASL rule (MtaStageAuth).
 		"sysMtaInboundThrottleGet", "sysMtaInboundThrottleCreate", "sysMtaInboundThrottleUpdate",
 		"sysMtaInboundThrottleDestroy", "sysMtaInboundThrottleQuery",
 		"sysMtaStageAuthGet", "sysMtaStageAuthUpdate",
+		// MailState v2's part of the base plan (bootstrap.ApplyDoc): the
+		// host name, the relay route and its TLS strategy, the outbound
+		// strategy and degraded mode's sender authentication / security.
+		"sysSystemSettingsGet", "sysSystemSettingsUpdate",
+		"sysMtaRouteGet", "sysMtaRouteQuery", "sysMtaRouteCreate", "sysMtaRouteUpdate", "sysMtaRouteDestroy",
+		"sysMtaTlsStrategyCreate", "sysMtaOutboundStrategyGet", "sysMtaOutboundStrategyUpdate",
+		"sysSecurityGet", "sysSecurityUpdate",
+		// An account is created with the built-in User role, and Stalwart
+		// refuses to grant a role whose permissions the caller lacks: 1.1's
+		// User role (after the role-permission update) holds the passkey
+		// set, so the key holds it too (seen in core CI: every account
+		// create refused "not authorized to grant permissions: sysPasskey…").
+		"sysPasskeyGet", "sysPasskeyCreate", "sysPasskeyUpdate", "sysPasskeyDestroy", "sysPasskeyQuery",
 	}
 	seen := map[string]bool{}
 	var out []string

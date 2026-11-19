@@ -1,7 +1,7 @@
 // Package creds is mail passwords: Stalwart app passwords created only for
 // a person (contract §19.6), at most 5 active, permissions Replace =
 // MailPasswordPermissions (M6), allowed IPs the Local networks with
-// MAIL_SUBMISSION_LAN_ONLY. The secret exists once, in the create answer.
+// submission_lan_only. The secret exists once, in the create answer.
 package creds
 
 import (
@@ -32,13 +32,18 @@ type Created struct {
 	ExpiresAt *time.Time `json:"expires_at"`
 }
 
-// Info is one password's metadata (never its secret).
+// Info is one password's metadata (never its secret): GET
+// /v1/credentials?uuid= rows (contract §19.5).
 type Info struct {
 	ID        string     `json:"id"`
+	UUID      string     `json:"uuid"`
 	Label     string     `json:"label"`
 	CreatedAt time.Time  `json:"created_at"`
 	ExpiresAt *time.Time `json:"expires_at"`
 	LastUsed  *time.Time `json:"last_used"` // always null: v1.1.0 doesn't record it
+	// AllowedIPs: [] = anywhere; else the prefixes it may authenticate
+	// from (canonical, sorted; a /32 or /128 as a prefix).
+	AllowedIPs []string `json:"allowed_ips"`
 }
 
 // ValidLabel is 1-64 characters on one line.
@@ -118,15 +123,21 @@ func read(ctx context.Context, c *stalwart.Client, accountID string) ([]apw, err
 	return out, nil
 }
 
-// List is an account's mail passwords.
-func List(ctx context.Context, c *stalwart.Client, accountID string) ([]Info, error) {
+// List is an account's mail passwords, each row naming uuid (the
+// account's, as the Hub asked for it).
+func List(ctx context.Context, c *stalwart.Client, accountID, uuid string) ([]Info, error) {
 	ps, err := read(ctx, c, accountID)
 	if err != nil {
 		return nil, err
 	}
 	out := []Info{}
 	for _, p := range ps {
-		out = append(out, Info{ID: p.ID, Label: p.Description, CreatedAt: p.CreatedAt.UTC(), ExpiresAt: p.ExpiresAt})
+		ips := []string{}
+		for k := range canonIPs(p.AllowedIPs) {
+			ips = append(ips, k)
+		}
+		sort.Strings(ips)
+		out = append(out, Info{ID: p.ID, UUID: uuid, Label: p.Description, CreatedAt: p.CreatedAt.UTC(), ExpiresAt: p.ExpiresAt, AllowedIPs: ips})
 	}
 	return out, nil
 }

@@ -235,7 +235,8 @@ groups:
           description: >-
             Its healthcheck has failed for 5 minutes. See the instance in the Hub (logs, restart).
 
-      # Mail (profile mail, contract §19.8): mailctl's gauges (job mailctl).
+      # Mail (contract §19.8): the wired provider's contract gauges (job
+      # mail-provider); MailCertExpiring is core's textfile metric.
       - alert: MailQueueHigh
         expr: portcullis_mail_queue_messages > 100
         for: 30m

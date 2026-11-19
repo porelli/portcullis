@@ -34,6 +34,7 @@ func newServer(t *testing.T, subnet string) (*Server, string) {
 func do(s *Server, ip, method, path, auth string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, path, nil)
 	r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey, &net.TCPAddr{IP: net.ParseIP(ip), Port: 8080}))
+	r.RemoteAddr = "172.31.255.18:40000" // the Hub's pinned address
 	if auth != "" {
 		r.Header.Set("Authorization", auth)
 	}
@@ -74,6 +75,7 @@ func TestAPIRefusesBadBearer(t *testing.T) {
 	// Two Authorization headers: refused.
 	r := httptest.NewRequest("GET", "/v1/state", nil)
 	r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey, &net.TCPAddr{IP: net.ParseIP("172.31.255.19")}))
+	r.RemoteAddr = "172.31.255.18:40000"
 	r.Header.Add("Authorization", "Bearer "+secretA)
 	r.Header.Add("Authorization", "Bearer "+secretA)
 	w := httptest.NewRecorder()
@@ -132,5 +134,38 @@ func TestHealthzLoopbackOnly(t *testing.T) {
 	}
 	if w := do(s, "127.0.0.1", "GET", "/v1/state", "Bearer "+secretA); w.Code != 403 {
 		t.Fatalf("v1 on loopback: %d", w.Code)
+	}
+}
+
+// M1 (final cross review): the fence is the SOURCE address too (contract
+// §19.5: refuse any source outside PORTCULLIS_MAIL_API_SUBNET; with
+// PORTCULLIS_MAIL_API_HUB_IP set, the Hub's address only) — on rootless
+// Podman networks aren't isolated, so a destination check alone leaves
+// the bearer as the only fence.
+func TestAPIRefusesSourceOutsideSubnetOrNotTheHub(t *testing.T) {
+	s, _ := newServer(t, "172.31.255.16/28")
+	from := func(src string) int {
+		r := httptest.NewRequest("GET", "/v1/state", nil)
+		r = r.WithContext(context.WithValue(r.Context(), http.LocalAddrContextKey, &net.TCPAddr{IP: net.ParseIP("172.31.255.19"), Port: 8080}))
+		r.RemoteAddr = src
+		r.Header.Set("Authorization", "Bearer "+secretA)
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, r)
+		return w.Code
+	}
+	for _, src := range []string{"10.89.0.7:5000", "172.31.255.3:5000", "192.0.2.1:1234", "garbage"} {
+		if c := from(src); c != 403 {
+			t.Errorf("source %s: %d (want 403)", src, c)
+		}
+	}
+	if c := from("172.31.255.20:5000"); c != 200 {
+		t.Fatalf("a source inside the subnet, no Hub address set: %d", c)
+	}
+	s.HubIP = netip.MustParseAddr("172.31.255.18")
+	if c := from("172.31.255.20:5000"); c != 403 {
+		t.Fatalf("another address of the subnet with the Hub's pinned: %d (want 403)", c)
+	}
+	if c := from("172.31.255.18:5000"); c != 200 {
+		t.Fatalf("the Hub: %d", c)
 	}
 }

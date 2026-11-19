@@ -3,10 +3,16 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"net/mail"
+	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -14,25 +20,35 @@ import (
 
 	"github.com/portcullis/mailctl/internal/checks"
 	"github.com/portcullis/mailctl/internal/creds"
+	"github.com/portcullis/mailctl/internal/logx"
 	"github.com/portcullis/mailctl/internal/machines"
+	"github.com/portcullis/mailctl/internal/mailtest"
 	"github.com/portcullis/mailctl/internal/reconcile"
 	"github.com/portcullis/mailctl/internal/stalwart"
 	"github.com/portcullis/mailctl/internal/state"
+	"github.com/portcullis/mailctl/internal/tlsprobe"
 )
 
 // MaxBody bounds every request body (contract §19.5).
 const MaxBody = 4 << 20
 
-// V1 is the Hub API's routes (behind Server's guard).
+// V1 is the provider API v1's routes (behind Server's guard). LAN-only,
+// the client address mode and the rest come from the accepted document
+// (MailState v2), never from the environment.
 type V1 struct {
-	Store   *state.Store
-	C       *stalwart.Client
-	Runner  *reconcile.Runner
-	LANOnly bool
-	// Rewritten client addresses: LAN-only admits loopback only.
-	Rewritten bool
-	Now       func() time.Time
-	Logf      func(string, ...any)
+	Store  *state.Store
+	C      *stalwart.Client
+	Runner *reconcile.Runner
+	Now    func() time.Time
+	Logf   func(string, ...any)
+	// TLSDir holds fullchain.pem and privkey.pem (PORTCULLIS_MAIL_TLS_DIR).
+	TLSDir string
+	// Serving reads the leaf the listeners serve (the TLS reload's answer).
+	Serving func(ctx context.Context) (*x509.Certificate, error)
+	// Test submits the test message (POST /v1/actions/test): its queue id.
+	Test func(ctx context.Context, doc *state.Doc, to string) (string, error)
+	// Export: the template's mail: block has export (GET /v1/provider).
+	Export bool
 	// M runs the state machines (DNS set, status, actions).
 	M *machines.Machines
 	// Checks are GET /v1/checks.
@@ -46,9 +62,14 @@ type V1 struct {
 	bootState bool
 }
 
-// Handler is the v1 mux.
+// Handler is the v1 mux. Before the bootstrap only GET /v1/provider and
+// GET /v1/state answer; every other route is 503 (contract §19.5).
 func (v *V1) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/provider", v.getProvider)
+	mux.HandleFunc("POST /v1/void", v.void)
+	mux.HandleFunc("POST /v1/tls/reload", v.tlsReload)
+	mux.HandleFunc("POST /v1/actions/test", v.actionTest)
 	mux.HandleFunc("PUT /v1/state", v.putState)
 	mux.HandleFunc("GET /v1/state", v.getState)
 	mux.HandleFunc("GET /v1/credentials", v.listCreds)
@@ -58,7 +79,187 @@ func (v *V1) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/status", v.getStatus)
 	mux.HandleFunc("GET /v1/checks", v.getChecks)
 	mux.HandleFunc("POST /v1/actions/{action}", v.action)
-	return mux
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		always := r.Method == http.MethodGet && (r.URL.Path == "/v1/provider" || r.URL.Path == "/v1/state")
+		if !always && !v.bootstrapped(r.Context()) {
+			writeErr(w, http.StatusServiceUnavailable, "the mail server isn't ready")
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
+}
+
+// Actions are the provider's actions (GET /v1/provider).
+var Actions = []string{"dkim-rotate", "dmarc-promote", "mtasts-enforce", "test"}
+
+func (v *V1) getProvider(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"name": machines.ProviderName, "version": machines.ProviderVersion, "api_version": 1,
+		"checks": checks.Catalog, "actions": Actions, "export": v.Export})
+}
+
+// decodeStrict decodes one JSON object into dst: unknown and duplicate
+// keys and trailing data refused, every key of keys required.
+func decodeStrict(b []byte, dst any, keys ...string) bool {
+	if state.NoDuplicateKeys(b) != nil {
+		return false
+	}
+	d := json.NewDecoder(bytes.NewReader(b))
+	d.DisallowUnknownFields()
+	if d.Decode(dst) != nil {
+		return false
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return false
+	}
+	var m map[string]json.RawMessage
+	if json.Unmarshal(b, &m) != nil {
+		return false
+	}
+	for _, k := range keys {
+		if v, ok := m[k]; !ok || string(v) == "null" {
+			return false
+		}
+	}
+	return true
+}
+
+// void is POST /v1/void: every mail password of every account (live and
+// parked) destroyed, verified gone, then restored_at recorded (contract
+// §19.11). Under the pass lock: no create lands meanwhile.
+func (v *V1) void(w http.ResponseWriter, r *http.Request) {
+	b, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Reason string `json:"reason"`
+	}
+	if !decodeStrict(b, &req, "reason") || (req.Reason != "wire" && req.Reason != "restore") {
+		writeErr(w, http.StatusBadRequest, `the body must be {"reason": "wire" | "restore"}`)
+		return
+	}
+	if v.Runner != nil {
+		v.Runner.LockPass()
+		defer v.Runner.UnlockPass()
+	}
+	// Its own deadline, never the client's (M6): the Hub's client gives up
+	// after 30 s, and a void stopped half way only costs a retry.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Minute)
+	defer cancel()
+	n, err := creds.VoidAll(ctx, v.C)
+	if err != nil {
+		if v.Logf != nil {
+			v.Logf("void: failed after %d mail passwords: %s", n, logx.Redact(err.Error()))
+		}
+		writeErr(w, http.StatusServiceUnavailable, "the void failed: mail passwords may be left")
+		return
+	}
+	now := v.now().UTC().Truncate(time.Second)
+	if err := v.Store.Update(func(p *state.Persistent) error { p.RestoredAt = &now; return nil }); err != nil {
+		writeErr(w, http.StatusServiceUnavailable, "the void's time couldn't be recorded")
+		return
+	}
+	if v.Logf != nil {
+		v.Logf("void (%s): %d mail passwords destroyed", req.Reason, n)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"voided": n, "restored_at": now})
+}
+
+var reSPKI = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// tlsReload is POST /v1/tls/reload: the certificate files read again
+// (refused while they can't be), the server's TLS reloaded, and the SPKI
+// its submissions listener then serves (contract §19.3).
+func (v *V1) tlsReload(w http.ResponseWriter, r *http.Request) {
+	b, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		SPKI []string `json:"spki_sha256"`
+	}
+	valid := decodeStrict(b, &req, "spki_sha256") && len(req.SPKI) >= 1 && len(req.SPKI) <= 2
+	for _, k := range req.SPKI {
+		valid = valid && reSPKI.MatchString(k)
+	}
+	if !valid {
+		writeErr(w, http.StatusBadRequest, `the body must be {"spki_sha256": ["<64 lowercase hex>", …]} with 1-2 keys`)
+		return
+	}
+	if _, err := tls.LoadX509KeyPair(filepath.Join(v.TLSDir, "fullchain.pem"), filepath.Join(v.TLSDir, "privkey.pem")); err != nil {
+		writeErr(w, http.StatusServiceUnavailable, "the certificate files can't be read")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), time.Minute)
+	defer cancel()
+	if err := v.C.Action(ctx, "ReloadTlsCertificates"); err != nil {
+		v.unreachable(w, err)
+		return
+	}
+	v.M.ForgetCert()
+	if v.Serving == nil {
+		writeErr(w, http.StatusServiceUnavailable, "the served certificate can't be read")
+		return
+	}
+	leaf, err := v.Serving(ctx)
+	if err != nil {
+		writeErr(w, http.StatusServiceUnavailable, "the served certificate can't be read")
+		return
+	}
+	got := tlsprobe.SPKI(leaf)
+	if !slices.Contains(req.SPKI, got) && v.Logf != nil {
+		v.Logf("tls reload: the listeners serve %s, not one of the keys sent", got)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"serving_spki_sha256": got})
+}
+
+// actionTest is POST /v1/actions/test: one message from the first
+// postmaster account (contract §19.10).
+func (v *V1) actionTest(w http.ResponseWriter, r *http.Request) {
+	b, ok := readBody(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		To string `json:"to"`
+	}
+	if !decodeStrict(b, &req, "to") || !oneAddress(req.To) {
+		writeErr(w, http.StatusBadRequest, "to must be one address")
+		return
+	}
+	doc := v.Store.Get().Doc
+	if doc == nil || len(doc.Postmaster) == 0 {
+		writeErr(w, http.StatusConflict, "no postmaster account: an administrator who has a mailbox is one")
+		return
+	}
+	if v.Test == nil {
+		writeErr(w, http.StatusServiceUnavailable, "the test can't be sent")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
+	defer cancel()
+	id, err := v.Test(ctx, doc, req.To)
+	if errors.Is(err, mailtest.ErrNoPostmaster) {
+		writeErr(w, http.StatusConflict, "no postmaster account: an administrator who has a mailbox is one")
+		return
+	}
+	if err != nil {
+		if v.Logf != nil {
+			v.Logf("actions: test: %s", logx.Redact(err.Error()))
+		}
+		writeErr(w, http.StatusServiceUnavailable, "the test message couldn't be submitted")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"queue_id": id})
+}
+
+// oneAddress: a bare address (no display name, no list), one line.
+func oneAddress(s string) bool {
+	if s == "" || len(s) > 254 || strings.ContainsAny(s, " <>,\r\n\t") {
+		return false
+	}
+	a, err := mail.ParseAddress(s)
+	return err == nil && a.Name == "" && a.Address == s && strings.Contains(s, "@")
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -70,6 +271,11 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// writeKind is a refusal the Hub branches on (contract §19.5: error_kind).
+func writeKind(w http.ResponseWriter, status int, kind, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg, "error_kind": kind})
 }
 
 func (v *V1) unreachable(w http.ResponseWriter, err error) {
@@ -107,7 +313,7 @@ func (v *V1) putState(w http.ResponseWriter, r *http.Request) {
 	}
 	p := v.Store.Get()
 	if doc.Generation <= p.Generation {
-		writeErr(w, http.StatusConflict, "generation is not greater than the last accepted one")
+		writeKind(w, http.StatusConflict, "generation", "generation is not greater than the last accepted one")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
@@ -150,7 +356,7 @@ func (v *V1) putState(w http.ResponseWriter, r *http.Request) {
 		s.Doc, s.Generation, s.MassRemoval = doc, doc.Generation, confirmed
 		return nil
 	}); err != nil {
-		writeErr(w, http.StatusConflict, "generation is not greater than the last accepted one")
+		writeKind(w, http.StatusConflict, "generation", "generation is not greater than the last accepted one")
 		return
 	}
 	if v.Runner != nil {
@@ -185,44 +391,44 @@ func (v *V1) getState(w http.ResponseWriter, r *http.Request) {
 		"bootstrap": v.bootstrapped(r.Context()), "errors": errs})
 }
 
-// account resolves ?user= (or the body's username) to a live account id;
-// it writes the answer itself when it fails.
-func (v *V1) account(w http.ResponseWriter, ctx context.Context, user string) (string, *state.Doc, bool) {
-	p := v.Store.Get()
-	if p.Doc == nil {
-		writeErr(w, http.StatusNotFound, "no such account")
-		return "", nil, false
+// listCreds is GET /v1/credentials?uuid=: the mail passwords of every
+// account carrying that uuid, live or parked (a void's verification must
+// see a parked account's too), each row echoing the uuid. 404 when no
+// account carries it.
+func (v *V1) listCreds(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	uuid := q.Get("uuid")
+	if len(q) != 1 || len(q["uuid"]) != 1 || !state.ValidUUID(uuid) {
+		writeErr(w, http.StatusBadRequest, "GET /v1/credentials takes exactly ?uuid=<account uuid>")
+		return
 	}
-	if _, ok := p.Doc.Account(user); !ok {
-		writeErr(w, http.StatusNotFound, "no such account")
-		return "", nil, false
-	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
 	live, err := reconcile.Read(ctx, v.C)
 	if err != nil {
 		v.unreachable(w, err)
-		return "", nil, false
-	}
-	id := reconcile.FindAccount(live, p.Doc, user)
-	if id == "" {
-		writeErr(w, http.StatusNotFound, "no such account")
-		return "", nil, false
-	}
-	return id, p.Doc, true
-}
-
-func (v *V1) listCreds(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-	id, _, ok := v.account(w, ctx, r.URL.Query().Get("user"))
-	if !ok {
 		return
 	}
-	list, err := creds.List(ctx, v.C, id)
-	if err != nil {
-		v.unreachable(w, err)
+	out := []creds.Info{}
+	found := false
+	for _, la := range live.Accounts {
+		if !strings.EqualFold(la.UUID, uuid) {
+			continue
+		}
+		found = true
+		list, err := creds.List(ctx, v.C, la.ID, uuid)
+		if err != nil {
+			v.unreachable(w, err)
+			return
+		}
+		out = append(out, list...)
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "no account with that uuid")
 		return
 	}
-	writeJSON(w, http.StatusOK, list)
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	writeJSON(w, http.StatusOK, out)
 }
 
 type createReq struct {
@@ -297,7 +503,7 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 	p := v.Store.Get()
 	doc := p.Doc
 	if doc == nil {
-		writeErr(w, http.StatusServiceUnavailable, "mailctl has no accepted mail document yet")
+		writeErr(w, http.StatusServiceUnavailable, "no accepted mail document yet")
 		return
 	}
 	if _, known := doc.Account(req.Username); !known {
@@ -335,10 +541,10 @@ func (v *V1) createCred(w http.ResponseWriter, r *http.Request) {
 		refuse()
 		return
 	}
-	cr, err := creds.Create(ctx, v.C, id, req.Label, req.ExpiresAt, creds.AllowedIPs(v.LANOnly, reconcile.LocalNets(doc, v.Rewritten)), v.now())
+	cr, err := creds.Create(ctx, v.C, id, req.Label, req.ExpiresAt, creds.AllowedIPs(doc.SubmissionLANOnly, reconcile.LocalNets(doc, doc.Rewritten())), v.now())
 	switch {
 	case errors.Is(err, creds.ErrLimit):
-		writeErr(w, http.StatusConflict, err.Error())
+		writeKind(w, http.StatusConflict, "limit", err.Error())
 		return
 	case err != nil:
 		v.unreachable(w, err)
@@ -392,13 +598,6 @@ func (v *V1) deleteCred(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (v *V1) clientIP() string {
-	if v.Rewritten {
-		return "rewritten"
-	}
-	return "preserved"
-}
-
 func (v *V1) getDNS(w http.ResponseWriter, r *http.Request) {
 	var noWild bool
 	switch r.URL.Query().Get("wildcard") {
@@ -420,7 +619,7 @@ func (v *V1) getDNS(w http.ResponseWriter, r *http.Request) {
 func (v *V1) getStatus(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	st, err := v.M.Status(ctx, v.bootstrapped(ctx), v.clientIP())
+	st, err := v.M.Status(ctx, v.bootstrapped(ctx))
 	if err != nil {
 		v.unreachable(w, err)
 		return

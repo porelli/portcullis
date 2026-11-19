@@ -1,5 +1,6 @@
 // Package machines drives the per-domain state machines (DKIM, MTA-STS,
-// DMARC) and the main host's TLSA from the applied document, renders each
+// DMARC) from the applied document (MailState v2: the host name, the
+// relay's SPF include and the DKIM rotation come from it), renders each
 // domain's wanted mail set (dnsset), and answers status, the well-known
 // files and the actions (contract §19.5, §19.7). State lives in
 // state.json's ext.
@@ -8,6 +9,7 @@ package machines
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -27,7 +29,6 @@ import (
 	"github.com/portcullis/mailctl/internal/resolve"
 	"github.com/portcullis/mailctl/internal/stalwart"
 	"github.com/portcullis/mailctl/internal/state"
-	"github.com/portcullis/mailctl/internal/tlsa"
 	"golang.org/x/net/publicsuffix"
 )
 
@@ -36,8 +37,6 @@ const (
 	extDKIM   = "dkim"
 	extMTASTS = "mtasts"
 	extDMARC  = "dmarc"
-	extTLSA   = "tlsa"
-	extDNSSEC = "main_dnssec"
 )
 
 // ErrNotMailDomain: not a domain of the applied document (404).
@@ -50,12 +49,8 @@ func (e ErrNothingToDo) Error() string { return e.Why }
 
 // Config is what the machines need besides the document.
 type Config struct {
-	MainDomain  string
-	Hostname    string
-	SPFInclude  string
-	Resolvers   []string // the public resolvers (DKIM visibility)
-	RotateEvery time.Duration
-	Reachable   bool // the well-known router is on websecure (not VPN-only)
+	Resolvers []string // the public resolvers (DKIM visibility)
+	Reachable bool     // the well-known router is on websecure (not VPN-only)
 }
 
 // Machines is the driver.
@@ -74,6 +69,12 @@ type Machines struct {
 	// Verify authenticates report messages (nil: every report is
 	// unauthenticated, display only).
 	Verify Verify
+	// Serving reads the leaf the listeners serve (MailStatus.cert).
+	Serving func(ctx context.Context) (*x509.Certificate, error)
+
+	certMu   sync.Mutex
+	certSeen *CertStatus
+	certAt   time.Time
 
 	mu   sync.Mutex
 	wake chan struct{}
@@ -121,7 +122,22 @@ func (m *Machines) Trigger() {
 	}
 }
 
-// Loop runs a pass every 5 minutes and on Trigger.
+// PendingRecheck: the pass interval while a DKIM key waits for its
+// records (a few TXT lookups).
+const PendingRecheck = 30 * time.Second
+
+// loopWait: 5 minutes, PendingRecheck while a DKIM key is pending.
+func (m *Machines) loopWait() time.Duration {
+	for _, k := range read[dkim.State](m.Store.Get(), extDKIM).Keys {
+		if k.Stage == dkim.Pending {
+			return PendingRecheck
+		}
+	}
+	return 5 * time.Minute
+}
+
+// Loop runs a pass every 5 minutes (PendingRecheck while a DKIM key is
+// pending) and on Trigger.
 func (m *Machines) Loop(ctx context.Context) {
 	for {
 		if err := m.Step(ctx); err != nil && m.Logf != nil {
@@ -131,7 +147,7 @@ func (m *Machines) Loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-m.wake:
-		case <-time.After(5 * time.Minute):
+		case <-time.After(m.loopWait()):
 		}
 	}
 }
@@ -417,14 +433,14 @@ const MinReporters = 2
 // certificate check), never on reports (ruling); reports from
 // MinReporters authenticated reporters only hold testing from becoming
 // enforce, which never weakens the current policy.
-func (m *Machines) inputs(d state.Domain, rs []Report, now time.Time) mtasts.Inputs {
+func (m *Machines) inputs(d state.Domain, host string, rs []Report, now time.Time) mtasts.Inputs {
 	cert := func() (bool, bool) {
 		if m.CertOK == nil {
 			return true, true
 		}
 		return m.CertOK()
 	}
-	return mtasts.Inputs{Mail: d.Mail, Reachable: m.Cfg.Reachable, MX: m.Cfg.Hostname,
+	return mtasts.Inputs{Mail: d.Mail, Reachable: m.Cfg.Reachable, MX: host,
 		Failure: func(time.Time) bool { ok, known := cert(); return known && !ok },
 		Blocking: func(since time.Time) bool {
 			ok, known := cert()
@@ -479,16 +495,17 @@ func (m *Machines) Step(ctx context.Context) error {
 	for _, d := range doc.Domains {
 		if rerr == nil {
 			// A failed read never downgrades (no reports = no failures).
-			sts[d.Name] = mtasts.Step(sts[d.Name], m.inputs(d, reps, now), now)
+			sts[d.Name] = mtasts.Step(sts[d.Name], m.inputs(d, doc.MailHostname, reps, now), now)
 		}
 		if _, ok := dms[d.Name]; !ok {
 			dms[d.Name] = dmarc.Start(d.DMARCStart, now)
 		}
+		dms[d.Name] = dmarc.AtLeast(dms[d.Name], d.DMARCFloor, now)
 		dms[d.Name] = dmarc.Observe(dms[d.Name], dmarcReports(m.Accepted(reps, "dmarc", d.Name, dms[d.Name].Since, now)))
 		if d.Mail != state.MailOn || ids[d.Name] == "" {
 			continue
 		}
-		next, acts := dkim.Step(ks, d.Name, now, m.Cfg.RotateEvery, func(n, v string) bool { return m.visible(ctx, n, v) })
+		next, acts := dkim.Step(ks, d.Name, now, state.Period(doc.DKIMRotate), func(n, v string) bool { return m.visible(ctx, n, v) })
 		next, err := m.execute(ctx, ks, next, acts, ids[d.Name])
 		if err != nil {
 			errs = append(errs, fmt.Errorf("dkim %s: %w", d.Name, err))
@@ -503,7 +520,7 @@ func (m *Machines) Step(ctx context.Context) error {
 	}
 	for name := range sts {
 		if _, ok := listed[name]; !ok {
-			sts[name] = mtasts.Step(sts[name], m.inputs(state.Domain{Name: name, Mail: state.MailOff}, reps, now), now)
+			sts[name] = mtasts.Step(sts[name], m.inputs(state.Domain{Name: name, Mail: state.MailOff}, doc.MailHostname, reps, now), now)
 		}
 	}
 	ks, rerrs := m.retireDomains(ctx, doc, ids, ks, sts, listed)
@@ -756,45 +773,26 @@ func (m *Machines) create(ctx context.Context, k dkim.Key, domainID string) (str
 	return id, got[0].PublicKey, nil
 }
 
-// mainSecure is the main zone's DNSSEC state: the newest mailctl holds
-// (mailctl rotate's, within 48 h, else the document's).
-func (m *Machines) mainState(p state.Persistent) string {
-	r := read[dnssecRec](p, extDNSSEC)
-	if r.State != "" && m.now().Sub(r.At) < 48*time.Hour {
-		return r.State
-	}
-	if p.Doc != nil {
-		for _, d := range p.Doc.Domains {
-			if d.Name == m.Cfg.MainDomain {
-				return d.DNSSEC
-			}
-		}
-	}
-	return "unknown"
-}
-
 // DNSSet is GET /v1/dns/{domain}.
 type DNSSet struct {
 	Domain  string          `json:"domain"`
 	Records []dnsset.Record `json:"records"`
 	DKIM    string          `json:"dkim"`
-	TLSA    string          `json:"tlsa"`
 }
 
 // DNSHashes is MailStatus.dns: every mail domain of the document (the
 // main one included) → sha256 of the canonical record set Set serves at
 // /v1/dns/<domain> (records sorted by name, type, value, TTL). It changes
 // whenever the set does (a key made or moving stage, the MTA-STS id, a
-// DMARC step, the TLSA …): the Hub rewrites an added domain's set then.
-// Cached per state revision and the main zone's DNSSEC state (the one
-// input Set reads besides the state: its 48 h freshness).
+// DMARC step …): the Hub rewrites the domain's set then. Cached per
+// state revision.
 func (m *Machines) DNSHashes() map[string]string {
 	p, rev := m.Store.GetRev()
 	out := map[string]string{}
 	if p.Doc == nil {
 		return out
 	}
-	key := fmt.Sprintf("%d|%s", rev, m.mainState(p))
+	key := fmt.Sprint(rev)
 	m.hashMu.Lock()
 	defer m.hashMu.Unlock()
 	if m.hashes != nil && m.hashKey == key {
@@ -855,86 +853,22 @@ func (m *Machines) SetFor(domain string, noWildcard bool) (DNSSet, error) {
 	ks := read[dkim.State](p, extDKIM)
 	sts := read[map[string]mtasts.Domain](p, extMTASTS)
 	dms := read[map[string]dmarc.Domain](p, extDMARC)
-	main := domain == m.Cfg.MainDomain
-	in := dnsset.Input{Domain: domain, Main: main, Hostname: m.Cfg.Hostname, SPFInclude: m.Cfg.SPFInclude, Mail: dom.Mail,
+	in := dnsset.Input{Domain: domain, Hostname: p.Doc.MailHostname, SPFInclude: p.Doc.SPFInclude(), Mail: dom.Mail,
 		DMARC: dms[domain].Policy, MTASTSID: sts[domain].ID, NoWildcard: noWildcard}
 	if in.DMARC == "" {
 		in.DMARC = dmarc.Start(dom.DMARCStart, m.now()).Policy
 	}
+	// Never below the floor, also before a pass raised the stage (X-H1).
+	in.DMARC = dmarc.AtLeast(dmarc.Domain{Policy: in.DMARC}, dom.DMARCFloor, m.now()).Policy
 	for _, k := range dkim.Published(ks, domain) {
 		in.DKIM = append(in.DKIM, dnsset.DKIMRecord{Selector: k.Selector, Value: dkim.TXT(k)})
 	}
-	out := DNSSet{Domain: domain, DKIM: "auto", TLSA: "withheld: not the mail host's zone"}
-	if main {
-		st := m.mainState(p)
-		if st == "secure" {
-			in.TLSA = tlsa.Wanted(state.TLSA(p), true)
-			out.TLSA = "published"
-			if len(in.TLSA) == 0 {
-				out.TLSA = "withheld: the mail certificate's key isn't known yet"
-			}
-		} else {
-			out.TLSA = "withheld: dnssec " + st
-		}
-	}
+	out := DNSSet{Domain: domain, DKIM: "auto"}
 	out.Records = dnsset.Wanted(in)
 	if out.Records == nil {
 		out.Records = []dnsset.Record{}
 	}
 	return out, nil
-}
-
-// RotateIn is `mailctl rotate --json`'s stdin.
-type RotateIn struct {
-	DNSSECState string `json:"dnssec_state"`
-	SPKI        struct {
-		Current string `json:"current"`
-		Next    string `json:"next"`
-	} `json:"spki"`
-}
-
-// RotateOut is its answer: the main domain's set and the mail-cert steps due.
-type RotateOut struct {
-	DNSSet
-	NextKey   bool `json:"next_key"`
-	SwitchKey bool `json:"switch_key"`
-}
-
-// Rotate is the daily timer's step.
-func (m *Machines) Rotate(ctx context.Context, in RotateIn) (RotateOut, error) {
-	now := m.now()
-	var sw bool
-	if err := m.Store.Update(func(s *state.Persistent) error {
-		ts, switchKey := tlsa.Update(state.TLSA(*s), strings.ToLower(in.SPKI.Current), strings.ToLower(in.SPKI.Next), now)
-		sw = switchKey
-		put(s, extTLSA, ts)
-		if in.DNSSECState != "" {
-			put(s, extDNSSEC, dnssecRec{State: in.DNSSECState, At: now})
-		}
-		s.TimerSeenAt = &now
-		return nil
-	}); err != nil {
-		return RotateOut{}, err
-	}
-	err := m.Step(ctx)
-	set, serr := m.Set(m.Cfg.MainDomain)
-	if serr != nil {
-		return RotateOut{}, errors.Join(err, serr)
-	}
-	return RotateOut{DNSSet: set, SwitchKey: sw}, err
-}
-
-// RecordKey records the mail certificate's current SPKI only (`mailctl
-// tls-key`: mail enable, before the Hub's first document — Rotate needs
-// one for the main domain's set). The same TLSA update as Rotate's with
-// no next key; nothing else (no pass, not the timer's visit).
-func (m *Machines) RecordKey(current string) error {
-	now := m.now()
-	return m.Store.Update(func(s *state.Persistent) error {
-		ts, _ := tlsa.Update(state.TLSA(*s), strings.ToLower(current), "", now)
-		put(s, extTLSA, ts)
-		return nil
-	})
 }
 
 // DKIMRotate is the dkim-rotate action.
@@ -1016,7 +950,7 @@ func (m *Machines) MTASTSEnforce(ctx context.Context, domain string) error {
 	}
 	return m.Store.Update(func(s *state.Persistent) error {
 		sts := read[map[string]mtasts.Domain](*s, extMTASTS)
-		d, err := mtasts.DoEnforce(sts[domain], m.inputs(dom, reps, m.now()), m.now())
+		d, err := mtasts.DoEnforce(sts[domain], m.inputs(dom, p.Doc.MailHostname, reps, m.now()), m.now())
 		if err != nil {
 			return ErrNothingToDo{err.Error()}
 		}
@@ -1071,7 +1005,7 @@ func (m *Machines) Statuses(ctx context.Context) ([]DKIMStatus, []MTASTSStatus, 
 				mode = mtasts.Off
 			}
 			ms = append(ms, MTASTSStatus{Domain: d.Name, Mode: mode, Since: st.Since,
-				EnforceReady: mtasts.EnforceReady(st, m.inputs(d, reps, m.now()), m.now()) == nil})
+				EnforceReady: mtasts.EnforceReady(st, m.inputs(d, p.Doc.MailHostname, reps, m.now()), m.now()) == nil})
 			dm := dms[d.Name]
 			var prop *string
 			if pp := dmarc.Proposed(dm, m.now()); pp != "" {
@@ -1095,8 +1029,13 @@ func (m *Machines) Policy(domain string) string {
 	return read[map[string]mtasts.Domain](m.Store.Get(), extMTASTS)[domain].Policy
 }
 
-// Hostname is MAIL_HOSTNAME.
-func (m *Machines) Hostname() string { return m.Cfg.Hostname }
+// Hostname is MAIL_HOSTNAME: the accepted document's mail_hostname ("" = none yet).
+func (m *Machines) Hostname() string {
+	if p := m.Store.Get(); p.Doc != nil {
+		return p.Doc.MailHostname
+	}
+	return ""
+}
 
 func init() {
 	for _, u := range []stalwart.Use{
@@ -1123,10 +1062,3 @@ func (m *Machines) Reports(ctx context.Context) ([]Report, error) { return m.cac
 
 // Keys are every domain's DKIM keys as the state holds them.
 func (m *Machines) Keys() []dkim.Key { return read[dkim.State](m.Store.Get(), extDKIM).Keys }
-
-// TLSAWanted are the SPKIs published at _25._tcp.<MAIL_HOSTNAME> right now
-// (none unless the main zone is secure).
-func (m *Machines) TLSAWanted() []string {
-	p := m.Store.Get()
-	return tlsa.Wanted(state.TLSA(p), m.mainState(p) == "secure")
-}

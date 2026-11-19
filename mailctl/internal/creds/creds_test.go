@@ -68,7 +68,7 @@ func TestCreateFields(t *testing.T) {
 	if cr.ExpiresAt == nil || !cr.ExpiresAt.Equal(exp.Truncate(time.Second)) {
 		t.Fatalf("expires %v", cr.ExpiresAt)
 	}
-	list, _ := List(context.Background(), c, id)
+	list, _ := List(context.Background(), c, id, "6f1c2a9e-3b4d-4e5f-8a7b-1c2d3e4f5a6b")
 	if len(list) != 1 || list[0].Label != "laptop" || list[0].LastUsed != nil {
 		t.Fatalf("list %+v", list)
 	}

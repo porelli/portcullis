@@ -3,7 +3,7 @@
 // wanted) → active once both public resolvers serve the exact TXT (the
 // previous active key becomes retiring at the same step) → retired after
 // 7 days (the TXT goes) → destroyed 30 days later. Rotation every
-// MAIL_DKIM_ROTATE, or at once on dkim-rotate. Step is pure; the caller
+// the document's dkim_rotate (Settings → Mail), or at once on dkim-rotate. Step is pure; the caller
 // executes its actions in Stalwart and commits the returned state.
 package dkim
 

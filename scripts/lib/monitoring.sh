@@ -76,8 +76,6 @@ monitoring_prepare() {
     '[{targets: ["auth." + $d + ":443"], labels: {probe: "public-cert"}}]' > "$m/prometheus/tls-targets.json"
   # wg-targets.json: the wg job's target only while the profile is on (V13).
   if declare -F vpn_prom_targets >/dev/null; then vpn_prom_targets; fi
-  # mail-targets.json + the metrics password copy: only with the mail profile.
-  if declare -F mail_prom_targets >/dev/null; then mail_prom_targets; fi
   alertmanager_config > "$m/alertmanager/alertmanager.yml.tmp"
   if ! cmp -s "$m/alertmanager/alertmanager.yml.tmp" "$m/alertmanager/alertmanager.yml"; then
     cat "$m/alertmanager/alertmanager.yml.tmp" > "$m/alertmanager/alertmanager.yml"

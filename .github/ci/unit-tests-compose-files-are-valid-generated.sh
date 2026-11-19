@@ -94,7 +94,7 @@ binds() {  # <config json> — "service target read_only selinux" of every proje
 }
 [ -z "$(binds "$CFG_ALL" | awk '$4 != "-"')" ] || { echo "FAIL: docker-compose.yml relabels a bind (selinux): only the overlay may"; exit 1; }
 NBINDS="$(binds "$CFG_ALL" | wc -l | tr -d ' ')"
-[ "$NBINDS" = 60 ] || { echo "FAIL: expected 60 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
+[ "$NBINDS" = 51 ] || { echo "FAIL: expected 51 project binds in docker-compose.yml, got $NBINDS: update docker-compose.podman-selinux.yml (and this count)"; exit 1; }
 diff <({ binds "$CFG_ALL" | grep -vx 'hub /project true -' | awk '{print $1, $2, $3}'; echo "hub /project/group-gate/group-gate-map.conf true"; } | sort) \
      <(binds "$OV_ALL" | awk '{print $1, $2, $3}' | sort) \
   || { echo "FAIL: docker-compose.podman-selinux.yml must re-declare every project bind (but the Hub's /project root) with the same target / read_only, plus the Hub's map file"; exit 1; }
@@ -630,7 +630,7 @@ echo "$CFG_ALL" | jq -e '([.services | to_entries[] | select((.value.networks //
     and .networks["portcullis-metrics-hub"].internal == true
     and .services.hub.networks["portcullis-metrics-hub"].aliases == ["hub-metrics"]
     and .services.hub.environment.HUB_METRICS_ADDR == "hub-metrics:9100"
-    and ([.services.hub.networks | keys[]] | sort == ["portcullis", "portcullis-domains", "portcullis-link", "portcullis-mailctl", "portcullis-mcp", "portcullis-metrics-hub", "socket-proxy-hub"])' >/dev/null \
+    and ([.services.hub.networks | keys[]] | sort == ["portcullis", "portcullis-domains", "portcullis-link", "portcullis-mail-api", "portcullis-mcp", "portcullis-metrics-hub", "socket-proxy-hub"])' >/dev/null \
   || { echo "FAIL: portcullis-metrics-hub must hold exactly hub (alias hub-metrics, HUB_METRICS_ADDR) and prometheus, internal"; exit 1; }
 # shellcheck disable=SC2034  # read through ${!c} below
 CFG_PODMAN_ALL="$(CONTAINER_RUNTIME=podman PORTCULLIS_ENGINE_SOCKET="$PODMAN_SOCK" docker compose -f docker-compose.yml -f docker-compose.podman.yml --profile '*' config --format json)"
@@ -655,7 +655,7 @@ PORTCULLIS_VPN_MODE=server PORTCULLIS_VPN_PUBLIC_ENROL=false docker compose -f d
 # PORTCULLIS_VPN_RUNTIME_POOLS: runtime_export, test_shell_libs), with the
 # defaults and with every subnet moved. Compared word by word.
 for pools in "" "10.88.0.0/16 10.89.0.0/16"; do
-  for over in "" "PORTCULLIS_PROXY_SUBNET=10.80.0.0/24 PORTCULLIS_PROXY_IP_RANGE=10.80.0.128/25 PORTCULLIS_TRAEFIK_IP=10.80.0.2 PORTCULLIS_AUTH_SUBNET=10.81.0.0/28 PORTCULLIS_DOMAINS_SUBNET=10.82.0.0/28 PORTCULLIS_MCP_SUBNET=10.83.0.0/28 PORTCULLIS_VPN_NET=10.84.0.0/26 PORTCULLIS_VPN_EDGE_SUBNET=10.85.0.0/28 PORTCULLIS_MAIL_SUBNET=10.86.0.0/28 PORTCULLIS_MAILCTL_SUBNET=10.87.0.0/28 PORTCULLIS_LINK_NET=10.79.0.0/29 PORTCULLIS_LINK_DATA_NET=10.79.1.0/26 PORTCULLIS_LINK_DATA_IP_RANGE=10.79.1.32/27"; do
+  for over in "" "PORTCULLIS_PROXY_SUBNET=10.80.0.0/24 PORTCULLIS_PROXY_IP_RANGE=10.80.0.128/25 PORTCULLIS_TRAEFIK_IP=10.80.0.2 PORTCULLIS_AUTH_SUBNET=10.81.0.0/28 PORTCULLIS_DOMAINS_SUBNET=10.82.0.0/28 PORTCULLIS_MCP_SUBNET=10.83.0.0/28 PORTCULLIS_VPN_NET=10.84.0.0/26 PORTCULLIS_VPN_EDGE_SUBNET=10.85.0.0/28 PORTCULLIS_MAIL_API_SUBNET=10.87.0.0/28 PORTCULLIS_LINK_NET=10.79.0.0/29 PORTCULLIS_LINK_DATA_NET=10.79.1.0/26 PORTCULLIS_LINK_DATA_IP_RANGE=10.79.1.32/27"; do
     # shellcheck disable=SC2086  # VAR=value words
     HUBLIST="$(env $over PORTCULLIS_VPN_RUNTIME_POOLS="$pools" bash -c 'source scripts/lib/common.sh; source scripts/lib/network.sh; vpn_reserved_ranges')"
     # shellcheck disable=SC2086
@@ -675,6 +675,6 @@ bash -c 'source scripts/lib/common.sh; source scripts/lib/network.sh; env_load; 
 # three set to distinct values, every router shows its own class.
 EP_ROUTERS="$(PORTCULLIS_EP_CORE=x-core PORTCULLIS_EP_ADMIN=x-admin PORTCULLIS_EP_ENROL=x-enrol PORTCULLIS_WEB_CORE=w-core PORTCULLIS_WEB_ADMIN=w-admin PORTCULLIS_WEB_ENROL=w-enrol docker compose -f docker-compose.yml --profile '*' config --format json \
     | jq -r '[.services[].labels // {} | to_entries[] | select(.key | test("^traefik\\.http\\.routers\\.[^.]+\\.entrypoints$")) | "\(.key | split(".")[3])=\(.value)"] | sort | join(" ")')"
-WANT_EP="core-vpn-required=websecure dashboard-vpn=vpnsecure dashboard=w-admin enroll-invite=x-enrol grafana-metrics-vpn=vpnsecure grafana-metrics=w-admin hub-mcp=x-admin hub-vpn=vpnsecure hub=w-admin keycloak-admin-vpn-required=websecure keycloak-admin-vpn=vpnsecure keycloak-admin=w-admin keycloak-resources=x-enrol keycloak=x-enrol lldap=x-admin mail-wellknown=x-core mcp=x-admin oauth2-callback=x-enrol people-cli=x-enrol people-mcp=x-admin people-vpn-enrol-vpn=vpnsecure people-vpn-enrol=w-enrol people-vpn=vpnsecure people=w-core portal-vpn=vpnsecure portal=w-core"
+WANT_EP="core-vpn-required=websecure dashboard-vpn=vpnsecure dashboard=w-admin enroll-invite=x-enrol grafana-metrics-vpn=vpnsecure grafana-metrics=w-admin hub-mcp=x-admin hub-vpn=vpnsecure hub=w-admin keycloak-admin-vpn-required=websecure keycloak-admin-vpn=vpnsecure keycloak-admin=w-admin keycloak-resources=x-enrol keycloak=x-enrol lldap=x-admin mcp=x-admin oauth2-callback=x-enrol people-cli=x-enrol people-mcp=x-admin people-vpn-enrol-vpn=vpnsecure people-vpn-enrol=w-enrol people-vpn=vpnsecure people=w-core portal-vpn=vpnsecure portal=w-core"
 [ "$EP_ROUTERS" = "$WANT_EP" ] || { echo "FAIL: core router entrypoint classes: got $EP_ROUTERS, want $WANT_EP"; exit 1; }
 echo "PASS: socket proxies, hub proxy secret, hardening, auth network, monitoring wiring, domains service, mcp-gate, session store"

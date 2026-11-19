@@ -1,0 +1,317 @@
+package bootstrap
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// jobServer is the fake mail server behind the job: recovery mode accepts
+// the recovery admin on /jmap; a normal start refuses it unless leak.
+type jobServer struct {
+	f        *fakeStalwart
+	mu       sync.Mutex
+	up       bool
+	recovery bool
+	leak     bool // a normal start that still accepts the recovery admin
+	starts   [][]string
+	// bearer counts API-key (Bearer) requests: real Stalwart refuses one
+	// from an address outside the key's allowedIps (the adapter's /32
+	// only), so the job, on loopback, must never send one (Ruling R2-N2b).
+	bearer int
+}
+
+func (s *jobServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	up, rec, leak := s.up, s.recovery, s.leak
+	s.mu.Unlock()
+	if !up {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+	if r.URL.Path == "/healthz/live" {
+		return
+	}
+	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+		// As real Stalwart: the key's allowedIps hold only the adapter's
+		// address, never this loopback client (security.ip-unauthorized).
+		s.mu.Lock()
+		s.bearer++
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	// As Stalwart 1.1 (measured): a recovery admin whose password starts
+	// with "_" is refused (401, nothing logged), whatever the mode.
+	if u, pw, _ := r.BasicAuth(); u == RecoveryUser && strings.HasPrefix(pw, "_") {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	if u, _, _ := r.BasicAuth(); u == RecoveryUser && !rec {
+		if leak {
+			w.Write([]byte(`{"methodResponses":[]}`))
+		} else {
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+		return
+	}
+	s.f.ServeHTTP(w, r)
+}
+
+func (s *jobServer) start(_ context.Context, env []string) (func() error, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.starts = append(s.starts, env)
+	s.up, s.recovery = true, false
+	for _, e := range env {
+		if e == "STALWART_RECOVERY_MODE=1" {
+			s.recovery = true
+		}
+	}
+	return func() error { s.mu.Lock(); s.up = false; s.mu.Unlock(); return nil }, nil
+}
+
+func newJob(t *testing.T, s *jobServer) *Job {
+	srv := httptest.NewServer(s)
+	t.Cleanup(srv.Close)
+	return &Job{URL: srv.URL, DataDir: t.TempDir(), StoreDir: t.TempDir(), SessionFile: filepath.Join(t.TempDir(), "recovery-session"),
+		ServerImage: "docker.io/stalwartlabs/stalwart:v1.1.0@sha256:aa", Params: params(), Start: s.start, Ready: 5 * time.Second}
+}
+
+// The job applies the plan in recovery mode, writes the key 0600, and
+// exits nil only once a normal start refuses the recovery login.
+func TestBootstrapJobVerifiesRecoveryRefused(t *testing.T) {
+	s := &jobServer{f: newFake()}
+	j := newJob(t, s)
+	if err := j.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(KeyFile(j.DataDir))
+	b, _ := os.ReadFile(KeyFile(j.DataDir))
+	if err != nil || fi.Mode().Perm() != 0o640 || !strings.HasPrefix(string(b), "API_") {
+		t.Fatalf("key %v %v %q", err, fi, b)
+	}
+	if len(s.starts) != 2 || !strings.HasPrefix(strings.Join(s.starts[0], " "), "STALWART_RECOVERY_MODE=1 STALWART_RECOVERY_ADMIN=portcullis-recovery:") ||
+		strings.Join(s.starts[1], " ") != "STALWART_UPDATE_ROLE_PERMISSIONS=true" {
+		t.Fatalf("starts %q", s.starts)
+	}
+	if _, err := os.Stat(j.SessionFile); !os.IsNotExist(err) {
+		t.Fatal("the recovery session file outlived the job")
+	}
+	if s.up {
+		t.Fatal("the server was left running")
+	}
+	// Ruling T17-c / R-H2: the store is marked; a cold start takes the
+	// lock, sees the marker, and only checks the key on one normal start
+	// (no plan, no settings touched).
+	if !markerValid(j.StoreDir) {
+		t.Fatal("no marker after the plan")
+	}
+	sets := func() string {
+		s.f.mu.Lock()
+		defer s.f.mu.Unlock()
+		var out []string
+		for _, c := range s.f.calls {
+			if strings.Contains(c, "/set") && !strings.Contains(c, "x:ApiKey/set") {
+				out = append(out, c)
+			}
+		}
+		return strings.Join(out, ",")
+	}
+	ino := inode(t, KeyFile(j.DataDir))
+	s.starts = nil
+	s.f.calls = nil
+	if err := j.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b2, _ := os.ReadFile(KeyFile(j.DataDir))
+	// R2-N2b: the key is judged by the recovery admin (one recovery start,
+	// then the normal start), never used; nothing is written.
+	if string(b2) != string(b) || inode(t, KeyFile(j.DataDir)) != ino || len(s.starts) != 2 || len(s.starts[1]) != 0 || sets() != "" ||
+		strings.Contains(strings.Join(s.f.calls, ","), "x:ApiKey/set") {
+		t.Fatalf("second run: key %q starts %q sets %s", b2, s.starts, sets())
+	}
+	// A server image change: the normal start runs the role update.
+	j.ServerImage = "docker.io/stalwartlabs/stalwart:v1.1.1@sha256:bb"
+	s.starts = nil
+	if err := j.Run(context.Background()); err != nil || len(s.starts) != 2 || strings.Join(s.starts[1], " ") != "STALWART_UPDATE_ROLE_PERMISSIONS=true" {
+		t.Fatalf("image change: %v %q", err, s.starts)
+	}
+	// R-H2: a marked store whose key is missing, empty or out of scope
+	// (the store's key widened) mints a new key only: the recovery start,
+	// the normal start; no object but the API key is written.
+	widen := func() {
+		s.f.mu.Lock()
+		for st, objs := range s.f.objs {
+			if strings.HasPrefix(st, "ApiKey@") {
+				for _, k := range objs {
+					k["allowedIps"] = map[string]any{"0.0.0.0/0": true}
+				}
+			}
+		}
+		s.f.mu.Unlock()
+	}
+	for name, lose := range map[string]func(){
+		"missing":      func() { os.Remove(KeyFile(j.DataDir)) },
+		"empty":        func() { os.WriteFile(KeyFile(j.DataDir), nil, 0o640) },
+		"out of scope": widen,
+	} {
+		lose()
+		old, _ := os.ReadFile(KeyFile(j.DataDir))
+		s.starts = nil
+		s.f.calls = nil
+		if err := j.Run(context.Background()); err != nil || len(s.starts) != 2 || sets() != "" || !markerValid(j.StoreDir) {
+			t.Fatalf("%s key: %v starts %q sets %s", name, err, s.starts, sets())
+		}
+		if k, _ := os.ReadFile(KeyFile(j.DataDir)); !strings.HasPrefix(string(k), "API_") || string(k) == string(old) {
+			t.Fatalf("%s key: new key %q", name, k)
+		}
+	}
+	// A key file whose secret isn't the store's key can't be told by the
+	// job without using it: in scope = in place; the adapter's first call
+	// finds out and fails closed.
+	os.WriteFile(KeyFile(j.DataDir), []byte("API_stale"), 0o640)
+	s.starts = nil
+	if err := j.Run(context.Background()); err != nil || len(s.starts) != 2 {
+		t.Fatalf("stale key file: %v %q", err, s.starts)
+	}
+	// No temporary key file left behind (written by rename).
+	if _, err := os.Stat(KeyFile(j.DataDir) + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("a temporary key file is left")
+	}
+	// A marked store without mailctl's account: fail closed (no plan).
+	s.f.mu.Lock()
+	for id, a := range s.f.objs["Account"] {
+		if a["name"] == MailctlAccount {
+			delete(s.f.objs["Account"], id)
+		}
+	}
+	s.f.mu.Unlock()
+	os.Remove(KeyFile(j.DataDir))
+	s.f.calls = nil
+	if err := j.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "no mailctl account") || sets() != "" {
+		t.Fatalf("no account: %v sets %s", err, sets())
+	}
+	// An invalid marker runs the plan again (fail closed).
+	os.WriteFile(filepath.Join(j.StoreDir, planMarker), []byte(`{"version":2}`), 0o600)
+	s.starts = nil
+	if err := j.Run(context.Background()); err != nil || len(s.starts) != 2 {
+		t.Fatalf("invalid marker: %v %q", err, s.starts)
+	}
+	// The key at MAILCTL_API_KEY_FILE when set.
+	j.KeyFile = filepath.Join(t.TempDir(), "key")
+	os.Remove(filepath.Join(j.StoreDir, planMarker))
+	if err := j.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(j.KeyFile); err != nil || fi.Mode().Perm() != 0o640 {
+		t.Fatalf("key file %v %v", fi, err)
+	}
+	// A held lock: the job gives up at its deadline, never hangs (L1).
+	f, _ := os.OpenFile(filepath.Join(j.StoreDir, jobLock), os.O_RDWR|os.O_CREATE, 0o600)
+	syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	err = j.Run(ctx)
+	cancel()
+	syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	f.Close()
+	if err == nil || !strings.Contains(err.Error(), "locked by another bootstrap") {
+		t.Fatalf("held lock: %v", err)
+	}
+	// No store volume: refused before anything starts.
+	j2 := newJob(t, &jobServer{f: newFake()})
+	j2.StoreDir = filepath.Join(t.TempDir(), "missing")
+	if err := j2.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "store volume") {
+		t.Fatalf("missing store: %v", err)
+	}
+	// A normal start that still accepts the recovery admin fails the job,
+	// and leaves the store unmarked.
+	os.Remove(filepath.Join(j.StoreDir, planMarker))
+	s.leak = true
+	if err := j.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "still works") {
+		t.Fatalf("leak: %v", err)
+	}
+	if markerValid(j.StoreDir) {
+		t.Fatal("a failed plan marked the store")
+	}
+	// A server that never comes up fails it too, and stops it.
+	s2 := &jobServer{f: newFake()}
+	j2 = newJob(t, s2)
+	j2.Ready = 1500 * time.Millisecond
+	j2.Start = func(ctx context.Context, env []string) (func() error, error) { return func() error { return nil }, nil }
+	if err := j2.Run(context.Background()); err == nil {
+		t.Fatal("no server: accepted")
+	}
+	// Ruling R2-N2b: not one request with the API key, ever (the fake, as
+	// real Stalwart, refuses it from loopback).
+	if s.bearer != 0 {
+		t.Fatalf("the job used the API key %d times", s.bearer)
+	}
+}
+
+// Ruling R-H2b: an unmarked store holding data (a lost marker) never gets
+// the document-less base plan: the job fails closed and writes nothing.
+// The plan's own objects (mailctl's account, the parking domain) don't
+// count, so a first plan that failed half way runs again.
+func TestBootstrapJobRefusesPlanOnUnmarkedStoreWithData(t *testing.T) {
+	for name, seed := range map[string]func(f *fakeStalwart){
+		"account": func(f *fakeStalwart) { f.put("Account", map[string]any{"name": "alice", "domainId": "d1"}) },
+		"domain":  func(f *fakeStalwart) { f.put("Domain", map[string]any{"name": "example.org"}) },
+		// mailctl's name on another domain isn't the plan's account (L-f).
+		"mailctl elsewhere": func(f *fakeStalwart) {
+			f.put("Domain", map[string]any{"name": ParkingDomain})
+			f.put("Account", map[string]any{"name": MailctlAccount, "domainId": "elsewhere"})
+		},
+	} {
+		s := &jobServer{f: newFake()}
+		seed(s.f)
+		j := newJob(t, s)
+		err := j.Run(context.Background())
+		var sets []string
+		for _, c := range s.f.calls {
+			if strings.Contains(c, "/set") {
+				sets = append(sets, c)
+			}
+		}
+		if err == nil || !strings.Contains(err.Error(), "R-H2b") || len(sets) != 0 || markerValid(j.StoreDir) {
+			t.Fatalf("%s: %v sets %q marked %v", name, err, sets, markerValid(j.StoreDir))
+		}
+		if _, err := os.Stat(KeyFile(j.DataDir)); !os.IsNotExist(err) {
+			t.Fatalf("%s: a key was written", name)
+		}
+	}
+	// Only the plan's own objects: the plan runs (a half-done first plan).
+	s := &jobServer{f: newFake()}
+	d9 := s.f.put("Domain", map[string]any{"name": ParkingDomain})
+	s.f.put("Account", map[string]any{"name": MailctlAccount, "domainId": d9})
+	j := newJob(t, s)
+	if err := j.Run(context.Background()); err != nil || !markerValid(j.StoreDir) {
+		t.Fatalf("plan-only objects: %v", err)
+	}
+}
+
+// Stalwart 1.1 refuses a recovery password starting with "_" (1 in 64 of
+// the base64url ones: a cold start failed "x:Domain/query: HTTP 401" now
+// and then). The job's passwords are hex: 400 cold starts all pass.
+func TestBootstrapJobRecoveryPasswordAlwaysAccepted(t *testing.T) {
+	s := &jobServer{f: newFake()}
+	j := newJob(t, s)
+	for i := 0; i < 400; i++ {
+		if err := j.Run(context.Background()); err != nil {
+			t.Fatalf("run %d: %v", i, err)
+		}
+	}
+	for i := 0; i < 2000; i++ {
+		pw, err := recoveryPassword()
+		if err != nil || len(pw) != 64 || strings.Trim(pw, "0123456789abcdef") != "" {
+			t.Fatalf("recovery password %q %v", pw, err)
+		}
+	}
+}

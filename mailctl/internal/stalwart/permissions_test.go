@@ -46,3 +46,18 @@ func TestMailctlRoleHasNoSelfWidening(t *testing.T) {
 		}
 	}
 }
+
+// The built-in User role every account is created with holds the passkey
+// set on Stalwart 1.1; Stalwart refuses to grant what the caller lacks, so
+// mailctl's role must hold it (core CI: every account create was refused).
+func TestMailctlRoleCanGrantUserRole(t *testing.T) {
+	have := map[string]bool{}
+	for _, p := range MailctlRolePermissions {
+		have[p] = true
+	}
+	for _, p := range []string{"sysPasskeyGet", "sysPasskeyCreate", "sysPasskeyUpdate", "sysPasskeyDestroy", "sysPasskeyQuery"} {
+		if !have[p] {
+			t.Errorf("mailctl's role lacks %s (the User role it grants holds it)", p)
+		}
+	}
+}
