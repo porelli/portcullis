@@ -1520,7 +1520,14 @@ def confirm_pending_removal() -> None:
             return False
         h = (json.loads(run("./portcullis", "mail", "status", "--json", timeout=120).stdout).get("hub") or {})
         return h.get("reachable") and h.get("generation") and h.get("applied_generation") == h.get("generation")
-    until("the mail sync converged after the confirmation", converged, 300, every=10)
+    try:
+        until("the mail sync converged after the confirmation", converged, 300, every=10)
+    except AssertionError:
+        # What holds it (usernames and uuids only, no secret).
+        pr = hub_ok_as("GET", "/api/mail/settings", "root").get("pending_removal")
+        kinds = sorted({f.get("kind") for f in (hub_ok("GET", "/api/doctor").get("findings") or []) if str(f.get("kind", "")).startswith("mail_")})
+        print(f"    after the confirmation: pending_removal {json.dumps(pr)}; mail findings {kinds}", flush=True)
+        raise
 
 
 def report() -> int:
