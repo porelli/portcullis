@@ -66,7 +66,9 @@ type fdVector struct {
 var fdClasses = map[string]bool{"ok": true, "timeout": true, "refused": true, "tls": true, "http_status": true}
 
 // TestFrontdoorVectorsShape: the file decodes strictly; rounds are 10 s
-// apart; every prober's round has the §20.4 shape (ok iff class ok,
+// apart, or a multiple of 10 s for a gap (a round that couldn't run);
+// every prober's round is at most the round's time (an older one is a
+// round seen before) and has the §20.4 shape (ok iff class ok,
 // reached_any iff a result is ok, never a result for itself); the
 // worst-case texts follow §20.8 (TTL = max(60, the provider's minimum),
 // worst_case_s = 30 + TTL, minutes floored, at least 1); the required
@@ -110,12 +112,14 @@ func TestFrontdoorVectorsShape(t *testing.T) {
 			}
 		}
 		for i, r := range v.Rounds {
-			if i > 0 && r.T.Sub(v.Rounds[i-1].T) != 10*time.Second {
-				t.Errorf("%s: round %d isn't 10 s after the last", v.Name, i)
+			if i > 0 {
+				if d := r.T.Sub(v.Rounds[i-1].T); d < 10*time.Second || d%(10*time.Second) != 0 {
+					t.Errorf("%s: round %d isn't a multiple of 10 s after the last", v.Name, i)
+				}
 			}
 			for _, p := range r.Probes {
 				n, ok := v.Nodes[p.Prober]
-				if !ok || n.Site != p.Site || !p.T.Equal(r.T) {
+				if !ok || n.Site != p.Site || p.T.After(r.T) {
 					t.Errorf("%s: round %d: prober %s", v.Name, i, p.Prober)
 				}
 				if _, own := p.Results[p.Prober]; n.Ingress && !own {
@@ -172,29 +176,50 @@ func TestFrontdoorVectorsShape(t *testing.T) {
 				t.Errorf("%s: %s left with no address", v.Name, c.Name)
 			}
 		}
-		// Every removal follows 3 consecutive unhealthy rounds (§20.8: S6
-		// eligibility, R10 blind probers and span, a STRICT failing majority:
-		// a tie keeps the address), fail-static rounds not counted.
-		streak, owner := map[string]int{}, map[string]string{}
+		// Every removal of an ingress node's address follows 3 consecutive
+		// unhealthy rounds of every node behind it (§20.8: S6 eligibility,
+		// R10 blind probers and span, a STRICT failing majority: a tie keeps
+		// the address); an address of no ingress node goes at once. A gap
+		// (rounds more than 10 s apart) and a fail-static round (every node
+		// unhealthy, or every counted prober reaching nothing) restart the
+		// count; a probe round seen before, or over 15 s old, isn't counted.
+		streak, owners := map[string]int{}, map[string][]string{}
 		for id, n := range v.Nodes {
 			for _, a := range n.Public {
-				owner[a] = id
+				if n.Ingress {
+					owners[a] = append(owners[a], id)
+				}
 			}
 		}
 		removedAt := map[time.Time][]string{}
 		for _, c := range v.Want.Changes {
 			if c.Op == "remove" {
-				removedAt[c.T] = append(removedAt[c.T], owner[c.Value])
+				removedAt[c.T] = append(removedAt[c.T], c.Value)
 			}
 		}
-		for _, r := range v.Rounds {
-			health, anyOK := map[string]bool{}, false
+		seen := map[string]time.Time{}
+		for i, r := range v.Rounds {
+			if i > 0 && r.T.Sub(v.Rounds[i-1].T) > 10*time.Second {
+				streak = map[string]int{}
+			}
+			var probes []fdProbeRound
+			for _, p := range r.Probes {
+				if l, ok := seen[p.Prober]; (ok && !p.T.After(l)) || r.T.Sub(p.T) > 15*time.Second {
+					continue
+				}
+				seen[p.Prober] = p.T
+				probes = append(probes, p)
+			}
+			health, anyOK, reached := map[string]bool{}, false, false
+			for _, p := range probes {
+				reached = reached || p.ReachedAny
+			}
 			for id, n := range v.Nodes {
 				if !n.Ingress {
 					continue
 				}
 				elig, failing, failSites, sites := 0, 0, map[string]bool{}, map[string]bool{}
-				for _, p := range r.Probes {
+				for _, p := range probes {
 					res, ok := p.Results[id]
 					if !ok || p.Site == n.Site || (!p.ReachedAny && !p.EgressOK) {
 						continue
@@ -213,7 +238,11 @@ func TestFrontdoorVectorsShape(t *testing.T) {
 				health[id] = r.Ready[id] && !bad
 				anyOK = anyOK || health[id]
 			}
-			if !anyOK {
+			if !anyOK || (len(probes) > 0 && !reached) {
+				streak = map[string]int{}
+				if len(removedAt[r.T]) > 0 {
+					t.Errorf("%s: a removal in a fail-static round (%s)", v.Name, r.T.Format(time.TimeOnly))
+				}
 				continue
 			}
 			for id, h := range health {
@@ -223,9 +252,11 @@ func TestFrontdoorVectorsShape(t *testing.T) {
 					streak[id]++
 				}
 			}
-			for _, id := range removedAt[r.T] {
-				if streak[id] < 3 {
-					t.Errorf("%s: %s removed at %s after %d unhealthy rounds", v.Name, id, r.T.Format(time.TimeOnly), streak[id])
+			for _, a := range removedAt[r.T] {
+				for _, id := range owners[a] {
+					if streak[id] < 3 {
+						t.Errorf("%s: %s (%s) removed at %s after %d unhealthy rounds", v.Name, a, id, r.T.Format(time.TimeOnly), streak[id])
+					}
 				}
 			}
 		}

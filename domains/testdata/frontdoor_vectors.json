@@ -26763,5 +26763,4782 @@
    "main": "if site main fails: worst case ~1 min on Cloudflare",
    "tb": "if site tb fails: worst case ~1 min on Cloudflare"
   }
+ },
+ {
+  "name": "an address of no ingress node is removed at once (not a health judgement), but never the last",
+  "cross_site": false,
+  "provider": "cloudflare",
+  "provider_name": "Cloudflare",
+  "provider_min_ttl": 60,
+  "lease": true,
+  "names": [
+   "example.org",
+   "*.example.org"
+  ],
+  "nodes": {
+   "n1": {
+    "site": "main",
+    "ingress": true,
+    "public": [
+     "198.51.100.1"
+    ]
+   },
+   "n2": {
+    "site": "main",
+    "ingress": true,
+    "public": [
+     "198.51.100.2"
+    ]
+   },
+   "n3": {
+    "site": "main",
+    "ingress": true,
+    "public": [
+     "198.51.100.3"
+    ]
+   }
+  },
+  "initial": {
+   "example.org": [
+    "198.51.100.1",
+    "198.51.100.2",
+    "198.51.100.3",
+    "198.51.100.9"
+   ],
+   "*.example.org": [
+    "198.51.100.9"
+   ]
+  },
+  "rounds": [
+   {
+    "t": "2026-11-18T10:00:00Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:10Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:20Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:20Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:20Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:20Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:30Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:30Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:30Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:30Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:40Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:40Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:40Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:40Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:50Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:50Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:50Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:50Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:00Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:10Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:20Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:20Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:20Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:20Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:30Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:30Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:30Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:30Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:40Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:40Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:40Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:40Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:50Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:50Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:50Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:50Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:02:00Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:02:00Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:02:00Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:02:00Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:02:10Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:02:10Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:02:10Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:02:10Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:02:20Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:02:20Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:02:20Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:02:20Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:02:30Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:02:30Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:02:30Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:02:30Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:02:40Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:02:40Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:02:40Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:02:40Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:02:50Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:02:50Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:02:50Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:02:50Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:03:00Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:03:00Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:03:00Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:03:00Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:03:10Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:03:10Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:03:10Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:03:10Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   }
+  ],
+  "want": {
+   "addresses": {
+    "example.org": [
+     "198.51.100.1",
+     "198.51.100.2",
+     "198.51.100.3"
+    ],
+    "*.example.org": [
+     "198.51.100.1"
+    ]
+   },
+   "changes": [
+    {
+     "t": "2026-11-18T10:00:00Z",
+     "name": "example.org",
+     "op": "remove",
+     "value": "198.51.100.9"
+    },
+    {
+     "t": "2026-11-18T10:02:00Z",
+     "name": "*.example.org",
+     "op": "add",
+     "value": "198.51.100.1"
+    },
+    {
+     "t": "2026-11-18T10:03:00Z",
+     "name": "*.example.org",
+     "op": "remove",
+     "value": "198.51.100.9"
+    }
+   ],
+   "internal_only": true
+  },
+  "want_worst_case_text": {
+   "example.org": "worst case ~1 min for clients that hit the dead address first, on Cloudflare",
+   "*.example.org": "worst case ~1 min for clients that hit the dead address first, on Cloudflare"
+  },
+  "want_site_worst_case_text": {
+   "main": "if site main fails: worst case ~1 min on Cloudflare"
+  }
+ },
+ {
+  "name": "a gap in the rounds (no snapshot or no provider read) restarts the count: 3 consecutive rounds after it",
+  "cross_site": false,
+  "provider": "cloudflare",
+  "provider_name": "Cloudflare",
+  "provider_min_ttl": 60,
+  "lease": true,
+  "names": [
+   "example.org"
+  ],
+  "nodes": {
+   "n1": {
+    "site": "main",
+    "ingress": true,
+    "public": [
+     "198.51.100.1"
+    ]
+   },
+   "n2": {
+    "site": "main",
+    "ingress": true,
+    "public": [
+     "198.51.100.2"
+    ]
+   },
+   "n3": {
+    "site": "main",
+    "ingress": true,
+    "public": [
+     "198.51.100.3"
+    ]
+   }
+  },
+  "initial": {
+   "example.org": [
+    "198.51.100.1",
+    "198.51.100.2",
+    "198.51.100.3"
+   ]
+  },
+  "rounds": [
+   {
+    "t": "2026-11-18T10:00:00Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": false
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:10Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": false
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:00Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": false
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:10Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": false
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:20Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": false
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:20Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:20Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:20Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:30Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": false
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:30Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:30Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:30Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   }
+  ],
+  "want": {
+   "addresses": {
+    "example.org": [
+     "198.51.100.1",
+     "198.51.100.2"
+    ]
+   },
+   "changes": [
+    {
+     "t": "2026-11-18T10:01:20Z",
+     "name": "example.org",
+     "op": "remove",
+     "value": "198.51.100.3"
+    }
+   ],
+   "internal_only": true
+  },
+  "want_worst_case_text": {
+   "example.org": "worst case ~1 min for clients that hit the dead address first, on Cloudflare"
+  },
+  "want_site_worst_case_text": {
+   "main": "if site main fails: worst case ~1 min on Cloudflare"
+  }
+ },
+ {
+  "name": "a probe round seen before (a stalled nodeagent) isn't counted again",
+  "cross_site": true,
+  "provider": "cloudflare",
+  "provider_name": "Cloudflare",
+  "provider_min_ttl": 60,
+  "lease": true,
+  "names": [
+   "example.org"
+  ],
+  "nodes": {
+   "n1": {
+    "site": "main",
+    "ingress": true,
+    "public": [
+     "198.51.100.1"
+    ]
+   },
+   "n2": {
+    "site": "main",
+    "ingress": true,
+    "public": [
+     "198.51.100.2"
+    ]
+   },
+   "e1": {
+    "site": "edge",
+    "ingress": true,
+    "public": [
+     "203.0.113.1"
+    ]
+   },
+   "e2": {
+    "site": "edge",
+    "ingress": true,
+    "public": [
+     "203.0.113.2"
+    ]
+   }
+  },
+  "initial": {
+   "example.org": [
+    "198.51.100.1",
+    "198.51.100.2",
+    "203.0.113.1",
+    "203.0.113.2"
+   ]
+  },
+  "rounds": [
+   {
+    "t": "2026-11-18T10:00:00Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:10Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:20Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:20Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:20Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:20Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:20Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:30Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:30Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:30Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:30Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:30Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:40Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:40Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:40Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:40Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:40Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:50Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:50Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:50Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:50Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:50Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:00Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:10Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "e2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   }
+  ],
+  "want": {
+   "addresses": {
+    "example.org": [
+     "198.51.100.1",
+     "198.51.100.2",
+     "203.0.113.1",
+     "203.0.113.2"
+    ]
+   },
+   "changes": [],
+   "internal_only": false
+  },
+  "want_worst_case_text": {
+   "example.org": "worst case ~1 min for clients that hit the dead address first, on Cloudflare"
+  },
+  "want_site_worst_case_text": {
+   "edge": "if site edge fails: worst case ~1 min on Cloudflare",
+   "main": "if site main fails: worst case ~1 min on Cloudflare"
+  }
+ },
+ {
+  "name": "every prober fails every target (egress working), one ingress node not probed yet: nothing changes (fail static)",
+  "cross_site": true,
+  "provider": "cloudflare",
+  "provider_name": "Cloudflare",
+  "provider_min_ttl": 60,
+  "lease": true,
+  "names": [
+   "example.org"
+  ],
+  "nodes": {
+   "n1": {
+    "site": "main",
+    "ingress": true,
+    "public": [
+     "198.51.100.1"
+    ]
+   },
+   "n2": {
+    "site": "main",
+    "ingress": true,
+    "public": [
+     "198.51.100.2"
+    ]
+   },
+   "e1": {
+    "site": "edge",
+    "ingress": true,
+    "public": [
+     "203.0.113.1"
+    ]
+   },
+   "e2": {
+    "site": "edge",
+    "ingress": true,
+    "public": [
+     "203.0.113.2"
+    ]
+   },
+   "e3": {
+    "site": "edge",
+    "ingress": true,
+    "public": [
+     "203.0.113.3"
+    ]
+   }
+  },
+  "initial": {
+   "example.org": [
+    "198.51.100.1",
+    "198.51.100.2",
+    "203.0.113.1",
+    "203.0.113.2"
+   ]
+  },
+  "rounds": [
+   {
+    "t": "2026-11-18T10:00:00Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true,
+     "e3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:10Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true,
+     "e3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:20Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true,
+     "e3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:20Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:20Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:20Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:20Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:30Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true,
+     "e3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:30Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:30Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:30Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:30Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:40Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true,
+     "e3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:40Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:40Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:40Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:40Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:50Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true,
+     "e3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:50Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:50Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:50Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:50Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:00Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true,
+     "e3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:10Z",
+    "ready": {
+     "e1": true,
+     "e2": true,
+     "n1": true,
+     "n2": true,
+     "e3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "e1",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "e2",
+      "site": "edge",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": false,
+      "egress_ok": true,
+      "results": {
+       "e1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "e2": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n1": {
+        "ok": false,
+        "class": "timeout"
+       },
+       "n2": {
+        "ok": false,
+        "class": "timeout"
+       }
+      }
+     }
+    ]
+   }
+  ],
+  "want": {
+   "addresses": {
+    "example.org": [
+     "198.51.100.1",
+     "198.51.100.2",
+     "203.0.113.1",
+     "203.0.113.2"
+    ]
+   },
+   "changes": [],
+   "internal_only": false
+  },
+  "want_worst_case_text": {
+   "example.org": "worst case ~1 min for clients that hit the dead address first, on Cloudflare"
+  },
+  "want_site_worst_case_text": {
+   "edge": "if site edge fails: worst case ~1 min on Cloudflare",
+   "main": "if site main fails: worst case ~1 min on Cloudflare"
+  }
+ },
+ {
+  "name": "two ingress nodes behind one public address: it goes only when both are unhealthy",
+  "cross_site": false,
+  "provider": "cloudflare",
+  "provider_name": "Cloudflare",
+  "provider_min_ttl": 60,
+  "lease": true,
+  "names": [
+   "example.org"
+  ],
+  "nodes": {
+   "n1": {
+    "site": "main",
+    "ingress": true,
+    "public": [
+     "198.51.100.1"
+    ]
+   },
+   "n2": {
+    "site": "main",
+    "ingress": true,
+    "public": [
+     "198.51.100.2"
+    ]
+   },
+   "n3": {
+    "site": "main",
+    "ingress": true,
+    "public": [
+     "198.51.100.2"
+    ]
+   }
+  },
+  "initial": {
+   "example.org": [
+    "198.51.100.1",
+    "198.51.100.2"
+   ]
+  },
+  "rounds": [
+   {
+    "t": "2026-11-18T10:00:00Z",
+    "ready": {
+     "n1": true,
+     "n2": false,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:00Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:10Z",
+    "ready": {
+     "n1": true,
+     "n2": false,
+     "n3": true
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:10Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:20Z",
+    "ready": {
+     "n1": true,
+     "n2": false,
+     "n3": false
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:20Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:20Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:20Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:30Z",
+    "ready": {
+     "n1": true,
+     "n2": false,
+     "n3": false
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:30Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:30Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:30Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:40Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": false
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:40Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:40Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:40Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:00:50Z",
+    "ready": {
+     "n1": true,
+     "n2": true,
+     "n3": false
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:00:50Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:50Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:00:50Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:00Z",
+    "ready": {
+     "n1": true,
+     "n2": false,
+     "n3": false
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:00Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:10Z",
+    "ready": {
+     "n1": true,
+     "n2": false,
+     "n3": false
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:10Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:20Z",
+    "ready": {
+     "n1": true,
+     "n2": false,
+     "n3": false
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:20Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:20Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:20Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "t": "2026-11-18T10:01:30Z",
+    "ready": {
+     "n1": true,
+     "n2": false,
+     "n3": false
+    },
+    "probes": [
+     {
+      "t": "2026-11-18T10:01:30Z",
+      "prober": "n1",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:30Z",
+      "prober": "n2",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     },
+     {
+      "t": "2026-11-18T10:01:30Z",
+      "prober": "n3",
+      "site": "main",
+      "reached_any": true,
+      "egress_ok": true,
+      "results": {
+       "n1": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n2": {
+        "ok": true,
+        "class": "ok"
+       },
+       "n3": {
+        "ok": true,
+        "class": "ok"
+       }
+      }
+     }
+    ]
+   }
+  ],
+  "want": {
+   "addresses": {
+    "example.org": [
+     "198.51.100.1"
+    ]
+   },
+   "changes": [
+    {
+     "t": "2026-11-18T10:01:20Z",
+     "name": "example.org",
+     "op": "remove",
+     "value": "198.51.100.2"
+    }
+   ],
+   "internal_only": true
+  },
+  "want_worst_case_text": {
+   "example.org": "worst case ~1 min for clients that hit the dead address first, on Cloudflare"
+  },
+  "want_site_worst_case_text": {
+   "main": "if site main fails: worst case ~1 min on Cloudflare"
+  }
  }
 ]
