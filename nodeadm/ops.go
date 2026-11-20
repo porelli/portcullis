@@ -9,16 +9,18 @@ package main
 //	marked           the node removed and its certificate revoked (no join
 //	                 can pass verifySigned any more);
 //	tokens_deleted   its bootstrap tokens deleted from kube-system;
-//	node_deleted     its Node object deleted;
-//	published        the cluster addresses list it removed;
-//	etcd_removed     (a server) its etcd member removed through a surviving
-//	                 server's nodeagent;
 //	server_rotated   a new server token, generated and persisted in the op
 //	                 BEFORE the rotate call, in effect (server-bootstrap: the
 //	                 new one 200, the old one 401) and promoted to the Secret;
 //	agent_rotated    the same for the agent token;
-//	applied          every surviving server then agent applied, recorded
-//	                 per node;
+//	applied          every Ready surviving server then agent applied,
+//	                 recorded per node (the revoked node skipped);
+//	node_deleted     its Node object deleted          } gated by etcd's
+//	published        the cluster addresses list it    } quorum (a server:
+//	                 removed                          } revokeQuorum)
+//	etcd_removed     (a server) its etcd member removed through a surviving
+//	                 server's nodeagent;
+//	deferred_applied the survivors that weren't Ready get the tokens;
 //	done             the op's tokens dropped.
 //
 // A resumed rotation first asks the supervisor which token it accepts: the
@@ -57,8 +59,12 @@ type revokeOp struct {
 	LastKind  string         `json:"last_kind,omitempty"` // an error kind (quorum_minimum) for the answer
 }
 
-var revokeSteps = []string{"created", "marked", "tokens_deleted", "node_deleted", "published", "etcd_removed",
-	"server_rotated", "agent_rotated", "applied", "done"}
+// Security first (fix round 5): the tokens are rotated and applied to the
+// Ready survivors before the quorum-gated Node / etcd steps, so a revoke
+// parked on quorum has already cut the node off; the survivors that were
+// down get the tokens last (deferred_applied).
+var revokeSteps = []string{"created", "marked", "tokens_deleted", "server_rotated", "agent_rotated", "applied",
+	"node_deleted", "published", "etcd_removed", "deferred_applied", "done"}
 
 func stepIndex(s string) int { return slices.Index(revokeSteps, s) }
 
@@ -183,7 +189,7 @@ func (s *Server) revokeQuorum(ctx context.Context, target string) error {
 	}
 	if h*2 <= v {
 		return errKind(http.StatusConflict, "quorum_minimum",
-			"removing %s would leave etcd %d healthy of %d members: not a majority (its certificate is revoked and its bootstrap tokens deleted; its Node and etcd member stay until etcd has a healthy majority)", target, h, v)
+			"removing %s would leave etcd %d healthy of %d members: parked (certificate revoked, bootstrap tokens deleted, k3s tokens rotated; Node and etcd member kept until quorum)", target, h, v)
 	}
 	return nil
 }
@@ -334,7 +340,11 @@ func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 			return err
 		}
 	case "applied":
-		if err := s.applyTokens(ctx, op); err != nil {
+		if err := s.applyTokens(ctx, op, false); err != nil {
+			return err
+		}
+	case "deferred_applied":
+		if err := s.applyTokens(ctx, op, true); err != nil {
 			return err
 		}
 	case "done":
@@ -509,7 +519,10 @@ func (s *Server) rotateOne(ctx context.Context, op *revokeOp, agent bool) error 
 // applyTokens: each surviving server (apply the server token, apply-agent
 // the agent token) one at a time, then each agent (apply the agent token),
 // each Ready again before the next; recorded per node.
-func (s *Server) applyTokens(ctx context.Context, op *revokeOp) error {
+// applyTokens: final false applies the Ready survivors and leaves the
+// others for later; final true applies every survivor not applied yet,
+// waiting (the op retries) while one isn't Ready.
+func (s *Server) applyTokens(ctx context.Context, op *revokeOp, final bool) error {
 	servers, agents, err := s.survivors(ctx, op.Node)
 	if err != nil {
 		return err
@@ -534,6 +547,13 @@ func (s *Server) applyTokens(ctx context.Context, op *revokeOp) error {
 		}
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("stopped: %w", err)
+		}
+		if !n.Ready {
+			if final {
+				return fmt.Errorf("waiting for %s to be Ready to apply the rotated k3s tokens", n.Name)
+			}
+			s.log.Info("k3s tokens deferred until the node is Ready", "node", n.Name)
+			continue
 		}
 		if n.Role == "server" {
 			if err := call(n, srv, "apply"); err != nil {

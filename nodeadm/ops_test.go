@@ -90,8 +90,8 @@ func TestRevokeResumesAtEachStep(t *testing.T) {
 		stopsAt    string
 	}{
 		{"etcd removal fails", "etcd", false, "published"},
-		{"rotate fails", "rotate", false, "etcd_removed"},
-		{"rotate took effect, its answer lost", "rotate", true, "etcd_removed"},
+		{"rotate fails", "rotate", false, "tokens_deleted"},
+		{"rotate took effect, its answer lost", "rotate", true, "tokens_deleted"},
 		{"rotate ok, rotate-agent fails", "rotate-agent", false, "server_rotated"},
 		{"rotate-agent took effect, its answer lost", "rotate-agent", true, "server_rotated"},
 		{"an apply fails", "apply", false, "agent_rotated"},
@@ -522,11 +522,12 @@ func TestRevokeQuorumLive(t *testing.T) {
 		st.Ops["n2"] = &revokeOp{Node: "n2", Role: "server", Mesh: "10.215.0.2", Step: "published", Started: vecNow}
 	})
 	h.failAgent("etcd", false) // n2's op can't finish meanwhile
+	h.agents.onRotate = h.bootFollows
 	h.kube.CoreV1().Nodes().Delete(ctx, "n2", metav1.DeleteOptions{})
 	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n3?mode=revoke", nil); w.Code != 409 || !strings.Contains(w.Body.String(), "quorum_minimum") {
 		t.Fatalf("with a stuck server revoke: %d %s", w.Code, w.Body)
 	}
-	if op := h.state(t).Ops["n3"]; op == nil || op.Step != "tokens_deleted" {
+	if op := h.state(t).Ops["n3"]; op == nil || op.Step != "applied" {
 		t.Fatalf("n3's op isn't parked before node_deleted: %+v", op)
 	}
 
@@ -537,6 +538,7 @@ func TestRevokeQuorumLive(t *testing.T) {
 	h.putState(t, func(st *nodeadmState) {
 		st.Nodes["n6"] = &nodeRecord{Role: "server", Serial: "66:66", MeshIP: "10.215.0.6"}
 	})
+	h.agents.onRotate = h.bootFollows
 	// n2 and n3 go down after the op starts (at its node delete step).
 	// (Through the tracker: a reactor runs under the fake's lock.)
 	gvr := schema.GroupVersionResource{Version: "v1", Resource: "nodes"}
@@ -660,8 +662,9 @@ func TestRevokeParksSecurityDone(t *testing.T) {
 	// 4 servers, n2 and n3 down: removing the Ready n5 leaves 1 of 3.
 	h.setReady(t, "n2", false)
 	h.setReady(t, "n3", false)
+	h.agents.onRotate = h.bootFollows
 	w := h.internal(clientHub, "DELETE", "/v1/nodes/n5?mode=revoke", nil)
-	if w.Code != 409 || !strings.Contains(w.Body.String(), `"kind":"quorum_minimum"`) || !strings.Contains(w.Body.String(), "its certificate is revoked") {
+	if w.Code != 409 || !strings.Contains(w.Body.String(), `"kind":"quorum_minimum"`) || !strings.Contains(w.Body.String(), "certificate revoked") {
 		t.Fatalf("revoke without quorum: %d %s", w.Code, w.Body)
 	}
 	st := h.state(t)
@@ -671,7 +674,7 @@ func TestRevokeParksSecurityDone(t *testing.T) {
 	if _, err := h.kube.CoreV1().Secrets(bootstrapNS).Get(ctx, "bootstrap-token-abc123", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatal("its bootstrap token wasn't deleted")
 	}
-	if op := st.Ops["n5"]; op == nil || op.Step != "tokens_deleted" || op.LastKind != "quorum_minimum" {
+	if op := st.Ops["n5"]; op == nil || op.Step != "applied" || op.LastKind != "quorum_minimum" {
 		t.Fatalf("the op isn't parked before the Node / etcd steps: %+v", op)
 	}
 	if _, err := h.kube.CoreV1().Nodes().Get(ctx, "n5", metav1.GetOptions{}); err != nil || len(h.agents.etcdRm) != 0 {
@@ -680,16 +683,35 @@ func TestRevokeParksSecurityDone(t *testing.T) {
 	if w := h.join(t, j, nearRTT); w.Code != 403 {
 		t.Fatalf("the revoked node's join: %d", w.Code)
 	}
+	// Parked, the k3s tokens are rotated already (fix round 5): the old
+	// server and agent tokens are refused, the Secret holds the new ones,
+	// the Ready survivor applied, the down ones deferred.
+	if st, _ := h.boot.Status(ctx, "10.215.0.1", testServerToken); st != 401 {
+		t.Fatalf("the old server token answers %d while parked", st)
+	}
+	if st, _ := h.boot.AgentStatus(ctx, "10.215.0.1", testAgentToken); st != 401 {
+		t.Fatalf("the old agent token answers %d while parked", st)
+	}
+	if srv, agt := h.secretTokens(t); srv == testServerToken || agt == testAgentToken {
+		t.Fatal("the Secret keeps an old token while parked")
+	}
+	if !slices.Contains(h.agents.rotations, "apply:n1") || slices.Contains(h.agents.rotations, "apply:n2") || slices.Contains(h.agents.rotations, "apply:n5") {
+		t.Fatalf("applied %v (want n1, not the down n2/n3 nor the revoked n5)", h.agents.rotations)
+	}
 	snap := h.internal(clientHub, "GET", "/v1/cluster", nil).Body.String()
 	if !strings.Contains(snap, "the revocation of n5 is parked before its Node and etcd member are removed") {
 		t.Fatalf("the snapshot doesn't say it: %s", snap)
 	}
-	// Quorum back: resumed to the end.
-	h.agents.onRotate = h.bootFollows
+	// Quorum back: resumed to the end, the deferred survivors applied.
 	h.setReady(t, "n2", true)
 	h.setReady(t, "n3", true)
 	h.resume(t, "n5")
 	if _, err := h.kube.CoreV1().Nodes().Get(ctx, "n5", metav1.GetOptions{}); !apierrors.IsNotFound(err) || len(h.agents.etcdRm) != 1 {
 		t.Fatal("the parked revoke didn't finish once quorum was back")
+	}
+	for _, r := range []string{"apply:n2", "apply-agent:n2", "apply:n3", "apply-agent:n3"} {
+		if !slices.Contains(h.agents.rotations, r) {
+			t.Fatalf("%s not applied after the resume: %v", r, h.agents.rotations)
+		}
 	}
 }

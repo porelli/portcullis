@@ -1533,7 +1533,7 @@
     "status": 409,
     "headers": {},
     "body": {
-     "error": "removing n3 would leave etcd 1 healthy of 3 members: not a majority (its certificate is revoked and its bootstrap tokens deleted; its Node and etcd member stay until etcd has a healthy majority)",
+     "error": "removing n3 would leave etcd 1 healthy of 3 members: parked (certificate revoked, bootstrap tokens deleted, k3s tokens rotated; Node and etcd member kept until quorum)",
      "kind": "quorum_minimum"
     }
    }
