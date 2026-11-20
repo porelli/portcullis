@@ -118,9 +118,9 @@ func snapshotFixture(t *testing.T, h *harness) {
 				{TopologyKey: "kubernetes.io/hostname"}}}}
 		add(v)
 	}
-	add(agentPod("portcullis-pg-1", coreNS, "n1", "portcullis-pg", "Cluster", map[string]string{"cnpg.io/cluster": "portcullis-pg"}))
+	add(agentPod("portcullis-pg-1", "cnpg-system", "n1", "portcullis-pg", "Cluster", map[string]string{"cnpg.io/cluster": "portcullis-pg"}))
 	pg := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "postgresql.cnpg.io/v1", "kind": "Cluster",
-		"metadata": map[string]any{"name": "portcullis-pg", "namespace": coreNS},
+		"metadata": map[string]any{"name": "portcullis-pg", "namespace": "cnpg-system"},
 		"spec":     map[string]any{"postgresql": map[string]any{"synchronous": map[string]any{"number": int64(1)}}},
 		"status":   map[string]any{"instances": int64(2), "readyInstances": int64(2), "currentPrimary": "portcullis-pg-1"}}}
 	vol := &unstructured.Unstructured{Object: map[string]any{"apiVersion": "longhorn.io/v1beta2", "kind": "Volume",

@@ -23,6 +23,9 @@ const (
 	vaultSet    = "vault"
 	sentinelSet = "sessions-sentinel"
 	pgCluster   = "portcullis-pg"
+	// pgNS: the CNPG Cluster and its instances live with the operator
+	// (core plan Task 23: the operator's rights end at its namespace).
+	pgNS = "cnpg-system"
 )
 
 // GET /v1/cluster
@@ -301,13 +304,14 @@ func snapPod(p *corev1.Pod, mins map[setKey]int) SnapPod {
 	return sp
 }
 
-// postgres reads the CNPG Cluster portcullis-pg (absent: no instance).
+// postgres reads the CNPG Cluster portcullis-pg in cnpg-system (absent: no
+// instance).
 func (s *Server) postgres(ctx context.Context, pods []corev1.Pod) Postgres {
 	pg := Postgres{}
 	if s.dyn == nil {
 		return pg
 	}
-	u, err := s.dyn.Resource(gvrCNPGCluster).Namespace(s.cfg.CoreNS).Get(ctx, pgCluster, metav1.GetOptions{})
+	u, err := s.dyn.Resource(gvrCNPGCluster).Namespace(pgNS).Get(ctx, pgCluster, metav1.GetOptions{})
 	if err != nil {
 		return pg
 	}
@@ -318,7 +322,7 @@ func (s *Server) postgres(ctx context.Context, pods []corev1.Pod) Postgres {
 	pg.Instances = int(inst)
 	pg.SyncStandbys = int(min(max(ready-1, 0), syncN))
 	for i := range pods {
-		if pods[i].Name == prim && pods[i].Namespace == s.cfg.CoreNS && pods[i].Spec.NodeName != "" {
+		if pods[i].Name == prim && pods[i].Namespace == pgNS && pods[i].Spec.NodeName != "" {
 			node := pods[i].Spec.NodeName
 			pg.Primary = &node
 		}
