@@ -275,8 +275,10 @@ kube_install_host_checks() {
       fi
     done
   fi
-  taken="$(_ki_mesh_taken)"
-  if [ -n "$taken" ]; then
+  # cidr_contains is network.sh's: without it nothing would look taken.
+  if ! declare -F cidr_contains >/dev/null; then
+    _rt_chk fail "the mesh subnet $KUBE_MESH_CIDR can't be checked free (network.sh isn't loaded)"
+  elif taken="$(_ki_mesh_taken)" && [ -n "$taken" ]; then
     _rt_chk fail "the mesh subnet $KUBE_MESH_CIDR is already in use on this host ($taken)"
   else
     _rt_chk ok "the mesh subnet $KUBE_MESH_CIDR is free"

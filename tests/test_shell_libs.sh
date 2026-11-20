@@ -4650,6 +4650,8 @@ OUT="$(kip 'return 0' 'mkdir -p "$KUBE_INSTALL_PREFIX/dev" && : > "$KUBE_INSTALL
 case "$OUT" in *"ok	open-iscsi installed"*"ok	nfs-common installed"*"ok	watchdog device /dev/watchdog"*"warn	/var/lib is on ZFS"*) t_pass "_ki_node_checks: packages, the watchdog and ZFS reported" ;; *) t_fail "ki node checks: $OUT" ;; esac
 OUT="$(kip 'return 0' '_ki_have() { [ "$1" != ss ]; }; kube_install_host_checks')"
 case "$OUT" in *"fail	ss (iproute2) is missing: the ports can't be checked free"*) t_pass "kube_install_host_checks: no ss → fail (never every port free)" ;; *) t_fail "ki no ss: $OUT" ;; esac
+OUT="$(KUBE_INSTALL_OS=Linux KUBE_INSTALL_PREFIX="$KI/root" bash -c '. "$1/scripts/lib/common.sh"; . "$1/scripts/lib/kube_install.sh"; _ki_port_busy() { return 1; }; kube_install_host_checks' _ "$HERE/.." 2>&1)"
+case "$OUT" in *"fail	the mesh subnet 10.215.0.0/24 can't be checked free (network.sh isn't loaded)"*) t_pass "kube_install_host_checks: only common.sh + kube_install.sh (no cidr_contains) → the mesh check fails closed" ;; *) t_fail "ki no network.sh: $OUT" ;; esac
 # A half-finished init of our own resumes (I3): pcmesh up with our config
 # and key holds 51830; k3s with our token, net-conf and unit holds its ports.
 kir() { kik "KUBE_INSTALL_OS=Linux; INIT_INTERACTIVE=false; _ki_pkg_installed() { return 0; }; _ki_mesh_taken() { :; }; _ki_fs_type() { echo ext4; }; _ki_link_up() { return 0; }
