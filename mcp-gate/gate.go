@@ -39,9 +39,12 @@ type gateOptions struct {
 	// HubURL is the Hub's MCP listener (MCP_GATE_HUB_URL) for the
 	// Portcullis resources and the aggregate's people tools; "" = none
 	// (the Portcullis kinds answer 503).
-	HubURL             string
-	LogPath            string
-	LogGroup           int
+	HubURL   string
+	LogPath  string
+	LogGroup int
+	// LogGeneration keeps the access log's generation file (the log
+	// port's cursors; on only with MCP_GATE_LOG_LISTEN).
+	LogGeneration      bool
 	Base               http.RoundTripper
 	MintWait, MintPoll time.Duration
 	// Now is the limiter's clock (nil = time.Now; tests freeze it).
@@ -65,7 +68,7 @@ func newGate(o gateOptions) (*gate, error) {
 		return nil, errors.New("no Hub API client")
 	}
 	act := &activity{snap: o.Snapshot, hubSecret: o.HubSecret}
-	alog, err := accesslog.OpenWith(o.LogPath, accesslog.Options{Retention: accesslog.DefaultRetention, Group: o.LogGroup, Secrets: act.secrets})
+	alog, err := accesslog.OpenWith(o.LogPath, accesslog.Options{Retention: accesslog.DefaultRetention, Group: o.LogGroup, Secrets: act.secrets, Generation: o.LogGeneration})
 	if err != nil {
 		return nil, err
 	}

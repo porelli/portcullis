@@ -2,6 +2,7 @@ package accesslog
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -93,6 +94,9 @@ func TestReadPagesAndCursor(t *testing.T) {
 	if err := os.WriteFile(path, b.Bytes(), 0o640); err != nil {
 		t.Fatal(err)
 	}
+	if err := writeGen(path, -1); err != nil {
+		t.Fatal(err)
+	}
 	page := func(cur *Cursor, from time.Time, limit, max int) Page {
 		t.Helper()
 		pg, err := Read(path, cur, from, limit, max)
@@ -137,33 +141,127 @@ func TestReadPagesAndCursor(t *testing.T) {
 	if again := page(&end.Next, time.Time{}, 10, 4<<20); len(again.Body) != 0 || again.Next != end.Next || again.Truncated {
 		t.Fatalf("at the end: %+v", again)
 	}
-	// Rewritten (a new inode, as prune does): restart at the cursor's time.
-	mid := page(nil, time.Time{}, 1, 4<<20).Next
-	tmp := path + ".new"
-	_ = os.WriteFile(tmp, append(testLine(base.Add(-time.Hour), "old"), b.Bytes()...), 0o640)
-	if err := os.Rename(tmp, path); err != nil {
+	// A cursor mid-line: expired.
+	bad := page(nil, time.Time{}, 1, 4<<20).Next
+	bad.Off -= 3
+	if _, err := Read(path, &bad, time.Time{}, 1, 4<<20); err != ErrCursorExpired {
+		t.Fatalf("mid-line cursor: %v", err)
+	}
+}
+
+// TestCursorExpiresOnEveryRewrite: the generation token changes at every
+// rewrite — by rename (Prune) and in place on the same inode (what inode
+// reuse looks like) — and a cursor of an older generation is expired even
+// where its offset would still fall on a line start.
+func TestCursorExpiresOnEveryRewrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "access.jsonl")
+	base := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+	var b bytes.Buffer
+	for i := 0; i < 10; i++ {
+		b.Write(testLine(base, "r")) // equal lengths: every old offset is a line start
+	}
+	_ = os.WriteFile(path, b.Bytes(), 0o640)
+	if err := writeGen(path, -1); err != nil {
 		t.Fatal(err)
 	}
-	pg := page(&mid, time.Time{}, 1, 4<<20)
-	if ln, err := ParseLine(bytes.TrimSuffix(pg.Body, []byte("\n"))); err != nil || ln.Time != base {
-		t.Fatalf("rewritten file: %q", pg.Body)
+	read := func(cur *Cursor) (Page, error) { return Read(path, cur, time.Time{}, 3, 4<<20) }
+	pg, err := read(nil)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// A cursor mid-line (same inode): restart at its time too.
-	bad := pg.Next
-	bad.Off -= 3
-	if pg := page(&bad, time.Time{}, 1, 4<<20); len(pg.Body) == 0 {
-		t.Fatal("mid-line cursor: nothing")
+	c1 := pg.Next
+	if _, err := read(&c1); err != nil {
+		t.Fatalf("the same generation: %v", err)
+	}
+	// Rewrite 1: a new file renamed over it (Prune's way).
+	tmp := path + ".new"
+	_ = os.WriteFile(tmp, b.Bytes(), 0o640)
+	_ = os.Rename(tmp, path)
+	if _, err := read(&c1); err != ErrGenUnknown {
+		t.Fatalf("before the generation is written: %v (want unknown: 503)", err)
+	}
+	_ = writeGen(path, -1)
+	if _, err := read(&c1); err != ErrCursorExpired {
+		t.Fatalf("after rewrite 1: %v", err)
+	}
+	pg, _ = read(nil)
+	c2 := pg.Next
+	// Rewrite 2: in place, the same inode.
+	_ = os.WriteFile(path, b.Bytes(), 0o640)
+	_ = writeGen(path, -1)
+	for _, c := range []Cursor{c1, c2} {
+		if _, err := read(&c); err != ErrCursorExpired {
+			t.Fatalf("after rewrite 2, cursor %+v: %v", c, err)
+		}
+	}
+	if pg, err := read(nil); err != nil || pg.Next.Gen == c2.Gen || pg.Next.Gen == c1.Gen {
+		t.Fatalf("a fresh start: %+v %v", pg.Next, err)
+	}
+}
+
+// TestPruneRenewsTheGeneration: the Log keeps the generation file (with
+// Generation on): created with the log, renewed by a Prune that
+// rewrites, untouched by one that doesn't, absent with Generation off.
+func TestPruneRenewsTheGeneration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "access.jsonl")
+	now := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
+	l, err := OpenWith(path, Options{Group: -1, Generation: true, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	g0, err := ReadGen(path)
+	if err != nil {
+		t.Fatalf("no generation at creation: %v", err)
+	}
+	_ = l.Write(Line{Time: now.Add(-100 * 24 * time.Hour), Resource: "old"})
+	_ = l.Write(Line{Time: now, Resource: "new"})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = l.Flush(ctx)
+	pg, _ := Read(path, nil, time.Time{}, 1, 4<<20)
+	if pg.Next.Gen != g0 {
+		t.Fatalf("cursor generation %q, want %q", pg.Next.Gen, g0)
+	}
+	if err := l.Prune(); err != nil {
+		t.Fatal(err)
+	}
+	g1, _ := ReadGen(path)
+	if g1 == "" || g1 == g0 {
+		t.Fatalf("the rewrite kept the generation (%q → %q)", g0, g1)
+	}
+	if _, err := Read(path, &pg.Next, time.Time{}, 1, 4<<20); err != ErrCursorExpired {
+		t.Fatalf("a cursor from before the prune: %v", err)
+	}
+	if err := l.Prune(); err != nil { // nothing to remove: no rewrite
+		t.Fatal(err)
+	}
+	if g2, _ := ReadGen(path); g2 != g1 {
+		t.Fatalf("a prune without a rewrite renewed the generation")
+	}
+	_ = l.Close()
+	off := filepath.Join(t.TempDir(), "access.jsonl")
+	l2, err := OpenWith(off, Options{Group: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = l2.Close()
+	if _, err := os.Stat(GenPath(off)); !os.IsNotExist(err) {
+		t.Fatalf("a generation file with Generation off: %v", err)
 	}
 }
 
 func TestParseCursor(t *testing.T) {
-	c := Cursor{Ino: 42, Off: 1234, Time: 1790000000}
-	if got, err := ParseCursor(c.String()); err != nil || got != c {
-		t.Fatalf("round trip: %+v %v", got, err)
+	c := Cursor{Gen: "0123456789abcdef0123456789abcdef", Off: 1234, Time: 1790000000}
+	for _, ok := range []Cursor{c, {Off: 0}} {
+		if got, err := ParseCursor(ok.String()); err != nil || got != ok {
+			t.Fatalf("round trip %+v: %+v %v", ok, got, err)
+		}
 	}
 	enc := func(s string) string { return base64RawURL(s) }
-	for _, s := range []string{"", "***", c.String() + "A", c.String() + "=", enc("mg1|42|1234"), enc("gg1|42|1234|5"),
-		enc("mg1|42|-1|5"), enc("mg1|42|01|5"), enc("mg1|x|1|5"), enc("mg1|42|1|999999999999")} {
+	for _, s := range []string{"", "***", c.String() + "A", c.String() + "=", enc("mg2|" + c.Gen + "|1234"),
+		enc("mg1|" + c.Gen + "|1|5"), enc("mg2|42|1|5"), enc("mg2|" + c.Gen + "|-1|5"), enc("mg2|" + c.Gen + "|01|5"),
+		enc("mg2|ABCDEF0123456789ABCDEF0123456789|1|5"), enc("mg2|" + c.Gen + "|1|999999999999")} {
 		if _, err := ParseCursor(s); err == nil {
 			t.Errorf("%q accepted", s)
 		}

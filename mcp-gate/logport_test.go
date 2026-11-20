@@ -23,7 +23,7 @@ import (
 func TestAccessLogEndpoint(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "access.jsonl")
-	l, err := accesslog.OpenWith(path, accesslog.Options{Group: -1, Secrets: func() []string { return []string{"s3cret-value"} }})
+	l, err := accesslog.OpenWith(path, accesslog.Options{Group: -1, Generation: true, Secrets: func() []string { return []string{"s3cret-value"} }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,6 +154,11 @@ func TestAccessLogEndpoint(t *testing.T) {
 		t.Fatalf("symlink: %d %s", w.Code, w.Body)
 	}
 	_ = os.Remove(path)
+	// A cursor of a log that is gone: 410 cursor_expired.
+	gone := accesslog.Cursor{Gen: "0123456789abcdef0123456789abcdef", Off: 10}.String()
+	if w := do("GET", "/v1/log?cursor="+gone); w.Code != http.StatusGone || strings.TrimSpace(w.Body.String()) != "cursor_expired" {
+		t.Fatalf("expired cursor: %d %q", w.Code, w.Body)
+	}
 	if w := do("GET", "/v1/log"); w.Code != 200 || w.Body.Len() != 0 || w.Header().Get("X-Portcullis-Next") == "" ||
 		w.Header().Get("X-Portcullis-Truncated") != "false" {
 		t.Fatalf("missing log: %d %q %v", w.Code, w.Body, w.Header())

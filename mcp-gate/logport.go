@@ -17,7 +17,8 @@ import (
 // &limit=<n> answers the access log's lines as they are on disk (JSONL,
 // file order, at most limit lines — 1–10000, default 1000 — and 4 MiB)
 // with X-Portcullis-Next (the exclusive cursor of the next page) and
-// X-Portcullis-Truncated; every other method is 405. At most 4
+// X-Portcullis-Truncated; a cursor of another generation of the log (it was
+// rewritten by its pruning) is 410 cursor_expired; every other method is 405. At most 4
 // connections, each within 30 s of its accept, one read at a time held
 // until its answer is written. No auth of its own: only the Hub pod may
 // reach it (NetworkPolicy, a stated delta in hardening.md). The gate's own
@@ -133,7 +134,14 @@ func newLogHandler(logFile string) http.Handler {
 		}
 		defer func() { <-one }() // held until the answer is written
 		pg, err := accesslog.Read(logFile, cur, from, limit, logAnswerMax)
-		if err != nil {
+		switch {
+		case errors.Is(err, accesslog.ErrCursorExpired):
+			http.Error(w, "cursor_expired", http.StatusGone)
+			return
+		case errors.Is(err, accesslog.ErrGenUnknown):
+			http.Error(w, "busy", http.StatusServiceUnavailable)
+			return
+		case err != nil:
 			http.Error(w, "the access log can't be read", http.StatusInternalServerError)
 			return
 		}

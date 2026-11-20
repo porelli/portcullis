@@ -129,6 +129,10 @@ type Options struct {
 	// WriteHook (tests only) runs before each write, under the file lock;
 	// an error fails that write, blocking stalls the writer.
 	WriteHook func() error
+	// Generation keeps the generation file <path>.gen (the log port's
+	// cursors, contract §20.10): a new random token whenever the log is
+	// created or rewritten by Prune. Off on Docker (no log port).
+	Generation bool
 }
 
 // Log is the access log. Safe for concurrent use.
@@ -216,6 +220,7 @@ func OpenWith(path string, o Options) (*Log, error) {
 		return nil, err
 	}
 	l.f = f
+	l.ensureGen()
 	if err := l.Prune(); err != nil {
 		log.Printf("mcp-gate: access log prune: %v", err)
 	}
@@ -223,6 +228,22 @@ func OpenWith(path string, o Options) (*Log, error) {
 	go l.writer()
 	go l.pruner()
 	return l, nil
+}
+
+// ensureGen writes a new generation when the generation file is missing
+// or names another file (the log was created, or replaced while the
+// gate was down); a failure is logged (the log port answers 503 until it
+// is written).
+func (l *Log) ensureGen() {
+	if !l.o.Generation {
+		return
+	}
+	if _, err := ReadGen(l.path); err == nil {
+		return
+	}
+	if err := writeGen(l.path, l.o.Group); err != nil {
+		log.Printf("mcp-gate: access log generation: %v", err)
+	}
 }
 
 func (l *Log) openFile() (*os.File, error) {
@@ -537,6 +558,7 @@ func (l *Log) pruner() {
 // Lines are filtered without holding the writer; only the tail written
 // meanwhile is copied under the lock. Nothing to remove: no rewrite.
 func (l *Log) Prune() error {
+	l.ensureGen()
 	cut := l.o.Now().Add(-l.o.Retention)
 	l.mu.Lock()
 	st, err := l.f.Stat()
@@ -611,6 +633,12 @@ func (l *Log) Prune() error {
 		return err
 	}
 	done = true
+	if l.o.Generation {
+		// Rewritten: every cursor into the old file is expired.
+		if err := writeGen(l.path, l.o.Group); err != nil {
+			log.Printf("mcp-gate: access log generation: %v", err)
+		}
+	}
 	if d, err := os.Open(filepath.Dir(l.path)); err == nil {
 		_ = d.Sync()
 		d.Close()

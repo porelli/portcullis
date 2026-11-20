@@ -204,6 +204,7 @@ import math
 import os
 import queue
 import re
+import secrets
 import socket
 import stat
 import threading
@@ -2377,8 +2378,13 @@ class OpenedLog:
     QUEUE_MAX = 1000
     LOG_EVERY = 60.0
 
-    def __init__(self, directory: str, capacity: int = 10000, gid: Optional[int] = None):
+    def __init__(self, directory: str, capacity: int = 10000, gid: Optional[int] = None,
+                 generation: bool = False):
         self.directory = directory
+        # The log port's cursors (contract §20.10): each new day file gets a
+        # random generation token in .<day>.gen first (off on Docker,
+        # where the Hub reads and prunes the files and would leave them).
+        self.generation = generation
         self.capacity = max(int(capacity), 1)
         self.gid = OPENED_GID if gid is None else gid
         self._seen: "collections.OrderedDict[Tuple[str, str], None]" = collections.OrderedDict()
@@ -2431,6 +2437,8 @@ class OpenedLog:
     def _write(self, now: datetime.datetime, line: bytes):
         self._ensure_dir()
         path = os.path.join(self.directory, now.strftime("%Y-%m-%d") + ".jsonl")
+        if self.generation and not os.path.lexists(path):
+            self._write_gen(now.strftime("%Y-%m-%d"))
         flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
                  | getattr(os, "O_CLOEXEC", 0))
         try:
@@ -2636,6 +2644,38 @@ class OpenedLog:
                 return pos
             pos += len(raw)
 
+    GEN_RE = re.compile(r"^[0-9a-f]{32}$")
+    GEN_FILE_RE = re.compile(r"^\.(\d{4}-\d{2}-\d{2})\.gen$")
+
+    def _write_gen(self, day: str):
+        """A new random generation for <day>'s file, written (atomically,
+        0640, the Hub's group) before the file is created, so no reader
+        ever sees the file without it."""
+        tmp = os.path.join(self.directory, f".{day}.gen.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), 0o640)
+        try:
+            os.write(fd, secrets.token_hex(16).encode())
+            os.fchmod(fd, 0o640)
+            if os.fstat(fd).st_gid != self.gid:
+                os.fchown(fd, -1, self.gid)
+        finally:
+            os.close(fd)
+        os.replace(tmp, os.path.join(self.directory, f".{day}.gen"))
+
+    def _read_gen(self, dfd: int, day: str) -> str:
+        """<day>'s generation token, "" when it has none (a file made
+        without the log port)."""
+        try:
+            fd = os.open(f".{day}.gen", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0),
+                         dir_fd=dfd)
+        except OSError:
+            return ""
+        try:
+            tok = os.read(fd, 64).decode("ascii", "replace").strip()
+        finally:
+            os.close(fd)
+        return tok if self.GEN_RE.match(tok) else ""
+
     @staticmethod
     def _unix(key: str) -> int:
         return int(datetime.datetime.strptime(key, "%Y-%m-%dT%H:%M:%SZ")
@@ -2645,29 +2685,32 @@ class OpenedLog:
     def _key(unix: int) -> str:
         return datetime.datetime.fromtimestamp(unix, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def read(self, from_key: Optional[str], cursor: Optional[Tuple[str, int, int]], limit: int,
-             max_bytes: int) -> Tuple[bytes, Tuple[str, int, int], bool]:
+    def read(self, from_key: Optional[str], cursor: Optional[Tuple[str, int, int, str]], limit: int,
+             max_bytes: int) -> Tuple[bytes, Tuple[str, int, int, str], bool]:
         """The log port's answer (contract §20.10): (body, next cursor,
-        truncated). Starts at `cursor` (day, byte offset, time: exclusive,
-        right after the last line served) or at the first line whose time
-        is at or after `from_key` (whole seconds, UTC), else at the start.
-        Lines in file order, exactly as on disk, whole lines record() wrote
-        only, at most `limit` and `max_bytes`; truncated = a cut stopped
-        the answer while another line was there. A cursor whose position
-        doesn't hold (not after a newline, past the end) restarts at its
-        time."""
+        truncated). Starts at `cursor` (day, byte offset, time, the day
+        file's generation: exclusive, right after the last line served;
+        CursorExpired when that day file is there with another generation
+        or the offset doesn't hold — a pruned day goes on with the later
+        ones) or at the first line, in file order, whose time is at or
+        after `from_key` (whole seconds, UTC), else at the start. Lines in
+        file order, exactly as on disk, whole lines record() wrote only, at
+        most `limit` and `max_bytes`; truncated = a cut stopped the answer
+        while another line was there."""
         dfd = self._open_dir()
         if cursor is not None:
-            day, off, t = cursor
+            day, off, t, gen = cursor
             from_key = None
         elif from_key is not None:
-            day, off, t = from_key[:10], None, self._unix(from_key)
+            day, off, t, gen = from_key[:10], None, self._unix(from_key), ""
         else:
-            day, off, t = "0001-01-01", 0, 0
+            day, off, t, gen = "0001-01-01", 0, 0, ""
         out: List[bytes] = []
         size = 0
-        nxt = (day, off or 0, t)
+        nxt = (day, off or 0, t, gen)
         if dfd is None:
+            if cursor is not None and gen:
+                raise CursorExpired()
             return b"", nxt, False
         try:
             for fday, name in self._day_files(dfd):
@@ -2677,27 +2720,30 @@ class OpenedLog:
                 if f is None:
                     continue
                 with f:
+                    fgen = self._read_gen(dfd, fday)
                     start = 0
                     if fday == day:
                         if off is None:
                             start = self._start_of(f, from_key)
                         else:
                             end = os.fstat(f.fileno()).st_size
-                            ok = off <= end
+                            ok = fgen == gen and off <= end
                             if ok and off > 0:
                                 f.seek(off - 1)
                                 ok = f.read(1) == b"\n"
-                            start = off if ok else self._start_of(f, self._key(t))
-                    nxt = (fday, start, t)
+                            if not ok:
+                                raise CursorExpired()
+                            start = off
+                    nxt = (fday, start, nxt[2], fgen)
                     for pos, body, lt in self._lines(f, start):
                         if lt is None:
-                            nxt = (fday, pos, nxt[2])
+                            nxt = (fday, pos, nxt[2], fgen)
                             continue
                         if len(out) >= limit or size + len(body) + 1 > max_bytes:
                             return b"".join(out), nxt, True
                         out.append(body + b"\n")
                         size += len(body) + 1
-                        nxt = (fday, pos, self._unix(lt))
+                        nxt = (fday, pos, self._unix(lt), fgen)
         finally:
             os.close(dfd)
         return b"".join(out), nxt, False
@@ -2724,6 +2770,13 @@ class OpenedLog:
             METRICS.inc("group_gate_opened_log_failures_total")
             return 0
         try:
+            for name in os.listdir(dfd):
+                m = self.GEN_FILE_RE.match(name)
+                if m and m.group(1) < cutoff and m.group(1) < today:
+                    try:
+                        os.unlink(name, dir_fd=dfd)
+                    except OSError:
+                        pass
             for day, name in self._day_files(dfd):
                 if not (day < cutoff and day < today):
                     continue
@@ -2756,7 +2809,7 @@ class OpenedLog:
             if stop.wait(every):
                 return
 
-OPENED_LOG = OpenedLog(OPENED_DIR)
+OPENED_LOG = OpenedLog(OPENED_DIR, generation=bool(LOG_PORT))
 
 
 def log_session_id(claims: dict, user: str) -> str:
@@ -4198,6 +4251,12 @@ class Handler(BaseHTTPRequestHandler):
 
 # The log port (contract §20.10).
 LOG_PATH = "/v1/log"
+
+
+class CursorExpired(Exception):
+    """The cursor's day file was replaced (another generation) or its
+    offset doesn't hold: 410 cursor_expired, the Hub restarts with from."""
+
 LOG_ANSWER_MAX = 4 << 20
 LOG_LIMIT_DEFAULT = 1000
 LOG_LIMIT_MAX = 10000
@@ -4205,7 +4264,7 @@ LOG_MAX_CONNECTIONS = 4
 LOG_REQUEST_DEADLINE = 30.0  # seconds, from the connection's accept
 RFC3339_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d{1,9})?([Zz]|[+-]\d{2}:\d{2})$")
 CURSOR_RE = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
-CURSOR_BODY_RE = re.compile(r"^gg1\|(\d{4}-\d{2}-\d{2})\|(0|[1-9]\d{0,9})\|(0|[1-9]\d{0,10})$")
+CURSOR_BODY_RE = re.compile(r"^gg2\|(\d{4}-\d{2}-\d{2})\|(0|[1-9]\d{0,9})\|(0|[1-9]\d{0,10})\|([0-9a-f]{32})?$")
 # One read at a time, held until its answer is written: at most one answer
 # (4 MiB) and one read buffer in memory, whoever asks how often.
 _LOG_READ_LOCK = threading.Lock()
@@ -4236,14 +4295,14 @@ def parse_rfc3339(text: str) -> Optional[datetime.datetime]:
     return t
 
 
-def encode_cursor(cur: Tuple[str, int, int]) -> str:
-    raw = f"gg1|{cur[0]}|{cur[1]}|{cur[2]}".encode()
+def encode_cursor(cur: Tuple[str, int, int, str]) -> str:
+    raw = f"gg2|{cur[0]}|{cur[1]}|{cur[2]}|{cur[3]}".encode()
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
 
 
-def decode_cursor(text: str) -> Tuple[str, int, int]:
-    """A cursor of encode_cursor (day, byte offset, unix time); ValueError
-    for anything else."""
+def decode_cursor(text: str) -> Tuple[str, int, int, str]:
+    """A cursor of encode_cursor (day, byte offset, unix time, the day
+    file's generation); ValueError for anything else."""
     if not CURSOR_RE.match(text):
         raise ValueError("malformed cursor")
     try:
@@ -4251,17 +4310,17 @@ def decode_cursor(text: str) -> Tuple[str, int, int]:
     except (ValueError, UnicodeDecodeError):
         raise ValueError("malformed cursor")
     m = CURSOR_BODY_RE.match(raw)
-    if not m or encode_cursor((m.group(1), int(m.group(2)), int(m.group(3)))) != text:
+    if not m or encode_cursor((m.group(1), int(m.group(2)), int(m.group(3)), m.group(4) or "")) != text:
         raise ValueError("malformed cursor")
     try:
         datetime.date.fromisoformat(m.group(1))
         OpenedLog._key(int(m.group(3)))
     except (ValueError, OverflowError, OSError):
         raise ValueError("malformed cursor")
-    return m.group(1), int(m.group(2)), int(m.group(3))
+    return m.group(1), int(m.group(2)), int(m.group(3)), m.group(4) or ""
 
 
-def log_query(query: str) -> Tuple[Optional[str], Optional[Tuple[str, int, int]], int]:
+def log_query(query: str) -> Tuple[Optional[str], Optional[Tuple[str, int, int, str]], int]:
     """(from as a whole-second UTC key, rounded up; cursor; limit) of a
     /v1/log query; ValueError (the 400's text) for anything else: an
     unknown or repeated parameter, both from and cursor, a `from` that
@@ -4400,6 +4459,9 @@ class LogHandler(BaseHTTPRequestHandler):
         try:
             try:
                 body, nxt, truncated = OPENED_LOG.read(from_key, cursor, limit, LOG_ANSWER_MAX)
+            except CursorExpired:
+                self._answer(410, b"cursor_expired\n")
+                return
             except Exception as e:  # noqa: BLE001 — the gate's requests are never affected
                 print(f"group-gate: log port: reading the opened log failed ({type(e).__name__})", flush=True)
                 self._answer(500, b"the opened log can't be read\n")

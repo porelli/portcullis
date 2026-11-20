@@ -4522,23 +4522,64 @@ class LogPortTest(GateTest):
         self.write_day("2026-11-20", [self.line("2026-11-20T08:00:00Z", "d.example.com")])
         self.assertEqual([x["host"] for x in self.page(f"cursor={cur}")[0]], ["d.example.com"])
 
-    def test_log_cursor_that_no_longer_holds_restarts_at_its_time(self):
+    def test_log_cursor_that_no_longer_holds_is_expired(self):
+        # A day file rewritten shorter, or longer with the cursor mid-line:
+        # 410 cursor_expired (the Hub restarts with from).
         self.write_day("2026-11-18", [self.line("2026-11-18T10:00:00Z", "a.example.com"),
                                       self.line("2026-11-18T10:00:05Z", "b.example.com"),
                                       self.line("2026-11-18T10:00:09Z", "c.example.com")])
-        _, cur, _ = self.page("limit=2")  # after b (10:00:05)
-        # The file rewritten shorter, then longer: the offset is mid-line or past the end.
+        _, cur, _ = self.page("limit=2")  # after b
         for docs in ([self.line("2026-11-18T10:00:05Z", "b.example.com")],
                      [self.line("2026-11-18T10:00:00Z", "a-long-name.example.com"),
-                      self.line("2026-11-18T10:00:05Z", "b.example.com"),
-                      self.line("2026-11-18T10:00:09Z", "c.example.com")]):
+                      self.line("2026-11-18T10:00:05Z", "b.example.com")]):
             os.remove(os.path.join(self.dir, "2026-11-18.jsonl"))
             self.write_day("2026-11-18", docs)
-            got = [x["time"] for x in self.page(f"cursor={cur}")[0]]
-            self.assertTrue(got and all(t >= "2026-11-18T10:00:05Z" for t in got), got)
+            code, _, body = self.call(f"/v1/log?cursor={cur}")
+            self.assertEqual((code, body), (410, b"cursor_expired\n"))
+
+    def test_log_cursor_expires_on_every_new_generation(self):
+        # With the log port on, each day file gets a generation token when
+        # it is created. Recreated twice, with the same bytes (so the old
+        # offsets still fall on line starts): every older cursor is 410.
+        log = gg.OpenedLog(self.dir, gid=os.getgid(), generation=True)
+        gg.OPENED_LOG = log
+        now = datetime.datetime(2026, 11, 18, 10, 0, tzinfo=datetime.timezone.utc)
+        recs = lambda: [log._write(now, (json.dumps(self.line("2026-11-18T10:00:00Z", f"h{i}.example.com"),
+                                                     separators=(",", ":")) + "\n").encode()) for i in range(4)]
+        recs()
+        gen_file = os.path.join(self.dir, ".2026-11-18.gen")
+        g1 = open(gen_file).read()
+        self.assertRegex(g1, r"^[0-9a-f]{32}$")
+        self.assertEqual(stat.S_IMODE(os.stat(gen_file).st_mode), 0o640)
+        _, c1, _ = self.page("limit=2")
+        self.assertEqual(gg.decode_cursor(c1)[3], g1)
+        self.assertEqual(len(self.page(f"cursor={c1}")[0]), 2)  # the same generation
+        cursors = [c1]
+        for _ in range(2):
+            os.remove(os.path.join(self.dir, "2026-11-18.jsonl"))
+            recs()
+            self.assertNotIn(open(gen_file).read(), [gg.decode_cursor(c)[3] for c in cursors])
+            for c in cursors:
+                self.assertEqual(self.call(f"/v1/log?cursor={c}")[0], 410)
+            cursors.append(self.page("limit=2")[1])
+        # A file made without the log port has no generation: its cursors hold.
+        self.write_day("2026-11-19", [self.line("2026-11-19T10:00:00Z")] * 3)
+        lines, cur, _ = self.page("from=2026-11-19T00:00:00Z&limit=1")
+        self.assertEqual(gg.decode_cursor(cur)[3], "")
+        self.assertEqual(len(self.page(f"cursor={cur}")[0]), 2)
+        # Pruning takes the generation files with their days.
+        old = "2026-10-01"  # an orphan generation file
+        open(os.path.join(self.dir, f".{old}.gen"), "w").write("0" * 32)
+        log.prune(7, now=datetime.datetime(2026, 12, 31, tzinfo=datetime.timezone.utc))
+        self.assertFalse(os.path.exists(gen_file))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, f".{old}.gen")))
+        # Without the log port (Docker) no generation file is ever written.
+        plain = os.path.join(tempfile.mkdtemp(dir=TMP), "opened")
+        gg.OpenedLog(plain, gid=os.getgid())._write(now, b'{"time":"2026-11-18T10:00:00Z"}\n')
+        self.assertEqual(os.listdir(plain), ["2026-11-18.jsonl"])
 
     def test_log_endpoint_bad_queries(self):
-        good = gg.encode_cursor(("2026-11-18", 0, 0))
+        good = gg.encode_cursor(("2026-11-18", 0, 0, ""))
         for q in ("limit=0", "limit=10001", "limit=20000", "limit=-1", "limit=1.5", "limit=", "limit=abc",
                   "limit=00001", "limit=01", "limit=%2B5",
                   "from=2026-11-18", "from=2026-11-18T10:00:00", "from=yesterday", "from=",
@@ -4548,10 +4589,13 @@ class LogPortTest(GateTest):
                   "from=0001-01-01T00:00:00%2B23:59", "from=9999-12-31T23:59:59.5Z",
                   "from=9999-12-31T23:59:59-23:59",
                   "cursor=", "cursor=***", "cursor=" + good + "A", f"cursor={good}&from=2026-11-18T10:00:00Z",
-                  "cursor=" + base64.urlsafe_b64encode(b"gg1|2026-11-18|01|0").decode().rstrip("="),
-                  "cursor=" + base64.urlsafe_b64encode(b"gg1|2026-02-30|0|0").decode().rstrip("="),
-                  "cursor=" + base64.urlsafe_b64encode(b"gg1|2026-11-18|0|999999999999").decode().rstrip("="),
-                  f"cursor={good}&cursor={good}"):
+                  "cursor=" + base64.urlsafe_b64encode(b"gg2|2026-11-18|01|0|").decode().rstrip("="),
+                  "cursor=" + base64.urlsafe_b64encode(b"gg2|2026-02-30|0|0|").decode().rstrip("="),
+                  "cursor=" + base64.urlsafe_b64encode(b"gg2|2026-11-18|0|999999999999|").decode().rstrip("="),
+                  f"cursor={good}&cursor={good}",
+                  "cursor=" + base64.urlsafe_b64encode(b"gg1|2026-11-18|0|0").decode().rstrip("="),
+                  "cursor=" + base64.urlsafe_b64encode(b"gg2|2026-11-18|0|0|ABC").decode().rstrip("="),
+                  "cursor=" + base64.urlsafe_b64encode(b"gg2|2026-11-18|0|0|" + b"A" * 32).decode().rstrip("=")):
             with self.subTest(q=q):
                 self.assertEqual(self.call("/v1/log?" + q)[0], 400)
         self.assertEqual(self.call(f"/v1/log?cursor={good}")[0], 200)

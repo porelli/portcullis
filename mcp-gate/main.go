@@ -165,7 +165,7 @@ func serve() error {
 	g, err := newGate(gateOptions{
 		Snapshot: store.Snapshot, Verifier: v, Hub: hub, HubSecret: hubSecret, HubURL: env("MCP_GATE_HUB_URL", defaultHubURL),
 		LogPath:  filepath.Join(env("MCP_GATE_DATA", defaultData), "access.jsonl"),
-		LogGroup: accesslog.DefaultGroup,
+		LogGroup: accesslog.DefaultGroup, LogGeneration: os.Getenv("MCP_GATE_LOG_LISTEN") != "",
 	})
 	if err != nil {
 		return err
