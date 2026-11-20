@@ -4800,8 +4800,15 @@ rc=0"
 # kubelet's flags; the CLI labels the registered node.
 expect_eq "kube_k3s_server_flags: no --node-label / --node-taint for the reserved prefixes" \
   "$(kik 'kube_k3s_server_flags' | grep -cE -- '^--node-(label|taint)=(portcullis\.io/|topology\.kubernetes\.io/|node\.longhorn\.io/|svccontroller\.k3s\.cattle\.io/)' || true)" "0"
-expect_eq "kube_install_k3s: after Ready, the CLI labels node-1 (k3s kubectl, its admin identity)" \
-  "$(grep -c '^kubectl label node node-1 --overwrite portcullis.io/class=home portcullis.io/site=main topology.kubernetes.io/zone=main portcullis.io/ingress=true svccontroller.k3s.cattle.io/enablelb=true portcullis.io/storage=true node.longhorn.io/create-default-disk=true$' "$WORK/k3s-calls.keep" 2>/dev/null || true)" "1"
+expect_eq "kube_install_k3s: after Ready, the CLI labels node-1, then removes its unlabelled taint (k3s kubectl, its admin identity)" \
+  "$(grep -nE '^kubectl (label|taint) node node-1' "$WORK/k3s-calls.keep" 2>/dev/null | cut -d: -f2-)" "kubectl label node node-1 --overwrite portcullis.io/class=home portcullis.io/site=main topology.kubernetes.io/zone=main portcullis.io/ingress=true svccontroller.k3s.cattle.io/enablelb=true portcullis.io/storage=true node.longhorn.io/create-default-disk=true
+kubectl taint node node-1 nodeadm.portcullis/unlabelled:NoSchedule-"
+expect_eq "kube_k3s_server_flags: the node registers with the unlabelled taint (the one registration portcullis-node-labels admits)" \
+  "$(kik 'kube_k3s_server_flags' | grep -cx -- '--node-taint=nodeadm.portcullis/unlabelled=true:NoSchedule')" "1"
+OUT="$(kik 'k3s() { case "$*" in *taint*) echo "error: taint \"nodeadm.portcullis/unlabelled:NoSchedule\" not found" >&2; return 1 ;; esac; }; _ki_label_node')"
+expect_eq "_ki_label_node: the taint already gone → fine" "$OUT" "rc=0"
+OUT="$(kik 'k3s() { case "$*" in *taint*) echo "error: Unauthorized" >&2; return 1 ;; esac; }; _ki_label_node')"
+case "$OUT" in *"could not remove the taint nodeadm.portcullis/unlabelled from the node node-1"*"rc=1") t_pass "_ki_label_node: a refused taint removal fails init" ;; *) t_fail "label taint fail: $OUT" ;; esac
 
 # The mesh: the private key generated here (0600), never printed and never
 # in the config (PostUp loads it), wg-quick@pcmesh enabled.

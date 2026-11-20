@@ -15,6 +15,7 @@
 --kubelet-arg=sync-frequency=10s
 --node-ip=10.215.0.1
 --node-name=node-1
+--node-taint=nodeadm.portcullis/unlabelled=true:NoSchedule
 --secrets-encryption
 --token-file=/etc/rancher/k3s/token
 --write-kubeconfig-mode=0600

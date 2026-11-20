@@ -124,14 +124,19 @@ _ki_node_class() {
 # The first node's Kubernetes name: its server id (contract §20.1, §17.3;
 # Task 17 ruling: default node-1, later nodes get theirs from the join code).
 KUBE_FIRST_NODE_NAME="${PORTCULLIS_NODE_NAME:-node-1}"
+# The registration taint of every node (ruling R-NODELABELS; nodeadm's
+# unlabelledTaint): off once the node is labelled.
+KUBE_UNLABELLED_TAINT="nodeadm.portcullis/unlabelled=true:NoSchedule"
 
 # kube_k3s_server_flags — the first server's flags, one per line (the
 # shared fixture tests/fixtures/k3s-server-flags.txt; nodeadm's join
 # answer follows it, contract §20.2 / §20.11). No placement label: the
 # kubelet may not set portcullis.io/, topology.kubernetes.io/,
 # node.longhorn.io/ or svccontroller.k3s.cattle.io/ labels on its own Node
-# (ruling R-NODELABELS); the CLI labels it once it registers
-# (_ki_label_node, kube_k3s_node_labels).
+# (ruling R-NODELABELS); it registers with the unlabelled taint (the only
+# registration portcullis-node-labels admits, as a joining node's) and the
+# CLI labels it and removes the taint once it registers (_ki_label_node,
+# kube_k3s_node_labels).
 kube_k3s_server_flags() {
   local ip="$KUBE_MESH_IP"
   [[ "$KUBE_FIRST_NODE_NAME" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || fail "PORTCULLIS_NODE_NAME must match ^[a-z][a-z0-9-]{0,30}$ (a server id)"
@@ -156,6 +161,7 @@ kube_k3s_server_flags() {
 --etcd-arg=listen-client-urls=https://$ip:2379,https://127.0.0.1:2379
 --etcd-arg=heartbeat-interval=200
 --etcd-arg=election-timeout=2000
+--node-taint=$KUBE_UNLABELLED_TAINT
 EOF
 }
 
@@ -178,14 +184,19 @@ EOF
   [ "$class" = small ] || printf '%s\n' "portcullis.io/storage=true" "node.longhorn.io/create-default-disk=true"
 }
 
-# _ki_label_node — the labels on the registered first node, as the CLI
-# (k3s's admin kubeconfig, never the kubelet's identity).
+# _ki_label_node — the labels on the registered first node, then its
+# unlabelled taint removed, as the CLI (k3s's admin kubeconfig, never the
+# kubelet's identity); before anything is scheduled on it (until then only
+# what tolerates the taint runs there). The taint already gone is fine.
 _ki_label_node() {
-  local labels=() l
+  local labels=() l n="$KUBE_FIRST_NODE_NAME" out
   while IFS= read -r l; do labels+=("$l"); done < <(kube_k3s_node_labels)
   [ "${#labels[@]}" -gt 0 ] || fail "could not compute the first node's labels"
-  _ki_sudo k3s kubectl label node "$KUBE_FIRST_NODE_NAME" --overwrite "${labels[@]}" >/dev/null \
-    || fail "could not label the node $KUBE_FIRST_NODE_NAME (re-run ./portcullis init)"
+  _ki_sudo k3s kubectl label node "$n" --overwrite "${labels[@]}" >/dev/null \
+    || fail "could not label the node $n (re-run ./portcullis init)"
+  if ! out="$(_ki_sudo k3s kubectl taint node "$n" "${KUBE_UNLABELLED_TAINT%%=*}:NoSchedule-" 2>&1)"; then
+    case "$out" in *"not found"*) ;; *) fail "could not remove the taint ${KUBE_UNLABELLED_TAINT%%=*} from the node $n (re-run ./portcullis init)" ;; esac
+  fi
 }
 
 # kube_flannel_conf — flannel's net-conf, used verbatim by k3s (so it

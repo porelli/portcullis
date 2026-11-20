@@ -339,9 +339,12 @@ func TestJoinFlagsEqualInitFlags(t *testing.T) {
 		want = append(want, l)
 	}
 	server := "https://10.215.0.1:6443"
-	// A joining node registers with nodeadm's unlabelled taint (it gets its
-	// labels from nodeadm, ruling R-NODELABELS).
-	want = append(want, "--server="+server, "--node-taint="+unlabelledTaint)
+	// Init and a joining node both register with the unlabelled taint (the
+	// fixture has it; labels come from nodeadm / the CLI, R-NODELABELS).
+	want = append(want, "--server="+server)
+	if !slices.Contains(want, "--node-taint="+unlabelledTaint) {
+		t.Fatal("the fixture lacks the unlabelled registration taint")
+	}
 	sort.Strings(want)
 	for _, f := range want {
 		if strings.HasPrefix(f, "--node-label=") || strings.HasPrefix(f, "--node-taint=portcullis.io/") {
