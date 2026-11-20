@@ -148,7 +148,20 @@ denied pods "$(printf '%s' "$POD" | sed 's/"portcullis.io\/instance":"e2e"/"port
 denied pods "$(printf '%s' "$POD" | sed 's/"portcullis.io\/instance":"e2e"/"portcullis.io\/instance":"e2e","portcullis.io\/vpn-slot":"47"/')"'}}'
 [ "$(KH -n "$APPS" auth can-i get pods --subresource=exec)" = no ] || fail "the Hub's ServiceAccount may get pods/exec (K2: create only)"
 [ "$(KH -n "$APPS" auth can-i create pods --subresource=exec)" = yes ] || fail "the Hub's ServiceAccount can't create pods/exec"
-[ "$(KH -n "$NS" auth can-i get secrets)" = no ] || fail "the Hub's ServiceAccount reads core Secrets"
+[ "$(KH -n "$NS" auth can-i get secrets)" = no ] || fail "the Hub's ServiceAccount reads core Secrets beyond pub-mcp-credentials"
+# The core namespace (contract §6, portcullis-hub-core): the published
+# Secret by name, get / update only; never portcullis-env; no create, list
+# or delete of Secrets, no create or delete of ConfigMaps.
+for verb in get update; do
+  [ "$(KH -n "$NS" auth can-i "$verb" secret/pub-mcp-credentials)" = yes ] || fail "the Hub's ServiceAccount can't $verb secret/pub-mcp-credentials"
+done
+[ "$(KH -n "$NS" auth can-i get secret/portcullis-env 2>/dev/null || true)" = no ] || fail "the Hub's ServiceAccount can get portcullis-env"
+for verb in create list delete; do
+  [ "$(KH -n "$NS" auth can-i "$verb" secrets 2>/dev/null || true)" = no ] || fail "the Hub's ServiceAccount may $verb Secrets in $NS"
+done
+for verb in create delete; do
+  [ "$(KH -n "$NS" auth can-i "$verb" configmaps 2>/dev/null || true)" = no ] || fail "the Hub's ServiceAccount may $verb ConfigMaps in $NS"
+done
 # Usage (contract §11.11): pod metrics read in the apps namespace; never
 # the kubelet's stats or proxy (nodes are cluster-scoped: no grant at all).
 [ "$(KH -n "$APPS" auth can-i list pods.metrics.k8s.io)" = yes ] || fail "the Hub's ServiceAccount can't list pod metrics"
@@ -156,7 +169,7 @@ for sub in stats proxy; do
   [ "$(KH auth can-i get nodes --subresource="$sub" 2>/dev/null || true)" = no ] || fail "the Hub's ServiceAccount may get nodes/$sub"
 done
 [ "$(KH -n "$APPS" auth can-i list nodes.metrics.k8s.io 2>/dev/null || true)" = no ] || fail "the Hub's ServiceAccount lists node metrics"
-pass "the guard refuses a hostPath outside the roots, a NodePort, a foreign helper image and vpn-slot 47, each by its binding; pods/exec is create only"
+pass "the guard refuses a hostPath outside the roots, a NodePort, a foreign helper image and vpn-slot 47, each by its binding; pods/exec is create only; in the core namespace the Hub gets / updates only secret/pub-mcp-credentials (never portcullis-env; no Secret create, list or delete; no ConfigMap create or delete)"
 # The apps' Traefik objects live in portcullis-edge: every refusal there.
 bash .github/ci/e2e-k3s-edge-admission.sh ci
 # The Hub's route shape routes: edge ExternalName → the app pod.
@@ -176,7 +189,10 @@ bash .github/ci/e2e-k3s-rebind.sh
 
 # ── Secret access of every ServiceAccount (least privilege) ──
 # Traefik reads Secrets only in the edge namespace (it holds none), the Hub
-# only in the apps namespace; nobody else anywhere of ours or kube-system.
+# only in the apps namespace (and, by name, the Secret pub-mcp-credentials
+# in the core namespace: a by-name rule answers no to these name-less
+# checks, the by-name ones are above); nobody else anywhere of ours or
+# kube-system.
 [ "$(K auth can-i get secret/portcullis-env -n "$NS" --as="system:serviceaccount:$NS:traefik" 2>/dev/null || true)" = no ] \
   || fail "Traefik's ServiceAccount can get portcullis-env"
 [ "$(K -n "$EDGE" get secrets -o json | jq '.items | length')" = 0 ] || fail "the edge namespace holds a Secret (Traefik reads every Secret there)"
@@ -194,7 +210,7 @@ while IFS= read -r sa; do
 done < <(K get serviceaccounts -A -o json | jq -r --arg a "$NS" --arg b "$APPS" --arg c "$EDGE" --arg d "$STORAGE" \
   '.items[] | select(.metadata.namespace as $n | [$a, $b, $c, $d] | index($n)) | "\(.metadata.namespace)/\(.metadata.name)"')
 [ "$n" -ge 4 ] || fail "only $n ServiceAccounts found in our namespaces"
-pass "Secret access: Traefik only $EDGE (no Secret there, never portcullis-env), the Hub only $APPS, the other $((n - 2)) ServiceAccounts none"
+pass "Secret access: Traefik only $EDGE (no Secret there, never portcullis-env), the Hub only $APPS, and in $NS the Secret pub-mcp-credentials by name, the other $((n - 2)) ServiceAccounts none"
 
 # ── revocation within 10 s ──
 SER="$(cat "$T/../e2e-k3s-serial" 2>/dev/null || true)"

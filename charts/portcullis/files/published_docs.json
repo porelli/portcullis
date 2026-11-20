@@ -1,0 +1,117 @@
+[
+ {
+  "doc": "group-gate-policy",
+  "object": "pub-group-gate-policy",
+  "kind": "configmap",
+  "key": "group-gate-policy.json",
+  "mount": "/hub-data",
+  "readers": [
+   "group-gate"
+  ],
+  "mode": "0444",
+  "fs_group": null,
+  "rev_path": "/hub-data/.rev-group-gate-policy",
+  "optional": true
+ },
+ {
+  "doc": "user-attributes",
+  "object": "pub-user-attributes",
+  "kind": "configmap",
+  "key": "user-attributes.json",
+  "mount": "/hub-data",
+  "readers": [
+   "group-gate",
+   "mcp-gate"
+  ],
+  "mode": "0444",
+  "fs_group": null,
+  "rev_path": "/hub-data/.rev-user-attributes",
+  "optional": true
+ },
+ {
+  "doc": "portal-apps",
+  "object": "pub-portal-apps",
+  "kind": "configmap",
+  "key": "portal-apps.json",
+  "mount": "/hub-data",
+  "readers": [
+   "group-gate"
+  ],
+  "mode": "0444",
+  "fs_group": null,
+  "rev_path": "/hub-data/.rev-portal-apps",
+  "optional": true
+ },
+ {
+  "doc": "signin-keycloak",
+  "object": "pub-signin-keycloak",
+  "kind": "configmap",
+  "key": "signin-keycloak.json",
+  "mount": "/hub-data",
+  "readers": [
+   "keycloak"
+  ],
+  "mode": "0444",
+  "fs_group": null,
+  "rev_path": "/hub-data/.rev-signin-keycloak",
+  "optional": true
+ },
+ {
+  "doc": "impersonation",
+  "object": "pub-impersonation",
+  "kind": "configmap",
+  "key": "impersonation.json",
+  "mount": "/hub-data",
+  "readers": [
+   "group-gate",
+   "keycloak"
+  ],
+  "mode": "0444",
+  "fs_group": null,
+  "rev_path": "/hub-data/.rev-impersonation",
+  "optional": true
+ },
+ {
+  "doc": "mcp-gate",
+  "object": "pub-mcp-gate",
+  "kind": "configmap",
+  "key": "mcp-gate.json",
+  "mount": "/hub-data",
+  "readers": [
+   "mcp-gate"
+  ],
+  "mode": "0444",
+  "fs_group": null,
+  "rev_path": "/hub-data/.rev-mcp-gate",
+  "optional": true
+ },
+ {
+  "doc": "mcp-credentials",
+  "object": "pub-mcp-credentials",
+  "kind": "secret",
+  "key": "mcp-credentials.json",
+  "mount": "/hub-data",
+  "readers": [
+   "mcp-gate"
+  ],
+  "mode": "0440",
+  "fs_group": 10001,
+  "rev_path": "/hub-data/.rev-mcp-credentials",
+  "optional": true
+ },
+ {
+  "doc": "vpn",
+  "object": "pub-vpn",
+  "kind": "configmap",
+  "key": "vpn.json",
+  "mount": "/vpn-doc",
+  "readers": [
+   "group-gate",
+   "wg"
+  ],
+  "mode": "0444",
+  "fs_group": null,
+  "rev_path": "/vpn-doc/.rev-vpn",
+  "optional": true
+ }
+]

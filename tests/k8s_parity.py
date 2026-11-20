@@ -374,6 +374,9 @@ def published_problems(docs):
     read-only in its container; no other pod projects a pub-* object."""
     out = []
     rows = json.loads((K.ROOT / "tests" / "published_docs.json").read_text())
+    # The chart renders from its own byte copy: both are the Hub's file.
+    if (K.CHART / "files" / "published_docs.json").read_bytes() != (K.ROOT / "tests" / "published_docs.json").read_bytes():
+        out.append("charts/portcullis/files/published_docs.json differs from tests/published_docs.json (both are byte copies of the Hub's)")
     objs = {(d["kind"], d["metadata"]["name"]): d for d in docs if d.get("kind") in ("ConfigMap", "Secret")
             and d["metadata"]["name"].startswith("pub-")}
     want = {("Secret" if r["kind"] == "secret" else "ConfigMap", r["object"]) for r in rows}

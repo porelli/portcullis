@@ -34,9 +34,13 @@ WRITABLE_ROOT_OK = {"keycloak"}  # compose: not read_only (`start` re-augments)
 # ServiceAccount (namespace/name) → the namespaces whose Secrets it may read.
 SECRET_READERS = {
     f"{K.NS}/traefik": {K.EDGE_NS},
-    # The core namespace: only pub-mcp-credentials, by name (check_hub_core).
-    f"{K.NS}/portcullis-hub": {K.APPS_NS, K.NS},
+    f"{K.NS}/portcullis-hub": {K.APPS_NS},
 }
+# By-name Secret grants that don't make a ServiceAccount a reader of the
+# namespace: (namespace, ServiceAccount) → the names its rules may list.
+# The Hub's portcullis-hub-core: the published Secret only (contract §6).
+# Any rule, from any Role, granting it more Secrets there counts in full.
+SECRET_BY_NAME = {(K.NS, f"{K.NS}/portcullis-hub"): {"pub-mcp-credentials"}}
 SECRET_READ_VERBS = {"get", "list", "watch", "*"}
 RESTRICTED_VOLUMES = {"configMap", "csi", "downwardAPI", "emptyDir", "ephemeral", "persistentVolumeClaim", "projected", "secret"}
 
@@ -196,6 +200,29 @@ def check_hub_core():
     docs = K.render() + K.render({"oneshot": "hub"}, "templates/oneshot.yaml")
     if not any(n == "oneshot-hub" for n, *_ in K.pod_specs(docs)):
         F.add("the hub one-shot isn't rendered (check_hub_core's exception is stale)")
+    # A by-name grant is allowed only for exactly its names: an extra Role
+    # giving the Hub any other Secret of the core namespace (or all) counts.
+    base = K.render()
+    hub_sa = f"{K.NS}/portcullis-hub"
+    if secret_access(base).get(hub_sa) != {K.APPS_NS}:
+        F.add(f"the Hub's Secret access {secret_access(base).get(hub_sa)} (want {K.APPS_NS}, plus pub-mcp-credentials by name)")
+    for names in (None, ["portcullis-env"], ["pub-mcp-credentials", "portcullis-env"]):
+        rule = {"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"]}
+        if names:
+            rule["resourceNames"] = names
+        extra = [{"kind": "Role", "metadata": {"name": "x", "namespace": K.NS}, "rules": [rule]},
+                 {"kind": "RoleBinding", "metadata": {"name": "x", "namespace": K.NS}, "roleRef": {"kind": "Role", "name": "x"},
+                  "subjects": [{"kind": "ServiceAccount", "name": "portcullis-hub", "namespace": K.NS}]}]
+        if K.NS not in secret_access(base + extra).get(hub_sa, set()):
+            F.add(f"secret_access misses a second Role giving the Hub core Secrets {names or 'all'} (mutation test)")
+    # The byte copy's namespace is rewritten to the release namespace.
+    other = "portcullis-x"
+    out = K.subprocess.run([K.os.environ.get("HELM", "helm"), "template", "portcullis", str(K.CHART), "-n", other,
+                            "-f", str(K.ROOT / "tests" / "k8s-ci-values.yaml"), "-f", "/dev/stdin", "--show-only", "templates/hub-rbac.yaml"],
+                           input=yaml.safe_dump(K.images_values()), check=True, capture_output=True, text=True).stdout
+    core = [d for d in yaml.safe_load_all(out) if d and d.get("kind") == "Role" and d["metadata"]["name"] == "portcullis-hub-core"]
+    if len(core) != 1 or core[0]["metadata"]["namespace"] != other:
+        F.add(f"portcullis-hub-core doesn't follow the release namespace ({other}): {[c['metadata'].get('namespace') for c in core]}")
 
 
 LOG_PORTS = {"group-gate": ("GATE_LOG_PORT", "8091", 8091), "mcp-gate": ("MCP_GATE_LOG_LISTEN", ":8092", 8092),
@@ -293,11 +320,13 @@ def check_log_ports():
     pinned = any(gate_mounts_shared(sp) for sp in gate_pod_specs(two).values())
     if pinned != any("pinned" in p for p in gate_shape_problems(two)):
         F.add("ha: the gate pinning check doesn't follow the hub-data / vpn-doc mounts")
-    try:
-        K.render({"ha": {"enabled": True, "gateReplicas": 0}})
-        F.add("ha: gateReplicas 0 renders (must be refused)")
-    except K.subprocess.CalledProcessError:
-        pass
+    for n in (0, 17):
+        try:
+            K.render({"ha": {"enabled": True, "gateReplicas": n}})
+            F.add(f"ha: gateReplicas {n} renders (must be refused: the Hub takes 1-16)")
+        except K.subprocess.CalledProcessError:
+            pass
+    K.render({"ha": {"enabled": True, "gateReplicas": 16}})
     pvcs = {c["metadata"]["name"] for c in K.by_kind(ha, "PersistentVolumeClaim")}
     if pvcs & {"group-gate-data", "mcp-gate-data"}:
         F.add(f"ha: the shared gate PVCs still render: {sorted(pvcs & {'group-gate-data', 'mcp-gate-data'})}")
@@ -823,11 +852,15 @@ def secret_access(docs):
         if role is None:
             F.add(f"{b['kind']} {bns}/{b['metadata']['name']}: its {ref['kind']} {ref['name']} isn't rendered")
             continue
-        if not any(reads_secrets(r) for r in role.get("rules", [])):
+        rules = [r for r in role.get("rules", []) if reads_secrets(r)]
+        if not rules:
             continue
         where = bns if b["kind"] == "RoleBinding" else "*"
         for s in b.get("subjects", []):
             key = f"{s.get('namespace', bns)}/{s['name']}" if s["kind"] == "ServiceAccount" else f"{s['kind']}:{s['name']}"
+            names = SECRET_BY_NAME.get((where, key))
+            if names is not None and all(r.get("resourceNames") and set(r["resourceNames"]) <= names for r in rules):
+                continue
             out.setdefault(key, set()).add(where)
     return out
 

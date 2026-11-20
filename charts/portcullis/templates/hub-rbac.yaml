@@ -49,7 +49,9 @@ subjects:
     name: portcullis-hub
     namespace: {{ .Release.Namespace }}
 ---
-{{ .Files.Get "files/hub-role-core.yaml" | replace "\n  namespace: portcullis\n" (printf "\n  namespace: %s\n" .Release.Namespace) }}
+{{- $core := .Files.Get "files/hub-role-core.yaml" }}
+{{- if ne (len (regexFindAll "\n  namespace: portcullis\n" $core -1)) 1 }}{{ fail "files/hub-role-core.yaml: not exactly one metadata.namespace: portcullis line to rewrite to the release namespace" }}{{ end }}
+{{ $core | replace "\n  namespace: portcullis\n" (printf "\n  namespace: %s\n" .Release.Namespace) }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

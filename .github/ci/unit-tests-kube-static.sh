@@ -153,6 +153,8 @@ copies="charts/portcullis/files/hub-role.yaml=internal/runtime/kube/testdata/rol
 copies="$copies charts/portcullis/files/hub-role-core.yaml=internal/runtime/kube/testdata/role-core.yaml"
 # HA vectors (contract §4, §20.3, §20.11): byte copies of the Hub's.
 copies="$copies tests/published_docs.json=internal/publish/testdata/published_docs.json"
+# The chart renders the published documents from its own copy.
+copies="$copies charts/portcullis/files/published_docs.json=internal/publish/testdata/published_docs.json"
 copies="$copies nodeadm/testdata/joincode_v2_vectors.json=internal/servers/testdata/joincode_v2_vectors.json"
 copies="$copies nodeadm/testdata/site_roles_vectors.json=internal/servers/testdata/site_roles_vectors.json"
 # The admission vectors (the HA cases run in e2e-k3s-apps-admission.sh).

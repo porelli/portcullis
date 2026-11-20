@@ -324,7 +324,7 @@ bound: netpol-gate-logs.yaml admits the Hub alone on the log port).
 */}}
 {{- define "portcullis.haGate" -}}
 {{- $s := .s -}}
-{{- if lt (int .root.Values.ha.gateReplicas) 1 }}{{ fail "ha.gateReplicas must be at least 1" }}{{ end -}}
+{{- if or (lt (int .root.Values.ha.gateReplicas) 1) (gt (int .root.Values.ha.gateReplicas) 16) }}{{ fail "ha.gateReplicas must be 1-16 (the Hub's HUB_GATE_REPLICAS bound)" }}{{ end -}}
 {{- $vols := list -}}
 {{- range $s.volumes }}{{ if ne .name "data" }}{{ $vols = append $vols . }}{{ end }}{{ end -}}
 {{- $_ := set $s "volumes" $vols -}}
@@ -357,19 +357,15 @@ spec:
 
 {{/*
 portcullis.pubDocs — the published documents (contract §4 "On Kubernetes:
-published documents"): the rows of tests/published_docs.json (the Hub's
-internal/publish/testdata/, byte-copied), as a YAML list; k8s_parity
-compares them. mode is decimal (0444 = 292, 0440 = 288).
+published documents"): the rows of files/published_docs.json, the byte
+copy of the Hub's internal/publish/testdata/published_docs.json (CI
+compares it, and tests/published_docs.json, with the Hub's), as a YAML
+list. mode stays the row's octal string ("0444"): `int` reads it as octal.
 */}}
 {{- define "portcullis.pubDocs" -}}
-- {doc: group-gate-policy, object: pub-group-gate-policy, kind: configmap, key: group-gate-policy.json, mount: /hub-data, readers: [group-gate], mode: 292}
-- {doc: user-attributes, object: pub-user-attributes, kind: configmap, key: user-attributes.json, mount: /hub-data, readers: [group-gate, mcp-gate], mode: 292}
-- {doc: portal-apps, object: pub-portal-apps, kind: configmap, key: portal-apps.json, mount: /hub-data, readers: [group-gate], mode: 292}
-- {doc: signin-keycloak, object: pub-signin-keycloak, kind: configmap, key: signin-keycloak.json, mount: /hub-data, readers: [keycloak], mode: 292}
-- {doc: impersonation, object: pub-impersonation, kind: configmap, key: impersonation.json, mount: /hub-data, readers: [group-gate, keycloak], mode: 292}
-- {doc: mcp-gate, object: pub-mcp-gate, kind: configmap, key: mcp-gate.json, mount: /hub-data, readers: [mcp-gate], mode: 292}
-- {doc: mcp-credentials, object: pub-mcp-credentials, kind: secret, key: mcp-credentials.json, mount: /hub-data, readers: [mcp-gate], mode: 288}
-- {doc: vpn, object: pub-vpn, kind: configmap, key: vpn.json, mount: /vpn-doc, readers: [group-gate, wg], mode: 292}
+{{- $rows := .Files.Get "files/published_docs.json" | fromJsonArray -}}
+{{- if not $rows }}{{ fail "files/published_docs.json: no rows (the Hub's published_docs.json byte copy)" }}{{ end -}}
+{{- toYaml $rows -}}
 {{- end }}
 
 {{/*
