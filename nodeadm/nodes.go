@@ -51,7 +51,9 @@ type clusterNode struct {
 	Ready     bool
 	Mesh      string
 	Addresses NodeAddresses
-	Node      *corev1.Node
+	// RawLAN: its LAN addresses before the uniqueness rule (dedupeLAN).
+	RawLAN []string
+	Node   *corev1.Node
 }
 
 func nodeReady(n *corev1.Node) bool {
@@ -135,9 +137,15 @@ func (s *Server) clusterNodes(ctx context.Context) ([]clusterNode, error) {
 	for i := range l.Items {
 		c := toClusterNode(&l.Items[i])
 		c.Addresses = s.cleanAddrs(c.Addresses)
+		c.RawLAN = append([]string{}, c.Addresses.LAN...)
 		out = append(out, c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	st, err := s.load(ctx)
+	if err != nil {
+		st = nil
+	}
+	dedupeLAN(out, st)
 	return out, nil
 }
 

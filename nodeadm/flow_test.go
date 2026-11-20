@@ -408,11 +408,14 @@ func secretFlow(t *testing.T) (*harness, []string, [][]byte) {
 		return w
 	}
 	h.agents.onRotate = func(_, step, tok string) {
-		if step == "rotate" {
-			h.boot.mu.Lock()
+		h.boot.mu.Lock()
+		switch step {
+		case "rotate":
 			h.boot.current = tok
-			h.boot.mu.Unlock()
+		case "rotate-agent":
+			h.boot.agent = tok
 		}
+		h.boot.mu.Unlock()
 	}
 	var secrets []string
 	ja := h.issue(t, "n4", "agent", "cloud", "main", "10.215.0.4")
@@ -459,7 +462,7 @@ func secretFlow(t *testing.T) (*harness, []string, [][]byte) {
 func TestJoinNeverLogsSecrets(t *testing.T) {
 	h, secrets, answers := secretFlow(t)
 	logs := h.logs.String()
-	if !strings.Contains(logs, "token_id=") || !strings.Contains(logs, "server token rotated") {
+	if !strings.Contains(logs, "token_id=") || !strings.Contains(logs, "server and agent tokens rotated") {
 		t.Fatalf("the flow didn't run through: %s", logs)
 	}
 	for _, sc := range secrets {
@@ -551,8 +554,11 @@ func TestRevokeRotatesServerToken(t *testing.T) {
 		st.Nodes["n2"] = &nodeRecord{Role: "server", Serial: "12:34", MeshIP: "10.215.0.2"}
 	})
 	h.agents.onRotate = func(_, step, tok string) {
-		if step == "rotate" {
+		switch step {
+		case "rotate":
 			h.boot.current = tok
+		case "rotate-agent":
+			h.boot.agent = tok
 		}
 	}
 	w := h.internal(clientHub, "DELETE", "/v1/nodes/n2?mode=revoke", nil)
@@ -565,22 +571,40 @@ func TestRevokeRotatesServerToken(t *testing.T) {
 	if !slices.Equal(h.etcd.removed, []uint64{2}) || !slices.Equal(h.enroll.revoked, []string{"12:34"}) {
 		t.Fatalf("etcd %v, revoked %v", h.etcd.removed, h.enroll.revoked)
 	}
-	if want := []string{"rotate:n1", "apply:n1", "apply:n3", "apply:n4"}; !slices.Equal(h.agents.rotations, want) {
+	if want := []string{"rotate:n1", "rotate-agent:n1", "apply:n1", "apply-agent:n1", "apply:n3", "apply-agent:n3", "apply:n4"}; !slices.Equal(h.agents.rotations, want) {
 		t.Fatalf("rotations %v", h.agents.rotations)
 	}
-	// No call to an agent ever carries a server token (old or new): it
-	// gets the agent token; the servers the new server token.
+	// Both tokens are new; no call to an agent ever carries a server token
+	// (old or new): agents get the new agent token, the servers the new
+	// server token (apply) and the new agent token (apply-agent).
+	sec, _ := h.kube.CoreV1().Secrets(coreNS).Get(ctx, tokenSecret, metav1.GetOptions{})
+	newAgent := string(sec.Data[agentTokenKey])
+	if newAgent == testAgentToken || !strings.HasPrefix(newAgent, "K10"+caHash(testServerToken)+"::node:") {
+		t.Fatalf("the agent token isn't rotated: %.20q", newAgent)
+	}
 	for i, step := range h.agents.rotations {
 		tok := h.agents.tokens[i]
-		if step == "apply:n4" && (tok != testAgentToken || strings.Contains(tok, "::server:")) {
-			t.Fatalf("the agent n4 was sent %.12q", tok)
-		}
-		if step != "apply:n4" && (tok == testAgentToken || !strings.Contains(tok, "::server:")) {
-			t.Fatalf("%s was sent a non-server token", step)
+		switch {
+		case strings.HasSuffix(step, ":n4"):
+			if tok != newAgent || strings.Contains(tok, "::server:") {
+				t.Fatalf("the agent n4 was sent %.12q", tok)
+			}
+		case strings.HasPrefix(step, "apply-agent:"), strings.HasPrefix(step, "rotate-agent:"):
+			if tok != newAgent {
+				t.Fatalf("%s: not the new agent token", step)
+			}
+		default:
+			if !strings.Contains(tok, "::server:") || tok == testServerToken {
+				t.Fatalf("%s: not the new server token", step)
+			}
 		}
 	}
-	if sec, _ := h.kube.CoreV1().Secrets(coreNS).Get(ctx, tokenSecret, metav1.GetOptions{}); string(sec.Data[agentTokenKey]) != testAgentToken {
-		t.Fatal("the rotation lost the agent token")
+	// The revoked node's old agent token is refused, the new one admitted.
+	if st, _ := h.boot.AgentStatus(ctx, "10.215.0.1", testAgentToken); st != 401 {
+		t.Fatalf("the old agent token answers %d", st)
+	}
+	if st, _ := h.boot.AgentStatus(ctx, "10.215.0.1", newAgent); st != 200 {
+		t.Fatalf("the new agent token answers %d", st)
 	}
 	tok, _ := h.s.serverToken(ctx)
 	if tok == testServerToken || tok != h.boot.current || caHash(tok) != caHash(testServerToken) || !strings.Contains(tok, "::server:") {
@@ -928,4 +952,74 @@ func TestEnrolRefusesBadAddresses(t *testing.T) {
 	if a := h.s.cleanAddrs(NodeAddresses{Mesh: "10.215.0.1", LAN: []string{"127.0.0.1", "192.0.2.10"}, Public: []string{"10.0.0.1", "8.8.8.8"}}); !slices.Equal(a.LAN, []string{"192.0.2.10"}) || !slices.Equal(a.Public, []string{"8.8.8.8"}) {
 		t.Fatalf("cleanAddrs %+v", a)
 	}
+}
+
+// TestLANUniqueness: a LAN address two nodes claim (annotations, status or
+// an enrolment record) is dropped on both; an enrolment racing another for
+// one LAN address is refused inside the compare-and-swap.
+func TestLANUniqueness(t *testing.T) {
+	nodes := append([]nodeSpec{}, baseNodes...)
+	nodes[1].lan = []string{"192.0.2.11"} // n2 claims n1's LAN address
+	h := newHarness(t, nodes...)
+	ctx := context.Background()
+	cl, err := h.s.clusterNodes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range cl[:2] {
+		if contains(c.Addresses.LAN, "192.0.2.11") {
+			t.Fatalf("%s keeps a LAN address another node holds", c.Name)
+		}
+	}
+	if !contains(cl[2].Addresses.LAN, "192.0.2.13") {
+		t.Fatal("n3's own LAN address dropped")
+	}
+	// A pending record claiming n3's LAN address: n3 loses it too.
+	lan := "192.0.2.13:51830"
+	h.putState(t, func(st *nodeadmState) {
+		st.Nodes["n9"] = &nodeRecord{Role: "agent", Class: "home", Site: "main", MeshIP: "10.215.0.9", Serial: "aa",
+			Mesh: MeshReport{Pub: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=", LAN: &lan}}
+	})
+	cl, _ = h.s.clusterNodes(ctx)
+	if contains(cl[2].Addresses.LAN, "192.0.2.13") {
+		t.Fatal("n3 keeps a LAN address a record claims")
+	}
+	// TOCTOU: the address is free when the report is checked, taken
+	// before the compare-and-swap (another enrolment won it).
+	h = newHarness(t)
+	j := h.issue(t, "n4", "agent", "cloud", "main", "10.215.0.4")
+	nonce := h.nonce(t, "n4")
+	mine := "192.168.50.5:51830"
+	h.s.store = &racingStore{memStore: h.store, before: func(st *nodeadmState) {
+		st.Nodes["n5"] = &nodeRecord{Role: "agent", MeshIP: "10.215.0.5", Serial: "bb",
+			Mesh: MeshReport{Pub: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=", LAN: &mine}}
+	}}
+	body, _ := json.Marshal(enrolReq{ServerID: "n4", Nonce: nonce, Proof: j.proof(nonce), CSR: j.csrPEM,
+		Mesh: MeshReport{Pub: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=", LAN: &mine}})
+	w := h.public("POST", "/node/v1/enrol", body, nil)
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "is node n5's") {
+		t.Fatalf("racing enrol: %d %s", w.Code, w.Body)
+	}
+	if st, _, _ := h.store.Load(ctx); st.Codes["n4"].Used || len(h.enroll.signed) != 0 {
+		t.Fatal("the refused enrolment burnt the code or signed")
+	}
+}
+
+// racingStore injects another writer's change the first time the state is
+// read inside a compare-and-swap (the third load: after the proof's read
+// and the report's check).
+type racingStore struct {
+	*memStore
+	before func(*nodeadmState)
+	loads  int
+}
+
+func (r *racingStore) Load(ctx context.Context) (*nodeadmState, string, error) {
+	r.loads++
+	if r.loads == 3 && r.before != nil {
+		st, ver, _ := r.memStore.Load(ctx)
+		r.before(st)
+		r.memStore.Save(ctx, st, ver)
+	}
+	return r.memStore.Load(ctx)
 }

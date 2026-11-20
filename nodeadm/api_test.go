@@ -264,11 +264,14 @@ func setupCase(t *testing.T, vs *apiVectors, c apiCase) (*harness, []byte, map[s
 			}
 		}
 		h.agents.onRotate = func(_, step, tok string) {
-			if step == "rotate" {
-				h.boot.mu.Lock()
+			h.boot.mu.Lock()
+			switch step {
+			case "rotate":
 				h.boot.current = tok
-				h.boot.mu.Unlock()
+			case "rotate-agent":
+				h.boot.agent = tok
 			}
+			h.boot.mu.Unlock()
 		}
 	}
 	return h, body, hdr
@@ -430,7 +433,7 @@ func checkCaseEffects(t *testing.T, h *harness, c apiCase) {
 		if len(h.etcd.removed) != 1 || h.etcd.removed[0] != 3 {
 			t.Errorf("etcd removed %v", h.etcd.removed)
 		}
-		if want := []string{"rotate:n1", "apply:n1", "apply:n2", "apply:n4"}; !slices.Equal(h.agents.rotations, want) {
+		if want := []string{"rotate:n1", "rotate-agent:n1", "apply:n1", "apply-agent:n1", "apply:n2", "apply-agent:n2", "apply:n4"}; !slices.Equal(h.agents.rotations, want) {
 			t.Errorf("rotations %v, want %v", h.agents.rotations, want)
 		}
 		tok, _ := h.s.serverToken(ctx)

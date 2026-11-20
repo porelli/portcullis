@@ -359,6 +359,15 @@ func (s *Server) handleEnrol(w http.ResponseWriter, r *http.Request) error {
 		if cur == nil || cur.KeySHA256 != c.KeySHA256 || cur.Used {
 			return errProof
 		}
+		// The LAN address again, against this state (two enrolments racing
+		// for one address: the second is refused here).
+		if req.Mesh.LAN != nil {
+			if ap, err := netip.ParseAddrPort(*req.Mesh.LAN); err == nil {
+				if err := lanFree(ap.Addr().String(), req.ServerID, cl, st); err != nil {
+					return errPlain(http.StatusBadRequest, "the enrolment report is refused: %v", err)
+				}
+			}
+		}
 		cur.Used, cur.KeySHA256 = true, ""
 		code = *cur
 		st.Nodes[req.ServerID] = &nodeRecord{Role: cur.Role, Class: cur.Class, Site: cur.Site, MeshIP: cur.MeshIP,

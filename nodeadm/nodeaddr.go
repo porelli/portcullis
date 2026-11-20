@@ -62,6 +62,58 @@ func (s *Server) cleanAddrs(a NodeAddresses) NodeAddresses {
 	return out
 }
 
+// lanHolders: every LAN address → the nodes holding it (live nodes' raw
+// addresses, enrolment records that aren't removed).
+func lanHolders(cl []clusterNode, st *nodeadmState) map[string]map[string]bool {
+	h := map[string]map[string]bool{}
+	add := func(a, id string) {
+		if h[a] == nil {
+			h[a] = map[string]bool{}
+		}
+		h[a][id] = true
+	}
+	for _, c := range cl {
+		for _, a := range c.RawLAN {
+			add(a, c.Name)
+		}
+	}
+	if st != nil {
+		for id, r := range st.Nodes {
+			if !r.Removed {
+				for _, a := range reportAddrs(r).LAN {
+					add(a, id)
+				}
+			}
+		}
+	}
+	return h
+}
+
+// lanTaken: another node than id holds a.
+func lanTaken(h map[string]map[string]bool, a, id string) string {
+	for o := range h[a] {
+		if o != id {
+			return o
+		}
+	}
+	return ""
+}
+
+// dedupeLAN drops from every node a LAN address another node also holds
+// (a self-reported address nobody can vouch for: dropped on both sides).
+func dedupeLAN(cl []clusterNode, st *nodeadmState) {
+	h := lanHolders(cl, st)
+	for i := range cl {
+		keep := []string{}
+		for _, a := range cl[i].Addresses.LAN {
+			if lanTaken(h, a, cl[i].Name) == "" {
+				keep = append(keep, a)
+			}
+		}
+		cl[i].Addresses.LAN = keep
+	}
+}
+
 // checkReport validates and normalises an enrolment report: the LAN
 // endpoint's address by lanCheck and held by no other node, the public
 // endpoint's by the public rule (several nodes may share a NAT's public
@@ -77,15 +129,8 @@ func (s *Server) checkReport(m MeshReport, id string, cl []clusterNode, st *node
 			return out, fmt.Errorf("the LAN endpoint: %v", err)
 		}
 		a := ap.Addr().String()
-		for _, c := range cl {
-			if c.Name != id && (contains(c.Addresses.LAN, a) || contains(c.Addresses.Public, a) || c.Mesh == a) {
-				return out, fmt.Errorf("the LAN address %s is node %s's", a, c.Name)
-			}
-		}
-		for oid, r := range st.Nodes {
-			if oid != id && !r.Removed && contains(reportAddrs(r).LAN, a) {
-				return out, fmt.Errorf("the LAN address %s is node %s's", a, oid)
-			}
+		if err := lanFree(a, id, cl, st); err != nil {
+			return out, err
 		}
 		v := ap.String()
 		out.LAN = &v
@@ -102,6 +147,20 @@ func (s *Server) checkReport(m MeshReport, id string, cl []clusterNode, st *node
 		out.Public = &v
 	}
 	return out, nil
+}
+
+// lanFree: no other node (live, its public or mesh address included, or a
+// record that isn't removed) holds a.
+func lanFree(a, id string, cl []clusterNode, st *nodeadmState) error {
+	for _, c := range cl {
+		if c.Name != id && (contains(c.Addresses.Public, a) || c.Mesh == a) {
+			return fmt.Errorf("the LAN address %s is node %s's", a, c.Name)
+		}
+	}
+	if o := lanTaken(lanHolders(cl, st), a, id); o != "" {
+		return fmt.Errorf("the LAN address %s is node %s's", a, o)
+	}
+	return nil
 }
 
 func contains(l []string, v string) bool {

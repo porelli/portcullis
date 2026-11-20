@@ -369,19 +369,29 @@ func (e *etcdClient) Remove(ctx context.Context, id uint64) error {
 	return err
 }
 
-// ── the k3s supervisor's bootstrap check ──
+// ── the k3s supervisor's checks ──
 
 type k3sBootstrap struct{}
 
 // Status: GET /v1-k3s/server-bootstrap with basic auth server:<passphrase>,
 // the server's CA pinned by the token's hash (k3s's /cacerts).
 func (k3sBootstrap) Status(ctx context.Context, serverIP, token string) (int, error) {
+	return supervisorStatus(ctx, serverIP, token, "server", "/v1-k3s/server-bootstrap")
+}
+
+// AgentStatus: an agent's supervisor call (its kube-proxy client
+// certificate) with basic auth node:<agent passphrase>.
+func (k3sBootstrap) AgentStatus(ctx context.Context, serverIP, token string) (int, error) {
+	return supervisorStatus(ctx, serverIP, token, "node", "/v1-k3s/client-kube-proxy.crt")
+}
+
+func supervisorStatus(ctx context.Context, serverIP, token, user, path string) (int, error) {
 	m := k10Re.FindStringSubmatch(token)
 	if m == nil || !meshAddrOK(serverIP) {
 		return 0, errors.New("not a K10 token")
 	}
 	pass := m[2]
-	if p, ok := strings.CutPrefix(pass, "server:"); ok {
+	if p, ok := strings.CutPrefix(pass, user+":"); ok {
 		pass = p
 	}
 	base := "https://" + serverIP + ":6443"
@@ -399,11 +409,11 @@ func (k3sBootstrap) Status(ctx context.Context, serverIP, token string) (int, er
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(ca)
 	c := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: serverIP}}}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+"/v1-k3s/server-bootstrap", nil)
-	req.SetBasicAuth("server", pass)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+	req.SetBasicAuth(user, pass)
 	resp, err = c.Do(req)
 	if err != nil {
-		return 0, errors.New("server-bootstrap unreachable")
+		return 0, errors.New("the k3s supervisor is unreachable")
 	}
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()

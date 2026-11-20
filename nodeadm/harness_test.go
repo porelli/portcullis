@@ -153,10 +153,26 @@ func (f *fakeEtcd) Remove(_ context.Context, id uint64) error {
 	return nil
 }
 
-// fakeBoot: server-bootstrap answers 200 for the rotated token, 401 else.
+// fakeBoot: server-bootstrap answers 200 for the rotated token, 401 else;
+// the agent call likewise for the agent token (the initial one until a
+// rotate-agent).
 type fakeBoot struct {
 	mu      sync.Mutex
 	current string
+	agent   string
+}
+
+func (f *fakeBoot) AgentStatus(_ context.Context, _, token string) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	cur := f.agent
+	if cur == "" {
+		cur = testAgentToken
+	}
+	if token == cur {
+		return 200, nil
+	}
+	return 401, nil
 }
 
 func (f *fakeBoot) Status(_ context.Context, _, token string) (int, error) {

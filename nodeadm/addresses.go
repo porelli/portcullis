@@ -93,6 +93,7 @@ func (s *Server) buildAddresses(cl []clusterNode, st *nodeadmState) (*AddressesD
 			errs = append(errs, fmt.Sprintf("node %s has no recorded LAN and public addresses: no cluster addresses written", c.Name))
 		}
 	}
+	holders := lanHolders(cl, st)
 	for id, rec := range st.Nodes {
 		if _, ok := doc.Nodes[id]; ok {
 			continue
@@ -108,10 +109,20 @@ func (s *Server) buildAddresses(cl []clusterNode, st *nodeadmState) (*AddressesD
 			// Enrolling: no certificate yet, no material can follow.
 		case !meshAddrOK(rec.MeshIP):
 			errs = append(errs, fmt.Sprintf("node %s has no mesh address: no cluster addresses written", id))
-		case rec.JoinedAt != nil:
-			doc.Nodes[id] = docNode(reportAddrs(rec), stateActive)
 		default:
-			doc.Nodes[id] = docNode(reportAddrs(rec), statePending)
+			a := s.cleanAddrs(reportAddrs(rec))
+			keep := []string{}
+			for _, l := range a.LAN {
+				if lanTaken(holders, l, id) == "" {
+					keep = append(keep, l)
+				}
+			}
+			a.LAN = keep
+			state := statePending
+			if rec.JoinedAt != nil {
+				state = stateActive
+			}
+			doc.Nodes[id] = docNode(a, state)
 		}
 	}
 	if len(doc.API) == 0 {
@@ -148,8 +159,10 @@ func (s *Server) annotateJoined(ctx context.Context, cl []clusterNode, st *nodea
 			c.Node.Annotations = map[string]string{}
 		}
 		c.Node.Annotations[annAddresses] = string(b)
-		c.Addresses = nodeAddrs(c.Node)
+		c.Addresses = s.cleanAddrs(nodeAddrs(c.Node))
+		c.RawLAN = append([]string{}, c.Addresses.LAN...)
 	}
+	dedupeLAN(cl, st)
 }
 
 // writeAddresses replaces the ConfigMap's document (nodeadm's one right

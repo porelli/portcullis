@@ -62,9 +62,12 @@ type Etcd interface {
 }
 
 // K3sBootstrap answers the status of GET https://<server>:6443/v1-k3s/
-// server-bootstrap with basic auth server:<token> (the rotation check).
+// server-bootstrap with basic auth server:<token> (the rotation check),
+// and AgentStatus an agent-authenticated supervisor call with
+// node:<agent token> (the agent token's rotation check).
 type K3sBootstrap interface {
 	Status(ctx context.Context, serverIP, token string) (int, error)
+	AgentStatus(ctx context.Context, serverIP, token string) (int, error)
 }
 
 // Config is nodeadm's configuration (from the chart's environment).
