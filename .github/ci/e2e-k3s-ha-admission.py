@@ -11,9 +11,8 @@ admission the answer is NotFound):
 A denial must come from a Portcullis binding and carry the vector's reason.
 The vectors' test values are mapped to the live params: the Traefik image
 to traefikImage, the test generation 0123456789abcdef to the live one,
-${NOW+<n>m} to now + n minutes. Binding denials are skipped: the API server
-never runs API-defined policies on admission policies or bindings (Hub
-envtest TestAdmissionPolicyObjectsNotJudged).
+${NOW+<n>m} to now + n minutes. An op update / delete creates its existing
+object as the CLI first; a subresource is sent as one.
   python3 .github/ci/e2e-k3s-ha-admission.py [<context>]   (default ci)
 """
 import datetime
@@ -27,7 +26,8 @@ import urllib.parse
 CTX = sys.argv[1] if len(sys.argv) > 1 else "ci"
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 IDS = {"hub": "system:serviceaccount:portcullis:portcullis-hub", "intruder": "system:serviceaccount:portcullis:intruder",
-       "nodeadm": "system:serviceaccount:portcullis-nodeadm:nodeadm"}
+       "nodeadm": "system:serviceaccount:portcullis-nodeadm:nodeadm",
+       "daemonset-controller": "system:serviceaccount:kube-system:daemon-set-controller"}
 TEST_TRAEFIK = "docker.io/library/traefik:v3.7.0@sha256:" + "2" * 64
 TEST_GEN = "0123456789abcdef"
 
@@ -60,13 +60,10 @@ if created_sa and k(["-n", "portcullis-ingress", "create", "serviceaccount", "tr
     fail("can't create the ServiceAccount portcullis-ingress/traefik")
 
 vectors = json.loads((ROOT / "tests" / "admission_vectors.json").read_text())
-admitted = refused = skipped = 0
+admitted = refused = 0
 try:
     for v in vectors:
         if not v.get("ha"):
-            continue
-        if v["object"].get("kind") == "ValidatingAdmissionPolicyBinding" and v["want"] == "deny":
-            skipped += 1
             continue
         raw = json.dumps(v["object"]).replace(TEST_TRAEFIK, params["traefikImage"]).replace(TEST_GEN, params["generation"])
         raw = re.sub(r"\$\{NOW\+([0-9]+)m\}", lambda m: (datetime.datetime.now(datetime.timezone.utc)
@@ -74,16 +71,34 @@ try:
         reason = v["reason_contains"].replace(TEST_GEN, params["generation"])
         o = json.loads(raw)
         who = [] if v["as"] == "cli" else [f"--as={IDS[v['as']]}", "--as-group=system:masters"]
+        ex = None
         if v.get("existing"):
-            fail(f"{v['name']}: an existing object outside the skipped binding cases")
-        if v.get("op") == "exec":
+            ex = json.loads(json.dumps(v["existing"]).replace(TEST_TRAEFIK, params["traefikImage"]))
+            # Never scheduled (a real cluster would run it): the same
+            # unmatchable nodeSelector on the update.
+            if ex["kind"] == "Pod":
+                for x in (ex, o):
+                    x["spec"]["nodeSelector"] = {"portcullis.io/e2e-never": "true"}
+            rc, out = k(["create", "-f", "-"], json.dumps(ex))
+            if rc != 0:
+                fail(f"{v['name']}: creating the existing object: {out[:300]}")
+        if v.get("op") in ("exec", "attach", "portforward"):
             md = o["metadata"]
             q = [("command", c) for c in o.get("command", [])] + [(f, "true") for f in ("stdin", "stdout", "stderr", "tty") if o.get(f)]
+            q += [("ports", str(p)) for p in o.get("ports", [])]
             if o.get("container"):
                 q.append(("container", o["container"]))
-            url = f"/api/v1/namespaces/{md['namespace']}/pods/{md['name']}/exec?" + urllib.parse.urlencode(q)
+            url = f"/api/v1/namespaces/{md['namespace']}/pods/{md['name']}/{v['op']}?" + urllib.parse.urlencode(q)
             rc, out = k([*who, "create", "--raw", url, "-f", "-"])
             ok = rc == 0 or ("NotFound" in out or "not found" in out) and "denied request" not in out
+        elif ex is not None:
+            md = ex["metadata"]
+            rc, cur = k(["-n", md["namespace"], "get", ex["kind"].lower(), md["name"], "-o", "json"])
+            o["metadata"]["resourceVersion"] = json.loads(cur)["metadata"]["resourceVersion"]
+            sub = [f"--subresource={v['subresource']}"] if v.get("subresource") else []
+            rc, out = k([*who, "replace", "--dry-run=server", *sub, "-f", "-"], json.dumps(o))
+            ok = rc == 0
+            k(["-n", md["namespace"], "delete", ex["kind"].lower(), md["name"], "--wait=false"])
         else:
             rc, out = k([*who, "create", "--dry-run=server", "-f", "-"], json.dumps(o))
             ok = rc == 0
@@ -98,4 +113,4 @@ try:
 finally:
     if created_sa:
         k(["-n", "portcullis-ingress", "delete", "serviceaccount", "traefik", "--ignore-not-found"])
-print(f"PASS: HA admission vectors: {admitted} admitted, {refused} refused by their bindings, {skipped} binding denials skipped (no admission policy judges a binding)")
+print(f"PASS: HA admission vectors: {admitted} admitted, {refused} refused by their bindings")

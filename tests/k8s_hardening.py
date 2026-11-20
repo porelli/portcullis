@@ -369,8 +369,12 @@ def main():
     check_frontdoor()
     check_log_ports()
     check_psa()
-    check_priorities(docs)
+    check_priorities()
+    check_classes(docs + K.render({"ha": {"enabled": True}}))
     check_core_exec()
+    check_placement_twins()
+    check_token_literal()
+    check_ingress_allowlists(K.render({"ha": {"enabled": True}}) + docs)
     # Every PVC a pod claims is rendered, with and without the optional
     # profiles (compose's named volumes exist in every profile), and in HA.
     for extra in (None, {"wg": {"enabled": False}}, {"ha": {"enabled": True}}):
@@ -417,11 +421,110 @@ PRIORITIES = {"portcullis-core": (1000000, "PreemptLowerPriority"), "portcullis-
               "portcullis-low": (100, "Never")}
 
 
-def check_priorities(docs):
-    got = {d["metadata"]["name"]: (d["value"], d.get("preemptionPolicy"), d.get("globalDefault", False)) for d in K.by_kind(docs, "PriorityClass")}
+def check_priorities():
+    docs = [d for d in yaml.safe_load_all((K.ROOT / "kube" / "priorityclasses.yaml").read_text()) if d]
+    got = {d["metadata"]["name"]: (d["value"], d.get("preemptionPolicy"), d.get("globalDefault", False)) for d in docs if d.get("kind") == "PriorityClass"}
     want = {n: (v, p, n == "portcullis-normal") for n, (v, p) in PRIORITIES.items()}
-    if got != want:
-        F.add(f"PriorityClasses {got} != {want}")
+    if got != want or len(docs) != len(want):
+        F.add(f"kube/priorityclasses.yaml {got} != {want}")
+    for p in sorted((K.CHART / "templates").glob("*")):
+        if "kind: PriorityClass" in p.read_text():
+            F.add(f"{p.name}: a PriorityClass in the chart (kube/priorityclasses.yaml is the CLI's, applied before anything names one)")
+
+
+# Every pod that isn't an app's names a class (Task 18 fix round, ruling
+# I5): globalDefault portcullis-normal would otherwise make it an app-level
+# pod that app pods at high / critical preempt, and that N−1 counts as
+# evictable. Core and infrastructure: portcullis-core (portcullis-critical
+# where the plan says so) or a system-* class. Every pod template of the
+# chart (every profile, HA too) and of kube/ (the CLI's manifests, HA
+# infrastructure included).
+CLASS_OK = re.compile(r"^(portcullis-core|portcullis-critical|system-node-critical|system-cluster-critical)$")
+POD_KINDS = {"Pod", "Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob", "ReplicaSet"}
+
+
+def pod_spec_of(d):
+    k = d.get("kind")
+    if k == "Pod":
+        return d.get("spec", {})
+    if k == "CronJob":
+        return d["spec"]["jobTemplate"]["spec"]["template"].get("spec", {})
+    return d.get("spec", {}).get("template", {}).get("spec", {})
+
+
+def check_classes(chart_docs):
+    kube_docs = []
+    for f in sorted((K.ROOT / "kube").rglob("*.yaml")):
+        if "admission" in f.parts or f.name.endswith(".tmpl.yaml"):
+            continue
+        kube_docs += [(f.relative_to(K.ROOT), d) for d in yaml.safe_load_all(f.read_text()) if d]
+    for where, d in [("chart", d) for d in chart_docs] + kube_docs:
+        if not isinstance(d, dict) or d.get("kind") not in POD_KINDS:
+            continue
+        c = pod_spec_of(d).get("priorityClassName")
+        if not c or not CLASS_OK.match(c):
+            F.add(f"{where}: {d['kind']} {d['metadata'].get('name')}: priorityClassName {c} (every non-app pod: portcullis-core, portcullis-critical or system-*)")
+
+
+# The placement rules are written twice (pods, workloads): equal but for the
+# guard (tests can't make CEL share an expression).
+def check_placement_twins():
+    pols = {d["metadata"]["name"]: d for d in yaml.safe_load_all((K.ROOT / "kube" / "admission" / "policies.yaml").read_text()) if d}
+    msgs = ("app pods may use only", "the portcullis.io/small toleration", "nodeName is refused", "topologySpreadConstraints and affinity")
+
+    def block(name):
+        out = []
+        for v in pols[name]["spec"]["validations"]:
+            if any(str(v.get("message", "")).startswith(m) for m in msgs):
+                e = v["expression"].split("\n", 1)[1]
+                out.append((v["message"], e.replace("request.operation != 'CREATE' || ", "")))
+        return out
+    a, b = block("portcullis-apps-pods"), block("portcullis-apps-workloads")
+    if len(a) != 4 or a != b:
+        F.add("the placement rules of portcullis-apps-pods and portcullis-apps-workloads differ (beyond the guard and the pod-only nodeName create)")
+
+
+# The token policy's matchCondition literal is the CLI's KUBE_NODEADM_SA
+# (a matchCondition can't read params).
+def check_token_literal():
+    pol = [d for d in yaml.safe_load_all((K.ROOT / "kube" / "admission" / "nodeadm-tokens.yaml").read_text()) if d][0]
+    sa = re.search(r'^KUBE_NODEADM_SA="([^"]+)"', (K.ROOT / "scripts" / "lib" / "kube_install.sh").read_text(), re.M)
+    conds = [c["expression"] for c in pol["spec"].get("matchConditions", [])]
+    if not sa or conds != [f"request.userInfo.username == '{sa.group(1)}'"]:
+        F.add(f"portcullis-nodeadm-tokens matchConditions {conds} != the CLI's KUBE_NODEADM_SA {sa and sa.group(1)}")
+
+
+# portcullis-ingress-pods' allowlists hold the chart's Traefik pod: its
+# environment names, its Secrets (volumes and valueFrom) and ConfigMaps, no
+# command or args.
+def check_ingress_allowlists(docs):
+    pol = next(d for d in yaml.safe_load_all((K.ROOT / "kube" / "admission" / "policies.yaml").read_text())
+               if d and d["metadata"]["name"] == "portcullis-ingress-pods")
+    var = {v["name"]: set(re.findall(r"'([^']*)'", v["expression"])) for v in pol["spec"]["variables"] if v["name"].startswith("traefik")}
+    found = False
+    for d in docs:
+        if d.get("kind") not in POD_KINDS or d["metadata"].get("name") != "traefik":
+            continue
+        found = True
+        spec = pod_spec_of(d)
+        for c in spec["containers"]:
+            if c.get("command") or c.get("args") or c.get("envFrom"):
+                F.add("traefik: command / args / envFrom (portcullis-ingress-pods refuses them)")
+            for e in c.get("env", []):
+                if e["name"] not in var["traefikEnv"]:
+                    F.add(f"traefik: env {e['name']} not in portcullis-ingress-pods' traefikEnv")
+                ref = e.get("valueFrom", {}).get("secretKeyRef")
+                if e.get("valueFrom") and (not ref or ref["name"] not in var["traefikSecrets"]):
+                    F.add(f"traefik: env {e['name']} from {e['valueFrom']} (only secretKeyRef of traefikSecrets)")
+        for v in spec.get("volumes", []):
+            srcs = v.get("projected", {}).get("sources", []) + [v]
+            for s in srcs:
+                if "configMap" in s and s["configMap"]["name"] not in var["traefikConfigMaps"]:
+                    F.add(f"traefik: ConfigMap {s['configMap']['name']} not in traefikConfigMaps")
+                if "secret" in s and (s["secret"].get("secretName") or s["secret"].get("name")) not in var["traefikSecrets"]:
+                    F.add(f"traefik: Secret {s['secret']} not in traefikSecrets")
+    if not found:
+        F.add("no traefik pod rendered")
 
 
 # portcullis-core-exec (NEW, HA; contract §6 "core exec"): its document

@@ -30,6 +30,13 @@ spec:
       - UPDATE
       resources:
       - secrets
+  # nodeadm's own writes only: k3s's and the controllers' kube-system Secrets
+  # never reach this policy, so a missing params ConfigMap can't block them
+  # (a matchCondition can't read params: the literal is params
+  # nodeadmServiceAccount = KUBE_NODEADM_SA, tests/k8s_hardening.py).
+  matchConditions:
+  - name: nodeadm-only
+    expression: "request.userInfo.username == 'system:serviceaccount:portcullis-nodeadm:nodeadm'"
   variables:
   - name: nodeadm
     expression: "params.data.nodeadmServiceAccount != '' && request.userInfo.username == params.data.nodeadmServiceAccount"
@@ -46,7 +53,8 @@ spec:
       ? [string(variables.data['expiration'])].map(e, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19].map(i,
           ((e.charAt(i / 3 * 4 + 0) == '=' ? 0 : 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.indexOf(e.charAt(i / 3 * 4 + 0))) * 262144 + (e.charAt(i / 3 * 4 + 1) == '=' ? 0 : 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.indexOf(e.charAt(i / 3 * 4 + 1))) * 4096 + (e.charAt(i / 3 * 4 + 2) == '=' ? 0 : 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.indexOf(e.charAt(i / 3 * 4 + 2))) * 64 + (e.charAt(i / 3 * 4 + 3) == '=' ? 0 : 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'.indexOf(e.charAt(i / 3 * 4 + 3)))) / (i % 3 == 0 ? 65536 : (i % 3 == 1 ? 256 : 1)) % 256))[0]
       : []
-  # The expiration as the number YYYYMMDDHHMMSS (-1 for any other shape), and
+  # The expiration as the number YYYYMMDDHHMMSS (-1 for any other shape or a
+  # month, day, hour, minute or second out of range), and
   # the API server's now + 15 minutes the same way (an admission policy has
   # no clock: metadata.creationTimestamp is set to now before validation).
   - name: expNum
@@ -54,6 +62,10 @@ spec:
       size(variables.exp) == 20 && variables.exp[4] == 45 && variables.exp[7] == 45 && variables.exp[10] == 84
       && variables.exp[13] == 58 && variables.exp[16] == 58 && variables.exp[19] == 90
       && [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18].all(d, variables.exp[d] >= 48 && variables.exp[d] <= 57)
+      && (variables.exp[5] - 48) * 10 + variables.exp[6] - 48 >= 1 && (variables.exp[5] - 48) * 10 + variables.exp[6] - 48 <= 12
+      && (variables.exp[8] - 48) * 10 + variables.exp[9] - 48 >= 1 && (variables.exp[8] - 48) * 10 + variables.exp[9] - 48 <= 31
+      && (variables.exp[11] - 48) * 10 + variables.exp[12] - 48 <= 23
+      && variables.exp[14] <= 53 && variables.exp[17] <= 53
       ? (variables.exp[0] - 48) * 10000000000000 + (variables.exp[1] - 48) * 1000000000000 + (variables.exp[2] - 48) * 100000000000 + (variables.exp[3] - 48) * 10000000000 + (variables.exp[5] - 48) * 1000000000 + (variables.exp[6] - 48) * 100000000 + (variables.exp[8] - 48) * 10000000 + (variables.exp[9] - 48) * 1000000 + (variables.exp[11] - 48) * 100000 + (variables.exp[12] - 48) * 10000 + (variables.exp[14] - 48) * 1000 + (variables.exp[15] - 48) * 100 + (variables.exp[17] - 48) * 10 + (variables.exp[18] - 48) * 1
       : -1
   - name: bound

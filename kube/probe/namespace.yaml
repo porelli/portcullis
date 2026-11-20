@@ -19,6 +19,7 @@ metadata:
     portcullis.io/probe: server
 spec:
   automountServiceAccountToken: false
+  priorityClassName: portcullis-core
   restartPolicy: Never
   terminationGracePeriodSeconds: 1
   securityContext:

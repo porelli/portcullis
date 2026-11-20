@@ -4264,14 +4264,14 @@ case "$*" in
     case "$in" in *'Host(`portcullis-admission-probe.'*) exit 0 ;; esac
     echo "ValidatingAdmissionPolicy 'portcullis-edge-routes' with binding 'portcullis-edge-guard-routes-x' denied request: a route on a reserved core hostname" >&2; exit 1 ;;
   "--as=system:serviceaccount:portcullis-nodeadm:nodeadm --as-group=system:masters create --dry-run=server -f -"|"--as=system:serviceaccount:portcullis:portcullis-hub --as-group=system:masters create --raw "*)
-    # HA probes: nodeadm's Secret / ConfigMap (dry runs), the Hub's exec.
+    # HA probes: nodeadm's Secret (a dry run), the Hub's exec.
     if [ "$4" = --raw ]; then
       b=portcullis-core-guard-exec g="${5##*command=probe-}"; g="${g%%&*}"
       [ "$6 $7" = "-f -" ] || { echo "stub: exec probe without -f -" >&2; exit 97; }
     else
       in="$(cat)"; g="$(printf '%s' "$in" | jq -r '.metadata.annotations["portcullis.io/params-generation"] // ""')"
       case "$(printf '%s' "$in" | jq -r .kind):$ns" in
-        Secret:kube-system) b=portcullis-nodeadm-guard-tokens ;; ConfigMap:portcullis) b=portcullis-nodeadm-guard-admission ;; *) echo "stub: nodeadm probe $ns" >&2; exit 97 ;;
+        Secret:kube-system) b=portcullis-nodeadm-guard-tokens ;; *) echo "stub: nodeadm probe $ns" >&2; exit 97 ;;
       esac
     fi
     printf 'probe %s\n' "$b" >> "$STUB_DIR/order"
@@ -4803,14 +4803,14 @@ expect_eq "cluster setup: params ConfigMap carries the resolved Hub digest, the 
 expect_eq "cluster setup: the params ConfigMap has exactly params.tmpl.yaml's keys" \
   "$(jq -r '.data | keys | join(" ")' "$PJ") " \
   "$(sed -n '/^data:/,$p' "$HERE/../kube/admission/params.tmpl.yaml" | sed -n 's/^  \([A-Za-z]*\): .*/\1/p' | sort | tr '\n' ' ')"
-expect_eq "cluster setup: the ten bindings as <name>-<generation> on portcullis-admission-params-<generation>, labelled with their base name" \
-  "$(jq -s -r --arg g "$G1" 'map(select(.metadata.labels["portcullis.io/params-generation"] == $g) | [.metadata.name == .metadata.labels["portcullis.io/binding"] + "-" + $g, .spec.paramRef.name == "portcullis-admission-params-" + $g] | all) | [length, all] | map(tostring) | join(":")' "$KS"/live/Binding.*.json)" "10:true"
-expect_eq "cluster setup: the five apps bindings select portcullis-apps, the edge one portcullis-edge, (HA) the exec and nodeadm-admission ones the core namespace, nodeadm's tokens kube-system, the ingress one portcullis-ingress" \
+expect_eq "cluster setup: the nine bindings as <name>-<generation> on portcullis-admission-params-<generation>, labelled with their base name" \
+  "$(jq -s -r --arg g "$G1" 'map(select(.metadata.labels["portcullis.io/params-generation"] == $g) | [.metadata.name == .metadata.labels["portcullis.io/binding"] + "-" + $g, .spec.paramRef.name == "portcullis-admission-params-" + $g] | all) | [length, all] | map(tostring) | join(":")' "$KS"/live/Binding.*.json)" "9:true"
+expect_eq "cluster setup: the five apps bindings select portcullis-apps, the edge one portcullis-edge, (HA) the exec one the core namespace, nodeadm's tokens kube-system, the ingress one portcullis-ingress" \
   "$(jq -s -r --arg g "$G1" 'map(select(.metadata.labels["portcullis.io/params-generation"] == $g) | .spec.matchResources.namespaceSelector.matchLabels["kubernetes.io/metadata.name"]) | group_by(.) | map("\(.[0])=\(length)") | join(" ")' "$KS"/live/Binding.*.json)" \
-  "kube-system=1 portcullis=2 portcullis-apps=5 portcullis-edge=1 portcullis-ingress=1"
+  "kube-system=1 portcullis=1 portcullis-apps=5 portcullis-edge=1 portcullis-ingress=1"
 expect_eq "cluster setup: first run → params, bindings, probe (3 requests), nothing older to delete" \
-  "$(grep -E '^(apply bindings|probe|delete binding|delete params|stamp)' "$KS/order" | sed "s/$G1/G1/; s/^probe .*/probe/" | uniq -c | tr -s ' ' | tr '\n' ';')" " 1 apply bindings G1; 12 probe;"
-expect_eq "cluster setup: every one of the ten bindings probed with its own object" \
+  "$(grep -E '^(apply bindings|probe|delete binding|delete params|stamp)' "$KS/order" | sed "s/$G1/G1/; s/^probe .*/probe/" | uniq -c | tr -s ' ' | tr '\n' ';')" " 1 apply bindings G1; 11 probe;"
+expect_eq "cluster setup: every one of the nine bindings probed with its own object" \
   "$(grep '^probe portcullis-' "$KS/order" | sort | tr '\n' ' ')" "$(printf 'probe %s\n' $KUBE_BINDINGS | sort | tr '\n' ' ')"
 expect_eq "cluster setup: the five namespaces with PSA labels and K11's label + install annotation (server-side)" \
   "$(jq -cs '[.[] | select(.kind == "Namespace") | [.metadata.name, .metadata.labels["pod-security.kubernetes.io/enforce"], .metadata.labels["pod-security.kubernetes.io/warn"], .metadata.labels["app.kubernetes.io/managed-by"], .metadata.annotations["portcullis.io/install"]]]' < <(grep -v '^---$' "$KS/kubectl-stdin" | jq -c 'select(type == "object")' 2>/dev/null))" \
@@ -4818,17 +4818,17 @@ expect_eq "cluster setup: the five namespaces with PSA labels and K11's label + 
 expect_eq "cluster setup: CRDs and VAPs applied server-side (never Helm), bindings.yaml never applied under its own names, the storage API egress to each endpoint" \
   "$(grep -c 'apply --server-side --force-conflicts --field-manager=portcullis-cli -f .*charts/portcullis/crds/traefik-v3.7.17.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/policies.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*kube/admission/bindings.yaml' "$KS/kubectl-calls"):$(grep -c 'apply --server-side .* -f .*/bindings.json' "$KS/kubectl-calls"):$(grep -c '"cidr": "10.1.0.4/32"' "$KS/kubectl-stdin")" "1:1:0:1:1"
 expect_eq "cluster setup: applied.json records every step (0600)" \
-  "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json"):$(file_mode "$CS_ROOT/secrets/kube/applied.json")" "cluster.admission cluster.crds cluster.namespaces cluster.params cluster.storage:600"
+  "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json"):$(file_mode "$CS_ROOT/secrets/kube/applied.json")" "cluster.admission cluster.crds cluster.namespaces cluster.params cluster.priorities cluster.storage:600"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
 expect_eq "cluster setup: unchanged params → the same generation re-applied and probed, nothing deleted, no Hub scaling" \
-  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c 'delete binding\|scale deploy/hub' "$KS/order" || true):$(grep -c '^probe' "$KS/order")" "rc=0:0:12"
+  "$(printf '%s\n' "$OUT" | tail -n1):$(grep -c 'delete binding\|scale deploy/hub' "$KS/order" || true):$(grep -c '^probe' "$KS/order")" "rc=0:0:11"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.7'; kube_cluster_setup")"
 G2="$(grep '^apply bindings ' "$KS/order" | tail -n1 | cut -d' ' -f3)"
 expect_eq "cluster setup: changed params → create-before-delete: the new generation's bindings, the probe, only then the older bindings deleted; the older params stamped, not deleted; the Hub never scaled" \
   "$(printf '%s\n' "$OUT" | tail -n1):$([ "$G2" != "$G1" ] && echo new-gen):$(grep -E '^(apply bindings|probe|delete binding|delete params|stamp|kubectl .*scale)' "$KS/order" | sed "s/$G2/G2/; s/$G1/G1/; s/^probe .*/probe/" | uniq -c | tr -s ' ' | tr '\n' ';')" \
-  "rc=0:new-gen: 1 apply bindings G2; 12 probe; 1 delete binding portcullis-apps-guard-netpol-G1; 1 delete binding portcullis-apps-guard-pods-G1; 1 delete binding portcullis-apps-guard-services-G1; 1 delete binding portcullis-apps-guard-traefik-G1; 1 delete binding portcullis-apps-guard-workloads-G1; 1 delete binding portcullis-core-guard-exec-G1; 1 delete binding portcullis-edge-guard-routes-G1; 1 delete binding portcullis-ingress-guard-pods-G1; 1 delete binding portcullis-nodeadm-guard-admission-G1; 1 delete binding portcullis-nodeadm-guard-tokens-G1; 1 stamp portcullis-admission-params-G1;"
+  "rc=0:new-gen: 1 apply bindings G2; 11 probe; 1 delete binding portcullis-apps-guard-netpol-G1; 1 delete binding portcullis-apps-guard-pods-G1; 1 delete binding portcullis-apps-guard-services-G1; 1 delete binding portcullis-apps-guard-traefik-G1; 1 delete binding portcullis-apps-guard-workloads-G1; 1 delete binding portcullis-core-guard-exec-G1; 1 delete binding portcullis-edge-guard-routes-G1; 1 delete binding portcullis-ingress-guard-pods-G1; 1 delete binding portcullis-nodeadm-guard-tokens-G1; 1 stamp portcullis-admission-params-G1;"
 echo '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"portcullis-admission-params-ffffffffffffffff","labels":{"app.kubernetes.io/managed-by":"portcullis","portcullis.io/params-generation":"ffffffffffffffff"},"annotations":{"portcullis.io/orphaned-at":"a[$(touch '"$WORK"'/pwned)]"}},"data":{}}' > "$KS/live/ConfigMap.portcullis-admission-params-ffffffffffffffff.json"
 echo '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"portcullis-admission-params-evil","labels":{"app.kubernetes.io/managed-by":"portcullis","portcullis.io/params-generation":"x"},"annotations":{"portcullis.io/orphaned-at":"1"}},"data":{}}' > "$KS/live/ConfigMap.portcullis-admission-params-evil.json"
 rm -f "$KS/order"
@@ -4846,11 +4846,11 @@ rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.8' KUBE_ADMISSION_PROBE_WAIT=0; export STUB_PROBE_STALE_BINDING=portcullis-apps-guard-netpol; kube_cluster_setup")"
 case "$OUT" in *"not live with generation"*"portcullis-apps-guard-netpol"*"aren't live with their params"*"rc=1") t_pass "cluster setup: one binding of the six (netpol) not live → refused, the older bindings kept" ;; *) t_fail "cluster setup one stale binding: $OUT" ;; esac
 expect_eq "cluster setup: one stale binding deletes nothing" "$(grep -c '^delete binding' "$KS/order" || true)" 0
-expect_eq "cluster setup: a failed probe deletes no binding" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:10"
+expect_eq "cluster setup: a failed probe deletes no binding" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:9"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES='10.1.0.4 198.51.100.9'; export STUB_BINDINGS_FAIL=1; kube_cluster_setup")"
 case "$OUT" in *"could not create the admission bindings of params generation"*"the older ones still judge"*"rc=1") t_pass "cluster setup: the new bindings can't be created → refused, nothing deleted" ;; *) t_fail "cluster setup bindings failure: $OUT" ;; esac
-expect_eq "cluster setup: failed bindings → the older bindings kept" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:10"
+expect_eq "cluster setup: failed bindings → the older bindings kept" "$(grep -c '^delete binding' "$KS/order" || true):$(ls "$KS"/live/Binding.*-"$G2".json | wc -l | tr -d ' ')" "0:9"
 echo '{"items":[{"kind":"IngressRoute","metadata":{"name":"app-ok","labels":{"portcullis.io/instance":"a"}}},{"kind":"IngressRoute","metadata":{"name":"app-bad","labels":{"portcullis.io/instance":"b"}},"spec":{"x":"REFUSE-ME"}}]}' > "$KS/kube/edge-hub-ir.json"
 rm -f "$KS/order"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; kube_cluster_setup")"
@@ -4861,7 +4861,7 @@ k_fixtures
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_APPS_NAMESPACE=team-apps; export STUB_APPS_NS=team-apps; kube_cluster_setup")"
 expect_eq "cluster setup, PORTCULLIS_APPS_NAMESPACE=team-apps: the five apps bindings select team-apps, the edge one portcullis-edge (the HA ones unchanged)" \
   "$(printf '%s\n' "$OUT" | tail -n1) $(jq -s -r 'map(.spec.matchResources.namespaceSelector.matchLabels["kubernetes.io/metadata.name"]) | group_by(.) | map("\(.[0])=\(length)") | join(" ")' "$KS"/live/Binding.*.json)" \
-  "rc=0 kube-system=1 portcullis=2 portcullis-edge=1 portcullis-ingress=1 team-apps=5"
+  "rc=0 kube-system=1 portcullis=1 portcullis-edge=1 portcullis-ingress=1 team-apps=5"
 expect_eq "no Hub scaling around the admission bindings (create-before-delete needs none)" "$(declare -f kube_admission_params_apply kube_cluster_setup | grep -c '_kube_scale\|deployment hub' || true)" 0
 k_fixtures
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; export STUB_WHOAMI_FAIL=1; kube_cluster_setup")"
@@ -4875,7 +4875,7 @@ rm -rf "$CS_ROOT/secrets/kube"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD'; export STUB_APPLY_FAIL_MATCH=kube/admission/policies.yaml; kube_cluster_setup")"
 case "$OUT" in *"could not apply the admission policies"*"rc=1") t_pass "cluster setup: a failed VAP apply fails the setup" ;; *) t_fail "cluster setup VAP failure: $OUT" ;; esac
 expect_eq "cluster setup: a failed VAP apply leaves applied.json without the admission and params steps" \
-  "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json")" "cluster.crds cluster.namespaces cluster.storage"
+  "$(jq -r 'keys | join(" ")' "$CS_ROOT/secrets/kube/applied.json")" "cluster.crds cluster.namespaces cluster.priorities cluster.storage"
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE=ghcr.io/porelli/portcullis-hub:edge; kube_cluster_setup")"
 case "$OUT" in *"isn't resolved to a digest"*"rc=1") t_pass "cluster setup: an unresolved Hub tag → refused (the params pin a digest)" ;; *) t_fail "cluster setup tag: $OUT" ;; esac
 OUT="$(kt "PORTCULLIS_ROOT='$CS_ROOT' KUBE_HUB_IMAGE='$HUBD' PORTCULLIS_KUBE_NODE_ADDRESSES=' '; kube_ctl() { [ \"\$1 \$2\" = 'get nodes' ] && { echo '{\"items\":[]}'; return 0; }; command kubectl --context ci \"\$@\"; }; kube_admission_params x")"
@@ -4939,13 +4939,15 @@ expect_eq "kube/storage/admission.yaml pins the same helper and provisioner imag
 expect_eq "StorageClasses: portcullis-core Retain, portcullis-apps Delete, both portcullis.io/local-path with the three owner patterns, never volumeType local" \
   "$(python3 -c 'import sys, yaml; print([(d["metadata"]["name"], d["reclaimPolicy"], d["provisioner"], sorted(d["parameters"]), "volumeType" in d["parameters"]) for d in yaml.safe_load_all(open(sys.argv[1]))])' "$HERE/../kube/storage/storageclasses.yaml")" \
   "[('portcullis-core', 'Retain', 'portcullis.io/local-path', ['groupPattern', 'permPattern', 'userPattern'], False), ('portcullis-apps', 'Delete', 'portcullis.io/local-path', ['groupPattern', 'permPattern', 'userPattern'], False)]"
-expect_eq "kube/admission: ten policies (policies.yaml + nodeadm's two), ten bindings (portcullis-apps-guard-<policy>, portcullis-edge-guard-routes, HA: portcullis-core-guard-exec, portcullis-nodeadm-guard-tokens / -admission, portcullis-ingress-guard-pods; Deny, params missing = Deny, Fail)" \
-  "$(python3 -c 'import sys, yaml; P = [d for f in sys.argv[3:] for d in yaml.safe_load_all(open(f)) if d]; B = [d for d in yaml.safe_load_all(open(sys.argv[2])) if d]; print(sorted(p["metadata"]["name"] for p in P), all(p["spec"]["failurePolicy"] == "Fail" for p in P), sorted((b["metadata"]["name"], b["spec"]["policyName"], b["spec"]["validationActions"] == ["Deny"], b["spec"]["paramRef"]["parameterNotFoundAction"]) for b in B))' "$HERE/../kube/admission/policies.yaml" "$HERE/../kube/admission/bindings.yaml" "$HERE/../kube/admission/policies.yaml" "$HERE/../kube/admission/nodeadm-tokens.yaml" "$HERE/../kube/admission/nodeadm-admission.yaml")" \
-  "['portcullis-apps-netpol', 'portcullis-apps-pods', 'portcullis-apps-services', 'portcullis-apps-traefik', 'portcullis-apps-workloads', 'portcullis-core-exec', 'portcullis-edge-routes', 'portcullis-ingress-pods', 'portcullis-nodeadm-admission', 'portcullis-nodeadm-tokens'] True [('portcullis-apps-guard-netpol', 'portcullis-apps-netpol', True, 'Deny'), ('portcullis-apps-guard-pods', 'portcullis-apps-pods', True, 'Deny'), ('portcullis-apps-guard-services', 'portcullis-apps-services', True, 'Deny'), ('portcullis-apps-guard-traefik', 'portcullis-apps-traefik', True, 'Deny'), ('portcullis-apps-guard-workloads', 'portcullis-apps-workloads', True, 'Deny'), ('portcullis-core-guard-exec', 'portcullis-core-exec', True, 'Deny'), ('portcullis-edge-guard-routes', 'portcullis-edge-routes', True, 'Deny'), ('portcullis-ingress-guard-pods', 'portcullis-ingress-pods', True, 'Deny'), ('portcullis-nodeadm-guard-admission', 'portcullis-nodeadm-admission', True, 'Deny'), ('portcullis-nodeadm-guard-tokens', 'portcullis-nodeadm-tokens', True, 'Deny')]"
-expect_eq "KUBE_BINDINGS lists portcullis-nodeadm-guard-tokens (and the other HA bindings)" \
-  "$(for b in portcullis-core-guard-exec portcullis-nodeadm-guard-tokens portcullis-nodeadm-guard-admission portcullis-ingress-guard-pods; do case " $KUBE_BINDINGS " in *" $b "*) printf y ;; *) printf n ;; esac; done)" yyyy
-expect_eq "cluster setup applies the three policy files (KUBE_POLICY_FILES), never a binding of them" \
-  "$KUBE_POLICY_FILES:$(grep -c 'kind: ValidatingAdmissionPolicyBinding' "$HERE/../kube/admission/nodeadm-tokens.yaml" "$HERE/../kube/admission/nodeadm-admission.yaml" "$HERE/../kube/admission/policies.yaml" | awk -F: '{s += $2} END {print s}')" "policies.yaml nodeadm-tokens.yaml nodeadm-admission.yaml:0"
+expect_eq "kube/admission: nine policies (policies.yaml + nodeadm-tokens.yaml), nine bindings (portcullis-apps-guard-<policy>, portcullis-edge-guard-routes, HA: portcullis-core-guard-exec, portcullis-nodeadm-guard-tokens, portcullis-ingress-guard-pods; Deny, params missing = Deny, Fail)" \
+  "$(python3 -c 'import sys, yaml; P = [d for f in sys.argv[2:] for d in yaml.safe_load_all(open(f)) if d]; B = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]; print(sorted(p["metadata"]["name"] for p in P), all(p["spec"]["failurePolicy"] == "Fail" for p in P), sorted((b["metadata"]["name"], b["spec"]["policyName"], b["spec"]["validationActions"] == ["Deny"], b["spec"]["paramRef"]["parameterNotFoundAction"]) for b in B))' "$HERE/../kube/admission/bindings.yaml" "$HERE/../kube/admission/policies.yaml" "$HERE/../kube/admission/nodeadm-tokens.yaml")" \
+  "['portcullis-apps-netpol', 'portcullis-apps-pods', 'portcullis-apps-services', 'portcullis-apps-traefik', 'portcullis-apps-workloads', 'portcullis-core-exec', 'portcullis-edge-routes', 'portcullis-ingress-pods', 'portcullis-nodeadm-tokens'] True [('portcullis-apps-guard-netpol', 'portcullis-apps-netpol', True, 'Deny'), ('portcullis-apps-guard-pods', 'portcullis-apps-pods', True, 'Deny'), ('portcullis-apps-guard-services', 'portcullis-apps-services', True, 'Deny'), ('portcullis-apps-guard-traefik', 'portcullis-apps-traefik', True, 'Deny'), ('portcullis-apps-guard-workloads', 'portcullis-apps-workloads', True, 'Deny'), ('portcullis-core-guard-exec', 'portcullis-core-exec', True, 'Deny'), ('portcullis-edge-guard-routes', 'portcullis-edge-routes', True, 'Deny'), ('portcullis-ingress-guard-pods', 'portcullis-ingress-pods', True, 'Deny'), ('portcullis-nodeadm-guard-tokens', 'portcullis-nodeadm-tokens', True, 'Deny')]"
+expect_eq "KUBE_BINDINGS lists portcullis-nodeadm-guard-tokens (and the other HA bindings), never a guard on admission objects (R-ADM)" \
+  "$(for b in portcullis-core-guard-exec portcullis-nodeadm-guard-tokens portcullis-ingress-guard-pods; do case " $KUBE_BINDINGS " in *" $b "*) printf y ;; *) printf n ;; esac; done):$(printf '%s\n' $KUBE_BINDINGS | grep -c 'nodeadm-guard-admission')" yyy:0
+expect_eq "cluster setup applies the two policy files (KUBE_POLICY_FILES), never a binding of them" \
+  "$KUBE_POLICY_FILES:$(grep -c 'kind: ValidatingAdmissionPolicyBinding' "$HERE/../kube/admission/nodeadm-tokens.yaml" "$HERE/../kube/admission/policies.yaml" | awk -F: '{s += $2} END {print s}')" "policies.yaml nodeadm-tokens.yaml:0"
+expect_eq "cluster setup applies kube/priorityclasses.yaml (server-side) before the storage step (the provisioner names portcullis-core)" \
+  "$(awk '/apply --server-side .* -f .*kube\/priorityclasses.yaml/ { p = NR } /apply --server-side .* -f .*kube\/storage\/namespace.yaml/ { s = NR } END { print (p > 0 && p < s) ? "first" : "p=" p " s=" s }' "$KS/kubectl-calls")" first
 expect_eq "the CLI's KUBE_BINDINGS = bindings.yaml's names" \
   "$(python3 -c 'import sys, yaml; print(" ".join(d["metadata"]["name"] for d in yaml.safe_load_all(open(sys.argv[1])) if d))' "$HERE/../kube/admission/bindings.yaml")" "$KUBE_BINDINGS"
 expect_eq "admission edgeCoreMiddlewares = the CLI's KUBE_EDGE_CORE_MIDDLEWARES = the params example's" "$(sed -n 's/^  edgeCoreMiddlewares: //p' "$HERE/../kube/admission/params.yaml")" "$KUBE_EDGE_CORE_MIDDLEWARES"

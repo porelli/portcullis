@@ -24,11 +24,9 @@ KUBE_STORAGE_NS="portcullis-storage"
 # Traefik's only watched namespace (the chart's edgeNamespace): the core
 # IngressRoutes and Middlewares, hub-proxy-secret, never a Secret.
 KUBE_EDGE_NS="portcullis-edge"
-# The ten admission bindings (kube/admission/bindings.yaml), live as
-# <name>-<params generation> (kube_admission_params_apply); the last four are
-# NEW (HA): the core namespace's exec guard, nodeadm's two, and Traefik's
-# namespace (contract §6).
-KUBE_BINDINGS="portcullis-apps-guard-pods portcullis-apps-guard-workloads portcullis-apps-guard-services portcullis-apps-guard-traefik portcullis-apps-guard-netpol portcullis-edge-guard-routes portcullis-core-guard-exec portcullis-nodeadm-guard-tokens portcullis-nodeadm-guard-admission portcullis-ingress-guard-pods"
+# The nine admission bindings (kube/admission/bindings.yaml; the last three
+# HA), live as <name>-<params generation> (kube_admission_params_apply).
+KUBE_BINDINGS="portcullis-apps-guard-pods portcullis-apps-guard-workloads portcullis-apps-guard-services portcullis-apps-guard-traefik portcullis-apps-guard-netpol portcullis-edge-guard-routes portcullis-core-guard-exec portcullis-nodeadm-guard-tokens portcullis-ingress-guard-pods"
 KUBE_PROBE_NS="portcullis-netpol-probe"
 KUBE_MANAGED_LABEL="app.kubernetes.io/managed-by"
 KUBE_INSTALL_ANNOTATION="portcullis.io/install"
@@ -749,7 +747,7 @@ kube_vpn_reserved() {
 }
 
 # kube_status_extra — status --json's kubernetes fields: netpol (the CLI's
-# probe ConfigMap), admission (the ten bindings), dns_shadows (an app
+# probe ConfigMap), admission (the nine bindings), dns_shadows (an app
 # Service named like a core one), kube_api_public (K8).
 # kube_crashing_json — the Deployments of both namespaces whose live pods
 # crash: a container waiting in CrashLoopBackOff / Error / an image pull
@@ -957,7 +955,7 @@ kube_reserved_hosts() {
 # hex), create-before-delete so no object is ever unbound (contract K6):
 #   1. ConfigMap portcullis-admission-params-<gen> (kube_admission_params +
 #      generation; replaced whole);
-#   2. bindings.yaml's ten bindings as <name>-<gen> on those params (labels
+#   2. bindings.yaml's nine bindings as <name>-<gen> on those params (labels
 #      portcullis.io/binding = the base name, portcullis.io/params-generation);
 #      older generations' bindings stay and judge too (stricter, fail safe);
 #   3. kube_admission_probe <gen>: the <gen> bindings are live with these
@@ -1086,11 +1084,9 @@ _kube_hub_sa() { echo "system:serviceaccount:$(kube_ns):portcullis-hub"; }
 # admission), server dry-run, nothing kept:
 #   - one object per policy annotated portcullis.io/params-generation=<gen>
 #     (a Pod, a Deployment, a Service, an apps IngressRoute, a NetworkPolicy,
-#     an edge IngressRoute; HA: a pod of portcullis-ingress, and as nodeadm's
-#     ServiceAccount a bootstrap token Secret in kube-system and a params
-#     ConfigMap in the core namespace; an exec can't be dry-run, so the exec
-#     guard's probe is the Hub's `hub rev /hub-data probe-<gen>` in a reader
-#     pod name, refused before anything runs) is refused by <binding>-<gen>
+#     an edge IngressRoute; HA: a pod of portcullis-ingress, nodeadm's
+#     bootstrap token Secret, the Hub's exec `hub rev /hub-data probe-<gen>`
+#     in a reader pod name, refused before anything runs) by <binding>-<gen>
 #     naming <gen> (each policy refuses exactly its own params' generation
 #     first; older generations' bindings let it by);
 #   - a route on a reserved host is refused by an edge binding;
@@ -1127,7 +1123,7 @@ _kube_probe_object() {
   local b="$1" ns kind
   case "$b" in
     portcullis-edge-guard-routes) _kube_probe_route "portcullis-admission-probe.${PORTCULLIS_DOMAIN,,}" "$2"; return ;;
-    portcullis-core-guard-exec|portcullis-nodeadm-guard-*|portcullis-ingress-guard-pods) _kube_probe_ha "$b" "$2"; return ;;
+    portcullis-core-guard-exec|portcullis-nodeadm-guard-tokens|portcullis-ingress-guard-pods) _kube_probe_ha "$b" "$2"; return ;;
     portcullis-apps-guard-pods) kind=Pod ;;
     portcullis-apps-guard-workloads) kind=Deployment ;;
     portcullis-apps-guard-services) kind=Service ;;
@@ -1192,7 +1188,7 @@ _kube_configmap_from() {
 #   storage     the provisioner portcullis.io/local-path (kube/storage),
 #               its ConfigMap, the StorageClasses, its deny policy + API egress;
 #   crds        the Traefik CRDs (K14: kubectl --server-side, never Helm);
-#   admission   the ten VAPs and their ten bindings (kube/admission);
+#   admission   the nine VAPs and their nine bindings (kube/admission);
 #   params      portcullis-admission-params: the Hub's resolved digest
 #               (KUBE_HUB_IMAGE, name@sha256:…), roots, ports, networks, peers.
 kube_cluster_setup() {
@@ -1213,6 +1209,9 @@ kube_cluster_setup() {
   done
   _kube_applied_set cluster.namespaces "${PORTCULLIS_KUBE_INSTALL_ID}"
 
+  # The PriorityClasses first: the provisioner and the probe name one.
+  _kube_apply_files "$PORTCULLIS_HOME/kube/priorityclasses.yaml" || fail "could not apply the PriorityClasses (kube/priorityclasses.yaml)"
+  _kube_applied_set cluster.priorities "$(_kube_sha "$PORTCULLIS_HOME/kube/priorityclasses.yaml")"
   info "Cluster setup: storage (portcullis.io/local-path)..."
   tmp="$(mktemp -d)"
   cp "$st/config.json" "$tmp/config.json"
@@ -1629,7 +1628,7 @@ kube_health_report() {
 }
 
 # kube_cluster_check — the Hub's cluster check input (contract §6): the apps
-# namespace's PSA labels and the ten bindings, written as the ConfigMap
+# namespace's PSA labels and the nine bindings, written as the ConfigMap
 # portcullis-cluster-check (checked_at RFC 3339 UTC, ok true|false, why).
 # The Hub refuses every runtime operation once it is 24 h old: `up` writes
 # it, and so does `kube check`, which the portcullis-kube-check.timer init
@@ -2292,7 +2291,7 @@ help_kube_check() {
 Usage: portcullis kube check
 
 Kubernetes only. Re-checks the apps namespace's Pod Security labels and the
-ten admission bindings and writes the result into the ConfigMap
+nine admission bindings and writes the result into the ConfigMap
 portcullis-cluster-check (checked_at, ok, why), which the Hub reads: it
 refuses every runtime operation while the check failed or is more than 24 h
 old. `up` writes it too; init installs portcullis-kube-check.timer, which

@@ -87,6 +87,7 @@ spec:
         app: portcullis-local-path
     spec:
       serviceAccountName: portcullis-local-path
+      priorityClassName: portcullis-core
       securityContext:
         runAsNonRoot: true
         runAsUser: 65534

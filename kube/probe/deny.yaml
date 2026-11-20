@@ -63,6 +63,7 @@ metadata:
     portcullis.io/probe: ingress-test
 spec:
   automountServiceAccountToken: false
+  priorityClassName: portcullis-core
   restartPolicy: Never
   terminationGracePeriodSeconds: 1
   securityContext:
@@ -95,6 +96,7 @@ metadata:
     portcullis.io/probe: egress-test
 spec:
   automountServiceAccountToken: false
+  priorityClassName: portcullis-core
   restartPolicy: Never
   terminationGracePeriodSeconds: 1
   securityContext:

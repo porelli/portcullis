@@ -371,7 +371,7 @@ spec:
         !has(variables.spec.tolerations) || (size(variables.spec.tolerations) <= 32
           && !variables.spec.tolerations.exists(t, !has(t.key) || t.key == '' || t.key == 'portcullis.io/small'))
         || (size(variables.requiredTerms) > 0 && size(variables.requiredTerms) <= 32
-          && variables.requiredTerms.exists(t, has(t.matchExpressions) && t.matchExpressions.exists(e,
+          && variables.requiredTerms.exists(t, has(t.matchExpressions) && size(t.matchExpressions) <= 32 && t.matchExpressions.exists(e,
                e.key == 'portcullis.io/class' && e.operator == 'In' && has(e.values) && e.values == ['small']))
           && variables.requiredTerms.all(t, has(t.matchExpressions) && size(t.matchExpressions) <= 32 && t.matchExpressions.exists(e,
                e.key == 'portcullis.io/class' && e.operator in ['In', 'NotIn'] && has(e.values) && e.values == ['small'])))
@@ -840,7 +840,7 @@ spec:
         !has(variables.spec.tolerations) || (size(variables.spec.tolerations) <= 32
           && !variables.spec.tolerations.exists(t, !has(t.key) || t.key == '' || t.key == 'portcullis.io/small'))
         || (size(variables.requiredTerms) > 0 && size(variables.requiredTerms) <= 32
-          && variables.requiredTerms.exists(t, has(t.matchExpressions) && t.matchExpressions.exists(e,
+          && variables.requiredTerms.exists(t, has(t.matchExpressions) && size(t.matchExpressions) <= 32 && t.matchExpressions.exists(e,
                e.key == 'portcullis.io/class' && e.operator == 'In' && has(e.values) && e.values == ['small']))
           && variables.requiredTerms.all(t, has(t.matchExpressions) && size(t.matchExpressions) <= 32 && t.matchExpressions.exists(e,
                e.key == 'portcullis.io/class' && e.operator in ['In', 'NotIn'] && has(e.values) && e.values == ['small'])))
@@ -1466,7 +1466,9 @@ spec:
 # tests/published_docs.json (tests/k8s_hardening.py compares these
 # literals), or probe-<16 hex> (another params generation's probe: prints
 # nothing). Every other exec there (the front door's DNS credentials, Vault,
-# a shell) is refused. The probe: `hub rev /hub-data probe-<generation>`.
+# a shell) is refused, and so is every attach or port-forward. The probe:
+# `hub rev /hub-data probe-<generation>`. The `container` parameter isn't
+# judged: any container of a reader pod runs the same fixed command.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -1486,6 +1488,8 @@ spec:
       - CONNECT
       resources:
       - pods/exec
+      - pods/attach
+      - pods/portforward
   variables:
   - name: cli
     expression: "params.data.cliUsername != '' && request.userInfo.username == params.data.cliUsername"
@@ -1493,11 +1497,16 @@ spec:
     expression: 'has(object.command) && type(object.command) == list ? object.command : []'
   validations:
   - expression: >-
-      !(size(variables.cmd) == 4 && variables.cmd[0] == '/portcullis-bin/hub' && variables.cmd[1] == 'rev'
+      request.subResource != 'exec'
+      || !(size(variables.cmd) == 4 && variables.cmd[0] == '/portcullis-bin/hub' && variables.cmd[1] == 'rev'
       && variables.cmd[2] == '/hub-data' && variables.cmd[3] == 'probe-' + params.data.generation)
     messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
+  # No attach or port-forward in the core namespace (nobody but the CLI
+  # holds either right today: defense in depth).
+  - expression: "variables.cli || request.subResource == 'exec'"
+    message: only the CLI may attach to or port-forward a pod of the core namespace
   - expression: |-
-      variables.cli || (
+      variables.cli || request.subResource != 'exec' || (
         request.userInfo.username == params.data.hubServiceAccount
         && ['group-gate-', 'keycloak-', 'mcp-gate-', 'wg-'].exists(p, request.name.startsWith(p))
         && size(variables.cmd) == 4 && variables.cmd[0] == '/portcullis-bin/hub' && variables.cmd[1] == 'rev'
@@ -1513,12 +1522,16 @@ spec:
 # 3): portcullis-ingress is PSA privileged (baseline forbids hostPort), so
 # this is its only pod guard, for every identity (the CLI and the DaemonSet
 # controller included): only the Traefik DaemonSet `traefik` and its pods
-# (owned by it), the image traefikImage, ServiceAccount traefik, the label
-# app.kubernetes.io/name: traefik, one container (no init or ephemeral
-# one), the PSA restricted profile in every field (non-root, no privilege
-# escalation, drop ALL with nothing added, seccomp RuntimeDefault, the
-# restricted volume types, so no hostPath) except hostPort 80 / 443 on that
-# container, and no host namespaces. A dry run annotated with another
+# (owned by it, and created only by the DaemonSet controller or the CLI:
+# a self-declared owner reference isn't enough), the image traefikImage, no
+# command or args (the image's entrypoint; Traefik is configured by
+# environment), environment variables only of traefikEnv's names (values
+# from the traefikSecrets only, no envFrom), ServiceAccount traefik, the
+# label app.kubernetes.io/name: traefik, one container (no init or
+# ephemeral one), volumes only emptyDir and the named ConfigMaps / Secrets
+# (projected too), the PSA restricted profile in every field (non-root, no
+# privilege escalation, drop ALL with nothing added, seccomp RuntimeDefault)
+# except hostPort 80 / 443 on that container, and no host namespaces. A dry run annotated with another
 # params generation (16 hex) is another generation's probe and is let by:
 # a dry run persists nothing.
 apiVersion: admissionregistration.k8s.io/v1
@@ -1564,6 +1577,52 @@ spec:
     expression: 'has(variables.meta.annotations) ? variables.meta.annotations : {}'
   - name: volumes
     expression: 'has(variables.spec.volumes) ? variables.spec.volumes : []'
+  - name: cli
+    expression: "params.data.cliUsername != '' && request.userInfo.username == params.data.cliUsername"
+  # Traefik's only ConfigMaps, Secrets and environment variable names
+  # (charts/portcullis/templates/traefik.yaml; tests/k8s_hardening.py holds
+  # the rendered pod to these lists). kube-root-ca.crt: the API access volume
+  # the ServiceAccount admission plugin adds.
+  - name: traefikConfigMaps
+    expression: "['config-traefik-dynamic', 'traefik-dynamic', 'certs', 'kube-root-ca.crt']"
+  - name: traefikSecrets
+    expression: "['secrets-certs', 'secrets-domains-certs-endpoint', 'portcullis-env']"
+  - name: traefikEnv
+    expression: >-
+      ['TRAEFIK_API_DASHBOARD', 'TRAEFIK_API_INSECURE', 'TRAEFIK_LOG_LEVEL', 'TRAEFIK_ACCESSLOG',
+       'TRAEFIK_ACCESSLOG_FORMAT', 'TRAEFIK_PING', 'TRAEFIK_ENTRYPOINTS_TRAEFIK_ADDRESS',
+       'TRAEFIK_ENTRYPOINTS_TRAEFIK_HTTP_ALIASHEADERSSTRATEGY', 'TRAEFIK_ENTRYPOINTS_METRICS_ADDRESS',
+       'TRAEFIK_ENTRYPOINTS_METRICS_HTTP_ALIASHEADERSSTRATEGY', 'TRAEFIK_METRICS_PROMETHEUS',
+       'TRAEFIK_METRICS_PROMETHEUS_ENTRYPOINT', 'TRAEFIK_ENTRYPOINTS_WEB_ADDRESS',
+       'TRAEFIK_ENTRYPOINTS_WEB_HTTP_ALIASHEADERSSTRATEGY',
+       'TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_ALIASHEADERSSTRATEGY', 'TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_MIDDLEWARES',
+       'TRAEFIK_ENTRYPOINTS_WEBSECURE_ASDEFAULT', 'TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_TO',
+       'TRAEFIK_ENTRYPOINTS_WEB_HTTP_REDIRECTIONS_ENTRYPOINT_SCHEME', 'TRAEFIK_ENTRYPOINTS_WEBSECURE_ADDRESS',
+       'TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_CERTRESOLVER',
+       'TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_DOMAINS_0_MAIN',
+       'TRAEFIK_ENTRYPOINTS_WEBSECURE_HTTP_TLS_DOMAINS_0_SANS', 'TRAEFIK_ENTRYPOINTS_KCINTERNAL_ADDRESS',
+       'TRAEFIK_ENTRYPOINTS_KCINTERNAL_HTTP_ALIASHEADERSSTRATEGY', 'TRAEFIK_ENTRYPOINTS_KCINTERNAL_HTTP_MIDDLEWARES',
+       'TRAEFIK_ENTRYPOINTS_VPNSECURE_ADDRESS', 'TRAEFIK_ENTRYPOINTS_VPNSECURE_PROXYPROTOCOL_TRUSTEDIPS',
+       'TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_ALIASHEADERSSTRATEGY', 'TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_MIDDLEWARES',
+       'TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_CERTRESOLVER',
+       'TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_DOMAINS_0_MAIN',
+       'TRAEFIK_ENTRYPOINTS_VPNSECURE_HTTP_TLS_DOMAINS_0_SANS', 'TRAEFIK_ENTRYPOINTS_PARKED_ADDRESS',
+       'TRAEFIK_PROVIDERS_KUBERNETESCRD', 'TRAEFIK_PROVIDERS_KUBERNETESCRD_NAMESPACES',
+       'TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWCROSSNAMESPACE',
+       'TRAEFIK_PROVIDERS_KUBERNETESCRD_ALLOWEXTERNALNAMESERVICES',
+       'TRAEFIK_PROVIDERS_KUBERNETESCRD_DISABLECLUSTERSCOPERESOURCES', 'TRAEFIK_PROVIDERS_KUBERNETESCRD_SAFENAMING',
+       'TRAEFIK_PROVIDERS_FILE_DIRECTORY', 'TRAEFIK_PROVIDERS_FILE_WATCH', 'TRAEFIK_PROVIDERS_HTTP_ENDPOINT',
+       'TRAEFIK_PROVIDERS_HTTP_POLLINTERVAL', 'TRAEFIK_PROVIDERS_HTTP_POLLTIMEOUT',
+       'TRAEFIK_PROVIDERS_HTTP_MAXRESPONSEBODYSIZE', 'TRAEFIK_PROVIDERS_HTTP_TLS_CA',
+       'TRAEFIK_PROVIDERS_HTTP_TLS_CERT', 'TRAEFIK_PROVIDERS_HTTP_TLS_KEY',
+       'TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_EMAIL',
+       'TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_STORAGE',
+       'TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_CASERVER',
+       'TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_DNSCHALLENGE',
+       'TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_DNSCHALLENGE_PROVIDER',
+       'TRAEFIK_CERTIFICATESRESOLVERS_LETSENCRYPT_ACME_DNSCHALLENGE_RESOLVERS', 'CF_API_EMAIL', 'GCE_PROJECT',
+       'CF_DNS_API_TOKEN', 'PORKBUN_API_KEY', 'PORKBUN_SECRET_API_KEY', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
+       'AWS_HOSTED_ZONE_ID', 'DO_AUTH_TOKEN', 'HETZNER_API_KEY', 'HETZNER_API_TOKEN']
   - name: otherProbe
     expression: >-
       request.dryRun && has(object.metadata.annotations) && 'portcullis.io/params-generation' in object.metadata.annotations
@@ -1597,10 +1656,23 @@ spec:
             'net.ipv4.ip_local_port_range', 'net.ipv4.ip_unprivileged_port_start', 'net.ipv4.tcp_syncookies', 'net.ipv4.ping_group_range',
             'net.ipv4.ip_local_reserved_ports', 'net.ipv4.tcp_keepalive_time', 'net.ipv4.tcp_fin_timeout', 'net.ipv4.tcp_keepalive_intvl',
             'net.ipv4.tcp_keepalive_probes'])))
+        && size(variables.annotations) <= 64
         && variables.annotations.all(k, !k.startsWith('container.apparmor.security.beta.kubernetes.io/') || variables.annotations[k] != 'unconfined')
-        && size(variables.volumes) <= 32 && variables.volumes.all(v, has(v.configMap) || has(v.csi) || has(v.downwardAPI) || has(v.emptyDir)
-            || has(v.ephemeral) || has(v.persistentVolumeClaim) || has(v.projected) || has(v.secret))
+        && (variables.ds || request.operation != 'CREATE' || variables.cli
+            || request.userInfo.username in ['system:serviceaccount:kube-system:daemon-set-controller', 'system:kube-controller-manager'])
+        && size(variables.volumes) <= 32 && variables.volumes.all(v, has(v.emptyDir)
+            || (has(v.configMap) && v.configMap.name in variables.traefikConfigMaps)
+            || (has(v.secret) && v.secret.secretName in variables.traefikSecrets)
+            || (has(v.projected) && has(v.projected.sources) && size(v.projected.sources) <= 8 && v.projected.sources.all(src,
+                 (has(src.configMap) && src.configMap.name in variables.traefikConfigMaps)
+                 || (has(src.secret) && src.secret.name in variables.traefikSecrets)
+                 || has(src.downwardAPI) || (has(src.serviceAccountToken) && !has(src.serviceAccountToken.audience)))))
         && variables.spec.containers.all(c, c.image == params.data.traefikImage && has(c.securityContext)
+          && (!has(c.command) || size(c.command) == 0) && (!has(c.args) || size(c.args) == 0)
+          && (!has(c.envFrom) || size(c.envFrom) == 0)
+          && (!has(c.env) || (size(c.env) <= 96 && c.env.all(e, e.name in variables.traefikEnv
+              && (!has(e.valueFrom) || (has(e.valueFrom.secretKeyRef) && e.valueFrom.secretKeyRef.name in variables.traefikSecrets
+                  && !has(e.valueFrom.configMapKeyRef) && !has(e.valueFrom.fieldRef) && !has(e.valueFrom.resourceFieldRef))))))
           && !(has(c.securityContext.privileged) && c.securityContext.privileged)
           && has(c.securityContext.allowPrivilegeEscalation) && c.securityContext.allowPrivilegeEscalation == false
           && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && 'ALL' in c.securityContext.capabilities.drop

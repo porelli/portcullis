@@ -1,0 +1,66 @@
+# The five PriorityClasses (NEW, HA; plan Global Constraints, contract
+# §20.1), applied by ./portcullis (kube_cluster_setup, server-side, first:
+# the storage provisioner and the NetworkPolicy probe already name a class)
+# like the CRDs, never by Helm. portcullis-core is for every pod that isn't
+# an app's: the chart's pods and one-shots, the storage provisioner, the
+# NetworkPolicy probe and every infrastructure piece (tests/k8s_hardening.py
+# checks every pod template of the chart and kube/). The four app classes
+# are the Hub's translator's (state.yaml availability.priority; the
+# admission policy keeps portcullis-core off app pods, contract §6).
+# globalDefault only on portcullis-normal; portcullis-low never preempts.
+# The Hub keeps a byte copy (internal/runtime/kube/testdata/priorityclasses.yaml)
+# for its envtest.
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: portcullis-core
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+value: 1000000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "Core pods: sign-in, the gates, the Hub, data, and the infrastructure Portcullis installs."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: portcullis-critical
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+value: 100000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "Apps at priority critical."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: portcullis-high
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+value: 10000
+globalDefault: false
+preemptionPolicy: PreemptLowerPriority
+description: "Apps at priority high."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: portcullis-normal
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+value: 1000
+globalDefault: true
+preemptionPolicy: PreemptLowerPriority
+description: "Apps at priority normal (the default)."
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: portcullis-low
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+value: 100
+globalDefault: false
+preemptionPolicy: Never
+description: "Apps at priority low: never preempts."

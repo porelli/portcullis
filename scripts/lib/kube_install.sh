@@ -517,11 +517,11 @@ kube_cluster_addresses() {
   _K_ERR=""
 }
 
-# ── HA admission (plan Task 18; contract §6): the four HA bindings' objects ──
+# ── HA admission (plan Task 18; contract §6): the three HA bindings' objects ──
 
-# The admission policy files (kube/admission): policies.yaml and nodeadm's two.
+# The admission policy files (kube/admission): policies.yaml and nodeadm's.
 # shellcheck disable=SC2034  # read by kube.sh (kube_cluster_setup)
-KUBE_POLICY_FILES="policies.yaml nodeadm-tokens.yaml nodeadm-admission.yaml"
+KUBE_POLICY_FILES="policies.yaml nodeadm-tokens.yaml"
 # NEW (HA): Traefik's own namespace (PSA privileged for hostPort 80/443;
 # portcullis-ingress-pods admits only its DaemonSet's pod shape there), and
 # nodeadm's ServiceAccount (params nodeadmServiceAccount, contract §20.2).
@@ -547,8 +547,6 @@ kube_traefik_image() {
 #             needed: admission answers before the pod is looked up);
 #   tokens    as nodeadm, a canonical bootstrap token Secret (expiring in
 #             10 min) in kube-system;
-#   admission as nodeadm, the ConfigMap portcullis-admission-params-<16 x 0>
-#             in the core namespace;
 #   ingress   a pod of portcullis-ingress (another generation's binding lets
 #             a dry run annotated with its generation by).
 _kube_probe_ha() {
@@ -566,9 +564,6 @@ _kube_probe_ha() {
           stringData: {"token-id": "pcprob", "token-secret": "portcullisprobe0", "expiration": (now + 600 | floor | strftime("%Y-%m-%dT%H:%M:%SZ")),
             "usage-bootstrap-authentication": "true", "auth-extra-groups": "system:bootstrappers:k3s:default-node-token"}}' \
         | kube_ctl -n kube-system --as="$KUBE_NODEADM_SA" --as-group=system:masters create --dry-run=server -f - ;;
-    portcullis-nodeadm-guard-admission)
-      M="$m" jq -n '{apiVersion: "v1", kind: "ConfigMap", metadata: (env.M | fromjson | .name = "portcullis-admission-params-0000000000000000")}' \
-        | kube_ctl -n "$cns" --as="$KUBE_NODEADM_SA" --as-group=system:masters create --dry-run=server -f - ;;
     portcullis-ingress-guard-pods)
       M="$m" IMG="${KUBE_HUB_IMAGE:-$PORTCULLIS_HELPER_IMAGE}" jq -n '{apiVersion: "v1", kind: "Pod", metadata: (env.M | fromjson),
           spec: {automountServiceAccountToken: false, containers: [{name: "c", image: env.IMG, command: ["true"]}]}}' \

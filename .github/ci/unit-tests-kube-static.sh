@@ -101,7 +101,7 @@ done
 # The CLI-applied manifests (probe, storage, admission; not the template of
 # the params' keys).
 KUBE_FILES=()
-while IFS= read -r f; do KUBE_FILES+=("$f"); done < <(ls kube/probe/*.yaml kube/storage/*.yaml; find kube/admission -name '*.yaml' ! -name '*.tmpl.yaml' | sort)
+while IFS= read -r f; do KUBE_FILES+=("$f"); done < <(ls kube/priorityclasses.yaml kube/probe/*.yaml kube/storage/*.yaml; find kube/admission -name '*.yaml' ! -name '*.tmpl.yaml' | sort)
 "$KUBECONFORM" -strict -summary -kubernetes-version "$K8S_VERSION" \
   -schema-location "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/$K8S_SCHEMA_COMMIT/{{ .NormalizedKubernetesVersion }}-standalone{{ .StrictSuffix }}/{{ .ResourceKind }}{{ .KindSuffix }}.json" \
   "${KUBE_FILES[@]}"
@@ -154,8 +154,9 @@ copies="$copies nodeadm/testdata/joincode_v2_vectors.json=internal/servers/testd
 copies="$copies nodeadm/testdata/site_roles_vectors.json=internal/servers/testdata/site_roles_vectors.json"
 # The admission vectors (the HA cases run in e2e-k3s-apps-admission.sh).
 copies="$copies tests/admission_vectors.json=internal/runtime/kube/testdata/admission_vectors.json"
+copies="$copies kube/priorityclasses.yaml=internal/runtime/kube/testdata/priorityclasses.yaml"
 if [ -d kube/admission ]; then
-  for f in kube/admission/policies.yaml kube/admission/bindings.yaml kube/admission/params.yaml kube/admission/nodeadm-tokens.yaml kube/admission/nodeadm-admission.yaml; do
+  for f in kube/admission/policies.yaml kube/admission/bindings.yaml kube/admission/params.yaml kube/admission/nodeadm-tokens.yaml; do
     copies="$copies $f=internal/runtime/kube/testdata/admission/${f##*/}"
   done
 fi
@@ -165,7 +166,7 @@ for pair in $copies; do
   if ! curl -fsSL --retry 3 -o "$TOOLS/theirs" "https://raw.githubusercontent.com/porelli/portcullis-hub/$sha/$theirs"; then
     echo "::error::portcullis-hub $ref ($sha) has no $theirs: core's $own is a byte copy of it (K13)"; fail=1; continue
   fi
-  cmp -s "$own" "$TOOLS/theirs" || { echo "::error::$own differs from portcullis-hub $ref:$theirs ($sha)"; diff "$own" "$TOOLS/theirs" | head -40; fail=1; }
+  cmp -s "$own" "$TOOLS/theirs" || { echo "::error::$own differs from portcullis-hub $ref:$theirs ($sha)"; diff "$own" "$TOOLS/theirs" | head -40 || true; fail=1; }
 done
 # The two Go modules' strict vector decoders are one file, kept in step.
 cmp -s domains/strict_vectors_test.go nodeadm/strict_vectors_test.go \
