@@ -10,7 +10,8 @@
   ],
   "mode": "0444",
   "fs_group": null,
-  "rev_path": "/hub-data/.rev-group-gate-policy"
+  "rev_path": "/hub-data/.rev-group-gate-policy",
+  "optional": true
  },
  {
   "doc": "user-attributes",
@@ -23,7 +24,8 @@
   ],
   "mode": "0444",
   "fs_group": null,
-  "rev_path": "/hub-data/.rev-user-attributes"
+  "rev_path": "/hub-data/.rev-user-attributes",
+  "optional": true
  },
  {
   "doc": "portal-apps",
@@ -36,7 +38,8 @@
   ],
   "mode": "0444",
   "fs_group": null,
-  "rev_path": "/hub-data/.rev-portal-apps"
+  "rev_path": "/hub-data/.rev-portal-apps",
+  "optional": true
  },
  {
   "doc": "signin-keycloak",
@@ -49,7 +52,8 @@
   ],
   "mode": "0444",
   "fs_group": null,
-  "rev_path": "/hub-data/.rev-signin-keycloak"
+  "rev_path": "/hub-data/.rev-signin-keycloak",
+  "optional": true
  },
  {
   "doc": "impersonation",
@@ -63,7 +67,8 @@
   ],
   "mode": "0444",
   "fs_group": null,
-  "rev_path": "/hub-data/.rev-impersonation"
+  "rev_path": "/hub-data/.rev-impersonation",
+  "optional": true
  },
  {
   "doc": "mcp-gate",
@@ -76,7 +81,8 @@
   ],
   "mode": "0444",
   "fs_group": null,
-  "rev_path": "/hub-data/.rev-mcp-gate"
+  "rev_path": "/hub-data/.rev-mcp-gate",
+  "optional": true
  },
  {
   "doc": "mcp-credentials",
@@ -89,7 +95,8 @@
   ],
   "mode": "0440",
   "fs_group": 10001,
-  "rev_path": "/hub-data/.rev-mcp-credentials"
+  "rev_path": "/hub-data/.rev-mcp-credentials",
+  "optional": true
  },
  {
   "doc": "vpn",
@@ -103,6 +110,7 @@
   ],
   "mode": "0444",
   "fs_group": null,
-  "rev_path": "/vpn-doc/.rev-vpn"
+  "rev_path": "/vpn-doc/.rev-vpn",
+  "optional": true
  }
 ]

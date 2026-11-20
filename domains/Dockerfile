@@ -8,6 +8,7 @@ COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 COPY *.go ./
 COPY internal/ ./internal/
+COPY frontdoor/ ./frontdoor/
 RUN CGO_ENABLED=0 go build -trimpath -tags "$GO_TAGS" -ldflags="-s -w" -o /domains .
 
 # alpine:3.24.3
