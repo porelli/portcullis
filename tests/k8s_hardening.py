@@ -349,6 +349,21 @@ def gate_shape_problems(docs, vals=None):
 DO_NOT_SCHEDULE = {"group-gate", "mcp-gate", "alertmanager", "keycloak"}
 
 
+def check_traefik_peer():
+    """The Hub's HUB_TRAEFIK_PEER (its routed apps' NetworkPolicy peer, Hub
+    Task 13) is exactly the admission params' traefik value the CLI writes
+    (kube_traefik_peer), with and without HA: the policy compares the two."""
+    for ha in (False, True):
+        out = K.subprocess.run(["bash", "-c", f'source "{K.ROOT}/scripts/lib/common.sh" >/dev/null 2>&1; '
+                                f'PORTCULLIS_NAMESPACE={K.NS} {"PORTCULLIS_HA=on " if ha else ""}kube_traefik_peer'],
+                               check=True, capture_output=True, text=True).stdout.strip()
+        docs = K.render({"ha": {"enabled": ha}})
+        hub = next(sp for n, _, _, sp, _ in K.pod_specs(docs) if n == "hub")
+        env = {e["name"]: e.get("value") for e in hub["containers"][0].get("env", [])}
+        if not out or env.get("HUB_TRAEFIK_PEER") != out:
+            F.add(f"{'ha: ' if ha else ''}the Hub's HUB_TRAEFIK_PEER {env.get('HUB_TRAEFIK_PEER')!r} != the params' traefik {out!r} (kube_traefik_peer)")
+
+
 HA_TOLERATIONS = [{"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 30},
                   {"key": "node.kubernetes.io/unreachable", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 30}]
 
@@ -616,6 +631,7 @@ def main():
     check_nodeadm()
     check_log_ports()
     check_ha_shape()
+    check_traefik_peer()
     check_sites_storage()
     check_psa()
     check_priorities()

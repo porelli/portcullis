@@ -634,3 +634,17 @@ nodeadm answers 404 for any other /node/<file> anyway).
 {{- $p := list -}}{{- range $paths }}{{- $p = append $p (printf "Path(`%s`)" .) -}}{{- end -}}
 Host(`{{ include "portcullis.domain" . }}`) && ({{ join " || " $p }})
 {{- end }}
+
+{{/*
+portcullis.traefikPeerParam — Traefik as the admission params name it
+(<namespace>:<label>=<value>, the CLI's kube_traefik_peer): the Hub's
+HUB_TRAEFIK_PEER, the peer of its routed apps' NetworkPolicies (Hub Task
+13), so the two can't disagree (k8s_hardening checks them equal).
+*/}}
+{{- define "portcullis.traefikPeerParam" -}}
+{{- if .Values.ha.enabled -}}
+{{ .Values.ingressNamespace }}:app.kubernetes.io/name=traefik
+{{- else -}}
+{{ .Release.Namespace }}:portcullis.io/component=traefik
+{{- end -}}
+{{- end }}
