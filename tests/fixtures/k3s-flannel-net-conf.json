@@ -1,0 +1,1 @@
+{"Network":"10.42.0.0/16","EnableIPv4":true,"EnableIPv6":false,"Backend":{"Type":"wireguard","ListenPort":51840,"PersistentKeepaliveInterval":25,"Mode":"separate"}}

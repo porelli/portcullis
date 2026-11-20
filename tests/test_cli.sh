@@ -153,7 +153,6 @@ init --frob|unknown argument: --frob
 init --runtime|--runtime needs a value
 init --runtime lxc|--runtime must be docker, podman or kubernetes
 init --runtime docker --kube-context ci|--kube-context goes with --runtime kubernetes
-init --runtime kubernetes|--runtime kubernetes needs --kube-context
 init --kube-context|--kube-context needs a value
 vault init --rotate-enroll-secret|unknown argument
 pki setup --with-server-certs|unknown argument
@@ -289,9 +288,12 @@ expect_eq "mail enable on podman with port start 80 → refused naming net.ipv4.
 
 # ── no secret on a command line (CLAUDE.md: stdin, -H @<(...), key=-, jq
 # --rawfile / env.X) ── lines marked "secret-argv-ok" are reviewed exceptions.
-ARGV_RE='--from-literal|--set(-string|-json)?[ =][^ ]*(secrets/|\$\(cat|PASSWORD|SECRET|TOKEN)|--arg(json)? [A-Za-z_]+ "?\$\(cat|--arg(json)? [A-Za-z_]+ "?\$\{?[A-Za-z_]*(PASSWORD|SECRET|TOKEN|PASS)\b|--(admin-)?password[ =]"?\$|--token[ =]"?\$|(PASSWORD|SECRET|TOKEN)=[^ ]*\$\(cat '
+ARGV_RE='--from-literal|--set(-string|-json)?[ =][^ ]*(secrets/|\$\(cat|PASSWORD|SECRET|TOKEN)|--arg(json)? [A-Za-z_]+ "?\$\(cat|--arg(json)? [A-Za-z_]+ "?\$\{?[A-Za-z_]*(PASSWORD|SECRET|TOKEN|PASS)\b|--(admin-)?password[ =]"?\$|--token[ =]"?\$|(PASSWORD|SECRET|TOKEN)=[^ ]*\$\(cat |K3S_TOKEN=|--new-token|--agent-token[ =]'
 HITS="$(grep -nE -e "$ARGV_RE" "$HERE/../portcullis" "$HERE"/../scripts/lib/*.sh | grep -v 'secret-argv-ok' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
 expect_eq "no secrets on argv in the CLI" "$HITS" ""
+# HA (Task 17): the grep covers the k3s installer (the token reaches k3s as
+# --token-file only, the mesh key through wg-quick's PostUp file).
+expect_eq "the argv grep covers scripts/lib/kube_install.sh" "$(printf '%s\n' "$HERE"/../scripts/lib/*.sh | grep -c '/kube_install\.sh$')" 1
 # Container root is the operator under rootless Podman: an operator-owned
 # file is chowned to ct_operator_id, never $(id -u) (a subuid there).
 # Contract §6: the engine socket reaches only the two socket proxies, from
@@ -808,6 +810,11 @@ expect_eq "init: CONTAINER_RUNTIME=kubernetes in .env, --runtime docker → refu
 rm -f "$PORTCULLIS_ROOT/.env"
 RC=0; PATH="$WORK/kbin:$PATH" KUBE_CALLS="$WORK/kube-calls" "$CLI" init --env-only --non-interactive --domain ci.example.org --dns-provider none --runtime kubernetes --kube-context prod >/dev/null 2>"$WORK/err" </dev/null || RC=$?
 expect_eq "init --runtime kubernetes: a context that doesn't exist → refused, no .env" "$RC:$(grep -c "kube context prod doesn't exist" "$WORK/err"):$(test -e "$PORTCULLIS_ROOT/.env" && echo yes || echo no)" "1:1:no"
+# Without --kube-context, init installs k3s on this host (T17 b): the host
+# checks come first (here: not Linux → refused), nothing written.
+RC=0; PATH="$WORK/kbin:$PATH" KUBE_CALLS="$WORK/kube-calls-noctx" KUBE_INSTALL_OS=Darwin "$CLI" init --env-only --non-interactive --domain ci.example.org --dns-provider none --runtime kubernetes >/dev/null 2>"$WORK/err" </dev/null || RC=$?
+expect_eq "init --runtime kubernetes without --kube-context → the k3s install's host checks (Linux only), no .env, no cluster call" \
+  "$RC:$(grep -c 'init installs k3s on Linux only' "$WORK/err"):$(test -e "$PORTCULLIS_ROOT/.env" && echo yes || echo no):$(cat "$WORK/kube-calls-noctx" 2>/dev/null | grep -vc '^config get-contexts' || true)" "1:1:no:0"
 run init --env-only --non-interactive --domain ci.example.org --dns-provider none --runtime docker
 expect_eq "init --env-only succeeds" "$RC" 0
 ENVF="$PORTCULLIS_ROOT/.env"
@@ -1407,6 +1414,48 @@ expect_eq "init: hub started after the service account step" \
 expect_eq "init: second up is 'up hub'" \
   "$(printf '%s\n' "$calls" | tail -1 | tr -s ' ')" "up hub"
 expect_eq "init: tighten runs at the end (after the Hub's up)" "$(cat "$WORK/tighten-at" 2>/dev/null)" "$(printf '%s\n' "$calls" | wc -l | tr -d ' ')"
+
+# ── test_docker_init_unchanged (HA, Task 17): a Docker init gains no prompt,
+# step, service or .env key. Its transcript (init --env-only through the
+# CLI, then the whole init_run with the stubs above and its compose calls)
+# and its .env key set equal the fixtures committed with Task 17.
+DI="$WORK/docker-init"; rm -rf "$DI"; mkdir -p "$DI/a" "$DI/b/certs" "$DI/b/secrets"
+{
+  echo "== init --env-only --runtime docker"
+  RC=0; PORTCULLIS_ROOT="$DI/a" "$CLI" init --env-only --runtime docker --non-interactive --domain ci.example.org --dns-provider none 2>&1 </dev/null || RC=$?
+  echo "rc=$RC"
+  echo "== init_run (stubbed), runtime docker"
+  : > "$DC_CALLS"
+  (
+    export PATH="$WORK/dcbin:$PATH" LLDAP_ACCOUNT_CHANGED PORTCULLIS_ROOT="$DI/b"
+    unset CONTAINER_RUNTIME
+    # shellcheck disable=SC1091
+    . "$HERE/../scripts/lib/common.sh"
+    # shellcheck disable=SC1091
+    . "$WORK/test-init-stub.sh"
+    # shellcheck disable=SC1091
+    . "$HERE/../scripts/lib/stack.sh"
+    # shellcheck disable=SC2034  # read by init_run
+    INIT_INTERACTIVE=false
+    init_run ci.example.org admin@ci.example.org none false true false docker "" 2>&1 </dev/null
+    echo "rc=$?"
+  )
+  echo "== compose calls"
+  cat "$DC_CALLS"
+} 2>&1 | sed "s#$WORK#<WORK>#g" > "$DI/transcript.txt"
+env_keys() { grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$1" | tr -d '=' | sort -u; }
+{ env_keys "$DI/a/.env"; echo "--"; env_keys "$DI/b/.env"; } > "$DI/env-keys.txt"
+FX="$HERE/fixtures"
+if diff -u "$FX/docker-init-transcript.txt" "$DI/transcript.txt" > "$DI/t.diff" 2>&1; then
+  t_pass "test_docker_init_unchanged: the Docker init transcript is the fixture"
+else
+  t_fail "test_docker_init_unchanged: the Docker init transcript changed: $(head -c 2000 "$DI/t.diff")"
+fi
+if diff -u "$FX/docker-env-keys.txt" "$DI/env-keys.txt" > "$DI/k.diff" 2>&1; then
+  t_pass "test_docker_init_unchanged: the Docker .env key set is the fixture"
+else
+  t_fail "test_docker_init_unchanged: the Docker .env key set changed: $(head -c 2000 "$DI/k.diff")"
+fi
 
 # Test stack_up and upgrade_run: restart hub only when lldap_service_account changed.
 # Set up VAULT_INIT_FILE

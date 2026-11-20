@@ -666,3 +666,7 @@ runtime_status_json() {
 # rt_* kubernetes branch).
 # shellcheck source=kube.sh
 source "$PORTCULLIS_LIB/kube.sh"
+# init's own k3s on the node mesh (kube_install_k3s, kube_install_mesh, the
+# cluster addresses; plan R8).
+# shellcheck source=kube_install.sh
+source "$PORTCULLIS_LIB/kube_install.sh"

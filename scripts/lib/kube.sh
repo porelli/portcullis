@@ -6,7 +6,7 @@
 # runtime.sh. Every kubectl / helm call goes through kube_ctl / kube_helm.
 #
 # .env keys (written by `init --runtime kubernetes`, never switched):
-#   PORTCULLIS_KUBE_CONTEXT          the kubeconfig context (required)
+#   PORTCULLIS_KUBE_CONTEXT          the kubeconfig context (required; init's own k3s: portcullis)
 #   PORTCULLIS_NAMESPACE             core's namespace (portcullis)
 #   PORTCULLIS_APPS_NAMESPACE        the app instances' namespace (portcullis-apps)
 #   PORTCULLIS_POD_CIDR / _SERVICE_CIDR / PORTCULLIS_KUBE_API_ENDPOINTS
@@ -71,8 +71,8 @@ _kube_cidr_ok() {
   [ -n "$first" ] && [ "$(ip_to_int "${1%/*}")" = "$first" ]
 }
 
-# kube_detect_cidrs — sets _K_POD_CIDR (the node's spec.podCIDRs, space-
-# separated), _K_SVC_CIDR (from a server dry-run Service with clusterIP
+# kube_detect_cidrs — sets _K_POD_CIDR (k3s: the cluster CIDR; else the one
+# node's spec.podCIDRs, space-separated), _K_SVC_CIDR (from a server dry-run Service with clusterIP
 # 0.0.0.1, whose rejection names the valid range) and _K_API_EP (the
 # default/kubernetes EndpointSlice: ip:port, space-separated, sorted).
 # An unparsable answer is refused (return 1, _K_ERR says why).
@@ -80,12 +80,15 @@ kube_detect_cidrs() {
   local nodes out
   _K_POD_CIDR="" _K_SVC_CIDR="" _K_API_EP="" _K_ERR=""
   nodes="$(kube_ctl get nodes -o json 2>/dev/null)" || { _K_ERR="kubectl get nodes failed"; return 1; }
+  # k3s (node-args on a node): the cluster CIDR, --cluster-cidr or k3s's
+  # 10.42.0.0/16, holds every node's range; another distribution: one node.
+  _K_POD_CIDR="$(printf '%s' "$nodes" | jq -r '[.items[].metadata.annotations["k3s.io/node-args"] // empty][0] // empty | fromjson
+    | . as $a | ([range(0; length) | select($a[.] | startswith("--cluster-cidr")) | if $a[.] | contains("=") then ($a[.] | sub("^--cluster-cidr="; "")) else $a[. + 1] end][0] // "10.42.0.0/16" | gsub(","; " "))' 2>/dev/null || true)"
   case "$(printf '%s' "$nodes" | jq -r '.items | length' 2>/dev/null)" in
-    1) ;;
     0|"") _K_ERR="the cluster has no node"; return 1 ;;
-    *) _K_ERR="the cluster has more than one node (Portcullis runs on a single-node k3s)"; return 1 ;;
+    1) [ -n "$_K_POD_CIDR" ] || _K_POD_CIDR="$(printf '%s' "$nodes" | jq -r '.items[0].spec | (.podCIDRs // [.podCIDR // empty]) | join(" ")' 2>/dev/null || true)" ;;
+    *) [ -n "$_K_POD_CIDR" ] || { _K_ERR="the cluster has more than one node and isn't k3s (no k3s.io/node-args): its cluster CIDR can't be read"; return 1; } ;;
   esac
-  _K_POD_CIDR="$(printf '%s' "$nodes" | jq -r '.items[0].spec | (.podCIDRs // [.podCIDR // empty]) | join(" ")' 2>/dev/null || true)"
   [ -n "$_K_POD_CIDR" ] || { _K_ERR="the node has no spec.podCIDRs"; return 1; }
   # A Service no cluster can allocate: the API server names the range.
   out="$(kube_ctl create --dry-run=server -f - 2>&1 >/dev/null <<EOF
@@ -251,6 +254,7 @@ kube_host_checks() {
     esac
   fi
   _kube_apparmor_check "$nodes"
+  [ ! -s "$(kube_install_kubeconfig)" ] || _ki_node_checks
   cfg="$(kube_ctl get --raw "/api/v1/nodes/$(printf '%s' "$nodes" | jq -r '.items[0].metadata.name // "?"' 2>/dev/null)/proxy/configz" 2>/dev/null || true)"
   pids="$(printf '%s' "$cfg" | jq -r '.kubeletconfig.podPidsLimit // empty' 2>/dev/null || true)"
   if [ "$pids" = 1024 ]; then
@@ -356,10 +360,10 @@ kube_require_host() {
 # both values; an IPv6 entry is refused).
 kube_runtime_check() {
   local a v
-  [ -n "${PORTCULLIS_KUBE_CONTEXT:-}" ] || fail "PORTCULLIS_KUBE_CONTEXT is not set in .env (CONTAINER_RUNTIME=kubernetes): ./portcullis init --runtime kubernetes --kube-context <ctx> writes it; the current context is never used"
+  [ -n "${PORTCULLIS_KUBE_CONTEXT:-}" ] || fail "PORTCULLIS_KUBE_CONTEXT is not set in .env (CONTAINER_RUNTIME=kubernetes): ./portcullis init --runtime kubernetes [--kube-context <ctx>] writes it; the current context is never used"
   command -v kubectl >/dev/null 2>&1 || fail "kubectl is missing (CONTAINER_RUNTIME=kubernetes)"
   kube_context_exists "$PORTCULLIS_KUBE_CONTEXT" || fail "the kube context $PORTCULLIS_KUBE_CONTEXT (PORTCULLIS_KUBE_CONTEXT) doesn't exist in the kubeconfig"
-  kube_detect_cidrs || fail "can't read the cluster behind $PORTCULLIS_KUBE_CONTEXT: $_K_ERR"
+  { kube_detect_cidrs && kube_cluster_addresses; } || fail "can't read the cluster behind $PORTCULLIS_KUBE_CONTEXT: $_K_ERR"
   ! _kube_ipv6_in "$_K_POD_CIDR $_K_SVC_CIDR" || fail "dual-stack or IPv6 cluster (pods $_K_POD_CIDR, services $_K_SVC_CIDR): Portcullis supports IPv4 single-stack only"
   for a in "PORTCULLIS_POD_CIDR:$_K_POD_CIDR" "PORTCULLIS_SERVICE_CIDR:$_K_SVC_CIDR" "PORTCULLIS_KUBE_API_ENDPOINTS:$_K_API_EP"; do
     v="${a%%:*}"
@@ -369,29 +373,6 @@ kube_runtime_check() {
   # The CLI's Vault / Keycloak calls go through port-forwards when the
   # release runs (127.0.0.1 inside the pods).
   kube_forward_core
-}
-
-# kube_env_keys — the .env lines of a new kubernetes install (after
-# kube_detect_cidrs): context, namespaces, networks, install id, images,
-# the three fixed ClusterIPs.
-kube_env_keys() {
-  local ctx="$1" id
-  id="$(uuidgen 2>/dev/null | tr 'A-Z' 'a-z')" || true
-  [ -n "$id" ] || id="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
-  [[ "$id" =~ ^[0-9a-f-]{36}$ ]] || fail "could not generate PORTCULLIS_KUBE_INSTALL_ID (uuidgen)"
-  cat <<EOF
-PORTCULLIS_KUBE_CONTEXT=$ctx
-PORTCULLIS_NAMESPACE=portcullis
-PORTCULLIS_APPS_NAMESPACE=portcullis-apps
-PORTCULLIS_POD_CIDR=$_K_POD_CIDR
-PORTCULLIS_SERVICE_CIDR=$_K_SVC_CIDR
-PORTCULLIS_KUBE_API_ENDPOINTS=$_K_API_EP
-PORTCULLIS_KUBE_INSTALL_ID=$id
-PORTCULLIS_KUBE_IMAGES=registry
-PORTCULLIS_TRAEFIK_SERVICE_IP=$(kube_svc_ip "$KUBE_TRAEFIK_SVC_OFFSET" "$_K_SVC_CIDR")
-PORTCULLIS_TRAEFIK_VPN_SERVICE_IP=$(kube_svc_ip "$KUBE_TRAEFIK_VPN_SVC_OFFSET" "$_K_SVC_CIDR")
-PORTCULLIS_WG_EDGE_SERVICE_IP=$(kube_svc_ip "$KUBE_WG_EDGE_SVC_OFFSET" "$_K_SVC_CIDR")
-EOF
 }
 
 # ── NetworkPolicy enforcement probe (spec §6) ─────────────

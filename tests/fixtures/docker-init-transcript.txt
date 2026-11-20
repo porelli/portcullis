@@ -1,0 +1,63 @@
+== init --env-only --runtime docker
+==> Created <WORK>/docker-init/a/.env (0600).
+==> Generated POSTGRES_PASSWORD in .env
+==> Generated KEYCLOAK_ADMIN_PASSWORD in .env
+==> Generated LLDAP_ADMIN_PASSWORD in .env
+==> Generated LLDAP_JWT_SECRET in .env
+==> Generated FORWARD_AUTH_CLIENT_SECRET in .env
+==> Generated FORWARD_AUTH_COOKIE_SECRET in .env
+==> Generated FORWARD_AUTH_REDIS_PASSWORD in .env
+==> Generated FORWARD_AUTH_EXT_REDIS_PASSWORD in .env
+==> Generated HUB_PROXY_SECRET in .env
+==> Generated HUB_CLI_PROXY_SECRET in .env
+==> Generated BACKUP_PASSWORD in .env
+==> .env is ready. Review it, then run ./portcullis init to set up the stack.
+rc=0
+== init_run (stubbed), runtime docker
+==> Created <WORK>/docker-init/b/.env (0600).
+==> Generated POSTGRES_PASSWORD in .env
+==> Generated KEYCLOAK_ADMIN_PASSWORD in .env
+==> Generated LLDAP_ADMIN_PASSWORD in .env
+==> Generated LLDAP_JWT_SECRET in .env
+==> Generated FORWARD_AUTH_CLIENT_SECRET in .env
+==> Generated FORWARD_AUTH_COOKIE_SECRET in .env
+==> Generated FORWARD_AUTH_REDIS_PASSWORD in .env
+==> Generated FORWARD_AUTH_EXT_REDIS_PASSWORD in .env
+==> Generated HUB_PROXY_SECRET in .env
+==> Generated HUB_CLI_PROXY_SECRET in .env
+==> Generated BACKUP_PASSWORD in .env
+==> Skipping DNS record setup.
+==> Initialising Vault...
+==> Starting services...
+==> Creating the Vault PKI...
+==> Restarting Traefik, the forward-auth services, Keycloak and group-gate to pick up the CA chain...
+==> Starting the Hub...
+
+==> Portcullis is running.
+
+  Portal          https://ci.example.org             (your apps; the Hub for admins)
+  Hub             https://hub.ci.example.org         (apps, marketplace; admins)
+  People          https://people.ci.example.org      (users, groups, org chart; every signed-in user)
+  Identity        https://auth.ci.example.org/admin/portcullis/console/  (realm console for lldap_admin)
+  Vault           http://127.0.0.1:8200  (root token: secrets/vault-init.json)
+  Break-glass     Keycloak master console https://auth.ci.example.org/admin/master/console/
+                  ($KEYCLOAK_ADMIN / KEYCLOAK_ADMIN_PASSWORD), LLDAP: ./portcullis lldap-ui
+                  (admin / LLDAP_ADMIN_PASSWORD) — both in .env
+
+  admin never signs in with a password. Open the link below, register your
+  security key (YubiKey) and you land in the Hub as the LLDAP admin. New link any time:
+  ./portcullis invite admin --to hub
+
+  Setup link for admin (one use, expires never):
+
+  http://test
+
+==> Back up secrets/vault-init.json OFFLINE (Vault root token + unseal key).
+rc=0
+== compose calls
+version
+sessions_restart_if_changed
+build --quiet
+up vault lldap keycloak traefik
+restart traefik forward-auth forward-auth-ext keycloak group-gate
+up hub

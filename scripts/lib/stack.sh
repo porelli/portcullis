@@ -166,7 +166,7 @@ _init_runtime_existing() {
     return 0
   fi
   [ "$flag" != kubernetes ] && [ "${CONTAINER_RUNTIME:-}" != kubernetes ] \
-    || fail "CONTAINER_RUNTIME=kubernetes needs a fresh .env (init --runtime kubernetes --kube-context <ctx> writes its keys)"
+    || fail "CONTAINER_RUNTIME=kubernetes needs a fresh .env (init --runtime kubernetes [--kube-context <ctx>] writes its keys)"
   rt="$(runtime_detect "$flag")" || exit 1
   env_set CONTAINER_RUNTIME "$rt"
   info "Set CONTAINER_RUNTIME=$rt in .env"
@@ -208,7 +208,11 @@ init_run() {
       # The cluster's networks are detected now (runtime_check re-checks
       # them every run), before anything is written.
       kctx="${kctx:-${PORTCULLIS_KUBE_CONTEXT:-}}"
-      [ -n "$kctx" ] || usage_error init "--runtime kubernetes needs --kube-context <ctx> (the current context is never used)"
+      if [ -z "$kctx" ]; then
+        # No cluster named: this host becomes the first node (pcmesh + k3s).
+        kube_install_run
+        kctx="$PORTCULLIS_KUBE_CONTEXT"
+      fi
       require_cmd kubectl
       kube_context_exists "$kctx" || fail "the kube context $kctx doesn't exist (kubectl config get-contexts)"
       PORTCULLIS_KUBE_CONTEXT="$kctx" kube_detect_cidrs || fail "can't read the cluster behind $kctx: $_K_ERR"
@@ -652,12 +656,17 @@ Options:
                           else Docker if its engine answers, else rootless
                           Podman on the user socket; podman needs the host
                           preparation of docs operations/rootless-podman;
-                          kubernetes is never detected: name it, with
-                          --kube-context, docs operations/kubernetes)
-  --kube-context CTX      the kubeconfig context of the cluster (required
-                          with --runtime kubernetes; written to .env as
+                          kubernetes is never detected: name it, docs
+                          operations/kubernetes)
+  --kube-context CTX      the kubeconfig context of an existing cluster
+                          (with --runtime kubernetes; written to .env as
                           PORTCULLIS_KUBE_CONTEXT: the current context is
-                          never used)
+                          never used). Without it, this Linux host becomes
+                          the cluster's first node: after the host checks
+                          and one confirmation, init installs the node mesh
+                          pcmesh (10.215.0.1, UDP 51830) and the pinned k3s
+                          with embedded etcd on it (context portcullis in
+                          secrets/kube/kubeconfig)
   --env-only              only write/complete .env, then stop (refused
                           without --runtime when no engine answers)
   --skip-dns              do not create DNS records
@@ -740,8 +749,6 @@ cmd_init() {
   done
   [ -z "$kube_context" ] || [ "$runtime" = kubernetes ] || [ "${CONTAINER_RUNTIME:-}" = kubernetes ] \
     || usage_error init "--kube-context goes with --runtime kubernetes"
-  [ "$runtime" != kubernetes ] || [ -n "$kube_context" ] || [ -n "${PORTCULLIS_KUBE_CONTEXT:-}" ] || [ -f "$(env_file)" ] \
-    || usage_error init "--runtime kubernetes needs --kube-context <ctx> (the current context is never used)"
   init_run "$domain" "$email" "$provider" "$env_only" "$skip_dns" "$config_repo" "$runtime" "$kube_context"
 }
 
