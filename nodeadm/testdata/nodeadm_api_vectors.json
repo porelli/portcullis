@@ -2190,6 +2190,33 @@
    }
   },
   {
+   "name": "join: the admission params don't include the node yet",
+   "route": "POST /node/v1/join",
+   "client": "none",
+   "leader": true,
+   "state": "flags illustrative (tests/fixtures/k3s-server-flags.txt is the authority); n4 enrolled (the certificate of the vectors, signed by ca_pem), now = 2026-11-18T10:05:00Z, the nodeagent of n4 answers over pcmesh, portcullis-admission-active doesn't hold n4's addresses",
+   "request": {
+    "method": "POST",
+    "path": "/node/v1/join",
+    "headers": {
+     "Portcullis-Node-Cert": "MIIBvjCCAWSgAwIBAgIETk9ERTAKBggqhkjOPQQDAjAmMSQwIgYDVQQDDBtQb3J0Y3VsbGlzIHRlc3QgcGtpX25vZGUgQ0EwHhcNMjYxMTE4MDk1OTAwWhcNMjYxMjE4MTAwMDAwWjApMScwJQYDVQQDEx5uNC5jbHVzdGVyLnBvcnRjdWxsaXMuaW50ZXJuYWwwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARArbxiTU+wlkjSMPAZ26VKhEQUQtJ2+xnWgxX/h3eUmqvyuHaHqEqHwYYjDn2+tg9l4Qay9LgIqf8Vk6rvw8hOo30wezAOBgNVHQ8BAf8EBAMCB4AwHQYDVR0lBBYwFAYIKwYBBQUHAwIGCCsGAQUFBwMBMB8GA1UdIwQYMBaAFBW+/4jdttXKnv4K3jGHm51Vx2C0MCkGA1UdEQQiMCCCHm40LmNsdXN0ZXIucG9ydGN1bGxpcy5pbnRlcm5hbDAKBggqhkjOPQQDAgNIADBFAiBxFJYvtr8Y8+tqg7jHBlTdAGJnZxrDzHCsqepF1QW/gQIhAMySlAvGyHNj85BaBKbMEkXWkAEkHqhpj/snWRZFk2t7",
+     "Portcullis-Node-Time": "2026-11-18T10:05:00Z",
+     "Portcullis-Node-Nonce": "qiHBdkL82Q-Yi0t8u_EJrw",
+     "Portcullis-Node-Signature": "MEUCIGWOBcyt-9hlGt27LDJ3fdqUkOhvGhVa_DP3I8LX9hgHAiEA7TXgXQMNBZMCZYZc4z2JwzN2oA9GCIlstdsUJXzO6jc"
+    },
+    "body": null,
+    "body_text": "{\"server_id\":\"n4\",\"rtt_ms\":{\"n1\":3,\"n2\":4,\"n3\":5}}"
+   },
+   "response": {
+    "status": 409,
+    "headers": {},
+    "body": {
+     "error": "waiting for the admission params to include this node: retry",
+     "kind": "waiting_admission"
+    }
+   }
+  },
+  {
    "name": "join: a signature by another key",
    "route": "POST /node/v1/join",
    "client": "none",

@@ -1,7 +1,8 @@
 name: Core images
 
 # The five images core builds locally on Docker (K1: group-gate, enroll,
-# domains — also the dns-tool —, mcp-gate, wg), published for Kubernetes,
+# domains — also the dns-tool —, mcp-gate, wg), and nodeadm (Kubernetes
+# only, contract §20.1: no compose service), published for Kubernetes,
 # where k3s has no builder: ghcr.io/porelli/portcullis-<svc>. `edge` from
 # main (a push touching the service's directory, or a dispatch), cosign
 # keyless; on another branch a dispatch only builds. Release tags X.Y.Z are
@@ -16,6 +17,7 @@ on:
       - 'domains/**'
       - 'mcp-gate/**'
       - 'wg/**'
+      - 'nodeadm/**'
       - '.github/workflows/images.yml'
   workflow_dispatch:
 
@@ -32,7 +34,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        svc: [group-gate, enroll, domains, mcp-gate, wg]
+        svc: [group-gate, enroll, domains, mcp-gate, wg, nodeadm]
     permissions:
       contents: read
       packages: write   # push to GHCR
@@ -44,6 +46,10 @@ jobs:
       ON_MAIN: ${{ github.ref == 'refs/heads/main' }}
       EVENT: ${{ github.event_name }}
       BEFORE: ${{ github.event.before }}
+      # nodeadm's nodeagent binaries (its Dockerfile's `nodeagent` build
+      # context): the Hub's image, pinned by digest at the Hub merge (plan
+      # Task 36, ruling P20).
+      NODEAGENT_IMAGE: ghcr.io/porelli/portcullis-nodeagent:edge
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -101,6 +107,7 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ matrix.svc }}
+          build-contexts: ${{ matrix.svc == 'nodeadm' && format('nodeagent=docker-image://{0}', env.NODEAGENT_IMAGE) || '' }}
           push: ${{ steps.changed.outputs.push == 'true' }}
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}

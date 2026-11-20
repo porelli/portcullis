@@ -1,0 +1,63 @@
+[
+ {
+  "name": "one key",
+  "params": {
+   "a": "1"
+  },
+  "want_generation": "9493985885f1acd6"
+ },
+ {
+  "name": "the generation key is left out",
+  "params": {
+   "podCIDR": "10.42.0.0/16",
+   "generation": "0123456789abcdef"
+  },
+  "want_generation": "718d5631b5b714e4"
+ },
+ {
+  "name": "bytewise order: upper case, underscore, lower case",
+  "params": {
+   "b": "x",
+   "B": "y",
+   "_c": "z",
+   "a": ""
+  },
+  "want_generation": "bc4a2d2dfdf6a084"
+ },
+ {
+  "name": "lists are space-separated values",
+  "params": {
+   "nodeAddresses": "10.215.0.1/32 192.0.2.10/32 198.51.100.7/32",
+   "apiAddresses": "10.215.0.1/32 10.215.0.2/32 10.215.0.3/32",
+   "corePorts": "80 443 51820 8000 8081 8443 8444"
+  },
+  "want_generation": "41a8ce1380a353a8"
+ },
+ {
+  "name": "the CLI's keys",
+  "params": {
+   "hubImage": "ghcr.io/porelli/portcullis-hub@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+   "hubServiceAccount": "system:serviceaccount:portcullis:portcullis-hub",
+   "bindRoots": "/srv /mnt /media",
+   "corePorts": "80 443 51820 8000 8081 8443 8444",
+   "podCIDR": "10.42.0.0/16",
+   "serviceCIDR": "10.43.0.0/16",
+   "nodeAddresses": "10.215.0.1/32 192.0.2.10/32",
+   "apiAddresses": "10.215.0.1/32",
+   "kubeDNS": "kube-system:k8s-app=kube-dns",
+   "traefik": "portcullis-ingress:app.kubernetes.io/name=traefik",
+   "mcpGate": "portcullis:portcullis.io/component=mcp-gate",
+   "wg": "portcullis:portcullis.io/component=wg",
+   "fileMiddlewares": "rate-limit@file security-headers@file group-gate@file",
+   "cliUsername": "system:admin",
+   "appsNamespace": "portcullis-apps",
+   "edgeNamespace": "portcullis-edge",
+   "edgeCoreMiddlewares": "hub-proxy-secret",
+   "reservedHosts": "example.org auth.example.org hub.example.org",
+   "maxAppPriority": "1000",
+   "nodeadmServiceAccount": "system:serviceaccount:portcullis-nodeadm:nodeadm",
+   "traefikImage": "docker.io/library/traefik@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "want_generation": "777141eb47f58c3e"
+ }
+]

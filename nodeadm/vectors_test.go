@@ -88,7 +88,7 @@ var apiRoutes = []string{
 	"GET /node/join.sh", "GET /node/nodeagent-{arch}", "POST /node/v1/nonce", "POST /node/v1/enrol", "POST /node/v1/join",
 }
 
-var apiKinds = map[string]int{"quorum_minimum": 409, "replica_minimum": 409, "unknown_node": 404, "proof_invalid": 403, "mesh_pending": 409, "not_leader": 503}
+var apiKinds = map[string]int{"quorum_minimum": 409, "replica_minimum": 409, "unknown_node": 404, "proof_invalid": 403, "mesh_pending": 409, "waiting_admission": 409, "not_leader": 503}
 
 var k10 = regexp.MustCompile(`^K10[0-9a-f]{64}::.+$`)
 
