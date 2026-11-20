@@ -273,7 +273,7 @@ func TestFrontDoorOnlyMainRecords(t *testing.T) {
 
 func TestAddrPolicy(t *testing.T) {
 	prod := AddrPolicy{Excluded: prefixes("10.215.0.0/24", "10.42.0.0/16", "10.43.0.0/16")}
-	for _, ok := range []string{"8.8.8.8", "1.1.1.1", "2a00:1450:4001::1", "45.33.32.156"} {
+	for _, ok := range []string{"8.8.8.8", "1.1.1.1", "2a00:1450:4001::1", "45.33.32.156", "2606:4700::1111", "3ffe:ffff::1"} {
 		if err := prod.Check(ok); err != nil {
 			t.Errorf("%s refused: %v", ok, err)
 		}
@@ -283,6 +283,9 @@ func TestAddrPolicy(t *testing.T) {
 		"0.0.0.0", "::", "100.64.0.1", "100.127.255.254", "192.0.0.8", "198.18.0.1", "198.19.255.1", "2001:2::1",
 		"192.0.2.1", "198.51.100.7", "203.0.113.9", "2001:db8::1", "3fff::1", "fd00::1", "240.0.0.1", "255.255.255.255",
 		"10.215.0.3", "10.42.1.1", "10.43.0.10", "::ffff:8.8.8.8", "fe80::1%eth0", "not-an-ip",
+		// IPv6 outside 2000::/3 (rereview N2): NAT64, IPv4-compatible,
+		// discard, the unallocated space.
+		"64:ff9b::808:808", "::8.8.8.8", "100::1", "4000::1", "1::1", "e000::1", "8000::1",
 	} {
 		if err := prod.Check(bad); err == nil {
 			t.Errorf("%s accepted as public", bad)

@@ -108,7 +108,7 @@ func Eligible(proberSite, targetSite string) bool { return proberSite != targetS
 // rules switches a rule off, only in the tests that prove the vectors
 // pin each rule (the zero value is the contract's).
 type rules struct {
-	noBlind, noSpan, tieReadds, noFresh, noGapReset, keepOrphans, oneOwner, verdictFailStatic bool
+	noBlind, noSpan, tieReadds, noFresh, noGapReset, keepOrphans, oneOwner, verdictFailStatic, noObservationHealthy bool
 }
 
 // Judgement is a node's verdict in a round and how it was reached.
@@ -119,6 +119,10 @@ type Judgement struct {
 	InternalOnly bool
 	// Eligible and Failing count the eligible non-blind results.
 	Eligible, Failing int
+	// NoObservation: the probers that would judge it sent only rounds
+	// already counted or stale: this round neither counts towards a
+	// removal nor as healthy.
+	NoObservation bool
 }
 
 // Judge is node id's verdict from its readiness and the probe rounds.
@@ -253,10 +257,11 @@ func (e *Engine) Step(now time.Time, in Inputs) []Change {
 		e.nodes = map[string]*nodeState{}
 	}
 	e.lastStep = now
-	var probes []ProbeRound
+	var probes, dropped []ProbeRound
 	for _, p := range in.Probes {
 		if last, ok := e.seen[p.Prober]; !e.rules.noFresh && ((ok && !p.T.After(last)) || now.Sub(p.T) > ProbeFresh || p.T.Sub(now) > ProbeFresh) {
-			continue // a round already counted, or stale
+			dropped = append(dropped, p) // a round already counted, or stale
+			continue
 		}
 		e.seen[p.Prober] = p.T
 		probes = append(probes, p)
@@ -275,6 +280,12 @@ func (e *Engine) Step(now time.Time, in Inputs) []Change {
 			owners[a] = append(owners[a], id)
 		}
 		j := judge(e.rules, id, n, in.Ready[id], probes)
+		// No observation: Ready, no counted eligible result, but probers
+		// that would judge it sent only rounds already counted or stale.
+		// Its counts stay as they are (no reset, no healthy round).
+		if in.Ready[id] && j.Eligible == 0 && !e.rules.noObservationHealthy && judge(e.rules, id, n, true, dropped).Eligible > 0 {
+			j.NoObservation = true
+		}
 		v.Judgements[id] = j
 		anyOK = anyOK || j.Verdict != Unhealthy
 	}
@@ -301,7 +312,10 @@ func (e *Engine) Step(now time.Time, in Inputs) []Change {
 			s = &nodeState{}
 			e.nodes[id] = s
 		}
-		if v.FailStatic {
+		if v.FailStatic || j.NoObservation {
+			if s.streak > 0 {
+				v.UnhealthySince[id] = s.unhealthySince
+			}
 			continue
 		}
 		if j.Verdict == Unhealthy {
@@ -374,13 +388,16 @@ func (e *Engine) Step(now time.Time, in Inputs) []Change {
 				continue
 			}
 			var since time.Time
+			observed := false
 			for _, id := range owners[a] {
 				if s := e.nodes[id]; !s.healthySince.IsZero() && (since.IsZero() || s.healthySince.Before(since)) {
 					since = s.healthySince
 				}
+				observed = observed || (v.Judgements[id].Verdict == Healthy && !v.Judgements[id].NoObservation)
 			}
 			if !since.IsZero() {
-				add = append(add, cand{value: a, since: since, due: now.Sub(since) >= AddAfter})
+				// Due only on a round that observed an owner healthy.
+				add = append(add, cand{value: a, since: since, due: observed && now.Sub(since) >= AddAfter})
 			}
 		}
 		sort.Slice(rm, func(i, j int) bool {

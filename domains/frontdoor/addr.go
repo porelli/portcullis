@@ -17,7 +17,10 @@ type AddrPolicy struct {
 }
 
 var (
-	documentation = prefixes("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32", "3fff::/20")
+	// globalUnicast6: the only IPv6 space IANA allocates for global
+	// unicast (RFC 4291, RFC 3513).
+	globalUnicast6 = netip.MustParsePrefix("2000::/3")
+	documentation  = prefixes("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24", "2001:db8::/32", "3fff::/20")
 	// notPublic: what IsGlobalUnicast admits but the internet doesn't
 	// route to a host (RFC 6890 and the IANA special-purpose registries).
 	notPublic = prefixes(
@@ -39,6 +42,9 @@ func (p AddrPolicy) Check(value string) error {
 	ip, err := netip.ParseAddr(value)
 	if err != nil || ip.Zone() != "" || ip.Is4In6() {
 		return fmt.Errorf("%q is not an IPv4 or IPv6 address", value)
+	}
+	if ip.Is6() && !globalUnicast6.Contains(ip) {
+		return fmt.Errorf("%s is not a global unicast IPv6 address (2000::/3)", ip)
 	}
 	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
 		return fmt.Errorf("%s is not a public address", ip)

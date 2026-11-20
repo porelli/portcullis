@@ -272,3 +272,70 @@ func TestJudgeTies(t *testing.T) {
 		t.Errorf("not ready: %v", g)
 	}
 }
+
+// TestNoObservationKeepsCounts (rereview N1): a round in which every
+// prober that would judge a Ready target sent only a round already
+// counted (or a stale one) is no observation: it neither resets the
+// unhealthy streak nor counts as a healthy round (no addition is due on
+// it). Switched off (a dropped round read as "no prober: healthy"), both
+// halves fail.
+func TestNoObservationKeepsCounts(t *testing.T) {
+	nodes := map[string]Node{
+		"n1": {Site: "main", Ingress: true, Public: []string{"198.51.100.1"}},
+		"n2": {Site: "main", Ingress: true, Public: []string{"198.51.100.2"}},
+		"e1": {Site: "edge", Ingress: true, Public: []string{"203.0.113.1"}},
+		"e2": {Site: "edge", Ingress: true, Public: []string{"203.0.113.2"}},
+	}
+	ready := map[string]bool{"n1": true, "n2": true, "e1": true, "e2": true}
+	round := func(prober, site string, at time.Time, n2ok bool) ProbeRound {
+		res := map[string]ProbeResult{}
+		for id := range nodes {
+			res[id] = ProbeResult{OK: true, Class: "ok"}
+		}
+		if !n2ok {
+			res["n2"] = ProbeResult{OK: false, Class: "timeout"}
+		}
+		return ProbeRound{T: at, Prober: prober, Site: site, ReachedAny: true, EgressOK: true, Results: res}
+	}
+	// probersAt: every node's round; the edge probers' taken at edgeT.
+	probersAt := func(now, edgeT time.Time, n2ok bool) []ProbeRound {
+		return []ProbeRound{round("n1", "main", now, true), round("n2", "main", now, true),
+			round("e1", "edge", edgeT, n2ok), round("e2", "edge", edgeT, n2ok)}
+	}
+	at := func(s int) time.Time { return t0.Add(time.Duration(s) * time.Second) }
+	for _, off := range []bool{false, true} {
+		// Removal: fail, fail, the 10 s rounds again (dropped), fail → the
+		// third counted failure removes n2 at 30 s.
+		e := newEngine([]string{"example.org"}, rules{noObservationHealthy: off})
+		pub := map[string][]string{"example.org": {"198.51.100.1", "198.51.100.2", "203.0.113.1", "203.0.113.2"}}
+		var got []Change
+		for _, r := range []struct {
+			now, edge int
+		}{{0, 0}, {10, 10}, {20, 10}, {30, 30}} {
+			got = append(got, e.Step(at(r.now), Inputs{Lease: true, Nodes: nodes, Ready: ready, Probes: probersAt(at(r.now), at(r.edge), false), Published: pub})...)
+			if r.now == 20 && !off && !e.View().Judgements["n2"].NoObservation {
+				t.Error("the dropped rounds were an observation")
+			}
+		}
+		removed := len(got) == 1 && got[0].Value == "198.51.100.2" && got[0].T.Equal(at(30))
+		if removed == off {
+			t.Errorf("rule off=%v: changes %v (want n2 removed at 30 s with the rule)", off, got)
+		}
+		// Addition: n2 passing from 0 s; at 120 s the edge probers resend
+		// their 110 s rounds (dropped): not due then; added at 130 s.
+		e = newEngine([]string{"example.org"}, rules{noObservationHealthy: off})
+		pub = map[string][]string{"example.org": {"198.51.100.1", "203.0.113.1", "203.0.113.2"}}
+		got = nil
+		for s := 0; s <= 130; s += 10 {
+			edge := s
+			if s == 120 {
+				edge = 110
+			}
+			got = append(got, e.Step(at(s), Inputs{Lease: true, Nodes: nodes, Ready: ready, Probes: probersAt(at(s), at(edge), true), Published: pub})...)
+		}
+		added := len(got) == 1 && got[0].Op == "add" && got[0].T.Equal(at(130))
+		if added == off {
+			t.Errorf("rule off=%v: changes %v (want n2 added at 130 s with the rule)", off, got)
+		}
+	}
+}
