@@ -377,8 +377,9 @@ subPath; the document's key and its .rev as .rev-<doc>, with the row's
 mode; every source optional: true, so the chart's empty objects and a
 withdrawn document are a missing file, never a failed mount), read-only;
 and the init container portcullis-bin (the Hub's image by digest) copies
-the hub binary into an emptyDir mounted read-only at /portcullis-bin in
-the reader, for the Hub's `hub rev <dir> <doc>` exec (§4 "Confirmation").
+only the hub binary (`hub seed-self /portcullis-bin`, 0555) into an
+emptyDir, writable there only, mounted read-only at /portcullis-bin in the
+reader, for the Hub's `hub rev <dir> <doc>` exec (§4 "Confirmation").
 */}}
 {{- define "portcullis.published" -}}
 {{- $root := .root -}}{{- $s := .s -}}
@@ -403,11 +404,13 @@ the reader, for the Hub's `hub rev <dir> <doc>` exec (§4 "Confirmation").
 {{- end -}}
 {{- $img := include "portcullis.image" (list $root "hub") -}}
 {{- $bin := dict "name" "portcullis-bin" "image" $img "imagePullPolicy" (ternary "Never" "IfNotPresent" (hasPrefix "localhost/" $img))
-  "command" (list "/usr/local/bin/hub" "seed" "/usr/local/bin" "/portcullis-bin")
+  "command" (list "/usr/local/bin/hub" "seed-self" "/portcullis-bin")
   "resources" (dict "limits" (dict "memory" "64Mi") "requests" (dict "memory" "64Mi"))
   "securityContext" (dict "allowPrivilegeEscalation" false "readOnlyRootFilesystem" true "capabilities" (dict "drop" (list "ALL")))
   "volumeMounts" (list (dict "name" "portcullis-bin" "mountPath" "/portcullis-bin")) -}}
 {{- $_ := set $s "initContainers" (prepend ($s.initContainers | default list) $bin) -}}
+{{- /* 128Mi: hub seed-self copies the hub binary alone (~77 MB today),
+~50 MB of room for its growth. */ -}}
 {{- $_ = set $s "volumes" (append $vols (dict "name" "portcullis-bin" "emptyDir" (dict "sizeLimit" "128Mi"))) -}}
 {{- $_ = set $s "mounts" (append $mounts (dict "name" "portcullis-bin" "mountPath" "/portcullis-bin" "readOnly" true)) -}}
 {{- end }}

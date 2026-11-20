@@ -437,8 +437,8 @@ def published_problems(docs):
         inits = [i for i in sp.get("initContainers", []) if i["name"] == "portcullis-bin"]
         binm = [m for m in c.get("volumeMounts", []) if m["mountPath"] == "/portcullis-bin"]
         if len(inits) != 1 or inits[0]["image"] != hub_img \
-                or inits[0].get("command") != ["/usr/local/bin/hub", "seed", "/usr/local/bin", "/portcullis-bin"] \
-                or [m["mountPath"] for m in inits[0].get("volumeMounts", [])] != ["/portcullis-bin"]:
+                or inits[0].get("command") != ["/usr/local/bin/hub", "seed-self", "/portcullis-bin"] \
+                or [(m["mountPath"], m.get("readOnly", False)) for m in inits[0].get("volumeMounts", [])] != [("/portcullis-bin", False)]:
             out.append(f"{name}: no portcullis-bin init container with the Hub's image copying hub to /portcullis-bin")
         elif len(binm) != 1 or binm[0].get("readOnly") is not True or "emptyDir" not in vols.get(binm[0]["name"], {}) \
                 or binm[0]["name"] != inits[0]["volumeMounts"][0]["name"]:
