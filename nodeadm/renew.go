@@ -11,12 +11,12 @@ package main
 // revoked. Rate-limited like every public write.
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"net/http"
-	"slices"
 )
 
 type renewReq struct {
@@ -90,9 +90,13 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) error {
 		n.Serial, n.NotAfter = newSerial, signed.NotAfter
 		return nil
 	}); err != nil {
-		// The new certificate is never kept: revoked at once.
+		// The new certificate is never kept: revoked at once, or queued and
+		// retried by reconcile.
 		if rerr := s.enroll.Revoke(ctx, newSerial); rerr != nil {
-			s.log.Error("couldn't revoke a refused renewal's certificate", "server_id", id, "serial", newSerial)
+			s.log.Warn("a refused renewal's certificate isn't revoked yet (retried)", "server_id", id, "serial", newSerial)
+			if qerr := s.queueRevoke(context.WithoutCancel(ctx), id, newSerial); qerr != nil {
+				s.log.Error("couldn't queue a refused renewal's certificate for revocation", "server_id", id, "serial", newSerial)
+			}
 		}
 		var ae *apiError
 		if errors.As(err, &ae) {
@@ -104,12 +108,9 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) error {
 		// The record no longer accepts it (the serial moved); the revoke is
 		// retried by reconcile (PendingRevoke).
 		s.log.Warn("the renewed certificate's predecessor isn't revoked yet (retried)", "server_id", id, "serial", oldSerial)
-		_ = s.mutate(ctx, func(st *nodeadmState) error {
-			if n := st.Nodes[id]; n != nil && !slices.Contains(n.PendingRevoke, oldSerial) {
-				n.PendingRevoke = append(n.PendingRevoke, oldSerial)
-			}
-			return nil
-		})
+		if qerr := s.queueRevoke(context.WithoutCancel(ctx), id, oldSerial); qerr != nil {
+			s.log.Error("couldn't queue a renewed-away certificate for revocation", "server_id", id, "serial", oldSerial)
+		}
 	}
 	s.log.Info("node certificate renewed", "server_id", id, "serial", newSerial, "previous", oldSerial)
 	w.Header().Set("Cache-Control", "no-store")

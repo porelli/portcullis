@@ -65,12 +65,11 @@ type nodeRecord struct {
 	// document keeps for it (state removed) until the active admission
 	// generation no longer holds its mesh address.
 	Removed bool `json:"removed,omitempty"`
-	// RevokeSerial: the certificate still to revoke through enroll once
-	// the record is marked removed (review N6: marked first).
-	RevokeSerial string `json:"revoke_serial,omitempty"`
 	// TokensStale: a removed node a rotation skipped (it keeps old tokens).
 	TokensStale bool `json:"tokens_stale,omitempty"`
-	// PendingRevoke: renewed-away serials enroll didn't revoke yet.
+	// PendingRevoke: serials still to revoke through enroll (a removed
+	// node's, a renewed-away one, a refused renewal's); the record is never
+	// dropped while one is left.
 	PendingRevoke []string       `json:"pending_revoke,omitempty"`
 	Addrs         *NodeAddresses `json:"addrs,omitempty"`
 	// TokenIDs: the bootstrap tokens issued to it (a revoke deletes them).

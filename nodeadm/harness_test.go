@@ -44,13 +44,14 @@ type fakeLeader struct{ on atomic.Bool }
 func (f *fakeLeader) Leading() bool { return f.on.Load() }
 
 type fakeEnroll struct {
-	mu      sync.Mutex
-	cert    *SignedCert // answered for node-cluster when set
-	ca      *testCA     // else: signs with this CA
-	signed  []string    // role:cn
-	revoked []string
-	fail    error
-	onSign  func() // runs while "enroll signs" (outside the lock)
+	mu         sync.Mutex
+	cert       *SignedCert // answered for node-cluster when set
+	ca         *testCA     // else: signs with this CA
+	signed     []string    // role:cn
+	revoked    []string
+	fail       error
+	onSign     func() // runs while "enroll signs" (outside the lock)
+	revokeFail error  // Revoke only
 }
 
 func (f *fakeEnroll) Sign(_ context.Context, role, cn, csrPEM string) (*SignedCert, error) {
@@ -85,6 +86,9 @@ func (f *fakeEnroll) Revoke(_ context.Context, serial string) error {
 	defer f.mu.Unlock()
 	if f.fail != nil {
 		return f.fail
+	}
+	if f.revokeFail != nil {
+		return f.revokeFail
 	}
 	f.revoked = append(f.revoked, serial)
 	return nil

@@ -611,7 +611,7 @@ func TestForgetMarksFirst(t *testing.T) {
 		t.Fatal("forget with enroll down didn't report it")
 	}
 	r := h.state(t).Nodes["n4"]
-	if !r.Removed || r.Serial != "" || r.RevokeSerial != serial {
+	if !r.Removed || r.Serial != "" || !slices.Equal(r.PendingRevoke, []string{serial}) {
 		t.Fatalf("not marked first: %+v", r)
 	}
 	if w := h.join(t, j, nearRTT); w.Code != 403 {
@@ -619,7 +619,7 @@ func TestForgetMarksFirst(t *testing.T) {
 	}
 	h.enroll.fail = nil
 	h.s.dropRemoved(context.Background(), h.state(t))
-	if r := h.state(t).Nodes["n4"]; r == nil || r.RevokeSerial != "" || !slices.Contains(h.enroll.revoked, serial) {
+	if r := h.state(t).Nodes["n4"]; r == nil || len(r.PendingRevoke) != 0 || !slices.Contains(h.enroll.revoked, serial) {
 		t.Fatalf("the revoke wasn't retried: %+v %v", r, h.enroll.revoked)
 	}
 }
@@ -836,5 +836,68 @@ func TestRenewOnce(t *testing.T) {
 	j.cert = nc
 	if w := h.join(t, j, nearRTT); w.Code != 200 {
 		t.Fatalf("a join with the renewed certificate: %d %s", w.Code, w.Body)
+	}
+}
+
+// TestPendingRevokesSurviveEnrollOutage (fix round 7): with enroll unable
+// to revoke, a renewal's old certificate, a losing renewal's new one and
+// a forgotten node's certificate stay queued; the removed record is never
+// dropped while one is left; enroll back, reconcile revokes them all and
+// only then the record may go.
+func TestPendingRevokesSurviveEnrollOutage(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	j := h.issue(t, "n5", "agent", "home", "main", "10.215.0.5")
+	if w := h.enrol(t, j, ""); w.Code != 200 {
+		t.Fatalf("enrol: %d", w.Code)
+	}
+	h.enroll.cert = nil
+	h.enroll.revokeFail = errors.New("vault sealed")
+	mk := func() ([]byte, map[string]string) {
+		der, _ := x509.CreateCertificateRequest(rand.Reader, &x509.CertificateRequest{Subject: pkix.Name{CommonName: "n5." + clusterDomain}}, j.key)
+		body, _ := json.Marshal(renewReq{ServerID: "n5", CSR: string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: der}))})
+		return body, signedHeaders(j.cert, j.key, "n5", "/node/v1/renew", body, h.s.now())
+	}
+	oldSerial := certSerial(j.cert)
+	b1, h1 := mk()
+	b2, h2 := mk()
+	// The second renewal runs while the first is signing: it signs too, then
+	// loses the compare-and-swap.
+	var w2code int
+	h.enroll.onSign = func() {
+		h.enroll.onSign = nil
+		w2code = h.public("POST", "/node/v1/renew", b2, h2).Code
+	}
+	if w := h.public("POST", "/node/v1/renew", b1, h1); w.Code != 200 && w2code != 200 {
+		t.Fatalf("renewals: %d / %d", w.Code, w2code)
+	}
+	st := h.state(t)
+	cur := st.Nodes["n5"].Serial
+	pend := st.Nodes["n5"].PendingRevoke
+	if len(pend) != 2 || !slices.Contains(pend, oldSerial) || slices.Contains(pend, cur) {
+		t.Fatalf("queued %v (want the old serial and the losing renewal's, not the current %s)", pend, cur)
+	}
+	if err := h.s.forget(ctx, "n5", nil); err == nil {
+		t.Fatal("forget with enroll unable to revoke didn't report it")
+	}
+	if r := h.state(t).Nodes["n5"]; !r.Removed || len(r.PendingRevoke) != 3 || !slices.Contains(r.PendingRevoke, cur) {
+		t.Fatalf("after forget: %+v", r)
+	}
+	// Still down: never dropped (the active params no longer hold it).
+	h.s.dropRemoved(ctx, h.state(t))
+	h.s.dropRemoved(ctx, h.state(t))
+	if h.state(t).Nodes["n5"] == nil {
+		t.Fatal("a record with pending revokes was dropped")
+	}
+	// Enroll back: all revoked, then the record may go.
+	h.enroll.revokeFail = nil
+	h.s.dropRemoved(ctx, h.state(t))
+	for _, sr := range append(pend, cur) {
+		if !slices.Contains(h.enroll.revoked, sr) {
+			t.Fatalf("%s never revoked: %v", sr, h.enroll.revoked)
+		}
+	}
+	if r := h.state(t).Nodes["n5"]; r != nil && len(r.PendingRevoke) != 0 {
+		t.Fatalf("still pending: %v", r.PendingRevoke)
 	}
 }

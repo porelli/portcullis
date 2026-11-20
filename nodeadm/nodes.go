@@ -495,9 +495,9 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) error {
 // enrolled leaves nothing behind.
 func (s *Server) forget(ctx context.Context, id string, addrs *NodeAddresses) error {
 	// Marked removed first (verifySigned refuses from here on, whether or
-	// not enroll is up), the serial kept in RevokeSerial; then revoked; a
-	// failed revoke is retried by the next call (review N6).
-	var serial string
+	// not enroll is up), the serial queued in PendingRevoke; then every
+	// pending serial revoked; a failed one stays queued and is retried by
+	// reconcile, the record kept until none is left (review N6).
 	if err := s.mutate(ctx, func(st *nodeadmState) error {
 		if c := st.Codes[id]; c != nil {
 			c.KeySHA256, c.Used = "", true
@@ -514,25 +514,62 @@ func (s *Server) forget(ctx context.Context, id string, addrs *NodeAddresses) er
 			a := *addrs
 			rec.Addrs = &a
 		}
-		if rec.Serial != "" {
-			rec.RevokeSerial = rec.Serial
+		if rec.Serial != "" && !slices.Contains(rec.PendingRevoke, rec.Serial) {
+			rec.PendingRevoke = append(rec.PendingRevoke, rec.Serial)
 		}
 		rec.Removed, rec.Serial = true, ""
-		serial = rec.RevokeSerial
 		return nil
 	}); err != nil {
 		return err
 	}
-	if serial == "" {
+	return s.revokePending(ctx, id)
+}
+
+// revokePending revokes every serial queued on node id's record, dropping
+// each one enroll revoked; an error while any is left.
+func (s *Server) revokePending(ctx context.Context, id string) error {
+	st, err := s.load(ctx)
+	if err != nil {
+		return err
+	}
+	rec := st.Nodes[id]
+	if rec == nil || len(rec.PendingRevoke) == 0 {
 		return nil
 	}
-	if err := s.enroll.Revoke(ctx, serial); err != nil {
-		return fmt.Errorf("revoking %s's certificate: %w", id, err)
+	var done []string
+	var failed error
+	for _, sr := range rec.PendingRevoke {
+		if err := s.enroll.Revoke(ctx, sr); err != nil {
+			failed = fmt.Errorf("revoking %s's certificate %s: %w", id, sr, err)
+			continue
+		}
+		s.log.Info("node certificate revoked", "node", id, "serial", sr)
+		done = append(done, sr)
 	}
-	s.log.Info("node certificate revoked", "node", id, "serial", serial)
+	if len(done) > 0 {
+		if err := s.mutate(ctx, func(st *nodeadmState) error {
+			if n := st.Nodes[id]; n != nil {
+				n.PendingRevoke = slices.DeleteFunc(n.PendingRevoke, func(x string) bool { return slices.Contains(done, x) })
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+	return failed
+}
+
+// queueRevoke records a serial still to revoke on node id's record (a
+// removed placeholder record when there is none, so it can't be lost).
+func (s *Server) queueRevoke(ctx context.Context, id, serial string) error {
 	return s.mutate(ctx, func(st *nodeadmState) error {
-		if rec := st.Nodes[id]; rec != nil && rec.RevokeSerial == serial {
-			rec.RevokeSerial = ""
+		n := st.Nodes[id]
+		if n == nil {
+			n = &nodeRecord{Removed: true}
+			st.Nodes[id] = n
+		}
+		if !slices.Contains(n.PendingRevoke, serial) {
+			n.PendingRevoke = append(n.PendingRevoke, serial)
 		}
 		return nil
 	})

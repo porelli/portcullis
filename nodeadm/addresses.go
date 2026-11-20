@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
-	"slices"
 	"sort"
 	"time"
 
@@ -288,28 +287,15 @@ func (s *Server) reconcile(ctx context.Context) {
 func (s *Server) dropRemoved(ctx context.Context, st *nodeadmState) {
 	var gone []string
 	for id, r := range st.Nodes {
-		for _, sr := range r.PendingRevoke {
-			if err := s.enroll.Revoke(ctx, sr); err != nil {
-				continue
+		if len(r.PendingRevoke) > 0 {
+			// Revokes enroll refused: retried here; the record is never
+			// dropped while one is left.
+			if err := s.revokePending(ctx, id); err != nil {
+				s.log.Warn("a node's certificate isn't revoked yet (retried)", "node", id)
 			}
-			s.log.Info("a renewed-away certificate revoked", "node", id, "serial", sr)
-			nid, ser := id, sr
-			_ = s.mutate(ctx, func(st *nodeadmState) error {
-				if n := st.Nodes[nid]; n != nil {
-					n.PendingRevoke = slices.DeleteFunc(n.PendingRevoke, func(x string) bool { return x == ser })
-				}
-				return nil
-			})
-		}
-		if !r.Removed || st.Ops[id] != nil {
 			continue
 		}
-		if r.RevokeSerial != "" {
-			// A revoke enroll refused: retried here, the record kept until
-			// it succeeds (review N6).
-			if err := s.forget(ctx, id, nil); err != nil {
-				s.log.Warn("a removed node's certificate isn't revoked yet (retried)", "node", id)
-			}
+		if !r.Removed || st.Ops[id] != nil {
 			continue
 		}
 		mesh := r.MeshIP
@@ -325,7 +311,7 @@ func (s *Server) dropRemoved(ctx context.Context, st *nodeadmState) {
 	}
 	if err := s.mutate(ctx, func(st *nodeadmState) error {
 		for _, id := range gone {
-			if r := st.Nodes[id]; r != nil && r.Removed {
+			if r := st.Nodes[id]; r != nil && r.Removed && len(r.PendingRevoke) == 0 && st.Ops[id] == nil {
 				delete(st.Nodes, id)
 			}
 		}
