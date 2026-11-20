@@ -104,6 +104,10 @@ dns:
   caaIssuer: ""
   caaIodef: ""
 
+# The main domain's DNS provider's name (.env DNS_PROVIDER, never a
+# credential): the Hub's HUB_DNS_PROVIDER (the HA page, Hub Task 15).
+dnsProvider: ""
+
 keycloak:
   admin: admin
 

@@ -648,3 +648,10 @@ HUB_TRAEFIK_PEER, the peer of its routed apps' NetworkPolicies (Hub Task
 {{ .Release.Namespace }}:portcullis.io/component=traefik
 {{- end -}}
 {{- end }}
+
+{{/* portcullis.dnsProvider — dnsProvider, a provider name only (else the render fails: never a credential). */}}
+{{- define "portcullis.dnsProvider" -}}
+{{- $v := .Values.dnsProvider | default "" | toString -}}
+{{- if and $v (not (regexMatch "^[a-z0-9-]{1,32}$" $v)) }}{{ fail "dnsProvider must be a DNS provider's name ([a-z0-9-], at most 32)" }}{{ end -}}
+{{- $v -}}
+{{- end }}

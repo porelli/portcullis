@@ -1625,7 +1625,7 @@ kube_render_values() {
   if kube_ha_on; then ha=true; nsp="$(kube_nonsmall_at_primary)"; fi
   [[ "$nsp" =~ ^[0-9]+$ ]] || nsp=0
   jq -n --argjson images "$_K_IMAGES" --argjson hashes "${_K_HASHES:-{\}}" --argjson items "${_K_ITEMS:-{\}}" \
-    --argjson mon "$mon" --argjson wg "$wg" --argjson ha "$ha" --argjson nsp "$nsp" --arg psite "$KUBE_PRIMARY_SITE" \
+    --argjson mon "$mon" --argjson wg "$wg" --argjson ha "$ha" --argjson nsp "$nsp" --arg psite "$KUBE_PRIMARY_SITE" --arg dnsname "${DNS_PROVIDER:-}" \
     --arg domain "$PORTCULLIS_DOMAIN" --arg pod "$PORTCULLIS_POD_CIDR" --arg svc "$PORTCULLIS_SERVICE_CIDR" \
     --arg api "$PORTCULLIS_KUBE_API_ENDPOINTS" --arg nodes "${PORTCULLIS_KUBE_NODE_ADDRESSES:-$(kube_node_addresses)}" \
     --arg tip "$PORTCULLIS_TRAEFIK_SERVICE_IP" --arg tvip "$PORTCULLIS_TRAEFIK_VPN_SERVICE_IP" --arg weip "$PORTCULLIS_WG_EDGE_SERVICE_IP" \
@@ -1661,7 +1661,8 @@ kube_render_values() {
      hub: {bindRoots: $roots, invitesProtectedGroups: $ipg, portalDisplayName: $pdn, clientCertTTL: $ttl,
            certExpiryWarnDays: $warn, impersonationMaxMinutes: $imp, selfImage: $images.hub, appsNamespace: $apps},
      alerting: {smtpFrom: $smtp}, appsNamespace: $apps,
-     ha: {enabled: $ha, nonSmallNodesAtPrimary: $nsp, primarySite: $psite}}' > "$f.tmp" && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f" \
+     ha: {enabled: $ha, nonSmallNodesAtPrimary: $nsp, primarySite: $psite},
+     dnsProvider: (if ($dnsname | test("^[a-z0-9-]{1,32}$")) then $dnsname else "" end)}' > "$f.tmp" && chmod 600 "$f.tmp" && mv -f "$f.tmp" "$f" \
     || fail "could not write $f"
   kube_nodeadm_values "$f"
 }

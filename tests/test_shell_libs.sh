@@ -5231,6 +5231,10 @@ OUT="$(kt "$K15_ENV; _K_IMAGES='{\"hub\":\"ghcr.io/porelli/portcullis-hub@sha256
 expect_eq "kube_render_values: .env → values (the networks, the ClusterIPs, the six classes, the pools, the Hub's digest)" "$(printf '%s\n' "$OUT" | head -n1)" \
   "[\"k.example.org\",\"10.42.0.0/24\",\"[\\\"10.1.0.4:6443\\\"]\",\"[\\\"10.1.0.4\\\",\\\"198.51.100.1\\\"]\",\"10.43.0.20\",\"websecure\",\"10.42.0.0/24 10.43.0.0/16\",\"ghcr.io/porelli/portcullis-hub@sha256:$(printf '%064d' 1)\"]"
 expect_eq "kube_render_values: no secret in values.yaml (0600)" "$(grep -cE 'PG-SECRET|HUB-PROXY|KC-SECRET' "$K15/secrets/kube/values.yaml" || true):$(file_mode "$K15/secrets/kube/values.yaml")" "0:600"
+OUT="$(kt "$K15_ENV; export DNS_PROVIDER=porkbun; _K_IMAGES='{}'; kube_render_values; jq -r .dnsProvider \"$K15/secrets/kube/values.yaml\"; export DNS_PROVIDER='tok=SECRET'; kube_render_values; jq -r .dnsProvider \"$K15/secrets/kube/values.yaml\"")"
+expect_eq "kube_render_values: dnsProvider = DNS_PROVIDER's name only (HUB_DNS_PROVIDER), never anything else" "$(printf '%s\n' "$OUT" | head -n2 | tr '\n' ' ')" "porkbun  "
+expect_eq "hub_env_write: core.env carries DNS_PROVIDER's name (the HA page), and nothing that isn't a provider id" \
+  "$( (export PORTCULLIS_ROOT="$WORK/dnsp"; mkdir -p "$PORTCULLIS_ROOT"; DNS_PROVIDER=route53 hub_env_write; grep '^DNS_PROVIDER=' "$PORTCULLIS_ROOT/secrets/hub/core.env"; DNS_PROVIDER='x y=SECRET' hub_env_write; grep '^DNS_PROVIDER=' "$PORTCULLIS_ROOT/secrets/hub/core.env") 2>/dev/null | tr '\n' ' ')" "DNS_PROVIDER=route53 DNS_PROVIDER= "
 # HA (Task 19): ha.enabled from PORTCULLIS_HA=on, the non-small nodes at main.
 OUT="$(kt "$K15_ENV; _K_IMAGES='{}'; kube_render_values; jq -c .ha \"$K15/secrets/kube/values.yaml\"")"
 expect_eq "kube_render_values: ha off without PORTCULLIS_HA=on" "$(printf '%s\n' "$OUT" | head -n1)" '{"enabled":false,"nonSmallNodesAtPrimary":0,"primarySite":"main"}'

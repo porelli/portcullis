@@ -750,7 +750,7 @@ secrets_fix_perms() {
 # Core variables the Hub may copy into app .env files (templates reference
 # them as ${VAR}); everything else in .env is a core secret the Hub never
 # sees. Operators can add names via HUB_SHARED_ENV="VAR1 VAR2".
-HUB_ENV_VARS="PORTCULLIS_DOMAIN PORTCULLIS_TRAEFIK_IP PORTCULLIS_MCP_GATE_IP PORTCULLIS_TRAEFIK_SOURCE PORTCULLIS_MCP_GATE_SOURCE PORTCULLIS_PROXY_SUBNET PORTCULLIS_PROXY_IP_RANGE PORTAL_DISPLAY_NAME PORTCULLIS_VPN_MODE PORTCULLIS_VPN_PUBLIC_ENROL PORTCULLIS_VPN_NET PORTCULLIS_VPN_WG_IP PORTCULLIS_VPN_BUILTIN PORTCULLIS_VPN_RESERVED_RANGES PORTCULLIS_LINK_DATA_WG_IP"
+HUB_ENV_VARS="PORTCULLIS_DOMAIN PORTCULLIS_TRAEFIK_IP PORTCULLIS_MCP_GATE_IP PORTCULLIS_TRAEFIK_SOURCE PORTCULLIS_MCP_GATE_SOURCE PORTCULLIS_PROXY_SUBNET PORTCULLIS_PROXY_IP_RANGE PORTAL_DISPLAY_NAME PORTCULLIS_VPN_MODE PORTCULLIS_VPN_PUBLIC_ENROL PORTCULLIS_VPN_NET PORTCULLIS_VPN_WG_IP PORTCULLIS_VPN_BUILTIN PORTCULLIS_VPN_RESERVED_RANGES PORTCULLIS_LINK_DATA_WG_IP DNS_PROVIDER"
 HUB_ENV_PREFIXES="NETBIRD_ COTURN_"
 
 # hub_env_write — secrets/hub/core.env, mounted read-only as the Hub's
@@ -805,6 +805,9 @@ hub_env_write() {
       # Multiple servers (contract §17.2): link's data CONNECT address, the
       # relays' upstream (never a template variable: the prefix is reserved).
       PORTCULLIS_LINK_DATA_WG_IP) val="$(link_data_wg_ip)" ;;
+      # The main domain's DNS provider, its NAME only (the HA page, Hub
+      # Task 15): never a credential, and nothing but a provider id passes.
+      DNS_PROVIDER) val="${DNS_PROVIDER:-}"; [[ "$val" =~ ^[a-z0-9-]{1,32}$ ]] || val="" ;;
       *) val="${!v:-}" ;;
     esac
     content+="$v=$val"$'\n'

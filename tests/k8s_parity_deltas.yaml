@@ -48,6 +48,7 @@ env-missing:
   - {service: wg, item: WG_LINK_CA, reason: "multiple servers: Docker/Podman primaries only (contract §17.1; Servers is off on Kubernetes)"}
 
 env-extra:
+  - {service: hub, item: HUB_DNS_PROVIDER, reason: "Kubernetes: the main domain's DNS provider name for the HA page (Hub Task 15); on Docker the Hub reads core.env's DNS_PROVIDER; a name only, never a credential"}
   - {service: hub, item: HUB_TRAEFIK_PEER, reason: "Kubernetes: the routed apps' NetworkPolicy peer, = the admission params' traefik (kube_traefik_peer; Hub Task 13)"}
   - {service: keycloak, item: JAVA_OPTS_KC_HEAP, reason: "Task 19 review I2: the heap capped at 768 Mi on Kubernetes so the 1024 Mi request bounds it (Docker keeps the image's default share of mem_limit); re-measured in Task 33"}
   - {service: traefik, item: TRAEFIK_PROVIDERS_KUBERNETESCRD, reason: "spec §5: the kubernetesCRD provider"}

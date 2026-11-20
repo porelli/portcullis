@@ -31,6 +31,7 @@ HUB_HA=on in HA (§20.1 "HA mode"). */ -}}
     (dict "name" "HUB_SELF_IMAGE" "value" (include "portcullis.image" (list . "hub")))
     (dict "name" "HUB_APPS_NAMESPACE" "value" .Values.appsNamespace)
     (dict "name" "HUB_TRAEFIK_PEER" "value" (include "portcullis.traefikPeerParam" .))
+    (dict "name" "HUB_DNS_PROVIDER" "value" (include "portcullis.dnsProvider" .))
     (dict "name" "PORTCULLIS_DOMAIN" "value" $d)
     (dict "name" "DEFAULT_TEMPLATES_URL" "value" "https://github.com/porelli/portcullis-templates.git")
     (dict "name" "PORTAL_DISPLAY_NAME" "value" .Values.hub.portalDisplayName)
