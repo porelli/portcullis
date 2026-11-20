@@ -1,7 +1,8 @@
 {{- /* wg (compose: wg, profile wg → wg.enabled), K7: one Deployment,
 WG_ADDR_MODE=pod (every role on the pod's one address, isolated by
 netpol-wg-edge.yaml instead of networks), uid 10006 + 10007, no capability,
-the people key as a Secret file, vpn-doc read-only, no hub-data. */ -}}
+the people key as a Secret file, /vpn-doc its published document (projected,
+read-only: portcullis.published, contract §4), no hub-data. */ -}}
 {{- if .Values.wg.enabled }}
 {{- $s := dict
   "name" "wg" "uid" .Values.uids.wg "gid" .Values.uids.wg "groups" (list .Values.uids.vpnDoc)
@@ -37,11 +38,11 @@ the people key as a Secret file, vpn-doc read-only, no hub-data. */ -}}
     (dict "name" "data" "mountPath" "/data")
     (dict "name" "key" "mountPath" "/run/portcullis/wg" "readOnly" true))
   "volumes" (list
-    (dict "name" "vpn-doc" "persistentVolumeClaim" (dict "claimName" "vpn-doc" "readOnly" true))
     (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "wg-data"))
     (dict "name" "key" "secret" (dict "secretName" "secrets-wg" "defaultMode" 288 "items" (list (dict "key" "people.key" "path" "people.key")))))
   "fsGroup" .Values.uids.wg
 -}}
+{{- include "portcullis.published" (dict "root" . "s" $s) }}
 {{- if .Values.ha.enabled }}
 {{- /* HA (contract §20.10): status.json served to the Hub on :8093 (the
 pod's address; netpol-wg-edge.yaml admits the Hub alone there). */ -}}

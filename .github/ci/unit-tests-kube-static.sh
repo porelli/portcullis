@@ -149,6 +149,8 @@ fi
 sha=$(awk -v r="refs/heads/$ref" '$2 == r { print $1 }' <<<"$heads")
 [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::portcullis-hub has no single commit for refs/heads/$ref"; exit 1; }
 copies="charts/portcullis/files/hub-role.yaml=internal/runtime/kube/testdata/role.yaml charts/portcullis/files/hub-role-edge.yaml=internal/runtime/kube/testdata/role-edge.yaml"
+# NEW (HA): the core-namespace Role portcullis-hub-core (contract §6).
+copies="$copies charts/portcullis/files/hub-role-core.yaml=internal/runtime/kube/testdata/role-core.yaml"
 # HA vectors (contract §4, §20.3, §20.11): byte copies of the Hub's.
 copies="$copies tests/published_docs.json=internal/publish/testdata/published_docs.json"
 copies="$copies nodeadm/testdata/joincode_v2_vectors.json=internal/servers/testdata/joincode_v2_vectors.json"

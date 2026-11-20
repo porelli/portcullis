@@ -1,0 +1,33 @@
+{{- /* The published documents (contract §4 "On Kubernetes: published
+documents", §20.5): the eight objects the Hub publishes into (seven
+ConfigMaps and the Secret pub-mcp-credentials), created EMPTY (no key: the
+Hub's first update writes the document and its .rev together; a reader
+projects them optional, so an absent key is a missing file) and kept on
+uninstall; the Hub only gets and updates them (portcullis-hub-core). Helm
+owns no key of theirs, so an upgrade never resets a published document.
+And the Hub's Lease portcullis-hub, with no spec (an upgrade never resets
+holderIdentity). Every Kubernetes install, HA or not (§20.1). */ -}}
+{{- range (include "portcullis.pubDocs" . | fromYamlArray) }}
+---
+apiVersion: v1
+kind: {{ ternary "Secret" "ConfigMap" (eq .kind "secret") }}
+metadata:
+  name: {{ .object }}
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+  annotations:
+    helm.sh/resource-policy: keep
+{{- if eq .kind "secret" }}
+type: Opaque
+{{- end }}
+data: {}
+{{- end }}
+---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: portcullis-hub
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis

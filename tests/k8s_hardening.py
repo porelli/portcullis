@@ -34,7 +34,8 @@ WRITABLE_ROOT_OK = {"keycloak"}  # compose: not read_only (`start` re-augments)
 # ServiceAccount (namespace/name) → the namespaces whose Secrets it may read.
 SECRET_READERS = {
     f"{K.NS}/traefik": {K.EDGE_NS},
-    f"{K.NS}/portcullis-hub": {K.APPS_NS},
+    # The core namespace: only pub-mcp-credentials, by name (check_hub_core).
+    f"{K.NS}/portcullis-hub": {K.APPS_NS, K.NS},
 }
 SECRET_READ_VERBS = {"get", "list", "watch", "*"}
 RESTRICTED_VOLUMES = {"configMap", "csi", "downwardAPI", "emptyDir", "ephemeral", "persistentVolumeClaim", "projected", "secret"}
@@ -82,7 +83,9 @@ def check_pod(name, ns, labels, spec, ann):
         if set(caps.get("add", [])) - {"NET_BIND_SERVICE"}:
             F.add(f"{cn}: adds {caps.get('add')} (restricted allows NET_BIND_SERVICE only)")
         ro = sc.get("readOnlyRootFilesystem")
-        if name in WRITABLE_ROOT_OK:
+        # The writable root is the service's own container's (init
+        # containers, portcullis-bin, are read-only everywhere).
+        if name in WRITABLE_ROOT_OK and c in spec.get("containers", []):
             if ro is not False:
                 F.add(f"{cn}: expected the writable root compose gives it")
         elif ro is not True:
@@ -119,7 +122,7 @@ def check_frontdoor():
     it reads no Secret through the API (its credentials are a file mount)
     and only it mounts frontdoor-env and frontdoor-control-tls."""
     docs = K.render({"ha": {"enabled": True}})
-    if K.by_kind(K.render(), "Lease"):
+    if [x for x in K.by_kind(K.render(), "Lease") if x["metadata"]["name"] == "portcullis-frontdoor"]:
         F.add("the front door's objects render without ha.enabled")
     pods = [p for p in K.pod_specs(docs) if p[0] == "frontdoor"]
     if len(pods) != 1:
@@ -142,6 +145,57 @@ def check_frontdoor():
         if name == "frontdoor" and secrets != {"frontdoor-env", "frontdoor-control-tls"}:
             F.add(f"frontdoor: mounts {sorted(secrets)}")
     check_secret_access(docs + storage_docs())
+
+
+PUB_PVCS = {"hub-data", "vpn-doc"}  # the Hub's own: no reader mounts them (contract §4)
+
+
+def check_hub_core():
+    """Contract §6 "On Kubernetes" / §20.5, every Kubernetes install (HA or
+    not): the Role portcullis-hub-core is the byte copy of the Hub's
+    role-core.yaml (here in the release namespace), bound to the Hub's
+    ServiceAccount alone; its Secret rule names only pub-mcp-credentials;
+    the Hub's Lease portcullis-hub is rendered once with no spec; the Hub
+    has POD_NAME from metadata.name; HUB_GATE_REPLICAS = ha.gateReplicas
+    in HA only (with the log ports); and no pod but the Hub (and its
+    one-shot) mounts hub-data or vpn-doc ("ha: no pod but hub mounts
+    hub-state": hub-data until Task 19 renames it)."""
+    want = yaml.safe_load((K.CHART / "files" / "hub-role-core.yaml").read_text())
+    for label, extra in (("", None), ("ha: ", {"ha": {"enabled": True}}), ("ha: ", {"ha": {"enabled": True, "gateReplicas": 2}})):
+        docs = K.render(extra)
+        roles = [r for r in K.by_kind(docs, "Role") if r["metadata"]["name"] == "portcullis-hub-core"]
+        if len(roles) != 1 or roles[0]["metadata"]["namespace"] != K.NS or roles[0]["rules"] != want["rules"] \
+                or roles[0]["metadata"].get("labels") != want["metadata"].get("labels"):
+            F.add(f"{label}the Role portcullis-hub-core must be files/hub-role-core.yaml in {K.NS}, once")
+        binds = [b for b in K.by_kind(docs, "RoleBinding") if b["roleRef"]["name"] == "portcullis-hub-core"]
+        if len(binds) != 1 or binds[0]["metadata"]["namespace"] != K.NS or binds[0]["roleRef"]["kind"] != "Role" \
+                or binds[0]["subjects"] != [{"kind": "ServiceAccount", "name": "portcullis-hub", "namespace": K.NS}]:
+            F.add(f"{label}portcullis-hub-core must be bound to the Hub's ServiceAccount alone, in {K.NS}")
+        for r in roles:
+            for rule in r["rules"]:
+                if reads_secrets(rule) and rule.get("resourceNames") != ["pub-mcp-credentials"]:
+                    F.add(f"{label}portcullis-hub-core reads Secrets beyond pub-mcp-credentials: {rule}")
+        leases = [x for x in K.by_kind(docs, "Lease") if x["metadata"]["name"] == "portcullis-hub"]
+        if len(leases) != 1 or leases[0]["metadata"]["namespace"] != K.NS or "spec" in leases[0]:
+            F.add(f"{label}the Lease portcullis-hub must render once in {K.NS}, with no spec")
+        pods = {n: sp for n, _, _, sp, _ in K.pod_specs(docs)}
+        env = {e["name"]: e for e in pods["hub"]["containers"][0].get("env", [])}
+        if env.get("POD_NAME", {}).get("valueFrom") != {"fieldRef": {"fieldPath": "metadata.name"}}:
+            F.add(f"{label}the Hub needs POD_NAME from the downward API (metadata.name): its Lease identity")
+        ha = bool(extra)
+        gr = str((extra or {}).get("ha", {}).get("gateReplicas", 1))
+        if ha and env.get("HUB_GATE_REPLICAS", {}).get("value") != gr:
+            F.add(f"{label}the Hub's HUB_GATE_REPLICAS {env.get('HUB_GATE_REPLICAS')} != ha.gateReplicas {gr}")
+        if not ha and "HUB_GATE_REPLICAS" in env:
+            F.add("HUB_GATE_REPLICAS without ha.enabled (the Hub reads the gates' files there)")
+        for n, sp in pods.items():
+            for v in sp.get("volumes", []):
+                c = (v.get("persistentVolumeClaim") or {}).get("claimName")
+                if c in PUB_PVCS and n not in ("hub", "oneshot-hub"):
+                    F.add(f"{label}{n} mounts {c}: no pod but the Hub mounts its PVCs (readers get the published documents)")
+    docs = K.render() + K.render({"oneshot": "hub"}, "templates/oneshot.yaml")
+    if not any(n == "oneshot-hub" for n, *_ in K.pod_specs(docs)):
+        F.add("the hub one-shot isn't rendered (check_hub_core's exception is stale)")
 
 
 LOG_PORTS = {"group-gate": ("GATE_LOG_PORT", "8091", 8091), "mcp-gate": ("MCP_GATE_LOG_LISTEN", ":8092", 8092),
@@ -336,7 +390,7 @@ def main():
     for r in hub_roles:
         if r["metadata"]["namespace"] == K.EDGE_NS and any("services" in x["resources"] for x in r["rules"]) and not (judges_svc and pins):
             F.add(f"the Hub's Role in {K.EDGE_NS} grants services but portcullis-edge-routes doesn't judge and pin Services (CREATE / UPDATE / DELETE, externalName = <name>.<apps ns>.svc.cluster.local)")
-    for r in hub_roles:
+    for r in hub_roles + [x for x in K.by_kind(docs, "Role") if x["metadata"]["name"] == "portcullis-hub-core"]:
         for rule in r["rules"]:
             if "pods/exec" in rule["resources"] and rule["verbs"] != ["create"]:
                 F.add("the Hub's Role: pods/exec must be create only, never get (K2)")
@@ -367,6 +421,7 @@ def main():
     check_secret_access(docs + storage_docs())
     check_edge(docs)
     check_frontdoor()
+    check_hub_core()
     check_nodeadm()
     check_log_ports()
     check_psa()

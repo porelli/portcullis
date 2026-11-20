@@ -57,6 +57,7 @@ env-extra:
   - {service: traefik, item: TRAEFIK_ACCESSLOG_FORMAT, reason: "JSON access log: e2e-k3s asserts the client address (ClientHost) through ServiceLB"}
   - {service: hub, item: HUB_SELF_IMAGE, reason: "contract §6: the Hub's own digest, its helper pods' image"}
   - {service: hub, item: HUB_APPS_NAMESPACE, reason: "contract §6: the namespace the Hub's Role covers"}
+  - {service: hub, item: POD_NAME, reason: "contract §20.5: the downward API's pod name, the Hub's identity on its Lease portcullis-hub"}
   - {service: wg, item: WG_ADDR_MODE, reason: "K7: pod — one pod address for every role"}
   - {service: wg, item: WG_POD_IP, reason: "K7: the Downward API status.podIP behind WG_VPN_ADDR / WG_EDGE_ADDR / WG_METRICS"}
 

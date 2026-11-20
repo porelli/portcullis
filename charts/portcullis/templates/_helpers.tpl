@@ -73,7 +73,7 @@ EnvVar), envFrom, args, command, ports ([{name, port, protocol}]), mounts
 ([VolumeMount]), volumes ([Volume]), nets ([compose network]), egress
 (bool), token (bool: the ServiceAccount token, Traefik and the Hub only),
 serviceAccount, hostAliases, dnsSearches (dnsConfig.searches), hashes ([object names]), grace (seconds),
-extraLabels (map), fsGroup, httpReady ({path, port}: a kube-only readiness
+extraLabels (map), fsGroup, initContainers ([Container], as given), httpReady ({path, port}: a kube-only readiness
 httpGet for an image without a compose healthcheck — distroless —, so helm
 --wait and status see a crash loop; readiness only, never liveness;
 k8s_parity's delta kind kube-probe).
@@ -189,6 +189,10 @@ spec:
         {{- end }}
         seccompProfile:
           type: RuntimeDefault
+      {{- with $s.initContainers }}
+      initContainers:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: {{ $s.name }}
           image: {{ include "portcullis.image" (list $root ($s.image | default $s.name)) }}
@@ -349,4 +353,65 @@ spec:
   selector:
     matchLabels:
       portcullis.io/component: {{ index . 1 }}
+{{- end }}
+
+{{/*
+portcullis.pubDocs — the published documents (contract §4 "On Kubernetes:
+published documents"): the rows of tests/published_docs.json (the Hub's
+internal/publish/testdata/, byte-copied), as a YAML list; k8s_parity
+compares them. mode is decimal (0444 = 292, 0440 = 288).
+*/}}
+{{- define "portcullis.pubDocs" -}}
+- {doc: group-gate-policy, object: pub-group-gate-policy, kind: configmap, key: group-gate-policy.json, mount: /hub-data, readers: [group-gate], mode: 292}
+- {doc: user-attributes, object: pub-user-attributes, kind: configmap, key: user-attributes.json, mount: /hub-data, readers: [group-gate], mode: 292}
+- {doc: portal-apps, object: pub-portal-apps, kind: configmap, key: portal-apps.json, mount: /hub-data, readers: [group-gate], mode: 292}
+- {doc: signin-keycloak, object: pub-signin-keycloak, kind: configmap, key: signin-keycloak.json, mount: /hub-data, readers: [keycloak], mode: 292}
+- {doc: impersonation, object: pub-impersonation, kind: configmap, key: impersonation.json, mount: /hub-data, readers: [group-gate, keycloak], mode: 292}
+- {doc: mcp-gate, object: pub-mcp-gate, kind: configmap, key: mcp-gate.json, mount: /hub-data, readers: [mcp-gate], mode: 292}
+- {doc: mcp-credentials, object: pub-mcp-credentials, kind: secret, key: mcp-credentials.json, mount: /hub-data, readers: [mcp-gate], mode: 288}
+- {doc: vpn, object: pub-vpn, kind: configmap, key: vpn.json, mount: /vpn-doc, readers: [group-gate, wg], mode: 292}
+{{- end }}
+
+{{/*
+portcullis.published (dict "root" . "s" <spec>) — a reader of the
+published documents, changing <spec> in place: every mount of the spec at
+a documents' directory (/hub-data, /vpn-doc) gets one projected volume of
+that name holding the reader's rows (each object through items, never
+subPath; the document's key and its .rev as .rev-<doc>, with the row's
+mode; every source optional: true, so the chart's empty objects and a
+withdrawn document are a missing file, never a failed mount), read-only;
+and the init container portcullis-bin (the Hub's image by digest) copies
+the hub binary into an emptyDir mounted read-only at /portcullis-bin in
+the reader, for the Hub's `hub rev <dir> <doc>` exec (§4 "Confirmation").
+*/}}
+{{- define "portcullis.published" -}}
+{{- $root := .root -}}{{- $s := .s -}}
+{{- $rows := include "portcullis.pubDocs" $root | fromYamlArray -}}
+{{- $vols := $s.volumes -}}
+{{- $mounts := list -}}
+{{- range $s.mounts -}}
+{{- $m := . -}}
+{{- $srcs := list -}}
+{{- range $rows -}}
+{{- if and (eq .mount $m.mountPath) (has $s.name .readers) -}}
+{{- $items := list (dict "key" .key "path" .key "mode" (int .mode)) (dict "key" ".rev" "path" (printf ".rev-%s" .doc) "mode" (int .mode)) -}}
+{{- $srcs = append $srcs (dict (ternary "secret" "configMap" (eq .kind "secret")) (dict "name" .object "optional" true "items" $items)) -}}
+{{- end -}}
+{{- end -}}
+{{- if $srcs -}}
+{{- $vols = append $vols (dict "name" $m.name "projected" (dict "sources" $srcs)) -}}
+{{- $mounts = append $mounts (dict "name" $m.name "mountPath" $m.mountPath "readOnly" true) -}}
+{{- else -}}
+{{- $mounts = append $mounts $m -}}
+{{- end -}}
+{{- end -}}
+{{- $img := include "portcullis.image" (list $root "hub") -}}
+{{- $bin := dict "name" "portcullis-bin" "image" $img "imagePullPolicy" (ternary "Never" "IfNotPresent" (hasPrefix "localhost/" $img))
+  "command" (list "/usr/local/bin/hub" "seed" "/usr/local/bin" "/portcullis-bin")
+  "resources" (dict "limits" (dict "memory" "64Mi") "requests" (dict "memory" "64Mi"))
+  "securityContext" (dict "allowPrivilegeEscalation" false "readOnlyRootFilesystem" true "capabilities" (dict "drop" (list "ALL")))
+  "volumeMounts" (list (dict "name" "portcullis-bin" "mountPath" "/portcullis-bin")) -}}
+{{- $_ := set $s "initContainers" (prepend ($s.initContainers | default list) $bin) -}}
+{{- $_ = set $s "volumes" (append $vols (dict "name" "portcullis-bin" "emptyDir" (dict "sizeLimit" "128Mi"))) -}}
+{{- $_ = set $s "mounts" (append $mounts (dict "name" "portcullis-bin" "mountPath" "/portcullis-bin" "readOnly" true)) -}}
 {{- end }}

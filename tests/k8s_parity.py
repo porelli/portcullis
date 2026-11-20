@@ -5,12 +5,15 @@ keys, mount targets (every one of the 51 project binds a ConfigMap / Secret
 mount), probes (Task 4's mapping, K17), network labels; then every core
 router's entrypoints for vpn mode apps|admin|server, its rule, priority,
 middlewares and service; the entrypoint middlewares; the Traefik CRD bundle
-at the compose Traefik version (K14). Reviewed differences live in
+at the compose Traefik version (K14); the published documents (contract §4:
+"ha: every reader mounts its published documents through a projected
+volume, never subPath", in every render). Reviewed differences live in
 tests/k8s_parity_deltas.yaml, each with its reason; a delta that no longer
 applies fails too (the list can't rot).
 
   python3 tests/k8s_parity.py
 """
+import json
 import math
 import re
 import subprocess
@@ -356,6 +359,134 @@ def check_traefik(comp, docs):
         F.add(f"charts/portcullis/crds: {crds} != [traefik-{ver}.yaml] (K14: the compose Traefik version)")
 
 
+PUB_DIRS = ("/hub-data", "/vpn-doc")
+
+
+def published_problems(docs):
+    """Contract §4 "On Kubernetes: published documents", against the rows of
+    tests/published_docs.json (the Hub's byte copy): the eight objects
+    rendered empty (no key) and kept; every reader mounts its rows through
+    ONE projected volume per directory, read-only, never subPath, each
+    object exactly once with items [its key, .rev → .rev-<doc>] at the
+    row's mode and optional: true; the Secret's reader has the row's
+    fsGroup; no reader mounts the Hub's PVCs there; every reader has the
+    portcullis-bin init container (the Hub's image) and /portcullis-bin
+    read-only in its container; no other pod projects a pub-* object."""
+    out = []
+    rows = json.loads((K.ROOT / "tests" / "published_docs.json").read_text())
+    objs = {(d["kind"], d["metadata"]["name"]): d for d in docs if d.get("kind") in ("ConfigMap", "Secret")
+            and d["metadata"]["name"].startswith("pub-")}
+    want = {("Secret" if r["kind"] == "secret" else "ConfigMap", r["object"]) for r in rows}
+    if set(objs) != want:
+        out.append(f"published objects {sorted(objs)} != published_docs.json {sorted(want)}")
+    for (kind, name), d in objs.items():
+        if d.get("data") or d.get("stringData") or d.get("binaryData"):
+            out.append(f"{kind} {name}: rendered with keys (the chart creates it empty; the Hub writes the document and .rev)")
+        if (d["metadata"].get("annotations") or {}).get("helm.sh/resource-policy") != "keep":
+            out.append(f"{kind} {name}: not helm.sh/resource-policy: keep")
+    readers = sorted({x for r in rows for x in r["readers"]})
+    hub_img = K.images_values()["images"]["hub"]
+    pods = {n: sp for n, _, _, sp, _ in K.pod_specs(docs)}
+    for name, sp in sorted(pods.items()):
+        vols = {v["name"]: v for v in sp.get("volumes", [])}
+        projected = {s_.get(k, {}).get("name") for v in vols.values() for s_ in v.get("projected", {}).get("sources", []) for k in ("configMap", "secret")}
+        projected |= {(v.get("configMap") or {}).get("name") for v in vols.values()} | {(v.get("secret") or {}).get("secretName") for v in vols.values()}
+        if name not in readers:
+            if any(str(x).startswith("pub-") for x in projected):
+                out.append(f"{name}: mounts a published document but isn't its reader")
+            continue
+        mine = [r for r in rows if name in r["readers"]]
+        c = sp["containers"][0]
+        for d_ in PUB_DIRS:
+            rs = [r for r in mine if r["mount"] == d_]
+            ms = [m for c_ in sp["containers"] for m in c_.get("volumeMounts", []) if m["mountPath"] == d_ or m["mountPath"].startswith(d_ + "/")]
+            if not rs:
+                if ms:
+                    out.append(f"{name}: mounts {d_} without a document there")
+                continue
+            if len(ms) != 1 or ms[0]["mountPath"] != d_ or "subPath" in ms[0] or "subPathExpr" in ms[0] or ms[0].get("readOnly") is not True:
+                out.append(f"{name}: {d_} must be one read-only mount of the whole projected volume, never subPath: {ms}")
+                continue
+            v = vols.get(ms[0]["name"], {})
+            if set(v) != {"name", "projected"}:
+                out.append(f"{name}: {d_} is {sorted(set(v) - {'name'})}, not a projected volume (never the Hub's PVC)")
+                continue
+            got = {}
+            for src in v["projected"]["sources"]:
+                (k, o), = src.items()
+                got.setdefault(o["name"], []).append((k, o))
+            if sorted(got) != sorted(r["object"] for r in rs):
+                out.append(f"{name}: {d_} projects {sorted(got)} != its rows {sorted(r['object'] for r in rs)}")
+            for r in rs:
+                srcs = got.get(r["object"], [])
+                if len(srcs) != 1:
+                    continue
+                k, o = srcs[0]
+                mode = int(r["mode"], 8)
+                if r["rev_path"] != f"{d_}/.rev-{r['doc']}":
+                    out.append(f"published_docs.json {r['doc']}: rev_path {r['rev_path']} (want {d_}/.rev-{r['doc']})")
+                items = [{"key": r["key"], "path": r["key"], "mode": mode}, {"key": ".rev", "path": r["rev_path"][len(d_) + 1:], "mode": mode}]
+                if k != ("secret" if r["kind"] == "secret" else "configMap") or o.get("items") != items \
+                        or o.get("optional") is not r["optional"] or set(o) != {"name", "items", "optional"}:
+                    out.append(f"{name}: {r['object']} projected as {k} {o} (want items {items}, optional {r['optional']})")
+                if r["fs_group"] is not None and sp.get("securityContext", {}).get("fsGroup") != r["fs_group"]:
+                    out.append(f"{name}: fsGroup {sp.get('securityContext', {}).get('fsGroup')} (reads {r['object']}: fs_group {r['fs_group']})")
+        inits = [i for i in sp.get("initContainers", []) if i["name"] == "portcullis-bin"]
+        binm = [m for m in c.get("volumeMounts", []) if m["mountPath"] == "/portcullis-bin"]
+        if len(inits) != 1 or inits[0]["image"] != hub_img \
+                or inits[0].get("command") != ["/usr/local/bin/hub", "seed", "/usr/local/bin", "/portcullis-bin"] \
+                or [m["mountPath"] for m in inits[0].get("volumeMounts", [])] != ["/portcullis-bin"]:
+            out.append(f"{name}: no portcullis-bin init container with the Hub's image copying hub to /portcullis-bin")
+        elif len(binm) != 1 or binm[0].get("readOnly") is not True or "emptyDir" not in vols.get(binm[0]["name"], {}) \
+                or binm[0]["name"] != inits[0]["volumeMounts"][0]["name"]:
+            out.append(f"{name}: /portcullis-bin isn't the init container's emptyDir, read-only in {c['name']}")
+    for r in readers:
+        if r not in pods:
+            out.append(f"reader {r}: no pod rendered")
+    return out
+
+
+def check_published():
+    for label, extra in (("", None), ("ha: ", {"ha": {"enabled": True}}), ("ha: ", {"ha": {"enabled": True, "gateReplicas": 2}})):
+        for p in published_problems(K.render(extra)):
+            F.add(f"{label}{p}")
+    # The check bites: a subPath, a PVC, a missing optional, a stray reader.
+    import copy as _c
+    base = K.render({"ha": {"enabled": True}})
+    if published_problems(base):
+        return  # reported above; the mutations need a passing chart
+
+    def pod(docs, n):
+        return next(sp for nm, _, _, sp, _ in K.pod_specs(docs) if nm == n)
+
+    def subpath(d):
+        m = next(m for m in pod(d, "group-gate")["containers"][0]["volumeMounts"] if m["mountPath"] == "/hub-data")
+        m["subPath"] = "group-gate-policy.json"
+
+    def pvc(d):
+        v = next(v for v in pod(d, "keycloak")["volumes"] if v["name"] == "hub-data")
+        v.pop("projected")
+        v["persistentVolumeClaim"] = {"claimName": "hub-data", "readOnly": True}
+
+    def required(d):
+        v = next(v for v in pod(d, "mcp-gate")["volumes"] if v["name"] == "hub-data")
+        v["projected"]["sources"][0][next(iter(v["projected"]["sources"][0]))]["optional"] = False
+
+    def stray(d):
+        pod(d, "lldap")["volumes"].append({"name": "x", "projected": {"sources": [{"configMap": {"name": "pub-vpn"}}]}})
+
+    def nobin(d):
+        sp = pod(d, "wg")
+        sp["initContainers"] = []
+
+    for what, mut in (("a subPath", subpath), ("a reader on the Hub's PVC", pvc), ("a required source", required),
+                      ("a non-reader projecting pub-vpn", stray), ("a reader without portcullis-bin", nobin)):
+        d = _c.deepcopy(base)
+        mut(d)
+        if not published_problems(d):
+            F.add(f"published_problems misses {what} (mutation test)")
+
+
 def main():
     comp = K.compose()
     docs = K.render()
@@ -365,6 +496,7 @@ def main():
     check_services(comp, docs)
     check_routers(comp)
     check_traefik(comp, docs)
+    check_published()
     for kind, items in D.items():
         for e in items:
             if (kind, e.get("service"), str(e.get("item"))) not in USED:

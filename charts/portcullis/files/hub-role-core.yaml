@@ -1,0 +1,38 @@
+# The Hub's Role in the core namespace (contract §6, the Role
+# portcullis-hub-core; NEW, HA): only the published documents of §4
+# (got and updated, never created, deleted, listed or patched), the front door's status
+# and the cluster addresses (read), its Lease (§20.5), the hub rev exec
+# on the reader pods (narrowed by the admission policy
+# portcullis-core-exec) and listing pods (the readers, the gates'
+# replicas). The Hub is the source: core's chart keeps a byte copy
+# (charts/portcullis/files/hub-role-core.yaml).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: portcullis-hub-core
+  namespace: portcullis
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "update"]
+    resourceNames: ["pub-group-gate-policy", "pub-user-attributes", "pub-portal-apps", "pub-signin-keycloak", "pub-impersonation", "pub-mcp-gate", "pub-vpn"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get"]
+    resourceNames: ["frontdoor-status", "portcullis-cluster-addresses"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "update"]
+    resourceNames: ["pub-mcp-credentials"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "update"]
+    resourceNames: ["portcullis-hub"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]

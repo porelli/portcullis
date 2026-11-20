@@ -4,7 +4,10 @@ here). /project is an emptyDir: core.env (secrets/hub/core.env) and the
 group-gate map are mounted into it, templates/ and appfiles/ are its own
 scratch (the kube backend delivers them as ConfigMaps / Secrets). The
 cluster check's result (portcullis-cluster-check, written by the CLI at
-every up / upgrade) is read-only at /run/portcullis/cluster-check. */ -}}
+every up / upgrade) is read-only at /run/portcullis/cluster-check. POD_NAME
+(the downward API) is its identity on its Lease portcullis-hub (contract
+§20.5, published.yaml); its documents for other services are the pub-*
+objects (published.yaml), never a file on hub-data for them. */ -}}
 {{- $d := include "portcullis.domain" . -}}
 {{- $s := dict
   "name" "hub" "uid" .Values.uids.hub "gid" .Values.uids.hub "groups" (list .Values.uids.vpnDoc .Values.uids.mailProvider)
@@ -17,6 +20,7 @@ every up / upgrade) is read-only at /run/portcullis/cluster-check. */ -}}
     (dict "name" "PROJECT_HOST_DIR" "value" "/project")
     (dict "name" "HUB_DATA_DIR" "value" "/data")
     (dict "name" "HUB_CONTAINER_RUNTIME" "value" "kubernetes")
+    (dict "name" "POD_NAME" "valueFrom" (dict "fieldRef" (dict "fieldPath" "metadata.name")))
     (dict "name" "HUB_SELF_IMAGE" "value" (include "portcullis.image" (list . "hub")))
     (dict "name" "HUB_APPS_NAMESPACE" "value" .Values.appsNamespace)
     (dict "name" "PORTCULLIS_DOMAIN" "value" $d)
@@ -100,13 +104,14 @@ every up / upgrade) is read-only at /run/portcullis/cluster-check. */ -}}
 {{- /* HA (contract §20.10): the gates' logs and wg's status are per
 replica, read over their log ports (HUB_GATE_LOG_SOURCES=http): no mount
 of group-gate-data, mcp-gate-data or wg-data, and the gates prune their
-own logs. */ -}}
+own logs; HUB_GATE_REPLICAS = ha.gateReplicas, so a missing replica
+counts as incomplete. */ -}}
 {{- $drop := list "group-gate-data" "mcp-gate-data" "wg-data" }}
 {{- $m := list }}{{- range $s.mounts }}{{- if not (has .name $drop) }}{{- $m = append $m . }}{{- end }}{{- end }}
 {{- $v := list }}{{- range $s.volumes }}{{- if not (has .name $drop) }}{{- $v = append $v . }}{{- end }}{{- end }}
 {{- $_ := set $s "mounts" $m }}
 {{- $_ = set $s "volumes" $v }}
-{{- $_ = set $s "env" (append $s.env (dict "name" "HUB_GATE_LOG_SOURCES" "value" "http")) }}
+{{- $_ = set $s "env" (concat $s.env (list (dict "name" "HUB_GATE_LOG_SOURCES" "value" "http") (dict "name" "HUB_GATE_REPLICAS" "value" (int .Values.ha.gateReplicas | toString)))) }}
 {{- end }}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---

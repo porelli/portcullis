@@ -2,6 +2,8 @@
 volume (map.conf, revocation/, ca/: compose's four binds, no nested
 mounts); its revocation list updates in place. Its VPN mode comes from its own env
 (vpn.mode / vpn.publicEnrol): break-glass `vpn mode apps` with the Hub at 0.
+/hub-data and /vpn-doc are its published documents (projected, read-only:
+portcullis.published, contract §4), never the Hub's PVC.
 HA (contract §20.10): a StatefulSet, one opened log per replica, served to
 the Hub on :8091 and pruned by the gate itself (portcullis.haGate). */ -}}
 {{- $s := dict
@@ -38,11 +40,10 @@ the Hub on :8091 and pruned by the gate itself (portcullis.haGate). */ -}}
       (dict "configMap" (dict "name" "config-group-gate" "items" (list (dict "key" "group-gate-map.conf" "path" "map.conf"))))
       (dict "configMap" (dict "name" "certs-revocation" "items" (list (dict "key" "revoked-serials.txt" "path" "revocation/revoked-serials.txt"))))
       (dict "configMap" (dict "name" "certs" "items" (list (dict "key" "yubikey-ca.crt" "path" "ca/yubikey-ca.crt") (dict "key" "browser-ca.crt" "path" "ca/browser-ca.crt")))))))
-    (dict "name" "hub-data" "persistentVolumeClaim" (dict "claimName" "hub-data" "readOnly" true))
-    (dict "name" "vpn-doc" "persistentVolumeClaim" (dict "claimName" "vpn-doc" "readOnly" true))
     (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "group-gate-data"))
     (dict "name" "tmp" "emptyDir" (dict "medium" "Memory")))
 -}}
+{{- include "portcullis.published" (dict "root" . "s" $s) }}
 {{- if .Values.ha.enabled }}
 {{- include "portcullis.haGate" (dict "root" . "s" $s "uid" .Values.uids.groupGate "port" 8091 "env" (list
   (dict "name" "GATE_LOG_PORT" "value" "8091")

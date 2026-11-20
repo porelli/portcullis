@@ -3,7 +3,10 @@ core Services' cluster DNS names (apps can't create Services in this
 namespace, so nothing can shadow them); Keycloak through kcinternal. The
 companions' gate aliases portcullis-mcp-<instance>--<companion> are the
 Hub's ClusterIP Services in the apps namespace: its search domain resolves
-them by the bare alias, as Docker's DNS does. HA (contract §20.10): a
+them by the bare alias, as Docker's DNS does. /hub-data is its published documents (projected, read-only:
+portcullis.published, contract §4); fsGroup 10001 reads the Secret
+pub-mcp-credentials (0440) and owns its data as the Hub's group.
+HA (contract §20.10): a
 StatefulSet, one access log per replica, served to the Hub on :8092
 (portcullis.haGate). */ -}}
 {{- $s := dict
@@ -28,12 +31,12 @@ StatefulSet, one access log per replica, served to the Hub on :8092
     (dict "name" "secrets" "mountPath" "/run/portcullis/mcp-gate" "readOnly" true)
     (dict "name" "tmp" "mountPath" "/tmp"))
   "volumes" (list
-    (dict "name" "hub-data" "persistentVolumeClaim" (dict "claimName" "hub-data" "readOnly" true))
     (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "mcp-gate-data"))
     (dict "name" "secrets" "secret" (dict "secretName" "secrets-mcp-gate" "defaultMode" 288 "items" (list (dict "key" "age.key" "path" "age.key") (dict "key" "hub-secret" "path" "hub-secret"))))
     (dict "name" "tmp" "emptyDir" (dict "medium" "Memory")))
-  "fsGroup" .Values.uids.mcpGate
+  "fsGroup" .Values.uids.hub
 -}}
+{{- include "portcullis.published" (dict "root" . "s" $s) }}
 {{- if .Values.ha.enabled }}
 {{- include "portcullis.haGate" (dict "root" . "s" $s "uid" .Values.uids.mcpGate "port" 8092 "env" (list
   (dict "name" "MCP_GATE_LOG_LISTEN" "value" ":8092"))) }}

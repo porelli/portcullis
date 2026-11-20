@@ -4,8 +4,12 @@ IngressRoutes, Middlewares and Services: the apps' routes and their pinned
 ExternalName backends, held to owner=hub and the Hub's shapes by the
 portcullis-edge-routes admission policy) —
 files/hub-role.yaml and files/hub-role-edge.yaml, byte copies of the Hub's
-internal/runtime/kube/testdata/role.yaml and role-edge.yaml, compared in CI; nothing in this
-namespace, nothing cluster-scoped. */ -}}
+internal/runtime/kube/testdata/role.yaml and role-edge.yaml, compared in CI;
+NEW (HA, contract §6): here only portcullis-hub-core (files/hub-role-core.yaml,
+the byte copy of role-core.yaml): the published documents (get / update by
+name), frontdoor-status and portcullis-cluster-addresses (get), its Lease,
+pods list and the hub rev exec (narrowed by the admission policy
+portcullis-core-exec). Nothing cluster-scoped. */ -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -40,6 +44,22 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: portcullis-hub
+subjects:
+  - kind: ServiceAccount
+    name: portcullis-hub
+    namespace: {{ .Release.Namespace }}
+---
+{{ .Files.Get "files/hub-role-core.yaml" | replace "\n  namespace: portcullis\n" (printf "\n  namespace: %s\n" .Release.Namespace) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: portcullis-hub-core
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: portcullis-hub-core
 subjects:
   - kind: ServiceAccount
     name: portcullis-hub
