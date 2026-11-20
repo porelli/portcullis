@@ -9,6 +9,7 @@
 //	domains healthcheck  exit 0 if the API answers /healthz (Docker HEALTHCHECK)
 //	domains enrolled   the number of enrolled domains
 //	domains dns …      the one-shot DNS tool (tool.go)
+//	domains frontdoor  the front-door role in HA (frontdoor_main.go, §20.8)
 //	domains traefik-account-uri <acme.json>, domains report --main --json|--refresh
 package main
 
@@ -105,6 +106,8 @@ func main() {
 			os.Exit(runMailCert(os.Args[2:], toolEnv{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr, resolvers: resolvers}))
 		case "mail-tlsa":
 			os.Exit(runMailTLSA(os.Args[2:], toolEnv{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr}))
+		case "frontdoor":
+			os.Exit(runFrontdoor(os.Stderr))
 		case "traefik-account-uri":
 			os.Exit(runTraefikAccountURI(os.Args[2:], os.Stdout, os.Stderr))
 		case "report":
@@ -115,7 +118,7 @@ func main() {
 			}
 			os.Exit(runReport(os.Args[2:], "http://127.0.0.1"+env("DOMAINS_API_ADDR", ":8080"), secret, os.Stdout, os.Stderr))
 		default:
-			fmt.Fprintf(os.Stderr, "usage: domains [keygen|healthcheck|enrolled|dns|mail-cert|mail-tlsa|traefik-account-uri|report]\n")
+			fmt.Fprintf(os.Stderr, "usage: domains [keygen|healthcheck|enrolled|dns|mail-cert|mail-tlsa|frontdoor|traefik-account-uri|report]\n")
 			os.Exit(2)
 		}
 	}

@@ -25,7 +25,7 @@ import yaml
 import k8s_lib as K
 
 F = K.Failures("k8s_hardening")
-TOKEN_OK = {"traefik", "hub"}
+TOKEN_OK = {"traefik", "hub", "frontdoor"}  # frontdoor: HA only (its Lease, frontdoor-status)
 WRITABLE_ROOT_OK = {"keycloak"}  # compose: not read_only (`start` re-augments)
 # ServiceAccount (namespace/name) → the namespaces whose Secrets it may read.
 SECRET_READERS = {
@@ -99,6 +99,43 @@ def check_pod(name, ns, labels, spec, ann):
             F.add(f"{cn}: procMount")
     if spec.get("securityContext", {}).get("sysctls"):
         F.add(f"{name}: sysctls")
+
+
+FRONTDOOR_RULES = [
+    {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "resourceNames": ["portcullis-frontdoor"], "verbs": ["get", "update"]},
+    {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["frontdoor-status"], "verbs": ["get", "update"]},
+]
+
+
+def check_frontdoor():
+    """HA only (contract §20.8): the front door's pod has the baseline, its
+    Role is exactly its Lease and frontdoor-status (get / update, by name),
+    it reads no Secret through the API (its credentials are a file mount)
+    and only it mounts frontdoor-env and frontdoor-control-tls."""
+    docs = K.render({"ha": {"enabled": True}})
+    if K.by_kind(K.render(), "Lease"):
+        F.add("the front door's objects render without ha.enabled")
+    pods = [p for p in K.pod_specs(docs) if p[0] == "frontdoor"]
+    if len(pods) != 1:
+        F.add(f"ha: {len(pods)} frontdoor pods")
+    for name, ns, labels, spec, ann in pods:
+        check_pod(name, ns, labels, spec, ann)
+        if spec.get("serviceAccountName") != "frontdoor":
+            F.add("frontdoor: ServiceAccount must be frontdoor")
+    roles = [r for r in K.by_kind(docs, "Role") if r["metadata"]["name"] == "frontdoor"]
+    if len(roles) != 1 or roles[0]["rules"] != FRONTDOOR_RULES:
+        F.add(f"the front door's Role must be exactly {FRONTDOOR_RULES}")
+    for name, ns, labels, spec, ann in K.pod_specs(docs):
+        secrets = {v["secret"]["secretName"] for v in spec.get("volumes", []) if "secret" in v}
+        for p in spec.get("volumes", []):
+            for src in p.get("projected", {}).get("sources", []):
+                if "secret" in src:
+                    secrets.add(src["secret"]["name"])
+        if name != "frontdoor" and secrets & {"frontdoor-env", "frontdoor-control-tls"}:
+            F.add(f"{name}: mounts the front door's Secrets")
+        if name == "frontdoor" and secrets != {"frontdoor-env", "frontdoor-control-tls"}:
+            F.add(f"frontdoor: mounts {sorted(secrets)}")
+    check_secret_access(docs + storage_docs())
 
 
 def main():
@@ -213,6 +250,7 @@ def main():
                     F.add(f"Traefik's Role in {r['metadata']['namespace']}: {rule['verbs']} (read-only)")
     check_secret_access(docs + storage_docs())
     check_edge(docs)
+    check_frontdoor()
     check_psa()
     # Every PVC a pod claims is rendered, with and without the optional
     # profiles (compose's named volumes exist in every profile).

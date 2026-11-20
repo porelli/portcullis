@@ -1,0 +1,196 @@
+{{- /* The front door (HA only, contract §20.8): `domains frontdoor`, the domains
+image's front-door role. One replica writing DNS only while it holds the Lease
+portcullis-frontdoor (§20.5). It alone mounts the Secret frontdoor-env (the
+main domain's DNS credentials, the file credentials.json; written by the CLI,
+never Helm) and frontdoor-control-tls (its frontdoor.control client
+certificate, written and renewed by nodeadm; empty until then, so the front
+door reaches no prober and changes nothing). Its Role: get / update of its
+Lease and of frontdoor-status only. Its network: egress to the DNS provider's
+API (any public address on 443: a NetworkPolicy can't name a host), the
+nodeagents' :7443 on the node mesh, nodeadm's :8443 and the API server;
+ingress only Prometheus on :9106. The label portcullis.io/net-frontdoor names
+a network of one (no generic net policy selects it). */ -}}
+{{- if .Values.ha.enabled }}
+{{- $ns := .Release.Namespace }}
+{{- $s := dict
+  "name" "frontdoor" "image" "domains" "uid" .Values.uids.domains "gid" .Values.uids.domains
+  "memory" "128Mi" "nets" (list "frontdoor") "token" true "serviceAccount" "frontdoor"
+  "args" (list "frontdoor") "fsGroup" .Values.uids.domains
+  "httpReady" (dict "path" "/healthz" "port" 8090)
+  "ports" (list (dict "name" "health" "port" 8090) (dict "name" "metrics" "port" 9106))
+  "env" (list
+    (dict "name" "PORTCULLIS_DOMAIN" "value" (include "portcullis.domain" .))
+    (dict "name" "PORTCULLIS_HA" "value" "on")
+    (dict "name" "POD_NAME" "valueFrom" (dict "fieldRef" (dict "fieldPath" "metadata.name")))
+    (dict "name" "POD_NAMESPACE" "valueFrom" (dict "fieldRef" (dict "fieldPath" "metadata.namespace")))
+    (dict "name" "FRONTDOOR_NODEADM_URL" "value" (printf "https://nodeadm.%s.svc:8443" .Values.ha.nodeadmNamespace))
+    (dict "name" "FRONTDOOR_CREDENTIALS_FILE" "value" "/run/portcullis/frontdoor/credentials.json")
+    (dict "name" "FRONTDOOR_TLS_DIR" "value" "/run/portcullis/frontdoor-tls"))
+  "mounts" (list
+    (dict "name" "credentials" "mountPath" "/run/portcullis/frontdoor" "readOnly" true)
+    (dict "name" "control-tls" "mountPath" "/run/portcullis/frontdoor-tls" "readOnly" true))
+  "volumes" (list
+    (dict "name" "credentials" "secret" (dict "secretName" "frontdoor-env" "defaultMode" 288 "items" (list (dict "key" "credentials.json" "path" "credentials.json"))))
+    (dict "name" "control-tls" "secret" (dict "secretName" "frontdoor-control-tls" "defaultMode" 288 "optional" true)))
+-}}
+{{ include "portcullis.deployment" (dict "root" . "s" $s) }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: frontdoor
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: frontdoor
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    resourceNames: ["portcullis-frontdoor"]
+    verbs: ["get", "update"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["frontdoor-status"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: frontdoor
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: frontdoor
+subjects:
+  - kind: ServiceAccount
+    name: frontdoor
+    namespace: {{ $ns }}
+---
+apiVersion: coordination.k8s.io/v1
+kind: Lease
+metadata:
+  name: portcullis-frontdoor
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontdoor-status
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+data: {}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: frontdoor-control-tls
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+  annotations:
+    helm.sh/resource-policy: keep
+type: Opaque
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontdoor
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: frontdoor
+  policyTypes: ["Ingress", "Egress"]
+  {{- if .Values.monitoring.enabled }}
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: prometheus
+      ports:
+        - protocol: TCP
+          port: 9106
+  {{- else }}
+  ingress: []
+  {{- end }}
+  egress:
+    # The DNS provider's API (and, Task 29, the ACME CA): public 443 only.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - {{ required "podCIDR is required" .Values.podCIDR }}
+              - {{ required "serviceCIDR is required" .Values.serviceCIDR }}
+              - {{ .Values.ha.meshCIDR }}
+              - 169.254.0.0/16
+              {{- range (required "nodeAddresses is required" .Values.nodeAddresses) }}
+              - {{ . }}/32
+              {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+    # The nodeagents (GET /v1/probes) on the node mesh.
+    - to:
+        - ipBlock:
+            cidr: {{ .Values.ha.meshCIDR }}
+      ports:
+        - protocol: TCP
+          port: 7443
+    # nodeadm (GET /v1/cluster).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.ha.nodeadmNamespace }}
+      ports:
+        - protocol: TCP
+          port: 8443
+    # The API server (its Lease and frontdoor-status).
+    {{- range (required "apiEndpoints is required" .Values.apiEndpoints) }}
+    {{- $p := splitList ":" . }}
+    - to:
+        - ipBlock:
+            cidr: {{ index $p 0 }}/32
+      ports:
+        - protocol: TCP
+          port: {{ index $p 1 }}
+    {{- end }}
+{{- if .Values.monitoring.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus-to-frontdoor
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: prometheus
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: frontdoor
+      ports:
+        - protocol: TCP
+          port: 9106
+{{- end }}
+{{- end }}

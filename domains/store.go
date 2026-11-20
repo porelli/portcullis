@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -231,7 +232,12 @@ func redact(msg string, creds map[string]string) string {
 		if len(v) < 4 {
 			continue
 		}
-		for _, form := range []string{v, fmt.Sprintf("%q", v), url.QueryEscape(v), url.PathEscape(v)} {
+		b := []byte(v)
+		// base64 (an echoed basic-auth header or request body) in the
+		// four alphabets, padding included and stripped.
+		for _, form := range []string{v, fmt.Sprintf("%q", v), url.QueryEscape(v), url.PathEscape(v),
+			base64.StdEncoding.EncodeToString(b), base64.RawStdEncoding.EncodeToString(b),
+			base64.URLEncoding.EncodeToString(b), base64.RawURLEncoding.EncodeToString(b)} {
 			msg = strings.ReplaceAll(msg, form, "[redacted]")
 		}
 		if len(v) >= 12 {

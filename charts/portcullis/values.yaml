@@ -122,6 +122,15 @@ hub:
 alerting:
   smtpFrom: ""
 
+# High availability (PORTCULLIS_HA=on, contract §20; Task 19 adds the rest
+# of the HA mode). The front door (templates/frontdoor.yaml) renders only
+# with it.
+ha:
+  enabled: false
+  # The node mesh pcmesh (§20.11): the nodeagents answer on :7443 there.
+  meshCIDR: 10.215.0.0/24
+  nodeadmNamespace: portcullis-nodeadm
+
 # Content hashes of every synced ConfigMap / Secret (secrets/kube/applied.json):
 # pods carry portcullis.io/config-hash over the ones they mount, so a
 # change rolls them.
