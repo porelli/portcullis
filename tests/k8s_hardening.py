@@ -12,6 +12,9 @@ exactly SECRET_READERS (Traefik only the edge namespace, which renders no
 Secret; the Hub only the apps namespace; nobody the core one, which holds
 portcullis-env, the age / wg / vault Secrets); Traefik watches only the edge
 namespace, and every core IngressRoute / Middleware lives there.
+HA (contract §20.10): the baseline on every HA pod; group-gate and mcp-gate
+StatefulSets ×2 with a data PVC per replica and a PDB, the log ports and
+the gate's own pruning only in HA, no shared gate / wg data mount.
 
   python3 tests/k8s_hardening.py
 """
@@ -138,6 +141,64 @@ def check_frontdoor():
     check_secret_access(docs + storage_docs())
 
 
+LOG_PORTS = {"group-gate": ("GATE_LOG_PORT", "8091", 8091), "mcp-gate": ("MCP_GATE_LOG_LISTEN", ":8092", 8092),
+             "wg": ("WG_STATUS_LISTEN", "$(WG_POD_IP):8093", 8093)}
+
+
+def check_log_ports():
+    """HA (contract §20.10): every HA pod has the baseline; group-gate and
+    mcp-gate are StatefulSets of ha.gateReplicas, each replica its own
+    `data` PVC (no shared group-gate-data / mcp-gate-data), port-bound,
+    with a PDB keeping one up; the log ports and group-gate's own pruning
+    are set only in HA, and there no pod but its owner mounts a gate's or
+    wg's data (the Hub reads them over the ports: HUB_GATE_LOG_SOURCES)."""
+    ha = K.render({"ha": {"enabled": True}})
+    plain = K.render()
+    for name, ns, labels, spec, ann in K.pod_specs(ha):
+        check_pod(name, ns, labels, spec, ann)
+    envs = lambda docs: {n: {e["name"]: e.get("value") for c in sp["containers"] for e in c.get("env", [])}
+                         for n, _, _, sp, _ in K.pod_specs(docs)}
+    ports = lambda docs: {n: {p["containerPort"] for c in sp["containers"] for p in c.get("ports", [])}
+                          for n, _, _, sp, _ in K.pod_specs(docs)}
+    he, pe, hp, pp = envs(ha), envs(plain), ports(ha), ports(plain)
+    for svc, (var, value, port) in LOG_PORTS.items():
+        if he.get(svc, {}).get(var) != value or port not in hp.get(svc, set()):
+            F.add(f"ha: {svc} must serve its log port {port} ({var}={value})")
+        if var in pe.get(svc, {}) or port in pp.get(svc, set()):
+            F.add(f"{svc}: the log port {port} without ha.enabled")
+    if he.get("group-gate", {}).get("GATE_OPENED_PRUNE_DAYS") != "365" or "GATE_OPENED_PRUNE_DAYS" in pe.get("group-gate", {}):
+        F.add("group-gate prunes its own log (GATE_OPENED_PRUNE_DAYS=365) in HA only")
+    if he.get("hub", {}).get("HUB_GATE_LOG_SOURCES") != "http" or "HUB_GATE_LOG_SOURCES" in pe.get("hub", {}):
+        F.add("the Hub reads the gates over HTTP (HUB_GATE_LOG_SOURCES=http) in HA only")
+    sts = {d["metadata"]["name"]: d for d in K.by_kind(ha, "StatefulSet")}
+    if sorted(sts) != ["group-gate", "mcp-gate"] or K.by_kind(plain, "StatefulSet"):
+        F.add(f"ha: StatefulSets {sorted(sts)} (want group-gate, mcp-gate; none without HA)")
+    pdbs = {d["spec"]["selector"]["matchLabels"].get("portcullis.io/component"): d["spec"] for d in K.by_kind(ha, "PodDisruptionBudget")}
+    for name, d in sts.items():
+        sp = d["spec"]
+        claims = sp.get("volumeClaimTemplates") or []
+        if sp.get("replicas") != 2 or [c["metadata"]["name"] for c in claims] != ["data"]:
+            F.add(f"ha: {name}: 2 replicas with one data PVC each, got {sp.get('replicas')} / {[c['metadata']['name'] for c in claims]}")
+        for c in claims:
+            a = c["metadata"].get("annotations", {})
+            if c["spec"].get("storageClassName") != "portcullis-core" or not {"portcullis.io/uid", "portcullis.io/gid", "portcullis.io/mode"} <= set(a):
+                F.add(f"ha: {name}: its data PVCs need portcullis-core and the owner annotations")
+        if sp.get("persistentVolumeClaimRetentionPolicy") != {"whenDeleted": "Retain", "whenScaled": "Retain"}:
+            F.add(f"ha: {name}: its PVCs must be kept (Retain)")
+        if sp["template"]["metadata"]["labels"].get("portcullis.io/ingress") != "bound":
+            F.add(f"ha: {name}: not port-bound (portcullis.io/ingress: bound)")
+        if pdbs.get(name) is None or pdbs[name].get("minAvailable") != 1:
+            F.add(f"ha: {name}: no PodDisruptionBudget minAvailable 1")
+    pvcs = {c["metadata"]["name"] for c in K.by_kind(ha, "PersistentVolumeClaim")}
+    if pvcs & {"group-gate-data", "mcp-gate-data"}:
+        F.add(f"ha: the shared gate PVCs still render: {sorted(pvcs & {'group-gate-data', 'mcp-gate-data'})}")
+    for name, _, _, spec, _ in K.pod_specs(ha):
+        for v in spec.get("volumes", []):
+            c = (v.get("persistentVolumeClaim") or {}).get("claimName")
+            if c in ("group-gate-data", "mcp-gate-data", "wg-data") and name != c[: -len("-data")]:
+                F.add(f"ha: {name} mounts {c} (the log ports replace it)")
+
+
 def main():
     # Every profile on, and the one-shots.
     docs = K.render()
@@ -251,10 +312,11 @@ def main():
     check_secret_access(docs + storage_docs())
     check_edge(docs)
     check_frontdoor()
+    check_log_ports()
     check_psa()
     # Every PVC a pod claims is rendered, with and without the optional
-    # profiles (compose's named volumes exist in every profile).
-    for extra in (None, {"wg": {"enabled": False}}):
+    # profiles (compose's named volumes exist in every profile), and in HA.
+    for extra in (None, {"wg": {"enabled": False}}, {"ha": {"enabled": True}}):
         d = K.render(extra)
         have = {c["metadata"]["name"] for c in K.by_kind(d, "PersistentVolumeClaim")}
         for name, _, _, spec, _ in K.pod_specs(d):

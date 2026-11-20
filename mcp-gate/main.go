@@ -12,7 +12,8 @@
 //
 // Environment: MCP_GATE_LISTEN (:8080), MCP_GATE_HUB_DATA (/hub-data),
 // MCP_GATE_DATA (/data), MCP_GATE_AGE_KEY_FILE, MCP_GATE_HUB_SECRET_FILE,
-// MCP_GATE_JWKS_URL, MCP_GATE_HUB_URL (http://hub:8890).
+// MCP_GATE_JWKS_URL, MCP_GATE_HUB_URL (http://hub:8890), MCP_GATE_LOG_LISTEN
+// (unset = off; the chart sets :8092 in HA: the log port, logport.go).
 package main
 
 import (
@@ -176,6 +177,24 @@ func serve() error {
 	srv := newServer(env("MCP_GATE_LISTEN", defaultListen), g.handler)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
+	// The log port (contract §20.10): only when the chart sets it (HA).
+	if addr := os.Getenv("MCP_GATE_LOG_LISTEN"); addr != "" {
+		if _, port, err := net.SplitHostPort(addr); err != nil || port == "" {
+			return fmt.Errorf("MCP_GATE_LOG_LISTEN must be [host]:port")
+		}
+		ls := newLogServer(addr, filepath.Join(env("MCP_GATE_DATA", defaultData), "access.jsonl"))
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			return fmt.Errorf("log port: %w", err)
+		}
+		go func() {
+			if err := ls.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+				log.Printf("mcp-gate: log port: %v", err)
+			}
+		}()
+		go func() { <-ctx.Done(); _ = ls.Close() }()
+		log.Printf("mcp-gate: log port on %s (GET %s)", addr, logPath)
+	}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

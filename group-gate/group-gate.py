@@ -101,6 +101,18 @@ host) this process hasn't logged yet appends a line to
 GATE_OPENED_DIR/<YYYY-MM-DD>.jsonl (OpenedLog; the Hub's sign-in history
 reads it). A failed write is counted, never a deny.
 
+The log port (contract §20.10, Kubernetes HA only: the chart sets both
+variables, Docker sets neither and the Hub reads and prunes the files):
+  - GATE_LOG_PORT (e.g. 8091): a second listener serving only
+    GET /v1/log?from=<RFC 3339>&limit=<1-10000, default 1000> — the opened
+    log's lines as they are on disk (JSONL, oldest first, at most `limit`
+    lines and 4 MiB), every other method 405. No auth: only the Hub pod may
+    reach it (NetworkPolicy, a stated delta in hardening.md). The gate port
+    never serves it.
+  - GATE_OPENED_PRUNE_DAYS (e.g. 365): the gate deletes the opened log's day
+    files older than that many days, at start and then daily (the Hub's
+    rule: never today's file).
+
 Config sources (both re-read on every request; they are tiny):
   - /etc/group-gate/map.conf — <sub>=required_group, expanded to
     <sub>.<PORTCULLIS_DOMAIN> (`*` = any signed-in user, valid only
@@ -218,6 +230,10 @@ BROWSER_CA_FILE = os.environ.get("GATE_BROWSER_CA_FILE", "/etc/group-gate/ca/bro
 OPENED_DIR = os.environ.get("GATE_OPENED_DIR", "/data/opened")
 # The Hub's gid: opened/ is 2770 with this group, its files 0640.
 OPENED_GID = int(os.environ.get("GATE_OPENED_GID", "10001"))
+# The log port and the gate's own pruning (contract §20.10): both unset
+# ("" = off) on Docker; startup_problem() refuses a malformed value.
+LOG_PORT = os.environ.get("GATE_LOG_PORT", "").strip()
+OPENED_PRUNE_DAYS = os.environ.get("GATE_OPENED_PRUNE_DAYS", "").strip()
 # A CRL list this long past its nextUpdate is stale: certificates stop
 # counting until it is read again.
 CRL_STALE_GRACE = 3600.0
@@ -2510,6 +2526,138 @@ class OpenedLog:
         except Exception as e:  # noqa: BLE001 — logging never denies a request
             self._failed(f"{type(e).__name__}: {e}")
 
+    # ── the log port's read and the gate's own pruning (contract §20.10) ──
+
+    DAY_FILE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.jsonl$")
+    LINE_TIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+    def _day_files(self) -> List[Tuple[datetime.date, str]]:
+        """(day, name) of every day file, oldest first. A missing directory
+        is no files; one that isn't a directory (a symlink included) is an
+        error."""
+        try:
+            st = os.lstat(self.directory)
+        except FileNotFoundError:
+            return []
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError(f"{self.directory} is not a directory")
+        out = []
+        for name in os.listdir(self.directory):
+            m = self.DAY_FILE_RE.match(name)
+            if not m:
+                continue
+            try:
+                day = datetime.date.fromisoformat(m.group(1))
+            except ValueError:
+                continue
+            out.append((day, name))
+        out.sort()
+        return out
+
+    def _read_day(self, name: str) -> bytes:
+        """A day file's bytes (at most DAY_FILE_MAX, from its start): never
+        through a symlink, never a FIFO or other non-regular file (an
+        error); a directory or a file gone meanwhile is empty."""
+        path = os.path.join(self.directory, name)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            return b""
+        try:
+            mode = os.fstat(fd).st_mode
+            if stat.S_ISDIR(mode):
+                return b""  # not a day file (prune leaves it alone too)
+            if not stat.S_ISREG(mode):
+                raise OSError(f"{name} is not a regular file")
+            chunks, left = [], self.DAY_FILE_MAX
+            while left > 0:
+                b = os.read(fd, min(left, 1 << 20))
+                if not b:
+                    break
+                chunks.append(b)
+                left -= len(b)
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+
+    def read(self, since: Optional[datetime.datetime], limit: int, max_bytes: int) -> bytes:
+        """The log port's answer: the lines written at or after `since`
+        (None = all), oldest first (by their `time`, then file order), at
+        most `limit` lines and `max_bytes` bytes, each exactly as it is on
+        disk. Torn (no final newline) and unparsable lines are skipped, so
+        nothing is served that isn't a whole line the gate wrote."""
+        since = since.astimezone(datetime.timezone.utc) if since is not None else None
+        from_key = since.strftime("%Y-%m-%dT%H:%M:%SZ") if since is not None else ""
+        if since is not None and since.microsecond:
+            # A line's time has whole seconds: one inside that second is
+            # before `since`.
+            from_key = (since.replace(microsecond=0) + datetime.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        out: List[bytes] = []
+        size = 0
+        for day, name in self._day_files():
+            if since is not None and day < since.date():
+                continue
+            lines = []
+            for i, raw in enumerate(self._read_day(name).split(b"\n")[:-1]):
+                try:
+                    doc = json.loads(raw)
+                except ValueError:
+                    continue
+                t = doc.get("time") if isinstance(doc, dict) else None
+                if not isinstance(t, str) or not self.LINE_TIME_RE.match(t) or t < from_key:
+                    continue
+                lines.append((t, i, raw))
+            lines.sort(key=lambda x: (x[0], x[1]))
+            for _, _, raw in lines:
+                if len(out) >= limit or size + len(raw) + 1 > max_bytes:
+                    return b"".join(out)
+                out.append(raw + b"\n")
+                size += len(raw) + 1
+        return b"".join(out)
+
+    def prune(self, days: int, now: Optional[datetime.datetime] = None) -> int:
+        """Deletes the day files older than `days` (their day before today −
+        days, UTC); today's file (and any later one) is never deleted,
+        whatever `days` is (the Hub's Prune, internal/signinhistory).
+        Other names and directories are left alone; a missing log prunes
+        nothing. Returns how many were deleted; a failure is printed and
+        counted, never raised."""
+        today = (now or datetime.datetime.now(datetime.timezone.utc)).astimezone(datetime.timezone.utc).date()
+        cutoff = today - datetime.timedelta(days=max(int(days), 0))
+        removed = 0
+        try:
+            files = self._day_files()
+        except OSError as e:
+            print(f"group-gate: opened log prune: {e}", flush=True)
+            METRICS.inc("group_gate_opened_log_failures_total")
+            return 0
+        for day, name in files:
+            if not (day < cutoff and day < today):
+                continue
+            path = os.path.join(self.directory, name)
+            try:
+                if stat.S_ISDIR(os.lstat(path).st_mode):
+                    continue
+                os.remove(path)
+                removed += 1
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                print(f"group-gate: opened log prune: {name}: {e}", flush=True)
+                METRICS.inc("group_gate_opened_log_failures_total")
+        return removed
+
+    def prune_forever(self, days: int, every: float = 86400.0, stop: Optional[threading.Event] = None):
+        """prune(days) now and then every `every` seconds until `stop`."""
+        stop = stop or threading.Event()
+        while True:
+            n = self.prune(days)
+            if n:
+                print(f"group-gate: pruned {n} opened log day file(s) older than {days} days", flush=True)
+            if stop.wait(every):
+                return
+
 
 OPENED_LOG = OpenedLog(OPENED_DIR)
 
@@ -3951,6 +4099,118 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+# The log port (contract §20.10).
+LOG_PATH = "/v1/log"
+LOG_ANSWER_MAX = 4 << 20
+LOG_LIMIT_DEFAULT = 1000
+LOG_LIMIT_MAX = 10000
+RFC3339_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d{1,9})?([Zz]|[+-]\d{2}:\d{2})$")
+# One read at a time: an answer holds at most a day file (8 MiB) and 4 MiB
+# of lines, so the gate's memory stays bounded whoever asks how often.
+_LOG_READ_LOCK = threading.Lock()
+
+
+def parse_rfc3339(text: str) -> Optional[datetime.datetime]:
+    """An RFC 3339 timestamp (seconds required, any fraction, Z or an
+    offset) as an aware datetime, or None."""
+    if not RFC3339_RE.match(text):
+        return None
+    head, frac, zone = text[:19], "", text[19:]
+    if zone.startswith("."):
+        i = 1
+        while i < len(zone) and zone[i].isdigit():
+            i += 1
+        frac, zone = zone[1:i], zone[i:]
+    zone = "+00:00" if zone in ("Z", "z") else zone
+    try:
+        t = datetime.datetime.fromisoformat(head.replace("t", "T") + zone)
+    except ValueError:
+        return None
+    return t.replace(microsecond=int((frac + "000000")[:6])) if frac else t
+
+
+def log_query(query: str) -> Tuple[Optional[datetime.datetime], int]:
+    """`from` and `limit` of a /v1/log query; ValueError (the 400's text)
+    for anything else: an unknown or repeated parameter, a `from` that
+    isn't RFC 3339, a `limit` outside 1–10000."""
+    try:
+        params = urllib.parse.parse_qs(query, keep_blank_values=True, strict_parsing=bool(query),
+                                       max_num_fields=4)
+    except ValueError:
+        raise ValueError("malformed query")
+    unknown = sorted(set(params) - {"from", "limit"})
+    if unknown:
+        raise ValueError(f"unknown parameter {unknown[0]!r}")
+    if any(len(v) != 1 for v in params.values()):
+        raise ValueError("a parameter given twice")
+    since = None
+    if "from" in params:
+        since = parse_rfc3339(params["from"][0])
+        if since is None:
+            raise ValueError("from must be an RFC 3339 timestamp")
+    limit = LOG_LIMIT_DEFAULT
+    if "limit" in params:
+        text = params["limit"][0]
+        if not re.fullmatch(r"[0-9]{1,5}", text) or not 1 <= int(text) <= LOG_LIMIT_MAX:
+            raise ValueError(f"limit must be 1-{LOG_LIMIT_MAX}")
+        limit = int(text)
+    return since, limit
+
+
+class LogHandler(BaseHTTPRequestHandler):
+    """The log port (GATE_LOG_PORT): GET /v1/log only, every other method
+    405 (contract §20.10). Reachable only from the Hub pod (NetworkPolicy);
+    no auth of its own. Logs nothing."""
+
+    timeout = 30  # a stalled client holds a thread at most this long
+    server_version = "group-gate"
+    sys_version = ""
+
+    def _answer(self, code: int, body: bytes, ctype: str = "text/plain; charset=utf-8",
+                headers: Optional[dict] = None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _not_allowed(self):
+        self._answer(405, b"method not allowed\n", headers={"Allow": "GET"})
+
+    def __getattr__(self, name):
+        # BaseHTTPRequestHandler dispatches to do_<METHOD>: every method but
+        # GET (any name, HEAD included) is 405, never 501.
+        if name.startswith("do_") and name != "do_GET":
+            return self._not_allowed
+        raise AttributeError(name)
+
+    def do_GET(self):
+        parts = urllib.parse.urlsplit(self.path)
+        if parts.path != LOG_PATH:
+            self._answer(404, b"not found\n")
+            return
+        try:
+            since, limit = log_query(parts.query)
+        except ValueError as e:
+            self._answer(400, f"{e}\n".encode())
+            return
+        try:
+            with _LOG_READ_LOCK:
+                body = OPENED_LOG.read(since, limit, LOG_ANSWER_MAX)
+        except Exception as e:  # noqa: BLE001 — the gate's requests are never affected
+            print(f"group-gate: log port: reading the opened log failed ({type(e).__name__})", flush=True)
+            self._answer(500, b"the opened log can't be read\n")
+            return
+        self._answer(200, body, "application/x-ndjson")
+
+    def log_message(self, fmt, *args):
+        pass
+
+
 def startup_problem() -> Optional[str]:
     """Why the gate must not start, or None."""
     if not DOMAIN_OK:
@@ -3960,6 +4220,11 @@ def startup_problem() -> Optional[str]:
     if old:
         return (f"{', '.join(old)} no longer exist: set GATE_CRL_URLS / GATE_DELTA_CRL_URLS "
                 f"(space-separated, both CAs' lists) and remove {', '.join(old)}")
+    if LOG_PORT and (not re.fullmatch(r"[0-9]{1,5}", LOG_PORT) or not 1 <= int(LOG_PORT) <= 65535
+                     or int(LOG_PORT) == LISTEN_PORT):
+        return f"GATE_LOG_PORT={LOG_PORT!r} must be a port number other than GATE_PORT"
+    if OPENED_PRUNE_DAYS and (not re.fullmatch(r"[0-9]{1,5}", OPENED_PRUNE_DAYS) or int(OPENED_PRUNE_DAYS) < 1):
+        return f"GATE_OPENED_PRUNE_DAYS={OPENED_PRUNE_DAYS!r} must be a positive number of days"
     return None
 
 
@@ -3984,4 +4249,13 @@ if __name__ == "__main__":
     if CRL_CACHE is not None:
         threading.Thread(target=CRL_CACHE.run_forever, args=(warn_crl_coverage,), daemon=True,
                          name="crl-refresh").start()
+    if OPENED_PRUNE_DAYS:
+        threading.Thread(target=OPENED_LOG.prune_forever, args=(int(OPENED_PRUNE_DAYS),), daemon=True,
+                         name="opened-prune").start()
+        print(f"group-gate: pruning the opened log to {OPENED_PRUNE_DAYS} days (daily)", flush=True)
+    if LOG_PORT:
+        log_srv = ThreadingHTTPServer(("0.0.0.0", int(LOG_PORT)), LogHandler)
+        log_srv.daemon_threads = True
+        threading.Thread(target=log_srv.serve_forever, daemon=True, name="log-port").start()
+        print(f"group-gate: log port :{LOG_PORT} (GET {LOG_PATH})", flush=True)
     ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()

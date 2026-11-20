@@ -4342,5 +4342,203 @@ class VpnTest(GateTest):
         self.assertNotIn("via", by_host["other.example.com"])
 
 
+class LogPortTest(GateTest):
+    """The log port (contract §20.10, Kubernetes HA): GET /v1/log on its own
+    listener, from/limit, at most 4 MiB, every other method 405; and the
+    gate's own pruning (GATE_OPENED_PRUNE_DAYS)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.log_srv = gg.ThreadingHTTPServer(("127.0.0.1", 0), gg.LogHandler)
+        cls.log_port = cls.log_srv.server_address[1]
+        threading.Thread(target=cls.log_srv.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.log_srv.shutdown()
+        super().tearDownClass()
+
+    def setUp(self):
+        super().setUp()
+        self.dir = os.path.join(tempfile.mkdtemp(dir=TMP), "opened")
+        old = gg.OPENED_LOG
+        gg.OPENED_LOG = gg.OpenedLog(self.dir, gid=os.getgid())
+        self.addCleanup(setattr, gg, "OPENED_LOG", old)
+
+    def call(self, path="/v1/log", method="GET", port=None):
+        """(status, headers, body bytes) of a request to the log port."""
+        body = b"{}" if method in ("POST", "PUT", "PATCH") else None
+        r = urllib.request.Request(f"http://127.0.0.1:{port or self.log_port}{path}", data=body, method=method)
+        try:
+            with urllib.request.urlopen(r) as resp:
+                return resp.status, dict(resp.headers), resp.read()
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, dict(e.headers), e.read()
+
+    def lines(self, path="/v1/log"):
+        code, headers, body = self.call(path)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(headers.get("Content-Type"), "application/x-ndjson")
+        self.assertTrue(body == b"" or body.endswith(b"\n"))
+        return [json.loads(x) for x in body.decode().split("\n") if x]
+
+    def write_day(self, day, docs, raw_tail=b""):
+        os.makedirs(self.dir, exist_ok=True)
+        with open(os.path.join(self.dir, f"{day}.jsonl"), "ab") as f:
+            for d in docs:
+                f.write((json.dumps(d, separators=(",", ":")) + "\n").encode())
+            f.write(raw_tail)
+
+    def line(self, t, host="a.example.com", **kw):
+        return {"time": t, "user": "bob", "session": "s1", "host": host, "app": "A", "methods": ["hwk"],
+                "ip": "192.0.2.1", "ua": "UA", "act": "", **kw}
+
+    def test_log_endpoint_get_only(self):
+        self.write_day("2026-11-18", [self.line("2026-11-18T10:00:00Z")])
+        self.assertEqual(len(self.lines()), 1)
+        for method in ("POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE", "FOO"):
+            with self.subTest(method=method):
+                code, headers, _ = self.call(method=method)
+                self.assertEqual(code, 405)
+                self.assertEqual(headers.get("Allow"), "GET")
+        # Only /v1/log on the log port; the gate port never serves the log.
+        self.assertEqual(self.call("/v1/log/x")[0], 404)
+        self.assertEqual(self.call("/")[0], 404)
+        code, _, body = self.call(port=self.port)
+        self.assertNotEqual(code, 200)
+        self.assertNotIn(b"192.0.2.1", body)
+
+    def test_log_endpoint_from_limit(self):
+        # Requests through the gate write lines; the port serves them as written.
+        for i in range(5):
+            tok = token(amr=["hwk"], preferred_username="bob", sid="s-bob")
+            self.assertEqual(self.req(f"app{i}.example.com", groups="lldap_admin",
+                                      extra={"X-Forwarded-Access-Token": tok}), 200)
+        self.assertTrue(gg.OPENED_LOG.flush())
+        got = self.lines()
+        self.assertEqual(sorted(x["host"] for x in got), [f"app{i}.example.com" for i in range(5)])
+        on_disk = b"".join(open(os.path.join(self.dir, n), "rb").read() for n in sorted(os.listdir(self.dir)))
+        self.assertEqual(self.call()[2], on_disk)
+        self.assertEqual(len(self.lines("/v1/log?limit=2")), 2)
+
+    def test_log_endpoint_order_and_from(self):
+        # Two days, a line out of order within a day, a torn and an
+        # unparsable line, a non-day file and a directory: oldest first by
+        # time, from inclusive, the bad lines never served.
+        shutil.rmtree(self.dir, ignore_errors=True)
+        self.write_day("2026-11-17", [self.line("2026-11-17T23:59:59Z", "d1.example.com")])
+        self.write_day("2026-11-18", [self.line("2026-11-18T10:00:02Z", "c.example.com"),
+                                      self.line("2026-11-18T10:00:00Z", "a.example.com"),
+                                      self.line("2026-11-18T10:00:01Z", "b.example.com")],
+                       raw_tail=b'not json\n{"time":"x"}\n{"time":"2026-11-18T11:00:00Z","host":"torn')
+        open(os.path.join(self.dir, "notes.txt"), "w").write(json.dumps(self.line("2026-11-18T12:00:00Z")) + "\n")
+        os.mkdir(os.path.join(self.dir, "2026-11-19.jsonl"))
+        hosts = lambda q="": [x["host"] for x in self.lines("/v1/log" + q)]
+        self.assertEqual(hosts(), ["d1.example.com", "a.example.com", "b.example.com", "c.example.com"])
+        self.assertEqual(hosts("?from=2026-11-18T10:00:01Z"), ["b.example.com", "c.example.com"])
+        # Offsets and fractions: 11:00:00.5+01:00 = 10:00:00.5Z, so 10:00:00 is before it.
+        self.assertEqual(hosts("?from=" + urllib.parse.quote("2026-11-18T11:00:00.5+01:00")),
+                         ["b.example.com", "c.example.com"])
+        self.assertEqual(hosts("?from=2026-11-18T10:00:00Z&limit=1"), ["a.example.com"])
+        self.assertEqual(hosts("?from=2026-11-19T00:00:00Z"), [])
+        self.assertEqual(hosts("?limit=10000"), hosts())
+        # No log at all: an empty answer.
+        shutil.rmtree(self.dir)
+        code, _, body = self.call()
+        self.assertEqual((code, body), (200, b""))
+
+    def test_log_endpoint_bad_queries(self):
+        for q in ("limit=0", "limit=10001", "limit=20000", "limit=-1", "limit=1.5", "limit=", "limit=abc",
+                  "from=2026-11-18", "from=2026-11-18T10:00:00", "from=yesterday", "from=",
+                  "from=2026-11-18T10:00:00+01:00",  # an unescaped + is a space
+                  "from=2026-13-40T10:00:00Z", "limit=1&limit=2", "since=2026-11-18T10:00:00Z", "x"):
+            with self.subTest(q=q):
+                self.assertEqual(self.call("/v1/log?" + q)[0], 400)
+
+    def test_log_endpoint_at_most_4_mib(self):
+        # 8 lines of ~1 MiB each: the answer stops at whole lines, ≤ 4 MiB.
+        shutil.rmtree(self.dir, ignore_errors=True)
+        big = "x" * (1 << 20)
+        self.write_day("2026-11-18", [self.line(f"2026-11-18T10:00:0{i}Z", ua=big) for i in range(8)])
+        code, _, body = self.call("/v1/log?limit=10000")
+        self.assertEqual(code, 200)
+        self.assertLessEqual(len(body), 4 << 20)
+        got = [json.loads(x) for x in body.split(b"\n") if x]
+        self.assertEqual(len(got), 3)
+        self.assertEqual([x["time"] for x in got], [f"2026-11-18T10:00:0{i}Z" for i in range(3)])
+
+    def test_log_endpoint_refuses_a_symlinked_day(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+        self.write_day("2026-11-18", [self.line("2026-11-18T10:00:00Z")])
+        secret = os.path.join(TMP, "secret.jsonl")
+        open(secret, "w").write(json.dumps(self.line("2026-11-19T10:00:00Z", "secret.example.com")) + "\n")
+        os.symlink(secret, os.path.join(self.dir, "2026-11-19.jsonl"))
+        code, _, body = self.call()
+        self.assertEqual(code, 500)
+        self.assertNotIn(b"secret.example.com", body)
+
+    def write_days(self, *ages):
+        today = datetime.datetime.now(datetime.timezone.utc).date()
+        names = {}
+        for age in ages:
+            day = (today - datetime.timedelta(days=age)).isoformat()
+            self.write_day(day, [self.line(day + "T10:00:00Z")])
+            names[age] = os.path.join(self.dir, day + ".jsonl")
+        return names
+
+    def test_prune_days(self):
+        names = self.write_days(9, 8, 7, 2, 0, -1)
+        other = os.path.join(self.dir, "notes.txt")
+        open(other, "w").close()
+        self.assertEqual(gg.OPENED_LOG.prune(7), 2)
+        self.assertEqual({a: os.path.exists(p) for a, p in names.items()},
+                         {9: False, 8: False, 7: True, 2: True, 0: True, -1: True})
+        self.assertTrue(os.path.exists(other))
+        # Today's file never goes, whatever the days.
+        self.assertEqual(gg.OPENED_LOG.prune(0), 2)
+        self.assertEqual(sorted(os.listdir(self.dir)), sorted([os.path.basename(names[0]), os.path.basename(names[-1]), "notes.txt"]))
+        # A missing log prunes nothing.
+        shutil.rmtree(self.dir)
+        self.assertEqual(gg.OPENED_LOG.prune(7), 0)
+
+    def test_prune_at_start_and_daily(self):
+        names = self.write_days(10, 1)
+        stop = threading.Event()
+        t = threading.Thread(target=gg.OPENED_LOG.prune_forever, args=(7, 0.05, stop), daemon=True)
+        t.start()
+        self.addCleanup(t.join, 2)
+        self.addCleanup(stop.set)
+        deadline = time.monotonic() + 2
+        while os.path.exists(names[10]) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(os.path.exists(names[10]))  # at start
+        again = self.write_days(30)[30]
+        deadline = time.monotonic() + 2
+        while os.path.exists(again) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertFalse(os.path.exists(again))  # on the next round
+        self.assertTrue(os.path.exists(names[1]))
+
+    def test_startup_refuses_bad_values(self):
+        for var, value in (("LOG_PORT", "x"), ("LOG_PORT", "0"), ("LOG_PORT", "70000"), ("LOG_PORT", str(gg.LISTEN_PORT)),
+                           ("OPENED_PRUNE_DAYS", "0"), ("OPENED_PRUNE_DAYS", "-3"), ("OPENED_PRUNE_DAYS", "seven")):
+            with self.subTest(var=var, value=value):
+                old = getattr(gg, var)
+                setattr(gg, var, value)
+                try:
+                    self.assertIsNotNone(gg.startup_problem())
+                finally:
+                    setattr(gg, var, old)
+        for var, value in (("LOG_PORT", "8091"), ("OPENED_PRUNE_DAYS", "365"), ("LOG_PORT", ""), ("OPENED_PRUNE_DAYS", "")):
+            old = getattr(gg, var)
+            setattr(gg, var, value)
+            try:
+                self.assertIsNone(gg.startup_problem())
+            finally:
+                setattr(gg, var, old)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

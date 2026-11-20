@@ -4,7 +4,9 @@
 // userspace WireGuard (wireguard-go + gVisor netstack): no capability, no
 // TUN device. It reads /vpn-doc/vpn.json (the vpn_doc volume) and
 // /link-doc/link.json (the link_doc volume; both Hub-written, public data
-// only) and writes wg_data/status.json.
+// only) and writes wg_data/status.json, which (Kubernetes HA only,
+// WG_STATUS_LISTEN) it also serves to the Hub on GET /v1/status
+// (statusport.go).
 //
 //	wg run            the service
 //	wg genkey <path>  write a new private key into <path> in place (0640); prints nothing
@@ -278,6 +280,9 @@ type config struct {
 	LinkPort                            int
 	LinkControl, LinkData               netip.AddrPort
 	LinkTLSKey, LinkTLSCert, LinkCAFile string
+	// StatusListen: the status port (contract §20.10, Kubernetes HA only),
+	// the pod's address and a port; invalid = zero = off.
+	StatusListen netip.AddrPort
 }
 
 const (
@@ -463,6 +468,19 @@ func loadConfig(getenv func(string) string) (*config, error) {
 			return nil, errors.New("WG_METRICS must be <host>:<port> or off")
 		}
 		c.Metrics = m
+	}
+	if v := getenv("WG_STATUS_LISTEN"); v != "" {
+		// The status port is for the Hub in Kubernetes HA (the chart sets
+		// it); under docker any address of wg is on a network a gateway or
+		// Traefik shares, so it is refused there.
+		a, err := netip.ParseAddrPort(v)
+		if c.AddrMode != "pod" {
+			return nil, errors.New("WG_STATUS_LISTEN needs WG_ADDR_MODE=pod (the Hub reads status.json on Docker)")
+		}
+		if err != nil || a.Addr() != c.VPNAddr || a.Port() == 0 {
+			return nil, errors.New("WG_STATUS_LISTEN must be the pod's <ipv4>:<port> (= WG_VPN_ADDR)")
+		}
+		c.StatusListen = a
 	}
 	if err := edgeLimits(getenv, c); err != nil {
 		return nil, err
@@ -652,6 +670,9 @@ func serve(ctx context.Context, cfg *config) error {
 	}
 	if cfg.Metrics != "" {
 		go serveMetrics(ctx, cfg, gatherer)
+	}
+	if cfg.StatusListen.IsValid() {
+		go serveStatusPort(ctx, cfg.StatusListen.String(), cfg.StatusFile)
 	}
 
 	build := func() status.Doc {

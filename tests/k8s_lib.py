@@ -81,7 +81,7 @@ def pod_specs(docs):
     """(name, namespace, labels, pod spec, annotations) of every pod the chart renders."""
     out = []
     for d in docs:
-        if d.get("kind") == "Deployment":
+        if d.get("kind") in ("Deployment", "StatefulSet"):
             t = d["spec"]["template"]
             out.append((d["metadata"]["name"], d["metadata"]["namespace"], t["metadata"].get("labels", {}), t["spec"], t["metadata"].get("annotations", {})))
         elif d.get("kind") == "Pod":

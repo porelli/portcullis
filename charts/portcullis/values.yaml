@@ -130,6 +130,13 @@ ha:
   # The node mesh pcmesh (§20.11): the nodeagents answer on :7443 there.
   meshCIDR: 10.215.0.0/24
   nodeadmNamespace: portcullis-nodeadm
+  # group-gate and mcp-gate in HA (contract §20.10): StatefulSets of this
+  # many replicas, each with its own log, served to the Hub on :8091 /
+  # :8092 (wg's status on :8093).
+  gateReplicas: 2
+  # group-gate prunes its own opened log to this many days in HA
+  # (GATE_OPENED_PRUNE_DAYS; the Hub's default history_days, contract §8.2).
+  openedPruneDays: 365
 
 # Content hashes of every synced ConfigMap / Secret (secrets/kube/applied.json):
 # pods carry portcullis.io/config-hash over the ones they mount, so a

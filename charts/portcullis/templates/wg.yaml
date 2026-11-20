@@ -42,6 +42,12 @@ the people key as a Secret file, vpn-doc read-only, no hub-data. */ -}}
     (dict "name" "key" "secret" (dict "secretName" "secrets-wg" "defaultMode" 288 "items" (list (dict "key" "people.key" "path" "people.key")))))
   "fsGroup" .Values.uids.wg
 -}}
+{{- if .Values.ha.enabled }}
+{{- /* HA (contract §20.10): status.json served to the Hub on :8093 (the
+pod's address; netpol-wg-edge.yaml admits the Hub alone there). */ -}}
+{{- $_ := set $s "env" (append $s.env (dict "name" "WG_STATUS_LISTEN" "value" "$(WG_POD_IP):8093")) }}
+{{- $_ = set $s "ports" (append $s.ports (dict "name" "status" "port" 8093)) }}
+{{- end }}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---
 # The gateways' edge (K5/K8): ports 9001–9047 → the wg pod, at a fixed

@@ -77,12 +77,18 @@ extraLabels (map), fsGroup, httpReady ({path, port}: a kube-only readiness
 httpGet for an image without a compose healthcheck — distroless —, so helm
 --wait and status see a crash loop; readiness only, never liveness;
 k8s_parity's delta kind kube-probe).
+statefulSet ({replicas, claims: [{name, uid, gid, mode, size?}]}): a
+StatefulSet instead (HA's per-replica logs, contract §20.10): `replicas`
+pods, each with its own PVC per claim (portcullis-core, the K3 owner
+annotations, kept when scaled down or deleted), spread over the nodes, a
+claim mounted by its name like a volume.
 */}}
 {{- define "portcullis.deployment" -}}
 {{- $root := .root -}}{{- $s := .s -}}
 {{- $ro := true -}}{{- if hasKey $s "readOnly" -}}{{- $ro = $s.readOnly -}}{{- end }}
+{{- $sts := $s.statefulSet }}
 apiVersion: apps/v1
-kind: Deployment
+kind: {{ ternary "StatefulSet" "Deployment" (not (empty $sts)) }}
 metadata:
   name: {{ $s.name }}
   namespace: {{ include "portcullis.ns" $root }}
@@ -90,9 +96,38 @@ metadata:
     app.kubernetes.io/managed-by: portcullis
     portcullis.io/component: {{ $s.name }}
 spec:
+  {{- if $sts }}
+  replicas: {{ $sts.replicas }}
+  serviceName: {{ $s.name }}
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  volumeClaimTemplates:
+    {{- range $sts.claims }}
+    - metadata:
+        name: {{ .name }}
+        labels:
+          app.kubernetes.io/managed-by: portcullis
+          portcullis.io/component: {{ $s.name }}
+        annotations:
+          portcullis.io/uid: {{ .uid | quote }}
+          portcullis.io/gid: {{ .gid | quote }}
+          portcullis.io/mode: {{ .mode | quote }}
+      spec:
+        storageClassName: portcullis-core
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .size | default "1Gi" }}
+    {{- end }}
+  {{- else }}
   replicas: 1
   strategy:
     type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       portcullis.io/component: {{ $s.name }}
@@ -127,6 +162,15 @@ spec:
       {{- with $s.dnsSearches }}
       dnsConfig:
         searches: {{ toJson . }}
+      {{- end }}
+      {{- if $sts }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              portcullis.io/component: {{ $s.name }}
       {{- end }}
       securityContext:
         runAsNonRoot: true
@@ -261,4 +305,42 @@ spec:
 - name: edge-{{ $n }}
   port: {{ add 9001 $n }}
 {{- end }}
+{{- end }}
+
+{{/*
+portcullis.haGate (dict "root" . "s" <spec> "uid" <data owner> "port" <log port> "env" [EnvVar]) — a
+gate's HA shape (contract §20.10), changing <spec> in place: a StatefulSet
+of ha.gateReplicas with its own `data` PVC per replica (instead of the
+shared one), the read-only log port, port-bound (portcullis.io/ingress:
+bound: netpol-gate-logs.yaml admits the Hub alone on the log port).
+*/}}
+{{- define "portcullis.haGate" -}}
+{{- $s := .s -}}
+{{- $vols := list -}}
+{{- range $s.volumes }}{{ if ne .name "data" }}{{ $vols = append $vols . }}{{ end }}{{ end -}}
+{{- $_ := set $s "volumes" $vols -}}
+{{- $_ = set $s "statefulSet" (dict "replicas" (int .root.Values.ha.gateReplicas) "claims" (list (dict "name" "data" "uid" .uid "gid" .root.Values.uids.hub "mode" "0750"))) -}}
+{{- $_ = set $s "env" (concat $s.env .env) -}}
+{{- $_ = set $s "ports" (append $s.ports (dict "name" "log" "port" .port)) -}}
+{{- $_ = set $s "extraLabels" (merge (dict "portcullis.io/ingress" "bound") ($s.extraLabels | default dict)) -}}
+{{- end }}
+
+{{/*
+portcullis.pdb <root> <name> — a PodDisruptionBudget keeping one pod of a
+replicated core service up (HA).
+*/}}
+{{- define "portcullis.pdb" -}}
+{{- $root := index . 0 -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ index . 1 }}
+  namespace: {{ include "portcullis.ns" $root }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      portcullis.io/component: {{ index . 1 }}
 {{- end }}

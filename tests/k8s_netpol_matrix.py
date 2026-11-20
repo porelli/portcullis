@@ -18,7 +18,11 @@ Constraints and K7, which replace a network for one port:
 Synthetic peers: an app pod, VPN gateway pods (slots 0, 1 and 46) in the
 apps namespace, an external address and a node address.
 
-HA (ha.enabled, contract §20.1 "Network flows", §20.8): the front door
+HA (ha.enabled, contract §20.1 "Network flows", §20.8, §20.10): the
+whole compose matrix again, with group-gate and mcp-gate port-bound (their
+gate port as compose says; the log ports group-gate :8091, mcp-gate :8092
+and wg :8093 admit the Hub pod alone, every other core pod, an app pod, a
+gateway and the internet denied). The front door
 reaches exactly nodeadm :8443, the nodeagents :7443 on the node mesh, the
 public internet on 443 and the API endpoints; only Prometheus reaches it
 (:9106); every other core pod, an app pod and the internet are denied both
@@ -151,10 +155,48 @@ def check_ha():
             F.add(f"ha: {src} → {dst}:{port}: {'allowed' if got else 'denied'}, want {'allowed' if want else 'denied'}")
 
 
+def check_log_ports():
+    """HA (contract §20.10): group-gate :8091, mcp-gate :8092 and wg :8093
+    admit the Hub alone — every other core pod, an app pod, a VPN gateway
+    and the internet are denied — and the Hub reaches each."""
+    docs = K.render({"ha": {"enabled": True}})
+    pols = K.by_kind(docs, "NetworkPolicy")
+    pods = {name: Peer(name, ns, labels) for name, ns, labels, _, _ in K.pod_specs(docs)}
+    others = [Peer("app", K.APPS_NS, {"portcullis.io/instance": "echo", "portcullis.io/service": "web"}),
+              Peer("gateway-0", K.APPS_NS, {"portcullis.io/instance": "hs", "portcullis.io/vpn-slot": "0"}),
+              Peer("external", None, {}, ip=EXTERNAL), Peer("node", None, {}, ip=NODE)]
+    for dst, port in (("group-gate", 8091), ("mcp-gate", 8092), ("wg", 8093)):
+        if dst not in pods:
+            F.add(f"ha: no {dst} pod")
+            continue
+        if not allowed(pols, pods["hub"], pods[dst], port):
+            F.add(f"ha: hub → {dst}:{port} denied")
+        for name, src in sorted(pods.items()):
+            if name != "hub" and allowed(pols, src, pods[dst], port):
+                F.add(f"ha: {name} → {dst}:{port} allowed (the Hub alone)")
+        for src in others:
+            if allowed(pols, src, pods[dst], port, ingress_only=src.ns == K.APPS_NS):
+                F.add(f"ha: {src} → {dst}:{port} allowed (the Hub alone)")
+        # Without HA the port isn't there and no policy names it.
+    for p in K.by_kind(K.render(), "NetworkPolicy"):
+        for rule in (p["spec"].get("ingress") or []) + (p["spec"].get("egress") or []):
+            if any(int(x.get("port", 0)) in (8091, 8092, 8093) for x in rule.get("ports") or []):
+                F.add(f"policy {p['metadata']['name']} names a log port without ha.enabled")
+
+
 def main():
     check_ha()
+    check_log_ports()
+    check_compose(K.render(), ha=False)
+    check_compose(K.render({"ha": {"enabled": True}}), ha=True)
+    return F.done()
+
+
+def check_compose(docs, ha):
+    """The compose network pairs (+ the port-bound rules); in HA the gates
+    are port-bound too (their gate port as compose, the log port the Hub's)."""
+    tag = "ha: " if ha else ""
     comp = K.compose()
-    docs = K.render()
     pols = K.by_kind(docs, "NetworkPolicy")
     pods = {}
     for name, ns, labels, spec, _ in K.pod_specs(docs):
@@ -176,6 +218,10 @@ def main():
         "grafana": {3000: {"traefik"}},
         "wg": {9100: {"prometheus"}},
     }
+    if ha:
+        bound["group-gate"] = {8080: "any", 8091: {"hub"}}
+        bound["mcp-gate"] = {8080: "any", 8092: {"hub"}}
+        bound["wg"][8093] = {"hub"}
     for src in sorted(nets):
         for dst in sorted(nets):
             if src == dst:
@@ -183,7 +229,7 @@ def main():
             for port, proto in pods[dst].ports:
                 if dst in bound:
                     b = bound[dst].get(port)
-                    if dst == "wg" and port != 9100:
+                    if dst == "wg" and port not in (9100, 8093):
                         want = False  # edge and people ports: no core pod
                     elif b == "any":
                         want = bool(nets[src] & nets[dst])
@@ -197,26 +243,26 @@ def main():
                     want = port == 8444
                 got = allowed(pols, pods[src], pods[dst], port, proto)
                 if got != want:
-                    F.add(f"{src} → {dst}:{port}/{proto}: {'allowed' if got else 'denied'}, compose says {'allowed' if want else 'denied'}")
+                    F.add(f"{tag}{src} → {dst}:{port}/{proto}: {'allowed' if got else 'denied'}, compose says {'allowed' if want else 'denied'}")
     # Synthetic peers.
     app = Peer("app", K.APPS_NS, {"portcullis.io/instance": "echo", "portcullis.io/service": "web"})
     gws = {n: Peer(f"gateway-{n}", K.APPS_NS, {"portcullis.io/instance": "hs", "portcullis.io/vpn-slot": str(n)}) for n in (0, 1, 46)}
     ext, node = Peer("external", None, {}, ip=EXTERNAL), Peer("node", None, {}, ip=NODE)
     for dst, port in [("traefik", 8000), ("traefik", 8443)]:
         if not allowed(pols, app, pods[dst], port, ingress_only=True) or not allowed(pols, ext, pods[dst], port):
-            F.add(f"an app pod / the internet can't reach {dst}:{port}")
+            F.add(f"{tag}an app pod / the internet can't reach {dst}:{port}")
     for dst in sorted(nets):
         for port, proto in pods[dst].ports:
             if dst == "traefik" and port in (8000, 8443):
                 continue
             if allowed(pols, app, pods[dst], port, proto, ingress_only=True):
-                F.add(f"an app pod reaches {dst}:{port}")
+                F.add(f"{tag}an app pod reaches {dst}:{port}")
             if dst == "wg" and port == 51820:
                 if not allowed(pols, ext, pods[dst], port, proto):
                     F.add("the internet can't reach wg's people port")
                 continue
             if allowed(pols, ext, pods[dst], port, proto):
-                F.add(f"the internet reaches {dst}:{port}")
+                F.add(f"{tag}the internet reaches {dst}:{port}")
     for n, gw in gws.items():
         for m in (0, 1, 46):
             got = allowed(pols, gw, pods["wg"], 9001 + m, ingress_only=True)
@@ -225,6 +271,8 @@ def main():
         if allowed(pols, gw, pods["wg"], 9100, ingress_only=True):
             F.add(f"gateway slot {n} reaches wg's metrics")
     for name, peer in pods.items():
+        if ha and name not in nets:
+            continue  # the HA-only pods (the front door): check_ha
         eg = peer.labels.get("portcullis.io/egress") == "true"
         if allowed(pols, peer, ext, 443) != eg:
             F.add(f"{name}: internet egress {'denied' if eg else 'allowed'} (portcullis.io/egress {eg})")
@@ -241,8 +289,7 @@ def main():
         for field, key in (("ingress", "from"), ("egress", "to")):
             for rule in p["spec"].get(field) or []:
                 if not rule.get(key):
-                    F.add(f"policy {p['metadata']['name']}: a {field} rule without {key}")
-    return F.done()
+                    F.add(f"{tag}policy {p['metadata']['name']}: a {field} rule without {key}")
 
 
 if __name__ == "__main__":

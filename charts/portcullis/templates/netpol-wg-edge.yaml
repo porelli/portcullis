@@ -1,7 +1,8 @@
 {{- /* wg (K5, K7, contract §16.1): the VPN networks as port-bound rules.
 Each edge port 9001+n admits only apps pods labelled
 portcullis.io/vpn-slot: "<n>"; the people UDP port admits anyone; metrics
-9100 admits Prometheus only; nothing else reaches wg. wg reaches Traefik's
+9100 admits Prometheus only; in HA the status port 8093 the Hub only
+(contract §20.10); nothing else reaches wg. wg reaches Traefik's
 vpnsecure 8444 only (plus the resolver upstreams: portcullis.io/egress),
 never the kube API. */ -}}
 {{- if .Values.wg.enabled }}
@@ -33,6 +34,16 @@ spec:
       ports:
         - protocol: TCP
           port: 9100
+    {{- end }}
+    {{- if .Values.ha.enabled }}
+    # HA: the status port (contract §20.10), the Hub alone.
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: hub
+      ports:
+        - protocol: TCP
+          port: 8093
     {{- end }}
     {{- range $n := until 47 }}
     - from:

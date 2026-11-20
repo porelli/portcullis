@@ -1,7 +1,9 @@
 {{- /* group-gate (compose: group-gate). /etc/group-gate is one projected
 volume (map.conf, revocation/, ca/: compose's four binds, no nested
 mounts); its revocation list updates in place. Its VPN mode comes from its own env
-(vpn.mode / vpn.publicEnrol): break-glass `vpn mode apps` with the Hub at 0. */ -}}
+(vpn.mode / vpn.publicEnrol): break-glass `vpn mode apps` with the Hub at 0.
+HA (contract §20.10): a StatefulSet, one opened log per replica, served to
+the Hub on :8091 and pruned by the gate itself (portcullis.haGate). */ -}}
 {{- $s := dict
   "name" "group-gate" "uid" .Values.uids.groupGate "gid" .Values.uids.groupGate
   "groups" (list .Values.uids.hub .Values.uids.vpnDoc)
@@ -41,9 +43,18 @@ mounts); its revocation list updates in place. Its VPN mode comes from its own e
     (dict "name" "data" "persistentVolumeClaim" (dict "claimName" "group-gate-data"))
     (dict "name" "tmp" "emptyDir" (dict "medium" "Memory")))
 -}}
+{{- if .Values.ha.enabled }}
+{{- include "portcullis.haGate" (dict "root" . "s" $s "uid" .Values.uids.groupGate "port" 8091 "env" (list
+  (dict "name" "GATE_LOG_PORT" "value" "8091")
+  (dict "name" "GATE_OPENED_PRUNE_DAYS" "value" (.Values.ha.openedPruneDays | toString)))) }}
+{{- end }}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---
+{{- if .Values.ha.enabled }}
+{{ include "portcullis.pdb" (list . "group-gate") }}
+{{- else }}
 {{ include "portcullis.pvc" (list . "group-gate-data" .Values.uids.groupGate .Values.uids.hub "0750") }}
+{{- end }}
 ---
 apiVersion: v1
 kind: Service

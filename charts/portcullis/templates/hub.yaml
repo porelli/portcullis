@@ -96,6 +96,18 @@ every up / upgrade) is read-only at /run/portcullis/cluster-check. */ -}}
     (dict "name" "home" "emptyDir" (dict "medium" "Memory")))
   "fsGroup" .Values.uids.hub
 -}}
+{{- if .Values.ha.enabled }}
+{{- /* HA (contract §20.10): the gates' logs and wg's status are per
+replica, read over their log ports (HUB_GATE_LOG_SOURCES=http): no mount
+of group-gate-data, mcp-gate-data or wg-data, and the gates prune their
+own logs. */ -}}
+{{- $drop := list "group-gate-data" "mcp-gate-data" "wg-data" }}
+{{- $m := list }}{{- range $s.mounts }}{{- if not (has .name $drop) }}{{- $m = append $m . }}{{- end }}{{- end }}
+{{- $v := list }}{{- range $s.volumes }}{{- if not (has .name $drop) }}{{- $v = append $v . }}{{- end }}{{- end }}
+{{- $_ := set $s "mounts" $m }}
+{{- $_ = set $s "volumes" $v }}
+{{- $_ = set $s "env" (append $s.env (dict "name" "HUB_GATE_LOG_SOURCES" "value" "http")) }}
+{{- end }}
 {{ include "portcullis.deployment" (dict "root" . "s" $s) }}
 ---
 {{ include "portcullis.pvc" (list . "hub-data" .Values.uids.hub .Values.uids.hub "0750") }}

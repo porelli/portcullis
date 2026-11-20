@@ -1,0 +1,105 @@
+{{- /* HA only (contract §20.10, §20.1 "Network flows"): the per-replica log
+ports. group-gate :8091, mcp-gate :8092 and wg :8093 have no auth of their
+own (a stated delta in hardening.md), so only the Hub pod may reach them.
+The gates are port-bound in HA (portcullis.io/ingress: bound, so the
+net-*-ingress policies, which admit every port, don't select them): their
+gate port admits their compose networks' members exactly as before, the
+log port the Hub alone. wg's is in netpol-wg-edge.yaml. */ -}}
+{{- if .Values.ha.enabled }}
+{{- $ns := .Release.Namespace }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: group-gate-ingress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: group-gate
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/net-portcullis: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: hub
+      ports:
+        - protocol: TCP
+          port: 8091
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-gate-ingress
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: mcp-gate
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/net-portcullis-mcp: "true"
+        - podSelector:
+            matchLabels:
+              portcullis.io/net-portcullis-proxy: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+    - from:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: hub
+      ports:
+        - protocol: TCP
+          port: 8092
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: hub-to-log-ports
+  namespace: {{ $ns }}
+  labels:
+    app.kubernetes.io/managed-by: portcullis
+spec:
+  podSelector:
+    matchLabels:
+      portcullis.io/component: hub
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: group-gate
+      ports:
+        - protocol: TCP
+          port: 8091
+    - to:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: mcp-gate
+      ports:
+        - protocol: TCP
+          port: 8092
+    {{- if .Values.wg.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              portcullis.io/component: wg
+      ports:
+        - protocol: TCP
+          port: 8093
+    {{- end }}
+{{- end }}
