@@ -106,7 +106,7 @@ func (s *Server) handleRenew(w http.ResponseWriter, r *http.Request) error {
 	}
 	if err := s.enroll.Revoke(ctx, oldSerial); err != nil {
 		// The record no longer accepts it (the serial moved); the revoke is
-		// retried by reconcile (PendingRevoke).
+		// retried by reconcile (PendingRevokes).
 		s.log.Warn("the renewed certificate's predecessor isn't revoked yet (retried)", "server_id", id, "serial", oldSerial)
 		if qerr := s.queueRevoke(context.WithoutCancel(ctx), id, oldSerial); qerr != nil {
 			s.log.Error("couldn't queue a renewed-away certificate for revocation", "server_id", id, "serial", oldSerial)

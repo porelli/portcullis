@@ -66,12 +66,8 @@ type nodeRecord struct {
 	// generation no longer holds its mesh address.
 	Removed bool `json:"removed,omitempty"`
 	// TokensStale: a removed node a rotation skipped (it keeps old tokens).
-	TokensStale bool `json:"tokens_stale,omitempty"`
-	// PendingRevoke: serials still to revoke through enroll (a removed
-	// node's, a renewed-away one, a refused renewal's); the record is never
-	// dropped while one is left.
-	PendingRevoke []string       `json:"pending_revoke,omitempty"`
-	Addrs         *NodeAddresses `json:"addrs,omitempty"`
+	TokensStale bool           `json:"tokens_stale,omitempty"`
+	Addrs       *NodeAddresses `json:"addrs,omitempty"`
 	// TokenIDs: the bootstrap tokens issued to it (a revoke deletes them).
 	TokenIDs []string `json:"token_ids,omitempty"`
 	// Releases: how many times the join material went out (either role).
@@ -87,10 +83,22 @@ type nodeadmState struct {
 	// OwnSerials: nodeadm's own node-nodeadm certificates; the leader
 	// revokes every one but the current (review M11).
 	OwnSerials []string `json:"own_serials,omitempty"`
+	// PendingRevokes: every node-cluster serial still to revoke through
+	// enroll (a removed node's, a renewed-away one, a refused renewal's),
+	// by serial. Independent of the node records (a re-enrolment or a
+	// dropped record never touches it); reconcile retries it until each is
+	// revoked.
+	PendingRevokes map[string]*pendingRevoke `json:"pending_revokes,omitempty"`
+}
+
+type pendingRevoke struct {
+	NodeID   string    `json:"node_id"`
+	QueuedAt time.Time `json:"queued_at"`
 }
 
 func newState() *nodeadmState {
-	return &nodeadmState{V: 1, Codes: map[string]*codeRecord{}, Nodes: map[string]*nodeRecord{}, Ops: map[string]*revokeOp{}}
+	return &nodeadmState{V: 1, Codes: map[string]*codeRecord{}, Nodes: map[string]*nodeRecord{}, Ops: map[string]*revokeOp{},
+		PendingRevokes: map[string]*pendingRevoke{}}
 }
 
 func (st *nodeadmState) clone() *nodeadmState {
@@ -105,6 +113,9 @@ func (st *nodeadmState) clone() *nodeadmState {
 	}
 	if out.Ops == nil {
 		out.Ops = map[string]*revokeOp{}
+	}
+	if out.PendingRevokes == nil {
+		out.PendingRevokes = map[string]*pendingRevoke{}
 	}
 	return out
 }

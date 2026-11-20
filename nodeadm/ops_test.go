@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -611,7 +612,7 @@ func TestForgetMarksFirst(t *testing.T) {
 		t.Fatal("forget with enroll down didn't report it")
 	}
 	r := h.state(t).Nodes["n4"]
-	if !r.Removed || r.Serial != "" || !slices.Equal(r.PendingRevoke, []string{serial}) {
+	if !r.Removed || r.Serial != "" || !slices.Equal(pending(h.state(t)), []string{serial}) {
 		t.Fatalf("not marked first: %+v", r)
 	}
 	if w := h.join(t, j, nearRTT); w.Code != 403 {
@@ -619,8 +620,8 @@ func TestForgetMarksFirst(t *testing.T) {
 	}
 	h.enroll.fail = nil
 	h.s.dropRemoved(context.Background(), h.state(t))
-	if r := h.state(t).Nodes["n4"]; r == nil || len(r.PendingRevoke) != 0 || !slices.Contains(h.enroll.revoked, serial) {
-		t.Fatalf("the revoke wasn't retried: %+v %v", r, h.enroll.revoked)
+	if len(pending(h.state(t))) != 0 || !slices.Contains(h.enroll.revoked, serial) {
+		t.Fatalf("the revoke wasn't retried: %v %v", pending(h.state(t)), h.enroll.revoked)
 	}
 }
 
@@ -873,21 +874,22 @@ func TestPendingRevokesSurviveEnrollOutage(t *testing.T) {
 	}
 	st := h.state(t)
 	cur := st.Nodes["n5"].Serial
-	pend := st.Nodes["n5"].PendingRevoke
+	pend := pending(st)
 	if len(pend) != 2 || !slices.Contains(pend, oldSerial) || slices.Contains(pend, cur) {
 		t.Fatalf("queued %v (want the old serial and the losing renewal's, not the current %s)", pend, cur)
 	}
 	if err := h.s.forget(ctx, "n5", nil); err == nil {
 		t.Fatal("forget with enroll unable to revoke didn't report it")
 	}
-	if r := h.state(t).Nodes["n5"]; !r.Removed || len(r.PendingRevoke) != 3 || !slices.Contains(r.PendingRevoke, cur) {
-		t.Fatalf("after forget: %+v", r)
+	if r := h.state(t).Nodes["n5"]; !r.Removed || len(pending(h.state(t))) != 3 || !slices.Contains(pending(h.state(t)), cur) {
+		t.Fatalf("after forget: %+v %v", r, pending(h.state(t)))
 	}
-	// Still down: never dropped (the active params no longer hold it).
+	// Still down: the queue survives reconciles and the record's drop.
 	h.s.dropRemoved(ctx, h.state(t))
+	h.putState(t, func(st *nodeadmState) { delete(st.Nodes, "n5") })
 	h.s.dropRemoved(ctx, h.state(t))
-	if h.state(t).Nodes["n5"] == nil {
-		t.Fatal("a record with pending revokes was dropped")
+	if len(pending(h.state(t))) != 3 {
+		t.Fatalf("the queue lost serials: %v", pending(h.state(t)))
 	}
 	// Enroll back: all revoked, then the record may go.
 	h.enroll.revokeFail = nil
@@ -897,7 +899,52 @@ func TestPendingRevokesSurviveEnrollOutage(t *testing.T) {
 			t.Fatalf("%s never revoked: %v", sr, h.enroll.revoked)
 		}
 	}
-	if r := h.state(t).Nodes["n5"]; r != nil && len(r.PendingRevoke) != 0 {
-		t.Fatalf("still pending: %v", r.PendingRevoke)
+	if p := pending(h.state(t)); len(p) != 0 {
+		t.Fatalf("still pending: %v", p)
+	}
+}
+
+func pending(st *nodeadmState) []string {
+	var out []string
+	for sr := range st.PendingRevokes {
+		out = append(out, sr)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TestPendingRevokeSurvivesReEnrol (fix round 8): a serial queued while
+// enroll can't revoke survives the node's re-enrolment under the same id
+// (a new record); enroll back, the old serial is revoked, the new one kept.
+func TestPendingRevokeSurvivesReEnrol(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	j := h.issue(t, "n5", "agent", "home", "main", "10.215.0.5")
+	if w := h.enrol(t, j, ""); w.Code != 200 {
+		t.Fatalf("enrol: %d", w.Code)
+	}
+	old := h.state(t).Nodes["n5"].Serial
+	h.enroll.revokeFail = errors.New("vault sealed")
+	if err := h.s.forget(ctx, "n5", nil); err == nil {
+		t.Fatal("forget with enroll down didn't report it")
+	}
+	// The removed record leaves (as reconcile drops it); the same id enrols
+	// again: a new record.
+	h.putState(t, func(st *nodeadmState) { delete(st.Nodes, "n5") })
+	j2 := h.issue(t, "n5", "agent", "home", "main", "10.215.0.5")
+	if w := h.enrol(t, j2, ""); w.Code != 200 {
+		t.Fatalf("re-enrol: %d %s", w.Code, w.Body)
+	}
+	cur := h.state(t).Nodes["n5"].Serial
+	if cur == old || !slices.Equal(pending(h.state(t)), []string{old}) {
+		t.Fatalf("after the re-enrolment: current %s, pending %v (want %s)", cur, pending(h.state(t)), old)
+	}
+	h.enroll.revokeFail = nil
+	h.s.dropRemoved(ctx, h.state(t))
+	if !slices.Contains(h.enroll.revoked, old) || slices.Contains(h.enroll.revoked, cur) || len(pending(h.state(t))) != 0 {
+		t.Fatalf("revoked %v (want %s, not %s), pending %v", h.enroll.revoked, old, cur, pending(h.state(t)))
+	}
+	if r := h.state(t).Nodes["n5"]; r == nil || r.Removed || r.Serial != cur {
+		t.Fatalf("the re-enrolled record changed: %+v", r)
 	}
 }

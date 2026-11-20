@@ -286,15 +286,14 @@ func (s *Server) reconcile(ctx context.Context) {
 // address.
 func (s *Server) dropRemoved(ctx context.Context, st *nodeadmState) {
 	var gone []string
-	for id, r := range st.Nodes {
-		if len(r.PendingRevoke) > 0 {
-			// Revokes enroll refused: retried here; the record is never
-			// dropped while one is left.
-			if err := s.revokePending(ctx, id); err != nil {
-				s.log.Warn("a node's certificate isn't revoked yet (retried)", "node", id)
-			}
-			continue
+	// Revokes enroll refused: retried here, until each is revoked
+	// (PendingRevokes is independent of the records dropped below).
+	if len(st.PendingRevokes) > 0 {
+		if err := s.revokePending(ctx, ""); err != nil {
+			s.log.Warn("node certificates aren't revoked yet (retried)", "pending", len(st.PendingRevokes))
 		}
+	}
+	for id, r := range st.Nodes {
 		if !r.Removed || st.Ops[id] != nil {
 			continue
 		}
@@ -311,7 +310,7 @@ func (s *Server) dropRemoved(ctx context.Context, st *nodeadmState) {
 	}
 	if err := s.mutate(ctx, func(st *nodeadmState) error {
 		for _, id := range gone {
-			if r := st.Nodes[id]; r != nil && r.Removed && len(r.PendingRevoke) == 0 && st.Ops[id] == nil {
+			if r := st.Nodes[id]; r != nil && r.Removed && st.Ops[id] == nil {
 				delete(st.Nodes, id)
 			}
 		}
