@@ -192,7 +192,8 @@ def check_nodeadm():
     """nodeadm (contract §20.1 "Network flows"; nodeadm.enabled): only the
     Hub and the front door reach its :8443, only Traefik its :8080, only
     Prometheus its :9105; it reaches only enroll :8444, the node mesh's
-    :7443 / :2379 / :6443, the API endpoints and kube-dns."""
+    :7443 / :6443 (no etcd :2379: review I6), the API endpoints and
+    kube-dns."""
     for ha in (False, True):
         docs = K.render({"ha": {"enabled": ha}, "nodeadm": {"enabled": True, "image": "ghcr.io/porelli/portcullis-nodeadm@sha256:" + "4" * 64}})
         pols = K.by_kind(docs, "NetworkPolicy")
@@ -215,7 +216,7 @@ def check_nodeadm():
                     rows.append((peer, na, port, name in who))
             rows += [(app, na, port, False), (ext, na, port, False)]
         rows += [(ingress_traefik, na, 8080, True), (ingress_traefik, na, 8443, False)]
-        rows += [(na, pods["enroll"], 8444, True), (na, agent, 7443, True), (na, agent, 2379, True), (na, agent, 6443, True),
+        rows += [(na, pods["enroll"], 8444, True), (na, agent, 7443, True), (na, agent, 2379, False), (na, agent, 6443, True),
                  (na, agent, 22, False), (na, ext, 443, False), (na, node, 10250, False), (na, app, 80, False)]
         for name, peer in sorted(pods.items()):
             for port, proto in peer.ports:

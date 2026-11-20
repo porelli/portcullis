@@ -259,20 +259,17 @@ func setupCase(t *testing.T, vs *apiVectors, c apiCase) (*harness, []byte, map[s
 		})
 	case "DELETE /v1/nodes/{id}?mode=revoke":
 		if strings.Contains(st, "1 of 3 healthy") {
-			for i := 1; i < len(h.etcd.members); i++ {
-				h.etcd.members[i].Healthy = false
+			for _, id := range []string{"n2", "n3"} {
+				n, _ := h.kube.CoreV1().Nodes().Get(ctx, id, metav1.GetOptions{})
+				for i := range n.Status.Conditions {
+					if n.Status.Conditions[i].Type == corev1.NodeReady {
+						n.Status.Conditions[i].Status = corev1.ConditionFalse
+					}
+				}
+				h.kube.CoreV1().Nodes().Update(ctx, n, metav1.UpdateOptions{})
 			}
 		}
-		h.agents.onRotate = func(_, step, tok string) {
-			h.boot.mu.Lock()
-			switch step {
-			case "rotate":
-				h.boot.current = tok
-			case "rotate-agent":
-				h.boot.agent = tok
-			}
-			h.boot.mu.Unlock()
-		}
+		h.agents.onRotate = h.bootFollows
 	}
 	return h, body, hdr
 }
@@ -430,8 +427,8 @@ func checkCaseEffects(t *testing.T, h *harness, c apiCase) {
 		if _, err := h.kube.CoreV1().Nodes().Get(ctx, "n3", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 			t.Errorf("n3 still there")
 		}
-		if len(h.etcd.removed) != 1 || h.etcd.removed[0] != 3 {
-			t.Errorf("etcd removed %v", h.etcd.removed)
+		if !slices.Equal(h.agents.etcdRm, []string{"n1:n3:10.215.0.3"}) {
+			t.Errorf("etcd removed %v", h.agents.etcdRm)
 		}
 		if want := []string{"rotate:n1", "rotate-agent:n1", "apply:n1", "apply-agent:n1", "apply:n2", "apply-agent:n2", "apply:n4"}; !slices.Equal(h.agents.rotations, want) {
 			t.Errorf("rotations %v, want %v", h.agents.rotations, want)

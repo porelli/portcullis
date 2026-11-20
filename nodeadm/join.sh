@@ -20,10 +20,13 @@ die() { printf 'join.sh: %s\n' "$1" >&2; exit "${2:-1}"; }
 
 AGENT_DIR=/usr/local/lib/portcullis
 code_file=""
+parent_work=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --code-file) [ $# -ge 2 ] || die "--code-file needs a path" 2; code_file="$2"; shift 2 ;;
     --code-file=*) code_file="${1#--code-file=}"; shift ;;
+    # Internal: the verified copy run by a piped one (its work dir goes too).
+    --parent-work) [ $# -ge 2 ] || die "--parent-work needs a path" 2; parent_work="$2"; shift 2 ;;
     -h|--help) sed -n '2,7p' "$0" 2>/dev/null || true; exit 0 ;;
     *) die "unknown argument (the join code is a secret: paste it when asked, or use --code-file)" 2 ;;
   esac
@@ -39,8 +42,13 @@ tty_echo_off=false
 cleanup() {
   if [ "$tty_echo_off" = true ]; then stty echo </dev/tty 2>/dev/null || true; fi
   rm -rf "$work"
+  if [ -n "$parent_work" ]; then rm -rf "$parent_work"; fi
 }
 trap cleanup EXIT
+if [ -n "$parent_work" ]; then
+  case "$parent_work" in /tmp/portcullis-join.??????) ;; *) die "--parent-work isn't a join work directory" 2 ;; esac
+  [ -d "$parent_work" ] && [ ! -L "$parent_work" ] && [ "$(stat -c '%a %u' "$parent_work")" = "700 0" ] || die "--parent-work isn't a join work directory" 2
+fi
 trap 'exit 130' INT TERM HUP
 
 # The code: from the 0600 root-owned file, else from the terminal.
@@ -74,15 +82,20 @@ agents="$(printf '%s' "$json" | sed -n 's/.*"agent_sha256":{\([^}]*\)}.*/\1/p')"
 unset json b64 code
 case "$endpoint" in https://*/node) ;; *) die "the join code's endpoint isn't https://<domain>/node" ;; esac
 
-# This script's own sha256 (piped into sh it has no file: the served copy
-# is fetched and checked, then run from that file).
+# This script's own sha256. Run from a file, that file is checked. Piped
+# into sh it has no file: the served copy is fetched, checked, and that
+# verified copy runs the rest (exec, with the code in its 0600 file), so
+# the code that installs anything is the code that was checked (review M4).
 self=""
 case "$0" in */*) [ -f "$0" ] && self="$0" ;; esac
-if [ -z "$self" ] || [ "$(sha256sum "$self" | cut -d' ' -f1)" != "$script_sha" ]; then
+if [ -z "$self" ]; then
+  [ -z "$parent_work" ] || die "the verified copy has no file" 2
   curl -fsSL --proto '=https' --tlsv1.2 -o "$work/join.sh" "$endpoint/join.sh" || die "could not download $endpoint/join.sh"
-  self="$work/join.sh"
+  [ "$(sha256sum "$work/join.sh" | cut -d' ' -f1)" = "$script_sha" ] || die "join.sh doesn't match the join code's script_sha256: nothing was installed"
+  trap - EXIT
+  exec sh "$work/join.sh" --code-file "$work/code" --parent-work "$work"
 fi
-[ "$(sha256sum "$self" | cut -d' ' -f1)" = "$script_sha" ] || die "join.sh doesn't match the join code's script_sha256: nothing was installed"
+[ "$(sha256sum "$self" | cut -d' ' -f1)" = "$script_sha" ] || die "join.sh doesn't match the join code's script_sha256: nothing was installed (download it again from $endpoint/join.sh)"
 
 case "$(uname -m)" in
   x86_64|amd64) arch=amd64 ;;

@@ -47,9 +47,10 @@ jobs:
       EVENT: ${{ github.event_name }}
       BEFORE: ${{ github.event.before }}
       # nodeadm's nodeagent binaries (its Dockerfile's `nodeagent` build
-      # context): the Hub's image, pinned by digest at the Hub merge (plan
-      # Task 36, ruling P20).
-      NODEAGENT_IMAGE: ghcr.io/porelli/portcullis-nodeagent:edge
+      # context): the Hub's image <repo>:<tag>@sha256:<digest>, pinned at the
+      # Hub merge (plan Task 36, ruling P20). Empty until then: the nodeadm
+      # image isn't built (no unpinned build context, ever).
+      NODEAGENT_IMAGE: ""
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -66,6 +67,14 @@ jobs:
              && git cat-file -e "$BEFORE^{commit}" 2>/dev/null \
              && git diff --quiet "$BEFORE" "$GITHUB_SHA" -- "$SVC" .github/workflows/images.yml; then
             go=false
+          fi
+          if [ "$SVC" = nodeadm ] && [ "$go" = true ]; then
+            if [ -z "$NODEAGENT_IMAGE" ]; then
+              echo "::notice::nodeadm isn't built: NODEAGENT_IMAGE is empty until the nodeagent image is pinned (plan Task 36)"
+              go=false
+            elif ! [[ "$NODEAGENT_IMAGE" =~ ^ghcr\.io/porelli/portcullis-nodeagent:[A-Za-z0-9._-]+@sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::NODEAGENT_IMAGE must be ghcr.io/porelli/portcullis-nodeagent:<tag>@sha256:<digest>"; exit 1
+            fi
           fi
           push=false
           if [ "$go" = true ] && [ "$ON_MAIN" = true ]; then push=true; fi

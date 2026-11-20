@@ -1,9 +1,9 @@
 {
-  "_comment": "Pod Security Admission levels of the six namespaces: [enforce, warn, audit]. The one source: ./portcullis (kube_cluster_setup, status) applies and checks them, templates/namespaces.yaml renders them for kubeconform. apps and storage enforce privileged (root one-shots / the storage helpers' hostPath; their admission policies pin what runs there), warn / audit baseline; ingress (NEW, HA) enforces privileged (Traefik's hostPort 80/443; portcullis-ingress-pods admits only its DaemonSet's pod shape), warn / audit baseline; nodeadm (NEW, HA) enforces privileged (its init container reads the server's etcd client key from a read-only hostPath as root), warn / audit baseline.",
+  "_comment": "Pod Security Admission levels of the six namespaces: [enforce, warn, audit]. The one source: ./portcullis (kube_cluster_setup, status) applies and checks them, templates/namespaces.yaml renders them for kubeconform. apps and storage enforce privileged (root one-shots / the storage helpers' hostPath; their admission policies pin what runs there), warn / audit baseline; ingress (NEW, HA) enforces privileged (Traefik's hostPort 80/443; portcullis-ingress-pods admits only its DaemonSet's pod shape), warn / audit baseline; nodeadm (NEW, HA) is restricted (it holds no etcd key and mounts nothing of the host).",
   "core": ["restricted", "restricted", "restricted"],
   "apps": ["privileged", "baseline", "baseline"],
   "storage": ["privileged", "baseline", "baseline"],
   "edge": ["restricted", "restricted", "restricted"],
   "ingress": ["privileged", "baseline", "baseline"],
-  "nodeadm": ["privileged", "baseline", "baseline"]
+  "nodeadm": ["restricted", "restricted", "restricted"]
 }

@@ -1,0 +1,18 @@
+{
+  "_comment": "The node address rule shared by nodeadm (lanCheck / the enrolment report / cleanAddrs) and the CLI (kube_doc_addresses): strict IPv4 only (the cluster is IPv4 single-stack: octets 0-255, no leading zero, no zone, no IPv6, no IPv4-mapped IPv6). Each value is a unicast LAN address outside the cluster's networks when it's IPv4, so accept is the IPv4 rule alone (review I4).",
+  "vectors": [
+    {"address": "192.0.2.10", "accept": true},
+    {"address": "192.168.7.9", "accept": true},
+    {"address": "172.16.0.1", "accept": true},
+    {"address": "2001:db8::1", "accept": false},
+    {"address": "fd00::1", "accept": false},
+    {"address": "::ffff:192.0.2.10", "accept": false},
+    {"address": "192.0.2.10%eth0", "accept": false},
+    {"address": "198.51.100.300", "accept": false},
+    {"address": "010.1.2.3", "accept": false},
+    {"address": "192.0.2", "accept": false},
+    {"address": " 192.0.2.10", "accept": false},
+    {"address": "192.0.2.10/32", "accept": false},
+    {"address": "", "accept": false}
+  ]
+}

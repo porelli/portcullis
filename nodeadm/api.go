@@ -32,6 +32,7 @@ const (
 	textProof     = "the join code's proof doesn't match"
 	textUnsigned  = "the join request isn't signed by the node"
 	textMesh      = "the node mesh isn't ready yet: retry"
+	textRate      = "too many requests: retry in a minute"
 	textMode      = "mode must be cooperative or revoke"
 	textAdmission = "waiting for the admission params to include this node: retry"
 	textNoQuorum  = "etcd has no quorum: the member can't be removed"
@@ -62,6 +63,7 @@ var (
 	errProof     = errKind(http.StatusForbidden, "proof_invalid", textProof)
 	errUnsigned  = errPlain(http.StatusForbidden, textUnsigned)
 	errMesh      = errKind(http.StatusConflict, "mesh_pending", textMesh)
+	errRate      = errPlain(http.StatusTooManyRequests, textRate)
 	// errWaitAdmission (ruling R-ADM): the CLI's params-sync hasn't put the
 	// node's addresses into the active admission params yet.
 	errWaitAdmission = errKind(http.StatusConflict, "waiting_admission", textAdmission)
@@ -173,6 +175,10 @@ func (s *Server) internal(write, frontdoor bool, h func(w http.ResponseWriter, r
 // public wraps a public route (no client certificate; Traefik in front).
 func (s *Server) public(write bool, h func(w http.ResponseWriter, r *http.Request) error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if write && !s.limit.allow(sourceIP(r)) {
+			s.writeErr(w, r, errRate)
+			return
+		}
 		if write && !s.leader.Leading() {
 			s.writeErr(w, r, errNotLeader)
 			return

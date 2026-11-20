@@ -30,8 +30,8 @@ func (s *Server) publicPolicy() AddrPolicy {
 // lanCheck is nil for an address a node may report as its LAN address.
 func (s *Server) lanCheck(value string) error {
 	ip, err := netip.ParseAddr(value)
-	if err != nil || ip.Zone() != "" || ip.Is4In6() || ip.String() != value {
-		return fmt.Errorf("%q is not an IPv4 or IPv6 address", value)
+	if err != nil || !ip.Is4() || ip.String() != value {
+		return fmt.Errorf("%q is not an IPv4 address (the cluster is IPv4 single-stack)", value)
 	}
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() ||
 		ip.IsInterfaceLocalMulticast() || (ip.Is4() && ip.As4() == [4]byte{255, 255, 255, 255}) {
@@ -55,7 +55,7 @@ func (s *Server) cleanAddrs(a NodeAddresses) NodeAddresses {
 	}
 	pol := s.publicPolicy()
 	for _, p := range a.Public {
-		if pol.Check(p) == nil {
+		if ip, err := netip.ParseAddr(p); err == nil && ip.Is4() && pol.Check(p) == nil {
 			out.Public = append(out.Public, p)
 		}
 	}
@@ -139,6 +139,9 @@ func (s *Server) checkReport(m MeshReport, id string, cl []clusterNode, st *node
 		ap, err := netip.ParseAddrPort(*m.Public)
 		if err != nil || ap.Port() == 0 {
 			return out, fmt.Errorf("the public endpoint isn't an address:port")
+		}
+		if !ap.Addr().Is4() {
+			return out, fmt.Errorf("the public endpoint %s isn't IPv4 (the cluster is IPv4 single-stack)", ap.Addr())
 		}
 		if err := s.publicPolicy().Check(ap.Addr().String()); err != nil {
 			return out, fmt.Errorf("the public endpoint: %v", err)

@@ -21,10 +21,9 @@ RUN apk add --no-cache ca-certificates \
 COPY --from=builder /nodeadm /usr/local/bin/nodeadm
 COPY --from=nodeagent --chmod=0444 /nodeagent-linux-amd64 /usr/local/lib/portcullis/nodeagent-amd64
 COPY --from=nodeagent --chmod=0444 /nodeagent-linux-arm64 /usr/local/lib/portcullis/nodeagent-arm64
-# Non-root (the chart's init container alone runs as root, to copy the
-# server's etcd client key). Reads the enroll bearer and the etcd copies
-# (group 10010), writes nothing on disk: its state is the Secret
-# nodeadm-state, its own key stays in memory.
+# Non-root, restricted. Reads the enroll bearer (group 10010), writes
+# nothing on disk: its state is the Secret nodeadm-state, its own key stays
+# in memory. No etcd key (an etcd member removal is a nodeagent op).
 USER 10010:10010
 EXPOSE 8080 8443 9105
 ENTRYPOINT ["nodeadm"]

@@ -462,7 +462,7 @@ func secretFlow(t *testing.T) (*harness, []string, [][]byte) {
 func TestJoinNeverLogsSecrets(t *testing.T) {
 	h, secrets, answers := secretFlow(t)
 	logs := h.logs.String()
-	if !strings.Contains(logs, "token_id=") || !strings.Contains(logs, "server and agent tokens rotated") {
+	if !strings.Contains(logs, "token_id=") || !strings.Contains(logs, "step=done") {
 		t.Fatalf("the flow didn't run through: %s", logs)
 	}
 	for _, sc := range secrets {
@@ -553,14 +553,7 @@ func TestRevokeRotatesServerToken(t *testing.T) {
 	h.putState(t, func(st *nodeadmState) {
 		st.Nodes["n2"] = &nodeRecord{Role: "server", Serial: "12:34", MeshIP: "10.215.0.2"}
 	})
-	h.agents.onRotate = func(_, step, tok string) {
-		switch step {
-		case "rotate":
-			h.boot.current = tok
-		case "rotate-agent":
-			h.boot.agent = tok
-		}
-	}
+	h.agents.onRotate = h.bootFollows
 	w := h.internal(clientHub, "DELETE", "/v1/nodes/n2?mode=revoke", nil)
 	if w.Code != 204 {
 		t.Fatalf("revoke: %d %s", w.Code, w.Body)
@@ -568,8 +561,8 @@ func TestRevokeRotatesServerToken(t *testing.T) {
 	if _, err := h.kube.CoreV1().Nodes().Get(ctx, "n2", metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatal("n2 still there")
 	}
-	if !slices.Equal(h.etcd.removed, []uint64{2}) || !slices.Equal(h.enroll.revoked, []string{"12:34"}) {
-		t.Fatalf("etcd %v, revoked %v", h.etcd.removed, h.enroll.revoked)
+	if !slices.Equal(h.agents.etcdRm, []string{"n1:n2:10.215.0.2"}) || !slices.Equal(h.enroll.revoked, []string{"12:34"}) {
+		t.Fatalf("etcd %v, revoked %v", h.agents.etcdRm, h.enroll.revoked)
 	}
 	if want := []string{"rotate:n1", "rotate-agent:n1", "apply:n1", "apply-agent:n1", "apply:n3", "apply-agent:n3", "apply:n4"}; !slices.Equal(h.agents.rotations, want) {
 		t.Fatalf("rotations %v", h.agents.rotations)
@@ -810,7 +803,8 @@ func TestUnparseableAddressesNoRewrite(t *testing.T) {
 }
 
 // TestProbeTargetsPushed: after a change of the document every Ready
-// nodeagent gets the ingress nodes' public addresses with their sites.
+// nodeagent gets the ingress nodes' public addresses with their sites
+// (IPv4 only: an IPv6 annotation is dropped, review I4).
 func TestProbeTargetsPushed(t *testing.T) {
 	nodes := []nodeSpec{
 		{"n1", "server", "home", "main", "10.215.0.1", nil, []string{"198.51.100.1"}, true, true},
@@ -820,7 +814,7 @@ func TestProbeTargetsPushed(t *testing.T) {
 	h := newHarness(t, nodes...)
 	h.s.reconcile(context.Background())
 	want := ProbeTargets{Domain: "example.org", EgressHost: "api.porkbun.com", Targets: []ProbeTarget{
-		{"n1", "main", "198.51.100.1"}, {"n3", "edge", "2001:db8::3"}, {"n3", "edge", "203.0.113.3"}}}
+		{"n1", "main", "198.51.100.1"}, {"n3", "edge", "203.0.113.3"}}}
 	for _, n := range []string{"n1", "n2", "n3"} {
 		if got := h.agents.targets[n]; mustJSON(got) != mustJSON(want) {
 			t.Errorf("%s got %s", n, mustJSON(got))
@@ -915,6 +909,8 @@ func TestEnrolRefusesBadAddresses(t *testing.T) {
 		{"a private public address", "", "10.0.0.1:51830"},
 		{"a CGNAT public address", "", "100.64.0.1:51830"},
 		{"port 0", "", "203.0.113.9:0"},
+		{"an IPv6 LAN endpoint", "[fd00::9]:51830", ""},
+		{"an IPv6 public endpoint", "", "[2001:4860::9]:51830"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)

@@ -94,6 +94,9 @@ type fakeAgents struct {
 	tokens    []string        // every new_token seen
 	targets   map[string]ProbeTargets
 	onRotate  func(id, step, tok string)
+	etcdRm    []string         // via:node:mesh
+	fail      map[string]error // "rotate"/"apply"/... or "etcd": the call fails (its error echoes the token)
+	effect    map[string]bool  // the failing call took effect first (an answer lost)
 }
 
 func (f *fakeAgents) Health(_ context.Context, id, meshIP string) (*AgentHealth, error) {
@@ -117,6 +120,15 @@ func (f *fakeAgents) PutProbeTargets(_ context.Context, id, _ string, t ProbeTar
 
 func (f *fakeAgents) TokenRotate(_ context.Context, id, _, tok, step string) error {
 	f.mu.Lock()
+	if err := f.fail[step]; err != nil {
+		cb := f.onRotate
+		eff := f.effect[step]
+		f.mu.Unlock()
+		if eff && cb != nil {
+			cb(id, step, tok)
+		}
+		return fmt.Errorf("%w (request body {\"new_token\":%q})", err, tok)
+	}
 	f.rotations = append(f.rotations, step+":"+id)
 	f.tokens = append(f.tokens, tok)
 	cb := f.onRotate
@@ -127,29 +139,13 @@ func (f *fakeAgents) TokenRotate(_ context.Context, id, _, tok, step string) err
 	return nil
 }
 
-type fakeEtcd struct {
-	mu      sync.Mutex
-	members []EtcdMember
-	removed []uint64
-}
-
-func (f *fakeEtcd) Members(context.Context) ([]EtcdMember, error) {
+func (f *fakeAgents) EtcdRemoveMember(_ context.Context, via, _, node, mesh string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]EtcdMember{}, f.members...), nil
-}
-
-func (f *fakeEtcd) Remove(_ context.Context, id uint64) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.removed = append(f.removed, id)
-	var out []EtcdMember
-	for _, m := range f.members {
-		if m.ID != id {
-			out = append(out, m)
-		}
+	if err := f.fail["etcd"]; err != nil {
+		return err
 	}
-	f.members = out
+	f.etcdRm = append(f.etcdRm, via+":"+node+":"+mesh)
 	return nil
 }
 
@@ -281,7 +277,6 @@ type harness struct {
 	leader  *fakeLeader
 	enroll  *fakeEnroll
 	agents  *fakeAgents
-	etcd    *fakeEtcd
 	boot    *fakeBoot
 	store   *memStore
 	logs    *bytes.Buffer
@@ -318,19 +313,14 @@ func newHarness(t testing.TB, nodes ...nodeSpec) *harness {
 		nodes = baseNodes
 	}
 	var objs []runtime.Object
-	var members []EtcdMember
-	for i, n := range nodes {
+	for _, n := range nodes {
 		objs = append(objs, mkNode(n))
-		if n.role == "server" {
-			members = append(members, EtcdMember{ID: uint64(i + 1), Name: n.name + "-abc", PeerIP: n.mesh, Healthy: true})
-		}
 	}
 	objs = append(objs,
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: tokenSecret, Namespace: coreNS}, Data: map[string][]byte{tokenKey: []byte(testServerToken + "\n"), agentTokenKey: []byte(testAgentToken)}},
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: addressesCM, Namespace: coreNS}},
 	)
 	h.kube = fake.NewSimpleClientset(objs...)
-	h.etcd = &fakeEtcd{members: members}
 	cfg := Config{Domain: "example.org", CoreNS: coreNS, NodeadmNS: "portcullis-nodeadm", IngressNS: "portcullis-ingress",
 		FencingNS: "portcullis-fencing", LonghornNS: "longhorn-system", ClusterCIDR: "10.42.0.0/16", ServiceCIDR: "10.43.0.0/16",
 		EgressHost: "api.porkbun.com", PodName: "nodeadm-0", Script: []byte("#!/bin/sh\necho join\n"),
@@ -343,7 +333,8 @@ func newHarness(t testing.TB, nodes ...nodeSpec) *harness {
 		cfg.AgentFiles[a] = p
 	}
 	s := newServer(cfg)
-	s.kube, s.store, s.enroll, s.agents, s.etcd, s.bootstrap, s.leader = h.kube, h.store, h.enroll, h.agents, h.etcd, h.boot, h.leader
+	s.kube, s.store, s.enroll, s.agents, s.bootstrap, s.leader = h.kube, h.store, h.enroll, h.agents, h.boot, h.leader
+	s.limit = newLimiter(1000, 1000, 1000, 1000)
 	s.now = func() time.Time { return h.now.Load().(time.Time) }
 	s.rand = rand.Reader
 	s.log = slog.New(slog.NewTextHandler(&lockedBuf{b: h.logs}, &slog.HandlerOptions{Level: slog.LevelDebug}))

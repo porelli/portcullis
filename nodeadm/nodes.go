@@ -220,8 +220,23 @@ func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
-	if err := s.patchNode(r.Context(), id, labelPatch(n, req)); err != nil {
-		return err
+	// The taints are replaced whole: the patch carries the read's
+	// resourceVersion, and a conflict reads again (review M8).
+	for try := 0; ; try++ {
+		p := labelPatch(n, req)
+		if n.ResourceVersion != "" {
+			p["metadata"].(map[string]any)["resourceVersion"] = n.ResourceVersion
+		}
+		err := s.patchNode(r.Context(), id, p)
+		if err == nil {
+			break
+		}
+		if !apierrors.IsConflict(errors.Unwrap(err)) || try >= 3 {
+			return err
+		}
+		if n, err = s.getNode(r.Context(), id); err != nil {
+			return err
+		}
 	}
 	s.log.Info("node labels set", "node", id, "class", req.Class, "site", req.Site, "ingress", req.Ingress, "storage", req.Storage)
 	if err := s.mutate(r.Context(), func(st *nodeadmState) error {
@@ -274,10 +289,12 @@ func (s *Server) handleDrain(w http.ResponseWriter, r *http.Request) error {
 	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
-	if err := s.quorumMinimum(r.Context(), n); err != nil {
+	ctx, cancel := s.fenced(r.Context())
+	defer cancel()
+	if err := s.quorumMinimum(ctx, n); err != nil {
 		return err
 	}
-	if err := s.drain(r.Context(), id); err != nil {
+	if err := s.drain(ctx, id); err != nil {
 		return err
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -455,12 +472,14 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) error {
 	if len(mode) != 1 || (mode[0] != "cooperative" && mode[0] != "revoke") {
 		return errPlain(http.StatusBadRequest, textMode)
 	}
-	s.opMu.Lock()
-	defer s.opMu.Unlock()
 	if mode[0] == "revoke" {
 		err = s.revoke(r.Context(), id)
 	} else {
-		err = s.removeCooperative(r.Context(), id)
+		s.opMu.Lock()
+		ctx, cancel := s.fenced(r.Context())
+		err = s.removeCooperative(ctx, id)
+		cancel()
+		s.opMu.Unlock()
 	}
 	if err != nil {
 		return err
@@ -535,119 +554,56 @@ func (s *Server) removeCooperative(ctx context.Context, id string) error {
 	if err := s.evictLonghorn(ctx, id); err != nil {
 		return err
 	}
-	if isServer(n) {
-		if err := s.removeEtcdMember(ctx, toClusterNode(n), false); err != nil {
-			return err
-		}
+	// The node marked removed (cert revoked) first, then its Node gone, then
+	// the document says so, then (a server) its etcd member removed.
+	cn := toClusterNode(n)
+	if err := s.forget(ctx, id, &cn.Addresses); err != nil {
+		return err
 	}
 	if err := s.kube.CoreV1().Nodes().Delete(ctx, id, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("deleting node %s: %w", id, err)
 	}
+	if isServer(n) {
+		if err := s.publishAddresses(ctx); err != nil {
+			return err
+		}
+		if err := s.removeEtcdMember(ctx, cn); err != nil {
+			return err
+		}
+	}
 	s.log.Info("node removed", "node", id, "mode", "cooperative")
-	cn := toClusterNode(n)
-	return s.forget(ctx, id, &cn.Addresses)
+	return nil
 }
 
-// removeEtcdMember removes the member whose peer address is the node's
-// mesh address. checkQuorum: refuse (503) unless a majority is healthy.
-func (s *Server) removeEtcdMember(ctx context.Context, n clusterNode, checkQuorum bool) error {
-	if s.etcd == nil {
-		return errors.New("no etcd client")
+// etcdQuorum: the server nodes and the Ready ones among them.
+func etcdQuorum(cl []clusterNode) (voters, healthy int) {
+	for _, c := range cl {
+		if c.Role == "server" {
+			voters++
+			if c.Ready {
+				healthy++
+			}
+		}
 	}
-	ms, err := s.etcd.Members(ctx)
+	return voters, healthy
+}
+
+// removeEtcdMember has a Ready surviving server's nodeagent remove the
+// member of n (POST /v1/etcd/remove-member; the nodeagent checks that
+// portcullis-cluster-addresses lists n removed, and holds the etcd key).
+func (s *Server) removeEtcdMember(ctx context.Context, n clusterNode) error {
+	cl, err := s.clusterNodes(ctx)
 	if err != nil {
-		return errPlain(http.StatusServiceUnavailable, textNoQuorum)
+		return err
 	}
-	if checkQuorum {
-		voters, healthy := 0, 0
-		for _, m := range ms {
-			if !m.Learner {
-				voters++
-				if m.Healthy {
-					healthy++
-				}
+	for _, c := range cl {
+		if c.Role == "server" && c.Ready && c.Name != n.Name && c.Mesh != "" {
+			if err := s.agents.EtcdRemoveMember(ctx, c.Name, c.Mesh, n.Name, n.Mesh); err != nil {
+				return fmt.Errorf("removing %s's etcd member through %s: %w", n.Name, c.Name, err)
 			}
-		}
-		if healthy*2 <= voters {
-			return errPlain(http.StatusServiceUnavailable, textNoQuorum)
-		}
-	}
-	for _, m := range ms {
-		if m.PeerIP != "" && m.PeerIP == n.Mesh {
-			if err := s.etcd.Remove(ctx, m.ID); err != nil {
-				return fmt.Errorf("removing %s's etcd member: %w", n.Name, err)
-			}
-			s.log.Info("etcd member removed", "node", n.Name)
+			s.log.Info("etcd member removed", "node", n.Name, "through", c.Name)
 			return nil
 		}
 	}
-	return nil
-}
-
-// revoke (the node is lost): never refused for a minimum. The node object
-// deleted, the etcd member removed, the certificate revoked, the server
-// token rotated.
-func (s *Server) revoke(ctx context.Context, id string) error {
-	st, err := s.load(ctx)
-	if err != nil {
-		return err
-	}
-	n, err := s.getNode(ctx, id)
-	var ae *apiError
-	if errors.As(err, &ae) && ae.Status == http.StatusNotFound {
-		if st.Nodes[id] == nil && st.Codes[id] == nil {
-			return err
-		}
-		n = nil
-	} else if err != nil {
-		return err
-	}
-	var cn clusterNode
-	if n != nil {
-		cn = toClusterNode(n)
-	} else if rec := st.Nodes[id]; rec != nil {
-		cn = clusterNode{Name: id, Role: rec.Role, Mesh: rec.MeshIP}
-	}
-	server := cn.Role == "server"
-	if server {
-		// etcd's own quorum rule: checked before anything changes.
-		ms, err := s.etcd.Members(ctx)
-		if err != nil {
-			return errPlain(http.StatusServiceUnavailable, textNoQuorum)
-		}
-		voters, healthy := 0, 0
-		for _, m := range ms {
-			if !m.Learner {
-				voters++
-				if m.Healthy {
-					healthy++
-				}
-			}
-		}
-		if healthy*2 <= voters {
-			return errPlain(http.StatusServiceUnavailable, textNoQuorum)
-		}
-	}
-	if n != nil {
-		if err := s.kube.CoreV1().Nodes().Delete(ctx, id, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-			return fmt.Errorf("deleting node %s: %w", id, err)
-		}
-	}
-	if server {
-		if err := s.removeEtcdMember(ctx, cn, true); err != nil {
-			return err
-		}
-	}
-	var addrs *NodeAddresses
-	if n != nil {
-		addrs = &cn.Addresses
-	}
-	if err := s.forget(ctx, id, addrs); err != nil {
-		return err
-	}
-	s.log.Info("node revoked", "node", id)
-	if err := s.rotateServerToken(ctx, id); err != nil {
-		return err
-	}
-	return nil
+	return errors.New("no Ready server to remove the etcd member through")
 }

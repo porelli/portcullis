@@ -1,8 +1,8 @@
 package main
 
 // nodeadm's clients: enroll (its own bearer), the nodeagents (mTLS with
-// nodeadm.control), etcd (the server's etcd client certificate) and the
-// k3s supervisor's server-bootstrap check.
+// nodeadm.control; etcd member removal goes through them: nodeadm holds no
+// etcd key) and the k3s supervisor's checks.
 
 import (
 	"bytes"
@@ -22,13 +22,10 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/netip"
-	"net/url"
 	"os"
 	"strings"
 	"time"
 
-	clientv3 "go.etcd.io/etcd/client/v3"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -212,6 +209,7 @@ func (s *Server) ensureFrontdoorCert(ctx context.Context) error {
 	}
 	sec.Data = map[string][]byte{"tls.crt": []byte(sc.CertPEM), "tls.key": keyPEM(k), "ca.crt": []byte(sc.CAPEM)}
 	if _, err := secs.Update(ctx, sec, metav1.UpdateOptions{}); err != nil {
+		err = secretErr(err)
 		return fmt.Errorf("writing the Secret %s: %w", frontdoorSecret, err)
 	}
 	s.log.Info("frontdoor.control certificate written", "serial", sc.Serial)
@@ -220,17 +218,42 @@ func (s *Server) ensureFrontdoorCert(ctx context.Context) error {
 
 // ── the nodeagents ──
 
-type agentClient struct{ s *Server }
+type agentClient struct {
+	s    *Server
+	base func(meshIP string) string // tests only; nil = https://<mesh IP>:7443
+}
 
-func (a agentClient) client(id string) (*http.Client, error) {
+// client: mTLS to node id's nodeagent. Its certificate must chain to the
+// pki_node CA for <id>.cluster.portcullis.internal and, for a node nodeadm
+// enrolled, carry exactly the serial it recorded (a revoked but unexpired
+// certificate of an earlier enrolment is refused, review M12); a removed
+// node is never called.
+func (a agentClient) client(ctx context.Context, id string) (*http.Client, error) {
 	own := a.s.pki.ownCert()
 	pool := a.s.pki.caPool()
 	if own == nil || pool == nil {
 		return nil, errors.New("nodeadm has no node-nodeadm certificate yet")
 	}
+	st, err := a.s.load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	want := ""
+	if rec := st.Nodes[id]; rec != nil {
+		if rec.Removed {
+			return nil, fmt.Errorf("node %s is removed", id)
+		}
+		want = rec.Serial
+	}
+	verify := func(cs tls.ConnectionState) error {
+		if want != "" && (len(cs.PeerCertificates) == 0 || certSerial(cs.PeerCertificates[0]) != want) {
+			return errors.New("the nodeagent's certificate isn't the one nodeadm signed")
+		}
+		return nil
+	}
 	return &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, RootCAs: pool, ServerName: id + "." + clusterDomain,
-			Certificates: []tls.Certificate{*own}},
+			Certificates: []tls.Certificate{*own}, VerifyConnection: verify},
 		DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext, ForceAttemptHTTP2: false}}, nil
 }
 
@@ -238,7 +261,7 @@ func (a agentClient) do(ctx context.Context, id, meshIP, method, path string, bo
 	if !meshAddrOK(meshIP) {
 		return fmt.Errorf("%s has no mesh address", id)
 	}
-	c, err := a.client(id)
+	c, err := a.client(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -247,7 +270,11 @@ func (a agentClient) do(ctx context.Context, id, meshIP, method, path string, bo
 		b, _ := json.Marshal(body)
 		rd = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, "https://"+meshIP+":7443"+path, rd)
+	base := "https://" + meshIP + ":7443"
+	if a.base != nil {
+		base = a.base(meshIP)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, base+path, rd)
 	if err != nil {
 		return err
 	}
@@ -281,92 +308,13 @@ func (a agentClient) PutProbeTargets(ctx context.Context, id, meshIP string, t P
 	return a.do(ctx, id, meshIP, http.MethodPut, "/v1/probes/targets", t, nil)
 }
 
+func (a agentClient) EtcdRemoveMember(ctx context.Context, viaID, viaMesh, node, nodeMesh string) error {
+	return a.do(ctx, viaID, viaMesh, http.MethodPost, "/v1/etcd/remove-member", map[string]string{"node": node, "mesh_ip": nodeMesh}, nil)
+}
+
 func (a agentClient) TokenRotate(ctx context.Context, id, meshIP, newToken, step string) error {
 	// The error never carries the body (the token).
 	return a.do(ctx, id, meshIP, http.MethodPost, "/v1/k3s/token-rotate", map[string]string{"new_token": newToken, "step": step}, nil)
-}
-
-// ── etcd ──
-
-type etcdClient struct {
-	endpoints []string
-	tls       *tls.Config
-}
-
-func newEtcdClient(dir, hostIP string) (*etcdClient, error) {
-	cert, err := tls.LoadX509KeyPair(dir+"/client.crt", dir+"/client.key")
-	if err != nil {
-		return nil, fmt.Errorf("etcd's client certificate: %w", err)
-	}
-	caPEM, err := os.ReadFile(dir + "/server-ca.crt")
-	if err != nil {
-		return nil, fmt.Errorf("etcd's CA: %w", err)
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caPEM) {
-		return nil, errors.New("etcd's CA doesn't parse")
-	}
-	if !meshAddrOK(hostIP) {
-		return nil, fmt.Errorf("the node's address %q isn't a mesh address", hostIP)
-	}
-	return &etcdClient{endpoints: []string{"https://" + hostIP + ":2379"},
-		tls: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool, Certificates: []tls.Certificate{cert}}}, nil
-}
-
-func (e *etcdClient) connect(eps []string) (*clientv3.Client, error) {
-	return clientv3.New(clientv3.Config{Endpoints: eps, TLS: e.tls, DialTimeout: 5 * time.Second})
-}
-
-func peerIP(urls []string) string {
-	for _, u := range urls {
-		if p, err := url.Parse(u); err == nil {
-			if a, err := netip.ParseAddr(p.Hostname()); err == nil {
-				return a.String()
-			}
-		}
-	}
-	return ""
-}
-
-func (e *etcdClient) Members(ctx context.Context) ([]EtcdMember, error) {
-	c, err := e.connect(e.endpoints)
-	if err != nil {
-		return nil, err
-	}
-	defer c.Close()
-	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	l, err := c.MemberList(cctx)
-	if err != nil {
-		return nil, err
-	}
-	var out []EtcdMember
-	for _, m := range l.Members {
-		em := EtcdMember{ID: m.ID, Name: m.Name, PeerIP: peerIP(m.PeerURLs), Learner: m.IsLearner}
-		for _, cu := range m.ClientURLs {
-			sctx, scancel := context.WithTimeout(ctx, 2*time.Second)
-			_, err := c.Status(sctx, cu)
-			scancel()
-			if err == nil {
-				em.Healthy = true
-				break
-			}
-		}
-		out = append(out, em)
-	}
-	return out, nil
-}
-
-func (e *etcdClient) Remove(ctx context.Context, id uint64) error {
-	c, err := e.connect(e.endpoints)
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	_, err = c.MemberRemove(cctx, id)
-	return err
 }
 
 // ── the k3s supervisor's checks ──
@@ -418,4 +366,47 @@ func supervisorStatus(ctx context.Context, serverIP, token, user, path string) (
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 	return resp.StatusCode, nil
+}
+
+// revokeOldOwnCerts (the leader): records this process's node-nodeadm
+// serial and revokes every older one (review M11).
+func (s *Server) revokeOldOwnCerts(ctx context.Context) {
+	own := s.pki.ownCert()
+	if own == nil || own.Leaf == nil {
+		return
+	}
+	cur := certSerial(own.Leaf)
+	st, err := s.load(ctx)
+	if err != nil {
+		return
+	}
+	var keep []string
+	for _, sr := range st.OwnSerials {
+		if sr == cur {
+			continue
+		}
+		if err := s.enroll.Revoke(ctx, sr); err != nil {
+			s.log.Warn("couldn't revoke an old node-nodeadm certificate", "serial", sr)
+			keep = append(keep, sr)
+			continue
+		}
+		s.log.Info("old node-nodeadm certificate revoked", "serial", sr)
+	}
+	keep = append(keep, cur)
+	if slicesEqual(keep, st.OwnSerials) {
+		return
+	}
+	_ = s.mutate(ctx, func(st *nodeadmState) error { st.OwnSerials = keep; return nil })
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

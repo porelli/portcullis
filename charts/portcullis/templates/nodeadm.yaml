@@ -2,11 +2,10 @@
 cluster API, the only holder of the k3s server token. Rendered with
 nodeadm.enabled (the CLI sets it on a cluster init installed, where it can
 read the server token). One replica on a server node, in its own namespace
-(PSA privileged, created by the CLI): an init container (root, every
-capability dropped, read-only) copies the server's etcd client certificate
-from the read-only hostPath into an in-memory emptyDir, group-readable for
-nodeadm itself (uid 10010, restricted otherwise). Writes only while it holds
-the Lease portcullis-nodeadm.
+(PSA restricted, created by the CLI), uid 10010. It holds no etcd key and
+mounts nothing of the host (review I6): an etcd member removal is the fixed
+nodeagent op POST /v1/etcd/remove-member on a surviving server. Writes only
+while it holds the Lease portcullis-nodeadm.
 
 Its rights (the security delta of hardening.md):
   - ClusterRole: nodes get / list / watch / patch / delete; pods list /
@@ -14,7 +13,9 @@ Its rights (the security delta of hardening.md):
     Remediation status objects get / list; NO admission object at all
     (R-ADM: the API server applies no policy to them);
   - Role in kube-system: secrets create (bootstrap tokens only, judged by
-    portcullis-nodeadm-tokens);
+    portcullis-nodeadm-tokens) and delete (a revoke deletes the bootstrap
+    tokens it recorded for the node, review I1; the admission judge of the
+    delete is owed: see the Task 21 report);
   - Role in the core namespace: secrets get / update on nodeadm-k3s-token,
     frontdoor-control-tls and nodeadm-state (its own state: the join codes'
     hashes, which are secret-equivalent, and the enrolled nodes);
@@ -88,7 +89,7 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create"]
+    verbs: ["create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -210,7 +211,7 @@ spec:
       automountServiceAccountToken: true
       enableServiceLinks: false
       priorityClassName: portcullis-core
-      # On a server node only: its etcd client certificate is there.
+      # On a server node (contract §20.2): the control plane's own nodes.
       nodeSelector:
         node-role.kubernetes.io/control-plane: "true"
       tolerations:
@@ -229,31 +230,6 @@ spec:
         fsGroup: {{ $uid }}
         seccompProfile:
           type: RuntimeDefault
-      initContainers:
-        # Root reads the root-owned 0600 key (it owns it: no capability)
-        # and writes 0440 copies (group = the pod's fsGroup).
-        - name: etcd-certs
-          image: {{ required "nodeadm.image is required (by digest)" .Values.nodeadm.image }}
-          args: ["copy-etcd-certs", "/host-etcd", "/run/portcullis/etcd"]
-          securityContext:
-            runAsUser: 0
-            runAsGroup: {{ $uid }}
-            runAsNonRoot: false
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
-          resources:
-            requests:
-              memory: 32Mi
-            limits:
-              memory: 32Mi
-          volumeMounts:
-            - name: host-etcd
-              mountPath: /host-etcd
-              readOnly: true
-            - name: etcd
-              mountPath: /run/portcullis/etcd
       containers:
         - name: nodeadm
           image: {{ .Values.nodeadm.image }}
@@ -295,8 +271,6 @@ spec:
               value: http://enroll.{{ $ns }}.svc.cluster.local:8444
             - name: NODEADM_ENROLL_BEARER_FILE
               value: /run/portcullis/nodeadm/enroll-bearer
-            - name: NODEADM_ETCD_DIR
-              value: /run/portcullis/etcd
           ports:
             - name: internal
               containerPort: 8443
@@ -321,21 +295,10 @@ spec:
             limits:
               memory: 128Mi
           volumeMounts:
-            - name: etcd
-              mountPath: /run/portcullis/etcd
-              readOnly: true
             - name: enroll-bearer
               mountPath: /run/portcullis/nodeadm
               readOnly: true
       volumes:
-        - name: host-etcd
-          hostPath:
-            path: /var/lib/rancher/k3s/server/tls/etcd
-            type: Directory
-        - name: etcd
-          emptyDir:
-            medium: Memory
-            sizeLimit: 1Mi
         - name: enroll-bearer
           secret:
             secretName: nodeadm-enroll
@@ -462,16 +425,14 @@ spec:
       ports:
         - protocol: TCP
           port: 8444
-    # The nodeagents (:7443), etcd (:2379) and the k3s supervisor (:6443,
-    # the token rotation's check) on the node mesh.
+    # The nodeagents (:7443) and the k3s supervisor (:6443, the token
+    # rotation's check) on the node mesh (no etcd: review I6).
     - to:
         - ipBlock:
             cidr: {{ .Values.ha.meshCIDR }}
       ports:
         - protocol: TCP
           port: 7443
-        - protocol: TCP
-          port: 2379
         - protocol: TCP
           port: 6443
     # The API server.

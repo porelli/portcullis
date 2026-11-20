@@ -4336,6 +4336,8 @@ case "$*" in
   "get configmap portcullis-cluster-addresses -o json") cat "$K/cluster-addresses.json" 2>/dev/null || { echo 'Error from server (NotFound): configmaps "portcullis-cluster-addresses" not found' >&2; exit 1; } ;;
   "get configmap portcullis-admission-active -o json") cat "$K/active.json" 2>/dev/null || { echo 'Error from server (NotFound)' >&2; exit 1; } ;;
   "get configmap portcullis-admission-params-"*" -o json") g="${3#portcullis-admission-params-}"; cat "$K/params-$g.json" 2>/dev/null || { echo 'Error from server (NotFound)' >&2; exit 1; } ;;
+  "get configmap portcullis-admission-params-"*" -o name") g="${3#portcullis-admission-params-}"; [ -e "$K/params-$g.json" ] && echo "configmap/$3" || { echo 'Error from server (NotFound)' >&2; exit 1; } ;;
+  "get validatingadmissionpolicybinding -l portcullis.io/params-generation="*" -o json") g="${4#*=}"; cat "$K/bindings-$g.json" 2>/dev/null || echo '{"items":[]}' ;;
   *) [ -n "${STUB_KUBE_SCRIPT:-}" ] && . "$STUB_KUBE_SCRIPT" ;;
 esac
 exit 0
@@ -4626,6 +4628,18 @@ for bad in '.nodes.n1.lan = ["2001:db8::1"]' '.nodes.n1.public = ["198.51.100.30
   ca "$(printf '%s' "$CA_ST" | jq -c "$bad")"
   case "$(kda)" in *"rc1 "*"don't parse"*) t_pass "kube_doc_addresses: $bad → refused" ;; *) t_fail "kda strict $bad: $(kda)" ;; esac
 done
+# The node address rule nodeadm applies (tests/node_address_vectors.json,
+# also TestNodeAddressVectors): the same verdict for every vector.
+bad=""
+NAV="$HERE/node_address_vectors.json"
+for i in $(seq 0 $(( $(jq '.vectors | length' "$NAV") - 1 ))); do
+  addr="$(jq -r --argjson i "$i" '.vectors[$i].address' "$NAV")"
+  want="$(jq -r --argjson i "$i" '.vectors[$i].accept' "$NAV")"
+  ca "$(printf '%s' "$CA_ST" | jq -c --arg a "$addr" '.nodes.n1.lan = [$a]')"
+  case "$(kda)" in *"rc=0") got=true ;; *"don't parse"*) got=false ;; *) got=other ;; esac
+  [ "$got" = "$want" ] || bad="$bad [$addr]=$got"
+done
+expect_eq "kube_doc_addresses: the shared node address vectors give nodeadm's verdict" "$bad" ""
 ca "$CA_ST"
 ca "$(printf '%s' "$CA_ST" | jq -c '.nodes.n2.state = "joining"')"
 case "$(kda)" in *"rc1 the cluster addresses (ConfigMap portcullis-cluster-addresses) don't parse"*) t_pass "kube_doc_addresses: an unknown node state → refused" ;; *) t_fail "kda state: $(kda)" ;; esac
@@ -4636,15 +4650,28 @@ case "$(kda)" in *"rc2"*) t_pass "kube_doc_addresses: no document yet → 2 (the
 # params-sync: the active generation's params with the document's four
 # keys; unchanged → nothing; changed → the swap; refused → nothing.
 PS_BASE="$(printf 'hubImage\tghcr.io/porelli/portcullis-hub@sha256:%064d\nappsNamespace\tportcullis-apps\nnodeAddresses\t10.215.0.1/32\napiAddresses\t10.215.0.1/32 10.215.0.10/32\npodCIDR\t10.42.0.0/24\nserviceCIDR\t10.43.0.0/16' 1)"
-psync() { # psync <base params lines> → kube_params_sync with the stub's active record / params
+PS_BINDINGS="$(kt 'echo $KUBE_BINDINGS' | head -n1)"
+psync() { # psync <base params lines> [drop binding] [record jq] → kube_params_sync with the stub's active record / params / bindings
   local g; g="$(printf '%s\n' "$1" | kt kube_params_generation | head -n1)"
   printf '%s\n' "$1" | jq -R 'split("\t") | {(.[0]): .[1]}' | jq -s --arg g "$g" '{data: (add + {generation: $g})}' > "$KS/kube/params-$g.json"
-  jq -n --arg g "$g" '{data: {"active.json": ({generation: $g, node_addresses: [], api_addresses: [], proven_at: "x"} | tojson)}}' > "$KS/kube/active.json"
+  jq -n --arg g "$g" --slurpfile p "$KS/kube/params-$g.json" '{data: {"active.json": ({generation: $g, node_addresses: ($p[0].data.nodeAddresses | split(" ")),
+      api_addresses: ($p[0].data.apiAddresses | split(" ")), proven_at: "x"} | '"${3:-.}"' | tojson)}}' > "$KS/kube/active.json"
+  printf '%s\n' $PS_BINDINGS | grep -vx "${2:-none}" | jq -R --arg g "$g" '{metadata: {name: (. + "-" + $g)}, spec: {paramRef: {name: ("portcullis-admission-params-" + $g)}}}' \
+    | jq -s '{items: .}' > "$KS/kube/bindings-$g.json"
   kt "kube_admission_params_apply() { echo \"APPLY \$1\"; printf '%s\n' \"\$2\" | awk -F'\t' '\$1 ~ /Addresses\$/'; }; kube_params_sync"
 }
 ca "$CA_ST"
 OUT="$(psync "$(printf '%s\n' "$PS_BASE" | sed 's#^nodeAddresses\t.*#nodeAddresses\t10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32 198.51.100.9/32#')")"
 expect_eq "kube params-sync: the document's addresses already in the active generation → nothing" "$OUT" "rc=0"
+# Unchanged but not judging (review I3): a binding gone, or the record
+# naming other addresses → repaired by the same swap.
+PS_SAME="$(printf '%s\n' "$PS_BASE" | sed 's#^nodeAddresses\t.*#nodeAddresses\t10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32 198.51.100.9/32#')"
+OUT="$(psync "$PS_SAME" "$(printf '%s\n' $PS_BINDINGS | sed -n 3p)")"
+case "$OUT" in *"is recorded but the binding $(printf '%s\n' $PS_BINDINGS | sed -n 3p)-"*"is missing: repairing it"*"APPLY "*"rc=0") t_pass "kube params-sync: an unchanged generation missing a binding → repaired" ;; *) t_fail "psync missing binding: $OUT" ;; esac
+OUT="$(psync "$PS_SAME" none '.node_addresses = ["10.215.0.1/32"]')"
+case "$OUT" in *"doesn't match it: repairing it"*"APPLY "*"rc=0") t_pass "kube params-sync: an unchanged generation whose record doesn't match → repaired" ;; *) t_fail "psync record: $OUT" ;; esac
+expect_eq "kube params-sync and kube check run under cli_lock (review I3)" \
+  "$(sed -n '/^cli_lock() {/,/^}/p' "$HERE/../scripts/lib/common.sh" | grep -c 'kube) case "$sub" in params-sync|check) ;; \*) return 0 ;; esac ;;')" 1
 OUT="$(psync "$PS_BASE")"
 case "$OUT" in *"APPLY ghcr.io/porelli/portcullis-hub@sha256:"*"nodeAddresses	10.215.0.1/32 10.215.0.10/32 192.0.2.10/32 198.51.100.7/32 198.51.100.9/32"*"apiAddresses	10.215.0.1/32 10.215.0.10/32"*"rc=0")
   t_pass "kube params-sync: a pending node's addresses → the swap with the document's addresses and the active hub image" ;; *) t_fail "psync change: $OUT" ;; esac
@@ -4674,7 +4701,7 @@ OUT="$(kt "PORTCULLIS_ROOT='$KN/root'; KUBE_INSTALL_PREFIX='$KN'; PORTCULLIS_K3S
     *'--dry-run=client -o json'*) printf '{\"metadata\":{}}' ;; *' get nodes -o json'*) echo '{\"items\":[]}' ;; esac; }
   kube_namespace_apply() { echo \"NS \$*\"; }; _kube_put() { echo PUT; }
   kube_nodeadm_prepare; kube_nodeadm_sync; stat -c %a '$KN/root/secrets/enroll/nodeadm-api-secret'")"
-case "$OUT" in *"NS portcullis-nodeadm privileged baseline baseline"*"--from-file=bearer="*"--from-file=token="*"--from-file=agent="*"create --field-manager"*"state.json"*"addr.json"*"600"*"rc=0") t_pass "kube_nodeadm_sync: its namespace, its bearer and the server token by --from-file, the state Secret and the addresses ConfigMap created" ;; *) t_fail "nodeadm sync: $OUT" ;; esac
+case "$OUT" in *"NS portcullis-nodeadm restricted restricted restricted"*"--from-file=bearer="*"--from-file=token="*"--from-file=agent="*"create --field-manager"*"state.json"*"addr.json"*"600"*"rc=0") t_pass "kube_nodeadm_sync: its namespace, its bearer and the server token by --from-file, the state Secret and the addresses ConfigMap created" ;; *) t_fail "nodeadm sync: $OUT" ;; esac
 case "$OUT" in *"s3cr3t-server-token-value"*|*"agent-s3cr3t-value"*) t_fail "a k3s token reached argv or the output" ;; *) t_pass "kube_nodeadm_sync: the server and agent tokens are on no argv" ;; esac
 rm -f "$KS/kube/cluster-addresses.json"
 k_fixtures
@@ -5704,7 +5731,9 @@ mkdir -p "$ML.lock-root"
 sleep 1
 rc=0; ( export PORTCULLIS_ROOT="$ML.lock-root" PORTCULLIS_LOCK_WAIT=1; unset PORTCULLIS_LOCKED; cli_lock backup ) >/dev/null 2>&1 || rc=$?
 expect_eq "cli_lock: a held lock → backup waits, then refuses" "$rc" 1
-rc=0; ( export PORTCULLIS_ROOT="$ML.lock-root" PORTCULLIS_LOCK_WAIT=1; unset PORTCULLIS_LOCKED; cli_lock mail rotate --help; cli_lock status ) >/dev/null 2>&1 || rc=$?
+rc=0; ( export PORTCULLIS_ROOT="$ML.lock-root" PORTCULLIS_LOCK_WAIT=1; unset PORTCULLIS_LOCKED; cli_lock kube params-sync ) >/dev/null 2>&1 || rc=$?
+expect_eq "cli_lock: a held lock → kube params-sync waits, then refuses (review I3)" "$rc" 1
+rc=0; ( export PORTCULLIS_ROOT="$ML.lock-root" PORTCULLIS_LOCK_WAIT=1; unset PORTCULLIS_LOCKED; cli_lock mail rotate --help; cli_lock status; cli_lock kube status; cli_lock kube params-sync --help ) >/dev/null 2>&1 || rc=$?
 expect_eq "cli_lock: --help and read-only commands never wait" "$rc" 0
 wait "$lockpid" 2>/dev/null
 rc=0; ( export PORTCULLIS_ROOT="$ML.lock-root" PORTCULLIS_LOCK_WAIT=1; unset PORTCULLIS_LOCKED; cli_lock mail rotate ) >/dev/null 2>&1 || rc=$?

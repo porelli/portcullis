@@ -397,9 +397,8 @@ def main():
 PSA_WANT = {"core": ["restricted"] * 3, "apps": ["privileged", "baseline", "baseline"],
             "storage": ["privileged", "baseline", "baseline"], "edge": ["restricted"] * 3,
             "ingress": ["privileged", "baseline", "baseline"],
-            # nodeadm (contract §20.1): the init container's root read of the
-            # etcd client key (hostPath, read-only).
-            "nodeadm": ["privileged", "baseline", "baseline"]}
+            # nodeadm: restricted (no etcd key, no hostPath: review I6).
+            "nodeadm": ["restricted"] * 3}
 
 
 NODEADM_NS = "portcullis-nodeadm"
@@ -418,7 +417,7 @@ NODEADM_CORE_RULES = [
     {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["portcullis-admission-active"], "verbs": ["get"]},
     {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "resourceNames": ["portcullis-nodeadm"], "verbs": ["get", "update"]},
 ]
-NODEADM_KUBE_SYSTEM_RULES = [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["create"]}]
+NODEADM_KUBE_SYSTEM_RULES = [{"apiGroups": [""], "resources": ["secrets"], "verbs": ["create", "delete"]}]
 NODEADM_LONGHORN_RULES = [{"apiGroups": ["longhorn.io"], "resources": ["nodes"], "verbs": ["get", "patch"]}]
 ADMISSION_RESOURCES = {"validatingadmissionpolicies", "validatingadmissionpolicybindings", "mutatingwebhookconfigurations",
                        "validatingwebhookconfigurations", "mutatingadmissionpolicies", "mutatingadmissionpolicybindings"}
@@ -426,12 +425,11 @@ ADMISSION_RESOURCES = {"validatingadmissionpolicies", "validatingadmissionpolicy
 
 def check_nodeadm():
     """nodeadm (contract §20.2, ruling R-ADM), rendered with nodeadm.enabled
-    only: one pod in portcullis-nodeadm on a server node; the main
-    container restricted as 10010; only the init container runs as root
-    (every capability dropped, read-only, no escalation) and only it mounts
-    the etcd certificates' hostPath, read-only; its RBAC exactly the
-    contract's (no admission object anywhere, no ConfigMap create, Secrets
-    only by name in the core namespace and create in kube-system)."""
+    only: one pod in portcullis-nodeadm on a server node; one container,
+    restricted as 10010; no init container, no hostPath, no etcd key (review
+    I6); its RBAC exactly the contract's (no admission object anywhere, no
+    ConfigMap create, Secrets only by name in the core namespace and create /
+    delete in kube-system: bootstrap tokens)."""
     if [d for d in K.render() if d.get("metadata", {}).get("namespace") == NODEADM_NS or "nodeadm" in d.get("metadata", {}).get("name", "")]:
         F.add("nodeadm renders without nodeadm.enabled")
     for ha in (False, True):
@@ -449,15 +447,12 @@ def check_nodeadm():
         for k in ("hostNetwork", "hostPID", "hostIPC"):
             if spec.get(k):
                 F.add(f"nodeadm: {k}")
-        hostpaths = [v for v in spec.get("volumes", []) if "hostPath" in v]
-        if [v["hostPath"]["path"] for v in hostpaths] != ["/var/lib/rancher/k3s/server/tls/etcd"]:
-            F.add(f"nodeadm: hostPath volumes {hostpaths}")
         for v in spec.get("volumes", []):
             kinds = set(v) - {"name"}
-            if not kinds <= RESTRICTED_VOLUMES | {"hostPath"}:
-                F.add(f"nodeadm: volume {v['name']} {sorted(kinds)}")
+            if not kinds <= RESTRICTED_VOLUMES:
+                F.add(f"nodeadm: volume {v['name']} {sorted(kinds)} (restricted volumes only)")
         inits, mains = spec.get("initContainers", []), spec.get("containers", [])
-        if [c["name"] for c in inits] != ["etcd-certs"] or [c["name"] for c in mains] != ["nodeadm"]:
+        if inits or [c["name"] for c in mains] != ["nodeadm"]:
             F.add("nodeadm: containers")
             return
         for c in inits + mains:
@@ -470,9 +465,6 @@ def check_nodeadm():
                 F.add(f"nodeadm/{c['name']}: memory limit != request")
             if not re.search(r"@sha256:[0-9a-f]{64}$", c["image"]):
                 F.add(f"nodeadm/{c['name']}: image not by digest")
-            for m in c.get("volumeMounts", []):
-                if m["name"] == "host-etcd" and (c["name"] != "etcd-certs" or m.get("readOnly") is not True):
-                    F.add(f"nodeadm/{c['name']}: mounts the etcd hostPath (only the init container, read-only)")
         msc = mains[0]["securityContext"]
         if msc.get("runAsUser") != 10010 or msc.get("runAsNonRoot") is not True:
             F.add(f"nodeadm: runs as {msc.get('runAsUser')} (10010, non-root)")

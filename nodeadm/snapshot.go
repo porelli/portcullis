@@ -68,22 +68,9 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	var members []EtcdMember
-	if s.etcd != nil {
-		if members, err = s.etcd.Members(ctx); err != nil {
-			snap.Errors = append(snap.Errors, "etcd's members can't be read")
-		}
-	}
-	etcdIPs := map[string]bool{}
-	for _, m := range members {
-		if !m.Learner {
-			snap.Quorum.Etcd.Voters++
-			if m.Healthy {
-				snap.Quorum.Etcd.Healthy++
-			}
-		}
-		etcdIPs[m.PeerIP] = true
-	}
+	// etcd's voters are the server nodes, its healthy ones the Ready
+	// servers (nodeadm holds no etcd client, ruling I6).
+	snap.Quorum.Etcd.Voters, snap.Quorum.Etcd.Healthy = etcdQuorum(cl)
 	traefik, fencing := map[string]bool{}, map[string]bool{}
 	for i := range pods.Items {
 		p := &pods.Items[i]
@@ -104,7 +91,7 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 		sn := SnapNode{Name: c.Name, Role: c.Role, Ready: c.Ready, Unschedulable: n.Spec.Unschedulable,
 			Allocatable: Resources{CPUm: n.Status.Allocatable.Cpu().MilliValue(), MemBytes: n.Status.Allocatable.Memory().Value()},
 			Labels:      map[string]string{}, Taints: []Taint{}, Addresses: c.Addresses,
-			TraefikReady: traefik[c.Name], FencingReady: fencing[c.Name], EtcdMember: c.Mesh != "" && etcdIPs[c.Mesh]}
+			TraefikReady: traefik[c.Name], FencingReady: fencing[c.Name], EtcdMember: c.Role == "server"}
 		if !c.Ready {
 			for _, cond := range n.Status.Conditions {
 				if cond.Type == corev1.NodeReady && !cond.LastTransitionTime.IsZero() {
@@ -123,6 +110,9 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 		}
 		if c.Mesh == "" {
 			snap.Errors = append(snap.Errors, fmt.Sprintf("node %s has no mesh address: the admission params aren't rewritten", c.Name))
+		}
+		if rec := st.Nodes[c.Name]; rec != nil && rec.Removed && st.Ops[c.Name] == nil {
+			snap.Errors = append(snap.Errors, fmt.Sprintf("node %s was removed but registered again (its kubelet still runs): revoke it again and reinstall that machine", c.Name))
 		}
 		snap.Nodes = append(snap.Nodes, sn)
 		s.metrics.nodeReady.WithLabelValues(c.Name).Set(b2f(c.Ready))
@@ -173,6 +163,11 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 	snap.Postgres = s.postgres(ctx, pods.Items)
 	snap.Volumes = s.volumes(ctx)
 	snap.Errors = append(snap.Errors, s.addrErrors()...)
+	for id, op := range st.Ops {
+		if op.LastError != "" {
+			snap.Errors = append(snap.Errors, fmt.Sprintf("the revocation of %s waits at %s: %s", id, op.Step, op.LastError))
+		}
+	}
 	s.metrics.observe(snap)
 	return snap, nil
 }

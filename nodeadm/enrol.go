@@ -13,6 +13,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/x509"
@@ -33,6 +34,10 @@ import (
 )
 
 const (
+	// rejoinWindow / maxJoinTokens: a released node that hasn't registered
+	// may ask again (its answer lost) only this long and this often.
+	rejoinWindow  = 30 * time.Minute
+	maxJoinTokens = 3
 	codeTTL       = 15 * time.Minute
 	nonceTTL      = 60 * time.Second
 	joinNonceTTL  = 5 * time.Minute
@@ -142,6 +147,9 @@ func (s *Server) handleCodes(w http.ResponseWriter, r *http.Request) error {
 	key := sha256.Sum256(secret)
 	now := s.now()
 	err = s.mutate(ctx, func(st *nodeadmState) error {
+		if n, ok := st.Nodes[req.ServerID]; ok && n.Serial == "" && !n.Removed && n.JoinedAt == nil {
+			delete(st.Nodes, req.ServerID)
+		}
 		if n, ok := st.Nodes[req.ServerID]; ok {
 			if n.Removed {
 				return errPlain(409, "node %s is still being removed: retry later", req.ServerID)
@@ -222,8 +230,11 @@ func (s *Server) handleNonce(w http.ResponseWriter, r *http.Request) error {
 	nonce := base64.RawURLEncoding.EncodeToString(n)
 	now := s.now()
 	s.nonceMu.Lock()
+	// At most one live nonce per server_id (a new one replaces it), so a
+	// flood of requests for other ids can't evict a node's own nonce.
+	sid := trunc(req.ServerID, 64)
 	for k, v := range s.nonces {
-		if now.Sub(v.at) > nonceTTL {
+		if now.Sub(v.at) > nonceTTL || v.serverID == sid {
 			delete(s.nonces, k)
 		}
 	}
@@ -315,29 +326,47 @@ func (s *Server) handleEnrol(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return s.refuseEnrol(req.ServerID, "nonce_invalid")
 	}
-	// 2. The proof (constant time), keyed by the stored hash.
+	// 2. The proof (constant time), keyed by the stored hash. The same work
+	// (the CSR parsed, an HMAC computed, with a random key when there is no
+	// live code) whatever the code's state, so the answer's timing tells an
+	// unauthenticated caller nothing; only then the branch.
 	st, err := s.load(r.Context())
 	if err != nil {
 		return err
 	}
 	c := st.Codes[req.ServerID]
-	if c == nil || !serverIDRe.MatchString(req.ServerID) {
-		return s.refuseEnrol(req.ServerID, "unknown_server_id")
-	}
-	if c.KeySHA256 == "" {
-		if c.Used {
-			return s.refuseEnrol(req.ServerID, "code_used")
+	key := make([]byte, 32)
+	live := c != nil && c.KeySHA256 != "" && serverIDRe.MatchString(req.ServerID)
+	if live {
+		if k, err := hex.DecodeString(c.KeySHA256); err == nil && len(k) == 32 {
+			key = k
+		} else {
+			live = false
 		}
-		return s.refuseEnrol(req.ServerID, "code_expired")
 	}
-	csr, err := parseNodeCSR(req.CSR, req.ServerID)
-	if err != nil {
-		return s.refuseEnrol(req.ServerID, "csr_invalid")
+	if !live {
+		if _, err := io.ReadFull(rand.Reader, key); err != nil {
+			return err
+		}
 	}
-	key, err := hex.DecodeString(c.KeySHA256)
+	var spki [32]byte
+	csr, csrErr := parseNodeCSR(req.CSR, req.ServerID)
+	if csrErr == nil {
+		spki = sha256.Sum256(csr.RawSubjectPublicKeyInfo)
+	}
 	got, err2 := base64.RawURLEncoding.DecodeString(req.Proof)
-	want := proofFor(key, nonce, req.ServerID, sha256.Sum256(csr.RawSubjectPublicKeyInfo))
-	if err != nil || err2 != nil || subtle.ConstantTimeCompare(got, want) != 1 {
+	want := proofFor(key, nonce, req.ServerID, spki)
+	match := err2 == nil && subtle.ConstantTimeCompare(got, want) == 1
+	switch {
+	case c == nil || !serverIDRe.MatchString(req.ServerID):
+		return s.refuseEnrol(req.ServerID, "unknown_server_id")
+	case c.KeySHA256 == "" && c.Used:
+		return s.refuseEnrol(req.ServerID, "code_used")
+	case c.KeySHA256 == "":
+		return s.refuseEnrol(req.ServerID, "code_expired")
+	case csrErr != nil:
+		return s.refuseEnrol(req.ServerID, "csr_invalid")
+	case !live || !match:
 		return s.refuseEnrol(req.ServerID, "proof_mismatch")
 	}
 	// 3. Only now: the expiry and the compare-and-swap that burns the code.
@@ -384,7 +413,17 @@ func (s *Server) handleEnrol(w http.ResponseWriter, r *http.Request) error {
 	// 4. The CSR signed (node-cluster) through enroll.
 	signed, err := s.enroll.Sign(r.Context(), "node-cluster", req.ServerID+"."+clusterDomain, req.CSR)
 	if err != nil {
-		return fmt.Errorf("signing %s's node-cluster certificate: %w", req.ServerID, err)
+		// The code is burnt; the serial-less record goes so a new code can
+		// be issued for the id at once.
+		if derr := s.mutate(r.Context(), func(st *nodeadmState) error {
+			if n := st.Nodes[req.ServerID]; n != nil && n.Serial == "" && !n.Removed {
+				delete(st.Nodes, req.ServerID)
+			}
+			return nil
+		}); derr != nil {
+			s.log.Warn("couldn't drop a failed enrolment's record", "server_id", req.ServerID)
+		}
+		return fmt.Errorf("signing %s's node-cluster certificate: %w", req.ServerID, redactErr(err, req.CSR))
 	}
 	if err := s.mutate(r.Context(), func(st *nodeadmState) error {
 		n := st.Nodes[req.ServerID]
@@ -558,6 +597,15 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	// The material goes out once per enrolment: once released, never again
+	// after the node registered, after rejoinWindow, or past maxJoinTokens
+	// (a lost answer may be retried briefly; a stolen key mints nothing).
+	if rec.JoinState == joinReleased {
+		if clusterNodeByName(cl, id) != nil || rec.JoinedAt == nil || s.now().Sub(*rec.JoinedAt) > rejoinWindow || len(rec.TokenIDs) >= maxJoinTokens {
+			s.log.Warn("join refused: the material was given already", "server_id", id)
+			return errPlain(http.StatusConflict, "node %s has joined: its k3s material is given once", id)
+		}
+	}
 	// The RTT limits (§20.11, the Hub's CheckRTT): fail closed.
 	if err := checkRTT(rec.Role, serverNames(cl, id), req.RTTms); err != nil {
 		s.log.Warn("join refused", "server_id", id, "why", err.Error())
@@ -600,13 +648,26 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) error {
 	serverURL := "https://" + serverIP + ":6443"
 	// Released only while the node is still enrolled with this
 	// certificate (a removal or revocation meanwhile: no material).
+	// A bootstrap token's id is recorded before the token exists, so a
+	// revoke can always delete it.
 	now := s.now()
+	tokID := ""
+	if rec.Role != "server" {
+		if tokID, err = randString(s.rand, 6); err != nil {
+			return err
+		}
+	}
 	if err := s.mutate(ctx, func(st *nodeadmState) error {
 		n := st.Nodes[id]
 		if n == nil || n.Removed || n.Serial != rec.Serial {
 			return errUnsigned
 		}
-		n.JoinedAt = &now
+		if n.JoinedAt == nil {
+			n.JoinedAt = &now
+		}
+		if tokID != "" {
+			n.TokenIDs = append(n.TokenIDs, tokID)
+		}
 		n.ServerToken = n.ServerToken || rec.Role == "server"
 		n.JoinState, n.WaitingSince = joinReleased, nil
 		return nil
@@ -617,7 +678,7 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) error {
 	if rec.Role == "server" {
 		token, err = s.serverToken(ctx)
 	} else {
-		token, err = s.bootstrapToken(ctx)
+		token, err = s.bootstrapToken(ctx, tokID)
 	}
 	if err != nil {
 		return err

@@ -262,6 +262,9 @@ cli_lock() {
   case "$cmd" in
     up|down|upgrade|restore|backup) ;;
     mail) case "$sub" in enable|disable|rotate|cert) ;; *) return 0 ;; esac ;;
+    # The admission params' swap (kube params-sync, its 30 s timer, and
+    # kube check) runs one at a time with up / upgrade (review I3).
+    kube) case "$sub" in params-sync|check) ;; *) return 0 ;; esac ;;
     *) return 0 ;;
   esac
   [ -z "${PORTCULLIS_LOCKED:-}" ] || return 0

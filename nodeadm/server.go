@@ -38,27 +38,16 @@ type Enroll interface {
 }
 
 // Agents is nodeadm's nodeagent client (nodeadm.control, §20.4): only
-// GET /v1/health, PUT /v1/probes/targets and POST /v1/k3s/token-rotate.
+// GET /v1/health, PUT /v1/probes/targets, POST /v1/k3s/token-rotate and
+// POST /v1/etcd/remove-member.
 type Agents interface {
 	Health(ctx context.Context, id, meshIP string) (*AgentHealth, error)
 	PutProbeTargets(ctx context.Context, id, meshIP string, t ProbeTargets) error
 	TokenRotate(ctx context.Context, id, meshIP, newToken, step string) error
-}
-
-// EtcdMember is one etcd member as nodeadm's etcd client sees it.
-type EtcdMember struct {
-	ID      uint64
-	Name    string
-	PeerIP  string
-	Healthy bool
-	Learner bool
-}
-
-// Etcd is the embedded etcd, through the server's etcd client
-// certificate (mounted read-only).
-type Etcd interface {
-	Members(ctx context.Context) ([]EtcdMember, error)
-	Remove(ctx context.Context, id uint64) error
+	// EtcdRemoveMember asks server via (its nodeagent, which holds the
+	// etcd client key; nodeadm holds none) to remove the member of node,
+	// which portcullis-cluster-addresses must list removed.
+	EtcdRemoveMember(ctx context.Context, viaID, viaMesh, node, nodeMesh string) error
 }
 
 // K3sBootstrap answers the status of GET https://<server>:6443/v1-k3s/
@@ -113,7 +102,6 @@ type Server struct {
 	store     Store
 	enroll    Enroll
 	agents    Agents
-	etcd      Etcd
 	bootstrap K3sBootstrap
 	leader    Leader
 	now       func() time.Time
@@ -125,6 +113,9 @@ type Server struct {
 
 	stateMu sync.Mutex // serialises state changes (the CAS guards across processes)
 	opMu    sync.Mutex // one node operation (drain, removal, rotation) at a time
+	limit   *limiter
+	runMu   sync.Mutex
+	running map[string]chan struct{} // revoke ops being driven, by node
 
 	nonceMu    sync.Mutex
 	nonces     map[string]nonceRec  // enrol nonces (single use, 60 s)
@@ -202,6 +193,7 @@ type nonceRec struct {
 // newServer wires a Server; the caller sets the collaborators.
 func newServer(cfg Config) *Server {
 	return &Server{cfg: cfg, now: time.Now, timing: defaultTiming(), pki: &pkiState{},
-		kickCh: make(chan struct{}, 1), nonces: map[string]nonceRec{}, joinNonces: map[string]time.Time{}, degraded: map[string]time.Time{},
-		log: slog.New(slog.NewJSONHandler(io.Discard, nil)), metrics: newMetrics()}
+		kickCh: make(chan struct{}, 1), running: map[string]chan struct{}{}, nonces: map[string]nonceRec{}, joinNonces: map[string]time.Time{}, degraded: map[string]time.Time{},
+		log: slog.New(slog.NewJSONHandler(io.Discard, nil)), metrics: newMetrics(),
+		limit: newLimiter(perSourceRate, perSourceBurst, globalRate, globalBurst)}
 }

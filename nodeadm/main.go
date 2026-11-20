@@ -41,19 +41,9 @@ func env(k, def string) string {
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
-		case "copy-etcd-certs":
-			if len(os.Args) != 4 {
-				fmt.Fprintln(os.Stderr, "usage: nodeadm copy-etcd-certs <src dir> <dst dir>")
-				os.Exit(2)
-			}
-			if err := copyEtcdCerts(os.Args[2], os.Args[3]); err != nil {
-				fmt.Fprintln(os.Stderr, "nodeadm:", err)
-				os.Exit(1)
-			}
-			return
 		case "serve":
 		default:
-			fmt.Fprintln(os.Stderr, "usage: nodeadm [serve | copy-etcd-certs <src> <dst>]")
+			fmt.Fprintln(os.Stderr, "usage: nodeadm [serve]")
 			os.Exit(2)
 		}
 	}
@@ -62,29 +52,6 @@ func main() {
 		log.Error("nodeadm stopped", "err", redact(err.Error()))
 		os.Exit(1)
 	}
-}
-
-// copyEtcdCerts (the init container, root, read-only hostPath): the etcd
-// client certificate, key and CA into an in-memory emptyDir, group-readable
-// for nodeadm (the pod's fsGroup), so nodeadm itself runs as 10010.
-func copyEtcdCerts(src, dst string) error {
-	for _, f := range []string{"client.crt", "client.key", "server-ca.crt"} {
-		b, err := os.ReadFile(filepath.Join(src, f))
-		if err != nil {
-			return err
-		}
-		tmp := filepath.Join(dst, "."+f)
-		if err := os.WriteFile(tmp, b, 0o440); err != nil {
-			return err
-		}
-		if err := os.Chmod(tmp, 0o440); err != nil {
-			return err
-		}
-		if err := os.Rename(tmp, filepath.Join(dst, f)); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func sha256File(p string) (string, error) {
@@ -151,11 +118,6 @@ func run(log *slog.Logger) error {
 		http:       &http.Client{Timeout: 30 * time.Second}}
 	s.agents = agentClient{s: s}
 	s.bootstrap = k3sBootstrap{}
-	if ec, err := newEtcdClient(env("NODEADM_ETCD_DIR", "/run/portcullis/etcd"), os.Getenv("HOST_IP")); err != nil {
-		log.Warn("no etcd client: quorum unknown, member removal refused", "err", err.Error())
-	} else {
-		s.etcd = ec
-	}
 	fence := NewFence(kube, core, cfg.PodName)
 	s.leader = fence
 

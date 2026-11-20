@@ -306,6 +306,13 @@ expect_eq "join.sh reads the code with echo off, checks --code-file's mode/owner
   "$(grep -c 'stty -echo </dev/tty' "$JS"):$(grep -c '"600 0"' "$JS"):$(grep -c 'nodeagent" join < "$work/code"' "$JS")" "1:1:1"
 OUT="$(sh "$JS" pcj2.secret 2>&1; echo "rc=$?")"
 case "$OUT" in *"the join code is a secret"*"rc=2") t_pass "join.sh refuses the code as an argument (exit 2)" ;; *) t_fail "join.sh argv: $OUT" ;; esac
+# Piped, it runs the copy it verified (review M4): fetched, checked, exec'd
+# with the code in its 0600 file; the internal --parent-work names only a
+# join work directory.
+expect_eq "join.sh piped: the verified download is what runs (exec after the sha256 check)" \
+  "$(grep -c '^  exec sh "$work/join.sh" --code-file "$work/code" --parent-work "$work"$' "$JS"):$(awk '/curl .*"\$work\/join.sh"/{c=NR} /exec sh "\$work\/join.sh"/{e=NR} /sha256sum "\$work\/join.sh"/{v=NR} END{print (c<v && v<e) ? "ordered" : "unordered"}' "$JS")" "1:ordered"
+OUT="$(sh "$JS" --parent-work /etc 2>&1; echo "rc=$?")"
+case "$OUT" in *"rc=2"|*"run it as root"*"rc=1") t_pass "join.sh: --parent-work outside a join work directory is refused (or root is asked first)" ;; *) t_fail "join.sh parent-work: $OUT" ;; esac
 # Container root is the operator under rootless Podman: an operator-owned
 # file is chowned to ct_operator_id, never $(id -u) (a subuid there).
 # Contract §6: the engine socket reaches only the two socket proxies, from

@@ -66,16 +66,23 @@ type nodeRecord struct {
 	// generation no longer holds its mesh address.
 	Removed bool           `json:"removed,omitempty"`
 	Addrs   *NodeAddresses `json:"addrs,omitempty"`
+	// TokenIDs: the bootstrap tokens issued to it (a revoke deletes them).
+	TokenIDs []string `json:"token_ids,omitempty"`
 }
 
 type nodeadmState struct {
 	V     int                    `json:"v"`
 	Codes map[string]*codeRecord `json:"codes"`
 	Nodes map[string]*nodeRecord `json:"nodes"`
+	// Ops: the revocations under way (ops.go), by node.
+	Ops map[string]*revokeOp `json:"ops,omitempty"`
+	// OwnSerials: nodeadm's own node-nodeadm certificates; the leader
+	// revokes every one but the current (review M11).
+	OwnSerials []string `json:"own_serials,omitempty"`
 }
 
 func newState() *nodeadmState {
-	return &nodeadmState{V: 1, Codes: map[string]*codeRecord{}, Nodes: map[string]*nodeRecord{}}
+	return &nodeadmState{V: 1, Codes: map[string]*codeRecord{}, Nodes: map[string]*nodeRecord{}, Ops: map[string]*revokeOp{}}
 }
 
 func (st *nodeadmState) clone() *nodeadmState {
@@ -87,6 +94,9 @@ func (st *nodeadmState) clone() *nodeadmState {
 	}
 	if out.Nodes == nil {
 		out.Nodes = map[string]*nodeRecord{}
+	}
+	if out.Ops == nil {
+		out.Ops = map[string]*revokeOp{}
 	}
 	return out
 }
@@ -109,6 +119,7 @@ type secretStore struct {
 
 func (s *secretStore) Load(ctx context.Context) (*nodeadmState, string, error) {
 	sec, err := s.kube.CoreV1().Secrets(s.ns).Get(ctx, stateSecret, metav1.GetOptions{})
+	err = secretErr(err)
 	if err != nil {
 		return nil, "", fmt.Errorf("reading the Secret %s: %w", stateSecret, err)
 	}
@@ -131,6 +142,7 @@ func (s *secretStore) Save(ctx context.Context, st *nodeadmState, version string
 		Labels: map[string]string{"app.kubernetes.io/managed-by": "portcullis"}},
 		Type: corev1.SecretTypeOpaque, Data: map[string][]byte{stateKey: b}}
 	out, err := s.kube.CoreV1().Secrets(s.ns).Update(ctx, sec, metav1.UpdateOptions{})
+	err = secretErr(err)
 	if apierrors.IsConflict(err) {
 		return "", errConflict
 	}
@@ -214,4 +226,21 @@ func (s *Server) sweepCodes(ctx context.Context) error {
 		}
 		return nil
 	})
+}
+
+// secretErr: an API error about a Secret without the API server's message
+// (an "invalid" answer may quote the object's values: a token, the state's
+// code hashes; review M3). The reason and the code survive, so
+// IsConflict / IsNotFound still work.
+func secretErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var se apierrors.APIStatus
+	if errors.As(err, &se) {
+		st := se.Status()
+		return &apierrors.StatusError{ErrStatus: metav1.Status{Status: metav1.StatusFailure, Code: st.Code, Reason: st.Reason,
+			Message: fmt.Sprintf("the API server answered %d %s (its message withheld: it may quote the Secret)", st.Code, st.Reason)}}
+	}
+	return errors.New(redact(err.Error()))
 }

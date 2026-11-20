@@ -235,9 +235,41 @@ kube_params_sync() {
   params="$(printf '%s\n' "$base" | awk -F'\t' -v n="$_K_DOC_NODES" -v a="$_K_DOC_API" -v p="$_K_POD_CIDR" -v s="$_K_SVC_CIDR" 'BEGIN { OFS = "\t" }
     $1 == "nodeAddresses" { $2 = n } $1 == "apiAddresses" { $2 = a } $1 == "podCIDR" { $2 = p } $1 == "serviceCIDR" { $2 = s } { print }')"
   gen="$(printf '%s\n' "$params" | kube_params_generation)"
-  [ "$gen" != "$cur" ] || return 0
-  info "params-sync: the cluster addresses changed: admission params generation $gen (was $cur)..."
+  if [ "$gen" = "$cur" ]; then
+    # Unchanged only when it still judges (review I3): every binding of the
+    # generation, its params and the record naming them; else repaired.
+    local why
+    why="$(kube_params_intact "$cur" "$params")"
+    [ -n "$why" ] || return 0
+    warn "params-sync: admission params generation $cur is recorded but $why: repairing it..."
+  else
+    info "params-sync: the cluster addresses changed: admission params generation $gen (was $cur)..."
+  fi
   kube_admission_params_apply "$hub" "$params"
+}
+
+# kube_params_intact <gen> <params lines> — prints why generation <gen>
+# doesn't judge as recorded (nothing = intact): each of the KUBE_BINDINGS
+# <binding>-<gen> exists, labelled with <gen> and naming
+# portcullis-admission-params-<gen>; that ConfigMap exists; the record
+# portcullis-admission-active names <gen> with the params' addresses.
+kube_params_intact() {
+  local gen="$1" params="$2" live b rec nodes api
+  live="$(kube_ctl get validatingadmissionpolicybinding -l "portcullis.io/params-generation=$gen" -o json 2>/dev/null)" \
+    || { echo "its bindings can't be listed"; return 0; }
+  for b in $KUBE_BINDINGS; do
+    printf '%s' "$live" | N="$b-$gen" P="portcullis-admission-params-$gen" jq -e \
+      '[.items[] | select(.metadata.name == env.N and .spec.paramRef.name == env.P)] | length == 1' >/dev/null 2>&1 \
+      || { echo "the binding $b-$gen is missing"; return 0; }
+  done
+  kube_ctl -n "$(kube_ns)" get configmap "portcullis-admission-params-$gen" -o name >/dev/null 2>&1 \
+    || { echo "its params portcullis-admission-params-$gen are missing"; return 0; }
+  nodes="$(printf '%s\n' "$params" | awk -F'\t' '$1 == "nodeAddresses" { print $2 }')"
+  api="$(printf '%s\n' "$params" | awk -F'\t' '$1 == "apiAddresses" { print $2 }')"
+  rec="$(kube_ctl -n "$(kube_ns)" get configmap "$KUBE_ADMISSION_ACTIVE" -o json 2>/dev/null | jq -r '.data["active.json"] // empty' 2>/dev/null)"
+  printf '%s' "$rec" | G="$gen" N="$nodes" A="$api" jq -e 'fromjson? // . | .generation == env.G
+      and (.node_addresses | join(" ")) == env.N and (.api_addresses | join(" ")) == env.A' >/dev/null 2>&1 \
+    || { echo "the record $KUBE_ADMISSION_ACTIVE doesn't match it"; return 0; }
 }
 
 # cmd_kube_params_sync — `./portcullis kube params-sync` (cmd_kube).

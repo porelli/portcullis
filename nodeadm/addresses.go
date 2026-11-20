@@ -250,6 +250,8 @@ func (s *Server) reconcile(ctx context.Context) {
 	if err := s.sweepCodes(ctx); err != nil {
 		s.log.Warn("couldn't sweep the join codes", "err", err.Error())
 	}
+	s.resumeOps(ctx)
+	s.revokeOldOwnCerts(ctx)
 	if err := s.ensureFrontdoorCert(ctx); err != nil {
 		s.log.Warn("the front door's certificate", "err", redact(err.Error()))
 	}
@@ -285,7 +287,7 @@ func (s *Server) reconcile(ctx context.Context) {
 func (s *Server) dropRemoved(ctx context.Context, st *nodeadmState) {
 	var gone []string
 	for id, r := range st.Nodes {
-		if !r.Removed {
+		if !r.Removed || st.Ops[id] != nil {
 			continue
 		}
 		mesh := r.MeshIP
