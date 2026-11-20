@@ -1711,9 +1711,17 @@ spec:
 # node identities (group system:nodes; matchConditions, so every other
 # identity, the CLI and nodeadm among them, is never judged here), a Node
 # CREATE or UPDATE (status included) may not add, change or remove a label
-# under portcullis.io/, topology.kubernetes.io/, node.longhorn.io/ or
-# svccontroller.k3s.cattle.io/, nor a taint under portcullis.io/; a CREATE
-# carrying any of them is refused. The binding's namespaceSelector is the
+# under portcullis.io/, topology.kubernetes.io/,
+# failure-domain.beta.kubernetes.io/, node.longhorn.io/ or
+# svccontroller.k3s.cattle.io/, nor a taint under portcullis.io/ or
+# nodeadm.portcullis/; a CREATE carrying any of those labels is refused, and
+# a CREATE must carry exactly nodeadm.portcullis/unlabelled=true:NoSchedule
+# among those taints (the join flags register it; nodeadm drops it once it
+# has labelled the Node). A node identity never deletes a Node (a delete and
+# re-register would shed nodeadm's labels). kubernetes.io/hostname (Runs on's node
+# pins and the hostname spread) must be the Node's own name and never
+# change or go (a kubelet could otherwise take another node's name and
+# attract its pinned pods). The binding's namespaceSelector is the
 # core namespace's only for the CLI's rewrite: a Node is cluster-scoped and
 # never skipped by it. The probe: a node identity's dry-run Node annotated
 # with the generation.
@@ -1735,6 +1743,7 @@ spec:
       operations:
       - CREATE
       - UPDATE
+      - DELETE
       resources:
       - nodes
       - nodes/status
@@ -1743,25 +1752,38 @@ spec:
     expression: "'system:nodes' in request.userInfo.groups"
   variables:
   - name: placed
-    expression: "['portcullis.io/', 'topology.kubernetes.io/', 'node.longhorn.io/', 'svccontroller.k3s.cattle.io/']"
+    expression: "['portcullis.io/', 'topology.kubernetes.io/', 'failure-domain.beta.kubernetes.io/', 'node.longhorn.io/', 'svccontroller.k3s.cattle.io/']"
+  # The taints only nodeadm (or the CLI) sets or drops.
+  - name: taintPrefixes
+    expression: "['portcullis.io/', 'nodeadm.portcullis/']"
   - name: newLabels
-    expression: 'has(object.metadata.labels) ? object.metadata.labels : {}'
+    expression: "request.operation != 'DELETE' && has(object.metadata.labels) ? object.metadata.labels : {}"
   - name: oldLabels
     expression: "request.operation == 'UPDATE' && has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}"
   - name: newTaints
-    expression: "has(object.spec.taints) ? object.spec.taints.filter(t, t.key.startsWith('portcullis.io/')) : []"
+    expression: >-
+      request.operation != 'DELETE' && has(object.spec.taints)
+      ? object.spec.taints.filter(t, variables.taintPrefixes.exists(p, t.key.startsWith(p))) : []
   - name: oldTaints
-    expression: "request.operation == 'UPDATE' && has(oldObject.spec.taints) ? oldObject.spec.taints.filter(t, t.key.startsWith('portcullis.io/')) : []"
+    expression: >-
+      request.operation == 'UPDATE' && has(oldObject.spec.taints)
+      ? oldObject.spec.taints.filter(t, variables.taintPrefixes.exists(p, t.key.startsWith(p))) : []
   validations:
   - expression: >-
-      !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
+      request.operation == 'DELETE' || !has(object.metadata.annotations) || !('portcullis.io/params-generation' in object.metadata.annotations)
       || object.metadata.annotations['portcullis.io/params-generation'] != params.data.generation
     messageExpression: "'admission probe: params generation ' + params.data.generation + ' in effect'"
   - expression: |-
-      size(variables.newLabels) <= 256 && size(variables.oldLabels) <= 256
+      request.operation != 'DELETE' && size(variables.newLabels) <= 256 && size(variables.oldLabels) <= 256
       && variables.newLabels.all(k, !variables.placed.exists(p, k.startsWith(p))
            || (k in variables.oldLabels && variables.oldLabels[k] == variables.newLabels[k]))
       && variables.oldLabels.all(k, !variables.placed.exists(p, k.startsWith(p)) || k in variables.newLabels)
       && size(variables.newTaints) <= 32 && size(variables.oldTaints) <= 32
-      && variables.newTaints.all(t, t in variables.oldTaints) && variables.oldTaints.all(t, t in variables.newTaints)
+      && (request.operation == 'CREATE'
+          ? (size(variables.newTaints) == 1 && variables.newTaints[0].key == 'nodeadm.portcullis/unlabelled'
+             && has(variables.newTaints[0].value) && variables.newTaints[0].value == 'true' && variables.newTaints[0].effect == 'NoSchedule')
+          : (variables.newTaints.all(t, t in variables.oldTaints) && variables.oldTaints.all(t, t in variables.newTaints)))
+      && (!('kubernetes.io/hostname' in variables.newLabels) || variables.newLabels['kubernetes.io/hostname'] == object.metadata.name)
+      && (!('kubernetes.io/hostname' in variables.oldLabels) || ('kubernetes.io/hostname' in variables.newLabels
+           && variables.newLabels['kubernetes.io/hostname'] == variables.oldLabels['kubernetes.io/hostname']))
     message: nodes can't set Portcullis placement labels or taints; nodeadm sets them

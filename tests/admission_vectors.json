@@ -13991,6 +13991,15 @@
      "kubernetes.io/hostname": "pc-e2e-node",
      "portcullis.io/class": "home"
     }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true",
+      "effect": "NoSchedule"
+     }
+    ]
    }
   },
   "as": "node",
@@ -14009,6 +14018,15 @@
      "kubernetes.io/hostname": "pc-e2e-node",
      "topology.kubernetes.io/zone": "main"
     }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true",
+      "effect": "NoSchedule"
+     }
+    ]
    }
   },
   "as": "node",
@@ -14030,6 +14048,11 @@
    "spec": {
     "taints": [
      {
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true",
+      "effect": "NoSchedule"
+     },
+     {
       "key": "portcullis.io/small",
       "value": "true",
       "effect": "NoSchedule"
@@ -14043,7 +14066,100 @@
   "ha": true
  },
  {
-  "name": "ha: a kubelet registering its Node without placement labels or taints",
+  "name": "ha: a kubelet registering its Node with another node's hostname label is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "node-2"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "as": "node",
+  "want": "deny",
+  "reason_contains": "nodes can't set Portcullis placement labels or taints; nodeadm sets them",
+  "ha": true
+ },
+ {
+  "name": "ha: a kubelet changing its hostname label to another node's name is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "node-2",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   }
+  },
+  "as": "node",
+  "want": "deny",
+  "reason_contains": "nodes can't set Portcullis placement labels or taints; nodeadm sets them",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   }
+  },
+  "op": "update",
+  "ha": true
+ },
+ {
+  "name": "ha: a kubelet removing its hostname label is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   }
+  },
+  "as": "node",
+  "want": "deny",
+  "reason_contains": "nodes can't set Portcullis placement labels or taints; nodeadm sets them",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   }
+  },
+  "op": "update",
+  "ha": true
+ },
+ {
+  "name": "ha: a kubelet registering its Node with only the unlabelled taint and no placement label",
   "object": {
    "apiVersion": "v1",
    "kind": "Node",
@@ -14052,11 +14168,392 @@
     "labels": {
      "kubernetes.io/hostname": "pc-e2e-node"
     }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true",
+      "effect": "NoSchedule"
+     }
+    ]
    }
   },
   "as": "node",
   "want": "allow",
   "reason_contains": "",
+  "ha": true
+ },
+ {
+  "name": "ha: a kubelet registering its Node without the nodeadm.portcullis/unlabelled taint is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node"
+    }
+   },
+   "spec": {
+    "taints": []
+   }
+  },
+  "as": "node",
+  "want": "deny",
+  "reason_contains": "nodes can't set Portcullis placement labels or taints; nodeadm sets them",
+  "ha": true
+ },
+ {
+  "name": "ha: a kubelet registering with the unlabelled taint at another value is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "false",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "as": "node",
+  "want": "deny",
+  "reason_contains": "nodes can't set Portcullis placement labels or taints; nodeadm sets them",
+  "ha": true
+ },
+ {
+  "name": "ha: a kubelet registering with the unlabelled taint and another nodeadm.portcullis/ taint is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true",
+      "effect": "NoSchedule"
+     },
+     {
+      "key": "nodeadm.portcullis/ready",
+      "value": "true",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "as": "node",
+  "want": "deny",
+  "reason_contains": "nodes can't set Portcullis placement labels or taints; nodeadm sets them",
+  "ha": true
+ },
+ {
+  "name": "ha: a kubelet registering with topology.kubernetes.io/region is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "topology.kubernetes.io/region": "main"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "as": "node",
+  "want": "deny",
+  "reason_contains": "nodes can't set Portcullis placement labels or taints; nodeadm sets them",
+  "ha": true
+ },
+ {
+  "name": "ha: a kubelet registering with failure-domain.beta.kubernetes.io/zone is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "failure-domain.beta.kubernetes.io/zone": "main"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "as": "node",
+  "want": "deny",
+  "reason_contains": "nodes can't set Portcullis placement labels or taints; nodeadm sets them",
+  "ha": true
+ },
+ {
+  "name": "ha: a kubelet adding failure-domain.beta.kubernetes.io/region is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main",
+     "failure-domain.beta.kubernetes.io/region": "main"
+    }
+   }
+  },
+  "as": "node",
+  "want": "deny",
+  "reason_contains": "nodes can't set Portcullis placement labels or taints; nodeadm sets them",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   }
+  },
+  "op": "update",
+  "ha": true
+ },
+ {
+  "name": "ha: a kubelet removing its nodeadm.portcullis/unlabelled taint is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   },
+   "spec": {
+    "taints": []
+   }
+  },
+  "as": "node",
+  "want": "deny",
+  "reason_contains": "nodes can't set Portcullis placement labels or taints; nodeadm sets them",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "op": "update",
+  "ha": true
+ },
+ {
+  "name": "ha: a kubelet adding a nodeadm.portcullis/ taint is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "nodeadm.portcullis/ready",
+      "value": "true",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "as": "node",
+  "want": "deny",
+  "reason_contains": "nodes can't set Portcullis placement labels or taints; nodeadm sets them",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   },
+   "spec": {
+    "taints": []
+   }
+  },
+  "op": "update",
+  "ha": true
+ },
+ {
+  "name": "ha: nodeadm dropping the unlabelled taint once it has labelled the Node",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   },
+   "spec": {
+    "taints": []
+   }
+  },
+  "as": "nodeadm",
+  "want": "allow",
+  "reason_contains": "",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   },
+   "spec": {
+    "taints": [
+     {
+      "key": "nodeadm.portcullis/unlabelled",
+      "value": "true",
+      "effect": "NoSchedule"
+     }
+    ]
+   }
+  },
+  "op": "update",
+  "ha": true
+ },
+ {
+  "name": "ha: a kubelet deleting its Node is refused",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   }
+  },
+  "as": "node",
+  "want": "deny",
+  "reason_contains": "nodes can't set Portcullis placement labels or taints; nodeadm sets them",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   }
+  },
+  "op": "delete",
+  "ha": true
+ },
+ {
+  "name": "ha: nodeadm deleting a Node (revoke)",
+  "object": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   }
+  },
+  "as": "nodeadm",
+  "want": "allow",
+  "reason_contains": "",
+  "existing": {
+   "apiVersion": "v1",
+   "kind": "Node",
+   "metadata": {
+    "name": "pc-e2e-node",
+    "labels": {
+     "kubernetes.io/hostname": "pc-e2e-node",
+     "portcullis.io/class": "home",
+     "portcullis.io/site": "main",
+     "topology.kubernetes.io/zone": "main"
+    }
+   }
+  },
+  "op": "delete",
   "ha": true
  }
 ]

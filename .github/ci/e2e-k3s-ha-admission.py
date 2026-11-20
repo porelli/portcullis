@@ -205,21 +205,35 @@ def run(v, owner):
         if v.get("op") == "delete":
             rc, out = k([*who, *nsa, "delete", kind, md["name"], "--dry-run=server"])
             return rc == 0, out
+        def tk(t):
+            return (t.get("key"), t.get("value"), t.get("effect"))
+        # The vector's own change, once (o is rewritten from the live object
+        # on every try): labels gone / set, taints gone / added.
+        want_o = json.loads(json.dumps(o))
+        gone = set(ex["metadata"].get("labels", {})) - set(want_o["metadata"].get("labels", {}))
+        ext = [tk(t) for t in ex.get("spec", {}).get("taints", [])]
+        obt = [tk(t) for t in want_o.get("spec", {}).get("taints", [])]
         for _ in range(15):  # a controller's own write in between: fetch again
             if ex["kind"] == "Node":
-                # The live Node with only the vector's label change (the node
+                # The live Node with only the vector's change (the node
                 # lifecycle controller's taints and status stay: NodeRestriction
                 # refuses a kubelet changing taints before any policy).
-                gone = set(ex["metadata"].get("labels", {})) - set(o["metadata"].get("labels", {}))
                 labels = {kk: vv for kk, vv in cur["metadata"].get("labels", {}).items() if kk not in gone}
-                labels.update(o["metadata"].get("labels", {}))
+                labels.update(want_o["metadata"].get("labels", {}))
+                taints = [t for t in cur.get("spec", {}).get("taints", []) if tk(t) not in set(ext) - set(obt)]
+                taints += [t for t in want_o.get("spec", {}).get("taints", []) if tk(t) not in set(ext)]
                 o = json.loads(json.dumps(cur))
                 o["metadata"]["labels"] = labels
+                o.setdefault("spec", {})["taints"] = taints
             o["metadata"]["resourceVersion"] = cur["metadata"]["resourceVersion"]
             sub = [f"--subresource={v['subresource']}"] if v.get("subresource") else []
             rc, out = k([*who, "replace", "--dry-run=server", *sub, "-f", "-"], json.dumps(o))
             # A fresh Node gets the lifecycle controller's taints: until they
             # settle the copy is stale ("not allowed to modify taints").
+            if "not allowed to modify taints" in out and v["as"] == "node" and set(ext) != set(obt):
+                # The vector changes a kubelet's taints: on k3s NodeRestriction
+                # refuses that before any policy (envtest judges the policy).
+                return False, "NODERESTRICTION " + out
             if "the object has been modified" not in out and "not allowed to modify taints" not in out:
                 return rc == 0, out
             time.sleep(2)
@@ -268,10 +282,11 @@ try:
         elif v["want"] == "allow":
             results.append((v["name"], ok, "" if ok else f"refused, want admitted: {first}"))
         else:
-            good = not ok and "with binding 'portcullis-" in out and reason in out
+            good = not ok and (("with binding 'portcullis-" in out and reason in out) or out.startswith("NODERESTRICTION "))
             results.append((v["name"], good, "" if good else f"want a denial with {reason!r} from a Portcullis binding, got: {out[:300]}"))
         name, good, why = results[-1]
-        print(f"{'PASS' if good else 'FAIL'}: {name}{'' if good else ': ' + why}", flush=True)
+        note = " (NodeRestriction first)" if good and out.startswith("NODERESTRICTION ") else ""
+        print(f"{'PASS' if good else 'FAIL'}: {name}{note}{'' if good else ': ' + why}", flush=True)
 finally:
     drop_made_ds()
     drop_overrides()
