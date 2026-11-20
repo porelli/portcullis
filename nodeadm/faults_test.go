@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"crypto/sha256"
 	"fmt"
 	"strings"
 	"testing"

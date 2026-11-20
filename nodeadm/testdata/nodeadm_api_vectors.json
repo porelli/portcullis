@@ -1521,7 +1521,7 @@
    "route": "DELETE /v1/nodes/{id}?mode=revoke",
    "client": "hub.control",
    "leader": true,
-   "state": "etcd 1 of 3 healthy",
+   "state": "etcd 1 of 4 healthy (only n1 Ready)",
    "request": {
     "method": "DELETE",
     "path": "/v1/nodes/n3?mode=revoke",
@@ -1530,10 +1530,11 @@
     "body_text": null
    },
    "response": {
-    "status": 503,
+    "status": 409,
     "headers": {},
     "body": {
-     "error": "etcd has no quorum: the member can't be removed"
+     "error": "revoking n3 would leave etcd 1 healthy of 3 members: not a majority",
+     "kind": "quorum_minimum"
     }
    }
   },

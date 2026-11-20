@@ -290,6 +290,14 @@ func (s *Server) dropRemoved(ctx context.Context, st *nodeadmState) {
 		if !r.Removed || st.Ops[id] != nil {
 			continue
 		}
+		if r.RevokeSerial != "" {
+			// A revoke enroll refused: retried here, the record kept until
+			// it succeeds (review N6).
+			if err := s.forget(ctx, id, nil); err != nil {
+				s.log.Warn("a removed node's certificate isn't revoked yet (retried)", "node", id)
+			}
+			continue
+		}
 		mesh := r.MeshIP
 		if r.Addrs != nil {
 			mesh = r.Addrs.Mesh

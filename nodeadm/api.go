@@ -35,7 +35,6 @@ const (
 	textRate      = "too many requests: retry in a minute"
 	textMode      = "mode must be cooperative or revoke"
 	textAdmission = "waiting for the admission params to include this node: retry"
-	textNoQuorum  = "etcd has no quorum: the member can't be removed"
 )
 
 // apiError is an answer other than a success: the status, the text (≤ 200

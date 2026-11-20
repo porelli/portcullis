@@ -83,6 +83,9 @@ func (f *fakeEnroll) Sign(_ context.Context, role, cn, csrPEM string) (*SignedCe
 func (f *fakeEnroll) Revoke(_ context.Context, serial string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.fail != nil {
+		return f.fail
+	}
 	f.revoked = append(f.revoked, serial)
 	return nil
 }

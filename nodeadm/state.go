@@ -64,8 +64,13 @@ type nodeRecord struct {
 	// Removed: the node is being removed; Addrs are the addresses the
 	// document keeps for it (state removed) until the active admission
 	// generation no longer holds its mesh address.
-	Removed bool           `json:"removed,omitempty"`
-	Addrs   *NodeAddresses `json:"addrs,omitempty"`
+	Removed bool `json:"removed,omitempty"`
+	// RevokeSerial: the certificate still to revoke through enroll once
+	// the record is marked removed (review N6: marked first).
+	RevokeSerial string `json:"revoke_serial,omitempty"`
+	// TokensStale: a removed node a rotation skipped (it keeps old tokens).
+	TokensStale bool           `json:"tokens_stale,omitempty"`
+	Addrs       *NodeAddresses `json:"addrs,omitempty"`
 	// TokenIDs: the bootstrap tokens issued to it (a revoke deletes them).
 	TokenIDs []string `json:"token_ids,omitempty"`
 	// Releases: how many times the join material went out (either role).

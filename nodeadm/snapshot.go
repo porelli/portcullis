@@ -112,7 +112,7 @@ func (s *Server) snapshot(ctx context.Context) (*Snapshot, error) {
 			snap.Errors = append(snap.Errors, fmt.Sprintf("node %s has no mesh address: the admission params aren't rewritten", c.Name))
 		}
 		if rec := st.Nodes[c.Name]; rec != nil && rec.Removed && st.Ops[c.Name] == nil {
-			snap.Errors = append(snap.Errors, fmt.Sprintf("node %s was removed but registered again (its kubelet still runs): revoke it again and reinstall that machine", c.Name))
+			snap.Errors = append(snap.Errors, fmt.Sprintf("node %s was removed but registered again (its kubelet still runs; token rotations skip it): revoke it again and reinstall that machine", c.Name))
 		}
 		snap.Nodes = append(snap.Nodes, sn)
 		s.metrics.nodeReady.WithLabelValues(c.Name).Set(b2f(c.Ready))

@@ -479,3 +479,162 @@ func TestNonceNeverEvictsAnotherID(t *testing.T) {
 		t.Fatalf("at the cap: %d, n4 kept %v, %d → %d", w.Code, kept, before, after)
 	}
 }
+
+func (h *harness) setReady(t *testing.T, id string, ready bool) {
+	n, err := h.kube.CoreV1().Nodes().Get(context.Background(), id, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := corev1.ConditionTrue
+	if !ready {
+		st = corev1.ConditionFalse
+	}
+	for i := range n.Status.Conditions {
+		if n.Status.Conditions[i].Type == corev1.NodeReady {
+			n.Status.Conditions[i].Status = st
+		}
+	}
+	h.kube.CoreV1().Nodes().Update(context.Background(), n, metav1.UpdateOptions{})
+}
+
+// TestRevokeQuorumLive (review N2): a live server's revoke while another
+// server is down would leave 1 healthy of 2: quorum_minimum, nothing
+// changed. A stuck server revoke (its Node gone, its etcd member not yet
+// removed) still counts as a member; and the check runs again before each
+// removal step.
+func TestRevokeQuorumLive(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.agents.onRotate = h.bootFollows
+	h.setReady(t, "n2", false)
+	w := h.internal(clientHub, "DELETE", "/v1/nodes/n3?mode=revoke", nil)
+	if w.Code != 409 || !strings.Contains(w.Body.String(), `"kind":"quorum_minimum"`) {
+		t.Fatalf("a live server with another down: %d %s", w.Code, w.Body)
+	}
+	if _, err := h.kube.CoreV1().Nodes().Get(ctx, "n3", metav1.GetOptions{}); err != nil || h.state(t).Ops["n3"] != nil {
+		t.Fatal("a refused revoke changed something")
+	}
+	// The down server itself may go (2 healthy of 2 after).
+	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n2?mode=revoke", nil); w.Code != 204 {
+		t.Fatalf("revoking the down server: %d %s\n%s", w.Code, w.Body, h.logs)
+	}
+
+	// A stuck revoke hides no voter: n2's op stopped before etcd_removed,
+	// its Node gone; n1 and n3 Ready. Revoking n3 leaves 1 healthy of 2.
+	h = newHarness(t)
+	h.putState(t, func(st *nodeadmState) {
+		st.Nodes["n2"] = &nodeRecord{Role: "server", Removed: true, MeshIP: "10.215.0.2"}
+		st.Ops["n2"] = &revokeOp{Node: "n2", Role: "server", Mesh: "10.215.0.2", Step: "published", Started: vecNow}
+	})
+	h.failAgent("etcd", false) // n2's op can't finish meanwhile
+	h.kube.CoreV1().Nodes().Delete(ctx, "n2", metav1.DeleteOptions{})
+	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n3?mode=revoke", nil); w.Code != 409 || !strings.Contains(w.Body.String(), "quorum_minimum") {
+		t.Fatalf("with a stuck server revoke: %d %s", w.Code, w.Body)
+	}
+
+	// Re-checked before every step: a server going down mid-op stops it
+	// before its etcd member goes.
+	agent := nodeSpec{"n4", "agent", "cloud", "edge", "10.215.0.4", nil, nil, true, false}
+	h = newHarness(t, append(append([]nodeSpec{}, baseNodes...), nodeSpec{"n6", "server", "home", "main", "10.215.0.6", nil, nil, true, false}, agent)...)
+	h.putState(t, func(st *nodeadmState) {
+		st.Nodes["n6"] = &nodeRecord{Role: "server", Serial: "66:66", MeshIP: "10.215.0.6"}
+	})
+	// n2 and n3 go down after the op starts (at its node delete step).
+	// (Through the tracker: a reactor runs under the fake's lock.)
+	gvr := schema.GroupVersionResource{Version: "v1", Resource: "nodes"}
+	h.kube.PrependReactor("delete", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+		for _, id := range []string{"n2", "n3"} {
+			o, err := h.kube.Tracker().Get(gvr, "", id)
+			if err != nil {
+				continue
+			}
+			n := o.(*corev1.Node).DeepCopy()
+			for i := range n.Status.Conditions {
+				if n.Status.Conditions[i].Type == corev1.NodeReady {
+					n.Status.Conditions[i].Status = corev1.ConditionFalse
+				}
+			}
+			h.kube.Tracker().Update(gvr, n, "")
+		}
+		return false, nil, nil
+	})
+	w = h.internal(clientHub, "DELETE", "/v1/nodes/n6?mode=revoke", nil)
+	op := h.state(t).Ops["n6"]
+	if w.Code != 409 || op == nil || stepIndex(op.Step) >= stepIndex("etcd_removed") || len(h.agents.etcdRm) != 0 {
+		t.Fatalf("mid-op quorum loss: %d %s, op %+v, etcd %v", w.Code, w.Body, op, h.agents.etcdRm)
+	}
+}
+
+// TestJoinOnceAcrossStates (review N1): a released node whose retry went
+// back through mesh_pending still gets nothing once its Node registered.
+func TestJoinOnceAcrossStates(t *testing.T) {
+	h := newHarness(t)
+	j := h.issue(t, "n5", "agent", "home", "main", "10.215.0.5")
+	h.enrol(t, j, "")
+	if w := h.join(t, j, nearRTT); w.Code != 200 {
+		t.Fatalf("join: %d", w.Code)
+	}
+	h.agents.down["n5"] = true
+	h.putState(t, func(st *nodeadmState) { st.Nodes["n5"].JoinState = joinMeshPending })
+	h.agents.down["n5"] = false
+	h.kube.CoreV1().Nodes().Create(context.Background(), mkNode(nodeSpec{"n5", "agent", "home", "main", "10.215.0.5", nil, nil, true, false}), metav1.CreateOptions{})
+	if w := h.join(t, j, nearRTT); w.Code != 409 {
+		t.Fatalf("released → mesh_pending → join after the Node registered: %d %s", w.Code, w.Body)
+	}
+	if r := h.state(t).Nodes["n5"]; r.Releases != 1 || len(r.TokenIDs) != 1 {
+		t.Fatalf("releases %d, tokens %d", r.Releases, len(r.TokenIDs))
+	}
+}
+
+// TestForgetMarksFirst (review N6): with enroll down the node is marked
+// removed anyway (its joins refused); the revoke is retried later.
+func TestForgetMarksFirst(t *testing.T) {
+	h := newHarness(t)
+	j := h.issue(t, "n4", "agent", "home", "main", "10.215.0.4")
+	h.enrol(t, j, "")
+	serial := h.state(t).Nodes["n4"].Serial
+	h.enroll.fail = errors.New("vault sealed")
+	if err := h.s.forget(context.Background(), "n4", nil); err == nil {
+		t.Fatal("forget with enroll down didn't report it")
+	}
+	r := h.state(t).Nodes["n4"]
+	if !r.Removed || r.Serial != "" || r.RevokeSerial != serial {
+		t.Fatalf("not marked first: %+v", r)
+	}
+	if w := h.join(t, j, nearRTT); w.Code != 403 {
+		t.Fatalf("a join after the mark: %d", w.Code)
+	}
+	h.enroll.fail = nil
+	h.s.dropRemoved(context.Background(), h.state(t))
+	if r := h.state(t).Nodes["n4"]; r == nil || r.RevokeSerial != "" || !slices.Contains(h.enroll.revoked, serial) {
+		t.Fatalf("the revoke wasn't retried: %+v %v", r, h.enroll.revoked)
+	}
+}
+
+// TestRotationSkipsReRegistered (review N6): a removed node that
+// registered again doesn't stall the apply: skipped, recorded, the others
+// all applied.
+func TestRotationSkipsReRegistered(t *testing.T) {
+	agent := nodeSpec{"n4", "agent", "cloud", "edge", "10.215.0.4", nil, nil, true, false}
+	back := nodeSpec{"n0", "agent", "home", "main", "10.215.0.9", nil, nil, true, false}
+	h := newHarness(t, append(append([]nodeSpec{}, baseNodes...), agent, back)...)
+	h.putState(t, func(st *nodeadmState) {
+		st.Nodes["n0"] = &nodeRecord{Role: "agent", Removed: true, MeshIP: "10.215.0.9"}
+		st.Nodes["n3"] = &nodeRecord{Role: "server", Serial: "56:78", MeshIP: "10.215.0.3"}
+	})
+	h.agents.onRotate = h.bootFollows
+	if w := h.internal(clientHub, "DELETE", "/v1/nodes/n3?mode=revoke", nil); w.Code != 204 {
+		t.Fatalf("revoke: %d %s", w.Code, w.Body)
+	}
+	for _, r := range h.agents.rotations {
+		if strings.HasSuffix(r, ":n0") {
+			t.Fatal("the removed node was called")
+		}
+	}
+	if !slices.Contains(h.agents.rotations, "apply:n4") {
+		t.Fatalf("an agent after it wasn't applied: %v", h.agents.rotations)
+	}
+	if r := h.state(t).Nodes["n0"]; r == nil || !r.TokensStale {
+		t.Fatalf("the skip isn't recorded: %+v", r)
+	}
+}

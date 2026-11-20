@@ -258,8 +258,8 @@ func setupCase(t *testing.T, vs *apiVectors, c apiCase) (*harness, []byte, map[s
 			}
 		})
 	case "DELETE /v1/nodes/{id}?mode=revoke":
-		if strings.Contains(st, "1 of 3 healthy") {
-			for _, id := range []string{"n2", "n3"} {
+		if strings.Contains(st, "1 of 4 healthy") {
+			for _, id := range []string{"n2", "n3", "n6"} {
 				n, _ := h.kube.CoreV1().Nodes().Get(ctx, id, metav1.GetOptions{})
 				for i := range n.Status.Conditions {
 					if n.Status.Conditions[i].Type == corev1.NodeReady {

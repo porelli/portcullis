@@ -356,16 +356,22 @@ func supervisorStatus(ctx context.Context, serverIP, token, user, path string) (
 	}
 	pool := x509.NewCertPool()
 	pool.AppendCertsFromPEM(ca)
-	c := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: serverIP}}}
+	// k3s has no supervisor endpoint that authenticates a token and returns
+	// no key material: server-bootstrap answers the cluster's bootstrap data
+	// (the CA and etcd keys), client-kube-proxy.crt a client key. Only the
+	// status line and headers are read: the body is never read, kept or
+	// logged, and the connection is closed (review N3).
+	c := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DisableKeepAlives: true,
+		TLSClientConfig: &tls.Config{RootCAs: pool, ServerName: serverIP}}}
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
 	req.SetBasicAuth(user, pass)
 	resp, err = c.Do(req)
 	if err != nil {
 		return 0, errors.New("the k3s supervisor is unreachable")
 	}
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	code := resp.StatusCode
 	resp.Body.Close()
-	return resp.StatusCode, nil
+	return code, nil
 }
 
 // revokeOldOwnCerts (the leader): records this process's node-nodeadm

@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -50,8 +51,10 @@ type revokeOp struct {
 	NewServer string         `json:"new_server,omitempty"`
 	NewAgent  string         `json:"new_agent,omitempty"`
 	Applied   []string       `json:"applied,omitempty"`
+	Skipped   []string       `json:"skipped,omitempty"` // removed nodes the rotation didn't touch (N6)
 	Started   time.Time      `json:"started"`
 	LastError string         `json:"last_error,omitempty"`
+	LastKind  string         `json:"last_kind,omitempty"` // an error kind (quorum_minimum) for the answer
 }
 
 var revokeSteps = []string{"created", "marked", "tokens_deleted", "node_deleted", "published", "etcd_removed",
@@ -111,13 +114,10 @@ func (s *Server) revoke(ctx context.Context, id string) error {
 			op.Serial, op.TokenIDs = rec.Serial, append([]string{}, rec.TokenIDs...)
 		}
 		if op.Role == "server" {
-			// etcd's own quorum rule, before anything changes.
-			cl, err := s.clusterNodes(ctx)
-			if err != nil {
+			// etcd's own quorum rule, before anything changes (and again
+			// before every removal step: revokeStep).
+			if err := s.revokeQuorum(ctx, id); err != nil {
 				return err
-			}
-			if voters, healthy := etcdQuorum(cl); healthy*2 <= voters {
-				return errPlain(http.StatusServiceUnavailable, textNoQuorum)
 			}
 		}
 		if err := s.mutate(ctx, func(st *nodeadmState) error {
@@ -141,7 +141,53 @@ func (s *Server) revoke(ctx context.Context, id string) error {
 		return err
 	}
 	if op := st.Ops[id]; op != nil {
+		if op.LastKind != "" {
+			return errKind(http.StatusConflict, op.LastKind, "%s (the revocation of %s waits at %s)", op.LastError, id, op.Step)
+		}
 		return fmt.Errorf("revoking %s stopped at %s: %s", id, op.Step, op.LastError)
+	}
+	return nil
+}
+
+// revokeQuorum (review N2): removing server target must leave a strict
+// majority of etcd's current members healthy, judged on live state. The
+// members: every server Node, plus every server whose revoke hasn't
+// reached etcd_removed (its Node may be gone; it still votes, unhealthy).
+// Healthy: the Ready server Nodes now. After the removal: members − 1,
+// healthy − (target Ready).
+func (s *Server) revokeQuorum(ctx context.Context, target string) error {
+	cl, err := s.clusterNodes(ctx)
+	if err != nil {
+		return err
+	}
+	st, err := s.load(ctx)
+	if err != nil {
+		return err
+	}
+	voters, healthy := map[string]bool{}, map[string]bool{}
+	for _, c := range cl {
+		if c.Role == "server" {
+			voters[c.Name] = true
+			if c.Ready {
+				healthy[c.Name] = true
+			}
+		}
+	}
+	for id, op := range st.Ops {
+		if op.Role == "server" && stepIndex(op.Step) < stepIndex("etcd_removed") {
+			voters[id] = true
+		}
+	}
+	if !voters[target] {
+		return nil
+	}
+	v, h := len(voters)-1, len(healthy)
+	if healthy[target] {
+		h--
+	}
+	if h*2 <= v {
+		return errKind(http.StatusConflict, "quorum_minimum",
+			"revoking %s would leave etcd %d healthy of %d members: not a majority", target, h, v)
 	}
 	return nil
 }
@@ -173,9 +219,14 @@ func (s *Server) driveOp(id string) <-chan struct{} {
 			if !s.leader.Leading() {
 				return // the next holder resumes it
 			}
+			kind := ""
+			var ae *apiError
+			if errors.As(err, &ae) {
+				kind = ae.Kind
+			}
 			_ = s.mutate(context.Background(), func(st *nodeadmState) error {
 				if op := st.Ops[id]; op != nil {
-					op.LastError = msg
+					op.LastError, op.LastKind = msg, kind
 				}
 				return nil
 			})
@@ -202,7 +253,7 @@ func (s *Server) opStep(ctx context.Context, id string, fn func(op *revokeOp)) e
 			return errors.New("the op is gone")
 		}
 		fn(op)
-		op.LastError = ""
+		op.LastError, op.LastKind = "", ""
 		return nil
 	})
 }
@@ -242,6 +293,11 @@ func (s *Server) runRevoke(ctx context.Context, id string) error {
 func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 	id := op.Node
 	next := revokeSteps[stepIndex(op.Step)+1]
+	if op.Role == "server" && stepIndex(next) <= stepIndex("etcd_removed") {
+		if err := s.revokeQuorum(ctx, id); err != nil {
+			return err
+		}
+	}
 	switch next {
 	case "marked":
 		if err := s.forget(ctx, id, op.Addrs); err != nil {
@@ -283,6 +339,19 @@ func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 		}
 	case "done":
 		op.NewServer, op.NewAgent = "", ""
+		if len(op.Skipped) > 0 {
+			skipped := op.Skipped
+			if err := s.mutate(ctx, func(st *nodeadmState) error {
+				for _, k := range skipped {
+					if r := st.Nodes[k]; r != nil {
+						r.TokensStale = true
+					}
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+		}
 	}
 	op.Step = next
 	if err := s.opStep(ctx, id, func(o *revokeOp) { o.Step, o.NewServer, o.NewAgent = next, op.NewServer, op.NewAgent }); err != nil {
@@ -293,14 +362,26 @@ func (s *Server) revokeStep(ctx context.Context, op *revokeOp) error {
 }
 
 // survivors: the nodes a rotation applies to, refused while any of them
-// has no mesh address (it would keep the old token, M6).
+// has no mesh address (it would keep the old token, M6). A node whose
+// record is removed (re-registered after a revoke, or another op's
+// target) is skipped, never called: the op records it in Skipped and the
+// snapshot names it (review N6).
 func (s *Server) survivors(ctx context.Context, gone string) (servers, agents []clusterNode, err error) {
 	cl, err := s.clusterNodes(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
+	st, err := s.load(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	var skipped []string
 	for _, n := range cl {
 		if n.Name == gone {
+			continue
+		}
+		if rec := st.Nodes[n.Name]; rec != nil && rec.Removed {
+			skipped = append(skipped, n.Name)
 			continue
 		}
 		if n.Mesh == "" {
@@ -314,6 +395,19 @@ func (s *Server) survivors(ctx context.Context, gone string) (servers, agents []
 	}
 	sort.Slice(servers, func(i, j int) bool { return servers[i].Name < servers[j].Name })
 	sort.Slice(agents, func(i, j int) bool { return agents[i].Name < agents[j].Name })
+	if len(skipped) > 0 {
+		sort.Strings(skipped)
+		if err := s.opStep(ctx, gone, func(o *revokeOp) {
+			for _, k := range skipped {
+				if !slices.Contains(o.Skipped, k) {
+					o.Skipped = append(o.Skipped, k)
+				}
+			}
+		}); err != nil {
+			return nil, nil, err
+		}
+		s.log.Warn("removed nodes skipped by the token rotation (revoke them again)", "op", gone, "skipped", strings.Join(skipped, ","))
+	}
 	return servers, agents, nil
 }
 

@@ -494,17 +494,11 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) error {
 // active admission generation drops it; ruling R-ADM). A code that never
 // enrolled leaves nothing behind.
 func (s *Server) forget(ctx context.Context, id string, addrs *NodeAddresses) error {
-	st, err := s.load(ctx)
-	if err != nil {
-		return err
-	}
-	if rec := st.Nodes[id]; rec != nil && rec.Serial != "" {
-		if err := s.enroll.Revoke(ctx, rec.Serial); err != nil {
-			return fmt.Errorf("revoking %s's certificate: %w", id, err)
-		}
-		s.log.Info("node certificate revoked", "node", id, "serial", rec.Serial)
-	}
-	return s.mutate(ctx, func(st *nodeadmState) error {
+	// Marked removed first (verifySigned refuses from here on, whether or
+	// not enroll is up), the serial kept in RevokeSerial; then revoked; a
+	// failed revoke is retried by the next call (review N6).
+	var serial string
+	if err := s.mutate(ctx, func(st *nodeadmState) error {
 		if c := st.Codes[id]; c != nil {
 			c.KeySHA256, c.Used = "", true
 		}
@@ -520,7 +514,26 @@ func (s *Server) forget(ctx context.Context, id string, addrs *NodeAddresses) er
 			a := *addrs
 			rec.Addrs = &a
 		}
+		if rec.Serial != "" {
+			rec.RevokeSerial = rec.Serial
+		}
 		rec.Removed, rec.Serial = true, ""
+		serial = rec.RevokeSerial
+		return nil
+	}); err != nil {
+		return err
+	}
+	if serial == "" {
+		return nil
+	}
+	if err := s.enroll.Revoke(ctx, serial); err != nil {
+		return fmt.Errorf("revoking %s's certificate: %w", id, err)
+	}
+	s.log.Info("node certificate revoked", "node", id, "serial", serial)
+	return s.mutate(ctx, func(st *nodeadmState) error {
+		if rec := st.Nodes[id]; rec != nil && rec.RevokeSerial == serial {
+			rec.RevokeSerial = ""
+		}
 		return nil
 	})
 }
