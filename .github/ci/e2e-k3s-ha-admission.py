@@ -32,6 +32,7 @@ import re
 import subprocess
 import sys
 import time
+import time
 import urllib.parse
 
 CTX = sys.argv[1] if len(sys.argv) > 1 else "ci"
@@ -157,7 +158,15 @@ def run(v, owner):
         if o.get("kind") != "NetworkPolicy" or o["metadata"].get("namespace") != "portcullis-apps" or v.get("existing") or v.get("op"):
             return None, "a params case must be a create of an apps NetworkPolicy"
         o["metadata"]["namespace"] = override_ns(v["params"])
-    who = [] if v["as"] == "cli" else [f"--as={IDS[v['as']]}", "--as-group=system:masters"]
+    if v["as"] == "cli":
+        who = []
+    elif v["as"] == "node":
+        # A kubelet (R-NODELABELS): its own Node's name, group system:nodes
+        # (what portcullis-node-labels matches; NodeRestriction too);
+        # system:masters only gets RBAC out of the way.
+        who = [f"--as=system:node:{o['metadata']['name']}", "--as-group=system:nodes", "--as-group=system:authenticated", "--as-group=system:masters"]
+    else:
+        who = [f"--as={IDS[v['as']]}", "--as-group=system:masters"]
     if v.get("op") in ("exec", "attach", "portforward"):
         md = o["metadata"]
         q = [("command", c) for c in o.get("command", [])] + [(f, "true") for f in ("stdin", "stdout", "stderr", "tty") if o.get(f)]
@@ -176,32 +185,51 @@ def run(v, owner):
     ex = json.loads(json.dumps(v["existing"]).replace(TEST_TRAEFIK, params["traefikImage"]))
     md = ex["metadata"]
     kind = ex["kind"].lower()
+    nsa = ["-n", md["namespace"]] if md.get("namespace") else []  # a Node has none
     if ex["kind"] == "Pod":
         for x in (ex, o):
             x["spec"]["nodeSelector"] = NEVER
             for r in x["metadata"].get("ownerReferences", []):
                 if r.get("kind") == "DaemonSet" and r.get("name") == "traefik":
                     r["uid"] = owner()
-    cur, _ = kjson(["-n", md["namespace"], "get", kind, md["name"]])
+    cur, _ = kjson([*nsa, "get", kind, md["name"]])
     made = cur is None  # a live object (k3s's own Secrets) is never deleted
     if made:
         rc, out = k(["create", "-f", "-"], json.dumps(ex))
         if rc != 0:
             return None, f"creating the existing object: {out[:300]}"
-        cur, why = kjson(["-n", md["namespace"], "get", kind, md["name"]])
+        cur, why = kjson([*nsa, "get", kind, md["name"]])
         if cur is None:
             return None, f"the existing object is gone after its create: {why}"
     try:
         if v.get("op") == "delete":
-            rc, out = k([*who, "-n", md["namespace"], "delete", kind, md["name"], "--dry-run=server"])
-        else:
+            rc, out = k([*who, *nsa, "delete", kind, md["name"], "--dry-run=server"])
+            return rc == 0, out
+        for _ in range(15):  # a controller's own write in between: fetch again
+            if ex["kind"] == "Node":
+                # The live Node with only the vector's label change (the node
+                # lifecycle controller's taints and status stay: NodeRestriction
+                # refuses a kubelet changing taints before any policy).
+                gone = set(ex["metadata"].get("labels", {})) - set(o["metadata"].get("labels", {}))
+                labels = {kk: vv for kk, vv in cur["metadata"].get("labels", {}).items() if kk not in gone}
+                labels.update(o["metadata"].get("labels", {}))
+                o = json.loads(json.dumps(cur))
+                o["metadata"]["labels"] = labels
             o["metadata"]["resourceVersion"] = cur["metadata"]["resourceVersion"]
             sub = [f"--subresource={v['subresource']}"] if v.get("subresource") else []
             rc, out = k([*who, "replace", "--dry-run=server", *sub, "-f", "-"], json.dumps(o))
+            # A fresh Node gets the lifecycle controller's taints: until they
+            # settle the copy is stale ("not allowed to modify taints").
+            if "the object has been modified" not in out and "not allowed to modify taints" not in out:
+                return rc == 0, out
+            time.sleep(2)
+            cur, why = kjson([*nsa, "get", kind, md["name"]])
+            if cur is None:
+                return None, f"the existing object is gone: {why}"
         return rc == 0, out
     finally:
         if made:
-            k(["-n", md["namespace"], "delete", kind, md["name"], "--wait=true", "--timeout=60s", "--ignore-not-found"])
+            k([*nsa, "delete", kind, md["name"], "--wait=true", "--timeout=60s", "--ignore-not-found"])
         drop_made_ds()
 
 
