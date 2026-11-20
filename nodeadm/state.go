@@ -68,6 +68,8 @@ type nodeRecord struct {
 	Addrs   *NodeAddresses `json:"addrs,omitempty"`
 	// TokenIDs: the bootstrap tokens issued to it (a revoke deletes them).
 	TokenIDs []string `json:"token_ids,omitempty"`
+	// Releases: how many times the join material went out (either role).
+	Releases int `json:"releases,omitempty"`
 }
 
 type nodeadmState struct {

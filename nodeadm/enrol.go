@@ -44,7 +44,10 @@ const (
 	signedSkew    = 60 * time.Second
 	clusterDomain = "cluster.portcullis.internal"
 	maxNonces     = 4096
-	proofLabel    = "portcullis-node-enrol-v1"
+	// maxNoncesPerID: live nonces of one server_id (a new one drops that
+	// id's oldest); another id's nonce is never evicted.
+	maxNoncesPerID = 4
+	proofLabel     = "portcullis-node-enrol-v1"
 )
 
 // The join code v2 (§20.3), its keys in this order.
@@ -230,24 +233,28 @@ func (s *Server) handleNonce(w http.ResponseWriter, r *http.Request) error {
 	nonce := base64.RawURLEncoding.EncodeToString(n)
 	now := s.now()
 	s.nonceMu.Lock()
-	// At most one live nonce per server_id (a new one replaces it), so a
-	// flood of requests for other ids can't evict a node's own nonce.
+	// Expired nonces go; at most maxNoncesPerID live ones per server_id
+	// (the id's oldest is dropped); a request never evicts another id's
+	// nonce: with maxNonces live, a new one is refused (503) instead.
 	sid := trunc(req.ServerID, 64)
+	var mine []string
 	for k, v := range s.nonces {
-		if now.Sub(v.at) > nonceTTL || v.serverID == sid {
+		if now.Sub(v.at) > nonceTTL {
 			delete(s.nonces, k)
+		} else if v.serverID == sid {
+			mine = append(mine, k)
 		}
+	}
+	sort.Slice(mine, func(i, j int) bool { return s.nonces[mine[i]].at.Before(s.nonces[mine[j]].at) })
+	for len(mine) >= maxNoncesPerID {
+		delete(s.nonces, mine[0])
+		mine = mine[1:]
 	}
 	if len(s.nonces) >= maxNonces {
-		var oldest string
-		for k, v := range s.nonces {
-			if oldest == "" || v.at.Before(s.nonces[oldest].at) {
-				oldest = k
-			}
-		}
-		delete(s.nonces, oldest)
+		s.nonceMu.Unlock()
+		return errPlain(http.StatusServiceUnavailable, "too many enrolments in progress: retry in a minute")
 	}
-	s.nonces[nonce] = nonceRec{serverID: trunc(req.ServerID, 64), at: now}
+	s.nonces[nonce] = nonceRec{serverID: sid, at: now}
 	s.nonceMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]string{"nonce": nonce})
 	return nil
@@ -600,11 +607,10 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) error {
 	// The material goes out once per enrolment: once released, never again
 	// after the node registered, after rejoinWindow, or past maxJoinTokens
 	// (a lost answer may be retried briefly; a stolen key mints nothing).
-	if rec.JoinState == joinReleased {
-		if clusterNodeByName(cl, id) != nil || rec.JoinedAt == nil || s.now().Sub(*rec.JoinedAt) > rejoinWindow || len(rec.TokenIDs) >= maxJoinTokens {
-			s.log.Warn("join refused: the material was given already", "server_id", id)
-			return errPlain(http.StatusConflict, "node %s has joined: its k3s material is given once", id)
-		}
+	registered := clusterNodeByName(cl, id) != nil
+	if s.materialGiven(rec, registered) {
+		s.log.Warn("join refused: the material was given already", "server_id", id)
+		return errGivenOnce(id)
 	}
 	// The RTT limits (§20.11, the Hub's CheckRTT): fail closed.
 	if err := checkRTT(rec.Role, serverNames(cl, id), req.RTTms); err != nil {
@@ -662,6 +668,12 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) error {
 		if n == nil || n.Removed || n.Serial != rec.Serial {
 			return errUnsigned
 		}
+		// Again on the fresh record (the compare-and-swap): concurrent joins
+		// can't pass the cap together.
+		if s.materialGiven(n, registered) {
+			return errGivenOnce(id)
+		}
+		n.Releases++
 		if n.JoinedAt == nil {
 			n.JoinedAt = &now
 		}
@@ -688,6 +700,25 @@ func (s *Server) handleJoin(w http.ResponseWriter, r *http.Request) error {
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, joinAnswer{Role: rec.Role, ServerURL: serverURL, Token: token, Flags: flags})
 	return nil
+}
+
+// materialGiven: the material went out already and may not again: the
+// Node registered, past rejoinWindow, or maxJoinTokens releases (either
+// role; an agent's bootstrap tokens count too).
+func (s *Server) materialGiven(n *nodeRecord, registered bool) bool {
+	// Counted by releases, not the join state (a released node's retry may
+	// pass through mesh_pending / waiting_admission again).
+	if n.JoinState != joinReleased && n.Releases == 0 && len(n.TokenIDs) == 0 {
+		return false
+	}
+	if n.Releases >= maxJoinTokens || len(n.TokenIDs) >= maxJoinTokens {
+		return true
+	}
+	return registered || n.JoinedAt == nil || s.now().Sub(*n.JoinedAt) > rejoinWindow
+}
+
+func errGivenOnce(id string) error {
+	return errPlain(http.StatusConflict, "node %s has joined: its k3s material is given once", id)
 }
 
 // The join states (§20.2).

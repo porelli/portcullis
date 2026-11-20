@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -378,5 +379,103 @@ func TestLabelsPatchOptimistic(t *testing.T) {
 	}
 	if len(versions) != 2 || versions[0] == "" || versions[1] == "" || versions[0] == versions[1] {
 		t.Fatalf("patches carried resourceVersions %q (want each patch to carry one, a conflict retried once)", versions)
+	}
+}
+
+// TestJoinCapConcurrent (fix round 2): concurrent signed joins of one
+// released-window node can't pass the cap together: at most maxJoinTokens
+// releases of material, the rest 409, for either role.
+func TestJoinCapConcurrent(t *testing.T) {
+	for _, role := range []string{"agent", "server"} {
+		t.Run(role, func(t *testing.T) {
+			h := newHarness(t)
+			j := h.issue(t, "n5", role, "home", "main", "10.215.0.5")
+			if w := h.enrol(t, j, ""); w.Code != 200 {
+				t.Fatalf("enrol: %d", w.Code)
+			}
+			h.syncParams(t)
+			h.noAutoAdmit = true
+			const n = 12
+			codes := make(chan int, n)
+			var wg sync.WaitGroup
+			for i := 0; i < n; i++ {
+				wg.Add(1)
+				go func() { defer wg.Done(); codes <- h.join(t, j, nearRTT).Code }()
+			}
+			wg.Wait()
+			close(codes)
+			ok := 0
+			for c := range codes {
+				switch c {
+				case 200:
+					ok++
+				case 409:
+				default:
+					t.Errorf("a concurrent join answered %d", c)
+				}
+			}
+			rec := h.state(t).Nodes["n5"]
+			if ok != rec.Releases || ok > maxJoinTokens || ok == 0 {
+				t.Fatalf("%d joins got material, %d releases recorded (cap %d)", ok, rec.Releases, maxJoinTokens)
+			}
+			l, _ := h.kube.CoreV1().Secrets(bootstrapNS).List(context.Background(), metav1.ListOptions{})
+			if role == "agent" && len(l.Items) > maxJoinTokens {
+				t.Fatalf("%d bootstrap tokens minted", len(l.Items))
+			}
+			if role == "server" && len(l.Items) != 0 {
+				t.Fatal("a server got a bootstrap token")
+			}
+		})
+	}
+}
+
+// TestNonceNeverEvictsAnotherID (fix round 2): a flood of nonce requests
+// never evicts another server_id's nonce; one id keeps its 4 newest; at the
+// global cap a new nonce is refused (503), the live ones kept.
+func TestNonceNeverEvictsAnotherID(t *testing.T) {
+	h := newHarness(t)
+	mine := h.nonce(t, "n4")
+	for i := 0; i < maxNoncesPerID+3; i++ {
+		h.nonce(t, "n9")
+	}
+	h.s.nonceMu.Lock()
+	_, kept := h.s.nonces[mine]
+	n9 := 0
+	for _, v := range h.s.nonces {
+		if v.serverID == "n9" {
+			n9++
+		}
+	}
+	h.s.nonceMu.Unlock()
+	if !kept || n9 != maxNoncesPerID {
+		t.Fatalf("n4's nonce kept %v, n9 has %d live (want %d)", kept, n9, maxNoncesPerID)
+	}
+	// Up to 4 of one id stay valid: the first of four still enrols.
+	j := h.issue(t, "n5", "agent", "home", "main", "10.215.0.5")
+	first := h.nonce(t, "n5")
+	for i := 0; i < maxNoncesPerID-1; i++ {
+		h.nonce(t, "n5")
+	}
+	pub := "203.0.113.9:51830"
+	body, _ := json.Marshal(enrolReq{ServerID: "n5", Nonce: first, Proof: j.proof(first), CSR: j.csrPEM,
+		Mesh: MeshReport{Pub: "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ=", Public: &pub}})
+	if w := h.public("POST", "/node/v1/enrol", body, nil); w.Code != 200 {
+		t.Fatalf("the oldest of 4 nonces: %d %s", w.Code, w.Body)
+	}
+	// The global cap: refused, nothing evicted.
+	h.s.nonceMu.Lock()
+	for i := 0; len(h.s.nonces) < maxNonces; i++ {
+		h.s.nonces[fmt.Sprint("filler-", i)] = nonceRec{serverID: fmt.Sprint("x", i), at: h.s.now()}
+	}
+	h.s.nonces[mine] = nonceRec{serverID: "n4", at: h.s.now()}
+	before := len(h.s.nonces)
+	h.s.nonceMu.Unlock()
+	w := h.public("POST", "/node/v1/nonce", []byte(`{"server_id":"n7"}`), nil)
+	h.s.nonceMu.Lock()
+	_, kept = h.s.nonces[mine]
+	after := len(h.s.nonces)
+	h.s.nonceMu.Unlock()
+	if w.Code != 503 || !kept || after != before {
+		t.Fatalf("at the cap: %d, n4 kept %v, %d → %d", w.Code, kept, before, after)
 	}
 }
